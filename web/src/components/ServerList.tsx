@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { isServerOnline } from '../server-selection.js';
 
 interface ServerInfo {
   id: string;
@@ -17,9 +18,7 @@ interface Props {
 }
 
 function isOnline(server: ServerInfo): boolean {
-  if (server.status === 'offline') return false;
-  if (!server.lastHeartbeatAt) return false;
-  return Date.now() - server.lastHeartbeatAt < 2 * 60 * 1000;
+  return isServerOnline(server);
 }
 
 export function ServerList({ servers, onSelectServer, onDeleteServer }: Props) {

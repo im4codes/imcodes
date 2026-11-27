@@ -42,12 +42,14 @@ export interface SharedPresencePayload {
   source?: 'grant' | 'daemon' | 'pod-pong' | 'fallback';
 }
 
+export const SERVER_PRESENCE_STALENESS_MS = 120_000;
+
 /**
  * Authoritative presence classifier for shared and inventory servers.
  * - Explicit 'offline' status -> 'offline'
  * - Missing or invalid heartbeat -> 'unknown'
- * - Heartbeat within 60s freshness window -> 'online'
- * - Heartbeat older than 60s -> 'offline'
+ * - Heartbeat within 120s freshness window -> 'online'
+ * - Heartbeat older than 120s -> 'offline'
  */
 export function classifyServerPresence(
   server: { status?: string | null; lastHeartbeatAt?: number | null; heartbeatSource?: string | null } | null | undefined,
@@ -58,7 +60,7 @@ export function classifyServerPresence(
   if (typeof server.lastHeartbeatAt !== 'number' || !Number.isFinite(server.lastHeartbeatAt) || server.lastHeartbeatAt <= 0) {
     return 'unknown';
   }
-  return (now - server.lastHeartbeatAt < 60_000) ? 'online' : 'offline';
+  return (now - server.lastHeartbeatAt < SERVER_PRESENCE_STALENESS_MS) ? 'online' : 'offline';
 }
 
 export interface ShareAuthorizationSnapshot {

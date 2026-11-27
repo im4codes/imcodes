@@ -205,8 +205,15 @@ describe('isServerOnline', () => {
       id: 'srv-1',
       name: 'Server One',
       status: 'online',
-      lastHeartbeatAt: Date.now() - 61_000,
+      lastHeartbeatAt: Date.now() - 125_000,
     })).toBe(false);
+  });
+
+  it('keeps server online across 45s-75s DB throttling and 30s polling intervals (up to 120s)', () => {
+    const now = Date.now();
+    expect(isServerOnline({ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: now - 45_000 }, now)).toBe(true);
+    expect(isServerOnline({ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: now - 75_000 }, now)).toBe(true);
+    expect(isServerOnline({ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: now - 95_000 }, now)).toBe(true);
   });
 });
 
@@ -249,5 +256,20 @@ describe('mergeServerNavigation', () => {
     expect(mergeServerNavigation([], [shared, shared], new Set(['shared']))).toEqual([shared]);
     expect(mergeServerNavigation([], [shared], new Set())).toEqual([]);
     expect(mergeServerNavigation([shared], [shared], new Set(['shared']))).toEqual([shared]);
+  });
+
+  it('does not regress fresh live heartbeat with older REST timestamps for non-offline servers', () => {
+    const previous = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 200_000 }];
+    const incoming = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 150_000 }];
+    const result = mergeServerNavigation(incoming, previous, new Set());
+    expect(result[0].lastHeartbeatAt).toBe(200_000);
+  });
+
+  it('applies explicit offline status immediately without being overridden by previous heartbeat', () => {
+    const previous = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 200_000 }];
+    const incoming = [{ id: 'srv-1', name: 'Server One', status: 'offline', lastHeartbeatAt: 150_000 }];
+    const result = mergeServerNavigation(incoming, previous, new Set());
+    expect(result[0].status).toBe('offline');
+    expect(result[0].lastHeartbeatAt).toBe(150_000);
   });
 });

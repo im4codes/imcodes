@@ -2154,7 +2154,7 @@ const SHARE_INPUT_AUTHORITY_REUSE_MS = 30_000;
 /** Share-command audit rows that may be waiting to be written; beyond it new ones are dropped and counted. */
 const SHARE_AUDIT_MAX_PENDING = 500;
 /** Throttle periodic heartbeat DB writes well below MACHINE_PRESENCE_STALENESS_MS (90s) and cron timeout (10m). */
-const HEARTBEAT_DB_WRITE_INTERVAL_MS = 45_000;
+const HEARTBEAT_DB_WRITE_INTERVAL_MS = 30_000;
 /** Long fallback interval for cross-pod capability sync checks on heartbeat when no operations are active. */
 const CAPABILITY_HEARTBEAT_FALLBACK_INTERVAL_MS = 60_000;
 /** Cache controlled-node hostId resolution within a connection generation before periodic fallback recheck. */
@@ -2353,6 +2353,7 @@ export class WsBridge {
     promise: Promise<void>;
   } | null = null;
   private lastHeartbeatDbWriteAt = 0;
+  private lastHeartbeatReceivedAt = 0;
   private lastHeartbeatDbVersion: string | null = null;
   private lastHeartbeatDbGeneration: number | null = null;
   private lastHeartbeatDbStatus: 'online' | 'offline' | null = null;
@@ -2362,6 +2363,9 @@ export class WsBridge {
     this.lastHeartbeatDbVersion = null;
     this.lastHeartbeatDbGeneration = null;
     this.lastHeartbeatDbStatus = status;
+    if (status === 'offline' || status === null) {
+      this.lastHeartbeatReceivedAt = 0;
+    }
   }
 
   private persistHeartbeatIfDue(
@@ -2537,6 +2541,7 @@ export class WsBridge {
     db: Database,
     connectionGeneration: number,
   ): void {
+    this.lastHeartbeatReceivedAt = Date.now();
     const hbVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion;
     if (typeof hbVersion === 'string') this.daemonVersion = hbVersion;
     this.persistHeartbeatIfDue(db, connectionGeneration, hbVersion);
@@ -6619,6 +6624,7 @@ export class WsBridge {
         }
         onAuthenticated?.();
 
+        this.lastHeartbeatReceivedAt = Date.now();
         this.persistHeartbeatIfDue(db, connectionGeneration, this.daemonVersion, {
           force: true,
           controlledCapabilities: this.daemonNodeRole === NODE_ROLE.CONTROLLED ? [...this.controlledNodeCapabilities] : undefined,
@@ -7109,6 +7115,7 @@ export class WsBridge {
       }
 
       if (msg.type === 'heartbeat') {
+        this.lastHeartbeatReceivedAt = Date.now();
         const heartbeatDaemonVersion = typeof msg.daemonVersion === 'string'
           ? msg.daemonVersion
           : this.daemonVersion;
@@ -14332,6 +14339,12 @@ export class WsBridge {
   /** Returns true if the daemon WebSocket is connected and authenticated. */
   isDaemonConnected(): boolean {
     return !!(this.daemonWs && this.authenticated);
+  }
+
+  /** Returns latest known heartbeat timestamp for an active daemon connection. */
+  getLastHeartbeatAt(): number {
+    if (!this.isDaemonConnected()) return 0;
+    return Math.max(this.lastHeartbeatReceivedAt, this.lastHeartbeatDbWriteAt);
   }
 
   private isRemoteDesktopGuestOutboxTargetAvailable(): boolean {

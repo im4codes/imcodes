@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  SERVER_PRESENCE_STALENESS_MS,
   SHARE_ACTION_ID_IS_IDEMPOTENCY_KEY,
   SHARE_BROWSER_COMMANDS,
   SHARE_DAEMON_RELAY_INVENTORY,
@@ -7,6 +8,7 @@ import {
   SHARE_SCOPED_DAEMON_MESSAGE_POLICY,
   SHARE_SCOPED_COMMAND_POLICY,
   buildShareAuditIdempotencyKey,
+  classifyServerPresence,
   getShareScopedCommandPolicy,
   getShareScopedDaemonMessagePolicy,
   isActiveShareGrant,
@@ -354,5 +356,42 @@ describe('shared tab sharing contract', () => {
       attemptId: 'audit-b',
     });
     expect(keyA).not.toEqual(keyC);
+  });
+
+  describe('classifyServerPresence and SERVER_PRESENCE_STALENESS_MS', () => {
+    it('defines SERVER_PRESENCE_STALENESS_MS as 120_000 (2 minutes)', () => {
+      expect(SERVER_PRESENCE_STALENESS_MS).toBe(120_000);
+    });
+
+    it('classifies null or missing heartbeats as unknown', () => {
+      expect(classifyServerPresence(null)).toBe('unknown');
+      expect(classifyServerPresence(undefined)).toBe('unknown');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: null })).toBe('unknown');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: 0 })).toBe('unknown');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: -1 })).toBe('unknown');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: NaN })).toBe('unknown');
+    });
+
+    it('classifies explicit offline status as offline immediately even with fresh heartbeat', () => {
+      const now = Date.now();
+      expect(classifyServerPresence({ status: 'offline', lastHeartbeatAt: now }, now)).toBe('offline');
+      expect(classifyServerPresence({ status: 'offline', lastHeartbeatAt: now - 5_000 }, now)).toBe('offline');
+    });
+
+    it('classifies heartbeats within 120s as online (including DB 45s-75s lag and polling margin)', () => {
+      const now = 1_000_000;
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: now - 5_000 }, now)).toBe('online');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: now - 45_000 }, now)).toBe('online');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: now - 75_000 }, now)).toBe('online');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: now - 95_000 }, now)).toBe('online');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: now - 119_999 }, now)).toBe('online');
+    });
+
+    it('classifies heartbeats older than 120s as offline', () => {
+      const now = 1_000_000;
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: now - 120_000 }, now)).toBe('offline');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: now - 125_000 }, now)).toBe('offline');
+      expect(classifyServerPresence({ status: 'online', lastHeartbeatAt: now - 300_000 }, now)).toBe('offline');
+    });
   });
 });

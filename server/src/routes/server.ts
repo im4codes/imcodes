@@ -449,15 +449,27 @@ serverRoutes.get('/', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const dbServers = await getFullServersByUserId(c.env.DB, userId);
 
-  const servers = dbServers.map((s) => ({
-    id: s.id,
-    name: s.name,
-    status: s.status,
-    lastHeartbeatAt: s.last_heartbeat_at,
-    daemonVersion: s.daemon_version,
-    latestDaemonVersion: process.env.APP_VERSION ?? null,
-    createdAt: s.created_at,
-  }));
+  const servers = dbServers.map((s) => {
+    let lastHeartbeatAt = s.last_heartbeat_at;
+    if (s.status !== 'offline') {
+      const bridge = WsBridge.find(s.id);
+      if (bridge?.isDaemonConnected()) {
+        const liveHeartbeatAt = bridge.getLastHeartbeatAt();
+        if (liveHeartbeatAt > 0) {
+          lastHeartbeatAt = Math.max(lastHeartbeatAt ?? 0, liveHeartbeatAt);
+        }
+      }
+    }
+    return {
+      id: s.id,
+      name: s.name,
+      status: s.status,
+      lastHeartbeatAt,
+      daemonVersion: s.daemon_version,
+      latestDaemonVersion: process.env.APP_VERSION ?? null,
+      createdAt: s.created_at,
+    };
+  });
 
   return c.json({ servers });
 });

@@ -11,6 +11,7 @@ const mockDeleteServer = vi.fn();
 const mockResolveServerRole = vi.fn();
 const mockGetServerById = vi.fn();
 const mockResolveControlledMachineManagementAccess = vi.fn();
+const mockWsBridgeFind = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -42,6 +43,7 @@ vi.mock('../src/ws/bridge.js', () => ({
       requestDaemonUpgrade: (...args: unknown[]) => mockRequestDaemonUpgrade(...args),
       daemonUpgradeStatus: (...args: unknown[]) => mockDaemonUpgradeStatus(...args),
     }),
+    find: (...args: unknown[]) => mockWsBridgeFind(...args),
   },
 }));
 
@@ -96,6 +98,7 @@ describe('server routes', () => {
     mockResolveServerRole.mockResolvedValue('owner');
     mockGetServerById.mockResolvedValue({ id: 'srv-1', user_id: 'user-1', name: 'Alpha' });
     mockResolveControlledMachineManagementAccess.mockResolvedValue(null);
+    mockWsBridgeFind.mockReturnValue(undefined);
     delete process.env.APP_VERSION;
   });
 
@@ -124,6 +127,51 @@ describe('server routes', () => {
         createdAt: 99,
       }],
     });
+  });
+
+  it('GET /api/server merges live bridge heartbeat for connected daemon when newer', async () => {
+    mockGetFullServersByUserId.mockResolvedValue([{
+      id: 'srv-1',
+      name: 'Alpha',
+      status: 'online',
+      last_heartbeat_at: 100_000,
+      daemon_version: '2026.5.2047-dev.2025',
+      created_at: 99,
+    }]);
+    mockWsBridgeFind.mockReturnValue({
+      isDaemonConnected: () => true,
+      getLastHeartbeatAt: () => 180_000,
+    });
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { servers: Array<{ lastHeartbeatAt: number }> };
+    expect(body.servers[0].lastHeartbeatAt).toBe(180_000);
+  });
+
+  it('GET /api/server does not override offline status or heartbeat with bridge', async () => {
+    mockGetFullServersByUserId.mockResolvedValue([{
+      id: 'srv-1',
+      name: 'Alpha',
+      status: 'offline',
+      last_heartbeat_at: 50_000,
+      daemon_version: '2026.5.2047-dev.2025',
+      created_at: 99,
+    }]);
+    mockWsBridgeFind.mockReturnValue({
+      isDaemonConnected: () => true,
+      getLastHeartbeatAt: () => 180_000,
+    });
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server');
+
+    expect(res.status).toBe(200);
+    const body = await res.json() as { servers: Array<{ status: string; lastHeartbeatAt: number }> };
+    expect(body.servers[0].status).toBe('offline');
+    expect(body.servers[0].lastHeartbeatAt).toBe(50_000);
   });
 
   it('GET /api/server exposes the configured latest daemon version', async () => {

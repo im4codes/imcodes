@@ -1,4 +1,7 @@
 import { isWorkerSessionName } from './session-list-merge.js';
+import { classifyServerPresence, SERVER_PRESENCE_STALENESS_MS } from '@shared/tab-sharing.js';
+
+export { SERVER_PRESENCE_STALENESS_MS };
 
 export interface SelectableServerInfo {
   id: string;
@@ -52,11 +55,11 @@ export function resolveServerSessionSnapshot(
   return pickMostRecentMainSession(serverCandidates)?.sessionName ?? null;
 }
 
-export function isServerOnline(server: Pick<OnlineServerInfo, 'status' | 'lastHeartbeatAt'> | null | undefined): boolean {
-  if (!server) return false;
-  if (server.status === 'offline') return false;
-  if (!server.lastHeartbeatAt) return false;
-  return Date.now() - server.lastHeartbeatAt < 60_000;
+export function isServerOnline(
+  server: Pick<OnlineServerInfo, 'status' | 'lastHeartbeatAt'> | null | undefined,
+  now = Date.now(),
+): boolean {
+  return classifyServerPresence(server, now) === 'online';
 }
 
 export function hasSelectedServer(
@@ -75,8 +78,35 @@ export function mergeServerNavigation<T extends SelectableServerInfo>(
   previous: readonly T[],
   activeSharedServerIds: ReadonlySet<string>,
 ): T[] {
-  const ids = new Set(incoming.map((server) => server.id));
-  return [...incoming, ...previous.filter((server) => {
+  const previousMap = new Map(previous.map((server) => [server.id, server]));
+  const mergedIncoming = incoming.map((server) => {
+    const prev = previousMap.get(server.id);
+    if (!prev) return server;
+
+    const prevAny = prev as Record<string, unknown>;
+    const currAny = server as Record<string, unknown>;
+
+    // Explicit offline on incoming takes effect immediately
+    if (currAny.status === 'offline') {
+      return server;
+    }
+
+    const prevHb = typeof prevAny.lastHeartbeatAt === 'number' ? prevAny.lastHeartbeatAt : null;
+    const currHb = typeof currAny.lastHeartbeatAt === 'number' ? currAny.lastHeartbeatAt : null;
+
+    // Do not regress fresh live heartbeat with older REST timestamp, unless previous was offline
+    if (prevAny.status !== 'offline' && prevHb !== null && (currHb === null || prevHb > currHb)) {
+      return {
+        ...server,
+        lastHeartbeatAt: prevHb,
+      };
+    }
+
+    return server;
+  });
+
+  const ids = new Set(mergedIncoming.map((server) => server.id));
+  return [...mergedIncoming, ...previous.filter((server) => {
     if (ids.has(server.id) || !activeSharedServerIds.has(server.id)) return false;
     ids.add(server.id);
     return true;

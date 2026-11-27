@@ -110,15 +110,15 @@ describe('WsBridge Batch B-2: heartbeat throttling, node context cache, ownershi
       await flush();
       expect(heartbeatWrites).toHaveLength(1);
 
-      // Heartbeat within 45s with unchanged version: must still ack immediately, 0 extra DB writes.
-      await vi.advanceTimersByTimeAsync(15_000);
+      // Heartbeat within 30s with unchanged version: must still ack immediately, 0 extra DB writes.
+      await vi.advanceTimersByTimeAsync(10_000);
       ws1.emit('message', JSON.stringify({ type: 'heartbeat', daemonVersion: '1.0.0', sentAt: 111 }));
       await flush();
       expect(heartbeatWrites).toHaveLength(1);
       expect(ws1.sentFrames.filter((f) => f.type === 'heartbeat_ack')).toHaveLength(1);
 
-      // Another heartbeat at 30s (< 45s): still throttled, still acks.
-      await vi.advanceTimersByTimeAsync(15_000);
+      // Another heartbeat at 20s (< 30s): still throttled, still acks.
+      await vi.advanceTimersByTimeAsync(10_000);
       ws1.emit('message', JSON.stringify({ type: 'heartbeat', daemonVersion: '1.0.0', sentAt: 222 }));
       await flush();
       expect(heartbeatWrites).toHaveLength(1);
@@ -131,8 +131,8 @@ describe('WsBridge Batch B-2: heartbeat throttling, node context cache, ownershi
       expect(heartbeatWrites).toHaveLength(2);
       expect(ws1.sentFrames.filter((f) => f.type === 'heartbeat_ack')).toHaveLength(3);
 
-      // Crossing >= 45s threshold writes DB again even with unchanged version.
-      await vi.advanceTimersByTimeAsync(45_000);
+      // Crossing >= 30s threshold writes DB again even with unchanged version.
+      await vi.advanceTimersByTimeAsync(30_000);
       ws1.emit('message', JSON.stringify({ type: 'heartbeat', daemonVersion: '1.0.1', sentAt: 444 }));
       await flush();
       expect(heartbeatWrites).toHaveLength(3);
@@ -165,13 +165,13 @@ describe('WsBridge Batch B-2: heartbeat throttling, node context cache, ownershi
       await flush();
       expect(heartbeatWrites).toHaveLength(1);
 
-      await vi.advanceTimersByTimeAsync(20_000);
+      await vi.advanceTimersByTimeAsync(15_000);
       ws.emit('message', JSON.stringify({ type: 'heartbeat', daemonVersion: '2.0.0' }));
       await flush();
       expect(heartbeatWrites).toHaveLength(1);
       expect(ws.sentFrames.filter((f) => f.type === 'heartbeat_ack')).toHaveLength(1);
 
-      await vi.advanceTimersByTimeAsync(25_000);
+      await vi.advanceTimersByTimeAsync(15_000);
       ws.emit('message', JSON.stringify({ type: 'heartbeat', daemonVersion: '2.0.0' }));
       await flush();
       expect(heartbeatWrites).toHaveLength(2);

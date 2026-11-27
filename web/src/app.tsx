@@ -2670,7 +2670,33 @@ function InternalMainApp() {
       void loadServers();
       void refreshSharedEntries({ silent: true });
     }, 30_000);
-    return () => clearInterval(id);
+
+    let lastForegroundRefreshAt = Date.now();
+    const handleForeground = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      const now = Date.now();
+      if (now - lastForegroundRefreshAt < 10_000) return;
+      lastForegroundRefreshAt = now;
+      void loadServers();
+      void refreshSharedEntries({ silent: true });
+    };
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleForeground);
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', handleForeground);
+    }
+
+    return () => {
+      clearInterval(id);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleForeground);
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('focus', handleForeground);
+      }
+    };
   }, [auth, loadServers, refreshSharedEntries]);
 
   useEffect(() => {

@@ -456,7 +456,7 @@ describe('projectUnifiedServerList', () => {
       target: { kind: 'server', serverId: 'server-ai-208' },
       targetLabel: 'ai-208',
       serverStatus: 'online',
-      lastHeartbeatAt: now - 70_000,
+      lastHeartbeatAt: now - 150_000,
     };
     const offlineSharedEntry: SharedEntrySummary = {
       id: 'grant-offline',
@@ -518,7 +518,7 @@ describe('projectUnifiedServerList', () => {
     // 2. Grant heartbeat becomes stale -> turns offline
     const staleGrant: SharedEntrySummary = {
       ...freshGrant,
-      lastHeartbeatAt: now - 80_000,
+      lastHeartbeatAt: now - 150_000,
     };
     result = projectUnifiedServerList(
       [mockOwnedServer1, visitedSharedServer],
