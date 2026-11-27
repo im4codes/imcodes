@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { OpenCode } from '@opencode/sdk';
 import {
   OpenCodeSdkProvider,
@@ -2494,7 +2495,7 @@ describe('OpenCodeSdkProvider', () => {
       type: 'session.step.failed',
       data: {
         sessionID: 'oc-session-1',
-        error: { type: 'provider.auth', status: 401, message: 'Invalid credential' },
+        error: { type: 'provider.auth', status: 401, message: 'API key expired' },
       },
     });
     await vi.waitFor(() => expect(harness.client.sessions.prompt).toHaveBeenCalledTimes(2));
@@ -3202,21 +3203,26 @@ describe('OpenCodeSdkProvider', () => {
     await p3.disconnect();
   });
 
-  it('converts legacy v1 file/agent parts, rejects unconvertible parts cleanly, and restores a real v1.18.4 CLI file-attachment session', async () => {
+  it('losslessly converts project-scoped v1 file/agent parts, fails closed on unmigratable files/parts, and restores a v1.18.4 session without an external CLI binary', async () => {
     const tempDir = mkdtempSync(join(tmpdir(), 'oc-v1-real-attach-'));
     tempDirs.push(tempDir);
-    const v1Bin = '/home/k/.opencode/bin/opencode';
+    const v1Bin = process.env.OPENCODE_V1_BIN;
     const xdgConfig = join(tempDir, 'xdg-config');
     const xdgData = join(tempDir, 'xdg-data');
     const xdgState = join(tempDir, 'xdg-state');
     const xdgCache = join(tempDir, 'xdg-cache');
     const workDir = join(tempDir, 'work');
+    const outsideDir = join(tempDir, 'outside');
     const v2DbPath = join(tempDir, 'v2.db');
     mkdirSync(join(xdgConfig, 'opencode'), { recursive: true });
     mkdirSync(join(xdgData, 'opencode'), { recursive: true });
     mkdirSync(workDir, { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+    const sampleContent = 'legacy-v1-attachment-payload\n';
     const sampleFile = join(workDir, 'attachment.txt');
-    writeFileSync(sampleFile, 'legacy-v1-attachment-payload\n');
+    const outsideFile = join(outsideDir, 'secret.txt');
+    writeFileSync(sampleFile, sampleContent);
+    writeFileSync(outsideFile, 'outside-secret\n');
 
     const srv = createServer((req, res) => {
       let body = '';
@@ -3251,7 +3257,8 @@ describe('OpenCodeSdkProvider', () => {
     try {
       let legacySid = '';
       const { DatabaseSync } = await import('node:sqlite');
-      if (existsSync(v1Bin)) {
+      const v1DbFile = join(xdgData, 'opencode', 'opencode.db');
+      if (v1Bin && existsSync(v1Bin)) {
         writeFileSync(join(xdgConfig, 'opencode', 'opencode.json'), JSON.stringify({
           provider: {
             opencode: {
@@ -3269,6 +3276,7 @@ describe('OpenCodeSdkProvider', () => {
             env: {
               ...process.env,
               HOME: tempDir,
+              PWD: workDir,
               XDG_CONFIG_HOME: xdgConfig,
               XDG_DATA_HOME: xdgData,
               XDG_STATE_HOME: xdgState,
@@ -3293,33 +3301,129 @@ describe('OpenCodeSdkProvider', () => {
           });
         });
         expect(runV1.status).toBe(0);
-        const v1Db = new DatabaseSync(join(xdgData, 'opencode', 'opencode.db'));
+        const v1Db = new DatabaseSync(v1DbFile);
         try {
           const row = v1Db.prepare('SELECT id FROM session ORDER BY time_created DESC LIMIT 1').get() as { id: string } | undefined;
           expect(row?.id).toMatch(/^ses_/);
           legacySid = row!.id;
-          // Also add a second message row containing inline data-URI file + agent part to cover every v1 part conversion in one real DB
-          const msg2 = 'msg_v1_inline_agent_2';
-          v1Db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
-            .run(msg2, legacySid, Date.now(), Date.now(), JSON.stringify({ role: 'user', agent: 'build', time: { created: Date.now() } }));
-          v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
-            .run('prt_inline_1', msg2, legacySid, Date.now(), Date.now(), JSON.stringify({
-              type: 'file',
-              mime: 'image/png',
-              filename: 'inline.png',
-              url: `data:image/png;base64,${Buffer.from('PNG').toString('base64')}`,
-            }));
-          v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
-            .run('prt_agent_1', msg2, legacySid, Date.now(), Date.now(), JSON.stringify({
-              type: 'agent',
-              name: 'reviewer',
-              source: { value: '@reviewer', start: 0, end: 9 },
-            }));
         } finally {
           v1Db.close();
         }
       } else {
-        throw new Error(`Expected real v1.18.4 binary at ${v1Bin}`);
+        // Exact v1.18.4 SQLite schema + row shapes observed from real `opencode run --file`
+        legacySid = 'ses_legacy_v1_18_4_portable_001';
+        const now = Date.now();
+        const v1Db = new DatabaseSync(v1DbFile);
+        try {
+          v1Db.exec(`
+            CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL);
+            CREATE TABLE session (
+              id TEXT PRIMARY KEY,
+              project_id TEXT NOT NULL,
+              parent_id TEXT,
+              slug TEXT NOT NULL,
+              directory TEXT NOT NULL,
+              title TEXT NOT NULL,
+              version TEXT NOT NULL,
+              permission TEXT,
+              time_created INTEGER NOT NULL,
+              time_updated INTEGER NOT NULL
+            );
+            CREATE TABLE message (
+              id TEXT PRIMARY KEY,
+              session_id TEXT NOT NULL,
+              time_created INTEGER NOT NULL,
+              time_updated INTEGER NOT NULL,
+              data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+              id TEXT PRIMARY KEY,
+              message_id TEXT NOT NULL,
+              session_id TEXT NOT NULL,
+              time_created INTEGER NOT NULL,
+              time_updated INTEGER NOT NULL,
+              data TEXT NOT NULL
+            );
+          `);
+          v1Db.prepare('INSERT INTO project (id, worktree, time_created, time_updated) VALUES (?, ?, ?, ?)')
+            .run('global', workDir, now, now);
+          v1Db.prepare('INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, permission, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+            .run(
+              legacySid,
+              'global',
+              null,
+              'portable-v1-file-session',
+              workDir,
+              'inspect attached file',
+              '1.18.4',
+              JSON.stringify([{ permission: 'external_directory', pattern: `${workDir}/*`, action: 'allow' }]),
+              now,
+              now,
+            );
+          v1Db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+            .run('msg_v1_user_1', legacySid, now, now, JSON.stringify({
+              role: 'user',
+              agent: 'build',
+              model: { providerID: 'opencode', modelID: 'big-pickle' },
+              time: { created: now },
+            }));
+          v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+            .run('prt_v1_read_1', 'msg_v1_user_1', legacySid, now, now, JSON.stringify({
+              type: 'text',
+              text: `Called the Read tool with the following input: {"filePath":"${sampleFile}"}`,
+              synthetic: true,
+            }));
+          v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+            .run('prt_v1_file_1', 'msg_v1_user_1', legacySid, now + 1, now + 1, JSON.stringify({
+              type: 'file',
+              mime: 'text/plain',
+              filename: 'attachment.txt',
+              url: pathToFileURL(sampleFile).href,
+            }));
+          v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+            .run('prt_v1_text_1', 'msg_v1_user_1', legacySid, now + 2, now + 2, JSON.stringify({
+              type: 'text',
+              text: 'inspect attached file',
+            }));
+          v1Db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+            .run('msg_v1_assistant_1', legacySid, now + 3, now + 4, JSON.stringify({
+              role: 'assistant',
+              parentID: 'msg_v1_user_1',
+              modelID: 'big-pickle',
+              providerID: 'opencode',
+              finish: 'stop',
+              time: { created: now + 3, completed: now + 4 },
+            }));
+          v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+            .run('prt_v1_ast_1', 'msg_v1_assistant_1', legacySid, now + 4, now + 4, JSON.stringify({
+              type: 'text',
+              text: 'Read attachment.txt successfully.',
+            }));
+        } finally {
+          v1Db.close();
+        }
+      }
+
+      const v1DbExtra = new DatabaseSync(v1DbFile);
+      try {
+        const msg2 = 'msg_v1_inline_agent_2';
+        v1DbExtra.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+          .run(msg2, legacySid, Date.now(), Date.now(), JSON.stringify({ role: 'user', agent: 'build', time: { created: Date.now() } }));
+        v1DbExtra.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('prt_inline_1', msg2, legacySid, Date.now(), Date.now(), JSON.stringify({
+            type: 'file',
+            mime: 'image/png',
+            filename: 'inline.png',
+            url: `data:image/png;base64,${Buffer.from('PNG').toString('base64')}`,
+          }));
+        v1DbExtra.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('prt_agent_1', msg2, legacySid, Date.now(), Date.now(), JSON.stringify({
+            type: 'agent',
+            name: 'reviewer',
+            source: { value: '@reviewer', start: 0, end: 9 },
+          }));
+      } finally {
+        v1DbExtra.close();
       }
 
       process.env.XDG_DATA_HOME = xdgData;
@@ -3361,16 +3465,32 @@ describe('OpenCodeSdkProvider', () => {
       const msgData = importedMsgs.data ?? [];
       expect(msgData.some((m: any) => m.type === 'user' && Array.isArray(m.files) && m.files[0]?.name === 'inline.png')).toBe(true);
       expect(msgData.some((m: any) => m.type === 'user' && Array.isArray(m.agents) && m.agents[0]?.name === 'reviewer')).toBe(true);
-      expect(msgData.some((m: any) => m.type === 'user' && String(m.text).includes('Attachment unavailable after migration: attachment.txt'))).toBe(true);
+      const migratedFileMsg = msgData.find((m: any) =>
+        m.type === 'user'
+        && Array.isArray(m.files)
+        && m.files.some((f: any) => f.name === 'attachment.txt'),
+      );
+      expect(migratedFileMsg).toBeDefined();
+      const migratedAttachment = migratedFileMsg.files.find((f: any) => f.name === 'attachment.txt');
+      expect(migratedAttachment).toMatchObject({
+        mime: 'text/plain',
+        name: 'attachment.txt',
+        data: Buffer.from(sampleContent).toString('base64'),
+        source: { type: 'uri', uri: pathToFileURL(sampleFile).href },
+      });
+      expect(String(migratedFileMsg.text)).not.toContain('Attachment unavailable after migration');
 
       await provider.send(restoredRoute, 'continue restored v1 attachment session');
       await vi.waitFor(() => expect(completes).toHaveLength(1), { timeout: 10_000 });
       expect(completes[0].msg.content).toContain('V2_FOLLOWUP_OK:');
       expect(completes[0].msg.metadata?.providerSessionId).toBe(legacySid);
 
-      // Corrupt / unconvertible part type surfaces actionable opencode export diagnostic
+      // Fail-closed checks: unknown part type, missing file:// attachment, and out-of-project file:// attachment
+      // MUST reject with actionable `opencode export <id>`, NEVER register partial session in v2 DB, and preserve v1 DB!
+      const v1DbWrite = new DatabaseSync(v1DbFile);
       const badSid = 'ses_legacy_bad_part_001';
-      const v1DbWrite = new DatabaseSync(join(xdgData, 'opencode', 'opencode.db'));
+      const missingFileSid = 'ses_legacy_missing_file_001';
+      const outsideFileSid = 'ses_legacy_outside_file_001';
       try {
         v1DbWrite.prepare('INSERT INTO session (id, project_id, directory, slug, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
           .run(badSid, 'global', workDir, 'bad-part-session', 'Bad Part Session', '1.18.4', Date.now(), Date.now());
@@ -3378,15 +3498,50 @@ describe('OpenCodeSdkProvider', () => {
           .run('msg_bad_1', badSid, Date.now(), Date.now(), JSON.stringify({ role: 'user', time: { created: Date.now() } }));
         v1DbWrite.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
           .run('prt_bad_1', 'msg_bad_1', badSid, Date.now(), Date.now(), JSON.stringify({ type: 'unknown-v1-widget', payload: 1 }));
+
+        v1DbWrite.prepare('INSERT INTO session (id, project_id, directory, slug, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(missingFileSid, 'global', workDir, 'missing-file-session', 'Missing File Session', '1.18.4', Date.now(), Date.now());
+        v1DbWrite.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+          .run('msg_missing_1', missingFileSid, Date.now(), Date.now(), JSON.stringify({ role: 'user', time: { created: Date.now() } }));
+        v1DbWrite.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('prt_missing_1', 'msg_missing_1', missingFileSid, Date.now(), Date.now(), JSON.stringify({
+            type: 'file',
+            mime: 'text/plain',
+            filename: 'gone.txt',
+            url: pathToFileURL(join(workDir, 'gone.txt')).href,
+          }));
+
+        v1DbWrite.prepare('INSERT INTO session (id, project_id, directory, slug, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(outsideFileSid, 'global', workDir, 'outside-file-session', 'Outside File Session', '1.18.4', Date.now(), Date.now());
+        v1DbWrite.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+          .run('msg_outside_1', outsideFileSid, Date.now(), Date.now(), JSON.stringify({ role: 'user', time: { created: Date.now() } }));
+        v1DbWrite.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('prt_outside_1', 'msg_outside_1', outsideFileSid, Date.now(), Date.now(), JSON.stringify({
+            type: 'file',
+            mime: 'text/plain',
+            filename: 'secret.txt',
+            url: pathToFileURL(outsideFile).href,
+          }));
       } finally {
         v1DbWrite.close();
       }
-      await expect(provider.createSession({
-        sessionKey: 'bad-v1-attach-route',
-        cwd: workDir,
-        skipCreate: true,
-        resumeId: badSid,
-      })).rejects.toThrow(`opencode export ${badSid}`);
+
+      for (const failSid of [badSid, missingFileSid, outsideFileSid]) {
+        await expect(provider.createSession({
+          sessionKey: `fail-route-${failSid}`,
+          cwd: workDir,
+          skipCreate: true,
+          resumeId: failSid,
+        })).rejects.toThrow(`opencode export ${failSid}`);
+        await expect(client.session.get({ sessionID: failSid })).rejects.toThrow();
+      }
+
+      const v1Check = new DatabaseSync(v1DbFile, { readOnly: true });
+      try {
+        expect(v1Check.prepare('SELECT id FROM session WHERE id = ?').get(missingFileSid)).toEqual({ id: missingFileSid });
+      } finally {
+        v1Check.close();
+      }
 
       await provider.disconnect();
     } finally {
@@ -3631,4 +3786,450 @@ describe('OpenCodeSdkProvider', () => {
       srv.close();
     }
   }, 35_000);
+
+  it('ignores late session.execution.failed and session.execution.interrupted during manual /compact', async () => {
+    const harness = createHarness();
+    const compactDeferred = deferred<Record<string, unknown>>();
+    harness.client.session.compact.mockImplementationOnce(() => compactDeferred.promise);
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+
+    const provider = new OpenCodeSdkProvider();
+    const completes: any[] = [];
+    const errors: any[] = [];
+    provider.onComplete((_s, msg) => completes.push(msg));
+    provider.onError((_s, err) => errors.push(err));
+    await provider.connect({});
+    const routeId = await provider.createSession({ sessionKey: 'route-compact-stale-fail', cwd: '/tmp/project' });
+
+    const compactPromise = provider.send(routeId, '/compact');
+    await vi.waitFor(() => expect(harness.client.session.compact).toHaveBeenCalledOnce());
+    const compactInputId = (harness.client.session.compact.mock.calls[0]?.[0] as { id: string }).id;
+
+    harness.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', error: { message: 'stale prior step failed' } } });
+    harness.queue.push({ type: 'session.execution.failed', data: { sessionID: 'oc-session-1', error: { message: 'stale prior exec failed' } } });
+    harness.queue.push({ type: 'session.execution.interrupted', data: { sessionID: 'oc-session-1', reason: 'user' } });
+    compactDeferred.resolve({ id: compactInputId });
+    await compactPromise;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(errors).toHaveLength(0);
+    expect(completes).toHaveLength(0);
+
+    harness.queue.push({ type: 'session.compaction.started', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: compactInputId } });
+    harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: compactInputId } });
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+    expect(completes[0].content).toBe('OpenCode context compacted.');
+    expect(errors).toHaveLength(0);
+    await provider.disconnect();
+  });
+
+  it('deduplicates concurrent acquireClientEventSubscription calls, handles failures cleanly, and unsubscribes once after all leases release', async () => {
+    const harness = createHarness();
+    let subCalls = 0;
+    let abortedCount = 0;
+    const subGate = deferred<any>();
+    harness.client.events.subscribe = vi.fn(async (_opts: any, reqOpts?: { signal?: AbortSignal }) => {
+      subCalls += 1;
+      reqOpts?.signal?.addEventListener('abort', () => { abortedCount += 1; }, { once: true });
+      if (subCalls === 1) return subGate.promise;
+      if (subCalls === 2) throw new Error('transient subscribe error');
+      return {
+        stream: (async function* () {
+          while (!reqOpts?.signal?.aborted) {
+            await new Promise((r) => setTimeout(r, 5));
+          }
+        })(),
+      };
+    });
+
+    const provider = new OpenCodeSdkProvider();
+    const acquire = (provider as any).acquireClientEventSubscription.bind(provider) as (c: any) => Promise<() => Promise<void>>;
+
+    // Concurrent acquire calls before subscribe settles MUST share 1 upstream subscribe and refCount=2
+    const p1 = acquire(harness.client);
+    const p2 = acquire(harness.client);
+    await vi.waitFor(() => expect(subCalls).toBe(1));
+    subGate.resolve({
+      stream: (async function* () {
+        await new Promise((r) => setTimeout(r, 500));
+      })(),
+    });
+    const [rel1, rel2] = await Promise.all([p1, p2]);
+    expect(subCalls).toBe(1);
+    await rel1();
+    expect(abortedCount).toBe(0);
+    await rel2();
+    expect(abortedCount).toBe(1);
+
+    // Concurrent failure cleans up pending entry so subsequent acquire succeeds cleanly
+    const failedClient = { events: { subscribe: harness.client.events.subscribe } };
+    const f1 = acquire(failedClient);
+    const f2 = acquire(failedClient);
+    await expect(Promise.all([f1, f2])).rejects.toThrow('transient subscribe error');
+    expect(subCalls).toBe(2);
+
+    const rel3 = await acquire(failedClient);
+    expect(subCalls).toBe(3);
+    await rel3();
+    expect(abortedCount).toBe(2);
+  });
+
+  it('hands off MCP session ownership across routes sharing resumeId and restores fallback owner immediately on detach', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oc-same-resume-handoff-'));
+    tempDirs.push(tempDir);
+    const workDir = join(tempDir, 'project');
+    const xdgDir = join(tempDir, 'xdg');
+    const dbPath = join(tempDir, 'v2.db');
+    const mcpScript = join(tempDir, 'fake-mcp.mjs');
+    mkdirSync(workDir, { recursive: true });
+    mkdirSync(xdgDir, { recursive: true });
+
+    writeFileSync(mcpScript, [
+      "import readline from 'node:readline';",
+      "const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });",
+      "const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');",
+      "rl.on('line', (line) => {",
+      "  if (!line.trim()) return;",
+      "  const msg = JSON.parse(line);",
+      "  if (msg.method === 'initialize') {",
+      "    reply(msg.id, { protocolVersion: msg.params?.protocolVersion ?? '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'imcodes-memory', version: '1.0.0' } });",
+      "  } else if (msg.method === 'tools/list') {",
+      "    reply(msg.id, { tools: [{ name: 'whoami', description: 'Return session env', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }] });",
+      "  } else if (msg.method === 'tools/call') {",
+      "    reply(msg.id, { content: [{ type: 'text', text: JSON.stringify({ owner: process.env.IMCODES_DAEMON_SESSION_NAME ?? 'unset' }) }] });",
+      "  } else if (msg.id !== undefined) {",
+      "    reply(msg.id, {});",
+      "  }",
+      "});",
+    ].join('\n'));
+
+    let tcSeq = 0;
+    const srv = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        const parsed = body ? JSON.parse(body) as { messages?: Array<{ role?: string; content?: unknown }>; tools?: Array<{ function?: { name?: string } }> } : {};
+        const last = parsed.messages?.at(-1);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+        if (last?.role === 'tool') {
+          const text = typeof last.content === 'string' ? last.content : JSON.stringify(last.content);
+          res.write(`data: ${JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: `RESULT=${text}` }, finish_reason: null }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 10, completion_tokens: 5 } })}\n\n`);
+        } else {
+          const toolName = (parsed.tools ?? []).map((t) => t.function?.name).find((n) => n?.includes('whoami'));
+          res.write(`data: ${JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `tc_r_${++tcSeq}`, type: 'function', function: { name: toolName, arguments: '{}' } }] }, finish_reason: null }] })}\n\n`);
+          res.write(`data: ${JSON.stringify({ id: 'c1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] })}\n\n`);
+        }
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+    });
+    await new Promise<void>((resolveListen) => srv.listen(0, '127.0.0.1', resolveListen));
+    const port = (srv.address() as { port: number }).port;
+
+    const prevXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = xdgDir;
+    const origCreate = OpenCode.create.bind(OpenCode);
+    const createSpy = vi.spyOn(OpenCode, 'create').mockImplementation(async (opts: any) => origCreate({
+      ...opts,
+      config: {
+        content: JSON.stringify({
+          $schema: 'https://opencode.ai/config.json',
+          share: 'disabled',
+          provider: {
+            mock: {
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: 'sk-handoff' },
+              models: { 'big-pickle': { name: 'Mock Model' } },
+            },
+          },
+          model: 'mock/big-pickle',
+        }),
+      },
+    }));
+    const origStart = openCodeSdkRuntimeHooks.start.bind(openCodeSdkRuntimeHooks);
+    const hookSpy = vi.spyOn(openCodeSdkRuntimeHooks, 'start').mockImplementation(async (startOpts) => {
+      const res = await origStart(startOpts);
+      const origBind = res.bindSessionMcp;
+      return {
+        ...res,
+        ...(origBind
+          ? {
+            bindSessionMcp: (psid, dir, servers) => {
+              const patched = Object.fromEntries(
+                Object.entries(servers).map(([name, spec]) => [name, { ...spec, command: ['node', mcpScript] }]),
+              );
+              return origBind(psid, dir, patched);
+            },
+          }
+          : {}),
+      };
+    });
+
+    try {
+      const provider = new OpenCodeSdkProvider();
+      const completes: Array<{ sessionId: string; msg: any }> = [];
+      provider.onComplete((sessionId, msg) => completes.push({ sessionId, msg }));
+      await provider.connect({ databasePath: dbPath, cwd: workDir } as any);
+      const catalog = await provider.listModels(true);
+      const modelId = catalog.models.find((m) => m.id === 'mock/big-pickle')?.id ?? 'mock/big-pickle';
+
+      const infos: Array<{ sessionId: string; resumeId?: string }> = [];
+      provider.onSessionInfo((sessionId, info) => infos.push({ sessionId, resumeId: info.resumeId }));
+
+      const route1 = await provider.createSession({
+        sessionKey: 'handoff-route-1',
+        sessionName: 'deck_owner_one',
+        cwd: workDir,
+        agentId: modelId,
+      });
+      const sharedSid = infos.find((i) => i.sessionId === route1)?.resumeId!;
+      expect(sharedSid).toBeTruthy();
+
+      const route2 = await provider.createSession({
+        sessionKey: 'handoff-route-2',
+        sessionName: 'deck_owner_two',
+        cwd: workDir,
+        skipCreate: true,
+        resumeId: sharedSid,
+        agentId: modelId,
+      });
+
+      await provider.send(route2, 'check route2 owner');
+      await vi.waitFor(() => expect(completes.filter((c) => c.sessionId === route2)).toHaveLength(1), { timeout: 15_000 });
+      expect(completes.find((c) => c.sessionId === route2)!.msg.content).toContain('"owner":"deck_owner_two"');
+
+      // Detaching route2 MUST immediately restore route1's MCP identity instead of keeping route2 env or losing MCP!
+      await provider.detachSession(route2);
+      await provider.send(route1, 'check route1 restored owner');
+      await vi.waitFor(() => expect(completes.filter((c) => c.sessionId === route1)).toHaveLength(1), { timeout: 15_000 });
+      expect(completes.find((c) => c.sessionId === route1)!.msg.content).toContain('"owner":"deck_owner_one"');
+
+      await provider.disconnect();
+    } finally {
+      hookSpy.mockRestore();
+      createSpy.mockRestore();
+      if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevXdg;
+      srv.closeAllConnections?.();
+      srv.close();
+    }
+  }, 35_000);
+
+  it('rejects non-expired 401/403, conflicting providers, mid-turn credential switches, and unattributable OPENCODE_API_KEY deletion', async () => {
+    // 1. Generic 401 invalid_api_key / Invalid credential & 403 must NOT delete credentials
+    for (const [label, err] of [
+      ['invalid_api_key', { type: 'provider.auth', status: 401, code: 'invalid_api_key', message: 'Invalid credential' }],
+      ['403_with_expired_phrase', { type: 'provider.auth', status: 403, message: 'api_key_expired forbidden' }],
+      ['conflict_opencode_turn_minimax_err', { type: 'provider.auth', status: 401, providerID: 'minimax', message: 'api_key_expired' }],
+    ] as const) {
+      const h = createHarness();
+      h.credentials.push({ id: `cred-${label}`, integrationID: 'opencode', active: true });
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', h.queue.close, { once: true });
+        return { client: h.client as any, server: h.server };
+      });
+      const provider = new OpenCodeSdkProvider();
+      const errs: any[] = [];
+      provider.onError((_s, e) => errs.push(e));
+      await provider.connect({});
+      const routeId = await provider.createSession({ sessionKey: `route-${label}`, cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+      await provider.send(routeId, 'test');
+      h.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-1', error: err } });
+      await vi.waitFor(() => expect(errs).toHaveLength(1));
+      expect(errs[0].code).toBe(PROVIDER_ERROR_CODES.AUTH_FAILED);
+      expect(h.client.credential.remove).not.toHaveBeenCalled();
+      expect(h.client.sessions.prompt).toHaveBeenCalledOnce();
+      await provider.disconnect();
+    }
+
+    // 2. Minimax turn whose error carries providerID: 'opencode' still refuses healing (conflicting active step provider)
+    const hConflict = createHarness();
+    hConflict.credentials.push({ id: 'cred-oc-keep', integrationID: 'opencode', active: true });
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', hConflict.queue.close, { once: true });
+      return { client: hConflict.client as any, server: hConflict.server };
+    });
+    const pConflict = new OpenCodeSdkProvider();
+    const errsConflict: any[] = [];
+    pConflict.onError((_s, e) => errsConflict.push(e));
+    await pConflict.connect({});
+    const rConflict = await pConflict.createSession({ sessionKey: 'route-mm-oc-err', cwd: '/tmp/project', agentId: 'minimax/MiniMax-M2.5' });
+    await pConflict.send(rConflict, 'test');
+    hConflict.queue.push({
+      type: 'session.step.started',
+      data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-mm', model: { providerID: 'minimax', id: 'MiniMax-M2.5' } },
+    });
+    hConflict.queue.push({
+      type: 'session.step.failed',
+      data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-mm', error: { type: 'provider.auth', status: 401, providerID: 'opencode', message: 'api_key_expired' } },
+    });
+    await vi.waitFor(() => expect(errsConflict).toHaveLength(1));
+    expect(hConflict.client.credential.remove).not.toHaveBeenCalled();
+    await pConflict.disconnect();
+
+    // 3. Credential replaced after turn started (`time.created` > startedAt + credential.switched) MUST NOT be deleted
+    const hSwitched = createHarness();
+    hSwitched.credentials.push({ id: 'cred-fresh-replacement', integrationID: 'opencode', active: true, time: { updated: Date.now() + 60_000 } } as any);
+    hSwitched.client.model.list.mockResolvedValue({
+      data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }],
+    });
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', hSwitched.queue.close, { once: true });
+      return { client: hSwitched.client as any, server: hSwitched.server };
+    });
+    const pSwitched = new OpenCodeSdkProvider();
+    const completesSwitched: any[] = [];
+    pSwitched.onComplete((_s, m) => completesSwitched.push(m));
+    await pSwitched.connect({});
+    const rSwitched = await pSwitched.createSession({ sessionKey: 'route-fresh-cred', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+    await pSwitched.send(rSwitched, 'hello');
+    hSwitched.queue.push({ type: 'credential.switched', data: { integrationID: 'opencode' } });
+    hSwitched.queue.push({
+      type: 'session.step.failed',
+      data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-old-attempt', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } },
+    });
+    await vi.waitFor(() => expect(hSwitched.client.sessions.prompt).toHaveBeenCalledTimes(2));
+    expect(hSwitched.client.credential.remove).not.toHaveBeenCalled();
+    hSwitched.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-new-attempt', ordinal: 0, delta: 'Kept fresh cred' } });
+    hSwitched.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(completesSwitched).toHaveLength(1));
+    expect(completesSwitched[0].content).toBe('Kept fresh cred');
+    await pSwitched.disconnect();
+
+    // 4. OPENCODE_API_KEY env var active with only inactive backup DB cred -> fail cleanly, preserve backup cred
+    const prevEnvKey = process.env.OPENCODE_API_KEY;
+    process.env.OPENCODE_API_KEY = 'sk-expired-env-only';
+    try {
+      const hEnv = createHarness();
+      hEnv.credentials.push({ id: 'cred-backup-inactive', integrationID: 'opencode', active: false });
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', hEnv.queue.close, { once: true });
+        return { client: hEnv.client as any, server: hEnv.server };
+      });
+      const pEnv = new OpenCodeSdkProvider();
+      const errsEnv: any[] = [];
+      pEnv.onError((_s, e) => errsEnv.push(e));
+      await pEnv.connect({});
+      const rEnv = await pEnv.createSession({ sessionKey: 'route-env-backup', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+      await pEnv.send(rEnv, 'hello env');
+      hEnv.queue.push({
+        type: 'session.step.failed',
+        data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-env-1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } },
+      });
+      await vi.waitFor(() => expect(errsEnv).toHaveLength(1));
+      expect(errsEnv[0]).toMatchObject({
+        code: PROVIDER_ERROR_CODES.AUTH_FAILED,
+        recoverable: false,
+        message: expect.stringContaining('OPENCODE_API_KEY'),
+      });
+      expect(hEnv.client.credential.remove).not.toHaveBeenCalled();
+      expect(hEnv.credentials).toHaveLength(1);
+      expect(hEnv.client.sessions.prompt).toHaveBeenCalledOnce();
+      await pEnv.disconnect();
+    } finally {
+      if (prevEnvKey === undefined) delete process.env.OPENCODE_API_KEY;
+      else process.env.OPENCODE_API_KEY = prevEnvKey;
+    }
+  });
+
+  it('correlates retry attempt pre-ACK events and ignores delayed stale ID-less Attempt-1 terminal frames', async () => {
+    // 1. Synchronous pre-ACK retry events (both success and fast fail) inside sessions.prompt settle cleanly
+    for (const mode of ['succeed-pre-ack', 'fail-pre-ack'] as const) {
+      const h = createHarness();
+      h.credentials.push({ id: 'cred-preack', integrationID: 'opencode', active: true });
+      h.client.model.list.mockResolvedValue({
+        data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }],
+      });
+      const retryPromptGate = deferred<Record<string, unknown>>();
+      h.client.sessions.prompt.mockImplementation(async (args: { id: string }) => {
+        if (h.client.sessions.prompt.mock.calls.length === 1) return { id: args.id };
+        h.queue.push({ type: 'session.inbox.delivered', data: { sessionID: 'oc-session-1', inboxID: args.id } });
+        h.queue.push({ type: 'session.step.started', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-retry-preack', inputID: args.id, model: { providerID: 'opencode', id: 'big-pickle' } } });
+        if (mode === 'succeed-pre-ack') {
+          h.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-retry-preack', ordinal: 0, delta: 'Retry pre-ACK ok' } });
+          h.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1', inputID: args.id } });
+        } else {
+          h.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-retry-preack', inputID: args.id, error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+        }
+        return retryPromptGate.promise;
+      });
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', h.queue.close, { once: true });
+        return { client: h.client as any, server: h.server };
+      });
+      const provider = new OpenCodeSdkProvider();
+      const completes: any[] = [];
+      const errors: any[] = [];
+      provider.onComplete((_s, m) => completes.push(m));
+      provider.onError((_s, e) => errors.push(e));
+      await provider.connect({});
+      const routeId = await provider.createSession({ sessionKey: `route-${mode}`, cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+      await provider.send(routeId, 'hello pre-ack');
+      h.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-attempt1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+      if (mode === 'succeed-pre-ack') {
+        await vi.waitFor(() => expect(completes).toHaveLength(1));
+        expect(completes[0].content).toBe('Retry pre-ACK ok');
+      } else {
+        await vi.waitFor(() => expect(errors).toHaveLength(1));
+        expect(errors[0].code).toBe(PROVIDER_ERROR_CODES.AUTH_FAILED);
+      }
+      retryPromptGate.resolve({});
+      await provider.disconnect();
+    }
+
+    // 2. Stale Attempt-1 ID-less execution.succeeded / execution.failed / idle AFTER Retry prompt ACK are ignored when message.list has no Retry assistant reply yet
+    const h2 = createHarness();
+    h2.credentials.push({ id: 'cred-stale-ack', integrationID: 'opencode', active: true });
+    h2.client.model.list.mockResolvedValue({
+      data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }],
+    });
+    let retryIdCaptured = '';
+    h2.client.sessions.prompt.mockImplementation(async (args: { id: string }) => {
+      if (h2.client.sessions.prompt.mock.calls.length === 2) retryIdCaptured = args.id;
+      return { id: args.id };
+    });
+    h2.client.message.list.mockImplementation(async () => ({
+      data: retryIdCaptured
+        ? [
+          { id: retryIdCaptured, type: 'user' },
+          { id: 'msg-attempt1-err', type: 'assistant', error: { type: 'provider.auth', message: 'api_key_expired' } },
+        ]
+        : [],
+    }));
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', h2.queue.close, { once: true });
+      return { client: h2.client as any, server: h2.server };
+    });
+    const p2 = new OpenCodeSdkProvider();
+    const c2: any[] = [];
+    const e2: any[] = [];
+    p2.onComplete((_s, m) => c2.push(m));
+    p2.onError((_s, e) => e2.push(e));
+    await p2.connect({});
+    const r2 = await p2.createSession({ sessionKey: 'route-stale-after-ack', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+    await p2.send(r2, 'hello stale noise');
+    h2.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-attempt1-err', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+    await vi.waitFor(() => expect(h2.client.sessions.prompt).toHaveBeenCalledTimes(2));
+
+    // Stale Attempt-1 ID-less terminal frames + old Attempt-1 assistant delta arrive BEFORE Retry finishes
+    h2.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-attempt1-err', ordinal: 0, delta: 'STALE_ATTEMPT1' } });
+    h2.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
+    h2.queue.push({ type: 'session.execution.failed', data: { sessionID: 'oc-session-1', error: { message: 'stale err' } } });
+    h2.queue.push({ type: 'session.idle', data: { sessionID: 'oc-session-1' } });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(c2).toHaveLength(0);
+    expect(e2).toHaveLength(0);
+
+    // Real Retry step & completion settle cleanly
+    h2.queue.push({ type: 'session.step.started', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-retry-2', inputID: retryIdCaptured, model: { providerID: 'opencode', id: 'big-pickle' } } });
+    h2.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-retry-2', ordinal: 0, delta: 'Genuine Retry Success' } });
+    h2.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(c2).toHaveLength(1));
+    expect(c2[0].content).toBe('Genuine Retry Success');
+    expect(e2).toHaveLength(0);
+    await p2.disconnect();
+  });
 });

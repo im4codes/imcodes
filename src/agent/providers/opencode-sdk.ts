@@ -1,10 +1,10 @@
 import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { dirname, join, resolve, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { OpenCodeEvent } from '@opencode/sdk';
 import type {
   ApprovalRequest,
@@ -569,6 +569,7 @@ interface SharedOpenCodeHostEntry {
   }>;
   eventAbort: AbortController | null;
   eventLoop: Promise<void> | null;
+  eventStartPromise: Promise<void> | null;
   refCount: number;
   closed: boolean;
   closePromise: Promise<void> | null;
@@ -680,6 +681,7 @@ export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
         eventConsumers: new Map(),
         eventAbort: null,
         eventLoop: null,
+        eventStartPromise: null,
         refCount: 1,
         closed: false,
         closePromise: null,
@@ -689,65 +691,95 @@ export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
     });
 
     const stopHostEvents = async (): Promise<void> => {
+      const pendingStart = entry.eventStartPromise;
       const abort = entry.eventAbort;
       const loop = entry.eventLoop;
+      entry.eventStartPromise = null;
       entry.eventAbort = null;
       entry.eventLoop = null;
       abort?.abort();
+      if (pendingStart) await pendingStart.catch(() => {});
       if (loop) await loop.catch(() => {});
     };
 
     const ensureHostEventLoop = async (): Promise<void> => {
       if (entry.eventLoop && entry.eventAbort && !entry.eventAbort.signal.aborted) return;
+      if (entry.eventStartPromise) {
+        await entry.eventStartPromise;
+        return;
+      }
       const eventAbort = new AbortController();
-      const subscription = await entry.instance.events.subscribe({}, { signal: eventAbort.signal });
-      const stream = 'stream' in subscription ? subscription.stream : subscription;
       entry.eventAbort = eventAbort;
-      entry.eventLoop = (async () => {
-        const iterator = stream[Symbol.asyncIterator]();
-        let abortListener: (() => void) | null = null;
-        try {
-          const abortPromise = new Promise<{ aborted: true }>((resolveAbort) => {
-            if (eventAbort.signal.aborted) {
-              resolveAbort({ aborted: true });
-              return;
-            }
-            abortListener = () => {
-              void iterator.return?.().catch(() => {});
-              resolveAbort({ aborted: true });
-            };
-            eventAbort.signal.addEventListener('abort', abortListener, { once: true });
-          });
+      const startPromise = (async () => {
+        const subscription = await entry.instance.events.subscribe({}, { signal: eventAbort.signal });
+        if (eventAbort.signal.aborted || entry.eventConsumers.size === 0) {
+          const earlyStream = 'stream' in subscription ? subscription.stream : subscription;
+          void earlyStream[Symbol.asyncIterator]().return?.().catch(() => {});
+          return;
+        }
+        const stream = 'stream' in subscription ? subscription.stream : subscription;
+        entry.eventLoop = (async () => {
+          const iterator = stream[Symbol.asyncIterator]();
+          let abortListener: (() => void) | null = null;
+          try {
+            const abortPromise = new Promise<{ aborted: true }>((resolveAbort) => {
+              if (eventAbort.signal.aborted) {
+                resolveAbort({ aborted: true });
+                return;
+              }
+              abortListener = () => {
+                void iterator.return?.().catch(() => {});
+                resolveAbort({ aborted: true });
+              };
+              eventAbort.signal.addEventListener('abort', abortListener, { once: true });
+            });
 
-          while (!eventAbort.signal.aborted) {
-            const step = await Promise.race([
-              iterator.next().then((result: IteratorResult<Record<string, any>>) => ({ aborted: false as const, result })),
-              abortPromise,
-            ]);
-            if (step.aborted || eventAbort.signal.aborted) return;
-            if (step.result.done) {
-              throw new Error('OpenCode event stream ended');
-            }
-            for (const consumer of [...entry.eventConsumers.values()]) {
-              try {
-                consumer.listener(step.result.value);
-              } catch (listenerError) {
-                logger.warn({ provider: 'opencode-sdk', error: listenerError }, 'OpenCode event consumer listener threw');
+            while (!eventAbort.signal.aborted) {
+              const step = await Promise.race([
+                iterator.next().then((result: IteratorResult<Record<string, any>>) => ({ aborted: false as const, result })),
+                abortPromise,
+              ]);
+              if (step.aborted || eventAbort.signal.aborted) return;
+              if (step.result.done) {
+                throw new Error('OpenCode event stream ended');
+              }
+              for (const consumer of [...entry.eventConsumers.values()]) {
+                try {
+                  consumer.listener(step.result.value);
+                } catch (listenerError) {
+                  logger.warn({ provider: 'opencode-sdk', error: listenerError }, 'OpenCode event consumer listener threw');
+                }
               }
             }
+          } catch (error) {
+            if (eventAbort.signal.aborted) return;
+            for (const consumer of [...entry.eventConsumers.values()]) {
+              consumer.onError(error);
+            }
+          } finally {
+            if (abortListener) eventAbort.signal.removeEventListener('abort', abortListener);
+            if (eventAbort.signal.aborted) {
+              void iterator.return?.().catch(() => {});
+            }
+            if (entry.eventAbort === eventAbort) {
+              entry.eventAbort = null;
+              entry.eventLoop = null;
+            }
           }
-        } catch (error) {
-          if (eventAbort.signal.aborted) return;
-          for (const consumer of [...entry.eventConsumers.values()]) {
-            consumer.onError(error);
-          }
-        } finally {
-          if (abortListener) eventAbort.signal.removeEventListener('abort', abortListener);
-          if (eventAbort.signal.aborted) {
-            void iterator.return?.().catch(() => {});
-          }
+        })();
+      })().catch((error) => {
+        if (entry.eventAbort === eventAbort) {
+          entry.eventAbort = null;
+          entry.eventLoop = null;
         }
-      })();
+        throw error;
+      }).finally(() => {
+        if (entry.eventStartPromise === startPromise) {
+          entry.eventStartPromise = null;
+        }
+      });
+      entry.eventStartPromise = startPromise;
+      await startPromise;
     };
 
     const subscribeEvents: NonNullable<OpenCodeSdkRuntimeStartResult['subscribeEvents']> = async (
@@ -888,12 +920,18 @@ interface OpenCodeSessionState {
   completionEmitted: boolean;
   terminalErrorEmitted: boolean;
   authHealInFlight: boolean;
+  authHealPhase: 'none' | 'preparing' | 'retry-dispatched' | 'retry-active';
+  authHealRetryAcked: boolean;
+  priorAttemptAssistantIds: Set<string>;
+  priorAttemptUserMessageIds: Set<string>;
+  openCodeCredSwitchedDuringTurn: boolean;
   activeTurnParams: {
     generation: number;
     text: string;
     files: Array<Record<string, unknown>>;
     system?: string;
     messageId: string;
+    startedAt: number;
     authHealAttempted: boolean;
   } | null;
   missingFinalRecoveryAttempted: boolean;
@@ -1064,16 +1102,23 @@ function errorExplicitCode(error: unknown): string {
 
 function isExpiredOpenCodeAuthError(error: unknown, sessionProviderId: string | undefined): boolean {
   const explicitProvider = errorExplicitProviderId(error);
+  // Attribution must never conflict: reject when either the active turn's SDK provider
+  // or the error's explicit provider metadata points away from `opencode`.
+  if (sessionProviderId !== undefined && sessionProviderId !== 'opencode') return false;
   if (explicitProvider !== undefined && explicitProvider !== 'opencode') return false;
-  const effectiveProvider = explicitProvider ?? sessionProviderId;
-  // Strictly scope credential removal to OpenCode itself; never interfere with third-party providers (e.g. minimax).
-  if (effectiveProvider !== 'opencode') return false;
+  if ((explicitProvider ?? sessionProviderId) !== 'opencode') return false;
 
   const data = error && typeof error === 'object' ? (error as { data?: Record<string, unknown> }).data : undefined;
+  const response = error && typeof error === 'object' ? (error as { response?: Record<string, unknown> }).response : undefined;
   const nestedStatus = typeof data?.statusCode === 'number' && Number.isFinite(data.statusCode)
     ? data.statusCode
-    : undefined;
+    : typeof response?.status === 'number' && Number.isFinite(response.status)
+      ? response.status
+      : undefined;
   const status = errorHttpStatus(error) ?? nestedStatus;
+  // Explicit non-401 HTTP status (such as 403/400/429/500) must never trigger credential deletion.
+  if (status !== undefined && status !== 401) return false;
+
   const errorType = error && typeof error === 'object'
     ? safeString((error as { type?: unknown }).type)?.toLowerCase() ?? ''
     : '';
@@ -1084,16 +1129,11 @@ function isExpiredOpenCodeAuthError(error: unknown, sessionProviderId: string | 
   const combined = `${errorMessage(error)}\n${errorResponseBodyText(error)}`.toLowerCase();
 
   const is401 = status === 401;
-  const isStructuredAuth = errorType === 'provider.auth' || errorName.includes('providerautherror');
+  const isStatuslessSdkAuth = status === undefined && (errorType === 'provider.auth' || errorName.includes('providerautherror'));
   const hasExpiredKeyMarker = code === 'api_key_expired'
     || /\bapi_key_expired\b/.test(combined)
-    || /\binvalid[_ ]api[_ ]?key\b/.test(combined)
-    || /\bapi[_ ]?key\b[^\n]{0,40}\bexpired\b/.test(combined)
-    || /\btoken\b[^\n]{0,40}\bexpired\b/.test(combined)
-    || /\binvalid[_ ]credential\b/.test(combined);
-  // Require both an authoritative HTTP 401 or structured provider auth failure AND a specific expired/invalid credential marker.
-  // Plain 401 permission/scope errors or bare text mentions without 401/auth classification must never remove credentials.
-  return (is401 || isStructuredAuth) && hasExpiredKeyMarker;
+    || /\bapi[_ ]?key[^a-z0-9]{1,8}expired\b/.test(combined);
+  return (is401 || isStatuslessSdkAuth) && hasExpiredKeyMarker;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1462,6 +1502,7 @@ function mapLegacyToolPart(part: Record<string, any>, fallbackTime: number): Rec
   };
 }
 
+const LEGACY_IMPORT_MAX_FILE_BYTES = 20 * 1024 * 1024;
 const LEGACY_V1_USER_PART_TYPES = new Set(['text', 'file', 'agent', 'compaction', 'subtask']);
 const LEGACY_V1_ASSISTANT_PART_TYPES = new Set([
   'text',
@@ -1474,14 +1515,27 @@ const LEGACY_V1_ASSISTANT_PART_TYPES = new Set([
   'retry',
 ]);
 
-function mapLegacyFilePart(part: Record<string, any>): {
-  attachment?: Record<string, unknown>;
-  unavailableText?: string;
+function mapLegacyFilePart(
+  part: Record<string, any>,
+  sessionDirectory: string | undefined,
+  sessionId: string,
+): {
+  attachment: Record<string, unknown>;
 } {
   const mime = safeString(part.mime) ?? 'application/octet-stream';
   const url = typeof part.url === 'string' ? part.url : '';
   const source = part.source && typeof part.source === 'object' ? (part.source as Record<string, any>) : undefined;
   const filename = safeString(part.filename);
+  const sourceText = source?.text && typeof source.text === 'object' ? (source.text as Record<string, any>) : undefined;
+  const mention = sourceText && typeof sourceText.value === 'string'
+    ? {
+      mention: {
+        text: sourceText.value,
+        start: Number(sourceText.start ?? 0),
+        end: Number(sourceText.end ?? 0),
+      },
+    }
+    : {};
 
   if (url.startsWith('data:')) {
     const comma = url.indexOf(',');
@@ -1493,7 +1547,6 @@ function mapLegacyFilePart(part: Record<string, any>): {
     const data = header.endsWith(';base64')
       ? Buffer.from(payload, 'base64').toString('base64')
       : Buffer.from(decodeURIComponent(payload)).toString('base64');
-    const sourceText = source?.text && typeof source.text === 'object' ? (source.text as Record<string, any>) : undefined;
     return {
       attachment: {
         data,
@@ -1502,15 +1555,7 @@ function mapLegacyFilePart(part: Record<string, any>): {
           ? { type: 'uri', uri: safeString(source.uri) }
           : { type: 'inline' },
         ...(filename ? { name: filename } : {}),
-        ...(sourceText && typeof sourceText.value === 'string'
-          ? {
-            mention: {
-              text: sourceText.value,
-              start: Number(sourceText.start ?? 0),
-              end: Number(sourceText.end ?? 0),
-            },
-          }
-          : {}),
+        ...mention,
       },
     };
   }
@@ -1518,9 +1563,61 @@ function mapLegacyFilePart(part: Record<string, any>): {
   const label = filename
     ?? (source?.type === 'resource' ? safeString(source.uri) : undefined)
     ?? (safeString(url) ?? 'attachment');
-  return {
-    unavailableText: `[Attachment unavailable after migration: ${label} (${mime})]`,
-  };
+
+  if (url.startsWith('file://')) {
+    if (!sessionDirectory) {
+      throw new Error(
+        `Cannot losslessly migrate legacy OpenCode v1 file attachment "${label}" (${mime}) without a session directory. Export via \`opencode export ${sessionId}\`.`,
+      );
+    }
+    let rawPath: string;
+    try {
+      rawPath = fileURLToPath(url);
+    } catch (error) {
+      throw new Error(
+        `Cannot losslessly migrate legacy OpenCode v1 file attachment "${label}" (${mime}): invalid file URI (${errorMessage(error)}). Export via \`opencode export ${sessionId}\`.`,
+      );
+    }
+    if (!existsSync(rawPath)) {
+      throw new Error(
+        `Cannot losslessly migrate legacy OpenCode v1 file attachment "${label}" (${mime}): source file "${rawPath}" is missing. Export via \`opencode export ${sessionId}\`.`,
+      );
+    }
+    const realRoot = realpathSync(resolve(sessionDirectory));
+    const realTarget = realpathSync(rawPath);
+    if (realTarget !== realRoot && !realTarget.startsWith(`${realRoot}${sep}`)) {
+      throw new Error(
+        `Cannot losslessly migrate legacy OpenCode v1 file attachment "${label}" (${mime}): path "${realTarget}" is outside session directory "${realRoot}". Export via \`opencode export ${sessionId}\`.`,
+      );
+    }
+    const stat = statSync(realTarget);
+    if (!stat.isFile()) {
+      throw new Error(
+        `Cannot losslessly migrate legacy OpenCode v1 file attachment "${label}" (${mime}): path "${realTarget}" is not a regular file. Export via \`opencode export ${sessionId}\`.`,
+      );
+    }
+    if (stat.size > LEGACY_IMPORT_MAX_FILE_BYTES) {
+      throw new Error(
+        `Cannot losslessly migrate legacy OpenCode v1 file attachment "${label}" (${mime}): file size ${stat.size} exceeds ${LEGACY_IMPORT_MAX_FILE_BYTES} bytes. Export via \`opencode export ${sessionId}\`.`,
+      );
+    }
+    const data = readFileSync(realTarget).toString('base64');
+    return {
+      attachment: {
+        data,
+        mime,
+        source: source?.type === 'resource' && safeString(source.uri)
+          ? { type: 'uri', uri: safeString(source.uri) }
+          : { type: 'uri', uri: url },
+        ...(filename ? { name: filename } : {}),
+        ...mention,
+      },
+    };
+  }
+
+  throw new Error(
+    `Cannot losslessly migrate legacy OpenCode v1 file attachment "${label}" (${mime}; unsupported URI scheme). Export via \`opencode export ${sessionId}\`.`,
+  );
 }
 
 function makeLegacySyntheticId(sourceId: string, usedIds: Set<string>): string {
@@ -1547,6 +1644,8 @@ function makeLegacySyntheticId(sourceId: string, usedIds: Set<string>): string {
 function buildLegacyImportMessagesFromV1Rows(
   rawMessages: Array<Record<string, any>>,
   rawParts: Array<Record<string, any>>,
+  sessionDirectory: string | undefined,
+  sessionId: string,
 ): {
   messages: Array<Record<string, unknown>>;
   latestUserAgent?: string;
@@ -1636,12 +1735,8 @@ function buildLegacyImportMessagesFromV1Rows(
         if (part.type === 'text' && !part.ignored && !part.synthetic && typeof part.text === 'string') {
           textChunks.push(part.text);
         } else if (part.type === 'file') {
-          const mapped = mapLegacyFilePart(part);
-          if (mapped.attachment) convertedAttachments.push(mapped.attachment);
-          if (mapped.unavailableText) {
-            unavailableNotices.push(mapped.unavailableText);
-            textChunks.push(mapped.unavailableText);
-          }
+          const mapped = mapLegacyFilePart(part, sessionDirectory, sessionId);
+          convertedAttachments.push(mapped.attachment);
         }
       }
       const visibleText = textChunks.join('\n\n');
@@ -1839,6 +1934,9 @@ async function readLegacySessionImportPayload(
         }
       }
 
+      const sessionScopeDirectory = safeString(sessionRow.directory) ?? directoryHint;
+      const resolvedDirectory = sessionScopeDirectory ?? process.cwd();
+
       if (messages.length === 0 && tables.has('message')) {
         const rawMessages = db.prepare(
           'SELECT id, session_id, time_created, time_updated, data FROM message WHERE session_id = ? ORDER BY time_created ASC, id ASC',
@@ -1846,13 +1944,11 @@ async function readLegacySessionImportPayload(
         const rawParts = tables.has('part')
           ? (db.prepare('SELECT id, message_id, session_id, time_created, time_updated, data FROM part WHERE session_id = ? ORDER BY id ASC').all(sessionId) as Array<Record<string, any>>)
           : [];
-        const converted = buildLegacyImportMessagesFromV1Rows(rawMessages, rawParts);
+        const converted = buildLegacyImportMessagesFromV1Rows(rawMessages, rawParts, sessionScopeDirectory, sessionId);
         messages = converted.messages;
         inferredAgent ??= converted.latestUserAgent;
         inferredModel ??= converted.latestUserModel;
       }
-
-      const resolvedDirectory = safeString(sessionRow.directory) ?? directoryHint ?? process.cwd();
       const createdAt = Number(sessionRow.time_created ?? Date.now());
       const updatedAt = Number(sessionRow.time_updated ?? createdAt);
       const archivedAt = typeof sessionRow.time_archived === 'number' ? sessionRow.time_archived : undefined;
@@ -1956,7 +2052,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   };
 
   private readonly providerConsumerId = Symbol('opencode-provider');
-  private readonly activeClientEventSubs = new Map<OpenCodeClientLike, { refCount: number; unsubscribe: () => Promise<void> }>();
+  private readonly activeClientEventSubs = new Map<OpenCodeClientLike, {
+    refCount: number;
+    readyPromise: Promise<void>;
+    unsubscribe: () => Promise<void>;
+  }>();
   private readonly seenEventIds = new Set<string>();
   private readonly hostGroupKey = randomUUID();
   private client: OpenCodeClientLike | null = null;
@@ -2128,6 +2228,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       completionEmitted: false,
       terminalErrorEmitted: false,
       authHealInFlight: false,
+      authHealPhase: 'none',
+      authHealRetryAcked: false,
+      priorAttemptAssistantIds: new Set(),
+      priorAttemptUserMessageIds: new Set(),
+      openCodeCredSwitchedDuringTurn: false,
       activeTurnParams: null,
       missingFinalRecoveryAttempted: false,
       missingFinalRecoveryInFlight: false,
@@ -2154,7 +2259,6 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       nativeAgentFence: fenceOf(nativeAgentsFenced),
     };
     this.sessions.set(routeId, state);
-    this.registerProviderRoute(providerSessionId, routeId);
     try {
       await this.syncSessionMcp(state);
     } catch (error) {
@@ -2163,6 +2267,12 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       await this.closeSessionState(state, removedSoleRoute);
       throw this.normalizeError(error, 'mcp startup');
     }
+    const previousOwnerId = this.providerToRoute.get(providerSessionId);
+    const previousOwner = previousOwnerId ? this.sessions.get(previousOwnerId) : undefined;
+    if (previousOwner && previousOwner !== state) {
+      previousOwner.syncedMcpSignature = null;
+    }
+    this.registerProviderRoute(providerSessionId, routeId);
     if (state.model || state.effort) {
       await this.syncSessionModelAndEffort(state).catch(() => {});
     }
@@ -2174,12 +2284,21 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const state = this.sessions.get(sessionId);
     if (!state) return;
     state.authHealInFlight = false;
+    state.authHealPhase = 'none';
     state.activeTurnParams = null;
     state.generation += 1;
     this.sessions.delete(state.routeId);
     const removedSoleProviderRoute = this.releaseProviderRoute(state);
     if (state.busy && removedSoleProviderRoute) {
       await state.client.session.interrupt({ sessionID: state.providerSessionId }).catch(() => {});
+    }
+    if (!removedSoleProviderRoute) {
+      const fallbackRouteId = this.providerToRoute.get(state.providerSessionId);
+      const fallbackState = fallbackRouteId ? this.sessions.get(fallbackRouteId) : undefined;
+      if (fallbackState) {
+        fallbackState.syncedMcpSignature = null;
+        await this.syncSessionMcp(fallbackState).catch(() => {});
+      }
     }
     await this.closeSessionState(state, removedSoleProviderRoute);
   }
@@ -2188,10 +2307,19 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const state = this.sessions.get(sessionId);
     if (!state) return;
     state.authHealInFlight = false;
+    state.authHealPhase = 'none';
     state.activeTurnParams = null;
     state.generation += 1;
     this.sessions.delete(state.routeId);
     const removedSoleProviderRoute = this.releaseProviderRoute(state);
+    if (!removedSoleProviderRoute) {
+      const fallbackRouteId = this.providerToRoute.get(state.providerSessionId);
+      const fallbackState = fallbackRouteId ? this.sessions.get(fallbackRouteId) : undefined;
+      if (fallbackState) {
+        fallbackState.syncedMcpSignature = null;
+        await this.syncSessionMcp(fallbackState).catch(() => {});
+      }
+    }
     await this.closeSessionState(state, removedSoleProviderRoute);
   }
 
@@ -2473,6 +2601,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state.completionEmitted = false;
     state.terminalErrorEmitted = false;
     state.authHealInFlight = false;
+    state.authHealPhase = 'none';
+    state.authHealRetryAcked = false;
+    state.priorAttemptAssistantIds.clear();
+    state.priorAttemptUserMessageIds.clear();
+    state.openCodeCredSwitchedDuringTurn = false;
     state.activeStepProviderId = undefined;
     state.activeTurnParams = null;
     state.missingFinalRecoveryAttempted = false;
@@ -2500,6 +2633,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       files,
       ...(system ? { system } : {}),
       messageId,
+      startedAt: Date.now(),
       authHealAttempted: false,
     };
     try {
@@ -2883,20 +3017,22 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   ): Promise<() => Promise<void>> {
     let entry = this.activeClientEventSubs.get(client);
     if (!entry) {
-      let unsubscribeUpstream: () => Promise<void>;
-      if (subscribeEvents) {
-        unsubscribeUpstream = await subscribeEvents(
-          this.providerConsumerId,
-          (event) => this.handleEvent(event),
-          (error) => {
-            const normalized = this.normalizeError(error, 'events');
-            for (const state of this.sessions.values()) {
-              if (!state.busy) continue;
-              this.failOnce(state, normalized);
-            }
-          },
-        );
-      } else {
+      let unsubscribeUpstream: (() => Promise<void>) | null = null;
+      const readyPromise = (async () => {
+        if (subscribeEvents) {
+          unsubscribeUpstream = await subscribeEvents(
+            this.providerConsumerId,
+            (event) => this.handleEvent(event),
+            (error) => {
+              const normalized = this.normalizeError(error, 'events');
+              for (const state of this.sessions.values()) {
+                if (!state.busy) continue;
+                this.failOnce(state, normalized);
+              }
+            },
+          );
+          return;
+        }
         const subAbort = new AbortController();
         const subscription = await client.events.subscribe({}, { signal: subAbort.signal }) as unknown as
           | AsyncIterable<Record<string, any>>
@@ -2907,27 +3043,41 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           subAbort.abort();
           await loop.catch(() => {});
         };
-      }
+      })();
       const created = {
         refCount: 0,
+        readyPromise,
         unsubscribe: async () => {
           const current = this.activeClientEventSubs.get(client);
           if (!current || current !== created) return;
           current.refCount = Math.max(0, current.refCount - 1);
           if (current.refCount > 0) return;
           this.activeClientEventSubs.delete(client);
-          await unsubscribeUpstream();
+          await created.readyPromise.catch(() => {});
+          if (unsubscribeUpstream) {
+            await unsubscribeUpstream().catch(() => {});
+          }
         },
       };
       this.activeClientEventSubs.set(client, created);
       entry = created;
     }
     entry.refCount += 1;
+    try {
+      await entry.readyPromise;
+    } catch (error) {
+      entry.refCount = Math.max(0, entry.refCount - 1);
+      if (entry.refCount === 0 && this.activeClientEventSubs.get(client) === entry) {
+        this.activeClientEventSubs.delete(client);
+      }
+      throw error;
+    }
     let released = false;
+    const activeEntry = entry;
     return async () => {
       if (released) return;
       released = true;
-      await entry!.unsubscribe();
+      await activeEntry.unsubscribe();
     };
   }
 
@@ -3051,6 +3201,17 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       this.modelCache = null;
       return;
     }
+    if (event.type === 'credential.switched' || event.type === 'credential.updated') {
+      const credData = (event.data ?? event.properties) as Record<string, any> | undefined;
+      if (safeString(credData?.integrationID) === 'opencode') {
+        for (const activeState of this.sessions.values()) {
+          if (activeState.busy && !activeState.authHealInFlight && activeState.authHealPhase === 'none') {
+            activeState.openCodeCredSwitchedDuringTurn = true;
+          }
+        }
+      }
+      return;
+    }
     const providerSessionId = sessionIdFromEvent(event);
     if (!providerSessionId) return;
     const routeId = this.providerToRoute.get(providerSessionId);
@@ -3058,20 +3219,60 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     if (!state) return;
     const data = (event.data ?? event.properties) as Record<string, any> | undefined;
     const eventMessageId = safeString(data?.inputID ?? data?.userMessageID ?? data?.promptID);
-    if (
-      eventMessageId
-      && state.deliveryMessageId
-      && eventMessageId !== state.deliveryMessageId
-      && event.type !== 'session.compaction.started'
-      && event.type !== 'session.compaction.ended'
-      && event.type !== 'session.compaction.failed'
-    ) {
-      return;
+    const eventAssistantId = safeString(data?.assistantMessageID);
+    const inboxId = safeString(data?.inboxID);
+    const isCompactionEvent = event.type === 'session.compaction.started'
+      || event.type === 'session.compaction.ended'
+      || event.type === 'session.compaction.failed';
+
+    if (!isCompactionEvent) {
+      if (eventMessageId && state.priorAttemptUserMessageIds.has(eventMessageId)) {
+        return;
+      }
+      if (eventAssistantId && state.priorAttemptAssistantIds.has(eventAssistantId)) {
+        return;
+      }
+      if (
+        eventMessageId
+        && state.deliveryMessageId
+        && eventMessageId !== state.deliveryMessageId
+      ) {
+        return;
+      }
     }
 
+    const isCorrelatedRetryEvent = () => Boolean(
+      (state.deliveryMessageId && eventMessageId === state.deliveryMessageId)
+      || (eventAssistantId && !state.priorAttemptAssistantIds.has(eventAssistantId)),
+    );
+
+    const ensureRetryReadyForContentEvent = (allowAckedGeneric = false): boolean => {
+      if (state.authHealInFlight || state.authHealPhase === 'preparing') return false;
+      if (state.authHealPhase === 'retry-dispatched') {
+        if (isCorrelatedRetryEvent() || (!eventMessageId && !eventAssistantId && (allowAckedGeneric || event.type === 'session.step.started' || event.type === 'session.text.started' || event.type === 'session.text.delta'))) {
+          state.authHealPhase = 'retry-active';
+          return true;
+        }
+        return false;
+      }
+      return true;
+    };
+
     switch (event.type) {
+      case 'session.inbox.delivered': {
+        if (
+          state.busy
+          && state.authHealPhase === 'retry-dispatched'
+          && state.deliveryMessageId
+          && (!inboxId || inboxId === state.deliveryMessageId)
+        ) {
+          state.authHealPhase = 'retry-active';
+          state.authHealInFlight = false;
+        }
+        return;
+      }
       case 'session.step.started': {
-        if (!state.busy || state.authHealInFlight) return;
+        if (!state.busy || !ensureRetryReadyForContentEvent(true)) return;
         state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
         const providerID = safeString(data?.model?.providerID);
         if (providerID) state.activeStepProviderId = providerID;
@@ -3086,14 +3287,14 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.text.started': {
-        if (!state.busy) return;
+        if (!state.busy || !ensureRetryReadyForContentEvent(true)) return;
         state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
         const key = textPartKey(data?.assistantMessageID, data?.ordinal);
         if (!state.textParts.has(key)) state.textParts.set(key, '');
         return;
       }
       case 'session.text.delta': {
-        if (!state.busy) return;
+        if (!state.busy || !ensureRetryReadyForContentEvent(true)) return;
         state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
         const key = textPartKey(data?.assistantMessageID, data?.ordinal);
         const previous = state.textParts.get(key) ?? '';
@@ -3104,7 +3305,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.text.ended': {
-        if (!state.busy) return;
+        if (!state.busy || !ensureRetryReadyForContentEvent(true)) return;
         state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
         const key = textPartKey(data?.assistantMessageID, data?.ordinal);
         if (typeof data?.text === 'string' && state.textParts.get(key) !== data.text) {
@@ -3115,19 +3316,19 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       }
       case 'session.reasoning.started':
       case 'session.reasoning.delta': {
-        if (!state.busy) return;
+        if (!state.busy || !ensureRetryReadyForContentEvent(true)) return;
         this.emitStatus(state.routeId, { status: 'thinking', label: 'OpenCode is thinking…' });
         return;
       }
       case 'session.tool.input.started': {
-        if (!state.busy) return;
+        if (!state.busy || !ensureRetryReadyForContentEvent(true)) return;
         const id = safeString(data?.id);
         const name = safeString(data?.name);
         if (id && name) state.toolNames.set(id, name);
         return;
       }
       case 'session.tool.called': {
-        if (!state.busy) return;
+        if (!state.busy || !ensureRetryReadyForContentEvent(true)) return;
         const id = safeString(data?.id) ?? randomUUID();
         const name = state.toolNames.get(id) ?? safeString(data?.name) ?? safeString(data?.native?.tool) ?? 'tool';
         state.toolNames.set(id, name);
@@ -3136,7 +3337,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.tool.success': {
-        if (!state.busy) return;
+        if (!state.busy || !ensureRetryReadyForContentEvent(true)) return;
         const id = safeString(data?.id) ?? randomUUID();
         const name = state.toolNames.get(id) ?? safeString(data?.name) ?? safeString(data?.native?.tool) ?? 'tool';
         const output = extractToolContentText(data?.content);
@@ -3150,7 +3351,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.tool.failed': {
-        if (!state.busy) return;
+        if (!state.busy || !ensureRetryReadyForContentEvent(true)) return;
         const id = safeString(data?.id) ?? randomUUID();
         const name = state.toolNames.get(id) ?? safeString(data?.name) ?? safeString(data?.native?.tool) ?? 'tool';
         const output = extractToolContentText(data?.content)
@@ -3166,12 +3367,12 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.usage.updated': {
-        if (state.authHealInFlight) return;
+        if (state.authHealInFlight || !ensureRetryReadyForContentEvent(true)) return;
         this.emitUsage(state, state.currentMessageId, data?.tokens, data?.cost, false);
         return;
       }
       case 'session.step.ended': {
-        if (state.authHealInFlight) return;
+        if (state.authHealInFlight || !ensureRetryReadyForContentEvent(true)) return;
         state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
         this.emitUsage(state, data?.assistantMessageID, data?.tokens, data?.cost, true);
         if (isTerminalFinish(data?.finish)) {
@@ -3180,34 +3381,68 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.step.failed': {
-        if (!state.authHealInFlight) {
-          state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
-          this.emitUsage(state, data?.assistantMessageID, data?.tokens, data?.cost, true);
+        if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
+        if (state.authHealPhase === 'retry-dispatched') {
+          if (isCorrelatedRetryEvent()) {
+            state.authHealPhase = 'retry-active';
+          } else {
+            void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+            return;
+          }
         }
+        state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
+        this.emitUsage(state, data?.assistantMessageID, data?.tokens, data?.cost, true);
         this.handleSessionFailure(state, data?.error, 'step');
         return;
       }
       case 'session.execution.started': {
-        if (state.busy && !state.compacting && !state.authHealInFlight) {
+        if (
+          state.authHealPhase === 'retry-dispatched'
+          && state.deliveryMessageId
+          && eventMessageId === state.deliveryMessageId
+        ) {
+          state.authHealPhase = 'retry-active';
+        }
+        if (state.busy && !state.compacting && !state.authHealInFlight && state.authHealPhase !== 'preparing') {
           this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
         }
         return;
       }
       case 'session.execution.succeeded': {
         this.stopConfirmations.complete(state);
-        // Late prompt completion frames must never settle an active manual /compact or auth-heal attempt.
-        if (state.compacting || state.authHealInFlight) return;
+        // Late prompt completion frames must never settle an active manual /compact or auth-heal preparation.
+        if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
+        if (state.authHealPhase === 'retry-dispatched') {
+          if (isCorrelatedRetryEvent()) {
+            state.authHealPhase = 'retry-active';
+          } else {
+            void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+            return;
+          }
+        }
         this.completeOnce(state, 'session.execution.succeeded');
         return;
       }
       case 'session.execution.failed': {
         this.stopConfirmations.complete(state);
+        if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
+        if (state.authHealPhase === 'retry-dispatched') {
+          if (isCorrelatedRetryEvent()) {
+            state.authHealPhase = 'retry-active';
+          } else {
+            void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+            return;
+          }
+        }
         this.handleSessionFailure(state, data?.error, 'session');
         return;
       }
       case 'session.execution.interrupted': {
         this.stopConfirmations.complete(state);
-        if (state.authHealInFlight) return;
+        if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
+        if (state.authHealPhase === 'retry-dispatched' && !isCorrelatedRetryEvent() && !state.authHealRetryAcked) {
+          return;
+        }
         if (state.busy && !state.cancelled) {
           this.failOnce(state, providerError(
             PROVIDER_ERROR_CODES.CANCELLED,
@@ -3218,7 +3453,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.retry.scheduled': {
-        if (!state.busy || state.compacting || state.authHealInFlight) return;
+        if (!state.busy || state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
+        if (state.authHealPhase === 'retry-dispatched' && isCorrelatedRetryEvent()) {
+          state.authHealPhase = 'retry-active';
+        }
         const msg = safeString(data?.error?.message) ?? `OpenCode is retrying (attempt ${data?.attempt ?? 1})…`;
         this.emitStatus(state.routeId, { status: 'retrying', label: msg });
         return;
@@ -3248,13 +3486,21 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         }
         if (status?.type === 'idle') {
           this.stopConfirmations.complete(state);
-          if (state.authHealInFlight) return;
+          if (state.authHealInFlight || state.authHealPhase === 'preparing') return;
+          if (state.authHealPhase === 'retry-dispatched') {
+            if (isCorrelatedRetryEvent()) {
+              state.authHealPhase = 'retry-active';
+            } else {
+              void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+              return;
+            }
+          }
           this.completeOnce(state, 'session.status');
           return;
         }
         // Only surface progress while a turn is live; delayed/out-of-order busy/retry
         // frames after turn settlement must not strand the footer indicator.
-        if (!state.busy || state.authHealInFlight) return;
+        if (!state.busy || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (status?.type === 'busy') this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
         else if (status?.type === 'retry') this.emitStatus(state.routeId, { status: 'retrying', label: safeString(status.message) ?? 'OpenCode is retrying…' });
         return;
@@ -3313,7 +3559,15 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       }
       case 'session.idle':
         this.stopConfirmations.complete(state);
-        if (state.compacting || state.authHealInFlight) return;
+        if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
+        if (state.authHealPhase === 'retry-dispatched') {
+          if (isCorrelatedRetryEvent()) {
+            state.authHealPhase = 'retry-active';
+          } else {
+            void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+            return;
+          }
+        }
         this.completeOnce(state, 'session.idle');
         return;
       default:
@@ -3742,9 +3996,81 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     return true;
   }
 
+  private async reconcileRetryTerminalFrame(
+    state: OpenCodeSessionState,
+    generation: number,
+    eventType: string,
+    data: Record<string, any> | undefined,
+  ): Promise<void> {
+    if (!this.isCurrent(state, generation) || state.cancelled || state.authHealPhase !== 'retry-dispatched') return;
+    const retryMessageId = state.deliveryMessageId;
+    let items: Array<Record<string, any>> = [];
+    try {
+      const res = await withOpenCodeRequestTimeout(
+        state.client.message.list({ sessionID: state.providerSessionId, limit: 20, order: 'desc' }),
+        'auth-heal retry terminal reconciliation',
+      );
+      items = Array.isArray(res?.data) ? (res.data as Array<Record<string, any>>) : [];
+    } catch {
+      items = [];
+    }
+    if (!this.isCurrent(state, generation) || state.cancelled || state.authHealPhase !== 'retry-dispatched') return;
+
+    if (items.length > 0) {
+      const retryUserIdx = retryMessageId
+        ? items.findIndex((item) => item?.id === retryMessageId && item?.type === 'user')
+        : -1;
+      const candidatePool = retryUserIdx >= 0 ? items.slice(0, retryUserIdx) : items;
+      const terminalAssistant = candidatePool.find((item) => {
+        if (!isTerminalAssistantMessage(item)) return false;
+        const assistantId = safeString(item.id);
+        const parentId = safeString(item.parentID);
+        if (assistantId && state.priorAttemptAssistantIds.has(assistantId)) return false;
+        if (parentId && state.priorAttemptUserMessageIds.has(parentId)) return false;
+        if (retryMessageId && parentId && parentId !== retryMessageId) return false;
+        return retryUserIdx >= 0 || (retryMessageId !== null && parentId === retryMessageId);
+      });
+      if (!terminalAssistant) {
+        // Stale Attempt-1 terminal frame arrived before Retry produced a terminal assistant reply.
+        return;
+      }
+      state.authHealPhase = 'retry-active';
+      state.authHealInFlight = false;
+      if (terminalAssistant.error) {
+        this.handleSessionFailure(
+          state,
+          terminalAssistant.error,
+          eventType === 'session.step.failed' ? 'step' : 'session',
+        );
+        return;
+      }
+      this.processAssistantMessageRecord(state, terminalAssistant);
+      this.completeOnce(state, eventType);
+      return;
+    }
+
+    if (!state.authHealRetryAcked) {
+      // Uncorrelated pre-ACK terminal frame with no server message evidence is stale Attempt-1 noise.
+      return;
+    }
+    state.authHealPhase = 'retry-active';
+    state.authHealInFlight = false;
+    if (eventType === 'session.step.failed') {
+      state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
+      this.emitUsage(state, data?.assistantMessageID, data?.tokens, data?.cost, true);
+      this.handleSessionFailure(state, data?.error, 'step');
+      return;
+    }
+    if (eventType === 'session.execution.failed') {
+      this.handleSessionFailure(state, data?.error, 'session');
+      return;
+    }
+    this.completeOnce(state, eventType);
+  }
+
   private handleSessionFailure(state: OpenCodeSessionState, rawError: unknown, operation: string): void {
     if (!state.busy || state.completionEmitted || state.terminalErrorEmitted || state.cancelled) return;
-    if (state.authHealInFlight) return;
+    if (state.authHealInFlight || state.authHealPhase === 'preparing') return;
     const sessionProviderId = state.activeStepProviderId
       ?? parseModelIdentity(state.model)?.providerID
       ?? parseModelIdentity(this.modelCache?.value.defaultModel)?.providerID;
@@ -3756,6 +4082,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     ) {
       if (!turnParams.authHealAttempted) {
         state.authHealInFlight = true;
+        state.authHealPhase = 'preparing';
+        state.authHealRetryAcked = false;
+        state.priorAttemptUserMessageIds.add(turnParams.messageId);
+        if (state.currentMessageId) state.priorAttemptAssistantIds.add(state.currentMessageId);
         turnParams.authHealAttempted = true;
         const healGeneration = ++state.generation;
         turnParams.generation = healGeneration;
@@ -3784,6 +4114,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const aborted = () => !this.isCurrent(state, healGeneration) || state.cancelled;
     if (!params || aborted()) {
       state.authHealInFlight = false;
+      state.authHealPhase = 'none';
       return;
     }
     try {
@@ -3792,22 +4123,46 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         label: 'Expired OpenCode key detected; clearing credential and retrying…',
       });
       const credentialApi = state.client.credential ?? this.client?.credential;
+      let clearedStoredCred = false;
+      let preservedNewerCred = state.openCodeCredSwitchedDuringTurn;
       if (credentialApi?.list && credentialApi?.remove) {
         const creds = await credentialApi.list();
         if (aborted()) return;
         const explicitCredId = errorExplicitCredentialId(rawError);
         const opencodeCreds = creds.filter((cred) => cred?.integrationID === 'opencode' && safeString(cred.id));
-        const targets = explicitCredId
+        const candidates = explicitCredId
           ? opencodeCreds.filter((cred) => cred.id === explicitCredId)
           : (() => {
             const activeCreds = opencodeCreds.filter((cred) => cred.active === true);
             if (activeCreds.length > 0) return activeCreds;
             return opencodeCreds.length === 1 && opencodeCreds[0]?.active !== false ? opencodeCreds : [];
           })();
+        const targets = explicitCredId
+          ? candidates
+          : candidates.filter((cred) => {
+            if (state.openCodeCredSwitchedDuringTurn) {
+              preservedNewerCred = true;
+              return false;
+            }
+            const rec = cred as Record<string, any>;
+            const rawTs = positiveNumber(rec.time?.updated ?? rec.time?.created ?? rec.updatedAt ?? rec.createdAt);
+            const credTs = rawTs !== undefined && rawTs < 1e12 ? rawTs * 1000 : rawTs;
+            if (credTs !== undefined && credTs > params.startedAt) {
+              preservedNewerCred = true;
+              return false;
+            }
+            return true;
+          });
         for (const cred of targets) {
           await credentialApi.remove({ credentialID: cred.id });
+          clearedStoredCred = true;
           if (aborted()) return;
         }
+      }
+      if (!clearedStoredCred && !preservedNewerCred && safeString(process.env.OPENCODE_API_KEY)) {
+        throw new Error(
+          'OPENCODE_API_KEY is active in the environment and cannot be attributed to a clearable stored opencode credential; stored backup credentials were preserved',
+        );
       }
       this.modelCache = null;
       const refreshed = await this.listModels(true);
@@ -3844,6 +4199,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       await this.applySystemInstruction(state, params.system);
       if (aborted()) return;
       this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
+      state.authHealPhase = 'retry-dispatched';
+      state.authHealRetryAcked = false;
+      state.authHealInFlight = false;
       await state.client.sessions.prompt({
         sessionID: state.providerSessionId,
         id: retryMessageId,
@@ -3851,9 +4209,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         ...(params.files.length > 0 ? { files: params.files } : {}),
       });
       if (aborted()) return;
-      state.authHealInFlight = false;
+      state.authHealRetryAcked = true;
     } catch (healError) {
       state.authHealInFlight = false;
+      state.authHealPhase = 'none';
       if (aborted()) return;
       this.failOnce(
         state,
