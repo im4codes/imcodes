@@ -245,8 +245,10 @@ describe('update manager', () => {
 
     const pbxproj = readFileSync(join(WEB_ROOT, 'ios/App/App.xcodeproj/project.pbxproj'), 'utf8');
     // App, ShareActionExtension, ShareExtension, IMCodesWatch, and BackgroundAssetsExtension each have Debug and Release configurations.
-    expect(pbxproj.match(/CURRENT_PROJECT_VERSION = 1\.3;/g)).toHaveLength(10);
-    expect(pbxproj.match(/MARKETING_VERSION = 1\.3;/g)).toHaveLength(10);
+    expect(pbxproj.match(/CURRENT_PROJECT_VERSION = 1\.4;/g)).toHaveLength(10);
+    expect(pbxproj.match(/MARKETING_VERSION = 1\.4;/g)).toHaveLength(10);
+    expect(pbxproj).not.toContain('CURRENT_PROJECT_VERSION = 1.3;');
+    expect(pbxproj).not.toContain('MARKETING_VERSION = 1.3;');
     expect(pbxproj).not.toContain('CURRENT_PROJECT_VERSION = 1.2;');
     expect(pbxproj).not.toContain('MARKETING_VERSION = 1.2;');
     expect(pbxproj).not.toContain('CURRENT_PROJECT_VERSION = 1.1;');

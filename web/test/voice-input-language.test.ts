@@ -292,7 +292,7 @@ describe('iOS localized Action extension and shared Inbox handoff', () => {
     const project = read('../ios/App/App.xcodeproj/project.pbxproj');
     const ids = [...project.matchAll(/^\s*([A-F0-9]{24}) \/\*.*?\*\/ = \{/gm)].map(match => match[1]);
     expect(new Set(ids).size).toBe(ids.length);
-    for (const text of ['ShareActionExtension.appex', 'com.apple.product-type.app-extension', 'Embed App Extensions', 'dstSubfolderSpec = 13', 'com.im.codes.ShareAction', 'APPLICATION_EXTENSION_API_ONLY = YES', 'ShareActionExtension/ShareActionExtension.entitlements', 'PRODUCT_BUNDLE_IDENTIFIER = com.im.codes.ShareAction', 'MARKETING_VERSION = 1.3']) expect(project).toContain(text);
+    for (const text of ['ShareActionExtension.appex', 'com.apple.product-type.app-extension', 'Embed App Extensions', 'dstSubfolderSpec = 13', 'com.im.codes.ShareAction', 'APPLICATION_EXTENSION_API_ONLY = YES', 'ShareActionExtension/ShareActionExtension.entitlements', 'PRODUCT_BUNDLE_IDENTIFIER = com.im.codes.ShareAction', 'MARKETING_VERSION = 1.4']) expect(project).toContain(text);
     const extension = read('../ios/App/ShareActionExtension/ShareActionViewController.swift');
     expect(extension).toContain('loadFileRepresentation'); expect(extension).toContain('copyItem(at: source');
     expect(extension).toContain('moveItem(at: staging'); expect(extension).toContain('UNUserNotificationCenter.current()');
