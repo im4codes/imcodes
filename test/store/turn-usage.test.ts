@@ -441,15 +441,13 @@ describe('turn usage server sync metadata', () => {
 
     const prepareSpy = vi.spyOn(DatabaseSync.prototype, 'prepare');
     try {
-      // Cold check after external commit verifies counts once and warms the cache.
+      // Cold check after external commit verifies gap once via LEFT JOIN (zero COUNT(*) scans) and warms the cache.
       expect(selectTurnUsageSyncBatch({ limit: 50, now: 10_000 })).toEqual([]);
-      const coldCountQueries = prepareSpy.mock.calls.filter(
-        ([sql]) => typeof sql === 'string' && sql.includes('SELECT COUNT(*)'),
-      );
-      expect(coldCountQueries).toHaveLength(2);
+      expect(prepareSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('SELECT COUNT(*)'))).toHaveLength(0);
+      expect(prepareSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('LEFT JOIN context_turn_usage_sync'))).toHaveLength(1);
 
       prepareSpy.mockClear();
-      // Subsequent steady-state polls and same-connection atomic writes skip COUNT(*) completely.
+      // Subsequent steady-state polls and same-connection atomic writes skip both COUNT(*) and LEFT JOIN scans completely.
       recordTurnUsage({
         sessionName: 'steady',
         model: 'gpt-5',
@@ -467,13 +465,49 @@ describe('turn usage server sync metadata', () => {
       });
       expect(selectTurnUsageSyncBatch({ limit: 50, now: 20_100 })).toEqual([]);
 
-      const warmCountQueries = prepareSpy.mock.calls.filter(
-        ([sql]) => typeof sql === 'string' && sql.includes('SELECT COUNT(*)'),
-      );
-      expect(warmCountQueries).toHaveLength(0);
+      expect(prepareSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('SELECT COUNT(*)'))).toHaveLength(0);
+      expect(prepareSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('LEFT JOIN context_turn_usage_sync'))).toHaveLength(0);
     } finally {
       prepareSpy.mockRestore();
     }
+  });
+
+  it('recovers missing usage rows when an external connection leaves orphan sync rows with foreign_keys=OFF (warm cache and after reopen)', () => {
+    const dbPath = join(tempDir, 'context.sqlite');
+    for (const evt of ['id-1', 'id-2', 'id-3', 'id-4']) {
+      recordTurnUsage({ sessionName: 's', model: 'm', inputTokens: 1, outputTokens: 1, eventId: evt, createdAt: 100 });
+    }
+    const seedBatch = selectTurnUsageSyncBatch({ limit: 10, now: 100 });
+    recordTurnUsageSyncResults({
+      now: 100,
+      results: seedBatch.map((row) => ({ usageFactId: row.usageFactId, status: 'accepted' })),
+    });
+    // Warm the steady-state cache: usage [1,2,3,4], sync [1,2,3,4].
+    expect(selectTurnUsageSyncBatch({ limit: 10, now: 200 })).toEqual([]);
+
+    // External connection with foreign_keys=OFF creates usage=[2,3,4], sync=[1,3,4]:
+    // row 1 in sync is an orphan, row 2 in usage lacks sync, counts are equal (3 === 3), newest row 4 has sync.
+    const ext = new DatabaseSync(dbPath);
+    ext.exec('PRAGMA foreign_keys = OFF; BEGIN;');
+    ext.exec('DELETE FROM context_turn_usage WHERE id = 1;');
+    ext.exec('DELETE FROM context_turn_usage_sync WHERE turn_usage_rowid = 2;');
+    ext.exec('COMMIT;');
+    ext.close();
+
+    // 1) Warm cache invalidated via PRAGMA data_version -> direct LEFT JOIN probe finds and restores id=2.
+    const warmRecovered = selectTurnUsageSyncBatch({ limit: 10, now: 300 });
+    expect(warmRecovered.map((r) => r.turnUsageRowid)).toEqual([2]);
+    expect(warmRecovered[0].fact.sourceEventId).toBe('id-2');
+
+    // 2) Reproduce the exact same [2,3,4] vs [1,3,4] skewed state across DB close/reopen (cold start).
+    const extReopen = new DatabaseSync(dbPath);
+    extReopen.exec('PRAGMA foreign_keys = OFF; DELETE FROM context_turn_usage_sync WHERE turn_usage_rowid = 2;');
+    extReopen.close();
+    resetContextStoreForTests();
+
+    const reopenRecovered = selectTurnUsageSyncBatch({ limit: 10, now: 400 });
+    expect(reopenRecovered.map((r) => r.turnUsageRowid)).toEqual([2]);
+    expect(reopenRecovered[0].fact.sourceEventId).toBe('id-2');
   });
 
   it('invalidates warm cache via PRAGMA data_version when an external connection inserts an orphan before a higher synced row', () => {

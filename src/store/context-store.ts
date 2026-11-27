@@ -2554,31 +2554,20 @@ export function backfillTurnUsageSyncMetadata(limit = 500): { backfilled: number
   }
   const cached = turnUsageSyncBackfillState.get(database);
   const existingSync = database.prepare('SELECT turn_usage_rowid FROM context_turn_usage_sync WHERE turn_usage_rowid = ?').get(newestUsage.id);
-  if (existingSync) {
-    if (cached?.complete && cached.dataVersion === currentDataVersion) {
-      if (newestUsage.id !== cached.maxUsageId) {
-        turnUsageSyncBackfillState.set(database, {
-          complete: true,
-          maxUsageId: newestUsage.id,
-          dataVersion: currentDataVersion,
-        });
-      }
-      return { backfilled: 0 };
-    }
-    const uCount = (database.prepare('SELECT COUNT(*) as c FROM context_turn_usage').get() as { c: number }).c;
-    const sCount = (database.prepare('SELECT COUNT(*) as c FROM context_turn_usage_sync').get() as { c: number }).c;
-    if (uCount === sCount) {
+  if (existingSync && cached?.complete && cached.dataVersion === currentDataVersion) {
+    if (newestUsage.id !== cached.maxUsageId) {
       turnUsageSyncBackfillState.set(database, {
         complete: true,
         maxUsageId: newestUsage.id,
         dataVersion: currentDataVersion,
       });
-      return { backfilled: 0 };
     }
-    turnUsageSyncBackfillState.delete(database);
-  } else {
-    turnUsageSyncBackfillState.delete(database);
+    return { backfilled: 0 };
   }
+  // Cold start, PRAGMA data_version change, or missing newest sync: clear any stale
+  // complete mark and directly probe for actual missing usage rows (never rely on
+  // COUNT(*) equality, which can be masked by orphan sync rows when foreign_keys=OFF).
+  turnUsageSyncBackfillState.delete(database);
   const boundedLimit = Math.max(1, Math.min(5000, Math.trunc(limit)));
   const rows = database.prepare(`
     SELECT u.id

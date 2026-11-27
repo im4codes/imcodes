@@ -227,6 +227,7 @@ describe('timeline projection worker contract', () => {
       type: 'pruneSessionToAuthoritative',
       payload: { sessionId: sessionA, keepLast: 5 },
     })).ok).toBe(true);
+    expect((await request({ id: 'ckpt-prune', type: 'checkpointIfNeeded', payload: {} })).ok).toBe(true);
 
     const afterPruneDb = new DatabaseSync(dbPath, { readOnly: true });
     const freelistAfterPrune = Number((afterPruneDb.prepare('PRAGMA freelist_count').get() as { freelist_count: number | bigint }).freelist_count);
@@ -236,12 +237,85 @@ describe('timeline projection worker contract', () => {
     expect(sizeAfterPrune).toBeLessThan(sizeBeforePrune);
 
     expect((await request({ id: 'del-b', type: 'deleteSession', payload: { sessionId: sessionB } })).ok).toBe(true);
+    expect((await request({ id: 'ckpt-del', type: 'checkpointIfNeeded', payload: {} })).ok).toBe(true);
     const afterDeleteDb = new DatabaseSync(dbPath, { readOnly: true });
     const freelistAfterDelete = Number((afterDeleteDb.prepare('PRAGMA freelist_count').get() as { freelist_count: number | bigint }).freelist_count);
     afterDeleteDb.close();
     const sizeAfterDelete = statSync(dbPath).size;
     expect(freelistAfterDelete).toBeLessThan(64);
     expect(sizeAfterDelete).toBeLessThan(sizeAfterPrune);
+  });
+
+  it('does not run over-budget synchronous WAL checkpoints while a reader holds a large WAL, then shrinks on maintenance', async () => {
+    const configPath = join(tmpdir(), `imcodes-ret-large-wal-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+    const dayMs = HISTORY_RETENTION.dayMs;
+    const enabledAt = Date.now() - 2 * dayMs;
+    writeFileSync(configPath, JSON.stringify({ keepDays: 1, enabledAt }));
+    try {
+      const { request, dbPath } = await loadWorker({
+        retention: { configPath, dayMs, maxDays: HISTORY_RETENTION.maxDays, retryMs: 60_000, batchSize: 500 },
+      });
+      // Ensure schema & wal_autocheckpoint=0 are initialized.
+      expect((await request({ id: 'init', type: 'queryHistory', payload: { sessionId: 'none', limit: 1 } })).ok).toBe(true);
+
+      const bigText = 'backlog-'.repeat(180);
+      const nowMs = Date.now();
+      const oldTs = enabledAt - 10 * dayMs;
+      const freshTs = nowMs + 10 * dayMs;
+      const seeder = new DatabaseSync(dbPath);
+      seeder.exec('PRAGMA wal_autocheckpoint = 0;');
+      const insert = seeder.prepare(`INSERT INTO timeline_projection_events
+        (session_id, append_ordinal, event_id, ts, seq, epoch, type, source, confidence, text, payload_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 1, 'assistant.text', 'daemon', 'high', ?, ?, ?, ?)`);
+      seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_del', 1200, 0, 0, 1, 'ready', NULL)`).run();
+      seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_ret', 1200, 0, 0, 1, 'ready', NULL)`).run();
+      seeder.exec('BEGIN');
+      for (let i = 1; i <= 1200; i += 1) {
+        insert.run('s_del', i, `del-${i}`, freshTs + i, i, bigText, JSON.stringify({ text: bigText }), freshTs + i, freshTs + i);
+        insert.run('s_ret', i, `ret-${i}`, oldTs + i, i, bigText, JSON.stringify({ text: bigText }), oldTs + i, oldTs + i);
+      }
+      seeder.exec('COMMIT');
+      seeder.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      const dbSizeBaseline = statSync(dbPath).size;
+
+      // Build a large >1500-frame WAL backlog while holding an active reader snapshot.
+      const reader = new DatabaseSync(dbPath, { readOnly: true });
+      reader.exec('BEGIN; SELECT count(*) FROM timeline_projection_events;');
+      seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_wal', 1500, 0, 0, 1, 'ready', NULL)`).run();
+      seeder.exec('BEGIN');
+      for (let i = 1; i <= 1500; i += 1) {
+        insert.run('s_wal', i, `wal-${i}`, freshTs + 10_000 + i, i, bigText, JSON.stringify({ text: bigText }), freshTs + i, freshTs + i);
+      }
+      seeder.exec('COMMIT');
+      seeder.close();
+
+      const walPath = `${dbPath}-wal`;
+      const walBytesBeforeCleanup = statSync(walPath).size;
+      expect(walBytesBeforeCleanup).toBeGreaterThan(1500 * 4096);
+
+      // Cleanup requests (deleteSession + retentionTick) must NOT copy/truncate the large WAL while reader holds snapshot.
+      expect((await request({ id: 'del-large', type: 'deleteSession', payload: { sessionId: 's_del' } })).ok).toBe(true);
+      expect(statSync(walPath).size).toBeGreaterThanOrEqual(walBytesBeforeCleanup);
+
+      const retRes = await request({ id: 'tick-large', type: 'retentionTick', payload: { now: nowMs + dayMs } });
+      expect(retRes.ok).toBe(true);
+      expect((retRes.result as { deleted: number }).deleted).toBe(1200);
+      expect(statSync(walPath).size).toBeGreaterThanOrEqual(walBytesBeforeCleanup);
+
+      // Release reader snapshot, then run another prune step: worker wal_autocheckpoint=0 and small-WAL guard
+      // must STILL avoid an unbudgeted inline checkpoint until explicit maintenance runs.
+      reader.exec('COMMIT');
+      reader.close();
+      expect((await request({ id: 'prune-wal', type: 'pruneSessionToAuthoritative', payload: { sessionId: 's_wal', keepLast: 10 } })).ok).toBe(true);
+      expect(statSync(walPath).size).toBeGreaterThanOrEqual(walBytesBeforeCleanup);
+
+      // Now run explicit maintenance path (`checkpointIfNeeded`): WAL truncates and main DB shrinks on disk.
+      expect((await request({ id: 'maint-ckpt', type: 'checkpointIfNeeded', payload: {} })).ok).toBe(true);
+      expect(statSync(walPath).size).toBe(0);
+      expect(statSync(dbPath).size).toBeLessThan(dbSizeBaseline);
+    } finally {
+      rmSync(configPath, { force: true });
+    }
   });
 
   it('reclaims space after retentionTick and tolerates busy locks without blocking readers', async () => {
@@ -272,6 +346,7 @@ describe('timeline projection worker contract', () => {
       const retRes = await request({ id: 'tick', type: 'retentionTick', payload: { now: Date.now() + dayMs } });
       expect(retRes.ok).toBe(true);
       expect((retRes.result as { deleted: number }).deleted).toBe(700);
+      expect((await request({ id: 'ckpt-ret', type: 'checkpointIfNeeded', payload: {} })).ok).toBe(true);
       const sizeAfterRetention = statSync(dbPath).size;
       expect(sizeAfterRetention).toBeLessThan(sizeBeforeRetention);
 

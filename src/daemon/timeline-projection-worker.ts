@@ -27,6 +27,7 @@ const WORKER_BUSY_TIMEOUT_MS = 5000;
 const INCREMENTAL_VACUUM_MIN_FREELIST_PAGES = 64;
 const INCREMENTAL_VACUUM_MAX_PAGES = 512;
 const INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS = 50;
+const SMALL_WAL_CHECKPOINT_MAX_FRAMES = 512;
 // The worker entry must not import local modules (it loads as raw .ts without a `.js` resolver), so it cannot ask the state-dir
 // resolver itself: the client resolves the paths once and hands them over. There is deliberately no homedir() guess here — a worker
 // that guessed would open the real ~/.imcodes for a scoped daemon.
@@ -78,6 +79,10 @@ function ensureDb(): DatabaseSyncInstance {
   instance.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
+    -- Keep WAL autocheckpoint disabled so SQLite never triggers an unbounded
+    -- synchronous checkpoint inside bounded delete/prune/retention/vacuum steps.
+    -- Explicit maintenance (maybeCheckpoint / checkpointIfNeeded) owns full checkpoints.
+    PRAGMA wal_autocheckpoint = 0;
     -- Without busy_timeout, any lock contention (e.g. a read worker holding a
     -- shared lock while this writer checkpoints the 500MB+ WAL) surfaces as an
     -- immediate SQLITE_BUSY throw. That throw bubbles up as projection_unavailable
@@ -475,6 +480,22 @@ function rowToEvent(row: Record<string, unknown>): TimelineEvent {
   };
 }
 
+function estimateWalFrames(database: DatabaseSyncInstance): number {
+  const walPath = `${dbPath}-wal`;
+  if (!existsSync(walPath)) return 0;
+  try {
+    const walBytes = statSync(walPath).size;
+    if (walBytes <= 32) return 0;
+    const pageSize = Number(
+      (database.prepare('PRAGMA page_size').get() as { page_size: number | bigint }).page_size,
+    );
+    const frameSize = (Number.isFinite(pageSize) && pageSize > 0 ? pageSize : 4096) + 24;
+    return Math.floor((walBytes - 32) / frameSize);
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
 function maybeCheckpoint(): void {
   if (writesSinceCheckpoint < 256) return;
   writesSinceCheckpoint = 0;
@@ -484,12 +505,13 @@ function maybeCheckpoint(): void {
 /**
  * Best-effort bounded incremental vacuum for auto_vacuum=INCREMENTAL databases.
  * Leaves legacy auto_vacuum=0 databases untouched and drops out cleanly on lock contention.
+ * Never checkpoints a large backlog WAL synchronously inside the worker step.
  */
 export function maybeIncrementalVacuum(
   database: DatabaseSyncInstance,
   maxPages = INCREMENTAL_VACUUM_MAX_PAGES,
   minFreelistPages = INCREMENTAL_VACUUM_MIN_FREELIST_PAGES,
-): { vacuumed: boolean; freelistBefore: number; freelistAfter: number } {
+): { vacuumed: boolean; freelistBefore: number; freelistAfter: number; checkpointSkipped?: boolean } {
   const autoVacuum = Number(
     (database.prepare('PRAGMA auto_vacuum').get() as { auto_vacuum: number | bigint }).auto_vacuum,
   );
@@ -505,12 +527,17 @@ export function maybeIncrementalVacuum(
   const boundedMaxPages = Math.max(1, Math.trunc(maxPages));
   database.exec(`PRAGMA busy_timeout = ${INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS}`);
   let vacuumed = false;
+  let checkpointSkipped = false;
   try {
     database.exec(`PRAGMA incremental_vacuum(${boundedMaxPages});`);
     vacuumed = true;
-    // In WAL mode, main database file truncation only lands on disk after a checkpoint;
-    // PASSIVE never blocks concurrent WAL readers.
-    database.exec('PRAGMA wal_checkpoint(PASSIVE);');
+    // Only checkpoint inline when WAL pending frames are within the small budget;
+    // large backlog WALs defer to the independent checkpointIfNeeded maintenance path.
+    if (estimateWalFrames(database) <= SMALL_WAL_CHECKPOINT_MAX_FRAMES) {
+      database.exec('PRAGMA wal_checkpoint(PASSIVE);');
+    } else {
+      checkpointSkipped = true;
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (!/locked|busy/i.test(msg)) {
@@ -526,7 +553,7 @@ export function maybeIncrementalVacuum(
   const freelistAfter = Number(
     (database.prepare('PRAGMA freelist_count').get() as { freelist_count: number | bigint }).freelist_count,
   );
-  return { vacuumed, freelistBefore, freelistAfter };
+  return { vacuumed, freelistBefore, freelistAfter, ...(checkpointSkipped ? { checkpointSkipped: true } : {}) };
 }
 
 async function handleRecordAppendedEvent(event: TimelineEvent): Promise<boolean> {
@@ -700,7 +727,6 @@ async function handlePruneSessionToAuthoritative(sessionId: string, keepLast: nu
   }
   writesSinceCheckpoint += 1;
   maybeIncrementalVacuum(database);
-  maybeCheckpoint();
   return true;
 }
 
@@ -709,12 +735,15 @@ async function handleDeleteSession(sessionId: string): Promise<boolean> {
   deleteSessionRows(sessionId);
   writesSinceCheckpoint += 1;
   maybeIncrementalVacuum(database);
-  maybeCheckpoint();
   return true;
 }
 
 async function handleCheckpointIfNeeded(): Promise<boolean> {
-  maybeCheckpoint();
+  const database = ensureDb();
+  if (writesSinceCheckpoint > 0 || estimateWalFrames(database) > 0) {
+    writesSinceCheckpoint = 0;
+    database.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+  }
   return true;
 }
 
@@ -809,19 +838,14 @@ async function runRetention(now = Date.now()): Promise<Record<string, unknown>> 
       runs = runs + 1, last_error = NULL WHERE id = 1`).run(now, nextHistoryCleanupAt(now)));
     for (let step = 0; step < 32 && stillCurrent(); step += 1) {
       const vac = maybeIncrementalVacuum(database);
+      if (vac.vacuumed) {
+        writesSinceCheckpoint += 1;
+      }
       if (!vac.vacuumed || vac.freelistAfter < INCREMENTAL_VACUUM_MIN_FREELIST_PAGES || vac.freelistAfter >= vac.freelistBefore) {
         break;
       }
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    retentionWrite(() => {
-      try {
-        database.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (!/locked|busy/i.test(msg)) throw err;
-      }
-    });
     return retentionState();
   } catch (err) {
     retentionRetryAfter = now + retention.retryMs;
