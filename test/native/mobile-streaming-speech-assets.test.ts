@@ -3856,9 +3856,94 @@ do {
     realEngine.requestStop(abort: false, producerAlsoFinished: true)
     check(doneReal.wait(timeout: .now() + 5) == .success, "case 6e done")
     check((realEmitted.last?["text"] as? String) == "打开 IM.codes" && (realEmitted.last?["isFinal"] as? Bool) == true, "case 6e failed: \\(realEmitted)")
+
+    // 6f (Round 2 P0 #1 counterexample): streaming gets trusted text "今天完成文档",
+    // whole-utterance final returns isolated single hotword "IM.codes" -> MUST keep "今天完成文档"!
+    do {
+        var guardEmitted: [[String: Any]] = []
+        var guardPass = 0
+        let guardSem = DispatchSemaphore(value: 0)
+        let doneGuard = DispatchSemaphore(value: 0)
+        let guardEngine = QwenSegmentedDecodeEngine(
+            initialStrideSamples: 16_000,
+            strideSamples: 16_000,
+            maxSegmentSamples: 40_000,
+            maxFinalReDecodeSamples: 48_000,
+            expectLanguageHeader: false,
+            hotwordTerms: ["IM.codes"],
+            decodeFn: { _, _, _ in
+                guardPass += 1
+                if guardPass == 1 { return QwenSegmentedDecodeResult(text: "今天完成文档", tokens: [1, 2, 3]) }
+                return QwenSegmentedDecodeResult(text: "IM.codes", tokens: [4])
+            },
+            rollbackPrefixFn: { t, _, _ in t },
+            emitJsonFn: { payload in
+                guardEmitted.append(payload)
+                if (payload["isFinal"] as? Bool) == false && (payload["text"] as? String) == "今天完成文档" {
+                    guardSem.signal()
+                }
+            },
+            onLoopFinishedFn: { doneGuard.signal() }
+        )
+        DispatchQueue.global(qos: .userInitiated).async { guardEngine.runLoop() }
+        check(guardEngine.enqueue([Float](repeating: 0.15, count: 32_000)), "case 6f enqueue")
+        check(guardSem.wait(timeout: .now() + 5) == .success, "case 6f stream wait")
+        guardEngine.requestStop(abort: false, producerAlsoFinished: true)
+        check(doneGuard.wait(timeout: .now() + 5) == .success, "case 6f done")
+        let finals = guardEmitted.filter { ($0["isFinal"] as? Bool) == true }
+        check(finals.count == 1 && (finals[0]["text"] as? String) == "今天完成文档", "case 6f overwrote trusted text: \\(guardEmitted)")
+    }
+
+    // 6g (Round 2 P0 #1 committed-segment variants): committed "今天完成" (+ optional trailing "文档")
+    // <=cap whole-utterance final returning "IM.codes" preserves trusted text, while real "今天完成 IM.codes 文档" updates!
+    for (label, trailLen, finalReturn, expectedFinal) in [
+        ("committed-only-kept", 0, "IM.codes", "今天完成"),
+        ("committed+tail-kept", 8_000, "IM.codes", "今天完成文档"),
+        ("real-sentence-updates", 8_000, "今天完成 IM.codes 文档", "今天完成 IM.codes 文档"),
+    ] {
+        var varEmitted: [[String: Any]] = []
+        var varPass = 0
+        let commitSem = DispatchSemaphore(value: 0)
+        let tailSem = DispatchSemaphore(value: 0)
+        let doneVar = DispatchSemaphore(value: 0)
+        let varEngine = QwenSegmentedDecodeEngine(
+            initialStrideSamples: 8_000,
+            strideSamples: 8_000,
+            maxSegmentSamples: 16_000,
+            maxFinalReDecodeSamples: 48_000,
+            expectLanguageHeader: false,
+            hotwordTerms: ["IM.codes"],
+            decodeFn: { samples, _, _ in
+                varPass += 1
+                if samples.count == 16_000 { return QwenSegmentedDecodeResult(text: "今天完成", tokens: [1, 2]) }
+                if trailLen > 0 && samples.count == trailLen { return QwenSegmentedDecodeResult(text: "文档", tokens: [3]) }
+                return QwenSegmentedDecodeResult(text: finalReturn, tokens: [4, 5])
+            },
+            rollbackPrefixFn: { t, _, _ in t },
+            emitJsonFn: { payload in
+                varEmitted.append(payload)
+                let txt = payload["text"] as? String
+                let isF = (payload["isFinal"] as? Bool) ?? false
+                if !isF && txt == "今天完成" { commitSem.signal() }
+                if !isF && txt == "今天完成文档" { tailSem.signal() }
+            },
+            onLoopFinishedFn: { doneVar.signal() }
+        )
+        DispatchQueue.global(qos: .userInitiated).async { varEngine.runLoop() }
+        check(varEngine.enqueue([Float](repeating: 0.15, count: 16_000)), "case 6g \\(label) seg1")
+        check(commitSem.wait(timeout: .now() + 5) == .success, "case 6g \\(label) commitSem")
+        if trailLen > 0 {
+            check(varEngine.enqueue([Float](repeating: 0.15, count: trailLen)), "case 6g \\(label) seg2")
+            check(tailSem.wait(timeout: .now() + 5) == .success, "case 6g \\(label) tailSem")
+        }
+        varEngine.requestStop(abort: false, producerAlsoFinished: true)
+        check(doneVar.wait(timeout: .now() + 5) == .success, "case 6g \\(label) done")
+        let finals = varEmitted.filter { ($0["isFinal"] as? Bool) == true }
+        check(finals.count == 1 && (finals[0]["text"] as? String) == expectedFinal, "case 6g \\(label) mismatch: \\(varEmitted)")
+    }
 }
 
-// 7. Abort rejects new samples and never emits isFinal=true (even if abort happens during final re-decode).
+// 7. Abort rejects new samples and never emits isFinal=true (both before loop start AND during blocked final re-decode).
 do {
     var emitted: [[String: Any]] = []
     let engine = QwenSegmentedDecodeEngine(
@@ -3875,6 +3960,35 @@ do {
     engine.requestStop(abort: true, producerAlsoFinished: true)
     engine.runLoop()
     check(!emitted.contains { ($0["isFinal"] as? Bool) == true }, "abort emitted isFinal")
+
+    // 7b: abort arrives while decodeFn is blocked inside in-flight final pass (even if decodeFn returns non-empty without throwing)
+    var inflightEmitted: [[String: Any]] = []
+    let enteredFinalDecode = DispatchSemaphore(value: 0)
+    let releaseFinalDecode = DispatchSemaphore(value: 0)
+    let doneInflight = DispatchSemaphore(value: 0)
+    let inflightEngine = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 8,
+        strideSamples: 8,
+        maxSegmentSamples: 100,
+        maxFinalReDecodeSamples: 100,
+        expectLanguageHeader: false,
+        decodeFn: { samples, _, _ in
+            enteredFinalDecode.signal()
+            _ = releaseFinalDecode.wait(timeout: .now() + 5)
+            return QwenSegmentedDecodeResult(text: "should-be-dropped-\\(samples.count)", tokens: [1])
+        },
+        rollbackPrefixFn: { t, _, _ in t },
+        emitJsonFn: { inflightEmitted.append($0) },
+        onLoopFinishedFn: { doneInflight.signal() }
+    )
+    inflightEngine.preload([Float](repeating: 0.2, count: 6))
+    DispatchQueue.global(qos: .userInitiated).async { inflightEngine.runLoop() }
+    inflightEngine.requestStop(abort: false, producerAlsoFinished: true)
+    check(enteredFinalDecode.wait(timeout: .now() + 5) == .success, "case 7b enter final decode")
+    inflightEngine.requestStop(abort: true, producerAlsoFinished: true)
+    releaseFinalDecode.signal()
+    check(doneInflight.wait(timeout: .now() + 5) == .success, "case 7b done wait")
+    check(!inflightEmitted.contains { ($0["isFinal"] as? Bool) == true }, "case 7b abort during final decode emitted isFinal: \\(inflightEmitted)")
 }
 print("MAC_SEGMENTED_DECODE:PASS")
 `);

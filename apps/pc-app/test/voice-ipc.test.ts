@@ -2956,4 +2956,103 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       await voice.dispose();
     }
   });
+
+  it('isolates darwin resident worker across stop->abort->start and swallows delayed aborted end on immediate reuse', async () => {
+    const weights = Buffer.from('darwin-abort-reuse-weights');
+    const sha = createHash('sha256').update(weights).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'aufklarer/test-mac-0.6b',
+        revision: 'mac06',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'aufklarer/test-mac-1.7b',
+        revision: 'mac17',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+    };
+
+    const procs: Array<ReturnType<typeof createFakeChildProcess>> = [];
+    const sentEvents: PcAppVoiceEvent[] = [];
+    const voice = createPcAppVoiceController({
+      platform: 'darwin',
+      arch: 'arm64',
+      userDataDir: tempDir,
+      speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+      mlxHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech-mlx',
+      isMlxSupported: () => true,
+      useResidentMlxWorker: true,
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes/session/1',
+      sendToRenderer: (_ch, payload) => sentEvents.push(payload as PcAppVoiceEvent),
+      getMediaAccessStatus: () => 'granted',
+      manifests,
+      mirrorOrigins: ['https://hf-mirror.com'],
+      fetchModel: async () => new Response(new Uint8Array(weights), { status: 200 }),
+      runHelperAsync: async () => JSON.stringify({ mic: 'authorized', speech: 'authorized', speechAvailable: true }),
+      spawnHelper: () => {
+        const proc = createFakeChildProcess();
+        procs.push(proc);
+        queueMicrotask(() => {
+          proc.stdout.emit('data', '{"type":"ready","variant":"0.6b"}\n');
+        });
+        return proc as unknown as ChildProcess;
+      },
+    });
+
+    await voice.setSpeechModel('qwen3-0.6b');
+    await vi.waitFor(() => {
+      expect(procs).toHaveLength(1);
+    });
+    await vi.waitFor(async () => {
+      expect((await voice.getSpeechModelStatus()).state).toBe('ready');
+    });
+
+    // A: start -> abort before stop (reuses w0) -> immediate start -> delayed old end arrives BEFORE new start -> new utterance keeps receiving final!
+    expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    await voice.stopListening({ abort: true });
+    expect(procs[0]!.kill).not.toHaveBeenCalled();
+
+    sentEvents.length = 0;
+    expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    expect(procs).toHaveLength(1);
+    // Old aborted session end arrives asynchronously before new session emits start:
+    procs[0]!.stdout.emit('data', '{"type":"end"}\n');
+    // New session starts, decodes final, and ends:
+    procs[0]!.stdout.emit('data', '{"type":"start"}\n{"type":"result","text":"新会话终解","isFinal":true}\n{"type":"end"}\n');
+    expect(sentEvents).toEqual([
+      { type: 'start' },
+      { type: 'result', text: '新会话终解', isFinal: true },
+      { type: 'end' },
+    ]);
+
+    // B: start -> normal stop (in-flight final) -> abort -> immediate start -> spawns fresh worker w1 & ignores late w0 events
+    sentEvents.length = 0;
+    expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    const pendingStopP = voice.stopListening({ abort: false });
+    await voice.stopListening({ abort: true });
+    await pendingStopP;
+    expect(procs[0]!.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
+
+    sentEvents.length = 0;
+    expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    expect(procs).toHaveLength(2);
+    procs[0]!.stdout.emit('data', '{"type":"result","text":"老worker延迟终解","isFinal":true}\n{"type":"end"}\n');
+    procs[1]!.stdout.emit('data', '{"type":"start"}\n{"type":"result","text":"全新worker终解","isFinal":true}\n{"type":"end"}\n');
+    expect(sentEvents).toEqual([
+      { type: 'start' },
+      { type: 'result', text: '全新worker终解', isFinal: true },
+      { type: 'end' },
+    ]);
+
+    await voice.dispose();
+  });
 });

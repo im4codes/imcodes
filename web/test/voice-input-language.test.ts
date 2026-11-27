@@ -600,10 +600,13 @@ describe('voice recognition engine preference & cache switching', () => {
     }
   });
 
-  it('allows up to PC_APP_FINALIZE_DRAIN_MS (46s) for PC App local Qwen stopListening while still bounded', async () => {
+  it('allows up to PC_APP_FINALIZE_DRAIN_MS (46s) even when mobile preference is system, and forwards post-stop abort:true to PC App', async () => {
     vi.stubGlobal('Capacitor', undefined);
-    let releasePcStop!: () => void;
+    // Saved mobile recognizer preference = 'system' must NOT shrink PC App Qwen 46s drain budget!
+    input.setVoiceRecognitionEngine('system');
+    let resolveStopFalse!: () => void;
     let pcSub: ((ev: any) => void) | null = null;
+    const stopCalls: Array<{ abort?: boolean }> = [];
     (globalThis as any).__IMCODES_PC_APP__ = {
       platform: 'win32',
       voice: {
@@ -612,14 +615,24 @@ describe('voice recognition engine preference & cache switching', () => {
         requestPermissions: vi.fn(async () => ({ mic: 'granted', speech: 'granted' })),
         getSpeechModelStatus: vi.fn(async () => ({ selectedModel: 'qwen3-0.6b', activeBackend: 'qwen3-0.6b', state: 'ready' })),
         startListening: vi.fn(async () => ({ ok: true })),
-        stopListening: vi.fn(() => new Promise<void>((resolve) => { releasePcStop = resolve; })),
+        stopListening: vi.fn((opts?: { abort?: boolean }) => {
+          stopCalls.push(opts ?? {});
+          if (opts?.abort) {
+            resolveStopFalse?.();
+            return Promise.resolve();
+          }
+          return new Promise<void>((resolve) => {
+            resolveStopFalse = resolve;
+          });
+        }),
         subscribe: (fn: (ev: any) => void) => { pcSub = fn; return () => { pcSub = null; }; },
       },
     };
     vi.useFakeTimers();
     try {
+      // 1) Slow 30s+ Qwen final drain succeeds even with mobile preference = 'system'
       const onResult = vi.fn();
-      await expect(input.startListening(onResult)).resolves.toBe(true);
+      expect(await input.startListening(onResult)).toBe(true);
       let stopSettled = false;
       const stopPromise = input.stopListening().then(() => { stopSettled = true; });
       await vi.advanceTimersByTimeAsync(30_000);
@@ -627,13 +640,40 @@ describe('voice recognition engine preference & cache switching', () => {
 
       pcSub?.({ type: 'result', text: 'Windows 慢速完整终解', isFinal: true });
       pcSub?.({ type: 'end' });
-      releasePcStop();
+      resolveStopFalse();
       await stopPromise;
       expect(stopSettled).toBe(true);
       expect(onResult).toHaveBeenLastCalledWith('Windows 慢速完整终解', true);
+      expect(stopCalls).toEqual([{ abort: false }]);
+
+      // 2) Renderer calls stopListening() -> still waiting for final decode -> stopListening({ abort: true }) MUST forward { abort: true } to PC bridge!
+      stopCalls.length = 0;
+      const onAbortResult = vi.fn();
+      expect(await input.startListening(onAbortResult)).toBe(true);
+      let firstStopDone = false;
+      const inflightStop = input.stopListening().then(() => { firstStopDone = true; });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(firstStopDone).toBe(false);
+      await input.stopListening({ abort: true });
+      await inflightStop;
+      expect(stopCalls).toEqual([{ abort: false }, { abort: true }]);
+
+      // 3) When PC backend is actually 'system', short 20s upper bound is restored (not 46s)
+      (globalThis as any).__IMCODES_PC_APP__.voice.getSpeechModelStatus.mockResolvedValueOnce({
+        selectedModel: 'system',
+        activeBackend: 'system',
+        state: 'ready',
+      });
+      expect(await input.startListening(vi.fn())).toBe(true);
+      await Promise.resolve();
+      let sysSettled = false;
+      const sysStopP = input.stopListening().then(() => { sysSettled = true; });
+      await vi.advanceTimersByTimeAsync(20_500);
+      expect(sysSettled).toBe(true);
+      resolveStopFalse?.();
+      await sysStopP;
     } finally {
       vi.useRealTimers();
-      await input.stopListening({ abort: true });
       delete (globalThis as any).__IMCODES_PC_APP__;
     }
   });

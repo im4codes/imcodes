@@ -413,6 +413,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     sessionId?: string;
     remoteEnded?: boolean;
     stopRequested?: boolean;
+    sawActivity?: boolean;
     onEvent?: (event: PcAppVoiceEvent) => void;
     loggedFirstLevel: boolean;
     loggedFirstResult: boolean;
@@ -427,6 +428,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     stdoutBuffer: string;
     stderrBuffer: string;
     utterance: ActiveWorkerUtterance | null;
+    awaitingAbortedEnd?: boolean;
     killTimer: ReturnType<typeof setTimeout> | null;
   }
 
@@ -1572,6 +1574,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           }
 
           if (parsed.type === 'end') {
+            if (worker.awaitingAbortedEnd && !worker.utterance?.sawActivity) {
+              worker.awaitingAbortedEnd = false;
+              continue;
+            }
+            worker.awaitingAbortedEnd = false;
             const utt = worker.utterance;
             if (utt) {
               worker.utterance = null;
@@ -1582,6 +1589,13 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
               resolveUtteranceWaiters(utt);
             }
             continue;
+          }
+
+          if (parsed.type === 'start' || parsed.type === 'result') {
+            worker.awaitingAbortedEnd = false;
+            if (worker.utterance) {
+              worker.utterance.sawActivity = true;
+            }
           }
 
           if (
@@ -1681,6 +1695,35 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
   };
 
+  const detachAndAbortWorker = (
+    worker: ResidentMlxWorker | null,
+    utt: ActiveWorkerUtterance,
+    options?: { shutdownIfNotReady?: boolean; writeAbort?: boolean },
+  ): void => {
+    if (!worker) return;
+    worker.utterance = null;
+    if (utt.stopRequested || (options?.shutdownIfNotReady && (worker.state === 'starting' || worker.state === 'loading'))) {
+      // Isolate & shut down any worker whose in-flight final decode is aborted or timed out
+      // (both macOS MLX and Windows Sherpa) so delayed result/end frames never hit a new utterance.
+      shutdownMlxWorker(worker);
+      if (isWin32) {
+        try {
+          worker.proc.kill('SIGTERM');
+        } catch { /* ignore */ }
+      }
+      return;
+    }
+    if (options?.writeAbort !== false) {
+      worker.awaitingAbortedEnd = true;
+      try {
+        worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'abort' })}\n`);
+      } catch {
+        worker.awaitingAbortedEnd = false;
+        shutdownMlxWorker(worker);
+      }
+    }
+  };
+
   const cleanupRemoteSession = (
     utt: ActiveWorkerUtterance,
     options: {
@@ -1700,25 +1743,10 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       activeWorkerUtterance = null;
     }
     const worker = mlxWorker && mlxWorker.utterance === utt ? mlxWorker : null;
-    if (worker) {
-      worker.utterance = null;
-      if (options.shutdownIfNotReady && (worker.state === 'starting' || worker.state === 'loading')) {
-        shutdownMlxWorker(worker);
-      } else if (options.sendWorkerAbort) {
-        try {
-          worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'abort' })}\n`);
-        } catch {
-          shutdownMlxWorker(worker);
-        }
-        if (isWin32 && utt.stopRequested) {
-          // Sherpa-ONNX offline decode is synchronous; isolate & terminate the worker immediately on abort during stop.
-          shutdownMlxWorker(worker);
-          try {
-            worker.proc.kill('SIGTERM');
-          } catch { /* ignore */ }
-        }
-      }
-    }
+    detachAndAbortWorker(worker, utt, {
+      shutdownIfNotReady: options.shutdownIfNotReady,
+      writeAbort: options.sendWorkerAbort,
+    });
     resolveUtteranceWaiters(utt);
     emitRemoteProviderInfoChanged();
     if (options.errorCode && sessionId) {
@@ -1800,20 +1828,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       const worker = mlxWorker && mlxWorker.utterance === utt ? mlxWorker : null;
       if (options?.abort) {
         activeWorkerUtterance = null;
-        if (worker) {
-          worker.utterance = null;
-          try {
-            worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'abort' })}\n`);
-          } catch {
-            shutdownMlxWorker(worker);
-          }
-          if (isWin32 && utt.stopRequested) {
-            shutdownMlxWorker(worker);
-            try {
-              worker.proc.kill('SIGTERM');
-            } catch { /* ignore */ }
-          }
-        }
+        detachAndAbortWorker(worker, utt);
         resolveUtteranceWaiters(utt);
         emitWorkerUtteranceEvent(utt, { type: 'end' });
         return;
@@ -1855,18 +1870,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
             activeWorkerUtterance = null;
           }
           if (worker.utterance === utt) {
-            worker.utterance = null;
-            try {
-              worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'abort' })}\n`);
-            } catch {
-              shutdownMlxWorker(worker);
-            }
-            if (isWin32) {
-              shutdownMlxWorker(worker);
-              try {
-                worker.proc.kill('SIGTERM');
-              } catch { /* ignore */ }
-            }
+            detachAndAbortWorker(worker, utt);
           }
           emitWorkerUtteranceEvent(utt, { type: 'end' });
           resolveUtteranceWaiters(utt);
@@ -2668,12 +2672,6 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
             shutdownIfNotReady: true,
             emitEnd: true,
           });
-          if (isWin32) {
-            shutdownMlxWorker(worker);
-            try {
-              worker.proc.kill('SIGTERM');
-            } catch { /* ignore */ }
-          }
           done();
         }, QWEN_LOCAL_FINALIZE_TIMEOUT_MS);
       });

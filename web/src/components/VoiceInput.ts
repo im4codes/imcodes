@@ -319,6 +319,11 @@ function createPcAppSpeechRecognition(bridge: PcAppBridge): Omit<NativeSpeechRec
       ipcUnsub?.();
       ipcUnsub = null;
     },
+    abort: async () => {
+      await voice.stopListening?.({ abort: true });
+      ipcUnsub?.();
+      ipcUnsub = null;
+    },
     addListener: async (eventName: string, listenerFunc: (data: any) => void) => {
       ensureSubscribed();
       let set = listeners.get(eventName);
@@ -345,6 +350,7 @@ function createPcAppSpeechRecognition(bridge: PcAppBridge): Omit<NativeSpeechRec
       };
     },
   } as unknown as Omit<NativeSpeechRecognition, 'start' | 'addListener'> & {
+    abort?: () => Promise<void>;
     checkPermissions: () => Promise<{ speechRecognition: 'granted' | 'denied' | 'prompt' }>;
     start: (options?: { language?: string; initialPcmBase64?: string; finalizeOnly?: boolean; hotwords?: string[] }) => Promise<{ matches?: string[] } | void>;
     addListener: (eventName: string, listenerFunc: (data: any) => void) => Promise<PluginListenerHandle>;
@@ -373,7 +379,8 @@ interface CaptureOwner {
 interface NativeSession {
   generation: number;
   owner: CaptureOwner;
-  recognition: NativeSpeechRecognition;
+  recognition: NativeSpeechRecognition & { abort?: () => Promise<void> };
+  isPcApp?: boolean;
   isFallback?: boolean;
   initialPcmBase64?: string;
   text: string | null;
@@ -381,6 +388,7 @@ interface NativeSession {
   aborted: boolean;
   retired: boolean;
   stopStarted: boolean;
+  abortSent?: boolean;
   primed: boolean;
   deferAudioPause: boolean;
   captureStarted: boolean;
@@ -771,8 +779,8 @@ function invalidateVoiceSessionsOnAuthScopeChange(): void {
     const session = pending?.session ?? _nativeSession;
     _pendingStart = null;
     if (session) {
-      const shouldStop = Boolean(session.startInvoked && !session.stopStarted);
-      void beginNativeSessionAbort(session, shouldStop ? (pending?.promise ?? null) : null, shouldStop);
+      const shouldStop = shouldStopNativeSessionOnAbort(session, Boolean(session.startInvoked || _pendingStop));
+      void beginNativeSessionAbort(session, shouldStop && !session.stopStarted ? (pending?.promise ?? null) : null, shouldStop);
     }
   }
   if (_pendingRemoteStart && !_pendingRemoteStart.aborted) {
@@ -951,7 +959,7 @@ async function finalizeBufferedSpeechOnOwner(
         });
       }
       if (!signal.aborted) {
-        await withTimeout(donePromise, PC_APP_FINALIZE_DRAIN_MS, 'PC voice finalize timed out').catch(() => {
+        await withTimeout(donePromise, getNativeStopDrainTimeoutMs(null), 'PC voice finalize timed out').catch(() => {
           void bridge.voice?.stopListening?.({ abort: true }).catch(() => {});
         });
       }
@@ -1401,9 +1409,9 @@ async function attachSessionListeners(
       if (session.primed) {
         clearPrewarmCaches();
         session.retired = true;
-        if (session.startInvoked && !session.stopStarted) {
+        if (shouldStopNativeSessionOnAbort(session, Boolean(session.startInvoked))) {
           session.stopStarted = true;
-          void session.recognition.stop().catch(() => {});
+          void dispatchNativeAbortStop(session);
         }
         if (_nativeSession === session) _nativeSession = null;
         if (_pendingStart?.session === session) _pendingStart = null;
@@ -2637,6 +2645,7 @@ function primeNativeGesture(options?: { deferAudioPause?: boolean; projectKey?: 
     generation,
     owner: primedOwner,
     recognition: cached.effective,
+    isPcApp: isPcAppNativeSpeech(),
     isFallback: cached.effective !== cached.primary,
     text: null,
     final: false,
@@ -2675,7 +2684,7 @@ function cancelNativeGesturePrime(): void {
   if (pendingEntry?.session === session) {
     _pendingStart = null;
   }
-  const shouldStopNative = !!(session.startInvoked && !session.stopStarted);
+  const shouldStopNative = shouldStopNativeSessionOnAbort(session, Boolean(session.startInvoked));
   void beginNativeSessionAbort(session, startPromise, shouldStopNative);
 }
 
@@ -2766,6 +2775,32 @@ export interface StopListeningOptions {
   abort?: boolean;
 }
 
+function shouldStopNativeSessionOnAbort(session: NativeSession | null, hasActiveCaptureOrStart = true): boolean {
+  if (!session || session.abortSent) return false;
+  if (session.isPcApp) {
+    return (!session.primed || session.startInvoked || session.stopStarted)
+      && (hasActiveCaptureOrStart || session.stopStarted);
+  }
+  return !session.stopStarted && (!session.primed || session.startInvoked) && hasActiveCaptureOrStart;
+}
+
+function dispatchNativeAbortStop(session: NativeSession): Promise<void> {
+  session.abortSent = true;
+  const abortFn = session.isPcApp ? session.recognition.abort : undefined;
+  const call = typeof abortFn === 'function' ? abortFn() : session.recognition.stop();
+  return Promise.resolve(call).catch((err) => {
+    console.warn('[voice] abort stop failed:', err);
+  });
+}
+
+function getNativeStopDrainTimeoutMs(session: NativeSession | null): number {
+  if (!(session?.isPcApp ?? isPcAppNativeSpeech())) {
+    return NATIVE_STOP_DRAIN_MS;
+  }
+  syncPcModelCacheBridge();
+  return _cachedPcModelChoice === 'system' ? NATIVE_STOP_DRAIN_MS : PC_APP_FINALIZE_DRAIN_MS;
+}
+
 function beginNativeSessionAbort(
   session: NativeSession | null,
   startPromise: Promise<boolean> | null,
@@ -2793,9 +2828,7 @@ function beginNativeSessionAbort(
   // cannot leave old native listeners attached across an abort timeout.
   const detachPromise = cleanupSessionListeners(session).catch(() => {});
   const stopCallPromise = shouldStopNative && session
-    ? session.recognition.stop().catch((err) => {
-        console.warn('[voice] abort stop failed:', err);
-      })
+    ? dispatchNativeAbortStop(session)
     : Promise.resolve();
   const priorStopWait = priorPendingStop ? priorPendingStop.catch(() => {}) : Promise.resolve();
   const startWait = startPromise ? startPromise.catch(() => false) : Promise.resolve();
@@ -3983,6 +4016,7 @@ async function startLocalListening(
     generation,
     owner,
     recognition,
+    isPcApp: isPcAppNativeSpeech(),
     isFallback,
     ...(initialPcmBase64 ? { initialPcmBase64 } : {}),
     text: null,
@@ -4114,11 +4148,9 @@ export async function stopListening(options?: StopListeningOptions): Promise<voi
     const startPromise = pendingEntry?.promise ?? null;
     _pendingStart = null;
     const session = _nativeSession ?? pendingEntry?.session ?? null;
-    const shouldStopNative = !!(
-      session
-      && !session.stopStarted
-      && (!session.primed || session.startInvoked)
-      && (_listening || !!startPromise)
+    const shouldStopNative = shouldStopNativeSessionOnAbort(
+      session,
+      Boolean(_listening || startPromise || _pendingStop),
     );
     await beginNativeSessionAbort(session, startPromise, shouldStopNative);
     return;
@@ -4155,9 +4187,7 @@ export async function stopListening(options?: StopListeningOptions): Promise<voi
     }
   }
 
-  const drainTimeoutMs = isPcAppNativeSpeech() && getVoiceRecognitionEngine() !== 'system'
-    ? PC_APP_FINALIZE_DRAIN_MS
-    : NATIVE_STOP_DRAIN_MS;
+  const drainTimeoutMs = getNativeStopDrainTimeoutMs(session);
 
   let stopPromise!: Promise<void>;
   stopPromise = (async () => {
