@@ -1,6 +1,8 @@
 /**
  * @vitest-environment jsdom
  */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { cleanup, fireEvent, render } from '@testing-library/preact';
 
@@ -111,5 +113,26 @@ describe('ClientDownloadsModal', () => {
 
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps Android and iOS QR frames uniform and aligned above bottom buttons via CSS contract', () => {
+    configure('https://selfhosted.example.com:8443/custom/subpath');
+    const { getByTestId } = render(<ClientDownloadsModal open onClose={() => {}} />);
+
+    const androidSvg = getByTestId('download-qr-android').querySelector('svg');
+    const iosSvg = getByTestId('download-qr-ios').querySelector('svg');
+    expect(androidSvg?.getAttribute('width')).toBe('136');
+    expect(androidSvg?.getAttribute('height')).toBe('136');
+    expect(iosSvg?.getAttribute('width')).toBe('136');
+    expect(iosSvg?.getAttribute('height')).toBe('136');
+
+    fireEvent.click(getByTestId('android-variant-nofcm'));
+    expect(androidSvg?.getAttribute('width')).toBe('136');
+    expect(androidSvg?.getAttribute('height')).toBe('136');
+
+    const css = readFileSync(resolve(__dirname, '../../src/styles.css'), 'utf8');
+    expect(css).toMatch(/\.client-downloads-mobile-card\s+\.client-downloads-qr-frame\s*\{[^}]*margin-top:\s*auto/s);
+    expect(css).toMatch(/\.client-downloads-mobile-card\s+\.client-downloads-btn-full\s*\{[^}]*margin-top:\s*0/s);
+    expect(css).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*\.client-downloads-mobile-grid\s*\{[^}]*grid-template-columns:\s*1fr/s);
   });
 });

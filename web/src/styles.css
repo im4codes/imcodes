@@ -28175,6 +28175,12 @@ html.native-ios-mac .global-task-mode-entry-btn {
   align-items: center;
   text-align: center;
 }
+.client-downloads-mobile-card .client-downloads-qr-frame {
+  margin-top: auto;
+}
+.client-downloads-mobile-card .client-downloads-btn-full {
+  margin-top: 0;
+}
 .client-downloads-card-head {
   display: flex;
   align-items: center;
@@ -28278,6 +28284,9 @@ html.native-ios-mac .global-task-mode-entry-btn {
 }
 .client-downloads-qr-frame svg {
   display: block;
+  width: 136px;
+  height: 136px;
+  flex-shrink: 0;
 }
 .client-downloads-footer {
   font-size: 12px;
