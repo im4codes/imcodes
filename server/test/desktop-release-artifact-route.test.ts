@@ -626,7 +626,9 @@ describe('/api/enroll/v2/node-artifact release manifest & daemon-runtime routes'
       ['srv-mac-x64', { id: 'srv-mac-x64', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'mac', arch: 'x64', abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
       ['srv-mac-arm64', { id: 'srv-mac-arm64', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'mac', arch: 'arm64', abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
       ['srv-mac-univ', { id: 'srv-mac-univ', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'mac', arch: 'universal', abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
+      ['srv-mac-unknown', { id: 'srv-mac-unknown', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'mac', arch: 'unknown', abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
       ['srv-mac-null', { id: 'srv-mac-null', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'mac', arch: null, abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
+      ['srv-linux-unknown', { id: 'srv-linux-unknown', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'linux', arch: 'unknown', abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
     ]);
     const app = makeFakeServerApp(servers, {
       CONTROLLED_NODE_ARTIFACT_R2_BASE_URL: 'https://cdn.imcodes.example',
@@ -664,8 +666,8 @@ describe('/api/enroll/v2/node-artifact release manifest & daemon-runtime routes'
     expect(armHead.status).toBe(200);
     expect(armHead.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBe(arm64RmSha);
 
-    // 3. Explicit header x-imcodes-node-runtime-arch: x64 overrides stale arm64/universal DB arch.
-    for (const sid of ['srv-mac-arm64', 'srv-mac-univ']) {
+    // 3. Explicit header x-imcodes-node-runtime-arch: x64 overrides stale arm64/universal/unknown DB arch.
+    for (const sid of ['srv-mac-arm64', 'srv-mac-univ', 'srv-mac-unknown']) {
       const overrideRes = await app.request(`/api/enroll/v2/node-artifact?serverId=${sid}&os=mac&arch=universal`, {
         method: 'HEAD',
         headers: {
@@ -677,7 +679,8 @@ describe('/api/enroll/v2/node-artifact release manifest & daemon-runtime routes'
       expect(overrideRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBe(x64RmSha);
     }
 
-    // 4. Invalid x-imcodes-node-runtime-arch is ignored safely (falls back to DB or unknown without breaking node).
+    // 4. Invalid x-imcodes-node-runtime-arch is ignored safely (falls back to DB or unknown without breaking node),
+    //    and non-mac unrecognized DB arch (`srv-linux-unknown`) still rejects 403 platform_mismatch.
     const badHeaderWithDb = await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-x64&os=mac&arch=universal`, {
       method: 'HEAD',
       headers: {
@@ -688,8 +691,14 @@ describe('/api/enroll/v2/node-artifact release manifest & daemon-runtime routes'
     expect(badHeaderWithDb.status).toBe(200);
     expect(badHeaderWithDb.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBe(x64RmSha);
 
-    // 5. Unknown arch (server.arch = 'universal' / null, no valid header) validates published manifests and OMITS pinned hash.
-    for (const sid of ['srv-mac-univ', 'srv-mac-null']) {
+    const linuxUnknown = await app.request(`/api/enroll/v2/node-artifact?serverId=srv-linux-unknown&os=linux&arch=x64`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(linuxUnknown.status).toBe(403);
+
+    // 5. Unknown arch (server.arch = 'universal' / 'unknown' / null, no valid header) validates published manifests and OMITS pinned hash.
+    for (const sid of ['srv-mac-univ', 'srv-mac-unknown', 'srv-mac-null']) {
       for (const init of [
         { method: 'HEAD', headers: { authorization: `Bearer ${token}` } },
         { method: 'GET', headers: { authorization: `Bearer ${token}`, [CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH]: 'invalid' } },
@@ -702,13 +711,24 @@ describe('/api/enroll/v2/node-artifact release manifest & daemon-runtime routes'
       }
     }
 
+    // Also allow universal computer-use-helper for mac row with unknown DB arch.
+    const helperDir = join(dir, 'computer-use-helper', 'darwin-universal');
+    mkdirSync(helperDir, { recursive: true });
+    const helperBytes = Buffer.from('mac-ocu-helper-' + version);
+    writeFileSync(join(helperDir, 'open-computer-use.app.zip'), helperBytes);
+    const unknownHelperRes = await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-unknown&os=mac&arch=universal&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER}`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(unknownHelperRes.status).toBe(200);
+
     // 6. Fail-closed 503 when either macOS release manifest imcodes-node entry mismatches (even for unknown arch).
     writeMacReleaseManifest('x64', 'f'.repeat(64));
     expect((await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-x64&os=mac&arch=universal`, {
       method: 'HEAD',
       headers: { authorization: `Bearer ${token}` },
     })).status).toBe(503);
-    expect((await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-univ&os=mac&arch=universal`, {
+    expect((await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-unknown&os=mac&arch=universal`, {
       method: 'HEAD',
       headers: { authorization: `Bearer ${token}` },
     })).status).toBe(503);
@@ -719,5 +739,29 @@ describe('/api/enroll/v2/node-artifact release manifest & daemon-runtime routes'
       method: 'HEAD',
       headers: { authorization: `Bearer ${token}` },
     })).status).toBe(503);
+
+    // 7. Partial macOS release manifest publication (unilateral missing in either direction) fails closed (503) for unknown arch;
+    //    both absent retains legacy non-manifest 200 compatibility.
+    writeMacReleaseManifest('arm64');
+    rmSync(join(dir, desktopReleaseTargetManifestFilename('darwin-x64')));
+    expect((await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-unknown&os=mac&arch=universal`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    })).status).toBe(503);
+
+    writeMacReleaseManifest('x64');
+    rmSync(join(dir, desktopReleaseTargetManifestFilename('darwin-arm64')));
+    expect((await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-unknown&os=mac&arch=universal`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    })).status).toBe(503);
+
+    rmSync(join(dir, desktopReleaseTargetManifestFilename('darwin-x64')));
+    const legacyNoManifestRes = await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-unknown&os=mac&arch=universal`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(legacyNoManifestRes.status).toBe(200);
+    expect(legacyNoManifestRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBeNull();
   });
 });

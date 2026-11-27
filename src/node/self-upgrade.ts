@@ -9,6 +9,7 @@ import { tmpdir, uptime } from 'node:os';
 import { basename, dirname, join, resolve, win32 as pathWin32 } from 'node:path';
 import { promisify } from 'node:util';
 import {
+  CONTROLLED_NODE_ARCH_ARM64,
   CONTROLLED_NODE_ARCH_X64,
   CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
   CONTROLLED_NODE_ARTIFACT_ASSETS,
@@ -2613,6 +2614,45 @@ async function isControlledNodeInstallationCurrent(input: {
   return true;
 }
 
+async function verifyUniversalComponentsAgainstReleaseManifest(input: {
+  releaseManifest: DesktopReleaseManifest;
+  releaseTarget: NonNullable<ReturnType<typeof releaseTargetFromRuntime>>;
+  downloaded: { version?: string; filename: string; sha256: string; sizeBytes: number };
+  downloadedNodeManifest: { artifact?: { authenticodeSignerSha256?: string } };
+  helper?: { sha256: string; sizeBytes: number };
+  destinationPath: string;
+  target: ControlledNodeArtifactTarget;
+}): Promise<void> {
+  const nodeCheck = verifyDesktopReleaseComponentIdentity(input.releaseManifest, input.releaseTarget, 'imcodes-node', {
+    version: input.downloaded.version,
+    fileName: input.downloaded.filename,
+    sha256: input.downloaded.sha256,
+    sizeBytes: input.downloaded.sizeBytes,
+    ...(input.downloadedNodeManifest.artifact?.authenticodeSignerSha256
+      ? { authenticodeSignerSha256: input.downloadedNodeManifest.artifact.authenticodeSignerSha256 }
+      : {}),
+  });
+  if (!nodeCheck.ok) throw new Error(`release_manifest_${nodeCheck.reason}`);
+
+  if (input.helper) {
+    const helperCheck = verifyDesktopReleaseComponentIdentity(input.releaseManifest, input.releaseTarget, 'open-computer-use', {
+      sha256: input.helper.sha256,
+      sizeBytes: input.helper.sizeBytes,
+    });
+    if (!helperCheck.ok) throw new Error(`release_manifest_${helperCheck.reason}`);
+  } else {
+    const installedMatches = await verifyInstalledComputerUseHelperMatchesManifest({
+      destinationPath: input.destinationPath,
+      target: input.target,
+      releaseManifest: input.releaseManifest,
+      releaseTarget: input.releaseTarget,
+    });
+    if (!installedMatches) {
+      throw new Error('release_manifest_missing_required_component:open-computer-use');
+    }
+  }
+}
+
 export async function startControlledNodeSelfUpgrade(
   credential: ControlledNodeCredential,
   rawTargetVersion: unknown,
@@ -2735,52 +2775,90 @@ export async function startControlledNodeSelfUpgrade(
           os: target.os,
           arch: platform === 'darwin' && (arch === 'x64' || arch === 'arm64') ? arch : target.arch,
         };
-        const releaseManifest = await withArtifactDownloadRetries(
-          () => downloadDesktopReleaseManifest({
-            credential,
-            target: manifestTarget,
-            fetchImpl,
-            runtimeArch: arch,
-            expectedVersion: downloaded.version,
-            expectedSha256: downloaded.releaseManifestSha256,
-            ...downloadTimeoutOpts,
-          }),
-          { sleep: deps.sleep },
-        );
-        if (!releaseManifest) {
-          throw new Error('release_manifest_missing_after_announcement');
-        }
         const downloadedNodeManifest = JSON.parse(await readFile(downloaded.manifestPath, 'utf8')) as {
           artifact?: { authenticodeSignerSha256?: string };
         };
-        const nodeCheck = verifyDesktopReleaseComponentIdentity(releaseManifest, releaseTarget, 'imcodes-node', {
-          version: downloaded.version,
-          fileName: downloaded.filename,
-          sha256: downloaded.sha256,
-          sizeBytes: downloaded.sizeBytes,
-          ...(downloadedNodeManifest.artifact?.authenticodeSignerSha256
-            ? { authenticodeSignerSha256: downloadedNodeManifest.artifact.authenticodeSignerSha256 }
-            : {}),
-        });
-        if (!nodeCheck.ok) throw new Error(`release_manifest_${nodeCheck.reason}`);
-
-        if (helper) {
-          const helperCheck = verifyDesktopReleaseComponentIdentity(releaseManifest, releaseTarget, 'open-computer-use', {
-            sha256: helper.sha256,
-            sizeBytes: helper.sizeBytes,
-          });
-          if (!helperCheck.ok) throw new Error(`release_manifest_${helperCheck.reason}`);
-        } else {
-          const installedMatches = await verifyInstalledComputerUseHelperMatchesManifest({
+        let releaseManifest: DesktopReleaseManifest | undefined;
+        try {
+          releaseManifest = await withArtifactDownloadRetries(
+            () => downloadDesktopReleaseManifest({
+              credential,
+              target: manifestTarget,
+              fetchImpl,
+              runtimeArch: arch,
+              expectedVersion: downloaded.version,
+              expectedSha256: downloaded.releaseManifestSha256,
+              ...downloadTimeoutOpts,
+            }),
+            { sleep: deps.sleep },
+          );
+        } catch (err) {
+          if (
+            !(platform === 'darwin'
+              && arch === 'x64'
+              && err instanceof Error
+              && err.message === 'release_manifest_pinned_sha256_mismatch')
+          ) {
+            throw err;
+          }
+          // Old servers hardcoded darwin-arm64 release manifest sha256 on mac:universal downloads.
+          // First verify the pinned manifest against darwin-arm64 + universal binaries, then verify
+          // the darwin-x64 manifest from the same release before proceeding.
+          const arm64Manifest = await withArtifactDownloadRetries(
+            () => downloadDesktopReleaseManifest({
+              credential,
+              target: { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARCH_ARM64 },
+              fetchImpl,
+              runtimeArch: arch,
+              expectedVersion: downloaded.version,
+              expectedSha256: downloaded.releaseManifestSha256,
+              ...downloadTimeoutOpts,
+            }),
+            { sleep: deps.sleep },
+          );
+          if (!arm64Manifest) {
+            throw new Error('release_manifest_missing_after_announcement');
+          }
+          await verifyUniversalComponentsAgainstReleaseManifest({
+            releaseManifest: arm64Manifest,
+            releaseTarget: 'darwin-arm64',
+            downloaded,
+            downloadedNodeManifest,
+            helper,
             destinationPath,
             target,
-            releaseManifest,
-            releaseTarget,
           });
-          if (!installedMatches) {
-            throw new Error('release_manifest_missing_required_component:open-computer-use');
+          const x64Manifest = await withArtifactDownloadRetries(
+            () => downloadDesktopReleaseManifest({
+              credential,
+              target: { os: CONTROLLED_NODE_OS_MAC, arch: CONTROLLED_NODE_ARCH_X64 },
+              fetchImpl,
+              runtimeArch: arch,
+              expectedVersion: downloaded.version,
+              ...downloadTimeoutOpts,
+            }),
+            { sleep: deps.sleep },
+          );
+          if (!x64Manifest) {
+            throw new Error('release_manifest_missing_after_announcement');
           }
+          if (x64Manifest.releaseVersion !== arm64Manifest.releaseVersion || x64Manifest.gitSha !== arm64Manifest.gitSha) {
+            throw new Error('release_manifest_cross_arch_mismatch');
+          }
+          releaseManifest = x64Manifest;
         }
+        if (!releaseManifest) {
+          throw new Error('release_manifest_missing_after_announcement');
+        }
+        await verifyUniversalComponentsAgainstReleaseManifest({
+          releaseManifest,
+          releaseTarget,
+          downloaded,
+          downloadedNodeManifest,
+          helper,
+          destinationPath,
+          target,
+        });
 
         if (remoteDesktopWorker) {
           const rdManifest = JSON.parse(await readFile(remoteDesktopWorker.manifestPath, 'utf8')) as {

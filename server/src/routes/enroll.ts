@@ -1820,9 +1820,9 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
       return c.json({ error: 'abi_profile_mismatch' }, 409);
     }
   } else {
-    const compatServerArch = server.os === CONTROLLED_NODE_OS_MAC
-      && server.arch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL
-      ? null
+    const compatServerArch = artifactTarget!.os === CONTROLLED_NODE_OS_MAC
+      && artifactTarget!.arch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL
+      ? resolveControlledNodeRuntimeArch(server.arch)
       : server.arch;
     if ((server.os && compatServerArch
         && !isControlledNodeArtifactCompatibleWithRuntime(artifactTarget!.os, artifactTarget!.arch, server.os, compatServerArch))

@@ -1010,21 +1010,33 @@ export async function verifyDesktopReleaseManifestForNodeArtifact(
   }
 
   let releaseManifestSha256: string | undefined;
+  let sawPublished = false;
+  let sawNotPublished = false;
   for (const target of targetsToCheck) {
     const releaseCheck = await openDesktopReleaseManifestArtifact(dir, target);
     if (releaseCheck.status === 'invalid') {
       return { ok: false, error: 'desktop_release_manifest_invalid', reason: releaseCheck.reason };
     }
-    if (releaseCheck.status === 'ok') {
-      await releaseCheck.close();
-      const entry = releaseCheck.manifest.targets[target]?.components['imcodes-node'];
-      if (entry && (entry.sha256 !== descriptor.sha256 || entry.sizeBytes !== descriptor.sizeBytes || entry.version !== descriptor.version)) {
-        return { ok: false, error: 'desktop_release_manifest_mismatch' };
-      }
-      if (emitPinnedHeader) {
-        releaseManifestSha256 = releaseCheck.sha256;
-      }
+    if (releaseCheck.status === 'not_published') {
+      sawNotPublished = true;
+      continue;
     }
+    sawPublished = true;
+    await releaseCheck.close();
+    const entry = releaseCheck.manifest.targets[target]?.components['imcodes-node'];
+    if (entry && (entry.sha256 !== descriptor.sha256 || entry.sizeBytes !== descriptor.sizeBytes || entry.version !== descriptor.version)) {
+      return { ok: false, error: 'desktop_release_manifest_mismatch' };
+    }
+    if (emitPinnedHeader) {
+      releaseManifestSha256 = releaseCheck.sha256;
+    }
+  }
+  if (isUniversalMac && !runtimeArch && sawPublished && sawNotPublished) {
+    return {
+      ok: false,
+      error: 'desktop_release_manifest_invalid',
+      reason: 'partial_macos_release_manifest',
+    };
   }
   return { ok: true, ...(releaseManifestSha256 ? { releaseManifestSha256 } : {}) };
 }
@@ -1054,16 +1066,16 @@ export async function checkControlledNodeUpgradeArtifactAvailability(input: {
   }
 
   const rawArch = typeof input.arch === 'string' && input.arch.trim() ? input.arch.trim().toLowerCase() : null;
-  const fallbackArch = os === CONTROLLED_NODE_OS_MAC
-    ? CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL
-    : CONTROLLED_NODE_ARCH_X64;
+  const resolvedArtifactArch = os === CONTROLLED_NODE_OS_MAC
+    ? (resolveControlledNodeRuntimeArch(rawArch) ?? CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL)
+    : (rawArch ?? CONTROLLED_NODE_ARCH_X64);
   const profile = input.abiProfile === undefined || input.abiProfile === null
     ? CONTROLLED_NODE_ABI_MODERN
     : normalizeControlledNodeAbiProfile(input.abiProfile);
   if (!profile) {
     return { configured: true, available: false, reason: 'executable_not_built' };
   }
-  const artifactTarget = normalizeControlledNodeArtifactPair(os, rawArch ?? fallbackArch, profile);
+  const artifactTarget = normalizeControlledNodeArtifactPair(os, resolvedArtifactArch, profile);
   if (!artifactTarget) {
     return { configured: true, available: false, reason: 'executable_not_built' };
   }

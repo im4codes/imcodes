@@ -691,12 +691,32 @@ describe('controlled-node upgrade artifact availability', () => {
       os: CONTROLLED_NODE_OS_MAC, arch: 'arm64', artifactDir: dir, artifactCatalog: catalog,
     })).toEqual({ configured: true, available: true });
 
-    // Once both match, x64, arm64, and universal are all available.
+    // Once both match, x64, arm64, universal, and unrecognized (`unknown`) macOS arches are all available;
+    // linux `unknown` still stays refused (`executable_not_built`).
     writeMacManifest('x64', sha256(macUniversal));
-    for (const arch of ['x64', 'arm64', 'universal']) {
+    for (const arch of ['x64', 'arm64', 'universal', 'unknown']) {
       expect(await checkControlledNodeUpgradeArtifactAvailability({
         os: CONTROLLED_NODE_OS_MAC, arch, artifactDir: dir, artifactCatalog: catalog,
       })).toEqual({ configured: true, available: true });
+    }
+    expect(await checkControlledNodeUpgradeArtifactAvailability({
+      os: CONTROLLED_NODE_OS_LINUX, arch: 'unknown', artifactDir: dir, artifactCatalog: catalog,
+    })).toEqual({ configured: true, available: false, reason: 'executable_not_built' });
+
+    // Unilateral partial macOS release manifest publication (in either direction) rejects unknown/universal macOS arch.
+    rmSync(join(dir, 'desktop-release-darwin-x64.manifest.json'));
+    for (const arch of ['universal', 'unknown']) {
+      expect(await checkControlledNodeUpgradeArtifactAvailability({
+        os: CONTROLLED_NODE_OS_MAC, arch, artifactDir: dir, artifactCatalog: catalog,
+      })).toEqual({ configured: true, available: false, reason: 'desktop_release_manifest_invalid' });
+    }
+
+    writeMacManifest('x64', sha256(macUniversal));
+    rmSync(join(dir, 'desktop-release-darwin-arm64.manifest.json'));
+    for (const arch of ['universal', 'unknown']) {
+      expect(await checkControlledNodeUpgradeArtifactAvailability({
+        os: CONTROLLED_NODE_OS_MAC, arch, artifactDir: dir, artifactCatalog: catalog,
+      })).toEqual({ configured: true, available: false, reason: 'desktop_release_manifest_invalid' });
     }
   });
 });

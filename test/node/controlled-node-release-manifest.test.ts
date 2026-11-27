@@ -469,18 +469,21 @@ describe('controlled-node self-upgrade release manifest verification', () => {
     expect(scheduled5).toHaveLength(1);
   });
 
-  it('sends x-imcodes-node-runtime-arch: x64 on Intel Mac upgrades, verifies darwin-x64 release manifest, and rejects wrong arm64 pinned sha', async () => {
+  it('sends x-imcodes-node-runtime-arch: x64 on Intel Mac upgrades, handles old-server arm64 pins safely across manifests, and rejects forged/inconsistent pins', async () => {
     const version = '2026.11.6577-dev.6641';
     const nodeBytes = Buffer.from(`mac-universal-node-${version}`, 'utf8');
     const ocuBytes = Buffer.from(`mac-ocu-${version}`, 'utf8');
     const nodeSha = sha256(nodeBytes);
 
-    const makeMacReleaseManifest = (arch: 'x64' | 'arm64') => {
+    const makeMacReleaseManifest = (
+      arch: 'x64' | 'arm64',
+      overrides?: { gitSha?: string; ocuSha?: string; nodeSha?: string },
+    ) => {
       const target = `darwin-${arch}`;
       const bytes = Buffer.from(JSON.stringify({
         schemaVersion: 1,
         releaseVersion: version,
-        gitSha: 'abcdef1234567',
+        gitSha: overrides?.gitSha ?? 'abcdef1234567',
         generatedAt: new Date().toISOString(),
         targets: {
           [target]: {
@@ -492,7 +495,7 @@ describe('controlled-node self-upgrade release manifest verification', () => {
                 component: 'imcodes-node',
                 version,
                 fileName: 'imcodes-node-macos',
-                sha256: nodeSha,
+                sha256: overrides?.nodeSha ?? nodeSha,
                 sizeBytes: nodeBytes.length,
                 compat: { os: 'darwin', arch: 'universal' },
               },
@@ -508,7 +511,7 @@ describe('controlled-node self-upgrade release manifest verification', () => {
                 component: 'open-computer-use',
                 version,
                 fileName: 'open-computer-use.app.zip',
-                sha256: sha256(ocuBytes),
+                sha256: overrides?.ocuSha ?? sha256(ocuBytes),
                 sizeBytes: ocuBytes.length,
                 compat: { os: 'darwin', arch: 'universal' },
               },
@@ -533,20 +536,24 @@ describe('controlled-node self-upgrade release manifest verification', () => {
 
     const credential = { serverUrl: 'https://im.example', serverId: 'srv-intel-mac', token: 'tok', nodeId: '3394857735' } as never;
 
-    const buildMacFetch = (pinnedMode: 'match_runtime_header' | 'buggy_arm64_pin' | 'omit_header') => {
+    const buildMacFetch = (
+      pinnedMode: 'match_runtime_header' | 'old_server_arm64_pin' | 'garbage_pin' | 'omit_header',
+      manifests: { x64: { bytes: Buffer; sha: string }; arm64: { bytes: Buffer; sha: string } } = { x64: rmX64, arm64: rmArm64 },
+    ) => {
       const seenHeaders: Array<{ url: string; runtimeArch: string | null }> = [];
       const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
         const runtimeArch = new Headers(init?.headers).get(CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH);
         seenHeaders.push({ url, runtimeArch });
         if (url.includes(`asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST}`)) {
           const parsedUrl = new URL(url);
-          const rm = parsedUrl.searchParams.get('arch') === 'arm64' ? rmArm64 : rmX64;
+          const archParam = parsedUrl.searchParams.get('arch');
+          const rm = archParam === 'arm64' ? manifests.arm64 : manifests.x64;
           return new Response(rm.bytes, {
             status: 200,
             headers: {
               [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: rm.sha,
               [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(rm.bytes.length),
-              [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: `desktop-release-darwin-${parsedUrl.searchParams.get('arch')}.manifest.json`,
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: `desktop-release-darwin-${archParam}.manifest.json`,
               [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: version,
             },
           });
@@ -568,9 +575,11 @@ describe('controlled-node self-upgrade release manifest verification', () => {
           [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: version,
         };
         if (pinnedMode === 'match_runtime_header') {
-          headers[CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256] = runtimeArch === 'x64' ? rmX64.sha : rmArm64.sha;
-        } else if (pinnedMode === 'buggy_arm64_pin') {
-          headers[CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256] = rmArm64.sha;
+          headers[CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256] = runtimeArch === 'x64' ? manifests.x64.sha : manifests.arm64.sha;
+        } else if (pinnedMode === 'old_server_arm64_pin') {
+          headers[CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256] = manifests.arm64.sha;
+        } else if (pinnedMode === 'garbage_pin') {
+          headers[CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256] = 'f'.repeat(64);
         }
         return new Response(nodeBytes, { status: 200, headers });
       });
@@ -597,9 +606,63 @@ describe('controlled-node self-upgrade release manifest verification', () => {
     expect(okMock.seenHeaders.every((entry) => entry.runtimeArch === 'x64')).toBe(true);
     expect(okMock.seenHeaders.some((entry) => entry.url.includes('asset=desktop-release-manifest') && entry.url.includes('arch=x64'))).toBe(true);
 
-    // 2. Counterexample reproducing original bug: server wrongly pinning arm64 manifest SHA fails cleanly before scheduling.
-    const badDir = makeTempDir('cn-rm-mac-x64-bad-');
-    const badMock = buildMacFetch('buggy_arm64_pin');
+    // 2. Old server ignoring header & pinning darwin-arm64: Intel Mac verifies pinned arm64 manifest + universal binaries,
+    //    then verifies darwin-x64 manifest of the SAME release (matching gitSha + components) and succeeds!
+    const oldServerDir = makeTempDir('cn-rm-mac-x64-old-srv-');
+    const oldServerMock = buildMacFetch('old_server_arm64_pin');
+    const scheduledOldServer: string[] = [];
+    const oldServerRes = await startControlledNodeSelfUpgrade(credential, version, {
+      platform: 'darwin',
+      arch: 'x64',
+      execPath: join(oldServerDir, 'imcodes-node-macos'),
+      journalPath: join(oldServerDir, 'install-journal.json'),
+      tmpdir: () => oldServerDir,
+      spawnDetached: (_cmd, args) => { scheduledOldServer.push(args[0] ?? ''); },
+      sleep: async () => {},
+      fetchImpl: oldServerMock.fetchImpl as unknown as typeof fetch,
+    });
+    expect(oldServerRes).toMatchObject({ ok: true, targetVersion: version, artifactSha256: nodeSha });
+    expect(scheduledOldServer).toHaveLength(1);
+    expect(oldServerMock.seenHeaders.some((e) => e.url.includes('asset=desktop-release-manifest') && e.url.includes('arch=arm64'))).toBe(true);
+    expect(oldServerMock.seenHeaders.some((e) => e.url.includes('asset=desktop-release-manifest') && e.url.includes('arch=x64'))).toBe(true);
+
+    // 3. Old-server pin rejection when arm64 & x64 manifests belong to DIFFERENT gitSha builds.
+    const diffReleaseDir = makeTempDir('cn-rm-mac-x64-diff-sha-');
+    const rmArm64OtherGit = makeMacReleaseManifest('arm64', { gitSha: 'deadbeef12345' });
+    const diffReleaseMock = buildMacFetch('old_server_arm64_pin', { x64: rmX64, arm64: rmArm64OtherGit });
+    const scheduledDiff: string[] = [];
+    await expect(startControlledNodeSelfUpgrade(credential, version, {
+      platform: 'darwin',
+      arch: 'x64',
+      execPath: join(diffReleaseDir, 'imcodes-node-macos'),
+      journalPath: join(diffReleaseDir, 'install-journal.json'),
+      tmpdir: () => diffReleaseDir,
+      spawnDetached: (_cmd, args) => { scheduledDiff.push(args[0] ?? ''); },
+      sleep: async () => {},
+      fetchImpl: diffReleaseMock.fetchImpl as unknown as typeof fetch,
+    })).rejects.toThrow('release_manifest_cross_arch_mismatch');
+    expect(scheduledDiff).toHaveLength(0);
+
+    // 4. Old-server pin rejection when pinned arm64 manifest universal helper hash mismatches downloaded helper.
+    const badCompDir = makeTempDir('cn-rm-mac-x64-bad-comp-');
+    const rmArm64BadOcu = makeMacReleaseManifest('arm64', { ocuSha: 'a'.repeat(64) });
+    const badCompMock = buildMacFetch('old_server_arm64_pin', { x64: rmX64, arm64: rmArm64BadOcu });
+    const scheduledBadComp: string[] = [];
+    await expect(startControlledNodeSelfUpgrade(credential, version, {
+      platform: 'darwin',
+      arch: 'x64',
+      execPath: join(badCompDir, 'imcodes-node-macos'),
+      journalPath: join(badCompDir, 'install-journal.json'),
+      tmpdir: () => badCompDir,
+      spawnDetached: (_cmd, args) => { scheduledBadComp.push(args[0] ?? ''); },
+      sleep: async () => {},
+      fetchImpl: badCompMock.fetchImpl as unknown as typeof fetch,
+    })).rejects.toThrow('release_manifest_open-computer-use_sha256_mismatch');
+    expect(scheduledBadComp).toHaveLength(0);
+
+    // 5. Unknown/tampered pin matching NEITHER darwin-x64 NOR darwin-arm64 still rejects before scheduling.
+    const badDir = makeTempDir('cn-rm-mac-x64-garbage-');
+    const badMock = buildMacFetch('garbage_pin');
     const scheduledBad: string[] = [];
     await expect(startControlledNodeSelfUpgrade(credential, version, {
       platform: 'darwin',
@@ -613,7 +676,21 @@ describe('controlled-node self-upgrade release manifest verification', () => {
     })).rejects.toThrow('release_manifest_pinned_sha256_mismatch');
     expect(scheduledBad).toHaveLength(0);
 
-    // 3. Unknown-arch compatibility fallback (server omits ambiguous header) completes cleanly without false failure.
+    // 6. Apple Silicon (darwin/arm64) must NEVER trigger x64 fallback on pinned sha mismatch.
+    const armBadDir = makeTempDir('cn-rm-mac-arm64-garbage-');
+    const armBadMock = buildMacFetch('garbage_pin');
+    await expect(startControlledNodeSelfUpgrade(credential, version, {
+      platform: 'darwin',
+      arch: 'arm64',
+      execPath: join(armBadDir, 'imcodes-node-macos'),
+      journalPath: join(armBadDir, 'install-journal.json'),
+      tmpdir: () => armBadDir,
+      spawnDetached: () => {},
+      sleep: async () => {},
+      fetchImpl: armBadMock.fetchImpl as unknown as typeof fetch,
+    })).rejects.toThrow('release_manifest_pinned_sha256_mismatch');
+
+    // 7. Unknown-arch compatibility fallback (server omits ambiguous header) completes cleanly without false failure.
     const compatDir = makeTempDir('cn-rm-mac-x64-compat-');
     const compatMock = buildMacFetch('omit_header');
     const scheduledCompat: string[] = [];
