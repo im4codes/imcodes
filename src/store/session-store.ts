@@ -80,6 +80,7 @@ import {
   areClosedSessionRemovalsAuthorized,
   authorizeClosedSessionRemoval,
   clearClosedSessionRemovalAuthorizations,
+  isClosedSessionRemovalAuthorized,
   pruneClosedSessionRemovalAuthorizations,
   revokeClosedSessionRemovalAuthorization,
 } from './session-removal-auth.js';
@@ -1009,9 +1010,16 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
   try {
     const handle = writerHandle(targetPath);
     const swept = sweep ? await findChangedSessions() : new Set<string>();
-    // A strict native-start barrier must not mistake a queued/skipped write
-    // for a commit. The sweep can yield while the daemon loses its lock.
-    if (requireWrite && !hasWriteAuthority(targetPath)) throw new Error('session store write authority changed before commit');
+    // A strict native-start barrier or yielding sweep must not commit after
+    // another daemon took over the instance lock while findChangedSessions yielded.
+    if (sweep) {
+      if (!hasWriteAuthority(targetPath, Boolean(requireWrite))) {
+        if (requireWrite) throw new Error('session store write authority changed before commit');
+        return;
+      }
+    } else if (requireWrite && !hasWriteAuthority(targetPath)) {
+      throw new Error('session store write authority changed before commit');
+    }
 
     // From here to the commit nothing awaits: the rows reflect one instant, and a
     // mutation made while the sweep yielded is in `dirtyNames` and is included.
@@ -1048,22 +1056,45 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
         if (row.blobs) row.blobs = row.blobs.filter((blob) => !knownBlobHashes.has(blob.hash));
       }
       const allowEmptyForCommit = allowEmptyStoreWrite || areClosedSessionRemovalsAuthorized(deletes);
-      commitSessionChanges(handle, {
-        upserts,
-        deletes,
-        allowEmpty: allowEmptyForCommit,
-        markLegitimateEmpty: allowEmptyForCommit,
-        collectBlobs,
-      });
+      let committedDeletes = deletes;
+      let refusedUnauthorizedDeletes = false;
+      try {
+        commitSessionChanges(handle, {
+          upserts,
+          deletes,
+          allowEmpty: allowEmptyForCommit,
+          markLegitimateEmpty: allowEmptyForCommit,
+          collectBlobs,
+        });
+      } catch (error) {
+        if (!(error instanceof EmptyStoreRefusal) || upserts.length > 0) {
+          throw error;
+        }
+        const authorizedDeletes = deletes.filter((name) => isClosedSessionRemovalAuthorized(name));
+        if (authorizedDeletes.length === 0 || authorizedDeletes.length === deletes.length) {
+          throw error;
+        }
+        // Mixed delete batch hit empty-store protection: commit only the
+        // confirmed-closed removals while keeping unauthorized rows on disk.
+        commitSessionChanges(handle, {
+          upserts,
+          deletes: authorizedDeletes,
+          allowEmpty: false,
+          markLegitimateEmpty: false,
+          collectBlobs,
+        });
+        committedDeletes = authorizedDeletes;
+        refusedUnauthorizedDeletes = true;
+      }
       for (const row of upserts) {
         committedPayloads.set(row.name, row.payload);
         for (const blob of row.blobs ?? []) knownBlobHashes.add(blob.hash);
       }
-      for (const name of deletes) {
+      for (const name of committedDeletes) {
         committedPayloads.delete(name);
         revokeClosedSessionRemovalAuthorization(name);
       }
-      if (collectBlobs || deletes.length > 0) {
+      if (collectBlobs || committedDeletes.length > 0) {
         knownBlobHashes = listSessionBlobHashes(handle);
         pruneBlobTexts();
       }
@@ -1075,6 +1106,9 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
       }
       allowEmptyStoreWrite = false;
       scheduleCompatExport(targetPath);
+      if (refusedUnauthorizedDeletes) {
+        logger.error({ targetPath, sessions: committedPayloads.size }, 'Refusing to overwrite a non-empty session store with an empty snapshot');
+      }
     }
     pruneClosedSessionRemovalAuthorizations((name) => committedPayloads.has(name) || Boolean(store.sessions[name]));
     if (sweep) { lastFullSweepAt = Date.now(); fullSweepRequested = false; }

@@ -19,6 +19,10 @@ export function areClosedSessionRemovalsAuthorized(names: readonly string[]): bo
   return names.length > 0 && names.every((name) => authorizedClosedSessionRemovals.has(name));
 }
 
+export function isClosedSessionRemovalAuthorized(name: string): boolean {
+  return authorizedClosedSessionRemovals.has(name);
+}
+
 export function pruneClosedSessionRemovalAuthorizations(shouldKeep: (name: string) => boolean): void {
   for (const name of authorizedClosedSessionRemovals) {
     if (!shouldKeep(name)) authorizedClosedSessionRemovals.delete(name);

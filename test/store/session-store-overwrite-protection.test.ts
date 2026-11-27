@@ -1,4 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import { writeFileSync } from 'node:fs';
 import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -12,12 +13,19 @@ import {
   removeSession,
   resetSessionStoreAuthorityForTests,
   setSessionStoreBackupIntervalMsForTests,
+  setSessionStoreSweepSliceMsForTests,
   upsertSession,
   waitForSessionStoreSnapshotForTests,
   type SessionRecord,
 } from '../../src/store/session-store.js';
+import {
+  SESSION_DB_META_LEGITIMATE_EMPTY,
+  closeSessionDb,
+  openSessionDbReadOnly,
+  readSessionDbMeta,
+} from '../../src/store/session-store-db.js';
 import { currentDaemonProcessIdentity } from '../../src/daemon/instance-lock.js';
-import { persistedSessions, replacePersistedSessions } from '../helpers/session-store-db.js';
+import { persistedSessions, replacePersistedSessions, sessionDbPathForHome } from '../helpers/session-store-db.js';
 
 const identity = currentDaemonProcessIdentity();
 let home = '';
@@ -67,6 +75,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   setSessionStoreBackupIntervalMsForTests(undefined);
+  setSessionStoreSweepSliceMsForTests(undefined);
   resetSessionStoreAuthorityForTests();
   vi.unstubAllEnvs();
   await rm(home, { recursive: true, force: true });
@@ -197,23 +206,66 @@ describe('session-store ownership and recovery', () => {
     await flushStore();
     const before = persistedSessions(home);
 
-    // Authorizing one closed session must not allow an unauthorized removeSession to wipe the rest.
+    // Mixed delete batch: confirmed closed A commits on the first flush while
+    // unauthorized B is refused and stays persisted across reload without any later upsert.
     authorizeClosedSessionRemoval('deck_store_owner_brain');
     removeSession('deck_store_owner_brain');
     removeSession('deck_store_other_w1');
     await flushStore();
-    expect(persistedSessions(home)).toEqual(before);
-
-    // Partial close failure: the surviving session stays in error state while the closed one is removed.
-    upsertSession({ ...record('deck_store_other_w1'), state: 'error', error: 'close failed' });
-    await flushStore();
-    expect(persistedSessions(home).deck_store_owner_brain).toBeUndefined();
-    expect(persistedSessions(home).deck_store_other_w1?.state).toBe('error');
+    expect(persistedSessions(home)).toEqual({ deck_store_other_w1: before.deck_store_other_w1 });
 
     resetSessionStoreAuthorityForTests();
     await installOwner();
     await loadStore();
     expect(listSessions().map((session) => session.name)).toEqual(['deck_store_other_w1']);
+
+    // Independent partial close failure: closed A is removed while surviving B stays in error state.
+    upsertSession(record('deck_store_partial_a'));
+    upsertSession(record('deck_store_partial_b'));
+    await flushStore();
+    authorizeClosedSessionRemoval('deck_store_partial_a');
+    removeSession('deck_store_partial_a');
+    upsertSession({ ...record('deck_store_partial_b'), state: 'error', error: 'close failed' });
+    await flushStore();
+    expect(persistedSessions(home).deck_store_partial_a).toBeUndefined();
+    expect(persistedSessions(home).deck_store_partial_b?.state).toBe('error');
+  });
+
+  it('aborts a normal sweep before commit when another daemon takes the instance lock mid-sweep', async () => {
+    await installOwner();
+    await loadStore();
+    upsertSession(record('deck_store_owner_brain'));
+    await flushStore();
+    const before = persistedSessions(home);
+
+    setSessionStoreSweepSliceMsForTests(0);
+    const flushing = flushStore();
+    await new Promise<void>((resolve) => {
+      setImmediate(() => {
+        authorizeClosedSessionRemoval('deck_store_owner_brain');
+        removeSession('deck_store_owner_brain');
+        writeFileSync(metadataPath, JSON.stringify({
+          version: 1,
+          pid: identity.pid + 1,
+          startToken: 'foreign-start-token',
+          acquiredAt: Date.now(),
+          socketPath: join(home, '.imcodes', 'daemon.sock'),
+          sessionIds: [],
+          residualResources: [],
+        }), 'utf8');
+        resolve();
+      });
+    });
+    await flushing;
+
+    expect(persistedSessions(home)).toEqual(before);
+    const handle = openSessionDbReadOnly(sessionDbPathForHome(home));
+    expect(handle).not.toBeNull();
+    try {
+      expect(readSessionDbMeta(handle!, SESSION_DB_META_LEGITIMATE_EMPTY)).toBeNull();
+    } finally {
+      if (handle) closeSessionDb(handle);
+    }
   });
 
   it('test mode rejects the real HOME even when VITEST is absent', async () => {
