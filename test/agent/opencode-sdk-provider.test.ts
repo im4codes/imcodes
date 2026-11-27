@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -2154,17 +2155,22 @@ describe('OpenCodeSdkProvider', () => {
     const compactPromise = provider.send(routeId, '/compact');
     await vi.waitFor(() => expect(harness.client.session.compact).toHaveBeenCalledWith({
       sessionID: 'oc-session-1',
+      id: expect.stringMatching(/^msg_/),
     }));
+    const firstCompactId = (harness.client.session.compact.mock.calls[0]?.[0] as { id: string }).id;
     expect(statuses).toContainEqual({ status: 'compacting', label: 'Compacting conversation...' });
 
     // v2 session.compaction.started keeps compacting status; idle mid-compaction must not fail empty
-    harness.queue.push({ type: 'session.compaction.started', data: { sessionID: 'oc-session-1', reason: 'manual' } });
+    harness.queue.push({
+      type: 'session.compaction.started',
+      data: { sessionID: 'oc-session-1', reason: 'manual', inputID: firstCompactId },
+    });
     harness.queue.push({ type: 'session.idle', data: { sessionID: 'oc-session-1' } });
-    // v2 session.compaction.ended completes compaction once
+    // Real v2 session.compaction.ended omits inputID and settles only after matching manual start
     harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'manual', text: 'Summary' } });
     harness.queue.push({ type: 'session.compacted', data: { sessionID: 'oc-session-1' } });
     await vi.waitFor(() => expect(completions).toHaveLength(1));
-    compactDeferred.resolve({ id: 'msg-compact-1' });
+    compactDeferred.resolve({ id: firstCompactId });
     await compactPromise;
 
     expect(completions).toHaveLength(1);
@@ -2183,8 +2189,8 @@ describe('OpenCodeSdkProvider', () => {
     expect(statuses[statuses.length - 1]).toEqual({ status: null, label: null });
     expect(errors).toHaveLength(0);
 
-    // Legacy session.compacted also still works
-    harness.client.session.compact.mockResolvedValueOnce({ id: 'msg-compact-legacy' });
+    // Legacy session.compacted also still works when no v2 compaction events occurred
+    harness.client.session.compact.mockImplementationOnce(async ({ id }: { id: string }) => ({ id }));
     await provider.send(routeId, '/compact');
     harness.queue.push({ type: 'session.compacted', data: { sessionID: 'oc-session-1' } });
     await vi.waitFor(() => expect(completions).toHaveLength(2));
@@ -2193,11 +2199,12 @@ describe('OpenCodeSdkProvider', () => {
     });
 
     // session.compaction.failed surfaces normalized error
-    harness.client.session.compact.mockResolvedValueOnce({ id: 'msg-compact-fail' });
+    harness.client.session.compact.mockImplementationOnce(async ({ id }: { id: string }) => ({ id }));
     await provider.send(routeId, '/compact');
+    const failedCompactId = (harness.client.session.compact.mock.calls[2]?.[0] as { id: string }).id;
     harness.queue.push({
       type: 'session.compaction.failed',
-      data: { sessionID: 'oc-session-1', reason: 'manual', error: { message: 'compaction failed upstream' } },
+      data: { sessionID: 'oc-session-1', reason: 'manual', inputID: failedCompactId, error: { message: 'compaction failed upstream' } },
     });
     await vi.waitFor(() => expect(errors).toHaveLength(1));
     expect(errors[0]).toMatchObject({
@@ -2644,7 +2651,7 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
-  it('ignores late normal execution completions, auto compactions, and stale/mismatched frames during manual /compact', async () => {
+  it('ignores late normal execution completions, auto compactions, and stale/pre-ACK frames during manual /compact', async () => {
     const harness = createHarness();
     const compactDeferred = deferred<Record<string, unknown>>();
     harness.client.session.compact.mockImplementationOnce(() => compactDeferred.promise);
@@ -2663,29 +2670,33 @@ describe('OpenCodeSdkProvider', () => {
 
     const compactPromise = provider.send(routeId, '/compact');
     await vi.waitFor(() => expect(harness.client.session.compact).toHaveBeenCalledOnce());
+    const preBoundId = (harness.client.session.compact.mock.calls[0]?.[0] as { id: string }).id;
+    expect(preBoundId).toMatch(/^msg_/);
 
     // 1. Late normal turn completion arrives while manual compaction is in-flight -> MUST NOT settle /compact
     harness.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
-    // 2. Premature manual ended frame before current manual compaction started -> MUST NOT settle
-    harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'manual', text: 'stale' } });
+    // 2. Stale pre-ACK manual started + omitted-inputID ended BEFORE compact() RPC resolves -> MUST NOT settle
+    harness.queue.push({ type: 'session.compaction.started', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: 'msg_stale_old_1' } });
+    harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'manual', text: 'stale pre-ack' } });
     // 3. Background auto compaction lifecycle -> MUST NOT settle /compact or fail it
     harness.queue.push({ type: 'session.compaction.started', data: { sessionID: 'oc-session-1', reason: 'auto' } });
     harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'auto', text: 'auto' } });
     harness.queue.push({ type: 'session.compaction.failed', data: { sessionID: 'oc-session-1', reason: 'auto', error: { message: 'auto err' } } });
-    // 4. Mismatched inputID started/failed -> MUST NOT correlate with current admission
-    compactDeferred.resolve({ id: 'cmp-current-2' });
+    // 4. Legacy session.compacted after v2 compaction events MUST NOT bypass v2 correlation
+    harness.queue.push({ type: 'session.compacted', data: { sessionID: 'oc-session-1' } });
+    compactDeferred.resolve({ id: preBoundId });
     await compactPromise;
-    harness.queue.push({ type: 'session.compaction.started', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: 'cmp-old-1' } });
-    harness.queue.push({ type: 'session.compaction.failed', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: 'cmp-old-1', error: { message: 'old failed' } } });
+    harness.queue.push({ type: 'session.compaction.started', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: 'msg_old_other_1' } });
+    harness.queue.push({ type: 'session.compaction.failed', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: 'msg_old_other_1', error: { message: 'old failed' } } });
 
     await new Promise((r) => setTimeout(r, 25));
     expect(completes).toHaveLength(0);
     expect(errors).toHaveLength(0);
 
-    // 5. Matching current manual started + ended settles exactly once, and duplicates are ignored
-    harness.queue.push({ type: 'session.compaction.started', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: 'cmp-current-2' } });
-    harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: 'cmp-current-2', text: 'Current summary' } });
-    harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: 'cmp-current-2', text: 'Duplicate' } });
+    // 5. Matching current manual started (exact preBoundId) + v2 ended (no inputID) settles once, duplicates ignored
+    harness.queue.push({ type: 'session.compaction.started', data: { sessionID: 'oc-session-1', reason: 'manual', inputID: preBoundId } });
+    harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'manual', text: 'Current summary' } });
+    harness.queue.push({ type: 'session.compaction.ended', data: { sessionID: 'oc-session-1', reason: 'manual', text: 'Duplicate' } });
     await vi.waitFor(() => expect(completes).toHaveLength(1));
     expect(completes[0].content).toBe('OpenCode context compacted.');
     expect(errors).toHaveLength(0);
@@ -2990,4 +3001,634 @@ describe('OpenCodeSdkProvider', () => {
       rmSync(tempDir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it('rejects plain 401, non-401 api_key_expired text, conflicting provider, and keeps inactive opencode backup credentials', async () => {
+    for (const badError of [
+      { type: 'provider.error', status: 401, message: 'Unauthorized: missing organization scope' },
+      { type: 'provider.error', status: 400, message: 'note mentions api_key_expired in body without 401' },
+      { type: 'provider.auth', status: 401, providerID: 'minimax', message: 'api_key_expired' },
+    ]) {
+      const harness = createHarness();
+      harness.credentials.push({ id: 'cred-oc-only', integrationID: 'opencode', active: true });
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', harness.queue.close, { once: true });
+        return { client: harness.client as any, server: harness.server };
+      });
+      const provider = new OpenCodeSdkProvider();
+      const errors: any[] = [];
+      provider.onError((_s, err) => errors.push(err));
+      await provider.connect({});
+      const routeId = await provider.createSession({
+        sessionKey: 'route-strict-auth',
+        cwd: '/tmp/project',
+        agentId: DEFAULT_OPENCODE_MODEL_ID,
+      });
+      await provider.send(routeId, 'strict check');
+      harness.queue.push({
+        type: 'session.step.failed',
+        data: { sessionID: 'oc-session-1', error: badError },
+      });
+      await vi.waitFor(() => expect(errors).toHaveLength(1));
+      expect(harness.client.credential.remove).not.toHaveBeenCalled();
+      expect(harness.client.sessions.prompt).toHaveBeenCalledOnce();
+      await provider.disconnect();
+    }
+
+    // Multiple opencode credentials: remove ONLY active=true, leave inactive backup untouched!
+    const harness = createHarness();
+    harness.credentials.push(
+      { id: 'cred-oc-expired', integrationID: 'opencode', label: 'expired-active', active: true },
+      { id: 'cred-oc-backup', integrationID: 'opencode', label: 'valid-backup', active: false },
+    );
+    harness.client.provider.list.mockResolvedValue({
+      data: [{ id: 'opencode', name: 'OpenCode', activation: 'enabled' }],
+    });
+    harness.client.model.list.mockResolvedValue({
+      data: [{
+        id: DEFAULT_OPENCODE_MODEL_ID,
+        modelID: 'big-pickle',
+        providerID: 'opencode',
+        name: 'Big Pickle',
+        enabled: true,
+        type: 'chat',
+      }],
+    });
+    harness.client.credential.remove.mockImplementation(async ({ credentialID }) => {
+      const idx = harness.credentials.findIndex((c) => c.id === credentialID);
+      if (idx >= 0) harness.credentials.splice(idx, 1);
+    });
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const completes: any[] = [];
+    provider.onComplete((_s, msg) => completes.push(msg));
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-backup-cred',
+      cwd: '/tmp/project',
+      agentId: DEFAULT_OPENCODE_MODEL_ID,
+    });
+    await provider.send(routeId, 'backup cred test');
+    harness.queue.push({
+      type: 'session.step.failed',
+      data: {
+        sessionID: 'oc-session-1',
+        error: { type: 'provider.auth', status: 401, code: 'api_key_expired', message: 'API key expired' },
+      },
+    });
+    await vi.waitFor(() => expect(harness.client.sessions.prompt).toHaveBeenCalledTimes(2));
+    expect(harness.client.credential.remove).toHaveBeenCalledOnce();
+    expect(harness.client.credential.remove).toHaveBeenCalledWith({ credentialID: 'cred-oc-expired' });
+    expect(harness.credentials).toEqual([{ id: 'cred-oc-backup', integrationID: 'opencode', label: 'valid-backup', active: false }]);
+    harness.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', ordinal: 0, delta: 'OK with backup' } });
+    harness.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+    await provider.disconnect();
+  });
+
+  it('keeps authHealInFlight fenced across hung switchModel against late attempt-1 frames, aborts cleanly on close, and refuses third-party model leak', async () => {
+    // 1. Hung switchModel + late attempt-1 execution.failed / idle / execution.succeeded must not break retry
+    const harness = createHarness();
+    harness.credentials.push({ id: 'cred-oc-1', integrationID: 'opencode', active: true });
+    let healed = false;
+    harness.client.credential.remove.mockImplementation(async () => { healed = true; });
+    harness.client.model.list.mockImplementation(async () => ({
+      data: [
+        ...(!healed ? [{ id: 'opencode/paid', modelID: 'paid', providerID: 'opencode', enabled: true, type: 'chat' }] : []),
+        { id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' },
+      ],
+    }));
+    const switchGate = deferred<void>();
+    let switchCount = 0;
+    harness.client.session.switchModel.mockImplementation(async () => {
+      switchCount += 1;
+      if (switchCount === 2) return switchGate.promise;
+    });
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+
+    const provider = new OpenCodeSdkProvider();
+    const completes: any[] = [];
+    const errors: any[] = [];
+    provider.onComplete((_s, msg) => completes.push(msg));
+    provider.onError((_s, err) => errors.push(err));
+    await provider.connect({});
+    const routeId = await provider.createSession({
+      sessionKey: 'route-hung-switch',
+      cwd: '/tmp/project',
+      agentId: 'opencode/paid',
+    });
+    await provider.send(routeId, 'attempt 1');
+
+    harness.queue.push({
+      type: 'session.step.failed',
+      data: { sessionID: 'oc-session-1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } },
+    });
+    await vi.waitFor(() => expect(switchCount).toBe(2));
+
+    // Late attempt-1 frames arrive while switchModel is STILL suspended!
+    harness.queue.push({ type: 'session.execution.failed', data: { sessionID: 'oc-session-1', error: { message: 'late attempt 1 err' } } });
+    harness.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
+    harness.queue.push({ type: 'session.idle', data: { sessionID: 'oc-session-1' } });
+    await new Promise((r) => setTimeout(r, 25));
+    expect(completes).toHaveLength(0);
+    expect(errors).toHaveLength(0);
+
+    switchGate.resolve();
+    await vi.waitFor(() => expect(harness.client.sessions.prompt).toHaveBeenCalledTimes(2));
+    harness.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', ordinal: 0, delta: 'Attempt 2 succeeded' } });
+    harness.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+    expect(completes[0].content).toBe('Attempt 2 succeeded');
+    expect(errors).toHaveLength(0);
+    await provider.disconnect();
+
+    // 2. endSession() / close mid-heal aborts cleanly without sending zombie retry
+    const h2 = createHarness();
+    const listGate = deferred<{ data: any[] }>();
+    h2.client.model.list.mockImplementationOnce(async () => ({
+      data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }],
+    })).mockImplementationOnce(() => listGate.promise);
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', h2.queue.close, { once: true });
+      return { client: h2.client as any, server: h2.server };
+    });
+    const p2 = new OpenCodeSdkProvider();
+    await p2.connect({});
+    const r2 = await p2.createSession({ sessionKey: 'route-close-mid-heal', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+    await p2.send(r2, 'trigger');
+    h2.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+    await vi.waitFor(() => expect(h2.client.model.list).toHaveBeenCalledTimes(2));
+    await p2.endSession(r2);
+    listGate.resolve({ data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }] });
+    await new Promise((r) => setTimeout(r, 25));
+    expect(h2.client.sessions.prompt).toHaveBeenCalledOnce();
+    await p2.disconnect();
+
+    // 3. Missing opencode/big-pickle in refreshed catalog with only third-party minimax model -> fail cleanly (no minimax leak!)
+    const h3 = createHarness();
+    h3.credentials.push({ id: 'cred-oc-paid', integrationID: 'opencode', active: true });
+    let cleared = false;
+    h3.client.credential.remove.mockImplementation(async () => { cleared = true; });
+    h3.client.provider.list.mockImplementation(async () => ({
+      data: cleared ? [{ id: 'minimax', name: 'MiniMax', activation: 'enabled' }] : [{ id: 'opencode', name: 'OpenCode', activation: 'enabled' }],
+    }));
+    h3.client.model.list.mockImplementation(async () => ({
+      data: cleared
+        ? [{ id: 'minimax/minimax-m2.5', modelID: 'minimax-m2.5', providerID: 'minimax', enabled: true, type: 'chat' }]
+        : [{ id: 'opencode/paid', modelID: 'paid', providerID: 'opencode', enabled: true, type: 'chat' }],
+    }));
+    h3.client.model.default.mockImplementation(async () => ({
+      data: cleared ? { providerID: 'minimax', modelID: 'minimax-m2.5' } : { providerID: 'opencode', modelID: 'paid' },
+    }));
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', h3.queue.close, { once: true });
+      return { client: h3.client as any, server: h3.server };
+    });
+    const p3 = new OpenCodeSdkProvider();
+    const errs3: any[] = [];
+    p3.onError((_s, err) => errs3.push(err));
+    await p3.connect({});
+    const r3 = await p3.createSession({ sessionKey: 'route-no-leak', cwd: '/tmp/project', agentId: 'opencode/paid' });
+    await p3.send(r3, 'no third party leak');
+    h3.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+    await vi.waitFor(() => expect(errs3).toHaveLength(1));
+    expect(errs3[0]).toMatchObject({ code: PROVIDER_ERROR_CODES.AUTH_FAILED, recoverable: false });
+    expect(h3.client.sessions.prompt).toHaveBeenCalledOnce();
+    await p3.disconnect();
+  });
+
+  it('converts legacy v1 file/agent parts, rejects unconvertible parts cleanly, and restores a real v1.18.4 CLI file-attachment session', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oc-v1-real-attach-'));
+    tempDirs.push(tempDir);
+    const v1Bin = '/home/k/.opencode/bin/opencode';
+    const xdgConfig = join(tempDir, 'xdg-config');
+    const xdgData = join(tempDir, 'xdg-data');
+    const xdgState = join(tempDir, 'xdg-state');
+    const xdgCache = join(tempDir, 'xdg-cache');
+    const workDir = join(tempDir, 'work');
+    const v2DbPath = join(tempDir, 'v2.db');
+    mkdirSync(join(xdgConfig, 'opencode'), { recursive: true });
+    mkdirSync(join(xdgData, 'opencode'), { recursive: true });
+    mkdirSync(workDir, { recursive: true });
+    const sampleFile = join(workDir, 'attachment.txt');
+    writeFileSync(sampleFile, 'legacy-v1-attachment-payload\n');
+
+    const srv = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        const parsed = body ? JSON.parse(body) as { messages?: Array<{ content?: unknown }> } : {};
+        const lastMsg = JSON.stringify(parsed.messages?.at(-1) ?? {});
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+        res.write(`data: ${JSON.stringify({
+          id: 'c1',
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: { content: `V2_FOLLOWUP_OK:${lastMsg.slice(0, 40)}` }, finish_reason: null }],
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          id: 'c1',
+          object: 'chat.completion.chunk',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 12, completion_tokens: 6 },
+        })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+    });
+    await new Promise<void>((resolveListen) => srv.listen(0, '127.0.0.1', resolveListen));
+    const port = (srv.address() as { port: number }).port;
+
+    const prevXdgData = process.env.XDG_DATA_HOME;
+    const prevXdgConfig = process.env.XDG_CONFIG_HOME;
+    const origCreate = OpenCode.create.bind(OpenCode);
+    const createSpy = vi.spyOn(OpenCode, 'create');
+
+    try {
+      let legacySid = '';
+      const { DatabaseSync } = await import('node:sqlite');
+      if (existsSync(v1Bin)) {
+        writeFileSync(join(xdgConfig, 'opencode', 'opencode.json'), JSON.stringify({
+          provider: {
+            opencode: {
+              name: 'OpenCode',
+              npm: '@ai-sdk/openai-compatible',
+              options: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: 'mock-v1-key' },
+              models: { 'big-pickle': { name: 'Big Pickle' } },
+            },
+          },
+          model: 'opencode/big-pickle',
+        }));
+        const runV1 = await new Promise<{ status: number | null; stderr: string }>((resolveRun, rejectRun) => {
+          const child = spawn(v1Bin, ['run', '--file', sampleFile, '--', 'inspect attached file'], {
+            cwd: workDir,
+            env: {
+              ...process.env,
+              HOME: tempDir,
+              XDG_CONFIG_HOME: xdgConfig,
+              XDG_DATA_HOME: xdgData,
+              XDG_STATE_HOME: xdgState,
+              XDG_CACHE_HOME: xdgCache,
+              OPENCODE_API_KEY: 'mock-v1-key',
+            },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          let stderr = '';
+          child.stderr.on('data', (d) => { stderr += String(d); });
+          const timer = setTimeout(() => {
+            child.kill('SIGKILL');
+            rejectRun(new Error(`v1 binary timed out: ${stderr}`));
+          }, 20_000);
+          child.on('error', (err) => {
+            clearTimeout(timer);
+            rejectRun(err);
+          });
+          child.on('close', (code) => {
+            clearTimeout(timer);
+            resolveRun({ status: code, stderr });
+          });
+        });
+        expect(runV1.status).toBe(0);
+        const v1Db = new DatabaseSync(join(xdgData, 'opencode', 'opencode.db'));
+        try {
+          const row = v1Db.prepare('SELECT id FROM session ORDER BY time_created DESC LIMIT 1').get() as { id: string } | undefined;
+          expect(row?.id).toMatch(/^ses_/);
+          legacySid = row!.id;
+          // Also add a second message row containing inline data-URI file + agent part to cover every v1 part conversion in one real DB
+          const msg2 = 'msg_v1_inline_agent_2';
+          v1Db.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+            .run(msg2, legacySid, Date.now(), Date.now(), JSON.stringify({ role: 'user', agent: 'build', time: { created: Date.now() } }));
+          v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+            .run('prt_inline_1', msg2, legacySid, Date.now(), Date.now(), JSON.stringify({
+              type: 'file',
+              mime: 'image/png',
+              filename: 'inline.png',
+              url: `data:image/png;base64,${Buffer.from('PNG').toString('base64')}`,
+            }));
+          v1Db.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+            .run('prt_agent_1', msg2, legacySid, Date.now(), Date.now(), JSON.stringify({
+              type: 'agent',
+              name: 'reviewer',
+              source: { value: '@reviewer', start: 0, end: 9 },
+            }));
+        } finally {
+          v1Db.close();
+        }
+      } else {
+        throw new Error(`Expected real v1.18.4 binary at ${v1Bin}`);
+      }
+
+      process.env.XDG_DATA_HOME = xdgData;
+      process.env.XDG_CONFIG_HOME = xdgConfig;
+      createSpy.mockImplementation(async (opts: any) => origCreate({
+        ...opts,
+        config: {
+          content: JSON.stringify({
+            $schema: 'https://opencode.ai/config.json',
+            share: 'disabled',
+            provider: {
+              mock: {
+                npm: '@ai-sdk/openai-compatible',
+                options: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: 'sk-v2-local' },
+                models: { 'big-pickle': { name: 'Mock Model' } },
+              },
+            },
+            model: 'mock/big-pickle',
+          }),
+        },
+      }));
+
+      const provider = new OpenCodeSdkProvider();
+      const completes: Array<{ sessionId: string; msg: any }> = [];
+      provider.onComplete((sessionId, msg) => completes.push({ sessionId, msg }));
+      await provider.connect({ databasePath: v2DbPath, cwd: workDir } as any);
+      const client = (provider as any).client;
+      const catalog = await provider.listModels(true);
+      const modelId = catalog.models.find((m) => m.id === 'mock/big-pickle')?.id ?? 'mock/big-pickle';
+
+      const restoredRoute = await provider.createSession({
+        sessionKey: 'restored-v1-attach-route',
+        cwd: workDir,
+        skipCreate: true,
+        resumeId: legacySid,
+        agentId: modelId,
+      });
+      const importedMsgs = await client.message.list({ sessionID: legacySid });
+      const msgData = importedMsgs.data ?? [];
+      expect(msgData.some((m: any) => m.type === 'user' && Array.isArray(m.files) && m.files[0]?.name === 'inline.png')).toBe(true);
+      expect(msgData.some((m: any) => m.type === 'user' && Array.isArray(m.agents) && m.agents[0]?.name === 'reviewer')).toBe(true);
+      expect(msgData.some((m: any) => m.type === 'user' && String(m.text).includes('Attachment unavailable after migration: attachment.txt'))).toBe(true);
+
+      await provider.send(restoredRoute, 'continue restored v1 attachment session');
+      await vi.waitFor(() => expect(completes).toHaveLength(1), { timeout: 10_000 });
+      expect(completes[0].msg.content).toContain('V2_FOLLOWUP_OK:');
+      expect(completes[0].msg.metadata?.providerSessionId).toBe(legacySid);
+
+      // Corrupt / unconvertible part type surfaces actionable opencode export diagnostic
+      const badSid = 'ses_legacy_bad_part_001';
+      const v1DbWrite = new DatabaseSync(join(xdgData, 'opencode', 'opencode.db'));
+      try {
+        v1DbWrite.prepare('INSERT INTO session (id, project_id, directory, slug, title, version, time_created, time_updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+          .run(badSid, 'global', workDir, 'bad-part-session', 'Bad Part Session', '1.18.4', Date.now(), Date.now());
+        v1DbWrite.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)')
+          .run('msg_bad_1', badSid, Date.now(), Date.now(), JSON.stringify({ role: 'user', time: { created: Date.now() } }));
+        v1DbWrite.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)')
+          .run('prt_bad_1', 'msg_bad_1', badSid, Date.now(), Date.now(), JSON.stringify({ type: 'unknown-v1-widget', payload: 1 }));
+      } finally {
+        v1DbWrite.close();
+      }
+      await expect(provider.createSession({
+        sessionKey: 'bad-v1-attach-route',
+        cwd: workDir,
+        skipCreate: true,
+        resumeId: badSid,
+      })).rejects.toThrow(`opencode export ${badSid}`);
+
+      await provider.disconnect();
+    } finally {
+      createSpy.mockRestore();
+      if (prevXdgData === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevXdgData;
+      if (prevXdgConfig === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = prevXdgConfig;
+      srv.closeAllConnections?.();
+      srv.close();
+    }
+  }, 30_000);
+
+  it('uses a single host event subscription (zero duplicate delivery) and isolates parallel same-cwd MCP sessions on a shared DB host', async () => {
+    const tempDir = mkdtempSync(join(tmpdir(), 'oc-parallel-samecwd-mcp-'));
+    tempDirs.push(tempDir);
+    const sharedDir = join(tempDir, 'shared-project');
+    const xdgDir = join(tempDir, 'xdg');
+    const dbPath = join(tempDir, 'shared-v2.db');
+    const mcpScript = join(tempDir, 'fake-mcp.mjs');
+    mkdirSync(sharedDir, { recursive: true });
+    mkdirSync(xdgDir, { recursive: true });
+
+    // Zero-dependency stdio MCP server returning its own process.env.IMCODES_SESSION
+    writeFileSync(mcpScript, [
+      "import readline from 'node:readline';",
+      "const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });",
+      "const reply = (id, result) => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\\n');",
+      "rl.on('line', (line) => {",
+      "  if (!line.trim()) return;",
+      "  const msg = JSON.parse(line);",
+      "  if (msg.method === 'initialize') {",
+      "    reply(msg.id, {",
+      "      protocolVersion: msg.params?.protocolVersion ?? '2024-11-05',",
+      "      capabilities: { tools: {} },",
+      "      serverInfo: { name: 'imcodes-memory', version: '1.0.0' },",
+      "    });",
+      "  } else if (msg.method === 'tools/list') {",
+      "    reply(msg.id, {",
+      "      tools: [{",
+      "        name: 'whoami',",
+      "        description: 'Return session env identity',",
+      "        inputSchema: { type: 'object', properties: {}, additionalProperties: false },",
+      "      }],",
+      "    });",
+      "  } else if (msg.method === 'tools/call') {",
+      "    reply(msg.id, {",
+      "      content: [{ type: 'text', text: JSON.stringify({ session: process.env.IMCODES_DAEMON_SESSION_NAME ?? 'unset' }) }],",
+      "    });",
+      "  } else if (msg.id !== undefined) {",
+      "    reply(msg.id, {});",
+      "  }",
+      "});",
+    ].join('\n'));
+
+    let callSeq = 0;
+    const srv = createServer((req, res) => {
+      let body = '';
+      req.on('data', (chunk) => { body += chunk; });
+      req.on('end', () => {
+        const parsed = body ? JSON.parse(body) as {
+          messages?: Array<{ role?: string; content?: unknown }>;
+          tools?: Array<{ function?: { name?: string } }>;
+        } : {};
+        const last = parsed.messages?.at(-1);
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+        if (last?.role === 'tool') {
+          const text = typeof last.content === 'string' ? last.content : JSON.stringify(last.content);
+          res.write(`data: ${JSON.stringify({
+            id: 'c1',
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: { content: `WHOAMI=${text}` }, finish_reason: null }],
+          })}\n\n`);
+          res.write(`data: ${JSON.stringify({
+            id: 'c1',
+            object: 'chat.completion.chunk',
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 15, completion_tokens: 8 },
+          })}\n\n`);
+        } else {
+          const toolName = (parsed.tools ?? []).map((t) => t.function?.name).find((n) => n?.includes('whoami'));
+          if (!toolName) {
+            res.write(`data: ${JSON.stringify({
+              id: 'c1',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: { content: 'NO_MCP_TOOL' }, finish_reason: null }],
+            })}\n\n`);
+            res.write(`data: ${JSON.stringify({
+              id: 'c1',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            })}\n\n`);
+          } else {
+            res.write(`data: ${JSON.stringify({
+              id: 'c1',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `tc_${++callSeq}`, type: 'function', function: { name: toolName, arguments: '{}' } }] }, finish_reason: null }],
+            })}\n\n`);
+            res.write(`data: ${JSON.stringify({
+              id: 'c1',
+              object: 'chat.completion.chunk',
+              choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+            })}\n\n`);
+          }
+        }
+        res.write('data: [DONE]\n\n');
+        res.end();
+      });
+    });
+    await new Promise<void>((resolveListen) => srv.listen(0, '127.0.0.1', resolveListen));
+    const port = (srv.address() as { port: number }).port;
+
+    const prevXdg = process.env.XDG_DATA_HOME;
+    process.env.XDG_DATA_HOME = xdgDir;
+    const origCreate = OpenCode.create.bind(OpenCode);
+    const createSpy = vi.spyOn(OpenCode, 'create');
+    let subscribeCalls = 0;
+
+    try {
+      createSpy.mockImplementation(async (opts: any) => {
+        const sdk = await origCreate({
+          ...opts,
+          config: {
+            content: JSON.stringify({
+              $schema: 'https://opencode.ai/config.json',
+              share: 'disabled',
+              provider: {
+                mock: {
+                  npm: '@ai-sdk/openai-compatible',
+                  options: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: 'sk-mcp-test' },
+                  models: { 'big-pickle': { name: 'Mock Model' } },
+                },
+              },
+              model: 'mock/big-pickle',
+            }),
+          },
+        });
+        const origSub = sdk.events.subscribe.bind(sdk.events);
+        (sdk.events as any).subscribe = (...args: any[]) => {
+          subscribeCalls += 1;
+          return origSub(...args);
+        };
+        return sdk;
+      });
+
+      const provider = new OpenCodeSdkProvider();
+      const completes: Array<{ sessionId: string; msg: any }> = [];
+      const toolsBySession = new Map<string, string[]>();
+      const errors: any[] = [];
+      provider.onComplete((sessionId, msg) => completes.push({ sessionId, msg }));
+      provider.onToolCall((sessionId, tool) => {
+        if (tool.status === 'complete') {
+          const list = toolsBySession.get(sessionId) ?? [];
+          list.push(tool.id);
+          toolsBySession.set(sessionId, list);
+        }
+      });
+      provider.onError((sessionId, err) => errors.push({ sessionId, err }));
+
+      await provider.connect({ databasePath: dbPath, cwd: sharedDir } as any);
+      const catalog = await provider.listModels(true);
+      const modelId = catalog.models.find((m) => m.id === 'mock/big-pickle')?.id ?? 'mock/big-pickle';
+
+      // Create two concurrent sessions sharing the EXACT same `sharedDir` cwd, pointing to our isolated stdio MCP script
+      const origStart = openCodeSdkRuntimeHooks.start.bind(openCodeSdkRuntimeHooks);
+      const hookSpy = vi.spyOn(openCodeSdkRuntimeHooks, 'start').mockImplementation(async (startOpts) => {
+        const res = await origStart(startOpts);
+        const origBind = res.bindSessionMcp;
+        return {
+          ...res,
+          ...(origBind
+            ? {
+              bindSessionMcp: (psid, dir, servers) => {
+                const patched = Object.fromEntries(
+                  Object.entries(servers).map(([name, spec]) => [name, {
+                    ...spec,
+                    command: ['node', mcpScript],
+                  }]),
+                );
+                return origBind(psid, dir, patched);
+              },
+            }
+            : {}),
+        };
+      });
+
+      try {
+        const routeA = await provider.createSession({
+          sessionKey: 'samecwd-alpha',
+          sessionName: 'deck_sub_alpha',
+          cwd: sharedDir,
+          agentId: modelId,
+        });
+        const routeB = await provider.createSession({
+          sessionKey: 'samecwd-beta',
+          sessionName: 'deck_sub_beta',
+          cwd: sharedDir,
+          agentId: modelId,
+        });
+
+        // Only ONE shared host AND ONLY ONE events.subscribe() stream across connect + both sessions!
+        expect(createSpy).toHaveBeenCalledTimes(1);
+        expect(subscribeCalls).toBe(1);
+
+        // Execute parallel turns in both sessions sharing sharedDir
+        await Promise.all([
+          provider.send(routeA, 'identify alpha'),
+          provider.send(routeB, 'identify beta'),
+        ]);
+        await vi.waitFor(() => {
+          if (errors.length > 0) throw new Error(`Parallel MCP errors: ${JSON.stringify(errors)}`);
+          expect(completes.filter((c) => c.sessionId === routeA)).toHaveLength(1);
+          expect(completes.filter((c) => c.sessionId === routeB)).toHaveLength(1);
+        }, { timeout: 15_000 });
+
+        const completeA = completes.find((c) => c.sessionId === routeA)!;
+        const completeB = completes.find((c) => c.sessionId === routeB)!;
+        expect(completeA.msg.content).toContain('"session":"deck_sub_alpha"');
+        expect(completeB.msg.content).toContain('"session":"deck_sub_beta"');
+        // Zero duplicate tool call / completion deliveries
+        expect(toolsBySession.get(routeA)).toHaveLength(1);
+        expect(toolsBySession.get(routeB)).toHaveLength(1);
+
+        // Close Session B only -> Session A's stream & MCP client must keep working identically
+        await provider.endSession(routeB);
+        await provider.send(routeA, 'identify alpha again');
+        await vi.waitFor(() => {
+          expect(completes.filter((c) => c.sessionId === routeA)).toHaveLength(2);
+        }, { timeout: 15_000 });
+        expect(completes.filter((c) => c.sessionId === routeA)[1].msg.content).toContain('"session":"deck_sub_alpha"');
+        expect(subscribeCalls).toBe(1);
+
+        await provider.disconnect();
+      } finally {
+        hookSpy.mockRestore();
+      }
+    } finally {
+      createSpy.mockRestore();
+      if (prevXdg === undefined) delete process.env.XDG_DATA_HOME;
+      else process.env.XDG_DATA_HOME = prevXdg;
+      srv.closeAllConnections?.();
+      srv.close();
+    }
+  }, 35_000);
 });

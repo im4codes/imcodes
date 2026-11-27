@@ -155,7 +155,7 @@ export interface OpenCodeClientLike {
       sessionID: string;
       model: { providerID: string; id: string; variant?: string };
     }): Promise<void>;
-    compact(input: { sessionID: string }): Promise<Record<string, unknown>>;
+    compact(input: { sessionID: string; id?: string }): Promise<Record<string, unknown>>;
     interrupt(input: { sessionID: string }): Promise<{ interrupted?: boolean } | void>;
     message: {
       get(input: { sessionID: string; messageID: string }): Promise<Record<string, unknown>>;
@@ -234,6 +234,13 @@ interface OpenCodeServerLike {
   close(): Promise<void> | void;
 }
 
+export interface OpenCodeMcpServerSpec {
+  type: 'local';
+  command: string[];
+  environment: Record<string, string>;
+  disabled: boolean;
+}
+
 export interface OpenCodeSdkStartOptions {
   hostname: string;
   port: number;
@@ -244,24 +251,324 @@ export interface OpenCodeSdkStartOptions {
   directory?: string;
   warmupCatalog?: boolean;
   hostGroupKey?: string;
-  mcpServers?: Record<string, {
-    type: 'local';
-    command: string[];
-    environment: Record<string, string>;
-    disabled: boolean;
-  }>;
+  mcpServers?: Record<string, OpenCodeMcpServerSpec>;
+}
+
+export interface OpenCodeSdkRuntimeStartResult {
+  client: OpenCodeClientLike;
+  server: OpenCodeServerLike;
+  subscribeEvents?: (
+    consumerId: symbol,
+    listener: (event: Record<string, any>) => void,
+    onError: (error: unknown) => void,
+  ) => Promise<() => Promise<void>>;
+  bindSessionMcp?: (
+    providerSessionId: string,
+    directory: string,
+    mcpServers: Record<string, OpenCodeMcpServerSpec>,
+  ) => Promise<void>;
+  unbindSessionMcp?: (providerSessionId: string) => Promise<void>;
 }
 
 export interface OpenCodeSdkRuntimeHooks {
-  start(options: OpenCodeSdkStartOptions): Promise<{
-    client: OpenCodeClientLike;
-    server: OpenCodeServerLike;
-  }>;
+  start(options: OpenCodeSdkStartOptions): Promise<OpenCodeSdkRuntimeStartResult>;
+}
+
+interface McpToolDescriptor {
+  serverName: string;
+  toolName: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+}
+
+interface BoundSessionMcpServer {
+  serverName: string;
+  signature: string;
+  client: {
+    callTool(
+      params: { name: string; arguments: Record<string, unknown> },
+      resultSchema?: unknown,
+      options?: { signal?: AbortSignal },
+    ): Promise<{
+      isError?: boolean;
+      structuredContent?: unknown;
+      content?: Array<{ type: string; text?: string; mimeType?: string; data?: string; uri?: string }>;
+    }>;
+    close(): Promise<void>;
+  };
+  transport: { close(): Promise<void> };
+  tools: McpToolDescriptor[];
+}
+
+function normalizeOpenCodeMcpNamespace(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'mcp';
+}
+
+function normalizeOpenCodeMcpToolName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '') || 'tool';
+}
+
+function sanitizeMcpInputSchema(schema: unknown): Record<string, unknown> {
+  if (schema && typeof schema === 'object' && !Array.isArray(schema)) {
+    return schema as Record<string, unknown>;
+  }
+  return { type: 'object', properties: {} };
+}
+
+function formatMcpToolResult(result: Awaited<ReturnType<BoundSessionMcpServer['client']['callTool']>>): {
+  output: unknown;
+  content?: Array<{ type: 'text'; text: string }>;
+} {
+  const parts = Array.isArray(result?.content) ? result.content : [];
+  const textParts = parts
+    .filter((part): part is { type: 'text'; text: string } => part?.type === 'text' && typeof part.text === 'string')
+    .map((part) => ({ type: 'text' as const, text: part.text }));
+  const text = textParts.map((part) => part.text).join('\n');
+  if (result?.isError) {
+    throw new Error(text.trim() || 'MCP tool returned an error');
+  }
+  let output: unknown = text === '' ? null : text;
+  if (result?.structuredContent !== undefined) {
+    output = result.structuredContent;
+  } else if (text.startsWith('{') || text.startsWith('[')) {
+    try {
+      output = JSON.parse(text);
+    } catch {
+      output = text;
+    }
+  }
+  return {
+    output,
+    ...(textParts.length > 0 ? { content: textParts } : {}),
+  };
+}
+
+class SharedOpenCodeHostMcpCoordinator {
+  private readonly sessionBindings = new Map<string, {
+    directory: string;
+    servers: Map<string, BoundSessionMcpServer>;
+  }>();
+  private readonly directoryReloaders = new Map<string, Set<() => Promise<void>>>();
+
+  readonly plugin = {
+    id: 'imcodes-session-mcp',
+    setup: (ctx: {
+      location: { directory: string };
+      tool: {
+        transform: (fn: (editor: {
+          add: (tool: Record<string, unknown>) => void;
+        }) => void) => void;
+        reload: () => Promise<void>;
+      };
+      session: {
+        hook: (event: string, fn: (request: {
+          sessionID: string;
+          tools: Record<string, unknown>;
+        }) => void | Promise<void>) => void;
+      };
+    }) => {
+      const dirKey = resolve(ctx.location.directory);
+      const reloader = () => ctx.tool.reload().catch(() => {});
+      let reloaders = this.directoryReloaders.get(dirKey);
+      if (!reloaders) {
+        reloaders = new Set();
+        this.directoryReloaders.set(dirKey, reloaders);
+      }
+      reloaders.add(reloader);
+
+      ctx.tool.transform((editor) => {
+        const deduped = new Map<string, McpToolDescriptor>();
+        for (const binding of this.sessionBindings.values()) {
+          if (binding.directory !== dirKey) continue;
+          for (const server of binding.servers.values()) {
+            for (const tool of server.tools) {
+              const key = `${normalizeOpenCodeMcpNamespace(tool.serverName)}\0${normalizeOpenCodeMcpToolName(tool.toolName)}`;
+              if (!deduped.has(key)) deduped.set(key, tool);
+            }
+          }
+        }
+        for (const tool of deduped.values()) {
+          const namespace = normalizeOpenCodeMcpNamespace(tool.serverName);
+          editor.add({
+            name: tool.toolName,
+            options: { namespace, codemode: false },
+            description: tool.description ?? '',
+            input: tool.inputSchema,
+            output: tool.outputSchema ?? { type: 'object' },
+            execute: async (input: unknown, toolContext: { sessionID: string; signal?: AbortSignal }) => {
+              const bound = this.resolveBoundServer(toolContext.sessionID, tool.serverName, tool.toolName);
+              if (!bound) {
+                throw new Error(`MCP server "${tool.serverName}" tool "${tool.toolName}" is not bound to session ${toolContext.sessionID}`);
+              }
+              const result = await bound.client.callTool(
+                { name: tool.toolName, arguments: (input && typeof input === 'object' ? input : {}) as Record<string, unknown> },
+                undefined,
+                toolContext.signal ? { signal: toolContext.signal } : undefined,
+              );
+              return formatMcpToolResult(result);
+            },
+          });
+        }
+      });
+
+      ctx.session.hook('context', (request) => {
+        const sessionBinding = this.sessionBindings.get(request.sessionID);
+        const managedNames = new Set<string>();
+        const allowedNames = new Set<string>();
+        for (const [sid, binding] of this.sessionBindings.entries()) {
+          if (binding.directory !== dirKey) continue;
+          for (const server of binding.servers.values()) {
+            const ns = normalizeOpenCodeMcpNamespace(server.serverName);
+            for (const tool of server.tools) {
+              const fullName = `${ns}_${normalizeOpenCodeMcpToolName(tool.toolName)}`;
+              managedNames.add(fullName);
+              if (sid === request.sessionID || (sessionBinding && sessionBinding.servers.has(server.serverName))) {
+                allowedNames.add(fullName);
+              }
+            }
+          }
+        }
+        for (const toolName of managedNames) {
+          if (!allowedNames.has(toolName)) {
+            delete request.tools[toolName];
+          }
+        }
+      });
+
+      return () => {
+        reloaders?.delete(reloader);
+        if (reloaders && reloaders.size === 0) {
+          this.directoryReloaders.delete(dirKey);
+        }
+      };
+    },
+  };
+
+  private resolveBoundServer(providerSessionId: string, serverName: string, toolName: string): BoundSessionMcpServer | undefined {
+    const binding = this.sessionBindings.get(providerSessionId);
+    if (!binding) return undefined;
+    const server = binding.servers.get(serverName);
+    if (!server) return undefined;
+    return server.tools.some((tool) => tool.toolName === toolName) ? server : undefined;
+  }
+
+  private async reloadDirectory(dirKey: string): Promise<void> {
+    const reloaders = this.directoryReloaders.get(dirKey);
+    if (!reloaders || reloaders.size === 0) return;
+    await Promise.all([...reloaders].map((fn) => fn()));
+  }
+
+  async bindSession(
+    providerSessionId: string,
+    directory: string,
+    mcpServers: Record<string, OpenCodeMcpServerSpec>,
+  ): Promise<void> {
+    const dirKey = resolve(directory);
+    const existing = this.sessionBindings.get(providerSessionId);
+    const nextServers = new Map<string, BoundSessionMcpServer>();
+    const toClose: BoundSessionMcpServer[] = [];
+
+    if (existing) {
+      for (const [serverName, bound] of existing.servers.entries()) {
+        const nextSpec = mcpServers[serverName];
+        if (!nextSpec || nextSpec.disabled || JSON.stringify(nextSpec) !== bound.signature) {
+          toClose.push(bound);
+        } else {
+          nextServers.set(serverName, bound);
+        }
+      }
+    }
+
+    const [{ Client }, { StdioClientTransport }] = await Promise.all([
+      import('@modelcontextprotocol/sdk/client/index.js'),
+      import('@modelcontextprotocol/sdk/client/stdio.js'),
+    ]);
+
+    for (const [serverName, spec] of Object.entries(mcpServers)) {
+      if (spec.disabled || nextServers.has(serverName) || !Array.isArray(spec.command) || spec.command.length === 0) {
+        continue;
+      }
+      const signature = JSON.stringify(spec);
+      const [command, ...args] = spec.command;
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) {
+        if (typeof v === 'string') env[k] = v;
+      }
+      for (const [k, v] of Object.entries(spec.environment ?? {})) {
+        if (typeof v === 'string') env[k] = v;
+      }
+      const transport = new StdioClientTransport({
+        command,
+        args,
+        env,
+        cwd: dirKey,
+        stderr: 'pipe',
+      });
+      const client = new Client({ name: 'imcodes-opencode-mcp', version: '1.0.0' });
+      try {
+        await withOpenCodeRequestTimeout(client.connect(transport), `MCP connect (${serverName})`);
+        const listed = await withOpenCodeRequestTimeout(client.listTools(), `MCP listTools (${serverName})`);
+        const tools: McpToolDescriptor[] = (Array.isArray(listed?.tools) ? listed.tools : []).map((tool) => ({
+          serverName,
+          toolName: String(tool.name),
+          ...(typeof tool.description === 'string' ? { description: tool.description } : {}),
+          inputSchema: sanitizeMcpInputSchema(tool.inputSchema),
+        }));
+        nextServers.set(serverName, {
+          serverName,
+          signature,
+          client: client as unknown as BoundSessionMcpServer['client'],
+          transport,
+          tools,
+        });
+      } catch (error) {
+        await Promise.resolve(client.close()).catch(() => {});
+        await Promise.resolve(transport.close()).catch(() => {});
+        logger.warn({ provider: 'opencode-sdk', providerSessionId, serverName, directory: dirKey, error }, 'OpenCode session MCP startup failed');
+      }
+    }
+
+    for (const old of toClose) {
+      await Promise.resolve(old.client.close()).catch(() => {});
+      await Promise.resolve(old.transport.close()).catch(() => {});
+    }
+
+    if (nextServers.size === 0) {
+      this.sessionBindings.delete(providerSessionId);
+    } else {
+      this.sessionBindings.set(providerSessionId, { directory: dirKey, servers: nextServers });
+    }
+    await this.reloadDirectory(dirKey);
+  }
+
+  async unbindSession(providerSessionId: string): Promise<void> {
+    const existing = this.sessionBindings.get(providerSessionId);
+    if (!existing) return;
+    this.sessionBindings.delete(providerSessionId);
+    for (const bound of existing.servers.values()) {
+      await Promise.resolve(bound.client.close()).catch(() => {});
+      await Promise.resolve(bound.transport.close()).catch(() => {});
+    }
+    await this.reloadDirectory(existing.directory);
+  }
+
+  async closeAll(): Promise<void> {
+    const ids = [...this.sessionBindings.keys()];
+    await Promise.all(ids.map((id) => this.unbindSession(id)));
+  }
 }
 
 interface SharedOpenCodeHostEntry {
   key: string;
   instance: Awaited<ReturnType<typeof import('@opencode/sdk')['OpenCode']['create']>>;
+  mcpCoordinator: SharedOpenCodeHostMcpCoordinator;
+  eventConsumers: Map<symbol, {
+    listener: (event: Record<string, any>) => void;
+    onError: (error: unknown) => void;
+  }>;
+  eventAbort: AbortController | null;
+  eventLoop: Promise<void> | null;
   refCount: number;
   closed: boolean;
   closePromise: Promise<void> | null;
@@ -304,13 +611,13 @@ function buildSanitizedSharedHostConfig(rawConfig: Record<string, unknown> | und
 export async function applyOpenCodeDirectoryMcpServers(
   client: OpenCodeClientLike,
   directory: string | undefined,
-  mcpServers: Record<string, Record<string, unknown>> | undefined,
+  mcpServers: Record<string, OpenCodeMcpServerSpec | Record<string, unknown>> | undefined,
 ): Promise<void> {
   const add = client.experimental?.mcp?.add;
   if (!add || !directory || !mcpServers) return;
   for (const [server, serverConfig] of Object.entries(mcpServers)) {
     try {
-      await add({ server, location: { directory }, config: serverConfig });
+      await add({ server, location: { directory }, config: { ...serverConfig } });
     } catch (error) {
       logger.warn({ provider: 'opencode-sdk', server, directory, error }, 'OpenCode experimental.mcp.add failed');
     }
@@ -359,14 +666,20 @@ export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
           return existing;
         }
       }
+      const mcpCoordinator = new SharedOpenCodeHostMcpCoordinator();
       const instance = await OpenCode.create({
         database: { path: dbPath },
         fs: { filewatcher: false },
+        plugins: [mcpCoordinator.plugin as never],
         ...(content ? { config: { content } } : {}),
       });
       const created: SharedOpenCodeHostEntry = {
         key: hostKey,
-        instance,
+        instance: instance as unknown as SharedOpenCodeHostEntry['instance'],
+        mcpCoordinator,
+        eventConsumers: new Map(),
+        eventAbort: null,
+        eventLoop: null,
         refCount: 1,
         closed: false,
         closePromise: null,
@@ -374,6 +687,89 @@ export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
       sharedOpenCodeHosts.set(hostKey, created);
       return created;
     });
+
+    const stopHostEvents = async (): Promise<void> => {
+      const abort = entry.eventAbort;
+      const loop = entry.eventLoop;
+      entry.eventAbort = null;
+      entry.eventLoop = null;
+      abort?.abort();
+      if (loop) await loop.catch(() => {});
+    };
+
+    const ensureHostEventLoop = async (): Promise<void> => {
+      if (entry.eventLoop && entry.eventAbort && !entry.eventAbort.signal.aborted) return;
+      const eventAbort = new AbortController();
+      const subscription = await entry.instance.events.subscribe({}, { signal: eventAbort.signal });
+      const stream = 'stream' in subscription ? subscription.stream : subscription;
+      entry.eventAbort = eventAbort;
+      entry.eventLoop = (async () => {
+        const iterator = stream[Symbol.asyncIterator]();
+        let abortListener: (() => void) | null = null;
+        try {
+          const abortPromise = new Promise<{ aborted: true }>((resolveAbort) => {
+            if (eventAbort.signal.aborted) {
+              resolveAbort({ aborted: true });
+              return;
+            }
+            abortListener = () => {
+              void iterator.return?.().catch(() => {});
+              resolveAbort({ aborted: true });
+            };
+            eventAbort.signal.addEventListener('abort', abortListener, { once: true });
+          });
+
+          while (!eventAbort.signal.aborted) {
+            const step = await Promise.race([
+              iterator.next().then((result: IteratorResult<Record<string, any>>) => ({ aborted: false as const, result })),
+              abortPromise,
+            ]);
+            if (step.aborted || eventAbort.signal.aborted) return;
+            if (step.result.done) {
+              throw new Error('OpenCode event stream ended');
+            }
+            for (const consumer of [...entry.eventConsumers.values()]) {
+              try {
+                consumer.listener(step.result.value);
+              } catch (listenerError) {
+                logger.warn({ provider: 'opencode-sdk', error: listenerError }, 'OpenCode event consumer listener threw');
+              }
+            }
+          }
+        } catch (error) {
+          if (eventAbort.signal.aborted) return;
+          for (const consumer of [...entry.eventConsumers.values()]) {
+            consumer.onError(error);
+          }
+        } finally {
+          if (abortListener) eventAbort.signal.removeEventListener('abort', abortListener);
+          if (eventAbort.signal.aborted) {
+            void iterator.return?.().catch(() => {});
+          }
+        }
+      })();
+    };
+
+    const subscribeEvents: NonNullable<OpenCodeSdkRuntimeStartResult['subscribeEvents']> = async (
+      consumerId,
+      listener,
+      onError,
+    ) => {
+      entry.eventConsumers.set(consumerId, { listener, onError });
+      try {
+        await ensureHostEventLoop();
+      } catch (error) {
+        entry.eventConsumers.delete(consumerId);
+        if (entry.eventConsumers.size === 0) await stopHostEvents();
+        throw error;
+      }
+      return async () => {
+        entry.eventConsumers.delete(consumerId);
+        if (entry.eventConsumers.size === 0) {
+          await stopHostEvents();
+        }
+      };
+    };
 
     let releasePromise: Promise<void> | null = null;
     const close = (): Promise<void> => {
@@ -386,13 +782,16 @@ export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
         entry.refCount = Math.max(0, entry.refCount - 1);
         if (entry.refCount > 0 || entry.closed) return;
         entry.closed = true;
-        const closing = entry.instance.close()
-          .catch(() => {})
-          .finally(() => {
-            if (sharedOpenCodeHosts.get(hostKey) === entry) {
-              sharedOpenCodeHosts.delete(hostKey);
-            }
-          });
+        const closing = (async () => {
+          entry.eventConsumers.clear();
+          await stopHostEvents();
+          await entry.mcpCoordinator.closeAll().catch(() => {});
+          await entry.instance.close().catch(() => {});
+        })().finally(() => {
+          if (sharedOpenCodeHosts.get(hostKey) === entry) {
+            sharedOpenCodeHosts.delete(hostKey);
+          }
+        });
         entry.closePromise = closing;
         await closing;
       });
@@ -410,9 +809,6 @@ export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
     }, { once: true });
 
     const client = entry.instance as unknown as OpenCodeClientLike;
-    const staticMcpServers = (options.config?.mcp as { servers?: Record<string, Record<string, unknown>> } | undefined)?.servers;
-    const dynamicMcpServers = (options.mcpServers as Record<string, Record<string, unknown>> | undefined) ?? staticMcpServers;
-    await applyOpenCodeDirectoryMcpServers(client, safeString(options.directory), dynamicMcpServers);
 
     if (options.warmupCatalog) {
       // `PluginSupervisor` registers internal provider/model plugins asynchronously
@@ -438,6 +834,9 @@ export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
     return {
       client,
       server: { url: `http://${LOOPBACK_HOST}:${options.port}`, close },
+      subscribeEvents,
+      bindSessionMcp: (providerSessionId, directory, mcpServers) => entry.mcpCoordinator.bindSession(providerSessionId, directory, mcpServers),
+      unbindSessionMcp: (providerSessionId) => entry.mcpCoordinator.unbindSession(providerSessionId),
     };
   },
 };
@@ -465,9 +864,10 @@ interface OpenCodeModelReasoningMeta {
 
 interface OpenCodeCompactRequestState {
   generation: number;
-  inputId: string | null;
+  inputId: string;
   startedInputId: string | null;
   manualStarted: boolean;
+  sawV2Compaction: boolean;
 }
 
 interface OpenCodeSessionState {
@@ -513,7 +913,9 @@ interface OpenCodeSessionState {
   client: OpenCodeClientLike;
   server: OpenCodeServerLike;
   abort: AbortController;
-  eventLoop: Promise<void>;
+  releaseEvents: () => Promise<void>;
+  bindSessionMcp?: OpenCodeSdkRuntimeStartResult['bindSessionMcp'];
+  unbindSessionMcp?: OpenCodeSdkRuntimeStartResult['unbindSessionMcp'];
   pendingPermissions: Map<string, ReturnType<typeof setTimeout>>;
   runtimeConfig: SessionConfig;
   /** The native-agent fence this session's own OpenCode runtime was started with. */
@@ -607,6 +1009,10 @@ function openCodeAuthHealRetryMessageId(providerSessionId: string, deliveryMessa
   return openCodePromptMessageId(providerSessionId, `${deliveryMessageId}\0auth-heal-retry`);
 }
 
+function openCodeCompactInputId(providerSessionId: string): string {
+  return openCodePromptMessageId(providerSessionId, `compact\0${randomUUID()}`);
+}
+
 function errorResponseBodyText(error: unknown): string {
   if (!error || typeof error !== 'object') return '';
   const record = error as Record<string, unknown>;
@@ -621,31 +1027,73 @@ function errorExplicitProviderId(error: unknown): string | undefined {
   const record = error as Record<string, unknown>;
   const data = record.data as Record<string, unknown> | undefined;
   const metadata = record.metadata as Record<string, unknown> | undefined;
+  const nestedError = record.error as Record<string, unknown> | undefined;
   return safeString(record.providerID)
     ?? safeString(data?.providerID)
-    ?? safeString(metadata?.providerID);
+    ?? safeString(metadata?.providerID)
+    ?? safeString(nestedError?.providerID)
+    ?? safeString((nestedError?.data as Record<string, unknown> | undefined)?.providerID);
+}
+
+function errorExplicitCredentialId(error: unknown): string | undefined {
+  if (!error || typeof error !== 'object') return undefined;
+  const record = error as Record<string, unknown>;
+  const data = record.data as Record<string, unknown> | undefined;
+  const metadata = record.metadata as Record<string, unknown> | undefined;
+  const nestedError = record.error as Record<string, unknown> | undefined;
+  return safeString(record.credentialID)
+    ?? safeString(data?.credentialID)
+    ?? safeString(metadata?.credentialID)
+    ?? safeString(nestedError?.credentialID)
+    ?? safeString((nestedError?.data as Record<string, unknown> | undefined)?.credentialID);
+}
+
+function errorExplicitCode(error: unknown): string {
+  if (!error || typeof error !== 'object') return '';
+  const record = error as Record<string, unknown>;
+  const data = record.data as Record<string, unknown> | undefined;
+  const nestedError = record.error as Record<string, unknown> | undefined;
+  return (
+    safeString(record.code)
+    ?? safeString(data?.code)
+    ?? safeString(nestedError?.code)
+    ?? safeString((nestedError?.data as Record<string, unknown> | undefined)?.code)
+    ?? ''
+  ).toLowerCase();
 }
 
 function isExpiredOpenCodeAuthError(error: unknown, sessionProviderId: string | undefined): boolean {
   const explicitProvider = errorExplicitProviderId(error);
+  if (explicitProvider !== undefined && explicitProvider !== 'opencode') return false;
   const effectiveProvider = explicitProvider ?? sessionProviderId;
   // Strictly scope credential removal to OpenCode itself; never interfere with third-party providers (e.g. minimax).
   if (effectiveProvider !== 'opencode') return false;
 
-  const status = errorHttpStatus(error);
+  const data = error && typeof error === 'object' ? (error as { data?: Record<string, unknown> }).data : undefined;
+  const nestedStatus = typeof data?.statusCode === 'number' && Number.isFinite(data.statusCode)
+    ? data.statusCode
+    : undefined;
+  const status = errorHttpStatus(error) ?? nestedStatus;
   const errorType = error && typeof error === 'object'
     ? safeString((error as { type?: unknown }).type)?.toLowerCase() ?? ''
     : '';
   const errorName = error && typeof error === 'object'
     ? safeString((error as { name?: unknown }).name)?.toLowerCase() ?? ''
     : '';
+  const code = errorExplicitCode(error);
   const combined = `${errorMessage(error)}\n${errorResponseBodyText(error)}`.toLowerCase();
 
-  const is401 = status === 401 || /\b401\b/.test(combined);
-  const isAuthMarker = errorType === 'provider.auth'
-    || errorName.includes('providerautherror')
-    || /api_key_expired|authentication_error|invalid[_ ]credential|invalid[_ ]api[_ ]?key|expired/.test(combined);
-  return (is401 && isAuthMarker) || combined.includes('api_key_expired');
+  const is401 = status === 401;
+  const isStructuredAuth = errorType === 'provider.auth' || errorName.includes('providerautherror');
+  const hasExpiredKeyMarker = code === 'api_key_expired'
+    || /\bapi_key_expired\b/.test(combined)
+    || /\binvalid[_ ]api[_ ]?key\b/.test(combined)
+    || /\bapi[_ ]?key\b[^\n]{0,40}\bexpired\b/.test(combined)
+    || /\btoken\b[^\n]{0,40}\bexpired\b/.test(combined)
+    || /\binvalid[_ ]credential\b/.test(combined);
+  // Require both an authoritative HTTP 401 or structured provider auth failure AND a specific expired/invalid credential marker.
+  // Plain 401 permission/scope errors or bare text mentions without 401/auth classification must never remove credentials.
+  return (is401 || isStructuredAuth) && hasExpiredKeyMarker;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -1014,6 +1462,88 @@ function mapLegacyToolPart(part: Record<string, any>, fallbackTime: number): Rec
   };
 }
 
+const LEGACY_V1_USER_PART_TYPES = new Set(['text', 'file', 'agent', 'compaction', 'subtask']);
+const LEGACY_V1_ASSISTANT_PART_TYPES = new Set([
+  'text',
+  'reasoning',
+  'tool',
+  'step-start',
+  'step-finish',
+  'snapshot',
+  'patch',
+  'retry',
+]);
+
+function mapLegacyFilePart(part: Record<string, any>): {
+  attachment?: Record<string, unknown>;
+  unavailableText?: string;
+} {
+  const mime = safeString(part.mime) ?? 'application/octet-stream';
+  const url = typeof part.url === 'string' ? part.url : '';
+  const source = part.source && typeof part.source === 'object' ? (part.source as Record<string, any>) : undefined;
+  const filename = safeString(part.filename);
+
+  if (url.startsWith('data:')) {
+    const comma = url.indexOf(',');
+    if (comma < 0) {
+      throw new Error(`Legacy v1 file part has malformed data URI (${filename ?? mime})`);
+    }
+    const header = url.slice(0, comma);
+    const payload = url.slice(comma + 1);
+    const data = header.endsWith(';base64')
+      ? Buffer.from(payload, 'base64').toString('base64')
+      : Buffer.from(decodeURIComponent(payload)).toString('base64');
+    const sourceText = source?.text && typeof source.text === 'object' ? (source.text as Record<string, any>) : undefined;
+    return {
+      attachment: {
+        data,
+        mime,
+        source: source?.type === 'resource' && safeString(source.uri)
+          ? { type: 'uri', uri: safeString(source.uri) }
+          : { type: 'inline' },
+        ...(filename ? { name: filename } : {}),
+        ...(sourceText && typeof sourceText.value === 'string'
+          ? {
+            mention: {
+              text: sourceText.value,
+              start: Number(sourceText.start ?? 0),
+              end: Number(sourceText.end ?? 0),
+            },
+          }
+          : {}),
+      },
+    };
+  }
+
+  const label = filename
+    ?? (source?.type === 'resource' ? safeString(source.uri) : undefined)
+    ?? (safeString(url) ?? 'attachment');
+  return {
+    unavailableText: `[Attachment unavailable after migration: ${label} (${mime})]`,
+  };
+}
+
+function makeLegacySyntheticId(sourceId: string, usedIds: Set<string>): string {
+  const prefix = sourceId.slice(0, 16);
+  const alphabet = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+  for (let salt = 0; ; salt++) {
+    const hex = createHash('sha256')
+      .update(`v1-synthetic:${sourceId}${salt ? `:${salt}` : ''}`)
+      .digest('hex');
+    let value = BigInt(`0x${hex}`);
+    let suffix = '';
+    while (suffix.length < 14) {
+      suffix = alphabet[Number(value % 62n)] + suffix;
+      value /= 62n;
+    }
+    const id = `${prefix}${suffix}`;
+    if (!usedIds.has(id)) {
+      usedIds.add(id);
+      return id;
+    }
+  }
+}
+
 function buildLegacyImportMessagesFromV1Rows(
   rawMessages: Array<Record<string, any>>,
   rawParts: Array<Record<string, any>>,
@@ -1037,6 +1567,7 @@ function buildLegacyImportMessagesFromV1Rows(
     partsByMessage.set(msgId, list);
   }
 
+  const usedIds = new Set<string>(messages.map(({ row }) => String(row.id)));
   const pairedAssistantIds = new Set<string>();
   const imported: Array<Record<string, unknown>> = [];
   let latestUserAgent: string | undefined;
@@ -1046,6 +1577,12 @@ function buildLegacyImportMessagesFromV1Rows(
     if (pairedAssistantIds.has(String(row.id))) continue;
     const owned = partsByMessage.get(String(row.id)) ?? [];
     if (data.role === 'user') {
+      for (const part of owned) {
+        const partType = typeof part.type === 'string' ? part.type : '';
+        if (!LEGACY_V1_USER_PART_TYPES.has(partType)) {
+          throw new Error(`Unsupported legacy OpenCode v1 user part type "${partType || 'unknown'}" in message ${String(row.id)}`);
+        }
+      }
       const compaction = owned.find((p) => p.type === 'compaction');
       if (compaction) {
         const pairedSummary = messages.find(
@@ -1081,24 +1618,83 @@ function buildLegacyImportMessagesFromV1Rows(
         }
       }
 
-      const visibleText = owned
-        .filter((p) => p.type === 'text' && !p.ignored && !p.synthetic && typeof p.text === 'string')
-        .map((p) => String(p.text))
-        .join('\n\n');
-      const syntheticText = owned
-        .filter((p) => p.type === 'text' && !p.ignored && p.synthetic && typeof p.text === 'string')
-        .map((p) => String(p.text))
-        .join('\n\n');
-      if (visibleText) {
+      const subtasks = owned.filter((p) => p.type === 'subtask');
+      const visible = owned.filter((p) => p.type === 'text' && !p.ignored && typeof p.text === 'string');
+      const files = owned.filter((p) => p.type === 'file');
+      const agents = owned.filter((p) => p.type === 'agent');
+      if (subtasks.length > 0 && visible.length === 0 && files.length === 0 && agents.length === 0) {
+        continue;
+      }
+
+      const ordinary = visible.filter((p) => !p.synthetic);
+      const synthetic = visible.filter((p) => p.synthetic);
+      const convertedAttachments: Array<Record<string, unknown>> = [];
+      const unavailableNotices: string[] = [];
+      const textChunks: string[] = [];
+
+      for (const part of owned) {
+        if (part.type === 'text' && !part.ignored && !part.synthetic && typeof part.text === 'string') {
+          textChunks.push(part.text);
+        } else if (part.type === 'file') {
+          const mapped = mapLegacyFilePart(part);
+          if (mapped.attachment) convertedAttachments.push(mapped.attachment);
+          if (mapped.unavailableText) {
+            unavailableNotices.push(mapped.unavailableText);
+            textChunks.push(mapped.unavailableText);
+          }
+        }
+      }
+      const visibleText = textChunks.join('\n\n');
+      const agentAttachments = agents
+        .filter((p) => safeString(p.name))
+        .map((p) => ({
+          name: safeString(p.name)!,
+          ...(p.source && typeof p.source === 'object' && typeof p.source.value === 'string'
+            ? {
+              mention: {
+                text: String(p.source.value),
+                start: Number(p.source.start ?? 0),
+                end: Number(p.source.end ?? 0),
+              },
+            }
+            : {}),
+        }));
+      const syntheticText = synthetic.map((p) => String(p.text)).join('\n\n');
+
+      if (
+        ordinary.length === 0
+        && unavailableNotices.length === 0
+        && synthetic.length > 0
+        && convertedAttachments.length === 0
+        && agentAttachments.length === 0
+      ) {
+        imported.push({
+          id: String(row.id),
+          type: 'synthetic',
+          text: syntheticText,
+          time: { created: Number(row.time_created) },
+        });
+        continue;
+      }
+
+      if (
+        visibleText
+        || convertedAttachments.length > 0
+        || agentAttachments.length > 0
+        || ordinary.length > 0
+      ) {
         imported.push({
           id: String(row.id),
           type: 'user',
           text: visibleText,
+          ...(convertedAttachments.length > 0 ? { files: convertedAttachments } : {}),
+          ...(agentAttachments.length > 0 ? { agents: agentAttachments } : {}),
           time: { created: Number(row.time_created) },
         });
-      } else if (syntheticText) {
+      }
+      if (syntheticText) {
         imported.push({
-          id: String(row.id),
+          id: makeLegacySyntheticId(String(row.id), usedIds),
           type: 'synthetic',
           text: syntheticText,
           time: { created: Number(row.time_created) },
@@ -1107,7 +1703,15 @@ function buildLegacyImportMessagesFromV1Rows(
       continue;
     }
 
-    if (data.role !== 'assistant') continue;
+    if (data.role !== 'assistant') {
+      throw new Error(`Unsupported legacy OpenCode v1 message role "${String(data.role ?? 'unknown')}" in message ${String(row.id)}`);
+    }
+    for (const part of owned) {
+      const partType = typeof part.type === 'string' ? part.type : '';
+      if (!LEGACY_V1_ASSISTANT_PART_TYPES.has(partType)) {
+        throw new Error(`Unsupported legacy OpenCode v1 assistant part type "${partType || 'unknown'}" in message ${String(row.id)}`);
+      }
+    }
     const content = owned.flatMap((part) => {
       if (part.type === 'text' && typeof part.text === 'string') {
         return [{ type: 'text', text: part.text, ...(part.metadata ? { native: part.metadata } : {}) }];
@@ -1126,6 +1730,13 @@ function buildLegacyImportMessagesFromV1Rows(
       if (part.type === 'tool') return [mapLegacyToolPart(part, Number(row.time_created))];
       return [];
     });
+    const startSnapshot = owned.find((p) => p.type === 'step-start' && safeString(p.snapshot))?.snapshot
+      ?? owned.find((p) => p.type === 'snapshot' && safeString(p.snapshot))?.snapshot
+      ?? owned.find((p) => p.type === 'patch' && safeString(p.hash))?.hash;
+    const endSnapshot = [...owned].reverse().find((p) => p.type === 'step-finish' && safeString(p.snapshot))?.snapshot;
+    const snapshotFiles = Array.from(new Set(
+      owned.flatMap((p) => (p.type === 'patch' && Array.isArray(p.files) ? p.files.filter((f): f is string => typeof f === 'string') : [])),
+    ));
 
     const providerID = safeString(data.providerID ?? data.model?.providerID) ?? latestUserModel?.providerID ?? 'opencode';
     const modelID = safeString(data.modelID ?? data.model?.modelID ?? data.model?.id) ?? latestUserModel?.id ?? 'big-pickle';
@@ -1140,6 +1751,15 @@ function buildLegacyImportMessagesFromV1Rows(
         variant: safeString(data.variant) ?? 'default',
       },
       content,
+      ...(startSnapshot || endSnapshot || snapshotFiles.length > 0
+        ? {
+          snapshot: {
+            ...(startSnapshot ? { start: startSnapshot } : {}),
+            ...(endSnapshot ? { end: endSnapshot } : {}),
+            ...(snapshotFiles.length > 0 ? { files: snapshotFiles } : {}),
+          },
+        }
+        : {}),
       ...(finish ? { finish } : {}),
       cost: Number(data.cost ?? 0),
       tokens: {
@@ -1241,7 +1861,21 @@ async function readLegacySessionImportPayload(
         ? (() => {
           try {
             const p = JSON.parse(sessionRow.permission);
-            return Array.isArray(p) ? p : undefined;
+            if (!Array.isArray(p)) return undefined;
+            const normalized = p.flatMap((entry) => {
+              if (!entry || typeof entry !== 'object') return [];
+              const rec = entry as Record<string, unknown>;
+              const hasV2Resource = typeof rec.resource === 'string' && rec.resource.trim().length > 0;
+              const action = hasV2Resource
+                ? safeString(rec.action)
+                : safeString(rec.permission ?? rec.action);
+              const resource = safeString(rec.resource ?? rec.pattern) ?? '*';
+              const rawEffect = safeString(rec.effect) ?? (!hasV2Resource ? safeString(rec.action) : undefined);
+              const effect = rawEffect === 'allow' || rawEffect === 'deny' || rawEffect === 'ask' ? rawEffect : undefined;
+              if (!action || !effect) return [];
+              return [{ action, resource, effect }];
+            });
+            return normalized.length > 0 ? normalized : undefined;
           } catch {
             return undefined;
           }
@@ -1283,7 +1917,7 @@ async function readLegacySessionImportPayload(
       };
     } catch (error) {
       throw new Error(
-        `Failed to read legacy OpenCode v1 session "${sessionId}" from ${dbFile}: ${errorMessage(error)}. Verify file permissions or upgrade via \`opencode upgrade --major\`.`,
+        `Failed to read legacy OpenCode v1 session "${sessionId}" from ${dbFile}: ${errorMessage(error)}. Export via \`opencode export ${sessionId}\`, verify file permissions, or upgrade via \`opencode upgrade --major\`.`,
       );
     } finally {
       try { db?.close(); } catch {}
@@ -1321,6 +1955,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
   };
 
+  private readonly providerConsumerId = Symbol('opencode-provider');
+  private readonly activeClientEventSubs = new Map<OpenCodeClientLike, { refCount: number; unsubscribe: () => Promise<void> }>();
+  private readonly seenEventIds = new Set<string>();
   private readonly hostGroupKey = randomUUID();
   private client: OpenCodeClientLike | null = null;
   private server: OpenCodeServerLike | null = null;
@@ -1395,7 +2032,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     this.providerRouteOrder.clear();
     this.lifecycleAbort?.abort();
     this.lifecycleAbort = null;
-    for (const state of states) await this.closeSessionState(state);
+    for (const state of states) await this.closeSessionState(state, true);
+    this.activeClientEventSubs.clear();
+    this.seenEventIds.clear();
     this.pendingQuestions.clear();
     this.legacyImportInFlight.clear();
     await Promise.resolve(this.server?.close()).catch(() => {});
@@ -1479,7 +2118,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       model: initialModel,
       effort: config.effort,
       appliedModelSignature: null,
-      syncedMcpSignature: sessionRuntime.mcpSignature,
+      syncedMcpSignature: null,
       busy: false,
       compacting: false,
       compactRequest: null,
@@ -1507,14 +2146,23 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       client: sessionRuntime.client,
       server: sessionRuntime.server,
       abort: sessionRuntime.abort,
-      eventLoop: Promise.resolve(),
+      releaseEvents: sessionRuntime.releaseEvents,
+      bindSessionMcp: sessionRuntime.bindSessionMcp,
+      unbindSessionMcp: sessionRuntime.unbindSessionMcp,
       pendingPermissions: new Map(),
       runtimeConfig: { ...config },
       nativeAgentFence: fenceOf(nativeAgentsFenced),
     };
     this.sessions.set(routeId, state);
     this.registerProviderRoute(providerSessionId, routeId);
-    state.eventLoop = this.consumeEvents(sessionRuntime.stream, sessionRuntime.abort.signal);
+    try {
+      await this.syncSessionMcp(state);
+    } catch (error) {
+      this.sessions.delete(routeId);
+      const removedSoleRoute = this.releaseProviderRoute(state);
+      await this.closeSessionState(state, removedSoleRoute);
+      throw this.normalizeError(error, 'mcp startup');
+    }
     if (state.model || state.effort) {
       await this.syncSessionModelAndEffort(state).catch(() => {});
     }
@@ -1533,7 +2181,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     if (state.busy && removedSoleProviderRoute) {
       await state.client.session.interrupt({ sessionID: state.providerSessionId }).catch(() => {});
     }
-    await this.closeSessionState(state);
+    await this.closeSessionState(state, removedSoleProviderRoute);
   }
 
   async detachSession(sessionId: string): Promise<void> {
@@ -1543,8 +2191,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state.activeTurnParams = null;
     state.generation += 1;
     this.sessions.delete(state.routeId);
-    this.releaseProviderRoute(state);
-    await this.closeSessionState(state);
+    const removedSoleProviderRoute = this.releaseProviderRoute(state);
+    await this.closeSessionState(state, removedSoleProviderRoute);
   }
 
   private async ensureSessionPresentOrImportLegacy(
@@ -1762,15 +2410,21 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
   private async syncSessionMcp(state: OpenCodeSessionState): Promise<void> {
     const mcpServers = getDefaultMcpServers(state.runtimeConfig);
-    const mcpServersConfig = Object.fromEntries(Object.entries(mcpServers).map(([name, server]) => [name, {
-      type: 'local',
-      command: [server.command, ...server.args],
-      environment: server.env,
-      disabled: false,
-    }]));
+    const mcpServersConfig: Record<string, OpenCodeMcpServerSpec> = Object.fromEntries(
+      Object.entries(mcpServers).map(([name, server]) => [name, {
+        type: 'local',
+        command: [server.command, ...server.args],
+        environment: server.env,
+        disabled: false,
+      }]),
+    );
     const signature = JSON.stringify(mcpServersConfig);
     if (state.syncedMcpSignature === signature) return;
-    await applyOpenCodeDirectoryMcpServers(state.client, state.cwd, mcpServersConfig);
+    if (state.bindSessionMcp) {
+      await state.bindSessionMcp(state.providerSessionId, state.cwd, mcpServersConfig);
+    } else {
+      await applyOpenCodeDirectoryMcpServers(state.client, state.cwd, mcpServersConfig);
+    }
     state.syncedMcpSignature = signature;
   }
 
@@ -1906,13 +2560,15 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     }
 
     const generation = ++state.generation;
+    const compactInputId = openCodeCompactInputId(state.providerSessionId);
     state.busy = true;
     state.compacting = true;
     state.compactRequest = {
       generation,
-      inputId: null,
+      inputId: compactInputId,
       startedInputId: null,
       manualStarted: false,
+      sawV2Compaction: false,
     };
     state.compactCompletionEmitted = false;
     state.cancelled = false;
@@ -1925,10 +2581,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     try {
       await this.syncSessionModelAndEffort(state);
       if (!this.isCurrent(state, generation) || state.cancelled) return;
-      const result = await compact({ sessionID: state.providerSessionId });
+      const result = await compact({ sessionID: state.providerSessionId, id: compactInputId });
       const resolvedInputId = safeString((result as Record<string, unknown> | undefined)?.id);
       if (
         resolvedInputId
+        && resolvedInputId !== state.compactRequest?.inputId
         && this.isCurrent(state, generation)
         && state.compactRequest
         && state.compactRequest.generation === generation
@@ -2220,23 +2877,80 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     return this.sessions.get(providerSessionId)?.nativeAgentFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
   }
 
+  private async acquireClientEventSubscription(
+    client: OpenCodeClientLike,
+    subscribeEvents?: OpenCodeSdkRuntimeStartResult['subscribeEvents'],
+  ): Promise<() => Promise<void>> {
+    let entry = this.activeClientEventSubs.get(client);
+    if (!entry) {
+      let unsubscribeUpstream: () => Promise<void>;
+      if (subscribeEvents) {
+        unsubscribeUpstream = await subscribeEvents(
+          this.providerConsumerId,
+          (event) => this.handleEvent(event),
+          (error) => {
+            const normalized = this.normalizeError(error, 'events');
+            for (const state of this.sessions.values()) {
+              if (!state.busy) continue;
+              this.failOnce(state, normalized);
+            }
+          },
+        );
+      } else {
+        const subAbort = new AbortController();
+        const subscription = await client.events.subscribe({}, { signal: subAbort.signal }) as unknown as
+          | AsyncIterable<Record<string, any>>
+          | { stream: AsyncIterable<Record<string, any>> };
+        const stream = 'stream' in subscription ? subscription.stream : subscription;
+        const loop = this.consumeEvents(stream, subAbort.signal);
+        unsubscribeUpstream = async () => {
+          subAbort.abort();
+          await loop.catch(() => {});
+        };
+      }
+      const created = {
+        refCount: 0,
+        unsubscribe: async () => {
+          const current = this.activeClientEventSubs.get(client);
+          if (!current || current !== created) return;
+          current.refCount = Math.max(0, current.refCount - 1);
+          if (current.refCount > 0) return;
+          this.activeClientEventSubs.delete(client);
+          await unsubscribeUpstream();
+        },
+      };
+      this.activeClientEventSubs.set(client, created);
+      entry = created;
+    }
+    entry.refCount += 1;
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      await entry!.unsubscribe();
+    };
+  }
+
   private async startSessionRuntime(config: SessionConfig, cwd: string, _nativeAgentsFenced: boolean): Promise<{
     client: OpenCodeClientLike;
     server: OpenCodeServerLike;
     abort: AbortController;
-    stream: AsyncIterable<Record<string, any>>;
-    mcpSignature: string;
+    releaseEvents: () => Promise<void>;
+    bindSessionMcp?: OpenCodeSdkRuntimeStartResult['bindSessionMcp'];
+    unbindSessionMcp?: OpenCodeSdkRuntimeStartResult['unbindSessionMcp'];
   }> {
     const abort = new AbortController();
     const mcpServers = getDefaultMcpServers(config);
-    let started: Awaited<ReturnType<OpenCodeSdkRuntimeHooks['start']>> | null = null;
-    const mcpServersConfig = Object.fromEntries(Object.entries(mcpServers).map(([name, server]) => [name, {
-      type: 'local' as const,
-      command: [server.command, ...server.args],
-      environment: server.env,
-      disabled: false,
-    }]));
-    const mcpSignature = JSON.stringify(mcpServersConfig);
+    let started: OpenCodeSdkRuntimeStartResult | null = null;
+    const mcpServersConfig: Record<string, OpenCodeMcpServerSpec> = Object.fromEntries(
+      Object.entries(mcpServers).map(([name, server]) => [name, {
+        type: 'local',
+        command: [server.command, ...server.args],
+        environment: server.env,
+        disabled: false,
+      }]),
+    );
+    let releaseEvents: (() => Promise<void>) | null = null;
     try {
       started = await openCodeSdkRuntimeHooks.start({
         hostname: LOOPBACK_HOST,
@@ -2257,12 +2971,17 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       if (url.hostname !== LOOPBACK_HOST && url.hostname !== 'localhost' && url.hostname !== '::1') {
         throw providerError(PROVIDER_ERROR_CODES.CONFIG_ERROR, 'OpenCode SDK session server did not bind to loopback', false);
       }
-      const subscription = await started.client.events.subscribe({}, { signal: abort.signal }) as unknown as
-        | AsyncIterable<Record<string, any>>
-        | { stream: AsyncIterable<Record<string, any>> };
-      const stream = 'stream' in subscription ? subscription.stream : subscription;
-      return { client: started.client, server: started.server, abort, stream, mcpSignature };
+      releaseEvents = await this.acquireClientEventSubscription(started.client, started.subscribeEvents);
+      return {
+        client: started.client,
+        server: started.server,
+        abort,
+        releaseEvents,
+        bindSessionMcp: started.bindSessionMcp,
+        unbindSessionMcp: started.unbindSessionMcp,
+      };
     } catch (error) {
+      if (releaseEvents) await releaseEvents().catch(() => {});
       abort.abort();
       await Promise.resolve(started?.server.close()).catch(() => {});
       throw this.normalizeError(error, 'session server startup');
@@ -2272,19 +2991,24 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   private async closeStartedRuntime(runtime: {
     server: OpenCodeServerLike;
     abort: AbortController;
+    releaseEvents: () => Promise<void>;
   }): Promise<void> {
+    await runtime.releaseEvents().catch(() => {});
     runtime.abort.abort();
     await Promise.resolve(runtime.server.close()).catch(() => {});
   }
 
-  private async closeSessionState(state: OpenCodeSessionState): Promise<void> {
+  private async closeSessionState(state: OpenCodeSessionState, unbindMcp = false): Promise<void> {
     this.clearPendingQuestion(state, true);
     for (const timer of state.pendingPermissions.values()) clearTimeout(timer);
     state.pendingPermissions.clear();
     state.surfacedQuestionCallIds.clear();
+    if (unbindMcp && state.unbindSessionMcp) {
+      await state.unbindSessionMcp(state.providerSessionId).catch(() => {});
+    }
+    await state.releaseEvents().catch(() => {});
     state.abort.abort();
     await Promise.resolve(state.server.close()).catch(() => {});
-    await state.eventLoop.catch(() => {});
   }
 
   private releaseProviderRoute(state: OpenCodeSessionState): boolean {
@@ -2314,6 +3038,15 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   private handleEvent(event: Record<string, any>): void {
+    const eventId = safeString(event.id ?? event.eventId);
+    if (eventId) {
+      if (this.seenEventIds.has(eventId)) return;
+      this.seenEventIds.add(eventId);
+      if (this.seenEventIds.size > 4096) {
+        const oldest = this.seenEventIds.values().next().value;
+        if (oldest !== undefined) this.seenEventIds.delete(oldest);
+      }
+    }
     if (event.type === 'model.updated' || event.type === 'provider.updated') {
       this.modelCache = null;
       return;
@@ -2324,10 +3057,21 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const state = routeId ? this.sessions.get(routeId) : undefined;
     if (!state) return;
     const data = (event.data ?? event.properties) as Record<string, any> | undefined;
+    const eventMessageId = safeString(data?.inputID ?? data?.userMessageID ?? data?.promptID);
+    if (
+      eventMessageId
+      && state.deliveryMessageId
+      && eventMessageId !== state.deliveryMessageId
+      && event.type !== 'session.compaction.started'
+      && event.type !== 'session.compaction.ended'
+      && event.type !== 'session.compaction.failed'
+    ) {
+      return;
+    }
 
     switch (event.type) {
       case 'session.step.started': {
-        if (!state.busy) return;
+        if (!state.busy || state.authHealInFlight) return;
         state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
         const providerID = safeString(data?.model?.providerID);
         if (providerID) state.activeStepProviderId = providerID;
@@ -2422,10 +3166,12 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.usage.updated': {
+        if (state.authHealInFlight) return;
         this.emitUsage(state, state.currentMessageId, data?.tokens, data?.cost, false);
         return;
       }
       case 'session.step.ended': {
+        if (state.authHealInFlight) return;
         state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
         this.emitUsage(state, data?.assistantMessageID, data?.tokens, data?.cost, true);
         if (isTerminalFinish(data?.finish)) {
@@ -2434,21 +3180,23 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.step.failed': {
-        state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
-        this.emitUsage(state, data?.assistantMessageID, data?.tokens, data?.cost, true);
+        if (!state.authHealInFlight) {
+          state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
+          this.emitUsage(state, data?.assistantMessageID, data?.tokens, data?.cost, true);
+        }
         this.handleSessionFailure(state, data?.error, 'step');
         return;
       }
       case 'session.execution.started': {
-        if (state.busy && !state.compacting) {
+        if (state.busy && !state.compacting && !state.authHealInFlight) {
           this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
         }
         return;
       }
       case 'session.execution.succeeded': {
         this.stopConfirmations.complete(state);
-        // Late prompt completion frames must never settle an active manual /compact request.
-        if (state.compacting) return;
+        // Late prompt completion frames must never settle an active manual /compact or auth-heal attempt.
+        if (state.compacting || state.authHealInFlight) return;
         this.completeOnce(state, 'session.execution.succeeded');
         return;
       }
@@ -2459,6 +3207,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       }
       case 'session.execution.interrupted': {
         this.stopConfirmations.complete(state);
+        if (state.authHealInFlight) return;
         if (state.busy && !state.cancelled) {
           this.failOnce(state, providerError(
             PROVIDER_ERROR_CODES.CANCELLED,
@@ -2469,7 +3218,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.retry.scheduled': {
-        if (!state.busy || state.compacting) return;
+        if (!state.busy || state.compacting || state.authHealInFlight) return;
         const msg = safeString(data?.error?.message) ?? `OpenCode is retrying (attempt ${data?.attempt ?? 1})…`;
         this.emitStatus(state.routeId, { status: 'retrying', label: msg });
         return;
@@ -2512,46 +3261,51 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       }
       case 'session.compaction.started': {
         if (!state.compacting || !state.compactRequest || state.cancelled) return;
+        state.compactRequest.sawV2Compaction = true;
         if (data?.reason !== 'manual') return;
-        const startedInputId = safeString(data?.inputID) ?? null;
-        if (state.compactRequest.inputId && startedInputId && startedInputId !== state.compactRequest.inputId) {
+        const startedInputId = safeString(data?.inputID);
+        if (!startedInputId || startedInputId !== state.compactRequest.inputId) {
           return;
         }
         state.compactRequest.manualStarted = true;
         state.compactRequest.startedInputId = startedInputId;
-        if (!state.compactRequest.inputId && startedInputId) {
-          state.compactRequest.inputId = startedInputId;
-        }
         this.emitStatus(state.routeId, { status: 'compacting', label: 'Compacting conversation...' });
         return;
       }
       case 'session.compaction.ended': {
         this.stopConfirmations.complete(state);
         if (!state.compacting || !state.compactRequest || state.cancelled) return;
+        state.compactRequest.sawV2Compaction = true;
         if (data?.reason !== 'manual') return;
         const endedInputId = safeString(data?.inputID);
-        if (state.compactRequest.inputId && endedInputId && endedInputId !== state.compactRequest.inputId) {
+        if (endedInputId) {
+          if (endedInputId !== state.compactRequest.inputId) return;
+        } else if (
+          !state.compactRequest.manualStarted
+          || state.compactRequest.startedInputId !== state.compactRequest.inputId
+        ) {
           return;
         }
-        const matchesCurrentManual = state.compactRequest.manualStarted
-          || Boolean(endedInputId && endedInputId === state.compactRequest.inputId);
-        if (!matchesCurrentManual) return;
         this.completeCompactOnce(state, event.type);
         return;
       }
       case 'session.compacted':
-        // Standalone legacy compaction compatibility event (pre-reason/inputID streams).
+        // Standalone legacy v1 compaction compatibility event (never overrides an active v2 compaction flow).
         this.stopConfirmations.complete(state);
-        if (state.compacting && !state.cancelled) {
+        if (state.compacting && !state.cancelled && !state.compactRequest?.sawV2Compaction) {
           this.completeCompactOnce(state, event.type);
         }
         return;
       case 'session.compaction.failed': {
         this.stopConfirmations.complete(state);
         if (!state.compacting || !state.compactRequest || state.cancelled) return;
-        if (data?.reason === 'auto') return;
+        state.compactRequest.sawV2Compaction = true;
+        if (data?.reason !== 'manual') return;
         const failedInputId = safeString(data?.inputID);
-        if (state.compactRequest.inputId && failedInputId && failedInputId !== state.compactRequest.inputId) {
+        if (failedInputId && failedInputId !== state.compactRequest.inputId) {
+          return;
+        }
+        if (!failedInputId && !state.compactRequest.manualStarted) {
           return;
         }
         this.failOnce(state, this.normalizeError(data?.error, 'compact'));
@@ -2967,17 +3721,20 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const previous = {
       abort: state.abort,
       server: state.server,
-      eventLoop: state.eventLoop,
+      releaseEvents: state.releaseEvents,
     };
     state.client = replacement.client;
     state.server = replacement.server;
     state.abort = replacement.abort;
-    state.syncedMcpSignature = replacement.mcpSignature;
+    state.releaseEvents = replacement.releaseEvents;
+    state.bindSessionMcp = replacement.bindSessionMcp;
+    state.unbindSessionMcp = replacement.unbindSessionMcp;
+    state.syncedMcpSignature = null;
     state.nativeAgentFence = fenceOf(nativeAgentsFenced);
-    state.eventLoop = this.consumeEvents(replacement.stream, replacement.abort.signal);
+    await this.syncSessionMcp(state).catch(() => {});
+    await previous.releaseEvents().catch(() => {});
     previous.abort.abort();
     await Promise.resolve(previous.server.close()).catch(() => {});
-    await previous.eventLoop.catch(() => {});
     logger.warn(
       { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId },
       'OpenCode session runtime reconnected during missing-final recovery',
@@ -3038,11 +3795,18 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       if (credentialApi?.list && credentialApi?.remove) {
         const creds = await credentialApi.list();
         if (aborted()) return;
-        for (const cred of creds) {
-          if (cred?.integrationID === 'opencode' && safeString(cred.id)) {
-            await credentialApi.remove({ credentialID: cred.id });
-            if (aborted()) return;
-          }
+        const explicitCredId = errorExplicitCredentialId(rawError);
+        const opencodeCreds = creds.filter((cred) => cred?.integrationID === 'opencode' && safeString(cred.id));
+        const targets = explicitCredId
+          ? opencodeCreds.filter((cred) => cred.id === explicitCredId)
+          : (() => {
+            const activeCreds = opencodeCreds.filter((cred) => cred.active === true);
+            if (activeCreds.length > 0) return activeCreds;
+            return opencodeCreds.length === 1 && opencodeCreds[0]?.active !== false ? opencodeCreds : [];
+          })();
+        for (const cred of targets) {
+          await credentialApi.remove({ credentialID: cred.id });
+          if (aborted()) return;
         }
       }
       this.modelCache = null;
@@ -3051,11 +3815,14 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
       const previousModel = state.model;
       const stillAvailable = previousModel ? refreshed.models.some((m) => m.id === previousModel) : false;
-      const fallbackModel = refreshed.models.some((m) => m.id === DEFAULT_OPENCODE_MODEL_ID)
-        ? DEFAULT_OPENCODE_MODEL_ID
-        : refreshed.defaultModel;
-      if (!stillAvailable && fallbackModel && fallbackModel !== state.model) {
-        state.model = fallbackModel;
+      if (!stillAvailable) {
+        const hasDefaultOpenCodeModel = refreshed.models.some((m) => m.id === DEFAULT_OPENCODE_MODEL_ID);
+        if (!hasDefaultOpenCodeModel) {
+          throw new Error(
+            `OpenCode fallback model "${DEFAULT_OPENCODE_MODEL_ID}" is unavailable after clearing expired credentials`,
+          );
+        }
+        state.model = DEFAULT_OPENCODE_MODEL_ID;
       }
       state.appliedModelSignature = null;
       this.emitSessionInfo(state);
@@ -3071,7 +3838,6 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       state.lastUsageSignature = null;
       state.lastUsage = undefined;
       state.lastUsageMessageId = null;
-      state.authHealInFlight = false;
 
       await this.syncSessionModelAndEffort(state);
       if (aborted()) return;
@@ -3084,6 +3850,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         text: params.text,
         ...(params.files.length > 0 ? { files: params.files } : {}),
       });
+      if (aborted()) return;
+      state.authHealInFlight = false;
     } catch (healError) {
       state.authHealInFlight = false;
       if (aborted()) return;
