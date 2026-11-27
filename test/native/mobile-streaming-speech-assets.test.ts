@@ -549,7 +549,7 @@ describe('Qwen3-ASR mobile assets', () => {
     });
     const files: Record<string, string> = {
       'android/Manifest.java': `package android; public class Manifest { public static class permission { public static final String RECORD_AUDIO="mic"; } }`,
-      'android/view/HapticFeedbackConstants.java': `package android.view; public class HapticFeedbackConstants { public static final int LONG_PRESS=0, FLAG_IGNORE_VIEW_SETTING=1; }`,
+      'android/view/HapticFeedbackConstants.java': `package android.view; public class HapticFeedbackConstants { public static final int LONG_PRESS=0, VIRTUAL_KEY=1, FLAG_IGNORE_VIEW_SETTING=1, CLOCK_TICK=4, CONFIRM=16; }`,
       'android/view/View.java': `package android.view;
 public class View {
   public static volatile int hapticCalls=0, lastFeedback=-1, lastFlags=-1;
@@ -714,7 +714,7 @@ public class Bridge {
 public class AssetManager {
   public java.io.InputStream open(String path) throws java.io.IOException { throw new java.io.IOException("unimplemented"); }
 }`,
-      'android/os/Build.java': `package android.os; public class Build { public static class VERSION { public static int SDK_INT = 28; } public static class VERSION_CODES { public static final int LOLLIPOP = 21; public static final int M = 23; public static final int O = 26; } }`,
+      'android/os/Build.java': `package android.os; public class Build { public static class VERSION { public static int SDK_INT = 28; } public static class VERSION_CODES { public static final int LOLLIPOP = 21; public static final int M = 23; public static final int O = 26; public static final int R = 30; } }`,
       'android/os/Bundle.java': `package android.os; public class Bundle {}`,
       'android/os/Looper.java': `package android.os; public class Looper { private static final Looper MAIN = new Looper(); public static Looper getMainLooper(){ return MAIN; } }`,
       'android/os/Handler.java': `package android.os; public class Handler { public Handler(Looper l){} public boolean postDelayed(Runnable r, long delay){ return true; } public void removeCallbacks(Runnable r){} public void removeCallbacksAndMessages(Object token){} }`,
@@ -1408,6 +1408,40 @@ public class Harness {
   PluginCall hapticNullBridge=new PluginCall();p.performHaptic(hapticNullBridge);await(hapticNullBridge.done);
   p.setBridge(origBridge);
   check(android.view.View.hapticCalls==1, "null bridge/webView still invoked haptic");
+  String[] semanticStyles = new String[]{"selection", "light", "warning", "medium", ""};
+  int[] semanticExpected = new int[]{
+    android.view.HapticFeedbackConstants.CLOCK_TICK,
+    android.view.HapticFeedbackConstants.CLOCK_TICK,
+    android.view.HapticFeedbackConstants.VIRTUAL_KEY,
+    android.view.HapticFeedbackConstants.LONG_PRESS,
+    android.view.HapticFeedbackConstants.LONG_PRESS,
+  };
+  for (int si = 0; si < semanticStyles.length; si++) {
+    PluginCall styleCall = new PluginCall().setArg("style", semanticStyles[si]);
+    p.performHaptic(styleCall);
+    await(styleCall.done);
+    check(android.view.View.lastFeedback == semanticExpected[si]
+      && android.view.View.lastFlags == android.view.HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING,
+      "performHaptic mismatch for style=" + semanticStyles[si]);
+  }
+  int prevSdkInt = android.os.Build.VERSION.SDK_INT;
+  try {
+    android.os.Build.VERSION.SDK_INT = android.os.Build.VERSION_CODES.R - 1;
+    PluginCall successPreR = new PluginCall().setArg("style", "success");
+    p.performHaptic(successPreR);
+    await(successPreR.done);
+    check(android.view.View.lastFeedback == android.view.HapticFeedbackConstants.VIRTUAL_KEY,
+      "expected VIRTUAL_KEY for success below Android R, got " + android.view.View.lastFeedback);
+    android.os.Build.VERSION.SDK_INT = android.os.Build.VERSION_CODES.R;
+    PluginCall successOnR = new PluginCall().setArg("style", "success");
+    p.performHaptic(successOnR);
+    await(successOnR.done);
+    check(android.view.View.lastFeedback == android.view.HapticFeedbackConstants.CONFIRM,
+      "expected CONFIRM for success on Android R+, got " + android.view.View.lastFeedback);
+  } finally {
+    android.os.Build.VERSION.SDK_INT = prevSdkInt;
+  }
+  check(android.view.View.hapticCalls == 1 + semanticStyles.length + 2, "unexpected total hapticCalls=" + android.view.View.hapticCalls);
   System.out.println("HAPTIC_OK");
   // System TTS tests: missing engine, chunking, audio focus, events, stop, and shutdown
   android.speech.tts.TextToSpeech.reset();
