@@ -215,15 +215,24 @@ export function readTrustedPeerLookupStrict(
   }
 
   const store = { ...(parsed as Record<string, unknown>) };
-  if (!Object.prototype.hasOwnProperty.call(store, normalizedId)) {
+  const matchingEntries = Object.entries(store).filter(([rawKey]) => rawKey.trim() === normalizedId);
+  if (matchingEntries.length === 0) {
     return { status: 'missing', store };
   }
 
-  const publicKey = extractTrustedPeerEntryKey(store[normalizedId]);
-  if (!publicKey) {
-    return { status: 'error', reason: `trust_store_corrupt_entry:${normalizedId}` };
+  const matchedKeys = new Set<string>();
+  for (const [, entry] of matchingEntries) {
+    const pub = extractTrustedPeerEntryKey(entry);
+    if (!pub) {
+      return { status: 'error', reason: `trust_store_corrupt_entry:${normalizedId}` };
+    }
+    matchedKeys.add(pub);
   }
-  return { status: 'pinned', publicKey };
+  if (matchedKeys.size > 1) {
+    return { status: 'error', reason: `trust_store_conflicting_entries:${normalizedId}` };
+  }
+  const [publicKey] = matchedKeys;
+  return { status: 'pinned', publicKey: publicKey! };
 }
 
 /**

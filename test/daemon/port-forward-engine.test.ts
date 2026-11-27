@@ -1366,5 +1366,114 @@ describe('PortForwardEngine 3-tier transport & mux suites', () => {
     corruptEntryEngine.closeAll();
     expect(corruptEntryMsgs.some((m) => m.type === PORT_FORWARD_MSG.ERROR && m.error.includes('trust_store_corrupt_entry'))).toBe(true);
     expect(readFileSync(corruptEntryFile, 'utf8')).toBe(corruptPayload);
+
+    // 7d. Legacy whitespace-padded property names normalize identically to loadTrustedPeerPublicKeys()
+    const trimmedKeyFile = join(tmpRoot, 'trimmed-keys.json');
+    const trimmedPayload = JSON.stringify({ ' node_trimmed ': { publicKeyB64: existingPinId.publicKeyB64 } });
+    writeFileSync(trimmedKeyFile, trimmedPayload, 'utf8');
+    const trimmedMsgs: PortForwardWireMessage[] = [];
+    const trimmedEngine = new PortForwardEngine({
+      sendWs: (m) => { trimmedMsgs.push(m); },
+      identityKeyPair: idA,
+      trustedPeersFilePath: trimmedKeyFile,
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+    });
+    const sendTargetConnect = async (
+      engine: PortForwardEngine,
+      tunnelId: string,
+      peerServerId: string,
+      peerIdent: ReturnType<typeof generateEndpointIdentityKeyPair>,
+    ) => {
+      const cap = randomBytes(32).toString('base64url');
+      const mac = deriveAdmissionMacKey(cap, tunnelId);
+      const ecdh = generateEphemeralEcdhKeyPair();
+      await engine.handleMessage({
+        type: PORT_FORWARD_MSG.PREPARE,
+        tunnelId,
+        role: PORT_FORWARD_ROLE.TARGET,
+        capability: cap,
+        selfServerId: 'node_a',
+        peerServerId,
+        targetHost: '127.0.0.1',
+        targetPort: backend.port,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+        iceServers: [],
+        ttlMs: 60_000,
+      });
+      await engine.handleMessage({
+        type: PORT_FORWARD_MSG.CONNECT,
+        tunnelId,
+        role: PORT_FORWARD_ROLE.TARGET,
+        peerCandidates: [],
+        peerPublicKey: ecdh.publicKeyB64,
+        peerKeyProof: computeEphemeralKeyProof(mac, {
+          tunnelId,
+          role: PORT_FORWARD_ROLE.LISTEN,
+          selfServerId: peerServerId,
+          peerServerId: 'node_a',
+          publicKey: ecdh.publicKeyB64,
+        }),
+        peerIdentityPublicKey: peerIdent.publicKeyB64,
+        peerIdentitySignature: signPortForwardTranscript(peerIdent.privateKey, {
+          tunnelId,
+          role: PORT_FORWARD_ROLE.LISTEN,
+          selfServerId: peerServerId,
+          peerServerId: 'node_a',
+          capability: cap,
+          ecdhPublicKey: ecdh.publicKeyB64,
+          candidates: [],
+        }),
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      });
+    };
+    // Matching key against whitespace-padded pin succeeds without adding duplicate key
+    await sendTargetConnect(trimmedEngine, 'pf_trimmed_match_001', 'node_trimmed', existingPinId);
+    expect(trimmedMsgs.some((m) => m.tunnelId === 'pf_trimmed_match_001' && m.type === PORT_FORWARD_MSG.TARGET_READY)).toBe(true);
+    // Different key against the same normalized ID MUST fail closed and preserve exact file bytes
+    await sendSignedConnect(trimmedEngine, 'pf_trimmed_swap_0002', 'node_trimmed', peerB);
+    trimmedEngine.closeAll();
+    expect(trimmedMsgs.some((m) => m.tunnelId === 'pf_trimmed_swap_0002' && m.type === PORT_FORWARD_MSG.ERROR && m.reason === PORT_FORWARD_ERRORS.SCOPED_AUTH)).toBe(true);
+    expect(readFileSync(trimmedKeyFile, 'utf8')).toBe(trimmedPayload);
+
+    // Conflicting duplicate keys normalizing to the same ID MUST fail closed and keep original bytes
+    const conflictDupFile = join(tmpRoot, 'conflict-dup.json');
+    const conflictPayload = JSON.stringify({
+      node_dup: { publicKeyB64: existingPinId.publicKeyB64 },
+      ' node_dup ': { publicKeyB64: peerB.publicKeyB64 },
+    });
+    writeFileSync(conflictDupFile, conflictPayload, 'utf8');
+    const conflictMsgs: PortForwardWireMessage[] = [];
+    const conflictEngine = new PortForwardEngine({
+      sendWs: (m) => { conflictMsgs.push(m); },
+      identityKeyPair: idA,
+      trustedPeersFilePath: conflictDupFile,
+    });
+    await sendSignedConnect(conflictEngine, 'pf_conflict_dup_0001', 'node_dup', peerB);
+    conflictEngine.closeAll();
+    expect(conflictMsgs.some((m) => m.type === PORT_FORWARD_MSG.ERROR && m.error.includes('trust_store_conflicting_entries'))).toBe(true);
+    expect(readFileSync(conflictDupFile, 'utf8')).toBe(conflictPayload);
+
+    // Identical duplicate keys normalizing to the same ID resolve cleanly to that pin
+    const sameDupFile = join(tmpRoot, 'same-dup.json');
+    const samePayload = JSON.stringify({
+      node_same_dup: { publicKeyB64: existingPinId.publicKeyB64 },
+      ' node_same_dup ': existingPinId.publicKeyB64,
+    });
+    writeFileSync(sameDupFile, samePayload, 'utf8');
+    const sameMsgs: PortForwardWireMessage[] = [];
+    const sameEngine = new PortForwardEngine({
+      sendWs: (m) => { sameMsgs.push(m); },
+      identityKeyPair: idA,
+      trustedPeersFilePath: sameDupFile,
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+    });
+    await sendTargetConnect(sameEngine, 'pf_same_dup_match_01', 'node_same_dup', existingPinId);
+    await sendSignedConnect(sameEngine, 'pf_same_dup_swap_002', 'node_same_dup', peerB);
+    sameEngine.closeAll();
+    expect(sameMsgs.some((m) => m.tunnelId === 'pf_same_dup_match_01' && m.type === PORT_FORWARD_MSG.TARGET_READY)).toBe(true);
+    expect(sameMsgs.some((m) => m.tunnelId === 'pf_same_dup_swap_002' && m.type === PORT_FORWARD_MSG.ERROR && m.reason === PORT_FORWARD_ERRORS.SCOPED_AUTH)).toBe(true);
+    expect(readFileSync(sameDupFile, 'utf8')).toBe(samePayload);
   });
 });
