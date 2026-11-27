@@ -442,9 +442,13 @@ test('renders sub-session sequence badges, opens & focuses composer via configur
   await page.locator('#settings-tab-shortcuts').click();
   await expect(page.getByTestId('subsession-quick-shortcuts-section')).toBeVisible();
   await expect(page.getByTestId('subsession-quick-preview-close')).toHaveCount(0);
-  await page.getByTestId('shortcut-record-subSessionCloseAll').click();
+  const closeAllRecordBtn = page.getByTestId('shortcut-record-subSessionCloseAll');
+  await closeAllRecordBtn.click();
+  await expect(closeAllRecordBtn).toHaveAttribute('data-shortcut-recording', 'true');
+  // Preact schedules useEffect listener attachment post-paint; yield one frame before pressing the chord.
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(resolve, 20))));
   await page.keyboard.press('Alt+Shift+KeyX');
-  await expect(page.getByTestId('shortcut-record-subSessionCloseAll')).toContainText('X');
+  await expect(closeAllRecordBtn).toContainText('X');
   await page.getByTestId('subsession-mod-ctrl').click();
   await page.getByTestId('subsession-mod-shift').click();
   await page.getByTestId('subsession-mod-alt').click();
@@ -640,4 +644,108 @@ test('floating bottom-left sequence badges do not increase sub-session button he
       }
     }
   }
+});
+
+test('swapped defaults open & toggle sub-sessions with Alt+1..9, switch main tabs with Ctrl+1..9, and support Settings modifier customization', async ({ page }) => {
+  const { errors } = await openDesktopApp(page, 'Linux x86_64', {
+    subSessions: [
+      {
+        id: 'sub-e2e-1',
+        server_id: 'srv-1',
+        type: 'claude-code-sdk',
+        runtime_type: 'transport',
+        label: 'Sub One',
+        parent_session: 'deck_gamma_brain',
+      },
+      {
+        id: 'sub-e2e-2',
+        server_id: 'srv-1',
+        type: 'codex-sdk',
+        runtime_type: 'transport',
+        label: 'Sub Two',
+        parent_session: 'deck_gamma_brain',
+      },
+    ],
+  });
+
+  // Alt+1 while focused in main composer opens sub-e2e-1 and focuses its .controls-input
+  await page.locator('.controls-input').first().click();
+  await page.keyboard.press('Alt+Digit1');
+  const subWin1 = page.locator('.subsession-window[data-subsession-id="sub-e2e-1"]');
+  await expect(subWin1).toBeVisible();
+  await expect(subWin1.locator('.controls-input')).toBeFocused();
+
+  await page.keyboard.type('hello sub one');
+  await expect(subWin1.locator('.controls-input')).toContainText('hello sub one');
+
+  // Alt+2 opens sub-e2e-2, repeated Alt+2 closes it while leaving sub-e2e-1 open, Ctrl+0 closes all
+  await page.keyboard.press('Alt+Digit2');
+  const subWin2 = page.locator('.subsession-window[data-subsession-id="sub-e2e-2"]');
+  await expect(subWin2).toBeVisible();
+  await expect(subWin2.locator('.controls-input')).toBeFocused();
+
+  await page.keyboard.press('Alt+Digit2');
+  await expect(subWin2).toBeHidden();
+  await expect(subWin1).toBeVisible();
+
+  await page.keyboard.press('Alt+Digit2');
+  await expect(subWin2).toBeVisible();
+  await page.keyboard.press('Control+Digit0');
+  await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
+
+  // Visual tab order is pinned first (#1 Gamma Tab, #2 Beta Tab, #3 Alpha Tab).
+  // Default Ctrl+2 / Ctrl+3 / Ctrl+1 switch main tabs cleanly in real Chromium.
+  await page.keyboard.press('Control+Digit2');
+  await expect(page.locator('.tab.active')).toContainText('Beta Tab');
+  await page.keyboard.press('Control+Digit3');
+  await expect(page.locator('.tab.active')).toContainText('Alpha Tab');
+  await page.keyboard.press('Control+Digit1');
+  await expect(page.locator('.tab.active')).toContainText('Gamma Tab');
+
+  // Re-pressing Ctrl+1 while sub-e2e-1 is open collapses open sub-sessions on the active main tab
+  await page.keyboard.press('Alt+Digit1');
+  await expect(subWin1).toBeVisible();
+  await page.keyboard.press('Control+Digit1');
+  await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
+
+  // Settings -> Shortcuts verifies swapped default modifiers (Alt for sub-session, Ctrl for main tab) and customization
+  await page.locator('button.server-icon[title="Settings"]').click();
+  await page.locator('#settings-tab-shortcuts').click();
+  await expect(page.getByTestId('subsession-mod-alt')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.getByTestId('maintab-mod-ctrl')).toHaveAttribute('aria-pressed', 'true');
+
+  const closeAllRecordBtn = page.getByTestId('shortcut-record-subSessionCloseAll');
+  await closeAllRecordBtn.click();
+  await expect(closeAllRecordBtn).toHaveAttribute('data-shortcut-recording', 'true');
+  // Preact schedules useEffect listener attachment post-paint; yield one frame before pressing the chord.
+  await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => setTimeout(resolve, 20))));
+  await page.keyboard.press('Alt+Shift+KeyX');
+  await expect(closeAllRecordBtn).toContainText('X');
+  await page.getByTestId('subsession-mod-ctrl').click();
+  await page.getByTestId('subsession-mod-shift').click();
+  await page.getByTestId('subsession-mod-alt').click();
+  await expect(page.getByTestId('subsession-quick-preview-open')).toContainText('Ctrl');
+  await expect(page.getByTestId('subsession-quick-preview-open')).toContainText('Shift');
+  await page.locator('.settings-back-btn').click();
+
+  // Plain Alt+1 and Ctrl+0 no longer trigger; Ctrl+Shift+1 toggles sub-e2e-1 and Alt+Shift+X closes all
+  await page.locator('.controls-input').first().click();
+  await page.keyboard.press('Alt+Digit1');
+  await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
+
+  await page.keyboard.press('Control+Shift+Digit1');
+  await expect(subWin1).toBeVisible();
+  await expect(subWin1.locator('.controls-input')).toBeFocused();
+
+  await page.keyboard.press('Control+Shift+Digit1');
+  await expect(subWin1).toBeHidden();
+
+  await page.keyboard.press('Control+Shift+Digit1');
+  await expect(subWin1).toBeVisible();
+  await page.keyboard.press('Control+Digit0');
+  await expect(subWin1).toBeVisible();
+
+  await page.keyboard.press('Alt+Shift+KeyX');
+  await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
+  expect(errors).toEqual([]);
 });
