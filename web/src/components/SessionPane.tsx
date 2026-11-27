@@ -99,7 +99,7 @@ export interface SessionPaneProps {
   /** Called with the terminal focus function. */
   onFocusFn?: (fn: () => void) => void;
   /** Called with the chat scroll-to-bottom function. */
-  onChatScrollFn?: (fn: () => void) => void;
+  onChatScrollFn?: (fn: (opts?: { passive?: boolean }) => boolean | void) => void;
   /** Called with the chat input element ref so app.tsx can route keystrokes to it. */
   onInputRef?: (el: HTMLDivElement | null) => void;
   /** Called with the terminal diff applier for this session. */
@@ -387,8 +387,8 @@ export function SessionPane({
   }, [isTransportSession, liveSessionState, session]);
 
   // ── Chat scroll + input ref ─────────────────────────────────────────────────
-  const chatScrollFnRef = useRef<(() => void) | null>(null);
-  const setChatScrollFn = useCallback((fn: () => void) => {
+  const chatScrollFnRef = useRef<((opts?: { passive?: boolean }) => boolean | void) | null>(null);
+  const setChatScrollFn = useCallback((fn: (opts?: { passive?: boolean }) => boolean | void) => {
     chatScrollFnRef.current = fn;
     onChatScrollFn?.(fn);
   }, [onChatScrollFn]);

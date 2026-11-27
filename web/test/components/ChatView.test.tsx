@@ -1820,12 +1820,10 @@ describe('ChatView', () => {
     // Wait past both the 200ms programmatic-scroll watchdog AND the 1200ms
     // suppressLoadOlder window (which the transientTopJump handler keys on).
     await new Promise((resolve) => setTimeout(resolve, 1300));
-    // Use scrollTop=1300 — beyond the disengage threshold (distance=300 > 180)
-    // and well past the transientTopJump threshold (scrollTop=1300 > 100), so
-    // handleScroll cleanly disengages auto-follow without triggering the
-    // mobile-keyboard recovery branch.
-    scrollEl.scrollTop = 1300;
-    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
+    // Jump scrollTop with unchanged geometry (`1200`, `distance = 300 > 180` and
+    // `scrollTop = 700 > 100`) so handleScroll cleanly disengages auto-follow
+    // without triggering the transientTopJump or passive-layout-growth paths.
+    scrollEl.scrollTop = 700;
     fireEvent.scroll(scrollEl);
 
     rerender(
@@ -1846,7 +1844,7 @@ describe('ChatView', () => {
     // Give the layout effect a tick to (potentially) fire and confirm it
     // does NOT yank the viewport to bottom.
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(scrollEl.scrollTop).toBe(1300);
+    expect(scrollEl.scrollTop).toBe(700);
   });
 
   it('continues following streamed updates in main chat when the user remains near the bottom', async () => {
@@ -1989,10 +1987,8 @@ describe('ChatView', () => {
 
     // Wait past the 200ms watchdog and 1200ms suppressLoadOlder window.
     await new Promise((resolve) => setTimeout(resolve, 1300));
-    // Grow scrollHeight FIRST, then move scrollTop and dispatch — so
-    // handleScroll computes distance against the new layout.
-    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
-    scrollEl.scrollTop = 1300;
+    // Move scrollTop upward on unchanged geometry (distance=300 > 180, scrollTop=700 > 100).
+    scrollEl.scrollTop = 700;
     fireEvent.scroll(scrollEl);
 
     rerender(
@@ -2008,7 +2004,7 @@ describe('ChatView', () => {
 
     // Wait for the rAF inside the lastVisibleTs effect to fire.
     await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(scrollEl.scrollTop).toBe(1300);
+    expect(scrollEl.scrollTop).toBe(700);
   });
 
   it('does not auto-resume after idle time while the user remains scrolled away', async () => {
@@ -2034,16 +2030,14 @@ describe('ChatView', () => {
       // watchdog and the 1200 ms suppressLoadOlder window before simulating
       // a real user scroll-up.
       vi.advanceTimersByTime(1300);
-      Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
-      // Use scrollTop=1300 — beyond the disengage threshold and well above
-      // the transientTopJump 100 px floor.
-      scrollEl.scrollTop = 1300;
+      // Use scrollTop=700 on unchanged geometry (distance=300 > 180, above 100 px floor).
+      scrollEl.scrollTop = 700;
       fireEvent.scroll(scrollEl);
 
       // Advance past the old 60 s threshold + the old 10 s polling interval.
       vi.advanceTimersByTime(75_000);
 
-      expect(scrollEl.scrollTop).toBe(1300);
+      expect(scrollEl.scrollTop).toBe(700);
     } finally {
       vi.useRealTimers();
     }
@@ -2068,9 +2062,7 @@ describe('ChatView', () => {
     });
 
     await new Promise((resolve) => setTimeout(resolve, 1300));
-    // Grow scrollHeight first, then disengage with a real scroll event.
-    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
-    scrollEl.scrollTop = 1300;
+    scrollEl.scrollTop = 700;
     fireEvent.scroll(scrollEl);
 
     rerender(
@@ -2112,8 +2104,7 @@ describe('ChatView', () => {
     });
 
     await new Promise((resolve) => setTimeout(resolve, 1300));
-    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, value: 1800 });
-    scrollEl.scrollTop = 1300;
+    scrollEl.scrollTop = 700;
     fireEvent.scroll(scrollEl);
 
     await waitFor(() => {

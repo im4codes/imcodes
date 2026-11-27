@@ -241,7 +241,7 @@ interface Props {
   /** Session labels used by task-pair status rows when the event omits one. */
   sessions?: readonly { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
   /** Receives a function that forces the chat list to scroll to the bottom. */
-  onScrollBottomFn?: (fn: () => void) => void;
+  onScrollBottomFn?: (fn: (opts?: { passive?: boolean }) => boolean | void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */
   preview?: boolean;
   /** False for retained/collapsed windows: keep data cached but pause all chat timers. */
@@ -4757,10 +4757,25 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
 
   // Expose scroll-to-bottom fn to parent via stable ref delegate so retained/hidden
   // parents never invoke a stale closure after `visible` transitions false -> true.
+  // Delayed settle calls pass `{ passive: true }` so an upward scroll/touch/wheel
+  // landing between frames still wins over switch settle.
   useEffect(() => {
-    onScrollBottomFn?.(() => {
+    onScrollBottomFn?.((opts?: { passive?: boolean }) => {
       if (!isMountedRef.current) return false;
-      scrollToBottomRef.current(true);
+      const engageFollow = opts?.passive !== true;
+      if (!engageFollow) {
+        if (
+          !autoScrollRef.current
+          || isTouchInteracting()
+          || hasActiveUserScrollIntent()
+          || pendingPinnedLocateIdRef.current
+          || loadingOlderRef.current
+          || scrollAnchorRef.current
+        ) {
+          return true;
+        }
+      }
+      scrollToBottomRef.current(engageFollow);
       return true;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -5377,6 +5392,20 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const wasAutoFollowing = autoScrollRef.current;
     const hasExplicitUserScrollUp = hasActiveUserScrollIntent();
     const touchBusy = isTouchInteracting();
+    const distance = scrollHeight - scrollTop - clientHeight;
+    // Explicit upward scroll intent (wheel, touch drag, scrollbar pointer drag, or
+    // unmodified PageUp/ArrowUp/Home) with actual upward displacement disengages
+    // immediately regardless of distance threshold, and before any passive growth repin.
+    if (wasAutoFollowing && (hasExplicitUserScrollUp || touchBusy) && scrollTop < lastScrollTopRef.current && distance > 1) {
+      disengageFollow();
+      setShowScrollBtn(true);
+      lastScrollActivityRef.current = Date.now();
+      captureReaderAnchor();
+      lastScrollTopRef.current = scrollTop;
+      lastScrollHeightRef.current = scrollHeight;
+      lastClientHeightRef.current = clientHeight;
+      return;
+    }
     const awaitingInitialPin = !hasInitialPinCompletedRef.current
       || pendingEngageFollowRef.current
       || pendingScrollFrameRef.current !== null;
@@ -5384,6 +5413,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       && !hasExplicitUserScrollUp
       && !touchBusy
       && !pendingPinnedLocateIdRef.current
+      && !loadingOlderRef.current
+      && !scrollAnchorRef.current
       && scrollHeight > clientHeight
       && (
         scrollTop === 0
@@ -5395,32 +5426,38 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         && scrollTop < 100
         && !hasExplicitUserScrollUp
         && !touchBusy
+        && !pendingPinnedLocateIdRef.current
+        && !loadingOlderRef.current
+        && !scrollAnchorRef.current
         && awaitingInitialPin
       );
-    // Before initial hydration/measurement finishes pinning (or when a short
-    // pre-overflow snippet grows into overflowing history, or when async image/footer/
-    // composer layout shifts change scrollHeight/clientHeight without user scroll-up),
-    // re-pin instead of misclassifying that lag as a manual scroll-away.
+    // Before initial hydration/measurement finishes pinning, or when content growth /
+    // virtualizer row measurement / viewport shrink shifts layout without user upward
+    // scroll intent (even when virtualizer/browser shifts scrollTop > 2px), keep
+    // following via a coalesced repin instead of misclassifying as a scroll-away.
+    // Unchanged geometry with explicit coordinate jump still disengages below.
     const wasPinnedBeforeLayoutShift = lastScrollHeightRef.current > 0
       && (lastScrollHeightRef.current - lastScrollTopRef.current - prevClientHeight) < 24
-      && Math.abs(scrollTop - lastScrollTopRef.current) <= 2
+      && scrollTop >= lastScrollTopRef.current - 2
       && layoutChanged;
-    const stationaryDuringGrowthOrBaseline = Math.abs(scrollTop - lastScrollTopRef.current) <= 2
+    const passiveLayoutShift = scrollTop >= lastScrollTopRef.current - 2
       && (
         wasPinnedBeforeLayoutShift
+        || (layoutChanged && (wasAutoFollowing || pendingGrowthRepinRef.current || lastScrollHeightRef.current === 0))
         || pendingGrowthRepinRef.current
-        || (layoutChanged && lastScrollHeightRef.current === 0)
       );
     const hydrationGrowthLag = !preview
       && wasAutoFollowing
       && !hasExplicitUserScrollUp
       && !touchBusy
       && !pendingPinnedLocateIdRef.current
-      && (scrollHeight - scrollTop - clientHeight) > 1
+      && !loadingOlderRef.current
+      && !scrollAnchorRef.current
+      && distance > 1
       && (
         (awaitingInitialPin && scrollTop >= lastScrollTopRef.current)
         || (scrollTop === 0 && lastScrollTopRef.current === 0 && scrollHeight > lastScrollHeightRef.current)
-        || stationaryDuringGrowthOrBaseline
+        || passiveLayoutShift
       );
     if (transientTopJump || hydrationGrowthLag) {
       lastScrollTopRef.current = scrollTop;
@@ -5442,7 +5479,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     // follow-mode is always escapable by scrolling up even when the content
     // barely overflows the viewport. See chat-follow-thresholds.ts. This is the
     // secondary disengage path; the primary is the wheel/touch gesture handler.
-    const distance = scrollHeight - scrollTop - clientHeight;
     const { disengageThreshold, reengageThreshold } = computeFollowThresholds(clientHeight, scrollHeight);
     const previousDistance = lastScrollHeightRef.current > 0
       ? lastScrollHeightRef.current - lastScrollTopRef.current - clientHeight

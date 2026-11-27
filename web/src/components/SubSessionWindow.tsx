@@ -143,7 +143,7 @@ interface Props {
   /** Optional: register this sub-session's composer `.controls-input` element with app.tsx. */
   onInputRef?: (el: HTMLDivElement | null) => void;
   /** Optional: register this sub-session's chat scroll-to-bottom callback with app.tsx. */
-  onChatScrollFn?: (fn: () => void) => void;
+  onChatScrollFn?: (fn: (opts?: { passive?: boolean }) => boolean | void) => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
@@ -569,11 +569,11 @@ export function SubSessionWindow({
   const viewModeRef = useRef(viewMode);
   viewModeRef.current = viewMode;
   const termScrollRef = useRef<(() => void) | null>(null);
-  const chatScrollRef = useRef<(() => void) | null>(null);
+  const chatScrollRef = useRef<((opts?: { passive?: boolean }) => boolean | void) | null>(null);
   const onChatScrollFnRef = useRef(onChatScrollFn);
   onChatScrollFnRef.current = onChatScrollFn;
   const onTermScrollBottomFn = useCallback((fn: () => void) => { termScrollRef.current = fn; }, []);
-  const onChatScrollBottomFn = useCallback((fn: () => void) => {
+  const onChatScrollBottomFn = useCallback((fn: (opts?: { passive?: boolean }) => boolean | void) => {
     chatScrollRef.current = fn;
     onChatScrollFnRef.current?.(fn);
   }, []);
@@ -591,7 +591,7 @@ export function SubSessionWindow({
     }
     if (typeof requestAnimationFrame === 'function') {
       const id = requestAnimationFrame(() => {
-        chatScrollRef.current?.();
+        chatScrollRef.current?.({ passive: true });
       });
       return () => cancelAnimationFrame(id);
     }

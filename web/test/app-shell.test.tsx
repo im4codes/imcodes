@@ -56,6 +56,8 @@ const {
     enabled: false,
     mainCalls: [] as string[],
     subCalls: [] as string[],
+    mainCallDetails: [] as Array<{ target: string; passive: boolean }>,
+    subCallDetails: [] as Array<{ target: string; passive: boolean }>,
     staleMainOnce: new Set<string>(),
     staleSubOnce: new Set<string>(),
     staleDelayMs: 25,
@@ -689,8 +691,9 @@ vi.mock('../src/components/SessionPane.js', () => ({
     onChatScrollFnLatest.current = onChatScrollFn;
     useEffect(() => {
       if (!autoRegisterChatScrollState.enabled) return;
-      onChatScrollFnLatest.current?.(() => {
+      onChatScrollFnLatest.current?.((opts?: { passive?: boolean }) => {
         autoRegisterChatScrollState.mainCalls.push(session.name);
+        autoRegisterChatScrollState.mainCallDetails.push({ target: session.name, passive: opts?.passive === true });
       });
     }, [session.name]);
     useEffect(() => {
@@ -699,8 +702,9 @@ vi.mock('../src/components/SessionPane.js', () => ({
       autoRegisterChatScrollState.staleMainOnce.delete(session.name);
       onChatScrollFnLatest.current?.(() => false);
       const timer = window.setTimeout(() => {
-        onChatScrollFnLatest.current?.(() => {
+        onChatScrollFnLatest.current?.((opts?: { passive?: boolean }) => {
           autoRegisterChatScrollState.mainCalls.push(session.name);
+          autoRegisterChatScrollState.mainCallDetails.push({ target: session.name, passive: opts?.passive === true });
           return true;
         });
       }, autoRegisterChatScrollState.staleDelayMs);
@@ -929,8 +933,9 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
     onChatScrollFnLatest.current = onChatScrollFn;
     useEffect(() => {
       if (!autoRegisterChatScrollState.enabled || !sub?.id) return;
-      onChatScrollFnLatest.current?.(() => {
+      onChatScrollFnLatest.current?.((opts?: { passive?: boolean }) => {
         autoRegisterChatScrollState.subCalls.push(sub.id);
+        autoRegisterChatScrollState.subCallDetails.push({ target: sub.id, passive: opts?.passive === true });
       });
     }, [sub?.id]);
     useEffect(() => {
@@ -939,8 +944,9 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       autoRegisterChatScrollState.staleSubOnce.delete(sub.id);
       onChatScrollFnLatest.current?.(() => false);
       const timer = window.setTimeout(() => {
-        onChatScrollFnLatest.current?.(() => {
+        onChatScrollFnLatest.current?.((opts?: { passive?: boolean }) => {
           autoRegisterChatScrollState.subCalls.push(sub.id);
+          autoRegisterChatScrollState.subCallDetails.push({ target: sub.id, passive: opts?.passive === true });
           return true;
         });
       }, autoRegisterChatScrollState.staleDelayMs);
@@ -1381,6 +1387,8 @@ beforeEach(() => {
   autoRegisterChatScrollState.enabled = false;
   autoRegisterChatScrollState.mainCalls = [];
   autoRegisterChatScrollState.subCalls = [];
+  autoRegisterChatScrollState.mainCallDetails = [];
+  autoRegisterChatScrollState.subCallDetails = [];
   autoRegisterChatScrollState.staleMainOnce.clear();
   autoRegisterChatScrollState.staleSubOnce.clear();
   autoRegisterChatScrollState.staleDelayMs = 25;
@@ -13778,6 +13786,36 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => {
         expect(autoRegisterChatScrollState.mainCalls).toContain('deck_srv3_brain');
         expect(autoRegisterChatScrollState.subCalls).toContain('sub-srv3-1');
+        expect(autoRegisterChatScrollState.mainCallDetails).toEqual(
+          expect.arrayContaining([
+            { target: 'deck_srv3_brain', passive: false },
+            { target: 'deck_srv3_brain', passive: true },
+          ]),
+        );
+        expect(autoRegisterChatScrollState.subCallDetails).toEqual(
+          expect.arrayContaining([
+            { target: 'sub-srv3-1', passive: false },
+            { target: 'sub-srv3-1', passive: true },
+          ]),
+        );
+      }, { timeout: 5000 });
+
+      // Complete A -> B -> C -> A cycle back to srv-1 via Alt+k (wrapping around).
+      autoRegisterChatScrollState.mainCalls = [];
+      autoRegisterChatScrollState.subCalls = [];
+      autoRegisterChatScrollState.mainCallDetails = [];
+      autoRegisterChatScrollState.subCallDetails = [];
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', altKey: true, bubbles: true, cancelable: true }));
+      const srv1ReturnPane = await screen.findByTestId('session-pane-deck_srv1_brain', undefined, { timeout: 5000 });
+      expect(srv1ReturnPane.getAttribute('data-is-active')).toBe('true');
+      await waitFor(() => {
+        expect(autoRegisterChatScrollState.mainCalls).toContain('deck_srv1_brain');
+        expect(autoRegisterChatScrollState.mainCallDetails).toEqual(
+          expect.arrayContaining([
+            { target: 'deck_srv1_brain', passive: false },
+            { target: 'deck_srv1_brain', passive: true },
+          ]),
+        );
       }, { timeout: 5000 });
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });

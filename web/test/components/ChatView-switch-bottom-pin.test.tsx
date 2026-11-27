@@ -4,14 +4,20 @@
  * Causal regression tests for keyboard/tab/server switching + post-switch hydration bottom pinning:
  * 1. Retained `ChatView` `visible: false -> true` with pending parent `onScrollBottomFn()` +
  *    subsequent layout/height growth must not clobber `lastScrollHeightRef` or drop follow mode.
- * 2. Multi-step `scrollHeight` expansion during `handleScroll` (without upward scroll intent)
- *    must re-pin via `pendingGrowthRepinRef` rather than calling `disengageFollow()`.
- * 3. Server/tab switch with cached history -> delayed new messages + virtualized row measurement +
- *    async `<img>` decode must stay 100% pinned at bottom without `[↓ N]` badge.
+ * 2. Passive `scrollHeight` expansion — including single-step AND two-step geometry growth where
+ *    `scrollTop` simultaneously moves > 2px (`1200/200/1000 -> 1900/200/1020`,
+ *    `1200/200/1000 -> 1240/200/1010 -> 1900/200/1035`) — must re-pin without calling
+ *    `disengageFollow()`, while unchanged-geometry coordinate jumps still disengage.
+ * 3. Server/tab rapid A -> B -> C -> A switching across >24-row virtualized & non-virtualized
+ *    sessions with cached render -> delayed new messages + live virtual row `ResizeObserver`
+ *    measurement + async `<img>` decode stays 100% pinned without `[↓ N]`.
  * 4. Modified keyboard shortcuts (`Alt+ArrowUp`, `Ctrl+PageUp`, `Meta+Home`, `defaultPrevented`)
- *    must not arm `userPointerOrKeyScrollUntilRef`.
- * 5. Genuine user upward scroll (wheel, touch drag, scrollbar pointer drag, unmodified `PageUp`,
- *    or explicit scroll-away) must still disengage cleanly and show `[↓ 1]` on arriving messages.
+ *    do not arm `userPointerOrKeyScrollUntilRef`.
+ * 5. Active upward user scroll wins over switching bottom-pin:
+ *    - A single unmodified `ArrowUp` moving 40px (< `disengageThreshold`) immediately disengages
+ *      and stays unfollowed after the hold window expires.
+ *    - A real `wheel` upward scroll between initial engage and frame-2 passive settle (`{ passive: true }`)
+ *      wins over delayed settle, never snaps back, and shows `[↓ 1]` on arriving messages.
  */
 import { h } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -41,6 +47,11 @@ class FakeResizeObserver {
   observe(): void {}
   unobserve(): void {}
   disconnect(): void {}
+}
+
+function fireResize(targets: Element[] = []): void {
+  const entries = targets.map((target) => ({ target })) as unknown as ResizeObserverEntry[];
+  for (const cb of resizeCallbacks) cb(entries, {} as ResizeObserver);
 }
 
 class FakeIntersectionObserver {
@@ -78,6 +89,8 @@ function assistantEvent(eventId: string, text: string, ts: number): TimelineEven
   } as unknown as TimelineEvent;
 }
 
+type ScrollBottomDelegate = (opts?: { passive?: boolean }) => boolean | void;
+
 async function mountSwitchHarness(initialProps: {
   serverId: string;
   sessionId: string;
@@ -87,7 +100,7 @@ async function mountSwitchHarness(initialProps: {
   initialClientHeight?: number;
 }) {
   let currentProps = { ...initialProps };
-  let scrollBottomFn: (() => void) | null = null;
+  let scrollBottomFn: ScrollBottomDelegate | null = null;
   const rendered = render(
     <ChatView
       events={currentProps.events as never}
@@ -129,7 +142,7 @@ async function mountSwitchHarness(initialProps: {
     scrollEl,
     get scrollTop() { return scrollTopValue; },
     get maxTop() { return Math.max(0, scrollHeightValue - clientHeightValue); },
-    invokeScrollBottom: () => { scrollBottomFn?.(); },
+    invokeScrollBottom: (opts?: { passive?: boolean }) => { scrollBottomFn?.(opts); },
     drainFrames,
     setGeometry: (next: { scrollHeight?: number; clientHeight?: number; scrollTop?: number }) => {
       if (next.scrollHeight !== undefined) scrollHeightValue = next.scrollHeight;
@@ -182,15 +195,10 @@ describe('ChatView — switch bottom-pin guarantees', () => {
       initialClientHeight: 200,
     });
 
-    // Parent requests scroll-to-bottom while retained pane is still hidden (tab switch prep).
     act(() => { chat.invokeScrollBottom(); });
-
-    // Transition visible: false -> true. pinScrollToBottomNow records lastScrollHeight=1200,
-    // and becameVisible MUST NOT wipe lastScrollHeightRef or pendingEngageFollowRef afterwards.
     await chat.updateProps({ visible: true });
     expect(chat.scrollTop).toBe(1000);
 
-    // Grow past 200ms programmatic ignore window with content expansion + lagging scroll event.
     await new Promise((resolve) => setTimeout(resolve, 250));
     chat.setGeometry({ scrollHeight: 1650 });
     fireEvent.scroll(chat.scrollEl);
@@ -198,7 +206,6 @@ describe('ChatView — switch bottom-pin guarantees', () => {
     await chat.drainFrames();
     expect(chat.scrollTop).toBe(1450);
 
-    // Subsequent arriving message stays pinned with zero `[↓ N]` badge.
     chat.setGeometry({ scrollHeight: 1950 });
     await chat.updateProps({
       events: [...initialEvents, assistantEvent('a-2', 'fresh reply', 3000)],
@@ -207,7 +214,7 @@ describe('ChatView — switch bottom-pin guarantees', () => {
     expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
   });
 
-  it('handles multi-step passive scrollHeight expansion in handleScroll without false disengage or [↓ 1]', async () => {
+  it('re-pins passive single-step and two-step growth even when scrollTop shifts > 2px, while keeping unchanged-geometry jump disengage', async () => {
     const baseEvents = [
       userEvent('m-1', 'msg 1', 1000),
       assistantEvent('m-2', 'reply 1', 2000),
@@ -222,30 +229,44 @@ describe('ChatView — switch bottom-pin guarantees', () => {
     });
     expect(chat.scrollTop).toBe(1000);
 
-    // Expire both programmatic-scroll guard (200ms) and mount settle (1500ms) to exercise pure handleScroll.
+    // Expire both 200ms programmatic guard and 1500ms mount settle so handleScroll owns classification.
     await new Promise((resolve) => setTimeout(resolve, 1600));
 
-    // Step 1: content grows slightly (`distance = 40`), scrollTop remains stationary at 1000.
-    // Step 2 (BEFORE scheduled rAF runs): image / row growth jumps scrollHeight 1240 -> 1900 (`distance = 700 > disengageThreshold`).
-    chat.setGeometry({ scrollHeight: 1240 });
+    // Single-step passive layout growth with simultaneous >2px scrollTop shift (1200/200/1000 -> 1900/200/1020).
+    chat.setGeometry({ scrollHeight: 1900, scrollTop: 1020 });
     fireEvent.scroll(chat.scrollEl);
-    chat.setGeometry({ scrollHeight: 1900 });
-    fireEvent.scroll(chat.scrollEl);
-
     await waitFor(() => expect(chat.scrollTop).toBe(1700));
     expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
 
+    // Expire 200ms guard before testing two-step growth with >2px scrollTop shift in both steps.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    chat.setGeometry({ scrollHeight: 1940, scrollTop: 1710 });
+    fireEvent.scroll(chat.scrollEl);
+    chat.setGeometry({ scrollHeight: 2600, scrollTop: 1735 });
+    fireEvent.scroll(chat.scrollEl);
+
+    await waitFor(() => expect(chat.scrollTop).toBe(2400));
+    expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
+
     // Arriving message after multi-step expansion must still auto-follow with zero `[↓ 1]`.
-    chat.setGeometry({ scrollHeight: 2200 });
+    chat.setGeometry({ scrollHeight: 2900 });
     await chat.updateProps({
       events: [...baseEvents, assistantEvent('m-3', 'new message', 3000)],
     });
-    expect(chat.scrollTop).toBe(2000);
+    expect(chat.scrollTop).toBe(2700);
     expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
+
+    // Unchanged geometry explicit coordinate jump (`2900/200/2700 -> 2900/200/2100`) still disengages.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    chat.setGeometry({ scrollTop: 2100 });
+    fireEvent.scroll(chat.scrollEl);
+    expect(chat.container.querySelector('.chat-scroll-btn')).not.toBeNull();
   });
 
-  it('keeps virtualized >24-row and non-virtualized chats pinned when cached switch is followed by delayed new message + img load', async () => {
-    const cachedVirtual: TimelineEvent[] = Array.from({ length: 30 }, (_, i) => (
+  it('keeps virtualized >24-row chats pinned through A -> B -> C -> A switches, ResizeObserver row measurement, delayed catch-up, and img load', async () => {
+    const eventsA = [userEvent('a-1', 'server A', 500)];
+    const eventsB = [userEvent('b-1', 'server B', 600)];
+    const cachedVirtualC: TimelineEvent[] = Array.from({ length: 120 }, (_, i) => (
       i % 2 === 0
         ? userEvent(`c-${i}`, `cached user ${i}`, 1000 + i * 10)
         : assistantEvent(`c-${i}`, `cached reply ${i}`, 1000 + i * 10)
@@ -254,22 +275,23 @@ describe('ChatView — switch bottom-pin guarantees', () => {
       serverId: 'srv-1',
       sessionId: 'deck_srv1_main',
       visible: true,
-      events: [userEvent('s1', 'server 1', 500)],
+      events: eventsA,
       initialScrollHeight: 1200,
       initialClientHeight: 250,
     });
 
-    // Rapid A -> B -> C server switches ending on virtualized srv-3 cached history.
-    await chat.updateProps({ serverId: 'srv-2', sessionId: 'deck_srv2_main', events: [userEvent('s2', 'server 2', 600)] }, false);
+    // Rapid A -> B -> C switch ending on virtualized srv-3 cached history.
+    await chat.updateProps({ serverId: 'srv-2', sessionId: 'deck_srv2_main', events: eventsB }, false);
     chat.setGeometry({ scrollHeight: 2200 });
-    await chat.updateProps({ serverId: 'srv-3', sessionId: 'deck_srv3_main', events: cachedVirtual });
+    await chat.updateProps({ serverId: 'srv-3', sessionId: 'deck_srv3_main', events: cachedVirtualC });
     expect(chat.scrollTop).toBe(1950);
     expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
 
-    // Delayed catch-up (250ms later) adds a new message with an image attachment, firing scroll + img load.
+    // Delayed catch-up arrives 250ms later with a user turn + assistant message containing an <img>.
     await new Promise((resolve) => setTimeout(resolve, 250));
     const withImage = [
-      ...cachedVirtual,
+      ...cachedVirtualC,
+      userEvent('u-new-img', 'show screenshot', 4900),
       assistantEvent('c-new-img', 'screenshot attached:\n\n![result](https://example.test/out.png)', 5000),
     ];
     chat.setGeometry({ scrollHeight: 2320 });
@@ -277,13 +299,41 @@ describe('ChatView — switch bottom-pin guarantees', () => {
     await chat.updateProps({ events: withImage });
     expect(chat.scrollTop).toBe(2070);
 
+    // Fire real ResizeObserver callback on the newly mounted virtual row `[data-virtual-key]`.
+    const tailEvent = chat.container.querySelector('[data-event-id="c-new-img"]') as HTMLElement | null;
+    expect(tailEvent).not.toBeNull();
+    const tailVirtualRow = tailEvent?.closest('[data-virtual-key]') as HTMLElement | null;
+    expect(tailVirtualRow).toBeTruthy();
+    const rectSpy = vi.spyOn(tailVirtualRow!, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, top: 0, left: 0, right: 320, bottom: 260, width: 320, height: 260, toJSON: () => ({}),
+    } as DOMRect);
+    try {
+      chat.setGeometry({ scrollHeight: 2640, scrollTop: 2090 });
+      fireEvent.scroll(chat.scrollEl);
+      act(() => { fireResize([tailVirtualRow!]); });
+      await waitFor(() => expect(chat.scrollTop).toBe(2390));
+      expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
+    } finally {
+      rectSpy.mockRestore();
+    }
+
+    // Async <img> decode expands scrollHeight further.
     const img = chat.container.querySelector('img[alt="result"]') as HTMLImageElement | null;
     expect(img).not.toBeNull();
-    chat.setGeometry({ scrollHeight: 2780 });
+    chat.setGeometry({ scrollHeight: 2880 });
     fireEvent.scroll(chat.scrollEl);
     fireEvent(img!, new Event('load', { bubbles: false }));
+    await waitFor(() => expect(chat.scrollTop).toBe(2630));
+    expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
 
-    await waitFor(() => expect(chat.scrollTop).toBe(2530));
+    // Return A: switching back from C -> A re-pins cleanly to A's bottom.
+    chat.setGeometry({ scrollHeight: 1450 });
+    await chat.updateProps({
+      serverId: 'srv-1',
+      sessionId: 'deck_srv1_main',
+      events: [...eventsA, assistantEvent('a-2', 'back on A', 6000)],
+    });
+    expect(chat.scrollTop).toBe(1200);
     expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
   });
 
@@ -318,7 +368,7 @@ describe('ChatView — switch bottom-pin guarantees', () => {
     expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
   });
 
-  it('still disengages immediately on genuine wheel up / touch drag / pointer scrollbar drag / unmodified PageUp without snapping back', async () => {
+  it('lets a single 40px ArrowUp and between-frame wheel upward scroll win over switch settle and surface unread badge', async () => {
     const events = [
       userEvent('u-neg', 'msg', 1000),
       assistantEvent('a-neg', 'reply', 2000),
@@ -328,41 +378,54 @@ describe('ChatView — switch bottom-pin guarantees', () => {
       sessionId: 'deck_neg',
       visible: true,
       events,
-      initialScrollHeight: 1600,
+      initialScrollHeight: 1200,
       initialClientHeight: 200,
     });
-    expect(chat.scrollTop).toBe(1400);
+    expect(chat.scrollTop).toBe(1000);
 
-    // 1) Genuine wheel up disengages immediately and counts arriving unread as [↓ 1].
-    fireEvent.wheel(chat.scrollEl, { deltaY: -120 });
-    chat.setGeometry({ scrollTop: 600 });
+    // 1) A single 40px unmodified ArrowUp (`1000 -> 960`, < 180 disengageThreshold) MUST disengage immediately.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    fireEvent.keyDown(chat.scrollEl, { key: 'ArrowUp' });
+    chat.setGeometry({ scrollTop: 960 });
     fireEvent.scroll(chat.scrollEl);
-    chat.setGeometry({ scrollHeight: 1900 });
+    expect(chat.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+
+    // Even after the 400ms keyboard hold expires, arriving content stays at 960 and surfaces `[↓ 1]`.
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    chat.setGeometry({ scrollHeight: 1500 });
     await chat.updateProps({
-      events: [...events, assistantEvent('a-neg-2', 'unread while reading', 3000)],
+      events: [...events, assistantEvent('a-neg-arrow', 'unread after ArrowUp', 2500)],
     });
-    expect(chat.scrollTop).toBe(600);
+    expect(chat.scrollTop).toBe(960);
     expect(chat.container.querySelector('.chat-scroll-btn')?.textContent).toContain('↓ 1');
 
-    // Re-engage by clicking the bottom button.
+    // Re-engage via bottom button.
     fireEvent.click(chat.container.querySelector('.chat-scroll-btn') as HTMLButtonElement);
     await chat.drainFrames();
-    expect(chat.scrollTop).toBe(1700);
+    expect(chat.scrollTop).toBe(1300);
     expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
 
-    // 2) Unmodified PageUp arms keyboard hold + prevents snap-back when scrolling up.
-    fireEvent.keyDown(chat.scrollEl, { key: 'PageUp' });
-    chat.setGeometry({ scrollTop: 900 });
+    // 2) Simulate parent switch engage (`invokeScrollBottom()`) followed immediately by wheel-up
+    //    BEFORE frame-2 passive settle (`invokeScrollBottom({ passive: true })`) executes.
+    act(() => { chat.invokeScrollBottom(); });
+    fireEvent.wheel(chat.scrollEl, { deltaY: -120 });
+    chat.setGeometry({ scrollTop: 650 });
     fireEvent.scroll(chat.scrollEl);
-    chat.setGeometry({ scrollHeight: 2100 });
+    act(() => { chat.invokeScrollBottom({ passive: true }); });
+    await chat.drainFrames();
+
+    expect(chat.scrollTop).toBe(650);
+    expect(chat.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+
+    chat.setGeometry({ scrollHeight: 1850 });
     await chat.updateProps({
       events: [
         ...events,
-        assistantEvent('a-neg-2', 'unread while reading', 3000),
-        assistantEvent('a-neg-3', 'unread after PageUp', 4000),
+        assistantEvent('a-neg-arrow', 'unread after ArrowUp', 2500),
+        assistantEvent('a-neg-wheel', 'unread after wheel between frames', 3500),
       ],
     });
-    expect(chat.scrollTop).toBe(900);
+    expect(chat.scrollTop).toBe(650);
     expect(chat.container.querySelector('.chat-scroll-btn')?.textContent).toContain('↓ 1');
   });
 });

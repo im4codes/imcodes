@@ -3766,8 +3766,9 @@ function InternalMainApp() {
   }, [bringSubToFront, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
   // Per-session chat scroll functions — registered by SessionPane and SubSessionWindow.
-  const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
-  const subChatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
+  type ChatScrollCallback = (opts?: { passive?: boolean }) => boolean | void;
+  const chatScrollFnsRef = useRef<Map<string, ChatScrollCallback>>(new Map());
+  const subChatScrollFnsRef = useRef<Map<string, ChatScrollCallback>>(new Map());
   const pendingChatScrollSessionRef = useRef<string | null>(null);
   const pendingChatScrollRafRef = useRef<number | null>(null);
   const settleChatScrollRafRef = useRef<number | null>(null);
@@ -3829,8 +3830,8 @@ function InternalMainApp() {
     cancelSubChatScrollRafs();
   }, [cancelMainChatScrollRafs, cancelSubChatScrollRafs]);
 
-  const runRegisteredMainChatScroll = useCallback((name: string, fn: () => void, scheduleSettle: boolean): boolean => {
-    const handled = (fn as () => boolean | void)();
+  const runRegisteredMainChatScroll = useCallback((name: string, fn: ChatScrollCallback, scheduleSettle: boolean): boolean => {
+    const handled = fn();
     if (handled === false) {
       chatScrollFnsRef.current.delete(name);
       return false;
@@ -3849,15 +3850,15 @@ function InternalMainApp() {
       settleChatScrollRafRef.current = requestAnimationFrame(() => {
         settleChatScrollRafRef.current = null;
         if (pendingChatScrollSessionRef.current !== null && pendingChatScrollSessionRef.current !== name) return;
-        const latest = chatScrollFnsRef.current.get(name) as (() => boolean | void) | undefined;
-        latest?.();
+        const latest = chatScrollFnsRef.current.get(name);
+        latest?.({ passive: true });
       });
     }
     return true;
   }, []);
 
-  const runRegisteredSubChatScroll = useCallback((id: string, fn: () => void, scheduleSettle: boolean): boolean => {
-    const handled = (fn as () => boolean | void)();
+  const runRegisteredSubChatScroll = useCallback((id: string, fn: ChatScrollCallback, scheduleSettle: boolean): boolean => {
+    const handled = fn();
     if (handled === false) {
       subChatScrollFnsRef.current.delete(id);
       return false;
@@ -3873,8 +3874,8 @@ function InternalMainApp() {
       if (existingSettle !== undefined) cancelAnimationFrame(existingSettle);
       const settleRaf = requestAnimationFrame(() => {
         settleSubScrollRafsRef.current.delete(id);
-        const latest = subChatScrollFnsRef.current.get(id) as (() => boolean | void) | undefined;
-        latest?.();
+        const latest = subChatScrollFnsRef.current.get(id);
+        latest?.({ passive: true });
       });
       settleSubScrollRafsRef.current.set(id, settleRaf);
     }
