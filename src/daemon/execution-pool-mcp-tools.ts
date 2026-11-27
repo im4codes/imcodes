@@ -38,6 +38,11 @@ export interface ExecutionPoolMcpToolDeps {
   probeSdks?: (caller: McpRuntimeCaller) => Promise<ExecutionPoolSdkProbeResult> | ExecutionPoolSdkProbeResult;
   loadKnowledge?: () => Promise<LearnedModelTierRecord[]> | LearnedModelTierRecord[];
   saveKnowledge?: (updates: readonly LearnedModelTierInput[]) => Promise<LearnedModelTierRecord[]> | LearnedModelTierRecord[];
+  /** Production stdio seam: execute execution_pool_get/set inside the main daemon so cached pools update synchronously. */
+  invokeDaemonTool?: (
+    name: typeof EXECUTION_POOL_MCP_TOOLS[keyof typeof EXECUTION_POOL_MCP_TOOLS],
+    input?: unknown,
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
 }
 
 const poolEntrySchema = z.strictObject({
@@ -209,56 +214,76 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
     return { probe, knowledge };
   };
 
+  const invokeThroughDaemon = async (
+    name: typeof EXECUTION_POOL_MCP_TOOLS[keyof typeof EXECUTION_POOL_MCP_TOOLS],
+    input: unknown,
+    localFallback: () => Promise<ToolResult>,
+  ): Promise<ToolResult> => {
+    if (!deps.invokeDaemonTool) return localFallback();
+    try {
+      return await deps.invokeDaemonTool(name, input);
+    } catch (err) {
+      if (err instanceof Error && /\bstatus 404\b/.test(err.message)) {
+        return localFallback();
+      }
+      throw err;
+    }
+  };
+
+  const localGet = async (): Promise<ToolResult> => {
+    if (!authorized()) return error('execution pool reads require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+    const [defaults, context] = await Promise.all([
+      Promise.resolve(getDefaults(caller)),
+      readContext(),
+    ]);
+    return poolOutput(defaults, context.probe, context.knowledge);
+  };
+
+  const localSet = async (input: unknown): Promise<ToolResult> => {
+    if (!authorized()) return error('execution pool changes require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+    const parsed = validateExecutionPoolMcpPatch(input);
+    if ('error' in parsed) return error(parsed.error);
+
+    let updatedKnowledgeCount: number | undefined;
+    let latestKnowledge: LearnedModelTierRecord[] | undefined;
+    if (parsed.learnedModelTiers && parsed.learnedModelTiers.length > 0) {
+      latestKnowledge = await Promise.resolve(saveKnowledge(parsed.learnedModelTiers));
+      updatedKnowledgeCount = parsed.learnedModelTiers.length;
+    }
+
+    const hasPoolOrPolicyChange = parsed.entries !== undefined
+      || parsed.primaryEntries !== undefined
+      || parsed.economyEntries !== undefined
+      || parsed.autoPairingEnabled !== undefined
+      || parsed.auditByDefault !== undefined
+      || parsed.concurrencyCap !== undefined;
+
+    let targetDefaults: SupervisorDefaultConfig | null;
+    if (hasPoolOrPolicyChange) {
+      // The persistence boundary must read + merge inside its shared queue.
+      targetDefaults = await setDefaults(caller, (current) => applyPatch(current, parsed));
+      if (!targetDefaults) {
+        return error('execution pool persistence could not be confirmed; read the current preferences before retrying', MCP_ERROR_REASONS.INTERNAL_ERROR);
+      }
+    } else {
+      targetDefaults = await getDefaults(caller);
+    }
+
+    const [probe, loadedKnowledge] = await Promise.all([
+      Promise.resolve(probeSdks(caller)).catch(() => null),
+      latestKnowledge ? Promise.resolve(latestKnowledge) : Promise.resolve(loadKnowledge()).catch(() => [] as LearnedModelTierRecord[]),
+    ]);
+    return poolOutput(
+      targetDefaults,
+      probe,
+      loadedKnowledge,
+      updatedKnowledgeCount !== undefined ? { learnedModelsUpdated: updatedKnowledgeCount } : undefined,
+    );
+  };
+
   return {
-    [EXECUTION_POOL_MCP_TOOLS.GET]: async () => {
-      if (!authorized()) return error('execution pool reads require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
-      const [defaults, context] = await Promise.all([
-        Promise.resolve(getDefaults(caller)),
-        readContext(),
-      ]);
-      return poolOutput(defaults, context.probe, context.knowledge);
-    },
-    [EXECUTION_POOL_MCP_TOOLS.SET]: async (input) => {
-      if (!authorized()) return error('execution pool changes require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
-      const parsed = validateExecutionPoolMcpPatch(input);
-      if ('error' in parsed) return error(parsed.error);
-
-      let updatedKnowledgeCount: number | undefined;
-      let latestKnowledge: LearnedModelTierRecord[] | undefined;
-      if (parsed.learnedModelTiers && parsed.learnedModelTiers.length > 0) {
-        latestKnowledge = await Promise.resolve(saveKnowledge(parsed.learnedModelTiers));
-        updatedKnowledgeCount = parsed.learnedModelTiers.length;
-      }
-
-      const hasPoolOrPolicyChange = parsed.entries !== undefined
-        || parsed.primaryEntries !== undefined
-        || parsed.economyEntries !== undefined
-        || parsed.autoPairingEnabled !== undefined
-        || parsed.auditByDefault !== undefined
-        || parsed.concurrencyCap !== undefined;
-
-      let targetDefaults: SupervisorDefaultConfig | null;
-      if (hasPoolOrPolicyChange) {
-        // The persistence boundary must read + merge inside its shared queue.
-        targetDefaults = await setDefaults(caller, (current) => applyPatch(current, parsed));
-        if (!targetDefaults) {
-          return error('execution pool persistence could not be confirmed; read the current preferences before retrying', MCP_ERROR_REASONS.INTERNAL_ERROR);
-        }
-      } else {
-        targetDefaults = await getDefaults(caller);
-      }
-
-      const [probe, loadedKnowledge] = await Promise.all([
-        Promise.resolve(probeSdks(caller)).catch(() => null),
-        latestKnowledge ? Promise.resolve(latestKnowledge) : Promise.resolve(loadKnowledge()).catch(() => [] as LearnedModelTierRecord[]),
-      ]);
-      return poolOutput(
-        targetDefaults,
-        probe,
-        loadedKnowledge,
-        updatedKnowledgeCount !== undefined ? { learnedModelsUpdated: updatedKnowledgeCount } : undefined,
-      );
-    },
+    [EXECUTION_POOL_MCP_TOOLS.GET]: () => invokeThroughDaemon(EXECUTION_POOL_MCP_TOOLS.GET, {}, localGet),
+    [EXECUTION_POOL_MCP_TOOLS.SET]: (input) => invokeThroughDaemon(EXECUTION_POOL_MCP_TOOLS.SET, input, () => localSet(input)),
   };
 }
 

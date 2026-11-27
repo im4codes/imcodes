@@ -4,6 +4,7 @@ import {
   buildSupervisionExecutionCapabilityId,
   classifySdkModelTiers,
   evaluateSupervisionExecutionBinding,
+  isFutureVersionedClaudeModelId,
   mayFinalizeEconomyAssignment,
   migrateLegacySupervisionExecutionPools,
   normalizeSupervisionExecutionConfig,
@@ -22,6 +23,8 @@ import {
   type LearnedModelTierRecord,
   type SupervisionExecutionConfig,
 } from '../../shared/supervision-execution-pool.js';
+import { configFromExecutionPoolEntry } from '../../shared/execution-pool-mcp.js';
+import { normalizeClaudeSdkModelForProvider } from '../../src/agent/sdk-runtime-config.js';
 import { SUPERVISION_SUPPORTED_UI_LOCALES } from '../../shared/supervision-config.js';
 
 function config(agentType: string, providerFamily: string, model: string, ccPresetId?: string): SupervisionExecutionConfig {
@@ -848,5 +851,31 @@ describe('dynamic model tier classification & cross-SDK recommendations', () => 
     for (const preset of rec.recommendedPresets) {
       expect(preset.primaryEntries.some((e) => e.provider === 'codex-sdk')).toBe(false);
     }
+  });
+
+  it('preserves future versioned Claude models (claude-fable-6, claude-opus-6, etc.) end-to-end without collapsing to v5/v4 aliases', () => {
+    for (const futureModel of ['claude-fable-6', 'claude-fable-6[1m]', 'claude-opus-6', 'claude-sonnet-6', 'claude-haiku-6']) {
+      expect(isFutureVersionedClaudeModelId(futureModel)).toBe(true);
+      expect(normalizeSupervisionExecutionModel('claude-code-sdk', futureModel)).toBe(futureModel);
+      expect(normalizeClaudeSdkModelForProvider(futureModel)).toBe(futureModel);
+      const entryCfg = configFromExecutionPoolEntry({ provider: 'claude-code-sdk', model: futureModel, role: 'executor', enabled: true });
+      expect(entryCfg).toMatchObject({ agentType: 'claude-code-sdk', providerFamily: 'anthropic', model: futureModel });
+      expect(buildSupervisionExecutionCapabilityId(entryCfg!)).toContain(futureModel);
+    }
+    // Legacy v4/v5 compatibility preserved
+    expect(isFutureVersionedClaudeModelId('claude-opus-4-7')).toBe(false);
+    expect(isFutureVersionedClaudeModelId('claude-opus-5')).toBe(false);
+    expect(normalizeSupervisionExecutionModel('claude-code-sdk', 'claude-opus-4-7')).toBe('opus[1M]');
+    expect(normalizeSupervisionExecutionModel('claude-code-sdk', 'claude-opus-5')).toBe('opus[1M]');
+    expect(normalizeSupervisionExecutionModel('claude-code-sdk', 'claude-fable-5')).toBe('fable');
+    expect(normalizeClaudeSdkModelForProvider('fable')).toBe('claude-fable-5');
+
+    // Tier classification ranks claude-fable-6 above fable alias
+    const classified = classifySdkModelTiers('claude-code-sdk', ['fable', 'claude-fable-6', 'sonnet', 'haiku']);
+    expect(classified.tiers).toEqual({
+      flagship: 'claude-fable-6',
+      secondary: 'sonnet',
+      economy: 'haiku',
+    });
   });
 });

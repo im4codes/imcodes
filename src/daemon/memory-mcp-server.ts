@@ -98,7 +98,11 @@ import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { enqueueDurableResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 import { registerExecutionPoolMcpTools, type ExecutionPoolMcpToolDeps } from './execution-pool-mcp-tools.js';
-import { EXECUTION_POOL_SDKS_HOOK_PATH } from '../../shared/execution-pool-mcp.js';
+import {
+  EXECUTION_POOL_DAEMON_RPC_PATH,
+  EXECUTION_POOL_SDKS_HOOK_PATH,
+  type ExecutionPoolMcpToolName,
+} from '../../shared/execution-pool-mcp.js';
 import { probeExecutionPoolSdks, type ExecutionPoolSdkProbeResult } from './sdk-execution-pool-probe.js';
 import { getCachedSupervisorDefaults, refreshSupervisorDefaultsCache, updateSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
 import { fileTransferMcpTimeoutMs } from '../../shared/transport/file-transfer.js';
@@ -498,7 +502,16 @@ export function createMemoryMcpServer(
   for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps, toolDeps.legacyToolForwarder)) {
     registered.set(name, tool);
   }
+  const hasCustomExecutionPoolPersistence = Boolean(
+    executionPoolToolDeps.getDefaults
+    || executionPoolToolDeps.setDefaults
+    || executionPoolToolDeps.loadKnowledge
+    || executionPoolToolDeps.saveKnowledge,
+  );
   for (const [name, tool] of registerExecutionPoolMcpTools(server, caller, {
+    ...(toolDeps.invokeDaemonExecutionPoolTool && !hasCustomExecutionPoolPersistence
+      ? { invokeDaemonTool: toolDeps.invokeDaemonExecutionPoolTool }
+      : {}),
     getDefaults: executionPoolToolDeps.getDefaults ?? (async () => {
       await refreshSupervisorDefaultsCache();
       return getCachedSupervisorDefaults();
@@ -692,6 +705,29 @@ export function mergeDefaultToolDeps(
       : undefined),
     participantTurnRequired: toolDeps.participantTurnRequired
       ?? (postSharedMachineAuthorityHook ? participantTurnFromAuthorityHook(postSharedMachineAuthorityHook) : undefined),
+    invokeDaemonExecutionPoolTool: toolDeps.invokeDaemonExecutionPoolTool
+      ?? (resourceOwner && caller.sessionName
+        ? (() => {
+            const postExecutionPoolHook = createResourceOwnerHookWithEpochRefresh({
+              resourceOwner,
+              callerSessionName: caller.sessionName!,
+              requireHookPort,
+              hookPath: EXECUTION_POOL_DAEMON_RPC_PATH,
+              timeoutMs: MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS,
+              staleRuntimeError: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR,
+              rejectStopped: true,
+              env: initialBridgeEnv,
+            });
+            return async (name: ExecutionPoolMcpToolName, input?: unknown) => {
+              const response = await postExecutionPoolHook({ serverId: caller.serverId, tool: name, input });
+              const result = response.result;
+              if (!result || typeof result !== 'object' || Array.isArray(result)) {
+                throw new Error('daemon_execution_pool_invalid_response');
+              }
+              return result as Record<string, unknown>;
+            };
+          })()
+        : undefined),
     invokeDaemonMemoryTool: toolDeps.invokeDaemonMemoryTool
       ?? (resourceOwner && caller.sessionName
         ? (() => {

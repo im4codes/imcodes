@@ -5412,6 +5412,24 @@ describe('handleWebCommand transport queue behavior', () => {
       expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck_sub_idle', requestedModel: 'sonnet' }));
     });
 
+    it('preserves explicit future versioned Claude model IDs end-to-end without collapsing to fable/opus aliases', async () => {
+      const setAgentId = vi.fn();
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_cc1', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', activeModel: 'sonnet',
+      });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-cc1', setAgentId, pendingCount: 0 });
+
+      const result = await switchSessionModelNow('deck_sub_cc1', 'claude-fable-6');
+
+      expect(result).toMatchObject({ ok: true, model: 'claude-fable-6', previousModel: 'sonnet' });
+      expect(setAgentId).toHaveBeenCalledWith('claude-fable-6');
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+        name: 'deck_sub_cc1',
+        requestedModel: 'claude-fable-6',
+        activeModel: 'claude-fable-6',
+      }));
+    });
+
     it('refuses an unknown model for a validated provider and returns the valid list', async () => {
       const setAgentId = vi.fn();
       getSessionMock.mockReturnValue({

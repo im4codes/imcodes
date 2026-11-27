@@ -8,6 +8,8 @@ import {
   isCodexFamily,
 } from '../../shared/agent-types.js';
 import { AGY_FALLBACK_MODEL_IDS, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { AGY_USAGE_MAX_PERSISTED_AGE_MS } from '../../shared/agy-usage.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { resolvePeerAuditProviderFamily } from '../../shared/peer-audit.js';
 import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import {
@@ -42,7 +44,16 @@ const CANDIDATE_SDKS = [
   'opencode-sdk',
   'cursor-headless',
   'deepseek-harness',
+  'qoder-sdk',
+  'pi',
+  HERMES_AGENT_PROVIDER_ID,
 ] as const;
+
+const SKIP_LIVE_LIST_MODELS_SDKS = new Set<string>([
+  'claude-code-sdk',
+  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
+  'codex-sdk',
+]);
 
 export interface ExecutionPoolBrainSnapshot {
   provider: string;
@@ -55,14 +66,24 @@ export interface ExecutionPoolSdkProbeResult {
   sdks: ExecutionPoolSdkSummary[];
 }
 
+export type ProbeableProviderList = {
+  models?: Array<{ id: string }>;
+  isAuthenticated?: boolean;
+  error?: string;
+};
+
 export interface SdkExecutionPoolProbeDeps {
   env?: NodeJS.ProcessEnv;
   homeDir?: string;
+  now?: () => number;
   listSessions?: () => SessionRecord[];
   getSession?: (name: string) => SessionRecord | undefined;
   detectInstalledAgents?: () => Promise<AgentAvailabilityMap>;
   detectLocalAuthContext?: (providerId: string, env: NodeJS.ProcessEnv) => Promise<LocalAuthContext>;
-  getProvider?: (id: string) => (Pick<TransportProvider, 'id'> & { getCachedModels?: () => { models?: Array<{ id: string }>; isAuthenticated?: boolean } | null }) | undefined;
+  getProvider?: (id: string) => (Pick<TransportProvider, 'id'> & {
+    getCachedModels?: () => ProbeableProviderList | null;
+    listModels?: (force?: boolean) => Promise<ProbeableProviderList | null | undefined>;
+  }) | undefined;
   getCodexRuntimeConfig?: typeof getCodexRuntimeConfig;
   fileExists?: (path: string) => boolean;
   readFile?: (path: string) => string;
@@ -114,7 +135,19 @@ function safeJsonFileNonEmpty(
   }
 }
 
+function hasFreshPersistedAt(parsed: Record<string, unknown>, nowMs: number): boolean {
+  const ts = typeof parsed.at === 'number'
+    ? parsed.at
+    : typeof parsed.updatedAt === 'number'
+      ? parsed.updatedAt
+      : null;
+  if (ts === null || !Number.isFinite(ts)) return false;
+  if (ts > nowMs + 60_000) return false;
+  return nowMs - ts < AGY_USAGE_MAX_PERSISTED_AGE_MS;
+}
+
 function hasValidAgyQuotaCache(
+  nowMs: number,
   env: NodeJS.ProcessEnv,
   fileExists: (p: string) => boolean,
   readFileFn: (p: string) => string,
@@ -123,11 +156,13 @@ function hasValidAgyQuotaCache(
   void env;
   const parsed = safeJsonFileNonEmpty(path, fileExists, readFileFn);
   if (!parsed) return false;
+  if (!hasFreshPersistedAt(parsed, nowMs)) return false;
   const value = parsed.value && typeof parsed.value === 'object' ? (parsed.value as Record<string, unknown>) : parsed;
   return Boolean(value.quotaMeta && typeof value.quotaMeta === 'object');
 }
 
 function hasValidClaudeLocalAuth(
+  nowMs: number,
   env: NodeJS.ProcessEnv,
   homeDir: string,
   fileExists: (p: string) => boolean,
@@ -139,13 +174,15 @@ function hasValidClaudeLocalAuth(
     ? (creds.claudeAiOauth as { accessToken?: unknown; expiresAt?: unknown })
     : undefined;
   if (typeof oauth?.accessToken === 'string' && oauth.accessToken.trim().length > 0) {
-    if (typeof oauth.expiresAt === 'number' && Number.isFinite(oauth.expiresAt) && Date.now() >= oauth.expiresAt) {
+    if (typeof oauth.expiresAt === 'number' && Number.isFinite(oauth.expiresAt) && nowMs >= oauth.expiresAt) {
       return false;
     }
     return true;
   }
   const quotaCache = safeJsonFileNonEmpty(imcodesStatePath('claude-usage-quota.json'), fileExists, readFileFn);
-  if (quotaCache) return true;
+  if (quotaCache && quotaCache.value && typeof quotaCache.value === 'object' && hasFreshPersistedAt(quotaCache, nowMs)) {
+    return true;
+  }
   return false;
 }
 
@@ -158,6 +195,10 @@ function matchesProviderFamilyOrCanonical(sessionAgentType: string, sdkProvider:
   return false;
 }
 
+function isLiveSessionRecord(session: SessionRecord): boolean {
+  return session.state !== 'error' && session.state !== 'stopped';
+}
+
 function sessionObservedModelsForSdk(sessions: readonly SessionRecord[], sdkProvider: string): string[] {
   const collected: string[] = [];
   const push = (val: unknown) => {
@@ -167,8 +208,11 @@ function sessionObservedModelsForSdk(sessions: readonly SessionRecord[], sdkProv
   };
   for (const session of sessions) {
     if (!matchesProviderFamilyOrCanonical(session.agentType, sdkProvider)) continue;
+    if (!isLiveSessionRecord(session)) continue;
     push(session.activeModel);
-    push(session.requestedModel);
+    if (!session.activeModel && hasVerifiedSessionRuntimeEvidence(session)) {
+      push(session.requestedModel);
+    }
     if (sdkProvider === 'codex-sdk' && Array.isArray(session.codexAvailableModels)) {
       for (const m of session.codexAvailableModels) push(m);
     }
@@ -203,12 +247,41 @@ function staticFallbackModelsForSdk(sdkProvider: string): readonly string[] {
   }
 }
 
-function hasHealthySessionForSdk(sessions: readonly SessionRecord[], sdkProvider: string, callerSessionName?: string): boolean {
+function hasVerifiedSessionRuntimeEvidence(session: SessionRecord): boolean {
+  if (session.activeModel?.trim()) return true;
+  if (
+    session.ccSessionId?.trim()
+    || session.codexSessionId?.trim()
+    || session.geminiSessionId?.trim()
+    || session.opencodeSessionId?.trim()
+  ) {
+    return true;
+  }
+  return (session.state === 'idle' || session.state === 'running')
+    && Boolean(session.sessionInstanceId?.trim() && session.runtimeEpoch?.trim());
+}
+
+function hasVerifiedActiveSessionForSdk(
+  sessions: readonly SessionRecord[],
+  sdkProvider: string,
+  callerSessionName?: string,
+): boolean {
   return sessions.some((s) => {
     if (!matchesProviderFamilyOrCanonical(s.agentType, sdkProvider)) return false;
+    if (!isLiveSessionRecord(s)) return false;
     if (callerSessionName && s.name === callerSessionName) return true;
-    return s.state !== 'error' && Boolean(s.activeModel || s.requestedModel || s.state === 'idle' || s.state === 'running');
+    return hasVerifiedSessionRuntimeEvidence(s);
   });
+}
+
+function isStaticMuseFallbackList(
+  sdkProvider: string,
+  providerList: ProbeableProviderList | null | undefined,
+  hasActiveSession: boolean,
+): boolean {
+  if (sdkProvider !== 'muse-code-sdk' || hasActiveSession || !providerList?.models?.length) return false;
+  if (providerList.models.length !== MUSE_MODEL_IDS.length) return false;
+  return providerList.models.every((m, idx) => m.id === MUSE_MODEL_IDS[idx]);
 }
 
 /**
@@ -220,12 +293,17 @@ export async function probeExecutionPoolSdks(
 ): Promise<ExecutionPoolSdkProbeResult> {
   const deps = options.deps ?? {};
   const env = deps.env ?? process.env;
+  const nowMs = (deps.now ?? Date.now)();
   const homeDir = deps.homeDir ?? env.HOME?.trim() ?? homedir();
   const fileExists = deps.fileExists ?? existsSync;
   const readFileFn = deps.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
   const getSess = deps.getSession ?? getSession;
   const listSess = deps.listSessions ?? (() => listSessions());
-  const getProv = deps.getProvider ?? ((id: string) => getProvider(id) as { id: string; getCachedModels?: () => { models?: Array<{ id: string }>; isAuthenticated?: boolean } | null } | undefined);
+  const getProv = deps.getProvider ?? ((id: string) => getProvider(id) as {
+    id: string;
+    getCachedModels?: () => ProbeableProviderList | null;
+    listModels?: (force?: boolean) => Promise<ProbeableProviderList | null | undefined>;
+  } | undefined);
   const loadCodexCfg = deps.getCodexRuntimeConfig ?? getCodexRuntimeConfig;
   const loadKnowledge = deps.loadKnowledge ?? (() => loadModelTierKnowledge());
   const authProbe = deps.detectLocalAuthContext ?? detectLocalAuthContext;
@@ -268,24 +346,45 @@ export async function probeExecutionPoolSdks(
   for (const sdkProvider of candidateProviders) {
     const providerFamily = resolvePeerAuditProviderFamily({ agentType: sdkProvider, providerId: sdkProvider });
     const liveProvider = getProv(sdkProvider);
-    const cachedProviderList = liveProvider?.getCachedModels?.() ?? null;
     const observedModels = sessionObservedModelsForSdk(sessions, sdkProvider);
     const installed = installedAgents[sdkProvider as keyof AgentAvailabilityMap]?.installed === true;
-    const isBrainSdk = sdkProvider === currentBrainProvider
-      || matchesProviderFamilyOrCanonical(callerRecord?.agentType ?? '', sdkProvider);
-    const healthySession = hasHealthySessionForSdk(sessions, sdkProvider, options.callerSessionName);
+    const isBrainSdk = Boolean(
+      callerRecord
+      && isLiveSessionRecord(callerRecord)
+      && (sdkProvider === currentBrainProvider || matchesProviderFamilyOrCanonical(callerRecord.agentType, sdkProvider)),
+    );
+    const healthySession = hasVerifiedActiveSessionForSdk(sessions, sdkProvider, options.callerSessionName);
+
+    let providerList: ProbeableProviderList | null = liveProvider?.getCachedModels?.() ?? null;
+    if (
+      !providerList
+      && !liveProvider?.getCachedModels
+      && typeof liveProvider?.listModels === 'function'
+      && (installed || healthySession || isBrainSdk)
+      && !SKIP_LIVE_LIST_MODELS_SDKS.has(sdkProvider)
+    ) {
+      providerList = (await withTimeout(
+        Promise.resolve().then(() => liveProvider.listModels!(false)).catch(() => null),
+        PROBE_TIMEOUT_MS,
+        null,
+      )) ?? null;
+    }
+
+    const staticMuseFallback = isStaticMuseFallbackList(sdkProvider, providerList, healthySession || isBrainSdk);
+    const effectiveProviderList = staticMuseFallback ? null : providerList;
+    const explicitUnauthenticated = effectiveProviderList?.isAuthenticated === false;
 
     let loggedIn = isBrainSdk || healthySession;
 
-    if (!loggedIn) {
+    if (!loggedIn && !explicitUnauthenticated) {
       if (sdkProvider === AGY_SDK_PROVIDER_ID) {
         loggedIn = Boolean(
-          cachedProviderList?.isAuthenticated === true
-          || (cachedProviderList?.models && cachedProviderList.models.length > 0)
-          || hasValidAgyQuotaCache(env, fileExists, readFileFn),
+          effectiveProviderList?.isAuthenticated === true
+          || (effectiveProviderList?.models?.length && !effectiveProviderList.error)
+          || hasValidAgyQuotaCache(nowMs, env, fileExists, readFileFn),
         );
       } else if (sdkProvider === 'claude-code-sdk') {
-        if (hasValidClaudeLocalAuth(env, homeDir, fileExists, readFileFn)) {
+        if (hasValidClaudeLocalAuth(nowMs, env, homeDir, fileExists, readFileFn)) {
           loggedIn = true;
         } else if (hasLocalAuthCandidate(sdkProvider, env)) {
           const ctx = await withTimeout(authProbe(sdkProvider, env), PROBE_TIMEOUT_MS, {
@@ -294,7 +393,7 @@ export async function probeExecutionPoolSdks(
           loggedIn = ctx.authenticated;
         }
       } else if (sdkProvider === 'codex-sdk') {
-        if (cachedProviderList?.isAuthenticated === true || Boolean(codexCfg.planLabel)) {
+        if (effectiveProviderList?.isAuthenticated === true || Boolean(codexCfg.planLabel)) {
           loggedIn = true;
         } else {
           const ctx = await withTimeout(authProbe(sdkProvider, env), PROBE_TIMEOUT_MS, {
@@ -303,7 +402,10 @@ export async function probeExecutionPoolSdks(
           loggedIn = ctx.authenticated;
         }
       } else {
-        if (cachedProviderList?.isAuthenticated === true) {
+        if (
+          effectiveProviderList?.isAuthenticated === true
+          || (effectiveProviderList?.isAuthenticated === undefined && Boolean(effectiveProviderList?.models?.length) && !effectiveProviderList?.error)
+        ) {
           loggedIn = true;
         } else if (hasLocalAuthCandidate(sdkProvider, env)) {
           const ctx = await withTimeout(authProbe(sdkProvider, env), PROBE_TIMEOUT_MS, {
@@ -318,11 +420,16 @@ export async function probeExecutionPoolSdks(
     if (!loggedIn && !installed && !isBrainSdk) continue;
 
     // Collect model catalog with strict priority: live_catalog > session_observed > static_fallback
+    // Never mix historical session_observed models into an authoritative live_catalog.
     let rawModels: string[] = [];
     let source: ExecutionPoolSdkCatalogSource = 'static_fallback';
 
-    if (cachedProviderList?.models?.length) {
-      rawModels = cachedProviderList.models.map((m) => m.id);
+    if (
+      effectiveProviderList?.models?.length
+      && !effectiveProviderList.error
+      && effectiveProviderList.isAuthenticated !== false
+    ) {
+      rawModels = effectiveProviderList.models.map((m) => m.id);
       source = 'live_catalog';
     } else if (sdkProvider === 'codex-sdk' && codexCfg.availableModels?.length && (codexModelsCacheExists || codexCfg.planLabel || Boolean(liveProvider))) {
       // Distinguish live/file-cached Codex catalog from static CODEX_MODEL_IDS fallback
@@ -337,9 +444,6 @@ export async function probeExecutionPoolSdks(
     if (rawModels.length === 0 && observedModels.length > 0) {
       rawModels = [...observedModels];
       source = 'session_observed';
-    } else if (observedModels.length > 0) {
-      // Prepend any session-observed models (e.g. brain's activeModel) not yet in live cache
-      rawModels = [...observedModels, ...rawModels];
     }
 
     if (rawModels.length === 0) {

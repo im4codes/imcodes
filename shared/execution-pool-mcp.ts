@@ -24,7 +24,16 @@ export const EXECUTION_POOL_MCP_TOOLS = {
   SET: 'execution_pool_set',
 } as const;
 export const EXECUTION_POOL_SDKS_HOOK_PATH = '/execution-pool-sdks' as const;
+export const EXECUTION_POOL_DAEMON_RPC_PATH = '/execution-pool/tool' as const;
+export const EXECUTION_POOL_DAEMON_TOOL_NAMES = [
+  EXECUTION_POOL_MCP_TOOLS.GET,
+  EXECUTION_POOL_MCP_TOOLS.SET,
+] as const satisfies readonly ExecutionPoolMcpToolName[];
 export type ExecutionPoolMcpToolName = typeof EXECUTION_POOL_MCP_TOOLS[keyof typeof EXECUTION_POOL_MCP_TOOLS];
+const EXECUTION_POOL_DAEMON_TOOL_NAME_SET: ReadonlySet<string> = new Set(EXECUTION_POOL_DAEMON_TOOL_NAMES);
+export function isExecutionPoolDaemonToolName(value: unknown): value is ExecutionPoolMcpToolName {
+  return typeof value === 'string' && EXECUTION_POOL_DAEMON_TOOL_NAME_SET.has(value);
+}
 export const EXECUTION_POOL_MCP_ROLES = SUPERVISION_EXECUTION_POOL_ROLES;
 export type ExecutionPoolMcpRole = SupervisionExecutionPoolRole;
 export const EXECUTION_POOL_MCP_LIMITS = Object.freeze({ MAX_CONCURRENCY: 100, MAX_LEARNED_MODEL_TIERS: 100 });

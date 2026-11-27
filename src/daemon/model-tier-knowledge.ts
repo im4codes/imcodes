@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import {
   MODEL_TIERS,
   normalizeModelTierKnowledgeProvider,
@@ -16,6 +16,9 @@ const MODEL_TIER_KNOWLEDGE_SCHEMA_VERSION = 1;
 const MAX_KNOWLEDGE_RECORDS = 500;
 const MAX_SOURCE_CHARS = 200;
 const MAX_NOTES_CHARS = 300;
+const KNOWLEDGE_LOCK_TIMEOUT_MS = 5_000;
+const KNOWLEDGE_LOCK_STALE_MS = 10_000;
+const SLEEP_INT32 = new Int32Array(new SharedArrayBuffer(4));
 
 export interface LearnedModelTierInput {
   provider: string;
@@ -110,15 +113,93 @@ export function loadModelTierKnowledge(filePath = resolveModelTierKnowledgePath(
   }
 }
 
-/**
- * Atomically persist learned model-tier records (tmp + rename) with serialized writes.
- */
-export function upsertModelTierKnowledgeSync(
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function tryBreakStaleKnowledgeLock(lockDirPath: string): boolean {
+  try {
+    const ownerFile = join(lockDirPath, 'owner.json');
+    if (existsSync(ownerFile)) {
+      const parsed = JSON.parse(readFileSync(ownerFile, 'utf8')) as { pid?: unknown; createdAt?: unknown };
+      const pid = typeof parsed.pid === 'number' ? parsed.pid : null;
+      const createdAt = typeof parsed.createdAt === 'number' ? parsed.createdAt : null;
+      if ((pid !== null && !isProcessAlive(pid)) || (createdAt !== null && Date.now() - createdAt >= KNOWLEDGE_LOCK_STALE_MS)) {
+        rmSync(lockDirPath, { recursive: true, force: true });
+        return true;
+      }
+      return false;
+    }
+    const stat = statSync(lockDirPath);
+    if (Date.now() - stat.mtimeMs >= KNOWLEDGE_LOCK_STALE_MS) {
+      rmSync(lockDirPath, { recursive: true, force: true });
+      return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function tryAcquireKnowledgeLock(lockDirPath: string): (() => void) | null {
+  try {
+    mkdirSync(lockDirPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return null;
+    throw err;
+  }
+  try {
+    writeFileSync(join(lockDirPath, 'owner.json'), JSON.stringify({ pid: process.pid, createdAt: Date.now() }), 'utf8');
+  } catch { /* ignore owner metadata write failure */ }
+  return () => {
+    try {
+      rmSync(lockDirPath, { recursive: true, force: true });
+    } catch { /* ignore release error */ }
+  };
+}
+
+function acquireKnowledgeLockSync(filePath: string): () => void {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const lockDirPath = `${filePath}.lock`;
+  const deadline = Date.now() + KNOWLEDGE_LOCK_TIMEOUT_MS;
+  while (true) {
+    const release = tryAcquireKnowledgeLock(lockDirPath);
+    if (release) return release;
+    if (tryBreakStaleKnowledgeLock(lockDirPath)) continue;
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDirPath}`);
+    }
+    Atomics.wait(SLEEP_INT32, 0, 0, 10);
+  }
+}
+
+async function acquireKnowledgeLockAsync(filePath: string): Promise<() => void> {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const lockDirPath = `${filePath}.lock`;
+  const deadline = Date.now() + KNOWLEDGE_LOCK_TIMEOUT_MS;
+  while (true) {
+    const release = tryAcquireKnowledgeLock(lockDirPath);
+    if (release) return release;
+    if (tryBreakStaleKnowledgeLock(lockDirPath)) continue;
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDirPath}`);
+    }
+    const jitter = 5 + Math.floor(Math.random() * 11);
+    await new Promise((resolve) => setTimeout(resolve, jitter));
+  }
+}
+
+function performLockedKnowledgeUpsert(
   updates: readonly LearnedModelTierInput[],
-  filePath = resolveModelTierKnowledgePath(),
-  now = Date.now(),
+  filePath: string,
+  now: number,
 ): LearnedModelTierRecord[] {
-  assertNotRealImcodesPathInTests(filePath, MODEL_TIER_KNOWLEDGE_FILE);
   const existing = loadModelTierKnowledge(filePath);
   const incoming: LearnedModelTierRecord[] = [];
   for (let i = 0; i < updates.length; i += 1) {
@@ -155,12 +236,37 @@ export function upsertModelTierKnowledgeSync(
   return merged;
 }
 
+/**
+ * Atomically persist learned model-tier records (tmp + rename) with cross-process lock + serialized writes.
+ */
+export function upsertModelTierKnowledgeSync(
+  updates: readonly LearnedModelTierInput[],
+  filePath = resolveModelTierKnowledgePath(),
+  now = Date.now(),
+): LearnedModelTierRecord[] {
+  assertNotRealImcodesPathInTests(filePath, MODEL_TIER_KNOWLEDGE_FILE);
+  const release = acquireKnowledgeLockSync(filePath);
+  try {
+    return performLockedKnowledgeUpsert(updates, filePath, now);
+  } finally {
+    release();
+  }
+}
+
 export async function upsertModelTierKnowledge(
   updates: readonly LearnedModelTierInput[],
   filePath = resolveModelTierKnowledgePath(),
   now = Date.now(),
 ): Promise<LearnedModelTierRecord[]> {
-  const run = writeChain.catch(() => {}).then(() => upsertModelTierKnowledgeSync(updates, filePath, now));
+  assertNotRealImcodesPathInTests(filePath, MODEL_TIER_KNOWLEDGE_FILE);
+  const run = writeChain.catch(() => {}).then(async () => {
+    const release = await acquireKnowledgeLockAsync(filePath);
+    try {
+      return performLockedKnowledgeUpsert(updates, filePath, now);
+    } finally {
+      release();
+    }
+  });
   writeChain = run.then(() => undefined, () => undefined);
   return run;
 }

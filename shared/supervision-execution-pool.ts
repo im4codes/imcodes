@@ -348,6 +348,12 @@ function text(value: unknown): string | undefined {
  * third-party models (MiniMax-M3, qwen3.8-27b), and those must pass through
  * verbatim rather than be folded into a Claude family bucket.
  */
+const CLAUDE_FUTURE_VERSIONED_MODEL_RE = /^claude-(?:(?:fable|mythos|opus|sonnet|haiku)-(?:[6-9]|\d{2,})|(?:[6-9]|\d{2,})-(?:fable|mythos|opus|sonnet|haiku))(?:$|[-._[\]])/i;
+
+export function isFutureVersionedClaudeModelId(model: string): boolean {
+  return CLAUDE_FUTURE_VERSIONED_MODEL_RE.test(model.trim());
+}
+
 export function normalizeSupervisionExecutionModel(agentType: string, model: string): string {
   const trimmed = model.trim();
   const lower = trimmed.toLowerCase();
@@ -358,6 +364,7 @@ export function normalizeSupervisionExecutionModel(agentType: string, model: str
     return DEFAULT_CODEX_SESSION_MODEL;
   }
   if (!trimmed || !isClaudeCodeFamily(agentType)) return trimmed;
+  if (isFutureVersionedClaudeModelId(trimmed)) return trimmed;
   return normalizeClaudeCodeModelId(trimmed) ?? trimmed;
 }
 

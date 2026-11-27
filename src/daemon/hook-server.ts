@@ -16,7 +16,12 @@
 import { isLocalHookRequest } from './hook-request-guard.js';
 import { hookClaimAllowed } from './hook-session-credential.js';
 import { HOOK_SESSION_CREDENTIAL_ERROR } from '../../shared/hook-session-credential.js';
-import { EXECUTION_POOL_SDKS_HOOK_PATH } from '../../shared/execution-pool-mcp.js';
+import {
+  EXECUTION_POOL_DAEMON_RPC_PATH,
+  EXECUTION_POOL_SDKS_HOOK_PATH,
+  isExecutionPoolDaemonToolName,
+  type ExecutionPoolMcpToolName,
+} from '../../shared/execution-pool-mcp.js';
 import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import {
   MEMORY_MCP_TOOL_NAMES,
@@ -953,6 +958,12 @@ export interface HookServerOptions {
     tool: MemoryMcpDaemonToolName,
     input?: unknown,
   ) => Promise<Record<string, unknown>>;
+  /** Test seam; production executes execution_pool_get/set against daemon-local supervisor defaults cache. */
+  invokeExecutionPoolMcpTool?: (
+    caller: McpRuntimeCaller,
+    tool: ExecutionPoolMcpToolName,
+    input?: unknown,
+  ) => Promise<Record<string, unknown>>;
   /** Test seam; production dynamically imports `./memory-mcp-http.js` on the first `/mcp` request. */
   loadMemoryMcpHttp?: () => Promise<Pick<typeof import('./memory-mcp-http.js'), 'createMemoryMcpHttpHandler'>>;
   /** Exact ServerLink identity injected by the daemon, never by the MCP child. */
@@ -974,6 +985,35 @@ async function invokeDaemonMemoryMcpTool(
   const { createMemoryMcpToolHandlers } = await import('./memory-mcp-tools.js');
   const { withPairsLegacyTools } = await import('./task-pairs/legacy-tools.js');
   return withPairsLegacyTools(caller.sessionName, createMemoryMcpToolHandlers(caller))[tool](input) as Promise<Record<string, unknown>>;
+}
+
+async function invokeDaemonExecutionPoolMcpTool(
+  caller: McpRuntimeCaller,
+  tool: ExecutionPoolMcpToolName,
+  input?: unknown,
+): Promise<Record<string, unknown>> {
+  const [
+    { createExecutionPoolMcpToolHandlers },
+    { createSupervisionMcpToolDeps },
+    { getCachedSupervisorDefaults, refreshSupervisorDefaultsCache, updateSupervisorDefaultsCache },
+    { probeExecutionPoolSdks },
+  ] = await Promise.all([
+    import('./execution-pool-mcp-tools.js'),
+    import('./supervision-registry-port.js'),
+    import('./supervisor-defaults-cache.js'),
+    import('./sdk-execution-pool-probe.js'),
+  ]);
+  const supervisionDeps = createSupervisionMcpToolDeps();
+  const handlers = createExecutionPoolMcpToolHandlers(caller, {
+    getDefaults: async () => {
+      await refreshSupervisorDefaultsCache();
+      return getCachedSupervisorDefaults();
+    },
+    setDefaults: (_runtimeCaller, mutate) => updateSupervisorDefaultsCache(mutate),
+    isProjectBrain: supervisionDeps.isProjectBrain,
+    probeSdks: (runtimeCaller) => probeExecutionPoolSdks({ callerSessionName: runtimeCaller.sessionName ?? undefined }),
+  });
+  return handlers[tool](input);
 }
 
 export async function startHookServer(
@@ -1225,6 +1265,68 @@ export async function startHookServer(
         res.end(JSON.stringify({
           ok: false,
           error: status === 413 ? 'daemon_memory_worker_request_oversize' : 'daemon_memory_worker_failed',
+        }));
+      }
+      return;
+    }
+
+    if (url === EXECUTION_POOL_DAEMON_RPC_PATH) {
+      const senderHeader = req.headers['x-imcodes-session'];
+      const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+      const session = senderSessionName ? getSession(senderSessionName) : null;
+      if (!session || session.state === 'stopped') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'daemon_execution_pool_identity_unavailable' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, MEMORY_MCP_DAEMON_RPC_MAX_BODY_BYTES)) as Record<string, unknown>;
+        if (body.sessionInstanceId !== session.sessionInstanceId
+          || body.runtimeEpoch !== session.runtimeEpoch) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR }));
+          return;
+        }
+        if (!isExecutionPoolDaemonToolName(body.tool)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'daemon_execution_pool_tool_forbidden' }));
+          return;
+        }
+        const callerCtx = resolveSessionMcpCallerContext({
+          session,
+          requestedServerId: typeof body.serverId === 'string' ? body.serverId : undefined,
+          daemonServerId: options.memoryMcpServerId,
+          transport: 'in_process',
+          fallbackToDaemonServerId: false,
+        });
+        if (!callerCtx.ok) {
+          res.writeHead(callerCtx.status, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: callerCtx.error }));
+          return;
+        }
+        const participantTurn = readSenderParticipantTurn(session.name);
+        if (participantTurn) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            result: {
+              status: 'error',
+              reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+              message: 'execution pool tools are not available during a shared-session participant turn',
+            },
+          }));
+          return;
+        }
+        const invoke = options.invokeExecutionPoolMcpTool ?? invokeDaemonExecutionPoolMcpTool;
+        const result = await invoke(callerCtx.caller, body.tool, body.input);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, result }));
+      } catch (error) {
+        const status = (error as Error).message === 'body too large' ? 413 : 500;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          error: status === 413 ? 'daemon_execution_pool_request_oversize' : 'daemon_execution_pool_failed',
         }));
       }
       return;
