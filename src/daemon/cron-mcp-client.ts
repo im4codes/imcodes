@@ -12,7 +12,12 @@ import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 import { normalizeClientTimezone } from '../../shared/client-timezone.js';
 import { daemonApiUrl, type DaemonHttpMethod } from '../../shared/daemon-token-routes.js';
 import { daemonServerAuthHeaders } from '../../shared/daemon-server-auth.js';
-import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
+import {
+  CRON_RESTRICTED_ACTOR_EXTERNAL_CLI,
+  CRON_RESTRICTED_ACTOR_HEADER,
+  SHARED_MACHINE_AUTHORITY_HEADER,
+} from '../../shared/shared-machine-authority.js';
+import type { CronAuthorityResolution } from './shared-machine-authority.js';
 import {
   formatNetworkErrorMessage,
   isPreConnectNetworkError,
@@ -48,6 +53,7 @@ export interface CronMcpClientOptions {
   /** Optional retry policy override for transient network failures (test seam). */
   preConnectRetry?: PreConnectRetryOptions;
   loadSharedMachineAuthority?: () => Promise<string | null>;
+  loadCronAuthority?: () => Promise<CronAuthorityResolution>;
 }
 
 export interface CronCreateInput extends MemoryMcpSourceProvenance {
@@ -258,7 +264,16 @@ async function requestCron(
       : Intl.DateTimeFormat().resolvedOptions().timeZone,
   );
   let sharedMachineAuthority: string | null = null;
-  if (options.loadSharedMachineAuthority) {
+  let restrictedExternalCli = false;
+  if (options.loadCronAuthority) {
+    try {
+      const resolved = await options.loadCronAuthority();
+      sharedMachineAuthority = resolved.authority;
+      restrictedExternalCli = resolved.restrictedExternalCli;
+    } catch {
+      return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'shared machine authority unavailable');
+    }
+  } else if (options.loadSharedMachineAuthority) {
     try {
       sharedMachineAuthority = await options.loadSharedMachineAuthority();
     } catch {
@@ -269,6 +284,7 @@ async function requestCron(
     // The credential names the BOUND server (the token belongs to it); the route names the server the job is for.
     ...daemonServerAuthHeaders(endpoint),
     ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
+    ...(restrictedExternalCli && !sharedMachineAuthority ? { [CRON_RESTRICTED_ACTOR_HEADER]: CRON_RESTRICTED_ACTOR_EXTERNAL_CLI } : {}),
     'Content-Type': 'application/json',
     ...(deviceTimezone ? { [DEVICE_TIMEZONE_HEADER]: deviceTimezone } : {}),
     ...init.headers,

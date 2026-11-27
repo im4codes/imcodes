@@ -42,6 +42,7 @@ import {
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { isValidImcodesSessionName, resolveEffectiveProjectName, resolveRuntimeScope } from '../../shared/session-scope.js';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getSession as getStoredSession, type SessionRecord } from '../store/session-store.js';
 import { drainTransportResendQueueForDispatch, ensureTransportRuntimeForPendingResend, getTransportRuntime } from '../agent/session-manager.js';
@@ -237,6 +238,31 @@ export function buildServerMemberSharedActorOption(
   return {
     ...(attachActor ? { sharedActor: buildServerMemberActorEnvelope(caller, callerRecord, target, actionId, now, caller.userId || caller.sessionName, 'server-member') } : {}),
     ...(ownerAuthority ? { ownerMachineAuthority: ownerAuthority } : {}),
+  };
+}
+
+/**
+ * External CLI (`imcodes send` without a managed session identity) must stay usable for
+ * local collaboration and restricted cron creation while running the receiving turn under
+ * least-privilege participant restriction with zero machine/owner authority.
+ */
+export function buildExternalCliSharedActorOption(
+  from: string,
+  target: SessionRecord,
+  actionId: string,
+  now: number,
+): SessionDispatchActorOption {
+  const actorDisplay = from.trim() || IMCODES_EXTERNAL_CLI_SENDER;
+  return {
+    sharedActor: buildServerMemberActorEnvelope(
+      { userId: IMCODES_EXTERNAL_CLI_SENDER, sessionName: actorDisplay },
+      undefined,
+      target,
+      actionId,
+      now,
+      IMCODES_EXTERNAL_CLI_SENDER,
+      'participant',
+    ),
   };
 }
 

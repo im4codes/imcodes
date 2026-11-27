@@ -36,6 +36,8 @@ import { dispatchJobNow, readCronJobAndProvenanceLocked, type CronProvenanceLook
 import { WsBridge } from '../ws/bridge.js';
 import { RESOURCE_TOPICS } from '../../../shared/resource-events.js';
 import { AUTHORIZATION_HEADER, CLIENT_TIMEZONE_HEADER, DEVICE_TIMEZONE_HEADER, SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
+import { CRON_RESTRICTED_ACTOR_EXTERNAL_CLI, CRON_RESTRICTED_ACTOR_HEADER } from '../../../shared/shared-machine-authority.js';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../../shared/imcodes-send.js';
 import { normalizeClientTimezone } from '../../../shared/client-timezone.js';
 import { loadRememberedClientTimezone, rememberClientTimezone } from '../util/client-timezone.js';
 
@@ -225,13 +227,40 @@ function isDaemonCronRequest(
   return isDaemonServerTokenCronRequest(c, routeServerId);
 }
 
+function wantsExternalCliRestrictedCron(
+  c: Context<CronRouteEnv>,
+  routeServerId: string | null,
+): boolean {
+  return isDaemonServerTokenCronRequest(c, routeServerId)
+    && c.req.header(CRON_RESTRICTED_ACTOR_HEADER) === CRON_RESTRICTED_ACTOR_EXTERNAL_CLI;
+}
+
 async function resolveCronDaemonContext(
   c: Context<CronRouteEnv>,
   targetServerId?: string | null,
 ) {
+  const allowExternalCliRestricted = wantsExternalCliRestrictedCron(c, getPodStickyServerId(c));
   return await resolveDaemonCallerAuthority(c as unknown as Context<{ Bindings: Env }>, {
     ...(targetServerId ? { targetServerId, allowOwnerCrossServer: true } : {}),
+    ...(allowExternalCliRestricted ? { denySharedHostAbsentAuthority: false } : {}),
   });
+}
+
+function isExternalCliRestrictedAuthority(
+  c: Context<CronRouteEnv>,
+  routeServerId: string | null,
+  authority: Awaited<ReturnType<typeof resolveCronDaemonContext>>,
+): boolean {
+  return authority.ok
+    && authority.kind === 'owner_daemon'
+    && !authority.hasTurnAuthority
+    && wantsExternalCliRestrictedCron(c, routeServerId);
+}
+
+function isExternalCliOwnedProvenance(
+  prov: { creator_user_id?: string | null; shared?: boolean | null } | null | undefined,
+): boolean {
+  return prov?.creator_user_id === IMCODES_EXTERNAL_CLI_SENDER && !prov?.shared;
 }
 
 function pinnedSessionForAuthority(
@@ -697,7 +726,12 @@ cronApiRoutes.get('/', requireCronAuth(), async (c) => {
       queryProjectName,
     ],
   );
-  return c.json({ jobs: await filterCronRowsForSharedScope(c, access.scope, jobs, pinnedSessionName) });
+  const filteredJobs = await filterCronRowsForSharedScope(c, access.scope, jobs, pinnedSessionName);
+  return c.json({
+    jobs: isExternalCliRestrictedAuthority(c, routeServerId, authority)
+      ? filteredJobs.filter((job) => (job as { creator_user_id?: string }).creator_user_id === IMCODES_EXTERNAL_CLI_SENDER)
+      : filteredJobs,
+  });
 });
 
 // POST /api/cron — create a cron job
@@ -727,6 +761,7 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
   const authority = await resolveCronDaemonContext(c, serverId);
   if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
   const pinnedSessionName = pinnedSessionForAuthority(authority);
+  const externalCliRestricted = isExternalCliRestrictedAuthority(c, routeServerId, authority);
   const isDaemonReq = isDaemonCronRequest(c, routeServerId, authority.kind);
   const isAgentCaller = authority.isDaemon || isDaemonReq;
   const unboundAction = normalizeCronActionForPersistence(action, isDaemonReq);
@@ -776,7 +811,9 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
     validation.intervalMs,
   );
 
-  const requiresProvenance = access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId;
+  const requiresProvenance = externalCliRestricted || access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId;
+  const provenanceCreatorUserId = externalCliRestricted ? IMCODES_EXTERNAL_CLI_SENDER : authority.actorUserId;
+  const provenanceShared = !externalCliRestricted;
   await runCronWriteTx(c.env.DB, async (tx) => {
     await tx.execute(
       `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
@@ -788,7 +825,7 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
         `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (job_id) DO NOTHING`,
-        [id, authority.actorUserId, serverId, access.scope.projectName ?? projectName ?? null, true, now],
+        [id, provenanceCreatorUserId, serverId, access.scope.projectName ?? projectName ?? null, provenanceShared, now],
       );
     }
   });
@@ -834,6 +871,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   const authority = await resolveCronDaemonContext(c, initialJob.server_id);
   if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
   const pinnedSessionName = pinnedSessionForAuthority(authority);
+  const externalCliRestricted = isExternalCliRestrictedAuthority(c, routeServerId, authority);
   const isDaemonReq = isDaemonCronRequest(c, routeServerId, authority.kind);
   const isAgentCaller = authority.isDaemon || isDaemonReq;
   const forceFlag = c.req.query('force') === 'true';
@@ -862,6 +900,9 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
     );
     if (lockedJob.server_id !== initialJob.server_id || lockedJob.user_id !== initialJob.user_id) {
       return { kind: 'conflict' };
+    }
+    if (externalCliRestricted && !isExternalCliOwnedProvenance(lockedProv)) {
+      return { kind: 'forbidden', reason: 'external_cli_cron_scope_denied' };
     }
 
     const access = await resolveCronJobScope(c, {
@@ -994,7 +1035,10 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
     }
 
     const isSharedOrNonOwner = access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId;
-    if (isSharedOrNonOwner) {
+    if (externalCliRestricted) {
+      // External-CLI restricted provenance (`creator_user_id = IMCODES_EXTERNAL_CLI_SENDER, shared = FALSE`)
+      // was verified above and must never be cleared or downgraded on update.
+    } else if (isSharedOrNonOwner) {
       await tx.execute(
         `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
          VALUES ($1, $2, $3, $4, TRUE, $5)
@@ -1081,6 +1125,7 @@ cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
   if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
   const userId = authority.actorUserId;
   const pinnedSessionName = pinnedSessionForAuthority(authority);
+  const externalCliRestricted = isExternalCliRestrictedAuthority(c, routeServerId, authority);
 
   type StatusTxResult =
     | { kind: 'ok'; serverId: string }
@@ -1095,6 +1140,15 @@ cronApiRoutes.patch('/:id/status', requireCronAuth(), async (c) => {
       [jobId],
     );
     if (!lockedJob || isWrongPodStickyServer(lockedJob.server_id, routeServerId)) return { kind: 'not_found' };
+    if (externalCliRestricted) {
+      const lockedProv = await tx.queryOne<{ creator_user_id?: string; shared?: boolean }>(
+        'SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1 FOR UPDATE',
+        [jobId],
+      );
+      if (!isExternalCliOwnedProvenance(lockedProv)) {
+        return { kind: 'forbidden', reason: 'external_cli_cron_scope_denied' };
+      }
+    }
     const access = await resolveCronJobScope(c, { userId, job: lockedJob, mode: 'write', pinnedSessionName, db: tx });
     if (!access.ok) return { kind: 'forbidden', reason: access.reason };
     if (newStatus === CRON_STATUS.ACTIVE && lockedJob.status !== CRON_STATUS.PAUSED) {
@@ -1135,6 +1189,7 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
   if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
   const userId = authority.actorUserId;
   const pinnedSessionName = pinnedSessionForAuthority(authority);
+  const externalCliRestricted = isExternalCliRestrictedAuthority(c, routeServerId, authority);
   const isDaemonReq = isDaemonCronRequest(c, routeServerId, authority.kind);
   const force = c.req.query('force') === 'true';
 
@@ -1151,6 +1206,15 @@ cronApiRoutes.delete('/:id', requireCronAuth(), async (c) => {
       [jobId],
     );
     if (!lockedJob || isWrongPodStickyServer(lockedJob.server_id, routeServerId)) return { kind: 'not_found' };
+    if (externalCliRestricted) {
+      const lockedProv = await tx.queryOne<{ creator_user_id?: string; shared?: boolean }>(
+        'SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1 FOR UPDATE',
+        [jobId],
+      );
+      if (!isExternalCliOwnedProvenance(lockedProv)) {
+        return { kind: 'forbidden', reason: 'external_cli_cron_scope_denied' };
+      }
+    }
     const access = await resolveCronJobScope(c, { userId, job: lockedJob, mode: 'write', pinnedSessionName, db: tx });
     if (!access.ok) return { kind: 'forbidden', reason: access.reason };
     const completionPolicy = normalizeCronCompletionPolicy(lockedJob.completion_policy);
@@ -1207,6 +1271,7 @@ cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
   if (!authority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, authority);
   const userId = authority.actorUserId;
   const pinnedSessionName = pinnedSessionForAuthority(authority);
+  const externalCliRestricted = isExternalCliRestrictedAuthority(c, routeServerId, authority);
 
   type TriggerTxResult =
     | { kind: 'ok'; job: DbCronJob; provenance: CronProvenanceLookup }
@@ -1227,6 +1292,9 @@ cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
     if (locked.job.server_id !== initialJob.server_id || locked.job.user_id !== initialJob.user_id) {
       return { kind: 'conflict' };
     }
+    if (externalCliRestricted && !isExternalCliOwnedProvenance(locked.provenance.row)) {
+      return { kind: 'forbidden', reason: 'external_cli_cron_scope_denied' };
+    }
 
     const access = await resolveCronJobScope(c, {
       userId,
@@ -1236,9 +1304,11 @@ cronApiRoutes.post('/:id/trigger', requireCronAuth(), async (c) => {
       db: tx,
     });
     if (!access.ok) return { kind: 'forbidden', reason: access.reason };
-    const isSharedTrigger = access.scope.shared
+    const isSharedTrigger = !externalCliRestricted && (
+      access.scope.shared
       || authority.kind === 'participant_daemon'
-      || authority.actorUserId !== locked.job.user_id;
+      || authority.actorUserId !== locked.job.user_id
+    );
     const effectiveProvenance: CronProvenanceLookup = isSharedTrigger
       ? { ok: true, row: { creator_user_id: authority.actorUserId, shared: true } }
       : locked.provenance;

@@ -16,6 +16,7 @@ import { HookAuthorityUnavailableError, resolveHookAuthority, resolveLiveHookPor
 import {
   HookRateLimitError,
   createResourceOwnerHookWithEpochRefresh,
+  createSessionCronAuthorityLoader,
   createSessionSharedMachineAuthorityLoader,
   postHookSend,
   sharedMachineAuthorityFromHookResponse,
@@ -521,6 +522,7 @@ export function createMemoryMcpServer(
     }),
     setDefaults: executionPoolToolDeps.setDefaults ?? ((_runtimeCaller, mutate) => updateSupervisorDefaultsCache(mutate)),
     isProjectBrain: executionPoolToolDeps.isProjectBrain ?? supervisionToolDeps.isProjectBrain,
+    participantTurnRequired: toolDeps.participantTurnRequired,
     probeSdks: executionPoolToolDeps.probeSdks ?? (async (runtimeCaller) => {
       if (runtimeCaller.sessionName) {
         const port = await resolveLiveHookPort().catch(() => null);
@@ -681,10 +683,17 @@ export function mergeDefaultToolDeps(
     env: initialBridgeEnv,
     requireHookPort,
   });
+  const loadCronAuthority = createSessionCronAuthorityLoader({
+    callerSessionName: caller.sessionName,
+    resourceOwner,
+    env: initialBridgeEnv,
+    requireHookPort,
+  });
   return {
     ...toolDeps,
     cronOptions: {
       loadSharedMachineAuthority,
+      loadCronAuthority,
       ...toolDeps.cronOptions,
     },
     verificationClientOptions: {

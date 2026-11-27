@@ -12,6 +12,11 @@ import {
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { DEVICE_TIMEZONE_HEADER } from '../../shared/http-header-names.js';
 import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
+import {
+  CRON_RESTRICTED_ACTOR_EXTERNAL_CLI,
+  CRON_RESTRICTED_ACTOR_HEADER,
+  SHARED_MACHINE_AUTHORITY_HEADER,
+} from '../../shared/shared-machine-authority.js';
 
 const endpoint = {
   serverId: 'srv-bound',
@@ -574,5 +579,28 @@ describe('cron MCP client', () => {
       cronExpr: '*/5 * * * *',
       shortIntervalReason: 'User requested 5m canary deployment polling window',
     });
+  });
+
+  it('attaches X-IMCodes-Cron-Actor: external_cli without shared machine authority when loadCronAuthority marks an external-CLI turn', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ id: 'job-ext-cli' }));
+
+    const result = await cronMcpCreateSelf({
+      name: 'Restricted check',
+      cronExpr: '*/20 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: 'check status',
+    }, {
+      ...boundIdentity,
+      fetchImpl,
+      loadSharedMachineAuthority: async () => { throw new Error('should_not_be_called_directly'); },
+      loadCronAuthority: async () => ({ authority: null, restrictedExternalCli: true }),
+    });
+
+    expect(result.status).toBe('ok');
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    const headers = init.headers as Record<string, string>;
+    expect(headers[CRON_RESTRICTED_ACTOR_HEADER]).toBe(CRON_RESTRICTED_ACTOR_EXTERNAL_CLI);
+    expect(headers[SHARED_MACHINE_AUTHORITY_HEADER]).toBeUndefined();
   });
 });

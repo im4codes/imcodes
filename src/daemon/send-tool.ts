@@ -177,7 +177,7 @@ import {
   type DelegationReplyRecord,
   type PendingAuditDeliveryAuthority,
 } from './delegation-reply-store.js';
-import { buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
+import { buildExternalCliSharedActorOption, buildServerMemberSharedActorOption as buildSharedServerMemberSharedActorOption, buildSessionDispatchMessage, dispatchSessionMessage, type SessionDispatchMessageResult, type SessionDispatchOptions } from './session-dispatch.js';
 import type { SupervisionWorktreeProvisionResult } from './supervision-worktree-provision.js';
 import {
   inspectSupervisionAssignmentWorktree,
@@ -561,6 +561,8 @@ export interface HookSendDispatchInput {
   supervision?: { taskId: string; assignmentId: string; auditAttemptId?: string; auditRevision?: string };
   /** Stable supervised delivery id supplied by the managed MCP bridge. */
   messageId?: SendMessageId;
+  /** Pre-resolved sender record from hook-server (`null` = verified external/unregistered sender). */
+  senderRecord?: SessionRecord | null;
 }
 
 export interface HookSendDispatchResult {
@@ -5969,7 +5971,9 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   const queued: string[] = [];
   const errors: string[] = [];
   const messages: SendMessageDelivery[] = [];
-  const callerRecord = d.getSession(input.from) ?? undefined;
+  const callerRecord = input.senderRecord !== undefined
+    ? (input.senderRecord ?? undefined)
+    : (d.getSession(input.from) ?? undefined);
   const now = d.now();
 
   // ── Provider-limit gate ────────────────────────────────────────────────
@@ -6036,6 +6040,20 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       ...(input.command ? { command: true } : {}),
     });
     try {
+      const actorOption = callerRecord
+        ? buildSharedServerMemberSharedActorOption(
+            {
+              userId: input.from,
+              sessionName: input.from,
+              projectName: callerRecord.projectName ?? null,
+              projectRoot: input.projectRoot ?? callerRecord.projectDir ?? null,
+            },
+            callerRecord,
+            target,
+            messageId,
+            now,
+          )
+        : buildExternalCliSharedActorOption(input.from, target, messageId, now);
       const result = await d.dispatchMessage(target, message, {
         dispatchId,
         messageId,
@@ -6045,18 +6063,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
         ...(input.command ? { command: true as const } : {}),
         ...(input.emergency ? { emergency: true } : {}),
         ...(deps?.cancelSession ? { cancelSession: deps.cancelSession } : {}),
-        ...buildSharedServerMemberSharedActorOption(
-          {
-            userId: input.from,
-            sessionName: input.from,
-            projectName: callerRecord?.projectName ?? null,
-            projectRoot: input.projectRoot ?? callerRecord?.projectDir ?? null,
-          },
-          callerRecord,
-          target,
-          messageId,
-          now,
-        ),
+        ...actorOption,
       });
       if (result === 'queued') queued.push(target.name);
       else delivered.push(target.name);

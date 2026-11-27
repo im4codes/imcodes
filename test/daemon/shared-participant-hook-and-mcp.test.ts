@@ -7,9 +7,16 @@ import {
   MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH,
   MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
 } from '../../shared/memory-mcp-contracts.js';
-import { MEMORY_MCP_DAEMON_RPC_PATH } from '../../shared/memory-mcp-daemon-rpc.js';
+import {
+  MEMORY_MCP_DAEMON_RPC_PATH,
+} from '../../shared/memory-mcp-daemon-rpc.js';
+import {
+  EXECUTION_POOL_DAEMON_RPC_PATH,
+} from '../../shared/execution-pool-mcp.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
+import { SEND_COMMAND_HOOK_PATH } from '../../shared/send-command-mode.js';
 
 const participantTurns = new Map<string, { actorUserId: string; authority: string | null }>();
 const sessionsMap = new Map<string, {
@@ -391,6 +398,161 @@ describe('hook-server shared participant isolation', () => {
       'deck_shared_sub',
       'deck_private_main',
     ]);
+  });
+
+  it('blocks unauthenticated external /send, /send-command, /send "/stop", and /stop while any active session runs a shared participant turn', async () => {
+    for (const from of [IMCODES_EXTERNAL_CLI_SENDER, 'cli']) {
+      const sendRes = await requestHook(port, 'POST', '/send', undefined, {
+        from,
+        to: 'deck_private_main',
+        message: 'elevate',
+      });
+      expect(sendRes, `${from} /send`).toEqual({ status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } });
+
+      const cmdRes = await requestHook(port, 'POST', SEND_COMMAND_HOOK_PATH, undefined, {
+        from,
+        to: 'deck_private_main',
+        message: '/status',
+      });
+      expect(cmdRes, `${from} /send-command`).toEqual({ status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } });
+
+      const sendStopRes = await requestHook(port, 'POST', '/send', undefined, {
+        from,
+        to: 'deck_private_main',
+        message: '/stop',
+      });
+      expect(sendStopRes, `${from} /send /stop`).toEqual({ status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } });
+
+      const stopRes = await requestHook(port, 'POST', '/stop', undefined, {
+        from,
+        to: 'deck_private_main',
+      });
+      expect(stopRes, `${from} /stop`).toEqual({ status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } });
+    }
+    expect(mockDispatchHookSend).not.toHaveBeenCalled();
+    expect(mockStopSessionNow).not.toHaveBeenCalled();
+
+    // Authenticated managed owner session (sibling deck_shared_sub) is NOT blocked by another session's participant turn
+    const ownerSend = await requestHook(port, 'POST', '/send', 'deck_shared_sub', {
+      from: 'deck_shared_sub',
+      to: 'deck_shared_main',
+      message: 'owner message',
+    });
+    expect(ownerSend.status).toBe(200);
+    expect(mockDispatchHookSend).toHaveBeenCalledTimes(1);
+
+    // Stopped participant session must not permanently block external CLI sends
+    sessionsMap.set('deck_shared_main', {
+      name: 'deck_shared_main',
+      projectName: 'proj-shared',
+      state: 'stopped',
+      contextNamespace: { scope: 'personal', projectId: 'proj_shared', userId: 'owner_user_1' },
+    });
+    const afterStopSend = await requestHook(port, 'POST', '/send', undefined, {
+      from: IMCODES_EXTERNAL_CLI_SENDER,
+      to: 'deck_private_main',
+      message: 'callback after participant stopped',
+    });
+    expect(afterStopSend.status).toBe(200);
+
+    // Once active participant turn finishes, external /send succeeds again;
+    // pure external-CLI restricted turns do not block external callbacks
+    sessionsMap.set('deck_shared_main', {
+      name: 'deck_shared_main',
+      projectName: 'proj-shared',
+      state: 'idle',
+      contextNamespace: { scope: 'personal', projectId: 'proj_shared', userId: 'owner_user_1' },
+    });
+    participantTurns.clear();
+    participantTurns.set('deck_private_main', { actorUserId: IMCODES_EXTERNAL_CLI_SENDER, authority: null });
+    const extTurnSend = await requestHook(port, 'POST', '/send', undefined, {
+      from: IMCODES_EXTERNAL_CLI_SENDER,
+      to: 'deck_private_main',
+      message: 'second webhook callback',
+    });
+    expect(extTurnSend.status).toBe(200);
+    expect(mockDispatchHookSend.mock.calls.at(-1)?.[0]).toMatchObject({
+      from: IMCODES_EXTERNAL_CLI_SENDER,
+      senderRecord: null,
+    });
+  });
+
+  it('keeps exec_remote/aliases/save_preference/execution_pool fail-closed during external-CLI turns while permitting purpose=cron only for pure external-CLI turns', async () => {
+    const {
+      createSessionCronAuthorityLoader,
+    } = await import('../../src/daemon/shared-machine-authority.js');
+    const {
+      bindProcessSharedMachineActivity,
+      clearProcessSharedMachineAuthoritiesForTests,
+    } = await import('../../src/daemon/shared-machine-authority-context.js');
+    const {
+      SHARED_MACHINE_ACTIVITY_KIND,
+      SHARED_MACHINE_AUTHORITY_HOOK_PATH,
+    } = await import('../../shared/shared-machine-authority.js');
+
+    clearProcessSharedMachineAuthoritiesForTests();
+    participantTurns.clear();
+    participantTurns.set('deck_private_main', { actorUserId: IMCODES_EXTERNAL_CLI_SENDER, authority: null });
+    sessionsMap.set('deck_private_main', {
+      name: 'deck_private_main',
+      projectName: 'proj-private',
+      state: 'idle',
+      sessionInstanceId: 'inst-priv-1',
+      runtimeEpoch: 'epoch-priv-1',
+      contextNamespace: { scope: 'personal', projectId: 'proj_private', userId: 'owner_user_1' },
+    } as never);
+    bindProcessSharedMachineActivity(
+      'deck_private_main',
+      { sessionInstanceId: 'inst-priv-1', runtimeEpoch: 'epoch-priv-1' },
+      { kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT, actorUserId: IMCODES_EXTERNAL_CLI_SENDER },
+    );
+
+    try {
+      // Non-cron authority lookup (exec_remote, aliases, etc.) still fails closed 403
+      const ordinaryHook = await requestHook(port, 'POST', SHARED_MACHINE_AUTHORITY_HOOK_PATH, 'deck_private_main', {
+        sessionInstanceId: 'inst-priv-1',
+        runtimeEpoch: 'epoch-priv-1',
+      });
+      expect(ordinaryHook.status).toBe(403);
+
+      const stdLoader = createSessionSharedMachineAuthorityLoader({
+        callerSessionName: 'deck_private_main',
+        resourceOwner: { sessionName: 'deck_private_main', sessionInstanceId: 'inst-priv-1', runtimeEpoch: 'epoch-priv-1' },
+        requireHookPort: async () => port,
+      });
+      await expect(stdLoader()).rejects.toThrow();
+
+      // Cron authority lookup identifies pure external-CLI turn cleanly
+      const cronLoader = createSessionCronAuthorityLoader({
+        callerSessionName: 'deck_private_main',
+        resourceOwner: { sessionName: 'deck_private_main', sessionInstanceId: 'inst-priv-1', runtimeEpoch: 'epoch-priv-1' },
+        requireHookPort: async () => port,
+      });
+      expect(await cronLoader()).toEqual({ authority: null, restrictedExternalCli: true });
+
+      // save_preference and execution_pool daemon RPCs stay forbidden during external-CLI turns
+      const prefRes = await requestHook(port, 'POST', MEMORY_MCP_DAEMON_RPC_PATH, 'deck_private_main', {
+        sessionInstanceId: 'inst-priv-1',
+        runtimeEpoch: 'epoch-priv-1',
+        tool: 'save_preference',
+        input: { text: 'hijack' },
+      });
+      expect(prefRes.body).toMatchObject({ ok: true, result: { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN } });
+
+      const poolRes = await requestHook(port, 'POST', EXECUTION_POOL_DAEMON_RPC_PATH, 'deck_private_main', {
+        sessionInstanceId: 'inst-priv-1',
+        runtimeEpoch: 'epoch-priv-1',
+        tool: 'execution_pool_set',
+        input: { concurrencyCap: 2 },
+      });
+      expect(poolRes.body).toMatchObject({ ok: true, result: { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN } });
+
+      // Mixed/ambiguous web participant turn MUST stay 403 even with purpose=cron
+      participantTurns.set('deck_private_main', { actorUserId: '__ambiguous_participant__', authority: null });
+      await expect(cronLoader()).rejects.toThrow();
+    } finally {
+      clearProcessSharedMachineAuthoritiesForTests();
+    }
   });
 });
 

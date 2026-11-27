@@ -9,6 +9,11 @@ export const SHARED_MACHINE_AUTHORITY_HEADER = 'x-imcodes-shared-machine-authori
 export const SHARED_MACHINE_AUTHORITY_FIELD = 'sharedMachineAuthority' as const;
 export const OWNER_MACHINE_AUTHORITY_FIELD = 'ownerMachineAuthority' as const;
 export const SHARED_MACHINE_AUTHORITY_HOOK_PATH = '/shared-machine-authority' as const;
+/** Purpose marker sent only by cron MCP authority resolution so external-CLI turns can create restricted crons while keeping machine/alias hooks fail-closed. */
+export const SHARED_MACHINE_AUTHORITY_CRON_PURPOSE = 'cron' as const;
+export const SHARED_MACHINE_AUTHORITY_EXTERNAL_CLI_ACTOR_KIND = 'external_cli' as const;
+export const CRON_RESTRICTED_ACTOR_HEADER = 'x-imcodes-cron-actor' as const;
+export const CRON_RESTRICTED_ACTOR_EXTERNAL_CLI = 'external_cli' as const;
 /** Hook response used when a stdio child still carries a pre-restart epoch. */
 export const SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR = 'shared_machine_authority_stale_runtime' as const;
 

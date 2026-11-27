@@ -29,6 +29,7 @@ import {
   type CronDispatchMessage,
 } from '../../../shared/cron-types.js';
 import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../../shared/imcodes-send.js';
 import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
 import logger from '../util/logger.js';
 
@@ -368,6 +369,34 @@ type CronDispatchAuthorityFields = {
   sharedActor?: SharedActorEnvelope;
 };
 
+function buildExternalCliCronActorEnvelope(
+  job: DbCronJob,
+  targetSessionName: string,
+  actionId: string,
+): SharedActorEnvelope {
+  const target = targetSessionName.startsWith('deck_sub_')
+    ? { kind: 'subsession' as const, serverId: job.server_id, subSessionId: targetSessionName }
+    : { kind: 'main' as const, serverId: job.server_id, sessionName: targetSessionName };
+  return {
+    actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+    actorDisplayName: IMCODES_EXTERNAL_CLI_SENDER,
+    snapshot: {
+      target,
+      effectiveRole: 'participant',
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: [],
+      primaryShareId: null,
+      authorizedAt: job.created_at,
+    },
+    primaryShareId: null,
+    effectiveActorRole: 'participant',
+    actionId,
+    origin: 'server-member',
+    authorizedAt: job.created_at,
+  };
+}
+
 async function issueCronDispatchAuthority(
   env: Env,
   job: DbCronJob,
@@ -375,13 +404,22 @@ async function issueCronDispatchAuthority(
   prov: CronProvenanceRow | null,
   auth: Extract<SharedCronDispatchAuth, { authorized: true }>,
 ): Promise<CronDispatchAuthorityFields> {
+  const targetSessionName = job.target_session_name?.trim()
+    || (job.project_name ? `deck_${job.project_name}_${job.target_role ?? 'brain'}` : '');
+  const actionId = `cron-${job.id}-${executionId}`;
+
+  if (prov?.creator_user_id === IMCODES_EXTERNAL_CLI_SENDER) {
+    // External-CLI restricted crons always run under least-privilege participant restriction
+    // with zero owner or shared-machine authority, never elevating back into owner turns.
+    return targetSessionName
+      ? { sharedActor: buildExternalCliCronActorEnvelope(job, targetSessionName, actionId) }
+      : {};
+  }
+
   if (!env.JWT_SIGNING_KEY || typeof (env.DB as { queryOne?: unknown })?.queryOne !== 'function') {
     return {};
   }
-  const targetSessionName = job.target_session_name?.trim()
-    || (job.project_name ? `deck_${job.project_name}_${job.target_role ?? 'brain'}` : '');
   if (!targetSessionName) return {};
-  const actionId = `cron-${job.id}-${executionId}`;
 
   if (auth.participantActorUserId && auth.participantSnapshot) {
     const shareTarget = auth.participantSnapshot.target;

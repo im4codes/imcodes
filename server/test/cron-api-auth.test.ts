@@ -57,7 +57,14 @@ function makeDb(servers: ServerRow[]) {
     },
     query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => {
       const s = normalize(sql);
-      if (s.includes('from cron_jobs')) return [...cronJobs.values()].filter((job) => job.user_id === params[0]) as T[];
+      if (s.includes('from cron_jobs')) {
+        return [...cronJobs.values()]
+          .filter((job) => job.user_id === params[0])
+          .map((job) => ({
+            ...job,
+            creator_user_id: cronProvenance.get(job.id as string)?.creator_user_id ?? job.user_id,
+          })) as T[];
+      }
       return [] as T[];
     },
     execute: async (sql: string, params: unknown[] = []): Promise<{ changes: number }> => {
@@ -298,6 +305,83 @@ describe('cron API authentication (real auth middleware)', () => {
       const res = await request(app, base, ROUTES[0]!, { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(jwt)}` });
       expect([401, 403, 404]).toContain(res.status);
       expect(await res.text()).not.toContain('Owner job');
+    });
+
+    it('external-CLI restricted cron header creates non-owner provenance, isolates owner jobs, and dispatches with participant restriction', async () => {
+      const { CRON_RESTRICTED_ACTOR_EXTERNAL_CLI, CRON_RESTRICTED_ACTOR_HEADER } = await import('../../shared/shared-machine-authority.js');
+      const { IMCODES_EXTERNAL_CLI_SENDER } = await import('../../shared/imcodes-send.js');
+      const { dispatchJobNow } = await import('../src/cron/job-dispatch.js');
+      const { WsBridge } = await import('../src/ws/bridge.js');
+
+      const extHeaders = {
+        ...daemonServerAuthHeaders({ serverId: VICTIM_SERVER, token: TOKENS.victim }),
+        [CRON_RESTRICTED_ACTOR_HEADER]: CRON_RESTRICTED_ACTOR_EXTERNAL_CLI,
+      };
+
+      // Interactive browser user cannot forge external_cli cron header (cookie userId = ATTACKER is refused)
+      const attackerJwt = signJwt({ sub: ATTACKER, role: 'owner' }, SIGNING_KEY, 3600);
+      const forged = await request(app, base, ROUTES[1]!, {
+        Cookie: `${COOKIE_SESSION}=${encodeURIComponent(attackerJwt)}`,
+        [CRON_RESTRICTED_ACTOR_HEADER]: CRON_RESTRICTED_ACTOR_EXTERNAL_CLI,
+      });
+      expect(forged.status).toBe(403);
+
+      // External-CLI restricted turn creates a cron with creator_user_id = IMCODES_EXTERNAL_CLI_SENDER, shared = false
+      const created = await request(app, base, ROUTES[1]!, extHeaders);
+      expect(created.status).toBe(201);
+      const createdJson = await created.json() as { id: string };
+      expect(state.cronProvenance.get(createdJson.id)).toMatchObject({
+        creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
+        shared: false,
+      });
+
+      // List returns only external-CLI-owned jobs, hiding owner's job-1
+      const listed = await request(app, base, ROUTES[0]!, extHeaders);
+      expect(listed.status).toBe(200);
+      const listedIds = ((await listed.json()) as { jobs: MockRow[] }).jobs.map((j) => j.id);
+      expect(listedIds).toEqual([createdJson.id]);
+
+      // External-CLI turn cannot modify, pause, trigger, or delete owner's job-1
+      for (const call of [ROUTES[2]!, ROUTES[3]!, ROUTES[4]!, ROUTES[5]!]) {
+        const res = await request(app, base, call, extHeaders);
+        expect(res.status, call.name).toBe(403);
+      }
+      expect(state.cronJobs.has('job-1')).toBe(true);
+
+      // External-CLI turn can update its own cron while keeping restricted provenance intact
+      const selfUpdate = await request(app, base, { name: 'self-update', method: 'PUT', path: `/${createdJson.id}`, body: { name: 'Updated CLI' } }, extHeaders);
+      expect(selfUpdate.status).toBe(200);
+      expect(state.cronProvenance.get(createdJson.id)).toMatchObject({
+        creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
+        shared: false,
+      });
+
+      // Dispatching that job emits restricted sharedActor and NEVER ownerMachineAuthority
+      const sentPayloads: string[] = [];
+      const bridge = WsBridge.get(VICTIM_SERVER);
+      const origConnected = bridge.isDaemonConnected.bind(bridge);
+      const origSend = bridge.sendToDaemon.bind(bridge);
+      bridge.isDaemonConnected = () => true;
+      bridge.sendToDaemon = (raw: string) => { sentPayloads.push(raw); };
+      try {
+        const storedJob = state.cronJobs.get(createdJson.id) as never;
+        await dispatchJobNow(env(state.db), storedJob, {
+          skipReload: true,
+          verifiedProvenance: { ok: true, row: { creator_user_id: IMCODES_EXTERNAL_CLI_SENDER, shared: false } },
+        });
+      } finally {
+        bridge.isDaemonConnected = origConnected;
+        bridge.sendToDaemon = origSend;
+      }
+      expect(sentPayloads).toHaveLength(1);
+      const dispatched = JSON.parse(sentPayloads[0]!) as Record<string, unknown>;
+      expect(dispatched.sharedActor).toMatchObject({
+        actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+        effectiveActorRole: 'participant',
+        origin: 'server-member',
+      });
+      expect(dispatched.ownerMachineAuthority).toBeUndefined();
+      expect(dispatched.sharedMachineAuthority).toBeUndefined();
     });
   });
 });

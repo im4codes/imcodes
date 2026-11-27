@@ -47,6 +47,8 @@ export interface ExecutionPoolMcpToolDeps {
     name: typeof EXECUTION_POOL_MCP_TOOLS[keyof typeof EXECUTION_POOL_MCP_TOOLS],
     input?: unknown,
   ) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  /** Shared/external-CLI participant turn check so HTTP/in-process MCP refuses restricted turns consistently with stdio. */
+  participantTurnRequired?: () => Promise<boolean>;
 }
 
 const poolEntrySchema = z.strictObject({
@@ -217,6 +219,14 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
   const loadKnowledge = deps.loadKnowledge ?? (() => loadModelTierKnowledge());
   const saveKnowledge = deps.saveKnowledge ?? ((updates) => upsertModelTierKnowledge(updates));
   const authorized = () => Boolean(caller.sessionName && caller.projectName && deps.isProjectBrain?.(caller));
+  const participantTurnForbidden = async (): Promise<boolean> => {
+    if (!deps.participantTurnRequired) return false;
+    try {
+      return await deps.participantTurnRequired();
+    } catch {
+      return true;
+    }
+  };
 
   const readContext = async () => {
     const [probe, knowledge] = await Promise.all([
@@ -261,7 +271,7 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
   };
 
   const invokeGetThroughDaemon = async (localFallback: () => Promise<ToolResult>): Promise<ToolResult> => {
-    if (!authorized()) {
+    if (!authorized() || await participantTurnForbidden()) {
       return error('execution pool reads require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
     }
     if (!deps.invokeDaemonTool) return localFallback();
@@ -280,7 +290,7 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
   };
 
   const invokeSetThroughDaemon = async (input: unknown, localFallback: () => Promise<ToolResult>): Promise<ToolResult> => {
-    if (!authorized()) {
+    if (!authorized() || await participantTurnForbidden()) {
       return error('execution pool changes require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
     }
     if (!deps.invokeDaemonTool) return localFallback();
@@ -305,7 +315,9 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
   };
 
   const localGet = async (): Promise<ToolResult> => {
-    if (!authorized()) return error('execution pool reads require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+    if (!authorized() || await participantTurnForbidden()) {
+      return error('execution pool reads require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+    }
     const [defaults, context] = await Promise.all([
       Promise.resolve(getDefaults(caller)),
       readContext(),
@@ -314,7 +326,9 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
   };
 
   const localSet = async (input: unknown): Promise<ToolResult> => {
-    if (!authorized()) return error('execution pool changes require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+    if (!authorized() || await participantTurnForbidden()) {
+      return error('execution pool changes require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+    }
     const parsed = validateExecutionPoolMcpPatch(input);
     if ('error' in parsed) return error(parsed.error);
 

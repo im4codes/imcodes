@@ -257,4 +257,79 @@ describe('dispatch of a participant-stamped message', () => {
     expect(partStamp.sharedMachineAuthority).toBe('part-jwt-1');
     expect(partStamp.ownerMachineAuthority).toBeUndefined();
   });
+
+  it('stamps external CLI /send with restricted non-owner authority and blocks Streamable HTTP execution_pool tools in restricted turns', async () => {
+    const { dispatchHookSend } = await import('../../src/daemon/send-tool.js');
+    const { createExecutionPoolMcpToolHandlers } = await import('../../src/daemon/execution-pool-mcp-tools.js');
+    const { IMCODES_EXTERNAL_CLI_SENDER } = await import('../../shared/imcodes-send.js');
+
+    const transportTarget = record('deck_proj_brain', { runtimeType: 'transport' });
+    const processTarget = record('deck_proj_w1', { runtimeType: 'process', agentType: 'claude-code' });
+    mocks.sessions.set(transportTarget.name, transportTarget);
+    mocks.sessions.set(processTarget.name, processTarget);
+    const transportSend = vi.fn((): 'sent' => 'sent');
+    mocks.runtimes.set(transportTarget.name, { providerSessionId: 'p-brain', send: transportSend });
+
+    const deps = {
+      listSessions: () => [transportTarget, processTarget],
+      getSession: (name: string) => mocks.sessions.get(name) as SessionRecord | undefined,
+      dispatchMessage: dispatchSessionMessage,
+      isDispatchEnabled: () => true,
+      now: () => 1234,
+    };
+
+    // External CLI targeting transport session runs under restricted participant role with zero machine authority
+    const tRes = await dispatchHookSend({
+      from: IMCODES_EXTERNAL_CLI_SENDER,
+      targetRecords: [transportTarget],
+      message: 'delayed wake check',
+      senderRecord: null,
+    }, deps);
+    expect(tRes.delivered).toEqual([transportTarget.name]);
+    const tMeta = transportSend.mock.calls[0]![4] as Record<string, unknown>;
+    expect(tMeta.sharedActor).toMatchObject({
+      actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+      effectiveActorRole: 'participant',
+      origin: 'server-member',
+    });
+    expect(tMeta.sharedMachineAuthority).toBeUndefined();
+    expect(tMeta.ownerMachineAuthority).toBeUndefined();
+
+    // Unregistered arbitrary `from: "cli"` targeting process session also binds restricted participant activity
+    const pRes = await dispatchHookSend({
+      from: 'cli',
+      targetRecords: [processTarget],
+      message: 'check build',
+      senderRecord: null,
+    }, deps);
+    expect(pRes.delivered).toEqual([processTarget.name]);
+    expect(readProcessSharedMachineAuthority(processTarget.name, {
+      sessionInstanceId: processTarget.sessionInstanceId!,
+      runtimeEpoch: processTarget.runtimeEpoch!,
+    })).toEqual({ required: true, authority: null });
+    expect(readSenderParticipantTurn(processTarget.name)).toEqual({
+      actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+      authority: null,
+    });
+    expect(readSenderOwnerMachineAuthority(processTarget.name)).toBeNull();
+
+    // Streamable HTTP execution_pool handlers must reject restricted participant turns even without invokeDaemonTool
+    const poolHandlers = createExecutionPoolMcpToolHandlers(
+      {
+        userId: 'owner',
+        sessionName: 'deck_proj_brain',
+        projectName: 'proj',
+        namespace: { scope: 'personal', projectId: 'proj', userId: 'owner' },
+        transport: 'streamable_http',
+      },
+      {
+        isProjectBrain: () => true,
+        participantTurnRequired: async () => true,
+        getDefaults: () => ({} as never),
+        setDefaults: () => ({} as never),
+      },
+    );
+    expect(await poolHandlers.execution_pool_get()).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+    expect(await poolHandlers.execution_pool_set({ concurrencyCap: 2 })).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+  });
 });

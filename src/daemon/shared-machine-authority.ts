@@ -7,6 +7,8 @@ import { IMCODES_SESSION_ENV } from '../../shared/imcodes-send.js';
 import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
 import {
   SHARED_MACHINE_AUTHORITY_ACTOR_KIND,
+  SHARED_MACHINE_AUTHORITY_CRON_PURPOSE,
+  SHARED_MACHINE_AUTHORITY_EXTERNAL_CLI_ACTOR_KIND,
   SHARED_MACHINE_AUTHORITY_HOOK_PATH,
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
 } from '../../shared/shared-machine-authority.js';
@@ -204,6 +206,26 @@ export function sharedMachineAuthorityFromHookResponse(answer: Record<string, un
   throw new Error('shared_machine_authority_invalid_response');
 }
 
+export interface CronAuthorityResolution {
+  authority: string | null;
+  restrictedExternalCli: boolean;
+}
+
+export function cronAuthorityFromHookResponse(answer: Record<string, unknown>): CronAuthorityResolution {
+  if (
+    answer.ok === true
+    && answer.required === true
+    && answer.actorKind === SHARED_MACHINE_AUTHORITY_EXTERNAL_CLI_ACTOR_KIND
+    && answer.authority == null
+  ) {
+    return { authority: null, restrictedExternalCli: true };
+  }
+  return {
+    authority: sharedMachineAuthorityFromHookResponse(answer),
+    restrictedExternalCli: false,
+  };
+}
+
 export function hasSessionContextEnv(env: Record<string, string | undefined> = process.env): boolean {
   return Boolean(
     env[IMCODES_SESSION_ENV]?.trim()
@@ -214,36 +236,25 @@ export function hasSessionContextEnv(env: Record<string, string | undefined> = p
   );
 }
 
-/**
- * Shared CLI + MCP default resolver for `X-IMCodes-Shared-Machine-Authority`.
- * - Outside any managed session context: returns `null` (explicit owner operation).
- * - Inside a session/delegation context: fails closed if sessionInstanceId/runtimeEpoch
- *   are missing, if daemon hook authority lookup fails, if the session is stopped, or
- *   if the daemon returns an invalid authority reply.
- */
-export function createSessionSharedMachineAuthorityLoader(options: {
+interface SessionAuthorityLoaderOptions {
   env?: Record<string, string | undefined>;
   callerSessionName?: string | null;
   resourceOwner?: SessionResourceOwner | null;
   resolveHookAuthority?: typeof resolveHookAuthority;
   requireHookPort?: (operation: string) => Promise<number>;
-} = {}): () => Promise<string | null> {
+}
+
+function resolveSessionAuthorityPostHook(
+  options: SessionAuthorityLoaderOptions,
+): ((body?: Record<string, unknown>) => Promise<Record<string, unknown>>) | 'outside' | 'incomplete' {
   const env = (options.env ?? process.env) as NodeJS.ProcessEnv;
   const effectiveOwner = options.resourceOwner !== undefined
     ? options.resourceOwner
     : sessionResourceOwnerFromEnv(env);
   const callerName = options.callerSessionName?.trim() || effectiveOwner?.sessionName || '';
   const inSessionContext = Boolean(effectiveOwner || callerName || hasSessionContextEnv(env));
-
-  if (!inSessionContext) {
-    return async () => null;
-  }
-
-  if (!effectiveOwner || !callerName) {
-    return async () => {
-      throw new Error('shared_machine_authority_incomplete_session_context');
-    };
-  }
+  if (!inSessionContext) return 'outside';
+  if (!effectiveOwner || !callerName) return 'incomplete';
 
   const resolveAuthority = options.resolveHookAuthority ?? resolveHookAuthority;
   const requireHookPort = options.requireHookPort ?? (async (operation: string): Promise<number> => {
@@ -252,7 +263,7 @@ export function createSessionSharedMachineAuthorityLoader(options: {
     throw new HookAuthorityUnavailableError(resolution.reason, operation, resolution.detail);
   });
 
-  const postHook = createResourceOwnerHookWithEpochRefresh({
+  return createResourceOwnerHookWithEpochRefresh({
     resourceOwner: effectiveOwner,
     callerSessionName: callerName,
     hookPath: SHARED_MACHINE_AUTHORITY_HOOK_PATH,
@@ -262,6 +273,42 @@ export function createSessionSharedMachineAuthorityLoader(options: {
     env,
     requireHookPort,
   });
+}
 
+/**
+ * Shared CLI + MCP default resolver for `X-IMCodes-Shared-Machine-Authority`.
+ * - Outside any managed session context: returns `null` (explicit owner operation).
+ * - Inside a session/delegation context: fails closed if sessionInstanceId/runtimeEpoch
+ *   are missing, if daemon hook authority lookup fails, if the session is stopped, or
+ *   if the daemon returns an invalid authority reply.
+ */
+export function createSessionSharedMachineAuthorityLoader(
+  options: SessionAuthorityLoaderOptions = {},
+): () => Promise<string | null> {
+  const postHook = resolveSessionAuthorityPostHook(options);
+  if (postHook === 'outside') return async () => null;
+  if (postHook === 'incomplete') {
+    return async () => {
+      throw new Error('shared_machine_authority_incomplete_session_context');
+    };
+  }
   return async () => sharedMachineAuthorityFromHookResponse(await postHook());
+}
+
+/**
+ * Cron-specific authority loader: preserves fail-closed denial for mixed/web-participant
+ * turns while recognizing pure external-CLI restricted turns so they can create
+ * restricted (non-owner) cron jobs.
+ */
+export function createSessionCronAuthorityLoader(
+  options: SessionAuthorityLoaderOptions = {},
+): () => Promise<CronAuthorityResolution> {
+  const postHook = resolveSessionAuthorityPostHook(options);
+  if (postHook === 'outside') return async () => ({ authority: null, restrictedExternalCli: false });
+  if (postHook === 'incomplete') {
+    return async () => {
+      throw new Error('shared_machine_authority_incomplete_session_context');
+    };
+  }
+  return async () => cronAuthorityFromHookResponse(await postHook({ purpose: SHARED_MACHINE_AUTHORITY_CRON_PURPOSE }));
 }

@@ -105,6 +105,8 @@ import {
 } from './hook-server-state.js';
 import {
   SHARED_MACHINE_AUTHORITY_ACTOR_KIND,
+  SHARED_MACHINE_AUTHORITY_CRON_PURPOSE,
+  SHARED_MACHINE_AUTHORITY_EXTERNAL_CLI_ACTOR_KIND,
   SHARED_MACHINE_AUTHORITY_HOOK_PATH,
   SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
 } from '../../shared/shared-machine-authority.js';
@@ -362,6 +364,21 @@ function resolveSenderRecord(from: string, allSessions: SessionRecord[]): Sessio
   if (byLabel.length === 1) return byLabel[0];
   if (byLabel.length > 1) return 'ambiguous';
   return null;
+}
+
+/**
+ * Active shared-session participant turns must block unauthenticated external CLI sends
+ * (`/send`, `/send-command`, `/stop`) so shell commands in a participant turn cannot strip
+ * `IMCODES_SESSION` and inject an owner-privileged message or `/stop` another session.
+ * Pure external-CLI restricted turns (`actorUserId === IMCODES_EXTERNAL_CLI_SENDER`) remain
+ * non-blocking for external callbacks while still running under least-privilege restriction.
+ */
+function hasActiveSharedParticipantTurn(sessions = listSessions()): boolean {
+  return sessions.some((session) => {
+    if (session.state === 'stopped') return false;
+    const turn = readSenderParticipantTurn(session.name);
+    return turn !== null && turn.actorUserId !== IMCODES_EXTERNAL_CLI_SENDER;
+  });
 }
 
 /**
@@ -727,6 +744,12 @@ async function handleSend(
     return { status: 429, body: { ok: false, error: 'depth limit exceeded' } };
   }
 
+  const allSessions = listSessions();
+  const sender = resolveSenderRecord(from, allSessions);
+  if (sender === null && hasActiveSharedParticipantTurn(allSessions)) {
+    return { status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } };
+  }
+
   // Resolve target
   const result = resolveTarget(from, to);
   if (!result.ok) {
@@ -776,8 +799,8 @@ async function handleSend(
   // the ordinary send bucket.
   recordSend(from);
 
-  const sender = resolveSenderRecord(from, listSessions());
-  const projectRoot = sender && sender !== 'ambiguous' ? sender.projectDir : null;
+  const senderRecord = sender && sender !== 'ambiguous' ? sender : null;
+  const projectRoot = senderRecord ? senderRecord.projectDir : null;
   let dispatch;
   try {
     dispatch = await dispatchHookSend({
@@ -786,6 +809,7 @@ async function handleSend(
       message,
       files: body.files,
       projectRoot,
+      senderRecord,
       reply: body.reply === true,
       ...(body.emergency === true || body.enmergency === true || body.enmergacy === true ? { emergency: true } : {}),
       ...(commandMode ? { command: true } : {}),
@@ -861,6 +885,11 @@ async function handleStop(body: StopRequest): Promise<{ status: number; body: Re
   const { from, to } = body;
   if (!from || !to) {
     return { status: 400, body: { ok: false, error: 'missing required fields: from, to' } };
+  }
+  const allSessions = listSessions();
+  const sender = resolveSenderRecord(from, allSessions);
+  if (sender === null && hasActiveSharedParticipantTurn(allSessions)) {
+    return { status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } };
   }
   const result = resolveTarget(from, to);
   if (!result.ok) {
@@ -1398,6 +1427,20 @@ export async function startHookServer(
           ? (required ? runtime.getActiveSharedMachineAuthority() : (runtime.getActiveOwnerMachineAuthority?.() ?? null))
           : processContext.authority;
         if (required && !authority) {
+          const participantTurn = readSenderParticipantTurn(session.name);
+          if (
+            body.purpose === SHARED_MACHINE_AUTHORITY_CRON_PURPOSE
+            && participantTurn?.actorUserId === IMCODES_EXTERNAL_CLI_SENDER
+          ) {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              ok: true,
+              required: true,
+              actorKind: SHARED_MACHINE_AUTHORITY_EXTERNAL_CLI_ACTOR_KIND,
+              authority: null,
+            }));
+            return;
+          }
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'shared_machine_authority_unavailable' }));
           return;
