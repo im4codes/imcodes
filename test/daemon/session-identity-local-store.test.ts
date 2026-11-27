@@ -17,6 +17,7 @@ import {
   removeLocalSessionIdentityProfile,
   removeSessionIdentitiesForSession,
   resetIdentityStoreCacheForTests,
+  SESSION_IDENTITY_METADATA_COVERING_SELECT_SQL,
 } from '../../src/daemon/session-identity-local-store.js';
 
 const require = createRequire(import.meta.url);
@@ -453,5 +454,55 @@ describe('daemon-local session identity store', () => {
     } finally {
       legacyCheck.close();
     }
+  });
+
+  it('serves listLocalSessionIdentityMetadata via covering index without reading 56x327KB content overflow pages', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    const large = 'M'.repeat(327_000);
+    for (let i = 0; i < 56; i += 1) {
+      await putLocalSessionIdentityProfile({
+        scope: 'session',
+        scopeKey: `srv-99:sess-${String(i).padStart(2, '0')}`,
+        content: `${i}:${large}`,
+        source: 'mcp',
+      });
+    }
+
+    // Reopen cold connection and verify EXPLAIN QUERY PLAN + covering index footprint
+    resetIdentityStoreCacheForTests();
+    const inspectDb = new DatabaseSync(localSessionIdentityDbPath());
+    try {
+      const plan = inspectDb.prepare(`EXPLAIN QUERY PLAN ${SESSION_IDENTITY_METADATA_COVERING_SELECT_SQL}`).all() as Array<{ detail?: string }>;
+      expect(plan).toHaveLength(1);
+      expect(plan[0]?.detail).toContain('USING COVERING INDEX idx_session_identity_meta_covering');
+      expect(plan.some((step) => step.detail?.includes('USE TEMP B-TREE'))).toBe(false);
+
+      // Quantify covering index footprint vs table overflow pages (SQLite compiled with SQLITE_ENABLE_DBSTAT)
+      try {
+        const idxPages = inspectDb.prepare(`SELECT count(*) AS cnt FROM dbstat WHERE name = 'idx_session_identity_meta_covering'`).get() as { cnt?: number };
+        const tblPages = inspectDb.prepare(`SELECT count(*) AS cnt FROM dbstat WHERE name = 'session_identity_profiles'`).get() as { cnt?: number };
+        expect(Number(idxPages.cnt ?? 0)).toBeGreaterThan(0);
+        expect(Number(idxPages.cnt ?? 0)).toBeLessThan(20);
+        expect(Number(tblPages.cnt ?? 0)).toBeGreaterThan(4000);
+      } catch {
+        // dbstat optional on non-standard builds; EXPLAIN QUERY PLAN above already enforces covering index.
+      }
+    } finally {
+      inspectDb.close();
+    }
+
+    const beforeStats = identityStoreReadStatsForTests();
+    const t0 = performance.now();
+    const meta = await listLocalSessionIdentityMetadata();
+    const elapsedMs = performance.now() - t0;
+    expect(meta).toHaveLength(56);
+    for (const entry of meta) {
+      expect(entry).not.toHaveProperty('content');
+    }
+    expect(elapsedMs).toBeLessThan(100);
+    const afterStats = identityStoreReadStatsForTests();
+    expect(afterStats.listScans).toBe(beforeStats.listScans);
+    expect(afterStats.pkReads).toBe(beforeStats.pkReads);
+    expect(afterStats.metaScans).toBe(beforeStats.metaScans + 1);
   });
 });

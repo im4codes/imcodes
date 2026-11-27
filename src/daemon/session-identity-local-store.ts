@@ -413,6 +413,9 @@ function getDb(): DatabaseSyncInstance {
 
       CREATE INDEX IF NOT EXISTS idx_session_identity_scope
         ON session_identity_profiles(scope);
+
+      CREATE INDEX IF NOT EXISTS idx_session_identity_meta_covering
+        ON session_identity_profiles(scope, scope_key, content_hash, revision, updated_at, source, source_file);
     `);
 
     migrateLegacyJson(db);
@@ -460,6 +463,84 @@ export interface LocalIdentityWrite {
   sourceFile?: string;
 }
 
+/**
+ * Covering-index query for metadata-only reads:
+ * projects ONLY the 7 columns stored in `idx_session_identity_meta_covering` (never `content`),
+ * and orders by index leading keys `(scope, scope_key)` so SQLite uses
+ * `SCAN session_identity_profiles USING COVERING INDEX idx_session_identity_meta_covering`
+ * without touching table/overflow pages or running a temp B-tree sort.
+ */
+export const SESSION_IDENTITY_METADATA_COVERING_SELECT_SQL = `
+  SELECT scope, scope_key, content_hash, revision, updated_at, source, source_file
+  FROM session_identity_profiles INDEXED BY idx_session_identity_meta_covering
+  ORDER BY scope ASC, scope_key ASC
+`;
+
+const PROFILE_BY_KEY_SELECT_SQL = `
+  SELECT scope, scope_key, content, content_hash, revision, updated_at, source, source_file
+  FROM session_identity_profiles
+  WHERE scope = ? AND scope_key = ?
+`;
+
+type StatementSync = ReturnType<DatabaseSyncInstance['prepare']>;
+
+function readProfilesByKeysWithStatement(
+  stmt: StatementSync,
+  keys: ReadonlyArray<SessionIdentityProfileKey>,
+): SessionIdentityProfile[] {
+  if (keys.length === 0) return [];
+  const unique: SessionIdentityProfileKey[] = [];
+  const seen = new Set<string>();
+  for (const key of keys) {
+    const id = `${key.scope}\0${key.scopeKey}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    unique.push(key);
+  }
+  const profiles: SessionIdentityProfile[] = [];
+  for (const { scope, scopeKey } of unique) {
+    readStats.pkReads += 1;
+    const row = stmt.get(scope, scopeKey) as unknown as ProfileRow | undefined;
+    if (row) profiles.push(rowToProfile(row));
+  }
+  return profiles;
+}
+
+export interface LocalIdentitySnapshotReader {
+  listMetadata(): SessionIdentityProfileMeta[];
+  getProfilesByKeys(keys: ReadonlyArray<SessionIdentityProfileKey>): SessionIdentityProfile[];
+}
+
+/**
+ * Executes metadata covering scan and targeted PK content loads inside ONE synchronous
+ * SQLite WAL read transaction (zero `await` inside), guaranteeing snapshot consistency
+ * across metadata selection, cache comparison, and PK content retrieval.
+ */
+export function withLocalSessionIdentityReadSnapshot<T>(
+  fn: (reader: LocalIdentitySnapshotReader) => T,
+): T {
+  const db = getDb();
+  const metaStmt = db.prepare(SESSION_IDENTITY_METADATA_COVERING_SELECT_SQL);
+  const pkStmt = db.prepare(PROFILE_BY_KEY_SELECT_SQL);
+  db.exec('BEGIN DEFERRED');
+  try {
+    const reader: LocalIdentitySnapshotReader = {
+      listMetadata: () => {
+        readStats.metaScans += 1;
+        const rows = metaStmt.all() as unknown as ProfileMetaRow[];
+        return rows.map(rowToProfileMeta);
+      },
+      getProfilesByKeys: (keys) => readProfilesByKeysWithStatement(pkStmt, keys),
+    };
+    const result = fn(reader);
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw err;
+  }
+}
+
 export async function listLocalSessionIdentityProfiles(): Promise<SessionIdentityProfile[]> {
   try {
     const db = getDb();
@@ -476,18 +557,14 @@ export async function listLocalSessionIdentityProfiles(): Promise<SessionIdentit
 }
 
 /**
- * Lightweight metadata-only scan (NEVER selects the `content` column).
+ * Lightweight metadata-only scan via covering index (NEVER touches `content` or its overflow pages).
  * Propagates SQLite read errors (fail-closed) so callers like sync never confuse
  * a locked or unreadable store with an empty identity table.
  */
 export async function listLocalSessionIdentityMetadata(): Promise<SessionIdentityProfileMeta[]> {
   const db = getDb();
   readStats.metaScans += 1;
-  const rows = db.prepare(`
-    SELECT scope, scope_key, content_hash, revision, updated_at, source, source_file
-    FROM session_identity_profiles
-    ORDER BY rowid ASC
-  `).all() as unknown as ProfileMetaRow[];
+  const rows = db.prepare(SESSION_IDENTITY_METADATA_COVERING_SELECT_SQL).all() as unknown as ProfileMetaRow[];
   return rows.map(rowToProfileMeta);
 }
 
@@ -499,27 +576,9 @@ export async function getLocalSessionIdentityProfilesByKeys(
   keys: ReadonlyArray<SessionIdentityProfileKey>,
 ): Promise<SessionIdentityProfile[]> {
   if (keys.length === 0) return [];
-  const unique: SessionIdentityProfileKey[] = [];
-  const seen = new Set<string>();
-  for (const key of keys) {
-    const id = `${key.scope}\0${key.scopeKey}`;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    unique.push(key);
-  }
   const db = getDb();
-  const stmt = db.prepare(`
-    SELECT scope, scope_key, content, content_hash, revision, updated_at, source, source_file
-    FROM session_identity_profiles
-    WHERE scope = ? AND scope_key = ?
-  `);
-  const profiles: SessionIdentityProfile[] = [];
-  for (const { scope, scopeKey } of unique) {
-    readStats.pkReads += 1;
-    const row = stmt.get(scope, scopeKey) as unknown as ProfileRow | undefined;
-    if (row) profiles.push(rowToProfile(row));
-  }
-  return profiles;
+  const stmt = db.prepare(PROFILE_BY_KEY_SELECT_SQL);
+  return readProfilesByKeysWithStatement(stmt, keys);
 }
 
 export async function getLocalSessionIdentityProfile(

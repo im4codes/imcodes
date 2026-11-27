@@ -14,6 +14,7 @@ import {
   identityStoreReadStatsForTests,
   localSessionIdentityDbPath,
   putLocalSessionIdentityProfile,
+  removeLocalSessionIdentityProfileQuiet,
   resetIdentityStoreCacheForTests,
 } from '../../src/daemon/session-identity-local-store.js';
 import {
@@ -426,5 +427,101 @@ describe('metadata-first steady-state session identity reconciliation', () => {
     await vi.waitFor(() => {
       expect(runPassSpy).toHaveBeenCalledWith('session-identity-sync', expect.any(Function));
     });
+    const inFlightPass = runPassSpy.mock.results[0]?.value as Promise<unknown> | undefined;
+    await inFlightPass;
+  });
+
+  it('never empties identity when add-before-delete commits during boundServerId await on real SQLite', async () => {
+    const home = makeIsolatedHome();
+    vi.stubEnv('IMCODES_HOME', home);
+    resetIdentityStoreCacheForTests();
+    resetSessionIdentityResolverCacheForTests();
+
+    const initialSess = await putLocalSessionIdentityProfile({
+      scope: 'session',
+      scopeKey: 'srv-9:deck_proj_brain',
+      content: 'initial session rule',
+      source: 'mcp',
+    });
+    const initialPrompt = renderSessionIdentityProfiles([initialSess]);
+    const live = session({ name: 'deck_proj_brain', appliedIdentityHash: identityPromptHash(initialPrompt) });
+    const appliedHistory: Array<string | undefined> = [];
+    const applyIdentity = vi.fn((_name: string, prompt: string | undefined) => {
+      appliedHistory.push(prompt);
+      live.appliedIdentityHash = identityPromptHash(prompt);
+      return { applied: true };
+    });
+
+    const result = await syncSessionIdentities({
+      listLocalSessions: () => [live],
+      applyIdentity,
+      boundServerId: async () => {
+        // Add replacement project identity BEFORE removing the old session identity while async preflight awaits.
+        await putLocalSessionIdentityProfile({
+          scope: 'project',
+          scopeKey: 'repo-1',
+          content: 'replacement project rule',
+          source: 'mcp',
+        });
+        await removeLocalSessionIdentityProfileQuiet('session', 'srv-9:deck_proj_brain');
+        return 'srv-9';
+      },
+    });
+
+    expect(result).toEqual({ status: 'ok', checked: 1, changed: 1 });
+    expect(appliedHistory).toHaveLength(1);
+    expect(appliedHistory[0]).toBeDefined();
+    expect(appliedHistory[0]).toContain('replacement project rule');
+  });
+
+  it('retries inconsistent split-reader snapshots and never renders/applies missing layers when tearing persists', async () => {
+    resetSessionIdentityResolverCacheForTests();
+    const sessProfile = profile('session', 'srv-9:deck_proj_brain', 'old session');
+    const projProfile = profile('project', 'repo-1', 'new project');
+
+    let metaCalls = 0;
+    const listMetadata = vi.fn(async () => {
+      metaCalls += 1;
+      const { content: _c, ...meta } = metaCalls === 1 ? sessProfile : projProfile;
+      return [meta];
+    });
+    const getProfilesByKeys = vi.fn(async (keys: ReadonlyArray<{ scope: SessionIdentityProfile['scope']; scopeKey: string }>) => {
+      // Attempt 1 requests session key after writer already swapped to project -> returns empty (missing layer)
+      if (metaCalls === 1 && keys.some((k) => k.scope === 'session')) return [];
+      return [projProfile];
+    });
+
+    const live = session({ name: 'deck_proj_brain', appliedIdentityHash: 'prior-hash' });
+    const applyIdentity = vi.fn((_name: string, prompt: string | undefined) => {
+      live.appliedIdentityHash = identityPromptHash(prompt);
+      return { applied: true };
+    });
+
+    const converged = await syncSessionIdentities({
+      listLocalMetadata: listMetadata,
+      getLocalProfilesByKeys: getProfilesByKeys,
+      listLocalSessions: () => [live],
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+    });
+    expect(converged).toEqual({ status: 'ok', checked: 1, changed: 1 });
+    expect(listMetadata).toHaveBeenCalledTimes(2);
+    expect(applyIdentity).toHaveBeenCalledTimes(1);
+    expect(applyIdentity).toHaveBeenCalledWith('deck_proj_brain', expect.stringContaining('new project'), { refresh: true });
+
+    // Perpetual tearing across all retries omits the unstable session instead of wiping running identity
+    resetSessionIdentityResolverCacheForTests();
+    const stableHash = live.appliedIdentityHash;
+    const tornApply = vi.fn(() => ({ applied: true }));
+    const tornRes = await syncSessionIdentities({
+      listLocalMetadata: async () => [{ scope: 'project', scopeKey: 'repo-1', contentHash: 'h-meta', revision: 1, updatedAt: 1, source: 'mcp' }],
+      getLocalProfilesByKeys: async () => [],
+      listLocalSessions: () => [live],
+      applyIdentity: tornApply,
+      boundServerId: async () => 'srv-9',
+    });
+    expect(tornRes).toEqual({ status: 'ok', checked: 1, changed: 0 });
+    expect(tornApply).not.toHaveBeenCalled();
+    expect(live.appliedIdentityHash).toBe(stableHash);
   });
 });
