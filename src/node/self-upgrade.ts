@@ -18,6 +18,7 @@ import {
   CONTROLLED_NODE_OS_LINUX,
   CONTROLLED_NODE_OS_MAC,
   CONTROLLED_NODE_OS_WIN,
+  isControlledNodeArch,
   type AideskLocalUiArtifactAsset,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
@@ -664,11 +665,18 @@ function readHeader(headers: Headers, name: string): string | null {
   return headers.get(name) ?? headers.get(name.toLowerCase()) ?? headers.get(name.toUpperCase());
 }
 
-function buildControlledNodeArtifactRequestHeaders(credential: ArtifactDownloadCredential): Record<string, string> {
+function buildControlledNodeArtifactRequestHeaders(
+  credential: ArtifactDownloadCredential,
+  runtimeArch: string = process.arch,
+): Record<string, string> {
+  const normalizedArch = runtimeArch.trim().toLowerCase();
   return {
     Authorization: `Bearer ${credential.token}`,
     'X-Server-Id': credential.serverId,
     [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
+    ...(isControlledNodeArch(normalizedArch)
+      ? { [CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH]: normalizedArch }
+      : {}),
   };
 }
 
@@ -697,6 +705,7 @@ export async function probeControlledNodeArtifactMetadata(input: {
   credential: ArtifactDownloadCredential;
   target: ControlledNodeArtifactTarget;
   asset?: typeof CONTROLLED_NODE_ARTIFACT_ASSETS[keyof typeof CONTROLLED_NODE_ARTIFACT_ASSETS];
+  runtimeArch?: string;
   fetchImpl?: typeof fetch;
 }): Promise<ControlledNodeArtifactMetadataProbe> {
   const asset = input.asset ?? CONTROLLED_NODE_ARTIFACT_ASSETS.NODE;
@@ -704,7 +713,7 @@ export async function probeControlledNodeArtifactMetadata(input: {
     controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset),
     {
       method: 'HEAD',
-      headers: buildControlledNodeArtifactRequestHeaders(input.credential),
+      headers: buildControlledNodeArtifactRequestHeaders(input.credential, input.runtimeArch ?? process.arch),
     },
   );
   await response.body?.cancel().catch(() => {});
@@ -900,6 +909,7 @@ async function downloadArtifact(input: {
   dir: string;
   fetchImpl: typeof fetch;
   asset?: typeof CONTROLLED_NODE_ARTIFACT_ASSETS[keyof typeof CONTROLLED_NODE_ARTIFACT_ASSETS];
+  runtimeArch?: string;
   expectedFileName?: string;
   expectedVersion?: string;
   fileMode?: number;
@@ -919,7 +929,7 @@ async function downloadArtifact(input: {
   return fetchAndVerifyControlledNodeArtifactWithOriginFallback({
     fetchImpl: createTimeoutFetch(input.fetchImpl, requestTimeoutMs, activeController),
     url: controlledNodeArtifactUpgradeUrl(input.credential, input.target, asset),
-    headers: buildControlledNodeArtifactRequestHeaders(input.credential),
+    headers: buildControlledNodeArtifactRequestHeaders(input.credential, input.runtimeArch ?? process.arch),
     onExternalFallback: (reason) => {
       logger.warn(
         { asset, err: reason instanceof Error ? reason.message : String(reason) },
@@ -1138,6 +1148,7 @@ export async function downloadDesktopReleaseManifest(input: {
   credential: ArtifactDownloadCredential;
   target: ControlledNodeArtifactTarget;
   fetchImpl: typeof fetch;
+  runtimeArch?: string;
   expectedVersion?: string;
   expectedSha256?: string;
   requestTimeoutMs?: number;
@@ -1153,11 +1164,7 @@ export async function downloadDesktopReleaseManifest(input: {
       input.target,
       CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST,
     ),
-    headers: {
-      Authorization: `Bearer ${input.credential.token}`,
-      'X-Server-Id': input.credential.serverId,
-      [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: String(REMOTE_DESKTOP_PROTOCOL_VERSION),
-    },
+    headers: buildControlledNodeArtifactRequestHeaders(input.credential, input.runtimeArch ?? process.arch),
     onExternalFallback: (reason) => {
       logger.warn(
         { err: reason instanceof Error ? reason.message : String(reason) },
@@ -1236,6 +1243,7 @@ export async function downloadControlledNodeComputerUseHelper(input: {
   target: ControlledNodeArtifactTarget;
   dir: string;
   fetchImpl: typeof fetch;
+  runtimeArch?: string;
   requestTimeoutMs?: number;
   streamIdleTimeoutMs?: number;
 }): Promise<{ helperDir: string; artifactPath: string; sha256: string; sizeBytes: number } | undefined> {
@@ -1248,6 +1256,7 @@ export async function downloadControlledNodeComputerUseHelper(input: {
       dir: helperDir,
       fetchImpl: input.fetchImpl,
       asset: CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER,
+      ...(input.runtimeArch !== undefined ? { runtimeArch: input.runtimeArch } : {}),
       expectedFileName: controlledNodeComputerUseHelperFilename(input.target.os),
       fileMode: input.target.os === CONTROLLED_NODE_OS_MAC ? 0o644 : 0o755,
       ...(input.requestTimeoutMs !== undefined ? { requestTimeoutMs: input.requestTimeoutMs } : {}),
@@ -2683,13 +2692,14 @@ export async function startControlledNodeSelfUpgrade(
       target,
       dir: stagingDir,
       fetchImpl,
+      runtimeArch: arch,
       ...(targetVersion === DAEMON_UPGRADE_TARGET_LATEST ? {} : { expectedVersion: targetVersion }),
       ...downloadTimeoutOpts,
       onProgress: recordProgress,
     }), { sleep: deps.sleep });
     if (!downloaded.version) throw new Error('missing_artifact_version');
     const helper = abiProfile === CONTROLLED_NODE_ABI_GLIBC217 ? undefined : await withArtifactDownloadRetries(
-      () => downloadControlledNodeComputerUseHelper({ credential, target, dir: stagingDir, fetchImpl, ...downloadTimeoutOpts }),
+      () => downloadControlledNodeComputerUseHelper({ credential, target, dir: stagingDir, fetchImpl, runtimeArch: arch, ...downloadTimeoutOpts }),
       { sleep: deps.sleep },
     );
     // A Windows/Linux release is one publication unit. Installing the runtime
@@ -2730,6 +2740,7 @@ export async function startControlledNodeSelfUpgrade(
             credential,
             target: manifestTarget,
             fetchImpl,
+            runtimeArch: arch,
             expectedVersion: downloaded.version,
             expectedSha256: downloaded.releaseManifestSha256,
             ...downloadTimeoutOpts,

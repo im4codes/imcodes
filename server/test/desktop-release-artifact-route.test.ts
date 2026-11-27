@@ -27,6 +27,7 @@ import {
   setR2ManifestFetchForTests,
 } from '../src/services/controlled-node-artifact-distribution.js';
 import { USER_STATUS } from '../../shared/user-status.js';
+import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 import type { Env } from '../src/env.js';
 
 const tempDirs: string[] = [];
@@ -44,7 +45,7 @@ function sha256(buf: Buffer | string): string {
 
 function makeFakeServerApp(serverRows: Map<string, Record<string, unknown>>, extraEnv: Record<string, unknown> = {}) {
   const catalog = createArtifactCatalog();
-  const routes = createEnrollRoutes({ artifactCatalog: catalog });
+  const routes = createEnrollRoutes(catalog);
   const app = new Hono<{ Bindings: Env }>();
   const mockDb = {
     queryOne: async (_sql: string, params: unknown[]) => {
@@ -74,7 +75,7 @@ function makeFakeServerApp(serverRows: Map<string, Record<string, unknown>>, ext
 
 function writeReleaseArtifactsManifest(
   dir: string,
-  target: 'linux-x64' | 'linux-arm64' | 'darwin-arm64' | 'win32-x64',
+  target: 'linux-x64' | 'linux-arm64' | 'darwin-arm64' | 'darwin-x64' | 'win32-x64',
   version: string,
   archiveBytes: Buffer,
   entryOverrides: Record<string, unknown> = {},
@@ -119,7 +120,7 @@ function writeReleaseArtifactsManifest(
 
 function writeDaemonRuntimeFixture(
   dir: string,
-  target: 'linux-x64' | 'linux-arm64' | 'darwin-arm64' | 'win32-x64',
+  target: 'linux-x64' | 'linux-arm64' | 'darwin-arm64' | 'darwin-x64' | 'win32-x64',
   version: string,
 ) {
   const [os, arch] = target.split('-');
@@ -515,5 +516,208 @@ describe('/api/enroll/v2/node-artifact release manifest & daemon-runtime routes'
       { headers: { authorization: `Bearer ${fullToken}`, [CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT]: CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN } },
     );
     expect(tamperedLocalRes.status).toBe(503);
+  });
+
+  it('resolves mac:universal node release manifest sha256 by x-imcodes-node-runtime-arch -> server.arch, omits it when unknown, and fails closed on mismatch', async () => {
+    const dir = makeTempDir('enroll-mac-universal-arch-');
+    process.env.IMCODES_NODE_EXE_DIR = dir;
+    const version = '2026.11.6577-dev.6641';
+    const nodeBytes = Buffer.from('universal-macos-node-binary-' + version, 'utf8');
+    const nodeSha = sha256(nodeBytes);
+    writeFileSync(join(dir, 'imcodes-node-macos'), nodeBytes);
+    writeFileSync(join(dir, 'imcodes-node-macos.manifest.json'), JSON.stringify({
+      schemaVersion: 1,
+      artifact: {
+        os: 'mac',
+        arch: 'universal',
+        fileName: 'imcodes-node-macos',
+        size: nodeBytes.length,
+        sha256: nodeSha,
+      },
+      build: { version },
+    }, null, 2));
+
+    const writeMacReleaseManifest = (arch: 'arm64' | 'x64', nodeShaOverride?: string): string => {
+      const target = `darwin-${arch}` as const;
+      const bytes = Buffer.from(JSON.stringify({
+        schemaVersion: 1,
+        releaseVersion: version,
+        gitSha: '1234567abcdef',
+        generatedAt: new Date().toISOString(),
+        targets: {
+          [target]: {
+            target,
+            os: 'darwin',
+            arch,
+            components: {
+              'imcodes-node': {
+                component: 'imcodes-node',
+                version,
+                fileName: 'imcodes-node-macos',
+                sha256: nodeShaOverride ?? nodeSha,
+                sizeBytes: nodeBytes.length,
+                compat: { os: 'darwin', arch: 'universal' },
+              },
+              'remote-desktop': {
+                component: 'remote-desktop',
+                version,
+                fileName: `imcodes-macos-remote-desktop-${arch}.tar.gz`,
+                sha256: (arch === 'x64' ? '2' : '3').repeat(64),
+                sizeBytes: 456,
+                compat: { os: 'darwin', arch, protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION },
+              },
+              'open-computer-use': {
+                component: 'open-computer-use',
+                version,
+                fileName: 'open-computer-use.app.zip',
+                sha256: '4'.repeat(64),
+                sizeBytes: 789,
+                compat: { os: 'darwin', arch: 'universal' },
+              },
+              'daemon-runtime': {
+                component: 'daemon-runtime',
+                version,
+                fileName: `daemon-runtime-${target}.tar.gz`,
+                sha256: (arch === 'x64' ? '5' : '6').repeat(64),
+                sizeBytes: 999,
+                compat: { os: 'darwin', arch, nodeVersion: 'v24.16.0' },
+              },
+            },
+          },
+        },
+      }, null, 2), 'utf8');
+      writeFileSync(join(dir, desktopReleaseTargetManifestFilename(target)), bytes);
+      return sha256(bytes);
+    };
+
+    const arm64RmSha = writeMacReleaseManifest('arm64');
+    const x64RmSha = writeMacReleaseManifest('x64');
+    expect(arm64RmSha).not.toBe(x64RmSha);
+
+    const macNodeKey = controlledNodeReleaseArtifactEntryKey({
+      asset: CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+      os: 'mac',
+      arch: 'universal',
+    });
+    const r2Manifest = {
+      schemaVersion: CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_SCHEMA_VERSION,
+      version,
+      generatedAt: new Date().toISOString(),
+      artifacts: {
+        [macNodeKey]: {
+          asset: CONTROLLED_NODE_ARTIFACT_ASSETS.NODE,
+          assetFilename: 'imcodes-node-macos',
+          relativePath: 'imcodes-node-macos',
+          sha256: nodeSha,
+          sizeBytes: nodeBytes.length,
+          version,
+          os: 'mac',
+          arch: 'universal',
+        },
+      },
+    };
+    writeFileSync(join(dir, CONTROLLED_NODE_RELEASE_ARTIFACTS_MANIFEST_FILENAME), JSON.stringify(r2Manifest));
+    invalidateReleaseArtifactsManifestCache(dir);
+    setR2ManifestFetchForTests(async () => new Response(JSON.stringify(r2Manifest), { status: 200 }));
+
+    const token = 'mac-ctrl-token';
+    const tokenHash = sha256Hex(token);
+    const servers = new Map<string, Record<string, unknown>>([
+      ['srv-mac-x64', { id: 'srv-mac-x64', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'mac', arch: 'x64', abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
+      ['srv-mac-arm64', { id: 'srv-mac-arm64', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'mac', arch: 'arm64', abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
+      ['srv-mac-univ', { id: 'srv-mac-univ', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'mac', arch: 'universal', abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
+      ['srv-mac-null', { id: 'srv-mac-null', token_hash: tokenHash, node_role: NODE_ROLE.CONTROLLED, revoked_at: null, os: 'mac', arch: null, abi_profile: 'modern', owner_status: USER_STATUS.ACTIVE }],
+    ]);
+    const app = makeFakeServerApp(servers, {
+      CONTROLLED_NODE_ARTIFACT_R2_BASE_URL: 'https://cdn.imcodes.example',
+    });
+
+    // 1. Intel Mac (server.arch = 'x64', legacy client without header): HEAD, direct GET, and 302 ALL pin darwin-x64.
+    const x64Head = await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-x64&os=mac&arch=universal`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(x64Head.status).toBe(200);
+    expect(x64Head.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBe(x64RmSha);
+
+    const x64Direct = await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-x64&os=mac&arch=universal`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(x64Direct.status).toBe(200);
+    expect(x64Direct.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBe(x64RmSha);
+    expect(Buffer.from(await x64Direct.arrayBuffer())).toEqual(nodeBytes);
+
+    const x64Redirect = await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-x64&os=mac&arch=universal`, {
+      headers: {
+        authorization: `Bearer ${token}`,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT]: CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN,
+      },
+    });
+    expect(x64Redirect.status).toBe(302);
+    expect(x64Redirect.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBe(x64RmSha);
+
+    // 2. Apple Silicon (server.arch = 'arm64', no header) pins darwin-arm64.
+    const armHead = await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-arm64&os=mac&arch=universal`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(armHead.status).toBe(200);
+    expect(armHead.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBe(arm64RmSha);
+
+    // 3. Explicit header x-imcodes-node-runtime-arch: x64 overrides stale arm64/universal DB arch.
+    for (const sid of ['srv-mac-arm64', 'srv-mac-univ']) {
+      const overrideRes = await app.request(`/api/enroll/v2/node-artifact?serverId=${sid}&os=mac&arch=universal`, {
+        method: 'HEAD',
+        headers: {
+          authorization: `Bearer ${token}`,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH]: 'x64',
+        },
+      });
+      expect(overrideRes.status).toBe(200);
+      expect(overrideRes.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBe(x64RmSha);
+    }
+
+    // 4. Invalid x-imcodes-node-runtime-arch is ignored safely (falls back to DB or unknown without breaking node).
+    const badHeaderWithDb = await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-x64&os=mac&arch=universal`, {
+      method: 'HEAD',
+      headers: {
+        authorization: `Bearer ${token}`,
+        [CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH]: 'mips64',
+      },
+    });
+    expect(badHeaderWithDb.status).toBe(200);
+    expect(badHeaderWithDb.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBe(x64RmSha);
+
+    // 5. Unknown arch (server.arch = 'universal' / null, no valid header) validates published manifests and OMITS pinned hash.
+    for (const sid of ['srv-mac-univ', 'srv-mac-null']) {
+      for (const init of [
+        { method: 'HEAD', headers: { authorization: `Bearer ${token}` } },
+        { method: 'GET', headers: { authorization: `Bearer ${token}`, [CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH]: 'invalid' } },
+        { method: 'GET', headers: { authorization: `Bearer ${token}`, [CONTROLLED_NODE_ARTIFACT_HEADERS.EXTERNAL_REDIRECT]: CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN } },
+      ] as RequestInit[]) {
+        const res = await app.request(`/api/enroll/v2/node-artifact?serverId=${sid}&os=mac&arch=universal`, init);
+        expect([200, 302]).toContain(res.status);
+        expect(res.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256)).toBeNull();
+        await res.body?.cancel().catch(() => {});
+      }
+    }
+
+    // 6. Fail-closed 503 when either macOS release manifest imcodes-node entry mismatches (even for unknown arch).
+    writeMacReleaseManifest('x64', 'f'.repeat(64));
+    expect((await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-x64&os=mac&arch=universal`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    })).status).toBe(503);
+    expect((await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-univ&os=mac&arch=universal`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    })).status).toBe(503);
+
+    writeMacReleaseManifest('x64');
+    writeMacReleaseManifest('arm64', 'e'.repeat(64));
+    expect((await app.request(`/api/enroll/v2/node-artifact?serverId=srv-mac-univ&os=mac&arch=universal`, {
+      method: 'HEAD',
+      headers: { authorization: `Bearer ${token}` },
+    })).status).toBe(503);
   });
 });

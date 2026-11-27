@@ -213,11 +213,29 @@ export const CONTROLLED_NODE_ARTIFACT_HEADERS = {
   FILENAME: 'x-imcodes-node-artifact-filename',
   VERSION: 'x-imcodes-node-artifact-version',
   ABI_PROFILE: 'x-imcodes-node-artifact-abi-profile',
+  RUNTIME_ARCH: 'x-imcodes-node-runtime-arch',
   AUTHENTICODE_SIGNER_SHA256: 'x-imcodes-node-artifact-authenticode-signer-sha256',
   REMOTE_DESKTOP_PROTOCOL_VERSION: 'x-imcodes-remote-desktop-protocol-version',
   RELEASE_MANIFEST_SHA256: 'x-imcodes-node-release-manifest-sha256',
   EXTERNAL_REDIRECT: 'x-imcodes-external-artifact-redirect',
 } as const;
+
+/**
+ * Resolve a controlled node's concrete runtime architecture (`'x64'` | `'arm64'`),
+ * preferring a valid caller-declared header over the enrolled DB row while
+ * safely ignoring unrecognized values such as `'universal'`.
+ */
+export function resolveControlledNodeRuntimeArch(
+  headerArch?: unknown,
+  dbArch?: unknown,
+): ControlledNodeArch | null {
+  for (const candidate of [headerArch, dbArch]) {
+    if (typeof candidate !== 'string') continue;
+    const normalized = candidate.trim().toLowerCase();
+    if (isControlledNodeArch(normalized)) return normalized;
+  }
+  return null;
+}
 
 export const CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN = '1';
 export const CONTROLLED_NODE_EXTERNAL_MAX_REDIRECTS = 5;

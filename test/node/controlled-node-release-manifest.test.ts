@@ -7,6 +7,7 @@ import {
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
 } from '../../shared/controlled-node-artifacts.js';
+import { REMOTE_DESKTOP_PROTOCOL_VERSION } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_LINUX_WORKER_FILENAME, REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX } from '../../shared/remote-desktop-worker.js';
 import { startControlledNodeSelfUpgrade } from '../../src/node/self-upgrade.js';
 
@@ -466,5 +467,167 @@ describe('controlled-node self-upgrade release manifest verification', () => {
     });
     expect(legacyRes).toMatchObject({ ok: true, targetVersion: version });
     expect(scheduled5).toHaveLength(1);
+  });
+
+  it('sends x-imcodes-node-runtime-arch: x64 on Intel Mac upgrades, verifies darwin-x64 release manifest, and rejects wrong arm64 pinned sha', async () => {
+    const version = '2026.11.6577-dev.6641';
+    const nodeBytes = Buffer.from(`mac-universal-node-${version}`, 'utf8');
+    const ocuBytes = Buffer.from(`mac-ocu-${version}`, 'utf8');
+    const nodeSha = sha256(nodeBytes);
+
+    const makeMacReleaseManifest = (arch: 'x64' | 'arm64') => {
+      const target = `darwin-${arch}`;
+      const bytes = Buffer.from(JSON.stringify({
+        schemaVersion: 1,
+        releaseVersion: version,
+        gitSha: 'abcdef1234567',
+        generatedAt: new Date().toISOString(),
+        targets: {
+          [target]: {
+            target,
+            os: 'darwin',
+            arch,
+            components: {
+              'imcodes-node': {
+                component: 'imcodes-node',
+                version,
+                fileName: 'imcodes-node-macos',
+                sha256: nodeSha,
+                sizeBytes: nodeBytes.length,
+                compat: { os: 'darwin', arch: 'universal' },
+              },
+              'remote-desktop': {
+                component: 'remote-desktop',
+                version,
+                fileName: `imcodes-macos-remote-desktop-${arch}.tar.gz`,
+                sha256: (arch === 'x64' ? '2' : '3').repeat(64),
+                sizeBytes: 222,
+                compat: { os: 'darwin', arch, protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION },
+              },
+              'open-computer-use': {
+                component: 'open-computer-use',
+                version,
+                fileName: 'open-computer-use.app.zip',
+                sha256: sha256(ocuBytes),
+                sizeBytes: ocuBytes.length,
+                compat: { os: 'darwin', arch: 'universal' },
+              },
+              'daemon-runtime': {
+                component: 'daemon-runtime',
+                version,
+                fileName: `daemon-runtime-${target}.tar.gz`,
+                sha256: (arch === 'x64' ? '5' : '6').repeat(64),
+                sizeBytes: 999,
+                compat: { os: 'darwin', arch, nodeVersion: 'v24.16.0' },
+              },
+            },
+          },
+        },
+      }), 'utf8');
+      return { bytes, sha: sha256(bytes) };
+    };
+
+    const rmX64 = makeMacReleaseManifest('x64');
+    const rmArm64 = makeMacReleaseManifest('arm64');
+    expect(rmX64.sha).not.toBe(rmArm64.sha);
+
+    const credential = { serverUrl: 'https://im.example', serverId: 'srv-intel-mac', token: 'tok', nodeId: '3394857735' } as never;
+
+    const buildMacFetch = (pinnedMode: 'match_runtime_header' | 'buggy_arm64_pin' | 'omit_header') => {
+      const seenHeaders: Array<{ url: string; runtimeArch: string | null }> = [];
+      const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
+        const runtimeArch = new Headers(init?.headers).get(CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH);
+        seenHeaders.push({ url, runtimeArch });
+        if (url.includes(`asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.DESKTOP_RELEASE_MANIFEST}`)) {
+          const parsedUrl = new URL(url);
+          const rm = parsedUrl.searchParams.get('arch') === 'arm64' ? rmArm64 : rmX64;
+          return new Response(rm.bytes, {
+            status: 200,
+            headers: {
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: rm.sha,
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(rm.bytes.length),
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: `desktop-release-darwin-${parsedUrl.searchParams.get('arch')}.manifest.json`,
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: version,
+            },
+          });
+        }
+        if (url.includes(`asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER}`)) {
+          return new Response(ocuBytes, {
+            status: 200,
+            headers: {
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: sha256(ocuBytes),
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(ocuBytes.length),
+              [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'open-computer-use.app.zip',
+            },
+          });
+        }
+        const headers: Record<string, string> = {
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256]: nodeSha,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES]: String(nodeBytes.length),
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME]: 'imcodes-node-macos',
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION]: version,
+        };
+        if (pinnedMode === 'match_runtime_header') {
+          headers[CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256] = runtimeArch === 'x64' ? rmX64.sha : rmArm64.sha;
+        } else if (pinnedMode === 'buggy_arm64_pin') {
+          headers[CONTROLLED_NODE_ARTIFACT_HEADERS.RELEASE_MANIFEST_SHA256] = rmArm64.sha;
+        }
+        return new Response(nodeBytes, { status: 200, headers });
+      });
+      return { fetchImpl, seenHeaders };
+    };
+
+    // 1. Fixed server + client: sends x-imcodes-node-runtime-arch: x64 on every request, fetches arch=x64 manifest, succeeds!
+    const okDir = makeTempDir('cn-rm-mac-x64-ok-');
+    const okMock = buildMacFetch('match_runtime_header');
+    const scheduledOk: string[] = [];
+    const okRes = await startControlledNodeSelfUpgrade(credential, version, {
+      platform: 'darwin',
+      arch: 'x64',
+      execPath: join(okDir, 'imcodes-node-macos'),
+      journalPath: join(okDir, 'install-journal.json'),
+      tmpdir: () => okDir,
+      spawnDetached: (_cmd, args) => { scheduledOk.push(args[0] ?? ''); },
+      sleep: async () => {},
+      fetchImpl: okMock.fetchImpl as unknown as typeof fetch,
+    });
+    expect(okRes).toMatchObject({ ok: true, targetVersion: version, artifactSha256: nodeSha });
+    expect(scheduledOk).toHaveLength(1);
+    expect(okMock.seenHeaders.length).toBeGreaterThanOrEqual(3);
+    expect(okMock.seenHeaders.every((entry) => entry.runtimeArch === 'x64')).toBe(true);
+    expect(okMock.seenHeaders.some((entry) => entry.url.includes('asset=desktop-release-manifest') && entry.url.includes('arch=x64'))).toBe(true);
+
+    // 2. Counterexample reproducing original bug: server wrongly pinning arm64 manifest SHA fails cleanly before scheduling.
+    const badDir = makeTempDir('cn-rm-mac-x64-bad-');
+    const badMock = buildMacFetch('buggy_arm64_pin');
+    const scheduledBad: string[] = [];
+    await expect(startControlledNodeSelfUpgrade(credential, version, {
+      platform: 'darwin',
+      arch: 'x64',
+      execPath: join(badDir, 'imcodes-node-macos'),
+      journalPath: join(badDir, 'install-journal.json'),
+      tmpdir: () => badDir,
+      spawnDetached: (_cmd, args) => { scheduledBad.push(args[0] ?? ''); },
+      sleep: async () => {},
+      fetchImpl: badMock.fetchImpl as unknown as typeof fetch,
+    })).rejects.toThrow('release_manifest_pinned_sha256_mismatch');
+    expect(scheduledBad).toHaveLength(0);
+
+    // 3. Unknown-arch compatibility fallback (server omits ambiguous header) completes cleanly without false failure.
+    const compatDir = makeTempDir('cn-rm-mac-x64-compat-');
+    const compatMock = buildMacFetch('omit_header');
+    const scheduledCompat: string[] = [];
+    const compatRes = await startControlledNodeSelfUpgrade(credential, version, {
+      platform: 'darwin',
+      arch: 'x64',
+      execPath: join(compatDir, 'imcodes-node-macos'),
+      journalPath: join(compatDir, 'install-journal.json'),
+      tmpdir: () => compatDir,
+      spawnDetached: (_cmd, args) => { scheduledCompat.push(args[0] ?? ''); },
+      sleep: async () => {},
+      fetchImpl: compatMock.fetchImpl as unknown as typeof fetch,
+    });
+    expect(compatRes).toMatchObject({ ok: true, targetVersion: version, artifactSha256: nodeSha });
+    expect(scheduledCompat).toHaveLength(1);
   });
 });
