@@ -164,6 +164,8 @@ interface PiSessionState {
   terminalError: string | null;
   terminalAborted: boolean;
   lastUsage?: ProviderUsageUpdate['usage'];
+  modelContextWindow?: { provider: string; modelId: string; contextWindow: number };
+  catalogContextWindows?: Map<string, number>;
   sessionSystemTextInjected?: string;
   pendingSessionSystemText?: string;
   toolNames: Map<string, string>;
@@ -213,6 +215,10 @@ function modelInfo(value: unknown): { id?: string; name?: string; provider?: str
     provider: typeof model?.provider === 'string' ? model.provider : undefined,
     ...(contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {}),
   };
+}
+
+function modelWindowKey(provider: string | undefined, modelId: string): string {
+  return JSON.stringify([provider?.trim() ?? '', modelId.trim()]);
 }
 
 function resolveAttachmentImageMime(attachment: TransportAttachment): string | null {
@@ -312,7 +318,6 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
   private readonly questions = new PendingQuestionRegistry<PiQuestionOutcome>();
   private readonly pendingQuestionMeta = new Map<string, PiPendingQuestionMeta>();
   private modelCache: { at: number; value: ProviderModelList } | null = null;
-  private modelContextWindows = new Map<string, number>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
@@ -331,7 +336,6 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     this.questions.releaseAll();
     this.pendingQuestionMeta.clear();
     this.modelCache = null;
-    this.modelContextWindows.clear();
     this.config = null;
     logger.info({ provider: this.id }, 'Pi provider disconnected');
   }
@@ -634,12 +638,14 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
             const switched = modelInfo(response.data);
             state.model = switched.id ?? modelId;
             state.provider = switched.provider ?? provider;
-            this.recordModelContextWindow(state.provider, state.model, switched.contextWindow);
+            this.setSessionModelContextWindow(state, state.provider, state.model, switched.contextWindow);
             this.emitInfo(sessionId, { model: state.model });
             void this.syncAvailableThinkingLevels(state);
           })
           .catch(() => {
             if (!state.incognito && state.child === child && !state.disposed) {
+              state.modelContextWindow = undefined;
+              state.catalogContextWindows = undefined;
               this.detachChild(state);
               void this.stopChild(state, child);
             }
@@ -649,6 +655,8 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     }
     if (state.incognito) return;
     if (child) {
+      state.modelContextWindow = undefined;
+      state.catalogContextWindows = undefined;
       this.detachChild(state);
       void this.stopChild(state, child);
     }
@@ -690,24 +698,28 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
       }
       const models: ProviderModelInfo[] = [];
       const seen = new Set<string>();
+      const catalogContextWindows = new Map<string, number>();
       for (const entry of rawModels) {
         const record = asRecord(entry);
         const rawId = typeof record?.id === 'string' ? record.id.trim() : '';
         if (!rawId) continue;
         const provider = typeof record?.provider === 'string' ? record.provider.trim() : '';
+        const contextWindow = numeric(record?.contextWindow);
+        if (contextWindow !== undefined && contextWindow > 0) {
+          catalogContextWindows.set(modelWindowKey(provider, rawId), contextWindow);
+        }
         const id = provider && !rawId.includes('/') ? `${provider}/${rawId}` : rawId;
         if (seen.has(id)) continue;
         seen.add(id);
         const rawName = typeof record?.name === 'string' && record.name.trim() ? record.name.trim() : rawId;
         const name = provider && !rawName.startsWith(provider) ? `${provider} · ${rawName}` : rawName;
-        const contextWindow = numeric(record?.contextWindow);
-        this.recordModelContextWindow(provider, rawId, contextWindow);
         models.push({
           id,
           name,
           ...(record?.reasoning === true ? { supportsReasoningEffort: true } : {}),
         });
       }
+      probeState.catalogContextWindows = catalogContextWindows;
       const list: ProviderModelList = {
         models,
         ...(models.length > 0 ? { isAuthenticated: true } : {}),
@@ -799,6 +811,8 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
       },
     ));
     state.child = child;
+    state.modelContextWindow = undefined;
+    state.catalogContextWindows = undefined;
     // Crash coverage: if the daemon dies without running teardown, the startup
     // sweep reaps this group using the registry's process-start fingerprint.
     state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
@@ -1179,12 +1193,21 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     const text = extractTextContent(message.content);
     if (text) state.committedSegments.push(text);
     const info = modelInfo(message);
+    const prevProvider = state.provider?.trim() ?? '';
+    const prevModel = state.model?.trim() ?? '';
     // Pi assistant messages carry `model` as the model id string, whereas
     // get_state returns the full model object. Accept both authoritative shapes
     // so usage/final metadata follows provider switches made by Pi itself.
     const messageModel = typeof message.model === 'string' ? message.model : info.id;
     if (messageModel) state.model = messageModel;
     if (info.provider) state.provider = info.provider;
+    const nextProvider = state.provider?.trim() ?? '';
+    const nextModel = state.model?.trim() ?? '';
+    if (info.contextWindow !== undefined) {
+      this.setSessionModelContextWindow(state, nextProvider, nextModel, info.contextWindow);
+    } else if (nextProvider !== prevProvider || nextModel !== prevModel) {
+      state.modelContextWindow = undefined;
+    }
     this.captureUsage(state, message.usage);
     if (message.stopReason === 'error') state.terminalError = typeof message.errorMessage === 'string' ? message.errorMessage : 'Pi turn failed';
     if (message.stopReason === 'aborted') state.terminalAborted = true;
@@ -1193,10 +1216,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
   private captureUsage(state: PiSessionState, value: unknown): void {
     const usage = asRecord(value);
     if (!usage) return;
-    const contextWindow = state.model
-      ? (this.modelContextWindows.get(state.provider ? `${state.provider}/${state.model}` : state.model)
-        ?? this.modelContextWindows.get(state.model))
-      : undefined;
+    const contextWindow = this.resolveSessionModelContextWindow(state);
     const normalized = {
       ...(numeric(usage.input) !== undefined ? { input_tokens: numeric(usage.input) } : {}),
       ...(numeric(usage.output) !== undefined ? { output_tokens: numeric(usage.output) } : {}),
@@ -1249,13 +1269,33 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     for (const cb of this.completeCallbacks) cb(state.routeId, completion);
   }
 
-  private recordModelContextWindow(provider: string | undefined, modelId: string | undefined, contextWindow: number | undefined): void {
+  private setSessionModelContextWindow(
+    state: PiSessionState,
+    provider: string | undefined,
+    modelId: string | undefined,
+    contextWindow: number | undefined,
+  ): void {
     const rawId = modelId?.trim();
-    if (!rawId || contextWindow === undefined || !Number.isFinite(contextWindow) || contextWindow <= 0) return;
-    const prov = provider?.trim();
-    const id = prov && !rawId.includes('/') ? `${prov}/${rawId}` : rawId;
-    this.modelContextWindows.set(id, contextWindow);
-    this.modelContextWindows.set(rawId, contextWindow);
+    if (!rawId || contextWindow === undefined || !Number.isFinite(contextWindow) || contextWindow <= 0) {
+      state.modelContextWindow = undefined;
+      return;
+    }
+    state.modelContextWindow = {
+      provider: provider?.trim() ?? '',
+      modelId: rawId,
+      contextWindow,
+    };
+  }
+
+  private resolveSessionModelContextWindow(state: PiSessionState): number | undefined {
+    const rawId = state.model?.trim();
+    if (!rawId) return undefined;
+    const provider = state.provider?.trim() ?? '';
+    const snapshot = state.modelContextWindow;
+    if (snapshot && snapshot.provider === provider && snapshot.modelId === rawId) {
+      return snapshot.contextWindow;
+    }
+    return state.catalogContextWindows?.get(modelWindowKey(provider, rawId));
   }
 
   private applyStateResponse(state: PiSessionState, value: unknown): void {
@@ -1263,7 +1303,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     const model = modelInfo(data?.model);
     if (model.id) state.model = model.id;
     if (model.provider) state.provider = model.provider;
-    this.recordModelContextWindow(state.provider, state.model, model.contextWindow);
+    this.setSessionModelContextWindow(state, state.provider, state.model, model.contextWindow);
     const effort = data?.thinkingLevel;
     if (isTransportEffortLevel(effort)) state.effort = effort;
     this.emitInfo(state.routeId, {

@@ -882,4 +882,205 @@ describe('PiProvider', () => {
       },
     });
   });
+
+  it('isolates contextWindow per session and (provider, rawModelId) across interleaved sessions, slash IDs, and 1.6.x fallback', async () => {
+    const childA = new FakePiChild();
+    const childB = new FakePiChild();
+    let spawnIndex = 0;
+    spawnMock.mockImplementation(() => {
+      spawnIndex += 1;
+      return spawnIndex === 1 ? childA : childB;
+    });
+
+    childA.onCommand = (cmd) => {
+      if (cmd.type === PI_RPC_COMMAND.GET_STATE) {
+        return {
+          success: true,
+          data: {
+            sessionId: 'pi-a',
+            model: { id: 'shared-preset', provider: 'custom-llm', contextWindow: 100_000 },
+            thinkingLevel: 'medium',
+          },
+        };
+      }
+      if (cmd.type === PI_RPC_COMMAND.SET_MODEL) {
+        // Switching to a legacy Pi 1.6.x model with no contextWindow reported
+        return { success: true };
+      }
+      if (cmd.type === PI_RPC_COMMAND.GET_AVAILABLE_MODELS) {
+        return {
+          success: true,
+          data: {
+            models: [
+              { id: 'a', provider: 'direct', contextWindow: 111_000 },
+              { id: 'direct/a', provider: 'router', contextWindow: 222_000 },
+              { id: 'shared-bare', provider: 'alpha', contextWindow: 333_000 },
+            ],
+          },
+        };
+      }
+      return undefined;
+    };
+    childB.onCommand = (cmd) => {
+      if (cmd.type === PI_RPC_COMMAND.GET_STATE) {
+        return {
+          success: true,
+          data: {
+            sessionId: 'pi-b',
+            model: { id: 'shared-preset', provider: 'custom-llm', contextWindow: 200_000 },
+            thinkingLevel: 'medium',
+          },
+        };
+      }
+      return undefined;
+    };
+
+    const usageBySession: Record<string, Array<{ usage?: Record<string, unknown>; model?: string }>> = {};
+    provider.onUsage((sid, u) => {
+      (usageBySession[sid] ??= []).push(u as { usage?: Record<string, unknown>; model?: string });
+    });
+
+    const sessionA = await provider.createSession({ sessionKey: 'route-a', sessionName: 'deck_a', cwd: '/tmp' });
+    await provider.send(sessionA, 'turn A1');
+    childA.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: {
+        role: 'assistant',
+        model: 'shared-preset',
+        content: [{ type: 'text', text: 'a1' }],
+        usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    expect(usageBySession[sessionA]?.at(-1)?.usage).toMatchObject({
+      input_tokens: 100,
+      output_tokens: 10,
+      model_context_window: 100_000,
+    });
+
+    // Start Session B with same (provider, modelId) but different contextWindow (200_000)
+    const sessionB = await provider.createSession({ sessionKey: 'route-b', sessionName: 'deck_b', cwd: '/tmp' });
+    await provider.send(sessionB, 'turn B1');
+    childB.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: {
+        role: 'assistant',
+        model: 'shared-preset',
+        content: [{ type: 'text', text: 'b1' }],
+        usage: { input: 200, output: 20, cacheRead: 0, cacheWrite: 0 },
+      },
+    });
+    expect(usageBySession[sessionB]?.at(-1)?.usage).toMatchObject({
+      input_tokens: 200,
+      output_tokens: 20,
+      model_context_window: 200_000,
+    });
+
+    // Session A's subsequent usage must remain bound to 100_000 (not overwritten by B's 200_000)
+    childA.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_UPDATE,
+      usage: { input: 150, output: 15, cacheRead: 0, cacheWrite: 0 },
+      assistantMessageEvent: { type: PI_ASSISTANT_EVENT.TEXT_DELTA, contentIndex: 0, delta: 'still A' },
+    });
+    expect(usageBySession[sessionA]?.at(-1)?.usage).toMatchObject({
+      input_tokens: 150,
+      output_tokens: 15,
+      model_context_window: 100_000,
+    });
+    childA.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    childB.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await flush();
+
+    // Switching Session A to a Pi 1.6.x model without contextWindow clears old 100_000 window
+    // while still reporting actual token usage
+    provider.setSessionAgentId(sessionA, 'legacy/old-model');
+    await flush();
+    await provider.send(sessionA, 'turn A2');
+    childA.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: {
+        role: 'assistant',
+        model: 'old-model',
+        content: [{ type: 'text', text: 'a2' }],
+        usage: { input: 300, output: 30, cacheRead: 5, cacheWrite: 2 },
+      },
+    });
+    const legacyUsage = usageBySession[sessionA]?.at(-1)?.usage;
+    expect(legacyUsage).toEqual({
+      input_tokens: 300,
+      output_tokens: 30,
+      cache_read_input_tokens: 5,
+      cache_creation_input_tokens: 2,
+    });
+    expect(legacyUsage).not.toHaveProperty('model_context_window');
+    childA.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await flush();
+
+    // Probe catalog via Session A (first live session): disambiguate direct/a vs router/direct/a and block cross-provider bare-ID fallback
+    await provider.listModels(true);
+    await provider.send(sessionA, 'turn A3');
+    // Update A to router + direct/a via message_end (clear old snapshot, fall back to A's catalog tuple)
+    childA.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: {
+        role: 'assistant',
+        provider: 'router',
+        model: 'direct/a',
+        content: [{ type: 'text', text: 'a3' }],
+        usage: { input: 400, output: 40 },
+      },
+    });
+    expect(usageBySession[sessionA]?.at(-1)?.usage).toMatchObject({
+      input_tokens: 400,
+      output_tokens: 40,
+      model_context_window: 222_000,
+    });
+
+    // direct + a resolves its own 111_000 tuple on Session A
+    childA.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: {
+        role: 'assistant',
+        provider: 'direct',
+        model: 'a',
+        content: [{ type: 'text', text: 'a4' }],
+        usage: { input: 410, output: 41 },
+      },
+    });
+    expect(usageBySession[sessionA]?.at(-1)?.usage).toMatchObject({
+      input_tokens: 410,
+      output_tokens: 41,
+      model_context_window: 111_000,
+    });
+
+    // Different provider (beta) with same bare ID (shared-bare) must NOT borrow alpha's 333_000
+    childA.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: {
+        role: 'assistant',
+        provider: 'beta',
+        model: 'shared-bare',
+        content: [{ type: 'text', text: 'a5' }],
+        usage: { input: 420, output: 42 },
+      },
+    });
+    const crossProviderUsage = usageBySession[sessionA]?.at(-1)?.usage;
+    expect(crossProviderUsage).toEqual({ input_tokens: 420, output_tokens: 42 });
+    expect(crossProviderUsage).not.toHaveProperty('model_context_window');
+
+    // Session B must NOT borrow Session A's probed catalog either
+    await provider.send(sessionB, 'turn B2');
+    childB.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: {
+        role: 'assistant',
+        provider: 'direct',
+        model: 'a',
+        content: [{ type: 'text', text: 'b2' }],
+        usage: { input: 500, output: 50 },
+      },
+    });
+    const sessionBUsingACatalog = usageBySession[sessionB]?.at(-1)?.usage;
+    expect(sessionBUsingACatalog).toEqual({ input_tokens: 500, output_tokens: 50 });
+    expect(sessionBUsingACatalog).not.toHaveProperty('model_context_window');
+  });
 });
