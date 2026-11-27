@@ -150,16 +150,54 @@ describe('sanitizeVoiceTranscriptWithHotwords & resolveSessionTranscriptResult h
     const r3 = resolveSessionTranscriptResult(`Codex，${'IM.codes。'.repeat(6)}`, true, r2.nextLastNonEmptyText, hotwords);
     expect(r3).toEqual({ emit: true, text: '打开 IM.codes', nextLastNonEmptyText: '打开 IM.codes' });
 
-    // Provisional single hotword interim MUST NOT be cached into lastNonEmptyText or resurrected on empty/echo final
+    // Isolated single-hotword interim MUST be held back (emit: false) so legacy clients without
+    // hotwords and end-only sessions never receive or resurrect it on echo/empty final or end.
     const p1 = resolveSessionTranscriptResult('IM.codes', false, '', ['IM.codes']);
-    expect(p1).toEqual({ emit: true, text: 'IM.codes', nextLastNonEmptyText: '' });
+    expect(p1).toEqual({ emit: false, text: '', nextLastNonEmptyText: '' });
     const p2EchoFinal = resolveSessionTranscriptResult('IM.codes，IM.codes。', true, p1.nextLastNonEmptyText, ['IM.codes']);
     expect(p2EchoFinal).toEqual({ emit: true, text: '', nextLastNonEmptyText: '' });
     const p2EmptyFinal = resolveSessionTranscriptResult('', true, p1.nextLastNonEmptyText, ['IM.codes']);
     expect(p2EmptyFinal).toEqual({ emit: true, text: '', nextLastNonEmptyText: '' });
 
-    // Direct audible single-hotword final still emits cleanly
+    // Feed new relay frames through legacy baseline resolver (without hotwords): never resurrects "IM.codes"
+    for (const seq of [
+      [{ text: 'IM.codes', isFinal: false }, { text: 'IM.codes，IM.codes。', isFinal: true }],
+      [{ text: 'IM.codes', isFinal: false }, { text: '', isFinal: true }],
+      [{ text: 'IM.codes', isFinal: false }, { text: 'IM.codes，IM.codes。', isFinal: false }],
+    ]) {
+      let relayLast = '';
+      let legacyLast = '';
+      const relayFrames: Array<{ text: string; isFinal: boolean }> = [];
+      const legacyOutputs: Array<{ text: string; isFinal: boolean }> = [];
+      for (const f of seq) {
+        const relayed = resolveSessionTranscriptResult(f.text, f.isFinal, relayLast, ['IM.codes']);
+        relayLast = relayed.nextLastNonEmptyText;
+        if (relayed.emit) relayFrames.push({ text: relayed.text, isFinal: f.isFinal });
+      }
+      for (const rf of relayFrames) {
+        const consumed = resolveSessionTranscriptResult(rf.text, rf.isFinal, legacyLast);
+        legacyLast = consumed.nextLastNonEmptyText;
+        if (consumed.emit) legacyOutputs.push({ text: consumed.text, isFinal: rf.isFinal });
+      }
+      expect(legacyOutputs.every((o) => o.text === '')).toBe(true);
+    }
+
+    // Explicit audible single-hotword final still emits cleanly on both relay and legacy client
     const pSingleFinal = resolveSessionTranscriptResult('IM.codes', true, '', ['IM.codes']);
     expect(pSingleFinal).toEqual({ emit: true, text: 'IM.codes', nextLastNonEmptyText: '' });
+    expect(resolveSessionTranscriptResult(pSingleFinal.text, true, '')).toEqual({
+      emit: true,
+      text: 'IM.codes',
+      nextLastNonEmptyText: 'IM.codes',
+    });
+
+    // Baseline without hotwords keeps caching normal non-empty interims across empty final
+    const b1 = resolveSessionTranscriptResult('IM.codes', false, '');
+    expect(b1).toEqual({ emit: true, text: 'IM.codes', nextLastNonEmptyText: 'IM.codes' });
+    expect(resolveSessionTranscriptResult('', true, b1.nextLastNonEmptyText)).toEqual({
+      emit: true,
+      text: 'IM.codes',
+      nextLastNonEmptyText: 'IM.codes',
+    });
   });
 });

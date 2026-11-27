@@ -19,6 +19,7 @@ import {
   isValidRemoteVoiceModelRegistration,
   parseRemoteVoiceInboundFrame,
   resolveOpenAiTranscriptionEndpoint,
+  resolveSessionTranscriptResult,
   sanitizeCrossAccountOwnerLabel,
   sanitizeRemoteVoiceNickname,
   sanitizeRemoteVoiceProviderErrorCode,
@@ -2898,7 +2899,8 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
       { type: 'voice.session.result', sessionId: 'pc-tag-order', text: '打开 IM.codes', isFinal: true },
     ]);
 
-    // 3. PC provider relay: provisional single hotword interim ("IM.codes") must NOT resurrect on empty or echo final
+    // 3. PC provider relay: isolated provisional single-hotword interim ("IM.codes") is held back at relay
+    //    so legacy clients (without hotwords) and end-only paths never receive or resurrect it.
     for (const [sid, finalRaw] of [
       ['pc-provisional-echo', 'IM.codes，IM.codes。'],
       ['pc-provisional-empty', 'language None<asr_text>'],
@@ -2924,11 +2926,70 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
         isFinal: true,
       }));
       await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.end', sessionId: sid }));
-      expect(clientSent.filter((f) => f.sessionId === sid && f.type === 'voice.session.result')).toEqual([
-        { type: 'voice.session.result', sessionId: sid, text: 'IM.codes', isFinal: false },
+      const relayed = clientSent.filter((f) => f.sessionId === sid && f.type === 'voice.session.result');
+      expect(relayed).toEqual([
         { type: 'voice.session.result', sessionId: sid, text: '', isFinal: true },
       ]);
+      // Simulate legacy consumer without hotwords:
+      let legacyLast = '';
+      for (const rf of relayed) {
+        const legacy = resolveSessionTranscriptResult(String(rf.text), Boolean(rf.isFinal), legacyLast);
+        legacyLast = legacy.nextLastNonEmptyText;
+        expect(legacy.text).toBe('');
+      }
     }
+
+    // 4. PC provider relay: provisional single hotword -> echo interim -> end only -> zero result frames on wire
+    await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-provisional-end-only',
+      targetDeviceId: 'mac-order',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes'],
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.ready', sessionId: 'pc-provisional-end-only' }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-provisional-end-only',
+      text: 'IM.codes',
+      isFinal: false,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-provisional-end-only',
+      text: 'IM.codes，IM.codes。',
+      isFinal: false,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-provisional-end-only' }));
+    expect(clientSent.filter((f) => f.sessionId === 'pc-provisional-end-only' && f.type === 'voice.session.result')).toEqual([]);
+    expect(clientSent).toContainEqual({ type: 'voice.session.end', sessionId: 'pc-provisional-end-only' });
+
+    // 5. Explicit single-hotword final passes through relay
+    await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-explicit-single-final',
+      targetDeviceId: 'mac-order',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes'],
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.ready', sessionId: 'pc-explicit-single-final' }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-explicit-single-final',
+      text: 'IM.codes',
+      isFinal: false,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-explicit-single-final',
+      text: 'IM.codes',
+      isFinal: true,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-explicit-single-final' }));
+    expect(clientSent.filter((f) => f.sessionId === 'pc-explicit-single-final' && f.type === 'voice.session.result')).toEqual([
+      { type: 'voice.session.result', sessionId: 'pc-explicit-single-final', text: 'IM.codes', isFinal: true },
+    ]);
+
     expect(hub.getActiveSessionCount()).toBe(0);
     hub.stop();
   });

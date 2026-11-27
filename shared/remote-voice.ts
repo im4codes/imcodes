@@ -935,9 +935,17 @@ export function resolveSessionTranscriptResult(
         || (compiled.asrTerms?.length ?? 0) > 0
         || (compiled.replacements?.length ?? 0) > 0;
     }
-    // An isolated single hotword stays provisional rather than updating fallback history,
-    // so a subsequent echo loop or empty final cannot resurrect it as final text.
+    // An isolated single hotword stays provisional rather than emitted as an interim or
+    // cached into fallback history, so legacy clients, end-only paths, and subsequent
+    // echo/empty finals cannot resurrect it as final text.
     const isTrusted = !hasHotwords || stripVoiceHotwordHallucination(sanitized, hotwords, { silentAudio: true }).length > 0;
+    if (!isFinal && !isTrusted) {
+      return {
+        emit: false,
+        text: '',
+        nextLastNonEmptyText: lastNonEmptyText,
+      };
+    }
     return {
       emit: true,
       text: sanitized,

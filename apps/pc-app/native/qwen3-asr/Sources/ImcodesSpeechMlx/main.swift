@@ -966,6 +966,15 @@ final class QwenSegmentedDecodeEngine {
 
                 if activeText.isEmpty && !hasSpeechEnergy(segmentCopy) {
                     // Pure silence / faint noise floor: skip ASR decode so hotwords context cannot hallucinate.
+                    if isFinalPass && (!lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal) {
+                        let finalCombined = !lastEmittedText.isEmpty ? lastEmittedText : committedText
+                        pendingRetractionFinal = false
+                        emitJsonFn([
+                            "type": "result",
+                            "text": finalCombined,
+                            "isFinal": true,
+                        ])
+                    }
                 } else if let result = try? decodeFn(
                     segmentCopy,
                     prefixCopy,
@@ -1099,7 +1108,6 @@ final class QwenSegmentedDecodeEngine {
                     activeText = ""
                     activeTrustedRealText = ""
                     activePendingSingleHotword = false
-                    pendingRetractionFinal = false
                     confirmedTokens = []
                     lock.lock()
                     activeSegment.removeAll(keepingCapacity: true)

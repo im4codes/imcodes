@@ -4828,7 +4828,8 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
       expect(onSpokenRes).toHaveBeenCalledWith('IM.codes', true);
 
-      // 3. Provisional interim "IM.codes" followed by empty final "" MUST retract instead of resurrecting "IM.codes"
+      // 3. Unpatched-server provisional interim "IM.codes" followed by empty final "" (or end-only)
+      //    is held back by client resolveSessionTranscriptResult so "IM.codes" never emits or resurrects.
       apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-retract' });
       const onRetractRes = vi.fn();
       const startRetract = VoiceInput.startListening(onRetractRes, undefined, undefined, { projectKey: 'proj-remote-guard' });
@@ -4847,16 +4848,35 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       ws3.emitMessage({ type: 'voice.session.end', sessionId: frame3.sessionId });
       await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
       expect(onRetractRes.mock.calls).toEqual([
-        ['IM.codes', false],
         ['', true],
       ]);
+
+      // 3b. Provisional interim "IM.codes" followed by echo interim + end-only never surfaces "IM.codes"
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-end-only' });
+      const onEndOnlyRes = vi.fn();
+      const startEndOnly = VoiceInput.startListening(onEndOnlyRes, undefined, undefined, { projectKey: 'proj-remote-guard' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
+      const ws3b = FakeWebSocket.instances[3]!;
+      ws3b.emitOpen();
+      const frame3b = JSON.parse(ws3b.sent[0]!) as { sessionId: string };
+      ws3b.emitMessage({ type: 'voice.session.ready', sessionId: frame3b.sessionId });
+      await expect(startEndOnly).resolves.toBe(true);
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array([4000, -4000])),
+        level: 0.2,
+      });
+      ws3b.emitMessage({ type: 'voice.session.result', sessionId: frame3b.sessionId, text: 'IM.codes', isFinal: false });
+      ws3b.emitMessage({ type: 'voice.session.result', sessionId: frame3b.sessionId, text: 'IM.codes，IM.codes。', isFinal: false });
+      ws3b.emitMessage({ type: 'voice.session.end', sessionId: frame3b.sessionId });
+      await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
+      expect(onEndOnlyRes).not.toHaveBeenCalled();
 
       // 4. Real sentence interim "打开 IM.codes" followed by empty final "" preserves "打开 IM.codes"
       apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-preserve' });
       const onPreserveRes = vi.fn();
       const startPreserve = VoiceInput.startListening(onPreserveRes, undefined, undefined, { projectKey: 'proj-remote-guard' });
-      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
-      const ws4 = FakeWebSocket.instances[3]!;
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(5));
+      const ws4 = FakeWebSocket.instances[4]!;
       ws4.emitOpen();
       const frame4 = JSON.parse(ws4.sent[0]!) as { sessionId: string };
       ws4.emitMessage({ type: 'voice.session.ready', sessionId: frame4.sessionId });
