@@ -18,6 +18,7 @@ import {
   getSupportedCursorWindowsExts,
   getUnixCursorCandidateDirs,
   getWindowsCursorSearchDirs,
+  KIMI_CLI_PATH_ENV,
   resolveCursorCmdLauncherPlan,
   resolveNodePackageRoot,
 } from './transport-paths.js';
@@ -524,6 +525,15 @@ async function probeOpenClaw(deps: AgentAvailabilityProbeDeps): Promise<AgentAva
   return { installed: false, reason: 'OpenClaw gateway config not found' };
 }
 
+function getKimiPreferredDirs(deps: AgentAvailabilityProbeDeps): string[] {
+  const p = pathModuleFor(deps.platform);
+  const kimiCodeHome = deps.env.KIMI_CODE_HOME?.trim();
+  return uniqueNonEmpty([
+    kimiCodeHome ? p.join(kimiCodeHome, 'bin') : undefined,
+    deps.homeDir ? p.join(deps.homeDir, '.kimi-code', 'bin') : undefined,
+  ]);
+}
+
 async function probeAgentType(agentType: SessionAgentType, deps: AgentAvailabilityProbeDeps): Promise<AgentAvailabilityEntry> {
   switch (agentType) {
     case AGY_SDK_PROVIDER_ID:
@@ -552,8 +562,12 @@ async function probeAgentType(agentType: SessionAgentType, deps: AgentAvailabili
     case 'kimi-sdk':
       return probeBinary(
         deps,
-        'kimi',
-        { trailingDirs: deps.platform === 'win32' ? [] : getUnixAcpPreferredDirs(deps) },
+        deps.env[KIMI_CLI_PATH_ENV]?.trim() || 'kimi',
+        {
+          leadingDirs: getKimiPreferredDirs(deps),
+          trailingDirs: deps.platform === 'win32' ? [] : getUnixAcpPreferredDirs(deps),
+          includeWindowsGlobalNpmDirs: true,
+        },
         'kimi CLI not found',
       );
     case 'muse-code-sdk':

@@ -226,8 +226,8 @@ async function createProvider(id: string, config: ProviderConfig): Promise<Trans
       return new QwenProvider();
     }
     case 'kimi-sdk': {
-      const { KimiSdkProvider } = await import('./providers/kimi-sdk.js');
-      return new KimiSdkProvider();
+      const { KimiV2Provider } = await import('./providers/kimi-v2.js');
+      return new KimiV2Provider();
     }
     case HERMES_AGENT_PROVIDER_ID: {
       const { HermesAcpProvider } = await import('./providers/hermes-acp.js');

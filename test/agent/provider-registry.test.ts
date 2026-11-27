@@ -403,8 +403,8 @@ vi.mock('../../src/agent/providers/opencode-sdk.js', () => ({
   OpenCodeSdkProvider: MockOpenCodeSdkProvider,
 }));
 
-vi.mock('../../src/agent/providers/kimi-sdk.js', () => ({
-  KimiSdkProvider: MockKimiSdkProvider,
+vi.mock('../../src/agent/providers/kimi-v2.js', () => ({
+  KimiV2Provider: MockKimiSdkProvider,
 }));
 
 vi.mock('../../src/agent/providers/hermes-acp.js', () => ({

@@ -1104,6 +1104,76 @@ export function resolveCursorPathForSdk(name = 'cursor-agent'): string {
   return name;
 }
 
+export const KIMI_CLI_PATH_ENV = 'KIMI_CLI_PATH';
+
+function getWindowsKimiInstallCandidates(name: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  const basename = path.win32.basename(name);
+  const hasExt = /\.[^\\/]+$/.test(basename);
+  const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
+  const kimiCodeHome = env.KIMI_CODE_HOME?.trim();
+  const dirs = uniqueNonEmpty([
+    kimiCodeHome ? path.win32.join(kimiCodeHome, 'bin') : undefined,
+    env.USERPROFILE ? path.win32.join(env.USERPROFILE, '.kimi-code', 'bin') : undefined,
+    env.USERPROFILE ? path.win32.join(env.USERPROFILE, '.local', 'bin') : undefined,
+    ...getWindowsGlobalCliDirs(),
+    env.LOCALAPPDATA ? path.win32.join(env.LOCALAPPDATA, 'Programs', 'kimi-code', 'bin') : undefined,
+    env.LOCALAPPDATA ? path.win32.join(env.LOCALAPPDATA, 'bin') : undefined,
+  ]);
+  return dirs.flatMap((dir) => fileNames.map((fileName) => path.win32.join(dir, fileName)));
+}
+
+function getUnixKimiInstallCandidates(env: NodeJS.ProcessEnv = process.env): string[] {
+  const home = env.HOME?.trim();
+  const kimiCodeHome = env.KIMI_CODE_HOME?.trim();
+  return uniqueNonEmpty([
+    kimiCodeHome ? path.join(kimiCodeHome, 'bin', 'kimi') : undefined,
+    home ? path.join(home, '.kimi-code', 'bin', 'kimi') : undefined,
+    home ? path.join(home, '.local', 'bin', 'kimi') : undefined,
+    home ? path.join(home, '.npm-global', 'bin', 'kimi') : undefined,
+    '/opt/homebrew/bin/kimi',
+    '/usr/local/bin/kimi',
+    '/usr/bin/kimi',
+    '/bin/kimi',
+  ]);
+}
+
+/** Resolve a CLI path for Kimi Code CLI (`kimi`).
+ *  Supports both Kimi Code CLI v2 (`@moonshot-ai/kimi-code`, `~/.kimi-code/bin/kimi`, `$KIMI_CODE_HOME/bin/kimi`)
+ *  and legacy Python `kimi-cli` 1.x (`~/.local/bin/kimi`) under sparse daemon PATHs. */
+export function resolveKimiPathForSdk(name = 'kimi', env: NodeJS.ProcessEnv = process.env): string {
+  const override = name === 'kimi' ? env[KIMI_CLI_PATH_ENV]?.trim() : undefined;
+  if (override && existsSync(override)) {
+    if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(override)) {
+      return parseNpmCmdShim(override) ?? override;
+    }
+    return override;
+  }
+  if (process.platform === 'win32') {
+    if (isAbsoluteSmart(name) || hasPathSeparator(name)) {
+      if (/\.(cmd|bat)$/i.test(name)) {
+        return parseNpmCmdShim(name) ?? name;
+      }
+      return name;
+    }
+    const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsKimiInstallCandidates(name, env));
+    if (/\.(cmd|bat)$/i.test(resolved)) {
+      return parseNpmCmdShim(resolved) ?? resolved;
+    }
+    return resolved;
+  }
+  if (name !== 'kimi') {
+    if (path.isAbsolute(name) || hasPathSeparator(name)) return name;
+    for (const candidate of getUnixKimiInstallCandidates(env)) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  for (const candidate of getUnixKimiInstallCandidates(env)) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return name;
+}
+
 
 /** Result of resolving a binary that may be an npm .cmd shim.
  *  When the resolved path is a real .exe, just `{ executable }`.

@@ -33,7 +33,7 @@ const SESSION_OWNED = [
  * a shared process under one session's owner would let that session's teardown
  * reap another session's live agent.
  */
-const DAEMON_SHARED = ['codex-sdk', 'kimi-sdk'];
+const DAEMON_SHARED = ['codex-sdk', 'kimi-sdk', 'kimi-v2'];
 
 const ALL = [...SESSION_OWNED, ...DAEMON_SHARED];
 

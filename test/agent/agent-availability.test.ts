@@ -374,6 +374,29 @@ describe('detectInstalledAgents()', () => {
     expect(result['pi']?.installed).toBe(true);
   });
 
+  it('detects kimi-sdk in Kimi Code CLI v2 (~/.kimi-code/bin) and KIMI_CODE_HOME/KIMI_CLI_PATH', async () => {
+    const v2Deps = createFakeDeps({
+      env: { PATH: '/usr/bin' },
+      homeDir: '/home/alice',
+      executables: ['/home/alice/.kimi-code/bin/kimi'],
+    });
+    expect((await detectInstalledAgents({ deps: v2Deps }))['kimi-sdk']?.installed).toBe(true);
+
+    const customHomeDeps = createFakeDeps({
+      env: { PATH: '/usr/bin', KIMI_CODE_HOME: '/opt/kimi-code-home' },
+      homeDir: '/home/alice',
+      executables: ['/opt/kimi-code-home/bin/kimi'],
+    });
+    expect((await detectInstalledAgents({ deps: customHomeDeps }))['kimi-sdk']?.installed).toBe(true);
+
+    const overrideDeps = createFakeDeps({
+      env: { PATH: '/usr/bin', KIMI_CLI_PATH: '/custom/bin/kimi-v2' },
+      homeDir: '/home/alice',
+      executables: ['/custom/bin/kimi-v2'],
+    });
+    expect((await detectInstalledAgents({ deps: overrideDeps }))['kimi-sdk']?.installed).toBe(true);
+  });
+
   it('detects openclaw availability from connected provider or local gateway config', async () => {
     const configDeps = createFakeDeps({
       files: ['/home/alice/.openclaw/openclaw.json'],
