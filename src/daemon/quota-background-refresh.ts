@@ -13,7 +13,6 @@ const EMPTY_RESULT_COOLDOWN_MS = 60_000;
 
 const inFlightRefreshes = new Set<BackgroundQuotaProviderKey>();
 const emptyRefreshCooldownUntil = new Map<BackgroundQuotaProviderKey, number>();
-const lastNotifiedSnapshots = new Map<BackgroundQuotaProviderKey, string>();
 const listeners = new Set<BackgroundQuotaChangedListener>();
 
 export function serializeQuotaSnapshot(
@@ -83,10 +82,9 @@ export function scheduleBackgroundQuotaRefresh<T>(
       emptyRefreshCooldownUntil.delete(key);
       if (!serializeResult) return;
       const nextSnapshot = serializeResult(result);
-      if (!nextSnapshot || nextSnapshot === beforeSnapshot || nextSnapshot === lastNotifiedSnapshots.get(key)) {
+      if (!nextSnapshot || nextSnapshot === beforeSnapshot) {
         return;
       }
-      lastNotifiedSnapshots.set(key, nextSnapshot);
       for (const listener of [...listeners]) {
         try {
           listener(key);
@@ -103,9 +101,8 @@ export function scheduleBackgroundQuotaRefresh<T>(
     });
 }
 
-/** Test seam — clear in-flight, cooldown, and last-notified snapshots (preserves registered command-handler listeners). */
+/** Test seam — clear in-flight and empty-result cooldowns (preserves registered command-handler listeners). */
 export function __resetBackgroundQuotaRefreshForTests(): void {
   inFlightRefreshes.clear();
   emptyRefreshCooldownUntil.clear();
-  lastNotifiedSnapshots.clear();
 }

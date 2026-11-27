@@ -279,6 +279,36 @@ describe('non-blocking buildSessionList & buildSubSessionSyncPayload', () => {
     // Must NOT loop after pushing the new snapshot
     await new Promise((r) => setTimeout(r, 30));
     expect(sentFrames).toHaveLength(2);
+
+    // Cycle 2: simulate opt-out clearing provider quota cache, then opt-in with the same quota X.
+    // The new cold-cache cycle (beforeSnapshot = null) must push X again once instead of suppressing
+    // it because of the earlier push before cache clear.
+    cachedClaudeQuota = null;
+    let resolveSecondClaudeProbe!: (v: typeof cachedClaudeQuota) => void;
+    quotaMocks.getClaudeUsageQuota.mockImplementationOnce(
+      async () =>
+        new Promise<typeof cachedClaudeQuota>((resolve) => {
+          resolveSecondClaudeProbe = resolve;
+        }) as never,
+    );
+
+    handleWebCommand({ type: 'get_sessions' }, serverLink as never);
+    await vi.waitFor(() => expect(sentFrames).toHaveLength(3));
+    const thirdSessions = sentFrames[2]!.sessions as Array<Record<string, unknown>>;
+    expect(thirdSessions.find((s) => s.name === 'deck_claude_push_brain')?.quotaLabel).toBeUndefined();
+
+    cachedClaudeQuota = freshQuota;
+    resolveSecondClaudeProbe(freshQuota);
+
+    await vi.waitFor(() => expect(sentFrames).toHaveLength(4));
+    const fourthSessions = sentFrames[3]!.sessions as Array<Record<string, unknown>>;
+    expect(fourthSessions.find((s) => s.name === 'deck_claude_push_brain')).toMatchObject({
+      quotaLabel: '5h 18% · 7d 42%',
+      quotaMeta: freshQuota.quotaMeta,
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(sentFrames).toHaveLength(4);
   });
 
   it('queues background authLimit probe for known qwen-oauth sessions and pushes updated session_list once resolved', async () => {
