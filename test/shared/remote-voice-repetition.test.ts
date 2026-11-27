@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   resolveSessionTranscriptResult,
   sanitizeAsrRepetitionLoop,
+  sanitizeVoiceTranscriptWithHotwords,
   stripAsrControlTags,
 } from '../../shared/remote-voice.js';
 
@@ -111,5 +112,42 @@ describe('sanitizeAsrRepetitionLoop', () => {
 
     expect(result).toBe(uniqueLongText);
     expect(elapsedMs).toBeLessThan(20); // typ. <1ms even on loaded CI runners
+  });
+});
+
+describe('sanitizeVoiceTranscriptWithHotwords & resolveSessionTranscriptResult hotwords order', () => {
+  it('strips ASR control tags first, catches full hotword hallucinations before repetition-loop trimming, and runs a post-loop pass', () => {
+    const hotwords = ['Codex', 'IM.codes'];
+
+    // "Codex，" + 6x "IM.codes。" must collapse to "" instead of losing "IM.codes" to repetition loop first and leaving "Codex"
+    expect(sanitizeVoiceTranscriptWithHotwords(`Codex，${'IM.codes。'.repeat(6)}`, hotwords)).toBe('');
+
+    // Control tag before 4-repeat hotword echo must be stripped before hotword check
+    expect(
+      sanitizeVoiceTranscriptWithHotwords('language None<asr_text>IM.codes，IM.codes。IM.codes，IM.codes。', hotwords),
+    ).toBe('');
+
+    // Normal speech with control tag & hotwords stays intact
+    expect(sanitizeVoiceTranscriptWithHotwords('language Chinese<asr_text>打开 IM.codes 再看看 Codex', hotwords)).toBe(
+      '打开 IM.codes 再看看 Codex',
+    );
+
+    // Trailing repetition burst + real speech keeps real speech
+    expect(
+      sanitizeVoiceTranscriptWithHotwords(`打开 IM.codes，${'IM.codes。'.repeat(6)}`, hotwords),
+    ).toBe('打开 IM.codes，');
+
+    // resolveSessionTranscriptResult preserves prior real speech if a hallucinated final frame arrives
+    const r1 = resolveSessionTranscriptResult('language Chinese<asr_text>打开 IM.codes', false, '', hotwords);
+    expect(r1).toEqual({ emit: true, text: '打开 IM.codes', nextLastNonEmptyText: '打开 IM.codes' });
+    const r2 = resolveSessionTranscriptResult(
+      'language None<asr_text>IM.codes，IM.codes。IM.codes，IM.codes。',
+      false,
+      r1.nextLastNonEmptyText,
+      hotwords,
+    );
+    expect(r2).toEqual({ emit: false, text: '', nextLastNonEmptyText: '打开 IM.codes' });
+    const r3 = resolveSessionTranscriptResult(`Codex，${'IM.codes。'.repeat(6)}`, true, r2.nextLastNonEmptyText, hotwords);
+    expect(r3).toEqual({ emit: true, text: '打开 IM.codes', nextLastNonEmptyText: '打开 IM.codes' });
   });
 });

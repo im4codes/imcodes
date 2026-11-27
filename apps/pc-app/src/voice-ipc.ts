@@ -17,7 +17,7 @@ const PC_VOICE_HOTWORDS_MAX_TERMS = 60;
 const PC_VOICE_HOTWORDS_MAX_TERM_CHARS = 64;
 const PC_VOICE_HOTWORDS_MAX_CONTEXT_CHARS = 1000;
 
-export function normalizePcAppVoiceHotwordsContext(raw: unknown): string | undefined {
+export function normalizePcAppVoiceHotwordsTerms(raw: unknown): string[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const kept: string[] = [];
   const seen = new Set<string>();
@@ -40,7 +40,12 @@ export function normalizePcAppVoiceHotwordsContext(raw: unknown): string | undef
     kept.push(clean);
     totalChars += sepLen + clean.length;
   }
-  return kept.length > 0 ? kept.join(', ') : undefined;
+  return kept.length > 0 ? kept : undefined;
+}
+
+export function normalizePcAppVoiceHotwordsContext(raw: unknown): string | undefined {
+  const kept = normalizePcAppVoiceHotwordsTerms(raw);
+  return kept ? kept.join(', ') : undefined;
 }
 
 export function normalizePcAppDeviceName(raw: unknown): string | undefined {
@@ -2009,14 +2014,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           activeWorkerUtterance = utterance;
           clearPendingStartIfCurrent();
           try {
-            const hotwordsContext = normalizePcAppVoiceHotwordsContext(options?.hotwords);
+            const hotwordsTerms = normalizePcAppVoiceHotwordsTerms(options?.hotwords);
             if (finalizeOnly) {
-              const startPcmCmd: { cmd: 'start_pcm'; locale?: string; hotwords?: string } = { cmd: 'start_pcm' };
+              const startPcmCmd: { cmd: 'start_pcm'; locale?: string; hotwords?: string[] } = { cmd: 'start_pcm' };
               if (typeof options?.locale === 'string' && options.locale.trim()) {
                 startPcmCmd.locale = options.locale.trim();
               }
-              if (hotwordsContext) {
-                startPcmCmd.hotwords = hotwordsContext;
+              if (hotwordsTerms) {
+                startPcmCmd.hotwords = hotwordsTerms;
               }
               appendVoiceLog(`mlx serve finalizeOnly variant=${variant} chunks=${prefillChunks.length}`);
               worker.proc.stdin?.write(`${JSON.stringify(startPcmCmd)}\n`);
@@ -2026,12 +2031,12 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
               worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'stop' })}\n`);
               return { ok: true };
             }
-            const startCmd: { cmd: 'start'; locale?: string; device?: string; hotwords?: string } = { cmd: 'start' };
+            const startCmd: { cmd: 'start'; locale?: string; device?: string; hotwords?: string[] } = { cmd: 'start' };
             if (typeof options?.locale === 'string' && options.locale.trim()) {
               startCmd.locale = options.locale.trim();
             }
-            if (hotwordsContext) {
-              startCmd.hotwords = hotwordsContext;
+            if (hotwordsTerms) {
+              startCmd.hotwords = hotwordsTerms;
             }
             if (selectedInputDevice !== 'auto') {
               startCmd.device = selectedInputDevice;
@@ -2508,13 +2513,13 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       activeWorkerUtterance = utt;
       activeRemoteSession = { sessionId, utt };
 
-      const startCmd: { cmd: 'start_pcm'; locale?: string; hotwords?: string } = { cmd: 'start_pcm' };
+      const startCmd: { cmd: 'start_pcm'; locale?: string; hotwords?: string[] } = { cmd: 'start_pcm' };
       if (typeof options.locale === 'string' && options.locale.trim()) {
         startCmd.locale = options.locale.trim();
       }
-      const hotwordsContext = normalizePcAppVoiceHotwordsContext(options.hotwords);
-      if (hotwordsContext) {
-        startCmd.hotwords = hotwordsContext;
+      const hotwordsTerms = normalizePcAppVoiceHotwordsTerms(options.hotwords);
+      if (hotwordsTerms) {
+        startCmd.hotwords = hotwordsTerms;
       }
       try {
         appendVoiceLog(`mlx serve start_pcm variant=${variant} sessionId=${sessionId}`);

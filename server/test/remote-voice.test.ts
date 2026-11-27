@@ -2791,4 +2791,113 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
     expect(hub.getActiveSessionCount()).toBe(0);
     hub.stop();
   });
+
+  it('sanitizes control tags before hotword hallucination check across HTTP ASR and PC provider relay while preserving prior real speech', async () => {
+    let nextTranscript = `Codex，${'IM.codes。'.repeat(6)}`;
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+      return new Response(JSON.stringify({ text: nextTranscript }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    const hub = new RemoteVoiceHub({
+      readyTimeoutMs: 50,
+      idleTimeoutMs: 50,
+      httpAsrTimeoutMs: 500,
+      fetchFn: mockFetch as unknown as typeof fetch,
+    });
+    hub.setServerAsrServices([
+      {
+        id: 'asr_order',
+        name: 'ASR Order',
+        baseUrl: 'https://secret-asr.internal/v1',
+        apiKey: '',
+        model: 'whisper-1',
+        enabled: true,
+        source: 'admin',
+      },
+    ], false);
+
+    const providerWs = { readyState: WebSocket.OPEN, send: () => {}, on: () => {}, close: () => {} } as unknown as WebSocket;
+    const clientSent: Array<Record<string, unknown>> = [];
+    const clientWs = { readyState: WebSocket.OPEN, send: (d: string) => clientSent.push(JSON.parse(d)), on: () => {}, close: () => {} } as unknown as WebSocket;
+    hub.handleConnection(providerWs, 'owner-order');
+    hub.handleConnection(clientWs, 'owner-order');
+
+    const proto = hub as unknown as {
+      handleRawMessage: (ws: WebSocket, u: string, raw: string) => Promise<void>;
+    };
+
+    const audibleBuf = Buffer.alloc(1600);
+    for (let i = 0; i < 800; i += 1) {
+      audibleBuf.writeInt16LE(1500, i * 2);
+    }
+    const audiblePcm = audibleBuf.toString('base64');
+
+    // 1. HTTP ASR: "Codex，" + 6x "IM.codes。" must NOT strip IM.codes first and leave "Codex，" behind
+    await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'http-codex-loop',
+      targetDeviceId: 'asr_order',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['Codex', 'IM.codes'],
+    }));
+    await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.audio',
+      sessionId: 'http-codex-loop',
+      pcmBase64: audiblePcm,
+    }));
+    await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.stop',
+      sessionId: 'http-codex-loop',
+    }));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(clientSent.filter((f) => f.sessionId === 'http-codex-loop' && f.type === 'voice.session.result')).toEqual([]);
+    expect(clientSent).toContainEqual({ type: 'voice.session.end', sessionId: 'http-codex-loop' });
+
+    // 2. PC provider relay: control tag prefix before 4-repeat loop is stripped FIRST, then hotword guard catches loop
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.provider.register',
+      deviceId: 'mac-order',
+      model: 'qwen3-1.7b',
+      modelLabel: 'Qwen3-ASR 1.7B',
+      ready: true,
+    }));
+    await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-tag-order',
+      targetDeviceId: 'mac-order',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['Codex', 'IM.codes'],
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.ready', sessionId: 'pc-tag-order' }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-tag-order',
+      text: 'language None<asr_text>IM.codes，IM.codes。IM.codes，IM.codes。',
+      isFinal: false,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-tag-order',
+      text: 'language Chinese<asr_text>打开 IM.codes',
+      isFinal: false,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-tag-order',
+      text: 'language None<asr_text>IM.codes，IM.codes。IM.codes，IM.codes。',
+      isFinal: true,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-tag-order' }));
+
+    const pcResults = clientSent.filter((f) => f.sessionId === 'pc-tag-order' && f.type === 'voice.session.result');
+    expect(pcResults).toEqual([
+      { type: 'voice.session.result', sessionId: 'pc-tag-order', text: '打开 IM.codes', isFinal: false },
+      { type: 'voice.session.result', sessionId: 'pc-tag-order', text: '打开 IM.codes', isFinal: true },
+    ]);
+    expect(hub.getActiveSessionCount()).toBe(0);
+    hub.stop();
+  });
 });

@@ -358,7 +358,8 @@ interface CaptureOwner {
   scope?: VoiceHotwordsScopeSnapshot;
   hasAudioLevel?: boolean;
   maxAudioLevel?: number;
-  emittedNonEmptyResult?: boolean;
+  lastTrustedRealText?: string;
+  emittedPendingSingleHotword?: boolean;
   notifiedListening?: boolean;
   normalStopRequested?: boolean;
   pendingFallback?: { promise: Promise<void>; abort: () => void };
@@ -1067,27 +1068,39 @@ function isOwnerSilentAudio(owner: CaptureOwner | null | undefined): boolean {
 function emitOwnerResult(owner: CaptureOwner | null, text: string, isFinal: boolean): void {
   if (!isOwnerCurrent(owner)) return;
   const currentOwner = owner!;
-  const processed = currentOwner.hotwords
-    ? applyVoiceHotwordPostProcess(text, currentOwner.hotwords)
-    : text;
-  const filtered = currentOwner.hotwords
-    ? stripVoiceHotwordHallucination(processed, currentOwner.hotwords, {
-        silentAudio: isOwnerSilentAudio(currentOwner),
-      })
-    : processed;
-
-  const wasSuppressed = processed.trim().length > 0 && filtered.length === 0;
-  if (wasSuppressed) {
-    if (!currentOwner.emittedNonEmptyResult) {
-      return;
-    }
-    currentOwner.emittedNonEmptyResult = false;
-    currentOwner.onResult?.('', isFinal);
+  if (!currentOwner.hotwords) {
+    currentOwner.onResult?.(text, isFinal);
     return;
   }
 
-  if (filtered.trim().length > 0) {
-    currentOwner.emittedNonEmptyResult = true;
+  const processed = applyVoiceHotwordPostProcess(text, currentOwner.hotwords);
+  const filtered = stripVoiceHotwordHallucination(processed, currentOwner.hotwords, {
+    silentAudio: isOwnerSilentAudio(currentOwner),
+  });
+
+  const wasSuppressed = processed.trim().length > 0 && filtered.length === 0;
+  if (wasSuppressed) {
+    if (currentOwner.lastTrustedRealText) {
+      if (isFinal) {
+        currentOwner.onResult?.(currentOwner.lastTrustedRealText, true);
+      }
+      return;
+    }
+    if (currentOwner.emittedPendingSingleHotword) {
+      currentOwner.emittedPendingSingleHotword = false;
+      currentOwner.onResult?.('', isFinal);
+    }
+    return;
+  }
+
+  const hasNonHotwordContent =
+    processed.trim().length > 0
+    && stripVoiceHotwordHallucination(processed, currentOwner.hotwords, { silentAudio: true }).length > 0;
+  if (hasNonHotwordContent) {
+    currentOwner.lastTrustedRealText = filtered;
+    currentOwner.emittedPendingSingleHotword = false;
+  } else if (filtered.trim().length > 0 && !currentOwner.lastTrustedRealText) {
+    currentOwner.emittedPendingSingleHotword = true;
   }
   currentOwner.onResult?.(filtered, isFinal);
 }

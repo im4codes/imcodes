@@ -1,5 +1,10 @@
 import { maskTtsApiKey, validateTtsBaseUrl, type TtsBaseUrlValidationResult } from './tts-config.js';
-import { formatVoiceHotwordsContext, sanitizeRemoteVoiceHotwords } from './voice-hotwords.js';
+import {
+  formatVoiceHotwordsContext,
+  sanitizeRemoteVoiceHotwords,
+  stripVoiceHotwordHallucination,
+  type CompiledVoiceHotwords,
+} from './voice-hotwords.js';
 
 export const REMOTE_VOICE_WS_PATH = '/api/ws/voice-relay';
 export const REMOTE_VOICE_API_PREFIX = '/api/voice';
@@ -878,16 +883,48 @@ export function stripAsrControlTags(text: string): string {
 }
 
 /**
+ * Sanitize an ASR transcript with control-tag removal, pre-loop hotword hallucination
+ * stripping, runaway repetition collapse, and a post-loop hotword hallucination check.
+ */
+export function sanitizeVoiceTranscriptWithHotwords(
+  rawText: string,
+  hotwords?: Pick<CompiledVoiceHotwords, 'terms' | 'asrTerms' | 'replacements'> | readonly string[] | null,
+  options?: { silentAudio?: boolean },
+): string {
+  const tagsStripped = stripAsrControlTags(rawText);
+  if (!tagsStripped) return '';
+  let hasHotwords = false;
+  if (Array.isArray(hotwords)) {
+    hasHotwords = hotwords.length > 0;
+  } else if (hotwords) {
+    const compiled = hotwords as Pick<CompiledVoiceHotwords, 'terms' | 'asrTerms' | 'replacements'>;
+    hasHotwords = (compiled.terms?.length ?? 0) > 0
+      || (compiled.asrTerms?.length ?? 0) > 0
+      || (compiled.replacements?.length ?? 0) > 0;
+  }
+  const preHallucination = hasHotwords
+    ? stripVoiceHotwordHallucination(tagsStripped, hotwords, options)
+    : tagsStripped;
+  if (!preHallucination) return '';
+  const loopSanitized = sanitizeAsrRepetitionLoop(preHallucination);
+  if (!loopSanitized) return '';
+  return hasHotwords
+    ? stripVoiceHotwordHallucination(loopSanitized, hotwords, options)
+    : loopSanitized;
+}
+
+/**
  * Sanitize an incoming ASR transcript result and preserve the session's last
  * non-empty sanitized transcript when a terminal `isFinal` frame collapses to
- * empty (e.g. `language None<asr_text>` or a pure repetition burst from an older helper).
+ * empty (e.g. `language None<asr_text>` or a pure repetition/hallucination burst).
  */
 export function resolveSessionTranscriptResult(
   rawText: string,
   isFinal: boolean,
   lastNonEmptyText: string,
+  hotwords?: Pick<CompiledVoiceHotwords, 'terms' | 'asrTerms' | 'replacements'> | readonly string[] | null,
 ): { emit: boolean; text: string; nextLastNonEmptyText: string } {
-  const sanitized = sanitizeAsrRepetitionLoop(rawText);
+  const sanitized = sanitizeVoiceTranscriptWithHotwords(rawText, hotwords);
   if (sanitized.trim().length > 0) {
     return { emit: true, text: sanitized, nextLastNonEmptyText: sanitized };
   }

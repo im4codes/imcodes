@@ -337,9 +337,16 @@ describe('shared voice hotwords', () => {
     expect(stripVoiceHotwordHallucination('im.codes！codex？错别词。', compiled)).toBe('');
     expect(stripVoiceHotwordHallucination('「IM.codes」\n(Codex)...', compiled)).toBe('');
 
+    // Fullwidth width/punctuation variants and immediate same-term concatenation
+    expect(stripVoiceHotwordHallucination('IM．codes，IM．codes。', compiled)).toBe('');
+    expect(stripVoiceHotwordHallucination('ＩＭ．ｃｏｄｅｓ，IM.codes！', ['IM.codes'])).toBe('');
+    expect(stripVoiceHotwordHallucination('IM.codesIM.codes', compiled)).toBe('');
+    expect(stripVoiceHotwordHallucination('IM．codesIM.codes', compiled)).toBe('');
+    expect(stripVoiceHotwordHallucination('打开 IM．codes 看下 worktree', compiled, { silentAudio: true })).toBe('打开 IM．codes 看下 worktree');
+
     // Single hotword echo: stripped ONLY when silentAudio=true, preserved on normal speech
     expect(stripVoiceHotwordHallucination('IM.codes', compiled, { silentAudio: true })).toBe('');
-    expect(stripVoiceHotwordHallucination('IM.codes。', ['IM.codes'], { silentAudio: true })).toBe('');
+    expect(stripVoiceHotwordHallucination('IM．codes。', ['IM.codes'], { silentAudio: true })).toBe('');
     expect(stripVoiceHotwordHallucination('IM.codes', compiled, { silentAudio: false })).toBe('IM.codes');
     expect(stripVoiceHotwordHallucination('IM.codes', compiled)).toBe('IM.codes');
 
@@ -366,7 +373,7 @@ describe('shared voice hotwords', () => {
     expect(stripVoiceHotwordHallucination('IM.codes，IM.codes。IM.codes，IM.codes。', [])).toBe('IM.codes，IM.codes。IM.codes，IM.codes。');
     expect(stripVoiceHotwordHallucination('IM.codes', null, { silentAudio: true })).toBe('IM.codes');
 
-    // Performance bound: 60 hotwords across ~1000 chars stays sub-millisecond
+    // Performance bound: 60 hotwords across ~1000 chars stays sub-millisecond (including shared-prefix unmatchable text)
     const rules60 = Array.from({ length: 60 }, (_, i) => `HotwordTerm_${i}`).join('\n');
     const compiled60 = mergeVoiceHotwords({ projectRaw: rules60 });
     const echoText = Array.from({ length: 60 }, (_, i) => `HotwordTerm_${i}`).join(', ');
@@ -374,14 +381,29 @@ describe('shared voice hotwords', () => {
     expect(normalText.length).toBeGreaterThanOrEqual(900);
     expect(stripVoiceHotwordHallucination(echoText, compiled60)).toBe('');
 
-    const start = performance.now();
-    for (let i = 0; i < 20; i += 1) {
+    const sharedPrefixRawTerms = Array.from({ length: 60 }, (_, i) => `a${i}`);
+    const repeatedPrefixUnmatched = 'a'.repeat(1000);
+    const groupTerms = Array.from({ length: 60 }, (_, i) => `global task ${String(i).padStart(2, '0')}`);
+    const groupUnmatched = `${'global task '.repeat(80)}x`;
+
+    // Warm caches before timing
+    for (let i = 0; i < 10; i += 1) {
       stripVoiceHotwordHallucination(echoText, compiled60);
       stripVoiceHotwordHallucination(normalText, compiled60);
+      stripVoiceHotwordHallucination(repeatedPrefixUnmatched, sharedPrefixRawTerms);
+      stripVoiceHotwordHallucination(groupUnmatched, groupTerms);
     }
-    const avgMs = (performance.now() - start) / 40;
-    expect(avgMs).toBeLessThan(1);
-    expect(stripVoiceHotwordHallucination(normalText, compiled60)).toBe(normalText);
+
+    const start = performance.now();
+    const iterations = 100;
+    for (let i = 0; i < iterations; i += 1) {
+      expect(stripVoiceHotwordHallucination(echoText, compiled60)).toBe('');
+      expect(stripVoiceHotwordHallucination(normalText, compiled60)).toBe(normalText);
+      expect(stripVoiceHotwordHallucination(repeatedPrefixUnmatched, sharedPrefixRawTerms)).toBe(repeatedPrefixUnmatched);
+      expect(stripVoiceHotwordHallucination(groupUnmatched, groupTerms)).toBe(groupUnmatched);
+    }
+    const avgPerCallMs = (performance.now() - start) / (iterations * 4);
+    expect(avgPerCallMs).toBeLessThan(1);
   });
 
   it('detects PCM16 speech energy safely across silence, faint noise, quiet speech, empty, and odd-byte buffers', () => {

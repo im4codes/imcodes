@@ -471,15 +471,14 @@ func sanitizeAsrRepetitionLoop(_ text: String) -> String {
     return hasMeaningful ? cleaned : ""
 }
 
-private func readHotwords(from modelDir: URL) -> String? {
-    let hotwordsText = ((try? String(contentsOf: modelDir.appendingPathComponent("hotwords.txt"), encoding: .utf8)) ?? "")
+private func readHotwords(from modelDir: URL) -> [String] {
+    ((try? String(contentsOf: modelDir.appendingPathComponent("hotwords.txt"), encoding: .utf8)) ?? "")
         .split(whereSeparator: \.isNewline)
         .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         .filter { !$0.isEmpty }
-    return hotwordsText.isEmpty ? nil : hotwordsText.joined(separator: ", ")
 }
 
-private func mergeSessionHotwords(base: String?, requestHotwords: Any?) -> String? {
+private func mergeSessionHotwords(base: [String], requestHotwords: Any?) -> (context: String?, filterTerms: [String]) {
     var terms: [String] = []
     var seen = Set<String>()
     var totalChars = 0
@@ -515,16 +514,14 @@ private func mergeSessionHotwords(base: String?, requestHotwords: Any?) -> Strin
 
     // Preserve legacy static hotwords.txt verbatim when no valid per-request hotwords are provided.
     if terms.isEmpty {
-        return base
+        return (base.isEmpty ? nil : base.joined(separator: ", "), base)
     }
 
-    if let base, !base.isEmpty {
-        for part in base.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
-            appendTerm(String(part))
-        }
+    for part in base {
+        appendTerm(part)
     }
 
-    return terms.joined(separator: ", ")
+    return (terms.isEmpty ? nil : terms.joined(separator: ", "), terms)
 }
 
 private func checkMlxRuntimeAvailable() -> Bool {
@@ -639,89 +636,144 @@ private func isAsciiAlnumOrUnderscore(_ ch: Character) -> Bool {
         || s.value == 0x5F
 }
 
-func stripVoiceHotwordHallucination(_ text: String, hotwordsContext: String?) -> String {
-    guard !text.isEmpty, let hotwordsContext, !hotwordsContext.isEmpty else { return text }
-
-    var seen = Set<String>()
-    var rawTerms: [[Character]] = []
-    for part in hotwordsContext.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
-        let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { continue }
-        let lower = trimmed.lowercased()
-        guard !seen.contains(lower) else { continue }
-        seen.insert(lower)
-        rawTerms.append(Array(lower))
-    }
-    guard !rawTerms.isEmpty else { return text }
-
-    rawTerms.sort { $0.count > $1.count }
-    var buckets: [Character: [[Character]]] = [:]
-    for term in rawTerms {
-        if let first = term.first {
-            buckets[first, default: []].append(term)
+private func normalizeHotwordMatchCharacters(_ raw: String) -> [Character] {
+    let nfkc = raw.precomposedStringWithCompatibilityMapping.lowercased()
+    var out: [Character] = []
+    out.reserveCapacity(nfkc.count)
+    for ch in nfkc {
+        switch ch {
+        case "\u{2010}", "\u{2011}", "\u{2012}", "\u{2013}", "\u{2014}", "\u{2015}", "\u{2212}", "\u{FE58}", "\u{FE63}":
+            out.append("-")
+        case "\u{2018}", "\u{2019}", "\u{201A}", "\u{201B}":
+            out.append("'")
+        case "\u{201C}", "\u{201D}", "\u{201E}", "\u{201F}":
+            out.append("\"")
+        case "\u{FF61}":
+            out.append(".")
+        default:
+            out.append(ch)
         }
     }
+    return out
+}
 
-    let chars = Array(text.lowercased())
+private final class HotwordTrieNode {
+    var children: [Character: HotwordTrieNode] = [:]
+    var termId: Int = -1
+}
+
+func stripVoiceHotwordHallucination(_ text: String, hotwordsContext: String?, allowSingle: Bool = false) -> String {
+    guard !text.isEmpty, let hotwordsContext, !hotwordsContext.isEmpty else { return text }
+    let splitTerms = hotwordsContext
+        .split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" })
+        .map { String($0) }
+    return stripVoiceHotwordHallucination(text, hotwordTerms: splitTerms, allowSingle: allowSingle)
+}
+
+func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allowSingle: Bool = false) -> String {
+    guard !text.isEmpty, !hotwordTerms.isEmpty else { return text }
+
+    var seen = Set<[Character]>()
+    var normalizedTerms: [[Character]] = []
+    for raw in hotwordTerms {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        let norm = normalizeHotwordMatchCharacters(trimmed)
+        guard !norm.isEmpty, !seen.contains(norm) else { continue }
+        seen.insert(norm)
+        normalizedTerms.append(norm)
+    }
+    guard !normalizedTerms.isEmpty else { return text }
+
+    let root = HotwordTrieNode()
+    var termStartsAscii = [Bool](repeating: false, count: normalizedTerms.count)
+    var termEndsAscii = [Bool](repeating: false, count: normalizedTerms.count)
+    for (termId, norm) in normalizedTerms.enumerated() {
+        termStartsAscii[termId] = isAsciiAlnumOrUnderscore(norm[0])
+        termEndsAscii[termId] = isAsciiAlnumOrUnderscore(norm[norm.count - 1])
+        var node = root
+        for ch in norm {
+            if let child = node.children[ch] {
+                node = child
+            } else {
+                let child = HotwordTrieNode()
+                node.children[ch] = child
+                node = child
+            }
+        }
+        node.termId = termId
+    }
+
+    let chars = normalizeHotwordMatchCharacters(text)
     let n = chars.count
     guard n > 0 else { return text }
 
-    let dpStride = 4
-    var dp = [Int](repeating: -1, count: (n + 1) * dpStride)
-    for state in 0..<dpStride {
-        dp[n * dpStride + state] = 0
-    }
+    let inf = 0x3FFF_FFFF
+    var cleared = [Int](repeating: inf, count: n + 1)
+    var endedAscii = [Int](repeating: inf, count: n + 1)
+    cleared[0] = 0
 
-    for pos in stride(from: n - 1, through: 0, by: -1) {
-        let ch = chars[pos]
-        let isSep = isHotwordHallucinationSeparator(ch)
-        let candidates = buckets[ch]
+    for pos in 0..<n {
+        let cCount = cleared[pos]
+        let aCount = endedAscii[pos]
+        if cCount == inf && aCount == inf { continue }
+        let bestAtPos = min(cCount, aCount)
 
-        for prevAscii in 0...1 {
-            for hasSep in 0...1 {
-                var best = -1
+        if isHotwordHallucinationSeparator(chars[pos]) {
+            if bestAtPos < cleared[pos + 1] {
+                cleared[pos + 1] = bestAtPos
+            }
+        }
 
-                if let candidates {
-                    for term in candidates {
-                        let nextAscii = isAsciiAlnumOrUnderscore(term[0]) ? 1 : 0
-                        if prevAscii == 1 && nextAscii == 1 && hasSep == 0 {
-                            continue
-                        }
-                        let endPos = pos + term.count
-                        guard endPos <= n else { continue }
-                        var matches = true
-                        for k in 0..<term.count {
-                            if chars[pos + k] != term[k] {
-                                matches = false
-                                break
-                            }
-                        }
-                        guard matches else { continue }
-                        let endAscii = isAsciiAlnumOrUnderscore(term[term.count - 1]) ? 1 : 0
-                        let tail = dp[endPos * dpStride + endAscii * 2]
-                        if tail >= 0 {
-                            let total = 1 + tail
-                            if best == -1 || total < best {
-                                best = total
-                            }
+        var node: HotwordTrieNode? = root
+        for p in pos..<n {
+            node = node?.children[chars[p]]
+            guard let cur = node else { break }
+            let termId = cur.termId
+            if termId < 0 { continue }
+
+            let startCost = termStartsAscii[termId] ? cCount : bestAtPos
+            if startCost >= inf { continue }
+
+            let endPos = p + 1
+            let nextCost = startCost + 1
+            if !termEndsAscii[termId] || endPos == n {
+                if nextCost < cleared[endPos] {
+                    cleared[endPos] = nextCost
+                }
+            } else {
+                if nextCost < endedAscii[endPos] {
+                    endedAscii[endPos] = nextCost
+                }
+                let termChars = normalizedTerms[termId]
+                var repPos = endPos
+                var repCost = nextCost
+                while repPos + termChars.count <= n {
+                    var sameMatch = true
+                    for k in 0..<termChars.count {
+                        if chars[repPos + k] != termChars[k] {
+                            sameMatch = false
+                            break
                         }
                     }
-                }
-
-                if isSep {
-                    let tail = dp[(pos + 1) * dpStride + prevAscii * 2 + 1]
-                    if tail >= 0 && (best == -1 || tail < best) {
-                        best = tail
+                    if !sameMatch { break }
+                    repPos += termChars.count
+                    repCost += 1
+                    if repPos == n {
+                        if repCost < cleared[repPos] { cleared[repPos] = repCost }
+                    } else if repCost < endedAscii[repPos] {
+                        endedAscii[repPos] = repCost
                     }
                 }
-
-                dp[pos * dpStride + prevAscii * 2 + hasSep] = best
             }
         }
     }
 
-    let minMatches = dp[1] // pos=0, prevAscii=0, hasSep=1
-    return minMatches >= 2 ? "" : text
+    let minMatches = min(cleared[n], endedAscii[n])
+    if minMatches >= inf { return text }
+    if minMatches >= 2 { return "" }
+    if allowSingle && minMatches == 1 { return "" }
+    return text
 }
 
 struct QwenSegmentedDecodeResult {
@@ -747,7 +799,7 @@ final class QwenSegmentedDecodeEngine {
     private let maxSegmentSamples: Int
     private let rollbackTokenCount: Int
     private let expectLanguageHeader: Bool
-    private let hotwords: String?
+    private let hotwordTerms: [String]
     private let decodeFn: DecodeFn
     private let rollbackPrefixFn: RollbackPrefixFn
     private let emitJsonFn: ([String: Any]) -> Void
@@ -761,6 +813,8 @@ final class QwenSegmentedDecodeEngine {
     private var lastDecodedCount = 0
     private var committedText = ""
     private var activeText = ""
+    private var activeTrustedRealText = ""
+    private var activePendingSingleHotword = false
     private var confirmedTokens: [Int32] = []
     private var lastEmittedText = ""
     private var stopRequested = false
@@ -773,7 +827,7 @@ final class QwenSegmentedDecodeEngine {
         maxSegmentSamples: Int = 216_000,
         rollbackTokenCount: Int = 5,
         expectLanguageHeader: Bool,
-        hotwords: String? = nil,
+        hotwordTerms: [String] = [],
         decodeFn: @escaping DecodeFn,
         rollbackPrefixFn: @escaping RollbackPrefixFn,
         emitJsonFn: @escaping ([String: Any]) -> Void,
@@ -784,7 +838,7 @@ final class QwenSegmentedDecodeEngine {
         self.maxSegmentSamples = maxSegmentSamples
         self.rollbackTokenCount = rollbackTokenCount
         self.expectLanguageHeader = expectLanguageHeader
-        self.hotwords = hotwords
+        self.hotwordTerms = hotwordTerms
         self.decodeFn = decodeFn
         self.rollbackPrefixFn = rollbackPrefixFn
         self.emitJsonFn = emitJsonFn
@@ -916,40 +970,121 @@ final class QwenSegmentedDecodeEngine {
                     }
                 ) {
                     let rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let afterRepetition = sanitizeAsrRepetitionLoop(rawText)
-                    let text = stripVoiceHotwordHallucination(afterRepetition, hotwordsContext: hotwords)
-                    let hitGuard = text != rawText
-                    activeText = text
-                    if hitGuard {
-                        confirmedTokens = []
-                    } else if !isFinalPass {
-                        confirmedTokens = rollbackPrefixFn(
-                            result.tokens,
-                            rollbackTokenCount,
-                            expectLanguageHeader
+                    let hasHotwords = !hotwordTerms.isEmpty
+                    if !hasHotwords {
+                        let text = sanitizeAsrRepetitionLoop(rawText)
+                        let hitRepetitionLoop = text != rawText
+                        activeText = text
+                        if hitRepetitionLoop {
+                            confirmedTokens = []
+                        } else if !isFinalPass {
+                            confirmedTokens = rollbackPrefixFn(
+                                result.tokens,
+                                rollbackTokenCount,
+                                expectLanguageHeader
+                            )
+                        }
+                        let combined = joinTranscriptSegments(committedText, activeText)
+                        if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
+                            lastEmittedText = combined
+                            emitJsonFn([
+                                "type": "result",
+                                "text": combined,
+                                "isFinal": isFinalPass,
+                            ])
+                        }
+                    } else {
+                        let preHallucination = stripVoiceHotwordHallucination(
+                            rawText,
+                            hotwordTerms: hotwordTerms,
+                            allowSingle: false
                         )
-                    }
-                    let combined = joinTranscriptSegments(committedText, activeText)
-                    if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
-                        lastEmittedText = combined
-                        emitJsonFn([
-                            "type": "result",
-                            "text": combined,
-                            "isFinal": isFinalPass,
-                        ])
-                    } else if combined.isEmpty && !lastEmittedText.isEmpty && isFinalPass {
-                        lastEmittedText = ""
-                        emitJsonFn([
-                            "type": "result",
-                            "text": "",
-                            "isFinal": true,
-                        ])
+                        let afterRepetition = sanitizeAsrRepetitionLoop(preHallucination)
+                        let text = stripVoiceHotwordHallucination(
+                            afterRepetition,
+                            hotwordTerms: hotwordTerms,
+                            allowSingle: false
+                        )
+                        let hitHotwordHallucination = !rawText.isEmpty && text.isEmpty && (preHallucination.isEmpty || !afterRepetition.isEmpty)
+                        let hitAnyGuard = text != rawText
+
+                        if hitHotwordHallucination {
+                            confirmedTokens = []
+                            if !activeTrustedRealText.isEmpty {
+                                activeText = activeTrustedRealText
+                                let combined = joinTranscriptSegments(committedText, activeText)
+                                if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
+                                    lastEmittedText = combined
+                                    emitJsonFn([
+                                        "type": "result",
+                                        "text": combined,
+                                        "isFinal": isFinalPass,
+                                    ])
+                                }
+                            } else if activePendingSingleHotword {
+                                activeText = ""
+                                activePendingSingleHotword = false
+                                let combined = committedText
+                                if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
+                                    lastEmittedText = combined
+                                    emitJsonFn([
+                                        "type": "result",
+                                        "text": combined,
+                                        "isFinal": isFinalPass,
+                                    ])
+                                } else if combined.isEmpty && !lastEmittedText.isEmpty && isFinalPass {
+                                    lastEmittedText = ""
+                                    emitJsonFn([
+                                        "type": "result",
+                                        "text": "",
+                                        "isFinal": true,
+                                    ])
+                                }
+                            } else {
+                                activeText = ""
+                            }
+                        } else {
+                            activeText = text
+                            if !text.isEmpty {
+                                let hasRealNonHotword = !stripVoiceHotwordHallucination(
+                                    text,
+                                    hotwordTerms: hotwordTerms,
+                                    allowSingle: true
+                                ).isEmpty
+                                if hasRealNonHotword {
+                                    activeTrustedRealText = text
+                                    activePendingSingleHotword = false
+                                } else if activeTrustedRealText.isEmpty {
+                                    activePendingSingleHotword = true
+                                }
+                            }
+                            if hitAnyGuard {
+                                confirmedTokens = []
+                            } else if !isFinalPass {
+                                confirmedTokens = rollbackPrefixFn(
+                                    result.tokens,
+                                    rollbackTokenCount,
+                                    expectLanguageHeader
+                                )
+                            }
+                            let combined = joinTranscriptSegments(committedText, activeText)
+                            if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
+                                lastEmittedText = combined
+                                emitJsonFn([
+                                    "type": "result",
+                                    "text": combined,
+                                    "isFinal": isFinalPass,
+                                ])
+                            }
+                        }
                     }
                 }
 
                 if !isFinalPass && currentLen >= maxSegmentSamples {
                     committedText = joinTranscriptSegments(committedText, activeText)
                     activeText = ""
+                    activeTrustedRealText = ""
+                    activePendingSingleHotword = false
                     confirmedTokens = []
                     lock.lock()
                     activeSegment.removeAll(keepingCapacity: true)
@@ -978,7 +1113,8 @@ final class QwenStreamingSession {
     private let rollbackTokenCount = 5
 
     private let model: Qwen3ASRModel
-    private let hotwords: String?
+    private let hotwordsContext: String?
+    private let hotwordTerms: [String]
     private let decodeQueue: DispatchQueue
     private let unloadOnFinish: Bool
     private let captureQueue = DispatchQueue(label: "com.imcodes.pc-app.qwen3asr.capture", qos: .userInteractive)
@@ -1001,19 +1137,22 @@ final class QwenStreamingSession {
 
     init(
         model: Qwen3ASRModel,
-        hotwords: String?,
+        hotwordsContext: String?,
+        hotwordTerms: [String],
         decodeQueue: DispatchQueue,
         unloadOnFinish: Bool
     ) {
         self.model = model
-        self.hotwords = hotwords
+        self.hotwordsContext = hotwordsContext
+        self.hotwordTerms = hotwordTerms
         self.decodeQueue = decodeQueue
         self.unloadOnFinish = unloadOnFinish
     }
 
     private func makeDecodeEngine(language: String?) -> QwenSegmentedDecodeEngine {
         let model = self.model
-        let hotwords = self.hotwords
+        let hotwordsContext = self.hotwordsContext
+        let hotwordTerms = self.hotwordTerms
         let sampleRate = self.sampleRate
         let rollbackTokenCount = self.rollbackTokenCount
         let maxSegmentSamples = self.maxSegmentSamples
@@ -1021,12 +1160,12 @@ final class QwenStreamingSession {
             maxSegmentSamples: maxSegmentSamples,
             rollbackTokenCount: rollbackTokenCount,
             expectLanguageHeader: language == nil,
-            hotwords: hotwords,
+            hotwordTerms: hotwordTerms,
             decodeFn: { samples, prefixTokens, checkCancellation in
                 let options = Qwen3DecodingOptions(
                     maxTokens: 192,
                     language: language,
-                    context: hotwords
+                    context: hotwordsContext
                 )
                 let result = try model.transcribeSegmentWithCancellation(
                     audio: samples,
@@ -1467,7 +1606,7 @@ final class QwenStreamingSession {
 
 final class QwenServeRunner {
     private let model: Qwen3ASRModel
-    private let hotwords: String?
+    private let hotwords: [String]
     private let decodeQueue: DispatchQueue
     private let sessionLock = NSLock()
     private var activeSession: QwenStreamingSession?
@@ -1475,7 +1614,7 @@ final class QwenServeRunner {
     private let maxPrefillSamples = 16_000 * 30
     private var shuttingDown = false
 
-    init(model: Qwen3ASRModel, hotwords: String?, decodeQueue: DispatchQueue) {
+    init(model: Qwen3ASRModel, hotwords: [String], decodeQueue: DispatchQueue) {
         self.model = model
         self.hotwords = hotwords
         self.decodeQueue = decodeQueue
@@ -1548,10 +1687,11 @@ final class QwenServeRunner {
                 }
                 let localeTag = json["locale"] as? String
                 let deviceUID = json["device"] as? String
-                let utteranceHotwords = mergeSessionHotwords(base: hotwords, requestHotwords: json["hotwords"])
+                let mergedHotwords = mergeSessionHotwords(base: hotwords, requestHotwords: json["hotwords"])
                 let session = QwenStreamingSession(
                     model: model,
-                    hotwords: utteranceHotwords,
+                    hotwordsContext: mergedHotwords.context,
+                    hotwordTerms: mergedHotwords.filterTerms,
                     decodeQueue: decodeQueue,
                     unloadOnFinish: false
                 )
@@ -1580,10 +1720,11 @@ final class QwenServeRunner {
                 prefilledPcm.removeAll(keepingCapacity: false)
                 stopActiveSession(abort: true, wait: true)
                 let localeTag = json["locale"] as? String
-                let utteranceHotwords = mergeSessionHotwords(base: hotwords, requestHotwords: json["hotwords"])
+                let mergedHotwords = mergeSessionHotwords(base: hotwords, requestHotwords: json["hotwords"])
                 let session = QwenStreamingSession(
                     model: model,
-                    hotwords: utteranceHotwords,
+                    hotwordsContext: mergedHotwords.context,
+                    hotwordTerms: mergedHotwords.filterTerms,
                     decodeQueue: decodeQueue,
                     unloadOnFinish: false
                 )
@@ -1706,9 +1847,11 @@ case "listen":
     guard let model = loadMlxModel(modelDir: modelDir, variant: parsed.variant, onQueue: decodeQueue) else {
         exit(1)
     }
+    let staticHotwords = readHotwords(from: modelDir)
     let session = QwenStreamingSession(
         model: model,
-        hotwords: readHotwords(from: modelDir),
+        hotwordsContext: staticHotwords.isEmpty ? nil : staticHotwords.joined(separator: ", "),
+        hotwordTerms: staticHotwords,
         decodeQueue: decodeQueue,
         unloadOnFinish: true
     )

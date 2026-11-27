@@ -2647,6 +2647,22 @@ describe('Web Mobile final drain', () => {
       listeners.partialResults({ matches: ['IM.codes，IM.codes。'], isFinal: true });
       expect(onClearedInterim).toHaveBeenLastCalledWith('', true);
       await VoiceInput.stopListening();
+
+      // 7. Fullwidth dot & adjacent repetition variants are stripped without dropping real preceding speech
+      const onTrustedPreserved = vi.fn();
+      await VoiceInput.startListening(onTrustedPreserved, undefined, undefined, { projectKey: 'proj-hallucination' });
+      listeners.audioLevel({ level: 0.2 });
+      listeners.partialResults({ matches: ['打开 IM.codes 再看看 Codex'], isFinal: false });
+      expect(onTrustedPreserved).toHaveBeenLastCalledWith('打开 IM.codes 再看看 Codex', false);
+      // Hallucination interim frame is dropped rather than clearing real text
+      listeners.partialResults({ matches: ['IM．codes，IM．codes。'], isFinal: false });
+      listeners.partialResults({ matches: ['IM.codesIM.codes'], isFinal: false });
+      expect(onTrustedPreserved).toHaveBeenCalledTimes(1);
+      // Hallucination final frame terminates with last trusted real text
+      listeners.partialResults({ matches: ['IM.codes，IM.codes。'], isFinal: true });
+      expect(onTrustedPreserved).toHaveBeenCalledTimes(2);
+      expect(onTrustedPreserved).toHaveBeenLastCalledWith('打开 IM.codes 再看看 Codex', true);
+      await VoiceInput.stopListening();
     } finally {
       await VoiceInput.stopListening({ abort: true });
       hotwordsMod.resetVoiceHotwordsScopeForTesting();

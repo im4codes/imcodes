@@ -19,11 +19,11 @@ import {
   parseServerSharedProvidersSetting,
   resolveOpenAiTranscriptionEndpoint,
   resolveSessionTranscriptResult,
-  sanitizeAsrRepetitionLoop,
   sanitizeCrossAccountOwnerLabel,
   sanitizeRemoteVoiceDeviceName,
   sanitizeRemoteVoiceNickname,
   sanitizeRemoteVoiceProviderErrorCode,
+  sanitizeVoiceTranscriptWithHotwords,
   type RemoteVoiceErrorCode,
   type RemoteVoiceModelId,
   type RemoteVoiceModelLabel,
@@ -32,10 +32,7 @@ import {
   type RemoteVoiceServerFrame,
   type RemoteVoiceServerSharedEntry,
 } from '../../../shared/remote-voice.js';
-import {
-  hasPcm16SpeechEnergy,
-  stripVoiceHotwordHallucination,
-} from '../../../shared/voice-hotwords.js';
+import { hasPcm16SpeechEnergy } from '../../../shared/voice-hotwords.js';
 import type { Database } from '../db/client.js';
 import { getSetting, getUserById, getUserPref } from '../db/queries.js';
 import {
@@ -1237,10 +1234,7 @@ export class RemoteVoiceHub {
         return;
       }
 
-      const afterRepetition = sanitizeAsrRepetitionLoop(transcript);
-      const sanitized = session.hotwords && session.hotwords.length > 0
-        ? stripVoiceHotwordHallucination(afterRepetition, session.hotwords)
-        : afterRepetition;
+      const sanitized = sanitizeVoiceTranscriptWithHotwords(transcript, session.hotwords);
       if (sanitized.length > 0) {
         safeSendWs(session.clientWs, {
           type: 'voice.session.result',
@@ -1284,10 +1278,12 @@ export class RemoteVoiceHub {
     const session = this.sessions.get(sessionId);
     if (!session || session.providerUserId !== providerUserId || session.providerWs !== providerWs) return;
     this.resetIdleTimer(session);
-    const filteredInput = session.hotwords && session.hotwords.length > 0
-      ? stripVoiceHotwordHallucination(text, session.hotwords)
-      : text;
-    const resolved = resolveSessionTranscriptResult(filteredInput, isFinal, session.lastNonEmptyText ?? '');
+    const resolved = resolveSessionTranscriptResult(
+      text,
+      isFinal,
+      session.lastNonEmptyText ?? '',
+      session.hotwords,
+    );
     session.lastNonEmptyText = resolved.nextLastNonEmptyText;
     if (!resolved.emit) {
       return;

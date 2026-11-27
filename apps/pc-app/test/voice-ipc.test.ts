@@ -2776,14 +2776,14 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       const proc = spawnedProcs[0]!;
       proc.stdout.emit('data', '{"type":"ready","variant":"1.7b"}\n');
 
-      // 1) Local startListening passes hotwords cleanly and leaves hotwords.txt untouched
+      // 1) Local startListening passes structured hotwords array cleanly (keeping commas inside single term intact) and leaves hotwords.txt untouched
       const localStart1 = await handlers.get(PC_APP_VOICE_CHANNELS.startListening)!(trustedEv, {
         locale: 'zh-Hans',
-        hotwords: ['IM.codes', 'worktree'],
+        hotwords: ['IM.codes', 'worktree', 'Codex, Claude'],
       });
       expect(localStart1).toEqual({ ok: true });
       const start1Cmd = JSON.parse(String(proc.stdin.write.mock.calls.at(-1)?.[0]).trim());
-      expect(start1Cmd).toEqual({ cmd: 'start', locale: 'zh-Hans', hotwords: 'IM.codes, worktree' });
+      expect(start1Cmd).toEqual({ cmd: 'start', locale: 'zh-Hans', hotwords: ['IM.codes', 'worktree', 'Codex, Claude'] });
       proc.stdout.emit('data', '{"type":"end"}\n');
       await voice.stopListening({ abort: true });
 
@@ -2795,15 +2795,15 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       proc.stdout.emit('data', '{"type":"end"}\n');
       await voice.stopListening({ abort: true });
 
-      // 3) Remote session A with hotwords -> start_pcm carries hotwords
+      // 3) Remote session A with hotwords -> start_pcm carries structured hotwords array (preserving commas within a term)
       const rem1 = await handlers.get(PC_APP_VOICE_CHANNELS.startRemoteSession)!(trustedEv, {
         sessionId: 'rem-hw-1',
         locale: 'zh-Hans',
-        hotwords: ['IM.codes', 'codex-sdk'],
+        hotwords: ['IM.codes', 'codex-sdk', 'Codex, Claude'],
       });
       expect(rem1).toEqual({ ok: true });
       const rem1Cmd = JSON.parse(String(proc.stdin.write.mock.calls.at(-1)?.[0]).trim());
-      expect(rem1Cmd).toEqual({ cmd: 'start_pcm', locale: 'zh-Hans', hotwords: 'IM.codes, codex-sdk' });
+      expect(rem1Cmd).toEqual({ cmd: 'start_pcm', locale: 'zh-Hans', hotwords: ['IM.codes', 'codex-sdk', 'Codex, Claude'] });
       proc.stdout.emit('data', '{"type":"end"}\n');
 
       // 4) Remote session B without hotwords -> zero leakage
@@ -2824,7 +2824,7 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       });
       expect(rem3).toEqual({ ok: true });
       const rem3Cmd = JSON.parse(String(proc.stdin.write.mock.calls.at(-1)?.[0]).trim());
-      expect(rem3Cmd).toEqual({ cmd: 'start_pcm', locale: 'ja-JP', hotwords: 'ProjectY' });
+      expect(rem3Cmd).toEqual({ cmd: 'start_pcm', locale: 'ja-JP', hotwords: ['ProjectY'] });
       proc.stdout.emit('data', '{"type":"end"}\n');
 
       expect(readFileSync(hotwordsFilePath, 'utf8')).toBe('StaticOne\nStaticTwo\n');
