@@ -30,6 +30,7 @@ public class MainActivity extends BridgeActivity {
         registerPlugin(ShareReceiverPlugin.class);
         registerPlugin(NativeClipboardPlugin.class);
         registerPlugin(FileTransferKeepAlivePlugin.class);
+        registerPlugin(BackgroundPushPlugin.class);
         if (!isPluginListedInCapacitorPlugins("com.imcodes.speech.StreamingSpeechPlugin")) {
             registerPlugin(StreamingSpeechPlugin.class);
         }
@@ -65,6 +66,7 @@ public class MainActivity extends BridgeActivity {
             }
         }
         ShareReceiverPlugin.handleShareIntent(this, getIntent());
+        BackgroundPushPlugin.handleNotificationIntent(getIntent());
     }
 
     @Override
@@ -83,6 +85,7 @@ public class MainActivity extends BridgeActivity {
     protected void onNewIntent(Intent intent) {
         setIntent(intent);
         super.onNewIntent(intent);
+        BackgroundPushPlugin.handleNotificationIntent(intent);
         // Forward external file/text shares to ShareReceiverPlugin
         if (ShareReceiverPlugin.handleShareIntent(this, intent)) {
             return;

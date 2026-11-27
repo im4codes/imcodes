@@ -12,11 +12,12 @@
  * servers detect "I have no push credentials configured" and relay everything
  * via POST /api/push/relay back to the central server.
  */
-import { USER_STATUS, isUserStatusActive } from '../../../shared/user-status.js';
+import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { requireAuth } from '../security/authorization.js';
+import { loadUserAccess } from '../security/user-status.js';
 import { timingSafeEqual } from '../security/crypto.js';
 import { MemoryRateLimiter } from '../ws/rate-limiter.js';
 import { SignJWT, importPKCS8 } from 'jose';
@@ -39,6 +40,7 @@ import {
 import { listAccessibleControlledMachines } from '../share/machine-access.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
+import { PUSH_STREAM_KEEPALIVE_MS, pushStreamHub } from '../services/push-stream-hub.js';
 
 export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -51,10 +53,115 @@ export function isValidApnsDeviceToken(token: string): boolean {
   return APNS_DEVICE_TOKEN_RE.test(token);
 }
 
-// Auth required for register/unregister/preferences; relay is protected by optional PUSH_RELAY_SECRET + rate limit
+// Auth required for register/unregister/preferences/stream; relay is protected by optional PUSH_RELAY_SECRET + rate limit
 pushRoutes.use('/register', requireAuth());
 pushRoutes.use('/unregister', requireAuth());
 pushRoutes.use('/preferences', requireAuth());
+pushRoutes.use('/stream', requireAuth());
+
+// GET /api/push/stream — lightweight SSE push stream for native clients without FCM (e.g. Android withoutFcm)
+pushRoutes.get('/stream', async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const access = await loadUserAccess(c.env.DB, userId).catch(() => null);
+  if (!access) {
+    return c.json({ error: 'unauthorized' }, 401);
+  }
+  if (!isUserStatusActive(access.status)) {
+    return c.json({ error: userStatusDenialCode(access.status) }, 403);
+  }
+
+  const encoder = new TextEncoder();
+  const signal = c.req.raw.signal;
+  let cleanupFn: (() => void) | null = null;
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let cleaned = false;
+      let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
+      let unsubscribe: (() => void) | null = null;
+
+      const sendChunk = (chunk: string): boolean => {
+        if (cleaned) return false;
+        try {
+          controller.enqueue(encoder.encode(chunk));
+          return true;
+        } catch {
+          cleanup();
+          return false;
+        }
+      };
+
+      const onAbort = (): void => {
+        cleanup();
+      };
+
+      const cleanup = (): void => {
+        if (cleaned) return;
+        cleaned = true;
+        if (keepaliveTimer !== null) {
+          clearInterval(keepaliveTimer);
+          keepaliveTimer = null;
+        }
+        try {
+          signal.removeEventListener('abort', onAbort);
+        } catch {
+          // ignore
+        }
+        if (unsubscribe) {
+          const fn = unsubscribe;
+          unsubscribe = null;
+          fn();
+        }
+        try {
+          controller.close();
+        } catch {
+          // ignore already-closed controller
+        }
+      };
+
+      cleanupFn = cleanup;
+
+      if (signal.aborted) {
+        cleanup();
+        return;
+      }
+
+      unsubscribe = pushStreamHub.subscribe(userId, {
+        send: sendChunk,
+        close: cleanup,
+      });
+
+      signal.addEventListener('abort', onAbort, { once: true });
+
+      if (!sendChunk(': connected\n\n')) {
+        cleanup();
+        return;
+      }
+
+      keepaliveTimer = setInterval(() => {
+        if (!sendChunk(': keepalive\n\n')) {
+          cleanup();
+        }
+      }, PUSH_STREAM_KEEPALIVE_MS);
+      if (typeof (keepaliveTimer as { unref?: () => void }).unref === 'function') {
+        (keepaliveTimer as { unref: () => void }).unref();
+      }
+    },
+    cancel() {
+      cleanupFn?.();
+    },
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'X-Accel-Buffering': 'no',
+      Connection: 'keep-alive',
+    },
+  });
+});
 
 // POST /api/push/register — store device token for user
 pushRoutes.post('/register', async (c) => {
@@ -468,9 +575,15 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   const desktopAllowed = userNotificationTypes !== null
     ? (!payload.type || userNotificationTypes.includes(payload.type))
     : (matchingTokens.length > 0 || !payload.type);
+  const streamAllowed = userNotificationTypes !== null
+    ? (!payload.type || userNotificationTypes.includes(payload.type))
+    : (!payload.type || DEFAULT_PUSH_NOTIFICATION_TYPES.includes(payload.type) || matchingTokens.length > 0);
 
-  if (matchingTokens.length === 0 && !desktopAllowed) return;
-  if ((matchingTokens.length === 0 || payload.suppressMobilePush) && (!desktopAllowed || payload.suppressDesktopPush)) return;
+  const wantsDesktop = desktopAllowed && !payload.suppressDesktopPush;
+  const wantsTokenMobile = matchingTokens.length > 0 && !payload.suppressMobilePush;
+  const wantsStreamMobile = streamAllowed && !payload.suppressMobilePush && pushStreamHub.hasSubscribers(payload.userId);
+
+  if (!wantsDesktop && !wantsTokenMobile && !wantsStreamMobile) return;
 
   if (targetServerId && !shouldBypassServerPushMute(payload.type)) {
     if (Array.isArray(rawEnabledServerIds)) {
@@ -481,10 +594,12 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     }
   }
 
-  if (desktopAllowed && !payload.suppressDesktopPush) {
+  const eventId = resolvePushEventId(payload, targetServerId);
+
+  if (wantsDesktop) {
     await globalTaskHub.notifyPushNotification(db, {
       userId: payload.userId,
-      eventId: resolvePushEventId(payload, targetServerId),
+      eventId,
       title: payload.title,
       body: payload.body,
       ...(payload.type ? { notificationType: payload.type } : {}),
@@ -498,7 +613,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     });
   }
 
-  if (matchingTokens.length === 0 || payload.suppressMobilePush) return;
+  if (!wantsTokenMobile && !wantsStreamMobile) return;
 
   // Atomically increment badge count and read the new value
   let badgeCount = 1;
@@ -512,6 +627,19 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     logger.warn({ err, userId: payload.userId }, 'Failed to increment badge_count — falling back to 1');
   }
   payload.badge = badgeCount;
+
+  if (wantsStreamMobile) {
+    pushStreamHub.publish(payload.userId, {
+      id: eventId,
+      title: payload.title,
+      body: payload.body,
+      ...(payload.type ? { type: payload.type } : {}),
+      badge: badgeCount,
+      ...(payload.data ? { data: payload.data } : {}),
+    });
+  }
+
+  if (!wantsTokenMobile) return;
 
   const hasApns = !!(env.APNS_KEY && env.APNS_KEY_ID && env.APNS_TEAM_ID);
   const hasFcm = !!env.FCM_SERVICE_ACCOUNT_JSON?.trim();

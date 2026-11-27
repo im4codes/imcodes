@@ -13,6 +13,7 @@ import { findInactiveUsers } from '../security/user-status.js';
 import logger from '../util/logger.js';
 import { WsBridge } from './bridge.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
+import { pushStreamHub } from '../services/push-stream-hub.js';
 import { remoteVoiceHub } from '../services/remote-voice-hub.js';
 
 export interface AccountWatchResult {
@@ -30,12 +31,14 @@ export async function closeConnectionsOfInactiveUsers(
   const live = new Set<string>();
   for (const bridge of all) bridge.collectLiveUserIds(live);
   globalTaskHub.collectLiveUserIds(live);
+  pushStreamHub.collectLiveUserIds(live);
   remoteVoiceHub.collectLiveUserIds(live);
   if (live.size === 0) return { inactiveUsers: 0, browserSockets: 0, daemons: 0 };
   const inactive = await findInactiveUsers(db, [...live]);
   if (inactive.size === 0) return { inactiveUsers: 0, browserSockets: 0, daemons: 0 };
   const result: AccountWatchResult = { inactiveUsers: inactive.size, browserSockets: 0, daemons: 0 };
   result.browserSockets += globalTaskHub.closeInactiveUserSockets(inactive);
+  result.browserSockets += pushStreamHub.closeInactiveUsers(inactive);
   result.browserSockets += remoteVoiceHub.closeInactiveUserSockets(inactive);
   for (const bridge of all) {
     const closed = bridge.closeConnectionsOfUsers(inactive, userStatusDenialCode(USER_STATUS.DISABLED));

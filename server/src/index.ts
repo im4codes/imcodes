@@ -4,6 +4,7 @@ import { TASK_PAIR_TITLE_AUTHORITY_PATH } from '../../shared/task-pair-title-acc
 import { MachineGroupInvalidationRuntime } from './services/machine-group-invalidation.js';
 import { applyMachineGroupInvalidation, failClosedMachineGroupConnections } from './ws/machine-group-revalidation.js';
 import { globalTaskHub } from './services/global-task-hub.js';
+import { pushStreamHub } from './services/push-stream-hub.js';
 import { globalTasksRoutes } from './routes/global-tasks.js';
 import { remoteVoiceHub } from './services/remote-voice-hub.js';
 import { remoteVoiceRoutes } from './routes/remote-voice.js';
@@ -1582,6 +1583,7 @@ async function main() {
     setRemoteDesktopShellLaunchContextDispatcher(null);
     stopAccountWatch();
     await globalTaskHub.stop();
+    pushStreamHub.stop();
     remoteVoiceHub.stop();
     await machineGroupInvalidation.stop();
     await managementPrivacyWorker.stop();

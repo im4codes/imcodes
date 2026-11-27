@@ -365,6 +365,7 @@ import {
 import {
   initPushNotifications,
   resetPushBadge,
+  stopAndroidBackgroundPushOnLogout,
   getLocalPushEnabledServers,
   fetchPushNotificationSettings,
   subscribePushEnabledServers,
@@ -7297,6 +7298,7 @@ function InternalMainApp() {
       // Local authority revocation must continue even if Secure Storage is
       // unavailable. In particular, server switching must never carry the old
       // in-memory/localStorage identity into ServerSetupPage.
+      await stopAndroidBackgroundPushOnLogout().catch(() => {});
       await clearStoredAuthForServer(credentialServerUrl);
       clearApiKey();
     } else {

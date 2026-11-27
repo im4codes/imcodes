@@ -228,6 +228,7 @@ vi.mock('../src/biometric-auth.js', () => ({
 vi.mock('../src/push-notifications.js', () => ({
   initPushNotifications: vi.fn(async () => undefined),
   resetPushBadge: vi.fn(async () => undefined),
+  stopAndroidBackgroundPushOnLogout: vi.fn(async () => undefined),
   getLocalPushEnabledServers: vi.fn(() => null),
   fetchPushNotificationSettings: vi.fn(async () => null),
   subscribePushEnabledServers: vi.fn(() => () => {}),

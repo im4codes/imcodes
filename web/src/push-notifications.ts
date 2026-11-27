@@ -21,9 +21,51 @@ import {
   type PushNotificationType,
 } from '@shared/push-notifications.js';
 
+export type AndroidBackgroundPushConnectionState =
+  | 'disabled'
+  | 'stopped'
+  | 'connecting'
+  | 'connected'
+  | 'waiting_network'
+  | 'auth_error';
+
+export interface AndroidBackgroundPushStatus {
+  supported: boolean;
+  hasFcm: boolean;
+  enabled: boolean;
+  running: boolean;
+  connectionState: AndroidBackgroundPushConnectionState;
+  notificationsGranted: boolean;
+  batteryOptimizationIgnored: boolean;
+}
+
+interface BackgroundPushPluginContract {
+  getStatus(): Promise<AndroidBackgroundPushStatus>;
+  requestNotificationPermission(): Promise<{ supported: boolean; granted: boolean }>;
+  requestIgnoreBatteryOptimizations(): Promise<{ supported: boolean; granted: boolean }>;
+  start(options: {
+    serverUrl: string;
+    apiKey: string;
+    statusTitle?: string;
+    statusText?: string;
+  }): Promise<{ supported: boolean; started: boolean }>;
+  stop(): Promise<{ supported: boolean; stopped: boolean }>;
+  consumePendingNotification(): Promise<{ notification: { serverId?: string; session?: string } | null }>;
+  addListener(
+    eventName: 'backgroundPushActionPerformed' | 'backgroundPushStateChanged',
+    listener: (payload: Record<string, unknown>) => void,
+  ): Promise<{ remove?: () => Promise<void> }>;
+}
+
+export const ANDROID_BG_PUSH_ENABLED_KEY = 'imcodes.android_background_push_enabled';
+
 let pushSupported = false;
 let resetBadgePromise: Promise<void> | null = null;
 let lastBadgeResetAt = 0;
+let activeAndroidBgAuth: { apiKey: string; serverUrl: string } | null = null;
+let androidBgListenersMounted = false;
+let lastAndroidBgStatus: AndroidBackgroundPushStatus | null = null;
+const androidBgStatusListeners = new Set<(status: AndroidBackgroundPushStatus | null) => void>();
 
 // Expose badge-reset to native layer (AppDelegate calls via evaluateJavaScript on app foreground).
 // Uses apiFetch which prepends baseUrl and includes Bearer token — relative URLs fail in Capacitor.
@@ -58,7 +100,7 @@ export async function initPushNotifications(
 
   const platform = getPlatform();
   if (platform === 'android' && !isFcmBuild()) {
-    pushSupported = false;
+    await initAndroidBackgroundPush(apiKey, cfWorkerUrl);
     return;
   }
   await initApnsOrFcm(apiKey, cfWorkerUrl);
@@ -68,6 +110,222 @@ function isFcmBuild(): boolean {
   // Inline Vite/Vitest harnesses do not define the production macro. Preserve
   // the historical default (FCM enabled) while making the pure build explicit.
   return typeof __PUSH_FCM__ === 'undefined' || __PUSH_FCM__;
+}
+
+export function isAndroidBackgroundPushSupportedBuild(): boolean {
+  return isNative() && getPlatform() === 'android' && !isFcmBuild();
+}
+
+export function getLocalAndroidBackgroundPushEnabled(): boolean {
+  try {
+    return localStorage.getItem(ANDROID_BG_PUSH_ENABLED_KEY) !== '0';
+  } catch {
+    return true;
+  }
+}
+
+export function setLocalAndroidBackgroundPushEnabled(enabled: boolean): void {
+  try {
+    localStorage.setItem(ANDROID_BG_PUSH_ENABLED_KEY, enabled ? '1' : '0');
+  } catch {
+    // ignore unavailable storage
+  }
+}
+
+function emitAndroidBgStatus(status: AndroidBackgroundPushStatus | null): void {
+  lastAndroidBgStatus = status;
+  for (const listener of androidBgStatusListeners) {
+    listener(status);
+  }
+}
+
+async function getBackgroundPushPlugin(): Promise<BackgroundPushPluginContract | null> {
+  if (!isAndroidBackgroundPushSupportedBuild()) return null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const cap = (globalThis as any).Capacitor;
+  if (cap?.Plugins?.BackgroundPush) {
+    return cap.Plugins.BackgroundPush as BackgroundPushPluginContract;
+  }
+  if (typeof cap?.isPluginAvailable === 'function' && cap.isPluginAvailable('BackgroundPush')) {
+    const { registerPlugin } = await import('@capacitor/core');
+    return registerPlugin<BackgroundPushPluginContract>('BackgroundPush');
+  }
+  return null;
+}
+
+async function mountAndroidBackgroundListeners(plugin: BackgroundPushPluginContract): Promise<void> {
+  if (androidBgListenersMounted) return;
+  androidBgListenersMounted = true;
+  await plugin.addListener('backgroundPushActionPerformed', (payload) => {
+    const data: Record<string, string> = {};
+    if (typeof payload?.serverId === 'string') data.serverId = payload.serverId;
+    if (typeof payload?.session === 'string') data.session = payload.session;
+    handleNotificationOpen(data);
+  });
+  await plugin.addListener('backgroundPushStateChanged', (payload) => {
+    if (payload && typeof payload.supported === 'boolean') {
+      emitAndroidBgStatus(payload as unknown as AndroidBackgroundPushStatus);
+    }
+  });
+}
+
+async function initAndroidBackgroundPush(apiKey: string, cfWorkerUrl: string): Promise<void> {
+  activeAndroidBgAuth = { apiKey, serverUrl: cfWorkerUrl };
+  const plugin = await getBackgroundPushPlugin();
+  if (!plugin) {
+    pushSupported = false;
+    return;
+  }
+
+  await mountAndroidBackgroundListeners(plugin);
+
+  try {
+    const pending = await plugin.consumePendingNotification();
+    if (pending?.notification && (pending.notification.serverId || pending.notification.session)) {
+      const navData: Record<string, string> = {};
+      if (pending.notification.serverId) navData.serverId = pending.notification.serverId;
+      if (pending.notification.session) navData.session = pending.notification.session;
+      handleNotificationOpen(navData);
+    }
+  } catch {
+    // ignore failed pending read
+  }
+
+  let status = await plugin.getStatus();
+  if (!status?.supported) {
+    pushSupported = false;
+    emitAndroidBgStatus(status ?? null);
+    return;
+  }
+
+  const userEnabled = getLocalAndroidBackgroundPushEnabled();
+  if (!userEnabled) {
+    if (status.running || status.enabled) {
+      await plugin.stop();
+      status = await plugin.getStatus();
+    }
+    pushSupported = status.notificationsGranted;
+    emitAndroidBgStatus(status);
+    return;
+  }
+
+  let granted = status.notificationsGranted;
+  if (!granted) {
+    const req = await plugin.requestNotificationPermission();
+    granted = Boolean(req?.granted);
+  }
+  if (!granted) {
+    pushSupported = false;
+    emitAndroidBgStatus(await plugin.getStatus());
+    return;
+  }
+
+  const startRes = await plugin.start({ serverUrl: cfWorkerUrl, apiKey });
+  pushSupported = Boolean(startRes?.started);
+  emitAndroidBgStatus(await plugin.getStatus());
+}
+
+export async function getAndroidBackgroundPushStatus(): Promise<AndroidBackgroundPushStatus | null> {
+  const plugin = await getBackgroundPushPlugin();
+  if (!plugin) return null;
+  const status = await plugin.getStatus();
+  emitAndroidBgStatus(status);
+  return status;
+}
+
+export function subscribeAndroidBackgroundPushStatus(
+  listener: (status: AndroidBackgroundPushStatus | null) => void,
+): () => void {
+  androidBgStatusListeners.add(listener);
+  if (lastAndroidBgStatus) {
+    listener(lastAndroidBgStatus);
+  }
+  return () => {
+    androidBgStatusListeners.delete(listener);
+  };
+}
+
+export async function enableAndroidBackgroundPush(credentials?: {
+  apiKey?: string | null;
+  serverUrl?: string | null;
+}): Promise<AndroidBackgroundPushStatus | null> {
+  const plugin = await getBackgroundPushPlugin();
+  if (!plugin) return null;
+
+  setLocalAndroidBackgroundPushEnabled(true);
+  let status = await plugin.getStatus();
+  if (!status.notificationsGranted) {
+    const req = await plugin.requestNotificationPermission();
+    if (!req?.granted) {
+      status = await plugin.getStatus();
+      pushSupported = false;
+      emitAndroidBgStatus(status);
+      return status;
+    }
+  }
+
+  const apiKey = credentials?.apiKey?.trim() || activeAndroidBgAuth?.apiKey;
+  const serverUrl = credentials?.serverUrl?.trim() || activeAndroidBgAuth?.serverUrl;
+  if (apiKey && serverUrl) {
+    activeAndroidBgAuth = { apiKey, serverUrl };
+    const startRes = await plugin.start({ serverUrl, apiKey });
+    pushSupported = Boolean(startRes?.started);
+  }
+  status = await plugin.getStatus();
+  emitAndroidBgStatus(status);
+  return status;
+}
+
+export async function disableAndroidBackgroundPush(): Promise<AndroidBackgroundPushStatus | null> {
+  const plugin = await getBackgroundPushPlugin();
+  setLocalAndroidBackgroundPushEnabled(false);
+  if (!plugin) return null;
+  await plugin.stop();
+  const status = await plugin.getStatus();
+  emitAndroidBgStatus(status);
+  return status;
+}
+
+export async function requestAndroidNotificationPermission(): Promise<AndroidBackgroundPushStatus | null> {
+  const plugin = await getBackgroundPushPlugin();
+  if (!plugin) return null;
+  const res = await plugin.requestNotificationPermission();
+  if (res?.granted && getLocalAndroidBackgroundPushEnabled() && activeAndroidBgAuth) {
+    const startRes = await plugin.start({
+      serverUrl: activeAndroidBgAuth.serverUrl,
+      apiKey: activeAndroidBgAuth.apiKey,
+    });
+    pushSupported = Boolean(startRes?.started);
+  }
+  const status = await plugin.getStatus();
+  emitAndroidBgStatus(status);
+  return status;
+}
+
+export async function requestAndroidBatteryOptimizationExemption(): Promise<AndroidBackgroundPushStatus | null> {
+  const plugin = await getBackgroundPushPlugin();
+  if (!plugin) return null;
+  await plugin.requestIgnoreBatteryOptimizations();
+  const status = await plugin.getStatus();
+  emitAndroidBgStatus(status);
+  return status;
+}
+
+export async function stopAndroidBackgroundPushOnLogout(): Promise<void> {
+  activeAndroidBgAuth = null;
+  pushSupported = false;
+  const plugin = await getBackgroundPushPlugin();
+  if (!plugin) return;
+  await plugin.stop();
+  emitAndroidBgStatus(await plugin.getStatus().catch(() => null));
+}
+
+export function resetAndroidBackgroundPushStateForTesting(): void {
+  pushSupported = false;
+  activeAndroidBgAuth = null;
+  androidBgListenersMounted = false;
+  lastAndroidBgStatus = null;
+  androidBgStatusListeners.clear();
 }
 
 // ── APNs (iOS) / FCM (International Android) via @capacitor/push-notifications ──
