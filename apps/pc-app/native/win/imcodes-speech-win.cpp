@@ -32,6 +32,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #ifdef IMCODES_HAS_SHERPA_ONNX
@@ -601,27 +602,146 @@ int run_status_command() {
   return 0;
 }
 
+inline void append_utf8_cp(std::string& out, uint32_t cp) {
+  if (cp < 0x80) {
+    out.push_back(static_cast<char>(cp));
+  } else if (cp < 0x800) {
+    out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else if (cp < 0x10000) {
+    out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  } else {
+    out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+    out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+  }
+}
+
+std::optional<std::string> parse_json_string_at(const std::string& json_line, size_t open_quote, size_t* out_next_pos) {
+  if (open_quote >= json_line.size() || json_line[open_quote] != '"') return std::nullopt;
+  std::string out;
+  for (size_t i = open_quote + 1; i < json_line.size(); ++i) {
+    char ch = json_line[i];
+    if (ch == '\\' && i + 1 < json_line.size()) {
+      char esc = json_line[++i];
+      if (esc == 'n') out.push_back('\n');
+      else if (esc == 'r') out.push_back('\r');
+      else if (esc == 't') out.push_back('\t');
+      else if (esc == 'u' && i + 4 < json_line.size()) {
+        uint32_t hex_cp = 0;
+        bool valid_hex = true;
+        for (int k = 1; k <= 4; ++k) {
+          char h = json_line[i + k];
+          hex_cp <<= 4;
+          if (h >= '0' && h <= '9') hex_cp |= static_cast<uint32_t>(h - '0');
+          else if (h >= 'a' && h <= 'f') hex_cp |= static_cast<uint32_t>(h - 'a' + 10);
+          else if (h >= 'A' && h <= 'F') hex_cp |= static_cast<uint32_t>(h - 'A' + 10);
+          else { valid_hex = false; break; }
+        }
+        if (valid_hex) {
+          i += 4;
+          // Handle UTF-16 surrogate pair in \uD800..\uDBFF \uDC00..\uDFFF
+          if (hex_cp >= 0xD800 && hex_cp <= 0xDBFF && i + 6 < json_line.size() &&
+              json_line[i + 1] == '\\' && json_line[i + 2] == 'u') {
+            uint32_t low = 0;
+            bool valid_low = true;
+            for (int k = 3; k <= 6; ++k) {
+              char h = json_line[i + k];
+              low <<= 4;
+              if (h >= '0' && h <= '9') low |= static_cast<uint32_t>(h - '0');
+              else if (h >= 'a' && h <= 'f') low |= static_cast<uint32_t>(h - 'a' + 10);
+              else if (h >= 'A' && h <= 'F') low |= static_cast<uint32_t>(h - 'A' + 10);
+              else { valid_low = false; break; }
+            }
+            if (valid_low && low >= 0xDC00 && low <= 0xDFFF) {
+              hex_cp = 0x10000 + (((hex_cp - 0xD800) << 10) | (low - 0xDC00));
+              i += 6;
+            }
+          }
+          append_utf8_cp(out, hex_cp);
+        } else {
+          out.push_back(esc);
+        }
+      } else {
+        out.push_back(esc);
+      }
+      continue;
+    }
+    if (ch == '"') {
+      if (out_next_pos) *out_next_pos = i + 1;
+      return out;
+    }
+    out.push_back(ch);
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> extract_json_string_field(const std::string& json_line, const std::string& key) {
   const std::string needle = "\"" + key + "\"";
   const size_t pos = json_line.find(needle);
   if (pos == std::string::npos) return std::nullopt;
   const size_t colon = json_line.find(':', pos + needle.size());
   if (colon == std::string::npos) return std::nullopt;
-  const size_t q1 = json_line.find('"', colon + 1);
-  if (q1 == std::string::npos) return std::nullopt;
-  std::string out;
-  for (size_t i = q1 + 1; i < json_line.size(); ++i) {
-    char ch = json_line[i];
-    if (ch == '\\' && i + 1 < json_line.size()) {
-      out.push_back(json_line[++i]);
-      continue;
+  size_t p = colon + 1;
+  while (p < json_line.size() && is_ascii_ws(json_line[p])) ++p;
+  if (p >= json_line.size() || json_line[p] != '"') return std::nullopt;
+  return parse_json_string_at(json_line, p, nullptr);
+}
+
+std::vector<std::string> extract_json_string_array_field(const std::string& json_line, const std::string& key) {
+  std::vector<std::string> items;
+  const std::string needle = "\"" + key + "\"";
+  const size_t pos = json_line.find(needle);
+  if (pos == std::string::npos) return items;
+  const size_t colon = json_line.find(':', pos + needle.size());
+  if (colon == std::string::npos) return items;
+  size_t p = colon + 1;
+  while (p < json_line.size() && is_ascii_ws(json_line[p])) ++p;
+  if (p >= json_line.size() || json_line[p] != '[') return items;
+  ++p;
+  while (p < json_line.size()) {
+    while (p < json_line.size() && (is_ascii_ws(json_line[p]) || json_line[p] == ',')) ++p;
+    if (p >= json_line.size() || json_line[p] == ']') break;
+    if (json_line[p] == '"') {
+      size_t next_p = p;
+      auto val = parse_json_string_at(json_line, p, &next_p);
+      if (!val.has_value()) break;
+      std::string trimmed = trim_ascii_ws(*val);
+      if (!trimmed.empty()) items.push_back(std::move(trimmed));
+      p = next_p;
+    } else {
+      break;
     }
-    if (ch == '"') {
-      return out;
-    }
-    out.push_back(ch);
   }
-  return std::nullopt;
+  return items;
+}
+
+std::vector<std::string> split_hotwords_string(const std::string& raw) {
+  std::vector<std::string> out;
+  std::string cur;
+  for (char ch : raw) {
+    if (ch == ',' || ch == '\n' || ch == '\r') {
+      std::string trimmed = trim_ascii_ws(cur);
+      if (!trimmed.empty()) out.push_back(std::move(trimmed));
+      cur.clear();
+    } else {
+      cur.push_back(ch);
+    }
+  }
+  std::string trimmed = trim_ascii_ws(cur);
+  if (!trimmed.empty()) out.push_back(std::move(trimmed));
+  return out;
+}
+
+std::vector<std::string> merge_hotword_terms(
+    const std::vector<std::string>& base,
+    const std::vector<std::string>& extra) {
+  std::vector<std::string> merged = base;
+  merged.insert(merged.end(), extra.begin(), extra.end());
+  return merged;
 }
 
 std::string resolve_target_capture_uid(const std::string& requested_uid) {
@@ -660,21 +780,47 @@ bool has_speech_energy_indexed(SampleAtFn&& sample_at, size_t end) {
   return false;
 }
 
-// Conservative utterance silence gate: skips pure silence / faint noise floor before feeding
-// ONNX Qwen3-ASR (with hotwords context), while keeping quiet speech (peak >= 0.015 or 50ms RMS >= 0.005).
-bool has_utterance_speech_energy(const std::vector<float>& samples, int sample_rate = kTargetSampleRate) {
+struct SpeechEnergyBounds {
+  size_t first{0};
+  size_t last{0};
+  bool found{false};
+};
+
+// Conservative utterance silence scan: detects speech where peak >= 0.015 or 50ms RMS >= 0.005.
+SpeechEnergyBounds scan_speech_energy_bounds(
+    const std::vector<float>& samples,
+    int sample_rate = kTargetSampleRate,
+    bool stop_on_first = false) {
+  SpeechEnergyBounds out;
   const size_t count = samples.size();
-  if (count == 0) return false;
+  if (count == 0) return out;
   constexpr float kUtterancePeakThreshold = 0.015f;
   constexpr double kUtteranceWindowRmsThreshold = 0.005;
   constexpr double kRmsSqThreshold = kUtteranceWindowRmsThreshold * kUtteranceWindowRmsThreshold;
   const int rate = sample_rate > 0 ? sample_rate : kTargetSampleRate;
   const size_t window_samples = std::max<size_t>(1, static_cast<size_t>(std::llround(static_cast<double>(rate) * 0.05)));
 
+  constexpr float kRmsSampleThresh = static_cast<float>(kUtteranceWindowRmsThreshold);
   double window_sum_sq = 0.0;
+  bool has_above_rms = false;
+  size_t first_above_rms = 0;
+  size_t last_above_rms = 0;
   for (size_t i = 0; i < count; ++i) {
     const float s = samples[i];
-    if (std::fabs(s) >= kUtterancePeakThreshold) return true;
+    const float abs_s = std::fabs(s);
+    if (abs_s >= kRmsSampleThresh) {
+      if (!has_above_rms) {
+        has_above_rms = true;
+        first_above_rms = i;
+      }
+      last_above_rms = i;
+    }
+    if (abs_s >= kUtterancePeakThreshold) {
+      if (!out.found) out.first = i;
+      out.last = i;
+      out.found = true;
+      if (stop_on_first) return out;
+    }
     const double d = static_cast<double>(s);
     window_sum_sq += d * d;
     if (i >= window_samples) {
@@ -683,13 +829,58 @@ bool has_utterance_speech_energy(const std::vector<float>& samples, int sample_r
       if (window_sum_sq < 0.0) window_sum_sq = 0.0;
     }
     if (i + 1 >= window_samples && (window_sum_sq / static_cast<double>(window_samples)) >= kRmsSqThreshold) {
-      return true;
+      const size_t win_start = i + 1 - window_samples;
+      if (!out.found) {
+        size_t tightened = win_start;
+        if (has_above_rms && first_above_rms >= win_start) {
+          tightened = first_above_rms;
+        } else {
+          for (size_t j = win_start; j <= i; ++j) {
+            if (std::fabs(samples[j]) >= kRmsSampleThresh) {
+              tightened = j;
+              break;
+            }
+          }
+        }
+        out.first = tightened;
+        out.last = tightened;
+        out.found = true;
+      }
+      if (has_above_rms && last_above_rms >= win_start && last_above_rms > out.last) {
+        out.last = last_above_rms;
+      }
+      if (stop_on_first) return out;
     }
   }
   if (count < window_samples && (window_sum_sq / static_cast<double>(count)) >= kRmsSqThreshold) {
-    return true;
+    out.first = has_above_rms ? first_above_rms : 0;
+    out.last = has_above_rms ? last_above_rms : (count - 1);
+    out.found = true;
   }
-  return false;
+  return out;
+}
+
+bool has_utterance_speech_energy(const std::vector<float>& samples, int sample_rate = kTargetSampleRate) {
+  return scan_speech_energy_bounds(samples, sample_rate, true).found;
+}
+
+std::vector<float> trim_silence_edges(
+    const std::vector<float>& samples,
+    int sample_rate = kTargetSampleRate,
+    int pad_ms = 250) {
+  const size_t count = samples.size();
+  const SpeechEnergyBounds bounds = scan_speech_energy_bounds(samples, sample_rate, false);
+  if (!bounds.found || bounds.last < bounds.first) return {};
+  const int rate = sample_rate > 0 ? sample_rate : kTargetSampleRate;
+  const size_t pad_samples = pad_ms > 0
+      ? static_cast<size_t>(std::llround(static_cast<double>(rate) * static_cast<double>(pad_ms) / 1000.0))
+      : 0;
+  const size_t start = bounds.first > pad_samples ? (bounds.first - pad_samples) : 0;
+  const size_t end = std::min(count, bounds.last + 1 + pad_samples);
+  if (start == 0 && end == count) return samples;
+  return std::vector<float>(
+      samples.begin() + static_cast<std::ptrdiff_t>(start),
+      samples.begin() + static_cast<std::ptrdiff_t>(end));
 }
 
 bool has_trailing_silence_pause(const std::vector<float>& samples, const std::string& active_segment_text) {
@@ -739,6 +930,558 @@ size_t find_pause_split_take_count(
   return max_take;
 }
 
+// MARK: - Voice Hotword Edge Hallucination Stripping
+
+inline bool is_hotword_combining_mark_cp(uint32_t cp) {
+  return (cp >= 0x0300 && cp <= 0x036F)
+      || (cp >= 0x1AB0 && cp <= 0x1AFF)
+      || (cp >= 0x1DC0 && cp <= 0x1DFF)
+      || (cp >= 0x20D0 && cp <= 0x20FF)
+      || (cp >= 0xFE20 && cp <= 0xFE2F);
+}
+
+inline uint32_t normalize_hotword_cp(uint32_t cp) {
+  if (cp >= 0xFF01 && cp <= 0xFF5E) {
+    cp -= 0xFEE0;
+  } else if (cp == 0x3000 || cp == 0x00A0 || (cp >= 0x2000 && cp <= 0x200B) || cp == 0xFEFF) {
+    cp = ' ';
+  } else if (cp == 0xFF61) {
+    cp = '.';
+  } else if ((cp >= 0x2010 && cp <= 0x2015) || cp == 0x2212 || cp == 0xFE58 || cp == 0xFE63) {
+    cp = '-';
+  } else if (cp >= 0x2018 && cp <= 0x201B) {
+    cp = '\'';
+  } else if (cp >= 0x201C && cp <= 0x201F) {
+    cp = '"';
+  }
+  if (cp >= 'A' && cp <= 'Z') {
+    cp += ('a' - 'A');
+  }
+  return cp;
+}
+
+inline bool is_hotword_ascii_alnum_cp(uint32_t cp) {
+  return (cp >= '0' && cp <= '9')
+      || (cp >= 'A' && cp <= 'Z')
+      || (cp >= 'a' && cp <= 'z')
+      || cp == '_';
+}
+
+inline bool is_hotword_sep_cp(uint32_t cp) {
+  if (cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n') return true;
+  if (cp < 0x80) return !is_hotword_ascii_alnum_cp(cp);
+  return (cp >= 0x00A0 && cp <= 0x00BF)
+      || (cp >= 0x2000 && cp <= 0x206F)
+      || cp == 0x20AC
+      || (cp >= 0x3000 && cp <= 0x303F)
+      || (cp >= 0xFE10 && cp <= 0xFE6F)
+      || (cp >= 0xFF01 && cp <= 0xFF65);
+}
+
+inline bool is_hotword_sentence_end_cp(uint32_t cp) {
+  return cp == '.' || cp == '!' || cp == '?' || cp == ';'
+      || cp == '\n' || cp == '\r'
+      || cp == 0x3002 || cp == 0xFF01 || cp == 0xFF1F || cp == 0xFF1B;
+}
+
+inline bool is_hotword_weak_trailing_sep_cp(uint32_t cp) {
+  return cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n'
+      || cp == ',' || cp == ':' || cp == '-'
+      || cp == 0x3001 || cp == 0x2013 || cp == 0x2014 || cp == 0x00B7 || cp == 0x2022;
+}
+
+inline bool is_hotword_intra_word_punct_cp(uint32_t cp) {
+  return cp == '.' || cp == '-' || cp == '_' || cp == '\'' || cp == '/' || cp == '+';
+}
+
+inline void decode_next_utf8_cp(const std::string& s, size_t& i, uint32_t& out_cp) {
+  const size_t n = s.size();
+  const unsigned char b = static_cast<unsigned char>(s[i]);
+  if (b < 0x80) {
+    out_cp = b;
+    i += 1;
+  } else if ((b & 0xE0) == 0xC0 && i + 1 < n) {
+    out_cp = (static_cast<uint32_t>(b & 0x1F) << 6) |
+             static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1]) & 0x3F);
+    i += 2;
+  } else if ((b & 0xF0) == 0xE0 && i + 2 < n) {
+    out_cp = (static_cast<uint32_t>(b & 0x0F) << 12) |
+             (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1]) & 0x3F) << 6) |
+             static_cast<uint32_t>(static_cast<unsigned char>(s[i + 2]) & 0x3F);
+    i += 3;
+  } else if ((b & 0xF8) == 0xF0 && i + 3 < n) {
+    out_cp = (static_cast<uint32_t>(b & 0x07) << 18) |
+             (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1]) & 0x3F) << 12) |
+             (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 2]) & 0x3F) << 6) |
+             static_cast<uint32_t>(static_cast<unsigned char>(s[i + 3]) & 0x3F);
+    i += 4;
+  } else {
+    out_cp = b;
+    i += 1;
+  }
+}
+
+struct CppNormalizedClusterMap {
+  std::vector<uint32_t> cps;
+  std::vector<size_t> norm_to_raw_byte;
+  std::vector<size_t> cluster_start;
+  std::vector<uint8_t> is_sep;
+  std::vector<uint8_t> is_sent_end;
+  std::vector<uint8_t> is_weak_sep;
+  std::vector<uint8_t> is_intra_punct;
+  std::vector<uint8_t> is_ascii_alnum;
+};
+
+CppNormalizedClusterMap build_cpp_normalized_cluster_map(const std::string& text) {
+  CppNormalizedClusterMap map;
+  size_t i = 0;
+  const size_t bytes = text.size();
+  while (i < bytes) {
+    const size_t raw_start = i;
+    uint32_t base_cp = 0;
+    decode_next_utf8_cp(text, i, base_cp);
+    while (i < bytes) {
+      size_t peek_i = i;
+      uint32_t next_cp = 0;
+      decode_next_utf8_cp(text, peek_i, next_cp);
+      if (!is_hotword_combining_mark_cp(next_cp)) break;
+      i = peek_i;
+    }
+    const uint32_t norm_cp = normalize_hotword_cp(base_cp);
+    const size_t c_start = map.cps.size();
+    map.cps.push_back(norm_cp);
+    map.norm_to_raw_byte.push_back(raw_start);
+    map.cluster_start.push_back(c_start);
+    map.is_sep.push_back(is_hotword_sep_cp(norm_cp) ? 1 : 0);
+    map.is_sent_end.push_back(is_hotword_sentence_end_cp(norm_cp) ? 1 : 0);
+    map.is_weak_sep.push_back(is_hotword_weak_trailing_sep_cp(norm_cp) ? 1 : 0);
+    map.is_intra_punct.push_back(is_hotword_intra_word_punct_cp(norm_cp) ? 1 : 0);
+    map.is_ascii_alnum.push_back(is_hotword_ascii_alnum_cp(norm_cp) ? 1 : 0);
+  }
+  map.norm_to_raw_byte.push_back(bytes);
+  map.cluster_start.push_back(map.cps.size());
+  return map;
+}
+
+struct CppTrieNode {
+  std::unordered_map<uint32_t, int> children;
+  int term_id{-1};
+};
+
+struct CppHallucinationMatcher {
+  std::vector<CppTrieNode> fwd_nodes;
+  std::vector<CppTrieNode> rev_nodes;
+  std::vector<uint8_t> term_starts_ascii;
+  std::vector<uint8_t> term_ends_ascii;
+  std::vector<uint32_t> term_first_cp;
+  std::vector<uint32_t> term_last_cp;
+};
+
+bool is_cpp_chain_qualified(
+    int node_idx,
+    const std::vector<int>& node_prev,
+    const std::vector<int>& node_term,
+    bool require_sent_end,
+    bool has_sent_end) {
+  int total = 0;
+  std::unordered_map<int, int> counts;
+  int cur = node_idx;
+  while (cur > 0) {
+    const int tid = node_term[cur];
+    if (tid >= 0) {
+      total += 1;
+      const int next = ++counts[tid];
+      if (next >= 2) return true;
+    }
+    cur = node_prev[cur];
+  }
+  return total >= 3 && (!require_sent_end || has_sent_end);
+}
+
+size_t find_cpp_leading_cut(
+    const CppHallucinationMatcher& matcher,
+    const CppNormalizedClusterMap& map) {
+  const size_t n = map.cps.size();
+  if (n == 0) return 0;
+  constexpr int kInf = 0x3FFF'FFFF;
+  std::vector<int> cleared_cost(n + 1, kInf);
+  std::vector<int> cleared_node(n + 1, -1);
+  std::vector<uint8_t> cleared_from_sep(n + 1, 0);
+  std::vector<uint8_t> cleared_sep_end(n + 1, 0);
+  std::vector<int> ended_ascii_cost(n + 1, kInf);
+  std::vector<int> ended_ascii_node(n + 1, -1);
+  std::vector<std::unordered_map<int, std::pair<int, int>>> same_states(n + 1);
+
+  std::vector<int> node_prev{-1};
+  std::vector<int> node_term{-1};
+  cleared_cost[0] = 0;
+  cleared_node[0] = 0;
+  size_t best_cut = 0;
+
+  for (size_t pos = 0; pos < n; ++pos) {
+    const int c_cost = cleared_cost[pos];
+    const int a_cost = ended_ascii_cost[pos];
+    auto& same_map = same_states[pos];
+    if (c_cost == kInf && a_cost == kInf && same_map.empty()) continue;
+
+    int best_cost = c_cost;
+    int best_node = cleared_node[pos];
+    if (a_cost < best_cost) {
+      best_cost = a_cost;
+      best_node = ended_ascii_node[pos];
+    }
+    for (const auto& kv : same_map) {
+      if (kv.second.first < best_cost) {
+        best_cost = kv.second.first;
+        best_node = kv.second.second;
+      }
+    }
+
+    if (pos > 0 && map.is_sep[pos] == 0 && cleared_from_sep[pos] == 1 && c_cost < kInf) {
+      bool valid_sep = (map.is_ascii_alnum[pos] == 0);
+      if (!valid_sep) {
+        size_t scan = pos;
+        while (scan > 0 && map.is_sep[scan - 1] == 1) {
+          if (map.is_intra_punct[scan - 1] == 0) {
+            valid_sep = true;
+            break;
+          }
+          --scan;
+        }
+      }
+      if (valid_sep && is_cpp_chain_qualified(cleared_node[pos], node_prev, node_term, true, cleared_sep_end[pos] == 1)) {
+        best_cut = pos;
+      }
+    }
+
+    if (map.is_sep[pos] == 1) {
+      const uint8_t next_end = ((c_cost == best_cost && cleared_from_sep[pos] == 1 && cleared_sep_end[pos] == 1) || map.is_sent_end[pos] == 1) ? 1 : 0;
+      if (best_cost < cleared_cost[pos + 1] ||
+          (best_cost == cleared_cost[pos + 1] && (cleared_from_sep[pos + 1] == 0 || (next_end == 1 && cleared_sep_end[pos + 1] == 0)))) {
+        cleared_cost[pos + 1] = best_cost;
+        cleared_node[pos + 1] = best_node;
+        cleared_from_sep[pos + 1] = 1;
+        cleared_sep_end[pos + 1] = next_end;
+      }
+    }
+
+    int cur_node_idx = 0;
+    for (size_t p = pos; p < n; ++p) {
+      const auto it = matcher.fwd_nodes[cur_node_idx].children.find(map.cps[p]);
+      if (it == matcher.fwd_nodes[cur_node_idx].children.end()) break;
+      cur_node_idx = it->second;
+      const int tid = matcher.fwd_nodes[cur_node_idx].term_id;
+      if (tid < 0) continue;
+
+      int start_cost = matcher.term_starts_ascii[tid] ? c_cost : best_cost;
+      int start_node = matcher.term_starts_ascii[tid] ? cleared_node[pos] : best_node;
+      const auto same_it = same_map.find(tid);
+      if (same_it != same_map.end() && same_it->second.first < start_cost) {
+        start_cost = same_it->second.first;
+        start_node = same_it->second.second;
+      }
+      if (start_cost >= kInf || start_node < 0) continue;
+
+      const size_t end_pos = p + 1;
+      const int next_cost = start_cost + 1;
+      const int new_node = static_cast<int>(node_prev.size());
+      node_prev.push_back(start_node);
+      node_term.push_back(tid);
+
+      if (!matcher.term_ends_ascii[tid] || end_pos == n) {
+        if (next_cost < cleared_cost[end_pos]) {
+          cleared_cost[end_pos] = next_cost;
+          cleared_node[end_pos] = new_node;
+          cleared_from_sep[end_pos] = 0;
+          cleared_sep_end[end_pos] = 0;
+        }
+      } else {
+        if (next_cost < ended_ascii_cost[end_pos]) {
+          ended_ascii_cost[end_pos] = next_cost;
+          ended_ascii_node[end_pos] = new_node;
+        }
+        if (matcher.term_starts_ascii[tid] && map.cps[end_pos] == matcher.term_first_cp[tid]) {
+          auto& target = same_states[end_pos];
+          const auto prev = target.find(tid);
+          if (prev == target.end() || next_cost < prev->second.first) {
+            target[tid] = {next_cost, new_node};
+          }
+        }
+      }
+    }
+    same_map.clear();
+  }
+  return best_cut;
+}
+
+size_t find_cpp_trailing_cut(
+    const CppHallucinationMatcher& matcher,
+    const CppNormalizedClusterMap& map) {
+  const size_t n = map.cps.size();
+  if (n == 0) return n;
+  constexpr int kInf = 0x3FFF'FFFF;
+  std::vector<int> rev_cleared_cost(n + 1, kInf);
+  std::vector<int> rev_cleared_node(n + 1, -1);
+  std::vector<int> rev_ascii_cost(n + 1, kInf);
+  std::vector<int> rev_ascii_node(n + 1, -1);
+  std::vector<std::unordered_map<int, std::pair<int, int>>> rev_same(n + 1);
+
+  std::vector<int> node_prev{-1};
+  std::vector<int> node_term{-1};
+  rev_cleared_cost[n] = 0;
+  rev_cleared_node[n] = 0;
+  size_t best_term_start = n;
+
+  for (size_t pos = n; pos > 0; --pos) {
+    const int c_cost = rev_cleared_cost[pos];
+    const int a_cost = rev_ascii_cost[pos];
+    auto& same_map = rev_same[pos];
+    if (c_cost == kInf && a_cost == kInf && same_map.empty()) continue;
+
+    int best_cost = c_cost;
+    int best_node = rev_cleared_node[pos];
+    if (a_cost < best_cost) {
+      best_cost = a_cost;
+      best_node = rev_ascii_node[pos];
+    }
+    for (const auto& kv : same_map) {
+      if (kv.second.first < best_cost) {
+        best_cost = kv.second.first;
+        best_node = kv.second.second;
+      }
+    }
+
+    if (map.is_sep[pos - 1] == 1) {
+      if (best_cost < rev_cleared_cost[pos - 1]) {
+        rev_cleared_cost[pos - 1] = best_cost;
+        rev_cleared_node[pos - 1] = best_node;
+      }
+    }
+
+    int cur_rev_idx = 0;
+    for (size_t p = pos; p > 0; --p) {
+      const size_t idx = p - 1;
+      const auto it = matcher.rev_nodes[cur_rev_idx].children.find(map.cps[idx]);
+      if (it == matcher.rev_nodes[cur_rev_idx].children.end()) break;
+      cur_rev_idx = it->second;
+      const int tid = matcher.rev_nodes[cur_rev_idx].term_id;
+      if (tid < 0) continue;
+
+      int right_cost = matcher.term_ends_ascii[tid] ? c_cost : best_cost;
+      int right_node = matcher.term_ends_ascii[tid] ? rev_cleared_node[pos] : best_node;
+      const auto same_it = same_map.find(tid);
+      if (same_it != same_map.end() && same_it->second.first < right_cost) {
+        right_cost = same_it->second.first;
+        right_node = same_it->second.second;
+      }
+      if (right_cost >= kInf || right_node < 0) continue;
+
+      const int next_cost = right_cost + 1;
+      const int new_node = static_cast<int>(node_prev.size());
+      node_prev.push_back(right_node);
+      node_term.push_back(tid);
+
+      if (!matcher.term_starts_ascii[tid] || idx == 0) {
+        if (next_cost < rev_cleared_cost[idx]) {
+          rev_cleared_cost[idx] = next_cost;
+          rev_cleared_node[idx] = new_node;
+        }
+      } else {
+        if (next_cost < rev_ascii_cost[idx]) {
+          rev_ascii_cost[idx] = next_cost;
+          rev_ascii_node[idx] = new_node;
+        }
+        if (matcher.term_ends_ascii[tid] && map.cps[idx - 1] == matcher.term_last_cp[tid]) {
+          auto& target = rev_same[idx];
+          const auto prev = target.find(tid);
+          if (prev == target.end() || next_cost < prev->second.first) {
+            target[tid] = {next_cost, new_node};
+          }
+        }
+      }
+
+      if (idx > 0) {
+        size_t scan = idx;
+        bool sent_end = false;
+        bool has_real_sep = false;
+        while (scan > 0 && map.is_sep[scan - 1] == 1) {
+          if (map.is_sent_end[scan - 1] == 1) sent_end = true;
+          if (map.is_intra_punct[scan - 1] == 0) has_real_sep = true;
+          --scan;
+        }
+        const bool has_sep_before = scan < idx;
+        const bool before_sep_ascii = scan > 0 ? (map.is_ascii_alnum[scan - 1] == 1) : false;
+        if (is_cpp_chain_qualified(new_node, node_prev, node_term, true, sent_end)) {
+          const bool valid_boundary = has_sep_before
+              ? !(matcher.term_starts_ascii[tid] == 1 && !has_real_sep && before_sep_ascii)
+              : (matcher.term_starts_ascii[tid] == 1 && !before_sep_ascii);
+          if (valid_boundary && idx < best_term_start) {
+            best_term_start = idx;
+          }
+        }
+      }
+    }
+    same_map.clear();
+  }
+
+  if (best_term_start >= n) return n;
+  size_t cut = best_term_start;
+  while (cut > 0 && map.is_weak_sep[cut - 1] == 1) {
+    --cut;
+  }
+  return cut;
+}
+
+std::string strip_voice_hotword_hallucination(
+    const std::string& text,
+    const std::vector<std::string>& hotword_terms,
+    bool allow_single = false) {
+  if (text.empty() || hotword_terms.empty()) return text;
+
+  std::vector<std::vector<uint32_t>> unique_terms;
+  for (const auto& raw : hotword_terms) {
+    const std::string trimmed = trim_ascii_ws(raw);
+    if (trimmed.empty()) continue;
+    const auto map = build_cpp_normalized_cluster_map(trimmed);
+    if (map.cps.empty()) continue;
+    bool dup = false;
+    for (const auto& existing : unique_terms) {
+      if (existing == map.cps) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) unique_terms.push_back(map.cps);
+  }
+  if (unique_terms.empty()) return text;
+
+  CppHallucinationMatcher matcher;
+  matcher.fwd_nodes.emplace_back();
+  matcher.rev_nodes.emplace_back();
+  matcher.term_starts_ascii.reserve(unique_terms.size());
+  matcher.term_ends_ascii.reserve(unique_terms.size());
+  matcher.term_first_cp.reserve(unique_terms.size());
+  matcher.term_last_cp.reserve(unique_terms.size());
+
+  for (int tid = 0; tid < static_cast<int>(unique_terms.size()); ++tid) {
+    const auto& cps = unique_terms[tid];
+    matcher.term_starts_ascii.push_back(is_hotword_ascii_alnum_cp(cps.front()) ? 1 : 0);
+    matcher.term_ends_ascii.push_back(is_hotword_ascii_alnum_cp(cps.back()) ? 1 : 0);
+    matcher.term_first_cp.push_back(cps.front());
+    matcher.term_last_cp.push_back(cps.back());
+
+    int cur = 0;
+    for (uint32_t cp : cps) {
+      auto it = matcher.fwd_nodes[cur].children.find(cp);
+      if (it == matcher.fwd_nodes[cur].children.end()) {
+        int next = static_cast<int>(matcher.fwd_nodes.size());
+        matcher.fwd_nodes.emplace_back();
+        matcher.fwd_nodes[cur].children[cp] = next;
+        cur = next;
+      } else {
+        cur = it->second;
+      }
+    }
+    matcher.fwd_nodes[cur].term_id = tid;
+
+    int rcur = 0;
+    for (size_t k = cps.size(); k > 0; --k) {
+      uint32_t cp = cps[k - 1];
+      auto it = matcher.rev_nodes[rcur].children.find(cp);
+      if (it == matcher.rev_nodes[rcur].children.end()) {
+        int next = static_cast<int>(matcher.rev_nodes.size());
+        matcher.rev_nodes.emplace_back();
+        matcher.rev_nodes[rcur].children[cp] = next;
+        rcur = next;
+      } else {
+        rcur = it->second;
+      }
+    }
+    matcher.rev_nodes[rcur].term_id = tid;
+  }
+
+  const auto whole_map = build_cpp_normalized_cluster_map(text);
+  const size_t n = whole_map.cps.size();
+  if (n == 0) return text;
+
+  constexpr int kInf = 0x3FFF'FFFF;
+  std::vector<int> cleared(n + 1, kInf);
+  std::vector<int> ended_ascii(n + 1, kInf);
+  std::vector<std::unordered_map<int, int>> same_states(n + 1);
+  cleared[0] = 0;
+
+  for (size_t pos = 0; pos < n; ++pos) {
+    const int c_count = cleared[pos];
+    const int a_count = ended_ascii[pos];
+    auto& same_map = same_states[pos];
+    if (c_count == kInf && a_count == kInf && same_map.empty()) continue;
+    const int best_at_pos = std::min(c_count, a_count);
+
+    if (whole_map.is_sep[pos] == 1) {
+      int sep_min = best_at_pos;
+      for (const auto& kv : same_map) {
+        if (kv.second < sep_min) sep_min = kv.second;
+      }
+      if (sep_min < cleared[pos + 1]) {
+        cleared[pos + 1] = sep_min;
+      }
+    }
+
+    int cur_idx = 0;
+    for (size_t p = pos; p < n; ++p) {
+      const auto it = matcher.fwd_nodes[cur_idx].children.find(whole_map.cps[p]);
+      if (it == matcher.fwd_nodes[cur_idx].children.end()) break;
+      cur_idx = it->second;
+      const int tid = matcher.fwd_nodes[cur_idx].term_id;
+      if (tid < 0) continue;
+
+      int start_cost = matcher.term_starts_ascii[tid] ? c_count : best_at_pos;
+      const auto same_it = same_map.find(tid);
+      if (same_it != same_map.end() && same_it->second < start_cost) {
+        start_cost = same_it->second;
+      }
+      if (start_cost >= kInf) continue;
+
+      const size_t end_pos = p + 1;
+      const int next_cost = start_cost + 1;
+      if (!matcher.term_ends_ascii[tid] || end_pos == n) {
+        if (next_cost < cleared[end_pos]) cleared[end_pos] = next_cost;
+      } else {
+        if (next_cost < ended_ascii[end_pos]) ended_ascii[end_pos] = next_cost;
+        if (matcher.term_starts_ascii[tid] && whole_map.cps[end_pos] == matcher.term_first_cp[tid]) {
+          auto& target = same_states[end_pos];
+          const auto prev = target.find(tid);
+          if (prev == target.end() || next_cost < prev->second) {
+            target[tid] = next_cost;
+          }
+        }
+      }
+    }
+    same_map.clear();
+  }
+
+  const int min_matches = std::min(cleared[n], ended_ascii[n]);
+  if (min_matches < kInf) {
+    if (min_matches >= 2) return {};
+    if (allow_single && min_matches == 1) return {};
+    return text;
+  }
+
+  std::string current = text;
+  const size_t lead_cut = find_cpp_leading_cut(matcher, whole_map);
+  if (lead_cut > 0 && lead_cut < n) {
+    current = current.substr(whole_map.norm_to_raw_byte[lead_cut]);
+  }
+  if (current.empty()) return {};
+
+  const auto tail_map = lead_cut > 0 ? build_cpp_normalized_cluster_map(current) : whole_map;
+  const size_t tail_cut = find_cpp_trailing_cut(matcher, tail_map);
+  if (tail_cut < tail_map.cps.size()) {
+    current = current.substr(0, tail_map.norm_to_raw_byte[tail_cut]);
+  }
+  return current;
+}
+
 template <typename DecodeFn, typename EmitFn>
 class SegmentedUtterancePipeline {
  public:
@@ -746,11 +1489,13 @@ class SegmentedUtterancePipeline {
       DecodeFn decode_fn,
       EmitFn emit_fn,
       size_t max_segment_samples = kMaxSegmentSamples,
-      size_t max_final_redecode_samples = kMaxFinalReDecodeSamples)
+      size_t max_final_redecode_samples = kMaxFinalReDecodeSamples,
+      std::vector<std::string> hotword_terms = {})
       : decode_fn_(std::move(decode_fn)),
         emit_fn_(std::move(emit_fn)),
         max_segment_samples_(max_segment_samples),
-        max_final_redecode_samples_(max_final_redecode_samples) {}
+        max_final_redecode_samples_(max_final_redecode_samples),
+        hotword_terms_(std::move(hotword_terms)) {}
 
   void preload(std::vector<float> initial) {
     if (initial.empty()) return;
@@ -804,9 +1549,31 @@ class SegmentedUtterancePipeline {
     std::vector<float> utterance_samples;
     bool utterance_exceeded_final_cap = false;
     std::string committed_text;
+    bool committed_has_trusted_real_text = false;
     std::string active_segment_text;
+    std::string active_trusted_real_text;
+    bool active_pending_single_hotword = false;
+    bool retracted_segment_single_hotword = false;
+    bool pending_retraction_final = false;
     std::string last_emitted_text;
     size_t last_decoded_len = 0;
+
+    auto sanitize_decoded = [&](const std::string& raw_decoded,
+                                bool& out_hit_hallucination,
+                                bool& out_has_real_non_hotword) -> std::string {
+      const std::string raw_text = strip_asr_control_tags(raw_decoded);
+      if (hotword_terms_.empty()) {
+        out_hit_hallucination = false;
+        out_has_real_non_hotword = !raw_text.empty();
+        return raw_text;
+      }
+      const std::string pre_hallucination = strip_voice_hotword_hallucination(raw_text, hotword_terms_, false);
+      const std::string after_rep = sanitize_asr_repetition_loop(pre_hallucination);
+      const std::string text = strip_voice_hotword_hallucination(after_rep, hotword_terms_, false);
+      out_hit_hallucination = !raw_text.empty() && text.empty() && (pre_hallucination.empty() || !after_rep.empty());
+      out_has_real_non_hotword = !text.empty() && !strip_voice_hotword_hallucination(text, hotword_terms_, true).empty();
+      return text;
+    };
 
     while (true) {
       bool can_finish_now = false;
@@ -877,10 +1644,12 @@ class SegmentedUtterancePipeline {
 
       if (need_decode && !(can_finish_now && (!should_commit_segment || skip_trailing_segment_commit))) {
         last_decoded_len = segment_samples.size();
-        const bool segment_has_speech =
-            !active_segment_text.empty() || has_utterance_speech_energy(segment_samples);
+        const std::vector<float> trimmed_seg = trim_silence_edges(segment_samples);
+        const bool segment_has_speech = !trimmed_seg.empty();
+        bool hit_hallucination = false;
+        bool has_real_non_hotword = false;
         const std::string seg_text = segment_has_speech
-            ? strip_asr_control_tags(decode_fn_(segment_samples))
+            ? sanitize_decoded(decode_fn_(trimmed_seg), hit_hallucination, has_real_non_hotword)
             : std::string{};
         {
           std::lock_guard<std::mutex> lock(mu_);
@@ -892,20 +1661,55 @@ class SegmentedUtterancePipeline {
           std::vector<float>().swap(utterance_samples);
           break;
         }
-        if (!seg_text.empty()) {
+        if (!hotword_terms_.empty() && hit_hallucination) {
+          if (active_pending_single_hotword) {
+            retracted_segment_single_hotword = true;
+          }
+          active_pending_single_hotword = false;
+          if (!active_trusted_real_text.empty()) {
+            active_segment_text = active_trusted_real_text;
+          } else {
+            active_segment_text.clear();
+          }
+          const std::string fallback = join_transcript_segments(committed_text, active_segment_text);
+          if (fallback != last_emitted_text && (!fallback.empty() || !last_emitted_text.empty())) {
+            last_emitted_text = fallback;
+            if (fallback.empty()) pending_retraction_final = true;
+            if (!can_finish_now) {
+              emit_fn_("{\"type\":\"result\",\"text\":\"" + json_escape(fallback) + "\",\"isFinal\":false}");
+            }
+          }
+        } else if (!seg_text.empty()) {
           active_segment_text = seg_text;
+          if (!hotword_terms_.empty()) {
+            if (has_real_non_hotword) {
+              active_trusted_real_text = seg_text;
+              active_pending_single_hotword = false;
+              retracted_segment_single_hotword = false;
+            } else if (active_trusted_real_text.empty()) {
+              active_pending_single_hotword = true;
+            }
+          }
         }
-        const std::string& effective_seg = !seg_text.empty() ? seg_text : active_segment_text;
+        const std::string& effective_seg = !active_segment_text.empty() ? active_segment_text : std::string{};
         const std::string combined = join_transcript_segments(committed_text, effective_seg);
         if (should_commit_segment) {
           if (!effective_seg.empty()) {
+            if (!hotword_terms_.empty() && (!active_trusted_real_text.empty() || has_real_non_hotword)) {
+              committed_has_trusted_real_text = true;
+            } else if (hotword_terms_.empty()) {
+              committed_has_trusted_real_text = true;
+            }
             committed_text = combined;
           }
           active_segment_text.clear();
+          active_trusted_real_text.clear();
+          active_pending_single_hotword = false;
           segment_samples.clear();
           last_decoded_len = 0;
           if (!can_finish_now && !combined.empty() && combined != last_emitted_text) {
             last_emitted_text = combined;
+            pending_retraction_final = false;
             emit_fn_("{\"type\":\"result\",\"text\":\"" + json_escape(combined) + "\",\"isFinal\":false}");
           }
           if (has_remaining_pending || (is_stop_requested && !can_finish_now)) {
@@ -913,6 +1717,7 @@ class SegmentedUtterancePipeline {
           }
         } else if (!seg_text.empty() && !combined.empty() && combined != last_emitted_text) {
           last_emitted_text = combined;
+          pending_retraction_final = false;
           emit_fn_("{\"type\":\"result\",\"text\":\"" + json_escape(combined) + "\",\"isFinal\":false}");
         }
       }
@@ -931,31 +1736,62 @@ class SegmentedUtterancePipeline {
     if (!final_aborted) {
       std::string final_text;
       if (!utterance_exceeded_final_cap && utterance_samples.size() >= 1600) {
-        const bool utterance_has_speech =
-            !committed_text.empty() ||
-            !active_segment_text.empty() ||
-            has_utterance_speech_energy(utterance_samples);
-        if (utterance_has_speech) {
-          final_text = strip_asr_control_tags(decode_fn_(utterance_samples));
-          std::vector<float>().swap(utterance_samples);
-          if (final_text.empty()) {
+        const std::vector<float> trimmed_utterance = trim_silence_edges(utterance_samples);
+        std::vector<float>().swap(utterance_samples);
+        if (!trimmed_utterance.empty()) {
+          bool hit_hallucination = false;
+          bool has_real_non_hotword = false;
+          final_text = sanitize_decoded(decode_fn_(trimmed_utterance), hit_hallucination, has_real_non_hotword);
+          if (!hotword_terms_.empty()) {
+            const bool blocked_single_only = !final_text.empty() && !has_real_non_hotword &&
+                (retracted_segment_single_hotword || pending_retraction_final ||
+                 committed_has_trusted_real_text || !active_trusted_real_text.empty());
+            if (hit_hallucination || blocked_single_only || final_text.empty()) {
+              if (committed_has_trusted_real_text) {
+                final_text = committed_text;
+              } else if (!active_trusted_real_text.empty()) {
+                final_text = active_trusted_real_text;
+              } else {
+                final_text.clear();
+              }
+            }
+          } else if (final_text.empty()) {
             final_text = join_transcript_segments(committed_text, active_segment_text);
           }
         } else {
-          std::vector<float>().swap(utterance_samples);
-          final_text = join_transcript_segments(committed_text, active_segment_text);
+          if (hotword_terms_.empty()) {
+            final_text = join_transcript_segments(committed_text, active_segment_text);
+          } else if (committed_has_trusted_real_text) {
+            final_text = join_transcript_segments(committed_text, active_trusted_real_text);
+          } else {
+            final_text.clear();
+          }
         }
       } else {
         std::vector<float>().swap(utterance_samples);
         std::string final_seg = active_segment_text;
-        if (segment_samples.size() >= 1600 &&
-            (!active_segment_text.empty() || has_utterance_speech_energy(segment_samples))) {
-          const std::string tail_text = strip_asr_control_tags(decode_fn_(segment_samples));
-          if (!tail_text.empty()) {
+        const std::vector<float> trimmed_tail = trim_silence_edges(segment_samples);
+        if (segment_samples.size() >= 1600 && !trimmed_tail.empty()) {
+          bool hit_hallucination = false;
+          bool has_real_non_hotword = false;
+          const std::string tail_text = sanitize_decoded(decode_fn_(trimmed_tail), hit_hallucination, has_real_non_hotword);
+          if (!hotword_terms_.empty()) {
+            const bool blocked_single_only = !tail_text.empty() && !has_real_non_hotword &&
+                (retracted_segment_single_hotword || pending_retraction_final || !active_trusted_real_text.empty());
+            if (hit_hallucination || blocked_single_only || tail_text.empty()) {
+              final_seg = active_trusted_real_text;
+            } else {
+              final_seg = tail_text;
+            }
+          } else if (!tail_text.empty()) {
             final_seg = tail_text;
           }
+        } else if (!hotword_terms_.empty()) {
+          final_seg = active_trusted_real_text;
         }
-        final_text = join_transcript_segments(committed_text, final_seg);
+        const std::string base_committed =
+            (hotword_terms_.empty() || committed_has_trusted_real_text) ? committed_text : std::string{};
+        final_text = join_transcript_segments(base_committed, final_seg);
       }
       {
         std::lock_guard<std::mutex> lock(mu_);
@@ -975,6 +1811,7 @@ class SegmentedUtterancePipeline {
   EmitFn emit_fn_;
   size_t max_segment_samples_;
   size_t max_final_redecode_samples_;
+  std::vector<std::string> hotword_terms_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::vector<float> pending_samples_;
@@ -1049,9 +1886,15 @@ class PcmUtteranceDecoder : public ActiveServeSessionHandle {
       DecodeFn decode_fn,
       EmitFn emit_fn,
       size_t max_segment_samples = kMaxSegmentSamples,
-      size_t max_final_redecode_samples = kMaxFinalReDecodeSamples)
+      size_t max_final_redecode_samples = kMaxFinalReDecodeSamples,
+      std::vector<std::string> hotword_terms = {})
       : emit_fn_(emit_fn),
-        pipeline_(std::move(decode_fn), std::move(emit_fn), max_segment_samples, max_final_redecode_samples) {}
+        pipeline_(
+            std::move(decode_fn),
+            std::move(emit_fn),
+            max_segment_samples,
+            max_final_redecode_samples,
+            std::move(hotword_terms)) {}
 
   ~PcmUtteranceDecoder() override {
     stop(true);
@@ -1093,9 +1936,17 @@ class ServeCommandLoop {
  public:
   using MicFactoryFn = std::function<std::unique_ptr<ActiveServeSessionHandle>(const std::string& dev, std::vector<float> initial)>;
   using PcmFactoryFn = std::function<std::unique_ptr<ActiveServeSessionHandle>()>;
+  using MicWithHotwordsFactoryFn = std::function<std::unique_ptr<ActiveServeSessionHandle>(
+      const std::string& dev, std::vector<float> initial, std::vector<std::string> hotwords)>;
+  using PcmWithHotwordsFactoryFn = std::function<std::unique_ptr<ActiveServeSessionHandle>(std::vector<std::string> hotwords)>;
 
   ServeCommandLoop(MicFactoryFn mic_factory, PcmFactoryFn pcm_factory)
       : mic_factory_(std::move(mic_factory)), pcm_factory_(std::move(pcm_factory)) {}
+
+  void set_hotword_factories(MicWithHotwordsFactoryFn mic_hw, PcmWithHotwordsFactoryFn pcm_hw) {
+    mic_hw_factory_ = std::move(mic_hw);
+    pcm_hw_factory_ = std::move(pcm_hw);
+  }
 
   ~ServeCommandLoop() {
     join_and_reset_active(true);
@@ -1141,11 +1992,14 @@ class ServeCommandLoop {
       }
     } else if (*cmd == "start") {
       join_and_reset_active(true);
-      if (mic_factory_) {
+      if (mic_hw_factory_ || mic_factory_) {
         const std::string dev = extract_json_string_field(line, "device").value_or("auto");
+        std::vector<std::string> hotwords = extract_json_string_array_field(line, "hotwords");
         std::vector<float> initial = std::move(prefilled_pcm_);
         prefilled_pcm_.clear();
-        active_session_ = mic_factory_(dev, std::move(initial));
+        active_session_ = mic_hw_factory_
+            ? mic_hw_factory_(dev, std::move(initial), std::move(hotwords))
+            : mic_factory_(dev, std::move(initial));
         if (active_session_) {
           active_session_->start();
         }
@@ -1153,8 +2007,11 @@ class ServeCommandLoop {
     } else if (*cmd == "start_pcm") {
       prefilled_pcm_.clear();
       join_and_reset_active(true);
-      if (pcm_factory_) {
-        active_session_ = pcm_factory_();
+      if (pcm_hw_factory_ || pcm_factory_) {
+        std::vector<std::string> hotwords = extract_json_string_array_field(line, "hotwords");
+        active_session_ = pcm_hw_factory_
+            ? pcm_hw_factory_(std::move(hotwords))
+            : pcm_factory_();
         if (active_session_) {
           active_session_->start();
         }
@@ -1184,6 +2041,8 @@ class ServeCommandLoop {
   static constexpr size_t kMaxPrefillSamples = 16000 * 30;
   MicFactoryFn mic_factory_;
   PcmFactoryFn pcm_factory_;
+  MicWithHotwordsFactoryFn mic_hw_factory_;
+  PcmWithHotwordsFactoryFn pcm_hw_factory_;
   std::unique_ptr<ActiveServeSessionHandle> active_session_;
   std::vector<float> prefilled_pcm_;
 };
@@ -1288,6 +2147,7 @@ class Qwen3OnnxEngine {
   }
 
   const std::string& active_provider() const { return active_provider_; }
+  std::vector<std::string> hotword_terms() const { return split_hotwords_string(hotwords_); }
 
  private:
   static std::string load_hotwords_string(const std::filesystem::path& p) {
@@ -1329,13 +2189,17 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
   WasapiUtteranceCapture(
       Qwen3OnnxEngine& engine,
       std::string device_uid,
-      std::vector<float> initial_samples = {})
+      std::vector<float> initial_samples = {},
+      std::vector<std::string> hotword_terms = {})
       : engine_(engine),
         device_uid_(std::move(device_uid)),
         initial_samples_(std::move(initial_samples)),
         pipeline_(
             [this](const std::vector<float>& samples) { return engine_.decode(samples); },
-            [](const std::string& line) { emit_json_line(line); }) {}
+            [](const std::string& line) { emit_json_line(line); },
+            kMaxSegmentSamples,
+            kMaxFinalReDecodeSamples,
+            std::move(hotword_terms)) {}
 
   ~WasapiUtteranceCapture() override {
     stop(true);
@@ -1630,14 +2494,19 @@ int run_serve_command(const std::string& model_dir, const std::string& variant, 
   emit_json_line("{\"type\":\"ready\",\"variant\":\"" + json_escape(variant) +
                  "\",\"provider\":\"" + json_escape(engine.active_provider()) + "\"}");
 
-  ServeCommandLoop loop(
-      [&](const std::string& dev, std::vector<float> initial) {
-        return std::make_unique<WasapiUtteranceCapture>(engine, dev, std::move(initial));
+  ServeCommandLoop loop(nullptr, nullptr);
+  loop.set_hotword_factories(
+      [&](const std::string& dev, std::vector<float> initial, std::vector<std::string> req_hotwords) {
+        return std::make_unique<WasapiUtteranceCapture>(
+            engine, dev, std::move(initial), merge_hotword_terms(engine.hotword_terms(), req_hotwords));
       },
-      [&]() {
+      [&](std::vector<std::string> req_hotwords) {
         return std::make_unique<PcmUtteranceDecoder>(
             [&engine](const std::vector<float>& samples) { return engine.decode(samples); },
-            [](const std::string& json_line) { emit_json_line(json_line); });
+            [](const std::string& json_line) { emit_json_line(json_line); },
+            kMaxSegmentSamples,
+            kMaxFinalReDecodeSamples,
+            merge_hotword_terms(engine.hotword_terms(), req_hotwords));
       });
 
   std::string line;
@@ -1658,7 +2527,7 @@ int run_listen_command(const std::string& model_dir, const std::string& variant,
     emit_error("model_load_failed", "speech", init_err);
     return 1;
   }
-  auto capture = std::make_shared<WasapiUtteranceCapture>(engine, device_uid);
+  auto capture = std::make_shared<WasapiUtteranceCapture>(engine, device_uid, std::vector<float>{}, engine.hotword_terms());
   capture->start();
   std::weak_ptr<WasapiUtteranceCapture> weak_capture = capture;
   std::thread([weak_capture]() {

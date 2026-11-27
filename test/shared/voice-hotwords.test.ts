@@ -373,6 +373,66 @@ describe('shared voice hotwords', () => {
 
     // Empty hotwords never strip anything
     expect(stripVoiceHotwordHallucination('IM.codes，IM.codes。IM.codes，IM.codes。', [])).toBe('IM.codes，IM.codes。IM.codes，IM.codes。');
+
+    // Leading / trailing repeated-hotword edge hallucination stripping
+    expect(
+      stripVoiceHotwordHallucination('IM.codes，IM.codes。你答的对，就这么来。', compiled),
+    ).toBe('你答的对，就这么来。');
+    expect(
+      stripVoiceHotwordHallucination(
+        '我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。IM.codes，IM.codes。',
+        compiled,
+      ),
+    ).toBe('我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。');
+    expect(
+      stripVoiceHotwordHallucination('我要的是速度 IM.codes IM.codes', compiled),
+    ).toBe('我要的是速度');
+    expect(
+      stripVoiceHotwordHallucination('我要的是速度，IM.codes，IM.codes。', compiled),
+    ).toBe('我要的是速度');
+    expect(
+      stripVoiceHotwordHallucination(
+        'ＩＭ．ｃｏｄｅｓ，IM.codes。你答的对，就这么来。Codex, Codex!',
+        ['IM.codes', 'Codex'],
+      ),
+    ).toBe('你答的对，就这么来。');
+    expect(
+      stripVoiceHotwordHallucination('IM.codesIM.codes 你好', ['IM.codes']),
+    ).toBe('你好');
+    expect(
+      stripVoiceHotwordHallucination('我要的是速度IM.codes，IM.codes。', ['IM.codes']),
+    ).toBe('我要的是速度');
+    // >= 3 distinct hotwords adjacent to sentence end strip, while comma-listed tools stay intact
+    expect(
+      stripVoiceHotwordHallucination('IM.codes, Claude, Codex。开始工作', ['IM.codes', 'Claude', 'Codex']),
+    ).toBe('开始工作');
+    expect(
+      stripVoiceHotwordHallucination('开始工作。IM.codes, Claude, Codex。', ['IM.codes', 'Claude', 'Codex']),
+    ).toBe('开始工作。');
+    expect(
+      stripVoiceHotwordHallucination('请你对比 IM.codes, Claude, Codex。', ['IM.codes', 'Claude', 'Codex']),
+    ).toBe('请你对比 IM.codes, Claude, Codex。');
+    // Unicode combining marks & surrogate-pair emoji safety on boundaries
+    expect(
+      stripVoiceHotwordHallucination('IM.codes，IM.codes。Café👍🏽，IM.codes，IM.codes。', ['IM.codes']),
+    ).toBe('Café👍🏽');
+    expect(
+      stripVoiceHotwordHallucination('e\u0301, e\u0301。你好', ['é']),
+    ).toBe('你好');
+    // Edge negative safety: single hotword or partial-identifier boundary must remain intact
+    expect(stripVoiceHotwordHallucination('IM.codes is great', ['IM.codes'])).toBe('IM.codes is great');
+    expect(stripVoiceHotwordHallucination('Use IM.codes', ['IM.codes'])).toBe('Use IM.codes');
+    expect(stripVoiceHotwordHallucination('testcode, code', ['code'])).toBe('testcode, code');
+    expect(stripVoiceHotwordHallucination('code, codeReview', ['code'])).toBe('code, codeReview');
+    expect(stripVoiceHotwordHallucination('Check foo.bar.baz', ['foo', 'bar'])).toBe('Check foo.bar.baz');
+    expect(stripVoiceHotwordHallucination('foo.bar.baz', ['foo', 'bar'])).toBe('foo.bar.baz');
+    expect(stripVoiceHotwordHallucination('我想要你的代码，代码', ['代码'])).toBe('我想要你的代码，代码');
+    expect(stripVoiceHotwordHallucination('你好，你好吗', ['你好'])).toBe('你好，你好吗');
+    expect(stripVoiceHotwordHallucination('IM.codes、Codex 都要支持', ['IM.codes', 'Codex'])).toBe('IM.codes、Codex 都要支持');
+    expect(stripVoiceHotwordHallucination('IM.codes 和 IM.codes 的区别', ['IM.codes'])).toBe('IM.codes 和 IM.codes 的区别');
+    expect(
+      stripVoiceHotwordHallucination('IM.codes，IM.codes。你好世界。IM.codes，IM.codes。', ['IM.codes']),
+    ).toBe('你好世界。');
     expect(stripVoiceHotwordHallucination('IM.codes', null, { silentAudio: true })).toBe('IM.codes');
 
     // Performance bound: 60 hotwords across ~1000 chars stays sub-millisecond (including shared-prefix unmatchable text)

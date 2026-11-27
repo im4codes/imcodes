@@ -591,41 +591,162 @@ private final class CaptureAudioDelegate: NSObject, AVCaptureAudioDataOutputSamp
 private let kSpeechEnergyPeakThreshold: Float = 0.015
 private let kSpeechEnergyWindowRmsThreshold: Float = 0.005
 
-func hasSpeechEnergy(_ samples: [Float], sampleRate: Int = 16_000) -> Bool {
+private func scanSpeechEnergyRange(
+    _ samples: ArraySlice<Float>,
+    sampleRate: Int,
+    stopOnFirst: Bool
+) -> (first: Int, last: Int)? {
     let count = samples.count
-    guard count > 0 else { return false }
+    guard count > 0 else { return nil }
     let rate = sampleRate > 0 ? sampleRate : 16_000
     let windowSamples = max(1, Int((Double(rate) * 0.05).rounded()))
     let rmsSqThreshold = Double(kSpeechEnergyWindowRmsThreshold) * Double(kSpeechEnergyWindowRmsThreshold)
 
+    let base = samples.startIndex
+    var firstIdx: Int? = nil
+    var lastIdx = -1
+    var firstAboveRmsThresh: Int? = nil
+    var lastAboveRmsThresh = -1
     var windowSumSq = 0.0
-    for i in 0..<count {
-        let s = samples[i]
-        if abs(s) >= kSpeechEnergyPeakThreshold {
-            return true
+    let rmsSampleThresh = Float(kSpeechEnergyWindowRmsThreshold)
+
+    for offset in 0..<count {
+        let s = samples[base + offset]
+        let absS = abs(s)
+        if absS >= rmsSampleThresh {
+            if firstAboveRmsThresh == nil { firstAboveRmsThresh = offset }
+            lastAboveRmsThresh = offset
+        }
+        if absS >= kSpeechEnergyPeakThreshold {
+            if firstIdx == nil { firstIdx = offset }
+            lastIdx = offset
+            if stopOnFirst {
+                return (firstIdx!, lastIdx)
+            }
         }
         let d = Double(s)
         windowSumSq += d * d
-        if i >= windowSamples {
-            let old = Double(samples[i - windowSamples])
+        if offset >= windowSamples {
+            let old = Double(samples[base + offset - windowSamples])
             windowSumSq -= old * old
             if windowSumSq < 0 { windowSumSq = 0 }
         }
-        if i + 1 >= windowSamples && (windowSumSq / Double(windowSamples)) >= rmsSqThreshold {
-            return true
+        if offset + 1 >= windowSamples && (windowSumSq / Double(windowSamples)) >= rmsSqThreshold {
+            let winStart = offset - windowSamples + 1
+            if firstIdx == nil {
+                if let firstAbove = firstAboveRmsThresh, firstAbove >= winStart {
+                    firstIdx = firstAbove
+                } else {
+                    var tightened = winStart
+                    for j in winStart...offset where abs(samples[base + j]) >= rmsSampleThresh {
+                        tightened = j
+                        break
+                    }
+                    firstIdx = tightened
+                }
+            }
+            if lastAboveRmsThresh >= winStart && lastAboveRmsThresh > lastIdx {
+                lastIdx = lastAboveRmsThresh
+            }
+            if stopOnFirst {
+                return (firstIdx!, max(firstIdx!, lastIdx))
+            }
         }
     }
     if count < windowSamples && (windowSumSq / Double(count)) >= rmsSqThreshold {
-        return true
+        if firstIdx == nil { firstIdx = firstAboveRmsThresh ?? 0 }
+        if lastAboveRmsThresh > lastIdx {
+            lastIdx = lastAboveRmsThresh
+        } else if lastIdx < 0 {
+            lastIdx = count - 1
+        }
+        return (firstIdx!, max(firstIdx!, lastIdx))
     }
-    return false
+    if let firstIdx, lastIdx >= firstIdx {
+        return (firstIdx, lastIdx)
+    }
+    return nil
+}
+
+func hasSpeechEnergy(_ samples: [Float], sampleRate: Int = 16_000) -> Bool {
+    return scanSpeechEnergyRange(samples[...], sampleRate: sampleRate, stopOnFirst: true) != nil
+}
+
+func trimSilenceEdgesWithRange(
+    _ samples: [Float],
+    sampleRate: Int = 16_000,
+    padMs: Int = 250
+) -> (samples: [Float], range: Range<Int>)? {
+    let count = samples.count
+    guard count > 0, let bounds = scanSpeechEnergyRange(samples[...], sampleRate: sampleRate, stopOnFirst: false) else {
+        return nil
+    }
+    let rate = sampleRate > 0 ? sampleRate : 16_000
+    let padSamples = max(0, Int((Double(rate) * Double(max(0, padMs)) / 1000.0).rounded()))
+    let start = max(0, bounds.first - padSamples)
+    let end = min(count, bounds.last + 1 + padSamples)
+    if start == 0 && end == count {
+        return (samples, 0..<count)
+    }
+    return (Array(samples[start..<end]), start..<end)
+}
+
+func trimSilenceEdges(_ samples: [Float], sampleRate: Int = 16_000, padMs: Int = 250) -> [Float] {
+    return trimSilenceEdgesWithRange(samples, sampleRate: sampleRate, padMs: padMs)?.samples ?? []
+}
+
+func trimTrailingSilence(
+    _ samples: [Float],
+    fixedStart: Int,
+    sampleRate: Int = 16_000,
+    padMs: Int = 250
+) -> [Float] {
+    let count = samples.count
+    let clampedStart = max(0, min(fixedStart, count))
+    guard clampedStart < count,
+          let bounds = scanSpeechEnergyRange(samples[clampedStart..<count], sampleRate: sampleRate, stopOnFirst: false) else {
+        return []
+    }
+    let rate = sampleRate > 0 ? sampleRate : 16_000
+    let padSamples = max(0, Int((Double(rate) * Double(max(0, padMs)) / 1000.0).rounded()))
+    let end = min(count, clampedStart + bounds.last + 1 + padSamples)
+    guard clampedStart < end else { return [] }
+    if clampedStart == 0 && end == count {
+        return samples
+    }
+    return Array(samples[clampedStart..<end])
 }
 
 private func isHotwordHallucinationSeparator(_ ch: Character) -> Bool {
-    if ch.isWhitespace || ch.isPunctuation || ch.isSymbol {
+    return ch.isWhitespace || ch.isPunctuation || ch.isSymbol
+}
+
+private func isHotwordSentenceEndChar(_ ch: Character) -> Bool {
+    switch ch {
+    case ".", "!", "?", "。", "！", "？", "\n", "\r", "\r\n", ";", "；":
         return true
+    default:
+        return false
     }
-    return false
+}
+
+private func isHotwordWeakTrailingSepChar(_ ch: Character) -> Bool {
+    if ch.isWhitespace { return true }
+    switch ch {
+    case ",", "，", "、", ":", "：", "-", "—", "–", "·", "•":
+        return true
+    default:
+        return false
+    }
+}
+
+private func isHotwordIntraWordPunctChar(_ ch: Character) -> Bool {
+    switch ch {
+    case ".", "-", "_", "'", "/", "+":
+        return true
+    default:
+        return false
+    }
 }
 
 private func isAsciiAlnumOrUnderscore(_ ch: Character) -> Bool {
@@ -657,9 +778,380 @@ private func normalizeHotwordMatchCharacters(_ raw: String) -> [Character] {
     return out
 }
 
+private struct SwiftNormalizedClusterMap {
+    let chars: [Character]
+    let normToRawIndex: [String.Index]
+    let clusterStart: [Int]
+    let isSep: [Bool]
+    let isSentenceEnd: [Bool]
+    let isWeakTrailingSep: [Bool]
+    let isIntraWordPunct: [Bool]
+    let isAsciiAlnum: [Bool]
+}
+
+private func buildSwiftNormalizedClusterMap(_ text: String) -> SwiftNormalizedClusterMap {
+    var chars: [Character] = []
+    var normToRawIndex: [String.Index] = []
+    var clusterStart: [Int] = []
+    var isSep: [Bool] = []
+    var isSentenceEnd: [Bool] = []
+    var isWeakTrailingSep: [Bool] = []
+    var isIntraWordPunct: [Bool] = []
+    var isAsciiAlnum: [Bool] = []
+
+    var rawIdx = text.startIndex
+    while rawIdx < text.endIndex {
+        let nextIdx = text.index(after: rawIdx)
+        let normSlice = normalizeHotwordMatchCharacters(String(text[rawIdx..<nextIdx]))
+        if !normSlice.isEmpty {
+            let cStart = chars.count
+            for ch in normSlice {
+                chars.append(ch)
+                normToRawIndex.append(rawIdx)
+                clusterStart.append(cStart)
+                isSep.append(isHotwordHallucinationSeparator(ch))
+                isSentenceEnd.append(isHotwordSentenceEndChar(ch))
+                isWeakTrailingSep.append(isHotwordWeakTrailingSepChar(ch))
+                isIntraWordPunct.append(isHotwordIntraWordPunctChar(ch))
+                isAsciiAlnum.append(isAsciiAlnumOrUnderscore(ch))
+            }
+        }
+        rawIdx = nextIdx
+    }
+    normToRawIndex.append(text.endIndex)
+    clusterStart.append(chars.count)
+
+    return SwiftNormalizedClusterMap(
+        chars: chars,
+        normToRawIndex: normToRawIndex,
+        clusterStart: clusterStart,
+        isSep: isSep,
+        isSentenceEnd: isSentenceEnd,
+        isWeakTrailingSep: isWeakTrailingSep,
+        isIntraWordPunct: isIntraWordPunct,
+        isAsciiAlnum: isAsciiAlnum
+    )
+}
+
 private final class HotwordTrieNode {
     var children: [Character: HotwordTrieNode] = [:]
     var termId: Int = -1
+}
+
+private func isSwiftChainQualifiedHallucination(
+    nodeIdx: Int,
+    nodePrev: [Int],
+    nodeTerm: [Int],
+    requireSentenceEndForDistinct: Bool,
+    hasSentenceEnd: Bool
+) -> Bool {
+    var totalTerms = 0
+    var counts: [Int: Int] = [:]
+    var cur = nodeIdx
+    while cur > 0 {
+        let termId = nodeTerm[cur]
+        if termId >= 0 {
+            totalTerms += 1
+            let next = (counts[termId] ?? 0) + 1
+            counts[termId] = next
+            if next >= 2 { return true }
+        }
+        cur = nodePrev[cur]
+    }
+    return totalTerms >= 3 && (!requireSentenceEndForDistinct || hasSentenceEnd)
+}
+
+private func findSwiftLeadingHallucinationCut(
+    map: SwiftNormalizedClusterMap,
+    root: HotwordTrieNode,
+    termStartsAscii: [Bool],
+    termEndsAscii: [Bool],
+    termFirstChars: [Character]
+) -> Int {
+    let chars = map.chars
+    let n = chars.count
+    guard n > 0 else { return 0 }
+
+    let inf = 0x3FFF_FFFF
+    var clearedCost = [Int](repeating: inf, count: n + 1)
+    var clearedNode = [Int](repeating: -1, count: n + 1)
+    var clearedFromSep = [Bool](repeating: false, count: n + 1)
+    var clearedSepHasEnd = [Bool](repeating: false, count: n + 1)
+    var endedAsciiCost = [Int](repeating: inf, count: n + 1)
+    var endedAsciiNode = [Int](repeating: -1, count: n + 1)
+    var sameTermStates: [[Int: (cost: Int, node: Int)]?]? = nil
+
+    var nodePrev = [-1]
+    var nodeTerm = [-1]
+    clearedCost[0] = 0
+    clearedNode[0] = 0
+    var bestCut = 0
+
+    for pos in 0..<n {
+        let cCost = clearedCost[pos]
+        let aCost = endedAsciiCost[pos]
+        let sameMap = sameTermStates?[pos] ?? nil
+        sameTermStates?[pos] = nil
+        if cCost == inf && aCost == inf && sameMap == nil { continue }
+
+        var bestCost = cCost
+        var bestNode = clearedNode[pos]
+        if aCost < bestCost {
+            bestCost = aCost
+            bestNode = endedAsciiNode[pos]
+        }
+        if let sameMap {
+            for entry in sameMap.values where entry.cost < bestCost {
+                bestCost = entry.cost
+                bestNode = entry.node
+            }
+        }
+
+        if pos > 0
+            && pos == map.clusterStart[pos]
+            && !map.isSep[pos]
+            && clearedFromSep[pos]
+            && cCost < inf {
+            var hasValidSep = !map.isAsciiAlnum[pos]
+            if map.isAsciiAlnum[pos] {
+                var sepScan = pos
+                while sepScan > 0 {
+                    let c = map.clusterStart[sepScan - 1]
+                    if !map.isSep[c] { break }
+                    var hasNonIntra = false
+                    for k in c..<sepScan where !map.isIntraWordPunct[k] {
+                        hasNonIntra = true
+                        break
+                    }
+                    if hasNonIntra {
+                        hasValidSep = true
+                        break
+                    }
+                    sepScan = c
+                }
+            }
+            if hasValidSep && isSwiftChainQualifiedHallucination(
+                nodeIdx: clearedNode[pos],
+                nodePrev: nodePrev,
+                nodeTerm: nodeTerm,
+                requireSentenceEndForDistinct: true,
+                hasSentenceEnd: clearedSepHasEnd[pos]
+            ) {
+                bestCut = pos
+            }
+        }
+
+        if map.isSep[pos] {
+            let nextEnd = (cCost == bestCost && clearedFromSep[pos] && clearedSepHasEnd[pos]) || map.isSentenceEnd[pos]
+            if bestCost < clearedCost[pos + 1]
+                || (bestCost == clearedCost[pos + 1] && (!clearedFromSep[pos + 1] || (nextEnd && !clearedSepHasEnd[pos + 1]))) {
+                clearedCost[pos + 1] = bestCost
+                clearedNode[pos + 1] = bestNode
+                clearedFromSep[pos + 1] = true
+                clearedSepHasEnd[pos + 1] = nextEnd
+            }
+        }
+
+        if pos != map.clusterStart[pos] { continue }
+
+        var node: HotwordTrieNode? = root
+        for p in pos..<n {
+            node = node?.children[chars[p]]
+            guard let cur = node else { break }
+            let termId = cur.termId
+            if termId < 0 { continue }
+
+            let endPos = p + 1
+            if endPos < n && endPos != map.clusterStart[endPos] { continue }
+
+            var startCost = termStartsAscii[termId] ? cCost : bestCost
+            var startNode = termStartsAscii[termId] ? clearedNode[pos] : bestNode
+            if let sameEntry = sameMap?[termId], sameEntry.cost < startCost {
+                startCost = sameEntry.cost
+                startNode = sameEntry.node
+            }
+            if startCost >= inf || startNode < 0 { continue }
+
+            let nextCost = startCost + 1
+            let newNode = nodePrev.count
+            nodePrev.append(startNode)
+            nodeTerm.append(termId)
+
+            if !termEndsAscii[termId] || endPos == n {
+                if nextCost < clearedCost[endPos] {
+                    clearedCost[endPos] = nextCost
+                    clearedNode[endPos] = newNode
+                    clearedFromSep[endPos] = false
+                    clearedSepHasEnd[endPos] = false
+                }
+            } else {
+                if nextCost < endedAsciiCost[endPos] {
+                    endedAsciiCost[endPos] = nextCost
+                    endedAsciiNode[endPos] = newNode
+                }
+                if termStartsAscii[termId] && chars[endPos] == termFirstChars[termId] {
+                    if sameTermStates == nil {
+                        sameTermStates = [[Int: (cost: Int, node: Int)]?](repeating: nil, count: n + 1)
+                    }
+                    var targetMap = sameTermStates![endPos] ?? [:]
+                    if let prev = targetMap[termId] {
+                        if nextCost < prev.cost { targetMap[termId] = (nextCost, newNode) }
+                    } else {
+                        targetMap[termId] = (nextCost, newNode)
+                    }
+                    sameTermStates![endPos] = targetMap
+                }
+            }
+        }
+    }
+
+    return bestCut
+}
+
+private func findSwiftTrailingHallucinationCut(
+    map: SwiftNormalizedClusterMap,
+    revRoot: HotwordTrieNode,
+    termStartsAscii: [Bool],
+    termEndsAscii: [Bool],
+    termLastChars: [Character]
+) -> Int {
+    let chars = map.chars
+    let n = chars.count
+    guard n > 0 else { return n }
+
+    let inf = 0x3FFF_FFFF
+    var revClearedCost = [Int](repeating: inf, count: n + 1)
+    var revClearedNode = [Int](repeating: -1, count: n + 1)
+    var revStartedAsciiCost = [Int](repeating: inf, count: n + 1)
+    var revStartedAsciiNode = [Int](repeating: -1, count: n + 1)
+    var revSameStates: [[Int: (cost: Int, node: Int)]?]? = nil
+
+    var nodePrev = [-1]
+    var nodeTerm = [-1]
+    revClearedCost[n] = 0
+    revClearedNode[n] = 0
+    var bestTermStart = n
+
+    for pos in stride(from: n, to: 0, by: -1) {
+        if pos < n && pos != map.clusterStart[pos] { continue }
+        let cCost = revClearedCost[pos]
+        let aCost = revStartedAsciiCost[pos]
+        let sameMap = revSameStates?[pos] ?? nil
+        revSameStates?[pos] = nil
+        if cCost == inf && aCost == inf && sameMap == nil { continue }
+
+        var bestCost = cCost
+        var bestNode = revClearedNode[pos]
+        if aCost < bestCost {
+            bestCost = aCost
+            bestNode = revStartedAsciiNode[pos]
+        }
+        if let sameMap {
+            for entry in sameMap.values where entry.cost < bestCost {
+                bestCost = entry.cost
+                bestNode = entry.node
+            }
+        }
+
+        let prevClusterStart = map.clusterStart[pos - 1]
+        if map.isSep[prevClusterStart] {
+            if bestCost < revClearedCost[prevClusterStart] {
+                revClearedCost[prevClusterStart] = bestCost
+                revClearedNode[prevClusterStart] = bestNode
+            }
+        }
+
+        var revNode: HotwordTrieNode? = revRoot
+        for p in stride(from: pos - 1, through: 0, by: -1) {
+            revNode = revNode?.children[chars[p]]
+            guard let cur = revNode else { break }
+            let termId = cur.termId
+            if termId < 0 { continue }
+            if p != map.clusterStart[p] { continue }
+
+            var rightCost = termEndsAscii[termId] ? cCost : bestCost
+            var rightNode = termEndsAscii[termId] ? revClearedNode[pos] : bestNode
+            if let sameEntry = sameMap?[termId], sameEntry.cost < rightCost {
+                rightCost = sameEntry.cost
+                rightNode = sameEntry.node
+            }
+            if rightCost >= inf || rightNode < 0 { continue }
+
+            let nextCost = rightCost + 1
+            let newNode = nodePrev.count
+            nodePrev.append(rightNode)
+            nodeTerm.append(termId)
+
+            if !termStartsAscii[termId] || p == 0 {
+                if nextCost < revClearedCost[p] {
+                    revClearedCost[p] = nextCost
+                    revClearedNode[p] = newNode
+                }
+            } else {
+                if nextCost < revStartedAsciiCost[p] {
+                    revStartedAsciiCost[p] = nextCost
+                    revStartedAsciiNode[p] = newNode
+                }
+                if termEndsAscii[termId] && p > 0 && chars[p - 1] == termLastChars[termId] {
+                    if revSameStates == nil {
+                        revSameStates = [[Int: (cost: Int, node: Int)]?](repeating: nil, count: n + 1)
+                    }
+                    var targetMap = revSameStates![p] ?? [:]
+                    if let prev = targetMap[termId] {
+                        if nextCost < prev.cost { targetMap[termId] = (nextCost, newNode) }
+                    } else {
+                        targetMap[termId] = (nextCost, newNode)
+                    }
+                    revSameStates![p] = targetMap
+                }
+            }
+
+            if p > 0 {
+                var sepScan = p
+                var sentEnd = false
+                var hasRealSep = false
+                while sepScan > 0 {
+                    let c = map.clusterStart[sepScan - 1]
+                    if !map.isSep[c] { break }
+                    for k in c..<sepScan {
+                        if map.isSentenceEnd[k] { sentEnd = true }
+                        if !map.isIntraWordPunct[k] { hasRealSep = true }
+                    }
+                    sepScan = c
+                }
+                let hasSepBefore = sepScan < p
+                let beforeSepAscii = sepScan > 0 ? map.isAsciiAlnum[sepScan - 1] : false
+                if isSwiftChainQualifiedHallucination(
+                    nodeIdx: newNode,
+                    nodePrev: nodePrev,
+                    nodeTerm: nodeTerm,
+                    requireSentenceEndForDistinct: true,
+                    hasSentenceEnd: sentEnd
+                ) {
+                    let validBoundary = hasSepBefore
+                        ? !(termStartsAscii[termId] && !hasRealSep && beforeSepAscii)
+                        : (termStartsAscii[termId] && !beforeSepAscii)
+                    if validBoundary && p < bestTermStart {
+                        bestTermStart = p
+                    }
+                }
+            }
+        }
+    }
+
+    guard bestTermStart < n else { return n }
+    var cutNorm = bestTermStart
+    while cutNorm > 0 {
+        let c = map.clusterStart[cutNorm - 1]
+        var allWeak = true
+        for k in c..<cutNorm where !map.isWeakTrailingSep[k] {
+            allWeak = false
+            break
+        }
+        if !allWeak { break }
+        cutNorm = c
+    }
+    return cutNorm
 }
 
 func stripVoiceHotwordHallucination(_ text: String, hotwordsContext: String?, allowSingle: Bool = false) -> String {
@@ -686,13 +1178,17 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
     guard !normalizedTerms.isEmpty else { return text }
 
     let root = HotwordTrieNode()
+    let revRoot = HotwordTrieNode()
     var termStartsAscii = [Bool](repeating: false, count: normalizedTerms.count)
     var termEndsAscii = [Bool](repeating: false, count: normalizedTerms.count)
     var termFirstChars = [Character](repeating: "\0", count: normalizedTerms.count)
+    var termLastChars = [Character](repeating: "\0", count: normalizedTerms.count)
     for (termId, norm) in normalizedTerms.enumerated() {
         termStartsAscii[termId] = isAsciiAlnumOrUnderscore(norm[0])
         termEndsAscii[termId] = isAsciiAlnumOrUnderscore(norm[norm.count - 1])
         termFirstChars[termId] = norm[0]
+        termLastChars[termId] = norm[norm.count - 1]
+
         var node = root
         for ch in norm {
             if let child = node.children[ch] {
@@ -704,9 +1200,22 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
             }
         }
         node.termId = termId
+
+        var revNode = revRoot
+        for ch in norm.reversed() {
+            if let child = revNode.children[ch] {
+                revNode = child
+            } else {
+                let child = HotwordTrieNode()
+                revNode.children[ch] = child
+                revNode = child
+            }
+        }
+        revNode.termId = termId
     }
 
-    let chars = normalizeHotwordMatchCharacters(text)
+    let wholeMap = buildSwiftNormalizedClusterMap(text)
+    let chars = wholeMap.chars
     let n = chars.count
     guard n > 0 else { return text }
 
@@ -724,7 +1233,7 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
         if cCount == inf && aCount == inf && sameMap == nil { continue }
         let bestAtPos = min(cCount, aCount)
 
-        if isHotwordHallucinationSeparator(chars[pos]) {
+        if wholeMap.isSep[pos] {
             var sepMin = bestAtPos
             if let sameMap {
                 for cost in sameMap.values where cost < sepMin {
@@ -736,6 +1245,8 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
             }
         }
 
+        if pos != wholeMap.clusterStart[pos] { continue }
+
         var node: HotwordTrieNode? = root
         for p in pos..<n {
             node = node?.children[chars[p]]
@@ -743,13 +1254,15 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
             let termId = cur.termId
             if termId < 0 { continue }
 
+            let endPos = p + 1
+            if endPos < n && endPos != wholeMap.clusterStart[endPos] { continue }
+
             var startCost = termStartsAscii[termId] ? cCount : bestAtPos
             if let sameCost = sameMap?[termId], sameCost < startCost {
                 startCost = sameCost
             }
             if startCost >= inf { continue }
 
-            let endPos = p + 1
             let nextCost = startCost + 1
             if !termEndsAscii[termId] || endPos == n {
                 if nextCost < cleared[endPos] {
@@ -776,10 +1289,37 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
     }
 
     let minMatches = min(cleared[n], endedAscii[n])
-    if minMatches >= inf { return text }
-    if minMatches >= 2 { return "" }
-    if allowSingle && minMatches == 1 { return "" }
-    return text
+    if minMatches < inf {
+        if minMatches >= 2 { return "" }
+        if allowSingle && minMatches == 1 { return "" }
+        return text
+    }
+
+    var current = text
+    let leadCutNorm = findSwiftLeadingHallucinationCut(
+        map: wholeMap,
+        root: root,
+        termStartsAscii: termStartsAscii,
+        termEndsAscii: termEndsAscii,
+        termFirstChars: termFirstChars
+    )
+    if leadCutNorm > 0 && leadCutNorm < n {
+        current = String(current[wholeMap.normToRawIndex[leadCutNorm]...])
+    }
+    guard !current.isEmpty else { return "" }
+
+    let tailMap = leadCutNorm > 0 ? buildSwiftNormalizedClusterMap(current) : wholeMap
+    let tailCutNorm = findSwiftTrailingHallucinationCut(
+        map: tailMap,
+        revRoot: revRoot,
+        termStartsAscii: termStartsAscii,
+        termEndsAscii: termEndsAscii,
+        termLastChars: termLastChars
+    )
+    if tailCutNorm < tailMap.chars.count {
+        current = String(current[..<tailMap.normToRawIndex[tailCutNorm]])
+    }
+    return current
 }
 
 struct QwenSegmentedDecodeResult {
@@ -828,6 +1368,7 @@ final class QwenSegmentedDecodeEngine {
     private var retractedSegmentSingleHotword = false
     private var pendingRetractionFinal = false
     private var confirmedTokens: [Int32] = []
+    private var activeSegmentTrimStart: Int? = nil
     private var lastEmittedText = ""
     private var stopRequested = false
     private var producerFinished = false
@@ -1024,7 +1565,23 @@ final class QwenSegmentedDecodeEngine {
                     ? (committedHasTrustedRealText || !activeTrustedRealText.isEmpty || (hotwordTerms.isEmpty && (!committedText.isEmpty || !activeText.isEmpty)))
                     : (!activeTrustedRealText.isEmpty || (hotwordTerms.isEmpty && !activeText.isEmpty))
 
-                if !hasTrustedText && !hasSpeechEnergy(audioCopy) {
+                let decodeAudio: [Float]
+                if !isFinalPass && !prefixCopy.isEmpty {
+                    let fixedStart = activeSegmentTrimStart ?? 0
+                    decodeAudio = trimTrailingSilence(audioCopy, fixedStart: fixedStart)
+                } else if let trimmed = trimSilenceEdgesWithRange(audioCopy) {
+                    decodeAudio = trimmed.samples
+                    if !isFinalPass {
+                        activeSegmentTrimStart = trimmed.range.lowerBound
+                    }
+                } else {
+                    decodeAudio = []
+                    if !isFinalPass {
+                        activeSegmentTrimStart = nil
+                    }
+                }
+
+                if decodeAudio.isEmpty && (!hasTrustedText || isFinalPass) {
                     // Pure silence / faint noise floor: skip ASR decode so hotwords context cannot hallucinate.
                     if isFinalPass && (!lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal || activePendingSingleHotword) {
                         let finalCombined: String
@@ -1044,8 +1601,8 @@ final class QwenSegmentedDecodeEngine {
                             "isFinal": true,
                         ])
                     }
-                } else if let result = try? decodeFn(
-                    audioCopy,
+                } else if !decodeAudio.isEmpty, let result = try? decodeFn(
+                    decodeAudio,
                     prefixCopy,
                     { [weak self] in
                         guard let self else { throw CancellationError() }
@@ -1063,6 +1620,7 @@ final class QwenSegmentedDecodeEngine {
                         activeText = text
                         if hitRepetitionLoop {
                             confirmedTokens = []
+                            activeSegmentTrimStart = nil
                         } else if !isFinalPass {
                             confirmedTokens = rollbackPrefixFn(
                                 result.tokens,
@@ -1124,6 +1682,7 @@ final class QwenSegmentedDecodeEngine {
                             || blockedTrustedOverwriteSingleHotword
                             || (text.isEmpty && (activePendingSingleHotword || !activeTrustedRealText.isEmpty || (isFinalWholeUtterance && committedHasTrustedRealText))) {
                             confirmedTokens = []
+                            activeSegmentTrimStart = nil
                             let trustedCommitted = (!isFinalWholeUtterance || committedHasTrustedRealText) ? committedText : ""
                             if !activeTrustedRealText.isEmpty {
                                 activeText = activeTrustedRealText
@@ -1196,6 +1755,7 @@ final class QwenSegmentedDecodeEngine {
                             }
                             if hitAnyGuard {
                                 confirmedTokens = []
+                                activeSegmentTrimStart = nil
                             } else if !isFinalPass {
                                 confirmedTokens = rollbackPrefixFn(
                                     result.tokens,
@@ -1248,6 +1808,7 @@ final class QwenSegmentedDecodeEngine {
                     activeTrustedRealText = ""
                     activePendingSingleHotword = false
                     confirmedTokens = []
+                    activeSegmentTrimStart = nil
                     lock.lock()
                     activeSegment.removeAll(keepingCapacity: true)
                     lastDecodedCount = 0

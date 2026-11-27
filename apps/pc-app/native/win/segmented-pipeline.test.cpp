@@ -582,8 +582,9 @@ int main() {
     worker.join();
 
     assert(decode_sizes.size() == 3);
-    assert(decode_sizes[0] == kMinPauseSplitSamples + kPauseWindowSamples);
-    assert(decode_sizes[1] == kMinPauseSplitSamples + kPauseWindowSamples);
+    // Trailing 400ms (6400 samples) pause is trimmed to 250ms (4000 samples) protective pad before decode.
+    assert(decode_sizes[0] == kMinPauseSplitSamples + 4000);
+    assert(decode_sizes[1] == kMinPauseSplitSamples + 4000);
     assert(decode_sizes[2] == 24000);
 
     std::string final_text;
@@ -624,7 +625,7 @@ int main() {
     worker.join();
 
     assert(decode_sizes.size() == 2);
-    assert(decode_sizes[0] == kMinPauseSplitSamples + kPauseWindowSamples);
+    assert(decode_sizes[0] == kMinPauseSplitSamples + 4000);
     assert(decode_sizes[1] == kMinPauseSplitSamples + kPauseWindowSamples + 24000);
     std::string final_text;
     for (const auto& line : emitted) {
@@ -847,6 +848,120 @@ int main() {
       assert(extract_json_bool_or_str(line, "isFinal") != "true");
     }
     assert(!emitted.empty() && extract_json_string_field(emitted.back(), "type") == "end");
+  }
+
+  // 15. Edge silence trimming: strips long leading/trailing silence while retaining ~250ms pad (4000 samples @ 16kHz),
+  // clamps near boundaries, preserves quiet speech, and returns empty on pure silence/sub-threshold noise.
+  {
+    assert(trim_silence_edges(std::vector<float>{}).empty());
+    assert(trim_silence_edges(std::vector<float>(32000, 0.0f)).empty());
+    assert(trim_silence_edges(std::vector<float>(16000, 0.002f)).empty());
+
+    std::vector<float> padded(48000, 0.0f); // 3.0s leading silence
+    padded.insert(padded.end(), 16000, 0.05f); // 1.0s speech
+    padded.insert(padded.end(), 48000, 0.0f); // 3.0s trailing silence
+    const std::vector<float> trimmed = trim_silence_edges(padded);
+    assert(trimmed.size() == 4000 + 16000 + 4000);
+    assert(trimmed.front() == 0.0f);
+    assert(trimmed[4000] == 0.05f);
+    assert(trimmed[4000 + 15999] == 0.05f);
+    assert(trimmed.back() == 0.0f);
+
+    // Clamping when silence margins are shorter than 250ms:
+    std::vector<float> short_margin(1000, 0.0f);
+    short_margin.insert(short_margin.end(), 2000, 0.02f);
+    short_margin.insert(short_margin.end(), 1000, 0.0f);
+    assert(trim_silence_edges(short_margin).size() == 4000);
+
+    // Quiet speech (0.006 RMS < 0.015 peak) still triggers 50ms RMS threshold:
+    std::vector<float> quiet_padded(20000, 0.0f);
+    quiet_padded.insert(quiet_padded.end(), 3200, 0.006f);
+    quiet_padded.insert(quiet_padded.end(), 20000, 0.0f);
+    const std::vector<float> quiet_trimmed = trim_silence_edges(quiet_padded);
+    assert(!quiet_trimmed.empty() && quiet_trimmed.size() < quiet_padded.size());
+  }
+
+  // 16. Pipeline trims leading+trailing silence before decoding AND strips edge hotword hallucinations via ServeCommandLoop.
+  {
+    std::vector<std::string> emitted;
+    std::vector<size_t> decode_sizes;
+    ServeCommandLoop loop(nullptr, nullptr);
+    loop.set_hotword_factories(
+        nullptr,
+        [&](std::vector<std::string> req_hotwords) {
+          return std::make_unique<PcmUtteranceDecoder>(
+              [&](const std::vector<float>& samples) -> std::string {
+                decode_sizes.push_back(samples.size());
+                return "language Chinese<asr_text>IM.codes，IM.codes。你答的对，就这么来。";
+              },
+              [&](const std::string& line) { emitted.push_back(line); },
+              kMaxSegmentSamples,
+              kMaxFinalReDecodeSamples,
+              req_hotwords);
+        });
+
+    auto encode_pcm16_b64_vals = [](const std::vector<int16_t>& vals) {
+      static const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      std::vector<uint8_t> bytes(vals.size() * 2);
+      for (size_t i = 0; i < vals.size(); ++i) {
+        bytes[i * 2] = static_cast<uint8_t>(vals[i] & 0xff);
+        bytes[i * 2 + 1] = static_cast<uint8_t>((vals[i] >> 8) & 0xff);
+      }
+      std::string out;
+      for (size_t i = 0; i < bytes.size(); i += 3) {
+        uint32_t v = static_cast<uint32_t>(bytes[i]) << 16;
+        if (i + 1 < bytes.size()) v |= static_cast<uint32_t>(bytes[i + 1]) << 8;
+        if (i + 2 < bytes.size()) v |= static_cast<uint32_t>(bytes[i + 2]);
+        out.push_back(kB64[(v >> 18) & 63]);
+        out.push_back(kB64[(v >> 12) & 63]);
+        out.push_back(i + 1 < bytes.size() ? kB64[(v >> 6) & 63] : '=');
+        out.push_back(i + 2 < bytes.size() ? kB64[v & 63] : '=');
+      }
+      return out;
+    };
+
+    std::vector<int16_t> audio(24000, 0); // 1.5s leading silence
+    audio.insert(audio.end(), 16000, 4000); // 1.0s speech
+    audio.insert(audio.end(), 24000, 0); // 1.5s trailing silence
+
+    assert(loop.handle_line("{\"cmd\":\"start_pcm\",\"hotwords\":[\"IM.codes\",\"Claude\"]}"));
+    assert(loop.handle_line("{\"cmd\":\"pcm\",\"data\":\"" + encode_pcm16_b64_vals(audio) + "\"}"));
+    assert(loop.handle_line("{\"cmd\":\"stop\"}"));
+    loop.join_and_reset_active(false);
+    assert(!loop.handle_line("{\"cmd\":\"shutdown\"}"));
+
+    assert(!decode_sizes.empty());
+    assert(decode_sizes.back() == 4000 + 16000 + 4000);
+    std::string final_text;
+    for (const auto& line : emitted) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_text = extract_json_string_field(line, "text").value_or("");
+      }
+    }
+    assert(final_text == "你答的对，就这么来。");
+  }
+
+  // 17. Direct C++ strip_voice_hotword_hallucination coverage: positive + negative safety cases.
+  {
+    const std::vector<std::string> terms{"IM.codes", "Claude Code", "Codex", "代码"};
+    assert(strip_voice_hotword_hallucination("IM.codes，IM.codes。你答的对，就这么来。", terms) ==
+           "你答的对，就这么来。");
+    assert(strip_voice_hotword_hallucination("我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。IM.codes，IM.codes。", terms) ==
+           "我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。");
+    assert(strip_voice_hotword_hallucination("我要的是速度 IM.codes IM.codes", terms) == "我要的是速度");
+    assert(strip_voice_hotword_hallucination("我要的是速度，IM.codes，IM.codes。", terms) == "我要的是速度");
+    assert(strip_voice_hotword_hallucination("ＩＭ．ｃｏｄｅｓ，IM.codes。你好，IM.codes，im.codes。", terms) == "你好");
+    assert(strip_voice_hotword_hallucination("IM.codes, Claude Code, Codex。开始工作", terms) == "开始工作");
+    assert(strip_voice_hotword_hallucination("开始工作。IM.codes, Claude Code, Codex。", terms) == "开始工作。");
+    // Negative cases must stay intact:
+    assert(strip_voice_hotword_hallucination("IM.codes is great", terms) == "IM.codes is great");
+    assert(strip_voice_hotword_hallucination("Use IM.codes", terms) == "Use IM.codes");
+    assert(strip_voice_hotword_hallucination("testcode, code", std::vector<std::string>{"code"}) == "testcode, code");
+    assert(strip_voice_hotword_hallucination("code, codeReview", std::vector<std::string>{"code"}) == "code, codeReview");
+    assert(strip_voice_hotword_hallucination("你好，你好吗", std::vector<std::string>{"你好"}) == "你好，你好吗");
+    assert(strip_voice_hotword_hallucination("请你对比 IM.codes, Claude Code, Codex。", terms) ==
+           "请你对比 IM.codes, Claude Code, Codex。");
   }
 
   std::printf("segmented-pipeline tests passed\n");

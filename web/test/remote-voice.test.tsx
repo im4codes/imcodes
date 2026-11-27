@@ -4893,6 +4893,29 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
         ['打开 IM.codes', false],
         ['打开 IM.codes', true],
       ]);
+
+      // 5. Edge repeated-hotword hallucinations around real speech are stripped on VoiceInput owner emit
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-edge-strip' });
+      const onEdgeRes = vi.fn();
+      const startEdge = VoiceInput.startListening(onEdgeRes, undefined, undefined, { projectKey: 'proj-remote-guard' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(6));
+      const ws5 = FakeWebSocket.instances[5]!;
+      ws5.emitOpen();
+      const frame5 = JSON.parse(ws5.sent[0]!) as { sessionId: string };
+      ws5.emitMessage({ type: 'voice.session.ready', sessionId: frame5.sessionId });
+      await expect(startEdge).resolves.toBe(true);
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array([4000, -4000])),
+        level: 0.2,
+      });
+      ws5.emitMessage({ type: 'voice.session.result', sessionId: frame5.sessionId, text: 'IM.codes，IM.codes。你答的对，就这么来。', isFinal: false });
+      ws5.emitMessage({ type: 'voice.session.result', sessionId: frame5.sessionId, text: '我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。IM.codes，IM.codes。', isFinal: true });
+      ws5.emitMessage({ type: 'voice.session.end', sessionId: frame5.sessionId });
+      await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
+      expect(onEdgeRes.mock.calls).toEqual([
+        ['你答的对，就这么来。', false],
+        ['我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。', true],
+      ]);
     } finally {
       await VoiceInput.stopListening({ abort: true });
       delete (streamingBridge as Record<string, unknown>).startRawPcmCapture;

@@ -2990,6 +2990,33 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
       { type: 'voice.session.result', sessionId: 'pc-explicit-single-final', text: 'IM.codes', isFinal: true },
     ]);
 
+    // 6. Edge repeated-hotword hallucinations around real speech are stripped on relay while preserving spoken speech & sentence period
+    await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-edge-hallucination',
+      targetDeviceId: 'mac-order',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes', 'Claude'],
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.ready', sessionId: 'pc-edge-hallucination' }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-edge-hallucination',
+      text: 'IM.codes，IM.codes。你答的对，就这么来。',
+      isFinal: false,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-edge-hallucination',
+      text: '我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。IM.codes，IM.codes。',
+      isFinal: true,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-edge-hallucination' }));
+    expect(clientSent.filter((f) => f.sessionId === 'pc-edge-hallucination' && f.type === 'voice.session.result')).toEqual([
+      { type: 'voice.session.result', sessionId: 'pc-edge-hallucination', text: '你答的对，就这么来。', isFinal: false },
+      { type: 'voice.session.result', sessionId: 'pc-edge-hallucination', text: '我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。', isFinal: true },
+    ]);
+
     expect(hub.getActiveSessionCount()).toBe(0);
     hub.stop();
   });

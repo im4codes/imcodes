@@ -142,10 +142,14 @@ describe('sanitizeVoiceTranscriptWithHotwords & resolveSessionTranscriptResult h
       '打开 IM.codes 再看看 Codex',
     );
 
-    // Trailing repetition burst + real speech keeps real speech
+    // Trailing repeated-hotword hallucinations + weak trailing comma/space are stripped cleanly,
+    // while non-hotword trailing repetition bursts still preserve preceding real speech.
     expect(
       sanitizeVoiceTranscriptWithHotwords(`打开 IM.codes，${'IM.codes。'.repeat(6)}`, hotwords),
-    ).toBe('打开 IM.codes，');
+    ).toBe('打开');
+    expect(
+      sanitizeVoiceTranscriptWithHotwords(`打开这个文件，${'测试。'.repeat(6)}`, hotwords),
+    ).toBe('打开这个文件，');
 
     // resolveSessionTranscriptResult preserves prior real speech if a hallucinated final frame arrives
     const r1 = resolveSessionTranscriptResult('language Chinese<asr_text>打开 IM.codes', false, '', hotwords);

@@ -3990,6 +3990,135 @@ do {
     check(doneInflight.wait(timeout: .now() + 5) == .success, "case 7b done wait")
     check(!inflightEmitted.contains { ($0["isFinal"] as? Bool) == true }, "case 7b abort during final decode emitted isFinal: \\(inflightEmitted)")
 }
+
+// 8. Silence edge trimming keeps ~250ms padding (4000 samples @ 16kHz), clamps short margins,
+//    preserves quiet speech (RMS >= 0.005), returns empty on pure silence, and anchors fixedStart during streaming.
+do {
+    check(trimSilenceEdges([]).isEmpty, "case 8 empty audio")
+    check(trimSilenceEdges([Float](repeating: 0, count: 32_000)).isEmpty, "case 8 all silence")
+    check(trimSilenceEdges([Float](repeating: 0.002, count: 16_000)).isEmpty, "case 8 sub-threshold noise")
+
+    var padded = [Float](repeating: 0, count: 48_000)
+    padded.append(contentsOf: [Float](repeating: 0.05, count: 16_000))
+    padded.append(contentsOf: [Float](repeating: 0, count: 48_000))
+    let trimmed = trimSilenceEdgesWithRange(padded)
+    check(trimmed != nil && trimmed!.range == 44_000..<68_000 && trimmed!.samples.count == 24_000, "case 8 250ms pad mismatch: \\(String(describing: trimmed?.range))")
+    check(trimTrailingSilence(padded, fixedStart: 44_000).count == 24_000, "case 8 trailing trim fixedStart")
+
+    var extended = padded
+    extended.append(contentsOf: [Float](repeating: 0, count: 32_000))
+    check(trimTrailingSilence(extended, fixedStart: 44_000).count == 24_000, "case 8 trailing silence after speech stays 24k")
+
+    var shortMargin = [Float](repeating: 0, count: 1_000)
+    shortMargin.append(contentsOf: [Float](repeating: 0.02, count: 2_000))
+    shortMargin.append(contentsOf: [Float](repeating: 0, count: 1_000))
+    check(trimSilenceEdges(shortMargin).count == 4_000, "case 8 short margin clamp")
+
+    var quiet = [Float](repeating: 0, count: 20_000)
+    quiet.append(contentsOf: [Float](repeating: 0.006, count: 3_200))
+    quiet.append(contentsOf: [Float](repeating: 0, count: 20_000))
+    let quietTrimmed = trimSilenceEdges(quiet)
+    check(!quietTrimmed.isEmpty && quietTrimmed.count < quiet.count, "case 8 quiet RMS speech dropped")
+}
+
+// 9. QwenSegmentedDecodeEngine trims silence edges while keeping fixed left start during active confirmedTokens,
+//    re-trims cleanly on whole-utterance final, and strips leading/trailing repeated hotword hallucinations.
+do {
+    var decodeCalls: [(count: Int, prefix: [Int32])] = []
+    var emitted: [[String: Any]] = []
+    let passLock = NSLock()
+    var passCount = 0
+    let sem1 = DispatchSemaphore(value: 0)
+    let sem2 = DispatchSemaphore(value: 0)
+    let sem3 = DispatchSemaphore(value: 0)
+    let done = DispatchSemaphore(value: 0)
+
+    let engine = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 16_000,
+        strideSamples: 16_000,
+        maxSegmentSamples: 216_000,
+        maxFinalReDecodeSamples: 480_000,
+        rollbackTokenCount: 0,
+        expectLanguageHeader: false,
+        hotwordTerms: ["IM.codes", "Claude", "Codex"],
+        decodeFn: { samples, prefix, checkCancel in
+            try checkCancel()
+            passLock.lock()
+            decodeCalls.append((samples.count, prefix))
+            passCount += 1
+            let p = passCount
+            passLock.unlock()
+            if p == 1 {
+                return QwenSegmentedDecodeResult(text: "IM.codes，IM.codes。你答的对", tokens: [101, 102])
+            }
+            if p == 2 {
+                return QwenSegmentedDecodeResult(text: "你答的对，就这么", tokens: [101, 102, 103])
+            }
+            if p == 3 {
+                return QwenSegmentedDecodeResult(text: "你答的对，就这么来", tokens: [101, 102, 103, 104])
+            }
+            return QwenSegmentedDecodeResult(text: "IM.codes，IM.codes。你答的对，就这么来。", tokens: [101, 102, 103, 104])
+        },
+        rollbackPrefixFn: { tokens, _, _ in tokens },
+        emitJsonFn: { payload in
+            emitted.append(payload)
+            let isF = (payload["isFinal"] as? Bool) ?? false
+            let txt = payload["text"] as? String
+            if !isF && txt == "你答的对" { sem1.signal() }
+            if !isF && txt == "你答的对，就这么" { sem2.signal() }
+            if !isF && txt == "你答的对，就这么来" { sem3.signal() }
+        },
+        onLoopFinishedFn: { done.signal() }
+    )
+
+    DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
+    var chunk1 = [Float](repeating: 0, count: 24_000) // 1.5s leading silence
+    chunk1.append(contentsOf: [Float](repeating: 0.2, count: 16_000)) // 1.0s speech
+    check(engine.enqueue(chunk1), "case 9 chunk 1")
+    check(sem1.wait(timeout: .now() + 5) == .success, "case 9 sem1")
+
+    var chunk2 = [Float](repeating: 0.2, count: 8_000) // 0.5s more speech
+    chunk2.append(contentsOf: [Float](repeating: 0, count: 8_000))
+    check(engine.enqueue(chunk2), "case 9 chunk 2")
+    check(sem2.wait(timeout: .now() + 5) == .success, "case 9 sem2")
+
+    var chunk3 = [Float](repeating: 0.2, count: 4_000) // 0.25s more speech (trailing before silence)
+    chunk3.append(contentsOf: [Float](repeating: 0, count: 16_000)) // 1.0s trailing silence
+    check(engine.enqueue(chunk3), "case 9 chunk 3")
+    check(sem3.wait(timeout: .now() + 5) == .success, "case 9 sem3")
+
+    engine.requestStop(abort: false, producerAlsoFinished: true)
+    check(done.wait(timeout: .now() + 5) == .success, "case 9 done")
+
+    // Pass 1: trimmed 24k lead to 4k -> 20k (edge hallucination cleared confirmedTokens)
+    // Pass 2: re-trimmed to 4k lead + 24k speech + 4k trail = 32k, confirmedTokens = [101,102,103] anchored at 20k
+    // Pass 3: anchored left at 20k while trimming trailing silence to 4k -> 4k+16k+8k+8k+4k+4k = 44k with prefix=[101,102,103]!
+    // Pass 4: final pass re-decodes whole utterance with prefix=[] and 44k trimmed!
+    check(decodeCalls.count == 4, "case 9 decodeCalls count: \\(decodeCalls)")
+    check(decodeCalls[0].count == 20_000 && decodeCalls[0].prefix.isEmpty, "case 9 pass 1: \\(decodeCalls[0])")
+    check(decodeCalls[1].count == 32_000 && decodeCalls[1].prefix.isEmpty, "case 9 pass 2: \\(decodeCalls[1])")
+    check(decodeCalls[2].count == 44_000 && decodeCalls[2].prefix == [101, 102, 103], "case 9 pass 3: \\(decodeCalls[2])")
+    check(decodeCalls[3].count == 44_000 && decodeCalls[3].prefix.isEmpty, "case 9 pass 4: \\(decodeCalls[3])")
+    let finals = emitted.filter { ($0["isFinal"] as? Bool) == true }
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "你答的对，就这么来。", "case 9 final: \\(finals)")
+}
+
+// 10. Swift stripVoiceHotwordHallucination edge parity checks
+do {
+    let terms = ["IM.codes", "Claude", "Codex", "你好"]
+    check(stripVoiceHotwordHallucination("我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。IM.codes，IM.codes。", hotwordTerms: terms) == "我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。", "case 10 trailing period")
+    check(stripVoiceHotwordHallucination("我要的是速度 IM.codes IM.codes", hotwordTerms: terms) == "我要的是速度", "case 10 trailing space")
+    check(stripVoiceHotwordHallucination("我要的是速度，IM.codes，IM.codes。", hotwordTerms: terms) == "我要的是速度", "case 10 trailing comma")
+    check(stripVoiceHotwordHallucination("ＩＭ．ｃｏｄｅｓ，IM.codes。Café👍🏽，IM.codes，im.codes。", hotwordTerms: terms) == "Café👍🏽", "case 10 both + emoji")
+    check(stripVoiceHotwordHallucination("IM.codes, Claude, Codex。开始工作", hotwordTerms: terms) == "开始工作", "case 10 3 distinct leading")
+    check(stripVoiceHotwordHallucination("开始工作。IM.codes, Claude, Codex。", hotwordTerms: terms) == "开始工作。", "case 10 3 distinct trailing")
+    check(stripVoiceHotwordHallucination("IM.codes is great", hotwordTerms: terms) == "IM.codes is great", "case 10 single lead intact")
+    check(stripVoiceHotwordHallucination("Use IM.codes", hotwordTerms: terms) == "Use IM.codes", "case 10 single trail intact")
+    check(stripVoiceHotwordHallucination("testcode, code", hotwordTerms: ["code"]) == "testcode, code", "case 10 ascii left intact")
+    check(stripVoiceHotwordHallucination("code, codeReview", hotwordTerms: ["code"]) == "code, codeReview", "case 10 ascii right intact")
+    check(stripVoiceHotwordHallucination("你好，你好吗", hotwordTerms: ["你好"]) == "你好，你好吗", "case 10 cjk boundary intact")
+    check(stripVoiceHotwordHallucination("请你对比 IM.codes, Claude, Codex。", hotwordTerms: terms) == "请你对比 IM.codes, Claude, Codex。", "case 10 list intact")
+}
 print("MAC_SEGMENTED_DECODE:PASS")
 `);
   await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { timeout: 120000 });
@@ -4007,7 +4136,7 @@ print("MAC_SEGMENTED_DECODE:PASS")
   if (clangPp) {
     const helperStart = winCpp.indexOf('constexpr uint64_t kDirectMlMinVramMb');
     const helperEnd = winCpp.indexOf('std::string wide_to_utf8(');
-    const b64Start = winCpp.indexOf('std::optional<std::string> extract_json_string_field(');
+    const b64Start = winCpp.indexOf('inline void append_utf8_cp(');
     const b64End = winCpp.indexOf('std::string resolve_target_capture_uid(');
     const pipeStart = winCpp.indexOf('template <typename SampleAtFn>');
     const pipeEnd = winCpp.indexOf('#ifdef IMCODES_HAS_SHERPA_ONNX', pipeStart);
@@ -4042,6 +4171,7 @@ print("MAC_SEGMENTED_DECODE:PASS")
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 ${winCpp.slice(helperStart, helperEnd)}

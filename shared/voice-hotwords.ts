@@ -989,6 +989,10 @@ export function canStoreVoiceHotwordProjectKey(
 }
 
 const HOTWORD_HALLUCINATION_SEP_CHAR_RE = /^[\s\p{P}\p{Z}\u2026\u2022\u00B7~`+=|<>$¥€£°^]$/u;
+const HOTWORD_COMBINING_MARK_RE = /^\p{M}$/u;
+const HOTWORD_SENTENCE_END_CHAR_RE = /^[.!?。！？\n\r;；]$/u;
+const HOTWORD_WEAK_TRAILING_SEP_RE = /^[\s,，、:：\-—–·•]$/u;
+const HOTWORD_INTRA_WORD_PUNCT_RE = /^[.\-_'/+]$/;
 const PCM16_SPEECH_PEAK_THRESHOLD = 0.015;
 const PCM16_SPEECH_WINDOW_RMS_THRESHOLD = 0.005;
 const PCM16_SPEECH_WINDOW_RMS_SQ = PCM16_SPEECH_WINDOW_RMS_THRESHOLD * PCM16_SPEECH_WINDOW_RMS_THRESHOLD;
@@ -1004,9 +1008,12 @@ interface HallucinationTrieNode {
 
 interface CompiledHallucinationMatcher {
   root: HallucinationTrieNode;
+  revRoot: HallucinationTrieNode;
+  termCount: number;
   termStartsAscii: Uint8Array;
   termEndsAscii: Uint8Array;
   termFirstCodes: Uint16Array;
+  termLastCodes: Uint16Array;
 }
 
 const compiledHallucinationCache = new WeakMap<object, CompiledHallucinationMatcher | null>();
@@ -1021,6 +1028,66 @@ function normalizeHotwordMatchText(raw: string): string {
     .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
     .replace(/\uFF61/g, '.')
     .toLowerCase();
+}
+
+interface NormalizedClusterMap {
+  normText: string;
+  normToRawStart: Int32Array;
+  normClusterStart: Int32Array;
+  isSep: Uint8Array;
+  isSentenceEnd: Uint8Array;
+}
+
+function buildNormalizedClusterMap(text: string): NormalizedClusterMap {
+  const parts: string[] = [];
+  const rawStarts: number[] = [];
+  const clusterStarts: number[] = [];
+  const seps: number[] = [];
+  const sentEnds: number[] = [];
+  let normLen = 0;
+
+  for (let i = 0; i < text.length; ) {
+    const clusterRawStart = i;
+    const cp = text.codePointAt(i)!;
+    i += cp > 0xffff ? 2 : 1;
+    while (i < text.length) {
+      const nextCp = text.codePointAt(i)!;
+      const nextStr = String.fromCodePoint(nextCp);
+      if (!HOTWORD_COMBINING_MARK_RE.test(nextStr)) break;
+      i += nextCp > 0xffff ? 2 : 1;
+    }
+    const rawCluster = text.slice(clusterRawStart, i);
+    const normSlice = normalizeHotwordMatchText(rawCluster);
+    if (!normSlice) continue;
+    const cStart = normLen;
+    parts.push(normSlice);
+    for (let k = 0; k < normSlice.length; ) {
+      const nCp = normSlice.codePointAt(k)!;
+      const nLen = nCp > 0xffff ? 2 : 1;
+      const nCh = normSlice.slice(k, k + nLen);
+      const sepFlag = HOTWORD_HALLUCINATION_SEP_CHAR_RE.test(nCh) ? 1 : 0;
+      const endFlag = HOTWORD_SENTENCE_END_CHAR_RE.test(nCh) ? 1 : 0;
+      for (let u = 0; u < nLen; u += 1) {
+        rawStarts.push(clusterRawStart);
+        clusterStarts.push(cStart);
+        seps.push(sepFlag);
+        sentEnds.push(endFlag);
+      }
+      k += nLen;
+    }
+    normLen += normSlice.length;
+  }
+
+  rawStarts.push(text.length);
+  clusterStarts.push(normLen);
+
+  return {
+    normText: parts.join(''),
+    normToRawStart: Int32Array.from(rawStarts),
+    normClusterStart: Int32Array.from(clusterStarts),
+    isSep: Uint8Array.from(seps),
+    isSentenceEnd: Uint8Array.from(sentEnds),
+  };
 }
 
 function createHallucinationTrieNode(): HallucinationTrieNode {
@@ -1070,27 +1137,40 @@ function buildHallucinationMatcherFromRawList(rawList: readonly string[]): Compi
   if (uniqueTerms.length === 0) return null;
 
   const root = createHallucinationTrieNode();
+  const revRoot = createHallucinationTrieNode();
   const termStartsAscii = new Uint8Array(uniqueTerms.length);
   const termEndsAscii = new Uint8Array(uniqueTerms.length);
   const termFirstCodes = new Uint16Array(uniqueTerms.length);
+  const termLastCodes = new Uint16Array(uniqueTerms.length);
 
   for (let termId = 0; termId < uniqueTerms.length; termId += 1) {
     const term = uniqueTerms[termId]!;
     termStartsAscii[termId] = ASCII_ALNUM_UNDER_RE.test(term[0]!) ? 1 : 0;
     termEndsAscii[termId] = ASCII_ALNUM_UNDER_RE.test(term[term.length - 1]!) ? 1 : 0;
     termFirstCodes[termId] = term.charCodeAt(0);
+    termLastCodes[termId] = term.charCodeAt(term.length - 1);
+
     let node = root;
     for (let i = 0; i < term.length; i += 1) {
       node = getOrAddTrieChild(node, term.charCodeAt(i));
     }
     node.termId = termId;
+
+    let revNode = revRoot;
+    for (let i = term.length - 1; i >= 0; i -= 1) {
+      revNode = getOrAddTrieChild(revNode, term.charCodeAt(i));
+    }
+    revNode.termId = termId;
   }
 
   return {
     root,
+    revRoot,
+    termCount: uniqueTerms.length,
     termStartsAscii,
     termEndsAscii,
     termFirstCodes,
+    termLastCodes,
   };
 }
 
@@ -1124,11 +1204,335 @@ function getCompiledHallucinationMatcher(
   return matcher;
 }
 
+function isChainQualifiedHallucination(
+  nodeIdx: number,
+  nodePrev: readonly number[],
+  nodeTerm: readonly number[],
+  requireSentenceEndForDistinct: boolean,
+  hasSentenceEnd: boolean,
+): boolean {
+  let totalTerms = 0;
+  let maxSame = 0;
+  let counts: Map<number, number> | null = null;
+  let cur = nodeIdx;
+  while (cur > 0) {
+    const termId = nodeTerm[cur]!;
+    if (termId >= 0) {
+      totalTerms += 1;
+      if (!counts) counts = new Map<number, number>();
+      const next = (counts.get(termId) ?? 0) + 1;
+      counts.set(termId, next);
+      if (next > maxSame) maxSame = next;
+      if (maxSame >= 2) return true;
+    }
+    cur = nodePrev[cur]!;
+  }
+  if (totalTerms >= 3 && (!requireSentenceEndForDistinct || hasSentenceEnd)) {
+    return true;
+  }
+  return false;
+}
+
+function findLeadingHallucinationCut(
+  matcher: CompiledHallucinationMatcher,
+  map: NormalizedClusterMap,
+): number {
+  const { normText, normClusterStart, isSep, isSentenceEnd } = map;
+  const n = normText.length;
+  if (n === 0) return 0;
+
+  const clearedCost = new Int32Array(n + 1).fill(HALLUCINATION_INF);
+  const clearedNode = new Int32Array(n + 1).fill(-1);
+  const clearedFromSep = new Uint8Array(n + 1);
+  const clearedSepHasEnd = new Uint8Array(n + 1);
+  const endedAsciiCost = new Int32Array(n + 1).fill(HALLUCINATION_INF);
+  const endedAsciiNode = new Int32Array(n + 1).fill(-1);
+  let sameTermStates: Array<Map<number, { cost: number; node: number }> | undefined> | null = null;
+
+  const nodePrev: number[] = [-1];
+  const nodeTerm: number[] = [-1];
+  clearedCost[0] = 0;
+  clearedNode[0] = 0;
+
+  let bestCut = 0;
+
+  for (let pos = 0; pos < n; pos += 1) {
+    const cCost = clearedCost[pos]!;
+    const aCost = endedAsciiCost[pos]!;
+    const sameMap = sameTermStates?.[pos];
+    if (sameTermStates) sameTermStates[pos] = undefined;
+    if (cCost === HALLUCINATION_INF && aCost === HALLUCINATION_INF && !sameMap) continue;
+
+    let bestCost = cCost;
+    let bestNode = clearedNode[pos]!;
+    if (aCost < bestCost) {
+      bestCost = aCost;
+      bestNode = endedAsciiNode[pos]!;
+    }
+    if (sameMap) {
+      for (const entry of sameMap.values()) {
+        if (entry.cost < bestCost) {
+          bestCost = entry.cost;
+          bestNode = entry.node;
+        }
+      }
+    }
+
+    const cp = normText.codePointAt(pos)!;
+    const charLen = cp > 0xffff ? 2 : 1;
+
+    if (
+      pos > 0
+      && pos === normClusterStart[pos]!
+      && isSep[pos] === 0
+      && clearedFromSep[pos] === 1
+      && cCost < HALLUCINATION_INF
+    ) {
+      let bodyEnd = pos + 1;
+      while (bodyEnd < n && normClusterStart[bodyEnd]! === pos) bodyEnd += 1;
+      const bodyStartsAscii = ASCII_ALNUM_UNDER_RE.test(normText.slice(pos, bodyEnd));
+      let hasValidSep = !bodyStartsAscii;
+      if (bodyStartsAscii) {
+        let sepScan = pos;
+        while (sepScan > 0) {
+          const c = normClusterStart[sepScan - 1]!;
+          if (isSep[c] !== 1) break;
+          if (!HOTWORD_INTRA_WORD_PUNCT_RE.test(normText.slice(c, sepScan))) {
+            hasValidSep = true;
+            break;
+          }
+          sepScan = c;
+        }
+      }
+      if (
+        hasValidSep
+        && isChainQualifiedHallucination(clearedNode[pos]!, nodePrev, nodeTerm, true, clearedSepHasEnd[pos] === 1)
+      ) {
+        bestCut = pos;
+      }
+    }
+
+    if (isSep[pos] === 1) {
+      const nextPos = pos + charLen;
+      const nextEnd = (cCost === bestCost && clearedFromSep[pos] === 1 && clearedSepHasEnd[pos] === 1) || isSentenceEnd[pos] === 1 ? 1 : 0;
+      if (
+        bestCost < clearedCost[nextPos]!
+        || (bestCost === clearedCost[nextPos]! && (clearedFromSep[nextPos] === 0 || (nextEnd === 1 && clearedSepHasEnd[nextPos] === 0)))
+      ) {
+        clearedCost[nextPos] = bestCost;
+        clearedNode[nextPos] = bestNode;
+        clearedFromSep[nextPos] = 1;
+        clearedSepHasEnd[nextPos] = nextEnd;
+      }
+    }
+
+    if (pos !== normClusterStart[pos]!) continue;
+
+    let node: HallucinationTrieNode | undefined = matcher.root;
+    for (let p = pos; p < n; p += 1) {
+      node = getTrieChild(node, normText.charCodeAt(p));
+      if (!node) break;
+      const termId = node.termId;
+      if (termId < 0) continue;
+
+      const endPos = p + 1;
+      if (endPos < n && endPos !== normClusterStart[endPos]!) continue;
+
+      let startCost = matcher.termStartsAscii[termId]! ? cCost : bestCost;
+      let startNode = matcher.termStartsAscii[termId]! ? clearedNode[pos]! : bestNode;
+      if (sameMap) {
+        const sameEntry = sameMap.get(termId);
+        if (sameEntry && sameEntry.cost < startCost) {
+          startCost = sameEntry.cost;
+          startNode = sameEntry.node;
+        }
+      }
+      if (startCost >= HALLUCINATION_INF || startNode < 0) continue;
+
+      const nextCost = startCost + 1;
+      const newNode = nodePrev.length;
+      nodePrev.push(startNode);
+      nodeTerm.push(termId);
+
+      if (!matcher.termEndsAscii[termId]! || endPos === n) {
+        if (nextCost < clearedCost[endPos]!) {
+          clearedCost[endPos] = nextCost;
+          clearedNode[endPos] = newNode;
+          clearedFromSep[endPos] = 0;
+          clearedSepHasEnd[endPos] = 0;
+        }
+      } else {
+        if (nextCost < endedAsciiCost[endPos]!) {
+          endedAsciiCost[endPos] = nextCost;
+          endedAsciiNode[endPos] = newNode;
+        }
+        if (matcher.termStartsAscii[termId]! && normText.charCodeAt(endPos) === matcher.termFirstCodes[termId]!) {
+          if (!sameTermStates) sameTermStates = new Array(n + 1);
+          let targetMap = sameTermStates[endPos];
+          if (!targetMap) {
+            targetMap = new Map<number, { cost: number; node: number }>();
+            sameTermStates[endPos] = targetMap;
+          }
+          const prev = targetMap.get(termId);
+          if (!prev || nextCost < prev.cost) {
+            targetMap.set(termId, { cost: nextCost, node: newNode });
+          }
+        }
+      }
+    }
+  }
+
+  return bestCut;
+}
+
+function findTrailingHallucinationCut(
+  matcher: CompiledHallucinationMatcher,
+  map: NormalizedClusterMap,
+): number {
+  const { normText, normClusterStart, isSep, isSentenceEnd } = map;
+  const n = normText.length;
+  if (n === 0) return n;
+
+  const revClearedCost = new Int32Array(n + 1).fill(HALLUCINATION_INF);
+  const revClearedNode = new Int32Array(n + 1).fill(-1);
+  const revStartedAsciiCost = new Int32Array(n + 1).fill(HALLUCINATION_INF);
+  const revStartedAsciiNode = new Int32Array(n + 1).fill(-1);
+  let revSameStates: Array<Map<number, { cost: number; node: number }> | undefined> | null = null;
+
+  const nodePrev: number[] = [-1];
+  const nodeTerm: number[] = [-1];
+  revClearedCost[n] = 0;
+  revClearedNode[n] = 0;
+
+  let bestTermStart = n;
+
+  for (let pos = n; pos > 0; pos -= 1) {
+    if (pos < n && pos !== normClusterStart[pos]!) continue;
+    const cCost = revClearedCost[pos]!;
+    const aCost = revStartedAsciiCost[pos]!;
+    const sameMap = revSameStates?.[pos];
+    if (revSameStates) revSameStates[pos] = undefined;
+    if (cCost === HALLUCINATION_INF && aCost === HALLUCINATION_INF && !sameMap) continue;
+
+    let bestCost = cCost;
+    let bestNode = revClearedNode[pos]!;
+    if (aCost < bestCost) {
+      bestCost = aCost;
+      bestNode = revStartedAsciiNode[pos]!;
+    }
+    if (sameMap) {
+      for (const entry of sameMap.values()) {
+        if (entry.cost < bestCost) {
+          bestCost = entry.cost;
+          bestNode = entry.node;
+        }
+      }
+    }
+
+    const prevClusterStart = normClusterStart[pos - 1]!;
+    if (isSep[prevClusterStart] === 1) {
+      if (bestCost < revClearedCost[prevClusterStart]!) {
+        revClearedCost[prevClusterStart] = bestCost;
+        revClearedNode[prevClusterStart] = bestNode;
+      }
+    }
+
+    let revNode: HallucinationTrieNode | undefined = matcher.revRoot;
+    for (let p = pos - 1; p >= 0; p -= 1) {
+      revNode = getTrieChild(revNode, normText.charCodeAt(p));
+      if (!revNode) break;
+      const termId = revNode.termId;
+      if (termId < 0) continue;
+      if (p !== normClusterStart[p]!) continue;
+
+      let rightCost = matcher.termEndsAscii[termId]! ? cCost : bestCost;
+      let rightNode = matcher.termEndsAscii[termId]! ? revClearedNode[pos]! : bestNode;
+      if (sameMap) {
+        const sameEntry = sameMap.get(termId);
+        if (sameEntry && sameEntry.cost < rightCost) {
+          rightCost = sameEntry.cost;
+          rightNode = sameEntry.node;
+        }
+      }
+      if (rightCost >= HALLUCINATION_INF || rightNode < 0) continue;
+
+      const nextCost = rightCost + 1;
+      const newNode = nodePrev.length;
+      nodePrev.push(rightNode);
+      nodeTerm.push(termId);
+
+      if (!matcher.termStartsAscii[termId]! || p === 0) {
+        if (nextCost < revClearedCost[p]!) {
+          revClearedCost[p] = nextCost;
+          revClearedNode[p] = newNode;
+        }
+      } else {
+        if (nextCost < revStartedAsciiCost[p]!) {
+          revStartedAsciiCost[p] = nextCost;
+          revStartedAsciiNode[p] = newNode;
+        }
+        if (matcher.termEndsAscii[termId]! && p > 0 && normText.charCodeAt(p - 1) === matcher.termLastCodes[termId]!) {
+          if (!revSameStates) revSameStates = new Array(n + 1);
+          let targetMap = revSameStates[p];
+          if (!targetMap) {
+            targetMap = new Map<number, { cost: number; node: number }>();
+            revSameStates[p] = targetMap;
+          }
+          const prev = targetMap.get(termId);
+          if (!prev || nextCost < prev.cost) {
+            targetMap.set(termId, { cost: nextCost, node: newNode });
+          }
+        }
+      }
+
+      if (p > 0) {
+        let sepScan = p;
+        let sentEnd = false;
+        let hasRealSep = false;
+        while (sepScan > 0) {
+          const c = normClusterStart[sepScan - 1]!;
+          if (isSep[c] !== 1) break;
+          for (let k = c; k < sepScan; k += 1) {
+            if (isSentenceEnd[k] === 1) sentEnd = true;
+          }
+          if (!HOTWORD_INTRA_WORD_PUNCT_RE.test(normText.slice(c, sepScan))) {
+            hasRealSep = true;
+          }
+          sepScan = c;
+        }
+        const hasSepBefore = sepScan < p;
+        const beforeSepAscii = sepScan > 0
+          ? ASCII_ALNUM_UNDER_RE.test(normText.slice(normClusterStart[sepScan - 1]!, sepScan))
+          : false;
+        if (isChainQualifiedHallucination(newNode, nodePrev, nodeTerm, true, sentEnd)) {
+          const validBoundary = hasSepBefore
+            ? !(matcher.termStartsAscii[termId]! === 1 && !hasRealSep && beforeSepAscii)
+            : (matcher.termStartsAscii[termId]! === 1 && !beforeSepAscii);
+          if (validBoundary && p < bestTermStart) {
+            bestTermStart = p;
+          }
+        }
+      }
+    }
+  }
+
+  if (bestTermStart >= n) return n;
+  let cutNorm = bestTermStart;
+  while (cutNorm > 0) {
+    const c = normClusterStart[cutNorm - 1]!;
+    const ch = normText.slice(c, cutNorm);
+    if (!HOTWORD_WEAK_TRAILING_SEP_RE.test(ch)) break;
+    cutNorm = c;
+  }
+  return cutNorm;
+}
+
 /**
  * Strip generative-ASR prompt-echo hallucinations where the transcript consists
- * exclusively of configured hotwords plus whitespace/punctuation (e.g. `"IM.codes，IM.codes。IM.codes，IM.codes。"`).
- * Normal speech containing non-hotword words is never altered; a single isolated
- * hotword is stripped only when `options.silentAudio === true`.
+ * exclusively of configured hotwords plus whitespace/punctuation (e.g. `"IM.codes，IM.codes。IM.codes，IM.codes。"`),
+ * or where repeated hotword hallucinations leak at the leading/trailing edge around real speech
+ * (e.g. `"IM.codes，IM.codes。你答的对，就这么来。"` -> `"你答的对，就这么来。"`).
+ * A single isolated hotword is stripped only when `options.silentAudio === true`.
  */
 export function stripVoiceHotwordHallucination(
   text: string,
@@ -1139,14 +1543,12 @@ export function stripVoiceHotwordHallucination(
   const matcher = getCompiledHallucinationMatcher(hotwords);
   if (!matcher) return text;
 
-  const normText = normalizeHotwordMatchText(text);
+  const wholeMap = buildNormalizedClusterMap(text);
+  const normText = wholeMap.normText;
   const n = normText.length;
   if (n === 0) return text;
 
-  // Forward reachable-state DP over a compact Trie:
-  // - `cleared[pos]`: min hotword count at start-of-string, after a separator, or after a non-ASCII-word ending.
-  // - `endedAscii[pos]`: min hotword count immediately after an ASCII-word-ending hotword without separator.
-  // - `sameTermStates[pos]`: bounded per-position map allowing only immediate same-term adjacency (e.g. "IM.codesIM.codes").
+  // Forward reachable-state DP over a compact Trie for whole-string hallucination checks:
   const cleared = new Int32Array(n + 1);
   const endedAscii = new Int32Array(n + 1);
   cleared.fill(HALLUCINATION_INF);
@@ -1164,9 +1566,8 @@ export function stripVoiceHotwordHallucination(
     const bestAtPos = cCount < aCount ? cCount : aCount;
     const cp = normText.codePointAt(pos)!;
     const charLen = cp > 0xffff ? 2 : 1;
-    const isSep = HOTWORD_HALLUCINATION_SEP_CHAR_RE.test(String.fromCodePoint(cp));
 
-    if (isSep) {
+    if (wholeMap.isSep[pos] === 1) {
       let sepMin = bestAtPos;
       if (sameMap) {
         for (const cost of sameMap.values()) {
@@ -1179,12 +1580,17 @@ export function stripVoiceHotwordHallucination(
       }
     }
 
+    if (pos !== wholeMap.normClusterStart[pos]!) continue;
+
     let node: HallucinationTrieNode | undefined = matcher.root;
     for (let p = pos; p < n; p += 1) {
       node = getTrieChild(node, normText.charCodeAt(p));
       if (!node) break;
       const termId = node.termId;
       if (termId < 0) continue;
+
+      const endPos = p + 1;
+      if (endPos < n && endPos !== wholeMap.normClusterStart[endPos]!) continue;
 
       let startCost = matcher.termStartsAscii[termId]! ? cCount : bestAtPos;
       if (sameMap) {
@@ -1195,7 +1601,6 @@ export function stripVoiceHotwordHallucination(
       }
       if (startCost >= HALLUCINATION_INF) continue;
 
-      const endPos = p + 1;
       const nextCost = startCost + 1;
       if (!matcher.termEndsAscii[termId]! || endPos === n) {
         if (nextCost < cleared[endPos]!) cleared[endPos] = nextCost;
@@ -1218,10 +1623,25 @@ export function stripVoiceHotwordHallucination(
   }
 
   const minMatches = cleared[n]! < endedAscii[n]! ? cleared[n]! : endedAscii[n]!;
-  if (minMatches >= HALLUCINATION_INF) return text;
-  if (minMatches >= 2) return '';
-  if (minMatches === 1 && options?.silentAudio === true) return '';
-  return text;
+  if (minMatches < HALLUCINATION_INF) {
+    if (minMatches >= 2) return '';
+    if (minMatches === 1 && options?.silentAudio === true) return '';
+    return text;
+  }
+
+  let current = text;
+  const leadCutNorm = findLeadingHallucinationCut(matcher, wholeMap);
+  if (leadCutNorm > 0 && leadCutNorm < n) {
+    current = current.slice(wholeMap.normToRawStart[leadCutNorm]!);
+  }
+  if (!current) return '';
+
+  const tailMap = leadCutNorm > 0 ? buildNormalizedClusterMap(current) : wholeMap;
+  const tailCutNorm = findTrailingHallucinationCut(matcher, tailMap);
+  if (tailCutNorm < tailMap.normText.length) {
+    current = current.slice(0, tailMap.normToRawStart[tailCutNorm]!);
+  }
+  return current;
 }
 
 /**
