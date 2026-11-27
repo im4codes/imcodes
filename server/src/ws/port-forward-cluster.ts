@@ -31,12 +31,14 @@ export interface PortForwardClusterTunnelRecord {
   listenNode: string;
   listenServerId: string;
   listenNodeId?: string;
+  listenPodId: string;
   listenGeneration: number;
   requestedListenPort: number;
   boundListenPort: number | null;
   targetNode: string;
   targetServerId: string;
   targetNodeId?: string;
+  targetPodId: string;
   targetGeneration: number;
   targetHost: string;
   targetPort: number;
@@ -58,6 +60,7 @@ export type PortForwardClusterBusMessage =
   | {
       kind: 'to_endpoint';
       serverId: string;
+      expectedPodId?: string;
       expectedGeneration: number;
       frame: PortForwardWireMessage;
       tunnelId?: string;
@@ -68,6 +71,7 @@ export type PortForwardClusterBusMessage =
       kind: 'to_coordinator';
       tunnelId: string;
       fromServerId: string;
+      fromPodId: string;
       fromGeneration: number;
       frame: PortForwardWireMessage;
       direction?: PortForwardRelayDirection;
@@ -83,12 +87,14 @@ export type PortForwardClusterBusMessage =
       kind: 'daemon_disconnected';
       tunnelId: string;
       serverId: string;
+      podId: string;
       generation: number;
     }
   | {
       kind: 'close_delivery_failed';
       tunnelId: string;
       serverId: string;
+      podId: string;
       generation: number;
     }
   | {
@@ -130,7 +136,7 @@ export interface PortForwardClusterStore {
   getTunnel(tunnelId: string): Promise<PortForwardClusterTunnelRecord | null>;
   listActiveTunnels(userId: string, filterServerId?: string): Promise<PortForwardTunnelSummary[]>;
   listOpenTunnelsForUser(userId: string, filterServerId?: string): Promise<PortForwardClusterTunnelRecord[]>;
-  listOpenTunnelsForEndpoint(serverId: string, generation: number): Promise<PortForwardClusterTunnelRecord[]>;
+  listOpenTunnelsForEndpoint(serverId: string, generation: number, podId?: string): Promise<PortForwardClusterTunnelRecord[]>;
   subscribePod(podId: string, handler: PortForwardClusterBusHandler): () => void;
   sendToPod(targetPodId: string, message: PortForwardClusterBusMessage): Promise<void>;
   enqueueBusMessage(
@@ -332,12 +338,16 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
     return out;
   }
 
-  async listOpenTunnelsForEndpoint(serverId: string, generation: number): Promise<PortForwardClusterTunnelRecord[]> {
+  async listOpenTunnelsForEndpoint(serverId: string, generation: number, podId?: string): Promise<PortForwardClusterTunnelRecord[]> {
     const out: PortForwardClusterTunnelRecord[] = [];
     for (const tunnel of this.tunnels.values()) {
       if (tunnel.status === 'closed') continue;
-      const matchesListen = tunnel.listenServerId === serverId && tunnel.listenGeneration === generation;
-      const matchesTarget = tunnel.targetServerId === serverId && tunnel.targetGeneration === generation;
+      const matchesListen = tunnel.listenServerId === serverId
+        && tunnel.listenGeneration === generation
+        && (!podId || tunnel.listenPodId === podId);
+      const matchesTarget = tunnel.targetServerId === serverId
+        && tunnel.targetGeneration === generation
+        && (!podId || tunnel.targetPodId === podId);
       if (matchesListen || matchesTarget) out.push({ ...tunnel });
     }
     return out;
@@ -594,12 +604,14 @@ interface PgTunnelRow {
   listen_node: string;
   listen_server_id: string;
   listen_node_id: string | null;
+  listen_pod_id?: string | null;
   listen_generation: number | string;
   requested_listen_port: number;
   bound_listen_port: number | null;
   target_node: string;
   target_server_id: string;
   target_node_id: string | null;
+  target_pod_id?: string | null;
   target_generation: number | string;
   target_host: string;
   target_port: number;
@@ -623,12 +635,14 @@ function rowToTunnelRecord(row: PgTunnelRow): PortForwardClusterTunnelRecord {
     listenNode: row.listen_node,
     listenServerId: row.listen_server_id,
     ...(row.listen_node_id ? { listenNodeId: row.listen_node_id } : {}),
+    listenPodId: row.listen_pod_id ?? '',
     listenGeneration: Number(row.listen_generation),
     requestedListenPort: row.requested_listen_port,
     boundListenPort: row.bound_listen_port,
     targetNode: row.target_node,
     targetServerId: row.target_server_id,
     ...(row.target_node_id ? { targetNodeId: row.target_node_id } : {}),
+    targetPodId: row.target_pod_id ?? '',
     targetGeneration: Number(row.target_generation),
     targetHost: row.target_host,
     targetPort: row.target_port,
@@ -750,20 +764,20 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
       await tx.execute(
         `INSERT INTO port_forward_tunnels (
            tunnel_id, user_id, coordinator_pod_id,
-           listen_node, listen_server_id, listen_node_id, listen_generation,
+           listen_node, listen_server_id, listen_node_id, listen_pod_id, listen_generation,
            requested_listen_port, bound_listen_port,
-           target_node, target_server_id, target_node_id, target_generation,
+           target_node, target_server_id, target_node_id, target_pod_id, target_generation,
            target_host, target_port, transport_pref, transport_mode,
            status, active_connections, bytes_sent, bytes_received, label,
            created_at, expires_at, updated_at
          ) VALUES (
            $1, $2, $3,
-           $4, $5, $6, $7,
-           $8, $9,
-           $10, $11, $12, $13,
-           $14, $15, $16, $17,
-           $18, $19, $20, $21, $22,
-           $23, $24, $25
+           $4, $5, $6, $7, $8,
+           $9, $10,
+           $11, $12, $13, $14, $15,
+           $16, $17, $18, $19,
+           $20, $21, $22, $23, $24,
+           $25, $26, $27
          )`,
         [
           record.tunnelId,
@@ -772,12 +786,14 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
           record.listenNode,
           record.listenServerId,
           record.listenNodeId ?? null,
+          record.listenPodId,
           record.listenGeneration,
           record.requestedListenPort,
           record.boundListenPort,
           record.targetNode,
           record.targetServerId,
           record.targetNodeId ?? null,
+          record.targetPodId,
           record.targetGeneration,
           record.targetHost,
           record.targetPort,
@@ -876,14 +892,22 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
     return rows.map(rowToTunnelRecord);
   }
 
-  async listOpenTunnelsForEndpoint(serverId: string, generation: number): Promise<PortForwardClusterTunnelRecord[]> {
-    const rows = await this.db.query<PgTunnelRow>(
-      `SELECT * FROM port_forward_tunnels
-        WHERE status <> 'closed'
-          AND ((listen_server_id = $1 AND listen_generation = $2)
-            OR (target_server_id = $1 AND target_generation = $2))`,
-      [serverId, generation],
-    );
+  async listOpenTunnelsForEndpoint(serverId: string, generation: number, podId?: string): Promise<PortForwardClusterTunnelRecord[]> {
+    const rows = podId
+      ? await this.db.query<PgTunnelRow>(
+          `SELECT * FROM port_forward_tunnels
+            WHERE status <> 'closed'
+              AND ((listen_server_id = $1 AND listen_pod_id = $2 AND listen_generation = $3)
+                OR (target_server_id = $1 AND target_pod_id = $2 AND target_generation = $3))`,
+          [serverId, podId, generation],
+        )
+      : await this.db.query<PgTunnelRow>(
+          `SELECT * FROM port_forward_tunnels
+            WHERE status <> 'closed'
+              AND ((listen_server_id = $1 AND listen_generation = $2)
+                OR (target_server_id = $1 AND target_generation = $2))`,
+          [serverId, generation],
+        );
     return rows.map(rowToTunnelRecord);
   }
 
@@ -916,58 +940,54 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
     );
   }
 
-  private async notifyExpiredOpenTunnels(tunnelIds: Iterable<string>): Promise<void> {
-    for (const tunnelId of new Set(tunnelIds)) {
-      try {
-        const tunnel = await this.getTunnel(tunnelId);
-        if (!tunnel || tunnel.status === 'closing' || tunnel.status === 'closed') continue;
-        const expiresAt = Date.now() + PORT_FORWARD_LIMITS.CLUSTER_RELAY_MSG_TTL_MS;
-        await this.db.execute(
-          `INSERT INTO port_forward_bus_messages (target_pod_id, kind, tunnel_id, direction, byte_size, expires_at, payload, created_at)
-           VALUES ($1, 'close_tunnel', $2, NULL, 0, $3, $4::jsonb, $5)`,
-          [
-            tunnel.coordinatorPodId,
-            tunnelId,
-            expiresAt,
-            JSON.stringify({
-              kind: 'close_tunnel',
-              tunnelId,
-              reason: 'relay_message_expired',
-            } satisfies PortForwardClusterBusMessage),
-            Date.now(),
-          ],
-        );
-        await this.notifyPod(tunnel.coordinatorPodId);
-      } catch {
-        // Best-effort close notification for expired relay data.
-      }
-    }
-  }
-
   async reclaimStaleMessages(now = Date.now()): Promise<number> {
-    const rows = await this.db.query<{ seq: number | string; expired_tunnel_id: string | null }>(
-      `DELETE FROM port_forward_bus_messages m
-        WHERE (m.expires_at > 0 AND m.expires_at <= $1)
-           OR (m.tunnel_id IS NOT NULL AND m.kind IN ('to_endpoint', 'to_coordinator') AND EXISTS (
-             SELECT 1 FROM port_forward_tunnels t
-              WHERE t.tunnel_id = m.tunnel_id AND (t.status = 'closed' OR t.expires_at <= $1)
-           ))
-        RETURNING m.seq,
-          CASE
-            WHEN m.expires_at > 0 AND m.expires_at <= $1
-             AND m.byte_size > 0
-             AND m.kind IN ('to_endpoint', 'to_coordinator')
-             AND m.tunnel_id IS NOT NULL
-            THEN m.tunnel_id
-            ELSE NULL
-          END AS expired_tunnel_id`,
-      [now],
+    const closeExpiresAt = now + PORT_FORWARD_LIMITS.CLUSTER_RELAY_MSG_TTL_MS;
+    const row = await this.db.queryOne<{ deleted_count: number | string; notified_pods: string[] | null }>(
+      `WITH deleted AS (
+         DELETE FROM port_forward_bus_messages m
+          WHERE (m.expires_at > 0 AND m.expires_at <= $1::bigint)
+             OR (m.tunnel_id IS NOT NULL AND m.kind IN ('to_endpoint', 'to_coordinator') AND EXISTS (
+               SELECT 1 FROM port_forward_tunnels t
+                WHERE t.tunnel_id = m.tunnel_id AND (t.status = 'closed' OR t.expires_at <= $1::bigint)
+             ))
+          RETURNING m.seq,
+            CASE
+              WHEN m.expires_at > 0 AND m.expires_at <= $1::bigint
+               AND m.byte_size > 0
+               AND m.kind IN ('to_endpoint', 'to_coordinator')
+               AND m.tunnel_id IS NOT NULL
+              THEN m.tunnel_id
+              ELSE NULL
+            END AS expired_tunnel_id
+       ),
+       inserted_close AS (
+         INSERT INTO port_forward_bus_messages (
+           target_pod_id, kind, tunnel_id, direction, byte_size, expires_at, payload, created_at
+         )
+         SELECT DISTINCT
+           t.coordinator_pod_id,
+           'close_tunnel',
+           t.tunnel_id,
+           NULL,
+           0,
+           $2::bigint,
+           jsonb_build_object('kind', 'close_tunnel', 'tunnelId', t.tunnel_id, 'reason', 'relay_message_expired'),
+           $1::bigint
+         FROM deleted d
+         JOIN port_forward_tunnels t ON t.tunnel_id = d.expired_tunnel_id
+         WHERE d.expired_tunnel_id IS NOT NULL
+           AND t.status NOT IN ('closing', 'closed')
+         RETURNING target_pod_id
+       )
+       SELECT
+         (SELECT COUNT(*)::int FROM deleted) AS deleted_count,
+         ARRAY(SELECT DISTINCT target_pod_id FROM inserted_close) AS notified_pods`,
+      [now, closeExpiresAt],
     );
-    const expiredTunnels = rows.map((r) => r.expired_tunnel_id).filter((id): id is string => Boolean(id));
-    if (expiredTunnels.length > 0) {
-      await this.notifyExpiredOpenTunnels(expiredTunnels);
+    for (const coordinatorPodId of row?.notified_pods ?? []) {
+      await this.notifyPod(coordinatorPodId);
     }
-    return rows.length;
+    return Number(row?.deleted_count ?? 0);
   }
 
   async setPodDrainPausedForTests(podId: string, paused: boolean): Promise<void> {
@@ -1000,29 +1020,51 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
 
     if (acc.isRelayData && acc.tunnelId && acc.direction && acc.hop) {
       const hop = acc.hop;
-      const expiredTunnels: string[] = [];
+      const notifiedPods = new Set<string>();
       const result = await this.db.transaction(async (tx): Promise<PortForwardClusterEnqueueResult> => {
         await tx.execute('SELECT pg_advisory_xact_lock($1::bigint)', [
           advisoryLockKey64(`pf_q:${acc.tunnelId}:${acc.direction}:${hop}`),
         ]);
-        const expiredRows = await tx.query<{ expired_tunnel_id: string | null }>(
-          `DELETE FROM port_forward_bus_messages m
-            WHERE (m.expires_at > 0 AND m.expires_at <= $1)
-               OR (m.tunnel_id = $2 AND m.kind IN ('to_endpoint', 'to_coordinator') AND EXISTS (
-                 SELECT 1 FROM port_forward_tunnels t WHERE t.tunnel_id = $2 AND t.status = 'closed'
-               ))
-            RETURNING CASE
-              WHEN m.expires_at > 0 AND m.expires_at <= $1
-               AND m.byte_size > 0
-               AND m.kind IN ('to_endpoint', 'to_coordinator')
-               AND m.tunnel_id IS NOT NULL
-              THEN m.tunnel_id
-              ELSE NULL
-            END AS expired_tunnel_id`,
-          [now, acc.tunnelId],
+        const expiredRow = await tx.queryOne<{ notified_pods: string[] | null }>(
+          `WITH deleted AS (
+             DELETE FROM port_forward_bus_messages m
+              WHERE (m.expires_at > 0 AND m.expires_at <= $1::bigint)
+                 OR (m.tunnel_id = $2::text AND m.kind IN ('to_endpoint', 'to_coordinator') AND EXISTS (
+                   SELECT 1 FROM port_forward_tunnels t WHERE t.tunnel_id = $2::text AND t.status = 'closed'
+                 ))
+              RETURNING CASE
+                WHEN m.expires_at > 0 AND m.expires_at <= $1::bigint
+                 AND m.byte_size > 0
+                 AND m.kind IN ('to_endpoint', 'to_coordinator')
+                 AND m.tunnel_id IS NOT NULL
+                THEN m.tunnel_id
+                ELSE NULL
+              END AS expired_tunnel_id
+           ),
+           inserted_close AS (
+             INSERT INTO port_forward_bus_messages (
+               target_pod_id, kind, tunnel_id, direction, byte_size, expires_at, payload, created_at
+             )
+             SELECT DISTINCT
+               t.coordinator_pod_id,
+               'close_tunnel',
+               t.tunnel_id,
+               NULL,
+               0,
+               $3::bigint,
+               jsonb_build_object('kind', 'close_tunnel', 'tunnelId', t.tunnel_id, 'reason', 'relay_message_expired'),
+               $1::bigint
+             FROM deleted d
+             JOIN port_forward_tunnels t ON t.tunnel_id = d.expired_tunnel_id
+             WHERE d.expired_tunnel_id IS NOT NULL
+               AND t.status NOT IN ('closing', 'closed')
+             RETURNING target_pod_id
+           )
+           SELECT ARRAY(SELECT DISTINCT target_pod_id FROM inserted_close) AS notified_pods`,
+          [now, acc.tunnelId, expiresAt],
         );
-        for (const r of expiredRows) {
-          if (r.expired_tunnel_id) expiredTunnels.push(r.expired_tunnel_id);
+        for (const p of expiredRow?.notified_pods ?? []) {
+          notifiedPods.add(p);
         }
         const row = await tx.queryOne<{ total: number | string }>(
           `SELECT COALESCE(SUM(byte_size), 0)::int AS total
@@ -1055,8 +1097,8 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
           highWater: totalAfter >= PORT_FORWARD_LIMITS.CLUSTER_RELAY_HIGH_WATER_BYTES,
         };
       });
-      if (expiredTunnels.length > 0) {
-        await this.notifyExpiredOpenTunnels(expiredTunnels);
+      for (const p of notifiedPods) {
+        await this.notifyPod(p);
       }
       if (!result.ok) return result;
       await this.notifyPod(targetPodId);
@@ -1102,21 +1144,42 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
       if (stopped || draining || this.pausedPods.has(podId)) return;
       draining = true;
       try {
-        const expiredRows = await this.db.query<{ expired_tunnel_id: string | null }>(
-          `DELETE FROM port_forward_bus_messages
-            WHERE target_pod_id = $1 AND expires_at > 0 AND expires_at <= $2
-            RETURNING CASE
-              WHEN byte_size > 0 AND kind IN ('to_endpoint', 'to_coordinator') AND tunnel_id IS NOT NULL
-              THEN tunnel_id
-              ELSE NULL
-            END AS expired_tunnel_id`,
-          [podId, Date.now()],
+        const drainNow = Date.now();
+        const drainCloseExpiresAt = drainNow + PORT_FORWARD_LIMITS.CLUSTER_RELAY_MSG_TTL_MS;
+        const expiredRow = await this.db.queryOne<{ notified_pods: string[] | null }>(
+          `WITH deleted AS (
+             DELETE FROM port_forward_bus_messages
+              WHERE target_pod_id = $1::text AND expires_at > 0 AND expires_at <= $2::bigint
+              RETURNING CASE
+                WHEN byte_size > 0 AND kind IN ('to_endpoint', 'to_coordinator') AND tunnel_id IS NOT NULL
+                THEN tunnel_id
+                ELSE NULL
+              END AS expired_tunnel_id
+           ),
+           inserted_close AS (
+             INSERT INTO port_forward_bus_messages (
+               target_pod_id, kind, tunnel_id, direction, byte_size, expires_at, payload, created_at
+             )
+             SELECT DISTINCT
+               t.coordinator_pod_id,
+               'close_tunnel',
+               t.tunnel_id,
+               NULL,
+               0,
+               $3::bigint,
+               jsonb_build_object('kind', 'close_tunnel', 'tunnelId', t.tunnel_id, 'reason', 'relay_message_expired'),
+               $2::bigint
+             FROM deleted d
+             JOIN port_forward_tunnels t ON t.tunnel_id = d.expired_tunnel_id
+             WHERE d.expired_tunnel_id IS NOT NULL
+               AND t.status NOT IN ('closing', 'closed')
+             RETURNING target_pod_id
+           )
+           SELECT ARRAY(SELECT DISTINCT target_pod_id FROM inserted_close) AS notified_pods`,
+          [podId, drainNow, drainCloseExpiresAt],
         );
-        const expiredTunnels = expiredRows
-          .map((r) => r.expired_tunnel_id)
-          .filter((id): id is string => Boolean(id));
-        if (expiredTunnels.length > 0) {
-          await this.notifyExpiredOpenTunnels(expiredTunnels);
+        for (const p of expiredRow?.notified_pods ?? []) {
+          await this.notifyPod(p);
         }
         for (;;) {
           if (stopped || this.pausedPods.has(podId)) break;

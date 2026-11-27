@@ -607,6 +607,8 @@ class RelayTransport implements PortForwardCarrier {
   private wsBackpressured = false;
   private clusterBackpressured = false;
   private drainTimer: ReturnType<typeof setInterval> | null = null;
+  private seqGapTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly SEQ_GAP_TIMEOUT_MS = 10_000;
 
   constructor(
     private readonly tunnelId: string,
@@ -712,6 +714,7 @@ class RelayTransport implements PortForwardCarrier {
         return false;
       }
       this.reorderBuffer.set(counter, plaintext);
+      this.armSeqGapTimer();
       return true;
     }
 
@@ -727,6 +730,11 @@ class RelayTransport implements PortForwardCarrier {
         current = this.reorderBuffer.get(this.nextRxCounter);
         if (current) this.reorderBuffer.delete(this.nextRxCounter);
       }
+      if (this.reorderBuffer.size > 0) {
+        this.armSeqGapTimer(true);
+      } else {
+        this.clearSeqGapTimer();
+      }
       return true;
     } catch {
       this.close('invalid_mux_stream');
@@ -734,10 +742,31 @@ class RelayTransport implements PortForwardCarrier {
     }
   }
 
+  private armSeqGapTimer(reset = false): void {
+    if (this.closed) return;
+    if (reset) this.clearSeqGapTimer();
+    if (this.seqGapTimer) return;
+    this.seqGapTimer = setTimeout(() => {
+      this.seqGapTimer = null;
+      if (!this.closed && this.reorderBuffer.size > 0) {
+        this.close('relay_seq_gap_timeout');
+      }
+    }, RelayTransport.SEQ_GAP_TIMEOUT_MS);
+    this.seqGapTimer.unref?.();
+  }
+
+  private clearSeqGapTimer(): void {
+    if (this.seqGapTimer) {
+      clearTimeout(this.seqGapTimer);
+      this.seqGapTimer = null;
+    }
+  }
+
   close(reason = 'closed'): void {
     if (this.closed) return;
     this.closed = true;
     this.reorderBuffer.clear();
+    this.clearSeqGapTimer();
     if (this.drainTimer) {
       clearInterval(this.drainTimer);
       this.drainTimer = null;
