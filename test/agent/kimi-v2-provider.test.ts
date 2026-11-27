@@ -7,7 +7,9 @@ import { PassThrough } from 'node:stream';
 import { RequestError } from '@agentclientprotocol/sdk/unstable';
 import type { AcpClientConnection, AcpClientHandlers } from '../../src/agent/providers/acp-client-adapter.js';
 import { PROVIDER_ERROR_CODES, type ProviderStatusUpdate } from '../../src/agent/transport-provider.js';
+import { onConfirmedProviderStop } from '../../src/agent/provider-stop-confirmation.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import { TRANSPORT_STOP_QUEUE_TIMEOUT_MS } from '../../shared/transport-queue-types.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
@@ -366,6 +368,226 @@ describe('KimiV2Provider', () => {
     } finally {
       await runtime.kill({ reason: 'test_cleanup' });
     }
+  });
+
+  it('triggers late stop proof on runtime stop timeout and rejects physical confirmation on stream error while child stays alive', async () => {
+    vi.useFakeTimers();
+    let resolveFirst!: (v: { stopReason: string }) => void;
+    let resolveSecond!: (v: { stopReason: string }) => void;
+    const promptFn = vi.fn()
+      .mockImplementationOnce(() => new Promise((r) => { resolveFirst = r; }))
+      .mockImplementationOnce(() => new Promise((r) => { resolveSecond = r; }));
+    state.conn = makeMockConn({ prompt: promptFn });
+
+    const provider = new KimiV2Provider({ cancelGraceMs: 60_000 });
+    await provider.connect({});
+    const runtime = new TransportSessionRuntime(provider, 'deck_kimi_v2_late_stop');
+    try {
+      await runtime.initialize({ sessionKey: 'deck_kimi_v2_late_stop', cwd: os.tmpdir() });
+      const sentA = runtime.send('msg A', 'id-a');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(promptFn).toHaveBeenCalledTimes(1);
+
+      // Direct WeakMap identity check on returned Promise
+      const lateProof = vi.fn();
+      const rawStop = provider.cancelAndWait('deck_kimi_v2_late_stop');
+      void rawStop.catch(() => {});
+      const unsub = onConfirmedProviderStop(rawStop, lateProof);
+      expect(typeof unsub).toBe('function');
+
+      // Queue msg B and trigger runtime Stop-and-send that times out after TRANSPORT_STOP_QUEUE_TIMEOUT_MS
+      runtime.send('msg B', 'id-b');
+      const cancelPromise = runtime.cancel({ waitForProvider: true }).catch((e: Error) => e);
+      await vi.advanceTimersByTimeAsync(TRANSPORT_STOP_QUEUE_TIMEOUT_MS + 100);
+      const cancelResult = await cancelPromise;
+      expect(cancelResult).toBeInstanceOf(Error);
+      expect(lateProof).not.toHaveBeenCalled();
+      expect(promptFn).toHaveBeenCalledTimes(1);
+
+      // Late native terminal settles original prompt -> fires onConfirmedProviderStop -> releases B
+      resolveFirst({ stopReason: 'cancelled' });
+      await vi.advanceTimersByTimeAsync(20);
+      expect(lateProof).toHaveBeenCalledTimes(1);
+      expect(promptFn).toHaveBeenCalledTimes(2);
+      resolveSecond({ stopReason: 'end_turn' });
+      await vi.advanceTimersByTimeAsync(10);
+      unsub();
+    } finally {
+      await runtime.kill({ reason: 'test_cleanup' });
+    }
+
+    // Stream/transport rejection while captured child is STILL ALIVE must NOT settle cancelAndWait until child exits
+    vi.useRealTimers();
+    let rejectPrompt!: (e: Error) => void;
+    state.conn = makeMockConn({
+      prompt: vi.fn(() => new Promise((_, rej) => { rejectPrompt = rej; })),
+    });
+    const streamProvider = new KimiV2Provider({ cancelGraceMs: 60_000 });
+    await streamProvider.connect({});
+    await streamProvider.createSession({ sessionKey: 'sess-alive', cwd: os.tmpdir() });
+    await streamProvider.send('sess-alive', 'disconnect mid-flight');
+
+    const capturedChild = state.children[state.children.length - 1]!;
+    let stopSettled = false;
+    const stopWait = streamProvider.cancelAndWait('sess-alive').then(() => { stopSettled = true; });
+    rejectPrompt(new Error('stream pipe closed unexpectedly'));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(stopSettled).toBe(false);
+
+    capturedChild.exitCode = 1;
+    capturedChild.emit('exit', 1, null);
+    await stopWait;
+    expect(stopSettled).toBe(true);
+    await streamProvider.disconnect();
+  });
+
+  it('keeps bindExistingKey local route separate from native resumeId and emits updated resumeId on reconnect fallback', async () => {
+    const conn1 = makeMockConn({
+      resumeSession: vi.fn(async () => ({ configOptions: [] })),
+    });
+    const conn2 = makeMockConn({
+      resumeSession: vi.fn(async () => { throw new RequestError(-32002, 'Session expired'); }),
+      newSession: vi.fn(async () => ({ sessionId: 'native-acp-id-2', configOptions: [] })),
+    });
+    const conn3 = makeMockConn({
+      resumeSession: vi.fn(async () => ({ configOptions: [] })),
+    });
+    state.connQueue.push(conn1, conn2, conn3);
+
+    const provider = new KimiV2Provider();
+    const infoEvents: Array<{ sessionId: string; resumeId?: string }> = [];
+    provider.onSessionInfo((sid, info) => infoEvents.push({ sessionId: sid, resumeId: info.resumeId }));
+    await provider.connect({});
+
+    // Cold restore receives both local bindExistingKey AND remote resumeId: must resume native ACP id!
+    const routeKey = await provider.createSession({
+      sessionKey: 'local-route-uuid',
+      bindExistingKey: 'local-route-uuid',
+      resumeId: 'native-acp-id-1',
+      cwd: os.tmpdir(),
+    });
+    expect(routeKey).toBe('local-route-uuid');
+    expect(conn1.resumeSession).toHaveBeenCalledWith({
+      sessionId: 'native-acp-id-1',
+      cwd: expect.any(String),
+      mcpServers: expect.any(Array),
+    });
+
+    // Crash child 1 -> send() falls back to newSession() -> MUST emit updated resumeId 'native-acp-id-2'
+    state.children[0]!.exitCode = 1;
+    state.children[0]!.emit('exit', 1, null);
+    await provider.send('local-route-uuid', 'trigger fallback');
+    expect(infoEvents.some((e) => e.resumeId === 'native-acp-id-2')).toBe(true);
+    await provider.disconnect();
+
+    // Subsequent restart using persisted new resumeId resumes 'native-acp-id-2'
+    const provider2 = new KimiV2Provider();
+    await provider2.connect({});
+    await provider2.createSession({
+      sessionKey: 'local-route-uuid',
+      bindExistingKey: 'local-route-uuid',
+      resumeId: 'native-acp-id-2',
+      cwd: os.tmpdir(),
+    });
+    expect(conn3.resumeSession).toHaveBeenCalledWith({
+      sessionId: 'native-acp-id-2',
+      cwd: expect.any(String),
+      mcpServers: expect.any(Array),
+    });
+    await provider2.disconnect();
+  });
+
+  it('serializes delayed teardown + spawn inside one connecting transaction and fences stale child notifications', async () => {
+    const conn1 = makeMockConn({ newSession: vi.fn(async () => ({ sessionId: 'old-acp-1', configOptions: [] })) });
+    const conn2 = makeMockConn({
+      newSession: vi.fn()
+        .mockResolvedValueOnce({ sessionId: 'new-acp-1', configOptions: [] })
+        .mockResolvedValueOnce({ sessionId: 'new-acp-2', configOptions: [] }),
+    });
+    state.connQueue.push(conn1, conn2);
+
+    const provider = new KimiV2Provider();
+    await provider.connect({ env: { KIMI_API_KEY: 'k1' } } as never);
+    await provider.createSession({ sessionKey: 'seed', cwd: os.tmpdir(), env: { KIMI_API_KEY: 'k1' } });
+    const oldHandlers = state.handlers!;
+    await provider.detachSession('seed');
+
+    // Reconnect with changed auth env while mockKillProcessTree stalls teardown
+    let resolveKill!: () => void;
+    mockKillProcessTree.mockImplementationOnce(async (child: { killed?: boolean; exitCode?: number | null; emit?: (ev: string, ...args: unknown[]) => void }) => {
+      await new Promise<void>((r) => { resolveKill = r; });
+      if (child) {
+        child.killed = true;
+        child.exitCode = 0;
+        child.emit?.('exit', 0, null);
+      }
+    });
+
+    const pA = provider.createSession({ sessionKey: 'cA', cwd: os.tmpdir(), env: { KIMI_API_KEY: 'k2' } });
+    const pB = provider.createSession({ sessionKey: 'cB', cwd: os.tmpdir(), env: { KIMI_API_KEY: 'k2' } });
+    await vi.waitFor(() => expect(resolveKill).toBeTypeOf('function'));
+    expect(mockSpawn).toHaveBeenCalledTimes(1); // Only initial child so far, no double spawn!
+
+    resolveKill();
+    await Promise.all([pA, pB]);
+    expect(mockSpawn).toHaveBeenCalledTimes(2); // Exactly ONE replacement child spawned!
+
+    // Stale notification from superseded child 1 handlers must be ignored
+    const deltas: string[] = [];
+    provider.onDelta((_, d) => deltas.push(d.delta));
+    await oldHandlers.sessionUpdate({
+      sessionId: 'new-acp-1',
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'stale-leak' } } as never,
+    });
+    expect(deltas).toEqual([]);
+
+    await provider.disconnect();
+  });
+
+  it('keeps pendingModel unconfirmed after failed switch on reconnect so next send retries model before prompt without recreating session', async () => {
+    const v2Conn1 = makeMockConn();
+    const v2Conn2 = makeMockConn({
+      resumeSession: vi.fn(async () => ({
+        configOptions: [{
+          id: 'model',
+          category: 'model',
+          type: 'select',
+          currentValue: 'kimi-k2.5',
+          options: [
+            { value: 'kimi-k2.5', name: 'Kimi K2.5' },
+            { value: 'kimi-for-coding', name: 'Kimi for Coding' },
+          ],
+        }],
+      })),
+      setSessionConfigOption: vi.fn()
+        .mockRejectedValueOnce(new RequestError(-32603, 'Temporary model backend failure'))
+        .mockResolvedValue({ configOptions: [] }),
+    });
+    state.connQueue.push(v2Conn1, v2Conn2);
+
+    const provider = new KimiV2Provider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-retry-mod', cwd: os.tmpdir(), model: 'kimi-for-coding' });
+    expect(provider.getSessionDiagnostics('sess-retry-mod')?.model).toBe('kimi-for-coding');
+
+    // Crash child 1 -> reconnect fails model switch on first send()
+    state.children[0]!.exitCode = 1;
+    state.children[0]!.emit('exit', 1, null);
+
+    await expect(provider.send('sess-retry-mod', 'first try')).rejects.toThrow(/Temporary model backend failure/);
+    expect(v2Conn2.prompt).not.toHaveBeenCalled();
+    expect(v2Conn2.resumeSession).toHaveBeenCalledTimes(1);
+    expect(provider.getSessionDiagnostics('sess-retry-mod')?.model).toBe('kimi-k2.5');
+
+    // Next send() retries pendingModel ('kimi-for-coding') without calling resumeSession again, then runs prompt
+    await provider.send('sess-retry-mod', 'second try');
+    expect(v2Conn2.resumeSession).toHaveBeenCalledTimes(1);
+    expect(v2Conn2.setSessionConfigOption).toHaveBeenCalledTimes(2);
+    expect(v2Conn2.prompt).toHaveBeenCalledTimes(1);
+    expect(provider.getSessionDiagnostics('sess-retry-mod')?.model).toBe('kimi-for-coding');
+
+    await provider.disconnect();
   });
 
   it('awaits a single shared initialize across concurrent createSession calls, re-resumes after child crash, and bounds close timeout', async () => {
