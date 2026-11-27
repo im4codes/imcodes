@@ -35,10 +35,12 @@ import { COOKIE_PREVIEW_ACCESS } from '../../../shared/cookie-names.js';
 /**
  * Wrap an upstream SSE `ReadableStream` to emit `: keepalive\n\n` comment frames
  * when no upstream chunk arrives within `keepaliveMs` while the consumer is pulling.
- * Tracks SSE empty-line event boundaries across arbitrary binary chunk/CR/LF splits
- * so comments are ONLY emitted before the first byte or after a complete blank line
- * terminating an event block — never mid-line or mid-event. Strictly pull-driven so
- * downstream backpressure and upstream abort/error/close propagation are preserved 1:1.
+ * Tracks SSE empty-line event boundaries across CR (`\r\r`), LF (`\n\n`), and CRLF
+ * (`\r\n\r\n`, including CR/LF split across chunks) and strips at most one leading
+ * UTF-8 BOM (`0xEF 0xBB 0xBF`, even if split across chunks) so an early keepalive
+ * comment never turns a valid leading BOM into part of the first event field name.
+ * Strictly pull-driven so downstream backpressure and upstream abort/error/close
+ * propagation are preserved 1:1.
  */
 export function wrapSseKeepaliveStream(
   body: ReadableStream<Uint8Array>,
@@ -55,10 +57,70 @@ export function wrapSseKeepaliveStream(
   let startedAnyByte = false;
   let consecutiveEols = 0;
   let lastWasCr = false;
+  let bomState: 'init' | 'ef' | 'ef_bb' | 'done' = 'init';
+
+  const stripLeadingBomChunk = (chunk: Uint8Array): Uint8Array => {
+    if (bomState === 'done' || chunk.byteLength === 0) return chunk;
+    let offset = 0;
+    const prefixBytes: number[] = [];
+
+    if (bomState === 'init') {
+      if (chunk[0] === 0xef) {
+        bomState = 'ef';
+        offset = 1;
+      } else {
+        bomState = 'done';
+        return chunk;
+      }
+    }
+
+    if (bomState === 'ef' && offset < chunk.byteLength) {
+      if (chunk[offset] === 0xbb) {
+        bomState = 'ef_bb';
+        offset += 1;
+      } else {
+        prefixBytes.push(0xef);
+        bomState = 'done';
+      }
+    }
+
+    if (bomState === 'ef_bb' && offset < chunk.byteLength) {
+      if (chunk[offset] === 0xbf) {
+        bomState = 'done';
+        offset += 1;
+      } else {
+        prefixBytes.push(0xef, 0xbb);
+        bomState = 'done';
+      }
+    }
+
+    const tail = offset === 0 ? chunk : chunk.subarray(offset);
+    if (prefixBytes.length === 0) return tail;
+    if (tail.byteLength === 0) return new Uint8Array(prefixBytes);
+    const out = new Uint8Array(prefixBytes.length + tail.byteLength);
+    out.set(prefixBytes, 0);
+    out.set(tail, prefixBytes.length);
+    return out;
+  };
+
+  const flushPendingNonBomBytes = (): Uint8Array | null => {
+    if (bomState === 'ef') {
+      bomState = 'done';
+      return new Uint8Array([0xef]);
+    }
+    if (bomState === 'ef_bb') {
+      bomState = 'done';
+      return new Uint8Array([0xef, 0xbb]);
+    }
+    return null;
+  };
 
   const isAtEventBoundary = (): boolean => {
+    // Do not insert keepalive while inspecting/buffering a split leading UTF-8 BOM.
+    if (bomState === 'ef' || bomState === 'ef_bb') return false;
     if (!startedAnyByte) return true;
-    return consecutiveEols >= 2 && !lastWasCr;
+    // Complete blank line across LF (\n\n), CR (\r\r), or CRLF (\r\n\r\n, incl. split across chunks).
+    return consecutiveEols >= 2;
   };
 
   const advanceBoundaryState = (chunk: Uint8Array): void => {
@@ -100,36 +162,48 @@ export function wrapSseKeepaliveStream(
 
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
-      if (closed) return;
-      const readPromise = ensureRead();
-      const winner = isAtEventBoundary()
-        ? await new Promise<'keepalive' | ReadOutcome>((resolve) => {
-            clearKeepaliveTimer();
-            timer = setTimeout(() => resolve('keepalive'), keepaliveMs);
-            timer.unref?.();
-            void readPromise.then(resolve);
-          })
-        : await readPromise;
-      clearKeepaliveTimer();
-      if (closed) return;
-      if (winner === 'keepalive') {
-        // Leave pendingRead intact so the next pull awaits the same in-flight read without losing data.
-        controller.enqueue(keepaliveChunk);
+      while (!closed) {
+        const readPromise = ensureRead();
+        const winner = isAtEventBoundary()
+          ? await new Promise<'keepalive' | ReadOutcome>((resolve) => {
+              clearKeepaliveTimer();
+              timer = setTimeout(() => resolve('keepalive'), keepaliveMs);
+              timer.unref?.();
+              void readPromise.then(resolve);
+            })
+          : await readPromise;
+        clearKeepaliveTimer();
+        if (closed) return;
+        if (winner === 'keepalive') {
+          // Leave pendingRead intact so the next pull awaits the same in-flight read without losing data.
+          controller.enqueue(keepaliveChunk);
+          return;
+        }
+        pendingRead = null;
+        if (!winner.ok) {
+          closed = true;
+          controller.error(winner.err);
+          return;
+        }
+        if (winner.res.done) {
+          const remaining = flushPendingNonBomBytes();
+          if (remaining && remaining.byteLength > 0) {
+            advanceBoundaryState(remaining);
+            controller.enqueue(remaining);
+          }
+          closed = true;
+          controller.close();
+          return;
+        }
+        const processed = stripLeadingBomChunk(winner.res.value);
+        if (processed.byteLength === 0) {
+          // Pure BOM / partial BOM prefix chunk: continue loop immediately to read body bytes.
+          continue;
+        }
+        advanceBoundaryState(processed);
+        controller.enqueue(processed);
         return;
       }
-      pendingRead = null;
-      if (!winner.ok) {
-        closed = true;
-        controller.error(winner.err);
-        return;
-      }
-      if (winner.res.done) {
-        closed = true;
-        controller.close();
-        return;
-      }
-      advanceBoundaryState(winner.res.value);
-      controller.enqueue(winner.res.value);
     },
     cancel(reason) {
       closed = true;

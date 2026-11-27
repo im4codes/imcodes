@@ -51,6 +51,7 @@ function runPatchedRuntime(opts?: { accessToken?: string; locationHref?: string 
   WSClass: any;
   lastES: () => CapturedES | null;
   lastWsUrl: () => unknown;
+  fetchCalls: Array<{ url: unknown; init: unknown }>;
   win: any;
 } {
   const accessToken = opts?.accessToken;
@@ -59,6 +60,7 @@ function runPatchedRuntime(opts?: { accessToken?: string; locationHref?: string 
 
   let lastES: CapturedES | null = null;
   let lastWsUrl: unknown = null;
+  const fetchCalls: Array<{ url: unknown; init: unknown }> = [];
 
   // Native EventSource constants (per WHATWG): CONNECTING=0, OPEN=1, CLOSED=2.
   class MockEventSource {
@@ -97,7 +99,10 @@ function runPatchedRuntime(opts?: { accessToken?: string; locationHref?: string 
     },
     EventSource: MockEventSource,
     WebSocket: MockWebSocket,
-    fetch: undefined,
+    fetch: (url: unknown, init?: unknown) => {
+      fetchCalls.push({ url, init });
+      return Promise.resolve({ ok: true });
+    },
     open: undefined,
     Location: undefined,
     document: documentStub,
@@ -132,6 +137,7 @@ function runPatchedRuntime(opts?: { accessToken?: string; locationHref?: string 
     WSClass: win.WebSocket,
     lastES: () => lastES,
     lastWsUrl: () => lastWsUrl,
+    fetchCalls,
     win,
   };
 }
@@ -383,5 +389,50 @@ describe('local web preview runtime — EventSource patch (behavioral)', () => {
     // Plain bare-relative without dots/token stays intact as document-relative under <base href>.
     new nested.ESClass('events');
     expect(nested.lastES()!.url).toBe('events');
+  });
+
+  it('rewrites session-only parent-query, encoded dot-paths, and no-trailing-slash root relative URLs instead of leaving proxy escape paths raw', () => {
+    // Session-only auth (no accessToken): browser location is already at PREFIX root without token.
+    const root = runPatchedRuntime({ locationHref: `https://im.codes${PREFIX}/` });
+
+    new root.ESClass('..?retry=1');
+    expect(root.lastES()!.url).toBe(`${PREFIX}/?retry=1`);
+
+    new root.ESClass('..#frag');
+    expect(root.lastES()!.url).toBe(`${PREFIX}/#frag`);
+
+    new root.ESClass('%2e%2e/events?a=1');
+    expect(root.lastES()!.url).toBe(`${PREFIX}/events?a=1`);
+
+    new root.WSClass('%2e%2e/ws?r=1');
+    expect(root.lastWsUrl()).toBe(`wss://im.codes${PREFIX}/ws?r=1`);
+
+    new root.WSClass('..?retry=1');
+    expect(root.lastWsUrl()).toBe(`wss://im.codes${PREFIX}/?retry=1`);
+
+    // Plain bare relative without escaping or dots still passes through unchanged.
+    new root.ESClass('events');
+    expect(root.lastES()!.url).toBe('events');
+
+    // Non-trailing-slash proxy root location must not treat parent as outside preview.
+    const bareRoot = runPatchedRuntime({ locationHref: `https://im.codes${PREFIX}` });
+    new bareRoot.ESClass('events');
+    expect(bareRoot.lastES()!.url).toBe(`${PREFIX}/events`);
+    new bareRoot.ESClass('..?retry=1');
+    expect(bareRoot.lastES()!.url).toBe(`${PREFIX}/?retry=1`);
+
+    // External origins and mismatched loopback ports stay untouched.
+    new root.ESClass('https://cdn.example.com/events');
+    expect(root.lastES()!.url).toBe('https://cdn.example.com/events');
+    new root.WSClass('ws://localhost:9999/ws');
+    expect(root.lastWsUrl()).toBe('ws://localhost:9999/ws');
+  });
+
+  it('rewrites fetch() parent-query and encoded dot-paths under session-only auth too', async () => {
+    const root = runPatchedRuntime({ locationHref: `https://im.codes${PREFIX}/` });
+    await root.win.fetch('%2e%2e/api?x=1');
+    expect(root.fetchCalls.at(-1)?.url).toBe(`${PREFIX}/api?x=1`);
+    await root.win.fetch('..?poll=1');
+    expect(root.fetchCalls.at(-1)?.url).toBe(`${PREFIX}/?poll=1`);
   });
 });

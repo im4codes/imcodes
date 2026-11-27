@@ -43,6 +43,81 @@ type PendingPreviewRequest = {
 const pendingPreviewRequests = new Map<string, PendingPreviewRequest>();
 const LOOPBACK_HOST = '127.0.0.1';
 
+// Scoped Undici dispatcher for loopback preview HTTP/SSE fetches. Disables Undici's
+// default 300,000ms `bodyTimeout` so long-silent SSE streams are governed solely by our
+// preview lifecycle (first-header timeout, non-SSE idle timeout, abort/disconnect, expiry).
+type PreviewHttpDispatcher = { close?: () => Promise<void> | void };
+type PreviewDispatcherCtor = new (opts: { bodyTimeout?: number }) => PreviewHttpDispatcher;
+
+let previewBodyTimeoutOverrideMs: number | null = null;
+let cachedDispatcherCtor: PreviewDispatcherCtor | null | undefined;
+let activePreviewDispatcher: PreviewHttpDispatcher | null = null;
+let activePreviewDispatcherTimeoutMs: number | null = null;
+
+async function resolvePreviewDispatcherCtor(): Promise<PreviewDispatcherCtor | null> {
+  if (cachedDispatcherCtor !== undefined) return cachedDispatcherCtor;
+  const globalSym = Symbol.for('undici.globalDispatcher.1');
+  const existing = (globalThis as Record<symbol, unknown>)[globalSym] as { constructor?: PreviewDispatcherCtor } | undefined;
+  if (existing && typeof existing.constructor === 'function') {
+    cachedDispatcherCtor = existing.constructor;
+    return cachedDispatcherCtor;
+  }
+  try {
+    const undiciModName = 'undici';
+    const mod = await import(undiciModName) as { Agent?: PreviewDispatcherCtor };
+    if (typeof mod?.Agent === 'function') {
+      cachedDispatcherCtor = mod.Agent;
+      return cachedDispatcherCtor;
+    }
+  } catch {
+    // Fall back to Node's lazy globalDispatcher probe below when undici package is unavailable.
+  }
+  const fetchFn = globalThis.fetch as (typeof fetch & { mock?: unknown }) | undefined;
+  if (typeof fetchFn === 'function' && !fetchFn.mock && String(fetchFn).includes('function fetch(input')) {
+    try {
+      await fetchFn('http://127.0.0.1:1', { signal: AbortSignal.abort() }).catch(() => {});
+      const populated = (globalThis as Record<symbol, unknown>)[globalSym] as { constructor?: PreviewDispatcherCtor } | undefined;
+      if (populated && typeof populated.constructor === 'function') {
+        cachedDispatcherCtor = populated.constructor;
+        return cachedDispatcherCtor;
+      }
+    } catch { /* ignore */ }
+  }
+  cachedDispatcherCtor = null;
+  return null;
+}
+
+async function getPreviewFetchDispatcher(): Promise<PreviewHttpDispatcher | undefined> {
+  const desiredTimeoutMs = previewBodyTimeoutOverrideMs ?? 0;
+  if (activePreviewDispatcher && activePreviewDispatcherTimeoutMs === desiredTimeoutMs) {
+    return activePreviewDispatcher;
+  }
+  const Ctor = await resolvePreviewDispatcherCtor();
+  if (!Ctor) return undefined;
+  if (activePreviewDispatcher) {
+    const prev = activePreviewDispatcher;
+    activePreviewDispatcher = null;
+    try { await prev.close?.(); } catch { /* ignore */ }
+  }
+  activePreviewDispatcher = new Ctor({ bodyTimeout: desiredTimeoutMs });
+  activePreviewDispatcherTimeoutMs = desiredTimeoutMs;
+  return activePreviewDispatcher;
+}
+
+/**
+ * Test seam for overriding the scoped loopback fetch `bodyTimeout` (in ms;
+ * `null` restores production default `0`, disabling Undici's 300s body-idle kill).
+ */
+export async function __setPreviewFetchBodyTimeoutForTests(timeoutMs: number | null): Promise<void> {
+  previewBodyTimeoutOverrideMs = timeoutMs;
+  if (activePreviewDispatcher) {
+    const prev = activePreviewDispatcher;
+    activePreviewDispatcher = null;
+    activePreviewDispatcherTimeoutMs = null;
+    try { await prev.close?.(); } catch { /* ignore */ }
+  }
+}
+
 // ── Preview registry: tracks previewId → port so WS tunnel can validate port ─
 // Populated when HTTP requests arrive. The server always sends the correct port,
 // but we cross-check to defend against confused-deputy scenarios.
@@ -233,6 +308,7 @@ function resetPreviewTimeout(
 async function runPreviewFetch(serverLink: ServerLink, msg: PreviewRequestMessage, pending: PendingPreviewRequest): Promise<void> {
   const targetUrl = new URL(normalizePreviewUpstreamPath(msg.path), `http://${LOOPBACK_HOST}:${msg.port}`);
   try {
+    const dispatcher = await getPreviewFetchDispatcher();
     const response = await fetch(targetUrl, {
       method: msg.method,
       headers: buildUpstreamHeaders(msg.headers, msg.port),
@@ -240,7 +316,8 @@ async function runPreviewFetch(serverLink: ServerLink, msg: PreviewRequestMessag
       duplex: pending.bodyStream ? 'half' : undefined,
       redirect: 'manual',
       signal: pending.abortController.signal,
-    } as RequestInit & { duplex?: 'half' });
+      ...(dispatcher ? { dispatcher } : {}),
+    } as RequestInit & { duplex?: 'half'; dispatcher?: PreviewHttpDispatcher });
 
     const responseHeaders = responseHeadersToRecord(response.headers);
     // Classify ONCE at RESPONSE_START (shared predicate). Streaming responses are

@@ -249,7 +249,7 @@ async function setup() {
     } as Record<string, unknown>, fakeServerLink as never);
   };
 
-  return { bridge, types, serverId, previewId, daemonToBridge, bridgeToDaemon, injectHttpRequest, WsBridge };
+  return { bridge, relay, types, serverId, previewId, daemonToBridge, bridgeToDaemon, injectHttpRequest, WsBridge };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -750,4 +750,39 @@ describe('E2E: Local Web Preview streaming protocols (real upstreams, real daemo
     bridge.terminatePreviewRelaysForPreview(previewId);
     await expect(reader2.read()).rejects.toBeTruthy();
   });
+
+  // ── 11. Scoped Undici bodyTimeout=0 prevents Node fetch UND_ERR_BODY_TIMEOUT on silent SSE ─
+  it('uses scoped Undici Agent(bodyTimeout=0) so silent SSE survives when a bounded bodyTimeout would fail with UND_ERR_BODY_TIMEOUT', async () => {
+    const upstream = await startHttpUpstream((req, res) => {
+      if (!req.url?.startsWith('/undici-silent-sse')) { res.writeHead(404).end(); return; }
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      res.write('data: one\n\n');
+      setTimeout(() => {
+        if (!res.writableEnded) {
+          res.write('data: two\n\n');
+          res.end();
+        }
+      }, 1400); // > 1000ms Undici fastTimer resolution
+    });
+    cleanups.push(() => upstream.close());
+
+    const { bridge, relay, previewId, injectHttpRequest, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+    cleanups.push(() => relay.__setPreviewFetchBodyTimeoutForTests(null));
+
+    // Counterexample: with a finite Undici bodyTimeout (50ms -> trips on ~1s Undici timer), silent SSE aborts.
+    relay.__setPreviewFetchBodyTimeoutForTests(50);
+    const failedRelay = bridge.createPreviewRelay('sse-undici-finite', previewId, 10_000);
+    injectHttpRequest('sse-undici-finite', upstream.port, '/undici-silent-sse');
+    const startedFinite = await failedRelay.start;
+    await expect(new Response(startedFinite.body).text()).rejects.toThrow(/TIMEOUT|terminated|Body Timeout/i);
+
+    // Production default (null -> Agent({ bodyTimeout: 0 })): survives 1400ms silence and delivers both events cleanly.
+    relay.__setPreviewFetchBodyTimeoutForTests(null);
+    const okRelay = bridge.createPreviewRelay('sse-undici-zero', previewId, 10_000);
+    injectHttpRequest('sse-undici-zero', upstream.port, '/undici-silent-sse');
+    const startedZero = await okRelay.start;
+    const text = await new Response(startedZero.body).text();
+    expect(text).toBe('data: one\n\ndata: two\n\n');
+  }, 15_000);
 });
