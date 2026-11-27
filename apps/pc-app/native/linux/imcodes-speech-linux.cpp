@@ -1081,13 +1081,13 @@ class LinuxAudioCapture : public ActiveServeSessionHandle {
 
   void run_loop() {
     if (aborted_.load() || stop_requested_.load()) {
-      drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
+      imcodes::speech::drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
       return;
     }
     std::string audio_err;
     if (!audio_.open(device_uid_, audio_err)) {
       if (aborted_.load() || stop_requested_.load()) {
-        drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
+        imcodes::speech::drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
         return;
       }
       std::vector<float>().swap(initial_samples_);
@@ -1097,7 +1097,7 @@ class LinuxAudioCapture : public ActiveServeSessionHandle {
     }
     if (aborted_.load() || stop_requested_.load()) {
       audio_.close();
-      drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
+      imcodes::speech::drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
       return;
     }
 
