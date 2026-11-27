@@ -573,6 +573,9 @@ vi.mock('../src/pages/SettingsPage.js', () => ({
       <button onClick={() => onChangeShortcutOverrides?.({ subSessionQuickModifiers: ['ctrl', 'shift'] })}>
         settings-subsession-ctrl-shift
       </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ mainTabQuickModifiers: ['ctrl', 'alt'] })}>
+        settings-maintab-ctrl-alt
+      </button>
       <button onClick={() => onChangeShortcutOverrides?.({ subSessionCloseAll: 'Alt+Shift+x' })}>
         settings-close-all-alt-shift-x
       </button>
@@ -15359,4 +15362,108 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     expect(screen.getByTestId('sub-session-window-sub_cov_p').getAttribute('data-share-role')).toBe('participant');
     expect(screen.getByTestId('session-pane-deck_m_brain').getAttribute('data-share-role')).toBe('viewer');
   }, 20_000);
+
+  it('switches main session tabs with Alt+1..9 (macOS Option chars), collapses floating sub-sessions on re-press, exits Task Mode, and respects recording/modal guards and custom modifiers', async () => {
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      useSubSessionsState.subSessions = [
+        { id: 'sub-main-1', sessionName: 'deck_sub_main_1', parentSession: 'deck_beta_brain', label: 'Helper1', description: '', cwd: '/work/beta', type: 'claude-code-sdk', runtimeType: 'transport', state: 'idle', serverId: 'srv-1' },
+      ];
+      useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      await waitFor(() => expect(alphaPane.getAttribute('data-is-active')).toBe('true'));
+
+      const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(mainInput));
+
+      // Blocking guards: IME composition, active shortcut recording, and dialogs must NOT trigger Alt+2
+      const imeEvt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, isComposing: true, bubbles: true, cancelable: true });
+      mainInput.dispatchEvent(imeEvt);
+      expect(imeEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      const recorder = document.createElement('button');
+      recorder.setAttribute('data-shortcut-recording', 'true');
+      document.body.appendChild(recorder);
+      const recEvt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      recorder.dispatchEvent(recEvt);
+      expect(recEvt.defaultPrevented).toBe(false);
+      recorder.remove();
+
+      const modal = document.createElement('div');
+      modal.setAttribute('role', 'dialog');
+      modal.setAttribute('aria-modal', 'true');
+      document.body.appendChild(modal);
+      const modalEvt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(modalEvt);
+      expect(modalEvt.defaultPrevented).toBe(false);
+      modal.remove();
+
+      // Out-of-bounds Alt+5 with 2 tabs is a safe no-op
+      const oobEvt = new KeyboardEvent('keydown', { key: '∞', code: 'Digit5', altKey: true, bubbles: true, cancelable: true });
+      mainInput.dispatchEvent(oobEvt);
+      expect(oobEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      // macOS Option+2 (key='™', code='Digit2') switches cleanly to deck_beta_brain
+      const switchTo2Evt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      mainInput.dispatchEvent(switchTo2Evt);
+      expect(switchTo2Evt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('false');
+      });
+
+      // Open floating sub-session on deck_beta_brain via Ctrl+1, then press Alt+2 again to collapse it cleanly (never stops session!)
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-main-1').getAttribute('data-visible')).toBe('true'));
+
+      const collapseOnActiveTabEvt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(collapseOnActiveTabEvt);
+      expect(collapseOnActiveTabEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('sub-session-window-sub-main-1').getAttribute('data-visible')).toBe('false');
+        expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+      });
+
+      // Open Task Mode, then press Alt+1 (key='¡', code='Digit1') -> exits Task Mode and switches to deck_alpha_brain
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+      const taskModeOverlay = await screen.findByText(/global task mode|任务模式/i).catch(() => null);
+      void taskModeOverlay;
+      const backTo1FromTaskMode = new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(backTo1FromTaskMode);
+      expect(backTo1FromTaskMode.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+      });
+
+      // Customize mainTabQuickModifiers to ['ctrl', 'alt']: plain Alt+2 stops switching, Ctrl+Alt+2 switches!
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(await screen.findByText('settings-maintab-ctrl-alt'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const ignoredAlt2 = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ignoredAlt2);
+      expect(ignoredAlt2.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+
+      const customCtrlAlt2 = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', ctrlKey: true, altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(customCtrlAlt2);
+      expect(customCtrlAlt2.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+      });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15_000);
 });

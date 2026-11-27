@@ -1135,4 +1135,80 @@ describe('SessionTabs', () => {
     expect(tabs[0]?.classList.contains('active')).toBe(true);
     expect(tabs[1]?.classList.contains('incognito')).toBe(false);
   });
+
+  it('renders top-left corner sequence numbers matching visual tab order without increasing tab height or width', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const cssText = fs.readFileSync(path.resolve(process.cwd(), 'src/styles.css'), 'utf8');
+
+    // Inject tab CSS rules directly into the document to assert real box/positioning properties.
+    const tabRule = cssText.match(/\.tab\s*\{[^}]+\}/)?.[0] ?? '';
+    const seqRule = cssText.match(/\.session-tab-seq\s*\{[^}]+\}/)?.[0] ?? '';
+    const barRule = cssText.match(/\.tab-bar\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(tabRule).toContain('overflow: visible');
+    expect(tabRule).toContain('position: relative');
+    expect(seqRule).toContain('position: absolute');
+    expect(seqRule).toContain('top: -3px');
+    expect(seqRule).toContain('left: -3px');
+    expect(seqRule).toContain('pointer-events: none');
+    // .tab-bar has top/left padding sufficient so top: -3px / left: -3px corner badge is never clipped
+    expect(barRule).toMatch(/padding:\s*4px\s+8px\s+0/);
+
+    const styleEl = document.createElement('style');
+    styleEl.textContent = `${barRule}\n${tabRule}\n${seqRule}`;
+    document.head.appendChild(styleEl);
+
+    try {
+      const sessions = makeSessions([
+        { name: 'sess_a', label: 'Alpha', role: 'brain', agentType: 'claude-code-sdk' },
+        { name: 'sess_b', label: 'Beta', role: 'w1', agentType: 'codex-sdk' },
+        { name: 'sess_c', label: 'Gamma', role: 'w2', agentType: 'gemini-cli' },
+      ]);
+      const view = render(
+        <SessionTabs
+          sessions={sessions}
+          activeSession="sess_a"
+          onSelect={vi.fn()}
+          sessionsLoaded={true}
+          {...defaultProps}
+          pinned={new Set(['sess_c'])}
+        />,
+      );
+
+      // Pinned tab sess_c moves first visually -> gets corner badge 1, sess_a -> 2, sess_b -> 3
+      const renderedTabs = screen.getAllByRole('tab');
+      expect(renderedTabs.map((btn) => btn.querySelector('.session-tab-seq')?.textContent)).toEqual(['1', '2', '3']);
+      expect(screen.getByTestId('session-tab-seq-sess_c').textContent).toBe('1');
+      expect(screen.getByTestId('session-tab-seq-sess_a').textContent).toBe('2');
+      expect(screen.getByTestId('session-tab-seq-sess_b').textContent).toBe('3');
+
+      // Drag sess_b before sess_a -> corner badges immediately renumber to match new visual order
+      const wrappers = [...view.container.querySelectorAll('.tab-wrap')];
+      fireEvent.dragStart(wrappers[2]);
+      fireEvent.dragOver(wrappers[1]);
+      fireEvent.drop(wrappers[1]);
+      fireEvent.dragEnd(wrappers[2]);
+      expect(screen.getByTestId('session-tab-seq-sess_c').textContent).toBe('1');
+      expect(screen.getByTestId('session-tab-seq-sess_b').textContent).toBe('2');
+      expect(screen.getByTestId('session-tab-seq-sess_a').textContent).toBe('3');
+
+      // Geometry guard: removing the absolute-positioned corner badge leaves computed style / dimensions 0px changed
+      const tabBtn = screen.getAllByRole('tab')[0] as HTMLElement;
+      const badge = tabBtn.querySelector('.session-tab-seq') as HTMLElement;
+      const csBadge = getComputedStyle(badge);
+      expect(csBadge.position).toBe('absolute');
+      expect(csBadge.pointerEvents).toBe('none');
+      const rectWithBadge = tabBtn.getBoundingClientRect();
+      const widthWith = tabBtn.offsetWidth;
+      const heightWith = tabBtn.offsetHeight;
+      badge.style.display = 'none';
+      const rectWithoutBadge = tabBtn.getBoundingClientRect();
+      expect(tabBtn.offsetWidth).toBe(widthWith);
+      expect(tabBtn.offsetHeight).toBe(heightWith);
+      expect(rectWithoutBadge.width).toBe(rectWithBadge.width);
+      expect(rectWithoutBadge.height).toBe(rectWithBadge.height);
+    } finally {
+      styleEl.remove();
+    }
+  });
 });

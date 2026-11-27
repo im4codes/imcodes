@@ -86,6 +86,12 @@ vi.mock('react-i18next', () => ({
         'settings.shortcuts.task_pair_split.modifiers_aria': 'Task pair split view shortcut modifier keys',
         'settings.shortcuts.task_pair_split.reset_aria': 'Reset task pair split view shortcut modifiers',
         'settings.shortcuts.task_pair_split.record_aria': 'Record task pair split view shortcut modifier combination',
+        'settings.shortcuts.main_tab_quick.title': 'Main Tab Quick Switch Shortcuts',
+        'settings.shortcuts.main_tab_quick.desc': 'Choose modifiers for 1–9 main tab switch.',
+        'settings.shortcuts.main_tab_quick.open_label': 'Switch to main tab #',
+        'settings.shortcuts.main_tab_quick.modifiers_aria': 'Main tab quick switch shortcut modifier keys',
+        'settings.shortcuts.main_tab_quick.reset_aria': 'Reset main tab quick switch shortcut modifiers',
+        'settings.shortcuts.main_tab_quick.record_aria': 'Record main tab quick switch shortcut modifier combination',
         'settings.shortcuts.mac_voice.title': 'Mac App Inline Voice Input',
         'settings.shortcuts.mac_voice.desc': 'Double-tap modifier key to dictate directly inside composer.',
         'settings.shortcuts.mac_voice.trigger_label': 'Double-tap shortcut',
@@ -670,5 +676,43 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     // Reset sub-session modifiers clears conflict
     fireEvent.click(screen.getByTestId('subsession-mod-reset'));
     expect(screen.queryByTestId('subsession-quick-conflict')).toBeNull();
+  });
+
+  it('renders main-tab quick switch modifier controls, records custom modifiers, detects conflicts, and resets', () => {
+    render(<KeyboardShortcutsSection isMacOverride={true} />);
+
+    const mainTabSection = screen.getByTestId('maintab-quick-shortcuts-section');
+    expect(mainTabSection).toBeTruthy();
+    expect(screen.getByTestId('maintab-mod-alt').getAttribute('aria-pressed')).toBe('true');
+    expect((screen.getByTestId('maintab-mod-alt') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTestId('maintab-quick-preview').textContent).toContain('⌥');
+    expect(screen.getByTestId('maintab-quick-preview').textContent).toContain('1–9');
+    expect(screen.queryByTestId('maintab-mod-reset')).toBeNull();
+
+    // Record Ctrl+Alt via recorder button + Digit1 chord
+    fireEvent.click(screen.getByTestId('maintab-mod-record'));
+    expect(mainTabSection.getAttribute('data-shortcut-recording')).toBe('true');
+    fireEvent.keyDown(document, { key: '1', code: 'Digit1', ctrlKey: true, altKey: true });
+    expect(mainTabSection.getAttribute('data-shortcut-recording')).toBeNull();
+    expect(screen.getByTestId('maintab-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('maintab-mod-alt').getAttribute('aria-pressed')).toBe('true');
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      KEYBOARD_SHORTCUTS_PREF_KEY,
+      expect.stringContaining('"mainTabQuickModifiers":["ctrl","alt"]'),
+      expect.anything(),
+    );
+
+    // Colliding with sub-session quick modifiers (Ctrl) surfaces conflict warning on both sections
+    fireEvent.click(screen.getByTestId('maintab-mod-record'));
+    fireEvent.keyDown(document, { key: 'Control', ctrlKey: true });
+    fireEvent.keyUp(document, { key: 'Control', ctrlKey: false });
+    expect(screen.getByTestId('maintab-quick-conflict').textContent).toContain('Sub-session Quick Shortcuts');
+    expect(screen.getByTestId('subsession-quick-conflict').textContent).toContain('Main Tab Quick Switch Shortcuts');
+
+    // Reset restores ['alt'] and clears conflict
+    fireEvent.click(screen.getByTestId('maintab-mod-reset'));
+    expect(screen.getByTestId('maintab-mod-alt').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.queryByTestId('maintab-quick-conflict')).toBeNull();
+    expect(screen.queryByTestId('maintab-mod-reset')).toBeNull();
   });
 });

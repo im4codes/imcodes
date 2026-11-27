@@ -7,6 +7,7 @@ import {
   SHORTCUT_MODIFIER_KEYS,
   SHORTCUT_SLOTS,
   applyMacVoiceInlineModifier,
+  applyMainTabQuickModifiers,
   applyShortcutSlotOverride,
   applySubSessionQuickModifiers,
   applyTaskPairSplitModifiers,
@@ -18,6 +19,7 @@ import {
   formatShortcutKeycaps,
   formatShortcutModifierKeycaps,
   formatSubSessionQuickModifierKeycaps,
+  getDefaultMainTabQuickModifiers,
   getDefaultSecondaryShortcuts,
   getDefaultShortcutForSlot,
   getDefaultShortcuts,
@@ -28,6 +30,7 @@ import {
   normalizeShortcutChordString,
   resolveKeyboardShortcutSlots,
   resolveMacVoiceInlineModifier,
+  resolveMainTabQuickModifiers,
   resolveSubSessionQuickModifiers,
   resolveTaskPairSplitModifiers,
   sanitizeShortcutOverrides,
@@ -80,7 +83,38 @@ const ACTION_LABELS: Record<ShortcutActionId, { titleKey: string; descKey: strin
   },
 };
 
-type ModifierGroupId = 'subsession' | 'taskPairSplit';
+type ModifierGroupId = 'subsession' | 'taskPairSplit' | 'mainTab';
+
+const MODIFIER_GROUP_IDS: readonly ModifierGroupId[] = ['subsession', 'taskPairSplit', 'mainTab'];
+
+const MODIFIER_GROUP_HANDLERS: Record<ModifierGroupId, {
+  titleKey: string;
+  getDefault: () => ShortcutModifierKey[];
+  resolve: (overrides: KeyboardShortcutOverrides | null | undefined) => ShortcutModifierKey[];
+  apply: (
+    overrides: KeyboardShortcutOverrides | null | undefined,
+    modifiers: readonly ShortcutModifierKey[],
+  ) => KeyboardShortcutOverrides;
+}> = {
+  subsession: {
+    titleKey: 'settings.shortcuts.subsession_quick.title',
+    getDefault: getDefaultSubSessionQuickModifiers,
+    resolve: resolveSubSessionQuickModifiers,
+    apply: applySubSessionQuickModifiers,
+  },
+  taskPairSplit: {
+    titleKey: 'settings.shortcuts.task_pair_split.title',
+    getDefault: getDefaultTaskPairSplitModifiers,
+    resolve: resolveTaskPairSplitModifiers,
+    apply: applyTaskPairSplitModifiers,
+  },
+  mainTab: {
+    titleKey: 'settings.shortcuts.main_tab_quick.title',
+    getDefault: getDefaultMainTabQuickModifiers,
+    resolve: resolveMainTabQuickModifiers,
+    apply: applyMainTabQuickModifiers,
+  },
+};
 
 const collectModifiersFromEvent = (e: KeyboardEvent): ShortcutModifierKey[] => {
   const active = new Set<ShortcutModifierKey>();
@@ -163,11 +197,38 @@ function KeyboardShortcutsSectionInner({
     [taskPairSplitModifiers, isMac, defaultTaskPairSplitModifiers],
   );
 
-  const hasModifierGroupConflict = areShortcutModifiersEqual(
-    subSessionModifiers,
-    taskPairSplitModifiers,
-    defaultSubSessionModifiers,
+  const mainTabModifiers = useMemo(
+    () => resolveMainTabQuickModifiers(cleanOverrides),
+    [cleanOverrides],
   );
+  const defaultMainTabModifiers = useMemo(() => getDefaultMainTabQuickModifiers(), []);
+  const isCustomMainTabModifiers = !areShortcutModifiersEqual(
+    mainTabModifiers,
+    defaultMainTabModifiers,
+    defaultMainTabModifiers,
+  );
+  const mainTabModifierCaps = useMemo(
+    () => formatShortcutModifierKeycaps(mainTabModifiers, isMac, defaultMainTabModifiers),
+    [mainTabModifiers, isMac, defaultMainTabModifiers],
+  );
+
+  const modifierGroupConflicts = useMemo(() => {
+    const resolvedByGroup: Record<ModifierGroupId, ShortcutModifierKey[]> = {
+      subsession: subSessionModifiers,
+      taskPairSplit: taskPairSplitModifiers,
+      mainTab: mainTabModifiers,
+    };
+    const out = {} as Record<ModifierGroupId, string | null>;
+    for (const id of MODIFIER_GROUP_IDS) {
+      const others = MODIFIER_GROUP_IDS
+        .filter((other) => other !== id && areShortcutModifiersEqual(resolvedByGroup[id], resolvedByGroup[other], resolvedByGroup[id]))
+        .map((other) => t(MODIFIER_GROUP_HANDLERS[other].titleKey));
+      out[id] = others.length > 0
+        ? t('settings.shortcuts.conflict_warning', { actions: others.join(', ') })
+        : null;
+    }
+    return out;
+  }, [subSessionModifiers, taskPairSplitModifiers, mainTabModifiers, t]);
 
   const macVoiceModifier = useMemo(
     () => resolveMacVoiceInlineModifier(cleanOverrides),
@@ -182,6 +243,7 @@ function KeyboardShortcutsSectionInner({
   const hasAnyOverride = useMemo(
     () => isCustomSubSessionModifiers
       || isCustomTaskPairSplitModifiers
+      || isCustomMainTabModifiers
       || isCustomMacVoiceModifier
       || SHORTCUT_ACTION_IDS.some(
         (id) => resolvedSlots[id].primary !== primaryDefaults[id]
@@ -190,6 +252,7 @@ function KeyboardShortcutsSectionInner({
     [
       isCustomSubSessionModifiers,
       isCustomTaskPairSplitModifiers,
+      isCustomMainTabModifiers,
       isCustomMacVoiceModifier,
       resolvedSlots,
       primaryDefaults,
@@ -217,21 +280,16 @@ function KeyboardShortcutsSectionInner({
     group: ModifierGroupId,
     nextModifiers: readonly ShortcutModifierKey[],
   ) => {
-    onChangeOverrides((prev) => (
-      group === 'subsession'
-        ? applySubSessionQuickModifiers(prev, nextModifiers)
-        : applyTaskPairSplitModifiers(prev, nextModifiers)
-    ));
+    onChangeOverrides((prev) => MODIFIER_GROUP_HANDLERS[group].apply(prev, nextModifiers));
   };
 
   const handleToggleModifierInGroup = (group: ModifierGroupId, mod: ShortcutModifierKey) => {
     setStatusNotice(null);
     cancelModifierRecording();
     setRecordingTarget(null);
+    const handler = MODIFIER_GROUP_HANDLERS[group];
     onChangeOverrides((prev) => {
-      const current = group === 'subsession'
-        ? resolveSubSessionQuickModifiers(prev)
-        : resolveTaskPairSplitModifiers(prev);
+      const current = handler.resolve(prev);
       const exists = current.includes(mod);
       if (exists && current.length <= 1) {
         return prev;
@@ -239,9 +297,7 @@ function KeyboardShortcutsSectionInner({
       const next = exists
         ? current.filter((item) => item !== mod)
         : [...current, mod];
-      return group === 'subsession'
-        ? applySubSessionQuickModifiers(prev, next)
-        : applyTaskPairSplitModifiers(prev, next);
+      return handler.apply(prev, next);
     });
   };
 
@@ -251,7 +307,7 @@ function KeyboardShortcutsSectionInner({
     setRecordingTarget(null);
     applyModifierGroupChange(
       group,
-      group === 'subsession' ? defaultSubSessionModifiers : defaultTaskPairSplitModifiers,
+      MODIFIER_GROUP_HANDLERS[group].getDefault(),
     );
   };
 
@@ -844,12 +900,31 @@ function KeyboardShortcutsSectionInner({
         modifiersAriaKey: 'settings.shortcuts.subsession_quick.modifiers_aria',
         resetAriaKey: 'settings.shortcuts.subsession_quick.reset_aria',
         recordAriaKey: 'settings.shortcuts.subsession_quick.record_aria',
-        conflictText: hasModifierGroupConflict
-          ? t('settings.shortcuts.conflict_warning', { actions: t('settings.shortcuts.task_pair_split.title') })
-          : null,
+        conflictText: modifierGroupConflicts.subsession,
         modifiers: subSessionModifiers,
         caps: subSessionModifierCaps,
         isCustom: isCustomSubSessionModifiers,
+      })}
+
+      {renderModifierDigitSection({
+        group: 'mainTab',
+        sectionTestId: 'maintab-quick-shortcuts-section',
+        previewTestId: 'maintab-quick-preview',
+        modTestIdPrefix: 'maintab-mod',
+        recordTestId: 'maintab-mod-record',
+        cancelTestId: 'maintab-mod-cancel',
+        resetTestId: 'maintab-mod-reset',
+        conflictTestId: 'maintab-quick-conflict',
+        titleKey: 'settings.shortcuts.main_tab_quick.title',
+        descKey: 'settings.shortcuts.main_tab_quick.desc',
+        openLabelKey: 'settings.shortcuts.main_tab_quick.open_label',
+        modifiersAriaKey: 'settings.shortcuts.main_tab_quick.modifiers_aria',
+        resetAriaKey: 'settings.shortcuts.main_tab_quick.reset_aria',
+        recordAriaKey: 'settings.shortcuts.main_tab_quick.record_aria',
+        conflictText: modifierGroupConflicts.mainTab,
+        modifiers: mainTabModifiers,
+        caps: mainTabModifierCaps,
+        isCustom: isCustomMainTabModifiers,
       })}
 
       {renderModifierDigitSection({
@@ -867,9 +942,7 @@ function KeyboardShortcutsSectionInner({
         modifiersAriaKey: 'settings.shortcuts.task_pair_split.modifiers_aria',
         resetAriaKey: 'settings.shortcuts.task_pair_split.reset_aria',
         recordAriaKey: 'settings.shortcuts.task_pair_split.record_aria',
-        conflictText: hasModifierGroupConflict
-          ? t('settings.shortcuts.conflict_warning', { actions: t('settings.shortcuts.subsession_quick.title') })
-          : null,
+        conflictText: modifierGroupConflicts.taskPairSplit,
         modifiers: taskPairSplitModifiers,
         caps: taskPairSplitModifierCaps,
         isCustom: isCustomTaskPairSplitModifiers,

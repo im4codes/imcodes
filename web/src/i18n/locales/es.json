@@ -2480,6 +2480,14 @@
         "reset_aria": "Restablecer modificadores de vista dividida de tareas",
         "record_aria": "Grabar combinación de modificadores para vista dividida de tareas"
       },
+      "main_tab_quick": {
+        "title": "Atajos rápidos de pestaña principal",
+        "desc": "Elige las teclas modificadoras que se combinan con 1–9 para cambiar a la pestaña principal numerada, o púlsalo de nuevo en la pestaña activa para contraer subsesiones flotantes (por defecto Alt).",
+        "open_label": "Cambiar a la pestaña principal #",
+        "modifiers_aria": "Teclas modificadoras para atajos rápidos de pestaña principal",
+        "reset_aria": "Restablecer modificadores de pestaña principal",
+        "record_aria": "Grabar combinación de modificadores para pestaña principal"
+      },
       "mac_voice": {
         "title": "Entrada de voz integrada en Mac",
         "desc": "En la app de escritorio para Mac, pulsa dos veces la tecla modificadora elegida para dictar directamente en el cuadro de mensaje activo; vuelve a pulsarla dos veces para detener y enviar.",

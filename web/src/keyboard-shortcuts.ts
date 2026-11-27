@@ -58,6 +58,7 @@ export type ShortcutModifierKey = 'ctrl' | 'alt' | 'shift' | 'meta';
 export const SHORTCUT_MODIFIER_KEYS: readonly ShortcutModifierKey[] = ['ctrl', 'alt', 'shift', 'meta'];
 export const DEFAULT_SUBSESSION_QUICK_MODIFIERS: readonly ShortcutModifierKey[] = ['ctrl'];
 export const DEFAULT_TASK_PAIR_SPLIT_MODIFIERS: readonly ShortcutModifierKey[] = ['ctrl', 'shift'];
+export const DEFAULT_MAIN_TAB_QUICK_MODIFIERS: readonly ShortcutModifierKey[] = ['alt'];
 export type MacVoiceInlineModifier = ShortcutModifierKey | null;
 export const DEFAULT_MAC_VOICE_INLINE_MODIFIER: ShortcutModifierKey = 'shift';
 
@@ -65,6 +66,7 @@ export type KeyboardShortcutOverrides = Partial<Record<ShortcutActionId, string 
   secondary?: Partial<Record<ShortcutActionId, string | null>>;
   subSessionQuickModifiers?: ShortcutModifierKey[];
   taskPairSplitModifiers?: ShortcutModifierKey[];
+  mainTabQuickModifiers?: ShortcutModifierKey[];
   macVoiceInlineModifier?: MacVoiceInlineModifier;
 };
 
@@ -448,6 +450,12 @@ export function sanitizeShortcutOverrides(raw: unknown): KeyboardShortcutOverrid
     const cleanSplitModifiers = sanitizeSubSessionQuickModifiers(input.taskPairSplitModifiers);
     if (cleanSplitModifiers) {
       out.taskPairSplitModifiers = cleanSplitModifiers;
+    }
+  }
+  if ('mainTabQuickModifiers' in input) {
+    const cleanMainTabModifiers = sanitizeSubSessionQuickModifiers(input.mainTabQuickModifiers);
+    if (cleanMainTabModifiers) {
+      out.mainTabQuickModifiers = cleanMainTabModifiers;
     }
   }
   if ('macVoiceInlineModifier' in input) {
@@ -1139,7 +1147,7 @@ function areModifierCombinationsEqual(
 
 function applyModifierCombinationOverride(
   overrides: KeyboardShortcutOverrides | null | undefined,
-  key: 'subSessionQuickModifiers' | 'taskPairSplitModifiers',
+  key: 'subSessionQuickModifiers' | 'taskPairSplitModifiers' | 'mainTabQuickModifiers',
   modifiers: readonly ShortcutModifierKey[],
   defaultModifiers: readonly ShortcutModifierKey[],
 ): KeyboardShortcutOverrides {
@@ -1161,6 +1169,11 @@ export function getDefaultSubSessionQuickModifiers(): ShortcutModifierKey[] {
 /** Return the default modifier combination (`Ctrl+Shift`) for task-pair split-view digit shortcuts. */
 export function getDefaultTaskPairSplitModifiers(): ShortcutModifierKey[] {
   return [...DEFAULT_TASK_PAIR_SPLIT_MODIFIERS];
+}
+
+/** Return the default modifier combination (`Alt`) for main session tab digit shortcuts. */
+export function getDefaultMainTabQuickModifiers(): ShortcutModifierKey[] {
+  return [...DEFAULT_MAIN_TAB_QUICK_MODIFIERS];
 }
 
 /** Sanitize a candidate modifier list into canonical non-empty `ShortcutModifierKey[]` order, or `undefined`. */
@@ -1192,6 +1205,14 @@ export function areSubSessionQuickModifiersEqual(
   return areModifierCombinationsEqual(a, b, DEFAULT_SUBSESSION_QUICK_MODIFIERS);
 }
 
+/** Check whether two main-tab quick-shortcut modifier combinations represent the exact same modifier set. */
+export function areMainTabQuickModifiersEqual(
+  a: readonly ShortcutModifierKey[],
+  b: readonly ShortcutModifierKey[],
+): boolean {
+  return areModifierCombinationsEqual(a, b, DEFAULT_MAIN_TAB_QUICK_MODIFIERS);
+}
+
 /** Resolve active sub-session quick-shortcut modifiers from stored overrides (defaults to `['ctrl']`). */
 export function resolveSubSessionQuickModifiers(
   overrides: KeyboardShortcutOverrides | null | undefined,
@@ -1204,6 +1225,13 @@ export function resolveTaskPairSplitModifiers(
   overrides: KeyboardShortcutOverrides | null | undefined,
 ): ShortcutModifierKey[] {
   return sanitizeSubSessionQuickModifiers(overrides?.taskPairSplitModifiers) ?? getDefaultTaskPairSplitModifiers();
+}
+
+/** Resolve active main-tab quick-switch modifiers from stored overrides (defaults to `['alt']`). */
+export function resolveMainTabQuickModifiers(
+  overrides: KeyboardShortcutOverrides | null | undefined,
+): ShortcutModifierKey[] {
+  return sanitizeSubSessionQuickModifiers(overrides?.mainTabQuickModifiers) ?? getDefaultMainTabQuickModifiers();
 }
 
 /** Update `subSessionQuickModifiers` on an override object, omitting it when back to default `['ctrl']`. */
@@ -1229,6 +1257,19 @@ export function applyTaskPairSplitModifiers(
     'taskPairSplitModifiers',
     modifiers,
     DEFAULT_TASK_PAIR_SPLIT_MODIFIERS,
+  );
+}
+
+/** Update `mainTabQuickModifiers` on an override object, omitting it when back to default `['alt']`. */
+export function applyMainTabQuickModifiers(
+  overrides: KeyboardShortcutOverrides | null | undefined,
+  modifiers: readonly ShortcutModifierKey[],
+): KeyboardShortcutOverrides {
+  return applyModifierCombinationOverride(
+    overrides,
+    'mainTabQuickModifiers',
+    modifiers,
+    DEFAULT_MAIN_TAB_QUICK_MODIFIERS,
   );
 }
 
@@ -1259,6 +1300,7 @@ export function formatSubSessionQuickModifierKeycaps(
 
 export type SubSessionQuickShortcutMatch = { kind: 'open'; index: number };
 export type TaskPairSplitQuickShortcutMatch = { kind: 'toggleSplit'; index: number };
+export type MainTabQuickShortcutMatch = { kind: 'selectMainTab'; index: number };
 
 export function extractDigitFromKeyboardEvent(
   e: Pick<KeyboardEvent, 'key' | 'code'>,
@@ -1330,4 +1372,19 @@ export function matchTaskPairSplitQuickShortcut(
 ): TaskPairSplitQuickShortcutMatch | null {
   const index = matchModifierDigitIndex(e, modifiers, DEFAULT_TASK_PAIR_SPLIT_MODIFIERS);
   return index === null ? null : { kind: 'toggleSplit', index };
+}
+
+/**
+ * Match `<Modifier> + 1..9` (switch/open N-th main session tab or collapse floating sub-sessions
+ * when already active on that tab) against the user's configured modifier combination (`['alt']` by default).
+ */
+export function matchMainTabQuickShortcut(
+  e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'> & {
+    isComposing?: boolean;
+    keyCode?: number;
+  },
+  modifiers: readonly ShortcutModifierKey[],
+): MainTabQuickShortcutMatch | null {
+  const index = matchModifierDigitIndex(e, modifiers, DEFAULT_MAIN_TAB_QUICK_MODIFIERS);
+  return index === null ? null : { kind: 'selectMainTab', index };
 }

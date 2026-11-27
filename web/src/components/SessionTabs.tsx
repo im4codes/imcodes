@@ -527,6 +527,13 @@ function SessionTabsControlled({ sessions, activeSession, connected, latencyMs, 
                 onMouseLeave={(e) => onTabMouseEnd(e as MouseEvent)}
                 title={`${s.agentType}${s.agentVersion ? ` ${s.agentVersion}` : ''} — ${s.state}${isPinned ? ' (pinned)' : ''}`}
               >
+                <sup
+                  class="session-tab-seq"
+                  data-testid={`session-tab-seq-${s.name}`}
+                  aria-hidden="true"
+                >
+                  {idx + 1}
+                </sup>
                 {isPinned && <span class="tab-pin">📌</span>}
                 {agentBadge(s.agentType)}
                 {getLabel(s)}

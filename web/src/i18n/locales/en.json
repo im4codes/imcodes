@@ -2480,6 +2480,14 @@
         "reset_aria": "Reset task pair split view shortcut modifiers",
         "record_aria": "Record task pair split view shortcut modifier combination"
       },
+      "main_tab_quick": {
+        "title": "Main Tab Quick Switch Shortcuts",
+        "desc": "Choose which modifier keys combine with number keys 1–9 to switch to the numbered main tab, or press again on the active tab to collapse floating sub-sessions.",
+        "open_label": "Switch to main tab #",
+        "modifiers_aria": "Main tab quick switch shortcut modifier keys",
+        "reset_aria": "Reset main tab quick switch shortcut modifiers",
+        "record_aria": "Record main tab quick switch shortcut modifier combination"
+      },
       "mac_voice": {
         "title": "Mac App Inline Voice Input",
         "desc": "In the Mac desktop app, double-tap the selected modifier key to dictate directly inside the active message composer; double-tap again to stop and send.",

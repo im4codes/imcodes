@@ -4,11 +4,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_MAC_VOICE_INLINE_MODIFIER,
+  DEFAULT_MAIN_TAB_QUICK_MODIFIERS,
   DEFAULT_TASK_PAIR_SPLIT_MODIFIERS,
   applyMacVoiceInlineModifier,
+  applyMainTabQuickModifiers,
   applyShortcutSlotOverride,
   applySubSessionQuickModifiers,
   applyTaskPairSplitModifiers,
+  areMainTabQuickModifiersEqual,
   areSubSessionQuickModifiersEqual,
   canHandleGlobalNavigationShortcut,
   canHandleOpenSettingsShortcut,
@@ -24,11 +27,13 @@ import {
   formatShortcutKeycaps,
   formatShortcutModifierKeycaps,
   formatSubSessionQuickModifierKeycaps,
+  getDefaultMainTabQuickModifiers,
   getDefaultSecondaryShortcuts,
   getDefaultShortcuts,
   getDefaultSubSessionQuickModifiers,
   getDefaultTaskPairSplitModifiers,
   isMacPlatform,
+  matchMainTabQuickShortcut,
   matchesOpenSettingsShortcut,
   matchesShortcutChord,
   matchNavigationShortcutAction,
@@ -41,6 +46,7 @@ import {
   resolveKeyboardShortcuts,
   resolveKeyboardShortcutSlots,
   resolveMacVoiceInlineModifier,
+  resolveMainTabQuickModifiers,
   resolveSubSessionQuickModifiers,
   resolveTaskPairSplitModifiers,
   sanitizeMacVoiceInlineModifier,
@@ -1029,6 +1035,68 @@ describe('keyboard-shortcuts core helpers', () => {
       metaKey: false,
       isComposing: true,
     }, ['ctrl', 'shift'])).toBeNull();
+  });
+
+  it('defaults mainTabQuickModifiers to Alt, supports backward-compatible overrides, and matches macOS Option+Digit1..9', () => {
+    expect(DEFAULT_MAIN_TAB_QUICK_MODIFIERS).toEqual(['alt']);
+    expect(getDefaultMainTabQuickModifiers()).toEqual(['alt']);
+    expect(resolveMainTabQuickModifiers(undefined)).toEqual(['alt']);
+    expect(resolveMainTabQuickModifiers({ subSessionQuickModifiers: ['ctrl', 'alt'] })).toEqual(['alt']);
+    expect(resolveMainTabQuickModifiers({ mainTabQuickModifiers: [] })).toEqual(['alt']);
+
+    expect(sanitizeShortcutOverrides({ mainTabQuickModifiers: ['shift', 'ctrl'] })).toEqual({
+      mainTabQuickModifiers: ['ctrl', 'shift'],
+    });
+    expect(applyMainTabQuickModifiers({}, ['ctrl', 'alt'])).toEqual({
+      mainTabQuickModifiers: ['ctrl', 'alt'],
+    });
+    expect(applyMainTabQuickModifiers({ mainTabQuickModifiers: ['ctrl', 'alt'] }, ['alt'])).toEqual({});
+    expect(areMainTabQuickModifiersEqual(['shift', 'ctrl'], ['ctrl', 'shift'])).toBe(true);
+    expect(areMainTabQuickModifiersEqual(['alt'], ['ctrl', 'alt'])).toBe(false);
+
+    // macOS Option+1 produces e.key === '¡' while e.code === 'Digit1'
+    expect(matchMainTabQuickShortcut({
+      key: '¡',
+      code: 'Digit1',
+      ctrlKey: false,
+      altKey: true,
+      shiftKey: false,
+      metaKey: false,
+    }, ['alt'])).toEqual({ kind: 'selectMainTab', index: 0 });
+    expect(matchMainTabQuickShortcut({
+      key: '9',
+      code: 'Numpad9',
+      ctrlKey: false,
+      altKey: true,
+      shiftKey: false,
+      metaKey: false,
+    }, ['alt'])).toEqual({ kind: 'selectMainTab', index: 8 });
+    // Extra modifier or digit 0 or IME composing must NOT match
+    expect(matchMainTabQuickShortcut({
+      key: '¡',
+      code: 'Digit1',
+      ctrlKey: true,
+      altKey: true,
+      shiftKey: false,
+      metaKey: false,
+    }, ['alt'])).toBeNull();
+    expect(matchMainTabQuickShortcut({
+      key: 'º',
+      code: 'Digit0',
+      ctrlKey: false,
+      altKey: true,
+      shiftKey: false,
+      metaKey: false,
+    }, ['alt'])).toBeNull();
+    expect(matchMainTabQuickShortcut({
+      key: '¡',
+      code: 'Digit1',
+      ctrlKey: false,
+      altKey: true,
+      shiftKey: false,
+      metaKey: false,
+      isComposing: true,
+    }, ['alt'])).toBeNull();
   });
 
   it('allows non-text input controls and non-modal aria-modal="false" dialogs while blocking text inputs and modals', () => {

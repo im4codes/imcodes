@@ -141,8 +141,10 @@ import {
   canHandleToggleTaskModeShortcut,
   cycleOrderedId,
   formatShortcutKeycaps,
+  formatShortcutModifierKeycaps,
   hasDomBlockingOverlay,
   isMacPlatform,
+  matchMainTabQuickShortcut,
   matchNavigationShortcutBinding,
   matchSubSessionQuickShortcut,
   matchTaskPairSplitQuickShortcut,
@@ -151,6 +153,7 @@ import {
   resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcutSlots,
   resolveMacVoiceInlineModifier,
+  resolveMainTabQuickModifiers,
   resolveSubSessionQuickModifiers,
   resolveTaskPairSplitModifiers,
   sortSessionsByTabOrder,
@@ -3198,6 +3201,10 @@ function InternalMainApp() {
   );
   const resolvedTaskPairSplitModifiers = useMemo(
     () => resolveTaskPairSplitModifiers(shortcutOverrides),
+    [shortcutOverrides],
+  );
+  const resolvedMainTabQuickModifiers = useMemo(
+    () => resolveMainTabQuickModifiers(shortcutOverrides),
     [shortcutOverrides],
   );
   const resolvedMacVoiceModifier = useMemo(
@@ -9563,6 +9570,10 @@ function InternalMainApp() {
   resolvedSubSessionQuickModifiersRef.current = resolvedSubSessionQuickModifiers;
   const resolvedTaskPairSplitModifiersRef = useRef(resolvedTaskPairSplitModifiers);
   resolvedTaskPairSplitModifiersRef.current = resolvedTaskPairSplitModifiers;
+  const resolvedMainTabQuickModifiersRef = useRef(resolvedMainTabQuickModifiers);
+  resolvedMainTabQuickModifiersRef.current = resolvedMainTabQuickModifiers;
+  const showTaskModeRef = useRef(showTaskMode);
+  showTaskModeRef.current = showTaskMode;
   useEffect(() => {
     (window as Window & { __imcodesTaskPairSplitModifiers?: ShortcutModifierKey[] }).__imcodesTaskPairSplitModifiers = resolvedTaskPairSplitModifiers;
     window.dispatchEvent(new CustomEvent('deck:task-pair-split-modifiers'));
@@ -10062,7 +10073,10 @@ function InternalMainApp() {
       const pairSplitMatch = matched || quickSubMatch
         ? null
         : matchTaskPairSplitQuickShortcut(e, resolvedTaskPairSplitModifiersRef.current);
-      if (!matched && !quickSubMatch && !pairSplitMatch) return;
+      const mainTabMatch = matched || quickSubMatch || pairSplitMatch
+        ? null
+        : matchMainTabQuickShortcut(e, resolvedMainTabQuickModifiersRef.current);
+      if (!matched && !quickSubMatch && !pairSplitMatch && !mainTabMatch) return;
 
       if (matched?.action === 'subSessionCloseAll') {
         if (!canHandleReturnToMainWindowShortcut(e.target, document.activeElement, {
@@ -10178,6 +10192,57 @@ function InternalMainApp() {
           auditor: String(targetRow.payload.auditor),
           action: 'toggle',
         });
+        return;
+      }
+
+      if (mainTabMatch) {
+        if (!selectedServerIdRef.current) return;
+        const targetTab = orderedTabsNavRef.current[mainTabMatch.index];
+        if (!targetTab) return;
+        e.preventDefault();
+        e.stopPropagation();
+        suppressHoverPreviewsUntilPointerMove();
+        const wasInDashboard = manualDashboardRef.current;
+        if (wasInDashboard) {
+          setManualDashboard(false);
+        }
+        const wasInTaskMode = showTaskModeRef.current;
+        if (wasInTaskMode) {
+          setShowTaskMode(false);
+        }
+        const alreadyActiveMainTab = !wasInTaskMode
+          && !wasInDashboard
+          && activeSessionRef.current === targetTab.name;
+        if (alreadyActiveMainTab) {
+          const hasOpenOverlay = openSubIdsRef.current.size > 0
+            || (remoteDesktopWorkspaceOpenRef.current && !remoteDesktopWorkspaceMinimizedRef.current)
+            || (remoteDesktopWallOpenRef.current && !remoteDesktopWallMinimizedRef.current);
+          if (hasOpenOverlay) {
+            returnToMainWindowRef.current();
+          }
+          return;
+        }
+        const shareTarget = selectedShareTargetNavRef.current;
+        if (!shareTarget || shareTarget.kind === 'server') {
+          const serverId = selectedServerIdRef.current;
+          const serverName = resolvedSelectedServerNameNavRef.current
+            || unifiedServersNavRef.current.find((srv) => srv.id === serverId)?.name
+            || serverId;
+          const sessionLabel = targetTab.label || targetTab.project || targetTab.name;
+          const keycaps = [
+            ...formatShortcutModifierKeycaps(resolvedMainTabQuickModifiersRef.current, isMacPlatform()),
+            String(mainTabMatch.index + 1),
+          ];
+          setServerSwitchWatermark((prev) => ({
+            serverId,
+            serverName,
+            sessionName: sessionLabel,
+            switchKind: 'session',
+            shortcutKeycaps: keycaps,
+            nonce: (prev?.nonce ?? 0) + 1,
+          }));
+        }
+        selectMainSessionTabNavRef.current(targetTab.name);
         return;
       }
 
