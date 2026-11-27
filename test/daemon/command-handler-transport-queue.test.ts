@@ -53,6 +53,7 @@ import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { DEFAULT_CLAUDE_CODE_MODEL_ID } from '../../src/shared/models/options.js';
 import { RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER } from '../../shared/supervision-config.js';
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
@@ -3913,6 +3914,25 @@ describe('handleWebCommand transport queue behavior', () => {
       requestId: 'passive-muse-models',
       defaultModel: expect.any(String),
       models: expect.arrayContaining([expect.objectContaining({ id: 'muse-spark-1.3' })]),
+    }));
+  });
+
+  it('serves passive transport.list_models for claude-code-sdk with DEFAULT_CLAUDE_CODE_MODEL_ID without connecting provider', async () => {
+    getProviderMock.mockReturnValue(undefined);
+
+    handleWebCommand({ type: 'transport.list_models', agentType: 'claude-code-sdk', requestId: 'passive-claude-models' }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).type === 'transport.models_response'
+        && (call[0] as Record<string, unknown>).requestId === 'passive-claude-models'
+    )));
+
+    expect(ensureProviderConnectedMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'transport.models_response',
+      agentType: 'claude-code-sdk',
+      requestId: 'passive-claude-models',
+      defaultModel: DEFAULT_CLAUDE_CODE_MODEL_ID,
+      models: expect.arrayContaining([expect.objectContaining({ id: 'opus[1M]' })]),
     }));
   });
 

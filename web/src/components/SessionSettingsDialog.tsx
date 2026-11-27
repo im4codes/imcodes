@@ -54,7 +54,7 @@ import {
 import {
   type SessionSettingsOpenIntent,
 } from '../session-settings-open-intent.js';
-import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
+import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, DEFAULT_CLAUDE_CODE_MODEL_ID, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { SessionIdentityTabs } from './SessionIdentityTabs.js';
 import { dispatchSessionModelSwitch } from '../session-model-switch.js';
@@ -573,7 +573,7 @@ export function SessionSettingsDialog({
   }, [sessionName, subSessionId, type]);
 
   const providerDefaultModel = (nextType: string): string | null => {
-    if (nextType === 'claude-code') return CLAUDE_CODE_MODEL_IDS[0] ?? null;
+    if (nextType === 'claude-code') return DEFAULT_CLAUDE_CODE_MODEL_ID;
     if (nextType === 'codex') return CODEX_MODEL_IDS[0] ?? null;
     if (nextType === 'qwen') return getKnownQwenModelOptions()[0]?.id ?? null;
     const catalog = readCachedTransportModels(`${sessionName.trim()}\0${nextType}\0`, nextType);

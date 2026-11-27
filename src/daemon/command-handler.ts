@@ -276,7 +276,7 @@ import {
   collectRecentSummarySyncCandidates,
   fingerprintRecentSummary,
 } from '../context/summary-sync.js';
-import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, looksLikeCodexModelId, MUSE_MODEL_IDS, normalizeClaudeCodeModelId, selectLatestCodexSolModel } from '../shared/models/options.js';
+import { AGY_MODEL_IDS, CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, DEFAULT_CLAUDE_CODE_MODEL_ID, looksLikeCodexModelId, MUSE_MODEL_IDS, normalizeClaudeCodeModelId, selectLatestCodexSolModel } from '../shared/models/options.js';
 import type { TransportSessionRuntime } from '../agent/transport-session-runtime.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
@@ -13475,7 +13475,9 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
   if (isClaudeCodeSdkAgentType(agentType)) {
     return {
       models: modelIdsToTransportModels(CLAUDE_CODE_MODEL_IDS),
-      defaultModel: CLAUDE_CODE_MODEL_IDS[0],
+      defaultModel: CLAUDE_CODE_MODEL_IDS.includes(DEFAULT_CLAUDE_CODE_MODEL_ID)
+        ? DEFAULT_CLAUDE_CODE_MODEL_ID
+        : CLAUDE_CODE_MODEL_IDS[0],
     };
   }
   if (agentType === 'qwen') {

@@ -8,6 +8,7 @@ import { render, screen, fireEvent, cleanup, waitFor, act, within } from '@testi
 import {
   CLAUDE_CODE_MODEL_IDS,
   CODEX_MODEL_IDS,
+  DEFAULT_CLAUDE_CODE_MODEL_ID,
 } from '../../../src/shared/models/options.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 import { __clearTransportModelCacheForTests } from '../../src/hooks/useTransportModels.js';
@@ -2203,7 +2204,7 @@ describe('SessionSettingsDialog supervision', () => {
 
     // Selected model must have been reset to a Claude default (not a stale Codex model)
     await waitFor(() => {
-      expect(CLAUDE_CODE_MODEL_IDS.includes(modelSelect.value as typeof CLAUDE_CODE_MODEL_IDS[number])).toBe(true);
+      expect(modelSelect.value).toBe(DEFAULT_CLAUDE_CODE_MODEL_ID);
     });
 
     // A provider switch is committed by Save, not a separate /model command.
@@ -2211,7 +2212,32 @@ describe('SessionSettingsDialog supervision', () => {
     expect((applyButton as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
     await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
-      agentType: 'claude-code-sdk', requestedModel: CLAUDE_CODE_MODEL_IDS[0], activeModel: null,
+      agentType: 'claude-code-sdk', requestedModel: DEFAULT_CLAUDE_CODE_MODEL_ID, activeModel: null,
+    }));
+    expect(ws.sendSessionMessage).not.toHaveBeenCalled();
+  });
+
+  it('resets model to DEFAULT_CLAUDE_CODE_MODEL_ID when switching provider to claude-code CLI', async () => {
+    const ws = makeIdentityAckWs();
+    const onClose = vi.fn();
+    render(<SessionSettingsDialog
+      serverId="srv-1" sessionName="deck_proj_brain"
+      label="Brain" description="" cwd="/proj" type="codex-sdk"
+      activeModel={CODEX_MODEL_IDS[0]} requestedModel={CODEX_MODEL_IDS[0]} modelDisplay={CODEX_MODEL_IDS[0]}
+      transportConfig={null} surface="session" ws={ws as any} onClose={onClose}
+    />);
+
+    const typeSelect = screen.getByTestId('session-agent-type') as HTMLSelectElement;
+    changeSelect(typeSelect, 'claude-code');
+
+    const modelSelect = screen.getByLabelText('label') as HTMLSelectElement;
+    await waitFor(() => {
+      expect(modelSelect.value).toBe(DEFAULT_CLAUDE_CODE_MODEL_ID);
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
+      agentType: 'claude-code', requestedModel: DEFAULT_CLAUDE_CODE_MODEL_ID, activeModel: null,
     }));
     expect(ws.sendSessionMessage).not.toHaveBeenCalled();
   });
