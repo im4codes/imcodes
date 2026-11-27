@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -452,17 +452,20 @@ describe('CursorHeadlessProvider', () => {
       expect(spawned.args.slice(0, 2)).toEqual(['--use-system-ca', fakeIndex]);
       expect(spawned.args.slice(-2)).toEqual(['--', 'hello windows']);
 
-      // Official .cmd -> .ps1 delegation with staged .new preserves system powershell.exe + -File argv,
-      // and broken explicit-missing-node.cmd falls through cleanly to downstream agent.exe.
+      // Official .cmd -> .ps1 delegation runs fixed `--version` via system powershell.exe to promote `.new`,
+      // then re-resolves direct bundled node.exe + index.js so create-chat/send pass prompts via native argv.
       const psDir = join(tmpRoot, 'official-ps');
       const psVerOld = join(psDir, 'versions', '2026.05.05-a1b2c3d');
-      const psVerNew = join(psDir, 'versions', '2026.11.22-e9042b2.new');
+      const psVerNewStaged = join(psDir, 'versions', '2026.11.22-e9042b2.new');
+      const psVerNewPromoted = join(psDir, 'versions', '2026.11.22-e9042b2');
+      const promotedNode = join(psVerNewPromoted, 'node.exe');
+      const promotedIndex = join(psVerNewPromoted, 'index.js');
       mkdirSync(psVerOld, { recursive: true });
-      mkdirSync(psVerNew, { recursive: true });
-      writeFileSync(join(psVerOld, 'node.exe'), 'node');
+      mkdirSync(psVerNewStaged, { recursive: true });
+      writeFileSync(join(psVerOld, 'node.exe'), 'old node');
       writeFileSync(join(psVerOld, 'index.js'), 'ok');
-      writeFileSync(join(psVerNew, 'node.exe'), 'node');
-      writeFileSync(join(psVerNew, 'index.js'), 'ok');
+      writeFileSync(join(psVerNewStaged, 'node.exe'), 'new node');
+      writeFileSync(join(psVerNewStaged, 'index.js'), 'ok');
       writeFileSync(join(psDir, 'versions', 'promote-staged.cmd'), '@echo off\r\nexit /b 0\r\n');
       const ps1File = join(psDir, 'cursor-agent.ps1');
       writeFileSync(ps1File, [
@@ -486,19 +489,123 @@ describe('CursorHeadlessProvider', () => {
       writeFileSync(join(brokenNodeDir, 'index.js'), 'console.log("x");\n');
       writeFileSync(join(brokenNodeDir, 'cursor-agent.cmd'), '"%~dp0missing\\node.exe" "%~dp0index.js" %*\r\n');
 
+      const expectedPsExe = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+      const psExecCalls: Array<{ file: string; args: string[] }> = [];
+      cursorHeadlessRuntimeHooks.loadChildProcess = async () => ({
+        execFile: vi.fn((file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+          psExecCalls.push({ file, args });
+          if (args.includes('--version')) {
+            // Simulate official powershell.exe promote hook moving `.new` -> active directory
+            if (file === expectedPsExe) {
+              renameSync(psVerNewStaged, psVerNewPromoted);
+            }
+            cb(null, '2026.11.22-e9042b2\n', '');
+          } else if (args.includes('status')) cb(null, 'Logged in\n', '');
+          else if (args.includes('create-chat')) cb(null, 'cursor-chat-win\n', '');
+          else cb(null, '', '');
+          return { stdin: { end: vi.fn() } } as never;
+        }),
+        spawn: harness.spawn,
+      } as unknown as typeof import('node:child_process'));
+
       process.env.PATH = `${brokenNodeDir};${psDir}`;
-      execCalls.length = 0;
       const provider2 = new CursorHeadlessProvider();
       await provider2.connect({});
       const sid2 = await provider2.createSession({ sessionKey: 'route-win-ps1', cwd: tmpRoot });
-      await provider2.send(sid2, 'run via ps1 hook');
+      await provider2.send(sid2, 'run after promote without ps1 second hop');
 
-      const expectedPsExe = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
-      expect(execCalls.every((c) => c.file === expectedPsExe && c.args.slice(0, 4).join(' ') === `-NoProfile -ExecutionPolicy Bypass -File` && c.args[4] === ps1File)).toBe(true);
-      const psSpawn = harness.lastSpawn();
-      expect(psSpawn.file).toBe(expectedPsExe);
-      expect(psSpawn.args.slice(0, 5)).toEqual(['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1File]);
-      expect(psSpawn.args.slice(-2)).toEqual(['--', 'run via ps1 hook']);
+      // Version check used official PowerShell hook; subsequent create-chat + send invoked promoted node.exe directly
+      expect(psExecCalls[0]).toEqual({
+        file: expectedPsExe,
+        args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1File, '--version'],
+      });
+      expect(psExecCalls.slice(1).every((c) => c.file === promotedNode && c.args[0] === promotedIndex)).toBe(true);
+      const directSpawn = harness.lastSpawn();
+      expect(directSpawn.file).toBe(promotedNode);
+      expect(directSpawn.args[0]).toBe(promotedIndex);
+      expect(directSpawn.args.slice(-2)).toEqual(['--', 'run after promote without ps1 second hop']);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+      process.env.PATH = origPath;
+      if (origPathExt === undefined) delete process.env.PATHEXT;
+      else process.env.PATHEXT = origPathExt;
+      if (origLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = origLocalAppData;
+      if (origUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = origUserProfile;
+    }
+  });
+
+  it('delivers quoted spaces, JSON, multiline quotes, and trailing backslashes byte-for-byte to a real Node receiver via Windows direct launch', async () => {
+    const origPlatform = process.platform;
+    const origPath = process.env.PATH;
+    const origPathExt = process.env.PATHEXT;
+    const origLocalAppData = process.env.LOCALAPPDATA;
+    const origUserProfile = process.env.USERPROFILE;
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'cursor-real-argv-'));
+    tempDirs.push(tmpRoot);
+
+    try {
+      const cmdDir = join(tmpRoot, 'cmd-bin');
+      mkdirSync(cmdDir, { recursive: true });
+      const receiverJs = join(tmpRoot, 'receiver.mjs');
+      // Real Node entrypoint: prints received argv after `--` inside result.success
+      writeFileSync(receiverJs, [
+        'const sep = process.argv.indexOf("--");',
+        'const wsIdx = process.argv.indexOf("--workspace");',
+        'const receivedPrompt = sep >= 0 ? process.argv[sep + 1] : null;',
+        'const receivedWs = wsIdx >= 0 ? process.argv[wsIdx + 1] : null;',
+        'if (process.argv.includes("--version")) { console.log("2026.11.22-e9042b2"); process.exit(0); }',
+        'if (process.argv.includes("status")) { console.log("Logged in"); process.exit(0); }',
+        'if (process.argv.includes("create-chat")) { console.log("chat-real-1"); process.exit(0); }',
+        'console.log(JSON.stringify({ type: "system", subtype: "init", session_id: "chat-real-1" }));',
+        'console.log(JSON.stringify({ type: "result", subtype: "success", session_id: "chat-real-1", result: JSON.stringify({ prompt: receivedPrompt, workspace: receivedWs }) }));',
+      ].join('\n'));
+
+      const wrapperCmd = join(cmdDir, 'cursor-agent.cmd');
+      writeFileSync(wrapperCmd, `"${process.execPath}" "${receiverJs}" %*\r\n`);
+
+      // Switch to real child_process with platform='win32' resolution
+      const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      cursorHeadlessRuntimeHooks.loadChildProcess = async () => realCp;
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      process.env.PATH = cmdDir;
+      process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+      process.env.LOCALAPPDATA = tmpRoot;
+      process.env.USERPROFILE = tmpRoot;
+
+      const provider = new CursorHeadlessProvider();
+      await provider.connect({ binaryPath: wrapperCmd });
+      const wsDir = join(tmpRoot, 'ws dir with spaces');
+      mkdirSync(wsDir, { recursive: true });
+      const sessionId = await provider.createSession({ sessionKey: 'route-real-argv', cwd: wsDir, resumeId: 'chat-real-1' });
+
+      const adversarialPrompts = [
+        'say "hello world" and \'single quotes\'',
+        '{"key":"val with spaces","nested":{"n":1},"arr":["a","b"]}',
+        'line 1 "quoted"\nline 2 "more \\"escaped\\""\n{"ok":true}',
+        'C:\\dir with spaces\\sub\\',
+      ];
+
+      const results: string[] = [];
+      provider.onComplete((_sid, msg) => results.push(msg.content));
+      for (const prompt of adversarialPrompts) {
+        const donePromise = new Promise<void>((resolve) => {
+          const prevLen = results.length;
+          const poll = setInterval(() => {
+            if (results.length > prevLen) {
+              clearInterval(poll);
+              resolve();
+            }
+          }, 10);
+        });
+        await provider.send(sessionId, prompt);
+        await donePromise;
+      }
+
+      expect(results.map((r) => JSON.parse(r))).toEqual(
+        adversarialPrompts.map((prompt) => ({ prompt, workspace: wsDir })),
+      );
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });
       process.env.PATH = origPath;

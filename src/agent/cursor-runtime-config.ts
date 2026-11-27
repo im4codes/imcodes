@@ -1,5 +1,9 @@
 import * as childProcess from 'node:child_process';
-import { resolveCursorExecutableForSpawn, resolveCursorPathForSdk } from './transport-paths.js';
+import {
+  hasPendingCursorStagedUpdate,
+  resolveCursorLaunchPlan,
+  resolveCursorPathForSdk,
+} from './transport-paths.js';
 import logger from '../util/logger.js';
 
 const CURSOR_BIN = 'cursor-agent';
@@ -127,7 +131,16 @@ export async function getCursorRuntimeConfig(options: CursorRuntimeConfigOptions
   if (inFlightProbe) return inFlightProbe;
   inFlightProbe = (async () => {
     try {
-      const resolved = resolveCursorExecutableForSpawn(resolveCursorPathForSdk(CURSOR_BIN));
+      let plan = resolveCursorLaunchPlan(resolveCursorPathForSdk(CURSOR_BIN));
+      if (hasPendingCursorStagedUpdate(plan) && plan.promoteStep) {
+        try {
+          await execFileStdout(plan.promoteStep.executable, [...plan.promoteStep.prependArgs, '--version']);
+          plan = resolveCursorLaunchPlan(resolveCursorPathForSdk(CURSOR_BIN));
+        } catch (err) {
+          logger.debug({ err }, 'cursor-agent staged promote step failed during runtime config probe');
+        }
+      }
+      const resolved = plan.direct;
       let modelsOut = '';
       try {
         modelsOut = await execFileStdout(resolved.executable, [...resolved.prependArgs, '--list-models']);

@@ -21,6 +21,8 @@ vi.mock('../../src/util/logger.js', () => ({
 // Stabilize the transport-paths resolution so tests don't depend on PATH lookups.
 vi.mock('../../src/agent/transport-paths.js', () => ({
   resolveCursorPathForSdk: (bin = 'cursor-agent') => bin,
+  resolveCursorLaunchPlan: (bin = 'cursor-agent') => ({ direct: { executable: bin, prependArgs: [] } }),
+  hasPendingCursorStagedUpdate: () => false,
   resolveCursorExecutableForSpawn: (bin = 'cursor-agent') => ({ executable: bin, prependArgs: [] }),
   resolveExecutableForSpawn: (bin: string) => ({ executable: bin, prependArgs: [] }),
 }));

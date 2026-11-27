@@ -13,6 +13,8 @@ import {
   resolveCursorPathForSdk,
   resolveCursorExecutableForSpawn,
   resolveCursorCmdLauncher,
+  resolveCursorLaunchPlan,
+  hasPendingCursorStagedUpdate,
 } from '../../src/agent/transport-paths.js';
 
 describe('normalizeTransportCwd', () => {
@@ -254,15 +256,24 @@ describe('resolveCursorPathForSdk (cursor-agent and agent resolution)', () => {
       process.env.LOCALAPPDATA = tmpDir;
       process.env.USERPROFILE = tmpDir;
 
-      // Skips dir1 POSIX cursor-agent + broken cursor-agent.cmd, picks dir2 official agent.cmd -> powershell.exe -File cursor-agent.ps1
-      const expectedPsSpec = {
+      // Skips dir1 POSIX cursor-agent + broken cursor-agent.cmd, picks dir2 official agent.cmd:
+      // launchPlan preserves powershell.exe -File cursor-agent.ps1 for promoteStep while direct runs bundled node.exe + index.js
+      const expectedPsPromote = {
         executable: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
         prependArgs: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', agentPs1],
       };
       expect(resolveCursorPathForSdk('cursor-agent')).toBe(agentCmd);
-      expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual(expectedPsSpec);
+      expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual({
+        executable: newNode,
+        prependArgs: [newIndex],
+      });
+      const initialPlan = resolveCursorLaunchPlan('cursor-agent');
+      expect(initialPlan.direct).toEqual({ executable: newNode, prependArgs: [newIndex] });
+      expect(initialPlan.promoteStep).toEqual(expectedPsPromote);
+      expect(hasPendingCursorStagedUpdate(initialPlan)).toBe(false);
 
-      // When installer staged 2026.11.new alongside 2026.05 with promote-staged hook, official PowerShell entrypoint is preserved
+      // When installer staged 2026.12.new alongside existing versions with promote-staged hook,
+      // hasPendingCursorStagedUpdate triggers while official PowerShell promoteStep + direct fallback stay grounded.
       const stagedNewDir = path.join(goodDir, 'versions', '2026.12.01-f1e2d3c.new');
       fs.mkdirSync(stagedNewDir, { recursive: true });
       fs.writeFileSync(path.join(stagedNewDir, 'node.exe'), 'staged node');
@@ -275,7 +286,9 @@ describe('resolveCursorPathForSdk (cursor-agent and agent resolution)', () => {
         fs.readFileSync(agentPs1, 'utf8'),
       ].join('\n');
       fs.writeFileSync(agentPs1, ps1WithHook);
-      expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual(expectedPsSpec);
+      const stagedPlan = resolveCursorLaunchPlan('cursor-agent');
+      expect(stagedPlan.promoteStep).toEqual(expectedPsPromote);
+      expect(hasPendingCursorStagedUpdate(stagedPlan)).toBe(true);
 
       // Even if active.txt points to a missing version, static .ps1 launchability fails closed -> bad wrapper rejected
       const activeTxt = path.join(goodDir, 'versions', 'active.txt');

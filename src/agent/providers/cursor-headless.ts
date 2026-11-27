@@ -34,9 +34,11 @@ import type { TransportAttachment } from '../../../shared/transport-attachments.
 import logger from '../../util/logger.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import {
+  hasPendingCursorStagedUpdate,
   normalizeTransportCwd,
-  resolveCursorExecutableForSpawn,
+  resolveCursorLaunchPlan,
   resolveCursorPathForSdk,
+  type ResolvedExecutable,
 } from '../transport-paths.js';
 import {
   parseCursorStreamLine,
@@ -186,10 +188,11 @@ export class CursorHeadlessProvider implements TransportProvider {
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
-    const resolved = resolveCursorExecutableForSpawn(this.resolveBinaryPath(config));
+    const plan = resolveCursorLaunchPlan(this.resolveBinaryPath(config));
+    const versionRunner = plan.promoteStep ?? plan.direct;
     let versionOutput = '';
     try {
-      const versionProbe = await this.runExecFile(resolved.executable, [...resolved.prependArgs, '--version'], {
+      const versionProbe = await this.runExecFile(versionRunner.executable, [...versionRunner.prependArgs, '--version'], {
         windowsHide: true,
         timeout: CONNECT_PROBE_TIMEOUT_MS,
       });
@@ -217,6 +220,9 @@ export class CursorHeadlessProvider implements TransportProvider {
         },
       );
     }
+    const resolved = plan.promoteStep
+      ? resolveCursorLaunchPlan(this.resolveBinaryPath(config)).direct
+      : plan.direct;
     try {
       const { stdout, stderr } = await this.runExecFile(resolved.executable, [...resolved.prependArgs, 'status'], {
         windowsHide: true,
@@ -468,7 +474,7 @@ export class CursorHeadlessProvider implements TransportProvider {
     const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
     const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
     const prompt = this.composePrompt(payload, includeSessionSystemText);
-    const resolved = resolveCursorExecutableForSpawn(this.resolveBinaryPath(this.config));
+    const resolved = await this.resolveDirectExecutableWithStagedPromote();
     const resumeId = await this.ensureResumeId(state, resolved);
     const args = [
       ...resolved.prependArgs,
@@ -782,6 +788,26 @@ export class CursorHeadlessProvider implements TransportProvider {
     return resolveCursorPathForSdk(CURSOR_BIN);
   }
 
+  private async resolveDirectExecutableWithStagedPromote(): Promise<ResolvedExecutable> {
+    let plan = resolveCursorLaunchPlan(this.resolveBinaryPath(this.config));
+    if (hasPendingCursorStagedUpdate(plan) && plan.promoteStep) {
+      try {
+        await this.runExecFile(plan.promoteStep.executable, [...plan.promoteStep.prependArgs, '--version'], {
+          windowsHide: true,
+          timeout: CONNECT_PROBE_TIMEOUT_MS,
+          env: {
+            ...process.env,
+            ...toProcessEnv(this.config?.env),
+          },
+        });
+        plan = resolveCursorLaunchPlan(this.resolveBinaryPath(this.config));
+      } catch (err) {
+        logger.debug({ err }, 'Cursor staged launcher promote check failed; continuing with active entrypoint');
+      }
+    }
+    return plan.direct;
+  }
+
   private resolveDefaultModel(): string | undefined {
     return normalizeCursorModelId(this.config?.agentId);
   }
@@ -816,7 +842,7 @@ export class CursorHeadlessProvider implements TransportProvider {
   }
 
   private async createRemoteChat(config: SessionConfig, model?: string): Promise<string> {
-    const resolved = resolveCursorExecutableForSpawn(this.resolveBinaryPath(this.config));
+    const resolved = await this.resolveDirectExecutableWithStagedPromote();
     const { stdout, stderr } = await this.runExecFile(resolved.executable, [...resolved.prependArgs, 'create-chat'], {
       windowsHide: true,
       timeout: CONNECT_PROBE_TIMEOUT_MS,

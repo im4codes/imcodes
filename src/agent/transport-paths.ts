@@ -769,14 +769,34 @@ function isBatchForwardArgsToken(token: string): boolean {
   return /^%(?:\*|~?[0-9]+)$/i.test(token);
 }
 
-/** Resolve ONLY Cursor-specific Windows `.cmd`/`.bat` wrappers cleanly.
+export interface CursorWindowsLaunchPlan {
+  /** Direct Node/binary entrypoint to spawn with user prompts and arbitrary argv (zero PowerShell second hop). */
+  direct: ResolvedExecutable;
+  /** Official wrapper invocation (e.g. `powershell.exe -File cursor-agent.ps1`) used ONLY with
+   *  trusted fixed args such as `--version` to execute staged `.new` promotion before re-resolving `direct`. */
+  promoteStep?: ResolvedExecutable;
+  /** Versions directory where staged `.new` updates live, if applicable. */
+  stagedVersionsDir?: string;
+}
+
+export function hasPendingCursorStagedUpdate(plan: CursorWindowsLaunchPlan): boolean {
+  if (!plan.promoteStep || !plan.stagedVersionsDir) return false;
+  try {
+    const entries = readdirSync(plan.stagedVersionsDir, { withFileTypes: true });
+    return entries.some((entry) => entry.isDirectory() && entry.name.endsWith('.new'));
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve ONLY Cursor-specific Windows `.cmd`/`.bat` wrappers into `{ direct, promoteStep }`.
  *  Never guesses arbitrary `versions/` folders for unrecognized `.cmd` files,
  *  and never alters shared non-Cursor provider `resolveExecutableForSpawn()` paths. */
-export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedExecutable | null {
+export function resolveCursorCmdLauncherPlan(cmdPath: string, depth = 0): CursorWindowsLaunchPlan | null {
   if (depth > 3) return null;
   const npmScript = parseNpmCmdShim(cmdPath);
   if (npmScript && isRegularFileSync(npmScript)) {
-    return { executable: process.execPath, prependArgs: [npmScript] };
+    return { direct: { executable: process.execPath, prependArgs: [npmScript] } };
   }
   let content: string;
   try {
@@ -848,20 +868,25 @@ export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedEx
     const headBase = baseNameSmart(headRaw).toLowerCase();
 
     // Case A: official Cursor `.cmd` delegating to `%SystemRoot%\...\powershell.exe ... -File "<ps1>" %*`
-    // Preserve the system powershell.exe + `-File <ps1>` entrypoint so the installer's staged
-    // promote hook and `.ps1` active-version selection execute at spawn time while keeping argv array passing.
+    // Use powershell.exe ONLY as `promoteStep` with trusted fixed `--version` when staged `.new` updates exist,
+    // while `direct` invokes the resolved bundled node.exe + index.js directly via native Win32 argv.
     if (headBase === 'powershell.exe' || headBase === 'powershell') {
       const fileFlagIdx = cmdTokens.findIndex((t) => /^-file$/i.test(t));
       const ps1TokenIdx = fileFlagIdx >= 0 ? fileFlagIdx + 1 : cmdTokens.findIndex((t) => /\.ps1$/i.test(t));
       const ps1Raw = ps1TokenIdx >= 0 ? cmdTokens[ps1TokenIdx] : undefined;
       if (ps1Raw) {
         const ps1Path = normalizeBatchPath(ps1Raw);
-        if (isRegularFileSync(ps1Path) && resolveCursorPs1Launcher(ps1Path)) {
+        const direct = isRegularFileSync(ps1Path) ? resolveCursorPs1Launcher(ps1Path) : null;
+        if (direct) {
           const powershellExe = headRaw.includes('/') || headRaw.includes('\\')
             ? path.win32.normalize(headRaw)
             : headRaw;
           const psArgs = cmdTokens.slice(1).map((tok, i) => (i + 1 === ps1TokenIdx ? ps1Path : tok));
-          return { executable: powershellExe, prependArgs: psArgs };
+          return {
+            direct,
+            promoteStep: { executable: powershellExe, prependArgs: psArgs },
+            stagedVersionsDir: joinSmart(dirnameSmart(ps1Path), 'versions'),
+          };
         }
       }
       continue;
@@ -880,7 +905,7 @@ export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedEx
           }
           const nodeExe = hasExplicitDir ? explicitNode : process.execPath;
           const fixedArgs = cmdTokens.slice(1, scriptIdx);
-          return { executable: nodeExe, prependArgs: [...fixedArgs, scriptPath] };
+          return { direct: { executable: nodeExe, prependArgs: [...fixedArgs, scriptPath] } };
         }
       }
       continue;
@@ -890,7 +915,7 @@ export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedEx
     if (/\.exe$/i.test(headRaw) && headBase !== 'cmd.exe') {
       const exePath = normalizeBatchPath(headRaw);
       if (isRegularFileSync(exePath)) {
-        return { executable: exePath, prependArgs: cmdTokens.slice(1) };
+        return { direct: { executable: exePath, prependArgs: cmdTokens.slice(1) } };
       }
       continue;
     }
@@ -899,8 +924,14 @@ export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedEx
     if (/^call$/i.test(headBase) && cmdTokens[1] && /\.(?:cmd|bat)$/i.test(cmdTokens[1])) {
       const nestedCmd = normalizeBatchPath(cmdTokens[1]);
       if (nestedCmd.toLowerCase() !== cmdPath.toLowerCase() && isRegularFileSync(nestedCmd)) {
-        const nested = resolveCursorCmdLauncher(nestedCmd, depth + 1);
-        if (nested) return { executable: nested.executable, prependArgs: [...nested.prependArgs, ...cmdTokens.slice(2)] };
+        const nested = resolveCursorCmdLauncherPlan(nestedCmd, depth + 1);
+        if (nested) {
+          return {
+            direct: { executable: nested.direct.executable, prependArgs: [...nested.direct.prependArgs, ...cmdTokens.slice(2)] },
+            ...(nested.promoteStep ? { promoteStep: nested.promoteStep } : {}),
+            ...(nested.stagedVersionsDir ? { stagedVersionsDir: nested.stagedVersionsDir } : {}),
+          };
+        }
       }
     }
   }
@@ -908,33 +939,37 @@ export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedEx
   return null;
 }
 
-function resolveCursorExplicitWindowsTarget(target: string): ResolvedExecutable | null {
+export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedExecutable | null {
+  return resolveCursorCmdLauncherPlan(cmdPath, depth)?.direct ?? null;
+}
+
+function resolveCursorExplicitWindowsPlan(target: string): CursorWindowsLaunchPlan | null {
   const trimmed = target.trim();
   if (!trimmed) return null;
   if (/\.(exe|com)$/i.test(trimmed)) {
-    return isRegularFileSync(trimmed) ? { executable: trimmed, prependArgs: [] } : null;
+    return isRegularFileSync(trimmed) ? { direct: { executable: trimmed, prependArgs: [] } } : null;
   }
   if (/\.(?:js|mjs|cjs)$/i.test(trimmed)) {
-    return isRegularFileSync(trimmed) ? { executable: process.execPath, prependArgs: [trimmed] } : null;
+    return isRegularFileSync(trimmed) ? { direct: { executable: process.execPath, prependArgs: [trimmed] } } : null;
   }
   if (/\.(cmd|bat)$/i.test(trimmed)) {
-    return resolveCursorCmdLauncher(trimmed);
+    return resolveCursorCmdLauncherPlan(trimmed);
   }
   return null;
 }
 
-/** Resolve Cursor Agent to a directly-launchable `(executable, prependArgs)` spec.
- *  Matches `probeCursorHeadless()` candidate order and rejects non-executable/unlaunchable wrappers. */
-export function resolveCursorExecutableForSpawn(nameOrPath = 'cursor-agent'): ResolvedExecutable {
+/** Resolve Cursor Agent into a launch plan: `direct` (native binary/Node entrypoint for safe argv prompt delivery)
+ *  and optional `promoteStep` (official PowerShell wrapper for fixed `--version` / staged `.new` promotion). */
+export function resolveCursorLaunchPlan(nameOrPath = 'cursor-agent'): CursorWindowsLaunchPlan {
   const trimmed = nameOrPath.trim();
   if (process.platform !== 'win32') {
-    return { executable: trimmed || 'cursor-agent', prependArgs: [] };
+    return { direct: { executable: trimmed || 'cursor-agent', prependArgs: [] } };
   }
 
   if (trimmed && (isAbsoluteSmart(trimmed) || hasPathSeparator(trimmed))) {
-    const explicitResolved = resolveCursorExplicitWindowsTarget(trimmed);
-    if (explicitResolved) return explicitResolved;
-    return { executable: trimmed, prependArgs: [] };
+    const explicitPlan = resolveCursorExplicitWindowsPlan(trimmed);
+    if (explicitPlan) return explicitPlan;
+    return { direct: { executable: trimmed, prependArgs: [] } };
   }
 
   const exts = getSupportedCursorWindowsExts(process.env.PATHEXT);
@@ -946,20 +981,25 @@ export function resolveCursorExecutableForSpawn(nameOrPath = 'cursor-agent'): Re
     for (const dir of uniqueNonEmpty(searchDirs)) {
       for (const candidate of listWindowsCandidateFilesInDir(dir, bin, exts)) {
         if (/\.(exe|com)$/i.test(candidate)) {
-          return { executable: candidate, prependArgs: [] };
+          return { direct: { executable: candidate, prependArgs: [] } };
         }
         if (/\.(?:js|mjs|cjs)$/i.test(candidate)) {
-          return { executable: process.execPath, prependArgs: [candidate] };
+          return { direct: { executable: process.execPath, prependArgs: [candidate] } };
         }
         if (/\.(cmd|bat)$/i.test(candidate)) {
-          const unwrapped = resolveCursorCmdLauncher(candidate);
-          if (unwrapped) return unwrapped;
+          const plan = resolveCursorCmdLauncherPlan(candidate);
+          if (plan) return plan;
         }
       }
     }
   }
 
-  return { executable: trimmed || 'cursor-agent', prependArgs: [] };
+  return { direct: { executable: trimmed || 'cursor-agent', prependArgs: [] } };
+}
+
+/** Resolve Cursor Agent to a directly-launchable `(executable, prependArgs)` spec (always `direct`, never PowerShell). */
+export function resolveCursorExecutableForSpawn(nameOrPath = 'cursor-agent'): ResolvedExecutable {
+  return resolveCursorLaunchPlan(nameOrPath).direct;
 }
 
 /** Resolve a CLI path/entry for Cursor Agent (`cursor-agent` or `agent`).
