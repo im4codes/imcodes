@@ -40,6 +40,7 @@ vi.mock('../../src/hooks/usePref.js', () => ({
 
 import { ChatView } from '../../src/components/ChatView.js';
 import type { TimelineEvent } from '../../src/ws-client.js';
+import { __resetMessagePinNavigationForTests, requestMessagePinNavigation } from '../../src/message-pin-navigation.js';
 
 const resizeCallbacks: ResizeObserverCallback[] = [];
 class FakeResizeObserver {
@@ -98,6 +99,8 @@ async function mountSwitchHarness(initialProps: {
   events: TimelineEvent[];
   initialScrollHeight?: number;
   initialClientHeight?: number;
+  messagePinsEnabled?: boolean;
+  onLoadMessageContext?: (eventId: string, ts?: number) => Promise<boolean>;
 }) {
   let currentProps = { ...initialProps };
   let scrollBottomFn: ScrollBottomDelegate | null = null;
@@ -109,6 +112,8 @@ async function mountSwitchHarness(initialProps: {
       serverId={currentProps.serverId}
       sessionId={currentProps.sessionId}
       visible={currentProps.visible}
+      messagePinsEnabled={currentProps.messagePinsEnabled}
+      onLoadMessageContext={currentProps.onLoadMessageContext}
       onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
     />,
   );
@@ -160,6 +165,8 @@ async function mountSwitchHarness(initialProps: {
           serverId={currentProps.serverId}
           sessionId={currentProps.sessionId}
           visible={currentProps.visible}
+          messagePinsEnabled={currentProps.messagePinsEnabled}
+          onLoadMessageContext={currentProps.onLoadMessageContext}
           onScrollBottomFn={(fn) => { scrollBottomFn = fn; }}
         />,
       );
@@ -176,6 +183,7 @@ describe('ChatView — switch bottom-pin guarantees', () => {
   });
 
   afterEach(() => {
+    __resetMessagePinNavigationForTests();
     cleanup();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
@@ -248,7 +256,18 @@ describe('ChatView — switch bottom-pin guarantees', () => {
     await waitFor(() => expect(chat.scrollTop).toBe(2400));
     expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
 
-    // Arriving message after multi-step expansion must still auto-follow with zero `[↓ 1]`.
+    // Negative scrollTop displacement during passive layout shift (e.g., shorter intermediate layout
+    // clamped scrollTop down, then backfilled to a taller scrollHeight without user scroll intent).
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    chat.setGeometry({ scrollHeight: 1600, scrollTop: 1400 });
+    fireEvent.scroll(chat.scrollEl);
+    await chat.drainFrames();
+    chat.setGeometry({ scrollHeight: 2600, scrollTop: 1100 });
+    fireEvent.scroll(chat.scrollEl);
+    await waitFor(() => expect(chat.scrollTop).toBe(2400));
+    expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
+
+    // Arriving message after multi-step + negative-clamped expansion must still auto-follow with zero `[↓ 1]`.
     chat.setGeometry({ scrollHeight: 2900 });
     await chat.updateProps({
       events: [...baseEvents, assistantEvent('m-3', 'new message', 3000)],
@@ -261,6 +280,60 @@ describe('ChatView — switch bottom-pin guarantees', () => {
     chat.setGeometry({ scrollTop: 2100 });
     fireEvent.scroll(chat.scrollEl);
     expect(chat.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+  });
+
+  it('does not let queued passive settle or subsequent virtual measurement override an in-pane pin locate', async () => {
+    const items: TimelineEvent[] = Array.from({ length: 120 }, (_, i) => (
+      i % 2 === 0
+        ? userEvent(`p-${i}`, `prompt ${i}`, 1000 + i * 10)
+        : assistantEvent(`p-${i}`, `answer ${i}`, 1000 + i * 10)
+    ));
+    const chat = await mountSwitchHarness({
+      serverId: 'srv-1',
+      sessionId: 'deck_pin_race',
+      visible: true,
+      events: items,
+      initialScrollHeight: 2200,
+      initialClientHeight: 200,
+      messagePinsEnabled: true,
+      onLoadMessageContext: () => new Promise(() => {}),
+    });
+    expect(chat.scrollTop).toBe(2000);
+
+    // Expire mount settle window, then simulate:
+    // 1) a passive layout repin / settle is queued (`scrollToBottom(false)` + passive delegate)
+    // 2) BEFORE that rAF executes, user clicks an in-pane pin to locate an off-screen message near 460px.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    chat.setGeometry({ scrollHeight: 2350 });
+    fireEvent.scroll(chat.scrollEl);
+    act(() => {
+      chat.setGeometry({ scrollTop: 460 });
+      requestMessagePinNavigation({
+        id: 'pin-race-1',
+        serverId: 'srv-1',
+        sessionName: 'deck_pin_race',
+        eventId: 'older-pinned-target',
+        eventTs: 500,
+        eventType: 'user.message',
+        text: 'older pinned prompt',
+        createdAt: 1,
+        updatedAt: 1,
+      });
+    });
+
+    // Queued settle frame + passive invoke MUST yield to pendingPinnedLocateIdRef (`460`, never `2150`).
+    act(() => { chat.invokeScrollBottom({ passive: true }); });
+    await chat.drainFrames();
+    expect(chat.scrollTop).toBe(460);
+
+    // Subsequent virtualizer row measurement + new content while pin anchor is still active
+    // must also preserve 460 and not snap to bottom.
+    const row = chat.container.querySelector('[data-virtual-key]') as HTMLElement | null;
+    expect(row).toBeTruthy();
+    chat.setGeometry({ scrollHeight: 2600 });
+    act(() => { fireResize([row!]); });
+    await chat.drainFrames();
+    expect(chat.scrollTop).toBe(460);
   });
 
   it('keeps virtualized >24-row chats pinned through A -> B -> C -> A switches, ResizeObserver row measurement, delayed catch-up, and img load', async () => {

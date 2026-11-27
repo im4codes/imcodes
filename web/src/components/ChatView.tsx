@@ -4337,6 +4337,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (pendingPinnedLocateIdRef.current === pin.id) return;
     pendingPinnedLocateIdRef.current = pin.id;
     pendingVisibleScrollToBottomRef.current = false;
+    pendingEngageFollowRef.current = false;
+    pendingGrowthRepinRef.current = false;
     setPinnedLocateError(false);
     setPendingPinnedLocate(pin);
   }, [sessionId]);
@@ -4447,6 +4449,9 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const hasInitialPinCompletedRef = useRef(false);
   const loadingRef = useRef(loading);
   loadingRef.current = loading;
+  // Mirror `loadingOlder` into a ref so mount-settle and passive-pin guards read the CURRENT value.
+  const loadingOlderRef = useRef(loadingOlder);
+  loadingOlderRef.current = loadingOlder;
   const lastVisibleTsRef = useRef(0);
   const visibleRef = useRef(visible);
   visibleRef.current = visible;
@@ -4467,6 +4472,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     Date.now() < userScrollUpUntilRef.current
     || Date.now() < userPointerOrKeyScrollUntilRef.current
     || pointerScrollActiveRef.current
+  );
+  const hasActiveScrollAnchorLock = () => Boolean(
+    pendingPinnedLocateIdRef.current
+    || loadingOlderRef.current
+    || scrollAnchorRef.current,
+  );
+  const canPassiveBottomFollow = () => (
+    autoScrollRef.current
+    && !isTouchInteracting()
+    && !hasActiveUserScrollIntent()
+    && !hasActiveScrollAnchorLock()
   );
 
   const pinScrollToBottomNow = (el: HTMLDivElement, clampToBottom = false) => {
@@ -4542,7 +4558,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       // is never snapped back down by a pin that was queued before they moved.
       const maxTop = Math.max(0, node.scrollHeight - node.clientHeight);
       if (!shouldEngage && !preview) {
-        if (!autoScrollRef.current || isTouchInteracting() || hasActiveUserScrollIntent()) return;
+        if (!canPassiveBottomFollow()) return;
         if (isVirtualizedChatRef.current && node.scrollTop >= maxTop - 1) return;
       }
       if (isVirtualizedChatRef.current && node.clientHeight > 0 && Math.abs(node.scrollTop - maxTop) <= 1) return;
@@ -4648,7 +4664,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       restoreReaderAnchor();
       return;
     }
-    if (isTouchInteracting() || hasActiveUserScrollIntent()) {
+    if (isTouchInteracting() || hasActiveUserScrollIntent() || hasActiveScrollAnchorLock()) {
       return;
     }
     if (!hasInitialPinCompletedRef.current) {
@@ -4701,7 +4717,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     // Force scroll to bottom on server/tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
     scheduleFollowFrame(() => {
-      if (hasActiveUserScrollIntent() || isTouchInteracting() || !autoScrollRef.current) return;
+      if (!canPassiveBottomFollow()) return;
       scrollToBottom(false);
     });
   }, [scrollScopeKey, scheduleFollowFrame]);
@@ -4763,17 +4779,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     onScrollBottomFn?.((opts?: { passive?: boolean }) => {
       if (!isMountedRef.current) return false;
       const engageFollow = opts?.passive !== true;
-      if (!engageFollow) {
-        if (
-          !autoScrollRef.current
-          || isTouchInteracting()
-          || hasActiveUserScrollIntent()
-          || pendingPinnedLocateIdRef.current
-          || loadingOlderRef.current
-          || scrollAnchorRef.current
-        ) {
-          return true;
-        }
+      if (!engageFollow && !preview && !canPassiveBottomFollow()) {
+        return true;
       }
       scrollToBottomRef.current(engageFollow);
       return true;
@@ -5101,7 +5108,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       // Pin synchronously before paint whenever initial content renders (both
       // pre-seeded and async-hydrated) so the first painted frame never sits
       // at scrollTop=0, and schedule a non-engaging rAF pass for post-paint settle.
-      if (autoScrollRef.current && !hasActiveUserScrollIntent() && !isTouchInteracting()) {
+      if (canPassiveBottomFollow()) {
         suppressLoadOlder();
         if (scrollRef.current) {
           pinScrollToBottomNow(scrollRef.current, true);
@@ -5143,6 +5150,10 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       layoutHandledVisibleTsRef.current = lastVisibleTs;
       return;
     }
+    if (!preview && hasActiveScrollAnchorLock()) {
+      layoutHandledVisibleTsRef.current = lastVisibleTs;
+      return;
+    }
     if (contentBecameVisible) {
       suppressLoadOlder();
     }
@@ -5154,6 +5165,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       && el.scrollHeight > el.clientHeight
       && !hasExplicitUserScrollUp
       && !isTouchInteracting()
+      && !hasActiveScrollAnchorLock()
       && el.scrollTop < Math.max(0, el.scrollHeight - el.clientHeight) - 1
       && (
         !hasInitialPinCompletedRef.current
@@ -5194,7 +5206,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       // Re-check inside the rAF callback so a state flip during the frame
       // window (e.g. a user scroll-up that lands between schedule and fire)
       // is honoured. Preview always follows by design.
-      if (preview || autoScrollRef.current) scrollToBottom(false);
+      if (preview || canPassiveBottomFollow()) scrollToBottom(false);
     });
   }, [lastVisibleTs, preview, scheduleFollowFrame]);
 
@@ -5211,14 +5223,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // Scroll auto-trigger for Load Older
   const lastLoadOlderAtRef = useRef(0);
   const LOAD_OLDER_COOLDOWN_MS = 1000;
-
-  // Mirror `loadingOlder` into a ref so the mount-settle interval can read the
-  // CURRENT value. Adding the prop to that effect's deps instead would restart
-  // the settle window every time a load-older starts or finishes, which is both
-  // wasteful and wrong (the window is meant to track the mount, not history
-  // fetches), and reading the captured prop would leave it permanently stale.
-  const loadingOlderRef = useRef(loadingOlder);
-  loadingOlderRef.current = loadingOlder;
 
   // Pause "stick to bottom" follow mode. Shared by handleScroll's distance
   // threshold and the explicit wheel/touch up-gesture handlers below.
@@ -5385,7 +5389,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const scrollTop = el.scrollTop;
     const scrollHeight = el.scrollHeight;
     const clientHeight = el.clientHeight;
-    const prevClientHeight = lastClientHeightRef.current > 0 ? lastClientHeightRef.current : clientHeight;
     const layoutGrew = scrollHeight > lastScrollHeightRef.current;
     const viewportShrank = lastClientHeightRef.current > 0 && clientHeight < lastClientHeightRef.current;
     const layoutChanged = layoutGrew || viewportShrank;
@@ -5406,15 +5409,14 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       lastClientHeightRef.current = clientHeight;
       return;
     }
+    const anchorLocked = hasActiveScrollAnchorLock();
     const awaitingInitialPin = !hasInitialPinCompletedRef.current
       || pendingEngageFollowRef.current
       || pendingScrollFrameRef.current !== null;
     const spuriousTopReset = wasAutoFollowing
       && !hasExplicitUserScrollUp
       && !touchBusy
-      && !pendingPinnedLocateIdRef.current
-      && !loadingOlderRef.current
-      && !scrollAnchorRef.current
+      && !anchorLocked
       && scrollHeight > clientHeight
       && (
         scrollTop === 0
@@ -5426,39 +5428,24 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         && scrollTop < 100
         && !hasExplicitUserScrollUp
         && !touchBusy
-        && !pendingPinnedLocateIdRef.current
-        && !loadingOlderRef.current
-        && !scrollAnchorRef.current
+        && !anchorLocked
         && awaitingInitialPin
       );
     // Before initial hydration/measurement finishes pinning, or when content growth /
     // virtualizer row measurement / viewport shrink shifts layout without user upward
-    // scroll intent (even when virtualizer/browser shifts scrollTop > 2px), keep
-    // following via a coalesced repin instead of misclassifying as a scroll-away.
-    // Unchanged geometry with explicit coordinate jump still disengages below.
-    const wasPinnedBeforeLayoutShift = lastScrollHeightRef.current > 0
-      && (lastScrollHeightRef.current - lastScrollTopRef.current - prevClientHeight) < 24
-      && scrollTop >= lastScrollTopRef.current - 2
-      && layoutChanged;
-    const passiveLayoutShift = scrollTop >= lastScrollTopRef.current - 2
-      && (
-        wasPinnedBeforeLayoutShift
-        || (layoutChanged && (wasAutoFollowing || pendingGrowthRepinRef.current || lastScrollHeightRef.current === 0))
-        || pendingGrowthRepinRef.current
-      );
+    // scroll intent (including browser clamping that lowers scrollTop before backfill),
+    // re-pin via coalesced frame instead of misclassifying as a scroll-away.
+    // Explicit coordinate jumps on unchanged geometry still disengage below.
+    const passiveLayoutShift = layoutChanged
+      || pendingGrowthRepinRef.current
+      || awaitingInitialPin;
     const hydrationGrowthLag = !preview
       && wasAutoFollowing
       && !hasExplicitUserScrollUp
       && !touchBusy
-      && !pendingPinnedLocateIdRef.current
-      && !loadingOlderRef.current
-      && !scrollAnchorRef.current
+      && !anchorLocked
       && distance > 1
-      && (
-        (awaitingInitialPin && scrollTop >= lastScrollTopRef.current)
-        || (scrollTop === 0 && lastScrollTopRef.current === 0 && scrollHeight > lastScrollHeightRef.current)
-        || passiveLayoutShift
-      );
+      && passiveLayoutShift;
     if (transientTopJump || hydrationGrowthLag) {
       lastScrollTopRef.current = scrollTop;
       lastScrollHeightRef.current = scrollHeight;
@@ -5466,7 +5453,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       setShowScrollBtn(false);
       pendingGrowthRepinRef.current = true;
       scheduleFollowFrame(() => {
-        if (!autoScrollRef.current || hasActiveUserScrollIntent() || isTouchInteracting()) {
+        if (!canPassiveBottomFollow()) {
           pendingGrowthRepinRef.current = false;
           return;
         }
@@ -6499,7 +6486,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             absorbTopShiftRef={absorbTopShiftRef}
             resetKey={scrollScopeKey || undefined}
             isFollowing={() => autoScrollRef.current}
-            canPassivePin={() => !isTouchInteracting() && !hasActiveUserScrollIntent()}
+            canPassivePin={() => !isTouchInteracting() && !hasActiveUserScrollIntent() && !hasActiveScrollAnchorLock()}
             onProgrammaticScroll={markProgrammaticScroll}
             onRowsRendered={() => { syncPinnedTargetRef.current?.(); }}
             onTopOffsetReconciled={() => { if (!autoScrollRef.current) captureReaderAnchor(); }}
