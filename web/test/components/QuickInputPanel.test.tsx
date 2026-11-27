@@ -993,6 +993,7 @@ describe('useQuickData persistence guard', () => {
 
     expect(apiFetchMock).toHaveBeenNthCalledWith(2, '/api/quick-data', {
       method: 'PUT',
+      signal: expect.any(AbortSignal),
       body: JSON.stringify({
         data: {
           history: [],
@@ -1048,7 +1049,7 @@ describe('useQuickData persistence guard', () => {
 
     expect(screen.getByTestId('commands').textContent).toBe('/custom');
     expect(apiFetchMock).toHaveBeenCalledTimes(1);
-    expect(apiFetchMock).toHaveBeenCalledWith('/api/quick-data');
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/quick-data', { signal: expect.any(AbortSignal) });
   });
 
   it('still PUTs quick-data after a successful initial hydration', async () => {
@@ -1062,9 +1063,10 @@ describe('useQuickData persistence guard', () => {
     vi.advanceTimersByTime(2000);
     await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(2));
 
-    expect(apiFetchMock).toHaveBeenNthCalledWith(1, '/api/quick-data');
+    expect(apiFetchMock).toHaveBeenNthCalledWith(1, '/api/quick-data', { signal: expect.any(AbortSignal) });
     expect(apiFetchMock).toHaveBeenNthCalledWith(2, '/api/quick-data', {
       method: 'PUT',
+      signal: expect.any(AbortSignal),
       body: JSON.stringify({
         data: {
           history: [],
@@ -1113,6 +1115,7 @@ describe('useQuickData persistence guard', () => {
     await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(3));
     expect(apiFetchMock).toHaveBeenNthCalledWith(3, '/api/quick-data', {
       method: 'PUT',
+      signal: expect.any(AbortSignal),
       body: JSON.stringify({
         data: {
           history: [],
@@ -1145,6 +1148,7 @@ describe('useQuickData persistence guard', () => {
     expect(apiFetchMock).toHaveBeenCalledTimes(2);
     expect(apiFetchMock).toHaveBeenNthCalledWith(2, '/api/quick-data', {
       method: 'PUT',
+      signal: expect.any(AbortSignal),
       body: JSON.stringify({
         data: {
           history: [],
@@ -1343,9 +1347,18 @@ describe('useQuickData persistence guard', () => {
     return record && Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
   }
 
+  function listPendingKeysForScope(scopeKey: string): string[] {
+    const prefix = `imcodes.quick_data.pending:${encodeURIComponent(scopeKey)}:`;
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(prefix)) keys.push(k);
+    }
+    return keys;
+  }
+
   it('persists a >64KB 200-entry snapshot across pagehide without keepalive failure and replays it to server on reload scoped by authoritative API account', async () => {
     setMockAuthIdentity('user-1', 'https://im.test');
-    const pendingKeyUser1 = `imcodes.quick_data.pending:${encodeURIComponent('https://im.test|user-1')}`;
     const initial200 = Array.from({ length: 200 }, (_, i) => `long-item-${i}-${'x'.repeat(240)}`);
     const serverData: QuickData = {
       history: initial200,
@@ -1382,7 +1395,7 @@ describe('useQuickData persistence guard', () => {
     await Promise.resolve();
     expect(apiFetchMock).toHaveBeenCalledTimes(2);
     expect((apiFetchMock.mock.calls[1][1] as RequestInit).keepalive).toBeUndefined();
-    expect(localStorage.getItem(pendingKeyUser1)).not.toBeNull();
+    expect(listPendingKeysForScope('https://im.test|user-1')).toHaveLength(1);
 
     // Account isolation: user-2 does NOT see user-1's unconfirmed backup.
     view.unmount();
@@ -1410,7 +1423,7 @@ describe('useQuickData persistence guard', () => {
     expect(apiFetchMock.mock.calls[4][0]).toBe('/api/quick-data');
     expect((apiFetchMock.mock.calls[4][1] as RequestInit).method).toBe('PUT');
     await waitFor(() => {
-      expect(localStorage.getItem(pendingKeyUser1)).toBeNull();
+      expect(listPendingKeysForScope('https://im.test|user-1')).toEqual([]);
     });
   });
 
@@ -1560,10 +1573,8 @@ describe('useQuickData persistence guard', () => {
     // Debounced backup and pagehide PUT fail under identity guard; pending backup stays ONLY in user-A's namespace.
     window.dispatchEvent(new Event('pagehide'));
     await Promise.resolve();
-    const keyUserA = `imcodes.quick_data.pending:${encodeURIComponent('https://im.test|user-A')}`;
-    const keyUserB = `imcodes.quick_data.pending:${encodeURIComponent('https://im.test|user-B')}`;
-    expect(localStorage.getItem(keyUserA)).not.toBeNull();
-    expect(localStorage.getItem(keyUserB)).toBeNull();
+    expect(listPendingKeysForScope('https://im.test|user-A')).toHaveLength(1);
+    expect(listPendingKeysForScope('https://im.test|user-B')).toEqual([]);
     for (let i = 0; i < localStorage.length; i++) {
       expect(localStorage.key(i)).not.toContain('anon');
     }
@@ -1600,7 +1611,7 @@ describe('useQuickData persistence guard', () => {
     act(() => { setMockAuthIdentity('user-B', 'https://im.test'); });
     await waitFor(() => expect(screen.getByTestId('hist').textContent).toBe('b-initial'));
     act(() => { quick.recordHistory('b-pending', 's2'); });
-    expect(localStorage.getItem(keyUserB)).not.toBeNull();
+    expect(listPendingKeysForScope('https://im.test|user-B')).toHaveLength(1);
 
     // User-A's old PUT now resolves — must NOT touch user-B's UI or user-B's pending backup!
     await act(async () => {
@@ -1608,7 +1619,159 @@ describe('useQuickData persistence guard', () => {
       await Promise.resolve();
     });
     expect(screen.getByTestId('hist').textContent).toBe('b-pending,b-initial');
-    expect(localStorage.getItem(keyUserB)).not.toBeNull();
+    expect(listPendingKeysForScope('https://im.test|user-B')).toHaveLength(1);
     switchView.unmount();
+  });
+
+  it('does not revive baseline entry X deleted by another device when local device only added A, keeping both A and B and clearing X timestamps', async () => {
+    setMockAuthIdentity('user-1', 'https://im.test/tenant-a');
+    let quick!: ReturnType<typeof useQuickData>;
+    function ThreeWayHarness() {
+      quick = useQuickData();
+      return <div data-testid="hist">{quick.data.history.join(',')}</div>;
+    }
+
+    const baselineData: QuickData = {
+      history: ['X'],
+      sessionHistory: { s1: ['X'] },
+      historyTimestamps: { X: 1000 },
+      sessionHistoryTimestamps: { s1: { X: 1000 } },
+      commands: [],
+      phrases: [],
+    };
+    apiFetchMock.mockResolvedValueOnce({ data: baselineData });
+    apiFetchMock.mockRejectedValueOnce(new Error('offline'));
+    const view = render(<ThreeWayHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    // Local device only adds A (unmodified X remains in local state with ts 1000).
+    vi.setSystemTime(2000);
+    act(() => { quick.recordHistory('A', 's1'); });
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+    view.unmount();
+
+    // Another device concurrently deleted X and added B (ts 3000) in both global & s1.
+    __simulateReloadForTests();
+    const serverAfterOtherDevice: QuickData = {
+      history: ['B'],
+      sessionHistory: { s1: ['B'] },
+      historyTimestamps: { B: 3000 },
+      sessionHistoryTimestamps: { s1: { B: 3000 } },
+      commands: [],
+      phrases: [],
+    };
+    apiFetchMock.mockResolvedValueOnce({ data: serverAfterOtherDevice });
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+
+    render(<ThreeWayHarness />);
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(4));
+    expect(quick.data.history).toEqual(['B', 'A']);
+    expect(quick.data.history).not.toContain('X');
+    expect(quick.data.historyTimestamps).toEqual({ B: 3000, A: 2000 });
+    expect(readOwnRecordValueSafe(quick.data.historyTimestamps, 'X')).toBeUndefined();
+    expect(quick.data.sessionHistory.s1).toEqual(['B', 'A']);
+    expect(quick.data.sessionHistoryTimestamps?.s1).toEqual({ B: 3000, A: 2000 });
+    expect(readOwnRecordValueSafe(quick.data.sessionHistoryTimestamps?.s1, 'X')).toBeUndefined();
+  });
+
+  it('prevents same-account concurrent tabs with identical saveRevision=1 from deleting each other pending backups on out-of-order responses and isolates same-origin distinct base paths', async () => {
+    setMockAuthIdentity('user-1', 'https://host.test/tenant-a');
+    let quick!: ReturnType<typeof useQuickData>;
+    function ConcurrentTabHarness() {
+      quick = useQuickData();
+      return <div data-testid="hist">{quick.data.history.join(',')}</div>;
+    }
+
+    // Tab 1 (clientId='tab-1') starts PUT revision=1 which suspends in-flight.
+    __simulateReloadForTests({ clientId: 'tab-1' });
+    let resolveTab1Put!: (v: unknown) => void;
+    apiFetchMock
+      .mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveTab1Put = resolve; }));
+
+    const tab1View = render(<ConcurrentTabHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+    vi.setSystemTime(1000);
+    act(() => { quick.recordHistory('tab-1', 's1'); });
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+    expect(listPendingKeysForScope('https://host.test/tenant-a|user-1')).toHaveLength(1);
+    tab1View.unmount();
+
+    // Verify same-origin distinct service path /tenant-b sees NONE of /tenant-a's pending backup.
+    tab1View.unmount();
+    __simulateReloadForTests({ clientId: 'tab-tenant-b' });
+    setMockAuthIdentity('user-1', 'https://host.test/tenant-b');
+    apiFetchMock.mockResolvedValueOnce({ data: { history: ['b-tenant'], sessionHistory: {}, commands: [], phrases: [] } });
+    const tenantBView = render(<ConcurrentTabHarness />);
+    await waitFor(() => expect(screen.getByTestId('hist').textContent).toBe('b-tenant'));
+    expect(listPendingKeysForScope('https://host.test/tenant-a|user-1')).toHaveLength(1);
+    expect(listPendingKeysForScope('https://host.test/tenant-b|user-1')).toEqual([]);
+    tenantBView.unmount();
+
+    // Now test concurrent out-of-order same-account tabs (both at saveRevision=1):
+    // Tab 1 PUT is suspended in-flight while Tab 2 fails PUT at saveRevision=1 ->
+    // Tab 1 resolves late 200 OK -> Tab 2 slot MUST stay intact -> Tab 3 reload recovers BOTH!
+    __resetQuickDataForTests();
+    apiFetchMock.mockReset();
+    setMockAuthIdentity('user-1', 'https://host.test/tenant-a');
+    __simulateReloadForTests({ clientId: 'tab-1' });
+    apiFetchMock
+      .mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveTab1Put = resolve; }));
+    const tab1Live = render(<ConcurrentTabHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+    vi.setSystemTime(1000);
+    act(() => { quick.recordHistory('tab-1', 's1'); });
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+
+    // Meanwhile Tab 2 (distinct tab slot) wrote & failed PUT at revision=1 for 'tab-2'.
+    const scopeKey = 'https://host.test/tenant-a|user-1';
+    const tab2Key = `imcodes.quick_data.pending:${encodeURIComponent(scopeKey)}:tab-2`;
+    localStorage.setItem(tab2Key, JSON.stringify({
+      v: 3,
+      entryId: 'tab-2:1',
+      clientId: 'tab-2',
+      scopeKey,
+      updatedAt: 2000,
+      baseline: { history: [], sessionHistory: {}, commands: [], phrases: [] },
+      target: {
+        history: ['tab-2'],
+        sessionHistory: { s1: ['tab-2'] },
+        historyTimestamps: { 'tab-2': 2000 },
+        sessionHistoryTimestamps: { s1: { 'tab-2': 2000 } },
+        commands: [],
+        phrases: [],
+      },
+    }));
+
+    // Now Tab 1's delayed PUT resolves 200 OK — MUST delete ONLY Tab 1's slot, NEVER Tab 2's slot!
+    await act(async () => {
+      resolveTab1Put({ ok: true });
+      await Promise.resolve();
+    });
+    expect(localStorage.getItem(tab2Key)).not.toBeNull();
+    expect(listPendingKeysForScope(scopeKey)).toHaveLength(1);
+    tab1Live.unmount();
+
+    // Reopen Tab 3: server has ['tab-1'], consolidated replay recovers ['tab-2'] from preserved Tab 2 slot -> BOTH present!
+    __simulateReloadForTests({ clientId: 'tab-3' });
+    apiFetchMock
+      .mockResolvedValueOnce({
+        data: {
+          history: ['tab-1'],
+          sessionHistory: { s1: ['tab-1'] },
+          historyTimestamps: { 'tab-1': 1000 },
+          sessionHistoryTimestamps: { s1: { 'tab-1': 1000 } },
+          commands: [],
+          phrases: [],
+        },
+      })
+      .mockResolvedValueOnce({ ok: true });
+    render(<ConcurrentTabHarness />);
+    await waitFor(() => expect(screen.getByTestId('hist').textContent).toBe('tab-2,tab-1'));
+    await waitFor(() => expect(listPendingKeysForScope(scopeKey)).toEqual([]));
   });
 });

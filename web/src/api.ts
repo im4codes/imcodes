@@ -954,10 +954,23 @@ async function read401BodyBounded(
   }
 }
 
+function assertSameRequestBinding(
+  startBaseUrl: string,
+  startExpectedUserId: string | null,
+  startAuthEpoch: number,
+): void {
+  if (_baseUrl !== startBaseUrl || _expectedUserId !== startExpectedUserId || _authIdentityEpoch !== startAuthEpoch) {
+    throw new ApiError(409, AUTH_IDENTITY_ERRORS.CHANGED);
+  }
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   opts: RequestInit = {},
 ): Promise<T> {
+  const startBaseUrl = _baseUrl;
+  const startExpectedUserId = _expectedUserId;
+  const startAuthEpoch = _authIdentityEpoch;
   throwIfAborted(opts.signal);
 
   const res = await rawFetch(path, opts);
@@ -990,6 +1003,7 @@ export async function apiFetch<T = unknown>(
     // has not yet accepted API keys) must never erase a still-valid app login.
     if (_apiKey) {
       throwIfAborted(opts.signal);
+      assertSameRequestBinding(startBaseUrl, startExpectedUserId, startAuthEpoch);
       console.warn(`[auth] bearer 401 on ${path} — verifying account before changing login state`);
       let verifyRes: Response;
       try {
@@ -999,6 +1013,7 @@ export async function apiFetch<T = unknown>(
         throw new ApiError(503, 'server_unavailable');
       }
       throwIfAborted(opts.signal);
+      assertSameRequestBinding(startBaseUrl, startExpectedUserId, startAuthEpoch);
       if (verifyRes.ok) {
         if (path === '/api/auth/user/me') {
           return await readResponseJsonWithSignal<T>(verifyRes, opts.signal);
@@ -1033,6 +1048,7 @@ export async function apiFetch<T = unknown>(
     // A single failure might be transient (e.g., CSRF mismatch after cookie rotation).
     for (let attempt = 0; attempt < 2; attempt++) {
       throwIfAborted(opts.signal);
+      assertSameRequestBinding(startBaseUrl, startExpectedUserId, startAuthEpoch);
       if (!refreshPromise) {
         refreshPromise = doRefresh().finally(() => { refreshPromise = null; });
       }
@@ -1045,6 +1061,7 @@ export async function apiFetch<T = unknown>(
         throw new ApiError(503, 'server_unavailable');
       }
       throwIfAborted(opts.signal);
+      assertSameRequestBinding(startBaseUrl, startExpectedUserId, startAuthEpoch);
       if (ok) {
         const retryRes = await rawFetch(path, opts);
         throwIfAborted(opts.signal);
@@ -1075,6 +1092,7 @@ export async function apiFetch<T = unknown>(
     }
     // Both refresh attempts failed — but verify session is truly expired before logout.
     // Another tab may have refreshed successfully and our cookies are now valid.
+    assertSameRequestBinding(startBaseUrl, startExpectedUserId, startAuthEpoch);
     let verifyRes: Response;
     try {
       verifyRes = await rawFetch('/api/auth/user/me', { signal: opts.signal });
@@ -1083,6 +1101,7 @@ export async function apiFetch<T = unknown>(
       throw new ApiError(503, 'server_unavailable');
     }
     throwIfAborted(opts.signal);
+    assertSameRequestBinding(startBaseUrl, startExpectedUserId, startAuthEpoch);
     if (verifyRes.ok) {
       console.warn(`[auth] refresh failed but /me succeeded — session still valid, retrying original request`);
       _lastRefreshAt = Date.now();
@@ -1121,12 +1140,14 @@ export async function apiFetch<T = unknown>(
     throwIfAborted(opts.signal);
     if (body.includes('csrf_rejected')) {
       console.warn(`[auth] CSRF rejected on ${path} — refreshing session for new CSRF cookie`);
+      assertSameRequestBinding(startBaseUrl, startExpectedUserId, startAuthEpoch);
       if (!refreshPromise) {
         refreshPromise = doRefresh().finally(() => { refreshPromise = null; });
       }
       try {
         const ok = await waitForPromiseWithSignal(refreshPromise, opts.signal);
         throwIfAborted(opts.signal);
+        assertSameRequestBinding(startBaseUrl, startExpectedUserId, startAuthEpoch);
         if (ok) {
           const retryRes = await rawFetch(path, opts);
           throwIfAborted(opts.signal);

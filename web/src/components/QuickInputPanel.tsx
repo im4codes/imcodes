@@ -237,15 +237,24 @@ interface AuthoritativeAuthScope {
 interface AuthBinding {
   scope: AuthoritativeAuthScope | null;
   epoch: number;
+  controller: AbortController;
 }
 
 interface PendingQuickDataSnapshot {
-  v: 2;
+  v: 3;
+  entryId: string;
+  clientId: string;
   scopeKey: string;
-  saveRevision: number;
+  updatedAt: number;
   baseline: QuickData;
   target: QuickData;
   removedAllTexts?: string[];
+}
+
+interface PendingQuickDataSlot {
+  storageKey: string;
+  entryId: string;
+  snapshot: PendingQuickDataSnapshot;
 }
 
 type PreHydrationOp =
@@ -259,6 +268,17 @@ type PreHydrationOp =
   | { type: 'add_phrase'; phrase: string }
   | { type: 'remove_phrase'; phrase: string };
 
+let _instanceCounter = 0;
+function generateClientInstanceId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch { /* ignore */ }
+  return `qp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}_${++_instanceCounter}`;
+}
+
+let _clientInstanceId = generateClientInstanceId();
 let _debounceTimer: ReturnType<typeof setTimeout> | null = null;
 let _hasHydratedFromServer = false;
 let _mutatedBeforeHydration = false;
@@ -270,6 +290,7 @@ let _saveRevision = 0;
 let _inFlightSaves = 0;
 let _baseline: QuickData | null = null;
 let _boundBinding: AuthBinding | null = null;
+const _inFlightControllers = new Set<AbortController>();
 const _pendingRemovedAllTexts = new Set<string>();
 let _preHydrationOps: PreHydrationOp[] = [];
 
@@ -280,14 +301,21 @@ function apiFetch<T = unknown>(path: string, opts?: RequestInit): Promise<T> {
   return opts === undefined ? apiModule.apiFetch<T>(path) : apiModule.apiFetch<T>(path, opts);
 }
 
+/**
+ * Normalize an API base URL while preserving any service sub-path on the same
+ * origin (e.g. `https://host.test/tenant-a/` vs `https://host.test/tenant-b`),
+ * so distinct tenant/proxy paths never collide under one storage scope.
+ */
 function normalizeAuthBaseUrl(baseUrl: string | null | undefined): string {
   if (typeof baseUrl !== 'string') return '';
-  const trimmed = baseUrl.trim().replace(/\/+$/, '');
+  const trimmed = baseUrl.trim();
   if (!trimmed) return '';
   try {
-    return new URL(trimmed).origin.toLowerCase();
+    const parsed = new URL(trimmed);
+    const cleanPath = parsed.pathname.replace(/\/+$/, '');
+    return `${parsed.origin.toLowerCase()}${cleanPath}`;
   } catch {
-    return trimmed.toLowerCase();
+    return trimmed.replace(/\/+$/, '').toLowerCase();
   }
 }
 
@@ -343,11 +371,12 @@ function captureCurrentBinding(): AuthBinding {
   return {
     scope,
     epoch: scope ? scope.epoch : readAuthIdentityEpochFromApi(),
+    controller: new AbortController(),
   };
 }
 
 function isBindingCurrent(binding: AuthBinding | null): boolean {
-  if (!binding) return false;
+  if (!binding || binding.controller.signal.aborted) return false;
   const current = captureCurrentBinding();
   if (binding.epoch !== current.epoch) return false;
   if (!binding.scope && !current.scope) return true;
@@ -355,33 +384,48 @@ function isBindingCurrent(binding: AuthBinding | null): boolean {
   return binding.scope.scopeKey === current.scope.scopeKey;
 }
 
-function getQuickDataPendingStorageKey(scope: AuthoritativeAuthScope | null): string | null {
+function abortBindingAndInFlightRequests(binding?: AuthBinding | null): void {
+  const err = typeof DOMException !== 'undefined'
+    ? new DOMException('Auth binding changed', 'AbortError')
+    : new Error('Auth binding changed');
+  try { binding?.controller.abort(err); } catch { /* ignore */ }
+  for (const ctrl of [..._inFlightControllers]) {
+    try { ctrl.abort(err); } catch { /* ignore */ }
+  }
+  _inFlightControllers.clear();
+}
+
+function getQuickDataPendingScopePrefix(scope: AuthoritativeAuthScope): string {
+  return `${QUICK_DATA_PENDING_KEY_PREFIX}${encodeURIComponent(scope.scopeKey)}:`;
+}
+
+function getQuickDataPendingStorageKey(scope: AuthoritativeAuthScope | null, clientId = _clientInstanceId): string | null {
   if (!scope || typeof localStorage === 'undefined') return null;
-  return `${QUICK_DATA_PENDING_KEY_PREFIX}${encodeURIComponent(scope.scopeKey)}`;
+  return `${getQuickDataPendingScopePrefix(scope)}${encodeURIComponent(clientId)}`;
 }
 
-function writePendingSnapshot(scope: AuthoritativeAuthScope | null, snapshot: PendingQuickDataSnapshot): void {
-  const key = getQuickDataPendingStorageKey(scope);
-  if (!key || !scope || snapshot.scopeKey !== scope.scopeKey) return;
+function parsePendingSnapshotRecord(raw: string | null, expectedScopeKey: string): PendingQuickDataSnapshot | null {
+  if (!raw) return null;
   try {
-    localStorage.setItem(key, JSON.stringify(snapshot));
-  } catch { /* ignore quota/private mode errors */ }
-}
-
-function readPendingSnapshot(scope: AuthoritativeAuthScope | null): PendingQuickDataSnapshot | null {
-  const key = getQuickDataPendingStorageKey(scope);
-  if (!key || !scope) return null;
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<PendingQuickDataSnapshot> | null;
-    if (!parsed || typeof parsed !== 'object' || parsed.v !== 2 || parsed.scopeKey !== scope.scopeKey) {
+    if (
+      !parsed
+      || typeof parsed !== 'object'
+      || parsed.v !== 3
+      || parsed.scopeKey !== expectedScopeKey
+      || typeof parsed.entryId !== 'string'
+      || !parsed.entryId
+      || typeof parsed.clientId !== 'string'
+      || !parsed.clientId
+    ) {
       return null;
     }
     return {
-      v: 2,
-      scopeKey: scope.scopeKey,
-      saveRevision: typeof parsed.saveRevision === 'number' && Number.isFinite(parsed.saveRevision) ? parsed.saveRevision : 0,
+      v: 3,
+      entryId: parsed.entryId,
+      clientId: parsed.clientId,
+      scopeKey: expectedScopeKey,
+      updatedAt: typeof parsed.updatedAt === 'number' && Number.isFinite(parsed.updatedAt) ? parsed.updatedAt : 0,
       baseline: normalizeQuickData(parsed.baseline),
       target: normalizeQuickData(parsed.target),
       ...(Array.isArray(parsed.removedAllTexts)
@@ -393,16 +437,40 @@ function readPendingSnapshot(scope: AuthoritativeAuthScope | null): PendingQuick
   }
 }
 
-function clearPendingSnapshotIfRevision(scope: AuthoritativeAuthScope | null, expectedRevision: number): void {
-  const key = getQuickDataPendingStorageKey(scope);
-  if (!key || !scope) return;
+function writePendingSnapshot(scope: AuthoritativeAuthScope | null, snapshot: PendingQuickDataSnapshot): void {
+  const key = getQuickDataPendingStorageKey(scope, snapshot.clientId);
+  if (!key || !scope || snapshot.scopeKey !== scope.scopeKey) return;
   try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return;
-    const parsed = JSON.parse(raw) as Partial<PendingQuickDataSnapshot> | null;
-    if (!parsed || parsed.v !== 2 || parsed.scopeKey !== scope.scopeKey) return;
-    if (parsed.saveRevision === expectedRevision) {
-      localStorage.removeItem(key);
+    localStorage.setItem(key, JSON.stringify(snapshot));
+  } catch { /* ignore quota/private mode errors */ }
+}
+
+function readPendingSnapshots(scope: AuthoritativeAuthScope | null): PendingQuickDataSlot[] {
+  if (!scope || typeof localStorage === 'undefined') return [];
+  const prefix = getQuickDataPendingScopePrefix(scope);
+  const slots: PendingQuickDataSlot[] = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k || !k.startsWith(prefix)) continue;
+      const parsed = parsePendingSnapshotRecord(localStorage.getItem(k), scope.scopeKey);
+      if (parsed) {
+        slots.push({ storageKey: k, entryId: parsed.entryId, snapshot: parsed });
+      }
+    }
+  } catch { /* ignore */ }
+  slots.sort((a, b) => (a.snapshot.updatedAt !== b.snapshot.updatedAt
+    ? a.snapshot.updatedAt - b.snapshot.updatedAt
+    : a.entryId.localeCompare(b.entryId)));
+  return slots;
+}
+
+function clearPendingSlotIfEntryId(storageKey: string, expectedScopeKey: string, expectedEntryId: string): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const parsed = parsePendingSnapshotRecord(localStorage.getItem(storageKey), expectedScopeKey);
+    if (parsed && parsed.entryId === expectedEntryId) {
+      localStorage.removeItem(storageKey);
     }
   } catch { /* ignore */ }
 }
@@ -424,6 +492,7 @@ function resetInMemoryQuickDataForAuthChange(revalidateSubscribers: boolean): vo
     clearTimeout(_debounceTimer);
     _debounceTimer = null;
   }
+  abortBindingAndInFlightRequests(_boundBinding);
   _hasHydratedFromServer = false;
   _mutatedBeforeHydration = false;
   _saveRevision += 1;
@@ -511,11 +580,13 @@ function mergeOrderedHistoryLists(
   baselineList: readonly string[],
   localList: readonly string[],
   serverList: readonly string[],
+  baselineTsMap: Record<string, number> | undefined,
   localTsMap: Record<string, number> | undefined,
   serverTsMap: Record<string, number> | undefined,
   removedAllSet: ReadonlySet<string>,
   max: number,
 ): { entries: string[]; timestamps: Record<string, number> | undefined } {
+  const baselineSet = new Set(baselineList);
   const localSet = new Set(localList);
   const removed = new Set<string>();
   for (const item of baselineList) {
@@ -524,18 +595,39 @@ function mergeOrderedHistoryLists(
   for (const item of removedAllSet) {
     if (!localSet.has(item)) removed.add(item);
   }
+
+  // Extract ONLY local additions and genuine local re-sends (newer timestamp
+  // than baseline). Unmodified baseline items follow the server's existence
+  // and timestamp so deletes performed on another device are never revived.
+  const localAddedOrUpdated: string[] = [];
+  const localAddedOrUpdatedSet = new Set<string>();
+  for (const item of localList) {
+    const inBaseline = baselineSet.has(item);
+    const baseTs = validTimestamp(readOwnRecordValue(baselineTsMap, item));
+    const localTs = validTimestamp(readOwnRecordValue(localTsMap, item));
+    const isAdded = !inBaseline;
+    const isUpdated = inBaseline && localTs !== undefined && localTs > (baseTs ?? -1);
+    if (isAdded || isUpdated) {
+      localAddedOrUpdated.push(item);
+      localAddedOrUpdatedSet.add(item);
+    }
+  }
+
   const survivingServer = serverList.filter((item) => !removed.has(item));
   const combined: string[] = [];
   const seen = new Set<string>();
-  for (const item of [...localList, ...survivingServer]) {
+  for (const item of [...localAddedOrUpdated, ...survivingServer]) {
     if (seen.has(item)) continue;
     seen.add(item);
     combined.push(item);
   }
+
   const tsMap = new Map<string, number>();
   for (const item of combined) {
-    const localTs = validTimestamp(readOwnRecordValue(localTsMap, item));
     const serverTs = validTimestamp(readOwnRecordValue(serverTsMap, item));
+    const localTs = localAddedOrUpdatedSet.has(item)
+      ? validTimestamp(readOwnRecordValue(localTsMap, item))
+      : undefined;
     const best = localTs !== undefined && serverTs !== undefined
       ? Math.max(localTs, serverTs)
       : (localTs ?? serverTs);
@@ -574,6 +666,7 @@ export function mergeQuickDataThreeWay(
     baseline.history,
     local.history,
     server.history,
+    baseline.historyTimestamps,
     local.historyTimestamps,
     server.historyTimestamps,
     removedAllSet,
@@ -591,6 +684,7 @@ export function mergeQuickDataThreeWay(
       readOwnRecordValue(baseline.sessionHistory, session) ?? [],
       readOwnRecordValue(local.sessionHistory, session) ?? [],
       readOwnRecordValue(server.sessionHistory, session) ?? [],
+      readOwnRecordValue(baseline.sessionHistoryTimestamps, session),
       readOwnRecordValue(local.sessionHistoryTimestamps, session),
       readOwnRecordValue(server.sessionHistoryTimestamps, session),
       removedAllSet,
@@ -691,11 +785,16 @@ function utf8ByteLength(str: string): number {
   return str.length * 3;
 }
 
+function makePendingEntryId(clientId: string, rev: number): string {
+  return `${clientId}:${rev}`;
+}
+
 function buildPendingSnapshotRecord(
   scope: AuthoritativeAuthScope,
   rev: number,
   target: QuickData,
   extraRemovedAll?: readonly string[],
+  clientId = _clientInstanceId,
 ): PendingQuickDataSnapshot {
   const removedSet = new Set<string>(_pendingRemovedAllTexts);
   if (extraRemovedAll) {
@@ -706,9 +805,11 @@ function buildPendingSnapshotRecord(
     if (targetGlobal.has(item)) removedSet.delete(item);
   }
   return {
-    v: 2,
+    v: 3,
+    entryId: makePendingEntryId(clientId, rev),
+    clientId,
     scopeKey: scope.scopeKey,
-    saveRevision: rev,
+    updatedAt: Date.now(),
     baseline: _baseline ?? EMPTY_QUICK_DATA,
     target,
     ...(removedSet.size > 0 ? { removedAllTexts: Array.from(removedSet) } : {}),
@@ -718,32 +819,51 @@ function buildPendingSnapshotRecord(
 function scheduleSave(data: QuickData, canPersist: boolean): void {
   if (!canPersist) return;
   const binding = _boundBinding ?? captureCurrentBinding();
-  if (!isBindingCurrent(binding)) return;
+  if (!isBindingCurrent(binding)) {
+    abortBindingAndInFlightRequests(binding);
+    return;
+  }
   const rev = ++_saveRevision;
+  const clientId = _clientInstanceId;
+  const entryId = makePendingEntryId(clientId, rev);
   if (binding.scope) {
-    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data));
+    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data, undefined, clientId));
   }
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
     _debounceTimer = null;
-    runSave(data, { revision: rev, binding });
+    runSave(data, { revision: rev, entryId, clientId, binding });
   }, 2000);
 }
 
 /**
- * Fire a PUT for the supplied snapshot. Snapshots the pending sets and the
- * authoritative auth binding so a successful response clears ONLY matching
- * revision/account state and concurrent mutations or identity changes are
- * preserved safely.
+ * Fire a PUT for the supplied snapshot. Carries the binding's AbortSignal and
+ * verifies binding + cross-tab unique entryId before mutating state or clearing
+ * localStorage slots, so concurrent tabs and late retries never wipe newer or
+ * cross-account work.
  */
-function runSave(data: QuickData, opts: { keepalive?: boolean; revision: number; binding: AuthBinding }): void {
-  if (!isBindingCurrent(opts.binding)) return;
-  const rev = opts.revision;
+function runSave(
+  data: QuickData,
+  opts: {
+    keepalive?: boolean;
+    revision: number;
+    entryId: string;
+    clientId: string;
+    binding: AuthBinding;
+    consolidatedSlots?: readonly PendingQuickDataSlot[];
+  },
+): void {
+  if (!isBindingCurrent(opts.binding)) {
+    abortBindingAndInFlightRequests(opts.binding);
+    return;
+  }
   const snapPhraseAdds = new Set(_pendingPhraseAdds);
   const snapCommandAdds = new Set(_pendingCommandAdds);
   const snapRemovedAll = new Set(_pendingRemovedAllTexts);
-  const init: RequestInit = { method: 'PUT', body: JSON.stringify({ data }) };
+  const ctrl = opts.binding.controller;
+  const init: RequestInit = { method: 'PUT', body: JSON.stringify({ data }), signal: ctrl.signal };
   if (opts.keepalive) init.keepalive = true;
+  _inFlightControllers.add(ctrl);
   _inFlightSaves += 1;
   apiFetch('/api/quick-data', init)
     .then(() => {
@@ -752,44 +872,79 @@ function runSave(data: QuickData, opts: { keepalive?: boolean; revision: number;
       for (const c of snapCommandAdds) _pendingCommandAdds.delete(c);
       for (const r of snapRemovedAll) _pendingRemovedAllTexts.delete(r);
       _baseline = data;
-      if (_saveRevision === rev) {
-        clearPendingSnapshotIfRevision(opts.binding.scope, rev);
+      if (opts.binding.scope) {
+        const ownKey = getQuickDataPendingStorageKey(opts.binding.scope, opts.clientId);
+        if (ownKey) {
+          clearPendingSlotIfEntryId(ownKey, opts.binding.scope.scopeKey, opts.entryId);
+        }
+        if (opts.consolidatedSlots) {
+          for (const slot of opts.consolidatedSlots) {
+            clearPendingSlotIfEntryId(slot.storageKey, opts.binding.scope.scopeKey, slot.entryId);
+          }
+        }
       }
     })
     .catch((err) => {
+      if (ctrl.signal.aborted) return;
       console.error('[quick-data] save failed:', err);
-      // Pending sets + account-bound localStorage snapshot keep unconfirmed
-      // changes (including deletes/clears) for safe reload replay.
     })
     .finally(() => {
+      _inFlightControllers.delete(ctrl);
       _inFlightSaves = Math.max(0, _inFlightSaves - 1);
     });
 }
 
 /**
  * Flush a pending debounced save during page hide / unload.
- * Stores an account-bound pending snapshot before attempting network delivery;
- * uses `fetch(..., { keepalive: true })` when under Chromium's 64 KiB cap, and
- * falls back to a standard PUT + persisted local retry when a large snapshot
- * exceeds the keepalive body limit.
+ * Stores an account-bound, per-tab-unique pending snapshot before attempting
+ * network delivery; skips `keepalive` above Chromium's 64 KiB cap.
  */
 function flushPendingSave(): void {
   if (!_debounceTimer || !_hasHydratedFromServer) return;
   clearTimeout(_debounceTimer);
   _debounceTimer = null;
   const binding = _boundBinding;
-  if (!isBindingCurrent(binding) || !binding) return;
+  if (!isBindingCurrent(binding) || !binding) {
+    abortBindingAndInFlightRequests(binding);
+    return;
+  }
   const rev = _saveRevision;
+  const clientId = _clientInstanceId;
+  const entryId = makePendingEntryId(clientId, rev);
   const data = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
   if (binding.scope) {
-    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data));
+    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data, undefined, clientId));
   }
   const body = JSON.stringify({ data });
   if (utf8ByteLength(body) <= KEEPALIVE_SAFE_BODY_BYTES) {
-    runSave(data, { keepalive: true, revision: rev, binding });
+    runSave(data, { keepalive: true, revision: rev, entryId, clientId, binding });
   } else {
-    runSave(data, { revision: rev, binding });
+    runSave(data, { revision: rev, entryId, clientId, binding });
   }
+}
+
+function consolidatePendingSlots(
+  server: QuickData,
+  slots: readonly PendingQuickDataSlot[],
+): { merged: QuickData; removedAllTexts: string[] } {
+  let merged = server;
+  const removedAllSet = new Set<string>();
+  for (const slot of slots) {
+    merged = mergeQuickDataThreeWay(
+      slot.snapshot.baseline,
+      slot.snapshot.target,
+      merged,
+      slot.snapshot.removedAllTexts,
+    );
+    if (slot.snapshot.removedAllTexts) {
+      for (const item of slot.snapshot.removedAllTexts) removedAllSet.add(item);
+    }
+  }
+  const mergedGlobal = new Set(merged.history);
+  for (const item of Array.from(removedAllSet)) {
+    if (mergedGlobal.has(item)) removedAllSet.delete(item);
+  }
+  return { merged, removedAllTexts: Array.from(removedAllSet) };
 }
 
 // Explicit annotation: the fetcher closure references `quickDataResource`
@@ -799,9 +954,12 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
   fetcher: async () => {
     ensureAuthChangeSubscription();
     const fetchBinding = captureCurrentBinding();
+    const ctrl = fetchBinding.controller;
+    _inFlightControllers.add(ctrl);
     try {
-      const res = await apiFetch<{ data: QuickData }>('/api/quick-data');
+      const res = await apiFetch<{ data: QuickData }>('/api/quick-data', { signal: ctrl.signal });
       if (!isBindingCurrent(fetchBinding)) {
+        abortBindingAndInFlightRequests(fetchBinding);
         return normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
       }
       const server = normalizeQuickData(res.data);
@@ -809,31 +967,40 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
       _hasHydratedFromServer = true;
       _boundBinding = fetchBinding;
       const shouldReplayPending = _debounceTimer === null && _inFlightSaves === 0;
-      const pendingLocal = shouldReplayPending ? readPendingSnapshot(fetchBinding.scope) : null;
-      if (_mutatedBeforeHydration || pendingLocal) {
+      const pendingSlots = shouldReplayPending ? readPendingSnapshots(fetchBinding.scope) : [];
+      if (_mutatedBeforeHydration || pendingSlots.length > 0) {
         const preOps = _preHydrationOps.splice(0);
         _mutatedBeforeHydration = false;
-        let merged = pendingLocal
-          ? mergeQuickDataThreeWay(pendingLocal.baseline, pendingLocal.target, server, pendingLocal.removedAllTexts)
-          : server;
+        const consolidated = pendingSlots.length > 0
+          ? consolidatePendingSlots(server, pendingSlots)
+          : { merged: server, removedAllTexts: [] as string[] };
+        let merged = consolidated.merged;
         if (preOps.length > 0) {
           merged = applyPreHydrationOps(merged, preOps);
         }
         _baseline = server;
-        if (pendingLocal?.removedAllTexts) {
+        if (consolidated.removedAllTexts.length > 0) {
           const mergedGlobal = new Set(merged.history);
-          for (const item of pendingLocal.removedAllTexts) {
+          for (const item of consolidated.removedAllTexts) {
             if (!mergedGlobal.has(item)) _pendingRemovedAllTexts.add(item);
           }
         }
         quickDataResource.mutate(merged);
-        if (pendingLocal && fetchBinding.scope) {
+        if (pendingSlots.length > 0 && fetchBinding.scope) {
           const rev = ++_saveRevision;
+          const clientId = _clientInstanceId;
+          const entryId = makePendingEntryId(clientId, rev);
           writePendingSnapshot(
             fetchBinding.scope,
-            buildPendingSnapshotRecord(fetchBinding.scope, rev, merged, pendingLocal.removedAllTexts),
+            buildPendingSnapshotRecord(fetchBinding.scope, rev, merged, consolidated.removedAllTexts, clientId),
           );
-          runSave(merged, { revision: rev, binding: fetchBinding });
+          runSave(merged, {
+            revision: rev,
+            entryId,
+            clientId,
+            binding: fetchBinding,
+            consolidatedSlots: pendingSlots,
+          });
         }
         return applyPendingAdds(merged);
       }
@@ -841,20 +1008,18 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
       if (hadPriorHydration && _debounceTimer !== null) {
         return normalizeQuickData(quickDataResource.peek().value ?? applyPendingAdds(server));
       }
-      // Re-fetch path: ensure optimistic phrase/command additions that
-      // haven't yet been persisted survive the refresh.
       return applyPendingAdds(server);
     } catch {
       if (!isBindingCurrent(fetchBinding)) {
         return EMPTY_QUICK_DATA;
       }
-      // Don't wipe the in-memory value on transient fetch errors — keep
-      // whatever is currently in the resource (or verified account target / EMPTY).
       if (_hasHydratedFromServer) {
         return normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
       }
-      const pending = readPendingSnapshot(fetchBinding.scope);
-      return pending ? pending.target : EMPTY_QUICK_DATA;
+      const slots = readPendingSnapshots(fetchBinding.scope);
+      return slots.length > 0 ? consolidatePendingSlots(EMPTY_QUICK_DATA, slots).merged : EMPTY_QUICK_DATA;
+    } finally {
+      _inFlightControllers.delete(ctrl);
     }
   },
 });
@@ -1033,9 +1198,11 @@ export function useQuickData(): UseQuickDataResult {
   return useMemo(() => ({ data, loaded: snapshot.loaded, ...QUICK_DATA_ACTIONS }), [data, snapshot.loaded]);
 }
 
-export function __simulateReloadForTests(): void {
+export function __simulateReloadForTests(opts?: { clientId?: string }): void {
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = null;
+  abortBindingAndInFlightRequests(_boundBinding);
+  _clientInstanceId = opts?.clientId ?? generateClientInstanceId();
   _hasHydratedFromServer = false;
   _mutatedBeforeHydration = false;
   _saveRevision = 0;
