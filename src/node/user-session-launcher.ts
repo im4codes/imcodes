@@ -149,13 +149,13 @@ export async function resolveMacosConsoleUser(
   options: MacosUserSessionDiscoveryOptions = {},
 ): Promise<MacosConsoleUser> {
   const execText = options.execFileText ?? defaultExecFileText;
-  const name = await execText('/usr/bin/stat', ['-f', '%Su', '/dev/console']);
+  const name = (await execText('/usr/bin/stat', ['-f', '%Su', '/dev/console'])).trim();
   if (!isEligibleMacosUserName(name)) {
     throw new Error(MACOS_USER_SESSION_ERROR.NO_ACTIVE_GUI_SESSION);
   }
 
-  const uid = parseMacosUserId(await execText('/usr/bin/id', ['-u', name]));
-  const gid = parseMacosUserId(await execText('/usr/bin/id', ['-g', name]));
+  const uid = parseMacosUserId((await execText('/usr/bin/id', ['-u', name])).trim());
+  const gid = parseMacosUserId((await execText('/usr/bin/id', ['-g', name])).trim());
   if (uid === null || gid === null) {
     throw new Error(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER);
   }
@@ -184,13 +184,13 @@ export async function resolveMacosUserSession(
   const execText = options.execFileText ?? defaultExecFileText;
   const user = await resolveMacosConsoleUser({ execFileText: execText });
 
-  const tempDir = await execText('/usr/bin/sudo', [
+  const tempDir = (await execText('/usr/bin/sudo', [
     '-n',
     '-u',
     user.name,
     '/usr/bin/getconf',
     'DARWIN_USER_TEMP_DIR',
-  ]);
+  ])).trim();
   if (!isAbsoluteBoundedPath(tempDir)) {
     throw new Error(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER_TEMP);
   }

@@ -47,6 +47,7 @@ import {
   MACOS_LAUNCHCTL_PATH,
   resolveMacosUserSession,
   runMacosUserSessionCommand,
+  type MacosExecFileText,
   type MacosUserSession,
 } from './user-session-launcher.js';
 import { launchWindowsActiveUserCommand, quoteWindowsArgument } from './windows-user-session.js';
@@ -560,6 +561,17 @@ async function resolveWindowsInteractiveUser(
   }
 }
 
+/** Adapts `execText` to `MacosExecFileText` with trimmed stdout matching `defaultExecFileText`. */
+function createMacosExecFileText(
+  execText: NonNullable<LocalDaemonControlDeps['execText']>,
+  env: NodeJS.ProcessEnv,
+): MacosExecFileText {
+  return async (file, args, timeoutMs) => {
+    const res = await execText(file, args, { timeoutMs, env });
+    return res.stdout.trim();
+  };
+}
+
 async function resolveDefaultActiveUser(
   platform: NodeJS.Platform,
   env: NodeJS.ProcessEnv,
@@ -584,10 +596,7 @@ async function resolveDefaultActiveUser(
       };
     }
     const macUser: MacosUserSession | null = await resolveMacosUserSession({
-      execFileText: async (file, args, timeoutMs) => {
-        const res = await execText(file, args, { timeoutMs, env });
-        return res.stdout;
-      },
+      execFileText: createMacosExecFileText(execText, env),
     }).catch(() => null);
     if (!macUser) return null;
     return {
@@ -1738,10 +1747,7 @@ export function createLocalDaemonController(deps: LocalDaemonControlDeps = {}): 
               await runMacosUserSessionCommand(macUser, {
                 executable: '/bin/kill',
                 args: ['-TERM', String(targetPid)],
-              }, 5_000, async (file, args, timeoutMs) => {
-                const res = await execText(file, args, { timeoutMs, env });
-                return res.stdout;
-              });
+              }, 5_000, createMacosExecFileText(execText, env));
             }
           } else if (typeof user.uid !== 'number' || user.uid === currentUid) {
             killProcess(targetPid, 'SIGTERM');

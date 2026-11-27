@@ -29,6 +29,9 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
   var wasInSetup = false;
   var loadSeq = 0;
   var appliedLoadSeq = 0;
+  var SESSION_RELOAD_KEY = 'aidesk-local-session-reload';
+  var SESSION_RELOAD_COOLDOWN_MS = 5000;
+  var HISTORY_RELOAD_FIELD = '__imcodesPanelReloadAt';
   function isRemoteBusy() { return remoteBusyCount > 0; }
   function isDaemonBusy() { return daemonBusyCount > 0; }
 
@@ -468,10 +471,74 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
   }
 
   // ---- talking to the node ----------------------------------------------
+  function makeSessionReloadError() {
+    var err = new Error('reloading');
+    err.name = 'SessionReloadError';
+    return err;
+  }
+  function isSessionReloadError(err) {
+    return Boolean(err && err.name === 'SessionReloadError');
+  }
+  function readSessionReloadAt() {
+    var best = 0;
+    try {
+      if (typeof sessionStorage !== 'undefined' && sessionStorage && typeof sessionStorage.getItem === 'function') {
+        var storedTs = Number(sessionStorage.getItem(SESSION_RELOAD_KEY));
+        if (Number.isFinite(storedTs) && storedTs > best) best = storedTs;
+      }
+    } catch (e) { /* storage unavailable; try history.state below */ }
+    try {
+      if (typeof history !== 'undefined' && history && history.state && typeof history.state === 'object') {
+        var histTs = Number(history.state[HISTORY_RELOAD_FIELD]);
+        if (Number.isFinite(histTs) && histTs > best) best = histTs;
+      }
+    } catch (e2) { /* history.state unavailable */ }
+    return best;
+  }
+  function writeSessionReloadAt(now) {
+    try {
+      if (typeof sessionStorage !== 'undefined' && sessionStorage && typeof sessionStorage.setItem === 'function' && typeof sessionStorage.getItem === 'function') {
+        var token = String(now);
+        sessionStorage.setItem(SESSION_RELOAD_KEY, token);
+        if (sessionStorage.getItem(SESSION_RELOAD_KEY) === token) return true;
+      }
+    } catch (e) { /* storage unavailable; fall back to same-origin history.state */ }
+    try {
+      if (typeof history !== 'undefined' && history && typeof history.replaceState === 'function') {
+        var nextState = {};
+        var prev = history.state;
+        if (prev && typeof prev === 'object' && !Array.isArray(prev)) {
+          for (var k in prev) {
+            if (Object.prototype.hasOwnProperty.call(prev, k)) nextState[k] = prev[k];
+          }
+        }
+        nextState[HISTORY_RELOAD_FIELD] = now;
+        history.replaceState(nextState, '');
+        if (history.state && typeof history.state === 'object' && Number(history.state[HISTORY_RELOAD_FIELD]) === now) {
+          return true;
+        }
+      }
+    } catch (e2) { /* history.replaceState unavailable */ }
+    return false;
+  }
+  function recoverExpiredSession() {
+    var now = Date.now();
+    var lastAt = readSessionReloadAt();
+    if (lastAt > 0 && Math.abs(now - lastAt) < SESSION_RELOAD_COOLDOWN_MS) return false;
+    if (!writeSessionReloadAt(now)) return false;
+    try {
+      if (typeof window !== 'undefined' && window.location && typeof window.location.reload === 'function') {
+        window.location.reload();
+        return true;
+      }
+    } catch (e) { /* reload blocked */ }
+    return false;
+  }
   function load() {
     if (!hasActiveDom()) return Promise.resolve();
     var seq = ++loadSeq;
     return fetch(B.statePath, { cache: 'no-store' }).then(function (response) {
+      if (response && response.status === 401 && recoverExpiredSession()) throw makeSessionReloadError();
       if (!response.ok) throw new Error('state');
       return response.json();
     }).then(function (next) {
@@ -480,8 +547,9 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
       state = next;
       offline = false;
       renderAll();
-    }).catch(function () {
+    }).catch(function (err) {
       if (!hasActiveDom() || seq < appliedLoadSeq) return;
+      if (isSessionReloadError(err)) return;
       appliedLoadSeq = seq;
       offline = true;
       renderStatus();
@@ -507,7 +575,12 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     if (extra) {
       for (var k in extra) if (Object.prototype.hasOwnProperty.call(extra, k)) body[k] = extra[k];
     }
+    var reloading = false;
     return post(B.actionPath, body).then(function (response) {
+      if (response && response.status === 401 && recoverExpiredSession()) {
+        reloading = true;
+        return false;
+      }
       if (!response.ok && hasActiveDom()) toast(T('actionFailed'));
       return response.ok;
     }).catch(function () {
@@ -521,6 +594,7 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
         remoteBusyCount = Math.max(0, remoteBusyCount - 1);
         if (hasActiveDom()) renderStatus();
       }
+      if (reloading) return ok;
       return load().then(function () { return ok; });
     });
   }
@@ -541,22 +615,26 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     pre.textContent = '...';
     meta.textContent = '';
     return fetch(B.daemonLogsPath, { cache: 'no-store' }).then(function (response) {
+      if (response && response.status === 401 && recoverExpiredSession()) throw makeSessionReloadError();
       if (!response.ok) throw new Error('logs');
       return response.json();
     }).then(function (data) {
       pre.textContent = data && data.text ? data.text : T('daemonLogsEmpty');
       meta.textContent = data && data.truncated ? T('daemonLogsTruncated') : (data && data.source ? data.source : '');
-    }).catch(function () {
+    }).catch(function (err) {
+      if (isSessionReloadError(err)) return;
       pre.textContent = T('actionFailed');
     });
   }
   function openExternal(target, fallbackUrl) {
     post(B.externalPath, { target: target }).then(function (response) {
+      if (response && response.status === 401) recoverExpiredSession();
       if (!response.ok) window.open(fallbackUrl, '_blank', 'noopener,noreferrer');
     }).catch(function () { window.open(fallbackUrl, '_blank', 'noopener,noreferrer'); });
   }
   function openSettings(target) {
     post(B.settingsPath, { target: target }).then(function (response) {
+      if (response && response.status === 401 && recoverExpiredSession()) return;
       if (!response.ok) toast(T('actionFailed'));
     }).catch(function () { toast(T('actionFailed')); });
   }
@@ -747,7 +825,9 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
         setupLocalError = '';
         setupBusy = true;
         renderSetup();
+        var reloading = false;
         post(B.actionPath, { action: B.setupActions.START_BROWSER_AUTH, relayUrl: relay, locale: locale }).then(function (response) {
+          if (response && response.status === 401 && recoverExpiredSession()) { reloading = true; return null; }
           if (response.ok) return null;
           return response.json().catch(function () { return null; }).then(function (data) {
             setupLocalError = data && data.error ? data.error : 'setup_bind_failed';
@@ -756,6 +836,7 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
           setupLocalError = 'setup_bind_failed';
         }).then(function () {
           setupBusy = false;
+          if (reloading) return;
           return load();
         });
       };
@@ -763,7 +844,8 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
     if ($('setupCancelBrowser')) {
       $('setupCancelBrowser').onclick = function () {
         if (!B.setupActions) return;
-        post(B.actionPath, { action: B.setupActions.CANCEL_BROWSER_AUTH }).then(function () {
+        post(B.actionPath, { action: B.setupActions.CANCEL_BROWSER_AUTH }).then(function (response) {
+          if (response && response.status === 401 && recoverExpiredSession()) return;
           setupLocalError = '';
           return load();
         });
@@ -792,7 +874,9 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
         setupLocalError = '';
         setupBusy = true;
         renderSetup();
+        var reloading = false;
         post(B.actionPath, { action: B.setupActions.BIND_MANUAL, bindUrl: raw }).then(function (response) {
+          if (response && response.status === 401 && recoverExpiredSession()) { reloading = true; return null; }
           if (response.ok) return null;
           return response.json().catch(function () { return null; }).then(function (data) {
             setupLocalError = data && data.error ? data.error : 'setup_bind_failed';
@@ -801,6 +885,7 @@ export const LOCAL_PANEL_PAGE_SCRIPT = String.raw`
           setupLocalError = 'setup_bind_failed';
         }).then(function () {
           setupBusy = false;
+          if (reloading) return;
           return load();
         });
       };

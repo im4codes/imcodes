@@ -104,4 +104,42 @@ describe('macOS graphical-session authority', () => {
       })).rejects.toThrow(MACOS_USER_SESSION_ERROR.NO_ACTIVE_GUI_SESSION);
     }
   });
+
+  it('trims trailing newlines from custom execFileText outputs while still rejecting embedded newlines', async () => {
+    const resolved = await resolveMacosUserSession({
+      execFileText: async (file, args) => {
+        if (file === '/usr/bin/stat' && args.includes('%Su')) return 'k\n';
+        if (file === '/usr/bin/id' && args[0] === '-u') return '503\r\n';
+        if (file === '/usr/bin/id' && args[0] === '-g') return '20\n';
+        if (file === '/usr/bin/dscl') return 'NFSHomeDirectory: /Users/k\n';
+        if (file === '/usr/bin/sudo' && args.includes('DARWIN_USER_TEMP_DIR')) return '/var/folders/xx/T/\n';
+        throw new Error(`unexpected command: ${file}`);
+      },
+    });
+    expect(resolved).toEqual({
+      name: 'k',
+      uid: 503,
+      gid: 20,
+      home: '/Users/k',
+      tempDir: '/var/folders/xx/T/',
+    });
+
+    await expect(resolveMacosUserSession({
+      execFileText: async (file, args) => {
+        if (file === '/usr/bin/stat' && args.includes('%Su')) return 'k\nroot\n';
+        throw new Error('unexpected lookup');
+      },
+    })).rejects.toThrow(MACOS_USER_SESSION_ERROR.NO_ACTIVE_GUI_SESSION);
+
+    await expect(resolveMacosUserSession({
+      execFileText: async (file, args) => {
+        if (file === '/usr/bin/stat' && args.includes('%Su')) return 'k\n';
+        if (file === '/usr/bin/id' && args[0] === '-u') return '503\n';
+        if (file === '/usr/bin/id' && args[0] === '-g') return '20\n';
+        if (file === '/usr/bin/dscl') return 'NFSHomeDirectory: /Users/k\n';
+        if (file === '/usr/bin/sudo' && args.includes('DARWIN_USER_TEMP_DIR')) return '/var/folders/xx\n/evil\n';
+        throw new Error(`unexpected command: ${file}`);
+      },
+    })).rejects.toThrow(MACOS_USER_SESSION_ERROR.INVALID_CONSOLE_USER_TEMP);
+  });
 });
