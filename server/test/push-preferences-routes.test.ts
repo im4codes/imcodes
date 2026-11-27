@@ -993,22 +993,29 @@ describe('push preferences and registration routes', () => {
     it('suppresses push notifications on RESUME and same-status scheduling projections', () => {
       expect(classifyTaskPairNotificationType({
         verb: 'RESUME',
-        effect: 'scheduled',
+        effect: 'recorded',
         fromStatus: 'working',
         toStatus: 'working',
         scheduling: { manual: false, resumePending: true, epoch: 2 },
       })).toBeNull();
       expect(classifyTaskPairNotificationType({
         verb: 'RESUME',
-        effect: 'scheduled',
+        effect: 'recorded',
         fromStatus: 'in_audit',
         toStatus: 'in_audit',
         scheduling: { manual: false, resumePending: false, epoch: 2 },
       })).toBeNull();
-      // Dependency unlock while still manually paused must not re-fire PAUSED push
+      // Dependency unlock while still manually paused uses effect='recorded' so both new and older baseline servers suppress push
       expect(classifyTaskPairNotificationType({
         verb: 'RESUME',
-        effect: 'scheduled',
+        effect: 'recorded',
+        fromStatus: 'working',
+        toStatus: 'working',
+        scheduling: { manual: true, epoch: 2 },
+      })).toBeNull();
+      expect(classifyTaskPairNotificationType({
+        verb: 'LEGACY_UNRECOGNIZED_SCHED',
+        effect: 'recorded',
         fromStatus: 'working',
         toStatus: 'working',
         scheduling: { manual: true, epoch: 2 },

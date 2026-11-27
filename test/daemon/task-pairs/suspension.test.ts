@@ -8,6 +8,7 @@ import { sendTaskPairMessage, setTaskPairDeliveryDepsForTests } from '../../../s
 import { queuedPairWakeAllowed } from '../../../src/daemon/task-pairs/wake-authority.js';
 import { resolveTransportQueueEntryAdmission } from '../../../src/daemon/delegation-reply-task-liveness.js';
 import { isTaskPairSuspended, TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_RESUME_REASON } from '../../../shared/task-pair-suspension.js';
+import { classifyTaskPairNotificationType, PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED } from '../../../shared/push-notifications.js';
 import { TASK_PAIR_TIMELINE_EVENT, taskPairSideToAct, type TaskPairState } from '../../../shared/task-pair.js';
 import { getSession, removeSession, upsertSession, type SessionRecord } from '../../../src/store/session-store.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
@@ -535,23 +536,26 @@ describe('timeline-event projection symmetry on pause, resume, dependency unlock
       ]);
       expect(schedEvents.map((e) => ({
         verb: e.payload.verb,
+        effect: e.payload.effect,
         fromStatus: e.payload.fromStatus,
         toStatus: e.payload.toStatus,
         scheduling: e.payload.scheduling,
       }))).toEqual([
-        { verb: 'PAUSE', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 1, manual: true, resumePending: false, dependencyCount: 0, details: { brief: { dependsOn: [], note: 'hold 1' } } }) },
-        { verb: 'RESUME', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 2, manual: false, resumePending: true, dependencyCount: 0 }) },
-        { verb: 'RESUME', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 2, manual: false, resumePending: false, dependencyCount: 0 }) },
-        { verb: 'PAUSE', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 3, manual: true, resumePending: false, dependencyCount: 0, details: { brief: { dependsOn: [], note: 'hold 2' } } }) },
-        { verb: 'RESUME', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 4, manual: false, resumePending: true, dependencyCount: 0 }) },
-        { verb: 'RESUME', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 4, manual: false, resumePending: false, dependencyCount: 0 }) },
+        { verb: 'PAUSE', effect: 'scheduled', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 1, manual: true, resumePending: false, dependencyCount: 0, details: { brief: { dependsOn: [], note: 'hold 1' } } }) },
+        { verb: 'RESUME', effect: 'recorded', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 2, manual: false, resumePending: true, dependencyCount: 0 }) },
+        { verb: 'RESUME', effect: 'recorded', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 2, manual: false, resumePending: false, dependencyCount: 0 }) },
+        { verb: 'PAUSE', effect: 'scheduled', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 3, manual: true, resumePending: false, dependencyCount: 0, details: { brief: { dependsOn: [], note: 'hold 2' } } }) },
+        { verb: 'RESUME', effect: 'recorded', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 4, manual: false, resumePending: true, dependencyCount: 0 }) },
+        { verb: 'RESUME', effect: 'recorded', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 4, manual: false, resumePending: false, dependencyCount: 0 }) },
       ]);
+      // Real PAUSE production projection classifies as TASK_PAIR_PAUSED
+      expect(classifyTaskPairNotificationType(schedEvents[0]!.payload as never)).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED);
     } finally {
       off();
     }
   });
 
-  it('emits deps-cleared and resume-settled for dependency unlocks, preserves unsatisfied dependencies on manual resume, and ignores non-manual resume', async () => {
+  it('emits deps-cleared and resume-settled for dependency unlocks, preserves unsatisfied dependencies on manual resume, ignores non-manual resume, and suppresses push on manual-paused dep unlock', async () => {
     const emitted: Array<{ eventId?: string; payload: Record<string, unknown> }> = [];
     const seen = new Set<string>();
     const off = timelineEmitter.on((ev) => {
@@ -563,6 +567,7 @@ describe('timeline-event projection symmetry on pause, resume, dependency unlock
     try {
       save('up1', 'working');
       save('up2', 'working');
+      save('up3', 'working');
       save('dep-only', 'working');
       pausePair(P, 'dep-only', B, 'dependencies', ['up1']);
       const beforeNoopCount = emitted.length;
@@ -578,8 +583,25 @@ describe('timeline-event projection symmetry on pause, resume, dependency unlock
         `task_pair.event:deps-cleared:dep-only:1:${B}`,
         `task_pair.event:resume-settled:dep-only:1:${B}`,
       ]);
+      expect(depOnlyEvents[1]!.payload.effect).toBe('recorded');
       expect(depOnlyEvents[1]!.payload.scheduling).toMatchObject({ manual: false, dependencyCount: 0, resumePending: true });
+      expect(depOnlyEvents[2]!.payload.effect).toBe('recorded');
       expect(depOnlyEvents[2]!.payload.scheduling).toMatchObject({ manual: false, dependencyCount: 0, resumePending: false });
+
+      // Real production projection: dependency unlock while manual pause remains true
+      // must carry effect='recorded' so both current and baseline older classifiers never push PAUSED
+      save('dep-stays-manual', 'in_audit');
+      pausePair(P, 'dep-stays-manual', B, 'dependencies', ['up3']);
+      pausePair(P, 'dep-stays-manual', B, 'manual');
+      putTaskPairFixture(getTaskPairStore(), P, { ...get('up3'), status: 'done' });
+      await automation.reconcileSuspensions();
+      const depsClearedWhileManual = emitted.find((e) => e.eventId === `task_pair.event:deps-cleared:dep-stays-manual:2:${B}`);
+      expect(depsClearedWhileManual).toBeDefined();
+      expect(depsClearedWhileManual!.payload.effect).toBe('recorded');
+      expect(depsClearedWhileManual!.payload.scheduling).toMatchObject({ manual: true, dependencyCount: 0, resumePending: false });
+      expect(classifyTaskPairNotificationType(depsClearedWhileManual!.payload as never)).toBeNull();
+      // Simulated older-server baseline (unknown verb -> only effect='recorded' guards it): still null
+      expect(classifyTaskPairNotificationType({ ...(depsClearedWhileManual!.payload as Record<string, unknown>), verb: 'LEGACY_CHECK' } as never)).toBeNull();
 
       // Resuming a pair with unsatisfied dependsOn transitions paused -> waiting_dependencies without clearing dependsOn
       save('dep-and-man', 'rework');

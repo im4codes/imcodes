@@ -45,7 +45,7 @@ export function emitSchedulingTimelineEvent(
       verb: opts.verb,
       fromStatus: saved.state.status,
       toStatus: saved.state.status,
-      effect: 'scheduled',
+      effect: opts.verb === 'RESUME' ? 'recorded' : 'scheduled',
       unusual: false,
       ...(opts.noticeText ? { noticeText: opts.noticeText } : {}),
     }, saved.state, opts.eventId);

@@ -269,5 +269,14 @@ describe('multi-pair aggregate Brain digest notices', () => {
     });
     expect(single?.payload).not.toHaveProperty('aggregate');
   });
+
+  it('excludes PAUSE and RESUME scheduling projections from lifecycle correlation keys even when carrying toStatus', () => {
+    expect(taskPairNotificationKey({ taskId: 'tsk_abc', verb: 'READY_FOR_AUDIT', toStatus: 'in_audit' })).toBe('tsk_abc\u0000in_audit');
+    expect(taskPairNotificationKey({ taskId: 'tsk_abc', verb: 'REWORK', toStatus: 'rework' })).toBe('tsk_abc\u0000rework');
+    expect(taskPairNotificationKey({ taskId: 'tsk_abc', verb: 'PAUSE', toStatus: 'in_audit' })).toBeUndefined();
+    expect(taskPairNotificationKey({ taskId: 'tsk_abc', verb: 'RESUME', toStatus: 'in_audit' })).toBeUndefined();
+    expect(taskPairNotificationKey({ taskId: 'tsk_abc', verb: 'pause', toStatus: 'rework' })).toBeUndefined();
+    expect(taskPairNotificationKey({ taskId: 'tsk_abc', verb: 'resume', toStatus: 'rework' })).toBeUndefined();
+  });
 });
 
