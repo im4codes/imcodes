@@ -31,7 +31,6 @@ import { dispatchJobNow, jobDispatchCron, readCronJobAndProvenanceLocked } from 
 import { CRON_STATUS, wrapExternalCliRestrictedCronAction } from '../../shared/cron-types.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { SESSION_IDENTITY_SCOPES } from '../../shared/session-identity.js';
-import { jobDispatchCron, readCronJobAndProvenanceLocked } from '../src/cron/job-dispatch.js';
 import type { Env } from '../src/env.js';
 
 const JWT_KEY = 'test-jwt-key-real-machine-32chars!';
