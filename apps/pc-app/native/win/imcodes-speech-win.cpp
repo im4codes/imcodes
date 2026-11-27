@@ -659,6 +659,38 @@ bool has_speech_energy_indexed(SampleAtFn&& sample_at, size_t end) {
   return false;
 }
 
+// Conservative utterance silence gate: skips pure silence / faint noise floor before feeding
+// ONNX Qwen3-ASR (with hotwords context), while keeping quiet speech (peak >= 0.015 or 50ms RMS >= 0.005).
+bool has_utterance_speech_energy(const std::vector<float>& samples, int sample_rate = kTargetSampleRate) {
+  const size_t count = samples.size();
+  if (count == 0) return false;
+  constexpr float kUtterancePeakThreshold = 0.015f;
+  constexpr double kUtteranceWindowRmsThreshold = 0.005;
+  constexpr double kRmsSqThreshold = kUtteranceWindowRmsThreshold * kUtteranceWindowRmsThreshold;
+  const int rate = sample_rate > 0 ? sample_rate : kTargetSampleRate;
+  const size_t window_samples = std::max<size_t>(1, static_cast<size_t>(std::llround(static_cast<double>(rate) * 0.05)));
+
+  double window_sum_sq = 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    const float s = samples[i];
+    if (std::fabs(s) >= kUtterancePeakThreshold) return true;
+    const double d = static_cast<double>(s);
+    window_sum_sq += d * d;
+    if (i >= window_samples) {
+      const double old_d = static_cast<double>(samples[i - window_samples]);
+      window_sum_sq -= old_d * old_d;
+      if (window_sum_sq < 0.0) window_sum_sq = 0.0;
+    }
+    if (i + 1 >= window_samples && (window_sum_sq / static_cast<double>(window_samples)) >= kRmsSqThreshold) {
+      return true;
+    }
+  }
+  if (count < window_samples && (window_sum_sq / static_cast<double>(count)) >= kRmsSqThreshold) {
+    return true;
+  }
+  return false;
+}
+
 bool has_trailing_silence_pause(const std::vector<float>& samples, const std::string& active_segment_text) {
   if (samples.size() < kMinPauseSplitSamples || samples.size() <= kPauseWindowSamples) {
     return false;
@@ -825,7 +857,11 @@ class SegmentedUtterancePipeline {
 
       if (need_decode && !(can_finish_now && !should_commit_segment)) {
         last_decoded_len = segment_samples.size();
-        const std::string seg_text = strip_asr_control_tags(decode_fn_(segment_samples));
+        const bool segment_has_speech =
+            !active_segment_text.empty() || has_utterance_speech_energy(segment_samples);
+        const std::string seg_text = segment_has_speech
+            ? strip_asr_control_tags(decode_fn_(segment_samples))
+            : std::string{};
         {
           std::lock_guard<std::mutex> lock(mu_);
           if (aborted_) {
@@ -873,7 +909,8 @@ class SegmentedUtterancePipeline {
 
     if (!final_aborted) {
       std::string final_seg = active_segment_text;
-      if (segment_samples.size() >= 1600) {
+      if (segment_samples.size() >= 1600 &&
+          (!active_segment_text.empty() || has_utterance_speech_energy(segment_samples))) {
         const std::string tail_text = strip_asr_control_tags(decode_fn_(segment_samples));
         if (!tail_text.empty()) {
           final_seg = tail_text;

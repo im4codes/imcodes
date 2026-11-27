@@ -32,6 +32,10 @@ import {
   type RemoteVoiceServerFrame,
   type RemoteVoiceServerSharedEntry,
 } from '../../../shared/remote-voice.js';
+import {
+  hasPcm16SpeechEnergy,
+  stripVoiceHotwordHallucination,
+} from '../../../shared/voice-hotwords.js';
 import type { Database } from '../db/client.js';
 import { getSetting, getUserById, getUserPref } from '../db/queries.js';
 import {
@@ -1136,7 +1140,7 @@ export class RemoteVoiceHub {
     session.audioChunks = [];
     session.totalAudioBytes = 0;
 
-    if (pcmBuffer.length === 0) {
+    if (pcmBuffer.length === 0 || !hasPcm16SpeechEnergy(pcmBuffer, session.sampleRate)) {
       if (this.sessions.get(session.sessionId) === session) {
         safeSendWs(session.clientWs, { type: 'voice.session.end', sessionId: session.sessionId });
         this.cleanupSession(session.sessionId);
@@ -1233,7 +1237,10 @@ export class RemoteVoiceHub {
         return;
       }
 
-      const sanitized = sanitizeAsrRepetitionLoop(transcript);
+      const afterRepetition = sanitizeAsrRepetitionLoop(transcript);
+      const sanitized = session.hotwords && session.hotwords.length > 0
+        ? stripVoiceHotwordHallucination(afterRepetition, session.hotwords)
+        : afterRepetition;
       if (sanitized.length > 0) {
         safeSendWs(session.clientWs, {
           type: 'voice.session.result',
@@ -1277,7 +1284,10 @@ export class RemoteVoiceHub {
     const session = this.sessions.get(sessionId);
     if (!session || session.providerUserId !== providerUserId || session.providerWs !== providerWs) return;
     this.resetIdleTimer(session);
-    const resolved = resolveSessionTranscriptResult(text, isFinal, session.lastNonEmptyText ?? '');
+    const filteredInput = session.hotwords && session.hotwords.length > 0
+      ? stripVoiceHotwordHallucination(text, session.hotwords)
+      : text;
+    const resolved = resolveSessionTranscriptResult(filteredInput, isFinal, session.lastNonEmptyText ?? '');
     session.lastNonEmptyText = resolved.nextLastNonEmptyText;
     if (!resolved.emit) {
       return;

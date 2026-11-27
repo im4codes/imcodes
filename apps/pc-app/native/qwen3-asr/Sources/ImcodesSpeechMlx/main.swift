@@ -591,6 +591,139 @@ private final class CaptureAudioDelegate: NSObject, AVCaptureAudioDataOutputSamp
 
 // MARK: - Segmented Decode Engine (Pure Foundation)
 
+private let kSpeechEnergyPeakThreshold: Float = 0.015
+private let kSpeechEnergyWindowRmsThreshold: Float = 0.005
+
+func hasSpeechEnergy(_ samples: [Float], sampleRate: Int = 16_000) -> Bool {
+    let count = samples.count
+    guard count > 0 else { return false }
+    let rate = sampleRate > 0 ? sampleRate : 16_000
+    let windowSamples = max(1, Int((Double(rate) * 0.05).rounded()))
+    let rmsSqThreshold = Double(kSpeechEnergyWindowRmsThreshold) * Double(kSpeechEnergyWindowRmsThreshold)
+
+    var windowSumSq = 0.0
+    for i in 0..<count {
+        let s = samples[i]
+        if abs(s) >= kSpeechEnergyPeakThreshold {
+            return true
+        }
+        let d = Double(s)
+        windowSumSq += d * d
+        if i >= windowSamples {
+            let old = Double(samples[i - windowSamples])
+            windowSumSq -= old * old
+            if windowSumSq < 0 { windowSumSq = 0 }
+        }
+        if i + 1 >= windowSamples && (windowSumSq / Double(windowSamples)) >= rmsSqThreshold {
+            return true
+        }
+    }
+    if count < windowSamples && (windowSumSq / Double(count)) >= rmsSqThreshold {
+        return true
+    }
+    return false
+}
+
+private func isHotwordHallucinationSeparator(_ ch: Character) -> Bool {
+    if ch.isWhitespace || ch.isPunctuation || ch.isSymbol {
+        return true
+    }
+    return false
+}
+
+private func isAsciiAlnumOrUnderscore(_ ch: Character) -> Bool {
+    guard let s = ch.unicodeScalars.first, ch.unicodeScalars.count == 1 else { return false }
+    return (s.value >= 0x30 && s.value <= 0x39)
+        || (s.value >= 0x41 && s.value <= 0x5A)
+        || (s.value >= 0x61 && s.value <= 0x7A)
+        || s.value == 0x5F
+}
+
+func stripVoiceHotwordHallucination(_ text: String, hotwordsContext: String?) -> String {
+    guard !text.isEmpty, let hotwordsContext, !hotwordsContext.isEmpty else { return text }
+
+    var seen = Set<String>()
+    var rawTerms: [[Character]] = []
+    for part in hotwordsContext.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
+        let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { continue }
+        let lower = trimmed.lowercased()
+        guard !seen.contains(lower) else { continue }
+        seen.insert(lower)
+        rawTerms.append(Array(lower))
+    }
+    guard !rawTerms.isEmpty else { return text }
+
+    rawTerms.sort { $0.count > $1.count }
+    var buckets: [Character: [[Character]]] = [:]
+    for term in rawTerms {
+        if let first = term.first {
+            buckets[first, default: []].append(term)
+        }
+    }
+
+    let chars = Array(text.lowercased())
+    let n = chars.count
+    guard n > 0 else { return text }
+
+    let dpStride = 4
+    var dp = [Int](repeating: -1, count: (n + 1) * dpStride)
+    for state in 0..<dpStride {
+        dp[n * dpStride + state] = 0
+    }
+
+    for pos in stride(from: n - 1, through: 0, by: -1) {
+        let ch = chars[pos]
+        let isSep = isHotwordHallucinationSeparator(ch)
+        let candidates = buckets[ch]
+
+        for prevAscii in 0...1 {
+            for hasSep in 0...1 {
+                var best = -1
+
+                if let candidates {
+                    for term in candidates {
+                        let nextAscii = isAsciiAlnumOrUnderscore(term[0]) ? 1 : 0
+                        if prevAscii == 1 && nextAscii == 1 && hasSep == 0 {
+                            continue
+                        }
+                        let endPos = pos + term.count
+                        guard endPos <= n else { continue }
+                        var matches = true
+                        for k in 0..<term.count {
+                            if chars[pos + k] != term[k] {
+                                matches = false
+                                break
+                            }
+                        }
+                        guard matches else { continue }
+                        let endAscii = isAsciiAlnumOrUnderscore(term[term.count - 1]) ? 1 : 0
+                        let tail = dp[endPos * dpStride + endAscii * 2]
+                        if tail >= 0 {
+                            let total = 1 + tail
+                            if best == -1 || total < best {
+                                best = total
+                            }
+                        }
+                    }
+                }
+
+                if isSep {
+                    let tail = dp[(pos + 1) * dpStride + prevAscii * 2 + 1]
+                    if tail >= 0 && (best == -1 || tail < best) {
+                        best = tail
+                    }
+                }
+
+                dp[pos * dpStride + prevAscii * 2 + hasSep] = best
+            }
+        }
+    }
+
+    let minMatches = dp[1] // pos=0, prevAscii=0, hasSep=1
+    return minMatches >= 2 ? "" : text
+}
+
 struct QwenSegmentedDecodeResult {
     let text: String
     let tokens: [Int32]
@@ -614,6 +747,7 @@ final class QwenSegmentedDecodeEngine {
     private let maxSegmentSamples: Int
     private let rollbackTokenCount: Int
     private let expectLanguageHeader: Bool
+    private let hotwords: String?
     private let decodeFn: DecodeFn
     private let rollbackPrefixFn: RollbackPrefixFn
     private let emitJsonFn: ([String: Any]) -> Void
@@ -639,6 +773,7 @@ final class QwenSegmentedDecodeEngine {
         maxSegmentSamples: Int = 216_000,
         rollbackTokenCount: Int = 5,
         expectLanguageHeader: Bool,
+        hotwords: String? = nil,
         decodeFn: @escaping DecodeFn,
         rollbackPrefixFn: @escaping RollbackPrefixFn,
         emitJsonFn: @escaping ([String: Any]) -> Void,
@@ -649,6 +784,7 @@ final class QwenSegmentedDecodeEngine {
         self.maxSegmentSamples = maxSegmentSamples
         self.rollbackTokenCount = rollbackTokenCount
         self.expectLanguageHeader = expectLanguageHeader
+        self.hotwords = hotwords
         self.decodeFn = decodeFn
         self.rollbackPrefixFn = rollbackPrefixFn
         self.emitJsonFn = emitJsonFn
@@ -766,7 +902,9 @@ final class QwenSegmentedDecodeEngine {
                 lastDecodedCount = currentLen
                 lock.unlock()
 
-                if let result = try? decodeFn(
+                if activeText.isEmpty && !hasSpeechEnergy(segmentCopy) {
+                    // Pure silence / faint noise floor: skip ASR decode so hotwords context cannot hallucinate.
+                } else if let result = try? decodeFn(
                     segmentCopy,
                     prefixCopy,
                     { [weak self] in
@@ -778,10 +916,11 @@ final class QwenSegmentedDecodeEngine {
                     }
                 ) {
                     let rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let text = sanitizeAsrRepetitionLoop(rawText)
-                    let hitRepetitionLoop = text != rawText
+                    let afterRepetition = sanitizeAsrRepetitionLoop(rawText)
+                    let text = stripVoiceHotwordHallucination(afterRepetition, hotwordsContext: hotwords)
+                    let hitGuard = text != rawText
                     activeText = text
-                    if hitRepetitionLoop {
+                    if hitGuard {
                         confirmedTokens = []
                     } else if !isFinalPass {
                         confirmedTokens = rollbackPrefixFn(
@@ -797,6 +936,13 @@ final class QwenSegmentedDecodeEngine {
                             "type": "result",
                             "text": combined,
                             "isFinal": isFinalPass,
+                        ])
+                    } else if combined.isEmpty && !lastEmittedText.isEmpty && isFinalPass {
+                        lastEmittedText = ""
+                        emitJsonFn([
+                            "type": "result",
+                            "text": "",
+                            "isFinal": true,
                         ])
                     }
                 }
@@ -875,6 +1021,7 @@ final class QwenStreamingSession {
             maxSegmentSamples: maxSegmentSamples,
             rollbackTokenCount: rollbackTokenCount,
             expectLanguageHeader: language == nil,
+            hotwords: hotwords,
             decodeFn: { samples, prefixTokens, checkCancellation in
                 let options = Qwen3DecodingOptions(
                     maxTokens: 192,

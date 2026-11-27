@@ -14,6 +14,7 @@ import {
   formatVoiceHotwordsContext,
   getOwnDictValue,
   hasOwnDictKey,
+  hasPcm16SpeechEnergy,
   isValidVoiceHotwordProjectKey,
   mergeVoiceHotwordRawText,
   mergeVoiceHotwords,
@@ -23,6 +24,7 @@ import {
   sanitizeRemoteVoiceHotwords,
   sanitizeVoiceHotwordText,
   setOwnDictValue,
+  stripVoiceHotwordHallucination,
 } from '../../shared/voice-hotwords.js';
 
 describe('shared voice hotwords', () => {
@@ -319,5 +321,99 @@ describe('shared voice hotwords', () => {
     }
     expect(canStoreVoiceHotwordProjectKey(projects, 'tombOld')).toBe(true);
     expect(canStoreVoiceHotwordProjectKey(projects, 'brand-new')).toBe(false);
+  });
+
+  it('strips multi-term hotword hallucination loops and silent-audio single echoes while preserving real speech', () => {
+    const compiled = mergeVoiceHotwords({
+      projectRaw: 'IM.codes\nCodex\nClaude\nwork\ntree\n错别词 => IM.codes',
+    });
+
+    // Exact reproduced user counterexample: alternating CJK comma/period, 4 occurrences
+    expect(stripVoiceHotwordHallucination('IM.codes，IM.codes。IM.codes，IM.codes。', compiled)).toBe('');
+    expect(stripVoiceHotwordHallucination('IM.codes，IM.codes。IM.codes，IM.codes。', ['IM.codes'])).toBe('');
+    expect(stripVoiceHotwordHallucination('IM.codes IM.codes', ['IM.codes'])).toBe('');
+    expect(stripVoiceHotwordHallucination('IM.codes, Codex, Claude', compiled)).toBe('');
+    // Case-insensitive & alias trigger matching
+    expect(stripVoiceHotwordHallucination('im.codes！codex？错别词。', compiled)).toBe('');
+    expect(stripVoiceHotwordHallucination('「IM.codes」\n(Codex)...', compiled)).toBe('');
+
+    // Single hotword echo: stripped ONLY when silentAudio=true, preserved on normal speech
+    expect(stripVoiceHotwordHallucination('IM.codes', compiled, { silentAudio: true })).toBe('');
+    expect(stripVoiceHotwordHallucination('IM.codes。', ['IM.codes'], { silentAudio: true })).toBe('');
+    expect(stripVoiceHotwordHallucination('IM.codes', compiled, { silentAudio: false })).toBe('IM.codes');
+    expect(stripVoiceHotwordHallucination('IM.codes', compiled)).toBe('IM.codes');
+
+    // Compound ASCII words ('worktree') must NOT match separate ASCII hotwords ('work', 'tree')
+    expect(stripVoiceHotwordHallucination('worktree', compiled, { silentAudio: true })).toBe('worktree');
+    expect(stripVoiceHotwordHallucination('work, tree', compiled, { silentAudio: false })).toBe('');
+
+    // Normal speech containing hotwords (including multiple hotwords) MUST remain intact
+    const intactCases = [
+      'IM.codes 的热词有 bug',
+      '打开 IM.codes 再看看 IM.codes',
+      '在 IM.codes 里配置 Codex 和 Claude',
+      'worktree',
+      '...',
+      '   ',
+      '',
+    ];
+    for (const sample of intactCases) {
+      expect(stripVoiceHotwordHallucination(sample, compiled, { silentAudio: true })).toBe(sample);
+      expect(stripVoiceHotwordHallucination(sample, compiled, { silentAudio: false })).toBe(sample);
+    }
+
+    // Empty hotwords never strip anything
+    expect(stripVoiceHotwordHallucination('IM.codes，IM.codes。IM.codes，IM.codes。', [])).toBe('IM.codes，IM.codes。IM.codes，IM.codes。');
+    expect(stripVoiceHotwordHallucination('IM.codes', null, { silentAudio: true })).toBe('IM.codes');
+
+    // Performance bound: 60 hotwords across ~1000 chars stays sub-millisecond
+    const rules60 = Array.from({ length: 60 }, (_, i) => `HotwordTerm_${i}`).join('\n');
+    const compiled60 = mergeVoiceHotwords({ projectRaw: rules60 });
+    const echoText = Array.from({ length: 60 }, (_, i) => `HotwordTerm_${i}`).join(', ');
+    const normalText = `Please verify HotwordTerm_0 with ${'real speech context '.repeat(45)}HotwordTerm_59`;
+    expect(normalText.length).toBeGreaterThanOrEqual(900);
+    expect(stripVoiceHotwordHallucination(echoText, compiled60)).toBe('');
+
+    const start = performance.now();
+    for (let i = 0; i < 20; i += 1) {
+      stripVoiceHotwordHallucination(echoText, compiled60);
+      stripVoiceHotwordHallucination(normalText, compiled60);
+    }
+    const avgMs = (performance.now() - start) / 40;
+    expect(avgMs).toBeLessThan(1);
+    expect(stripVoiceHotwordHallucination(normalText, compiled60)).toBe(normalText);
+  });
+
+  it('detects PCM16 speech energy safely across silence, faint noise, quiet speech, empty, and odd-byte buffers', () => {
+    // Empty, 1-byte, odd trailing byte, and zero-filled buffers
+    expect(hasPcm16SpeechEnergy(new Uint8Array(0))).toBe(false);
+    expect(hasPcm16SpeechEnergy(new Uint8Array([0xff]))).toBe(false);
+    expect(hasPcm16SpeechEnergy(new Uint8Array(3200))).toBe(false);
+
+    // Odd-byte trailing silence with non-zero noise below threshold does not throw
+    const faintNoise = new Uint8Array(3201);
+    for (let i = 0; i < 1600; i += 1) {
+      const val = i % 2 === 0 ? 100 : -100; // ~0.00305 amplitude (< 0.005 RMS, < 0.015 peak)
+      faintNoise[i * 2] = val & 0xff;
+      faintNoise[i * 2 + 1] = (val >> 8) & 0xff;
+    }
+    faintNoise[3200] = 0xab;
+    expect(hasPcm16SpeechEnergy(faintNoise, 16_000)).toBe(false);
+
+    // Quiet speech peak (~0.03) inside mostly quiet buffer passes
+    const quietSpeechPeak = new Uint8Array(3200);
+    const quietSample = Math.round(0.03 * 32768);
+    quietSpeechPeak[1600] = quietSample & 0xff;
+    quietSpeechPeak[1601] = (quietSample >> 8) & 0xff;
+    expect(hasPcm16SpeechEnergy(quietSpeechPeak, 16_000)).toBe(true);
+
+    // Sustained soft speech (peak ~0.01 < 0.015, RMS ~0.007 >= 0.005) straddling 50ms window boundary passes
+    const softSustained = new Uint8Array(3200); // 100ms
+    const softSample = Math.round(0.008 * 32768);
+    for (let i = 400; i < 1200; i += 1) {
+      softSustained[i * 2] = softSample & 0xff;
+      softSustained[i * 2 + 1] = (softSample >> 8) & 0xff;
+    }
+    expect(hasPcm16SpeechEnergy(softSustained, 16_000)).toBe(true);
   });
 });

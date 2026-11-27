@@ -30,7 +30,11 @@ import {
   type VoiceRecognitionEngine,
 } from '../voice-recognition-backend.js';
 import type { RemoteVoiceProviderInfo } from '@shared/remote-voice.js';
-import { applyVoiceHotwordPostProcess, type CompiledVoiceHotwords } from '@shared/voice-hotwords.js';
+import {
+  applyVoiceHotwordPostProcess,
+  stripVoiceHotwordHallucination,
+  type CompiledVoiceHotwords,
+} from '@shared/voice-hotwords.js';
 import {
   getActiveVoiceHotwordProject,
   getCompiledVoiceHotwordsForProject,
@@ -352,6 +356,9 @@ interface CaptureOwner {
   retired: boolean;
   hotwords?: CompiledVoiceHotwords;
   scope?: VoiceHotwordsScopeSnapshot;
+  hasAudioLevel?: boolean;
+  maxAudioLevel?: number;
+  emittedNonEmptyResult?: boolean;
   notifiedListening?: boolean;
   normalStopRequested?: boolean;
   pendingFallback?: { promise: Promise<void>; abort: () => void };
@@ -719,6 +726,8 @@ interface EagerRemoteStartState {
   listeningNotified: boolean;
   failedReason: string | null;
   failedPermission: boolean;
+  hasAudioLevel?: boolean;
+  maxAudioLevel?: number;
   onListeningChange?: (listening: boolean) => void;
   adoptedOwner: CaptureOwner | null;
   handoffPromise: Promise<void>;
@@ -1040,10 +1049,47 @@ function setOwnerListening(owner: CaptureOwner | null, next: boolean): void {
   owner!.onListeningChange?.(next);
 }
 
+const SILENT_AUDIO_LEVEL_THRESHOLD = 0.03;
+
+function recordOwnerAudioLevel(owner: CaptureOwner | null | undefined, rawLevel: number): void {
+  if (!owner || owner.retired) return;
+  const level = Number.isFinite(rawLevel) ? Math.max(0, rawLevel) : 0;
+  owner.hasAudioLevel = true;
+  if (owner.maxAudioLevel === undefined || level > owner.maxAudioLevel) {
+    owner.maxAudioLevel = level;
+  }
+}
+
+function isOwnerSilentAudio(owner: CaptureOwner | null | undefined): boolean {
+  return Boolean(owner?.hasAudioLevel && (owner.maxAudioLevel ?? 0) < SILENT_AUDIO_LEVEL_THRESHOLD);
+}
+
 function emitOwnerResult(owner: CaptureOwner | null, text: string, isFinal: boolean): void {
   if (!isOwnerCurrent(owner)) return;
-  const processed = owner!.hotwords ? applyVoiceHotwordPostProcess(text, owner!.hotwords) : text;
-  owner!.onResult?.(processed, isFinal);
+  const currentOwner = owner!;
+  const processed = currentOwner.hotwords
+    ? applyVoiceHotwordPostProcess(text, currentOwner.hotwords)
+    : text;
+  const filtered = currentOwner.hotwords
+    ? stripVoiceHotwordHallucination(processed, currentOwner.hotwords, {
+        silentAudio: isOwnerSilentAudio(currentOwner),
+      })
+    : processed;
+
+  const wasSuppressed = processed.trim().length > 0 && filtered.length === 0;
+  if (wasSuppressed) {
+    if (!currentOwner.emittedNonEmptyResult) {
+      return;
+    }
+    currentOwner.emittedNonEmptyResult = false;
+    currentOwner.onResult?.('', isFinal);
+    return;
+  }
+
+  if (filtered.trim().length > 0) {
+    currentOwner.emittedNonEmptyResult = true;
+  }
+  currentOwner.onResult?.(filtered, isFinal);
 }
 
 const _stoppedSessionRecognitions = new WeakMap<NativeSession, WeakSet<NativeSpeechRecognition>>();
@@ -1255,7 +1301,9 @@ async function attachSessionListeners(
     // Audio level listener (emitted from native at ~15-20fps; ignore while primed or after stop advances generation)
     ['audioLevel', (data: any) => {
       if (!isSessionLive() || session.primed || generation !== _generation) return;
-      _onLevel?.(data.level ?? 0);
+      const level = data.level ?? 0;
+      recordOwnerAudioLevel(session.owner, level);
+      _onLevel?.(level);
     }],
     ['listeningState', (data: { status?: string; variant?: string }) => {
       if (!isSessionLive() || generation !== _generation) return;
@@ -2219,7 +2267,11 @@ async function startWebLevelMeter(generation: number): Promise<void> {
         sum += v * v;
       }
       const rms = Math.sqrt(sum / data.length);
-      _onLevel?.(Math.min(1, rms * 3));
+      const level = Math.min(1, rms * 3);
+      if (_webSession?.generation === generation) {
+        recordOwnerAudioLevel(_webSession.owner, level);
+      }
+      _onLevel?.(level);
       if (isCapturing()) _webLevelRAF = requestAnimationFrame(tick);
     };
     _webLevelRAF = requestAnimationFrame(tick);
@@ -3172,6 +3224,14 @@ export async function startListening(
         },
         onLevel: (lvl) => {
           if (eager.aborted || eager.releasedToSend || !_listening) return;
+          const level = Number.isFinite(lvl) ? Math.max(0, lvl) : 0;
+          eager.hasAudioLevel = true;
+          if (eager.maxAudioLevel === undefined || level > eager.maxAudioLevel) {
+            eager.maxAudioLevel = level;
+          }
+          if (eager.adoptedOwner) {
+            recordOwnerAudioLevel(eager.adoptedOwner, level);
+          }
           _onLevel?.(lvl);
         },
         onError: (reason, isPermissionDenied) => {
@@ -3223,6 +3283,10 @@ export async function startListening(
       };
       if (eager.listeningNotified && !eager.releasedToSend) {
         owner.notifiedListening = true;
+      }
+      if (eager.hasAudioLevel) {
+        owner.hasAudioLevel = true;
+        owner.maxAudioLevel = eager.maxAudioLevel ?? 0;
       }
       eager.adoptedOwner = owner;
       claimActiveOwner(owner);
@@ -3297,6 +3361,7 @@ export async function startListening(
           },
           onLevel: (lvl) => {
             if (generation === _generation && _listening) {
+              recordOwnerAudioLevel(owner, lvl);
               _onLevel?.(lvl);
             }
           },

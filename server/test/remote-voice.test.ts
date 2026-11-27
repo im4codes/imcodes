@@ -2665,4 +2665,130 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
     expect(hub.getActiveSessionCount()).toBe(0);
     hub.stop();
   });
+
+  it('skips upstream HTTP ASR on pure silence/faint noise and strips pure hotword hallucination loops without dropping normal speech', async () => {
+    let nextTranscript = 'IM.codes，IM.codes。IM.codes，IM.codes。';
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit): Promise<Response> => {
+      return new Response(JSON.stringify({ text: nextTranscript }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    const hub = new RemoteVoiceHub({
+      readyTimeoutMs: 50,
+      idleTimeoutMs: 50,
+      httpAsrTimeoutMs: 500,
+      fetchFn: mockFetch as unknown as typeof fetch,
+    });
+    hub.setServerAsrServices([
+      {
+        id: 'asr_guard',
+        name: 'ASR Guard',
+        baseUrl: 'https://secret-asr.internal/v1',
+        apiKey: '',
+        model: 'whisper-1',
+        enabled: true,
+        source: 'admin',
+      },
+    ], false);
+
+    const clientSent: Array<Record<string, unknown>> = [];
+    const clientWs = { readyState: WebSocket.OPEN, send: (d: string) => clientSent.push(JSON.parse(d)), on: () => {}, close: () => {} } as unknown as WebSocket;
+    hub.handleConnection(clientWs, 'owner-guard');
+
+    const proto = hub as unknown as {
+      handleRawMessage: (ws: WebSocket, u: string, raw: string) => Promise<void>;
+    };
+
+    // 1. Pure silence (zero PCM16) + faint noise floor (< 0.005 RMS, < 0.015 peak): skip HTTP ASR call completely
+    const silentPcm = Buffer.alloc(1600, 0).toString('base64');
+    const faintNoiseBuf = Buffer.alloc(3200);
+    for (let i = 0; i < 1600; i += 1) {
+      faintNoiseBuf.writeInt16LE(i % 2 === 0 ? 100 : -100, i * 2); // peak ~0.00305, rms ~0.00305
+    }
+    const faintNoisePcm = faintNoiseBuf.toString('base64');
+
+    for (const [sid, pcmPayload] of [['http-silent', silentPcm], ['http-faint', faintNoisePcm]] as const) {
+      await proto.handleRawMessage(clientWs, 'owner-guard', JSON.stringify({
+        type: 'voice.session.start',
+        sessionId: sid,
+        targetDeviceId: 'asr_guard',
+        sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+        hotwords: ['IM.codes', 'Codex'],
+      }));
+      await proto.handleRawMessage(clientWs, 'owner-guard', JSON.stringify({
+        type: 'voice.session.audio',
+        sessionId: sid,
+        pcmBase64: pcmPayload,
+      }));
+      await proto.handleRawMessage(clientWs, 'owner-guard', JSON.stringify({
+        type: 'voice.session.stop',
+        sessionId: sid,
+      }));
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(clientSent.filter((f) => f.type === 'voice.session.result')).toEqual([]);
+    expect(clientSent).toContainEqual({ type: 'voice.session.end', sessionId: 'http-silent' });
+    expect(clientSent).toContainEqual({ type: 'voice.session.end', sessionId: 'http-faint' });
+
+    // 2. Audible tap / noise triggers upstream ASR, which echoes "IM.codes，IM.codes。IM.codes，IM.codes。" -> stripped, no result emitted
+    const audibleBuf = Buffer.alloc(1600);
+    for (let i = 0; i < 800; i += 1) {
+      audibleBuf.writeInt16LE(1500, i * 2); // ~0.046 amplitude (real speech / tap)
+    }
+    const audiblePcm = audibleBuf.toString('base64');
+
+    nextTranscript = 'IM.codes，IM.codes。IM.codes，IM.codes。';
+    await proto.handleRawMessage(clientWs, 'owner-guard', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'http-echo',
+      targetDeviceId: 'asr_guard',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes', 'Codex'],
+    }));
+    await proto.handleRawMessage(clientWs, 'owner-guard', JSON.stringify({
+      type: 'voice.session.audio',
+      sessionId: 'http-echo',
+      pcmBase64: audiblePcm,
+    }));
+    await proto.handleRawMessage(clientWs, 'owner-guard', JSON.stringify({
+      type: 'voice.session.stop',
+      sessionId: 'http-echo',
+    }));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(clientSent.filter((f) => f.sessionId === 'http-echo' && f.type === 'voice.session.result')).toEqual([]);
+    expect(clientSent).toContainEqual({ type: 'voice.session.end', sessionId: 'http-echo' });
+
+    // 3. Real sentence containing hotwords passes through intact
+    nextTranscript = '打开 IM.codes 再看看 Codex';
+    await proto.handleRawMessage(clientWs, 'owner-guard', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'http-real',
+      targetDeviceId: 'asr_guard',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes', 'Codex'],
+    }));
+    await proto.handleRawMessage(clientWs, 'owner-guard', JSON.stringify({
+      type: 'voice.session.audio',
+      sessionId: 'http-real',
+      pcmBase64: audiblePcm,
+    }));
+    await proto.handleRawMessage(clientWs, 'owner-guard', JSON.stringify({
+      type: 'voice.session.stop',
+      sessionId: 'http-real',
+    }));
+    await new Promise((r) => setTimeout(r, 60));
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(clientSent).toContainEqual({
+      type: 'voice.session.result',
+      sessionId: 'http-real',
+      text: '打开 IM.codes 再看看 Codex',
+      isFinal: true,
+    });
+    expect(hub.getActiveSessionCount()).toBe(0);
+    hub.stop();
+  });
 });

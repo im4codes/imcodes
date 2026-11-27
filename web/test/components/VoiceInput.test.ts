@@ -2585,4 +2585,73 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('strips repeated hotword hallucination loops and silent-audio single echoes while keeping audible single hotwords and real speech', async () => {
+    const origCap = (globalThis as any).Capacitor;
+    (globalThis as any).Capacitor = {
+      isNativePlatform: () => true,
+      isPluginAvailable: () => true,
+      getPlatform: () => 'ios',
+    };
+    const hotwordsMod = await import('../../src/voice-hotwords.js');
+    hotwordsMod.resetVoiceHotwordsScopeForTesting();
+    hotwordsMod.setProjectVoiceHotwordsRaw('proj-hallucination', 'IM.codes\nCodex');
+
+    try {
+      // 1. Multi-term hallucination loop is suppressed right away without emitting stray text
+      const onEchoResult = vi.fn();
+      await VoiceInput.startListening(onEchoResult, undefined, undefined, { projectKey: 'proj-hallucination' });
+      listeners.partialResults({ matches: ['IM.codes，IM.codes。IM.codes，IM.codes。'], isFinal: false });
+      listeners.partialResults({ matches: ['IM.codes，IM.codes。IM.codes，IM.codes。'], isFinal: true });
+      expect(onEchoResult).not.toHaveBeenCalled();
+      await VoiceInput.stopListening();
+
+      // 2. Single hotword with low audioLevel (< 0.03) is treated as silent-audio hallucination and suppressed
+      const onSilentSingle = vi.fn();
+      await VoiceInput.startListening(onSilentSingle, undefined, undefined, { projectKey: 'proj-hallucination' });
+      listeners.audioLevel({ level: 0.01 });
+      listeners.audioLevel({ level: 0.02 });
+      listeners.partialResults({ matches: ['IM.codes'], isFinal: true });
+      expect(onSilentSingle).not.toHaveBeenCalled();
+      await VoiceInput.stopListening();
+
+      // 3. Single hotword with normal speech audioLevel (>= 0.03) passes through
+      const onLoudSingle = vi.fn();
+      await VoiceInput.startListening(onLoudSingle, undefined, undefined, { projectKey: 'proj-hallucination' });
+      listeners.audioLevel({ level: 0.01 });
+      listeners.audioLevel({ level: 0.25 });
+      listeners.partialResults({ matches: ['IM.codes'], isFinal: true });
+      expect(onLoudSingle).toHaveBeenCalledWith('IM.codes', true);
+      await VoiceInput.stopListening();
+
+      // 4. Single hotword when no audioLevel events arrived (e.g. engine without meter) passes through
+      const onNoMeterSingle = vi.fn();
+      await VoiceInput.startListening(onNoMeterSingle, undefined, undefined, { projectKey: 'proj-hallucination' });
+      listeners.partialResults({ matches: ['IM.codes'], isFinal: true });
+      expect(onNoMeterSingle).toHaveBeenCalledWith('IM.codes', true);
+      await VoiceInput.stopListening();
+
+      // 5. Real sentence containing hotwords passes through regardless of audioLevel
+      const onRealSentence = vi.fn();
+      await VoiceInput.startListening(onRealSentence, undefined, undefined, { projectKey: 'proj-hallucination' });
+      listeners.audioLevel({ level: 0.01 });
+      listeners.partialResults({ matches: ['打开 IM.codes 再看看 Codex'], isFinal: true });
+      expect(onRealSentence).toHaveBeenCalledWith('打开 IM.codes 再看看 Codex', true);
+      await VoiceInput.stopListening();
+
+      // 6. If an interim single hotword emitted first, and subsequent tokens turn it into a pure loop, interim is cleared with ''
+      const onClearedInterim = vi.fn();
+      await VoiceInput.startListening(onClearedInterim, undefined, undefined, { projectKey: 'proj-hallucination' });
+      listeners.audioLevel({ level: 0.1 });
+      listeners.partialResults({ matches: ['IM.codes'], isFinal: false });
+      expect(onClearedInterim).toHaveBeenLastCalledWith('IM.codes', false);
+      listeners.partialResults({ matches: ['IM.codes，IM.codes。'], isFinal: true });
+      expect(onClearedInterim).toHaveBeenLastCalledWith('', true);
+      await VoiceInput.stopListening();
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      hotwordsMod.resetVoiceHotwordsScopeForTesting();
+      (globalThis as any).Capacitor = origCap;
+    }
+  });
+
 });

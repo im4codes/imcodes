@@ -4746,4 +4746,95 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it('suppresses silent-audio single hotword and multi-term hotword hallucination results over remote voice while preserving spoken hotwords', async () => {
+    vi.stubGlobal('Capacitor', {
+      getPlatform: () => 'ios',
+      isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+    });
+    setupFakeWebAudio({ sampleRate: 16_000 });
+    FakeWebSocket.instances.length = 0;
+
+    const removeRawListener = vi.fn(async () => {});
+    const startRawPcmCapture = vi.fn(async () => {});
+    const stopRawPcmCapture = vi.fn(async () => {});
+    streamingBridge.addListener.mockImplementation(async (name: string, fn: (data: unknown) => void) => {
+      streamingBridge.listeners[name] = fn;
+      return { remove: name === 'rawPcmChunk' ? removeRawListener : vi.fn(async () => {}) };
+    });
+    Object.assign(streamingBridge, { startRawPcmCapture, stopRawPcmCapture });
+
+    try {
+      const ownMac: RemoteVoiceProvidersSnapshot['providers'][number] = {
+        deviceId: 'own-mac',
+        displayName: 'Own Mac',
+        model: 'qwen3-1.7b',
+        modelLabel: 'Qwen3-ASR 1.7B',
+        ready: true,
+        busy: false,
+        shareScope: 'none',
+        providerKind: 'pc_app',
+        isOwnDevice: true,
+      };
+      const snapshot: RemoteVoiceProvidersSnapshot = {
+        primaryDeviceId: 'own-mac',
+        canManageServerSharing: false,
+        canShareOwnProviderToServer: false,
+        providers: [ownMac],
+      };
+      resetRemoteVoiceClientForTesting({ primaryDeviceId: 'own-mac', fetchedAt: Date.now(), providers: [ownMac] });
+      apiMocks.fetchRemoteVoiceProviders.mockResolvedValue(snapshot);
+      await probeRemoteMicPermission();
+
+      configureApi('https://relay.example');
+      configureExpectedUserId('user-guard');
+      setProjectVoiceHotwordsRaw('proj-remote-guard', 'IM.codes\nCodex');
+
+      // 1. Silent mic (< 0.03 level) + remote returns single hotword "IM.codes" -> suppressed
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-silent' });
+      const onSilentRes = vi.fn();
+      const startSilent = VoiceInput.startListening(onSilentRes, undefined, undefined, { projectKey: 'proj-remote-guard' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      const ws1 = FakeWebSocket.instances[0]!;
+      ws1.emitOpen();
+      const frame1 = JSON.parse(ws1.sent[0]!) as { sessionId: string };
+      ws1.emitMessage({ type: 'voice.session.ready', sessionId: frame1.sessionId });
+      await expect(startSilent).resolves.toBe(true);
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array(160)),
+        level: 0.01,
+      });
+      ws1.emitMessage({ type: 'voice.session.result', sessionId: frame1.sessionId, text: 'IM.codes', isFinal: true });
+      ws1.emitMessage({ type: 'voice.session.end', sessionId: frame1.sessionId });
+      await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
+      expect(onSilentRes).not.toHaveBeenCalled();
+
+      // 2. Normal speech (>= 0.03 level) + remote returns single "IM.codes" -> preserved
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-spoken' });
+      const onSpokenRes = vi.fn();
+      const startSpoken = VoiceInput.startListening(onSpokenRes, undefined, undefined, { projectKey: 'proj-remote-guard' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+      const ws2 = FakeWebSocket.instances[1]!;
+      ws2.emitOpen();
+      const frame2 = JSON.parse(ws2.sent[0]!) as { sessionId: string };
+      ws2.emitMessage({ type: 'voice.session.ready', sessionId: frame2.sessionId });
+      await expect(startSpoken).resolves.toBe(true);
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array([4000, -4000])),
+        level: 0.2,
+      });
+      ws2.emitMessage({ type: 'voice.session.result', sessionId: frame2.sessionId, text: 'IM.codes', isFinal: true });
+      ws2.emitMessage({ type: 'voice.session.end', sessionId: frame2.sessionId });
+      await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
+      expect(onSpokenRes).toHaveBeenCalledWith('IM.codes', true);
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      delete (streamingBridge as Record<string, unknown>).startRawPcmCapture;
+      delete (streamingBridge as Record<string, unknown>).stopRawPcmCapture;
+      configureExpectedUserId(null);
+      configureApi('');
+      resetVoiceHotwordsScopeForTesting();
+      vi.unstubAllGlobals();
+    }
+  });
 });

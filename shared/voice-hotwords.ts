@@ -987,3 +987,163 @@ export function canStoreVoiceHotwordProjectKey(
   if (hasOwnDictKey(projects, projectKey)) return true;
   return Object.keys(projects).length < maxProjects;
 }
+
+const HOTWORD_HALLUCINATION_SEP_CHAR_RE = /^[\s\p{P}\p{Z}\u2026\u2022\u00B7~`+=|<>$¥€£°^]$/u;
+const PCM16_SPEECH_PEAK_THRESHOLD = 0.015;
+const PCM16_SPEECH_WINDOW_RMS_THRESHOLD = 0.005;
+const PCM16_SPEECH_WINDOW_RMS_SQ = PCM16_SPEECH_WINDOW_RMS_THRESHOLD * PCM16_SPEECH_WINDOW_RMS_THRESHOLD;
+
+function collectHotwordHallucinationTerms(
+  hotwords: Pick<CompiledVoiceHotwords, 'terms' | 'asrTerms' | 'replacements'> | readonly string[],
+): Map<string, string[]> | null {
+  let rawList: string[];
+  if (Array.isArray(hotwords)) {
+    rawList = [...hotwords];
+  } else {
+    const compiled = hotwords as Pick<CompiledVoiceHotwords, 'terms' | 'asrTerms' | 'replacements'>;
+    rawList = [
+      ...(compiled.terms ?? []),
+      ...(compiled.asrTerms ?? []),
+      ...(compiled.replacements ?? []).flatMap((r) => [r.from, r.to]),
+    ];
+  }
+
+  const seen = new Set<string>();
+  const uniqueTerms: string[] = [];
+  for (const raw of rawList) {
+    const clean = sanitizeVoiceHotwordText(raw, VOICE_HOTWORDS_MAX_TERM_CHARS);
+    if (!clean) continue;
+    const lower = clean.toLowerCase();
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    uniqueTerms.push(lower);
+  }
+  if (uniqueTerms.length === 0) return null;
+
+  uniqueTerms.sort((a, b) => b.length - a.length);
+  const buckets = new Map<string, string[]>();
+  for (const term of uniqueTerms) {
+    const first = term[0]!;
+    const list = buckets.get(first);
+    if (list) list.push(term);
+    else buckets.set(first, [term]);
+  }
+  return buckets;
+}
+
+/**
+ * Strip generative-ASR prompt-echo hallucinations where the transcript consists
+ * exclusively of configured hotwords plus whitespace/punctuation (e.g. `"IM.codes，IM.codes。IM.codes，IM.codes。"`).
+ * Normal speech containing non-hotword words is never altered; a single isolated
+ * hotword is stripped only when `options.silentAudio === true`.
+ */
+export function stripVoiceHotwordHallucination(
+  text: string,
+  hotwords: Pick<CompiledVoiceHotwords, 'terms' | 'asrTerms' | 'replacements'> | readonly string[] | null | undefined,
+  options?: { silentAudio?: boolean },
+): string {
+  if (!text || !hotwords) return text;
+  const buckets = collectHotwordHallucinationTerms(hotwords);
+  if (!buckets) return text;
+
+  const lowerText = text.toLowerCase();
+  const n = lowerText.length;
+  if (n === 0) return text;
+
+  // Iterative DP over `(pos, prevEndedAsciiWord, hasSepSincePrev)`:
+  // stores minimum hotword count needed to cover `lowerText[pos..n]` (-1 = unreachable).
+  const stride = 4;
+  const dp = new Int32Array((n + 1) * stride);
+  dp.fill(-1);
+  for (let state = 0; state < stride; state += 1) {
+    dp[n * stride + state] = 0;
+  }
+
+  for (let pos = n - 1; pos >= 0; pos -= 1) {
+    const cp = lowerText.codePointAt(pos)!;
+    const charStr = String.fromCodePoint(cp);
+    const charLen = cp > 0xffff ? 2 : 1;
+    const isSep = HOTWORD_HALLUCINATION_SEP_CHAR_RE.test(charStr);
+    const candidates = buckets.get(lowerText[pos]!);
+
+    for (let prevAscii = 0; prevAscii <= 1; prevAscii += 1) {
+      for (let hasSep = 0; hasSep <= 1; hasSep += 1) {
+        let best = -1;
+
+        if (candidates) {
+          for (const term of candidates) {
+            const nextAscii = ASCII_ALNUM_UNDER_RE.test(term[0]!) ? 1 : 0;
+            if (prevAscii && nextAscii && !hasSep) continue;
+            if (!lowerText.startsWith(term, pos)) continue;
+            const endPos = pos + term.length;
+            const endAscii = ASCII_ALNUM_UNDER_RE.test(term[term.length - 1]!) ? 1 : 0;
+            const tail = dp[endPos * stride + endAscii * 2]!;
+            if (tail >= 0) {
+              const total = 1 + tail;
+              if (best === -1 || total < best) best = total;
+            }
+          }
+        }
+
+        if (isSep && pos + charLen <= n) {
+          const tail = dp[(pos + charLen) * stride + prevAscii * 2 + 1]!;
+          if (tail >= 0 && (best === -1 || tail < best)) {
+            best = tail;
+          }
+        }
+
+        dp[pos * stride + prevAscii * 2 + hasSep] = best;
+      }
+    }
+  }
+
+  const minMatches = dp[1]!; // pos=0, prevAscii=0, hasSep=1
+  if (minMatches >= 2) return '';
+  if (minMatches === 1 && options?.silentAudio === true) return '';
+  return text;
+}
+
+/**
+ * Lightweight silence gate for little-endian signed 16-bit mono PCM audio.
+ * Returns `true` if peak amplitude `>= 0.015` or any 50ms window RMS `>= 0.005`.
+ */
+export function hasPcm16SpeechEnergy(
+  pcmBuffer: Uint8Array,
+  sampleRate: number = 16_000,
+): boolean {
+  if (!pcmBuffer || pcmBuffer.byteLength < 2) return false;
+  const sampleCount = Math.floor(pcmBuffer.byteLength / 2);
+  if (sampleCount <= 0) return false;
+
+  const rate = Number.isFinite(sampleRate) && sampleRate > 0 ? sampleRate : 16_000;
+  const windowSamples = Math.max(1, Math.round(rate * 0.05));
+
+  let windowSumSq = 0;
+  for (let i = 0; i < sampleCount; i += 1) {
+    const byteOffset = i * 2;
+    const raw = pcmBuffer[byteOffset]! | (pcmBuffer[byteOffset + 1]! << 8);
+    const signed = raw >= 0x8000 ? raw - 0x10000 : raw;
+    const sample = signed / 32768;
+    if (Math.abs(sample) >= PCM16_SPEECH_PEAK_THRESHOLD) {
+      return true;
+    }
+
+    windowSumSq += sample * sample;
+    if (i >= windowSamples) {
+      const oldOffset = (i - windowSamples) * 2;
+      const oldRaw = pcmBuffer[oldOffset]! | (pcmBuffer[oldOffset + 1]! << 8);
+      const oldSigned = oldRaw >= 0x8000 ? oldRaw - 0x10000 : oldRaw;
+      const oldSample = oldSigned / 32768;
+      windowSumSq -= oldSample * oldSample;
+      if (windowSumSq < 0) windowSumSq = 0;
+    }
+    if (i + 1 >= windowSamples && windowSumSq / windowSamples >= PCM16_SPEECH_WINDOW_RMS_SQ) {
+      return true;
+    }
+  }
+
+  if (sampleCount < windowSamples && windowSumSq / sampleCount >= PCM16_SPEECH_WINDOW_RMS_SQ) {
+    return true;
+  }
+  return false;
+}
