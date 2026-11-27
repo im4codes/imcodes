@@ -47,12 +47,21 @@ import {
   loadOrCreatePortForwardIdentity,
   loadTrustedPeerPublicKeys,
   signPortForwardTranscript,
+  upsertTrustedPeerPublicKey,
+  validateEd25519SpkiPublicKey,
   verifyEphemeralKeyProof,
   verifyKeyConfirmationMac,
   verifyPortForwardTranscript,
   type E2eTransportKeys,
   type EndpointIdentityKeyPair,
 } from './port-forward-crypto.js';
+
+export const PORT_FORWARD_STRICT_TRUST_ENV = 'IMCODES_PORT_FORWARD_STRICT_TRUST';
+
+export function isPortForwardStrictTrustEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env[PORT_FORWARD_STRICT_TRUST_ENV]?.trim().toLowerCase();
+  return raw === '1' || raw === 'true';
+}
 import { probeStunCandidates } from './port-forward-stun.js';
 import {
   ReliableUdpTransport,
@@ -107,6 +116,10 @@ export interface PortForwardEngineOptions {
   /** Out-of-band relay-independent trusted peer public key resolver or JSON map file. */
   resolveTrustedPeerPublicKey?: (peerServerId: string) => Promise<string | null> | string | null;
   trustedPeersFilePath?: string;
+  /** Trust-on-first-use auto-pinning when trustedPeersFilePath is configured and strict mode is off. */
+  trustOnFirstUse?: boolean;
+  /** Disable TOFU and require every peer public key to be pre-pinned before connecting. */
+  strictPinnedTrust?: boolean;
   /** Test seam to disallow direct TCP/UDP and force relay or p2p_only failure. */
   disableDirectTcp?: boolean;
   disableDirectUdp?: boolean;
@@ -1309,6 +1322,7 @@ export class PortForwardEngine {
   private readonly collectAddresses: () => string[];
   private readonly probeStun: typeof probeStunCandidates;
   private readonly identityKeyPair: EndpointIdentityKeyPair;
+  private readonly fallbackPinnedPeers = new Map<string, string>();
 
   constructor(private readonly options: PortForwardEngineOptions) {
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...options.timeouts };
@@ -1324,16 +1338,44 @@ export class PortForwardEngine {
     return this.identityKeyPair.publicKeyB64;
   }
 
+  private isTrustOnFirstUseEnabled(): boolean {
+    if (this.options.strictPinnedTrust === true || isPortForwardStrictTrustEnabled()) return false;
+    if (this.options.trustOnFirstUse !== undefined) return this.options.trustOnFirstUse;
+    return Boolean(this.options.trustedPeersFilePath) && !this.options.resolveTrustedPeerPublicKey;
+  }
+
+  private lookupLocalPinnedPeerPublicKey(peerServerId: string): string | null {
+    if (this.options.trustedPeersFilePath) {
+      const fromFile = loadTrustedPeerPublicKeys(this.options.trustedPeersFilePath).get(peerServerId);
+      if (fromFile) return fromFile;
+    }
+    return this.fallbackPinnedPeers.get(peerServerId) ?? null;
+  }
+
   private async lookupTrustedPeerPublicKey(peerServerId: string): Promise<string | null> {
     if (this.options.resolveTrustedPeerPublicKey) {
       const resolved = await this.options.resolveTrustedPeerPublicKey(peerServerId);
       if (resolved) return resolved;
     }
-    if (this.options.trustedPeersFilePath) {
-      const map = loadTrustedPeerPublicKeys(this.options.trustedPeersFilePath);
-      return map.get(peerServerId) ?? null;
+    return this.lookupLocalPinnedPeerPublicKey(peerServerId);
+  }
+
+  private pinPeerPublicKeyOnFirstUse(peerServerId: string, publicKeyB64: string): boolean {
+    const existing = this.lookupLocalPinnedPeerPublicKey(peerServerId);
+    if (existing !== null) {
+      return existing === publicKeyB64;
     }
-    return null;
+    if (this.options.trustedPeersFilePath) {
+      try {
+        upsertTrustedPeerPublicKey(this.options.trustedPeersFilePath, peerServerId, publicKeyB64);
+        return true;
+      } catch {
+        this.fallbackPinnedPeers.set(peerServerId, publicKeyB64);
+        return true;
+      }
+    }
+    this.fallbackPinnedPeers.set(peerServerId, publicKeyB64);
+    return true;
   }
 
   listTunnels(): PortForwardEngineTunnelSnapshot[] {
@@ -1784,19 +1826,10 @@ export class PortForwardEngine {
       return;
     }
 
-    // Relay-independent peer identity verification: look up trusted Ed25519 public key locally.
-    const trustedPeerPublicKey = await this.lookupTrustedPeerPublicKey(tunnel.peerServerId);
-    if (!trustedPeerPublicKey) {
-      this.closeTunnel(tunnel.tunnelId, PORT_FORWARD_ERRORS.SCOPED_AUTH, false);
-      this.emitError(
-        tunnel.tunnelId,
-        PORT_FORWARD_ERRORS.SCOPED_AUTH,
-        `untrusted_peer_identity: missing local trusted public key for peer "${tunnel.peerServerId}"`,
-      );
-      return;
-    }
-
-    if (msg.peerIdentityPublicKey !== trustedPeerPublicKey || !verifyPortForwardTranscript(trustedPeerPublicKey, {
+    // Relay-independent peer identity verification: look up trusted Ed25519 public key locally,
+    // or pin it on first authenticated use (TOFU) when trustedPeersFilePath is configured and strict mode is off.
+    let trustedPeerPublicKey = await this.lookupTrustedPeerPublicKey(tunnel.peerServerId);
+    const transcript = {
       tunnelId: tunnel.tunnelId,
       role: peerRole,
       selfServerId: tunnel.peerServerId,
@@ -1804,7 +1837,36 @@ export class PortForwardEngine {
       capability: tunnel.capability,
       ecdhPublicKey: msg.peerPublicKey,
       candidates: msg.peerCandidates,
-    }, msg.peerIdentitySignature)) {
+    };
+
+    if (!trustedPeerPublicKey) {
+      if (!this.isTrustOnFirstUseEnabled()) {
+        this.closeTunnel(tunnel.tunnelId, PORT_FORWARD_ERRORS.SCOPED_AUTH, false);
+        this.emitError(
+          tunnel.tunnelId,
+          PORT_FORWARD_ERRORS.SCOPED_AUTH,
+          `untrusted_peer_identity: missing local trusted public key for peer "${tunnel.peerServerId}"`,
+        );
+        return;
+      }
+      if (
+        !validateEd25519SpkiPublicKey(msg.peerIdentityPublicKey)
+        || !verifyPortForwardTranscript(msg.peerIdentityPublicKey, transcript, msg.peerIdentitySignature)
+        || !this.pinPeerPublicKeyOnFirstUse(tunnel.peerServerId, msg.peerIdentityPublicKey)
+      ) {
+        this.closeTunnel(tunnel.tunnelId, PORT_FORWARD_ERRORS.SCOPED_AUTH, false);
+        this.emitError(
+          tunnel.tunnelId,
+          PORT_FORWARD_ERRORS.SCOPED_AUTH,
+          `peer identity signature verification failed for "${tunnel.peerServerId}"`,
+        );
+        return;
+      }
+      trustedPeerPublicKey = msg.peerIdentityPublicKey;
+    } else if (
+      msg.peerIdentityPublicKey !== trustedPeerPublicKey
+      || !verifyPortForwardTranscript(trustedPeerPublicKey, transcript, msg.peerIdentitySignature)
+    ) {
       this.closeTunnel(tunnel.tunnelId, PORT_FORWARD_ERRORS.SCOPED_AUTH, false);
       this.emitError(
         tunnel.tunnelId,

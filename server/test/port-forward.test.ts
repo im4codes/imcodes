@@ -9,12 +9,15 @@ import {
   PORT_FORWARD_ERRORS,
   PORT_FORWARD_LIMITS,
   PORT_FORWARD_MSG,
+  PORT_FORWARD_ROLE,
   PORT_FORWARD_TRANSPORT,
   PORT_FORWARD_TRANSPORT_PREF,
+  validatePortForwardWireMessage,
 } from '../../shared/port-forward.js';
 import { CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD } from '../../shared/controlled-node-abi.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { OWNER_MACHINE_AUTHORITY_TYPE, SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
+import { stringifyForServerSend } from '../../src/daemon/latency-tracer.js';
 import { generateEndpointIdentityKeyPair } from '../../src/daemon/port-forward-crypto.js';
 import { PortForwardEngine } from '../../src/daemon/port-forward-engine.js';
 import { signJwt } from '../src/security/crypto.js';
@@ -2827,5 +2830,84 @@ describe('server port-forward router & HTTP control plane', () => {
     expect(engA.listTunnels()).toHaveLength(0);
     expect(engT.listTunnels()).toHaveLength(0);
     expect((await baseStore.getTunnel(tid))?.status).toBe('closed');
+  });
+
+  it('accepts and strips optional non-negative safe integer seq from ServerLink frames across all port_forward.* types while rejecting invalid seq or unknown keys', () => {
+    const tunnelId = 'pf_seq_envelope_0001';
+    const samplePubKey = generateEndpointIdentityKeyPair().publicKeyB64;
+    const sampleCap = 'c'.repeat(43);
+    const sampleProof = 'p'.repeat(43);
+    const sampleSig = 's'.repeat(86);
+    const validMessages = [
+      {
+        type: PORT_FORWARD_MSG.PREPARE,
+        tunnelId,
+        role: PORT_FORWARD_ROLE.LISTEN,
+        capability: sampleCap,
+        selfServerId: 'srv_a',
+        peerServerId: 'srv_b',
+        listenHost: '127.0.0.1',
+        listenPort: 0,
+        transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
+        iceServers: [],
+        ttlMs: 60_000,
+      },
+      {
+        type: PORT_FORWARD_MSG.READY,
+        tunnelId,
+        role: PORT_FORWARD_ROLE.LISTEN,
+        listenPort: 41234,
+        publicKey: samplePubKey,
+        keyProof: sampleProof,
+        identityPublicKey: samplePubKey,
+        identitySignature: sampleSig,
+        candidates: [{ transport: 'tcp' as const, kind: 'host' as const, host: '127.0.0.1', port: 41235 }],
+      },
+      {
+        type: PORT_FORWARD_MSG.CONNECT,
+        tunnelId,
+        role: PORT_FORWARD_ROLE.LISTEN,
+        peerPublicKey: samplePubKey,
+        peerKeyProof: sampleProof,
+        peerIdentityPublicKey: samplePubKey,
+        peerIdentitySignature: sampleSig,
+        peerCandidates: [],
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      },
+      { type: PORT_FORWARD_MSG.TARGET_READY, tunnelId },
+      { type: PORT_FORWARD_MSG.ESTABLISHED, tunnelId, role: PORT_FORWARD_ROLE.LISTEN, transportMode: PORT_FORWARD_TRANSPORT.RELAY, listenPort: 41234 },
+      { type: PORT_FORWARD_MSG.CLOSE, tunnelId, reason: 'done', role: PORT_FORWARD_ROLE.LISTEN },
+      { type: PORT_FORWARD_MSG.CLOSE_ACK, tunnelId, role: PORT_FORWARD_ROLE.LISTEN },
+      { type: PORT_FORWARD_MSG.ERROR, tunnelId, reason: PORT_FORWARD_ERRORS.SCOPED_AUTH, error: 'bad_auth' },
+      { type: PORT_FORWARD_MSG.RELAY_FRAME, tunnelId, data: 'AQID' },
+      { type: PORT_FORWARD_MSG.RELAY_BACKPRESSURE, tunnelId, paused: true },
+      { type: PORT_FORWARD_MSG.STATS, tunnelId, activeConnections: 1, bytesSent: 10, bytesReceived: 20 },
+    ];
+
+    let seq = 0;
+    for (const msg of validMessages) {
+      // Unwrapped controlled-node frame still passes
+      const withoutSeq = validatePortForwardWireMessage(msg);
+      expect(withoutSeq.ok).toBe(true);
+
+      // Real FULL Daemon ServerLink envelope frame with seq passes and strips seq
+      const { payload } = stringifyForServerSend(msg, seq);
+      const parsed = validatePortForwardWireMessage(JSON.parse(payload));
+      expect(parsed.ok).toBe(true);
+      if (parsed.ok) {
+        expect('seq' in parsed.value).toBe(false);
+        expect(parsed.value.type).toBe(msg.type);
+      }
+      seq = seq === 0 ? Number.MAX_SAFE_INTEGER : 1;
+    }
+
+    const readyBase = validMessages[1]!;
+    for (const badSeq of [-1, 1.5, '1', Number.NaN, null, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      const res = validatePortForwardWireMessage({ ...readyBase, seq: badSeq });
+      expect(res).toEqual({ ok: false, error: 'invalid_seq' });
+    }
+
+    const extraKeyRes = validatePortForwardWireMessage({ ...readyBase, seq: 3, unexpectedField: true });
+    expect(extraKeyRes).toEqual({ ok: false, error: 'invalid_keys' });
   });
 });

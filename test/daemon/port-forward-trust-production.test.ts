@@ -19,6 +19,9 @@ import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { closeDaemonPortForwards, handleWebCommand, setRouterContext } from '../../src/daemon/command-handler.js';
 import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
 import { createMemoryMcpServerFromEnv } from '../../src/daemon/memory-mcp-server.js';
+import { stringifyForServerSend } from '../../src/daemon/latency-tracer.js';
+import { loadTrustedPeerPublicKeys } from '../../src/daemon/port-forward-crypto.js';
+import { PORT_FORWARD_STRICT_TRUST_ENV } from '../../src/daemon/port-forward-engine.js';
 import { runPortForwardCliCommand } from '../../src/daemon/port-forward-trust-cli.js';
 import { openPortForward, listPortForwards, closePortForward } from '../../src/daemon/port-forward-client.js';
 import type { ServerLink } from '../../src/daemon/server-link.js';
@@ -266,14 +269,19 @@ describe('port-forward production identity & trust enrollment (P0 #1)', () => {
       }, 15);
       poll.unref?.();
     });
+    let fullOutboundSeq = 0;
     const serverLinkShim = {
       trySend: (msg: Record<string, unknown>) => {
         if (fullWs.readyState !== fullWs.OPEN) return false;
-        fullWs.send(JSON.stringify(msg));
+        // Exercise the exact FULL Daemon ServerLink frame serializer (injects seq field).
+        fullWs.send(stringifyForServerSend(msg, ++fullOutboundSeq).payload);
         return true;
       },
       getWsBufferedAmount: () => fullWs.bufferedAmount,
     } as unknown as ServerLink;
+    cleanupFns.push(() => {
+      delete process.env[PORT_FORWARD_STRICT_TRUST_ENV];
+    });
     fullWs.on('message', (buf) => {
       const msg = JSON.parse(buf.toString('utf8')) as { type?: string };
       if (msg.type && isPortForwardMessageType(msg.type)) {
@@ -346,7 +354,50 @@ describe('port-forward production identity & trust enrollment (P0 #1)', () => {
     });
     expect(discoverRes.isError).not.toBe(true);
 
-    // 2. BEFORE trust registration: MCP port_forward_open MUST fail closed (relay-independent trust not established!).
+    // 2. Out-of-the-box TOFU with zero pre-written JSON + real ServerLink seq frames:
+    //    MCP port_forward_open succeeds immediately, forwards traffic, and atomically pins peer keys on both nodes.
+    const tofuOpen = await mcpClient.callTool({
+      name: MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN,
+      arguments: { listenNode: 'local', targetNode: ctlNodeId, targetPort: backendPort, transport: PORT_FORWARD_TRANSPORT_PREF.RELAY },
+    });
+    expect(tofuOpen.isError).not.toBe(true);
+    expect(fullOutboundSeq).toBeGreaterThan(0);
+    const tofuPayload = mcpToolPayload<{
+      status: string;
+      tunnelId: string;
+      listenPort: number;
+      transportMode: string;
+    }>(tofuOpen);
+    expect(tofuPayload.status).toBe('ok');
+    const tofuBody = await new Promise<string>((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port: tofuPayload.listenPort, path: '/' }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    expect(JSON.parse(tofuBody)).toEqual({ ok: true, via: 'production-trust-cli' });
+    await mcpClient.callTool({
+      name: MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE,
+      arguments: { tunnelId: tofuPayload.tunnelId },
+    });
+
+    // Verify TOFU wrote persistent trust files on both sides cleanly
+    expect(loadTrustedPeerPublicKeys(join(fullHome, 'port-forward-trusted-peers.json')).get(ctlId)).toBeTruthy();
+    expect(loadTrustedPeerPublicKeys(join(ctlDir, 'port-forward-trusted-peers.json')).get(fullId)).toBeTruthy();
+
+    // Remove trusted peer entry and enable strict mode: MCP port_forward_open MUST now fail closed before explicit CLI registration!
+    expect(await runPortForwardCliCommand(['trust', 'remove', ctlId], {
+      role: 'full',
+      stateDir: fullHome,
+      credentialPath: join(fullHome, 'server.json'),
+      stdout: () => {},
+      stderr: () => {},
+    })).toBe(0);
+    process.env[PORT_FORWARD_STRICT_TRUST_ENV] = '1';
+
     const untrustedOpen = await mcpClient.callTool({
       name: MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN,
       arguments: { listenNode: 'local', targetNode: ctlNodeId, targetPort: backendPort, transport: PORT_FORWARD_TRANSPORT_PREF.RELAY },

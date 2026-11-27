@@ -565,14 +565,25 @@ export function validatePortForwardOpenRequest(
 }
 
 export function validatePortForwardWireMessage(
-  raw: unknown,
+  rawInput: unknown,
 ): { ok: true; value: PortForwardWireMessage } | { ok: false; error: string } {
-  if (!isObject(raw)) return { ok: false, error: 'invalid_object' };
-  const type = raw.type;
+  if (!isObject(rawInput)) return { ok: false, error: 'invalid_object' };
+  const type = rawInput.type;
   if (!isPortForwardMessageType(type)) return { ok: false, error: 'invalid_type' };
-  const tunnelId = raw.tunnelId;
+  const tunnelId = rawInput.tunnelId;
   if (typeof tunnelId !== 'string' || !TUNNEL_ID_RE.test(tunnelId)) {
     return { ok: false, error: 'invalid_tunnel_id' };
+  }
+  let raw: Record<string, unknown> = rawInput;
+  if (Object.prototype.hasOwnProperty.call(rawInput, 'seq')) {
+    if (
+      rawInput.seq !== undefined
+      && (typeof rawInput.seq !== 'number' || !Number.isSafeInteger(rawInput.seq) || rawInput.seq < 0)
+    ) {
+      return { ok: false, error: 'invalid_seq' };
+    }
+    const { seq: _seq, ...rest } = rawInput;
+    raw = rest;
   }
 
   switch (type) {

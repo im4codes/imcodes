@@ -1,7 +1,10 @@
 import { createDecipheriv, createHash, createHmac, hkdfSync, randomBytes } from 'node:crypto';
 import { createSocket } from 'node:dgram';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { connect as tcpConnect, createServer as createTcpServer, type Server as NetServer, type Socket as NetSocket } from 'node:net';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import WebSocket, { WebSocketServer } from 'ws';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -14,14 +17,16 @@ import {
   type PortForwardCandidate,
   type PortForwardWireMessage,
 } from '../../shared/port-forward.js';
+import { stringifyForServerSend } from '../../src/daemon/latency-tracer.js';
 import {
   computeEphemeralKeyProof,
   deriveAdmissionMacKey,
   generateEndpointIdentityKeyPair,
   generateEphemeralEcdhKeyPair,
+  loadTrustedPeerPublicKeys,
   signPortForwardTranscript,
 } from '../../src/daemon/port-forward-crypto.js';
-import { PortForwardEngine } from '../../src/daemon/port-forward-engine.js';
+import { PORT_FORWARD_STRICT_TRUST_ENV, PortForwardEngine } from '../../src/daemon/port-forward-engine.js';
 import { probeStunCandidates } from '../../src/daemon/port-forward-stun.js';
 import { PortForwardRouter, type PortForwardBridgeEndpoint } from '../../server/src/ws/port-forward-router.js';
 
@@ -824,5 +829,383 @@ describe('PortForwardEngine 3-tier transport & mux suites', () => {
     expect(eps).toEqual([]);
     expect(Date.now() - start).toBeLessThan(1_000);
     expect(probeSock.listenerCount('message')).toBe(0);
+  });
+
+  it('connects end-to-end when FULL daemon wraps every port_forward.* message with stringifyForServerSend seq', async () => {
+    const backend = await startTestAppServer();
+    cleanupCallbacks.push(() => backend.close());
+
+    let listenSeq = 0;
+    const { router, listenEngine, targetEngine } = createPairedEngines({
+      listenOpts: {
+        disableDirectTcp: true,
+        disableDirectUdp: true,
+        sendWs: (msg) => {
+          const { payload } = stringifyForServerSend(msg, ++listenSeq);
+          const wire = JSON.parse(payload);
+          queueMicrotask(() => {
+            router.handleDaemonMessage('node_a', 1, wire);
+          });
+        },
+      },
+      targetOpts: { disableDirectTcp: true, disableDirectUdp: true },
+    });
+    cleanupCallbacks.push(() => {
+      listenEngine.closeAll();
+      targetEngine.closeAll();
+    });
+
+    const opened = await router.openTunnel({
+      userId: 'u_seq',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: backend.port,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    expect(listenSeq).toBeGreaterThan(0);
+
+    const res = await httpGet(opened.tunnel.listenPort, '/hello');
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body.toString('utf8'))).toEqual({ ok: true, secret: 'TOP_SECRET_HTTP_BODY' });
+    await router.closeTunnelForUser('u_seq', opened.tunnel.tunnelId);
+  });
+
+  it('auto-pins unknown peers on first authenticated use (TOFU), reuses persisted pins across restarts, rejects MITM key changes without overwriting, and honors strict mode', async () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'pf-tofu-'));
+    cleanupCallbacks.push(() => {
+      delete process.env[PORT_FORWARD_STRICT_TRUST_ENV];
+      rmSync(tmpRoot, { recursive: true, force: true });
+    });
+
+    const backend = await startTestAppServer();
+    cleanupCallbacks.push(() => backend.close());
+
+    const peersA = join(tmpRoot, 'peers-a.json');
+    const peersB = join(tmpRoot, 'peers-b.json');
+    const idA = generateEndpointIdentityKeyPair();
+    const idB = generateEndpointIdentityKeyPair();
+
+    const bridges = new Map<string, PortForwardBridgeEndpoint>();
+    const router = new PortForwardRouter({
+      lookupBridge: (id) => bridges.get(id),
+      getIceServers: () => [],
+      prepareTimeoutMs: 3_000,
+      establishTimeoutMs: 5_000,
+    });
+
+    const makeEngines = () => {
+      const engA = new PortForwardEngine({
+        sendWs: (msg) => { queueMicrotask(() => router.handleDaemonMessage('node_a', 1, msg)); },
+        collectInterfaceAddresses: () => ['127.0.0.1'],
+        identityKeyPair: idA,
+        trustedPeersFilePath: peersA,
+        disableDirectTcp: true,
+        disableDirectUdp: true,
+      });
+      const engB = new PortForwardEngine({
+        sendWs: (msg) => { queueMicrotask(() => router.handleDaemonMessage('node_b', 1, msg)); },
+        collectInterfaceAddresses: () => ['127.0.0.1'],
+        identityKeyPair: idB,
+        trustedPeersFilePath: peersB,
+        disableDirectTcp: true,
+        disableDirectUdp: true,
+      });
+      bridges.set('node_a', {
+        isDaemonConnected: () => true,
+        daemonConnectionGeneration: () => 1,
+        trySendPortForward: (m) => { void engA.handleMessage(m); return true; },
+      });
+      bridges.set('node_b', {
+        isDaemonConnected: () => true,
+        daemonConnectionGeneration: () => 1,
+        trySendPortForward: (m) => { void engB.handleMessage(m); return true; },
+      });
+      router.onDaemonConnected('node_a', 1);
+      router.onDaemonConnected('node_b', 1);
+      return { engA, engB };
+    };
+
+    // 1. First connection with zero pre-written trusted peers succeeds via TOFU and persists both files
+    const first = makeEngines();
+    cleanupCallbacks.push(() => { first.engA.closeAll(); first.engB.closeAll(); });
+    const concurrentTunnels = await Promise.all([
+      router.openTunnel({
+        userId: 'u_tofu',
+        listenNode: 'node_a',
+        listenServerId: 'node_a',
+        listenPort: 0,
+        targetNode: 'node_b',
+        targetServerId: 'node_b',
+        targetHost: '127.0.0.1',
+        targetPort: backend.port,
+        ttlSeconds: 120,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      }),
+      router.openTunnel({
+        userId: 'u_tofu',
+        listenNode: 'node_a',
+        listenServerId: 'node_a',
+        listenPort: 0,
+        targetNode: 'node_b',
+        targetServerId: 'node_b',
+        targetHost: '127.0.0.1',
+        targetPort: backend.port,
+        ttlSeconds: 120,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      }),
+    ]);
+    for (const opened of concurrentTunnels) {
+      expect(opened.ok).toBe(true);
+      if (opened.ok) {
+        const res = await httpGet(opened.tunnel.listenPort, '/hello');
+        expect(res.status).toBe(200);
+        expect(JSON.parse(res.body.toString('utf8'))).toEqual({ ok: true, secret: 'TOP_SECRET_HTTP_BODY' });
+        await router.closeTunnelForUser('u_tofu', opened.tunnel.tunnelId);
+      }
+    }
+    expect(loadTrustedPeerPublicKeys(peersA).get('node_b')).toBe(idB.publicKeyB64);
+    expect(loadTrustedPeerPublicKeys(peersB).get('node_a')).toBe(idA.publicKeyB64);
+
+    // 2. New engine instances reuse persisted pins cleanly
+    first.engA.closeAll();
+    first.engB.closeAll();
+    const second = makeEngines();
+    cleanupCallbacks.push(() => { second.engA.closeAll(); second.engB.closeAll(); });
+    const reopened = await router.openTunnel({
+      userId: 'u_tofu',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: backend.port,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(reopened.ok).toBe(true);
+    if (reopened.ok) {
+      await router.closeTunnelForUser('u_tofu', reopened.tunnel.tunnelId);
+    }
+
+    // 3. Swapped peer identity key K2 must fail closed and MUST NOT overwrite pinned K1 on disk
+    const swappedIdentity = generateEndpointIdentityKeyPair();
+    const attackerEcdh = generateEphemeralEcdhKeyPair();
+    const emittedOnMismatch: PortForwardWireMessage[] = [];
+    const mismatchEngine = new PortForwardEngine({
+      sendWs: (m) => { emittedOnMismatch.push(m); },
+      identityKeyPair: idA,
+      trustedPeersFilePath: peersA,
+    });
+    cleanupCallbacks.push(() => mismatchEngine.closeAll());
+    const tidMismatch = 'pf_tofu_swap_0001';
+    const capMismatch = randomBytes(32).toString('base64url');
+    const macMismatch = deriveAdmissionMacKey(capMismatch, tidMismatch);
+    await mismatchEngine.handleMessage({
+      type: PORT_FORWARD_MSG.PREPARE,
+      tunnelId: tidMismatch,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      capability: capMismatch,
+      selfServerId: 'node_a',
+      peerServerId: 'node_b',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      iceServers: [],
+      ttlMs: 60_000,
+    });
+    await mismatchEngine.handleMessage({
+      type: PORT_FORWARD_MSG.CONNECT,
+      tunnelId: tidMismatch,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      peerCandidates: [],
+      peerPublicKey: attackerEcdh.publicKeyB64,
+      peerKeyProof: computeEphemeralKeyProof(macMismatch, {
+        tunnelId: tidMismatch,
+        role: PORT_FORWARD_ROLE.TARGET,
+        selfServerId: 'node_b',
+        peerServerId: 'node_a',
+        publicKey: attackerEcdh.publicKeyB64,
+      }),
+      peerIdentityPublicKey: swappedIdentity.publicKeyB64,
+      peerIdentitySignature: signPortForwardTranscript(swappedIdentity.privateKey, {
+        tunnelId: tidMismatch,
+        role: PORT_FORWARD_ROLE.TARGET,
+        selfServerId: 'node_b',
+        peerServerId: 'node_a',
+        capability: capMismatch,
+        ecdhPublicKey: attackerEcdh.publicKeyB64,
+        candidates: [],
+      }),
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(emittedOnMismatch.some((m) => m.type === PORT_FORWARD_MSG.ERROR && m.reason === PORT_FORWARD_ERRORS.SCOPED_AUTH)).toBe(true);
+    expect(loadTrustedPeerPublicKeys(peersA).get('node_b')).toBe(idB.publicKeyB64);
+
+    // 4. Unwritable trustedPeersFilePath parent falls back to in-memory pin without crashing and rejects later key change
+    const blockingFile = join(tmpRoot, 'not-a-directory');
+    writeFileSync(blockingFile, 'x', 'utf8');
+    const roMsgs: PortForwardWireMessage[] = [];
+    const roEngine = new PortForwardEngine({
+      sendWs: (m) => { roMsgs.push(m); },
+      identityKeyPair: idA,
+      trustedPeersFilePath: join(blockingFile, 'peers.json'),
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+    });
+    cleanupCallbacks.push(() => roEngine.closeAll());
+    const peerB = generateEndpointIdentityKeyPair();
+    const peerBEcdh = generateEphemeralEcdhKeyPair();
+    const tidRo1 = 'pf_tofu_readonly_0001';
+    const capRo1 = randomBytes(32).toString('base64url');
+    const macRo1 = deriveAdmissionMacKey(capRo1, tidRo1);
+    await roEngine.handleMessage({
+      type: PORT_FORWARD_MSG.PREPARE,
+      tunnelId: tidRo1,
+      role: PORT_FORWARD_ROLE.TARGET,
+      capability: capRo1,
+      selfServerId: 'node_a',
+      peerServerId: 'node_ro',
+      targetHost: '127.0.0.1',
+      targetPort: backend.port,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      iceServers: [],
+      ttlMs: 60_000,
+    });
+    await roEngine.handleMessage({
+      type: PORT_FORWARD_MSG.CONNECT,
+      tunnelId: tidRo1,
+      role: PORT_FORWARD_ROLE.TARGET,
+      peerCandidates: [],
+      peerPublicKey: peerBEcdh.publicKeyB64,
+      peerKeyProof: computeEphemeralKeyProof(macRo1, {
+        tunnelId: tidRo1,
+        role: PORT_FORWARD_ROLE.LISTEN,
+        selfServerId: 'node_ro',
+        peerServerId: 'node_a',
+        publicKey: peerBEcdh.publicKeyB64,
+      }),
+      peerIdentityPublicKey: peerB.publicKeyB64,
+      peerIdentitySignature: signPortForwardTranscript(peerB.privateKey, {
+        tunnelId: tidRo1,
+        role: PORT_FORWARD_ROLE.LISTEN,
+        selfServerId: 'node_ro',
+        peerServerId: 'node_a',
+        capability: capRo1,
+        ecdhPublicKey: peerBEcdh.publicKeyB64,
+        candidates: [],
+      }),
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(roMsgs.some((m) => m.type === PORT_FORWARD_MSG.TARGET_READY && m.tunnelId === tidRo1)).toBe(true);
+
+    // Second connection to node_ro with a different key MUST still fail against in-memory pin
+    const tidRo2 = 'pf_tofu_readonly_0002';
+    const capRo2 = randomBytes(32).toString('base64url');
+    const macRo2 = deriveAdmissionMacKey(capRo2, tidRo2);
+    await roEngine.handleMessage({
+      type: PORT_FORWARD_MSG.PREPARE,
+      tunnelId: tidRo2,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      capability: capRo2,
+      selfServerId: 'node_a',
+      peerServerId: 'node_ro',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      iceServers: [],
+      ttlMs: 60_000,
+    });
+    await roEngine.handleMessage({
+      type: PORT_FORWARD_MSG.CONNECT,
+      tunnelId: tidRo2,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      peerCandidates: [],
+      peerPublicKey: attackerEcdh.publicKeyB64,
+      peerKeyProof: computeEphemeralKeyProof(macRo2, {
+        tunnelId: tidRo2,
+        role: PORT_FORWARD_ROLE.TARGET,
+        selfServerId: 'node_ro',
+        peerServerId: 'node_a',
+        publicKey: attackerEcdh.publicKeyB64,
+      }),
+      peerIdentityPublicKey: swappedIdentity.publicKeyB64,
+      peerIdentitySignature: signPortForwardTranscript(swappedIdentity.privateKey, {
+        tunnelId: tidRo2,
+        role: PORT_FORWARD_ROLE.TARGET,
+        selfServerId: 'node_ro',
+        peerServerId: 'node_a',
+        capability: capRo2,
+        ecdhPublicKey: attackerEcdh.publicKeyB64,
+        candidates: [],
+      }),
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(roMsgs.some((m) => m.tunnelId === tidRo2 && m.type === PORT_FORWARD_MSG.ERROR && m.reason === PORT_FORWARD_ERRORS.SCOPED_AUTH)).toBe(true);
+
+    // 5. Strict mode via option or env rejects unknown peers cleanly
+    const strictFile = join(tmpRoot, 'strict-peers.json');
+    for (const mode of ['option_false', 'strict_flag', 'env'] as const) {
+      if (mode === 'env') process.env[PORT_FORWARD_STRICT_TRUST_ENV] = '1';
+      else delete process.env[PORT_FORWARD_STRICT_TRUST_ENV];
+      const strictMsgs: PortForwardWireMessage[] = [];
+      const strictEngine = new PortForwardEngine({
+        sendWs: (m) => { strictMsgs.push(m); },
+        identityKeyPair: idA,
+        trustedPeersFilePath: strictFile,
+        ...(mode === 'option_false' ? { trustOnFirstUse: false } : {}),
+        ...(mode === 'strict_flag' ? { strictPinnedTrust: true } : {}),
+      });
+      const tidStrict = `pf_strict_check_${mode}`;
+      const capStrict = randomBytes(32).toString('base64url');
+      const macStrict = deriveAdmissionMacKey(capStrict, tidStrict);
+      await strictEngine.handleMessage({
+        type: PORT_FORWARD_MSG.PREPARE,
+        tunnelId: tidStrict,
+        role: PORT_FORWARD_ROLE.LISTEN,
+        capability: capStrict,
+        selfServerId: 'node_a',
+        peerServerId: 'node_unknown',
+        listenHost: '127.0.0.1',
+        listenPort: 0,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+        iceServers: [],
+        ttlMs: 60_000,
+      });
+      await strictEngine.handleMessage({
+        type: PORT_FORWARD_MSG.CONNECT,
+        tunnelId: tidStrict,
+        role: PORT_FORWARD_ROLE.LISTEN,
+        peerCandidates: [],
+        peerPublicKey: peerBEcdh.publicKeyB64,
+        peerKeyProof: computeEphemeralKeyProof(macStrict, {
+          tunnelId: tidStrict,
+          role: PORT_FORWARD_ROLE.TARGET,
+          selfServerId: 'node_unknown',
+          peerServerId: 'node_a',
+          publicKey: peerBEcdh.publicKeyB64,
+        }),
+        peerIdentityPublicKey: peerB.publicKeyB64,
+        peerIdentitySignature: signPortForwardTranscript(peerB.privateKey, {
+          tunnelId: tidStrict,
+          role: PORT_FORWARD_ROLE.TARGET,
+          selfServerId: 'node_unknown',
+          peerServerId: 'node_a',
+          capability: capStrict,
+          ecdhPublicKey: peerBEcdh.publicKeyB64,
+          candidates: [],
+        }),
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      });
+      strictEngine.closeAll();
+      expect(strictMsgs.some((m) => m.type === PORT_FORWARD_MSG.ERROR && m.error.includes('untrusted_peer_identity'))).toBe(true);
+    }
   });
 });
