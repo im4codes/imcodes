@@ -329,8 +329,44 @@ describe('resolveCursorPathForSdk (cursor-agent and agent resolution)', () => {
         prependArgs: [],
       });
 
-      // Even if active.txt points to a missing version, static .ps1 launchability fails closed -> bad wrapper rejected
+      // Forged/staged active.txt pins (`.new`, `.NEW`, trailing-dot Windows synonyms) in BOTH
+      // `versions/active.txt` and `scriptPath/active.txt` must NEVER populate `direct` with `.new`;
+      // `promoteStep` stays armed and `direct` remains null until a formal active dir exists.
+      for (const pinLoc of [
+        path.join(stagedOnlyDir, 'versions', 'active.txt'),
+        path.join(stagedOnlyDir, 'active.txt'),
+      ]) {
+        for (const badPin of [
+          '2026.12.01-f1e2d3c.new',
+          '2026.12.01-f1e2d3c.NEW',
+          '2026.12.01-f1e2d3c.new.',
+        ]) {
+          fs.writeFileSync(pinLoc, `${badPin}\n`);
+          const forgedPlan = resolveCursorCmdLauncherPlan(stagedOnlyCmd);
+          expect(forgedPlan?.direct).toBeNull();
+          expect(forgedPlan?.promoteStep).toEqual({
+            executable: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+            prependArgs: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', stagedOnlyPs1],
+          });
+          expect(hasPendingCursorStagedUpdate(forgedPlan!)).toBe(true);
+          expect(resolveCursorCmdLauncher(stagedOnlyCmd)).toBeNull();
+        }
+        fs.unlinkSync(pinLoc);
+      }
+
+      // Healthy formal pin in active.txt continues to select the exact formal version directory.
       const activeTxt = path.join(goodDir, 'versions', 'active.txt');
+      fs.writeFileSync(activeTxt, '2026.05.05-a1b2c3d\n');
+      expect(resolveCursorCmdLauncher(agentCmd)).toEqual({ executable: oldNode, prependArgs: [oldIndex] });
+
+      // Forged .new pin when healthy formal version(s) ALSO exist alongside .new falls back ONLY to healthy formal dirs.
+      fs.writeFileSync(activeTxt, '2026.12.01-f1e2d3c.new\n');
+      const forgedWithHealthyPlan = resolveCursorCmdLauncherPlan(agentCmd);
+      expect(forgedWithHealthyPlan?.direct).toEqual({ executable: newNode, prependArgs: [newIndex] });
+      expect(forgedWithHealthyPlan?.promoteStep).toEqual(expectedPsPromote);
+      fs.unlinkSync(activeTxt);
+
+      // Even if active.txt points to a missing version, static .ps1 launchability fails closed -> bad wrapper rejected
       fs.writeFileSync(activeTxt, '2099.01.01-missing\n');
       expect(resolveCursorCmdLauncher(agentCmd)).toBeNull();
       fs.unlinkSync(activeTxt);

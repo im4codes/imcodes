@@ -700,6 +700,49 @@ function resolveCursorVersionDirExecutable(verDir: string, fixedFlags: string[])
   return null;
 }
 
+function sanitizeCursorVersionPinSegment(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  if (/[\\/:*?"<>|\0\s~]/.test(trimmed)) return null;
+  if (trimmed === '.' || trimmed === '..' || trimmed.endsWith('.')) return null;
+  if (/\.new$/i.test(trimmed)) return null;
+  return trimmed;
+}
+
+function parseActiveCursorVersionPin(raw: string): string | null {
+  const segment = sanitizeCursorVersionPinSegment(raw);
+  if (!segment) return null;
+  return CURSOR_PS1_VERSION_RE.test(segment) ? segment : null;
+}
+
+function resolveFormalVersionDirExecutable(versionsDir: string, activeVer: string, fixedFlags: string[]): ResolvedExecutable | null {
+  const validPin = parseActiveCursorVersionPin(activeVer);
+  if (!validPin) return null;
+  let matchedName: string | null = null;
+  try {
+    const entries = readdirSync(versionsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      if (!parseActiveCursorVersionPin(entry.name)) continue;
+      if (entry.name.toLowerCase() === validPin.toLowerCase()) {
+        matchedName = entry.name;
+        break;
+      }
+    }
+  } catch {
+    return null;
+  }
+  if (!matchedName) return null;
+  const verDir = joinSmart(versionsDir, matchedName);
+  try {
+    const resolvedBase = baseNameSmart(realpathSync(verDir));
+    if (!parseActiveCursorVersionPin(resolvedBase)) return null;
+  } catch {
+    return null;
+  }
+  return resolveCursorVersionDirExecutable(verDir, fixedFlags);
+}
+
 function resolveCursorPs1LauncherPlan(ps1Path: string): CursorPs1Resolution | null {
   let content: string;
   try {
@@ -723,14 +766,19 @@ function resolveCursorPs1LauncherPlan(ps1Path: string): CursorPs1Resolution | nu
   // Case 2: active.txt version pin (check both scriptPath\active.txt and scriptPath\versions\active.txt)
   for (const activeFile of [joinSmart(ps1Dir, 'active.txt'), joinSmart(versionsDir, 'active.txt')]) {
     if (!isRegularFileSync(activeFile)) continue;
-    let activeVer = '';
+    let rawPin = '';
     try {
-      activeVer = readFileSync(activeFile, 'utf8').trim();
+      rawPin = readFileSync(activeFile, 'utf8').trim();
     } catch {
       return null;
     }
-    if (!activeVer || /[\\/]/.test(activeVer)) return null;
-    const activeExec = resolveCursorVersionDirExecutable(joinSmart(versionsDir, activeVer), fixedFlags);
+    const activeVer = sanitizeCursorVersionPinSegment(rawPin);
+    if (!activeVer) {
+      // Pin points to a staged `.new` name or Windows synonym/traversal path:
+      // ignore the invalid pin and fall through to validated formal/staged-promote resolution.
+      continue;
+    }
+    const activeExec = resolveFormalVersionDirExecutable(versionsDir, activeVer, fixedFlags);
     if (activeExec) {
       return { active: activeExec };
     }
@@ -739,7 +787,7 @@ function resolveCursorPs1LauncherPlan(ps1Path: string): CursorPs1Resolution | nu
     if (hasPromoteHook && resolveCursorVersionDirExecutable(joinSmart(versionsDir, `${activeVer}.new`), fixedFlags)) {
       return { active: null };
     }
-    // Fail closed if active.txt points to an incomplete/missing directory.
+    // Fail closed if formal pin points to an incomplete/missing directory.
     return null;
   }
 
@@ -748,13 +796,13 @@ function resolveCursorPs1LauncherPlan(ps1Path: string): CursorPs1Resolution | nu
   if (!hasVersionsLookup) return null;
 
   try {
-    const dirEntries = readdirSync(versionsDir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    const dirEntries = readdirSync(versionsDir, { withFileTypes: true }).filter((entry) => entry.isDirectory() || entry.isSymbolicLink());
     const entries = dirEntries
-      .filter((entry) => CURSOR_PS1_VERSION_RE.test(entry.name))
+      .filter((entry) => parseActiveCursorVersionPin(entry.name) !== null)
       .map((entry) => entry.name)
       .sort(compareCursorVersionDirsDesc);
     for (const ver of entries) {
-      const activeExec = resolveCursorVersionDirExecutable(joinSmart(versionsDir, ver), fixedFlags);
+      const activeExec = resolveFormalVersionDirExecutable(versionsDir, ver, fixedFlags);
       if (activeExec) {
         return { active: activeExec };
       }
@@ -763,11 +811,11 @@ function resolveCursorPs1LauncherPlan(ps1Path: string): CursorPs1Resolution | nu
     // NEVER that `.new` itself can be launched directly when promotion fails or does not activate it.
     if (hasPromoteHook) {
       const stagedEntries = dirEntries
-        .filter((entry) => entry.name.endsWith('.new') && CURSOR_PS1_VERSION_RE.test(entry.name.slice(0, -4)))
-        .map((entry) => entry.name.slice(0, -4))
-        .sort(compareCursorVersionDirsDesc);
-      for (const ver of stagedEntries) {
-        if (resolveCursorVersionDirExecutable(joinSmart(versionsDir, `${ver}.new`), fixedFlags)) {
+        .filter((entry) => /\.new$/i.test(entry.name) && parseActiveCursorVersionPin(entry.name.slice(0, -4)) !== null)
+        .map((entry) => entry.name)
+        .sort((a, b) => compareCursorVersionDirsDesc(a.slice(0, -4), b.slice(0, -4)));
+      for (const stagedName of stagedEntries) {
+        if (resolveCursorVersionDirExecutable(joinSmart(versionsDir, stagedName), fixedFlags)) {
           return { active: null };
         }
       }
@@ -845,8 +893,8 @@ export function resolveCursorCmdLauncherPlan(cmdPath: string, depth = 0): Cursor
       const activePath = expandBatchPath(setPromptMatch[2]!.trim(), dp0, vars);
       if (!isRegularFileSync(activePath)) return null;
       try {
-        const val = readFileSync(activePath, 'utf8').trim();
-        if (!val || /[\\/]/.test(val)) return null;
+        const val = parseActiveCursorVersionPin(readFileSync(activePath, 'utf8'));
+        if (!val) return null;
         vars[varKey] = val;
       } catch {
         return null;

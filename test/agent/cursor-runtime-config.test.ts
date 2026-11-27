@@ -276,5 +276,72 @@ describe('cursor-runtime-config parsers', () => {
       expect(calls[1]?.file).toBe(oldDirect.executable);
       expect(calls[2]?.file).toBe(oldDirect.executable);
     });
+
+    it('rejects .new pins in active.txt through real transport-paths resolution during model probe', async () => {
+      const actualTp = await vi.importActual<typeof import('../../src/agent/transport-paths.js')>('../../src/agent/transport-paths.js');
+      const fs = await import('node:fs');
+      const os = await import('node:os');
+      const path = await import('node:path');
+      const origPlatform = process.platform;
+      const origPath = process.env.PATH;
+      const origPathExt = process.env.PATHEXT;
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cursor-rt-active-pin-'));
+      try {
+        const verNewDir = path.join(tmpDir, 'versions', '2026.12.01-f1e2d3c.new');
+        const newStagedNode = path.join(verNewDir, 'node.exe');
+        fs.mkdirSync(verNewDir, { recursive: true });
+        fs.writeFileSync(newStagedNode, 'staged node');
+        fs.writeFileSync(path.join(verNewDir, 'index.js'), 'ok');
+        fs.writeFileSync(path.join(tmpDir, 'versions', 'promote-staged.cmd'), '@echo off\r\nexit /b 1\r\n');
+        const ps1Path = path.join(tmpDir, 'cursor-agent.ps1');
+        fs.writeFileSync(ps1Path, [
+          '# cursor-agent-promote-staged',
+          '$promoteStaged = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) "versions\\promote-staged.cmd"',
+          'if (Test-Path -LiteralPath $promoteStaged) { & $promoteStaged }',
+          '$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition',
+          'function Parse-VersionString { param([string]$versionString) $p = $versionString.Split("-")[0].Split("."); return [int]($p[0] + $p[1].PadLeft(2,"0") + $p[2].PadLeft(2,"0")) }',
+          '$versionDir = Get-ChildItem -Path "$scriptPath\\versions"',
+          '& "$nodePath" "$scriptPath\\versions\\$versionName\\index.js" $args',
+        ].join('\n'));
+        fs.writeFileSync(path.join(tmpDir, 'cursor-agent.cmd'), [
+          '@echo off',
+          '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0cursor-agent.ps1" %*',
+        ].join('\r\n'));
+        // Forge `.new` in versions/active.txt
+        fs.writeFileSync(path.join(tmpDir, 'versions', 'active.txt'), '2026.12.01-f1e2d3c.new\n');
+
+        Object.defineProperty(process, 'platform', { value: 'win32' });
+        process.env.PATH = tmpDir;
+        process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+        transportPathsMock.resolveCursorPathForSdk.mockImplementation(actualTp.resolveCursorPathForSdk);
+        transportPathsMock.resolveCursorLaunchPlan.mockImplementation(actualTp.resolveCursorLaunchPlan);
+        transportPathsMock.hasPendingCursorStagedUpdate.mockImplementation(actualTp.hasPendingCursorStagedUpdate);
+
+        const calls: Array<{ file: string; args: string[] }> = [];
+        childProcessMock.execFile.mockImplementation((...args: any[]) => {
+          const file = args[0] as string;
+          const cliArgs = args[1] as string[];
+          const cb = args.at(-1);
+          calls.push({ file, args: cliArgs });
+          // Zero-exit promote hook that leaves `.new` unpromoted
+          cb?.(null, '2026.12.01-f1e2d3c\n', '');
+          return { stdin: { end: vi.fn() } } as never;
+        });
+
+        const cfg = await getCursorRuntimeConfig(true);
+        expect(cfg).toEqual({ availableModels: [], isAuthenticated: false });
+        expect(calls).toEqual([{
+          file: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+          args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path, '--version'],
+        }]);
+        expect(calls.some((c) => c.file === newStagedNode)).toBe(false);
+      } finally {
+        Object.defineProperty(process, 'platform', { value: origPlatform });
+        process.env.PATH = origPath;
+        if (origPathExt === undefined) delete process.env.PATHEXT;
+        else process.env.PATHEXT = origPathExt;
+        try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+      }
+    });
   });
 });

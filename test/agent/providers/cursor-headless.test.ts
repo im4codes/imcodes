@@ -698,6 +698,45 @@ describe('CursorHeadlessProvider', () => {
       expect(calls2.some((c) => c.file === stagedNewNode)).toBe(false);
       expect(harness.spawn).not.toHaveBeenCalled();
 
+      // Even with a `.new` pin written into `versions/active.txt` or root `active.txt`,
+      // promote failure OR zero-exit unpromoted hook STILL leaves direct=null and never touches `.new/node.exe`.
+      for (const activePinPath of [join(stagedOnlyDir, 'versions', 'active.txt'), join(stagedOnlyDir, 'active.txt')]) {
+        writeFileSync(activePinPath, '2026.12.01-f1e2d3c.new\n');
+        calls1.length = 0;
+        cursorHeadlessRuntimeHooks.loadChildProcess = async () => ({
+          execFile: vi.fn((file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+            calls1.push({ file, args });
+            cb(new Error('promote failed (exit 1)'), '', 'promote failed');
+            return { stdin: { end: vi.fn() } } as never;
+          }),
+          spawn: harness.spawn,
+        } as unknown as typeof import('node:child_process'));
+        await expect(new CursorHeadlessProvider().connect({ binaryPath: stagedOnlyCmd })).rejects.toThrow();
+        expect(calls1.some((c) => c.file === stagedNewNode)).toBe(false);
+
+        calls2.length = 0;
+        cursorHeadlessRuntimeHooks.loadChildProcess = async () => ({
+          execFile: vi.fn((file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+            calls2.push({ file, args });
+            if (args.includes('--version')) cb(null, '2026.12.01-f1e2d3c\n', '');
+            else cb(null, 'Logged in\n', '');
+            return { stdin: { end: vi.fn() } } as never;
+          }),
+          spawn: harness.spawn,
+        } as unknown as typeof import('node:child_process'));
+        const providerPinned = new CursorHeadlessProvider();
+        await expect(providerPinned.connect({ binaryPath: stagedOnlyCmd })).rejects.toThrow(/staged update did not activate/i);
+        expect(calls2).toEqual([{ file: psExe, args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', stagedOnlyPs1, '--version'] }]);
+        expect(calls2.some((c) => c.file === stagedNewNode)).toBe(false);
+
+        (providerPinned as unknown as { config: Record<string, unknown> }).config = { binaryPath: stagedOnlyCmd };
+        const sidPinned = await providerPinned.createSession({ sessionKey: 'staged-pinned-fail', cwd: tmpRoot, resumeId: 'chat-pinned' });
+        await expect(providerPinned.send(sidPinned, 'must not run .new via active.txt')).rejects.toThrow(/did not activate/i);
+        expect(calls2.some((c) => c.file === stagedNewNode)).toBe(false);
+        expect(harness.spawn).not.toHaveBeenCalled();
+        rmSync(activePinPath);
+      }
+
       // Case 2: Old healthy active version + `.new` where promote fails non-zero -> safely falls back to old active version
       const fallbackDir = join(tmpRoot, 'with-old-active');
       const oldVerDir = join(fallbackDir, 'versions', '2026.05.05-a1b2c3d');
