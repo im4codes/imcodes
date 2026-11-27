@@ -1178,18 +1178,26 @@ export class RepoCallbackMonitor {
     };
   }
 
-  private resolveTargetSession(config: RepoCallbackRepoConfig): { sessionName: string; record?: SessionRecord; error?: string } {
+  private resolveTargetSession(config: RepoCallbackRepoConfig): {
+    sessionName: string;
+    record?: SessionRecord;
+    error?: string;
+    temporary?: boolean;
+  } {
     const sessions = this.listSessionsFn();
     const projectSessions = sessions.filter((s) => sameProjectDir(s.projectDir, config.projectDir));
-    const brainRecord = selectProjectBrainSession(projectSessions);
-    const inferredProjectName = brainRecord?.projectName
-      ?? projectSessions.map((s) => resolveEffectiveProjectName(s, sessions)).find(Boolean);
 
     const requested = config.target.trim();
     if (!requested || requested === REPO_CALLBACK_TARGET_BRAIN) {
+      const brainRecord = selectProjectBrainSession(projectSessions);
       if (brainRecord) {
         if (brainRecord.state === 'stopped') {
-          return { sessionName: brainRecord.name, record: brainRecord, error: `Brain session ${brainRecord.name} is stopped` };
+          return {
+            sessionName: brainRecord.name,
+            record: brainRecord,
+            error: `Brain session ${brainRecord.name} is stopped`,
+            temporary: true,
+          };
         }
         if (brainRecord.state === 'error') {
           return {
@@ -1198,16 +1206,26 @@ export class RepoCallbackMonitor {
             error: brainRecord.error
               ? `Brain session ${brainRecord.name} is in error state: ${brainRecord.error}`
               : `Brain session ${brainRecord.name} is in error state`,
+            temporary: true,
           };
         }
         return { sessionName: brainRecord.name, record: brainRecord };
       }
+
+      const inferredProjectName = projectSessions
+        .map((s) => s.projectName || resolveEffectiveProjectName(s, sessions))
+        .find(Boolean);
       if (inferredProjectName) {
         const fallbackName = projectBrainSession(inferredProjectName);
         const fallbackRecord = sessions.find((s) => s.name === fallbackName);
         if (fallbackRecord) {
           if (fallbackRecord.state === 'stopped') {
-            return { sessionName: fallbackRecord.name, record: fallbackRecord, error: `Brain session ${fallbackRecord.name} is stopped` };
+            return {
+              sessionName: fallbackRecord.name,
+              record: fallbackRecord,
+              error: `Brain session ${fallbackRecord.name} is stopped`,
+              temporary: true,
+            };
           }
           if (fallbackRecord.state === 'error') {
             return {
@@ -1216,6 +1234,7 @@ export class RepoCallbackMonitor {
               error: fallbackRecord.error
                 ? `Brain session ${fallbackRecord.name} is in error state: ${fallbackRecord.error}`
                 : `Brain session ${fallbackRecord.name} is in error state`,
+              temporary: true,
             };
           }
           return { sessionName: fallbackRecord.name, record: fallbackRecord };
@@ -1225,18 +1244,38 @@ export class RepoCallbackMonitor {
       return { sessionName: REPO_CALLBACK_TARGET_BRAIN, error: `No session found for ${config.projectDir}` };
     }
 
+    const baseBrainRecord = projectSessions.find((s) => s.role === 'brain');
+    const baseInferredProjectName = baseBrainRecord?.projectName
+      ?? projectSessions.map((s) => resolveEffectiveProjectName(s, sessions)).find(Boolean);
+
+    const projectNames = new Set(
+      projectSessions
+        .map((s) => s.projectName || resolveEffectiveProjectName(s, sessions))
+        .filter((name): name is string => typeof name === 'string' && name.length > 0),
+    );
+    if (baseInferredProjectName) {
+      projectNames.add(baseInferredProjectName);
+    }
+
     const exact = sessions.find((s) => (
       s.name === requested
       && (
         sameProjectDir(s.projectDir, config.projectDir)
-        || (inferredProjectName !== undefined && resolveEffectiveProjectName(s, sessions) === inferredProjectName)
+        || (baseInferredProjectName !== undefined && resolveEffectiveProjectName(s, sessions) === baseInferredProjectName)
+        || projectNames.has(s.projectName)
+        || projectNames.has(resolveEffectiveProjectName(s, sessions))
       )
     ));
     if (!exact) {
       return { sessionName: requested, error: `Target session ${requested} is unavailable in ${config.projectDir}` };
     }
     if (exact.state === 'stopped') {
-      return { sessionName: exact.name, record: exact, error: `Target session ${exact.name} is stopped` };
+      return {
+        sessionName: exact.name,
+        record: exact,
+        error: `Target session ${exact.name} is stopped`,
+        temporary: true,
+      };
     }
     if (exact.state === 'error') {
       return {
@@ -1245,6 +1284,7 @@ export class RepoCallbackMonitor {
         error: exact.error
           ? `Target session ${exact.name} is in error state: ${exact.error}`
           : `Target session ${exact.name} is in error state`,
+        temporary: true,
       };
     }
     return { sessionName: exact.name, record: exact };
@@ -1272,10 +1312,12 @@ export class RepoCallbackMonitor {
 
     if (existing) {
       if (resolvedTarget.error) {
-        this.failedDispatchAttempts.set(
-          candidate.dedupKey,
-          (this.failedDispatchAttempts.get(candidate.dedupKey) ?? 0) + 1,
-        );
+        if (!resolvedTarget.temporary) {
+          this.failedDispatchAttempts.set(
+            candidate.dedupKey,
+            (this.failedDispatchAttempts.get(candidate.dedupKey) ?? 0) + 1,
+          );
+        }
         this.store.updateCallback({
           callbackId: existing.callbackId,
           status: 'failed',
@@ -1319,7 +1361,9 @@ export class RepoCallbackMonitor {
       });
 
       if (resolvedTarget.error) {
-        this.failedDispatchAttempts.set(candidate.dedupKey, 1);
+        if (!resolvedTarget.temporary) {
+          this.failedDispatchAttempts.set(candidate.dedupKey, 1);
+        }
         return 'failed';
       }
     }

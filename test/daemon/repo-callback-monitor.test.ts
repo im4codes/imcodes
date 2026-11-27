@@ -1959,7 +1959,7 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
       store.close();
     });
 
-    it('boundary 3: error brain marks failed, un-seen, and successfully retries without duplicates when healthy', async () => {
+    it('boundary 3: temporary error brain does not exhaust retry budget over 5+ polls and delivers once when healthy', async () => {
       const store = new CallbackTaskStore(':memory:');
       const nowMs = 1_700_900_000_000;
       const sent: Array<{ sessionName: string; text: string }> = [];
@@ -2001,9 +2001,11 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
       });
       monitor.setConfigsForTesting({ repos: { '/tmp/repo-err': config } });
 
-      // Poll 1: Brain in error state -> marks failed, error recorded, not seen
-      const p1 = await monitor.checkProject('/tmp/repo-err');
-      expect(p1).toEqual({ checked: true, dispatched: 0 });
+      // Run 6 consecutive polls while brain is in error state: must NOT become exhausted
+      for (let i = 1; i <= 6; i++) {
+        const p = await monitor.checkProject('/tmp/repo-err');
+        expect(p).toEqual({ checked: true, dispatched: 0 });
+      }
       expect(sent).toHaveLength(0);
 
       let rows = store.listCallbacks({ scopeKey: '/tmp/repo-err' });
@@ -2012,14 +2014,85 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
       expect(rows[0]!.lastError).toContain('error');
       const originalCallbackId = rows[0]!.callbackId;
 
-      // Poll 2: Brain recovers to idle -> dispatches successfully reusing callbackId
+      // Poll 7: Brain recovers to idle -> dispatches successfully reusing callbackId
       brainState = 'idle';
-      const p2 = await monitor.checkProject('/tmp/repo-err');
-      expect(p2).toEqual({ checked: true, dispatched: 1 });
+      const p7 = await monitor.checkProject('/tmp/repo-err');
+      expect(p7).toEqual({ checked: true, dispatched: 1 });
       expect(sent).toHaveLength(1);
       expect(sent[0]!.text).toContain(originalCallbackId);
 
       rows = store.listCallbacks({ scopeKey: '/tmp/repo-err' });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.callbackId).toBe(originalCallbackId);
+      expect(rows[0]!.status).toBe('pending');
+      expect(rows[0]!.lastError).toBeUndefined();
+
+      store.close();
+    });
+
+    it('boundary 3b: stopped brain does not exhaust retry budget over 5+ polls and delivers once when recovered', async () => {
+      const store = new CallbackTaskStore(':memory:');
+      const nowMs = 1_700_900_000_000;
+      const sent: Array<{ sessionName: string; text: string }> = [];
+      let brainState: SessionRecord['state'] = 'stopped';
+
+      const pr: RepoPR = {
+        number: 831,
+        title: 'Stopped Brain Retry PR',
+        author: 'charlie',
+        state: 'open',
+        draft: false,
+        head: 'feat/stop-retry',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 1_000,
+        updatedAt: nowMs + 1_000,
+        url: 'https://github.com/acme/widget/pull/831',
+      };
+      const provider: RepoProvider = {
+        ...createMockProvider({}),
+        listPRs: vi.fn(async () => ({ items: [pr], page: 1, hasMore: false, projectDir: '/tmp/repo-stop' })),
+      };
+
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-stop');
+      config.enabled = true;
+      config.target = 'brain';
+      config.sinceAtMs = nowMs;
+      config.events.pr_new.enabled = true;
+
+      const monitor = new RepoCallbackMonitor({
+        store,
+        detect: async () => createOkContext('/tmp/repo-stop'),
+        createProvider: () => provider,
+        listSessions: () => [makeSession({ name: 'deck_stop_brain', projectDir: '/tmp/repo-stop', state: brainState })],
+        sendToSession: async (sessionName, text) => {
+          sent.push({ sessionName, text });
+        },
+        now: () => nowMs + 2_000,
+      });
+      monitor.setConfigsForTesting({ repos: { '/tmp/repo-stop': config } });
+
+      // Run 6 consecutive polls while brain is stopped: must NOT become exhausted
+      for (let i = 1; i <= 6; i++) {
+        const p = await monitor.checkProject('/tmp/repo-stop');
+        expect(p).toEqual({ checked: true, dispatched: 0 });
+      }
+      expect(sent).toHaveLength(0);
+
+      let rows = store.listCallbacks({ scopeKey: '/tmp/repo-stop' });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.status).toBe('failed');
+      expect(rows[0]!.lastError).toContain('stopped');
+      const originalCallbackId = rows[0]!.callbackId;
+
+      // Poll 7: Brain recovers to idle
+      brainState = 'idle';
+      const p7 = await monitor.checkProject('/tmp/repo-stop');
+      expect(p7).toEqual({ checked: true, dispatched: 1 });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.text).toContain(originalCallbackId);
+
+      rows = store.listCallbacks({ scopeKey: '/tmp/repo-stop' });
       expect(rows).toHaveLength(1);
       expect(rows[0]!.callbackId).toBe(originalCallbackId);
       expect(rows[0]!.status).toBe('pending');
@@ -2076,6 +2149,89 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
       expect(res).toEqual({ checked: true, dispatched: 1 });
       expect(sent).toHaveLength(1);
       expect(sent[0]!.sessionName).toBe('deck_cd1_brain');
+
+      store.close();
+    });
+
+    it('boundary 5: explicit target in different worktree/cwd resolves via project scope when repo has multiple brains with different project names', async () => {
+      const store = new CallbackTaskStore(':memory:');
+      const nowMs = 1_700_900_000_000;
+      const sent: Array<{ sessionName: string; text: string }> = [];
+
+      const pr: RepoPR = {
+        number: 85,
+        title: 'Cross-cwd Worktree PR',
+        author: 'eve',
+        state: 'open',
+        draft: false,
+        head: 'feat/cross-cwd',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 1_000,
+        updatedAt: nowMs + 1_000,
+        url: 'https://github.com/acme/widget/pull/85',
+      };
+      const provider: RepoProvider = {
+        ...createMockProvider({}),
+        listPRs: vi.fn(async () => ({ items: [pr], page: 1, hasMore: false, projectDir: '/tmp/repo-shared' })),
+      };
+
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-shared');
+      config.enabled = true;
+      config.target = 'deck_cd1_w1'; // Target session in a linked worktree
+      config.sinceAtMs = nowMs;
+      config.events.pr_new.enabled = true;
+
+      // In /tmp/repo-shared:
+      // deck_cd1_brain has projectName: 'cd1', state: 'error'
+      // deck_cd_brain has projectName: 'cd', state: 'running' (most recently updated)
+      const cd1Brain = makeSession({
+        name: 'deck_cd1_brain',
+        projectName: 'cd1',
+        projectDir: '/tmp/repo-shared',
+        role: 'brain',
+        state: 'error',
+        updatedAt: 1000,
+      });
+      const cdBrain = makeSession({
+        name: 'deck_cd_brain',
+        projectName: 'cd',
+        projectDir: '/tmp/repo-shared',
+        role: 'brain',
+        state: 'running',
+        updatedAt: 9000,
+      });
+      // Target worker is in a linked worktree with different projectDir, but matching projectName: 'cd1'
+      const cd1Worker = makeSession({
+        name: 'deck_cd1_w1',
+        projectName: 'cd1',
+        projectDir: '/tmp/linked-worktree',
+        role: 'w1',
+        state: 'running',
+        updatedAt: 5000,
+      });
+
+      const monitor = new RepoCallbackMonitor({
+        store,
+        detect: async () => createOkContext('/tmp/repo-shared'),
+        createProvider: () => provider,
+        listSessions: () => [cd1Brain, cdBrain, cd1Worker],
+        sendToSession: async (sessionName, text) => {
+          sent.push({ sessionName, text });
+        },
+        now: () => nowMs + 2_000,
+      });
+      monitor.setConfigsForTesting({ repos: { '/tmp/repo-shared': config } });
+
+      const res = await monitor.checkProject('/tmp/repo-shared');
+      expect(res).toEqual({ checked: true, dispatched: 1 });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.sessionName).toBe('deck_cd1_w1');
+
+      const callbacks = store.listCallbacks({ scopeKey: '/tmp/repo-shared' });
+      expect(callbacks).toHaveLength(1);
+      expect(callbacks[0]!.targetSession).toBe('deck_cd1_w1');
+      expect(callbacks[0]!.status).toBe('pending');
 
       store.close();
     });
