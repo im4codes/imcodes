@@ -258,8 +258,8 @@ async function createProvider(id: string, config: ProviderConfig): Promise<Trans
       return new QoderSdkProvider();
     }
     case 'cursor-headless': {
-      const { CursorHeadlessProvider } = await import('./providers/cursor-headless.js');
-      return new CursorHeadlessProvider();
+      const { CursorAcpProvider } = await import('./providers/cursor-acp.js');
+      return new CursorAcpProvider();
     }
     case 'copilot-sdk': {
       const { CopilotSdkProvider } = await import('./providers/copilot-sdk.js');

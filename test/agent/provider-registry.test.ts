@@ -383,8 +383,8 @@ vi.mock('../../src/agent/providers/qoder-sdk.js', () => ({
   QoderSdkProvider: MockQoderSdkProvider,
 }));
 
-vi.mock('../../src/agent/providers/cursor-headless.js', () => ({
-  CursorHeadlessProvider: MockCursorHeadlessProvider,
+vi.mock('../../src/agent/providers/cursor-acp.js', () => ({
+  CursorAcpProvider: MockCursorHeadlessProvider,
 }));
 
 vi.mock('../../src/agent/providers/copilot-sdk.js', () => ({
@@ -612,7 +612,7 @@ describe('connectProvider', () => {
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);
   });
 
-  it('instantiates CursorHeadlessProvider and calls connect()', async () => {
+  it('instantiates CursorAcpProvider and calls connect()', async () => {
     await connectProvider('cursor-headless', CONFIG);
     expect(MockCursorHeadlessProvider).toHaveBeenCalledOnce();
     expect(mockConnect).toHaveBeenCalledWith(CONFIG);

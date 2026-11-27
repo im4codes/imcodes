@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => {
   const cursorSpawns: Array<{
     file: string;
     args: string[];
+    acpRequests: Array<{ method: string; params: Record<string, unknown> }>;
     child: EventEmitter & {
       stdout: PassThrough;
       stderr: PassThrough;
@@ -50,8 +51,42 @@ vi.mock("node:child_process", async (importOriginal) => {
   const spawn = vi.fn((file: string, args: string[]) => {
     const stdout = new PassThrough();
     const stderr = new PassThrough();
+    const acpRequests: Array<{ method: string; params: Record<string, unknown> }> = [];
+    let stdinBuf = "";
     const stdin = new Writable({
-      write(_chunk, _enc, cb) {
+      write(chunk, _enc, cb) {
+        stdinBuf += chunk.toString();
+        let nl: number;
+        while ((nl = stdinBuf.indexOf("\n")) !== -1) {
+          const line = stdinBuf.slice(0, nl).trim();
+          stdinBuf = stdinBuf.slice(nl + 1);
+          if (!line) continue;
+          try {
+            const msg = JSON.parse(line) as { id?: number | string; method?: string; params?: Record<string, unknown> };
+            if (msg.method) acpRequests.push({ method: msg.method, params: msg.params ?? {} });
+            if (msg.id !== undefined && msg.method === "initialize") {
+              stdout.write(`${JSON.stringify({
+                jsonrpc: "2.0",
+                id: msg.id,
+                result: {
+                  protocolVersion: 1,
+                  agentCapabilities: { loadSession: true, sessionCapabilities: { list: {} }, promptCapabilities: { image: true } },
+                  authMethods: [{ id: "cursor_login", name: "Cursor Login" }],
+                },
+              })}\n`);
+            } else if (msg.id !== undefined && msg.method === "session/load") {
+              stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} })}\n`);
+            } else if (msg.id !== undefined && msg.method === "session/set_model") {
+              stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} })}\n`);
+            } else if (msg.id !== undefined && msg.method === "session/new") {
+              stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "cursor-chat-restored" } })}\n`);
+            } else if (msg.id !== undefined && msg.method === "session/prompt") {
+              stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } })}\n`);
+            }
+          } catch {
+            // ignore non-json test writes
+          }
+        }
         cb();
       },
     });
@@ -68,10 +103,10 @@ vi.mock("node:child_process", async (importOriginal) => {
     child.killed = false;
     child.kill = vi.fn((signal?: string) => {
       child.killed = true;
-      queueMicrotask(() => child.emit("close", 0, signal ?? "SIGTERM"));
+      queueMicrotask(() => child.emit("exit", 0, signal ?? "SIGTERM"));
       return true;
     });
-    mocks.cursorSpawns.push({ file, args, child });
+    mocks.cursorSpawns.push({ file, args, acpRequests, child });
     queueMicrotask(() => child.emit("spawn"));
     return child as never;
   });
@@ -314,10 +349,12 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
     expect(runtime?.providerSessionId).toBe("route-cursor-restore");
 
     runtime!.send("Verify cursor restore");
-    await flush();
     const spawned = mocks.cursorSpawns.at(-1);
-    expect(spawned?.args).toContain("--resume");
-    expect(spawned?.args).toContain("cursor-chat-restore");
+    expect(spawned?.args).toEqual(["acp"]);
+    await vi.waitFor(() => {
+      expect(spawned?.acpRequests.some((r) => r.method === "session/load" && r.params?.sessionId === "cursor-chat-restore")).toBe(true);
+      expect(spawned?.acpRequests.some((r) => r.method === "session/prompt" && r.params?.sessionId === "cursor-chat-restore")).toBe(true);
+    });
   });
 
   it("a restored session gets its identity from the identity store (it is not in the stored record)", async () => {
