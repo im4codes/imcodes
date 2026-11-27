@@ -193,36 +193,47 @@ jobs:
           npm --prefix apps/pc-app ci
       - name: Verify node-exe has no native deps
         run: npm run check:node-exe-deps
-      - name: Cache sherpa-onnx Windows x64 C API SDK
+      - name: Cache ONNX Runtime DirectML Windows x64 SDK
         uses: actions/cache@v4
-        id: sherpa-cache
+        id: ort-win-cache
         with:
-          path: ${{ runner.temp }}/sherpa-onnx
-          key: sherpa-onnx-v2.0.3-win-x64-shared-MT-Release-no-tts-e1536db1fcd1
-      - name: Download and verify sherpa-onnx Windows x64 C API SDK
+          path: ${{ runner.temp }}/onnxruntime-win
+          key: ort-directml-1.24.4-dml-1.15.4-win-x64-57e9f11b-4e7cb7dd
+      - name: Download and verify ONNX Runtime DirectML Windows x64 SDK
         shell: bash
         run: |
           set -euo pipefail
-          SHERPA_TAG="v2.0.3"
-          SHERPA_ARCHIVE="sherpa-onnx-${SHERPA_TAG}-win-x64-shared-MT-Release-no-tts.tar.bz2"
-          SHERPA_SUBDIR="sherpa-onnx-${SHERPA_TAG}-win-x64-shared-MT-Release-no-tts"
-          SHERPA_SHA256="e1536db1fcd1dde829f3cf26dfdbf60909aee6984983f6cd16b03b1352ac43fc"
-          SHERPA_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/${SHERPA_TAG}/${SHERPA_ARCHIVE}"
-          SHERPA_ROOT="$(cygpath -u "${RUNNER_TEMP}")/sherpa-onnx"
-          SHERPA_DIR="${SHERPA_ROOT}/${SHERPA_SUBDIR}"
-          if [ ! -f "${SHERPA_DIR}/include/sherpa-onnx/c-api/c-api.h" ] || [ ! -f "${SHERPA_DIR}/lib/sherpa-onnx-c-api.dll" ]; then
-            rm -rf "${SHERPA_ROOT}"
-            mkdir -p "${SHERPA_ROOT}"
-            ARCHIVE_PATH="${SHERPA_ROOT}/${SHERPA_ARCHIVE}"
-            curl -fsSL -o "${ARCHIVE_PATH}" "${SHERPA_URL}"
-            echo "${SHERPA_SHA256}  ${ARCHIVE_PATH}" | sha256sum -c -
-            tar -xjf "${ARCHIVE_PATH}" -C "${SHERPA_ROOT}"
-            rm -f "${ARCHIVE_PATH}"
+          ORT_PKG="Microsoft.ML.OnnxRuntime.DirectML"
+          ORT_VER="1.24.4"
+          ORT_SHA256="57e9f11b73437bef7a309496135d4c1f96b1a8e9ddba60013fa27bfc1d788681"
+          ORT_URL="https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime.directml/${ORT_VER}/microsoft.ml.onnxruntime.directml.${ORT_VER}.nupkg"
+          DML_PKG="Microsoft.AI.DirectML"
+          DML_VER="1.15.4"
+          DML_SHA256="4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9"
+          DML_URL="https://api.nuget.org/v3-flatcontainer/microsoft.ai.directml/${DML_VER}/microsoft.ai.directml.${DML_VER}.nupkg"
+          ORT_ROOT="$(cygpath -u "${RUNNER_TEMP}")/onnxruntime-win"
+          ORT_DIR="${ORT_ROOT}/ort-${ORT_VER}"
+          DML_DIR="${ORT_ROOT}/dml-${DML_VER}"
+          if [ ! -f "${ORT_DIR}/build/native/include/onnxruntime_cxx_api.h" ] || [ ! -f "${ORT_DIR}/build/native/include/dml_provider_factory.h" ] || [ ! -f "${ORT_DIR}/runtimes/win-x64/native/onnxruntime.dll" ] || [ ! -f "${ORT_DIR}/runtimes/win-x64/native/DirectML.dll" ]; then
+            rm -rf "${ORT_ROOT}"
+            mkdir -p "${ORT_DIR}" "${DML_DIR}"
+            ORT_NUPKG="${ORT_ROOT}/${ORT_PKG}.${ORT_VER}.nupkg"
+            DML_NUPKG="${ORT_ROOT}/${DML_PKG}.${DML_VER}.nupkg"
+            curl -fsSL -o "${ORT_NUPKG}" "${ORT_URL}"
+            echo "${ORT_SHA256}  ${ORT_NUPKG}" | sha256sum -c -
+            unzip -q -o "${ORT_NUPKG}" -d "${ORT_DIR}"
+            curl -fsSL -o "${DML_NUPKG}" "${DML_URL}"
+            echo "${DML_SHA256}  ${DML_NUPKG}" | sha256sum -c -
+            unzip -q -o "${DML_NUPKG}" -d "${DML_DIR}"
+            cp -f "${DML_DIR}/bin/x64-win/DirectML.dll" "${ORT_DIR}/runtimes/win-x64/native/DirectML.dll"
+            rm -f "${ORT_NUPKG}" "${DML_NUPKG}"
           fi
-          test -f "${SHERPA_DIR}/include/sherpa-onnx/c-api/c-api.h"
-          test -f "${SHERPA_DIR}/lib/sherpa-onnx-c-api.dll"
-          test -f "${SHERPA_DIR}/lib/onnxruntime.dll"
-          echo "IMCODES_SHERPA_ONNX_WIN_DIR=$(cygpath -w "${SHERPA_DIR}")" >> "${GITHUB_ENV}"
+          test -f "${ORT_DIR}/build/native/include/onnxruntime_cxx_api.h"
+          test -f "${ORT_DIR}/build/native/include/dml_provider_factory.h"
+          test -f "${ORT_DIR}/runtimes/win-x64/native/onnxruntime.lib"
+          test -f "${ORT_DIR}/runtimes/win-x64/native/onnxruntime.dll"
+          test -f "${ORT_DIR}/runtimes/win-x64/native/DirectML.dll"
+          echo "IMCODES_ONNXRUNTIME_WIN_DIR=$(cygpath -w "${ORT_DIR}")" >> "${GITHUB_ENV}"
       - name: Import Windows release-signing certificate
         shell: powershell
         env:

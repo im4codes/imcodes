@@ -51,7 +51,7 @@ export interface PcAppSpeechModelStatus {
   totalBytes: number;
   mlxSupported: boolean;
   localAsrSupported?: boolean;
-  executionProvider?: 'mlx' | 'directml' | 'cpu' | 'system';
+  executionProvider?: 'mlx' | 'directml' | 'cuda' | 'cpu' | 'system';
   gpuName?: string | null;
   vramMb?: number | null;
   lowVramWarning?: boolean;
@@ -148,7 +148,7 @@ export const SPEECH_MODEL_MANIFESTS: Record<PcAppSpeechVariant, PcAppSpeechModel
   },
 };
 
-export const WIN32_SPEECH_MODEL_MANIFESTS: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+export const ONNX_SPEECH_MODEL_MANIFESTS: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
   '0.6b': {
     choice: 'qwen3-0.6b',
     variant: '0.6b',
@@ -227,10 +227,12 @@ export const WIN32_SPEECH_MODEL_MANIFESTS: Record<PcAppSpeechVariant, PcAppSpeec
   },
 };
 
+export const WIN32_SPEECH_MODEL_MANIFESTS = ONNX_SPEECH_MODEL_MANIFESTS;
+
 export function getSpeechModelManifests(
   platform: NodeJS.Platform = process.platform,
 ): Record<PcAppSpeechVariant, PcAppSpeechModelManifest> {
-  return platform === 'win32' ? WIN32_SPEECH_MODEL_MANIFESTS : SPEECH_MODEL_MANIFESTS;
+  return platform === 'win32' || platform === 'linux' ? ONNX_SPEECH_MODEL_MANIFESTS : SPEECH_MODEL_MANIFESTS;
 }
 
 export function choiceToSpeechVariant(choice: PcAppSpeechModelChoice): PcAppSpeechVariant | null {
@@ -252,8 +254,15 @@ export function defaultWindowsSpeechModelsDir(appDataDir?: string): string {
   return path.join(base, 'imcodes-pc-app', 'speech-models');
 }
 
+export function defaultLinuxSpeechModelsDir(xdgDataHome?: string): string {
+  const base = xdgDataHome?.trim() || process.env.XDG_DATA_HOME?.trim() || path.join(os.homedir(), '.local', 'share');
+  return path.join(base, 'imcodes-pc-app', 'speech-models');
+}
+
 export function defaultSpeechModelsDir(platform: NodeJS.Platform = process.platform): string {
-  return platform === 'win32' ? defaultWindowsSpeechModelsDir() : defaultMacosSpeechModelsDir();
+  if (platform === 'win32') return defaultWindowsSpeechModelsDir();
+  if (platform === 'linux') return defaultLinuxSpeechModelsDir();
+  return defaultMacosSpeechModelsDir();
 }
 
 export function verifiedMarkerFilename(revision: string): string {

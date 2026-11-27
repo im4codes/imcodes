@@ -4210,71 +4210,52 @@ print("MAC_SEGMENTED_DECODE:PASS")
   await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { timeout: 120000 });
   expect((await runNativeOrThrow(binFile, [], { timeout: 60000 })).trim()).toBe('MAC_SEGMENTED_DECODE:PASS');
 
-  // 3. Compile & execute the full standalone Windows C++ test suite (apps/pc-app/native/win/segmented-pipeline.test.cpp)
-  //    against the portable C++ slices of imcodes-speech-win.cpp when clang++ is available.
-  const winCppPath = fileURLToPath(new URL('../../apps/pc-app/native/win/imcodes-speech-win.cpp', import.meta.url));
+  // 3. Compile & execute the C++20 ONNX streaming pipeline tests (apps/pc-app/native/onnx-qwen3-asr + win/segmented-pipeline.test.cpp)
+  const onnxCoreDir = fileURLToPath(new URL('../../apps/pc-app/native/onnx-qwen3-asr', import.meta.url));
+  const commonIncDir = fileURLToPath(new URL('../../apps/pc-app/native/common', import.meta.url));
+  const pipelineHpp = await readFile(join(onnxCoreDir, 'streaming_pipeline.hpp'), 'utf8');
   const winTestPath = fileURLToPath(new URL('../../apps/pc-app/native/win/segmented-pipeline.test.cpp', import.meta.url));
-  const winCpp = await readFile(winCppPath, 'utf8');
-  const winTestSrc = await readFile(winTestPath, 'utf8');
-  expect(winCpp).toContain('kMaxFinalReDecodeSamples = 480000');
-  expect(winCpp).toContain('cfg.model_config.qwen3_asr.max_new_tokens = 384;');
+  expect(pipelineHpp).toContain('max_final_redecode_samples{480000}');
+  expect(pipelineHpp).toContain('final_max_new_tokens{384}');
   const clangPp = process.env.CXX || (existsSync('/usr/bin/clang++') ? '/usr/bin/clang++' : undefined);
   if (clangPp) {
-    const helperStart = winCpp.indexOf('constexpr uint64_t kDirectMlMinVramMb');
-    const helperEnd = winCpp.indexOf('std::string wide_to_utf8(');
-    const b64Start = winCpp.indexOf('inline void append_utf8_cp(');
-    const b64End = winCpp.indexOf('std::string resolve_target_capture_uid(');
-    const pipeStart = winCpp.indexOf('template <typename SampleAtFn>');
-    const pipeEnd = winCpp.indexOf('#ifdef IMCODES_HAS_SHERPA_ONNX', pipeStart);
-    expect(helperStart).toBeGreaterThan(-1);
-    expect(helperEnd).toBeGreaterThan(helperStart);
-    expect(b64Start).toBeGreaterThan(-1);
-    expect(b64End).toBeGreaterThan(b64Start);
-    expect(pipeStart).toBeGreaterThan(-1);
-    expect(pipeEnd).toBeGreaterThan(pipeStart);
+    const coreCpps = [
+      'mel_features.cpp',
+      'qwen3_tokenizer.cpp',
+      'text_guards.cpp',
+      'qwen3_onnx_engine.cpp',
+      'ort_ep_dml.cpp',
+      'streaming_pipeline.cpp',
+    ].map((f) => join(onnxCoreDir, f));
 
-    // Strip lines 1-2 (#define IMCODES_SPEECH_WIN_NO_MAIN / #include "imcodes-speech-win.cpp") from standalone suite
-    const testBodyStart = winTestSrc.indexOf('#include <cassert>');
-    expect(testBodyStart).toBeGreaterThan(-1);
+    const darwinFlags = process.platform === 'darwin' ? ['-DIMCODES_USE_COREFOUNDATION=1', '-framework', 'CoreFoundation'] : [];
+    const onnxTestBin = join(root, 'qwen3-onnx-tests');
+    await runNativeOrThrow(clangPp, [
+      '-std=c++20',
+      '-Wall',
+      '-Wextra',
+      ...darwinFlags,
+      `-I${onnxCoreDir}`,
+      join(onnxCoreDir, 'tests', 'qwen3_onnx_tests.cpp'),
+      ...coreCpps,
+      '-o',
+      onnxTestBin,
+    ], { timeout: 60000 });
+    expect((await runNativeOrThrow(onnxTestBin, [], { timeout: 60000 })).trim()).toContain('passed');
 
-    const cppFile = join(root, 'WinSegmentedPipelineFullSuite.cpp');
     const cppBin = join(root, 'win-segmented-pipeline-full');
-    await writeFile(cppFile, `#if defined(__APPLE__) && defined(IMCODES_USE_COREFOUNDATION)
-#include <CoreFoundation/CoreFoundation.h>
-#endif
-#include <algorithm>
-#include <atomic>
-#include <cctype>
-#include <chrono>
-#include <cmath>
-#include <condition_variable>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <functional>
-#include <iostream>
-#include <memory>
-#include <mutex>
-#include <optional>
-#include <sstream>
-#include <string>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-
-${winCpp.slice(helperStart, helperEnd)}
-${winCpp.slice(b64Start, b64End)}
-${winCpp.slice(pipeStart, pipeEnd)}
-
-${winTestSrc.slice(testBodyStart)}
-`);
-    const cppArgs = ['-std=c++17', '-Wall', '-Wextra'];
-    if (process.platform === 'darwin') {
-      cppArgs.push('-DIMCODES_USE_COREFOUNDATION', '-framework', 'CoreFoundation');
-    }
-    cppArgs.push(cppFile, '-o', cppBin);
-    await runNativeOrThrow(clangPp, cppArgs, { timeout: 60000 });
-    expect((await runNativeOrThrow(cppBin, [], { timeout: 60000 })).trim()).toBe('segmented-pipeline tests passed');
+    await runNativeOrThrow(clangPp, [
+      '-std=c++20',
+      '-Wall',
+      '-Wextra',
+      ...darwinFlags,
+      `-I${commonIncDir}`,
+      `-I${onnxCoreDir}`,
+      winTestPath,
+      ...coreCpps,
+      '-o',
+      cppBin,
+    ], { timeout: 60000 });
+    expect((await runNativeOrThrow(cppBin, [], { timeout: 60000 })).trim()).toBe('win speech pipeline tests passed');
   }
 }, 180_000);

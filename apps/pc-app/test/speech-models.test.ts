@@ -301,4 +301,18 @@ describe('PC App Qwen3-ASR region-aware mirrors, sticky promotion, persistence, 
     expect(readdirSync(tokDir).some((f) => f.includes('.part.'))).toBe(false);
     expect(readFileSync(path.join(tokDir, 'vocab.json'))).toEqual(tokPayload);
   });
+
+  it('routes linux to ONNX manifests and XDG data directory', async () => {
+    const {
+      ONNX_SPEECH_MODEL_MANIFESTS,
+      WIN32_SPEECH_MODEL_MANIFESTS,
+      getSpeechModelManifests,
+      defaultLinuxSpeechModelsDir,
+      defaultSpeechModelsDir,
+    } = await import('../src/speech-models.js');
+    expect(getSpeechModelManifests('linux')).toBe(ONNX_SPEECH_MODEL_MANIFESTS);
+    expect(WIN32_SPEECH_MODEL_MANIFESTS).toBe(ONNX_SPEECH_MODEL_MANIFESTS);
+    expect(defaultLinuxSpeechModelsDir('/tmp/xdg-data')).toBe(path.join('/tmp/xdg-data', 'imcodes-pc-app', 'speech-models'));
+    expect(defaultSpeechModelsDir('linux')).toContain(path.join('imcodes-pc-app', 'speech-models'));
+  });
 });

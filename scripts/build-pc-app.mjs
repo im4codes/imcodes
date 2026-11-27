@@ -47,6 +47,8 @@ export const DEFAULT_SPEECH_MLX_PKG_DIR = join(PC_APP_DIR, 'native', 'qwen3-asr'
 export const DEFAULT_SPEECH_BIN_DIR = join(DEFAULT_NODE_EXE_DIR, 'speech-helper-macos');
 export const DEFAULT_WIN_SPEECH_SRC_DIR = join(PC_APP_DIR, 'native', 'win');
 export const DEFAULT_WIN_SPEECH_BIN_DIR = join(DEFAULT_NODE_EXE_DIR, 'speech-helper-win');
+export const DEFAULT_LINUX_SPEECH_SRC_DIR = join(PC_APP_DIR, 'native', 'linux');
+export const DEFAULT_LINUX_SPEECH_BIN_DIR = join(DEFAULT_NODE_EXE_DIR, 'speech-helper-linux');
 export const DEFAULT_STAGE_ROOT = join(REPO_ROOT, '.pc-app-stage');
 export const DEFAULT_PC_APP_OUT_DIR = join(PC_APP_DIR, 'release');
 
@@ -401,7 +403,16 @@ export function buildMacosSpeechMlxHelper({
   };
 }
 
-const REQUIRED_WIN_ASR_DLLS = ['sherpa-onnx-c-api.dll', 'onnxruntime.dll'];
+const REQUIRED_WIN_ASR_DLLS = ['onnxruntime.dll', 'DirectML.dll'];
+
+function findFirstRegularFile(candidates) {
+  for (const p of candidates) {
+    if (!p) continue;
+    const info = inspectRegularFile(p);
+    if (info.isFile && info.size > 0) return p;
+  }
+  return '';
+}
 
 function collectDllsFromDirs(sourceDirs, destDir) {
   const seen = new Set();
@@ -409,8 +420,8 @@ function collectDllsFromDirs(sourceDirs, destDir) {
   for (const dir of sourceDirs) {
     if (!dir || !existsSync(dir)) continue;
     for (const entry of readdirSync(dir)) {
-      if (!entry.toLowerCase().endsWith('.dll')) continue;
       const lower = entry.toLowerCase();
+      if (!lower.endsWith('.dll') || lower === 'directml.debug.dll') continue;
       if (seen.has(lower)) continue;
       const srcPath = join(dir, entry);
       if (!inspectRegularFile(srcPath).isFile) continue;
@@ -423,38 +434,98 @@ function collectDllsFromDirs(sourceDirs, destDir) {
   return copied;
 }
 
+function collectLinuxOrtLibsFromDirs(sourceDirs, destDir) {
+  const seen = new Set();
+  const copied = [];
+  for (const dir of sourceDirs) {
+    if (!dir || !existsSync(dir)) continue;
+    for (const entry of readdirSync(dir)) {
+      const lower = entry.toLowerCase();
+      if (!lower.startsWith('libonnxruntime') || !lower.includes('.so')) continue;
+      if (seen.has(lower)) continue;
+      const srcPath = join(dir, entry);
+      if (!inspectRegularFile(srcPath).isFile) continue;
+      seen.add(lower);
+      const destLib = join(destDir, entry);
+      cpSync(srcPath, destLib);
+      copied.push(destLib);
+    }
+  }
+  // NuGet ORT Linux packages ship libonnxruntime.so (SONAME libonnxruntime.so.1) without the .so.1 file.
+  const baseSo = join(destDir, 'libonnxruntime.so');
+  const sonameSo = join(destDir, 'libonnxruntime.so.1');
+  if (existsSync(baseSo) && !existsSync(sonameSo)) {
+    cpSync(baseSo, sonameSo);
+    copied.push(sonameSo);
+  }
+  return copied;
+}
+
 function assertRequiredWinAsrDlls(dllPaths, contextLabel) {
   const presentLower = new Set(
     dllPaths
       .filter((p) => p && inspectRegularFile(p).isFile && inspectRegularFile(p).size > 0)
       .map((p) => p.split(/[\\/]/).pop().toLowerCase()),
   );
-  const missing = REQUIRED_WIN_ASR_DLLS.filter((name) => !presentLower.has(name));
+  const missing = REQUIRED_WIN_ASR_DLLS.filter((name) => !presentLower.has(name.toLowerCase()));
   if (missing.length > 0) {
     throw new Error(`[pc-app build] Missing required Windows ASR DLL(s) (${missing.join(', ')}) in ${contextLabel} (--require-win-asr)`);
   }
 }
 
-function assertValidWinAsrSdk(sherpaSdkDir) {
-  const absSdkDir = sherpaSdkDir ? resolve(sherpaSdkDir) : '';
-  const headerPath = absSdkDir ? join(absSdkDir, 'include', 'sherpa-onnx', 'c-api', 'c-api.h') : '';
-  const importLibPath = absSdkDir ? join(absSdkDir, 'lib', 'sherpa-onnx-c-api.lib') : '';
-  if (
-    !absSdkDir
-    || !inspectRegularFile(headerPath).isFile
-    || inspectRegularFile(headerPath).size === 0
-    || !inspectRegularFile(importLibPath).isFile
-    || inspectRegularFile(importLibPath).size === 0
-  ) {
+function resolveOrtHeaderCandidates(absSdkDir) {
+  return [
+    join(absSdkDir, 'include'),
+    join(absSdkDir, 'include', 'onnxruntime'),
+    join(absSdkDir, 'include', 'onnxruntime', 'core', 'session'),
+    join(absSdkDir, 'build', 'native', 'include'),
+    join(absSdkDir, 'buildTransitive', 'native', 'include'),
+  ];
+}
+
+function assertValidWinAsrSdk(ortSdkDir, arch = 'x64') {
+  const absSdkDir = ortSdkDir ? resolve(ortSdkDir) : '';
+  const includeDirs = absSdkDir ? resolveOrtHeaderCandidates(absSdkDir) : [];
+  const headerPath = findFirstRegularFile(includeDirs.map((d) => join(d, 'onnxruntime_cxx_api.h')));
+  const dmlHeaderPath = findFirstRegularFile(includeDirs.map((d) => join(d, 'dml_provider_factory.h')));
+  const rid = arch === 'arm64' ? 'win-arm64' : 'win-x64';
+  const importLibPath = absSdkDir
+    ? findFirstRegularFile([
+        join(absSdkDir, 'runtimes', rid, 'native', 'onnxruntime.lib'),
+        join(absSdkDir, 'runtimes', 'win-x64', 'native', 'onnxruntime.lib'),
+        join(absSdkDir, 'lib', 'onnxruntime.lib'),
+        join(absSdkDir, 'build', 'native', 'lib', arch === 'arm64' ? 'arm64' : 'x64', 'onnxruntime.lib'),
+      ])
+    : '';
+  if (!absSdkDir || !headerPath || !dmlHeaderPath || !importLibPath) {
     throw new Error(
-      '[pc-app build] sherpa-onnx Windows C API SDK missing or incomplete (set IMCODES_SHERPA_ONNX_WIN_DIR or SHERPA_ONNX_DIR with include/sherpa-onnx/c-api/c-api.h and lib/sherpa-onnx-c-api.lib) (--require-win-asr)',
+      '[pc-app build] ONNX Runtime DirectML Windows SDK missing or incomplete (set IMCODES_ONNXRUNTIME_WIN_DIR or ONNXRUNTIME_DIR with onnxruntime_cxx_api.h, dml_provider_factory.h, and onnxruntime.lib) (--require-win-asr)',
+    );
+  }
+  return absSdkDir;
+}
+
+function assertValidLinuxAsrSdk(ortSdkDir) {
+  const absSdkDir = ortSdkDir ? resolve(ortSdkDir) : '';
+  const includeDirs = absSdkDir ? resolveOrtHeaderCandidates(absSdkDir) : [];
+  const headerPath = findFirstRegularFile(includeDirs.map((d) => join(d, 'onnxruntime_cxx_api.h')));
+  const sharedLibPath = absSdkDir
+    ? findFirstRegularFile([
+        join(absSdkDir, 'lib', 'libonnxruntime.so'),
+        join(absSdkDir, 'lib64', 'libonnxruntime.so'),
+        join(absSdkDir, 'runtimes', 'linux-x64', 'native', 'libonnxruntime.so'),
+      ])
+    : '';
+  if (!absSdkDir || !headerPath || !sharedLibPath) {
+    throw new Error(
+      '[pc-app build] ONNX Runtime Linux SDK missing or incomplete (set IMCODES_ONNXRUNTIME_LINUX_DIR or ONNXRUNTIME_DIR with onnxruntime_cxx_api.h and libonnxruntime.so) (--require-linux-asr)',
     );
   }
   return absSdkDir;
 }
 
 /**
- * Compile or collect `imcodes-speech-win.exe` (and companion sherpa-onnx / ONNX Runtime DLLs)
+ * Compile or collect `imcodes-speech-win.exe` (and companion ONNX Runtime + DirectML DLLs)
  * on Windows hosts (`cmake` when available; returns `null` when native toolchain/SDK is absent
  * unless `requireWinAsr` is `true`, in which case missing SDK, binary, or DLLs throws).
  */
@@ -474,11 +545,19 @@ export function buildWindowsSpeechHelper({
     warnFn(msg);
     return null;
   };
-  const rawSdkDir = env.IMCODES_SHERPA_ONNX_WIN_DIR?.trim() || env.SHERPA_ONNX_DIR?.trim() || '';
-  const sherpaSdkDir = requireWinAsr ? assertValidWinAsrSdk(rawSdkDir) : (rawSdkDir ? resolve(rawSdkDir) : '');
-  const sdkDllDirs = sherpaSdkDir
-    ? [join(sherpaSdkDir, 'lib'), join(sherpaSdkDir, 'bin')]
-    : [];
+  const rawSdkDir = env.IMCODES_ONNXRUNTIME_WIN_DIR?.trim() || env.ONNXRUNTIME_DIR?.trim() || '';
+  const ortSdkDir = requireWinAsr ? assertValidWinAsrSdk(rawSdkDir, arch) : (rawSdkDir ? resolve(rawSdkDir) : '');
+  const rid = arch === 'arm64' ? 'win-arm64' : 'win-x64';
+  const sdkDllDirs = ortSdkDir
+    ? [
+        join(ortSdkDir, 'runtimes', rid, 'native'),
+        join(ortSdkDir, 'runtimes', 'win-x64', 'native'),
+        join(ortSdkDir, 'bin', 'x64-win'),
+        join(ortSdkDir, 'lib'),
+        join(ortSdkDir, 'bin'),
+        env.IMCODES_DIRECTML_DLL_DIR?.trim(),
+      ].filter(Boolean)
+    : (env.IMCODES_DIRECTML_DLL_DIR?.trim() ? [env.IMCODES_DIRECTML_DLL_DIR.trim()] : []);
   const prebuiltPath = env.IMCODES_WIN_SPEECH_BIN_PATH?.trim();
   const absOutDir = resolve(outDir);
   if (prebuiltPath && existsSync(prebuiltPath)) {
@@ -500,11 +579,11 @@ export function buildWindowsSpeechHelper({
   const buildDir = join(resolve(srcDir), 'build');
   try {
     const cmakeArgs = ['-S', resolve(srcDir), '-B', buildDir, '-A', arch === 'arm64' ? 'ARM64' : 'x64'];
-    if (sherpaSdkDir) {
-      cmakeArgs.push(`-DSHERPA_ONNX_DIR=${sherpaSdkDir}`);
+    if (ortSdkDir) {
+      cmakeArgs.push(`-DONNXRUNTIME_DIR=${ortSdkDir}`);
     }
     if (requireWinAsr) {
-      cmakeArgs.push('-DIMCODES_REQUIRE_SHERPA_ONNX=ON');
+      cmakeArgs.push('-DIMCODES_REQUIRE_ONNXRUNTIME=ON');
     }
     execFn('cmake', cmakeArgs, { stdio: 'inherit', env });
     execFn('cmake', ['--build', buildDir, '--config', 'Release'], { stdio: 'inherit', env });
@@ -533,6 +612,86 @@ export function buildWindowsSpeechHelper({
 }
 
 /**
+ * Compile or collect `imcodes-speech-linux` (and companion ONNX Runtime `.so` files)
+ * on Linux hosts.
+ */
+export function buildLinuxSpeechHelper({
+  srcDir = DEFAULT_LINUX_SPEECH_SRC_DIR,
+  outDir = DEFAULT_LINUX_SPEECH_BIN_DIR,
+  requireLinuxAsr = false,
+  execFn = execFileSync,
+  warnFn = (msg) => process.stderr.write(`${msg}\n`),
+  env = process.env,
+} = {}) {
+  const failOrWarn = (msg) => {
+    if (requireLinuxAsr) {
+      throw new Error(`${msg} (--require-linux-asr)`);
+    }
+    warnFn(msg);
+    return null;
+  };
+  const rawSdkDir = env.IMCODES_ONNXRUNTIME_LINUX_DIR?.trim() || env.ONNXRUNTIME_DIR?.trim() || '';
+  const ortSdkDir = requireLinuxAsr ? assertValidLinuxAsrSdk(rawSdkDir) : (rawSdkDir ? resolve(rawSdkDir) : '');
+  const sdkLibDirs = ortSdkDir
+    ? [
+        join(ortSdkDir, 'runtimes', 'linux-x64', 'native'),
+        join(ortSdkDir, 'lib'),
+        join(ortSdkDir, 'lib64'),
+      ]
+    : [];
+  const prebuiltPath = env.IMCODES_LINUX_SPEECH_BIN_PATH?.trim();
+  const absOutDir = resolve(outDir);
+  if (prebuiltPath && existsSync(prebuiltPath)) {
+    mkdirSync(absOutDir, { recursive: true });
+    const destBin = join(absOutDir, 'imcodes-speech-linux');
+    cpSync(prebuiltPath, destBin);
+    chmodSync(destBin, 0o755);
+    const runtimeLibs = collectLinuxOrtLibsFromDirs([dirname(resolve(prebuiltPath)), ...sdkLibDirs], absOutDir);
+    if (requireLinuxAsr && !runtimeLibs.some((p) => p.split(/[\\/]/).pop().startsWith('libonnxruntime.so'))) {
+      throw new Error(`[pc-app build] Missing required libonnxruntime.so in ${absOutDir} (--require-linux-asr)`);
+    }
+    return { binPath: destBin, runtimeLibs };
+  }
+
+  const cmakeLists = join(resolve(srcDir), 'CMakeLists.txt');
+  if (!existsSync(cmakeLists)) {
+    return failOrWarn(`[pc-app build] Linux speech CMake source missing at ${srcDir}; skipping imcodes-speech-linux`);
+  }
+
+  const buildDir = join(resolve(srcDir), 'build');
+  try {
+    const cmakeArgs = ['-S', resolve(srcDir), '-B', buildDir, '-DCMAKE_BUILD_TYPE=Release'];
+    if (ortSdkDir) {
+      cmakeArgs.push(`-DONNXRUNTIME_DIR=${ortSdkDir}`);
+    }
+    if (requireLinuxAsr) {
+      cmakeArgs.push('-DIMCODES_REQUIRE_ONNXRUNTIME=ON');
+    }
+    execFn('cmake', cmakeArgs, { stdio: 'inherit', env });
+    execFn('cmake', ['--build', buildDir, '-j'], { stdio: 'inherit', env });
+  } catch (err) {
+    return failOrWarn(
+      `[pc-app build] CMake build for imcodes-speech-linux failed (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+
+  const builtBin = join(buildDir, 'imcodes-speech-linux');
+  if (!existsSync(builtBin)) {
+    return failOrWarn(`[pc-app build] imcodes-speech-linux not produced under ${buildDir}`);
+  }
+
+  mkdirSync(absOutDir, { recursive: true });
+  const destBin = join(absOutDir, 'imcodes-speech-linux');
+  cpSync(builtBin, destBin);
+  chmodSync(destBin, 0o755);
+  const runtimeLibs = collectLinuxOrtLibsFromDirs(sdkLibDirs, absOutDir);
+  if (requireLinuxAsr && !runtimeLibs.some((p) => p.split(/[\\/]/).pop().startsWith('libonnxruntime.so'))) {
+    throw new Error(`[pc-app build] Missing required libonnxruntime.so in ${absOutDir} (--require-linux-asr)`);
+  }
+  return { binPath: destBin, runtimeLibs };
+}
+
+/**
  * Stage `extraResources` for macOS or Windows prior to `electron-builder` packing/signing.
  * - macOS: `imcodes`, `imcodes-speech` (when provided), optional `imcodes-speech-mlx` (+ `mlx.metallib`), `bin/tmux`, `terminfo/`, `licenses/`
  * - Windows: `imcodes.exe`, optional `imcodes-speech-win.exe` (+ companion `.dll`s)
@@ -546,7 +705,10 @@ export function stagePcAppResources({
   mlxMetallibPath,
   winSpeechBinPath,
   winSpeechRuntimeDlls,
+  linuxSpeechBinPath,
+  linuxSpeechRuntimeLibs,
   requireWinAsr = false,
+  requireLinuxAsr = false,
   stageDir,
 }) {
   if (!nodeExePath || !existsSync(nodeExePath)) {
@@ -637,6 +799,43 @@ export function stagePcAppResources({
       stageDir: absStageDir,
       imcodesPath: destExe,
       ...(destWinSpeech ? { winSpeechBinPath: destWinSpeech, winSpeechRuntimeDlls: stagedDlls } : {}),
+    };
+  }
+
+  if (platform === 'linux') {
+    accessSync(nodeExePath, fsConstants.X_OK);
+    const destExe = join(absStageDir, 'imcodes');
+    cpSync(nodeExePath, destExe);
+    chmodSync(destExe, 0o755);
+    let destLinuxSpeech = null;
+    const stagedLibs = [];
+    if (linuxSpeechBinPath && existsSync(linuxSpeechBinPath)) {
+      destLinuxSpeech = join(absStageDir, 'imcodes-speech-linux');
+      cpSync(linuxSpeechBinPath, destLinuxSpeech);
+      chmodSync(destLinuxSpeech, 0o755);
+      for (const libPath of linuxSpeechRuntimeLibs ?? []) {
+        if (libPath && existsSync(libPath)) {
+          const libName = libPath.split(/[\\/]/).pop();
+          const destLib = join(absStageDir, libName);
+          if (resolve(libPath) !== resolve(destLib)) {
+            cpSync(libPath, destLib);
+          }
+          stagedLibs.push(destLib);
+        }
+      }
+    }
+    if (requireLinuxAsr) {
+      if (!destLinuxSpeech) {
+        throw new Error(`Bundled imcodes-speech-linux missing for Linux staging at ${absStageDir} (--require-linux-asr)`);
+      }
+      if (!stagedLibs.some((p) => p.split(/[\\/]/).pop().startsWith('libonnxruntime.so'))) {
+        throw new Error(`Bundled libonnxruntime.so missing for Linux staging at ${absStageDir} (--require-linux-asr)`);
+      }
+    }
+    return {
+      stageDir: absStageDir,
+      imcodesPath: destExe,
+      ...(destLinuxSpeech ? { linuxSpeechBinPath: destLinuxSpeech, linuxSpeechRuntimeLibs: stagedLibs } : {}),
     };
   }
 

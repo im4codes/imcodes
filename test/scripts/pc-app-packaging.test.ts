@@ -43,6 +43,7 @@ import {
 } from '../../apps/pc-app/electron-builder.config.mjs';
 // @ts-expect-error ESM script module
 import {
+  buildLinuxSpeechHelper,
   buildMacosSpeechHelper,
   buildMacosSpeechMlxHelper,
   buildPcAppNodeExeEnv,
@@ -523,11 +524,13 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
 
     const winExe = join(work, 'imcodes-node.exe');
     const winSpeechExe = join(work, 'win-bin', 'imcodes-speech-win.exe');
-    const winSpeechDll = join(work, 'win-bin', 'sherpa-onnx-c-api.dll');
+    const winSpeechDll = join(work, 'win-bin', 'onnxruntime.dll');
+    const winDirectMlDll = join(work, 'win-bin', 'DirectML.dll');
     mkdirSync(join(work, 'win-bin'), { recursive: true });
     writeFileSync(winExe, 'MZ-fake-exe', 'utf8');
     writeFileSync(winSpeechExe, 'MZ-speech-win', 'utf8');
-    writeFileSync(winSpeechDll, 'MZ-sherpa-dll', 'utf8');
+    writeFileSync(winSpeechDll, 'MZ-ort-dll', 'utf8');
+    writeFileSync(winDirectMlDll, 'MZ-dml-dll', 'utf8');
 
     const builtWinSpeech = buildWindowsSpeechHelper({
       outDir: join(work, 'out-win-speech'),
@@ -535,7 +538,8 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     });
     expect(builtWinSpeech).not.toBeNull();
     expect(existsSync(builtWinSpeech!.binPath)).toBe(true);
-    expect(builtWinSpeech!.runtimeDlls.some((p) => p.endsWith('sherpa-onnx-c-api.dll'))).toBe(true);
+    expect(builtWinSpeech!.runtimeDlls.some((p) => p.endsWith('onnxruntime.dll'))).toBe(true);
+    expect(builtWinSpeech!.runtimeDlls.some((p) => p.endsWith('DirectML.dll'))).toBe(true);
 
     const stagedWin = stagePcAppResources({
       platform: 'win32',
@@ -546,7 +550,8 @@ describe('PC App V1 Phase D packaging, afterSign, and verification', () => {
     });
     expect(existsSync(stagedWin.imcodesPath)).toBe(true);
     expect(existsSync(join(work, 'stage-win', 'imcodes-speech-win.exe'))).toBe(true);
-    expect(existsSync(join(work, 'stage-win', 'sherpa-onnx-c-api.dll'))).toBe(true);
+    expect(existsSync(join(work, 'stage-win', 'onnxruntime.dll'))).toBe(true);
+    expect(existsSync(join(work, 'stage-win', 'DirectML.dll'))).toBe(true);
   });
 
   it('verifyPackagedMacosApp enforces Gate 1-4, nested codesign, optional stapler validate, and clean daemon run', () => {
@@ -1590,24 +1595,26 @@ exit 0
       }),
     ).toThrow(/--require-win-asr/);
 
-    // 3. buildWindowsSpeechHelper stages DLLs deduplicated across lib/ and bin/, passes IMCODES_REQUIRE_SHERPA_ONNX=ON
-    const sdkDir = join(work, 'sherpa-sdk');
-    mkdirSync(join(sdkDir, 'include', 'sherpa-onnx', 'c-api'), { recursive: true });
-    mkdirSync(join(sdkDir, 'lib'), { recursive: true });
-    mkdirSync(join(sdkDir, 'bin'), { recursive: true });
-    writeFileSync(join(sdkDir, 'include', 'sherpa-onnx', 'c-api', 'c-api.h'), '// stub c-api.h\n', 'utf8');
-    writeFileSync(join(sdkDir, 'lib', 'sherpa-onnx-c-api.lib'), 'LIB-c-api', 'utf8');
-    writeFileSync(join(sdkDir, 'lib', 'sherpa-onnx-c-api.dll'), 'MZ-c-api', 'utf8');
-    writeFileSync(join(sdkDir, 'lib', 'onnxruntime.dll'), 'MZ-ort-lib', 'utf8');
-    writeFileSync(join(sdkDir, 'bin', 'onnxruntime.dll'), 'MZ-ort-bin-dup', 'utf8');
-    writeFileSync(join(sdkDir, 'bin', 'DirectML.dll'), 'MZ-dml-bin', 'utf8');
+    // 3. buildWindowsSpeechHelper stages DLLs deduplicated across runtimes/win-x64/native and bin/x64-win, excludes DirectML.Debug.dll, passes IMCODES_REQUIRE_ONNXRUNTIME=ON
+    const sdkDir = join(work, 'ort-win-sdk');
+    mkdirSync(join(sdkDir, 'build', 'native', 'include'), { recursive: true });
+    mkdirSync(join(sdkDir, 'runtimes', 'win-x64', 'native'), { recursive: true });
+    mkdirSync(join(sdkDir, 'bin', 'x64-win'), { recursive: true });
+    writeFileSync(join(sdkDir, 'build', 'native', 'include', 'onnxruntime_cxx_api.h'), '// stub ort\n', 'utf8');
+    writeFileSync(join(sdkDir, 'build', 'native', 'include', 'dml_provider_factory.h'), '// stub dml\n', 'utf8');
+    writeFileSync(join(sdkDir, 'runtimes', 'win-x64', 'native', 'onnxruntime.lib'), 'LIB-ort', 'utf8');
+    writeFileSync(join(sdkDir, 'runtimes', 'win-x64', 'native', 'onnxruntime.dll'), 'MZ-ort-native', 'utf8');
+    writeFileSync(join(sdkDir, 'runtimes', 'win-x64', 'native', 'onnxruntime_providers_shared.dll'), 'MZ-shared', 'utf8');
+    writeFileSync(join(sdkDir, 'bin', 'x64-win', 'onnxruntime.dll'), 'MZ-ort-bin-dup', 'utf8');
+    writeFileSync(join(sdkDir, 'bin', 'x64-win', 'DirectML.dll'), 'MZ-dml-bin', 'utf8');
+    writeFileSync(join(sdkDir, 'bin', 'x64-win', 'DirectML.Debug.dll'), 'MZ-dml-debug', 'utf8');
 
     const cmakeInvocations: string[][] = [];
     const strictBuilt = buildWindowsSpeechHelper({
       srcDir,
       outDir: join(work, 'out-strict'),
       requireWinAsr: true,
-      env: { IMCODES_SHERPA_ONNX_WIN_DIR: sdkDir },
+      env: { IMCODES_ONNXRUNTIME_WIN_DIR: sdkDir },
       execFn: (_cmd: string, args: string[]) => {
         cmakeInvocations.push(args);
         if (args.includes('--build')) {
@@ -1616,26 +1623,26 @@ exit 0
         }
       },
     });
-    expect(cmakeInvocations[0]).toContain(`-DSHERPA_ONNX_DIR=${sdkDir}`);
-    expect(cmakeInvocations[0]).toContain('-DIMCODES_REQUIRE_SHERPA_ONNX=ON');
+    expect(cmakeInvocations[0]).toContain(`-DONNXRUNTIME_DIR=${sdkDir}`);
+    expect(cmakeInvocations[0]).toContain('-DIMCODES_REQUIRE_ONNXRUNTIME=ON');
     expect(strictBuilt).not.toBeNull();
     expect(strictBuilt!.runtimeDlls.map((p: string) => p.split(/[\\/]/).pop()).sort()).toEqual([
       'DirectML.dll',
       'onnxruntime.dll',
-      'sherpa-onnx-c-api.dll',
+      'onnxruntime_providers_shared.dll',
     ]);
-    // lib/ takes precedence over duplicate in bin/
-    expect(readFileSync(join(work, 'out-strict', 'onnxruntime.dll'), 'utf8')).toBe('MZ-ort-lib');
+    // runtimes/win-x64/native takes precedence over duplicate in bin/x64-win
+    expect(readFileSync(join(work, 'out-strict', 'onnxruntime.dll'), 'utf8')).toBe('MZ-ort-native');
+    expect(existsSync(join(work, 'out-strict', 'DirectML.Debug.dll'))).toBe(false);
 
-    // Missing required onnxruntime.dll fails closed under requireWinAsr
-    rmSync(join(sdkDir, 'lib', 'onnxruntime.dll'));
-    rmSync(join(sdkDir, 'bin', 'onnxruntime.dll'));
+    // Missing required DirectML.dll fails closed under requireWinAsr
+    rmSync(join(sdkDir, 'bin', 'x64-win', 'DirectML.dll'));
     expect(() =>
       buildWindowsSpeechHelper({
         srcDir,
         outDir: join(work, 'out-missing-dll'),
         requireWinAsr: true,
-        env: { IMCODES_SHERPA_ONNX_WIN_DIR: sdkDir },
+        env: { IMCODES_ONNXRUNTIME_WIN_DIR: sdkDir },
         execFn: (_cmd: string, args: string[]) => {
           if (args.includes('--build')) {
             mkdirSync(join(srcDir, 'build', 'Release'), { recursive: true });
@@ -1643,86 +1650,139 @@ exit 0
           }
         },
       }),
-    ).toThrow(/onnxruntime\.dll.*--require-win-asr/);
+    ).toThrow(/DirectML\.dll.*--require-win-asr/);
 
     // 3b. Prebuilt IMCODES_WIN_SPEECH_BIN_PATH + DLLs still validates current SDK when requireWinAsr=true
     const prebuiltDir = join(work, 'prebuilt-win');
     mkdirSync(prebuiltDir, { recursive: true });
     const prebuiltExe = join(prebuiltDir, 'imcodes-speech-win.exe');
     writeFileSync(prebuiltExe, 'MZ-prebuilt-win', 'utf8');
-    writeFileSync(join(prebuiltDir, 'sherpa-onnx-c-api.dll'), 'MZ-prebuilt-capi', 'utf8');
     writeFileSync(join(prebuiltDir, 'onnxruntime.dll'), 'MZ-prebuilt-ort', 'utf8');
+    writeFileSync(join(prebuiltDir, 'DirectML.dll'), 'MZ-prebuilt-dml', 'utf8');
     expect(() =>
       buildWindowsSpeechHelper({
         outDir: join(work, 'out-prebuilt-no-sdk'),
         requireWinAsr: true,
         env: { IMCODES_WIN_SPEECH_BIN_PATH: prebuiltExe },
       }),
-    ).toThrow(/sherpa-onnx Windows C API SDK missing or incomplete.*--require-win-asr/);
+    ).toThrow(/ONNX Runtime DirectML Windows SDK missing or incomplete.*--require-win-asr/);
 
     const sdkNoLib = join(work, 'sdk-no-lib');
-    mkdirSync(join(sdkNoLib, 'include', 'sherpa-onnx', 'c-api'), { recursive: true });
-    writeFileSync(join(sdkNoLib, 'include', 'sherpa-onnx', 'c-api', 'c-api.h'), '// header only\n', 'utf8');
+    mkdirSync(join(sdkNoLib, 'build', 'native', 'include'), { recursive: true });
+    writeFileSync(join(sdkNoLib, 'build', 'native', 'include', 'onnxruntime_cxx_api.h'), '// header only\n', 'utf8');
+    writeFileSync(join(sdkNoLib, 'build', 'native', 'include', 'dml_provider_factory.h'), '// dml header only\n', 'utf8');
     expect(() =>
       buildWindowsSpeechHelper({
         outDir: join(work, 'out-prebuilt-missing-lib'),
         requireWinAsr: true,
         env: {
           IMCODES_WIN_SPEECH_BIN_PATH: prebuiltExe,
-          IMCODES_SHERPA_ONNX_WIN_DIR: sdkNoLib,
+          IMCODES_ONNXRUNTIME_WIN_DIR: sdkNoLib,
         },
       }),
-    ).toThrow(/sherpa-onnx Windows C API SDK missing or incomplete.*--require-win-asr/);
+    ).toThrow(/ONNX Runtime DirectML Windows SDK missing or incomplete.*--require-win-asr/);
 
+    writeFileSync(join(sdkDir, 'bin', 'x64-win', 'DirectML.dll'), 'MZ-dml-bin-restored', 'utf8');
     const prebuiltWithValidSdk = buildWindowsSpeechHelper({
       outDir: join(work, 'out-prebuilt-valid'),
       requireWinAsr: true,
       env: {
         IMCODES_WIN_SPEECH_BIN_PATH: prebuiltExe,
-        IMCODES_SHERPA_ONNX_WIN_DIR: sdkDir,
+        IMCODES_ONNXRUNTIME_WIN_DIR: sdkDir,
       },
     });
     expect(prebuiltWithValidSdk).not.toBeNull();
     expect(prebuiltWithValidSdk!.runtimeDlls.some((p: string) => p.endsWith('onnxruntime.dll'))).toBe(true);
+    expect(prebuiltWithValidSdk!.runtimeDlls.some((p: string) => p.endsWith('DirectML.dll'))).toBe(true);
 
-    // 3c. CMakeLists.txt must not reuse cached SHERPA_ONNX_C_API_LIB from SDK A when reconfiguring to header-only SDK B
+    // 3c. CMakeLists.txt must not reuse cached IMCODES_ORT_LIBRARY from SDK A when reconfiguring to header-only SDK B
     const cmakeProbe = spawnSync('cmake', ['--version'], { encoding: 'utf8' });
     if (cmakeProbe.status === 0) {
       const realWinSrc = resolve('apps/pc-app/native/win');
       const sdkA = join(work, 'cmake-sdk-a');
       const sdkB = join(work, 'cmake-sdk-b');
       const cmakeBuild = join(work, 'cmake-reconfig-build');
-      mkdirSync(join(sdkA, 'include', 'sherpa-onnx', 'c-api'), { recursive: true });
-      mkdirSync(join(sdkA, 'lib'), { recursive: true });
-      mkdirSync(join(sdkB, 'include', 'sherpa-onnx', 'c-api'), { recursive: true });
-      writeFileSync(join(sdkA, 'include', 'sherpa-onnx', 'c-api', 'c-api.h'), '// sdk A\n', 'utf8');
-      writeFileSync(join(sdkB, 'include', 'sherpa-onnx', 'c-api', 'c-api.h'), '// sdk B\n', 'utf8');
-      const mockLibName = process.platform === 'win32' ? 'sherpa-onnx-c-api.lib' : 'libsherpa-onnx-c-api.a';
-      writeFileSync(join(sdkA, 'lib', mockLibName), 'mock-lib-a', 'utf8');
+      mkdirSync(join(sdkA, 'build', 'native', 'include'), { recursive: true });
+      mkdirSync(join(sdkA, 'runtimes', 'win-x64', 'native'), { recursive: true });
+      mkdirSync(join(sdkB, 'build', 'native', 'include'), { recursive: true });
+      writeFileSync(join(sdkA, 'build', 'native', 'include', 'onnxruntime_cxx_api.h'), '// sdk A\n', 'utf8');
+      writeFileSync(join(sdkB, 'build', 'native', 'include', 'onnxruntime_cxx_api.h'), '// sdk B\n', 'utf8');
+      const mockLibName = process.platform === 'win32'
+        ? 'onnxruntime.lib'
+        : process.platform === 'darwin'
+          ? 'libonnxruntime.dylib'
+          : 'libonnxruntime.so';
+      writeFileSync(join(sdkA, 'runtimes', 'win-x64', 'native', mockLibName), 'mock-lib-a', 'utf8');
 
       const cfgA = spawnSync(
         'cmake',
-        ['-S', realWinSrc, '-B', cmakeBuild, `-DSHERPA_ONNX_DIR=${sdkA}`, '-DIMCODES_REQUIRE_SHERPA_ONNX=ON'],
+        ['-S', realWinSrc, '-B', cmakeBuild, `-DONNXRUNTIME_DIR=${sdkA}`, '-DIMCODES_REQUIRE_ONNXRUNTIME=ON'],
         { encoding: 'utf8' },
       );
       expect(cfgA.status, cfgA.stderr).toBe(0);
       const cacheText = readFileSync(join(cmakeBuild, 'CMakeCache.txt'), 'utf8');
-      const cachedLibMatch = cacheText.match(/^SHERPA_ONNX_C_API_LIB:FILEPATH=(.+)$/m);
+      const cachedLibMatch = cacheText.match(/^IMCODES_ORT_LIBRARY:FILEPATH=(.+)$/m);
       expect(cachedLibMatch).not.toBeNull();
       expect(cachedLibMatch![1]!.trim().replaceAll('\\', '/')).toBe(
-        join(sdkA, 'lib', mockLibName).replaceAll('\\', '/'),
+        join(sdkA, 'runtimes', 'win-x64', 'native', mockLibName).replaceAll('\\', '/'),
       );
 
       const cfgB = spawnSync(
         'cmake',
-        ['-S', realWinSrc, '-B', cmakeBuild, `-DSHERPA_ONNX_DIR=${sdkB}`, '-DIMCODES_REQUIRE_SHERPA_ONNX=ON'],
+        ['-S', realWinSrc, '-B', cmakeBuild, `-DONNXRUNTIME_DIR=${sdkB}`, '-DIMCODES_REQUIRE_ONNXRUNTIME=ON'],
         { encoding: 'utf8' },
       );
       expect(cfgB.status).not.toBe(0);
-      expect(`${cfgB.stdout}\n${cfgB.stderr}`).toContain('sherpa-onnx-c-api library not found');
+      expect(`${cfgB.stdout}\n${cfgB.stderr}`).toContain('ONNX Runtime Windows SDK missing or incomplete');
     }
 
-    // 4. verifyPackagedWindowsDir checks helper, DLLs, and probe localAsrSupported: true
+    // 3d. buildLinuxSpeechHelper & Linux stagePcAppResources
+    const linuxSrcDir = join(work, 'linux-src');
+    mkdirSync(linuxSrcDir, { recursive: true });
+    writeFileSync(join(linuxSrcDir, 'CMakeLists.txt'), 'cmake_minimum_required(VERSION 3.20)\n', 'utf8');
+    const linuxSdk = join(work, 'ort-linux-sdk');
+    mkdirSync(join(linuxSdk, 'buildTransitive', 'native', 'include'), { recursive: true });
+    mkdirSync(join(linuxSdk, 'runtimes', 'linux-x64', 'native'), { recursive: true });
+    writeFileSync(join(linuxSdk, 'buildTransitive', 'native', 'include', 'onnxruntime_cxx_api.h'), '// linux ort\n', 'utf8');
+    writeFileSync(join(linuxSdk, 'runtimes', 'linux-x64', 'native', 'libonnxruntime.so'), 'ELF-ort', 'utf8');
+    writeFileSync(join(linuxSdk, 'runtimes', 'linux-x64', 'native', 'libonnxruntime_providers_cuda.so'), 'ELF-cuda', 'utf8');
+    const linuxCmakeCalls: string[][] = [];
+    const builtLinux = buildLinuxSpeechHelper({
+      srcDir: linuxSrcDir,
+      outDir: join(work, 'out-linux'),
+      requireLinuxAsr: true,
+      env: { IMCODES_ONNXRUNTIME_LINUX_DIR: linuxSdk },
+      execFn: (_cmd: string, args: string[]) => {
+        linuxCmakeCalls.push(args);
+        if (args.includes('--build')) {
+          mkdirSync(join(linuxSrcDir, 'build'), { recursive: true });
+          writeFileSync(join(linuxSrcDir, 'build', 'imcodes-speech-linux'), '#!/bin/sh\n', { mode: 0o755 });
+        }
+      },
+    });
+    expect(linuxCmakeCalls[0]).toContain(`-DONNXRUNTIME_DIR=${linuxSdk}`);
+    expect(linuxCmakeCalls[0]).toContain('-DIMCODES_REQUIRE_ONNXRUNTIME=ON');
+    expect(builtLinux).not.toBeNull();
+    expect(builtLinux!.runtimeLibs.map((p: string) => p.split(/[\\/]/).pop()).sort()).toEqual([
+      'libonnxruntime.so',
+      'libonnxruntime.so.1',
+      'libonnxruntime_providers_cuda.so',
+    ]);
+    const linuxDaemonExe = join(work, 'imcodes-linux');
+    writeFileSync(linuxDaemonExe, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    const stagedLinux = stagePcAppResources({
+      platform: 'linux',
+      nodeExePath: linuxDaemonExe,
+      linuxSpeechBinPath: builtLinux!.binPath,
+      linuxSpeechRuntimeLibs: builtLinux!.runtimeLibs,
+      requireLinuxAsr: true,
+      stageDir: join(work, 'stage-linux'),
+    });
+    expect(existsSync(stagedLinux.linuxSpeechBinPath!)).toBe(true);
+    expect(existsSync(join(work, 'stage-linux', 'libonnxruntime.so'))).toBe(true);
+    expect(existsSync(join(work, 'stage-linux', 'libonnxruntime.so.1'))).toBe(true);
+
+    // 4. verifyPackagedWindowsDir checks helper, DLLs (onnxruntime + DirectML), and probe localAsrSupported: true
     const winUnpacked = join(work, 'win-unpacked');
     mkdirSync(join(winUnpacked, 'resources'), { recursive: true });
     writeFileSync(join(winUnpacked, 'IM.codes.exe'), 'MZ-shell', 'utf8');
@@ -1733,12 +1793,12 @@ exit 0
     ).toThrow(/imcodes-speech-win\.exe missing/);
 
     writeFileSync(join(winUnpacked, 'resources', 'imcodes-speech-win.exe'), 'MZ-helper', 'utf8');
-    writeFileSync(join(winUnpacked, 'resources', 'sherpa-onnx-c-api.dll'), 'MZ-capi', 'utf8');
+    writeFileSync(join(winUnpacked, 'resources', 'onnxruntime.dll'), 'MZ-ort', 'utf8');
     expect(() =>
       verifyPackagedWindowsDir(winUnpacked, { requireWinAsr: true }),
-    ).toThrow(/onnxruntime\.dll/);
+    ).toThrow(/DirectML\.dll/);
 
-    writeFileSync(join(winUnpacked, 'resources', 'onnxruntime.dll'), 'MZ-ort', 'utf8');
+    writeFileSync(join(winUnpacked, 'resources', 'DirectML.dll'), 'MZ-dml', 'utf8');
     expect(() =>
       verifyPackagedWindowsDir(winUnpacked, {
         requireWinAsr: true,
@@ -1785,11 +1845,17 @@ exit 0
 
     // 6. C++/CI contract checks
     const cppSrc = readFileSync('apps/pc-app/native/win/imcodes-speech-win.cpp', 'utf8');
-    expect(cppSrc).toContain('#ifdef IMCODES_HAS_SHERPA_ONNX');
+    expect(cppSrc).toContain('#ifdef IMCODES_HAS_ONNXRUNTIME');
     expect(cppSrc).toContain('\\"localAsrSupported\\":true}');
     expect(cppSrc).toContain('\\"localAsrSupported\\":false}');
+    const linuxCppSrc = readFileSync('apps/pc-app/native/linux/imcodes-speech-linux.cpp', 'utf8');
+    expect(linuxCppSrc).toContain('#ifdef IMCODES_HAS_ONNXRUNTIME');
+    expect(linuxCppSrc).toContain('\\"localAsrSupported\\":true}');
+    expect(linuxCppSrc).toContain('\\"localAsrSupported\\":false}');
     const wfYml = readFileSync('.github/workflows/build-pc-app.yml', 'utf8');
-    expect(wfYml).toContain('IMCODES_SHERPA_ONNX_WIN_DIR');
+    expect(wfYml).toContain('IMCODES_ONNXRUNTIME_WIN_DIR');
+    expect(wfYml).toContain('Microsoft.ML.OnnxRuntime.DirectML');
+    expect(wfYml).toContain('Microsoft.AI.DirectML');
     expect(wfYml).toContain('--require-win-asr');
   });
 });

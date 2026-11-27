@@ -33,9 +33,17 @@ else()
 endif()
 if(WIN32)
   target_compile_definitions(imcodes_qwen3_onnx_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+  target_link_libraries(imcodes_qwen3_onnx_core PUBLIC normaliz)
+elseif(APPLE)
+  target_compile_definitions(imcodes_qwen3_onnx_core PUBLIC IMCODES_USE_COREFOUNDATION=1)
+  target_link_libraries(imcodes_qwen3_onnx_core PUBLIC "-framework CoreFoundation")
 endif()
 
 set(IMCODES_ORT_FOUND FALSE)
+set(IMCODES_ORT_HAS_DML FALSE)
+set(IMCODES_ORT_HAS_CUDA FALSE)
+unset(IMCODES_ORT_INCLUDE_DIR CACHE)
+unset(IMCODES_ORT_LIBRARY CACHE)
 if(ONNXRUNTIME_DIR AND EXISTS "${ONNXRUNTIME_DIR}")
   find_path(IMCODES_ORT_INCLUDE_DIR
     NAMES onnxruntime_cxx_api.h
@@ -44,6 +52,7 @@ if(ONNXRUNTIME_DIR AND EXISTS "${ONNXRUNTIME_DIR}")
       "${ONNXRUNTIME_DIR}/include/onnxruntime"
       "${ONNXRUNTIME_DIR}/include/onnxruntime/core/session"
       "${ONNXRUNTIME_DIR}/build/native/include"
+      "${ONNXRUNTIME_DIR}/buildTransitive/native/include"
     NO_DEFAULT_PATH
   )
   find_library(IMCODES_ORT_LIBRARY
@@ -71,12 +80,21 @@ if(ONNXRUNTIME_DIR AND EXISTS "${ONNXRUNTIME_DIR}")
       target_link_options(imcodes_qwen3_onnx_core PUBLIC "-Wl,-rpath,${IMCODES_ORT_LIB_DIR}")
     endif()
     if(WIN32 AND IMCODES_ORT_ENABLE_DML AND EXISTS "${IMCODES_ORT_INCLUDE_DIR}/dml_provider_factory.h")
+      set(IMCODES_ORT_HAS_DML TRUE)
       target_compile_definitions(imcodes_qwen3_onnx_core PUBLIC IMCODES_ORT_HAS_DML=1)
     endif()
     if(UNIX AND NOT APPLE AND IMCODES_ORT_ENABLE_CUDA)
+      set(IMCODES_ORT_HAS_CUDA TRUE)
       target_compile_definitions(imcodes_qwen3_onnx_core PUBLIC IMCODES_ORT_HAS_CUDA=1)
     endif()
   endif()
+endif()
+
+get_directory_property(_imcodes_has_parent PARENT_DIRECTORY)
+if(_imcodes_has_parent)
+  set(IMCODES_ORT_FOUND "${IMCODES_ORT_FOUND}" PARENT_SCOPE)
+  set(IMCODES_ORT_HAS_DML "${IMCODES_ORT_HAS_DML}" PARENT_SCOPE)
+  set(IMCODES_ORT_HAS_CUDA "${IMCODES_ORT_HAS_CUDA}" PARENT_SCOPE)
 endif()
 
 if(UNIX AND NOT APPLE)

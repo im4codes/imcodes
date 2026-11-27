@@ -256,8 +256,10 @@ export interface PcAppVoiceControllerDeps {
   resourcesPath?: string;
   speechHelperPath?: string;
   winSpeechHelperPath?: string;
+  linuxSpeechHelperPath?: string;
   mlxHelperPath?: string;
   winProvider?: 'auto' | 'directml' | 'cpu';
+  linuxProvider?: 'auto' | 'cuda' | 'cpu';
   isMainWebContents: (sender: unknown) => boolean;
   getCurrentTrustedOrigin: () => string | null;
   getActiveOrigin: () => string | null;
@@ -391,6 +393,8 @@ function defaultBuildDevHelper(outPath: string, arch = process.arch === 'x64' ? 
 export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   const isDarwin = deps.platform === 'darwin';
   const isWin32 = deps.platform === 'win32';
+  const isLinux = deps.platform === 'linux';
+  const isOnnxPlatform = isWin32 || isLinux;
   let activeChild: ChildProcess | null = null;
   let activeChildIsMlx = false;
   let activeChildSource: 'in-app' | 'global' | undefined;
@@ -398,14 +402,16 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let cachedDevHelperPath: string | null = null;
   let cachedMlxSupport: boolean | null =
     !isDarwin || (deps.arch ?? process.arch) !== 'arm64' ? false : null;
-  let cachedWinOnnxSupport: boolean | null = isWin32 ? null : false;
+  let cachedWinOnnxSupport: boolean | null = isOnnxPlatform ? null : false;
   let cachedWinGpuName: string | null = null;
   let cachedWinVramMb: number | null = null;
-  let cachedWinProvider: 'directml' | 'cpu' = deps.winProvider === 'directml' ? 'directml' : 'cpu';
+  let cachedWinProvider: 'directml' | 'cuda' | 'cpu' = isLinux
+    ? (deps.linuxProvider === 'cuda' ? 'cuda' : 'cpu')
+    : (deps.winProvider === 'directml' ? 'directml' : 'cpu');
   let lastProgressNotifiedBucket = -1;
   let lastProgressNotifiedState: PcAppSpeechModelStatus['state'] | null = null;
   let lastProgressNotifiedDownloading: PcAppSpeechVariant | null = null;
-  let lastProgressNotifiedMlx: boolean | null = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+  let lastProgressNotifiedMlx: boolean | null = isOnnxPlatform ? cachedWinOnnxSupport : cachedMlxSupport;
   let lastProgressNotifiedAt = 0;
 
   interface ActiveWorkerUtterance {
@@ -506,7 +512,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     !controllerDisposed && !serveUnsupported && (deps.useResidentMlxWorker ?? (deps.spawnHelper === undefined));
 
   const modelStore = new PcAppSpeechModelStore(deps.userDataDir);
-  const loadedModel = modelStore.load(isWin32 ? 'qwen3-0.6b' : 'system');
+  const loadedModel = modelStore.load(isOnnxPlatform ? 'qwen3-0.6b' : 'system');
   let selectedModel: PcAppSpeechModelChoice = loadedModel;
   let pendingStartupModel: Exclude<PcAppSpeechModelChoice, 'system'> | null =
     loadedModel !== 'system' ? loadedModel : null;
@@ -594,6 +600,24 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     return candidates.find((p) => existsSync(p)) ?? null;
   };
 
+  const resolveLinuxSpeechHelperPath = (): string | null => {
+    if (!isLinux) return null;
+    if (deps.linuxSpeechHelperPath) return deps.linuxSpeechHelperPath;
+    if (deps.speechHelperPath && !deps.speechHelperPath.toLowerCase().endsWith('.exe')) {
+      return deps.speechHelperPath;
+    }
+    if (deps.resourcesPath) {
+      const packaged = join(deps.resourcesPath, 'imcodes-speech-linux');
+      if (existsSync(packaged)) return packaged;
+    }
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const candidates = [
+      resolve(moduleDir, '../../native/linux/build/imcodes-speech-linux'),
+      resolve(moduleDir, '../native/linux/build/imcodes-speech-linux'),
+    ];
+    return candidates.find((p) => existsSync(p)) ?? null;
+  };
+
   const resolveMlxHelperPath = (): string | null => {
     if (deps.platform !== 'darwin') return null;
     if ((deps.arch ?? process.arch) !== 'arm64') return null;
@@ -613,10 +637,10 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   };
 
   const resolveLocalBackendHelperPath = (): string | null =>
-    isWin32 ? resolveWinSpeechHelperPath() : resolveMlxHelperPath();
+    isWin32 ? resolveWinSpeechHelperPath() : isLinux ? resolveLinuxSpeechHelperPath() : resolveMlxHelperPath();
 
   const isLocalAsrSupportedSync = (): boolean =>
-    isWin32 ? (cachedWinOnnxSupport ?? false) : (cachedMlxSupport ?? false);
+    isOnnxPlatform ? (cachedWinOnnxSupport ?? false) : (cachedMlxSupport ?? false);
 
   const variantManifestTotal = (variant: PcAppSpeechVariant): number =>
     downloader.getManifest(variant).files.reduce((sum, f) => sum + f.expectedSize, 0);
@@ -633,7 +657,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   const getVariantStatusSync = (variant: PcAppSpeechVariant) => {
     const totalBytes = variantMeta[variant].totalBytes || variantManifestTotal(variant);
     const modelDir = downloader.getModelDirectory(variant);
-    const cachedSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    const cachedSupport = isOnnxPlatform ? cachedWinOnnxSupport : cachedMlxSupport;
     if (cachedSupport === false) {
       return {
         state: 'unsupported' as const,
@@ -682,7 +706,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   };
 
   const getEffectiveSelectedModel = (): PcAppSpeechModelChoice => {
-    const cachedSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    const cachedSupport = isOnnxPlatform ? cachedWinOnnxSupport : cachedMlxSupport;
     if (cachedSupport === false) return 'system';
     const variant = choiceToSpeechVariant(selectedModel);
     if (!variant) return 'system';
@@ -701,16 +725,20 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     const downloadingModel = downloadingVariant ? variantToChoice(downloadingVariant) : null;
     const effectiveSelected = getEffectiveSelectedModel();
     const activeBackend: PcAppSpeechModelChoice = localAsrSupported ? effectiveSelected : 'system';
-    const winMeta = isWin32
+    const winMeta = isOnnxPlatform
       ? {
           localAsrSupported,
           executionProvider: activeBackend === 'system' ? ('system' as const) : cachedWinProvider,
           gpuName: cachedWinGpuName,
           vramMb: cachedWinVramMb,
-          lowVramWarning:
-            selectedModel === 'qwen3-1.7b' &&
-            cachedWinVramMb !== null &&
-            cachedWinVramMb < WIN32_GPU_MIN_VRAM_MB,
+          ...(isWin32
+            ? {
+                lowVramWarning:
+                  selectedModel === 'qwen3-1.7b' &&
+                  cachedWinVramMb !== null &&
+                  cachedWinVramMb < WIN32_GPU_MIN_VRAM_MB,
+              }
+            : {}),
         }
       : {
           localAsrSupported,
@@ -734,7 +762,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       };
     }
 
-    const cachedSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    const cachedSupport = isOnnxPlatform ? cachedWinOnnxSupport : cachedMlxSupport;
     if (cachedSupport === false && (selectedModel !== 'system' || lastStatusVariant !== null)) {
       const refVariant = choiceToSpeechVariant(selectedModel) ?? lastStatusVariant ?? '0.6b';
       const refStatus = refVariant === '0.6b' ? status06 : status17;
@@ -867,14 +895,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   }
 
   const checkMlxSupported = async (): Promise<boolean> => {
-    if (isWin32) {
+    if (isOnnxPlatform) {
       if (localBackendPermanentlyUnavailable || cachedWinOnnxSupport === false) {
         cachedWinOnnxSupport = false;
         return false;
       }
       if (cachedWinOnnxSupport !== null) return cachedWinOnnxSupport;
-      const winBin = resolveWinSpeechHelperPath();
-      if (!winBin) {
+      const onnxBin = resolveLocalBackendHelperPath();
+      if (!onnxBin) {
         cachedWinOnnxSupport = false;
         cachedWinGpuName = null;
         cachedWinVramMb = null;
@@ -883,8 +911,8 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       }
       try {
         const raw = deps.runHelperSync
-          ? deps.runHelperSync(winBin, ['probe'])
-          : await (deps.runHelperAsync ?? defaultRunHelperAsync)(winBin, ['probe']);
+          ? deps.runHelperSync(onnxBin, ['probe'])
+          : await (deps.runHelperAsync ?? defaultRunHelperAsync)(onnxBin, ['probe']);
         if (localBackendPermanentlyUnavailable || cachedWinOnnxSupport === false) {
           cachedWinOnnxSupport = false;
           return false;
@@ -894,22 +922,33 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           gpuName?: unknown;
           vramMb?: unknown;
           provider?: unknown;
+          cudaEligible?: unknown;
           localAsrSupported?: unknown;
         };
         const vram = typeof parsed.vramMb === 'number' && Number.isFinite(parsed.vramMb)
           ? Math.max(0, Math.round(parsed.vramMb))
           : 0;
         const probeGpuName = typeof parsed.gpuName === 'string' && parsed.gpuName.trim() ? parsed.gpuName.trim() : null;
-        let probeProvider: 'cpu' | 'directml';
-        // Enforce benchmark policy: DirectML ONLY when dedicated VRAM >= 4096 MB; < 4 GB uses CPU.
-        if (deps.winProvider === 'cpu') {
-          probeProvider = 'cpu';
-        } else if (deps.winProvider === 'directml') {
-          probeProvider = vram >= WIN32_GPU_MIN_VRAM_MB ? 'directml' : 'cpu';
+        let probeProvider: 'cpu' | 'directml' | 'cuda';
+        if (isLinux) {
+          if (deps.linuxProvider === 'cpu') {
+            probeProvider = 'cpu';
+          } else {
+            probeProvider = parsed.provider === 'cuda' || (deps.linuxProvider === 'cuda' && parsed.cudaEligible === true)
+              ? 'cuda'
+              : 'cpu';
+          }
         } else {
-          probeProvider = vram >= WIN32_GPU_MIN_VRAM_MB && parsed.provider === 'directml'
-            ? 'directml'
-            : 'cpu';
+          // Enforce benchmark policy: DirectML ONLY when dedicated VRAM >= 4096 MB; < 4 GB uses CPU.
+          if (deps.winProvider === 'cpu') {
+            probeProvider = 'cpu';
+          } else if (deps.winProvider === 'directml') {
+            probeProvider = vram >= WIN32_GPU_MIN_VRAM_MB ? 'directml' : 'cpu';
+          } else {
+            probeProvider = vram >= WIN32_GPU_MIN_VRAM_MB && parsed.provider === 'directml'
+              ? 'directml'
+              : 'cpu';
+          }
         }
         if (localBackendPermanentlyUnavailable || cachedWinOnnxSupport === false) {
           cachedWinOnnxSupport = false;
@@ -1054,6 +1093,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     if (isWin32) {
       return resolveWinSpeechHelperPath();
     }
+    if (isLinux) {
+      return resolveLinuxSpeechHelperPath();
+    }
     if (!isDarwin) return null;
     if (deps.speechHelperPath) return deps.speechHelperPath;
     if (deps.resourcesPath) {
@@ -1098,9 +1140,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   };
 
   const getPermissions = async (): Promise<PcAppVoicePermissions> => {
-    if (isWin32) {
-      const winBin = resolveWinSpeechHelperPath();
-      if (!winBin) {
+    if (isOnnxPlatform) {
+      const onnxBin = resolveLocalBackendHelperPath();
+      if (!onnxBin) {
         return {
           mic: 'unknown',
           speech: 'unavailable',
@@ -1250,9 +1292,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
     const variant = choiceToSpeechVariant(selectedModel);
     const modelLabel = formatRemoteVoiceModelLabel(selectedModel);
-    const backendSupported = isWin32 ? cachedWinOnnxSupport === true : cachedMlxSupport === true;
+    const backendSupported = isOnnxPlatform ? cachedWinOnnxSupport === true : cachedMlxSupport === true;
     const ready = Boolean(
-      (isDarwin || isWin32)
+      (isDarwin || isOnnxPlatform)
       && variant
       && modelLabel
       && backendSupported
@@ -1369,7 +1411,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
   const markBackendUnavailable = (reasonCode: string): void => {
     serveUnsupported = true;
-    if (reasonCode === 'sherpa_onnx_unavailable' && isWin32) {
+    if ((reasonCode === 'onnxruntime_unavailable' || reasonCode === 'sherpa_onnx_unavailable') && isOnnxPlatform) {
       localBackendPermanentlyUnavailable = true;
       cachedWinOnnxSupport = false;
     }
@@ -1505,7 +1547,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       }
 
       const modelDir = downloader.getModelDirectory(variant);
-      const args = isWin32
+      const args = isOnnxPlatform
         ? ['serve', '--model-dir', modelDir, '--variant', variant, '--provider', cachedWinProvider]
         : ['serve', '--model-dir', modelDir, '--variant', variant];
       appendVoiceLog(`mlx serve spawn variant=${variant} bin=${mlxBin} args=${JSON.stringify(args)}`);
@@ -1569,6 +1611,15 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
             if (worker.state !== 'stopping') {
               worker.state = 'ready';
             }
+            const readyProvider = (parsed as { provider?: unknown }).provider;
+            if (
+              isOnnxPlatform
+              && (readyProvider === 'cpu' || readyProvider === 'directml' || readyProvider === 'cuda')
+              && readyProvider !== cachedWinProvider
+            ) {
+              cachedWinProvider = readyProvider;
+              notifyStatusChanged(true);
+            }
             if (worker.utterance && activeRemoteSession?.utt === worker.utterance) {
               refreshRemoteIdleTimer(worker.utterance);
             }
@@ -1586,6 +1637,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
             if (parsed.type === 'error') {
               if (
                 (parsed.code === 'unknown_command' && worker.state !== 'ready')
+                || parsed.code === 'onnxruntime_unavailable'
                 || parsed.code === 'sherpa_onnx_unavailable'
               ) {
                 markBackendUnavailable(parsed.code);
@@ -1599,6 +1651,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           if (parsed.type === 'error') {
             if (
               (parsed.code === 'unknown_command' && worker.state !== 'ready')
+              || parsed.code === 'onnxruntime_unavailable'
               || parsed.code === 'sherpa_onnx_unavailable'
             ) {
               markBackendUnavailable(parsed.code);
@@ -1729,7 +1782,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     worker.awaitingAbortedEnd = false;
     resolveAbortedEndWait(worker, false);
     shutdownMlxWorker(worker);
-    if (isWin32) {
+    if (isOnnxPlatform) {
       try {
         worker.proc.kill('SIGTERM');
       } catch { /* ignore */ }
@@ -2023,7 +2076,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     onEvent?: (event: PcAppVoiceEvent) => void;
   }): Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }> => {
     const isGlobalSource = options?.source === 'global';
-    if (!isDarwin && !isWin32) {
+    if (!isDarwin && !isOnnxPlatform) {
       return { ok: false, error: 'unsupported_platform' };
     }
     const finalizeOnly = options?.finalizeOnly === true;
@@ -2067,7 +2120,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       }
       if (perms.mic !== 'granted') {
         clearPendingStartIfCurrent();
-        if (isWin32) {
+        if (isOnnxPlatform) {
           return { ok: false, error: 'speech_helper_unavailable' };
         }
         appendVoiceLog(`startListening denied target=mic selectedModel=${selectedModel} device=${selectedInputDevice}`);
@@ -2208,7 +2261,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       if (mlxBin && verified) {
         bin = mlxBin;
         isMlxHelper = true;
-        args = isWin32
+        args = isOnnxPlatform
           ? ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant, '--provider', cachedWinProvider]
           : ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant];
         if (typeof options?.locale === 'string' && options.locale.trim()) {
@@ -2237,11 +2290,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
 
     if (!bin) {
-      if (isWin32) {
+      if (isOnnxPlatform) {
         clearPendingStartIfCurrent();
         if (!isGlobalSource) notifyVoiceEvent({ type: 'end' });
         const errCode = variant ? 'speech_model_downloading' : 'speech_model_required';
-        appendVoiceLog(`startListening win32 unavailable reason=${errCode} selectedModel=${selectedModel}`);
+        appendVoiceLog(`startListening ${deps.platform} unavailable reason=${errCode} selectedModel=${selectedModel}`);
         return { ok: false, error: errCode };
       }
       if (!perms || perms.speech !== 'granted') {
@@ -2309,7 +2362,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         }
       } else if (payload.type === 'error') {
         appendVoiceLog(`helper error code=${payload.code} target=${payload.target ?? '-'} message=${payload.message ?? '-'}`);
-        if (payload.code === 'sherpa_onnx_unavailable') {
+        if (payload.code === 'onnxruntime_unavailable' || payload.code === 'sherpa_onnx_unavailable') {
           markBackendUnavailable(payload.code);
         }
       }
@@ -2396,11 +2449,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   const getSpeechModel = (): PcAppSpeechModelChoice => getEffectiveSelectedModel();
 
   const getSpeechModelStatus = async (): Promise<PcAppSpeechModelStatus> => {
-    const prevSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    const prevSupport = isOnnxPlatform ? cachedWinOnnxSupport : cachedMlxSupport;
     const prevProvider = cachedWinProvider;
     const prevVram = cachedWinVramMb;
     await checkMlxSupported();
-    const nextSupport = isWin32 ? cachedWinOnnxSupport : cachedMlxSupport;
+    const nextSupport = isOnnxPlatform ? cachedWinOnnxSupport : cachedMlxSupport;
     if (prevSupport !== nextSupport || prevProvider !== cachedWinProvider || prevVram !== cachedWinVramMb) {
       notifyStatusChanged(true);
     }
@@ -2481,7 +2534,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   };
 
   const getInputDevices = async (): Promise<PcAppInputDevice[]> => {
-    if (!isDarwin && !isWin32) {
+    if (!isDarwin && !isOnnxPlatform) {
       return [];
     }
     const bin = resolveSpeechHelperPath();
@@ -2554,7 +2607,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         );
         return { ok: false, error: 'busy' };
       }
-      if (!isDarwin && !isWin32) {
+      if (!isDarwin && !isOnnxPlatform) {
         appendVoiceLog(`startRemoteSession rejected reason=not_ready detail=unsupported_platform sessionId=${sessionId}`);
         return { ok: false, error: 'not_ready' };
       }

@@ -3139,4 +3139,110 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
 
     await voice.dispose();
   });
+
+  it('supports linux ONNX helper with CUDA/CPU probe, resident serve, hotwords, and onnxruntime_unavailable degradation', async () => {
+    const weights = Buffer.from('linux-onnx-weights');
+    const sha = createHash('sha256').update(weights).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'csukuangfj2/test-linux-0.6b',
+        revision: 'linux06',
+        files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'ilmina/test-linux-1.7b',
+        revision: 'linux17',
+        files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+      },
+    };
+
+    const cudaDir = path.join(tempDir, 'linux-cuda');
+    mkdirSync(path.join(cudaDir, 'speech-models', '0.6b'), { recursive: true });
+    writeFileSync(path.join(cudaDir, 'speech-models', '0.6b', 'encoder.int8.onnx'), weights);
+    writeFileSync(path.join(cudaDir, 'speech-models', '0.6b', '.verified-linux06'), '');
+
+    const spawnCalls: Array<{ bin: string; args: string[] }> = [];
+    const spawned: Array<ReturnType<typeof createFakeChildProcess>> = [];
+    const voice = createPcAppVoiceController({
+      platform: 'linux',
+      arch: 'x64',
+      userDataDir: cudaDir,
+      linuxSpeechHelperPath: '/opt/imcodes/imcodes-speech-linux',
+      useResidentMlxWorker: true,
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes/',
+      sendToRenderer: () => {},
+      manifests,
+      runHelperAsync: async (_bin, args) => {
+        if (args[0] === 'probe') {
+          return JSON.stringify({
+            ok: true,
+            gpuName: 'NVIDIA A100-SXM4-80GB',
+            vramMb: 81920,
+            provider: 'cuda',
+            cudaEligible: true,
+            localAsrSupported: true,
+          });
+        }
+        if (args[0] === 'devices') {
+          return JSON.stringify([{ uid: 'default', name: 'Pulse Default', transport: 'pulseaudio', isDefault: true, isPhysical: true }]);
+        }
+        return '[]';
+      },
+      spawnHelper: (bin, args) => {
+        spawnCalls.push({ bin, args });
+        const proc = createFakeChildProcess();
+        spawned.push(proc);
+        return proc as unknown as ChildProcess;
+      },
+    });
+
+    const status = await voice.getSpeechModelStatus();
+    expect(status.localAsrSupported).toBe(true);
+    expect(status.executionProvider).toBe('cuda');
+    expect(status.gpuName).toBe('NVIDIA A100-SXM4-80GB');
+    expect(status.vramMb).toBe(81920);
+    expect(await voice.getInputDevices()).toHaveLength(1);
+
+    const startRes = await voice.startRemoteSession({
+      sessionId: 'rem-linux-1',
+      locale: 'zh-CN',
+      hotwords: ['OpenClaw', 'Qwen3'],
+    });
+    expect(startRes).toEqual({ ok: true });
+    expect(spawnCalls[0]).toEqual({
+      bin: '/opt/imcodes/imcodes-speech-linux',
+      args: [
+        'serve',
+        '--model-dir',
+        path.join(cudaDir, 'speech-models', '0.6b'),
+        '--variant',
+        '0.6b',
+        '--provider',
+        'cuda',
+      ],
+    });
+    spawned[0]!.stdout.emit('data', '{"type":"ready","variant":"0.6b","provider":"cpu"}\n');
+    expect(voice.getSpeechModelStatusSync().executionProvider).toBe('cpu');
+    expect(spawned[0]!.stdin.write).toHaveBeenCalledWith(
+      expect.stringContaining('"hotwords":["OpenClaw","Qwen3"]'),
+    );
+
+    spawned[0]!.stdout.emit(
+      'data',
+      '{"type":"error","code":"onnxruntime_unavailable","message":"Built without ONNX Runtime support"}\n',
+    );
+    spawned[0]!.emit('exit', 1, null);
+    expect(voice.getSpeechModelStatusSync().localAsrSupported).toBe(false);
+    expect(voice.getSpeechModelStatusSync().state).toBe('unsupported');
+    expect(await voice.getRemoteProviderInfo()).toBeNull();
+    await voice.dispose();
+  });
 });

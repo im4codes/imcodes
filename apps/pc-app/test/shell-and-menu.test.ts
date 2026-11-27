@@ -1533,6 +1533,7 @@ describe('PC App V1 shell lifecycle, server menu switcher, and sandboxed server 
     expect(worker1.stdin.write).toHaveBeenCalledWith(JSON.stringify({ cmd: 'abort' }) + '\n');
     expect(worker1.stdin.write).not.toHaveBeenCalledWith(JSON.stringify({ cmd: 'shutdown' }) + '\n');
     expect(worker1.kill).not.toHaveBeenCalled();
+    worker1.stdout.emit('data', '{"type":"end"}\n');
 
     const afterCloseInfo = await shell.voice.getRemoteProviderInfo();
     expect(afterCloseInfo).toEqual(expect.objectContaining({

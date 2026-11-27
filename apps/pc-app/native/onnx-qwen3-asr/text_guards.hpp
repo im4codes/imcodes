@@ -17,11 +17,33 @@ inline constexpr size_t kPauseScanStrideSamples = 800;   // 50ms scan stride
 inline constexpr float kPauseRmsThreshold = 0.012f;
 inline constexpr float kSpeechPeakPauseThreshold = 0.02f;
 
+struct SpeechEnergyBounds {
+  bool found{false};
+  size_t first{0};
+  size_t last{0};
+};
+
+/** Locate first and last speech-energy sample bounds in audio. */
+SpeechEnergyBounds scan_speech_energy_bounds(
+    const std::vector<float>& samples,
+    int sample_rate = 16000,
+    bool stop_on_first = false);
+
 /**
  * Returns true if audio contains speech above energy floor (peak >= 0.015 or
  * 50ms sliding window RMS >= 0.005).
  */
 bool has_utterance_speech_energy(const std::vector<float>& samples, int sample_rate = 16000);
+
+/**
+ * Trim leading and trailing sub-threshold silence while preserving `pad_ms` of acoustic context
+ * around speech bounds. Optionally outputs exact `out_start_sample` in the source buffer.
+ */
+std::vector<float> trim_silence_edges(
+    const std::vector<float>& samples,
+    int sample_rate = 16000,
+    int pad_ms = 250,
+    size_t* out_start_sample = nullptr);
 
 /** Compute how many pending samples to append into active segment before hitting a natural 400ms pause after >=6s. */
 size_t find_pause_split_take_count(
@@ -64,19 +86,27 @@ HotwordMergeResult merge_session_hotwords_raw(
     const std::vector<std::string>& base_terms,
     const std::string& request_hotwords_csv_or_lines);
 
+using HotwordNfkcNormalizerFn = std::string (*)(const std::string&);
+
+/** Override NFKC lowercase normalizer in unit tests; pass nullptr to restore OS default. */
+void set_hotword_nfkc_normalizer_for_testing(HotwordNfkcNormalizerFn fn);
+
 /**
- * Trie-based hotword hallucination filter matching macOS stripVoiceHotwordHallucination:
- * clears text when >=2 hotword-only terms compose the entire utterance (or >=1 when allow_single is true).
+ * Unified Rule A (same-hotword adjacent/cross-sentence repeat) + Rule B (>=3 distinct hotwords)
+ * Trie-based hallucination filter matching shared/voice-hotwords.ts & macOS Swift & Win C++.
+ * When `whole_only` is true, runs only the full-string check (used for >30s cross-segment merges).
  */
 std::string strip_voice_hotword_hallucination(
     const std::string& text,
     const std::vector<std::string>& hotword_terms,
-    bool allow_single = false);
+    bool allow_single = false,
+    bool whole_only = false);
 
 std::string strip_voice_hotword_hallucination_csv(
     const std::string& text,
     const std::string& hotwords_context,
-    bool allow_single = false);
+    bool allow_single = false,
+    bool whole_only = false);
 
 /**
  * Compute prefix continuation tokens by keeping any `language <Lang><asr_text>` header intact,
