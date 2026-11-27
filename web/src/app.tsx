@@ -1169,6 +1169,7 @@ function InternalMainApp() {
   const incognitoActiveSessionByServerRef = useRef<Map<string, string>>(new Map());
   const incognitoMainSessionsByServerRef = useRef<Map<string, SessionInfo[]>>(new Map());
   const sessionsRef = useRef<SessionInfo[]>([]);
+  const sessionsServerIdRef = useRef<string | null>(null);
   const manualStoppedMainSessionsRef = useRef<Set<string>>(new Set());
   const clearAuthState = useCallback(async (
     reason?: string,
@@ -1240,6 +1241,8 @@ function InternalMainApp() {
     sharedNavigationServerIdsRef.current = new Set();
     setServersLoaded(false);
     setServersSynced(false);
+    sessionsServerIdRef.current = null;
+    sessionsRef.current = [];
     setSessions([]);
     setSessionsLoaded(false);
     setSharedActiveDispatchIds(new Map());
@@ -2745,12 +2748,20 @@ function InternalMainApp() {
         quotaMeta: undefined,
       }));
       const preservedIncognito = incognitoMainSessionsByServerRef.current.get(targetServerId) ?? [];
-      const mergedForNav = mergeRestSessionList(mapped, sessionsRef.current, preservedIncognito);
+      const currentServerSessions = sessionsServerIdRef.current === targetServerId ? sessionsRef.current : [];
+      const mergedForNav = mergeRestSessionList(mapped, currentServerSessions, preservedIncognito);
+      if (isCurrentPreAuthoritativeRest()) {
+        sessionsServerIdRef.current = targetServerId;
+        sessionsRef.current = mergedForNav;
+      }
       setSessions((prev) => {
         if (!isCurrentPreAuthoritativeRest()) return prev;
         return mergeRestSessionList(mapped, prev, preservedIncognito);
       });
       const navigableMapped = mergedForNav.filter(isNavigableMainSession);
+      const restConfirmedNormalNames = mapped
+        .filter((session) => isNavigableMainSession(session) && session.incognito !== true)
+        .map((session) => session.name);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
       // so wait for WS session_list to avoid flashing "No active sessions"
       if (mapped.length > 0 || preservedIncognito.length > 0) {
@@ -2763,18 +2774,12 @@ function InternalMainApp() {
       if (isCurrentPreAuthoritativeRest() && navigableMapped.length > 0) {
         const pendingCandidate = pendingDashboardTabCandidateRef.current;
         if (pendingCandidate && pendingCandidate.serverId === targetServerId) {
-          if (navigableMapped.some((session) => session.name === pendingCandidate.sessionName)) {
+          if (!pendingCandidate.incognito && restConfirmedNormalNames.includes(pendingCandidate.sessionName)) {
+            pendingDashboardTabCandidateRef.current = null;
             selectMainSessionTabNavRef.current(pendingCandidate.sessionName);
-            if (pendingCandidate.incognito) {
-              // Keep pending candidate until live WS session_list confirms incognito liveness.
-              pendingDashboardTabCandidateRef.current = pendingCandidate;
-            }
-          } else {
-            if (!pendingCandidate.incognito) {
-              pendingDashboardTabCandidateRef.current = null;
-            }
-            restoreLastTabRef.current(targetServerId, navigableMapped.map((session) => session.name));
           }
+          // Otherwise keep pendingCandidate until authoritative WS session_list settles:
+          // REST cannot confirm incognito rows or cached normal rows omitted from DB rows.
         } else {
           restoreLastTabRef.current(targetServerId, navigableMapped.map((session) => session.name));
         }
@@ -2791,13 +2796,17 @@ function InternalMainApp() {
     return readCachedServerSessions(initialServerId);
   });
   sessionsRef.current = sessions;
+  sessionsServerIdRef.current = selectedServerId;
   const isIncognitoMainSessionName = useCallback((
     serverId: string | null | undefined,
     sessionName: string | null | undefined,
+    serverSessions?: readonly SessionInfo[],
   ) => {
     if (!serverId || !sessionName) return false;
+    const ownedSessions = serverSessions
+      ?? (sessionsServerIdRef.current === serverId ? sessionsRef.current : undefined);
     return isIncognitoTimelineSession(serverId, sessionName)
-      || sessionsRef.current.some((s) => s.name === sessionName && s.incognito === true)
+      || (ownedSessions?.some((s) => s.name === sessionName && s.incognito === true) ?? false)
       || (incognitoMainSessionsByServerRef.current.get(serverId)?.some((s) => s.name === sessionName) ?? false);
   }, []);
   const writeSafeHashState = useCallback((
@@ -5621,6 +5630,8 @@ function InternalMainApp() {
           serverCache.set(session.name, session);
         }
       }
+      sessionsServerIdRef.current = opened.server.id;
+      sessionsRef.current = mappedSessions;
       setSessions(mappedSessions);
       setSessionsLoaded(true);
       hydrateSharedSubSessions(opened.server.id, opened.subSessions);
@@ -6774,8 +6785,9 @@ function InternalMainApp() {
         ));
         const newSessions = msg.sessions.filter((s) => !isSubSessionName(s.name));
         const navigableNewSessions = newSessions.filter(isNavigableMainSession);
+        const existingServerSessions = sessionsServerIdRef.current === selectedServerId ? sessionsRef.current : [];
         const mergedSessionList = newSessions.map((s) => {
-          const existing = sessionsRef.current.find((p) => p.name === s.name);
+          const existing = existingServerSessions.find((p) => p.name === s.name);
           return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
         });
         const liveIncogMain = mergedSessionList.filter((s) => s.incognito === true);
@@ -6802,6 +6814,8 @@ function InternalMainApp() {
             serverCache.set(session.name, session);
           }
         }
+        sessionsServerIdRef.current = selectedServerId;
+        sessionsRef.current = mergedSessionList;
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
           return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
@@ -8173,6 +8187,8 @@ function InternalMainApp() {
     setServers([]);
     ownedServerIdsRef.current = new Set();
     sharedNavigationServerIdsRef.current = new Set();
+    sessionsServerIdRef.current = null;
+    sessionsRef.current = [];
     setSessions([]);
     setActiveSession(null);
     setSelectedServerId(null);
@@ -8270,6 +8286,8 @@ function InternalMainApp() {
       ...cachedOwnedMain,
       ...restoredIncogMain.filter((s) => !cachedOwnedNames.has(s.name)),
     ];
+    sessionsServerIdRef.current = nextServerId ?? null;
+    sessionsRef.current = initialSwitchSessions;
     setSessions(initialSwitchSessions);
     setSessionsLoaded(false);
     // Clear only active view state without erasing per-server incognito caches/open windows.
@@ -9187,9 +9205,9 @@ function InternalMainApp() {
       ? unifiedServersNavRef.current.find((srv) => srv.id === prevServer && !srv.isSharedIn)
       : undefined;
     if (prevOwnedServer) {
-      const liveIncogFromSessions = sessionsRef.current.filter(
-        (s) => isNavigableMainSession(s) && s.incognito === true,
-      );
+      const liveIncogFromSessions = sessionsServerIdRef.current === prevOwnedServer.id
+        ? sessionsRef.current.filter((s) => isNavigableMainSession(s) && s.incognito === true)
+        : [];
       if (liveIncogFromSessions.length > 0) {
         const existingIncog = incognitoMainSessionsByServerRef.current.get(prevOwnedServer.id) ?? [];
         const byName = new Map(existingIncog.map((s) => [s.name, s]));

@@ -15515,24 +15515,22 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     const sessionBIncog = { name: 'deck_incog_mid_brain', project: 'incog-mid', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', incognito: true };
     const sessionC = { name: 'deck_gamma_brain', project: 'gamma', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' };
 
+    const restResolvers: Array<(data: { sessions: unknown[] }) => void> = [];
     try {
-      apiFetchMock.mockImplementation(async (path: string) => {
-        if (path === '/api/auth/user/me') return { id: 'user-1' };
+      apiFetchMock.mockImplementation((path: string) => {
+        if (path === '/api/auth/user/me') return Promise.resolve({ id: 'user-1' });
         if (path === '/api/server') {
-          return {
+          return Promise.resolve({
             servers: [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() }],
-          };
+          });
         }
         if (path === '/api/server/srv-1/sessions') {
-          return {
-            sessions: [
-              { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
-              { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
-            ],
-          };
+          return new Promise((resolve) => {
+            restResolvers.push(resolve as (data: { sessions: unknown[] }) => void);
+          });
         }
-        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
-        return {};
+        if (path.startsWith('/api/watch/sessions')) return Promise.resolve({ sessions: [] });
+        return Promise.resolve({});
       });
 
       localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
@@ -15543,6 +15541,15 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       render(<App />);
 
       await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(1));
+      await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(1));
+      await act(async () => {
+        restResolvers[0]!({
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          ],
+        });
+      });
       const ws1 = wsInstances[wsInstances.length - 1]!;
       ws1.connected = true;
       await act(async () => {
@@ -15554,13 +15561,28 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       // Persistent cache drops incognito B, retaining only [A, C]
       expect(readCachedServerSessions('srv-1').map((s) => s.name)).toEqual(['deck_alpha_brain', 'deck_gamma_brain']);
 
-      // 1. Go to Dashboard -> Alt+2 selects incognito B (slot 2), NOT cached slot 2 (C)
+      // 1. Go to Dashboard -> Alt+2 selects incognito B (slot 2), NOT cached slot 2 (C),
+      // and MUST NOT activate B between REST resolve and delayed WS session_list!
       fireEvent.click(screen.getByText('server-home'));
       await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
 
       const alt2ToIncog = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
       window.dispatchEvent(alt2ToIncog);
       expect(alt2ToIncog.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(2));
+      await act(async () => {
+        restResolvers[1]!({
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          ],
+        });
+      });
+      // Window between REST and delayed WS: incognito candidate B is NOT yet confirmed or active
+      expect(screen.getByTestId('session-pane-deck_incog_mid_brain').getAttribute('data-is-active')).toBe('false');
+      expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('false');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('false');
 
       await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
       const ws2 = wsInstances[wsInstances.length - 1]!;
@@ -15580,7 +15602,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(JSON.stringify({ ...localStorage })).not.toContain('deck_incog_mid_brain');
       expect(JSON.parse(sessionStorage.getItem('rcc_tab_route_v1')!).sessionName).toBeNull();
 
-      // 2. Return to Dashboard -> Alt+3 switches cleanly to C
+      // 2. Return to Dashboard -> Alt+3 switches cleanly to C (REST confirms C directly)
       fireEvent.click(screen.getByText('server-home'));
       await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
 
@@ -15588,6 +15610,15 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       window.dispatchEvent(alt3ToC);
       expect(alt3ToC.defaultPrevented).toBe(true);
 
+      await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(3));
+      await act(async () => {
+        restResolvers[2]!({
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          ],
+        });
+      });
       await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(3));
       const ws3 = wsInstances[wsInstances.length - 1]!;
       ws3.connected = true;
@@ -15598,7 +15629,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
 
       // 3. Switch to A first, go to Dashboard, then B disappears on srv-1 while C shifts to index 2:
-      // pressing Alt+2 (formerly B) must NOT switch to C!
+      // B must NOT activate between REST [A, C] and WS [A, C], and pressing Alt+2 must fall back to A (never C)!
       fireEvent.click(within(screen.getByTestId('app-shell-session-tabs')).getByText('tabs-select-deck_alpha_brain'));
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
       fireEvent.click(screen.getByText('server-home'));
@@ -15607,6 +15638,18 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const alt2MissingIncog = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
       window.dispatchEvent(alt2MissingIncog);
       expect(alt2MissingIncog.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(4));
+      await act(async () => {
+        restResolvers[3]!({
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+            { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          ],
+        });
+      });
+      expect(screen.getByTestId('session-pane-deck_incog_mid_brain').getAttribute('data-is-active')).toBe('false');
+      expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('false');
 
       await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(4));
       const ws4 = wsInstances[wsInstances.length - 1]!;
@@ -15782,5 +15825,234 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
+  }, 15_000);
+
+  it('keeps unconfirmed cached normal tab inactive between delayed REST and WS on Dashboard return, activating on WS confirmation or falling back on removal', async () => {
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+
+    const sessionA = { name: 'deck_alpha_brain', project: 'alpha', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' };
+    const sessionC = { name: 'deck_cached_c_brain', project: 'cached-c', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' };
+    const sessionD = { name: 'deck_delta_brain', project: 'delta', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' };
+    const restResolvers: Array<(data: { sessions: unknown[] }) => void> = [];
+
+    try {
+      apiFetchMock.mockImplementation((path: string) => {
+        if (path === '/api/auth/user/me') return Promise.resolve({ id: 'user-1' });
+        if (path === '/api/server') {
+          return Promise.resolve({
+            servers: [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() }],
+          });
+        }
+        if (path === '/api/server/srv-1/sessions') {
+          return new Promise((resolve) => {
+            restResolvers.push(resolve as (data: { sessions: unknown[] }) => void);
+          });
+        }
+        if (path.startsWith('/api/watch/sessions')) return Promise.resolve({ sessions: [] });
+        return Promise.resolve({});
+      });
+
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(1));
+      await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(1));
+      await act(async () => {
+        restResolvers[0]!({
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+            { name: 'deck_cached_c_brain', project_name: 'cached-c', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          ],
+        });
+      });
+      const ws1 = wsInstances[wsInstances.length - 1]!;
+      ws1.connected = true;
+      await act(async () => {
+        ws1.emit({ type: 'session.event', event: 'connected' });
+        ws1.emit({ type: 'session_list', sessions: [sessionA, sessionC] });
+      });
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(readCachedServerSessions('srv-1').map((s) => s.name)).toEqual(['deck_alpha_brain', 'deck_cached_c_brain']);
+
+      // 1. Go to Dashboard, press Alt+2 (cached C), REST returns only [A] (omits C):
+      // C MUST remain inactive until WS confirms [A, C].
+      fireEvent.click(screen.getByText('server-home'));
+      await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true }));
+
+      await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(2));
+      await act(async () => {
+        restResolvers[1]!({
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          ],
+        });
+      });
+      expect(screen.getByTestId('session-pane-deck_cached_c_brain').getAttribute('data-is-active')).toBe('false');
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('false');
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+      const ws2 = wsInstances[wsInstances.length - 1]!;
+      ws2.connected = true;
+      await act(async () => {
+        ws2.emit({ type: 'session.event', event: 'connected' });
+        ws2.emit({ type: 'session_list', sessions: [sessionA, sessionC] });
+      });
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_cached_c_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // 2. Switch back to A, return to Dashboard, press Alt+2 (cached C), REST returns only [A],
+      // and WS confirms C was removed and replaced in slot 2 by D: C stays inactive, falls back to A (never D!).
+      fireEvent.click(within(screen.getByTestId('app-shell-session-tabs')).getByText('tabs-select-deck_alpha_brain'));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      fireEvent.click(screen.getByText('server-home'));
+      await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true }));
+
+      await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(3));
+      await act(async () => {
+        restResolvers[2]!({
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          ],
+        });
+      });
+      expect(screen.getByTestId('session-pane-deck_cached_c_brain').getAttribute('data-is-active')).toBe('false');
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(3));
+      const ws3 = wsInstances[wsInstances.length - 1]!;
+      ws3.connected = true;
+      await act(async () => {
+        ws3.emit({ type: 'session.event', event: 'connected' });
+        ws3.emit({ type: 'session_list', sessions: [sessionA, sessionD] });
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.getByTestId('session-pane-deck_delta_brain').getAttribute('data-is-active')).toBe('false');
+      });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 20_000);
+
+  it('does not treat another server incognito session with the same name as incognito on the target server', async () => {
+    const sharedName = 'deck_shared_x_brain';
+    writeCachedServerSessions('srv-2', [
+      {
+        name: 'deck_srv2_other_brain',
+        project: 'srv2-other',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        state: 'idle',
+        runtimeType: 'transport',
+      },
+      {
+        name: sharedName,
+        project: 'shared-x',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        state: 'idle',
+        runtimeType: 'transport',
+      },
+    ]);
+    localStorage.setItem(serverSessionStorageKey('srv-2'), sharedName);
+
+    let resolveSrv2Rest!: (data: { sessions: unknown[] }) => void;
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/auth/user/me') return Promise.resolve({ id: 'user-1' });
+      if (path === '/api/server') {
+        return Promise.resolve({
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        });
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return Promise.resolve({
+          sessions: [
+            { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          ],
+        });
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        return new Promise((resolve) => {
+          resolveSrv2Rest = resolve as (data: { sessions: unknown[] }) => void;
+        });
+      }
+      if (path.startsWith('/api/watch/sessions')) return Promise.resolve({ sessions: [] });
+      return Promise.resolve({});
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(1));
+    const ws1 = wsInstances[wsInstances.length - 1]!;
+    ws1.connected = true;
+    await act(async () => {
+      ws1.emit({ type: 'session.event', event: 'connected' });
+      ws1.emit({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_alpha_brain', project: 'alpha', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' },
+          { name: sharedName, project: 'shared-x', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', incognito: true },
+        ],
+      });
+    });
+
+    // Activate incognito deck_shared_x_brain on srv-1
+    await waitFor(() => expect(screen.getByTestId(`session-pane-${sharedName}`)).toBeTruthy());
+    fireEvent.click(within(screen.getByTestId('app-shell-session-tabs')).getByText(`tabs-select-${sharedName}`));
+    await waitFor(() => expect(screen.getByTestId(`session-pane-${sharedName}`).getAttribute('data-is-active')).toBe('true'));
+
+    // Switch to srv-2 where deck_shared_x_brain is a normal remembered session:
+    // sync restore MUST keep rcc_session and #/srv-2/deck_shared_x_brain intact!
+    fireEvent.click(await screen.findByTestId('server-icon-srv-2'));
+    await waitFor(() => {
+      expect(screen.getByTestId(`session-pane-${sharedName}`).getAttribute('data-is-active')).toBe('true');
+      expect(localStorage.getItem('rcc_session')).toBe(sharedName);
+      expect(window.location.hash).toBe(`#/srv-2/${sharedName}`);
+    });
+
+    // Delayed REST & WS on srv-2 arrive with another session listed first -> deck_shared_x_brain stays active!
+    await act(async () => {
+      resolveSrv2Rest?.({
+        sessions: [
+          { name: 'deck_srv2_other_brain', project_name: 'srv2-other', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          { name: sharedName, project_name: 'shared-x', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+        ],
+      });
+    });
+    expect(screen.getByTestId(`session-pane-${sharedName}`).getAttribute('data-is-active')).toBe('true');
+    expect(window.location.hash).toBe(`#/srv-2/${sharedName}`);
+
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+    const ws2 = wsInstances[wsInstances.length - 1]!;
+    ws2.connected = true;
+    await act(async () => {
+      ws2.emit({ type: 'session.event', event: 'connected' });
+      ws2.emit({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_srv2_other_brain', project: 'srv2-other', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' },
+          { name: sharedName, project: 'shared-x', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' },
+        ],
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId(`session-pane-${sharedName}`).getAttribute('data-is-active')).toBe('true');
+      expect(screen.getByTestId('session-pane-deck_srv2_other_brain').getAttribute('data-is-active')).toBe('false');
+    });
+    expect(localStorage.getItem('rcc_session')).toBe(sharedName);
+    expect(window.location.hash).toBe(`#/srv-2/${sharedName}`);
   }, 15_000);
 });
