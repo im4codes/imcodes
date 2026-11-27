@@ -217,8 +217,8 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
     setType(lastUnlockedType);
   };
   const selectedCcPreset = useMemo(
-    () => ccPresets.find((preset) => preset.name === ccPreset),
-    [ccPreset, ccPresets],
+    () => (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) ? ccPresets.find((preset) => preset.name === ccPreset) : undefined),
+    [type, ccPreset, ccPresets],
   );
   const selectedPresetModels = useMemo(
     () => selectedCcPreset ? getCcPresetAvailableModelIds(selectedCcPreset) : [],

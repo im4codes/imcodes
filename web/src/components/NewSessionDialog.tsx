@@ -334,8 +334,8 @@ export function NewSessionDialog({
     setAgentType(target);
   };
   const selectedCcPreset = useMemo(
-    () => ccPresets.find((preset) => preset.name === ccPreset),
-    [ccPreset, ccPresets],
+    () => (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) ? ccPresets.find((preset) => preset.name === ccPreset) : undefined),
+    [agentType, ccPreset, ccPresets],
   );
   const selectedPresetModels = useMemo(
     () => selectedCcPreset ? getCcPresetAvailableModelIds(selectedCcPreset) : [],

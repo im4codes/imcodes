@@ -76,6 +76,13 @@ describe('useTransportModels caching and fallbacks', () => {
     expect(fallback?.defaultModel).toBe('gemini-4-hydrogen-high');
   });
 
+  it('provides static fallback models and defaultModel opus[1M] for claude-code-sdk', () => {
+    const fallback = getStaticFallbackModels('claude-code-sdk');
+    expect(fallback).not.toBeNull();
+    expect(fallback?.defaultModel).toBe('opus[1M]');
+    expect(fallback?.models.map((m) => m.id)).toContain('opus[1M]');
+  });
+
   it('initializes useTransportModels with static fallback for AGY so initial state is never empty', () => {
     const { result } = renderHook(() => useTransportModels(null, AGY_SDK_PROVIDER_ID));
     expect(result.current.models.length).toBeGreaterThan(0);

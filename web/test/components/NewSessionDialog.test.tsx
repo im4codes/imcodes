@@ -2218,21 +2218,184 @@ describe('NewSessionDialog', () => {
     await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
     await waitFor(() => expect(getModelSelect()?.value).toBe('opus[1M]'));
 
-    // 4. Manually edit to sonnet -> preserved across catalog messages
+    // 4. Manually edit to sonnet -> preserved across async catalog messages
     const ccSelect2 = getModelSelect()!;
     fireEvent.input(ccSelect2, { target: { value: 'sonnet' } });
     expect(ccSelect2.value).toBe('sonnet');
-    const onMessageHandler = ws.onMessage.mock.calls[0]?.[0];
-    if (onMessageHandler) {
-      act(() => {
-        onMessageHandler({
-          type: 'transport.list_models',
-          agentType: 'claude-code-sdk',
-          models: [{ id: 'fable' }, { id: 'opus[1M]' }, { id: 'sonnet' }, { id: 'haiku' }],
-          defaultModel: 'opus[1M]',
-        });
+
+    const request = ws.send.mock.calls
+      .map((c: any) => c[0])
+      .filter((msg: any) => msg?.type === 'transport.list_models' && msg?.agentType === 'claude-code-sdk')
+      .at(-1);
+    act(() => {
+      ws.emit({
+        type: 'transport.models_response',
+        requestId: request?.requestId,
+        agentType: 'claude-code-sdk',
+        models: [
+          { id: 'opus[1M]' },
+          { id: 'sonnet' },
+          { id: 'haiku' },
+          { id: 'custom-claude-model' },
+        ],
+        defaultModel: 'opus[1M]',
       });
-    }
-    expect(ccSelect2.value).toBe('sonnet');
+    });
+
+    // Confirm that the async catalog response was actually consumed into the DOM
+    await waitFor(() => {
+      const currentSelect = getModelSelect()!;
+      expect(Array.from(currentSelect.options).some((o) => o.value === 'custom-claude-model')).toBe(true);
+    });
+
+    // Verify user's manual selection was preserved
+    expect(getModelSelect()?.value).toBe('sonnet');
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'manual-sonnet' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'claude-code-sdk',
+      requestedModel: 'sonnet',
+    }));
+  });
+
+  it('opencode-sdk falls back to transport defaultModel or first model when big-pickle is absent', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    selectAgent('opencode-sdk');
+    await waitFor(() => expect(getAgentButton('opencode-sdk').getAttribute('aria-pressed')).toBe('true'));
+    const ocInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    expect(ocInput.value).toBe('opencode/big-pickle');
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((c: any) => c[0]?.type === 'transport.list_models' && c[0]?.agentType === 'opencode-sdk')).toBe(true);
+    });
+    const request = ws.send.mock.calls
+      .map((c: any) => c[0])
+      .filter((msg: any) => msg?.type === 'transport.list_models' && msg?.agentType === 'opencode-sdk')
+      .at(-1);
+
+    act(() => {
+      ws.emit({
+        type: 'transport.models_response',
+        requestId: request?.requestId,
+        agentType: 'opencode-sdk',
+        models: [{ id: 'qwen2.5-coder:32b' }, { id: 'deepseek-coder-v2' }],
+        defaultModel: 'qwen2.5-coder:32b',
+      });
+    });
+
+    await waitFor(() => {
+      const select = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+        .find((s) => s.tagName === 'SELECT' && Array.from(s.options).some((o) => o.value === 'qwen2.5-coder:32b'));
+      expect(select?.value).toBe('qwen2.5-coder:32b');
+    });
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'test-fallback' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'opencode-sdk',
+      requestedModel: 'qwen2.5-coder:32b',
+    }));
+  });
+
+  it('Claude Code preset MiniMax does not block opencode/big-pickle when switching to opencode-sdk, and does not attach ccPreset to opencode payload', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    act(() => {
+      ws.emit({
+        type: 'cc.presets.list_response',
+        presets: [
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-M3' }],
+          },
+        ],
+      });
+    });
+
+    selectAgent('claude-code-sdk');
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((select) => Array.from(select.options ?? []).some((option) => option.value === 'MiniMax'));
+    expect(presetSelect).toBeDefined();
+    fireEvent.input(presetSelect!, { target: { value: 'MiniMax' } });
+
+    const getMiniMaxModelSelect = () => {
+      const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+      return selects.find((s) => Array.from(s.options).some((o) => o.value === 'MiniMax-M2.7'));
+    };
+    await waitFor(() => expect(getMiniMaxModelSelect()?.value).toBe('MiniMax-M2.7'));
+
+    // Switch to opencode-sdk: MiniMax preset in state must NOT block opencode/big-pickle
+    selectAgent('opencode-sdk');
+    await waitFor(() => expect(getAgentButton('opencode-sdk').getAttribute('aria-pressed')).toBe('true'));
+    const ocInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    expect(ocInput.value).toBe('opencode/big-pickle');
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'test-oc-preset' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'opencode-sdk',
+      requestedModel: 'opencode/big-pickle',
+    }));
+    const ocPayload = ws.sendSessionCommand.mock.calls[0]?.[1];
+    expect(ocPayload?.ccPreset).toBeUndefined();
+  });
+
+  it('restores MiniMax preset when switching from opencode-sdk back to claude-code-sdk', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    act(() => {
+      ws.emit({
+        type: 'cc.presets.list_response',
+        presets: [
+          {
+            name: 'MiniMax',
+            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+            availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-M3' }],
+          },
+        ],
+      });
+    });
+
+    selectAgent('claude-code-sdk');
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((select) => Array.from(select.options ?? []).some((option) => option.value === 'MiniMax'));
+    expect(presetSelect).toBeDefined();
+    fireEvent.input(presetSelect!, { target: { value: 'MiniMax' } });
+
+    const getMiniMaxModelSelect = () => {
+      const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+      return selects.find((s) => Array.from(s.options).some((o) => o.value === 'MiniMax-M2.7'));
+    };
+    await waitFor(() => expect(getMiniMaxModelSelect()?.value).toBe('MiniMax-M2.7'));
+
+    // Switch to opencode-sdk
+    selectAgent('opencode-sdk');
+    await waitFor(() => expect(getAgentButton('opencode-sdk').getAttribute('aria-pressed')).toBe('true'));
+    const ocInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    expect(ocInput.value).toBe('opencode/big-pickle');
+
+    // Switch back to claude-code-sdk: MiniMax preset is restored
+    selectAgent('claude-code-sdk');
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+    await waitFor(() => expect(getMiniMaxModelSelect()?.value).toBe('MiniMax-M2.7'));
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'test-cc-restored' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
+    }));
   });
 });
