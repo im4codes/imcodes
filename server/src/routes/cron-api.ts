@@ -18,6 +18,7 @@ import {
   CRON_CONTROL_CONTRACT,
   LEGACY_CRON_CONTROL_CONTRACT_V1,
   CRON_STATUS,
+  isAllowedExternalCliRestrictedCronAction,
   normalizeCronCompletionPolicy,
   normalizeCronExecutionDetail,
   normalizeCronSendActionForInterval,
@@ -263,10 +264,23 @@ async function resolveCronDaemonContext(
   } else if (c.req.header(CRON_RESTRICTED_ACTOR_HEADER) !== undefined) {
     return { ok: false, status: 403, error: 'forbidden', reason: 'external_cli_cron_requires_restricted_route' };
   }
-  return await resolveDaemonCallerAuthority(c as unknown as Context<{ Bindings: Env }>, {
+  const authority = await resolveDaemonCallerAuthority(c as unknown as Context<{ Bindings: Env }>, {
     ...(targetServerId ? { targetServerId, allowOwnerCrossServer: true } : {}),
     ...(isRestrictedRoute ? { denySharedHostAbsentAuthority: false } : {}),
   });
+  if (isRestrictedRoute) {
+    if (
+      !authority.ok
+      || authority.kind !== 'owner_daemon'
+      || authority.hasTurnAuthority
+      || c.req.header(CRON_RESTRICTED_ACTOR_HEADER) !== CRON_RESTRICTED_ACTOR_EXTERNAL_CLI
+    ) {
+      return !authority.ok
+        ? authority
+        : { ok: false, status: 403, error: 'forbidden', reason: 'external_cli_cron_route_denied' };
+    }
+  }
+  return authority;
 }
 
 function isExternalCliRestrictedAuthority(
@@ -283,7 +297,7 @@ function isExternalCliRestrictedAuthority(
 function isExternalCliOwnedProvenance(
   prov: { creator_user_id?: string | null; shared?: boolean | null } | null | undefined,
 ): boolean {
-  return prov?.creator_user_id === IMCODES_EXTERNAL_CLI_SENDER && !prov?.shared;
+  return prov?.creator_user_id === IMCODES_EXTERNAL_CLI_SENDER;
 }
 
 function pinnedSessionForAuthority(
@@ -744,7 +758,7 @@ router.get('/', requireCronAuth(), async (c) => {
       WHERE j.user_id = $1
         AND ($2::text IS NULL OR j.server_id = $2)
         AND ($3::text IS NULL OR j.project_name = $3)
-        AND ($4::text IS NULL OR (p.creator_user_id = $4 AND COALESCE(p.shared, FALSE) = FALSE))
+        AND ($4::text IS NULL OR p.creator_user_id = $4)
       ORDER BY j.created_at DESC`,
     [
       access.scope.ownerUserId,
@@ -758,7 +772,6 @@ router.get('/', requireCronAuth(), async (c) => {
     jobs: externalCliRestricted
       ? filteredJobs.filter((job) => isExternalCliOwnedProvenance({
           creator_user_id: (job as { creator_user_id?: string | null }).creator_user_id,
-          shared: Boolean((job as { creator_is_shared?: boolean | null }).creator_is_shared),
         }))
       : filteredJobs,
   });
@@ -795,6 +808,9 @@ router.post('/', requireCronAuth(), async (c) => {
   const isDaemonReq = isDaemonCronRequest(c, routeServerId, authority.kind);
   const isAgentCaller = authority.isDaemon || isDaemonReq;
   const unboundAction = normalizeCronActionForPersistence(action, isDaemonReq);
+  if (externalCliRestricted && !isAllowedExternalCliRestrictedCronAction(unboundAction)) {
+    return c.json({ error: 'forbidden', reason: 'external_cli_cron_action_not_allowed' }, 403);
+  }
 
   const access = await resolveCronScope(c, {
     serverId,
@@ -843,7 +859,10 @@ router.post('/', requireCronAuth(), async (c) => {
 
   const requiresProvenance = externalCliRestricted || access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId;
   const provenanceCreatorUserId = externalCliRestricted ? IMCODES_EXTERNAL_CLI_SENDER : authority.actorUserId;
-  const provenanceShared = !externalCliRestricted;
+  // Every non-owner provenance row (shared participants AND external_cli) sets shared=TRUE
+  // so older schedulers that do not understand IMCODES_EXTERNAL_CLI_SENDER fail closed
+  // (`{ authorized: false }`) instead of elevating it to owner authority.
+  const provenanceShared = true;
   await runCronWriteTx(c.env.DB, async (tx) => {
     await tx.execute(
       `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
@@ -928,10 +947,11 @@ router.put('/:id', requireCronAuth(), async (c) => {
       'SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1 FOR UPDATE',
       [jobId],
     );
+    const lockedIsExternalCli = isExternalCliOwnedProvenance(lockedProv);
     if (lockedJob.server_id !== initialJob.server_id || lockedJob.user_id !== initialJob.user_id) {
       return { kind: 'conflict' };
     }
-    if (externalCliRestricted && !isExternalCliOwnedProvenance(lockedProv)) {
+    if (externalCliRestricted && !lockedIsExternalCli) {
       return { kind: 'forbidden', reason: 'external_cli_cron_scope_denied' };
     }
 
@@ -951,6 +971,9 @@ router.put('/:id', requireCronAuth(), async (c) => {
       const parsedExisting = cronActionSchema.safeParse(JSON.parse(lockedJob.action));
       if (parsedExisting.success) existingAction = parsedExisting.data;
     } catch { /* invalid legacy action remains non-editable through a shared scope */ }
+    if ((externalCliRestricted || lockedIsExternalCli) && !isAllowedExternalCliRestrictedCronAction(updates.action ?? existingAction)) {
+      return { kind: 'forbidden', reason: 'external_cli_cron_action_not_allowed' };
+    }
     if (!await cronScopeCoversPayload(c, lockedJob.server_id, access.scope, {
       targetRole: updates.targetRole !== undefined ? updates.targetRole : lockedJob.target_role,
       targetSessionName: updates.targetSessionName !== undefined ? updates.targetSessionName : lockedJob.target_session_name,
@@ -1064,15 +1087,14 @@ router.put('/:id', requireCronAuth(), async (c) => {
       return { kind: 'conflict' };
     }
 
-    const lockedIsExternalCli = isExternalCliOwnedProvenance(lockedProv);
     const isSharedOrNonOwner = access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId;
     if (externalCliRestricted || lockedIsExternalCli) {
-      // External-CLI restricted provenance (`creator_user_id = IMCODES_EXTERNAL_CLI_SENDER, shared = FALSE`)
+      // External-CLI restricted provenance (`creator_user_id = IMCODES_EXTERNAL_CLI_SENDER, shared = TRUE`)
       // is an upper bound on this job and must survive owner/participant maintenance edits.
-      if (lockedIsExternalCli && updates.projectName !== undefined) {
+      if (lockedIsExternalCli && (!lockedProv?.shared || updates.projectName !== undefined)) {
         await tx.execute(
-          'UPDATE cron_job_provenance SET project_name = $1 WHERE job_id = $2',
-          [updates.projectName, jobId],
+          'UPDATE cron_job_provenance SET shared = TRUE, project_name = COALESCE($1, project_name) WHERE job_id = $2',
+          [updates.projectName ?? null, jobId],
         );
       }
     } else if (isSharedOrNonOwner) {
@@ -1396,7 +1418,6 @@ router.get('/executions', requireCronAuth(), async (c) => {
     externalCliRestricted
       ? rows.filter((row) => isExternalCliOwnedProvenance({
           creator_user_id: (row as { creator_user_id?: string | null }).creator_user_id,
-          shared: Boolean((row as { creator_is_shared?: boolean | null }).creator_is_shared),
         }))
       : rows
   );
@@ -1417,7 +1438,7 @@ router.get('/executions', requireCronAuth(), async (c) => {
        WHERE j.user_id = $1
          AND ($2::text IS NULL OR j.server_id = $2)
          AND ($3::text IS NULL OR j.project_name = $3)
-         AND ($4::text IS NULL OR (p.creator_user_id = $4 AND COALESCE(p.shared, FALSE) = FALSE))
+         AND ($4::text IS NULL OR p.creator_user_id = $4)
        ORDER BY j.id, e.created_at DESC`,
       [
         access.scope.ownerUserId,
@@ -1446,7 +1467,7 @@ router.get('/executions', requireCronAuth(), async (c) => {
      WHERE j.user_id = $1
        AND ($2::text IS NULL OR j.server_id = $2)
        AND ($3::text IS NULL OR j.project_name = $3)
-       AND ($5::text IS NULL OR (p.creator_user_id = $5 AND COALESCE(p.shared, FALSE) = FALSE))
+       AND ($5::text IS NULL OR p.creator_user_id = $5)
      ORDER BY e.created_at DESC
      LIMIT $4`,
     [

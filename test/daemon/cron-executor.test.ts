@@ -1256,4 +1256,93 @@ describe('executeCronJob', () => {
       detail: 'Cron target session is busy: deck_myapp_brain (thinking)',
     });
   });
+
+  it('rejects unsupported p2p and non-selfManaged command actions for external_cli while executing selfManaged command and structured send with restricted sharedActor', async () => {
+    const { IMCODES_EXTERNAL_CLI_SENDER } = await import('../../shared/imcodes-send.js');
+    const transportSend = vi.fn().mockResolvedValue(undefined);
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession({
+      runtimeType: 'transport',
+      agentType: 'claude-code-sdk',
+    }));
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue({
+      providerSessionId: 'p-1',
+      send: transportSend,
+      getStatus: () => 'idle',
+    });
+
+    const extActor: SharedActorEnvelope = {
+      actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+      actorDisplayName: IMCODES_EXTERNAL_CLI_SENDER,
+      snapshot: {
+        shareId: 'external-cli',
+        serverId: 'srv-1',
+        userId: IMCODES_EXTERNAL_CLI_SENDER,
+        effectiveRole: 'participant',
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_myapp_brain' },
+        authorizedAt: 1,
+        issuedAt: 1,
+      },
+      primaryShareId: null,
+      effectiveActorRole: 'participant',
+      actionId: 'cron-ext-1',
+      origin: 'server-member',
+      authorizedAt: 1,
+    };
+
+    // Disallowed: P2P under external_cli must NOT startP2pRun
+    await executeCronJob(makeMsg({
+      executionId: 'exec-ext-p2p',
+      sharedActor: extActor,
+      action: { type: 'p2p', mode: 'audit', topic: 'hijack', participants: ['brain'] },
+    }), mockServerLink);
+    expect(startP2pRun).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: CRON_MSG.COMMAND_RESULT,
+      executionId: 'exec-ext-p2p',
+      status: 'error',
+    }));
+
+    // Disallowed: raw command (selfManaged !== true) under external_cli must NOT send
+    await executeCronJob(makeMsg({
+      executionId: 'exec-ext-raw-cmd',
+      sharedActor: extActor,
+      action: { type: 'command', command: '/status' },
+    }), mockServerLink);
+    expect(transportSend).not.toHaveBeenCalled();
+    expect(cronProcessSendMock).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: CRON_MSG.COMMAND_RESULT,
+      executionId: 'exec-ext-raw-cmd',
+      status: 'error',
+    }));
+
+    // Allowed #1: selfManaged command executes with restricted sharedActor and zero machine authorities
+    const registered = registerCronControlAction({
+      type: 'command',
+      command: 'check status safely',
+      selfManaged: true,
+    }, 'job-1', CRON_COMPLETION_POLICY.UNTIL_COMPLETE);
+    expect(registered.ok).toBe(true);
+    if (!registered.ok) throw new Error('unexpected registration failure');
+    await executeCronJob(makeMsg({
+      executionId: 'exec-ext-self-cmd',
+      sharedActor: extActor,
+      action: registered.action,
+      completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    }), mockServerLink);
+    expect(transportSend).toHaveBeenCalledTimes(1);
+    const meta = transportSend.mock.calls[0]![4] as Record<string, unknown>;
+    expect(meta.sharedActor).toEqual(extActor);
+    expect(meta.sharedMachineAuthority).toBeUndefined();
+    expect(meta.ownerMachineAuthority).toBeUndefined();
+
+    // Allowed #2: normal owner raw command still runs without external_cli rejection
+    await executeCronJob(makeMsg({
+      executionId: 'exec-owner-raw',
+      action: { type: 'command', command: '/status' },
+      [OWNER_MACHINE_AUTHORITY_FIELD]: 'owner-jwt',
+    }), mockServerLink);
+    expect(transportSend).toHaveBeenCalledTimes(2);
+    expect((transportSend.mock.calls[1]![4] as Record<string, unknown>).ownerMachineAuthority).toBe('owner-jwt');
+  });
 });

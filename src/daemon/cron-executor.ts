@@ -9,9 +9,11 @@ import {
   buildCronRunTimelineProjection,
   CRON_CONTROL_PROTOCOL,
   CRON_MSG,
+  isAllowedExternalCliRestrictedCronAction,
   normalizeCronCompletionPolicy,
   validateRegisteredCronControlAction,
 } from '../../shared/cron-types.js';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
 import {
   OWNER_MACHINE_AUTHORITY_FIELD,
@@ -259,6 +261,18 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
       });
       return;
     }
+  }
+
+  if (sharedActor?.actorUserId === IMCODES_EXTERNAL_CLI_SENDER && !isAllowedExternalCliRestrictedCronAction(action)) {
+    logger.warn({ jobId, actionType: (action as { type?: unknown }).type }, 'Cron: unsupported action rejected for external_cli');
+    sendCommandResult(serverLink, {
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId,
+      executionId,
+      status: 'error',
+      detail: 'Cron restricted action rejected: external_cli only allows structured send or selfManaged command',
+    });
+    return;
   }
 
   // Busy check — skip tmux detection for transport sessions

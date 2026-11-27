@@ -5,6 +5,7 @@
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import http from 'http';
+import { HOOK_SESSION_CREDENTIAL_HEADER } from '../../shared/hook-session-credential.js';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -79,12 +80,22 @@ import { resolveSupervisionAssignmentWorktree } from '../../src/daemon/supervisi
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 function postSend(port: number, body: Record<string, unknown>, headers?: Record<string, string>): Promise<{ status: number; body: Record<string, unknown> }> {
+  const claimedFrom = typeof body.from === 'string' ? getSessionMock(body.from) as { hookCredential?: string } | null | undefined : null;
+  const authHeaders: Record<string, string> = claimedFrom?.hookCredential && headers?.[HOOK_SESSION_CREDENTIAL_HEADER] === undefined
+    ? { [HOOK_SESSION_CREDENTIAL_HEADER]: claimedFrom.hookCredential }
+    : {};
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({
       hostname: '127.0.0.1', port, path: '/send', method: 'POST',
       agent: false,
-      headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(data)), Connection: 'close', ...headers },
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(data)),
+        Connection: 'close',
+        ...authHeaders,
+        ...headers,
+      },
     }, (res) => {
       let body = '';
       res.on('data', (chunk) => { body += chunk; });
@@ -125,6 +136,7 @@ function makeSession(overrides: Record<string, unknown>) {
     agentType: 'claude-code',
     projectDir: '/proj',
     state: 'running',
+    hookCredential: 'test-hook-cred',
     restarts: 0,
     restartTimestamps: [],
     createdAt: Date.now(),
@@ -278,7 +290,7 @@ describe('Hook server /send endpoint', () => {
         '/audit-reply',
         JSON.stringify(validReply),
         'application/json',
-        { 'x-imcodes-session': 'deck_proj_w1' },
+        { 'x-imcodes-session': 'deck_proj_w1', [HOOK_SESSION_CREDENTIAL_HEADER]: 'test-hook-cred' },
       );
       expect(res.status).toBe(200);
       expect(JSON.parse(res.body)).toEqual({ ok: true });
@@ -357,7 +369,7 @@ describe('Hook server /send endpoint', () => {
           receiptKind: 'final',
         }),
         'application/json',
-        { 'x-imcodes-session': target.sessionName },
+        { 'x-imcodes-session': target.sessionName, [HOOK_SESSION_CREDENTIAL_HEADER]: 'test-hook-cred' },
       );
 
       expect(res.status).toBe(200);
@@ -394,7 +406,7 @@ describe('Hook server /send endpoint', () => {
         '/audit-reply',
         JSON.stringify({ ...validReply, extra: true }),
         'application/json',
-        { 'x-imcodes-session': 'deck_proj_w1' },
+        { 'x-imcodes-session': 'deck_proj_w1', [HOOK_SESSION_CREDENTIAL_HEADER]: 'test-hook-cred' },
       );
       expect(unknown.status).toBe(400);
       const oversized = await postRaw(
@@ -402,7 +414,7 @@ describe('Hook server /send endpoint', () => {
         '/audit-reply',
         JSON.stringify({ ...validReply, findings: '你'.repeat(PEER_AUDIT_REPLY_TOTAL_BYTES) }),
         'application/json',
-        { 'x-imcodes-session': 'deck_proj_w1' },
+        { 'x-imcodes-session': 'deck_proj_w1', [HOOK_SESSION_CREDENTIAL_HEADER]: 'test-hook-cred' },
       );
       expect(oversized.status).toBe(413);
       expect(sendKeysMock).not.toHaveBeenCalled();

@@ -95,7 +95,7 @@ function makeDb(servers: ServerRow[]) {
             if (serverId && job.server_id !== serverId) return null;
             if (projectName && job.project_name !== projectName) return null;
             const prov = cronProvenance.get(String(job.id ?? ''));
-            if (extFilter && (prov?.creator_user_id !== extFilter || Boolean(prov?.shared))) return null;
+            if (extFilter && prov?.creator_user_id !== extFilter) return null;
             return {
               ...exec,
               job_name: job.name,
@@ -129,7 +129,7 @@ function makeDb(servers: ServerRow[]) {
           .filter((job) => {
             if (job.user_id !== params[0]) return false;
             const prov = cronProvenance.get(job.id as string);
-            if (extFilter && (prov?.creator_user_id !== extFilter || Boolean(prov?.shared))) return false;
+            if (extFilter && prov?.creator_user_id !== extFilter) return false;
             return true;
           })
           .map((job) => ({
@@ -170,6 +170,13 @@ function makeDb(servers: ServerRow[]) {
           project_name: params[3],
           shared: s.includes('true') ? true : Boolean(params[4]),
         });
+      }
+      if (s.includes('update cron_job_provenance')) {
+        const prov = cronProvenance.get(params[params.length - 1] as string);
+        if (prov) {
+          prov.shared = true;
+          if (params[0] !== null && params[0] !== undefined) prov.project_name = params[0];
+        }
       }
       if (s.includes('insert into cron_executions')) {
         cronExecutions.push({
@@ -417,38 +424,84 @@ describe('cron API authentication (real auth middleware)', () => {
       };
 
       // Old server without cron-restricted mount refuses before any DB write (and ordinary /cron refuses external_cli header)
+      const extCreateSend = {
+        ...ROUTES[1]!,
+        body: {
+          ...createBody,
+          action: { type: 'send', target: 'brain', message: 'ping safely' },
+        },
+      };
+      const extCreateSelfCmd = {
+        ...ROUTES[1]!,
+        body: {
+          ...createBody,
+          name: 'Restricted Self Command',
+          action: { type: 'command', command: '/status', selfManaged: true },
+        },
+      };
       const oldServerApp = await buildApp(state.db, { includeRestrictedMount: false });
-      const oldRejected = await request(oldServerApp, restrictedBase, ROUTES[1]!, extHeaders);
+      const oldRejected = await request(oldServerApp, restrictedBase, extCreateSend, extHeaders);
       expect([403, 404]).toContain(oldRejected.status);
       expect(state.writes).toEqual([]);
       expect(state.cronJobs.size).toBe(1);
 
-      const headerOnOldCron = await request(app, base, ROUTES[1]!, extHeaders);
+      const headerOnOldCron = await request(app, base, extCreateSend, extHeaders);
       expect(headerOnOldCron.status).toBe(403);
       expect(state.writes).toEqual([]);
 
-      // Interactive browser user or headerless owner daemon cannot access cron-restricted
+      // Interactive browser user, headerless owner daemon, AND user-JWT bearer + X-Server-Id + X-IMCodes-Cron-Actor MUST NOT fall back to ordinary processing on cron-restricted
       const attackerJwt = signJwt({ sub: ATTACKER, role: 'owner' }, SIGNING_KEY, 3600);
-      expect((await request(app, restrictedBase, ROUTES[1]!, {
+      const ownerJwt = signJwt({ sub: OWNER, role: 'owner' }, SIGNING_KEY, 3600);
+      expect((await request(app, restrictedBase, extCreateSend, {
         Cookie: `${COOKIE_SESSION}=${encodeURIComponent(attackerJwt)}`,
         [CRON_RESTRICTED_ACTOR_HEADER]: CRON_RESTRICTED_ACTOR_EXTERNAL_CLI,
       })).status).toBe(403);
-      expect((await request(app, restrictedBase, ROUTES[1]!, daemon)).status).toBe(403);
+      expect((await request(app, restrictedBase, extCreateSend, {
+        Authorization: `Bearer ${ownerJwt}`,
+        [SERVER_ID_HEADER]: VICTIM_SERVER,
+        [CRON_RESTRICTED_ACTOR_HEADER]: CRON_RESTRICTED_ACTOR_EXTERNAL_CLI,
+      })).status).toBe(403);
+      expect((await request(app, restrictedBase, extCreateSend, daemon)).status).toBe(403);
+      expect(state.cronJobs.size).toBe(1);
 
-      // External-CLI restricted turn creates a cron with creator_user_id = IMCODES_EXTERNAL_CLI_SENDER, shared = false
-      const created = await request(app, restrictedBase, ROUTES[1]!, extHeaders);
+      // Disallowed actions (raw non-selfManaged command & P2P) are rejected at creation under external_cli
+      for (const disallowedAction of [
+        { type: 'command', command: '/status' },
+        { type: 'p2p', mode: 'audit', topic: 'hijack', participants: ['brain'] },
+      ]) {
+        const res = await request(app, restrictedBase, {
+          name: 'disallowed-ext-create',
+          method: 'POST',
+          path: '',
+          body: { ...createBody, action: disallowedAction },
+        }, extHeaders);
+        expect(res.status).toBe(403);
+        expect(await res.json()).toMatchObject({ reason: 'external_cli_cron_action_not_allowed' });
+      }
+      expect(state.cronJobs.size).toBe(1);
+
+      // Allowed actions (structured send AND selfManaged command) create restricted crons with shared=true (old schedulers fail closed!)
+      const created = await request(app, restrictedBase, extCreateSend, extHeaders);
       expect(created.status).toBe(201);
       const createdJson = await created.json() as { id: string };
       expect(state.cronProvenance.get(createdJson.id)).toMatchObject({
         creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
-        shared: false,
+        shared: true,
+      });
+
+      const createdSelf = await request(app, restrictedBase, extCreateSelfCmd, extHeaders);
+      expect(createdSelf.status).toBe(201);
+      const createdSelfJson = await createdSelf.json() as { id: string };
+      expect(state.cronProvenance.get(createdSelfJson.id)).toMatchObject({
+        creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
+        shared: true,
       });
 
       // List returns only external-CLI-owned jobs, hiding owner's job-1
       const listed = await request(app, restrictedBase, ROUTES[0]!, extHeaders);
       expect(listed.status).toBe(200);
-      const listedIds = ((await listed.json()) as { jobs: MockRow[] }).jobs.map((j) => j.id);
-      expect(listedIds).toEqual([createdJson.id]);
+      const listedIds = ((await listed.json()) as { jobs: MockRow[] }).jobs.map((j) => j.id).sort();
+      expect(listedIds).toEqual([createdJson.id, createdSelfJson.id].sort());
 
       // Execution history routes isolate owner executions and filter before SQL LIMIT
       state.cronExecutions.push(
@@ -473,7 +526,6 @@ describe('cron API authentication (real auth middleware)', () => {
       expect(((await extJobExecsAllowed.json()) as { executions: MockRow[] }).executions.map((e) => e.id)).toEqual(['exec-ext-1']);
 
       // Normal owner reads full execution history as before
-      const ownerJwt = signJwt({ sub: OWNER, role: 'owner' }, SIGNING_KEY, 3600);
       const ownerHeaders = { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(ownerJwt)}` };
       const ownerAll = await request(app, base, { name: 'owner-exec-all', method: 'GET', path: '/executions?mode=all' }, ownerHeaders);
       expect(ownerAll.status).toBe(200);
@@ -493,7 +545,37 @@ describe('cron API authentication (real auth middleware)', () => {
       }
       expect(state.cronJobs.has('job-1')).toBe(true);
 
-      // Owner renaming the restricted job keeps restricted external-CLI provenance as upper bound across scheduled + manual triggers
+      // Owner CANNOT escalate an existing restricted job's action into P2P or raw command,
+      // while owner CAN still edit normal job-1 into P2P or raw command!
+      for (const badOwnerAction of [
+        { type: 'command', command: '/status' },
+        { type: 'p2p', mode: 'audit', topic: 'hijack', participants: ['brain'] },
+      ]) {
+        const escalated = await request(app, base, {
+          name: 'owner-escalate-ext-action',
+          method: 'PUT',
+          path: `/${createdJson.id}`,
+          body: { action: badOwnerAction },
+        }, ownerHeaders);
+        expect(escalated.status).toBe(403);
+        expect(await escalated.json()).toMatchObject({ reason: 'external_cli_cron_action_not_allowed' });
+      }
+      const ownerNormalP2pUpdate = await request(app, base, {
+        name: 'owner-normal-p2p',
+        method: 'PUT',
+        path: '/job-1',
+        body: { action: { type: 'p2p', mode: 'audit', topic: 'ok owner p2p', participants: ['brain'] } },
+      }, ownerHeaders);
+      expect(ownerNormalP2pUpdate.status).toBe(200);
+      // Restore job-1 command action before trigger check
+      expect((await request(app, base, {
+        name: 'owner-restore-job1',
+        method: 'PUT',
+        path: '/job-1',
+        body: { action: { type: 'command', command: '/status' } },
+      }, ownerHeaders)).status).toBe(200);
+
+      // Owner renaming the restricted job keeps restricted external-CLI provenance (shared=true) intact
       const ownerRename = await request(app, base, {
         name: 'owner-rename-ext',
         method: 'PUT',
@@ -503,8 +585,20 @@ describe('cron API authentication (real auth middleware)', () => {
       expect(ownerRename.status).toBe(200);
       expect(state.cronProvenance.get(createdJson.id)).toMatchObject({
         creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
-        shared: false,
+        shared: true,
       });
+
+      // Legacy-scheduler backward compat proof: with shared=true + creator_user_id='external-cli' (not a server member/share holder),
+      // an old scheduler lacking special IMCODES_EXTERNAL_CLI_SENDER handling sees shared=true and fails closed ({ authorized: false }).
+      const { resolveServerMemberAccessOrShareDeny } = await import('../src/routes/share-http-auth.js');
+      const { listActiveSharesForUser } = await import('../src/db/tab-sharing.js');
+      const storedExtProv = state.cronProvenance.get(createdJson.id)!;
+      expect(Boolean(storedExtProv.shared)).toBe(true);
+      expect((await resolveServerMemberAccessOrShareDeny(state.db, {
+        serverId: VICTIM_SERVER,
+        userId: String(storedExtProv.creator_user_id),
+      })).ok).toBe(false);
+      expect(await listActiveSharesForUser(state.db, String(storedExtProv.creator_user_id), Date.now())).toEqual([]);
 
       const sentPayloads: string[] = [];
       const bridge = WsBridge.get(VICTIM_SERVER);
@@ -513,20 +607,28 @@ describe('cron API authentication (real auth middleware)', () => {
       bridge.isDaemonConnected = () => true;
       bridge.sendToDaemon = (raw: string) => { sentPayloads.push(raw); };
       try {
-        // Reload-based scheduled dispatch preserves restricted authority
+        // Reload-based scheduled dispatch preserves restricted authority for both send and selfManaged command
         await dispatchJobNow(env(state.db), state.cronJobs.get(createdJson.id) as never);
+        await dispatchJobNow(env(state.db), state.cronJobs.get(createdSelfJson.id) as never);
         // Owner manual trigger of restricted job also preserves restricted authority
         const manualExt = await request(app, base, { name: 'owner-trig-ext', method: 'POST', path: `/${createdJson.id}/trigger` }, ownerHeaders);
         expect(manualExt.status).toBe(200);
         // Owner manual trigger of normal owner job retains ownerMachineAuthority
         const manualOwner = await request(app, base, { name: 'owner-trig-job1', method: 'POST', path: '/job-1/trigger' }, ownerHeaders);
         expect(manualOwner.status).toBe(200);
+        // Server-side dispatch refuses tampered restricted DB job with disallowed P2P action
+        const tamperedJob = {
+          ...(state.cronJobs.get(createdJson.id) as MockRow),
+          action: JSON.stringify({ type: 'p2p', mode: 'audit', topic: 'tampered', participants: ['brain'] }),
+        };
+        state.cronJobs.set(createdJson.id, tamperedJob);
+        await expect(dispatchJobNow(env(state.db), tamperedJob as never)).rejects.toThrow('share_revoked');
       } finally {
         bridge.isDaemonConnected = origConnected;
         bridge.sendToDaemon = origSend;
       }
-      expect(sentPayloads).toHaveLength(3);
-      for (const idx of [0, 1]) {
+      expect(sentPayloads).toHaveLength(4);
+      for (const idx of [0, 1, 2]) {
         const dispatched = JSON.parse(sentPayloads[idx]!) as Record<string, unknown>;
         expect(dispatched.sharedActor).toMatchObject({
           actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
@@ -536,12 +638,12 @@ describe('cron API authentication (real auth middleware)', () => {
         expect(dispatched.ownerMachineAuthority).toBeUndefined();
         expect(dispatched.sharedMachineAuthority).toBeUndefined();
       }
-      const ownerDispatched = JSON.parse(sentPayloads[2]!) as Record<string, unknown>;
+      const ownerDispatched = JSON.parse(sentPayloads[3]!) as Record<string, unknown>;
       expect(ownerDispatched.sharedActor).toBeUndefined();
       expect(typeof ownerDispatched.ownerMachineAuthority).toBe('string');
       expect(state.cronProvenance.get(createdJson.id)).toMatchObject({
         creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
-        shared: false,
+        shared: true,
       });
     });
   });

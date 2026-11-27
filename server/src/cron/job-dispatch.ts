@@ -23,6 +23,7 @@ import {
   CRON_EXACT_SEND_CAPABILITY_V1,
   CRON_MSG,
   CRON_STATUS,
+  isAllowedExternalCliRestrictedCronAction,
   normalizeCronCompletionPolicy,
   registerCronControlAction,
   type CronAction,
@@ -174,6 +175,21 @@ async function verifySharedCronCreatorStillAuthorized(
   now: number,
   prov: CronProvenanceRow | null,
 ): Promise<SharedCronDispatchAuth> {
+  if (prov?.creator_user_id === IMCODES_EXTERNAL_CLI_SENDER) {
+    let parsedAction: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(job.action);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        parsedAction = parsed as Record<string, unknown>;
+      }
+    } catch {
+      return { authorized: false };
+    }
+    return isAllowedExternalCliRestrictedCronAction(parsedAction)
+      ? { authorized: true }
+      : { authorized: false };
+  }
+
   if (!prov || !prov.shared || prov.creator_user_id === job.user_id) return { authorized: true };
 
   const member = await resolveServerMemberAccessOrShareDeny(db, {

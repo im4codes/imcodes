@@ -603,6 +603,38 @@ describe('executeCronJob structured send actions', () => {
       sharedMachineAuthority: 'part-send-jwt',
     }));
 
+    // External-CLI restricted structured send preserves restricted sharedActor with zero machine authorities
+    const { IMCODES_EXTERNAL_CLI_SENDER } = await import('../../shared/imcodes-send.js');
+    const extActor: SharedActorEnvelope = {
+      actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+      actorDisplayName: IMCODES_EXTERNAL_CLI_SENDER,
+      snapshot: {
+        shareId: 'external-cli',
+        serverId: 'srv-1',
+        userId: IMCODES_EXTERNAL_CLI_SENDER,
+        effectiveRole: 'participant',
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_myapp_w1' },
+        authorizedAt: 1,
+        issuedAt: 1,
+      },
+      primaryShareId: null,
+      effectiveActorRole: 'participant',
+      actionId: 'cron-send-ext',
+      origin: 'server-member',
+      authorizedAt: 1,
+    };
+    dispatchCronSend.mockClear();
+    await executeCronJob({
+      ...makeSendMsg(),
+      executionId: 'exec-ext-send',
+      sharedActor: extActor,
+    }, mockServerLink);
+    expect(dispatchCronSend).toHaveBeenCalledWith(expect.objectContaining({
+      sharedActor: extActor,
+    }));
+    expect((dispatchCronSend.mock.calls[0] as any)[0].ownerMachineAuthority).toBeUndefined();
+    expect((dispatchCronSend.mock.calls[0] as any)[0].sharedMachineAuthority).toBeUndefined();
+
     __setCronExactSelfSenderForTests(null);
   });
 });

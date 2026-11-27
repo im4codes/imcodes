@@ -17,6 +17,7 @@ import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { SEND_COMMAND_HOOK_PATH } from '../../shared/send-command-mode.js';
+import { HOOK_SESSION_CREDENTIAL_HEADER } from '../../shared/hook-session-credential.js';
 
 const participantTurns = new Map<string, { actorUserId: string; authority: string | null }>();
 const sessionsMap = new Map<string, {
@@ -108,6 +109,7 @@ function requestHook(
 ) {
   return new Promise<{ status: number; body: Record<string, unknown> }>((resolve, reject) => {
     const data = body === undefined ? '' : JSON.stringify(body);
+    const matchedSession = sender ? sessionsMap.get(sender) as { hookCredential?: string } | undefined : undefined;
     const req = http.request({
       hostname: '127.0.0.1',
       port,
@@ -120,6 +122,7 @@ function requestHook(
           ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
           : {}),
         ...(sender ? { 'x-imcodes-session': sender } : {}),
+        ...(matchedSession?.hookCredential ? { [HOOK_SESSION_CREDENTIAL_HEADER]: matchedSession.hookCredential } : {}),
         ...extraHeaders,
       },
     }, (res) => {
@@ -175,9 +178,15 @@ describe('hook-server shared participant isolation', () => {
       name: 'deck_shared_main',
       projectName: 'proj-shared',
       state: 'idle',
+      hookCredential: 'cred-shared-main',
       contextNamespace: { scope: 'personal', projectId: 'proj_shared', userId: 'owner_user_1' },
-    });
-    sessionsMap.set('deck_shared_sub', { name: 'deck_shared_sub', projectName: 'proj-shared', state: 'idle' });
+    } as never);
+    sessionsMap.set('deck_shared_sub', {
+      name: 'deck_shared_sub',
+      projectName: 'proj-shared',
+      state: 'idle',
+      hookCredential: 'cred-shared-sub',
+    } as never);
     sessionsMap.set('deck_private_main', {
       name: 'deck_private_main',
       projectName: 'proj-private',
@@ -434,14 +443,41 @@ describe('hook-server shared participant isolation', () => {
     expect(mockDispatchHookSend).not.toHaveBeenCalled();
     expect(mockStopSessionNow).not.toHaveBeenCalled();
 
-    // Authenticated managed owner session (sibling deck_shared_sub) is NOT blocked by another session's participant turn
+    // Authenticated managed owner session (sibling deck_shared_sub with matching credential) is NOT blocked by another session's participant turn
+    const { HOOK_SESSION_CREDENTIAL_HEADER } = await import('../../shared/hook-session-credential.js');
     const ownerSend = await requestHook(port, 'POST', '/send', 'deck_shared_sub', {
       from: 'deck_shared_sub',
       to: 'deck_shared_main',
       message: 'owner message',
+    }, {
+      [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-shared-sub',
     });
     expect(ownerSend.status).toBe(200);
     expect(mockDispatchHookSend).toHaveBeenCalledTimes(1);
+
+    // Legacy/adopted active session WITHOUT stored hookCredential MUST use external policy only:
+    // blocked 403 while participant turn is active, and cannot broadcast/resolve labels even when idle.
+    sessionsMap.set('deck_legacy_pane', {
+      name: 'deck_legacy_pane',
+      projectName: 'proj-shared',
+      label: 'LegacyPane',
+      state: 'idle',
+    } as never);
+    for (const legacyAttempt of [
+      { path: '/send', body: { from: 'deck_legacy_pane', to: 'deck_private_main', message: 'elevate' } },
+      { path: '/send', body: { from: 'LegacyPane', to: 'deck_private_main', message: 'elevate' } },
+      { path: SEND_COMMAND_HOOK_PATH, body: { from: 'deck_legacy_pane', to: 'deck_private_main', message: '/status' } },
+      { path: '/send', body: { from: 'deck_legacy_pane', to: 'deck_private_main', message: '/stop' } },
+      { path: '/stop', body: { from: 'deck_legacy_pane', to: 'deck_private_main' } },
+    ] as const) {
+      const blockedLegacy = await requestHook(port, 'POST', legacyAttempt.path, undefined, legacyAttempt.body);
+      expect(blockedLegacy, `${legacyAttempt.path}`).toEqual({
+        status: 403,
+        body: { ok: false, error: 'external_send_blocked_during_participant_turn' },
+      });
+    }
+    expect(mockDispatchHookSend).toHaveBeenCalledTimes(1);
+    expect(mockStopSessionNow).not.toHaveBeenCalled();
 
     // Stopped participant session must not permanently block external CLI sends
     sessionsMap.set('deck_shared_main', {
@@ -463,8 +499,9 @@ describe('hook-server shared participant isolation', () => {
       name: 'deck_shared_main',
       projectName: 'proj-shared',
       state: 'idle',
+      hookCredential: 'cred-shared-main',
       contextNamespace: { scope: 'personal', projectId: 'proj_shared', userId: 'owner_user_1' },
-    });
+    } as never);
     participantTurns.clear();
     participantTurns.set('deck_private_main', { actorUserId: IMCODES_EXTERNAL_CLI_SENDER, authority: null });
     const extTurnSend = await requestHook(port, 'POST', '/send', undefined, {
@@ -477,6 +514,27 @@ describe('hook-server shared participant isolation', () => {
       from: IMCODES_EXTERNAL_CLI_SENDER,
       senderRecord: null,
     });
+
+    // When idle, legacy credential-less active session can use exact active target ONLY (restricted external policy),
+    // never broadcast or sibling label resolution (`senderRecord: null`, NOT trusted dispatch).
+    if (sessionsMap.has('deck_legacy_pane')) {
+      const legacyBroadcast = await requestHook(port, 'POST', '/send', undefined, {
+        from: 'deck_legacy_pane',
+        to: '*',
+        message: 'broadcast forbidden',
+      });
+      expect(legacyBroadcast.status).toBe(404);
+      const legacyExact = await requestHook(port, 'POST', '/send', undefined, {
+        from: 'LegacyPane',
+        to: 'deck_private_main',
+        message: 'restricted local callback',
+      });
+      expect(legacyExact.status).toBe(200);
+      expect(mockDispatchHookSend.mock.calls.at(-1)?.[0]).toMatchObject({
+        from: 'LegacyPane',
+        senderRecord: null,
+      });
+    }
   });
 
   it('verifies hookCredential against canonical session identity on label claims and propagates canonical identity on authenticated labels', async () => {

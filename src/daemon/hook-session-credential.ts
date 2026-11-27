@@ -37,3 +37,20 @@ export function hookClaimAllowed(
   const presented = headerValue(headers[HOOK_SESSION_CREDENTIAL_HEADER]);
   return typeof presented === 'string' && presented.length > 0 && sameHookCredential(expected, presented);
 }
+
+/**
+ * Strict proof check: true ONLY when `claimedSession` has a non-empty stored
+ * `hookCredential` AND the request presents the matching secret.
+ * Legacy/adopted sessions with no stored credential return `false` here so
+ * `/send`, `/send-command`, and `/stop` fall back to untrusted external policy.
+ */
+export function hookCredentialMatches(
+  claimedSession: string | undefined,
+  headers: Record<string, string | string[] | undefined>,
+): boolean {
+  if (!claimedSession) return false;
+  const expected = getSession(claimedSession)?.hookCredential?.trim();
+  if (!expected) return false;
+  const presented = headerValue(headers[HOOK_SESSION_CREDENTIAL_HEADER]);
+  return typeof presented === 'string' && presented.length > 0 && sameHookCredential(expected, presented);
+}

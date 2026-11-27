@@ -6,6 +6,18 @@ import type { SharedActorEnvelope } from './tab-sharing.js';
 
 export type CronActionType = 'command' | 'p2p' | 'send';
 
+/**
+ * Restricted external-CLI cron schedules only permit structured `send` and
+ * `selfManaged: true` `command` actions (never raw arbitrary commands or P2P).
+ */
+export function isAllowedExternalCliRestrictedCronAction(
+  action: { type?: unknown; selfManaged?: unknown } | null | undefined,
+): boolean {
+  if (!action || typeof action !== 'object') return false;
+  if (action.type === 'send') return true;
+  return action.type === 'command' && action.selfManaged === true;
+}
+
 /** Static capability advertised by daemons supporting exact scoped cron send binding & self-delivery. */
 export const CRON_EXACT_SEND_CAPABILITY_V1 = 'cron_exact_send_v1';
 

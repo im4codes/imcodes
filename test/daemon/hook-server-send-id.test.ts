@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 import { isSendDispatchId, isSendMessageId } from '../../shared/send-message-id.js';
 import { buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
+import { HOOK_SESSION_CREDENTIAL_HEADER } from '../../shared/hook-session-credential.js';
 
 const getSessionMock = vi.hoisted(() => vi.fn());
 const upsertSessionMock = vi.hoisted(() => vi.fn());
@@ -49,7 +50,11 @@ function makeSession(overrides: Record<string, unknown>) {
   };
 }
 
-function postSend(port: number, body: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }> {
+function postSend(
+  port: number,
+  body: Record<string, unknown>,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; body: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({
@@ -58,7 +63,12 @@ function postSend(port: number, body: Record<string, unknown>): Promise<{ status
       path: '/send',
       method: 'POST',
       agent: false,
-      headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(data)), Connection: 'close' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(data)),
+        Connection: 'close',
+        ...headers,
+      },
     }, (res) => {
       let response = '';
       res.on('data', (chunk) => { response += chunk; });
@@ -108,12 +118,16 @@ describe('hook-server /send ids', () => {
   });
 
   it('returns dispatchId/messageId while preserving single-target compatibility fields', async () => {
-    const brain = makeSession({ name: 'deck_alpha_brain', role: 'brain' });
+    const brain = makeSession({ name: 'deck_alpha_brain', role: 'brain', hookCredential: 'cred-alpha-brain' });
     const worker = makeSession({ name: 'deck_alpha_w1', role: 'w1', label: 'Coder' });
     getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
     listSessionsMock.mockReturnValue([brain, worker]);
 
-    const res = await postSend(port, { from: 'deck_alpha_brain', to: 'Coder', message: 'hello' });
+    const res = await postSend(
+      port,
+      { from: 'deck_alpha_brain', to: 'Coder', message: 'hello' },
+      { [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-alpha-brain' },
+    );
 
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ ok: true, delivered: true, target: 'deck_alpha_w1' });
@@ -146,13 +160,17 @@ describe('hook-server /send ids', () => {
   });
 
   it('returns per-target message ids for broadcast while preserving delivered array', async () => {
-    const brain = makeSession({ name: 'deck_alpha_brain', role: 'brain' });
+    const brain = makeSession({ name: 'deck_alpha_brain', role: 'brain', hookCredential: 'cred-alpha-brain' });
     const w1 = makeSession({ name: 'deck_alpha_w1', role: 'w1', label: 'Coder1' });
     const w2 = makeSession({ name: 'deck_alpha_w2', role: 'w2', label: 'Coder2' });
     getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : null);
     listSessionsMock.mockReturnValue([brain, w1, w2]);
 
-    const res = await postSend(port, { from: 'deck_alpha_brain', to: '*', message: 'hello all' });
+    const res = await postSend(
+      port,
+      { from: 'deck_alpha_brain', to: '*', message: 'hello all' },
+      { [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-alpha-brain' },
+    );
 
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);

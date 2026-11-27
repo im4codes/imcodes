@@ -14,7 +14,7 @@
  * All hook scripts and plugins read this value at write time.
  */
 import { isLocalHookRequest } from './hook-request-guard.js';
-import { hookClaimAllowed } from './hook-session-credential.js';
+import { hookClaimAllowed, hookCredentialMatches } from './hook-session-credential.js';
 import { HOOK_SESSION_CREDENTIAL_ERROR } from '../../shared/hook-session-credential.js';
 import {
   EXECUTION_POOL_DAEMON_RPC_PATH,
@@ -369,8 +369,7 @@ function resolveSenderRecord(from: string, allSessions: SessionRecord[]): Sessio
 type VerifiedHookSender =
   | { kind: 'verified'; session: SessionRecord }
   | { kind: 'credential_rejected' }
-  | { kind: 'ambiguous' }
-  | { kind: 'external' };
+  | { kind: 'untrusted'; ambiguous: boolean };
 
 function resolveVerifiedHookSender(
   from: string,
@@ -378,10 +377,17 @@ function resolveVerifiedHookSender(
   allSessions: SessionRecord[],
 ): VerifiedHookSender {
   const resolved = resolveSenderRecord(from, allSessions);
-  if (resolved === 'ambiguous') return { kind: 'ambiguous' };
-  if (!resolved) return { kind: 'external' };
-  if (!hookClaimAllowed(resolved.name, headers)) return { kind: 'credential_rejected' };
-  return { kind: 'verified', session: resolved };
+  if (resolved === 'ambiguous') return { kind: 'untrusted', ambiguous: true };
+  if (!resolved) return { kind: 'untrusted', ambiguous: false };
+  // A session with a stored hookCredential requires an exact matching header.
+  // A legacy/adopted session lacking a stored hookCredential stays compatible (no 403)
+  // but CANNOT prove identity, so it must take the untrusted external policy branch.
+  if (resolved.hookCredential?.trim()) {
+    return hookCredentialMatches(resolved.name, headers)
+      ? { kind: 'verified', session: resolved }
+      : { kind: 'credential_rejected' };
+  }
+  return { kind: 'untrusted', ambiguous: false };
 }
 
 /**
@@ -782,7 +788,7 @@ async function handleSend(
   const canonicalFrom = senderRecord ? senderRecord.name : from;
   const resolvedSenderArg: SessionRecord | null | 'ambiguous' = senderAuth.kind === 'verified'
     ? senderAuth.session
-    : senderAuth.kind === 'ambiguous'
+    : senderAuth.ambiguous
       ? 'ambiguous'
       : null;
 
@@ -936,7 +942,7 @@ async function handleStop(
   const canonicalFrom = senderRecord ? senderRecord.name : from;
   const resolvedSenderArg: SessionRecord | null | 'ambiguous' = senderAuth.kind === 'verified'
     ? senderAuth.session
-    : senderAuth.kind === 'ambiguous'
+    : senderAuth.ambiguous
       ? 'ambiguous'
       : null;
   const result = resolveTarget(canonicalFrom, to, resolvedSenderArg);
