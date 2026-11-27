@@ -141,7 +141,7 @@ export interface OpenCodeClientLike {
       permissions?: OpenCodeSessionPermissionRuleLike[];
     }): Promise<OpenCodeSessionInfoLike>;
     get(input: { sessionID: string }): Promise<OpenCodeSessionInfoLike>;
-    prompt(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+    prompt(input: Record<string, unknown>, requestOptions?: { signal?: AbortSignal }): Promise<Record<string, unknown>>;
   };
   session: {
     list(input?: { directory?: string }): Promise<{ data?: OpenCodeSessionInfoLike[]; cursor?: unknown }>;
@@ -156,8 +156,12 @@ export interface OpenCodeClientLike {
       sessionID: string;
       model: { providerID: string; id: string; variant?: string };
     }): Promise<void>;
-    compact(input: { sessionID: string; id?: string }): Promise<Record<string, unknown>>;
+    compact(input: { sessionID: string; id?: string }, requestOptions?: { signal?: AbortSignal }): Promise<Record<string, unknown>>;
     interrupt(input: { sessionID: string }): Promise<{ interrupted?: boolean } | void>;
+    inbox?: {
+      list(input: { sessionID: string }): Promise<Array<Record<string, unknown>> | { data?: Array<Record<string, unknown>> }>;
+      cancel?(input: { sessionID: string; inboxID: string }): Promise<void>;
+    };
     message: {
       get(input: { sessionID: string; messageID: string }): Promise<Record<string, unknown>>;
     };
@@ -936,6 +940,10 @@ interface OpenCodeSessionState {
   openCodeCredChangedIdsDuringTurn: Set<string>;
   retryTerminalReconcileInFlight: boolean;
   retryTerminalHint: string | null;
+  retryTerminalError: unknown;
+  retryActivitySeq: number;
+  retryReconcileToken: number;
+  pendingAdmissionAbort: AbortController | null;
   activeTurnParams: {
     generation: number;
     text: string;
@@ -982,20 +990,61 @@ class OpenCodeRequestTimeoutError extends Error {
   }
 }
 
-function withOpenCodeRequestTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+function invokeWithOptionalSignal<TInput, TResult>(
+  fn: (input: TInput, requestOptions?: { signal?: AbortSignal }) => Promise<TResult>,
+  input: TInput,
+  signal: AbortSignal,
+): Promise<TResult> {
+  return fn.length >= 2 ? fn(input, { signal }) : fn(input);
+}
+
+function withOpenCodeRequestTimeout<T>(
+  promise: Promise<T>,
+  operation: string,
+  abortController?: AbortController,
+): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new OpenCodeRequestTimeoutError(operation)),
-      MISSING_FINAL_RECOVERY_TIMEOUT_MS,
-    );
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const abortErr = new Error(`OpenCode ${operation} aborted`);
+      abortErr.name = 'AbortError';
+      reject(abortErr);
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      abortController?.signal.removeEventListener('abort', onAbort);
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      abortController?.signal.removeEventListener('abort', onAbort);
+      abortController?.abort();
+      reject(new OpenCodeRequestTimeoutError(operation));
+    }, MISSING_FINAL_RECOVERY_TIMEOUT_MS);
     timer.unref?.();
+
+    if (abortController) {
+      if (abortController.signal.aborted) {
+        onAbort();
+        return;
+      }
+      abortController.signal.addEventListener('abort', onAbort, { once: true });
+    }
+
     promise.then(
       (value) => {
-        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        cleanup();
         resolve(value);
       },
       (error) => {
-        clearTimeout(timer);
+        if (settled) return;
+        settled = true;
+        cleanup();
         reject(error);
       },
     );
@@ -1155,8 +1204,7 @@ function isExpiredOpenCodeAuthError(error: unknown, sessionProviderId: string | 
   const isStatuslessSdkAuth = status === undefined && (errorType === 'provider.auth' || errorName.includes('providerautherror'));
   const hasExpiredKeyMarker = code === 'api_key_expired'
     || /\bapi_key_expired\b/.test(combined)
-    || /\bapi[_ ]?key[^a-z0-9]{1,8}expired\b/.test(combined)
-    || /\breconnect opencode console to continue\b/.test(combined);
+    || /\bapi[_ ]?key[^a-z0-9]{1,8}expired\b/.test(combined);
   return (is401 || isStatuslessSdkAuth) && hasExpiredKeyMarker;
 }
 
@@ -2276,6 +2324,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       openCodeCredChangedIdsDuringTurn: new Set(),
       retryTerminalReconcileInFlight: false,
       retryTerminalHint: null,
+      retryTerminalError: undefined,
+      retryActivitySeq: 0,
+      retryReconcileToken: 0,
+      pendingAdmissionAbort: null,
       activeTurnParams: null,
       missingFinalRecoveryAttempted: false,
       missingFinalRecoveryInFlight: false,
@@ -2308,6 +2360,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       const previousOwner = previousOwnerId ? this.sessions.get(previousOwnerId) : undefined;
       if (previousOwner && previousOwner !== state) {
         previousOwner.syncedMcpSignature = null;
+        previousOwner.pendingAdmissionAbort?.abort();
         if (previousOwner.busy) {
           previousOwner.cancelled = true;
           previousOwner.generation += 1;
@@ -2359,6 +2412,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     let removedSoleProviderRoute = false;
     await this.withProviderSessionLock(state.providerSessionId, async () => {
       if (this.sessions.get(sessionId) !== state) return;
+      state.pendingAdmissionAbort?.abort();
       state.authHealInFlight = false;
       state.authHealPhase = 'none';
       state.activeTurnParams = null;
@@ -2781,15 +2835,28 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         await this.applySystemInstruction(state, system);
         this.assertRouteOwner(state);
         if (!this.isCurrent(state, generation) || state.cancelled) return;
-        await withOpenCodeRequestTimeout(
-          state.client.sessions.prompt({
-            sessionID: state.providerSessionId,
-            id: messageId,
-            text: payload.assembledMessage,
-            ...(files.length > 0 ? { files } : {}),
-          }),
-          'prompt submission',
-        );
+        const admissionAbort = new AbortController();
+        state.pendingAdmissionAbort = admissionAbort;
+        try {
+          await withOpenCodeRequestTimeout(
+            invokeWithOptionalSignal(
+              state.client.sessions.prompt,
+              {
+                sessionID: state.providerSessionId,
+                id: messageId,
+                text: payload.assembledMessage,
+                ...(files.length > 0 ? { files } : {}),
+              },
+              admissionAbort.signal,
+            ),
+            'prompt submission',
+            admissionAbort,
+          );
+        } finally {
+          if (state.pendingAdmissionAbort === admissionAbort) {
+            state.pendingAdmissionAbort = null;
+          }
+        }
       });
     } catch (error) {
       this.assertRouteOwner(state);
@@ -2797,6 +2864,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       if (isTransientRequestFailure(error)) {
         try {
           const acceptance = await this.waitForPromptAcceptance(state, generation, messageId);
+          this.assertRouteOwner(state);
           if (acceptance === 'accepted' || !this.isCurrent(state, generation) || state.cancelled) return;
           if (acceptance === 'unknown') {
             logger.warn(
@@ -2861,10 +2929,24 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         await this.syncSessionModelAndEffort(state);
         this.assertRouteOwner(state);
         if (!this.isCurrent(state, generation) || state.cancelled) return;
-        const result = await withOpenCodeRequestTimeout(
-          compact({ sessionID: state.providerSessionId, id: compactInputId }),
-          'compact',
-        );
+        const admissionAbort = new AbortController();
+        state.pendingAdmissionAbort = admissionAbort;
+        let result: Record<string, unknown>;
+        try {
+          result = await withOpenCodeRequestTimeout(
+            invokeWithOptionalSignal(
+              compact,
+              { sessionID: state.providerSessionId, id: compactInputId },
+              admissionAbort.signal,
+            ),
+            'compact',
+            admissionAbort,
+          );
+        } finally {
+          if (state.pendingAdmissionAbort === admissionAbort) {
+            state.pendingAdmissionAbort = null;
+          }
+        }
         const resolvedInputId = safeString((result as Record<string, unknown> | undefined)?.id);
         if (
           resolvedInputId
@@ -2976,6 +3058,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.clearPendingQuestion(state, true);
+    state.pendingAdmissionAbort?.abort();
     if (!state.busy) return;
     const wasCompacting = state.compacting;
     state.cancelled = true;
@@ -3508,14 +3591,26 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     );
     const inRetryLifecycle = () => state.authHealPhase === 'retry-dispatched' || state.authHealPhase === 'retry-active';
 
+    const markRetryLiveActivity = () => {
+      state.retryActivitySeq += 1;
+      state.retryReconcileToken += 1;
+      state.retryTerminalReconcileInFlight = false;
+      state.retryTerminalHint = null;
+      state.retryTerminalError = undefined;
+    };
+
     const ensureRetryReadyForContentEvent = (allowAckedGeneric = false): boolean => {
       if (state.authHealInFlight || state.authHealPhase === 'preparing') return false;
       if (state.authHealPhase === 'retry-dispatched') {
         if (isCorrelatedRetryEvent() || (!eventMessageId && !eventAssistantId && (allowAckedGeneric || event.type === 'session.step.started' || event.type === 'session.text.started' || event.type === 'session.text.delta'))) {
           state.authHealPhase = 'retry-active';
+          markRetryLiveActivity();
           return true;
         }
         return false;
+      }
+      if (state.authHealPhase === 'retry-active') {
+        markRetryLiveActivity();
       }
       return true;
     };
@@ -3530,6 +3625,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         ) {
           state.authHealPhase = 'retry-active';
           state.authHealInFlight = false;
+          markRetryLiveActivity();
         }
         return;
       }
@@ -3669,6 +3765,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           && eventMessageId === state.deliveryMessageId
         ) {
           state.authHealPhase = 'retry-active';
+          markRetryLiveActivity();
+        } else if (state.authHealPhase === 'retry-active' && (!eventMessageId || eventMessageId === state.deliveryMessageId)) {
+          markRetryLiveActivity();
         }
         if (state.busy && !state.compacting && !state.authHealInFlight && state.authHealPhase !== 'preparing') {
           this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
@@ -3697,7 +3796,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           if (isCorrelatedRetryEvent()) {
             state.authHealPhase = 'retry-active';
           } else {
-            this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
+            this.scheduleRetryTerminalReconcile(state, state.generation, event.type, data?.error);
             return;
           }
         }
@@ -4315,19 +4414,30 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state: OpenCodeSessionState,
     generation: number,
     eventType: string,
+    terminalError?: unknown,
   ): void {
-    state.retryTerminalHint = eventType;
+    const isTerminalFailOrInterrupt = eventType === 'session.execution.failed'
+      || eventType === 'session.execution.interrupted';
+    const currentIsFailOrInterrupt = state.retryTerminalHint === 'session.execution.failed'
+      || state.retryTerminalHint === 'session.execution.interrupted';
+    if (isTerminalFailOrInterrupt || !currentIsFailOrInterrupt) {
+      state.retryTerminalHint = eventType;
+      if (terminalError !== undefined) state.retryTerminalError = terminalError;
+    }
     if (state.retryTerminalReconcileInFlight) return;
     state.retryTerminalReconcileInFlight = true;
-    void this.reconcileRetryTerminalFrame(state, generation);
+    const reconcileToken = ++state.retryReconcileToken;
+    void this.reconcileRetryTerminalFrame(state, generation, reconcileToken);
   }
 
   private async reconcileRetryTerminalFrame(
     state: OpenCodeSessionState,
     generation: number,
+    reconcileToken: number,
   ): Promise<void> {
     const canContinue = () => (
       this.isCurrent(state, generation)
+      && state.retryReconcileToken === reconcileToken
       && !state.cancelled
       && this.isRouteOwner(state)
       && !state.completionEmitted
@@ -4335,6 +4445,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       && (state.authHealPhase === 'retry-dispatched' || state.authHealPhase === 'retry-active')
     );
     const retryMessageId = state.deliveryMessageId;
+    const activitySeqAtStart = state.retryActivitySeq;
     let lastReadError: unknown = null;
     let cleanNonTerminalChecks = 0;
 
@@ -4342,6 +4453,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       for (const delayMs of RETRY_TERMINAL_RECONCILE_DELAYS_MS) {
         if (delayMs > 0) await sleep(delayMs);
         if (!canContinue()) return;
+        if (state.retryActivitySeq !== activitySeqAtStart) return;
 
         let items: Array<Record<string, any>>;
         try {
@@ -4391,26 +4503,70 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           return;
         }
 
-        // The server responded cleanly with no Retry terminal assistant record yet:
-        // allow one short projection-lag recheck, then conclude the hint was stale Attempt-1 noise
-        // so a healthy slow Retry keeps running.
+        if (!canContinue() || state.retryActivitySeq !== activitySeqAtStart) return;
+
+        if (retryMessageId && typeof state.client.session.inbox?.list === 'function') {
+          try {
+            const inboxRaw = await withOpenCodeRequestTimeout(
+              state.client.session.inbox.list({ sessionID: state.providerSessionId }),
+              'auth-heal retry inbox check',
+            );
+            if (!canContinue()) return;
+            const inboxItems = Array.isArray(inboxRaw)
+              ? inboxRaw
+              : (Array.isArray(inboxRaw?.data) ? inboxRaw.data : []);
+            if (inboxItems.some((item) => item?.id === retryMessageId)) {
+              // Retry prompt is still pending in the SDK inbox; the hint came from an earlier attempt.
+              return;
+            }
+          } catch {
+            // Fall through to bounded history reconciliation when inbox check fails transiently.
+          }
+        }
+
         cleanNonTerminalChecks += 1;
-        if (cleanNonTerminalChecks >= 2) {
+        const isTerminalFailOrInterrupt = state.retryTerminalHint === 'session.execution.failed'
+          || state.retryTerminalHint === 'session.execution.interrupted';
+        if (!isTerminalFailOrInterrupt && cleanNonTerminalChecks >= 2) {
           return;
         }
       }
 
-      if (!canContinue() || lastReadError === null) return;
-      this.failOnce(
-        state,
-        providerError(
-          PROVIDER_ERROR_CODES.CONNECTION_LOST,
-          `OpenCode retry completion could not be confirmed due to repeated history read failures: ${errorMessage(lastReadError)}`,
-          true,
-        ),
-      );
+      if (!canContinue() || state.retryActivitySeq !== activitySeqAtStart) return;
+      if (lastReadError !== null) {
+        this.failOnce(
+          state,
+          providerError(
+            PROVIDER_ERROR_CODES.CONNECTION_LOST,
+            `OpenCode retry completion could not be confirmed due to repeated history read failures: ${errorMessage(lastReadError)}`,
+            true,
+          ),
+        );
+        return;
+      }
+      if (state.retryTerminalHint === 'session.execution.failed') {
+        const normalized = state.retryTerminalError
+          ? this.normalizeError(state.retryTerminalError, 'session')
+          : providerError(
+            PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+            'OpenCode retry execution failed before generating an assistant response',
+            true,
+          );
+        this.failOnce(state, normalized.recoverable ? normalized : { ...normalized, recoverable: true });
+        return;
+      }
+      if (state.retryTerminalHint === 'session.execution.interrupted') {
+        this.failOnce(
+          state,
+          providerError(
+            PROVIDER_ERROR_CODES.CANCELLED,
+            'OpenCode retry execution was interrupted before generating an assistant response',
+            true,
+          ),
+        );
+      }
     } finally {
-      if (this.isCurrent(state, generation)) {
+      if (this.isCurrent(state, generation) && state.retryReconcileToken === reconcileToken) {
         state.retryTerminalReconcileInFlight = false;
       }
     }
@@ -4516,6 +4672,23 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           if (!matched) {
             preservedNewerCred = true;
           } else {
+            const matchedValue = matched.value && typeof matched.value === 'object'
+              ? (matched.value as Record<string, unknown>)
+              : undefined;
+            const matchedCredType = safeString(matchedValue?.type)?.toLowerCase();
+            const isNonAtomicMutableCred = Boolean(
+              matchedCredType === 'oauth'
+              || matchedCredType === 'external'
+              || safeString(matchedValue?.refresh)
+              || safeString(matchedValue?.access)
+              || safeString(matchedValue?.methodID)
+              || (matchedValue !== undefined && matchedCredType !== 'key' && matchedCredType !== 'api'),
+            );
+            if (isNonAtomicMutableCred) {
+              throw new Error(
+                `OpenCode ${matchedCredType ?? 'oauth'} credential "${matched.id}" cannot be safely auto-deleted because the SDK lacks an atomic version/fingerprint precondition; reconnect OpenCode authentication or switch providers`,
+              );
+            }
             const currentFingerprint = fingerprintCredentialValue(matched);
             const rawTs = positiveNumber(matched.time?.updated ?? matched.time?.created ?? matched.updatedAt ?? matched.createdAt);
             const credTs = rawTs !== undefined && rawTs < 1e12 ? rawTs * 1000 : rawTs;
@@ -4566,6 +4739,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       state.deliveryMessageId = retryMessageId;
       state.currentMessageId = null;
       state.activeStepProviderId = undefined;
+      state.retryTerminalHint = null;
+      state.retryTerminalError = undefined;
+      state.retryActivitySeq = 0;
       state.textParts.clear();
       state.toolNames.clear();
       state.toolInputs.clear();
@@ -4589,15 +4765,28 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         state.authHealPhase = 'retry-dispatched';
         state.authHealRetryAcked = false;
         state.authHealInFlight = false;
-        await withOpenCodeRequestTimeout(
-          state.client.sessions.prompt({
-            sessionID: state.providerSessionId,
-            id: retryMessageId,
-            text: params.text,
-            ...(params.files.length > 0 ? { files: params.files } : {}),
-          }),
-          'auth-heal retry prompt',
-        );
+        const admissionAbort = new AbortController();
+        state.pendingAdmissionAbort = admissionAbort;
+        try {
+          await withOpenCodeRequestTimeout(
+            invokeWithOptionalSignal(
+              state.client.sessions.prompt,
+              {
+                sessionID: state.providerSessionId,
+                id: retryMessageId,
+                text: params.text,
+                ...(params.files.length > 0 ? { files: params.files } : {}),
+              },
+              admissionAbort.signal,
+            ),
+            'auth-heal retry prompt',
+            admissionAbort,
+          );
+        } finally {
+          if (state.pendingAdmissionAbort === admissionAbort) {
+            state.pendingAdmissionAbort = null;
+          }
+        }
       });
       if (aborted()) return;
       state.authHealRetryAcked = true;
@@ -4629,6 +4818,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state.authHealInFlight = false;
     state.retryTerminalReconcileInFlight = false;
     state.retryTerminalHint = null;
+    state.retryTerminalError = undefined;
     state.activeTurnParams = null;
     if (!state.cancelled) {
       // Revoke in-flight turn generation so suspended preprocessing/recovery exits immediately after feed drops or errors.
