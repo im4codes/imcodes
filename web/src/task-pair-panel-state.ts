@@ -13,6 +13,7 @@
  * storage no longer loses it on a resize.
  */
 import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY } from '@shared/task-pair.js';
+import { getDomRectToLayoutScale } from './ui-scale.js';
 
 /** The key prefix of the per-sub-session map an earlier version wrote; it is no longer used and is removed once per page load. */
 export const LEGACY_SESSION_MAP_KEY_PREFIX = `${TASK_PAIR_STATUS_PANEL_STORAGE_KEY}.sessions` as const;
@@ -30,6 +31,15 @@ export const NARROW_SCOPED_PANE_MIN_WIDTH_PX = 680;
 /** True when a real laid-out scoped `.chat-main` width (`> 0`) is too narrow for side-by-side docking. */
 export function isNarrowScopedPaneWidth(width: number | undefined): boolean {
   return typeof width === 'number' && Number.isFinite(width) && width > 0 && width < NARROW_SCOPED_PANE_MIN_WIDTH_PX;
+}
+
+/** Measure `.chat-main` width in unzoomed CSS layout pixels; returns `0` when unmeasured (e.g. jsdom `0px`). */
+export function measurePaneLayoutWidth(el: HTMLElement): number {
+  if (el.clientWidth > 0) return el.clientWidth;
+  const rectWidth = el.getBoundingClientRect().width;
+  if (!(rectWidth > 0)) return 0;
+  const scale = getDomRectToLayoutScale(el);
+  return scale > 0 && Number.isFinite(scale) ? rectWidth / scale : rectWidth;
 }
 
 /** The server-wide flag of the main chat (and of every desktop/tablet panel). */

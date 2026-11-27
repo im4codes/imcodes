@@ -47,12 +47,14 @@ import {
   cleanLegacyTaskPairPanelKeysOnce,
   isNarrowScopedPaneWidth,
   isPhoneScreen,
+  measurePaneLayoutWidth,
   readServerWideChoice,
   resolveTaskPairPanelCollapsed,
   serverWideStorageKey,
   usesVisitScopedChoice,
   writeServerWideChoice,
 } from '../task-pair-panel-state.js';
+import { UI_SCALE_EVENT } from '../ui-scale.js';
 
 /** Kept for callers and tests: the server-wide flag's key (see task-pair-panel-state.ts). */
 export const collapsedStorageKey = serverWideStorageKey;
@@ -384,7 +386,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
   // inline sub-window shows the strip without touching the choice. On narrow mobile main chat (no scopeSessionId), expanding uses fullscreen
   // overlay so inline cramped measurement / --task-pair-panel-max-h must not collapse or clip it; on expanded mobile (>= 720px), main chat docks right in .chat-main.
-  const usesScopedPaneWidth = !isMobile && Boolean(scopeSessionId);
+  const usesScopedPaneWidth = (!isMobile || isExpandedMobile) && Boolean(scopeSessionId);
   const usesInlineMobileFit = isMobile && Boolean(scopeSessionId);
   const baseCollapsed = narrowScoped
     ? (narrowVisitChoice !== undefined ? narrowVisitChoice : true)
@@ -442,7 +444,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       return undefined;
     }
     const measure = () => {
-      const next = isNarrowScopedPaneWidth(mainEl.getBoundingClientRect().width);
+      const next = isNarrowScopedPaneWidth(measurePaneLayoutWidth(mainEl));
       if (prevNarrowRef.current !== next) {
         prevNarrowRef.current = next;
         setNarrowScoped(next);
@@ -453,9 +455,11 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
     observer?.observe(mainEl);
     window.addEventListener('resize', measure);
+    window.addEventListener(UI_SCALE_EVENT, measure);
     return () => {
       observer?.disconnect();
       window.removeEventListener('resize', measure);
+      window.removeEventListener(UI_SCALE_EVENT, measure);
     };
   }, [usesScopedPaneWidth, hasRows, collapsed, mobileAnchor]);
   useLayoutEffect(() => {
