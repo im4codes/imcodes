@@ -309,7 +309,9 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       await syncVoiceHotwordsFromServer();
       expect(fetchRecord).not.toHaveBeenCalled();
 
-      // Now confirm user-1 and test full bidirectional LWW sync + legacy migration + tombstones + per-scope isolation
+      // Confirm user-1 only AFTER mocking serverState, and seed legacy local data prior to first server sync
+      resetVoiceHotwordsScopeForTesting();
+      localStorage.clear();
       setVoiceHotwordsAuthScope({ userId: 'user-1', baseUrl: 'https://sync.example' });
       setGlobalVoiceHotwordsRaw('LegacyGlobal');
       setProjectVoiceHotwordsRaw('srv:srv-1::app', 'LegacyProj');
@@ -349,6 +351,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
         return structuredClone(serverState);
       });
 
+      registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
       await syncVoiceHotwordsFromServer();
 
       // Oversized & 400-rejected project MUST keep local raw WITHOUT blocking user/share migration!
@@ -446,6 +449,106 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
     } finally {
       configureExpectedUserId(null);
       globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('handles 6-minute-fast clocks across confirmed clears, stale offline resurrection, recoverable capacity retries, and serverId+prefix keys', async () => {
+    vi.useFakeTimers();
+    try {
+      const serverBaseNow = Date.now();
+      let serverRev = 100;
+      const nextRev = () => {
+        serverRev += 1;
+        return serverRev;
+      };
+      const srv: any = {
+        version: 1,
+        user: { raw: 'InitialUser', updatedAt: serverRev, source: 'web' },
+        projects: {},
+        shareWithOthers: { enabled: true, updatedAt: serverRev },
+      };
+      let simulateCapacityFull = false;
+
+      const fetchRecord = vi.fn(async () => structuredClone(srv));
+      const updateRecord = vi.fn(async (payload: any) => {
+        if (simulateCapacityFull && payload.scope === 'project') {
+          const err = new Error('payload_too_large') as Error & { status: number; code: string };
+          err.status = 400;
+          err.code = 'payload_too_large';
+          throw err;
+        }
+        if (payload.scope === 'user') {
+          if (payload.baseUpdatedAt === undefined || payload.baseUpdatedAt === srv.user.updatedAt) {
+            srv.user = { raw: payload.raw, updatedAt: nextRev(), source: 'web' };
+          }
+        } else if (payload.scope === 'project') {
+          const curTs = srv.projects[payload.projectKey]?.updatedAt ?? 0;
+          if (payload.baseUpdatedAt === undefined || payload.baseUpdatedAt === curTs) {
+            srv.projects[payload.projectKey] = { raw: payload.raw, updatedAt: nextRev(), source: 'web' };
+          }
+        } else if (payload.scope === 'share') {
+          if (payload.baseUpdatedAt === undefined || payload.baseUpdatedAt === srv.shareWithOthers.updatedAt) {
+            srv.shareWithOthers = { enabled: payload.enabled, updatedAt: nextRev() };
+          }
+        }
+        return structuredClone(srv);
+      });
+
+      setVoiceHotwordsAuthScope({ userId: 'user-skew', baseUrl: 'https://skew.example' });
+      registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
+      await syncVoiceHotwordsFromServer();
+      expect(getGlobalVoiceHotwordsRaw()).toBe('InitialUser');
+      expect(getShareHotwordsWithOthers()).toBe(true);
+
+      // 1. Device clock is 6 minutes ahead, edits & confirms PUT; server clamps/returns authoritative ts
+      vi.setSystemTime(serverBaseNow + 6 * 60 * 1000);
+      setGlobalVoiceHotwordsRaw('FastClockWord');
+      await flushVoiceHotwordsPush();
+      expect(srv.user.raw).toBe('FastClockWord');
+
+      // MCP clears user hotwords with authoritative ts still < client's fast wall clock!
+      srv.user = { raw: '', updatedAt: nextRev(), source: 'mcp' };
+      await syncVoiceHotwordsFromServer();
+      expect(getGlobalVoiceHotwordsRaw()).toBe('');
+
+      // 2. Fast-clock offline edit based on old version arrives AFTER a later MCP clear & share revoke: MUST NOT resurrect!
+      setGlobalVoiceHotwordsRaw('OfflineFastEdit');
+      setShareHotwordsWithOthers(true);
+      // Simulate server clearing & revoking AFTER client went offline (before push executes)
+      srv.user = { raw: '', updatedAt: nextRev(), source: 'mcp' };
+      srv.shareWithOthers = { enabled: false, updatedAt: nextRev() };
+      await flushVoiceHotwordsPush();
+      expect(srv.user.raw).toBe('');
+      expect(srv.shareWithOthers.enabled).toBe(false);
+      expect(getGlobalVoiceHotwordsRaw()).toBe('');
+      expect(getShareHotwordsWithOthers()).toBe(false);
+
+      // 3. Recoverable capacity conflict (payload_too_large): keeps dirty without 300ms spin, succeeds when space freed
+      simulateCapacityFull = true;
+      const projKeyA = encodeVoiceHotwordProjectKey('srv:other::my-app', 'srv-1')!;
+      const projKeyB = encodeVoiceHotwordProjectKey('srv:other::my-app', 'srv-2')!;
+      expect(projKeyA).toBe('srv:srv-1::srv:other::my-app');
+      expect(projKeyB).toBe('srv:srv-2::srv:other::my-app');
+
+      setProjectVoiceHotwordsRaw(projKeyA, 'PendingValidHotword');
+      setGlobalVoiceHotwordsRaw('IndependentValidGlobal'); // other valid scope succeeds even while project fails capacity!
+      await vi.advanceTimersByTimeAsync(350);
+      expect(srv.user.raw).toBe('IndependentValidGlobal');
+      expect(srv.projects[projKeyA]).toBeUndefined();
+      const callsRightAfterCapacityFail = updateRecord.mock.calls.length;
+
+      // No 300ms spin on capacity error
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(updateRecord.mock.calls.length).toBe(callsRightAfterCapacityFail);
+
+      // Space freed externally -> next sync pull automatically retries the capacity-blocked project & persists it!
+      simulateCapacityFull = false;
+      await syncVoiceHotwordsFromServer();
+      expect(srv.projects[projKeyA]?.raw).toBe('PendingValidHotword');
+      expect(getProjectVoiceHotwordsRaw(projKeyA)).toBe('PendingValidHotword');
+      expect(getProjectVoiceHotwordsRaw(projKeyB)).toBe('');
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

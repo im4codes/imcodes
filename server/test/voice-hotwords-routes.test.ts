@@ -255,6 +255,49 @@ describe('/api/voice-hotwords routes and reserved preference key', () => {
       source: 'web',
     });
 
+    // baseUpdatedAt OCC guard: fast-clock offline edit based on stale version (< current updatedAt) CANNOT resurrect clear
+    const staleBaseRes = await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({
+        scope: 'user',
+        raw: 'FastClockResurrection',
+        mode: 'replace',
+        baseUpdatedAt: 1000,
+        clientUpdatedAt: Date.now() + 360_000,
+      }),
+    });
+    expect((await staleBaseRes.json() as { record: any }).record.user.raw).toBe('');
+
+    // Exact matching baseUpdatedAt succeeds and uses authoritative monotonic server version
+    const matchingBaseRes = await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({
+        scope: 'user',
+        raw: 'AcceptedWithBase',
+        mode: 'replace',
+        baseUpdatedAt: 1300,
+      }),
+    });
+    const matchedJson = await matchingBaseRes.json() as { record: any };
+    expect(matchedJson.record.user.raw).toBe('AcceptedWithBase');
+    expect(matchedJson.record.user.updatedAt).toBeGreaterThan(1300);
+
+    // serverId + projectName with reserved srv:...::... prefix binds serverId cleanly
+    const reservedProjPut = await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({
+        scope: 'project',
+        serverId: 'srv-1',
+        projectName: 'srv:other::app',
+        raw: 'BoundPrefixed',
+        mode: 'replace',
+      }),
+    });
+    expect((await reservedProjPut.json() as { projectKey: string }).projectKey).toBe('srv:srv-1::srv:other::app');
+
     // Repeated share=false advances updatedAt so stale share=true (t=1250) cannot re-enable sharing
     await app.request(VOICE_HOTWORDS_API_PATH, {
       method: 'PUT',

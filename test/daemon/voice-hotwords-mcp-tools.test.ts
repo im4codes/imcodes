@@ -164,14 +164,30 @@ describe('voice hotwords MCP client & tools', () => {
     }, {});
     expect(clearRes).toMatchObject({ status: 'ok', entry: { raw: '' } });
 
-    // Caller with pre-encoded srv:... projectName keeps its encoding without double-prefixing
-    const encodedCallerHandlers = createVoiceHotwordsMcpToolHandlers({
+    // Caller whose raw projectName contains reserved srv:...::... MUST STILL bind its trusted serverId
+    const reservedShapeCallerHandlers = createVoiceHotwordsMcpToolHandlers({
       ...caller,
       projectName: 'srv:srv-remote::custom-proj',
       serverId: 'srv-other',
     }, { getVoiceHotwords: getMock, setVoiceHotwords: setMock });
-    await encodedCallerHandlers.voice_hotwords_get({ scope: 'all' });
-    expect(getMock).toHaveBeenLastCalledWith({}, 'srv:srv-remote::custom-proj');
+    await reservedShapeCallerHandlers.voice_hotwords_get({ scope: 'all' });
+    expect(getMock).toHaveBeenLastCalledWith({}, 'srv:srv-other::srv:srv-remote::custom-proj');
+
+    // Two machines with identical projectName produce distinct bound keys
+    const machineOneHandlers = createVoiceHotwordsMcpToolHandlers({
+      ...caller,
+      projectName: 'codedeck',
+      serverId: 'srv-1',
+    }, { getVoiceHotwords: getMock, setVoiceHotwords: setMock });
+    const machineTwoHandlers = createVoiceHotwordsMcpToolHandlers({
+      ...caller,
+      projectName: 'codedeck',
+      serverId: 'srv-2',
+    }, { getVoiceHotwords: getMock, setVoiceHotwords: setMock });
+    await machineOneHandlers.voice_hotwords_get({ scope: 'project' });
+    expect(getMock).toHaveBeenLastCalledWith({}, 'srv:srv-1::codedeck');
+    await machineTwoHandlers.voice_hotwords_get({ scope: 'project' });
+    expect(getMock).toHaveBeenLastCalledWith({}, 'srv:srv-2::codedeck');
 
     // Unbound projectName: scope='project' fails, scope='all' omits project cleanly
     const unboundHandlers = createVoiceHotwordsMcpToolHandlers({

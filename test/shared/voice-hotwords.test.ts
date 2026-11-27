@@ -263,12 +263,20 @@ describe('shared voice hotwords', () => {
 
   it('encodes, decodes, normalizes, and validates project keys consistently', () => {
     expect(encodeVoiceHotwordProjectKey('codedeck', 'srv-1')).toBe('srv:srv-1::codedeck');
-    expect(encodeVoiceHotwordProjectKey('srv:srv-1::codedeck', 'srv-2')).toBe('srv:srv-1::codedeck');
+    expect(encodeVoiceHotwordProjectKey('codedeck', 'srv-2')).toBe('srv:srv-2::codedeck');
+    // Raw projectName with reserved srv:...::... shape STILL binds the provided serverId
+    expect(encodeVoiceHotwordProjectKey('srv:srv-1::codedeck', 'srv-2')).toBe('srv:srv-2::srv:srv-1::codedeck');
+    expect(decodeVoiceHotwordProjectKey('srv:srv-2::srv:srv-1::codedeck')).toEqual({
+      serverId: 'srv-2',
+      projectName: 'srv:srv-1::codedeck',
+    });
     expect(encodeVoiceHotwordProjectKey('plain-proj', '')).toBe('plain-proj');
     expect(encodeVoiceHotwordProjectKey('   ')).toBeNull();
     expect(decodeVoiceHotwordProjectKey('srv:srv-1::codedeck')).toEqual({ serverId: 'srv-1', projectName: 'codedeck' });
     expect(decodeVoiceHotwordProjectKey('plain-proj')).toEqual({ serverId: null, projectName: 'plain-proj' });
-    expect(normalizeVoiceHotwordProjectKey({ projectName: 'app', serverId: 'srv/a' })).toBe('srv:srv%2Fa::app');
+    expect(normalizeVoiceHotwordProjectKey('srv:srv-1::codedeck')).toBe('srv:srv-1::codedeck');
+    expect(normalizeVoiceHotwordProjectKey('plain-proj')).toBe('plain-proj');
+    expect(normalizeVoiceHotwordProjectKey({ projectName: 'srv:other::app', serverId: 'srv/a' })).toBe('srv:srv%2Fa::srv:other::app');
 
     expect(isValidVoiceHotwordProjectKey('srv:srv-1::codedeck')).toBe(true);
     expect(isValidVoiceHotwordProjectKey('codedeck')).toBe(true);

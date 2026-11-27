@@ -16,6 +16,10 @@ export const VOICE_HOTWORDS_MAX_PROJECT_KEY_CHARS = 256;
 export const VOICE_HOTWORDS_MAX_PROJECTS = 100;
 export const VOICE_HOTWORDS_MAX_STORAGE_BYTES = 60 * 1024;
 export const VOICE_HOTWORDS_MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+export const VOICE_HOTWORDS_CAPACITY_ERRORS = Object.freeze({
+  TOO_MANY_PROJECTS: 'too_many_projects',
+  PAYLOAD_TOO_LARGE: 'payload_too_large',
+} as const);
 
 export const VOICE_HOTWORDS_MCP_TOOLS = Object.freeze({
   GET: 'voice_hotwords_get',
@@ -51,6 +55,7 @@ export interface VoiceHotwordsScopePatch {
   raw: string;
   mode?: 'replace' | 'merge';
   clientUpdatedAt?: number;
+  baseUpdatedAt?: number;
 }
 
 export interface VoiceHotwordsProjectPatch extends VoiceHotwordsScopePatch {
@@ -60,6 +65,7 @@ export interface VoiceHotwordsProjectPatch extends VoiceHotwordsScopePatch {
 export interface VoiceHotwordsSharePatch {
   enabled: boolean;
   clientUpdatedAt?: number;
+  baseUpdatedAt?: number;
 }
 
 export interface VoiceHotwordsPutRequest {
@@ -68,6 +74,7 @@ export interface VoiceHotwordsPutRequest {
   entries?: string[];
   mode?: 'replace' | 'merge';
   clientUpdatedAt?: number;
+  baseUpdatedAt?: number;
   projectKey?: string;
   serverId?: string;
   projectName?: string;
@@ -723,6 +730,11 @@ const SCOPED_PROJECT_SEP = '::';
 const ASCII_CONTROL_TEST_RE = /[\u0000-\u001F\u007F]/;
 const RAW_NON_NEWLINE_CONTROL_RE = /[\u0000-\u0009\u000B-\u001F\u007F]/g;
 
+/**
+ * Encode a raw `(projectName, serverId)` pair into a storage `projectKey`.
+ * Whenever `serverId` is provided, it is ALWAYS bound even if `projectName`
+ * starts with a `srv:...::...` literal substring.
+ */
 export function encodeVoiceHotwordProjectKey(
   projectName: string | null | undefined,
   serverId?: string | null,
@@ -730,14 +742,6 @@ export function encodeVoiceHotwordProjectKey(
   if (typeof projectName !== 'string') return null;
   const trimmedName = projectName.trim();
   if (!trimmedName) return null;
-  if (trimmedName.startsWith(SCOPED_PROJECT_PREFIX)) {
-    const sepIdx = trimmedName.indexOf(SCOPED_PROJECT_SEP, SCOPED_PROJECT_PREFIX.length);
-    if (sepIdx > SCOPED_PROJECT_PREFIX.length) {
-      const innerProject = trimmedName.slice(sepIdx + SCOPED_PROJECT_SEP.length).trim();
-      if (!innerProject) return null;
-      return trimmedName;
-    }
-  }
   const cleanServer = typeof serverId === 'string' ? serverId.trim() : '';
   if (!cleanServer) return trimmedName;
   return `${SCOPED_PROJECT_PREFIX}${encodeURIComponent(cleanServer)}${SCOPED_PROJECT_SEP}${trimmedName}`;
@@ -766,12 +770,34 @@ export function decodeVoiceHotwordProjectKey(
   return { serverId: null, projectName: trimmed };
 }
 
+/**
+ * Normalize an already-encoded stored `projectKey` string or a `{ projectName, serverId }` reference.
+ * String inputs preserve pre-encoded `srv:<encodedServer>::<projectName>` keys and legacy unscoped keys;
+ * object inputs always bind `serverId` via {@link encodeVoiceHotwordProjectKey}.
+ */
 export function normalizeVoiceHotwordProjectKey(projectInput: VoiceHotwordProjectInput): string | null {
   if (!projectInput) return null;
-  if (typeof projectInput === 'string') {
-    return encodeVoiceHotwordProjectKey(projectInput);
+  if (typeof projectInput !== 'string') {
+    return encodeVoiceHotwordProjectKey(projectInput.projectName, projectInput.serverId);
   }
-  return encodeVoiceHotwordProjectKey(projectInput.projectName, projectInput.serverId);
+  const trimmed = projectInput.trim();
+  if (!trimmed) return null;
+  if (trimmed.startsWith(SCOPED_PROJECT_PREFIX)) {
+    const sepIdx = trimmed.indexOf(SCOPED_PROJECT_SEP, SCOPED_PROJECT_PREFIX.length);
+    if (sepIdx > SCOPED_PROJECT_PREFIX.length) {
+      const rawServer = trimmed.slice(SCOPED_PROJECT_PREFIX.length, sepIdx);
+      const innerProject = trimmed.slice(sepIdx + SCOPED_PROJECT_SEP.length).trim();
+      if (!innerProject) return null;
+      let decodedServer = rawServer;
+      try {
+        decodedServer = decodeURIComponent(rawServer);
+      } catch {
+        decodedServer = rawServer;
+      }
+      return encodeVoiceHotwordProjectKey(innerProject, decodedServer);
+    }
+  }
+  return trimmed;
 }
 
 export function isValidVoiceHotwordProjectKey(value: unknown): value is string {
@@ -780,7 +806,7 @@ export function isValidVoiceHotwordProjectKey(value: unknown): value is string {
   if (!trimmed || trimmed !== value) return false;
   if (trimmed.length > VOICE_HOTWORDS_MAX_PROJECT_KEY_CHARS) return false;
   if (ASCII_CONTROL_TEST_RE.test(trimmed)) return false;
-  return encodeVoiceHotwordProjectKey(trimmed) === trimmed;
+  return normalizeVoiceHotwordProjectKey(trimmed) === trimmed;
 }
 
 /** Normalize line endings and strip unsafe non-newline ASCII control chars. */

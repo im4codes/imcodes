@@ -1,5 +1,6 @@
 import type { RemoteVoiceProviderInfo } from '@shared/remote-voice.js';
 import {
+  VOICE_HOTWORDS_CAPACITY_ERRORS,
   VOICE_HOTWORDS_MAX_RAW_CHARS,
   createNullProtoDict,
   decodeVoiceHotwordProjectKey,
@@ -33,6 +34,7 @@ export const VOICE_HOTWORDS_SYNC_META_STORAGE_KEY = 'imcodes_voice_hotwords_sync
 const STORAGE_SCOPE_VERSION = 'v2';
 const STANDALONE_ACCOUNT_SCOPE = '__standalone__';
 const PUSH_DEBOUNCE_MS = 300;
+const CAPACITY_ERROR_SET: ReadonlySet<string> = new Set(Object.values(VOICE_HOTWORDS_CAPACITY_ERRORS));
 
 export interface VoiceHotwordsAuthScope {
   userId?: string | null;
@@ -52,17 +54,26 @@ export interface VoiceHotwordsSyncClient {
 }
 
 interface LocalVoiceHotwordsSyncMeta {
-  userUpdatedAt: number;
+  userEditGen: number;
+  userConfirmedGen: number;
+  userBaseServerUpdatedAt: number;
   userServerUpdatedAt: number;
-  userDirty: boolean;
-  userRejectedAt: number;
-  projects: Record<string, number>;
-  projectsServer: Record<string, number>;
-  dirtyProjects: Record<string, boolean>;
-  rejectedProjects: Record<string, number>;
-  shareUpdatedAt: number;
+  userRejectedEditGen: number;
+  userCapacityBlocked: boolean;
+
+  projEditGen: Record<string, number>;
+  projConfirmedGen: Record<string, number>;
+  projBaseServerUpdatedAt: Record<string, number>;
+  projServerUpdatedAt: Record<string, number>;
+  projRejectedEditGen: Record<string, number>;
+  projCapacityBlocked: Record<string, boolean>;
+
+  shareEditGen: number;
+  shareConfirmedGen: number;
+  shareBaseServerUpdatedAt: number;
   shareServerUpdatedAt: number;
-  shareDirty: boolean;
+  shareCapacityBlocked: boolean;
+
   initialMigrationDone: boolean;
 }
 
@@ -89,34 +100,40 @@ function notifyChange(): void {
 
 function emptySyncMeta(): LocalVoiceHotwordsSyncMeta {
   return {
-    userUpdatedAt: 0,
+    userEditGen: 0,
+    userConfirmedGen: 0,
+    userBaseServerUpdatedAt: 0,
     userServerUpdatedAt: 0,
-    userDirty: false,
-    userRejectedAt: 0,
-    projects: createNullProtoDict<number>(),
-    projectsServer: createNullProtoDict<number>(),
-    dirtyProjects: createNullProtoDict<boolean>(),
-    rejectedProjects: createNullProtoDict<number>(),
-    shareUpdatedAt: 0,
+    userRejectedEditGen: 0,
+    userCapacityBlocked: false,
+    projEditGen: createNullProtoDict<number>(),
+    projConfirmedGen: createNullProtoDict<number>(),
+    projBaseServerUpdatedAt: createNullProtoDict<number>(),
+    projServerUpdatedAt: createNullProtoDict<number>(),
+    projRejectedEditGen: createNullProtoDict<number>(),
+    projCapacityBlocked: createNullProtoDict<boolean>(),
+    shareEditGen: 0,
+    shareConfirmedGen: 0,
+    shareBaseServerUpdatedAt: 0,
     shareServerUpdatedAt: 0,
-    shareDirty: false,
+    shareCapacityBlocked: false,
     initialMigrationDone: false,
   };
 }
 
-function coerceTs(value: unknown): number {
+function coerceNum(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
     ? Math.floor(value)
     : 0;
 }
 
-function coerceTsMap(input: unknown): Record<string, number> {
+function coerceNumMap(input: unknown): Record<string, number> {
   const out = createNullProtoDict<number>();
   if (!input || typeof input !== 'object' || Array.isArray(input)) return out;
   for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
     const cleanKey = normalizeVoiceHotwordProjectKey(k);
-    const ts = coerceTs(v);
-    if (cleanKey && ts > 0) setOwnDictValue(out, cleanKey, ts);
+    const num = coerceNum(v);
+    if (cleanKey && num > 0) setOwnDictValue(out, cleanKey, num);
   }
   return out;
 }
@@ -204,17 +221,23 @@ function readSyncMeta(accountKey: string): LocalVoiceHotwordsSyncMeta {
     const parsed = JSON.parse(raw) as Record<string, unknown> | null;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return emptySyncMeta();
     return {
-      userUpdatedAt: coerceTs(parsed.userUpdatedAt),
-      userServerUpdatedAt: coerceTs(parsed.userServerUpdatedAt),
-      userDirty: parsed.userDirty === true,
-      userRejectedAt: coerceTs(parsed.userRejectedAt),
-      projects: coerceTsMap(parsed.projects),
-      projectsServer: coerceTsMap(parsed.projectsServer),
-      dirtyProjects: coerceBoolMap(parsed.dirtyProjects),
-      rejectedProjects: coerceTsMap(parsed.rejectedProjects),
-      shareUpdatedAt: coerceTs(parsed.shareUpdatedAt),
-      shareServerUpdatedAt: coerceTs(parsed.shareServerUpdatedAt),
-      shareDirty: parsed.shareDirty === true,
+      userEditGen: coerceNum(parsed.userEditGen),
+      userConfirmedGen: coerceNum(parsed.userConfirmedGen),
+      userBaseServerUpdatedAt: coerceNum(parsed.userBaseServerUpdatedAt),
+      userServerUpdatedAt: coerceNum(parsed.userServerUpdatedAt),
+      userRejectedEditGen: coerceNum(parsed.userRejectedEditGen),
+      userCapacityBlocked: parsed.userCapacityBlocked === true,
+      projEditGen: coerceNumMap(parsed.projEditGen),
+      projConfirmedGen: coerceNumMap(parsed.projConfirmedGen),
+      projBaseServerUpdatedAt: coerceNumMap(parsed.projBaseServerUpdatedAt),
+      projServerUpdatedAt: coerceNumMap(parsed.projServerUpdatedAt),
+      projRejectedEditGen: coerceNumMap(parsed.projRejectedEditGen),
+      projCapacityBlocked: coerceBoolMap(parsed.projCapacityBlocked),
+      shareEditGen: coerceNum(parsed.shareEditGen),
+      shareConfirmedGen: coerceNum(parsed.shareConfirmedGen),
+      shareBaseServerUpdatedAt: coerceNum(parsed.shareBaseServerUpdatedAt),
+      shareServerUpdatedAt: coerceNum(parsed.shareServerUpdatedAt),
+      shareCapacityBlocked: parsed.shareCapacityBlocked === true,
       initialMigrationDone: parsed.initialMigrationDone === true,
     };
   } catch {
@@ -229,8 +252,29 @@ function writeSyncMeta(accountKey: string, meta: LocalVoiceHotwordsSyncMeta): vo
   } catch { /* localStorage may be unavailable */ }
 }
 
-function nextMonotonicTimestamp(prevLocalTs: number, serverTs: number): number {
-  return Math.max(Date.now(), prevLocalTs + 1, serverTs + 1);
+function extractApiErrorCode(err: unknown): string | null {
+  if (!err || typeof err !== 'object') return null;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && code) return code;
+  const body = (err as { body?: unknown }).body;
+  if (typeof body === 'string') {
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown };
+      if (typeof parsed.error === 'string') return parsed.error;
+    } catch { /* ignore */ }
+  }
+  const message = (err as { message?: unknown }).message;
+  if (typeof message === 'string') {
+    for (const capCode of CAPACITY_ERROR_SET) {
+      if (message.includes(capCode)) return capCode;
+    }
+  }
+  return null;
+}
+
+function isCapacityError(err: unknown): boolean {
+  const code = extractApiErrorCode(err);
+  return Boolean(code && CAPACITY_ERROR_SET.has(code));
 }
 
 function isClientValidationError(err: unknown): boolean {
@@ -460,9 +504,12 @@ export function setGlobalVoiceHotwordsRaw(raw: string): void {
   if (!snapshot.accountKey) return;
   writeGlobalRawForAccount(snapshot.accountKey, raw);
   const meta = readSyncMeta(snapshot.accountKey);
-  meta.userUpdatedAt = nextMonotonicTimestamp(meta.userUpdatedAt, meta.userServerUpdatedAt);
-  meta.userDirty = true;
-  meta.userRejectedAt = 0;
+  if (meta.userEditGen === meta.userConfirmedGen) {
+    meta.userBaseServerUpdatedAt = meta.userServerUpdatedAt;
+  }
+  meta.userEditGen += 1;
+  meta.userRejectedEditGen = 0;
+  meta.userCapacityBlocked = false;
   writeSyncMeta(snapshot.accountKey, meta);
   notifyChange();
   scheduleVoiceHotwordsPush(snapshot);
@@ -489,13 +536,14 @@ export function setProjectVoiceHotwordsRaw(projectKey: string | VoiceHotwordProj
   }
   writeProjectsMapForAccount(snapshot.accountKey, map);
   const meta = readSyncMeta(snapshot.accountKey);
-  const nextTs = nextMonotonicTimestamp(
-    getOwnDictValue(meta.projects, key) ?? 0,
-    getOwnDictValue(meta.projectsServer, key) ?? 0,
-  );
-  setOwnDictValue(meta.projects, key, nextTs);
-  setOwnDictValue(meta.dirtyProjects, key, true);
-  deleteOwnDictKey(meta.rejectedProjects, key);
+  const editGen = getOwnDictValue(meta.projEditGen, key) ?? 0;
+  const confirmedGen = getOwnDictValue(meta.projConfirmedGen, key) ?? 0;
+  if (editGen === confirmedGen) {
+    setOwnDictValue(meta.projBaseServerUpdatedAt, key, getOwnDictValue(meta.projServerUpdatedAt, key) ?? 0);
+  }
+  setOwnDictValue(meta.projEditGen, key, editGen + 1);
+  deleteOwnDictKey(meta.projRejectedEditGen, key);
+  deleteOwnDictKey(meta.projCapacityBlocked, key);
   writeSyncMeta(snapshot.accountKey, meta);
   notifyChange();
   scheduleVoiceHotwordsPush(snapshot);
@@ -517,17 +565,20 @@ export function setShareHotwordsWithOthers(enabled: boolean): void {
   if (!snapshot.accountKey) return;
   writeShareForAccount(snapshot.accountKey, enabled);
   const meta = readSyncMeta(snapshot.accountKey);
-  meta.shareUpdatedAt = nextMonotonicTimestamp(meta.shareUpdatedAt, meta.shareServerUpdatedAt);
-  meta.shareDirty = true;
+  if (meta.shareEditGen === meta.shareConfirmedGen) {
+    meta.shareBaseServerUpdatedAt = meta.shareServerUpdatedAt;
+  }
+  meta.shareEditGen += 1;
+  meta.shareCapacityBlocked = false;
   writeSyncMeta(snapshot.accountKey, meta);
   notifyChange();
   scheduleVoiceHotwordsPush(snapshot);
 }
 
 type PendingScopePush =
-  | { kind: 'user'; ts: number; payload: VoiceHotwordsPutRequest }
-  | { kind: 'project'; projectKey: string; ts: number; payload: VoiceHotwordsPutRequest }
-  | { kind: 'share'; ts: number; payload: VoiceHotwordsPutRequest };
+  | { kind: 'user'; editGen: number; baseUpdatedAt: number; payload: VoiceHotwordsPutRequest }
+  | { kind: 'project'; projectKey: string; editGen: number; baseUpdatedAt: number; payload: VoiceHotwordsPutRequest }
+  | { kind: 'share'; editGen: number; baseUpdatedAt: number; payload: VoiceHotwordsPutRequest };
 
 function collectDirtyScopePushes(accountKey: string, meta: LocalVoiceHotwordsSyncMeta): PendingScopePush[] {
   const out: PendingScopePush[] = [];
@@ -535,37 +586,59 @@ function collectDirtyScopePushes(accountKey: string, meta: LocalVoiceHotwordsSyn
   const localProjects = readProjectsMapForAccount(accountKey);
   const localShare = readShareForAccount(accountKey);
 
-  if (meta.userDirty && meta.userRejectedAt !== meta.userUpdatedAt) {
-    if (localGlobal.length <= VOICE_HOTWORDS_MAX_RAW_CHARS) {
-      const ts = meta.userUpdatedAt || 1;
-      out.push({
-        kind: 'user',
-        ts,
-        payload: { scope: 'user', raw: localGlobal, mode: 'replace', clientUpdatedAt: ts },
-      });
-    }
-  }
-
-  for (const key of Object.keys(meta.dirtyProjects)) {
-    if (!getOwnDictValue(meta.dirtyProjects, key)) continue;
-    const raw = getOwnDictValue(localProjects, key) ?? '';
-    const ts = getOwnDictValue(meta.projects, key) ?? 1;
-    if (getOwnDictValue(meta.rejectedProjects, key) === ts) continue;
-    if (raw.length > VOICE_HOTWORDS_MAX_RAW_CHARS) continue;
+  if (
+    meta.userEditGen > meta.userConfirmedGen
+    && meta.userRejectedEditGen !== meta.userEditGen
+    && !meta.userCapacityBlocked
+    && localGlobal.length <= VOICE_HOTWORDS_MAX_RAW_CHARS
+  ) {
     out.push({
-      kind: 'project',
-      projectKey: key,
-      ts,
-      payload: { scope: 'project', projectKey: key, raw, mode: 'replace', clientUpdatedAt: ts },
+      kind: 'user',
+      editGen: meta.userEditGen,
+      baseUpdatedAt: meta.userBaseServerUpdatedAt,
+      payload: {
+        scope: 'user',
+        raw: localGlobal,
+        mode: 'replace',
+        baseUpdatedAt: meta.userBaseServerUpdatedAt,
+      },
     });
   }
 
-  if (meta.shareDirty) {
-    const ts = meta.shareUpdatedAt || 1;
+  for (const key of Object.keys(meta.projEditGen)) {
+    const editGen = getOwnDictValue(meta.projEditGen, key) ?? 0;
+    const confirmedGen = getOwnDictValue(meta.projConfirmedGen, key) ?? 0;
+    if (editGen <= confirmedGen) continue;
+    if (getOwnDictValue(meta.projRejectedEditGen, key) === editGen) continue;
+    if (getOwnDictValue(meta.projCapacityBlocked, key) === true) continue;
+    const raw = getOwnDictValue(localProjects, key) ?? '';
+    if (raw.length > VOICE_HOTWORDS_MAX_RAW_CHARS) continue;
+    const baseUpdatedAt = getOwnDictValue(meta.projBaseServerUpdatedAt, key) ?? 0;
+    out.push({
+      kind: 'project',
+      projectKey: key,
+      editGen,
+      baseUpdatedAt,
+      payload: {
+        scope: 'project',
+        projectKey: key,
+        raw,
+        mode: 'replace',
+        baseUpdatedAt,
+      },
+    });
+  }
+
+  if (meta.shareEditGen > meta.shareConfirmedGen && !meta.shareCapacityBlocked) {
     out.push({
       kind: 'share',
-      ts,
-      payload: { scope: 'share', enabled: localShare, clientUpdatedAt: ts },
+      editGen: meta.shareEditGen,
+      baseUpdatedAt: meta.shareBaseServerUpdatedAt,
+      payload: {
+        scope: 'share',
+        enabled: localShare,
+        baseUpdatedAt: meta.shareBaseServerUpdatedAt,
+      },
     });
   }
 
@@ -573,9 +646,13 @@ function collectDirtyScopePushes(accountKey: string, meta: LocalVoiceHotwordsSyn
 }
 
 type ConfirmedScopePush =
-  | { kind: 'user'; ts: number }
-  | { kind: 'project'; projectKey: string; ts: number }
-  | { kind: 'share'; ts: number };
+  | { kind: 'user'; editGen: number; baseUpdatedAt: number }
+  | { kind: 'project'; projectKey: string; editGen: number; baseUpdatedAt: number }
+  | { kind: 'share'; editGen: number; baseUpdatedAt: number };
+
+function rawDiffers(a: string, b: string): boolean {
+  return normalizeVoiceHotwordRawText(a) !== normalizeVoiceHotwordRawText(b) || (!a && b !== '');
+}
 
 function reconcileWithServerRecord(
   accountKey: string,
@@ -584,6 +661,13 @@ function reconcileWithServerRecord(
   markInitialMigrated = false,
 ): { pendingPushes: PendingScopePush[]; changedUi: boolean } {
   const meta = readSyncMeta(accountKey);
+  if (markInitialMigrated) {
+    // Re-enable capacity-blocked scopes once a fresh server snapshot arrives
+    meta.userCapacityBlocked = false;
+    meta.shareCapacityBlocked = false;
+    meta.projCapacityBlocked = createNullProtoDict<boolean>();
+  }
+
   let localGlobal = readGlobalRawForAccount(accountKey);
   const localProjects = readProjectsMapForAccount(accountKey);
   let localShare = readShareForAccount(accountKey);
@@ -593,149 +677,178 @@ function reconcileWithServerRecord(
   let projectsChanged = false;
   let shareChanged = false;
 
-  if (confirmed?.kind === 'user' && meta.userUpdatedAt === confirmed.ts) {
-    meta.userDirty = false;
-  } else if (confirmed?.kind === 'project' && (getOwnDictValue(meta.projects, confirmed.projectKey) ?? 0) === confirmed.ts) {
-    deleteOwnDictKey(meta.dirtyProjects, confirmed.projectKey);
-  } else if (confirmed?.kind === 'share' && meta.shareUpdatedAt === confirmed.ts) {
-    meta.shareDirty = false;
-  }
-
   // 1. User global scope
-  const localUserTs = meta.userUpdatedAt || (localGlobal ? 1 : 0);
-  const serverUserTs = server.user.updatedAt;
-  meta.userServerUpdatedAt = serverUserTs;
-  const userConfirmedPush = confirmed?.kind === 'user' && meta.userUpdatedAt === confirmed.ts;
+  {
+    const srvRaw = server.user.raw;
+    const srvTs = server.user.updatedAt;
+    const isConfirmedForCurrentEdit = confirmed?.kind === 'user' && meta.userEditGen === confirmed.editGen;
+    meta.userServerUpdatedAt = srvTs;
 
-  if (serverUserTs > localUserTs) {
-    if (normalizeVoiceHotwordRawText(server.user.raw) !== normalizeVoiceHotwordRawText(localGlobal) || (!server.user.raw && localGlobal !== '')) {
-      localGlobal = server.user.raw;
-      globalChanged = true;
-      changedUi = true;
-    }
-    meta.userUpdatedAt = serverUserTs;
-    meta.userDirty = false;
-  } else if (serverUserTs === localUserTs && (userConfirmedPush || !meta.userDirty)) {
-    // Authoritative server wins ties; align both content and confirmed ts
-    if (serverUserTs > 0 && (normalizeVoiceHotwordRawText(server.user.raw) !== normalizeVoiceHotwordRawText(localGlobal) || (!server.user.raw && localGlobal !== ''))) {
-      localGlobal = server.user.raw;
-      globalChanged = true;
-      changedUi = true;
-    }
-    meta.userUpdatedAt = serverUserTs;
-    meta.userDirty = false;
-  } else if ((meta.userDirty || (!meta.initialMigrationDone && localGlobal.length > 0 && serverUserTs === 0)) && localGlobal.length <= VOICE_HOTWORDS_MAX_RAW_CHARS) {
-    if (meta.userRejectedAt === 0 || meta.userUpdatedAt > meta.userRejectedAt) {
-      const pushTs = nextMonotonicTimestamp(localUserTs, serverUserTs);
-      if (!meta.userDirty) {
-        meta.userUpdatedAt = pushTs;
-        meta.userDirty = true;
+    if (isConfirmedForCurrentEdit) {
+      if (rawDiffers(srvRaw, localGlobal)) {
+        localGlobal = srvRaw;
+        globalChanged = true;
+        changedUi = true;
       }
+      meta.userConfirmedGen = meta.userEditGen;
+      meta.userBaseServerUpdatedAt = srvTs;
+      meta.userRejectedEditGen = 0;
+      meta.userCapacityBlocked = false;
+    } else if (confirmed?.kind === 'user' && meta.userEditGen > confirmed.editGen) {
+      // User kept editing mid-flight: advance base only if our in-flight write succeeded from prev base
+      if (meta.userBaseServerUpdatedAt === confirmed.baseUpdatedAt && srvTs > confirmed.baseUpdatedAt) {
+        meta.userBaseServerUpdatedAt = srvTs;
+      }
+    } else if (meta.userEditGen > meta.userConfirmedGen) {
+      // Pending offline edit: only survives if server did NOT move ahead of its base version
+      if (srvTs > meta.userBaseServerUpdatedAt) {
+        if (rawDiffers(srvRaw, localGlobal)) {
+          localGlobal = srvRaw;
+          globalChanged = true;
+          changedUi = true;
+        }
+        meta.userConfirmedGen = meta.userEditGen;
+        meta.userBaseServerUpdatedAt = srvTs;
+        meta.userCapacityBlocked = false;
+      }
+    } else if (!meta.initialMigrationDone && localGlobal.length > 0 && srvTs === 0) {
+      // Unmigrated legacy local value against uninitialized server
+      if (localGlobal.length <= VOICE_HOTWORDS_MAX_RAW_CHARS) {
+        meta.userEditGen += 1;
+        meta.userBaseServerUpdatedAt = 0;
+      }
+    } else {
+      // Clean synced state (or unmigrated legacy against already-initialized server)
+      if (rawDiffers(srvRaw, localGlobal)) {
+        localGlobal = srvRaw;
+        globalChanged = true;
+        changedUi = true;
+      }
+      meta.userBaseServerUpdatedAt = srvTs;
     }
-  } else if (serverUserTs > 0) {
-    meta.userUpdatedAt = serverUserTs;
   }
 
-  // 2. Project scopes (null-proto union across local, sync meta, server)
+  // 2. Project scopes (null-proto union across local, sync meta, and server)
   const allProjectKeys = new Set([
     ...Object.keys(localProjects),
-    ...Object.keys(meta.projects),
+    ...Object.keys(meta.projEditGen),
+    ...Object.keys(meta.projServerUpdatedAt),
     ...Object.keys(server.projects),
   ]);
   for (const key of allProjectKeys) {
     const localRaw = getOwnDictValue(localProjects, key) ?? '';
-    const isDirty = getOwnDictValue(meta.dirtyProjects, key) === true;
-    const localProjTs = getOwnDictValue(meta.projects, key) ?? (localRaw ? 1 : 0);
-    const wasConfirmedOnServer = (getOwnDictValue(meta.projectsServer, key) ?? 0) > 0;
-    const isRejected = localProjTs > 0 && (getOwnDictValue(meta.rejectedProjects, key) ?? 0) >= localProjTs;
+    const editGen = getOwnDictValue(meta.projEditGen, key) ?? 0;
+    const confirmedGen = getOwnDictValue(meta.projConfirmedGen, key) ?? 0;
+    const isDirty = editGen > confirmedGen;
+    const prevBaseTs = getOwnDictValue(meta.projBaseServerUpdatedAt, key) ?? 0;
+    const wasConfirmedOnServer = (getOwnDictValue(meta.projServerUpdatedAt, key) ?? 0) > 0;
+    const isRejected = editGen > 0 && (getOwnDictValue(meta.projRejectedEditGen, key) ?? 0) >= editGen;
     const isOversizedLocal = localRaw.length > VOICE_HOTWORDS_MAX_RAW_CHARS;
-    const serverEntry = getOwnDictValue(server.projects, key);
-    const serverProjTs = serverEntry?.updatedAt ?? 0;
-    const serverRaw = serverEntry?.raw ?? '';
-    const projConfirmedPush = confirmed?.kind === 'project' && confirmed.projectKey === key && (getOwnDictValue(meta.projects, key) ?? 0) === confirmed.ts;
 
-    if (serverProjTs > 0) {
-      setOwnDictValue(meta.projectsServer, key, serverProjTs);
+    const srvEntry = getOwnDictValue(server.projects, key);
+    const srvTs = srvEntry?.updatedAt ?? 0;
+    const srvRaw = srvEntry?.raw ?? '';
+
+    const isConfirmedForCurrentEdit = confirmed?.kind === 'project'
+      && confirmed.projectKey === key
+      && editGen === confirmed.editGen;
+
+    if (srvTs > 0) {
+      setOwnDictValue(meta.projServerUpdatedAt, key, srvTs);
     } else if (!isDirty && !isRejected && !isOversizedLocal) {
-      deleteOwnDictKey(meta.projectsServer, key);
+      deleteOwnDictKey(meta.projServerUpdatedAt, key);
     }
 
-    if (serverProjTs > localProjTs) {
-      if (normalizeVoiceHotwordRawText(serverRaw) !== normalizeVoiceHotwordRawText(localRaw) || (!serverRaw && localRaw !== '')) {
-        if (!serverRaw) {
-          deleteOwnDictKey(localProjects, key);
-        } else {
-          setOwnDictValue(localProjects, key, serverRaw);
+    if (isConfirmedForCurrentEdit) {
+      if (rawDiffers(srvRaw, localRaw)) {
+        if (!srvRaw) deleteOwnDictKey(localProjects, key);
+        else setOwnDictValue(localProjects, key, srvRaw);
+        projectsChanged = true;
+        changedUi = true;
+      }
+      setOwnDictValue(meta.projConfirmedGen, key, editGen);
+      setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
+      deleteOwnDictKey(meta.projRejectedEditGen, key);
+      deleteOwnDictKey(meta.projCapacityBlocked, key);
+    } else if (confirmed?.kind === 'project' && confirmed.projectKey === key && editGen > confirmed.editGen) {
+      if (prevBaseTs === confirmed.baseUpdatedAt && srvTs > confirmed.baseUpdatedAt) {
+        setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
+      }
+    } else if (isDirty) {
+      if (srvTs > prevBaseTs) {
+        if (rawDiffers(srvRaw, localRaw)) {
+          if (!srvRaw) deleteOwnDictKey(localProjects, key);
+          else setOwnDictValue(localProjects, key, srvRaw);
+          projectsChanged = true;
+          changedUi = true;
         }
+        setOwnDictValue(meta.projConfirmedGen, key, editGen);
+        setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
+        deleteOwnDictKey(meta.projCapacityBlocked, key);
+      }
+    } else if (!meta.initialMigrationDone && localRaw.length > 0 && srvTs === 0) {
+      if (!isOversizedLocal) {
+        setOwnDictValue(meta.projEditGen, key, editGen + 1);
+        setOwnDictValue(meta.projBaseServerUpdatedAt, key, 0);
+      }
+    } else if (srvTs > 0) {
+      if (rawDiffers(srvRaw, localRaw)) {
+        if (!srvRaw) deleteOwnDictKey(localProjects, key);
+        else setOwnDictValue(localProjects, key, srvRaw);
         projectsChanged = true;
         changedUi = true;
       }
-      setOwnDictValue(meta.projects, key, serverProjTs);
-      deleteOwnDictKey(meta.dirtyProjects, key);
-      deleteOwnDictKey(meta.rejectedProjects, key);
-    } else if (serverProjTs === localProjTs && (projConfirmedPush || !isDirty)) {
-      if (serverProjTs > 0 && (normalizeVoiceHotwordRawText(serverRaw) !== normalizeVoiceHotwordRawText(localRaw) || (!serverRaw && localRaw !== ''))) {
-        if (!serverRaw) {
-          deleteOwnDictKey(localProjects, key);
-        } else {
-          setOwnDictValue(localProjects, key, serverRaw);
-        }
-        projectsChanged = true;
-        changedUi = true;
-      } else if (serverProjTs === 0 && meta.initialMigrationDone && wasConfirmedOnServer && !isDirty && !isRejected && !isOversizedLocal && localRaw !== '') {
-        // Already-synced cache no longer exists on server; avoid silently re-creating removed key
-        deleteOwnDictKey(localProjects, key);
-        deleteOwnDictKey(meta.projects, key);
-        projectsChanged = true;
-        changedUi = true;
-      }
-      if (serverProjTs > 0) {
-        setOwnDictValue(meta.projects, key, serverProjTs);
-      }
-      deleteOwnDictKey(meta.dirtyProjects, key);
-    } else if (isDirty || (!meta.initialMigrationDone && serverProjTs === 0 && localRaw.length > 0)) {
-      if (!isDirty && !isRejected && !isOversizedLocal) {
-        const pushTs = nextMonotonicTimestamp(localProjTs, serverProjTs);
-        setOwnDictValue(meta.projects, key, pushTs);
-        setOwnDictValue(meta.dirtyProjects, key, true);
-      }
-    } else if (serverProjTs === 0 && meta.initialMigrationDone && wasConfirmedOnServer && !isRejected && !isOversizedLocal && localRaw !== '') {
+      setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
+    } else if (srvTs === 0 && meta.initialMigrationDone && wasConfirmedOnServer && !isRejected && !isOversizedLocal && localRaw !== '') {
       deleteOwnDictKey(localProjects, key);
-      deleteOwnDictKey(meta.projects, key);
+      deleteOwnDictKey(meta.projBaseServerUpdatedAt, key);
       projectsChanged = true;
       changedUi = true;
     }
   }
 
   // 3. Share consent scope
-  const localShareTs = meta.shareUpdatedAt || (localShare ? 1 : 0);
-  const serverShareTs = server.shareWithOthers.updatedAt;
-  meta.shareServerUpdatedAt = serverShareTs;
-  const shareConfirmedPush = confirmed?.kind === 'share' && meta.shareUpdatedAt === confirmed.ts;
+  {
+    const srvEnabled = server.shareWithOthers.enabled;
+    const srvTs = server.shareWithOthers.updatedAt;
+    const isConfirmedForCurrentEdit = confirmed?.kind === 'share' && meta.shareEditGen === confirmed.editGen;
+    meta.shareServerUpdatedAt = srvTs;
 
-  if (serverShareTs > localShareTs) {
-    if (server.shareWithOthers.enabled !== localShare) {
-      localShare = server.shareWithOthers.enabled;
-      shareChanged = true;
-      changedUi = true;
+    if (isConfirmedForCurrentEdit) {
+      if (srvEnabled !== localShare) {
+        localShare = srvEnabled;
+        shareChanged = true;
+        changedUi = true;
+      }
+      meta.shareConfirmedGen = meta.shareEditGen;
+      meta.shareBaseServerUpdatedAt = srvTs;
+      meta.shareCapacityBlocked = false;
+    } else if (confirmed?.kind === 'share' && meta.shareEditGen > confirmed.editGen) {
+      if (meta.shareBaseServerUpdatedAt === confirmed.baseUpdatedAt && srvTs > confirmed.baseUpdatedAt) {
+        meta.shareBaseServerUpdatedAt = srvTs;
+      }
+    } else if (meta.shareEditGen > meta.shareConfirmedGen) {
+      if (srvTs > meta.shareBaseServerUpdatedAt) {
+        if (srvEnabled !== localShare) {
+          localShare = srvEnabled;
+          shareChanged = true;
+          changedUi = true;
+        }
+        meta.shareConfirmedGen = meta.shareEditGen;
+        meta.shareBaseServerUpdatedAt = srvTs;
+        meta.shareCapacityBlocked = false;
+      }
+    } else if (!meta.initialMigrationDone && localShare && srvTs === 0) {
+      meta.shareEditGen += 1;
+      meta.shareBaseServerUpdatedAt = 0;
+    } else {
+      if (srvTs > 0 && srvEnabled !== localShare) {
+        localShare = srvEnabled;
+        shareChanged = true;
+        changedUi = true;
+      }
+      meta.shareBaseServerUpdatedAt = srvTs;
     }
-    meta.shareUpdatedAt = serverShareTs;
-    meta.shareDirty = false;
-  } else if (serverShareTs === localShareTs && (shareConfirmedPush || !meta.shareDirty)) {
-    if (serverShareTs > 0 && server.shareWithOthers.enabled !== localShare) {
-      localShare = server.shareWithOthers.enabled;
-      shareChanged = true;
-      changedUi = true;
-    }
-    meta.shareUpdatedAt = serverShareTs;
-    meta.shareDirty = false;
-  } else if (meta.shareDirty || (!meta.initialMigrationDone && localShare && serverShareTs === 0)) {
-    if (!meta.shareDirty) {
-      meta.shareUpdatedAt = nextMonotonicTimestamp(localShareTs, serverShareTs);
-      meta.shareDirty = true;
-    }
-  } else if (serverShareTs > 0) {
-    meta.shareUpdatedAt = serverShareTs;
   }
 
   if (markInitialMigrated) {
@@ -772,36 +885,47 @@ async function executeIsolatedPushes(
       });
       if (!serverRecord || !isVoiceHotwordsScopeValid(snapshot)) return false;
       const confirmed: ConfirmedScopePush = item.kind === 'user'
-        ? { kind: 'user', ts: item.ts }
+        ? { kind: 'user', editGen: item.editGen, baseUpdatedAt: item.baseUpdatedAt }
         : item.kind === 'share'
-          ? { kind: 'share', ts: item.ts }
-          : { kind: 'project', projectKey: item.projectKey, ts: item.ts };
+          ? { kind: 'share', editGen: item.editGen, baseUpdatedAt: item.baseUpdatedAt }
+          : { kind: 'project', projectKey: item.projectKey, editGen: item.editGen, baseUpdatedAt: item.baseUpdatedAt };
       const post = reconcileWithServerRecord(accountKey, serverRecord, confirmed);
       if (post.changedUi) notifyChange();
-      // Check if this specific scope got re-dirtied while its PUT was in flight
+
       const latestMeta = readSyncMeta(accountKey);
       if (
-        (item.kind === 'user' && latestMeta.userDirty)
-        || (item.kind === 'share' && latestMeta.shareDirty)
-        || (item.kind === 'project' && getOwnDictValue(latestMeta.dirtyProjects, item.projectKey) === true)
+        (item.kind === 'user' && latestMeta.userEditGen > latestMeta.userConfirmedGen && !latestMeta.userCapacityBlocked && latestMeta.userRejectedEditGen !== latestMeta.userEditGen)
+        || (item.kind === 'share' && latestMeta.shareEditGen > latestMeta.shareConfirmedGen && !latestMeta.shareCapacityBlocked)
+        || (item.kind === 'project'
+          && (getOwnDictValue(latestMeta.projEditGen, item.projectKey) ?? 0) > (getOwnDictValue(latestMeta.projConfirmedGen, item.projectKey) ?? 0)
+          && !getOwnDictValue(latestMeta.projCapacityBlocked, item.projectKey)
+          && getOwnDictValue(latestMeta.projRejectedEditGen, item.projectKey) !== getOwnDictValue(latestMeta.projEditGen, item.projectKey))
       ) {
         hasRemainingDirtyEdit = true;
       }
     } catch (err) {
       if (!isVoiceHotwordsScopeValid(snapshot)) return false;
-      if (isClientValidationError(err)) {
-        // Isolate 400 validation errors to THIS scope only without dropping local text or blocking other scopes
+      if (isCapacityError(err)) {
+        // Recoverable account-wide capacity conflict: preserve dirty editGen, pause retry until next fresh server snapshot (no 300ms spin)
         const latestMeta = readSyncMeta(accountKey);
-        if (item.kind === 'user' && latestMeta.userUpdatedAt === item.ts) {
-          latestMeta.userRejectedAt = item.ts;
-          latestMeta.userDirty = false;
-        } else if (item.kind === 'project' && getOwnDictValue(latestMeta.projects, item.projectKey) === item.ts) {
-          setOwnDictValue(latestMeta.rejectedProjects, item.projectKey, item.ts);
-          deleteOwnDictKey(latestMeta.dirtyProjects, item.projectKey);
+        if (item.kind === 'user' && latestMeta.userEditGen === item.editGen) {
+          latestMeta.userCapacityBlocked = true;
+        } else if (item.kind === 'share' && latestMeta.shareEditGen === item.editGen) {
+          latestMeta.shareCapacityBlocked = true;
+        } else if (item.kind === 'project' && (getOwnDictValue(latestMeta.projEditGen, item.projectKey) ?? 0) === item.editGen) {
+          setOwnDictValue(latestMeta.projCapacityBlocked, item.projectKey, true);
+        }
+        writeSyncMeta(accountKey, latestMeta);
+      } else if (isClientValidationError(err)) {
+        // Non-recoverable scope validation error: quarantine only this editGen until user edits again
+        const latestMeta = readSyncMeta(accountKey);
+        if (item.kind === 'user' && latestMeta.userEditGen === item.editGen) {
+          latestMeta.userRejectedEditGen = item.editGen;
+        } else if (item.kind === 'project' && (getOwnDictValue(latestMeta.projEditGen, item.projectKey) ?? 0) === item.editGen) {
+          setOwnDictValue(latestMeta.projRejectedEditGen, item.projectKey, item.editGen);
         }
         writeSyncMeta(accountKey, latestMeta);
       }
-      // Transient/network errors keep dirty=true for this scope while allowing other scopes to proceed
     }
   }
   return hasRemainingDirtyEdit;
