@@ -144,7 +144,7 @@ void Qwen3StreamingPipeline::run_loop() {
       const std::string combined = join_transcript_segments(committed_base, active_text);
       if (is_final_pass || (!combined.empty() && combined != last_emitted_text)) {
         last_emitted_text = combined;
-        emit_result_fn_({combined, is_final_pass});
+        emit_result_fn_({combined, is_final_pass, {}});
       }
       return;
     }
@@ -167,7 +167,7 @@ void Qwen3StreamingPipeline::run_loop() {
         if (is_final_pass || (!combined.empty() && combined != last_emitted_text)) {
           last_emitted_text = combined;
           pending_retraction_final = false;
-          emit_result_fn_({combined, is_final_pass});
+          emit_result_fn_({combined, is_final_pass, {}});
         }
       } else if (active_pending_single_hotword) {
         active_text.clear();
@@ -177,19 +177,19 @@ void Qwen3StreamingPipeline::run_loop() {
           if (is_final_pass || combined != last_emitted_text) {
             last_emitted_text = combined;
             pending_retraction_final = false;
-            emit_result_fn_({combined, is_final_pass});
+            emit_result_fn_({combined, is_final_pass, {}});
           }
         } else if (!last_emitted_text.empty() || is_final_pass || pending_retraction_final) {
           last_emitted_text.clear();
           pending_retraction_final = !is_final_pass;
-          emit_result_fn_({"", is_final_pass});
+          emit_result_fn_({"", is_final_pass, {}});
         }
       } else {
         active_text.clear();
         if (is_final_pass) {
           const std::string& combined = committed_base;
           last_emitted_text = combined;
-          emit_result_fn_({combined, true});
+          emit_result_fn_({combined, true, {}});
         }
       }
       return;
@@ -216,8 +216,21 @@ void Qwen3StreamingPipeline::run_loop() {
     if (is_final_pass || (!combined.empty() && combined != last_emitted_text)) {
       last_emitted_text = combined;
       pending_retraction_final = false;
-      emit_result_fn_({combined, is_final_pass});
+      emit_result_fn_({combined, is_final_pass, {}});
     }
+  };
+
+  auto best_retained_text = [&]() -> std::string {
+    if (!committed_text.empty() && !active_text.empty()) {
+      return join_transcript_segments(committed_text, active_text);
+    }
+    if (!last_emitted_text.empty()) {
+      return last_emitted_text;
+    }
+    if (!committed_text.empty()) {
+      return committed_text;
+    }
+    return active_text;
   };
 
   while (true) {
@@ -232,7 +245,9 @@ void Qwen3StreamingPipeline::run_loop() {
       std::unique_lock<std::mutex> lock(mu_);
       if (!skip_next_wait) {
         cv_.wait_for(lock, std::chrono::milliseconds(150), [this]() {
-          return pending_head_ < pending_samples_.size() || stop_requested_ || producer_finished_ || aborted_;
+          return aborted_ ||
+                 pending_head_ < pending_samples_.size() ||
+                 (stop_requested_ && producer_finished_);
         });
       }
       skip_next_wait = false;
@@ -290,19 +305,21 @@ void Qwen3StreamingPipeline::run_loop() {
           opts.should_cancel = [this]() { return is_aborted(); };
           const DecodeResult final_res = decode_fn_(full_copy, opts);
           if (is_aborted()) break;
-          if (!final_res.cancelled) {
+          if (!final_res.cancelled && final_res.error.empty()) {
             committed_text.clear();
             active_trusted_real_text.clear();
             active_pending_single_hotword = false;
             apply_guards_and_update(final_res, true, "");
             break;
           }
+          if (!final_res.error.empty()) {
+            pending_retraction_final = false;
+            emit_result_fn_({best_retained_text(), true, final_res.error});
+            break;
+          }
         }
-        const std::string retained = !committed_text.empty() && !active_text.empty()
-            ? join_transcript_segments(committed_text, active_text)
-            : (!last_emitted_text.empty() ? last_emitted_text : committed_text);
         pending_retraction_final = false;
-        emit_result_fn_({retained, true});
+        emit_result_fn_({best_retained_text(), true, {}});
         break;
       }
 
@@ -323,16 +340,18 @@ void Qwen3StreamingPipeline::run_loop() {
         opts.should_cancel = [this]() { return is_aborted(); };
         const DecodeResult final_res = decode_fn_(seg_copy, opts);
         if (is_aborted()) break;
-        if (!final_res.cancelled) {
+        if (!final_res.cancelled && final_res.error.empty()) {
           apply_guards_and_update(final_res, true, committed_text);
           break;
         }
+        if (!final_res.error.empty()) {
+          pending_retraction_final = false;
+          emit_result_fn_({best_retained_text(), true, final_res.error});
+          break;
+        }
       }
-      const std::string retained = !committed_text.empty() && !active_text.empty()
-          ? join_transcript_segments(committed_text, active_text)
-          : (!last_emitted_text.empty() ? last_emitted_text : committed_text);
       pending_retraction_final = false;
-      emit_result_fn_({retained, true});
+      emit_result_fn_({best_retained_text(), true, {}});
       break;
     }
 
@@ -362,7 +381,7 @@ void Qwen3StreamingPipeline::run_loop() {
         opts.should_cancel = [this]() { return is_aborted(); };
         const DecodeResult res = decode_fn_(seg_copy, opts);
         if (is_aborted()) break;
-        if (!res.cancelled) {
+        if (!res.cancelled && res.error.empty()) {
           apply_guards_and_update(res, false, committed_text);
         }
       }

@@ -32,6 +32,7 @@ struct StreamingPipelineConfig {
 struct TranscriptUpdate {
   std::string text;
   bool is_final{false};
+  std::string error;
 };
 
 /**

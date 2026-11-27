@@ -1,5 +1,7 @@
 #include "qwen3_tokenizer.hpp"
 
+#include "qwen3_unicode_data.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -369,46 +371,156 @@ std::string to_byte_level_utf8(const std::string& raw_utf8) {
   return out;
 }
 
-inline bool is_ascii_letter(unsigned char c) {
-  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+inline uint8_t unicode_cat_code(uint32_t cp) {
+  if (cp > 0x10FFFFu) return 0;
+  const uint8_t page = unicode_detail::kCatStage1[cp >> 8];
+  const uint8_t byte_val = unicode_detail::kCatStage2[page][(cp & 0xFFu) >> 2];
+  return (byte_val >> ((cp & 3u) * 2u)) & 3u;
 }
 
-inline bool is_ascii_digit(unsigned char c) {
-  return c >= '0' && c <= '9';
+uint8_t unicode_ccc(uint32_t cp) {
+  if (cp < 0x0300u) return 0;
+  constexpr size_t kCount = sizeof(unicode_detail::kCccTable) / sizeof(unicode_detail::kCccTable[0]);
+  auto it = std::lower_bound(
+      unicode_detail::kCccTable,
+      unicode_detail::kCccTable + kCount,
+      cp,
+      [](const unicode_detail::CccEntry& e, uint32_t key) { return e.cp < key; });
+  if (it != unicode_detail::kCccTable + kCount && it->cp == cp) {
+    return it->ccc;
+  }
+  return 0;
 }
 
-inline bool is_ws_byte(unsigned char c) {
-  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+bool find_canonical_decomp(uint32_t cp, uint32_t& out_first, uint32_t& out_second) {
+  if (cp < 0x00C0u) return false;
+  constexpr size_t kCount = sizeof(unicode_detail::kDecompTable) / sizeof(unicode_detail::kDecompTable[0]);
+  auto it = std::lower_bound(
+      unicode_detail::kDecompTable,
+      unicode_detail::kDecompTable + kCount,
+      cp,
+      [](const unicode_detail::DecompEntry& e, uint32_t key) { return e.cp < key; });
+  if (it != unicode_detail::kDecompTable + kCount && it->cp == cp) {
+    out_first = it->first;
+    out_second = it->second;
+    return true;
+  }
+  return false;
 }
 
-inline size_t utf8_char_len(const std::string& s, size_t i) {
-  const auto b = static_cast<unsigned char>(s[i]);
-  size_t len = 1;
-  if ((b & 0x80) == 0) len = 1;
-  else if ((b & 0xE0) == 0xC0) len = 2;
-  else if ((b & 0xF0) == 0xE0) len = 3;
-  else if ((b & 0xF8) == 0xF0) len = 4;
-  return std::min(len, s.size() - i);
+uint32_t find_primary_composite(uint32_t first, uint32_t second) {
+  const uint64_t key = (static_cast<uint64_t>(first) << 21) | (static_cast<uint64_t>(second) & 0x1FFFFFu);
+  constexpr size_t kCount = sizeof(unicode_detail::kCompTable) / sizeof(unicode_detail::kCompTable[0]);
+  auto it = std::lower_bound(
+      unicode_detail::kCompTable,
+      unicode_detail::kCompTable + kCount,
+      key,
+      [](const unicode_detail::CompEntry& e, uint64_t k) { return e.key < k; });
+  if (it != unicode_detail::kCompTable + kCount && it->key == key) {
+    return it->composed;
+  }
+  return 0;
+}
+
+void decompose_cp_recursive(uint32_t cp, std::vector<uint32_t>& out) {
+  // Algorithmic Hangul Jamo decomposition (U+AC00..U+D7A3)
+  if (cp >= 0xAC00u && cp <= 0xD7A3u) {
+    const uint32_t s_index = cp - 0xAC00u;
+    const uint32_t l = 0x1100u + s_index / 588u;
+    const uint32_t v = 0x1161u + (s_index % 588u) / 28u;
+    const uint32_t t_index = s_index % 28u;
+    out.push_back(l);
+    out.push_back(v);
+    if (t_index > 0) {
+      out.push_back(0x11A7u + t_index);
+    }
+    return;
+  }
+  uint32_t first = 0;
+  uint32_t second = 0;
+  if (find_canonical_decomp(cp, first, second)) {
+    decompose_cp_recursive(first, out);
+    if (second != 0) {
+      decompose_cp_recursive(second, out);
+    }
+    return;
+  }
+  out.push_back(cp);
+}
+
+struct CpSpan {
+  uint32_t cp{0};
+  size_t byte_start{0};
+  size_t byte_end{0};
+  uint8_t cat{0};
+};
+
+std::vector<CpSpan> decode_utf8_spans(const std::string& s) {
+  std::vector<CpSpan> spans;
+  spans.reserve(s.size());
+  size_t i = 0;
+  const size_t n = s.size();
+  while (i < n) {
+    const auto b0 = static_cast<unsigned char>(s[i]);
+    uint32_t cp = 0xFFFDu;
+    size_t len = 1;
+    if (b0 < 0x80) {
+      cp = b0;
+      len = 1;
+    } else if ((b0 & 0xE0) == 0xC0 && i + 1 < n &&
+               (static_cast<unsigned char>(s[i + 1]) & 0xC0) == 0x80) {
+      const uint32_t v = (static_cast<uint32_t>(b0 & 0x1Fu) << 6) |
+                         static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1]) & 0x3Fu);
+      if (v >= 0x80u) {
+        cp = v;
+        len = 2;
+      }
+    } else if ((b0 & 0xF0) == 0xE0 && i + 2 < n &&
+               (static_cast<unsigned char>(s[i + 1]) & 0xC0) == 0x80 &&
+               (static_cast<unsigned char>(s[i + 2]) & 0xC0) == 0x80) {
+      const uint32_t v = (static_cast<uint32_t>(b0 & 0x0Fu) << 12) |
+                         (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1]) & 0x3Fu) << 6) |
+                         static_cast<uint32_t>(static_cast<unsigned char>(s[i + 2]) & 0x3Fu);
+      if (v >= 0x800u && !(v >= 0xD800u && v <= 0xDFFFu)) {
+        cp = v;
+        len = 3;
+      }
+    } else if ((b0 & 0xF8) == 0xF0 && i + 3 < n &&
+               (static_cast<unsigned char>(s[i + 1]) & 0xC0) == 0x80 &&
+               (static_cast<unsigned char>(s[i + 2]) & 0xC0) == 0x80 &&
+               (static_cast<unsigned char>(s[i + 3]) & 0xC0) == 0x80) {
+      const uint32_t v = (static_cast<uint32_t>(b0 & 0x07u) << 18) |
+                         (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 1]) & 0x3Fu) << 12) |
+                         (static_cast<uint32_t>(static_cast<unsigned char>(s[i + 2]) & 0x3Fu) << 6) |
+                         static_cast<uint32_t>(static_cast<unsigned char>(s[i + 3]) & 0x3Fu);
+      if (v >= 0x10000u && v <= 0x10FFFFu) {
+        cp = v;
+        len = 4;
+      }
+    }
+    spans.push_back({cp, i, i + len, unicode_cat_code(cp)});
+    i += len;
+  }
+  return spans;
 }
 
 /**
- * Qwen2/Qwen3 compatible pre-tokenization:
- * - Splits contractions ('s, 't, 're, 've, 'm, 'll, 'd)
- * - Keeps optional single leading space attached to letters or non-ASCII word/symbol chunks
- * - Isolates individual digits [0-9] (Qwen2 regex `\p{N}`)
- * - Isolates newlines cleanly
+ * Full Qwen2/Qwen3 pre-tokenization matching HuggingFace regex:
+ * `(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`
  */
 std::vector<std::string> qwen_pre_tokenize(const std::string& text) {
   std::vector<std::string> chunks;
+  if (text.empty()) return chunks;
+  const std::vector<CpSpan> cps = decode_utf8_spans(text);
+  const size_t n = cps.size();
   size_t i = 0;
-  const size_t n = text.size();
 
   auto match_contraction = [&](size_t pos) -> size_t {
-    if (pos >= n || text[pos] != '\'') return 0;
-    if (pos + 2 <= n) {
-      const char c1 = static_cast<char>(std::tolower(static_cast<unsigned char>(text[pos + 1])));
-      if (pos + 3 <= n) {
-        const char c2 = static_cast<char>(std::tolower(static_cast<unsigned char>(text[pos + 2])));
+    if (pos >= n || cps[pos].cp != '\'') return 0;
+    if (pos + 1 < n && cps[pos + 1].cp < 0x80u) {
+      const char c1 = static_cast<char>(std::tolower(static_cast<unsigned char>(cps[pos + 1].cp)));
+      if (pos + 2 < n && cps[pos + 2].cp < 0x80u) {
+        const char c2 = static_cast<char>(std::tolower(static_cast<unsigned char>(cps[pos + 2].cp)));
         if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) {
           return 3;
         }
@@ -418,90 +530,127 @@ std::vector<std::string> qwen_pre_tokenize(const std::string& text) {
     return 0;
   };
 
+  auto emit_range = [&](size_t start_cp, size_t end_cp) {
+    const size_t bs = cps[start_cp].byte_start;
+    const size_t be = cps[end_cp - 1].byte_end;
+    chunks.push_back(text.substr(bs, be - bs));
+  };
+
   while (i < n) {
+    // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
     if (const size_t clen = match_contraction(i)) {
-      chunks.push_back(text.substr(i, clen));
+      emit_range(i, i + clen);
       i += clen;
       continue;
     }
 
-    const auto b = static_cast<unsigned char>(text[i]);
-    if (b == '\r' || b == '\n') {
-      const size_t start = i;
-      while (i < n && (text[i] == '\r' || text[i] == '\n')) ++i;
-      chunks.push_back(text.substr(start, i - start));
+    const uint32_t cp = cps[i].cp;
+    const uint8_t cat = cps[i].cat;
+
+    // 2. [^\r\n\p{L}\p{N}]?\p{L}+
+    if (cat == 1) {
+      size_t j = i + 1;
+      while (j < n && cps[j].cat == 1) ++j;
+      emit_range(i, j);
+      i = j;
+      continue;
+    }
+    if (cat != 2 && cp != '\r' && cp != '\n' && i + 1 < n && cps[i + 1].cat == 1) {
+      size_t j = i + 2;
+      while (j < n && cps[j].cat == 1) ++j;
+      emit_range(i, j);
+      i = j;
       continue;
     }
 
-    if (is_ascii_digit(b)) {
-      chunks.push_back(text.substr(i, 1));
-      ++i;
+    // 3. \p{N} (single Unicode number codepoint)
+    if (cat == 2) {
+      emit_range(i, i + 1);
+      i += 1;
       continue;
     }
 
-    // Optional single leading space attached to letters or punctuation/non-ASCII token
-    if (b == ' ' && i + 1 < n && !is_ws_byte(static_cast<unsigned char>(text[i + 1])) &&
-        !is_ascii_digit(static_cast<unsigned char>(text[i + 1]))) {
-      const size_t start = i;
-      ++i;
-      const auto b2 = static_cast<unsigned char>(text[i]);
-      if (is_ascii_letter(b2)) {
-        while (i < n && is_ascii_letter(static_cast<unsigned char>(text[i]))) ++i;
-        chunks.push_back(text.substr(start, i - start));
-        continue;
-      }
-      if (b2 >= 0x80) {
-        while (i < n && static_cast<unsigned char>(text[i]) >= 0x80) {
-          i += utf8_char_len(text, i);
+    // 4.  ?[^\s\p{L}\p{N}]+[\r\n]*
+    const bool has_leading_space_other =
+        (cp == ' ' && i + 1 < n && cps[i + 1].cat == 0);
+    if (cat == 0 || has_leading_space_other) {
+      size_t j = has_leading_space_other ? (i + 1) : i;
+      while (j < n && cps[j].cat == 0) ++j;
+      while (j < n && (cps[j].cp == '\r' || cps[j].cp == '\n')) ++j;
+      emit_range(i, j);
+      i = j;
+      continue;
+    }
+
+    // 5-7. Whitespace runs: \s*[\r\n]+ | \s+(?!\S) | \s+
+    if (cat == 3) {
+      size_t ws_end = i;
+      size_t last_nl = std::string::npos;
+      while (ws_end < n && cps[ws_end].cat == 3) {
+        if (cps[ws_end].cp == '\r' || cps[ws_end].cp == '\n') {
+          last_nl = ws_end;
         }
-        chunks.push_back(text.substr(start, i - start));
+        ++ws_end;
+      }
+      if (last_nl != std::string::npos) {
+        emit_range(i, last_nl + 1);
+        i = last_nl + 1;
         continue;
       }
-      // Punctuation with leading space
-      while (i < n) {
-        const auto bp = static_cast<unsigned char>(text[i]);
-        if (is_ws_byte(bp) || is_ascii_letter(bp) || is_ascii_digit(bp) || bp >= 0x80) break;
-        ++i;
+      if (ws_end == n) {
+        emit_range(i, ws_end);
+        i = ws_end;
+        continue;
       }
-      chunks.push_back(text.substr(start, i - start));
-      continue;
-    }
-
-    if (is_ascii_letter(b)) {
-      const size_t start = i;
-      while (i < n && is_ascii_letter(static_cast<unsigned char>(text[i]))) ++i;
-      chunks.push_back(text.substr(start, i - start));
-      continue;
-    }
-
-    if (b >= 0x80) {
-      const size_t start = i;
-      while (i < n && static_cast<unsigned char>(text[i]) >= 0x80) {
-        i += utf8_char_len(text, i);
+      if (ws_end - i >= 2) {
+        emit_range(i, ws_end - 1);
+        i = ws_end - 1;
+        continue;
       }
-      chunks.push_back(text.substr(start, i - start));
+      emit_range(i, ws_end);
+      i = ws_end;
       continue;
     }
 
-    if (is_ws_byte(b)) {
-      const size_t start = i;
-      while (i < n && (text[i] == ' ' || text[i] == '\t')) ++i;
-      chunks.push_back(text.substr(start, i - start));
-      continue;
-    }
-
-    // ASCII punctuation run
-    const size_t start = i;
-    while (i < n) {
-      const auto bp = static_cast<unsigned char>(text[i]);
-      if (is_ws_byte(bp) || is_ascii_letter(bp) || is_ascii_digit(bp) || bp >= 0x80 || match_contraction(i)) break;
-      ++i;
-    }
-    if (i == start) ++i;
-    chunks.push_back(text.substr(start, i - start));
+    // Defensive fallback
+    emit_range(i, i + 1);
+    i += 1;
   }
 
   return chunks;
+}
+
+void drop_trailing_incomplete_utf8(std::vector<uint8_t>& bytes) {
+  if (bytes.empty()) return;
+  const size_t n = bytes.size();
+  const uint8_t last = bytes.back();
+  if (last < 0x80u) return;
+
+  // Walk backwards at most 3 continuation bytes to inspect leading byte
+  size_t idx = n - 1;
+  size_t cont = 0;
+  while (cont < 3 && (bytes[idx] & 0xC0u) == 0x80u) {
+    ++cont;
+    if (idx == 0) {
+      // Pure orphan continuation bytes at start/end of small buffer
+      return;
+    }
+    --idx;
+  }
+  const uint8_t lead = bytes[idx];
+  if ((lead & 0xC0u) == 0x80u) {
+    // 4+ continuation bytes; not a truncated sequence header
+    return;
+  }
+  size_t expected = 0;
+  if ((lead & 0xE0u) == 0xC0u && lead >= 0xC2u) expected = 2;
+  else if ((lead & 0xF0u) == 0xE0u) expected = 3;
+  else if ((lead & 0xF8u) == 0xF0u && lead <= 0xF4u) expected = 4;
+
+  const size_t actual = n - idx;
+  if (expected > 0 && actual < expected) {
+    bytes.resize(idx);
+  }
 }
 
 std::string decode_utf8_lenient(const std::vector<uint8_t>& bytes) {
@@ -762,9 +911,97 @@ std::vector<std::string> Qwen3Tokenizer::bpe(const std::string& byte_level_token
   return pieces;
 }
 
+std::string Qwen3Tokenizer::normalize_nfc(const std::string& text) {
+  if (text.empty()) return text;
+  bool all_ascii = true;
+  for (unsigned char b : text) {
+    if (b >= 0x80u) {
+      all_ascii = false;
+      break;
+    }
+  }
+  if (all_ascii) return text;
+
+  const std::vector<CpSpan> spans = decode_utf8_spans(text);
+  std::vector<uint32_t> nfd;
+  nfd.reserve(spans.size() * 2);
+  for (const auto& sp : spans) {
+    decompose_cp_recursive(sp.cp, nfd);
+  }
+
+  // Canonical reordering of combining marks (non-zero ccc)
+  for (size_t i = 0; i < nfd.size();) {
+    const uint8_t c0 = unicode_ccc(nfd[i]);
+    if (c0 == 0) {
+      ++i;
+      continue;
+    }
+    size_t j = i + 1;
+    while (j < nfd.size() && unicode_ccc(nfd[j]) != 0) ++j;
+    // Insertion sort by ccc ascending (preserves relative order of equal ccc)
+    for (size_t a = i + 1; a < j; ++a) {
+      const uint32_t key_cp = nfd[a];
+      const uint8_t key_ccc = unicode_ccc(key_cp);
+      size_t b = a;
+      while (b > i && unicode_ccc(nfd[b - 1]) > key_ccc) {
+        nfd[b] = nfd[b - 1];
+        --b;
+      }
+      nfd[b] = key_cp;
+    }
+    i = j;
+  }
+
+  // Canonical composition
+  std::vector<uint32_t> composed;
+  composed.reserve(nfd.size());
+  size_t starter_idx = std::string::npos;
+  uint8_t last_ccc = 0;
+
+  for (uint32_t cp : nfd) {
+    const uint8_t ccc = unicode_ccc(cp);
+    if (starter_idx != std::string::npos && (last_ccc == 0 || last_ccc < ccc)) {
+      uint32_t starter = composed[starter_idx];
+      uint32_t merged = 0;
+      if (last_ccc == 0) {
+        // Hangul L + V
+        if (starter >= 0x1100u && starter <= 0x1112u && cp >= 0x1161u && cp <= 0x1175u) {
+          merged = 0xAC00u + ((starter - 0x1100u) * 21u + (cp - 0x1161u)) * 28u;
+        } else if (starter >= 0xAC00u && starter <= 0xD7A3u && ((starter - 0xAC00u) % 28u) == 0 &&
+                   cp >= 0x11A8u && cp <= 0x11C2u) {
+          // Hangul LV + T
+          merged = starter + (cp - 0x11A7u);
+        }
+      }
+      if (merged == 0) {
+        merged = find_primary_composite(starter, cp);
+      }
+      if (merged != 0) {
+        composed[starter_idx] = merged;
+        continue;
+      }
+    }
+    if (ccc == 0) {
+      starter_idx = composed.size();
+      last_ccc = 0;
+    } else {
+      last_ccc = ccc;
+    }
+    composed.push_back(cp);
+  }
+
+  std::string out;
+  out.reserve(text.size());
+  for (uint32_t cp : composed) {
+    append_utf8(out, cp);
+  }
+  return out;
+}
+
 void Qwen3Tokenizer::encode_plain_span(const std::string& text, std::vector<int64_t>& out_ids) const {
   if (text.empty()) return;
-  const std::vector<std::string> chunks = qwen_pre_tokenize(text);
+  const std::string normalized = normalize_nfc(text);
+  const std::vector<std::string> chunks = qwen_pre_tokenize(normalized);
   for (const std::string& chunk : chunks) {
     const std::string byte_tok = to_byte_level_utf8(chunk);
     if (bpe_ranks_.empty()) {
@@ -829,7 +1066,9 @@ std::vector<int64_t> Qwen3Tokenizer::encode(const std::string& text, bool parse_
   return out;
 }
 
-std::string Qwen3Tokenizer::decode(const std::vector<int64_t>& tokens, bool include_asr_tag) const {
+std::vector<uint8_t> Qwen3Tokenizer::decode_bytes(
+    const std::vector<int64_t>& tokens,
+    bool include_asr_tag) const {
   const auto& tables = byte_unicode_tables();
   std::vector<uint8_t> bytes;
   bytes.reserve(tokens.size() * 4);
@@ -889,6 +1128,16 @@ std::string Qwen3Tokenizer::decode(const std::vector<int64_t>& tokens, bool incl
     }
   }
 
+  return bytes;
+}
+
+std::string Qwen3Tokenizer::decode(const std::vector<int64_t>& tokens, bool include_asr_tag) const {
+  return decode_utf8_lenient(decode_bytes(tokens, include_asr_tag));
+}
+
+std::string Qwen3Tokenizer::decode_visible(const std::vector<int64_t>& tokens, bool include_asr_tag) const {
+  std::vector<uint8_t> bytes = decode_bytes(tokens, include_asr_tag);
+  drop_trailing_incomplete_utf8(bytes);
   return decode_utf8_lenient(bytes);
 }
 

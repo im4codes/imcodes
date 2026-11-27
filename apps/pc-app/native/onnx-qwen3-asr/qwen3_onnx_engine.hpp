@@ -63,7 +63,23 @@ class Qwen3OnnxEngine {
   const std::string& active_provider() const { return active_provider_; }
   const Qwen3Tokenizer& tokenizer() const { return tokenizer_; }
   int64_t max_total_len() const { return effective_max_total_len_; }
+  int64_t kv_physical_len() const { return kv_physical_len_; }
   int num_layers() const { return num_layers_; }
+
+  /**
+   * Trim trailing near-zero encoder frames (abs <= threshold, default 1e-6f).
+   * Returns count of leading effective frames (0 if all frames are near-zero).
+   */
+  static int64_t trim_audio_features_f32(
+      const float* data,
+      int64_t num_frames,
+      int64_t hidden_dim,
+      float threshold = 1e-6f);
+  static int64_t trim_audio_features_f16(
+      const uint16_t* data,
+      int64_t num_frames,
+      int64_t hidden_dim,
+      float threshold = 1e-6f);
 
   /**
    * Pure helper exposed for testing prompt assembly & KV length clamping without requiring live ORT sessions.
@@ -93,6 +109,7 @@ class Qwen3OnnxEngine {
   [[maybe_unused]] int64_t head_dim_{0};
   [[maybe_unused]] int64_t audio_hidden_dim_{0};
   [[maybe_unused]] int64_t vocab_size_{0};
+  [[maybe_unused]] int64_t kv_physical_len_{1024};
   [[maybe_unused]] int64_t effective_max_total_len_{1024};
   std::mutex decode_mutex_;
   std::unique_ptr<OrtState> ort_;

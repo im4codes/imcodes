@@ -17,6 +17,7 @@ add_library(imcodes_qwen3_onnx_core STATIC
   qwen3_tokenizer.cpp
   text_guards.cpp
   qwen3_onnx_engine.cpp
+  ort_ep_dml.cpp
   streaming_pipeline.cpp
 )
 
@@ -29,6 +30,9 @@ if(MSVC)
   target_compile_options(imcodes_qwen3_onnx_core PRIVATE /W4 /utf-8)
 else()
   target_compile_options(imcodes_qwen3_onnx_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+if(WIN32)
+  target_compile_definitions(imcodes_qwen3_onnx_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 endif()
 
 set(IMCODES_ORT_FOUND FALSE)
@@ -47,7 +51,10 @@ if(ONNXRUNTIME_DIR AND EXISTS "${ONNXRUNTIME_DIR}")
     PATHS
       "${ONNXRUNTIME_DIR}/lib"
       "${ONNXRUNTIME_DIR}/lib64"
+      "${ONNXRUNTIME_DIR}/build/native/lib/x64"
+      "${ONNXRUNTIME_DIR}/build/native/lib/arm64"
       "${ONNXRUNTIME_DIR}/runtimes/win-x64/native"
+      "${ONNXRUNTIME_DIR}/runtimes/win-arm64/native"
       "${ONNXRUNTIME_DIR}/runtimes/linux-x64/native"
       "${ONNXRUNTIME_DIR}/runtimes/osx-arm64/native"
     NO_DEFAULT_PATH

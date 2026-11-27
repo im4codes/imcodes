@@ -45,11 +45,26 @@ class Qwen3Tokenizer {
   std::vector<int64_t> encode(const std::string& text, bool parse_special = true) const;
 
   /**
+   * Decode token IDs to raw UTF-8/byte vector (preserving partial multi-byte bytes for diagnostics).
+   * Skips <|...|> special tokens; preserves <asr_text> when `include_asr_tag` is true.
+   */
+  std::vector<uint8_t> decode_bytes(const std::vector<int64_t>& tokens, bool include_asr_tag = true) const;
+
+  /**
    * Decode token IDs using a unified byte buffer so multi-byte UTF-8 sequences split across
-   * BPE tokens reassemble cleanly. Skips <|...|> special tokens; preserves <asr_text> when
-   * `include_asr_tag` is true. Incomplete trailing UTF-8 emits U+FFFD (\xEF\xBF\xBD).
+   * BPE tokens reassemble cleanly. Incomplete trailing UTF-8 emits U+FFFD (\xEF\xBF\xBD) for
+   * diagnostics and rollback boundary detection.
    */
   std::string decode(const std::vector<int64_t>& tokens, bool include_asr_tag = true) const;
+
+  /**
+   * Decode token IDs for user-visible transcript output: drops uncompletable incomplete
+   * trailing UTF-8 byte sequences instead of emitting trailing U+FFFD replacement characters.
+   */
+  std::string decode_visible(const std::vector<int64_t>& tokens, bool include_asr_tag = true) const;
+
+  /** Apply Unicode UAX #15 NFC normalization to a UTF-8 string. */
+  static std::string normalize_nfc(const std::string& text);
 
   bool is_loaded() const { return !id_to_token_.empty(); }
   size_t vocab_size() const { return id_to_token_.size(); }

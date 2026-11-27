@@ -15,12 +15,13 @@
 
 #ifdef IMCODES_HAS_ONNXRUNTIME
 #include <onnxruntime_cxx_api.h>
-#ifdef IMCODES_ORT_HAS_DML
-#include <dml_provider_factory.h>
-#endif
 #endif
 
 namespace imcodes::qwen3 {
+
+#if defined(IMCODES_HAS_ONNXRUNTIME) && defined(IMCODES_ORT_HAS_DML)
+bool append_dml_execution_provider(OrtSessionOptions* raw_opts, int device_id);
+#endif
 
 namespace {
 
@@ -73,9 +74,7 @@ const std::unordered_map<std::string, std::string>& language_map() {
   return kMap;
 }
 
-#ifdef IMCODES_HAS_ONNXRUNTIME
-
-inline float half_to_float(uint16_t h) {
+inline float half_to_float_scalar(uint16_t h) {
   const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
   const uint32_t exp = (h >> 10) & 0x1Fu;
   const uint32_t mant = h & 0x03FFu;
@@ -105,6 +104,8 @@ inline float half_to_float(uint16_t h) {
   return out;
 }
 
+#ifdef IMCODES_HAS_ONNXRUNTIME
+
 inline bool is_fp16_type(ONNXTensorElementDataType dtype) {
   return dtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ||
          dtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16;
@@ -124,7 +125,7 @@ int64_t argmax_logits_row(
     const auto* ptr = logits_tensor.GetTensorData<uint16_t>() + offset;
     for (int64_t i = 0; i < vocab_size; ++i) {
       if (i == forbid_a || i == forbid_b) continue;
-      const float v = half_to_float(ptr[i]);
+      const float v = half_to_float_scalar(ptr[i]);
       if (v > best_val) {
         best_val = v;
         best_id = i;
@@ -180,16 +181,10 @@ bool append_execution_provider(
     // DirectML requires sequential execution and disabled memory pattern.
     session_opts.DisableMemPattern();
     session_opts.SetExecutionMode(ORT_SEQUENTIAL);
-    OrtStatus* status = OrtSessionOptionsAppendExecutionProvider_DML(
-        session_opts, config.directml_device_id);
-    if (status == nullptr) {
-      return true;
-    }
-    Ort::GetApi().ReleaseStatus(status);
+    return append_dml_execution_provider(session_opts, config.directml_device_id);
 #else
-    (void)config;
-#endif
     return false;
+#endif
   }
   if (provider == "cuda") {
 #ifdef IMCODES_ORT_HAS_CUDA
@@ -228,6 +223,40 @@ std::string resolve_qwen3_language(const std::string& raw_language) {
     }
   }
   return {};
+}
+
+int64_t Qwen3OnnxEngine::trim_audio_features_f32(
+    const float* data,
+    int64_t num_frames,
+    int64_t hidden_dim,
+    float threshold) {
+  if (!data || num_frames <= 0 || hidden_dim <= 0) return 0;
+  for (int64_t f = num_frames - 1; f >= 0; --f) {
+    const float* row = data + static_cast<size_t>(f) * static_cast<size_t>(hidden_dim);
+    for (int64_t d = 0; d < hidden_dim; ++d) {
+      if (std::fabs(row[d]) > threshold) {
+        return f + 1;
+      }
+    }
+  }
+  return 0;
+}
+
+int64_t Qwen3OnnxEngine::trim_audio_features_f16(
+    const uint16_t* data,
+    int64_t num_frames,
+    int64_t hidden_dim,
+    float threshold) {
+  if (!data || num_frames <= 0 || hidden_dim <= 0) return 0;
+  for (int64_t f = num_frames - 1; f >= 0; --f) {
+    const uint16_t* row = data + static_cast<size_t>(f) * static_cast<size_t>(hidden_dim);
+    for (int64_t d = 0; d < hidden_dim; ++d) {
+      if (std::fabs(half_to_float_scalar(row[d])) > threshold) {
+        return f + 1;
+      }
+    }
+  }
+  return 0;
 }
 
 void Qwen3OnnxEngine::build_bounded_prompt_tokens(
@@ -490,9 +519,15 @@ bool Qwen3OnnxEngine::init(const EngineConfig& config, std::string& out_error) {
       }
       num_kv_heads_ = kv_shape[2];
       head_dim_ = kv_shape[3];
-      effective_max_total_len_ = kv_shape[1] > 0
-          ? std::min<int64_t>(config.max_total_len, kv_shape[1])
-          : config.max_total_len;
+      const int64_t cfg_max_len = std::max<int64_t>(2, config.max_total_len);
+      if (kv_shape[1] > 0) {
+        // Fixed graph KV dim1: allocate/feed exact graph shape while keeping logical limit bounded.
+        kv_physical_len_ = kv_shape[1];
+        effective_max_total_len_ = std::min<int64_t>(cfg_max_len, kv_physical_len_);
+      } else {
+        effective_max_total_len_ = cfg_max_len;
+        kv_physical_len_ = effective_max_total_len_;
+      }
 
       auto logits_info = state->decoder_sess->GetOutputTypeInfo(0);
       auto logits_ti = logits_info.GetTensorTypeAndShapeInfo();
@@ -505,7 +540,7 @@ bool Qwen3OnnxEngine::init(const EngineConfig& config, std::string& out_error) {
       vocab_size_ = logits_shape[2];
 
       const size_t elem_bytes = is_fp16_type(state->cache_elem_type) ? sizeof(uint16_t) : sizeof(float);
-      const size_t kv_bytes = static_cast<size_t>(effective_max_total_len_) *
+      const size_t kv_bytes = static_cast<size_t>(kv_physical_len_) *
                               static_cast<size_t>(num_kv_heads_) *
                               static_cast<size_t>(head_dim_) * elem_bytes;
       state->cache_keys.assign(static_cast<size_t>(num_layers_), std::vector<uint8_t>(kv_bytes, 0));
@@ -540,7 +575,7 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     result.error = "Engine not initialized";
     return result;
   }
-  if (samples_16k.empty()) {
+  if (samples_16k.empty() || !has_utterance_speech_energy(samples_16k)) {
     return result;
   }
   if (opts.should_cancel && opts.should_cancel()) {
@@ -601,14 +636,25 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     auto enc_outs = ort_->encoder_sess->Run(
         Ort::RunOptions{nullptr}, enc_in_names, enc_inputs.data(), enc_inputs.size(), enc_out_names, 1);
 
-    auto enc_shape = enc_outs[0].GetTensorTypeAndShapeInfo().GetShape();
+    auto enc_ti = enc_outs[0].GetTensorTypeAndShapeInfo();
+    const auto enc_dtype = enc_ti.GetElementType();
+    auto enc_shape = enc_ti.GetShape();
     if (enc_shape.size() != 3 || enc_shape[1] <= 0 || enc_shape[2] <= 0) {
       return result;
     }
     const int64_t enc_frames = enc_shape[1];
     const int64_t hidden = enc_shape[2];
-    const int64_t raw_audio_tokens = std::min(valid_frames, enc_frames);
-    if (raw_audio_tokens <= 0) {
+    const int64_t bounded_frames = std::min(valid_frames, enc_frames);
+    if (bounded_frames <= 0) {
+      return result;
+    }
+
+    // Trim trailing near-zero encoder frames (<= 1e-6); all-zero output skips decoder cleanly.
+    const bool enc_is_fp16 = is_fp16_type(enc_dtype);
+    const int64_t trimmed_audio_tokens = enc_is_fp16
+        ? trim_audio_features_f16(enc_outs[0].GetTensorData<uint16_t>(), bounded_frames, hidden, 1e-6f)
+        : trim_audio_features_f32(enc_outs[0].GetTensorData<float>(), bounded_frames, hidden, 1e-6f);
+    if (trimmed_audio_tokens <= 0) {
       return result;
     }
 
@@ -616,12 +662,12 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     const std::string resolved_lang = resolve_qwen3_language(opts.language);
     std::vector<int64_t> source_ids;
     std::vector<int64_t> effective_prefix;
-    int64_t audio_tokens = raw_audio_tokens;
+    int64_t audio_tokens = trimmed_audio_tokens;
     build_bounded_prompt_tokens(
         tokenizer_,
         opts.hotwords_context,
         resolved_lang,
-        raw_audio_tokens,
+        trimmed_audio_tokens,
         opts.prefix_tokens,
         effective_max_total_len_,
         opts.max_new_tokens,
@@ -631,6 +677,7 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     if (source_ids.empty() || audio_tokens <= 0) {
       return result;
     }
+    audio_tokens = std::min(audio_tokens, trimmed_audio_tokens);
 
     const int64_t context_len = static_cast<int64_t>(source_ids.size());
     if (context_len >= effective_max_total_len_) {
@@ -638,21 +685,24 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     }
     result.prefill_len = static_cast<int>(context_len);
 
-    // Slice encoder output to [1, audio_tokens, hidden] without extra copies when lengths match
-    const float* enc_data = enc_outs[0].GetTensorData<float>();
+    // Slice encoder output to [1, audio_tokens, hidden] matching encoder dtype
+    const size_t audio_elem_count = static_cast<size_t>(audio_tokens) * static_cast<size_t>(hidden);
+    const size_t audio_bytes = audio_elem_count * (enc_is_fp16 ? sizeof(uint16_t) : sizeof(float));
+    void* enc_raw_ptr = enc_is_fp16
+        ? static_cast<void*>(const_cast<uint16_t*>(enc_outs[0].GetTensorData<uint16_t>()))
+        : static_cast<void*>(const_cast<float*>(enc_outs[0].GetTensorData<float>()));
     std::array<int64_t, 3> audio_shape = {1, audio_tokens, hidden};
-    Ort::Value audio_tensor = Ort::Value::CreateTensor<float>(
-        ort_->mem_info,
-        const_cast<float*>(enc_data),
-        static_cast<size_t>(audio_tokens) * static_cast<size_t>(hidden),
-        audio_shape.data(),
-        audio_shape.size());
+    auto make_audio_tensor = [&]() {
+      return Ort::Value::CreateTensor(
+          ort_->mem_info, enc_raw_ptr, audio_bytes, audio_shape.data(), audio_shape.size(), enc_dtype);
+    };
 
     // Zero only the dirty portion of KV cache buffers from prior utterance
     const size_t elem_bytes = is_fp16_type(ort_->cache_elem_type) ? sizeof(uint16_t) : sizeof(float);
     const size_t row_bytes = static_cast<size_t>(num_kv_heads_) * static_cast<size_t>(head_dim_) * elem_bytes;
     if (ort_->dirty_cache_rows > 0) {
-      const size_t clear_bytes = static_cast<size_t>(ort_->dirty_cache_rows) * row_bytes;
+      const int64_t bounded_dirty = std::min(ort_->dirty_cache_rows, kv_physical_len_);
+      const size_t clear_bytes = static_cast<size_t>(bounded_dirty) * row_bytes;
       for (int l = 0; l < num_layers_; ++l) {
         std::memset(ort_->cache_keys[static_cast<size_t>(l)].data(), 0, clear_bytes);
         std::memset(ort_->cache_values[static_cast<size_t>(l)].data(), 0, clear_bytes);
@@ -668,7 +718,8 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     dec_out_names.reserve(ort_->dec_out_names.size());
     for (const auto& s : ort_->dec_out_names) dec_out_names.push_back(s.c_str());
 
-    std::array<int64_t, 4> kv_shape = {1, effective_max_total_len_, num_kv_heads_, head_dim_};
+    // Physical KV tensor shape always matches graph dim1 (fixed or configured dynamic)
+    std::array<int64_t, 4> kv_shape = {1, kv_physical_len_, num_kv_heads_, head_dim_};
     auto build_kv_views = [&](std::vector<Ort::Value>& inputs) {
       for (int l = 0; l < num_layers_; ++l) {
         auto& kbuf = ort_->cache_keys[static_cast<size_t>(l)];
@@ -681,6 +732,10 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     };
 
     auto copy_deltas = [&](const std::vector<Ort::Value>& outputs, int64_t cache_pos, int64_t seq_len) {
+      if (cache_pos < 0 || seq_len <= 0 || cache_pos + seq_len > effective_max_total_len_ ||
+          cache_pos + seq_len > kv_physical_len_) {
+        return;
+      }
       const size_t copy_bytes = static_cast<size_t>(seq_len) * row_bytes;
       const size_t dst_offset = static_cast<size_t>(cache_pos) * row_bytes;
       for (int l = 0; l < num_layers_; ++l) {
@@ -710,12 +765,7 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     prefill_inputs.reserve(4 + static_cast<size_t>(num_layers_) * 2);
     prefill_inputs.push_back(Ort::Value::CreateTensor<int64_t>(
         ort_->mem_info, source_ids.data(), source_ids.size(), prefill_ids_shape.data(), prefill_ids_shape.size()));
-    prefill_inputs.push_back(Ort::Value::CreateTensor<float>(
-        ort_->mem_info,
-        const_cast<float*>(enc_data),
-        static_cast<size_t>(audio_tokens) * static_cast<size_t>(hidden),
-        audio_shape.data(),
-        audio_shape.size()));
+    prefill_inputs.push_back(make_audio_tensor());
     prefill_inputs.push_back(Ort::Value::CreateTensor<int64_t>(
         ort_->mem_info, prefill_attn.data(), prefill_attn.size(), prefill_ids_shape.data(), prefill_ids_shape.size()));
     prefill_inputs.push_back(Ort::Value::CreateTensor<int64_t>(
@@ -795,12 +845,7 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
       step_inputs.reserve(4 + static_cast<size_t>(num_layers_) * 2);
       step_inputs.push_back(Ort::Value::CreateTensor<int64_t>(
           ort_->mem_info, &step_id, 1, step_ids_shape.data(), step_ids_shape.size()));
-      step_inputs.push_back(Ort::Value::CreateTensor<float>(
-          ort_->mem_info,
-          const_cast<float*>(enc_data),
-          static_cast<size_t>(audio_tokens) * static_cast<size_t>(hidden),
-          audio_shape.data(),
-          audio_shape.size()));
+      step_inputs.push_back(make_audio_tensor());
       step_inputs.push_back(Ort::Value::CreateTensor<int64_t>(
           ort_->mem_info, &step_attn, 1, step_ids_shape.data(), step_ids_shape.size()));
       step_inputs.push_back(Ort::Value::CreateTensor<int64_t>(
@@ -821,14 +866,15 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
       next_token = argmax_logits_row(step_outs[0], 0, vocab_size_, ort_->logits_elem_type);
     }
 
-    // Assemble complete non-EOS raw_tokens (prefix + generated) for rollback continuation
+    // Assemble complete non-EOS raw_tokens (prefix + generated) for rollback continuation,
+    // while visible text drops uncompletable trailing UTF-8 bytes without leaking U+FFFD.
     result.raw_tokens.reserve(effective_prefix.size() + generated_tokens.size());
     result.raw_tokens.insert(result.raw_tokens.end(), effective_prefix.begin(), effective_prefix.end());
     result.raw_tokens.insert(result.raw_tokens.end(), generated_tokens.begin(), generated_tokens.end());
 
-    const std::string raw_decoded = tokenizer_.decode(result.raw_tokens, true);
+    const std::string visible_decoded = tokenizer_.decode_visible(result.raw_tokens, true);
     const bool expect_header = resolved_lang.empty();
-    result.text = extract_asr_transcript_after_header(raw_decoded, expect_header);
+    result.text = extract_asr_transcript_after_header(visible_decoded, expect_header);
     return result;
   } catch (const std::exception& ex) {
     result.error = ex.what();

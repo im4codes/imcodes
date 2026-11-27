@@ -3,11 +3,13 @@
 #include "qwen3_tokenizer.hpp"
 #include "streaming_pipeline.hpp"
 #include "text_guards.hpp"
+#include "tiny_onnx_fixture.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <ctime>
 #include <filesystem>
 #include <iostream>
 #include <sstream>
@@ -16,7 +18,50 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 namespace {
+
+double process_cpu_ms() {
+#ifdef _WIN32
+  FILETIME ft_create{}, ft_exit{}, ft_kernel{}, ft_user{};
+  if (!GetProcessTimes(GetCurrentProcess(), &ft_create, &ft_exit, &ft_kernel, &ft_user)) {
+    return 0.0;
+  }
+  ULARGE_INTEGER k{}, u{};
+  k.LowPart = ft_kernel.dwLowDateTime;
+  k.HighPart = ft_kernel.dwHighDateTime;
+  u.LowPart = ft_user.dwLowDateTime;
+  u.HighPart = ft_user.dwHighDateTime;
+  return static_cast<double>(k.QuadPart + u.QuadPart) / 10000.0;
+#else
+  return 1000.0 * static_cast<double>(std::clock()) / static_cast<double>(CLOCKS_PER_SEC);
+#endif
+}
+
+std::string get_env_str(const char* name) {
+#ifdef _WIN32
+  char* buf = nullptr;
+  size_t len = 0;
+  if (_dupenv_s(&buf, &len, name) != 0 || !buf) {
+    return {};
+  }
+  std::string out(buf);
+  std::free(buf);
+  return out;
+#else
+  const char* val = std::getenv(name);
+  return val ? std::string(val) : std::string{};
+#endif
+}
 
 int g_failures = 0;
 
@@ -144,9 +189,22 @@ void test_tokenizer_utf8_and_bpe() {
   EXPECT_EQ(enc[2], 151645);
   EXPECT_EQ(tok.decode(enc, true), "hello");
 
-  // Incomplete UTF-8 prefix at end emits U+FFFD (\xEF\xBF\xBD)
+  // Incomplete UTF-8 prefix at end emits U+FFFD (\xEF\xBF\xBD) for byte diagnostics,
+  // while decode_visible drops uncompletable trailing UTF-8 bytes cleanly.
   std::string broken = tok.decode({16, 21}, true);
   EXPECT_TRUE(broken.find("\xEF\xBF\xBD") != std::string::npos);
+  std::string visible = tok.decode_visible({16, 21}, true);
+  EXPECT_EQ(visible, "hello");
+  std::vector<uint8_t> raw_bytes = tok.decode_bytes({16, 21}, true);
+  EXPECT_EQ(raw_bytes.size(), size_t{7});  // "hello" (5) + 0xE4 0xB8 (2)
+
+  // NFC normalization (NFD "fa\u0301cil" -> NFC "fácil", Hangul L+V+T -> composed syllable)
+  const std::string nfd_facil = "fa\xCC\x81" "cil";
+  const std::string nfc_facil = "f\xC3\xA1" "cil";
+  EXPECT_EQ(Qwen3Tokenizer::normalize_nfc(nfd_facil), nfc_facil);
+  const std::string nfd_hangul = "\xE1\x84\x92\xE1\x85\xA1\xE1\x86\xAB";  // ㅎ + ㅏ + ㄴ (한)
+  const std::string nfc_hangul = "\xED\x95\x9C";                          // 한
+  EXPECT_EQ(Qwen3Tokenizer::normalize_nfc(nfd_hangul), nfc_hangul);
 
   // Rollback across incomplete UTF-8 boundary + header preservation
   std::vector<int64_t> header_plus_tokens = {23, 24, 151704, 16, 21, 10, 11, 12, 13, 14, 151645};
@@ -426,11 +484,361 @@ void test_streaming_pipeline_30s_and_guards() {
     EXPECT_TRUE(!updates.empty() && updates.back().is_final);
     EXPECT_EQ(updates.back().text, "");
   }
+
+  // 4. Real streaming rollback=5 prefix delivery + error preservation + non-spinning wait predicate
+  {
+    StreamingPipelineConfig cfg;
+    cfg.initial_stride_samples = 1000;
+    cfg.step_stride_samples = 1000;
+    cfg.max_segment_samples = 10000;
+    cfg.max_final_redecode_samples = 20000;
+    cfg.min_final_samples = 100;
+    cfg.rollback_token_count = 5;
+    cfg.expect_language_header = true;
+
+    std::atomic<int> call_num{0};
+    std::vector<std::vector<int64_t>> seen_prefixes;
+    std::vector<TranscriptUpdate> updates;
+    std::vector<float> voiced(1200, 0.05f);
+
+    Qwen3StreamingPipeline pipe(
+        cfg,
+        tok,
+        [&](const std::vector<float>&, const DecodeOptions& opts) -> DecodeResult {
+          const int c = ++call_num;
+          seen_prefixes.push_back(opts.prefix_tokens);
+          DecodeResult res;
+          if (c == 1) {
+            // 8 content tokens after <asr_text>: rollback=5 preserves 3 content tokens -> 6 total prefix tokens
+            res.text = "valid_preview";
+            res.raw_tokens = {23, 24, 151704, 100, 101, 102, 103, 104, 105, 106, 107};
+          } else if (c == 2) {
+            // Transient streaming error must NOT overwrite preview or clear prefix
+            res.error = "transient_stream_err";
+          } else {
+            // Final <=30s error must retain valid_preview and propagate error
+            res.error = "final_decode_failed";
+          }
+          return res;
+        },
+        [&](const TranscriptUpdate& u) { updates.push_back(u); });
+
+    std::thread th([&]() { pipe.run_loop(); });
+    pipe.push_samples(voiced);
+    while (call_num.load() < 1) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    pipe.push_samples(voiced);
+    while (call_num.load() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    pipe.request_stop(false, true);
+    th.join();
+
+    EXPECT_TRUE(seen_prefixes.size() >= 3);
+    EXPECT_TRUE(seen_prefixes[0].empty());
+    EXPECT_EQ(seen_prefixes[1], (std::vector<int64_t>{23, 24, 151704, 100, 101, 102}));
+    EXPECT_TRUE(seen_prefixes[2].empty());
+    EXPECT_TRUE(!updates.empty() && updates.back().is_final);
+    EXPECT_EQ(updates.back().text, "valid_preview");
+    EXPECT_EQ(updates.back().error, "final_decode_failed");
+  }
+
+  // 5. >30s final tail error preserves committed + active preview and wait predicate does not spin
+  {
+    StreamingPipelineConfig cfg;
+    cfg.initial_stride_samples = 1000;
+    cfg.step_stride_samples = 1000;
+    cfg.max_segment_samples = 2000;
+    cfg.max_final_redecode_samples = 3000;
+    cfg.min_final_samples = 100;
+    cfg.rollback_token_count = 2;
+    cfg.expect_language_header = true;
+
+    std::atomic<int> decode_cnt{0};
+    std::vector<TranscriptUpdate> updates;
+    Qwen3StreamingPipeline pipe(
+        cfg,
+        tok,
+        [&](const std::vector<float>&, const DecodeOptions& opts) -> DecodeResult {
+          const int c = ++decode_cnt;
+          DecodeResult res;
+          if (opts.max_new_tokens == cfg.final_max_new_tokens) {
+            res.error = "tail_decode_failed";
+          } else {
+            res.text = (c == 1) ? "committed_chunk" : "tail_preview";
+            res.raw_tokens = {23, 24, 151704, 100, 101, 102, 103};
+          }
+          return res;
+        },
+        [&](const TranscriptUpdate& u) { updates.push_back(u); });
+
+    std::vector<float> big(3500, 0.05f);  // > 3000 cap, > 2000 segment cap
+    pipe.push_samples(big);
+    std::thread th([&]() { pipe.run_loop(); });
+    while (decode_cnt.load() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    // Call request_stop(false, false) BEFORE mark_producer_finished(): must sleep cleanly, not spin!
+    pipe.request_stop(false, false);
+    const double cpu_before = process_cpu_ms();
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    const double cpu_ms = process_cpu_ms() - cpu_before;
+    EXPECT_TRUE(cpu_ms < 50.0);
+
+    pipe.mark_producer_finished();
+    th.join();
+    EXPECT_TRUE(!updates.empty() && updates.back().is_final);
+    EXPECT_EQ(updates.back().text, "committed_chunk tail_preview");
+    EXPECT_EQ(updates.back().error, "tail_decode_failed");
+  }
+
+  // 6. Reverse arrival order: mark_producer_finished() before request_stop(false, false)
+  {
+    StreamingPipelineConfig cfg;
+    cfg.initial_stride_samples = 1000;
+    cfg.min_final_samples = 100;
+    std::vector<TranscriptUpdate> updates;
+    Qwen3StreamingPipeline pipe(
+        cfg,
+        tok,
+        [](const std::vector<float>&, const DecodeOptions&) -> DecodeResult {
+          DecodeResult r;
+          r.text = "language English<asr_text>done";
+          return r;
+        },
+        [&](const TranscriptUpdate& u) { updates.push_back(u); });
+    std::thread th([&]() { pipe.run_loop(); });
+    pipe.push_samples(std::vector<float>(1200, 0.05f));
+    pipe.mark_producer_finished();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    pipe.request_stop(false, false);
+    th.join();
+    EXPECT_TRUE(!updates.empty() && updates.back().is_final);
+    EXPECT_EQ(updates.back().text, "done");
+  }
+}
+
+void test_trim_audio_features_unit() {
+  // float32: 2 non-zero frames followed by 3 near-zero frames (<= 1e-6f)
+  std::vector<float> f32(5 * 4, 0.0f);
+  f32[0 * 4 + 2] = 0.01f;
+  f32[1 * 4 + 3] = -2e-6f;
+  f32[2 * 4 + 0] = 5e-7f;  // below 1e-6
+  EXPECT_EQ(Qwen3OnnxEngine::trim_audio_features_f32(f32.data(), 5, 4, 1e-6f), 2);
+
+  std::vector<float> f32_zero(4 * 4, 5e-7f);
+  EXPECT_EQ(Qwen3OnnxEngine::trim_audio_features_f32(f32_zero.data(), 4, 4, 1e-6f), 0);
+
+  // float16: 0x3C00 = 1.0, 0x0000 = 0.0
+  std::vector<uint16_t> f16 = {
+      0x3C00, 0x0000,
+      0x0000, 0x0000,
+      0x0000, 0x0000,
+  };
+  EXPECT_EQ(Qwen3OnnxEngine::trim_audio_features_f16(f16.data(), 3, 2, 1e-6f), 1);
+  std::vector<uint16_t> f16_zero(6, 0x0000);
+  EXPECT_EQ(Qwen3OnnxEngine::trim_audio_features_f16(f16_zero.data(), 3, 2, 1e-6f), 0);
+}
+
+void test_real_ort_engine_fixtures() {
+#ifdef IMCODES_HAS_ONNXRUNTIME
+  const std::filesystem::path base_tmp =
+      std::filesystem::temp_directory_path() / "imcodes_qwen3_onnx_unit_fixture";
+  std::error_code ec;
+  std::filesystem::remove_all(base_tmp, ec);
+
+  auto make_logits_table = [](int64_t vocab, const std::vector<std::pair<int64_t, int64_t>>& transitions,
+                              int64_t default_tok, float default_second_score = 5.0f,
+                              int64_t default_second_tok = 12) {
+    std::vector<float> tbl(static_cast<size_t>(vocab * vocab), -10.0f);
+    for (int64_t row = 0; row < vocab; ++row) {
+      tbl[static_cast<size_t>(row * vocab + default_second_tok)] = default_second_score;
+      tbl[static_cast<size_t>(row * vocab + default_tok)] = 10.0f;
+    }
+    for (const auto& kv : transitions) {
+      const int64_t from = kv.first;
+      const int64_t to = kv.second;
+      for (int64_t c = 0; c < vocab; ++c) {
+        tbl[static_cast<size_t>(from * vocab + c)] = -10.0f;
+      }
+      tbl[static_cast<size_t>(from * vocab + default_second_tok)] = default_second_score;
+      tbl[static_cast<size_t>(from * vocab + to)] = 10.0f;
+    }
+    return tbl;
+  };
+
+  // Fixture 1: Fixed KV dim1 = 32 with EngineConfig::max_total_len = 24,
+  // TrimAudioFeatures (2 active + 4 zero tail frames),
+  // incomplete trailing UTF-8 dropped in visible text, and cancellation + next utterance recovery!
+  {
+    const std::filesystem::path dir = base_tmp / "fixed_kv";
+    EXPECT_TRUE(test_onnx::write_minimal_tokenizer_files(dir / "tokenizer"));
+    // Non-zero head frames (0,1) + zero tail frames (2,3,4,5) -> TrimAudioFeatures leaves 2 frames!
+    std::vector<float> enc_data(6 * 4, 0.0f);
+    enc_data[0 * 4 + 0] = 0.5f;
+    enc_data[1 * 4 + 1] = 0.5f;
+    EXPECT_TRUE(test_onnx::write_const_conv_frontend(dir / "conv_frontend.onnx", 6, 4));
+    EXPECT_TRUE(test_onnx::write_const_encoder(dir / "encoder.int8.onnx", enc_data, 6, 4));
+
+    // Vocab=19: 3=EOS, 4=<asr_text>, 12="hello", 15=partial_utf8(0xE4 0xB8), 17="world"
+    auto tbl = make_logits_table(
+        19,
+        {{4, 12}, {12, 15}, {15, 3}, {17, 17}},
+        3,
+        4.0f,
+        17);
+    EXPECT_TRUE(test_onnx::write_tiny_decoder(dir / "decoder.int8.onnx", tbl, 19, 4, 2, 4, 32));
+
+    Qwen3OnnxEngine eng;
+    EngineConfig cfg;
+    cfg.model_dir = dir;
+    cfg.requested_provider = "cpu";
+    cfg.max_total_len = 24;  // strictly smaller than fixed kv dim1=32!
+    std::string err;
+    EXPECT_TRUE(eng.init(cfg, err));
+    EXPECT_EQ(eng.kv_physical_len(), 32);
+    EXPECT_EQ(eng.max_total_len(), 24);
+
+    // Silence PCM short-circuits BEFORE conv/encoder/decoder even with hotwords!
+    {
+      DecodeOptions silent_opts;
+      silent_opts.hotwords_context = "world";
+      auto sres = eng.decode(std::vector<float>(3200, 0.0f), silent_opts);
+      EXPECT_EQ(sres.prefill_len, 0);
+      EXPECT_EQ(sres.generated_steps, 0);
+      EXPECT_EQ(sres.text, "");
+    }
+
+    // Voiced PCM: TrimAudioFeatures trims 6->2 frames, incomplete UTF-8 (15) dropped from visible text,
+    // while raw_tokens & tokenizer.decode() retain diagnostic U+FFFD!
+    std::vector<float> voiced(6400, 0.05f);
+    int expected_prefill = 0;
+    {
+      DecodeOptions opts;
+      opts.language = "en";  // prompt ends at <asr_text>=4
+      auto res = eng.decode(voiced, opts);
+      EXPECT_EQ(res.error, "");
+      EXPECT_EQ(res.generated_steps, 2);  // token 12 ("hello"), token 15 (partial UTF-8) -> EOS
+      EXPECT_EQ(res.text, "hello");
+      EXPECT_TRUE(res.text.find("\xEF\xBF\xBD") == std::string::npos);
+      EXPECT_EQ(res.raw_tokens, (std::vector<int64_t>{12, 15}));
+      EXPECT_TRUE(eng.tokenizer().decode(res.raw_tokens, true).find("\xEF\xBF\xBD") != std::string::npos);
+      expected_prefill = res.prefill_len;
+      EXPECT_TRUE(expected_prefill > 0 && expected_prefill < 24);
+    }
+
+    // Same encoder with TrimAudioFeatures verification against un-trimmed 6 frames:
+    // Base prompt (9 before + 9 after) + 2 trimmed audio_pad frames = 20 (< 24 if untrimmed).
+    EXPECT_EQ(expected_prefill, 20);
+
+    {
+      // Cancel at prefill step -> cancelled=true, generated_steps=0
+      DecodeOptions copts;
+      copts.language = "en";
+      std::atomic<int> cancel_polls{0};
+      copts.should_cancel = [&]() {
+        return ++cancel_polls >= 4;  // after prefill, before step 1
+      };
+      auto cres = eng.decode(voiced, copts);
+      EXPECT_TRUE(cres.cancelled);
+      EXPECT_EQ(cres.generated_steps, 0);
+
+      // Cancel mid-loop after 1 generated step -> cancelled=true, generated_steps=1, no extra step
+      DecodeOptions step_copts;
+      step_copts.language = "en";
+      std::atomic<int> step_polls{0};
+      step_copts.should_cancel = [&]() {
+        return ++step_polls >= 6;  // 1..4 pass, step 1 generated (=1 step), next iteration cancels
+      };
+      auto scres = eng.decode(voiced, step_copts);
+      EXPECT_TRUE(scres.cancelled);
+      EXPECT_EQ(scres.generated_steps, 1);
+
+      // Next decode runs cleanly with no leftover state
+      DecodeOptions ok_opts;
+      ok_opts.language = "en";
+      auto nres = eng.decode(voiced, ok_opts);
+      EXPECT_TRUE(!nres.cancelled);
+      EXPECT_EQ(nres.text, "hello");
+    }
+  }
+
+  // Fixture 2: Unconditional EOS logits on prefill (prefix vs empty-prefix fallback) & All-Zero Encoder
+  {
+    const std::filesystem::path dir = base_tmp / "eos_and_zero_enc";
+    EXPECT_TRUE(test_onnx::write_minimal_tokenizer_files(dir / "tokenizer"));
+    // First subtest: encoder returns ALL zeros -> decoder must NEVER run (prefill_len == 0)!
+    std::vector<float> zero_enc(4 * 4, 0.0f);
+    EXPECT_TRUE(test_onnx::write_const_conv_frontend(dir / "conv_frontend.onnx", 4, 4));
+    EXPECT_TRUE(test_onnx::write_const_encoder(dir / "encoder.int8.onnx", zero_enc, 4, 4));
+    auto eos_tbl = make_logits_table(19, {}, 3, 5.0f, 12);  // argmax=3(EOS), 2nd=12("hello")
+    EXPECT_TRUE(test_onnx::write_tiny_decoder(dir / "decoder.int8.onnx", eos_tbl, 19, 4, 2, 4, -1));
+
+    Qwen3OnnxEngine zeng;
+    EngineConfig zcfg;
+    zcfg.model_dir = dir;
+    zcfg.requested_provider = "cpu";
+    std::string err;
+    EXPECT_TRUE(zeng.init(zcfg, err));
+    DecodeOptions opts;
+    opts.language = "en";
+    opts.hotwords_context = "world";
+    auto zres = zeng.decode(std::vector<float>(3200, 0.05f), opts);
+    EXPECT_EQ(zres.error, "");
+    EXPECT_EQ(zres.prefill_len, 0);
+    EXPECT_EQ(zres.generated_steps, 0);
+    EXPECT_EQ(zres.text, "");
+
+    // Second subtest: non-zero encoder + unconditional EOS logits (argmax=EOS, 2nd=12="hello"):
+    // - With non-empty prefix_tokens -> stops cleanly on prefill EOS (`generated_steps == 0`), preserves prefix text!
+    // - With empty prefix_tokens -> fallback selects 2nd best (12="hello") and runs decode loop (`generated_steps >= 1`)!
+    std::vector<float> active_enc(4 * 4, 0.25f);
+    EXPECT_TRUE(test_onnx::write_const_encoder(dir / "encoder.int8.onnx", active_enc, 4, 4));
+    Qwen3OnnxEngine eeng;
+    EXPECT_TRUE(eeng.init(zcfg, err));
+
+    std::vector<float> voiced(3200, 0.05f);
+    {
+      DecodeOptions popts;
+      popts.language = "en";
+      popts.prefix_tokens = {17};  // "world"
+      auto pres = eeng.decode(voiced, popts);
+      EXPECT_EQ(pres.error, "");
+      EXPECT_EQ(pres.generated_steps, 0);
+      EXPECT_EQ(pres.text, "world");
+    }
+    {
+      DecodeOptions eopts;
+      eopts.language = "en";
+      eopts.max_new_tokens = 2;
+      auto eres = eeng.decode(voiced, eopts);
+      EXPECT_EQ(eres.error, "");
+      EXPECT_EQ(eres.generated_steps, 1);
+      EXPECT_EQ(eres.text, "hello");
+    }
+    // Provider fallback smoke: requesting auto or GPU EPs initializes cleanly (DML/CUDA or CPU fallback)
+    {
+      for (const std::string& req : {std::string("auto"), std::string("directml"), std::string("cuda")}) {
+        Qwen3OnnxEngine peng;
+        EngineConfig pcfg;
+        pcfg.model_dir = dir;
+        pcfg.requested_provider = req;
+        std::string perr;
+        EXPECT_TRUE(peng.init(pcfg, perr));
+        EXPECT_TRUE(!peng.active_provider().empty());
+        DecodeOptions dopts;
+        dopts.language = "en";
+        dopts.max_new_tokens = 2;
+        auto dres = peng.decode(voiced, dopts);
+        EXPECT_EQ(dres.error, "");
+        EXPECT_EQ(dres.text, "hello");
+      }
+    }
+  }
+
+  std::filesystem::remove_all(base_tmp, ec);
+#endif
 }
 
 void test_real_tokenizer_if_present() {
-  const char* env_dir = std::getenv("IMCODES_QWEN3_TEST_MODEL_DIR");
-  if (!env_dir || !*env_dir) return;
+  const std::string env_dir = get_env_str("IMCODES_QWEN3_TEST_MODEL_DIR");
+  if (env_dir.empty()) return;
   const std::filesystem::path tok_dir = std::filesystem::path(env_dir) / "tokenizer";
   if (!std::filesystem::exists(tok_dir / "vocab.json")) return;
 
@@ -443,11 +851,16 @@ void test_real_tokenizer_if_present() {
   EXPECT_EQ(tok.audio_pad_token_id(), 151676);
   EXPECT_EQ(tok.asr_text_token_id(), 151704);
 
-  const std::string sample = "IM.codes, 中文语音热词测试, hello world";
+  // Verify exact real Qwen2/Qwen3 token IDs under Unicode \p{L} + NFC rules
+  EXPECT_EQ(tok.encode("f\xC3\xA1" "cil", false), (std::vector<int64_t>{69, 55604}));
+  EXPECT_EQ(tok.encode("fa\xCC\x81" "cil", false), (std::vector<int64_t>{69, 55604}));
+
+  const std::string sample =
+      "IM.codes, f\xC3\xA1" "cil, caf\xC3\xA9, na\xC3\xAFve, 中文语音热词测试, hello world";
   const auto ids = tok.encode(sample, false);
   EXPECT_TRUE(!ids.empty());
-  const std::string back = tok.decode(ids, false);
-  EXPECT_EQ(back, sample);
+  EXPECT_EQ(tok.decode(ids, false), sample);
+  EXPECT_EQ(tok.decode_visible(ids, false), sample);
 }
 
 }  // namespace
@@ -459,6 +872,8 @@ int main() {
   test_guards_and_hotwords();
   test_prompt_clamping_bounds();
   test_streaming_pipeline_30s_and_guards();
+  test_trim_audio_features_unit();
+  test_real_ort_engine_fixtures();
   test_real_tokenizer_if_present();
 
   if (g_failures > 0) {
