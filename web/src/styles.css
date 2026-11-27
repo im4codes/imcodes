@@ -481,7 +481,7 @@ html.native-ios-mac .chat-dl-btn {
 .tab-pin { position: absolute; bottom: 1px; left: 1px; font-size: 9px; line-height: 1; margin: 0; color: var(--chrome-warm); filter: drop-shadow(0 0 4px rgba(245,158,11,0.42)); z-index: 4; pointer-events: none; }
 .tab-session-error { margin-left: 4px; font-size: 11px; line-height: 1; flex-shrink: 0; }
 .tab.pinned { box-shadow: inset 0 1px 0 rgba(245,158,11,0.28); }
-.tab { min-height: 34px; min-width: calc(5ch + 30px); padding: 0 15px; cursor: pointer; color: #7b8797; border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0; white-space: nowrap; font-size: 12px; font-weight: 600; transition: color 0.14s, background 0.14s, border-color 0.14s, box-shadow 0.14s; background: rgba(15,23,42,0.38); display: flex; align-items: center; justify-content: center; position: relative; overflow: visible; }
+.tab { min-height: 34px; min-width: calc(5ch + 30px); padding: 0 15px; cursor: pointer; color: #7b8797; border: 1px solid rgba(125,211,252,0.18); border-bottom: none; border-radius: 7px 7px 0 0; white-space: nowrap; font-size: 12px; font-weight: 600; transition: color 0.14s, background 0.14s, border-color 0.14s, box-shadow 0.14s; background: rgba(15,23,42,0.38); display: flex; align-items: center; justify-content: center; position: relative; overflow: visible; }
 .tab-top-left-badges { position: absolute; top: -3px; left: 0; display: inline-flex; align-items: center; gap: 2px; z-index: 3; pointer-events: none; }
 .session-tab-seq { display: inline-flex; align-items: center; justify-content: center; font-size: 9px; font-weight: 700; line-height: 1; padding: 1px 3px; border-radius: 4px; background: rgba(15,23,42,0.94); border: 1px solid rgba(125,211,252,0.38); color: #bae6fd; font-variant-numeric: tabular-nums; box-sizing: border-box; vertical-align: middle; }
 .tab.active .session-tab-seq { border-color: rgba(34,211,238,0.72); color: #e0f2fe; }
@@ -489,11 +489,12 @@ html.native-ios-mac .chat-dl-btn {
 .tab.brain.active .session-tab-seq { border-color: rgba(167,139,250,0.82); color: #ede9fe; }
 .tab-top-left-badges .agent-badge { font-size: 8.5px; font-weight: 700; line-height: 1; padding: 1px 4px; border-radius: 4px; margin: 0; box-sizing: border-box; }
 .tab::before { content: ''; position: absolute; left: 8px; right: 8px; bottom: 0; height: 2px; border-radius: 999px 999px 0 0; background: transparent; pointer-events: none; }
-.tab:hover { color: #dbeafe; background: rgba(15,23,42,0.86); border-color: rgba(125,211,252,0.2); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
-.tab.active { color: #f8fafc; background: linear-gradient(180deg, rgba(34,211,238,0.16), rgba(15,23,42,0.92)); border-color: rgba(34,211,238,0.32); box-shadow: 0 0 0 1px rgba(34,211,238,0.10), 0 0 18px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.06); }
+.tab:hover { color: #dbeafe; background: rgba(15,23,42,0.86); border-color: rgba(125,211,252,0.32); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); }
+.tab.active { color: #f8fafc; background: linear-gradient(180deg, rgba(34,211,238,0.16), rgba(15,23,42,0.92)); border-color: rgba(34,211,238,0.46); box-shadow: 0 0 0 1px rgba(34,211,238,0.10), 0 0 18px rgba(34,211,238,0.14), inset 0 1px 0 rgba(255,255,255,0.06); }
 .tab.active::before { background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); box-shadow: 0 0 10px rgba(34,211,238,0.62); }
-.tab.brain { color: #c4b5fd; }
-.tab.brain.active { color: #ede9fe; background: linear-gradient(180deg, rgba(167,139,250,0.18), rgba(15,23,42,0.94)); border-color: rgba(167,139,250,0.34); border-top-color: transparent; border-bottom-color: #8b5cf6; border-bottom-width: 2px; box-shadow: 0 0 0 1px rgba(167,139,250,0.12), 0 0 18px rgba(167,139,250,0.16), inset 0 1px 0 rgba(255,255,255,0.06); }
+.tab.brain { color: #c4b5fd; border-color: rgba(167,139,250,0.28); }
+.tab.brain:hover { border-color: rgba(167,139,250,0.40); }
+.tab.brain.active { color: #ede9fe; background: linear-gradient(180deg, rgba(167,139,250,0.18), rgba(15,23,42,0.94)); border-color: rgba(167,139,250,0.52); border-bottom-color: #8b5cf6; border-bottom-width: 2px; box-shadow: 0 0 0 1px rgba(167,139,250,0.12), 0 0 18px rgba(167,139,250,0.16), inset 0 1px 0 rgba(255,255,255,0.06); }
 .tab.brain.active::before { background: linear-gradient(90deg, var(--chrome-accent-3), var(--chrome-accent)); box-shadow: 0 0 10px rgba(167,139,250,0.62); }
 @media (pointer: coarse) { .tab { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; touch-action: pan-x; } }
 .tab.busy::after {

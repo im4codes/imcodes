@@ -1523,4 +1523,65 @@ describe('SessionTabs', () => {
     fireEvent.click(tabs[2]);
     expect(onSelect).toHaveBeenCalledWith('sess_short_inactive');
   });
+
+  it('renders visible non-transparent top/left/right borders across inactive and active regular and brain tabs', () => {
+    const cssText = readTabStyles();
+
+    const tabRule = cssText.match(/(?:^|\n)\.tab\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(tabRule).toMatch(/border:\s*1px solid rgba\(125,\s*211,\s*252,\s*0\.18\)/);
+    expect(tabRule).toContain('border-bottom: none');
+
+    const tabHoverRule = cssText.match(/(?:^|\n)\.tab:hover\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(tabHoverRule).toMatch(/border-color:\s*rgba\(125,\s*211,\s*252,\s*0\.32\)/);
+
+    const activeTabRule = cssText.match(/(?:^|\n)\.tab\.active\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(activeTabRule).toMatch(/border-color:\s*rgba\(34,\s*211,\s*238,\s*0\.46\)/);
+
+    const brainTabRule = cssText.match(/(?:^|\n)\.tab\.brain\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(brainTabRule).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.28\)/);
+
+    const brainTabHoverRule = cssText.match(/(?:^|\n)\.tab\.brain:hover\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(brainTabHoverRule).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.40\)/);
+
+    const activeBrainRule = cssText.match(/(?:^|\n)\.tab\.brain\.active\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(activeBrainRule).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.52\)/);
+    expect(activeBrainRule).not.toMatch(/border-top-color:\s*transparent/);
+    expect(activeBrainRule).toMatch(/border-bottom-color:\s*#8b5cf6/);
+
+    // Verify rendered DOM elements
+    const sessions = makeSessions([
+      { name: 'sess_brain', label: 'Brain', role: 'brain', agentType: 'claude-code-sdk' },
+      { name: 'sess_w1', label: 'Worker 1', role: 'w1', agentType: 'codex-sdk' },
+    ]);
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="sess_brain"
+        connected={true}
+        latencyMs={15}
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+
+    const renderedTabs = screen.getAllByRole('tab');
+    expect(renderedTabs).toHaveLength(2);
+    // Active brain tab
+    expect(renderedTabs[0].className).toContain('tab');
+    expect(renderedTabs[0].className).toContain('brain');
+    expect(renderedTabs[0].className).toContain('active');
+    // Inactive worker tab
+    expect(renderedTabs[1].className).toContain('tab');
+    expect(renderedTabs[1].className).not.toContain('brain');
+    expect(renderedTabs[1].className).not.toContain('active');
+
+    // Badges sit inside .tab-top-left-badges
+    const badges = renderedTabs[0].querySelector('.tab-top-left-badges');
+    expect(badges).not.toBeNull();
+    const seq = badges?.querySelector('.session-tab-seq');
+    const agentBadge = badges?.querySelector('.agent-badge');
+    expect(seq).not.toBeNull();
+    expect(agentBadge).not.toBeNull();
+  });
 });

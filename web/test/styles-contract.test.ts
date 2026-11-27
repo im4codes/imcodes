@@ -698,7 +698,8 @@ describe('styles.css regression contracts', () => {
   it('active brain session tab keeps a 2px purple bottom border (consistent with other active windows)', () => {
     const activeBrainRule = css.match(/\.tab\.brain\.active\s*\{[^}]*\}/);
     expect(activeBrainRule).not.toBeNull();
-    expect(activeBrainRule![0]).toMatch(/border-top-color:\s*transparent/);
+    expect(activeBrainRule![0]).not.toMatch(/border-top-color:\s*transparent/);
+    expect(activeBrainRule![0]).toMatch(/border-color:\s*rgba\(167,\s*139,\s*250,\s*0\.52\)/);
     expect(activeBrainRule![0]).toMatch(/border-bottom-color:\s*#8b5cf6/);
     expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*2px/);
   });

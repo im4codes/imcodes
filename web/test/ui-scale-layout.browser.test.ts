@@ -1690,6 +1690,19 @@ Gtk.main()
           const b10 = badge10.getBoundingClientRect();
           const t10 = tab10.getBoundingClientRect();
 
+          const tab1Style = window.getComputedStyle(tab1);
+          const tab10Style = window.getComputedStyle(tab10);
+          const tab2 = document.querySelector('[data-testid="session-tab-seq-sess_2"]')?.closest('.tab') as HTMLElement;
+          const tab2Style = window.getComputedStyle(tab2);
+
+          const isNonTransparentBorder = (style: CSSStyleDeclaration) => {
+            const topColor = style.borderTopColor;
+            const topWidth = parseFloat(style.borderTopWidth);
+            const leftWidth = parseFloat(style.borderLeftWidth);
+            const rightWidth = parseFloat(style.borderRightWidth);
+            return topWidth >= 1 && leftWidth >= 1 && rightWidth >= 1 && topColor !== 'transparent' && !topColor.includes('rgba(0, 0, 0, 0)');
+          };
+
           return {
             tab1Text: badge1.textContent,
             badge1LeftOk: b1.left >= bBar0.left - 0.5 && b1.left >= t1.left - 0.5,
@@ -1703,6 +1716,9 @@ Gtk.main()
             badge10RightOk: b10.right <= bBar10.right + 0.5,
             badge10BottomOk: b10.bottom <= bBar10.bottom + 0.5,
             badge10SizeOk: b10.width > 0 && b10.height > 0,
+            tab1BorderOk: isNonTransparentBorder(tab1Style),
+            tab2BorderOk: isNonTransparentBorder(tab2Style),
+            tab10BorderOk: isNonTransparentBorder(tab10Style),
           };
         });
 
@@ -1717,6 +1733,9 @@ Gtk.main()
         expect(edgeCheck.badge10RightOk).toBe(true);
         expect(edgeCheck.badge10BottomOk).toBe(true);
         expect(edgeCheck.badge10SizeOk).toBe(true);
+        expect(edgeCheck.tab1BorderOk).toBe(true);
+        expect(edgeCheck.tab2BorderOk).toBe(true);
+        expect(edgeCheck.tab10BorderOk).toBe(true);
 
         await page.close();
       }
