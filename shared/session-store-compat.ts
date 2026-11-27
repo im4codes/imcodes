@@ -52,6 +52,15 @@ export const SESSION_IDENTITY_PROMPT_MARKER = `"${SESSION_IDENTITY_PROMPT_FIELD}
 /** Recorded in session_store_meta once the stored prompts were removed (a rescan on every start still catches an older build's writes). */
 export const SESSION_DB_META_IDENTITY_SCRUB = 'identity_prompt_scrub';
 
+/**
+ * Per-launch hook credential (`SessionRecord.hookCredential`). Never written to the
+ * `sessions.json` compatibility export, and for transport sessions kept strictly in
+ * memory (never persisted to `sessions.sqlite` or `.bak.*` backups).
+ */
+export const SESSION_HOOK_CREDENTIAL_FIELD = 'hookCredential';
+export const SESSION_HOOK_CREDENTIAL_MARKER = `"${SESSION_HOOK_CREDENTIAL_FIELD}"`;
+export const SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB = 'transport_hook_credential_scrub';
+
 // --- Files the daemon itself rotates beside the database ---------------------------------------------------------
 // ONLY names built from these are ever deleted by the identity cleanup; every other file is listed, never touched.
 /** `sessions.sqlite.bak.1` .. `.bak.N`: online snapshots of the database (newest = 1). */

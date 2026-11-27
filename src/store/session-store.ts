@@ -51,6 +51,7 @@ import {
   readSessionPayloads,
   readSessionStoreSnapshot,
   scrubStoredIdentityRows,
+  scrubTransportHookCredentialRows,
   vacuumSessionDbIfFragmented,
   readSnapshotBlobs,
   readSnapshotPayloads,
@@ -69,13 +70,15 @@ import {
   SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES,
   SESSION_DB_BACKUP_COUNT,
   SESSION_DB_BACKUP_TMP_SUFFIX,
+  SESSION_HOOK_CREDENTIAL_FIELD,
+  SESSION_HOOK_CREDENTIAL_MARKER,
   SESSION_IDENTITY_PROMPT_FIELD,
   SESSION_IDENTITY_PROMPT_REF_FIELD,
 } from '../../shared/session-store-compat.js';
 import { registerMemoryProbe } from '../daemon/memory-probes.js';
-import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, removeStoredIdentity } from './session-record-blobs.js';
+import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, removeStoredIdentity, removeTransportHookCredential } from './session-record-blobs.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
-import { cleanupIdentityBackups, type IdentityBackupCleanupDeps } from './session-identity-backups.js';
+import { cleanupIdentityBackups, cleanupLegacyCredentialBackups, type IdentityBackupCleanupDeps } from './session-identity-backups.js';
 import {
   areClosedSessionRemovalsAuthorized,
   authorizeClosedSessionRemoval,
@@ -580,6 +583,7 @@ function hydrateStore(value: unknown): { store: SessionStore; legacy: boolean } 
         ? table[reference] as string
         : undefined;
     removeStoredIdentity(record, text);
+    removeTransportHookCredential(record);
     sessions[name] = record as unknown as SessionRecord;
   }
   return { store: { sessions }, legacy: table === null };
@@ -704,17 +708,37 @@ function removeStoredIdentityFromDatabase(handle: SessionDbHandle): { scrubbedRo
   }
 }
 
+/** Remove persisted hook credentials from transport session rows in the database; null on failure so the next start retries. */
+function removeTransportHookCredentialsFromDatabase(handle: SessionDbHandle): { scrubbedRows: number; compacted: boolean } | null {
+  try {
+    const result = scrubTransportHookCredentialRows(handle);
+    if (result.scrubbedRows > 0) {
+      logger.info({ rows: result.scrubbedRows, compacted: result.compacted }, 'Removed persisted hook credentials from transport session database rows');
+    }
+    if (!result.compacted && result.scrubbedRows > 0) {
+      logger.warn('Session database could not be compacted after transport hook credentials were removed; the next start retries');
+    }
+    return result;
+  } catch (error) {
+    logger.error({ err: error }, 'Transport hook credentials could not be removed from the session database; the next start retries');
+    return null;
+  }
+}
+
 /** Databases whose rotation products this process already cleaned (a process never writes a prompt, so once is enough). */
 const identityBackupCleanupStarted = new Set<string>();
 let identityBackupCleanup: Promise<void> = Promise.resolve();
 let identityBackupCleanupDeps: IdentityBackupCleanupDeps = {};
 
 /** In the background: loading must not wait for scanning up to eight old files, and nothing here may fail a start. */
-function startIdentityBackupCleanup(targetPath: string): void {
+function startIdentityBackupCleanup(targetPath: string, opts: { identity: boolean; credential: boolean }): void {
   if (identityBackupCleanupStarted.has(targetPath)) return;
+  if (!opts.identity && !opts.credential) return;
   identityBackupCleanupStarted.add(targetPath);
-  identityBackupCleanup = cleanupIdentityBackups(targetPath, join(dirname(targetPath), LEGACY_JSON_FILE), identityBackupCleanupDeps)
-    .then((result) => {
+  const jsonPath = join(dirname(targetPath), LEGACY_JSON_FILE);
+  identityBackupCleanup = (async () => {
+    if (opts.identity) {
+      const result = await cleanupIdentityBackups(targetPath, jsonPath, identityBackupCleanupDeps);
       if (result.removed.length > 0) {
         // The newest snapshot may be gone: let the next flush write a clean one instead of waiting out the interval.
         if (dbPath() === targetPath) lastBackupAt = 0;
@@ -724,12 +748,23 @@ function startIdentityBackupCleanup(targetPath: string): void {
       if (result.untouched.length > 0 && (result.removed.length > 0 || result.failed.length > 0)) {
         logger.info({ files: result.untouched }, 'Other session files in the state directory were left untouched (not made by the daemon rotation); delete them if they are not needed');
       }
-    })
-    .catch((error) => { logger.warn({ err: error }, 'Cleaning old session backups failed; the next start retries'); });
+    }
+    if (opts.credential) {
+      const credResult = await cleanupLegacyCredentialBackups(targetPath, jsonPath, identityBackupCleanupDeps);
+      if (credResult.removed.length > 0) {
+        if (dbPath() === targetPath) lastBackupAt = 0;
+        logger.info({ removed: credResult.removed }, 'Removed old session backups that held persisted hook credentials');
+      }
+      if (credResult.failed.length > 0) {
+        logger.warn({ failed: credResult.failed }, 'Old session backups holding persisted hook credentials could not be removed; the next start retries');
+      }
+    }
+  })().catch((error) => { logger.warn({ err: error }, 'Cleaning old session backups failed; the next start retries'); });
 }
 
 /** Test seams: wait for the background cleanup; forget which databases were cleaned; inject the file removal. */
 export async function waitForIdentityBackupCleanupForTests(): Promise<void> { await identityBackupCleanup; }
+export const waitForCredentialBackupCleanupForTests = waitForIdentityBackupCleanupForTests;
 export function resetIdentityBackupCleanupForTests(deps: IdentityBackupCleanupDeps = {}): void {
   identityBackupCleanupStarted.clear();
   identityBackupCleanup = Promise.resolve();
@@ -813,6 +848,7 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
       await migrateLegacyJson(handle);
       // The identity prompt is not session state: rows an older build stored it in are cleaned BEFORE they are read.
       const identityScrub = removeStoredIdentityFromDatabase(handle);
+      const credentialScrub = removeTransportHookCredentialsFromDatabase(handle);
       let payloads = readSessionPayloads(handle);
       if (
         payloads.size === 0
@@ -826,7 +862,12 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
       // Older processes see the migrated sessions at once -- but only once they ARE migrated.
       if (legacyImportDone(handle)) scheduleCompatExport(targetPath, true);
       // Only once the live database is clean AND the import of sessions.json is done (those backups are its source until then).
-      if (identityScrub && legacyImportDone(handle)) startIdentityBackupCleanup(targetPath);
+      if (legacyImportDone(handle) && (identityScrub || credentialScrub)) {
+        startIdentityBackupCleanup(targetPath, {
+          identity: Boolean(identityScrub),
+          credential: Boolean(credentialScrub),
+        });
+      }
     } else {
       const sessions = await readWithoutAuthority(targetPath);
       if (sessions) store = { sessions };
@@ -1171,6 +1212,7 @@ const COMPAT_WORKER_SOURCE = `
   parentPort.on('message', (job) => {
     try {
       fs.writeFileSync(job.tmp, job.head + job.parts.join(',') + job.tail, { mode: 0o600 });
+      if (process.platform !== 'win32') try { fs.chmodSync(job.tmp, 0o600); } catch (_) { /* best effort */ }
       fs.renameSync(job.tmp, job.path);
       parentPort.postMessage({ id: job.id, ok: true });
     } catch (error) {
@@ -1251,14 +1293,21 @@ function scheduleCompatExport(targetPath: string, immediate = false): void {
 
 let lastCompatSkipWarnAt = 0;
 
-/** A payload with blob refs, rebuilt with those fields inline (older readers know no blob table). */
-function compatInlinePayload(name: string, payload: string): string {
+/** Serialize one row for sessions.json compatibility export: inline blob refs and never expose hookCredential. */
+function compatSerializePayload(name: string, payload: string): string | null {
+  const hasBlobs = hasGenericBlobRefs(payload);
+  const hasHookCredential = payload.includes(SESSION_HOOK_CREDENTIAL_MARKER);
+  if (!hasBlobs && !hasHookCredential) return payload;
   try {
     const parsed = JSON.parse(payload) as Record<string, unknown>;
-    return JSON.stringify(hydrateSessionRecord(parsed, (hash) => blobTextByHash.get(hash)));
+    const record = hasBlobs
+      ? hydrateSessionRecord(parsed, (hash) => blobTextByHash.get(hash))
+      : { ...parsed };
+    delete record[SESSION_HOOK_CREDENTIAL_FIELD];
+    return JSON.stringify(record);
   } catch (error) {
     logger.warn({ err: error, session: name }, 'sessions.json compatibility export: row kept as stored');
-    return payload;
+    return hasHookCredential ? null : payload;
   }
 }
 
@@ -1288,11 +1337,12 @@ function runCompatExport(targetPath: string): Promise<void> {
       const parts: string[] = [];
       let estimatedBytes = 0;
       for (const [name, payload] of committedPayloads) {
-        // Rows carry large fields by reference; older readers expect them inline. The identity prompt is in neither
-        // form: it is not stored, so the file an older build reads has no `identityPrompts` table and no prompt.
-        const inline = hasGenericBlobRefs(payload) ? compatInlinePayload(name, payload) : payload;
-        parts.push(`${JSON.stringify(name)}:${inline}`);
-        estimatedBytes += inline.length;
+        // Rows carry large fields by reference; older readers expect them inline. The identity prompt and
+        // hookCredential are never exported to sessions.json.
+        const serialized = compatSerializePayload(name, payload);
+        if (serialized === null) continue;
+        parts.push(`${JSON.stringify(name)}:${serialized}`);
+        estimatedBytes += serialized.length;
       }
       if (estimatedBytes > SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES) {
         // The file is write-only for older builds; past the budget the main thread is worth more than a fresher copy of it.

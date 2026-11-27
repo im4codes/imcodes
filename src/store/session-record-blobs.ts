@@ -9,10 +9,12 @@
  */
 import { createHash } from 'node:crypto';
 import {
+  SESSION_HOOK_CREDENTIAL_FIELD,
   SESSION_IDENTITY_PROMPT_FIELD,
   SESSION_IDENTITY_PROMPT_REF_FIELD,
   SESSION_RECORD_INLINE_STRING_MAX_CHARS,
 } from '../../shared/session-store-compat.js';
+import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { SESSION_BLOB_CACHE_MAX_CHARS } from '../../shared/daemon-memory-guard.js';
 import { SESSION_IDENTITY_SCOPES } from '../../shared/session-identity.js';
 import { identityContentHash, identityPromptHash } from '../util/identity-prompt-hash.js';
@@ -68,13 +70,27 @@ function isLargeString(value: unknown): value is string {
   return typeof value === 'string' && value.length > SESSION_RECORD_INLINE_STRING_MAX_CHARS;
 }
 
+/** Whether this record represents a transport session (as opposed to a tmux/process session). */
+export function isTransportSessionRecord(record: Record<string, unknown>): boolean {
+  if (record['runtimeType'] === 'transport') return true;
+  if (record['runtimeType'] === 'process') return false;
+  return typeof record['agentType'] === 'string' && getSessionRuntimeType(record['agentType']) === 'transport';
+}
+
 export function externalizeSessionRecord(record: object): ExternalizedSessionRecord {
   const blobs: SessionBlob[] = [];
   const out: Record<string, unknown> = {};
   let refs: Record<string, string> | undefined;
-  for (const [key, value] of Object.entries(record as Record<string, unknown>)) {
-    // Never carry stale references forward, and never store the identity prompt (even if a caller still sets one).
-    if (key === SESSION_BLOB_REFS_FIELD || key === SESSION_IDENTITY_PROMPT_FIELD || key === SESSION_IDENTITY_PROMPT_REF_FIELD) continue;
+  const raw = record as Record<string, unknown>;
+  const stripHookCredential = isTransportSessionRecord(raw);
+  for (const [key, value] of Object.entries(raw)) {
+    // Never carry stale references forward, never store the identity prompt, and keep transport hook credentials in memory only.
+    if (
+      key === SESSION_BLOB_REFS_FIELD
+      || key === SESSION_IDENTITY_PROMPT_FIELD
+      || key === SESSION_IDENTITY_PROMPT_REF_FIELD
+      || (stripHookCredential && key === SESSION_HOOK_CREDENTIAL_FIELD)
+    ) continue;
     if (isLargeString(value)) {
       const hash = hashSessionBlob(value);
       blobs.push({ hash, text: value });
@@ -125,7 +141,28 @@ export function hydrateSessionRecord(
   for (const [field, value] of Object.entries(record)) {
     if (isLargeString(value)) record[field] = internSessionText(value);
   }
+  if (isTransportSessionRecord(record)) delete record[SESSION_HOOK_CREDENTIAL_FIELD];
   return record;
+}
+
+/**
+ * Remove a persisted hook credential from a transport session record in place.
+ * Returns true when a persisted credential field or blob ref was present.
+ */
+export function removeTransportHookCredential(record: Record<string, unknown>): boolean {
+  if (!isTransportSessionRecord(record)) return false;
+  let removed = false;
+  if (SESSION_HOOK_CREDENTIAL_FIELD in record) {
+    delete record[SESSION_HOOK_CREDENTIAL_FIELD];
+    removed = true;
+  }
+  const refs = record[SESSION_BLOB_REFS_FIELD];
+  if (refs && typeof refs === 'object' && !Array.isArray(refs) && SESSION_HOOK_CREDENTIAL_FIELD in refs) {
+    delete (refs as Record<string, unknown>)[SESSION_HOOK_CREDENTIAL_FIELD];
+    if (Object.keys(refs as Record<string, unknown>).length === 0) delete record[SESSION_BLOB_REFS_FIELD];
+    removed = true;
+  }
+  return removed;
 }
 
 /** The text of the session section of a rendered identity (what an Agent is provisioned with), if it has one. */

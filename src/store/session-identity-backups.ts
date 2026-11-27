@@ -11,6 +11,7 @@
  * `sessions.json.backup-*`, `*.empty-at-*`, the one-time `.migrated-to-sqlite` freeze -- is left alone and only listed
  * (name, size) so the owner decides.
  */
+import { existsSync } from 'node:fs';
 import { lstat, open, readdir, rm } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import {
@@ -19,8 +20,12 @@ import {
   SESSION_DB_BACKUP_COUNT,
   SESSION_DB_BACKUP_INFIX,
   SESSION_DB_BACKUP_TMP_SUFFIX,
+  SESSION_HOOK_CREDENTIAL_FIELD,
+  SESSION_HOOK_CREDENTIAL_MARKER,
   SESSION_IDENTITY_PROMPT_MARKER,
 } from '../../shared/session-store-compat.js';
+import { isTransportSessionRecord, SESSION_BLOB_REFS_FIELD } from './session-record-blobs.js';
+import { readSnapshotPayloads } from './session-store-db.js';
 
 const SCAN_CHUNK_BYTES = 1024 * 1024;
 
@@ -114,6 +119,75 @@ export async function cleanupIdentityBackups(
     if (!name.startsWith(`${dbFile}.`) && !name.startsWith(`${jsonFile}.`) && !name.startsWith(`${dbFile}-`)) continue;
     const bytes = await regularFileSize(join(directory, name));
     if (bytes !== null) result.untouched.push({ name, bytes });
+  }
+  return result;
+}
+
+async function snapshotContainsTransportHookCredential(path: string): Promise<boolean> {
+  const walExisted = existsSync(`${path}-wal`);
+  const shmExisted = existsSync(`${path}-shm`);
+  try {
+    const payloads = readSnapshotPayloads(path);
+    if (!payloads) return false;
+    for (const payload of payloads.values()) {
+      if (!payload.includes(SESSION_HOOK_CREDENTIAL_MARKER)) continue;
+      try {
+        const parsed = JSON.parse(payload) as Record<string, unknown>;
+        if (!isTransportSessionRecord(parsed)) continue;
+        if (SESSION_HOOK_CREDENTIAL_FIELD in parsed) return true;
+        const refs = parsed[SESSION_BLOB_REFS_FIELD];
+        if (refs && typeof refs === 'object' && !Array.isArray(refs) && SESSION_HOOK_CREDENTIAL_FIELD in refs) {
+          return true;
+        }
+      } catch { /* unreadable row skipped */ }
+    }
+    return false;
+  } finally {
+    if (!walExisted) await rm(`${path}-wal`, { force: true }).catch(() => undefined);
+    if (!shmExisted) await rm(`${path}-shm`, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Remove daemon rotation files (`sessions.json.*`, `sessions.json.<pid>.<uuid>.tmp`) that still
+ * hold any `hookCredential`, and SQLite backup snapshots (`sessions.sqlite.bak.*`) that still hold
+ * legacy persisted `hookCredential` values for transport sessions.
+ */
+export async function cleanupLegacyCredentialBackups(
+  databasePath: string,
+  jsonPath: string,
+  deps: IdentityBackupCleanupDeps = {},
+): Promise<Pick<IdentityBackupCleanupResult, 'removed' | 'failed'>> {
+  const result: Pick<IdentityBackupCleanupResult, 'removed' | 'failed'> = { removed: [], failed: [] };
+  const directory = dirname(databasePath);
+  const dbFile = basename(databasePath);
+  const jsonFile = basename(jsonPath);
+  const removeFile = deps.removeFile ?? ((path: string) => rm(path));
+  let entries: string[];
+  try {
+    entries = await readdir(directory);
+  } catch {
+    return result;
+  }
+  const dbBackupTmpName = `${dbFile}${SESSION_DB_BACKUP_TMP_SUFFIX}`;
+  const dbBackupPrefix = `${dbFile}${SESSION_DB_BACKUP_INFIX}`;
+  const rotation = rotationProductNames(dbFile, jsonFile, entries);
+  for (const name of rotation) {
+    const path = join(directory, name);
+    const bytes = await regularFileSize(path);
+    if (bytes === null) continue;
+    try {
+      if (!await fileContainsText(path, SESSION_HOOK_CREDENTIAL_MARKER)) continue;
+      const isDbSnapshot = name === dbBackupTmpName || name.startsWith(dbBackupPrefix);
+      const shouldRemove = isDbSnapshot
+        ? (await snapshotContainsTransportHookCredential(path)) || name === dbBackupTmpName
+        : true;
+      if (!shouldRemove) continue;
+      await removeFile(path);
+      result.removed.push({ name, bytes });
+    } catch (error) {
+      result.failed.push({ name, error: error instanceof Error ? error.message : String(error) });
+    }
   }
   return result;
 }

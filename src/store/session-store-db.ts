@@ -11,19 +11,21 @@
  * this file only reads and writes rows.
  */
 import { createRequire } from 'node:module';
-import { existsSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 
 import {
   SESSION_DB_META_IDENTITY_SCRUB,
+  SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB,
   SESSION_DB_VACUUM_MIN_FREE_BYTES,
   SESSION_DB_WAL_SIZE_LIMIT_BYTES,
+  SESSION_HOOK_CREDENTIAL_MARKER,
   SESSION_IDENTITY_PROMPT_FIELD,
   SESSION_IDENTITY_PROMPT_MARKER,
   SESSION_IDENTITY_PROMPT_REF_FIELD,
 } from '../../shared/session-store-compat.js';
-import { removeStoredIdentity, type SessionBlob } from './session-record-blobs.js';
+import { removeStoredIdentity, removeTransportHookCredential, type SessionBlob } from './session-record-blobs.js';
 const require = createRequire(import.meta.url);
 suppressSqliteExperimentalWarning();
 const sqlite = require('node:sqlite') as typeof import('node:sqlite');
@@ -101,6 +103,17 @@ const SCHEMA_SQL = `
   ) WITHOUT ROWID;
 `;
 
+function enforceOwnerOnlyFileMode(path: string): void {
+  if (process.platform === 'win32') return;
+  try { chmodSync(path, 0o600); } catch { /* absent or unsupported */ }
+}
+
+function enforceSessionDbFileModes(dbPath: string): void {
+  enforceOwnerOnlyFileMode(dbPath);
+  enforceOwnerOnlyFileMode(`${dbPath}-wal`);
+  enforceOwnerOnlyFileMode(`${dbPath}-shm`);
+}
+
 /** Open the writer connection, creating the file and schema. */
 export function openSessionDbForWrite(path: string): SessionDbHandle {
   mkdirSync(dirname(path), { recursive: true });
@@ -113,6 +126,7 @@ export function openSessionDbForWrite(path: string): SessionDbHandle {
     db.exec(`PRAGMA journal_size_limit = ${SESSION_DB_WAL_SIZE_LIMIT_BYTES}`);
     db.exec(SCHEMA_SQL);
     db.prepare('INSERT OR IGNORE INTO session_store_meta (key, value) VALUES (?, ?)').run('schema_version', String(SESSION_DB_SCHEMA_VERSION));
+    enforceSessionDbFileModes(path);
   } catch (error) {
     try { db.close(); } catch { /* already unusable */ }
     throw error;
@@ -265,11 +279,69 @@ export function scrubStoredIdentityRows(handle: SessionDbHandle): { scrubbedRows
   return { scrubbedRows, compacted };
 }
 
+/**
+ * Remove any persisted hookCredential from transport session rows (older builds stored it on disk).
+ * Transport sessions mint a fresh in-memory hookCredential on every daemon boot/restore, while
+ * tmux process sessions keep theirs in SQLite across daemon restarts.
+ */
+export function scrubTransportHookCredentialRows(handle: SessionDbHandle): { scrubbedRows: number; compacted: boolean } {
+  if (handle.readOnly) return { scrubbedRows: 0, compacted: false };
+  const { db } = handle;
+  const marker = readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB);
+  const candidates = db
+    .prepare('SELECT name, agent_type FROM sessions WHERE instr(payload, ?) > 0')
+    .all(SESSION_HOOK_CREDENTIAL_MARKER) as Array<{ name: string; agent_type: string }>;
+  let scrubbedRows = 0;
+  if (candidates.length > 0) {
+    const read = db.prepare('SELECT payload FROM sessions WHERE name = ?');
+    const write = db.prepare('UPDATE sessions SET payload = ? WHERE name = ?');
+    let blobRefRemoved = false;
+    rowWritesThisTransaction = 0;
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      for (const candidate of candidates) {
+        const payload = (read.get(candidate.name) as { payload?: string } | undefined)?.payload;
+        if (typeof payload !== 'string') continue;
+        let record: Record<string, unknown>;
+        try { record = JSON.parse(payload) as Record<string, unknown>; } catch { continue; }
+        const hadBlobRef = Boolean(
+          record['blobRefs']
+          && typeof record['blobRefs'] === 'object'
+          && !Array.isArray(record['blobRefs'])
+          && 'hookCredential' in (record['blobRefs'] as Record<string, unknown>),
+        );
+        const probe = record['agentType'] === undefined && candidate.agent_type
+          ? { agentType: candidate.agent_type, ...record }
+          : record;
+        if (!removeTransportHookCredential(probe)) continue;
+        if (record['agentType'] === undefined && candidate.agent_type) delete probe['agentType'];
+        noteRowWrite();
+        write.run(JSON.stringify(probe), candidate.name);
+        if (hadBlobRef) blobRefRemoved = true;
+        scrubbedRows += 1;
+      }
+      if (scrubbedRows > 0) {
+        if (blobRefRemoved) collectUnreferencedBlobs(handle);
+        db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_PENDING_VACUUM);
+      }
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch { /* the failure already ended the transaction */ }
+      throw error;
+    }
+  }
+  if (scrubbedRows === 0 && marker !== SCRUB_PENDING_VACUUM) return { scrubbedRows: 0, compacted: false };
+  const compacted = compactSessionDb(handle);
+  if (compacted) db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_DONE);
+  return { scrubbedRows, compacted };
+}
+
 /** VACUUM and truncate the log, whatever the free-page thresholds; false when it could not run (the caller retries later). */
 function compactSessionDb(handle: SessionDbHandle): boolean {
   try {
     handle.db.exec('VACUUM');
     handle.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    enforceSessionDbFileModes(handle.path);
     return true;
   } catch {
     return false;
@@ -309,6 +381,7 @@ export function vacuumSessionDbIfFragmented(handle: SessionDbHandle): { vacuumed
     if (freeBytes < SESSION_DB_VACUUM_MIN_FREE_BYTES || free * 2 < pages) return { vacuumed: false, freeBytes };
     handle.db.exec('VACUUM');
     handle.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    enforceSessionDbFileModes(handle.path);
     return { vacuumed: true, freeBytes };
   } catch {
     return { vacuumed: false, freeBytes: 0 }; // compaction is an optimisation: never a reason to fail a flush
@@ -375,6 +448,7 @@ export function commitSessionChanges(
       }
     }
     db.exec('COMMIT');
+    enforceSessionDbFileModes(handle.path);
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* the failure already ended the transaction */ }
     throw error;
@@ -427,6 +501,7 @@ export function importLegacySessions(
       db.prepare('DELETE FROM session_store_meta WHERE key = ?').run(SESSION_DB_META_LEGITIMATE_EMPTY);
     }
     db.exec('COMMIT');
+    enforceSessionDbFileModes(handle.path);
     return { imported, keptExisting: rows.length - imported };
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* the failure already ended the transaction */ }
@@ -447,9 +522,11 @@ export function markLegacyImportDone(handle: SessionDbHandle): void {
 export async function snapshotSessionDb(handle: SessionDbHandle, destination: string): Promise<void> {
   if (typeof sqlite.backup === 'function') {
     await sqlite.backup(handle.db, destination);
+    enforceOwnerOnlyFileMode(destination);
     return;
   }
   handle.db.exec(`VACUUM INTO '${destination.replace(/'/g, "''")}'`);
+  enforceOwnerOnlyFileMode(destination);
 }
 
 /** Row count of a snapshot file, or null when it is not a usable session database. */

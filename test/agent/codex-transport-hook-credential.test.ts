@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type http from 'node:http';
+import { persistedSessions } from '../helpers/session-store-db.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { buildCodexMcpThreadConfig } from '../../src/agent/providers/codex-sdk.js';
@@ -127,6 +128,10 @@ describe('Codex transport launch/restore HTTP MCP credential binding', () => {
     const firstRecord = store.getSession('deck_codexcred_brain')!;
     expect(firstRecord.hookCredential).toBeTruthy();
     expect(firstRecord.sessionInstanceId).toBeTruthy();
+    await store.flushStore();
+    await store.waitForCompatExportForTests();
+    expect(persistedSessions(home)['deck_codexcred_brain']).not.toHaveProperty('hookCredential');
+    expect(readFileSync(path.join(home, '.imcodes', 'sessions.json'), 'utf8')).not.toContain('hookCredential');
     const firstConfig = capturedConfigs.at(-1)!;
     expect(firstConfig.env?.[HOOK_SESSION_CREDENTIAL_ENV]).toBe(firstRecord.hookCredential);
 
@@ -189,5 +194,25 @@ describe('Codex transport launch/restore HTTP MCP credential binding', () => {
     await expect(clientRestored.callTool({ name: 'search_memory', arguments: { query: 'restored' } }))
       .resolves.toMatchObject({ structuredContent: { status: 'ok', session: 'deck_codexcred_brain' } });
     await clientRestored.close().catch(() => {});
+
+    // Simulate a true daemon restart: reload from SQLite where no transport hookCredential was written,
+    // then restoreTransportSessions mints a fresh credential in memory and /mcp accepts only the new one.
+    await stopTransportRuntimeSession('deck_codexcred_brain');
+    await store.flushStore();
+    store.resetSessionStoreAuthorityForTests();
+    await store.loadStore({ probe: false });
+    expect(store.getSession('deck_codexcred_brain')?.hookCredential).toBeUndefined();
+    await restoreTransportSessions('codex-sdk', { sessionName: 'deck_codexcred_brain', concurrency: 1, interSessionDelayMs: 0 });
+    const rebootedRecord = store.getSession('deck_codexcred_brain')!;
+    expect(rebootedRecord.hookCredential).toBeTruthy();
+    expect(rebootedRecord.hookCredential).not.toBe(restoredRecord.hookCredential);
+    const rebootedEntry = (buildCodexMcpThreadConfig(capturedConfigs.at(-1)!) as Record<string, any>).mcp_servers['imcodes-memory'];
+    const clientRebooted = new Client({ name: 'codex-rebooted', version: '1' });
+    await clientRebooted.connect(new StreamableHTTPClientTransport(new URL(rebootedEntry.url), {
+      requestInit: { headers: rebootedEntry.http_headers },
+    }));
+    await expect(clientRebooted.callTool({ name: 'search_memory', arguments: { query: 'rebooted' } }))
+      .resolves.toMatchObject({ structuredContent: { status: 'ok', session: 'deck_codexcred_brain' } });
+    await clientRebooted.close().catch(() => {});
   });
 });
