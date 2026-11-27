@@ -177,14 +177,44 @@ describe('client-downloads helpers', () => {
     expect(openSpy).not.toHaveBeenCalled();
     expect(clickedAnchors).toEqual([{ href: 'https://host.im.codes/api/downloads/latest/desktop-linux-deb', download: '' }]);
 
-    // 5. Fetch error / old server rejection falls back to <a download>
+    // 5. Same-origin reverse-proxy/R2 artifact URL triggers in-page <a download> preserving query params and NEVER opens window.open
+    setWindowOrigin('https://selfhost.example');
+    configure('https://selfhost.example');
+    openSpy.mockClear();
+    clickedAnchors.length = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      mode: 'redirect',
+      url: 'https://selfhost.example/artifacts/master/imcodes.apk?v=9cc448ae',
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    await openPcAppDownloadUrl('https://selfhost.example/api/downloads/latest/android-with-fcm');
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(clickedAnchors).toEqual([
+      { href: 'https://selfhost.example/artifacts/master/imcodes.apk?v=9cc448ae', download: '' },
+    ]);
+
+    // 6. Same-origin self-referential /api/downloads/ URL falls back to clean base download URL without ?resolve=json or window.open
+    openSpy.mockClear();
+    clickedAnchors.length = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      mode: 'redirect',
+      url: 'https://selfhost.example/api/downloads/latest/android-with-fcm?resolve=json',
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    await openPcAppDownloadUrl('https://selfhost.example/api/downloads/latest/android-with-fcm');
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(clickedAnchors).toEqual([
+      { href: 'https://selfhost.example/api/downloads/latest/android-with-fcm', download: '' },
+    ]);
+
+    // 7. Fetch error / old server rejection falls back to <a download>
     clickedAnchors.length = 0;
     vi.stubGlobal('fetch', vi.fn(async () => {
       throw new Error('network_failure');
     }));
-    await openPcAppDownloadUrl('https://host.im.codes/api/downloads/latest/desktop-linux-sh');
+    await openPcAppDownloadUrl('https://selfhost.example/api/downloads/latest/desktop-linux-sh');
     expect(openSpy).not.toHaveBeenCalled();
-    expect(clickedAnchors).toEqual([{ href: 'https://host.im.codes/api/downloads/latest/desktop-linux-sh', download: '' }]);
+    expect(clickedAnchors).toEqual([{ href: 'https://selfhost.example/api/downloads/latest/desktop-linux-sh', download: '' }]);
     clickSpy.mockRestore();
   });
 });

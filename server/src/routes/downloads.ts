@@ -4,6 +4,12 @@ import { resolve, sep } from 'node:path';
 import { Hono, type Context } from 'hono';
 import type { Env, EnvConfig } from '../env.js';
 import {
+  CLIENT_DOWNLOAD_RESOLVE_MODES,
+  CLIENT_DOWNLOAD_RESOLVE_QUERY_PARAM,
+  CLIENT_DOWNLOAD_RESOLVE_QUERY_VALUE,
+  type ClientDownloadResolveResponse,
+} from '../../../shared/client-downloads.js';
+import {
   extractArtifactDistributionEnv,
   loadReleaseArtifactsManifest,
   resolveArtifactChannel,
@@ -127,10 +133,13 @@ export function createDownloadsRoutes(
     if (!channelQuery.valid) {
       return c.json({ error: 'invalid_channel' }, 400);
     }
-    const resolveJson = c.req.query('resolve') === 'json';
+    const resolveJson = c.req.query(CLIENT_DOWNLOAD_RESOLVE_QUERY_PARAM) === CLIENT_DOWNLOAD_RESOLVE_QUERY_VALUE;
     const respondRedirect = (location: string) => {
       if (resolveJson) {
-        return c.json({ ok: true, mode: 'redirect' as const, url: location }, 200);
+        return c.json<ClientDownloadResolveResponse>(
+          { ok: true, mode: CLIENT_DOWNLOAD_RESOLVE_MODES.REDIRECT, url: location },
+          200,
+        );
       }
       c.header('Location', location);
       return c.body(null, 302);
@@ -180,7 +189,10 @@ export function createDownloadsRoutes(
     }
     if (resolveJson) {
       try {
-        return c.json({ ok: true, mode: 'stream' as const, url: null }, 200);
+        return c.json<ClientDownloadResolveResponse>(
+          { ok: true, mode: CLIENT_DOWNLOAD_RESOLVE_MODES.STREAM, url: null },
+          200,
+        );
       } finally {
         await opened.close();
       }
