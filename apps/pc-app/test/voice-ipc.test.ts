@@ -3098,23 +3098,39 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
         { type: 'result', text: '隔离恢复终解', isFinal: true },
         { type: 'end' },
       ]);
+
+      // C2 (post-timeout reopen): abort without `end` -> timeout ALREADY fires BEFORE user calls startListening later -> MUST NOT bind old w1!
+      expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+      await voice.stopListening({ abort: true });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(procs[1]!.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
+      sentEvents.length = 0;
+      expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+      expect(procs).toHaveLength(3);
+      procs[1]!.stdout.emit('data', '{"type":"result","text":"过期旧w1残留","isFinal":true}\n{"type":"end"}\n');
+      procs[2]!.stdout.emit('data', '{"type":"start"}\n{"type":"result","text":"超时后重开新final","isFinal":true}\n{"type":"end"}\n');
+      expect(sentEvents.filter((e) => e.type !== 'loading')).toEqual([
+        { type: 'start' },
+        { type: 'result', text: '超时后重开新final', isFinal: true },
+        { type: 'end' },
+      ]);
     } finally {
       vi.useRealTimers();
     }
 
-    // D: start -> normal stop (in-flight final) -> abort -> immediate start -> spawns fresh worker w2 & ignores late w1 events
+    // D: start -> normal stop (in-flight final) -> abort -> immediate start -> spawns fresh worker w3 & ignores late w2 events
     sentEvents.length = 0;
     expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
     const pendingStopP = voice.stopListening({ abort: false });
     await voice.stopListening({ abort: true });
     await pendingStopP;
-    expect(procs[1]!.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
+    expect(procs[2]!.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
 
     sentEvents.length = 0;
     expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
-    expect(procs).toHaveLength(3);
-    procs[1]!.stdout.emit('data', '{"type":"result","text":"老worker延迟终解","isFinal":true}\n{"type":"end"}\n');
-    procs[2]!.stdout.emit('data', '{"type":"start"}\n{"type":"result","text":"全新worker终解","isFinal":true}\n{"type":"end"}\n');
+    expect(procs).toHaveLength(4);
+    procs[2]!.stdout.emit('data', '{"type":"result","text":"老worker延迟终解","isFinal":true}\n{"type":"end"}\n');
+    procs[3]!.stdout.emit('data', '{"type":"start"}\n{"type":"result","text":"全新worker终解","isFinal":true}\n{"type":"end"}\n');
     expect(sentEvents).toEqual([
       { type: 'start' },
       { type: 'result', text: '全新worker终解', isFinal: true },

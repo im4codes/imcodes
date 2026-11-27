@@ -451,13 +451,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let mlxWorker: ResidentMlxWorker | null = null;
   let activeWorkerUtterance: ActiveWorkerUtterance | null = null;
   let startRequestSeq = 0;
-  let pendingStartRequest: {
+  interface PendingStartRequest {
     seq: number;
     source?: 'in-app' | 'global';
     finalizeOnly: boolean;
     aborted: boolean;
     wakeOnCancel?: () => void;
-  } | null = null;
+  }
+  let pendingStartRequest: PendingStartRequest | null = null;
   let activeRemoteSession: { sessionId: string; utt: ActiveWorkerUtterance } | null = null;
   let remoteStopTimer: ReturnType<typeof setTimeout> | null = null;
   let remoteIdleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1724,6 +1725,20 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
   };
 
+  const isolateWorker = (worker: ResidentMlxWorker): void => {
+    worker.awaitingAbortedEnd = false;
+    resolveAbortedEndWait(worker, false);
+    shutdownMlxWorker(worker);
+    if (isWin32) {
+      try {
+        worker.proc.kill('SIGTERM');
+      } catch { /* ignore */ }
+    }
+  };
+
+  const isResidentWorkerUsable = (candidate: ResidentMlxWorker | null): candidate is ResidentMlxWorker =>
+    Boolean(candidate && candidate === mlxWorker && candidate.state !== 'stopping' && !serveUnsupported);
+
   const detachAndAbortWorker = (
     worker: ResidentMlxWorker | null,
     utt: ActiveWorkerUtterance,
@@ -1734,12 +1749,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     if (utt.stopRequested || (options?.shutdownIfNotReady && (worker.state === 'starting' || worker.state === 'loading'))) {
       // Isolate & shut down any worker whose in-flight final decode is aborted or timed out
       // (both macOS MLX and Windows Sherpa) so delayed result/end frames never hit a new utterance.
-      shutdownMlxWorker(worker);
-      if (isWin32) {
-        try {
-          worker.proc.kill('SIGTERM');
-        } catch { /* ignore */ }
-      }
+      isolateWorker(worker);
       return;
     }
     if (options?.writeAbort !== false) {
@@ -1750,7 +1760,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           resolveWait = resolve;
         });
         const timer = setTimeout(() => {
-          resolveAbortedEndWait(worker, false);
+          isolateWorker(worker);
         }, ABORT_END_DRAIN_TIMEOUT_MS);
         if (typeof timer.unref === 'function') {
           timer.unref();
@@ -1760,9 +1770,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       try {
         worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'abort' })}\n`);
       } catch {
-        worker.awaitingAbortedEnd = false;
-        resolveAbortedEndWait(worker, false);
-        shutdownMlxWorker(worker);
+        isolateWorker(worker);
       }
     }
   };
@@ -1774,7 +1782,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     registerCancelWakeup?: (wake: () => void) => void,
   ): Promise<ResidentMlxWorker | null> => {
     let worker = initialWorker;
-    if (!worker || worker.state === 'stopping' || serveUnsupported) return worker;
+    if (!worker || serveUnsupported) return null;
     if (worker.awaitingAbortedEnd && worker.abortedEndWait) {
       const drained = await new Promise<boolean>((resolve) => {
         let settled = false;
@@ -1787,20 +1795,17 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         void worker!.abortedEndWait!.promise.then(finish);
       });
       if (isCancelled()) return null;
-      if (!drained || worker.awaitingAbortedEnd || worker.state === 'stopping') {
-        worker.awaitingAbortedEnd = false;
-        resolveAbortedEndWait(worker, false);
-        shutdownMlxWorker(worker);
-        if (isWin32) {
-          try {
-            worker.proc.kill('SIGTERM');
-          } catch { /* ignore */ }
-        }
+      if (!drained || worker.awaitingAbortedEnd || !isResidentWorkerUsable(worker)) {
+        isolateWorker(worker);
         worker = await ensureResidentMlxWorker(variant, { skipVerify: true });
         if (isCancelled()) return null;
       }
+    } else if (worker.awaitingAbortedEnd || !isResidentWorkerUsable(worker)) {
+      isolateWorker(worker);
+      worker = await ensureResidentMlxWorker(variant, { skipVerify: true });
+      if (isCancelled()) return null;
     }
-    return worker;
+    return isResidentWorkerUsable(worker) ? worker : null;
   };
 
   const cleanupRemoteSession = (
@@ -2034,7 +2039,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       return { ok: false, error: 'empty_pcm' };
     }
     let perms: PcAppVoicePermissions | null = null;
-    const myStartReq = {
+    const myStartReq: PendingStartRequest = {
       seq: ++startRequestSeq,
       source: options?.source,
       finalizeOnly,
@@ -2042,6 +2047,8 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     };
     if (pendingStartRequest && (!options?.source || (pendingStartRequest.source ?? 'in-app') === options.source)) {
       pendingStartRequest.aborted = true;
+      pendingStartRequest.wakeOnCancel?.();
+      pendingStartRequest.wakeOnCancel = undefined;
     }
     pendingStartRequest = myStartReq;
     const isCancelledBeforeDispatch = (): boolean =>
