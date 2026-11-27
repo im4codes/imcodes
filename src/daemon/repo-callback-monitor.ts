@@ -340,6 +340,42 @@ function formatActionFailureDetails(run: RepoWorkflowRun, detail: RepoActionDeta
   return lines.join('\n') || 'CI run failed.';
 }
 
+function getBrainHealthTier(state: SessionRecord['state']): number {
+  if (state !== 'stopped' && state !== 'error') return 0;
+  if (state === 'error') return 1;
+  return 2;
+}
+
+function toSafeTimestamp(ts: unknown): number {
+  return typeof ts === 'number' && Number.isFinite(ts) ? ts : 0;
+}
+
+export function selectProjectBrainSession(projectSessions: SessionRecord[]): SessionRecord | undefined {
+  const brainSessions = projectSessions.filter((s) => s.role === 'brain');
+  if (brainSessions.length === 0) return undefined;
+  if (brainSessions.length === 1) return brainSessions[0];
+
+  return [...brainSessions].sort((a, b) => {
+    const healthA = getBrainHealthTier(a.state);
+    const healthB = getBrainHealthTier(b.state);
+    if (healthA !== healthB) return healthA - healthB;
+
+    const incognitoA = a.incognito ? 1 : 0;
+    const incognitoB = b.incognito ? 1 : 0;
+    if (incognitoA !== incognitoB) return incognitoA - incognitoB;
+
+    const updatedA = toSafeTimestamp(a.updatedAt);
+    const updatedB = toSafeTimestamp(b.updatedAt);
+    if (updatedA !== updatedB) return updatedB - updatedA;
+
+    const createdA = toSafeTimestamp(a.createdAt);
+    const createdB = toSafeTimestamp(b.createdAt);
+    if (createdA !== createdB) return createdB - createdA;
+
+    return a.name.localeCompare(b.name);
+  })[0];
+}
+
 export class RepoCallbackMonitor {
   private readonly store: CallbackTaskStore;
   private readonly getServerLink: () => ServerLink | null;
@@ -1145,7 +1181,7 @@ export class RepoCallbackMonitor {
   private resolveTargetSession(config: RepoCallbackRepoConfig): { sessionName: string; record?: SessionRecord; error?: string } {
     const sessions = this.listSessionsFn();
     const projectSessions = sessions.filter((s) => sameProjectDir(s.projectDir, config.projectDir));
-    const brainRecord = projectSessions.find((s) => s.role === 'brain');
+    const brainRecord = selectProjectBrainSession(projectSessions);
     const inferredProjectName = brainRecord?.projectName
       ?? projectSessions.map((s) => resolveEffectiveProjectName(s, sessions)).find(Boolean);
 
@@ -1155,6 +1191,15 @@ export class RepoCallbackMonitor {
         if (brainRecord.state === 'stopped') {
           return { sessionName: brainRecord.name, record: brainRecord, error: `Brain session ${brainRecord.name} is stopped` };
         }
+        if (brainRecord.state === 'error') {
+          return {
+            sessionName: brainRecord.name,
+            record: brainRecord,
+            error: brainRecord.error
+              ? `Brain session ${brainRecord.name} is in error state: ${brainRecord.error}`
+              : `Brain session ${brainRecord.name} is in error state`,
+          };
+        }
         return { sessionName: brainRecord.name, record: brainRecord };
       }
       if (inferredProjectName) {
@@ -1163,6 +1208,15 @@ export class RepoCallbackMonitor {
         if (fallbackRecord) {
           if (fallbackRecord.state === 'stopped') {
             return { sessionName: fallbackRecord.name, record: fallbackRecord, error: `Brain session ${fallbackRecord.name} is stopped` };
+          }
+          if (fallbackRecord.state === 'error') {
+            return {
+              sessionName: fallbackRecord.name,
+              record: fallbackRecord,
+              error: fallbackRecord.error
+                ? `Brain session ${fallbackRecord.name} is in error state: ${fallbackRecord.error}`
+                : `Brain session ${fallbackRecord.name} is in error state`,
+            };
           }
           return { sessionName: fallbackRecord.name, record: fallbackRecord };
         }
@@ -1183,6 +1237,15 @@ export class RepoCallbackMonitor {
     }
     if (exact.state === 'stopped') {
       return { sessionName: exact.name, record: exact, error: `Target session ${exact.name} is stopped` };
+    }
+    if (exact.state === 'error') {
+      return {
+        sessionName: exact.name,
+        record: exact,
+        error: exact.error
+          ? `Target session ${exact.name} is in error state: ${exact.error}`
+          : `Target session ${exact.name} is in error state`,
+      };
     }
     return { sessionName: exact.name, record: exact };
   }

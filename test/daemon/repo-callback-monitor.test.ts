@@ -18,7 +18,11 @@ import {
 import { CallbackTaskStore } from '../../src/daemon/callback-task-store.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
-import { RepoCallbackMonitor, handleRepoCallbackCommand } from '../../src/daemon/repo-callback-monitor.js';
+import {
+  RepoCallbackMonitor,
+  handleRepoCallbackCommand,
+  selectProjectBrainSession,
+} from '../../src/daemon/repo-callback-monitor.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
 import type { RepoProvider } from '../../src/repo/provider.js';
 import type {
@@ -1810,5 +1814,270 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
 
     store.close();
     rmSync(tmpBase, { recursive: true, force: true });
+  });
+
+  describe('selectProjectBrainSession and multi-brain callback resolution', () => {
+    it('selectProjectBrainSession prioritizes healthy > error > stopped, non-incognito, and recency', () => {
+      // 1. Single brain unchanged
+      const b1 = makeSession({ name: 'b1' });
+      expect(selectProjectBrainSession([b1])).toBe(b1);
+      expect(selectProjectBrainSession([])).toBeUndefined();
+
+      // 2. Health tier: healthy beats error, error beats stopped
+      const errorBrain = makeSession({ name: 'deck_cd1_brain', state: 'error', updatedAt: 2000 });
+      const healthyBrain = makeSession({ name: 'deck_cd_brain', state: 'running', updatedAt: 1000 });
+      const stoppedBrain = makeSession({ name: 'deck_cd0_brain', state: 'stopped', updatedAt: 3000 });
+      expect(selectProjectBrainSession([errorBrain, healthyBrain])).toBe(healthyBrain);
+      expect(selectProjectBrainSession([stoppedBrain, errorBrain])).toBe(errorBrain);
+
+      // 3. Incognito tier: non-incognito beats incognito within healthy tier
+      const incognitoRecent = makeSession({ name: 'deck_incognito_brain', state: 'idle', incognito: true, updatedAt: 9000 });
+      const normalOlder = makeSession({ name: 'deck_normal_brain', state: 'idle', incognito: false, updatedAt: 1000 });
+      expect(selectProjectBrainSession([incognitoRecent, normalOlder])).toBe(normalOlder);
+
+      // 4. Incognito fallback: healthy incognito beats error non-incognito
+      expect(selectProjectBrainSession([incognitoRecent, errorBrain])).toBe(incognitoRecent);
+
+      // 5. Recency: updatedAt descending within same tier
+      const activeBrain = makeSession({ name: 'deck_active_brain', state: 'idle', updatedAt: 5000 });
+      const idleBrain = makeSession({ name: 'deck_idle_brain', state: 'idle', updatedAt: 2000 });
+      expect(selectProjectBrainSession([idleBrain, activeBrain])).toBe(activeBrain);
+
+      // 6. Deterministic tie-breaks with missing/NaN timestamps
+      const nan1 = makeSession({ name: 'b_nan', updatedAt: NaN as never, createdAt: 10 });
+      const nan2 = makeSession({ name: 'a_nan', updatedAt: undefined as never, createdAt: 10 });
+      expect(selectProjectBrainSession([nan1, nan2])?.name).toBe('a_nan');
+    });
+
+    it('counterexample 1: default target="brain" routes to healthy deck_cd_brain over earlier error/stopped deck_cd1_brain', async () => {
+      const store = new CallbackTaskStore(':memory:');
+      const nowMs = 1_700_900_000_000;
+      const sent: Array<{ sessionName: string; text: string }> = [];
+
+      const pr: RepoPR = {
+        number: 81,
+        title: 'Multi-brain PR',
+        author: 'alice',
+        state: 'open',
+        draft: false,
+        head: 'feat/mb',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 1_000,
+        updatedAt: nowMs + 1_000,
+        url: 'https://github.com/acme/widget/pull/81',
+      };
+      const provider: RepoProvider = {
+        ...createMockProvider({}),
+        listPRs: vi.fn(async () => ({ items: [pr], page: 1, hasMore: false, projectDir: '/tmp/repo-multi' })),
+      };
+
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-multi');
+      config.enabled = true;
+      config.target = 'brain';
+      config.sinceAtMs = nowMs;
+      config.events.pr_new.enabled = true;
+
+      // deck_cd1_brain is alphabetically first but in 'error' state
+      const cd1 = makeSession({ name: 'deck_cd1_brain', projectDir: '/tmp/repo-multi', state: 'error', updatedAt: 2000 });
+      const cd = makeSession({ name: 'deck_cd_brain', projectDir: '/tmp/repo-multi', state: 'running', updatedAt: 1000 });
+
+      const monitor = new RepoCallbackMonitor({
+        store,
+        detect: async () => createOkContext('/tmp/repo-multi'),
+        createProvider: () => provider,
+        listSessions: () => [cd1, cd],
+        sendToSession: async (sessionName, text) => {
+          sent.push({ sessionName, text });
+        },
+        now: () => nowMs + 2_000,
+      });
+      monitor.setConfigsForTesting({ repos: { '/tmp/repo-multi': config } });
+
+      const res = await monitor.checkProject('/tmp/repo-multi');
+      expect(res).toEqual({ checked: true, dispatched: 1 });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.sessionName).toBe('deck_cd_brain');
+
+      const callbacks = store.listCallbacks({ scopeKey: '/tmp/repo-multi' });
+      expect(callbacks).toHaveLength(1);
+      expect(callbacks[0]!.targetSession).toBe('deck_cd_brain');
+      expect(callbacks[0]!.status).toBe('pending');
+      store.close();
+    });
+
+    it('counterexample 2: prioritizes non-incognito, recently active healthy Brain', async () => {
+      const store = new CallbackTaskStore(':memory:');
+      const nowMs = 1_700_900_000_000;
+      const sent: Array<{ sessionName: string; text: string }> = [];
+
+      const pr: RepoPR = {
+        number: 82,
+        title: 'Incognito vs Normal PR',
+        author: 'bob',
+        state: 'open',
+        draft: false,
+        head: 'feat/incog',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 1_000,
+        updatedAt: nowMs + 1_000,
+        url: 'https://github.com/acme/widget/pull/82',
+      };
+      const provider: RepoProvider = {
+        ...createMockProvider({}),
+        listPRs: vi.fn(async () => ({ items: [pr], page: 1, hasMore: false, projectDir: '/tmp/repo-multi-2' })),
+      };
+
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-multi-2');
+      config.enabled = true;
+      config.target = 'brain';
+      config.sinceAtMs = nowMs;
+      config.events.pr_new.enabled = true;
+
+      // Temporary incognito brain has higher updatedAt, but normal brain should win
+      const incognitoBrain = makeSession({ name: 'deck_temp_brain', projectDir: '/tmp/repo-multi-2', state: 'idle', incognito: true, updatedAt: 9000 });
+      const normalBrain = makeSession({ name: 'deck_regular_brain', projectDir: '/tmp/repo-multi-2', state: 'idle', incognito: false, updatedAt: 1000 });
+
+      const monitor = new RepoCallbackMonitor({
+        store,
+        detect: async () => createOkContext('/tmp/repo-multi-2'),
+        createProvider: () => provider,
+        listSessions: () => [incognitoBrain, normalBrain],
+        sendToSession: async (sessionName, text) => {
+          sent.push({ sessionName, text });
+        },
+        now: () => nowMs + 2_000,
+      });
+      monitor.setConfigsForTesting({ repos: { '/tmp/repo-multi-2': config } });
+
+      const res = await monitor.checkProject('/tmp/repo-multi-2');
+      expect(res).toEqual({ checked: true, dispatched: 1 });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.sessionName).toBe('deck_regular_brain');
+
+      store.close();
+    });
+
+    it('boundary 3: error brain marks failed, un-seen, and successfully retries without duplicates when healthy', async () => {
+      const store = new CallbackTaskStore(':memory:');
+      const nowMs = 1_700_900_000_000;
+      const sent: Array<{ sessionName: string; text: string }> = [];
+      let brainState: SessionRecord['state'] = 'error';
+
+      const pr: RepoPR = {
+        number: 83,
+        title: 'Error Brain Retry PR',
+        author: 'charlie',
+        state: 'open',
+        draft: false,
+        head: 'feat/err-retry',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 1_000,
+        updatedAt: nowMs + 1_000,
+        url: 'https://github.com/acme/widget/pull/83',
+      };
+      const provider: RepoProvider = {
+        ...createMockProvider({}),
+        listPRs: vi.fn(async () => ({ items: [pr], page: 1, hasMore: false, projectDir: '/tmp/repo-err' })),
+      };
+
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-err');
+      config.enabled = true;
+      config.target = 'brain';
+      config.sinceAtMs = nowMs;
+      config.events.pr_new.enabled = true;
+
+      const monitor = new RepoCallbackMonitor({
+        store,
+        detect: async () => createOkContext('/tmp/repo-err'),
+        createProvider: () => provider,
+        listSessions: () => [makeSession({ name: 'deck_err_brain', projectDir: '/tmp/repo-err', state: brainState })],
+        sendToSession: async (sessionName, text) => {
+          sent.push({ sessionName, text });
+        },
+        now: () => nowMs + 2_000,
+      });
+      monitor.setConfigsForTesting({ repos: { '/tmp/repo-err': config } });
+
+      // Poll 1: Brain in error state -> marks failed, error recorded, not seen
+      const p1 = await monitor.checkProject('/tmp/repo-err');
+      expect(p1).toEqual({ checked: true, dispatched: 0 });
+      expect(sent).toHaveLength(0);
+
+      let rows = store.listCallbacks({ scopeKey: '/tmp/repo-err' });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.status).toBe('failed');
+      expect(rows[0]!.lastError).toContain('error');
+      const originalCallbackId = rows[0]!.callbackId;
+
+      // Poll 2: Brain recovers to idle -> dispatches successfully reusing callbackId
+      brainState = 'idle';
+      const p2 = await monitor.checkProject('/tmp/repo-err');
+      expect(p2).toEqual({ checked: true, dispatched: 1 });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.text).toContain(originalCallbackId);
+
+      rows = store.listCallbacks({ scopeKey: '/tmp/repo-err' });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.callbackId).toBe(originalCallbackId);
+      expect(rows[0]!.status).toBe('pending');
+      expect(rows[0]!.lastError).toBeUndefined();
+
+      store.close();
+    });
+
+    it('boundary 4: explicit config.target="deck_cd1_brain" strictly routes to requested session', async () => {
+      const store = new CallbackTaskStore(':memory:');
+      const nowMs = 1_700_900_000_000;
+      const sent: Array<{ sessionName: string; text: string }> = [];
+
+      const pr: RepoPR = {
+        number: 84,
+        title: 'Explicit Target PR',
+        author: 'dave',
+        state: 'open',
+        draft: false,
+        head: 'feat/explicit',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 1_000,
+        updatedAt: nowMs + 1_000,
+        url: 'https://github.com/acme/widget/pull/84',
+      };
+      const provider: RepoProvider = {
+        ...createMockProvider({}),
+        listPRs: vi.fn(async () => ({ items: [pr], page: 1, hasMore: false, projectDir: '/tmp/repo-explicit' })),
+      };
+
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-explicit');
+      config.enabled = true;
+      config.target = 'deck_cd1_brain'; // explicit target
+      config.sinceAtMs = nowMs;
+      config.events.pr_new.enabled = true;
+
+      const cd1 = makeSession({ name: 'deck_cd1_brain', projectDir: '/tmp/repo-explicit', state: 'running', updatedAt: 1000 });
+      const cd = makeSession({ name: 'deck_cd_brain', projectDir: '/tmp/repo-explicit', state: 'running', updatedAt: 9000 });
+
+      const monitor = new RepoCallbackMonitor({
+        store,
+        detect: async () => createOkContext('/tmp/repo-explicit'),
+        createProvider: () => provider,
+        listSessions: () => [cd1, cd],
+        sendToSession: async (sessionName, text) => {
+          sent.push({ sessionName, text });
+        },
+        now: () => nowMs + 2_000,
+      });
+      monitor.setConfigsForTesting({ repos: { '/tmp/repo-explicit': config } });
+
+      const res = await monitor.checkProject('/tmp/repo-explicit');
+      expect(res).toEqual({ checked: true, dispatched: 1 });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.sessionName).toBe('deck_cd1_brain');
+
+      store.close();
+    });
   });
 });
