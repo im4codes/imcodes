@@ -4881,6 +4881,7 @@
     "mobile_keyboard_tab_ime": "输入法",
     "mobile_keyboard_tab_keys": "电脑键盘",
     "combo_mode": "组合键模式",
+    "combo_quick_keys": "快捷键",
     "computer_key": "按键 {{key}}",
     "computer_key_case": "大小写切换",
     "computer_keyboard_pages": "键盘页面",

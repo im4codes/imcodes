@@ -5148,7 +5148,9 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
       const macBar = macRendered.container.querySelector('.remote-desktop-combo-bar') as HTMLElement;
       expect(macBar).toBeTruthy();
       expect(macBar.querySelector('.remote-desktop-combo-toggle')).toBeNull();
-      expect(macBar.querySelector('.remote-desktop-combo-spacer')).toBeTruthy();
+      expect(macBar.querySelector('.remote-desktop-combo-quick-keys')).toBeTruthy();
+      const macQuickButtons = Array.from(macBar.querySelectorAll<HTMLButtonElement>('.remote-desktop-combo-quick-keys button'));
+      expect(macQuickButtons.map((b) => b.textContent)).toEqual(['ESC', 'Tab', 'Home', 'End']);
       const macButtons = Array.from(macBar.querySelectorAll<HTMLButtonElement>('.remote-desktop-combo-modifiers button'));
       expect(macButtons.map((b) => b.textContent)).toEqual(['CTRL', 'ALT', 'SHIFT', 'CMD']);
 
@@ -5402,13 +5404,51 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
 
       const comboBar = container.querySelector('.remote-desktop-combo-bar')!;
       const children = Array.from(comboBar.children);
-      expect(children.map((el) => el.classList.contains('remote-desktop-combo-spacer')
-        ? 'spacer'
+      expect(children.map((el) => el.classList.contains('remote-desktop-combo-quick-keys')
+        ? 'quick-keys'
         : el.classList.contains('remote-desktop-combo-dpad')
           ? 'dpad'
           : el.classList.contains('remote-desktop-combo-modifiers')
             ? 'modifiers'
-            : 'other')).toEqual(['spacer', 'dpad', 'modifiers']);
+            : 'other')).toEqual(['quick-keys', 'dpad', 'modifiers']);
+
+      const quickKeys = comboBar.querySelector('.remote-desktop-combo-quick-keys')!;
+      const quickButtons = Array.from(quickKeys.querySelectorAll<HTMLButtonElement>('button'));
+      expect(quickButtons.map((b) => b.textContent)).toEqual(['ESC', 'Tab', 'Home', 'End']);
+
+      // Plain clicks on ESC, Tab, Home, End dispatch down and up events
+      key.mockClear();
+      act(() => { quickButtons[0]!.click(); });
+      expect(key.mock.calls).toEqual([
+        ['Escape', 'Escape', true, false, { control: false, alt: false }],
+        ['Escape', 'Escape', false, false, { control: false, alt: false }],
+      ]);
+
+      key.mockClear();
+      act(() => { quickButtons[1]!.click(); });
+      expect(key.mock.calls).toEqual([
+        ['Tab', 'Tab', true, false, { control: false, alt: false }],
+        ['Tab', 'Tab', false, false, { control: false, alt: false }],
+      ]);
+
+      key.mockClear();
+      act(() => { quickButtons[2]!.click(); });
+      expect(key.mock.calls).toEqual([
+        ['Home', 'Home', true, false, { control: false, alt: false }],
+        ['Home', 'Home', false, false, { control: false, alt: false }],
+      ]);
+
+      key.mockClear();
+      act(() => { quickButtons[3]!.click(); });
+      expect(key.mock.calls).toEqual([
+        ['End', 'End', true, false, { control: false, alt: false }],
+        ['End', 'End', false, false, { control: false, alt: false }],
+      ]);
+
+      // onPointerDown prevents default to prevent focus steal
+      const pointerDownEvt = new MouseEvent(!('onpointerdown' in quickButtons[0]!) ? 'PointerDown' : 'pointerdown', { cancelable: true, bubbles: true });
+      quickButtons[0]!.dispatchEvent(pointerDownEvt);
+      expect(pointerDownEvt.defaultPrevented).toBe(true);
 
       const dpad = comboBar.querySelector<HTMLElement>('.remote-desktop-combo-dpad')!;
       expect(dpad.classList.contains('shortcut-dpad')).toBe(true);
@@ -5449,6 +5489,9 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
       for (const dot of pageDots) {
         act(() => { dot.click(); });
         expect(container.querySelector('.remote-desktop-combo-bar .remote-desktop-combo-dpad')).toBeTruthy();
+        expect(container.querySelector('.remote-desktop-combo-bar .remote-desktop-combo-quick-keys')).toBeTruthy();
+        const pageQuickBtns = Array.from(container.querySelectorAll<HTMLButtonElement>('.remote-desktop-combo-quick-keys button'));
+        expect(pageQuickBtns.map((b) => b.textContent)).toEqual(['ESC', 'Tab', 'Home', 'End']);
       }
 
       const modBtn = (label: string) => Array.from(
@@ -5457,6 +5500,30 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
 
       vi.useFakeTimers();
       try {
+        // Oneshot ALT + Tab -> sends Alt+Tab and releases ALT
+        act(() => { modBtn('ALT').click(); });
+        expect(modBtn('ALT').getAttribute('data-modifier-state')).toBe('oneshot');
+        key.mockClear();
+        act(() => { quickButtons[1]!.click(); });
+        expect(key.mock.calls).toEqual([
+          ['Tab', 'Tab', true, false, { control: false, alt: true }],
+          ['Tab', 'Tab', false, false, { control: false, alt: true }],
+          ['AltLeft', 'Alt', false, false, { control: false, alt: false }],
+        ]);
+        expect(modBtn('ALT').classList.contains('is-held')).toBe(false);
+
+        // Oneshot CTRL + Home -> sends Ctrl+Home and releases CTRL
+        act(() => { modBtn('CTRL').click(); });
+        expect(modBtn('CTRL').getAttribute('data-modifier-state')).toBe('oneshot');
+        key.mockClear();
+        act(() => { quickButtons[2]!.click(); });
+        expect(key.mock.calls).toEqual([
+          ['Home', 'Home', true, false, { control: true, alt: false }],
+          ['Home', 'Home', false, false, { control: true, alt: false }],
+          ['ControlLeft', 'Control', false, false, { control: false, alt: false }],
+        ]);
+        expect(modBtn('CTRL').classList.contains('is-held')).toBe(false);
+
         // Oneshot CTRL + drag left -> sends Ctrl+ArrowLeft and releases CTRL; auto-repeat sends plain ArrowLeft
         act(() => { modBtn('CTRL').click(); });
         expect(modBtn('CTRL').getAttribute('data-modifier-state')).toBe('oneshot');
@@ -5485,11 +5552,19 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
           pointer(dpad, 'pointerup', { pointerId: 12, clientX: 70, clientY: 100 });
         });
 
-        // Locked SHIFT + drag right + auto-repeat -> keeps SHIFT locked on BOTH initial arrow and repeat
+        // Locked SHIFT + Tab -> keeps SHIFT locked
         act(() => { modBtn('SHIFT').click(); });
         act(() => { modBtn('SHIFT').click(); });
         expect(modBtn('SHIFT').getAttribute('data-modifier-state')).toBe('locked');
+        key.mockClear();
+        act(() => { quickButtons[1]!.click(); });
+        expect(key.mock.calls).toEqual([
+          ['Tab', 'Tab', true, false, { control: false, alt: false }],
+          ['Tab', 'Tab', false, false, { control: false, alt: false }],
+        ]);
+        expect(modBtn('SHIFT').getAttribute('data-modifier-state')).toBe('locked');
 
+        // Locked SHIFT + drag right + auto-repeat -> keeps SHIFT locked on BOTH initial arrow and repeat
         key.mockClear();
         act(() => {
           pointer(dpad, 'pointerdown', { pointerId: 13, clientX: 100, clientY: 100 });
@@ -5528,6 +5603,10 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
         expect(key).toHaveBeenCalledWith('ShiftLeft', 'Shift', false, false, { control: false, alt: false });
         expect(modBtn('SHIFT').classList.contains('is-locked')).toBe(false);
         expect(dpad.getAttribute('data-disabled')).toBe('true');
+        expect(quickButtons.every((b) => b.disabled)).toBe(true);
+        key.mockClear();
+        act(() => { quickButtons[0]!.click(); });
+        expect(key).not.toHaveBeenCalled();
         key.mockClear();
         act(() => {
           vi.advanceTimersByTime(500);
@@ -5561,6 +5640,7 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
       expect(cssSource).toMatch(/\.remote-desktop-mobile-keyboard-tabs button\s*\{[^}]*flex:\s*1 1 0;/);
       expect(cssSource).toMatch(/\.remote-desktop-voice-trigger\s*\{[^}]*flex:\s*0 0 var\(--rd-kb-center-w/);
       expect(cssSource).toMatch(/\.remote-desktop-combo-bar \.remote-desktop-combo-dpad\s*\{[^}]*flex:\s*0 0 var\(--rd-kb-center-w/);
+      expect(cssSource).toMatch(/\.remote-desktop-combo-quick-keys\s*\{[^}]*justify-content:\s*flex-start;/);
       expect(cssSource).toMatch(/container-type:\s*inline-size;/);
       expect(cssSource).toMatch(/@container\s*\(max-width:\s*180px\)/);
       expect(cssSource).toMatch(/@container\s*\(max-width:\s*145px\)/);
@@ -5596,8 +5676,24 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
               const res = await page.evaluate(() => {
                 const voice = document.querySelector('.remote-desktop-voice-trigger')?.getBoundingClientRect();
                 const dpad = document.querySelector('.remote-desktop-combo-dpad')?.getBoundingClientRect();
+                const quick = document.querySelector('.remote-desktop-combo-quick-keys')?.getBoundingClientRect();
+                const quickButtons = Array.from(document.querySelectorAll('.remote-desktop-combo-quick-keys button')).map((b) => b.getBoundingClientRect());
                 const mod = document.querySelector('.remote-desktop-combo-modifiers')!.getBoundingClientRect();
                 const buttons = Array.from(document.querySelectorAll('.remote-desktop-combo-modifiers button')).map((b) => b.getBoundingClientRect());
+
+                let quickOverlap = false;
+                for (let i = 0; i < quickButtons.length - 1; i++) {
+                  if (quickButtons[i].right > quickButtons[i + 1].left + 0.5) {
+                    quickOverlap = true;
+                  }
+                }
+                const firstQuick = quickButtons[0];
+                const lastQuick = quickButtons[quickButtons.length - 1];
+                const quickInsideContainer = (firstQuick && lastQuick && quick)
+                  ? firstQuick.left >= quick.left - 0.5 && lastQuick.right <= quick.right + 0.5
+                  : true;
+                const quickClearOfDpad = (lastQuick && dpad) ? lastQuick.right <= dpad.left + 0.5 : true;
+                const quickAlignLeft = (firstQuick && quick) ? Math.abs(firstQuick.left - quick.left) <= 0.5 : true;
 
                 let overlap = false;
                 for (let i = 0; i < buttons.length - 1; i++) {
@@ -5615,6 +5711,10 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
                 const voiceDpadWidthAligned = (voice && dpad) ? Math.abs(voice.width - dpad.width) <= 0.5 : true;
 
                 return {
+                  quickOverlap,
+                  quickInsideContainer,
+                  quickClearOfDpad,
+                  quickAlignLeft,
                   overlap,
                   insideContainer,
                   clearOfDpad,
@@ -5627,6 +5727,10 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
                 };
               });
 
+              expect(res.quickOverlap).toBe(false);
+              expect(res.quickInsideContainer).toBe(true);
+              expect(res.quickClearOfDpad).toBe(true);
+              expect(res.quickAlignLeft).toBe(true);
               expect(res.overlap).toBe(false);
               expect(res.insideContainer).toBe(true);
               expect(res.clearOfDpad).toBe(true);
@@ -5663,7 +5767,12 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
             </div>
             <div class="remote-desktop-computer-keyboard">
               <div class="remote-desktop-combo-bar">
-                <div class="remote-desktop-combo-spacer"></div>
+                <div class="remote-desktop-combo-quick-keys">
+                  <button type="button">ESC</button>
+                  <button type="button">Tab</button>
+                  <button type="button">Home</button>
+                  <button type="button">End</button>
+                </div>
                 <div class="remote-desktop-combo-dpad shortcut-dpad">
                   <span class="dpad-arrow dpad-arrow-up">▲</span>
                   <span class="dpad-arrow dpad-arrow-down">▼</span>
@@ -5704,7 +5813,12 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
             </div>
             <div class="remote-desktop-computer-keyboard">
               <div class="remote-desktop-combo-bar">
-                <div class="remote-desktop-combo-spacer"></div>
+                <div class="remote-desktop-combo-quick-keys">
+                  <button type="button">ESC</button>
+                  <button type="button">Tab</button>
+                  <button type="button">Home</button>
+                  <button type="button">End</button>
+                </div>
                 <div class="remote-desktop-combo-dpad shortcut-dpad"></div>
                 <div class="remote-desktop-combo-modifiers">
                   <button type="button">⌃</button>
@@ -5739,7 +5853,12 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
             </div>
             <div class="remote-desktop-computer-keyboard">
               <div class="remote-desktop-combo-bar">
-                <div class="remote-desktop-combo-spacer"></div>
+                <div class="remote-desktop-combo-quick-keys">
+                  <button type="button">ESC</button>
+                  <button type="button">Tab</button>
+                  <button type="button">Home</button>
+                  <button type="button">End</button>
+                </div>
                 <div class="remote-desktop-combo-dpad shortcut-dpad"></div>
                 <div class="remote-desktop-combo-modifiers">
                   <button type="button">CTRL</button>
@@ -5775,7 +5894,12 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
             </div>
             <div class="remote-desktop-computer-keyboard">
               <div class="remote-desktop-combo-bar">
-                <div class="remote-desktop-combo-spacer"></div>
+                <div class="remote-desktop-combo-quick-keys">
+                  <button type="button">ESC</button>
+                  <button type="button">Tab</button>
+                  <button type="button">Home</button>
+                  <button type="button">End</button>
+                </div>
                 <div class="remote-desktop-combo-dpad shortcut-dpad"></div>
                 <div class="remote-desktop-combo-modifiers">
                   <button type="button">CTRL</button>

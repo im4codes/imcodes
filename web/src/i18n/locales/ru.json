@@ -4881,6 +4881,7 @@
     "mobile_keyboard_tab_ime": "Ввод",
     "mobile_keyboard_tab_keys": "Клавиши",
     "combo_mode": "Режим комбинаций клавиш",
+    "combo_quick_keys": "Быстрые клавиши",
     "computer_key": "Клавиша {{key}}",
     "computer_key_case": "Прописные / строчные",
     "computer_keyboard_pages": "Страницы клавиатуры",

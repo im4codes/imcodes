@@ -789,6 +789,13 @@ export const REMOTE_DESKTOP_GLOBAL_MODIFIER_KEYS: readonly RemoteDesktopComputer
   { code: 'MetaLeft', key: 'Meta', modifier: true },
 ];
 
+export const REMOTE_DESKTOP_COMBO_QUICK_KEYS: readonly (RemoteDesktopComputerKeySpec & { label: string })[] = [
+  { code: 'Escape', key: 'Escape', modifier: false, label: 'ESC' },
+  { code: 'Tab', key: 'Tab', modifier: false, label: 'Tab' },
+  { code: 'Home', key: 'Home', modifier: false, label: 'Home' },
+  { code: 'End', key: 'End', modifier: false, label: 'End' },
+];
+
 export function remoteDesktopGlobalModifierLabel(
   spec: RemoteDesktopComputerKeySpec,
   targetPlatform: RemoteDesktopTargetPlatform,

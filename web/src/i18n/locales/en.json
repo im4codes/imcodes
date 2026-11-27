@@ -4881,6 +4881,7 @@
     "mobile_keyboard_tab_ime": "Input",
     "mobile_keyboard_tab_keys": "Keys",
     "combo_mode": "Combo key mode",
+    "combo_quick_keys": "Quick keys",
     "computer_key": "Key {{key}}",
     "computer_key_case": "Uppercase / lowercase",
     "computer_keyboard_pages": "Keyboard pages",

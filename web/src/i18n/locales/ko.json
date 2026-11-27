@@ -4881,6 +4881,7 @@
     "mobile_keyboard_tab_ime": "입력",
     "mobile_keyboard_tab_keys": "키보드",
     "combo_mode": "조합키 모드",
+    "combo_quick_keys": "빠른 키",
     "computer_key": "키 {{key}}",
     "computer_key_case": "대문자 / 소문자",
     "computer_keyboard_pages": "키보드 페이지",

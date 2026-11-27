@@ -80,6 +80,7 @@ import {
   REMOTE_DESKTOP_COMPUTER_CASE_KEY,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_DEFAULT_PAGE,
   REMOTE_DESKTOP_COMPUTER_KEYBOARD_PAGES,
+  REMOTE_DESKTOP_COMBO_QUICK_KEYS,
   REMOTE_DESKTOP_GLOBAL_MODIFIER_KEYS,
   remoteDesktopComputerKeyChord,
   remoteDesktopComputerUpperKey,
@@ -4925,7 +4926,20 @@ export function RemoteDesktopPanel({
             {mobileKeyboardTab === 'keys' && (
               <div class="remote-desktop-computer-keyboard">
                 <div class="remote-desktop-combo-bar">
-                  <span class="remote-desktop-combo-spacer" aria-hidden="true" />
+                  <div class="remote-desktop-combo-quick-keys" role="group" aria-label={t('remote_desktop.combo_quick_keys', 'Quick keys')}>
+                    {REMOTE_DESKTOP_COMBO_QUICK_KEYS.map((spec) => (
+                      <button
+                        key={spec.code}
+                        type="button"
+                        aria-label={t('remote_desktop.computer_key', { key: spec.label })}
+                        disabled={!snapshot.inputEnabled}
+                        onPointerDown={(event) => event.preventDefault()}
+                        onClick={() => pressComputerKey(spec)}
+                      >
+                        {spec.label}
+                      </button>
+                    ))}
+                  </div>
                   <MobileDpad
                     className="remote-desktop-combo-dpad"
                     disabled={!snapshot.inputEnabled}

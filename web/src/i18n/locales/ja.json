@@ -4881,6 +4881,7 @@
     "mobile_keyboard_tab_ime": "入力",
     "mobile_keyboard_tab_keys": "キーボード",
     "combo_mode": "組み合わせキーモード",
+    "combo_quick_keys": "クイックキー",
     "computer_key": "キー {{key}}",
     "computer_key_case": "大文字 / 小文字",
     "computer_keyboard_pages": "キーボードページ",

@@ -17521,6 +17521,16 @@ button.quick-agent-delegation-preset.active {
   min-width: 0;
 }
 
+.remote-desktop-combo-quick-keys {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 4px;
+  flex: 1 1 0;
+  min-width: 0;
+  container-type: inline-size;
+}
+
 .remote-desktop-combo-modifiers {
   display: flex;
   align-items: center;
@@ -17531,6 +17541,7 @@ button.quick-agent-delegation-preset.active {
   container-type: inline-size;
 }
 
+.remote-desktop-combo-quick-keys button,
 .remote-desktop-combo-modifiers button {
   min-height: 28px;
   padding: 4px 7px;
@@ -17546,9 +17557,11 @@ button.quick-agent-delegation-preset.active {
 }
 
 @container (max-width: 180px) {
+  .remote-desktop-combo-quick-keys,
   .remote-desktop-combo-modifiers {
     gap: 3px;
   }
+  .remote-desktop-combo-quick-keys button,
   .remote-desktop-combo-modifiers button {
     padding: 4px 4px;
     font-size: 10px;
@@ -17556,9 +17569,11 @@ button.quick-agent-delegation-preset.active {
 }
 
 @container (max-width: 145px) {
+  .remote-desktop-combo-quick-keys,
   .remote-desktop-combo-modifiers {
     gap: 2px;
   }
+  .remote-desktop-combo-quick-keys button,
   .remote-desktop-combo-modifiers button {
     padding: 4px 2px;
     font-size: 9px;
@@ -17567,9 +17582,11 @@ button.quick-agent-delegation-preset.active {
 }
 
 @container (max-width: 115px) {
+  .remote-desktop-combo-quick-keys,
   .remote-desktop-combo-modifiers {
     gap: 2px;
   }
+  .remote-desktop-combo-quick-keys button,
   .remote-desktop-combo-modifiers button {
     padding: 4px 1px;
     font-size: 8px;
@@ -17577,6 +17594,7 @@ button.quick-agent-delegation-preset.active {
   }
 }
 
+.remote-desktop-combo-quick-keys button:active,
 .remote-desktop-combo-modifiers button:active {
   color: #03131d;
   background: #6bd9ff;
@@ -17595,6 +17613,7 @@ button.quick-agent-delegation-preset.active {
   box-shadow: inset 0 -2px 0 #023347, 0 0 0 1px rgb(70 227 255 / 45%);
 }
 
+.remote-desktop-combo-quick-keys button:disabled,
 .remote-desktop-combo-modifiers button:disabled {
   opacity: 0.45;
 }

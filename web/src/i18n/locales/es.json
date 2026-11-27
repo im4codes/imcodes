@@ -4881,6 +4881,7 @@
     "mobile_keyboard_tab_ime": "Entrada",
     "mobile_keyboard_tab_keys": "Teclas",
     "combo_mode": "Modo de combinación de teclas",
+    "combo_quick_keys": "Teclas rápidas",
     "computer_key": "Tecla {{key}}",
     "computer_key_case": "Mayúsculas / minúsculas",
     "computer_keyboard_pages": "Páginas del teclado",
