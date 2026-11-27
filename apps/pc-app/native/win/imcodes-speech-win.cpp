@@ -1382,6 +1382,18 @@ inline std::pair<bool, bool> is_valid_cpp_trailing_left_boundary(
   return {valid, sent_end};
 }
 
+constexpr int kRuleASingleCrossedEnd = 1;
+constexpr int kRuleASingleClean = 2;
+constexpr int kRuleAQualCrossedEnd = 3;
+constexpr int kRuleAQualInternal = 4;
+
+inline int advance_cpp_rule_a(int prev_state) {
+  if (prev_state == kRuleASingleClean || prev_state >= kRuleAQualCrossedEnd) {
+    return kRuleAQualInternal;
+  }
+  return kRuleAQualCrossedEnd;
+}
+
 size_t find_cpp_leading_rule_a_cut(
     const CppHallucinationMatcher& matcher,
     const CppNormalizedClusterMap& map) {
@@ -1389,21 +1401,23 @@ size_t find_cpp_leading_rule_a_cut(
   if (n == 0) return 0;
 
   std::vector<uint8_t> completed_sep(n + 1, 0);
+  std::vector<uint8_t> pending_cross_end_sep(n + 1, 0);
   std::vector<std::unordered_map<int, int>> sep_run(n + 1);
   std::vector<std::unordered_map<int, int>> imm_same(n + 1);
   completed_sep[0] = 1;
   size_t best_cut = 0;
 
-  auto record_run = [](std::unordered_map<int, int>& m, int tid, int len) {
+  auto record_run = [](std::unordered_map<int, int>& m, int tid, int st) {
     auto it = m.find(tid);
-    if (it == m.end() || len > it->second) m[tid] = len;
+    if (it == m.end() || st > it->second) m[tid] = st;
   };
 
   for (size_t pos = 0; pos < n; ++pos) {
     const bool can_start_fresh = completed_sep[pos] == 1;
+    const bool is_pending_cross_end = pending_cross_end_sep[pos] == 1;
     auto& run_map = sep_run[pos];
     auto& imm_map = imm_same[pos];
-    if (!can_start_fresh && run_map.empty() && imm_map.empty()) continue;
+    if (!can_start_fresh && !is_pending_cross_end && run_map.empty() && imm_map.empty()) continue;
 
     if (pos > 0 && pos == map.cluster_start[pos] && map.is_sep[pos] == 0 && can_start_fresh) {
       if (has_valid_cpp_leading_sep(map, pos)) {
@@ -1413,19 +1427,31 @@ size_t find_cpp_leading_rule_a_cut(
 
     if (map.is_sep[pos] == 1) {
       const bool is_sent_end = map.is_sent_end[pos] == 1;
-      if (can_start_fresh) completed_sep[pos + 1] = 1;
-      for (const auto& kv : run_map) {
-        if (kv.second >= 2) completed_sep[pos + 1] = 1;
-        if (!(kv.second >= 2 && is_sent_end)) {
-          record_run(sep_run[pos + 1], kv.first, kv.second);
-        }
+      if (can_start_fresh || (is_pending_cross_end && is_sent_end)) {
+        completed_sep[pos + 1] = 1;
+      } else if (is_pending_cross_end) {
+        pending_cross_end_sep[pos + 1] = 1;
       }
-      for (const auto& kv : imm_map) {
-        if (kv.second >= 2) completed_sep[pos + 1] = 1;
-        if (!(kv.second >= 2 && is_sent_end)) {
-          record_run(sep_run[pos + 1], kv.first, kv.second);
+      auto step_map = [&](const std::unordered_map<int, int>& src) {
+        for (const auto& kv : src) {
+          if (kv.second == kRuleAQualInternal) {
+            completed_sep[pos + 1] = 1;
+            if (!is_sent_end) record_run(sep_run[pos + 1], kv.first, kv.second);
+          } else if (kv.second == kRuleAQualCrossedEnd) {
+            if (is_sent_end) {
+              completed_sep[pos + 1] = 1;
+            } else {
+              pending_cross_end_sep[pos + 1] = 1;
+              record_run(sep_run[pos + 1], kv.first, kv.second);
+            }
+          } else {
+            const int next_st = is_sent_end ? kRuleASingleCrossedEnd : kv.second;
+            record_run(sep_run[pos + 1], kv.first, next_st);
+          }
         }
-      }
+      };
+      step_map(run_map);
+      step_map(imm_map);
     }
 
     if (pos != map.cluster_start[pos]) {
@@ -1445,21 +1471,21 @@ size_t find_cpp_leading_rule_a_cut(
       const size_t end_pos = p + 1;
       if (end_pos < n && end_pos != map.cluster_start[end_pos]) continue;
 
-      int next_len = can_start_fresh ? 1 : 0;
+      int next_state = can_start_fresh ? kRuleASingleClean : 0;
       const auto rit = run_map.find(tid);
-      if (rit != run_map.end() && rit->second >= 1) {
-        next_len = std::max(next_len, rit->second >= 2 ? 2 : rit->second + 1);
+      if (rit != run_map.end() && rit->second > 0) {
+        next_state = std::max(next_state, advance_cpp_rule_a(rit->second));
       }
       const auto iit = imm_map.find(tid);
-      if (iit != imm_map.end() && iit->second >= 1) {
-        next_len = std::max(next_len, iit->second >= 2 ? 2 : iit->second + 1);
+      if (iit != imm_map.end() && iit->second > 0) {
+        next_state = std::max(next_state, advance_cpp_rule_a(iit->second));
       }
-      if (next_len == 0) continue;
+      if (next_state == 0) continue;
 
       if (!matcher.term_ends_ascii[tid] || end_pos == n) {
-        record_run(sep_run[end_pos], tid, next_len);
+        record_run(sep_run[end_pos], tid, next_state);
       } else {
-        record_run(imm_same[end_pos], tid, next_len);
+        record_run(imm_same[end_pos], tid, next_state);
       }
     }
     run_map.clear();
@@ -1587,22 +1613,24 @@ size_t find_cpp_trailing_rule_a_cut(
   if (n == 0) return n;
 
   std::vector<uint8_t> completed_sep(n + 1, 0);
+  std::vector<uint8_t> pending_cross_end_sep(n + 1, 0);
   std::vector<std::unordered_map<int, int>> sep_run(n + 1);
   std::vector<std::unordered_map<int, int>> rev_same(n + 1);
   completed_sep[n] = 1;
   size_t best_term_start = n;
 
-  auto record_run = [](std::unordered_map<int, int>& m, int tid, int len) {
+  auto record_run = [](std::unordered_map<int, int>& m, int tid, int st) {
     auto it = m.find(tid);
-    if (it == m.end() || len > it->second) m[tid] = len;
+    if (it == m.end() || st > it->second) m[tid] = st;
   };
 
   for (size_t pos = n; pos > 0; --pos) {
     if (pos < n && pos != map.cluster_start[pos]) continue;
     const bool can_end_fresh = completed_sep[pos] == 1;
+    const bool is_pending_cross_end = pending_cross_end_sep[pos] == 1;
     auto& run_map = sep_run[pos];
     auto& imm_map = rev_same[pos];
-    if (!can_end_fresh && run_map.empty() && imm_map.empty()) continue;
+    if (!can_end_fresh && !is_pending_cross_end && run_map.empty() && imm_map.empty()) continue;
 
     const size_t prev_c = map.cluster_start[pos - 1];
     if (map.is_sep[prev_c] == 1) {
@@ -1613,19 +1641,31 @@ size_t find_cpp_trailing_rule_a_cut(
           break;
         }
       }
-      if (can_end_fresh) completed_sep[prev_c] = 1;
-      for (const auto& kv : run_map) {
-        if (kv.second >= 2) completed_sep[prev_c] = 1;
-        if (!(kv.second >= 2 && sep_has_end)) {
-          record_run(sep_run[prev_c], kv.first, kv.second);
-        }
+      if (can_end_fresh || (is_pending_cross_end && sep_has_end)) {
+        completed_sep[prev_c] = 1;
+      } else if (is_pending_cross_end) {
+        pending_cross_end_sep[prev_c] = 1;
       }
-      for (const auto& kv : imm_map) {
-        if (kv.second >= 2) completed_sep[prev_c] = 1;
-        if (!(kv.second >= 2 && sep_has_end)) {
-          record_run(sep_run[prev_c], kv.first, kv.second);
+      auto step_map = [&](const std::unordered_map<int, int>& src) {
+        for (const auto& kv : src) {
+          if (kv.second == kRuleAQualInternal) {
+            completed_sep[prev_c] = 1;
+            if (!sep_has_end) record_run(sep_run[prev_c], kv.first, kv.second);
+          } else if (kv.second == kRuleAQualCrossedEnd) {
+            if (sep_has_end) {
+              completed_sep[prev_c] = 1;
+            } else {
+              pending_cross_end_sep[prev_c] = 1;
+              record_run(sep_run[prev_c], kv.first, kv.second);
+            }
+          } else {
+            const int next_st = sep_has_end ? kRuleASingleCrossedEnd : kv.second;
+            record_run(sep_run[prev_c], kv.first, next_st);
+          }
         }
-      }
+      };
+      step_map(run_map);
+      step_map(imm_map);
     }
 
     int cur_rev_idx = 0;
@@ -1638,27 +1678,27 @@ size_t find_cpp_trailing_rule_a_cut(
       if (tid < 0) continue;
       if (idx != map.cluster_start[idx]) continue;
 
-      int next_len = can_end_fresh ? 1 : 0;
+      int next_state = can_end_fresh ? kRuleASingleClean : 0;
       const auto rit = run_map.find(tid);
-      if (rit != run_map.end() && rit->second >= 1) {
-        next_len = std::max(next_len, rit->second >= 2 ? 2 : rit->second + 1);
+      if (rit != run_map.end() && rit->second > 0) {
+        next_state = std::max(next_state, advance_cpp_rule_a(rit->second));
       }
       const auto iit = imm_map.find(tid);
-      if (iit != imm_map.end() && iit->second >= 1) {
-        next_len = std::max(next_len, iit->second >= 2 ? 2 : iit->second + 1);
+      if (iit != imm_map.end() && iit->second > 0) {
+        next_state = std::max(next_state, advance_cpp_rule_a(iit->second));
       }
-      if (next_len == 0) continue;
+      if (next_state == 0) continue;
 
       if (!matcher.term_starts_ascii[tid] || idx == 0) {
-        record_run(sep_run[idx], tid, next_len);
+        record_run(sep_run[idx], tid, next_state);
       } else {
-        record_run(rev_same[idx], tid, next_len);
+        record_run(rev_same[idx], tid, next_state);
       }
 
-      if (next_len >= 2 && idx > 0) {
+      if (next_state >= kRuleAQualCrossedEnd && idx > 0) {
         const auto [valid, sent_end] = is_valid_cpp_trailing_left_boundary(map, idx, matcher.term_starts_ascii[tid] == 1);
-        (void)sent_end;
-        if (valid && idx < best_term_start) {
+        const bool allows_cut = (next_state == kRuleAQualInternal) || sent_end;
+        if (valid && allows_cut && idx < best_term_start) {
           best_term_start = idx;
         }
       }

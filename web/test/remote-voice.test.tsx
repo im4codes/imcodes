@@ -4916,6 +4916,32 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
         ['你答的对，就这么来。', false],
         ['我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。', true],
       ]);
+
+      // 6. Round 4 cross-sentence body-mention single hotwords ("我常用 IM.codes。IM.codes", "IM.codes。IM.codes 很好用。")
+      //    must survive remote owner VoiceInput untouched while standalone two-sentence hotwords ("A。A。正文") still strip cleanly
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-preserve-cross' });
+      const onCrossRes = vi.fn();
+      const startCross = VoiceInput.startListening(onCrossRes, undefined, undefined, { projectKey: 'proj-remote-guard' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(7));
+      const ws6 = FakeWebSocket.instances[6]!;
+      ws6.emitOpen();
+      const frame6 = JSON.parse(ws6.sent[0]!) as { sessionId: string };
+      ws6.emitMessage({ type: 'voice.session.ready', sessionId: frame6.sessionId });
+      await expect(startCross).resolves.toBe(true);
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array([4000, -4000])),
+        level: 0.2,
+      });
+      ws6.emitMessage({ type: 'voice.session.result', sessionId: frame6.sessionId, text: '我常用 IM.codes。IM.codes', isFinal: false });
+      ws6.emitMessage({ type: 'voice.session.result', sessionId: frame6.sessionId, text: 'IM.codes。IM.codes 很好用。', isFinal: false });
+      ws6.emitMessage({ type: 'voice.session.result', sessionId: frame6.sessionId, text: 'IM.codes。IM.codes。你好', isFinal: true });
+      ws6.emitMessage({ type: 'voice.session.end', sessionId: frame6.sessionId });
+      await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
+      expect(onCrossRes.mock.calls).toEqual([
+        ['我常用 IM.codes。IM.codes', false],
+        ['IM.codes。IM.codes 很好用。', false],
+        ['你好', true],
+      ]);
     } finally {
       await VoiceInput.stopListening({ abort: true });
       delete (streamingBridge as Record<string, unknown>).startRawPcmCapture;

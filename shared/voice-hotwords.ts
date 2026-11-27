@@ -1236,6 +1236,22 @@ function advanceDistinct3(state: Distinct3State, termId: number): Distinct3State
   return { t1: state.t1, t2: state.t2, count: 3 };
 }
 
+const RULE_A_SINGLE_CROSSED_END = 1;
+const RULE_A_SINGLE_CLEAN = 2;
+const RULE_A_QUAL_CROSSED_END = 3;
+const RULE_A_QUAL_INTERNAL = 4;
+
+function advanceRuleAFromStart(): number {
+  return RULE_A_SINGLE_CLEAN;
+}
+
+function advanceRuleAFromPrev(prevState: number): number {
+  if (prevState === RULE_A_SINGLE_CLEAN || prevState >= RULE_A_QUAL_CROSSED_END) {
+    return RULE_A_QUAL_INTERNAL;
+  }
+  return RULE_A_QUAL_CROSSED_END;
+}
+
 function findLeadingRuleACut(
   matcher: CompiledHallucinationMatcher,
   map: NormalizedClusterMap,
@@ -1244,33 +1260,36 @@ function findLeadingRuleACut(
   const n = normText.length;
   if (n === 0) return 0;
 
-  // completedSep[pos] === 1 when [0..pos) is start/seps or ends with >=1 completed adjacent-repeat block + sep.
+  // completedSep[pos] === 1 when [0..pos) is start/seps or ends with qualified block(s) ready to cut.
   const completedSep = new Uint8Array(n + 1);
-  // sepRun[pos]: map termId -> max runLen (capped at 2) reachable at pos cleanly (after sep or non-ASCII end)
+  // pendingCrossEndSep[pos] === 1 when [0..pos) ends with a sentence-crossing pair awaiting a body-side sentence-end.
+  const pendingCrossEndSep = new Uint8Array(n + 1);
+  // sepRun[pos]: map termId -> best Rule A state reachable cleanly after sep or non-ASCII end
   const sepRun: Array<Map<number, number> | undefined> = new Array(n + 1);
-  // immediateSame[pos]: map termId -> max runLen for immediate same-term concatenation without sep
+  // immediateSame[pos]: map termId -> best Rule A state for immediate same-term concatenation without sep
   let immediateSame: Array<Map<number, number> | undefined> | null = null;
   completedSep[0] = 1;
 
   let bestCut = 0;
 
-  const recordRun = (arr: Array<Map<number, number> | undefined>, pos: number, tid: number, len: number) => {
+  const recordRun = (arr: Array<Map<number, number> | undefined>, pos: number, tid: number, state: number) => {
     let m = arr[pos];
     if (!m) {
       m = new Map<number, number>();
       arr[pos] = m;
     }
     const prev = m.get(tid) ?? 0;
-    if (len > prev) m.set(tid, len);
+    if (state > prev) m.set(tid, state);
   };
 
   for (let pos = 0; pos < n; pos += 1) {
     const canStartFresh = completedSep[pos] === 1;
+    const isPendingCrossEnd = pendingCrossEndSep[pos] === 1;
     const runMap = sepRun[pos];
     const immMap = immediateSame?.[pos];
     sepRun[pos] = undefined;
     if (immediateSame) immediateSame[pos] = undefined;
-    if (!canStartFresh && !runMap && !immMap) continue;
+    if (!canStartFresh && !isPendingCrossEnd && !runMap && !immMap) continue;
 
     if (
       pos > 0
@@ -1305,32 +1324,35 @@ function findLeadingRuleACut(
     if (isSep[pos] === 1) {
       const nextPos = pos + charLen;
       const isSentEnd = map.isSentenceEnd[pos] === 1;
-      if (canStartFresh) {
+      if (canStartFresh || (isPendingCrossEnd && isSentEnd)) {
         completedSep[nextPos] = 1;
+      } else if (isPendingCrossEnd) {
+        pendingCrossEndSep[nextPos] = 1;
       }
-      if (runMap) {
-        for (const [tid, len] of runMap.entries()) {
-          if (len >= 2) completedSep[nextPos] = 1;
-          // Freeze an already-qualified run at strong sentence boundaries so a following
-          // single hotword mention in body text cannot inherit the prior run.
-          if (!(len >= 2 && isSentEnd)) {
-            recordRun(sepRun, nextPos, tid, len);
+      const stepMap = (src: Map<number, number> | undefined) => {
+        if (!src) return;
+        for (const [tid, st] of src.entries()) {
+          if (st === RULE_A_QUAL_INTERNAL) {
+            completedSep[nextPos] = 1;
+            if (!isSentEnd) recordRun(sepRun, nextPos, tid, st);
+          } else if (st === RULE_A_QUAL_CROSSED_END) {
+            if (isSentEnd) {
+              completedSep[nextPos] = 1;
+            } else {
+              pendingCrossEndSep[nextPos] = 1;
+              recordRun(sepRun, nextPos, tid, st);
+            }
+          } else {
+            const nextSt = isSentEnd ? RULE_A_SINGLE_CROSSED_END : st;
+            recordRun(sepRun, nextPos, tid, nextSt);
           }
         }
-      }
-      if (immMap) {
-        for (const [tid, len] of immMap.entries()) {
-          if (len >= 2) completedSep[nextPos] = 1;
-          if (!(len >= 2 && isSentEnd)) {
-            recordRun(sepRun, nextPos, tid, len);
-          }
-        }
-      }
+      };
+      stepMap(runMap);
+      stepMap(immMap);
     }
 
     if (pos !== normClusterStart[pos]!) continue;
-    // Note: terms starting with ASCII can only begin at position with sep/non-ASCII-end (`cleared` semantic),
-    // which holds for `completedSep` and for `runMap` entries except wait: non-sep `endedAscii` was only stored in `immediateSame`.
 
     let node: HallucinationTrieNode | undefined = matcher.root;
     for (let p = pos; p < n; p += 1) {
@@ -1342,27 +1364,27 @@ function findLeadingRuleACut(
       const endPos = p + 1;
       if (endPos < n && endPos !== normClusterStart[endPos]!) continue;
 
-      let nextLen = 0;
+      let nextState = 0;
       if (canStartFresh) {
-        nextLen = 1;
+        nextState = advanceRuleAFromStart();
       }
       const prevRun = runMap?.get(termId) ?? 0;
-      if (prevRun >= 1) {
-        const cand = prevRun >= 2 ? 2 : prevRun + 1;
-        if (cand > nextLen) nextLen = cand;
+      if (prevRun > 0) {
+        const cand = advanceRuleAFromPrev(prevRun);
+        if (cand > nextState) nextState = cand;
       }
       const prevImm = immMap?.get(termId) ?? 0;
-      if (prevImm >= 1) {
-        const cand = prevImm >= 2 ? 2 : prevImm + 1;
-        if (cand > nextLen) nextLen = cand;
+      if (prevImm > 0) {
+        const cand = advanceRuleAFromPrev(prevImm);
+        if (cand > nextState) nextState = cand;
       }
-      if (nextLen === 0) continue;
+      if (nextState === 0) continue;
 
       if (!matcher.termEndsAscii[termId]! || endPos === n) {
-        recordRun(sepRun, endPos, termId, nextLen);
+        recordRun(sepRun, endPos, termId, nextState);
       } else {
         if (!immediateSame) immediateSame = new Array(n + 1);
-        recordRun(immediateSame, endPos, termId, nextLen);
+        recordRun(immediateSame, endPos, termId, nextState);
       }
     }
   }
@@ -1545,30 +1567,32 @@ function findTrailingRuleACut(
   if (n === 0) return n;
 
   const completedSep = new Uint8Array(n + 1);
+  const pendingCrossEndSep = new Uint8Array(n + 1);
   const sepRun: Array<Map<number, number> | undefined> = new Array(n + 1);
   let revSame: Array<Map<number, number> | undefined> | null = null;
   completedSep[n] = 1;
 
   let bestTermStart = n;
 
-  const recordRun = (arr: Array<Map<number, number> | undefined>, pos: number, tid: number, len: number) => {
+  const recordRun = (arr: Array<Map<number, number> | undefined>, pos: number, tid: number, state: number) => {
     let m = arr[pos];
     if (!m) {
       m = new Map<number, number>();
       arr[pos] = m;
     }
     const prev = m.get(tid) ?? 0;
-    if (len > prev) m.set(tid, len);
+    if (state > prev) m.set(tid, state);
   };
 
   for (let pos = n; pos > 0; pos -= 1) {
     if (pos < n && pos !== normClusterStart[pos]!) continue;
     const canEndFresh = completedSep[pos] === 1;
+    const isPendingCrossEnd = pendingCrossEndSep[pos] === 1;
     const runMap = sepRun[pos];
     const immMap = revSame?.[pos];
     sepRun[pos] = undefined;
     if (revSame) revSame[pos] = undefined;
-    if (!canEndFresh && !runMap && !immMap) continue;
+    if (!canEndFresh && !isPendingCrossEnd && !runMap && !immMap) continue;
 
     const prevClusterStart = normClusterStart[pos - 1]!;
     if (isSep[prevClusterStart] === 1) {
@@ -1579,27 +1603,32 @@ function findTrailingRuleACut(
           break;
         }
       }
-      if (canEndFresh) {
+      if (canEndFresh || (isPendingCrossEnd && sepHasEnd)) {
         completedSep[prevClusterStart] = 1;
+      } else if (isPendingCrossEnd) {
+        pendingCrossEndSep[prevClusterStart] = 1;
       }
-      if (runMap) {
-        for (const [tid, len] of runMap.entries()) {
-          if (len >= 2) completedSep[prevClusterStart] = 1;
-          // Freeze an already-qualified trailing run at strong sentence boundaries so an
-          // earlier single hotword mention inside body text cannot inherit it.
-          if (!(len >= 2 && sepHasEnd)) {
-            recordRun(sepRun, prevClusterStart, tid, len);
+      const stepMap = (src: Map<number, number> | undefined) => {
+        if (!src) return;
+        for (const [tid, st] of src.entries()) {
+          if (st === RULE_A_QUAL_INTERNAL) {
+            completedSep[prevClusterStart] = 1;
+            if (!sepHasEnd) recordRun(sepRun, prevClusterStart, tid, st);
+          } else if (st === RULE_A_QUAL_CROSSED_END) {
+            if (sepHasEnd) {
+              completedSep[prevClusterStart] = 1;
+            } else {
+              pendingCrossEndSep[prevClusterStart] = 1;
+              recordRun(sepRun, prevClusterStart, tid, st);
+            }
+          } else {
+            const nextSt = sepHasEnd ? RULE_A_SINGLE_CROSSED_END : st;
+            recordRun(sepRun, prevClusterStart, tid, nextSt);
           }
         }
-      }
-      if (immMap) {
-        for (const [tid, len] of immMap.entries()) {
-          if (len >= 2) completedSep[prevClusterStart] = 1;
-          if (!(len >= 2 && sepHasEnd)) {
-            recordRun(sepRun, prevClusterStart, tid, len);
-          }
-        }
-      }
+      };
+      stepMap(runMap);
+      stepMap(immMap);
     }
 
     let revNode: HallucinationTrieNode | undefined = matcher.revRoot;
@@ -1610,40 +1639,33 @@ function findTrailingRuleACut(
       if (termId < 0) continue;
       if (p !== normClusterStart[p]!) continue;
 
-      let nextLen = 0;
+      let nextState = 0;
       if (canEndFresh) {
-        nextLen = 1;
+        nextState = advanceRuleAFromStart();
       }
       const prevRun = runMap?.get(termId) ?? 0;
-      if (prevRun >= 1) {
-        const cand = prevRun >= 2 ? 2 : prevRun + 1;
-        if (cand > nextLen) nextLen = cand;
+      if (prevRun > 0) {
+        const cand = advanceRuleAFromPrev(prevRun);
+        if (cand > nextState) nextState = cand;
       }
       const prevImm = immMap?.get(termId) ?? 0;
-      if (prevImm >= 1) {
-        const cand = prevImm >= 2 ? 2 : prevImm + 1;
-        if (cand > nextLen) nextLen = cand;
+      if (prevImm > 0) {
+        const cand = advanceRuleAFromPrev(prevImm);
+        if (cand > nextState) nextState = cand;
       }
-      if (nextLen === 0) continue;
+      if (nextState === 0) continue;
 
       if (!matcher.termStartsAscii[termId]! || p === 0) {
-        recordRun(sepRun, p, termId, nextLen);
-        if (nextLen >= 2 && p === 0) {
-          // Whole-string check handles p === 0, keep safe guard here.
-        }
+        recordRun(sepRun, p, termId, nextState);
       } else {
         if (!revSame) revSame = new Array(n + 1);
-        recordRun(revSame, p, termId, nextLen);
-        if (matcher.termEndsAscii[termId]! && p > 0) {
-          // Wait: non-identical ASCII terms to the left cannot join immediately without sep; record in revSame for same-term only:
-          // Actually sepRun is ONLY stepped after a separator above, while revSame only allows identical `termId`!
-          // Let's also allow separator scan to promote `revSame` into `sepRun` when `pos` steps over a separator!
-        }
+        recordRun(revSame, p, termId, nextState);
       }
 
-      if (nextLen >= 2 && p > 0) {
-        const { valid } = isValidTrailingLeftBoundary(map, p, matcher.termStartsAscii[termId]! === 1);
-        if (valid && p < bestTermStart) {
+      if (nextState >= RULE_A_QUAL_CROSSED_END && p > 0) {
+        const { valid, sentEnd } = isValidTrailingLeftBoundary(map, p, matcher.termStartsAscii[termId]! === 1);
+        const allowsCut = nextState === RULE_A_QUAL_INTERNAL || sentEnd;
+        if (valid && allowsCut && p < bestTermStart) {
           bestTermStart = p;
         }
       }

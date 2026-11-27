@@ -12,6 +12,12 @@ vi.mock('react-i18next', () => ({
 
 import { SessionControls, readComposerElementText } from '../../src/components/SessionControls.js';
 import * as VoiceInput from '../../src/components/VoiceInput.js';
+import {
+  resetVoiceHotwordsScopeForTesting,
+  setActiveVoiceHotwordProject,
+  setProjectVoiceHotwordsRaw,
+  setVoiceHotwordsAuthScope,
+} from '../../src/voice-hotwords.js';
 
 const quickData: UseQuickDataResult = {
   data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
@@ -655,6 +661,43 @@ describe('PC App inline voice dictation and quick permission grant', () => {
       unmount();
     } finally {
       document.getElementById('imcodes-voice-hud-root')?.remove();
+    }
+  });
+
+  it('preserves cross-sentence single hotwords while stripping standalone & intra-sentence hallucinations on PC App native VoiceInput owner results', async () => {
+    const fake = createFakePcAppBridge();
+    (globalThis as any).__IMCODES_PC_APP__ = fake.bridge;
+    setVoiceHotwordsAuthScope({ baseUrl: 'https://relay.example', userId: 'pc-owner-1' }, { sync: false });
+    setActiveVoiceHotwordProject('proj-pc-guard');
+    setProjectVoiceHotwordsRaw('proj-pc-guard', 'IM.codes\nClaude');
+
+    try {
+      const results: Array<[string, boolean]> = [];
+      const started = await VoiceInput.startListening(
+        (text, isFinal) => results.push([text, isFinal]),
+        undefined,
+        undefined,
+        { projectKey: 'proj-pc-guard' },
+      );
+      expect(started).toBe(true);
+      fake.emit({ type: 'start' });
+      fake.emit({ type: 'result', text: '我常用 IM.codes。IM.codes', isFinal: false });
+      fake.emit({ type: 'result', text: 'IM.codes。IM.codes 很好用。', isFinal: false });
+      fake.emit({ type: 'result', text: 'IM.codes。IM.codes。你好', isFinal: false });
+      fake.emit({ type: 'result', text: 'IM.codes，IM.codes。你答的对，就这么来。', isFinal: false });
+      fake.emit({ type: 'result', text: '我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。IM.codes，IM.codes。', isFinal: true });
+      fake.emit({ type: 'end' });
+
+      expect(results).toEqual([
+        ['我常用 IM.codes。IM.codes', false],
+        ['IM.codes。IM.codes 很好用。', false],
+        ['你好', false],
+        ['你答的对，就这么来。', false],
+        ['我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。', true],
+      ]);
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      resetVoiceHotwordsScopeForTesting();
     }
   });
 });

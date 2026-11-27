@@ -902,6 +902,18 @@ private func isValidSwiftTrailingLeftBoundary(
     return (valid, sentEnd)
 }
 
+private let swiftRuleASingleCrossedEnd = 1
+private let swiftRuleASingleClean = 2
+private let swiftRuleAQualCrossedEnd = 3
+private let swiftRuleAQualInternal = 4
+
+private func advanceSwiftRuleA(_ prevState: Int) -> Int {
+    if prevState == swiftRuleASingleClean || prevState >= swiftRuleAQualCrossedEnd {
+        return swiftRuleAQualInternal
+    }
+    return swiftRuleAQualCrossedEnd
+}
+
 private func findSwiftLeadingRuleACut(
     map: SwiftNormalizedClusterMap,
     root: HotwordTrieNode,
@@ -912,26 +924,28 @@ private func findSwiftLeadingRuleACut(
     guard n > 0 else { return 0 }
 
     var completedSep = [Bool](repeating: false, count: n + 1)
+    var pendingCrossEndSep = [Bool](repeating: false, count: n + 1)
     var sepRun = [[Int: Int]?](repeating: nil, count: n + 1)
     var immediateSame: [[Int: Int]?]? = nil
     completedSep[0] = true
     var bestCut = 0
 
-    func recordRun(_ arr: inout [[Int: Int]?], _ pos: Int, _ tid: Int, _ len: Int) {
+    func recordRun(_ arr: inout [[Int: Int]?], _ pos: Int, _ tid: Int, _ st: Int) {
         var m = arr[pos] ?? [:]
-        if len > (m[tid] ?? 0) {
-            m[tid] = len
+        if st > (m[tid] ?? 0) {
+            m[tid] = st
             arr[pos] = m
         }
     }
 
     for pos in 0..<n {
         let canStartFresh = completedSep[pos]
+        let isPendingCrossEnd = pendingCrossEndSep[pos]
         let runMap = sepRun[pos]
         let immMap = immediateSame?[pos] ?? nil
         sepRun[pos] = nil
         immediateSame?[pos] = nil
-        if !canStartFresh && runMap == nil && immMap == nil { continue }
+        if !canStartFresh && !isPendingCrossEnd && runMap == nil && immMap == nil { continue }
 
         if pos > 0
             && pos == map.clusterStart[pos]
@@ -944,25 +958,32 @@ private func findSwiftLeadingRuleACut(
         if map.isSep[pos] {
             let nextPos = pos + 1
             let isSentEnd = map.isSentenceEnd[pos]
-            if canStartFresh {
+            if canStartFresh || (isPendingCrossEnd && isSentEnd) {
                 completedSep[nextPos] = true
+            } else if isPendingCrossEnd {
+                pendingCrossEndSep[nextPos] = true
             }
-            if let runMap {
-                for (tid, len) in runMap {
-                    if len >= 2 { completedSep[nextPos] = true }
-                    if !(len >= 2 && isSentEnd) {
-                        recordRun(&sepRun, nextPos, tid, len)
+            func stepMap(_ src: [Int: Int]?) {
+                guard let src else { return }
+                for (tid, st) in src {
+                    if st == swiftRuleAQualInternal {
+                        completedSep[nextPos] = true
+                        if !isSentEnd { recordRun(&sepRun, nextPos, tid, st) }
+                    } else if st == swiftRuleAQualCrossedEnd {
+                        if isSentEnd {
+                            completedSep[nextPos] = true
+                        } else {
+                            pendingCrossEndSep[nextPos] = true
+                            recordRun(&sepRun, nextPos, tid, st)
+                        }
+                    } else {
+                        let nextSt = isSentEnd ? swiftRuleASingleCrossedEnd : st
+                        recordRun(&sepRun, nextPos, tid, nextSt)
                     }
                 }
             }
-            if let immMap {
-                for (tid, len) in immMap {
-                    if len >= 2 { completedSep[nextPos] = true }
-                    if !(len >= 2 && isSentEnd) {
-                        recordRun(&sepRun, nextPos, tid, len)
-                    }
-                }
-            }
+            stepMap(runMap)
+            stepMap(immMap)
         }
 
         if pos != map.clusterStart[pos] { continue }
@@ -977,22 +998,22 @@ private func findSwiftLeadingRuleACut(
             let endPos = p + 1
             if endPos < n && endPos != map.clusterStart[endPos] { continue }
 
-            var nextLen = canStartFresh ? 1 : 0
-            if let prevRun = runMap?[termId], prevRun >= 1 {
-                nextLen = max(nextLen, prevRun >= 2 ? 2 : prevRun + 1)
+            var nextState = canStartFresh ? swiftRuleASingleClean : 0
+            if let prevRun = runMap?[termId], prevRun > 0 {
+                nextState = max(nextState, advanceSwiftRuleA(prevRun))
             }
-            if let prevImm = immMap?[termId], prevImm >= 1 {
-                nextLen = max(nextLen, prevImm >= 2 ? 2 : prevImm + 1)
+            if let prevImm = immMap?[termId], prevImm > 0 {
+                nextState = max(nextState, advanceSwiftRuleA(prevImm))
             }
-            if nextLen == 0 { continue }
+            if nextState == 0 { continue }
 
             if !termEndsAscii[termId] || endPos == n {
-                recordRun(&sepRun, endPos, termId, nextLen)
+                recordRun(&sepRun, endPos, termId, nextState)
             } else {
                 if immediateSame == nil {
                     immediateSame = [[Int: Int]?](repeating: nil, count: n + 1)
                 }
-                recordRun(&immediateSame!, endPos, termId, nextLen)
+                recordRun(&immediateSame!, endPos, termId, nextState)
             }
         }
     }
@@ -1132,15 +1153,16 @@ private func findSwiftTrailingRuleACut(
     guard n > 0 else { return n }
 
     var completedSep = [Bool](repeating: false, count: n + 1)
+    var pendingCrossEndSep = [Bool](repeating: false, count: n + 1)
     var sepRun = [[Int: Int]?](repeating: nil, count: n + 1)
     var revSame: [[Int: Int]?]? = nil
     completedSep[n] = true
     var bestTermStart = n
 
-    func recordRun(_ arr: inout [[Int: Int]?], _ pos: Int, _ tid: Int, _ len: Int) {
+    func recordRun(_ arr: inout [[Int: Int]?], _ pos: Int, _ tid: Int, _ st: Int) {
         var m = arr[pos] ?? [:]
-        if len > (m[tid] ?? 0) {
-            m[tid] = len
+        if st > (m[tid] ?? 0) {
+            m[tid] = st
             arr[pos] = m
         }
     }
@@ -1148,11 +1170,12 @@ private func findSwiftTrailingRuleACut(
     for pos in stride(from: n, to: 0, by: -1) {
         if pos < n && pos != map.clusterStart[pos] { continue }
         let canEndFresh = completedSep[pos]
+        let isPendingCrossEnd = pendingCrossEndSep[pos]
         let runMap = sepRun[pos]
         let immMap = revSame?[pos] ?? nil
         sepRun[pos] = nil
         revSame?[pos] = nil
-        if !canEndFresh && runMap == nil && immMap == nil { continue }
+        if !canEndFresh && !isPendingCrossEnd && runMap == nil && immMap == nil { continue }
 
         let prevClusterStart = map.clusterStart[pos - 1]
         if map.isSep[prevClusterStart] {
@@ -1161,25 +1184,32 @@ private func findSwiftTrailingRuleACut(
                 sepHasEnd = true
                 break
             }
-            if canEndFresh {
+            if canEndFresh || (isPendingCrossEnd && sepHasEnd) {
                 completedSep[prevClusterStart] = true
+            } else if isPendingCrossEnd {
+                pendingCrossEndSep[prevClusterStart] = true
             }
-            if let runMap {
-                for (tid, len) in runMap {
-                    if len >= 2 { completedSep[prevClusterStart] = true }
-                    if !(len >= 2 && sepHasEnd) {
-                        recordRun(&sepRun, prevClusterStart, tid, len)
+            func stepMap(_ src: [Int: Int]?) {
+                guard let src else { return }
+                for (tid, st) in src {
+                    if st == swiftRuleAQualInternal {
+                        completedSep[prevClusterStart] = true
+                        if !sepHasEnd { recordRun(&sepRun, prevClusterStart, tid, st) }
+                    } else if st == swiftRuleAQualCrossedEnd {
+                        if sepHasEnd {
+                            completedSep[prevClusterStart] = true
+                        } else {
+                            pendingCrossEndSep[prevClusterStart] = true
+                            recordRun(&sepRun, prevClusterStart, tid, st)
+                        }
+                    } else {
+                        let nextSt = sepHasEnd ? swiftRuleASingleCrossedEnd : st
+                        recordRun(&sepRun, prevClusterStart, tid, nextSt)
                     }
                 }
             }
-            if let immMap {
-                for (tid, len) in immMap {
-                    if len >= 2 { completedSep[prevClusterStart] = true }
-                    if !(len >= 2 && sepHasEnd) {
-                        recordRun(&sepRun, prevClusterStart, tid, len)
-                    }
-                }
-            }
+            stepMap(runMap)
+            stepMap(immMap)
         }
 
         var revNode: HotwordTrieNode? = revRoot
@@ -1190,27 +1220,28 @@ private func findSwiftTrailingRuleACut(
             if termId < 0 { continue }
             if p != map.clusterStart[p] { continue }
 
-            var nextLen = canEndFresh ? 1 : 0
-            if let prevRun = runMap?[termId], prevRun >= 1 {
-                nextLen = max(nextLen, prevRun >= 2 ? 2 : prevRun + 1)
+            var nextState = canEndFresh ? swiftRuleASingleClean : 0
+            if let prevRun = runMap?[termId], prevRun > 0 {
+                nextState = max(nextState, advanceSwiftRuleA(prevRun))
             }
-            if let prevImm = immMap?[termId], prevImm >= 1 {
-                nextLen = max(nextLen, prevImm >= 2 ? 2 : prevImm + 1)
+            if let prevImm = immMap?[termId], prevImm > 0 {
+                nextState = max(nextState, advanceSwiftRuleA(prevImm))
             }
-            if nextLen == 0 { continue }
+            if nextState == 0 { continue }
 
             if !termStartsAscii[termId] || p == 0 {
-                recordRun(&sepRun, p, termId, nextLen)
+                recordRun(&sepRun, p, termId, nextState)
             } else {
                 if revSame == nil {
                     revSame = [[Int: Int]?](repeating: nil, count: n + 1)
                 }
-                recordRun(&revSame!, p, termId, nextLen)
+                recordRun(&revSame!, p, termId, nextState)
             }
 
-            if nextLen >= 2 && p > 0 {
-                let (valid, _) = isValidSwiftTrailingLeftBoundary(map, p: p, termStartsAscii: termStartsAscii[termId])
-                if valid && p < bestTermStart {
+            if nextState >= swiftRuleAQualCrossedEnd && p > 0 {
+                let (valid, sentEnd) = isValidSwiftTrailingLeftBoundary(map, p: p, termStartsAscii: termStartsAscii[termId])
+                let allowsCut = nextState == swiftRuleAQualInternal || sentEnd
+                if valid && allowsCut && p < bestTermStart {
                     bestTermStart = p
                 }
             }

@@ -3017,6 +3017,60 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
       { type: 'voice.session.result', sessionId: 'pc-edge-hallucination', text: '我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。', isFinal: true },
     ]);
 
+    // 7. Cross-sentence single hotwords around real body speech ("我常用 IM.codes。IM.codes", "IM.codes。IM.codes 很好用。")
+    //    stay intact across resolveSessionTranscriptResult relay while standalone "A。A。正文" / "正文。A。A。" still strip cleanly
+    await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-cross-sentence-preserve',
+      targetDeviceId: 'mac-order',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes', 'Claude'],
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.ready', sessionId: 'pc-cross-sentence-preserve' }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-cross-sentence-preserve',
+      text: '我常用 IM.codes。',
+      isFinal: false,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-cross-sentence-preserve',
+      text: '我常用 IM.codes。IM.codes',
+      isFinal: true,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-cross-sentence-preserve' }));
+    expect(clientSent.filter((f) => f.sessionId === 'pc-cross-sentence-preserve' && f.type === 'voice.session.result')).toEqual([
+      { type: 'voice.session.result', sessionId: 'pc-cross-sentence-preserve', text: '我常用 IM.codes。', isFinal: false },
+      { type: 'voice.session.result', sessionId: 'pc-cross-sentence-preserve', text: '我常用 IM.codes。IM.codes', isFinal: true },
+    ]);
+
+    await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-cross-sentence-standalone',
+      targetDeviceId: 'mac-order',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes'],
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.ready', sessionId: 'pc-cross-sentence-standalone' }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-cross-sentence-standalone',
+      text: 'IM.codes。IM.codes 很好用。',
+      isFinal: false,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+      type: 'voice.session.result',
+      sessionId: 'pc-cross-sentence-standalone',
+      text: '你好。IM.codes。IM.codes。',
+      isFinal: true,
+    }));
+    await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-cross-sentence-standalone' }));
+    expect(clientSent.filter((f) => f.sessionId === 'pc-cross-sentence-standalone' && f.type === 'voice.session.result')).toEqual([
+      { type: 'voice.session.result', sessionId: 'pc-cross-sentence-standalone', text: 'IM.codes。IM.codes 很好用。', isFinal: false },
+      { type: 'voice.session.result', sessionId: 'pc-cross-sentence-standalone', text: '你好。', isFinal: true },
+    ]);
+
     expect(hub.getActiveSessionCount()).toBe(0);
     hub.stop();
   });

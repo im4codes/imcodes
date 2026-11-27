@@ -978,7 +978,10 @@ int main() {
     assert(strip_voice_hotword_hallucination("请你对比 IM.codes, Claude Code, Codex。", terms) ==
            "请你对比 IM.codes, Claude Code, Codex。");
 
-    // Round 2 cross-sentence Rule A freeze & exact Unicode separator category parity:
+    // Round 2 & Round 4 cross-sentence Rule A boundary & exact Unicode separator category parity:
+    assert(strip_voice_hotword_hallucination("我常用 IM.codes。IM.codes", terms) == "我常用 IM.codes。IM.codes");
+    assert(strip_voice_hotword_hallucination("我常用 IM.codes。IM.codes。", terms) == "我常用 IM.codes。IM.codes。");
+    assert(strip_voice_hotword_hallucination("IM.codes。IM.codes 很好用。", terms) == "IM.codes。IM.codes 很好用。");
     assert(strip_voice_hotword_hallucination("IM.codes，IM.codes。IM.codes 很好用。", terms) ==
            "IM.codes 很好用。");
     assert(strip_voice_hotword_hallucination("我常用 IM.codes。IM.codes，IM.codes。", terms) ==

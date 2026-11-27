@@ -4129,7 +4129,10 @@ do {
     check(stripVoiceHotwordHallucination("\u{1100}\u{1161}, \u{AC00}。你好", hotwordTerms: ["\u{AC00}"]) == "你好", "case 10 hangul jamo leading")
     check(stripVoiceHotwordHallucination("Café, Cafe\u{0301}。你好", hotwordTerms: ["Café"]) == "你好", "case 10 latin nfd/nfc")
     check(stripVoiceHotwordHallucination("code\u{0301}, code。你好", hotwordTerms: ["code"]) == "code\u{0301}, code。你好", "case 10 distinct accent intact")
-    // Round 2 cross-sentence Rule A freeze & exact Unicode separator category parity:
+    // Round 2 & Round 4 cross-sentence Rule A boundary & exact Unicode separator category parity:
+    check(stripVoiceHotwordHallucination("我常用 IM.codes。IM.codes", hotwordTerms: matrixTerms) == "我常用 IM.codes。IM.codes", "case 10 cross-sentence ambiguous trailing intact")
+    check(stripVoiceHotwordHallucination("我常用 IM.codes。IM.codes。", hotwordTerms: matrixTerms) == "我常用 IM.codes。IM.codes。", "case 10 cross-sentence ambiguous trailing period intact")
+    check(stripVoiceHotwordHallucination("IM.codes。IM.codes 很好用。", hotwordTerms: matrixTerms) == "IM.codes。IM.codes 很好用。", "case 10 cross-sentence ambiguous leading intact")
     check(stripVoiceHotwordHallucination("IM.codes，IM.codes。IM.codes 很好用。", hotwordTerms: matrixTerms) == "IM.codes 很好用。", "case 10 cross-sentence fwd intact")
     check(stripVoiceHotwordHallucination("我常用 IM.codes。IM.codes，IM.codes。", hotwordTerms: matrixTerms) == "我常用 IM.codes。", "case 10 cross-sentence bwd intact")
     check(stripVoiceHotwordHallucination("IM.codes。IM.codes。你好", hotwordTerms: matrixTerms) == "你好", "case 10 independent period chain fwd")

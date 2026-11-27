@@ -456,7 +456,10 @@ describe('shared voice hotwords', () => {
     expect(stripVoiceHotwordHallucination('Café, Cafe\u0301。你好', ['Café'])).toBe('你好');
     expect(stripVoiceHotwordHallucination('code\u0301, code。你好', ['code'])).toBe('code\u0301, code。你好');
     expect(stripVoiceHotwordHallucination('cod\u0301, code。你好', ['code'])).toBe('cod\u0301, code。你好');
-    // Round 2 cross-sentence Rule A freeze + separator category parity matrix:
+    // Round 2 & Round 4 cross-sentence Rule A freeze + separator category parity matrix:
+    expect(stripVoiceHotwordHallucination('我常用 IM.codes。IM.codes', ['IM.codes'])).toBe('我常用 IM.codes。IM.codes');
+    expect(stripVoiceHotwordHallucination('我常用 IM.codes。IM.codes。', ['IM.codes'])).toBe('我常用 IM.codes。IM.codes。');
+    expect(stripVoiceHotwordHallucination('IM.codes。IM.codes 很好用。', ['IM.codes'])).toBe('IM.codes。IM.codes 很好用。');
     expect(stripVoiceHotwordHallucination('IM.codes，IM.codes。IM.codes 很好用。', ['IM.codes'])).toBe('IM.codes 很好用。');
     expect(stripVoiceHotwordHallucination('我常用 IM.codes。IM.codes，IM.codes。', ['IM.codes'])).toBe('我常用 IM.codes。');
     expect(stripVoiceHotwordHallucination('IM.codes。IM.codes。你好', ['IM.codes'])).toBe('你好');
