@@ -1,7 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { getSessionRuntimeType, isSessionAgentType } from '../../shared/agent-types.js';
+import { getSessionRuntimeType, isSessionAgentType, isShellLikeAgentType } from '../../shared/agent-types.js';
+import {
+  PARTICIPANT_SHELL_FORBIDDEN_REASON,
+  isParticipantSharedActorEnvelope,
+} from '../../shared/tab-sharing.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { p2pScopedSessionKey } from '../../shared/p2p-config-scope.js';
 import {
@@ -266,9 +270,15 @@ function skippedMembersForVisibleNonCandidates(sourceMainSessionName: string): S
   return skipped;
 }
 
-function assertCloneableAgent(record: SessionRecord): void {
+function assertCloneableAgent(record: SessionRecord, isParticipant = false): void {
   if (!isSessionAgentType(record.agentType)) {
     throw new SessionGroupCloneValidationError('unsupported_session_type', `Unsupported session type for ${record.name}`);
+  }
+  if (isParticipant && isShellLikeAgentType(record.agentType)) {
+    throw new SessionGroupCloneValidationError(
+      PARTICIPANT_SHELL_FORBIDDEN_REASON,
+      `Shared participants cannot clone shell/script session ${record.name}`,
+    );
   }
 }
 
@@ -294,6 +304,7 @@ function newSubSessionId(existingNames: Set<string>): string {
 async function buildCloneSpec(
   cmd: SessionGroupCloneRequest,
   operation: CloneOperationSnapshot,
+  isParticipant = false,
 ): Promise<CloneableSessionGroupSpec> {
   transitionNoSend(operation, 'validating');
   const source = getSession(cmd.sourceMainSessionName);
@@ -301,7 +312,12 @@ async function buildCloneSpec(
   if (!isRoleCompatibleMainSession(source)) {
     throw new SessionGroupCloneValidationError('source_not_role_compatible', 'Source session is not a role-compatible main session');
   }
-  assertCloneableAgent(source);
+  assertCloneableAgent(source, isParticipant);
+
+  const activeDirectChildren = listSessions().filter((record) => isActiveDirectChild(record, source.name));
+  for (const child of activeDirectChildren) {
+    assertCloneableAgent(child, isParticipant);
+  }
 
   const currentNames = new Set(listSessions().map((session) => session.name));
   for (const name of cmd.unavailableSessionNames ?? []) {
@@ -329,7 +345,6 @@ async function buildCloneSpec(
   const mainProjectDir = cwdOverride ?? await resolveUsableDirectory(source.projectDir, `${source.name}.projectDir`);
   assertNotCancelled(operation);
 
-  const activeDirectChildren = listSessions().filter((record) => isActiveDirectChild(record, source.name));
   const existingNamesWithAllocated = new Set(currentNames);
   const subSessions: CloneableSubSessionSpec[] = [];
   const skippedMembers = skippedMembersForVisibleNonCandidates(source.name);
@@ -340,7 +355,7 @@ async function buildCloneSpec(
   }
 
   for (const child of activeDirectChildren) {
-    assertCloneableAgent(child);
+    assertCloneableAgent(child, isParticipant);
     const cwd = await resolveCloneableSubSessionCwd(child, cwdOverride);
     const clonedId = newSubSessionId(existingNamesWithAllocated);
     const clonedSessionName = `deck_sub_${clonedId}`;
@@ -445,9 +460,15 @@ async function copyDaemonLocalP2pConfig(
   return remapped.warnings;
 }
 
-function assertAgentType(agentType: string): asserts agentType is import('../agent/detect.js').AgentType {
+function assertAgentType(agentType: string, isParticipant = false): asserts agentType is import('../agent/detect.js').AgentType {
   if (!isSessionAgentType(agentType)) {
     throw new SessionGroupCloneValidationError('unsupported_session_type', `Unsupported session type ${agentType}`);
+  }
+  if (isParticipant && isShellLikeAgentType(agentType)) {
+    throw new SessionGroupCloneValidationError(
+      PARTICIPANT_SHELL_FORBIDDEN_REASON,
+      `Shared participants cannot launch shell/script session type ${agentType}`,
+    );
   }
 }
 
@@ -456,6 +477,7 @@ async function launchCloneMembers(
   operation: CloneOperationSnapshot,
   spec: CloneableSessionGroupSpec,
   resources: CreatedResources,
+  isParticipant = false,
 ): Promise<void> {
   transition(serverLink, operation, 'reserving', {
     clonedMainSessionName: spec.main.targetMainSessionName,
@@ -469,7 +491,7 @@ async function launchCloneMembers(
   assertNotCancelled(operation);
   const recordsToPersist: SessionRecord[] = [];
 
-  assertAgentType(spec.main.agentType);
+  assertAgentType(spec.main.agentType, isParticipant);
   transition(serverLink, operation, 'creating_main', {
     clonedMainSessionName: spec.main.targetMainSessionName,
     totalSubSessions: spec.subSessions.length,
@@ -510,7 +532,7 @@ async function launchCloneMembers(
   const clonedSubRecords: Array<SessionRecord | null> = new Array(spec.subSessions.length).fill(null);
   const subLaunchResults = await Promise.allSettled(spec.subSessions.map(async (sub, index) => {
     assertNotCancelled(operation);
-    assertAgentType(sub.agentType);
+    assertAgentType(sub.agentType, isParticipant);
     await startSubSession({
       id: sub.clonedId,
       type: sub.agentType,
@@ -822,11 +844,12 @@ export async function handleSessionGroupCloneCommand(cmd: Record<string, unknown
     cleanupResources: [],
   };
 
+  const isParticipant = isParticipantSharedActorEnvelope(cmd.sharedActor);
   try {
     sendCloneEvent(serverLink, operation);
-    const spec = await buildCloneSpec(request, operation);
+    const spec = await buildCloneSpec(request, operation, isParticipant);
     assertNotCancelled(operation);
-    await launchCloneMembers(serverLink, operation, spec, resources);
+    await launchCloneMembers(serverLink, operation, spec, resources, isParticipant);
     assertNotCancelled(operation);
     transition(serverLink, operation, 'committing', {
       clonedMainSessionName: spec.main.targetMainSessionName,

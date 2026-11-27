@@ -465,4 +465,78 @@ describe('SessionControls shared participant settings entry points', () => {
     expect(screen.queryByRole('button', { name: 'Settings' })).toBeNull();
     expect(onSettings).not.toHaveBeenCalled();
   });
+
+  it('hides group clone menu when a whole-server participant views a group with shell/script members while allowing pure-LLM groups and owners', () => {
+    const serverParticipant = {
+      name: 'deck_proj_brain',
+      project: 'proj',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      userCreated: true,
+      sharedState: {
+        targetKind: 'server',
+        effectiveRole: 'participant',
+        status: 'active',
+        outgoing: false,
+      },
+    } as SessionInfo;
+
+    const mixedView = render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={serverParticipant}
+        subSessions={[
+          { sessionName: 'deck_sub_sh1', type: 'shell', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={quickData}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    const mixedMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(within(mixedMenu).queryByRole('button', { name: 'menu' })).toBeNull();
+    mixedView.unmount();
+
+    const llmView = render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={serverParticipant}
+        subSessions={[
+          { sessionName: 'deck_sub_llm1', type: 'codex-sdk', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={quickData}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    const llmMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(within(llmMenu).getByRole('button', { name: 'menu' })).toBeDefined();
+    llmView.unmount();
+
+    render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-owner"
+        activeSession={{
+          name: 'deck_proj_brain',
+          project: 'proj',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          runtimeType: 'transport',
+          userCreated: true,
+        } as SessionInfo}
+        subSessions={[
+          { sessionName: 'deck_sub_sh1', type: 'shell', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={quickData}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    const ownerMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(within(ownerMenu).getByRole('button', { name: 'menu' })).toBeDefined();
+  });
 });

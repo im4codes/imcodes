@@ -34,6 +34,8 @@ const resolveSessionIdentityProjectKeyMock = vi.fn<(sessionName: string) => stri
  * every OTHER test in this file (which never touches identity) is unaffected.
  */
 const isDaemonConnectedMock = vi.fn(() => true);
+const resolveSessionAgentTypeMock = vi.fn<(name: string) => Promise<string | null>>(async () => null);
+const invalidateSessionAgentTypeCacheMock = vi.fn();
 const sendSessionIdentityLocalRequestMock = vi.fn(async (
   _requestId: string,
   payload: { op: 'get' | 'set' | 'delete'; scope: string; scopeKey: string; content?: string },
@@ -85,6 +87,8 @@ vi.mock('../src/ws/bridge.js', () => ({
       resolveSessionIdentityProjectKey: resolveSessionIdentityProjectKeyMock,
       isDaemonConnected: isDaemonConnectedMock,
       sendSessionIdentityLocalRequest: sendSessionIdentityLocalRequestMock,
+      resolveSessionAgentType: resolveSessionAgentTypeMock,
+      invalidateSessionAgentTypeCache: invalidateSessionAgentTypeCacheMock,
     }),
   },
 }));
@@ -120,6 +124,7 @@ describe('session-mgmt persistence routes', () => {
     getActiveDispatchIdForSessionMock.mockReturnValue('dispatch-1');
     mockGetDbSessionsByServer.mockResolvedValue([]);
     mockGetSubSessionsByServer.mockResolvedValue([]);
+    resolveSessionAgentTypeMock.mockResolvedValue(null);
     mockGetUserPref.mockResolvedValue(null);
     mockSetUserPref.mockResolvedValue(undefined);
   });
@@ -2302,14 +2307,69 @@ describe('session-mgmt persistence routes', () => {
     }
     expect(sendToDaemonMock).not.toHaveBeenCalled();
 
-    // Whole-server participant POST /session/start with LLM succeeds
+    // Whole-server participant POST /session/start with LLM succeeds and stamps server-owned sharedActor
     const llmStartRes = await app.request('/api/server/srv-1/session/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project: 'llmproj', dir: '/tmp/llmproj', agentType: 'claude-code' }),
+      body: JSON.stringify({
+        project: 'llmproj',
+        dir: '/tmp/llmproj',
+        agentType: 'claude-code',
+        sharedActor: { effectiveActorRole: 'owner' },
+      }),
     });
     expect(llmStartRes.status).toBe(200);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toMatchObject({
+      type: 'session.start',
+      project: 'llmproj',
+      agentType: 'claude-code',
+      sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
+    });
     sendToDaemonMock.mockClear();
+
+    // Live bridge type mismatch ('shell') rejects PATCH /sessions/:name even if DB still says 'claude-code'
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
+      shareProvenance: 'server',
+    });
+    mockGetDbSessionByName.mockResolvedValueOnce({ name: 'deck_live_sh', role: 'brain', agent_type: 'claude-code' });
+    resolveSessionAgentTypeMock.mockResolvedValueOnce('shell');
+    const liveMismatchPatch = await app.request('/api/server/srv-1/sessions/deck_live_sh', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'nope' }),
+    });
+    expect(liveMismatchPatch.status).toBe(403);
+    expect(await liveMismatchPatch.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+
+    // Whole-server participant POST /session/send to LLM brain with P2P target pointing to shell sub-session -> 403
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
+      shareProvenance: 'server',
+    });
+    mockGetDbSessionByName.mockResolvedValue({ name: 'deck_proj_brain', role: 'brain', agent_type: 'claude-code' });
+    mockGetSubSessionById.mockImplementation(async (_db: unknown, subId: string) => (
+      subId === 'subsh1' ? { id: 'subsh1', server_id: 'srv-1', type: 'shell', parent_session: 'deck_proj_brain', closed_at: null } : null
+    ));
+    mockGetSubSessionsByServer.mockResolvedValue([
+      { id: 'subsh1', server_id: 'srv-1', type: 'shell', parent_session: 'deck_proj_brain', closed_at: null },
+    ]);
+    for (const p2pPayload of [
+      { sessionName: 'deck_proj_brain', text: '@@discuss(deck_sub_subsh1, audit)' },
+      { sessionName: 'deck_proj_brain', text: 'check', p2pAtTargets: [{ session: 'deck_sub_subsh1', mode: 'audit' }] },
+      { sessionName: 'deck_proj_brain', text: 'check', p2pSessionConfig: { deck_sub_subsh1: { enabled: true, mode: 'audit' } } },
+    ]) {
+      const p2pRes = await app.request('/api/server/srv-1/session/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(p2pPayload),
+      });
+      expect(p2pRes.status).toBe(403);
+      expect(await p2pRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    }
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
 
     // 2. Whole-server participant PATCH /sessions/:name to shell/script OR on existing shell session -> 403
     mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({

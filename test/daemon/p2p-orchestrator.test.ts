@@ -3510,4 +3510,114 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(done.error).toContain('synthesis unavailable');
     await waitForNoRoundHopArtifacts(tempProjectDir, done.id);
   }, 25_000);
+
+  it('blocks shared participant P2P runs and queued hop dispatches targeting shell/script while allowing pure-LLM and owner runs', async () => {
+    const participantActor = {
+      actorUserId: 'user-p1',
+      actorDisplayName: 'Participant',
+      effectiveActorRole: 'participant' as const,
+      origin: 'shared-server' as const,
+      actionId: 'p2p-1',
+      primaryShareId: 'share-1',
+      authorizedAt: 1000,
+      snapshot: {
+        target: { kind: 'server' as const, serverId: 'srv-1' },
+        effectiveRole: 'participant' as const,
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-1'],
+        primaryShareId: 'share-1',
+        authorizedAt: 1000,
+        serverParticipantAuthority: true,
+      },
+    };
+
+    // 1. Mixed recipients (LLM + shell) rejected at startP2pRun with zero writes
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_proj_brain') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'brain', runtimeType: 'process', state: 'idle' };
+      if (name === 'deck_proj_w1') return { agentType: 'codex', projectDir: tempProjectDir, parentSession: undefined, label: 'w1', runtimeType: 'process', state: 'idle' };
+      if (name === 'deck_sub_sh1') return { agentType: 'shell', projectDir: tempProjectDir, parentSession: 'deck_proj_brain', label: 'sh1', runtimeType: 'process', state: 'idle' };
+      return null;
+    });
+    await expect(startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [
+        { session: 'deck_proj_w1', mode: 'audit' },
+        { session: 'deck_sub_sh1', mode: 'audit' },
+      ],
+      userText: 'check mixed recipients',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      sharedActor: participantActor,
+    })).rejects.toThrow('participant_shell_forbidden');
+    expect(processSessionSendMock).not.toHaveBeenCalled();
+    expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+
+    // 2. Queued/subsequent hop flip to shell aborts with participant_shell_forbidden, and beforeTyping catches in-lock flip
+    let w1AgentType = 'codex';
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_proj_brain') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'brain', runtimeType: 'process', state: 'idle' };
+      if (name === 'deck_proj_w1') return { agentType: w1AgentType, projectDir: tempProjectDir, parentSession: undefined, label: 'w1', runtimeType: 'process', state: 'idle' };
+      return null;
+    });
+    let w1DispatchCount = 0;
+    let beforeTypingWhileLlm: boolean | undefined;
+    let beforeTypingAfterFlipToShell: boolean | undefined;
+    processSessionSendMock.mockImplementation(async (session: string, prompt: string, opts?: { beforeTyping?: () => boolean }) => {
+      if (session === 'deck_proj_w1') {
+        w1DispatchCount += 1;
+        beforeTypingWhileLlm = opts?.beforeTyping?.();
+        w1AgentType = 'shell';
+        beforeTypingAfterFlipToShell = opts?.beforeTyping?.();
+      }
+      await sendKeysDelayedEnterMock(session, prompt);
+    });
+
+    const raceRun = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      rounds: 2,
+      userText: 'race flip to shell',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      sharedActor: participantActor,
+    });
+    const raceDone = await waitForStatus(raceRun.id, ['failed'], 10_000);
+    expect(raceDone.error).toContain('participant_shell_forbidden');
+    expect(w1DispatchCount).toBe(1);
+    expect(beforeTypingWhileLlm).toBe(true);
+    expect(beforeTypingAfterFlipToShell).toBe(false);
+
+    // 3. Pure-LLM participant run & owner run with shell session succeed cleanly
+    processSessionSendMock.mockClear();
+    w1AgentType = 'codex';
+    processSessionSendMock.mockImplementation(async (session: string, prompt: string) => {
+      await sendKeysDelayedEnterMock(session, prompt);
+    });
+
+    const pureLlmRun = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'pure llm participant run',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      sharedActor: participantActor,
+    });
+    const pureDone = await waitForStatus(pureLlmRun.id, ['completed'], 15_000);
+    expect(pureDone.status).toBe('completed');
+    expect(processSessionSendMock.mock.calls.some(([sess]) => sess === 'deck_proj_w1')).toBe(true);
+
+    processSessionSendMock.mockClear();
+    w1AgentType = 'shell';
+    const ownerRun = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'owner run with shell target',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+    });
+    const ownerDone = await waitForStatus(ownerRun.id, ['completed'], 15_000);
+    expect(ownerDone.status).toBe('completed');
+    expect(processSessionSendMock.mock.calls.some(([sess]) => sess === 'deck_proj_w1')).toBe(true);
+  }, 25_000);
 });

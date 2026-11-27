@@ -15,6 +15,7 @@ import {
   resolveHttpShareAccessForCoveredSession,
   resolveServerMemberAccessOrShareDeny,
 } from './share-http-auth.js';
+import { buildHttpSharedActor, isWholeServerShareAccess } from '../share/http-shared-actor.js';
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { listActiveSharesForUser } from '../db/tab-sharing.js';
@@ -260,6 +261,7 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     body.effort ?? null,
     body.transport_config ?? null,
   );
+  WsBridge.get(serverId).invalidateSessionAgentTypeCache?.(sessionName);
 
   return c.json({ id: sub.id, sessionName, subSession: sub }, 201);
 });
@@ -311,6 +313,7 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
 
   let body: {
     type?: string | null;
+    sessionType?: string | null;
     label?: string | null;
     closedAt?: number | null;
     description?: string | null;
@@ -332,17 +335,37 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   // authority. Reject every shape (including null/empty/partial) before a DB
   // write or daemon relay, using the server-resolved share capability rather
   // than any client/projected session role.
-  const isWholeServerShare = access?.actor.kind === 'share'
-    && (access.shareProvenance === 'server'
-      || (access.shareProvenance === undefined && access.actor.coverage?.target?.kind === 'server'));
-  if (isShellLikeAgentType(body.type) || isShellLikeAgentType(existing.type)) {
-    const isShareParticipantActor = access?.actor.kind === 'share'
-      || (memberMayUpdate && (await resolveServerMembershipRole(c.env.DB, serverId, userId)) === 'none');
-    if (isShareParticipantActor) {
+  const realMembership = memberMayUpdate
+    ? await resolveServerMembershipRole(c.env.DB, serverId, userId)
+    : 'none';
+  const serverShareAccess = memberMayUpdate && realMembership === 'none'
+    ? await resolveHttpShareAccess(c.env.DB, {
+        serverId,
+        userId,
+        target: { kind: 'server', serverId },
+      })
+    : null;
+  const effectiveShareAccess = access?.actor.kind === 'share'
+    ? access
+    : (serverShareAccess?.actor.kind === 'share' ? serverShareAccess : null);
+  const isShareActor = effectiveShareAccess?.actor.kind === 'share' || (memberMayUpdate && realMembership === 'none');
+  if (memberMayUpdate && realMembership === 'none' && (effectiveShareAccess?.actor.kind !== 'share' || effectiveShareAccess.actor.effectiveActorRole !== 'participant')) {
+    return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+  const subSessionName = `deck_sub_${subId}`;
+  const liveAgentType = await WsBridge.get(serverId).resolveSessionAgentType?.(subSessionName);
+  const isWholeServerShare = effectiveShareAccess ? isWholeServerShareAccess(effectiveShareAccess) : false;
+  if (
+    isShellLikeAgentType(body.type)
+    || isShellLikeAgentType(body.sessionType)
+    || isShellLikeAgentType(existing.type)
+    || isShellLikeAgentType(liveAgentType)
+  ) {
+    if (isShareActor) {
       return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
     }
   }
-  if (access?.actor.kind === 'share'
+  if (isShareActor
     && (Object.prototype.hasOwnProperty.call(body, 'transportConfig')
       || (!isWholeServerShare
         && Object.prototype.hasOwnProperty.call(body, 'cwd')))) {
@@ -385,12 +408,25 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   }
 
   await updateSubSession(c.env.DB, subId, serverId, fields);
+  if (typeof body.type === 'string') {
+    WsBridge.get(serverId).invalidateSessionAgentTypeCache?.(subSessionName);
+  }
+  const sharedActorNow = Date.now();
+  const sharedActor = effectiveShareAccess?.actor.kind === 'share' && effectiveShareAccess.actor.coverage
+    ? await buildHttpSharedActor(c.env.DB, {
+        userId,
+        coverage: effectiveShareAccess.actor.coverage,
+        actionId: `subsession-settings-${sharedActorNow}`,
+        now: sharedActorNow,
+        origin: isWholeServerShare ? 'shared-server' : 'shared-tab',
+      })
+    : null;
 
   if (typeof body.type === 'string') {
     try {
       WsBridge.get(serverId).sendToDaemon(JSON.stringify({
         type: 'subsession.restart',
-        sessionName: `deck_sub_${subId}`,
+        sessionName: subSessionName,
         agentType: body.type,
         ...(body.label !== undefined ? { label: body.label } : {}),
         ...(body.description !== undefined ? { description: body.description } : {}),
@@ -399,6 +435,7 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
         ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
         ...(body.effort !== undefined ? { effort: body.effort } : {}),
         ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
+        ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, subId, err }, 'WsBridge sub-session settings relay failed');
@@ -409,8 +446,9 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
     try {
       WsBridge.get(serverId).sendToDaemon(JSON.stringify({
         type: 'subsession.rename',
-        sessionName: `deck_sub_${subId}`,
+        sessionName: subSessionName,
         label: body.label ?? null,
+        ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, subId, err }, 'WsBridge sub-session rename relay failed');
@@ -421,8 +459,9 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
     try {
       WsBridge.get(serverId).sendToDaemon(JSON.stringify({
         type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
-        sessionName: `deck_sub_${subId}`,
+        sessionName: subSessionName,
         transportConfig: body.transportConfig ?? null,
+        ...(sharedActor ? { sharedActor } : {}),
       }));
     } catch (err) {
       logger.error({ serverId, subId, err }, 'WsBridge sub-session transportConfig relay failed');
@@ -443,6 +482,8 @@ subSessionRoutes.delete('/:id/sub-sessions/:subId', async (c) => {
   if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
 
   await deleteSubSession(c.env.DB, subId, serverId);
-  void WsBridge.get(serverId).revalidateShareSocketsForTarget({ kind: 'subsession', serverId, subSessionId: subId });
+  const bridge = WsBridge.get(serverId);
+  bridge.invalidateSessionAgentTypeCache?.(`deck_sub_${subId}`);
+  void bridge.revalidateShareSocketsForTarget({ kind: 'subsession', serverId, subSessionId: subId });
   return c.json({ ok: true });
 });

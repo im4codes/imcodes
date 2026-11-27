@@ -451,4 +451,106 @@ describe('sub-session routes', () => {
     });
     expect(ownerShellRes.status).toBe(201);
   });
+
+  it('stamps sharedActor on participant PATCH sub-session restarts and rejects live daemon shell type mismatches', async () => {
+    const { getSubSessionById } = await import('../src/db/queries.js');
+    const { WsBridge } = await import('../src/ws/bridge.js');
+    const bridge = WsBridge.get('srv-1');
+    const sendSpy = vi.spyOn(bridge, 'sendToDaemon').mockImplementation(() => {});
+    const liveTypeSpy = vi.spyOn(bridge, 'resolveSessionAgentType').mockResolvedValue(null);
+    const invalidateSpy = vi.spyOn(bridge, 'invalidateSessionAgentTypeCache');
+    try {
+      const app = await buildApp();
+
+      // 1) Tab-share participant allowed LLM type switch -> relays subsession.restart with sharedActor
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
+      mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+        membership: 'none',
+        actor: {
+          kind: 'share',
+          effectiveActorRole: 'participant',
+          coverage: {
+            target: { kind: 'subsession', serverId: 'srv-1', subSessionId: 'sub-llm-1' },
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['tab-1'],
+            primaryShareId: 'tab-1',
+            authorizedAt: 1000,
+          },
+        },
+        shareProvenance: 'session',
+      });
+      vi.mocked(getSubSessionById).mockResolvedValue({
+        id: 'sub-llm-1',
+        server_id: 'srv-1',
+        type: 'codex-sdk',
+      } as never);
+
+      const tabPatch = await app.request('/api/server/srv-1/sub-sessions/sub-llm-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'claude-code-sdk' }),
+      });
+      expect(tabPatch.status).toBe(200);
+      expect(invalidateSpy).toHaveBeenCalledWith('deck_sub_sub-llm-1');
+      expect(JSON.parse(String(sendSpy.mock.calls[0]?.[0]))).toMatchObject({
+        type: 'subsession.restart',
+        sessionName: 'deck_sub_sub-llm-1',
+        agentType: 'claude-code-sdk',
+        sharedActor: { effectiveActorRole: 'participant', origin: 'shared-tab' },
+      });
+
+      // 2) Whole-server participant allowed LLM type switch -> relays with shared-server actor
+      sendSpy.mockClear();
+      mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+      mockResolveServerMembershipRole.mockResolvedValue('none');
+      mockResolveHttpShareAccess.mockResolvedValue({
+        membership: 'none',
+        actor: {
+          kind: 'share',
+          effectiveActorRole: 'participant',
+          coverage: {
+            target: { kind: 'server', serverId: 'srv-1' },
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['srv-share-1'],
+            primaryShareId: 'srv-share-1',
+            authorizedAt: 1000,
+            serverParticipantAuthority: true,
+          },
+        },
+        shareProvenance: 'server',
+      });
+      const srvPatch = await app.request('/api/server/srv-1/sub-sessions/sub-llm-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'codex-sdk' }),
+      });
+      expect(srvPatch.status).toBe(200);
+      expect(JSON.parse(String(sendSpy.mock.calls[0]?.[0]))).toMatchObject({
+        type: 'subsession.restart',
+        sessionName: 'deck_sub_sub-llm-1',
+        agentType: 'codex-sdk',
+        sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
+      });
+
+      // 3) DB says codex-sdk, but live bridge type is shell -> rejected 403 participant_shell_forbidden
+      sendSpy.mockClear();
+      liveTypeSpy.mockResolvedValueOnce('shell');
+      const mismatchRes = await app.request('/api/server/srv-1/sub-sessions/sub-llm-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'claude-code-sdk' }),
+      });
+      expect(mismatchRes.status).toBe(403);
+      expect(await mismatchRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      sendSpy.mockRestore();
+      liveTypeSpy.mockRestore();
+      invalidateSpy.mockRestore();
+    }
+  });
 });

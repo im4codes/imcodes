@@ -43,7 +43,7 @@ import {
   isSubSessionRecord,
   unsupportedAgentTypeError,
 } from '../../shared/agent-types.js';
-import { PARTICIPANT_SHELL_FORBIDDEN_REASON } from '../../shared/tab-sharing.js';
+import { PARTICIPANT_SHELL_FORBIDDEN_REASON, isParticipantSharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { isServerLinkResyncStatePayload, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
@@ -3316,12 +3316,7 @@ async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
 // sanitizeProjectName moved to shared/sanitize-project-name.ts
 
 function isParticipantSharedActor(cmd: Record<string, unknown>): boolean {
-  const sharedActor = cmd.sharedActor;
-  return Boolean(
-    sharedActor
-    && typeof sharedActor === 'object'
-    && (sharedActor as { effectiveActorRole?: unknown }).effectiveActorRole === 'participant',
-  );
+  return isParticipantSharedActorEnvelope(cmd.sharedActor);
 }
 
 async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -3331,7 +3326,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     const targetProject = rawProject ? sanitizeProjectName(rawProject) : undefined;
     const targetSession = targetProject ? `deck_${targetProject}_brain` : undefined;
     const existingTarget = targetSession ? getSession(targetSession) : undefined;
-    if (isShellLikeAgentType(agentType) || isShellLikeAgentType(existingTarget?.agentType)) {
+    if (
+      isShellLikeAgentType(agentType)
+      || isShellLikeAgentType(cmd.sessionType)
+      || isShellLikeAgentType(existingTarget?.agentType)
+    ) {
       logger.warn({ project: targetProject ?? rawProject, agentType }, 'session.start rejected: participant_shell_forbidden');
       serverLink.send({
         type: 'session.error',
@@ -3560,7 +3559,11 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     const record = getSession(sessionName);
     if (
       isParticipantSharedActor(cmd)
-      && (isShellLikeAgentType(cmd.agentType) || isShellLikeAgentType(record?.agentType))
+      && (
+        isShellLikeAgentType(cmd.agentType)
+        || isShellLikeAgentType(cmd.sessionType)
+        || isShellLikeAgentType(record?.agentType)
+      )
     ) {
       logger.warn({ sessionName, requestedAgentType: cmd.agentType, currentAgentType: record?.agentType }, 'session.restart rejected: participant_shell_forbidden');
       serverLink.send({
@@ -3579,7 +3582,19 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     try {
       await runExclusiveSessionRelaunch(sessionName, async () => {
         try {
-          await relaunchSessionWithSettings(record, {
+          const liveRecord = getSession(sessionName) ?? record;
+          if (isParticipantSharedActor(cmd) && isShellLikeAgentType(liveRecord.agentType)) {
+            logger.warn({ sessionName, currentAgentType: liveRecord.agentType }, 'session.restart rejected inside lock: participant_shell_forbidden');
+            serverLink.send({
+              type: 'session.error',
+              project: liveRecord.projectName,
+              session: sessionName,
+              sessionName,
+              message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+            });
+            return;
+          }
+          await relaunchSessionWithSettings(liveRecord, {
             agentType: (cmd.agentType as any) ?? undefined,
             projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
             label: ('label' in cmd ? (cmd.label as string | null) : undefined),
@@ -3648,12 +3663,19 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
       if (am && bm) return Number(am[1]) - Number(bm[1]);
       return 0;
     });
+  if (
+    isParticipantSharedActor(cmd)
+    && (
+      isShellLikeAgentType(cmd.sessionType)
+      || projectWorkers.some((worker) => isShellLikeAgentType(worker.agentType))
+    )
+  ) {
+    logger.warn({ project }, 'session.restart(project) rejected before teardown: participant_shell_forbidden');
+    try { serverLink.send({ type: 'session.error', project, message: PARTICIPANT_SHELL_FORBIDDEN_REASON }); } catch { /* ignore */ }
+    return;
+  }
   const workerTypes: ProjectConfig['workerTypes'] = [];
   for (const worker of projectWorkers) {
-    if (isParticipantSharedActor(cmd) && isShellLikeAgentType(worker.agentType)) {
-      logger.warn({ project, sessionName: worker.name, agentType: worker.agentType }, 'session.restart: skipping shell/script worker for shared participant');
-      continue;
-    }
     if (!isSessionAgentType(worker.agentType)) {
       logger.warn(
         { project, sessionName: worker.name, role: worker.role, agentType: worker.agentType },
@@ -5554,6 +5576,24 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   }
 
   if (tokens.agents.length > 0) {
+    if (
+      sharedActor?.effectiveActorRole === 'participant'
+      && tokens.agents.some((target) => isShellLikeAgentType(getSession(target.session)?.agentType))
+    ) {
+      logger.warn({ sessionName, commandId: effectiveId }, 'session.send P2P rejected: participant_shell_forbidden');
+      timelineEmitter.emit(sessionName, 'command.ack', {
+        commandId: effectiveId,
+        status: 'error',
+        error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+      });
+      emitCommandAckReliable(serverLink, {
+        commandId: effectiveId,
+        sessionName,
+        status: 'error',
+        error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+      });
+      return;
+    }
     // P2P Quick Discussion — delegate to orchestrator
     try {
       // ── Concurrency guard: check for active P2P runs on same initiator ──
@@ -7411,6 +7451,20 @@ async function handleInputBound(cmd: Record<string, unknown>, serverLink: Server
   // write ordering, so the fast path keeps input ordering without coupling it
   // to the long-running process command lane.
   if (!terminalInputNeedsSessionMutex(BACKEND)) {
+    const liveAgentType = getSession(sessionName)?.agentType;
+    if (isParticipantSharedActor(cmd) && isShellLikeAgentType(liveAgentType)) {
+      logger.warn({ sessionName, agentType: liveAgentType }, 'session.input rejected before write: participant_shell_forbidden');
+      try {
+        serverLink.send({
+          type: 'session.error',
+          project: getSession(sessionName)?.projectName ?? sessionName,
+          session: sessionName,
+          sessionName,
+          message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
     const stageStartedAt = Date.now();
     terminalStageTrace('browser_input_received', sessionName, stageStartedAt);
     try {
@@ -7427,7 +7481,21 @@ async function handleInputBound(cmd: Record<string, unknown>, serverLink: Server
   try {
     // For Codex and Gemini, ESC doesn't interrupt an ongoing task — they need Ctrl+C.
     // Remap ESC → Ctrl+C for these agents so interrupt behavior is consistent with CC.
-    const agentType = getSession(sessionName)?.agentType;
+    const liveRecord = getSession(sessionName);
+    const agentType = liveRecord?.agentType;
+    if (isParticipantSharedActor(cmd) && isShellLikeAgentType(agentType)) {
+      logger.warn({ sessionName, agentType }, 'session.input rejected inside mutex: participant_shell_forbidden');
+      try {
+        serverLink.send({
+          type: 'session.error',
+          project: liveRecord?.projectName ?? sessionName,
+          session: sessionName,
+          sessionName,
+          message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
     const isEsc = data === '\x1b';
     if (agentType && agentType !== 'shell' && agentType !== 'script' && (isEsc || data === '\x03')) {
       if (!markSessionUserStopped(sessionName)) {
@@ -8763,8 +8831,16 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const id = cmd.id as string | undefined;
   const type = cmd.sessionType as string | undefined;
   const sessionName = id ? subSessionName(id) : undefined;
-  if (isParticipantSharedActor(cmd) && isShellLikeAgentType(type ?? cmd.agentType)) {
-    logger.warn({ id, sessionName, type: type ?? cmd.agentType }, 'subsession.start rejected: participant_shell_forbidden');
+  const existingSub = sessionName ? getSession(sessionName) : undefined;
+  if (
+    isParticipantSharedActor(cmd)
+    && (
+      isShellLikeAgentType(type)
+      || isShellLikeAgentType(cmd.agentType)
+      || isShellLikeAgentType(existingSub?.agentType)
+    )
+  ) {
+    logger.warn({ id, sessionName, type: type ?? cmd.agentType, existingType: existingSub?.agentType }, 'subsession.start rejected: participant_shell_forbidden');
     serverLink.send({
       type: 'session.error',
       message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
@@ -8805,7 +8881,6 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     parentSession ? getSession(parentSession)?.projectDir : undefined,
   );
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
-  const existingSub = getSession(sessionName);
   const effort = isTransportEffortLevel(requestedEffort)
     ? requestedEffort
     : existingSub?.effort ?? getDefaultThinkingLevel(type);
@@ -8958,7 +9033,11 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   const record = getSession(sName);
   if (
     isParticipantSharedActor(cmd)
-    && (isShellLikeAgentType(cmd.agentType ?? cmd.sessionType) || isShellLikeAgentType(record?.agentType))
+    && (
+      isShellLikeAgentType(cmd.agentType)
+      || isShellLikeAgentType(cmd.sessionType)
+      || isShellLikeAgentType(record?.agentType)
+    )
   ) {
     logger.warn({ sessionName: sName, requestedAgentType: cmd.agentType ?? cmd.sessionType, currentAgentType: record?.agentType }, 'subsession.restart rejected: participant_shell_forbidden');
     serverLink.send({
@@ -8988,7 +9067,19 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   try {
     await runExclusiveSessionRelaunch(sName, async () => {
       try {
-        const effectiveRecord = (await recoverOpenCodeSessionRecord(record)) ?? record;
+        const liveRecord = getSession(sName) ?? record;
+        if (isParticipantSharedActor(cmd) && isShellLikeAgentType(liveRecord.agentType)) {
+          logger.warn({ sessionName: sName, currentAgentType: liveRecord.agentType }, 'subsession.restart rejected inside lock: participant_shell_forbidden');
+          serverLink.send({
+            type: 'session.error',
+            project: liveRecord.projectName,
+            session: sName,
+            sessionName: sName,
+            message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+          });
+          return;
+        }
+        const effectiveRecord = (await recoverOpenCodeSessionRecord(liveRecord)) ?? liveRecord;
         await relaunchSessionWithSettings(effectiveRecord, {
           agentType: (cmd.agentType as any) ?? undefined,
           projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),

@@ -38,7 +38,7 @@ import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-co
 import { CC_PRESET_MSG } from '../../shared/cc-presets.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
-import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
+import { SESSION_GROUP_CLONE_CAPABILITY_V1, SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
 import { encodeSessionIdentityDirectHandle } from '../../shared/session-identity.js';
 import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
 
@@ -3748,12 +3748,193 @@ describe('WsBridge share-scoped sockets', () => {
       expect(sock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === `send-${label}` && m.reason === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN)).toBe(true);
       expect(sock.sentJson.filter((m) => m.type === 'error' && m.code === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN).length).toBeGreaterThanOrEqual(4);
 
-      // Permitted LLM session commands keep working normally
-      sock.emit('message', JSON.stringify({ type: 'session.input', sessionName: 'deck_proj_brain', data: '\x1b' }));
-      sock.emit('message', JSON.stringify({ type: 'subsession.start', id: `ok_${label}`, sessionType: 'codex-sdk', parentSession: 'deck_proj_brain' }));
+      // Permitted LLM session commands keep working normally and carry stamped sharedActor
+      daemon.sent.length = 0;
+      sock.sent.length = 0;
+      sock.emit('message', JSON.stringify({
+        type: 'session.input',
+        sessionName: 'deck_proj_brain',
+        data: '\x1b',
+        sharedActor: { effectiveActorRole: 'owner' },
+      }));
+      sock.emit('message', JSON.stringify({
+        type: 'subsession.start',
+        id: `ok_${label}`,
+        sessionType: 'codex-sdk',
+        parentSession: 'deck_proj_brain',
+        sharedActor: { effectiveActorRole: 'owner' },
+      }));
+      sock.emit('message', JSON.stringify({
+        type: 'subsession.restart',
+        sessionName: 'deck_proj_brain',
+        parentSession: 'deck_proj_brain',
+        agentType: 'claude-code-sdk',
+      }));
+      sock.emit('message', JSON.stringify({
+        type: 'session.start',
+        project: 'okllm',
+        dir: '/tmp/okllm',
+        agentType: 'claude-code-sdk',
+        sharedActor: { effectiveActorRole: 'owner' },
+      }));
+      sock.emit('message', JSON.stringify({
+        type: 'session.restart',
+        sessionName: 'deck_proj_brain',
+        agentType: 'claude-code',
+      }));
       await flushAsync();
-      expect(daemon.sentJson.some((m) => m.type === 'session.input' && m.sessionName === 'deck_proj_brain')).toBe(true);
-      expect(daemon.sentJson.some((m) => m.type === 'subsession.start' && m.sessionType === 'codex-sdk')).toBe(true);
+      const expectedOrigin = label === 'server-share' ? 'shared-server' : 'shared-tab';
+      const expectedCommands = label === 'server-share'
+        ? ['session.input', 'subsession.start', 'subsession.restart', 'session.start', 'session.restart']
+        : ['session.input', 'subsession.start', 'subsession.restart', 'session.restart'];
+      for (const cmdType of expectedCommands) {
+        const relayed = daemon.sentJson.find((m) => m.type === cmdType);
+        expect(relayed, cmdType).toBeDefined();
+        expect(relayed?.sharedActor).toMatchObject({
+          effectiveActorRole: 'participant',
+          origin: expectedOrigin,
+        });
+      }
     }
+  });
+
+  it('uses execution target (not parentSession) on subsession.start, checks mixed-project session.restart, dual type fields, group-clone, P2P targets, and cache invalidation', async () => {
+    const now = Date.now();
+    const daemon = new MockWs();
+    const bridge = WsBridge.get(serverId);
+    const subRows: Array<{ id: string; parent_session: string | null; type?: string; closed_at?: number | null }> = [
+      { id: 'sh1', parent_session: 'deck_proj_brain', type: 'shell', closed_at: null },
+      { id: 'llm1', parent_session: 'deck_proj_brain', type: 'codex-sdk', closed_at: null },
+      { id: 'mix_sh', parent_session: 'deck_mixproj_brain', type: 'script', closed_at: null },
+    ];
+    const baseDb = makeDb(null, [], { subSessions: subRows });
+    const db = {
+      ...baseDb,
+      query: async (sql: string, params: unknown[] = []) => {
+        if (sql.includes('FROM server_shares')) {
+          return [{
+            target_kind: 'server',
+            id: 'share-1',
+            server_id: serverId,
+            session_name: null,
+            sub_session_id: null,
+            target_user_id: 'participant-server-2',
+            role: 'participant',
+            created_by: 'owner-user',
+            created_at: now - 1000,
+            updated_at: now - 1000,
+            expires_at: null,
+            revoked_at: null,
+          }];
+        }
+        if (sql.includes('FROM sub_sessions WHERE server_id = $1 AND parent_session = $2')) {
+          return subRows.filter((r) => r.parent_session === params[1] && !r.closed_at).map((r) => ({ id: r.id, type: r.type ?? 'codex-sdk' }));
+        }
+        if (sql.includes('FROM sessions WHERE server_id = $1 AND (project_name = $2')) {
+          if (params[1] === 'mixproj') {
+            return [
+              { name: 'deck_mixproj_brain', agent_type: 'claude-code' },
+              { name: 'deck_mixproj_w1', agent_type: 'shell' },
+            ];
+          }
+          if (params[1] === 'purellm') {
+            return [{ name: 'deck_purellm_brain', agent_type: 'claude-code' }];
+          }
+          return [];
+        }
+        return (baseDb as { query: (s: string, p?: unknown[]) => Promise<unknown[]> }).query(sql, params);
+      },
+      queryOne: async (sql: string, params: unknown[] = []) => {
+        if (sql.includes('SELECT EXISTS')) {
+          return { exists: true };
+        }
+        if (sql.includes('actor_status')) {
+          return { user_id: 'owner-user', owner_status: 'active', actor_status: 'active' };
+        }
+        if (sql.includes('FROM sub_sessions WHERE server_id = $1 AND id = $2')) {
+          const hit = subRows.find((r) => r.id === params[1]);
+          return hit ? { agent_type: hit.type ?? null } : null;
+        }
+        if (sql.includes('FROM sessions WHERE server_id = $1 AND name = $2')) {
+          if (params[1] === 'deck_proj_brain') return { agent_type: 'claude-code' };
+          if (params[1] === 'deck_mixproj_brain') return { agent_type: 'claude-code' };
+          if (params[1] === 'deck_purellm_brain') return { agent_type: 'claude-code' };
+          if (params[1] === 'deck_shellmain_brain') return { agent_type: 'shell' };
+        }
+        return (baseDb as { queryOne: (s: string, p?: unknown[]) => Promise<unknown> }).queryOne(sql, params);
+      },
+    } as never;
+
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-shell-ws-key-2' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+      daemonId: serverId,
+      capabilities: [SESSION_GROUP_CLONE_CAPABILITY_V1],
+      helloEpoch: 1,
+      sentAt: now,
+    }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: 'deck_proj_brain', project: 'proj', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+        { name: 'deck_mixproj_brain', project: 'mixproj', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+        { name: 'deck_mixproj_w1', project: 'mixproj', role: 'w1', state: 'idle', agentType: 'shell', runtimeType: 'process' },
+        { name: 'deck_purellm_brain', project: 'purellm', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+      ],
+    }));
+    daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'sh1', parentSession: 'deck_proj_brain', sessionType: 'shell', runtimeType: 'process', state: 'idle' }));
+    daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'llm1', parentSession: 'deck_proj_brain', sessionType: 'codex-sdk', runtimeType: 'transport', state: 'idle' }));
+    await flushAsync();
+
+    // Cache invalidation: updating DB type and invalidating refreshes resolveSessionAgentType cleanly
+    expect(await bridge.resolveSessionAgentType('deck_sub_llm1')).toBe('codex-sdk');
+    subRows[1]!.type = 'shell';
+    bridge.invalidateSessionAgentTypeCache('deck_sub_llm1');
+    expect(await bridge.resolveSessionAgentType('deck_sub_llm1')).toBe('shell');
+    subRows[1]!.type = 'codex-sdk';
+    bridge.invalidateSessionAgentTypeCache('deck_sub_llm1');
+    expect(await bridge.resolveSessionAgentType('deck_sub_llm1')).toBe('codex-sdk');
+
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+    const cov = { ...coverage(serverTarget, 'participant', now), serverParticipantAuthority: true };
+    bridge.setShareCoverageResolverForTests(async () => cov);
+    const sock = new MockWs();
+    bridge.handleShareBrowserConnection(sock as never, 'participant-server-2', db, {
+      ticketId: 'ticket-server-2',
+      target: serverTarget,
+      snapshot: cov,
+    });
+    daemon.sent.length = 0;
+
+    // 1) Existing shell child sh1 under LLM parent deck_proj_brain blocked even if request claims codex-sdk;
+    //    dual field agentType=claude-code-sdk + sessionType=shell blocked; independent LLM subsession allowed
+    sock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'sh1', sessionType: 'codex-sdk', parentSession: 'deck_proj_brain' }));
+    sock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'dual1', agentType: 'claude-code-sdk', sessionType: 'shell', parentSession: 'deck_proj_brain' }));
+    sock.emit('message', JSON.stringify({ type: 'session.restart', project: 'mixproj' }));
+    sock.emit('message', JSON.stringify({ type: SESSION_GROUP_CLONE_MSG.START, serverId, sourceMainSessionName: 'deck_mixproj_brain', idempotencyKey: 'clone-mix-1' }));
+    sock.emit('message', JSON.stringify({ type: SESSION_GROUP_CLONE_MSG.START, serverId, sourceMainSessionName: 'deck_shellmain_brain', idempotencyKey: 'clone-sh-1' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_proj_brain', text: '@@discuss(deck_sub_sh1, audit)', commandId: 'p2p-text-sh' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_proj_brain', text: 'hi', p2pAtTargets: [{ session: 'deck_sub_sh1', mode: 'audit' }], commandId: 'p2p-at-sh' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_proj_brain', text: 'hi', p2pSessionConfig: { deck_sub_sh1: { enabled: true, mode: 'audit' } }, commandId: 'p2p-cfg-sh' }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toHaveLength(0);
+    expect(sock.sentJson.filter((m) => m.type === 'error' && m.code === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN).length).toBeGreaterThanOrEqual(5);
+    for (const cmdId of ['p2p-text-sh', 'p2p-at-sh', 'p2p-cfg-sh']) {
+      expect(sock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === cmdId && m.reason === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN)).toBe(true);
+    }
+
+    // 2) Pure-LLM subsession.start, pure-LLM group-clone, and pure-LLM P2P send succeed with stamped sharedActor
+    sock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'llm_new', sessionType: 'codex-sdk', parentSession: 'deck_proj_brain' }));
+    sock.emit('message', JSON.stringify({ type: SESSION_GROUP_CLONE_MSG.START, serverId, sourceMainSessionName: 'deck_purellm_brain', idempotencyKey: 'clone-llm-1' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_proj_brain', text: 'hi', p2pAtTargets: [{ session: 'deck_sub_llm1', mode: 'audit' }], commandId: 'p2p-llm-ok' }));
+    await flushAsync();
+
+    expect(daemon.sentJson.some((m) => m.type === 'subsession.start' && m.id === 'llm_new' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === SESSION_GROUP_CLONE_MSG.START && m.sourceMainSessionName === 'deck_purellm_brain' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'p2p-llm-ok' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
   });
 });

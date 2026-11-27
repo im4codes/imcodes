@@ -1,6 +1,7 @@
 import { sanitizeProjectName } from './sanitize-project-name.js';
 import type { P2pContextReducerConfig } from './p2p-advanced.js';
 import type { P2pSavedConfig } from './p2p-modes.js';
+import { PARTICIPANT_SHELL_FORBIDDEN_REASON } from './tab-sharing.js';
 
 export const SESSION_GROUP_CLONE_CAPABILITY_V1 = 'session-group-clone:v1' as const;
 
@@ -44,6 +45,7 @@ export type SessionGroupCloneErrorCode =
   | 'git_clone_failed'
   | 'incomplete_clone_spec'
   | 'unsupported_session_type'
+  | typeof PARTICIPANT_SHELL_FORBIDDEN_REASON
   | 'p2p_config_invalid'
   | 'persist_failed'
   | 'idempotency_conflict'

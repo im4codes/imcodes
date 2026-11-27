@@ -233,6 +233,7 @@ import { SESSION_MODEL_COMMAND, shouldHideOptimisticUserMessageForSessionControl
 import { resizeHandleHoverEvents } from './window-resize.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import { isShellLikeAgentType } from '@shared/agent-types.js';
 import {
   CODEBUDDY_CHINA_MODEL_FALLBACK,
   CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
@@ -3679,12 +3680,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [activeSession?.agentType, activeSession?.qwenModel, qwenModel]);
 
   const hasSession = !!activeSession;
+  const hasParticipantForbiddenCloneMember = isShareScopedSession && (
+    isShellSession
+    || (subSessions ?? []).some((s) => (
+      s.parentSession === activeSession?.name
+      && !isExecutionCloneTemplateLike(s)
+      && s.state !== 'stopped'
+      && s.state !== 'error'
+      && (isShellLikeAgentType(s.type) || isShellLikeAgentType(s.agentType))
+    ))
+  );
   const canShowCloneGroupAction = !!activeSession
     && !subSessionId
     && !compact
     && activeSession.role === 'brain'
     && !activeSession.name.startsWith('deck_sub_')
-    && activeSession.userCreated !== false;
+    && activeSession.userCreated !== false
+    && (!isShareScopedSession || (canManageSharedServer && !hasParticipantForbiddenCloneMember));
   const canShowPinAction = !!activeSession
     && !subSessionId
     && !compact
@@ -12505,6 +12517,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           sourceSession={activeSession}
           sessions={sessions}
           subSessions={subSessions}
+          forbidShellAgentTypes={isShareScopedSession}
           onClose={() => setCloneDialogOpen(false)}
         />
       )}

@@ -546,4 +546,37 @@ describe('CloneSessionGroupDialog', () => {
     expect(secondKey).toBeDefined();
     expect(secondKey).not.toBe(firstKey);
   });
+
+  it('disables clone submission and shows warning for shared participants when group has shell or script members', () => {
+    const ws = makeWs();
+    render(
+      <CloneSessionGroupDialog
+        ws={ws as never}
+        serverId="srv-1"
+        sourceSession={{
+          name: 'deck_cd_brain',
+          project: 'cd',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+        }}
+        subSessions={[
+          {
+            sessionName: 'deck_sub_sh1',
+            type: 'shell',
+            state: 'idle',
+            parentSession: 'deck_cd_brain',
+          },
+        ]}
+        forbidShellAgentTypes={true}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const submit = screen.getByRole('button', { name: 'Copy group' });
+    expect(submit.hasAttribute('disabled')).toBe(true);
+    expect(screen.getByText('share.shell_participant_forbidden')).toBeDefined();
+    fireEvent.click(submit);
+    expect(ws.cloneSessionGroup).not.toHaveBeenCalled();
+  });
 });

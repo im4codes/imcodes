@@ -723,6 +723,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+export function isParticipantSharedActorEnvelope(value: unknown): boolean {
+  return Boolean(
+    value
+    && typeof value === 'object'
+    && (value as { effectiveActorRole?: unknown }).effectiveActorRole === 'participant',
+  );
+}
+
 function minNullable(values: readonly (number | null)[]): number | null {
   let min: number | null = null;
   for (const value of values) {

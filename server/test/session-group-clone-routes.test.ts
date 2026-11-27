@@ -7,6 +7,7 @@ import {
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
+const mockResolveServerMembershipRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
 const mockSendToDaemon = vi.fn();
 const mockIsDaemonConnected = vi.fn(() => true);
 const mockHasDaemonCapability = vi.fn(() => true);
@@ -14,6 +15,9 @@ const mockLogAudit = vi.fn().mockResolvedValue(undefined);
 const mockRegisterCloneContext = vi.fn();
 const mockGetCloneOperationEvent = vi.fn(() => null);
 const mockGetDbSessionsByServer = vi.fn(async () => []);
+const mockGetDbSessionByName = vi.fn(async () => null);
+const mockGetSubSessionsByServer = vi.fn(async () => []);
+const mockResolveSessionAgentType = vi.fn(async () => null);
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -22,11 +26,14 @@ vi.mock('../src/security/authorization.js', () => ({
     await next();
   },
   resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args as []),
+  resolveServerMembershipRole: (...args: unknown[]) => mockResolveServerMembershipRole(...args as []),
 }));
 
 vi.mock('../src/db/queries.js', () => ({
   getServerById: vi.fn(async () => ({ id: 'srv-1' })),
   getDbSessionsByServer: (...args: unknown[]) => mockGetDbSessionsByServer(...args),
+  getDbSessionByName: (...args: unknown[]) => mockGetDbSessionByName(...args),
+  getSubSessionsByServer: (...args: unknown[]) => mockGetSubSessionsByServer(...args),
   upsertDbSession: vi.fn(),
   deleteDbSession: vi.fn(),
   updateSessionLabel: vi.fn(),
@@ -51,6 +58,7 @@ vi.mock('../src/ws/bridge.js', () => ({
       hasDaemonCapability: mockHasDaemonCapability,
       registerSessionGroupCloneOperationContext: mockRegisterCloneContext,
       getSessionGroupCloneOperationEvent: mockGetCloneOperationEvent,
+      resolveSessionAgentType: mockResolveSessionAgentType,
     }),
   },
 }));
@@ -74,14 +82,19 @@ describe('session group clone routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
+    mockResolveServerMembershipRole.mockResolvedValue('owner');
     mockIsDaemonConnected.mockReturnValue(true);
     mockHasDaemonCapability.mockReturnValue(true);
     mockGetCloneOperationEvent.mockReturnValue(null);
     mockGetDbSessionsByServer.mockResolvedValue([]);
+    mockGetDbSessionByName.mockResolvedValue(null);
+    mockGetSubSessionsByServer.mockResolvedValue([]);
+    mockResolveSessionAgentType.mockResolvedValue(null);
   });
 
   it.each(['owner', 'admin'])('allows %s to start a group clone and forwards the routed payload', async (role) => {
     mockResolveServerRole.mockResolvedValue(role);
+    mockResolveServerMembershipRole.mockResolvedValue(role);
     const app = await buildApp();
     const res = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
       method: 'POST',
@@ -175,6 +188,7 @@ describe('session group clone routes', () => {
 
   it('rejects members before daemon forwarding and writes a safe audit log', async () => {
     mockResolveServerRole.mockResolvedValue('member');
+    mockResolveServerMembershipRole.mockResolvedValue('member');
     const app = await buildApp();
     const res = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
       method: 'POST',
@@ -371,5 +385,73 @@ describe('session group clone routes', () => {
         targetProjectSlug: 'p2p_design_review',
       }),
     }), {});
+  });
+
+  it('rejects whole-server participants cloning shell/script groups while stamping sharedActor on pure-LLM clones and keeping owner clones unchanged', async () => {
+    const shareAuth = await import('../src/db/tab-sharing.js');
+    const spyCoverage = vi.spyOn(shareAuth, 'resolveEffectiveShareCoverage').mockResolvedValue({
+      target: { kind: 'server', serverId: 'srv-1' },
+      effectiveRole: 'participant',
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['srv-share-1'],
+      primaryShareId: 'srv-share-1',
+      authorizedAt: 1000,
+      serverParticipantAuthority: true,
+    });
+    try {
+      mockResolveServerMembershipRole.mockResolvedValue('none');
+      mockGetDbSessionsByServer.mockResolvedValue([{ name: 'deck_sh_brain', agent_type: 'shell' }] as never);
+      const app = await buildApp();
+
+      // 1) Shell main -> 403 participant_shell_forbidden
+      const shMainRes = await app.request('/api/server/srv-1/sessions/deck_sh_brain/group-clone', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idempotencyKey: 'idem-sh-main' }),
+      });
+      expect(shMainRes.status).toBe(403);
+      await expect(shMainRes.json()).resolves.toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+
+      // 2) LLM main with active script child -> 403 participant_shell_forbidden
+      mockGetDbSessionsByServer.mockResolvedValue([{ name: 'deck_cd_brain', agent_type: 'claude-code' }] as never);
+      mockGetSubSessionsByServer.mockResolvedValue([{ id: 'sc1', parent_session: 'deck_cd_brain', type: 'script', closed_at: null }] as never);
+      const mixRes = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idempotencyKey: 'idem-mix-sub' }),
+      });
+      expect(mixRes.status).toBe(403);
+      await expect(mixRes.json()).resolves.toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(mockSendToDaemon).not.toHaveBeenCalled();
+
+      // 3) Pure LLM group -> 200 with stamped sharedActor
+      mockGetSubSessionsByServer.mockResolvedValue([{ id: 'llm1', parent_session: 'deck_cd_brain', type: 'codex-sdk', closed_at: null }] as never);
+      const llmRes = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idempotencyKey: 'idem-llm-ok' }),
+      });
+      expect(llmRes.status).toBe(200);
+      expect(JSON.parse(String(mockSendToDaemon.mock.calls[0]?.[0]))).toMatchObject({
+        type: SESSION_GROUP_CLONE_MSG.START,
+        sourceMainSessionName: 'deck_cd_brain',
+        sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
+      });
+
+      // 4) Real owner cloning mixed/shell group -> 200 without sharedActor
+      mockSendToDaemon.mockClear();
+      mockResolveServerMembershipRole.mockResolvedValue('owner');
+      mockGetSubSessionsByServer.mockResolvedValue([{ id: 'sc1', parent_session: 'deck_cd_brain', type: 'script', closed_at: null }] as never);
+      const ownerRes = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idempotencyKey: 'idem-owner-ok' }),
+      });
+      expect(ownerRes.status).toBe(200);
+      expect(JSON.parse(String(mockSendToDaemon.mock.calls[0]?.[0])).sharedActor).toBeUndefined();
+    } finally {
+      spyCoverage.mockRestore();
+    }
   });
 });

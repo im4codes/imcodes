@@ -1520,4 +1520,108 @@ describe('daemon session group clone', () => {
     expect(sessions.get('deck_cd_1_brain')).toBeUndefined();
     expect(stopProjectMock).toHaveBeenCalledWith('cd_1', link);
   });
+
+  it('forbids shared participants from cloning groups containing shell/script members while allowing pure-LLM and owner clones', async () => {
+    const dir = await makeDir('share-shell');
+    const participantActor = {
+      actorUserId: 'user-p1',
+      actorDisplayName: 'Participant',
+      effectiveActorRole: 'participant',
+      origin: 'shared-server',
+      actionId: 'clone-1',
+      primaryShareId: 'share-1',
+      authorizedAt: 1000,
+    };
+
+    // 1. Mixed group (LLM brain + active script sub-session) rejected for participant
+    sessions.set('deck_cd_brain', makeSession({
+      name: 'deck_cd_brain',
+      projectName: 'cd',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: dir,
+      state: 'idle',
+    }));
+    sessions.set('deck_sub_sc1', makeSession({
+      name: 'deck_sub_sc1',
+      projectName: 'deck_sub_sc1',
+      role: 'w1',
+      agentType: 'script',
+      parentSession: 'deck_cd_brain',
+      projectDir: dir,
+      state: 'idle',
+    }));
+
+    const { link, sent } = makeServerLink();
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-part-mix-${unique++}`,
+      sharedActor: participantActor,
+    }, link as never);
+    expect(sent.at(-1)).toMatchObject({ state: 'failed', errorCode: 'participant_shell_forbidden' });
+    expect(launchSessionMock).not.toHaveBeenCalled();
+    expect(startSubSessionMock).not.toHaveBeenCalled();
+
+    // 2. Shell main session rejected for participant
+    sessions.delete('deck_sub_sc1');
+    sessions.set('deck_sh_brain', makeSession({
+      name: 'deck_sh_brain',
+      projectName: 'sh',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: dir,
+      state: 'idle',
+    }));
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_sh_brain',
+      idempotencyKey: `idem-part-sh-${unique++}`,
+      sharedActor: participantActor,
+    }, link as never);
+    expect(sent.at(-1)).toMatchObject({ state: 'failed', errorCode: 'participant_shell_forbidden' });
+    expect(launchSessionMock).not.toHaveBeenCalled();
+
+    // 3. Pure LLM group succeeds for participant
+    sessions.set('deck_sub_llm1', makeSession({
+      name: 'deck_sub_llm1',
+      projectName: 'deck_sub_llm1',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      parentSession: 'deck_cd_brain',
+      projectDir: dir,
+      state: 'idle',
+    }));
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      idempotencyKey: `idem-part-llm-${unique++}`,
+      sharedActor: participantActor,
+    }, link as never);
+    expect(sent.at(-1)?.state).toBe('succeeded');
+    expect(launchSessionMock).toHaveBeenCalledTimes(1);
+    expect(startSubSessionMock).toHaveBeenCalledTimes(1);
+
+    // 4. Owner still clones mixed group with shell child cleanly
+    launchSessionMock.mockClear();
+    startSubSessionMock.mockClear();
+    sessions.set('deck_sub_sh_own', makeSession({
+      name: 'deck_sub_sh_own',
+      projectName: 'deck_sub_sh_own',
+      role: 'w1',
+      agentType: 'shell',
+      parentSession: 'deck_cd_brain',
+      projectDir: dir,
+      state: 'idle',
+    }));
+    await handleSessionGroupCloneCommand({
+      type: SESSION_GROUP_CLONE_MSG.START,
+      sourceMainSessionName: 'deck_cd_brain',
+      targetProjectName: 'cd_owner_ok',
+      idempotencyKey: `idem-owner-sh-${unique++}`,
+    }, link as never);
+    expect(sent.at(-1)?.state).toBe('succeeded');
+    expect(launchSessionMock).toHaveBeenCalledTimes(1);
+    expect(startSubSessionMock).toHaveBeenCalledTimes(2);
+  });
 });

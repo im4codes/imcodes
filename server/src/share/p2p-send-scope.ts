@@ -1,4 +1,5 @@
-import type { ShareDenialReason, ShareTarget } from '../../../shared/tab-sharing.js';
+import { isShellLikeAgentType } from '../../../shared/agent-types.js';
+import { PARTICIPANT_SHELL_FORBIDDEN_REASON, type ShareDenialReason, type ShareTarget } from '../../../shared/tab-sharing.js';
 import { collectP2pRoutedSessionNames, extractInTextRoutingTargets } from '../../../shared/p2p-routing-fields.js';
 
 export interface P2pSendTargets {
@@ -55,6 +56,19 @@ export function extractP2pSendTargets(msg: Record<string, unknown>): P2pSendTarg
   return { hasP2pRouting, hasUnboundedExpansion, sessions: [...sessions] };
 }
 
+export function extractAllP2pRoutedSessionNames(msg: Record<string, unknown>): P2pSendTargets {
+  const targets = extractP2pSendTargets(msg);
+  const sweptSessions = collectP2pRoutedSessionNames(msg);
+  const inText = extractInTextRoutingTargets(msg.text);
+  const hasP2pRouting = targets.hasP2pRouting
+    || sweptSessions.length > 0
+    || inText.sessions.length > 0
+    || inText.expandsAll;
+  const hasUnboundedExpansion = targets.hasUnboundedExpansion || inText.expandsAll;
+  const sessions = [...new Set([...targets.sessions, ...sweptSessions, ...inText.sessions])];
+  return { hasP2pRouting, hasUnboundedExpansion, sessions };
+}
+
 export function evaluateP2pSendTargetScope(params: {
   msg: Record<string, unknown>;
   target: ShareTarget;
@@ -83,5 +97,20 @@ export function evaluateP2pSendTargetScope(params: {
   for (const name of routed) {
     if (!params.coversSession(name)) return 'share-direct-surface-denied';
   }
+  return null;
+}
+
+export async function evaluateParticipantP2pShellRestriction(params: {
+  msg: Record<string, unknown>;
+  resolveAgentType: (sessionName: string) => Promise<string | null>;
+}): Promise<typeof PARTICIPANT_SHELL_FORBIDDEN_REASON | null> {
+  const routed = extractAllP2pRoutedSessionNames(params.msg);
+  if (!routed.hasP2pRouting) return null;
+
+  for (const sessionName of routed.sessions) {
+    const agentType = await params.resolveAgentType(sessionName);
+    if (isShellLikeAgentType(agentType)) return PARTICIPANT_SHELL_FORBIDDEN_REASON;
+  }
+
   return null;
 }

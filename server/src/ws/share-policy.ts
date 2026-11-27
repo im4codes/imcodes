@@ -154,6 +154,14 @@ export const SHELL_FORBIDDEN_SHARE_COMMANDS: ReadonlySet<string> = new Set([
   'session.restart',
   'subsession.start',
   'subsession.restart',
+  SESSION_GROUP_CLONE_MSG.START,
+]);
+
+const SHARE_LIFECYCLE_ACTOR_COMMANDS: ReadonlySet<string> = new Set([
+  'session.start',
+  'session.restart',
+  'subsession.start',
+  'subsession.restart',
 ]);
 
 const SHARE_MODEL_CATALOG_AGENT_TYPES = new Set([
@@ -605,12 +613,37 @@ function stampNonServerShareFsMessage(
   };
 }
 
+function shareCommandHasForbiddenShellType(
+  type: string,
+  msg: Record<string, unknown>,
+  targetAgentType?: string | null,
+  targetAgentTypes?: ReadonlyArray<string | null | undefined>,
+): boolean {
+  if (!SHELL_FORBIDDEN_SHARE_COMMANDS.has(type)) return false;
+  if (isShellLikeAgentType(msg.agentType) || isShellLikeAgentType(msg.sessionType)) return true;
+  if (isShellLikeAgentType(targetAgentType)) return true;
+  return targetAgentTypes?.some((entry) => isShellLikeAgentType(entry)) ?? false;
+}
+
+function stripClientShareAuthorityFields(msg: Record<string, unknown>): Record<string, unknown> {
+  const {
+    sharedActor: _clientActor,
+    [SHARED_MACHINE_AUTHORITY_FIELD]: _clientAuthority,
+    ...rest
+  } = msg;
+  void _clientActor;
+  void _clientAuthority;
+  return rest;
+}
+
 export function evaluateShareCommand(input: {
   msg: Record<string, unknown>;
   state: ShareScopedSocketState;
   now: number;
   runtimeType: 'process' | 'transport' | 'unknown';
   targetAgentType?: string | null;
+  targetAgentTypes?: ReadonlyArray<string | null | undefined>;
+  p2pForbiddenReason?: ShareReason | null;
   activeDispatchId: string | null;
 }): ShareCommandDecision {
   const type = typeof input.msg.type === 'string' ? input.msg.type : '';
@@ -630,6 +663,9 @@ export function evaluateShareCommand(input: {
     if (!serverParticipant) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
+    if (shareCommandHasForbiddenShellType(type, input.msg, input.targetAgentType, input.targetAgentTypes)) {
+      return { allowed: false, reason: SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN };
+    }
     const actionId = typeof input.msg.idempotencyKey === 'string' && input.msg.idempotencyKey.trim()
       ? input.msg.idempotencyKey.trim()
       : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()
@@ -638,7 +674,7 @@ export function evaluateShareCommand(input: {
     return {
       allowed: true,
       stampedMessage: {
-        ...input.msg,
+        ...stripClientShareAuthorityFields(input.msg),
         sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
       },
     };
@@ -653,7 +689,7 @@ export function evaluateShareCommand(input: {
     return {
       allowed: true,
       stampedMessage: {
-        ...input.msg,
+        ...stripClientShareAuthorityFields(input.msg),
         sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
       },
     };
@@ -762,15 +798,8 @@ export function evaluateShareCommand(input: {
     return { allowed: false, reason: SHARE_REASONS.ROLE_DENIED };
   }
 
-  if (SHELL_FORBIDDEN_SHARE_COMMANDS.has(type)) {
-    const requestedAgentType = typeof input.msg.agentType === 'string'
-      ? input.msg.agentType
-      : typeof input.msg.sessionType === 'string'
-        ? input.msg.sessionType
-        : undefined;
-    if (isShellLikeAgentType(requestedAgentType) || isShellLikeAgentType(input.targetAgentType)) {
-      return { allowed: false, reason: SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN };
-    }
+  if (shareCommandHasForbiddenShellType(type, input.msg, input.targetAgentType, input.targetAgentTypes)) {
+    return { allowed: false, reason: SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN };
   }
 
   if (policy.kind === 'participant-bound-action') {
@@ -788,16 +817,25 @@ export function evaluateShareCommand(input: {
       // Raw keystrokes drive a process session's agent exactly like a message
       // does, so they carry the same server-stamped actor (the daemon binds the
       // participant context from it) and never a client-supplied one.
-      const {
-        sharedActor: _clientActor,
-        [SHARED_MACHINE_AUTHORITY_FIELD]: _clientAuthority,
-        ...rest
-      } = input.msg;
       return {
         allowed: true,
         stampedMessage: {
-          ...rest,
+          ...stripClientShareAuthorityFields(input.msg),
           sharedActor: buildSharedActorEnvelope(input.state, `share-input-${input.state.userId}`, input.now),
+        },
+      };
+    }
+    if (SHARE_LIFECYCLE_ACTOR_COMMANDS.has(type)) {
+      const actionId = typeof input.msg.actionId === 'string' && input.msg.actionId.trim()
+        ? input.msg.actionId.trim()
+        : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()
+          ? input.msg.commandId.trim()
+          : `share-action-${input.now}`;
+      return {
+        allowed: true,
+        stampedMessage: {
+          ...stripClientShareAuthorityFields(input.msg),
+          sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
         },
       };
     }
@@ -942,6 +980,7 @@ export function evaluateShareCommand(input: {
   if (policy.kind === 'participant-send') {
     const p2pScopeReason = evaluateP2pSendScope(input.msg, input.state);
     if (p2pScopeReason) return { allowed: false, reason: p2pScopeReason };
+    if (input.p2pForbiddenReason) return { allowed: false, reason: input.p2pForbiddenReason };
     const actionId = typeof input.msg.actionId === 'string' && input.msg.actionId.trim()
       ? input.msg.actionId.trim()
       : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()
@@ -950,7 +989,7 @@ export function evaluateShareCommand(input: {
     return {
       allowed: true,
       stampedMessage: {
-        ...input.msg,
+        ...stripClientShareAuthorityFields(input.msg),
         sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
       },
     };
