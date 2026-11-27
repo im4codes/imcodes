@@ -180,7 +180,7 @@ export function daemonScopeFailure<
   E extends { Bindings: Env; Variables?: any } = { Bindings: Env; Variables: any },
 >(
   c: Context<E>,
-  res: Extract<DaemonCallerAuthority, { ok: false }>,
+  res: Extract<DaemonCallerAuthority, { ok: false }> | { ok: false; status: 403; error: 'forbidden'; reason: string },
 ): Response {
   return c.json({ error: res.error, reason: res.reason }, res.status);
 }

@@ -1525,6 +1525,7 @@ router.get('/:id/executions', requireCronAuth(), async (c) => {
   if (!preAuthority.ok) return daemonScopeFailure(c as unknown as Context<{ Bindings: Env }>, preAuthority);
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
+  if (!jobId) return c.json({ error: 'not_found' }, 404);
   const limitParam = parseInt(c.req.query('limit') || '20', 10);
   const limit = Math.min(Math.max(1, limitParam), 100);
 
