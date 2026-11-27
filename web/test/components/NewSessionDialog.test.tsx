@@ -955,12 +955,12 @@ describe('NewSessionDialog', () => {
     selectAgent('cursor-headless');
     await waitFor(() => expect(screen.getAllByRole('combobox').length).toBeGreaterThanOrEqual(1));
     const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
-    fireEvent.input(selects[0], { target: { value: 'gpt-5.2' } });
+    fireEvent.input(selects[0], { target: { value: 'gpt-5.4' } });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
       agentType: 'cursor-headless',
-      requestedModel: 'gpt-5.2',
+      requestedModel: 'gpt-5.4',
     }));
   });
 

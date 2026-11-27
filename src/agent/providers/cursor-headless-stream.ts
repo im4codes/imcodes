@@ -33,6 +33,19 @@ export interface CursorToolStartedEvent {
   input?: unknown;
 }
 
+export interface CursorThinkingDeltaEvent {
+  kind: 'thinking.delta';
+  raw: CursorRecord;
+  sessionId?: string;
+  text: string;
+}
+
+export interface CursorThinkingCompletedEvent {
+  kind: 'thinking.completed';
+  raw: CursorRecord;
+  sessionId?: string;
+}
+
 export interface CursorToolCompletedEvent {
   kind: 'tool.completed';
   raw: CursorRecord;
@@ -41,6 +54,7 @@ export interface CursorToolCompletedEvent {
   name: string;
   input?: unknown;
   output?: unknown;
+  isError?: boolean;
 }
 
 export interface CursorResultSuccessEvent {
@@ -66,6 +80,8 @@ export interface CursorUnknownEvent {
 
 export type CursorParsedEvent =
   | CursorSessionInitEvent
+  | CursorThinkingDeltaEvent
+  | CursorThinkingCompletedEvent
   | CursorAssistantDeltaEvent
   | CursorAssistantFinalEvent
   | CursorToolStartedEvent
@@ -146,6 +162,7 @@ function extractTextFromContent(content: unknown): string | undefined {
   const parts = content
     .map((block) => {
       if (!isRecord(block)) return '';
+      if (block.type === 'thinking') return '';
       if (block.type === 'text' && typeof block.text === 'string') return block.text;
       if (typeof block.text === 'string') return block.text;
       return '';
@@ -154,12 +171,78 @@ function extractTextFromContent(content: unknown): string | undefined {
   return parts.length > 0 ? parts.join('') : undefined;
 }
 
-function extractToolPayload(record: CursorRecord): { id?: string; name?: string; input?: unknown; output?: unknown } {
-  const id = pickString(record, 'id', 'tool_call_id', 'toolCallId', 'toolId');
-  const name = pickString(record, 'name', 'tool', 'tool_name', 'toolName');
-  const input = record.input ?? record.arguments ?? record.params ?? record.payload;
-  const output = record.output ?? record.result ?? record.stdout ?? record.aggregated_output ?? record.aggregatedOutput;
-  return { id, name, input, output };
+function normalizeCursorToolName(rawKey: string, payload?: CursorRecord): string {
+  if (rawKey === 'mcpToolCall' && payload) {
+    const args = pickRecord(payload.args);
+    const toolName = (args ? pickString(args, 'toolName', 'name') : undefined)
+      ?? pickString(payload, 'toolName', 'name');
+    if (toolName) return toolName;
+  }
+  return rawKey.endsWith('ToolCall') && rawKey.length > 'ToolCall'.length
+    ? rawKey.slice(0, -'ToolCall'.length)
+    : rawKey;
+}
+
+function unwrapToolCallOutput(rawResult: unknown): { output?: unknown; isError?: boolean } {
+  if (rawResult === undefined) return {};
+  if (!isRecord(rawResult)) return { output: rawResult };
+  if ('success' in rawResult && rawResult.success !== undefined) {
+    return { output: rawResult.success };
+  }
+  if ('error' in rawResult && rawResult.error !== undefined) {
+    return { output: rawResult.error, isError: true };
+  }
+  if ('rejected' in rawResult && rawResult.rejected !== undefined) {
+    return { output: rawResult.rejected, isError: true };
+  }
+  return { output: rawResult };
+}
+
+function extractToolPayload(record: CursorRecord): {
+  id?: string;
+  name?: string;
+  input?: unknown;
+  output?: unknown;
+  isError?: boolean;
+} {
+  const id = pickString(record, 'id', 'call_id', 'tool_call_id', 'toolCallId', 'toolId');
+  let name = pickString(record, 'name', 'tool', 'tool_name', 'toolName');
+  let input = record.input ?? record.arguments ?? record.params ?? record.payload;
+  let output = record.output ?? record.result ?? record.stdout ?? record.aggregated_output ?? record.aggregatedOutput;
+  let isError = record.is_error === true || record.isError === true;
+
+  // Modern Cursor CLI (2026.x) emits `{ type: "tool_call", call_id, tool_call: { <kind>ToolCall: { args, result? } } }`
+  // or `{ function: { name, arguments } }` inside `tool_call`.
+  const nestedToolCall = pickRecord(record.tool_call);
+  if (nestedToolCall) {
+    const nestedFunc = pickRecord(nestedToolCall.function);
+    if (nestedFunc) {
+      name ??= pickString(nestedFunc, 'name');
+      input ??= nestedFunc.arguments ?? nestedFunc.input;
+    } else {
+      for (const [key, rawValue] of Object.entries(nestedToolCall)) {
+        if (!key.endsWith('ToolCall') && !pickRecord(rawValue)) continue;
+        const inner = pickRecord(rawValue);
+        if (!inner) continue;
+        name ??= normalizeCursorToolName(key, inner);
+        input ??= inner.args ?? inner.input ?? inner.arguments ?? inner.params;
+        if (output === undefined && 'result' in inner) {
+          const unwrapped = unwrapToolCallOutput(inner.result);
+          output = unwrapped.output;
+          if (unwrapped.isError) isError = true;
+        }
+        break;
+      }
+    }
+  }
+
+  return {
+    id,
+    name,
+    input,
+    output,
+    ...(isError ? { isError: true } : {}),
+  };
 }
 
 function extractMessageId(record: CursorRecord): string | undefined {
@@ -249,6 +332,24 @@ function parseCursorRecord(record: unknown, fallbackSessionId?: string): CursorP
     return null;
   }
 
+  if (type === 'thinking') {
+    if (subtype === 'completed') {
+      return {
+        kind: 'thinking.completed',
+        raw: record,
+        sessionId,
+      };
+    }
+    const text = typeof record.text === 'string' ? record.text : '';
+    if (!text) return null;
+    return {
+      kind: 'thinking.delta',
+      raw: record,
+      sessionId,
+      text,
+    };
+  }
+
   if (
     type === 'tool_call.started'
     || type === 'tool.started'
@@ -281,6 +382,7 @@ function parseCursorRecord(record: unknown, fallbackSessionId?: string): CursorP
       name: tool.name,
       ...(tool.input !== undefined ? { input: tool.input } : {}),
       ...(tool.output !== undefined ? { output: tool.output } : {}),
+      ...(tool.isError ? { isError: true } : {}),
     };
   }
 
@@ -327,7 +429,7 @@ function parseCursorRecord(record: unknown, fallbackSessionId?: string): CursorP
     };
   }
 
-  if (type === 'result.error' || (type === 'result' && isErrorResult(record))) {
+  if (type === 'error' || type === 'result.error' || (type === 'result' && isErrorResult(record))) {
     const message =
       pickString(record, 'message', 'error')
       ?? (pickRecord(record.error)?.message as string | undefined)
@@ -357,6 +459,14 @@ function parseCursorRecord(record: unknown, fallbackSessionId?: string): CursorP
           raw: record,
           sessionId,
           text: delta.text,
+        };
+      }
+      if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+        return {
+          kind: 'thinking.delta',
+          raw: record,
+          sessionId,
+          text: delta.thinking,
         };
       }
     }

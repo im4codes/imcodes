@@ -154,7 +154,6 @@ describe('detectInstalledAgents()', () => {
     expect(result['codex-sdk']?.installed).toBe(false);
     expect(result['codex']?.installed).toBe(false);
     expect(result['claude-code']?.installed).toBe(false);
-    expect(result['cursor-headless']?.installed).toBe(false);
     expect(result['opencode']?.installed).toBe(false);
     expect(result['opencode-sdk']?.installed).toBe(false);
     expect(result['deepseek-harness']?.installed).toBe(false);
@@ -163,11 +162,30 @@ describe('detectInstalledAgents()', () => {
 
     // Providers whose real launch path checks ~/.local/bin / candidate dirs must report true:
     expect(result['claude-code-sdk']?.installed).toBe(true);
+    expect(result['cursor-headless']?.installed).toBe(true);
     expect(result[AGY_SDK_PROVIDER_ID]?.installed).toBe(true);
     expect(result['kimi-sdk']?.installed).toBe(true);
     expect(result['muse-code-sdk']?.installed).toBe(true);
     expect(result['grok-sdk']?.installed).toBe(true);
     expect(result[HERMES_AGENT_PROVIDER_ID]?.installed).toBe(true);
+  });
+
+  it('detects cursor-headless via standalone agent binary on Unix ~/.local/bin and Windows agent.exe', async () => {
+    const unixDeps = createFakeDeps({
+      env: { PATH: '/usr/bin' },
+      executables: ['/home/alice/.local/bin/agent'],
+    });
+    const unixResult = await detectInstalledAgents({ deps: unixDeps });
+    expect(unixResult['cursor-headless']?.installed).toBe(true);
+
+    const winDeps = createFakeDeps({
+      platform: 'win32',
+      env: { PATH: 'C:\\Windows\\System32', LOCALAPPDATA: 'C:\\Users\\alice\\AppData\\Local' },
+      homeDir: 'C:\\Users\\alice',
+      executables: ['C:\\Users\\alice\\AppData\\Local\\cursor-agent\\agent.exe'],
+    });
+    const winResult = await detectInstalledAgents({ deps: winDeps });
+    expect(winResult['cursor-headless']?.installed).toBe(true);
   });
 
   it('finds bundled SDK runtimes without global CLIs on sparse daemon PATHs', async () => {

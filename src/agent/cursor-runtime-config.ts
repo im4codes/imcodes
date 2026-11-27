@@ -1,5 +1,5 @@
 import * as childProcess from 'node:child_process';
-import { resolveExecutableForSpawn } from './transport-paths.js';
+import { resolveCursorPathForSdk, resolveExecutableForSpawn } from './transport-paths.js';
 import logger from '../util/logger.js';
 
 const CURSOR_BIN = 'cursor-agent';
@@ -54,19 +54,25 @@ function stripAnsi(text: string): string {
   return text.replace(/\x1B\[[0-9;?]*[ -/]*[@-~]/g, '');
 }
 
+const LIST_MODELS_IGNORED_LINE_RE = /^(?:available\s+models\b|no\s+models\b|loading\b|tip:|error:|usage:)/i;
+const LIST_MODELS_DESC_RE = /^\s*([a-z0-9][a-zA-Z0-9._:/[\]-]*)\s+-\s+.*$/i;
+const LIST_MODELS_BARE_RE = /^\s*([a-z0-9][a-zA-Z0-9._:/[\]-]*)(?:\s+(?:\((?:default|current)(?:\s*,\s*(?:default|current))*\)\s*)+|\s*)$/i;
+const LIST_MODELS_DEFAULT_FLAG_RE = /\((?:[^)]*,)?\s*default\s*(?:,[^)]*)?\)/i;
+
 function parseListModelsOutput(raw: string): { availableModels: string[]; defaultModel?: string } {
   const text = stripAnsi(raw);
   const lines = text.split(/\r?\n/);
   const models: string[] = [];
   let defaultModel: string | undefined;
-  const entryRe = /^\s*([a-z0-9][a-zA-Z0-9._-]*)\s+-\s+.*$/;
   for (const line of lines) {
-    const match = entryRe.exec(line);
+    const trimmed = line.trim();
+    if (!trimmed || LIST_MODELS_IGNORED_LINE_RE.test(trimmed)) continue;
+    const match = LIST_MODELS_DESC_RE.exec(line) ?? LIST_MODELS_BARE_RE.exec(line);
     if (!match) continue;
     const id = match[1];
     if (!id || models.includes(id)) continue;
     models.push(id);
-    if (/\(default\)/i.test(line) && !defaultModel) defaultModel = id;
+    if (LIST_MODELS_DEFAULT_FLAG_RE.test(line) && !defaultModel) defaultModel = id;
   }
   return { availableModels: models, ...(defaultModel ? { defaultModel } : {}) };
 }
@@ -85,7 +91,7 @@ function parseStatusOutput(raw: string): { isAuthenticated: boolean; loggedInAs?
 async function execFileStdout(file: string, args: string[]): Promise<string> {
   const execFile = childProcess.execFile;
   return await new Promise<string>((resolve, reject) => {
-    execFile(
+    const child = execFile(
       file,
       args,
       { timeout: PROBE_TIMEOUT_MS, windowsHide: true, maxBuffer: 2 * 1024 * 1024 },
@@ -102,6 +108,7 @@ async function execFileStdout(file: string, args: string[]): Promise<string> {
         resolve(`${out}\n${errOut}`);
       },
     );
+    child?.stdin?.end?.();
   });
 }
 
@@ -120,7 +127,7 @@ export async function getCursorRuntimeConfig(options: CursorRuntimeConfigOptions
   if (inFlightProbe) return inFlightProbe;
   inFlightProbe = (async () => {
     try {
-      const resolved = resolveExecutableForSpawn(CURSOR_BIN);
+      const resolved = resolveExecutableForSpawn(resolveCursorPathForSdk(CURSOR_BIN));
       let modelsOut = '';
       try {
         modelsOut = await execFileStdout(resolved.executable, [...resolved.prependArgs, '--list-models']);

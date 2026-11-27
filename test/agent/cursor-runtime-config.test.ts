@@ -20,6 +20,7 @@ vi.mock('../../src/util/logger.js', () => ({
 
 // Stabilize the transport-paths resolution so tests don't depend on PATH lookups.
 vi.mock('../../src/agent/transport-paths.js', () => ({
+  resolveCursorPathForSdk: (bin = 'cursor-agent') => bin,
   resolveExecutableForSpawn: (bin: string) => ({ executable: bin, prependArgs: [] }),
 }));
 
@@ -72,6 +73,27 @@ describe('cursor-runtime-config parsers', () => {
       expect(parsed.availableModels).toEqual([]);
       expect(parsed.defaultModel).toBeUndefined();
     });
+
+    it('parses Cursor 2026.06 bare ids, slash/bracket ids, and (current, default) flags while skipping headers', () => {
+      const raw = [
+        'Available models',
+        'No models available for this account.',
+        'Loading models...',
+        'Error: partial fetch',
+        'auto (current)',
+        'composer-2.5-fast  (current, default)',
+        'claude-4.5-sonnet[1m] - Sonnet 4.5 1M',
+        'anthropic/claude-opus-4.6 - Claude Opus 4.6',
+      ].join('\n');
+      const parsed = parseListModelsOutput(raw);
+      expect(parsed.availableModels).toEqual([
+        'auto',
+        'composer-2.5-fast',
+        'claude-4.5-sonnet[1m]',
+        'anthropic/claude-opus-4.6',
+      ]);
+      expect(parsed.defaultModel).toBe('composer-2.5-fast');
+    });
   });
 
   describe('parseStatusOutput', () => {
@@ -111,26 +133,28 @@ describe('cursor-runtime-config parsers', () => {
       expect(childProcessMock.execFile).not.toHaveBeenCalled();
     });
 
-    it('combines probe outputs into a runtime config', async () => {
+    it('combines probe outputs into a runtime config and closes child stdin', async () => {
+      const endFn = vi.fn();
       childProcessMock.execFile.mockImplementation((...args: any[]) => {
         const cliArgs = args[1] as string[];
         const cb = args.at(-1);
         if (cliArgs.includes('--list-models')) {
-          cb?.(null, 'auto - Auto\ngpt-5.2 - GPT-5.2  (default)\n', '');
+          cb?.(null, 'auto - Auto\ncomposer-2.5-fast  (current, default)\n', '');
         } else if (cliArgs.includes('status')) {
           cb?.(null, ' ✓ Logged in as tester@example.com\n', '');
         } else {
           cb?.(new Error(`unexpected args: ${cliArgs.join(' ')}`), '', '');
         }
-        return {} as never;
+        return { stdin: { end: endFn } } as never;
       });
 
       const config = await getCursorRuntimeConfig(true);
-      expect(config.availableModels).toEqual(['auto', 'gpt-5.2']);
-      expect(config.defaultModel).toBe('gpt-5.2');
+      expect(config.availableModels).toEqual(['auto', 'composer-2.5-fast']);
+      expect(config.defaultModel).toBe('composer-2.5-fast');
       expect(config.isAuthenticated).toBe(true);
       expect(config.loggedInAs).toBe('tester@example.com');
       expect(config.isColdFallback).toBeUndefined();
+      expect(endFn).toHaveBeenCalledTimes(2);
     });
 
     it('returns a safe fallback when both probes fail', async () => {

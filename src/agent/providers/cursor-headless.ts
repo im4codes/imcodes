@@ -35,7 +35,7 @@ import logger from '../../util/logger.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import {
   normalizeTransportCwd,
-  resolveBinaryWithWindowsFallbacks,
+  resolveCursorPathForSdk,
   resolveExecutableForSpawn,
 } from '../transport-paths.js';
 import {
@@ -66,7 +66,7 @@ const MIN_CURSOR_VERSION = { major: 1, minor: 0, patch: 0 };
 // builds report a human label such as "Claude Sonnet 5 300K Medium No
 // Thinking" there.  Passing that label back to `--model` makes the next turn
 // fail with "Cannot use this model".
-const CURSOR_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const CURSOR_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/[\]-]*$/;
 
 export interface CursorHeadlessRuntimeHooks {
   loadChildProcess(): Promise<typeof import('node:child_process')>;
@@ -479,9 +479,12 @@ export class CursorHeadlessProvider implements TransportProvider {
       'stream-json',
       '--stream-partial-output',
       '--approve-mcps',
+      '--workspace',
+      state.cwd,
       '--resume',
       resumeId,
       ...(state.model ? ['--model', state.model] : []),
+      '--',
       prompt,
     ];
     const { spawn } = await cursorHeadlessRuntimeHooks.loadChildProcess();
@@ -575,6 +578,16 @@ export class CursorHeadlessProvider implements TransportProvider {
         return;
       }
 
+      if (event.kind === 'thinking.delta') {
+        statusCleared = false;
+        this.emitStatus(sessionKey, 'thinking', 'Thinking…');
+        return;
+      }
+
+      if (event.kind === 'thinking.completed') {
+        return;
+      }
+
       if (event.kind === 'assistant.delta') {
         // Adopt a new message id and reset the accumulator BEFORE accumulating,
         // so a new message's deltas start clean and emit under the right id.
@@ -623,10 +636,11 @@ export class CursorHeadlessProvider implements TransportProvider {
       }
 
       if (event.kind === 'tool.completed') {
+        statusCleared = false;
         emitTool({
           id: event.id,
           name: event.name,
-          status: 'complete',
+          status: event.isError ? 'error' : 'complete',
           ...(event.input !== undefined ? { input: event.input } : {}),
           ...(event.output !== undefined ? { output: stringifyUnknown(event.output) } : {}),
           detail: {
@@ -765,17 +779,7 @@ export class CursorHeadlessProvider implements TransportProvider {
   private resolveBinaryPath(config: ProviderConfig | null): string {
     const explicit = isTruthyString(config?.binaryPath) ? config.binaryPath.trim() : undefined;
     if (explicit) return explicit;
-    if (process.platform === 'win32') {
-      const localAppData = process.env.LOCALAPPDATA;
-      const windowsCandidates = localAppData
-        ? [
-            path.join(localAppData, 'cursor-agent', 'cursor-agent.exe'),
-            path.join(localAppData, 'cursor-agent', 'agent.exe'),
-          ]
-        : [];
-      return resolveBinaryWithWindowsFallbacks(CURSOR_BIN, windowsCandidates);
-    }
-    return CURSOR_BIN;
+    return resolveCursorPathForSdk(CURSOR_BIN);
   }
 
   private resolveDefaultModel(): string | undefined {
@@ -935,7 +939,7 @@ export class CursorHeadlessProvider implements TransportProvider {
   ): Promise<{ stdout: string; stderr: string }> {
     const { execFile } = await cursorHeadlessRuntimeHooks.loadChildProcess();
     return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-      execFile(executable, args, options, (error, stdout, stderr) => {
+      const child = execFile(executable, args, options, (error, stdout, stderr) => {
         if (error) {
           reject(error);
           return;
@@ -945,12 +949,13 @@ export class CursorHeadlessProvider implements TransportProvider {
           stderr: typeof stderr === 'string' ? stderr : String(stderr ?? ''),
         });
       });
+      child?.stdin?.end?.();
     });
   }
 
   private normalizeConnectError(err: unknown, fallbackMessage: string): ProviderError {
     const message = err instanceof Error ? err.message : String(err);
-    if (/ENOENT|not found|spawn .*cursor-agent/i.test(message)) {
+    if (/ENOENT|not found|spawn .*(?:cursor-agent|agent)/i.test(message)) {
       return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND, `Cursor binary not found: ${message}`, false, err);
     }
     if (/not\s+logged\s+in|sign\s*in|log\s+in|unauth/i.test(message)) {

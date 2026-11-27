@@ -160,6 +160,113 @@ describe('parseCursorStreamLine', () => {
     expect(parsed.usage).not.toHaveProperty('cache_creation_input_tokens');
   });
 
+  it('parses Cursor 2026.x nested tool_call events with call_id and error/rejected results', () => {
+    const started = parseCursorStreamLine(JSON.stringify({
+      type: 'tool_call',
+      subtype: 'started',
+      call_id: 'call_read_1',
+      session_id: 'cursor-chat-2026',
+      tool_call: {
+        readToolCall: {
+          args: { path: 'src/index.ts' },
+        },
+      },
+    }));
+    expect(started).toMatchObject({
+      kind: 'tool.started',
+      id: 'call_read_1',
+      name: 'read',
+      input: { path: 'src/index.ts' },
+    });
+
+    const completedOk = parseCursorStreamLine(JSON.stringify({
+      type: 'tool_call',
+      subtype: 'completed',
+      call_id: 'call_read_1',
+      session_id: 'cursor-chat-2026',
+      tool_call: {
+        readToolCall: {
+          args: { path: 'src/index.ts' },
+          result: { success: { content: 'export const x = 1;' } },
+        },
+      },
+    }));
+    expect(completedOk).toMatchObject({
+      kind: 'tool.completed',
+      id: 'call_read_1',
+      name: 'read',
+      output: { content: 'export const x = 1;' },
+    });
+    expect(completedOk && 'isError' in completedOk ? completedOk.isError : undefined).toBeUndefined();
+
+    const completedErr = parseCursorStreamLine(JSON.stringify({
+      type: 'tool_call',
+      subtype: 'completed',
+      call_id: 'call_shell_1',
+      session_id: 'cursor-chat-2026',
+      tool_call: {
+        shellToolCall: {
+          args: { command: 'false' },
+          result: { error: { errorMessage: 'exit code 1' } },
+        },
+      },
+    }));
+    expect(completedErr).toMatchObject({
+      kind: 'tool.completed',
+      id: 'call_shell_1',
+      name: 'shell',
+      output: { errorMessage: 'exit code 1' },
+      isError: true,
+    });
+  });
+
+  it('parses thinking delta/completed events, skips thinking content blocks in assistant text, and handles top-level error records', () => {
+    expect(parseCursorStreamLine(JSON.stringify({
+      type: 'thinking',
+      subtype: 'delta',
+      text: 'checking files...',
+      session_id: 'cursor-chat-2026',
+    }))).toMatchObject({
+      kind: 'thinking.delta',
+      sessionId: 'cursor-chat-2026',
+      text: 'checking files...',
+    });
+
+    expect(parseCursorStreamLine(JSON.stringify({
+      type: 'thinking',
+      subtype: 'completed',
+      session_id: 'cursor-chat-2026',
+    }))).toMatchObject({
+      kind: 'thinking.completed',
+      sessionId: 'cursor-chat-2026',
+    });
+
+    const assistantWithThinking = parseCursorStreamLine(JSON.stringify({
+      type: 'assistant',
+      session_id: 'cursor-chat-2026',
+      message: {
+        id: 'msg-think',
+        content: [
+          { type: 'thinking', text: 'internal reasoning' },
+          { type: 'text', text: 'visible answer' },
+        ],
+      },
+    }));
+    expect(assistantWithThinking).toMatchObject({
+      kind: 'assistant.final',
+      text: 'visible answer',
+    });
+
+    expect(parseCursorStreamLine(JSON.stringify({
+      type: 'error',
+      session_id: 'cursor-chat-2026',
+      message: 'rate limit exceeded',
+    }))).toMatchObject({
+      kind: 'result.error',
+      message: 'rate limit exceeded',
+    });
+  });
+
   it('ignores invalid or irrelevant records', () => {
     expect(parseCursorStreamLine('')).toBeNull();
     expect(parseCursorStreamLine('not-json')).toBeNull();

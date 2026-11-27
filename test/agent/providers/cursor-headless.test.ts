@@ -322,4 +322,49 @@ describe('CursorHeadlessProvider', () => {
     expect(harness.lastSpawn().child.killed).toBe(true);
     expect(errors.some((error) => error.code === 'CANCELLED')).toBe(true);
   });
+
+  it('passes --workspace and -- separator, handles 2026.x nested tool_call and thinking status lifecycle', async () => {
+    harness.state.versionOutput = '2026.06.15-03-48-54-da23e37\n';
+    const provider = new CursorHeadlessProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sessionId = await provider.createSession({
+      sessionKey: 'route-2026',
+      cwd: '/tmp/ws-project',
+      agentId: 'anthropic/claude-opus-4.6',
+      resumeId: 'cursor-chat-2026',
+    });
+
+    const statuses: Array<string | null> = [];
+    const tools: Array<{ id: string; name: string; status: string; output?: string }> = [];
+    const completed: string[] = [];
+    provider.onStatus((_sid, update) => statuses.push(update.status));
+    provider.onToolCall((_sid, tc) => tools.push({ id: tc.id, name: tc.name, status: tc.status, output: tc.output }));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send(sessionId, '- leading dash prompt');
+    const spawned = harness.lastSpawn();
+    const wsIdx = spawned.args.indexOf('--workspace');
+    expect(wsIdx).toBeGreaterThanOrEqual(0);
+    expect(spawned.args[wsIdx + 1]).toBe('/tmp/ws-project');
+    expect(spawned.args.slice(-2)).toEqual(['--', '- leading dash prompt']);
+    expect(spawned.args).toContain('anthropic/claude-opus-4.6');
+
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'system', subtype: 'init', session_id: 'cursor-chat-2026', model: 'Composer 2.5' })}\n`);
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'thinking', subtype: 'delta', text: 'step 1' })}\n`);
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'tool_call', subtype: 'started', call_id: 'call_1', tool_call: { shellToolCall: { args: { command: 'ls' } } } })}\n`);
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'tool_call', subtype: 'completed', call_id: 'call_1', tool_call: { shellToolCall: { args: { command: 'ls' }, result: { error: { message: 'denied' } } } } })}\n`);
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'thinking', subtype: 'delta', text: 'step 2' })}\n`);
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'assistant', timestamp_ms: 100, message: { id: 'm1', content: [{ type: 'text', text: 'Done' }] } })}\n`);
+    spawned.child.stdout.write(`${JSON.stringify({ type: 'result', subtype: 'success', session_id: 'cursor-chat-2026', result: 'Done' })}\n`);
+    spawned.child.emit('close', 0, null);
+    await harness.flush();
+
+    expect(tools).toEqual([
+      { id: 'call_1', name: 'shell', status: 'running', output: undefined },
+      { id: 'call_1', name: 'shell', status: 'error', output: JSON.stringify({ message: 'denied' }) },
+    ]);
+    expect(completed).toEqual(['Done']);
+    expect(statuses).toContain('thinking');
+    expect(statuses.at(-1)).toBeNull();
+  });
 });

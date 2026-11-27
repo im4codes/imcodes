@@ -10,6 +10,7 @@ import {
   resolveClaudeCodePathForSdk,
   resolveAgyPathForSdk,
   resolveGrokPathForSdk,
+  resolveCursorPathForSdk,
 } from '../../src/agent/transport-paths.js';
 
 describe('normalizeTransportCwd', () => {
@@ -105,6 +106,47 @@ describe('resolveGrokPathForSdk (per-user and system candidate resolution)', () 
       } else {
         process.env.GROK_HOME = origHome;
       }
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+});
+
+describe('resolveCursorPathForSdk (cursor-agent and agent resolution)', () => {
+  it('honours an explicit caller-provided binary path unchanged', () => {
+    if (process.platform === 'win32') return;
+    expect(resolveCursorPathForSdk('/custom/bin/agent')).toBe('/custom/bin/agent');
+  });
+
+  it('prefers PATH cursor-agent and falls back to ~/.local/bin/agent on sparse daemon PATH', () => {
+    if (process.platform === 'win32') return;
+    const origHome = process.env.HOME;
+    const origPath = process.env.PATH;
+    const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cursor-home-'));
+    try {
+      const localBin = path.join(tmpDir, '.local', 'bin');
+      const customPathBin = path.join(tmpDir, 'path-bin');
+      fs.mkdirSync(localBin, { recursive: true });
+      fs.mkdirSync(customPathBin, { recursive: true });
+
+      const fakeAgent = path.join(localBin, 'agent');
+      fs.writeFileSync(fakeAgent, '#!/bin/sh\nexit 0\n');
+      fs.chmodSync(fakeAgent, 0o755);
+
+      process.env.HOME = tmpDir;
+      process.env.PATH = '/nonexistent';
+      expect(resolveCursorPathForSdk('cursor-agent')).toBe(fakeAgent);
+
+      const fakePathCursor = path.join(customPathBin, 'cursor-agent');
+      fs.writeFileSync(fakePathCursor, '#!/bin/sh\nexit 0\n');
+      fs.chmodSync(fakePathCursor, 0o755);
+
+      process.env.PATH = customPathBin;
+      expect(resolveCursorPathForSdk('cursor-agent')).toBe(fakePathCursor);
+    } finally {
+      if (origHome === undefined) delete process.env.HOME;
+      else process.env.HOME = origHome;
+      if (origPath === undefined) delete process.env.PATH;
+      else process.env.PATH = origPath;
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
     }
   });

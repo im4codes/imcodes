@@ -508,6 +508,80 @@ export function resolveGrokPathForSdk(name = 'grok'): string {
   return name;
 }
 
+function getWindowsCursorInstallCandidates(name: string): string[] {
+  const basename = path.basename(name);
+  const hasExt = /\.[^\\/]+$/.test(basename);
+  const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
+  const dirs = uniqueNonEmpty([
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'cursor-agent') : undefined,
+    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'cursor-agent') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.local', 'bin') : undefined,
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.cursor', 'bin') : undefined,
+    ...getWindowsGlobalCliDirs(),
+  ]);
+  return dirs.flatMap((dir) => fileNames.map((fileName) => path.join(dir, fileName)));
+}
+
+/** Common install locations on macOS/Linux for Cursor Agent CLI (`cursor-agent` or `agent`).
+ *  Newer Cursor CLI releases install `agent` alongside (or instead of) `cursor-agent`
+ *  under `~/.local/bin`, which sparse systemd/launchd daemon PATHs omit. */
+function getUnixCursorInstallCandidates(): string[] {
+  const home = process.env.HOME;
+  const dirs = uniqueNonEmpty([
+    home ? path.join(home, '.local', 'bin') : undefined,
+    home ? path.join(home, '.cursor', 'bin') : undefined,
+    home ? path.join(home, '.npm-global', 'bin') : undefined,
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+    '/bin',
+  ]);
+  return dirs.flatMap((dir) => [path.join(dir, 'cursor-agent'), path.join(dir, 'agent')]);
+}
+
+function findOnUnixPath(binName: string): string | null {
+  const pathEnv = process.env.PATH ?? '';
+  for (const dir of uniqueNonEmpty(pathEnv.split(':'))) {
+    const candidate = path.join(dir, binName);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+/** Resolve a CLI path for Cursor Agent (`cursor-agent` or `agent`). */
+export function resolveCursorPathForSdk(name = 'cursor-agent'): string {
+  if (process.platform === 'win32') {
+    const resolved = resolveBinaryWithWindowsFallbacks(name, getWindowsCursorInstallCandidates(name));
+    if (resolved === name && name === 'cursor-agent') {
+      const agentResolved = resolveBinaryWithWindowsFallbacks('agent', getWindowsCursorInstallCandidates('agent'));
+      if (agentResolved !== 'agent') {
+        return /\.(cmd|bat)$/i.test(agentResolved) ? parseNpmCmdShim(agentResolved) ?? agentResolved : agentResolved;
+      }
+    }
+    if (/\.(cmd|bat)$/i.test(resolved)) {
+      return parseNpmCmdShim(resolved) ?? resolved;
+    }
+    return resolved;
+  }
+  if (name !== 'cursor-agent') {
+    if (path.isAbsolute(name) || name.includes('/')) return name;
+    const onPath = findOnUnixPath(name);
+    if (onPath) return onPath;
+    for (const candidate of getUnixCursorInstallCandidates()) {
+      if (path.basename(candidate) === name && existsSync(candidate)) return candidate;
+    }
+    return name;
+  }
+  const onPathCursorAgent = findOnUnixPath('cursor-agent');
+  if (onPathCursorAgent) return onPathCursorAgent;
+  for (const candidate of getUnixCursorInstallCandidates()) {
+    if (existsSync(candidate)) return candidate;
+  }
+  const onPathAgent = findOnUnixPath('agent');
+  if (onPathAgent) return onPathAgent;
+  return name;
+}
+
 
 /** Result of resolving a binary that may be an npm .cmd shim.
  *  When the resolved path is a real .exe, just `{ executable }`.
