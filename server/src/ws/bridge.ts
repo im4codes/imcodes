@@ -541,6 +541,7 @@ import {
   SESSION_GROUP_CLONE_MSG,
   SESSION_GROUP_CLONE_STATES,
   cloneP2pConfigWithSessionRemap,
+  isCloneableDirectChildState,
   mainSessionNameForProjectSlug,
   type SessionGroupCloneCleanupResource,
   type SessionGroupCloneEvent,
@@ -8435,6 +8436,9 @@ export class WsBridge {
       ? await evaluateParticipantP2pShellRestriction({
         msg,
         resolveAgentType: (name) => this.resolveSessionAgentType(name),
+        resolveExpandedSessions: sessionName
+          ? () => this.resolveP2pDomainSessionNames(sessionName)
+          : undefined,
       })
       : null;
     const decision = evaluateShareCommand({
@@ -9139,31 +9143,136 @@ export class WsBridge {
     return { hit: false };
   }
 
+  getLiveSubSessionCloneState(subSessionName: string): { known: true; state: string; agentType: string | null } | { known: false } {
+    const live = this.activeSubSessions.get(subSessionName);
+    if (!live) return { known: false };
+    return { known: true, state: live.state ?? 'unknown', agentType: live.agentType ?? null };
+  }
+
   async resolveSessionAgentType(sessionName: string): Promise<string | null> {
-    const cached = this.resolveCachedSessionAgentType(sessionName);
-    if (cached.hit) return cached.agentType;
-    if (!this.db) return null;
-    const epochBefore = this.sessionAgentTypeEpoch;
-    try {
-      const subSessionId = sessionName.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1];
-      const row = subSessionId
-        ? await this.db.queryOne<{ agent_type: string | null }>(
-          'SELECT type AS agent_type FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
-          [this.serverId, subSessionId],
-        )
-        : await this.db.queryOne<{ agent_type: string | null }>(
-          'SELECT agent_type FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
-          [this.serverId, sessionName],
-        );
-      const agentType = typeof row?.agent_type === 'string' && row.agent_type.trim() ? row.agent_type.trim() : null;
-      if (this.sessionAgentTypeEpoch === epochBefore) {
-        this.sessionAgentTypeInvalidated.delete(sessionName);
-        this.sessionAgentTypes.set(sessionName, { agentType, cachedAt: shareClockNow() });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const cached = this.resolveCachedSessionAgentType(sessionName);
+      if (cached.hit) return cached.agentType;
+      if (!this.db) return null;
+      const epochBefore = this.sessionAgentTypeEpoch;
+      try {
+        const subSessionId = sessionName.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1];
+        const row = subSessionId
+          ? await this.db.queryOne<{ agent_type: string | null }>(
+            'SELECT type AS agent_type FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+            [this.serverId, subSessionId],
+          )
+          : await this.db.queryOne<{ agent_type: string | null }>(
+            'SELECT agent_type FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+            [this.serverId, sessionName],
+          );
+        const agentType = typeof row?.agent_type === 'string' && row.agent_type.trim() ? row.agent_type.trim() : null;
+        if (this.sessionAgentTypeEpoch === epochBefore) {
+          this.sessionAgentTypeInvalidated.delete(sessionName);
+          this.sessionAgentTypes.set(sessionName, { agentType, cachedAt: shareClockNow() });
+          return agentType;
+        }
+        // A newer live sync or invalidation arrived while this DB query was in
+        // flight; prefer any fresh live/cached snapshot and otherwise retry.
+        const refreshed = this.resolveCachedSessionAgentType(sessionName);
+        if (refreshed.hit) return refreshed.agentType;
+      } catch {
+        return null;
       }
-      return agentType;
-    } catch {
-      return null;
     }
+    const finalCached = this.resolveCachedSessionAgentType(sessionName);
+    return finalCached.hit ? finalCached.agentType : null;
+  }
+
+  async resolveP2pDomainSessionNames(initiatorSession: string): Promise<string[]> {
+    const names = new Set<string>([initiatorSession]);
+    const liveInitSub = this.activeSubSessions.get(initiatorSession);
+    const liveInitMain = this.activeMainSessions.get(initiatorSession);
+
+    let scopeMainSession: string | null = liveInitSub?.parentSession ?? null;
+    let projectName: string | null = liveInitMain?.project ?? null;
+    if (this.db && initiatorSession.startsWith('deck_sub_') && !scopeMainSession) {
+      try {
+        const subId = initiatorSession.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1];
+        if (subId) {
+          const row = await this.db.queryOne<{ parent_session: string | null }>(
+            'SELECT parent_session FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+            [this.serverId, subId],
+          );
+          scopeMainSession = row?.parent_session ?? null;
+        }
+      } catch { /* best effort */ }
+    } else if (this.db && !initiatorSession.startsWith('deck_sub_') && !projectName) {
+      try {
+        const row = await this.db.queryOne<{ project_name: string | null }>(
+          'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+          [this.serverId, initiatorSession],
+        );
+        projectName = row?.project_name ?? null;
+      } catch { /* best effort */ }
+    }
+
+    if (initiatorSession.startsWith('deck_sub_')) {
+      if (scopeMainSession) {
+        const mainLive = this.activeMainSessions.get(scopeMainSession);
+        if (!mainLive || mainLive.state !== 'stopped') names.add(scopeMainSession);
+        for (const sub of this.activeSubSessions.values()) {
+          if (sub.parentSession === scopeMainSession && sub.state !== 'stopped') names.add(sub.name);
+        }
+      }
+    } else {
+      for (const sub of this.activeSubSessions.values()) {
+        if (sub.parentSession === initiatorSession && sub.state !== 'stopped') names.add(sub.name);
+      }
+      if (projectName) {
+        const projectSlug = sanitizeProjectName(projectName);
+        for (const session of this.activeMainSessions.values()) {
+          if (
+            session.state !== 'stopped'
+            && (session.project === projectName || (session.project ? sanitizeProjectName(session.project) === projectSlug : false))
+          ) {
+            names.add(session.name);
+          }
+        }
+      }
+    }
+
+    if (this.db) {
+      try {
+        if (initiatorSession.startsWith('deck_sub_') && scopeMainSession) {
+          const rows = await this.db.query<{ id: string }>(
+            'SELECT id FROM sub_sessions WHERE server_id = $1 AND parent_session = $2 AND closed_at IS NULL',
+            [this.serverId, scopeMainSession],
+          );
+          for (const row of rows) {
+            const subName = `deck_sub_${row.id}`;
+            if (this.activeSubSessions.get(subName)?.state !== 'stopped') names.add(subName);
+          }
+        } else if (!initiatorSession.startsWith('deck_sub_')) {
+          const subRows = await this.db.query<{ id: string }>(
+            'SELECT id FROM sub_sessions WHERE server_id = $1 AND parent_session = $2 AND closed_at IS NULL',
+            [this.serverId, initiatorSession],
+          );
+          for (const row of subRows) {
+            const subName = `deck_sub_${row.id}`;
+            if (this.activeSubSessions.get(subName)?.state !== 'stopped') names.add(subName);
+          }
+          if (projectName) {
+            const projectSlug = sanitizeProjectName(projectName);
+            const mainRows = await this.db.query<{ name: string; state: string | null }>(
+              "SELECT name, state FROM sessions WHERE server_id = $1 AND (project_name = $2 OR project_name = $3) AND name NOT LIKE 'deck_sub_%'",
+              [this.serverId, projectName, projectSlug],
+            );
+            for (const row of mainRows) {
+              const live = this.activeMainSessions.get(row.name);
+              const effectiveState = live?.state ?? row.state;
+              if (effectiveState !== 'stopped') names.add(row.name);
+            }
+          }
+        }
+      } catch { /* best effort */ }
+    }
+    return [...names];
   }
 
   private async resolveExecutionTargetAgentTypes(
@@ -9204,10 +9313,14 @@ export class WsBridge {
       const rawProject = readNameField('project');
       if (!rawProject) return [];
       const projectSlug = sanitizeProjectName(rawProject);
+      const matchesProject = (candidate: string | null | undefined): boolean => (
+        candidate === rawProject
+        || (typeof candidate === 'string' && candidate.trim() ? sanitizeProjectName(candidate) === projectSlug : false)
+      );
       const types: Array<string | null> = [];
       const seen = new Set<string>();
       for (const session of this.activeMainSessions.values()) {
-        if (session.project === projectSlug || session.name.startsWith(`deck_${projectSlug}_`)) {
+        if (matchesProject(session.project)) {
           seen.add(session.name);
           types.push(await this.resolveSessionAgentType(session.name));
         }
@@ -9215,13 +9328,13 @@ export class WsBridge {
       if (this.db) {
         try {
           const rows = await this.db.query<{ name: string; agent_type: string | null }>(
-            "SELECT name, agent_type FROM sessions WHERE server_id = $1 AND (project_name = $2 OR name LIKE $3) AND name NOT LIKE 'deck_sub_%'",
-            [this.serverId, projectSlug, `deck_${projectSlug}_%`],
+            "SELECT name, agent_type FROM sessions WHERE server_id = $1 AND (project_name = $2 OR project_name = $3) AND name NOT LIKE 'deck_sub_%'",
+            [this.serverId, rawProject, projectSlug],
           );
           for (const row of rows) {
             if (!seen.has(row.name)) {
               seen.add(row.name);
-              types.push(row.agent_type ?? await this.resolveSessionAgentType(row.name));
+              types.push((await this.resolveSessionAgentType(row.name)) ?? row.agent_type);
             }
           }
         } catch {
@@ -9236,24 +9349,25 @@ export class WsBridge {
       const types: Array<string | null> = [await this.resolveSessionAgentType(sourceMain)];
       const seen = new Set<string>([sourceMain]);
       for (const sub of this.activeSubSessions.values()) {
-        if (sub.parentSession === sourceMain && sub.state !== 'stopped' && sub.state !== 'error') {
+        if (sub.parentSession === sourceMain && isCloneableDirectChildState(sub.state)) {
           seen.add(sub.name);
           types.push(await this.resolveSessionAgentType(sub.name));
         }
       }
       if (this.db) {
         try {
-          const rows = await this.db.query<{ id: string; type: string | null }>(
-            'SELECT id, type FROM sub_sessions WHERE server_id = $1 AND parent_session = $2 AND closed_at IS NULL',
+          const rows = await this.db.query<{ id: string; type: string | null; execution_clone_metadata?: Record<string, unknown> | string | null }>(
+            'SELECT id, type, execution_clone_metadata FROM sub_sessions WHERE server_id = $1 AND parent_session = $2 AND closed_at IS NULL',
             [this.serverId, sourceMain],
           );
           for (const row of rows) {
+            if (isExecutionCloneRow({ execution_clone_metadata: row.execution_clone_metadata ?? null })) continue;
             const subName = `deck_sub_${row.id}`;
             if (seen.has(subName)) continue;
             const liveSub = this.activeSubSessions.get(subName);
-            if (liveSub && (liveSub.state === 'stopped' || liveSub.state === 'error')) continue;
+            if (liveSub && !isCloneableDirectChildState(liveSub.state)) continue;
             seen.add(subName);
-            types.push(row.type ?? await this.resolveSessionAgentType(subName));
+            types.push(liveSub?.agentType ?? row.type ?? await this.resolveSessionAgentType(subName));
           }
         } catch {
           // Best-effort clone member lookup.

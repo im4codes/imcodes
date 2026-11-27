@@ -30,6 +30,7 @@ interface Props {
   canStopProject?: boolean;
   onRestartProject: (project: string, fresh?: boolean) => void;
   onCloneSession?: (session: SessionInfo) => void;
+  canCloneSession?: (session: SessionInfo) => boolean;
   onOpenSessionSettings?: (session: SessionInfo) => void;
   onShareSession?: (session: SessionInfo) => void;
   /** When set to a session name, triggers inline rename */
@@ -85,7 +86,7 @@ type ControlledTabsProps = Omit<Props, 'tabOrder' | 'setTabOrder' | 'tabOrderHyd
   tabOrderHydrated: boolean;
 };
 
-function SessionTabsControlled({ sessions, activeSession, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr, tabOrder, setTabOrder, tabOrderHydrated }: ControlledTabsProps) {
+function SessionTabsControlled({ sessions, activeSession, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, canCloneSession: canCloneSessionProp, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr, tabOrder, setTabOrder, tabOrderHydrated }: ControlledTabsProps) {
   recordPerfRender('SessionTabs');
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
@@ -567,7 +568,8 @@ function SessionTabsControlled({ sessions, activeSession, idleAlerts, p2pSession
         const projectHasPinned = sessions.some((s) => s.project === ctx.session.project && pinned.has(s.name));
         const canCloneSession = ctx.session.role === 'brain'
           && !ctx.session.name.startsWith('deck_sub_')
-          && ctx.session.userCreated !== false;
+          && ctx.session.userCreated !== false
+          && (!canCloneSessionProp || canCloneSessionProp(ctx.session));
         return (
         <div ref={menuRef} class="tab-context-menu" style={{ left: menuX, top: menuY }}>
           <button class="menu-item session-action-menu-item" onClick={() => togglePin(ctx.session.name)}>
@@ -724,6 +726,7 @@ export const SessionTabs = memo(SessionTabsImpl, (prev, next) => (
   && prev.idleAlerts === next.idleAlerts
   && prev.p2pSessionLabels === next.p2pSessionLabels
   && prev.canStopProject === next.canStopProject
+  && prev.canCloneSession === next.canCloneSession
   && prev.renameRequest === next.renameRequest
   && prev.sessionsLoaded === next.sessionsLoaded
   && prev.pinned === next.pinned

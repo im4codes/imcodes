@@ -20,15 +20,24 @@ import {
 } from '@shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '@shared/git-remote-url.js';
 import { sanitizeProjectName } from '@shared/sanitize-project-name.js';
-import { isShellLikeAgentType } from '@shared/agent-types.js';
 import { PARTICIPANT_SHELL_FORBIDDEN_REASON } from '@shared/tab-sharing.js';
+import { hasShareRestrictedCloneShellMember } from '../tab-sharing-ui.js';
 
 interface Props {
   ws: WsClient | null;
   serverId?: string;
   sourceSession: SessionInfo;
   sessions?: SessionInfo[];
-  subSessions?: Array<{ sessionName: string; type: string; label?: string | null; state: string; parentSession?: string | null }>;
+  subSessions?: Array<{
+    sessionName: string;
+    type: string;
+    agentType?: string | null;
+    label?: string | null;
+    state: string;
+    parentSession?: string | null;
+    executionCloneKind?: string | null;
+    parentRunId?: string | null;
+  }>;
   forbidShellAgentTypes?: boolean;
   onClose: () => void;
 }
@@ -250,14 +259,10 @@ export function CloneSessionGroupDialog({
     () => (subSessions ?? []).filter((session) => session.parentSession === sourceSession.name),
     [sourceSession.name, subSessions],
   );
-  const hasForbiddenShellMember = forbidShellAgentTypes && (
-    isShellLikeAgentType(sourceSession.agentType)
-    || directChildSessions.some((session) => (
-      session.state !== 'stopped'
-      && session.state !== 'error'
-      && isShellLikeAgentType(session.type)
-    ))
-  );
+  const hasForbiddenShellMember = forbidShellAgentTypes && hasShareRestrictedCloneShellMember({
+    sourceSession,
+    subSessions,
+  });
   const sourceRunning = isRunningSessionState(sourceSession.state)
     || directChildSessions.some((session) => isRunningSessionState(session.state));
   const capabilityReady = canUseKnownCloneCapability(ws);

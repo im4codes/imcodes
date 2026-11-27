@@ -3588,6 +3588,31 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(beforeTypingWhileLlm).toBe(true);
     expect(beforeTypingAfterFlipToShell).toBe(false);
 
+    // 2b. When dispatch-time lock abort (beforeTyping -> false -> 'aborted') fires cleanly, run fails immediately without marking tmux delivery
+    sendKeysDelayedEnterMock.mockClear();
+    w1AgentType = 'codex';
+    processSessionSendMock.mockImplementation(async (session: string, prompt: string, opts?: { beforeTyping?: () => boolean }) => {
+      if (session === 'deck_proj_w1') {
+        w1AgentType = 'shell';
+        if (opts?.beforeTyping && !opts.beforeTyping()) {
+          return 'aborted';
+        }
+      }
+      await sendKeysDelayedEnterMock(session, prompt);
+      return 'sent';
+    });
+    const abortedRun = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'aborted inside beforeTyping',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      sharedActor: participantActor,
+    });
+    const abortedDone = await waitForStatus(abortedRun.id, ['failed'], 10_000);
+    expect(abortedDone.error).toContain('participant_shell_forbidden');
+    expect(sendKeysDelayedEnterMock.mock.calls.some(([sess]) => sess === 'deck_proj_w1')).toBe(false);
+
     // 3. Pure-LLM participant run & owner run with shell session succeed cleanly
     processSessionSendMock.mockClear();
     w1AgentType = 'codex';

@@ -1012,11 +1012,16 @@ async function dispatchP2pPromptToSession(args: {
     throw new Error(`missing_transport_runtime:${args.session}`);
   }
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
-  await sendProcessSessionMessageForAutomation(args.session, args.prompt, {
+  const sendResult = await sendProcessSessionMessageForAutomation(args.session, args.prompt, {
     beforeTyping: () => !(
       isParticipantSharedActorEnvelope(args.run.sharedActor)
       && isShellLikeAgentType(getSession(args.session)?.agentType)
     ),
+    onAborted: () => {
+      if (isParticipantSharedActorEnvelope(args.run.sharedActor) && isShellLikeAgentType(getSession(args.session)?.agentType)) {
+        failRun(args.run, 'dispatch_failed', PARTICIPANT_SHELL_FORBIDDEN_REASON, null);
+      }
+    },
     userMessageMetadata: {
       ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
       memoryExcluded: true,
@@ -1025,7 +1030,13 @@ async function dispatchP2pPromptToSession(args: {
       p2pPhase: args.run.activePhase,
     },
   });
-  return { mode: 'tmux' };
+  if (sendResult === 'aborted') {
+    if (isParticipantSharedActorEnvelope(args.run.sharedActor) && isShellLikeAgentType(getSession(args.session)?.agentType)) {
+      throw new Error(PARTICIPANT_SHELL_FORBIDDEN_REASON);
+    }
+    throw new Error('aborted_before_typing');
+  }
+  return { mode: sendResult === 'queued' ? 'queued' : 'tmux' };
 }
 
 interface P2pPromptDispatchResult {

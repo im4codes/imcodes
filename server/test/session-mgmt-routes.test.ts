@@ -2447,4 +2447,135 @@ describe('session-mgmt persistence routes', () => {
     });
     expect(ownerSend.status).toBe(200);
   });
+
+  it('rejects PUT /sessions/:name, shell relabel/rename, and mixed unbounded P2P broadcasts for whole-server participants while keeping pure-LLM & owner paths', async () => {
+    const app = await buildApp();
+    const serverCoverage = {
+      target: { kind: 'server', serverId: 'srv-1' } as const,
+      effectiveRole: 'participant' as const,
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['server-share-1'],
+      primaryShareId: 'server-share-1',
+      authorizedAt: Date.now(),
+      serverParticipantAuthority: true,
+    };
+
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
+      shareProvenance: 'server',
+    });
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
+      shareProvenance: 'server',
+    });
+
+    // 1. PUT /sessions/:name cannot persist shell/script or LLM DB rows via share participant without daemon token
+    for (const agentType of ['shell', 'script', 'claude-code-sdk']) {
+      const putRes = await app.request('/api/server/srv-1/sessions/deck_spoof_brain', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          projectName: 'spoof',
+          projectRole: 'brain',
+          agentType,
+          projectDir: '/tmp/spoof',
+          state: 'idle',
+        }),
+      });
+      expect(putRes.status).toBe(403);
+      expect(await putRes.json()).toEqual({
+        error: 'forbidden',
+        reason: agentType === 'shell' || agentType === 'script'
+          ? 'participant_shell_forbidden'
+          : 'share-direct-surface-denied',
+      });
+    }
+    const delRes = await app.request('/api/server/srv-1/sessions/deck_spoof_brain', { method: 'DELETE' });
+    expect(delRes.status).toBe(403);
+    expect(mockUpsertDbSession).not.toHaveBeenCalled();
+
+    // 2. PATCH /sessions/:name/label and /rename blocked for share participants on shell sessions
+    resolveSessionAgentTypeMock.mockResolvedValue('shell');
+    const labelRes = await app.request('/api/server/srv-1/sessions/deck_sh_brain/label', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'nope' }),
+    });
+    expect(labelRes.status).toBe(403);
+    expect(await labelRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+
+    const renameRes = await app.request('/api/server/srv-1/sessions/deck_sh_brain/rename', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'nope' }),
+    });
+    expect(renameRes.status).toBe(403);
+    expect(await renameRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+
+    // 3. Unbounded P2P broadcasts (@@all / p2pMode / __all__) rejected on mixed project, allowed on pure-LLM project
+    mockDbQueryOne.mockResolvedValue({ project_name: 'pure', display_name: 'Shared User', username: 'shared' });
+    mockDbQuery.mockImplementation(async (sql: string) => {
+      if (typeof sql === 'string' && sql.includes('FROM server_shares')) {
+        return [{
+          target_kind: 'server',
+          id: 'server-share-1',
+          server_id: 'srv-1',
+          session_name: null,
+          sub_session_id: null,
+          target_user_id: 'user-1',
+          role: 'participant',
+          created_by: 'owner-user',
+          created_at: 1000,
+          updated_at: 1000,
+          expires_at: null,
+          revoked_at: null,
+        }];
+      }
+      return [];
+    });
+    resolveSessionAgentTypeMock.mockImplementation(async (name: string) => {
+      if (name === 'deck_mix_brain' || name === 'deck_pure_brain') return 'claude-code';
+      if (name === 'deck_sub_mixsh') return 'shell';
+      if (name === 'deck_sub_purellm') return 'codex-sdk';
+      return null;
+    });
+    mockGetDbSessionsByServer.mockResolvedValue([
+      { name: 'deck_mix_brain', project_name: 'mix', role: 'brain', agent_type: 'claude-code', state: 'idle' },
+      { name: 'deck_pure_brain', project_name: 'pure', role: 'brain', agent_type: 'claude-code', state: 'idle' },
+    ]);
+    mockGetSubSessionsByServer.mockResolvedValue([
+      { id: 'mixsh', server_id: 'srv-1', type: 'shell', parent_session: 'deck_mix_brain', closed_at: null },
+      { id: 'purellm', server_id: 'srv-1', type: 'codex-sdk', parent_session: 'deck_pure_brain', closed_at: null },
+    ]);
+
+    for (const payload of [
+      { sessionName: 'deck_mix_brain', text: '@@all(audit)' },
+      { sessionName: 'deck_mix_brain', text: 'check', p2pMode: 'audit' },
+      { sessionName: 'deck_mix_brain', text: 'check', p2pAtTargets: [{ session: '__all__', mode: 'audit' }] },
+    ]) {
+      const mixBc = await app.request('/api/server/srv-1/session/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      expect(mixBc.status).toBe(403);
+      expect(await mixBc.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    }
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
+
+    const pureBc = await app.request('/api/server/srv-1/session/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionName: 'deck_pure_brain', text: 'check', p2pMode: 'audit' }),
+    });
+    expect(pureBc.status).toBe(200);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toMatchObject({
+      type: 'session.send',
+      sessionName: 'deck_pure_brain',
+      sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
+    });
+  });
 });

@@ -78,7 +78,7 @@ vi.mock('../../src/daemon/git-remote-clone.js', () => ({
   maybeCloneGitRemoteToDirectory: vi.fn(async ({ targetDir }: { targetDir: string }) => targetDir),
 }));
 
-import { handleWebCommand } from '../../src/daemon/command-handler.js';
+import { handleWebCommand, sendProcessSessionMessageForAutomation } from '../../src/daemon/command-handler.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -268,6 +268,131 @@ describe('command-handler participant shell/script defense-in-depth', () => {
         status: 'error',
         error: 'participant_shell_forbidden',
       }));
+    });
+
+    // 5. Direct process session.send flips to shell before in-mutex write -> no terminal write & error ack
+    sendKeysMock.mockClear();
+    sendKeysDelayedEnterMock.mockClear();
+    timelineEmitMock.mockClear();
+    let sendRaceStage = 0;
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_sendrace_brain') {
+        sendRaceStage += 1;
+        return {
+          name,
+          projectName: 'sendrace',
+          role: 'brain',
+          // Entry guards + Step 2 inspect codex; inside-mutex beforeTyping sees shell
+          agentType: sendRaceStage <= 4 ? 'codex' : 'shell',
+          projectDir: '/tmp/sendrace',
+          state: 'idle',
+          runtimeType: 'process',
+        };
+      }
+      return undefined;
+    });
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_sendrace_brain',
+      text: 'hello',
+      commandId: 'direct-send-race-1',
+      sharedActor: SERVER_PARTICIPANT,
+    }, serverLink as any);
+    await vi.waitFor(() => {
+      expect(timelineEmitMock).toHaveBeenCalledWith('deck_sendrace_brain', 'command.ack', expect.objectContaining({
+        commandId: 'direct-send-race-1',
+        status: 'error',
+        error: 'participant_shell_forbidden',
+      }));
+    });
+    expect(sendKeysMock).not.toHaveBeenCalled();
+    expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+
+    // Direct automation send abort propagates 'aborted' cleanly
+    let autoStage = 0;
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_autorace_brain') {
+        autoStage += 1;
+        return {
+          name,
+          projectName: 'autorace',
+          role: 'brain',
+          agentType: autoStage === 1 ? 'codex' : 'shell',
+          projectDir: '/tmp/autorace',
+          state: 'idle',
+          runtimeType: 'process',
+        };
+      }
+      return undefined;
+    });
+    const autoResult = await sendProcessSessionMessageForAutomation('deck_autorace_brain', 'ping', {
+      verbatim: true,
+      beforeTyping: () => getSessionMock('deck_autorace_brain')?.agentType !== 'shell',
+    });
+    expect(autoResult).toBe('aborted');
+    expect(sendKeysMock).not.toHaveBeenCalled();
+    expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+
+    // 6. Shell tmux recovery after input error blocked for participant, preserved for owner
+    relaunchSessionWithSettingsMock.mockClear();
+    sendRawInputMock.mockReset();
+    serverLink.send.mockClear();
+    let recAgentType = 'claude-code';
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_recsh_brain') {
+        return {
+          name,
+          projectName: 'recsh',
+          role: 'brain',
+          agentType: recAgentType,
+          projectDir: '/tmp/recsh',
+          state: 'idle',
+        };
+      }
+      return undefined;
+    });
+    sendRawInputMock.mockImplementationOnce(async () => {
+      // Simulate session transitioning / resolving to shell as tmux error occurs before catch recovery
+      recAgentType = 'shell';
+      throw new Error("can't find pane");
+    });
+    handleWebCommand({
+      type: 'session.input',
+      sessionName: 'deck_recsh_brain',
+      data: 'whoami\r',
+      sharedActor: SERVER_PARTICIPANT,
+    }, serverLink as any);
+    await vi.waitFor(() => {
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'session.error',
+        sessionName: 'deck_recsh_brain',
+        message: 'participant_shell_forbidden',
+      }));
+    });
+    expect(relaunchSessionWithSettingsMock).not.toHaveBeenCalled();
+    expect(sendRawInputMock).toHaveBeenCalledTimes(1);
+
+    // Owner recovery still relaunches shell and retries sendRawInput
+    relaunchSessionWithSettingsMock.mockClear();
+    relaunchSessionWithSettingsMock.mockResolvedValue(undefined);
+    sendRawInputMock.mockReset();
+    getSessionMock.mockReturnValue({
+      name: 'deck_ownersh_brain',
+      projectName: 'ownersh',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: '/tmp/ownersh',
+      state: 'idle',
+    });
+    sendRawInputMock.mockRejectedValueOnce(new Error("can't find pane")).mockResolvedValueOnce(undefined);
+    handleWebCommand({
+      type: 'session.input',
+      sessionName: 'deck_ownersh_brain',
+      data: 'ls\r',
+    }, serverLink as any);
+    await vi.waitFor(() => {
+      expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+      expect(sendRawInputMock).toHaveBeenCalledTimes(2);
     });
   });
 });

@@ -579,4 +579,33 @@ describe('CloneSessionGroupDialog', () => {
     fireEvent.click(submit);
     expect(ws.cloneSessionGroup).not.toHaveBeenCalled();
   });
+
+  it('allows shared participants to clone when shell children are stopped, error, or execution clones', () => {
+    const ws = makeWs();
+    render(
+      <CloneSessionGroupDialog
+        ws={ws as never}
+        serverId="srv-1"
+        sourceSession={{
+          name: 'deck_cd_brain',
+          project: 'cd',
+          role: 'brain',
+          agentType: 'claude-code-sdk',
+          state: 'idle',
+        }}
+        subSessions={[
+          { sessionName: 'deck_sub_shstop', type: 'shell', state: 'stopped', parentSession: 'deck_cd_brain' },
+          { sessionName: 'deck_sub_sherr', type: 'script', state: 'error', parentSession: 'deck_cd_brain' },
+          { sessionName: 'deck_sub_exsh', type: 'shell', state: 'idle', parentSession: 'deck_cd_brain', executionCloneKind: 'execution_clone' },
+          { sessionName: 'deck_sub_llm', type: 'codex-sdk', state: 'running', parentSession: 'deck_cd_brain' },
+        ]}
+        forbidShellAgentTypes={true}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const submit = screen.getByRole('button', { name: 'Copy group' });
+    expect(submit.hasAttribute('disabled')).toBe(false);
+    expect(screen.queryByText('share.shell_participant_forbidden')).toBeNull();
+  });
 });

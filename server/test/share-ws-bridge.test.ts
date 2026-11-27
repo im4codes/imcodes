@@ -3937,4 +3937,153 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson.some((m) => m.type === SESSION_GROUP_CLONE_MSG.START && m.sourceMainSessionName === 'deck_purellm_brain' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
     expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'p2p-llm-ok' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
   });
+
+  it('fences stale in-flight DB reads on newer sync, uses exact project match on session.restart, aligns clone visibility to active running/idle children, and blocks mixed unbounded P2P broadcasts', async () => {
+    const now = Date.now();
+    const daemon = new MockWs();
+    const bridge = WsBridge.get(serverId);
+    const subRows: Array<{ id: string; parent_session: string | null; type?: string; closed_at?: number | null }> = [
+      { id: 'stoppedsh', parent_session: 'deck_stopshclone_brain', type: 'shell', closed_at: null },
+      { id: 'okclone', parent_session: 'deck_stopshclone_brain', type: 'codex-sdk', closed_at: null },
+      { id: 'mixbsh', parent_session: 'deck_mixbc_brain', type: 'shell', closed_at: null },
+      { id: 'purebllm', parent_session: 'deck_purebc_brain', type: 'codex-sdk', closed_at: null },
+    ];
+    let resolveInflightQuery!: (val: { agent_type: string | null } | null) => void;
+    const inflightPromise = new Promise<{ agent_type: string | null } | null>((resolve) => {
+      resolveInflightQuery = resolve;
+    });
+
+    const baseDb = makeDb(null, [], { subSessions: subRows });
+    const db = {
+      ...baseDb,
+      query: async (sql: string, params: unknown[] = []) => {
+        if (sql.includes('FROM server_shares')) {
+          return [{
+            target_kind: 'server',
+            id: 'share-1',
+            server_id: serverId,
+            session_name: null,
+            sub_session_id: null,
+            target_user_id: 'participant-server-3',
+            role: 'participant',
+            created_by: 'owner-user',
+            created_at: now - 1000,
+            updated_at: now - 1000,
+            expires_at: null,
+            revoked_at: null,
+          }];
+        }
+        if (sql.includes('FROM sub_sessions WHERE server_id = $1 AND parent_session = $2')) {
+          return subRows.filter((r) => r.parent_session === params[1] && !r.closed_at).map((r) => ({ id: r.id, type: r.type ?? 'codex-sdk' }));
+        }
+        if (sql.includes('FROM sessions WHERE server_id = $1 AND (project_name = $2 OR project_name = $3)')) {
+          if (params[1] === 'app' || params[2] === 'app') return [{ name: 'deck_app_brain', agent_type: 'claude-code', state: 'idle' }];
+          if (params[1] === 'app_v2' || params[2] === 'app_v2') return [{ name: 'deck_app_v2_shell', agent_type: 'shell', state: 'idle' }];
+          if (params[1] === 'mixbc') return [{ name: 'deck_mixbc_brain', agent_type: 'claude-code', state: 'idle' }];
+          if (params[1] === 'purebc') return [{ name: 'deck_purebc_brain', agent_type: 'claude-code', state: 'idle' }];
+          return [];
+        }
+        return (baseDb as { query: (s: string, p?: unknown[]) => Promise<unknown[]> }).query(sql, params);
+      },
+      queryOne: async (sql: string, params: unknown[] = []) => {
+        if (sql.includes('SELECT EXISTS')) return { exists: true };
+        if (sql.includes('actor_status')) return { user_id: 'owner-user', owner_status: 'active', actor_status: 'active' };
+        if (sql.includes('FROM sessions WHERE server_id = $1 AND name = $2') && params[1] === 'deck_inflight_brain') {
+          if (sql.includes('project_name')) return { project_name: 'inflight' };
+          return inflightPromise;
+        }
+        if (sql.includes('FROM sub_sessions WHERE server_id = $1 AND id = $2')) {
+          const hit = subRows.find((r) => r.id === params[1]);
+          return hit ? { agent_type: hit.type ?? null } : null;
+        }
+        if (sql.includes('FROM sessions WHERE server_id = $1 AND name = $2')) {
+          if (params[1] === 'deck_app_brain') return { agent_type: 'claude-code', project_name: 'app' };
+          if (params[1] === 'deck_app_v2_shell') return { agent_type: 'shell', project_name: 'app_v2' };
+          if (params[1] === 'deck_stopshclone_brain') return { agent_type: 'claude-code', project_name: 'stopshclone' };
+          if (params[1] === 'deck_mixbc_brain') return { agent_type: 'claude-code', project_name: 'mixbc' };
+          if (params[1] === 'deck_purebc_brain') return { agent_type: 'claude-code', project_name: 'purebc' };
+        }
+        return (baseDb as { queryOne: (s: string, p?: unknown[]) => Promise<unknown> }).queryOne(sql, params);
+      },
+    } as never;
+
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-shell-ws-key-3' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+      daemonId: serverId,
+      capabilities: [SESSION_GROUP_CLONE_CAPABILITY_V1],
+      helloEpoch: 1,
+      sentAt: now,
+    }));
+    daemon.emit('message', JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: 'deck_app_brain', project: 'app', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+        { name: 'deck_app_v2_shell', project: 'app_v2', role: 'w1', state: 'idle', agentType: 'shell', runtimeType: 'process' },
+        { name: 'deck_stopshclone_brain', project: 'stopshclone', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+        { name: 'deck_mixbc_brain', project: 'mixbc', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+        { name: 'deck_purebc_brain', project: 'purebc', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+      ],
+    }));
+    daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'stoppedsh', parentSession: 'deck_stopshclone_brain', sessionType: 'shell', runtimeType: 'process', state: 'stopped' }));
+    daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'okclone', parentSession: 'deck_stopshclone_brain', sessionType: 'codex-sdk', runtimeType: 'transport', state: 'idle' }));
+    daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'mixbsh', parentSession: 'deck_mixbc_brain', sessionType: 'shell', runtimeType: 'process', state: 'idle' }));
+    daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'purebllm', parentSession: 'deck_purebc_brain', sessionType: 'codex-sdk', runtimeType: 'transport', state: 'idle' }));
+    await flushAsync();
+
+    // 1) In-flight DB read returning stale claude-code must NOT override newer session_list ('shell')
+    const inflightResolvePromise = bridge.resolveSessionAgentType('deck_inflight_brain');
+    await Promise.resolve();
+    daemon.emit('message', JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: 'deck_app_brain', project: 'app', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+        { name: 'deck_app_v2_shell', project: 'app_v2', role: 'w1', state: 'idle', agentType: 'shell', runtimeType: 'process' },
+        { name: 'deck_stopshclone_brain', project: 'stopshclone', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+        { name: 'deck_mixbc_brain', project: 'mixbc', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+        { name: 'deck_purebc_brain', project: 'purebc', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+        { name: 'deck_inflight_brain', project: 'inflight', role: 'brain', state: 'idle', agentType: 'shell', runtimeType: 'process' },
+      ],
+    }));
+    resolveInflightQuery({ agent_type: 'claude-code' });
+    expect(await inflightResolvePromise).toBe('shell');
+
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+    const cov = { ...coverage(serverTarget, 'participant', now), serverParticipantAuthority: true };
+    bridge.setShareCoverageResolverForTests(async () => cov);
+    const sock = new MockWs();
+    bridge.handleShareBrowserConnection(sock as never, 'participant-server-3', db, {
+      ticketId: 'ticket-server-3',
+      target: serverTarget,
+      snapshot: cov,
+    });
+    daemon.sent.length = 0;
+
+    // 2) Same-prefix independent project: 'app' restarts cleanly while 'app_v2' is blocked; 'inflight' ('shell') is blocked
+    sock.emit('message', JSON.stringify({ type: 'session.restart', project: 'app' }));
+    sock.emit('message', JSON.stringify({ type: 'session.restart', project: 'app_v2' }));
+    sock.emit('message', JSON.stringify({ type: 'session.input', sessionName: 'deck_inflight_brain', data: 'whoami\r' }));
+
+    // 3) Group clone allows inactive stopped shell child under pure LLM group
+    sock.emit('message', JSON.stringify({ type: SESSION_GROUP_CLONE_MSG.START, serverId, sourceMainSessionName: 'deck_stopshclone_brain', idempotencyKey: 'clone-stopped-sh' }));
+
+    // 4) Unbounded P2P broadcasts: mixed blocks BEFORE daemon relay; pure LLM relays with sharedActor
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: '@@all(audit)', commandId: 'bc-mix-all' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: 'hi', p2pMode: 'audit', commandId: 'bc-mix-mode' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_purebc_brain', text: 'hi', p2pMode: 'audit', commandId: 'bc-pure-mode' }));
+    await flushAsync();
+
+    expect(daemon.sentJson.some((m) => m.type === 'session.restart' && m.project === 'app' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === 'session.restart' && m.project === 'app_v2')).toBe(false);
+    expect(daemon.sentJson.some((m) => m.type === 'session.input' && m.sessionName === 'deck_inflight_brain')).toBe(false);
+    expect(daemon.sentJson.some((m) => m.type === SESSION_GROUP_CLONE_MSG.START && m.sourceMainSessionName === 'deck_stopshclone_brain' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'bc-mix-all')).toBe(false);
+    expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'bc-mix-mode')).toBe(false);
+    expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'bc-pure-mode' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    for (const cmdId of ['bc-mix-all', 'bc-mix-mode']) {
+      expect(sock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === cmdId && m.reason === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN)).toBe(true);
+    }
+  });
 });

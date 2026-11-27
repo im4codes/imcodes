@@ -2,6 +2,7 @@ import { Hono, type Context } from 'hono';
 import { TRANSPORT_STOP_QUEUE_FIELDS } from '../../../shared/transport-queue-types.js';
 import type { Env } from '../env.js';
 import { getServerById, getDbSessionByName, getDbSessionsByServer, getSubSessionById, getSubSessionsByServer, getUserPref, setUserPref, upsertDbSession, deleteDbSession, updateSessionLabel, updateProjectName, updateSession, updateSubSession } from '../db/queries.js';
+import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
 import { requireAuth } from '../security/authorization.js';
 import type { ServerRole } from '../security/authorization.js';
 import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
@@ -61,6 +62,7 @@ import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
 import {
   SESSION_GROUP_CLONE_CAPABILITY_V1,
   SESSION_GROUP_CLONE_MSG,
+  isCloneableDirectChildState,
   mainSessionNameForProjectSlug,
   type SessionGroupCloneErrorCode,
 } from '../../../shared/session-group-clone.js';
@@ -193,21 +195,57 @@ sessionMgmtRoutes.get('/:id/sessions', async (c) => {
   return c.json({ sessions });
 });
 
+async function resolveDaemonOrAdminMemberPersistAccess(
+  c: Context<{ Bindings: Env; Variables: { userId: string; role: string } }>,
+  serverId: string,
+  userId: string,
+): Promise<{ ok: true } | { ok: false; status: 403; reason: ShareDenialReason | 'not_authorized_for_server' | 'forbidden'; isShare: boolean }> {
+  if (c.get('authServerId' as never)) return { ok: true };
+  const access = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId,
+    target: { kind: 'server', serverId },
+  });
+  if (access.actor.kind === 'share') {
+    return { ok: false, status: 403, reason: 'share-direct-surface-denied', isShare: true };
+  }
+  if (access.actor.kind !== 'server-member') {
+    return { ok: false, status: 403, reason: 'not_authorized_for_server', isShare: false };
+  }
+  if (access.membership !== 'owner' && access.membership !== 'admin') {
+    return { ok: false, status: 403, reason: 'forbidden', isShare: false };
+  }
+  return { ok: true };
+}
+
 /** PUT /api/server/:id/sessions/:name — upsert a session record (daemon → DB) */
 sessionMgmtRoutes.put('/:id/sessions/:name', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
-  const role = access.role;
-  if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
+  const persistAccess = await resolveDaemonOrAdminMemberPersistAccess(c, serverId, userId);
 
   let body: Record<string, unknown>;
   try {
     body = await c.req.json() as Record<string, string>;
   } catch {
+    if (!persistAccess.ok) {
+      return c.json(
+        persistAccess.reason === 'forbidden'
+          ? { error: 'forbidden' }
+          : { error: 'forbidden', reason: persistAccess.reason },
+        403,
+      );
+    }
     return c.json({ error: 'invalid_json' }, 400);
+  }
+  if (!persistAccess.ok) {
+    const shellBody = isShellLikeAgentType(body?.agentType) || isShellLikeAgentType(body?.sessionType);
+    const reason = persistAccess.isShare && shellBody ? PARTICIPANT_SHELL_FORBIDDEN_REASON : persistAccess.reason;
+    return c.json(
+      reason === 'forbidden' ? { error: 'forbidden' } : { error: 'forbidden', reason },
+      403,
+    );
   }
 
   const {
@@ -278,6 +316,14 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/label', async (c) => {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 
+  if (access.actor.kind === 'share') {
+    const liveType = await WsBridge.get(serverId).resolveSessionAgentType?.(sessionName);
+    const trustedType = liveType ?? await getTrustedAgentType(c.env.DB, serverId, target);
+    if (isShellLikeAgentType(trustedType)) {
+      return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
+    }
+  }
+
   let body: { label?: string | null };
   try {
     body = await c.req.json() as { label?: string | null };
@@ -287,11 +333,22 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/label', async (c) => {
 
   const label = typeof body.label === 'string' && body.label.trim() ? body.label.trim() : null;
   await updateSessionLabel(c.env.DB, serverId, sessionName, label);
+  const sharedActorNow = Date.now();
+  const sharedActor = access.actor.kind === 'share' && access.actor.coverage
+    ? await buildHttpSharedActor(c.env.DB, {
+        userId,
+        coverage: access.actor.coverage,
+        actionId: `session-label-${sharedActorNow}`,
+        now: sharedActorNow,
+        origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
+      })
+    : null;
   try {
     WsBridge.get(serverId).sendToDaemon(JSON.stringify({
       type: 'session.relabel',
       sessionName,
       label,
+      ...(sharedActor ? { sharedActor } : {}),
     }));
   } catch (err) {
     logger.warn({ serverId, sessionName, err }, 'WsBridge session relabel relay failed');
@@ -844,6 +901,14 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/rename', async (c) => {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 
+  if (access.actor.kind === 'share') {
+    const liveType = await WsBridge.get(serverId).resolveSessionAgentType?.(sessionName);
+    const trustedType = liveType ?? await getTrustedAgentType(c.env.DB, serverId, target);
+    if (isShellLikeAgentType(trustedType)) {
+      return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
+    }
+  }
+
   let body: { name?: string };
   try {
     body = await c.req.json() as { name?: string };
@@ -855,11 +920,22 @@ sessionMgmtRoutes.patch('/:id/sessions/:name/rename', async (c) => {
   if (!newName) return c.json({ error: 'name_required' }, 400);
 
   await updateProjectName(c.env.DB, serverId, sessionName, newName);
+  const sharedActorNow = Date.now();
+  const sharedActor = access.actor.kind === 'share' && access.actor.coverage
+    ? await buildHttpSharedActor(c.env.DB, {
+        userId,
+        coverage: access.actor.coverage,
+        actionId: `session-rename-${sharedActorNow}`,
+        now: sharedActorNow,
+        origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
+      })
+    : null;
   try {
     WsBridge.get(serverId).sendToDaemon(JSON.stringify({
       type: 'session.rename',
       sessionName,
       projectName: newName,
+      ...(sharedActor ? { sharedActor } : {}),
     }));
   } catch (err) {
     logger.warn({ serverId, sessionName, err }, 'WsBridge session rename relay failed');
@@ -872,10 +948,15 @@ sessionMgmtRoutes.delete('/:id/sessions/:name', async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id')!;
   const sessionName = c.req.param('name')!;
-  const access = await resolveServerMemberAccessOrShareDeny(c.env.DB, { serverId, userId });
-  if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
-  const role = access.role;
-  if (role !== 'owner' && role !== 'admin') return c.json({ error: 'forbidden' }, 403);
+  const persistAccess = await resolveDaemonOrAdminMemberPersistAccess(c, serverId, userId);
+  if (!persistAccess.ok) {
+    return c.json(
+      persistAccess.reason === 'forbidden'
+        ? { error: 'forbidden' }
+        : { error: 'forbidden', reason: persistAccess.reason },
+      403,
+    );
+  }
 
   await deleteDbSession(c.env.DB, serverId, sessionName);
   WsBridge.get(serverId).invalidateSessionAgentTypeCache?.(sessionName);
@@ -1055,9 +1136,13 @@ sessionMgmtRoutes.post('/:id/sessions/:rootSession/group-clone', async (c) => {
     const dbSubSessions = await getSubSessionsByServer(c.env.DB, serverId);
     const childShellForbidden = await (async () => {
       for (const sub of dbSubSessions) {
-        if (sub.parent_session !== sourceMainSessionName || sub.closed_at !== null) continue;
+        if (sub.parent_session !== sourceMainSessionName || sub.closed_at !== null || isCloneRowExecutionClone(sub)) continue;
         const subName = `deck_sub_${sub.id}`;
-        const liveType = await bridge.resolveSessionAgentType?.(subName);
+        const liveSnapshot = bridge.getLiveSubSessionCloneState?.(subName);
+        if (liveSnapshot?.known && !isCloneableDirectChildState(liveSnapshot.state)) continue;
+        const liveType = liveSnapshot?.known && liveSnapshot.agentType
+          ? liveSnapshot.agentType
+          : await bridge.resolveSessionAgentType?.(subName);
         if (isShellLikeAgentType(sub.type) || isShellLikeAgentType(liveType)) return true;
       }
       return false;
@@ -1317,6 +1402,7 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         msg: body,
         resolveAgentType: async (name) => (await bridge.resolveSessionAgentType?.(name))
           ?? (await getTrustedAgentType(c.env.DB, serverId, shareTargetFromSessionName(serverId, name) ?? { kind: 'server', serverId })),
+        resolveExpandedSessions: async () => resolveHttpP2pDomainSessionNames(c.env.DB, serverId, bridge, targetSessionName!),
       });
       if (p2pShellReason) {
         await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: p2pShellReason, actionId, now });
@@ -1439,6 +1525,21 @@ async function getTrustedRuntimeType(db: Env['DB'], serverId: string, target: Sh
   return normalizeTrustedRuntimeType(row?.runtime_type ?? null);
 }
 
+function isCloneRowExecutionClone(row: { execution_clone_metadata?: Record<string, unknown> | string | null }): boolean {
+  const raw = row.execution_clone_metadata;
+  if (raw == null) return false;
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      return Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        && (parsed as { kind?: unknown }).kind === EXECUTION_CLONE_KIND);
+    } catch {
+      return false;
+    }
+  }
+  return typeof raw === 'object' && !Array.isArray(raw) && raw.kind === EXECUTION_CLONE_KIND;
+}
+
 async function getTrustedAgentType(db: Env['DB'], serverId: string, target: ShareTarget): Promise<string | null> {
   if (target.kind === 'server') return null;
   if (target.kind === 'subsession') {
@@ -1447,6 +1548,57 @@ async function getTrustedAgentType(db: Env['DB'], serverId: string, target: Shar
   }
   const session = await getDbSessionByName(db, serverId, target.sessionName);
   return typeof session?.agent_type === 'string' ? session.agent_type : null;
+}
+
+async function resolveHttpP2pDomainSessionNames(
+  db: Env['DB'],
+  serverId: string,
+  bridge: Pick<WsBridge, 'resolveP2pDomainSessionNames' | 'getLiveSubSessionCloneState'>,
+  initiatorSession: string,
+): Promise<string[]> {
+  const names = new Set<string>([initiatorSession]);
+  if (typeof bridge.resolveP2pDomainSessionNames === 'function') {
+    for (const name of await bridge.resolveP2pDomainSessionNames(initiatorSession)) {
+      names.add(name);
+    }
+  }
+  const dbSessions = await getDbSessionsByServer(db, serverId);
+  const dbSubs = await getSubSessionsByServer(db, serverId);
+  if (initiatorSession.startsWith('deck_sub_')) {
+    const initSubId = initiatorSession.slice('deck_sub_'.length);
+    const initSub = dbSubs.find((sub) => sub.id === initSubId);
+    const scopeMain = initSub?.parent_session ?? null;
+    if (scopeMain) {
+      const mainRow = dbSessions.find((session) => session.name === scopeMain);
+      if (!mainRow || mainRow.state !== 'stopped') names.add(scopeMain);
+      for (const sub of dbSubs) {
+        if (sub.parent_session !== scopeMain || sub.closed_at !== null) continue;
+        const subName = `deck_sub_${sub.id}`;
+        const liveState = bridge.getLiveSubSessionCloneState?.(subName);
+        if (liveState?.known && liveState.state === 'stopped') continue;
+        names.add(subName);
+      }
+    }
+  } else {
+    const initMain = dbSessions.find((session) => session.name === initiatorSession);
+    const projectSlug = initMain?.project_name ? sanitizeProjectName(initMain.project_name) : null;
+    for (const sub of dbSubs) {
+      if (sub.parent_session !== initiatorSession || sub.closed_at !== null) continue;
+      const subName = `deck_sub_${sub.id}`;
+      const liveState = bridge.getLiveSubSessionCloneState?.(subName);
+      if (liveState?.known && liveState.state === 'stopped') continue;
+      names.add(subName);
+    }
+    if (initMain?.project_name) {
+      for (const session of dbSessions) {
+        if (session.name.startsWith('deck_sub_') || session.state === 'stopped') continue;
+        const matchesProject = session.project_name === initMain.project_name
+          || (projectSlug ? sanitizeProjectName(session.project_name) === projectSlug : false);
+        if (matchesProject) names.add(session.name);
+      }
+    }
+  }
+  return [...names];
 }
 
 function normalizeTrustedRuntimeType(value: string | null): TrustedRuntimeType {

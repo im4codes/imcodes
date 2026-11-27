@@ -484,3 +484,8 @@ export function cloneP2pConfigWithSessionRemap(
   config.updatedAt = now;
   return { config, warnings, remappedPaths };
 }
+
+/** Direct sub-session states actually included when cloning a session group. */
+export function isCloneableDirectChildState(state: string | null | undefined): boolean {
+  return state === 'running' || state === 'idle';
+}

@@ -188,7 +188,7 @@ import {
   hasTransportPendingSyncSnapshot,
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
-import { canSharedActorControlSession, canSharedActorManageServer, formatSharedActorLabel } from '../tab-sharing-ui.js';
+import { canSharedActorControlSession, canSharedActorManageServer, formatSharedActorLabel, hasShareRestrictedCloneShellMember } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
   buildP2pConfigSelection,
@@ -233,7 +233,6 @@ import { SESSION_MODEL_COMMAND, shouldHideOptimisticUserMessageForSessionControl
 import { resizeHandleHoverEvents } from './window-resize.js';
 import type { SharedActorEnvelope } from '@shared/tab-sharing.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
-import { isShellLikeAgentType } from '@shared/agent-types.js';
 import {
   CODEBUDDY_CHINA_MODEL_FALLBACK,
   CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
@@ -3680,16 +3679,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [activeSession?.agentType, activeSession?.qwenModel, qwenModel]);
 
   const hasSession = !!activeSession;
-  const hasParticipantForbiddenCloneMember = isShareScopedSession && (
-    isShellSession
-    || (subSessions ?? []).some((s) => (
-      s.parentSession === activeSession?.name
-      && !isExecutionCloneTemplateLike(s)
-      && s.state !== 'stopped'
-      && s.state !== 'error'
-      && (isShellLikeAgentType(s.type) || isShellLikeAgentType(s.agentType))
-    ))
-  );
+  const hasParticipantForbiddenCloneMember = isShareScopedSession
+    && !!activeSession
+    && hasShareRestrictedCloneShellMember({ sourceSession: activeSession, subSessions });
   const canShowCloneGroupAction = !!activeSession
     && !subSessionId
     && !compact

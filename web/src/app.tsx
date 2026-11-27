@@ -293,7 +293,7 @@ import {
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
 import { hasPinnedPanelServerProvenance, type PanelRenderContext } from './components/PinnedPanelRegistry.js';
-import { canSharedActorControlSession, isShareScopedState, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type ShareRole, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
+import { canSharedActorControlSession, hasShareRestrictedCloneShellMember, isShareScopedState, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type ShareRole, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
 import {
   clearSharedTabRestoreMarker,
   findRememberedSharedEntry,
@@ -12008,6 +12008,9 @@ function InternalMainApp() {
                   && canSessionRoleOwnAutomaticSupervision(session.role),
               })}
               onCloneSession={(session) => setCloneSessionTarget(session)}
+              canCloneSession={(session) => (
+                (!selectedShareTarget || (isSharedServerParticipant && !hasShareRestrictedCloneShellMember({ sourceSession: session, subSessions })))
+              )}
               onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               renameRequest={renameRequest}
               onRenameHandled={() => setRenameRequest(null)}
@@ -13613,6 +13616,7 @@ function InternalMainApp() {
           sourceSession={sessions.find((session) => session.name === cloneSessionTarget.name) ?? cloneSessionTarget}
           sessions={sessions}
           subSessions={subSessions}
+          forbidShellAgentTypes={Boolean(selectedShareTarget)}
           onClose={() => setCloneSessionTarget(null)}
         />
       )}

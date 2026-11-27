@@ -103,11 +103,21 @@ export function evaluateP2pSendTargetScope(params: {
 export async function evaluateParticipantP2pShellRestriction(params: {
   msg: Record<string, unknown>;
   resolveAgentType: (sessionName: string) => Promise<string | null>;
+  resolveExpandedSessions?: () => Promise<string[]>;
 }): Promise<typeof PARTICIPANT_SHELL_FORBIDDEN_REASON | null> {
   const routed = extractAllP2pRoutedSessionNames(params.msg);
   if (!routed.hasP2pRouting) return null;
 
-  for (const sessionName of routed.sessions) {
+  const candidates = new Set<string>(routed.sessions);
+  if (routed.hasUnboundedExpansion && params.resolveExpandedSessions) {
+    for (const expanded of await params.resolveExpandedSessions()) {
+      if (typeof expanded === 'string' && expanded.trim()) {
+        candidates.add(expanded.trim());
+      }
+    }
+  }
+
+  for (const sessionName of candidates) {
     const agentType = await params.resolveAgentType(sessionName);
     if (isShellLikeAgentType(agentType)) return PARTICIPANT_SHELL_FORBIDDEN_REASON;
   }

@@ -18,6 +18,7 @@ const mockGetDbSessionsByServer = vi.fn(async () => []);
 const mockGetDbSessionByName = vi.fn(async () => null);
 const mockGetSubSessionsByServer = vi.fn(async () => []);
 const mockResolveSessionAgentType = vi.fn(async () => null);
+const mockGetLiveSubSessionCloneState = vi.fn(() => ({ known: false }));
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -59,6 +60,7 @@ vi.mock('../src/ws/bridge.js', () => ({
       registerSessionGroupCloneOperationContext: mockRegisterCloneContext,
       getSessionGroupCloneOperationEvent: mockGetCloneOperationEvent,
       resolveSessionAgentType: mockResolveSessionAgentType,
+      getLiveSubSessionCloneState: mockGetLiveSubSessionCloneState,
     }),
   },
 }));
@@ -438,6 +440,26 @@ describe('session group clone routes', () => {
         sourceMainSessionName: 'deck_cd_brain',
         sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
       });
+
+      // 3b) Stopped shell child + execution clone shell child ignored on pure-LLM group -> 200
+      mockSendToDaemon.mockClear();
+      mockGetLiveSubSessionCloneState.mockImplementation((name: string) => (
+        name === 'deck_sub_shstop'
+          ? { known: true, state: 'stopped', agentType: 'shell' }
+          : { known: false }
+      ));
+      mockGetSubSessionsByServer.mockResolvedValue([
+        { id: 'shstop', parent_session: 'deck_cd_brain', type: 'shell', closed_at: null },
+        { id: 'execsh', parent_session: 'deck_cd_brain', type: 'shell', closed_at: null, execution_clone_metadata: { kind: 'execution_clone' } },
+        { id: 'llm1', parent_session: 'deck_cd_brain', type: 'codex-sdk', closed_at: null },
+      ] as never);
+      const stoppedShellIgnoredRes = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idempotencyKey: 'idem-stopped-shell-ok' }),
+      });
+      expect(stoppedShellIgnoredRes.status).toBe(200);
+      mockGetLiveSubSessionCloneState.mockReturnValue({ known: false });
 
       // 4) Real owner cloning mixed/shell group -> 200 without sharedActor
       mockSendToDaemon.mockClear();

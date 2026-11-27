@@ -6516,6 +6516,27 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   try {
     await sendProcessSessionMessage(sessionName, finalText, attachments, {
       onTyped: () => authorityBinding.current?.typed(),
+      ...(sharedActor?.effectiveActorRole === 'participant' ? {
+        beforeTyping: () => {
+          const currentType = getSession(sessionName)?.agentType;
+          if (isShellLikeAgentType(currentType)) {
+            logger.warn({ sessionName, commandId: effectiveId, agentType: currentType }, 'session.send rejected inside mutex: participant_shell_forbidden');
+            timelineEmitter.emit(sessionName, 'command.ack', {
+              commandId: effectiveId,
+              status: 'error',
+              error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+            });
+            emitCommandAckReliable(serverLink, {
+              commandId: effectiveId,
+              sessionName,
+              status: 'error',
+              error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+            });
+            return false;
+          }
+          return true;
+        },
+      } : {}),
       originalText: displayText,
       ...((attachmentRetentionPreamble && !isVerbatimRequested) ? { agentMessagePreamble: attachmentRetentionPreamble } : {}),
       commandId: effectiveId,
@@ -6571,6 +6592,8 @@ async function sendProcessSessionMessage(
     onTyped?: () => void;
     /** Rechecked after async recall and the delivery lock, before any terminal typing. */
     beforeTyping?: () => boolean;
+    /** Invoked if a queued automation turn aborts in beforeTyping during async drain. */
+    onAborted?: () => void;
     originalText?: string;
     commandId?: string;
     isLegacy?: boolean;
@@ -6599,7 +6622,7 @@ async function sendProcessSessionMessage(
       sharedActor?: SharedActorEnvelope;
     }>;
   },
-): Promise<void> {
+): Promise<boolean> {
   // ── Step 1: Confirm receipt to the user IMMEDIATELY ─────────────────────────
   // This is the daemon-receipt confirmation. It happens BEFORE the mutex,
   // BEFORE memory recall, BEFORE any tmux work — so the spinner clears in one
@@ -6670,8 +6693,30 @@ async function sendProcessSessionMessage(
   await deliveryTurn.waitForTurn();
   const release = await getMutex(sessionName).acquire();
   try {
-    if (options?.beforeTyping && !options.beforeTyping()) { rollbackSummarySyncReservation(memoryContext.summaryReservation); return; }
-    await sendShellAwareCommand(sessionName, sendText, agentType, isVerbatim);
+    const liveAgentType = getSession(sessionName)?.agentType ?? agentType;
+    const liveIsVerbatim = Boolean(options?.verbatim || isShellLikeAgentType(liveAgentType));
+    if (options?.beforeTyping && !options.beforeTyping()) {
+      rollbackSummarySyncReservation(memoryContext.summaryReservation);
+      return false;
+    }
+    if (isParticipantSharedActorEnvelope(options?.userMessageMetadata?.sharedActor) && isShellLikeAgentType(liveAgentType)) {
+      rollbackSummarySyncReservation(memoryContext.summaryReservation);
+      if (options?.commandId) {
+        timelineEmitter.emit(sessionName, 'command.ack', {
+          commandId: options.commandId,
+          status: 'error',
+          error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+        });
+        emitCommandAckReliable(options.serverLink, {
+          commandId: options.commandId,
+          sessionName,
+          status: 'error',
+          error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+        });
+      }
+      return false;
+    }
+    await sendShellAwareCommand(sessionName, sendText, liveAgentType, liveIsVerbatim);
     options?.onTyped?.();
   } catch (sendErr) {
     rollbackSummarySyncReservation(memoryContext.summaryReservation);
@@ -6698,6 +6743,7 @@ async function sendProcessSessionMessage(
       getContextStoreClient().fireAndForget('recordMemoryHits', [memoryContext.hitIds]);
     }
   }
+  return true;
 
   if (agentType === 'opencode') {
     const { scheduleCatchup } = await import('./opencode-watcher.js');
@@ -6751,6 +6797,7 @@ export async function drainProcessAutomationQueue(sessionName: string): Promise<
     while (queue.length > 0) {
       const next = queue.shift()!;
       if (next.options?.beforeTyping && !next.options.beforeTyping()) {
+        next.options.onAborted?.();
         continue;
       }
       await sendProcessSessionMessage(sessionName, next.text, [], next.options);
@@ -6788,6 +6835,8 @@ export async function sendProcessSessionMessageForAutomation(
     onTyped?: () => void;
     /** Rechecked after async recall and the delivery lock, before any terminal typing. */
     beforeTyping?: () => boolean;
+    /** Invoked if a queued automation turn aborts in beforeTyping during async drain. */
+    onAborted?: () => void;
     userMessageMetadata?: Readonly<{
       allowDuplicate?: boolean;
       memoryExcluded?: boolean;
@@ -6801,13 +6850,14 @@ export async function sendProcessSessionMessageForAutomation(
       sharedActor?: SharedActorEnvelope;
     }>;
   },
-): Promise<'sent' | 'queued'> {
+): Promise<'sent' | 'queued' | 'aborted'> {
   const sendOpts: Parameters<typeof sendProcessSessionMessage>[3] = {
     originalText: text,
     ...(options?.verbatim ? { verbatim: true } : {}),
     ...(options?.suppressTimeline ? { suppressTimeline: true } : {}),
     ...(options?.onTyped ? { onTyped: options.onTyped } : {}),
     ...(options?.beforeTyping ? { beforeTyping: options.beforeTyping } : {}),
+    ...(options?.onAborted ? { onAborted: options.onAborted } : {}),
     ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
   };
 
@@ -6832,8 +6882,8 @@ export async function sendProcessSessionMessageForAutomation(
     }
   }
 
-  await sendProcessSessionMessage(sessionName, text, [], sendOpts);
-  return 'sent';
+  const delivered = await sendProcessSessionMessage(sessionName, text, [], sendOpts);
+  return delivered ? 'sent' : 'aborted';
 }
 
 async function resolveProcessRecallQueryContext(
@@ -7510,6 +7560,19 @@ async function handleInputBound(cmd: Record<string, unknown>, serverLink: Server
   } catch (err) {
     logger.error({ sessionName, err }, 'session.input failed');
     const record = getSession(sessionName);
+    if (isParticipantSharedActor(cmd) && isShellLikeAgentType(record?.agentType)) {
+      logger.warn({ sessionName, agentType: record?.agentType }, 'session.input recovery blocked: participant_shell_forbidden');
+      try {
+        serverLink.send({
+          type: 'session.error',
+          project: record?.projectName ?? sessionName,
+          session: sessionName,
+          sessionName,
+          message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
     const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
     const tmuxGone = record?.agentType === 'shell'
       && (message.includes('no server running')

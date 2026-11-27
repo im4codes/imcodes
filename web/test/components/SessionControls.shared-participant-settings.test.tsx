@@ -499,6 +499,24 @@ describe('SessionControls shared participant settings entry points', () => {
     expect(within(mixedMenu).queryByRole('button', { name: 'menu' })).toBeNull();
     mixedView.unmount();
 
+    const stoppedShellView = render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={serverParticipant}
+        subSessions={[
+          { sessionName: 'deck_sub_shstop', type: 'shell', state: 'stopped', parentSession: 'deck_proj_brain' },
+          { sessionName: 'deck_sub_llm1', type: 'codex-sdk', state: 'running', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={quickData}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    const stoppedShellMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(within(stoppedShellMenu).getByRole('button', { name: 'menu' })).toBeDefined();
+    stoppedShellView.unmount();
+
     const llmView = render(
       <SessionControls
         ws={makeWs() as never}

@@ -13,6 +13,7 @@ import {
   SessionGroupCloneValidationError,
   cloneP2pConfigWithSessionRemap,
   defaultCloneTargetProjectName,
+  isCloneableDirectChildState,
   isRoleCompatibleMainSession,
   resolveCloneTargetProject,
   type CloneableMainSessionSpec,
@@ -230,7 +231,7 @@ async function resolveCloneableSubSessionCwd(
 function isActiveDirectChild(record: SessionRecord, sourceMainSessionName: string): boolean {
   return record.parentSession === sourceMainSessionName
     && !isHiddenSession(record)
-    && (record.state === 'running' || record.state === 'idle');
+    && isCloneableDirectChildState(record.state);
 }
 
 function skippedMembersForVisibleNonCandidates(sourceMainSessionName: string): SessionGroupCloneSkippedMember[] {
