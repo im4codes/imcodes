@@ -372,50 +372,52 @@ export function useTransportModels(
       return;
     }
 
-    const unsub = ws.onMessage((msg) => {
-      if (currentCatalogIdentity.current !== catalogIdentity) return;
-      const raw = msg as unknown as Record<string, unknown>;
-      if (raw.type === DAEMON_MSG.RECONNECTED) {
-        fetchModels(false);
-        return;
-      }
-      if (raw.type !== TRANSPORT_MSG.MODELS_RESPONSE) return;
-      if (typeof raw.sessionName === 'string' && raw.sessionName !== (sessionName?.trim() ?? '')) return;
-      const replyAgent = raw.agentType;
-      if (replyAgent !== agentType) return;
-      const replyPreset = typeof raw.ccPreset === 'string'
-        ? raw.ccPreset.trim().toLowerCase()
-        : '';
-      if (replyPreset !== (ccPreset?.trim().toLowerCase() ?? '')) return;
-      // Accept both single-cast (requestId-matched) and broadcast replies.
-      const replyId = typeof raw.requestId === 'string' ? raw.requestId : undefined;
-      if (replyId && latestRequestId.current && replyId !== latestRequestId.current) return;
-      acceptedReplySequence.current += 1;
-      const catalog = normalizeCatalog({
-        models: validTransportModels(raw.models),
-        ...(typeof raw.defaultModel === 'string' ? { defaultModel: raw.defaultModel } : {}),
-        ...(typeof raw.isAuthenticated === 'boolean' ? { isAuthenticated: raw.isAuthenticated } : {}),
-      }, agentType);
-      if (catalog) writeCachedTransportModels(catalogIdentity, agentType, catalog, scope);
-      setStateEntry((prev) => {
-        const base = prev.identity === catalogIdentity
-          ? prev.state
-          : buildInitialModelState(catalogIdentity, agentType, scope);
-        return {
-          identity: catalogIdentity,
-          state: {
-            ...(catalog ?? base),
-            error: undefined,
-            ...(!catalog && typeof raw.defaultModel === 'string' ? { defaultModel: raw.defaultModel } : {}),
-            ...(typeof raw.isAuthenticated === 'boolean'
-              ? { isAuthenticated: raw.isAuthenticated }
-              : {}),
-            ...(typeof raw.error === 'string' ? { error: raw.error } : {}),
-            loading: false,
-          },
-        };
-      });
-    });
+    const unsub = typeof ws.onMessage === 'function'
+      ? ws.onMessage((msg) => {
+          if (currentCatalogIdentity.current !== catalogIdentity) return;
+          const raw = msg as unknown as Record<string, unknown>;
+          if (raw.type === DAEMON_MSG.RECONNECTED) {
+            fetchModels(false);
+            return;
+          }
+          if (raw.type !== TRANSPORT_MSG.MODELS_RESPONSE) return;
+          if (typeof raw.sessionName === 'string' && raw.sessionName !== (sessionName?.trim() ?? '')) return;
+          const replyAgent = raw.agentType;
+          if (replyAgent !== agentType) return;
+          const replyPreset = typeof raw.ccPreset === 'string'
+            ? raw.ccPreset.trim().toLowerCase()
+            : '';
+          if (replyPreset !== (ccPreset?.trim().toLowerCase() ?? '')) return;
+          // Accept both single-cast (requestId-matched) and broadcast replies.
+          const replyId = typeof raw.requestId === 'string' ? raw.requestId : undefined;
+          if (replyId && latestRequestId.current && replyId !== latestRequestId.current) return;
+          acceptedReplySequence.current += 1;
+          const catalog = normalizeCatalog({
+            models: validTransportModels(raw.models),
+            ...(typeof raw.defaultModel === 'string' ? { defaultModel: raw.defaultModel } : {}),
+            ...(typeof raw.isAuthenticated === 'boolean' ? { isAuthenticated: raw.isAuthenticated } : {}),
+          }, agentType);
+          if (catalog) writeCachedTransportModels(catalogIdentity, agentType, catalog, scope);
+          setStateEntry((prev) => {
+            const base = prev.identity === catalogIdentity
+              ? prev.state
+              : buildInitialModelState(catalogIdentity, agentType, scope);
+            return {
+              identity: catalogIdentity,
+              state: {
+                ...(catalog ?? base),
+                error: undefined,
+                ...(!catalog && typeof raw.defaultModel === 'string' ? { defaultModel: raw.defaultModel } : {}),
+                ...(typeof raw.isAuthenticated === 'boolean'
+                  ? { isAuthenticated: raw.isAuthenticated }
+                  : {}),
+                ...(typeof raw.error === 'string' ? { error: raw.error } : {}),
+                loading: false,
+              },
+            };
+          });
+        })
+      : undefined;
 
     // Grok, Hermes, Antigravity, and OpenCode require a live provider catalog
     // check on load: their models depend on the local binary/auth state and
@@ -430,7 +432,9 @@ export function useTransportModels(
       || agentType === AGY_SDK_PROVIDER_ID
       || agentType === 'opencode-sdk',
     );
-    return unsub;
+    return () => {
+      unsub?.();
+    };
   }, [ws, wsConnected, agentType, ccPreset, catalogIdentity, scope, fetchModels]);
 
   return {

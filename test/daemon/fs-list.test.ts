@@ -55,11 +55,12 @@ import { timelineStore } from '../../src/daemon/timeline-store.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 
 // Helper: make a Dirent-like object
-function makeDirent(name: string, isDir: boolean) {
+function makeDirent(name: string, isDir: boolean, isSymbolicLink = false) {
   return {
     name,
     isDirectory: () => isDir,
-    isFile: () => !isDir,
+    isFile: () => !isDir && !isSymbolicLink,
+    isSymbolicLink: () => isSymbolicLink,
   } as unknown as fsp.Dirent<string>;
 }
 
@@ -1141,6 +1142,67 @@ describe('fs.ls handler', () => {
       checked: 0,
       unchecked: 0,
     });
+  });
+
+  it('isolates includeSymlinkNames in cache keys and excludes symlink names from default/scoped fs.ls', async () => {
+    const projectsDir = path.join(homedir(), 'symlink-isolated-projects');
+    mockRealpath.mockResolvedValue(projectsDir as unknown as string);
+    mockReaddir.mockResolvedValue([
+      makeDirent('real_proj', true),
+      makeDirent('wu_lun', false, true),
+    ] as unknown as fsp.Dirent<string>[]);
+
+    handleWebCommand({ type: 'fs.ls', path: projectsDir, requestId: 'req-plain-sym', includeFiles: true }, mockServerLink as any);
+    await flushAsync();
+    expect((sent[0] as any).entries.map((e: any) => e.name)).toEqual(['real_proj']);
+
+    handleWebCommand({
+      type: 'fs.ls',
+      path: projectsDir,
+      requestId: 'req-sym-names',
+      includeFiles: true,
+      includeSymlinkNames: true,
+    }, mockServerLink as any);
+    await flushAsync();
+    expect((sent[1] as any).entries.map((e: any) => e.name)).toEqual(['real_proj', 'wu_lun']);
+
+    // Plain fs.ls after includeSymlinkNames query still omits symlink entries
+    handleWebCommand({ type: 'fs.ls', path: projectsDir, requestId: 'req-plain-sym-2', includeFiles: true }, mockServerLink as any);
+    await flushAsync();
+    expect((sent[2] as any).entries.map((e: any) => e.name)).toEqual(['real_proj']);
+
+    // Shared-tab scoped request must ignore includeSymlinkNames
+    const getSessionSpy = vi.spyOn(sessionStore, 'getSession').mockReturnValue({
+      name: 'deck_tab_main',
+      projectName: 'proj',
+      role: 'brain',
+      agentType: 'codex',
+      state: 'idle',
+      projectDir: projectsDir,
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+    try {
+      handleWebCommand({
+        type: 'fs.ls',
+        sessionName: 'deck_tab_main',
+        path: projectsDir,
+        requestId: 'req-tab-sym-ignored',
+        includeFiles: true,
+        includeSymlinkNames: true,
+        sharedActor: {
+          actorUserId: 'viewer-1',
+          origin: 'shared-tab',
+          snapshot: { target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_tab_main' }, effectiveRole: 'viewer' },
+        },
+      }, mockServerLink as any);
+      await flushAsync();
+      expect((sent[3] as any).entries.map((e: any) => e.name)).toEqual(['real_proj']);
+    } finally {
+      getSessionSpy.mockRestore();
+    }
   });
 
   it('keeps non-preview fs.ls responsive while preview worker slots are blocked', async () => {

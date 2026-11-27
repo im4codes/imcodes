@@ -2112,6 +2112,35 @@ describe('WsClient', () => {
       vi.useRealTimers();
     });
 
+    it('forwards includeSymlinkNames and isolates its single-flight key from plain fs.ls', async () => {
+      vi.useFakeTimers();
+      const client = new WsClient('http://localhost:8787', 'srv-1');
+      client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      lastWs!.emit('open');
+      lastWs!.send.mockClear();
+
+      const plainId = client.fsListDir('~/.imcodes/projects', true, false);
+      const symId = client.fsListDir('~/.imcodes/projects', true, false, { includeSymlinkNames: true });
+      expect(symId).not.toBe(plainId);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      const lsCalls = lastWs!.send.mock.calls
+        .map(([raw]) => JSON.parse(String(raw)))
+        .filter((msg) => msg.type === 'fs.ls');
+      expect(lsCalls).toHaveLength(2);
+      expect(lsCalls[0].includeSymlinkNames).toBeUndefined();
+      expect(lsCalls[1]).toMatchObject({
+        type: 'fs.ls',
+        path: '~/.imcodes/projects',
+        includeFiles: true,
+        includeMetadata: false,
+        includeSymlinkNames: true,
+      });
+      client.disconnect();
+      vi.useRealTimers();
+    });
+
     it('returns a unique UUID as requestId', async () => {
       const client = await connectClient();
       const id1 = client.fsListDir('/home/user/a');

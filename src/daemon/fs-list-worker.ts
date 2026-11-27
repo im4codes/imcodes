@@ -57,9 +57,15 @@ export async function scanFsListSnapshot(input: {
   realPath: string;
   includeFiles: boolean;
   includeMetadata: boolean;
+  includeSymlinkNames?: boolean;
 }): Promise<{ resolvedPath: string; dirSignature: string; entries: FsListWorkerEntry[] }> {
   const dirents = await readdir(input.realPath, { withFileTypes: true });
-  const filtered = dirents.filter((d) => d.isDirectory() || (input.includeFiles && d.isFile()));
+  const includeSymlinkNames = input.includeSymlinkNames === true;
+  const filtered = dirents.filter((d) =>
+    d.isDirectory()
+    || (input.includeFiles && d.isFile())
+    || (includeSymlinkNames && typeof d.isSymbolicLink === 'function' && d.isSymbolicLink())
+  );
 
   const buildBasicEntry = (d: import('node:fs').Dirent): FsListWorkerEntry => ({
     name: d.name,
@@ -71,7 +77,7 @@ export async function scanFsListSnapshot(input: {
   const entries = input.includeMetadata
     ? await mapWithConcurrency(filtered, FS_LIST_METADATA_CONCURRENCY, async (d) => {
       const entry = buildBasicEntry(d);
-      if (!d.isDirectory()) {
+      if (d.isFile()) {
         try {
           const fileStat = await stat(entry.path);
           entry.size = fileStat.size;

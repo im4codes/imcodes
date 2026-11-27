@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { scanFsListSnapshot } from '../../src/daemon/fs-list-worker.js';
@@ -48,5 +48,39 @@ describe('fs list worker', () => {
     });
 
     expect(result.entries.map((entry) => entry.name)).toEqual(['src']);
+  });
+
+  it('includes symlink entry names only when includeSymlinkNames is true without reading symlink targets', async () => {
+    tempDir = mkdtempSync(join(tmpdir(), 'imcodes-fs-list-worker-sym-'));
+    const projectsDir = join(tempDir, 'projects');
+    const outsideTarget = join(tempDir, 'external-dir');
+    mkdirSync(projectsDir);
+    mkdirSync(outsideTarget);
+    mkdirSync(join(projectsDir, 'regular_dir'));
+    writeFileSync(join(outsideTarget, 'inside.txt'), 'secret');
+    symlinkSync(outsideTarget, join(projectsDir, 'wu_lun'));
+    symlinkSync(join(tempDir, 'missing-target'), join(projectsDir, 'dangling_link'));
+
+    const defaultResult = await scanFsListSnapshot({
+      realPath: projectsDir,
+      includeFiles: true,
+      includeMetadata: false,
+    });
+    expect(defaultResult.entries.map((entry) => entry.name)).toEqual(['regular_dir']);
+
+    const withSymlinks = await scanFsListSnapshot({
+      realPath: projectsDir,
+      includeFiles: true,
+      includeMetadata: true,
+      includeSymlinkNames: true,
+    });
+    expect(withSymlinks.entries.map((entry) => entry.name)).toEqual(['regular_dir', 'dangling_link', 'wu_lun']);
+    expect(withSymlinks.entries.find((entry) => entry.name === 'wu_lun')).toMatchObject({
+      name: 'wu_lun',
+      isDir: false,
+      hidden: false,
+    });
+    expect(withSymlinks.entries.find((entry) => entry.name === 'wu_lun')?.size).toBeUndefined();
+    expect(withSymlinks.entries.find((entry) => entry.name === 'wu_lun')?.mime).toBeUndefined();
   });
 });

@@ -127,6 +127,8 @@ export interface P2pWorkflowRequestScope {
 
 export interface FsListDirOptions {
   includeOpenSpecTaskStats?: boolean;
+  /** Include direct symlink entry names without resolving targets (used to detect occupied project dirs). */
+  includeSymlinkNames?: boolean;
   /** Session whose project directory scopes this request. */
   sessionName?: string;
   /**
@@ -2044,7 +2046,15 @@ export class WsClient {
 
   /** Request a directory listing from the daemon. Returns the requestId for matching the response. */
   fsListDir(path: string, includeFiles = false, includeMetadata = false, options?: FsListDirOptions): string {
-    const key = JSON.stringify(['fs.ls', path, includeFiles, includeMetadata, options?.includeOpenSpecTaskStats === true, options?.sessionName ?? '']);
+    const key = JSON.stringify([
+      'fs.ls',
+      path,
+      includeFiles,
+      includeMetadata,
+      options?.includeOpenSpecTaskStats === true,
+      options?.includeSymlinkNames === true,
+      options?.sessionName ?? '',
+    ]);
     return this.beginOwnedDataRequest(
       key,
       (requestId) => ({
@@ -2054,6 +2064,7 @@ export class WsClient {
         includeFiles,
         includeMetadata,
         ...(options?.includeOpenSpecTaskStats ? { includeOpenSpecTaskStats: true } : {}),
+        ...(options?.includeSymlinkNames ? { includeSymlinkNames: true } : {}),
         ...(options?.sessionName ? { sessionName: options.sessionName } : {}),
       }),
       (requestId) => ({

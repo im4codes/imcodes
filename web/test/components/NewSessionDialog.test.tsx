@@ -64,7 +64,7 @@ vi.mock('../../src/components/file-browser-lazy.js', () => ({
   ),
 }));
 
-import { NewSessionDialog } from '../../src/components/NewSessionDialog.js';
+import { NewSessionDialog, PROJECT_DIR_LIST_TIMEOUT_MS } from '../../src/components/NewSessionDialog.js';
 
 const makeWs = () => {
   const handlers = new Set<(msg: unknown) => void>();
@@ -1350,7 +1350,7 @@ describe('NewSessionDialog', () => {
     const dirInput = screen.getByPlaceholderText('~/.imcodes/projects/my-project') as HTMLInputElement;
 
     expect(ws.fsListDir).toHaveBeenCalledTimes(1);
-    expect(ws.fsListDir).toHaveBeenCalledWith('~/.imcodes/projects', true, false);
+    expect(ws.fsListDir).toHaveBeenCalledWith('~/.imcodes/projects', true, false, { includeSymlinkNames: true });
 
     // Before fs.ls_response arrives, default dir has no random suffix
     fireEvent.input(projectInput, { target: { value: '无论' } });
@@ -1366,13 +1366,13 @@ describe('NewSessionDialog', () => {
     }));
     expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
 
-    // Matching response with existing wu_lun and wu_lun_1 increments dir to wu_lun_2
+    // Matching response with existing wu_lun (including symlink name entry with isDir: false) and wu_lun_1 increments dir to wu_lun_2
     act(() => ws.emit({
       type: 'fs.ls_response',
       requestId: 'ls-req-1',
       status: 'ok',
       entries: [
-        { name: 'wu_lun', isDir: true },
+        { name: 'wu_lun', isDir: false },
         { name: 'wu_lun_1', isDir: true },
       ],
     }));
@@ -1409,6 +1409,186 @@ describe('NewSessionDialog', () => {
     const third = render(<NewSessionDialog ws={ws3 as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     third.unmount();
     expect(ws3.forgetOwnedDataRequest).toHaveBeenCalledWith('ls-req-3');
+  });
+
+  it('defers Enter/Click start on auto-dir while ~/.imcodes/projects query is pending, resolves collision/error/timeout cleanly, and does not delay manual dir', async () => {
+    // 1. Pressing Enter while listing is pending waits, then launches with deduplicated wu_lun_1
+    const wsEnter = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'req-enter'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    const rEnter = render(<NewSessionDialog ws={wsEnter as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: '无论' } });
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Enter' });
+    expect(wsEnter.sendSessionCommand).not.toHaveBeenCalled();
+
+    act(() => wsEnter.emit({
+      type: 'fs.ls_response',
+      requestId: 'req-enter',
+      status: 'ok',
+      entries: [{ name: 'wu_lun', isDir: false }],
+    }));
+    expect(wsEnter.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(wsEnter.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: '无论',
+      dir: '~/.imcodes/projects/wu_lun_1',
+    }));
+    rEnter.unmount();
+
+    // 2. Clicking Start while listing is pending waits; error response falls back to empty set (wu_lun)
+    const wsClickErr = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'req-err'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    const rErr = render(<NewSessionDialog ws={wsClickErr as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: '无论' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(wsClickErr.sendSessionCommand).not.toHaveBeenCalled();
+
+    act(() => wsClickErr.emit({
+      type: 'fs.ls_response',
+      requestId: 'req-err',
+      status: 'error',
+      error: 'forbidden_path',
+    }));
+    expect(wsClickErr.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(wsClickErr.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: '无论',
+      dir: '~/.imcodes/projects/wu_lun',
+    }));
+    rErr.unmount();
+
+    // 3. Bounded timeout releases ownedDataRequest and starts with base dir
+    vi.useFakeTimers();
+    try {
+      const wsTimeout = {
+        ...makeWs(),
+        fsListDir: vi.fn(() => 'req-timeout'),
+        forgetOwnedDataRequest: vi.fn(),
+      };
+      const rTimeout = render(<NewSessionDialog ws={wsTimeout as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+      fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: '无论' } });
+      fireEvent.click(screen.getByRole('button', { name: /start/i }));
+      expect(wsTimeout.sendSessionCommand).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(PROJECT_DIR_LIST_TIMEOUT_MS);
+      });
+      expect(wsTimeout.forgetOwnedDataRequest).toHaveBeenCalledWith('req-timeout');
+      expect(wsTimeout.sendSessionCommand).toHaveBeenCalledTimes(1);
+      expect(wsTimeout.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+        dir: '~/.imcodes/projects/wu_lun',
+      }));
+      rTimeout.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // 4. Manual dir starts immediately even while fsListDir query is still pending
+    const wsManual = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'req-manual'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    render(<NewSessionDialog ws={wsManual as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: '无论' } });
+    fireEvent.input(screen.getByPlaceholderText('~/.imcodes/projects/my-project'), { target: { value: '/manual/path' } });
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Enter' });
+    expect(wsManual.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(wsManual.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      dir: '/manual/path',
+    }));
+  });
+
+  it('invalidates previous node directory listing and auto-dir on ws switch, falls back on B error, ignores late A responses, and preserves manual dir', async () => {
+    const wsA = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'req-a'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    const wsB = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'req-b'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    const onClose = vi.fn();
+    const onSessionStarted = vi.fn();
+    const rendered = render(
+      <NewSessionDialog serverId="srv-a" ws={wsA as any} onClose={onClose} onSessionStarted={onSessionStarted} isProviderConnected={() => false} />,
+    );
+    const projectInput = screen.getByPlaceholderText('my-project') as HTMLInputElement;
+    const dirInput = screen.getByPlaceholderText('~/.imcodes/projects/my-project') as HTMLInputElement;
+
+    fireEvent.input(projectInput, { target: { value: '无论' } });
+    act(() => wsA.emit({
+      type: 'fs.ls_response',
+      requestId: 'req-a',
+      status: 'ok',
+      entries: [{ name: 'wu_lun', isDir: true }],
+    }));
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun_1');
+
+    // Switch ws from A to B while dialog stays mounted
+    rendered.rerender(
+      <NewSessionDialog serverId="srv-b" ws={wsB as any} onClose={onClose} onSessionStarted={onSessionStarted} isProviderConnected={() => false} />,
+    );
+    // Stale A suffix is invalidated immediately while B query is in flight
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
+
+    // Late message on A is completely ignored
+    act(() => wsA.emit({
+      type: 'fs.ls_response',
+      requestId: 'req-a',
+      status: 'ok',
+      entries: [{ name: 'wu_lun', isDir: true }, { name: 'wu_lun_1', isDir: true }],
+    }));
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
+
+    // B returns error -> empty set fallback, subsequent typing does NOT use A entries
+    act(() => wsB.emit({
+      type: 'fs.ls_response',
+      requestId: 'req-b',
+      status: 'error',
+      error: 'failed',
+    }));
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
+    fireEvent.input(projectInput, { target: { value: '其他' } });
+    fireEvent.input(projectInput, { target: { value: '无论' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
+
+    // Manual edit stays locked across node switch
+    const wsC = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'req-c'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    fireEvent.input(dirInput, { target: { value: '/custom/locked/path' } });
+    rendered.rerender(
+      <NewSessionDialog serverId="srv-c" ws={wsC as any} onClose={onClose} onSessionStarted={onSessionStarted} isProviderConnected={() => false} />,
+    );
+    expect(dirInput.value).toBe('/custom/locked/path');
+  });
+
+  it('mounts safely without throwing when ws mock lacks onMessage and still auto-populates default dir', async () => {
+    const partialWs = {
+      connected: true,
+      sendSessionCommand: vi.fn(),
+    };
+    render(<NewSessionDialog serverId="srv-partial" ws={partialWs as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const projectInput = screen.getByPlaceholderText('my-project') as HTMLInputElement;
+    const dirInput = screen.getByPlaceholderText('~/.imcodes/projects/my-project') as HTMLInputElement;
+
+    fireEvent.input(projectInput, { target: { value: '无论' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
+
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(partialWs.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: '无论',
+      dir: '~/.imcodes/projects/wu_lun',
+    }));
   });
 
   it('stops auto-updating dir once the user manually edits the dir input or picks via FileBrowser', async () => {

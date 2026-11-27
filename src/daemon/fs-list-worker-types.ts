@@ -26,6 +26,7 @@ export interface FsListBuildJobInput {
   realPath: string;
   includeFiles: boolean;
   includeMetadata: boolean;
+  includeSymlinkNames?: boolean;
 }
 
 export interface FsListWorkerRequest extends FsListBuildJobInput, FsListWorkerIdentity {}

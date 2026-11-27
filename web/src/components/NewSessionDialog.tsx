@@ -81,6 +81,8 @@ const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const MUSE_SDK_MODEL_FALLBACK = ["muse-spark-1.3", "muse-spark", "muse-wonder", "muse-fast", "wander"] as const;
 const AGY_SDK_MODEL_FALLBACK = [...AGY_MODEL_IDS] as const;
+export const PROJECT_DIR_LIST_TIMEOUT_MS = 3_000;
+const EMPTY_PROJECT_ENTRIES: string[] = [];
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
@@ -137,11 +139,31 @@ export function NewSessionDialog({
   const [project, setProject] = useState("");
   const [dir, setDir] = useState(DEFAULT_PROJECTS_DIR_PREFIX);
   const [dirManuallyEdited, setDirManuallyEdited] = useState(false);
-  const [existingProjectEntries, setExistingProjectEntries] = useState<string[]>([]);
+  const [projectDirListing, setProjectDirListing] = useState<{
+    ws: WsClient | null;
+    status: "ready" | "loading";
+    entries: string[];
+  }>({ ws: null, status: "ready", entries: [] });
+  const [awaitingDirQueryStart, setAwaitingDirQueryStart] = useState(false);
   const projectRef = useRef(project);
   projectRef.current = project;
+  const dirRef = useRef(dir);
+  dirRef.current = dir;
   const dirManuallyEditedRef = useRef(dirManuallyEdited);
   dirManuallyEditedRef.current = dirManuallyEdited;
+  const awaitingDirQueryStartRef = useRef(awaitingDirQueryStart);
+  awaitingDirQueryStartRef.current = awaitingDirQueryStart;
+  const startSessionWithDirRef = useRef<(resolvedDir: string) => void>(() => {});
+  const activeListingMatchesWs = projectDirListing.ws === ws;
+  const existingProjectEntries = activeListingMatchesWs ? projectDirListing.entries : [];
+  const canQueryProjectDirs = Boolean(
+    ws
+    && ws.connected
+    && typeof ws.fsListDir === "function"
+    && typeof ws.onMessage === "function",
+  );
+  const projectDirQueryPending = canQueryProjectDirs
+    && (!activeListingMatchesWs || projectDirListing.status === "loading");
   const [gitRemoteUrl, setGitRemoteUrl] = useState("");
   const [agentType, setAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
   const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
@@ -339,59 +361,61 @@ export function NewSessionDialog({
 
   useEffect(() => {
     if (!ws) return;
-    const unsub = ws.onMessage((msg) => {
-      if (msg.type === "subsession.shells") {
-        const list = msg.shells as string[];
-        setShells(list);
-        // Use saved preference only if daemon actually has that shell; otherwise pick first detected
-        const preferred = savedShellPref;
-        if (preferred && list.includes(preferred)) {
-          setShellBin(preferred);
-        } else {
-          setShellBin(list[0] ?? "");
-        }
-      }
-      if (msg.type === AGENT_AVAILABILITY_MSG.RESULT) {
-        if (typeof msg.checkedAt === "number" && msg.checkedAt < lastAvailabilityCheckedAtRef.current) {
-          return;
-        }
-        if (typeof msg.checkedAt === "number") {
-          lastAvailabilityCheckedAtRef.current = msg.checkedAt;
-        }
-        const nextMap = msg.agents ?? {};
-        setAgentAvailability(nextMap);
-        setDetectingAgents(false);
-      }
-      // Listen for CC presets response
-      if (msg.type === CC_PRESET_MSG.LIST_RESPONSE) {
-        setCcPresets((msg as any).presets ?? []);
-      }
-      if (msg.type === CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE) {
-        setDiscoveringPreset(false);
-        if (msg.preset) {
-          const presetKey = normalizeCcPresetName(msg.preset.name);
-          setCcPresets((current) => [
-            ...current.filter((preset) => normalizeCcPresetName(preset.name) !== presetKey),
-            msg.preset,
-          ].filter((preset): preset is CcPreset => preset !== undefined));
-          if (newPresetName.trim().toLowerCase() === msg.preset.name.trim().toLowerCase()) {
-            applyPresetDraft(createCcPresetDraftFromPreset(msg.preset));
+    const unsub = typeof ws.onMessage === "function"
+      ? ws.onMessage((msg) => {
+          if (msg.type === "subsession.shells") {
+            const list = msg.shells as string[];
+            setShells(list);
+            // Use saved preference only if daemon actually has that shell; otherwise pick first detected
+            const preferred = savedShellPref;
+            if (preferred && list.includes(preferred)) {
+              setShellBin(preferred);
+            } else {
+              setShellBin(list[0] ?? "");
+            }
           }
-          if (ccPreset === msg.preset.name || !ccPreset) setCcPreset(msg.preset.name);
-          const nextModel = getCcPresetEffectiveModel(msg.preset)
-            ?? getCcPresetAvailableModelIds(msg.preset)[0];
-          if (nextModel) setRequestedModel(nextModel);
-        }
-        setPresetError(msg.ok ? "" : (msg.error ?? "Failed to discover models"));
-      }
-      // Listen for openclaw remote session list response
-      const raw = msg as unknown as Record<string, unknown>;
-      if (raw["type"] === "openclaw.sessions_response") {
-        const sessions = raw["sessions"] as RemoteSession[] | undefined;
-        setOcRemoteSessions(sessions ?? []);
-        setOcLoadingSessions(false);
-      }
-    });
+          if (msg.type === AGENT_AVAILABILITY_MSG.RESULT) {
+            if (typeof msg.checkedAt === "number" && msg.checkedAt < lastAvailabilityCheckedAtRef.current) {
+              return;
+            }
+            if (typeof msg.checkedAt === "number") {
+              lastAvailabilityCheckedAtRef.current = msg.checkedAt;
+            }
+            const nextMap = msg.agents ?? {};
+            setAgentAvailability(nextMap);
+            setDetectingAgents(false);
+          }
+          // Listen for CC presets response
+          if (msg.type === CC_PRESET_MSG.LIST_RESPONSE) {
+            setCcPresets((msg as any).presets ?? []);
+          }
+          if (msg.type === CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE) {
+            setDiscoveringPreset(false);
+            if (msg.preset) {
+              const presetKey = normalizeCcPresetName(msg.preset.name);
+              setCcPresets((current) => [
+                ...current.filter((preset) => normalizeCcPresetName(preset.name) !== presetKey),
+                msg.preset,
+              ].filter((preset): preset is CcPreset => preset !== undefined));
+              if (newPresetName.trim().toLowerCase() === msg.preset.name.trim().toLowerCase()) {
+                applyPresetDraft(createCcPresetDraftFromPreset(msg.preset));
+              }
+              if (ccPreset === msg.preset.name || !ccPreset) setCcPreset(msg.preset.name);
+              const nextModel = getCcPresetEffectiveModel(msg.preset)
+                ?? getCcPresetAvailableModelIds(msg.preset)[0];
+              if (nextModel) setRequestedModel(nextModel);
+            }
+            setPresetError(msg.ok ? "" : (msg.error ?? "Failed to discover models"));
+          }
+          // Listen for openclaw remote session list response
+          const raw = msg as unknown as Record<string, unknown>;
+          if (raw["type"] === "openclaw.sessions_response") {
+            const sessions = raw["sessions"] as RemoteSession[] | undefined;
+            setOcRemoteSessions(sessions ?? []);
+            setOcLoadingSessions(false);
+          }
+        })
+      : undefined;
     ws.subSessionDetectShells?.();
     if (typeof ws.detectAgents === "function") {
       setDetectingAgents(true);
@@ -406,42 +430,111 @@ export function NewSessionDialog({
     } catch {
       /* ws may not support send in test */
     }
-    return unsub;
+    return () => {
+      unsub?.();
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ws]);
 
+  const wsConnected = Boolean(ws?.connected);
+
   useEffect(() => {
-    if (!ws || typeof ws.fsListDir !== "function" || typeof ws.onMessage !== "function") return;
+    awaitingDirQueryStartRef.current = false;
+    setAwaitingDirQueryStart(false);
+
+    if (!ws || !wsConnected || typeof ws.fsListDir !== "function" || typeof ws.onMessage !== "function") {
+      setProjectDirListing({ ws: ws ?? null, status: "ready", entries: EMPTY_PROJECT_ENTRIES });
+      if (!dirManuallyEditedRef.current) {
+        setDir(projectRef.current.trim() ? buildReadableProjectDir(projectRef.current, EMPTY_PROJECT_ENTRIES) : DEFAULT_PROJECTS_DIR_PREFIX);
+      }
+      return;
+    }
+
     let disposed = false;
+    let settled = false;
     let pendingRequestId: string | null = null;
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+
+    setProjectDirListing({ ws, status: "loading", entries: EMPTY_PROJECT_ENTRIES });
+    if (!dirManuallyEditedRef.current) {
+      setDir(projectRef.current.trim() ? buildReadableProjectDir(projectRef.current, EMPTY_PROJECT_ENTRIES) : DEFAULT_PROJECTS_DIR_PREFIX);
+    }
+
+    const settleListing = (names: string[]) => {
+      if (disposed || settled) return;
+      settled = true;
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      setProjectDirListing({ ws, status: "ready", entries: names });
+      const currentProject = projectRef.current;
+      const nextDir = !dirManuallyEditedRef.current && currentProject.trim()
+        ? buildReadableProjectDir(currentProject, names)
+        : dirRef.current;
+      if (!dirManuallyEditedRef.current && currentProject.trim()) {
+        setDir(nextDir);
+      }
+      if (awaitingDirQueryStartRef.current) {
+        awaitingDirQueryStartRef.current = false;
+        setAwaitingDirQueryStart(false);
+        startSessionWithDirRef.current(nextDir);
+      }
+    };
+
     const unsub = ws.onMessage((msg) => {
       if (disposed || msg.type !== "fs.ls_response") return;
       const lsMsg = msg as { requestId?: unknown; status?: unknown; entries?: Array<{ name?: unknown }> };
       if (!pendingRequestId || lsMsg.requestId !== pendingRequestId) return;
       pendingRequestId = null;
-      if (lsMsg.status !== "ok" || !Array.isArray(lsMsg.entries)) return;
+      if (lsMsg.status !== "ok" || !Array.isArray(lsMsg.entries)) {
+        settleListing(EMPTY_PROJECT_ENTRIES);
+        return;
+      }
       const names = lsMsg.entries
         .map((entry) => (typeof entry?.name === "string" ? entry.name.trim() : ""))
         .filter(Boolean);
-      setExistingProjectEntries(names);
-      if (!dirManuallyEditedRef.current && projectRef.current.trim()) {
-        setDir(buildReadableProjectDir(projectRef.current, names));
-      }
+      settleListing(names);
     });
-    try {
-      pendingRequestId = ws.fsListDir(DEFAULT_PROJECTS_DIR_PREFIX.replace(/\/+$/, ""), true, false);
-    } catch {
-      pendingRequestId = null;
-    }
-    return () => {
-      disposed = true;
+
+    timeoutId = setTimeout(() => {
+      if (disposed || settled) return;
       if (pendingRequestId) {
         ws.forgetOwnedDataRequest?.(pendingRequestId);
         pendingRequestId = null;
       }
-      unsub();
+      settleListing(EMPTY_PROJECT_ENTRIES);
+    }, PROJECT_DIR_LIST_TIMEOUT_MS);
+
+    try {
+      pendingRequestId = ws.fsListDir(
+        DEFAULT_PROJECTS_DIR_PREFIX.replace(/\/+$/, ""),
+        true,
+        false,
+        { includeSymlinkNames: true },
+      );
+    } catch {
+      pendingRequestId = null;
+      settleListing(EMPTY_PROJECT_ENTRIES);
+    }
+
+    return () => {
+      disposed = true;
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      if (pendingRequestId) {
+        ws.forgetOwnedDataRequest?.(pendingRequestId);
+        pendingRequestId = null;
+      }
+      if (awaitingDirQueryStartRef.current) {
+        awaitingDirQueryStartRef.current = false;
+        setAwaitingDirQueryStart(false);
+      }
+      unsub?.();
     };
-  }, [ws]);
+  }, [ws, wsConnected]);
 
   // Recover the refresh button cleanly when an older daemon never replies to session.detect_agents.
   useEffect(() => {
@@ -471,7 +564,13 @@ export function NewSessionDialog({
     if (agentType !== "openclaw" || ocMode !== "bind" || !ws) return;
     setOcLoadingSessions(true);
     setOcRemoteSessions([]);
-    ws.send({ type: "openclaw.list_sessions" });
+    if (typeof ws.send === "function") {
+      try {
+        ws.send({ type: "openclaw.list_sessions" });
+      } catch {
+        setOcLoadingSessions(false);
+      }
+    }
   }, [agentType, ocMode, ws]);
 
   // Auto-generate a session key when switching to openclaw new mode
@@ -486,7 +585,7 @@ export function NewSessionDialog({
   // Listen while the dialog is mounted. A fast daemon can emit "started"
   // before a starting-gated effect gets registered.
   useEffect(() => {
-    if (!ws) return;
+    if (!ws || typeof ws.onMessage !== "function") return;
     const finishStart = (sessionName: string) => {
       pendingStartRef.current = null;
       setError("");
@@ -599,7 +698,133 @@ export function NewSessionDialog({
     }
   };
 
+  const startSessionWithDir = (resolvedDir: string) => {
+    const trimmedProject = projectRef.current.trim();
+    const trimmedDir = resolvedDir.trim();
+    if (!trimmedProject) {
+      setError(t("new_session.project_required"));
+      return;
+    }
+    if (!trimmedDir) {
+      setError(t("new_session.dir_required"));
+      return;
+    }
+    if (!ws) {
+      setError(t("new_session.not_connected"));
+      return;
+    }
+    if (!ws.connected) {
+      setError(t("new_session.daemon_offline"));
+      return;
+    }
+    if (!isAgentInstalled(agentType)) {
+      setError(t("new_session.agent_not_installed"));
+      return;
+    }
+    if (incognito && (!canIncognito || !supportsSessionIncognito(agentType))) {
+      setError(t('session.incognito_unsupported'));
+      return;
+    }
+    if (!isAgentValidForFilters(agentType)) {
+      setError(t("new_session.agent_not_installed"));
+      return;
+    }
+    if (customProviderSdk && !ccPreset) {
+      setError(t("new_session.custom_provider_preset_required"));
+      setShowPresetEditor(true);
+      return;
+    }
+    const trimmedGitRemoteUrl = gitRemoteUrl.trim();
+    if (trimmedGitRemoteUrl && !canUseGitRemoteClone(ws)) {
+      setError(t("new_session.git_remote_capability_missing"));
+      return;
+    }
+
+    const slug = sanitizeProjectName(trimmedProject);
+    const identityPrompt = pendingSessionIdentity.trim()
+      ? normalizeSessionIdentityContent(pendingSessionIdentity)
+      : undefined;
+    pendingStartRef.current = {
+      project: slug,
+      sessionName: `deck_${slug}_brain`,
+    };
+    setError("");
+    setStarting(true);
+    if (shellBin)
+      void defaultShellPref.save(shellBin).catch(() => {});
+
+    if (agentType === "openclaw") {
+      const extra =
+        ocMode === "bind"
+          ? { ocMode: "bind", ocSessionId: ocSelectedSession }
+          : {
+              ocMode: "new",
+              ocSessionKey: ocSessionKey.trim(),
+              ocDescription: ocDescription.trim(),
+            };
+      ws.sendSessionCommand("start", {
+        ...(incognito ? { incognito: true } : {}),
+        project: trimmedProject,
+        dir: trimmedDir,
+        agentType,
+        ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
+        ...extra,
+        thinking,
+        ...(identityPrompt ? { identityPrompt } : {}),
+      });
+    } else {
+      const extra: Record<string, unknown> = {};
+      if (ccPreset && CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType))
+        extra.ccPreset = ccPreset;
+      if (ccInitPrompt.trim() && agentType === "claude-code")
+        extra.ccInitPrompt = ccInitPrompt.trim();
+      if (
+        (agentType === "claude-code-sdk"
+          || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE
+          || agentType === "codex-sdk"
+          || agentType === "copilot-sdk"
+          || agentType === "cursor-headless"
+          || agentType === "opencode-sdk"
+          || agentType === "grok-sdk"
+          || agentType === "kimi-sdk"
+          || agentType === "muse-code-sdk"
+          || agentType === HERMES_AGENT_PROVIDER_ID
+          || agentType === AGY_SDK_PROVIDER_ID
+          || agentType === "deepseek-harness"
+          || agentType === "pi"
+          || isCodeBuddyProviderId(agentType)
+          || agentType === "qwen") &&
+        requestedModel.trim()
+      ) {
+        extra.requestedModel = requestedModel.trim();
+        if (agentType === AGY_SDK_PROVIDER_ID) {
+          saveAgyModelPreference(requestedModel.trim());
+        }
+      }
+      ws.sendSessionCommand("start", {
+        ...(incognito ? { incognito: true } : {}),
+        project: trimmedProject,
+        dir: trimmedDir,
+        agentType,
+        ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
+        ...extra,
+        ...(identityPrompt ? { identityPrompt } : {}),
+        ...(agentType === "claude-code-sdk" ||
+        agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE ||
+        agentType === "codex-sdk" ||
+        agentType === "copilot-sdk" ||
+        agentType === "muse-code-sdk" ||
+        agentType === "pi" ||
+        agentType === "qwen"
+          ? { thinking }
+          : {}),
+      });
+    }
+  };
+  startSessionWithDirRef.current = startSessionWithDir;
+
   const handleStart = () => {
+    if (starting || awaitingDirQueryStartRef.current) return;
     if (!project.trim()) {
       setError(t("new_session.project_required"));
       return;
@@ -638,87 +863,13 @@ export function NewSessionDialog({
       setError(t("new_session.git_remote_capability_missing"));
       return;
     }
-
-    const slug = sanitizeProjectName(project.trim());
-    const identityPrompt = pendingSessionIdentity.trim()
-      ? normalizeSessionIdentityContent(pendingSessionIdentity)
-      : undefined;
-    pendingStartRef.current = {
-      project: slug,
-      sessionName: `deck_${slug}_brain`,
-    };
-    setError("");
-    setStarting(true);
-    if (shellBin)
-      void defaultShellPref.save(shellBin).catch(() => {});
-
-    if (agentType === "openclaw") {
-      const extra =
-        ocMode === "bind"
-          ? { ocMode: "bind", ocSessionId: ocSelectedSession }
-          : {
-              ocMode: "new",
-              ocSessionKey: ocSessionKey.trim(),
-              ocDescription: ocDescription.trim(),
-            };
-      ws.sendSessionCommand("start", {
-        ...(incognito ? { incognito: true } : {}),
-        project: project.trim(),
-        dir: dir.trim(),
-        agentType,
-        ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
-        ...extra,
-        thinking,
-        ...(identityPrompt ? { identityPrompt } : {}),
-      });
-    } else {
-      const extra: Record<string, unknown> = {};
-      if (ccPreset && CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType))
-        extra.ccPreset = ccPreset;
-      if (ccInitPrompt.trim() && agentType === "claude-code")
-        extra.ccInitPrompt = ccInitPrompt.trim();
-      if (
-        (agentType === "claude-code-sdk"
-          || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE
-          || agentType === "codex-sdk"
-          || agentType === "copilot-sdk"
-          || agentType === "cursor-headless"
-          || agentType === "opencode-sdk"
-          || agentType === "grok-sdk"
-          || agentType === "kimi-sdk"
-          || agentType === "muse-code-sdk"
-          || agentType === HERMES_AGENT_PROVIDER_ID
-          || agentType === AGY_SDK_PROVIDER_ID
-          || agentType === "deepseek-harness"
-          || agentType === "pi"
-          || isCodeBuddyProviderId(agentType)
-          || agentType === "qwen") &&
-        requestedModel.trim()
-      ) {
-        extra.requestedModel = requestedModel.trim();
-        if (agentType === AGY_SDK_PROVIDER_ID) {
-          saveAgyModelPreference(requestedModel.trim());
-        }
-      }
-      ws.sendSessionCommand("start", {
-        ...(incognito ? { incognito: true } : {}),
-        project: project.trim(),
-        dir: dir.trim(),
-        agentType,
-        ...(trimmedGitRemoteUrl ? { gitRemoteUrl: trimmedGitRemoteUrl } : {}),
-        ...extra,
-        ...(identityPrompt ? { identityPrompt } : {}),
-        ...(agentType === "claude-code-sdk" ||
-        agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE ||
-        agentType === "codex-sdk" ||
-        agentType === "copilot-sdk" ||
-        agentType === "muse-code-sdk" ||
-        agentType === "pi" ||
-        agentType === "qwen"
-          ? { thinking }
-          : {}),
-      });
+    if (!dirManuallyEdited && projectDirQueryPending) {
+      awaitingDirQueryStartRef.current = true;
+      setAwaitingDirQueryStart(true);
+      setError("");
+      return;
     }
+    startSessionWithDir(dir);
   };
 
   const agentFlavor =
@@ -898,7 +1049,7 @@ export function NewSessionDialog({
   }, [agentType, qwenCompatibleApiPresetSelected]);
 
   const handleKey = (e: KeyboardEvent) => {
-    if (e.key === "Enter" && !starting) handleStart();
+    if (e.key === "Enter" && !starting && !awaitingDirQueryStartRef.current) handleStart();
   };
 
   return (
@@ -908,7 +1059,11 @@ export function NewSessionDialog({
           <h2>{t("new_session.title")}</h2>
           <button
             class="dialog-close"
-            onClick={onClose}
+            onClick={() => {
+              awaitingDirQueryStartRef.current = false;
+              setAwaitingDirQueryStart(false);
+              onClose();
+            }}
             disabled={starting}
           >
             ×
@@ -922,7 +1077,7 @@ export function NewSessionDialog({
             type="text"
             placeholder="my-project"
             value={project}
-            disabled={starting}
+            disabled={starting || awaitingDirQueryStart}
             onInput={(e) => {
               const nextProject = (e.target as HTMLInputElement).value;
               setProject(nextProject);
@@ -948,7 +1103,7 @@ export function NewSessionDialog({
               type="text"
               placeholder="~/.imcodes/projects/my-project"
               value={dir}
-              disabled={starting}
+              disabled={starting || awaitingDirQueryStart}
               onInput={(e) => {
                 setDirManuallyEdited(true);
                 setDir((e.target as HTMLInputElement).value);
@@ -964,7 +1119,7 @@ export function NewSessionDialog({
               <button
                 class="btn-browse"
                 type="button"
-                disabled={starting}
+                disabled={starting || awaitingDirQueryStart}
                 onClick={() => setShowDirBrowser(true)}
                 title={t("new_session.browse")}
               >
@@ -2118,7 +2273,11 @@ export function NewSessionDialog({
         >
           <button
             class="btn btn-secondary"
-            onClick={onClose}
+            onClick={() => {
+              awaitingDirQueryStartRef.current = false;
+              setAwaitingDirQueryStart(false);
+              onClose();
+            }}
             disabled={starting}
           >
             {t("common.cancel")}
@@ -2126,9 +2285,9 @@ export function NewSessionDialog({
           <button
             class={`btn btn-primary${incognito ? ' incognito-launch-btn' : ''}`}
             onClick={handleStart}
-            disabled={starting || !isAgentValidForFilters(agentType) || (incognito && !canIncognito)}
+            disabled={starting || awaitingDirQueryStart || !isAgentValidForFilters(agentType) || (incognito && !canIncognito)}
           >
-            {starting ? t("new_session.starting") : t("new_session.start")}
+            {starting || awaitingDirQueryStart ? t("new_session.starting") : t("new_session.start")}
           </button>
         </div>
       </div>

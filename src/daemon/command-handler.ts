@@ -11410,11 +11410,17 @@ async function mapWithConcurrency<T, U>(
   return results;
 }
 
-function getFsListCacheKey(realPath: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): string {
+function getFsListCacheKey(
+  realPath: string,
+  includeFiles: boolean,
+  includeMetadata: boolean,
+  allowDownloadHandles: boolean,
+  includeSymlinkNames = false,
+): string {
   const metadataMode = includeMetadata
     ? (allowDownloadHandles ? 'meta' : 'meta-no-downloads')
     : 'plain';
-  return `${realPath}::${includeFiles ? 'files' : 'dirs'}::${metadataMode}`;
+  return `${realPath}::${includeFiles ? 'files' : 'dirs'}${includeSymlinkNames ? '+symlinks' : ''}::${metadataMode}`;
 }
 
 function shouldAttachOpenSpecTaskStats(realPath: string, includeOpenSpecTaskStats: boolean): boolean {
@@ -11530,14 +11536,22 @@ function fsGitStatusWorkerQueueDepth(): number {
   }
 }
 
-async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
+async function loadFsListSnapshot(
+  real: string,
+  includeFiles: boolean,
+  includeMetadata: boolean,
+  allowDownloadHandles: boolean,
+  includeSymlinkNames = false,
+): Promise<FsLsSnapshot> {
+  const workerInput = {
+    realPath: real,
+    includeFiles,
+    includeMetadata,
+    ...(includeSymlinkNames ? { includeSymlinkNames: true } : {}),
+  };
   const snapshot = shouldUseFsListWorkerPool()
-    ? await getDefaultFsListWorkerPool().dispatch({
-      realPath: real,
-      includeFiles,
-      includeMetadata,
-    })
-    : await scanFsListSnapshot({ realPath: real, includeFiles, includeMetadata });
+    ? await getDefaultFsListWorkerPool().dispatch(workerInput)
+    : await scanFsListSnapshot(workerInput);
 
   const entries: Array<Record<string, unknown>> = snapshot.entries.map((entry) => ({ ...entry }));
   if (includeMetadata && allowDownloadHandles) {
@@ -11558,10 +11572,16 @@ async function loadFsListSnapshot(real: string, includeFiles: boolean, includeMe
   };
 }
 
-async function getFsListSnapshot(real: string, includeFiles: boolean, includeMetadata: boolean, allowDownloadHandles: boolean): Promise<FsLsSnapshot> {
+async function getFsListSnapshot(
+  real: string,
+  includeFiles: boolean,
+  includeMetadata: boolean,
+  allowDownloadHandles: boolean,
+  includeSymlinkNames = false,
+): Promise<FsLsSnapshot> {
   sweepExpiredCache(fsListCache);
   const dirSignature = await safeStatSignature(real);
-  const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata, allowDownloadHandles);
+  const cacheKey = getFsListCacheKey(real, includeFiles, includeMetadata, allowDownloadHandles, includeSymlinkNames);
   const cached = getCachedFsListSnapshot(cacheKey, dirSignature, false);
   if (cached) {
     recordFsWorkerMetric({
@@ -11601,7 +11621,7 @@ async function getFsListSnapshot(real: string, includeFiles: boolean, includeMet
 
   const workerStartedAt = Date.now();
   const queueDepthAtDispatch = fsListWorkerQueueDepth();
-  const promise = loadFsListSnapshot(real, includeFiles, includeMetadata, allowDownloadHandles)
+  const promise = loadFsListSnapshot(real, includeFiles, includeMetadata, allowDownloadHandles, includeSymlinkNames)
     .then(async (value) => {
       const currentSignature = await safeStatSignature(real);
       if (
@@ -11673,18 +11693,22 @@ function invalidateFsListCachesForPath(targetPath: string): void {
   const realTarget = normalizeFsPath(targetPath);
   bumpResourceGeneration(fsListGenerations, realTarget);
   for (const includeFiles of [false, true]) {
-    fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, false, true));
-    fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, true, true));
-    fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, true, false));
+    for (const includeSymlinkNames of [false, true]) {
+      fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, false, true, includeSymlinkNames));
+      fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, true, true, includeSymlinkNames));
+      fsListCache.delete(getFsListCacheKey(realTarget, includeFiles, true, false, includeSymlinkNames));
+    }
   }
 
   const parent = nodePath.dirname(realTarget);
   if (parent !== realTarget) {
     bumpResourceGeneration(fsListGenerations, parent);
     for (const includeFiles of [false, true]) {
-      fsListCache.delete(getFsListCacheKey(parent, includeFiles, false, true));
-      fsListCache.delete(getFsListCacheKey(parent, includeFiles, true, true));
-      fsListCache.delete(getFsListCacheKey(parent, includeFiles, true, false));
+      for (const includeSymlinkNames of [false, true]) {
+        fsListCache.delete(getFsListCacheKey(parent, includeFiles, false, true, includeSymlinkNames));
+        fsListCache.delete(getFsListCacheKey(parent, includeFiles, true, true, includeSymlinkNames));
+        fsListCache.delete(getFsListCacheKey(parent, includeFiles, true, false, includeSymlinkNames));
+      }
     }
   }
 }
@@ -11695,6 +11719,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const includeFiles = cmd.includeFiles === true;
   const includeMetadata = cmd.includeMetadata === true;
   const includeOpenSpecTaskStats = cmd.includeOpenSpecTaskStats === true;
+  const includeSymlinkNames = cmd.includeSymlinkNames === true;
   if (!rawPath || !requestId) return;
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
@@ -11729,7 +11754,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   });
 
   try {
-    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, requestContext, sessionRoot.realRoot), deadline]);
+    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, includeSymlinkNames, requestContext, sessionRoot.realRoot), deadline]);
   } catch (err) {
     const msg = fsListErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT || msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -11753,6 +11778,7 @@ async function handleFsListInner(
   includeFiles: boolean,
   includeMetadata: boolean,
   includeOpenSpecTaskStats: boolean,
+  includeSymlinkNames: boolean,
   requestContext: FsListRequestContext,
   sessionRealRoot?: string,
 ): Promise<void> {
@@ -11788,7 +11814,14 @@ async function handleFsListInner(
     return;
   }
 
-  const snapshot = await getFsListSnapshot(canonical.realPath, includeFiles, includeMetadata, !canonical.usedFallback);
+  const effectiveIncludeSymlinkNames = includeSymlinkNames && !sessionRealRoot && !includeMetadata;
+  const snapshot = await getFsListSnapshot(
+    canonical.realPath,
+    includeFiles,
+    includeMetadata,
+    !canonical.usedFallback && !effectiveIncludeSymlinkNames,
+    effectiveIncludeSymlinkNames,
+  );
   let visibleEntries = snapshot.entries;
   if (sessionRealRoot) {
     const filtered: Array<Record<string, unknown>> = [];
