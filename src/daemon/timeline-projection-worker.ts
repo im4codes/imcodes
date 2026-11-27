@@ -28,6 +28,9 @@ const INCREMENTAL_VACUUM_MIN_FREELIST_PAGES = 64;
 const INCREMENTAL_VACUUM_MAX_PAGES = 512;
 const INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS = 50;
 const SMALL_WAL_CHECKPOINT_MAX_FRAMES = 512;
+const DEFERRED_MAINTENANCE_INITIAL_MS = 100;
+const DEFERRED_MAINTENANCE_MAX_MS = 30_000;
+const DEFERRED_MAINTENANCE_MAX_ATTEMPTS = 12;
 // The worker entry must not import local modules (it loads as raw .ts without a `.js` resolver), so it cannot ask the state-dir
 // resolver itself: the client resolves the paths once and hands them over. There is deliberately no homedir() guess here — a worker
 // that guessed would open the real ~/.imcodes for a scoped daemon.
@@ -58,6 +61,9 @@ let retentionRetryAfter = 0;
 let retentionTimer: NodeJS.Timeout | undefined;
 let retentionStopped = false;
 let retentionWatchHandle: RetentionSettingsWatcherHandle | undefined;
+let deferredMaintenanceTimer: NodeJS.Timeout | undefined;
+let deferredMaintenanceAttempts = 0;
+let deferredMaintenanceRunning = false;
 
 function sessionFilePath(sessionId: string): string {
   const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
@@ -502,10 +508,78 @@ function maybeCheckpoint(): void {
   ensureDb().exec('PRAGMA wal_checkpoint(TRUNCATE);');
 }
 
+function scheduleDeferredMaintenance(delayMs = DEFERRED_MAINTENANCE_INITIAL_MS): void {
+  if (retentionStopped || deferredMaintenanceTimer) return;
+  const clampedDelay = Math.max(20, Math.min(DEFERRED_MAINTENANCE_MAX_MS, Math.trunc(delayMs)));
+  deferredMaintenanceTimer = setTimeout(() => {
+    deferredMaintenanceTimer = undefined;
+    void runDeferredMaintenance();
+  }, clampedDelay);
+  deferredMaintenanceTimer.unref();
+}
+
+function nextMaintenanceBackoffMs(attempt: number): number {
+  return Math.min(DEFERRED_MAINTENANCE_MAX_MS, DEFERRED_MAINTENANCE_INITIAL_MS * 2 ** Math.min(attempt, 10));
+}
+
+async function runDeferredMaintenance(): Promise<void> {
+  if (retentionStopped || deferredMaintenanceRunning) return;
+  deferredMaintenanceRunning = true;
+  try {
+    const database = ensureDb();
+    const vac = maybeIncrementalVacuum(database);
+    const pendingFrames = estimateWalFrames(database);
+    let needsRetry = vac.freelistAfter >= INCREMENTAL_VACUUM_MIN_FREELIST_PAGES;
+    if (pendingFrames > 0 || writesSinceCheckpoint > 0) {
+      database.exec(`PRAGMA busy_timeout = ${INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS}`);
+      try {
+        const passive = database.prepare('PRAGMA wal_checkpoint(PASSIVE)').get() as
+          | { busy?: number | bigint; log?: number | bigint; checkpointed?: number | bigint }
+          | undefined;
+        const passiveBusy = Number(passive?.busy ?? 0);
+        const logFrames = Number(passive?.log ?? 0);
+        const checkpointedFrames = Number(passive?.checkpointed ?? 0);
+        if (passiveBusy === 0 && checkpointedFrames >= logFrames) {
+          const trunc = database.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as
+            | { busy?: number | bigint; log?: number | bigint }
+            | undefined;
+          if (Number(trunc?.busy ?? 0) !== 0 || Number(trunc?.log ?? 0) > 0) {
+            needsRetry = true;
+          } else {
+            writesSinceCheckpoint = 0;
+          }
+        } else {
+          needsRetry = true;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/locked|busy/i.test(msg)) throw err;
+        needsRetry = true;
+      } finally {
+        try {
+          database.exec(`PRAGMA busy_timeout = ${WORKER_BUSY_TIMEOUT_MS}`);
+        } catch {
+          // ignore if database is closing
+        }
+      }
+    }
+    if (needsRetry && deferredMaintenanceAttempts < DEFERRED_MAINTENANCE_MAX_ATTEMPTS) {
+      const delay = nextMaintenanceBackoffMs(deferredMaintenanceAttempts);
+      deferredMaintenanceAttempts += 1;
+      scheduleDeferredMaintenance(delay);
+    } else {
+      deferredMaintenanceAttempts = 0;
+    }
+  } finally {
+    deferredMaintenanceRunning = false;
+  }
+}
+
 /**
  * Best-effort bounded incremental vacuum for auto_vacuum=INCREMENTAL databases.
  * Leaves legacy auto_vacuum=0 databases untouched and drops out cleanly on lock contention.
- * Never checkpoints a large backlog WAL synchronously inside the worker step.
+ * Never checkpoints a large backlog WAL synchronously inside the worker step; instead coalesces
+ * background maintenance so low-traffic daemons still shrink WAL and main DB once readers clear.
  */
 export function maybeIncrementalVacuum(
   database: DatabaseSyncInstance,
@@ -528,13 +602,19 @@ export function maybeIncrementalVacuum(
   database.exec(`PRAGMA busy_timeout = ${INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS}`);
   let vacuumed = false;
   let checkpointSkipped = false;
+  let checkpointBlocked = false;
   try {
     database.exec(`PRAGMA incremental_vacuum(${boundedMaxPages});`);
     vacuumed = true;
     // Only checkpoint inline when WAL pending frames are within the small budget;
-    // large backlog WALs defer to the independent checkpointIfNeeded maintenance path.
+    // large backlog WALs defer to coalesced background maintenance.
     if (estimateWalFrames(database) <= SMALL_WAL_CHECKPOINT_MAX_FRAMES) {
-      database.exec('PRAGMA wal_checkpoint(PASSIVE);');
+      const ckpt = database.prepare('PRAGMA wal_checkpoint(PASSIVE)').get() as
+        | { busy?: number | bigint; log?: number | bigint; checkpointed?: number | bigint }
+        | undefined;
+      if (Number(ckpt?.busy ?? 0) !== 0 || Number(ckpt?.checkpointed ?? 0) < Number(ckpt?.log ?? 0)) {
+        checkpointBlocked = true;
+      }
     } else {
       checkpointSkipped = true;
     }
@@ -543,6 +623,7 @@ export function maybeIncrementalVacuum(
     if (!/locked|busy/i.test(msg)) {
       throw err;
     }
+    checkpointBlocked = true;
   } finally {
     try {
       database.exec(`PRAGMA busy_timeout = ${WORKER_BUSY_TIMEOUT_MS}`);
@@ -553,6 +634,9 @@ export function maybeIncrementalVacuum(
   const freelistAfter = Number(
     (database.prepare('PRAGMA freelist_count').get() as { freelist_count: number | bigint }).freelist_count,
   );
+  if (checkpointSkipped || checkpointBlocked || freelistAfter >= INCREMENTAL_VACUUM_MIN_FREELIST_PAGES) {
+    scheduleDeferredMaintenance();
+  }
   return { vacuumed, freelistBefore, freelistAfter, ...(checkpointSkipped ? { checkpointSkipped: true } : {}) };
 }
 
@@ -726,7 +810,10 @@ async function handlePruneSessionToAuthoritative(sessionId: string, keepLast: nu
     });
   }
   writesSinceCheckpoint += 1;
-  maybeIncrementalVacuum(database);
+  const vac = maybeIncrementalVacuum(database);
+  if (vac.checkpointSkipped || estimateWalFrames(database) > SMALL_WAL_CHECKPOINT_MAX_FRAMES) {
+    scheduleDeferredMaintenance();
+  }
   return true;
 }
 
@@ -734,7 +821,10 @@ async function handleDeleteSession(sessionId: string): Promise<boolean> {
   const database = ensureDb();
   deleteSessionRows(sessionId);
   writesSinceCheckpoint += 1;
-  maybeIncrementalVacuum(database);
+  const vac = maybeIncrementalVacuum(database);
+  if (vac.checkpointSkipped || estimateWalFrames(database) > SMALL_WAL_CHECKPOINT_MAX_FRAMES) {
+    scheduleDeferredMaintenance();
+  }
   return true;
 }
 
@@ -846,6 +936,9 @@ async function runRetention(now = Date.now()): Promise<Record<string, unknown>> 
       }
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
+    if (estimateWalFrames(database) > SMALL_WAL_CHECKPOINT_MAX_FRAMES) {
+      scheduleDeferredMaintenance();
+    }
     return retentionState();
   } catch (err) {
     retentionRetryAfter = now + retention.retryMs;
@@ -889,6 +982,10 @@ function scheduleRetention(): void {
 async function handleShutdown(): Promise<true> {
   retentionStopped = true;
   if (retentionTimer) clearTimeout(retentionTimer);
+  if (deferredMaintenanceTimer) {
+    clearTimeout(deferredMaintenanceTimer);
+    deferredMaintenanceTimer = undefined;
+  }
   retentionWatchHandle?.stop();
   retentionWatchHandle = undefined;
   parentPort?.close();

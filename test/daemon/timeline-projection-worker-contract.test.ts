@@ -293,26 +293,38 @@ describe('timeline projection worker contract', () => {
       const walBytesBeforeCleanup = statSync(walPath).size;
       expect(walBytesBeforeCleanup).toBeGreaterThan(1500 * 4096);
 
-      // Cleanup requests (deleteSession + retentionTick) must NOT copy/truncate the large WAL while reader holds snapshot.
-      expect((await request({ id: 'del-large', type: 'deleteSession', payload: { sessionId: 's_del' } })).ok).toBe(true);
-      expect(statSync(walPath).size).toBeGreaterThanOrEqual(walBytesBeforeCleanup);
+      // Directly observe all SQL checkpoint invocations (both exec and prepare) during foreground cleanup.
+      const execSpy = vi.spyOn(DatabaseSync.prototype, 'exec');
+      const prepareSpy = vi.spyOn(DatabaseSync.prototype, 'prepare');
+      try {
+        // Foreground cleanup requests (deleteSession + retentionTick) must NOT invoke any wal_checkpoint
+        // while WAL exceeds budget and a reader holds a snapshot.
+        expect((await request({ id: 'del-large', type: 'deleteSession', payload: { sessionId: 's_del' } })).ok).toBe(true);
+        const retRes = await request({ id: 'tick-large', type: 'retentionTick', payload: { now: nowMs + dayMs } });
+        expect(retRes.ok).toBe(true);
+        expect((retRes.result as { deleted: number }).deleted).toBe(1200);
 
-      const retRes = await request({ id: 'tick-large', type: 'retentionTick', payload: { now: nowMs + dayMs } });
-      expect(retRes.ok).toBe(true);
-      expect((retRes.result as { deleted: number }).deleted).toBe(1200);
-      expect(statSync(walPath).size).toBeGreaterThanOrEqual(walBytesBeforeCleanup);
+        const fgExecCkpts = execSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && /wal_checkpoint/i.test(sql));
+        const fgPrepCkpts = prepareSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && /wal_checkpoint/i.test(sql));
+        expect(fgExecCkpts).toHaveLength(0);
+        expect(fgPrepCkpts).toHaveLength(0);
+        expect(statSync(walPath).size).toBeGreaterThanOrEqual(walBytesBeforeCleanup);
 
-      // Release reader snapshot, then run another prune step: worker wal_autocheckpoint=0 and small-WAL guard
-      // must STILL avoid an unbudgeted inline checkpoint until explicit maintenance runs.
-      reader.exec('COMMIT');
-      reader.close();
-      expect((await request({ id: 'prune-wal', type: 'pruneSessionToAuthoritative', payload: { sessionId: 's_wal', keepLast: 10 } })).ok).toBe(true);
-      expect(statSync(walPath).size).toBeGreaterThanOrEqual(walBytesBeforeCleanup);
+        // Release reader snapshot and wait WITHOUT sending any manual checkpointIfNeeded RPC or extra writes:
+        // coalesced deferred background maintenance must automatically truncate WAL and shrink main DB on disk.
+        reader.exec('COMMIT');
+        reader.close();
 
-      // Now run explicit maintenance path (`checkpointIfNeeded`): WAL truncates and main DB shrinks on disk.
-      expect((await request({ id: 'maint-ckpt', type: 'checkpointIfNeeded', payload: {} })).ok).toBe(true);
-      expect(statSync(walPath).size).toBe(0);
-      expect(statSync(dbPath).size).toBeLessThan(dbSizeBaseline);
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline && (statSync(walPath).size > 0 || statSync(dbPath).size >= dbSizeBaseline)) {
+          await new Promise((resolve) => setTimeout(resolve, 40));
+        }
+        expect(statSync(walPath).size).toBe(0);
+        expect(statSync(dbPath).size).toBeLessThan(dbSizeBaseline);
+      } finally {
+        execSpy.mockRestore();
+        prepareSpy.mockRestore();
+      }
     } finally {
       rmSync(configPath, { force: true });
     }
