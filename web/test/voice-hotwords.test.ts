@@ -56,19 +56,19 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
   });
 
   it('isolates hotwords per project, merges with global (project priority), and gates cross-account sharing by default', () => {
-    setGlobalVoiceHotwordsRaw('Antigravity\nwrong term => GlobalTarget');
-    setProjectVoiceHotwordsRaw('proj-a', 'IM.codes\nworktree\nwrong term => IM.codes');
+    setGlobalVoiceHotwordsRaw('Antigravity\n误识词 => GlobalTarget');
+    setProjectVoiceHotwordsRaw('proj-a', 'IM.codes\nworktree\n误识词 => IM.codes');
     setProjectVoiceHotwordsRaw('proj-b', 'codex-sdk');
 
     const compiledA = getCompiledVoiceHotwordsForProject('proj-a');
     expect(compiledA.terms).toEqual(['IM.codes', 'worktree', 'Antigravity']);
-    expect(compiledA.asrTerms).toEqual(['IM.codes', 'worktree', 'Antigravity', 'wrong term']);
-    expect(compiledA.replacements).toEqual([{ from: 'wrong term', to: 'IM.codes' }]);
+    expect(compiledA.asrTerms).toEqual(['IM.codes', 'worktree', 'Antigravity', '误识词']);
+    expect(compiledA.replacements).toEqual([{ from: '误识词', to: 'IM.codes' }]);
 
     const compiledB = getCompiledVoiceHotwordsForProject('proj-b');
     expect(compiledB.terms).toEqual(['codex-sdk', 'Antigravity', 'GlobalTarget']);
-    expect(compiledB.asrTerms).toEqual(['codex-sdk', 'Antigravity', 'GlobalTarget', 'wrong term']);
-    expect(compiledB.replacements).toEqual([{ from: 'wrong term', to: 'GlobalTarget' }]);
+    expect(compiledB.asrTerms).toEqual(['codex-sdk', 'Antigravity', 'GlobalTarget', '误识词']);
+    expect(compiledB.replacements).toEqual([{ from: '误识词', to: 'GlobalTarget' }]);
 
     // Privacy default: false for others' shared devices, always true for own PC App & server HTTP ASR
     expect(getShareHotwordsWithOthers()).toBe(false);
@@ -76,12 +76,12 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
     expect(shouldSendRemoteVoiceHotwords({ providerKind: 'pc_app', isOwnDevice: true })).toBe(true);
     expect(shouldSendRemoteVoiceHotwords({ providerKind: 'pc_app', isOwnDevice: false })).toBe(false);
     expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: false }, compiledA)).toBeUndefined();
-    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: true }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity', 'wrong term']);
-    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'http_asr', isOwnDevice: false }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity', 'wrong term']);
+    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: true }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity', '误识词']);
+    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'http_asr', isOwnDevice: false }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity', '误识词']);
 
     setShareHotwordsWithOthers(true);
     expect(getShareHotwordsWithOthers()).toBe(true);
-    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: false }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity', 'wrong term']);
+    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: false }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity', '误识词']);
 
     // Fallback compatibility with partial compiled objects lacking asrTerms
     const legacyCompiled = { terms: ['LegacyTerm'], contextText: 'LegacyTerm', replacements: [] };

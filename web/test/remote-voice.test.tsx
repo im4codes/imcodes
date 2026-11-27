@@ -2546,7 +2546,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
 
   it('forwards preserved PCM on route/pre-ready/mid-session/post-stop fallbacks across mobile Qwen3, old shell, system engine, and PC App', async () => {
     const audio = setupFakeWebAudio({ sampleRate: 16_000 });
-    const transcribePcm = vi.fn(async (_opts: { pcmBase64: string; language?: string }) => ({ text: '离线兜底识别结果' }));
+    const transcribePcm = vi.fn(async (_opts: { pcmBase64: string; language?: string; hotwords?: string[] }) => ({ text: '离线兜底识别结果' }));
 
     const setupMobileCaps = (withTranscribePcm: boolean) => {
       vi.stubGlobal('Capacitor', {
@@ -2580,6 +2580,9 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     };
 
     try {
+      setProjectVoiceHotwordsRaw('proj-pcm-hw', 'Kubernetes\n库伯 => Kubernetes');
+      setActiveVoiceHotwordProject('proj-pcm-hw');
+
       // Case A: route local_fallback preserves eager pre-roll PCM into StreamingSpeech.start({ initialPcmBase64 })
       setupMobileCaps(true);
       resetRemoteVoiceClientForTesting({
@@ -2660,6 +2663,9 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       await stopFinP;
       expect(streamingBridge.start).not.toHaveBeenCalled();
       expect(transcribePcm).toHaveBeenCalledTimes(1);
+      expect(transcribePcm).toHaveBeenCalledWith(
+        expect.objectContaining({ hotwords: ['Kubernetes', '库伯'] }),
+      );
       expect(rFin).toEqual([{ text: '离线兜底识别结果', isFinal: true }]);
 
       // Case D: older mobile shell without transcribePcm in PluginHeaders never invokes transcribePcm and never hangs stopListening
@@ -2724,12 +2730,19 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       await waitFor(() => expect(wsPc.sent.some((s) => JSON.parse(s).type === 'voice.session.stop')).toBe(true));
       wsPc.emitMessage({ type: 'voice.session.error', sessionId: sPc.sessionId, code: 'helper_error' });
       await stopPcP;
-      expect(pcStartListening).toHaveBeenCalledWith(expect.objectContaining({ finalizeOnly: true, initialPcmBase64: expect.any(String) }));
+      expect(pcStartListening).toHaveBeenCalledWith(
+        expect.objectContaining({
+          finalizeOnly: true,
+          initialPcmBase64: expect.any(String),
+          hotwords: ['Kubernetes', '库伯'],
+        }),
+      );
       expect(rPc).toEqual([{ text: 'PC 本地兜底结果', isFinal: true }]);
     } finally {
       delete (streamingBridge as Record<string, unknown>).transcribePcm;
       delete (globalThis as any).__IMCODES_PC_APP__;
       VoiceInput.setVoiceRecognitionEngine('builtin');
+      resetVoiceHotwordsScopeForTesting();
       await VoiceInput.stopListening({ abort: true });
     }
   });
@@ -3020,6 +3033,8 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       expect(oldPcReqPerm).not.toHaveBeenCalled();
 
       // New PC App bridge: prefers finalizePcmListening over startListening, and skips when PC speech model is 'system'.
+      setProjectVoiceHotwordsRaw('proj-pcm-hw', 'Kubernetes\n库伯 => Kubernetes');
+      setActiveVoiceHotwordProject('proj-pcm-hw');
       let pcModelChoice: 'qwen3-0.6b' | 'system' = 'qwen3-0.6b';
       const newPcEvents = new Set<(ev: any) => void>();
       const newPcStart = vi.fn(async () => ({ ok: true }));
@@ -3066,6 +3081,9 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       wsNewPc.emitMessage({ type: 'voice.session.error', sessionId: sNewPc.sessionId, code: 'helper_error' });
       await newPcStopP;
       expect(newPcFinalize).toHaveBeenCalledTimes(1);
+      expect(newPcFinalize).toHaveBeenCalledWith(
+        expect.objectContaining({ hotwords: ['Kubernetes', '库伯'] }),
+      );
       expect(newPcStart).not.toHaveBeenCalled();
       expect(newPcRes).toEqual([{ text: 'PC finalizePcmListening result', isFinal: true }]);
 
@@ -3088,12 +3106,22 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       await expect(sysStopP).resolves.toBeUndefined();
       expect(newPcFinalize).not.toHaveBeenCalled();
       expect(newPcStart).not.toHaveBeenCalled();
+
+      // Direct PC App voice.startListening receives hotwords [规范词, 触发词]
+      resetRemoteVoiceClientForTesting(null);
+      const directPcStartP = VoiceInput.startListening(vi.fn());
+      await waitFor(() => expect(newPcStart).toHaveBeenCalledTimes(1));
+      expect(newPcStart).toHaveBeenCalledWith(
+        expect.objectContaining({ hotwords: ['Kubernetes', '库伯'] }),
+      );
+      await VoiceInput.stopListening({ abort: true });
     } finally {
       delete (streamingBridge as Record<string, unknown>).transcribePcm;
       delete (streamingBridge as Record<string, unknown>).startRawPcmCapture;
       delete (streamingBridge as Record<string, unknown>).stopRawPcmCapture;
       delete (globalThis as any).__IMCODES_PC_APP__;
       VoiceInput.setVoiceRecognitionEngine('builtin');
+      resetVoiceHotwordsScopeForTesting();
       await VoiceInput.stopListening({ abort: true });
     }
   });
@@ -4034,7 +4062,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
   it('enforces cross-account privacy gating on voice.session.start while always applying deterministic post-processing and forwarding in RemoteVoiceProviderController', async () => {
     const audio = setupFakeWebAudio();
     FakeWebSocket.instances.length = 0;
-    setProjectVoiceHotwordsRaw('proj-voice', 'IM.codes\nworktree\n错别词 => IM.codes');
+    setProjectVoiceHotwordsRaw('proj-voice', 'IM.codes\nworktree\n库伯 => Kubernetes');
     setActiveVoiceHotwordProject('proj-voice');
 
     // 1. Others' shared PC App + privacy OFF (default): omits hotwords in voice.session.start, still post-processes returned results
@@ -4094,10 +4122,10 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     ws1.emitMessage({
       type: 'voice.session.result',
       sessionId: startFrame1.sessionId,
-      text: '在错别词里用WorkTree测试',
+      text: '在库伯里用WorkTree测试',
       isFinal: true,
     });
-    expect(privateResults).toEqual([{ text: '在IM.codes里用worktree测试', isFinal: true }]);
+    expect(privateResults).toEqual([{ text: '在Kubernetes里用worktree测试', isFinal: true }]);
     ws1.emitMessage({ type: 'voice.session.end', sessionId: startFrame1.sessionId });
     await VoiceInput.stopListening({ abort: true });
 
@@ -4109,7 +4137,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.emitOpen();
     const startFrame2 = JSON.parse(ws2.sent[0]!) as Record<string, unknown>;
-    expect(startFrame2.hotwords).toEqual(['IM.codes', 'worktree', '爱码']);
+    expect(startFrame2.hotwords).toEqual(['IM.codes', 'worktree', 'Kubernetes', '库伯']);
     expect(startFrame2.allowSharedHotwords).toBe(true);
     ws2.emitMessage({ type: 'voice.session.ready', sessionId: startFrame2.sessionId });
     await expect(start2).resolves.toBe(true);
@@ -4159,7 +4187,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     const ws3 = FakeWebSocket.instances[2]!;
     ws3.emitOpen();
     const startFrame3 = JSON.parse(ws3.sent[0]!) as Record<string, unknown>;
-    expect(startFrame3.hotwords).toEqual(['IM.codes', 'worktree', '爱码']);
+    expect(startFrame3.hotwords).toEqual(['IM.codes', 'worktree', 'Kubernetes', '库伯']);
     ws3.emitMessage({ type: 'voice.session.ready', sessionId: startFrame3.sessionId });
     await expect(start3).resolves.toBe(true);
     ws3.emitMessage({ type: 'voice.session.end', sessionId: startFrame3.sessionId });
