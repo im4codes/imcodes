@@ -527,6 +527,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private nativeCollaborationGate?: NativeCollaborationGate;
   private toolExecutionGuard?: ToolExecutionGuard;
+  private participantTurnResolver?: (sessionId: string) => boolean;
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
   private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
@@ -812,17 +813,30 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     this.toolExecutionGuard = guard;
   }
 
+  setParticipantTurnResolver(resolver: (sessionId: string) => boolean): void {
+    this.participantTurnResolver = resolver;
+  }
+
+  private isParticipantTurn(state: ClaudeSdkSessionState): boolean {
+    if (state.currentPayload?.participantRestricted) return true;
+    try {
+      return this.participantTurnResolver?.(state.routeId) === true;
+    } catch {
+      return true;
+    }
+  }
+
   /**
-   * PreToolUse hook for the Bash tool: the daemon may refuse a command before
-   * it runs (a pair participant writing git state in the main checkout). Any
-   * failure of the guard allows the call: a guard must never break a tool.
+   * PreToolUse hook for Bash and file-access tools: the daemon may refuse a call before
+   * it runs (e.g., pair main-checkout git writes or shared-participant sensitive paths).
+   * Owner guard errors allow the call; shared-participant guard errors fail closed.
    */
-  private evaluateToolExecutionHook(state: ClaudeSdkSessionState, input: unknown): Record<string, unknown> {
+  private async evaluateToolExecutionHook(state: ClaudeSdkSessionState, input: unknown): Promise<Record<string, unknown>> {
     const hookInput = this.asRecord(input);
     const guard = this.toolExecutionGuard;
     if (!guard || !hookInput || hookInput.hook_event_name !== 'PreToolUse') return {};
     try {
-      const decision = guard(state.routeId, {
+      const decision = await guard(state.routeId, {
         toolName: typeof hookInput.tool_name === 'string' ? hookInput.tool_name : '',
         input: hookInput.tool_input,
         cwd: typeof hookInput.cwd === 'string' && hookInput.cwd ? hookInput.cwd : state.cwd,
@@ -831,6 +845,10 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       if (decision.allow) return {};
       return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: decision.reason } };
     } catch (error) {
+      if (this.isParticipantTurn(state)) {
+        logger.warn({ provider: this.id, sessionName: state.sessionName, error }, 'Claude SDK tool execution guard failed during participant turn; failing closed');
+        return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'Sensitive path policy: verification failed' } };
+      }
       logger.warn({ provider: this.id, sessionName: state.sessionName, error }, 'Claude SDK tool execution guard failed; allowing the call');
       return {};
     }
@@ -1105,6 +1123,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         }, {
           matcher: 'Bash',
           hooks: [async (input: unknown) => this.evaluateToolExecutionHook(state, input)],
+        }, {
+          matcher: '^(?:Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep|LS)$',
+          hooks: [async (input: unknown) => this.evaluateToolExecutionHook(state, input)],
         }],
       },
       pathToClaudeCodeExecutable: resolvedBinary,
@@ -1179,9 +1200,28 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     // deny-message the model reads as their choice → same-turn continue) or the
     // wait window elapses (allow → the model self-continues / picks its own).
     // Every other tool is allowed unchanged.
-    options.canUseTool = (toolName: string, input: Record<string, unknown>, opts: { signal?: AbortSignal }) => {
+    options.canUseTool = async (toolName: string, input: Record<string, unknown>, opts: { signal?: AbortSignal; toolUseID?: string }) => {
       if (toolName !== 'AskUserQuestion') {
-        return Promise.resolve({ behavior: 'allow' as const, updatedInput: input });
+        if (this.toolExecutionGuard) {
+          try {
+            const decision = await this.toolExecutionGuard(state.routeId, {
+              toolName,
+              input,
+              cwd: payload.turnCwd ?? state.cwd,
+              ...(opts.toolUseID ? { toolUseId: opts.toolUseID } : {}),
+            });
+            if (!decision.allow) {
+              return { behavior: 'deny' as const, message: decision.reason };
+            }
+          } catch (error) {
+            if (this.isParticipantTurn(state)) {
+              logger.warn({ provider: this.id, sessionName: state.sessionName, error }, 'Claude SDK tool execution guard failed in canUseTool during participant turn; failing closed');
+              return { behavior: 'deny' as const, message: 'Sensitive path policy: verification failed' };
+            }
+            logger.warn({ provider: this.id, sessionName: state.sessionName, error }, 'Claude SDK tool execution guard failed in canUseTool; allowing the call');
+          }
+        }
+        return { behavior: 'allow' as const, updatedInput: input };
       }
       // Key by the daemon-facing sessionName (NOT the internal routeId
       // `sessionId`) so handleAskAnswer — which answers by sessionName — resolves

@@ -23,6 +23,7 @@ import {
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  FILE_TRANSFER_SHARED_ACTOR_CAPABILITY,
   FILE_TRANSFER_HTTP_HEADER,
   FILE_TRANSFER_RELAY_HEADER,
   FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD,
@@ -66,6 +67,7 @@ import { resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { sanitizeUploadFilename } from '../../../shared/upload-filename.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
+import type { EffectiveCoverage, SharedActorEnvelope } from '../../../shared/tab-sharing.js';
 import type {
   AttachmentRef,
   FileDownloadRequest,
@@ -108,6 +110,7 @@ const downloadTokens = new Map<string, {
   expiresAt: number;
   remainingUses: number;
   sessionName?: string;
+  sharedActor?: SharedActorEnvelope;
   controlledAdmission?: ControlledFileAdmission;
 }>();
 const stagedUploads = new Map<string, {
@@ -536,6 +539,7 @@ async function attemptStreamedDownload(
   controlledActorUserId?: string,
   offset = 0,
   gate?: Extract<ControlledTargetGate, { ok: true }>,
+  sharedActor?: SharedActorEnvelope,
 ): Promise<{ kind: 'done'; response: Response } | { kind: 'retry' }> {
   const downloadId = randomHex(16);
   const token = randomHex(32);
@@ -575,6 +579,7 @@ async function attemptStreamedDownload(
     attachmentId,
     uploadUrl: buildStagedDownloadUrl(c.req.url, c.env.SERVER_URL, serverId, downloadId, token),
     ...(offset > 0 ? { offset } : {}),
+    ...(sharedActor ? { sharedActor } : {}),
   };
   void sendControlledFileRequest(c, gate ?? { ok: true, bridge, controlled: false },
     downloadId,
@@ -605,6 +610,9 @@ async function attemptStreamedDownload(
       // Genuine missing/expired handle is terminal (base64 would fail too).
       if (errMsg === 'not_found') return { kind: 'done', response: c.json({ error: 'not_found' }, 404) };
       if (errMsg === 'expired') return { kind: 'done', response: c.json({ error: 'handle_expired' }, 410) };
+      if (errMsg === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+        return { kind: 'done', response: c.json({ error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }, 403) };
+      }
       return { kind: 'retry' }; // relay/transport error → retry, then base64
     }
 
@@ -689,6 +697,7 @@ fileTransferRoutes.use('/:id/uploads/:attachmentId/download', async (c, next) =>
     c.set('tokenServerId' as never, entry.serverId as never);
     c.set('tokenAttachmentId' as never, entry.attachmentId as never);
     if (entry.sessionName) c.set('tokenSessionName' as never, entry.sessionName as never);
+    if (entry.sharedActor) c.set('tokenSharedActor' as never, entry.sharedActor as never);
     if (entry.controlledAdmission) c.set('controlledTokenAdmission' as never, entry.controlledAdmission as never);
     return next();
   }
@@ -855,12 +864,52 @@ function controlledTargetGateError(c: Context, reason: Exclude<ControlledTargetG
 
 type SharedFileAccessMode = 'read' | 'write';
 
+async function buildFileTransferSharedActor(
+  db: Env['DB'],
+  params: {
+    userId: string;
+    effectiveActorRole: 'participant' | 'viewer';
+    coverage: EffectiveCoverage | null;
+    target: { kind: 'server' | 'main' | 'subsession'; serverId: string; sessionName?: string };
+  },
+): Promise<SharedActorEnvelope> {
+  const now = Date.now();
+  const user = await db.queryOne<{ display_name: string | null; username: string | null }>(
+    'SELECT display_name, username FROM users WHERE id = $1',
+    [params.userId],
+  ).catch(() => null);
+  const snapshot: EffectiveCoverage = params.coverage ?? {
+    target: params.target as EffectiveCoverage['target'],
+    effectiveRole: params.effectiveActorRole,
+    historyCutoffAt: now,
+    authorizedAt: now,
+    primaryShareId: 'http-share',
+    coveringShareIds: ['http-share'],
+    nextCoverageRecheckAt: null,
+  };
+  return {
+    actorUserId: params.userId,
+    actorDisplayName: user?.display_name ?? user?.username ?? params.userId,
+    snapshot,
+    primaryShareId: snapshot.primaryShareId ?? 'http-share',
+    effectiveActorRole: params.effectiveActorRole,
+    actionId: `file-transfer-${randomHex(8)}`,
+    origin: snapshot.target?.kind === 'server' ? 'shared-server' : 'shared-tab',
+    authorizedAt: snapshot.authorizedAt ?? now,
+    queuedAt: now,
+  };
+}
+
+function hasSharedActorCapability(bridge: ReturnType<typeof WsBridge.get>): boolean {
+  return bridge.hasDaemonCapability?.(FILE_TRANSFER_SHARED_ACTOR_CAPABILITY) === true;
+}
+
 async function authorizeSessionFileAccess(
   c: Context,
   serverId: string,
   userId: string,
   mode: SharedFileAccessMode,
-): Promise<{ ok: true; sessionName?: string } | { ok: false; reason: string }> {
+): Promise<{ ok: true; sessionName?: string; sharedActor?: SharedActorEnvelope } | { ok: false; reason: string }> {
   let effectiveUserId = userId;
   let pinnedSessionName: string | undefined;
   let forceParticipantShareOnly = false;
@@ -905,9 +954,15 @@ async function authorizeSessionFileAccess(
     if (mode === 'write' && serverAccess.actor.effectiveActorRole !== 'participant') {
       return { ok: false, reason: 'share-role-denied' };
     }
+    const sharedActor = await buildFileTransferSharedActor(c.env.DB, {
+      userId: effectiveUserId,
+      effectiveActorRole: serverAccess.actor.effectiveActorRole === 'participant' ? 'participant' : 'viewer',
+      coverage: serverAccess.actor.coverage,
+      target: { kind: 'server', serverId },
+    });
     return mode === 'read'
-      ? { ok: true }
-      : { ok: true, sessionName: sessionName || undefined };
+      ? { ok: true, sharedActor }
+      : { ok: true, sessionName: sessionName || undefined, sharedActor };
   }
 
   const target = shareTargetFromSessionName(serverId, sessionName);
@@ -922,7 +977,13 @@ async function authorizeSessionFileAccess(
   if (mode === 'write' && access.actor.effectiveActorRole !== 'participant') {
     return { ok: false, reason: 'share-role-denied' };
   }
-  return { ok: true, sessionName };
+  const sharedActor = await buildFileTransferSharedActor(c.env.DB, {
+    userId: effectiveUserId,
+    effectiveActorRole: access.actor.effectiveActorRole === 'participant' ? 'participant' : 'viewer',
+    coverage: access.actor.coverage,
+    target: { kind: 'main', serverId, sessionName },
+  });
+  return { ok: true, sessionName, sharedActor };
 }
 
 async function readBoundedJsonObject(
@@ -1350,10 +1411,15 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   // Controlled-node shares have their own DB-authoritative Owner/Participant
   // grants. Standard daemons retain the existing member/session-share check.
   let uploadSessionName: string | undefined;
+  let uploadSharedActor: SharedActorEnvelope | undefined;
   if (!controlledGate.controlled) {
     const access = await authorizeSessionFileAccess(c, serverId, userId, 'write');
     if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
     uploadSessionName = access.sessionName;
+    uploadSharedActor = access.sharedActor;
+    if (uploadSharedActor && !hasSharedActorCapability(controlledGate.bridge)) {
+      return c.json({ error: 'capability_unavailable' }, 409);
+    }
   }
 
   const contentLengthHeader = c.req.header('content-length');
@@ -1549,6 +1615,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
       ...(destinationDirectory ? { destinationDirectory } : {}),
       ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
+      ...(uploadSharedActor ? { sharedActor: uploadSharedActor } : {}),
     };
   } else {
     uploadMsg = {
@@ -1563,6 +1630,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       ...(negotiatedClientUploadId ? { clientUploadId: negotiatedClientUploadId } : {}),
       ...(destinationDirectory ? { destinationDirectory } : {}),
       ...(uploadSessionName ? { sessionName: uploadSessionName } : {}),
+      ...(uploadSharedActor ? { sharedActor: uploadSharedActor } : {}),
     };
   }
 
@@ -1581,6 +1649,9 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
           ? (result as { code: string }).code
           : 'upload_failed';
         logger.warn({ serverId, uploadId, error: result.message, code }, 'Daemon upload error');
+        if (code === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN || result.message === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+          return c.json({ error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN, message: result.message }, 403);
+        }
         // 507 Insufficient Storage when the daemon's disk is full; 500 otherwise.
         const status = code === FILE_TRANSFER_UPLOAD_ERROR_CODE.INSUFFICIENT_CAPACITY ? 507 : 500;
         return c.json({ error: code, message: result.message }, status);
@@ -1593,6 +1664,10 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       return c.json({ ok: true, attachment });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      const code = (err as { code?: unknown } | null)?.code;
+      if (msg === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN || code === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+        return c.json({ error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }, 403);
+      }
       if (msg === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
       if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') {
         return c.json({ error: 'daemon_offline' }, 503);
@@ -1768,9 +1843,12 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
   );
   if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
   const access = controlledGate.controlled
-    ? { ok: true as const, sessionName: undefined as string | undefined }
+    ? { ok: true as const, sessionName: undefined as string | undefined, sharedActor: undefined as SharedActorEnvelope | undefined }
     : await authorizeSessionFileAccess(c, serverId, userId, 'read');
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+  if (access.sharedActor && !hasSharedActorCapability(controlledGate.bridge)) {
+    return c.json({ error: 'capability_unavailable' }, 409);
+  }
 
   if (!/^[a-f0-9]+(\.[a-zA-Z0-9]+)?$/.test(attachmentId)) {
     return c.json({ error: 'invalid_attachment_id' }, 400);
@@ -1785,6 +1863,7 @@ fileTransferRoutes.post('/:id/uploads/:attachmentId/download-token', async (c) =
     expiresAt: Date.now() + 900_000,
     remainingUses: DOWNLOAD_TOKEN_MAX_USES,
     ...(access.sessionName ? { sessionName: access.sessionName } : {}),
+    ...(access.sharedActor ? { sharedActor: access.sharedActor } : {}),
     ...(controlledGate.admission ? { controlledAdmission: controlledGate.admission } : {}),
   });
 
@@ -1822,9 +1901,12 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
     true,
   );
   if (!controlledGate.ok) return controlledTargetGateError(c, controlledGate.reason);
+  let downloadSharedActor: SharedActorEnvelope | undefined =
+    c.get('tokenSharedActor' as never) as SharedActorEnvelope | undefined;
   if (!controlledGate.controlled) {
     const access = await authorizeSessionFileAccess(c, serverId, userId, 'read');
     if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
+    downloadSharedActor = access.sharedActor ?? downloadSharedActor;
   }
 
   // Validate attachment ID format (hex + optional extension)
@@ -1837,6 +1919,9 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   const bridge = controlledGate.bridge;
   if (!bridge.isDaemonConnected()) {
     return c.json({ error: 'daemon_offline' }, 503);
+  }
+  if (downloadSharedActor && !hasSharedActorCapability(bridge)) {
+    return c.json({ error: 'capability_unavailable' }, 409);
   }
 
   const downloadId = randomHex(16);
@@ -1863,6 +1948,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
           controlledGate.delegatedActorUserId,
           offset,
           controlledGate,
+          downloadSharedActor,
         );
         if (outcome.kind === 'done') return outcome.response;
       }
@@ -1882,6 +1968,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       type: 'file.download',
       downloadId: legacyDownloadId,
       attachmentId,
+      ...(downloadSharedActor ? { sharedActor: downloadSharedActor } : {}),
     };
     const result = await sendControlledFileRequest(c, controlledGate,
       legacyDownloadId,
@@ -1893,6 +1980,9 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
       const errMsg = result.message as string;
       if (errMsg === 'not_found') return c.json({ error: 'not_found' }, 404);
       if (errMsg === 'expired') return c.json({ error: 'handle_expired' }, 410);
+      if (errMsg === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+        return c.json({ error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }, 403);
+      }
       return c.json({ error: 'download_failed', message: errMsg }, 500);
     }
 
@@ -1900,6 +1990,10 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
   } catch (err) {
     deleteStagedDownload(downloadId, err instanceof Error ? err : new Error(String(err)));
     const msg = err instanceof Error ? err.message : String(err);
+    const code = (err as { code?: unknown } | null)?.code;
+    if (msg === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN || code === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+      return c.json({ error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }, 403);
+    }
     if (msg === 'target_forbidden') return c.json({ error: 'target_forbidden' }, 403);
     if (msg === 'daemon_offline' || msg === 'daemon_disconnected' || msg === 'daemon_error') return c.json({ error: 'daemon_offline' }, 503);
     if (msg === 'timeout') return c.json({ error: 'download_timeout' }, 504);
@@ -1911,7 +2005,7 @@ fileTransferRoutes.get('/:id/uploads/:attachmentId/download', async (c) => {
 
 // R2 is a metadata/control plane only. No file bytes pass through this server.
 type R2UploadTicket = { serverId: string; userId: string; key: string; filename: string; size: number;
-  expiresAt: number; sessionName?: string; clientUploadId?: string; destinationDirectory?: string };
+  expiresAt: number; sessionName?: string; clientUploadId?: string; destinationDirectory?: string; sharedActor?: SharedActorEnvelope };
 const r2UploadTickets = new Map<string, R2UploadTicket>();
 fileTransferRoutes.use(`/:id/${R2_RELAY_API.ROOT}/*`, authMiddleware);
 
@@ -1928,7 +2022,10 @@ async function r2RouteAccess(c: Context, mode: SharedFileAccessMode) {
     return { response: c.body(null, 204) } as const;
   }
   if (!bridge.isDaemonConnected()) return { response: c.json({ error: 'daemon_offline' }, 503) } as const;
-  return { config, bridge, serverId, userId, sessionName: access.sessionName } as const;
+  if (access.sharedActor && !hasSharedActorCapability(bridge)) {
+    return { response: c.json({ error: 'capability_unavailable' }, 409) } as const;
+  }
+  return { config, bridge, serverId, userId, sessionName: access.sessionName, sharedActor: access.sharedActor } as const;
 }
 fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, async (c) => {
   const access = await r2RouteAccess(c, 'write'); if ('response' in access) return access.response;
@@ -1949,6 +2046,7 @@ fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}`, asy
   const id = randomHex(16); const key = r2StagingKey(filename);
   r2UploadTickets.set(id, { serverId: access.serverId, userId: access.userId, key, filename, size: size as number,
     expiresAt: Date.now() + R2_RELAY_LIMITS.OBJECT_TTL_MS, sessionName: access.sessionName,
+    ...(access.sharedActor ? { sharedActor: access.sharedActor } : {}),
     ...(typeof clientUploadId === 'string' ? { clientUploadId } : {}),
     ...(typeof destinationDirectory === 'string' ? { destinationDirectory } : {}) });
   return c.json({ id, url: presignR2(access.config, 'PUT', key, {}, Date.now(), { 'content-length': String(size) }) });
@@ -1967,6 +2065,7 @@ fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/:uplo
     const head = await r2Request(access.config, 'HEAD', ticket.key);
     if (Number(head.headers.get('content-length')) !== ticket.size) return c.json({ error: R2_RELAY_ERROR.INVALID }, 400);
     const uploadId = randomHex(16);
+    const sharedActor = access.sharedActor ?? ticket.sharedActor;
     const result = await access.bridge.sendFileTransferRequest(uploadId, {
       type: FILE_TRANSFER_MSG.UPLOAD_FETCH, relayMode: FILE_RELAY_MODE.R2, uploadId, filename: fileTransferLegacyFilename(uploadId, ticket.filename),
       originalName: ticket.filename, mime: 'application/octet-stream', size: ticket.size,
@@ -1974,13 +2073,32 @@ fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.UPLOADS}/:uplo
       clientUploadId: ticket.clientUploadId ?? c.req.param('uploadId'),
       ...(ticket.destinationDirectory ? { destinationDirectory: ticket.destinationDirectory } : {}),
       ...(ticket.sessionName ? { sessionName: ticket.sessionName } : {}),
+      ...(sharedActor ? { sharedActor } : {}),
     }, fileTransferUploadTimeoutMs(ticket.size));
-    if (result.type !== FILE_TRANSFER_MSG.UPLOAD_DONE) throw new Error(R2_RELAY_ERROR.FAILED);
+    if (result.type !== FILE_TRANSFER_MSG.UPLOAD_DONE) {
+      const errCode = typeof (result as { code?: unknown }).code === 'string'
+        ? (result as { code: string }).code
+        : undefined;
+      const errMsg = typeof (result as { message?: unknown }).message === 'string'
+        ? (result as { message: string }).message
+        : (typeof (result as { error?: unknown }).error === 'string' ? (result as { error: string }).error : undefined);
+      if (errCode === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN || errMsg === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+        return c.json({ error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }, 403);
+      }
+      throw new Error(R2_RELAY_ERROR.FAILED);
+    }
     const attachment = result.attachment as AttachmentRef;
     attachment.serverId = access.serverId;
     r2UploadTickets.delete(c.req.param('uploadId'));
     return c.json({ ok: true, attachment });
-  } catch { return c.json({ error: R2_RELAY_ERROR.FAILED }, 502); }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const code = (err as { code?: unknown } | null)?.code;
+    if (msg === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN || code === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+      return c.json({ error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }, 403);
+    }
+    return c.json({ error: R2_RELAY_ERROR.FAILED }, 502);
+  }
 });
 fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.DOWNLOADS}/:attachmentId`, async (c) => {
   const access = await r2RouteAccess(c, 'read'); if ('response' in access) return access.response;
@@ -1995,17 +2113,38 @@ fileTransferRoutes.post(`/:id/${R2_RELAY_API.ROOT}/${R2_RELAY_API.DOWNLOADS}/:at
       try {
         const result = await access.bridge.sendFileTransferRequest(downloadId, {
           type: R2_RELAY_MSG.DOWNLOAD, downloadId, attachmentId, uploadUrl: presignR2(access.config, 'PUT', key),
+          ...(access.sharedActor ? { sharedActor: access.sharedActor } : {}),
         }, fileTransferUploadTimeoutMs(FILE_TRANSFER_LIMITS.MAX_FILE_SIZE), (msg) => {
           if (msg.type === R2_RELAY_MSG.PROGRESS) write(msg);
         });
-        if (result.type !== R2_RELAY_MSG.DONE) throw new Error(R2_RELAY_ERROR.FAILED);
+        if (result.type !== R2_RELAY_MSG.DONE) {
+          const errCode = typeof (result as { code?: unknown }).code === 'string'
+            ? (result as { code: string }).code
+            : undefined;
+          const errMsg = typeof (result as { message?: unknown }).message === 'string'
+            ? (result as { message: string }).message
+            : (typeof (result as { error?: unknown }).error === 'string' ? (result as { error: string }).error : undefined);
+          if (errCode === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN || errMsg === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+            write({ phase: R2_RELAY_PHASE.ERROR, error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN });
+            return;
+          }
+          throw new Error(R2_RELAY_ERROR.FAILED);
+        }
         // Include a signed disposition so cross-origin native/browser navigation saves, not renders, the file.
         const filename = String(result.filename || 'download');
         const url = presignR2(access.config, 'GET', key, {
           'response-content-disposition': attachmentContentDisposition('attachment', filename),
         });
         write({ phase: R2_RELAY_PHASE.READY, url });
-      } catch { write({ phase: R2_RELAY_PHASE.ERROR, error: R2_RELAY_ERROR.FAILED }); }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const code = (err as { code?: unknown } | null)?.code;
+        if (msg === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN || code === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+          write({ phase: R2_RELAY_PHASE.ERROR, error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN });
+        } else {
+          write({ phase: R2_RELAY_PHASE.ERROR, error: R2_RELAY_ERROR.FAILED });
+        }
+      }
       finally { if (!canceled) controller.close(); }
     },
     cancel() { canceled = true; },

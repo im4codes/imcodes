@@ -61,6 +61,23 @@ const bashInput = (command: string, cwd = '/project') => ({
   hook_event_name: 'PreToolUse', session_id: 's', transcript_path: '/t', cwd, tool_name: 'Bash', tool_input: { command }, tool_use_id: 'toolu_1',
 });
 
+async function startProviderWithRun(guard?: ToolExecutionGuard) {
+  const provider = new ClaudeCodeSdkProvider();
+  if (guard) provider.setToolExecutionGuard(guard);
+  await provider.connect({ binaryPath: 'claude' });
+  await provider.createSession({ sessionKey: 'route-exec', sessionName: 'deck_sub_exec', cwd: '/project' });
+  void provider.send('route-exec', 'work').catch(() => {});
+  const deadline = Date.now() + 1_000;
+  while (sdkMock.runs.length < 1) {
+    if (Date.now() > deadline) throw new Error('provider did not start a run');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  return sdkMock.runs[0]!.options as {
+    hooks?: { PreToolUse?: Array<{ matcher?: string; hooks: HookFn[] }> };
+    canUseTool?: (toolName: string, input: Record<string, unknown>, opts: { signal?: AbortSignal; toolUseID?: string }) => Promise<Record<string, unknown>>;
+  };
+}
+
 describe('Claude SDK Bash tool-execution guard', () => {
   beforeEach(() => {
     sdkMock.query.mockClear();
@@ -89,5 +106,74 @@ describe('Claude SDK Bash tool-execution guard', () => {
     const hook = await startProvider(() => { throw new Error('boom'); });
     await expect(hook(bashInput('git reset --hard'), 'toolu_1', { signal })).resolves.toEqual({});
     expect(loggerMock.warn).toHaveBeenCalled();
+  });
+
+  it('enforces the guard in non-Bash PreToolUse hooks and in options.canUseTool (async guard supported)', async () => {
+    const guard = vi.fn<ToolExecutionGuard>(async (_sid, req) => {
+      if (JSON.stringify(req.input).includes('.ssh')) {
+        return { allow: false, reason: 'sensitive path forbidden' };
+      }
+      return { allow: true };
+    });
+    const options = await startProviderWithRun(guard);
+    const nonBashMatcher = options.hooks?.PreToolUse?.find((entry) => entry.matcher?.includes('Read'));
+    expect(nonBashMatcher).toBeDefined();
+
+    await expect(nonBashMatcher!.hooks[0]!({
+      hook_event_name: 'PreToolUse',
+      session_id: 's',
+      transcript_path: '/t',
+      cwd: '/project',
+      tool_name: 'Read',
+      tool_input: { file_path: '/home/k/.ssh/id_ed25519' },
+      tool_use_id: 'toolu_read_1',
+    }, 'toolu_read_1', { signal })).resolves.toEqual({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: 'sensitive path forbidden',
+      },
+    });
+
+    await expect(options.canUseTool!('Read', { file_path: 'leak-key' }, { signal, toolUseID: 'toolu_can_1' }))
+      .resolves.toEqual({ behavior: 'allow', updatedInput: { file_path: 'leak-key' } });
+    await expect(options.canUseTool!('Edit', { file_path: '/home/k/.ssh/config' }, { signal, toolUseID: 'toolu_can_2' }))
+      .resolves.toEqual({ behavior: 'deny', message: 'sensitive path forbidden' });
+  });
+
+  it('fails closed in both PreToolUse and canUseTool when the guard throws during a shared participant turn (F2-R2)', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    provider.setParticipantTurnResolver(() => true);
+    provider.setToolExecutionGuard(() => { throw new Error('evaluator unavailable'); });
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-part-err', sessionName: 'deck_sub_part', cwd: '/project' });
+    void provider.send('route-part-err', 'work').catch(() => {});
+    const deadline = Date.now() + 1_000;
+    while (sdkMock.runs.length < 1) {
+      if (Date.now() > deadline) throw new Error('provider did not start a run');
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const opts = sdkMock.runs[0]!.options as {
+      hooks?: { PreToolUse?: Array<{ matcher?: string; hooks: HookFn[] }> };
+      canUseTool?: (toolName: string, input: Record<string, unknown>, o: { signal?: AbortSignal; toolUseID?: string }) => Promise<Record<string, unknown>>;
+    };
+    const readHook = opts.hooks!.PreToolUse!.find((entry) => entry.matcher?.includes('Read'))!.hooks[0]!;
+    await expect(readHook({
+      hook_event_name: 'PreToolUse',
+      session_id: 's',
+      transcript_path: '/t',
+      cwd: '/project',
+      tool_name: 'Read',
+      tool_input: { file_path: 'src/a.ts' },
+      tool_use_id: 'toolu_p_1',
+    }, 'toolu_p_1', { signal })).resolves.toEqual({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: 'Sensitive path policy: verification failed',
+      },
+    });
+    await expect(opts.canUseTool!('Write', { file_path: 'src/a.ts', content: 'x' }, { signal, toolUseID: 'toolu_p_2' }))
+      .resolves.toEqual({ behavior: 'deny', message: 'Sensitive path policy: verification failed' });
   });
 });

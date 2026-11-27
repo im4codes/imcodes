@@ -2294,6 +2294,218 @@ describe('transport-relay (timeline-emitter based)', () => {
         providerToolUseId: 'tool-1',
       }));
     });
+
+    it('suppresses CHAT_APPROVAL broadcast and emits status notice when participant turn targets a sensitive path without logging raw path', async () => {
+      const { default: logger } = await import('../../src/util/logger.js');
+      const warnSpy = vi.spyOn(logger, 'warn');
+      const { getTransportRuntime } = await import('../../src/agent/session-manager.js');
+      vi.mocked(getTransportRuntime).mockReturnValue({
+        requiresSharedMachineAuthority: () => true,
+      } as never);
+
+      const { provider, fireApproval } = makeMockProvider();
+      wireProviderToRelay(provider);
+      send.mockClear();
+
+      fireApproval('sess-approval', {
+        id: 'approval-sensitive',
+        description: 'Read ~/.ssh/id_ed25519',
+        tool: 'read',
+        provider: 'qoder-sdk',
+        inputPreview: '{"file_path":"/home/k/.ssh/id_ed25519"}',
+      });
+      await vi.waitFor(() => {
+        expect(emitMock).toHaveBeenCalledWith('sess-approval', 'agent.status', expect.objectContaining({
+          status: 'running',
+          label: 'Blocked sensitive path tool access',
+        }), expect.any(Object));
+      });
+
+      expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: TRANSPORT_EVENT.CHAT_APPROVAL }));
+      expect(appendMock).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalled();
+      for (const call of warnSpy.mock.calls) {
+        expect(JSON.stringify(call)).not.toContain('id_ed25519');
+        expect(JSON.stringify(call)).not.toContain('.ssh');
+      }
+      for (const call of emitMock.mock.calls) {
+        expect(JSON.stringify(call)).not.toContain('id_ed25519');
+      }
+      warnSpy.mockRestore();
+
+      // Non-sensitive approval in the same participant turn still broadcasts normally
+      fireApproval('sess-approval', {
+        id: 'approval-safe',
+        description: 'Read src/ssh-helper.ts',
+        tool: 'read',
+        provider: 'qoder-sdk',
+        inputPreview: '{"file_path":"src/ssh-helper.ts"}',
+      });
+      await vi.waitFor(() => {
+        expect(send).toHaveBeenCalledWith(expect.objectContaining({
+          type: TRANSPORT_EVENT.CHAT_APPROVAL,
+          requestId: 'approval-safe',
+        }));
+      });
+
+      // Targetless Read approval with innocuous description only MUST be suppressed and NOT broadcast (F2-R3)
+      send.mockClear();
+      emitMock.mockClear();
+      fireApproval('sess-approval', {
+        id: 'approval-targetless',
+        description: 'Read a document',
+        tool: 'Read',
+        provider: 'qoder-sdk',
+      });
+      await vi.waitFor(() => {
+        expect(emitMock).toHaveBeenCalledWith('sess-approval', 'agent.status', expect.objectContaining({
+          status: 'running',
+          label: 'Blocked sensitive path tool access',
+        }), expect.any(Object));
+      });
+      expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ type: TRANSPORT_EVENT.CHAT_APPROVAL }));
+
+      // Full structured guard allow bound by toolUseId lets truncated >300-char inputPreview broadcast CHAT_APPROVAL (F2-R3)
+      send.mockClear();
+      let installedGuard: ((sid: string, req: { toolName: string; input: unknown; cwd?: string; toolUseId?: string }) => unknown) | undefined;
+      const guardedMock = makeMockProvider();
+      (guardedMock.provider as unknown as {
+        setToolExecutionGuard?: (g: typeof installedGuard) => void;
+      }).setToolExecutionGuard = (g) => { installedGuard = g; };
+      wireProviderToRelay(guardedMock.provider);
+      const longWriteInput = { file_path: 'src/long.ts', content: 'x'.repeat(400) };
+      const preGuardDecision = await Promise.resolve(installedGuard!('sess-approval', {
+        toolName: 'Write',
+        input: longWriteInput,
+        cwd: '/tmp/safe-relay-workspace',
+        toolUseId: 'tu-relay-trunc',
+      }));
+      expect(preGuardDecision).toEqual({ allow: true });
+      guardedMock.fireApproval('sess-approval', {
+        id: 'approval-trunc-bound',
+        description: 'Write src/long.ts',
+        tool: 'Write',
+        provider: 'qoder-sdk',
+        providerToolUseId: 'tu-relay-trunc',
+        inputPreview: JSON.stringify(longWriteInput).slice(0, 300),
+      });
+      await vi.waitFor(() => {
+        expect(send).toHaveBeenCalledWith(expect.objectContaining({
+          type: TRANSPORT_EVENT.CHAT_APPROVAL,
+          requestId: 'approval-trunc-bound',
+        }));
+      });
+
+      // F2-R4: Delayed async pre-evaluation from dispatch 1 MUST be discarded after turn/dispatch transition,
+      // while current dispatch 2 full-input pre-check with truncated preview approves cleanly.
+      send.mockClear();
+      let activeDispatch = 1;
+      vi.mocked(getTransportRuntime).mockReturnValue({
+        requiresSharedMachineAuthority: () => true,
+        getParticipantToolBinding: () => ({ providerSessionId: 'sess-approval', dispatchId: activeDispatch }),
+      } as never);
+      let resolveDelayedGuard!: (d: { allow: true } | { allow: false; reason: string }) => void;
+      setTransportToolExecutionEvaluator((_session, req) => {
+        if (req.toolUseId === 'tu-delayed-r5') {
+          return new Promise((resolve) => { resolveDelayedGuard = resolve; });
+        }
+        return { allow: true };
+      });
+      const delayedPrePromise = Promise.resolve(installedGuard!('sess-approval', {
+        toolName: 'Write',
+        input: longWriteInput,
+        cwd: '/tmp/safe-relay-workspace',
+        toolUseId: 'tu-delayed-r5',
+      }));
+      // Turn switches to dispatch 2 before the delayed pre-check settles
+      guardedMock.fireComplete('sess-approval', makeMessage());
+      activeDispatch = 2;
+      resolveDelayedGuard({ allow: true });
+      const latePreResult = await delayedPrePromise;
+      expect(latePreResult).toMatchObject({ allow: false });
+
+      // Trying to use the stale toolUseId on dispatch 2 fails closed (never cached from late resolve)
+      setTransportToolExecutionEvaluator(undefined);
+      guardedMock.fireApproval('sess-approval', {
+        id: 'approval-delayed-stale',
+        description: 'Write src/long.ts',
+        tool: 'Write',
+        provider: 'qoder-sdk',
+        providerToolUseId: 'tu-delayed-r5',
+        inputPreview: JSON.stringify(longWriteInput).slice(0, 300),
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(send).not.toHaveBeenCalledWith(expect.objectContaining({ requestId: 'approval-delayed-stale' }));
+
+      // Fresh dispatch-2 pre-check still succeeds cleanly for truncated preview
+      const freshPreDecision = await Promise.resolve(installedGuard!('sess-approval', {
+        toolName: 'Write',
+        input: longWriteInput,
+        cwd: '/tmp/safe-relay-workspace',
+        toolUseId: 'tu-dispatch-2-ok',
+      }));
+      expect(freshPreDecision).toEqual({ allow: true });
+      guardedMock.fireApproval('sess-approval', {
+        id: 'approval-dispatch-2-ok',
+        description: 'Write src/long.ts',
+        tool: 'Write',
+        provider: 'qoder-sdk',
+        providerToolUseId: 'tu-dispatch-2-ok',
+        inputPreview: JSON.stringify(longWriteInput).slice(0, 300),
+      });
+      await vi.waitFor(() => {
+        expect(send).toHaveBeenCalledWith(expect.objectContaining({
+          type: TRANSPORT_EVENT.CHAT_APPROVAL,
+          requestId: 'approval-dispatch-2-ok',
+        }));
+      });
+
+      // F2-R5: raw provider onError / onComplete events from an earlier superseded turn MUST NOT
+      // advance epoch or clear a live dispatch's pre-evaluated record on the same provider session.
+      send.mockClear();
+      const preCheckWhileLive = await Promise.resolve(installedGuard!('sess-approval', {
+        toolName: 'Write',
+        input: longWriteInput,
+        cwd: '/tmp/safe-relay-workspace',
+        toolUseId: 'tu-live-survives-late-cancel',
+      }));
+      expect(preCheckWhileLive).toEqual({ allow: true });
+      guardedMock.fireError('sess-approval', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'late cancel', recoverable: true });
+      guardedMock.fireApproval('sess-approval', {
+        id: 'approval-survives-late-cancel',
+        description: 'Write src/long.ts',
+        tool: 'Write',
+        provider: 'qoder-sdk',
+        providerToolUseId: 'tu-live-survives-late-cancel',
+        inputPreview: JSON.stringify(longWriteInput).slice(0, 300),
+      });
+      await vi.waitFor(() => {
+        expect(send).toHaveBeenCalledWith(expect.objectContaining({
+          type: TRANSPORT_EVENT.CHAT_APPROVAL,
+          requestId: 'approval-survives-late-cancel',
+        }));
+      });
+
+      // Owner turn (requiresSharedMachineAuthority() === false) is unaffected
+      send.mockClear();
+      vi.mocked(getTransportRuntime).mockReturnValue({
+        requiresSharedMachineAuthority: () => false,
+      } as never);
+
+      fireApproval('sess-approval', {
+        id: 'approval-owner',
+        description: 'Read ~/.ssh/id_ed25519',
+        tool: 'read',
+        provider: 'qoder-sdk',
+        inputPreview: '{"file_path":"/home/k/.ssh/id_ed25519"}',
+      });
+      await vi.waitFor(() => {
+        expect(send).toHaveBeenCalledWith(expect.objectContaining({
+          type: TRANSPORT_EVENT.CHAT_APPROVAL,
+          requestId: 'approval-owner',
+        }));
+      });
+    });
   });
 
   // ── wireProviderToRelay — onToolCall: AskUserQuestion ────────────────────
@@ -2762,6 +2974,40 @@ describe('tool-execution guard seam (pair participants and the main checkout)', 
     expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' })).toEqual({ allow: false, reason: 'refused' });
     expect(evaluator).toHaveBeenCalledWith('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' });
     expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git status' } })).toEqual({ allow: true });
+  });
+
+  it('reuses async toolExecutionEvaluator in onApprovalRequest for participant turns without leaking raw path strings', async () => {
+    const { getTransportRuntime } = await import('../../src/agent/session-manager.js');
+    const { default: logger } = await import('../../src/util/logger.js');
+    const warnSpy = vi.spyOn(logger, 'warn');
+    vi.mocked(getTransportRuntime).mockReturnValue({ requiresSharedMachineAuthority: () => true } as never);
+    getSessionMock.mockReturnValue({ projectDir: '/proj' });
+
+    const evaluator = vi.fn(async () => ({ allow: false as const, reason: 'Blocked sensitive path' }));
+    setTransportToolExecutionEvaluator(evaluator);
+
+    const { provider, fireApproval } = makeMockProvider();
+    const send = vi.fn();
+    setTransportRelaySend(send);
+    wireProviderToRelay(provider);
+
+    fireApproval('sess-eval-approval', {
+      id: 'req-eval-1',
+      description: 'Read /home/k/.ssh/id_ed25519',
+      tool: 'Read',
+      inputPreview: '{"file_path":"/home/k/.ssh/id_ed25519"}',
+    });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(evaluator).toHaveBeenCalledWith('sess-eval-approval', expect.objectContaining({
+      toolName: 'Read',
+      cwd: '/proj',
+    }));
+    expect(send).not.toHaveBeenCalled();
+    for (const call of warnSpy.mock.calls) {
+      expect(JSON.stringify(call)).not.toContain('id_ed25519');
+    }
+    warnSpy.mockRestore();
   });
 });
 

@@ -1355,16 +1355,18 @@ export function FileBrowser({
           }
           const officeErrorFallbackType = pending.forceNativeText ? null : getAutoOfficePreviewType(filePath);
           const errorCodeOrMessage = String(msg.error ?? '');
+          const isForbiddenError = msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH
+            || msg.error === FS_READ_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN;
           const isMissingFileError = msg.error === FS_READ_ERROR_CODES.PARENT_NOT_FOUND
             || /not[_ -]?found|enoent|no such file/i.test(errorCodeOrMessage);
           const errDlId = msg.downloadId
-            || (!isMissingFileError && msg.error !== FS_READ_ERROR_CODES.FORBIDDEN_PATH ? fallbackNodeDownloadId : undefined);
+            || (!isMissingFileError && !isForbiddenError ? fallbackNodeDownloadId : undefined);
           if (
             officeErrorFallbackType
             && serverId
             && errDlId
             && !isMissingFileError
-            && msg.error !== FS_READ_ERROR_CODES.FORBIDDEN_PATH
+            && !isForbiddenError
             && msg.error !== FS_READ_ERROR_CODES.FILE_TOO_LARGE
           ) {
             void buildAttachmentDownloadUrl(serverId, errDlId, sessionName)
@@ -1383,7 +1385,7 @@ export function FileBrowser({
             return;
           }
           const errKey = msg.error === FS_READ_ERROR_CODES.FILE_TOO_LARGE ? 'file_browser.preview_too_large'
-            : msg.error === FS_READ_ERROR_CODES.FORBIDDEN_PATH ? 'file_browser.preview_error'
+            : isForbiddenError ? 'file_browser.preview_error'
             : 'file_browser.preview_error';
           finishPreviewError(filePath, t(errKey), errDlId);
           return;

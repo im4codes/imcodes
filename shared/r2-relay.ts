@@ -1,3 +1,5 @@
+import type { SharedActorEnvelope } from './tab-sharing.js';
+
 /** Opt-in, object-store-only file relay. Never change the default direct route. */
 export const FILE_RELAY_MODE = { DIRECT: 'direct', R2: 'r2_relay' } as const;
 export type FileRelayMode = typeof FILE_RELAY_MODE[keyof typeof FILE_RELAY_MODE];
@@ -42,6 +44,8 @@ export interface R2RelayDownloadRequest {
   type: typeof R2_RELAY_MSG.DOWNLOAD; downloadId: string; attachmentId: string; uploadUrl: string;
   /** Object PUTs are whole-object transfers; direct HTTP resume keeps its old protocol. */
   offset?: never;
+  /** Server-authored shared actor envelope for participant privacy enforcement. */
+  sharedActor?: SharedActorEnvelope;
 }
 export interface R2RelayProgressMessage extends R2RelayProgress {
   type: typeof R2_RELAY_MSG.PROGRESS; downloadId: string;

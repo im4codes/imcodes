@@ -28,6 +28,12 @@ import { readDelegationClaim } from '../../shared/delegation-claim.js';
 import { TASK_PAIR_TERMINAL_FLUSH_FIELD } from '../../shared/task-pair.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid, getTransportRuntime } from '../agent/session-manager.js';
+import {
+  clearPreEvaluatedParticipantToolDecisions,
+  evaluateParticipantToolAccess,
+  getParticipantToolTurnEpoch,
+  recordPreEvaluatedParticipantToolDecision,
+} from './participant-privacy-guard.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import {
@@ -533,8 +539,11 @@ export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void
   sendToServer = fn;
 }
 
-/** Decides, per session, whether a shell tool call may run. Installed once by the daemon lifecycle (the relay itself knows nothing about pairs). */
-export type TransportToolExecutionEvaluator = (sessionName: string, request: ToolExecutionRequest) => ToolExecutionGuardDecision;
+/** Decides, per session, whether a tool call may run. Installed once by the daemon lifecycle (the relay itself knows nothing about pairs). */
+export type TransportToolExecutionEvaluator = (
+  sessionName: string,
+  request: ToolExecutionRequest,
+) => ToolExecutionGuardDecision | Promise<ToolExecutionGuardDecision>;
 let toolExecutionEvaluator: TransportToolExecutionEvaluator | undefined;
 export function setTransportToolExecutionEvaluator(evaluator: TransportToolExecutionEvaluator | undefined): void {
   toolExecutionEvaluator = evaluator;
@@ -551,11 +560,113 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     const sessionName = resolveSessionName(providerSid);
     return sessionName ? evaluateNativeCollaborationPreExecution(sessionName, request) : { allow: true };
   });
-  // Pre-execution veto for shell tools where the provider has a real pre-tool
-  // hook: a pair participant may not write git state in the main checkout.
+  // Pre-execution veto for shell and file-access tools where the provider has a real pre-tool
+  // hook or permission gate. Fail closed if evaluator throws during a participant turn.
+  const isParticipantRoute = (providerSid: string): boolean => {
+    const sessionName = resolveSessionName(providerSid);
+    return Boolean(sessionName && getTransportRuntime(sessionName)?.requiresSharedMachineAuthority());
+  };
+  provider.setParticipantTurnResolver?.(isParticipantRoute);
+  interface RelayToolBinding {
+    sessionName: string;
+    providerSid: string;
+    dispatchId: number | null;
+    turnEpoch: number;
+  }
+  const captureRelayToolBinding = (sessionName: string, providerSid: string): RelayToolBinding => {
+    const runtime = getTransportRuntime(sessionName) as {
+      getParticipantToolBinding?: () => { providerSessionId: string | null; dispatchId: number | null };
+    } | undefined;
+    const runtimeBinding = runtime?.getParticipantToolBinding?.();
+    return {
+      sessionName,
+      providerSid,
+      dispatchId: runtimeBinding ? runtimeBinding.dispatchId : null,
+      turnEpoch: getParticipantToolTurnEpoch(sessionName),
+    };
+  };
+  const isRelayToolBindingCurrent = (captured: RelayToolBinding): boolean => {
+    if (resolveSessionName(captured.providerSid) !== captured.sessionName) return false;
+    if (getParticipantToolTurnEpoch(captured.sessionName) !== captured.turnEpoch) return false;
+    const runtime = getTransportRuntime(captured.sessionName) as {
+      requiresSharedMachineAuthority?: () => boolean;
+      getParticipantToolBinding?: () => { providerSessionId: string | null; dispatchId: number | null };
+    } | undefined;
+    if (!runtime?.requiresSharedMachineAuthority?.()) return false;
+    const currentBinding = runtime.getParticipantToolBinding?.();
+    if (currentBinding) {
+      if (currentBinding.providerSessionId !== null && currentBinding.providerSessionId !== captured.providerSid) {
+        return false;
+      }
+      if (currentBinding.dispatchId !== captured.dispatchId) {
+        return false;
+      }
+    }
+    return true;
+  };
+  const recordBoundGuardDecision = (
+    captured: RelayToolBinding,
+    request: ToolExecutionRequest,
+    decision: ToolExecutionGuardDecision,
+  ): ToolExecutionGuardDecision => {
+    if (!isRelayToolBindingCurrent(captured)) {
+      return { allow: false, reason: 'Sensitive path policy: stale turn binding' };
+    }
+    if (request.input !== undefined && request.toolUseId) {
+      recordPreEvaluatedParticipantToolDecision({
+        sessionName: captured.sessionName,
+        providerSessionId: captured.providerSid,
+        dispatchId: captured.dispatchId,
+        expectedTurnEpoch: captured.turnEpoch,
+        toolUseId: request.toolUseId,
+        toolName: request.toolName,
+        decision,
+      });
+    }
+    return decision;
+  };
   provider.setToolExecutionGuard?.((providerSid, request) => {
     const sessionName = resolveSessionName(providerSid);
-    return sessionName && toolExecutionEvaluator ? toolExecutionEvaluator(sessionName, request) : { allow: true };
+    if (!sessionName) return { allow: true };
+    const participantTurn = isParticipantRoute(providerSid);
+    if (!participantTurn) {
+      clearPreEvaluatedParticipantToolDecisions(sessionName);
+      if (!toolExecutionEvaluator) return { allow: true };
+      return toolExecutionEvaluator(sessionName, request);
+    }
+    const captured = captureRelayToolBinding(sessionName, providerSid);
+    const failClosed = (err: unknown): ToolExecutionGuardDecision => {
+      logger.warn({ sessionName, tool: request.toolName, err }, 'transport-relay: participant tool guard threw; failing closed');
+      return {
+        allow: false,
+        reason: 'Sensitive path policy: verification failed',
+      };
+    };
+    try {
+      const guardedRequest: ToolExecutionRequest = toolExecutionEvaluator
+        ? {
+            ...request,
+            providerSessionId: providerSid,
+            dispatchId: captured.dispatchId,
+          }
+        : request;
+      const decision = toolExecutionEvaluator
+        ? toolExecutionEvaluator(sessionName, guardedRequest)
+        : evaluateParticipantToolAccess(request, {
+            cwd: request.cwd ?? getSession(sessionName)?.projectDir,
+            sessionName,
+            providerSessionId: providerSid,
+            dispatchId: captured.dispatchId,
+          });
+      if (decision && typeof (decision as PromiseLike<ToolExecutionGuardDecision>).then === 'function') {
+        return (decision as Promise<ToolExecutionGuardDecision>)
+          .then((resolved) => recordBoundGuardDecision(captured, request, resolved))
+          .catch(failClosed);
+      }
+      return recordBoundGuardDecision(captured, request, decision as ToolExecutionGuardDecision);
+    } catch (err) {
+      return failClosed(err);
+    }
   });
   // Per-session fence resolver for `session_fence` providers, asked on the
   // path that launches, loads or sends. A provider that launches before the
@@ -1177,6 +1288,64 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     if (!sessionName) {
       logger.debug({ providerSid }, 'transport-relay: unresolved route for approval — dropped');
       return;
+    }
+    const runtime = getTransportRuntime(sessionName);
+    if (runtime?.requiresSharedMachineAuthority()) {
+      const captured = captureRelayToolBinding(sessionName, providerSid);
+      const requestInfo: ToolExecutionRequest = {
+        toolName: request.tool ?? '',
+        input: undefined,
+        description: request.description,
+        inputPreview: request.inputPreview,
+        cwd: getSession(sessionName)?.projectDir,
+        ...(request.providerToolUseId ? { toolUseId: request.providerToolUseId } : {}),
+        providerSessionId: providerSid,
+        dispatchId: captured.dispatchId,
+      };
+      void Promise.resolve(
+        toolExecutionEvaluator
+          ? toolExecutionEvaluator(sessionName, requestInfo)
+          : evaluateParticipantToolAccess(requestInfo, {
+              cwd: requestInfo.cwd,
+              sessionName,
+              providerSessionId: providerSid,
+              dispatchId: captured.dispatchId,
+            }),
+      ).then((decision) => {
+        if (!isRelayToolBindingCurrent(captured)) return;
+        if (!decision.allow) {
+          logger.warn(
+            { sessionName, providerSid, requestId: request.id, tool: request.tool },
+            'transport-relay: suppressed sensitive-path approval during shared-participant turn',
+          );
+          if (!toolExecutionEvaluator) {
+            emitAgentStatus(sessionName, {
+              status: 'running',
+              label: 'Blocked sensitive path tool access',
+            });
+          }
+          return;
+        }
+        runWithRelaySessionPrivacy(sessionName, () => {
+          const payload = {
+            type: TRANSPORT_EVENT.CHAT_APPROVAL,
+            sessionId: sessionName,
+            requestId: request.id,
+            description: request.description,
+            ...(request.tool ? { tool: request.tool } : {}),
+            ...(request.provider ? { provider: request.provider } : {}),
+            ...(typeof request.providerGeneration === 'number' ? { providerGeneration: request.providerGeneration } : {}),
+            ...(request.providerToolUseId ? { providerToolUseId: request.providerToolUseId } : {}),
+            ...(request.inputPreview ? { inputPreview: request.inputPreview } : {}),
+          } as const;
+          sendToServer?.(payload);
+          void appendTransportEvent(sessionName, payload);
+        });
+      });
+      return;
+    }
+    if (runtime && !runtime.requiresSharedMachineAuthority()) {
+      clearPreEvaluatedParticipantToolDecisions(sessionName);
     }
     runWithRelaySessionPrivacy(sessionName, () => {
     const payload = {

@@ -11,6 +11,7 @@ import type {
   ProviderStatusUpdate,
   ProviderDelegationNotification,
   ToolCallEvent,
+  ToolExecutionGuard,
   ApprovalRequest,
   RemoteSessionInfo,
   RemoteSessionListOptions,
@@ -381,6 +382,8 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
   private readonly pendingQuestionChoices = new Map<string, string[]>();
   private userInputSeq = 0;
   private nativeCollaborationGate?: NativeCollaborationGate;
+  private toolExecutionGuard?: ToolExecutionGuard;
+  private participantTurnResolver?: (sessionId: string) => boolean;
   private poisonedSessionIds = new Set<string>();
   private deltaCallbacks: Array<(sessionId: string, delta: MessageDelta) => void> = [];
   private completeCallbacks: Array<(sessionId: string, message: AgentMessage) => void> = [];
@@ -1091,8 +1094,32 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
       // tool, independently of the permission mode.
       hooks: {
         handlers: {
-          onPreToolUse: (input: PreToolUseHookInput): PreToolUseHookOutput | undefined =>
-            this.evaluateNativeAgentToolUse(routeId, input),
+          onPreToolUse: async (input: PreToolUseHookInput): Promise<PreToolUseHookOutput | undefined> => {
+            this.evaluateNativeAgentToolUse(routeId, input);
+            if (this.toolExecutionGuard) {
+              const record = input && typeof input === 'object' && !Array.isArray(input)
+                ? input as unknown as Record<string, unknown>
+                : undefined;
+              const toolName = typeof record?.toolName === 'string' ? record.toolName : '';
+              try {
+                const decision = await this.toolExecutionGuard(routeId, {
+                  toolName,
+                  input: record?.toolArgs ?? record,
+                  cwd: this.sessions.get(routeId)?.cwd,
+                });
+                if (!decision.allow) {
+                  return { permissionDecision: 'deny', permissionDecisionReason: decision.reason };
+                }
+              } catch (err) {
+                if (this.participantTurnResolver?.(routeId) === true) {
+                  logger.warn({ provider: this.id, routeId, err }, 'Copilot pre-tool guard failed during participant turn; failing closed');
+                  return { permissionDecision: 'deny', permissionDecisionReason: 'Sensitive path policy: verification failed' };
+                }
+                logger.warn({ provider: this.id, routeId, err }, 'Copilot pre-tool guard failed; allowing tool call');
+              }
+            }
+            return undefined;
+          },
         },
       },
     };
@@ -1100,6 +1127,14 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
 
   setNativeCollaborationGate(gate: NativeCollaborationGate): void {
     this.nativeCollaborationGate = gate;
+  }
+
+  setToolExecutionGuard(guard: ToolExecutionGuard): void {
+    this.toolExecutionGuard = guard;
+  }
+
+  setParticipantTurnResolver(resolver: (sessionId: string) => boolean): void {
+    this.participantTurnResolver = resolver;
   }
 
   /**
@@ -1328,6 +1363,29 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
       return { kind: 'denied-interactively-by-user', feedback: 'Session is cancelling' };
     }
     const requestId = randomUUID();
+    const rawToolCallId = typeof request.toolCallId === 'string' && request.toolCallId.trim().length > 0
+      ? request.toolCallId.trim()
+      : undefined;
+    const toolUseId = rawToolCallId ?? requestId;
+    if (this.toolExecutionGuard) {
+      try {
+        const decision = await this.toolExecutionGuard(routeId, {
+          toolName: isNonEmptyString(request.kind) ? request.kind : 'permission',
+          input: request,
+          cwd: state.cwd,
+          toolUseId,
+        });
+        if (!decision.allow) {
+          return { kind: 'denied-interactively-by-user', feedback: decision.reason };
+        }
+      } catch (err) {
+        if (this.participantTurnResolver?.(routeId) === true) {
+          logger.warn({ provider: this.id, routeId, err }, 'Copilot permission guard failed during participant turn; failing closed');
+          return { kind: 'denied-interactively-by-user', feedback: 'Sensitive path policy: verification failed' };
+        }
+        logger.warn({ provider: this.id, routeId, err }, 'Copilot permission guard failed; forwarding approval');
+      }
+    }
     const generation = generationOverride ?? state.generation;
     if (!this.approvalCallbacks.length) {
       return { kind: 'denied-no-approval-rule-and-could-not-request-from-user' };
@@ -1345,6 +1403,9 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
       const approvalRequest: ApprovalRequest = {
         id: requestId,
         description: buildApprovalDescription(request),
+        provider: this.id,
+        providerGeneration: generation,
+        providerToolUseId: toolUseId,
         ...(isNonEmptyString(request.kind) ? { tool: request.kind } : {}),
       };
       for (const cb of this.approvalCallbacks) cb(routeId, approvalRequest);

@@ -1155,4 +1155,63 @@ describe('MuseCodeSdkProvider session and turn lifecycle', () => {
     expect(normalizeMuseModelId('')).toBe('muse-wonder-full-1.0');
     expect(normalizeMuseModelId(undefined)).toBe('muse-wonder-full-1.0');
   });
+
+  it('enforces toolExecutionGuard in handleApprovalRequest BEFORE emitting approval and preserves subsequent owner requests', async () => {
+    const provider = new MuseCodeSdkProvider();
+    let blockSensitive = true;
+    provider.setToolExecutionGuard((_sid, req) => {
+      if (blockSensitive && JSON.stringify(req.input).includes('.ssh')) {
+        return { allow: false, reason: 'Sensitive path policy' };
+      }
+      return { allow: true };
+    });
+
+    let approvalHandler: any = null;
+    const sessionObj = {
+      sessionId: 'muse-priv-session',
+      onApproval: vi.fn().mockImplementation((handler) => {
+        approvalHandler = handler;
+      }),
+      sendUserTurn: vi.fn(),
+    };
+    (provider as any).client = { startSession: vi.fn().mockResolvedValue(sessionObj) };
+
+    const approvals: ApprovalRequest[] = [];
+    provider.onApprovalRequest((_sid, req) => approvals.push(req));
+
+    const routeId = await provider.createSession({ cwd: '/home/k/project', model: 'muse-wonder-1.0' });
+    expect(approvalHandler).toBeTypeOf('function');
+
+    const denied = await approvalHandler({
+      approvalId: 'muse-appr-1',
+      toolCallId: 'tc-1',
+      toolName: 'read',
+      title: 'Read file',
+      rawArgs: { file_path: '/home/k/.ssh/id_ed25519' },
+      availableChoices: [
+        { choiceId: 'allow-once', label: 'Allow', decision: 'approved' },
+        { choiceId: 'deny-once', label: 'Deny', decision: 'denied' },
+      ],
+    });
+    expect(denied).toEqual({ choiceId: 'deny-once' });
+    expect(approvals).toHaveLength(0);
+
+    // Owner turn on the same session forwards approval normally
+    blockSensitive = false;
+    const ownerPromise = approvalHandler({
+      approvalId: 'muse-appr-2',
+      toolCallId: 'tc-2',
+      toolName: 'read',
+      title: 'Read file',
+      rawArgs: { file_path: '/home/k/.ssh/id_ed25519' },
+      availableChoices: [
+        { choiceId: 'allow-once', label: 'Allow', decision: 'approved' },
+        { choiceId: 'deny-once', label: 'Deny', decision: 'denied' },
+      ],
+    });
+    await vi.waitFor(() => expect(approvals).toHaveLength(1));
+    await provider.respondApproval(routeId, 'muse-appr-2', true);
+    await expect(ownerPromise).resolves.toEqual({ choiceId: 'allow-once' });
+    await provider.endSession(routeId);
+  });
 });

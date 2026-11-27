@@ -87,6 +87,12 @@ import { TimelineProjectionBusyError } from './timeline-projection.js';
 import { FsListPoolError, getDefaultFsListWorkerPool, shouldUseFsListWorkerPool } from './fs-list-pool.js';
 import { scanFsListSnapshot } from './fs-list-worker.js';
 import { FsGitStatusPoolError, getDefaultFsGitStatusWorkerPool, shouldUseFsGitStatusWorkerPool, __resetFsGitStatusWorkerPoolForTests } from './fs-git-status-pool.js';
+import {
+  assertParticipantSubtreeSafe,
+  isParticipantSensitivePath,
+  isParticipantSensitiveRealPath,
+  isSharedParticipantActor,
+} from './participant-privacy-guard.js';
 import { loadDirectIgnoredChildren, scanFsGitStatusSnapshot } from './fs-git-status-worker.js';
 import { shapeTimelineDetailValueForTransport, shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
 import { getSupervisionTaskRegistry } from './supervision-state-store.js';
@@ -2910,6 +2916,25 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case 'file.upload':
       void (async () => {
+        if (isSharedParticipantActor(cmd.sharedActor)) {
+          const destDir = typeof cmd.destinationDirectory === 'string' ? cmd.destinationDirectory : '';
+          const fileName = typeof cmd.sanitizedName === 'string' && cmd.sanitizedName
+            ? cmd.sanitizedName
+            : typeof cmd.originalName === 'string' ? cmd.originalName : '';
+          if (
+            (destDir && await isParticipantSensitiveRealPath(destDir))
+            || (destDir && fileName && await isParticipantSensitiveRealPath(nodePath.join(destDir, fileName)))
+          ) {
+            try {
+              serverLink.send({
+                type: 'file.upload_error',
+                uploadId: cmd.uploadId,
+                error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN,
+              });
+            } catch { /* ignore */ }
+            return;
+          }
+        }
         if (typeof cmd.allowedRoot === 'string' && cmd.allowedRoot.trim()) {
           const destDir = typeof cmd.destinationDirectory === 'string' ? cmd.destinationDirectory : '';
           const sessionRoot = await resolveFsSessionRoot(cmd);
@@ -6348,6 +6373,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     const projectDir = record?.projectDir ?? '';
     const projectRealRoot = projectDir ? nodePath.resolve(projectDir) : '';
     const restrictToSessionUploads = isNonServerSharedActor(sharedActor);
+    const isParticipant = isSharedParticipantActor(sharedActor);
     for (const fp of tokens.files) {
       const absPath = nodePath.isAbsolute(fp) ? fp : nodePath.join(projectDir, fp);
       const entry = lookupAttachment(absPath);
@@ -6356,6 +6382,9 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
           const entrySessionName = extractAttachmentEntrySessionName(entry);
           const insideProject = !!projectRealRoot && isSameOrInsidePath(projectRealRoot, nodePath.resolve(entry.daemonPath));
           if (!insideProject && entrySessionName !== sessionName) continue;
+        }
+        if (isParticipant && entry.source !== 'upload' && await isParticipantSensitiveRealPath(entry.daemonPath, projectRealRoot ? { cwd: projectRealRoot } : undefined)) {
+          continue;
         }
         attachments.push({
           id: entry.id,
@@ -10627,6 +10656,17 @@ function isSameOrInsidePath(root: string, candidate: string): boolean {
   return relative === '' || (!!relative && !relative.startsWith('..') && !nodePath.isAbsolute(relative));
 }
 
+function isSafeRelativePathInsideUploadRoot(root: string, candidate: string): boolean {
+  const normalizedRoot = nodePath.resolve(root);
+  const normalizedCandidate = nodePath.resolve(candidate);
+  if (normalizedCandidate === normalizedRoot || !isSameOrInsidePath(normalizedRoot, normalizedCandidate)) {
+    return false;
+  }
+  const rel = nodePath.relative(normalizedRoot, normalizedCandidate).replace(/\\/g, '/');
+  if (!rel || rel === '.' || rel.split('/').includes('..')) return false;
+  return !isParticipantSensitivePath(rel);
+}
+
 function extractAttachmentEntrySessionName(entry: unknown): string {
   if (!entry || typeof entry !== 'object') return '';
   const raw = (entry as { sessionName?: unknown }).sessionName;
@@ -10644,12 +10684,18 @@ function extractAttachmentEntrySessionName(entry: unknown): string {
  * whole-server share participants have global download/read access to valid
  * registered uploads on that device regardless of `entry.sessionName`.
  */
+interface RegisteredUploadTarget {
+  realPath: string;
+  realUploadRoot: string;
+  lexicalUploadRoot: string;
+}
+
 async function resolveRegisteredUploadReadTarget(
   sessionName: string,
   rawPath: string,
   sharedActor?: unknown,
-): Promise<string | null> {
-  if (!sessionName) return null;
+): Promise<RegisteredUploadTarget | null> {
+  if (isNonServerSharedActor(sharedActor) && !sessionName) return null;
   const entry = lookupAttachment(rawPath);
   if (!entry || entry.source !== 'upload' || Date.now() > entry.expiresAt) return null;
 
@@ -10660,7 +10706,7 @@ async function resolveRegisteredUploadReadTarget(
 
   const uploadRoot = nodePath.resolve(imcodesStateDir(), 'uploads');
   const registeredPath = nodePath.resolve(entry.daemonPath);
-  if (registeredPath === uploadRoot || !isSameOrInsidePath(uploadRoot, registeredPath)) return null;
+  if (!isSafeRelativePathInsideUploadRoot(uploadRoot, registeredPath)) return null;
 
   try {
     const linkStats = await fsLstat(registeredPath);
@@ -10669,8 +10715,8 @@ async function resolveRegisteredUploadReadTarget(
       fsRealpath(uploadRoot),
       fsRealpath(registeredPath),
     ]);
-    if (!isSameOrInsidePath(realRoot, realTarget) || !isPathAllowed(realTarget)) return null;
-    return realTarget;
+    if (!isSafeRelativePathInsideUploadRoot(realRoot, realTarget) || !isPathAllowed(realTarget)) return null;
+    return { realPath: realTarget, realUploadRoot: realRoot, lexicalUploadRoot: uploadRoot };
   } catch {
     return null;
   }
@@ -10682,7 +10728,15 @@ async function resolveAuthorizedSessionOutOfRootReadTarget(input: {
   inProjectError: string;
   isChatFileReference: boolean;
 }): Promise<
-  | { ok: true; realPath: string; attemptedLocations?: string[]; matchCount?: number }
+  | {
+      ok: true;
+      realPath: string;
+      attemptedLocations?: string[];
+      matchCount?: number;
+      registeredUpload?: boolean;
+      uploadRoot?: string;
+      lexicalUploadRoot?: string;
+    }
   | { ok: false; error: string; attemptedLocations?: string[] }
 > {
   const hasExplicitAllowedRoot = typeof input.cmd.allowedRoot === 'string' && input.cmd.allowedRoot.trim().length > 0;
@@ -10702,7 +10756,14 @@ async function resolveAuthorizedSessionOutOfRootReadTarget(input: {
     input.cmd.sharedActor,
   );
   if (registeredUpload) {
-    return { ok: true, realPath: registeredUpload, matchCount: 1 };
+    return {
+      ok: true,
+      realPath: registeredUpload.realPath,
+      matchCount: 1,
+      registeredUpload: true,
+      uploadRoot: registeredUpload.realUploadRoot,
+      lexicalUploadRoot: registeredUpload.lexicalUploadRoot,
+    };
   }
   const published = await resolveAssistantPublishedReadTarget(sessionName, input.rawPath);
   if (!published.granted) {
@@ -10720,11 +10781,44 @@ async function resolveAuthorizedSessionOutOfRootReadTarget(input: {
         }
       : { ok: false, error: input.inProjectError };
   }
+  const uploadRoot = nodePath.resolve(imcodesStateDir(), 'uploads');
+  const registeredPublishedUpload = await resolveRegisteredUploadReadTarget(
+    sessionName,
+    published.resolution.realPath,
+    input.cmd.sharedActor,
+  );
+  let authorizedUploadRoots: { uploadRoot: string; lexicalUploadRoot: string } | undefined = registeredPublishedUpload
+    ? {
+        uploadRoot: registeredPublishedUpload.realUploadRoot,
+        lexicalUploadRoot: registeredPublishedUpload.lexicalUploadRoot,
+      }
+    : undefined;
+  if (!authorizedUploadRoots) {
+    try {
+      const [realUploadRoot, realPublished] = await Promise.all([
+        fsRealpath(uploadRoot),
+        fsRealpath(published.resolution.realPath),
+      ]);
+      const linkStats = await fsLstat(published.resolution.realPath);
+      if (
+        !linkStats.isSymbolicLink()
+        && linkStats.isFile()
+        && isSafeRelativePathInsideUploadRoot(realUploadRoot, realPublished)
+      ) {
+        authorizedUploadRoots = { uploadRoot: realUploadRoot, lexicalUploadRoot: uploadRoot };
+      }
+    } catch { /* ignore */ }
+  }
   return {
     ok: true,
     realPath: published.resolution.realPath,
     attemptedLocations: published.resolution.attemptedLocations,
     matchCount: published.resolution.matchCount,
+    ...(authorizedUploadRoots ? {
+      registeredUpload: true,
+      uploadRoot: authorizedUploadRoots.uploadRoot,
+      lexicalUploadRoot: authorizedUploadRoots.lexicalUploadRoot,
+    } : {}),
   };
 }
 
@@ -10808,7 +10902,15 @@ async function resolveUnconfinedSessionReadTarget(input: {
   rawPath: string;
   isChatFileReference: boolean;
 }): Promise<
-  | { ok: true; realPath: string; attemptedLocations?: string[]; matchCount?: number }
+  | {
+      ok: true;
+      realPath: string;
+      attemptedLocations?: string[];
+      matchCount?: number;
+      registeredUpload?: boolean;
+      uploadRoot?: string;
+      lexicalUploadRoot?: string;
+    }
   | { ok: false; error: string; attemptedLocations?: string[] }
 > {
   const normalizedRef = input.isChatFileReference
@@ -10830,7 +10932,14 @@ async function resolveUnconfinedSessionReadTarget(input: {
       input.cmd.sharedActor,
     );
     if (registeredUpload) {
-      return { ok: true, realPath: registeredUpload, matchCount: 1 };
+      return {
+        ok: true,
+        realPath: registeredUpload.realPath,
+        matchCount: 1,
+        registeredUpload: true,
+        uploadRoot: registeredUpload.realUploadRoot,
+        lexicalUploadRoot: registeredUpload.lexicalUploadRoot,
+      };
     }
   }
 
@@ -11224,6 +11333,7 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
   const projectDir = cmd.projectDir as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   if (!requestId || !projectDir) return;
+  const isParticipant = isSharedParticipantActor(cmd.sharedActor);
 
   try {
     const sessionRoot = await resolveFsSessionRoot(cmd);
@@ -11235,13 +11345,24 @@ async function handleFileSearch(cmd: Record<string, unknown>, serverLink: Server
       try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
+    if (isParticipant && projectDir !== FS_SESSION_ROOT_PATH && await isParticipantSensitiveRealPath(projectDir, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)) {
+      try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
+      return;
+    }
     const searchRoot = projectDir === FS_SESSION_ROOT_PATH ? sessionRoot.realRoot! : projectDir;
     const canonical = await resolveCanonical(searchRoot, 'strict');
     if (!canonical || (sessionRoot.realRoot && !isSameOrInsidePath(sessionRoot.realRoot, canonical.realPath))) {
       try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
       return;
     }
-    const allPaths = (await getFileSearchSnapshot(canonical.realPath)).paths;
+    if (isParticipant && isParticipantSensitivePath(canonical.realPath)) {
+      try { serverLink.send({ type: 'file.search_response', requestId, results: [], error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
+      return;
+    }
+    const snapshotPaths = (await getFileSearchSnapshot(canonical.realPath)).paths;
+    const allPaths = isParticipant
+      ? snapshotPaths.filter((p) => !isParticipantSensitivePath(p) && !isParticipantSensitivePath(nodePath.join(canonical.realPath, p)))
+      : snapshotPaths;
 
     let top: string[];
     if (!query) {
@@ -11721,6 +11842,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   const includeOpenSpecTaskStats = cmd.includeOpenSpecTaskStats === true;
   const includeSymlinkNames = cmd.includeSymlinkNames === true;
   if (!rawPath || !requestId) return;
+  const isParticipant = isSharedParticipantActor(cmd.sharedActor);
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
@@ -11739,6 +11861,10 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
     try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
     return;
   }
+  if (isParticipant && !isDrivesSentinel && rawPath !== FS_SESSION_ROOT_PATH && await isParticipantSensitiveRealPath(rawPath, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)) {
+    try { serverLink.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
+    return;
+  }
   const expanded = rawPath === FS_SESSION_ROOT_PATH
     ? sessionRoot.realRoot!
     : isDrivesSentinel
@@ -11754,7 +11880,7 @@ async function handleFsList(cmd: Record<string, unknown>, serverLink: ServerLink
   });
 
   try {
-    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, includeSymlinkNames, requestContext, sessionRoot.realRoot), deadline]);
+    await Promise.race([handleFsListInner(resolved, rawPath, requestId, includeFiles, includeMetadata, includeOpenSpecTaskStats, includeSymlinkNames, requestContext, sessionRoot.realRoot, isParticipant), deadline]);
   } catch (err) {
     const msg = fsListErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_TIMEOUT || msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -11781,6 +11907,7 @@ async function handleFsListInner(
   includeSymlinkNames: boolean,
   requestContext: FsListRequestContext,
   sessionRealRoot?: string,
+  isParticipant = false,
 ): Promise<void> {
   // Windows drive picker — only triggered by the explicit `:drives:` path,
   // NOT by `~` (which always means the user's home directory on every OS).
@@ -11813,6 +11940,10 @@ async function handleFsListInner(
     requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH });
     return;
   }
+  if (isParticipant && isParticipantSensitivePath(canonical.realPath)) {
+    requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN });
+    return;
+  }
 
   const effectiveIncludeSymlinkNames = includeSymlinkNames && !sessionRealRoot && !includeMetadata;
   const snapshot = await getFsListSnapshot(
@@ -11823,7 +11954,7 @@ async function handleFsListInner(
     effectiveIncludeSymlinkNames,
   );
   let visibleEntries = snapshot.entries;
-  if (sessionRealRoot) {
+  if (sessionRealRoot || isParticipant) {
     const filtered: Array<Record<string, unknown>> = [];
     for (const entry of visibleEntries) {
       const candidatePath = typeof entry.path === 'string' && entry.path
@@ -11832,14 +11963,21 @@ async function handleFsListInner(
           ? nodePath.join(canonical.realPath, entry.name)
           : '';
       if (!candidatePath) continue;
+      if (isParticipant && isParticipantSensitivePath(candidatePath)) {
+        continue;
+      }
       try {
         const realCandidate = await fsRealpath(candidatePath);
-        if (!isPathAllowed(realCandidate) || !isSameOrInsidePath(sessionRealRoot, realCandidate)) {
-          continue;
-        }
+        if (!isPathAllowed(realCandidate)) continue;
+        if (sessionRealRoot && !isSameOrInsidePath(sessionRealRoot, realCandidate)) continue;
+        if (isParticipant && isParticipantSensitivePath(realCandidate)) continue;
         filtered.push(entry);
       } catch {
-        // Broken symlink or inaccessible entry inside scoped root — omit
+        // Broken symlink or inaccessible entry inside scoped root — omit for scoped roots;
+        // for unconfined participant browse, keep regular entries only if non-sensitive.
+        if (!sessionRealRoot && isParticipant && !(await isParticipantSensitiveRealPath(candidatePath))) {
+          filtered.push(entry);
+        }
       }
     }
     visibleEntries = filtered;
@@ -11851,10 +11989,19 @@ async function handleFsListInner(
   requestContext.send({ type: 'fs.ls_response', requestId, path: rawPath, resolvedPath: snapshot.resolvedPath, status: 'ok', entries });
 }
 
+function isDirectUploadDirFileCandidate(rawPath: string): boolean {
+  const expanded = rawPath.startsWith('~') ? rawPath.replace(/^~/, homedir()) : rawPath;
+  if (expanded.replace(/\\/g, '/').split('/').includes('..')) return false;
+  const resolved = nodePath.resolve(expanded);
+  const uploadRoot = nodePath.resolve(imcodesStateDir(), 'uploads');
+  return isSafeRelativePathInsideUploadRoot(uploadRoot, resolved);
+}
+
 async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawPath = typeof cmd.path === 'string' ? cmd.path : '';
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
   if (!rawPath || !requestId) return;
+  const isParticipant = isSharedParticipantActor(cmd.sharedActor);
   const hasExplicitAllowedRoot = typeof cmd.allowedRoot === 'string' && cmd.allowedRoot.trim().length > 0;
   const confinedToSessionRoot = isNonServerSharedActor(cmd.sharedActor) || hasExplicitAllowedRoot;
   const sessionRoot = await resolveFsSessionRoot(cmd);
@@ -11863,10 +12010,63 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     return;
   }
   const isChatFileReference = cmd.chatFileReference === true;
+  const cwdOpts = sessionRoot.ok && sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined;
+  const isSafeAuthorizedUploadPath = (candidate: string, allowedRoots: readonly string[]): boolean => {
+    if (candidate.replace(/\\/g, '/').split('/').includes('..')) return false;
+    const expanded = candidate.startsWith('~') ? candidate.replace(/^~/, homedir()) : candidate;
+    const resolved = nodePath.resolve(expanded);
+    if (isParticipantSensitivePath(nodePath.basename(resolved))) return false;
+    return allowedRoots.some((rawRoot) => Boolean(rawRoot) && isSafeRelativePathInsideUploadRoot(rawRoot, resolved));
+  };
+  const hasRawSensitiveSegment = (candidate: string): boolean => {
+    if (isParticipantSensitivePath(candidate, cwdOpts)) return true;
+    for (const seg of candidate.replace(/\\/g, '/').split('/')) {
+      if (seg && seg !== '.' && seg !== '..' && isParticipantSensitivePath(seg)) return true;
+    }
+    return false;
+  };
   const sendReadResult = (
     realPath: string,
-    metadata?: { attemptedLocations?: string[]; matchCount?: number },
+    metadata?: {
+      attemptedLocations?: string[];
+      matchCount?: number;
+      registeredUpload?: boolean;
+      uploadRoot?: string;
+      lexicalUploadRoot?: string;
+    },
   ) => {
+    const defaultUploadRoot = nodePath.resolve(imcodesStateDir(), 'uploads');
+    const canonicalUploadRoots = metadata?.uploadRoot ? [metadata.uploadRoot] : [defaultUploadRoot];
+    const requestedUploadRoots = Array.from(new Set([
+      ...canonicalUploadRoots,
+      ...(metadata?.lexicalUploadRoot ? [metadata.lexicalUploadRoot] : []),
+      defaultUploadRoot,
+    ]));
+    const allowExactRegisteredUpload = Boolean(
+      metadata?.registeredUpload
+      && !hasExplicitAllowedRoot
+      && isSafeAuthorizedUploadPath(realPath, canonicalUploadRoots)
+      && (
+        (!hasRawSensitiveSegment(rawPath) && !rawPath.replace(/\\/g, '/').split('/').includes('..'))
+        || isSafeAuthorizedUploadPath(rawPath, requestedUploadRoots)
+      ),
+    );
+    if (
+      isParticipant
+      && !allowExactRegisteredUpload
+      && (hasRawSensitiveSegment(rawPath) || isParticipantSensitivePath(realPath, cwdOpts))
+    ) {
+      try {
+        serverLink.send({
+          type: 'fs.read_response',
+          requestId,
+          path: rawPath,
+          status: 'error',
+          error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
     if (!isChatFileReference) {
       getDefaultPreviewReadCoordinator().handle(realPath, requestId, (message) => serverLink.send(message));
       return;
@@ -11896,16 +12096,24 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
       sendReadResult(outOfRoot.realPath, {
         attemptedLocations: outOfRoot.attemptedLocations,
         matchCount: outOfRoot.matchCount,
+        registeredUpload: outOfRoot.registeredUpload,
+        uploadRoot: outOfRoot.uploadRoot,
+        lexicalUploadRoot: outOfRoot.lexicalUploadRoot,
       });
       return;
     }
+    const errorCode = isParticipant
+      && !isDirectUploadDirFileCandidate(rawPath)
+      && await isParticipantSensitiveRealPath(rawPath, cwdOpts)
+      ? FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN
+      : outOfRoot.error;
     try {
       serverLink.send({
         type: 'fs.read_response',
         requestId,
         path: rawPath,
         status: 'error',
-        error: outOfRoot.error,
+        error: errorCode,
         ...(outOfRoot.attemptedLocations ? { attemptedLocations: outOfRoot.attemptedLocations } : {}),
       });
     } catch { /* ignore */ }
@@ -11924,20 +12132,55 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
       sendReadResult(resolvedTarget.realPath, {
         attemptedLocations: resolvedTarget.attemptedLocations,
         matchCount: resolvedTarget.matchCount,
+        registeredUpload: resolvedTarget.registeredUpload,
+        uploadRoot: resolvedTarget.uploadRoot,
+        lexicalUploadRoot: resolvedTarget.lexicalUploadRoot,
       });
       return;
     }
+    const errorCode = isParticipant
+      && !isDirectUploadDirFileCandidate(rawPath)
+      && await isParticipantSensitiveRealPath(rawPath, cwdOpts)
+      ? FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN
+      : resolvedTarget.error;
     try {
       serverLink.send({
         type: 'fs.read_response',
         requestId,
         path: rawPath,
         status: 'error',
-        error: resolvedTarget.error,
+        error: errorCode,
         ...(resolvedTarget.attemptedLocations ? { attemptedLocations: resolvedTarget.attemptedLocations } : {}),
       });
     } catch { /* ignore */ }
     return;
+  }
+
+  if (isParticipant) {
+    const registeredUpload = !hasExplicitAllowedRoot
+      ? await resolveRegisteredUploadReadTarget('', rawPath, cmd.sharedActor)
+      : null;
+    if (registeredUpload) {
+      sendReadResult(registeredUpload.realPath, {
+        matchCount: 1,
+        registeredUpload: true,
+        uploadRoot: registeredUpload.realUploadRoot,
+        lexicalUploadRoot: registeredUpload.lexicalUploadRoot,
+      });
+      return;
+    }
+    if (await isParticipantSensitiveRealPath(rawPath)) {
+      try {
+        serverLink.send({
+          type: 'fs.read_response',
+          requestId,
+          path: rawPath,
+          status: 'error',
+          error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
   }
 
   getDefaultPreviewReadCoordinator().handle(rawPath, requestId, (message) => serverLink.send(message));
@@ -12703,10 +12946,15 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
   const summaryOnly = cmd.summaryOnly === true;
   const includeStats = !summaryOnly && cmd.includeStats === true;
   if (!rawPath || !requestId) return;
+  const isParticipant = isSharedParticipantActor(cmd.sharedActor);
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
     try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', files: [], error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (isParticipant && await isParticipantSensitiveRealPath(rawPath, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)) {
+    try { serverLink.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', files: [], error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
     return;
   }
 
@@ -12720,7 +12968,7 @@ async function handleFsGitStatus(cmd: Record<string, unknown>, serverLink: Serve
     deadlineTimer.unref?.();
   });
   try {
-    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, summaryOnly, requestContext, sessionRoot.realRoot), deadline]);
+    await Promise.race([handleFsGitStatusInner(resolved, rawPath, requestId, includeStats, summaryOnly, requestContext, sessionRoot.realRoot, isParticipant), deadline]);
   } catch (err) {
     const msg = fsGitStatusErrorCode(err);
     if (msg === FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_TIMEOUT) {
@@ -12743,8 +12991,13 @@ async function handleFsGitStatusInner(
   summaryOnly: boolean,
   requestContext: FsListRequestContext,
   sessionRealRoot?: string,
+  isParticipant = false,
 ): Promise<void> {
   const real = await fsRealpath(resolved);
+  if (isParticipant && isParticipantSensitivePath(real)) {
+    requestContext.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN });
+    return;
+  }
   const allowed = isPathAllowed(real) && (!sessionRealRoot || isSameOrInsidePath(sessionRealRoot, real));
   if (!allowed) {
     requestContext.send({ type: 'fs.git_status_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.FORBIDDEN_PATH });
@@ -12768,10 +13021,15 @@ async function handleFsGitDiff(cmd: Record<string, unknown>, serverLink: ServerL
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   if (!rawPath || !requestId) return;
+  const isParticipant = isSharedParticipantActor(cmd.sharedActor);
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
     try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (isParticipant && await isParticipantSensitiveRealPath(rawPath, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)) {
+    try { serverLink.send({ type: 'fs.git_diff_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
     return;
   }
 
@@ -12810,10 +13068,15 @@ async function handleFsMkdir(cmd: Record<string, unknown>, serverLink: ServerLin
   const rawPath = cmd.path as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   if (!rawPath || !requestId) return;
+  const isParticipant = isSharedParticipantActor(cmd.sharedActor);
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok || sessionRoot.allowedRootIsFile) {
     try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: sessionRoot.ok ? FS_READ_ERROR_CODES.FORBIDDEN_PATH : sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (isParticipant && await isParticipantSensitiveRealPath(rawPath, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)) {
+    try { serverLink.send({ type: 'fs.mkdir_response', requestId, path: rawPath, status: 'error', error: FS_READ_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
     return;
   }
 
@@ -12874,10 +13137,15 @@ async function handleFsWrite(cmd: Record<string, unknown>, serverLink: ServerLin
   const expectedMtime = typeof cmd.expectedMtime === 'number' ? cmd.expectedMtime : undefined;
   const createOnly = cmd.createOnly === true;
   const isBase64 = cmd.encoding === 'base64';
+  const isParticipant = isSharedParticipantActor(cmd.sharedActor);
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
     try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (isParticipant && await isParticipantSensitiveRealPath(rawPath, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)) {
+    try { serverLink.send({ type: 'fs.write_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
     return;
   }
 
@@ -13088,10 +13356,21 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
     }
     return;
   }
+  const isParticipant = isSharedParticipantActor(cmd.sharedActor);
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (
+    isParticipant
+    && (
+      await isParticipantSensitiveRealPath(rawPath, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)
+      || await isParticipantSensitiveRealPath(rawNewPath, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)
+    )
+  ) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, status: 'error', error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
     return;
   }
 
@@ -13108,6 +13387,20 @@ async function handleFsRename(cmd: Record<string, unknown>, serverLink: ServerLi
   });
   if (!destination.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: destination.resolved, status: 'error', error: destination.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (
+    isParticipant
+    && (
+      !(await assertParticipantSubtreeSafe(source.real, {
+        ...(sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : {}),
+        projectedDestinationRoot: destination.resolved,
+      }))
+      || isParticipantSensitivePath(destination.resolved, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)
+      || (overwrite && (await fsLstat(destination.resolved).then(() => true, () => false)) && !(await assertParticipantSubtreeSafe(destination.resolved, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)))
+    )
+  ) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.RENAME_RESPONSE, requestId, path: rawPath, newPath: rawNewPath, resolvedPath: source.real, status: 'error', error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
     return;
   }
 
@@ -13150,10 +13443,15 @@ async function handleFsDelete(cmd: Record<string, unknown>, serverLink: ServerLi
     }
     return;
   }
+  const isParticipant = isSharedParticipantActor(cmd.sharedActor);
 
   const sessionRoot = await resolveFsSessionRoot(cmd);
   if (!sessionRoot.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (isParticipant && await isParticipantSensitiveRealPath(rawPath, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined)) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
     return;
   }
 
@@ -13162,6 +13460,13 @@ async function handleFsDelete(cmd: Record<string, unknown>, serverLink: ServerLi
   });
   if (!target.ok) {
     try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, resolvedPath: target.resolved, status: 'error', error: target.error }); } catch { /* ignore */ }
+    return;
+  }
+  if (
+    isParticipant
+    && !(await assertParticipantSubtreeSafe(target.real, sessionRoot.realRoot ? { cwd: sessionRoot.realRoot } : undefined))
+  ) {
+    try { serverLink.send({ type: FS_TRANSPORT_MSG.DELETE_RESPONSE, requestId, path: rawPath, resolvedPath: target.real, status: 'error', error: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN }); } catch { /* ignore */ }
     return;
   }
 

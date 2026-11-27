@@ -1,4 +1,5 @@
 import { FILE_RELAY_MODE } from '../r2-relay.js';
+import type { SharedActorEnvelope } from '../tab-sharing.js';
 /**
  * Shared types for the file transfer channel (upload / download).
  * Used by server, daemon, and web.
@@ -181,6 +182,7 @@ export function fileTransferMcpTimeoutMs(sizeBytes?: number): number {
 export const FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY = 'file.transfer.upload_fetch.v1' as const;
 export const FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY = 'file.transfer.download_stream.v1' as const;
 export const FILE_TRANSFER_PATH_HANDLE_CAPABILITY = 'file.transfer.path_handle.v1' as const;
+export const FILE_TRANSFER_SHARED_ACTOR_CAPABILITY = 'file.transfer.shared_actor.v1' as const;
 
 /** Headers on the node's relay PUT (node -> server staged download sink). */
 export const FILE_TRANSFER_RELAY_HEADER = {
@@ -431,6 +433,8 @@ export interface FileUploadRequest {
   destinationDirectory?: string;
   /** Server-authorized session binding for upload isolation in shared views. */
   sessionName?: string;
+  /** Server-authored shared actor envelope for participant privacy enforcement. */
+  sharedActor?: SharedActorEnvelope;
 }
 
 export interface FileUploadFetchRequest {
@@ -450,12 +454,16 @@ export interface FileUploadFetchRequest {
   destinationDirectory?: string;
   /** Server-authorized session binding for upload isolation in shared views. */
   sessionName?: string;
+  /** Server-authored shared actor envelope for participant privacy enforcement. */
+  sharedActor?: SharedActorEnvelope;
 }
 
 export interface FileDownloadRequest {
   type: 'file.download';
   downloadId: string;
   attachmentId: string;
+  /** Server-authored shared actor envelope for participant privacy enforcement. */
+  sharedActor?: SharedActorEnvelope;
 }
 
 export interface FileDownloadStreamRequest {
@@ -465,6 +473,8 @@ export interface FileDownloadStreamRequest {
   uploadUrl: string;
   /** Resume an interrupted HTTP download from this byte. */
   offset?: number;
+  /** Server-authored shared actor envelope for participant privacy enforcement. */
+  sharedActor?: SharedActorEnvelope;
 }
 
 /** Server -> controlled node: mint a short-lived handle for one explicit path. */

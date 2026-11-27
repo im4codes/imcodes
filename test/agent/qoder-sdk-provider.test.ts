@@ -1715,4 +1715,49 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
     expect(events.completions).toHaveLength(0);
     expect(events.deltas).toHaveLength(0);
   });
+
+  it('enforces toolExecutionGuard in canUseTool BEFORE approval emission and preserves subsequent owner calls', async () => {
+    const p = await makeProvider();
+    let participantActive = true;
+    p.setToolExecutionGuard(async (_sid, req) => {
+      if (!participantActive) return { allow: true };
+      const text = JSON.stringify(req.input ?? '');
+      if (text.includes('.ssh') || text.includes('leak-key')) {
+        return { allow: false, reason: 'Sensitive path policy: denied' };
+      }
+      return { allow: true };
+    });
+    const route = await createReadySession(p);
+    const events = collect(p);
+    sdkMock.state.scripts.push([
+      async ({ call, state }: any) => {
+        // 1) Blocked before onApprovalRequest fires
+        state.permissionResults.push(await call.options.canUseTool?.(
+          'Read',
+          { file_path: '/home/k/.ssh/id_ed25519' },
+          { toolUseID: 'tool-blocked', signal: new AbortController().signal, title: 'Read key' },
+        ));
+        // 2) Flip to owner turn on same session: now allowed through to approval
+        participantActive = false;
+        const allowedPromise = call.options.canUseTool?.(
+          'Read',
+          { file_path: '/home/k/.ssh/id_ed25519' },
+          { toolUseID: 'tool-owner-allowed', signal: new AbortController().signal, title: 'Read key' },
+        );
+        await vi.waitFor(() => expect(events.approvals).toHaveLength(1));
+        await p.respondApproval(route, events.approvals[0].request.id, true);
+        state.permissionResults.push(await allowedPromise);
+      },
+      { type: 'result', subtype: 'success', result: 'done', uuid: 'qoder-guard-done' },
+    ]);
+
+    await p.send(route, 'hello');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(1));
+    expect(sdkMock.state.permissionResults[0]).toEqual({
+      behavior: 'deny',
+      message: 'Sensitive path policy: denied',
+      interrupt: false,
+    });
+    expect(sdkMock.state.permissionResults[1]).toEqual({ behavior: 'allow' });
+  });
 });

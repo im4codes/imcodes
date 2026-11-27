@@ -50,6 +50,22 @@ describe('R2 user routing and progress', () => {
     await expect(prepareR2AttachmentDownload('srv', 'abc')).rejects.toThrow();
     await expect(prepareR2AttachmentDownload('srv', 'abc')).rejects.toThrow();
   });
+  it('propagates sensitive_path_forbidden from R2 NDJSON error frame without falling back to browser anchor', async () => {
+    saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    fetchMock.mockResolvedValueOnce(new Response(
+      JSON.stringify({ phase: R2_RELAY_PHASE.ERROR, error: 'sensitive_path_forbidden' }) + '\n',
+    ));
+    try {
+      await expect(downloadAttachment('srv', 'abc', 'deck_test_brain')).rejects.toMatchObject({
+        status: 403,
+        message: expect.stringContaining('sensitive_path_forbidden'),
+      });
+      expect(click).not.toHaveBeenCalled();
+    } finally {
+      click.mockRestore();
+    }
+  });
   it('uploads browser bytes directly to signed PUT then commits metadata with no app credentials on PUT', async () => {
     saveFileRelayMode('user-a', FILE_RELAY_MODE.R2);
     fetchMock.mockResolvedValueOnce(Response.json({ id: 'ticket', url: 'https://r2.example/signed-put' }))

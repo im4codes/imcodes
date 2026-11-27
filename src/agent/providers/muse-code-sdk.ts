@@ -25,6 +25,7 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   ToolCallEvent,
+  ToolExecutionGuard,
   TransportProvider,
   ProviderDelegationNotification,
 } from '../transport-provider.js';
@@ -414,6 +415,16 @@ export class MuseCodeSdkProvider implements TransportProvider {
   private sessions = new Map<string, MuseSessionState>();
   private mcpRegistration: MuseMcpEnsureResult | null = null;
   private unregisterUsageReader: (() => void) | null = null;
+  private toolExecutionGuard?: ToolExecutionGuard;
+  private participantTurnResolver?: (sessionId: string) => boolean;
+
+  setToolExecutionGuard(guard: ToolExecutionGuard): void {
+    this.toolExecutionGuard = guard;
+  }
+
+  setParticipantTurnResolver(resolver: (sessionId: string) => boolean): void {
+    this.participantTurnResolver = resolver;
+  }
 
   private deltaCallbacks = new Set<(sessionId: string, delta: MessageDelta) => void>();
   private completeCallbacks = new Set<(sessionId: string, message: AgentMessage) => void>();
@@ -1145,14 +1156,37 @@ export class MuseCodeSdkProvider implements TransportProvider {
     }
   }
 
-  private handleApprovalRequest(routeId: string, request: MuseApprovalRequest): Promise<ApprovalDecisionInput> {
-    return new Promise<ApprovalDecisionInput>((resolve) => {
-      const state = this.sessions.get(routeId);
-      if (!state) {
-        resolve({ choiceId: request.availableChoices[0]?.choiceId ?? '' });
-        return;
+  private async handleApprovalRequest(routeId: string, request: MuseApprovalRequest): Promise<ApprovalDecisionInput> {
+    const state = this.sessions.get(routeId);
+    if (!state) {
+      return { choiceId: request.availableChoices[0]?.choiceId ?? '' };
+    }
+    if (this.toolExecutionGuard) {
+      try {
+        const decision = await this.toolExecutionGuard(routeId, {
+          toolName: request.toolName,
+          input: request.rawArgs ?? request,
+          cwd: state.cwd,
+          toolUseId: request.toolCallId || request.approvalId,
+        });
+        if (!decision.allow) {
+          const denyChoice = request.availableChoices.find(
+            (c: { decision?: string }) => c.decision === 'denied' || c.decision === 'deniedPolicyAmendment',
+          ) ?? request.availableChoices[0];
+          return { choiceId: denyChoice?.choiceId ?? '' };
+        }
+      } catch (err) {
+        if (this.participantTurnResolver?.(routeId) === true) {
+          logger.warn({ provider: this.id, routeId, err }, 'Muse permission guard failed during participant turn; failing closed');
+          const denyChoice = request.availableChoices.find(
+            (c: { decision?: string }) => c.decision === 'denied' || c.decision === 'deniedPolicyAmendment',
+          ) ?? request.availableChoices[0];
+          return { choiceId: denyChoice?.choiceId ?? '' };
+        }
+        logger.warn({ provider: this.id, routeId, err }, 'Muse permission guard failed; forwarding approval');
       }
-
+    }
+    return await new Promise<ApprovalDecisionInput>((resolve) => {
       const approvalId = request.approvalId;
       const approvalReq: ApprovalRequest = {
         id: approvalId,

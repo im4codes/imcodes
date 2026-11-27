@@ -22,6 +22,7 @@ import type {
   SessionConfig,
   SessionInfoUpdate,
   ToolCallEvent,
+  ToolExecutionGuard,
   TransportProvider,
 } from '../transport-provider.js';
 import {
@@ -756,6 +757,17 @@ export class QoderSdkProvider implements TransportProvider {
     this.toolCallCallbacks.push(cb);
   }
 
+  private toolExecutionGuard?: ToolExecutionGuard;
+  private participantTurnResolver?: (sessionId: string) => boolean;
+
+  setToolExecutionGuard(guard: ToolExecutionGuard): void {
+    this.toolExecutionGuard = guard;
+  }
+
+  setParticipantTurnResolver(resolver: (sessionId: string) => boolean): void {
+    this.participantTurnResolver = resolver;
+  }
+
   onApprovalRequest(cb: (sessionId: string, req: ApprovalRequest) => void): void {
     this.approvalCallbacks.push(cb);
   }
@@ -1088,6 +1100,25 @@ export class QoderSdkProvider implements TransportProvider {
   ): Promise<{ behavior: 'allow' } | { behavior: 'deny'; message: string; interrupt?: boolean }> {
     if (state.cancelled) return { behavior: 'deny', message: 'Qoder turn is cancelling', interrupt: true };
     const toolUseId = readString(options.toolUseID) ?? randomUUID();
+    if (this.toolExecutionGuard) {
+      try {
+        const decision = await this.toolExecutionGuard(state.routeId, {
+          toolName,
+          input,
+          cwd: state.cwd,
+          toolUseId,
+        });
+        if (!decision.allow) {
+          return { behavior: 'deny', message: decision.reason, interrupt: false };
+        }
+      } catch (err) {
+        if (this.participantTurnResolver?.(state.routeId) === true) {
+          logger.warn({ provider: this.id, routeId: state.routeId, err }, 'Qoder tool execution guard failed during participant turn; failing closed');
+          return { behavior: 'deny', message: 'Sensitive path policy: verification failed', interrupt: false };
+        }
+        logger.warn({ provider: this.id, routeId: state.routeId, err }, 'Qoder tool execution guard failed; allowing approval flow');
+      }
+    }
     const approvalId = `qoder:${state.routeId}:${state.activeGeneration}:${toolUseId}`;
     const description = options.description
       ?? options.title

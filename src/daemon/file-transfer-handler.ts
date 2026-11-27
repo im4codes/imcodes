@@ -60,6 +60,11 @@ import {
   type WellKnownDirectoryKind,
 } from './well-known-directories.js';
 import {
+  isParticipantSensitivePath,
+  isParticipantSensitiveRealPath,
+  isSharedParticipantActor,
+} from './participant-privacy-guard.js';
+import {
   createDelegatedListingProvider,
   createDirectListingProvider,
   directoryListingErrorForAppAnswer,
@@ -298,10 +303,35 @@ async function resolveDownloadTarget(
   attachmentId: string,
   serverLink: FileTransferSender,
   downloadId: string,
+  sharedActor?: unknown,
 ): Promise<DownloadTarget | null> {
   const entry = attachmentRegistry.get(attachmentId);
+  if (
+    isSharedParticipantActor(sharedActor)
+    && entry?.source === 'local'
+    && await isParticipantSensitiveRealPath(entry.daemonPath)
+  ) {
+    serverLink.send({
+      type: 'file.download_error',
+      downloadId,
+      message: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN,
+    } satisfies FileDownloadError);
+    return null;
+  }
   try {
     const source = await resolveDirectFileDownloadSource(attachmentId);
+    if (
+      isSharedParticipantActor(sharedActor)
+      && entry?.source === 'local'
+      && (await isParticipantSensitiveRealPath(entry.daemonPath) || isParticipantSensitivePath(source.readPath))
+    ) {
+      serverLink.send({
+        type: 'file.download_error',
+        downloadId,
+        message: FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN,
+      } satisfies FileDownloadError);
+      return null;
+    }
     return { entry: entry!, ...source };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -620,7 +650,11 @@ function isNoSpaceError(err: unknown): boolean {
 
 function sendUploadError(serverLink: FileTransferSender, uploadId: string, filename: string | undefined, err: unknown): void {
   const errMsg = err instanceof Error ? err.message : String(err);
-  const code = isNoSpaceError(err) ? FILE_TRANSFER_UPLOAD_ERROR_CODE.INSUFFICIENT_CAPACITY : undefined;
+  const code = isNoSpaceError(err)
+    ? FILE_TRANSFER_UPLOAD_ERROR_CODE.INSUFFICIENT_CAPACITY
+    : errMsg === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN
+      ? FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN
+      : undefined;
   logger.error({ uploadId, filename, err, code }, 'File upload failed');
   const response: FileUploadError = {
     type: 'file.upload_error',
@@ -845,6 +879,15 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
   let uploadClaim: symbol | null = null;
 
   try {
+    if (isSharedParticipantActor(cmd.sharedActor) && msg.destinationDirectory) {
+      const targetName = sanitizedName || originalName;
+      if (
+        await isParticipantSensitiveRealPath(msg.destinationDirectory)
+        || (targetName && isParticipantSensitivePath(path.join(msg.destinationDirectory, targetName)))
+      ) {
+        throw new Error(FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN);
+      }
+    }
     await initFileTransfer();
 
     // Opportunistic cleanup before writing
@@ -897,6 +940,15 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
   let uploadClaim: symbol | null = null;
 
   try {
+    if (isSharedParticipantActor(cmd.sharedActor) && msg.destinationDirectory) {
+      const targetName = sanitizedName || originalName;
+      if (
+        await isParticipantSensitiveRealPath(msg.destinationDirectory)
+        || (targetName && isParticipantSensitivePath(path.join(msg.destinationDirectory, targetName)))
+      ) {
+        throw new Error(FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN);
+      }
+    }
     await initFileTransfer();
     await cleanupExpiredUploads();
 
@@ -1018,7 +1070,7 @@ export async function handleFileDownload(cmd: Record<string, unknown>, serverLin
   let target: DownloadTarget | null = null;
 
   try {
-    target = await resolveDownloadTarget(attachmentId, serverLink, downloadId);
+    target = await resolveDownloadTarget(attachmentId, serverLink, downloadId, cmd.sharedActor);
     if (!target) return;
     await sendInlineDownload(serverLink, downloadId, target);
   } catch (err) {
@@ -1041,7 +1093,7 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
     if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) {
       throw new Error('invalid_offset');
     }
-    target = await resolveDownloadTarget(attachmentId, serverLink, downloadId);
+    target = await resolveDownloadTarget(attachmentId, serverLink, downloadId, cmd.sharedActor);
     if (!target) return;
     if (offset > target.size) {
       throw new Error('range_not_satisfiable');

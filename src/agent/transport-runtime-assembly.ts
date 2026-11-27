@@ -54,6 +54,8 @@ export interface TransportRuntimeAssemblyInput {
   deliveryId?: string;
   /** This turn's working directory when it is not the session's own (see ProviderContextPayload.turnCwd). */
   turnCwd?: string;
+  /** True when initiated/tainted by a shared participant lacking host authority. */
+  participantRestricted?: boolean;
   description?: string;
   /** Resolved deterministic user/project/session Agent identity contract. */
   identityPrompt?: string;
@@ -321,6 +323,7 @@ export function buildProviderContextPayload(
     turnSystemText: compiledContext.turnSystemText,
     ...(input.sessionIdentity?.role ? { sessionRole: input.sessionIdentity.role } : {}),
     ...(input.turnCwd ? { turnCwd: input.turnCwd } : {}),
+    ...(input.participantRestricted ? { participantRestricted: true } : {}),
     systemText: compiledContext.systemText,
     messagePreamble: compiledContext.messagePreamble,
     attachments: input.attachments,

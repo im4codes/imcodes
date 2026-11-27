@@ -18,6 +18,7 @@ import type {
   RemoteSessionListOptions,
   SessionConfig,
   SessionInfoUpdate,
+  ToolExecutionGuard,
   TransportProvider,
   ProviderDelegationNotification,
   ProviderCancelOptions,
@@ -891,6 +892,7 @@ interface NormalizedOpenCodePermission {
   operation?: string;
   title?: string;
   pattern?: string;
+  rawInput?: unknown;
   callId?: string;
 }
 
@@ -1257,6 +1259,7 @@ function normalizePermissionEvent(
       operation: safeString(payload?.action) ?? safeString(payload?.permission),
       title: safeString(payload?.message),
       pattern: permissionPattern(payload?.resources ?? payload?.patterns),
+      rawInput: payload,
       callId: safeString(payload?.source?.callID ?? payload?.tool?.callID),
     };
   }
@@ -1266,6 +1269,7 @@ function normalizePermissionEvent(
       operation: safeString(payload?.action),
       title: safeString(payload?.message),
       pattern: permissionPattern(payload?.resources),
+      rawInput: payload,
       callId: safeString(payload?.source?.callID),
     };
   }
@@ -1275,6 +1279,7 @@ function normalizePermissionEvent(
       operation: safeString(payload?.type),
       title: safeString(payload?.title),
       pattern: permissionPattern(payload?.pattern),
+      rawInput: payload,
       callId: safeString(payload?.callID),
     };
   }
@@ -3107,6 +3112,17 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     return () => { this.errorCallbacks = this.errorCallbacks.filter((item) => item !== cb); };
   }
 
+  private toolExecutionGuard?: ToolExecutionGuard;
+  private participantTurnResolver?: (sessionId: string) => boolean;
+
+  setToolExecutionGuard(guard: ToolExecutionGuard): void {
+    this.toolExecutionGuard = guard;
+  }
+
+  setParticipantTurnResolver(resolver: (sessionId: string) => boolean): void {
+    this.participantTurnResolver = resolver;
+  }
+
   onToolCall(cb: (sessionId: string, tool: ToolCallEvent) => void): void {
     this.toolCallbacks.push(cb);
   }
@@ -4074,14 +4090,46 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
   private processPermission(state: OpenCodeSessionState, permission: NormalizedOpenCodePermission | undefined): void {
     if (!permission) return;
+    if (this.toolExecutionGuard) {
+      const { id, operation, callId, rawInput, pattern } = permission;
+      const effectiveToolUseId = callId ?? id;
+      void Promise.resolve(this.toolExecutionGuard(state.routeId, {
+        toolName: operation ?? 'permission',
+        input: rawInput ?? pattern,
+        cwd: state.cwd,
+        ...(effectiveToolUseId ? { toolUseId: effectiveToolUseId } : {}),
+      })).then((decision) => {
+        if (!decision.allow) {
+          void this.replyPermission(state, id, false).catch((error) => {
+            this.emitError(state.routeId, this.normalizeError(error, 'permission rejection'));
+          });
+          return;
+        }
+        this.forwardPermissionApproval(state, permission);
+      }).catch(() => {
+        if (this.participantTurnResolver?.(state.routeId) === true) {
+          void this.replyPermission(state, id, false).catch((error) => {
+            this.emitError(state.routeId, this.normalizeError(error, 'permission rejection'));
+          });
+          return;
+        }
+        this.forwardPermissionApproval(state, permission);
+      });
+      return;
+    }
+    this.forwardPermissionApproval(state, permission);
+  }
+
+  private forwardPermissionApproval(state: OpenCodeSessionState, permission: NormalizedOpenCodePermission): void {
     const { id, operation, title, pattern, callId } = permission;
+    const effectiveToolUseId = callId ?? id;
     const request: ApprovalRequest = {
       id,
       description: title ?? `Allow OpenCode ${operation ?? 'operation'}${pattern ? `: ${pattern}` : ''}`,
       ...(operation ? { tool: operation } : {}),
       provider: this.id,
       providerGeneration: state.generation,
-      ...(callId ? { providerToolUseId: callId } : {}),
+      ...(effectiveToolUseId ? { providerToolUseId: effectiveToolUseId } : {}),
       ...(pattern ? { inputPreview: pattern.slice(0, 300) } : {}),
     };
     if (this.approvalCallbacks.length === 0) {

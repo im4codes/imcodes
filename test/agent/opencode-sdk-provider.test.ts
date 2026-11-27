@@ -5390,4 +5390,62 @@ describe('OpenCodeSdkProvider', () => {
       await p.disconnect();
     }
   });
+
+  it('enforces toolExecutionGuard in processPermission with untruncated properties BEFORE emitting approval', async () => {
+    const harness = createHarness();
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    let blockSensitive = true;
+    const seenInputs: unknown[] = [];
+    provider.setToolExecutionGuard(async (_sid, req) => {
+      seenInputs.push(req.input);
+      return blockSensitive && JSON.stringify(req.input).includes('/home/k/.ssh/id_ed25519')
+        ? { allow: false, reason: 'Sensitive path denied' }
+        : { allow: true };
+    });
+    const approvals: Array<{ id: string }> = [];
+    provider.onApprovalRequest((_sid, req) => approvals.push({ id: req.id }));
+
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'route-priv', cwd: '/tmp/project' });
+
+    const longPadding = 'x'.repeat(350);
+    harness.queue.push({
+      type: 'permission.asked',
+      data: {
+        id: 'perm-secret',
+        sessionID: 'oc-session-1',
+        action: 'read',
+        resources: [longPadding, '/home/k/.ssh/id_ed25519'],
+        metadata: {},
+      },
+    });
+
+    await vi.waitFor(() => expect(harness.client.permission.reply).toHaveBeenCalledWith(expect.objectContaining({
+      sessionID: 'oc-session-1',
+      requestID: 'perm-secret',
+      decision: 'reject',
+    })));
+    expect(approvals).toHaveLength(0);
+    expect(JSON.stringify(seenInputs[0])).toContain('/home/k/.ssh/id_ed25519');
+
+    // Subsequent owner turn in the same session forwards normally
+    blockSensitive = false;
+    harness.queue.push({
+      type: 'permission.asked',
+      data: {
+        id: 'perm-owner',
+        sessionID: 'oc-session-1',
+        action: 'read',
+        resources: ['/home/k/.ssh/id_ed25519'],
+        metadata: {},
+      },
+    });
+    await vi.waitFor(() => expect(approvals).toHaveLength(1));
+    expect(approvals[0]!.id).toBe('perm-owner');
+    await provider.disconnect();
+  });
 });

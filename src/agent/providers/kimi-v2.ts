@@ -43,6 +43,7 @@ import {
   type ConnectionMode,
   type ProviderCancelOptions,
   type ProviderCapabilities,
+  type ToolExecutionGuard,
   type ProviderConfig,
   type ProviderError,
   type ProviderModelInfo,
@@ -606,6 +607,16 @@ export class KimiV2Provider implements TransportProvider {
   private readonly usageHandlers = new Set<(sessionId: string, update: ProviderUsageUpdate) => void>();
   private readonly toolCallHandlers = new Set<(sessionId: string, tool: ToolCallEvent) => void>();
   private readonly approvalHandlers = new Set<(sessionId: string, req: ApprovalRequest) => void>();
+  private toolExecutionGuard?: ToolExecutionGuard;
+  private participantTurnResolver?: (sessionId: string) => boolean;
+
+  setToolExecutionGuard(guard: ToolExecutionGuard): void {
+    this.toolExecutionGuard = guard;
+  }
+
+  setParticipantTurnResolver(resolver: (sessionId: string) => boolean): void {
+    this.participantTurnResolver = resolver;
+  }
 
   constructor(options: KimiV2ProviderOptions = {}) {
     this.initTimeoutMs = options.initTimeoutMs ?? INIT_TIMEOUT_MS;
@@ -2341,6 +2352,32 @@ export class KimiV2Provider implements TransportProvider {
       return { outcome: { outcome: 'cancelled' } };
     }
     const options = params.options ?? [];
+    const toolName = params.toolCall.title || params.toolCall.kind || 'tool';
+    if (this.toolExecutionGuard) {
+      try {
+        const decision = await this.toolExecutionGuard(state.sessionKey, {
+          toolName,
+          input: params.toolCall.rawInput ?? params.toolCall,
+          cwd: state.cwd,
+          toolUseId: params.toolCall.toolCallId,
+        });
+        if (!decision.allow) {
+          const denyOpt = options.find((o) => o.kind === 'reject_once') ?? options.find((o) => o.kind === 'reject_always');
+          return denyOpt
+            ? { outcome: { outcome: 'selected', optionId: denyOpt.optionId } }
+            : { outcome: { outcome: 'cancelled' } };
+        }
+      } catch (err) {
+        if (this.participantTurnResolver?.(state.sessionKey) === true) {
+          logger.warn({ provider: this.id, sessionName: state.sessionKey, err }, 'Kimi v2 permission guard failed during participant turn; failing closed');
+          const denyOpt = options.find((o) => o.kind === 'reject_once') ?? options.find((o) => o.kind === 'reject_always');
+          return denyOpt
+            ? { outcome: { outcome: 'selected', optionId: denyOpt.optionId } }
+            : { outcome: { outcome: 'cancelled' } };
+        }
+        logger.warn({ provider: this.id, sessionName: state.sessionKey, err }, 'Kimi v2 permission guard failed; forwarding approval');
+      }
+    }
 
     if (this.approvalHandlers.size === 0) {
       const allowOpt = options.find((o) => o.kind === 'allow_once' || o.kind === 'allow_always') ?? options[0];
@@ -2350,7 +2387,6 @@ export class KimiV2Provider implements TransportProvider {
     }
 
     const reqId = `perm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const toolName = params.toolCall.title || params.toolCall.kind || 'tool';
     const preview = params.toolCall.rawInput !== undefined ? JSON.stringify(params.toolCall.rawInput).slice(0, 300) : undefined;
 
     return new Promise<RequestPermissionResponse>((resolve, reject) => {
@@ -2394,8 +2430,33 @@ export class KimiV2Provider implements TransportProvider {
     state.pendingApprovals.clear();
   }
 
+  private resolveSessionIoTarget(sessionId: string, rawPath: string): { state: KimiSessionState; targetPath: string } {
+    const routeId = this.acpToRoute.get(sessionId);
+    const state = routeId ? this.sessions.get(routeId) : undefined;
+    if (!state) {
+      throw new Error('Unknown session for file operation');
+    }
+    const targetPath = path.isAbsolute(rawPath)
+      ? path.resolve(rawPath)
+      : path.resolve(state.cwd, rawPath);
+    return { state, targetPath };
+  }
+
   private async handleReadTextFile(params: ReadTextFileRequest): Promise<ReadTextFileResponse> {
-    const raw = await readFile(params.path, 'utf8');
+    let ioPath = params.path;
+    if (this.toolExecutionGuard) {
+      const { state, targetPath } = this.resolveSessionIoTarget(params.sessionId, params.path);
+      ioPath = targetPath;
+      const decision = await this.toolExecutionGuard(state.sessionKey, {
+        toolName: 'read_file',
+        input: { path: targetPath },
+        cwd: state.cwd,
+      });
+      if (!decision.allow) {
+        throw new Error(decision.reason);
+      }
+    }
+    const raw = await readFile(ioPath, 'utf8');
     if (params.line == null && params.limit == null) {
       return { content: raw };
     }
@@ -2406,7 +2467,20 @@ export class KimiV2Provider implements TransportProvider {
   }
 
   private async handleWriteTextFile(params: WriteTextFileRequest): Promise<WriteTextFileResponse> {
-    await writeFile(params.path, params.content, 'utf8');
+    let ioPath = params.path;
+    if (this.toolExecutionGuard) {
+      const { state, targetPath } = this.resolveSessionIoTarget(params.sessionId, params.path);
+      ioPath = targetPath;
+      const decision = await this.toolExecutionGuard(state.sessionKey, {
+        toolName: 'write_file',
+        input: { path: targetPath },
+        cwd: state.cwd,
+      });
+      if (!decision.allow) {
+        throw new Error(decision.reason);
+      }
+    }
+    await writeFile(ioPath, params.content, 'utf8');
     return {};
   }
 

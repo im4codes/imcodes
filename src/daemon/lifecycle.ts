@@ -4,6 +4,7 @@ import { IMCODES_AUTOMATIC_COMPACTION_ENABLED } from '../../shared/automatic-com
 import { taskPairService } from './task-pairs/service.js';
 import { buildGlobalTaskFleetSnapshotPayload } from './task-pairs/fleet-snapshot.js';
 import { evaluatePairMainCheckoutGitWrite, mainCheckoutWriteRefusal } from './task-pairs/main-checkout-write-guard.js';
+import { evaluateParticipantToolAccess } from './participant-privacy-guard.js';
 import { setTransportToolExecutionEvaluator } from './transport-relay.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
@@ -1638,9 +1639,33 @@ export async function startup(): Promise<DaemonContext> {
   supervisionAutomation.init();
   taskPairService.init();
   // A pair participant's git write in the main checkout is refused before it runs where the provider has a pre-tool hook.
-  setTransportToolExecutionEvaluator((sessionName, request) => {
+  // During any shared-participant turn, sensitive host/credential path access is likewise refused deterministically before execution.
+  setTransportToolExecutionEvaluator(async (sessionName, request) => {
     const hit = evaluatePairMainCheckoutGitWrite(sessionName, request.toolName, request.input, { cwd: request.cwd });
-    return hit ? { allow: false, reason: mainCheckoutWriteRefusal(hit) } : { allow: true };
+    if (hit) return { allow: false, reason: mainCheckoutWriteRefusal(hit) };
+    const runtime = getTransportRuntime(sessionName);
+    if (runtime?.requiresSharedMachineAuthority()) {
+      try {
+        const decision = await evaluateParticipantToolAccess(request, {
+          cwd: request.cwd ?? getSession(sessionName)?.projectDir,
+          sessionName,
+          providerSessionId: request.providerSessionId,
+          dispatchId: request.dispatchId,
+        });
+        if (!decision.allow) {
+          logger.warn({ sessionName, tool: request.toolName }, 'Blocked sensitive tool access during shared-participant turn');
+          timelineEmitter.emit(sessionName, 'agent.status', {
+            status: 'running',
+            label: 'Blocked sensitive path tool access',
+          }, { source: 'daemon', confidence: 'high' });
+          return decision;
+        }
+      } catch (err) {
+        logger.warn({ sessionName, tool: request.toolName, err }, 'Participant privacy check failed; failing closed');
+        return { allow: false, reason: 'Sensitive path policy: verification failed' };
+      }
+    }
+    return { allow: true };
   });
   taskPairService.setScheduler(taskPairAutomation);
   taskPairAutomation.start();

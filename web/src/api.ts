@@ -35,6 +35,7 @@ import {
   recoverUploadFromLifecycleIfNeeded,
 } from './upload-suspend-wait.js';
 import { FILE_RELAY_MODE, R2_RELAY_API, R2_RELAY_PHASE, R2_RELAY_ERROR, type R2RelayProgress, type R2RelayReady } from '@shared/r2-relay.js';
+import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
 import { isServerR2RelayEnabled, readFileRelayMode, setFileRelayUser } from './r2-relay-preference.js';
 import {
   registerVoiceHotwordsSyncClient,
@@ -4215,8 +4216,13 @@ export async function prepareR2AttachmentDownload(serverId: string, attachmentId
   const decoder = new TextDecoder(); let pending = ''; let url: string | null = null;
   const consume = (line: string) => {
     if (!line.trim()) return;
-    const event = JSON.parse(line) as R2RelayProgress | R2RelayReady | { phase: typeof R2_RELAY_PHASE.ERROR };
-    if (event.phase === R2_RELAY_PHASE.ERROR) throw new Error(R2_RELAY_ERROR.FAILED);
+    const event = JSON.parse(line) as R2RelayProgress | R2RelayReady | { phase: typeof R2_RELAY_PHASE.ERROR; error?: string };
+    if (event.phase === R2_RELAY_PHASE.ERROR) {
+      if (event.error === FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN) {
+        throw new ApiError(403, FS_GENERIC_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN);
+      }
+      throw new Error(R2_RELAY_ERROR.FAILED);
+    }
     if (event.phase === R2_RELAY_PHASE.PREPARING) onProgress?.(event);
     if (event.phase === R2_RELAY_PHASE.READY && typeof event.url === 'string') url = event.url;
   };

@@ -189,6 +189,11 @@ export interface ProviderContextPayload {
    * session's own cwd, which is also what reverts the turn afterwards.
    */
   turnCwd?: string;
+  /**
+   * True when the active turn was initiated by or tainted by a shared participant
+   * lacking host machine authority; providers fail closed if guard evaluation errors.
+   */
+  participantRestricted?: boolean;
   sessionSystemText?: string;
   turnSystemText?: string;
   /**

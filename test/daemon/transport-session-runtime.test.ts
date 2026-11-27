@@ -5706,6 +5706,144 @@ describe('TransportSessionRuntime', () => {
     expect((approvalMock.provider as any).respondApproval).toHaveBeenCalledWith('sess-1', 'approval-2', true);
   });
 
+  it('auto-denies sensitive-path tool approvals during participant turns with zero prompt injection and leaves subsequent owner turns unaffected', async () => {
+    const approvalMock = makeMockProvider();
+    const runtimeWithPrivacy = new TransportSessionRuntime(approvalMock.provider, 'deck_test_brain');
+    const forwardedApprovals: Array<Record<string, unknown>> = [];
+    runtimeWithPrivacy.onApprovalRequest = (request) => forwardedApprovals.push(request as Record<string, unknown>);
+    await runtimeWithPrivacy.initialize(defaultConfig);
+
+    // 1. Participant turn active
+    expect(runtimeWithPrivacy.send('Inspect project helper', 'p-privacy-1', undefined, undefined, {
+      sharedActor: sharedActorFixture,
+    })).toBe('sent');
+    await waitForProviderSendCount(approvalMock.provider, 1);
+
+    // Assert zero prompt/system-instruction injection regarding .ssh / privacy
+    const firstSendPayload = (approvalMock.provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(JSON.stringify(firstSendPayload)).not.toContain('.ssh');
+    expect(JSON.stringify(firstSendPayload)).not.toContain('id_ed25519');
+    expect(JSON.stringify(firstSendPayload)).not.toContain('sensitive_path');
+
+    // Sensitive-path approval requests are auto-denied immediately and NOT forwarded
+    approvalMock.fireApproval('sess-1', {
+      id: 'approval-ssh',
+      description: 'Read ~/.ssh/id_ed25519',
+      tool: 'read',
+      inputPreview: '{"file_path":"/home/k/.ssh/id_ed25519"}',
+    });
+    approvalMock.fireApproval('sess-1', {
+      id: 'approval-imcodes',
+      description: 'cat ~/.imcodes/server.json',
+      tool: 'bash',
+      inputPreview: 'cat ~/.imcodes/server.json',
+    });
+    await Promise.resolve();
+
+    expect((approvalMock.provider as any).respondApproval).toHaveBeenCalledWith('sess-1', 'approval-ssh', false);
+    expect((approvalMock.provider as any).respondApproval).toHaveBeenCalledWith('sess-1', 'approval-imcodes', false);
+    expect(forwardedApprovals).toHaveLength(0);
+
+    // Non-sensitive approval on same participant turn IS still forwarded
+    approvalMock.fireApproval('sess-1', {
+      id: 'approval-src',
+      description: 'Read src/ssh-helper.ts',
+      tool: 'read',
+      inputPreview: '{"file_path":"src/ssh-helper.ts"}',
+    });
+    await vi.waitFor(() => expect(forwardedApprovals).toHaveLength(1));
+    expect(forwardedApprovals[0]?.id).toBe('approval-src');
+
+    // Targetless Read approval with innocuous description only MUST be auto-denied and NOT forwarded (F2-R3)
+    approvalMock.fireApproval('sess-1', {
+      id: 'approval-targetless',
+      description: 'Read a document',
+      tool: 'Read',
+    });
+    await vi.waitFor(() => {
+      expect((approvalMock.provider as any).respondApproval).toHaveBeenCalledWith('sess-1', 'approval-targetless', false);
+    });
+    expect(forwardedApprovals).toHaveLength(1);
+
+    // Pre-evaluated full-input tool call with truncated >300-char inputPreview still forwards cleanly (F2-R3)
+    const {
+      getParticipantToolTurnEpoch,
+      recordPreEvaluatedParticipantToolDecision,
+    } = await import('../../src/daemon/participant-privacy-guard.js');
+    const firstBinding = runtimeWithPrivacy.getParticipantToolBinding();
+    recordPreEvaluatedParticipantToolDecision({
+      sessionName: 'deck_test_brain',
+      providerSessionId: firstBinding.providerSessionId ?? 'sess-1',
+      dispatchId: firstBinding.dispatchId,
+      toolUseId: 'tu-r4-trunc',
+      toolName: 'Write',
+      decision: { allow: true },
+    });
+    approvalMock.fireApproval('sess-1', {
+      id: 'approval-trunc-ok',
+      description: 'Write src/long.ts',
+      tool: 'Write',
+      providerToolUseId: 'tu-r4-trunc',
+      inputPreview: JSON.stringify({ file_path: 'src/long.ts', content: 'x'.repeat(400) }).slice(0, 300),
+    });
+    await vi.waitFor(() => expect(forwardedApprovals).toHaveLength(2));
+    expect(forwardedApprovals[1]?.id).toBe('approval-trunc-ok');
+
+    // F2-R4: complete turn 1 and start participant turn 2 — prior dispatch's toolUseId & old-epoch late write cannot reuse
+    const turn1Epoch = getParticipantToolTurnEpoch('deck_test_brain');
+    approvalMock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(recordPreEvaluatedParticipantToolDecision({
+      sessionName: 'deck_test_brain',
+      providerSessionId: firstBinding.providerSessionId ?? 'sess-1',
+      dispatchId: firstBinding.dispatchId,
+      expectedTurnEpoch: turn1Epoch,
+      toolUseId: 'tu-r5-stale',
+      toolName: 'Write',
+      decision: { allow: true },
+    })).toBe(false);
+
+    forwardedApprovals.length = 0;
+    ((approvalMock.provider as any).respondApproval as ReturnType<typeof vi.fn>).mockClear();
+    expect(runtimeWithPrivacy.send('Second participant turn', 'p-privacy-r5', undefined, undefined, {
+      sharedActor: sharedActorFixture,
+    })).toBe('sent');
+    await waitForProviderSendCount(approvalMock.provider, 2);
+
+    // Trying to reuse turn 1 toolUseId on turn 2 fails closed (auto-denied)
+    approvalMock.fireApproval('sess-1', {
+      id: 'approval-stale-reuse',
+      description: 'Write src/long.ts',
+      tool: 'Write',
+      providerToolUseId: 'tu-r4-trunc',
+      inputPreview: JSON.stringify({ file_path: 'src/long.ts', content: 'x'.repeat(400) }).slice(0, 300),
+    });
+    await vi.waitFor(() => {
+      expect((approvalMock.provider as any).respondApproval).toHaveBeenCalledWith('sess-1', 'approval-stale-reuse', false);
+    });
+    expect(forwardedApprovals).toHaveLength(0);
+
+    // Finish turn 2 cleanly before the owner turn section below runs
+    approvalMock.fireComplete('sess-1');
+    await flushDispatch();
+    ((approvalMock.provider as any).respondApproval as ReturnType<typeof vi.fn>).mockClear();
+    forwardedApprovals.length = 0;
+
+    expect(runtimeWithPrivacy.send('Owner inspect ~/.ssh/id_ed25519', 'owner-privacy-2')).toBe('sent');
+    await waitForProviderSendCount(approvalMock.provider, 3);
+    expect(runtimeWithPrivacy.requiresSharedMachineAuthority()).toBe(false);
+
+    approvalMock.fireApproval('sess-1', {
+      id: 'approval-owner-ssh',
+      description: 'Read ~/.ssh/id_ed25519',
+      tool: 'read',
+      inputPreview: '{"file_path":"/home/k/.ssh/id_ed25519"}',
+    });
+    expect((approvalMock.provider as any).respondApproval).not.toHaveBeenCalled();
+    expect(forwardedApprovals).toHaveLength(1);
+    expect(forwardedApprovals[0]?.id).toBe('approval-owner-ssh');
+  });
+
   it('refreshes shared-context bootstrap on each dispatch turn instead of freezing launch-time namespace state', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'x');
@@ -7734,6 +7872,181 @@ ${PREFERENCE_CONTEXT_END}`;
     await flushDispatch();
     expect(runtime.sending).toBe(false);
     expect(runtime.getStatus()).toBe('idle');
+  });
+
+  it('late CANCELLED from settled turn 1 does not invalidate turn 2 participant tool pre-check or approval, while stale turn-1 delayed pre-check stays discarded (F2-R5)', async () => {
+    const sessionManager = await import('../../src/agent/session-manager.js');
+    const { TRANSPORT_EVENT } = await import('../../shared/transport-events.js');
+    const {
+      setTransportRelaySend,
+      setTransportToolExecutionEvaluator,
+      wireProviderToRelay,
+    } = await import('../../src/daemon/transport-relay.js');
+    const { getParticipantToolTurnEpoch } = await import('../../src/daemon/participant-privacy-guard.js');
+
+    const fanMock = makeMockProvider();
+    const relayCompletes: Array<(sid: string, msg: AgentMessage) => void> = [];
+    const relayErrors: Array<(sid: string, err: ProviderError) => void> = [];
+    const relayApprovals: Array<(sid: string, req: { id: string; description: string; tool?: string }) => void> = [];
+    let runtimeComplete: ((sid: string, msg: AgentMessage) => void) | null = null;
+    let runtimeError: ((sid: string, err: ProviderError) => void) | null = null;
+    let runtimeApproval: ((sid: string, req: { id: string; description: string; tool?: string }) => void) | null = null;
+    let installedGuard: ((sid: string, req: { toolName: string; input: unknown; cwd?: string; toolUseId?: string }) => unknown) | undefined;
+
+    (fanMock.provider as { onComplete: unknown }).onComplete = (cb: (sid: string, msg: AgentMessage) => void) => {
+      if (!runtimeComplete) {
+        runtimeComplete = cb;
+        return () => { runtimeComplete = null; };
+      }
+      relayCompletes.push(cb);
+      return () => {};
+    };
+    (fanMock.provider as { onError: unknown }).onError = (cb: (sid: string, err: ProviderError) => void) => {
+      if (!runtimeError) {
+        runtimeError = cb;
+        return () => { runtimeError = null; };
+      }
+      relayErrors.push(cb);
+      return () => {};
+    };
+    (fanMock.provider as { onApprovalRequest: unknown }).onApprovalRequest = (cb: (sid: string, req: { id: string; description: string; tool?: string }) => void) => {
+      if (!runtimeApproval) {
+        runtimeApproval = cb;
+        return;
+      }
+      relayApprovals.push(cb);
+    };
+    (fanMock.provider as unknown as { setToolExecutionGuard?: (g: typeof installedGuard) => void }).setToolExecutionGuard = (g) => {
+      installedGuard = g;
+    };
+
+    const relaySent: Array<Record<string, unknown>> = [];
+    const runtimeApprovals: Array<Record<string, unknown>> = [];
+    const localRuntime = new TransportSessionRuntime(fanMock.provider, 'deck_test_brain');
+    localRuntime.onApprovalRequest = (req) => runtimeApprovals.push(req as unknown as Record<string, unknown>);
+    await localRuntime.initialize(defaultConfig);
+
+    sessionManager.registerProviderRoute('sess-1', 'deck_test_brain');
+    const getRuntimeSpy = vi.spyOn(sessionManager, 'getTransportRuntime' as never);
+    // Test harness uses sessionManager internal registry via wireProviderToRelay? Register if not in map:
+    const hasRegistered = Boolean(sessionManager.getTransportRuntime('deck_test_brain'));
+    if (!hasRegistered) {
+      getRuntimeSpy.mockImplementation(((name: string) => (name === 'deck_test_brain' ? localRuntime : undefined)) as never);
+    }
+
+    setTransportRelaySend((msg) => relaySent.push(msg as Record<string, unknown>));
+    wireProviderToRelay(fanMock.provider);
+
+    const fireBothError = (err: ProviderError) => {
+      relayErrors.forEach((cb) => cb('sess-1', err));
+      runtimeError?.('sess-1', err);
+    };
+    const fireBothComplete = (msg: AgentMessage) => {
+      relayCompletes.forEach((cb) => cb('sess-1', msg));
+      runtimeComplete?.('sess-1', msg);
+    };
+    const fireBothApproval = (req: { id: string; description: string; tool?: string; provider?: string; providerToolUseId?: string; inputPreview?: string }) => {
+      runtimeApproval?.('sess-1', req);
+      relayApprovals.forEach((cb) => cb('sess-1', req));
+    };
+
+    try {
+      // Turn 1 (participant): start delayed pre-check, then settle Turn 1 externally before it resolves
+      let resolveTurn1PreCheck!: (d: { allow: true } | { allow: false; reason: string }) => void;
+      setTransportToolExecutionEvaluator(() => new Promise((resolve) => {
+        resolveTurn1PreCheck = resolve;
+      }));
+      expect(localRuntime.send('turn 1 participant', 'p-r5-t1', undefined, undefined, {
+        sharedActor: sharedActorFixture,
+      })).toBe('sent');
+      await waitForProviderSendCount(fanMock.provider, 1);
+
+      const turn1DelayedPre = Promise.resolve(installedGuard!('sess-1', {
+        toolName: 'Write',
+        input: { file_path: 'src/safe.ts', content: 'x'.repeat(400) },
+        cwd: '/tmp/safe-r5-ws',
+        toolUseId: 'tu-turn1-delayed',
+      }));
+
+      (fanMock.provider.cancel as ReturnType<typeof vi.fn>).mockResolvedValueOnce(undefined);
+      expect(localRuntime.settleActiveDispatchFromExternalCompletion('health-poll-stale-active-turn')).toBe(true);
+      await flushDispatch();
+      expect(localRuntime.getStatus()).toBe('idle');
+
+      // Turn 1 delayed pre-check resolves AFTER Turn 1 settled -> must fail closed and never populate cache
+      resolveTurn1PreCheck({ allow: true });
+      await expect(turn1DelayedPre).resolves.toMatchObject({ allow: false });
+
+      // Turn 2 (participant on same provider session 'sess-1') starts; install delayed Turn 2 pre-check
+      let resolveTurn2PreCheck!: (d: { allow: true } | { allow: false; reason: string }) => void;
+      setTransportToolExecutionEvaluator(() => new Promise((resolve) => {
+        resolveTurn2PreCheck = resolve;
+      }));
+      expect(localRuntime.send('turn 2 participant safe edit', 'p-r5-t2', undefined, undefined, {
+        sharedActor: sharedActorFixture,
+      })).toBe('sent');
+      await waitForProviderSendCount(fanMock.provider, 2);
+
+      const longSafeInput = { file_path: 'src/safe.ts', content: 'x'.repeat(400) };
+      const epochAtTurn2PreStart = getParticipantToolTurnEpoch('deck_test_brain');
+      const turn2Pre = Promise.resolve(installedGuard!('sess-1', {
+        toolName: 'Write',
+        input: longSafeInput,
+        cwd: '/tmp/safe-r5-ws',
+        toolUseId: 'tu-turn2-safe',
+      }));
+
+      // Turn 1's late CANCELLED arrives WHILE Turn 2 is active and Turn 2's pre-check is running!
+      fireBothError({ code: PROVIDER_ERROR_CODES.CANCELLED, message: 'late cancellation from settled turn 1', recoverable: true });
+      expect(localRuntime.sending).toBe(true);
+      expect(getParticipantToolTurnEpoch('deck_test_brain')).toBe(epochAtTurn2PreStart);
+
+      // Resolving Turn 2 pre-check MUST succeed & record despite the ignored late CANCELLED
+      resolveTurn2PreCheck({ allow: true });
+      await expect(turn2Pre).resolves.toEqual({ allow: true });
+
+      // Switch evaluator off so onApprovalRequest uses evaluateParticipantToolAccess + cached binding
+      setTransportToolExecutionEvaluator(undefined);
+
+      // Even if a second late CANCELLED arrives? Wait: only 1 was budgeted above; test Turn 2 truncated approval now:
+      fireBothApproval({
+        id: 'app-turn2-safe',
+        description: 'Write src/safe.ts',
+        tool: 'Write',
+        provider: 'qoder-sdk',
+        providerToolUseId: 'tu-turn2-safe',
+        inputPreview: JSON.stringify(longSafeInput).slice(0, 300),
+      });
+      await vi.waitFor(() => {
+        expect(runtimeApprovals).toHaveLength(1);
+        expect(relaySent.some((m) => m.type === TRANSPORT_EVENT.CHAT_APPROVAL && m.requestId === 'app-turn2-safe')).toBe(true);
+      });
+      expect((fanMock.provider as any).respondApproval).not.toHaveBeenCalled();
+
+      // Turn 1's discarded toolUseId CANNOT pass on Turn 2
+      relaySent.length = 0;
+      fireBothApproval({
+        id: 'app-turn1-stale-tool',
+        description: 'Write src/safe.ts',
+        tool: 'Write',
+        provider: 'qoder-sdk',
+        providerToolUseId: 'tu-turn1-delayed',
+        inputPreview: JSON.stringify(longSafeInput).slice(0, 300),
+      });
+      await vi.waitFor(() => {
+        expect((fanMock.provider as any).respondApproval).toHaveBeenCalledWith('sess-1', 'app-turn1-stale-tool', false);
+      });
+      expect(relaySent.some((m) => m.requestId === 'app-turn1-stale-tool')).toBe(false);
+
+      fireBothComplete({ id: 'msg-t2-done', sessionId: 'sess-1', kind: 'text', role: 'assistant', content: 'done', timestamp: Date.now(), status: 'complete' });
+      await flushDispatch();
+    } finally {
+      setTransportToolExecutionEvaluator(undefined);
+      setTransportRelaySend(() => {});
+      sessionManager.unregisterProviderRoute('sess-1');
+      getRuntimeSpy.mockRestore();
+      await localRuntime.kill().catch(() => {});
+    }
   });
 
   it.each([

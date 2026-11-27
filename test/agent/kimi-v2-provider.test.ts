@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -1765,6 +1765,111 @@ describe('KimiV2Provider', () => {
       expect(prompt9).toContain('DYNAMIC_CONTRACT_ALPHA');
     } finally {
       await runtime.kill();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('enforces toolExecutionGuard in requestPermission, readTextFile, and writeTextFile BEFORE access and preserves owner turns', async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-priv-'));
+    try {
+      const secretFile = path.join(tmpDir, 'id_ed25519');
+      writeFileSync(secretFile, 'PRIVATE-KEY\n');
+
+      state.conn = makeMockConn();
+      const provider = new KimiV2Provider();
+      let blockSensitive = true;
+      provider.setToolExecutionGuard((_sid, req) => {
+        if (blockSensitive && JSON.stringify(req.input).includes('id_ed25519')) {
+          return { allow: false, reason: 'Sensitive path policy' };
+        }
+        return { allow: true };
+      });
+
+      const approvals: Array<{ id: string }> = [];
+      provider.onApprovalRequest((_, r) => approvals.push({ id: r.id }));
+
+      await provider.connect({});
+      await provider.createSession({ sessionKey: 'sess-kimi-priv', cwd: tmpDir });
+
+      // 1) requestPermission denies sensitive target before emitting approval
+      const permDenied = await state.handlers!.requestPermission({
+        sessionId: 'kimi-sess-1',
+        toolCall: {
+          toolCallId: 'tc-priv',
+          title: 'read',
+          kind: 'read',
+          rawInput: { file_path: secretFile },
+        },
+        options: [
+          { optionId: 'approve_once', name: 'Allow', kind: 'allow_once' },
+          { optionId: 'reject_once', name: 'Reject', kind: 'reject_once' },
+        ],
+      } as never);
+      expect(permDenied).toEqual({ outcome: { outcome: 'selected', optionId: 'reject_once' } });
+      expect(approvals).toHaveLength(0);
+
+      // 2) readTextFile and writeTextFile deny sensitive paths before fs access
+      await expect(state.handlers!.readTextFile({
+        sessionId: 'kimi-sess-1',
+        path: secretFile,
+      } as never)).rejects.toThrow('Sensitive path policy');
+
+      await expect(state.handlers!.writeTextFile({
+        sessionId: 'kimi-sess-1',
+        path: secretFile,
+        content: 'OVERWRITE',
+      } as never)).rejects.toThrow('Sensitive path policy');
+
+      // 2b) Relative path is checked and executed against the SAME session cwd (not process.cwd()) and unknown session fails closed
+      writeFileSync(path.join(tmpDir, 'rel-note.txt'), 'relative-content\n');
+      const relSeenPaths: string[] = [];
+      provider.setToolExecutionGuard((_sid, req) => {
+        relSeenPaths.push((req.input as { path?: string }).path ?? '');
+        if (!blockSensitive) return { allow: true };
+        return JSON.stringify(req.input).includes('id_ed25519')
+          ? { allow: false, reason: 'Sensitive path policy' }
+          : { allow: true };
+      });
+      await expect(state.handlers!.readTextFile({
+        sessionId: 'kimi-sess-1',
+        path: 'rel-note.txt',
+      } as never)).resolves.toEqual({ content: 'relative-content\n' });
+      expect(relSeenPaths.at(-1)).toBe(path.join(tmpDir, 'rel-note.txt'));
+
+      await expect(state.handlers!.writeTextFile({
+        sessionId: 'kimi-sess-1',
+        path: 'rel-write.txt',
+        content: 'written-rel',
+      } as never)).resolves.toEqual({});
+      expect(relSeenPaths.at(-1)).toBe(path.join(tmpDir, 'rel-write.txt'));
+      expect(readFileSync(path.join(tmpDir, 'rel-write.txt'), 'utf8')).toBe('written-rel');
+
+      await expect(state.handlers!.readTextFile({
+        sessionId: 'unknown-acp-session',
+        path: path.join(tmpDir, 'rel-note.txt'),
+      } as never)).rejects.toThrow('Unknown session');
+      await expect(state.handlers!.writeTextFile({
+        sessionId: 'unknown-acp-session',
+        path: path.join(tmpDir, 'rel-note.txt'),
+        content: 'tamper',
+      } as never)).rejects.toThrow('Unknown session');
+      expect(readFileSync(path.join(tmpDir, 'rel-note.txt'), 'utf8')).toBe('relative-content\n');
+
+      // 3) Owner turn on the same session succeeds
+      blockSensitive = false;
+      const permOwner = state.handlers!.requestPermission({
+        sessionId: 'kimi-sess-1',
+        toolCall: { toolCallId: 'tc-owner', title: 'read', kind: 'read', rawInput: { file_path: secretFile } },
+        options: [{ optionId: 'approve_once', name: 'Allow', kind: 'allow_once' }],
+      } as never);
+      await vi.waitFor(() => expect(approvals).toHaveLength(1));
+      await provider.respondApproval('sess-kimi-priv', approvals[0]!.id, true);
+      expect(await permOwner).toEqual({ outcome: { outcome: 'selected', optionId: 'approve_once' } });
+      await expect(state.handlers!.readTextFile({ sessionId: 'kimi-sess-1', path: secretFile } as never))
+        .resolves.toEqual({ content: 'PRIVATE-KEY\n' });
+
+      await provider.disconnect();
+    } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
   });

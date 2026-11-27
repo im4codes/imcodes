@@ -605,9 +605,16 @@ export interface ToolExecutionRequest {
   input: unknown;
   cwd?: string;
   toolUseId?: string;
+  description?: string;
+  inputPreview?: string;
+  providerSessionId?: string;
+  dispatchId?: number | null;
 }
 export type ToolExecutionGuardDecision = { allow: true } | { allow: false; reason: string };
-export type ToolExecutionGuard = (providerSessionId: string, request: ToolExecutionRequest) => ToolExecutionGuardDecision;
+export type ToolExecutionGuard = (
+  providerSessionId: string,
+  request: ToolExecutionRequest,
+) => ToolExecutionGuardDecision | Promise<ToolExecutionGuardDecision>;
 
 export interface ProviderActiveWorkSnapshotOptions {
   /** When true, sample external background task log/progress sources (diagnostic/health-poll paths only). */
@@ -755,6 +762,13 @@ export interface TransportProvider {
    * honour a refusal; the others rely on the daemon's after-the-fact report.
    */
   setToolExecutionGuard?(guard: ToolExecutionGuard): void;
+
+  /**
+   * Optional resolver indicating whether a provider route's active turn currently
+   * belongs to a shared participant lacking host authority. When true, guard
+   * evaluation errors fail closed instead of falling back to allow.
+   */
+  setParticipantTurnResolver?(resolver: (providerSessionId: string) => boolean): void;
 
   /**
    * Install the daemon's fence resolver: does the IM.codes session served by

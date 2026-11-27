@@ -1019,4 +1019,46 @@ describe('CopilotSdkProvider', () => {
     await expect(pRead).resolves.toEqual({ kind: 'denied-interactively-by-user' });
     await provider.disconnect();
   });
+
+  it('enforces toolExecutionGuard in both onPreToolUse and permission requests before approval emission', async () => {
+    const harness = createCopilotHarness({ version: '1.0.117', protocolVersion: 4 });
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as unknown as typeof import('@microsoft/copilot-sdk');
+
+    let blockSensitive = true;
+    provider.setToolExecutionGuard((_sid, req) => {
+      if (blockSensitive && JSON.stringify(req.input).includes('.ssh')) {
+        return { allow: false, reason: 'Sensitive path policy' };
+      }
+      return { allow: true };
+    });
+
+    const approvals: Array<{ id: string }> = [];
+    provider.onApprovalRequest((_sid, req) => approvals.push({ id: req.id }));
+
+    await provider.connect({ binaryPath: 'copilot' });
+    await provider.createSession({ sessionKey: 'route-priv-cp', cwd: '/tmp/p1' });
+
+    const preHook = harness.createdConfigs[0]!.hooks!.handlers!.onPreToolUse!;
+    await expect(preHook({ toolName: 'view', toolArgs: { path: '/home/k/.ssh/id_ed25519' } }))
+      .resolves.toEqual({ permissionDecision: 'deny', permissionDecisionReason: 'Sensitive path policy' });
+    await expect(preHook({ toolName: 'view', toolArgs: { path: 'src/index.ts' } }))
+      .resolves.toBeUndefined();
+
+    const permFn = harness.createdConfigs[0]!.permissions!.onRequest!;
+    await expect(permFn({ kind: 'read', path: '/home/k/.ssh/id_ed25519' }))
+      .resolves.toEqual({ kind: 'denied-interactively-by-user', feedback: 'Sensitive path policy' });
+    expect(approvals).toHaveLength(0);
+
+    // Owner turn on the same session proceeds through permission flow cleanly
+    blockSensitive = false;
+    const ownerPerm = permFn({ kind: 'read', path: '/home/k/.ssh/id_ed25519' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(approvals).toHaveLength(1);
+    await provider.respondApproval('route-priv-cp', approvals[0]!.id, true);
+    await expect(ownerPerm).resolves.toEqual({ kind: 'approved' });
+    await provider.disconnect();
+  });
 });

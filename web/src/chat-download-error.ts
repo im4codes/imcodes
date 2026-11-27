@@ -25,7 +25,10 @@ export function localizeChatDownloadError(
 ): string {
   const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
   if (message.includes('daemon_offline') || message.includes('503')) return t('upload.daemon_offline');
-  if (message.includes(FS_READ_ERROR_CODES.FORBIDDEN_PATH)) return withAttempts(t('upload.download_forbidden'), error, t);
+  if (
+    message.includes(FS_READ_ERROR_CODES.FORBIDDEN_PATH)
+    || message.includes(FS_READ_ERROR_CODES.SENSITIVE_PATH_FORBIDDEN)
+  ) return withAttempts(t('upload.download_forbidden'), error, t);
   if (message.includes(FS_READ_ERROR_CODES.FILE_TOO_LARGE)) return withAttempts(t('upload.download_too_large'), error, t);
   if (message.includes(FILE_PATH_HANDLE_ERROR.INVALID_PATH)
     || message.includes(FILE_PATH_HANDLE_ERROR.NOT_REGULAR_FILE)) {

@@ -132,6 +132,12 @@ import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js'
 import { getTransportContextBudgetMs, readBoundedTimeoutMs } from './transport-context-budget.js';
 import { withTimeoutOutcome } from '../util/timeout-outcome.js';
 import { RESEND_EXPIRY_MS } from '../daemon/transport-resend-queue.js';
+import {
+  clearPreEvaluatedParticipantToolDecisions,
+  evaluateParticipantToolAccess,
+  getParticipantToolTurnEpoch,
+} from '../daemon/participant-privacy-guard.js';
+import { getSession } from '../store/session-store.js';
 
 export { getTransportContextBudgetMs };
 import {
@@ -1332,6 +1338,56 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.provider.onApprovalRequest((sid: string, req: ApprovalRequest) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        if (this.requiresSharedMachineAuthority()) {
+          const cwd = getSession(this.sessionKey)?.projectDir;
+          const capturedDispatchId = this._activeDispatchId;
+          const capturedTurnEpoch = getParticipantToolTurnEpoch(this.sessionKey);
+          void evaluateParticipantToolAccess({
+            toolName: req.tool ?? '',
+            description: req.description,
+            inputPreview: req.inputPreview,
+            cwd,
+            ...(req.providerToolUseId ? { toolUseId: req.providerToolUseId } : {}),
+          }, {
+            cwd,
+            sessionName: this.sessionKey,
+            providerSessionId: sid,
+            dispatchId: capturedDispatchId,
+          }).then((decision) => {
+            if (
+              sid !== this._providerSessionId
+              || this._activeDispatchId !== capturedDispatchId
+              || getParticipantToolTurnEpoch(this.sessionKey) !== capturedTurnEpoch
+              || !this.requiresSharedMachineAuthority()
+            ) {
+              return;
+            }
+            if (!decision.allow) {
+              logger.warn(
+                { sessionName: this.sessionKey, providerSessionId: sid, requestId: req.id, tool: req.tool },
+                'Auto-denying sensitive-path approval request during shared-participant turn',
+              );
+              void this.provider.respondApproval?.(sid, req.id, false)?.catch((err: unknown) => {
+                logger.warn({ sessionName: this.sessionKey, requestId: req.id, err }, 'Failed to auto-deny sensitive-path approval');
+              });
+              return;
+            }
+            this._activeDispatchHasSideEffectEvidence = true;
+            this._onApprovalRequest?.(req);
+          }).catch((err: unknown) => {
+            if (
+              sid !== this._providerSessionId
+              || this._activeDispatchId !== capturedDispatchId
+              || getParticipantToolTurnEpoch(this.sessionKey) !== capturedTurnEpoch
+              || !this.requiresSharedMachineAuthority()
+            ) {
+              return;
+            }
+            logger.warn({ sessionName: this.sessionKey, providerSessionId: sid, requestId: req.id, err }, 'Participant privacy evaluation threw on approval; auto-denying');
+            void this.provider.respondApproval?.(sid, req.id, false)?.catch(() => {});
+          });
+          return;
+        }
         this._activeDispatchHasSideEffectEvidence = true;
         this._onApprovalRequest?.(req);
       });
@@ -1359,6 +1415,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Set providerSessionId directly (restore from store without initialize). */
   setProviderSessionId(id: string): void {
     const wasUnset = !this._providerSessionId;
+    if (this._providerSessionId !== id) {
+      clearPreEvaluatedParticipantToolDecisions(this.sessionKey);
+    }
     this._providerSessionId = id;
     if (wasUnset && id) this._notifyProviderSessionReady();
   }
@@ -1590,6 +1649,13 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   requiresSharedMachineAuthority(): boolean {
     return this.turnOriginEntries().some((entry) => entry.sharedActor?.effectiveActorRole === 'participant');
+  }
+
+  getParticipantToolBinding(): { providerSessionId: string | null; dispatchId: number | null } {
+    return {
+      providerSessionId: this._providerSessionId,
+      dispatchId: this._activeDispatchId,
+    };
   }
 
   /** The participant users that fed the current turn (for stamping what this turn sends onward). */
@@ -2990,6 +3056,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._initializingProviderSessionId = config.bindExistingKey ?? config.sessionKey;
     try {
       this._providerSessionId = await this.provider.createSession(config);
+      clearPreEvaluatedParticipantToolDecisions(this.sessionKey);
       // The bodies belong to the logical owner, not the native conversation.
       // clear/reset/restart replace the latter and invalidate only injection.
       const ns = config.contextNamespace;
@@ -4269,6 +4336,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeDispatchId = null;
     this._activeDispatchStartedAt = 0;
     this._unacknowledgedActiveAppends = [];
+    clearPreEvaluatedParticipantToolDecisions(this.sessionKey);
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
     this._externalCancelIssuedDispatchIds.clear();
@@ -5068,6 +5136,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._compactionObservedDispatch = null;
     this.retireExternalCompletionGrace();
     this._activeDispatchId = dispatchId;
+    clearPreEvaluatedParticipantToolDecisions(this.sessionKey);
     this._activeDispatchStaleRecoveryStarted = false;
     this._activeDispatchEntries = (dispatchedEntries ?? [{
       clientMessageId: clientMessageId ?? randomUUID(),
@@ -5283,6 +5352,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           ? [`cwd: ${pairTurnCwd} (authoritative pair workspace — your shell tool still starts in the main checkout on each call; prefix every command with cd "${pairTurnCwd}" && ... or git -C "${pairTurnCwd}", and pass absolute paths under "${pairTurnCwd}" to file tools; never write in the main checkout)`, messagePreamble].filter(Boolean).join('\n')
           : messagePreamble,
         ...(pairTurnCwd && providerTakesTurnCwd ? { turnCwd: pairTurnCwd } : {}),
+        ...(this.requiresSharedMachineAuthority() ? { participantRestricted: true } : {}),
         // Session-level system prompt, identity, and IM.codes contracts are invariant
         // across slash controls (/compact, /clear, /usage) and command-mode dispatches.
         // Message-side providers keep slash-control prompts byte-clean by skipping
@@ -6205,6 +6275,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._activeDispatchId = null;
       this._activeDispatchStartedAt = 0;
       this._unacknowledgedActiveAppends = [];
+      clearPreEvaluatedParticipantToolDecisions(this.sessionKey);
     }
   }
 
