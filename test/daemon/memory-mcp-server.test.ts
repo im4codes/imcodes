@@ -31,6 +31,7 @@ import {
 import { ALIAS_MCP_TOOLS } from '../../shared/alias-types.js';
 import { MESSAGE_PIN_MCP_TOOLS } from '../../shared/message-pins.js';
 import { CAPABILITY_MCP_TOOL_NAMES } from '../../shared/capability-management.js';
+import { VOICE_HOTWORDS_MCP_TOOLS } from '../../shared/voice-hotwords.js';
 import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import { AGENT_DELEGATION_REPLY_ERRORS, buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 import {
@@ -495,6 +496,7 @@ describe('memory MCP stdio server', () => {
         ...MEMORY_MCP_TOOL_NAME_LIST,
         ...Object.values(ALIAS_MCP_TOOLS),
         ...Object.values(MESSAGE_PIN_MCP_TOOLS),
+        ...Object.values(VOICE_HOTWORDS_MCP_TOOLS),
         ...CAPABILITY_MCP_TOOL_NAMES,
       ]);
       expect(new Set(listedNames)).toEqual(expectedFullNames);

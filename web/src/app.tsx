@@ -5,6 +5,7 @@ import {
   registerOpenVoiceHotwordsSettingsHandler,
   setActiveVoiceHotwordProject,
   setVoiceHotwordsAuthScope,
+  syncVoiceHotwordsFromServer,
   type VoiceHotwordProjectInput,
 } from './voice-hotwords.js';
 import { setFileRelayUser, setServerR2RelayEnabled } from './r2-relay-preference.js';
@@ -2355,6 +2356,28 @@ function InternalMainApp() {
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [auth, clearAuthState]);
+
+  useEffect(() => {
+    if (!auth) return;
+    let lastSyncAt = 0;
+    const syncHotwords = () => {
+      const now = Date.now();
+      if (now - lastSyncAt < 1500) return;
+      lastSyncAt = now;
+      void syncVoiceHotwordsFromServer();
+    };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') syncHotwords();
+    };
+    window.addEventListener('focus', syncHotwords);
+    window.addEventListener('online', syncHotwords);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('focus', syncHotwords);
+      window.removeEventListener('online', syncHotwords);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [auth]);
 
   const handleRenameServer = useCallback(async (server: ServerInfo) => {
     const newName = prompt('Rename server:', server.name);

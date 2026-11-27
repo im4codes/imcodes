@@ -5562,6 +5562,87 @@
       }
     },
     {
+      "name": "voice_hotwords_get",
+      "description": "Read synced voice ASR hotwords for project or user scope.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "description": "Scope (default effective).",
+            "type": "string",
+            "enum": [
+              "effective",
+              "project",
+              "user"
+            ]
+          },
+          "projectName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "serverId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "voice_hotwords_set",
+      "description": "Write or merge synced voice ASR hotwords for project or user scope.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "project",
+              "user"
+            ]
+          },
+          "hotwords": {
+            "type": "string",
+            "maxLength": 8192,
+            "description": "Lines: \"term\" or \"wrong => right\"."
+          },
+          "mode": {
+            "description": "Default merge; replace overwrites.",
+            "type": "string",
+            "enum": [
+              "merge",
+              "replace"
+            ]
+          },
+          "projectName": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "serverId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "scope",
+          "hotwords"
+        ],
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
       "name": "execution_pool_get",
       "description": "Read execution pool, policy, logged-in SDK catalogs, unknown models, and recommended presets.",
       "inputSchema": {

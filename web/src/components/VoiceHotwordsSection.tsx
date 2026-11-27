@@ -17,6 +17,7 @@ import {
   setProjectVoiceHotwordsRaw,
   setShareHotwordsWithOthers,
   subscribeVoiceHotwordsChange,
+  syncVoiceHotwordsFromServer,
   type VoiceHotwordProjectInput,
 } from '../voice-hotwords.js';
 
@@ -93,6 +94,10 @@ export function VoiceHotwordsSection({
       setSelectedProject(nextCurrent);
     }
   }, [currentProjectName, targetProjectToken]);
+
+  useEffect(() => {
+    void syncVoiceHotwordsFromServer();
+  }, []);
 
   useEffect(() => {
     setProjectRaw(selectedProject ? getProjectVoiceHotwordsRaw(selectedProject) : '');

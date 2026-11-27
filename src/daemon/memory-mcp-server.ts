@@ -34,6 +34,7 @@ import {
   type MemoryMcpToolDeps,
 } from './memory-mcp-tools.js';
 import { registerMessagePinMcpTools, type MessagePinMcpToolDeps } from './message-pin-mcp-tools.js';
+import { registerVoiceHotwordsMcpTools, type VoiceHotwordsMcpToolDeps } from './voice-hotwords-mcp-tools.js';
 import { registerSupervisionMcpTools, type SupervisionMcpToolDeps } from './supervision-mcp-tools.js';
 import { createSupervisionMcpToolDeps } from './supervision-registry-port.js';
 import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
@@ -454,7 +455,7 @@ function installDispatchIdentityGate(
   }) as typeof server.registerTool;
 }
 
-type ExactStoreMcpToolDeps = MessagePinMcpToolDeps & AliasMcpToolDeps;
+type ExactStoreMcpToolDeps = MessagePinMcpToolDeps & AliasMcpToolDeps & VoiceHotwordsMcpToolDeps;
 
 export function createMemoryMcpServer(
   caller: McpRuntimeCaller,
@@ -490,6 +491,7 @@ export function createMemoryMcpServer(
   // the fuzzy-memory contract list and schema firewall.
   const effectiveExactStoreToolDeps: ExactStoreMcpToolDeps = {
     ...(toolDeps.aliasClientOptions ? { aliasClientOptions: toolDeps.aliasClientOptions } : {}),
+    ...(toolDeps.voiceHotwordsClientOptions ? { voiceHotwordsClientOptions: toolDeps.voiceHotwordsClientOptions } : {}),
     ...(toolDeps.cronOptions?.loadSharedMachineAuthority
       ? { clientOptions: { loadSharedMachineAuthority: toolDeps.cronOptions.loadSharedMachineAuthority } }
       : {}),
@@ -497,6 +499,7 @@ export function createMemoryMcpServer(
   };
   for (const [name, tool] of registerAliasMcpTools(server, caller, effectiveExactStoreToolDeps)) registered.set(name, tool);
   for (const [name, tool] of registerMessagePinMcpTools(server, caller, effectiveExactStoreToolDeps)) registered.set(name, tool);
+  for (const [name, tool] of registerVoiceHotwordsMcpTools(server, caller, effectiveExactStoreToolDeps)) registered.set(name, tool);
   // Supervision registry: exact server-backed operations, same separation as
   // alias/message-pin tools -- outside the fuzzy-memory contract + firewall.
   for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps, toolDeps.legacyToolForwarder)) {
@@ -691,6 +694,10 @@ export function mergeDefaultToolDeps(
     aliasClientOptions: {
       loadSharedMachineAuthority,
       ...toolDeps.aliasClientOptions,
+    },
+    voiceHotwordsClientOptions: {
+      loadSharedMachineAuthority,
+      ...toolDeps.voiceHotwordsClientOptions,
     },
     memorySearchOptions: {
       loadSharedMachineAuthority,

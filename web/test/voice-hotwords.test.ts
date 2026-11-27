@@ -13,11 +13,14 @@ import es from '../src/i18n/locales/es.json';
 import ru from '../src/i18n/locales/ru.json';
 import {
   encodeVoiceHotwordProjectKey,
+  flushVoiceHotwordsPush,
   getCompiledVoiceHotwordsForProject,
   getGlobalVoiceHotwordsRaw,
   getProjectVoiceHotwordsRaw,
   getShareHotwordsWithOthers,
+  getVoiceHotwordsAuthScopeKey,
   registerOpenVoiceHotwordsSettingsHandler,
+  registerVoiceHotwordsSyncClient,
   resetVoiceHotwordsScopeForTesting,
   resolveRemoteVoiceHotwordsForProvider,
   setActiveVoiceHotwordProject,
@@ -26,6 +29,7 @@ import {
   setShareHotwordsWithOthers,
   setVoiceHotwordsAuthScope,
   shouldSendRemoteVoiceHotwords,
+  syncVoiceHotwordsFromServer,
   type VoiceHotwordProjectInput,
 } from '../src/voice-hotwords.js';
 import { VoiceHotwordsSection } from '../src/components/VoiceHotwordsSection.js';
@@ -267,6 +271,98 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       ]);
     } finally {
       unregister();
+    }
+  });
+
+  it('syncs bidirectionally with server via LWW, migrates legacy local data, respects tombstones, aborts on account switch, and tolerates 404', async () => {
+    vi.useFakeTimers();
+    try {
+      // Seed legacy pre-sync local data for user-1 before registering sync client
+      setVoiceHotwordsAuthScope({ userId: 'user-1', baseUrl: 'https://sync.example' });
+      setGlobalVoiceHotwordsRaw('LegacyGlobal');
+      setProjectVoiceHotwordsRaw('srv:srv-1::app', 'LegacyProj');
+
+      // Simulate pre-existing empty localStorage tombstone vs newer server clear, plus fresh user/project scopes
+      const serverState = {
+        version: 1 as const,
+        user: { raw: '', updatedAt: 0 },
+        projects: {
+          'srv:srv-1::app': { raw: '', updatedAt: Date.now() + 10_000 }, // server explicitly cleared later -> must beat legacy
+          'srv:srv-1::other': { raw: 'FromMcp', updatedAt: 500, source: 'mcp' as const },
+        },
+        shareWithOthers: { enabled: true, updatedAt: 500 },
+      };
+
+      const fetchRecord = vi.fn(async () => structuredClone(
+        getVoiceHotwordsAuthScopeKey()?.endsWith('|user-1')
+          ? serverState
+          : { version: 1 as const, user: { raw: '', updatedAt: 0 }, projects: {}, shareWithOthers: { enabled: false, updatedAt: 0 } },
+      ));
+      const updateRecord = vi.fn(async (payload: any) => {
+        if (payload.user) {
+          serverState.user = { raw: payload.user.raw, updatedAt: payload.user.clientUpdatedAt ?? Date.now() };
+        }
+        if (payload.projects) {
+          for (const [k, v] of Object.entries<any>(payload.projects)) {
+            serverState.projects[k] = { raw: v.raw, updatedAt: v.clientUpdatedAt ?? Date.now() };
+          }
+        }
+        if (payload.shareWithOthers) {
+          serverState.shareWithOthers = { enabled: payload.shareWithOthers.enabled, updatedAt: payload.shareWithOthers.clientUpdatedAt ?? Date.now() };
+        }
+        return structuredClone(serverState);
+      });
+
+      registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
+      await syncVoiceHotwordsFromServer();
+
+      // Legacy user global migrated upward; newer server empty tombstone prevented app resurrection; new MCP project pulled; share consent pulled
+      expect(updateRecord).toHaveBeenCalledWith(expect.objectContaining({
+        user: expect.objectContaining({ raw: 'LegacyGlobal', mode: 'replace' }),
+      }), expect.anything());
+      expect(getGlobalVoiceHotwordsRaw()).toBe('LegacyGlobal');
+      expect(getProjectVoiceHotwordsRaw('srv:srv-1::app')).toBe('');
+      expect(getProjectVoiceHotwordsRaw('srv:srv-1::other')).toBe('FromMcp');
+      expect(getShareHotwordsWithOthers()).toBe(true);
+
+      // Local edit debounces push at 300ms
+      setProjectVoiceHotwordsRaw('srv:srv-1::other', 'FromMcp\nLocalEdited');
+      expect(updateRecord).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(350);
+      expect(updateRecord).toHaveBeenCalledTimes(2);
+      expect(serverState.projects['srv:srv-1::other'].raw).toBe('FromMcp\nLocalEdited');
+
+      // Switching accounts mid-flight aborts old pull and prevents cross-account leakage
+      let rejectOrResolveOld: ((val: any) => void) | null = null;
+      fetchRecord.mockImplementationOnce((signal?: AbortSignal) => new Promise((resolve) => {
+        rejectOrResolveOld = resolve;
+        signal?.addEventListener('abort', () => resolve({
+          version: 1,
+          user: { raw: 'StaleUserOneLeak', updatedAt: 999_999_999 },
+          projects: {},
+          shareWithOthers: { enabled: true, updatedAt: 999_999_999 },
+        }));
+      }));
+      const slowSync = syncVoiceHotwordsFromServer();
+      setVoiceHotwordsAuthScope({ userId: 'user-2', baseUrl: 'https://sync.example' });
+      rejectOrResolveOld?.({
+        version: 1,
+        user: { raw: 'StaleUserOneLeak', updatedAt: 999_999_999 },
+        projects: {},
+        shareWithOthers: { enabled: true, updatedAt: 999_999_999 },
+      });
+      await slowSync;
+      expect(getGlobalVoiceHotwordsRaw()).toBe('');
+      expect(getShareHotwordsWithOthers()).toBe(false);
+
+      // Returning null (404 graceful degradation) must not break local storage
+      fetchRecord.mockResolvedValueOnce(null as any);
+      updateRecord.mockResolvedValueOnce(null as any);
+      setGlobalVoiceHotwordsRaw('OfflineOr404Term');
+      await flushVoiceHotwordsPush();
+      expect(getGlobalVoiceHotwordsRaw()).toBe('OfflineOr404Term');
+    } finally {
+      vi.useRealTimers();
     }
   });
 });

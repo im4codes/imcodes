@@ -36,7 +36,15 @@ import {
 } from './upload-suspend-wait.js';
 import { FILE_RELAY_MODE, R2_RELAY_API, R2_RELAY_PHASE, R2_RELAY_ERROR, type R2RelayProgress, type R2RelayReady } from '@shared/r2-relay.js';
 import { isServerR2RelayEnabled, readFileRelayMode, setFileRelayUser } from './r2-relay-preference.js';
-import { setVoiceHotwordsAuthScope } from './voice-hotwords.js';
+import {
+  registerVoiceHotwordsSyncClient,
+  setVoiceHotwordsAuthScope,
+} from './voice-hotwords.js';
+import {
+  VOICE_HOTWORDS_API_PATH,
+  type VoiceHotwordsPutRequest,
+  type VoiceHotwordsSyncRecord,
+} from '@shared/voice-hotwords.js';
 /**
  * Fetch wrapper with cookie-based auth for the IM.codes API.
  * Credentials are sent automatically via HttpOnly cookie.
@@ -2208,6 +2216,43 @@ export async function saveUserPref(key: string, value: unknown, options: { signa
   });
   emitUserPrefChanged(key, value);
 }
+
+export async function fetchVoiceHotwords(options: { projectKey?: string; signal?: AbortSignal } = {}): Promise<VoiceHotwordsSyncRecord | null> {
+  const qs = options.projectKey ? `?projectKey=${encodeURIComponent(options.projectKey)}` : '';
+  try {
+    const res = await apiFetch<{ record?: VoiceHotwordsSyncRecord }>(`${VOICE_HOTWORDS_API_PATH}${qs}`, {
+      signal: options.signal,
+      headers: _expectedUserId ? { [EXPECTED_USER_ID_HEADER]: _expectedUserId } : undefined,
+    });
+    return res?.record ?? null;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+export async function updateVoiceHotwords(
+  payload: VoiceHotwordsPutRequest,
+  options: { signal?: AbortSignal } = {},
+): Promise<VoiceHotwordsSyncRecord | null> {
+  try {
+    const res = await apiFetch<{ record?: VoiceHotwordsSyncRecord }>(VOICE_HOTWORDS_API_PATH, {
+      signal: options.signal,
+      headers: _expectedUserId ? { [EXPECTED_USER_ID_HEADER]: _expectedUserId } : undefined,
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+    return res?.record ?? null;
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 404) return null;
+    throw err;
+  }
+}
+
+registerVoiceHotwordsSyncClient({
+  fetchRecord: (signal) => fetchVoiceHotwords({ signal }),
+  updateRecord: (payload, signal) => updateVoiceHotwords(payload, { signal }),
+});
 
 // ── Passkey (WebAuthn) API ─────────────────────────────────────────────────
 

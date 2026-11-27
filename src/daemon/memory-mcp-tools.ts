@@ -456,6 +456,7 @@ export interface MemoryMcpToolDeps {
   listVerificationAliases?: typeof aliasMcpList;
   verificationClientOptions?: VerificationMachineClientOptions;
   aliasClientOptions?: AliasMcpClientOptions;
+  voiceHotwordsClientOptions?: import('./voice-hotwords-mcp-client.js').VoiceHotwordsMcpClientOptions;
   memorySearchOptions?: MemoryMcpSearchOptions;
   applyEffectiveIdentity?: (
     sessionName: string,

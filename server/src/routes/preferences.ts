@@ -3,6 +3,7 @@ import type { Env } from '../env.js';
 import { getUserPref, setUserPref, deleteUserPref } from '../db/queries.js';
 import { requireAuth } from '../security/authorization.js';
 import { TTS_USER_CONFIG_PREF_KEY } from '../../../shared/tts-config.js';
+import { VOICE_HOTWORDS_PREF_KEY } from '../../../shared/voice-hotwords.js';
 
 export const preferencesRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 
@@ -10,13 +11,16 @@ preferencesRoutes.use('/*', requireAuth());
 
 const KEY_RE = /^[a-zA-Z0-9_.:@-]{1,128}$/;
 const MAX_VALUE_BYTES = 65536; // 64KB
+const isReservedPrefKey = (key: string): boolean => (
+  key === TTS_USER_CONFIG_PREF_KEY || key === VOICE_HOTWORDS_PREF_KEY
+);
 
 /** GET /api/preferences/:key */
 preferencesRoutes.get('/:key', async (c) => {
   const userId = c.get('userId' as never) as string;
   const key = c.req.param('key')!;
   if (!KEY_RE.test(key)) return c.json({ error: 'invalid_key' }, 400);
-  if (key === TTS_USER_CONFIG_PREF_KEY) return c.json({ error: 'reserved_key' }, 403);
+  if (isReservedPrefKey(key)) return c.json({ error: 'reserved_key' }, 403);
 
   const raw = await getUserPref(c.env.DB, userId, key);
   if (raw === null) return c.json({ value: null });
@@ -32,7 +36,7 @@ preferencesRoutes.put('/:key', async (c) => {
   const userId = c.get('userId' as never) as string;
   const key = c.req.param('key')!;
   if (!KEY_RE.test(key)) return c.json({ error: 'invalid_key' }, 400);
-  if (key === TTS_USER_CONFIG_PREF_KEY) return c.json({ error: 'reserved_key' }, 403);
+  if (isReservedPrefKey(key)) return c.json({ error: 'reserved_key' }, 403);
 
   let body: { value?: unknown };
   try {
@@ -55,7 +59,7 @@ preferencesRoutes.delete('/:key', async (c) => {
   const userId = c.get('userId' as never) as string;
   const key = c.req.param('key')!;
   if (!KEY_RE.test(key)) return c.json({ error: 'invalid_key' }, 400);
-  if (key === TTS_USER_CONFIG_PREF_KEY) return c.json({ error: 'reserved_key' }, 403);
+  if (isReservedPrefKey(key)) return c.json({ error: 'reserved_key' }, 403);
 
   await deleteUserPref(c.env.DB, userId, key);
   return c.json({ ok: true });

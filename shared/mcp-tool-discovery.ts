@@ -2,6 +2,7 @@ import { ALIAS_MCP_TOOLS } from './alias-types.js';
 import { CAPABILITY_MCP_TOOL_NAMES } from './capability-management.js';
 import { MEMORY_MCP_TOOL_NAMES } from './memory-mcp-contracts.js';
 import { MESSAGE_PIN_MCP_TOOLS } from './message-pins.js';
+import { VOICE_HOTWORDS_MCP_TOOLS } from './voice-hotwords.js';
 export {
   MCP_TOOL_DISCOVERY_DESCRIPTION,
   MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS,
@@ -157,6 +158,15 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
       MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN,
       MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_LIST,
       MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE,
+    ]),
+  }),
+  Object.freeze({
+    id: 'voice-hotwords',
+    aliases: Object.freeze(['voice hotwords', 'hotwords', '语音热词', '热词']),
+    summary: 'Read and write synced project/user voice ASR hotwords (voice_hotwords_get, voice_hotwords_set).',
+    tools: Object.freeze([
+      VOICE_HOTWORDS_MCP_TOOLS.GET,
+      VOICE_HOTWORDS_MCP_TOOLS.SET,
     ]),
   }),
 ]);

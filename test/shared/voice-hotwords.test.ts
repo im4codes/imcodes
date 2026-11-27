@@ -2,10 +2,19 @@ import { describe, expect, it } from 'vitest';
 import {
   VOICE_HOTWORDS_MAX_ALIASES,
   VOICE_HOTWORDS_MAX_CONTEXT_CHARS,
+  VOICE_HOTWORDS_MAX_PROJECTS,
   VOICE_HOTWORDS_MAX_TERMS,
   applyVoiceHotwordPostProcess,
+  coerceVoiceHotwordsSyncRecord,
+  compactVoiceHotwordsProjects,
+  decodeVoiceHotwordProjectKey,
+  encodeVoiceHotwordProjectKey,
   formatVoiceHotwordsContext,
+  isValidVoiceHotwordProjectKey,
+  mergeVoiceHotwordRawText,
   mergeVoiceHotwords,
+  normalizeVoiceHotwordProjectKey,
+  normalizeVoiceHotwordRawText,
   parseVoiceHotwordsInput,
   sanitizeRemoteVoiceHotwords,
   sanitizeVoiceHotwordText,
@@ -245,5 +254,66 @@ describe('shared voice hotwords', () => {
     }
     const avgMs = (performance.now() - start) / iterations;
     expect(avgMs).toBeLessThan(1);
+  });
+
+  it('encodes, decodes, normalizes, and validates project keys consistently', () => {
+    expect(encodeVoiceHotwordProjectKey('codedeck', 'srv-1')).toBe('srv:srv-1::codedeck');
+    expect(encodeVoiceHotwordProjectKey('srv:srv-1::codedeck', 'srv-2')).toBe('srv:srv-1::codedeck');
+    expect(encodeVoiceHotwordProjectKey('plain-proj', '')).toBe('plain-proj');
+    expect(encodeVoiceHotwordProjectKey('   ')).toBeNull();
+    expect(decodeVoiceHotwordProjectKey('srv:srv-1::codedeck')).toEqual({ serverId: 'srv-1', projectName: 'codedeck' });
+    expect(decodeVoiceHotwordProjectKey('plain-proj')).toEqual({ serverId: null, projectName: 'plain-proj' });
+    expect(normalizeVoiceHotwordProjectKey({ projectName: 'app', serverId: 'srv/a' })).toBe('srv:srv%2Fa::app');
+
+    expect(isValidVoiceHotwordProjectKey('srv:srv-1::codedeck')).toBe(true);
+    expect(isValidVoiceHotwordProjectKey('codedeck')).toBe(true);
+    expect(isValidVoiceHotwordProjectKey('')).toBe(false);
+    expect(isValidVoiceHotwordProjectKey(' codedeck')).toBe(false);
+    expect(isValidVoiceHotwordProjectKey('bad\nkey')).toBe(false);
+    expect(isValidVoiceHotwordProjectKey('x'.repeat(300))).toBe(false);
+  });
+
+  it('normalizes raw text and merges lines cleanly with case/alias deduplication', () => {
+    expect(normalizeVoiceHotwordRawText('a\r\nb\u0000c')).toBe('a\nbc');
+    expect(normalizeVoiceHotwordRawText('  \r\n  ')).toBe('');
+
+    const merged = mergeVoiceHotwordRawText(
+      'IM.codes\n错别词 => IM.codes\nWorkTree',
+      'im.codes\n错别词 -> IM.codes\n  worktree \ncodex-sdk\nCODEX-SDK\n新术语 => NewTerm',
+    );
+    expect(merged).toBe('IM.codes\n错别词 => IM.codes\nWorkTree\ncodex-sdk\n新术语 => NewTerm');
+  });
+
+  it('coerces sync records safely and compacts oldest empty tombstones before exceeding max projects', () => {
+    const coerced = coerceVoiceHotwordsSyncRecord({
+      version: 99,
+      user: { raw: 'GlobalTerm\r\n', updatedAt: 100.8, source: 'mcp' },
+      projects: {
+        valid: { raw: 'ProjTerm', updatedAt: 200, source: 'web' },
+        'bad\nkey': { raw: 'Ignored', updatedAt: 300 },
+      },
+      shareWithOthers: { enabled: true, updatedAt: 50 },
+    });
+    expect(coerced).toEqual({
+      version: 1,
+      user: { raw: 'GlobalTerm\n', updatedAt: 100, source: 'mcp' },
+      projects: {
+        valid: { raw: 'ProjTerm', updatedAt: 200, source: 'web' },
+      },
+      shareWithOthers: { enabled: true, updatedAt: 50 },
+    });
+
+    const projects: Record<string, { raw: string; updatedAt: number }> = {
+      tombOld: { raw: '', updatedAt: 10 },
+      tombNew: { raw: '', updatedAt: 20 },
+    };
+    for (let i = 0; i < VOICE_HOTWORDS_MAX_PROJECTS; i += 1) {
+      projects[`p${i}`] = { raw: `Term${i}`, updatedAt: 100 + i };
+    }
+    const compacted = compactVoiceHotwordsProjects(projects, VOICE_HOTWORDS_MAX_PROJECTS);
+    expect(Object.keys(compacted).length).toBe(VOICE_HOTWORDS_MAX_PROJECTS);
+    expect(compacted.tombOld).toBeUndefined();
+    expect(compacted.tombNew).toBeUndefined();
+    expect(compacted.p0).toEqual({ raw: 'Term0', updatedAt: 100 });
   });
 });

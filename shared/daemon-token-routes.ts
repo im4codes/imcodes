@@ -15,6 +15,7 @@ import { WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT } from './worker-session-snapshot
 import { CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH } from './controlled-node-artifacts.js';
 import { USAGE_INGEST_ROUTE_SUFFIX } from './usage-analytics.js';
 import { PORT_FORWARD_API_PATH } from './port-forward.js';
+import { VOICE_HOTWORDS_API_PATH } from './voice-hotwords.js';
 
 export const DAEMON_TOKEN_ROUTE_NOT_ALLOWED = 'daemon_token_route_not_allowed';
 export type DaemonHttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
@@ -45,6 +46,8 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   full('GET', ALIAS_API_PATH),
   full('POST', ALIAS_API_PATH),
   full('DELETE', `${ALIAS_API_PATH}/:name`),
+  full('GET', VOICE_HOTWORDS_API_PATH),
+  full('PUT', VOICE_HOTWORDS_API_PATH),
   full('GET', MESSAGE_PINS_API_PATH),
   full('GET', `${MESSAGE_PINS_API_PATH}/:id`),
   full('POST', MESSAGE_PINS_API_PATH),
