@@ -1,6 +1,7 @@
 import type { ChildProcess } from 'node:child_process';
 import {
   registerAgentProcessResource,
+  registerSharedProviderAgentResource,
   releaseSessionResource,
 } from '../../daemon/session-resource-service.js';
 import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
@@ -89,6 +90,40 @@ export function bindAgentProcessResource(
     const resourceId = await registration;
     if (!resourceId) return;
     await releaseSessionResource(resourceId, owner).catch(() => {});
+  };
+
+  child.once('exit', () => { void release(); });
+  return { release };
+}
+
+/**
+ * Register a daemon/provider-shared agent child (such as `cursor-acp`) under a
+ * daemon-lifetime owner so per-session teardowns never kill another session's
+ * live server while a crashed daemon's orphan group is still reaped on startup.
+ */
+export function bindSharedProviderProcessResource(
+  providerId: string,
+  child: ChildProcess,
+): AgentProcessResource {
+  const pid = child.pid;
+  if (!providerId.trim() || typeof pid !== 'number' || pid <= 0 || childHasExited(child)) return NOOP;
+
+  const registration = registerSharedProviderAgentResource(providerId, pid).catch((error) => {
+    const processIdentityUnavailable = error instanceof Error
+      && error.message === 'session_resource_process_identity_unavailable';
+    if (!processIdentityUnavailable || !childHasExited(child)) {
+      logger.warn({ err: error, pid, providerId }, 'shared provider process resource registration failed');
+    }
+    return null;
+  });
+
+  let released = false;
+  const release = async (): Promise<void> => {
+    if (released) return;
+    released = true;
+    const registered = await registration;
+    if (!registered) return;
+    await releaseSessionResource(registered.resourceId, registered.owner).catch(() => {});
   };
 
   child.once('exit', () => { void release(); });

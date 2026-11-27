@@ -60,6 +60,7 @@ export function isSessionResourceOwnerIdentity(value: unknown): value is Session
 export const SESSION_RESOURCE_LIFETIME = {
   RUNTIME: 'runtime',
   PROVIDER_HOST: 'provider_host',
+  SHARED_PROVIDER: 'shared_provider',
 } as const;
 
 export type SessionResourceLifetime = typeof SESSION_RESOURCE_LIFETIME[keyof typeof SESSION_RESOURCE_LIFETIME];

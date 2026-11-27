@@ -33,7 +33,7 @@ const SESSION_OWNED = [
  * a shared process under one session's owner would let that session's teardown
  * reap another session's live agent.
  */
-const DAEMON_SHARED = ['codex-sdk', 'kimi-sdk', 'kimi-v2'];
+const DAEMON_SHARED = ['codex-sdk', 'kimi-sdk', 'kimi-v2', 'cursor-acp'];
 
 const ALL = [...SESSION_OWNED, ...DAEMON_SHARED];
 
@@ -201,6 +201,9 @@ describe('every spawned agent process is bound to a group-owning reaper', () => 
         source,
         `${provider} shares one process across sessions, so a per-session lease would let one session reap another's agent`,
       ).not.toContain('bindAgentProcessResource(');
+      if (provider === 'cursor-acp') {
+        expect(source, 'cursor-acp must register its shared process under a daemon/provider lease').toContain('bindSharedProviderProcessResource(');
+      }
     }
   });
 

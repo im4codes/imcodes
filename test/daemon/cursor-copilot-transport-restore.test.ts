@@ -16,13 +16,21 @@ const mocks = vi.hoisted(() => {
       kill: ReturnType<typeof vi.fn>;
     };
   }> = [];
+  let cursorLoadErrorsRemaining = 0;
   const copilotRuns: Array<{
     sessionId: string;
     prompt: string;
     attachments?: Array<Record<string, unknown>>;
   }> = [];
   const copilotListFilters: Array<Record<string, unknown> | undefined> = [];
-  return { store, cursorSpawns, copilotRuns, copilotListFilters };
+  return {
+    store,
+    cursorSpawns,
+    copilotRuns,
+    copilotListFilters,
+    getCursorLoadErrorsRemaining: () => cursorLoadErrorsRemaining,
+    setCursorLoadErrorsRemaining: (count: number) => { cursorLoadErrorsRemaining = count; },
+  };
 });
 
 vi.mock("node:child_process", async (importOriginal) => {
@@ -75,7 +83,12 @@ vi.mock("node:child_process", async (importOriginal) => {
                 },
               })}\n`);
             } else if (msg.id !== undefined && msg.method === "session/load") {
-              stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} })}\n`);
+              if (mocks.getCursorLoadErrorsRemaining() > 0) {
+                mocks.setCursorLoadErrorsRemaining(mocks.getCursorLoadErrorsRemaining() - 1);
+                stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Transient internal load failure" } })}\n`);
+              } else {
+                stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} })}\n`);
+              }
             } else if (msg.id !== undefined && msg.method === "session/set_model") {
               stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} })}\n`);
             } else if (msg.id !== undefined && msg.method === "session/new") {
@@ -315,6 +328,7 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
     mocks.cursorSpawns.length = 0;
     mocks.copilotRuns.length = 0;
     mocks.copilotListFilters.length = 0;
+    mocks.setCursorLoadErrorsRemaining(0);
   });
 
   afterEach(async () => {
@@ -355,6 +369,45 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
       expect(spawned?.acpRequests.some((r) => r.method === "session/load" && r.params?.sessionId === "cursor-chat-restore")).toBe(true);
       expect(spawned?.acpRequests.some((r) => r.method === "session/prompt" && r.params?.sessionId === "cursor-chat-restore")).toBe(true);
     });
+  });
+
+  it("never falls back to session/new or overwrites providerResumeId on transient -32603 session/load failure during restore", async () => {
+    mocks.setCursorLoadErrorsRemaining(1);
+    mocks.store.set("deck_cursor_transient_brain", {
+      name: "deck_cursor_transient_brain",
+      projectName: "cursortransient",
+      role: "brain",
+      agentType: "cursor-headless",
+      projectDir: "/tmp/cursor-transient",
+      state: "idle",
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: "transport",
+      providerId: "cursor-headless",
+      providerSessionId: "route-cursor-transient",
+      providerResumeId: "cursor-chat-keep-me",
+      requestedModel: "gpt-5.2",
+      activeModel: "gpt-5.2",
+    });
+
+    await connectProvider("cursor-headless", {});
+    await restoreTransportSessions("cursor-headless");
+
+    const runtime = getTransportRuntime("deck_cursor_transient_brain");
+    expect(runtime?.providerSessionId).toBe("route-cursor-transient");
+
+    runtime!.send("First attempt hits transient -32603");
+    const spawned = mocks.cursorSpawns.at(-1);
+    await vi.waitFor(() => {
+      expect(spawned?.acpRequests.some((r) => r.method === "session/load" && r.params?.sessionId === "cursor-chat-keep-me")).toBe(true);
+    });
+    await flush();
+
+    // Critical invariant: no silent session/new fallback and persisted resumeId stays untouched!
+    expect(spawned?.acpRequests.some((r) => r.method === "session/new")).toBe(false);
+    expect(mocks.store.get("deck_cursor_transient_brain")?.providerResumeId).toBe("cursor-chat-keep-me");
   });
 
   it("a restored session gets its identity from the identity store (it is not in the stored record)", async () => {

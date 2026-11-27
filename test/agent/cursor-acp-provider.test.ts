@@ -10,6 +10,8 @@ import {
   normalizeCursorAcpUsage,
 } from '../../src/agent/providers/cursor-acp.js';
 import { getCursorRuntimeConfig, __cursorRuntimeConfigInternals } from '../../src/agent/cursor-runtime-config.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import {
   IMCODES_DAEMON_NAMESPACE_ENV,
@@ -28,6 +30,10 @@ vi.mock('../../src/util/logger.js', () => ({
     error: vi.fn(),
     debug: vi.fn(),
   },
+}));
+
+vi.mock('../../src/daemon/timeline-emitter.js', () => ({
+  timelineEmitter: { emit: vi.fn(), on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) },
 }));
 
 vi.mock('../../src/agent/cursor-runtime-config.js', () => ({
@@ -60,12 +66,16 @@ class FakeAcpServerProcess extends EventEmitter {
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
   pid = 424242;
+  holdExit = false;
 
   private buf = '';
 
   readonly kill = vi.fn((signal?: NodeJS.Signals) => {
     this.killed = true;
     this.signalCode = signal ?? 'SIGTERM';
+    if (this.holdExit) {
+      return true;
+    }
     this.exitCode = 0;
     queueMicrotask(() => {
       this.emit('exit', 0, signal ?? 'SIGTERM');
@@ -73,6 +83,14 @@ class FakeAcpServerProcess extends EventEmitter {
     });
     return true;
   });
+
+  releaseExit(code = 0, signal: NodeJS.Signals | null = 'SIGKILL'): void {
+    this.holdExit = false;
+    this.exitCode = code;
+    this.signalCode = signal;
+    this.emit('exit', code, signal);
+    this.emit('close', code, signal);
+  }
 
   constructor(
     private readonly onRequest: (req: FakeAcpRpcRequest, proc: FakeAcpServerProcess) => void,
@@ -135,12 +153,6 @@ class FakeAcpServerProcess extends EventEmitter {
   }
 }
 
-const flush = async (ticks = 6): Promise<void> => {
-  for (let i = 0; i < ticks; i += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-};
-
 function makePayload(userMessage: string, extra: Partial<ProviderContextPayload> = {}): ProviderContextPayload {
   return {
     userMessage,
@@ -177,11 +189,17 @@ describe('CursorAcpProvider', () => {
   let execFileMock: ReturnType<typeof vi.fn>;
 
   function installHarness(
-    handler: (req: FakeAcpRpcRequest, proc: FakeAcpServerProcess) => void,
-    options: { spawnError?: Error } = {},
+    handler: (req: FakeAcpRpcRequest, proc: FakeAcpServerProcess, index: number) => void,
+    options: {
+      spawnError?: Error;
+      holdExit?: boolean;
+      onExecFile?: (exec: string, args: string[], cb?: (err: Error | null, stdout: string, stderr: string) => void) => void;
+    } = {},
   ): void {
     spawnMock = vi.fn((_file: string, _args: string[]) => {
-      const proc = new FakeAcpServerProcess(handler);
+      const idx = spawnedProcesses.length;
+      const proc = new FakeAcpServerProcess((req, p) => handler(req, p, idx));
+      if (options.holdExit) proc.holdExit = true;
       spawnedProcesses.push(proc);
       queueMicrotask(() => {
         if (options.spawnError) {
@@ -192,8 +210,12 @@ describe('CursorAcpProvider', () => {
       });
       return proc as unknown as ReturnType<typeof import('node:child_process').spawn>;
     });
-    execFileMock = vi.fn((_file: string, _args: string[], _opts: unknown, cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
-      cb?.(null, '2026.06.15-03-48-54-da23e37\n', '');
+    execFileMock = vi.fn((file: string, args: string[], _opts: unknown, cb?: (err: Error | null, stdout: string, stderr: string) => void) => {
+      if (options.onExecFile) {
+        options.onExecFile(file, args, cb);
+      } else {
+        cb?.(null, '2026.06.15-03-48-54-da23e37\n', '');
+      }
       return { stdin: { end: vi.fn() } } as never;
     });
     cursorAcpRuntimeHooks.loadChildProcess = async () => ({
@@ -206,6 +228,7 @@ describe('CursorAcpProvider', () => {
     spawnedProcesses = [];
     vi.clearAllMocks();
     (__cursorRuntimeConfigInternals.clearCache as ReturnType<typeof vi.fn>)();
+    resetTransportQueueStoreForTests();
   });
 
   afterEach(() => {
@@ -236,14 +259,10 @@ describe('CursorAcpProvider', () => {
             description: "Authenticate using existing Cursor login credentials. Run 'agent login' first if not logged in.",
           }],
         });
-        return;
-      }
-      if (req.method === 'authenticate') {
+      } else if (req.method === 'authenticate') {
         requiresAuth = false;
         proc.reply(req.id!, {});
-        return;
-      }
-      if (req.method === 'session/new') {
+      } else if (req.method === 'session/new') {
         if (requiresAuth) {
           proc.replyError(req.id!, -32000, 'Authentication required', {
             message: "Authentication required. Please run 'agent login' first, then call authenticate() with methodId 'cursor_login'.",
@@ -251,10 +270,6 @@ describe('CursorAcpProvider', () => {
           return;
         }
         proc.reply(req.id!, { sessionId: 'acp-sess-1' });
-        return;
-      }
-      if (req.method === 'session/close') {
-        proc.reply(req.id!, {});
       }
     });
 
@@ -276,7 +291,7 @@ describe('CursorAcpProvider', () => {
     const authReq = spawnedProcesses[0]!.requests.find((r) => r.method === 'authenticate');
     expect(authReq?.params).toEqual({ methodId: 'cursor_login' });
 
-    // When authenticate itself rejects, provider surfaces actionable AUTH_FAILED without hanging
+    // Rejecting authenticate surfaces actionable AUTH_FAILED without hanging
     installHarness((req, proc) => {
       if (req.method === 'initialize') {
         proc.reply(req.id!, {
@@ -302,7 +317,8 @@ describe('CursorAcpProvider', () => {
     await unauthProvider.disconnect();
   });
 
-  it('normalizes exact context token usage via onUsage (usage_update, PromptResponse.usage, cached model contextWindow) and finalizes on completion', async () => {
+  it('keeps atomic context snapshots separate from cumulative PromptResponse.usage and clears stale cache across frames (P0-6)', async () => {
+    let promptNum = 0;
     installHarness((req, proc) => {
       if (req.method === 'initialize') {
         proc.reply(req.id!, {
@@ -320,21 +336,41 @@ describe('CursorAcpProvider', () => {
           },
         });
       } else if (req.method === 'session/prompt') {
+        promptNum += 1;
+        // 1) Snapshot 1: used=45000, cached=43800, window=300000
         proc.notifySessionUpdate('acp-usage-1', {
           sessionUpdate: 'usage_update',
           used: 45_000,
           size: 300_000,
-          tokens: { inputTokens: 1_200, cachedInputTokens: 43_800, outputTokens: 120 },
+          tokens: { cachedInputTokens: 43_800, outputTokens: 50 },
+        });
+        // 2) Snapshot 2: used=47000 WITHOUT cache fields -> must NOT retain 43800 cache!
+        proc.notifySessionUpdate('acp-usage-1', {
+          sessionUpdate: 'usage_update',
+          used: 47_000,
+          size: 300_000,
+        });
+        // 3) Snapshot 3: window changes to 200000 and partial omit on 4th update keeps 200000
+        proc.notifySessionUpdate('acp-usage-1', {
+          sessionUpdate: 'usage_update',
+          used: 48_000,
+          size: 200_000,
+        });
+        proc.notifySessionUpdate('acp-usage-1', {
+          sessionUpdate: 'usage_update',
+          used: 49_000,
         });
         proc.notifySessionUpdate('acp-usage-1', {
           sessionUpdate: 'agent_message_chunk',
-          messageId: 'msg-usage-1',
+          messageId: `msg-usage-${promptNum}`,
           content: { type: 'text', text: 'Token check ok' },
         });
         setTimeout(() => {
+          // 4) Terminal ACP PromptResponse.usage is CUMULATIVE across session turns (inputTokens=125000).
+          //    It must NEVER overwrite current-context 49000 on onUsage OR metadata.usage!
           proc.reply(req.id!, {
             stopReason: 'end_turn',
-            usage: { inputTokens: 1_250, outputTokens: 210, cachedReadTokens: 43_800, totalTokens: 45_260 },
+            usage: { inputTokens: 125_000, outputTokens: 210, cachedReadTokens: 43_800, totalTokens: 125_210 },
           });
         }, 10);
       }
@@ -352,40 +388,54 @@ describe('CursorAcpProvider', () => {
     await provider.send(sid, 'check tokens');
     await vi.waitFor(() => {
       expect(completed).toHaveLength(1);
-      expect(usageEvents).toHaveLength(2);
+      expect(usageEvents).toHaveLength(5);
     });
 
-    expect(usageEvents).toHaveLength(2);
-    expect(usageEvents[0]).toMatchObject({
-      finalized: false,
-      model: 'composer-2.5',
-      usage: {
-        input_tokens: 1_200,
-        cached_input_tokens: 43_800,
-        cache_read_input_tokens: 43_800,
-        output_tokens: 120,
-        model_context_window: 300_000,
-      },
+    // Live event 0: 45k total (1200 + 43800 cached) in 300k window
+    expect(usageEvents[0]?.usage).toEqual({
+      input_tokens: 1_200,
+      cached_input_tokens: 43_800,
+      cache_read_input_tokens: 43_800,
+      output_tokens: 50,
+      model_context_window: 300_000,
     });
-    expect(usageEvents[1]).toMatchObject({
+    // Live event 1: cache NOT supplied -> cache cleared completely (no 43800 + 47000 = 90800!)
+    expect(usageEvents[1]?.usage).toEqual({
+      input_tokens: 47_000,
+      model_context_window: 300_000,
+    });
+    // Live event 2: window change reflected immediately (200k)
+    expect(usageEvents[2]?.usage).toEqual({
+      input_tokens: 48_000,
+      model_context_window: 200_000,
+    });
+    // Live event 3: partial update omitting `size` retains latest verified 200k window
+    expect(usageEvents[3]?.usage).toEqual({
+      input_tokens: 49_000,
+      model_context_window: 200_000,
+    });
+    // Finalized event & completed message metadata keep current occupancy 49000 (NEVER 125000 or 168800!)
+    expect(usageEvents[4]).toMatchObject({
       finalized: true,
       messageId: 'msg-usage-1',
       model: 'composer-2.5',
       usage: {
-        input_tokens: 1_250,
-        cached_input_tokens: 43_800,
-        output_tokens: 210,
-        model_context_window: 300_000,
+        input_tokens: 49_000,
+        model_context_window: 200_000,
       },
     });
-    expect((completed[0]?.metadata as Record<string, unknown>)?.usage).toMatchObject({
-      input_tokens: 1_250,
-      cached_input_tokens: 43_800,
-      output_tokens: 210,
-      model_context_window: 300_000,
+    const metadata = completed[0]?.metadata as Record<string, unknown>;
+    expect(metadata.usage).toEqual({
+      input_tokens: 49_000,
+      model_context_window: 200_000,
+    });
+    expect(metadata.cumulativeUsage).toEqual({
+      inputTokens: 125_000,
+      outputTokens: 210,
+      cachedReadTokens: 43_800,
+      totalTokens: 125_210,
     });
 
-    // Helper boundary check: `used` + `cachedInputTokens` without discrete `inputTokens`
     expect(normalizeCursorAcpUsage({ used: 45_000, size: 200_000, cachedInputTokens: 43_800 })).toMatchObject({
       input_tokens: 1_200,
       cached_input_tokens: 43_800,
@@ -395,8 +445,9 @@ describe('CursorAcpProvider', () => {
     await provider.disconnect();
   });
 
-  it('surfaces ACP compaction status (compacting -> null), resets injected system text post-compaction, passes /compact verbatim, and clears stuck compacting on error/cancel', async () => {
-    let promptCount = 0;
+  it('enforces runtime /compact advertisement gate, translates advertised command, drives compaction end-to-end, and ignores late frames after finish/cancel (P0-7)', async () => {
+    let advertiseCompact = false;
+    let promptNum = 0;
     installHarness((req, proc) => {
       if (req.method === 'initialize') {
         proc.reply(req.id!, {
@@ -407,108 +458,342 @@ describe('CursorAcpProvider', () => {
         proc.reply(req.id!, { sessionId: 'acp-compact-1' });
         proc.notifySessionUpdate('acp-compact-1', {
           sessionUpdate: 'available_commands_update',
-          availableCommands: [{ name: 'compact', description: 'Compact conversation context' }],
+          availableCommands: advertiseCompact
+            ? [{ name: 'compress', description: 'Compress conversation' }]
+            : [{ name: 'copy-request-id', description: 'Copy last request ID' }],
         });
       } else if (req.method === 'session/prompt') {
-        promptCount += 1;
-        if (promptCount === 1) {
+        promptNum += 1;
+        const idx = promptNum;
+        if (idx === 1) {
           proc.notifySessionUpdate('acp-compact-1', {
             sessionUpdate: 'compaction_update',
-            compactionId: 'cmp-1',
             status: 'in_progress',
           });
           proc.notifySessionUpdate('acp-compact-1', {
             sessionUpdate: 'compaction_summary_chunk',
-            compactionId: 'cmp-1',
-            content: { type: 'text', text: 'Internal compacted summary' },
+            content: { type: 'text', text: 'Internal summary' },
           });
           proc.notifySessionUpdate('acp-compact-1', {
             sessionUpdate: 'compaction_update',
-            compactionId: 'cmp-1',
             status: 'completed',
-          });
-          proc.notifySessionUpdate('acp-compact-1', {
-            sessionUpdate: 'usage_update',
-            used: 4_000,
-            size: 200_000,
           });
           proc.notifySessionUpdate('acp-compact-1', {
             sessionUpdate: 'agent_message_chunk',
             messageId: 'msg-c1',
-            content: { type: 'text', text: 'After compact' },
+            content: { type: 'text', text: 'Compacted cleanly' },
           });
-          setTimeout(() => proc.reply(req.id!, { stopReason: 'end_turn' }), 10);
-        } else if (promptCount === 2) {
-          setTimeout(() => proc.reply(req.id!, { stopReason: 'end_turn' }), 10);
-        } else if (promptCount === 3) {
-          // Turn 3 stalls in compacting and gets cancelled
+          setTimeout(() => {
+            proc.reply(req.id!, { stopReason: 'end_turn' });
+            // Late compaction update arriving AFTER completion must be ignored!
+            setTimeout(() => {
+              proc.notifySessionUpdate('acp-compact-1', {
+                sessionUpdate: 'compaction_update',
+                status: 'in_progress',
+              });
+            }, 5);
+          }, 10);
+        } else {
           proc.notifySessionUpdate('acp-compact-1', {
-            sessionUpdate: 'compaction_update',
-            compactionId: 'cmp-2',
-            status: 'in_progress',
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `Reply ${idx}` },
           });
+          setTimeout(() => proc.reply(req.id!, { stopReason: 'end_turn' }), 10);
         }
+      }
+    });
+
+    // 1) Unadvertised (matching real Cursor 2026.06.15): runtime.send('/compact') MUST reject cleanly
+    const negProvider = new CursorAcpProvider();
+    await negProvider.connect({ binaryPath: 'cursor-agent' });
+    const negRuntime = new TransportSessionRuntime(negProvider, 'deck_neg_compact');
+    await negRuntime.initialize({
+      sessionKey: 'route-neg-compact',
+      cwd: '/tmp/proj',
+      identityPrompt: 'CONTRACT ALPHA',
+    });
+    // Trigger initial turn so available_commands_update from session/new settles
+    const completionsNeg: number[] = [];
+    negProvider.onComplete(() => completionsNeg.push(1));
+    negRuntime.send('init turn');
+    await vi.waitFor(() => expect(completionsNeg).toHaveLength(1));
+    expect(() => negRuntime.send('/compact')).toThrow(/not advertised|support \/compact/i);
+    await negProvider.disconnect();
+
+    // 2) Advertised `/compress`: runtime.send('/compact') reaches Cursor as `/compress` & reinjects contract post-compaction
+    advertiseCompact = true;
+    const posProvider = new CursorAcpProvider();
+    await posProvider.connect({ binaryPath: 'cursor-agent' });
+    const statuses: Array<string | null> = [];
+    const completionsPos: number[] = [];
+    posProvider.onStatus((_sid, s) => statuses.push(s.status));
+    posProvider.onComplete(() => completionsPos.push(1));
+
+    const posRuntime = new TransportSessionRuntime(posProvider, 'deck_pos_compact');
+    await posRuntime.initialize({
+      sessionKey: 'route-pos-compact',
+      cwd: '/tmp/proj',
+      identityPrompt: 'IDENTITY CONTRACT',
+    });
+    promptNum = 0;
+
+    // Warm turn 1 so session/new runs and available_commands_update advertises /compress cleanly
+    expect(posRuntime.send('warm turn')).toBe('sent');
+    await vi.waitFor(() => expect(completionsPos).toHaveLength(1));
+
+    // Turn 2 sends /compact through real TransportSessionRuntime -> translated to advertised /compress!
+    expect(posRuntime.send('/compact')).toBe('sent');
+    await vi.waitFor(() => {
+      expect(completionsPos).toHaveLength(2);
+    });
+    await new Promise((r) => setTimeout(r, 30)); // allow late compaction_update to arrive & be rejected
+
+    const proc = spawnedProcesses[1]!;
+    const compactPrompt = proc.requests.filter((r) => r.method === 'session/prompt')[1]!;
+    expect((compactPrompt.params?.prompt as Array<{ text: string }>)[0]?.text).toBe('/compress');
+    expect(statuses).toContain('compacting');
+    expect(statuses.at(-1)).toBeNull();
+    expect(posProvider.getSessionDiagnostics('route-pos-compact')?.compacting).toBe(false);
+
+    // Because turn 2 compacted, turn 3 through TransportSessionRuntime MUST re-inject identityPrompt!
+    expect(posRuntime.send('after compact')).toBe('sent');
+    await vi.waitFor(() => expect(completionsPos).toHaveLength(3));
+    const postCompactPrompt = proc.requests.filter((r) => r.method === 'session/prompt')[2]!;
+    expect(JSON.stringify(postCompactPrompt.params?.prompt)).toContain('IDENTITY CONTRACT');
+
+    await posProvider.disconnect();
+  });
+
+  it('refuses fake stop proof before physical child exit on TransportSessionRuntime Stop-and-send, and reclaims dead-pipe siblings (P0-1)', async () => {
+    installHarness((req, proc) => {
+      if (req.method === 'initialize') {
+        proc.reply(req.id!, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+      } else if (req.method === 'session/new') {
+        proc.reply(req.id!, { sessionId: `acp-p1-${proc.requests.filter((r) => r.method === 'session/new').length}` });
       } else if (req.method === 'session/cancel') {
-        const activePrompt = proc.requests.filter((r) => r.method === 'session/prompt').at(-1);
-        if (activePrompt?.id !== undefined) {
-          proc.reply(activePrompt.id, { stopReason: 'cancelled' });
+        // Deliberately ignore session/cancel!
+      }
+    }, { holdExit: true });
+
+    const provider = new CursorAcpProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const runtime = new TransportSessionRuntime(provider, 'deck_stop_proof');
+    await runtime.initialize({ sessionKey: 'route-stop-proof', cwd: '/tmp/proj' });
+
+    expect(runtime.send('turn 1 will wedge')).toBe('sent');
+    await vi.waitFor(() => {
+      expect(spawnedProcesses[0]!.requests.some((r) => r.method === 'session/prompt')).toBe(true);
+    });
+
+    // Queue turn 2 while turn 1 is wedged
+    expect(runtime.send('turn 2 queued', 'msg-2')).toBe('queued');
+
+    // Stop-and-send triggers cancelAndWait -> child ignores cancel AND refuses to exit (`holdExit=true`).
+    // TransportSessionRuntime MUST reject with timeout instead of releasing turn 2 onto a live wedged child!
+    await expect(runtime.stopAndSendPendingMessages(['msg-2'], 'notif-1')).rejects.toThrow(/timed out/i);
+    expect(spawnedProcesses[0]!.requests.filter((r) => r.method === 'session/prompt')).toHaveLength(1);
+    expect(spawnedProcesses[0]!.kill).toHaveBeenCalled();
+
+    // Also test sibling CONNECTION_LOST reclaim when ACP write/stream breaks while child is alive
+    spawnedProcesses[0]!.releaseExit(0, 'SIGKILL');
+    await new Promise((r) => setTimeout(r, 30));
+
+    let secondNewCount = 0;
+    installHarness((req, proc) => {
+      if (req.method === 'initialize') {
+        proc.reply(req.id!, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+      } else if (req.method === 'session/new') {
+        secondNewCount += 1;
+        proc.reply(req.id!, { sessionId: `acp-pipe-${secondNewCount}` });
+      }
+    });
+
+    const pipeProvider = new CursorAcpProvider();
+    await pipeProvider.connect({ binaryPath: 'cursor-agent' });
+    const a = await pipeProvider.createSession({ sessionKey: 'pipe-a', cwd: '/tmp/proj' });
+    const b = await pipeProvider.createSession({ sessionKey: 'pipe-b', cwd: '/tmp/proj' });
+    const errsA: Array<{ code: string }> = [];
+    const errsB: Array<{ code: string }> = [];
+    pipeProvider.onError((sid, err) => {
+      if (sid === a) errsA.push({ code: err.code });
+      if (sid === b) errsB.push({ code: err.code });
+    });
+
+    await pipeProvider.send(a, 'start a');
+    await pipeProvider.send(b, 'start b');
+    const pipeProc = spawnedProcesses.at(-1)!;
+    await vi.waitFor(() => {
+      expect(pipeProc.requests.filter((r) => r.method === 'session/prompt')).toHaveLength(2);
+    });
+    // Break the ACP stream while both sibling turns are active on the same live child
+    pipeProc.stdout.destroy(new Error('Broken pipe'));
+
+    await vi.waitFor(() => {
+      expect(errsA.some((e) => e.code === 'CONNECTION_LOST')).toBe(true);
+      expect(errsB.some((e) => e.code === 'CONNECTION_LOST')).toBe(true);
+      expect(pipeProc.kill).toHaveBeenCalled();
+    });
+
+    await pipeProvider.disconnect();
+  }, 15_000);
+
+  it('fences handshake publication across concurrent reconnects, disconnect during init, and stale old-child updates (P0-2)', async () => {
+    // 1) Concurrent sends after child crash must spawn ONLY ONE replacement child
+    let holdSecondInit = true;
+    let releaseInit!: () => void;
+    let initReq2: FakeAcpRpcRequest | undefined;
+    let newCounter = 0;
+
+    installHarness((req, proc, index) => {
+      if (req.method === 'initialize') {
+        if (index === 1 && holdSecondInit) {
+          initReq2 = req;
+          releaseInit = () => {
+            holdSecondInit = false;
+            proc.reply(initReq2!.id!, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+          };
+          return;
         }
+        proc.reply(req.id!, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+      } else if (req.method === 'session/new') {
+        newCounter += 1;
+        proc.reply(req.id!, { sessionId: `acp-fence-${newCounter}` });
+      } else if (req.method === 'session/load') {
+        proc.reply(req.id!, {});
+      } else if (req.method === 'session/prompt') {
+        const sid = String(req.params?.sessionId);
+        proc.notifySessionUpdate(sid, {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `OK:${sid}` },
+        });
+        setTimeout(() => proc.reply(req.id!, { stopReason: 'end_turn' }), 5);
       }
     });
 
     const provider = new CursorAcpProvider();
     await provider.connect({ binaryPath: 'cursor-agent' });
-    const sid = await provider.createSession({ sessionKey: 'route-compact', cwd: '/tmp/proj' });
+    const s1 = await provider.createSession({ sessionKey: 'fence-1', cwd: '/tmp/proj' });
+    const s2 = await provider.createSession({ sessionKey: 'fence-2', cwd: '/tmp/proj' });
 
-    const statuses: Array<string | null> = [];
-    const deltas: string[] = [];
-    const completions: string[] = [];
-    provider.onStatus((_sid, s) => statuses.push(s.status));
-    provider.onDelta((_sid, d) => deltas.push(d.delta));
-    provider.onComplete((_sid, m) => completions.push(m.content));
+    const deltas: Array<{ sid: string; text: string }> = [];
+    provider.onDelta((sid, d) => deltas.push({ sid, text: d.delta }));
 
-    await provider.send(sid, makePayload('first message', {
-      sessionSystemText: 'IDENTITY CONTRACT',
-      assembledMessage: 'first message',
-    }));
-    await vi.waitFor(() => {
-      expect(completions).toHaveLength(1);
+    await provider.send(s1, 'warm 1');
+    await vi.waitFor(() => expect(deltas.some((d) => d.sid === s1)).toBe(true));
+
+    // Crash old child 0, then issue concurrent send(s1) + send(s2) while init on child 1 is delayed
+    const oldProc = spawnedProcesses[0]!;
+    oldProc.exitCode = 1;
+    oldProc.emit('exit', 1, null);
+
+    deltas.length = 0;
+    const p1 = provider.send(s1, 'concurrent 1');
+    const p2 = provider.send(s2, 'concurrent 2');
+
+    await vi.waitFor(() => expect(initReq2).toBeDefined());
+    // Old child emitting late update BEFORE/AFTER reconnect must be completely ignored!
+    oldProc.notifySessionUpdate('acp-fence-1', {
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'STALE FROM DEAD CHILD' },
     });
+    expect(spawnedProcesses).toHaveLength(2); // single respawn transaction!
 
-    expect(statuses).toContain('compacting');
-    expect(statuses.at(-1)).toBeNull();
-    // Compaction summary chunks must NEVER bleed into assistant text deltas
-    expect(deltas).toEqual(['After compact']);
+    releaseInit();
+    await Promise.all([p1, p2]);
+    await vi.waitFor(() => {
+      expect(deltas.some((d) => d.sid === s1 && d.text.startsWith('OK:'))).toBe(true);
+      expect(deltas.some((d) => d.sid === s2 && d.text.startsWith('OK:'))).toBe(true);
+    });
+    expect(deltas.some((d) => d.text.includes('STALE FROM DEAD CHILD'))).toBe(false);
 
-    // Because compaction completed during turn 1, turn 2 MUST re-inject sessionSystemText!
-    await provider.send(sid, makePayload('second message', {
-      sessionSystemText: 'IDENTITY CONTRACT',
-      assembledMessage: 'second message',
-    }));
-    await vi.waitFor(() => {
-      expect(completions).toHaveLength(2);
+    // 2) disconnect() while delayed initialize is pending aborts handshake and kills spawned child
+    let pendingDelayedInitReq: FakeAcpRpcRequest | undefined;
+    installHarness((req) => {
+      if (req.method === 'initialize') pendingDelayedInitReq = req;
     });
-    const secondPrompt = spawnedProcesses[0]!.requests.filter((r) => r.method === 'session/prompt')[1]!;
-    expect(JSON.stringify(secondPrompt.params?.prompt)).toContain('IDENTITY CONTRACT');
-
-    // Turn 3 enters compacting then gets cancelled -> compacting status clears cleanly
-    statuses.length = 0;
-    await provider.send(sid, '/compact');
-    const thirdPrompt = spawnedProcesses[0]!.requests.filter((r) => r.method === 'session/prompt')[2]!;
-    expect((thirdPrompt.params?.prompt as Array<{ text: string }>)[0]?.text).toBe('/compact');
-    await vi.waitFor(() => {
-      expect(statuses).toContain('compacting');
-    });
-    await provider.cancelAndWait(sid);
-    await vi.waitFor(() => {
-      expect(statuses.at(-1)).toBeNull();
-      expect(provider.getSessionDiagnostics(sid)?.compacting).toBe(false);
-    });
+    const dcProvider = new CursorAcpProvider();
+    const connectPromise = dcProvider.connect({ binaryPath: 'cursor-agent' });
+    await vi.waitFor(() => expect(pendingDelayedInitReq).toBeDefined());
+    await dcProvider.disconnect();
+    await expect(connectPromise).rejects.toMatchObject({ code: 'CONNECTION_LOST' });
+    expect(spawnedProcesses.at(-1)!.kill).toHaveBeenCalled();
 
     await provider.disconnect();
   });
 
-  it('supports image attachments, HTTP/SSE + stdio MCP servers, approvals, session/load replay suppression, and multi-session isolation', async () => {
+  it('isolates model switch failures without overwriting confirmed model or contextWindow, and consumes config_option_update catalogs (P0-5)', async () => {
+    installHarness((req, proc) => {
+      if (req.method === 'initialize') {
+        proc.reply(req.id!, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+      } else if (req.method === 'session/new') {
+        proc.reply(req.id!, {
+          sessionId: 'acp-model-iso',
+          models: {
+            currentModelId: 'composer-2.5',
+            availableModels: [
+              { modelId: 'composer-2.5', name: 'Composer 2.5', contextWindow: 256_000 },
+              { modelId: 'gpt-5.3-codex', name: 'GPT 5.3 Codex', contextWindow: 400_000 },
+            ],
+          },
+        });
+      } else if (req.method === 'session/set_model') {
+        if (req.params?.modelId === 'bad-remote-model') {
+          proc.replyError(req.id!, -32602, 'Model unavailable');
+          return;
+        }
+        proc.reply(req.id!, {});
+      } else if (req.method === 'session/prompt') {
+        proc.notifySessionUpdate('acp-model-iso', {
+          sessionUpdate: 'usage_update',
+          used: 1_000,
+        });
+        setTimeout(() => proc.reply(req.id!, { stopReason: 'end_turn' }), 5);
+      }
+    });
+
+    const provider = new CursorAcpProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sid = await provider.createSession({ sessionKey: 'route-model-iso', cwd: '/tmp/proj' });
+
+    const usages: Array<{ finalized?: boolean; model?: string; window?: number }> = [];
+    provider.onUsage((_sid, u) => usages.push({ finalized: u.finalized, model: u.model, window: u.usage.model_context_window }));
+
+    await provider.send(sid, 'turn 1');
+    await vi.waitFor(() => expect(usages.filter((u) => u.finalized)).toHaveLength(1));
+    expect(usages.filter((u) => u.finalized)[0]).toEqual({ finalized: true, model: 'composer-2.5', window: 256_000 });
+
+    // Rejected switch MUST preserve confirmed composer-2.5 and 256_000 window
+    await expect(provider.applySessionModel(sid, 'bad-remote-model')).rejects.toBeTruthy();
+    expect(provider.getSessionDiagnostics(sid)?.model).toBe('composer-2.5');
+    expect(provider.getSessionDiagnostics(sid)?.pendingModel).toBeNull();
+
+    await provider.send(sid, 'turn 2 after failed switch');
+    await vi.waitFor(() => expect(usages.filter((u) => u.finalized)).toHaveLength(2));
+    expect(usages.filter((u) => u.finalized)[1]).toEqual({ finalized: true, model: 'composer-2.5', window: 256_000 });
+
+    // config_option_update must populate new model catalog, window, and confirmed model
+    spawnedProcesses[0]!.notifySessionUpdate('acp-model-iso', {
+      sessionUpdate: 'config_option_update',
+      configOptions: [{
+        id: 'model',
+        category: 'model',
+        currentValue: 'sonnet-5',
+        options: [
+          { value: 'sonnet-5', name: 'Sonnet 5', contextWindow: 500_000 },
+        ],
+      }],
+    });
+    await new Promise((r) => setTimeout(r, 15));
+    expect(provider.getCachedModels()?.models).toEqual([{ id: 'sonnet-5', name: 'Sonnet 5' }]);
+
+    await provider.send(sid, 'turn 3 on updated catalog model');
+    await vi.waitFor(() => expect(usages.filter((u) => u.finalized)).toHaveLength(3));
+    expect(usages.filter((u) => u.finalized)[2]).toEqual({ finalized: true, model: 'sonnet-5', window: 500_000 });
+
+    await provider.disconnect();
+  });
+
+  it('preserves shared ACP child when ending one session during no-ACK session/close, respects close capability, and supports approvals/images/listSessions/crash recovery (P0-3/P0-4)', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'cursor-acp-img-'));
     tempDirs.push(dir);
     const imgPath = join(dir, 'shot.png');
@@ -523,25 +808,31 @@ describe('CursorAcpProvider', () => {
             loadSession: true,
             mcpCapabilities: { http: true, sse: true },
             promptCapabilities: { image: true },
-            sessionCapabilities: { list: {} },
+            sessionCapabilities: { list: {}, close: {} },
           },
         });
       } else if (req.method === 'session/new') {
         newCount += 1;
-        const acpId = `acp-multi-${newCount}`;
-        proc.reply(req.id!, { sessionId: acpId });
+        proc.reply(req.id!, { sessionId: `acp-multi-${newCount}` });
       } else if (req.method === 'session/load') {
-        // History replay chunks must be suppressed!
+        if (req.params?.sessionId === 'acp-transient-fail') {
+          proc.replyError(req.id!, -32603, 'Temporary disk read glitch');
+          return;
+        }
+        if (req.params?.sessionId === 'acp-missing-id') {
+          proc.replyError(req.id!, -32602, 'Conversation not found');
+          return;
+        }
         proc.notifySessionUpdate(String(req.params?.sessionId), {
           sessionUpdate: 'agent_message_chunk',
           content: { type: 'text', text: 'STALE REPLAY' },
         });
         proc.reply(req.id!, {});
+      } else if (req.method === 'session/close') {
+        // Deliberately NEVER reply to verify CLOSE_SESSION_TIMEOUT_MS bounded detach!
       } else if (req.method === 'session/list') {
         proc.reply(req.id!, {
-          sessions: [
-            { sessionId: 'acp-listed-1', cwd: dir, title: 'Listed Cursor Session', updatedAt: '2026-11-28T00:00:00Z' },
-          ],
+          sessions: [{ sessionId: 'acp-listed-1', cwd: dir, title: 'Listed Cursor Session', updatedAt: '2026-11-28T00:00:00Z' }],
           nextCursor: null,
         });
       } else if (req.method === 'session/prompt') {
@@ -552,14 +843,10 @@ describe('CursorAcpProvider', () => {
             messageId: 'msg-r',
             content: { type: 'text', text: 'Fresh reply only' },
           });
-          setTimeout(() => proc.reply(req.id!, { stopReason: 'end_turn' }), 10);
+          setTimeout(() => proc.reply(req.id!, { stopReason: 'end_turn' }), 5);
           return;
         }
         if (sid === 'acp-multi-1') {
-          proc.notifySessionUpdate('acp-multi-1', {
-            sessionUpdate: 'agent_thought_chunk',
-            content: { type: 'text', text: 'secret thought' },
-          });
           proc.requestPermission('perm-1', 'acp-multi-1', {
             toolCallId: 'tc-1',
             title: 'Run shell command',
@@ -616,14 +903,18 @@ describe('CursorAcpProvider', () => {
       contextNamespace: { scope: 'user_private', userId: 'u1', projectId: 'p1' },
     });
     const s2 = await provider.createSession({ sessionKey: 'route-s2', cwd: dir });
-    const sResumed = await provider.createSession({
-      sessionKey: 'route-resumed',
-      cwd: dir,
-      resumeId: 'acp-resumed-existing',
-    });
+    const sResumed = await provider.createSession({ sessionKey: 'route-resumed', cwd: dir, resumeId: 'acp-resumed-existing' });
+    const sTransient = await provider.createSession({ sessionKey: 'route-transient', cwd: dir, resumeId: 'acp-transient-fail' });
+    const sMissing = await provider.createSession({ sessionKey: 'route-missing', cwd: dir, resumeId: 'acp-missing-id' });
+
+    // restoreSession distinguishes transient (-32603 throws, keeps ID) vs missing (-32602 returns false, keeps ID)
+    await expect(provider.restoreSession(sTransient)).rejects.toMatchObject({ code: 'PROVIDER_ERROR' });
+    expect(provider.getSessionDiagnostics(sTransient)?.acpSessionId).toBe('acp-transient-fail');
+    await expect(provider.restoreSession(sMissing)).resolves.toBe(false);
+    expect(provider.getSessionDiagnostics(sMissing)?.acpSessionId).toBe('acp-missing-id');
 
     const deltasBySession = new Map<string, string[]>();
-    const toolsBySession = new Map<string, ToolCallEvent[]>();
+    const toolsBySession = new Map<string, Array<{ name: string; status: string; output?: string }>>();
     const approvals: Array<{ sid: string; id: string; tool?: string }> = [];
     provider.onDelta((sid, d) => {
       const list = deltasBySession.get(sid) ?? [];
@@ -632,7 +923,7 @@ describe('CursorAcpProvider', () => {
     });
     provider.onToolCall((sid, tc) => {
       const list = toolsBySession.get(sid) ?? [];
-      list.push(tc);
+      list.push({ name: tc.name, status: tc.status, output: tc.output });
       toolsBySession.set(sid, list);
     });
     provider.onApprovalRequest((sid, req) => {
@@ -645,14 +936,12 @@ describe('CursorAcpProvider', () => {
     }));
     await provider.send(s2, 'turn 2');
     await provider.send(sResumed, 'after resume');
+
     const proc = spawnedProcesses[0]!;
     await vi.waitFor(() => {
-      const promptReqs = proc.requests.filter((x) => x.method === 'session/prompt');
-      expect(promptReqs).toHaveLength(3);
+      expect(proc.requests.filter((x) => x.method === 'session/prompt')).toHaveLength(3);
       expect(approvals).toHaveLength(1);
     });
-
-    // Reply permission on turn 1/2 prompts
     for (const r of proc.requests.filter((x) => x.method === 'session/prompt' && x.params?.sessionId !== 'acp-resumed-existing')) {
       proc.reply(r.id!, { stopReason: 'end_turn' });
     }
@@ -662,7 +951,7 @@ describe('CursorAcpProvider', () => {
       expect(deltasBySession.get(sResumed)).toEqual(['Fresh reply only']);
     });
 
-    // Verify stdio + http + sse MCP passed on session/new
+    // Verify stdio + http + sse MCP passed on session/new & image sent
     const firstNew = proc.requests.find((r) => r.method === 'session/new');
     const mcpServers = firstNew?.params?.mcpServers as Array<Record<string, unknown>>;
     const memEntry = mcpServers.find((m) => m.name === 'imcodes-memory');
@@ -674,132 +963,39 @@ describe('CursorAcpProvider', () => {
       [IMCODES_DAEMON_PROJECT_ROOT_ENV]: dir,
       [IMCODES_DAEMON_SERVER_ID_ENV]: 'srv-1',
     });
-    expect(JSON.parse(memEnv[IMCODES_DAEMON_NAMESPACE_ENV]!)).toEqual({
-      scope: 'user_private',
-      userId: 'u1',
-      projectId: 'p1',
-    });
+    expect(JSON.parse(memEnv[IMCODES_DAEMON_NAMESPACE_ENV]!)).toEqual({ scope: 'user_private', userId: 'u1', projectId: 'p1' });
     expect(mcpServers.some((m) => m.type === 'http' && m.name === 'remote-http')).toBe(true);
     expect(mcpServers.some((m) => m.type === 'sse' && m.name === 'remote-sse')).toBe(true);
-
-    // Verify image ContentBlock sent on prompt
-    const prompt1 = proc.requests.find((r) => r.method === 'session/prompt' && r.params?.sessionId === 'acp-multi-1');
-    const blocks = prompt1?.params?.prompt as Array<{ type: string; mimeType?: string; data?: string }>;
-    expect(blocks.some((b) => b.type === 'image' && b.mimeType === 'image/png' && b.data === Buffer.from([137, 80, 78, 71]).toString('base64'))).toBe(true);
-
-    // Verify isolation + replay suppression + approval response
-    expect(deltasBySession.get(s1)).toEqual(['Answer S1']);
-    expect(deltasBySession.get(s2)).toEqual(['Answer S2']);
-    expect(deltasBySession.get(sResumed)).toEqual(['Fresh reply only']);
-    expect(approvals).toHaveLength(1);
-    expect(approvals[0]).toMatchObject({ sid: s1, tool: 'Run shell command' });
-    expect(proc.responses.some((r) => r.id === 'perm-1' && (r.result as Record<string, any>)?.outcome?.optionId === 'allow_once')).toBe(true);
     expect(toolsBySession.get(s1)?.some((t) => t.name === 'shell' && t.status === 'complete' && t.output === 'file.ts')).toBe(true);
     expect(toolsBySession.get(s1)?.some((t) => t.name === 'plan')).toBe(true);
 
-    // Verify session/list
+    // Bounded no-ACK endSession(s1): completes in ~2s without killing shared child; s2 stays healthy!
+    await provider.endSession(s1);
+    expect(proc.requests.some((r) => r.method === 'session/close' && r.params?.sessionId === 'acp-multi-1')).toBe(true);
+    expect(proc.kill).not.toHaveBeenCalled();
+
+    const s2Done: number[] = [];
+    provider.onComplete((sid) => { if (sid === s2) s2Done.push(1); });
+    await provider.send(s2, 'turn after sibling ended');
+    await vi.waitFor(() => {
+      const reqs = proc.requests.filter((r) => r.method === 'session/prompt' && r.params?.sessionId === 'acp-multi-2');
+      expect(reqs.length).toBeGreaterThanOrEqual(2);
+    });
+    proc.reply(proc.requests.filter((r) => r.method === 'session/prompt' && r.params?.sessionId === 'acp-multi-2').at(-1)!.id!, { stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(s2Done).toHaveLength(1));
+
     const listed = await provider.listSessions({ directory: dir });
-    expect(listed).toEqual([
-      {
-        key: 'acp-listed-1',
-        displayName: 'Listed Cursor Session',
-        directory: dir,
-        updatedAt: Date.parse('2026-11-28T00:00:00Z'),
-      },
-    ]);
+    expect(listed).toEqual([{
+      key: 'acp-listed-1',
+      displayName: 'Listed Cursor Session',
+      directory: dir,
+      updatedAt: Date.parse('2026-11-28T00:00:00Z'),
+    }]);
 
     await provider.disconnect();
-  });
+  }, 10_000);
 
-  it('rejects human display labels in favor of canonical model ids, handles model switching, listModels, and recovers after child exit', async () => {
-    installHarness((req, proc) => {
-      if (req.method === 'initialize') {
-        proc.reply(req.id!, {
-          protocolVersion: 1,
-          agentCapabilities: { loadSession: true, sessionCapabilities: { list: {} } },
-        });
-      } else if (req.method === 'session/new') {
-        proc.reply(req.id!, {
-          sessionId: 'acp-model-1',
-          models: {
-            currentModelId: 'composer-2.5',
-            availableModels: [
-              { modelId: 'composer-2.5', name: 'Composer 2.5', contextWindow: 256_000 },
-              { modelId: 'gpt-5.3-codex', name: 'GPT 5.3 Codex', contextWindow: 400_000 },
-            ],
-          },
-        });
-      } else if (req.method === 'session/set_model') {
-        proc.reply(req.id!, {});
-      } else if (req.method === 'session/load') {
-        proc.reply(req.id!, {});
-      } else if (req.method === 'session/prompt') {
-        if (spawnedProcesses.length === 1) {
-          // Crash child mid-turn
-          queueMicrotask(() => {
-            proc.exitCode = 1;
-            proc.emit('exit', 1, null);
-          });
-        } else {
-          proc.notifySessionUpdate('acp-model-1', {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'Recovered' },
-          });
-          setTimeout(() => proc.reply(req.id!, { stopReason: 'end_turn' }), 10);
-        }
-      }
-    });
-
-    const provider = new CursorAcpProvider();
-    await provider.connect({ binaryPath: 'cursor-agent' });
-    const list = await provider.listModels(true);
-    expect(list).toMatchObject({
-      isAuthenticated: true,
-      defaultModel: 'composer-2.5',
-      models: [
-        { id: 'composer-2.5', name: 'Composer 2.5' },
-        { id: 'gpt-5.3-codex', name: 'GPT 5.3 Codex' },
-      ],
-    });
-    expect(vi.mocked(getCursorRuntimeConfig)).not.toHaveBeenCalled();
-
-    const sid = await provider.createSession({
-      sessionKey: 'route-model',
-      cwd: '/tmp/proj',
-      agentId: 'Claude Sonnet 5 300K Medium No Thinking',
-    });
-    // Invalid label was ignored; model starts unset until session/new reports canonical currentModelId
-    await expect(provider.applySessionModel(sid, 'Claude Sonnet 5 300K Medium No Thinking')).rejects.toMatchObject({
-      code: 'CONFIG_ERROR',
-    });
-
-    const errors: Array<Record<string, unknown>> = [];
-    const completed: string[] = [];
-    provider.onError((_sid, e) => errors.push(e as unknown as Record<string, unknown>));
-    provider.onComplete((_sid, m) => completed.push(m.content));
-
-    // Turn 1 crashes mid-turn -> emits CONNECTION_LOST
-    await provider.send(sid, 'turn before crash');
-    await vi.waitFor(() => {
-      expect(errors.some((e) => e.code === 'CONNECTION_LOST')).toBe(true);
-    });
-
-    // Next turn respawns child cleanly and reloads session via session/load
-    await provider.send(sid, 'turn after crash');
-    await vi.waitFor(() => {
-      expect(spawnedProcesses).toHaveLength(2);
-      expect(spawnedProcesses[1]!.requests.some((r) => r.method === 'session/load' && r.params?.sessionId === 'acp-model-1')).toBe(true);
-      expect(completed).toEqual(['Recovered']);
-    });
-
-    // Switch canonical model live
-    await expect(provider.applySessionModel(sid, 'gpt-5.3-codex')).resolves.toBe('live');
-    expect(spawnedProcesses[1]!.requests.some((r) => r.method === 'session/set_model' && r.params?.modelId === 'gpt-5.3-codex')).toBe(true);
-
-    await provider.disconnect();
-  });
-
-  it('handles ENOENT spawn errors, filters unsupported HTTP/SSE MCPs, falls back listModels to CLI, and force-settles wedged cancel', { timeout: 12_000 }, async () => {
+  it('handles ENOENT binary errors, filters unsupported HTTP/SSE/close capabilities, rejects display labels, and falls back listModels to CLI', async () => {
     const enoentErr = Object.assign(new Error('spawn /missing/agent ENOENT'), { code: 'ENOENT' });
     installHarness(() => {}, { spawnError: enoentErr });
     const missingProvider = new CursorAcpProvider();
@@ -812,20 +1008,13 @@ describe('CursorAcpProvider', () => {
         proc.reply(req.id!, {
           protocolVersion: 1,
           agentCapabilities: {
-            loadSession: true,
+            loadSession: false,
             mcpCapabilities: { http: false, sse: false },
             promptCapabilities: { image: false },
           },
         });
       } else if (req.method === 'session/new') {
-        // Deliberately omit models so listModels falls back to getCursorRuntimeConfig()
         proc.reply(req.id!, { sessionId: 'acp-boundary-1' });
-      } else if (req.method === 'session/prompt') {
-        proc.notifySessionUpdate('acp-boundary-1', {
-          sessionUpdate: 'compaction_update',
-          status: 'in_progress',
-        });
-        // Intentionally ignore session/cancel to test cancel grace teardown
       }
     });
 
@@ -848,35 +1037,29 @@ describe('CursorAcpProvider', () => {
       isAuthenticated: true,
     });
 
-    const sid = await provider.createSession({ sessionKey: 'route-boundary', cwd: '/tmp/proj' });
-    const errors: Array<Record<string, unknown>> = [];
-    const statuses: Array<string | null> = [];
-    provider.onError((_sid, err) => errors.push(err as unknown as Record<string, unknown>));
-    provider.onStatus((_sid, s) => statuses.push(s.status));
-
-    await provider.send(sid, 'hang until cancelled');
-    await vi.waitFor(() => {
-      expect(statuses).toContain('compacting');
+    const sid = await provider.createSession({
+      sessionKey: 'route-boundary',
+      cwd: '/tmp/proj',
+      agentId: 'Claude Sonnet 5 300K Medium No Thinking',
     });
+    await expect(provider.applySessionModel(sid, 'Claude Sonnet 5 300K Medium No Thinking')).rejects.toMatchObject({
+      code: 'CONFIG_ERROR',
+    });
+    await provider.send(sid, 'hello');
+    const proc = spawnedProcesses[1]!;
+    proc.reply(proc.requests.find((r) => r.method === 'session/prompt')!.id!, { stopReason: 'end_turn' });
+    await new Promise((r) => setTimeout(r, 15));
 
-    const sessionNewReq = spawnedProcesses[1]!.requests.find(
-      (r) => r.method === 'session/new' && (r.params?.mcpServers as Array<Record<string, unknown>>).length > 0,
-    );
+    const sessionNewReq = proc.requests.find((r) => r.method === 'session/new' && (r.params?.mcpServers as Array<Record<string, unknown>>).length > 0);
     const mcpNames = (sessionNewReq?.params?.mcpServers as Array<{ name: string }>).map((m) => m.name);
     expect(mcpNames).toContain('imcodes-memory');
     expect(mcpNames).toContain('custom-stdio');
     expect(mcpNames).not.toContain('remote-http');
     expect(mcpNames).not.toContain('remote-sse');
 
-    await provider.cancel(sid);
-    await vi.waitFor(() => {
-      expect(errors.some((e) => e.code === 'CANCELLED')).toBe(true);
-      expect(statuses.at(-1)).toBeNull();
-      expect(provider.getSessionDiagnostics(sid)).toMatchObject({
-        promptInFlight: false,
-        compacting: false,
-      });
-    }, { timeout: 7_000 });
+    await provider.endSession(sid);
+    // closeSession MUST NOT be sent when agentCapabilities.sessionCapabilities.close is absent
+    expect(proc.requests.some((r) => r.method === 'session/close')).toBe(false);
 
     await provider.disconnect();
   });

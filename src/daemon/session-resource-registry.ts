@@ -149,6 +149,20 @@ function isProviderHosted(record: SessionResourceRecord): boolean {
   return record.lifetime === SESSION_RESOURCE_LIFETIME.PROVIDER_HOST;
 }
 
+function isSharedProviderResource(record: SessionResourceRecord): boolean {
+  return record.lifetime === SESSION_RESOURCE_LIFETIME.SHARED_PROVIDER;
+}
+
+function parseSharedDaemonPidHandle(sessionInstanceId: string): { pid: number; processStart: string } | null {
+  if (!sessionInstanceId.startsWith('daemon:')) return null;
+  const firstSep = sessionInstanceId.indexOf(':', 7);
+  if (firstSep <= 7) return null;
+  const pid = Number(sessionInstanceId.slice(7, firstSep));
+  const processStart = sessionInstanceId.slice(firstSep + 1);
+  if (!Number.isSafeInteger(pid) || pid <= 1 || !boundedString(processStart)) return null;
+  return { pid, processStart };
+}
+
 function validProviderHostedRelease(value: unknown): value is ProviderHostedRelease {
   return Object.values(PROVIDER_HOSTED_RELEASE).includes(value as ProviderHostedRelease);
 }
@@ -744,9 +758,26 @@ export class SessionResourceRegistry {
         const current = await this.pidHandleIsCurrent(record.handle);
         return current === false ? record.resourceId : null;
       }))).filter((resourceId): resourceId is string => resourceId !== null));
+      const deadSharedDaemons = new Set((await Promise.all(records.map(async (record) => {
+        if (!isSharedProviderResource(record)) return null;
+        const daemonHandle = parseSharedDaemonPidHandle(record.owner.sessionInstanceId);
+        if (!daemonHandle) return null;
+        const daemonCurrent = await this.pidHandleIsCurrent({
+          type: SESSION_RESOURCE_HANDLE_TYPE.PID,
+          pid: daemonHandle.pid,
+          processStart: daemonHandle.processStart,
+        });
+        return daemonCurrent === false ? record.resourceId : null;
+      }))).filter((resourceId): resourceId is string => resourceId !== null));
       const now = this.now();
       const orphans = records.filter((record) => {
         const key = ownerKey(record.owner);
+        if (isSharedProviderResource(record)) {
+          // Shared-provider child processes belong to a daemon runtime, not a
+          // user session. Only reap when the registered process itself is gone
+          // or when its owning daemon PID+start identity is proven dead.
+          return invalidPidResources.has(record.resourceId) || deadSharedDaemons.has(record.resourceId);
+        }
         if (isProviderHosted(record)) {
           // Owner state (stopped/error) says nothing about a provider-hosted
           // MCP: its host thread may still be live and serving turns (e.g. a

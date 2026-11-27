@@ -1,10 +1,12 @@
-import { readProcessCpuMillis } from '../util/process-start.js';
+import { randomUUID } from 'node:crypto';
+import { readProcessCpuMillis, readProcessStart } from '../util/process-start.js';
 import type { SessionRecord } from '../store/session-store.js';
 import {
   MCP_RESOURCE_PREFIX,
   SESSION_RESOURCE_DEFAULTS,
   SESSION_RESOURCE_HANDLE_TYPE,
   SESSION_RESOURCE_KIND,
+  SESSION_RESOURCE_LIFETIME,
   SESSION_RESOURCE_OWNER_ENV,
   SESSION_RESOURCE_RELEASE_REASON,
   MEMORY_MCP_WATCHDOG,
@@ -144,6 +146,39 @@ export async function registerAgentProcessResource(
     handle: { type: SESSION_RESOURCE_HANDLE_TYPE.PID, pid, killTree: true },
   });
   return resourceId;
+}
+
+const daemonSharedRuntimeEpoch = randomUUID();
+let cachedDaemonProcessStart: string | null | undefined;
+
+export async function sharedProviderProcessOwner(providerId: string): Promise<SessionResourceOwner> {
+  if (cachedDaemonProcessStart === undefined) {
+    cachedDaemonProcessStart = await readProcessStart(process.pid);
+  }
+  const normalized = providerId.trim() || 'unknown';
+  return {
+    sessionName: `__provider__:${normalized}`,
+    sessionInstanceId: cachedDaemonProcessStart
+      ? `daemon:${process.pid}:${cachedDaemonProcessStart}`
+      : `daemon:${process.pid}`,
+    runtimeEpoch: daemonSharedRuntimeEpoch,
+  };
+}
+
+export async function registerSharedProviderAgentResource(
+  providerId: string,
+  pid: number,
+): Promise<{ resourceId: string; owner: SessionResourceOwner }> {
+  const owner = await sharedProviderProcessOwner(providerId);
+  const resourceId = `agent-shared:${providerId.trim() || 'unknown'}:${owner.runtimeEpoch}:${pid}`;
+  await registry.register({
+    resourceId,
+    kind: SESSION_RESOURCE_KIND.AGENT,
+    owner,
+    lifetime: SESSION_RESOURCE_LIFETIME.SHARED_PROVIDER,
+    handle: { type: SESSION_RESOURCE_HANDLE_TYPE.PID, pid, killTree: true },
+  });
+  return { resourceId, owner };
 }
 
 export async function sweepComputerUseOrphanedResources(): Promise<ReleaseSummary> {
