@@ -65,7 +65,7 @@ describe('iOS UIScene lifecycle migration for iPhone Duo / foldables', () => {
     const pbxproj = readFileSync(join(IOS_APP_ROOT, 'App.xcodeproj/project.pbxproj'), 'utf8');
     expect(pbxproj).toContain('/* SceneDelegate.swift */');
     expect(pbxproj).toContain('/* SceneDelegate.swift in Sources */');
-    expect(pbxproj.match(/MARKETING_VERSION = 1\.3;/g)).toHaveLength(10);
+    expect(pbxproj.match(/MARKETING_VERSION = 1\.4;/g)).toHaveLength(10);
   });
 
   it('typechecks SceneDelegate.swift + AppDelegate.swift together on macOS Catalyst SDK', async () => {
