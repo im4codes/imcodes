@@ -4387,6 +4387,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   useEffect(() => () => {
     if (revealingOlderTimerRef.current) clearTimeout(revealingOlderTimerRef.current);
     if (pendingScrollFrameRef.current !== null) cancelAnimationFrame(pendingScrollFrameRef.current);
+    clearActiveLocateSmooth();
   }, []);
 
   const markProgrammaticScroll = () => {
@@ -4443,6 +4444,13 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const pendingEngageFollowRef = useRef(false);
   const pendingGrowthRepinRef = useRef(false);
   const pendingVisibleScrollToBottomRef = useRef(false);
+  const activeLocateSmoothRef = useRef<{
+    eventId: string | null;
+    destTop: number;
+    needsReconcile: boolean;
+    until: number;
+    cleanup?: () => void;
+  } | null>(null);
   const isMountedRef = useRef(true);
   const hasInitialPinCompletedRef = useRef(false);
   const loadingRef = useRef(loading);
@@ -4482,6 +4490,33 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     && !hasActiveUserScrollIntent()
     && !hasActiveScrollAnchorLock()
   );
+  const hasActiveLocateSmooth = () => Boolean(
+    activeLocateSmoothRef.current && Date.now() < activeLocateSmoothRef.current.until,
+  );
+  const clearActiveLocateSmooth = () => {
+    const current = activeLocateSmoothRef.current;
+    if (!current) return;
+    activeLocateSmoothRef.current = null;
+    current.cleanup?.();
+  };
+  const finishActiveLocateSmooth = (root: HTMLElement) => {
+    const current = activeLocateSmoothRef.current;
+    if (!current) return;
+    activeLocateSmoothRef.current = null;
+    current.cleanup?.();
+    if (!autoScrollRef.current && current.needsReconcile && current.eventId) {
+      const target = findEventElement(root, current.eventId);
+      if (target) {
+        scrollEventWithinChat(root, target, 'auto');
+        lastScrollTopRef.current = root.scrollTop;
+        lastScrollHeightRef.current = root.scrollHeight;
+        lastClientHeightRef.current = root.clientHeight;
+      }
+    }
+    if (!autoScrollRef.current) {
+      captureReaderAnchor();
+    }
+  };
 
   const pinScrollToBottomNow = (el: HTMLDivElement, clampToBottom = false) => {
     markProgrammaticScroll();
@@ -4499,6 +4534,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
 
   const scrollToBottom = (engageFollow: boolean = true) => {
     if (engageFollow) {
+      clearActiveLocateSmooth();
       userScrollUpUntilRef.current = 0;
       userPointerOrKeyScrollUntilRef.current = 0;
       pointerScrollActiveRef.current = false;
@@ -4616,6 +4652,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     readerAnchorRef.current = pickReaderAnchor(rows, 0, root.scrollTop);
   };
   const restoreReaderAnchor = () => {
+    const activeLocate = activeLocateSmoothRef.current;
     const root = scrollRef.current;
     const anchor = readerAnchorRef.current;
     if (!root || !anchor) return;
@@ -4626,11 +4663,22 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       if (candidate.getAttribute('data-event-id') === anchor.id) { node = candidate; break; }
     }
     // The anchor row left the DOM (virtualized out): pick the row now in view.
-    if (!node) { captureReaderAnchor(); return; }
+    if (!node) {
+      if (activeLocate && Date.now() < activeLocate.until) return;
+      captureReaderAnchor();
+      return;
+    }
     const rectScale = getDomRectToLayoutScale(root);
     const contentTop = ((node.getBoundingClientRect().top - root.getBoundingClientRect().top) / rectScale) + root.scrollTop;
     const delta = computeReaderAnchorDelta(anchor.contentTop, contentTop);
     if (delta === 0) return;
+    if (activeLocate && Date.now() < activeLocate.until) {
+      // Never write scrollTop mid-smooth-scroll (browsers abort native smooth
+      // animations on programmatic scrollTop assignment); defer and reconcile
+      // around the located target once smooth finishes.
+      activeLocate.needsReconcile = true;
+      return;
+    }
     const remainder = absorbTopShiftRef.current ? absorbTopShiftRef.current(delta) : delta;
     if (remainder === 0) return; // absorbed: the row is back where it was, nothing was written
     if (isTouchInteracting()) return;
@@ -5020,6 +5068,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const prevVisibleRef = useRef(visible);
 
   const resetFollowRefsForSwitch = (engageFollow: boolean) => {
+    clearActiveLocateSmooth();
     autoScrollRef.current = true;
     pendingEngageFollowRef.current = engageFollow;
     pendingGrowthRepinRef.current = false;
@@ -5243,6 +5292,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // cannot snap back to the tail after pendingPinnedLocateIdRef clears, and
   // re-anchor around the locate target rather than the pre-jump bottom row.
   const commitExplicitLocateScroll = (root: HTMLElement, target: HTMLElement) => {
+    clearActiveLocateSmooth();
     pendingVisibleScrollToBottomRef.current = false;
     pendingEngageFollowRef.current = false;
     pendingGrowthRepinRef.current = false;
@@ -5256,6 +5306,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const reducedMotion = typeof window !== 'undefined'
       && typeof window.matchMedia === 'function'
       && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const behavior: ScrollBehavior = reducedMotion ? 'auto' : 'smooth';
     const rectScale = getDomRectToLayoutScale(root);
     const rootRect = root.getBoundingClientRect();
     const targetRect = target.getBoundingClientRect();
@@ -5264,18 +5315,45 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const centerOffset = Math.max(0, (root.clientHeight - targetHeight) / 2);
     const maxTop = Math.max(0, root.scrollHeight - root.clientHeight);
     const desiredTop = Math.min(maxTop, Math.max(0, targetTopInContent - centerOffset));
-    scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
-    const targetEventId = target.getAttribute('data-event-id')
-      ?? target.closest<HTMLElement>('[data-event-id]')?.getAttribute('data-event-id');
-    if (targetEventId) {
-      readerAnchorRef.current = { id: targetEventId, contentTop: targetTopInContent };
-    } else {
-      captureReaderAnchor();
-    }
     if (desiredTop < root.scrollTop && maxTop - desiredTop > 1) {
       lastScrollTopRef.current = root.scrollTop;
       lastScrollHeightRef.current = root.scrollHeight;
       lastClientHeightRef.current = root.clientHeight;
+    }
+    const targetEventId = target.getAttribute('data-event-id')
+      ?? target.closest<HTMLElement>('[data-event-id]')?.getAttribute('data-event-id')
+      ?? null;
+    if (targetEventId) {
+      readerAnchorRef.current = { id: targetEventId, contentTop: targetTopInContent };
+    }
+    const asyncSmoothExpected = behavior === 'smooth'
+      && typeof root.scrollTo === 'function'
+      && Math.abs(root.scrollTop - desiredTop) > 1;
+    if (asyncSmoothExpected) {
+      const onScrollEnd = () => {
+        finishActiveLocateSmooth(root);
+      };
+      root.addEventListener('scrollend', onScrollEnd, { once: true });
+      const watchdogId = window.setTimeout(() => {
+        finishActiveLocateSmooth(root);
+      }, 900);
+      activeLocateSmoothRef.current = {
+        eventId: targetEventId,
+        destTop: desiredTop,
+        needsReconcile: false,
+        until: Date.now() + 900,
+        cleanup: () => {
+          root.removeEventListener('scrollend', onScrollEnd);
+          window.clearTimeout(watchdogId);
+        },
+      };
+    }
+    scrollEventWithinChat(root, target, behavior);
+    if (!asyncSmoothExpected) {
+      clearActiveLocateSmooth();
+      if (!targetEventId) {
+        captureReaderAnchor();
+      }
     }
   };
 
@@ -5300,6 +5378,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     disengageFollow();
   };
   const handleWheel = (e: WheelEvent) => {
+    clearActiveLocateSmooth();
     if (e.deltaY < 0) {
       handleUserScrollUpIntent();
     } else if (e.deltaY > 0) {
@@ -5344,9 +5423,11 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     // Conversely, a non-reversed upward finger drag (clientY decreases) scrolls
     // content DOWN toward the bottom and clears any stale upward-scroll hold.
     if (y - touchMinYRef.current > 6) {
+      clearActiveLocateSmooth();
       touchScrollUpActiveRef.current = true;
       handleUserScrollUpIntent();
     } else if (!touchScrollUpActiveRef.current && touchStartYRef.current - y > 6) {
+      clearActiveLocateSmooth();
       userScrollUpUntilRef.current = 0;
       userPointerOrKeyScrollUntilRef.current = 0;
     }
@@ -5404,6 +5485,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const rectScale = getDomRectToLayoutScale(el);
     const onScrollbarTrack = e.clientX >= rect.left + el.clientWidth * rectScale;
     if (onScrollbarTrack || e.target === el) {
+      clearActiveLocateSmooth();
       pointerScrollActiveRef.current = true;
       userPointerOrKeyScrollUntilRef.current = Date.now() + CHAT_USER_SCROLL_UP_HOLD_MS;
     }
@@ -5436,6 +5518,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const hasExplicitUserScrollUp = hasActiveUserScrollIntent();
     const touchBusy = isTouchInteracting();
     const distance = scrollHeight - scrollTop - clientHeight;
+    if (activeLocateSmoothRef.current) {
+      if (Date.now() >= activeLocateSmoothRef.current.until) {
+        finishActiveLocateSmooth(el);
+        return;
+      } else if (hasExplicitUserScrollUp || touchBusy) {
+        clearActiveLocateSmooth();
+      } else if (Math.abs(scrollTop - activeLocateSmoothRef.current.destTop) <= 2) {
+        finishActiveLocateSmooth(el);
+        return;
+      }
+    }
     // Explicit upward scroll intent (wheel, touch drag, scrollbar pointer drag, or
     // unmodified PageUp/ArrowUp/Home) with actual upward displacement disengages
     // immediately regardless of distance threshold, and before any passive growth repin.
@@ -5518,6 +5611,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       disengageFollow();
     } else if (
       !wasAutoFollowing
+      && !hasActiveLocateSmooth()
       && distance < reengageThreshold
       && !touchScrollUpActiveRef.current
       && (
@@ -6398,11 +6492,14 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           onKeyDown={preview ? undefined : (e: KeyboardEvent) => {
             if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
             if (e.key === 'End') {
+              clearActiveLocateSmooth();
               e.preventDefault();
               scrollToBottom(true);
             } else if (e.key === 'PageUp' || e.key === 'ArrowUp' || e.key === 'Home' || (e.key === ' ' && e.shiftKey)) {
+              clearActiveLocateSmooth();
               userPointerOrKeyScrollUntilRef.current = Date.now() + CHAT_USER_SCROLL_UP_HOLD_MS;
             } else if (e.key === 'PageDown' || e.key === 'ArrowDown' || (e.key === ' ' && !e.shiftKey)) {
+              clearActiveLocateSmooth();
               userScrollUpUntilRef.current = 0;
               userPointerOrKeyScrollUntilRef.current = 0;
             }
