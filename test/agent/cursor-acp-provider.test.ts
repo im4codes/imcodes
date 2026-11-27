@@ -11,6 +11,7 @@ import {
 } from '../../src/agent/providers/cursor-acp.js';
 import { getCursorRuntimeConfig, __cursorRuntimeConfigInternals } from '../../src/agent/cursor-runtime-config.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import { __testing__ as transportRelayTesting } from '../../src/daemon/transport-relay.js';
 import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
 import {
@@ -72,11 +73,11 @@ class FakeAcpServerProcess extends EventEmitter {
 
   readonly kill = vi.fn((signal?: NodeJS.Signals) => {
     this.killed = true;
-    this.signalCode = signal ?? 'SIGTERM';
     if (this.holdExit) {
       return true;
     }
     this.exitCode = 0;
+    this.signalCode = signal ?? 'SIGTERM';
     queueMicrotask(() => {
       this.emit('exit', 0, signal ?? 'SIGTERM');
       this.emit('close', 0, signal ?? 'SIGTERM');
@@ -1227,8 +1228,16 @@ describe('CursorAcpProvider', () => {
     await provider.disconnect();
   });
 
-  it('requires explicit session-not-found errors before resetting resumeId on loadSession (P0-C)', async () => {
-    let mode: 'generic-32602' | 'missing-cwd' | 'does-not-exist' | 'wrong-id' | 'exact-cursor-not-found' = 'generic-32602';
+  it('requires explicit session-not-found errors before resetting resumeId on loadSession (P0-C / R3-P0-2)', async () => {
+    let mode:
+      | 'generic-32602'
+      | 'missing-cwd'
+      | 'does-not-exist'
+      | 'wrong-id'
+      | 'structured-32002-other'
+      | 'structured-32002-uri'
+      | 'structured-32002-match'
+      | 'exact-cursor-not-found' = 'generic-32602';
     let newCount = 0;
     installHarness((req, proc) => {
       if (req.method === 'initialize') {
@@ -1242,8 +1251,14 @@ describe('CursorAcpProvider', () => {
           proc.replyError(req.id!, -32602, 'Invalid params', { message: 'Resource does not exist' });
         } else if (mode === 'wrong-id') {
           proc.replyError(req.id!, -32602, 'Invalid params', { message: 'Session "other-unrelated-id" not found' });
+        } else if (mode === 'structured-32002-other') {
+          proc.replyError(req.id!, -32002, 'Resource not found', { sessionId: 'other-id' });
+        } else if (mode === 'structured-32002-uri') {
+          proc.replyError(req.id!, -32002, 'Resource not found', { uri: 'file:///missing' });
+        } else if (mode === 'structured-32002-match') {
+          proc.replyError(req.id!, -32002, 'Resource not found', { sessionId: 'acp-keep-me' });
         } else {
-          proc.replyError(req.id!, -32602, 'Invalid params', { message: 'Session "acp-keep-me" not found' });
+          proc.replyError(req.id!, -32602, 'Invalid params', { message: 'Session "acp-keep-fresh" not found' });
         }
       } else if (req.method === 'session/new') {
         newCount += 1;
@@ -1257,18 +1272,32 @@ describe('CursorAcpProvider', () => {
     await provider.connect({ binaryPath: 'cursor-agent' });
     const sid = await provider.createSession({ sessionKey: 'route-p0c', cwd: '/tmp/proj', resumeId: 'acp-keep-me' });
 
-    for (const badMode of ['generic-32602', 'missing-cwd', 'does-not-exist', 'wrong-id'] as const) {
+    for (const badMode of [
+      'generic-32602',
+      'missing-cwd',
+      'does-not-exist',
+      'wrong-id',
+      'structured-32002-other',
+      'structured-32002-uri',
+    ] as const) {
       mode = badMode;
       await expect(provider.send(sid, 'attempt')).rejects.toMatchObject({ code: 'PROVIDER_ERROR' });
       expect(newCount).toBe(0);
       expect(provider.getSessionDiagnostics(sid)?.acpSessionId).toBe('acp-keep-me');
     }
 
-    // Exact Cursor SessionNotFoundError clears old ID and creates a fresh session cleanly
-    mode = 'exact-cursor-not-found';
-    await provider.send(sid, 'now create fresh');
+    // Structured ACP SDK RequestError.sessionNotFound(candidateId) (-32002 + matching data.sessionId) clears old ID
+    mode = 'structured-32002-match';
+    await provider.send(sid, 'structured match fallback');
     expect(newCount).toBe(1);
     expect(provider.getSessionDiagnostics(sid)?.acpSessionId).toBe('acp-fresh-1');
+
+    // Exact Cursor CLI SessionNotFoundError (-32602 + quoted Session "<id>" not found) also clears old ID
+    const sid2 = await provider.createSession({ sessionKey: 'route-p0c-2', cwd: '/tmp/proj', resumeId: 'acp-keep-fresh' });
+    mode = 'exact-cursor-not-found';
+    await provider.send(sid2, 'cursor quoted not found');
+    expect(newCount).toBe(2);
+    expect(provider.getSessionDiagnostics(sid2)?.acpSessionId).toBe('acp-fresh-2');
 
     await provider.disconnect();
   });
@@ -1344,7 +1373,7 @@ describe('CursorAcpProvider', () => {
     await provider.disconnect();
   });
 
-  it('prevents cache_write double counting and preserves turn occupancy on window-only _meta (P0-E)', async () => {
+  it('prevents cache_write double counting on mixed used + _meta.inputTokens and preserves occupancy on window-only _meta (P0-E / R3-P0-4)', async () => {
     // Direct unit checks for normalizeCursorAcpUsage cache read + write math:
     expect(normalizeCursorAcpUsage({
       used: 45_000,
@@ -1357,9 +1386,29 @@ describe('CursorAcpProvider', () => {
       cache_creation_input_tokens: 5_000,
     });
 
+    // Mixed `used` AND `_meta.inputTokens` with same-frame cache read/write:
+    // `used` MUST remain authoritative so transport-relay reports 45k total, never 60k!
+    const mixed = normalizeCursorAcpUsage({
+      used: 45_000,
+      _meta: { inputTokens: 45_000 },
+      cachedInputTokens: 10_000,
+      cachedWriteTokens: 5_000,
+    });
+    expect(mixed).toEqual({
+      input_tokens: 30_000,
+      cached_input_tokens: 10_000,
+      cache_read_input_tokens: 10_000,
+      cache_creation_input_tokens: 5_000,
+    });
+    const relayMixed = transportRelayTesting.normalizeUsageUpdatePayload('deck_p0e_mixed', mixed, 'model-x');
+    expect(relayMixed?.inputTokens).toBe(35_000);
+    expect(relayMixed?.cacheTokens).toBe(10_000);
+    expect((relayMixed?.inputTokens as number) + (relayMixed?.cacheTokens as number)).toBe(45_000);
+
     // Inconsistent split (read + write > used): keep total `used`, omit unreliable cache splits
     expect(normalizeCursorAcpUsage({
       used: 10_000,
+      _meta: { inputTokens: 10_000 },
       cachedInputTokens: 8_000,
       cachedWriteTokens: 5_000,
     })).toEqual({
@@ -1375,6 +1424,7 @@ describe('CursorAcpProvider', () => {
         proc.notifySessionUpdate('acp-p0e', {
           sessionUpdate: 'usage_update',
           used: 45_000,
+          _meta: { inputTokens: 45_000 },
           cachedInputTokens: 10_000,
           cachedWriteTokens: 5_000,
         });
@@ -1491,6 +1541,213 @@ describe('CursorAcpProvider', () => {
     expect(() => rtB.send('/compact')).toThrow(/not advertised|support \/compact/i);
     expect(provider.getSessionCapabilities('route-p0f-a')?.compact?.providerCommand).toBe('/compress');
     expect(provider.getSessionCapabilities('route-p0f-b')?.compact?.execution).toBe('unsupported');
+
+    await provider.disconnect();
+  });
+
+  it('refuses Stop confirmation while child only received kill signal without exitCode/signalCode (R3-P0-1)', async () => {
+    installHarness((req, proc) => {
+      if (req.method === 'initialize') {
+        proc.reply(req.id!, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+      } else if (req.method === 'session/new') {
+        proc.reply(req.id!, { sessionId: 'acp-r3-p1' });
+      }
+    }, { holdExit: true });
+
+    const provider = new CursorAcpProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sid = await provider.createSession({ sessionKey: 'route-r3-p1', cwd: '/tmp/proj' });
+    await provider.send(sid, 'hold before signal');
+
+    const proc = spawnedProcesses[0]!;
+    await vi.waitFor(() => expect(proc.requests.some((r) => r.method === 'session/prompt')).toBe(true));
+
+    // Signal sent (`killed = true`), process NOT exited (`exitCode === null`, `signalCode === null`),
+    // and transport connection failed: Stop MUST NOT resolve physical proof prematurely!
+    proc.kill('SIGTERM');
+    expect(proc.killed).toBe(true);
+    expect(proc.exitCode).toBeNull();
+    expect(proc.signalCode).toBeNull();
+
+    proc.emit('error', new Error('broken pipe after SIGTERM sent'));
+    let stopResolved = false;
+    const stopPromise = provider.cancelAndWait(sid).then(() => { stopResolved = true; });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(stopResolved).toBe(false);
+
+    proc.releaseExit(0, 'SIGTERM');
+    await stopPromise;
+    expect(stopResolved).toBe(true);
+    await provider.disconnect();
+  });
+
+  it('prevents stale setSessionConfigOption response from overwriting replacement connection model or context window (R3-P0-3)', async () => {
+    let pendingOldConfigReq: { id: string | number; proc: FakeAcpServerProcess } | null = null;
+    installHarness((req, proc, index) => {
+      if (req.method === 'initialize') {
+        proc.reply(req.id!, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+      } else if (req.method === 'session/new') {
+        proc.reply(req.id!, {
+          sessionId: `acp-r3-p3-${index}`,
+          configOptions: [{
+            id: 'model',
+            category: 'model',
+            currentValue: index === 0 ? 'model-init-old' : 'model-new',
+            options: index === 0
+              ? [{ value: 'model-init-old', contextWindow: 100_000 }]
+              : [{ value: 'model-new', contextWindow: 256_000 }],
+          }],
+        });
+      } else if (req.method === 'session/load') {
+        proc.reply(req.id!, {
+          configOptions: [{
+            id: 'model',
+            category: 'model',
+            currentValue: 'model-new',
+            options: [{ value: 'model-new', contextWindow: 256_000 }],
+          }],
+        });
+      } else if (req.method === 'session/set_model') {
+        proc.replyError(req.id!, -32601, 'Method not found');
+      } else if (req.method === 'session/set_config_option') {
+        if (index === 0) {
+          pendingOldConfigReq = { id: req.id!, proc };
+        } else {
+          proc.reply(req.id!, {});
+        }
+      } else if (req.method === 'session/prompt') {
+        proc.reply(req.id!, { stopReason: 'end_turn' });
+      }
+    }, { holdExit: true });
+
+    const provider = new CursorAcpProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sessionInfos: Array<{ model?: string }> = [];
+    provider.onSessionInfo((_sid, info) => sessionInfos.push({ model: info.model }));
+
+    const sid = await provider.createSession({ sessionKey: 'route-r3-p3', cwd: '/tmp/proj' });
+    await provider.send(sid, 'bind old connection');
+
+    // Start fallback config-option switch on proc1; it hangs before returning stale catalog/currentValue
+    const oldSwitchPromise = provider.applySessionModel(sid, 'model-stale-target');
+    await vi.waitFor(() => expect(pendingOldConfigReq).not.toBeNull());
+
+    // Break proc1 so proc2 spawns and binds the SAME route confirming `model-new` (256_000)
+    const proc1 = spawnedProcesses[0]!;
+    proc1.emit('error', new Error('proc1 died before config option reply'));
+    provider.setSessionAgentId(sid, 'model-new');
+    await provider.send(sid, 'bind replacement connection');
+    expect(provider.getSessionDiagnostics(sid)?.model).toBe('model-new');
+    expect(provider.getSessionDiagnostics(sid)?.lastContextWindow).toBe(256_000);
+    const infoCountBeforeStaleReply = sessionInfos.length;
+
+    // Now resolve the hung old setSessionConfigOption RPC carrying stale `model-old` (64_000)!
+    pendingOldConfigReq!.proc.reply(pendingOldConfigReq!.id, {
+      configOptions: [{
+        id: 'model',
+        category: 'model',
+        currentValue: 'model-old',
+        options: [{ value: 'model-old', contextWindow: 64_000 }],
+      }],
+    });
+    await expect(oldSwitchPromise).rejects.toMatchObject({ code: 'CONNECTION_LOST' });
+
+    // Replacement connection's model, window, cached catalog, and sessionInfo events MUST stay intact:
+    expect(provider.getSessionDiagnostics(sid)?.model).toBe('model-new');
+    expect(provider.getSessionDiagnostics(sid)?.lastContextWindow).toBe(256_000);
+    expect(provider.getCachedModels()?.models.some((m) => m.id === 'model-old')).toBe(false);
+    expect(sessionInfos).toHaveLength(infoCountBeforeStaleReply);
+
+    proc1.releaseExit(0, 'SIGKILL');
+    spawnedProcesses[1]?.releaseExit(0, 'SIGTERM');
+    await provider.disconnect();
+  });
+
+  it('rejects queued /compact after capability revocation without sending raw prompt or setting compacted (R3-P0-5)', async () => {
+    let pendingTurn1: { id: string | number; proc: FakeAcpServerProcess } | null = null;
+    installHarness((req, proc) => {
+      if (req.method === 'initialize') {
+        proc.reply(req.id!, { protocolVersion: 1, agentCapabilities: { loadSession: true } });
+      } else if (req.method === 'session/new') {
+        proc.reply(req.id!, { sessionId: `acp-r3-p5-${proc.requests.filter((r) => r.method === 'session/new').length}` });
+      } else if (req.method === 'session/prompt') {
+        const text = (req.params?.prompt as Array<{ text?: string }>)[0]?.text ?? '';
+        if (text.includes('warm-with-compress')) {
+          proc.notifySessionUpdate(String(req.params?.sessionId), {
+            sessionUpdate: 'available_commands_update',
+            availableCommands: [{ name: 'compress' }],
+          });
+          proc.reply(req.id!, { stopReason: 'end_turn' });
+        } else if (text.includes('turn-1-hold')) {
+          pendingTurn1 = { id: req.id!, proc };
+        } else {
+          proc.reply(req.id!, { stopReason: 'end_turn' });
+        }
+      }
+    });
+
+    const provider = new CursorAcpProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const completedMsgs: Array<{ compacted?: boolean }> = [];
+    const providerErrors: Array<{ sid: string; message: string }> = [];
+    provider.onComplete((_sid, msg) => completedMsgs.push({ compacted: msg.metadata?.compacted as boolean | undefined }));
+    provider.onError((sid, err) => providerErrors.push({ sid, message: err.message }));
+
+    // 1) Revoked while `/compact` was queued:
+    const rtA = new TransportSessionRuntime(provider, 'deck_r3_p5_a');
+    await rtA.initialize({ sessionKey: 'route-r3-p5-a', cwd: '/tmp/proj' });
+    expect(rtA.send('warm-with-compress')).toBe('sent');
+    await vi.waitFor(() => expect(completedMsgs).toHaveLength(1));
+
+    expect(rtA.send('turn-1-hold')).toBe('sent');
+    await vi.waitFor(() => expect(pendingTurn1).not.toBeNull());
+
+    // While turn-1-hold is active, /compact is accepted by enqueue check:
+    expect(rtA.send('/compact')).toBe('queued');
+
+    // Before turn-1-hold settles, Cursor revokes `/compress` via available_commands_update:
+    pendingTurn1!.proc.notifySessionUpdate('acp-r3-p5-1', {
+      sessionUpdate: 'available_commands_update',
+      availableCommands: [],
+    });
+    pendingTurn1!.proc.reply(pendingTurn1!.id, { stopReason: 'end_turn' });
+
+    await vi.waitFor(() => expect(completedMsgs).toHaveLength(2));
+    await new Promise((r) => setTimeout(r, 40));
+
+    // Runtime drain MUST NOT send raw `/compact` or mark any completion `compacted: true`!
+    const promptsA = spawnedProcesses[0]!.requests.filter(
+      (r) => r.method === 'session/prompt' && r.params?.sessionId === 'acp-r3-p5-1',
+    );
+    expect(promptsA).toHaveLength(2);
+    expect(promptsA.some((r) => JSON.stringify(r.params?.prompt).includes('/compact'))).toBe(false);
+    expect(completedMsgs.some((m) => m.compacted === true)).toBe(false);
+    expect(rtA.lastProviderError?.message).toMatch(/not advertised|support \/compact/i);
+    expect(providerErrors.length + (rtA.lastProviderError ? 1 : 0)).toBeGreaterThan(0);
+
+    // 2) Command switched (`/compress` -> `/summarize`) while `/compact` was queued: translates to `/summarize`!
+    pendingTurn1 = null;
+    const rtB = new TransportSessionRuntime(provider, 'deck_r3_p5_b');
+    await rtB.initialize({ sessionKey: 'route-r3-p5-b', cwd: '/tmp/proj' });
+    expect(rtB.send('warm-with-compress')).toBe('sent');
+    await vi.waitFor(() => expect(completedMsgs).toHaveLength(3));
+
+    expect(rtB.send('turn-1-hold')).toBe('sent');
+    await vi.waitFor(() => expect(pendingTurn1).not.toBeNull());
+    expect(rtB.send('/compact')).toBe('queued');
+
+    pendingTurn1!.proc.notifySessionUpdate('acp-r3-p5-2', {
+      sessionUpdate: 'available_commands_update',
+      availableCommands: [{ name: 'summarize' }],
+    });
+    pendingTurn1!.proc.reply(pendingTurn1!.id, { stopReason: 'end_turn' });
+
+    await vi.waitFor(() => expect(completedMsgs).toHaveLength(5));
+    const promptsB = spawnedProcesses[0]!.requests.filter(
+      (r) => r.method === 'session/prompt' && r.params?.sessionId === 'acp-r3-p5-2',
+    );
+    expect((promptsB.at(-1)?.params?.prompt as Array<{ text: string }>)[0]?.text).toBe('/summarize');
+    expect(completedMsgs.at(-1)?.compacted).toBe(true);
 
     await provider.disconnect();
   });

@@ -5116,7 +5116,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._lastInjectedSupervisionContractSignature = null;
     }
 
-    if (isSessionCompactCommandText(message)) {
+    if (isSessionCompactCommandText(message) && this.effectiveCompactCapability()?.execution !== 'unsupported') {
       timelineEmitter.emit(this.sessionKey, 'session.state', {
         state: SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
         reason: SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
@@ -5332,6 +5332,17 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
           if (this.isDispatchLocallyCancelled(dispatchId)) {
             throw makeCancelledProviderError();
+          }
+          if (isSessionCompactCommandText(message)) {
+            const liveCompact = this.effectiveCompactCapability();
+            if (liveCompact?.execution === 'unsupported') {
+              const reason = liveCompact.reason?.trim();
+              throw {
+                code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+                message: reason || `${this.provider.id} does not support /compact`,
+                recoverable: false,
+              } satisfies ProviderError;
+            }
           }
           if (this._activeDispatchId === dispatchId) {
             this._activeDispatchProviderStarted = true;

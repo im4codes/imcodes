@@ -268,6 +268,15 @@ function isAuthErrorLike(err: unknown): boolean {
 
 function isSessionNotFoundError(err: unknown, candidateId?: string): boolean {
   if (isRecord(err) && err.code === PROVIDER_ERROR_CODES.SESSION_NOT_FOUND) return true;
+  const code = isRecord(err) && typeof err.code === 'number' ? err.code : undefined;
+  const data = isRecord(err) && isRecord(err.data) ? err.data : undefined;
+  // ACP SDK `RequestError.sessionNotFound(id)` -> `{ code: -32002, message: 'Resource not found', data: { sessionId } }`.
+  // Require `data.sessionId` to match `candidateId` when known so unrelated -32002 resource errors (e.g. `data.uri`)
+  // or mismatched session IDs never drop a valid persisted resumeId.
+  if (code === -32002 && data && isTruthyString(data.sessionId)) {
+    const errorSessionId = data.sessionId.trim();
+    return candidateId ? errorSessionId === candidateId : true;
+  }
   // Cursor 189.index.js throws SessionNotFoundError (`Session "${id}" not found`) wrapped via
   // invalidParams (-32602, data.message). Require explicit session-not-found text — NEVER treat
   // generic -32602 "Invalid params" or unrelated "does not exist" errors as missing resume chat.
@@ -454,15 +463,15 @@ export function normalizeCursorAcpUsage(
     ?? (limitRec ? (positiveNumber(limitRec.context) ?? positiveNumber(limitRec.contextWindow)) : undefined)
     ?? (fallbackContextWindow && fallbackContextWindow > 0 ? fallbackContextWindow : undefined);
 
-  // `used` represents total tokens currently in context. `transport-relay.ts` computes
-  // `inputTokens = input_tokens + cache_creation_input_tokens` and displays `cache_read_input_tokens`
-  // separately. Subtract both same-frame read & write cache counts from `used` so total context
-  // occupancy stays exact; if an inconsistent snapshot has `read + write > used`, omit unreliable
-  // cache breakdown fields and report `input_tokens: used`.
-  let inputTokens = explicitInput;
+  // `used` is the authoritative protocol-native context total when present, even if
+  // `_meta.inputTokens` also appears on the same frame. Subtract both same-frame read
+  // and write cache counts from `used` (unless inconsistent `read + write > used`, in
+  // which case omit unreliable cache breakdown fields and keep `input_tokens: used`).
+  // Fall back to `explicitInput` only when `used` is absent.
+  let inputTokens: number | undefined;
   let finalCachedRead = cachedTokens;
   let finalCacheWrite = cacheWriteTokens;
-  if (inputTokens === undefined && used !== undefined) {
+  if (used !== undefined) {
     const cacheReadVal = cachedTokens ?? 0;
     const cacheWriteVal = cacheWriteTokens ?? 0;
     if (cacheReadVal + cacheWriteVal <= used) {
@@ -472,6 +481,8 @@ export function normalizeCursorAcpUsage(
       finalCachedRead = undefined;
       finalCacheWrite = undefined;
     }
+  } else {
+    inputTokens = explicitInput;
   }
   if (
     inputTokens === undefined
@@ -640,7 +651,7 @@ export class CursorAcpProvider implements TransportProvider {
       }
       await this.teardownChildProcess();
       for (const turn of turnsToInspect) {
-        if (!turn.dispatched || !this.isChildAlive(turn.boundProcess)) {
+        if (!turn.dispatched || this.hasChildExited(turn.boundProcess)) {
           turn.resolvePhysicalTerminal();
         }
       }
@@ -661,7 +672,7 @@ export class CursorAcpProvider implements TransportProvider {
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
-    const ready = Boolean(this.config && this.connection && this.isChildAlive(this.child));
+    const ready = Boolean(this.config && this.connection && this.canUseChildForRpc(this.child));
     if (this.mcpRegistration?.degraded) {
       return {
         providerId: this.id,
@@ -741,8 +752,9 @@ export class CursorAcpProvider implements TransportProvider {
       this.cachedDefaultModel = null;
     }
     let authError: string | undefined;
-    if ((!this.cachedModels || force) && this.connection && this.isChildAlive(this.child)) {
+    if ((!this.cachedModels || force) && this.connection && this.canUseChildForRpc(this.child)) {
       const connection = this.connection;
+      const probeConnGen = this.connectionGeneration;
       try {
         const cwd = normalizeTransportCwd(process.cwd()) ?? '/';
         const result = await this.withAuthRetry(connection, () => this.runWithTimeout(
@@ -750,7 +762,9 @@ export class CursorAcpProvider implements TransportProvider {
           SESSION_RPC_TIMEOUT_MS,
           () => connection.newSession({ cwd, mcpServers: [] }),
         ));
-        this.captureSessionModels(result);
+        if (!this.isDisconnecting && this.connection === connection && this.connectionGeneration === probeConnGen) {
+          this.captureSessionModels(result);
+        }
         this.closeSessionBestEffort(connection, result.sessionId);
       } catch (err) {
         if (isAuthErrorLike(err)) {
@@ -923,7 +937,7 @@ export class CursorAcpProvider implements TransportProvider {
     const liveTurn = state.pendingTurn;
     const liveAcpSessionId = state.acpSessionId;
     const liveBoundGen = state.boundConnectionGeneration;
-    const liveConn = liveAcpSessionId && liveBoundGen === this.connectionGeneration && this.connection && this.isChildAlive(this.child)
+    const liveConn = liveAcpSessionId && liveBoundGen === this.connectionGeneration && this.connection && this.canUseChildForRpc(this.child)
       ? this.connection
       : null;
 
@@ -942,7 +956,7 @@ export class CursorAcpProvider implements TransportProvider {
         liveTurn,
         this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Cursor session ended', true),
       );
-      if (!liveTurn.dispatched || !this.isChildAlive(liveTurn.boundProcess)) {
+      if (!liveTurn.dispatched || this.hasChildExited(liveTurn.boundProcess)) {
         liveTurn.resolvePhysicalTerminal();
       }
     } else {
@@ -956,7 +970,7 @@ export class CursorAcpProvider implements TransportProvider {
       && state.boundConnectionGeneration === this.connectionGeneration
       && this.sessionCloseSupported
       && this.connection?.closeSession
-      && this.isChildAlive(this.child)
+      && this.canUseChildForRpc(this.child)
     ) {
       const closer = this.connection.closeSession;
       await withTimeoutOutcome(
@@ -973,7 +987,7 @@ export class CursorAcpProvider implements TransportProvider {
     const liveTurn = state.pendingTurn;
     const liveAcpSessionId = state.acpSessionId;
     const liveBoundGen = state.boundConnectionGeneration;
-    const liveConn = liveAcpSessionId && liveBoundGen === this.connectionGeneration && this.connection && this.isChildAlive(this.child)
+    const liveConn = liveAcpSessionId && liveBoundGen === this.connectionGeneration && this.connection && this.canUseChildForRpc(this.child)
       ? this.connection
       : null;
 
@@ -992,7 +1006,7 @@ export class CursorAcpProvider implements TransportProvider {
         liveTurn,
         this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Cursor session detached', true),
       );
-      if (!liveTurn.dispatched || !this.isChildAlive(liveTurn.boundProcess)) {
+      if (!liveTurn.dispatched || this.hasChildExited(liveTurn.boundProcess)) {
         liveTurn.resolvePhysicalTerminal();
       }
     } else {
@@ -1015,7 +1029,7 @@ export class CursorAcpProvider implements TransportProvider {
     const connGen = this.connectionGeneration;
     if (
       connection
-      && this.isChildAlive(this.child)
+      && this.canUseChildForRpc(this.child)
       && state.acpSessionId
       && state.boundConnectionGeneration === connGen
     ) {
@@ -1040,7 +1054,7 @@ export class CursorAcpProvider implements TransportProvider {
     const connGen = this.connectionGeneration;
     if (
       !connection
-      || !this.isChildAlive(this.child)
+      || !this.canUseChildForRpc(this.child)
       || !state.acpSessionId
       || state.boundConnectionGeneration !== connGen
     ) {
@@ -1134,13 +1148,27 @@ export class CursorAcpProvider implements TransportProvider {
       await this.ensureSessionReady(routeId, state, connection, connGen, { allowFresh: true });
       this.assertTurnCurrent(routeId, state, turn, connection, connGen);
 
-      const promptBlocks = isSlashControl
-        ? [{ type: 'text' as const, text: this.resolveSlashControlText(state, trimmedUserMsg, payload.assembledMessage) }]
-        : await this.buildPromptContent(payload, includeSessionSystemText);
+      let promptBlocks: ContentBlock[];
+      if (compactControl) {
+        const resolvedCompact = this.resolveCompactCommandText(state, trimmedUserMsg);
+        if (!resolvedCompact) {
+          throw this.makeError(
+            PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+            (state.compactCapability ?? this.defaultCompactCapability).reason?.trim()
+              || 'Cursor ACP server has not advertised a compaction slash command.',
+            false,
+          );
+        }
+        promptBlocks = [{ type: 'text' as const, text: resolvedCompact }];
+      } else if (isSlashControl) {
+        promptBlocks = [{ type: 'text' as const, text: payload.assembledMessage || trimmedUserMsg }];
+      } else {
+        promptBlocks = await this.buildPromptContent(payload, includeSessionSystemText);
+      }
       this.assertTurnCurrent(routeId, state, turn, connection, connGen);
 
       const capturedChild = this.child;
-      if (!capturedChild || !this.isChildAlive(capturedChild) || this.connection !== connection) {
+      if (!capturedChild || !this.canUseChildForRpc(capturedChild) || this.connection !== connection) {
         throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Cursor ACP child process unavailable at prompt boundary', true);
       }
 
@@ -1240,17 +1268,17 @@ export class CursorAcpProvider implements TransportProvider {
         : null;
     const isStaleWatchdog = options?.origin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG;
 
-    if (!state.acpSessionId || !capturedConnection || !this.isChildAlive(capturedChild)) {
+    if (!state.acpSessionId || !capturedConnection || !this.canUseChildForRpc(capturedChild)) {
       this.failTurn(
         state,
         turn,
         this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Cursor turn cancelled (no live connection)', true),
       );
-      if (!turn.dispatched || !this.isChildAlive(capturedChild)) {
+      if (!turn.dispatched || this.hasChildExited(capturedChild)) {
         turn.resolvePhysicalTerminal();
       } else if (capturedChild && capturedConnGen > 0) {
         // The replacement generation may have already cleared `this.child`/`this.connection`,
-        // while this turn's captured child is still alive; recycle it and wait for real OS exit.
+        // or the child was signaled (`killed=true`) without exiting yet; recycle it and wait for OS exit.
         void this.reclaimDeadAcpTransport(
           capturedChild,
           capturedConnGen,
@@ -1366,7 +1394,13 @@ export class CursorAcpProvider implements TransportProvider {
 
   // ── Internal ACP connection lifecycle ────────────────────────────────────
 
-  private isChildAlive(child: ChildProcessWithoutNullStreams | null): child is ChildProcessWithoutNullStreams {
+  /** True ONLY when the OS process is absent or has reported an exit/signal code. Sending a kill signal does NOT count. */
+  private hasChildExited(child: ChildProcessWithoutNullStreams | null): boolean {
+    return !child || child.exitCode != null || child.signalCode != null;
+  }
+
+  /** True when the child process has not been killed and has not exited, so new RPC writes may proceed. */
+  private canUseChildForRpc(child: ChildProcessWithoutNullStreams | null): child is ChildProcessWithoutNullStreams {
     return Boolean(child && !child.killed && child.exitCode == null && child.signalCode == null);
   }
 
@@ -1374,7 +1408,7 @@ export class CursorAcpProvider implements TransportProvider {
     if (this.connectInFlight) {
       return await this.connectInFlight.promise;
     }
-    if (this.connection && this.isChildAlive(this.child) && !this.isDisconnecting) {
+    if (this.connection && this.canUseChildForRpc(this.child) && !this.isDisconnecting) {
       return this.connection;
     }
 
@@ -1540,7 +1574,7 @@ export class CursorAcpProvider implements TransportProvider {
       handleChildTerminated(new Error(`Cursor ACP server closed with code=${code ?? 'null'} signal=${signal ?? 'null'}`));
     });
     child.on('error', (err) => {
-      if (this.isChildAlive(child)) {
+      if (!this.hasChildExited(child)) {
         void this.reclaimDeadAcpTransport(child, generation, null, err);
         return;
       }
@@ -1927,13 +1961,23 @@ export class CursorAcpProvider implements TransportProvider {
     state: CursorAcpSessionState,
     modelId: string,
   ): Promise<void> {
-    if (!state.acpSessionId) return;
+    const expectedAcpSessionId = state.acpSessionId;
+    const expectedConfigId = state.modelConfigOptionId;
+    if (!expectedAcpSessionId) return;
     const assertConnectionStillCurrent = (): void => {
-      if (this.isDisconnecting || this.connection !== connection || this.connectionGeneration !== expectedConnGen || this.sessions.get(routeId) !== state) {
+      if (
+        this.isDisconnecting
+        || this.connection !== connection
+        || this.connectionGeneration !== expectedConnGen
+        || this.sessions.get(routeId) !== state
+        || state.boundConnectionGeneration !== expectedConnGen
+        || state.acpSessionId !== expectedAcpSessionId
+      ) {
         throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Connection changed during Cursor model switch', true);
       }
     };
 
+    assertConnectionStillCurrent();
     let switched = false;
     if (typeof connection.unstable_setSessionModel === 'function') {
       try {
@@ -1941,31 +1985,34 @@ export class CursorAcpProvider implements TransportProvider {
           'Cursor ACP set_model',
           MODE_MODEL_RPC_TIMEOUT_MS,
           () => connection.unstable_setSessionModel!({
-            sessionId: state.acpSessionId!,
+            sessionId: expectedAcpSessionId,
             modelId,
           }),
         );
         switched = true;
       } catch (err) {
-        if (!isMethodNotFoundError(err) || !state.modelConfigOptionId || typeof connection.setSessionConfigOption !== 'function') {
+        assertConnectionStillCurrent();
+        if (!isMethodNotFoundError(err) || !expectedConfigId || typeof connection.setSessionConfigOption !== 'function') {
           throw err;
         }
       }
     }
 
     if (!switched) {
-      if (!state.modelConfigOptionId || typeof connection.setSessionConfigOption !== 'function') {
+      assertConnectionStillCurrent();
+      if (!expectedConfigId || typeof connection.setSessionConfigOption !== 'function') {
         throw this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR, `Cursor ACP server does not support switching model to ${modelId}`, false);
       }
       const configResp = await this.runWithTimeout(
         'Cursor ACP set_config_option',
         MODE_MODEL_RPC_TIMEOUT_MS,
         () => connection.setSessionConfigOption!({
-          sessionId: state.acpSessionId!,
-          configId: state.modelConfigOptionId!,
+          sessionId: expectedAcpSessionId,
+          configId: expectedConfigId,
           value: modelId,
         }),
       );
+      assertConnectionStillCurrent();
       if (isRecord(configResp) && Array.isArray(configResp.configOptions)) {
         this.captureSessionModels({ configOptions: configResp.configOptions }, state);
       }
@@ -2094,19 +2141,16 @@ export class CursorAcpProvider implements TransportProvider {
     }
   }
 
-  private resolveSlashControlText(
+  private resolveCompactCommandText(
     state: CursorAcpSessionState,
     trimmedUserMsg: string,
-    assembledMessage: string,
-  ): string {
-    if (isSessionControlCommandText(trimmedUserMsg, 'compact')) {
-      const advertised = (state.compactCapability ?? this.defaultCompactCapability).providerCommand;
-      if (advertised) {
-        const rest = trimmedUserMsg.slice('/compact'.length).trim();
-        return rest ? `${advertised} ${rest}` : advertised;
-      }
-    }
-    return assembledMessage || trimmedUserMsg;
+  ): string | null {
+    if (!isSessionControlCommandText(trimmedUserMsg, 'compact')) return null;
+    const compactCap = state.compactCapability ?? this.defaultCompactCapability;
+    const advertised = compactCap.execution !== 'unsupported' ? compactCap.providerCommand : undefined;
+    if (!advertised) return null;
+    const rest = trimmedUserMsg.slice('/compact'.length).trim();
+    return rest ? `${advertised} ${rest}` : advertised;
   }
 
   private mcpServersForState(state: CursorAcpSessionState): McpServer[] {
@@ -2647,7 +2691,7 @@ export class CursorAcpProvider implements TransportProvider {
     }
 
     const reclaimTask = (async (): Promise<void> => {
-      const childStillAlive = this.isChildAlive(brokenChild);
+      const childStillAlive = !this.hasChildExited(brokenChild);
       if (this.child === brokenChild && this.connectionGeneration === brokenGeneration) {
         this.connectionGeneration += 1;
         this.child = null;
@@ -2990,7 +3034,7 @@ export class CursorAcpProvider implements TransportProvider {
       state.availableCommands.clear();
       state.compactCapability = undefined;
     }
-    if (child && !child.killed) {
+    if (child && !this.hasChildExited(child)) {
       try {
         child.stdin?.end?.();
       } catch {
