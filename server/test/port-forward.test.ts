@@ -2698,4 +2698,134 @@ describe('server port-forward router & HTTP control plane', () => {
     // Only ONE winner pod should have dispatched CLOSE to podA (loser followed winner rather than double-adopting).
     expect(closeAttemptsToA).toBe(1);
   });
+
+  it('settles DELETE with retryable 504 without self-deadlock when CAS winner is unreachable and allows clean subsequent retry (R8 P0)', async () => {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const sListen = `r8_l_${suffix}`;
+    const sTarget = `r8_t_${suffix}`;
+    const baseStore = new InMemoryPortForwardClusterStore();
+    const origTryAdopt = baseStore.tryAdoptCoordinator.bind(baseStore);
+
+    let stealCasOnce = false;
+    const storeWithRaceStealer = new Proxy(baseStore, {
+      get(target, prop, receiver) {
+        if (prop === 'tryAdoptCoordinator') {
+          return async (
+            tid: string,
+            expCoord: string,
+            expUpdated: number,
+            newCoord: string,
+            now?: number,
+          ) => {
+            if (stealCasOnce) {
+              stealCasOnce = false;
+              // Unreachable ghost pod wins CAS right before caller, leaving coordinatorPodId = pod_r8_ghost (unsubscribed/offline).
+              await origTryAdopt(tid, expCoord, expUpdated, 'pod_r8_ghost', now);
+            }
+            return origTryAdopt(tid, expCoord, expUpdated, newCoord, now);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    const bridgesA = new Map<string, PortForwardBridgeEndpoint>();
+    const bridgesT = new Map<string, PortForwardBridgeEndpoint>();
+    const podCoordLive = new PortForwardRouter({
+      podId: 'pod_r8_coord',
+      clusterStore: baseStore,
+      closeAckTimeoutMs: 20,
+      prepareTimeoutMs: 2_000,
+      establishTimeoutMs: 4_000,
+    });
+    const podA = new PortForwardRouter({ podId: 'pod_r8_a', clusterStore: baseStore, lookupBridge: (id) => bridgesA.get(id), closeAckTimeoutMs: 20 });
+    const podT = new PortForwardRouter({ podId: 'pod_r8_t', clusterStore: baseStore, lookupBridge: (id) => bridgesT.get(id), closeAckTimeoutMs: 20 });
+    const podCaller = new PortForwardRouter({ podId: 'pod_r8_caller', clusterStore: storeWithRaceStealer, closeAckTimeoutMs: 20 });
+
+    const idL = generateEndpointIdentityKeyPair();
+    const idT = generateEndpointIdentityKeyPair();
+    const trusted = new Map([[sListen, idL.publicKeyB64], [sTarget, idT.publicKeyB64]]);
+
+    const engA = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idL,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podA.handleDaemonMessage(sListen, 1, m)); },
+    });
+    const engT = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idT,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podT.handleDaemonMessage(sTarget, 1, m)); },
+    });
+
+    cleanups.push(async () => {
+      stealCasOnce = false;
+      engA.closeAll();
+      engT.closeAll();
+      await podA.stopCluster();
+      await podT.stopCluster();
+      await podCaller.stopCluster();
+      await podCoordLive.stopCluster();
+    });
+
+    bridgesA.set(sListen, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => { void engA.handleMessage(m); return true; },
+    });
+    bridgesT.set(sTarget, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => { void engT.handleMessage(m); return true; },
+    });
+    podA.onDaemonConnected(sListen, 1);
+    podT.onDaemonConnected(sTarget, 1);
+
+    const opened = await podCoordLive.openTunnel({
+      userId: 'user_r8',
+      listenNode: sListen,
+      listenServerId: sListen,
+      listenPort: 0,
+      targetNode: sTarget,
+      targetServerId: sTarget,
+      targetHost: '127.0.0.1',
+      targetPort: 9999,
+      ttlSeconds: 60,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const tid = opened.tunnel.tunnelId;
+    expect(engA.listTunnels()).toHaveLength(1);
+
+    // Crash original coordinator cleanly from the cluster bus without tearing down endpoints (simulates ungraceful pod crash).
+    (podCoordLive as unknown as { unsubscribeBus?: () => void }).unsubscribeBus?.();
+    stealCasOnce = true;
+
+    const firstStart = Date.now();
+    const firstDelete = await Promise.race([
+      podCaller.closeTunnelForUser('user_r8', tid),
+      new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 2_000)),
+    ]);
+    expect(firstDelete).not.toBe('hung');
+    expect(Date.now() - firstStart).toBeLessThan(1_800);
+    expect(typeof firstDelete === 'object' && !firstDelete.ok ? firstDelete.status : null).toBe(504);
+    expect(typeof firstDelete === 'object' && !firstDelete.ok ? firstDelete.unconfirmedTunnelIds : null).toEqual([tid]);
+    expect(engA.listTunnels()).toHaveLength(1);
+
+    // Subsequent independent retry must NOT inherit the old inFlightAdoptions promise; it adopts from ghost winner & closes cleanly!
+    const retryDelete = await Promise.race([
+      podCaller.closeTunnelForUser('user_r8', tid),
+      new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 2_000)),
+    ]);
+    expect(retryDelete).not.toBe('hung');
+    expect(typeof retryDelete === 'object' && retryDelete.ok).toBe(true);
+    expect(engA.listTunnels()).toHaveLength(0);
+    expect(engT.listTunnels()).toHaveLength(0);
+    expect((await baseStore.getTunnel(tid))?.status).toBe('closed');
+  });
 });

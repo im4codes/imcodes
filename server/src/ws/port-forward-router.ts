@@ -1288,10 +1288,52 @@ export class PortForwardRouter {
     return this.clusterStore.listActiveTunnels(userId, nodeServerId);
   }
 
+  private async sendRemoteCloseAndAwaitAck(
+    record: PortForwardClusterTunnelRecord,
+    reason: string,
+  ): Promise<{ ok: boolean; outcome: PortForwardRemoteCloseAckOutcome }> {
+    const requestId = randomBytes(8).toString('hex');
+    const ackPromise = new Promise<{ ok: boolean; outcome: PortForwardRemoteCloseAckOutcome }>((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.pendingRemoteCloses.delete(requestId)) {
+          resolve({ ok: false, outcome: 'missing' });
+        }
+      }, this.closeAckTimeoutMs + 500);
+      timer.unref?.();
+      this.pendingRemoteCloses.set(requestId, (res) => {
+        clearTimeout(timer);
+        resolve(res);
+      });
+    });
+
+    try {
+      await this.clusterStore.sendToPod(record.coordinatorPodId, {
+        kind: 'close_tunnel',
+        requestId,
+        replyPodId: this.podId,
+        tunnelId: record.tunnelId,
+        reason,
+      });
+    } catch {
+      this.pendingRemoteCloses.delete(requestId);
+      return { ok: false, outcome: 'error' };
+    }
+
+    return ackPromise;
+  }
+
+  private async followRemoteCoordinatorClose(
+    record: PortForwardClusterTunnelRecord,
+    reason: string,
+  ): Promise<{ confirmed: boolean; tunnelId: string }> {
+    // Bounded single-shot follow: never re-enter closeTunnelRecordAndAwait or inFlightAdoptions on timeout/missing.
+    const ack = await this.sendRemoteCloseAndAwaitAck(record, reason);
+    return { confirmed: ack.ok, tunnelId: record.tunnelId };
+  }
+
   private async closeTunnelRecordAndAwait(
     record: PortForwardClusterTunnelRecord,
     reason: string,
-    allowRedirect = true,
   ): Promise<{ confirmed: boolean; tunnelId: string }> {
     const localTunnel = this.tunnels.get(record.tunnelId) ?? this.closingTunnels.get(record.tunnelId);
     if (localTunnel) {
@@ -1305,34 +1347,7 @@ export class PortForwardRouter {
     }
 
     if (record.coordinatorPodId !== this.podId) {
-      const requestId = randomBytes(8).toString('hex');
-      const ackPromise = new Promise<{ ok: boolean; outcome: PortForwardRemoteCloseAckOutcome }>((resolve) => {
-        const timer = setTimeout(() => {
-          if (this.pendingRemoteCloses.delete(requestId)) {
-            resolve({ ok: false, outcome: 'missing' });
-          }
-        }, this.closeAckTimeoutMs + 500);
-        timer.unref?.();
-        this.pendingRemoteCloses.set(requestId, (res) => {
-          clearTimeout(timer);
-          resolve(res);
-        });
-      });
-
-      try {
-        await this.clusterStore.sendToPod(record.coordinatorPodId, {
-          kind: 'close_tunnel',
-          requestId,
-          replyPodId: this.podId,
-          tunnelId: record.tunnelId,
-          reason,
-        });
-      } catch {
-        this.pendingRemoteCloses.delete(requestId);
-        return { confirmed: false, tunnelId: record.tunnelId };
-      }
-
-      const ack = await ackPromise;
+      const ack = await this.sendRemoteCloseAndAwaitAck(record, reason);
       if (ack.ok) {
         return { confirmed: true, tunnelId: record.tunnelId };
       }
@@ -1362,9 +1377,7 @@ export class PortForwardRouter {
         return { confirmed: true, tunnelId: record.tunnelId };
       }
       if (fresh.coordinatorPodId !== record.coordinatorPodId && fresh.coordinatorPodId !== this.podId) {
-        return allowRedirect
-          ? this.closeTunnelRecordAndAwait(fresh, reason, false)
-          : { confirmed: false, tunnelId: fresh.tunnelId };
+        return this.followRemoteCoordinatorClose(fresh, reason);
       }
       if (!fresh.listenPodId || !fresh.targetPodId) {
         await this.clusterStore.updateTunnel(fresh.tunnelId, { status: 'closing' }).catch(() => {});
@@ -1404,9 +1417,7 @@ export class PortForwardRouter {
           }
           return { confirmed: false, tunnelId: winner.tunnelId };
         }
-        return allowRedirect
-          ? this.closeTunnelRecordAndAwait(winner, reason, false)
-          : { confirmed: false, tunnelId: winner.tunnelId };
+        return this.followRemoteCoordinatorClose(winner, reason);
       }
 
       const adoptedRecord = adoptRes.record;
