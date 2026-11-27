@@ -2,6 +2,8 @@
  * @vitest-environment jsdom
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { URL } from 'node:url';
 import { h } from 'preact';
 import { act, render, screen, fireEvent, cleanup } from '@testing-library/preact';
 
@@ -44,6 +46,11 @@ const defaultProps = {
   onRestartProject: vi.fn(),
   pinned: new Set<string>(),
   setPinnedArr: vi.fn(),
+};
+
+const readTabStyles = (): string => {
+  const relPath = '../../src/styles.css';
+  return readFileSync(new URL(relPath, import.meta.url), 'utf8');
 };
 
 function firePointer(
@@ -1136,11 +1143,8 @@ describe('SessionTabs', () => {
     expect(tabs[1]?.classList.contains('incognito')).toBe(false);
   });
 
-  it('renders top-left corner sequence numbers matching visual tab order without increasing tab height or width', async () => {
-    const fs = await import('node:fs');
-    const path = await import('node:path');
-    const webRoot = process.cwd().endsWith('/web') ? process.cwd() : path.join(process.cwd(), 'web');
-    const cssText = fs.readFileSync(path.join(webRoot, 'src/styles.css'), 'utf8');
+  it('renders top-left corner sequence numbers matching visual tab order without increasing tab height or width', () => {
+    const cssText = readTabStyles();
 
     // Inject tab CSS rules directly into the document to assert real box/positioning properties.
     const tabRule = cssText.match(/\.tab\s*\{[^}]+\}/)?.[0] ?? '';
@@ -1194,11 +1198,8 @@ describe('SessionTabs', () => {
     expect(screen.getByTestId('session-tab-seq-sess_a').textContent).toBe('3');
   });
 
-  it('positions .tab-pin at bottom-left corner and .tab > .agent-badge at top-right corner out-of-flow without altering SessionTree badge', async () => {
-    const fs = await import('node:fs');
-    const path = await import('node:path');
-    const webRoot = process.cwd().endsWith('/web') ? process.cwd() : path.join(process.cwd(), 'web');
-    const cssText = fs.readFileSync(path.join(webRoot, 'src/styles.css'), 'utf8');
+  it('positions .tab-pin at bottom-left corner and .tab > .agent-badge at top-right corner out-of-flow without altering SessionTree badge', () => {
+    const cssText = readTabStyles();
 
     // 1. Assert CSS rules for out-of-flow corner positioning
     const pinRule = cssText.match(/(?:^|\n)\.tab-pin\s*\{[^}]+\}/)?.[0] ?? '';
@@ -1278,11 +1279,8 @@ describe('SessionTabs', () => {
     expect(tab3AgentBadge).toBeNull();
   });
 
-  it('positions .tab-ws-dot and .tab-latency at bottom-right corner out-of-flow without altering active tab interactions', async () => {
-    const fs = await import('node:fs');
-    const path = await import('node:path');
-    const webRoot = process.cwd().endsWith('/web') ? process.cwd() : path.join(process.cwd(), 'web');
-    const cssText = fs.readFileSync(path.join(webRoot, 'src/styles.css'), 'utf8');
+  it('positions .tab-ws-dot and .tab-latency at bottom-right corner out-of-flow without altering active tab interactions', () => {
+    const cssText = readTabStyles();
 
     // 1. Assert CSS rules for bottom-right corner overlay
     const wsDotRule = cssText.match(/(?:^|\n)\.tab-ws-dot\s*\{[^}]+\}/)?.[0] ?? '';
@@ -1311,6 +1309,7 @@ describe('SessionTabs', () => {
     expect(androidLatencyRule).toContain('font-size: 7px');
 
     // 2. Render SessionTabs and verify .tab-ws-dot rendering across connected/latency states
+    const onSelect = vi.fn();
     const sessions = makeSessions([
       { name: 'sess_active', label: 'Active Tab', state: 'idle' },
       { name: 'sess_inactive', label: 'Inactive Tab', state: 'idle' },
@@ -1324,7 +1323,7 @@ describe('SessionTabs', () => {
         connected={true}
         latencyMs={12}
         latencyColor="#34d399"
-        onSelect={vi.fn()}
+        onSelect={onSelect}
         sessionsLoaded={true}
         {...defaultProps}
       />,
@@ -1337,6 +1336,10 @@ describe('SessionTabs', () => {
     expect(activeDotA?.getAttribute('title')).toBe('12ms');
     expect(activeDotA?.querySelector('.tab-latency')?.textContent).toBe('12ms');
     expect(inactiveDotA).toBeNull();
+
+    // Active tab click still cleanly selects sess_active without pointer obstruction
+    fireEvent.click(tabsA[0]);
+    expect(onSelect).toHaveBeenCalledWith('sess_active');
 
     // Case B: Active + Connected + latencyMs=0 (0ms is valid latency, must not fall back to Connected)
     rerender(
