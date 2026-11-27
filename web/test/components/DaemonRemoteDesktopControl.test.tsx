@@ -651,6 +651,26 @@ describe('DaemonRemoteDesktopControl', () => {
       machines: [linkedOffline],
     })).toMatchObject({ target: null, unavailableReason: 'offline' });
 
+    // Offline daemon + ONLINE linked node -> STILL offline reason (matches DaemonRemoteDesktopControl top-bar guard)
+    expect(resolveServerRemoteDesktopTarget({
+      serverId: 'srv-1',
+      serverName: 'Srv 1',
+      daemonOnline: false,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      machines: [linkedOnline],
+    })).toMatchObject({ target: null, unavailableReason: 'offline' });
+
+    const { DaemonRemoteDesktopControl: RDControl } = await import('../../src/components/DaemonRemoteDesktopControl.js');
+    const offlineView = render(h(RDControl as never, {
+      ws: null,
+      serverId: 'srv-1',
+      serverName: 'Srv 1',
+      daemonOnline: false,
+      onOpen: vi.fn(),
+      machines: [linkedOnline],
+    }));
+    expect(offlineView.container.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+
     // Online daemon without RD capability and no openable linked node -> unavailable reason
     expect(resolveServerRemoteDesktopTarget({
       serverId: 'srv-1',

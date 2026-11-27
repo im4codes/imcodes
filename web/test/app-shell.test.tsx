@@ -10695,6 +10695,18 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
                 capabilities: [REMOTE_DESKTOP_CAPABILITY],
                 hostServerId: 'srv-1',
               },
+              {
+                serverId: 'node-off-linked',
+                nodeId: '1000000202',
+                refName: 'gamma-node',
+                displayName: 'Gamma Online Node',
+                os: 'win',
+                online: true,
+                execEnabled: true,
+                accessRole: 'owner',
+                capabilities: [REMOTE_DESKTOP_CAPABILITY],
+                hostServerId: 'srv-off',
+              },
             ],
           };
         }
@@ -10801,14 +10813,19 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(betaWorkspace.getAttribute('data-active-tab')).toBe('srv-2');
       expect(screen.getByText('remote-desktop-minimized:false')).toBeTruthy();
 
-      // Close and switch to offline/unavailable server -> error toast, no blank workspace
+      // Close and switch to offline daemon server (even with an online linked controlled node) -> matches top-bar guard: offline toast, no launch
       fireEvent.click(screen.getByText('remote-desktop-close'));
       await waitFor(() => expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull());
       fireEvent.click(screen.getByTestId('server-icon-srv-off'));
       await screen.findByTestId('pane-composer-deck_gamma_brain');
+      expect(view.container.querySelector('.daemon-remote-desktop-btn')).toBeNull();
 
       window.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', code: 'KeyR', altKey: true, bubbles: true, cancelable: true }));
-      await waitFor(() => expect(view.container.querySelector('.toast.toast-error')).toBeTruthy());
+      await waitFor(() => {
+        const errToast = view.container.querySelector('.toast.toast-error');
+        expect(errToast).toBeTruthy();
+        expect(errToast?.textContent).toContain('remote_desktop.citation_offline');
+      });
       expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull();
     } finally {
       __resetMachinesForTests();

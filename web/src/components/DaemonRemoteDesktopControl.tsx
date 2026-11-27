@@ -135,11 +135,11 @@ export function resolveServerRemoteDesktopTarget({
   }
   const linkedNode = machines.find((machine) => machine.hostServerId === serverId) ?? null;
   const linkedOpenable = linkedNode !== null && canOpenRemoteDesktopMachine(linkedNode);
-  if (!daemonOnline && !linkedOpenable) {
+  if (!daemonOnline) {
     return {
       target: null,
       linkedNode,
-      linkedOpenable: false,
+      linkedOpenable,
       ready,
       unavailableReason: 'offline',
     };
