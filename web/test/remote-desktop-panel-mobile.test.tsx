@@ -2461,16 +2461,20 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     vi.useFakeTimers();
     const { getByRole } = await renderPanel();
     const displayTab = getByRole('tab', { name: 'remote_desktop.display_name_main' });
+    voiceMocks.triggerHapticFeedback.mockClear();
     act(() => {
       pointer(displayTab, 'pointerdown', { pointerId: 44, clientX: 80, clientY: 60 });
     });
     await act(async () => { await vi.advanceTimersByTimeAsync(550); });
     expect(getByRole('menu')).not.toBeNull();
+    expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledWith(20, 'medium');
+    expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledTimes(1);
     act(() => {
       pointer(displayTab, 'pointerup', { pointerId: 44, clientX: 80, clientY: 60 });
       (displayTab as HTMLButtonElement).click();
     });
     expect(setDisplayMode).not.toHaveBeenCalled();
+    expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledTimes(1);
   });
 
   it('does not leave a stale click suppression behind when a long press emits no click', async () => {
@@ -2783,14 +2787,18 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     const ring = getByLabelText('remote_desktop.touch_ring');
     pointerClick.mockClear();
+    voiceMocks.triggerHapticFeedback.mockClear();
     act(() => { pointer(ring, 'pointerdown', { pointerId: 11, clientX: 200, clientY: 150 }); });
     await act(async () => { await vi.advanceTimersByTimeAsync(550); });
     // Held: armed, and still free to become a drag, so nothing clicked yet.
     expect(ring.className).toContain('is-right');
     expect(pointerClick).not.toHaveBeenCalled();
+    expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledWith(20, 'medium');
+    expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledTimes(1);
     act(() => { pointer(ring, 'pointerup', { pointerId: 11, clientX: 200, clientY: 150 }); });
     expect(pointerClick).toHaveBeenCalledTimes(1);
     expect(pointerClick).toHaveBeenCalledWith('right', 0.5, 0.5);
+    expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledTimes(1);
     await act(async () => { await vi.advanceTimersByTimeAsync(500); });
     expect(ring.className).not.toContain('is-right');
   });
@@ -2864,11 +2872,13 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     });
     const ring = getByLabelText('remote_desktop.touch_ring');
     pointerClick.mockClear();
+    voiceMocks.triggerHapticFeedback.mockClear();
     act(() => { pointer(ring, 'pointerdown', { pointerId: 13, clientX: 200, clientY: 150 }); });
     act(() => { pointer(ring, 'pointermove', { pointerId: 13, clientX: 230, clientY: 150 }); });
     await act(async () => { await vi.advanceTimersByTimeAsync(550); });
     expect(pointerClick).not.toHaveBeenCalledWith('right', expect.anything(), expect.anything());
     expect(ring.className).not.toContain('is-right');
+    expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
   });
 
   it('releases a captured mouse button even when pointer-up is outside video content', async () => {
@@ -3636,12 +3646,15 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   it('turns a long press into right-click and snaps a nearby double tap to one Windows target', async () => {
     const { stage } = await renderPanel();
     pointerButton.mockClear();
+    voiceMocks.triggerHapticFeedback.mockClear();
     vi.useFakeTimers();
 
     pointer(stage, 'pointerdown', { pointerId: 40, clientX: 200, clientY: 150 });
     act(() => { vi.advanceTimersByTime(550); });
     pointer(stage, 'pointerup', { pointerId: 40, clientX: 200, clientY: 150 });
     expect(pointerClick.mock.calls).toEqual([['right', 0.5, 0.5]]);
+    expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledWith(20, 'medium');
+    expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledTimes(1);
 
     pointerButton.mockClear();
     pointerClick.mockClear();
@@ -3655,6 +3668,89 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       ['left', 0.5, 0.5],
     ]);
     expect(pointerButton).not.toHaveBeenCalled();
+  });
+
+  describe('mobile haptic feedback', () => {
+    it('does not trigger haptic feedback on short tap or when gesture moves before 550ms on stage', async () => {
+      vi.useFakeTimers();
+      const { stage } = await renderPanel();
+      voiceMocks.triggerHapticFeedback.mockClear();
+
+      // 1. Short tap (under 550ms)
+      pointer(stage, 'pointerdown', { pointerId: 101, clientX: 200, clientY: 150 });
+      act(() => { vi.advanceTimersByTime(200); });
+      pointer(stage, 'pointerup', { pointerId: 101, clientX: 200, clientY: 150 });
+      act(() => { vi.advanceTimersByTime(400); });
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+
+      // 2. Touch move exceeding threshold cancels long press
+      voiceMocks.triggerHapticFeedback.mockClear();
+      pointer(stage, 'pointerdown', { pointerId: 102, clientX: 200, clientY: 150 });
+      act(() => { vi.advanceTimersByTime(100); });
+      pointer(stage, 'pointermove', { pointerId: 102, clientX: 220, clientY: 150 });
+      act(() => { vi.advanceTimersByTime(550); });
+      pointer(stage, 'pointerup', { pointerId: 102, clientX: 220, clientY: 150 });
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+
+      // 3. Second finger arriving cancels single-finger long-press
+      voiceMocks.triggerHapticFeedback.mockClear();
+      pointer(stage, 'pointerdown', { pointerId: 103, clientX: 200, clientY: 150 });
+      act(() => { vi.advanceTimersByTime(100); });
+      pointer(stage, 'pointerdown', { pointerId: 104, clientX: 240, clientY: 180 });
+      act(() => { vi.advanceTimersByTime(550); });
+      pointer(stage, 'pointerup', { pointerId: 103, clientX: 200, clientY: 150 });
+      pointer(stage, 'pointerup', { pointerId: 104, clientX: 240, clientY: 180 });
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+
+      // 4. View-only mode (!snapshot.inputEnabled) does not trigger haptics
+      voiceMocks.triggerHapticFeedback.mockClear();
+      act(() => clientHooks[0]!.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.CONNECTED,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+        inputEpoch: 1,
+        inputEnabled: false,
+        displays: [{ id: 'display-1', name: 'Main', width: 800, height: 600, primary: true }],
+        layoutRevision: 1,
+        stream: null,
+      }));
+      pointer(stage, 'pointerdown', { pointerId: 105, clientX: 200, clientY: 150 });
+      act(() => { vi.advanceTimersByTime(550); });
+      pointer(stage, 'pointerup', { pointerId: 105, clientX: 200, clientY: 150 });
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+    });
+
+    it('does not trigger haptic feedback on display tab when moved or released before 550ms', async () => {
+      vi.useFakeTimers();
+      const { getByRole } = await renderPanel();
+      const displayTab = getByRole('tab', { name: 'remote_desktop.display_name_main' });
+
+      // 1. Released before 550ms
+      voiceMocks.triggerHapticFeedback.mockClear();
+      act(() => {
+        pointer(displayTab, 'pointerdown', { pointerId: 110, clientX: 80, clientY: 60 });
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+      act(() => {
+        pointer(displayTab, 'pointerup', { pointerId: 110, clientX: 80, clientY: 60 });
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(400); });
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+
+      // 2. Moved > 10px before 550ms
+      voiceMocks.triggerHapticFeedback.mockClear();
+      act(() => {
+        pointer(displayTab, 'pointerdown', { pointerId: 111, clientX: 80, clientY: 60 });
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+      act(() => {
+        pointer(displayTab, 'pointermove', { pointerId: 111, clientX: 100, clientY: 60 });
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(550); });
+      act(() => {
+        pointer(displayTab, 'pointerup', { pointerId: 111, clientX: 100, clientY: 60 });
+      });
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+    });
   });
 
   it('does not show a redundant right-click button when the touch ring owns right-click', async () => {

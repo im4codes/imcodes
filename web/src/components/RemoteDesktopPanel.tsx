@@ -162,6 +162,7 @@ import {
   type RemoteDesktopQualityChoice,
 } from '../remote-desktop-quality-preference.js';
 import * as VoiceInput from './VoiceInput.js';
+import { triggerHapticFeedback } from './VoiceInput.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 
 /** Menu order of the quality modes. */
@@ -2044,6 +2045,7 @@ export function RemoteDesktopPanel({
         suppressDisplayTabClickRef.current = false;
         suppressDisplayTabClickTimerRef.current = null;
       }, 1_000);
+      void triggerHapticFeedback(20, 'medium');
       openDisplayModeMenu(displayId, target, start.x, start.y);
     }, 550);
     displayTabLongPressRef.current = { displayId, pointerId, start, timer };
@@ -2360,6 +2362,7 @@ export function RemoteDesktopPanel({
       if (touchRingArmedTimerRef.current) clearTimeout(touchRingArmedTimerRef.current);
       touchRingArmedTimerRef.current = null;
       setTouchRingArmed(true);
+      void triggerHapticFeedback(20, 'medium');
     }, TOUCH_LONG_PRESS_MS);
     touchRingPressRef.current = press;
   };
@@ -2499,6 +2502,7 @@ export function RemoteDesktopPanel({
         // long-press directly on the ring gives.
         commitVirtualMouse(current.start);
         flashTouchRingArmed();
+        void triggerHapticFeedback(20, 'medium');
       }, TOUCH_LONG_PRESS_MS);
       touchGestureRef.current = gesture;
     } else {
