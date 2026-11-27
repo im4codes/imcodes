@@ -1286,6 +1286,7 @@ export function SubSessionWindow({
             onRemoteDesktopClick={onRemoteDesktopClick ? stableOnRemoteDesktopClick : undefined}
             serverId={serverId}
             scopeTaskPairs={showTaskPairPanel}
+            hideTaskPairPanel={!showTaskPairPanel}
             taskPairPanelVisitKey={taskPairPanelVisitKey}
             canManageFileShares={effectiveCanManageFileShares}
             onQuote={addQuote}

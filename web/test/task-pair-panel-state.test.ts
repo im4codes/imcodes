@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   LEGACY_SESSION_MAP_KEY_PREFIX,
+  NARROW_SCOPED_PANE_MIN_WIDTH_PX,
   PHONE_SHORT_SIDE_MAX_PX,
+  isNarrowScopedPaneWidth,
   isPhoneScreen,
   readServerWideChoice,
   removeLegacyTaskPairPanelKeys,
@@ -136,5 +138,18 @@ describe('the per-sub-session maps the previous version stored are removed', () 
     expect(removeLegacyTaskPairPanelKeys(null)).toBe(0);
     expect(() => removeLegacyTaskPairPanelKeys(blockedStorage)).not.toThrow();
     expect(removeLegacyTaskPairPanelKeys(blockedStorage)).toBe(0);
+  });
+});
+
+describe('narrow scoped pane width detection', () => {
+  it('flags laid-out scoped panes strictly below the side-by-side width threshold and ignores jsdom zero/non-finite widths', () => {
+    expect(isNarrowScopedPaneWidth(0)).toBe(false);
+    expect(isNarrowScopedPaneWidth(-10)).toBe(false);
+    expect(isNarrowScopedPaneWidth(Number.NaN)).toBe(false);
+    expect(isNarrowScopedPaneWidth(undefined)).toBe(false);
+    expect(isNarrowScopedPaneWidth(480)).toBe(true);
+    expect(isNarrowScopedPaneWidth(NARROW_SCOPED_PANE_MIN_WIDTH_PX - 1)).toBe(true);
+    expect(isNarrowScopedPaneWidth(NARROW_SCOPED_PANE_MIN_WIDTH_PX)).toBe(false);
+    expect(isNarrowScopedPaneWidth(1200)).toBe(false);
   });
 });

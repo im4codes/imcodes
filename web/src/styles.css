@@ -20392,6 +20392,10 @@ button.quick-agent-delegation-preset.active {
 .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
   height: auto; max-height: var(--task-pair-panel-max-h, min(calc(var(--imcodes-ui-vh, 100vh) * 0.65), calc(var(--imcodes-ui-dvh) - 160px))); z-index: 20;
 }
+.chat-titlebar > .task-pair-status-panel.is-mobile.is-overlay:not(.is-collapsed) {
+  border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
+  box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
+}
 .chat-titlebar > .task-pair-status-panel.is-collapsed {
   /* Keep the collapsed strip in the titlebar flex flow on desktop too. The
      expanded rows remain positioned below the titlebar by the rule above. */
@@ -20412,6 +20416,13 @@ button.quick-agent-delegation-preset.active {
 .chat-main > .task-pair-status-panel:not(.is-collapsed) {
   position: absolute; top: 40px; right: 0; bottom: 0; height: auto; max-height: none;
   width: min(var(--task-pair-panel-width), 100%); max-width: var(--task-pair-panel-width); overflow: hidden;
+}
+.chat-main > .task-pair-status-panel.is-overlay:not(.is-collapsed) {
+  top: 40px; right: 8px; bottom: auto; height: auto; max-height: calc(100% - 48px);
+  width: min(var(--task-pair-panel-width, 300px), calc(100% - 16px)); max-width: calc(100% - 16px);
+  z-index: 20; overflow: hidden;
+  border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
+  box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
 }
 .chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
   bottom: auto; max-height: var(--task-pair-panel-max-h, calc(100% - 48px)); z-index: 20;
@@ -20440,26 +20451,18 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-icon.is-zero { opacity: .38; }
 .task-pair-status-icon.is-highlighted { color: var(--status-waiting-text, #fbbf24); border-color: color-mix(in srgb, currentColor 52%, transparent); background: color-mix(in srgb, currentColor 12%, transparent); }
 .task-pair-status-icon b { font-size: 10px; font-weight: 700; }
-.chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: calc(var(--task-pair-panel-width) + 12px); }
-.chat-view-wrap:has(.task-pair-status-panel) .chat-pending-ask-dock { padding-right: calc(var(--task-pair-panel-width) + 12px); }
+.chat-view-wrap:has(> .chat-main > .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-view { padding-right: calc(var(--task-pair-panel-width) + 12px); }
+.chat-view-wrap:has(> .chat-main > .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-pending-ask-dock { padding-right: calc(var(--task-pair-panel-width) + 12px); }
 /* The pinned "last sent" banner is a flow sibling of the panel (not inside
    .chat-view), so the .chat-view padding-right above never reaches it -- it
    still spans the full wrap width and its right edge sits under the panel.
    Reserve the same width here so the banner and the panel never overlap. */
-.chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: calc(var(--task-pair-panel-width) + 12px); }
+.chat-view-wrap:has(> .chat-main > .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-pinned-last-sent { margin-right: calc(var(--task-pair-panel-width) + 12px); }
 /* The floating scroll-to-bottom button is positioned inside .chat-main
    (`right: 12px; z-index: 10`), so an expanded desktop panel (`z-index: 12`)
    would otherwise cover it completely. Shift it left of the panel while
    clamping inside narrow desktop panes so it stays visible in `.chat-main`. */
-.chat-view-wrap:has(.task-pair-status-panel) .chat-scroll-btn { right: min(calc(var(--task-pair-panel-width) + 12px), max(12px, calc(100% - 48px))); }
-.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-view { padding-right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-pending-ask-dock { padding-right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-pinned-last-sent { margin-right: 10px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-scroll-btn { right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-view { padding-right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-pending-ask-dock { padding-right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-pinned-last-sent { margin-right: 10px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-scroll-btn { right: 12px; }
+.chat-view-wrap:has(> .chat-main > .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-scroll-btn { right: min(calc(var(--task-pair-panel-width) + 12px), max(12px, calc(100% - 48px))); }
 /* Owner rule: the collapsed mobile task status is a bare inline strip in
    the titlebar -- no border/background, no expand button, and it must not
    make the titlebar any taller. Keyed on the panel's .is-mobile class (not a
@@ -20553,10 +20556,10 @@ button.quick-agent-delegation-preset.active {
   .chat-main > .task-pair-status-panel.is-collapsed {
     position: absolute; top: 4px; right: 8px; bottom: auto; height: auto; max-height: none; overflow: visible;
   }
-  .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
-  .chat-view-wrap:has(.task-pair-status-panel) .chat-pending-ask-dock { padding-right: 10px; }
-  .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: 10px; }
-  .chat-view-wrap:has(.task-pair-status-panel) .chat-scroll-btn { right: 12px; }
+  .chat-view-wrap:has(> .chat-main > .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-view { padding-right: 12px; }
+  .chat-view-wrap:has(> .chat-main > .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-pending-ask-dock { padding-right: 10px; }
+  .chat-view-wrap:has(> .chat-main > .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-pinned-last-sent { margin-right: 10px; }
+  .chat-view-wrap:has(> .chat-main > .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-scroll-btn { right: 12px; }
   .chat-pending-ask-dock { padding: 6px 10px 8px; }
   /* Compact single-line "last sent" banner on mobile (tap to expand). */
   .chat-pinned-last-sent { flex-direction: row; align-items: center; gap: 6px; min-width: 0; padding: 4px 8px; }
@@ -20626,16 +20629,20 @@ button.quick-agent-delegation-preset.active {
   z-index: 12;
   overflow: hidden;
 }
-.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-view {
+.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-view,
+.layout-mobile-expanded .chat-view-wrap:has(> .chat-main > .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-view {
   padding-right: calc(min(var(--task-pair-panel-width, 360px), 46vw) + 12px);
 }
-.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-pending-ask-dock {
+.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-pending-ask-dock,
+.layout-mobile-expanded .chat-view-wrap:has(> .chat-main > .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-pending-ask-dock {
   padding-right: calc(min(var(--task-pair-panel-width, 360px), 46vw) + 12px);
 }
-.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-pinned-last-sent {
+.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-pinned-last-sent,
+.layout-mobile-expanded .chat-view-wrap:has(> .chat-main > .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-pinned-last-sent {
   margin-right: calc(min(var(--task-pair-panel-width, 360px), 46vw) + 12px);
 }
-.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-scroll-btn {
+.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-scroll-btn,
+.layout-mobile-expanded .chat-view-wrap:has(> .chat-main > .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) .chat-scroll-btn {
   right: min(calc(min(var(--task-pair-panel-width, 360px), 46vw) + 12px), max(12px, calc(100% - 48px)));
 }
 .task-pair-status-group { margin: 0 0 6px; }

@@ -45,6 +45,7 @@ import {
 } from '../task-pair-panel-order.js';
 import {
   cleanLegacyTaskPairPanelKeysOnce,
+  isNarrowScopedPaneWidth,
   isPhoneScreen,
   readServerWideChoice,
   resolveTaskPairPanelCollapsed,
@@ -167,13 +168,23 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   // room is left (landscape phone, keyboard open) the collapsed strip is shown
   // instead, without touching the user's choice.
   const [cramped, setCramped] = useState(false);
+  // Narrow desktop/tablet scoped sub-session panes (< 680px) cannot fit both
+  // a 300px docked sidebar and readable chat bubbles; auto-collapse to the
+  // titlebar strip without overwriting serverWideChoice, and overlay on click.
+  const [narrowScoped, setNarrowScoped] = useState(false);
+  const [narrowVisitChoice, setNarrowVisitChoice] = useState<boolean | undefined>(undefined);
+  const prevNarrowRef = useRef(false);
   const panelRef = useRef<HTMLElement>(null);
   const toggleRef = useRef<HTMLElement | null>(null);
   const setToggleNode = useCallback((el: HTMLElement | null) => { toggleRef.current = el; }, []);
   const persistCollapsed = useCallback((next: boolean) => {
+    if (narrowScoped) {
+      setNarrowVisitChoice(next);
+      return;
+    }
     setChoice(next);
     if (!visitScoped) writeServerWideChoice({ serverId, mobile: isMobile, collapsed: next });
-  }, [serverId, isMobile, visitScoped]);
+  }, [narrowScoped, serverId, isMobile, visitScoped]);
   useEffect(() => {
     // Only the layout class is tracked here; the choice is re-read by the effect below when the layout (or the panel's scope) changes.
     const onChange = () => {
@@ -193,6 +204,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     if (lastScopeKey.current === scopeKey) return;
     lastScopeKey.current = scopeKey;
     setChoice(visitScoped ? undefined : readServerWideChoice({ serverId, mobile: isMobile }));
+    setNarrowVisitChoice(undefined);
   }, [scopeKey, serverId, isMobile, visitScoped]);
   const lastSnapshotScopeRef = useRef<SnapshotScopeMeta | undefined>((() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
@@ -372,11 +384,16 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   // What is shown: the user's own choice if there is one, else the default (a phone sub-session: closed); too little room on a phone
   // inline sub-window shows the strip without touching the choice. On narrow mobile main chat (no scopeSessionId), expanding uses fullscreen
   // overlay so inline cramped measurement / --task-pair-panel-max-h must not collapse or clip it; on expanded mobile (>= 720px), main chat docks right in .chat-main.
+  const usesScopedPaneWidth = !isMobile && Boolean(scopeSessionId);
   const usesInlineMobileFit = isMobile && Boolean(scopeSessionId);
-  const collapsed = resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey }) || (usesInlineMobileFit && cramped);
+  const baseCollapsed = narrowScoped
+    ? (narrowVisitChoice !== undefined ? narrowVisitChoice : true)
+    : resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey });
+  const collapsed = baseCollapsed || (usesInlineMobileFit && cramped);
   const now = useNowTicker(visible && !collapsed && hasRows && hasActiveDurationRow);
   const isExpandedDocked = isMobile && isExpandedMobile && !scopeSessionId && !collapsed;
   const isFullscreen = isMobile && !isExpandedMobile && !scopeSessionId && !collapsed;
+  const isOverlay = narrowScoped && !collapsed && !isFullscreen;
   const shouldPortalToAnchor = Boolean(mobileAnchor && !isExpandedDocked && (isMobile || collapsed));
   const panelWidth = useTaskPairPanelWidth(panelRef, !isMobile && !collapsed && hasRows, Boolean(scopeSessionId || collapsedVisitKey));
   const syncTopActive = !collapsed && (!isMobile || isExpandedDocked);
@@ -413,6 +430,34 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       panel.style.removeProperty('top');
     };
   }, [syncTopActive, hasRows, mobileAnchor]);
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    const mainEl = usesScopedPaneWidth && hasRows && panel ? panel.closest<HTMLElement>('.chat-main') : null;
+    if (!mainEl) {
+      if (prevNarrowRef.current) {
+        prevNarrowRef.current = false;
+        setNarrowScoped(false);
+        setNarrowVisitChoice(undefined);
+      }
+      return undefined;
+    }
+    const measure = () => {
+      const next = isNarrowScopedPaneWidth(mainEl.getBoundingClientRect().width);
+      if (prevNarrowRef.current !== next) {
+        prevNarrowRef.current = next;
+        setNarrowScoped(next);
+        setNarrowVisitChoice(undefined);
+      }
+    };
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(mainEl);
+    window.addEventListener('resize', measure);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [usesScopedPaneWidth, hasRows, collapsed, mobileAnchor]);
   useLayoutEffect(() => {
     const panel = panelRef.current;
     if (!usesInlineMobileFit || !hasRows || !panel) {
@@ -482,7 +527,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
     </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>;
-  const panelEl = <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}${isFullscreen ? ' is-fullscreen' : ''}`} data-testid="task-pair-status-panel" onScroll={clampElementScroll}>
+  const panelEl = <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}${isFullscreen ? ' is-fullscreen' : ''}${isOverlay ? ' is-overlay' : ''}`} data-testid="task-pair-status-panel" onScroll={clampElementScroll}>
     {!isMobile && !collapsed && <div class="task-pair-status-resize" role="separator" tabIndex={0}
       aria-label={t('taskPair.panel_resize')} title={t('taskPair.panel_resize')} aria-orientation="vertical"
       aria-valuemin={panelWidth.min} aria-valuemax={panelWidth.max} aria-valuenow={panelWidth.width}
