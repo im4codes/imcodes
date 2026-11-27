@@ -703,4 +703,51 @@ describe('E2E: Local Web Preview streaming protocols (real upstreams, real daemo
     expect(seenBody).toBe('{"q":"hi"}');
     expect(text).toBe('id: 99\ndata: {"token":"hello"}\n\n');
   });
+
+  // ── 10. Silent SSE survives past shortened STREAM_IDLE_TIMEOUT_MS + safe keepalive boundaries ─
+  it('delivers split SSE events intact across silence > STREAM_IDLE_TIMEOUT_MS with event-boundary keepalives and cleans up on preview expiry', async () => {
+    vi.stubEnv('PREVIEW_STREAM_IDLE_TIMEOUT_MS', '80');
+    vi.stubEnv('PREVIEW_SSE_KEEPALIVE_MS', '30');
+
+    const upstream = await startHttpUpstream((req, res) => {
+      if (!req.url?.startsWith('/long-sse')) { res.writeHead(404).end(); return; }
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      res.write('id: 1\ndata: hel');
+      setTimeout(() => {
+        if (!res.writableEnded) res.write('lo\n\n');
+      }, 60); // split mid-word across 2x SSE_KEEPALIVE_MS -> MUST NOT inject keepalive inside "hello"!
+      setTimeout(() => {
+        if (!res.writableEnded) {
+          res.write('id: 2\ndata: after-idle\n\n');
+          res.end();
+        }
+      }, 220); // >160ms silence past 80ms STREAM_IDLE_TIMEOUT_MS -> MUST still survive!
+    });
+    cleanups.push(() => upstream.close());
+
+    const { bridge, previewId, injectHttpRequest, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+    const { wrapSseKeepaliveStream } = await import('../../server/src/routes/local-web-preview.js');
+
+    const relay = bridge.createPreviewRelay('sse-long-e2e', previewId, 5_000);
+    injectHttpRequest('sse-long-e2e', upstream.port, '/long-sse');
+
+    const started = await relay.start;
+    const wrappedBody = wrapSseKeepaliveStream(started.body);
+    const fullText = await new Response(wrappedBody).text();
+
+    // Must preserve both complete events intact, NEVER split "data: hello", and contain >=1 keepalive between events.
+    expect(fullText).toContain('id: 1\ndata: hello\n\n');
+    expect(fullText).toContain(': keepalive\n\n');
+    expect(fullText).toContain('id: 2\ndata: after-idle\n\n');
+    expect(fullText).not.toMatch(/data: hel: keepalive/);
+
+    // Verify preview expiry tears down an open silent SSE cleanly.
+    const relay2 = bridge.createPreviewRelay('sse-expire-e2e', previewId, 5_000);
+    injectHttpRequest('sse-expire-e2e', upstream.port, '/long-sse');
+    const started2 = await relay2.start;
+    const reader2 = wrapSseKeepaliveStream(started2.body).getReader();
+    bridge.terminatePreviewRelaysForPreview(previewId);
+    await expect(reader2.read()).rejects.toBeTruthy();
+  });
 });

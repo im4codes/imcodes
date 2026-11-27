@@ -383,4 +383,58 @@ describe('V-stream-bytes / V-buffer-cap', () => {
     expect(cancelled).toBe(true);
     await vi.advanceTimersByTimeAsync(5000);
   });
+
+  it('wrapSseKeepaliveStream NEVER injects ": keepalive\\n\\n" mid-line or mid-event across split LF/CRLF chunks', async () => {
+    const { wrapSseKeepaliveStream } = await import('../src/routes/local-web-preview.js');
+    vi.useFakeTimers();
+
+    let upstreamCtrl!: ReadableStreamDefaultController<Uint8Array>;
+    const upstream = new ReadableStream<Uint8Array>({
+      start(c) { upstreamCtrl = c; },
+    });
+
+    const wrapped = wrapSseKeepaliveStream(upstream, 100);
+    const reader = wrapped.getReader();
+    const collected: string[] = [];
+
+    // 1) Split mid-field ("data: hel" then wait > keepaliveMs then "lo\n\n"):
+    //    keepalive MUST NOT be inserted inside "data: hello".
+    upstreamCtrl.enqueue(Buffer.from('data: hel', 'utf8'));
+    const p1 = reader.read();
+    expect(Buffer.from((await p1).value ?? []).toString('utf8')).toBe('data: hel');
+
+    const p2 = reader.read();
+    await vi.advanceTimersByTimeAsync(350); // 3.5x keepaliveMs while mid-line!
+    upstreamCtrl.enqueue(Buffer.from('lo\n\n', 'utf8'));
+    const r2 = await p2;
+    collected.push(Buffer.from(r2.value ?? []).toString('utf8'));
+    expect(collected[0]).toBe('lo\n\n');
+
+    // 2) Now AT blank-line boundary -> silent > 100ms emits valid `: keepalive\n\n`.
+    const p3 = reader.read();
+    await vi.advanceTimersByTimeAsync(100);
+    const r3 = await p3;
+    expect(Buffer.from(r3.value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+
+    // 3) Split mid-event after `id: 9\n` (single EOL, NOT blank line) -> MUST NOT insert `: keepalive\n\n` before `data: ok\n\n`.
+    upstreamCtrl.enqueue(Buffer.from('id: 9\n', 'utf8'));
+    expect(Buffer.from((await reader.read()).value ?? []).toString('utf8')).toBe('id: 9\n');
+    const p4 = reader.read();
+    await vi.advanceTimersByTimeAsync(350);
+    upstreamCtrl.enqueue(Buffer.from('data: ok\r\n\r', 'utf8'));
+    expect(Buffer.from((await p4).value ?? []).toString('utf8')).toBe('data: ok\r\n\r');
+
+    // 4) Split right before final `\n` of `\r\n\r\n` -> still mid-CRLF, MUST NOT emit keepalive until `\n` completes!
+    const p5 = reader.read();
+    await vi.advanceTimersByTimeAsync(250);
+    upstreamCtrl.enqueue(Buffer.from('\n', 'utf8'));
+    expect(Buffer.from((await p5).value ?? []).toString('utf8')).toBe('\n');
+
+    // 5) Now CRLF blank line completed -> next silence emits `: keepalive\n\n` cleanly!
+    const p6 = reader.read();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(Buffer.from((await p6).value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+
+    await reader.cancel();
+  });
 });

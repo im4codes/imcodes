@@ -17,24 +17,24 @@ import {
   type PreviewWsOpenMessage,
   type PreviewWsCloseMessage,
 } from '../../shared/preview-types.js';
-import { buildUpstreamWsHeaders, normalizePreviewUpstreamPath } from '../../shared/preview-policy.js';
-import { isStreamingResponse } from '../../shared/preview-stream-policy.js';
+import { buildUpstreamWsHeaders, isSendableWsCloseCode, normalizePreviewUpstreamPath } from '../../shared/preview-policy.js';
+import { isSseResponse, isStreamingResponse } from '../../shared/preview-stream-policy.js';
 
 type PendingPreviewRequest = {
   abortController: AbortController;
   bodyStream: PassThrough | null;
+  serverLink: ServerLink;
   requestBytes: number;
   responseBytes: number;
   /**
    * Decided ONCE at RESPONSE_START via the shared `isStreamingResponse` predicate
    * (run 8a975732-23a A3/A5). A streaming response (SSE / ndjson / chunked non-JSON)
    * is EXEMPT from the cumulative MAX_RESPONSE_BYTES cap — it is instead bounded by
-   * the stream-idle timeout (here) and the server-side unconsumed-buffer high-watermark.
-   * Non-streaming responses keep the cumulative byte-cap protection. The server WS
-   * bridge feeds the SAME RESPONSE_START headers into the SAME shared predicate, so
-   * the two sides can never disagree (no copy across daemon/server — CLAUDE.md).
+   * the stream-idle timeout (here, except SSE) and server-side unconsumed-buffer high-watermark.
    */
   streaming: boolean;
+  /** True iff `RESPONSE_START` Content-Type is `text/event-stream` (exempt from idle timeout; stops on cancel/disconnect/expiry). */
+  sse: boolean;
   timedOut: boolean;
   timer: ReturnType<typeof setTimeout>;
   timerMode: 'start' | 'idle';
@@ -48,10 +48,11 @@ const LOOPBACK_HOST = '127.0.0.1';
 // but we cross-check to defend against confused-deputy scenarios.
 const previewPortRegistry = new Map<string, number>();
 
-// ── Active WS tunnels: wsId (dashless hex) → upstream WebSocket + ping timer ─
+// ── Active WS tunnels: wsId (dashless hex) → upstream WebSocket + ping timer + link ─
 type ActiveWsTunnel = {
   ws: WebSocket;
   pingTimer: ReturnType<typeof setInterval> | null;
+  serverLink: ServerLink;
 };
 const activeWsTunnels = new Map<string, ActiveWsTunnel>();
 
@@ -60,19 +61,50 @@ function normalizeWsId(wsId: string): string {
   return wsId.replace(/-/g, '');
 }
 
-function sendWsError(serverLink: ServerLink, wsId: string, error: string, status?: number): void {
+function sendControlWithConnectionCheck(serverLink: ServerLink, msg: unknown): boolean {
   try {
-    serverLink.send(status !== undefined
-      ? { type: PREVIEW_MSG.WS_ERROR, wsId, error, status }
-      : { type: PREVIEW_MSG.WS_ERROR, wsId, error });
+    const link = serverLink as ServerLink & { trySend?: (m: unknown) => boolean };
+    if (typeof link.trySend === 'function') {
+      return link.trySend(msg);
+    }
+    serverLink.send(msg);
+    return true;
   } catch {
-    // disconnected
+    return false;
   }
 }
 
-function removeWsTunnelEntry(wsId: string): ActiveWsTunnel | undefined {
+function sendWsError(serverLink: ServerLink, wsId: string, error: string, status?: number): void {
+  sendControlWithConnectionCheck(
+    serverLink,
+    status !== undefined
+      ? { type: PREVIEW_MSG.WS_ERROR, wsId, error, status }
+      : { type: PREVIEW_MSG.WS_ERROR, wsId, error },
+  );
+}
+
+function closeUpstreamWsSafely(ws: WebSocket, code?: number, reason?: string): void {
+  try {
+    if (ws.readyState === WebSocket.CONNECTING) {
+      ws.terminate();
+      return;
+    }
+    if (ws.readyState === WebSocket.OPEN) {
+      if (isSendableWsCloseCode(code)) {
+        ws.close(code, reason);
+      } else {
+        ws.terminate();
+      }
+    }
+  } catch {
+    try { ws.terminate(); } catch { /* ignore */ }
+  }
+}
+
+function removeWsTunnelEntry(wsId: string, expectedEntry?: ActiveWsTunnel): ActiveWsTunnel | undefined {
   const entry = activeWsTunnels.get(wsId);
   if (!entry) return undefined;
+  if (expectedEntry && entry !== expectedEntry) return undefined;
   if (entry.pingTimer) {
     clearInterval(entry.pingTimer);
     entry.pingTimer = null;
@@ -81,10 +113,29 @@ function removeWsTunnelEntry(wsId: string): ActiveWsTunnel | undefined {
   return entry;
 }
 
-function cleanupWsTunnel(wsId: string): void {
-  const entry = removeWsTunnelEntry(wsId);
-  if (entry && entry.ws.readyState === WebSocket.OPEN) {
-    try { entry.ws.close(); } catch { /* ignore */ }
+function cleanupWsTunnel(wsId: string, expectedEntry?: ActiveWsTunnel): void {
+  const entry = removeWsTunnelEntry(wsId, expectedEntry);
+  if (entry) {
+    closeUpstreamWsSafely(entry.ws);
+  }
+}
+
+/**
+ * Terminate every pending HTTP preview relay and upstream WS tunnel (including
+ * still-CONNECTING sockets and ping timers) owned by `serverLink`. Called when
+ * `ServerLink` closes, errors, is replaced by a reconnect, or disconnects.
+ */
+export function cleanupPreviewRelaysForLink(serverLink: ServerLink): void {
+  for (const [requestId, pending] of [...pendingPreviewRequests.entries()]) {
+    if (pending.serverLink !== serverLink) continue;
+    clearTimeout(pending.timer);
+    pendingPreviewRequests.delete(requestId);
+    try { pending.bodyStream?.destroy(new Error(PREVIEW_ERROR.ABORTED)); } catch { /* ignore */ }
+    try { pending.abortController.abort(); } catch { /* ignore */ }
+  }
+  for (const [wsId, entry] of [...activeWsTunnels.entries()]) {
+    if (entry.serverLink !== serverLink) continue;
+    cleanupWsTunnel(wsId, entry);
   }
 }
 
@@ -193,8 +244,10 @@ async function runPreviewFetch(serverLink: ServerLink, msg: PreviewRequestMessag
 
     const responseHeaders = responseHeadersToRecord(response.headers);
     // Classify ONCE at RESPONSE_START (shared predicate). Streaming responses are
-    // exempt from the cumulative MAX_RESPONSE_BYTES cap; non-streaming keep it.
+    // exempt from cumulative MAX_RESPONSE_BYTES; SSE (`text/event-stream`) is also
+    // exempt from STREAM_IDLE_TIMEOUT_MS (ends only on cancel, disconnect, or expiry).
     pending.streaming = isStreamingResponse(responseHeaders);
+    pending.sse = isSseResponse(responseHeaders);
     serverLink.send({
       type: PREVIEW_MSG.RESPONSE_START,
       requestId: msg.requestId,
@@ -202,21 +255,27 @@ async function runPreviewFetch(serverLink: ServerLink, msg: PreviewRequestMessag
       statusText: response.statusText,
       headers: responseHeaders,
     });
-    resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    if (pending.sse) {
+      clearTimeout(pending.timer);
+    } else {
+      resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    }
 
     if (response.body) {
       for await (const chunk of response.body) {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         pending.responseBytes += buffer.length;
         // Streaming responses (SSE / ndjson / chunked non-JSON) are NOT bounded by
-        // the cumulative byte cap — they rely on stream-idle + server buffer cap.
+        // the cumulative byte cap — non-SSE streams rely on stream-idle + server buffer cap.
         if (!pending.streaming && pending.responseBytes > PREVIEW_LIMITS.MAX_RESPONSE_BYTES) {
           pending.abortController.abort();
           failPreviewRequest(serverLink, msg.requestId, PREVIEW_ERROR.LIMIT_EXCEEDED, 'preview response exceeded byte limit', PREVIEW_TERMINAL_OUTCOME.LIMIT_EXCEEDED);
           cleanupPreviewRequest(msg.requestId);
           return;
         }
-        resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+        if (!pending.sse) {
+          resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+        }
         serverLink.sendBinary(packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.RESPONSE_BODY, msg.requestId, buffer));
       }
     }
@@ -257,9 +316,11 @@ export function handlePreviewCommand(cmd: Record<string, unknown>, serverLink: S
     const pending: PendingPreviewRequest = {
       abortController,
       bodyStream,
+      serverLink,
       requestBytes: 0,
       responseBytes: 0,
       streaming: false,
+      sse: false,
       timedOut: false,
       timer: setTimeout(() => {
         const active = pendingPreviewRequests.get(msg.requestId);
@@ -351,46 +412,54 @@ function handlePreviewWsOpen(msg: PreviewWsOpenMessage, serverLink: ServerLink):
   });
 
   // Track before open fires, so WS_CLOSE from server during handshake is handled.
-  const tunnelEntry: ActiveWsTunnel = { ws: upstreamWs, pingTimer: null };
+  const tunnelEntry: ActiveWsTunnel = { ws: upstreamWs, pingTimer: null, serverLink };
   activeWsTunnels.set(wsId, tunnelEntry);
 
   let opened = false;
   let settled = false;
 
   upstreamWs.on('open', () => {
+    if (activeWsTunnels.get(wsId) !== tunnelEntry) {
+      closeUpstreamWsSafely(upstreamWs);
+      return;
+    }
     opened = true;
     settled = true;
     logger.debug({ wsId }, 'Preview WS: upstream connected');
+    const sent = sendControlWithConnectionCheck(serverLink, {
+      type: PREVIEW_MSG.WS_OPENED,
+      wsId: msg.wsId,
+      protocol: upstreamWs.protocol || undefined,
+    });
+    if (!sent) {
+      // Server link disconnected / dropped send — clean up upstream and timers immediately.
+      cleanupWsTunnel(wsId, tunnelEntry);
+      return;
+    }
     tunnelEntry.pingTimer = setInterval(() => {
+      if (activeWsTunnels.get(wsId) !== tunnelEntry) return;
       if (upstreamWs.readyState === WebSocket.OPEN) {
         try { upstreamWs.ping(); } catch { /* ignore */ }
       }
     }, PREVIEW_LIMITS.WS_KEEPALIVE_MS);
     tunnelEntry.pingTimer.unref?.();
-    try {
-      serverLink.send({
-        type: PREVIEW_MSG.WS_OPENED,
-        wsId: msg.wsId,
-        protocol: upstreamWs.protocol || undefined,
-      });
-    } catch {
-      // Server disconnected — clean up upstream.
-      cleanupWsTunnel(wsId);
-    }
   });
 
-  upstreamWs.on('unexpected-response', (_req, res) => {
+  upstreamWs.on('unexpected-response', (req, res) => {
     if (opened || settled) return;
     settled = true;
     const rawStatus = res.statusCode ?? 0;
     const status = rawStatus >= 400 && rawStatus <= 599 ? rawStatus : 502;
     const statusText = res.statusMessage ?? '';
-    try { res.resume?.(); } catch { /* ignore */ }
+    // Immediately abort/destroy both response stream and client request so an
+    // upstream rejection that keeps the response body open never hangs a socket.
+    try { res.destroy?.(); } catch { /* ignore */ }
+    try { req.destroy?.(); } catch { /* ignore */ }
     const errMsg = statusText
       ? `upstream rejected: ${status} ${statusText}`
       : `upstream rejected: ${status}`;
     logger.warn({ wsId, status }, 'Preview WS: upstream rejected upgrade');
-    cleanupWsTunnel(wsId);
+    cleanupWsTunnel(wsId, tunnelEntry);
     sendWsError(serverLink, msg.wsId, errMsg, status);
   });
 
@@ -402,32 +471,44 @@ function handlePreviewWsOpen(msg: PreviewWsOpenMessage, serverLink: ServerLink):
     }
     if (settled) return;
     settled = true;
-    cleanupWsTunnel(wsId);
+    cleanupWsTunnel(wsId, tunnelEntry);
     sendWsError(serverLink, msg.wsId, `connection failed: ${err.message}`);
   });
 
   upstreamWs.on('message', (data: WebSocket.RawData, isBinaryMsg: boolean) => {
+    if (activeWsTunnels.get(wsId) !== tunnelEntry) return;
     // Enforce message size limit.
     const payload = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
     if (payload.length > PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES) {
       logger.warn({ wsId, size: payload.length }, 'Preview WS: upstream message exceeds size limit, closing tunnel');
-      cleanupWsTunnel(wsId);
-      try {
-        serverLink.send({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code: 1009, reason: 'Message Too Big' });
-      } catch { /* ignore */ }
+      cleanupWsTunnel(wsId, tunnelEntry);
+      sendControlWithConnectionCheck(serverLink, {
+        type: PREVIEW_MSG.WS_CLOSE,
+        wsId: msg.wsId,
+        code: 1009,
+        reason: 'Message Too Big',
+      });
       return;
     }
-    serverLink.sendBinary(packPreviewWsFrame(msg.wsId, isBinaryMsg, payload));
+    try {
+      serverLink.sendBinary(packPreviewWsFrame(msg.wsId, isBinaryMsg, payload));
+    } catch {
+      cleanupWsTunnel(wsId, tunnelEntry);
+    }
   });
 
   upstreamWs.on('close', (code, reasonBuf) => {
     const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString('utf8') : String(reasonBuf ?? '');
     logger.debug({ wsId, code, reason }, 'Preview WS: upstream closed');
-    removeWsTunnelEntry(wsId);
+    const removed = removeWsTunnelEntry(wsId, tunnelEntry);
     if (!opened && settled) return;
-    try {
-      serverLink.send({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code, reason });
-    } catch { /* ignore */ }
+    if (!removed && !opened) return;
+    sendControlWithConnectionCheck(serverLink, {
+      type: PREVIEW_MSG.WS_CLOSE,
+      wsId: msg.wsId,
+      code,
+      reason,
+    });
   });
 }
 
@@ -437,9 +518,7 @@ function handlePreviewWsCloseFromServer(msg: PreviewWsCloseMessage): void {
   const wsId = normalizeWsId(msg.wsId);
   const entry = removeWsTunnelEntry(wsId);
   if (!entry) return;
-  try {
-    entry.ws.close(msg.code, msg.reason);
-  } catch { /* ignore */ }
+  closeUpstreamWsSafely(entry.ws, msg.code, msg.reason);
 }
 
 export function handlePreviewBinaryFrame(data: Buffer, serverLink: ServerLink): boolean {

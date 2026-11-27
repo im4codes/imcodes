@@ -129,10 +129,12 @@ const WS_UPGRADE_STRIP_HEADERS = new Set([
   'sec-websocket-extensions',
 ]);
 
-// Headers managed by the daemon's WebSocket client (`ws`) during upstream handshake.
+// Headers managed by the daemon's WebSocket client (`ws`) during upstream handshake,
+// plus privacy/origin headers overridden or stripped for upstream loopback isolation.
 const WS_UPSTREAM_SKIP_HEADERS = new Set([
   'host',
   'origin',
+  'referer',
   'content-length',
   'sec-websocket-key',
   'sec-websocket-version',
@@ -141,6 +143,19 @@ const WS_UPSTREAM_SKIP_HEADERS = new Set([
   'connection',
   'upgrade',
 ]);
+
+/**
+ * RFC 6455 sendable Close frame status codes (excl. 1004, 1005, 1006, 1015).
+ * Abnormal codes like 1006 throw RangeError if passed to `ws.close(code)`.
+ */
+export function isSendableWsCloseCode(code: unknown): code is number {
+  if (typeof code !== 'number' || !Number.isInteger(code)) return false;
+  if (code === 1000) return true;
+  if (code >= 1001 && code <= 1014) {
+    return code !== 1004 && code !== 1005 && code !== 1006;
+  }
+  return code >= 3000 && code <= 4999;
+}
 
 /**
  * Build upstream headers for the daemon's WebSocket connection to `127.0.0.1:<port>`.

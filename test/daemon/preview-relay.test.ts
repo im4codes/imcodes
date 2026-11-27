@@ -319,4 +319,64 @@ describe('daemon preview relay', () => {
       code: PREVIEW_ERROR.TIMEOUT,
     }));
   });
+
+  it('keeps silent SSE alive past STREAM_IDLE_TIMEOUT_MS while still timing out non-SSE streams on idle', async () => {
+    const prevIdle = process.env.PREVIEW_STREAM_IDLE_TIMEOUT_MS;
+    process.env.PREVIEW_STREAM_IDLE_TIMEOUT_MS = '50';
+    vi.resetModules();
+    try {
+      const relay = await import('../../src/daemon/preview-relay.js');
+      const types = await import('../../shared/preview-types.js');
+
+      // 1) Silent SSE > 50ms must NOT time out; subsequent chunk + RESPONSE_END succeed.
+      const sseLink = createServerLink();
+      fetchMock.mockResolvedValueOnce({
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers({ 'content-type': 'text/event-stream' }),
+        body: Readable.from((async function* () {
+          yield Buffer.from('data: first\n\n');
+          await new Promise((r) => setTimeout(r, 140));
+          yield Buffer.from('data: delayed\n\n');
+        })()),
+      });
+      relay.handlePreviewCommand({
+        type: types.PREVIEW_MSG.REQUEST, requestId: 'req-sse-long', previewId: 'p-sse',
+        port: 3000, method: 'GET', path: '/events', headers: {}, hasBody: false,
+      }, sseLink as never);
+      await new Promise((r) => setTimeout(r, 200));
+      expect(sseLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: types.PREVIEW_MSG.RESPONSE_END, requestId: 'req-sse-long',
+      }));
+      expect(sseLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+        type: types.PREVIEW_MSG.ERROR, requestId: 'req-sse-long',
+      }));
+
+      // 2) Silent non-SSE stream (application/x-ndjson) > 50ms MUST still time out.
+      const ndjsonLink = createServerLink();
+      fetchMock.mockImplementationOnce((_url: URL, init?: RequestInit) => Promise.resolve({
+        status: 200,
+        statusText: 'OK',
+        headers: new Headers({ 'content-type': 'application/x-ndjson' }),
+        body: Readable.from((async function* () {
+          yield Buffer.from('{"line":1}\n');
+          await new Promise((_res, rej) => {
+            init?.signal?.addEventListener('abort', () => rej(Object.assign(new Error('Aborted'), { name: 'AbortError' })), { once: true });
+          });
+        })()),
+      }));
+      relay.handlePreviewCommand({
+        type: types.PREVIEW_MSG.REQUEST, requestId: 'req-ndjson-idle', previewId: 'p-ndjson',
+        port: 3000, method: 'GET', path: '/logs', headers: {}, hasBody: false,
+      }, ndjsonLink as never);
+      await new Promise((r) => setTimeout(r, 120));
+      expect(ndjsonLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: types.PREVIEW_MSG.ERROR, requestId: 'req-ndjson-idle', code: types.PREVIEW_ERROR.TIMEOUT,
+      }));
+    } finally {
+      if (prevIdle === undefined) delete process.env.PREVIEW_STREAM_IDLE_TIMEOUT_MS;
+      else process.env.PREVIEW_STREAM_IDLE_TIMEOUT_MS = prevIdle;
+      vi.resetModules();
+    }
+  });
 });

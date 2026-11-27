@@ -568,6 +568,7 @@ describe('daemon WS tunnel relay', () => {
         'user-agent': 'MockBrowser/1.0',
         'x-custom-header': 'custom-val',
         origin: 'https://im.codes',
+        referer: 'https://im.codes/api/server/s1/local-web/p1/?preview_access_token=placeholder-tok',
         host: 'im.codes',
         authorization: 'Bearer should-be-stripped',
         'sec-websocket-key': 'stale-browser-key==',
@@ -587,16 +588,24 @@ describe('daemon WS tunnel relay', () => {
     expect(hdr['x-custom-header']).toBe('custom-val');
     expect(hdr.host).toBe(`127.0.0.1:${upstream.port}`);
     expect(hdr.origin).toBe(`http://127.0.0.1:${upstream.port}`);
+    expect(hdr.referer).toBeUndefined();
     expect(hdr.authorization).toBeUndefined();
     expect(hdr['sec-websocket-key']).not.toBe('stale-browser-key==');
   });
 
-  // ── Upstream unexpected-response HTTP status forwarding ───────────────────
+  // ── Upstream unexpected-response HTTP status forwarding (open-ended body) ───
 
-  it('includes upstream HTTP status code on WS_ERROR for unexpected-response (401/403)', async () => {
+  it('includes upstream HTTP status on WS_ERROR and destroys open-ended rejection response without hanging', async () => {
     const { createServer } = await import('node:http');
+    let serverResEnded = false;
+    let closedByRelay = false;
     const httpSrv = createServer((_req, res) => {
-      res.writeHead(401, 'Unauthorized').end('denied');
+      res.writeHead(401, 'Unauthorized');
+      res.write('denied ');
+      // Intentionally do NOT call res.end() — relay must destroy req/res on status!
+      res.on('close', () => {
+        if (!serverResEnded) closedByRelay = true;
+      });
     });
     await new Promise<void>((resolve) => httpSrv.listen(0, '127.0.0.1', resolve));
     const port = (httpSrv.address() as AddressInfo).port;
@@ -614,17 +623,105 @@ describe('daemon WS tunnel relay', () => {
       }, serverLink as never);
 
       await waitFor(() => serverLink.send.mock.calls.some((c) => (c[0] as { type: string }).type === PREVIEW_MSG.WS_ERROR), 3000);
+      await waitFor(() => closedByRelay, 2000);
+      serverResEnded = true;
       const errCall = serverLink.send.mock.calls.find((c) => (c[0] as { type: string }).type === PREVIEW_MSG.WS_ERROR);
       expect(errCall?.[0]).toMatchObject({
         type: PREVIEW_MSG.WS_ERROR,
         wsId,
         status: 401,
       });
-      // Should NOT also emit WS_CLOSE right behind pre-open WS_ERROR.
       await new Promise((r) => setTimeout(r, 30));
       expect(serverLink.send.mock.calls.some((c) => (c[0] as { type: string }).type === PREVIEW_MSG.WS_CLOSE)).toBe(false);
     } finally {
+      httpSrv.closeAllConnections?.();
       await new Promise<void>((resolve) => httpSrv.close(() => resolve()));
+    }
+  });
+
+  // ── ServerLink disconnect cleanup & CONNECTING termination & entry ownership ─
+
+  it('cleans up OPEN/CONNECTING upstream WS tunnels and ping timers when owning ServerLink disconnects, without affecting replacement connections', async () => {
+    const prevKeepalive = process.env.PREVIEW_WS_KEEPALIVE_MS;
+    process.env.PREVIEW_WS_KEEPALIVE_MS = '30';
+    vi.resetModules();
+    try {
+      const relay = await import('../../src/daemon/preview-relay.js');
+      const types = await import('../../shared/preview-types.js');
+      const { createServer } = await import('node:net');
+
+      // 1) Hanging TCP server so upstream WS stays in CONNECTING state forever unless terminated.
+      const sockets: import('node:net').Socket[] = [];
+      let tcpClosed = 0;
+      const tcpSrv = createServer((sock) => {
+        sockets.push(sock);
+        sock.resume();
+        sock.on('close', () => { tcpClosed++; });
+      });
+      await new Promise<void>((resolve) => tcpSrv.listen(0, '127.0.0.1', resolve));
+      const connectingPort = (tcpSrv.address() as AddressInfo).port;
+
+      try {
+        const link1 = createServerLink();
+        const link2 = createServerLink();
+        const wsIdOpen = makeWsId();
+        const wsIdConnecting = makeWsId();
+        const wsIdOtherLink = makeWsId();
+        let openPings = 0;
+        let openClosed = false;
+        let link2Closed = false;
+
+        upstream.wss.on('connection', (ws, req) => {
+          if (req.url === '/link1') {
+            ws.on('ping', () => { openPings++; });
+            ws.on('close', () => { openClosed = true; });
+          } else {
+            ws.on('close', () => { link2Closed = true; });
+          }
+        });
+
+        relay.handlePreviewCommand({
+          type: types.PREVIEW_MSG.WS_OPEN, wsId: wsIdOpen, previewId: TEST_PREVIEW_ID,
+          port: upstream.port, path: '/link1', headers: {}, protocols: [],
+        }, link1 as never);
+        relay.handlePreviewCommand({
+          type: types.PREVIEW_MSG.WS_OPEN, wsId: wsIdConnecting, previewId: TEST_PREVIEW_ID,
+          port: connectingPort, path: '/hang', headers: {}, protocols: [],
+        }, link1 as never);
+        relay.handlePreviewCommand({
+          type: types.PREVIEW_MSG.WS_OPEN, wsId: wsIdOtherLink, previewId: TEST_PREVIEW_ID,
+          port: upstream.port, path: '/link2', headers: {}, protocols: [],
+        }, link2 as never);
+
+        await waitFor(() => link1.send.mock.calls.some((c) => (c[0] as { type: string }).type === types.PREVIEW_MSG.WS_OPENED));
+        await waitFor(() => link2.send.mock.calls.some((c) => (c[0] as { type: string }).type === types.PREVIEW_MSG.WS_OPENED));
+        await waitFor(() => sockets.length === 1);
+        await waitFor(() => openPings >= 1);
+
+        // Disconnect link1 -> must close OPEN tunnel, terminate CONNECTING socket, stop link1 pingTimer,
+        // and leave link2's tunnel completely intact.
+        relay.cleanupPreviewRelaysForLink(link1 as never);
+        await waitFor(() => openClosed && tcpClosed === 1, 2000);
+        const pingsAtDisconnect = openPings;
+        await new Promise((r) => setTimeout(r, 90));
+        expect(openPings).toBe(pingsAtDisconnect);
+        expect(link2Closed).toBe(false);
+
+        // Reusing the same wsId on link2 after link1 disconnect cannot be killed by late events from link1.
+        relay.handlePreviewCommand({
+          type: types.PREVIEW_MSG.WS_OPEN, wsId: wsIdOpen, previewId: TEST_PREVIEW_ID,
+          port: upstream.port, path: '/link2-reuse', headers: {}, protocols: [],
+        }, link2 as never);
+        await waitFor(() => link2.send.mock.calls.some((c) => (c[0] as { wsId?: string; type: string }).wsId === wsIdOpen && (c[0] as { type: string }).type === types.PREVIEW_MSG.WS_OPENED));
+        relay.cleanupPreviewRelaysForLink(link2 as never);
+      } finally {
+        for (const s of sockets) { try { s.destroy(); } catch { /* ignore */ } }
+        await new Promise<void>((resolve) => tcpSrv.close(() => resolve()));
+      }
+    } finally {
+      if (prevKeepalive === undefined) delete process.env.PREVIEW_WS_KEEPALIVE_MS;
+      else process.env.PREVIEW_WS_KEEPALIVE_MS = prevKeepalive;
+      vi.resetModules();
     }
   });
 

@@ -567,6 +567,7 @@ describe('preview XSS escaping and credential header stripping', () => {
     const wsHeaders = buildUpstreamWsHeaders({
       host: 'im.codes',
       origin: 'https://im.codes',
+      referer: 'https://im.codes/api/server/s1/local-web/p1/?preview_access_token=secret',
       cookie: 'app_session=123',
       'user-agent': 'UA',
       'x-custom': 'val',
@@ -586,5 +587,6 @@ describe('preview XSS escaping and credential header stripping', () => {
       host: '127.0.0.1:5173',
       origin: 'http://127.0.0.1:5173',
     });
+    expect(wsHeaders.referer).toBeUndefined();
   });
 });

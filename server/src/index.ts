@@ -1330,9 +1330,16 @@ async function handlePreviewWsUpgrade(
   // 8. Defer the browser handshake until the daemon reports the upstream-
   //    negotiated subprotocol (run 8a975732-23a P1.5.1), then complete the
   //    handshake echoing exactly that protocol so the browser's
-  //    `WebSocket.protocol` matches the upstream end-to-end. The `ws` library
-  //    echoes whatever `Sec-WebSocket-Protocol` the request carries, so we
-  //    overwrite it to the single negotiated value (or delete it for "none").
+  //    `WebSocket.protocol` matches the upstream end-to-end.
+  let upgradedWsSettled = false;
+  const onPreUpgradeSocketEnd = () => {
+    if (!upgradedWsSettled) {
+      bridge.cancelPendingPreviewWsUpgrade(wsId);
+    }
+  };
+  socket.once('close', onPreUpgradeSocketEnd);
+  socket.once('error', onPreUpgradeSocketEnd);
+
   bridge.beginPreviewWsTunnel({
     wsId,
     previewId,
@@ -1341,24 +1348,48 @@ async function handlePreviewWsUpgrade(
     headers: sanitizedHeaders,
     protocols,
     completeUpgrade: (selectedProtocol) => new Promise((resolve) => {
-      if (socket.destroyed || !socket.writable) {
-        resolve(null);
+      let settled = false;
+      const onUpgradeSocketEnd = () => finish(null);
+      const finish = (ws: import('ws').WebSocket | null) => {
+        if (settled) return;
+        settled = true;
+        upgradedWsSettled = true;
+        socket.off('close', onUpgradeSocketEnd);
+        socket.off('error', onUpgradeSocketEnd);
+        socket.off('close', onPreUpgradeSocketEnd);
+        socket.off('error', onPreUpgradeSocketEnd);
+        resolve(ws);
+      };
+      if (socket.destroyed || !socket.readable || !socket.writable) {
+        finish(null);
         return;
       }
+      socket.once('close', onUpgradeSocketEnd);
+      socket.once('error', onUpgradeSocketEnd);
       if (selectedProtocol) {
         req.headers['sec-websocket-protocol'] = selectedProtocol;
       } else {
         delete req.headers['sec-websocket-protocol'];
       }
       try {
-        wss.handleUpgrade(req, socket, head, (ws) => resolve(ws as unknown as import('ws').WebSocket));
+        wss.handleUpgrade(req, socket, head, (ws) => finish(ws as unknown as import('ws').WebSocket));
+        // ws@8.23.0 may decline/abort silently without calling callback if the socket
+        // loses readability or handshake checks fail internally; settle promptly.
+        queueMicrotask(() => {
+          if (!settled && (socket.destroyed || !socket.readable || !socket.writable)) {
+            finish(null);
+          }
+        });
       } catch (err) {
         logger.warn({ serverId, previewId, wsId, err }, 'Preview WS handleUpgrade failed');
         try { socket.destroy(); } catch { /* ignore */ }
-        resolve(null);
+        finish(null);
       }
     }),
     rejectUpgrade: (status) => {
+      upgradedWsSettled = true;
+      socket.off('close', onPreUpgradeSocketEnd);
+      socket.off('error', onPreUpgradeSocketEnd);
       if (socket.destroyed || !socket.writable) return;
       const safeStatus = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502;
       const statusText = STATUS_CODES[safeStatus] ?? 'Bad Gateway';

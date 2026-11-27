@@ -242,5 +242,57 @@ describe('V-ws-role: preview WS upgrade enforces resolveServerRole', () => {
     });
     expect(opened.protocol).toBe('vite-hmr');
     expect(opened.firstMessage).toBe('hello-first-frame');
+
+    // Also test real socket closing/aborting handshake after WS_OPENED and abnormal 1006 close:
+    // 1) Raw socket missing Sec-WebSocket-Key -> wss.handleUpgrade rejects silently without callback,
+    //    completeUpgrade settles cleanly, quota returns to 0, and WS_CLOSE is sent to daemon.
+    const { request } = await import('node:http');
+    const net = await import('node:net');
+    const daemonMsgs: Array<Record<string, unknown>> = [];
+    const origDaemonSend = daemon.send.bind(daemon);
+    daemon.send = (data: string | Buffer, optsOrCb?: unknown, cb?: (err?: Error) => void) => {
+      if (typeof data === 'string') {
+        try { daemonMsgs.push(JSON.parse(data)); } catch { /* ignore */ }
+      }
+      origDaemonSend(data, optsOrCb, cb);
+    };
+
+    daemonMode = 'open-with-greeting';
+    const rawSock = net.connect(port, '127.0.0.1');
+    await new Promise<void>((res) => rawSock.on('connect', res));
+    // Send invalid Upgrade (missing Sec-WebSocket-Key) so wss.handleUpgrade aborts internally without callback!
+    rawSock.write(
+      `GET /api/server/${serverId}/local-web/${preview.id}/?${PREVIEW_ACCESS_TOKEN_QUERY_PARAM}=${accessToken} HTTP/1.1\r\n` +
+      `Host: 127.0.0.1:${port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+    );
+    await new Promise<void>((res) => {
+      rawSock.on('close', () => res());
+      setTimeout(res, 1000);
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(bridge.getServerWsCount()).toBe(0);
+    expect(daemonMsgs.some((m) => m.type === PREVIEW_MSG.WS_CLOSE)).toBe(true);
+    void request;
+
+    // 2) Abnormal close (1006) on upgraded real WebSocket closes browser connection instead of hanging open.
+    const abnormalClosed = await new Promise<{ closed: boolean; code: number }>((resolve, reject) => {
+      const url = `ws://127.0.0.1:${port}/api/server/${serverId}/local-web/${preview.id}/?${PREVIEW_ACCESS_TOKEN_QUERY_PARAM}=${accessToken}`;
+      const ws = new WebSocket(url, ['vite-hmr']);
+      const timer = setTimeout(() => { try { ws.terminate(); } catch { /* ignore */ } reject(new Error('hung open')); }, 3000);
+      ws.on('open', () => {
+        const latestOpen = [...daemonMsgs].reverse().find((m) => m.type === PREVIEW_MSG.WS_OPEN);
+        if (latestOpen?.wsId) {
+          daemon.emit('message', Buffer.from(JSON.stringify({
+            type: PREVIEW_MSG.WS_CLOSE, wsId: latestOpen.wsId, code: 1006, reason: 'upstream crashed',
+          })), false);
+        }
+      });
+      ws.on('close', (code) => {
+        clearTimeout(timer);
+        resolve({ closed: true, code });
+      });
+    });
+    expect(abnormalClosed.closed).toBe(true);
+    expect(abnormalClosed.code).toBe(1006);
   });
 });

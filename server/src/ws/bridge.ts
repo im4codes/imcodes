@@ -342,7 +342,8 @@ import {
   type PreviewWsErrorMessage,
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
-import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
+import { isSendableWsCloseCode } from '../../../shared/preview-policy.js';
+import { isSseResponse, isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, createSubSessionsBatch, getSubSessionById, isExecutionCloneRow, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, scheduleSessionTextTailCacheEvent, flushSessionTextTailCacheForServer, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
@@ -1393,6 +1394,8 @@ type PendingPreviewRequest = {
    * unconsumed-buffer high-watermark below.
    */
   streaming: boolean;
+  /** True iff `RESPONSE_START` Content-Type is `text/event-stream` (exempt from STREAM_IDLE_TIMEOUT_MS). */
+  sse: boolean;
   /**
    * Unconsumed (received-but-not-yet-delivered-to-consumer) bytes — the total
    * byte size of `pendingChunks` (run 8a975732-23a P1.2 / N1 fix 394c114e-11f).
@@ -14173,6 +14176,7 @@ export class WsBridge {
       terminalOutcome: null,
       responseBytes: 0,
       streaming: false,
+      sse: false,
       unconsumedBytes: 0,
       pendingChunks: [],
       timer,
@@ -14668,7 +14672,12 @@ export class WsBridge {
     // the cumulative MAX_RESPONSE_BYTES cap; bounded instead by stream-idle +
     // the unconsumed-buffer high-watermark.
     pending.streaming = isStreamingResponse(msg.headers);
-    this.resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    pending.sse = isSseResponse(msg.headers);
+    if (pending.sse) {
+      clearTimeout(pending.timer);
+    } else {
+      this.resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    }
     pending.resolveStart({
       status: msg.status,
       statusText: msg.statusText,
@@ -14726,7 +14735,9 @@ export class WsBridge {
       return;
     }
 
-    this.resetPreviewTimeout(requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    if (!pending.sse) {
+      this.resetPreviewTimeout(requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    }
     // Slide the preview TTL while a stream is actively delivering data, so a
     // long-lived SSE (> preview_session_idle) is not idle-evicted (P1.3.2).
     // touch() is clamped by the absolute lifetime hard ceiling.
@@ -14854,13 +14865,17 @@ export class WsBridge {
     const { wsId, previewId, port, path, headers, protocols, completeUpgrade, rejectUpgrade } = args;
     const openTimer = setTimeout(() => {
       const pending = this.pendingPreviewWsUpgrades.get(wsId);
-      if (!pending || pending.state !== 'opening') return;
+      if (!pending) return;
       this.pendingPreviewWsUpgrades.delete(wsId);
-      logger.warn({ serverId: this.serverId, wsId, previewId }, 'Preview WS tunnel open timeout (deferred upgrade)');
-      if (pending.rejectUpgrade) {
-        pending.rejectUpgrade(504, 'open timeout');
-      } else {
-        void pending.completeUpgrade(undefined).catch(() => null);
+      pending.incomingQueue = [];
+      pending.incomingQueueBytes = 0;
+      logger.warn({ serverId: this.serverId, wsId, previewId, state: pending.state }, 'Preview WS tunnel open/upgrade timeout (deferred upgrade)');
+      if (pending.state === 'opening') {
+        if (pending.rejectUpgrade) {
+          pending.rejectUpgrade(504, 'open timeout');
+        } else {
+          void pending.completeUpgrade(undefined).catch(() => null);
+        }
       }
       this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1001, reason: 'open timeout' });
       this.maybeCleanup();
@@ -14886,6 +14901,21 @@ export class WsBridge {
       headers,
       protocols,
     });
+  }
+
+  /**
+   * Cancel a pending deferred WS upgrade when the browser socket closes or errors
+   * before `completeUpgrade` adopts an active tunnel. Releases quota and closes upstream.
+   */
+  cancelPendingPreviewWsUpgrade(wsId: string): void {
+    const pending = this.pendingPreviewWsUpgrades.get(wsId);
+    if (!pending) return;
+    this.pendingPreviewWsUpgrades.delete(wsId);
+    clearTimeout(pending.openTimer);
+    pending.incomingQueue = [];
+    pending.incomingQueueBytes = 0;
+    this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1001, reason: 'client disconnected' });
+    this.maybeCleanup();
   }
 
   /**
@@ -14989,29 +15019,54 @@ export class WsBridge {
    * Called when daemon sends preview.ws.opened.
    * Transitions tunnel to active state, flushes queued messages.
    */
+  private closeWsTunnelSocket(ws: WebSocket, code?: number, reason?: string): void {
+    const sock = ws as WebSocket & { terminate?: () => void };
+    try {
+      if (isSendableWsCloseCode(code)) {
+        sock.close(code, reason);
+      } else if (typeof sock.terminate === 'function') {
+        sock.terminate();
+      } else {
+        sock.close();
+      }
+    } catch {
+      try {
+        if (typeof sock.terminate === 'function') {
+          sock.terminate();
+        } else {
+          sock.close();
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
   private resolvePreviewWsOpened(msg: PreviewWsOpenedMessage): void {
-    // Deferred-upgrade path (P1.5.1): keep entry in pendingPreviewWsUpgrades
-    // in `'upgrading'` state while completeUpgrade() settles so early daemon
-    // WS_DATA/WS_CLOSE frames are buffered and never dropped.
+    // Deferred-upgrade path (P1.5.1): keep entry + openTimer in pendingPreviewWsUpgrades
+    // until completeUpgrade() settles so an un-called wss.handleUpgrade cannot leak slots
+    // and early daemon WS_DATA/WS_CLOSE frames are buffered and never dropped.
     const deferred = this.pendingPreviewWsUpgrades.get(msg.wsId);
     if (deferred) {
       if (deferred.state !== 'opening') return;
       deferred.state = 'upgrading';
-      clearTimeout(deferred.openTimer);
       void deferred.completeUpgrade(msg.protocol).then((browserWs) => {
+        clearTimeout(deferred.openTimer);
         const current = this.pendingPreviewWsUpgrades.get(msg.wsId);
         if (current === deferred) {
           this.pendingPreviewWsUpgrades.delete(msg.wsId);
         }
         if (current !== deferred) {
-          // Cancelled externally (preview closed or daemon disconnected) during upgrade.
+          // Cancelled or timed out during upgrade — close socket safely and avoid orphan.
           if (browserWs) {
-            try { browserWs.close(1001, 'closed'); } catch { /* ignore */ }
+            this.closeWsTunnelSocket(browserWs, 1001, 'closed');
           }
+          deferred.incomingQueue = [];
+          deferred.incomingQueueBytes = 0;
           this.maybeCleanup();
           return;
         }
         if (!browserWs) {
+          deferred.incomingQueue = [];
+          deferred.incomingQueueBytes = 0;
           // Handshake failed after WS_OPENED — tell daemon to close upstream.
           this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code: 1011, reason: 'handshake failed' });
           this.maybeCleanup();
@@ -15025,13 +15080,16 @@ export class WsBridge {
         deferred.incomingQueue = [];
         deferred.incomingQueueBytes = 0;
         if (deferred.earlyClose && this.previewWsTunnels.has(msg.wsId)) {
-          try { browserWs.close(deferred.earlyClose.code, deferred.earlyClose.reason); } catch { /* ignore */ }
+          this.closeWsTunnelSocket(browserWs, deferred.earlyClose.code, deferred.earlyClose.reason);
           this.cleanupTunnel(msg.wsId);
         }
       }).catch((err) => {
+        clearTimeout(deferred.openTimer);
         if (this.pendingPreviewWsUpgrades.get(msg.wsId) === deferred) {
           this.pendingPreviewWsUpgrades.delete(msg.wsId);
         }
+        deferred.incomingQueue = [];
+        deferred.incomingQueueBytes = 0;
         logger.warn({ serverId: this.serverId, wsId: msg.wsId, err }, 'Preview WS deferred upgrade failed');
         this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code: 1011, reason: 'handshake failed' });
         this.maybeCleanup();
@@ -15100,7 +15158,7 @@ export class WsBridge {
     const tunnel = this.previewWsTunnels.get(msg.wsId);
     if (!tunnel) return;
     logger.warn({ serverId: this.serverId, wsId: msg.wsId, error: msg.error }, 'Preview WS tunnel error from daemon');
-    try { tunnel.browserWs.close(1011, 'upstream error'); } catch { /* ignore */ }
+    this.closeWsTunnelSocket(tunnel.browserWs, 1011, 'upstream error');
     this.cleanupTunnel(msg.wsId);
   }
 
@@ -15127,7 +15185,7 @@ export class WsBridge {
     }
     const tunnel = this.previewWsTunnels.get(msg.wsId);
     if (!tunnel) return;
-    try { tunnel.browserWs.close(msg.code, msg.reason); } catch { /* ignore */ }
+    this.closeWsTunnelSocket(tunnel.browserWs, msg.code, msg.reason);
     this.cleanupTunnel(msg.wsId);
   }
 

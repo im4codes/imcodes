@@ -35,7 +35,9 @@ import { COOKIE_PREVIEW_ACCESS } from '../../../shared/cookie-names.js';
 /**
  * Wrap an upstream SSE `ReadableStream` to emit `: keepalive\n\n` comment frames
  * when no upstream chunk arrives within `keepaliveMs` while the consumer is pulling.
- * Strictly pull-driven (`Promise.race` over one single `reader.read()`) so
+ * Tracks SSE empty-line event boundaries across arbitrary binary chunk/CR/LF splits
+ * so comments are ONLY emitted before the first byte or after a complete blank line
+ * terminating an event block — never mid-line or mid-event. Strictly pull-driven so
  * downstream backpressure and upstream abort/error/close propagation are preserved 1:1.
  */
 export function wrapSseKeepaliveStream(
@@ -50,6 +52,34 @@ export function wrapSseKeepaliveStream(
   let pendingRead: Promise<ReadOutcome> | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let closed = false;
+  let startedAnyByte = false;
+  let consecutiveEols = 0;
+  let lastWasCr = false;
+
+  const isAtEventBoundary = (): boolean => {
+    if (!startedAnyByte) return true;
+    return consecutiveEols >= 2 && !lastWasCr;
+  };
+
+  const advanceBoundaryState = (chunk: Uint8Array): void => {
+    for (let i = 0; i < chunk.byteLength; i++) {
+      startedAnyByte = true;
+      const b = chunk[i];
+      if (b === 0x0d) {
+        consecutiveEols += 1;
+        lastWasCr = true;
+      } else if (b === 0x0a) {
+        if (lastWasCr) {
+          lastWasCr = false;
+        } else {
+          consecutiveEols += 1;
+        }
+      } else {
+        consecutiveEols = 0;
+        lastWasCr = false;
+      }
+    }
+  };
 
   const clearKeepaliveTimer = () => {
     if (timer !== null) {
@@ -72,12 +102,14 @@ export function wrapSseKeepaliveStream(
     async pull(controller) {
       if (closed) return;
       const readPromise = ensureRead();
-      const timerPromise = new Promise<'keepalive'>((res) => {
-        clearKeepaliveTimer();
-        timer = setTimeout(() => res('keepalive'), keepaliveMs);
-        timer.unref?.();
-      });
-      const winner = await Promise.race([readPromise, timerPromise]);
+      const winner = isAtEventBoundary()
+        ? await new Promise<'keepalive' | ReadOutcome>((resolve) => {
+            clearKeepaliveTimer();
+            timer = setTimeout(() => resolve('keepalive'), keepaliveMs);
+            timer.unref?.();
+            void readPromise.then(resolve);
+          })
+        : await readPromise;
       clearKeepaliveTimer();
       if (closed) return;
       if (winner === 'keepalive') {
@@ -96,6 +128,7 @@ export function wrapSseKeepaliveStream(
         controller.close();
         return;
       }
+      advanceBoundaryState(winner.res.value);
       controller.enqueue(winner.res.value);
     },
     cancel(reason) {
@@ -399,6 +432,8 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
       if (!responseHeaders.has('cache-control')) {
         responseHeaders.set('cache-control', 'no-cache, no-transform');
       }
+      // Keepalive comments are inserted into the SSE stream; remove fixed Content-Length.
+      responseHeaders.delete('content-length');
     }
 
     const responseBody = sse ? wrapSseKeepaliveStream(started.body) : started.body;

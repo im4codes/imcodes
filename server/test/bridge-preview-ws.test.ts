@@ -683,5 +683,63 @@ describe('WsBridge preview WS tunnels', () => {
       vi.advanceTimersByTime(PREVIEW_LIMITS.WS_KEEPALIVE_MS * 3);
       expect(ping).toHaveBeenCalledTimes(frozen);
     });
+
+    it('bounds an unsettled upgrading completeUpgrade with WS_OPEN_TIMEOUT_MS and handles abnormal close code 1006 safely', async () => {
+      vi.useFakeTimers();
+      const { bridge, daemon } = await setupBridge();
+
+      // 1) completeUpgrade never settles (e.g. ws.handleUpgrade declined silently) -> deadline frees slot & closes upstream.
+      const wsId1 = '7'.repeat(32);
+      const lateWs = Object.assign(new MockWs(), { terminate: vi.fn(function (this: MockWs) { this.closed = true; this.readyState = 3; }) });
+      let resolveLate!: (ws: MockWs | null) => void;
+      bridge.beginPreviewWsTunnel({
+        wsId: wsId1, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: [],
+        completeUpgrade: () => new Promise((resolve) => { resolveLate = (ws) => resolve(ws as never); }),
+      });
+      daemon.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.WS_OPENED, wsId: wsId1 })), false);
+      await flushAsync();
+      expect(bridge.getServerWsCount()).toBe(1);
+
+      vi.advanceTimersByTime(PREVIEW_LIMITS.WS_OPEN_TIMEOUT_MS + 10);
+      await flushAsync();
+      expect(bridge.getServerWsCount()).toBe(0);
+      expect(daemon.sentStrings.some((s) => s.includes(PREVIEW_MSG.WS_CLOSE) && s.includes(wsId1))).toBe(true);
+      // Late settlement after timeout must not adopt an orphaned socket.
+      resolveLate(lateWs);
+      await flushAsync();
+      expect(lateWs.closed).toBe(true);
+      expect(bridge.getServerWsCount()).toBe(0);
+
+      // 2) Abnormal close code 1006 (un-sendable over WS close frame) terminates without throwing RangeError.
+      const terminateSpy = vi.fn();
+      const realLikeSocket = Object.assign(new MockWs(), {
+        close: (code?: number) => {
+          if (code === 1006) throw new RangeError('Invalid WebSocket frame: invalid status code 1006');
+          realLikeSocket.closed = true;
+          realLikeSocket.readyState = 3;
+        },
+        terminate: () => {
+          terminateSpy();
+          realLikeSocket.closed = true;
+          realLikeSocket.readyState = 3;
+        },
+      });
+      const wsId2 = '8'.repeat(32);
+      let resolve2!: (ws: MockWs | null) => void;
+      bridge.beginPreviewWsTunnel({
+        wsId: wsId2, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: [],
+        completeUpgrade: () => new Promise((resolve) => { resolve2 = (ws) => resolve(ws as never); }),
+      });
+      daemon.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.WS_OPENED, wsId: wsId2 })), false);
+      daemon.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.WS_CLOSE, wsId: wsId2, code: 1006, reason: '' })), false);
+      await flushAsync();
+      resolve2(realLikeSocket);
+      await flushAsync();
+      expect(terminateSpy).toHaveBeenCalledTimes(1);
+      expect(realLikeSocket.closed).toBe(true);
+      expect(bridge.getServerWsCount()).toBe(0);
+    });
   });
 });

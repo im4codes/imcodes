@@ -195,6 +195,27 @@ describe('WebSocket constructor patch — URL rewriting', () => {
     const relPrefixed = `${PREFIX}/ws?room=1`;
     expect(getLastSocket(relPrefixed).url).toBe(`wss://im.codes${PREFIX}/ws?room=1&preview_access_token=tok-abc`);
   });
+
+  it('resolves dot-segment and nested relative WS URLs against the logical page path (never escaping PREFIX)', () => {
+    // At preview root / : ../ws must stay at PREFIX/ws (not walk out of previewId).
+    Object.defineProperty(window, 'location', {
+      writable: true,
+      value: { protocol: 'https:', host: 'im.codes', origin: 'https://im.codes', href: `https://im.codes${PREFIX}/`, pathname: `${PREFIX}/` },
+    });
+    installPatch();
+    expect(getLastSocket('../ws').url).toBe(`wss://im.codes${PREFIX}/ws?preview_access_token=tok-abc`);
+    expect(getLastSocket('/../ws').url).toBe(`wss://im.codes${PREFIX}/ws?preview_access_token=tok-abc`);
+    expect(getLastSocket('/a/../ws?k=1').url).toBe(`wss://im.codes${PREFIX}/ws?k=1&preview_access_token=tok-abc`);
+
+    // Nested logical page /app/sub/index.html : ../ws resolves to /app/ws under PREFIX.
+    Object.defineProperty(window, 'location', {
+      writable: true,
+      value: { protocol: 'https:', host: 'im.codes', origin: 'https://im.codes', href: `https://im.codes${PREFIX}/app/sub/index.html`, pathname: `${PREFIX}/app/sub/index.html` },
+    });
+    installPatch();
+    expect(getLastSocket('../ws').url).toBe(`wss://im.codes${PREFIX}/app/ws?preview_access_token=tok-abc`);
+    expect(getLastSocket('./live').url).toBe(`wss://im.codes${PREFIX}/app/sub/live?preview_access_token=tok-abc`);
+  });
 });
 
 describe('WebSocket constructor patch — protocols argument', () => {

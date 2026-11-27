@@ -453,11 +453,13 @@ describe('local web preview routes', () => {
     expect(await sseRes.text()).toBe('id: 43\ndata: ok\n\n');
     expect(recordedRequests[0]?.headers).toMatchObject({ 'last-event-id': '42' });
 
-    // When upstream explicitly sets Cache-Control / X-Accel-Buffering, preserve them without overwriting.
+    // When upstream explicitly sets Cache-Control / X-Accel-Buffering, preserve them without overwriting,
+    // and strip fixed Content-Length since wrapped SSE may insert `: keepalive\n\n` comments.
     mockRespHeaders = {
       'content-type': 'text/event-stream',
       'cache-control': 'private, no-cache',
       'x-accel-buffering': 'yes',
+      'content-length': '19',
     };
     const ssePreserved = await app.request(
       `/api/server/${serverId}/local-web/${created.preview.id}/events?${PREVIEW_ACCESS_TOKEN_QUERY_PARAM}=${created.preview.accessToken}`,
@@ -466,5 +468,7 @@ describe('local web preview routes', () => {
     expect(ssePreserved.status).toBe(200);
     expect(ssePreserved.headers.get('cache-control')).toBe('private, no-cache');
     expect(ssePreserved.headers.get('x-accel-buffering')).toBe('yes');
+    expect(ssePreserved.headers.get('content-length')).toBeNull();
+    expect(await ssePreserved.text()).toBe('id: 43\ndata: ok\n\n');
   });
 });

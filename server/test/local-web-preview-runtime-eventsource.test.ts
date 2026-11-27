@@ -361,4 +361,27 @@ describe('local web preview runtime — EventSource patch (behavioral)', () => {
     new WSClass(`ws://127.0.0.1:${PREVIEW_PORT + 1}/ws`);
     expect(lastWsUrl()).toBe(`ws://127.0.0.1:${PREVIEW_PORT + 1}/ws`);
   });
+
+  it('resolves ../events, ../ws, root dot-paths, and nested relative paths against the logical page path', () => {
+    const root = runPatchedRuntime({ accessToken: 'tok123', locationHref: `https://im.codes${PREFIX}/` });
+    new root.ESClass('../events');
+    expect(root.lastES()!.url).toBe(`${PREFIX}/events?preview_access_token=tok123`);
+    new root.ESClass('/../events');
+    expect(root.lastES()!.url).toBe(`${PREFIX}/events?preview_access_token=tok123`);
+    new root.ESClass('/a/../events?x=1');
+    expect(root.lastES()!.url).toBe(`${PREFIX}/events?x=1&preview_access_token=tok123`);
+    new root.WSClass('../ws');
+    expect(root.lastWsUrl()).toBe(`wss://im.codes${PREFIX}/ws?preview_access_token=tok123`);
+    new root.WSClass('/a/../ws');
+    expect(root.lastWsUrl()).toBe(`wss://im.codes${PREFIX}/ws?preview_access_token=tok123`);
+
+    const nested = runPatchedRuntime({ locationHref: `https://im.codes${PREFIX}/app/sub/page.html` });
+    new nested.ESClass('../events');
+    expect(nested.lastES()!.url).toBe(`${PREFIX}/app/events`);
+    new nested.WSClass('../ws');
+    expect(nested.lastWsUrl()).toBe(`wss://im.codes${PREFIX}/app/ws`);
+    // Plain bare-relative without dots/token stays intact as document-relative under <base href>.
+    new nested.ESClass('events');
+    expect(nested.lastES()!.url).toBe('events');
+  });
 });
