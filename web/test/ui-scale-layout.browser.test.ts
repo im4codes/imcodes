@@ -1549,7 +1549,7 @@ Gtk.main()
     }
   }, 60_000);
 
-  it('keeps SessionTabs top-left corner badges zero-growth and unclipped at left scroll edge, narrow viewports, and two-digit labels in real Chromium', { timeout: 45000 }, async () => {
+  it('keeps SessionTabs top-left corner badges zero-growth and unclipped at left scroll edge, narrow viewports, and two-digit labels in real Chromium', { timeout: 60000 }, async () => {
     const require = createRequire(import.meta.url);
     const { chromium } = require('playwright') as typeof import('playwright');
     const executablePath = resolveChromiumExecutable(chromium);
@@ -1566,16 +1566,19 @@ Gtk.main()
         contents: `
           import { render } from 'preact';
           import { SessionTabs } from ${JSON.stringify(sessionTabsPath)};
+          import * as uiScale from ${JSON.stringify(resolve(here, '../src/ui-scale.ts'))};
+          window.__uiScale = uiScale;
 
-          window.__mountTabs = (activeName) => {
+          window.__mountTabs = (activeName, alertNames = [], customSessions = null) => {
             const mount = document.getElementById('tabs-mount');
-            const sessions = Array.from({ length: 18 }, (_, i) => ({
+            const sessions = customSessions || Array.from({ length: 18 }, (_, i) => ({
               name: \`sess_\${i + 1}\`,
               project: \`proj-\${i + 1}\`,
               label: i === 9 ? 'tenth-tab' : \`tab-\${i + 1}\`,
-              role: i === 0 ? 'brain' : \`w\${i}\`,
+              role: i === 0 ? 'brain' : (i === 1 ? 'brain' : (i === 3 ? 'brain' : \`w\${i}\`)),
               agentType: i === 0 ? 'claude-code-sdk' : 'codex-sdk',
               state: 'idle',
+              incognito: i === 1,
             }));
             render(
               <SessionTabs
@@ -1590,6 +1593,7 @@ Gtk.main()
                 sessionsLoaded={true}
                 pinned={new Set(['sess_1'])}
                 setPinnedArr={() => {}}
+                idleAlerts={new Set(alertNames)}
               />,
               mount,
             );
@@ -1624,12 +1628,14 @@ Gtk.main()
 
     const browser = await chromium.launch({ headless: true, executablePath });
     try {
-      const viewports = [
+      const scaleViewports = [
+        { width: 375, height: 667, mobile: true },
+        { width: 390, height: 844, mobile: true },
         { width: 1280, height: 800, mobile: false },
-        { width: 460, height: 700, mobile: false },
-        { width: 360, height: 780, mobile: true },
       ];
-      for (const vp of viewports) {
+      const scaleFactors = [60, 80, 100, 125, 150];
+
+      for (const vp of scaleViewports) {
         const page = await browser.newPage({ viewport: { width: vp.width, height: vp.height } });
         await page.route('https://imcodes.test/**', (route) => route.fulfill({ contentType: 'text/html', body: html }));
         await page.goto('https://imcodes.test/');
@@ -1640,6 +1646,69 @@ Gtk.main()
           (window as unknown as { __mountTabs: (name: string) => void }).__mountTabs('sess_10');
         }, vp.mobile);
         await page.waitForSelector('.tab-bar .tab .session-tab-seq');
+
+        // Check corner badges across 60%, 80%, 100%, 125%, 150% scales (15 combinations total across 375, 390, 1280 viewports)
+        for (const scalePct of scaleFactors) {
+          await page.evaluate((s) => {
+            (window as unknown as { __uiScale: { writeUiScale: (v: number) => void } }).__uiScale.writeUiScale(s);
+          }, scalePct);
+
+          const badgeChecks = await page.evaluate(() => {
+            const bar = document.querySelector('.tab-bar') as HTMLElement;
+            const tabs = [...bar.querySelectorAll<HTMLElement>('.tab')];
+            const isNonTransparentBorder = (style: CSSStyleDeclaration) => {
+              const topColor = style.borderTopColor;
+              const topWidth = parseFloat(style.borderTopWidth);
+              const leftWidth = parseFloat(style.borderLeftWidth);
+              const rightWidth = parseFloat(style.borderRightWidth);
+              return topWidth >= 0.5 && leftWidth >= 0.5 && rightWidth >= 0.5 && topColor !== 'transparent' && !topColor.includes('rgba(0, 0, 0, 0)');
+            };
+
+            return tabs.map((tab, idx) => {
+              const tabRect = tab.getBoundingClientRect();
+              const badgeGroup = tab.querySelector('.tab-top-left-badges') as HTMLElement;
+              const seq = tab.querySelector('.session-tab-seq') as HTMLElement;
+              const agent = tab.querySelector('.agent-badge') as HTMLElement;
+
+              if (!badgeGroup || !seq || !agent) {
+                return { idx, found: false };
+              }
+
+              const groupRect = badgeGroup.getBoundingClientRect();
+              const seqRect = seq.getBoundingClientRect();
+              const agentRect = agent.getBoundingClientRect();
+              const tabStyle = window.getComputedStyle(tab);
+
+              const borderOk = isNonTransparentBorder(tabStyle);
+              const noOverlap = seqRect.right <= agentRect.left + 0.5;
+              const hasDimensions = seqRect.width > 0 && seqRect.height > 0 && agentRect.width > 0 && agentRect.height > 0;
+              const insideTab = groupRect.left >= tabRect.left - 0.5 && groupRect.top >= tabRect.top - 4.5 && groupRect.right <= tabRect.right + 0.5;
+
+              return {
+                idx,
+                found: true,
+                borderOk,
+                noOverlap,
+                hasDimensions,
+                insideTab,
+              };
+            });
+          });
+
+          expect(badgeChecks).toHaveLength(18);
+          for (const c of badgeChecks) {
+            expect(c.found, `vp ${vp.width} scale ${scalePct}% tab ${c.idx} found`).toBe(true);
+            expect(c.hasDimensions, `vp ${vp.width} scale ${scalePct}% tab ${c.idx} dimensions`).toBe(true);
+            expect(c.noOverlap, `vp ${vp.width} scale ${scalePct}% tab ${c.idx} noOverlap`).toBe(true);
+            expect(c.insideTab, `vp ${vp.width} scale ${scalePct}% tab ${c.idx} insideTab`).toBe(true);
+            expect(c.borderOk, `vp ${vp.width} scale ${scalePct}% tab ${c.idx} borderOk`).toBe(true);
+          }
+        }
+
+        // Reset scale to 100 for remaining checks
+        await page.evaluate(() => {
+          (window as unknown as { __uiScale: { writeUiScale: (v: number) => void } }).__uiScale.writeUiScale(100);
+        });
 
         // 1. Compare real rendered non-zero dimensions with corner badges visible vs hidden
         const dims = await page.evaluate(() => {
@@ -1737,12 +1806,134 @@ Gtk.main()
         expect(edgeCheck.tab2BorderOk).toBe(true);
         expect(edgeCheck.tab10BorderOk).toBe(true);
 
+        // 3. Causality test: verify alert pulse CSS animation preserves base borders at 0/500ms and pulses red at 250ms
+        if (!vp.mobile) {
+          await page.evaluate(() => {
+            (window as unknown as { __mountTabs: (active: string, alerts: string[]) => void }).__mountTabs('sess_1', ['sess_1', 'sess_2', 'sess_3', 'sess_4']);
+          });
+
+          const alertChecks1 = await page.evaluate(() => {
+            const sample = (selector: string) => {
+              const el = document.querySelector(selector) as HTMLElement;
+              if (!el) return null;
+              const anim = el.getAnimations().find((a) => (a as CSSAnimation).animationName?.includes('alert'));
+              if (!anim) return null;
+              anim.pause();
+              const times: Record<number, { color: string; style: string; width: string; isTransparent: boolean }> = {};
+              for (const ms of [0, 250, 500]) {
+                anim.currentTime = ms;
+                const s = window.getComputedStyle(el);
+                times[ms] = {
+                  color: s.borderTopColor,
+                  style: s.borderTopStyle,
+                  width: s.borderTopWidth,
+                  isTransparent: s.borderTopColor === 'transparent' || s.borderTopColor.includes('rgba(0, 0, 0, 0)'),
+                };
+              }
+              return times;
+            };
+
+            return {
+              regInactive: sample('.tab:not(.brain):not(.incognito):not(.active).alert'),
+              brainInactive: sample('.tab.brain:not(.incognito):not(.active).alert'),
+              brainIncognitoInactive: sample('.tab.brain.incognito:not(.active).alert'),
+              brainActive: sample('.tab.brain.active.alert'),
+            };
+          });
+
+          for (const item of [alertChecks1.regInactive, alertChecks1.brainInactive, alertChecks1.brainIncognitoInactive, alertChecks1.brainActive]) {
+            expect(item).not.toBeNull();
+            expect(item![0].isTransparent).toBe(false);
+            expect(parseFloat(item![0].width)).toBeGreaterThanOrEqual(1);
+            expect(item![500].isTransparent).toBe(false);
+            expect(parseFloat(item![500].width)).toBeGreaterThanOrEqual(1);
+            expect(item![250].color).toBe('rgb(239, 68, 68)');
+          }
+          expect(alertChecks1.brainIncognitoInactive![0].style).toBe('dashed');
+          expect(alertChecks1.brainIncognitoInactive![250].style).toBe('dashed');
+          expect(alertChecks1.brainIncognitoInactive![500].style).toBe('dashed');
+          // Brain active tab retains purple border at 0 and 500ms, not blue (#3b82f6)
+          expect(alertChecks1.brainActive![0].color).not.toBe('rgb(59, 130, 246)');
+          expect(alertChecks1.brainActive![500].color).not.toBe('rgb(59, 130, 246)');
+
+          // Check active regular tab and active brain incognito tab alerts
+          await page.evaluate(() => {
+            (window as unknown as { __mountTabs: (active: string, alerts: string[]) => void }).__mountTabs('sess_2', ['sess_2', 'sess_3']);
+          });
+
+          const alertChecks2 = await page.evaluate(() => {
+            const sample = (selector: string) => {
+              const el = document.querySelector(selector) as HTMLElement;
+              if (!el) return null;
+              const anim = el.getAnimations().find((a) => (a as CSSAnimation).animationName?.includes('alert'));
+              if (!anim) return null;
+              anim.pause();
+              const times: Record<number, { color: string; style: string; width: string; isTransparent: boolean }> = {};
+              for (const ms of [0, 250, 500]) {
+                anim.currentTime = ms;
+                const s = window.getComputedStyle(el);
+                times[ms] = {
+                  color: s.borderTopColor,
+                  style: s.borderTopStyle,
+                  width: s.borderTopWidth,
+                  isTransparent: s.borderTopColor === 'transparent' || s.borderTopColor.includes('rgba(0, 0, 0, 0)'),
+                };
+              }
+              return times;
+            };
+
+            return {
+              brainIncognitoActive: sample('.tab.brain.incognito.active.alert'),
+              regInactive: sample('.tab:not(.brain):not(.incognito):not(.active).alert'),
+            };
+          });
+
+          expect(alertChecks2.brainIncognitoActive).not.toBeNull();
+          expect(alertChecks2.brainIncognitoActive![0].isTransparent).toBe(false);
+          expect(alertChecks2.brainIncognitoActive![0].style).toBe('dashed');
+          expect(alertChecks2.brainIncognitoActive![0].color).not.toBe('rgb(59, 130, 246)');
+          expect(alertChecks2.brainIncognitoActive![250].color).toBe('rgb(239, 68, 68)');
+          expect(alertChecks2.brainIncognitoActive![250].style).toBe('dashed');
+          expect(alertChecks2.brainIncognitoActive![500].isTransparent).toBe(false);
+          expect(alertChecks2.brainIncognitoActive![500].style).toBe('dashed');
+          expect(alertChecks2.brainIncognitoActive![500].color).not.toBe('rgb(59, 130, 246)');
+
+          await page.evaluate(() => {
+            (window as unknown as { __mountTabs: (active: string, alerts: string[]) => void }).__mountTabs('sess_3', ['sess_3']);
+          });
+
+          const regActiveAlert = await page.evaluate(() => {
+            const el = document.querySelector('.tab:not(.brain):not(.incognito).active.alert') as HTMLElement;
+            if (!el) return null;
+            const anim = el.getAnimations().find((a) => (a as CSSAnimation).animationName?.includes('alert'));
+            if (!anim) return null;
+            anim.pause();
+            const times: Record<number, { color: string; style: string; width: string; isTransparent: boolean }> = {};
+            for (const ms of [0, 250, 500]) {
+              anim.currentTime = ms;
+              const s = window.getComputedStyle(el);
+              times[ms] = {
+                color: s.borderTopColor,
+                style: s.borderTopStyle,
+                width: s.borderTopWidth,
+                isTransparent: s.borderTopColor === 'transparent' || s.borderTopColor.includes('rgba(0, 0, 0, 0)'),
+              };
+            }
+            return times;
+          });
+
+          expect(regActiveAlert).not.toBeNull();
+          expect(regActiveAlert![0].isTransparent).toBe(false);
+          expect(regActiveAlert![250].color).toBe('rgb(239, 68, 68)');
+          expect(regActiveAlert![500].isTransparent).toBe(false);
+        }
+
         await page.close();
       }
     } finally {
       await browser.close();
     }
-  }, 45_000);
+  }, 60_000);
 
   it('keeps mobile top bar, server latency, chevron, and all tool buttons inside 320px and 375px viewports on web and android in real Chromium', { timeout: 45_000 }, async () => {
     const require = createRequire(import.meta.url);

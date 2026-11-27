@@ -704,6 +704,20 @@ describe('styles.css regression contracts', () => {
     expect(activeBrainRule![0]).toMatch(/border-bottom-width:\s*2px/);
   });
 
+  it('tab alert keyframes preserve base tab borders at 0% and 100% endpoints and pulse red at 50%', () => {
+    const tabAlertRule = css.match(/@keyframes tab-alert[^{]*\{[^\n]*\}/);
+    expect(tabAlertRule).not.toBeNull();
+    expect(tabAlertRule![0]).not.toMatch(/0%[^}]*border-color:\s*transparent/);
+    expect(tabAlertRule![0]).not.toMatch(/100%[^}]*border-color:\s*transparent/);
+    expect(tabAlertRule![0]).toMatch(/50%\s*\{[^}]*border-color:\s*#ef4444/);
+
+    const tabAlertActiveRule = css.match(/@keyframes tab-alert-active[^{]*\{[^\n]*\}/);
+    expect(tabAlertActiveRule).not.toBeNull();
+    expect(tabAlertActiveRule![0]).not.toMatch(/0%[^}]*border-color:\s*#3b82f6/);
+    expect(tabAlertActiveRule![0]).not.toMatch(/100%[^}]*border-color:\s*#3b82f6/);
+    expect(tabAlertActiveRule![0]).toMatch(/50%\s*\{[^}]*border-color:\s*#ef4444/);
+  });
+
   it('ctx live-status robot avatar stays legible without changing the compact footer layout', () => {
     const robotRule = css.match(/\.session-live-status-robot-avatar\s*\{[^}]*\}/);
     expect(robotRule).not.toBeNull();
