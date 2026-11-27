@@ -274,6 +274,18 @@ int main() {
            "Item");
     assert(strip_voice_hotword_hallucination("\xE2\x84\xA6, \xCE\xA9\xE3\x80\x82Value", std::vector<std::string>{"\xCF\x89"}) ==
            "Value");
+    // Unicode Final_Sigma contextual lowercasing without normalizer override:
+    // U+039F U+03A3 ("ΟΣ") lowercases to U+03BF U+03C2 ("ος") word-finally, matching "ος, ος".
+    assert(strip_voice_hotword_hallucination("\xCE\xBF\xCF\x82, \xCE\xBF\xCF\x82", std::vector<std::string>{"\xCE\x9F\xCE\xA3"}).empty());
+    assert(strip_voice_hotword_hallucination("\xCE\x9F\xCE\xA3, \xCE\xBF\xCF\x82\xE3\x80\x82\xE5\xBC\x80\xE5\xA7\x8B", std::vector<std::string>{"\xCE\x9F\xCE\xA3"}) ==
+           "\xE5\xBC\x80\xE5\xA7\x8B");
+    assert(strip_voice_hotword_hallucination("\xCE\x9F\xE2\x80\x99\xCE\xA3, \xCE\xBF\xE2\x80\x99\xCF\x82", std::vector<std::string>{"\xCE\xBF\xE2\x80\x99\xCF\x82"}).empty());
+    // Medial sigma ("σα") must still lowercase to medial U+03C3 rather than final U+03C2.
+    assert(strip_voice_hotword_hallucination("\xCF\x83\xCE\xB1, \xCF\x83\xCE\xB1", std::vector<std::string>{"\xCE\xA3\xCE\x91"}).empty());
+    assert(strip_voice_hotword_hallucination("\xCE\xBF\xCF\x82, \xCE\xBF\xCF\x83", std::vector<std::string>{"\xCE\x9F\xCE\xA3"}) ==
+           "\xCE\xBF\xCF\x82, \xCE\xBF\xCF\x83");
+    assert(strip_voice_hotword_hallucination("\xCE\xA3, \xCF\x83\xE3\x80\x82Next", std::vector<std::string>{"\xCE\xA3"}) ==
+           "Next");
   }
 
   // 5. Silence-edge trimming & prefix-shift alignment + >30s cross-segment hotword retention/retraction
@@ -448,6 +460,49 @@ int main() {
       }
     }
     assert(final_18b == "先看");
+  }
+
+  // 6. Fatal producer disconnect finalizes once and emits exactly one end event without external stop
+  {
+    std::vector<std::string> emitted_disconnect;
+    Qwen3Tokenizer empty_tok;
+    StreamingPipelineConfig cfg_disc;
+    cfg_disc.expect_language_header = false;
+    Qwen3StreamingPipeline p_disc(
+        cfg_disc,
+        empty_tok,
+        [&](const std::vector<float>&, const DecodeOptions&) -> DecodeResult {
+          DecodeResult r;
+          r.text = "disconnected-tail-text";
+          r.raw_tokens = {1, 2, 3};
+          return r;
+        },
+        [&](const imcodes::qwen3::TranscriptUpdate& upd) {
+          emit_transcript_update([&](const std::string& l) { emitted_disconnect.push_back(l); }, upd);
+        },
+        [&]() { emitted_disconnect.push_back("{\"type\":\"end\"}"); });
+
+    std::thread w_disc([&]() { p_disc.run_loop(); });
+    p_disc.push_samples(std::vector<float>(16000, 0.25f));
+    p_disc.request_stop(false, true);
+    w_disc.join();
+
+    int final_count = 0;
+    int end_count = 0;
+    std::string final_text;
+    for (const auto& l : emitted_disconnect) {
+      if (extract_json_bool_or_str(l, "isFinal") == "true") {
+        ++final_count;
+        final_text = extract_json_string_field(l, "text").value_or("");
+      }
+      if (extract_json_string_field(l, "type") == "end") {
+        ++end_count;
+      }
+    }
+    assert(final_count == 1);
+    assert(final_text == "disconnected-tail-text");
+    assert(end_count == 1);
+    assert(extract_json_string_field(emitted_disconnect.back(), "type") == "end");
   }
 
   std::printf("win speech pipeline tests passed\n");

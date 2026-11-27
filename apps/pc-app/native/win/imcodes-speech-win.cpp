@@ -545,14 +545,16 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
     std::vector<float> resampled_chunk;
     auto last_level_emit = std::chrono::steady_clock::now();
 
-    auto drain_wasapi_packets = [&]() {
+    auto drain_wasapi_packets = [&]() -> bool {
       UINT32 packet_len = 0;
-      while (SUCCEEDED(capture_client->GetNextPacketSize(&packet_len)) && packet_len > 0) {
+      HRESULT pkt_hr = S_OK;
+      while (SUCCEEDED(pkt_hr = capture_client->GetNextPacketSize(&packet_len)) && packet_len > 0) {
         BYTE* data = nullptr;
         UINT32 num_frames = 0;
         DWORD flags = 0;
-        if (FAILED(capture_client->GetBuffer(&data, &num_frames, &flags, nullptr, nullptr))) {
-          break;
+        HRESULT buf_hr = capture_client->GetBuffer(&data, &num_frames, &flags, nullptr, nullptr);
+        if (FAILED(buf_hr)) {
+          return false;
         }
         mono_chunk.clear();
         mono_chunk.reserve(num_frames);
@@ -625,21 +627,31 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
           }
         }
       }
+      return SUCCEEDED(pkt_hr);
     };
 
     HANDLE wait_handles[2] = {local_stop_event, capture_event};
-    while (!stop_requested_.load()) {
+    bool capture_error = false;
+    while (!stop_requested_.load() && !aborted_.load()) {
       DWORD wait_res = WaitForMultipleObjects(2, wait_handles, FALSE, 100);
       if (wait_res == WAIT_OBJECT_0) {
         break;
       }
-      drain_wasapi_packets();
+      if (!drain_wasapi_packets()) {
+        capture_error = true;
+        break;
+      }
     }
 
-    if (!aborted_.load()) {
-      drain_wasapi_packets();
+    if (capture_error && !stop_requested_.load() && !aborted_.load()) {
+      emit_error("audio_capture_failed", "mic", "WASAPI capture stream disconnected");
+      pipeline_.request_stop(false, true);
+    } else {
+      if (!aborted_.load()) {
+        drain_wasapi_packets();
+      }
+      pipeline_.mark_producer_finished();
     }
-    pipeline_.mark_producer_finished();
     if (decode_thread.joinable()) {
       decode_thread.join();
     }

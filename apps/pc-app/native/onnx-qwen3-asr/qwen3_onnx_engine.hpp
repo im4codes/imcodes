@@ -35,6 +35,11 @@ struct DecodeResult {
   std::vector<int64_t> raw_tokens;    // Complete non-EOS tokens (includes header in auto-detect mode)
   int generated_steps{0};
   int prefill_len{0};
+  int64_t mel_ms{0};
+  int64_t conv_ms{0};
+  int64_t enc_ms{0};
+  int64_t prefill_ms{0};
+  int64_t decode_loop_ms{0};
   bool cancelled{false};
   std::string error;
 };

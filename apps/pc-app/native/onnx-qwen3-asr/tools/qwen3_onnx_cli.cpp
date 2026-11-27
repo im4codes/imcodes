@@ -97,6 +97,7 @@ int main(int argc, char** argv) {
   std::string hotwords;
   std::string language;
   std::string provider = "auto";
+  int num_threads = 0;
   int max_new_tokens = 256;
   bool test_prefix = false;
   bool test_stream = false;
@@ -109,6 +110,7 @@ int main(int argc, char** argv) {
     else if (arg == "--hotwords" && i + 1 < argc) hotwords = argv[++i];
     else if (arg == "--language" && i + 1 < argc) language = argv[++i];
     else if (arg == "--provider" && i + 1 < argc) provider = argv[++i];
+    else if (arg == "--threads" && i + 1 < argc) num_threads = std::stoi(argv[++i]);
     else if (arg == "--max-new-tokens" && i + 1 < argc) max_new_tokens = std::stoi(argv[++i]);
     else if (arg == "--test-prefix") test_prefix = true;
     else if (arg == "--stream") test_stream = true;
@@ -118,7 +120,7 @@ int main(int argc, char** argv) {
   if (model_dir.empty() || (wav_path.empty() && !silence_test)) {
     std::cerr << "Usage: qwen3_onnx_cli --model-dir <dir> (--wav <16k.wav> | --silence) "
               << "[--hotwords \"a,b\"] [--language auto|zh|en] [--provider auto|cpu|directml|cuda] "
-              << "[--test-prefix] [--stream]\n";
+              << "[--threads N] [--test-prefix] [--stream]\n";
     return 2;
   }
 
@@ -126,6 +128,7 @@ int main(int argc, char** argv) {
   imcodes::qwen3::EngineConfig cfg;
   cfg.model_dir = model_dir;
   cfg.requested_provider = provider;
+  cfg.num_threads = num_threads;
 
   std::string err;
   const auto t0 = std::chrono::steady_clock::now();
@@ -168,7 +171,13 @@ int main(int argc, char** argv) {
                     << " prefix_len=" << dopts.prefix_tokens.size()
                     << " prefill=" << r.prefill_len
                     << " steps=" << r.generated_steps
-                    << " elapsed_ms=" << ms << "\n";
+                    << " elapsed_ms=" << ms
+                    << " (mel=" << r.mel_ms
+                    << " conv=" << r.conv_ms
+                    << " enc=" << r.enc_ms
+                    << " pre=" << r.prefill_ms
+                    << " loop=" << r.decode_loop_ms
+                    << " kv=" << engine.kv_physical_len() << ")\n";
           return r;
         },
         [](const imcodes::qwen3::TranscriptUpdate& upd) {
@@ -212,6 +221,12 @@ int main(int argc, char** argv) {
   std::cout << "Unprefixed: prefill=" << res.prefill_len
             << " steps=" << res.generated_steps
             << " elapsed_ms=" << ms
+            << " (mel=" << res.mel_ms
+            << " conv=" << res.conv_ms
+            << " enc=" << res.enc_ms
+            << " pre=" << res.prefill_ms
+            << " loop=" << res.decode_loop_ms
+            << " kv=" << engine.kv_physical_len() << ")"
             << " text=\"" << guarded << "\"\n";
 
   if (test_prefix && !res.raw_tokens.empty()) {

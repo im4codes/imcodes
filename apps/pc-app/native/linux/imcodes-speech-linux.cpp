@@ -52,6 +52,7 @@ constexpr int kPaContextTerminated = 6;
 constexpr int kPaStreamReady = 2;
 constexpr int kPaStreamFailed = 3;
 constexpr int kPaStreamTerminated = 4;
+constexpr int kPaStreamDontMove = 0x0200;
 constexpr int kPaStreamAdjustLatency = 0x2000;
 constexpr int kPaOperationRunning = 0;
 
@@ -581,7 +582,10 @@ class LinuxAudioSource {
   }
 
   bool open(const std::string& device_uid, std::string& out_error) {
-    interrupted_.store(false);
+    if (interrupted_.load()) {
+      out_error = "Audio capture aborted before open";
+      return false;
+    }
     if (device_uid.rfind("pulse:", 0) == 0) {
       const std::string pa_dev = device_uid.substr(6);
       if (open_pulse_async(pa_dev, out_error)) return true;
@@ -860,7 +864,9 @@ class LinuxAudioSource {
     const char* dev = (device_uid.empty() || device_uid == "auto" || device_uid == "default")
         ? nullptr
         : device_uid.c_str();
-    if (stream_connect_record(pa_stream_, dev, &attr, kPaStreamAdjustLatency, nullptr, nullptr) < 0) {
+    // Prevent PulseAudio/PipeWire from silently migrating the stream to another source/monitor on unplug.
+    if (stream_connect_record(
+            pa_stream_, dev, &attr, kPaStreamDontMove | kPaStreamAdjustLatency, nullptr, nullptr) < 0) {
       out_error = "Failed to connect PulseAudio capture stream to requested device";
       close();
       return false;
@@ -1070,9 +1076,20 @@ class LinuxAudioCapture : public ActiveServeSessionHandle {
   }
 
   void run_loop() {
+    if (aborted_.load() || stop_requested_.load()) {
+      emit_json_line("{\"type\":\"end\"}");
+      return;
+    }
     std::string audio_err;
     if (!audio_.open(device_uid_, audio_err)) {
-      emit_error("no_input_device", "mic", audio_err);
+      if (!aborted_.load()) {
+        emit_error("no_input_device", "mic", audio_err);
+      }
+      emit_json_line("{\"type\":\"end\"}");
+      return;
+    }
+    if (aborted_.load()) {
+      audio_.close();
       emit_json_line("{\"type\":\"end\"}");
       return;
     }
@@ -1089,9 +1106,11 @@ class LinuxAudioCapture : public ActiveServeSessionHandle {
     f32_buf.reserve(1600);
     last_level_emit_ = std::chrono::steady_clock::now();
 
+    bool capture_error = false;
     while (!stop_requested_.load() && !aborted_.load()) {
       const int frames = audio_.read_16k_mono(s16_buf);
       if (frames < 0) {
+        capture_error = true;
         break;
       }
       if (frames == 0) {
@@ -1100,13 +1119,18 @@ class LinuxAudioCapture : public ActiveServeSessionHandle {
       push_pcm16_slice(s16_buf, f32_buf);
     }
 
-    if (!aborted_.load()) {
-      audio_.drain_16k_mono(s16_buf);
-      push_pcm16_slice(s16_buf, f32_buf);
+    if (capture_error && !stop_requested_.load() && !aborted_.load()) {
+      emit_error("audio_capture_failed", "mic", "Audio input stream disconnected");
+      audio_.close();
+      pipeline_.request_stop(false, true);
+    } else {
+      if (!aborted_.load()) {
+        audio_.drain_16k_mono(s16_buf);
+        push_pcm16_slice(s16_buf, f32_buf);
+      }
+      audio_.close();
+      pipeline_.mark_producer_finished();
     }
-
-    audio_.close();
-    pipeline_.mark_producer_finished();
     if (decode_thread.joinable()) {
       decode_thread.join();
     }

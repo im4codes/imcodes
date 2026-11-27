@@ -3456,4 +3456,131 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     await winLowVoice.stopListening({ abort: true });
     await winLowVoice.dispose();
   });
+
+  it('preserves full-utterance finalization up to 44s inside the 45s finalize budget and recovers cleanly after mid-utterance capture disconnect', async () => {
+    vi.useFakeTimers();
+    try {
+      const weights = Buffer.from('linux-ctrl-weights');
+      const sha = createHash('sha256').update(weights).digest('hex');
+      const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+        '0.6b': {
+          choice: 'qwen3-0.6b',
+          variant: '0.6b',
+          repoId: 'csukuangfj2/test-ctrl-0.6b',
+          revision: 'ctrl1',
+          files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+        },
+        '1.7b': {
+          choice: 'qwen3-1.7b',
+          variant: '1.7b',
+          repoId: 'ilmina/test-ctrl-1.7b',
+          revision: 'ctrl17',
+          files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+        },
+      };
+
+      const dir = path.join(tempDir, 'ctrl-budget');
+      mkdirSync(path.join(dir, 'speech-models', '0.6b'), { recursive: true });
+      writeFileSync(path.join(dir, 'speech-models', '0.6b', 'encoder.int8.onnx'), weights);
+      writeFileSync(path.join(dir, 'speech-models', '0.6b', '.verified-ctrl1'), '');
+
+      const localEvents: PcAppVoiceEvent[] = [];
+      const remoteEvents: PcAppRemoteVoiceEvent[] = [];
+      const procs: Array<ReturnType<typeof createFakeChildProcess>> = [];
+
+      const voice = createPcAppVoiceController({
+        platform: 'linux',
+        arch: 'x64',
+        userDataDir: dir,
+        linuxSpeechHelperPath: '/opt/imcodes/imcodes-speech-linux',
+        useResidentMlxWorker: true,
+        isMainWebContents: () => true,
+        getCurrentTrustedOrigin: () => 'https://app.im.codes',
+        getActiveOrigin: () => 'https://app.im.codes',
+        getTrustedOrigins: () => new Set(['https://app.im.codes']),
+        getSenderUrl: () => 'https://app.im.codes/',
+        sendToRenderer: (_ch, ev) => localEvents.push(ev),
+        manifests,
+        runHelperAsync: async (_bin, args) => {
+          if (args[0] === 'probe') {
+            return JSON.stringify({
+              ok: true,
+              gpuName: 'NVIDIA A100-SXM4-80GB',
+              vramMb: 81151,
+              adapterIndex: 0,
+              provider: 'cuda',
+              cudaEligible: true,
+              localAsrSupported: true,
+            });
+          }
+          return '[]';
+        },
+        spawnHelper: () => {
+          const proc = createFakeChildProcess();
+          procs.push(proc);
+          return proc as unknown as ChildProcess;
+        },
+      });
+      voice.subscribeRemoteEvents((ev) => remoteEvents.push(ev));
+
+      // A. Remote serve session finalizing at 44s (inside 45s QWEN_LOCAL_FINALIZE_TIMEOUT_MS): must NOT abort/drop
+      expect(await voice.startRemoteSession({ sessionId: 'rem-44s', locale: 'zh-CN' })).toEqual({ ok: true });
+      expect(procs).toHaveLength(1);
+      procs[0]!.stdout.emit('data', '{"type":"ready","variant":"0.6b","provider":"cuda"}\n{"type":"start"}\n');
+      expect(voice.pushRemotePcm({ sessionId: 'rem-44s', pcmBase64: Buffer.alloc(640).toString('base64') })).toEqual({ ok: true });
+
+      const stopRemoteP = voice.stopRemoteSession({ sessionId: 'rem-44s' });
+      await vi.advanceTimersByTimeAsync(44_000);
+      expect(procs[0]!.kill).not.toHaveBeenCalled();
+      expect(procs[0]!.stdin.write).not.toHaveBeenCalledWith('{"cmd":"abort"}\n');
+
+      procs[0]!.stdout.emit('data', '{"type":"result","text":"完整无前缀长句终解","isFinal":true}\n{"type":"end"}\n');
+      expect(await stopRemoteP).toEqual({ ok: true });
+      expect(remoteEvents).toContainEqual({
+        type: 'voice.session.result',
+        sessionId: 'rem-44s',
+        text: '完整无前缀长句终解',
+        isFinal: true,
+      });
+      expect(remoteEvents).toContainEqual({ type: 'voice.session.end', sessionId: 'rem-44s' });
+      expect(remoteEvents.some((e) => e.type === 'voice.session.error')).toBe(false);
+
+      // B. Local serve session finalizing at 44s on the SAME resident worker: no abort/drop
+      localEvents.length = 0;
+      expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+      expect(procs).toHaveLength(1);
+      procs[0]!.stdout.emit('data', '{"type":"start"}\n');
+      const stopLocalP = voice.stopListening({ abort: false });
+      await vi.advanceTimersByTimeAsync(44_000);
+      expect(procs[0]!.kill).not.toHaveBeenCalled();
+      procs[0]!.stdout.emit('data', '{"type":"result","text":"本地长句终解","isFinal":true}\n{"type":"end"}\n');
+      await stopLocalP;
+      expect(localEvents).toContainEqual({ type: 'result', text: '本地长句终解', isFinal: true });
+      expect(localEvents).toContainEqual({ type: 'end' });
+
+      // C. Mid-utterance mic disconnect (error + tail final + single end without stop) keeps worker reusable
+      localEvents.length = 0;
+      expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+      procs[0]!.stdout.emit(
+        'data',
+        '{"type":"start"}\n{"type":"error","code":"audio_capture_failed","stage":"mic","message":"Audio input stream disconnected"}\n{"type":"result","text":"断流前语音","isFinal":true}\n{"type":"end"}\n',
+      );
+      expect(localEvents).toContainEqual(expect.objectContaining({ type: 'error', code: 'audio_capture_failed' }));
+      expect(localEvents).toContainEqual({ type: 'result', text: '断流前语音', isFinal: true });
+      expect(localEvents.filter((e) => e.type === 'end')).toHaveLength(1);
+
+      localEvents.length = 0;
+      expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+      expect(procs).toHaveLength(1);
+      procs[0]!.stdout.emit('data', '{"type":"start"}\n');
+      const stopNextP = voice.stopListening({ abort: false });
+      procs[0]!.stdout.emit('data', '{"type":"result","text":"恢复后下一句","isFinal":true}\n{"type":"end"}\n');
+      await stopNextP;
+      expect(localEvents).toContainEqual({ type: 'result', text: '恢复后下一句', isFinal: true });
+
+      await voice.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

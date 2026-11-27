@@ -468,7 +468,9 @@ bool Qwen3OnnxEngine::init(const EngineConfig& config, std::string& out_error) {
       };
 
       const bool is_gpu = (provider != "cpu");
-      const int threads = is_gpu ? 2 : cpu_threads;
+      // CPU fallback ops inside hybrid quantized graphs (e.g. DynamicQuantizeLinear/MatMulInteger)
+      // also rely on intra-op threads; avoid throttling them down to 2 threads.
+      const int threads = cpu_threads;
 
       Ort::SessionOptions conv_opts = make_opts(threads);
       Ort::SessionOptions enc_opts = make_opts(threads);
@@ -584,8 +586,11 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
   }
 
   try {
+    const auto ts_0 = std::chrono::steady_clock::now();
     // 1. Acoustic features: centered STFT 128-bin Whisper log-Mel [feat_frames, 128]
     MelSpectrogram mel = mel_extractor_.extract(samples_16k);
+    const auto ts_mel = std::chrono::steady_clock::now();
+    result.mel_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ts_mel - ts_0).count();
     if (mel.num_frames <= 0) {
       return result;
     }
@@ -602,6 +607,8 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     const char* conv_out_names[] = {ort_->conv_out_names[0].c_str()};
     auto conv_outs = ort_->conv_sess->Run(
         Ort::RunOptions{nullptr}, conv_in_names, &conv_in, 1, conv_out_names, 1);
+    const auto ts_conv = std::chrono::steady_clock::now();
+    result.conv_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ts_conv - ts_mel).count();
 
     auto conv_shape = conv_outs[0].GetTensorTypeAndShapeInfo().GetShape();
     if (conv_shape.size() != 3 || conv_shape[1] <= 0) {
@@ -633,8 +640,11 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     const char* enc_in_names[] = {ort_->enc_in_names[0].c_str(), ort_->enc_in_names[1].c_str()};
     const char* enc_out_names[] = {ort_->enc_out_names[0].c_str()};
     std::array<Ort::Value, 2> enc_inputs = {std::move(conv_outs[0]), std::move(feat_mask_tensor)};
+    const auto ts_enc_0 = std::chrono::steady_clock::now();
     auto enc_outs = ort_->encoder_sess->Run(
         Ort::RunOptions{nullptr}, enc_in_names, enc_inputs.data(), enc_inputs.size(), enc_out_names, 1);
+    const auto ts_enc_1 = std::chrono::steady_clock::now();
+    result.enc_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ts_enc_1 - ts_enc_0).count();
 
     auto enc_ti = enc_outs[0].GetTensorTypeAndShapeInfo();
     const auto enc_dtype = enc_ti.GetElementType();
@@ -772,6 +782,7 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
         ort_->mem_info, prefill_pos.data(), prefill_pos.size(), prefill_pos_shape.data(), prefill_pos_shape.size()));
     build_kv_views(prefill_inputs);
 
+    const auto ts_pre_0 = std::chrono::steady_clock::now();
     auto prefill_outs = ort_->decoder_sess->Run(
         Ort::RunOptions{nullptr},
         dec_in_names.data(),
@@ -779,6 +790,8 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
         prefill_inputs.size(),
         dec_out_names.data(),
         dec_out_names.size());
+    const auto ts_pre_1 = std::chrono::steady_clock::now();
+    result.prefill_ms = std::chrono::duration_cast<std::chrono::milliseconds>(ts_pre_1 - ts_pre_0).count();
 
     copy_deltas(prefill_outs, 0, context_len);
 
@@ -813,12 +826,16 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
     }
 
     // 6. Autoregressive KV-cache decode loop
+    const auto ts_loop_0 = std::chrono::steady_clock::now();
     int64_t cur_pos = context_len;
     while (!is_stop_token(next_token) &&
            static_cast<int64_t>(generated_tokens.size()) < max_steps &&
            cur_pos < effective_max_total_len_) {
       if (opts.should_cancel && opts.should_cancel()) {
         result.cancelled = true;
+        result.decode_loop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - ts_loop_0)
+                                    .count();
         return result;
       }
 
@@ -865,6 +882,9 @@ DecodeResult Qwen3OnnxEngine::decode(const std::vector<float>& samples_16k, cons
 
       next_token = argmax_logits_row(step_outs[0], 0, vocab_size_, ort_->logits_elem_type);
     }
+    result.decode_loop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - ts_loop_0)
+                                .count();
 
     // Assemble complete non-EOS raw_tokens (prefix + generated) for rollback continuation,
     // while visible text drops uncompletable trailing UTF-8 bytes without leaking U+FFFD.

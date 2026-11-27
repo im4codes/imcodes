@@ -1,4 +1,5 @@
 #include "text_guards.hpp"
+#include "qwen3_unicode_nfkc_data.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -13,7 +14,6 @@
 #include <CoreFoundation/CoreFoundation.h>
 #else
 #include "qwen3_unicode_data.hpp"
-#include "qwen3_unicode_nfkc_data.hpp"
 #endif
 
 #include <algorithm>
@@ -350,6 +350,63 @@ inline HotwordNfkcNormalizerFn& hotword_nfkc_normalizer_override() {
   return fn;
 }
 
+inline bool in_unicode_cp_ranges(
+    const unicode_detail::CodepointRange* arr,
+    size_t n,
+    uint32_t key) {
+  size_t lo = 0;
+  size_t hi = n;
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (key < arr[mid].start) {
+      hi = mid;
+    } else if (key > arr[mid].end) {
+      lo = mid + 1;
+    } else {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool is_unicode_cased_cp(uint32_t cp) {
+  constexpr size_t kCount = sizeof(unicode_detail::kCasedRanges) / sizeof(unicode_detail::kCasedRanges[0]);
+  return in_unicode_cp_ranges(unicode_detail::kCasedRanges, kCount, cp);
+}
+
+inline bool is_unicode_case_ignorable_only_cp(uint32_t cp) {
+  constexpr size_t kCount =
+      sizeof(unicode_detail::kCaseIgnorableOnlyRanges) / sizeof(unicode_detail::kCaseIgnorableOnlyRanges[0]);
+  return in_unicode_cp_ranges(unicode_detail::kCaseIgnorableOnlyRanges, kCount, cp);
+}
+
+inline uint32_t resolve_sigma_lowercase_cp(const std::vector<uint32_t>& cps, size_t idx) {
+  bool preceded_by_cased = false;
+  for (size_t back = idx; back > 0; --back) {
+    const uint32_t prev = cps[back - 1];
+    if (is_unicode_cased_cp(prev)) {
+      preceded_by_cased = true;
+      break;
+    }
+    if (!is_unicode_case_ignorable_only_cp(prev)) {
+      break;
+    }
+  }
+  bool followed_by_cased = false;
+  for (size_t fwd = idx + 1; fwd < cps.size(); ++fwd) {
+    const uint32_t next = cps[fwd];
+    if (is_unicode_cased_cp(next)) {
+      followed_by_cased = true;
+      break;
+    }
+    if (!is_unicode_case_ignorable_only_cp(next)) {
+      break;
+    }
+  }
+  return (preceded_by_cased && !followed_by_cased) ? 0x03C2u : 0x03C3u;
+}
+
+// Lookup / decomposition helpers above support both whole-string and cluster-mapped normalization.
 std::string default_os_nfkc_lower_utf8(const std::string& input) {
   if (input.empty()) return {};
 #ifdef _WIN32
@@ -374,6 +431,42 @@ std::string default_os_nfkc_lower_utf8(const std::string& input) {
 
   std::wstring wlower = wnfkc;
   if (!wnfkc.empty()) {
+    bool has_sigma = false;
+    for (wchar_t ch : wnfkc) {
+      if (ch == 0x03A3) {
+        has_sigma = true;
+        break;
+      }
+    }
+    if (has_sigma) {
+      // Win32 LCMapStringEx(..., LCMAP_LOWERCASE) does not implement Unicode SpecialCasing Final_Sigma.
+      // Resolve Greek U+03A3 -> U+03C2 / U+03C3 from NFKC context before calling LCMapStringEx.
+      std::vector<uint32_t> cps;
+      std::vector<size_t> sigma_wnfkc_pos;
+      std::vector<size_t> sigma_cp_pos;
+      cps.reserve(wnfkc.size());
+      for (size_t i = 0; i < wnfkc.size(); ++i) {
+        const uint32_t w1 = static_cast<uint16_t>(wnfkc[i]);
+        if (w1 >= 0xD800u && w1 <= 0xDBFFu && i + 1 < wnfkc.size()) {
+          const uint32_t w2 = static_cast<uint16_t>(wnfkc[i + 1]);
+          if (w2 >= 0xDC00u && w2 <= 0xDFFFu) {
+            cps.push_back(0x10000u + (((w1 - 0xD800u) << 10) | (w2 - 0xDC00u)));
+            ++i;
+            continue;
+          }
+        }
+        if (w1 == 0x03A3u) {
+          sigma_wnfkc_pos.push_back(i);
+          sigma_cp_pos.push_back(cps.size());
+        }
+        cps.push_back(w1);
+      }
+      for (size_t k = 0; k < sigma_cp_pos.size(); ++k) {
+        wnfkc[sigma_wnfkc_pos[k]] =
+            static_cast<wchar_t>(resolve_sigma_lowercase_cp(cps, sigma_cp_pos[k]));
+      }
+      wlower = wnfkc;
+    }
     const int lclen = LCMapStringEx(
         LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, wnfkc.data(), static_cast<int>(wnfkc.size()), nullptr, 0, nullptr, nullptr, 0);
     if (lclen > 0) {
@@ -538,7 +631,12 @@ std::string default_os_nfkc_lower_utf8(const std::string& input) {
   std::vector<uint32_t> lowered;
   lowered.reserve(composed.size());
   constexpr size_t kLowerCount = sizeof(unicode_detail::kLowerTable) / sizeof(unicode_detail::kLowerTable[0]);
-  for (uint32_t cp : composed) {
+  for (size_t idx = 0; idx < composed.size(); ++idx) {
+    const uint32_t cp = composed[idx];
+    if (cp == 0x03A3u) {
+      lowered.push_back(resolve_sigma_lowercase_cp(composed, idx));
+      continue;
+    }
     auto it = std::lower_bound(
         unicode_detail::kLowerTable,
         unicode_detail::kLowerTable + kLowerCount,
@@ -664,6 +762,8 @@ struct NormalizedClusterMap {
 
 NormalizedClusterMap build_normalized_cluster_map(const std::string& text) {
   NormalizedClusterMap map;
+  std::vector<uint8_t> from_upper_sigma;
+  bool any_upper_sigma = false;
   size_t i = 0;
   const size_t bytes = text.size();
   while (i < bytes) {
@@ -671,11 +771,14 @@ NormalizedClusterMap build_normalized_cluster_map(const std::string& text) {
     const size_t raw_end = advance_next_grapheme_cluster(text, i);
     i = raw_end;
     const std::string raw_cluster = text.substr(raw_start, raw_end - raw_start);
+    const bool has_upper_sigma = raw_cluster.find("\xCE\xA3") != std::string::npos;
+    if (has_upper_sigma) any_upper_sigma = true;
     const std::vector<uint32_t> norm_cps = normalize_hotword_utf8_to_cps(raw_cluster);
     if (norm_cps.empty()) continue;
     const size_t c_start = map.cps.size();
     for (uint32_t norm_cp : norm_cps) {
       map.cps.push_back(norm_cp);
+      from_upper_sigma.push_back((has_upper_sigma && (norm_cp == 0x03C3u || norm_cp == 0x03C2u)) ? 1 : 0);
       map.norm_to_raw_byte.push_back(raw_start);
       map.cluster_start.push_back(c_start);
       map.is_sep.push_back(is_hotword_sep_cp(norm_cp) ? 1 : 0);
@@ -683,6 +786,12 @@ NormalizedClusterMap build_normalized_cluster_map(const std::string& text) {
       map.is_weak_sep.push_back(is_hotword_weak_trailing_sep_cp(norm_cp) ? 1 : 0);
       map.is_intra_punct.push_back(is_hotword_intra_word_punct_cp(norm_cp) ? 1 : 0);
       map.is_ascii_alnum.push_back(is_hotword_ascii_alnum_cp(norm_cp) ? 1 : 0);
+    }
+  }
+  if (any_upper_sigma && !hotword_nfkc_normalizer_override()) {
+    for (size_t idx = 0; idx < map.cps.size(); ++idx) {
+      if (from_upper_sigma[idx] == 0) continue;
+      map.cps[idx] = resolve_sigma_lowercase_cp(map.cps, idx);
     }
   }
   map.norm_to_raw_byte.push_back(bytes);
