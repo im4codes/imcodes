@@ -615,8 +615,11 @@ int main() {
     };
 
     Qwen3Tokenizer empty_tok;
-    // Construct 4000-sample (0.25s @ 16kHz) non-zero PCM16 base64 chunk: 8000 bytes -> base64
-    const std::string prefill_b64 = std::string(10668, 'A');  // 8001 bytes -> 8000 bytes aligned zero PCM
+    // Construct 4000-sample (~0.25s @ 16kHz) non-zero PCM16 base64 chunk:
+    // "EBAQ" encodes bytes [0x10, 0x10, 0x10]; 2667 copies = 8001 bytes -> 4000 non-zero samples (0x1010).
+    std::string prefill_b64;
+    prefill_b64.reserve(2667 * 4);
+    for (int i = 0; i < 2667; ++i) prefill_b64 += "EBAQ";
 
     // 7a: Blocked open interrupted by normal `stop` preserves prefill_pcm -> start + final + end, no no_input_device
     {
