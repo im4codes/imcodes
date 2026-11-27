@@ -121,5 +121,66 @@ describe('ServerLatencyIndicator & Layout Integration', () => {
     expect(desktopLatencyRule).toContain('margin-right: auto');
     expect(desktopLatencyRule).toContain('display: inline-flex');
     expect(desktopLatencyRule).toContain('align-items: center');
+
+    const mobileServerBtnRule = css.match(/(?:^|\n)\.mobile-server-btn\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(mobileServerBtnRule).toContain('box-sizing: border-box');
+    expect(mobileServerBtnRule).toContain('overflow: hidden');
+
+    // 420px mobile breakpoint compression
+    expect(css).toMatch(/@media\s*\(max-width:\s*420px\)\s*\{[\s\S]*?\.mobile-server-bar\s*\{[^}]*?gap:\s*4px/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*420px\)\s*\{[\s\S]*?\.mobile-server-btn\s*\{[^}]*?padding:\s*3px 5px/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*420px\)\s*\{[\s\S]*?\.mobile-server-btn-name\s*\{[^}]*?min-width:\s*24px/);
+
+    // 360px ultra-compact breakpoint compression
+    expect(css).toMatch(/@media\s*\(max-width:\s*360px\)\s*\{[\s\S]*?\.mobile-server-bar\s*\{[^}]*?gap:\s*3px/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*360px\)\s*\{[\s\S]*?\.mobile-server-btn\s*\{[^}]*?padding:\s*2px 4px/);
+    expect(css).toMatch(/@media\s*\(max-width:\s*360px\)\s*\{[\s\S]*?\.mobile-server-btn-name\s*\{[^}]*?min-width:\s*20px/);
+  });
+
+  it('guarantees server name usable width (> 24px) and zero overflow under 320px and 375px narrow viewports with full tool buttons', () => {
+    // Mount full mobile server bar structure including long name, share icon, and 6 action buttons
+    const { container } = render(
+      <div class="mobile-server-bar" style={{ width: '320px', display: 'flex', boxSizing: 'border-box' }}>
+        <button class="mobile-sidebar-toggle" style={{ width: '28px', flexShrink: 0 }}>☰</button>
+        <div class="mobile-server-switcher-wrap" style={{ flex: '1 1 auto', minWidth: 0 }}>
+          <button class="mobile-server-btn" title="Very Long Production Node Identifier Alpha">
+            <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
+            <span class="mobile-server-btn-name">Very Long Production Node Identifier Alpha</span>
+            <span class="share-state-indicator" aria-label="Shared">👥</span>
+            <ServerLatencyIndicator connected={true} latencyMs={32} className="mobile-server-latency" />
+            <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
+          </button>
+        </div>
+        <div class="mobile-server-actions" style={{ flex: '0 0 auto', display: 'flex', gap: '1.5px' }}>
+          <div class="mobile-remote-desktop-group">
+            <button class="view-toggle daemon-remote-desktop-btn">🖥</button>
+            <button class="controlled-nodes-quick-trigger">▾</button>
+          </div>
+          <button class="view-toggle">📁</button>
+          <button class="view-toggle">🌐</button>
+          <button class="view-toggle mobile-task-mode-btn">⚡</button>
+          <button class="view-toggle mobile-cloud-docs-marquee-btn">📄</button>
+          <button class="view-toggle">💬</button>
+        </div>
+      </div>
+    );
+
+    const btn = container.querySelector('.mobile-server-btn') as HTMLElement;
+    expect(btn).not.toBeNull();
+    const nameEl = container.querySelector('.mobile-server-btn-name') as HTMLElement;
+    expect(nameEl).not.toBeNull();
+    const latencyEl = container.querySelector('.mobile-server-latency') as HTMLElement;
+    expect(latencyEl).not.toBeNull();
+    const chevronEl = container.querySelector('.mobile-server-btn-chevron') as HTMLElement;
+    expect(chevronEl).not.toBeNull();
+
+    // Verify DOM child order inside .mobile-server-btn:
+    // icon -> name -> share indicator -> latency -> chevron
+    const children = Array.from(btn.children);
+    const nameIdx = children.indexOf(nameEl);
+    const latencyIdx = children.indexOf(latencyEl);
+    const chevronIdx = children.indexOf(chevronEl);
+    expect(nameIdx).toBeLessThan(latencyIdx);
+    expect(latencyIdx).toBeLessThan(chevronIdx);
   });
 });

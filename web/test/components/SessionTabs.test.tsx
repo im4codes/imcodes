@@ -1414,11 +1414,18 @@ describe('SessionTabs', () => {
     expect(cssText).toContain('@keyframes tab-busy-marquee');
     expect(cssText).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?\.tab\.busy::after\s*\{[\s\S]*?animation:\s*none;/);
 
-    // 3. Render test with short labels, active idle, inactive idle, and busy
+    // 2.1 .tab-pin is elevated to z-index: 4 and .tab.pinned.busy::after clears left: 12px so pin icon is never obscured
+    const pinRule = cssText.match(/(?:^|\n)\.tab-pin\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(pinRule).toContain('z-index: 4');
+    const pinnedBusyRule = cssText.match(/(?:^|\n)\.tab\.pinned\.busy::after\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(pinnedBusyRule).toContain('left: 12px');
+
+    // 3. Render test with short labels, active idle, inactive idle, busy, and pinned busy
     const sessions = makeSessions([
       { name: 'sess_short_active', label: 'cd', state: 'idle' },
       { name: 'sess_short_inactive', label: 'sh', state: 'idle' },
       { name: 'sess_busy', label: 'worker', state: 'running' },
+      { name: 'sess_pinned_busy', label: 'pinned_worker', state: 'running' },
     ]);
     const onSelect = vi.fn();
     render(
@@ -1430,31 +1437,40 @@ describe('SessionTabs', () => {
         onSelect={onSelect}
         sessionsLoaded={true}
         {...defaultProps}
+        pinned={new Set(['sess_pinned_busy'])}
       />,
     );
 
     const tabs = screen.getAllByRole('tab');
-    expect(tabs).toHaveLength(3);
+    expect(tabs).toHaveLength(4);
 
-    // Tab 1: Active + idle
+    // Tab 1: Pinned + busy -> pinned tabs sort to front, has both .pinned and .busy, plus .tab-pin icon
     expect(tabs[0].className).toContain('tab');
-    expect(tabs[0].className).toContain('active');
-    expect(tabs[0].className).toContain('idle');
-    expect(tabs[0].querySelector('.tab-ws-dot')).toBeNull();
+    expect(tabs[0].className).toContain('pinned');
+    expect(tabs[0].className).toContain('busy');
+    const pinEl = tabs[0].querySelector('.tab-pin');
+    expect(pinEl).not.toBeNull();
+    expect(pinEl?.textContent).toBe('📌');
 
-    // Tab 2: Inactive + idle (no green dot in DOM or CSS)
+    // Tab 2: Active + idle
     expect(tabs[1].className).toContain('tab');
-    expect(tabs[1].className).not.toContain('active');
+    expect(tabs[1].className).toContain('active');
     expect(tabs[1].className).toContain('idle');
     expect(tabs[1].querySelector('.tab-ws-dot')).toBeNull();
 
-    // Tab 3: Inactive + busy
+    // Tab 3: Inactive + idle (no green dot in DOM or CSS)
     expect(tabs[2].className).toContain('tab');
-    expect(tabs[2].className).toContain('busy');
+    expect(tabs[2].className).not.toContain('active');
+    expect(tabs[2].className).toContain('idle');
     expect(tabs[2].querySelector('.tab-ws-dot')).toBeNull();
 
+    // Tab 4: Inactive + busy
+    expect(tabs[3].className).toContain('tab');
+    expect(tabs[3].className).toContain('busy');
+    expect(tabs[3].querySelector('.tab-ws-dot')).toBeNull();
+
     // Clicking inactive tab selects it cleanly
-    fireEvent.click(tabs[1]);
+    fireEvent.click(tabs[2]);
     expect(onSelect).toHaveBeenCalledWith('sess_short_inactive');
   });
 });

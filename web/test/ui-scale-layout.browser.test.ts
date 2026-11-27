@@ -1612,7 +1612,7 @@ Gtk.main()
             buildCtx.onLoad({ filter: /.*/, namespace: 'tabs-stub' }, (args) => ({
               contents: args.path === 'react-i18next'
                 ? 'export const useTranslation = () => ({ t: (_k, d) => (typeof d === "string" ? d : _k) });'
-                : 'export const getUserPref = async () => null; export const saveUserPref = async () => {};',
+                : 'export const getUserPref = async () => null; export const saveUserPref = async () => {}; export const apiFetch = async () => ({}); export class ApiError extends Error {}; export const getApiBaseUrl = () => ""; export const getExpectedUserId = () => "";',
               loader: 'js',
             }));
           },

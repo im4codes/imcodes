@@ -16379,4 +16379,99 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     });
     expect(document.body.textContent).not.toContain('Server Port 4100');
   }, 20_000);
+
+  it('wires ServerLatencyIndicator into real App shell for desktop (with and without active session) and mobile', async () => {
+    // 1. Desktop: without active session -> .desktop-view-toggle first child is .desktop-server-latency
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.removeItem('rcc_session');
+
+    const { App } = await importApp();
+    const { container: container1, unmount: unmount1 } = render(<App />);
+
+    await waitFor(() => {
+      const toggle = container1.querySelector('.desktop-view-toggle');
+      expect(toggle).not.toBeNull();
+      const firstChild = toggle?.firstElementChild;
+      expect(firstChild?.classList.contains('desktop-server-latency')).toBe(true);
+      expect(firstChild?.getAttribute('title')).toBe('Disconnected');
+    });
+
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+    const activeWs1 = wsInstances[wsInstances.length - 1]!;
+    activeWs1.connected = true;
+    await act(async () => {
+      activeWs1.emit({ type: 'session.event', event: 'connected' });
+      activeWs1.emitLatency(36);
+    });
+
+    await waitFor(() => {
+      const latencyEl = container1.querySelector('.desktop-server-latency');
+      expect(latencyEl?.textContent).toBe('● 36ms');
+      expect(latencyEl?.getAttribute('title')).toBe('36ms');
+    });
+
+    unmount1();
+
+    // 2. Desktop: with active session -> .desktop-view-toggle first child is .desktop-server-latency
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { container: containerDesktopActive, unmount: unmountDesktopActive } = render(<App />);
+
+    await screen.findByTestId('session-pane-deck_alpha_brain');
+    await waitFor(() => {
+      const toggle = containerDesktopActive.querySelector('.desktop-view-toggle');
+      expect(toggle).not.toBeNull();
+      const firstChild = toggle?.firstElementChild;
+      expect(firstChild?.classList.contains('desktop-server-latency')).toBe(true);
+    });
+
+    unmountDesktopActive();
+
+    // 3. Mobile: .mobile-server-btn has .mobile-server-latency between name and chevron
+    const originalUserAgent = navigator.userAgent;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'iPhone' });
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { container: containerMobile, unmount: unmountMobile } = render(<App />);
+      await waitFor(() => {
+        const btn = containerMobile.querySelector('.mobile-server-btn');
+        expect(btn).not.toBeNull();
+        const latency = btn?.querySelector('.mobile-server-latency');
+        expect(latency).not.toBeNull();
+
+        const nameEl = btn?.querySelector('.mobile-server-btn-name');
+        const chevronEl = btn?.querySelector('.mobile-server-btn-chevron');
+        expect(nameEl).not.toBeNull();
+        expect(chevronEl).not.toBeNull();
+
+        const children = Array.from(btn!.children);
+        expect(children.indexOf(nameEl!)).toBeLessThan(children.indexOf(latency!));
+        expect(children.indexOf(latency!)).toBeLessThan(children.indexOf(chevronEl!));
+      });
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThan(0));
+      const mobileWs = wsInstances[wsInstances.length - 1]!;
+      mobileWs.connected = true;
+      await act(async () => {
+        mobileWs.emit({ type: 'session.event', event: 'connected' });
+        mobileWs.emitLatency(48);
+      });
+
+      await waitFor(() => {
+        const latency = containerMobile.querySelector('.mobile-server-latency');
+        expect(latency?.textContent).toBe('● 48ms');
+        expect(latency?.getAttribute('title')).toBe('48ms');
+      });
+
+      unmountMobile();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+    }
+  }, 25_000);
 });
