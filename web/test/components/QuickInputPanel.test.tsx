@@ -2073,4 +2073,107 @@ describe('useQuickData persistence guard', () => {
     expect(serverSnapshot.sessionHistoryTimestamps?.s1).toEqual({ D: 3000, B: 2000, C: 1500, A: 1000 });
     view.unmount();
   });
+
+  it('syncs _pendingSaveTuple on superseded 409 conflict rebase so deleting remote entry B before pagehide removes B and its timestamps from server', async () => {
+    setMockAuthIdentity('user-1', 'https://host.test/app');
+    let quick!: ReturnType<typeof useQuickData>;
+    function SupersededConflictDeleteHarness() {
+      quick = useQuickData();
+      return <div data-testid="hist">{quick.data.history.join(',')}</div>;
+    }
+
+    let serverSnapshot: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
+    let serverVersion = 'v1:0';
+    let releaseFirstPut!: () => void;
+    let firstPutSuspended = true;
+
+    apiFetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === '/api/quick-data' && (!init?.method || init.method === 'GET')) {
+        return Promise.resolve({ data: serverSnapshot, version: serverVersion });
+      }
+      if (url === '/api/quick-data' && init?.method === 'PUT') {
+        const parsed = JSON.parse(String(init.body)) as { data: QuickData; expectedVersion?: string };
+        const runPut = () => {
+          if (parsed.expectedVersion !== serverVersion) {
+            const err = new Error('API 409: version_conflict') as Error & { status: number; body: string };
+            err.status = 409;
+            err.body = JSON.stringify({ error: 'version_conflict', data: serverSnapshot, version: serverVersion });
+            throw err;
+          }
+          serverSnapshot = parsed.data;
+          serverVersion = `v1:${serverVersion === 'v1:1' ? 2 : 3}`;
+          return { ok: true, version: serverVersion };
+        };
+        if (firstPutSuspended) {
+          firstPutSuspended = false;
+          return new Promise((resolve, reject) => {
+            releaseFirstPut = () => {
+              try {
+                resolve(runPut());
+              } catch (e) {
+                reject(e);
+              }
+            };
+          });
+        }
+        return Promise.resolve().then(runPut);
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    const view = render(<SupersededConflictDeleteHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    // Step 1: Add A (ts=1000) and trigger pagehide -> PUT #1 (expectedVersion='v1:0') suspends in-flight.
+    vi.setSystemTime(1000);
+    act(() => { quick.recordHistory('A', 's1'); });
+    window.dispatchEvent(new Event('pagehide'));
+    await waitFor(() => expect(typeof releaseFirstPut).toBe('function'));
+
+    // Step 2: While PUT #1 is suspended, user adds C (ts=1500) -> creates active debounced _pendingSaveTuple.
+    vi.setSystemTime(1500);
+    act(() => { quick.recordHistory('C', 's1'); });
+    expect(screen.getByTestId('hist').textContent).toBe('C,A');
+
+    // Step 3: Meanwhile another device writes B (ts=2000) advancing server to v1:1; then suspended PUT #1 gets 409!
+    serverSnapshot = {
+      history: ['B'],
+      sessionHistory: { s1: ['B'] },
+      historyTimestamps: { B: 2000 },
+      sessionHistoryTimestamps: { s1: { B: 2000 } },
+      commands: [],
+      phrases: [],
+    };
+    serverVersion = 'v1:1';
+    await act(async () => {
+      releaseFirstPut();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Live UI & active pending tuple both reflect rebased [B, C, A].
+    expect(screen.getByTestId('hist').textContent).toBe('B,C,A');
+
+    // Step 4: User deletes remote B from "All" and immediately triggers pagehide -> final PUT MUST send [C, A] with expectedVersion='v1:1' and clear B timestamps!
+    act(() => { quick.removeHistory('B'); });
+    expect(screen.getByTestId('hist').textContent).toBe('C,A');
+
+    await act(async () => {
+      window.dispatchEvent(new Event('pagehide'));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(serverVersion).toBe('v1:2');
+    expect(serverSnapshot.history).toEqual(['C', 'A']);
+    expect(serverSnapshot.history).not.toContain('B');
+    expect(readOwnRecordValueSafe(serverSnapshot.historyTimestamps, 'B')).toBeUndefined();
+    expect(serverSnapshot.historyTimestamps).toEqual({ C: 1500, A: 1000 });
+    expect(serverSnapshot.sessionHistory.s1).toEqual(['C', 'A']);
+    expect(serverSnapshot.sessionHistory.s1).not.toContain('B');
+    expect(readOwnRecordValueSafe(serverSnapshot.sessionHistoryTimestamps?.s1, 'B')).toBeUndefined();
+    expect(serverSnapshot.sessionHistoryTimestamps?.s1).toEqual({ C: 1500, A: 1000 });
+    view.unmount();
+  });
 });

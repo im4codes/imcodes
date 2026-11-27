@@ -1027,35 +1027,17 @@ function runSave(
           }
           if (ctrl.signal.aborted || !isBindingCurrent(opts.binding)) return;
 
-          _baseline = conflict.data;
-          _serverVersion = conflict.version;
-
           if (_saveRevision !== opts.revision) {
-            // A newer local edit already superseded this save in this tab; rebase
-            // the live target onto latest server state and let the newer save commit.
-            const liveLocal = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
-            const liveRebased = mergeQuickDataThreeWay(
-              currBaseline,
-              liveLocal,
-              conflict.data,
-              Array.from(_pendingRemovedAllTexts),
-            );
-            quickDataResource.mutate(liveRebased);
-            if (opts.binding.scope) {
-              writePendingSnapshot(
-                opts.binding.scope,
-                buildPendingSnapshotRecord(
-                  opts.binding.scope,
-                  _saveRevision,
-                  liveRebased,
-                  Array.from(_pendingRemovedAllTexts),
-                  opts.clientId,
-                  conflict.data,
-                ),
-              );
-            }
+            // A newer local edit already superseded this save in this tab. If it
+            // is still in its debounce window, rebase the active tuple + UI + backup
+            // atomically onto the latest server snapshot; otherwise leave the already
+            // in-flight newer request to resolve its own CAS conflict untouched.
+            rebasePendingDebounceTupleOntoServer(conflict.data, conflict.version, opts.binding);
             return;
           }
+
+          _baseline = conflict.data;
+          _serverVersion = conflict.version;
 
           if (attempt >= MAX_CAS_CONFLICT_RETRIES) {
             console.error('[quick-data] save conflict retry budget exhausted');
@@ -1167,6 +1149,48 @@ function consolidatePendingSlots(
   return { merged, removedAllTexts: Array.from(removedAllSet) };
 }
 
+function rebasePendingDebounceTupleOntoServer(
+  server: QuickData,
+  serverVersion: string | null,
+  binding: AuthBinding,
+): QuickData | null {
+  const activePendingTuple = _pendingSaveTuple;
+  if (activePendingTuple === null || _debounceTimer === null) return null;
+  const rebasedTarget = mergeQuickDataThreeWay(
+    activePendingTuple.baselineSnapshot,
+    activePendingTuple.target,
+    server,
+    activePendingTuple.removedAllTexts,
+  );
+  const rebasedGlobalSet = new Set(rebasedTarget.history);
+  const rebasedRemovedAll = activePendingTuple.removedAllTexts.filter((item) => !rebasedGlobalSet.has(item));
+  _baseline = server;
+  _serverVersion = serverVersion;
+  _pendingSaveTuple = {
+    ...activePendingTuple,
+    baselineSnapshot: server,
+    expectedVersion: serverVersion,
+    target: rebasedTarget,
+    removedAllTexts: rebasedRemovedAll,
+  };
+  if (binding.scope) {
+    writePendingSnapshot(
+      binding.scope,
+      buildPendingSnapshotRecord(
+        binding.scope,
+        activePendingTuple.revision,
+        rebasedTarget,
+        rebasedRemovedAll,
+        activePendingTuple.clientId,
+        server,
+      ),
+    );
+  }
+  const rebasedView = applyPendingAdds(rebasedTarget);
+  quickDataResource.mutate(rebasedView);
+  return rebasedView;
+}
+
 // Explicit annotation: the fetcher closure references `quickDataResource`
 // (in both the merge-on-hydrate path and the keep-current-on-error path),
 // so TS needs the type up front to avoid `implicitly any` in the cycle.
@@ -1187,43 +1211,10 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
       const hadPriorHydration = _hasHydratedFromServer;
       _hasHydratedFromServer = true;
       _boundBinding = fetchBinding;
-      const activePendingTuple = _pendingSaveTuple;
-      if (hadPriorHydration && activePendingTuple !== null && _debounceTimer !== null) {
-        // Rebase the pending debounced tuple atomically onto the newly refreshed
-        // server state + version so `baseline`, `expectedVersion`, and `target`
-        // advance together and never pair a new version with an un-merged snapshot.
-        const rebasedTarget = mergeQuickDataThreeWay(
-          activePendingTuple.baselineSnapshot,
-          activePendingTuple.target,
-          server,
-          activePendingTuple.removedAllTexts,
-        );
-        const rebasedGlobalSet = new Set(rebasedTarget.history);
-        const rebasedRemovedAll = activePendingTuple.removedAllTexts.filter((item) => !rebasedGlobalSet.has(item));
-        _baseline = server;
-        _serverVersion = serverVersion;
-        _pendingSaveTuple = {
-          ...activePendingTuple,
-          baselineSnapshot: server,
-          expectedVersion: serverVersion,
-          target: rebasedTarget,
-          removedAllTexts: rebasedRemovedAll,
-        };
-        if (fetchBinding.scope) {
-          writePendingSnapshot(
-            fetchBinding.scope,
-            buildPendingSnapshotRecord(
-              fetchBinding.scope,
-              activePendingTuple.revision,
-              rebasedTarget,
-              rebasedRemovedAll,
-              activePendingTuple.clientId,
-              server,
-            ),
-          );
-        }
-        const rebasedView = applyPendingAdds(rebasedTarget);
-        quickDataResource.mutate(rebasedView);
+      const rebasedView = hadPriorHydration
+        ? rebasePendingDebounceTupleOntoServer(server, serverVersion, fetchBinding)
+        : null;
+      if (rebasedView !== null) {
         return rebasedView;
       }
       if (hadPriorHydration && _inFlightSaves > 0) {
