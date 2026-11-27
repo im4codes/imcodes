@@ -633,7 +633,7 @@ describe('tab sharing APIs', () => {
     expect(mainEntry.parentSessionName).toBeUndefined();
 
     expect(subEntry.sessionState).toBeUndefined();
-    expect(subEntry.agentType).toBe('shell');
+    expect(subEntry.agentType).toBe('codex');
     expect(subEntry.parentSessionName).toBe(sessionName);
 
     // Closed subsession must report target-unavailable in discovery instead of active
