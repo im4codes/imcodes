@@ -147,6 +147,7 @@ interface CursorMergedToolCall {
 
 interface PendingApprovalEntry {
   routeId: string;
+  connGeneration: number;
   options: RequestPermissionRequest['options'];
   resolve: (res: RequestPermissionResponse) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -163,6 +164,9 @@ interface PendingTurn {
   terminalTarget: {};
   physicalTerminal: Promise<void>;
   resolvePhysicalTerminal: () => void;
+  dispatched: boolean;
+  boundProcess: ChildProcessWithoutNullStreams | null;
+  boundConnGen: number;
   settled: boolean;
   cancelled: boolean;
   compactedInTurn: boolean;
@@ -196,6 +200,8 @@ interface CursorAcpSessionState {
   currentMessageId: string | null;
   currentText: string;
   lastContextWindow?: number;
+  modelLiveContextWindows: Map<string, number>;
+  compactCapability?: NonNullable<ProviderCapabilities['compact']>;
   lastStatusSignature: string | null;
   sessionSystemTextInjected?: string;
   modelConfigOptionId?: string;
@@ -260,14 +266,21 @@ function isAuthErrorLike(err: unknown): boolean {
   return /auth(?:entication)?\s*required|not\s+logged\s+in|agent\s+login|cursor_login|unauth|invalid\s+api\s+key|expired\s+token/i.test(msg);
 }
 
-function isSessionNotFoundError(err: unknown): boolean {
+function isSessionNotFoundError(err: unknown, candidateId?: string): boolean {
   if (isRecord(err) && err.code === PROVIDER_ERROR_CODES.SESSION_NOT_FOUND) return true;
-  // Cursor 189.index.js maps missing/invalid resume chat lookup errors to invalidParams (-32602),
-  // whereas transient/service failures throw internalError (-32603).
-  if (isRecord(err) && err.code === -32602) return true;
-  if (err instanceof RequestError && err.code === -32602) return true;
+  // Cursor 189.index.js throws SessionNotFoundError (`Session "${id}" not found`) wrapped via
+  // invalidParams (-32602, data.message). Require explicit session-not-found text — NEVER treat
+  // generic -32602 "Invalid params" or unrelated "does not exist" errors as missing resume chat.
   const msg = formatErrorMessage(err);
-  return /session(?:\s+id)?\s+not\s+found|unknown\s+session|conversation\s+not\s+found|expired\s+session|does\s+not\s+exist|no\s+such\s+session|invalid\s+session\s+id/i.test(msg);
+  const explicitMatch = msg.match(/\bsession\s+(?:"([^"]+)"|'([^']+)'|([^\s"':,;]+))\s+not\s+found\b/i);
+  if (explicitMatch) {
+    const mentionedId = (explicitMatch[1] ?? explicitMatch[2] ?? explicitMatch[3] ?? '').trim();
+    if (mentionedId && mentionedId.toLowerCase() !== 'id' && candidateId && mentionedId !== candidateId) {
+      return false;
+    }
+    return true;
+  }
+  return /\bsession(?:\s+id)?\s+not\s+found\b|\bunknown\s+session\b|\bconversation\s+not\s+found\b|\bexpired\s+session\b|\bno\s+such\s+session\b|\binvalid\s+session\s+id\b/i.test(msg);
 }
 
 function isMethodNotFoundError(err: unknown): boolean {
@@ -288,6 +301,7 @@ function extractModelContextWindow(record: Record<string, unknown>): number | un
     positiveNumber(record.contextWindow)
     ?? positiveNumber(record.context_window)
     ?? positiveNumber(record.model_context_window)
+    ?? positiveNumber(record.contextWindowSize)
     ?? positiveNumber(record.maxContextTokens)
     ?? positiveNumber(record.max_context_tokens)
     ?? positiveNumber(record.size)
@@ -296,6 +310,7 @@ function extractModelContextWindow(record: Record<string, unknown>): number | un
     ?? positiveNumber(meta?.contextWindow)
     ?? positiveNumber(meta?.context_window)
     ?? positiveNumber(meta?.model_context_window)
+    ?? positiveNumber(meta?.contextWindowSize)
     ?? positiveNumber(metaLimit?.context)
   );
 }
@@ -439,19 +454,30 @@ export function normalizeCursorAcpUsage(
     ?? (limitRec ? (positiveNumber(limitRec.context) ?? positiveNumber(limitRec.contextWindow)) : undefined)
     ?? (fallbackContextWindow && fallbackContextWindow > 0 ? fallbackContextWindow : undefined);
 
-  // `used` represents total tokens currently in context. Only split out `cachedTokens`
-  // when THIS SAME frame supplied a consistent cache read count; never carry stale cache
-  // values from an earlier snapshot.
-  const inputTokens = explicitInput ?? (
-    used !== undefined
-      ? (cachedTokens !== undefined && used >= cachedTokens ? used - cachedTokens : (cachedTokens === undefined ? used : undefined))
-      : undefined
-  );
+  // `used` represents total tokens currently in context. `transport-relay.ts` computes
+  // `inputTokens = input_tokens + cache_creation_input_tokens` and displays `cache_read_input_tokens`
+  // separately. Subtract both same-frame read & write cache counts from `used` so total context
+  // occupancy stays exact; if an inconsistent snapshot has `read + write > used`, omit unreliable
+  // cache breakdown fields and report `input_tokens: used`.
+  let inputTokens = explicitInput;
+  let finalCachedRead = cachedTokens;
+  let finalCacheWrite = cacheWriteTokens;
+  if (inputTokens === undefined && used !== undefined) {
+    const cacheReadVal = cachedTokens ?? 0;
+    const cacheWriteVal = cacheWriteTokens ?? 0;
+    if (cacheReadVal + cacheWriteVal <= used) {
+      inputTokens = used - cacheReadVal - cacheWriteVal;
+    } else {
+      inputTokens = used;
+      finalCachedRead = undefined;
+      finalCacheWrite = undefined;
+    }
+  }
   if (
     inputTokens === undefined
     && outputTokens === undefined
-    && cachedTokens === undefined
-    && cacheWriteTokens === undefined
+    && finalCachedRead === undefined
+    && finalCacheWrite === undefined
     && contextWindow === undefined
   ) {
     return undefined;
@@ -460,8 +486,8 @@ export function normalizeCursorAcpUsage(
   return {
     ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
     ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
-    ...(cachedTokens !== undefined ? { cached_input_tokens: cachedTokens, cache_read_input_tokens: cachedTokens } : {}),
-    ...(cacheWriteTokens !== undefined ? { cache_creation_input_tokens: cacheWriteTokens } : {}),
+    ...(finalCachedRead !== undefined ? { cached_input_tokens: finalCachedRead, cache_read_input_tokens: finalCachedRead } : {}),
+    ...(finalCacheWrite !== undefined ? { cache_creation_input_tokens: finalCacheWrite } : {}),
     ...(contextWindow !== undefined ? { model_context_window: contextWindow } : {}),
   };
 }
@@ -554,6 +580,8 @@ export class CursorAcpProvider implements TransportProvider {
   private sessions = new Map<string, CursorAcpSessionState>();
   private acpToRoute = new Map<string, string>();
   private pendingApprovals = new Map<string, PendingApprovalEntry>();
+  private reclaimPromises = new Map<number, Promise<void>>();
+  private defaultCompactCapability: NonNullable<ProviderCapabilities['compact']> = { ...UNSUPPORTED_COMPACT_CAPABILITY };
   private pendingUpdateSlots = new WeakMap<object, WireSlot>();
   private promptTerminals = new WeakMap<PendingTurn, Promise<unknown>>();
   private promptWriteQueues = new WeakMap<AcpClientConnection, {
@@ -595,19 +623,27 @@ export class CursorAcpProvider implements TransportProvider {
       const states = Array.from(this.sessions.values());
       this.sessions.clear();
       this.acpToRoute.clear();
+      const turnsToInspect: PendingTurn[] = [];
       for (const state of states) {
-        if (state.pendingTurn) {
-          state.pendingTurn.cancelled = true;
+        const turn = state.pendingTurn;
+        if (turn) {
+          turn.cancelled = true;
           this.failTurn(
             state,
-            state.pendingTurn,
+            turn,
             this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Cursor provider disconnected', true),
           );
+          turnsToInspect.push(turn);
         } else {
           this.clearStatus(state.routeId, state);
         }
       }
       await this.teardownChildProcess();
+      for (const turn of turnsToInspect) {
+        if (!turn.dispatched || !this.isChildAlive(turn.boundProcess)) {
+          turn.resolvePhysicalTerminal();
+        }
+      }
       this.cachedModels = null;
       this.cachedDefaultModel = null;
       this.modelContextWindows.clear();
@@ -616,6 +652,7 @@ export class CursorAcpProvider implements TransportProvider {
       this.sessionCloseSupported = false;
       this.sessionListSupported = false;
       this.loadSessionSupported = true;
+      this.reclaimPromises.clear();
       this.updateCompactCapability([]);
       this.config = null;
     } finally {
@@ -640,6 +677,16 @@ export class CursorAcpProvider implements TransportProvider {
       status: ready ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
       connected: ready,
       degradedReasons: [],
+    };
+  }
+
+  getSessionCapabilities(sessionId: string): Partial<ProviderCapabilities> | null | undefined {
+    const resolved = this.findSessionByAnyId(sessionId);
+    if (!resolved) return undefined;
+    const [, state] = resolved;
+    return {
+      compact: state.compactCapability ?? this.defaultCompactCapability,
+      attachments: this.imageAttachmentSupported,
     };
   }
 
@@ -836,6 +883,7 @@ export class CursorAcpProvider implements TransportProvider {
       currentMessageId: null,
       currentText: '',
       lastContextWindow: undefined,
+      modelLiveContextWindows: new Map(),
       lastStatusSignature: null,
       availableCommands: new Set(),
       toolCalls: new Map(),
@@ -863,8 +911,8 @@ export class CursorAcpProvider implements TransportProvider {
       await this.ensureSessionReady(routeId, state, connection, this.connectionGeneration, { allowFresh: false });
       return true;
     } catch (err) {
-      if (isSessionNotFoundError(err)) return false;
-      throw this.normalizeError(err);
+      if (isSessionNotFoundError(err, state.acpSessionId)) return false;
+      throw this.normalizeError(err, state.acpSessionId);
     }
   }
 
@@ -872,19 +920,31 @@ export class CursorAcpProvider implements TransportProvider {
     const resolved = this.findSessionByAnyId(sessionId);
     if (!resolved) return;
     const [routeId, state] = resolved;
+    const liveTurn = state.pendingTurn;
+    const liveAcpSessionId = state.acpSessionId;
+    const liveBoundGen = state.boundConnectionGeneration;
+    const liveConn = liveAcpSessionId && liveBoundGen === this.connectionGeneration && this.connection && this.isChildAlive(this.child)
+      ? this.connection
+      : null;
+
     this.sessions.delete(routeId);
     if (state.acpSessionId && this.acpToRoute.get(state.acpSessionId) === routeId) {
       this.acpToRoute.delete(state.acpSessionId);
     }
     this.cancelPendingApprovals(routeId);
-    if (state.pendingTurn) {
-      state.pendingTurn.cancelled = true;
+    if (liveTurn) {
+      liveTurn.cancelled = true;
+      if (liveConn && liveAcpSessionId) {
+        void liveConn.cancel({ sessionId: liveAcpSessionId }).catch(() => {});
+      }
       this.failTurn(
         state,
-        state.pendingTurn,
+        liveTurn,
         this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Cursor session ended', true),
       );
-      state.pendingTurn.resolvePhysicalTerminal();
+      if (!liveTurn.dispatched || !this.isChildAlive(liveTurn.boundProcess)) {
+        liveTurn.resolvePhysicalTerminal();
+      }
     } else {
       this.clearStatus(routeId, state);
     }
@@ -910,19 +970,31 @@ export class CursorAcpProvider implements TransportProvider {
     const resolved = this.findSessionByAnyId(sessionId);
     if (!resolved) return;
     const [routeId, state] = resolved;
+    const liveTurn = state.pendingTurn;
+    const liveAcpSessionId = state.acpSessionId;
+    const liveBoundGen = state.boundConnectionGeneration;
+    const liveConn = liveAcpSessionId && liveBoundGen === this.connectionGeneration && this.connection && this.isChildAlive(this.child)
+      ? this.connection
+      : null;
+
     this.sessions.delete(routeId);
     if (state.acpSessionId && this.acpToRoute.get(state.acpSessionId) === routeId) {
       this.acpToRoute.delete(state.acpSessionId);
     }
     this.cancelPendingApprovals(routeId);
-    if (state.pendingTurn) {
-      state.pendingTurn.cancelled = true;
+    if (liveTurn) {
+      liveTurn.cancelled = true;
+      if (liveConn && liveAcpSessionId) {
+        void liveConn.cancel({ sessionId: liveAcpSessionId }).catch(() => {});
+      }
       this.failTurn(
         state,
-        state.pendingTurn,
+        liveTurn,
         this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Cursor session detached', true),
       );
-      state.pendingTurn.resolvePhysicalTerminal();
+      if (!liveTurn.dispatched || !this.isChildAlive(liveTurn.boundProcess)) {
+        liveTurn.resolvePhysicalTerminal();
+      }
     } else {
       this.clearStatus(routeId, state);
     }
@@ -981,7 +1053,7 @@ export class CursorAcpProvider implements TransportProvider {
       await this.switchModelOnConnection(connection, connGen, routeId, state, model);
     } catch (err) {
       if (state.pendingModel === model) state.pendingModel = undefined;
-      throw this.normalizeError(err);
+      throw this.normalizeError(err, state.acpSessionId);
     }
     return state.promptInFlight ? SESSION_MODEL_APPLIED.NEXT_START : SESSION_MODEL_APPLIED.LIVE;
   }
@@ -1032,6 +1104,9 @@ export class CursorAcpProvider implements TransportProvider {
       terminalTarget: {},
       physicalTerminal,
       resolvePhysicalTerminal,
+      dispatched: false,
+      boundProcess: null,
+      boundConnGen: 0,
       settled: false,
       cancelled: false,
       compactedInTurn: false,
@@ -1060,7 +1135,7 @@ export class CursorAcpProvider implements TransportProvider {
       this.assertTurnCurrent(routeId, state, turn, connection, connGen);
 
       const promptBlocks = isSlashControl
-        ? [{ type: 'text' as const, text: this.resolveSlashControlText(trimmedUserMsg, payload.assembledMessage) }]
+        ? [{ type: 'text' as const, text: this.resolveSlashControlText(state, trimmedUserMsg, payload.assembledMessage) }]
         : await this.buildPromptContent(payload, includeSessionSystemText);
       this.assertTurnCurrent(routeId, state, turn, connection, connGen);
 
@@ -1079,11 +1154,14 @@ export class CursorAcpProvider implements TransportProvider {
       capturedChild.once('exit', onCapturedExit);
       capturedChild.once('close', onCapturedExit);
 
+      turn.boundProcess = capturedChild;
+      turn.boundConnGen = connGen;
       const promptRpc = connection.prompt({
         sessionId: state.acpSessionId!,
         prompt: promptBlocks,
         messageId: turn.messageId,
       });
+      turn.dispatched = true;
       promptDispatched = true;
       this.promptTerminals.set(turn, promptRpc);
       this.trackPromptSettlement(
@@ -1108,7 +1186,7 @@ export class CursorAcpProvider implements TransportProvider {
         throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Cursor ACP prompt write failed', true);
       }
     } catch (err) {
-      const normalized = this.normalizeError(err);
+      const normalized = this.normalizeError(err, state.acpSessionId);
       this.failTurn(state, turn, normalized);
       if (!promptDispatched) {
         turn.resolvePhysicalTerminal();
@@ -1143,10 +1221,10 @@ export class CursorAcpProvider implements TransportProvider {
     const resolved = this.findSessionByAnyId(sessionId);
     if (!resolved) return;
     const [routeId, state] = resolved;
-    this.cancelPendingApprovals(routeId);
+    const turn = state.pendingTurn;
+    this.cancelPendingApprovals(routeId, turn?.boundConnGen || undefined);
     this.retireOpenToolCalls(state);
 
-    const turn = state.pendingTurn;
     if (!turn || !state.promptInFlight) {
       this.clearStatus(routeId, state);
       return;
@@ -1154,9 +1232,12 @@ export class CursorAcpProvider implements TransportProvider {
 
     turn.cancelled = true;
     const generation = turn.generation;
-    const capturedChild = this.child;
-    const capturedConnection = this.connection;
-    const capturedConnGen = this.connectionGeneration;
+    const capturedChild = turn.boundProcess ?? this.child;
+    const capturedConnGen = turn.boundConnGen || this.connectionGeneration;
+    const capturedConnection =
+      this.connection && this.connectionGeneration === capturedConnGen && this.child === capturedChild
+        ? this.connection
+        : null;
     const isStaleWatchdog = options?.origin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG;
 
     if (!state.acpSessionId || !capturedConnection || !this.isChildAlive(capturedChild)) {
@@ -1165,8 +1246,17 @@ export class CursorAcpProvider implements TransportProvider {
         turn,
         this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'Cursor turn cancelled (no live connection)', true),
       );
-      if (!capturedChild || !this.isChildAlive(capturedChild)) {
+      if (!turn.dispatched || !this.isChildAlive(capturedChild)) {
         turn.resolvePhysicalTerminal();
+      } else if (capturedChild && capturedConnGen > 0) {
+        // The replacement generation may have already cleared `this.child`/`this.connection`,
+        // while this turn's captured child is still alive; recycle it and wait for real OS exit.
+        void this.reclaimDeadAcpTransport(
+          capturedChild,
+          capturedConnGen,
+          state,
+          new Error('Cursor ACP turn cancelled after connection superseded'),
+        );
       }
       return;
     }
@@ -1402,40 +1492,59 @@ export class CursorAcpProvider implements TransportProvider {
       for (const release of [...activeSlotReleasers]) release();
     };
 
-    const handleChildFailure = (err: Error): void => {
+    let childTerminated = false;
+    const handleChildTerminated = (err: Error): void => {
+      if (childTerminated) return;
+      childTerminated = true;
       releaseAllSlots();
       void resource.release();
       if (this.sharedResource === resource) {
         this.sharedResource = null;
       }
-      if (this.isDisconnecting || this.child !== child || this.connectionGeneration !== generation) return;
-      this.connectionGeneration += 1;
-      this.child = null;
-      this.connection = null;
-      this.sessionCloseSupported = false;
-      this.sessionListSupported = false;
-      this.updateCompactCapability([]);
-      this.cancelAllPendingApprovals();
+      const isCurrentGen = !this.isDisconnecting && this.child === child && this.connectionGeneration === generation;
+      if (isCurrentGen) {
+        this.connectionGeneration += 1;
+        this.child = null;
+        this.connection = null;
+        this.connectInFlight = null;
+        this.sessionCloseSupported = false;
+        this.sessionListSupported = false;
+        this.updateCompactCapability([]);
+      }
+      this.cancelGenerationApprovals(generation);
       const lostErr = this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, err.message, true);
       for (const [routeId, state] of this.sessions) {
-        if (state.boundConnectionGeneration === generation) {
+        const ownsSession = state.boundConnectionGeneration === generation;
+        const turn = state.pendingTurn;
+        const ownsTurn = Boolean(turn && turn.boundConnGen === generation);
+        if (!ownsSession && !ownsTurn) continue;
+        if (ownsSession) {
           state.boundConnectionGeneration = 0;
+          state.replaying = false;
+          state.availableCommands.clear();
+          state.compactCapability = undefined;
         }
-        state.replaying = false;
-        if (state.pendingTurn) {
-          this.failTurn(state, state.pendingTurn, lostErr);
-          state.pendingTurn.resolvePhysicalTerminal();
-        } else {
+        if (turn && turn.boundConnGen === generation) {
+          this.failTurn(state, turn, lostErr);
+          turn.resolvePhysicalTerminal();
+        } else if (!turn && state.boundConnectionGeneration === 0) {
           this.clearStatus(routeId, state);
         }
       }
     };
 
     child.once('exit', (code, signal) => {
-      handleChildFailure(new Error(`Cursor ACP server exited with code=${code ?? 'null'} signal=${signal ?? 'null'}`));
+      handleChildTerminated(new Error(`Cursor ACP server exited with code=${code ?? 'null'} signal=${signal ?? 'null'}`));
+    });
+    child.once('close', (code, signal) => {
+      handleChildTerminated(new Error(`Cursor ACP server closed with code=${code ?? 'null'} signal=${signal ?? 'null'}`));
     });
     child.on('error', (err) => {
-      handleChildFailure(err);
+      if (this.isChildAlive(child)) {
+        void this.reclaimDeadAcpTransport(child, generation, null, err);
+        return;
+      }
+      handleChildTerminated(err);
     });
 
     const rawWriter = rawStream.writable.getWriter();
@@ -1602,19 +1711,23 @@ export class CursorAcpProvider implements TransportProvider {
     this.updateCompactCapability(parsedCmds);
   }
 
-  private updateCompactCapability(commands: Iterable<string>): void {
+  private updateCompactCapability(commands: Iterable<string>, state?: CursorAcpSessionState): void {
     const matched = matchAdvertisedCompactCommand(commands);
-    if (matched) {
-      this.capabilities.compact = {
-        execution: 'slash-command',
-        providerCommand: matched,
-        verified: true,
-        completion: 'command-result',
-        cancellation: 'provider-cancel',
-      };
-    } else {
-      this.capabilities.compact = { ...UNSUPPORTED_COMPACT_CAPABILITY };
+    const capability: NonNullable<ProviderCapabilities['compact']> = matched
+      ? {
+          execution: 'slash-command',
+          providerCommand: matched,
+          verified: true,
+          completion: 'command-result',
+          cancellation: 'provider-cancel',
+        }
+      : { ...UNSUPPORTED_COMPACT_CAPABILITY };
+    if (state) {
+      state.compactCapability = capability;
+      return;
     }
+    this.defaultCompactCapability = capability;
+    this.capabilities.compact = capability;
   }
 
   private createClientHandlers(
@@ -1711,7 +1824,7 @@ export class CursorAcpProvider implements TransportProvider {
           this.captureSessionModels(loadResult || undefined, state);
         } catch (err) {
           assertOwned();
-          if (!options.allowFresh || !isSessionNotFoundError(err)) {
+          if (!options.allowFresh || !isSessionNotFoundError(err, candidateId)) {
             throw err;
           }
           // Only explicit missing/expired session error when policy allows fresh creation clears old resumeId.
@@ -1720,6 +1833,10 @@ export class CursorAcpProvider implements TransportProvider {
           }
           state.acpSessionId = undefined;
           state.boundConnectionGeneration = 0;
+          state.modelLiveContextWindows.clear();
+          state.availableCommands.clear();
+          state.compactCapability = undefined;
+          state.lastContextWindow = state.model ? this.modelContextWindows.get(state.model) : undefined;
           logger.info(
             { provider: this.id, routeId, expiredSessionId: candidateId, message: formatErrorMessage(err) },
             'Cursor ACP session not found/expired; creating fresh session',
@@ -1751,6 +1868,10 @@ export class CursorAcpProvider implements TransportProvider {
         }
         state.acpSessionId = created.sessionId;
         state.boundConnectionGeneration = connGen;
+        state.modelLiveContextWindows.clear();
+        state.availableCommands.clear();
+        state.compactCapability = undefined;
+        state.lastContextWindow = state.model ? this.modelContextWindows.get(state.model) : undefined;
         this.acpToRoute.set(created.sessionId, routeId);
         this.captureSessionModels(created, state);
         this.emitSessionInfo(routeId, {
@@ -1851,14 +1972,49 @@ export class CursorAcpProvider implements TransportProvider {
     }
 
     assertConnectionStillCurrent();
-    state.model = modelId;
+    this.applyConfirmedModel(state, modelId, true);
+  }
+
+  private getConfirmedContextWindow(state: CursorAcpSessionState): number | undefined {
+    const scopedKey = state.acpSessionId && state.model ? `${state.acpSessionId}\0${state.model}` : undefined;
+    return (
+      (scopedKey ? state.modelLiveContextWindows.get(scopedKey) : undefined)
+      ?? state.lastContextWindow
+      ?? (state.model ? this.modelContextWindows.get(state.model) : undefined)
+    );
+  }
+
+  private recordConfirmedContextWindow(state: CursorAcpSessionState, window: number | undefined): void {
+    if (!window || window <= 0) return;
+    state.lastContextWindow = window;
+    if (state.acpSessionId && state.model) {
+      state.modelLiveContextWindows.set(`${state.acpSessionId}\0${state.model}`, window);
+    }
+  }
+
+  private applyConfirmedModel(
+    state: CursorAcpSessionState,
+    modelId: string,
+    includeResumeId = true,
+  ): void {
+    const changed = state.model !== modelId;
+    if (changed) {
+      state.model = modelId;
+      if (state.pendingModel === modelId) state.pendingModel = undefined;
+      const scopedKey = state.acpSessionId ? `${state.acpSessionId}\0${modelId}` : undefined;
+      const scopedWin = scopedKey ? state.modelLiveContextWindows.get(scopedKey) : undefined;
+      const catalogWin = this.modelContextWindows.get(modelId);
+      state.lastContextWindow = scopedWin ?? catalogWin;
+      this.emitSessionInfo(state.routeId, {
+        ...(includeResumeId && state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
+        model: modelId,
+      });
+      return;
+    }
     if (state.pendingModel === modelId) state.pendingModel = undefined;
-    const confirmedWindow = this.modelContextWindows.get(modelId);
-    if (confirmedWindow) state.lastContextWindow = confirmedWindow;
-    this.emitSessionInfo(routeId, {
-      ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
-      model: modelId,
-    });
+    if (state.lastContextWindow === undefined) {
+      state.lastContextWindow = this.getConfirmedContextWindow(state);
+    }
   }
 
   private captureSessionModels(
@@ -1890,14 +2046,7 @@ export class CursorAcpProvider implements TransportProvider {
       if (current) {
         this.cachedDefaultModel ??= current;
         if (state && state.model !== current) {
-          state.model = current;
-          if (state.pendingModel === current) state.pendingModel = undefined;
-          const ctxWin = this.modelContextWindows.get(current);
-          if (ctxWin) state.lastContextWindow = ctxWin;
-          this.emitSessionInfo(state.routeId, {
-            ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
-            model: current,
-          });
+          this.applyConfirmedModel(state, current, true);
         }
       }
     }
@@ -1939,22 +2088,19 @@ export class CursorAcpProvider implements TransportProvider {
       if (currentValue) {
         this.cachedDefaultModel ??= currentValue;
         if (state && state.model !== currentValue) {
-          state.model = currentValue;
-          if (state.pendingModel === currentValue) state.pendingModel = undefined;
-          const ctxWin = this.modelContextWindows.get(currentValue);
-          if (ctxWin) state.lastContextWindow = ctxWin;
-          this.emitSessionInfo(state.routeId, {
-            ...(state.acpSessionId ? { resumeId: state.acpSessionId } : {}),
-            model: currentValue,
-          });
+          this.applyConfirmedModel(state, currentValue, true);
         }
       }
     }
   }
 
-  private resolveSlashControlText(trimmedUserMsg: string, assembledMessage: string): string {
+  private resolveSlashControlText(
+    state: CursorAcpSessionState,
+    trimmedUserMsg: string,
+    assembledMessage: string,
+  ): string {
     if (isSessionControlCommandText(trimmedUserMsg, 'compact')) {
-      const advertised = this.capabilities.compact?.providerCommand;
+      const advertised = (state.compactCapability ?? this.defaultCompactCapability).providerCommand;
       if (advertised) {
         const rest = trimmedUserMsg.slice('/compact'.length).trim();
         return rest ? `${advertised} ${rest}` : advertised;
@@ -2099,7 +2245,7 @@ export class CursorAcpProvider implements TransportProvider {
           state.availableCommands.add(cmd.name.trim().replace(/^\//, ''));
         }
       }
-      this.updateCompactCapability(state.availableCommands);
+      this.updateCompactCapability(state.availableCommands, state);
       return;
     }
 
@@ -2117,11 +2263,7 @@ export class CursorAcpProvider implements TransportProvider {
     if (kind === 'session_info_update') {
       const model = normalizeCursorModelId(update.model ?? update.modelId);
       if (model && model !== state.model) {
-        state.model = model;
-        if (state.pendingModel === model) state.pendingModel = undefined;
-        const ctxWin = this.modelContextWindows.get(model);
-        if (ctxWin) state.lastContextWindow = ctxWin;
-        this.emitSessionInfo(routeId, { model });
+        this.applyConfirmedModel(state, model, false);
       }
       return;
     }
@@ -2136,12 +2278,22 @@ export class CursorAcpProvider implements TransportProvider {
     }
 
     if (kind === 'usage_update') {
-      const confirmedWindow = state.lastContextWindow
-        ?? (state.model ? this.modelContextWindows.get(state.model) : undefined);
+      const confirmedWindow = this.getConfirmedContextWindow(state);
       const normalized = normalizeCursorAcpUsage(update, confirmedWindow);
       if (normalized) {
         if (normalized.model_context_window !== undefined) {
-          state.lastContextWindow = normalized.model_context_window;
+          this.recordConfirmedContextWindow(state, normalized.model_context_window);
+        }
+        if (normalized.input_tokens === undefined && normalized.model_context_window !== undefined) {
+          // Window-only update: preserve prior turn occupancy rather than overwriting it.
+          if (turn.turnContextUsage) {
+            turn.turnContextUsage = {
+              ...turn.turnContextUsage,
+              model_context_window: normalized.model_context_window,
+            };
+            this.emitUsage(routeId, state, turn, turn.turnContextUsage, false);
+          }
+          return;
         }
         // Replace atomically: never spread prior frame's cached tokens into a newer frame.
         turn.turnContextUsage = normalized;
@@ -2365,6 +2517,7 @@ export class CursorAcpProvider implements TransportProvider {
       timer.unref?.();
       this.pendingApprovals.set(requestId, {
         routeId,
+        connGeneration: connGen,
         options: params.options,
         resolve,
         timer,
@@ -2432,7 +2585,7 @@ export class CursorAcpProvider implements TransportProvider {
         if (turn.settled || this.sessions.get(routeId) !== state || state.turnGeneration !== turn.generation) return;
         const normalized = turn.cancelled
           ? this.makeError(PROVIDER_ERROR_CODES.CANCELLED, formatErrorMessage(err), true, err)
-          : this.normalizeError(err);
+          : this.normalizeError(err, state.acpSessionId);
         this.failTurn(state, turn, normalized);
       })
       .finally(() => {
@@ -2484,41 +2637,67 @@ export class CursorAcpProvider implements TransportProvider {
   private async reclaimDeadAcpTransport(
     brokenChild: ChildProcessWithoutNullStreams,
     brokenGeneration: number,
-    originState: CursorAcpSessionState,
+    originState: CursorAcpSessionState | null,
     cause: unknown,
   ): Promise<void> {
-    const childStillAlive = this.isChildAlive(brokenChild);
-    if (this.child === brokenChild && this.connectionGeneration === brokenGeneration) {
-      this.connectionGeneration += 1;
-      this.child = null;
-      this.connection = null;
-      this.connectInFlight = null;
-      this.sessionCloseSupported = false;
-      this.sessionListSupported = false;
-      this.updateCompactCapability([]);
+    const existingReclaim = this.reclaimPromises.get(brokenGeneration);
+    if (existingReclaim) {
+      await existingReclaim;
+      return;
     }
 
-    const msg = formatErrorMessage(cause) || 'Cursor ACP transport stream closed';
-    const siblingErr = this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, msg, true, cause);
-    for (const session of this.sessions.values()) {
-      if (session.boundConnectionGeneration === brokenGeneration) {
-        session.boundConnectionGeneration = 0;
+    const reclaimTask = (async (): Promise<void> => {
+      const childStillAlive = this.isChildAlive(brokenChild);
+      if (this.child === brokenChild && this.connectionGeneration === brokenGeneration) {
+        this.connectionGeneration += 1;
+        this.child = null;
+        this.connection = null;
+        this.connectInFlight = null;
+        this.sessionCloseSupported = false;
+        this.sessionListSupported = false;
+        this.updateCompactCapability([]);
       }
-      session.replaying = false;
-      this.cancelPendingApprovals(session.routeId);
-      if (session === originState) continue;
-      if (session.pendingTurn && !session.pendingTurn.settled) {
-        this.failTurn(session, session.pendingTurn, siblingErr);
-      } else {
-        this.clearStatus(session.routeId, session);
-      }
-    }
 
-    if (childStillAlive) {
-      await killProcessTree(brokenChild, {
-        gracefulMs: CANCEL_ESCALATION_MS,
-        ownsProcessGroup: true,
-      });
+      // Synchronously capture approvals & sessions owned by `brokenGeneration` ONLY,
+      // so a replacement generation that spawns while killing the old child cannot be cleared.
+      this.cancelGenerationApprovals(brokenGeneration);
+
+      const msg = formatErrorMessage(cause) || 'Cursor ACP transport stream closed';
+      const siblingErr = this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, msg, true, cause);
+      for (const session of this.sessions.values()) {
+        const ownsSession = session.boundConnectionGeneration === brokenGeneration;
+        const turn = session.pendingTurn;
+        const ownsTurn = Boolean(turn && turn.boundConnGen === brokenGeneration);
+        if (!ownsSession && !ownsTurn) continue;
+        if (ownsSession) {
+          session.boundConnectionGeneration = 0;
+          session.replaying = false;
+          session.availableCommands.clear();
+          session.compactCapability = undefined;
+        }
+        if (session === originState) continue;
+        if (turn && turn.boundConnGen === brokenGeneration && !turn.settled) {
+          this.failTurn(session, turn, siblingErr);
+        } else if (!turn && session.boundConnectionGeneration === 0) {
+          this.clearStatus(session.routeId, session);
+        }
+      }
+
+      if (childStillAlive) {
+        await killProcessTree(brokenChild, {
+          gracefulMs: CANCEL_ESCALATION_MS,
+          ownsProcessGroup: true,
+        });
+      }
+    })();
+
+    this.reclaimPromises.set(brokenGeneration, reclaimTask);
+    try {
+      await reclaimTask;
+    } finally {
+      if (this.reclaimPromises.get(brokenGeneration) === reclaimTask) {
+        this.reclaimPromises.delete(brokenGeneration);
+      }
     }
   }
 
@@ -2531,7 +2710,7 @@ export class CursorAcpProvider implements TransportProvider {
     if (turn.settled) return;
     turn.settled = true;
     this.clearTurnTimersAndState(state, turn);
-    this.cancelPendingApprovals(routeId);
+    this.cancelPendingApprovals(routeId, turn.boundConnGen || undefined);
     this.retireOpenToolCalls(state);
     this.clearStatus(routeId, state);
 
@@ -2556,24 +2735,42 @@ export class CursorAcpProvider implements TransportProvider {
     }
 
     // Never merge cumulative PromptResponse.usage.inputTokens into current-context occupancy.
-    // Only use an atomic current-context snapshot (`usage_update` or explicit `used`/`size` in `_meta`),
-    // preserving the latest verified model/session context window and optional turn output tokens.
+    // Only use an atomic current-context snapshot (`usage_update` or explicit `used`/`input` in `_meta`).
+    // If `_meta` carries only window metadata (e.g. `{ size }`), preserve `turn.turnContextUsage`
+    // occupancy and update `model_context_window` on top of it.
     const metaRec = isRecord((result as unknown as { _meta?: unknown })._meta)
       ? (result as unknown as { _meta: Record<string, unknown> })._meta
       : undefined;
-    const confirmedWindow = state.lastContextWindow
-      ?? (state.model ? this.modelContextWindows.get(state.model) : undefined);
-    const metaContextUsage = metaRec && (nonNegativeNumber(metaRec.used) !== undefined || positiveNumber(metaRec.size) !== undefined)
+    const confirmedWindow = this.getConfirmedContextWindow(state);
+    const metaHasOccupancy = Boolean(
+      metaRec && (
+        nonNegativeNumber(metaRec.used) !== undefined
+        || nonNegativeNumber(metaRec.input_tokens) !== undefined
+        || nonNegativeNumber(metaRec.inputTokens) !== undefined
+        || nonNegativeNumber(metaRec.input) !== undefined
+      ),
+    );
+    const metaContextUsage = metaRec && metaHasOccupancy
       ? normalizeCursorAcpUsage(metaRec, confirmedWindow)
       : undefined;
+    const metaWindowOnly = !metaHasOccupancy && metaRec
+      ? extractModelContextWindow(metaRec)
+      : undefined;
+    const resolvedMetaWindow = metaWindowOnly ?? metaContextUsage?.model_context_window;
+    if (resolvedMetaWindow !== undefined) {
+      this.recordConfirmedContextWindow(state, resolvedMetaWindow);
+    }
+    const effectiveWindow = resolvedMetaWindow ?? this.getConfirmedContextWindow(state);
     const contextUsageBase = metaContextUsage ?? turn.turnContextUsage;
     const cumulativeUsage = extractCumulativePromptUsage(result);
     const finalContextUsage: CursorAcpUsage | undefined = contextUsageBase
       ? {
           ...contextUsageBase,
-          ...(contextUsageBase.model_context_window === undefined && confirmedWindow !== undefined
-            ? { model_context_window: confirmedWindow }
-            : {}),
+          ...(metaWindowOnly !== undefined
+            ? { model_context_window: metaWindowOnly }
+            : (contextUsageBase.model_context_window === undefined && effectiveWindow !== undefined
+              ? { model_context_window: effectiveWindow }
+              : {})),
         }
       : undefined;
 
@@ -2617,7 +2814,7 @@ export class CursorAcpProvider implements TransportProvider {
     if (err.code !== PROVIDER_ERROR_CODES.CANCELLED) {
       state.sessionSystemTextInjected = undefined;
     }
-    this.cancelPendingApprovals(state.routeId);
+    this.cancelPendingApprovals(state.routeId, turn.boundConnGen || undefined);
     this.retireOpenToolCalls(state);
     this.clearStatus(state.routeId, state);
     if (this.isDisconnecting) return;
@@ -2691,9 +2888,19 @@ export class CursorAcpProvider implements TransportProvider {
     state.emittedToolSignatures.clear();
   }
 
-  private cancelPendingApprovals(routeId: string): void {
+  private cancelPendingApprovals(routeId: string, connGeneration?: number): void {
     for (const [reqId, pending] of this.pendingApprovals) {
       if (pending.routeId !== routeId) continue;
+      if (connGeneration !== undefined && pending.connGeneration !== connGeneration) continue;
+      this.pendingApprovals.delete(reqId);
+      clearTimeout(pending.timer);
+      pending.resolve({ outcome: { outcome: 'cancelled' } });
+    }
+  }
+
+  private cancelGenerationApprovals(connGeneration: number): void {
+    for (const [reqId, pending] of this.pendingApprovals) {
+      if (pending.connGeneration !== connGeneration) continue;
       this.pendingApprovals.delete(reqId);
       clearTimeout(pending.timer);
       pending.resolve({ outcome: { outcome: 'cancelled' } });
@@ -2780,6 +2987,8 @@ export class CursorAcpProvider implements TransportProvider {
     for (const state of this.sessions.values()) {
       state.boundConnectionGeneration = 0;
       state.replaying = false;
+      state.availableCommands.clear();
+      state.compactCapability = undefined;
     }
     if (child && !child.killed) {
       try {
@@ -2879,7 +3088,7 @@ export class CursorAcpProvider implements TransportProvider {
     return this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR, `${fallbackMessage}: ${msg}`, false, err);
   }
 
-  private normalizeError(err: unknown): ProviderError {
+  private normalizeError(err: unknown, expectedSessionId?: string): ProviderError {
     if (isRecord(err) && 'code' in err && 'message' in err && 'recoverable' in err) {
       return err as unknown as ProviderError;
     }
@@ -2887,14 +3096,14 @@ export class CursorAcpProvider implements TransportProvider {
       return this.makeError(PROVIDER_ERROR_CODES.AUTH_FAILED, AUTH_ACTION_HINT, false, err);
     }
     const msg = formatErrorMessage(err);
-    if (/ENOENT|not found|spawn .*(?:cursor-agent|agent)/i.test(msg)) {
+    if (isSessionNotFoundError(err, expectedSessionId)) {
+      return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, msg, false, err);
+    }
+    if (/ENOENT|spawn\b.*(?:cursor-agent|agent)|(?:cursor-agent|agent)\b.*not found|command not found|no such file or directory/i.test(msg)) {
       return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND, `Cursor binary not found: ${msg}`, false, err);
     }
     if (isTransportClosedMessage(msg)) {
       return this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, msg, true, err);
-    }
-    if (isSessionNotFoundError(err)) {
-      return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, msg, false, err);
     }
     return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, msg, false, err);
   }

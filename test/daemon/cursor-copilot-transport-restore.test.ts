@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => {
     };
   }> = [];
   let cursorLoadErrorsRemaining = 0;
+  let cursorLoadErrorCode = -32603;
+  let cursorLoadErrorMessage = "Transient internal load failure";
   const copilotRuns: Array<{
     sessionId: string;
     prompt: string;
@@ -29,7 +31,12 @@ const mocks = vi.hoisted(() => {
     copilotRuns,
     copilotListFilters,
     getCursorLoadErrorsRemaining: () => cursorLoadErrorsRemaining,
-    setCursorLoadErrorsRemaining: (count: number) => { cursorLoadErrorsRemaining = count; },
+    setCursorLoadErrorsRemaining: (count: number, code = -32603, message = "Transient internal load failure") => {
+      cursorLoadErrorsRemaining = count;
+      cursorLoadErrorCode = code;
+      cursorLoadErrorMessage = message;
+    },
+    getCursorLoadErrorSpec: () => ({ code: cursorLoadErrorCode, message: cursorLoadErrorMessage }),
   };
 });
 
@@ -84,8 +91,13 @@ vi.mock("node:child_process", async (importOriginal) => {
               })}\n`);
             } else if (msg.id !== undefined && msg.method === "session/load") {
               if (mocks.getCursorLoadErrorsRemaining() > 0) {
-                mocks.setCursorLoadErrorsRemaining(mocks.getCursorLoadErrorsRemaining() - 1);
-                stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Transient internal load failure" } })}\n`);
+                mocks.setCursorLoadErrorsRemaining(
+                  mocks.getCursorLoadErrorsRemaining() - 1,
+                  mocks.getCursorLoadErrorSpec().code,
+                  mocks.getCursorLoadErrorSpec().message,
+                );
+                const spec = mocks.getCursorLoadErrorSpec();
+                stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, error: { code: spec.code, message: spec.message } })}\n`);
               } else {
                 stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} })}\n`);
               }
@@ -408,6 +420,44 @@ describe("cursor/copilot transport restore", { timeout: 10_000 }, () => {
     // Critical invariant: no silent session/new fallback and persisted resumeId stays untouched!
     expect(spawned?.acpRequests.some((r) => r.method === "session/new")).toBe(false);
     expect(mocks.store.get("deck_cursor_transient_brain")?.providerResumeId).toBe("cursor-chat-keep-me");
+  });
+
+  it("never resets providerResumeId or calls session/new on bare -32602 Invalid params during restore (P0-C)", async () => {
+    mocks.setCursorLoadErrorsRemaining(1, -32602, "Invalid params");
+    mocks.store.set("deck_cursor_invalid_params_brain", {
+      name: "deck_cursor_invalid_params_brain",
+      projectName: "cursorinvalidparams",
+      role: "brain",
+      agentType: "cursor-headless",
+      projectDir: "/tmp/cursor-invalid-params",
+      state: "idle",
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: "transport",
+      providerId: "cursor-headless",
+      providerSessionId: "route-cursor-32602",
+      providerResumeId: "cursor-chat-keep-32602",
+      requestedModel: "gpt-5.2",
+      activeModel: "gpt-5.2",
+    });
+
+    await connectProvider("cursor-headless", {});
+    await restoreTransportSessions("cursor-headless");
+
+    const runtime = getTransportRuntime("deck_cursor_invalid_params_brain");
+    expect(runtime?.providerSessionId).toBe("route-cursor-32602");
+
+    runtime!.send("Attempt with bare -32602 Invalid params");
+    const spawned = mocks.cursorSpawns.at(-1);
+    await vi.waitFor(() => {
+      expect(spawned?.acpRequests.some((r) => r.method === "session/load" && r.params?.sessionId === "cursor-chat-keep-32602")).toBe(true);
+    });
+    await flush();
+
+    expect(spawned?.acpRequests.some((r) => r.method === "session/new")).toBe(false);
+    expect(mocks.store.get("deck_cursor_invalid_params_brain")?.providerResumeId).toBe("cursor-chat-keep-32602");
   });
 
   it("a restored session gets its identity from the identity store (it is not in the stored record)", async () => {

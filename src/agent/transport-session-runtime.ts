@@ -15,7 +15,7 @@ import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderActiveWorkSnapshotOptions, ProviderActiveTurnDeliveryKind, ProviderCancelOrigin, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import type { TransportProvider, ProviderCapabilities, ProviderActiveWorkSnapshotOptions, ProviderActiveTurnDeliveryKind, ProviderCancelOrigin, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
 import { shouldRetryProviderErrorWithBackoff } from '../../shared/provider-error-classifier.js';
 import { CAPACITY_RETRY_LOG_EVERY_ATTEMPTS, CAPACITY_RETRY_SUCCESS_AFTER_MS, capacityRetryDelayMs } from '../../shared/capacity-retry.js';
@@ -3098,8 +3098,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     // A message sent while a capacity retry is pending is ordinary queued work: it lands behind the retried turn (the activity
     // snapshot reports `capacity_retry`), so the failed turn is never dropped and never sent twice.
-    if (isSessionCompactCommandText(message) && this.provider.capabilities.compact?.execution === 'unsupported') {
-      const reason = this.provider.capabilities.compact.reason?.trim();
+    const compactCap = this.effectiveCompactCapability();
+    if (isSessionCompactCommandText(message) && compactCap?.execution === 'unsupported') {
+      const reason = compactCap.reason?.trim();
       throw new Error(reason || `${this.provider.id} does not support /compact`);
     }
 
@@ -5869,6 +5870,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._registeredSystemContractSignatures.clear();
   }
 
+  private effectiveCompactCapability(): ProviderCapabilities['compact'] {
+    const sessionCaps = this._providerSessionId
+      ? this.provider.getSessionCapabilities?.(this._providerSessionId)
+      : undefined;
+    return sessionCaps?.compact ?? this.provider.capabilities.compact;
+  }
+
   /**
    * Compact a session whose context is nearly full, before the model degrades.
    *
@@ -5884,7 +5892,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    */
   private maybeAutoCompact(completed: AgentMessage): void {
     if (!IMCODES_AUTOMATIC_COMPACTION_ENABLED) return;
-    const compact = this.provider.capabilities.compact;
+    const compact = this.effectiveCompactCapability();
     if (compact?.execution === 'unsupported' || !compact?.verified || !compact.reassertsSessionSystemText) return;
     if (this._status !== 'idle' || this._pendingMessages.length > 0) return;
     const usage = completed.metadata?.usage as {

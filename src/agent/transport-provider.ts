@@ -861,6 +861,12 @@ export interface TransportProvider {
    * user text, API keys, environment variables, or raw MCP configuration.
    */
   getSessionDiagnostics?(sessionId: string): Record<string, unknown> | null;
+
+  /**
+   * Return effective per-session capability overrides (such as dynamically
+   * advertised slash commands for `/compact`), falling back to `this.capabilities`.
+   */
+  getSessionCapabilities?(sessionId: string): Partial<ProviderCapabilities> | null | undefined;
 }
 
 /** A single model entry returned by listModels(). */
