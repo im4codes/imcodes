@@ -8641,8 +8641,12 @@ function InternalMainApp() {
 
   useEffect(() => {
     if (typeof document === 'undefined') return;
-    document.title = buildDocumentTitle(resolvedSelectedServerName, activeSessionInfo);
-  }, [resolvedSelectedServerName, activeSessionInfo]);
+    document.title = buildDocumentTitle(
+      resolvedSelectedServerName,
+      activeSessionInfo,
+      trans('app.document_title'),
+    );
+  }, [resolvedSelectedServerName, activeSessionInfo, trans, i18n.language]);
 
   const newUserGuideSteps = useMemo<NewUserGuideStep[]>(() => [
     {

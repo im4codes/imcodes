@@ -1,4 +1,7 @@
 {
+  "app": {
+    "document_title": "IM.codes — AI フルスタック・ワークベンチ · あなた専属の AI 部隊"
+  },
   "picker": {
     "files": "ファイル"
   },

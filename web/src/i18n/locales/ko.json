@@ -1,4 +1,7 @@
 {
+  "app": {
+    "document_title": "IM.codes — AI 풀스택 워크벤치 · 나만의 AI 전대"
+  },
   "picker": {
     "files": "파일"
   },

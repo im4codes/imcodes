@@ -1,4 +1,7 @@
 {
+  "app": {
+    "document_title": "IM.codes — AI 全栈工作台 · 你的专属 AI 战队"
+  },
   "picker": {
     "files": "文件"
   },

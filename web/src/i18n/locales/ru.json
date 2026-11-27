@@ -1,4 +1,7 @@
 {
+  "app": {
+    "document_title": "IM.codes — Full-Stack AI-платформа · Твой AI-отряд"
+  },
   "picker": {
     "files": "Файлы"
   },
