@@ -56,17 +56,17 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
   });
 
   it('isolates hotwords per project, merges with global (project priority), and gates cross-account sharing by default', () => {
-    setGlobalVoiceHotwordsRaw('Antigravity\nai ma => GlobalTarget');
-    setProjectVoiceHotwordsRaw('proj-a', 'IM.codes\nworktree\nai ma => IM.codes');
+    setGlobalVoiceHotwordsRaw('Antigravity\nwrong term => GlobalTarget');
+    setProjectVoiceHotwordsRaw('proj-a', 'IM.codes\nworktree\nwrong term => IM.codes');
     setProjectVoiceHotwordsRaw('proj-b', 'codex-sdk');
 
     const compiledA = getCompiledVoiceHotwordsForProject('proj-a');
     expect(compiledA.terms).toEqual(['IM.codes', 'worktree', 'Antigravity']);
-    expect(compiledA.replacements).toEqual([{ from: 'ai ma', to: 'IM.codes' }]);
+    expect(compiledA.replacements).toEqual([{ from: 'wrong term', to: 'IM.codes' }]);
 
     const compiledB = getCompiledVoiceHotwordsForProject('proj-b');
     expect(compiledB.terms).toEqual(['codex-sdk', 'Antigravity', 'GlobalTarget']);
-    expect(compiledB.replacements).toEqual([{ from: 'ai ma', to: 'GlobalTarget' }]);
+    expect(compiledB.replacements).toEqual([{ from: 'wrong term', to: 'GlobalTarget' }]);
 
     // Privacy default: false for others' shared devices, always true for own PC App & server HTTP ASR
     expect(getShareHotwordsWithOthers()).toBe(false);
@@ -132,6 +132,11 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
         expect(typeof settings[key], `${locale}.settings.${key}`).toBe('string');
         expect(String(settings[key]).trim().length, `${locale}.settings.${key} non-empty`).toBeGreaterThan(0);
       }
+      expect(settings.voice_hotwords_project_placeholder, `${locale}.project_placeholder single line`).not.toContain('\n');
+      expect(settings.voice_hotwords_global_placeholder, `${locale}.global_placeholder single line`).not.toContain('\n');
+      const bannedCoinedHotwordsPattern = new RegExp(['\\u7231\\u7801', '\\u611b\\u78bc', 'ai ' + 'ma'].join('|'), 'i');
+      expect(settings.voice_hotwords_project_placeholder, `${locale}.project_placeholder no coined hotword`).not.toMatch(bannedCoinedHotwordsPattern);
+      expect(settings.voice_hotwords_global_placeholder, `${locale}.global_placeholder no coined hotword`).not.toMatch(bannedCoinedHotwordsPattern);
     }
   });
 

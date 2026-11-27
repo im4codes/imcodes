@@ -15,16 +15,16 @@ describe('shared voice hotwords', () => {
   it('parses plain terms and both alias syntaxes while stripping control characters', () => {
     const parsed = parseVoiceHotwordsInput([
       'IM.codes',
-      '爱码 => IM.codes',
+      '错别词 => 正确词',
       'im codes -> IM.codes',
       '  worktree\u0000\u0007  ',
       '',
       'codex-sdk',
     ].join('\n'));
 
-    expect(parsed.terms).toEqual(['IM.codes', 'IM.codes', 'IM.codes', 'worktree', 'codex-sdk']);
+    expect(parsed.terms).toEqual(['IM.codes', '正确词', 'IM.codes', 'worktree', 'codex-sdk']);
     expect(parsed.replacements).toEqual([
-      { from: '爱码', to: 'IM.codes' },
+      { from: '错别词', to: '正确词' },
       { from: 'im codes', to: 'IM.codes' },
     ]);
   });
@@ -74,7 +74,7 @@ describe('shared voice hotwords', () => {
     const compiled = mergeVoiceHotwords({
       projectRaw: [
         'IM.codes',
-        '爱码 => IM.codes',
+        '错别词 => IM.codes',
         'im codes -> IM.codes',
         'worktree',
         'codex-sdk',
@@ -84,7 +84,7 @@ describe('shared voice hotwords', () => {
     });
 
     // Alias replacement + ASCII word-boundary case normalization + punctuation adjacency + CJK adjacency
-    expect(applyVoiceHotwordPostProcess('我在用爱码和im codes管理WorkTree，接入CODEX-SDK。', compiled))
+    expect(applyVoiceHotwordPostProcess('我在用错别词和im codes管理WorkTree，接入CODEX-SDK。', compiled))
       .toBe('我在用IM.codes和IM.codes管理worktree，接入codex-sdk。');
 
     // Regex metacharacters (`C++`, `foo.bar[0]`) never throw or break matching
@@ -94,21 +94,21 @@ describe('shared voice hotwords', () => {
     // URLs (including parenthesized paths with CJK), inline/fenced code, and compound identifiers are untouched
     expect(
       applyVoiceHotwordPostProcess(
-        'Visit https://worktree.example.com/wiki/Foo_(WorkTree)/爱码 and [doc](https://example.com/imcodes_(CODEX-SDK)/爱码) or check `WorkTree` and ```ts\nconst x = "爱码 WorkTree";\n``` plus src/worktree_dir/im.codes.ts',
+        'Visit https://worktree.example.com/wiki/Foo_(WorkTree)/错别词 and [doc](https://example.com/imcodes_(CODEX-SDK)/错别词) or check `WorkTree` and ```ts\nconst x = "错别词 WorkTree";\n``` plus src/worktree_dir/im.codes.ts',
         compiled,
       ),
     ).toBe(
-      'Visit https://worktree.example.com/wiki/Foo_(WorkTree)/爱码 and [doc](https://example.com/imcodes_(CODEX-SDK)/爱码) or check `WorkTree` and ```ts\nconst x = "爱码 WorkTree";\n``` plus src/worktree_dir/im.codes.ts',
+      'Visit https://worktree.example.com/wiki/Foo_(WorkTree)/错别词 and [doc](https://example.com/imcodes_(CODEX-SDK)/错别词) or check `WorkTree` and ```ts\nconst x = "错别词 WorkTree";\n``` plus src/worktree_dir/im.codes.ts',
     );
   });
 
   it('prevents global aliases from overriding project canonical terms and handles long lines linearly', () => {
     const compiled = mergeVoiceHotwords({
       projectRaw: 'IM.codes\nWorkTree',
-      globalRaw: 'im.codes => WrongGlobal\nworktree => BadTree\n爱码 => IM.codes',
+      globalRaw: 'im.codes => WrongGlobal\nworktree => BadTree\n错别词 => IM.codes',
     });
 
-    expect(applyVoiceHotwordPostProcess('Please check im.codes and worktree via 爱码 today.', compiled))
+    expect(applyVoiceHotwordPostProcess('Please check im.codes and worktree via 错别词 today.', compiled))
       .toBe('Please check IM.codes and WorkTree via IM.codes today.');
 
     // Pathological long line with repeated arrows / unpaired backticks finishes well within budget
@@ -123,18 +123,18 @@ describe('shared voice hotwords', () => {
 
   it('preserves valid URLs containing single quotes and nested parens while correcting surrounding prose in linear time', () => {
     const compiled = mergeVoiceHotwords({
-      projectRaw: 'WorkTree\nIM.codes\n爱码 => IM.codes',
+      projectRaw: 'WorkTree\nIM.codes\n错别词 => IM.codes',
     });
 
-    const singleQuotedPathUrl = "https://en.wikipedia.org/wiki/O'Brien_(worktree)/爱码";
+    const singleQuotedPathUrl = "https://en.wikipedia.org/wiki/O'Brien_(worktree)/错别词";
     expect(() => new URL(singleQuotedPathUrl)).not.toThrow();
 
-    const text = `See ${singleQuotedPathUrl}, '${singleQuotedPathUrl}', and worktree for 爱码 today.`;
+    const text = `See ${singleQuotedPathUrl}, '${singleQuotedPathUrl}', and worktree for 错别词 today.`;
     expect(applyVoiceHotwordPostProcess(text, compiled))
       .toBe(`See ${singleQuotedPathUrl}, '${singleQuotedPathUrl}', and WorkTree for IM.codes today.`);
 
     // Unbalanced parens at scale inside URL candidate still run linearly
-    const manyParensUrl = `https://example.com/${'('.repeat(200)}worktree/${')'.repeat(400)} 爱码`;
+    const manyParensUrl = `https://example.com/${'('.repeat(200)}worktree/${')'.repeat(400)} 错别词`;
     const start = performance.now();
     const trimmed = applyVoiceHotwordPostProcess(manyParensUrl, compiled);
     expect(performance.now() - start).toBeLessThan(20);

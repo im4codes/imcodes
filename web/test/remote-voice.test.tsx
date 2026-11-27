@@ -4034,7 +4034,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
   it('enforces cross-account privacy gating on voice.session.start while always applying deterministic post-processing and forwarding in RemoteVoiceProviderController', async () => {
     const audio = setupFakeWebAudio();
     FakeWebSocket.instances.length = 0;
-    setProjectVoiceHotwordsRaw('proj-voice', 'IM.codes\nworktree\n爱码 => IM.codes');
+    setProjectVoiceHotwordsRaw('proj-voice', 'IM.codes\nworktree\n错别词 => IM.codes');
     setActiveVoiceHotwordProject('proj-voice');
 
     // 1. Others' shared PC App + privacy OFF (default): omits hotwords in voice.session.start, still post-processes returned results
@@ -4094,7 +4094,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     ws1.emitMessage({
       type: 'voice.session.result',
       sessionId: startFrame1.sessionId,
-      text: '在爱码里用WorkTree测试',
+      text: '在错别词里用WorkTree测试',
       isFinal: true,
     });
     expect(privateResults).toEqual([{ text: '在IM.codes里用worktree测试', isFinal: true }]);
