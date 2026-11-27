@@ -10,6 +10,8 @@ import path from 'node:path';
 import logger from '../util/logger.js';
 import { ensureImcDir } from '../util/imc-dir.js';
 import type { AgentType } from '../agent/detect.js';
+import { isShellLikeAgentType } from '../agent/shell-history.js';
+import { getSession } from '../store/session-store.js';
 import { DISCUSSION_RECONCILE_HIDDEN_MS } from '../../shared/discussion-ui.js';
 
 const IDLE_TIMEOUT = 300_000;      // max total wall time per response
@@ -283,7 +285,15 @@ async function waitAllReady(d: Discussion, timeoutMs: number): Promise<void> {
 
 // ── Title generation ──────────────────────────────────────────────────────
 
-async function generateTitle(sessionName: string, topic: string, titleFile: string): Promise<string> {
+function assertNonShellDiscussionSession(sessionName: string, declaredAgentType?: string | null): void {
+  const effectiveAgentType = getSession(sessionName)?.agentType ?? declaredAgentType;
+  if (isShellLikeAgentType(effectiveAgentType)) {
+    throw new Error(`Discussion participants cannot target ${effectiveAgentType} sessions (${sessionName})`);
+  }
+}
+
+async function generateTitle(sessionName: string, agentType: string, topic: string, titleFile: string): Promise<string> {
+  assertNonShellDiscussionSession(sessionName, agentType);
   await import('node:fs/promises').then((fs) => fs.writeFile(titleFile, '', 'utf8'));
 
   const prompt = [
@@ -385,7 +395,7 @@ async function runDiscussion(
   const discussDir = await ensureImcDir(d.cwd || process.cwd(), 'discussions');
   const titleAgent = d.participants[d.verdictParticipantIdx];
   const titleFile = path.join(discussDir, `title-${d.id.slice(0, 8)}.txt`);
-  const title = await generateTitle(titleAgent.sessionName, d.topic, titleFile);
+  const title = await generateTitle(titleAgent.sessionName, titleAgent.agentType, d.topic, titleFile);
   d.filePath = path.join(discussDir, `${d.id.slice(0, 8)}-${title}.md`);
   await writeFile(d.filePath, buildFileHeader(d), 'utf8');
   logger.info({ discussionId: d.id, filePath: d.filePath, title }, 'Discussion file created');
@@ -439,6 +449,7 @@ async function runDiscussion(
       const sectionHeader = `### Round ${round} — ${participant.roleLabel} (${participant.agentType}${modelTag})`;
       const prompt = buildRoundPrompt(d.filePath, participant, round, d.maxRounds, sectionHeader);
 
+      assertNonShellDiscussionSession(participant.sessionName, participant.agentType);
       await sendKeysDelayedEnter(participant.sessionName, prompt);
       const newContent = await waitForResponse(d.filePath, sizeBefore, participant.sessionName, IDLE_TIMEOUT);
 
@@ -484,6 +495,7 @@ async function runDiscussion(
   const verdictHeader = `## Verdict (by ${judge.roleLabel}${judgeModelTag})`;
   const verdictPrompt = buildVerdictPrompt(d.filePath, judge, verdictHeader);
 
+  assertNonShellDiscussionSession(judge.sessionName, judge.agentType);
   await sendKeysDelayedEnter(judge.sessionName, verdictPrompt);
   const verdictContent = await waitForResponse(d.filePath, verdictSizeBefore, judge.sessionName, IDLE_TIMEOUT);
   const verdict = verdictContent.replace(/^##[^\n]*\n*/m, '').trim() || verdictContent;
@@ -565,6 +577,14 @@ export async function startDiscussion(
 ): Promise<Discussion> {
   // filePath is set later in runDiscussion after LLM generates the title
   const filePath = '';
+  for (const p of opts.participants) {
+    if (isShellLikeAgentType(p.agentType)) {
+      throw new Error(`Discussion participants cannot use agentType ${p.agentType}`);
+    }
+    if (p.sessionName) {
+      assertNonShellDiscussionSession(p.sessionName, p.agentType);
+    }
+  }
   const participants: DiscussionParticipant[] = opts.participants.map((p, i) => {
     const reused = !!p.sessionName;
     const subId = reused

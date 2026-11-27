@@ -43,7 +43,7 @@ import { getTransportQueueStore } from './transport-queue-store.js';
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { hookCredentialEnv, mintHookCredential } from './hook-session-credential.js';
 import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
-import { cleanupShellHistoryFile, shellHistoryEnv } from '../agent/shell-history.js';
+import { cleanupShellHistoryFile, isShellLikeAgentType, shellHistoryEnv } from '../agent/shell-history.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { isNativeAgentFenceRequiredForLaunch } from './native-collaboration-guard.js';
 import { processLaunchFence } from '../agent/native-agent-fence.js';
@@ -350,7 +350,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     ...shellHistoryEnv(sessionName, agentType, sub.shellBin),
   });
 
-  const isShellLike = agentType === 'shell' || agentType === 'script';
+  const isShellLike = isShellLikeAgentType(agentType);
   const releaseRecovery = (!sub.fresh && !isShellLike)
     ? claimProcessRestartContinuationRecovery(sessionName, resourceRuntimeEpoch)
     : undefined;

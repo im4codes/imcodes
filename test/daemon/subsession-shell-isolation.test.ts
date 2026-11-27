@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => {
     capturePane: vi.fn(async () => []),
     sendKey: vi.fn(async () => {}),
     sendKeys: vi.fn(async () => {}),
+    sendKeysDelayedEnter: vi.fn(async () => {}),
     resolveEffectiveIdentityPrompt: vi.fn(async () => 'User identity instruction\n'.repeat(18)),
   };
 });
@@ -35,6 +36,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   capturePane: mocks.capturePane,
   sendKey: mocks.sendKey,
   sendKeys: mocks.sendKeys,
+  sendKeysDelayedEnter: mocks.sendKeysDelayedEnter,
   getPanePids: vi.fn(async () => []),
   getPaneId: mocks.getPaneId,
 }));
@@ -93,8 +95,9 @@ vi.mock('../../src/daemon/opencode-watcher.js', () => ({
 }));
 
 import { startSubSession, stopSubSession } from '../../src/daemon/subsession-manager.js';
+import { startDiscussion } from '../../src/daemon/discussion-orchestrator.js';
 
-describe('subsession-manager shell/script prompt guard & HISTFILE isolation', () => {
+describe('subsession-manager shell/script prompt guard, HISTFILE isolation, and discussion guard', () => {
   let stateDir: string;
 
   beforeEach(() => {
@@ -156,9 +159,9 @@ describe('subsession-manager shell/script prompt guard & HISTFILE isolation', ()
     expect(ccEnv?.HISTFILE).toBeUndefined();
   });
 
-  it('assigns distinct per-session HISTFILE paths across concurrent shell sub-sessions, preserves on restart, and cleans up on stopSubSession', async () => {
-    await startSubSession({ id: 'sh1', type: 'shell', cwd: '/tmp' });
-    await startSubSession({ id: 'sh2', type: 'shell', cwd: '/tmp' });
+  it('assigns distinct HISTFILE paths across concurrent shell sub-sessions, preserves on restart, and commits close even if history unlink hits non-ENOENT I/O error', async () => {
+    await startSubSession({ id: 'sh1', type: 'shell', cwd: '/tmp', shellBin: '/bin/bash' });
+    await startSubSession({ id: 'sh2', type: 'shell', cwd: '/tmp', shellBin: '/bin/bash' });
 
     const expected1 = join(stateDir, 'shell-history', 'deck_sub_sh1.history');
     const expected2 = join(stateDir, 'shell-history', 'deck_sub_sh2.history');
@@ -169,16 +172,67 @@ describe('subsession-manager shell/script prompt guard & HISTFILE isolation', ()
     writeFileSync(expected1, 'echo sh1\n', 'utf8');
     writeFileSync(expected2, 'echo sh2\n', 'utf8');
 
-    // Simulated daemon-restart rebuild when tmux session died: keeps sh1's existing HISTFILE content
-    await startSubSession({ id: 'sh1', type: 'shell', cwd: '/tmp' });
+    // Simulated daemon-restart rebuild keeps sh1 history
+    await startSubSession({ id: 'sh1', type: 'shell', cwd: '/tmp', shellBin: '/bin/bash' });
     expect((mocks.newSession.mock.calls[2] as any)?.[2]?.env?.HISTFILE).toBe(expected1);
     expect(readFileSync(expected1, 'utf8')).toBe('echo sh1\n');
 
-    // Permanent close via stopSubSession removes sh1 history file without affecting sh2
+    // Close removes sh1 cleanly
     const closeRes = await stopSubSession('deck_sub_sh1');
     expect(closeRes.ok).toBe(true);
     expect(existsSync(expected1)).toBe(false);
     expect(existsSync(expected2)).toBe(true);
+
+    // Real non-ENOENT EISDIR unlink failure on sh3 must NOT roll back close or fail stopSubSession
+    await startSubSession({ id: 'sh3', type: 'shell', cwd: '/tmp', shellBin: '/bin/bash' });
+    const expected3 = join(stateDir, 'shell-history', 'deck_sub_sh3.history');
+    mkdirSync(expected3);
+    const serverMessages: any[] = [];
+    const closeRes3 = await stopSubSession('deck_sub_sh3', { send: (m) => serverMessages.push(m) });
+    expect(closeRes3.ok).toBe(true);
+    expect(closeRes3.failed).toEqual([]);
+    expect(mocks.store.has('deck_sub_sh3')).toBe(false);
+    expect(serverMessages).toContainEqual({ type: 'subsession.closed', id: 'sh3', sessionName: 'deck_sub_sh3' });
     expect(readFileSync(expected2, 'utf8')).toBe('echo sh2\n');
+  });
+
+  it('rejects discussion participants targeting shell/script sessions by agentType or live store record before prompting', async () => {
+    mocks.store.set('deck_sub_live_shell', { name: 'deck_sub_live_shell', agentType: 'shell', state: 'idle' });
+    mocks.store.set('deck_sub_live_script', { name: 'deck_sub_live_script', agentType: 'script', state: 'idle' });
+
+    await expect(startDiscussion({
+      id: 'disc-1',
+      serverId: 'srv-1',
+      topic: 'Should reject shell',
+      cwd: stateDir,
+      participants: [{ agentType: 'shell', roleId: 'critic' }],
+    }, vi.fn())).rejects.toThrow(/shell/);
+
+    await expect(startDiscussion({
+      id: 'disc-2',
+      serverId: 'srv-1',
+      topic: 'Should reject script',
+      cwd: stateDir,
+      participants: [{ agentType: 'script', roleId: 'critic' }],
+    }, vi.fn())).rejects.toThrow(/script/);
+
+    // Reused session claiming agentType='claude-code' while live store record is actually shell/script MUST still reject
+    await expect(startDiscussion({
+      id: 'disc-3',
+      serverId: 'srv-1',
+      topic: 'Should reject spoofed reused shell',
+      cwd: stateDir,
+      participants: [{ agentType: 'claude-code', sessionName: 'deck_sub_live_shell', roleId: 'critic' }],
+    }, vi.fn())).rejects.toThrow(/shell/);
+
+    await expect(startDiscussion({
+      id: 'disc-4',
+      serverId: 'srv-1',
+      topic: 'Should reject spoofed reused script',
+      cwd: stateDir,
+      participants: [{ agentType: 'codex', sessionName: 'deck_sub_live_script', roleId: 'critic' }],
+    }, vi.fn())).rejects.toThrow(/script/);
+
+    expect(mocks.sendKeysDelayedEnter).not.toHaveBeenCalled();
   });
 });

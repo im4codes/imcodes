@@ -1,6 +1,7 @@
 import { cwdPrefix, type AgentDriver, type LaunchOptions } from './base.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
+import { buildShellHistoryLaunchArgs, resolveShellBin } from '../shell-history.js';
 
 export class ShellDriver implements AgentDriver {
   readonly type = 'shell' as const;
@@ -8,12 +9,11 @@ export class ShellDriver implements AgentDriver {
   readonly spinnerChars: string[] = [];
 
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
-    const bin = (opts as { shellBin?: string } | undefined)?.shellBin
-      ?? process.env.SHELL
-      ?? (process.platform === 'win32' ? (process.env.COMSPEC ?? 'powershell.exe') : '/bin/bash');
+    const bin = resolveShellBin(opts?.shellBin);
     const cwd = cwdPrefix(opts?.cwd);
     const quotedBin = process.platform === 'win32' && /\s/.test(bin) ? `"${bin}"` : bin;
-    return `${cwd}${quotedBin}`;
+    const rcArgs = buildShellHistoryLaunchArgs(bin);
+    return `${cwd}${quotedBin}${rcArgs}`;
   }
 
   buildResumeCommand(sessionName: string, opts?: LaunchOptions): string {

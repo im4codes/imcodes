@@ -151,7 +151,7 @@ import { getAuthenticatedCapabilityOwner } from '../capability/capability-author
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 import { imcodesStateDirEnv } from '../util/imcodes-state-dir.js';
-import { cleanupShellHistoryFile, shellHistoryEnv } from './shell-history.js';
+import { cleanupShellHistoryFile, isShellLikeAgentType, shellHistoryEnv } from './shell-history.js';
 import { extractSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 import { beginCrossVendorHandoffState, isCrossVendorHandoffLaunchCurrent, normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
@@ -1074,6 +1074,7 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
       agentType: effectiveRecord.agentType as AgentType,
       projectDir: effectiveRecord.projectDir,
       skipStore: true,
+      ...(effectiveRecord.shellBin ? { shellBin: effectiveRecord.shellBin } : {}),
       ccSessionId: effectiveRecord.ccSessionId,
       codexSessionId: effectiveRecord.codexSessionId,
       opencodeSessionId: effectiveRecord.opencodeSessionId,
@@ -1162,7 +1163,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   // doesn't need to parse POSIX `export` syntax.  On tmux/wezterm, prepend `export` to cmd.
   // A respawn always starts a new process, so it gets a new hook credential (the old process's copy stops working).
   const hookCredential = mintHookCredential();
-  const isShellLike = effectiveRecord.agentType === 'shell' || effectiveRecord.agentType === 'script';
+  const isShellLike = isShellLikeAgentType(effectiveRecord.agentType);
   const mergedEnv: Record<string, string> = {
     ...imcodesStateDirEnv(),
     IMCODES_SESSION: record.name,
@@ -1473,8 +1474,20 @@ export async function relaunchSessionWithSettings(
   const forceHandoff = overrides.handoff === true;
   const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
   const effectiveHandoffConfig = forceHandoff ? { ...handoffConfig, enabled: true } : handoffConfig;
-  const wantsHandoff = !isPrivate && shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled;
-  const isShellLikeTarget = targetAgentType === 'shell' || targetAgentType === 'script';
+  const isShellLikeSource = isShellLikeAgentType(record.agentType);
+  const isShellLikeTarget = isShellLikeAgentType(targetAgentType);
+  const wantsHandoff = !isPrivate
+    && !isShellLikeSource
+    && !isShellLikeTarget
+    && shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff)
+    && effectiveHandoffConfig.enabled;
+  if (isShellLikeTarget && record.crossVendorHandoff?.pending) {
+    upsertSession({
+      ...record,
+      crossVendorHandoff: stripPendingCrossVendorHandoff(record.crossVendorHandoff, true),
+      updatedAt: Date.now(),
+    });
+  }
   const [resolvedIdentityPrompt, cutoffEvents] = await Promise.all([
     overrides.identityPrompt !== undefined
       ? Promise.resolve(overrides.identityPrompt)
@@ -1626,7 +1639,8 @@ export async function relaunchSessionWithSettings(
         const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
         let injected = false;
         await runWithProcessSessionSendLock(record.name, async () => {
-          if (!isCurrentLaunch()) return;
+          const current = getSession(record.name);
+          if (!isCurrentLaunch() || isShellLikeTarget || isShellLikeAgentType(current?.agentType)) return;
           const writePrivate = await prepareProcessSessionPrivateWriter(record.name);
           writePrivate(pack.text);
           injected = true;
@@ -4643,7 +4657,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
 
   const exists = await sessionExists(name);
   const storedBeforeLaunch = getSession(name);
-  const pendingHandoffOnRestart = !fresh ? storedBeforeLaunch?.crossVendorHandoff?.pending : undefined;
+  const pendingHandoffOnRestart = !fresh && !isShellLikeAgentType(agentType) ? storedBeforeLaunch?.crossVendorHandoff?.pending : undefined;
   const resourceSessionInstanceId = storedBeforeLaunch?.sessionInstanceId ?? randomUUID();
   const resourceRuntimeEpoch = !exists ? randomUUID() : storedBeforeLaunch?.runtimeEpoch ?? randomUUID();
   // Inject both the display identity and the exact logical/runtime owner tuple.
@@ -4815,13 +4829,14 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       } : {}),
       ...(label ? { label } : {}),
       ...(opts.description ? { description: opts.description } : {}),
-      ...(opts.identityPrompt && agentType !== 'shell' && agentType !== 'script' ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
+      ...(opts.identityPrompt && !isShellLikeAgentType(agentType) ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
+      ...(opts.shellBin && isShellLikeAgentType(agentType) ? { shellBin: opts.shellBin } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
       ...(existing?.crossVendorHandoff ? {
         crossVendorHandoff: stripPendingCrossVendorHandoff(
           (getSession(name) ?? existing)?.crossVendorHandoff,
-          fresh,
+          fresh || isShellLikeAgentType(agentType),
         ),
       } : {}),
       ...(summarySyncFingerprints.length > 0 ? { summarySyncFingerprints } : {}),
@@ -4850,12 +4865,13 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(opencodeSessionId ? { opencodeSessionId } : {}),
         ...(opts.qwenModel ? { qwenModel: opts.qwenModel } : {}),
         ...(opts.description ? { description: opts.description } : {}),
-        ...(opts.identityPrompt && agentType !== 'shell' && agentType !== 'script' ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
+        ...(opts.identityPrompt && !isShellLikeAgentType(agentType) ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
+        ...(opts.shellBin && isShellLikeAgentType(agentType) ? { shellBin: opts.shellBin } : {}),
         ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
         ...(opts.userCreated ? { userCreated: true } : {}),
         ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
         ...(existing.crossVendorHandoff ? {
-          crossVendorHandoff: stripPendingCrossVendorHandoff(existing.crossVendorHandoff, fresh),
+          crossVendorHandoff: stripPendingCrossVendorHandoff(existing.crossVendorHandoff, fresh || isShellLikeAgentType(agentType)),
         } : {}),
         ...(launchedNativeAgentFence ? { nativeAgentLaunchFence: launchedNativeAgentFence } : {}),
         updatedAt: Date.now(),
@@ -4888,6 +4904,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
             (key) => sendKey(name, key),
           ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
         }
+        if (isShellLikeAgentType(agentType)) return;
         if (pendingHandoffOnRestart) {
           try {
             const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
@@ -4895,6 +4912,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
             await runWithProcessSessionSendLock(name, async () => {
               const current = getSession(name);
               if (!current?.crossVendorHandoff?.pending
+                || isShellLikeAgentType(current.agentType)
                 || current.crossVendorHandoff.pending.cutoff.epoch !== pendingHandoffOnRestart.cutoff.epoch
                 || current.crossVendorHandoff.pending.cutoff.seq !== pendingHandoffOnRestart.cutoff.seq) return;
               const writePrivate = await prepareProcessSessionPrivateWriter(name);
@@ -4915,7 +4933,6 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
             incrementCounter('handoff.injection_failed', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
           }
         }
-        if (agentType === 'shell' || agentType === 'script') return;
         if (fresh) {
           retireRestartContinuation(name);
         }

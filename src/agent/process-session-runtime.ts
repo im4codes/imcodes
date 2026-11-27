@@ -3,6 +3,7 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus, AgentType } from './detect.js';
 import { detectStatusAsync } from './detect.js';
 import { sendKeys, killSession } from './tmux.js';
+import { isShellLikeAgentType } from './shell-history.js';
 
 export class ProcessSessionRuntime implements SessionRuntime {
   readonly type = RUNTIME_TYPES.PROCESS;
@@ -14,8 +15,7 @@ export class ProcessSessionRuntime implements SessionRuntime {
   ) {}
 
   async send(message: string): Promise<void> {
-    const isShellLike = this.agentType === 'shell' || this.agentType === 'script';
-    if (isShellLike) {
+    if (isShellLikeAgentType(this.agentType)) {
       await sendKeys(this.sessionName, message, { verbatim: true });
       return;
     }
