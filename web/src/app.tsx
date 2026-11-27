@@ -285,6 +285,15 @@ import {
   readSharedTabRestoreMarker,
   rememberSharedTab,
 } from './shared-tab-restore.js';
+import {
+  buildSharedServerSubSessionStates,
+  findSharedEntryForServerTab,
+  isActiveRestrictedSharedServer,
+  mergeSharedServerSessions,
+  mergeSharedServerSubSessions,
+  resolvePreferredSharedEntryForServer,
+  resolveRestrictedSubSessionClick,
+} from './shared-server-tabs.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
   LOCAL_WEB_PREVIEW_PANEL_TYPE,
@@ -1382,9 +1391,13 @@ function InternalMainApp() {
   }, []);
   const [shareDialogTarget, setShareDialogTarget] = useState<ShareDialogTarget | null>(null);
   const [selectedShareTarget, setSelectedShareTarget] = useState<ShareTarget | null>(null);
+  const selectedShareTargetRef = useRef(selectedShareTarget);
+  selectedShareTargetRef.current = selectedShareTarget;
   const [selectedSharedEntryId, setSelectedSharedEntryId] = useState<string | null>(
     () => initialHashStateRef.current.sharedEntryId,
   );
+  const selectedSharedEntryIdRef = useRef(selectedSharedEntryId);
+  selectedSharedEntryIdRef.current = selectedSharedEntryId;
   const [sharedHashRestorePending, setSharedHashRestorePending] = useState(
     () => Boolean(initialHashStateRef.current.serverId),
   );
@@ -1392,6 +1405,11 @@ function InternalMainApp() {
   const [sharedReturnServer, setSharedReturnServer] = useState<SharedReturnServer | null>(null);
   const [showSharedReturnGuide, setShowSharedReturnGuide] = useState(false);
   const [sharedEntries, setSharedEntries] = useState<SharedEntrySummary[]>([]);
+  const sharedEntriesRef = useRef(sharedEntries);
+  sharedEntriesRef.current = sharedEntries;
+  const lastSharedEntryIdByServerRef = useRef<Map<string, string>>(new Map());
+  const visitedSharedSessionsByServerRef = useRef<Map<string, Map<string, SessionInfo>>>(new Map());
+  const visitedSharedSubSessionsByServerRef = useRef<Map<string, Map<string, SubSession>>>(new Map());
   const [sharedEntriesLoading, setSharedEntriesLoading] = useState(false);
   const [sharedEntriesLoaded, setSharedEntriesLoaded] = useState(false);
   const [sharedEntriesError, setSharedEntriesError] = useState<string | null>(null);
@@ -2402,6 +2420,9 @@ function InternalMainApp() {
 
     if (!authRef.current || !currentUserId) {
       lastSharedAuthUserIdRef.current = null;
+      lastSharedEntryIdByServerRef.current.clear();
+      visitedSharedSessionsByServerRef.current.clear();
+      visitedSharedSubSessionsByServerRef.current.clear();
       setSharedEntries([]);
       setSharedEntriesError(null);
       setSharedEntriesLoaded(false);
@@ -2411,6 +2432,9 @@ function InternalMainApp() {
     // Account switch boundary: if switching users, immediately clear prior user's shared entries
     if (lastSharedAuthUserIdRef.current !== currentUserId) {
       lastSharedAuthUserIdRef.current = currentUserId;
+      lastSharedEntryIdByServerRef.current.clear();
+      visitedSharedSessionsByServerRef.current.clear();
+      visitedSharedSubSessionsByServerRef.current.clear();
       setSharedEntries([]);
     }
     if (!options?.silent) {
@@ -2612,9 +2636,20 @@ function InternalMainApp() {
     return readCachedServerSessions(initialServerId);
   });
   const [sharedActiveDispatchIds, setSharedActiveDispatchIds] = useState<Map<string, string>>(() => new Map());
+  const mergedMainSessions = useMemo(
+    () => mergeSharedServerSessions({
+      serverId: selectedServerId,
+      isOwnedServer: Boolean(selectedServerId && ownedServerIdsRef.current.has(selectedServerId)),
+      activeTarget: selectedShareTarget,
+      sharedEntries,
+      liveSessions: sessions,
+      cachedSessions: selectedServerId ? visitedSharedSessionsByServerRef.current.get(selectedServerId) : undefined,
+    }),
+    [selectedServerId, selectedShareTarget, sessions, sharedEntries],
+  );
   const navigableMainSessions = useMemo(
-    () => sessions.filter(isNavigableMainSession),
-    [sessions],
+    () => mergedMainSessions.filter(isNavigableMainSession),
+    [mergedMainSessions],
   );
   const managedSharedStateByTarget = useMemo(() => indexManagedSharedStates(managedShares), [managedShares]);
   const selectedServerSharedOutState = useMemo(() => {
@@ -3998,7 +4033,36 @@ function InternalMainApp() {
     }
   }, [bringSubToFront, clearPendingSubChatScroll, clearSubSessionMaximized, scheduleSubChatScrollToBottom, setOpenSubIds, unpinSubSessionPanel]);
 
+  const handleOpenSharedEntryLatestRef = useRef<((
+    entry: SharedEntrySummary,
+    options?: {
+      restoreFromHash?: boolean;
+      preferredSessionName?: string | null;
+      openSubSessionId?: string;
+      source?: 'ui' | 'external' | 'startup';
+    },
+  ) => Promise<SharedOpenResultStatus>) | null>(null);
+  const mergedSubSessionsRef = useRef<readonly SubSession[]>([]);
+
   const toggleSubSession = useCallback((id: string) => {
+    const serverId = selectedServerIdRef.current;
+    const clickPlan = resolveRestrictedSubSessionClick({
+      entries: sharedEntriesRef.current,
+      serverId,
+      isOwnedServer: Boolean(serverId && ownedServerIdsRef.current.has(serverId)),
+      activeTarget: selectedShareTargetRef.current,
+      activeEntryId: selectedSharedEntryIdRef.current,
+      subSessionId: id,
+      subSessions: mergedSubSessionsRef.current,
+    });
+    if (clickPlan.action === 'open') {
+      void handleOpenSharedEntryLatestRef.current?.(
+        clickPlan.entry,
+        clickPlan.openSubSessionId ? { openSubSessionId: clickPlan.openSubSessionId } : undefined,
+      );
+      return;
+    }
+
     const mobile = isMobileRef.current;
 
     if (mobile) {
@@ -4463,6 +4527,58 @@ function InternalMainApp() {
   }, [selectedServerId, selectedSharedEntryId, selectedShareTarget]);
 
   const selectMainSessionTab = useCallback((name: string) => {
+    const serverId = selectedServerIdRef.current;
+    if (serverId && isActiveRestrictedSharedServer({
+      serverId,
+      isOwnedServer: ownedServerIdsRef.current.has(serverId),
+      activeTarget: selectedShareTargetRef.current,
+    })) {
+      const targetEntry = findSharedEntryForServerTab(
+        sharedEntriesRef.current,
+        serverId,
+        name,
+        mergedSubSessionsRef.current,
+      );
+      const currentTarget = selectedShareTargetRef.current;
+      const alreadyOpenMain = Boolean(
+        targetEntry
+        && targetEntry.target.kind === 'main'
+        && currentTarget?.kind === 'main'
+        && currentTarget.sessionName === name
+        && selectedSharedEntryIdRef.current === targetEntry.id,
+      );
+      const alreadyOpenSubParent = Boolean(
+        targetEntry
+        && targetEntry.target.kind === 'subsession'
+        && currentTarget?.kind === 'subsession'
+        && currentTarget.subSessionId === targetEntry.target.subSessionId
+        && selectedSharedEntryIdRef.current === targetEntry.id,
+      );
+      if (targetEntry && !alreadyOpenMain && !alreadyOpenSubParent) {
+        void handleOpenSharedEntryLatestRef.current?.(targetEntry, { preferredSessionName: name });
+        setIdleAlerts((prev) => {
+          const next = new Set(prev);
+          next.delete(name);
+          return next;
+        });
+        return;
+      }
+      if (targetEntry && (alreadyOpenMain || alreadyOpenSubParent)) {
+        if (name === activeSessionRef.current) {
+          closeAllSubSessionWindows();
+          scheduleMainChatScrollToBottom(name);
+        } else {
+          setActiveSession(name, { remember: false });
+        }
+        setIdleAlerts((prev) => {
+          const next = new Set(prev);
+          next.delete(name);
+          return next;
+        });
+        return;
+      }
+    }
+
     claimExplicitSessionNavigation(name);
     if (name === activeSessionRef.current) {
       closeAllSubSessionWindows();
@@ -4478,6 +4594,35 @@ function InternalMainApp() {
   }, [claimExplicitSessionNavigation, closeAllSubSessionWindows, scheduleMainChatScrollToBottom, setActiveSession]);
 
   const selectSubSessionFromTree = useCallback((sub: SubSession) => {
+    const serverId = selectedServerIdRef.current;
+    if (serverId && isActiveRestrictedSharedServer({
+      serverId,
+      isOwnedServer: ownedServerIdsRef.current.has(serverId),
+      activeTarget: selectedShareTargetRef.current,
+    })) {
+      const clickPlan = resolveRestrictedSubSessionClick({
+        entries: sharedEntriesRef.current,
+        serverId,
+        isOwnedServer: false,
+        activeTarget: selectedShareTargetRef.current,
+        activeEntryId: selectedSharedEntryIdRef.current,
+        subSessionId: sub.id,
+        subSessions: mergedSubSessionsRef.current,
+      });
+      if (clickPlan.action === 'open') {
+        void handleOpenSharedEntryLatestRef.current?.(
+          clickPlan.entry,
+          clickPlan.openSubSessionId ? { openSubSessionId: clickPlan.openSubSessionId } : undefined,
+        );
+        return;
+      }
+      if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
+        setActiveSession(sub.parentSession, { keepSubWindows: true, remember: false });
+      }
+      openSubSessionWindow(sub.id);
+      return;
+    }
+
     claimExplicitSessionNavigation(sub.parentSession ?? activeSessionRef.current ?? sub.sessionName);
     if (sub.parentSession && sub.parentSession !== activeSessionRef.current) {
       setActiveSession(sub.parentSession, { keepSubWindows: true });
@@ -4729,6 +4874,46 @@ function InternalMainApp() {
     () => (subSessionsScopedToServer && activeScopedSession ? rawVisibleSubSessions : []),
     [activeScopedSession, rawVisibleSubSessions, subSessionsScopedToServer],
   );
+  useEffect(() => {
+    if (!selectedServerId || ownedServerIdsRef.current.has(selectedServerId)) return;
+    if (!selectedShareTarget || selectedShareTarget.kind === 'server') return;
+    if (subSessions.length === 0) return;
+    let map = visitedSharedSubSessionsByServerRef.current.get(selectedServerId);
+    if (!map) {
+      map = new Map<string, SubSession>();
+      visitedSharedSubSessionsByServerRef.current.set(selectedServerId, map);
+    }
+    for (const sub of subSessions) {
+      map.set(sub.id, sub);
+    }
+  }, [selectedServerId, selectedShareTarget, subSessions]);
+  const mergedSubSessions = useMemo(
+    () => mergeSharedServerSubSessions({
+      serverId: selectedServerId,
+      isOwnedServer: Boolean(selectedServerId && ownedServerIdsRef.current.has(selectedServerId)),
+      activeTarget: selectedShareTarget,
+      sharedEntries,
+      liveSubSessions: subSessions,
+      cachedSubSessions: selectedServerId ? visitedSharedSubSessionsByServerRef.current.get(selectedServerId) : undefined,
+    }),
+    [selectedServerId, selectedShareTarget, sharedEntries, subSessions],
+  );
+  mergedSubSessionsRef.current = mergedSubSessions;
+  const mergedVisibleSubSessions = useMemo(() => {
+    if (!selectedServerId || !activeScopedSession) return visibleSubSessions;
+    if (!isActiveRestrictedSharedServer({
+      serverId: selectedServerId,
+      isOwnedServer: ownedServerIdsRef.current.has(selectedServerId),
+      activeTarget: selectedShareTarget,
+    })) {
+      return visibleSubSessions;
+    }
+    const existingIds = new Set(visibleSubSessions.map((sub) => sub.id));
+    const extras = mergedSubSessions.filter(
+      (sub) => !existingIds.has(sub.id) && sub.parentSession === activeScopedSession,
+    );
+    return extras.length > 0 ? [...visibleSubSessions, ...extras] : visibleSubSessions;
+  }, [activeScopedSession, mergedSubSessions, selectedServerId, selectedShareTarget, visibleSubSessions]);
 
   // Session settings may stay open across a daemon rolling upgrade. Keep the
   // authority fields live instead of freezing the identity snapshot captured
@@ -4824,7 +5009,7 @@ function InternalMainApp() {
   const managedSharedSubSessionStateById = useMemo(() => {
     const states = new Map<string, SharedStateSummary>();
     if (!selectedServerId) return states;
-    for (const sub of subSessions) {
+    for (const sub of mergedSubSessions) {
       const directState = managedSharedStateByTarget.get(`subsession:${selectedServerId}:${sub.id}`)
         ?? managedSharedStateByTarget.get(`subsession:${selectedServerId}:${sub.sessionName}`);
       const parentState = sub.parentSession ? managedSharedSessionStateByName.get(sub.parentSession) : null;
@@ -4837,8 +5022,16 @@ function InternalMainApp() {
       states.set(sub.id, withActiveDispatch);
       states.set(sub.sessionName, withActiveDispatch);
     }
-    return states;
-  }, [managedSharedSessionStateByName, managedSharedStateByTarget, selectedServerId, selectedServerSharedOutState, sharedActiveDispatchIds, subSessions]);
+    return buildSharedServerSubSessionStates({
+      serverId: selectedServerId,
+      isOwnedServer: ownedServerIdsRef.current.has(selectedServerId),
+      activeTarget: selectedShareTarget,
+      sharedEntries,
+      subSessions: mergedSubSessions,
+      baseStates: states,
+      activeDispatchIds: sharedActiveDispatchIds,
+    });
+  }, [managedSharedSessionStateByName, managedSharedStateByTarget, mergedSubSessions, selectedServerId, selectedServerSharedOutState, selectedShareTarget, sharedActiveDispatchIds, sharedEntries]);
 
   const resetServerScopedOverlaysAndTargets = useCallback((preservePendingNavForServerId?: string | null) => {
     askAnswerTrackerRef.current?.dispose();
@@ -4897,6 +5090,7 @@ function InternalMainApp() {
     options?: {
       restoreFromHash?: boolean;
       preferredSessionName?: string | null;
+      openSubSessionId?: string;
       source?: 'ui' | 'external' | 'startup';
     },
   ): Promise<SharedOpenResultStatus> => {
@@ -5017,6 +5211,7 @@ function InternalMainApp() {
       wsAuthoritativeServerEpochRef.current = null;
       setSelectedShareTarget(opened.target);
       setSelectedSharedEntryId(entry.id);
+      lastSharedEntryIdByServerRef.current.set(opened.server.id, entry.id);
       rememberSharedTab(entry);
       setManualDashboard(false);
       selectedServerIdRef.current = opened.server.id;
@@ -5037,6 +5232,16 @@ function InternalMainApp() {
           : [nextServer, ...prev]
       ));
       setServersLoaded(true);
+      if (opened.target.kind !== 'server') {
+        let serverCache = visitedSharedSessionsByServerRef.current.get(opened.server.id);
+        if (!serverCache) {
+          serverCache = new Map<string, SessionInfo>();
+          visitedSharedSessionsByServerRef.current.set(opened.server.id, serverCache);
+        }
+        for (const session of mappedSessions) {
+          serverCache.set(session.name, session);
+        }
+      }
       setSessions(mappedSessions);
       setSessionsLoaded(true);
       hydrateSharedSubSessions(opened.server.id, opened.subSessions);
@@ -5064,6 +5269,10 @@ function InternalMainApp() {
       if (openedTarget.kind === 'subsession') {
         setOpenSubIds((prev) => new Set([...prev, openedTarget.subSessionId]));
         scheduleSubChatScrollToBottom(openedTarget.subSessionId);
+      } else if (options?.openSubSessionId) {
+        const subIdToOpen = options.openSubSessionId;
+        setOpenSubIds((prev) => new Set([...prev, subIdToOpen]));
+        scheduleSubChatScrollToBottom(subIdToOpen);
       }
       if (returnServer) {
         setSharedReturnServer(returnServer);
@@ -5098,6 +5307,35 @@ function InternalMainApp() {
       }
     }
   }, [clearPendingMainChatScroll, clearPendingSubChatScroll, hydrateSharedSubSessions, resetServerScopedOverlaysAndTargets, resolvedSelectedServerName, scheduleSubChatScrollToBottom, selectedServerId, selectedShareTarget, servers, setActiveSession, setOpenSubIds, sharedReturnServer, trans]);
+  handleOpenSharedEntryLatestRef.current = handleOpenSharedEntry;
+
+  const openSharedServerEntryPreferringLast = useCallback((entry: SharedEntrySummary) => {
+    const preferred = resolvePreferredSharedEntryForServer(
+      sharedEntriesRef.current,
+      entry.serverId,
+      lastSharedEntryIdByServerRef.current.get(entry.serverId) ?? null,
+      entry,
+    );
+    return handleOpenSharedEntry(preferred ?? entry);
+  }, [handleOpenSharedEntry]);
+
+  useEffect(() => {
+    if (!selectedServerId || ownedServerIdsRef.current.has(selectedServerId)) return;
+    if (!sharedEntriesLoaded || !selectedShareTarget || !selectedSharedEntryId) return;
+    const stillActive = sharedEntries.some(
+      (entry) => entry.id === selectedSharedEntryId && entry.status === 'active',
+    );
+    if (stillActive) return;
+    const fallback = resolvePreferredSharedEntryForServer(
+      sharedEntries,
+      selectedServerId,
+      lastSharedEntryIdByServerRef.current.get(selectedServerId) ?? null,
+      null,
+    );
+    if (fallback) {
+      void handleOpenSharedEntry(fallback);
+    }
+  }, [handleOpenSharedEntry, selectedServerId, selectedShareTarget, selectedSharedEntryId, sharedEntries, sharedEntriesLoaded]);
 
   useEffect(() => {
     if (initialAuthVerificationPending || !sharedHashRestorePending || !auth || !serversLoaded) return;
@@ -6057,6 +6295,21 @@ function InternalMainApp() {
             manualStoppedMainSessionsRef.current.delete(key);
           }
         }
+        const isRestrictedSharedUpdate = isActiveRestrictedSharedServer({
+          serverId: selectedServerId,
+          isOwnedServer: ownedServerIdsRef.current.has(selectedServerId),
+          activeTarget: selectedShareTargetRef.current,
+        });
+        if (isRestrictedSharedUpdate) {
+          let serverCache = visitedSharedSessionsByServerRef.current.get(selectedServerId);
+          if (!serverCache) {
+            serverCache = new Map<string, SessionInfo>();
+            visitedSharedSessionsByServerRef.current.set(selectedServerId, serverCache);
+          }
+          for (const session of mergedSessionList) {
+            serverCache.set(session.name, session);
+          }
+        }
         setSessions((prev) => newSessions.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
           return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
@@ -6070,13 +6323,23 @@ function InternalMainApp() {
           writeCachedServerSessions(selectedServerId, mergedSessionList);
         }
         setSessionsLoaded(true);
+        const postMergeNavigable = isRestrictedSharedUpdate
+          ? mergeSharedServerSessions({
+              serverId: selectedServerId,
+              isOwnedServer: false,
+              activeTarget: selectedShareTargetRef.current,
+              sharedEntries: sharedEntriesRef.current,
+              liveSessions: mergedSessionList,
+              cachedSessions: visitedSharedSessionsByServerRef.current.get(selectedServerId),
+            }).filter(isNavigableMainSession)
+          : navigableNewSessions;
         // If the active top-level session disappeared or is a hidden worker,
         // navigate back to the owning brain session instead of surfacing W1/W2
         // as independent windows.
-        if (activeSessionRef.current && !navigableNewSessions.some((s) => s.name === activeSessionRef.current)) {
+        if (activeSessionRef.current && !postMergeNavigable.some((s) => s.name === activeSessionRef.current)) {
           const hiddenActive = newSessions.find((s) => s.name === activeSessionRef.current);
           const replacement = hiddenActive
-            ? navigableNewSessions.find((s) => s.project === hiddenActive.project)
+            ? postMergeNavigable.find((s) => s.project === hiddenActive.project)
             : null;
           setActiveSession(replacement?.name ?? null, { remember: false });
         } else if (!activeSessionRef.current && !selectedShareTarget && !sharedHashRestorePending) {
@@ -7681,12 +7944,12 @@ function InternalMainApp() {
   const handleUnifiedServerSelect = useCallback((item: UnifiedServerItem) => {
     if (item.isSharedIn) {
       if (item.sharedEntry) {
-        void handleOpenSharedEntry(item.sharedEntry);
+        void openSharedServerEntryPreferringLast(item.sharedEntry);
       }
       return;
     }
     handleSelectServer(item.id, item.name);
-  }, [handleOpenSharedEntry, handleSelectServer]);
+  }, [handleSelectServer, openSharedServerEntryPreferringLast]);
 
   const selectedServerIsSharedIn = useMemo(() => {
     if (!selectedServerId) return false;
@@ -9168,7 +9431,14 @@ function InternalMainApp() {
     );
     const nextServer = nextId ? serversList.find((srv) => srv.id === nextId) : null;
     if (nextServer && (nextServer.id !== currentServerId || (hasActiveShare && !nextServer.isSharedIn))) {
-      const targetSharedEntry = nextServer.isSharedIn ? (nextServer.sharedEntry ?? null) : null;
+      const targetSharedEntry = nextServer.isSharedIn
+        ? (resolvePreferredSharedEntryForServer(
+            sharedEntriesRef.current,
+            nextServer.id,
+            lastSharedEntryIdByServerRef.current.get(nextServer.id) ?? null,
+            nextServer.sharedEntry ?? null,
+          ) ?? nextServer.sharedEntry ?? null)
+        : null;
       setServerSwitchWatermark((prev) => ({
         serverId: nextServer.id,
         serverName: nextServer.name || nextServer.id,
@@ -10202,7 +10472,7 @@ function InternalMainApp() {
             servers={unifiedServers}
             activeServerId={selectedServerId}
             onSelectServer={handleSelectServer}
-            onOpenSharedEntry={(entry) => void handleOpenSharedEntry(entry)}
+            onOpenSharedEntry={(entry) => void openSharedServerEntryPreferringLast(entry)}
             onServerContextMenu={(server, x, y) => setServerCtxMenu({ server: server as ServerInfo, x, y })}
             sidebarCollapsed={sidebarCollapsed}
             onToggleSidebar={handleToggleSidebar}
@@ -10311,7 +10581,7 @@ function InternalMainApp() {
             {!mobileHideTabBar && <SessionTree
               serverId={selectedServerId}
               sessions={visibleMainSessions}
-              subSessions={subSessions}
+              subSessions={mergedSubSessions}
               sharedSubSessionStates={managedSharedSubSessionStateById}
               activeSession={activeSession}
               unreadCounts={unreadCounts}
@@ -11051,7 +11321,7 @@ function InternalMainApp() {
             {/* Sub-session bar — hidden on desktop when sidebar is expanded (SessionTree shows sub-sessions there) */}
             {selectedServerId && (
               <SubSessionBar
-                subSessions={visibleSubSessions}
+                subSessions={mergedVisibleSubSessions}
                 daemonBadgeState={daemonBadgeState}
                 sharedSubSessionStates={managedSharedSubSessionStateById}
                 openIds={openSubIds}
@@ -11282,7 +11552,7 @@ function InternalMainApp() {
               {selectedServerId && !mobileHideTabBar && <SessionTree
                 serverId={selectedServerId}
                 sessions={visibleMainSessions}
-                subSessions={subSessions}
+                subSessions={mergedSubSessions}
                 sharedSubSessionStates={managedSharedSubSessionStateById}
                 activeSession={activeSession}
                 unreadCounts={unreadCounts}

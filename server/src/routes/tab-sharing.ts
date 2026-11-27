@@ -111,6 +111,9 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
   let targetLabel: string | null = null;
   let serverStatus: string | null = null;
   let lastHeartbeatAt: number | null = null;
+  let sessionState: string | null = null;
+  let agentType: string | null = null;
+  let parentSessionName: string | null = null;
   if (share.target.kind === 'server') {
     const row = await db.queryOne<{ name: string; node_role: string | null; status: string | null; last_heartbeat_at: number | null }>(
       'SELECT name, node_role, status, last_heartbeat_at FROM servers WHERE id = $1',
@@ -124,8 +127,16 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     serverStatus = row?.status ?? null;
     lastHeartbeatAt = row?.last_heartbeat_at ?? null;
   } else if (share.target.kind === 'main') {
-    const row = await db.queryOne<{ server_name: string; label: string | null; project_name: string | null; status: string | null; last_heartbeat_at: number | null }>(
-      `SELECT sv.name AS server_name, s.label, s.project_name, sv.status, sv.last_heartbeat_at
+    const row = await db.queryOne<{
+      server_name: string;
+      label: string | null;
+      project_name: string | null;
+      session_state: string | null;
+      agent_type: string | null;
+      status: string | null;
+      last_heartbeat_at: number | null;
+    }>(
+      `SELECT sv.name AS server_name, s.label, s.project_name, s.state AS session_state, s.agent_type AS agent_type, sv.status, sv.last_heartbeat_at
          FROM sessions s
          JOIN servers sv ON sv.id = s.server_id
         WHERE s.server_id = $1 AND s.name = $2`,
@@ -133,11 +144,20 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     );
     serverName = row?.server_name ?? null;
     targetLabel = row?.label?.trim() || row?.project_name?.trim() || null;
+    sessionState = row?.session_state ?? null;
+    agentType = row?.agent_type ?? null;
     serverStatus = row?.status ?? null;
     lastHeartbeatAt = row?.last_heartbeat_at ?? null;
   } else {
-    const row = await db.queryOne<{ server_name: string; label: string | null; type: string | null; status: string | null; last_heartbeat_at: number | null }>(
-      `SELECT sv.name AS server_name, ss.label, ss.type, sv.status, sv.last_heartbeat_at
+    const row = await db.queryOne<{
+      server_name: string;
+      label: string | null;
+      type: string | null;
+      parent_session: string | null;
+      status: string | null;
+      last_heartbeat_at: number | null;
+    }>(
+      `SELECT sv.name AS server_name, ss.label, ss.type, ss.parent_session AS parent_session, sv.status, sv.last_heartbeat_at
          FROM sub_sessions ss
          JOIN servers sv ON sv.id = ss.server_id
         WHERE ss.server_id = $1 AND ss.id = $2`,
@@ -145,6 +165,8 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     );
     serverName = row?.server_name ?? null;
     targetLabel = row?.label?.trim() || row?.type?.trim() || null;
+    agentType = row?.type ?? null;
+    parentSessionName = row?.parent_session ?? null;
     serverStatus = row?.status ?? null;
     lastHeartbeatAt = row?.last_heartbeat_at ?? null;
   }
@@ -163,6 +185,9 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     expiresAt: share.expiresAt,
     serverStatus: serverStatus ?? null,
     lastHeartbeatAt: lastHeartbeatAt ?? null,
+    ...(sessionState ? { sessionState } : {}),
+    ...(agentType ? { agentType } : {}),
+    ...(parentSessionName ? { parentSessionName } : {}),
   };
 }
 

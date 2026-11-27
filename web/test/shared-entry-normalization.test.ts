@@ -100,4 +100,36 @@ describe('shared entry normalization and old-peer compatibility', () => {
     // status: 'active', lastHeartbeatAt: null, online: false
     // which caused ai-207 with fresh heartbeat to be displayed as false/grey (○).
   });
+
+  it('passes through optional sessionState, agentType, and parentSessionName when provided', () => {
+    const mainEntry = normalizeSharedEntrySummary({
+      id: 'share-main-1',
+      serverId: 'srv-1',
+      serverName: 'Server One',
+      role: 'participant',
+      status: 'active',
+      target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_alpha_brain' },
+      targetLabel: 'Alpha',
+      sessionState: 'running',
+      agentType: 'claude-code',
+    });
+    expect(mainEntry.sessionState).toBe('running');
+    expect(mainEntry.agentType).toBe('claude-code');
+    expect(mainEntry.parentSessionName).toBeUndefined();
+
+    const subEntry = normalizeSharedEntrySummary({
+      id: 'share-sub-1',
+      serverId: 'srv-1',
+      serverName: 'Server One',
+      role: 'viewer',
+      status: 'active',
+      target: { kind: 'subsession', serverId: 'srv-1', subSessionId: 'sub123' },
+      targetLabel: 'Sub Research',
+      agentType: 'codex-sdk',
+      parentSessionName: 'deck_alpha_brain',
+    });
+    expect(subEntry.agentType).toBe('codex-sdk');
+    expect(subEntry.parentSessionName).toBe('deck_alpha_brain');
+    expect(subEntry.sessionState).toBeUndefined();
+  });
 });

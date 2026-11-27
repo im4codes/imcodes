@@ -580,6 +580,63 @@ describe('tab sharing APIs', () => {
     }
   });
 
+  it('includes optional sessionState, agentType, and parentSessionName in /api/shares discovery entries without extra queries', async () => {
+    const app = makeApp();
+    const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();
+    await createOrUpdateShare(db, {
+      id: id('share-server-meta'),
+      target: { kind: 'server', serverId },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+    await createOrUpdateShare(db, {
+      id: id('share-main-meta'),
+      target: { kind: 'main', serverId, sessionName },
+      targetUserId: recipientId,
+      role: 'participant',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+    await createOrUpdateShare(db, {
+      id: id('share-sub-meta'),
+      target: { kind: 'subsession', serverId, subSessionId },
+      targetUserId: recipientId,
+      role: 'viewer',
+      createdBy: ownerId,
+      now: 5_000,
+    });
+
+    const discover = await app.request('/api/shares', { headers: authHeaders(recipientId) });
+    expect(discover.status).toBe(200);
+    const body = await discover.json() as {
+      shares: Array<{
+        id: string;
+        target: { kind: string };
+        sessionState?: string;
+        agentType?: string;
+        parentSessionName?: string;
+      }>;
+    };
+    const byTargetKind = new Map(body.shares.map((s) => [s.target.kind, s]));
+    const serverEntry = byTargetKind.get('server')!;
+    const mainEntry = byTargetKind.get('main')!;
+    const subEntry = byTargetKind.get('subsession')!;
+
+    expect(serverEntry.sessionState).toBeUndefined();
+    expect(serverEntry.agentType).toBeUndefined();
+    expect(serverEntry.parentSessionName).toBeUndefined();
+
+    expect(mainEntry.sessionState).toBe('idle');
+    expect(mainEntry.agentType).toBe('codex');
+    expect(mainEntry.parentSessionName).toBeUndefined();
+
+    expect(subEntry.sessionState).toBeUndefined();
+    expect(subEntry.agentType).toBe('shell');
+    expect(subEntry.parentSessionName).toBe(sessionName);
+  });
+
   it('opens a shared sub-session with its parent main session for tree rendering', async () => {
     const app = makeApp();
     const { ownerId, recipientId, serverId, sessionName, subSessionId } = await seedShareTarget();

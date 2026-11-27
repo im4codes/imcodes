@@ -1,0 +1,452 @@
+import type { SharedEntrySummary } from './api.js';
+import type { SubSession } from './hooks/useSubSessions.js';
+import { isNavigableMainSession, parseMainSessionName, resolveSharedSessionProject } from './session-list-merge.js';
+import type { SharedStateSummary, ShareRole, ShareTarget } from './tab-sharing-ui.js';
+import type { SessionInfo } from './types.js';
+import { getSessionRuntimeType } from '@shared/agent-types.js';
+
+function shareRoleRank(role: ShareRole): number {
+  return role === 'participant' ? 2 : 1;
+}
+
+function shareEntryPriorityRank(entry: SharedEntrySummary): number {
+  if (entry.target.kind === 'server') return 30;
+  return (entry.role === 'participant' ? 20 : 10) + (entry.target.kind === 'main' ? 2 : 1);
+}
+
+export function isActiveRestrictedSharedServer(params: {
+  serverId: string | null | undefined;
+  isOwnedServer: boolean;
+  activeTarget: ShareTarget | null;
+}): boolean {
+  if (!params.serverId || params.isOwnedServer) return false;
+  return params.activeTarget?.kind !== 'server';
+}
+
+export function filterActiveSharedEntriesForServer(
+  entries: readonly SharedEntrySummary[],
+  serverId: string | null | undefined,
+): SharedEntrySummary[] {
+  if (!serverId) return [];
+  return entries.filter((entry) => entry.status === 'active' && entry.serverId === serverId);
+}
+
+/**
+ * Resolve the highest-privilege active share entry for a main session tab on a
+ * shared-in server (`participant > viewer`). Falls back to a child `subsession`
+ * share when the main row is a synthetic parent container for a sub-session-only share.
+ */
+export function findSharedEntryForServerTab(
+  entries: readonly SharedEntrySummary[],
+  serverId: string | null | undefined,
+  sessionName: string,
+  subSessions?: readonly SubSession[],
+): SharedEntrySummary | null {
+  const active = filterActiveSharedEntriesForServer(entries, serverId);
+  let bestMain: SharedEntrySummary | null = null;
+  for (const entry of active) {
+    if (entry.target.kind !== 'main' || entry.target.sessionName !== sessionName) continue;
+    if (!bestMain || shareRoleRank(entry.role) > shareRoleRank(bestMain.role)) {
+      bestMain = entry;
+    }
+  }
+  if (bestMain) return bestMain;
+
+  let bestSub: SharedEntrySummary | null = null;
+  for (const entry of active) {
+    if (entry.target.kind !== 'subsession') continue;
+    const targetSubId = entry.target.subSessionId;
+    const matchesParent = entry.parentSessionName === sessionName
+      || Boolean(subSessions?.some((sub) => sub.id === targetSubId && sub.parentSession === sessionName));
+    if (!matchesParent) continue;
+    if (!bestSub || shareRoleRank(entry.role) > shareRoleRank(bestSub.role)) {
+      bestSub = entry;
+    }
+  }
+  return bestSub;
+}
+
+/**
+ * Resolve the highest-privilege active share entry for a specific sub-session
+ * on a shared-in server (`participant > viewer`).
+ */
+export function findSharedEntryForServerSubSession(
+  entries: readonly SharedEntrySummary[],
+  serverId: string | null | undefined,
+  subSessionId: string,
+): SharedEntrySummary | null {
+  const active = filterActiveSharedEntriesForServer(entries, serverId);
+  let best: SharedEntrySummary | null = null;
+  for (const entry of active) {
+    if (entry.target.kind !== 'subsession' || entry.target.subSessionId !== subSessionId) continue;
+    if (!best || shareRoleRank(entry.role) > shareRoleRank(best.role)) {
+      best = entry;
+    }
+  }
+  return best;
+}
+
+/**
+ * Choose which grant to open when switching back into a shared server:
+ * prefer the last active valid grant for that server, then the passed fallback
+ * entry if still active, then the highest-priority active grant on that server.
+ */
+export function resolvePreferredSharedEntryForServer(
+  entries: readonly SharedEntrySummary[],
+  serverId: string | null | undefined,
+  preferredEntryId: string | null | undefined,
+  fallbackEntry?: SharedEntrySummary | null,
+): SharedEntrySummary | null {
+  const active = filterActiveSharedEntriesForServer(entries, serverId);
+  if (active.length === 0) return null;
+  if (preferredEntryId) {
+    const remembered = active.find((entry) => entry.id === preferredEntryId);
+    if (remembered) return remembered;
+  }
+  if (fallbackEntry && fallbackEntry.serverId === serverId) {
+    const activeFallback = active.find((entry) => entry.id === fallbackEntry.id);
+    if (activeFallback) return activeFallback;
+  }
+  let best = active[0]!;
+  for (let i = 1; i < active.length; i += 1) {
+    const candidate = active[i]!;
+    if (shareEntryPriorityRank(candidate) > shareEntryPriorityRank(best)) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+/**
+ * Determine whether clicking a sub-session on a restricted shared-in server
+ * requires switching the active share grant via `/api/shares/open` (and which
+ * entry to open), or can open locally under the current grant.
+ */
+export function resolveRestrictedSubSessionClick(params: {
+  entries: readonly SharedEntrySummary[];
+  serverId: string | null | undefined;
+  isOwnedServer: boolean;
+  activeTarget: ShareTarget | null;
+  activeEntryId: string | null;
+  subSessionId: string;
+  subSessions: readonly SubSession[];
+}): { action: 'local' } | { action: 'open'; entry: SharedEntrySummary; openSubSessionId?: string } {
+  const { entries, serverId, isOwnedServer, activeTarget, activeEntryId, subSessionId, subSessions } = params;
+  if (!serverId || !isActiveRestrictedSharedServer({ serverId, isOwnedServer, activeTarget })) {
+    return { action: 'local' };
+  }
+  const sub = subSessions.find((item) => item.id === subSessionId);
+  const directSubEntry = findSharedEntryForServerSubSession(entries, serverId, subSessionId);
+  const activeRole: ShareRole = entries.find((entry) => entry.id === activeEntryId)?.role ?? 'viewer';
+
+  const alreadyOnDirectSub = Boolean(
+    directSubEntry
+    && activeTarget?.kind === 'subsession'
+    && activeTarget.subSessionId === subSessionId
+    && activeEntryId === directSubEntry.id,
+  );
+  if (alreadyOnDirectSub) return { action: 'local' };
+
+  const coveredByMainAtSameOrHigherRole = Boolean(
+    activeTarget?.kind === 'main'
+    && sub?.parentSession === activeTarget.sessionName
+    && (!directSubEntry || shareRoleRank(directSubEntry.role) <= shareRoleRank(activeRole)),
+  );
+  if (coveredByMainAtSameOrHigherRole) return { action: 'local' };
+
+  if (directSubEntry) {
+    return { action: 'open', entry: directSubEntry };
+  }
+  if (sub?.parentSession) {
+    const parentEntry = findSharedEntryForServerTab(entries, serverId, sub.parentSession, subSessions);
+    if (parentEntry) {
+      return { action: 'open', entry: parentEntry, openSubSessionId: subSessionId };
+    }
+  }
+  return { action: 'local' };
+}
+
+function buildBestMainGrantMap(activeEntries: readonly SharedEntrySummary[]): Map<string, SharedEntrySummary> {
+  const map = new Map<string, SharedEntrySummary>();
+  for (const entry of activeEntries) {
+    if (entry.target.kind !== 'main') continue;
+    const existing = map.get(entry.target.sessionName);
+    if (!existing || shareRoleRank(entry.role) > shareRoleRank(existing.role)) {
+      map.set(entry.target.sessionName, entry);
+    }
+  }
+  return map;
+}
+
+function buildBestSubGrantMap(activeEntries: readonly SharedEntrySummary[]): Map<string, SharedEntrySummary> {
+  const map = new Map<string, SharedEntrySummary>();
+  for (const entry of activeEntries) {
+    if (entry.target.kind !== 'subsession') continue;
+    const existing = map.get(entry.target.subSessionId);
+    if (!existing || shareRoleRank(entry.role) > shareRoleRank(existing.role)) {
+      map.set(entry.target.subSessionId, entry);
+    }
+  }
+  return map;
+}
+
+/**
+ * Merge live/opened sessions with cached sibling states and active restricted
+ * share grants belonging to the same shared-in server so switching tabs or
+ * receiving narrow WS `session_list` frames never drops sibling shared tabs.
+ */
+export function mergeSharedServerSessions(params: {
+  serverId: string | null | undefined;
+  isOwnedServer: boolean;
+  activeTarget: ShareTarget | null;
+  sharedEntries: readonly SharedEntrySummary[];
+  liveSessions: readonly SessionInfo[];
+  cachedSessions?: ReadonlyMap<string, SessionInfo>;
+}): SessionInfo[] {
+  const { serverId, isOwnedServer, activeTarget, sharedEntries, liveSessions, cachedSessions } = params;
+  if (!isActiveRestrictedSharedServer({ serverId, isOwnedServer, activeTarget })) {
+    return [...liveSessions];
+  }
+  const activeEntries = filterActiveSharedEntriesForServer(sharedEntries, serverId);
+  if (activeEntries.length === 0) {
+    return [...liveSessions];
+  }
+  // If the user has an active full-server share and hasn't explicitly narrowed to a
+  // single tab share, avoid duplicating/synthesizing tabs over full server WS state.
+  if (activeTarget === null && activeEntries.some((entry) => entry.target.kind === 'server')) {
+    return [...liveSessions];
+  }
+
+  const bestMainGrants = buildBestMainGrantMap(activeEntries);
+  const subParentGrants = new Map<string, SharedEntrySummary>();
+  for (const entry of activeEntries) {
+    if (entry.target.kind !== 'subsession' || !entry.parentSessionName) continue;
+    if (bestMainGrants.has(entry.parentSessionName)) continue;
+    const parsedParent = parseMainSessionName(entry.parentSessionName);
+    if (!isNavigableMainSession({ name: entry.parentSessionName, role: parsedParent?.role ?? 'brain' })) continue;
+    const existing = subParentGrants.get(entry.parentSessionName);
+    if (!existing || shareRoleRank(entry.role) > shareRoleRank(existing.role)) {
+      subParentGrants.set(entry.parentSessionName, entry);
+    }
+  }
+
+  const liveByName = new Map<string, SessionInfo>();
+  for (const live of liveSessions) {
+    liveByName.set(live.name, live);
+  }
+
+  const merged: SessionInfo[] = [];
+  const seenNames = new Set<string>();
+
+  const applyMainGrantOverlay = (session: SessionInfo, entry: SharedEntrySummary): SessionInfo => {
+    if (!session.sharedState || session.sharedState.targetKind === 'main') {
+      const updatedSharedState: SharedStateSummary = session.sharedState
+        ? { ...session.sharedState, effectiveRole: entry.role, scopeLabel: entry.targetLabel }
+        : {
+            targetKind: 'main',
+            effectiveRole: entry.role,
+            status: 'active',
+            scopeLabel: entry.targetLabel,
+            activeDispatchId: null,
+          };
+      return { ...session, sharedState: updatedSharedState };
+    }
+    return session;
+  };
+
+  for (const [sessionName, entry] of bestMainGrants) {
+    const live = liveByName.get(sessionName);
+    if (live) {
+      merged.push(applyMainGrantOverlay(live, entry));
+      seenNames.add(sessionName);
+      continue;
+    }
+    const cached = cachedSessions?.get(sessionName);
+    if (cached) {
+      merged.push(applyMainGrantOverlay(cached, entry));
+      seenNames.add(sessionName);
+      continue;
+    }
+    const parsed = parseMainSessionName(sessionName);
+    merged.push({
+      name: sessionName,
+      project: resolveSharedSessionProject(sessionName, entry.targetLabel),
+      role: parsed?.role ?? 'brain',
+      agentType: entry.agentType || 'unknown',
+      state: (entry.sessionState as SessionInfo['state']) || 'unknown',
+      label: entry.targetLabel && entry.targetLabel !== sessionName ? entry.targetLabel : null,
+      sharedState: {
+        targetKind: 'main',
+        effectiveRole: entry.role,
+        status: 'active',
+        scopeLabel: entry.targetLabel,
+        activeDispatchId: null,
+      },
+    });
+    seenNames.add(sessionName);
+  }
+
+  for (const [parentName, subEntry] of subParentGrants) {
+    if (seenNames.has(parentName)) continue;
+    const live = liveByName.get(parentName);
+    if (live) {
+      merged.push(live);
+      seenNames.add(parentName);
+      continue;
+    }
+    const cached = cachedSessions?.get(parentName);
+    if (cached) {
+      merged.push(cached);
+      seenNames.add(parentName);
+      continue;
+    }
+    const parsed = parseMainSessionName(parentName);
+    merged.push({
+      name: parentName,
+      project: resolveSharedSessionProject(parentName, parentName),
+      role: parsed?.role ?? 'brain',
+      agentType: 'unknown',
+      state: 'unknown',
+      label: null,
+      sharedState: {
+        targetKind: 'subsession',
+        effectiveRole: subEntry.role,
+        status: 'active',
+        scopeLabel: subEntry.targetLabel,
+        activeDispatchId: null,
+      },
+    });
+    seenNames.add(parentName);
+  }
+
+  for (const live of liveSessions) {
+    if (seenNames.has(live.name)) continue;
+    merged.push(live);
+    seenNames.add(live.name);
+  }
+
+  return merged;
+}
+
+/**
+ * Merge live opened sub-sessions with cached sibling sub-sessions and active
+ * `subsession` share grants on the same shared-in server so sibling shared
+ * sub-sessions appear together in SessionTree.
+ */
+export function mergeSharedServerSubSessions(params: {
+  serverId: string | null | undefined;
+  isOwnedServer: boolean;
+  activeTarget: ShareTarget | null;
+  sharedEntries: readonly SharedEntrySummary[];
+  liveSubSessions: readonly SubSession[];
+  cachedSubSessions?: ReadonlyMap<string, SubSession>;
+}): SubSession[] {
+  const { serverId, isOwnedServer, activeTarget, sharedEntries, liveSubSessions, cachedSubSessions } = params;
+  if (!isActiveRestrictedSharedServer({ serverId, isOwnedServer, activeTarget }) || !serverId) {
+    return [...liveSubSessions];
+  }
+  const activeEntries = filterActiveSharedEntriesForServer(sharedEntries, serverId);
+  if (activeEntries.length === 0) {
+    return [...liveSubSessions];
+  }
+  if (activeTarget === null && activeEntries.some((entry) => entry.target.kind === 'server')) {
+    return [...liveSubSessions];
+  }
+
+  const bestMainGrants = buildBestMainGrantMap(activeEntries);
+  const bestSubGrants = buildBestSubGrantMap(activeEntries);
+  const merged: SubSession[] = [];
+  const seenIds = new Set<string>();
+
+  for (const live of liveSubSessions) {
+    merged.push(live);
+    seenIds.add(live.id);
+  }
+
+  if (cachedSubSessions) {
+    for (const [subId, cached] of cachedSubSessions) {
+      if (seenIds.has(subId)) continue;
+      if (bestSubGrants.has(subId) || (cached.parentSession && bestMainGrants.has(cached.parentSession))) {
+        merged.push(cached);
+        seenIds.add(subId);
+      }
+    }
+  }
+
+  for (const [subId, entry] of bestSubGrants) {
+    if (seenIds.has(subId)) continue;
+    const cached = cachedSubSessions?.get(subId);
+    if (cached) {
+      merged.push(cached);
+      seenIds.add(subId);
+      continue;
+    }
+    const agentType = entry.agentType || 'unknown';
+    const runtimeType = getSessionRuntimeType(agentType);
+    merged.push({
+      id: subId,
+      serverId,
+      type: agentType,
+      runtimeType,
+      providerId: runtimeType === 'transport' ? agentType : null,
+      providerSessionId: null,
+      shellBin: null,
+      cwd: null,
+      label: entry.targetLabel || null,
+      closedAt: null,
+      createdAt: 0,
+      updatedAt: 0,
+      ccSessionId: null,
+      geminiSessionId: null,
+      parentSession: entry.parentSessionName ?? null,
+      description: null,
+      ccPresetId: null,
+      supervisionMode: null,
+      sessionName: `deck_sub_${subId}`,
+      state: 'unknown',
+    });
+    seenIds.add(subId);
+  }
+
+  return merged;
+}
+
+/**
+ * Overlay direct `subsession` grant badges (`viewer` vs `participant`) onto
+ * sub-sessions on an active restricted shared server while preserving any
+ * owner-managed share indicators when present.
+ */
+export function buildSharedServerSubSessionStates(params: {
+  serverId: string | null | undefined;
+  isOwnedServer: boolean;
+  activeTarget: ShareTarget | null;
+  sharedEntries: readonly SharedEntrySummary[];
+  subSessions: readonly SubSession[];
+  baseStates: ReadonlyMap<string, SharedStateSummary>;
+  activeDispatchIds: ReadonlyMap<string, string>;
+}): Map<string, SharedStateSummary> {
+  const states = new Map<string, SharedStateSummary>(params.baseStates);
+  if (!isActiveRestrictedSharedServer({
+    serverId: params.serverId,
+    isOwnedServer: params.isOwnedServer,
+    activeTarget: params.activeTarget,
+  })) {
+    return states;
+  }
+  const activeEntries = filterActiveSharedEntriesForServer(params.sharedEntries, params.serverId);
+  const bestSubGrants = buildBestSubGrantMap(activeEntries);
+  for (const sub of params.subSessions) {
+    const grant = bestSubGrants.get(sub.id);
+    if (!grant) continue;
+    const summary: SharedStateSummary = {
+      targetKind: 'subsession',
+      effectiveRole: grant.role,
+      status: 'active',
+      scopeLabel: grant.targetLabel,
+      activeDispatchId: params.activeDispatchIds.get(sub.sessionName) ?? null,
+    };
+    states.set(sub.id, summary);
+    states.set(sub.sessionName, summary);
+  }
+  return states;
+}

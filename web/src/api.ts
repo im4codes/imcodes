@@ -1307,6 +1307,9 @@ export interface SharedEntrySummary {
   serverStatus?: string | null;
   lastHeartbeatAt?: number | null;
   statusObservedAt?: number | null;
+  sessionState?: string | null;
+  agentType?: string | null;
+  parentSessionName?: string | null;
 }
 
 function shareTargetFallbackLabel(target: ShareTarget): string {
@@ -1327,6 +1330,15 @@ export function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary 
   const targetLabel = typeof raw.targetLabel === 'string' && raw.targetLabel.trim()
     ? raw.targetLabel
     : shareTargetFallbackLabel(target);
+  const sessionState = typeof raw.sessionState === 'string' && raw.sessionState.trim()
+    ? raw.sessionState.trim()
+    : undefined;
+  const agentType = typeof raw.agentType === 'string' && raw.agentType.trim()
+    ? raw.agentType.trim()
+    : undefined;
+  const parentSessionName = typeof raw.parentSessionName === 'string' && raw.parentSessionName.trim()
+    ? raw.parentSessionName.trim()
+    : undefined;
   return {
     id: typeof raw.id === 'string' ? raw.id : '',
     serverId,
@@ -1340,6 +1352,9 @@ export function normalizeSharedEntrySummary(value: unknown): SharedEntrySummary 
     statusObservedAt: typeof raw.statusObservedAt === 'number' && Number.isFinite(raw.statusObservedAt)
       ? raw.statusObservedAt
       : (typeof raw.lastHeartbeatAt === 'number' && Number.isFinite(raw.lastHeartbeatAt) ? raw.lastHeartbeatAt : null),
+    ...(sessionState ? { sessionState } : {}),
+    ...(agentType ? { agentType } : {}),
+    ...(parentSessionName ? { parentSessionName } : {}),
   };
 }
 

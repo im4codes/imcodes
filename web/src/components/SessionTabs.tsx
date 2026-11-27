@@ -676,6 +676,9 @@ function sameTabSessions(a: SessionInfo[], b: SessionInfo[]): boolean {
       || left.label !== right.label
       || left.agentType !== right.agentType
       || left.runtimeType !== right.runtimeType
+      || left.sharedState?.effectiveRole !== right.sharedState?.effectiveRole
+      || left.sharedState?.status !== right.sharedState?.status
+      || left.sharedState?.targetKind !== right.sharedState?.targetKind
       || !!left.incognito !== !!right.incognito) return false;
   }
   return true;
