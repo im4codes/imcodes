@@ -1724,4 +1724,139 @@ Gtk.main()
       await browser.close();
     }
   }, 45_000);
+
+  it('keeps mobile top bar, server latency, chevron, and all tool buttons inside 320px and 375px viewports on web and android in real Chromium', { timeout: 45_000 }, async () => {
+    const require = createRequire(import.meta.url);
+    const { chromium } = require('playwright') as typeof import('playwright');
+    const executablePath = resolveChromiumExecutable(chromium);
+    if (!executablePath) {
+      return;
+    }
+    const here = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(resolve(here, '../src/styles.css'), 'utf8');
+
+    const html = `<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>${css}</style>
+</head>
+<body style="margin:0;background:#080d16;">
+  <div class="layout layout-mobile" style="width:100vw;height:100vh;">
+    <main class="main" style="width:100%;min-width:0;display:flex;flex-direction:column;">
+      <div class="mobile-server-bar" data-testid="mobile-server-bar">
+        <button class="mobile-sidebar-toggle" type="button">☰</button>
+        <div class="mobile-server-switcher-wrap">
+          <button class="mobile-server-btn" type="button" title="Very Long Production Node Identifier Alpha">
+            <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
+            <span class="mobile-server-btn-name">Very Long Production Node Identifier Alpha</span>
+            <span class="share-state-indicator" aria-label="Shared">👥</span>
+            <span class="mobile-server-latency"><span class="badge-dot badge-dot-online">●</span>32ms</span>
+            <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
+          </button>
+        </div>
+        <div class="mobile-server-actions">
+          <div class="mobile-remote-desktop-group">
+            <button class="view-toggle daemon-remote-desktop-btn" type="button">🖥</button>
+            <button class="controlled-nodes-quick-trigger" type="button">▾</button>
+          </div>
+          <button class="view-toggle" type="button">📁</button>
+          <button class="view-toggle" type="button">🌐</button>
+          <button class="view-toggle global-task-mode-entry-btn mobile-task-mode-btn" type="button">⚡</button>
+          <button class="view-toggle mobile-cloud-docs-marquee-btn" type="button">📄</button>
+          <button class="view-toggle" type="button">💬</button>
+        </div>
+      </div>
+    </main>
+  </div>
+</body>
+</html>`;
+
+    const browser = await chromium.launch({ headless: true, executablePath });
+    try {
+      const testCases = [
+        { width: 320, height: 568, platform: 'web' },
+        { width: 320, height: 568, platform: 'android' },
+        { width: 375, height: 667, platform: 'web' },
+        { width: 375, height: 667, platform: 'android' },
+      ];
+
+      for (const tc of testCases) {
+        const page = await browser.newPage({ viewport: { width: tc.width, height: tc.height } });
+        await page.route('https://imcodes.test/**', (route) => route.fulfill({ contentType: 'text/html', body: html }));
+        await page.goto('https://imcodes.test/');
+        if (tc.platform === 'android') {
+          await page.evaluate(() => {
+            document.documentElement.setAttribute('data-native-platform', 'android');
+          });
+        }
+
+        const metrics = await page.evaluate((vpWidth) => {
+          const bar = document.querySelector('.mobile-server-bar') as HTMLElement;
+          const toggle = document.querySelector('.mobile-sidebar-toggle') as HTMLElement;
+          const btn = document.querySelector('.mobile-server-btn') as HTMLElement;
+          const name = document.querySelector('.mobile-server-btn-name') as HTMLElement;
+          const latency = document.querySelector('.mobile-server-latency') as HTMLElement;
+          const chevron = document.querySelector('.mobile-server-btn-chevron') as HTMLElement;
+          const actions = document.querySelector('.mobile-server-actions') as HTMLElement;
+          const actionButtons = Array.from(actions.querySelectorAll('button'));
+          const lastActionBtn = actionButtons[actionButtons.length - 1];
+
+          const bBar = bar.getBoundingClientRect();
+          const bToggle = toggle.getBoundingClientRect();
+          const bBtn = btn.getBoundingClientRect();
+          const bName = name.getBoundingClientRect();
+          const bLatency = latency.getBoundingClientRect();
+          const bChevron = chevron.getBoundingClientRect();
+          const bActions = actions.getBoundingClientRect();
+          const bLastBtn = lastActionBtn.getBoundingClientRect();
+
+          return {
+            barWidth: bBar.width,
+            toggleRight: bToggle.right,
+            btnLeft: bBtn.left,
+            btnRight: bBtn.right,
+            btnWidth: bBtn.width,
+            nameLeft: bName.left,
+            nameRight: bName.right,
+            nameWidth: bName.width,
+            nameTruncated: name.scrollWidth > name.clientWidth,
+            latencyLeft: bLatency.left,
+            latencyRight: bLatency.right,
+            chevronLeft: bChevron.left,
+            chevronRight: bChevron.right,
+            actionsLeft: bActions.left,
+            actionsRight: bActions.right,
+            actionsWidth: bActions.width,
+            lastBtnRight: bLastBtn.right,
+            vpWidth,
+          };
+        }, tc.width);
+
+        // 1. Mobile top bar fits viewport
+        expect(metrics.barWidth, `${tc.platform} ${tc.width} bar width`).toBeLessThanOrEqual(tc.width + 0.5);
+
+        // 2. Server dropdown button does not overlap toggle or actions
+        expect(metrics.btnLeft, `${tc.platform} ${tc.width} btn left`).toBeGreaterThanOrEqual(metrics.toggleRight - 0.5);
+        expect(metrics.btnRight, `${tc.platform} ${tc.width} btn right`).toBeLessThanOrEqual(metrics.actionsLeft + 0.5);
+
+        // 3. Name has usable width (>= 20px) and long server name is truncated
+        expect(metrics.nameWidth, `${tc.platform} ${tc.width} name width`).toBeGreaterThanOrEqual(20);
+        expect(metrics.nameTruncated, `${tc.platform} ${tc.width} name truncated`).toBe(true);
+
+        // 4. Latency and chevron stay inside server button
+        expect(metrics.latencyLeft, `${tc.platform} ${tc.width} latency left`).toBeGreaterThanOrEqual(metrics.nameRight - 0.5);
+        expect(metrics.chevronLeft, `${tc.platform} ${tc.width} chevron left`).toBeGreaterThanOrEqual(metrics.latencyRight - 0.5);
+        expect(metrics.chevronRight, `${tc.platform} ${tc.width} chevron inside btn`).toBeLessThanOrEqual(metrics.btnRight + 0.5);
+
+        // 5. All action buttons stay within the viewport (last action button right <= viewport width)
+        expect(metrics.lastBtnRight, `${tc.platform} ${tc.width} last btn in viewport`).toBeLessThanOrEqual(tc.width + 0.5);
+
+        await page.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  }, 45_000);
 });

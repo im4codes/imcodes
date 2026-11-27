@@ -5259,8 +5259,6 @@ html.native-ios-mac .chat-dl-btn {
   }
   .mobile-server-actions {
     gap: 2px;
-    flex-shrink: 1;
-    min-width: 0;
   }
   .mobile-server-actions .view-toggle {
     padding: 2px 4px;
@@ -5285,16 +5283,16 @@ html.native-ios-mac .chat-dl-btn {
 }
 @media (max-width: 360px) {
   .mobile-server-bar { gap: 3px; padding: 3px 4px; }
-  .mobile-sidebar-toggle { width: 28px; height: 28px; font-size: 14px; }
+  .mobile-sidebar-toggle { width: 26px; height: 26px; font-size: 13px; }
   .mobile-server-btn {
-    gap: 3px;
+    gap: 2.5px;
     padding: 2px 4px;
-    min-height: 30px;
+    min-height: 28px;
   }
   .mobile-server-btn-icon {
-    width: 18px;
-    height: 18px;
-    min-width: 18px;
+    width: 16px;
+    height: 16px;
+    min-width: 16px;
     font-size: 10px;
   }
   .mobile-server-btn-name {
@@ -5319,6 +5317,12 @@ html.native-ios-mac .chat-dl-btn {
     font-size: 10px;
     height: 24px;
     min-width: 18px;
+  }
+  .mobile-server-actions .view-toggle.mobile-cloud-docs-marquee-btn {
+    padding: 1px 3px;
+    font-size: 10px;
+    min-height: 24px;
+    height: 24px;
   }
   .mobile-remote-desktop-group .daemon-remote-desktop-btn {
     padding: 1px 3px;
@@ -26614,19 +26618,19 @@ html.native-mac-desktop .remote-desktop-window-blocked {
 
   html[data-native-platform="android"] .mobile-server-bar {
     gap: 4px;
-    padding: 5px 6px;
+    padding: 4px 6px;
   }
 
   html[data-native-platform="android"] .mobile-sidebar-toggle {
-    width: 32px;
-    height: 32px;
+    width: 30px;
+    height: 30px;
     border-radius: 8px;
-    font-size: 16px;
+    font-size: 15px;
   }
 
   html[data-native-platform="android"] .mobile-server-btn {
     min-height: 32px;
-    gap: 4px;
+    gap: 3px;
     padding: 3px 5px;
     border-radius: 10px;
     font-size: 12px;
@@ -26636,20 +26640,21 @@ html.native-mac-desktop .remote-desktop-window-blocked {
 
   html[data-native-platform="android"] .mobile-server-btn-icon,
   html[data-native-platform="android"] .mobile-server-btn-chevron {
-    width: 20px;
-    height: 20px;
+    width: 18px;
+    height: 18px;
     border-radius: 6px;
   }
 
   html[data-native-platform="android"] .mobile-server-actions {
     gap: 2px;
-    flex-shrink: 1;
-    min-width: 0;
   }
 
   html[data-native-platform="android"] .mobile-server-actions .view-toggle {
-    padding: 3px 5px;
-    font-size: 12px;
+    padding: 2px 4px;
+    font-size: 11px;
+    height: 26px;
+    min-width: 20px;
+    box-sizing: border-box;
   }
 
   html[data-native-platform="android"] .mobile-server-actions .view-toggle.mobile-cloud-docs-marquee-btn {
@@ -26658,6 +26663,21 @@ html.native-mac-desktop .remote-desktop-window-blocked {
     min-height: 26px;
     border: 0;
     background: transparent;
+  }
+
+  html[data-native-platform="android"] .mobile-remote-desktop-group .daemon-remote-desktop-btn {
+    padding: 2px 4px;
+    font-size: 11px;
+    height: 26px;
+    box-sizing: border-box;
+  }
+
+  html[data-native-platform="android"] .mobile-remote-desktop-group .controlled-nodes-quick-trigger {
+    width: 13px;
+    min-width: 13px;
+    height: 26px;
+    font-size: 9px;
+    box-sizing: border-box;
   }
 
   html[data-native-platform="android"] .tab-bar {
@@ -26768,6 +26788,85 @@ html.native-mac-desktop .remote-desktop-window-blocked {
   html[data-native-platform="android"] .chat-bubble-content {
     font-size: var(--imcodes-chat-font-size, 13.5px);
     line-height: 1.45;
+  }
+}
+
+@media (max-width: 360px) {
+  html[data-native-platform="android"] .mobile-server-bar {
+    gap: 3px;
+    padding: 3px 4px;
+  }
+
+  html[data-native-platform="android"] .mobile-sidebar-toggle {
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    font-size: 13px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-btn {
+    min-height: 28px;
+    gap: 2.5px;
+    padding: 2px 4px;
+    border-radius: 8px;
+    font-size: 11px;
+    box-sizing: border-box;
+    overflow: hidden;
+  }
+
+  html[data-native-platform="android"] .mobile-server-btn-icon,
+  html[data-native-platform="android"] .mobile-server-btn-chevron {
+    width: 16px;
+    height: 16px;
+    min-width: 16px;
+    border-radius: 5px;
+    font-size: 10px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-btn-name {
+    min-width: 20px;
+    font-size: 11px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-latency {
+    font-size: 9px;
+    gap: 1.5px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-actions {
+    gap: 1.5px;
+  }
+
+  html[data-native-platform="android"] .mobile-server-actions .view-toggle {
+    padding: 1px 3px;
+    font-size: 10px;
+    height: 24px;
+    min-width: 18px;
+    box-sizing: border-box;
+  }
+
+  html[data-native-platform="android"] .mobile-server-actions .view-toggle.mobile-cloud-docs-marquee-btn {
+    padding: 1px 3px;
+    font-size: 10px;
+    min-height: 24px;
+    height: 24px;
+    border: 0;
+    background: transparent;
+  }
+
+  html[data-native-platform="android"] .mobile-remote-desktop-group .daemon-remote-desktop-btn {
+    padding: 1px 3px;
+    font-size: 10px;
+    height: 24px;
+    box-sizing: border-box;
+  }
+
+  html[data-native-platform="android"] .mobile-remote-desktop-group .controlled-nodes-quick-trigger {
+    width: 12px;
+    min-width: 12px;
+    height: 24px;
+    font-size: 8.5px;
+    box-sizing: border-box;
   }
 }
 
