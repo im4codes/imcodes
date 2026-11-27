@@ -4299,6 +4299,29 @@ describe('TransportSessionRuntime', () => {
     const afterProviderCompactPayload = mock.provider.send.mock.calls[8]?.[1] as Record<string, unknown>;
     expect(afterProviderCompactPayload.messagePreamble).toContain('Use pnpm');
     expect(String(afterProviderCompactPayload.assembledMessage)).toContain('Use pnpm');
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    // 7. Late CANCELLED callback from a previously stopped turn must NOT clear compacting
+    // observed during the already-active next turn.
+    mock.provider.getActiveWorkSnapshot = undefined as never;
+    runtime.send('turn stopped then followed by compacting next turn', 'cmp-guard-10', undefined, preferencePreamble);
+    await flushDispatch();
+    runtime.send('second turn observes compacting', 'cmp-guard-11', undefined, preferencePreamble);
+    await runtime.cancel();
+    await flushDispatch();
+
+    mock.fireStatus('sess-1', { status: 'compacting' });
+    mock.fireError('sess-1', { code: PROVIDER_ERROR_CODES.CANCELLED, message: 'late stop from turn 1', recoverable: true });
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('third turn re-injects after late CANCELLED did not wipe second turn compaction', 'cmp-guard-12', undefined, preferencePreamble);
+    await flushDispatch();
+    const afterLateCancelCompactPayload = mock.provider.send.mock.calls[11]?.[1] as Record<string, unknown>;
+    expect(afterLateCancelCompactPayload.messagePreamble).toContain('Use pnpm');
+    expect(String(afterLateCancelCompactPayload.assembledMessage)).toContain('Use pnpm');
   });
 
   it('drops first-turn startup memory built before the project turned injection off, without a restart', async () => {

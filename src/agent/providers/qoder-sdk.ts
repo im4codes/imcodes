@@ -1583,11 +1583,12 @@ export class QoderSdkProvider implements TransportProvider {
       && state.mainRequestCountInTurn <= 1
       && (numTurns === undefined || numTurns <= 1)
       && !hasOtherModelInModelUsage(msg.modelUsage, state.effectiveModel);
+    const matchedWindow = (state.effectiveModel || resultAttributionSafe ? resultUsage?.model_context_window : undefined)
+      ?? extractModelContextWindow(msg.modelUsage, state.effectiveModel);
     const previous = state.lastAssistantUsage;
     let exactUsage: NonNullable<ProviderUsageUpdate['usage']> | undefined;
     if (previous) {
-      const explicitOrMatchedWindow = previous.model_context_window
-        ?? (state.effectiveModel || resultAttributionSafe ? resultUsage?.model_context_window : undefined);
+      const explicitOrMatchedWindow = previous.model_context_window ?? matchedWindow;
       exactUsage = {
         ...previous,
         ...(resultAttributionSafe && previous.output_tokens === undefined && resultUsage?.output_tokens !== undefined
@@ -1596,7 +1597,14 @@ export class QoderSdkProvider implements TransportProvider {
         ...(explicitOrMatchedWindow !== undefined ? { model_context_window: explicitOrMatchedWindow } : {}),
       };
     } else if (resultAttributionSafe) {
-      exactUsage = resultUsage ? { ...resultUsage } : undefined;
+      exactUsage = resultUsage
+        ? {
+            ...resultUsage,
+            ...(matchedWindow !== undefined ? { model_context_window: matchedWindow } : {}),
+          }
+        : undefined;
+    } else if (matchedWindow !== undefined) {
+      exactUsage = { model_context_window: matchedWindow };
     }
     if (!exactUsage) return undefined;
     this.emitUsage(sessionId, {

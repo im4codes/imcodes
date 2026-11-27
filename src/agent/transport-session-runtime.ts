@@ -1058,7 +1058,6 @@ export class TransportSessionRuntime implements SessionRuntime {
           && error.code === PROVIDER_ERROR_CODES.CANCELLED
           && this.consumeExternalCompletionGraceCancel();
         if (consumedStopIgnore || consumedExternalGraceIgnore) {
-          this._compactionObservedGeneration = null;
           if (consumedStopIgnore) this._cancelledProviderErrorsToIgnore--;
           logger.warn(
             {

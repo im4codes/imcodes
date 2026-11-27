@@ -1520,15 +1520,33 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
         uuid: 'res-a-to-b',
         num_turns: 2,
         usage: { input_tokens: 20000, output_tokens: 50 },
+        modelUsage: {
+          performance: {
+            inputTokens: 20000,
+            outputTokens: 50,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+            contextWindow: 256000,
+            maxOutputTokens: 16384,
+          },
+        },
       },
     ]);
 
     await p.send(route, 'request B without usage clears A');
     await vi.waitFor(() => expect(events.completions).toHaveLength(5));
 
-    // Only live emission from req-A; no finalized emission with req-A's stale 12000/4000
-    expect(events.usages).toHaveLength(usagesBeforeAtoB + 1);
-    expect(events.completions[4].message.metadata.usage).toBeUndefined();
+    // Request A emitted live + finalized carries ONLY matched model_context_window (no A or cumulative counts)
+    expect(events.usages).toHaveLength(usagesBeforeAtoB + 2);
+    expect(events.usages.at(-1)?.usage).toEqual({
+      messageId: 'res-a-to-b',
+      finalized: true,
+      model: 'performance',
+      usage: { model_context_window: 256000 },
+    });
+    expect(events.completions[4].message.metadata.usage).toEqual({ model_context_window: 256000 });
     expect(events.completions[4].message.metadata.totalUsage).toMatchObject({
       input_tokens: 20000,
       output_tokens: 50,
