@@ -804,9 +804,237 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       await flushVoiceHotwordsPush();
       expect(srv.projects[projKey].raw).toBe('DirectFlushEdit4');
       expect(getProjectVoiceHotwordsRaw(projKey)).toBe('DirectFlushEdit4');
-      expect(projectPutBases).toEqual([baseBeforeLost3, baseBeforeLost3, revAfterLost3]);
+      expect(projectPutBases).toEqual([baseBeforeLost3, revAfterLost3]);
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('serializes B -> A -> B account-switch queues without letting aborted A finally unblock concurrent B PUT during pending B GET', async () => {
+    const baseUrl = 'https://epoch-race.example';
+    const projKey = 'srv:srv-1::epoch-proj';
+    const srvA: any = {
+      version: 1,
+      user: { raw: 'A_User', updatedAt: 50, source: 'web' },
+      projects: { [projKey]: { raw: 'A_Proj', updatedAt: 50, source: 'web' } },
+      shareWithOthers: { enabled: false, updatedAt: 50 },
+    };
+    const srvB: any = {
+      version: 1,
+      user: { raw: 'B_User', updatedAt: 100, source: 'web' },
+      projects: { [projKey]: { raw: 'B_Initial', updatedAt: 100, source: 'web' } },
+      shareWithOthers: { enabled: false, updatedAt: 100 },
+    };
+
+    let releaseA!: () => void;
+    let releaseBGet!: () => void;
+    let bGetPending = false;
+    let sendsWhileBGetWasPending = 0;
+    const events: string[] = [];
+
+    const fetchRecord = vi.fn(async (opts: { expectedUserId: string; signal?: AbortSignal }) => {
+      if (opts.expectedUserId === 'user-a') {
+        events.push('fetchA:start');
+        await new Promise<void>((resolve) => {
+          releaseA = resolve;
+          opts.signal?.addEventListener('abort', () => {
+            // Delay settlement strictly asynchronously after switching back to B
+            setTimeout(() => {
+              events.push('fetchA:abortedSettled');
+              resolve();
+            }, 0);
+          });
+        });
+        return structuredClone(srvA);
+      }
+      if (bGetPending) {
+        events.push('fetchB2:start');
+        await new Promise<void>((resolve) => {
+          releaseBGet = resolve;
+        });
+        events.push('fetchB2:resolved');
+      }
+      return structuredClone(srvB);
+    });
+
+    const updateRecord = vi.fn(async (payload: any) => {
+      if (bGetPending) sendsWhileBGetWasPending += 1;
+      events.push(`putB:${payload.raw}`);
+      if (payload.scope === 'project' && payload.baseUpdatedAt === (srvB.projects[payload.projectKey]?.updatedAt ?? 0)) {
+        srvB.projects[payload.projectKey] = {
+          raw: payload.raw,
+          updatedAt: srvB.projects[payload.projectKey].updatedAt + 1,
+          source: 'web',
+          ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+        };
+      }
+      return { ok: true, applied: true, appliedScopes: { projects: { [payload.projectKey]: true } }, record: structuredClone(srvB) };
+    });
+
+    registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
+
+    // Complete B initial migration
+    setVoiceHotwordsAuthScope({ userId: 'user-b', baseUrl });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(getProjectVoiceHotwordsRaw(projKey)).toBe('B_Initial');
+
+    // Switch to A (hang fetchA), then switch back to B with a pending B GET
+    setVoiceHotwordsAuthScope({ userId: 'user-a', baseUrl });
+    bGetPending = true;
+    setVoiceHotwordsAuthScope({ userId: 'user-b', baseUrl });
+
+    // Allow A's async abort settlement to finish BEFORE B's GET settles
+    await new Promise((r) => setTimeout(r, 10));
+    expect(events).toContain('fetchA:abortedSettled');
+
+    // Edit B & push while B's GET is STILL pending -> PUT MUST NOT fire yet!
+    setProjectVoiceHotwordsRaw(projKey, 'B_NewWord');
+    const pushPromise = flushVoiceHotwordsPush();
+    await new Promise((r) => setTimeout(r, 10));
+    expect(sendsWhileBGetWasPending).toBe(0);
+
+    // Finish B GET -> PUT executes strictly AFTER GET, and both server and local converge to B_NewWord
+    bGetPending = false;
+    releaseBGet();
+    await pushPromise;
+    expect(srvB.projects[projKey].raw).toBe('B_NewWord');
+    expect(getProjectVoiceHotwordsRaw(projKey)).toBe('B_NewWord');
+    expect(events.indexOf('fetchB2:resolved')).toBeGreaterThan(-1);
+    expect(events.indexOf('putB:B_NewWord')).toBeGreaterThan(events.indexOf('fetchB2:resolved'));
+    releaseA?.();
+  });
+
+  it('preserves pending commit ID across 10+ failed offline edits/pushes, recovers final edit on reconnect, and still yields to external clear/revoke', async () => {
+    let rev = 100;
+    const nextRev = () => {
+      rev += 1;
+      return rev;
+    };
+    const projKey = 'srv:srv-1::offline-queue-proj';
+    const srv: any = {
+      version: 1,
+      user: { raw: 'UserInit', updatedAt: 100, source: 'web' },
+      projects: { [projKey]: { raw: 'ProjInit', updatedAt: 100, source: 'web' } },
+      shareWithOthers: { enabled: true, updatedAt: 100 },
+    };
+
+    let offline = false;
+    let dropNextCommitReply = false;
+
+    const fetchRecord = vi.fn(async () => {
+      if (offline) throw new Error('network_offline_get');
+      return structuredClone(srv);
+    });
+
+    const updateRecord = vi.fn(async (payload: any) => {
+      if (offline) throw new Error('network_offline_put');
+      let applied = false;
+      const appliedScopes: any = {};
+      if (payload.scope === 'project') {
+        const cur = srv.projects[payload.projectKey] ?? { raw: '', updatedAt: 0 };
+        if (payload.baseUpdatedAt === cur.updatedAt) {
+          srv.projects[payload.projectKey] = {
+            raw: payload.raw,
+            updatedAt: nextRev(),
+            source: 'web',
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && cur.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        appliedScopes.projects = { [payload.projectKey]: applied };
+      } else if (payload.scope === 'user') {
+        if (payload.baseUpdatedAt === srv.user.updatedAt) {
+          srv.user = {
+            raw: payload.raw,
+            updatedAt: nextRev(),
+            source: 'web',
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && srv.user.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        appliedScopes.user = applied;
+      } else if (payload.scope === 'share') {
+        if (payload.baseUpdatedAt === srv.shareWithOthers.updatedAt) {
+          srv.shareWithOthers = {
+            enabled: payload.enabled,
+            updatedAt: nextRev(),
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && srv.shareWithOthers.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        appliedScopes.shareWithOthers = applied;
+      }
+
+      if (dropNextCommitReply) {
+        dropNextCommitReply = false;
+        throw new Error('dropped_reply_after_commit');
+      }
+      return { ok: true, applied, appliedScopes, record: structuredClone(srv) };
+    });
+
+    setVoiceHotwordsAuthScope({ userId: 'user-offline', baseUrl: 'https://offline.example' });
+    registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
+    await syncVoiceHotwordsFromServer();
+
+    // Part 1: First PUT commits on server across all 3 scopes with dropped replies -> 10 offline edits + failed pushes -> reconnect MUST keep & persist final 10th edit!
+    dropNextCommitReply = true;
+    setGlobalVoiceHotwordsRaw('UserCommittedLost');
+    await flushVoiceHotwordsPush();
+    dropNextCommitReply = true;
+    setProjectVoiceHotwordsRaw(projKey, 'ProjCommittedLost');
+    await flushVoiceHotwordsPush();
+    dropNextCommitReply = true;
+    setShareHotwordsWithOthers(false);
+    await flushVoiceHotwordsPush();
+
+    expect(srv.user.raw).toBe('UserCommittedLost');
+    expect(srv.projects[projKey].raw).toBe('ProjCommittedLost');
+    expect(srv.shareWithOthers.enabled).toBe(false);
+
+    offline = true;
+    for (let i = 1; i <= 10; i += 1) {
+      setGlobalVoiceHotwordsRaw(`UserOffline_${i}`);
+      setProjectVoiceHotwordsRaw(projKey, `ProjOffline_${i}`);
+      setShareHotwordsWithOthers(i % 2 === 1);
+      await flushVoiceHotwordsPush();
+    }
+
+    offline = false;
+    await flushVoiceHotwordsPush();
+    expect(srv.user.raw).toBe('UserOffline_10');
+    expect(getGlobalVoiceHotwordsRaw()).toBe('UserOffline_10');
+    expect(srv.projects[projKey].raw).toBe('ProjOffline_10');
+    expect(getProjectVoiceHotwordsRaw(projKey)).toBe('ProjOffline_10');
+    expect(srv.shareWithOthers.enabled).toBe(false);
+    expect(getShareHotwordsWithOthers()).toBe(false);
+
+    // Part 2: External MCP clear/revoke during offline still wins over local offline edits!
+    dropNextCommitReply = true;
+    setProjectVoiceHotwordsRaw(projKey, 'ProjCommittedLost2');
+    await flushVoiceHotwordsPush();
+
+    offline = true;
+    for (let i = 1; i <= 10; i += 1) {
+      setProjectVoiceHotwordsRaw(projKey, `StaleOffline_${i}`);
+      setShareHotwordsWithOthers(true);
+      await flushVoiceHotwordsPush();
+    }
+    // External MCP clears project and revokes share before reconnect
+    srv.projects[projKey] = { raw: '', updatedAt: nextRev(), source: 'mcp' };
+    srv.shareWithOthers = { enabled: false, updatedAt: nextRev() };
+
+    offline = false;
+    await syncVoiceHotwordsFromServer();
+    expect(srv.projects[projKey].raw).toBe('');
+    expect(getProjectVoiceHotwordsRaw(projKey)).toBe('');
+    expect(srv.shareWithOthers.enabled).toBe(false);
+    expect(getShareHotwordsWithOthers()).toBe(false);
   });
 });

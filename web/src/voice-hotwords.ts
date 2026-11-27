@@ -63,7 +63,12 @@ interface PendingWriteRecord {
   editGen: number;
 }
 
-const MAX_UNCONFIRMED_WRITES = 8;
+interface AccountSyncQueueState {
+  readonly epoch: number;
+  readonly controller: AbortController;
+  tail: Promise<void>;
+  activeOps: number;
+}
 
 interface LocalVoiceHotwordsSyncMeta {
   userEditGen: number;
@@ -72,7 +77,7 @@ interface LocalVoiceHotwordsSyncMeta {
   userServerUpdatedAt: number;
   userRejectedEditGen: number;
   userCapacityBlocked: boolean;
-  userUnconfirmedWrites: PendingWriteRecord[];
+  userPendingWrite: PendingWriteRecord | null;
 
   projEditGen: Record<string, number>;
   projConfirmedGen: Record<string, number>;
@@ -80,14 +85,14 @@ interface LocalVoiceHotwordsSyncMeta {
   projServerUpdatedAt: Record<string, number>;
   projRejectedEditGen: Record<string, number>;
   projCapacityBlocked: Record<string, boolean>;
-  projUnconfirmedWrites: Record<string, PendingWriteRecord[]>;
+  projPendingWrite: Record<string, PendingWriteRecord>;
 
   shareEditGen: number;
   shareConfirmedGen: number;
   shareBaseServerUpdatedAt: number;
   shareServerUpdatedAt: number;
   shareCapacityBlocked: boolean;
-  shareUnconfirmedWrites: PendingWriteRecord[];
+  sharePendingWrite: PendingWriteRecord | null;
 
   initialMigrationDone: boolean;
 }
@@ -100,10 +105,7 @@ let _activeProjectKey: string | null = null;
 let _openSettingsHandler: OpenVoiceHotwordsSettingsHandler | null = null;
 let _syncClient: VoiceHotwordsSyncClient | null = null;
 let _pushTimer: ReturnType<typeof setTimeout> | null = null;
-let _syncAbortController: AbortController | null = null;
-let _syncQueuePromise: Promise<void> = Promise.resolve();
-let _syncQueueEpoch = 0;
-let _activeSyncOps = 0;
+let _currentSyncQueue: AccountSyncQueueState | null = null;
 let _inFlightSyncPromise: Promise<void> | null = null;
 let _inFlightSyncEpoch = -1;
 let _remoteSyncTriggeredEpoch = -1;
@@ -126,20 +128,20 @@ function emptySyncMeta(): LocalVoiceHotwordsSyncMeta {
     userServerUpdatedAt: 0,
     userRejectedEditGen: 0,
     userCapacityBlocked: false,
-    userUnconfirmedWrites: [],
+    userPendingWrite: null,
     projEditGen: createNullProtoDict<number>(),
     projConfirmedGen: createNullProtoDict<number>(),
     projBaseServerUpdatedAt: createNullProtoDict<number>(),
     projServerUpdatedAt: createNullProtoDict<number>(),
     projRejectedEditGen: createNullProtoDict<number>(),
     projCapacityBlocked: createNullProtoDict<boolean>(),
-    projUnconfirmedWrites: createNullProtoDict<PendingWriteRecord[]>(),
+    projPendingWrite: createNullProtoDict<PendingWriteRecord>(),
     shareEditGen: 0,
     shareConfirmedGen: 0,
     shareBaseServerUpdatedAt: 0,
     shareServerUpdatedAt: 0,
     shareCapacityBlocked: false,
-    shareUnconfirmedWrites: [],
+    sharePendingWrite: null,
     initialMigrationDone: false,
   };
 }
@@ -150,29 +152,26 @@ function coerceNum(value: unknown): number {
     : 0;
 }
 
-function coercePendingWriteList(input: unknown): PendingWriteRecord[] {
-  if (!Array.isArray(input)) return [];
-  const out: PendingWriteRecord[] = [];
-  for (const item of input) {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-    const obj = item as Record<string, unknown>;
-    const id = typeof obj.id === 'string' ? obj.id.trim() : '';
-    const editGen = coerceNum(obj.editGen);
-    if (id && id.length <= 64 && editGen > 0) {
-      out.push({ id, editGen });
-    }
+function coercePendingWriteRecord(input: unknown): PendingWriteRecord | null {
+  const candidate = Array.isArray(input) ? input[0] : input;
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+  const obj = candidate as Record<string, unknown>;
+  const id = typeof obj.id === 'string' ? obj.id.trim() : '';
+  const editGen = coerceNum(obj.editGen);
+  if (id && id.length <= 64 && editGen > 0) {
+    return { id, editGen };
   }
-  return out.slice(-MAX_UNCONFIRMED_WRITES);
+  return null;
 }
 
-function coercePendingWriteListMap(input: unknown): Record<string, PendingWriteRecord[]> {
-  const out = createNullProtoDict<PendingWriteRecord[]>();
+function coercePendingWriteMap(input: unknown): Record<string, PendingWriteRecord> {
+  const out = createNullProtoDict<PendingWriteRecord>();
   if (!input || typeof input !== 'object' || Array.isArray(input)) return out;
   for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
     const cleanKey = normalizeVoiceHotwordProjectKey(k);
     if (!cleanKey) continue;
-    const list = coercePendingWriteList(v);
-    if (list.length > 0) setOwnDictValue(out, cleanKey, list);
+    const rec = coercePendingWriteRecord(v);
+    if (rec) setOwnDictValue(out, cleanKey, rec);
   }
   return out;
 }
@@ -256,13 +255,10 @@ function clearPendingSyncState(): void {
     clearTimeout(_pushTimer);
     _pushTimer = null;
   }
-  if (_syncAbortController) {
-    _syncAbortController.abort();
-    _syncAbortController = null;
+  if (_currentSyncQueue) {
+    _currentSyncQueue.controller.abort();
+    _currentSyncQueue = null;
   }
-  _syncQueuePromise = Promise.resolve();
-  _syncQueueEpoch = 0;
-  _activeSyncOps = 0;
   _inFlightSyncPromise = null;
   _inFlightSyncEpoch = -1;
 }
@@ -280,20 +276,20 @@ function readSyncMeta(accountKey: string): LocalVoiceHotwordsSyncMeta {
       userServerUpdatedAt: coerceNum(parsed.userServerUpdatedAt),
       userRejectedEditGen: coerceNum(parsed.userRejectedEditGen),
       userCapacityBlocked: parsed.userCapacityBlocked === true,
-      userUnconfirmedWrites: coercePendingWriteList(parsed.userUnconfirmedWrites),
+      userPendingWrite: coercePendingWriteRecord(parsed.userPendingWrite ?? parsed.userUnconfirmedWrites),
       projEditGen: coerceNumMap(parsed.projEditGen),
       projConfirmedGen: coerceNumMap(parsed.projConfirmedGen),
       projBaseServerUpdatedAt: coerceNumMap(parsed.projBaseServerUpdatedAt),
       projServerUpdatedAt: coerceNumMap(parsed.projServerUpdatedAt),
       projRejectedEditGen: coerceNumMap(parsed.projRejectedEditGen),
       projCapacityBlocked: coerceBoolMap(parsed.projCapacityBlocked),
-      projUnconfirmedWrites: coercePendingWriteListMap(parsed.projUnconfirmedWrites),
+      projPendingWrite: coercePendingWriteMap(parsed.projPendingWrite ?? parsed.projUnconfirmedWrites),
       shareEditGen: coerceNum(parsed.shareEditGen),
       shareConfirmedGen: coerceNum(parsed.shareConfirmedGen),
       shareBaseServerUpdatedAt: coerceNum(parsed.shareBaseServerUpdatedAt),
       shareServerUpdatedAt: coerceNum(parsed.shareServerUpdatedAt),
       shareCapacityBlocked: parsed.shareCapacityBlocked === true,
-      shareUnconfirmedWrites: coercePendingWriteList(parsed.shareUnconfirmedWrites),
+      sharePendingWrite: coercePendingWriteRecord(parsed.sharePendingWrite ?? parsed.shareUnconfirmedWrites),
       initialMigrationDone: parsed.initialMigrationDone === true,
     };
   } catch {
@@ -731,44 +727,79 @@ function mintVoiceHotwordsWriteId(): string {
   return `vhw_${uuid}`.slice(0, 64);
 }
 
-function getOrAllocateWriteId(
-  list: PendingWriteRecord[],
+function resolveOrAllocatePendingWrite(
+  current: PendingWriteRecord | null | undefined,
   editGen: number,
-): { writeId: string; nextList: PendingWriteRecord[] } {
-  const existing = list.find((entry) => entry.editGen === editGen);
-  if (existing) {
-    return { writeId: existing.id, nextList: list };
+): { writeId: string; record: PendingWriteRecord; changed: boolean } {
+  if (current && current.editGen === editGen) {
+    return { writeId: current.id, record: current, changed: false };
   }
   const writeId = mintVoiceHotwordsWriteId();
-  const nextList = [...list, { id: writeId, editGen }].slice(-MAX_UNCONFIRMED_WRITES);
-  return { writeId, nextList };
+  return { writeId, record: { id: writeId, editGen }, changed: true };
 }
 
 function prepareScopePushWriteId(accountKey: string, item: PendingScopePush): string {
   const meta = readSyncMeta(accountKey);
   if (item.kind === 'user') {
-    const { writeId, nextList } = getOrAllocateWriteId(meta.userUnconfirmedWrites, item.editGen);
-    if (nextList !== meta.userUnconfirmedWrites) {
-      meta.userUnconfirmedWrites = nextList;
+    const res = resolveOrAllocatePendingWrite(meta.userPendingWrite, item.editGen);
+    if (res.changed) {
+      meta.userPendingWrite = res.record;
       writeSyncMeta(accountKey, meta);
     }
-    return writeId;
+    return res.writeId;
   }
   if (item.kind === 'share') {
-    const { writeId, nextList } = getOrAllocateWriteId(meta.shareUnconfirmedWrites, item.editGen);
-    if (nextList !== meta.shareUnconfirmedWrites) {
-      meta.shareUnconfirmedWrites = nextList;
+    const res = resolveOrAllocatePendingWrite(meta.sharePendingWrite, item.editGen);
+    if (res.changed) {
+      meta.sharePendingWrite = res.record;
       writeSyncMeta(accountKey, meta);
     }
-    return writeId;
+    return res.writeId;
   }
-  const existingList = getOwnDictValue(meta.projUnconfirmedWrites, item.projectKey) ?? [];
-  const { writeId, nextList } = getOrAllocateWriteId(existingList, item.editGen);
-  if (nextList !== existingList) {
-    setOwnDictValue(meta.projUnconfirmedWrites, item.projectKey, nextList);
+  const existing = getOwnDictValue(meta.projPendingWrite, item.projectKey);
+  const res = resolveOrAllocatePendingWrite(existing, item.editGen);
+  if (res.changed) {
+    setOwnDictValue(meta.projPendingWrite, item.projectKey, res.record);
     writeSyncMeta(accountKey, meta);
   }
-  return writeId;
+  return res.writeId;
+}
+
+function clearScopePendingWriteIfMatches(
+  accountKey: string,
+  item: PendingScopePush,
+  editGen: number,
+): void {
+  const meta = readSyncMeta(accountKey);
+  let mutated = false;
+  if (item.kind === 'user' && meta.userPendingWrite?.editGen === editGen) {
+    meta.userPendingWrite = null;
+    mutated = true;
+  } else if (item.kind === 'share' && meta.sharePendingWrite?.editGen === editGen) {
+    meta.sharePendingWrite = null;
+    mutated = true;
+  } else if (item.kind === 'project') {
+    const existing = getOwnDictValue(meta.projPendingWrite, item.projectKey);
+    if (existing?.editGen === editGen) {
+      deleteOwnDictKey(meta.projPendingWrite, item.projectKey);
+      mutated = true;
+    }
+  }
+  if (mutated) writeSyncMeta(accountKey, meta);
+}
+
+function hasAmbiguousPriorPendingWrite(meta: LocalVoiceHotwordsSyncMeta, pushes: PendingScopePush[]): boolean {
+  for (const item of pushes) {
+    if (item.kind === 'user') {
+      if (meta.userPendingWrite && meta.userPendingWrite.editGen < item.editGen) return true;
+    } else if (item.kind === 'share') {
+      if (meta.sharePendingWrite && meta.sharePendingWrite.editGen < item.editGen) return true;
+    } else {
+      const pending = getOwnDictValue(meta.projPendingWrite, item.projectKey);
+      if (pending && pending.editGen < item.editGen) return true;
+    }
+  }
+  return false;
 }
 
 function resolveScopeAppliedFlag(
@@ -788,14 +819,6 @@ function resolveScopeAppliedFlag(
   return typeof topApplied === 'boolean' ? topApplied : undefined;
 }
 
-function pruneUnconfirmedWrites(
-  list: PendingWriteRecord[],
-  confirmedGen: number,
-  rejectedWriteId?: string,
-): PendingWriteRecord[] {
-  return list.filter((w) => w.editGen > confirmedGen && w.id !== rejectedWriteId);
-}
-
 function reconcileWithServerRecord(
   accountKey: string,
   server: VoiceHotwordsSyncRecord,
@@ -803,6 +826,7 @@ function reconcileWithServerRecord(
   markInitialMigrated = false,
 ): { pendingPushes: PendingScopePush[]; changedUi: boolean; caughtUpFromOwnWrite: boolean } {
   const meta = readSyncMeta(accountKey);
+  const fromServerFetch = confirmed === undefined;
   if (markInitialMigrated) {
     // Re-enable capacity-blocked scopes once a fresh server snapshot arrives
     meta.userCapacityBlocked = false;
@@ -825,8 +849,9 @@ function reconcileWithServerRecord(
     const srvRaw = server.user.raw;
     const srvTs = server.user.updatedAt;
     const srvLastWriteId = server.user.lastWriteId;
-    const matchedOwnWrite = srvLastWriteId
-      ? meta.userUnconfirmedWrites.find((w) => w.id === srvLastWriteId)
+    const pendingWrite = meta.userPendingWrite;
+    const matchedOwnWrite = srvLastWriteId && pendingWrite && pendingWrite.id === srvLastWriteId
+      ? pendingWrite
       : undefined;
     const prevBaseTs = meta.userBaseServerUpdatedAt;
     meta.userServerUpdatedAt = srvTs;
@@ -836,7 +861,7 @@ function reconcileWithServerRecord(
         meta.userConfirmedGen = Math.max(meta.userConfirmedGen, matchedOwnWrite.editGen);
         meta.userBaseServerUpdatedAt = srvTs;
         meta.userCapacityBlocked = false;
-        meta.userUnconfirmedWrites = pruneUnconfirmedWrites(meta.userUnconfirmedWrites, meta.userConfirmedGen, confirmed.writeId);
+        meta.userPendingWrite = null;
         caughtUpFromOwnWrite = true;
       } else {
         if (rawDiffers(srvRaw, localGlobal)) {
@@ -848,7 +873,7 @@ function reconcileWithServerRecord(
         meta.userBaseServerUpdatedAt = srvTs;
         meta.userRejectedEditGen = 0;
         meta.userCapacityBlocked = false;
-        meta.userUnconfirmedWrites = [];
+        meta.userPendingWrite = null;
       }
     } else if (confirmed?.kind === 'user' && meta.userEditGen > confirmed.editGen) {
       const confirmedApplied = confirmed.applied === true
@@ -863,11 +888,9 @@ function reconcileWithServerRecord(
           meta.userBaseServerUpdatedAt = srvTs;
         }
         meta.userCapacityBlocked = false;
-        meta.userUnconfirmedWrites = pruneUnconfirmedWrites(
-          meta.userUnconfirmedWrites,
-          meta.userConfirmedGen,
-          confirmed.applied === false ? confirmed.writeId : undefined,
-        );
+        if (meta.userPendingWrite && meta.userPendingWrite.editGen <= meta.userConfirmedGen) {
+          meta.userPendingWrite = null;
+        }
         if (confirmed.applied === false && matchedOwnWrite) {
           caughtUpFromOwnWrite = true;
         }
@@ -881,7 +904,7 @@ function reconcileWithServerRecord(
         meta.userBaseServerUpdatedAt = srvTs;
         meta.userRejectedEditGen = 0;
         meta.userCapacityBlocked = false;
-        meta.userUnconfirmedWrites = [];
+        meta.userPendingWrite = null;
       }
     } else if (meta.userEditGen > meta.userConfirmedGen) {
       if (srvTs > prevBaseTs) {
@@ -889,7 +912,7 @@ function reconcileWithServerRecord(
           meta.userConfirmedGen = Math.max(meta.userConfirmedGen, matchedOwnWrite.editGen);
           meta.userBaseServerUpdatedAt = srvTs;
           meta.userCapacityBlocked = false;
-          meta.userUnconfirmedWrites = pruneUnconfirmedWrites(meta.userUnconfirmedWrites, meta.userConfirmedGen);
+          meta.userPendingWrite = null;
           if (meta.userEditGen === meta.userConfirmedGen && rawDiffers(srvRaw, localGlobal)) {
             localGlobal = srvRaw;
             globalChanged = true;
@@ -906,8 +929,11 @@ function reconcileWithServerRecord(
           meta.userBaseServerUpdatedAt = srvTs;
           meta.userRejectedEditGen = 0;
           meta.userCapacityBlocked = false;
-          meta.userUnconfirmedWrites = [];
+          meta.userPendingWrite = null;
         }
+      } else if (fromServerFetch && meta.userPendingWrite) {
+        // Authoritative GET shows server did not advance beyond prevBaseTs: prior pendingWrite never committed
+        meta.userPendingWrite = null;
       }
     } else if (!meta.initialMigrationDone && localGlobal.length > 0 && srvTs === 0) {
       if (localGlobal.length <= VOICE_HOTWORDS_MAX_RAW_CHARS) {
@@ -921,7 +947,7 @@ function reconcileWithServerRecord(
         changedUi = true;
       }
       meta.userBaseServerUpdatedAt = srvTs;
-      meta.userUnconfirmedWrites = [];
+      meta.userPendingWrite = null;
     }
   }
 
@@ -941,14 +967,14 @@ function reconcileWithServerRecord(
     const wasConfirmedOnServer = (getOwnDictValue(meta.projServerUpdatedAt, key) ?? 0) > 0;
     const isRejected = editGen > 0 && (getOwnDictValue(meta.projRejectedEditGen, key) ?? 0) >= editGen;
     const isOversizedLocal = localRaw.length > VOICE_HOTWORDS_MAX_RAW_CHARS;
-    const unconfirmedWrites = getOwnDictValue(meta.projUnconfirmedWrites, key) ?? [];
+    const pendingWrite = getOwnDictValue(meta.projPendingWrite, key);
 
     const srvEntry = getOwnDictValue(server.projects, key);
     const srvTs = srvEntry?.updatedAt ?? 0;
     const srvRaw = srvEntry?.raw ?? '';
     const srvLastWriteId = srvEntry?.lastWriteId;
-    const matchedOwnWrite = srvLastWriteId
-      ? unconfirmedWrites.find((w) => w.id === srvLastWriteId)
+    const matchedOwnWrite = srvLastWriteId && pendingWrite && pendingWrite.id === srvLastWriteId
+      ? pendingWrite
       : undefined;
 
     if (srvTs > 0) {
@@ -957,18 +983,13 @@ function reconcileWithServerRecord(
       deleteOwnDictKey(meta.projServerUpdatedAt, key);
     }
 
-    const setProjUnconfirmed = (nextList: PendingWriteRecord[]) => {
-      if (nextList.length === 0) deleteOwnDictKey(meta.projUnconfirmedWrites, key);
-      else setOwnDictValue(meta.projUnconfirmedWrites, key, nextList);
-    };
-
     if (confirmed?.kind === 'project' && confirmed.projectKey === key && editGen === confirmed.editGen) {
       if (confirmed.applied === false && matchedOwnWrite && matchedOwnWrite.editGen < editGen) {
         const nextConfirmed = Math.max(confirmedGen, matchedOwnWrite.editGen);
         setOwnDictValue(meta.projConfirmedGen, key, nextConfirmed);
         setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
         deleteOwnDictKey(meta.projCapacityBlocked, key);
-        setProjUnconfirmed(pruneUnconfirmedWrites(unconfirmedWrites, nextConfirmed, confirmed.writeId));
+        deleteOwnDictKey(meta.projPendingWrite, key);
         caughtUpFromOwnWrite = true;
       } else {
         if (rawDiffers(srvRaw, localRaw)) {
@@ -981,7 +1002,7 @@ function reconcileWithServerRecord(
         setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
         deleteOwnDictKey(meta.projRejectedEditGen, key);
         deleteOwnDictKey(meta.projCapacityBlocked, key);
-        setProjUnconfirmed([]);
+        deleteOwnDictKey(meta.projPendingWrite, key);
       }
     } else if (confirmed?.kind === 'project' && confirmed.projectKey === key && editGen > confirmed.editGen) {
       const confirmedApplied = confirmed.applied === true
@@ -997,11 +1018,9 @@ function reconcileWithServerRecord(
           setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
         }
         deleteOwnDictKey(meta.projCapacityBlocked, key);
-        setProjUnconfirmed(pruneUnconfirmedWrites(
-          unconfirmedWrites,
-          nextConfirmed,
-          confirmed.applied === false ? confirmed.writeId : undefined,
-        ));
+        if (pendingWrite && pendingWrite.editGen <= nextConfirmed) {
+          deleteOwnDictKey(meta.projPendingWrite, key);
+        }
         if (confirmed.applied === false && matchedOwnWrite) {
           caughtUpFromOwnWrite = true;
         }
@@ -1016,7 +1035,7 @@ function reconcileWithServerRecord(
         setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
         deleteOwnDictKey(meta.projRejectedEditGen, key);
         deleteOwnDictKey(meta.projCapacityBlocked, key);
-        setProjUnconfirmed([]);
+        deleteOwnDictKey(meta.projPendingWrite, key);
       }
     } else if (isDirty) {
       if (srvTs > prevBaseTs) {
@@ -1025,7 +1044,7 @@ function reconcileWithServerRecord(
           setOwnDictValue(meta.projConfirmedGen, key, nextConfirmed);
           setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
           deleteOwnDictKey(meta.projCapacityBlocked, key);
-          setProjUnconfirmed(pruneUnconfirmedWrites(unconfirmedWrites, nextConfirmed));
+          deleteOwnDictKey(meta.projPendingWrite, key);
           if (editGen === nextConfirmed && rawDiffers(srvRaw, localRaw)) {
             if (!srvRaw) deleteOwnDictKey(localProjects, key);
             else setOwnDictValue(localProjects, key, srvRaw);
@@ -1044,8 +1063,10 @@ function reconcileWithServerRecord(
           setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
           deleteOwnDictKey(meta.projRejectedEditGen, key);
           deleteOwnDictKey(meta.projCapacityBlocked, key);
-          setProjUnconfirmed([]);
+          deleteOwnDictKey(meta.projPendingWrite, key);
         }
+      } else if (fromServerFetch && pendingWrite) {
+        deleteOwnDictKey(meta.projPendingWrite, key);
       }
     } else if (!meta.initialMigrationDone && localRaw.length > 0 && srvTs === 0) {
       if (!isOversizedLocal) {
@@ -1060,11 +1081,11 @@ function reconcileWithServerRecord(
         changedUi = true;
       }
       setOwnDictValue(meta.projBaseServerUpdatedAt, key, srvTs);
-      setProjUnconfirmed([]);
+      deleteOwnDictKey(meta.projPendingWrite, key);
     } else if (srvTs === 0 && meta.initialMigrationDone && wasConfirmedOnServer && !isRejected && !isOversizedLocal && localRaw !== '') {
       deleteOwnDictKey(localProjects, key);
       deleteOwnDictKey(meta.projBaseServerUpdatedAt, key);
-      setProjUnconfirmed([]);
+      deleteOwnDictKey(meta.projPendingWrite, key);
       projectsChanged = true;
       changedUi = true;
     }
@@ -1075,8 +1096,9 @@ function reconcileWithServerRecord(
     const srvEnabled = server.shareWithOthers.enabled;
     const srvTs = server.shareWithOthers.updatedAt;
     const srvLastWriteId = server.shareWithOthers.lastWriteId;
-    const matchedOwnWrite = srvLastWriteId
-      ? meta.shareUnconfirmedWrites.find((w) => w.id === srvLastWriteId)
+    const pendingWrite = meta.sharePendingWrite;
+    const matchedOwnWrite = srvLastWriteId && pendingWrite && pendingWrite.id === srvLastWriteId
+      ? pendingWrite
       : undefined;
     const prevBaseTs = meta.shareBaseServerUpdatedAt;
     meta.shareServerUpdatedAt = srvTs;
@@ -1086,7 +1108,7 @@ function reconcileWithServerRecord(
         meta.shareConfirmedGen = Math.max(meta.shareConfirmedGen, matchedOwnWrite.editGen);
         meta.shareBaseServerUpdatedAt = srvTs;
         meta.shareCapacityBlocked = false;
-        meta.shareUnconfirmedWrites = pruneUnconfirmedWrites(meta.shareUnconfirmedWrites, meta.shareConfirmedGen, confirmed.writeId);
+        meta.sharePendingWrite = null;
         caughtUpFromOwnWrite = true;
       } else {
         if (srvEnabled !== localShare) {
@@ -1097,7 +1119,7 @@ function reconcileWithServerRecord(
         meta.shareConfirmedGen = meta.shareEditGen;
         meta.shareBaseServerUpdatedAt = srvTs;
         meta.shareCapacityBlocked = false;
-        meta.shareUnconfirmedWrites = [];
+        meta.sharePendingWrite = null;
       }
     } else if (confirmed?.kind === 'share' && meta.shareEditGen > confirmed.editGen) {
       const confirmedApplied = confirmed.applied === true
@@ -1112,11 +1134,9 @@ function reconcileWithServerRecord(
           meta.shareBaseServerUpdatedAt = srvTs;
         }
         meta.shareCapacityBlocked = false;
-        meta.shareUnconfirmedWrites = pruneUnconfirmedWrites(
-          meta.shareUnconfirmedWrites,
-          meta.shareConfirmedGen,
-          confirmed.applied === false ? confirmed.writeId : undefined,
-        );
+        if (meta.sharePendingWrite && meta.sharePendingWrite.editGen <= meta.shareConfirmedGen) {
+          meta.sharePendingWrite = null;
+        }
         if (confirmed.applied === false && matchedOwnWrite) {
           caughtUpFromOwnWrite = true;
         }
@@ -1129,7 +1149,7 @@ function reconcileWithServerRecord(
         meta.shareConfirmedGen = meta.shareEditGen;
         meta.shareBaseServerUpdatedAt = srvTs;
         meta.shareCapacityBlocked = false;
-        meta.shareUnconfirmedWrites = [];
+        meta.sharePendingWrite = null;
       }
     } else if (meta.shareEditGen > meta.shareConfirmedGen) {
       if (srvTs > prevBaseTs) {
@@ -1137,7 +1157,7 @@ function reconcileWithServerRecord(
           meta.shareConfirmedGen = Math.max(meta.shareConfirmedGen, matchedOwnWrite.editGen);
           meta.shareBaseServerUpdatedAt = srvTs;
           meta.shareCapacityBlocked = false;
-          meta.shareUnconfirmedWrites = pruneUnconfirmedWrites(meta.shareUnconfirmedWrites, meta.shareConfirmedGen);
+          meta.sharePendingWrite = null;
           if (meta.shareEditGen === meta.shareConfirmedGen && srvEnabled !== localShare) {
             localShare = srvEnabled;
             shareChanged = true;
@@ -1153,8 +1173,10 @@ function reconcileWithServerRecord(
           meta.shareConfirmedGen = meta.shareEditGen;
           meta.shareBaseServerUpdatedAt = srvTs;
           meta.shareCapacityBlocked = false;
-          meta.shareUnconfirmedWrites = [];
+          meta.sharePendingWrite = null;
         }
+      } else if (fromServerFetch && meta.sharePendingWrite) {
+        meta.sharePendingWrite = null;
       }
     } else if (!meta.initialMigrationDone && localShare && srvTs === 0) {
       meta.shareEditGen += 1;
@@ -1166,7 +1188,7 @@ function reconcileWithServerRecord(
         changedUi = true;
       }
       meta.shareBaseServerUpdatedAt = srvTs;
-      meta.shareUnconfirmedWrites = [];
+      meta.sharePendingWrite = null;
     }
   }
 
@@ -1207,7 +1229,7 @@ async function executeIsolatedPushes(
     let catchupRetries = 2;
 
     while (item) {
-      if (!isVoiceHotwordsScopeValid(snapshot)) return false;
+      if (!isVoiceHotwordsScopeValid(snapshot) || signal.aborted) return false;
       const currentItem: PendingScopePush = item;
       item = undefined;
 
@@ -1218,7 +1240,7 @@ async function executeIsolatedPushes(
           expectedUserId,
           signal,
         });
-        if (!rawRes || !isVoiceHotwordsScopeValid(snapshot)) return false;
+        if (!rawRes || !isVoiceHotwordsScopeValid(snapshot) || signal.aborted) return false;
 
         const serverRecord = 'record' in rawRes ? rawRes.record : rawRes;
         const appliedScopes = 'appliedScopes' in rawRes ? rawRes.appliedScopes : undefined;
@@ -1278,9 +1300,10 @@ async function executeIsolatedPushes(
           hasRemainingDirtyEdit = true;
         }
       } catch (err) {
-        if (!isVoiceHotwordsScopeValid(snapshot)) return false;
+        if (!isVoiceHotwordsScopeValid(snapshot) || signal.aborted) return false;
         if (isCapacityError(err)) {
-          // Recoverable account-wide capacity conflict: preserve dirty editGen, pause retry until next fresh server snapshot (no 300ms spin)
+          // Recoverable account-wide capacity conflict: server rejected deterministically -> clear unconfirmed writeId and pause retry until next snapshot
+          clearScopePendingWriteIfMatches(accountKey, currentItem, currentItem.editGen);
           const latestMeta = readSyncMeta(accountKey);
           if (currentItem.kind === 'user' && latestMeta.userEditGen === currentItem.editGen) {
             latestMeta.userCapacityBlocked = true;
@@ -1291,7 +1314,8 @@ async function executeIsolatedPushes(
           }
           writeSyncMeta(accountKey, latestMeta);
         } else if (isClientValidationError(err)) {
-          // Non-recoverable scope validation error: quarantine only this editGen until user edits again
+          // Non-recoverable scope validation error: server rejected deterministically -> clear unconfirmed writeId & quarantine this editGen
+          clearScopePendingWriteIfMatches(accountKey, currentItem, currentItem.editGen);
           const latestMeta = readSyncMeta(accountKey);
           if (currentItem.kind === 'user' && latestMeta.userEditGen === currentItem.editGen) {
             latestMeta.userRejectedEditGen = currentItem.editGen;
@@ -1310,27 +1334,40 @@ function enqueueAccountSyncOperation<T>(
   snapshot: VoiceHotwordsScopeSnapshot,
   task: (signal: AbortSignal) => Promise<T>,
 ): Promise<T | undefined> {
-  const runEpoch = snapshot.epoch;
+  if (!isVoiceHotwordsScopeValid(snapshot) || _scopeEpoch !== snapshot.epoch) {
+    return Promise.resolve(undefined);
+  }
+  let queue = _currentSyncQueue;
+  if (!queue || queue.epoch !== snapshot.epoch) {
+    queue = {
+      epoch: snapshot.epoch,
+      controller: new AbortController(),
+      tail: Promise.resolve(),
+      activeOps: 0,
+    };
+    _currentSyncQueue = queue;
+  }
+  const targetQueue = queue;
   const execute = async (): Promise<T | undefined> => {
-    if (!isVoiceHotwordsScopeValid(snapshot) || _scopeEpoch !== runEpoch) {
+    if (
+      targetQueue.controller.signal.aborted
+      || !isVoiceHotwordsScopeValid(snapshot)
+      || _scopeEpoch !== targetQueue.epoch
+    ) {
       return undefined;
     }
-    if (!_syncAbortController || _syncQueueEpoch !== runEpoch) {
-      _syncAbortController = new AbortController();
-      _syncQueueEpoch = runEpoch;
-    }
-    return task(_syncAbortController.signal);
+    return task(targetQueue.controller.signal);
   };
 
-  _activeSyncOps += 1;
+  targetQueue.activeOps += 1;
   const next = (
-    _activeSyncOps === 1
+    targetQueue.activeOps === 1
       ? execute()
-      : _syncQueuePromise.catch(() => undefined).then(() => execute())
+      : targetQueue.tail.catch(() => undefined).then(() => execute())
   ).finally(() => {
-    _activeSyncOps = Math.max(0, _activeSyncOps - 1);
+    targetQueue.activeOps = Math.max(0, targetQueue.activeOps - 1);
   });
-  _syncQueuePromise = next.then(() => undefined, () => undefined);
+  targetQueue.tail = next.then(() => undefined, () => undefined);
   return next;
 }
 
@@ -1340,9 +1377,30 @@ export async function flushVoiceHotwordsPush(): Promise<void> {
   if (!_syncClient || !isRemoteSyncEligibleAccountKey(accountKey) || !snapshot.userId) return;
 
   await enqueueAccountSyncOperation(snapshot, async (signal) => {
-    const meta = readSyncMeta(accountKey);
-    const pushes = collectDirtyScopePushes(accountKey, meta);
+    let meta = readSyncMeta(accountKey);
+    let pushes = collectDirtyScopePushes(accountKey, meta);
     if (pushes.length === 0) return;
+
+    if (hasAmbiguousPriorPendingWrite(meta, pushes)) {
+      try {
+        const serverRecord = await _syncClient?.fetchRecord({
+          expectedUserId: snapshot.userId!,
+          signal,
+        });
+        if (!serverRecord || !isVoiceHotwordsScopeValid(snapshot) || signal.aborted) return;
+        const reconciled = reconcileWithServerRecord(accountKey, serverRecord, undefined, true);
+        if (reconciled.changedUi) {
+          notifyChange();
+        }
+        meta = readSyncMeta(accountKey);
+        pushes = reconciled.pendingPushes;
+        if (pushes.length === 0) return;
+      } catch {
+        // Network/offline error resolving earlier pending write: retain pendingWriteId untouched for reconnect recovery
+        return;
+      }
+    }
+
     const needsReschedule = await executeIsolatedPushes(snapshot, pushes, signal);
     if (needsReschedule && isVoiceHotwordsScopeValid(snapshot)) {
       scheduleVoiceHotwordsPush(snapshot);
