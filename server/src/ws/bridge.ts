@@ -424,6 +424,7 @@ import {
   type GlobalTaskSummaryUpsertInput,
 } from '../db/global-task-summaries.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
+import { pushStreamHub } from '../services/push-stream-hub.js';
 import {
   adaptSharedContextRuntimeConfigForSupportedBackends,
   LEGACY_SHARED_CONTEXT_RUNTIME_BACKENDS,
@@ -15671,12 +15672,15 @@ export class WsBridge {
     return { hasMobileSocket, hasDesktopSocket };
   }
 
-  private buildSocketPushSuppressionFlags(userId: string): {
+  private buildSocketPushSuppressionFlags(
+    userId: string,
+    presence?: { hasMobileSocket: boolean; hasDesktopSocket: boolean },
+  ): {
     suppressTokenPush?: boolean;
     suppressDesktopPush?: boolean;
     suppressStreamPush: false;
   } {
-    const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(userId);
+    const { hasMobileSocket, hasDesktopSocket } = presence ?? this.getUserPushSocketPresence(userId);
     return {
       ...(hasMobileSocket ? { suppressTokenPush: true } : {}),
       ...(hasMobileSocket && !hasDesktopSocket ? { suppressDesktopPush: true } : {}),
@@ -15690,7 +15694,12 @@ export class WsBridge {
       : await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
-    const suppressionFlags = this.buildSocketPushSuppressionFlags(server.user_id);
+    const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(server.user_id);
+    if (hasMobileSocket && !hasDesktopSocket && !pushStreamHub.hasSubscribers(server.user_id) && !globalTaskHub.isPgListening()) {
+      return;
+    }
+
+    const suppressionFlags = this.buildSocketPushSuppressionFlags(server.user_id, { hasMobileSocket, hasDesktopSocket });
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');
@@ -15780,7 +15789,12 @@ export class WsBridge {
       : await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
-    const suppressionFlags = this.buildSocketPushSuppressionFlags(server.user_id);
+    const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(server.user_id);
+    if (hasMobileSocket && !hasDesktopSocket && !pushStreamHub.hasSubscribers(server.user_id) && !globalTaskHub.isPgListening()) {
+      return;
+    }
+
+    const suppressionFlags = this.buildSocketPushSuppressionFlags(server.user_id, { hasMobileSocket, hasDesktopSocket });
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');
