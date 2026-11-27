@@ -1285,14 +1285,18 @@ class MacosRemoteDesktopSession::Impl final
       return false;
     }
     if (!core_.readiness().ControlReady()) {
-      return SetControlActiveLocked(false, last_transport_time_);
+      // Preserve confirmed server transport authority (mode/epoch) so lease
+      // renewals keep matching while local control stays truthfully disabled.
+      return true;
     }
     return SetControlActiveLocked(true, last_transport_time_);
   }
 
   bool SetControlActiveLocked(bool active, common::TransportTime now) {
-    if (active && requested_controllers_ == 0)
+    if (active &&
+        (requested_controllers_ == 0 || !core_.readiness().ControlReady())) {
       return false;
+    }
     if (active && dependencies_.transport != nullptr &&
         !TransportChannelsReadyLocked()) {
       return false;

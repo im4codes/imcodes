@@ -1852,6 +1852,69 @@ void TestApplyModeAuthorityRoundTripsAndPendingChannelPromotion() {
     Require(fixture.session.ApplyKey({Stamp(1, revision), "KeyA", true}) ==
                 common::InputResult::kCapabilityUnavailable,
             "input frame must remain rejected while peer connection is disconnected");
+
+    // Failed SetControlActive(true) due to missing Accessibility must preserve
+    // the held View mode/epoch so matching RenewRouteAuthority still succeeds.
+    Require(fixture.session.OnPeerConnectionState(StampFor(request), common::PeerConnectionState::kConnected,
+                                                  {.unix_ms = 175, .monotonic_ms = 175}),
+            "peer reconnect callback succeeds cleanly");
+    fixture.readiness_gate.remove_input = true;
+    Require(!fixture.session.SetControlActive(true, {.unix_ms = 180, .monotonic_ms = 180}) &&
+                fixture.session.state() == common::SessionState::kViewing &&
+                fixture.session.transport_diagnostics().mode == common::TransportSessionMode::kView &&
+                fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 0},
+            "SetControlActive(true) must fail closed without mutating View mode when Accessibility is missing");
+    common::RouteAuthority view_renewal = *request.route_authority;
+    view_renewal.mode = common::TransportSessionMode::kView;
+    view_renewal.input_epoch = 10;
+    view_renewal.lease_expires_at_unix_ms = 6'000;
+    Require(fixture.session.RenewRouteAuthority(view_renewal, {.unix_ms = 190, .monotonic_ms = 190}),
+            "server lease renewal for held View/epoch must succeed after failed local promotion");
+  }
+
+  // 7. Pending Control authority must survive Accessibility loss before final
+  //    channel open so server-side RenewRouteAuthority at original Control/epoch succeeds.
+  {
+    Fixture fixture;
+    const macos::MacosRemoteDesktopStartRequest view_request = Request(/*controllers=*/0);
+    Require(fixture.session.Start(view_request), "pending-permission-loss fixture must start");
+    const common::TransportCallbackStamp stamp = StampFor(view_request);
+    Require(fixture.session.OnPeerConnectionState(stamp, common::PeerConnectionState::kConnected,
+                                                  {.unix_ms = 110, .monotonic_ms = 110}) &&
+                fixture.session.OnDataChannelState(stamp, common::DataChannelKind::kControl,
+                                                   common::DataChannelState::kOpen),
+            "initial control channel setup succeeds");
+
+    common::RouteAuthority promote = *view_request.route_authority;
+    promote.mode = common::TransportSessionMode::kControl;
+    promote.input_epoch = 1;
+    Require(fixture.session.ApplyModeAuthority(promote, {.unix_ms = 120, .monotonic_ms = 120}) &&
+                fixture.session.state() == common::SessionState::kViewing,
+            "pending Control authority accepted while channels incomplete");
+
+    fixture.readiness_gate.remove_input = true;
+    Require(fixture.session.OnDataChannelState(stamp, common::DataChannelKind::kKeyboard,
+                                               common::DataChannelState::kOpen) &&
+                fixture.session.OnDataChannelState(stamp, common::DataChannelKind::kPointer,
+                                                   common::DataChannelState::kOpen),
+            "remaining channels open cleanly despite missing Accessibility");
+    Require(fixture.session.state() == common::SessionState::kViewing &&
+                fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 0} &&
+                fixture.session.transport_diagnostics().mode == common::TransportSessionMode::kControl,
+            "missing Accessibility must keep Viewing + zero-controller disclosure without overwriting confirmed Control mode");
+    const common::TopologyRevision revision = fixture.session.topology()->revision;
+    Require(fixture.session.ApplyKey({{.controller_id = "controller-a",
+                                       .epoch = promote.input_epoch,
+                                       .sequence = 1,
+                                       .topology_revision = revision},
+                                      "KeyA",
+                                      true}) == common::InputResult::kCapabilityUnavailable,
+            "missing Accessibility must keep rejecting input when channels finish opening");
+
+    common::RouteAuthority renewal = promote;
+    renewal.lease_expires_at_unix_ms = 6'000;
+    Require(fixture.session.RenewRouteAuthority(renewal, {.unix_ms = 130, .monotonic_ms = 130}),
+            "RenewRouteAuthority with server's confirmed Control/epoch must still succeed");
   }
 }
 
