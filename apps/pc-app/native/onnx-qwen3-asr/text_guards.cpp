@@ -11,6 +11,9 @@
 #include <winnls.h>
 #elif defined(__APPLE__) && defined(IMCODES_USE_COREFOUNDATION)
 #include <CoreFoundation/CoreFoundation.h>
+#else
+#include "qwen3_unicode_data.hpp"
+#include "qwen3_unicode_nfkc_data.hpp"
 #endif
 
 #include <algorithm>
@@ -421,72 +424,137 @@ std::string default_os_nfkc_lower_utf8(const std::string& input) {
   out.resize(static_cast<size_t>(used));
   return out;
 #else
-  // Portable Hangul Jamo L+V[+T], common Latin NFD->NFC composition, and Latin-1 uppercase lowercase fallback.
-  const std::vector<uint32_t> cps_in = utf8_to_codepoints(input);
-  std::vector<uint32_t> raw_cps;
-  raw_cps.reserve(cps_in.size());
-  auto compose_latin = [](uint32_t base, uint32_t mark) -> uint32_t {
-    if (mark == 0x0300) {
-      switch (base) {
-        case 'A': return 0x00C0; case 'a': return 0x00E0;
-        case 'E': return 0x00C8; case 'e': return 0x00E8;
-        case 'I': return 0x00CC; case 'i': return 0x00EC;
-        case 'O': return 0x00D2; case 'o': return 0x00F2;
-        case 'U': return 0x00D9; case 'u': return 0x00F9;
-      }
-    } else if (mark == 0x0301) {
-      switch (base) {
-        case 'A': return 0x00C1; case 'a': return 0x00E1;
-        case 'E': return 0x00C9; case 'e': return 0x00E9;
-        case 'I': return 0x00CD; case 'i': return 0x00ED;
-        case 'O': return 0x00D3; case 'o': return 0x00F3;
-        case 'U': return 0x00DA; case 'u': return 0x00FA;
-        case 'Y': return 0x00DD; case 'y': return 0x00FD;
-      }
-    } else if (mark == 0x0302) {
-      switch (base) {
-        case 'A': return 0x00C2; case 'a': return 0x00E2;
-        case 'E': return 0x00CA; case 'e': return 0x00EA;
-        case 'I': return 0x00CE; case 'i': return 0x00EE;
-        case 'O': return 0x00D4; case 'o': return 0x00F4;
-        case 'U': return 0x00DB; case 'u': return 0x00FB;
-      }
-    } else if (mark == 0x0308) {
-      switch (base) {
-        case 'A': return 0x00C4; case 'a': return 0x00E4;
-        case 'E': return 0x00CB; case 'e': return 0x00EB;
-        case 'I': return 0x00CF; case 'i': return 0x00EF;
-        case 'O': return 0x00D6; case 'o': return 0x00F6;
-        case 'U': return 0x00DC; case 'u': return 0x00FC;
-      }
+  // Full Unicode 16.0 NFKC + Unicode lowercase fallback (used on Linux and any non-Win/macOS target).
+  auto lookup_ccc = [](uint32_t cp) -> uint8_t {
+    if (cp < 0x0300u) return 0;
+    constexpr size_t kCount = sizeof(unicode_detail::kCccTable) / sizeof(unicode_detail::kCccTable[0]);
+    auto it = std::lower_bound(
+        unicode_detail::kCccTable,
+        unicode_detail::kCccTable + kCount,
+        cp,
+        [](const unicode_detail::CccEntry& e, uint32_t key) { return e.cp < key; });
+    if (it != unicode_detail::kCccTable + kCount && it->cp == cp) {
+      return it->ccc;
     }
     return 0;
   };
+  auto lookup_composite = [](uint32_t first, uint32_t second) -> uint32_t {
+    const uint64_t key = (static_cast<uint64_t>(first) << 21) | (static_cast<uint64_t>(second) & 0x1FFFFFu);
+    constexpr size_t kCount = sizeof(unicode_detail::kCompTable) / sizeof(unicode_detail::kCompTable[0]);
+    auto it = std::lower_bound(
+        unicode_detail::kCompTable,
+        unicode_detail::kCompTable + kCount,
+        key,
+        [](const unicode_detail::CompEntry& e, uint64_t k) { return e.key < k; });
+    if (it != unicode_detail::kCompTable + kCount && it->key == key) {
+      return it->composed;
+    }
+    return 0;
+  };
+
+  const std::vector<uint32_t> cps_in = utf8_to_codepoints(input);
+  std::vector<uint32_t> nfkd;
+  nfkd.reserve(cps_in.size() * 2);
+  constexpr size_t kNfkdCount = sizeof(unicode_detail::kNfkdTable) / sizeof(unicode_detail::kNfkdTable[0]);
   for (uint32_t cp : cps_in) {
-    if (!raw_cps.empty() && cp >= 0x1161 && cp <= 0x1175 && raw_cps.back() >= 0x1100 && raw_cps.back() <= 0x1112) {
-      const uint32_t l_idx = raw_cps.back() - 0x1100;
-      const uint32_t v_idx = cp - 0x1161;
-      raw_cps.back() = 0xAC00 + (l_idx * 21 + v_idx) * 28;
-    } else if (!raw_cps.empty() && cp >= 0x11A8 && cp <= 0x11C2 &&
-               raw_cps.back() >= 0xAC00 && raw_cps.back() <= 0xD7A3 && ((raw_cps.back() - 0xAC00) % 28) == 0) {
-      raw_cps.back() += (cp - 0x11A7);
-    } else if (!raw_cps.empty()) {
-      const uint32_t composed = compose_latin(raw_cps.back(), cp);
-      if (composed != 0) {
-        raw_cps.back() = composed;
-      } else {
-        raw_cps.push_back(cp);
+    if (cp >= 0xAC00u && cp <= 0xD7A3u) {
+      const uint32_t s_index = cp - 0xAC00u;
+      nfkd.push_back(0x1100u + s_index / 588u);
+      nfkd.push_back(0x1161u + (s_index % 588u) / 28u);
+      const uint32_t t_index = s_index % 28u;
+      if (t_index > 0) nfkd.push_back(0x11A7u + t_index);
+      continue;
+    }
+    auto it = std::lower_bound(
+        unicode_detail::kNfkdTable,
+        unicode_detail::kNfkdTable + kNfkdCount,
+        cp,
+        [](const unicode_detail::NfkdEntry& e, uint32_t key) { return e.cp < key; });
+    if (it != unicode_detail::kNfkdTable + kNfkdCount && it->cp == cp) {
+      const uint32_t off = it->offset_len >> 5;
+      const uint32_t len = it->offset_len & 0x1Fu;
+      for (uint32_t k = 0; k < len; ++k) {
+        nfkd.push_back(unicode_detail::kNfkdPool[off + k]);
       }
     } else {
-      raw_cps.push_back(cp);
+      nfkd.push_back(cp);
     }
   }
-  for (uint32_t& cp : raw_cps) {
-    if ((cp >= 0x00C0 && cp <= 0x00D6) || (cp >= 0x00D8 && cp <= 0x00DE)) {
-      cp += 0x20;
+
+  for (size_t i = 0; i < nfkd.size();) {
+    if (lookup_ccc(nfkd[i]) == 0) {
+      ++i;
+      continue;
+    }
+    size_t j = i + 1;
+    while (j < nfkd.size() && lookup_ccc(nfkd[j]) != 0) ++j;
+    for (size_t a = i + 1; a < j; ++a) {
+      const uint32_t key_cp = nfkd[a];
+      const uint8_t key_ccc = lookup_ccc(key_cp);
+      size_t b = a;
+      while (b > i && lookup_ccc(nfkd[b - 1]) > key_ccc) {
+        nfkd[b] = nfkd[b - 1];
+        --b;
+      }
+      nfkd[b] = key_cp;
+    }
+    i = j;
+  }
+
+  std::vector<uint32_t> composed;
+  composed.reserve(nfkd.size());
+  size_t starter_idx = std::string::npos;
+  uint8_t last_ccc = 0;
+  for (uint32_t cp : nfkd) {
+    const uint8_t ccc = lookup_ccc(cp);
+    if (starter_idx != std::string::npos && (last_ccc == 0 || last_ccc < ccc)) {
+      const uint32_t starter = composed[starter_idx];
+      uint32_t merged = 0;
+      if (last_ccc == 0) {
+        if (starter >= 0x1100u && starter <= 0x1112u && cp >= 0x1161u && cp <= 0x1175u) {
+          merged = 0xAC00u + ((starter - 0x1100u) * 21u + (cp - 0x1161u)) * 28u;
+        } else if (starter >= 0xAC00u && starter <= 0xD7A3u && ((starter - 0xAC00u) % 28u) == 0 &&
+                   cp >= 0x11A8u && cp <= 0x11C2u) {
+          merged = starter + (cp - 0x11A7u);
+        }
+      }
+      if (merged == 0) {
+        merged = lookup_composite(starter, cp);
+      }
+      if (merged != 0) {
+        composed[starter_idx] = merged;
+        continue;
+      }
+    }
+    if (ccc == 0) {
+      starter_idx = composed.size();
+      last_ccc = 0;
+    } else {
+      last_ccc = ccc;
+    }
+    composed.push_back(cp);
+  }
+
+  std::vector<uint32_t> lowered;
+  lowered.reserve(composed.size());
+  constexpr size_t kLowerCount = sizeof(unicode_detail::kLowerTable) / sizeof(unicode_detail::kLowerTable[0]);
+  for (uint32_t cp : composed) {
+    auto it = std::lower_bound(
+        unicode_detail::kLowerTable,
+        unicode_detail::kLowerTable + kLowerCount,
+        cp,
+        [](const unicode_detail::NfkdEntry& e, uint32_t key) { return e.cp < key; });
+    if (it != unicode_detail::kLowerTable + kLowerCount && it->cp == cp) {
+      const uint32_t off = it->offset_len >> 5;
+      const uint32_t len = it->offset_len & 0x1Fu;
+      for (uint32_t k = 0; k < len; ++k) {
+        lowered.push_back(unicode_detail::kLowerPool[off + k]);
+      }
+    } else {
+      lowered.push_back(cp);
     }
   }
-  return codepoints_to_utf8(raw_cps);
+  return codepoints_to_utf8(lowered);
 #endif
 }
 

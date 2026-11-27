@@ -3245,4 +3245,215 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     expect(await voice.getRemoteProviderInfo()).toBeNull();
     await voice.dispose();
   });
+
+  it('forwards probe adapterIndex >= 1 to serve/listen while enforcing explicit CPU & <4GB policies, and passes dynamic hotwords only when present in single-shot ONNX listen', async () => {
+    const weights = Buffer.from('onnx-idx1-weights');
+    const sha = createHash('sha256').update(weights).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'csukuangfj2/test-0.6b',
+        revision: 'r1',
+        files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'ilmina/test-1.7b',
+        revision: 'r1',
+        files: [{ filename: 'encoder.int8.onnx', expectedSize: weights.length, expectedSha256: sha }],
+      },
+    };
+
+    // 1. Linux non-resident listen with GPU adapterIndex: 1 and back-to-back two utterances (only first has bilingual hotwords)
+    const linuxIdx1Dir = path.join(tempDir, 'linux-idx1');
+    mkdirSync(path.join(linuxIdx1Dir, 'speech-models', '0.6b'), { recursive: true });
+    writeFileSync(path.join(linuxIdx1Dir, 'speech-models', '0.6b', 'encoder.int8.onnx'), weights);
+    writeFileSync(path.join(linuxIdx1Dir, 'speech-models', '0.6b', '.verified-r1'), '');
+
+    const linuxSpawns: Array<{ args: string[]; proc: ReturnType<typeof createFakeChildProcess> }> = [];
+    const linuxSingleShot = createPcAppVoiceController({
+      platform: 'linux',
+      arch: 'x64',
+      userDataDir: linuxIdx1Dir,
+      linuxSpeechHelperPath: '/opt/imcodes/imcodes-speech-linux',
+      useResidentMlxWorker: false,
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes/',
+      sendToRenderer: () => {},
+      manifests,
+      runHelperAsync: async (_bin, args) => {
+        if (args[0] === 'probe') {
+          return JSON.stringify({
+            ok: true,
+            gpuName: 'NVIDIA A100-SXM4-80GB',
+            vramMb: 81920,
+            adapterIndex: 1,
+            provider: 'cuda',
+            cudaEligible: true,
+            localAsrSupported: true,
+          });
+        }
+        return '[]';
+      },
+      spawnHelper: (_bin, args) => {
+        const proc = createFakeChildProcess();
+        linuxSpawns.push({ args, proc });
+        return proc as unknown as ChildProcess;
+      },
+    });
+
+    const start1 = await linuxSingleShot.startListening({
+      locale: 'zh-CN',
+      hotwords: ['IM.codes', '陈伟', 'Claude, Code'],
+    });
+    expect(start1).toEqual({ ok: true });
+    expect(linuxSpawns).toHaveLength(1);
+    expect(linuxSpawns[0]!.args).toEqual([
+      'listen',
+      '--model-dir',
+      path.join(linuxIdx1Dir, 'speech-models', '0.6b'),
+      '--variant',
+      '0.6b',
+      '--provider',
+      'cuda',
+      '--device-id',
+      '1',
+      '--locale',
+      'zh-CN',
+      '--hotwords',
+      JSON.stringify(['IM.codes', '陈伟', 'Claude, Code']),
+    ]);
+    // Finish first utterance cleanly
+    const stop1 = linuxSingleShot.stopListening();
+    linuxSpawns[0]!.proc.emit('exit', 0, null);
+    await stop1;
+
+    // Second utterance with NO hotwords must NOT carry stale --hotwords, while still preserving --device-id 1
+    const start2 = await linuxSingleShot.startListening({ locale: 'en-US' });
+    expect(start2).toEqual({ ok: true });
+    expect(linuxSpawns).toHaveLength(2);
+    expect(linuxSpawns[1]!.args).toEqual([
+      'listen',
+      '--model-dir',
+      path.join(linuxIdx1Dir, 'speech-models', '0.6b'),
+      '--variant',
+      '0.6b',
+      '--provider',
+      'cuda',
+      '--device-id',
+      '1',
+      '--locale',
+      'en-US',
+    ]);
+    expect(linuxSpawns[1]!.args).not.toContain('--hotwords');
+    await linuxSingleShot.stopListening({ abort: true });
+    await linuxSingleShot.dispose();
+
+    // 2. Windows resident worker with adapterIndex: 1 & >=4GB -> passes --provider directml --device-id 1
+    const winIdx1Dir = path.join(tempDir, 'win-idx1');
+    mkdirSync(path.join(winIdx1Dir, 'speech-models', '0.6b'), { recursive: true });
+    writeFileSync(path.join(winIdx1Dir, 'speech-models', '0.6b', 'encoder.int8.onnx'), weights);
+    writeFileSync(path.join(winIdx1Dir, 'speech-models', '0.6b', '.verified-r1'), '');
+
+    const winIdx1Spawns: string[][] = [];
+    const winIdx1Voice = createPcAppVoiceController({
+      platform: 'win32',
+      arch: 'x64',
+      userDataDir: winIdx1Dir,
+      winSpeechHelperPath: 'C:\\IM.codes\\imcodes-speech-win.exe',
+      useResidentMlxWorker: true,
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes/',
+      sendToRenderer: () => {},
+      manifests,
+      runHelperAsync: async () =>
+        JSON.stringify({
+          ok: true,
+          gpuName: 'AMD Radeon RX 7800 XT',
+          vramMb: 16384,
+          adapterIndex: 1,
+          provider: 'directml',
+          directmlEligible: true,
+          localAsrSupported: true,
+        }),
+      spawnHelper: (_bin, args) => {
+        winIdx1Spawns.push(args);
+        return createFakeChildProcess() as unknown as ChildProcess;
+      },
+    });
+    await winIdx1Voice.warmSelectedSpeechModel();
+    await vi.waitFor(() => {
+      expect(winIdx1Spawns).toHaveLength(1);
+    });
+    expect(winIdx1Spawns[0]).toEqual([
+      'serve',
+      '--model-dir',
+      path.join(winIdx1Dir, 'speech-models', '0.6b'),
+      '--variant',
+      '0.6b',
+      '--provider',
+      'directml',
+      '--device-id',
+      '1',
+    ]);
+    await winIdx1Voice.dispose();
+
+    // 3. Explicit cpu override on A100 adapterIndex: 1 and <4GB winProvider: 'directml' keep --provider cpu (no --device-id)
+    const winLowDir = path.join(tempDir, 'win-low-explicit');
+    mkdirSync(path.join(winLowDir, 'speech-models', '0.6b'), { recursive: true });
+    writeFileSync(path.join(winLowDir, 'speech-models', '0.6b', 'encoder.int8.onnx'), weights);
+    writeFileSync(path.join(winLowDir, 'speech-models', '0.6b', '.verified-r1'), '');
+    const winLowSpawns: string[][] = [];
+    const winLowVoice = createPcAppVoiceController({
+      platform: 'win32',
+      arch: 'x64',
+      userDataDir: winLowDir,
+      winSpeechHelperPath: 'C:\\IM.codes\\imcodes-speech-win.exe',
+      winProvider: 'directml',
+      useResidentMlxWorker: false,
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes/',
+      sendToRenderer: () => {},
+      manifests,
+      runHelperAsync: async () =>
+        JSON.stringify({
+          ok: true,
+          gpuName: 'NVIDIA GeForce GT 1030',
+          vramMb: 2048,
+          adapterIndex: 1,
+          provider: 'directml',
+          directmlEligible: false,
+          localAsrSupported: true,
+        }),
+      spawnHelper: (_bin, args) => {
+        winLowSpawns.push(args);
+        return createFakeChildProcess() as unknown as ChildProcess;
+      },
+    });
+    await winLowVoice.startListening({ hotwords: ['IM.codes', '陈伟'] });
+    expect(winLowSpawns[0]).toEqual([
+      'listen',
+      '--model-dir',
+      path.join(winLowDir, 'speech-models', '0.6b'),
+      '--variant',
+      '0.6b',
+      '--provider',
+      'cpu',
+      '--hotwords',
+      'IM.codes, 陈伟',
+    ]);
+    await winLowVoice.stopListening({ abort: true });
+    await winLowVoice.dispose();
+  });
 });

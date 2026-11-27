@@ -84,6 +84,17 @@ int main() {
     assert(hw[1] == "Claude Code");
     assert(hw[2] == "A\"B");
 
+    const auto cli_json_hw = parse_cli_hotwords_arg("[\"IM.codes\",\"陈伟\",\"Foo, Bar\"]");
+    assert(cli_json_hw.size() == 3);
+    assert(cli_json_hw[0] == "IM.codes");
+    assert(cli_json_hw[1] == "陈伟");
+    assert(cli_json_hw[2] == "Foo, Bar");
+    const auto cli_csv_hw = parse_cli_hotwords_arg("IM.codes, 陈伟");
+    assert(cli_csv_hw.size() == 2);
+    assert(cli_csv_hw[0] == "IM.codes");
+    assert(cli_csv_hw[1] == "陈伟");
+    assert(parse_cli_hotwords_arg("[]").empty());
+
     ServeStartParams p;
     p.locale = "zh-CN";
     p.hotwords = {"DynamicTerm", "OpenClaw"};
@@ -244,20 +255,25 @@ int main() {
     assert(strip_voice_hotword_hallucination("我常用 IM.codes。IM.codes，IM.codes。", terms, false, true) ==
            "我常用 IM.codes。IM.codes，IM.codes。");
     assert(strip_voice_hotword_hallucination("IM.codes。IM.codes", terms, false, true).empty());
-    // Injectable NFKC hook
-    set_hotword_nfkc_normalizer_for_testing([](const std::string& s) -> std::string {
-      std::string out = s;
-      const std::string kelvin = "\xE2\x84\xAA";
-      size_t pos = 0;
-      while ((pos = out.find(kelvin, pos)) != std::string::npos) {
-        out.replace(pos, kelvin.size(), "k");
-        pos += 1;
-      }
-      return out;
-    });
+    // Production NFKC + Unicode lowercase (no normalizer override hook):
+    // Kelvin sign U+212A, compatibility ligatures, extended combining marks, circled/fullwidth, Hangul Jamo.
+    set_hotword_nfkc_normalizer_for_testing(nullptr);
     assert(strip_voice_hotword_hallucination("\xE2\x84\xAA, \xE2\x84\xAA\xE3\x80\x82\xE4\xBD\xA0\xE5\xA5\xBD", std::vector<std::string>{"k"}) ==
            "\xE4\xBD\xA0\xE5\xA5\xBD");
-    set_hotword_nfkc_normalizer_for_testing(nullptr);
+    assert(strip_voice_hotword_hallucination("\xEF\xAC\x81le, file\xE3\x80\x82Hello", std::vector<std::string>{"file", "ff"}) ==
+           "Hello");
+    assert(strip_voice_hotword_hallucination("\xEF\xAC\x81le, \xEF\xAC\x80, \xEF\xAC\x83" "ce\xE3\x80\x82Hello", std::vector<std::string>{"file", "ff", "ffice"}) ==
+           "Hello");
+    assert(strip_voice_hotword_hallucination("\xEF\xAC\x81le, \xEF\xAC\x80\xE3\x80\x82Hello", std::vector<std::string>{"file", "ff"}) ==
+           "\xEF\xAC\x81le, \xEF\xAC\x80\xE3\x80\x82Hello");
+    assert(strip_voice_hotword_hallucination("o\xEF\xAC\x83" "ce, office\xE3\x80\x82\xE5\xBC\x80\xE5\xA7\x8B", std::vector<std::string>{"office"}) ==
+           "\xE5\xBC\x80\xE5\xA7\x8B");
+    assert(strip_voice_hotword_hallucination("C\xCC\x8C" "at, \xC4\x8D" "at\xE3\x80\x82Next", std::vector<std::string>{"\xC4\x8D" "at"}) ==
+           "Next");
+    assert(strip_voice_hotword_hallucination("\xE2\x91\xA0, 1\xE3\x80\x82Item", std::vector<std::string>{"1"}) ==
+           "Item");
+    assert(strip_voice_hotword_hallucination("\xE2\x84\xA6, \xCE\xA9\xE3\x80\x82Value", std::vector<std::string>{"\xCF\x89"}) ==
+           "Value");
   }
 
   // 5. Silence-edge trimming & prefix-shift alignment + >30s cross-segment hotword retention/retraction

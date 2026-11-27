@@ -282,6 +282,24 @@ inline std::vector<std::string> load_hotwords_terms(const std::filesystem::path&
   return imcodes::qwen3::merge_session_hotwords_raw({}, raw).terms;
 }
 
+inline std::vector<std::string> parse_cli_hotwords_arg(const std::string& raw) {
+  std::string trimmed = raw;
+  while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.front()))) {
+    trimmed.erase(trimmed.begin());
+  }
+  while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.back()))) {
+    trimmed.pop_back();
+  }
+  if (trimmed.empty() || trimmed == "[]") return {};
+  if (trimmed.front() == '[') {
+    const auto parsed = extract_json_string_array_field("{\"hotwords\":" + trimmed + "}", "hotwords");
+    if (!parsed.empty()) {
+      return imcodes::qwen3::merge_session_hotwords({}, parsed).terms;
+    }
+  }
+  return imcodes::qwen3::merge_session_hotwords_raw({}, trimmed).terms;
+}
+
 struct ServeStartParams {
   std::string device{"auto"};
   std::string locale;

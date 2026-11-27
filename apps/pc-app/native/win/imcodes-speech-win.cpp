@@ -47,6 +47,7 @@ using imcodes::speech::extract_json_string_field;
 using imcodes::speech::json_escape;
 using imcodes::speech::load_hotwords_terms;
 using imcodes::speech::make_streaming_pipeline_config;
+using imcodes::speech::parse_cli_hotwords_arg;
 using imcodes::speech::PcmUtteranceDecoder;
 using imcodes::speech::ServeCommandLoop;
 using imcodes::speech::ServeStartParams;
@@ -310,18 +311,34 @@ std::string resolve_target_capture_uid(const std::string& requested_uid) {
 
 class WinQwen3AsrRunner {
  public:
-  bool init(const std::string& model_dir, const std::string& requested_provider, std::string& out_error) {
+  bool init(
+      const std::string& model_dir,
+      const std::string& requested_provider,
+      int requested_device_id,
+      std::string& out_error) {
     const std::filesystem::path base(utf8_to_wide(model_dir));
     base_hotwords_ = load_hotwords_terms(base / L"hotwords.txt");
 
     imcodes::qwen3::EngineConfig cfg;
     cfg.model_dir = base;
-    if (requested_provider == "directml" || requested_provider == "cpu") {
-      cfg.requested_provider = requested_provider;
+    if (requested_provider == "cpu") {
+      cfg.requested_provider = "cpu";
+    } else if (requested_provider == "directml") {
+      cfg.requested_provider = "directml";
+      if (requested_device_id >= 0) {
+        cfg.directml_device_id = requested_device_id;
+      } else {
+        const GpuProbeInfo gpu = probe_best_gpu();
+        if (gpu.adapter_index >= 0) {
+          cfg.directml_device_id = gpu.adapter_index;
+        }
+      }
     } else {
       const GpuProbeInfo gpu = probe_best_gpu();
       cfg.requested_provider = gpu.provider;
-      if (gpu.adapter_index >= 0) {
+      if (requested_device_id >= 0) {
+        cfg.directml_device_id = requested_device_id;
+      } else if (gpu.adapter_index >= 0) {
         cfg.directml_device_id = gpu.adapter_index;
       }
     }
@@ -639,11 +656,15 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
   std::thread worker_;
 };
 
-int run_serve_command(const std::string& model_dir, const std::string& variant, const std::string& provider) {
+int run_serve_command(
+    const std::string& model_dir,
+    const std::string& variant,
+    const std::string& provider,
+    int device_id) {
   emit_json_line("{\"type\":\"loading\",\"variant\":\"" + json_escape(variant) + "\"}");
   WinQwen3AsrRunner runner;
   std::string init_err;
-  if (!runner.init(model_dir, provider, init_err)) {
+  if (!runner.init(model_dir, provider, device_id, init_err)) {
     emit_error("model_load_failed", "speech", init_err);
     return 1;
   }
@@ -677,21 +698,22 @@ int run_listen_command(
     const std::string& model_dir,
     const std::string& variant,
     const std::string& provider,
+    int device_id,
     const std::string& device_uid,
     const std::string& locale,
-    const std::string& hotwords_csv) {
+    const std::string& hotwords_raw) {
   emit_json_line("{\"type\":\"loading\",\"variant\":\"" + json_escape(variant) + "\"}");
   WinQwen3AsrRunner runner;
   std::string init_err;
-  if (!runner.init(model_dir, provider, init_err)) {
+  if (!runner.init(model_dir, provider, device_id, init_err)) {
     emit_error("model_load_failed", "speech", init_err);
     return 1;
   }
   ServeStartParams params;
   params.device = device_uid;
   params.locale = locale;
-  if (!hotwords_csv.empty()) {
-    params.hotwords = imcodes::qwen3::merge_session_hotwords_raw({}, hotwords_csv).terms;
+  if (!hotwords_raw.empty()) {
+    params.hotwords = parse_cli_hotwords_arg(hotwords_raw);
   }
   auto capture = std::make_shared<WasapiUtteranceCapture>(runner, std::move(params));
   capture->start();
@@ -720,7 +742,7 @@ int run_listen_command(
 
 #else
 
-int run_serve_command(const std::string&, const std::string&, const std::string&) {
+int run_serve_command(const std::string&, const std::string&, const std::string&, int) {
   emit_error("onnxruntime_unavailable", "speech", "Built without ONNX Runtime support");
   return 1;
 }
@@ -729,6 +751,7 @@ int run_listen_command(
     const std::string&,
     const std::string&,
     const std::string&,
+    int,
     const std::string&,
     const std::string&,
     const std::string&) {
@@ -1111,6 +1134,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::string model_dir;
     std::string variant = "0.6b";
     std::string provider = "auto";
+    int device_id = -1;
     std::string device_uid = "auto";
     std::string locale;
     std::string hotwords;
@@ -1119,6 +1143,13 @@ int wmain(int argc, wchar_t* argv[]) {
       if (a == "--model-dir" && i + 1 < argc) model_dir = wide_to_utf8(argv[++i]);
       else if (a == "--variant" && i + 1 < argc) variant = wide_to_utf8(argv[++i]);
       else if (a == "--provider" && i + 1 < argc) provider = wide_to_utf8(argv[++i]);
+      else if (a == "--device-id" && i + 1 < argc) {
+        try {
+          device_id = std::stoi(wide_to_utf8(argv[++i]));
+        } catch (...) {
+          device_id = -1;
+        }
+      }
       else if (a == "--device" && i + 1 < argc) device_uid = wide_to_utf8(argv[++i]);
       else if (a == "--locale" && i + 1 < argc) locale = wide_to_utf8(argv[++i]);
       else if (a == "--hotwords" && i + 1 < argc) hotwords = wide_to_utf8(argv[++i]);
@@ -1128,8 +1159,8 @@ int wmain(int argc, wchar_t* argv[]) {
       return 1;
     }
     return cmd == "serve"
-        ? run_serve_command(model_dir, variant, provider)
-        : run_listen_command(model_dir, variant, provider, device_uid, locale, hotwords);
+        ? run_serve_command(model_dir, variant, provider, device_id)
+        : run_listen_command(model_dir, variant, provider, device_id, device_uid, locale, hotwords);
   }
 
   emit_error("unknown_command", "", "Unknown command: " + cmd);

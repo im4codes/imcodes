@@ -160,7 +160,16 @@ int main(int argc, char** argv) {
         pcfg,
         engine.tokenizer(),
         [&](const std::vector<float>& chunk, const imcodes::qwen3::DecodeOptions& dopts) {
-          return engine.decode(chunk, dopts);
+          const auto d0 = std::chrono::steady_clock::now();
+          const auto r = engine.decode(chunk, dopts);
+          const auto d1 = std::chrono::steady_clock::now();
+          const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(d1 - d0).count();
+          std::cout << "[STREAM PASS] samples=" << chunk.size()
+                    << " prefix_len=" << dopts.prefix_tokens.size()
+                    << " prefill=" << r.prefill_len
+                    << " steps=" << r.generated_steps
+                    << " elapsed_ms=" << ms << "\n";
+          return r;
         },
         [](const imcodes::qwen3::TranscriptUpdate& upd) {
           std::cout << "[STREAM isFinal=" << (upd.is_final ? "true" : "false") << "] "

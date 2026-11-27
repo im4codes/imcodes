@@ -405,9 +405,13 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
   let cachedWinOnnxSupport: boolean | null = isOnnxPlatform ? null : false;
   let cachedWinGpuName: string | null = null;
   let cachedWinVramMb: number | null = null;
+  const requestedProviderPolicy: 'auto' | 'directml' | 'cuda' | 'cpu' = isLinux
+    ? (deps.linuxProvider ?? 'auto')
+    : (deps.winProvider ?? 'auto');
   let cachedWinProvider: 'directml' | 'cuda' | 'cpu' = isLinux
     ? (deps.linuxProvider === 'cuda' ? 'cuda' : 'cpu')
     : (deps.winProvider === 'directml' ? 'directml' : 'cpu');
+  let cachedWinAdapterIndex: number | null = null;
   let lastProgressNotifiedBucket = -1;
   let lastProgressNotifiedState: PcAppSpeechModelStatus['state'] | null = null;
   let lastProgressNotifiedDownloading: PcAppSpeechVariant | null = null;
@@ -638,6 +642,18 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
 
   const resolveLocalBackendHelperPath = (): string | null =>
     isWin32 ? resolveWinSpeechHelperPath() : isLinux ? resolveLinuxSpeechHelperPath() : resolveMlxHelperPath();
+
+  const buildOnnxLaunchProviderArgs = (): string[] => {
+    if (!isOnnxPlatform) return [];
+    if (cachedWinProvider === 'cpu' || requestedProviderPolicy === 'cpu') {
+      return ['--provider', 'cpu'];
+    }
+    const providerArgs = ['--provider', cachedWinProvider];
+    if (cachedWinAdapterIndex !== null) {
+      providerArgs.push('--device-id', String(cachedWinAdapterIndex));
+    }
+    return providerArgs;
+  };
 
   const isLocalAsrSupportedSync = (): boolean =>
     isOnnxPlatform ? (cachedWinOnnxSupport ?? false) : (cachedMlxSupport ?? false);
@@ -921,6 +937,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           ok?: unknown;
           gpuName?: unknown;
           vramMb?: unknown;
+          adapterIndex?: unknown;
           provider?: unknown;
           cudaEligible?: unknown;
           localAsrSupported?: unknown;
@@ -929,6 +946,10 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           ? Math.max(0, Math.round(parsed.vramMb))
           : 0;
         const probeGpuName = typeof parsed.gpuName === 'string' && parsed.gpuName.trim() ? parsed.gpuName.trim() : null;
+        const probeAdapterIndex =
+          typeof parsed.adapterIndex === 'number' && Number.isInteger(parsed.adapterIndex) && parsed.adapterIndex >= 0
+            ? parsed.adapterIndex
+            : null;
         let probeProvider: 'cpu' | 'directml' | 'cuda';
         if (isLinux) {
           if (deps.linuxProvider === 'cpu') {
@@ -957,12 +978,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         cachedWinGpuName = probeGpuName;
         cachedWinVramMb = vram;
         cachedWinProvider = probeProvider;
+        cachedWinAdapterIndex = probeProvider === 'cpu' ? null : probeAdapterIndex;
         cachedWinOnnxSupport = parsed.ok === true && parsed.localAsrSupported === true;
       } catch {
         if (!localBackendPermanentlyUnavailable && cachedWinOnnxSupport !== false) {
           cachedWinGpuName = null;
           cachedWinVramMb = 0;
           cachedWinProvider = 'cpu';
+          cachedWinAdapterIndex = null;
         }
         cachedWinOnnxSupport = false;
       }
@@ -1547,9 +1570,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       }
 
       const modelDir = downloader.getModelDirectory(variant);
-      const args = isOnnxPlatform
-        ? ['serve', '--model-dir', modelDir, '--variant', variant, '--provider', cachedWinProvider]
-        : ['serve', '--model-dir', modelDir, '--variant', variant];
+      const args = ['serve', '--model-dir', modelDir, '--variant', variant, ...buildOnnxLaunchProviderArgs()];
       appendVoiceLog(`mlx serve spawn variant=${variant} bin=${mlxBin} args=${JSON.stringify(args)}`);
       const proc = (deps.spawnHelper ?? ((p, a) => spawn(p, a, { stdio: ['pipe', 'pipe', 'pipe'] })))(mlxBin, args);
       const worker: ResidentMlxWorker = {
@@ -1618,6 +1639,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
               && readyProvider !== cachedWinProvider
             ) {
               cachedWinProvider = readyProvider;
+              if (readyProvider === 'cpu') {
+                cachedWinAdapterIndex = null;
+              }
               notifyStatusChanged(true);
             }
             if (worker.utterance && activeRemoteSession?.utt === worker.utterance) {
@@ -2261,11 +2285,20 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       if (mlxBin && verified) {
         bin = mlxBin;
         isMlxHelper = true;
-        args = isOnnxPlatform
-          ? ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant, '--provider', cachedWinProvider]
-          : ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant];
+        args = ['listen', '--model-dir', downloader.getModelDirectory(variant), '--variant', variant, ...buildOnnxLaunchProviderArgs()];
         if (typeof options?.locale === 'string' && options.locale.trim()) {
           args.push('--locale', options.locale.trim());
+        }
+        if (isOnnxPlatform) {
+          const hotwordsTerms = normalizePcAppVoiceHotwordsTerms(options?.hotwords);
+          const hotwordsArg = hotwordsTerms
+            ? (hotwordsTerms.some((t) => /[,\r\n]/.test(t))
+                ? JSON.stringify(hotwordsTerms)
+                : normalizePcAppVoiceHotwordsContext(hotwordsTerms))
+            : undefined;
+          if (hotwordsArg) {
+            args.push('--hotwords', hotwordsArg);
+          }
         }
         if (selectedInputDevice !== 'auto') {
           args.push('--device', selectedInputDevice);
