@@ -394,6 +394,53 @@ describe('SessionTabs', () => {
     expect(onSelect).not.toHaveBeenCalled();
   });
 
+  it('triggers medium haptic once on touch long-press and not on mouse, short tap, or move-cancel', () => {
+    vi.useFakeTimers();
+    const vibrate = vi.fn(() => true);
+    const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+
+    try {
+      const sessions = makeSessions([{ name: 'session_w1' }]);
+      render(
+        <SessionTabs sessions={sessions} activeSession={null} onSelect={vi.fn()} sessionsLoaded={true} {...defaultProps} />,
+      );
+      const tab = screen.getByRole('tab');
+
+      // Mouse pointerdown does not trigger long-press haptic
+      firePointer(tab, 'pointerdown', { pointerId: 1, pointerType: 'mouse', button: 0, clientX: 24, clientY: 12 });
+      act(() => { vi.advanceTimersByTime(600); });
+      firePointer(tab, 'pointerup', { pointerId: 1, pointerType: 'mouse', button: 0, clientX: 24, clientY: 12 });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Touch short tap does not vibrate
+      firePointer(tab, 'pointerdown', { pointerId: 2, pointerType: 'touch', button: 0, clientX: 24, clientY: 12 });
+      act(() => { vi.advanceTimersByTime(100); });
+      firePointer(tab, 'pointerup', { pointerId: 2, pointerType: 'touch', button: 0, clientX: 24, clientY: 12 });
+      act(() => { vi.advanceTimersByTime(500); });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Touch move-cancel does not vibrate
+      firePointer(tab, 'pointerdown', { pointerId: 3, pointerType: 'touch', button: 0, clientX: 24, clientY: 12 });
+      firePointer(tab, 'pointermove', { pointerId: 3, pointerType: 'touch', clientX: 50, clientY: 12 });
+      act(() => { vi.advanceTimersByTime(600); });
+      firePointer(tab, 'pointerup', { pointerId: 3, pointerType: 'touch', button: 0, clientX: 50, clientY: 12 });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Touch long-press triggers medium (20ms) once; pointerup does not repeat
+      firePointer(tab, 'pointerdown', { pointerId: 4, pointerType: 'touch', button: 0, clientX: 24, clientY: 12 });
+      act(() => { vi.advanceTimersByTime(520); });
+      expect(screen.getByRole('button', { name: 'Pin' })).toBeDefined();
+      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate).toHaveBeenCalledWith(20);
+      firePointer(tab, 'pointerup', { pointerId: 4, pointerType: 'touch', button: 0, clientX: 24, clientY: 12 });
+      expect(vibrate).toHaveBeenCalledTimes(1);
+    } finally {
+      if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
+      else delete (navigator as unknown as Record<string, unknown>).vibrate;
+    }
+  });
+
   it('renders brain tab with brain class and project name', () => {
     const sessions: SessionInfo[] = [{
       name: 'session_brain',

@@ -210,6 +210,70 @@ describe('ChatView mobile navigation gesture isolation', () => {
     detach();
   });
 
+  it('triggers medium haptic once on message long-press menu and skips short tap, move-cancel, blank area, and right-click', () => {
+    vi.useFakeTimers();
+    const vibrate = vi.fn(() => true);
+    const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+
+    try {
+      const { container } = render(
+        <ChatView events={[makeAssistantEvent(1)]} loading={false} sessionId="sess-mobile" />,
+      );
+      act(() => {});
+      const chatContainer = container.querySelector('.chat-view') as HTMLElement;
+      const bubble = container.querySelector('.chat-event') as HTMLElement;
+
+      // Short tap: no vibrate
+      act(() => {
+        dispatchTouch(bubble, 'touchstart', [{ identifier: 1, clientX: 140, clientY: 180, target: bubble }]);
+        vi.advanceTimersByTime(100);
+        dispatchTouch(bubble, 'touchend', []);
+        vi.advanceTimersByTime(400);
+      });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Scroll move before 400ms: no vibrate
+      act(() => {
+        dispatchTouch(bubble, 'touchstart', [{ identifier: 2, clientX: 140, clientY: 180, target: bubble }]);
+        dispatchTouch(bubble, 'touchmove', [{ identifier: 2, clientX: 140, clientY: 220, target: bubble }]);
+        vi.advanceTimersByTime(450);
+        dispatchTouch(bubble, 'touchend', []);
+      });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Blank non-.chat-event area: no vibrate
+      act(() => {
+        dispatchTouch(chatContainer, 'touchstart', [{ identifier: 3, clientX: 10, clientY: 10, target: chatContainer }]);
+        vi.advanceTimersByTime(450);
+        dispatchTouch(chatContainer, 'touchend', []);
+      });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Desktop right-click: no vibrate
+      act(() => {
+        bubble.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, clientX: 140, clientY: 180 }));
+      });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Real touch long-press on .chat-event -> medium (20ms) once, touchend does not repeat
+      act(() => {
+        dispatchTouch(bubble, 'touchstart', [{ identifier: 4, clientX: 140, clientY: 180, target: bubble }]);
+        vi.advanceTimersByTime(410);
+      });
+      expect(container.querySelector('.chat-sel-menu')).toBeTruthy();
+      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate).toHaveBeenCalledWith(20);
+      act(() => {
+        dispatchTouch(bubble, 'touchend', []);
+      });
+      expect(vibrate).toHaveBeenCalledTimes(1);
+    } finally {
+      if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
+      else delete (navigator as unknown as Record<string, unknown>).vibrate;
+    }
+  });
+
   it('allows normal 1-finger immediate scroll-up intent without preventDefault or navigation', () => {
     vi.useFakeTimers();
     window.matchMedia = makeCoarseMatchMedia();

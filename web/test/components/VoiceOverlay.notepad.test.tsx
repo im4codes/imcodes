@@ -671,6 +671,34 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it('triggers medium haptic once when mic hold activates and stays silent on short tap', async () => {
+    const vibrate = vi.fn(() => true);
+    const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+
+    try {
+      await openVoice();
+      // Short tap: no haptic
+      pointer('pointerdown');
+      await vi.advanceTimersByTimeAsync(100);
+      pointer('pointerup');
+      await vi.advanceTimersByTimeAsync(350);
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Long press >= 350ms -> medium (20ms) once; pointerup does not repeat
+      pointer('pointerdown');
+      await vi.advanceTimersByTimeAsync(350);
+      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate).toHaveBeenCalledWith(20);
+      pointer('pointerup');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(vibrate).toHaveBeenCalledTimes(1);
+    } finally {
+      if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
+      else delete (navigator as unknown as Record<string, unknown>).vibrate;
+    }
+  });
+
   it('double-taps within 375ms, waits for the final tail and sends once', async () => {
     const send = await openVoice();
     let release!: () => void;

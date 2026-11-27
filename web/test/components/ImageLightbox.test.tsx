@@ -387,6 +387,52 @@ describe('ImageLightbox', () => {
       expect(container.querySelector('.fb-lightbox-actions')).toBeNull();
     });
 
+    it('triggers medium haptic once on image long-press and never on pinch-cancel, early release, or contextmenu', () => {
+      vi.useFakeTimers();
+      setMobilePointer();
+      const vibrate = vi.fn(() => true);
+      const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
+      Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+
+      try {
+        const { container } = render(
+          <ImageLightbox src="data:image/png;base64,aW1n" onClose={vi.fn()} />,
+        );
+        const { image } = stubLightboxGeometry(container);
+
+        // Early release: no vibrate
+        fireEvent.touchStart(image, { touches: [{ clientX: 150, clientY: 150 }] });
+        act(() => { vi.advanceTimersByTime(200); });
+        fireEvent.touchEnd(image, { touches: [], changedTouches: [{ clientX: 150, clientY: 150 }] });
+        act(() => { vi.advanceTimersByTime(400); });
+        expect(vibrate).not.toHaveBeenCalled();
+
+        // Pinch cancel: no vibrate
+        fireEvent.touchStart(image, { touches: [{ clientX: 150, clientY: 150 }] });
+        act(() => { vi.advanceTimersByTime(200); });
+        fireEvent.touchStart(image, { touches: [{ clientX: 150, clientY: 150 }, { clientX: 250, clientY: 150 }] });
+        act(() => { vi.advanceTimersByTime(540); });
+        fireEvent.touchEnd(image, { touches: [], changedTouches: [{ clientX: 150, clientY: 150 }] });
+        expect(vibrate).not.toHaveBeenCalled();
+
+        // Desktop right-click: no vibrate
+        fireEvent.contextMenu(image);
+        expect(vibrate).not.toHaveBeenCalled();
+
+        // Full 520ms long-press: medium (20ms) once; touchEnd does not repeat
+        fireEvent.touchStart(image, { touches: [{ clientX: 150, clientY: 150 }] });
+        act(() => { vi.advanceTimersByTime(520); });
+        expect(container.querySelector('.fb-lightbox-actions')).toBeTruthy();
+        expect(vibrate).toHaveBeenCalledTimes(1);
+        expect(vibrate).toHaveBeenCalledWith(20);
+        fireEvent.touchEnd(image, { touches: [], changedTouches: [{ clientX: 150, clientY: 150 }] });
+        expect(vibrate).toHaveBeenCalledTimes(1);
+      } finally {
+        if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
+        else delete (navigator as unknown as Record<string, unknown>).vibrate;
+      }
+    });
+
     it('mouse wheel zoom changes scale, anchored at the cursor', () => {
       const { container } = render(
         <ImageLightbox src="data:image/png;base64,aW1n" onClose={vi.fn()} />,

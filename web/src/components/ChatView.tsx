@@ -35,6 +35,7 @@ import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 import { localizeChatDownloadError } from '../chat-download-error.js';
 import { copyToClipboard } from '../util/clipboard.js';
+import { triggerHaptic } from '../util/haptics.js';
 import { WEB_UNLOCK_COALESCE_MS } from '@shared/scale-limits.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
@@ -6096,6 +6097,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         const chatEvent = startTarget?.closest?.('.chat-event') as HTMLElement | null;
         if (!chatEvent) return;
         openCtxMenu(chatEvent, startX, startY);
+        triggerHaptic('medium', 20);
         // One-shot: eat the touchend that follows to prevent synthetic click from closing menu
         container.addEventListener('touchend', cancelEvent, { once: true, capture: true });
       }, LONG_PRESS_MS);

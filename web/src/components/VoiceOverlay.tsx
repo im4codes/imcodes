@@ -3,6 +3,7 @@ import { createPortal, memo, forwardRef } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { RemoteVoiceProviderInfo } from '@shared/remote-voice.js';
 import * as VoiceInput from './VoiceInput.js';
+import { triggerHaptic } from '../util/haptics.js';
 import { normalizeVoiceWaveformLevel } from '../voice-waveform.js';
 import {
   formatActiveVoiceServiceLabel,
@@ -1549,6 +1550,7 @@ export function VoiceOverlay({
             holdTimerRef.current = setTimeout(() => {
               holdTimerRef.current = null;
               heldRef.current = true;
+              triggerHaptic('medium', 20);
               if (!listeningRef.current) void handleToggle();
             }, VOICE_HOLD_MS);
           }}

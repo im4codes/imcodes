@@ -509,6 +509,43 @@ describe('GlobalTaskModeView', () => {
     });
   });
 
+  it('triggers medium haptic once on task card long-press and skips scroll move-cancel or early release', async () => {
+    const vibrate = vi.fn(() => true);
+    const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+
+    try {
+      await mountWithSnapshot();
+      const replyBtn = screen.getByTestId('task-mode-reply-tsk_pair_1');
+
+      // Early release before 260ms: no haptic
+      dispatchPointer(replyBtn, 'pointerdown', { clientX: 100, clientY: 100, pointerId: 10 });
+      await act(async () => { vi.advanceTimersByTime(120); });
+      dispatchPointer(replyBtn, 'pointerup', { clientX: 100, clientY: 100, pointerId: 10 });
+      await act(async () => { vi.advanceTimersByTime(200); });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Scroll movement (>12px) cancels long-press: no haptic
+      dispatchPointer(replyBtn, 'pointerdown', { clientX: 100, clientY: 100, pointerId: 11 });
+      dispatchPointer(replyBtn, 'pointermove', { clientX: 100, clientY: 124, pointerId: 11 });
+      await act(async () => { vi.advanceTimersByTime(300); });
+      dispatchPointer(replyBtn, 'pointerup', { clientX: 100, clientY: 124, pointerId: 11 });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Valid long-press >= 260ms -> medium (20ms) once; pointerup does not repeat
+      dispatchPointer(replyBtn, 'pointerdown', { clientX: 100, clientY: 100, pointerId: 12 });
+      await act(async () => { vi.advanceTimersByTime(280); });
+      expect(screen.getByTestId('mock-voice-overlay')).toBeTruthy();
+      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate).toHaveBeenCalledWith(20);
+      dispatchPointer(replyBtn, 'pointerup', { clientX: 100, clientY: 100, pointerId: 12 });
+      expect(vibrate).toHaveBeenCalledTimes(1);
+    } finally {
+      if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
+      else delete (navigator as unknown as Record<string, unknown>).vibrate;
+    }
+  });
+
   it('auto-reads new Brain text & status transitions in order, deduplicates, ignores muted servers & historical snapshots, and stops task-mode TTS on exit without clearing global preference', async () => {
     const { setTtsAutoReadEnabled, getTtsAutoReadEnabled } = await import('../../src/tts.js');
     setTtsAutoReadEnabled(true);

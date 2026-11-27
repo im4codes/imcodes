@@ -43,6 +43,7 @@ import { VoiceOverlay } from './VoiceOverlay.js';
 import { encodeVoiceHotwordProjectKey } from '../voice-hotwords.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { formatTaskDuration, type ElapsedDurationUnits } from '../util/tool-duration.js';
+import { triggerHaptic } from '../util/haptics.js';
 import {
   clampContextMenuPosition,
   formatTaskPairCloseError,
@@ -989,6 +990,7 @@ export function GlobalTaskModeView({
           if (tracker.moved) return;
           tracker.firedLongPress = true;
           suppressClickKeysRef.current.add(key);
+          triggerHaptic('medium', 20);
           onLongPress();
         }, LONG_PRESS_MS),
         cleanup: () => {

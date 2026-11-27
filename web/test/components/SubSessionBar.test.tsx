@@ -1514,6 +1514,97 @@ describe('SubSessionBar', () => {
     }
   });
 
+  it('triggers medium haptic on drag activation and single light haptic per cross-button swap, never on short tap or move-cancel', async () => {
+    vi.useFakeTimers();
+    const vibrate = vi.fn(() => true);
+    const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+    const originalElementFromPoint = document.elementFromPoint;
+
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+      makeSubSession({ id: 'sub-c', sessionName: 'deck_sub_sub-c', label: 'c' }),
+    ];
+
+    const view = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={false}
+        serverId="srv-1"
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const first = view.container.querySelector('[data-sub-id="sub-a"]') as HTMLElement;
+    const second = view.container.querySelector('[data-sub-id="sub-b"]') as HTMLElement;
+    const third = view.container.querySelector('[data-sub-id="sub-c"]') as HTMLElement;
+    let currentOver: Element | null = second;
+    Object.defineProperty(document, 'elementFromPoint', {
+      configurable: true,
+      value: vi.fn(() => currentOver),
+    });
+
+    try {
+      // Short tap: no haptic
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(100); });
+      fireEvent.touchEnd(first);
+      act(() => { vi.advanceTimersByTime(400); });
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Move-cancel (>15px before 400ms): no haptic
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      fireEvent.touchMove(first, { touches: [{ clientX: 35, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(450); });
+      fireEvent.touchEnd(first);
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Long-press activation -> medium (20ms), swap onto sub-b -> light (10ms) once even with jitter over sub-b, then sub-c -> light (10ms)
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(401); });
+      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate).toHaveBeenLastCalledWith(20);
+
+      currentOver = second;
+      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
+      fireEvent.touchMove(first, { touches: [{ clientX: 22, clientY: 10 }] });
+      expect(vibrate).toHaveBeenCalledTimes(2);
+      expect(vibrate).toHaveBeenLastCalledWith(10);
+
+      currentOver = third;
+      fireEvent.touchMove(first, { touches: [{ clientX: 40, clientY: 10 }] });
+      expect(vibrate).toHaveBeenCalledTimes(3);
+      expect(vibrate).toHaveBeenLastCalledWith(10);
+
+      fireEvent.touchEnd(first);
+      expect(vibrate).toHaveBeenCalledTimes(3);
+
+      // Safe no-op when navigator.vibrate is unavailable
+      Object.defineProperty(navigator, 'vibrate', { configurable: true, value: undefined });
+      fireEvent.touchStart(first, { touches: [{ clientX: 10, clientY: 10 }] });
+      act(() => { vi.advanceTimersByTime(401); });
+      fireEvent.touchMove(first, { touches: [{ clientX: 20, clientY: 10 }] });
+      fireEvent.touchEnd(first);
+    } finally {
+      Object.defineProperty(document, 'elementFromPoint', {
+        configurable: true,
+        value: originalElementFromPoint,
+      });
+      if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
+      else delete (navigator as unknown as Record<string, unknown>).vibrate;
+    }
+  });
+
   it('fails safe when jsdom does not provide elementFromPoint during touch drag', async () => {
     vi.useFakeTimers();
     const onOpen = vi.fn();

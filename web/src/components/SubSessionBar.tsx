@@ -47,6 +47,7 @@ import { SUBSESSION_BAR_MAX_EXPANDED_CARDS } from '@shared/scale-limits.js';
 import type { DiskUsage } from '@shared/disk-usage.js';
 import type { MemoryShortRefHealth } from '@shared/memory-short-ref-health.js';
 import { formatDaemonVersionMobile, formatDaemonVersionShort, getBuildTimeCompact } from '../util/format-version.js';
+import { triggerHaptic } from '../util/haptics.js';
 import { isAuthoritativeUsageContextWindowSource, type UsageContextWindowSource } from '@shared/usage-context-window.js';
 import { resolveQuickAgentDelegationModel } from '../quick-agent-delegation-model.js';
 import {
@@ -903,7 +904,8 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     startX: number;
     startY: number;
     moved: boolean;
-  }>({ id: null, active: false, startX: 0, startY: 0, moved: false });
+    lastSwapOverId: string | null;
+  }>({ id: null, active: false, startX: 0, startY: 0, moved: false, lastSwapOverId: null });
   const expandedTouchRef = useRef<{
     id: string | null;
     startX: number;
@@ -1404,6 +1406,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const activateDrag = (id: string) => {
       td.id = id;
       td.active = true;
+      td.lastSwapOverId = null;
       getEntryGestureController(id).cancelTouchSequence();
       const initialOrder = orderedSessionsRef.current.map((s) => s.id);
       dragOrderRef.current = initialOrder;
@@ -1412,6 +1415,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       if (btn) { btn.style.transform = 'scale(1.18)'; btn.style.boxShadow = '0 0 10px rgba(251,191,36,0.6)'; btn.style.borderColor = '#f59e0b'; btn.style.zIndex = '2'; }
       el.style.overflowX = 'hidden';
       window.getSelection()?.removeAllRanges();
+      triggerHaptic('medium', 20);
     };
 
     const onMove = (e: TouchEvent) => {
@@ -1438,9 +1442,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         ? document.elementFromPoint(touch.clientX, touch.clientY)
         : null;
       const overId = findBtnId(targetEl);
-      if (overId && overId !== td.id) {
-        td.moved = true;
-        moveSubSessionInDragOrder(td.id, overId);
+      if (overId === td.id) {
+        td.lastSwapOverId = null;
+      } else if (overId && overId !== td.lastSwapOverId) {
+        const ids = dragOrderRef.current ?? orderedSessionsRef.current.map((s) => s.id);
+        if (ids.includes(td.id) && ids.includes(overId)) {
+          td.moved = true;
+          td.lastSwapOverId = overId;
+          moveSubSessionInDragOrder(td.id, overId);
+          triggerHaptic('light', 10);
+        }
       }
     };
 
@@ -1449,6 +1460,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       td.id = null;
       td.active = false;
       td.moved = false;
+      td.lastSwapOverId = null;
       td.startX = 0;
       td.startY = 0;
     };

@@ -11,6 +11,7 @@ import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 import { appendMissingOrderIds, reorderOrderIdsPreservingHidden, sameOrderIds } from '../server-order.js';
 import { readLegacyTabOrder, sortSessionsByTabOrder } from '../keyboard-shortcuts.js';
+import { triggerHaptic } from '../util/haptics.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -291,6 +292,7 @@ function SessionTabsControlled({ sessions, activeSession, connected, latencyMs, 
         suppressNextSyntheticClick();
         try { target.releasePointerCapture?.(pointerId); } catch { /* best-effort on older WebViews */ }
         openCtxAt(startX, startY, session);
+        triggerHaptic('medium', 20);
       }, TAB_LONG_PRESS_MS),
     };
   }, [clearLongPress, openCtxAt, suppressNextSyntheticClick]);

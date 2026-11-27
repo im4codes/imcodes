@@ -1,4 +1,5 @@
 import { hasDomBlockingOverlay } from './keyboard-shortcuts.js';
+import { triggerHaptic } from './util/haptics.js';
 
 export type MobileNavigationAction = 'serverPrev' | 'serverNext' | 'tabPrev' | 'tabNext';
 export type MobileNavigationDirection = 'up' | 'down' | 'left' | 'right';
@@ -886,6 +887,7 @@ export class TwoFingerSwipeTracker {
       this.lastPoints.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
       this.phase = 'tracking';
       this.setActive(true);
+      triggerHaptic('medium', 20);
       const evaluation = this.evaluateTrackedState();
       this.emitProgress(evaluation.progress);
       return null;

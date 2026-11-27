@@ -138,6 +138,50 @@ describe('mobile-navigation-gestures', () => {
     expect(progressEvents.at(-1)).toBeNull();
   });
 
+  it('triggers medium haptic once when 1-finger long-press actually enters drag tracking, not on arming alone or direct swipe', () => {
+    vi.useFakeTimers();
+    const vibrate = vi.fn(() => true);
+    const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+
+    try {
+      const tracker = new TwoFingerSwipeTracker({ viewportHeight: 667 });
+
+      // Long-press timer reaching long_press_ready without drag must NOT vibrate
+      tracker.onTouchStart({ touches: [{ identifier: 1, clientX: 160, clientY: 300 }] });
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Moving past dragStartPx transitions long_press_ready -> tracking and vibrates once
+      tracker.onTouchMove({
+        touches: [{ identifier: 1, clientX: 160 + MOBILE_LONG_PRESS_DRAG_START_PX + 4, clientY: 300 }],
+      });
+      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate).toHaveBeenCalledWith(20);
+
+      // Additional moves and release do not repeat vibrate
+      tracker.onTouchMove({ touches: [{ identifier: 1, clientX: 230, clientY: 300 }] });
+      tracker.evaluateTouchEnd({
+        touches: [],
+        changedTouches: [{ identifier: 1, clientX: 230, clientY: 300 }],
+      });
+      expect(vibrate).toHaveBeenCalledTimes(1);
+
+      // Direct horizontal swipe without long-press does NOT vibrate
+      vibrate.mockClear();
+      tracker.onTouchStart({ touches: [{ identifier: 2, clientX: 160, clientY: 300 }] });
+      tracker.onTouchMove({ touches: [{ identifier: 2, clientX: 230, clientY: 300 }] });
+      tracker.evaluateTouchEnd({
+        touches: [],
+        changedTouches: [{ identifier: 2, clientX: 230, clientY: 300 }],
+      });
+      expect(vibrate).not.toHaveBeenCalled();
+    } finally {
+      if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
+      else delete (navigator as unknown as Record<string, unknown>).vibrate;
+    }
+  });
+
   it('tracks multi-level steps horizontally (max 3) and vertically (3 default, 4 at >=740px, 5 at >=800px)', () => {
     vi.useFakeTimers();
     const runDrag = (viewportHeight: number, dx: number, dy: number, availableSteps?: number) => {

@@ -33,6 +33,7 @@ import {
   type RemoteDesktopViewport,
   type RemoteDesktopViewportGeometry,
 } from '../remote-desktop-viewport.js';
+import { triggerHaptic } from '../util/haptics.js';
 
 interface Props {
   src: string;
@@ -352,6 +353,7 @@ export function ImageLightbox({ src, alt = '', fileName, onDownload, onClose, on
       longPressTimerRef.current = null;
       suppressNextImageClickRef.current = true;
       setActionsVisible(true);
+      triggerHaptic('medium', 20);
     }, IMAGE_LONG_PRESS_MS);
   };
 
