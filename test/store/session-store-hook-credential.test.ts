@@ -11,10 +11,13 @@ import {
   markSessionStoreAuthoritative,
   resetIdentityBackupCleanupForTests,
   resetSessionStoreAuthorityForTests,
+  sessionStoreWriterConnectionForTests,
   setSessionStoreBackupIntervalMsForTests,
+  setSessionStoreScrubRetryDelayMsForTests,
   upsertSession,
   waitForCompatExportForTests,
   waitForCredentialBackupCleanupForTests,
+  waitForCredentialScrubRetryForTests,
   waitForSessionStoreSnapshotForTests,
   type SessionRecord,
 } from '../../src/store/session-store.js';
@@ -367,9 +370,12 @@ describe('hookCredential storage and sessions.json isolation', () => {
         reader.db.exec('BEGIN');
         reader.db.prepare('SELECT count(*) AS n FROM sessions').get();
 
+        const startMs = Date.now();
         const blocked = scrubTransportHookCredentialRows(handle);
+        expect(Date.now() - startMs).toBeLessThan(1_000);
         expect(blocked).toEqual({ scrubbedRows: 1, compacted: false });
-        expect(readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB)).toBe('vacuum_pending');
+        expect(readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB)).toBe('checkpoint_pending');
+        expect(Number(Object.values(handle.db.prepare('PRAGMA busy_timeout').get() as Record<string, number | bigint>)[0])).toBe(5_000);
         // Canary bytes are still physically present in WAL while reader pins it!
         expect(readFileSync(`${dbPath}-wal`).toString('latin1')).toContain(walCanary);
 
@@ -378,10 +384,13 @@ describe('hookCredential storage and sessions.json isolation', () => {
         closeSessionDb(reader);
       }
 
-      // Now that reader released WAL, retry completes physical cleanup & marks done.
+      // Now that reader released WAL, retry completes non-VACUUM checkpoint & marks done.
+      const retryExecSpy = vi.spyOn(handle.db, 'exec');
       const retried = scrubTransportHookCredentialRows(handle);
       expect(retried).toEqual({ scrubbedRows: 0, compacted: true });
       expect(readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB)).toBe('done');
+      expect(retryExecSpy.mock.calls.map(([sql]) => String(sql))).not.toContain('VACUUM');
+      expect(Number(Object.values(handle.db.prepare('PRAGMA busy_timeout').get() as Record<string, number | bigint>)[0])).toBe(5_000);
     } finally {
       closeSessionDb(handle);
     }
@@ -777,16 +786,41 @@ describe('hookCredential storage and sessions.json isolation', () => {
       closeSessionDb(pinHandle);
     }
 
-    // Hold a read transaction so startup scrub stays at vacuum_pending.
+    // Hold a read transaction so startup scrub stays at checkpoint_pending (VACUUM completed once).
     const blocker = openSessionDbReadOnly(dbPath)!;
     blocker.db.exec('BEGIN');
     blocker.db.prepare('SELECT count(*) AS n FROM sessions').get();
     try {
+      setSessionStoreScrubRetryDelayMsForTests(20);
       await freshStore();
+      setSessionStoreScrubRetryDelayMsForTests(20);
       setSessionStoreBackupIntervalMsForTests(0);
-      upsertSession(record('deck_f3r2_p_new', { role: 'w1', agentType: 'claude-code', hookCredential: 'keep-f3r2-proc', updatedAt: 50 }));
-      await flushStore();
-      await waitForSessionStoreSnapshotForTests();
+      const writerConn = sessionStoreWriterConnectionForTests();
+      expect(writerConn).not.toBeNull();
+      expect(readSessionDbMeta(
+        { db: writerConn!, path: dbPath, readOnly: false },
+        SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB,
+      )).toBe('checkpoint_pending');
+
+      const flushExecSpy = vi.spyOn(writerConn!, 'exec');
+      const initialWalSize = existsSync(`${dbPath}-wal`) ? statSync(`${dbPath}-wal`).size : 0;
+      const flushStartMs = Date.now();
+      for (let i = 0; i < 5; i += 1) {
+        upsertSession(record('deck_f3r2_p_new', {
+          role: 'w1',
+          agentType: 'claude-code',
+          hookCredential: 'keep-f3r2-proc',
+          updatedAt: 50 + i,
+        }));
+        await flushStore();
+        await waitForSessionStoreSnapshotForTests();
+      }
+      const flushElapsedMs = Date.now() - flushStartMs;
+      // F3-R3: consecutive flushes must neither hit 5000ms busy_timeout nor re-run VACUUM.
+      expect(flushElapsedMs).toBeLessThan(1_500);
+      expect(flushExecSpy.mock.calls.map(([sql]) => String(sql))).not.toContain('VACUUM');
+      const postFlushWalSize = existsSync(`${dbPath}-wal`) ? statSync(`${dbPath}-wal`).size : 0;
+      expect(postFlushWalSize).toBeLessThanOrEqual(initialWalSize + 64 * 1024);
       // Still pinned -> uncertified -> snapshot must NOT be published!
       expect(existsSync(bakPath)).toBe(false);
     } finally {
@@ -794,11 +828,22 @@ describe('hookCredential storage and sessions.json isolation', () => {
       closeSessionDb(blocker);
     }
 
-    // Once reader releases WAL, next flush certifies SCRUB_DONE and publishes a clean 0600 snapshot.
-    upsertSession(record('deck_f3r2_p_new', { role: 'w1', agentType: 'claude-code', hookCredential: 'keep-f3r2-proc', updatedAt: 51 }));
-    await flushStore();
+    // Once reader releases WAL, decoupled retry certifies SCRUB_DONE and publishes a clean 0600 snapshot
+    // without requiring a redundant VACUUM.
+    const postReleaseSpy = vi.spyOn(sessionStoreWriterConnectionForTests()!, 'exec');
+    await waitForCredentialScrubRetryForTests();
     await waitForSessionStoreSnapshotForTests();
+    expect(postReleaseSpy.mock.calls.map(([sql]) => String(sql))).not.toContain('VACUUM');
     expect(existsSync(bakPath)).toBe(true);
+    if (process.platform !== 'win32') {
+      expect(statSync(bakPath).mode & 0o777).toBe(0o600);
+    }
     expect(dbStateBytes(bakPath)).not.toContain(emptyDbCanary);
+    const certifiedReader = openSessionDbReadOnly(dbPath)!;
+    try {
+      expect(readSessionDbMeta(certifiedReader, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB)).toBe('done');
+    } finally {
+      closeSessionDb(certifiedReader);
+    }
   });
 });

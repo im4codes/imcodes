@@ -239,6 +239,7 @@ function collectUnreferencedBlobs(handle: SessionDbHandle): void {
 }
 
 const SCRUB_PENDING_VACUUM = 'vacuum_pending';
+const SCRUB_PENDING_CHECKPOINT = 'checkpoint_pending';
 const SCRUB_DONE = 'done';
 
 /**
@@ -248,8 +249,8 @@ const SCRUB_DONE = 'done';
  * ONE transaction: all rows and the blobs only they referred to, or nothing (a crash or a full disk rolls it back and
  * the next start repeats it). Idempotent, and repeated on EVERY start by a cheap substring scan, so rows an older build
  * wrote after a downgrade are cleaned too. The freed pages still hold the old text, so the file is compacted at once
- * (VACUUM, then the log is truncated); when that cannot run (disk space) the marker stays `vacuum_pending` and the next
- * start retries, instead of leaving the text on disk unannounced.
+ * (VACUUM -> `checkpoint_pending`, then non-blocking WAL truncation -> `done`); when that cannot finish, the pending
+ * phase is persisted so subsequent retries only repeat the failed step.
  */
 export function scrubStoredIdentityRows(handle: SessionDbHandle): { scrubbedRows: number; compacted: boolean } {
   if (handle.readOnly) return { scrubbedRows: 0, compacted: false };
@@ -258,6 +259,7 @@ export function scrubStoredIdentityRows(handle: SessionDbHandle): { scrubbedRows
   const names = (db.prepare('SELECT name FROM sessions WHERE instr(payload, ?) > 0').all(SESSION_IDENTITY_PROMPT_MARKER) as Array<{ name: string }>)
     .map((row) => row.name);
   let scrubbedRows = 0;
+  let effectiveMarker = marker;
   if (names.length > 0) {
     const read = db.prepare('SELECT payload FROM sessions WHERE name = ?');
     const readBlob = db.prepare('SELECT text FROM session_blobs WHERE hash = ?');
@@ -283,6 +285,7 @@ export function scrubStoredIdentityRows(handle: SessionDbHandle): { scrubbedRows
       if (scrubbedRows > 0) {
         collectUnreferencedBlobs(handle);
         db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_IDENTITY_SCRUB, SCRUB_PENDING_VACUUM);
+        effectiveMarker = SCRUB_PENDING_VACUUM;
       }
       db.exec('COMMIT');
     } catch (error) {
@@ -290,9 +293,10 @@ export function scrubStoredIdentityRows(handle: SessionDbHandle): { scrubbedRows
       throw error;
     }
   }
-  if (scrubbedRows === 0 && marker !== SCRUB_PENDING_VACUUM) return { scrubbedRows: 0, compacted: false };
-  const compacted = compactSessionDb(handle);
-  if (compacted) db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_IDENTITY_SCRUB, SCRUB_DONE);
+  if (scrubbedRows === 0 && effectiveMarker !== SCRUB_PENDING_VACUUM && effectiveMarker !== SCRUB_PENDING_CHECKPOINT) {
+    return { scrubbedRows: 0, compacted: false };
+  }
+  const compacted = compactAndCertifyScrub(handle, SESSION_DB_META_IDENTITY_SCRUB, effectiveMarker);
   return { scrubbedRows, compacted };
 }
 
@@ -309,6 +313,7 @@ export function scrubTransportHookCredentialRows(handle: SessionDbHandle): { scr
     .prepare('SELECT name, agent_type FROM sessions WHERE instr(payload, ?) > 0')
     .all(SESSION_HOOK_CREDENTIAL_MARKER) as Array<{ name: string; agent_type: string }>;
   let scrubbedRows = 0;
+  let effectiveMarker = marker;
   if (candidates.length > 0) {
     const read = db.prepare('SELECT payload FROM sessions WHERE name = ?');
     const write = db.prepare('UPDATE sessions SET payload = ? WHERE name = ?');
@@ -340,6 +345,7 @@ export function scrubTransportHookCredentialRows(handle: SessionDbHandle): { scr
       if (scrubbedRows > 0 || marker === null) {
         if (blobRefRemoved) collectUnreferencedBlobs(handle);
         db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_PENDING_VACUUM);
+        effectiveMarker = SCRUB_PENDING_VACUUM;
       }
       db.exec('COMMIT');
     } catch (error) {
@@ -347,33 +353,64 @@ export function scrubTransportHookCredentialRows(handle: SessionDbHandle): { scr
       throw error;
     }
   }
-  if (scrubbedRows === 0 && marker === SCRUB_DONE) {
+  if (scrubbedRows === 0 && effectiveMarker === SCRUB_DONE) {
     return { scrubbedRows: 0, compacted: false };
   }
-  if (marker !== SCRUB_PENDING_VACUUM) {
+  if (effectiveMarker !== SCRUB_PENDING_VACUUM && effectiveMarker !== SCRUB_PENDING_CHECKPOINT) {
     // An uncertified existing DB (even with 0 current rows and 0 WAL bytes, e.g. secure_delete=0
     // deleted rows in main free pages) must compact + checkpoint cleanly before SCRUB_DONE is recorded.
     db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_PENDING_VACUUM);
+    effectiveMarker = SCRUB_PENDING_VACUUM;
   }
-  const compacted = compactSessionDb(handle);
-  if (compacted) db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_DONE);
+  const compacted = compactAndCertifyScrub(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, effectiveMarker);
   return { scrubbedRows, compacted };
 }
 
-/** VACUUM and truncate the log, verifying no reader pinned the WAL (`busy === 0`). */
-function compactSessionDb(handle: SessionDbHandle): boolean {
+/**
+ * Truncate the WAL without blocking on `busy_timeout`, verifying no reader pinned the WAL (`busy === 0`).
+ * Restores `BUSY_TIMEOUT_MS` before returning so subsequent DB operations keep standard lock patience.
+ */
+function tryNonBlockingWalTruncate(handle: SessionDbHandle): boolean {
   try {
-    handle.db.exec('VACUUM');
+    handle.db.exec('PRAGMA busy_timeout = 0');
     const row = handle.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as
       | { busy?: number | bigint; log?: number | bigint; checkpointed?: number | bigint }
       | undefined;
-    enforceSessionDbFileModes(handle.path);
     if (!row) return false;
     const busy = Number(row.busy ?? 1);
     const log = Number(row.log ?? 0);
     const checkpointed = Number(row.checkpointed ?? 0);
     return busy === 0 && (log <= 0 || checkpointed >= log);
   } catch {
+    return false;
+  } finally {
+    try {
+      handle.db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    } catch {
+      /* ignore if connection already closed */
+    }
+    enforceSessionDbFileModes(handle.path);
+  }
+}
+
+/**
+ * Advance crash-safe scrub certification: run VACUUM once (`vacuum_pending` -> `checkpoint_pending`),
+ * then attempt non-blocking WAL truncation (`checkpoint_pending` -> `done`). Retries when only
+ * `checkpoint_pending` skip VACUUM so a pinned WAL reader never triggers repeated page rebuilds.
+ */
+function compactAndCertifyScrub(handle: SessionDbHandle, metaKey: string, currentMarker: string | null): boolean {
+  try {
+    if (currentMarker !== SCRUB_PENDING_CHECKPOINT) {
+      handle.db.exec('VACUUM');
+      handle.db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(metaKey, SCRUB_PENDING_CHECKPOINT);
+    }
+    const truncated = tryNonBlockingWalTruncate(handle);
+    if (truncated) {
+      handle.db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(metaKey, SCRUB_DONE);
+    }
+    return truncated;
+  } catch {
+    enforceSessionDbFileModes(handle.path);
     return false;
   }
 }

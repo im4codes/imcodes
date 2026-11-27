@@ -106,6 +106,15 @@ const FULL_SWEEP_INTERVAL_MS = 5_000;
 let sweepSliceMs = 2;
 /** An online snapshot of the database is taken at most this often; the newest few are kept. */
 let backupIntervalMs = 60 * 60 * 1000;
+const CREDENTIAL_SCRUB_RETRY_DELAYS_MS = [5_000, 15_000, 30_000, 60_000];
+const MAX_CREDENTIAL_SCRUB_AUTO_RETRIES = 12;
+let scrubRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let scrubRetryTargetPath: string | null = null;
+let scrubRetryAttempts = 0;
+let scrubRetryInFlight: Promise<void> | null = null;
+let scrubRetryDelayOverrideMs: number | undefined;
+let lastScrubRetryAttemptAt = 0;
+let uncertifiedSnapshotWarnedForPath: string | null = null;
 
 /** Test seams. */
 export function setSessionStoreSweepSliceMsForTests(ms: number | undefined): void {
@@ -113,6 +122,9 @@ export function setSessionStoreSweepSliceMsForTests(ms: number | undefined): voi
 }
 export function setSessionStoreBackupIntervalMsForTests(ms: number | undefined): void {
   backupIntervalMs = ms ?? 60 * 60 * 1000;
+}
+export function setSessionStoreScrubRetryDelayMsForTests(ms: number | undefined): void {
+  scrubRetryDelayOverrideMs = ms;
 }
 
 function storeDir(): string {
@@ -427,6 +439,8 @@ export function resetSessionStoreAuthorityForTests(): void {
   lastFullSweepAt = 0;
   fullSweepRequested = true;
   lastBackupAt = 0;
+  clearCredentialScrubRetry();
+  scrubRetryDelayOverrideMs = undefined;
   resetCompatExportForTests();
   sweepSliceMs = 2;
   backupIntervalMs = 60 * 60 * 1000;
@@ -609,6 +623,7 @@ function writerHandle(targetPath: string): SessionDbHandle {
   blobTextByHash.clear();
   dirtyNames.clear();
   clearClosedSessionRemovalAuthorizations();
+  clearCredentialScrubRetry();
   fullSweepRequested = true;
   lastBackupAt = 0;
   writerDb = openSessionDbForWrite(targetPath);
@@ -876,6 +891,9 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
       // The identity prompt and persisted transport hook credentials are not durable state: clean BEFORE reading.
       const identityScrub = removeStoredIdentityFromDatabase(handle);
       const credentialScrub = removeTransportHookCredentialsFromDatabase(handle);
+      if (readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) !== 'done') {
+        scheduleCredentialScrubRetry(targetPath);
+      }
       let payloads = readSessionPayloads(handle);
       if (
         payloads.size === 0
@@ -1211,6 +1229,90 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
   }
 }
 
+function clearCredentialScrubRetry(): void {
+  if (scrubRetryTimer) {
+    clearTimeout(scrubRetryTimer);
+    scrubRetryTimer = null;
+  }
+  scrubRetryTargetPath = null;
+  scrubRetryAttempts = 0;
+  lastScrubRetryAttemptAt = 0;
+  uncertifiedSnapshotWarnedForPath = null;
+}
+
+function scheduleCredentialScrubRetry(targetPath: string, fromFlush = false): void {
+  if (scrubRetryTimer || scrubRetryInFlight) return;
+  if (scrubRetryAttempts >= MAX_CREDENTIAL_SCRUB_AUTO_RETRIES) {
+    if (!fromFlush) return;
+    const cooldownMs = scrubRetryDelayOverrideMs ?? CREDENTIAL_SCRUB_RETRY_DELAYS_MS[CREDENTIAL_SCRUB_RETRY_DELAYS_MS.length - 1];
+    if (Date.now() - lastScrubRetryAttemptAt < cooldownMs) return;
+  }
+  const delayMs = scrubRetryDelayOverrideMs
+    ?? CREDENTIAL_SCRUB_RETRY_DELAYS_MS[Math.min(scrubRetryAttempts, CREDENTIAL_SCRUB_RETRY_DELAYS_MS.length - 1)];
+  scrubRetryTargetPath = targetPath;
+  scrubRetryTimer = setTimeout(() => {
+    const scheduledPath = scrubRetryTargetPath ?? dbPath();
+    scrubRetryTimer = null;
+    scrubRetryTargetPath = null;
+    void enqueueCredentialScrubRetry(scheduledPath);
+  }, delayMs);
+  scrubRetryTimer.unref?.();
+}
+
+function enqueueCredentialScrubRetry(targetPath: string): Promise<void> {
+  if (scrubRetryInFlight) return scrubRetryInFlight;
+  const queued = writeQueue.then(
+    () => runCredentialScrubRetry(targetPath),
+    () => runCredentialScrubRetry(targetPath),
+  );
+  const tracked = queued.finally(() => {
+    if (scrubRetryInFlight === tracked) scrubRetryInFlight = null;
+  });
+  scrubRetryInFlight = tracked;
+  writeQueue = tracked.catch(() => {});
+  return tracked;
+}
+
+function runCredentialScrubRetry(targetPath: string): void {
+  if (!hasWriteAuthority(targetPath)) return;
+  if (dbPath() !== targetPath) return;
+  if (writerDb && writerDb.path !== targetPath) return;
+  lastScrubRetryAttemptAt = Date.now();
+  const handle = writerHandle(targetPath);
+  if (readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) === 'done') {
+    uncertifiedSnapshotWarnedForPath = null;
+    scrubRetryAttempts = 0;
+    return;
+  }
+  try {
+    scrubTransportHookCredentialRows(handle);
+  } catch {
+    /* remain uncertified; bounded retry rescheduled below */
+  }
+  if (readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) === 'done') {
+    uncertifiedSnapshotWarnedForPath = null;
+    scrubRetryAttempts = 0;
+    maybeStartSnapshot(handle, targetPath);
+    return;
+  }
+  scrubRetryAttempts += 1;
+  scheduleCredentialScrubRetry(targetPath);
+}
+
+/** Test seam: execute any scheduled credential-scrub retry immediately once unblocked. */
+export async function waitForCredentialScrubRetryForTests(): Promise<void> {
+  if (scrubRetryInFlight) {
+    await scrubRetryInFlight;
+  }
+  if (scrubRetryTimer) {
+    const targetPath = scrubRetryTargetPath ?? dbPath();
+    clearTimeout(scrubRetryTimer);
+    scrubRetryTimer = null;
+    scrubRetryTargetPath = null;
+    await enqueueCredentialScrubRetry(targetPath);
+  }
+}
+
 /**
  * A consistent online snapshot of the database, at most once per interval, the
  * newest few kept. Replaces the five whole-file copies the JSON store rotated
@@ -1220,15 +1322,14 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
 function maybeStartSnapshot(handle: SessionDbHandle, targetPath: string): void {
   if (backupInFlight || committedPayloads.size === 0) return;
   if (readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) !== 'done') {
-    // Attempt certification if an earlier startup scrub stayed pending (e.g. reader released WAL);
-    // never publish a physical snapshot while credential cleanup/compaction remains uncertified.
-    try {
-      scrubTransportHookCredentialRows(handle);
-    } catch { /* reported below if still uncertified */ }
-    if (readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) !== 'done') {
+    // Never block normal flushes with synchronous VACUUM or blocking wal_checkpoint(TRUNCATE);
+    // keep physical snapshots gated until the decoupled bounded retry certifies SCRUB_DONE.
+    if (uncertifiedSnapshotWarnedForPath !== targetPath) {
+      uncertifiedSnapshotWarnedForPath = targetPath;
       logger.warn({ targetPath }, 'Skipping session database snapshot until transport credential scrub and compaction complete');
-      return;
     }
+    scheduleCredentialScrubRetry(targetPath, true);
+    return;
   }
   if (lastBackupAt === 0) {
     try { lastBackupAt = statSync(`${targetPath}.bak.1`).mtimeMs; } catch { lastBackupAt = 1; }
