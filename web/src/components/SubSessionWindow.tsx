@@ -183,6 +183,8 @@ interface Props {
   remoteDesktopCanSetUp?: boolean;
   /** Allow opening DocShare controls from embedded FileBrowser instances (false for shared-in callers). */
   canManageFileShares?: boolean;
+  /** Explicit account scope for capability cache isolation (omitted = unauthenticated/unscoped). */
+  accountScope?: string;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -315,7 +317,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, onAskAnswer, onViewModeChange, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onSessionSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick, zIndex, onFocus, onChatScrollFn, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, pendingTaskQuote, onPendingTaskQuoteConsumed, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, onAskAnswer, onViewModeChange, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onSessionSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick, zIndex, onFocus, onChatScrollFn, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, pendingTaskQuote, onPendingTaskQuoteConsumed, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true, accountScope,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
   const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(sharedState);
@@ -1188,6 +1190,7 @@ export function SubSessionWindow({
             ws={ws}
             serverId={serverId ?? null}
             daemonOnline={daemonOnline ?? false}
+            accountScope={accountScope}
             onOpen={(machine) => onOpenRemoteDesktop?.(machine)}
             canSetUp={remoteDesktopCanSetUp}
           />

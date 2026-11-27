@@ -13206,6 +13206,7 @@ function InternalMainApp() {
               ws={wsRef.current}
               connected={connected}
               daemonOnline={effectiveDaemonOnline}
+              accountScope={accountScope}
               onOpenRemoteDesktop={openRemoteDesktop}
               remoteDesktopCanSetUp={!selectedShareTarget}
               canManageFileShares={canManageServerFileShares}

@@ -88,15 +88,19 @@ const {
   writeCachedDaemonCapabilities,
 } = await import('../../src/daemon-capability-cache.js');
 
+const TEST_SCOPE = 'http://localhost:8080#test_user';
+
 type MessageHandler = (message: Record<string, unknown>) => void;
 
-function createSwitchableWsStub(initialCapabilities: string[] | null, targetServerId?: string) {
+function createSwitchableWsStub(initialCapabilities: string[] | null, targetServerId?: string, initialConnected = true) {
+  let isConnected = initialConnected;
   let currentSnapshot = initialCapabilities ? { capabilities: initialCapabilities } : null;
   const snapshotListeners = new Set<(s: { capabilities: string[] } | null) => void>();
   const messageHandlers = new Set<MessageHandler>();
   const sent: Array<Record<string, unknown>> = [];
 
   const client = {
+    get connected() { return isConnected; },
     targetsServer: (id: string) => (targetServerId !== undefined ? targetServerId === id : true),
     getDaemonCapabilitySnapshot: () => currentSnapshot,
     onDaemonCapabilitySnapshot: (listener: (s: { capabilities: string[] } | null) => void) => {
@@ -108,12 +112,15 @@ function createSwitchableWsStub(initialCapabilities: string[] | null, targetServ
       messageHandlers.add(handler);
       return () => { messageHandlers.delete(handler); };
     },
-    send: (message: Record<string, unknown>) => { sent.push(message); },
+    send: (message: Record<string, unknown>) => {
+      if (isConnected) sent.push(message);
+    },
   };
 
   return {
     client,
     sent,
+    setConnected: (val: boolean) => { isConnected = val; },
     emitMessage: (message: Record<string, unknown>) => {
       for (const handler of messageHandlers) handler(message);
     },
@@ -133,6 +140,7 @@ function wsStub(capabilities: string[]) {
       for (const handler of messageHandlers) handler(message);
     },
     client: {
+      get connected() { return true; },
       getDaemonCapabilitySnapshot: () => ({ capabilities }),
       onDaemonCapabilitySnapshot: () => () => {},
       onMessage: (handler: MessageHandler) => {
@@ -741,6 +749,7 @@ describe('DaemonRemoteDesktopControl', () => {
         serverId: 'server_A',
         serverName: 'Server A',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
       }));
@@ -749,13 +758,14 @@ describe('DaemonRemoteDesktopControl', () => {
       expect(container.querySelector('.daemon-remote-desktop-btn')).toBeTruthy();
 
       // 2. Switch to Server B: initial ws has null snapshot before hello, but server B has cached REMOTE_DESKTOP_INSTALLABLE_CAPABILITY
-      writeCachedDaemonCapabilities('server_B', [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      writeCachedDaemonCapabilities('server_B', [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY], { accountScope: TEST_SCOPE });
       const wsB = createSwitchableWsStub(null); // null before hello arrives
       rerender(h(DaemonRemoteDesktopControl as never, {
         ws: wsB.client as never,
         serverId: 'server_B',
         serverName: 'Server B',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
       }));
@@ -777,6 +787,7 @@ describe('DaemonRemoteDesktopControl', () => {
         serverId: 'server_A',
         serverName: 'Server A',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
       }));
@@ -795,13 +806,14 @@ describe('DaemonRemoteDesktopControl', () => {
 
     it('updates button state and cache when live capabilities change (e.g. revoked or uninstalled)', async () => {
       // Server was previously cached with REMOTE_DESKTOP_CAPABILITY
-      writeCachedDaemonCapabilities('server_revoked', [REMOTE_DESKTOP_CAPABILITY]);
+      writeCachedDaemonCapabilities('server_revoked', [REMOTE_DESKTOP_CAPABILITY], { accountScope: TEST_SCOPE });
       const ws = createSwitchableWsStub(null);
       const { container } = render(h(DaemonRemoteDesktopControl as never, {
         ws: ws.client as never,
         serverId: 'server_revoked',
         serverName: 'Revoked Host',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
         canSetUp: true,
@@ -818,16 +830,17 @@ describe('DaemonRemoteDesktopControl', () => {
 
       // Button converges to is-setup-required and cache is updated
       expect(container.querySelector('.daemon-remote-desktop-btn.is-setup-required')).toBeTruthy();
-      expect(readCachedDaemonCapabilities('server_revoked')).toEqual([]);
+      expect(readCachedDaemonCapabilities('server_revoked', { accountScope: TEST_SCOPE })).toEqual([]);
     });
 
     it('hides button when daemon is explicitly offline, even if capabilities are cached', () => {
-      writeCachedDaemonCapabilities('server_offline', [REMOTE_DESKTOP_CAPABILITY]);
+      writeCachedDaemonCapabilities('server_offline', [REMOTE_DESKTOP_CAPABILITY], { accountScope: TEST_SCOPE });
       const ws = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY]);
       const { container } = render(h(DaemonRemoteDesktopControl as never, {
         ws: ws.client as never,
         serverId: 'server_offline',
         daemonOnline: false,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
       }));
@@ -842,6 +855,7 @@ describe('DaemonRemoteDesktopControl', () => {
         serverId: 'server_A',
         serverName: 'Server A',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
       }));
@@ -864,6 +878,7 @@ describe('DaemonRemoteDesktopControl', () => {
         serverId: 'server_B',
         serverName: 'Server B',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
       }));
@@ -874,12 +889,12 @@ describe('DaemonRemoteDesktopControl', () => {
     });
 
     it('clears capability cache on logout preventing cross-account state leakage', () => {
-      writeCachedDaemonCapabilities('server_user1', [REMOTE_DESKTOP_CAPABILITY]);
-      expect(readCachedDaemonCapabilities('server_user1')).toEqual([REMOTE_DESKTOP_CAPABILITY]);
+      writeCachedDaemonCapabilities('server_user1', [REMOTE_DESKTOP_CAPABILITY], { accountScope: TEST_SCOPE });
+      expect(readCachedDaemonCapabilities('server_user1', { accountScope: TEST_SCOPE })).toEqual([REMOTE_DESKTOP_CAPABILITY]);
 
       // Logout called
       clearCachedDaemonCapabilities();
-      expect(readCachedDaemonCapabilities('server_user1')).toBeNull();
+      expect(readCachedDaemonCapabilities('server_user1', { accountScope: TEST_SCOPE })).toBeNull();
 
       // Cold mount without live snapshot does not show button for new user
       const ws = createSwitchableWsStub(null);
@@ -887,6 +902,7 @@ describe('DaemonRemoteDesktopControl', () => {
         ws: ws.client as never,
         serverId: 'server_user1',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
         canSetUp: false,
@@ -903,6 +919,7 @@ describe('DaemonRemoteDesktopControl', () => {
         serverId: 'server_B',
         serverName: 'Server B',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
         canSetUp: false,
@@ -911,7 +928,7 @@ describe('DaemonRemoteDesktopControl', () => {
       // Server B must NOT show Server A's button!
       expect(container.querySelector('.daemon-remote-desktop-btn')).toBeNull();
       // Server B's cache must NOT be polluted with Server A's capabilities!
-      expect(readCachedDaemonCapabilities('server_B')).toBeNull();
+      expect(readCachedDaemonCapabilities('server_B', { accountScope: TEST_SCOPE })).toBeNull();
     });
 
     it('discards late ticket mint failure from previous server on switch without polluting new server', async () => {
@@ -928,6 +945,7 @@ describe('DaemonRemoteDesktopControl', () => {
         serverId: 'server_A',
         serverName: 'Server A',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
         offerLoginScreenSetup: true,
@@ -946,6 +964,7 @@ describe('DaemonRemoteDesktopControl', () => {
         serverId: 'server_B',
         serverName: 'Server B',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
         offerLoginScreenSetup: true,
@@ -967,14 +986,253 @@ describe('DaemonRemoteDesktopControl', () => {
       spy.mockRestore();
     });
 
+    it('discards late mint failure or success on A -> B -> A switch without polluting second visit to A', async () => {
+      let rejectMintA1: (err: unknown) => void = () => {};
+      let resolveMintA1: (val: { ticket: string }) => void = () => {};
+      const mintPendingPromise = new Promise<{ ticket: string }>((resolve, reject) => {
+        resolveMintA1 = resolve;
+        rejectMintA1 = reject;
+      });
+      const machinesApi = await import('../../src/api/machines.js');
+      const spy = vi.spyOn(machinesApi, 'mintControlledNodeExecutableTicket').mockImplementationOnce(() => mintPendingPromise as never);
+
+      // 1. Visit Server A (first visit) with wsA1
+      const wsA1 = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_A');
+      const { container, rerender } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: wsA1.client as never,
+        serverId: 'server_A',
+        serverName: 'Server A',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: true,
+      }));
+
+      // Click login screen enable on visit 1 to A
+      const buttonsA1 = container.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttonsA1.length).toBe(2);
+      fireEvent.click(buttonsA1[1]);
+
+      // 2. Switch to Server B with wsB
+      const wsB = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_B');
+      rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: wsB.client as never,
+        serverId: 'server_B',
+        serverName: 'Server B',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: true,
+      }));
+
+      // 3. Switch back to Server A (second visit) with new WebSocket wsA2
+      const wsA2 = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_A');
+      rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: wsA2.client as never,
+        serverId: 'server_A',
+        serverName: 'Server A',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: true,
+      }));
+
+      const buttonsA2 = container.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttonsA2[1].getAttribute('title')).toBe('remote_desktop.login_screen_hint');
+
+      // 4. Reject the late promise from visit 1 to Server A
+      await act(async () => {
+        rejectMintA1(new Error('Late network error from visit 1'));
+      });
+
+      // Second visit to Server A MUST NOT turn into download_failed!
+      const buttonsA2AfterReject = container.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttonsA2AfterReject[1].getAttribute('title')).toBe('remote_desktop.login_screen_hint');
+      expect(wsA2.sent.length).toBe(0);
+      expect(wsA1.sent.length).toBe(0);
+
+      spy.mockRestore();
+    });
+
+    it('discards late mint callback on same server when connection replaces ws1 -> ws2', async () => {
+      let resolveMint1: (val: { ticket: string }) => void = () => {};
+      const mintPendingPromise = new Promise<{ ticket: string }>((resolve) => {
+        resolveMint1 = resolve;
+      });
+      const machinesApi = await import('../../src/api/machines.js');
+      const spy = vi.spyOn(machinesApi, 'mintControlledNodeExecutableTicket').mockImplementationOnce(() => mintPendingPromise as never);
+
+      // Visit Server A with ws1
+      const ws1 = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_A');
+      const { container, rerender } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws1.client as never,
+        serverId: 'server_A',
+        serverName: 'Server A',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: true,
+      }));
+
+      // Click login screen enable with ws1
+      const buttons1 = container.querySelectorAll('.daemon-remote-desktop-btn');
+      fireEvent.click(buttons1[1]);
+
+      // Reconnect/replace WebSocket on same server with ws2
+      const ws2 = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_A');
+      rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: ws2.client as never,
+        serverId: 'server_A',
+        serverName: 'Server A',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: true,
+      }));
+
+      // Resolve old mint from ws1
+      await act(async () => {
+        resolveMint1({ ticket: 'old_ticket_from_ws1' });
+      });
+
+      // Old mint must NOT send message on ws2 or ws1
+      expect(ws2.sent.length).toBe(0);
+      expect(ws1.sent.length).toBe(0);
+
+      spy.mockRestore();
+    });
+
+    it('ignores click on cached installable button when matching connection is not sendable, and succeeds once connected', () => {
+      writeCachedDaemonCapabilities('server_cached_install', [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY], { accountScope: TEST_SCOPE });
+      // WebSocket is created but not connected yet
+      const ws = createSwitchableWsStub([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY], 'server_cached_install', false);
+
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_cached_install',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+
+      // Button is visible from cache
+      const button = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+      expect(button).toBeTruthy();
+      expect(button.textContent).toContain('remote_desktop.install_worker');
+
+      // Click while disconnected: must NOT enter DOWNLOADING or send
+      fireEvent.click(button);
+      expect(ws.sent.length).toBe(0);
+      expect(button.disabled).toBe(false);
+      expect(button.querySelector('.connecting-dot')).toBeNull();
+
+      // Now connection becomes sendable/connected
+      act(() => {
+        ws.setConnected(true);
+      });
+
+      // Click when connected: successfully enters DOWNLOADING and sends request
+      fireEvent.click(button);
+      expect(ws.sent.length).toBe(1);
+      expect(ws.sent[0]).toEqual({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
+      expect(button.disabled).toBe(true);
+      expect(button.querySelector('.connecting-dot')).not.toBeNull();
+    });
+
+    it('recovers to retryable state if connection drops while mint is in flight', async () => {
+      let resolveMint: (val: { ticket: string }) => void = () => {};
+      const mintPendingPromise = new Promise<{ ticket: string }>((resolve) => {
+        resolveMint = resolve;
+      });
+      const machinesApi = await import('../../src/api/machines.js');
+      const spy = vi.spyOn(machinesApi, 'mintControlledNodeExecutableTicket').mockImplementationOnce(() => mintPendingPromise as never);
+
+      const ws = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_A', true);
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_A',
+        serverName: 'Server A',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: true,
+      }));
+
+      // Click login screen enable
+      const buttons = container.querySelectorAll('.daemon-remote-desktop-btn');
+      fireEvent.click(buttons[1]);
+      expect(buttons[1].querySelector('.connecting-dot')).not.toBeNull();
+
+      // Connection drops before mint finishes
+      act(() => {
+        ws.setConnected(false);
+      });
+
+      // Mint finishes
+      await act(async () => {
+        resolveMint({ ticket: 'valid_ticket' });
+      });
+
+      // Recovers to retryable failure state rather than stuck in DOWNLOADING
+      const buttonsAfter = container.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttonsAfter[1].getAttribute('title')).toBe('remote_desktop.login_screen_error_download_failed');
+      expect(buttonsAfter[1].querySelector('.connecting-dot')).toBeNull();
+
+      spy.mockRestore();
+    });
+
+    it('strictly enforces explicit accountScope: unscoped control uses live snapshot only and ignores cache', () => {
+      writeCachedDaemonCapabilities('server_scoped_test', [REMOTE_DESKTOP_CAPABILITY], { accountScope: TEST_SCOPE });
+
+      // Unscoped mount (missing accountScope): does NOT read from cache
+      const wsUnscoped = createSwitchableWsStub(null, 'server_scoped_test');
+      const { container: unscopedContainer } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: wsUnscoped.client as never,
+        serverId: 'server_scoped_test',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: false,
+      }));
+      expect(unscopedContainer.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+
+      // Scoped mount (with matching accountScope): reads immediately from cache
+      const wsScoped = createSwitchableWsStub(null, 'server_scoped_test');
+      const { container: scopedContainer } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: wsScoped.client as never,
+        serverId: 'server_scoped_test',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: false,
+      }));
+      expect(scopedContainer.querySelector('.daemon-remote-desktop-btn')).toBeTruthy();
+    });
+
     it('enforces canSetUp=false: hides worker install and login-screen enable buttons for restricted viewers', () => {
       // 1. Viewer on installable host: worker install button is hidden
-      writeCachedDaemonCapabilities('server_viewer_install', [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      writeCachedDaemonCapabilities('server_viewer_install', [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY], { accountScope: TEST_SCOPE });
       const ws1 = createSwitchableWsStub([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY], 'server_viewer_install');
       const { container: c1 } = render(h(DaemonRemoteDesktopControl as never, {
         ws: ws1.client as never,
         serverId: 'server_viewer_install',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
         canSetUp: false,
@@ -986,6 +1244,7 @@ describe('DaemonRemoteDesktopControl', () => {
         ws: ws1.client as never,
         serverId: 'server_viewer_install',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
         canSetUp: true,
@@ -994,12 +1253,13 @@ describe('DaemonRemoteDesktopControl', () => {
       expect(c1Owner.textContent).toContain('remote_desktop.install_worker');
 
       // 2. Viewer on ready host: open button IS shown, but login-screen enable button is hidden
-      writeCachedDaemonCapabilities('server_viewer_ready', [REMOTE_DESKTOP_CAPABILITY]);
+      writeCachedDaemonCapabilities('server_viewer_ready', [REMOTE_DESKTOP_CAPABILITY], { accountScope: TEST_SCOPE });
       const ws2 = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_viewer_ready');
       const { container: c2 } = render(h(DaemonRemoteDesktopControl as never, {
         ws: ws2.client as never,
         serverId: 'server_viewer_ready',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
         offerLoginScreenSetup: true,
@@ -1015,6 +1275,7 @@ describe('DaemonRemoteDesktopControl', () => {
         ws: ws2.client as never,
         serverId: 'server_viewer_ready',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
         offerLoginScreenSetup: true,
@@ -1031,6 +1292,7 @@ describe('DaemonRemoteDesktopControl', () => {
         ws: ws.client as never,
         serverId: 'server_stale',
         daemonOnline: true,
+        accountScope: TEST_SCOPE,
         onOpen: vi.fn(),
         machines: [],
       }));
@@ -1044,7 +1306,7 @@ describe('DaemonRemoteDesktopControl', () => {
       });
 
       // Cache for server_stale should NOT be written by unmounted component
-      expect(readCachedDaemonCapabilities('server_stale')).toBeNull();
+      expect(readCachedDaemonCapabilities('server_stale', { accountScope: TEST_SCOPE })).toBeNull();
     });
   });
 });

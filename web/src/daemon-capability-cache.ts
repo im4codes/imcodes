@@ -54,8 +54,10 @@ function resolveStorage(explicit?: Storage): Storage | null {
 }
 
 function toCacheKey(serverId: string, accountScope?: string | null): string {
-  const scope = typeof accountScope === 'string' && accountScope.trim() ? accountScope.trim() : 'global';
-  return `${scope}::${serverId}`;
+  const scope = typeof accountScope === 'string' ? accountScope.trim() : '';
+  const sId = typeof serverId === 'string' ? serverId.trim() : '';
+  if (!scope || !sId) return '';
+  return `${scope}::${sId}`;
 }
 
 function sanitizeCapabilities(raw: unknown): string[] {
@@ -126,6 +128,7 @@ export function readCachedDaemonCapabilities(
   if (!serverId) return null;
   const { accountScope, storage } = normalizeOptions(options);
   const cacheKey = toCacheKey(serverId, accountScope);
+  if (!cacheKey) return null;
   const mem = memoryCache.get(cacheKey);
   if (mem) {
     return [...mem.capabilities];
@@ -167,6 +170,7 @@ export function writeCachedDaemonCapabilities(
   if (!serverId) return;
   const { accountScope, storage } = normalizeOptions(options);
   const cacheKey = toCacheKey(serverId, accountScope);
+  if (!cacheKey) return;
   const sanitized = sanitizeCapabilities(capabilities);
   const now = nextTimestamp();
   memoryCache.set(cacheKey, {

@@ -203,6 +203,14 @@ export function resolveServerRemoteDesktopTarget({
  * link to an already-installed node. Right-click reopens that setup to change
  * the link.
  */
+function isWsSendable(ws: WsClient | null | undefined): boolean {
+  if (!ws) return false;
+  if ('connected' in ws && typeof (ws as { connected?: unknown }).connected === 'boolean') {
+    return Boolean((ws as { connected: boolean }).connected);
+  }
+  return typeof ws.send === 'function';
+}
+
 export function DaemonRemoteDesktopControl({
   ws,
   serverId,
@@ -222,16 +230,16 @@ export function DaemonRemoteDesktopControl({
     ? ws
     : null;
 
-  const currentServerRef = useRef(serverId);
-  const currentAccountScopeRef = useRef(accountScope);
-  currentServerRef.current = serverId;
-  currentAccountScopeRef.current = accountScope;
-
   const normalizedServerId = serverId ?? null;
   const normalizedAccountScope = accountScope ?? null;
 
   const [activeServerId, setActiveServerId] = useState<string | null>(normalizedServerId);
   const [activeAccountScope, setActiveAccountScope] = useState<string | null>(normalizedAccountScope);
+  const [activeWs, setActiveWs] = useState<WsClient | null>(matchingWs);
+  const [activeCanSetUp, setActiveCanSetUp] = useState<boolean>(canSetUp);
+
+  const operationEpochRef = useRef(0);
+  const unmountedRef = useRef(false);
 
   const [capabilities, setCapabilities] = useState<readonly string[]>(() => {
     if (!serverId) return [];
@@ -239,7 +247,7 @@ export function DaemonRemoteDesktopControl({
       const live = matchingWs.getDaemonCapabilitySnapshot()?.capabilities;
       if (live) return live;
     }
-    return readCachedDaemonCapabilities(serverId, { accountScope }) ?? [];
+    return accountScope ? readCachedDaemonCapabilities(serverId, { accountScope }) ?? [] : [];
   });
   const [install, setInstall] = useState<{ state: RemoteDesktopInstallState; error?: string } | null>(null);
   const [loginScreen, setLoginScreen] = useState<
@@ -249,17 +257,26 @@ export function DaemonRemoteDesktopControl({
   const sharedMachines = useMachines();
   const machineList = machines ?? sharedMachines.machines;
 
-  // Synchronous state alignment during render when switching serverId or accountScope
-  if (normalizedServerId !== activeServerId || normalizedAccountScope !== activeAccountScope) {
+  // Synchronous state alignment during render when switching serverId, accountScope, connection, or permissions
+  if (
+    normalizedServerId !== activeServerId
+    || normalizedAccountScope !== activeAccountScope
+    || activeWs !== matchingWs
+    || activeCanSetUp !== canSetUp
+  ) {
     setActiveServerId(normalizedServerId);
     setActiveAccountScope(normalizedAccountScope);
+    setActiveWs(matchingWs);
+    setActiveCanSetUp(canSetUp);
+    operationEpochRef.current += 1;
+
     const initialCapabilities = (() => {
       if (!serverId) return [];
       if (matchingWs) {
         const live = matchingWs.getDaemonCapabilitySnapshot()?.capabilities;
         if (live) return live;
       }
-      return readCachedDaemonCapabilities(serverId, { accountScope }) ?? [];
+      return accountScope ? readCachedDaemonCapabilities(serverId, { accountScope }) ?? [] : [];
     })();
     setCapabilities(initialCapabilities);
     setInstall(null);
@@ -268,6 +285,15 @@ export function DaemonRemoteDesktopControl({
   }
 
   useEffect(() => {
+    unmountedRef.current = false;
+    return () => {
+      unmountedRef.current = true;
+      operationEpochRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
+    const opEpoch = operationEpochRef.current;
     if (!serverId) {
       setCapabilities([]);
       return;
@@ -275,9 +301,11 @@ export function DaemonRemoteDesktopControl({
     const live = matchingWs?.getDaemonCapabilitySnapshot();
     if (live?.capabilities) {
       setCapabilities(live.capabilities);
-      writeCachedDaemonCapabilities(serverId, live.capabilities, { accountScope });
+      if (accountScope) {
+        writeCachedDaemonCapabilities(serverId, live.capabilities, { accountScope });
+      }
     } else {
-      const cached = readCachedDaemonCapabilities(serverId, { accountScope });
+      const cached = accountScope ? readCachedDaemonCapabilities(serverId, { accountScope }) : null;
       if (cached !== null) {
         setCapabilities(cached);
       } else {
@@ -286,19 +314,22 @@ export function DaemonRemoteDesktopControl({
     }
     if (!matchingWs) return;
     return matchingWs.onDaemonCapabilitySnapshot((snapshot) => {
-      if (currentServerRef.current !== serverId || currentAccountScopeRef.current !== accountScope) return;
+      if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
       if (snapshot && typeof snapshot === 'object' && 'capabilities' in snapshot && Array.isArray((snapshot as { capabilities: unknown }).capabilities)) {
         const caps = (snapshot as { capabilities: readonly string[] }).capabilities;
         setCapabilities(caps);
-        writeCachedDaemonCapabilities(serverId, caps, { accountScope });
+        if (accountScope) {
+          writeCachedDaemonCapabilities(serverId, caps, { accountScope });
+        }
       }
     });
   }, [matchingWs, serverId, accountScope]);
 
   useEffect(() => {
     if (!matchingWs) return;
+    const opEpoch = operationEpochRef.current;
     return matchingWs.onMessage((message) => {
-      if (currentServerRef.current !== serverId || currentAccountScopeRef.current !== accountScope) return;
+      if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
       const state = validateRemoteDesktopInstallStateMessage(message);
       if (state) setInstall({ state: state.state, ...(state.error ? { error: state.error } : {}) });
       const loginScreenState = validateRemoteDesktopLoginScreenStateMessage(message);
@@ -346,17 +377,26 @@ export function DaemonRemoteDesktopControl({
   const installHere = installHereTarget && canSetUp ? {
     state: loginScreen,
     start: () => {
-      const targetServerId = serverId;
-      const targetAccountScope = accountScope;
+      if (!canSetUp) return;
+      if (!matchingWs || !isWsSendable(matchingWs)) {
+        return;
+      }
+      const opEpoch = operationEpochRef.current;
       setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
       void mintControlledNodeInstallCommand(installHereTarget, serverId)
         .then((minted) => {
-          if (currentServerRef.current !== targetServerId || currentAccountScopeRef.current !== targetAccountScope) return;
-          if (!minted.installCode || !matchingWs) throw new Error('install_code_unavailable');
+          if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
+          if (!minted.installCode || !matchingWs || !isWsSendable(matchingWs)) {
+            setLoginScreen({
+              state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+              error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+            });
+            return;
+          }
           matchingWs.send({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST, installCode: minted.installCode });
         })
         .catch(() => {
-          if (currentServerRef.current !== targetServerId || currentAccountScopeRef.current !== targetAccountScope) return;
+          if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
           setLoginScreen({
             state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
             error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
@@ -423,22 +463,32 @@ export function DaemonRemoteDesktopControl({
             })
             : t('remote_desktop.login_screen_hint')}
           onClick={() => {
+            if (!canSetUp) return;
+            if (!matchingWs || !isWsSendable(matchingWs)) {
+              return;
+            }
             if (!window.confirm(t('remote_desktop.install_confirm', {
               server: serverName ?? serverId ?? '',
             }))) return;
-            const targetServerId = serverId;
-            const targetAccountScope = accountScope;
+            const opEpoch = operationEpochRef.current;
             setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
             void mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, serverId)
               .then((minted) => {
-                if (currentServerRef.current !== targetServerId || currentAccountScopeRef.current !== targetAccountScope) return;
-                matchingWs?.send({
+                if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
+                if (!minted.ticket || !matchingWs || !isWsSendable(matchingWs)) {
+                  setLoginScreen({
+                    state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+                    error: 'download_failed',
+                  });
+                  return;
+                }
+                matchingWs.send({
                   type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
                   ticket: minted.ticket,
                 });
               })
               .catch(() => {
-                if (currentServerRef.current !== targetServerId || currentAccountScopeRef.current !== targetAccountScope) return;
+                if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
                 setLoginScreen({
                   state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
                   error: 'download_failed',
@@ -498,16 +548,15 @@ export function DaemonRemoteDesktopControl({
       disabled={downloading}
       title={failed ? failureLabel : t('remote_desktop.install_worker')}
       onClick={() => {
-        // A one-time-per-click confirmation, not a config toggle: enabling
-        // remote control of this machine is worth a deliberate second step,
-        // the same way the login-screen and revoke actions elsewhere in
-        // this codebase already ask before doing something with this much
-        // reach (see ControlledNodesPanel's own window.confirm() calls).
+        if (!canSetUp) return;
+        if (!matchingWs || !isWsSendable(matchingWs)) {
+          return;
+        }
         if (!window.confirm(t('remote_desktop.install_confirm', {
           server: serverName ?? serverId ?? '',
         }))) return;
         setInstall({ state: REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING });
-        matchingWs?.send({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
+        matchingWs.send({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
       }}
     >
       {downloading
