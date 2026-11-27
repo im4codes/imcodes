@@ -7294,9 +7294,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [disarmTouchTapCompatMouseShield]);
 
   /** Restore editability and focus the composer on any short tap or failed hold. */
-  const fallbackToComposerClick = useCallback((pointerType?: string) => {
+  const fallbackToComposerClick = useCallback((
+    pointerType?: string,
+    tapCoords?: { x: number; y: number } | null,
+  ) => {
     pendingMobileInitialEndFocusRef.current = null;
     skipZoomCaretOnNextClickRef.current = true;
+    const tapState = composerTapStateRef.current;
+    composerTapStateRef.current = null;
     if (!mountedRef.current || inputDisabledRef.current) {
       didPrimeVoiceGestureRef.current = false;
       didPrimeVoiceGestureRef.current = false;
@@ -7312,6 +7317,18 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       armTouchTapCompatMouseShield();
     }
     focusComposerForTyping({ moveCursorToEnd: true });
+    const el = divRef.current;
+    if (
+      el
+      && tapCoords
+      && !tapState?.moved
+      && !imeComposingRef.current
+      && !(tapCoords.x === 0 && tapCoords.y === 0)
+      && (el.textContent?.length ?? 0) > 0
+      && el.getAttribute('contenteditable') === 'true'
+    ) {
+      placeContentEditableCaretAtPoint(el, tapCoords.x, tapCoords.y);
+    }
   }, [armTouchTapCompatMouseShield, focusComposerForTyping]);
 
   const updateVoiceHoldZoneFromDx = useCallback((
@@ -8155,7 +8172,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearComposerVoiceWindowListeners();
       // Any short release or pending pointercancel before active recording focuses typing immediately,
       // then cleans up any primed gesture after focus is in place.
-      fallbackToComposerClick(resolvedPointerType);
+      const tapCoords = !cancelled
+        ? {
+            x: event.clientX ?? ptr?.startX ?? 0,
+            y: event.clientY ?? ptr?.startY ?? 0,
+          }
+        : null;
+      fallbackToComposerClick(resolvedPointerType, tapCoords);
       return;
     }
 
@@ -11873,13 +11896,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
               const clickX = event.clientX === 0 && event.clientY === 0 && tapState ? tapState.x : event.clientX;
               const clickY = event.clientX === 0 && event.clientY === 0 && tapState ? tapState.y : event.clientY;
               if (
-                !shouldMoveInitialMobileToEnd
-                && !skipZoomCaretForInitialVoiceTap
+                !skipZoomCaretForInitialVoiceTap
                 && !imeComposingRef.current
                 && !tapState?.moved
                 && !event.shiftKey
                 && event.detail <= 1
                 && !(clickX === 0 && clickY === 0 && event.detail === 0)
+                && (el.textContent?.length ?? 0) > 0
                 && el.getAttribute('contenteditable') === 'true'
               ) {
                 placeContentEditableCaretAtPoint(el, clickX, clickY);

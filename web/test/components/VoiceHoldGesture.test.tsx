@@ -145,6 +145,7 @@ import {
   computeVoiceHoldBottomClearancePx,
 } from '../../src/components/SessionControls.js';
 import { focusComposerElement } from '../../src/util/composer-focus.js';
+import { applyUiScale } from '../../src/ui-scale.js';
 import type { SessionInfo } from '../../src/types.js';
 
 const uploadFileMock = vi.mocked(uploadFile);
@@ -4807,5 +4808,140 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
     expect(vibrate.mock.calls.map(([ms]) => ms)).toEqual([20, 12, 15]);
     view3.unmount();
+  });
+
+  it('places caret at tapped mid-text position on initial unfocused mobile tap under 125% UI zoom (both VoiceInput unavailable and available short tap) while keeping long-press hold and empty-draft paths intact', async () => {
+    const zoom = 1.25;
+    applyUiScale(125);
+    const origInnerWidth = window.innerWidth;
+    const origRootGetRect = document.documentElement.getBoundingClientRect;
+    const origCreateRange = document.createRange.bind(document);
+    try {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 });
+      document.documentElement.getBoundingClientRect = () => ({
+        left: 0, top: 0, right: 312, bottom: 600, width: 312, height: 600, x: 0, y: 0, toJSON: () => ({}),
+      } as DOMRect);
+
+      const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+      const draft = 'hello world middle text';
+
+      const installInputGeometry = (input: HTMLElement) => {
+        const tn = input.firstChild as Text;
+        input.getBoundingClientRect = () => ({
+          left: 10, top: 490, right: 290, bottom: 530, width: 280, height: 40, x: 10, y: 490, toJSON: () => ({}),
+        } as DOMRect);
+        return vi.spyOn(document, 'createRange').mockImplementation(() => {
+          const r = origCreateRange();
+          r.getClientRects = (() => {
+            if (r.startContainer === tn && r.endContainer === tn) {
+              if (r.startOffset === 0 && r.endOffset === draft.length) {
+                return [{ left: 20, top: 500, right: 20 + draft.length * 10, bottom: 520, width: draft.length * 10, height: 20, x: 20, y: 500, toJSON: () => ({}) }] as unknown as DOMRectList;
+              }
+              if (r.endOffset > r.startOffset) {
+                const l = 20 + r.startOffset * 10;
+                return [{ left: l, top: 500, right: l + 10, bottom: 520, width: 10, height: 20, x: l, y: 500, toJSON: () => ({}) }] as unknown as DOMRectList;
+              }
+            }
+            return [] as unknown as DOMRectList;
+          }) as unknown as () => DOMRectList;
+          return r;
+        });
+      };
+
+      const dispatchPrimary = (el: EventTarget, type: string, clientX: number, clientY: number, pointerId: number) => {
+        const ev = new Event(type, { bubbles: true, cancelable: true }) as PointerEvent;
+        Object.assign(ev, { clientX, clientY, pointerId, button: 0, pointerType: 'touch', isPrimary: true, buttons: type === 'pointerup' ? 0 : 1 });
+        return fireEvent(el, ev);
+      };
+
+      // Tap coords targeting character index 6 ('w', unzoomed x=80..90 -> viewport 82*1.25, y=510*1.25)
+      const tapX = 82 * zoom;
+      const tapY = 510 * zoom;
+
+      // Path A: VoiceInput unavailable -> unfocused initial mobile tap on non-empty draft lands at offset 6 (NOT end)
+      voiceMock.isAvailable.mockReturnValue(false);
+      const viewA = render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+      const inputA = document.querySelector('.controls-input') as HTMLElement;
+      inputA.textContent = draft;
+      const textA = inputA.firstChild as Text;
+      const spyA = installInputGeometry(inputA);
+
+      dispatchPrimary(inputA, 'pointerdown', tapX, tapY, 71);
+      dispatchPrimary(inputA, 'pointerup', tapX, tapY, 71);
+      inputA.focus();
+      fireEvent.focus(inputA);
+      fireEvent.click(inputA, { clientX: tapX, clientY: tapY, detail: 1 });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(document.activeElement).toBe(inputA);
+      expect(inputA.getAttribute('contenteditable')).toBe('true');
+      expect(window.getSelection()?.focusNode).toBe(textA);
+      expect(window.getSelection()?.focusOffset).toBe(6);
+
+      spyA.mockRestore();
+      viewA.unmount();
+
+      // Path B: VoiceInput available -> short touch tap fallbackToComposerClick on unfocused non-empty draft lands at offset 6 (NOT end)
+      voiceMock.isAvailable.mockReturnValue(true);
+      voiceMock.startListening.mockResolvedValue(true);
+      const viewB = render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+      const inputB = document.querySelector('.controls-input') as HTMLElement;
+      inputB.textContent = draft;
+      const textB = inputB.firstChild as Text;
+      const spyB = installInputGeometry(inputB);
+
+      dispatchPrimary(inputB, 'pointerdown', tapX, tapY, 72);
+      await vi.advanceTimersByTimeAsync(50);
+      dispatchPrimary(inputB, 'pointerup', tapX, tapY, 72);
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(document.activeElement).toBe(inputB);
+      expect(inputB.getAttribute('contenteditable')).toBe('true');
+      expect(window.getSelection()?.focusNode).toBe(textB);
+      expect(window.getSelection()?.focusOffset).toBe(6);
+
+      // Compat click after pointerup must preserve caret at offset 6
+      fireEvent.click(inputB, { clientX: 0, clientY: 0, detail: 0 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(window.getSelection()?.focusNode).toBe(textB);
+      expect(window.getSelection()?.focusOffset).toBe(6);
+
+      // Positive control: blur back to voice-ready, long press STILL enters voice hold recording
+      inputB.blur();
+      fireEvent.blur(inputB);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(inputB.getAttribute('contenteditable')).toBe('false');
+      dispatchPrimary(inputB, 'pointerdown', tapX, tapY, 73);
+      await vi.advanceTimersByTimeAsync(175);
+      expect(voiceMock.startListening).toHaveBeenCalledTimes(1);
+      dispatchPrimary(inputB, 'pointerup', tapX, tapY, 73);
+      await vi.advanceTimersByTimeAsync(300);
+
+      spyB.mockRestore();
+      viewB.unmount();
+    } finally {
+      applyUiScale(100);
+      document.documentElement.getBoundingClientRect = origRootGetRect;
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: origInnerWidth });
+      vi.restoreAllMocks();
+    }
   });
 });

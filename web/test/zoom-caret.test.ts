@@ -386,4 +386,92 @@ describe('zoom-caret calibrated hit-testing', () => {
       cleanup();
     }
   });
+
+  it('skips caret calibration during active IME composition per element for both <input> and <textarea> and resumes after compositionend', () => {
+    const ta = document.createElement('textarea');
+    ta.value = 'abcdefghij';
+    const inputEl = document.createElement('input');
+    inputEl.type = 'text';
+    inputEl.value = 'abcdefghij';
+    document.body.append(ta, inputEl);
+
+    applyUiScale(125);
+    document.documentElement.getBoundingClientRect = () => makeRect(0, 0, 800, 600);
+    Object.defineProperty(window, 'innerWidth', { value: 1000, configurable: true });
+
+    for (const el of [ta, inputEl]) {
+      Object.defineProperty(el, 'clientWidth', { value: 200, configurable: true });
+      el.getBoundingClientRect = () => makeRect(10, 10, 200, 40);
+    }
+
+    const origCreateElement = document.createElement.bind(document);
+    const origCreateRange = document.createRange.bind(document);
+    vi.spyOn(document, 'createElement').mockImplementation((tag: string, options?: ElementCreationOptions) => {
+      const created = origCreateElement(tag, options);
+      if (tag.toLowerCase() === 'div') {
+        created.getBoundingClientRect = () => makeRect(0, 0, 200, 40);
+      }
+      return created;
+    });
+    vi.spyOn(document, 'createRange').mockImplementation(() => {
+      const r = origCreateRange();
+      r.getClientRects = (() => {
+        if (r.startContainer.nodeType === Node.TEXT_NODE) {
+          const t = r.startContainer as Text;
+          if (t.data === 'abcdefghij') {
+            if (r.startOffset === 0 && r.endOffset === 10) {
+              return [makeRect(0, 0, 100, 20)] as unknown as DOMRectList;
+            }
+            return [makeRect(r.startOffset * 10, 0, 10, 20)] as unknown as DOMRectList;
+          }
+        }
+        return [] as unknown as DOMRectList;
+      }) as unknown as () => DOMRectList;
+      return r;
+    });
+
+    const cleanup = installGlobalZoomedInputCaretFix(document);
+    try {
+      // 1. Both <textarea> and <input>: active compositionstart protects caret against collapsed click;
+      // after compositionend, click calibrates accurately to offset 6.
+      for (const target of [ta, inputEl]) {
+        target.focus();
+        target.setSelectionRange(2, 2);
+        target.dispatchEvent(new Event('compositionstart', { bubbles: true }));
+        target.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          clientX: (10 + 62) * 1.25,
+          clientY: (10 + 10) * 1.25,
+          detail: 1,
+        }));
+        expect(target.selectionStart).toBe(2);
+        expect(target.selectionEnd).toBe(2);
+
+        target.dispatchEvent(new Event('compositionend', { bubbles: true }));
+        target.dispatchEvent(new MouseEvent('click', {
+          bubbles: true,
+          clientX: (10 + 62) * 1.25,
+          clientY: (10 + 10) * 1.25,
+          detail: 1,
+        }));
+        expect(target.selectionStart).toBe(6);
+        expect(target.selectionEnd).toBe(6);
+      }
+
+      // 2. Per-element isolation: ta composing must NOT block calibration on inputEl
+      ta.setSelectionRange(1, 1);
+      inputEl.setSelectionRange(0, 0);
+      ta.dispatchEvent(new Event('compositionstart', { bubbles: true }));
+      inputEl.dispatchEvent(new MouseEvent('click', {
+        bubbles: true,
+        clientX: (10 + 62) * 1.25,
+        clientY: (10 + 10) * 1.25,
+        detail: 1,
+      }));
+      expect(inputEl.selectionStart).toBe(6);
+      ta.dispatchEvent(new Event('compositionend', { bubbles: true }));
+    } finally {
+      cleanup();
+    }
+  });
 });

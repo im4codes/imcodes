@@ -522,6 +522,19 @@ export function installGlobalZoomedInputCaretFix(
   let downX = 0;
   let downY = 0;
   let dragMoved = false;
+  const composingInputs = new WeakSet<EventTarget>();
+
+  const onCompositionStart = (event: CompositionEvent) => {
+    if (isZoomCaretTargetInput(event.target)) {
+      composingInputs.add(event.target);
+    }
+  };
+
+  const onCompositionEnd = (event: Event) => {
+    if (event.target) {
+      composingInputs.delete(event.target);
+    }
+  };
 
   const onPointerDown = (event: PointerEvent) => {
     if (event.button !== undefined && event.button !== 0) {
@@ -550,6 +563,7 @@ export function installGlobalZoomedInputCaretFix(
     if (moved || event.shiftKey || event.detail > 1) return;
     if (event.clientX === 0 && event.clientY === 0 && event.detail === 0 && !sameTarget) return;
     if (!isZoomCaretTargetInput(event.target)) return;
+    if (composingInputs.has(event.target)) return;
 
     const input = event.target;
     if (input.selectionStart !== null && input.selectionEnd !== null && input.selectionStart !== input.selectionEnd) {
@@ -565,12 +579,18 @@ export function installGlobalZoomedInputCaretFix(
     }
   };
 
+  doc.addEventListener('compositionstart', onCompositionStart, true);
+  doc.addEventListener('compositionend', onCompositionEnd, true);
+  doc.addEventListener('blur', onCompositionEnd, true);
   doc.addEventListener('pointerdown', onPointerDown, true);
   doc.addEventListener('pointermove', onPointerMove, true);
   doc.addEventListener('click', onClick, true);
 
   return () => {
     installedDocuments.delete(doc);
+    doc.removeEventListener('compositionstart', onCompositionStart, true);
+    doc.removeEventListener('compositionend', onCompositionEnd, true);
+    doc.removeEventListener('blur', onCompositionEnd, true);
     doc.removeEventListener('pointerdown', onPointerDown, true);
     doc.removeEventListener('pointermove', onPointerMove, true);
     doc.removeEventListener('click', onClick, true);
