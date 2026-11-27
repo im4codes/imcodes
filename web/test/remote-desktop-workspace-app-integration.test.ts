@@ -19,7 +19,12 @@ describe('remote desktop workspace App integration', () => {
     const group = appSource.indexOf('<div class="controlled-nodes-shortcut-group">');
     expect(group).toBeGreaterThan(-1);
     const groupEnd = appSource.indexOf('</div>', appSource.indexOf('<ControlledNodeQuickMenu', group));
-    const next = appSource.slice(groupEnd, groupEnd + 600);
+    const controlStart = appSource.indexOf('<DaemonRemoteDesktopControl', groupEnd);
+    expect(controlStart).toBeGreaterThan(-1);
+    expect(appSource.indexOf('<', groupEnd + '</div>'.length)).toBe(controlStart);
+    const controlEnd = appSource.indexOf('/>', controlStart);
+    expect(controlEnd).toBeGreaterThan(controlStart);
+    const next = appSource.slice(controlStart, controlEnd + 2);
     expect(next).toMatch(/<DaemonRemoteDesktopControl[\s\S]*?compact[\s\S]*?onOpen=\{openRemoteDesktop\}/);
   });
 

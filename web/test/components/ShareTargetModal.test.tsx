@@ -16,6 +16,7 @@ const {
   composerHydrationGate,
   wsSendSessionCommandMock,
   wsSendMock,
+  apiBaseUrlState,
 } = vi.hoisted(() => ({
   uploadFileWithDirectFallbackMock: vi.fn(),
   apiFetchMock: vi.fn(),
@@ -29,6 +30,9 @@ const {
   },
   wsSendSessionCommandMock: vi.fn(),
   wsSendMock: vi.fn(),
+  apiBaseUrlState: {
+    current: 'http://localhost',
+  },
 }));
 
 if (!HTMLElement.prototype.scrollIntoView) {
@@ -89,12 +93,15 @@ vi.mock('../../src/api.js', () => {
     DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS: 15_000,
     apiFetch: (...args: unknown[]) => apiFetchMock(...args),
     clearApiKey: vi.fn(),
-    configure: vi.fn(),
+    configure: vi.fn((baseUrl?: string) => {
+      apiBaseUrlState.current = (baseUrl ?? 'http://localhost').replace(/\/$/, '');
+    }),
     configureExpectedUserId: vi.fn(),
     configureApiKey: vi.fn(),
     discoverSharedEntries: vi.fn(async () => []),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
     getApiKey: vi.fn(() => 'api-key-1'),
+    getApiBaseUrl: vi.fn(() => apiBaseUrlState.current),
     listManagedSharesForServer: vi.fn(async () => []),
     listP2pRuns: vi.fn(async () => []),
     normalizeLocalWebPreviewPath: (p: string) => (p.startsWith('/') ? p : `/${p}`),
@@ -404,6 +411,7 @@ const makeSession = (overrides: Partial<SessionInfo> & { name: string }): Sessio
 
 describe('ShareTargetModal & shared session attachment upload', () => {
   beforeEach(() => {
+    apiBaseUrlState.current = 'http://localhost';
     uploadFileWithDirectFallbackMock.mockReset();
     sessionStorage.clear();
     localStorage.clear();
