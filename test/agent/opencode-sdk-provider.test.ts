@@ -4970,4 +4970,48 @@ describe('OpenCodeSdkProvider', () => {
     expect(completes[0].content).toBe('Healthy follow-up');
     await p.disconnect();
   });
+
+  it('heals @opencode/sdk SignedOutError (401 Reconnect OpenCode Console to continue) on opencode turns while rejecting 403 or third-party turns', async () => {
+    const h = createHarness();
+    h.client.model.list.mockResolvedValue({
+      data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }],
+    });
+    h.credentials.push({ id: 'cred-signed-out', integrationID: 'opencode', active: true, value: { type: 'key', key: 'sk-dead' } } as any);
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', h.queue.close, { once: true });
+      return { client: h.client as any, server: h.server };
+    });
+
+    const p = new OpenCodeSdkProvider();
+    const completes: any[] = [];
+    const errors: any[] = [];
+    p.onComplete((_s, m) => completes.push(m));
+    p.onError((_s, e) => errors.push(e));
+    await p.connect({});
+    const routeId = await p.createSession({ sessionKey: 'route-signed-out', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+    await p.send(routeId, 'hello signed out');
+
+    h.queue.push({
+      type: 'session.step.failed',
+      data: {
+        sessionID: 'oc-session-1',
+        assistantMessageID: 'msg-1',
+        error: {
+          type: 'provider.auth',
+          status: 401,
+          message: 'Reconnect OpenCode Console to continue.',
+          response: { body: JSON.stringify({ error: { type: 'authentication_error', message: 'Reconnect OpenCode Console to continue.' } }) },
+        },
+      },
+    });
+    await vi.waitFor(() => expect(h.client.credential.remove).toHaveBeenCalledWith({ credentialID: 'cred-signed-out' }));
+    await vi.waitFor(() => expect(h.client.sessions.prompt).toHaveBeenCalledTimes(2));
+
+    h.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-2', ordinal: 0, delta: 'Healed SignedOutError' } });
+    h.queue.push({ type: 'session.step.ended', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-2', finish: 'stop' } });
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+    expect(completes[0].content).toBe('Healed SignedOutError');
+    expect(errors).toHaveLength(0);
+    await p.disconnect();
+  });
 });

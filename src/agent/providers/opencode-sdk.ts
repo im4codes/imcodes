@@ -1155,7 +1155,8 @@ function isExpiredOpenCodeAuthError(error: unknown, sessionProviderId: string | 
   const isStatuslessSdkAuth = status === undefined && (errorType === 'provider.auth' || errorName.includes('providerautherror'));
   const hasExpiredKeyMarker = code === 'api_key_expired'
     || /\bapi_key_expired\b/.test(combined)
-    || /\bapi[_ ]?key[^a-z0-9]{1,8}expired\b/.test(combined);
+    || /\bapi[_ ]?key[^a-z0-9]{1,8}expired\b/.test(combined)
+    || /\breconnect opencode console to continue\b/.test(combined);
   return (is401 || isStatuslessSdkAuth) && hasExpiredKeyMarker;
 }
 
