@@ -33,7 +33,9 @@ import { emitSessionStateProbeCorrection } from './session-state-probe-events.js
 import {
   SESSION_DB_FILE,
   SESSION_DB_LEGACY_IMPORT_DONE,
+  SESSION_DB_LEGITIMATE_EMPTY_VALUE,
   SESSION_DB_META_LEGACY_IMPORT,
+  SESSION_DB_META_LEGITIMATE_EMPTY,
   EmptyStoreRefusal,
   closeSessionDb,
   commitSessionChanges,
@@ -74,6 +76,15 @@ import { registerMemoryProbe } from '../daemon/memory-probes.js';
 import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, removeStoredIdentity } from './session-record-blobs.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 import { cleanupIdentityBackups, type IdentityBackupCleanupDeps } from './session-identity-backups.js';
+import {
+  areClosedSessionRemovalsAuthorized,
+  authorizeClosedSessionRemoval,
+  clearClosedSessionRemovalAuthorizations,
+  pruneClosedSessionRemovalAuthorizations,
+  revokeClosedSessionRemovalAuthorization,
+} from './session-removal-auth.js';
+
+export { authorizeClosedSessionRemoval };
 
 const DEBOUNCE_MS = 500;
 const SESSION_STORE_DISK_VERSION = 2;
@@ -402,6 +413,7 @@ export function resetSessionStoreAuthorityForTests(): void {
   storeWriteAuthority = null;
   storeLoaded = false;
   allowEmptyStoreWrite = false;
+  clearClosedSessionRemovalAuthorizations();
   warnedReadOnlyWrite = false;
   closeSessionDb(writerDb);
   writerDb = null;
@@ -590,6 +602,7 @@ function writerHandle(targetPath: string): SessionDbHandle {
   knownBlobHashes = new Set();
   blobTextByHash.clear();
   dirtyNames.clear();
+  clearClosedSessionRemovalAuthorizations();
   fullSweepRequested = true;
   lastBackupAt = 0;
   writerDb = openSessionDbForWrite(targetPath);
@@ -800,7 +813,10 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
       // The identity prompt is not session state: rows an older build stored it in are cleaned BEFORE they are read.
       const identityScrub = removeStoredIdentityFromDatabase(handle);
       let payloads = readSessionPayloads(handle);
-      if (payloads.size === 0) {
+      if (
+        payloads.size === 0
+        && readSessionDbMeta(handle, SESSION_DB_META_LEGITIMATE_EMPTY) !== SESSION_DB_LEGITIMATE_EMPTY_VALUE
+      ) {
         const restored = restoreFromDatabaseSnapshot(handle, targetPath);
         if (restored) { payloads = restored; dirty = true; }
       }
@@ -1031,12 +1047,22 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
         }
         if (row.blobs) row.blobs = row.blobs.filter((blob) => !knownBlobHashes.has(blob.hash));
       }
-      commitSessionChanges(handle, { upserts, deletes, allowEmpty: allowEmptyStoreWrite, collectBlobs });
+      const allowEmptyForCommit = allowEmptyStoreWrite || areClosedSessionRemovalsAuthorized(deletes);
+      commitSessionChanges(handle, {
+        upserts,
+        deletes,
+        allowEmpty: allowEmptyForCommit,
+        markLegitimateEmpty: allowEmptyForCommit,
+        collectBlobs,
+      });
       for (const row of upserts) {
         committedPayloads.set(row.name, row.payload);
         for (const blob of row.blobs ?? []) knownBlobHashes.add(blob.hash);
       }
-      for (const name of deletes) committedPayloads.delete(name);
+      for (const name of deletes) {
+        committedPayloads.delete(name);
+        revokeClosedSessionRemovalAuthorization(name);
+      }
       if (collectBlobs || deletes.length > 0) {
         knownBlobHashes = listSessionBlobHashes(handle);
         pruneBlobTexts();
@@ -1050,6 +1076,7 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
       allowEmptyStoreWrite = false;
       scheduleCompatExport(targetPath);
     }
+    pruneClosedSessionRemovalAuthorizations((name) => committedPayloads.has(name) || Boolean(store.sessions[name]));
     if (sweep) { lastFullSweepAt = Date.now(); fullSweepRequested = false; }
     maybeStartSnapshot(handle, targetPath);
   } catch (error) {
@@ -1413,6 +1440,7 @@ function didRuntimeAuthorityChange(existing: SessionRecord, incoming: SessionRec
 }
 
 export function upsertSession(record: SessionRecord): void {
+  revokeClosedSessionRemovalAuthorization(record.name);
   const existing = store.sessions[record.name];
   // Sticky execution-clone marker (P0). `upsertSession` REPLACES the whole
   // record, but incidental record rebuilds — sub-session launch, provider-id

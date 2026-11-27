@@ -9,6 +9,7 @@ import { isTransportAgent } from '../agent/detect.js';
 import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { createRuntimeEpoch, upsertSession, getSession, removeSession, type SessionRecord } from '../store/session-store.js';
+import { authorizeClosedSessionRemoval } from '../store/session-removal-auth.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -562,6 +563,7 @@ export async function stopSubSession(
       }
       clearResend(sessionName, 'session_removed');
       clearSessionRestartContinuation(sessionName);
+      authorizeClosedSessionRemoval(sessionName);
       removeSession(sessionName);
       timelineEmitter.forgetSession(sessionName);
       notifySessionTeardown(sessionName);

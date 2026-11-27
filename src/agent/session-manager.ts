@@ -62,6 +62,7 @@ import {
   type SessionRecord,
   type SessionState,
 } from '../store/session-store.js';
+import { authorizeClosedSessionRemoval } from '../store/session-removal-auth.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { hookCredentialEnv, mintHookCredential } from '../daemon/hook-session-credential.js';
 import logger from '../util/logger.js';
@@ -538,6 +539,7 @@ export async function stopProject(
             serverLink.send({ type: 'subsession.closed', id, sessionName: record.name });
           }
         }
+        authorizeClosedSessionRemoval(record.name);
         removeSession(record.name);
         clearTransportRestoreBackoff(record.name);
         // Session is gone — free its in-memory timeline ring buffer + dedup maps

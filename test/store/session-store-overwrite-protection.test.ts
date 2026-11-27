@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import {
+  authorizeClosedSessionRemoval,
   authorizeEmptySessionStoreWrite,
   configureSessionStoreWriteAuthority,
   flushStore,
@@ -10,6 +11,7 @@ import {
   listSessions,
   removeSession,
   resetSessionStoreAuthorityForTests,
+  setSessionStoreBackupIntervalMsForTests,
   upsertSession,
   waitForSessionStoreSnapshotForTests,
   type SessionRecord,
@@ -64,6 +66,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  setSessionStoreBackupIntervalMsForTests(undefined);
   resetSessionStoreAuthorityForTests();
   vi.unstubAllEnvs();
   await rm(home, { recursive: true, force: true });
@@ -151,6 +154,66 @@ describe('session-store ownership and recovery', () => {
     expect(listSessions().map((session) => session.name)).toEqual(['deck_store_owner_brain']);
     await flushStore();
     expect(persistedSessions(home).deck_store_owner_brain).toBeDefined();
+  });
+
+  it('confirmed closed-session removals persist an empty store past backup snapshots, then restore recovery resumes once non-empty rows exist', async () => {
+    await installOwner();
+    await loadStore();
+    upsertSession(record('deck_store_owner_brain'));
+    upsertSession({ ...record('deck_sub_tree_1'), parentSession: 'deck_store_owner_brain' });
+    await flushStore();
+    await waitForSessionStoreSnapshotForTests();
+    expect(await readdir(join(home, '.imcodes'))).toContain('sessions.sqlite.bak.1');
+
+    authorizeClosedSessionRemoval('deck_store_owner_brain');
+    removeSession('deck_store_owner_brain');
+    authorizeClosedSessionRemoval('deck_sub_tree_1');
+    removeSession('deck_sub_tree_1');
+    await flushStore();
+    expect(persistedSessions(home)).toEqual({});
+
+    resetSessionStoreAuthorityForTests();
+    await installOwner();
+    await loadStore();
+    expect(listSessions()).toEqual([]);
+
+    // Writing a new session clears the legitimate-empty marker so accidental emptying restores again.
+    setSessionStoreBackupIntervalMsForTests(0);
+    upsertSession(record('deck_store_reborn_brain'));
+    await flushStore();
+    await waitForSessionStoreSnapshotForTests();
+    replacePersistedSessions(home, []);
+    resetSessionStoreAuthorityForTests();
+    await installOwner();
+    await loadStore();
+    expect(listSessions().map((session) => session.name)).toEqual(['deck_store_reborn_brain']);
+  });
+
+  it('scopes empty-store authorization to the exact closed names and keeps unauthorized or partial-failure rows intact', async () => {
+    await installOwner();
+    await loadStore();
+    upsertSession(record('deck_store_owner_brain'));
+    upsertSession(record('deck_store_other_w1'));
+    await flushStore();
+    const before = persistedSessions(home);
+
+    // Authorizing one closed session must not allow an unauthorized removeSession to wipe the rest.
+    authorizeClosedSessionRemoval('deck_store_owner_brain');
+    removeSession('deck_store_owner_brain');
+    removeSession('deck_store_other_w1');
+    await flushStore();
+    expect(persistedSessions(home)).toEqual(before);
+
+    // Partial close failure: the surviving session stays in error state while the closed one is removed.
+    upsertSession({ ...record('deck_store_other_w1'), state: 'error', error: 'close failed' });
+    await flushStore();
+    expect(persistedSessions(home).deck_store_owner_brain).toBeUndefined();
+    expect(persistedSessions(home).deck_store_other_w1?.state).toBe('error');
+
+    resetSessionStoreAuthorityForTests();
+    await installOwner();
+    await loadStore();
+    expect(listSessions().map((session) => session.name)).toEqual(['deck_store_other_w1']);
   });
 
   it('test mode rejects the real HOME even when VITEST is absent', async () => {
