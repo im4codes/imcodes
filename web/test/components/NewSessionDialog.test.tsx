@@ -1322,15 +1322,93 @@ describe('NewSessionDialog', () => {
     fireEvent.input(projectInput, { target: { value: 'My App!' } });
     expect(dirInput.value).toBe('~/.imcodes/projects/my_app');
 
+    fireEvent.input(projectInput, { target: { value: '无论' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
+
     fireEvent.input(projectInput, { target: { value: '我的项目' } });
     expect(dirInput.value).toBe(buildReadableProjectDir('我的项目'));
-    expect(dirInput.value).toMatch(/^~\/\.imcodes\/projects\/wo_de_xiang_mu--[0-9a-z]{8}$/);
+    expect(dirInput.value).toBe('~/.imcodes/projects/wo_de_xiang_mu');
+
+    fireEvent.input(projectInput, { target: { value: 'my-project' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/my_project');
 
     fireEvent.input(projectInput, { target: { value: '../../etc/passwd' } });
     expect(dirInput.value).toBe('~/.imcodes/projects/etc_passwd');
 
     fireEvent.input(projectInput, { target: { value: '   ' } });
     expect(dirInput.value).toBe('~/.imcodes/projects/');
+  });
+
+  it('queries ~/.imcodes/projects once on mount, appends _1/_2/_3 only when colliding, and does not override manual dir edits', async () => {
+    const ws = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'ls-req-1'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    const rendered = render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    const projectInput = screen.getByPlaceholderText('my-project') as HTMLInputElement;
+    const dirInput = screen.getByPlaceholderText('~/.imcodes/projects/my-project') as HTMLInputElement;
+
+    expect(ws.fsListDir).toHaveBeenCalledTimes(1);
+    expect(ws.fsListDir).toHaveBeenCalledWith('~/.imcodes/projects', true, false);
+
+    // Before fs.ls_response arrives, default dir has no random suffix
+    fireEvent.input(projectInput, { target: { value: '无论' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
+    expect(ws.fsListDir).toHaveBeenCalledTimes(1);
+
+    // Unmatched requestId is ignored
+    act(() => ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'other-req',
+      status: 'ok',
+      entries: [{ name: 'wu_lun', isDir: true }],
+    }));
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
+
+    // Matching response with existing wu_lun and wu_lun_1 increments dir to wu_lun_2
+    act(() => ws.emit({
+      type: 'fs.ls_response',
+      requestId: 'ls-req-1',
+      status: 'ok',
+      entries: [
+        { name: 'wu_lun', isDir: true },
+        { name: 'wu_lun_1', isDir: true },
+      ],
+    }));
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun_2');
+
+    // Manual edit locks dir against late fs.ls_response updates
+    rendered.unmount();
+    const ws2 = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'ls-req-2'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    const second = render(<NewSessionDialog ws={ws2 as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    const projectInput2 = screen.getByPlaceholderText('my-project') as HTMLInputElement;
+    const dirInput2 = screen.getByPlaceholderText('~/.imcodes/projects/my-project') as HTMLInputElement;
+    fireEvent.input(projectInput2, { target: { value: '无论' } });
+    fireEvent.input(dirInput2, { target: { value: '/custom/wu_lun' } });
+
+    act(() => ws2.emit({
+      type: 'fs.ls_response',
+      requestId: 'ls-req-2',
+      status: 'ok',
+      entries: [{ name: 'wu_lun', isDir: true }],
+    }));
+    expect(dirInput2.value).toBe('/custom/wu_lun');
+
+    // Unmounting before response arrives cleans up owned data request
+    second.unmount();
+    const ws3 = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'ls-req-3'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    const third = render(<NewSessionDialog ws={ws3 as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    third.unmount();
+    expect(ws3.forgetOwnedDataRequest).toHaveBeenCalledWith('ls-req-3');
   });
 
   it('stops auto-updating dir once the user manually edits the dir input or picks via FileBrowser', async () => {
@@ -1794,7 +1872,7 @@ describe('NewSessionDialog', () => {
     await waitFor(() => expect((screen.getAllByRole('combobox')[1] as HTMLSelectElement).value).toBe('gpt-6.5-sol'));
   });
 
-  it('auto-populates readable ASCII working directory for non-ASCII project names without collisions while preserving sanitizeProjectName and manual dir lock', async () => {
+  it('auto-populates readable underscore-only ASCII working directory without random suffixes and increments _1/_2 only on existing dirs while preserving sanitizeProjectName and manual dir lock', async () => {
     const ws = makeWs();
     render(<NewSessionDialog serverId="srv-cjk" ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
@@ -1803,30 +1881,13 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(projectInput, { target: { value: '我的项目' } });
     const zhDir = dirInput.value;
-    expect(zhDir).toMatch(/^~\/\.imcodes\/projects\/wo_de_xiang_mu--[0-9a-z]{8}$/);
+    expect(zhDir).toBe('~/.imcodes/projects/wo_de_xiang_mu');
 
-    fireEvent.input(projectInput, { target: { value: 'wo_de_xiang_mu' } });
-    expect(dirInput.value).toBe('~/.imcodes/projects/wo_de_xiang_mu');
-    expect(dirInput.value).not.toBe(zhDir);
-
-    fireEvent.input(projectInput, { target: { value: '市' } });
-    const shi1Dir = dirInput.value;
-    fireEvent.input(projectInput, { target: { value: '是' } });
-    const shi2Dir = dirInput.value;
-    expect(shi1Dir).toMatch(/^~\/\.imcodes\/projects\/shi--[0-9a-z]{8}$/);
-    expect(shi2Dir).toMatch(/^~\/\.imcodes\/projects\/shi--[0-9a-z]{8}$/);
-    expect(shi1Dir).not.toBe(shi2Dir);
-
-    const long1 = `${'a'.repeat(65)}1`;
-    const long2 = `${'a'.repeat(65)}2`;
-    fireEvent.input(projectInput, { target: { value: long1 } });
-    const longDir1 = dirInput.value;
-    fireEvent.input(projectInput, { target: { value: long2 } });
-    const longDir2 = dirInput.value;
-    expect(longDir1).not.toBe(longDir2);
+    fireEvent.input(projectInput, { target: { value: 'my-app' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/my_app');
 
     fireEvent.input(projectInput, { target: { value: '日本語テスト' } });
-    expect(dirInput.value).toMatch(/^~\/\.imcodes\/projects\/ri_ben_yu_tesuto--[0-9a-z]{8}$/);
+    expect(dirInput.value).toBe('~/.imcodes/projects/ri_ben_yu_tesuto');
 
     // Empty/whitespace resets back to base projects dir.
     fireEvent.input(projectInput, { target: { value: '   ' } });

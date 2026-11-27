@@ -2,30 +2,10 @@ import anyAscii from 'any-ascii';
 import { DEFAULT_PROJECTS_DIR_PREFIX, sanitizeProjectName } from '@shared/sanitize-project-name.js';
 
 const MAX_PROJECT_DIR_SLUG_LENGTH = 64;
-const DISAMBIGUATION_SEPARATOR = '--';
-const DISAMBIGUATION_HASH_LENGTH = 8;
-const MAX_DISAMBIGUATED_PREFIX_LENGTH =
-  MAX_PROJECT_DIR_SLUG_LENGTH - DISAMBIGUATION_SEPARATOR.length - DISAMBIGUATION_HASH_LENGTH;
 const WINDOWS_RESERVED_NAME_RE = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
 // Separate CJK/Hangul script runs from ASCII & Latin-script runs so CJK TitleCase syllables
 // (`WoDeXiangMu`) gain `_` separators without splitting Latin words with diacritics (`diseño` -> `diseno`).
 const CJK_SCRIPT_RUN_RE = /\p{Script=Han}+|\p{Script=Hiragana}+|\p{Script=Katakana}+|\p{Script=Hangul}+/gu;
-
-/** Deterministic 8-char base36 digest using two independent 32-bit mixers so distinct canonical IDs do not collide. */
-function hashCanonicalSlug(input: string): string {
-  let h1 = 0x811c9dc5;
-  let h2 = 0x9e3779b9;
-  for (let i = 0; i < input.length; i++) {
-    const code = input.charCodeAt(i);
-    h1 ^= code;
-    h1 = Math.imul(h1, 0x01000193);
-    h2 ^= code + ((i + 1) & 0xff);
-    h2 = Math.imul(h2, 0x85ebca6b);
-  }
-  const part1 = (h1 >>> 0).toString(36).padStart(6, '0').slice(-4);
-  const part2 = (h2 >>> 0).toString(36).padStart(6, '0').slice(-4);
-  return `${part1}${part2}`;
-}
 
 function transliterateWithBoundaries(raw: string): string {
   const tokens: string[] = [];
@@ -53,46 +33,99 @@ function transliterateWithBoundaries(raw: string): string {
 
 /**
  * Convert a human project name (across all supported Unicode scripts) into a clean,
- * readable, cross-platform ASCII folder slug safe across POSIX, macOS, and Windows.
- * Any lossy transliteration, truncation past 64 chars, or Windows reserved name retains
- * a deterministic `--<hash>` disambiguation suffix derived from `sanitizeProjectName`
- * so distinct projects never silently merge onto the same working directory.
+ * readable, cross-platform ASCII folder slug using underscores (`_`) only.
+ * Never appends a random/hash suffix; only increments Windows reserved names safely.
  */
 export function transliterateProjectDirSlug(rawProject: string): string {
   const trimmed = rawProject.trim();
   if (!trimmed) return 'proj';
 
-  const canonicalId = sanitizeProjectName(trimmed);
   let slug = transliterateWithBoundaries(trimmed)
     .toLowerCase()
-    .replace(/[^a-z0-9_-]+/g, '_')
-    .replace(/-+/g, '-')
+    .replace(/[^a-z0-9_]+/g, '_')
     .replace(/_+/g, '_')
-    .replace(/(?:_-|-_)+/g, '_')
-    .replace(/^[_-]+|[_-]+$/g, '');
+    .replace(/^_+|_+$/g, '');
 
   if (!slug) {
-    slug = canonicalId || 'proj';
+    const canonicalFallback = sanitizeProjectName(trimmed)
+      .toLowerCase()
+      .replace(/[^a-z0-9_]+/g, '_')
+      .replace(/_+/g, '_')
+      .replace(/^_+|_+$/g, '');
+    slug = canonicalFallback || 'proj';
   }
 
-  const lossyTransliteration = slug.replace(/-/g, '_') !== canonicalId;
-  const truncated = slug.length > MAX_PROJECT_DIR_SLUG_LENGTH;
-  const windowsReserved = WINDOWS_RESERVED_NAME_RE.test(slug);
+  slug = slug.slice(0, MAX_PROJECT_DIR_SLUG_LENGTH).replace(/_+$/g, '') || 'proj';
 
-  if (lossyTransliteration || truncated || windowsReserved) {
-    const prefix = slug.slice(0, MAX_DISAMBIGUATED_PREFIX_LENGTH).replace(/[_-]+$/g, '') || 'proj';
-    return `${prefix}${DISAMBIGUATION_SEPARATOR}${hashCanonicalSlug(canonicalId)}`;
+  if (WINDOWS_RESERVED_NAME_RE.test(slug)) {
+    return `${slug}_1`;
   }
 
   return slug;
 }
 
 /**
+ * Resolve a collision-free project directory slug against `existingNames` (case-insensitive).
+ * Returns `baseSlug` directly when no collision exists; otherwise appends `_1`, `_2`, `_3`, ...
+ * while respecting `<= 64` characters and avoiding double/trailing underscores or `con_1_1`.
+ */
+export function resolveUniqueProjectDirSlug(
+  baseSlug: string,
+  existingNames?: Iterable<string> | null,
+): string {
+  const cleanBase = baseSlug
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, MAX_PROJECT_DIR_SLUG_LENGTH)
+    .replace(/_+$/g, '') || 'proj';
+
+  const existing = new Set<string>();
+  if (existingNames) {
+    for (const name of existingNames) {
+      if (typeof name !== 'string') continue;
+      const normalized = name.trim().toLowerCase();
+      if (normalized) existing.add(normalized);
+    }
+  }
+
+  const isDirectReserved = WINDOWS_RESERVED_NAME_RE.test(cleanBase);
+  if (!isDirectReserved && !existing.has(cleanBase)) {
+    return cleanBase;
+  }
+
+  // If `cleanBase` is already `<reserved>_1` (produced by transliterateProjectDirSlug('CON'))
+  // and collides, continue numbering (`con_2`, `con_3`, ...) instead of producing `con_1_1`.
+  const reservedBaseMatch = cleanBase.endsWith('_1')
+    ? cleanBase.slice(0, -2)
+    : null;
+  const isSuffixedReserved = Boolean(reservedBaseMatch && WINDOWS_RESERVED_NAME_RE.test(reservedBaseMatch));
+  const numberingRoot = isSuffixedReserved ? reservedBaseMatch! : cleanBase;
+  const startIndex = isDirectReserved ? 1 : (isSuffixedReserved ? 2 : 1);
+
+  for (let n = startIndex; ; n += 1) {
+    const suffix = `_${n}`;
+    const maxPrefixLen = Math.max(1, MAX_PROJECT_DIR_SLUG_LENGTH - suffix.length);
+    const prefix = numberingRoot.slice(0, maxPrefixLen).replace(/_+$/g, '') || 'proj';
+    const candidate = `${prefix}${suffix}`;
+    if (!existing.has(candidate)) {
+      return candidate;
+    }
+  }
+}
+
+/**
  * Build the default New Session working directory path `~/.imcodes/projects/<readable-slug>`
  * without altering `sanitizeProjectName` used for internal session IDs.
  */
-export function buildReadableProjectDir(rawProject: string): string {
+export function buildReadableProjectDir(
+  rawProject: string,
+  existingNames?: Iterable<string> | null,
+): string {
   const trimmed = rawProject.trim();
   if (!trimmed) return DEFAULT_PROJECTS_DIR_PREFIX;
-  return `${DEFAULT_PROJECTS_DIR_PREFIX}${transliterateProjectDirSlug(trimmed)}`;
+  const baseSlug = transliterateProjectDirSlug(trimmed);
+  return `${DEFAULT_PROJECTS_DIR_PREFIX}${resolveUniqueProjectDirSlug(baseSlug, existingNames)}`;
 }

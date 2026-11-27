@@ -137,6 +137,11 @@ export function NewSessionDialog({
   const [project, setProject] = useState("");
   const [dir, setDir] = useState(DEFAULT_PROJECTS_DIR_PREFIX);
   const [dirManuallyEdited, setDirManuallyEdited] = useState(false);
+  const [existingProjectEntries, setExistingProjectEntries] = useState<string[]>([]);
+  const projectRef = useRef(project);
+  projectRef.current = project;
+  const dirManuallyEditedRef = useRef(dirManuallyEdited);
+  dirManuallyEditedRef.current = dirManuallyEdited;
   const [gitRemoteUrl, setGitRemoteUrl] = useState("");
   const [agentType, setAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
   const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
@@ -403,6 +408,39 @@ export function NewSessionDialog({
     }
     return unsub;
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ws]);
+
+  useEffect(() => {
+    if (!ws || typeof ws.fsListDir !== "function" || typeof ws.onMessage !== "function") return;
+    let disposed = false;
+    let pendingRequestId: string | null = null;
+    const unsub = ws.onMessage((msg) => {
+      if (disposed || msg.type !== "fs.ls_response") return;
+      const lsMsg = msg as { requestId?: unknown; status?: unknown; entries?: Array<{ name?: unknown }> };
+      if (!pendingRequestId || lsMsg.requestId !== pendingRequestId) return;
+      pendingRequestId = null;
+      if (lsMsg.status !== "ok" || !Array.isArray(lsMsg.entries)) return;
+      const names = lsMsg.entries
+        .map((entry) => (typeof entry?.name === "string" ? entry.name.trim() : ""))
+        .filter(Boolean);
+      setExistingProjectEntries(names);
+      if (!dirManuallyEditedRef.current && projectRef.current.trim()) {
+        setDir(buildReadableProjectDir(projectRef.current, names));
+      }
+    });
+    try {
+      pendingRequestId = ws.fsListDir(DEFAULT_PROJECTS_DIR_PREFIX.replace(/\/+$/, ""), true, false);
+    } catch {
+      pendingRequestId = null;
+    }
+    return () => {
+      disposed = true;
+      if (pendingRequestId) {
+        ws.forgetOwnedDataRequest?.(pendingRequestId);
+        pendingRequestId = null;
+      }
+      unsub();
+    };
   }, [ws]);
 
   // Recover the refresh button cleanly when an older daemon never replies to session.detect_agents.
@@ -889,7 +927,7 @@ export function NewSessionDialog({
               const nextProject = (e.target as HTMLInputElement).value;
               setProject(nextProject);
               if (!dirManuallyEdited) {
-                setDir(buildReadableProjectDir(nextProject));
+                setDir(buildReadableProjectDir(nextProject, existingProjectEntries));
               }
               setError("");
             }}
