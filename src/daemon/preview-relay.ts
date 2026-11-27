@@ -51,40 +51,50 @@ type PreviewDispatcherCtor = new (opts: { bodyTimeout?: number }) => PreviewHttp
 
 let previewBodyTimeoutOverrideMs: number | null = null;
 let cachedDispatcherCtor: PreviewDispatcherCtor | null | undefined;
+let dispatcherCtorPromise: Promise<PreviewDispatcherCtor | null> | null = null;
 let activePreviewDispatcher: PreviewHttpDispatcher | null = null;
 let activePreviewDispatcherTimeoutMs: number | null = null;
+let dispatcherInitPromise: Promise<PreviewHttpDispatcher | undefined> | null = null;
+let dispatcherInitTimeoutMs: number | null = null;
 
 async function resolvePreviewDispatcherCtor(): Promise<PreviewDispatcherCtor | null> {
   if (cachedDispatcherCtor !== undefined) return cachedDispatcherCtor;
-  const globalSym = Symbol.for('undici.globalDispatcher.1');
-  const existing = (globalThis as Record<symbol, unknown>)[globalSym] as { constructor?: PreviewDispatcherCtor } | undefined;
-  if (existing && typeof existing.constructor === 'function') {
-    cachedDispatcherCtor = existing.constructor;
-    return cachedDispatcherCtor;
-  }
-  try {
-    const undiciModName = 'undici';
-    const mod = await import(undiciModName) as { Agent?: PreviewDispatcherCtor };
-    if (typeof mod?.Agent === 'function') {
-      cachedDispatcherCtor = mod.Agent;
-      return cachedDispatcherCtor;
-    }
-  } catch {
-    // Fall back to Node's lazy globalDispatcher probe below when undici package is unavailable.
-  }
-  const fetchFn = globalThis.fetch as (typeof fetch & { mock?: unknown }) | undefined;
-  if (typeof fetchFn === 'function' && !fetchFn.mock && String(fetchFn).includes('function fetch(input')) {
-    try {
-      await fetchFn('http://127.0.0.1:1', { signal: AbortSignal.abort() }).catch(() => {});
-      const populated = (globalThis as Record<symbol, unknown>)[globalSym] as { constructor?: PreviewDispatcherCtor } | undefined;
-      if (populated && typeof populated.constructor === 'function') {
-        cachedDispatcherCtor = populated.constructor;
+  if (!dispatcherCtorPromise) {
+    dispatcherCtorPromise = (async () => {
+      const globalSym = Symbol.for('undici.globalDispatcher.1');
+      const existing = (globalThis as Record<symbol, unknown>)[globalSym] as { constructor?: PreviewDispatcherCtor } | undefined;
+      if (existing && typeof existing.constructor === 'function') {
+        cachedDispatcherCtor = existing.constructor;
         return cachedDispatcherCtor;
       }
-    } catch { /* ignore */ }
+      try {
+        const undiciModName = 'undici';
+        const mod = await import(undiciModName) as { Agent?: PreviewDispatcherCtor };
+        if (typeof mod?.Agent === 'function') {
+          cachedDispatcherCtor = mod.Agent;
+          return cachedDispatcherCtor;
+        }
+      } catch {
+        // Fall back to Node's lazy globalDispatcher probe below when undici package is unavailable.
+      }
+      const fetchFn = globalThis.fetch as (typeof fetch & { mock?: unknown }) | undefined;
+      if (typeof fetchFn === 'function' && !fetchFn.mock && String(fetchFn).includes('function fetch(input')) {
+        try {
+          await fetchFn('http://127.0.0.1:1', { signal: AbortSignal.abort() }).catch(() => {});
+          const populated = (globalThis as Record<symbol, unknown>)[globalSym] as { constructor?: PreviewDispatcherCtor } | undefined;
+          if (populated && typeof populated.constructor === 'function') {
+            cachedDispatcherCtor = populated.constructor;
+            return cachedDispatcherCtor;
+          }
+        } catch { /* ignore */ }
+      }
+      cachedDispatcherCtor = null;
+      return null;
+    })().finally(() => {
+      dispatcherCtorPromise = null;
+    });
   }
-  cachedDispatcherCtor = null;
-  return null;
+  return dispatcherCtorPromise;
 }
 
 async function getPreviewFetchDispatcher(): Promise<PreviewHttpDispatcher | undefined> {
@@ -92,16 +102,32 @@ async function getPreviewFetchDispatcher(): Promise<PreviewHttpDispatcher | unde
   if (activePreviewDispatcher && activePreviewDispatcherTimeoutMs === desiredTimeoutMs) {
     return activePreviewDispatcher;
   }
-  const Ctor = await resolvePreviewDispatcherCtor();
-  if (!Ctor) return undefined;
-  if (activePreviewDispatcher) {
-    const prev = activePreviewDispatcher;
-    activePreviewDispatcher = null;
-    try { await prev.close?.(); } catch { /* ignore */ }
+  // Coalesce concurrent cold initializations for the same timeout setting so two
+  // simultaneous requests never close or race each other's newly created Agent.
+  if (!dispatcherInitPromise || dispatcherInitTimeoutMs !== desiredTimeoutMs) {
+    const targetTimeoutMs = desiredTimeoutMs;
+    const pending = (async () => {
+      const Ctor = await resolvePreviewDispatcherCtor();
+      if (!Ctor) return undefined;
+      if (activePreviewDispatcher && activePreviewDispatcherTimeoutMs === targetTimeoutMs) {
+        return activePreviewDispatcher;
+      }
+      const created = new Ctor({ bodyTimeout: targetTimeoutMs });
+      if ((previewBodyTimeoutOverrideMs ?? 0) === targetTimeoutMs) {
+        activePreviewDispatcher = created;
+        activePreviewDispatcherTimeoutMs = targetTimeoutMs;
+      }
+      return created;
+    })().finally(() => {
+      if (dispatcherInitPromise === pending) {
+        dispatcherInitPromise = null;
+        dispatcherInitTimeoutMs = null;
+      }
+    });
+    dispatcherInitTimeoutMs = targetTimeoutMs;
+    dispatcherInitPromise = pending;
   }
-  activePreviewDispatcher = new Ctor({ bodyTimeout: desiredTimeoutMs });
-  activePreviewDispatcherTimeoutMs = desiredTimeoutMs;
-  return activePreviewDispatcher;
+  return dispatcherInitPromise;
 }
 
 /**
@@ -110,6 +136,12 @@ async function getPreviewFetchDispatcher(): Promise<PreviewHttpDispatcher | unde
  */
 export async function __setPreviewFetchBodyTimeoutForTests(timeoutMs: number | null): Promise<void> {
   previewBodyTimeoutOverrideMs = timeoutMs;
+  const inflight = dispatcherInitPromise;
+  dispatcherInitPromise = null;
+  dispatcherInitTimeoutMs = null;
+  if (inflight) {
+    try { await inflight; } catch { /* ignore */ }
+  }
   if (activePreviewDispatcher) {
     const prev = activePreviewDispatcher;
     activePreviewDispatcher = null;

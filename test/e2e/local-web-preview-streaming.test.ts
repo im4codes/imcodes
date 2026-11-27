@@ -771,18 +771,109 @@ describe('E2E: Local Web Preview streaming protocols (real upstreams, real daemo
     cleanups.push(() => relay.__setPreviewFetchBodyTimeoutForTests(null));
 
     // Counterexample: with a finite Undici bodyTimeout (50ms -> trips on ~1s Undici timer), silent SSE aborts.
-    relay.__setPreviewFetchBodyTimeoutForTests(50);
+    await relay.__setPreviewFetchBodyTimeoutForTests(50);
     const failedRelay = bridge.createPreviewRelay('sse-undici-finite', previewId, 10_000);
     injectHttpRequest('sse-undici-finite', upstream.port, '/undici-silent-sse');
     const startedFinite = await failedRelay.start;
     await expect(new Response(startedFinite.body).text()).rejects.toThrow(/TIMEOUT|terminated|Body Timeout/i);
 
     // Production default (null -> Agent({ bodyTimeout: 0 })): survives 1400ms silence and delivers both events cleanly.
-    relay.__setPreviewFetchBodyTimeoutForTests(null);
+    await relay.__setPreviewFetchBodyTimeoutForTests(null);
     const okRelay = bridge.createPreviewRelay('sse-undici-zero', previewId, 10_000);
     injectHttpRequest('sse-undici-zero', upstream.port, '/undici-silent-sse');
     const startedZero = await okRelay.start;
     const text = await new Response(startedZero.body).text();
     expect(text).toBe('data: one\n\ndata: two\n\n');
+  }, 15_000);
+
+  // ── 12. Cold concurrent first dispatcher acquisition + sustained SSE reader + concurrent request ─
+  it('shares one initialized dispatcher across cold concurrent fetches without closing in-flight requests, and keeps an open SSE reader alive across concurrent requests', async () => {
+    let releaseCold1: (() => void) | null = null;
+    let releaseFirstStream: (() => void) | null = null;
+    const upstream = await startHttpUpstream((req, res) => {
+      if (req.url === '/cold-sse-1') {
+        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        res.write('data: /cold-sse-1-first\n\n');
+        releaseCold1 = () => {
+          if (!res.writableEnded) {
+            res.write('data: /cold-sse-1-second\n\n');
+            res.end();
+          }
+        };
+        return;
+      }
+      if (req.url === '/cold-sse-2') {
+        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        res.end('data: /cold-sse-2-only\n\n');
+        return;
+      }
+      if (req.url === '/long-open-sse') {
+        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        res.write('data: open-part-1\n\n');
+        releaseFirstStream = () => {
+          if (!res.writableEnded) {
+            res.write('data: open-part-2\n\n');
+            res.end();
+          }
+        };
+        return;
+      }
+      if (req.url === '/concurrent-api') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    cleanups.push(() => upstream.close());
+
+    // Fresh module graph guarantees cachedDispatcherCtor === undefined & activePreviewDispatcher === null.
+    const { bridge, previewId, injectHttpRequest, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+
+    // 1) Fire two concurrent requests simultaneously in the same tick BEFORE dispatcher is initialized;
+    //    keep cold-1's SSE open while cold-2 finishes, then read cold-1's trailing event.
+    const cold1 = bridge.createPreviewRelay('cold-1', previewId, 10_000);
+    const cold2 = bridge.createPreviewRelay('cold-2', previewId, 10_000);
+    injectHttpRequest('cold-1', upstream.port, '/cold-sse-1');
+    injectHttpRequest('cold-2', upstream.port, '/cold-sse-2');
+    const [started1, started2] = await Promise.all([cold1.start, cold2.start]);
+    const cold1Reader = started1.body.getReader();
+    const cold1First = await cold1Reader.read();
+    expect(Buffer.from(cold1First.value ?? []).toString('utf8')).toBe('data: /cold-sse-1-first\n\n');
+
+    expect(await new Response(started2.body).text()).toBe('data: /cold-sse-2-only\n\n');
+    releaseCold1!();
+    const cold1Tail: string[] = [];
+    while (true) {
+      const n = await cold1Reader.read();
+      if (n.done) break;
+      cold1Tail.push(Buffer.from(n.value).toString('utf8'));
+    }
+    expect(cold1Tail.join('')).toBe('data: /cold-sse-1-second\n\n');
+
+    // 2) Keep one SSE reader actively open & paused mid-stream while another concurrent request runs.
+    const openRelay = bridge.createPreviewRelay('open-sse', previewId, 10_000);
+    injectHttpRequest('open-sse', upstream.port, '/long-open-sse');
+    const startedOpen = await openRelay.start;
+    const openReader = startedOpen.body.getReader();
+    const firstChunk = await openReader.read();
+    expect(Buffer.from(firstChunk.value ?? []).toString('utf8')).toBe('data: open-part-1\n\n');
+
+    const concurrentRelay = bridge.createPreviewRelay('concurrent-after-open', previewId, 10_000);
+    injectHttpRequest('concurrent-after-open', upstream.port, '/concurrent-api');
+    const concurrentStarted = await concurrentRelay.start;
+    const concurrentJson = await new Response(concurrentStarted.body).text();
+    expect(JSON.parse(concurrentJson)).toEqual({ ok: true });
+
+    // Now finish the sustained SSE stream — must STILL be alive and deliver part 2 intact.
+    releaseFirstStream!();
+    const tailChunks: string[] = [];
+    while (true) {
+      const next = await openReader.read();
+      if (next.done) break;
+      tailChunks.push(Buffer.from(next.value).toString('utf8'));
+    }
+    expect(tailChunks.join('')).toBe('data: open-part-2\n\n');
   }, 15_000);
 });
