@@ -14,6 +14,7 @@ import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-que
 import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
+import { __testing__ as transportRelayTesting } from '../../src/daemon/transport-relay.js';
 
 const {
   mockSpawn,
@@ -1190,6 +1191,58 @@ describe('KimiV2Provider', () => {
       cumulativeUsage: { totalTokens: 170000, inputTokens: 160000, outputTokens: 10000 },
     });
 
+    // Turn 5 on sess-a: `used` already includes cached tokens -> subtract consistent breakdown so relay/Web total stays 1000 (not 1200/1250),
+    // and omit unreliable breakdown when cached exceeds `used`.
+    usagesA.length = 0;
+    state.conn.prompt.mockImplementationOnce(async () => {
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: 'usage_update', used: 1000, size: 4096, tokens: { cached: 200 } } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: 'usage_update', used: 1000, size: 4096, tokens: { cached: 1200 } } as never,
+      });
+      return {
+        stopReason: 'end_turn',
+        usage: { totalTokens: 190000, inputTokens: 180000, outputTokens: 10000 },
+        _meta: { used: 1000, size: 4096, cachedReadTokens: 200, cachedWriteTokens: 50 },
+      };
+    });
+    await provider.send('sess-a', 'turn 5');
+    await vi.waitFor(() => expect(completesA).toHaveLength(5));
+    expect(usagesA).toEqual([
+      expect.objectContaining({
+        usage: { input_tokens: 800, cached_input_tokens: 200, cache_read_input_tokens: 200, model_context_window: 4096 },
+      }),
+      expect.objectContaining({
+        usage: { input_tokens: 1000, model_context_window: 4096 },
+      }),
+      expect.objectContaining({
+        finalized: true,
+        usage: {
+          input_tokens: 750,
+          cached_input_tokens: 200,
+          cache_read_input_tokens: 200,
+          cache_creation_input_tokens: 50,
+          model_context_window: 4096,
+        },
+      }),
+    ]);
+    const relayStream = transportRelayTesting.normalizeUsageUpdatePayload('deck_kimi_iso', usagesA[0]!.usage, undefined);
+    expect((relayStream!.inputTokens as number) + ((relayStream!.cacheTokens as number) ?? 0)).toBe(1000);
+    const relayMeta = transportRelayTesting.normalizeUsageUpdatePayload(
+      'deck_kimi_iso',
+      completesA[4]!.metadata?.usage as never,
+      undefined,
+    );
+    expect((relayMeta!.inputTokens as number) + ((relayMeta!.cacheTokens as number) ?? 0)).toBe(1000);
+    expect(completesA[4]!.metadata?.cumulativeUsage).toEqual({
+      totalTokens: 190000,
+      inputTokens: 180000,
+      outputTokens: 10000,
+    });
+
     await provider.disconnect();
   });
 
@@ -1398,6 +1451,126 @@ describe('KimiV2Provider', () => {
     liveChild.emit('exit', 1, null);
     await vi.waitFor(() => expect(errors).toHaveLength(5));
     expect(statuses.at(-1)).toEqual({ status: null, label: null });
+
+    await provider.disconnect();
+  });
+
+  it('fails /compact on max_tokens, max_turn_requests, and non-terminal in_progress->end_turn, while preserving matching-ID commit during cancel', async () => {
+    let resolvePrompt!: (v: unknown) => void;
+    state.conn = makeMockConn({
+      prompt: vi.fn(() => new Promise((r) => { resolvePrompt = r; })),
+    });
+
+    const provider = new KimiV2Provider();
+    const statuses: ProviderStatusUpdate[] = [];
+    const completes: Array<{ metadata?: Record<string, unknown> }> = [];
+    const errors: Array<{ code: string }> = [];
+    provider.onStatus((_, s) => statuses.push(s));
+    provider.onComplete((_, m) => completes.push({ metadata: m.metadata }));
+    provider.onError((_, e) => errors.push({ code: e.code }));
+
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-compact-r2', cwd: os.tmpdir() });
+
+    // Establish injected SYS_R2
+    state.conn.prompt.mockImplementationOnce(async () => ({ stopReason: 'end_turn' }));
+    await provider.send('sess-compact-r2', {
+      context: { sessionSystemText: 'SYS_R2' },
+      assembledMessage: 'init',
+      sessionSystemText: 'SYS_R2',
+    } as never);
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+
+    // 1) Eventless /compact ending with max_tokens -> failTurn, failed outcome, no committed/compacted, SYS_R2 preserved
+    statuses.length = 0;
+    state.conn.prompt.mockImplementationOnce(async () => ({ stopReason: 'max_tokens' }));
+    await provider.send('sess-compact-r2', '/compact');
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    expect(errors[0]!.code).toBe(PROVIDER_ERROR_CODES.PROVIDER_ERROR);
+    expect(completes).toHaveLength(1);
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null, compactionOutcome: 'failed' },
+    ]);
+
+    // 2) Eventless /compact ending with max_turn_requests -> failTurn, failed outcome, no committed/compacted, SYS_R2 preserved
+    statuses.length = 0;
+    state.conn.prompt.mockImplementationOnce(async () => ({ stopReason: 'max_turn_requests' }));
+    await provider.send('sess-compact-r2', '/compact');
+    await vi.waitFor(() => expect(errors).toHaveLength(2));
+    expect(errors[1]!.code).toBe(PROVIDER_ERROR_CODES.PROVIDER_ERROR);
+    expect(completes).toHaveLength(1);
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null, compactionOutcome: 'failed' },
+    ]);
+
+    // 3) /compact with compaction_update in_progress (no committed terminal) -> end_turn -> failTurn, failed outcome, no committed/compacted
+    statuses.length = 0;
+    state.conn.prompt.mockImplementationOnce(async () => {
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-stalled', status: 'in_progress' } as never,
+      });
+      return { stopReason: 'end_turn' };
+    });
+    await provider.send('sess-compact-r2', '/compact');
+    await vi.waitFor(() => expect(errors).toHaveLength(3));
+    expect(errors[2]!.code).toBe(PROVIDER_ERROR_CODES.PROVIDER_ERROR);
+    expect(completes).toHaveLength(1);
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null, compactionOutcome: 'failed' },
+    ]);
+
+    // Verify SYS_R2 was NOT cleared by any of those 3 failed /compact attempts
+    state.conn.prompt.mockImplementationOnce(async () => ({ stopReason: 'end_turn' }));
+    await provider.send('sess-compact-r2', {
+      context: { sessionSystemText: 'SYS_R2' },
+      assembledMessage: 'after failed compacts',
+      sessionSystemText: 'SYS_R2',
+    } as never);
+    await vi.waitFor(() => expect(completes).toHaveLength(2));
+    expect((state.conn.prompt.mock.calls.at(-1)![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text).not.toContain('SYS_R2');
+
+    // 4) in_progress -> local cancel -> untracked new ID ignored -> matching ID completed accepted -> prompt settles cancelled, committed & SYS_R2 refreshed
+    statuses.length = 0;
+    state.conn.prompt.mockImplementationOnce(() => new Promise((r) => { resolvePrompt = r; }));
+    await provider.send('sess-compact-r2', '/compact');
+    await state.handlers!.sessionUpdate({
+      sessionId: 'kimi-sess-1',
+      update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-cancel-commit', status: 'in_progress' } as never,
+    });
+    await provider.cancel('sess-compact-r2');
+
+    // New ID arriving during cancel must be rejected
+    await state.handlers!.sessionUpdate({
+      sessionId: 'kimi-sess-1',
+      update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-new-ignored', status: 'in_progress' } as never,
+    });
+    // Matching already-tracked ID completing during cancel must be accepted
+    await state.handlers!.sessionUpdate({
+      sessionId: 'kimi-sess-1',
+      update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-cancel-commit', status: 'completed' } as never,
+    });
+    resolvePrompt({ stopReason: 'cancelled' });
+    await vi.waitFor(() => expect(errors).toHaveLength(4));
+    expect(errors[3]!.code).toBe(PROVIDER_ERROR_CODES.CANCELLED);
+    expect(completes).toHaveLength(2);
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null, compactionOutcome: 'committed' },
+    ]);
+
+    // Next turn re-injects SYS_R2 because cmp-cancel-commit committed during cancel!
+    state.conn.prompt.mockImplementationOnce(async () => ({ stopReason: 'end_turn' }));
+    await provider.send('sess-compact-r2', {
+      context: { sessionSystemText: 'SYS_R2' },
+      assembledMessage: 'after cancel commit',
+      sessionSystemText: 'SYS_R2',
+    } as never);
+    await vi.waitFor(() => expect(completes).toHaveLength(3));
+    expect((state.conn.prompt.mock.calls.at(-1)![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text).toContain('SYS_R2');
 
     await provider.disconnect();
   });
