@@ -367,39 +367,13 @@ function mergeSingleAuditField(saved: string | undefined, parsed: string | undef
   return saved;
 }
 
-function normalizeFullFindingSummary(value: string): string {
-  return value.replace(/\s+/gu, ' ').trim().toLowerCase();
-}
-
 function sameFindingSummaryOrPrefixTruncation(a: string, b: string): boolean {
-  const normA = normalizeFullFindingSummary(a);
-  const normB = normalizeFullFindingSummary(b);
+  const normA = a.replace(/\s+/gu, ' ').trim().toLowerCase();
+  const normB = b.replace(/\s+/gu, ' ').trim().toLowerCase();
   if (!normA || !normB) return false;
   if (normA === normB) return true;
   // Allow only full-string prefix expansion when an older slice truncated the tail of the same summary.
   return (normA.length >= 24 && normB.startsWith(normA)) || (normB.length >= 24 && normA.startsWith(normB));
-}
-
-function findUniqueParsedMatch(
-  item: AuditDraftFinding,
-  structuredList: readonly AuditDraftFinding[],
-  parsedList: readonly AuditDraftFinding[],
-): AuditDraftFinding | undefined {
-  const targetSummary = normalizeFullFindingSummary(item.summary);
-  if (!targetSummary) return undefined;
-  const compatibleSeverity = (other: AuditDraftFinding): boolean => (
-    !item.severity || !other.severity || item.severity === other.severity
-  );
-  // Refuse cross-matching when multiple structured entries share the same normalized summary.
-  const structuredDupes = structuredList.filter(
-    (s) => normalizeFullFindingSummary(s.summary) === targetSummary && compatibleSeverity(s),
-  );
-  if (structuredDupes.length !== 1) return undefined;
-
-  const exactMatches = parsedList.filter(
-    (p) => normalizeFullFindingSummary(p.summary) === targetSummary && compatibleSeverity(p),
-  );
-  return exactMatches.length === 1 ? exactMatches[0] : undefined;
 }
 
 function mergeAuditFindings(
@@ -408,27 +382,8 @@ function mergeAuditFindings(
   legacyStructured: readonly AuditDraftFinding[],
 ): AuditDraftFinding[] {
   if (structuredFull.length > 0) {
-    // Explicit structured findings keep their own order and fields; never index-bind or prefix-guess against independent notice text.
-    // Only fill missing optional fields when a single unambiguous exact-summary + severity match exists.
-    return structuredFull.map((item) => {
-      const supplement = findUniqueParsedMatch(item, structuredFull, parsedFromText);
-      if (!supplement) return item;
-      const severity = item.severity ?? supplement.severity;
-      const location = item.location ?? supplement.location;
-      const evidence = item.evidence ?? supplement.evidence;
-      const proposal = item.proposal ?? supplement.proposal;
-      const invariant = item.invariant ?? supplement.invariant;
-      const tradeoffs = item.tradeoffs ?? supplement.tradeoffs;
-      return {
-        ...(severity ? { severity } : {}),
-        summary: item.summary || supplement.summary,
-        ...(location ? { location } : {}),
-        ...(evidence ? { evidence } : {}),
-        ...(proposal ? { proposal } : {}),
-        ...(invariant ? { invariant } : {}),
-        ...(tradeoffs ? { tradeoffs } : {}),
-      };
-    });
+    // Explicit structured findings are authoritative; independent notice stays available via `noticeText` without cross-list field guessing.
+    return [...structuredFull];
   }
 
   if (parsedFromText.length > 0) {

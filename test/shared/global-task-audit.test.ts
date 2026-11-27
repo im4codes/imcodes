@@ -434,16 +434,16 @@ describe('global task structured audit summary & extraction', () => {
     });
   });
 
-  it('never cross-swaps location or proposal when structuredDetails and independent notice use reversed order, different wording, or shared prefixes', () => {
-    // 1. Same length, reversed order, matching full summaries -> each keeps/gets ONLY its own fields (never index-swapped)
-    const reversedExact = extractAuditFindingsFromVerdict({
+  it('keeps explicit structuredDetails findings authoritative without inheriting or cross-swapping fields from independent notice', () => {
+    // 1. Reversed-order notice against explicit structured findings -> keeps structured fields & order cleanly without cross-swapping; noticeText remains available
+    const reversedWithNotice = extractAuditFindingsFromVerdict({
       verb: 'REWORK',
       counts: { P0: 1, P1: 1, P2: 0, P3: 0, P4: 0 },
       judgement: 'consistent',
       round: 2,
       structuredDetails: {
         findings: [
-          { severity: 'P0', summary: 'First problem' },
+          { severity: 'P0', summary: 'First problem', location: 'src/first.ts:10', proposal: 'FIRST_FIX' },
           { severity: 'P1', summary: 'Second problem' },
         ],
       },
@@ -453,12 +453,12 @@ describe('global task structured audit summary & extraction', () => {
         'Proposal: SECOND_FIX',
         '',
         '- [P0] First problem',
-        'Location: src/first.ts:10',
-        'Proposal: FIRST_FIX',
+        'Location: src/other.ts:99',
+        'Proposal: OTHER_FIX',
       ].join('\n'),
     }, ['P0']);
 
-    expect(reversedExact?.findings).toEqual([
+    expect(reversedWithNotice?.findings).toEqual([
       {
         index: 1,
         severity: 'P0',
@@ -472,79 +472,34 @@ describe('global task structured audit summary & extraction', () => {
         severity: 'P1',
         blocking: false,
         summary: 'Second problem',
-        location: 'src/second.ts:20',
-        proposal: 'SECOND_FIX',
       },
     ]);
+    expect(reversedWithNotice?.noticeText).toContain('SECOND_FIX');
+    expect(reversedWithNotice?.noticeText).toContain('OTHER_FIX');
 
-    // 2. Same length, reversed order, independent notice wording (or shared 32-char prefix ambiguity) -> keeps structured fields cleanly without swapping or prefix-guessing
-    const sharedPrefix = 'Shared 32-char diagnostic prefix across entries: ';
-    const reversedIndependent = extractAuditFindingsFromVerdict({
+    // 2. Same-summary P0 + P1 in structuredDetails paired with an untagged numbered notice -> neither P0 nor P1 inherits the untagged notice location/proposal
+    const sameSummaryDiffSeverity = extractAuditFindingsFromVerdict({
       verb: 'REWORK',
       counts: { P0: 1, P1: 1, P2: 0, P3: 0, P4: 0 },
-      judgement: 'consistent',
-      round: 2,
-      structuredDetails: {
-        findings: [
-          { severity: 'P0', summary: `${sharedPrefix}First structured item`, location: 'src/struct-first.ts:1' },
-          { severity: 'P1', summary: `${sharedPrefix}Second structured item` },
-        ],
-      },
-      fullNoticeText: [
-        `- [P1] ${sharedPrefix}Independent second note`,
-        'Location: src/second.ts:20',
-        'Proposal: SECOND_FIX',
-        '',
-        `- [P0] ${sharedPrefix}Independent first note`,
-        'Location: src/first.ts:10',
-        'Proposal: FIRST_FIX',
-      ].join('\n'),
-    }, ['P0']);
-
-    expect(reversedIndependent?.findings).toEqual([
-      {
-        index: 1,
-        severity: 'P0',
-        blocking: true,
-        summary: `${sharedPrefix}First structured item`,
-        location: 'src/struct-first.ts:1',
-      },
-      {
-        index: 2,
-        severity: 'P1',
-        blocking: false,
-        summary: `${sharedPrefix}Second structured item`,
-      },
-    ]);
-    expect(reversedIndependent?.noticeText).toContain('SECOND_FIX');
-    expect(reversedIndependent?.noticeText).toContain('FIRST_FIX');
-
-    // 3. Duplicate identical summary across items in notice -> ambiguity guard refuses cross-fill instead of guessing
-    const ambiguousDuplicates = extractAuditFindingsFromVerdict({
-      verb: 'REWORK',
-      counts: { P0: 2, P1: 0, P2: 0, P3: 0, P4: 0 },
       judgement: 'consistent',
       round: 3,
       structuredDetails: {
         findings: [
-          { severity: 'P0', summary: 'Duplicate check headline' },
-          { severity: 'P0', summary: 'Duplicate check headline' },
+          { severity: 'P0', summary: 'Shared missing validation check' },
+          { severity: 'P1', summary: 'Shared missing validation check' },
         ],
       },
       fullNoticeText: [
-        '- [P0] Duplicate check headline',
-        'Location: src/a.ts:1',
-        'Proposal: FIX_A',
-        '',
-        '- [P0] Duplicate check headline',
-        'Location: src/b.ts:2',
-        'Proposal: FIX_B',
+        '1. Shared missing validation check',
+        'Location: src/ambiguous.ts:42',
+        'Proposal: AMBIGUOUS_SHARED_PROPOSAL',
       ].join('\n'),
     }, ['P0']);
 
-    expect(ambiguousDuplicates?.findings).toEqual([
-      { index: 1, severity: 'P0', blocking: true, summary: 'Duplicate check headline' },
-      { index: 2, severity: 'P0', blocking: true, summary: 'Duplicate check headline' },
+    expect(sameSummaryDiffSeverity?.findings).toEqual([
+      { index: 1, severity: 'P0', blocking: true, summary: 'Shared missing validation check' },
+      { index: 2, severity: 'P1', blocking: false, summary: 'Shared missing validation check' },
     ]);
+    expect(sameSummaryDiffSeverity?.noticeText).toContain('AMBIGUOUS_SHARED_PROPOSAL');
   });
 });
