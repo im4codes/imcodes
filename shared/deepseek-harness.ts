@@ -34,16 +34,18 @@ export const DSH_BRIDGE_COMMAND = {
 export const DSH_BRIDGE_EVENT = {
   /** Agent created or resumed; carries the durable session id used for resume. */
   READY: 'ready',
-  /** Incremental assistant text (`assistant/chunk` → `text-delta`). */
+  /** Incremental assistant text (`agent/assistant-stream` or `assistant/chunk` → `text-delta`). */
   DELTA: 'delta',
-  /** Model is reasoning (`assistant/chunk` → `reasoning-delta`); carries no content. */
+  /** Model is reasoning (`agent/assistant-stream` or `assistant/chunk` → `reasoning-delta`); carries no content. */
   REASONING: 'reasoning',
   /** A committed assistant message — the authoritative text for the turn. */
   MESSAGE: 'message',
   /** Tool lifecycle, from `tool/call` and `tool/result`. */
   TOOL: 'tool',
-  /** Token accounting (`assistant/chunk` → `usage`). */
+  /** Token accounting (`agent/assistant-stream` / `assistant/chunk` → `usage`, or `assistant/message`). */
   USAGE: 'usage',
+  /** Context compaction lifecycle (`compaction/start` → true, `compaction/end` → false). */
+  COMPACTING: 'compacting',
   /** The agent returned to idle; `reason` mirrors the harness turn outcome. */
   TURN_END: 'turnEnd',
   /** A failure the bridge could not attribute to a turn. */
@@ -129,6 +131,16 @@ export interface DshBridgeUsageEvent {
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  totalTokens?: number;
+  contextWindow?: number;
+  model?: string;
+  finalized?: boolean;
+}
+
+export interface DshBridgeCompactingEvent {
+  type: typeof DSH_BRIDGE_EVENT.COMPACTING;
+  active: boolean;
 }
 
 export interface DshBridgeTurnEndEvent {
@@ -152,8 +164,17 @@ export type DshBridgeEvent =
   | DshBridgeMessageEvent
   | DshBridgeToolEvent
   | DshBridgeUsageEvent
+  | DshBridgeCompactingEvent
   | DshBridgeTurnEndEvent
   | DshBridgeErrorEvent;
+
+/**
+ * Harness agent-subject event names (`ctx.on(...)`).
+ * Verified against `@deepseek-ai/dsh@0.2.2-rc.5`.
+ */
+export const DSH_AGENT_EVENT = {
+  ASSISTANT_STREAM: 'agent/assistant-stream',
+} as const;
 
 /**
  * Harness `session/event` names the bridge consumes. These are internal to
@@ -166,6 +187,9 @@ export const DSH_SESSION_EVENT = {
   ASSISTANT_MESSAGE: 'assistant/message',
   TOOL_CALL: 'tool/call',
   TOOL_RESULT: 'tool/result',
+  COMPACTION_START: 'compaction/start',
+  COMPACTION_END: 'compaction/end',
+  REQUEST_CONTEXT: 'request/context',
   TURN_END: 'turn/end',
 } as const;
 

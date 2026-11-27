@@ -155,6 +155,8 @@ interface DeepseekHarnessSessionState {
   /** Session context sent this turn, promoted to `injected` only once it settles. */
   pendingSessionSystemText?: string;
   lastStatusSignature: string | null;
+  /** True while the harness is executing an async context compaction bracket. */
+  compacting: boolean;
   disposed: boolean;
   /** The native-agent fence the live `child` was spawned with. */
   childNativeAgentFence?: NativeAgentFence;
@@ -268,6 +270,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
       toolNames: new Map(),
       sessionSystemTextInjected: existing?.sessionSystemTextInjected,
       lastStatusSignature: null,
+      compacting: false,
       disposed: false,
       memoryMcp: this.buildMemoryMcp(config),
       llmConfig: config.llm,
@@ -581,7 +584,12 @@ export class DeepseekHarnessProvider implements TransportProvider {
         this.failStartup(state, child, reason);
         return;
       }
-      if (wasActive) this.failSession(state, reason);
+      if (wasActive) {
+        this.failSession(state, reason);
+      } else if (state.compacting) {
+        state.compacting = false;
+        this.clearStatus(state.routeId, state);
+      }
     };
     child.on('exit', (code, signal) => {
       this.stopConfirmations.complete(child);
@@ -784,17 +792,29 @@ export class DeepseekHarnessProvider implements TransportProvider {
           ...(event.inputTokens !== undefined ? { input_tokens: event.inputTokens } : {}),
           ...(event.outputTokens !== undefined ? { output_tokens: event.outputTokens } : {}),
           ...(event.cacheReadTokens !== undefined ? { cache_read_input_tokens: event.cacheReadTokens } : {}),
+          ...(event.cacheWriteTokens !== undefined ? { cache_creation_input_tokens: event.cacheWriteTokens } : {}),
+          ...(event.contextWindow !== undefined ? { model_context_window: event.contextWindow } : {}),
         };
+        const model = event.model ?? state.model;
         state.lastUsage = usage;
         for (const cb of this.usageCallbacks) {
           cb(sessionId, {
             usage,
-            ...(state.model ? { model: state.model } : {}),
+            ...(model ? { model } : {}),
             ...(state.currentMessageId ? { messageId: state.currentMessageId } : {}),
+            ...(event.finalized ? { finalized: true } : {}),
           });
         }
         return;
       }
+      case DSH_BRIDGE_EVENT.COMPACTING:
+        state.compacting = event.active;
+        if (event.active) {
+          this.emitStatus(sessionId, state, { status: 'compacting', label: 'Compacting conversation...' });
+        } else {
+          this.clearStatus(sessionId, state);
+        }
+        return;
       case DSH_BRIDGE_EVENT.TURN_END:
         if (state.child) this.stopConfirmations.complete(state.child);
         this.finishTurn(state, event.reason, event.message, event.code);
@@ -887,6 +907,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     state.committedSegments = [];
     state.currentMessageId = null;
     state.pendingSessionSystemText = undefined;
+    state.compacting = false;
   }
 
   private clearStatus(sessionId: string, state: DeepseekHarnessSessionState): void {

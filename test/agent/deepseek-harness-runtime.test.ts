@@ -100,7 +100,8 @@ describe('dsh launch guidance', () => {
     expect(runtime.formatDshLaunchError(error)).toBe(
       `DeepSeek Harness (dsh) is not installed on this daemon host. Install it, then retry: ${runtime.DSH_INSTALL_COMMAND}`,
     );
-    expect(runtime.DSH_INSTALL_COMMAND).toBe('npm install -g @deepseek-ai/dsh@0.1.0-rc.7');
+    expect(runtime.DSH_SUPPORTED_PACKAGE).toBe('@deepseek-ai/dsh@0.2.2-rc.5');
+    expect(runtime.DSH_INSTALL_COMMAND).toBe('npm install -g @deepseek-ai/dsh@0.2.2-rc.5');
   });
 
   it('preserves non-missing launch failures for diagnostics', async () => {

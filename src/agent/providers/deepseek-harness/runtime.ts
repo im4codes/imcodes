@@ -47,17 +47,25 @@ export const DSH_DISABLED_ROW_IDS = ['headless-runner', 'headless-startup'] as c
 
 /**
  * dsh-base rows that start, orchestrate or hand more work to native agents:
- * spawn and fork sub-agents, the follow-up `send_message` control, workflows
- * and Ralph iteration. A managed session's overlay disables all of them
- * (patched by id like the stock headless rows).
+ * spawn and fork sub-agents, Agent Teams, follow-up `send_message` control,
+ * workflows and Ralph iteration. A managed session's overlay disables all of
+ * them (patched by id like the stock headless rows).
  */
 export const DSH_NATIVE_AGENT_ROW_IDS = [
   'tool-subagent',
   'tool-subagent-fork',
   'tool-subagent-control',
+  'tool-agent-team',
   'tool-workflow',
   'tool-ralph',
 ] as const;
+
+/**
+ * Stock headless patch couples `sandbox-policy` to `headlessStartup`. When our
+ * overlay disables `headless-startup`, resetting `sandbox-policy` clears that
+ * injection dependency while preserving the workspace-write default.
+ */
+export const DSH_SANDBOX_POLICY_ROW_ID = 'sandbox-policy';
 
 /** Package that connects one external MCP server and registers its tools. */
 export const DSH_MCP_CLIENT_PACKAGE = '@deepseek-ai/dsh-mcp-client';
@@ -72,7 +80,7 @@ export const DSH_BINARY_ENV = 'IMCODES_DSH_BIN';
 export const DSH_DEFAULT_BINARY = 'dsh';
 
 /** Harness release whose bridge/profile contract this adapter targets. */
-export const DSH_SUPPORTED_PACKAGE = '@deepseek-ai/dsh@0.1.0-rc.7';
+export const DSH_SUPPORTED_PACKAGE = '@deepseek-ai/dsh@0.2.2-rc.5';
 
 /** User-facing repair command when the external Harness CLI is absent. */
 export const DSH_INSTALL_COMMAND = `npm install -g ${DSH_SUPPORTED_PACKAGE}`;
@@ -132,6 +140,7 @@ interface DshPatchRow {
   id?: string;
   name?: string;
   disabled?: boolean;
+  inject?: string[];
   config?: Record<string, unknown>;
   insert?: DshPatchRow[];
 }
@@ -151,6 +160,12 @@ export function buildDshOverlay(
     ...DSH_DISABLED_ROW_IDS,
     ...(options.nativeAgentsFenced ? DSH_NATIVE_AGENT_ROW_IDS : []),
   ].map((id) => ({ id, disabled: true }));
+  // Decouple `sandbox-policy` from `headlessStartup` before inserting our own plugins.
+  rows.push({
+    id: DSH_SANDBOX_POLICY_ROW_ID,
+    inject: [],
+    config: { mode: process.env.DSH_PERMISSION_MODE?.trim() || 'workspace-write' },
+  });
   const insert: DshPatchRow[] = [];
   if (options.memoryMcp) {
     insert.push({

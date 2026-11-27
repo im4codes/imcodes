@@ -2,13 +2,14 @@
  * Tests for the Cordis plugin mounted inside the DeepSeek Harness process.
  *
  * The bridge is the only place that understands the harness's internal
- * `session/event` vocabulary, which is a developer-preview surface rather than
- * a declared API. These tests pin the exact payload shapes captured from
- * dsh 0.1.0-rc.7 so a harness change shows up here instead of as silent
- * streaming loss in a live session.
+ * `session/event` and `agent/assistant-stream` vocabulary, which is a
+ * developer-preview surface rather than a declared API. These tests pin the
+ * exact payload shapes captured from dsh 0.2.2-rc.5 so a harness change shows
+ * up here instead of as silent streaming loss in a live session.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
+  DSH_AGENT_EVENT,
   DSH_BRIDGE_COMMAND,
   DSH_BRIDGE_EVENT,
   DSH_BRIDGE_CWD_ENV,
@@ -20,7 +21,8 @@ import {
 } from '../../shared/deepseek-harness.js';
 import { apply, dispatchDshBridgeCommand, inject, name } from '../../src/agent/providers/deepseek-harness/bridge.js';
 
-type SessionEventListener = (session: { id: string }, event: { type: string; data?: Record<string, unknown> }) => void;
+type SessionEventListener = (session: { id: string }, event: { type: string; surfaceOp?: string; data?: Record<string, unknown> }) => void;
+type AssistantStreamListener = (payload: { agent?: { session?: { id: string } }; frame?: { type?: string; chunk?: unknown } }) => void;
 
 const OWN_SESSION = { id: 'session-own' };
 const OTHER_SESSION = { id: 'session-other' };
@@ -28,23 +30,26 @@ const OTHER_SESSION = { id: 'session-other' };
 function makeAgent() {
   const followups: unknown[] = [];
   const steers: unknown[] = [];
+  const cancelCauses: Array<{ kind: string } | undefined> = [];
   let cancelled = 0;
   return {
     followups,
     steers,
+    cancelCauses,
     cancelCount: () => cancelled,
     agent: {
       session: OWN_SESSION,
       whenIdle: vi.fn().mockResolvedValue(undefined),
       followup: (message: unknown) => { followups.push(message); },
       steer: (message: unknown) => { steers.push(message); },
-      cancel: () => { cancelled += 1; },
+      cancel: (cause?: { kind: string }) => { cancelled += 1; cancelCauses.push(cause); },
     },
   };
 }
 
 function makeCtx(agent: unknown, overrides: Record<string, unknown> = {}) {
   const listeners: SessionEventListener[] = [];
+  const streamListeners: AssistantStreamListener[] = [];
   const created: Array<Record<string, unknown>> = [];
   const resumed: Array<Record<string, unknown>> = [];
   const flushed: unknown[] = [];
@@ -59,14 +64,18 @@ function makeCtx(agent: unknown, overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
   return {
-    created, resumed, flushed, listeners,
-    emit(event: { type: string; data?: Record<string, unknown> }, session = OWN_SESSION) {
+    created, resumed, flushed, listeners, streamListeners,
+    emit(event: { type: string; surfaceOp?: string; data?: Record<string, unknown> }, session = OWN_SESSION) {
       for (const listener of listeners) listener(session, event);
+    },
+    emitStream(frame: { type: string; chunk?: unknown }, targetAgent: { session?: { id: string } } = agent as { session?: { id: string } }) {
+      for (const listener of streamListeners) listener({ agent: targetAgent, frame });
     },
     ctx: {
       get: (key: string) => services[key],
-      on: (channel: string, listener: SessionEventListener) => {
-        if (channel === 'session/event') listeners.push(listener);
+      on: (channel: string, listener: (...args: unknown[]) => void) => {
+        if (channel === 'session/event') listeners.push(listener as SessionEventListener);
+        if (channel === DSH_AGENT_EVENT.ASSISTANT_STREAM) streamListeners.push(listener as AssistantStreamListener);
         return () => {};
       },
     },
@@ -127,7 +136,10 @@ describe('deepseek-harness bridge', () => {
     const harness = await boot();
 
     expect(harness.resumed).toHaveLength(1);
-    expect(harness.resumed[0]).toMatchObject({ sessionId: 'session-previous' });
+    expect(harness.resumed[0]).toMatchObject({
+      resumeSessionId: 'session-previous',
+      sessionId: 'session-previous',
+    });
     expect(harness.created).toHaveLength(0);
     expect(frames[0]).toMatchObject({ resumed: true });
   });
@@ -268,20 +280,96 @@ describe('deepseek-harness bridge', () => {
     });
   });
 
-  it('translates turn outcomes, including the error payload', async () => {
+  it('streams text, reasoning, and usage over dsh 0.2.x agent/assistant-stream while isolating other agents', async () => {
+    const harness = await boot();
+    frames.length = 0;
+
+    harness.emit({
+      type: DSH_SESSION_EVENT.REQUEST_CONTEXT,
+      data: { provider: 'deepseek-official', model: 'deepseek-v4', contextWindow: 131_072 },
+    });
+    harness.emitStream({ type: 'start' });
+    harness.emitStream({ type: 'chunk', chunk: { type: 'reasoning-delta', text: 'hidden' } });
+    harness.emitStream({ type: 'chunk', chunk: { type: 'text-delta', text: 'Hi ' } });
+    harness.emitStream({ type: 'chunk', chunk: { type: 'text-delta', text: 'dsh' } });
+    // Subagent streams arrive on the same channel with a different agent/session id.
+    harness.emitStream({ type: 'chunk', chunk: { type: 'text-delta', text: 'subagent' } }, { session: OTHER_SESSION });
+    harness.emitStream({
+      type: 'chunk',
+      chunk: { type: 'usage', usage: { inputTokens: 500, outputTokens: 40, cacheReadTokens: 120, cacheWriteTokens: 80, totalTokens: 740 } },
+    });
+    harness.emit({
+      type: DSH_SESSION_EVENT.ASSISTANT_MESSAGE,
+      data: {
+        message: { role: 'assistant', content: [{ type: 'text', text: 'Hi dsh' }] },
+        usage: { inputTokens: 500, outputTokens: 40, cacheReadTokens: 120, cacheWriteTokens: 80, totalTokens: 740 },
+      },
+    });
+
+    expect(frames).toEqual([
+      { type: DSH_BRIDGE_EVENT.REASONING },
+      { type: DSH_BRIDGE_EVENT.DELTA, text: 'Hi ' },
+      { type: DSH_BRIDGE_EVENT.DELTA, text: 'dsh' },
+      {
+        type: DSH_BRIDGE_EVENT.USAGE,
+        inputTokens: 500,
+        outputTokens: 40,
+        cacheReadTokens: 120,
+        cacheWriteTokens: 80,
+        totalTokens: 740,
+        contextWindow: 131_072,
+        model: 'deepseek-v4',
+      },
+      { type: DSH_BRIDGE_EVENT.MESSAGE, text: 'Hi dsh' },
+      {
+        type: DSH_BRIDGE_EVENT.USAGE,
+        inputTokens: 500,
+        outputTokens: 40,
+        cacheReadTokens: 120,
+        cacheWriteTokens: 80,
+        totalTokens: 740,
+        contextWindow: 131_072,
+        model: 'deepseek-v4',
+        finalized: true,
+      },
+    ]);
+  });
+
+  it('forwards compaction lifecycle events and skips non-append tool/result rewrites', async () => {
+    const harness = await boot();
+    frames.length = 0;
+
+    harness.emit({ type: DSH_SESSION_EVENT.COMPACTION_START, data: { compactionId: 'cmp-1' } });
+    // Compaction replaces historical tool results with surfaceOp !== 'append'.
+    harness.emit({
+      type: DSH_SESSION_EVENT.TOOL_RESULT,
+      surfaceOp: 'replace',
+      data: { message: { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'old-1', content: [{ type: 'text', text: 'stale' }] }] } },
+    });
+    harness.emit({ type: DSH_SESSION_EVENT.COMPACTION_END, data: { compactionId: 'cmp-1', status: 'committed' } });
+
+    expect(frames).toEqual([
+      { type: DSH_BRIDGE_EVENT.COMPACTING, active: true },
+      { type: DSH_BRIDGE_EVENT.COMPACTING, active: false },
+    ]);
+  });
+
+  it('translates turn outcomes, including aborted (0.2.x), cancelled (0.1.x), and error payloads', async () => {
     const harness = await boot();
     frames.length = 0;
 
     harness.emit({ type: DSH_SESSION_EVENT.TURN_END, data: { turn: 1, reason: { kind: 'completed' } } });
     harness.emit({ type: DSH_SESSION_EVENT.TURN_END, data: { turn: 2, reason: { kind: 'cancelled' } } });
+    harness.emit({ type: DSH_SESSION_EVENT.TURN_END, data: { turn: 3, reason: { kind: 'aborted', reason: { kind: 'user' } } } });
     harness.emit({
       type: DSH_SESSION_EVENT.TURN_END,
-      data: { turn: 3, reason: { kind: 'error', error: { code: 'UPSTREAM', message: 'boom' } } },
+      data: { turn: 4, reason: { kind: 'error', error: { code: 'UPSTREAM', message: 'boom' } } },
     });
 
     expect(frames[0]).toEqual({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
     expect(frames[1]).toEqual({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.CANCELLED });
-    expect(frames[2]).toEqual({
+    expect(frames[2]).toEqual({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.CANCELLED });
+    expect(frames[3]).toEqual({
       type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.ERROR, message: 'boom', code: 'UPSTREAM',
     });
   });
@@ -346,6 +434,17 @@ describe('deepseek-harness bridge command handling', () => {
     });
     expect(harness.followups).toEqual([]);
     expect(harness.cancelCount()).toBe(0);
+    expect(requestExit).not.toHaveBeenCalled();
+  });
+
+  it('passes an explicit user abort cause to agent.cancel for dsh 0.2.x', () => {
+    const harness = makeAgent();
+    const requestExit = vi.fn();
+
+    dispatchDshBridgeCommand(harness.agent, { type: DSH_BRIDGE_COMMAND.CANCEL }, requestExit);
+
+    expect(harness.cancelCount()).toBe(1);
+    expect(harness.cancelCauses).toEqual([{ kind: 'user' }]);
     expect(requestExit).not.toHaveBeenCalled();
   });
 });

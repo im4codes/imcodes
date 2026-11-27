@@ -10,7 +10,7 @@
  *
  * Deliberately dependency-free: it imports nothing from `@deepseek-ai/*`. User
  * messages are plain frozen objects, which the harness accepts (verified
- * against dsh 0.1.0-rc.7), so the daemon never needs the harness's 195-package
+ * against dsh 0.2.2-rc.5), so the daemon never needs the harness's 195-package
  * dependency tree at build time and cannot break when that tree moves.
  *
  * STDOUT IS PROTOCOL-ONLY. Anything else written there corrupts the stream, so
@@ -19,6 +19,7 @@
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import {
+  DSH_AGENT_EVENT,
   DSH_BRIDGE_COMMAND,
   DSH_BRIDGE_EVENT,
   DSH_BRIDGE_TOOL_STATUS,
@@ -47,7 +48,7 @@ interface DshAgent {
   whenIdle(): Promise<void>;
   followup(message: unknown): void;
   steer(message: unknown): void;
-  cancel?(): void;
+  cancel?(cause?: { kind: string }): void;
 }
 
 interface DshAgentHandle {
@@ -70,12 +71,20 @@ interface DshSessionStore {
 
 interface DshPluginContext {
   get(key: string): unknown;
-  on(event: string, listener: (session: DshSession, event: DshSessionEvent) => void): unknown;
+  on(event: typeof DSH_AGENT_EVENT.ASSISTANT_STREAM, listener: (payload: DshAssistantStreamPayload) => void): unknown;
+  on(event: 'session/event', listener: (session: DshSession, event: DshSessionEvent) => void): unknown;
+  on(event: string, listener: (...args: never[]) => void): unknown;
+}
+
+interface DshAssistantStreamPayload {
+  agent?: { session?: DshSession };
+  frame?: { type?: string; chunk?: unknown };
 }
 
 interface DshSessionEvent {
   type: string;
   seq?: number;
+  surfaceOp?: string;
   data?: Record<string, unknown>;
 }
 
@@ -142,7 +151,9 @@ function mapTurnReason(reason: unknown): { reason: DshBridgeTurnReason; message?
       ...(code ? { code } : {}),
     };
   }
-  if (kind === DSH_BRIDGE_TURN_REASON.CANCELLED) return { reason: DSH_BRIDGE_TURN_REASON.CANCELLED };
+  if (kind === DSH_BRIDGE_TURN_REASON.CANCELLED || kind === 'aborted') {
+    return { reason: DSH_BRIDGE_TURN_REASON.CANCELLED };
+  }
   return { reason: DSH_BRIDGE_TURN_REASON.COMPLETED };
 }
 
@@ -177,7 +188,8 @@ export function dispatchDshBridgeCommand(
       }
       return;
     case DSH_BRIDGE_COMMAND.CANCEL:
-      agent.cancel?.();
+      // dsh 0.2.x `ReactLoopAgent.cancel(cause)` reads `cause.kind`.
+      agent.cancel?.({ kind: 'user' });
       return;
     case DSH_BRIDGE_COMMAND.SHUTDOWN:
       requestExit(0);
@@ -192,39 +204,84 @@ function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
   // per reasoning token would push thousands of lines the daemon's status
   // dedupe discards after the first.
   let reasoningAnnounced = false;
+  let latestContextWindow: number | undefined;
+  let latestModel: string | undefined;
+
+  const emitUsage = (rawUsage: unknown, finalized = false): void => {
+    const usage = asRecord(rawUsage);
+    if (!usage) return;
+    const inputTokens = readNumber(usage.inputTokens);
+    const outputTokens = readNumber(usage.outputTokens);
+    const cacheReadTokens = readNumber(usage.cacheReadTokens);
+    const cacheWriteTokens = readNumber(usage.cacheWriteTokens);
+    const totalTokens = readNumber(usage.totalTokens);
+    emit({
+      type: DSH_BRIDGE_EVENT.USAGE,
+      ...(inputTokens !== undefined ? { inputTokens } : {}),
+      ...(outputTokens !== undefined ? { outputTokens } : {}),
+      ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
+      ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
+      ...(totalTokens !== undefined ? { totalTokens } : {}),
+      ...(latestContextWindow !== undefined ? { contextWindow: latestContextWindow } : {}),
+      ...(latestModel ? { model: latestModel } : {}),
+      ...(finalized ? { finalized: true } : {}),
+    });
+  };
+
+  const handleStreamChunk = (rawChunk: unknown): void => {
+    const chunk = asRecord(rawChunk);
+    const chunkType = readString(chunk?.type);
+    if (chunkType === DSH_CHUNK_TYPE.TEXT_DELTA) {
+      const text = readString(chunk?.text);
+      if (text) emit({ type: DSH_BRIDGE_EVENT.DELTA, text });
+      return;
+    }
+    if (chunkType === DSH_CHUNK_TYPE.REASONING_DELTA) {
+      if (!reasoningAnnounced) {
+        reasoningAnnounced = true;
+        emit({ type: DSH_BRIDGE_EVENT.REASONING });
+      }
+      return;
+    }
+    if (chunkType === DSH_CHUNK_TYPE.USAGE) {
+      emitUsage(chunk?.usage);
+    }
+  };
+
+  ctx.on(DSH_AGENT_EVENT.ASSISTANT_STREAM, (payload) => {
+    const subject = payload?.agent;
+    if ((subject as unknown) !== (agent as unknown) && subject?.session?.id !== agent.session.id) return;
+    if (payload?.frame?.type === 'chunk') {
+      handleStreamChunk(payload.frame.chunk);
+    }
+  });
+
   ctx.on('session/event', (session, event) => {
     // Subagents publish on their own sessions through the same channel; only
     // this bridge's own agent is the daemon-facing conversation.
     if (session?.id !== agent.session.id) return;
     const data = event.data ?? {};
 
+    if (event.type === DSH_SESSION_EVENT.REQUEST_CONTEXT) {
+      const contextWindow = readNumber(data.contextWindow);
+      const model = readString(data.model);
+      if (contextWindow !== undefined && contextWindow > 0) latestContextWindow = contextWindow;
+      if (model) latestModel = model;
+      return;
+    }
+
+    if (event.type === DSH_SESSION_EVENT.COMPACTION_START) {
+      emit({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+      return;
+    }
+
+    if (event.type === DSH_SESSION_EVENT.COMPACTION_END) {
+      emit({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false });
+      return;
+    }
+
     if (event.type === DSH_SESSION_EVENT.ASSISTANT_CHUNK) {
-      const chunk = asRecord(data.chunk);
-      const chunkType = readString(chunk?.type);
-      if (chunkType === DSH_CHUNK_TYPE.TEXT_DELTA) {
-        const text = readString(chunk?.text);
-        if (text) emit({ type: DSH_BRIDGE_EVENT.DELTA, text });
-        return;
-      }
-      if (chunkType === DSH_CHUNK_TYPE.REASONING_DELTA) {
-        if (!reasoningAnnounced) {
-          reasoningAnnounced = true;
-          emit({ type: DSH_BRIDGE_EVENT.REASONING });
-        }
-        return;
-      }
-      if (chunkType === DSH_CHUNK_TYPE.USAGE) {
-        const usage = asRecord(chunk?.usage);
-        const inputTokens = readNumber(usage?.inputTokens);
-        const outputTokens = readNumber(usage?.outputTokens);
-        const cacheReadTokens = readNumber(usage?.cacheReadTokens);
-        emit({
-          type: DSH_BRIDGE_EVENT.USAGE,
-          ...(inputTokens !== undefined ? { inputTokens } : {}),
-          ...(outputTokens !== undefined ? { outputTokens } : {}),
-          ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
-        });
-      }
+      handleStreamChunk(data.chunk);
       return;
     }
 
@@ -234,6 +291,7 @@ function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
       // A tool-call-only assistant message has no text; emitting it empty would
       // blank the daemon's in-flight bubble mid-turn.
       if (text) emit({ type: DSH_BRIDGE_EVENT.MESSAGE, text });
+      if (data.usage !== undefined) emitUsage(data.usage, true);
       return;
     }
 
@@ -253,6 +311,8 @@ function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
     }
 
     if (event.type === DSH_SESSION_EVENT.TOOL_RESULT) {
+      // Compaction/surface rewrites emit replaced historical results; only live appends are new tool outputs.
+      if (event.surfaceOp !== undefined && event.surfaceOp !== 'append') return;
       const message = asRecord(data.message);
       const blocks = Array.isArray(message?.content) ? message.content : [];
       for (const block of blocks) {
@@ -312,7 +372,8 @@ async function start(ctx: DshPluginContext): Promise<void> {
   let resumed = false;
   if (resumeSessionId) {
     try {
-      handle = await agents.resume({ sessionId: resumeSessionId, agentOptions });
+      // dsh 0.2.x expects `resumeSessionId`; `sessionId` is retained for 0.1.x compatibility.
+      handle = await agents.resume({ resumeSessionId, sessionId: resumeSessionId, agentOptions });
       resumed = true;
     } catch (err) {
       // A resume target can be missing after a session-store prune. Falling

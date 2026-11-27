@@ -43,6 +43,8 @@ import {
   DSH_DISABLED_ROW_IDS,
   DSH_MCP_CLIENT_PACKAGE,
   DSH_MEMORY_MCP_ROW_ID,
+  DSH_NATIVE_AGENT_ROW_IDS,
+  DSH_SANDBOX_POLICY_ROW_ID,
 } from '../../src/agent/providers/deepseek-harness/runtime.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
@@ -374,22 +376,64 @@ describe('DeepseekHarnessProvider', () => {
     expect(tools[1].tool).toMatchObject({ id: 'call_1', name: 'bash', status: 'complete', output: 'hi\n' });
   });
 
-  it('forwards usage and attaches it to the completion metadata', async () => {
+  it('forwards usage including cacheWriteTokens, model_context_window, and finalized flag', async () => {
     const sessionId = await startSession();
     await provider.send(sessionId, 'hi');
     child.emitEvent({
-      type: DSH_BRIDGE_EVENT.USAGE, inputTokens: 100, outputTokens: 20, cacheReadTokens: 4608,
+      type: DSH_BRIDGE_EVENT.USAGE,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheReadTokens: 4608,
+      cacheWriteTokens: 512,
+      contextWindow: 131_072,
+      model: 'deepseek-v4',
+      finalized: true,
     });
     child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'done' });
     child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
     await flush();
 
     expect(usages[0]).toMatchObject({
-      usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 4608 },
+      model: 'deepseek-v4',
+      finalized: true,
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_input_tokens: 4608,
+        cache_creation_input_tokens: 512,
+        model_context_window: 131_072,
+      },
     });
     expect(completions[0].message.metadata).toMatchObject({
-      usage: { input_tokens: 100, output_tokens: 20, cache_read_input_tokens: 4608 },
+      usage: {
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_read_input_tokens: 4608,
+        cache_creation_input_tokens: 512,
+        model_context_window: 131_072,
+      },
     });
+  });
+
+  it('tracks compacting status and clears it on compaction end or child exit', async () => {
+    const sessionId = await startSession();
+    const statuses: Array<{ status: string | null; label?: string | null }> = [];
+    provider.onStatus((_s, st) => { statuses.push(st as { status: string | null; label?: string | null }); });
+
+    await provider.send(sessionId, 'hi');
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+    child.emit('exit', 1, null);
+    await flush();
+
+    expect(statuses).toEqual([
+      { status: 'working', label: null },
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null },
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null },
+    ]);
   });
 
   it('reports a failed turn as a recoverable provider error, not a completion', async () => {
@@ -526,7 +570,7 @@ describe('DeepseekHarnessProvider', () => {
     });
     const sessionId = await startSession();
     await expect(provider.send(sessionId, 'hi')).rejects.toThrow(
-      /npm install -g @deepseek-ai\/dsh@0\.1\.0-rc\.7/,
+      /npm install -g @deepseek-ai\/dsh@0\.2\.2-rc\.5/,
     );
 
     const healthy = new FakeChild();
@@ -604,10 +648,20 @@ describe('DeepseekHarnessProvider', () => {
 });
 
 describe('buildDshOverlay', () => {
-  it('disables the one-shot harness rows and mounts the bridge by absolute path', () => {
+  it('disables the one-shot harness rows, decouples sandbox-policy, and mounts the bridge by absolute path', () => {
     const rows = buildDshOverlay({});
     for (const id of DSH_DISABLED_ROW_IDS) {
       expect(rows).toContainEqual({ id, disabled: true });
+    }
+    expect(rows).toContainEqual({
+      id: DSH_SANDBOX_POLICY_ROW_ID,
+      inject: [],
+      config: { mode: 'workspace-write' },
+    });
+    const fencedRows = buildDshOverlay({ nativeAgentsFenced: true });
+    expect(DSH_NATIVE_AGENT_ROW_IDS).toContain('tool-agent-team');
+    for (const id of DSH_NATIVE_AGENT_ROW_IDS) {
+      expect(fencedRows).toContainEqual({ id, disabled: true });
     }
     const insert = rows.find((row) => row.insert)?.insert?.slice(-1)[0];
     expect(insert?.name).toMatch(/deepseek-harness\/bridge\.js$/);
