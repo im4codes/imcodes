@@ -750,6 +750,7 @@ let _lastObservedAuthScope: VoiceHotwordsScopeSnapshot = getVoiceHotwordsScopeSn
 function invalidateVoiceSessionsOnAuthScopeChange(): void {
   _primedOutcome = null;
   _listening = false;
+  cancelRemoteVoiceCapturePrime();
   if (_webSession) {
     void stopWebListening(true);
   }
@@ -781,6 +782,11 @@ function invalidateVoiceSessionsOnAuthScopeChange(): void {
     const ctrl = _pendingRemoteAbort;
     _pendingRemoteAbort = null;
     ctrl.abort();
+  }
+  if (_pendingRemoteStopAbort) {
+    const abortPendingStop = _pendingRemoteStopAbort;
+    _pendingRemoteStopAbort = null;
+    abortPendingStop();
   }
   if (_activeRemoteSession) {
     const active = _activeRemoteSession;

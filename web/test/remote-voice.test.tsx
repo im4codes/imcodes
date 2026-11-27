@@ -4456,4 +4456,122 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       resetVoiceHotwordsScopeForTesting();
     }
   });
+
+  it('cancels standalone remote prime and in-flight normal stop mic drain on account switch with zero leaked PCM or stop frames', async () => {
+    vi.stubGlobal('Capacitor', {
+      getPlatform: () => 'ios',
+      isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+    });
+    setupFakeWebAudio({ sampleRate: 16_000 });
+    FakeWebSocket.instances.length = 0;
+
+    const removeRawListener = vi.fn(async () => {});
+    const startRawPcmCapture = vi.fn(async () => {});
+    const stopRawPcmCapture = vi.fn(async () => {});
+    streamingBridge.addListener.mockImplementation(async (name: string, fn: (data: unknown) => void) => {
+      streamingBridge.listeners[name] = fn;
+      return { remove: name === 'rawPcmChunk' ? removeRawListener : vi.fn(async () => {}) };
+    });
+    Object.assign(streamingBridge, { startRawPcmCapture, stopRawPcmCapture });
+
+    try {
+      const sharedProvider: RemoteVoiceProvidersSnapshot['providers'][number] = {
+        deviceId: 'other-mac',
+        displayName: 'Shared Mac',
+        model: 'qwen3-1.7b',
+        modelLabel: 'Qwen3-ASR 1.7B',
+        ready: true,
+        busy: false,
+        shareScope: 'server',
+        providerKind: 'pc_app',
+        isOwnDevice: false,
+      };
+      const snapshot: RemoteVoiceProvidersSnapshot = {
+        primaryDeviceId: 'other-mac',
+        canManageServerSharing: false,
+        canShareOwnProviderToServer: false,
+        providers: [sharedProvider],
+      };
+      resetRemoteVoiceClientForTesting({ primaryDeviceId: 'other-mac', fetchedAt: Date.now(), providers: [sharedProvider] });
+      apiMocks.fetchRemoteVoiceProviders.mockResolvedValue(snapshot);
+      await probeRemoteMicPermission();
+
+      // 1. Account A runs standalone primeVoiceGesture() with pre-roll PCM, then switches synchronously to B
+      //    before any startListening: B's session must discard A's primed PCM and stream only B's pre-roll.
+      configureApi('https://relay.example');
+      configureExpectedUserId('user-a');
+      expect(VoiceInput.primeVoiceGesture()).toBe(true);
+      await waitFor(() => expect(startRawPcmCapture).toHaveBeenCalledTimes(1));
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array([9999, -9999])),
+        level: 0.5,
+      });
+
+      configureExpectedUserId('user-b');
+      await waitFor(() => expect(stopRawPcmCapture).toHaveBeenCalledTimes(1));
+
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-b-after-prime' });
+      const startB = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: null });
+      await waitFor(() => expect(startRawPcmCapture).toHaveBeenCalledTimes(2));
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array([111, -111])),
+        level: 0.2,
+      });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      const wsB = FakeWebSocket.instances[0]!;
+      wsB.emitOpen();
+      const frameB = JSON.parse(wsB.sent[0]!) as { sessionId: string };
+      wsB.emitMessage({ type: 'voice.session.ready', sessionId: frameB.sessionId });
+      await expect(startB).resolves.toBe(true);
+
+      const streamedB = wsB.sent
+        .map((s) => JSON.parse(s) as { type: string; pcmBase64?: string })
+        .filter((f) => f.type === 'voice.session.audio' && typeof f.pcmBase64 === 'string')
+        .flatMap((f) => Array.from(decodeBase64ToInt16Pcm(f.pcmBase64!)));
+      expect(streamedB).toEqual([111, -111]);
+      expect(streamedB).not.toContain(9999);
+
+      wsB.emitMessage({ type: 'voice.session.end', sessionId: frameB.sessionId });
+      await VoiceInput.stopListening({ abort: true });
+
+      // 2. Account A is in normal stopListening({ abort: false }) suspended inside mic drain,
+      //    then switches to B: sends voice.session.abort immediately and sends zero tail PCM/stop on drain release.
+      configureExpectedUserId('user-a');
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-a-drain' });
+      const startA = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: null });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+      const wsA = FakeWebSocket.instances[1]!;
+      wsA.emitOpen();
+      const frameA = JSON.parse(wsA.sent[0]!) as { sessionId: string };
+      wsA.emitMessage({ type: 'voice.session.ready', sessionId: frameA.sessionId });
+      await expect(startA).resolves.toBe(true);
+
+      let resolveDrain!: () => void;
+      stopRawPcmCapture.mockImplementationOnce(
+        () => new Promise<void>((res) => { resolveDrain = res; }),
+      );
+      const stopPromiseA = VoiceInput.stopListening({ abort: false });
+      await waitFor(() => expect(resolveDrain).toBeTypeOf('function'));
+
+      configureExpectedUserId('user-b');
+      expect(wsA.closedWith).not.toBeNull();
+      expect(wsA.sent.some((raw) => JSON.parse(raw).type === 'voice.session.abort')).toBe(true);
+      const sentCountAtAbort = wsA.sent.length;
+
+      // Release suspended mic drain with late tail PCM -> must flush neither tail audio nor voice.session.stop
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array([7777, -7777])),
+        level: 0.4,
+      });
+      resolveDrain();
+      await stopPromiseA;
+      expect(wsA.sent).toHaveLength(sentCountAtAbort);
+    } finally {
+      delete (streamingBridge as Record<string, unknown>).startRawPcmCapture;
+      delete (streamingBridge as Record<string, unknown>).stopRawPcmCapture;
+      configureExpectedUserId(null);
+      configureApi('');
+      resetVoiceHotwordsScopeForTesting();
+    }
+  });
 });
