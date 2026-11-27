@@ -2429,7 +2429,7 @@ describe('Web Mobile final drain', () => {
       // 1. Prime with proj-a: StreamingSpeech.start receives proj-a hotwords immediately.
       expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true, projectKey: 'proj-a' })).toBe(true);
       await waitFor(() => expect(streamingApi.start).toHaveBeenCalledTimes(1));
-      expect(streamingApi.start.mock.calls[0]?.[0]).toMatchObject({ hotwords: ['AlphaTerm'] });
+      expect(streamingApi.start.mock.calls[0]?.[0]).toMatchObject({ hotwords: ['AlphaTerm', 'alpha term'] });
 
       // Adopt with matching proj-a: reuses primed session with zero restart, and applies proj-a post-processing.
       const resA = vi.fn();
@@ -2452,7 +2452,7 @@ describe('Web Mobile final drain', () => {
       await expect(VoiceInput.startListening(resB, undefined, undefined, { projectKey: 'proj-b' })).resolves.toBe(true);
       expect(streamingApi.stop).toHaveBeenCalledTimes(1);
       expect(streamingApi.start).toHaveBeenCalledTimes(2);
-      expect(streamingApi.start.mock.calls[1]?.[0]).toMatchObject({ hotwords: ['BetaTerm'] });
+      expect(streamingApi.start.mock.calls[1]?.[0]).toMatchObject({ hotwords: ['BetaTerm', 'beta term'] });
       expect(streamingApi.requestPermissions).not.toHaveBeenCalled();
       expect(streamingApi.available).not.toHaveBeenCalled();
       listeners.partialResults?.({ matches: ['using beta term here'], isFinal: true });
@@ -2473,7 +2473,7 @@ describe('Web Mobile final drain', () => {
       await expect(VoiceInput.startListening(resAfterEnd, undefined, undefined, { projectKey: 'proj-b' })).resolves.toBe(true);
       expect(resAfterEnd).not.toHaveBeenCalled();
       expect(streamingApi.start).toHaveBeenCalledTimes(2);
-      expect(streamingApi.start.mock.calls[1]?.[0]).toMatchObject({ hotwords: ['BetaTerm'] });
+      expect(streamingApi.start.mock.calls[1]?.[0]).toMatchObject({ hotwords: ['BetaTerm', 'beta term'] });
       listeners.partialResults?.({ matches: ['fresh beta term'], isFinal: true });
       expect(resAfterEnd).toHaveBeenLastCalledWith('fresh BetaTerm', true);
       await VoiceInput.stopListening({ abort: true });
@@ -2495,6 +2495,37 @@ describe('Web Mobile final drain', () => {
       expect(speechApi.stop).not.toHaveBeenCalled();
       listeners.partialResults?.({ matches: ['using alpha term fallback'], isFinal: true });
       expect(resFallback2).toHaveBeenLastCalledWith('using AlphaTerm fallback', true);
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
+      hotwordsMod.resetVoiceHotwordsScopeForTesting();
+      (globalThis as any).Capacitor = origCap;
+    }
+  });
+
+  it('restarts primed native capture when alias from trigger is updated', async () => {
+    const origCap = (globalThis as any).Capacitor;
+    (globalThis as any).Capacitor = {
+      isNativePlatform: () => true,
+      isPluginAvailable: () => true,
+      getPlatform: () => 'ios',
+    };
+    const hotwordsMod = await import('../../src/voice-hotwords.js');
+    hotwordsMod.resetVoiceHotwordsScopeForTesting();
+
+    try {
+      await VoiceInput.prewarm({ requestPermission: false });
+      hotwordsMod.setProjectVoiceHotwordsRaw('proj-alias-update', 'AlphaTerm\nalpha old => AlphaTerm');
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true, projectKey: 'proj-alias-update' })).toBe(true);
+      await waitFor(() => expect(streamingApi.start).toHaveBeenCalledTimes(1));
+      expect(streamingApi.start.mock.calls[0]?.[0]).toMatchObject({ hotwords: ['AlphaTerm', 'alpha old'] });
+
+      // Change from trigger in project hotwords -> startedHotwordsKey mismatch triggers clean restart
+      hotwordsMod.setProjectVoiceHotwordsRaw('proj-alias-update', 'AlphaTerm\nalpha new => AlphaTerm');
+      const resUpdated = vi.fn();
+      await expect(VoiceInput.startListening(resUpdated, undefined, undefined, { projectKey: 'proj-alias-update' })).resolves.toBe(true);
+      expect(streamingApi.stop).toHaveBeenCalledTimes(1);
+      expect(streamingApi.start).toHaveBeenCalledTimes(2);
+      expect(streamingApi.start.mock.calls[1]?.[0]).toMatchObject({ hotwords: ['AlphaTerm', 'alpha new'] });
       await VoiceInput.stopListening({ abort: true });
     } finally {
       hotwordsMod.resetVoiceHotwordsScopeForTesting();

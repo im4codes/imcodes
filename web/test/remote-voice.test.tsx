@@ -4109,7 +4109,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     const ws2 = FakeWebSocket.instances[1]!;
     ws2.emitOpen();
     const startFrame2 = JSON.parse(ws2.sent[0]!) as Record<string, unknown>;
-    expect(startFrame2.hotwords).toEqual(['IM.codes', 'worktree']);
+    expect(startFrame2.hotwords).toEqual(['IM.codes', 'worktree', '爱码']);
     expect(startFrame2.allowSharedHotwords).toBe(true);
     ws2.emitMessage({ type: 'voice.session.ready', sessionId: startFrame2.sessionId });
     await expect(start2).resolves.toBe(true);
@@ -4159,7 +4159,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     const ws3 = FakeWebSocket.instances[2]!;
     ws3.emitOpen();
     const startFrame3 = JSON.parse(ws3.sent[0]!) as Record<string, unknown>;
-    expect(startFrame3.hotwords).toEqual(['IM.codes', 'worktree']);
+    expect(startFrame3.hotwords).toEqual(['IM.codes', 'worktree', '爱码']);
     ws3.emitMessage({ type: 'voice.session.ready', sessionId: startFrame3.sessionId });
     await expect(start3).resolves.toBe(true);
     ws3.emitMessage({ type: 'voice.session.end', sessionId: startFrame3.sessionId });
@@ -4428,7 +4428,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       const wsX = FakeWebSocket.instances[1]!;
       wsX.emitOpen();
       const frameX = JSON.parse(wsX.sent[0]!) as Record<string, unknown>;
-      expect(frameX.hotwords).toEqual(['OldTerm']);
+      expect(frameX.hotwords).toEqual(['OldTerm', 'old alias']);
       wsX.emitMessage({ type: 'voice.session.ready', sessionId: frameX.sessionId });
       await expect(startX).resolves.toBe(true);
       wsX.emitMessage({ type: 'voice.session.result', sessionId: frameX.sessionId, text: 'run old alias', isFinal: true });
@@ -4443,7 +4443,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       const wsY = FakeWebSocket.instances[2]!;
       wsY.emitOpen();
       const frameY = JSON.parse(wsY.sent[0]!) as Record<string, unknown>;
-      expect(frameY.hotwords).toEqual(['NewTerm']);
+      expect(frameY.hotwords).toEqual(['NewTerm', 'new alias']);
       wsY.emitMessage({ type: 'voice.session.ready', sessionId: frameY.sessionId });
       await expect(startY).resolves.toBe(true);
       wsY.emitMessage({ type: 'voice.session.result', sessionId: frameY.sessionId, text: 'run new alias', isFinal: true });

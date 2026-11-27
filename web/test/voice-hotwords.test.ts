@@ -62,10 +62,12 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
 
     const compiledA = getCompiledVoiceHotwordsForProject('proj-a');
     expect(compiledA.terms).toEqual(['IM.codes', 'worktree', 'Antigravity']);
+    expect(compiledA.asrTerms).toEqual(['IM.codes', 'worktree', 'Antigravity', 'wrong term']);
     expect(compiledA.replacements).toEqual([{ from: 'wrong term', to: 'IM.codes' }]);
 
     const compiledB = getCompiledVoiceHotwordsForProject('proj-b');
     expect(compiledB.terms).toEqual(['codex-sdk', 'Antigravity', 'GlobalTarget']);
+    expect(compiledB.asrTerms).toEqual(['codex-sdk', 'Antigravity', 'GlobalTarget', 'wrong term']);
     expect(compiledB.replacements).toEqual([{ from: 'wrong term', to: 'GlobalTarget' }]);
 
     // Privacy default: false for others' shared devices, always true for own PC App & server HTTP ASR
@@ -74,12 +76,16 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
     expect(shouldSendRemoteVoiceHotwords({ providerKind: 'pc_app', isOwnDevice: true })).toBe(true);
     expect(shouldSendRemoteVoiceHotwords({ providerKind: 'pc_app', isOwnDevice: false })).toBe(false);
     expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: false }, compiledA)).toBeUndefined();
-    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: true }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity']);
-    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'http_asr', isOwnDevice: false }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity']);
+    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: true }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity', 'wrong term']);
+    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'http_asr', isOwnDevice: false }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity', 'wrong term']);
 
     setShareHotwordsWithOthers(true);
     expect(getShareHotwordsWithOthers()).toBe(true);
-    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: false }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity']);
+    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'pc_app', isOwnDevice: false }, compiledA)).toEqual(['IM.codes', 'worktree', 'Antigravity', 'wrong term']);
+
+    // Fallback compatibility with partial compiled objects lacking asrTerms
+    const legacyCompiled = { terms: ['LegacyTerm'], contextText: 'LegacyTerm', replacements: [] };
+    expect(resolveRemoteVoiceHotwordsForProvider({ providerKind: 'http_asr', isOwnDevice: false }, legacyCompiled as any)).toEqual(['LegacyTerm']);
   });
 
   it('renders VoiceHotwordsSection, persists project/global edits and share toggle, and switches projects', async () => {
@@ -187,7 +193,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
     setVoiceHotwordsAuthScope(null);
     expect(getGlobalVoiceHotwordsRaw()).toBe('');
     expect(getShareHotwordsWithOthers()).toBe(false);
-    expect(getCompiledVoiceHotwordsForProject(srv1Proj).terms).toEqual([]);
+    expect(getCompiledVoiceHotwordsForProject(srv1Proj)).toEqual({ terms: [], asrTerms: [], contextText: '', replacements: [] });
 
     // Switch on same origin to Account B -> zero inheritance from A
     setVoiceHotwordsAuthScope({ userId: 'user-b', baseUrl: origin });

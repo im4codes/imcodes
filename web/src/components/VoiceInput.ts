@@ -864,7 +864,7 @@ async function finalizeBufferedSpeechOnOwner(
   }
   const pcmBase64 = encodeInt16PcmToBase64(bufferedPcm);
   const locale = pickRecognitionLocale();
-  const ownerHotwords = owner.hotwords?.terms;
+  const ownerHotwords = owner.hotwords?.asrTerms ?? owner.hotwords?.terms;
   if (isPcAppNativeSpeech()) {
     const bridge = getPcAppBridge();
     if (!bridge?.voice) return;
@@ -1765,7 +1765,7 @@ function captureHotwordsSessionContext(options?: { projectKey?: VoiceHotwordProj
     context: {
       scope,
       projectKey,
-      termsKey: serializeHotwordsTerms(compiledHotwords.terms),
+      termsKey: serializeHotwordsTerms(compiledHotwords.asrTerms ?? compiledHotwords.terms),
     },
   };
 }
@@ -2034,7 +2034,7 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
     };
 
     session.startInvoked = true;
-    const ownerHotwords = session.owner.hotwords?.terms;
+    const ownerHotwords = session.owner.hotwords?.asrTerms ?? session.owner.hotwords?.terms;
     const canPassHotwords = canAcceptHotwordsForRecognition(recognition);
     session.startedHotwordsKey = serializeHotwordsTerms(canPassHotwords ? ownerHotwords : undefined);
     const initialStartOpts = {
@@ -3765,7 +3765,7 @@ async function startLocalListening(
     }
   }
 
-  const expectedNativeHotwordsKey = getExpectedNativeHotwordsKey(hotwords?.terms);
+  const expectedNativeHotwordsKey = getExpectedNativeHotwordsKey(hotwords?.asrTerms ?? hotwords?.terms);
   const primedOutcome = consumePrimedOutcome(
     onResult,
     onListeningChange,
@@ -3794,7 +3794,7 @@ async function startLocalListening(
     const scopeMismatch = preCheckAdoptable.accountKey !== effectiveScope.accountKey
       || preCheckAdoptable.scopeEpoch !== effectiveScope.epoch;
     const requestedHotwordsKey = serializeHotwordsTerms(
-      canAcceptHotwordsForRecognition(preCheckAdoptable.recognition) ? hotwords?.terms : undefined,
+      canAcceptHotwordsForRecognition(preCheckAdoptable.recognition) ? (hotwords?.asrTerms ?? hotwords?.terms) : undefined,
     );
     const hotwordsMismatch = preCheckAdoptable.startInvoked
       && preCheckAdoptable.startedHotwordsKey !== undefined

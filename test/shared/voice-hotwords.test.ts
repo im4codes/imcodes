@@ -39,7 +39,8 @@ describe('shared voice hotwords', () => {
     });
 
     expect(merged.terms).toEqual(['IM.codes', 'worktree', 'Antigravity']);
-    expect(merged.contextText).toBe('IM.codes, worktree, Antigravity');
+    expect(merged.asrTerms).toEqual(['IM.codes', 'worktree', 'Antigravity', 'im codes']);
+    expect(merged.contextText).toBe('IM.codes, worktree, Antigravity, im codes');
     expect(merged.replacements).toEqual([{ from: 'im codes', to: 'IM.codes' }]);
 
     // Flood with 500 lines and oversized aliases
@@ -51,11 +52,96 @@ describe('shared voice hotwords', () => {
     });
 
     expect(bounded.terms.length).toBeLessThanOrEqual(VOICE_HOTWORDS_MAX_TERMS);
+    expect(bounded.asrTerms.length).toBeLessThanOrEqual(VOICE_HOTWORDS_MAX_TERMS);
     expect(bounded.contextText.length).toBeLessThanOrEqual(VOICE_HOTWORDS_MAX_CONTEXT_CHARS);
     expect(bounded.replacements.length).toBeLessThanOrEqual(VOICE_HOTWORDS_MAX_ALIASES);
     for (const term of bounded.terms) {
       expect(term.length).toBeLessThanOrEqual(64);
     }
+  });
+
+  it('places target terms in terms and front of asrTerms, and from triggers at back of asrTerms and in contextText', () => {
+    const compiled = mergeVoiceHotwords({
+      projectRaw: 'Kubernetes\n库伯 => Kubernetes\nK8s -> Kubernetes\nPrometheus',
+    });
+
+    // terms: only canonical terms and alias targets (1 line = 1 word for UI)
+    expect(compiled.terms).toEqual(['Kubernetes', 'Prometheus']);
+    // asrTerms: canonical terms first, then low-priority from triggers
+    expect(compiled.asrTerms).toEqual(['Kubernetes', 'Prometheus', '库伯', 'K8s']);
+    expect(compiled.contextText).toBe('Kubernetes, Prometheus, 库伯, K8s');
+    expect(compiled.replacements).toEqual([
+      { from: '库伯', to: 'Kubernetes' },
+      { from: 'K8s', to: 'Kubernetes' },
+    ]);
+  });
+
+  it('prioritizes all canonical terms over from triggers when approaching 60 terms budget', () => {
+    // 58 canonical terms + 5 aliases whose targets add 2 more terms to reach 60 terms
+    const baseTerms = Array.from({ length: 58 }, (_, i) => `NormTerm_${i}`);
+    const aliases = Array.from({ length: 5 }, (_, i) => `Trigger_${i} => Target_${i}`);
+    const compiled = mergeVoiceHotwords({
+      projectRaw: [...baseTerms, ...aliases].join('\n'),
+    });
+
+    expect(compiled.terms.length).toBe(60);
+    expect(compiled.terms.slice(0, 58)).toEqual(baseTerms);
+    expect(compiled.terms.slice(58)).toEqual(['Target_0', 'Target_1']);
+    // asrTerms is capped at 60 and contains all 60 terms; triggers never displace canonical terms
+    expect(compiled.asrTerms.length).toBe(60);
+    expect(compiled.asrTerms).toEqual(compiled.terms);
+
+    // When canonical terms stop at 58 and targets already exist, remaining budget is filled by from triggers
+    const compiledWithRoom = mergeVoiceHotwords({
+      projectRaw: [...baseTerms, 'Trigger_A => NormTerm_0', 'Trigger_B => NormTerm_1', 'Trigger_C => NormTerm_2'].join('\n'),
+    });
+    expect(compiledWithRoom.terms.length).toBe(58);
+    expect(compiledWithRoom.asrTerms.length).toBe(60);
+    expect(compiledWithRoom.asrTerms.slice(0, 58)).toEqual(baseTerms);
+    expect(compiledWithRoom.asrTerms.slice(58)).toEqual(['Trigger_A', 'Trigger_B']);
+  });
+
+  it('strictly bounds contextText to 1000 characters without truncating existing canonical terms', () => {
+    // Build canonical terms totaling ~960 chars
+    const chunks = Array.from({ length: 30 }, (_, i) => `LongCanonicalTerm_${i}_${'y'.repeat(15)}`);
+    const longAlias = `${'z'.repeat(60)} => ShortTarget`;
+    const compiled = mergeVoiceHotwords({
+      projectRaw: [...chunks, longAlias].join('\n'),
+    });
+
+    expect(compiled.terms).toContain('ShortTarget');
+    expect(compiled.contextText.length).toBeLessThanOrEqual(VOICE_HOTWORDS_MAX_CONTEXT_CHARS);
+    for (const term of compiled.terms) {
+      expect(compiled.asrTerms).toContain(term);
+    }
+  });
+
+  it('prevents shadowed or protected global alias from triggers from leaking into asrTerms', () => {
+    const compiled = mergeVoiceHotwords({
+      projectRaw: 'Kubernetes\n库伯 => Kubernetes',
+      globalRaw: '库伯 => WrongK8s\n全局专名 => GlobalTarget\nKubernetes => ShadowedK8s',
+    });
+
+    expect(compiled.terms).toEqual(['Kubernetes', 'GlobalTarget']);
+    expect(compiled.asrTerms).toEqual(['Kubernetes', 'GlobalTarget', '库伯', '全局专名']);
+    expect(compiled.contextText).toBe('Kubernetes, GlobalTarget, 库伯, 全局专名');
+    expect(compiled.asrTerms).not.toContain('WrongK8s');
+    expect(compiled.asrTerms).not.toContain('ShadowedK8s');
+  });
+
+  it('deduplicates from triggers case-insensitively and when from matches an existing term', () => {
+    const compiled = mergeVoiceHotwords({
+      projectRaw: 'kubernetes => Kubernetes\nk8s => Kubernetes\nK8S => Kubernetes',
+    });
+
+    // 'kubernetes' matches target 'Kubernetes' case-insensitively -> not duplicated in asrTerms
+    // 'K8S' matches 'k8s' case-insensitively -> not duplicated in asrTerms
+    expect(compiled.terms).toEqual(['Kubernetes']);
+    expect(compiled.asrTerms).toEqual(['Kubernetes', 'k8s']);
+    expect(compiled.contextText).toBe('Kubernetes, k8s');
+
+    // Post processing still works accurately
+    expect(applyVoiceHotwordPostProcess('deploy on k8s cluster', compiled)).toBe('deploy on Kubernetes cluster');
   });
 
   it('sanitizes remote wire hotwords and rejects non-array / non-string payloads', () => {

@@ -351,7 +351,7 @@ export function setShareHotwordsWithOthers(enabled: boolean): void {
 
 export function getCompiledVoiceHotwordsForProject(projectKey?: VoiceHotwordProjectInput): CompiledVoiceHotwords {
   if (!resolveCurrentAccountScopeKey()) {
-    return { terms: [], contextText: '', replacements: [] };
+    return { terms: [], asrTerms: [], contextText: '', replacements: [] };
   }
   // Explicit `null` means an explicit no-project voice entry (global hotwords only, never active-project fallback).
   const resolvedKey = projectKey === null
@@ -385,7 +385,8 @@ export function resolveRemoteVoiceHotwordsForProvider(
   compiled: CompiledVoiceHotwords | null | undefined,
   shareWithOthers: boolean = getShareHotwordsWithOthers(),
 ): string[] | undefined {
-  if (!compiled || compiled.terms.length === 0) return undefined;
+  const asrTerms = compiled?.asrTerms ?? compiled?.terms;
+  if (!asrTerms || asrTerms.length === 0) return undefined;
   if (!shouldSendRemoteVoiceHotwords(provider, shareWithOthers)) return undefined;
-  return compiled.terms;
+  return asrTerms;
 }

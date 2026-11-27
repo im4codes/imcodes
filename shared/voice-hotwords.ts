@@ -15,6 +15,7 @@ export interface VoiceHotwordReplacement {
 
 export interface CompiledVoiceHotwords {
   terms: string[];
+  asrTerms: string[];
   contextText: string;
   replacements: VoiceHotwordReplacement[];
 }
@@ -257,9 +258,25 @@ export function mergeVoiceHotwords(input: MergeVoiceHotwordsInput): CompiledVoic
     }
   }
 
+  const asrTerms: string[] = [...terms];
+  const seenAsrKeys = new Set<string>(seenTerms);
+  let asrContextLength = contextLength;
+
+  for (const alias of replacements) {
+    if (asrTerms.length >= VOICE_HOTWORDS_MAX_TERMS) break;
+    const key = termDedupeKey(alias.from);
+    if (seenAsrKeys.has(key)) continue;
+    const sepLen = asrTerms.length === 0 ? 0 : 2;
+    if (asrContextLength + sepLen + alias.from.length > VOICE_HOTWORDS_MAX_CONTEXT_CHARS) continue;
+    seenAsrKeys.add(key);
+    asrTerms.push(alias.from);
+    asrContextLength += sepLen + alias.from.length;
+  }
+
   return {
     terms,
-    contextText: terms.join(', '),
+    asrTerms,
+    contextText: asrTerms.join(', '),
     replacements,
   };
 }
