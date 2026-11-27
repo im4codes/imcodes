@@ -239,6 +239,7 @@ function collect(p: QoderSdkProvider) {
   const approvals: any[] = [];
   const statuses: any[] = [];
   const sessionInfos: any[] = [];
+  const usages: any[] = [];
   p.onDelta((sessionId, delta) => deltas.push({ sessionId, delta }));
   p.onComplete((sessionId, message) => completions.push({ sessionId, message }));
   p.onError((sessionId, error) => errors.push({ sessionId, error }));
@@ -246,7 +247,8 @@ function collect(p: QoderSdkProvider) {
   p.onApprovalRequest((sessionId, request) => approvals.push({ sessionId, request }));
   p.onStatus((sessionId, status) => statuses.push({ sessionId, status }));
   p.onSessionInfo((sessionId, info) => sessionInfos.push({ sessionId, info }));
-  return { deltas, completions, errors, tools, approvals, statuses, sessionInfos };
+  p.onUsage((sessionId, usage) => usages.push({ sessionId, usage }));
+  return { deltas, completions, errors, tools, approvals, statuses, sessionInfos, usages };
 }
 
 describe('Qoder SDK import surface and config gates', () => {
@@ -935,7 +937,7 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
     vi.useRealTimers();
   });
 
-  it('treats compact_boundary as status-only and emits one terminal result', async () => {
+  it('treats compact_boundary as compacting status, clears on completion, and emits one terminal result', async () => {
     const p = await makeProvider();
     const route = await createReadySession(p);
     const events = collect(p);
@@ -948,10 +950,145 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
     await p.send(route, '/compact');
     await vi.waitFor(() => expect(events.completions).toHaveLength(1));
 
-    expect(events.statuses.some((event) => event.status.status === 'qoder_compact_boundary')).toBe(true);
+    expect(events.statuses.some((event) => event.status.status === 'compacting')).toBe(true);
+    expect(events.statuses.at(-1)?.status).toEqual({ status: null, label: null });
     expect(events.completions[0].message.kind).toBe('text');
     expect(events.completions[0].message.content).toBe('after compact');
     expect(events.errors).toHaveLength(0);
+  });
+
+  it('emits live and finalized exact context token usage via onUsage and modelUsage contextWindow', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    const events = collect(p);
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'init', session_id: 'qoder-usage-1', model: 'performance' },
+      {
+        type: 'stream_event',
+        event: {
+          type: 'message_start',
+          message: {
+            id: 'msg-usage-1',
+            model: 'performance',
+            usage: { input_tokens: 12000, cache_read_input_tokens: 4000, cache_creation_input_tokens: 500, output_tokens: 1 },
+          },
+        },
+      },
+      {
+        type: 'stream_event',
+        event: {
+          type: 'message_delta',
+          usage: { output_tokens: 45 },
+        },
+      },
+      {
+        type: 'assistant',
+        uuid: 'asst-1',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Working' }],
+          usage: { input_tokens: 14500, cache_read_input_tokens: 4000, cache_creation_input_tokens: 0, output_tokens: 80 },
+        },
+      },
+      { type: 'stream_event', event: { type: 'message_stop' } },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Done',
+        uuid: 'res-usage-1',
+        usage: { input_tokens: 26500, cache_read_input_tokens: 8000, cache_creation_input_tokens: 500, output_tokens: 125 },
+        modelUsage: {
+          performance: {
+            inputTokens: 26500,
+            outputTokens: 125,
+            cacheReadInputTokens: 8000,
+            cacheCreationInputTokens: 500,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 256000,
+            maxOutputTokens: 16384,
+          },
+        },
+      },
+    ]);
+
+    await p.send(route, 'check usage');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(1));
+
+    // message_start, message_delta (preserving input/cache), assistant, finalized result
+    expect(events.usages).toHaveLength(4);
+    expect(events.usages[0].usage).toMatchObject({
+      messageId: 'msg-usage-1',
+      model: 'performance',
+      usage: { input_tokens: 12000, cache_read_input_tokens: 4000, cache_creation_input_tokens: 500, output_tokens: 1 },
+    });
+    expect(events.usages[0].usage.finalized).toBeUndefined();
+    expect(events.usages[1].usage.usage).toMatchObject({
+      input_tokens: 12000,
+      cache_read_input_tokens: 4000,
+      cache_creation_input_tokens: 500,
+      output_tokens: 45,
+    });
+    expect(events.usages[3].usage).toEqual({
+      messageId: 'res-usage-1',
+      finalized: true,
+      model: 'performance',
+      usage: {
+        input_tokens: 14500,
+        cache_read_input_tokens: 4000,
+        cache_creation_input_tokens: 0,
+        output_tokens: 125,
+        model_context_window: 256000,
+      },
+    });
+    expect(events.completions[0].message.metadata.usage).toMatchObject({
+      input_tokens: 14500,
+      cache_read_input_tokens: 4000,
+      output_tokens: 125,
+      model_context_window: 256000,
+    });
+    expect(events.completions[0].message.metadata.totalUsage).toMatchObject({
+      input_tokens: 26500,
+      output_tokens: 125,
+    });
+    expect(p.getSessionDiagnostics(route)).toMatchObject({ unknownMessageCount: 0 });
+  });
+
+  it('handles SDK status compacting/null transitions, clears on cancel/error/endSession, and ignores transcript-only replays', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    const events = collect(p);
+
+    // 1. status: 'compacting' -> null -> transcript-only assistant replay ignored -> error clears status
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'status', status: 'compacting' },
+      { type: 'system', subtype: 'status', status: null },
+      {
+        type: 'assistant',
+        isVisibleInTranscriptOnly: true,
+        uuid: 'replay-only-1',
+        message: { role: 'assistant', content: [{ type: 'text', text: 'replayed history' }] },
+      },
+      { type: 'system', subtype: 'status', status: 'compacting' },
+      { type: 'result', subtype: 'error_during_execution', errors: ['failed mid compact'], uuid: 'err-compact' },
+    ]);
+
+    await p.send(route, 'hello');
+    await vi.waitFor(() => expect(events.errors).toHaveLength(1));
+    expect(events.statuses.filter((e) => e.status.status === 'compacting')).toHaveLength(2);
+    expect(events.statuses.some((e) => e.status.status === null)).toBe(true);
+    expect(events.statuses.at(-1)?.status).toEqual({ status: null, label: null });
+    expect(events.deltas).toHaveLength(0);
+
+    // 2. endSession mid-compaction clears status cleanly
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'compact_boundary' },
+      { waitForInterrupt: true, lateMessages: [] },
+    ]);
+    await p.send(route, 'compact then end');
+    await vi.waitFor(() => expect(events.statuses.filter((e) => e.status.status === 'compacting')).toHaveLength(3));
+    await p.endSession(route);
+    expect(events.statuses.at(-1)?.status).toEqual({ status: null, label: null });
   });
 
   it('fails closed and unlocks the session when the SDK stream ends without result or error', async () => {

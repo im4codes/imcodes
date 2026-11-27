@@ -17,6 +17,7 @@ import type {
   ProviderError,
   ProviderModelList,
   ProviderStatusUpdate,
+  ProviderUsageUpdate,
   ProviderDelegationNotification,
   SessionConfig,
   SessionInfoUpdate,
@@ -122,6 +123,8 @@ interface QoderSessionState {
   activeTurnSettled: Promise<void> | null;
   resolveActiveTurnSettled: (() => void) | null;
   activeNotificationAdmissions: Map<string, Promise<AgentDelegationNotificationResult>>;
+  lastAssistantUsage?: NonNullable<ProviderUsageUpdate['usage']>;
+  compacting: boolean;
   /**
    * The native-agent fence the in-flight query was started with. Qoder
    * appends later messages into that live query, so it governs them too.
@@ -231,6 +234,61 @@ function normalizeUsage(usage: unknown): AgentMessage['metadata'] {
   return Object.keys(metadata).length ? { usage: metadata } : undefined;
 }
 
+function readNonNegativeTokenCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
+}
+
+function extractModelContextWindow(modelUsage: unknown, activeModel?: string): number | undefined {
+  if (!isRecord(modelUsage)) return undefined;
+  const candidates: Array<Record<string, unknown>> = [];
+  if (activeModel && isRecord(modelUsage[activeModel])) {
+    candidates.push(modelUsage[activeModel]);
+  }
+  for (const entry of Object.values(modelUsage)) {
+    if (isRecord(entry)) candidates.push(entry);
+  }
+  for (const candidate of candidates) {
+    const windowSize = readNumber(candidate.contextWindow);
+    if (windowSize !== undefined && windowSize > 0) return Math.round(windowSize);
+  }
+  return undefined;
+}
+
+function normalizeProviderUsage(
+  usage: unknown,
+  modelUsage?: unknown,
+  activeModel?: string,
+): NonNullable<ProviderUsageUpdate['usage']> | undefined {
+  const out: NonNullable<ProviderUsageUpdate['usage']> = {};
+  if (isRecord(usage)) {
+    const input = readNonNegativeTokenCount(usage.input_tokens);
+    const output = readNonNegativeTokenCount(usage.output_tokens);
+    const cacheRead = readNonNegativeTokenCount(usage.cache_read_input_tokens);
+    const cacheCreation = readNonNegativeTokenCount(usage.cache_creation_input_tokens);
+    const cachedInput = readNonNegativeTokenCount(usage.cached_input_tokens);
+    const explicitWindow = readNonNegativeTokenCount(usage.model_context_window);
+    if (input !== undefined) out.input_tokens = input;
+    if (output !== undefined) out.output_tokens = output;
+    if (cacheRead !== undefined) out.cache_read_input_tokens = cacheRead;
+    if (cacheCreation !== undefined) out.cache_creation_input_tokens = cacheCreation;
+    if (cachedInput !== undefined) out.cached_input_tokens = cachedInput;
+    if (explicitWindow !== undefined && explicitWindow > 0) out.model_context_window = explicitWindow;
+  }
+  const modelContextWindow = extractModelContextWindow(modelUsage, activeModel);
+  if (modelContextWindow !== undefined && out.model_context_window === undefined) {
+    out.model_context_window = modelContextWindow;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function usageContextTokenSum(usage: NonNullable<ProviderUsageUpdate['usage']> | undefined): number {
+  if (!usage) return 0;
+  return (usage.input_tokens ?? 0)
+    + (usage.cache_read_input_tokens ?? 0)
+    + (usage.cache_creation_input_tokens ?? 0)
+    + (usage.cached_input_tokens ?? 0);
+}
+
 function mcpStatusFromQoder(statuses: QoderMcpServerStatus[] | undefined): MemoryMcpProviderStatusView {
   const memory = statuses?.find((status) => status.name === IMCODES_MEMORY_MCP_SERVER_NAME);
   if (!memory) {
@@ -325,6 +383,7 @@ export class QoderSdkProvider implements TransportProvider {
   private approvalCallbacks: Array<(sessionId: string, req: ApprovalRequest) => void> = [];
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
+  private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
     this.config = config;
@@ -441,6 +500,7 @@ export class QoderSdkProvider implements TransportProvider {
       activeTurnSettled: null,
       resolveActiveTurnSettled: null,
       activeNotificationAdmissions: new Map(),
+      compacting: false,
     };
     this.sessions.set(routeId, state);
     if (state.effectiveModel) this.emitSessionInfo(routeId, { model: state.effectiveModel });
@@ -485,6 +545,8 @@ export class QoderSdkProvider implements TransportProvider {
     state.completedGeneration = null;
     state.currentMessageId = null;
     state.currentText = '';
+    state.lastAssistantUsage = undefined;
+    state.compacting = false;
     state.activeTools.clear();
     state.toolBlocksByIndex.clear();
     const queryOptions = this.buildSendOptions(state, payload);
@@ -663,6 +725,11 @@ export class QoderSdkProvider implements TransportProvider {
   onStatus(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void {
     this.statusCallbacks.push(cb);
     return () => { this.statusCallbacks = this.statusCallbacks.filter((entry) => entry !== cb); };
+  }
+
+  onUsage(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void {
+    this.usageCallbacks.push(cb);
+    return () => { this.usageCallbacks = this.usageCallbacks.filter((entry) => entry !== cb); };
   }
 
   async respondApproval(sessionId: string, requestId: string, approved: boolean): Promise<void> {
@@ -1086,15 +1153,38 @@ export class QoderSdkProvider implements TransportProvider {
       return;
     }
     if (msg.subtype === 'status') {
+      if (msg.status === 'compacting') {
+        state.compacting = true;
+        this.emitStatus(sessionId, { status: 'compacting', label: 'Compacting conversation...' });
+        return;
+      }
+      if (msg.status === null || msg.status === undefined) {
+        state.compacting = false;
+        this.emitStatus(sessionId, { status: null, label: null });
+        return;
+      }
+      if (typeof msg.status === 'string') {
+        const status = readString(msg.status);
+        state.compacting = false;
+        this.emitStatus(sessionId, status ? { status, label: status.replace(/_/g, ' ') } : { status: null, label: null });
+        return;
+      }
       const statusRecord = isRecord(msg.status) ? msg.status : undefined;
-      const status = readString(statusRecord?.status) ?? readString(statusRecord?.type) ?? 'qoder_status';
-      this.emitStatus(sessionId, { status, label: status.replace(/_/g, ' ') });
+      const status = readString(statusRecord?.status) ?? readString(statusRecord?.type);
+      if (status === 'compacting') {
+        state.compacting = true;
+        this.emitStatus(sessionId, { status: 'compacting', label: 'Compacting conversation...' });
+      } else {
+        state.compacting = false;
+        this.emitStatus(sessionId, status ? { status, label: status.replace(/_/g, ' ') } : { status: null, label: null });
+      }
       return;
     }
     if (msg.subtype === 'compact_boundary') {
+      state.compacting = true;
       this.emitStatus(sessionId, {
-        status: 'qoder_compact_boundary',
-        label: 'Qoder context compacted.',
+        status: 'compacting',
+        label: 'Compacting conversation...',
       });
       return;
     }
@@ -1117,8 +1207,28 @@ export class QoderSdkProvider implements TransportProvider {
     const type = readString(event.type);
     if (type === 'message_start') {
       const message = isRecord(event.message) ? event.message : undefined;
-      state.currentMessageId = readString(message?.id) ?? `${sessionId}:qoder:${generation}`;
+      const messageId = readString(message?.id) ?? `${sessionId}:qoder:${generation}`;
+      state.currentMessageId = messageId;
       state.currentText = '';
+      const model = readString(message?.model);
+      if (model && model !== state.effectiveModel) {
+        state.effectiveModel = model;
+        this.emitSessionInfo(sessionId, { model });
+      }
+      if (isRecord(message?.usage)) {
+        this.recordLiveUsage(sessionId, state, message.usage, messageId, model);
+      }
+      return;
+    }
+    if (type === 'message_delta') {
+      const delta = isRecord(event.delta) ? event.delta : undefined;
+      const usage = isRecord(event.usage) ? event.usage : isRecord(delta?.usage) ? delta.usage : undefined;
+      if (usage) {
+        this.recordLiveUsage(sessionId, state, usage, state.currentMessageId ?? `${sessionId}:qoder:${generation}`);
+      }
+      return;
+    }
+    if (type === 'message_stop') {
       return;
     }
     if (type === 'content_block_start') {
@@ -1207,7 +1317,13 @@ export class QoderSdkProvider implements TransportProvider {
   }
 
   private handleAssistantMessage(sessionId: string, state: QoderSessionState, msg: Record<string, unknown>): void {
+    if (msg.isVisibleInTranscriptOnly === true) return;
     const message = isRecord(msg.message) ? msg.message : undefined;
+    const model = readString(message?.model);
+    if (model && model !== state.effectiveModel) {
+      state.effectiveModel = model;
+      this.emitSessionInfo(sessionId, { model });
+    }
     const content = Array.isArray(message?.content) ? message.content : [];
     for (const block of content) {
       if (!isRecord(block)) continue;
@@ -1243,15 +1359,92 @@ export class QoderSdkProvider implements TransportProvider {
       this.emitSessionInfo(sessionId, {
         model: state.effectiveModel,
       });
+      this.recordLiveUsage(
+        sessionId,
+        state,
+        usage,
+        readString(msg.uuid) ?? state.currentMessageId ?? undefined,
+        model,
+      );
     }
+  }
+
+  private recordLiveUsage(
+    sessionId: string,
+    state: QoderSessionState,
+    rawUsage: unknown,
+    messageId?: string,
+    modelOverride?: string,
+  ): void {
+    const model = modelOverride ?? state.effectiveModel;
+    const normalized = normalizeProviderUsage(rawUsage, undefined, model);
+    if (!normalized) return;
+    const previous = state.lastAssistantUsage;
+    const effective: NonNullable<ProviderUsageUpdate['usage']> =
+      usageContextTokenSum(normalized) === 0 && usageContextTokenSum(previous) > 0
+        ? {
+            ...previous,
+            ...normalized,
+            ...(previous?.input_tokens !== undefined ? { input_tokens: previous.input_tokens } : {}),
+            ...(previous?.cache_read_input_tokens !== undefined ? { cache_read_input_tokens: previous.cache_read_input_tokens } : {}),
+            ...(previous?.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: previous.cache_creation_input_tokens } : {}),
+            ...(previous?.cached_input_tokens !== undefined ? { cached_input_tokens: previous.cached_input_tokens } : {}),
+          }
+        : normalized;
+    state.lastAssistantUsage = effective;
+    this.emitUsage(sessionId, {
+      ...(messageId ? { messageId } : {}),
+      usage: { ...effective },
+      ...(model ? { model } : {}),
+    });
+  }
+
+  private finalizeTurnUsage(
+    sessionId: string,
+    state: QoderSessionState,
+    msg: Record<string, unknown>,
+    messageId: string,
+  ): NonNullable<ProviderUsageUpdate['usage']> | undefined {
+    const previous = state.lastAssistantUsage;
+    const resultUsage = normalizeProviderUsage(msg.usage, msg.modelUsage, state.effectiveModel);
+    if (!previous && !resultUsage) return undefined;
+    const effective: NonNullable<ProviderUsageUpdate['usage']> =
+      previous && usageContextTokenSum(previous) > 0
+        ? {
+            ...previous,
+            ...(resultUsage?.output_tokens !== undefined ? { output_tokens: resultUsage.output_tokens } : {}),
+            ...(resultUsage?.model_context_window !== undefined ? { model_context_window: resultUsage.model_context_window } : {}),
+          }
+        : { ...(resultUsage ?? previous) };
+    this.emitUsage(sessionId, {
+      messageId,
+      finalized: true,
+      usage: { ...effective },
+      ...(state.effectiveModel ? { model: state.effectiveModel } : {}),
+    });
+    return effective;
   }
 
   private handleResultMessage(sessionId: string, state: QoderSessionState, generation: number, msg: Record<string, unknown>): void {
     if (state.completedGeneration === generation) return;
+    const messageId = readString(msg.uuid) ?? state.currentMessageId ?? `${sessionId}:qoder-result:${generation}`;
     if (msg.subtype === 'success') {
       const content = readString(msg.result) ?? state.currentText;
+      const previousUsage = state.lastAssistantUsage;
+      const rawUsageMeta = normalizeUsage(msg.usage);
+      const finalizedUsage = this.finalizeTurnUsage(sessionId, state, msg, messageId);
+      const modelContextWindow = extractModelContextWindow(msg.modelUsage, state.effectiveModel);
+      const usageMeta = previousUsage || modelContextWindow !== undefined
+        ? (finalizedUsage ? { usage: { ...(isRecord(rawUsageMeta?.usage) ? rawUsageMeta.usage : {}), ...finalizedUsage } } : rawUsageMeta)
+        : rawUsageMeta;
+      const rawTotal = normalizeProviderUsage(msg.usage);
+      const hasDistinctTotal = Boolean(
+        previousUsage
+        && rawUsageMeta?.usage
+        && usageContextTokenSum(previousUsage) !== usageContextTokenSum(rawTotal),
+      );
       this.finishWithComplete(sessionId, state, generation, {
-        id: readString(msg.uuid) ?? state.currentMessageId ?? `${sessionId}:qoder-result:${generation}`,
+        id: messageId,
         sessionId,
         kind: 'text',
         role: 'assistant',
@@ -1261,12 +1454,14 @@ export class QoderSdkProvider implements TransportProvider {
         metadata: {
           provider: this.id,
           ...(state.effectiveModel ? { model: state.effectiveModel } : {}),
-          ...normalizeUsage(msg.usage),
+          ...usageMeta,
+          ...(hasDistinctTotal ? { totalUsage: rawUsageMeta!.usage } : {}),
           ...(isSessionControlCommandText(content, 'compact') ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' } : {}),
         },
       });
       return;
     }
+    this.finalizeTurnUsage(sessionId, state, msg, messageId);
     const errors = Array.isArray(msg.errors) ? msg.errors.map(redactQoderDiagnostic) : [];
     this.finishWithError(sessionId, state, generation, this.makeError(
       PROVIDER_ERROR_CODES.PROVIDER_ERROR,
@@ -1285,6 +1480,8 @@ export class QoderSdkProvider implements TransportProvider {
     state.activeNotificationAdmissions.clear();
     state.inFlight = false;
     state.cancelled = false;
+    state.compacting = false;
+    state.lastAssistantUsage = undefined;
     state.activeQuery = undefined;
     this.denyPendingApprovals(state, 'Qoder turn completed');
     this.emitComplete(sessionId, message);
@@ -1299,6 +1496,8 @@ export class QoderSdkProvider implements TransportProvider {
     state.activeInput = undefined;
     state.activeNotificationAdmissions.clear();
     state.inFlight = false;
+    state.compacting = false;
+    state.lastAssistantUsage = undefined;
     state.activeQuery = undefined;
     this.denyPendingApprovals(state, error.message);
     this.emitError(sessionId, error);
@@ -1306,6 +1505,7 @@ export class QoderSdkProvider implements TransportProvider {
   }
 
   private async cleanupState(state: QoderSessionState, reason: string): Promise<void> {
+    const wasActive = state.inFlight || state.compacting;
     this.settleActiveTurn(state);
     state.activeInput?.close();
     state.activeInput = undefined;
@@ -1316,8 +1516,13 @@ export class QoderSdkProvider implements TransportProvider {
     await state.activeQuery?.close?.().catch(() => {});
     state.activeQuery = undefined;
     state.inFlight = false;
+    state.compacting = false;
+    state.lastAssistantUsage = undefined;
     state.activeTools.clear();
     state.toolBlocksByIndex.clear();
+    if (wasActive) {
+      this.emitStatus(state.routeId, { status: null, label: null });
+    }
   }
 
   private denyPendingApprovals(state: QoderSessionState, _reason: string): void {
@@ -1393,5 +1598,9 @@ export class QoderSdkProvider implements TransportProvider {
 
   private emitStatus(sessionId: string, status: ProviderStatusUpdate): void {
     for (const cb of this.statusCallbacks) cb(sessionId, status);
+  }
+
+  private emitUsage(sessionId: string, update: ProviderUsageUpdate): void {
+    for (const cb of this.usageCallbacks) cb(sessionId, update);
   }
 }
