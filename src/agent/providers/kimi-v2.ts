@@ -677,14 +677,13 @@ export class KimiV2Provider implements TransportProvider {
         throw new Error('Failed to open stdio pipes for kimi acp');
       }
 
-      const filteredStdout = filterAcpJsonLines(child.stdout, (line, count) => {
+      const filteredStdout = filterAcpJsonLines(gateChildStream(child.stdout), (line, count) => {
         if (count <= 5 || count % 50 === 0) {
           logger.debug({ provider: this.id, count, line: line.slice(0, 200) }, 'kimi-v2 dropped non-JSON ACP line');
         }
       });
-      const gatedStdout = gateChildStream(filteredStdout);
 
-      const readable = Readable.toWeb(gatedStdout) as ReadableStream<Uint8Array>;
+      const readable = Readable.toWeb(filteredStdout) as ReadableStream<Uint8Array>;
       const writable = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
       const stream = ndJsonStream(writable, readable);
 
