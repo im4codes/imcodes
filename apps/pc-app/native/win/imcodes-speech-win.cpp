@@ -453,12 +453,27 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
       CloseHandle(local_stop_event);
     };
 
+    auto fail_or_early_stop = [&](const char* err_code, const std::string& err_msg) {
+      cleanup();
+      if (aborted_.load() || stop_requested_.load()) {
+        drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
+        return;
+      }
+      std::vector<float>().swap(initial_samples_);
+      emit_error(err_code, "mic", err_msg);
+      emit_json_line("{\"type\":\"end\"}");
+    };
+
+    if (aborted_.load() || stop_requested_.load()) {
+      cleanup();
+      drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
+      return;
+    }
+
     if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                 __uuidof(IMMDeviceEnumerator),
                                 reinterpret_cast<void**>(&enumerator))) || !enumerator) {
-      cleanup();
-      emit_error("audio_init_failed", "mic", "MMDeviceEnumerator unavailable");
-      emit_json_line("{\"type\":\"end\"}");
+      fail_or_early_stop("audio_init_failed", "MMDeviceEnumerator unavailable");
       return;
     }
 
@@ -471,24 +486,18 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
       hr = enumerator->GetDefaultAudioEndpoint(eCapture, eConsole, &device);
     }
     if (FAILED(hr) || !device) {
-      cleanup();
-      emit_error("no_input_device", "mic", "No active WASAPI microphone found");
-      emit_json_line("{\"type\":\"end\"}");
+      fail_or_early_stop("no_input_device", "No active WASAPI microphone found");
       return;
     }
 
     if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                                 reinterpret_cast<void**>(&audio_client))) || !audio_client) {
-      cleanup();
-      emit_error("permission_denied", "mic", "Failed to activate WASAPI audio client");
-      emit_json_line("{\"type\":\"end\"}");
+      fail_or_early_stop("permission_denied", "Failed to activate WASAPI audio client");
       return;
     }
 
     if (FAILED(audio_client->GetMixFormat(&mix_fmt)) || !mix_fmt) {
-      cleanup();
-      emit_error("audio_format_failed", "mic", "Failed to read WASAPI mix format");
-      emit_json_line("{\"type\":\"end\"}");
+      fail_or_early_stop("audio_format_failed", "Failed to read WASAPI mix format");
       return;
     }
 
@@ -501,9 +510,7 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
         mix_fmt,
         nullptr);
     if (FAILED(hr)) {
-      cleanup();
-      emit_error("audio_init_failed", "mic", "WASAPI IAudioClient::Initialize failed");
-      emit_json_line("{\"type\":\"end\"}");
+      fail_or_early_stop("audio_init_failed", "WASAPI IAudioClient::Initialize failed");
       return;
     }
 
@@ -511,16 +518,18 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
         FAILED(audio_client->GetService(__uuidof(IAudioCaptureClient),
                                         reinterpret_cast<void**>(&capture_client))) ||
         !capture_client) {
-      cleanup();
-      emit_error("audio_init_failed", "mic", "Failed to bind WASAPI capture client");
-      emit_json_line("{\"type\":\"end\"}");
+      fail_or_early_stop("audio_init_failed", "Failed to bind WASAPI capture client");
       return;
     }
 
     if (FAILED(audio_client->Start())) {
+      fail_or_early_stop("audio_start_failed", "Failed to start WASAPI audio stream");
+      return;
+    }
+
+    if (aborted_.load() || stop_requested_.load()) {
       cleanup();
-      emit_error("audio_start_failed", "mic", "Failed to start WASAPI audio stream");
-      emit_json_line("{\"type\":\"end\"}");
+      drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
       return;
     }
 

@@ -505,4 +505,28 @@ class ServeCommandLoop {
   std::vector<float> prefilled_pcm_;
 };
 
+/**
+ * Handles early stop/abort during capture startup (before open, on interrupted/failed
+ * open, or before entering the read loop). Normal stop preserves prefill samples by
+ * running one unprefixed final pass (`start` -> `result` -> `end`) with no spurious
+ * open error; abort discards prefill samples and emits `end` only.
+ */
+inline void drain_prefill_or_end(
+    bool aborted,
+    std::vector<float>& initial_samples,
+    imcodes::qwen3::Qwen3StreamingPipeline& pipeline,
+    const std::function<void(const std::string&)>& emit_line_fn =
+        [](const std::string& l) { emit_json_line(l); }) {
+  if (aborted || initial_samples.empty()) {
+    std::vector<float>().swap(initial_samples);
+    emit_line_fn("{\"type\":\"end\"}");
+    return;
+  }
+  pipeline.preload(initial_samples);
+  std::vector<float>().swap(initial_samples);
+  pipeline.request_stop(false, true);
+  emit_line_fn("{\"type\":\"start\"}");
+  pipeline.run_loop();
+}
+
 }  // namespace imcodes::speech

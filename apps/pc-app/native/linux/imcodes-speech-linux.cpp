@@ -617,6 +617,10 @@ class LinuxAudioSource {
     if (open_pulse_async(device_uid, pa_err)) {
       return true;
     }
+    if (interrupted_.load()) {
+      out_error = "Audio capture interrupted during open";
+      return false;
+    }
     std::string alsa_dev = (device_uid.empty() || device_uid == "auto" || device_uid == "default")
         ? "default"
         : device_uid;
@@ -1077,20 +1081,23 @@ class LinuxAudioCapture : public ActiveServeSessionHandle {
 
   void run_loop() {
     if (aborted_.load() || stop_requested_.load()) {
-      emit_json_line("{\"type\":\"end\"}");
+      drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
       return;
     }
     std::string audio_err;
     if (!audio_.open(device_uid_, audio_err)) {
-      if (!aborted_.load()) {
-        emit_error("no_input_device", "mic", audio_err);
+      if (aborted_.load() || stop_requested_.load()) {
+        drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
+        return;
       }
+      std::vector<float>().swap(initial_samples_);
+      emit_error("no_input_device", "mic", audio_err);
       emit_json_line("{\"type\":\"end\"}");
       return;
     }
-    if (aborted_.load()) {
+    if (aborted_.load() || stop_requested_.load()) {
       audio_.close();
-      emit_json_line("{\"type\":\"end\"}");
+      drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
       return;
     }
 

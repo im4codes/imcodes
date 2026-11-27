@@ -505,6 +505,222 @@ int main() {
     assert(extract_json_string_field(emitted_disconnect.back(), "type") == "end");
   }
 
+  // 7. Early stop vs abort before/during blocked device open preserves or discards prefill_pcm cleanly
+  {
+    struct ControlledOpenSession final : public ActiveServeSessionHandle {
+      ControlledOpenSession(
+          ServeStartParams params,
+          const Qwen3Tokenizer& tok,
+          std::vector<std::string>& out_events,
+          std::mutex& out_mu,
+          bool block_open,
+          bool& open_called_out,
+          size_t& decoded_samples_out)
+          : initial_samples_(std::move(params.initial_samples)),
+            out_events_(out_events),
+            out_mu_(out_mu),
+            block_open_(block_open),
+            open_called_out_(open_called_out),
+            decoded_samples_out_(decoded_samples_out),
+            pipeline_(
+                []() {
+                  StreamingPipelineConfig cfg;
+                  cfg.expect_language_header = false;
+                  return cfg;
+                }(),
+                tok,
+                [&](const std::vector<float>& samples, const DecodeOptions&) -> DecodeResult {
+                  decoded_samples_out_ = samples.size();
+                  DecodeResult r;
+                  r.text = "prefill-preserved-final";
+                  r.raw_tokens = {1, 2};
+                  return r;
+                },
+                [&](const imcodes::qwen3::TranscriptUpdate& upd) {
+                  emit_transcript_update(
+                      [&](const std::string& l) {
+                        std::lock_guard<std::mutex> lock(out_mu_);
+                        out_events_.push_back(l);
+                      },
+                      upd);
+                },
+                [&]() {
+                  std::lock_guard<std::mutex> lock(out_mu_);
+                  out_events_.push_back("{\"type\":\"end\"}");
+                }) {}
+
+      ~ControlledOpenSession() override {
+        request_stop(true);
+        wait_for_finish();
+      }
+
+      void start() override {
+        worker_ = std::thread([this]() {
+          auto emit = [&](const std::string& l) {
+            std::lock_guard<std::mutex> lock(out_mu_);
+            out_events_.push_back(l);
+          };
+          if (aborted_.load() || stop_requested_.load()) {
+            drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_, emit);
+            return;
+          }
+          open_called_out_ = true;
+          if (block_open_) {
+            {
+              std::lock_guard<std::mutex> lock(open_mu_);
+              in_open_ = true;
+            }
+            open_cv_.notify_all();
+            std::unique_lock<std::mutex> lock(open_mu_);
+            open_cv_.wait(lock, [&]() { return stop_requested_.load() || aborted_.load(); });
+          }
+          // Simulated open failure / interruption during open
+          if (aborted_.load() || stop_requested_.load()) {
+            drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_, emit);
+            return;
+          }
+          emit("{\"type\":\"error\",\"code\":\"no_input_device\"}");
+          emit("{\"type\":\"end\"}");
+        });
+      }
+
+      void wait_in_open() {
+        wait_until_or_fail(open_mu_, open_cv_, [&]() { return in_open_; }, "controlled open entry");
+      }
+
+      void request_stop(bool abort_only) override {
+        if (abort_only) aborted_.store(true);
+        stop_requested_.store(true);
+        pipeline_.request_stop(abort_only, false);
+        open_cv_.notify_all();
+      }
+
+      void wait_for_finish() override {
+        if (worker_.joinable()) worker_.join();
+      }
+
+      std::vector<float> initial_samples_;
+      std::vector<std::string>& out_events_;
+      std::mutex& out_mu_;
+      bool block_open_;
+      bool& open_called_out_;
+      size_t& decoded_samples_out_;
+      Qwen3StreamingPipeline pipeline_;
+      std::atomic<bool> stop_requested_{false};
+      std::atomic<bool> aborted_{false};
+      std::mutex open_mu_;
+      std::condition_variable open_cv_;
+      bool in_open_{false};
+      std::thread worker_;
+    };
+
+    Qwen3Tokenizer empty_tok;
+    // Construct 4000-sample (0.25s @ 16kHz) non-zero PCM16 base64 chunk: 8000 bytes -> base64
+    const std::string prefill_b64 = std::string(10668, 'A');  // 8001 bytes -> 8000 bytes aligned zero PCM
+
+    // 7a: Blocked open interrupted by normal `stop` preserves prefill_pcm -> start + final + end, no no_input_device
+    {
+      std::vector<std::string> evs;
+      std::mutex ev_mu;
+      bool open_called = false;
+      size_t decoded_samples = 0;
+      ControlledOpenSession* raw_sess = nullptr;
+      ServeCommandLoop loop(
+          [&](ServeStartParams params) -> std::unique_ptr<ActiveServeSessionHandle> {
+            auto s = std::make_unique<ControlledOpenSession>(
+                std::move(params), empty_tok, evs, ev_mu, true, open_called, decoded_samples);
+            raw_sess = s.get();
+            return s;
+          },
+          {});
+      assert(loop.handle_line("{\"cmd\":\"prefill_reset\"}"));
+      assert(loop.handle_line("{\"cmd\":\"prefill_pcm\",\"data\":\"" + prefill_b64 + "\"}"));
+      assert(loop.handle_line("{\"cmd\":\"start\"}"));
+      raw_sess->wait_in_open();
+      assert(loop.handle_line("{\"cmd\":\"stop\"}"));
+      assert(!loop.handle_line("{\"cmd\":\"shutdown\"}"));
+      assert(open_called);
+      assert(decoded_samples > 0);
+      int start_count = 0, final_count = 0, end_count = 0, err_count = 0;
+      std::string final_text;
+      for (const auto& l : evs) {
+        const auto t = extract_json_string_field(l, "type").value_or("");
+        if (t == "start") ++start_count;
+        if (t == "error") ++err_count;
+        if (t == "end") ++end_count;
+        if (extract_json_bool_or_str(l, "isFinal") == "true") {
+          ++final_count;
+          final_text = extract_json_string_field(l, "text").value_or("");
+        }
+      }
+      assert(err_count == 0);
+      assert(start_count == 1);
+      assert(final_count == 1);
+      assert(final_text == "prefill-preserved-final");
+      assert(end_count == 1);
+    }
+
+    // 7b: Blocked open interrupted by `abort` discards prefill_pcm -> end only, zero result/error/start
+    {
+      std::vector<std::string> evs;
+      std::mutex ev_mu;
+      bool open_called = false;
+      size_t decoded_samples = 0;
+      ControlledOpenSession* raw_sess = nullptr;
+      ServeCommandLoop loop(
+          [&](ServeStartParams params) -> std::unique_ptr<ActiveServeSessionHandle> {
+            auto s = std::make_unique<ControlledOpenSession>(
+                std::move(params), empty_tok, evs, ev_mu, true, open_called, decoded_samples);
+            raw_sess = s.get();
+            return s;
+          },
+          {});
+      assert(loop.handle_line("{\"cmd\":\"prefill_reset\"}"));
+      assert(loop.handle_line("{\"cmd\":\"prefill_pcm\",\"data\":\"" + prefill_b64 + "\"}"));
+      assert(loop.handle_line("{\"cmd\":\"start\"}"));
+      raw_sess->wait_in_open();
+      assert(loop.handle_line("{\"cmd\":\"abort\"}"));
+      assert(!loop.handle_line("{\"cmd\":\"shutdown\"}"));
+      assert(open_called);
+      assert(decoded_samples == 0);
+      assert(evs.size() == 1);
+      assert(extract_json_string_field(evs[0], "type") == "end");
+    }
+
+    // 7c: Pre-open normal stop skips open altogether while still finalizing prefill_pcm
+    {
+      std::vector<std::string> evs;
+      std::mutex ev_mu;
+      bool open_called = false;
+      size_t decoded_samples = 0;
+      ServeStartParams p;
+      p.initial_samples = std::vector<float>(4000, 0.25f);
+      ControlledOpenSession sess(std::move(p), empty_tok, evs, ev_mu, false, open_called, decoded_samples);
+      sess.request_stop(false);
+      sess.start();
+      sess.wait_for_finish();
+      assert(!open_called);
+      assert(decoded_samples == 4000);
+      assert(extract_json_string_field(evs.back(), "type") == "end");
+    }
+
+    // 7d: Pre-open normal stop with empty prefill emits only end and skips open
+    {
+      std::vector<std::string> evs;
+      std::mutex ev_mu;
+      bool open_called = false;
+      size_t decoded_samples = 0;
+      ControlledOpenSession sess(ServeStartParams{}, empty_tok, evs, ev_mu, false, open_called, decoded_samples);
+      sess.request_stop(false);
+      sess.start();
+      sess.wait_for_finish();
+      assert(!open_called);
+      assert(decoded_samples == 0);
+      assert(evs.size() == 1);
+      assert(extract_json_string_field(evs[0], "type") == "end");
+    }
+  }
+
   std::printf("win speech pipeline tests passed\n");
   return 0;
 }
