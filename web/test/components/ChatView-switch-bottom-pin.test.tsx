@@ -336,6 +336,98 @@ describe('ChatView — switch bottom-pin guarantees', () => {
     expect(chat.scrollTop).toBe(460);
   });
 
+  it('keeps explicit locate on an already-mounted target during delayed smooth scroll over queued pin/measurements and resumes bottom follow on End', async () => {
+    const items: TimelineEvent[] = Array.from({ length: 120 }, (_, i) => (
+      i % 2 === 0
+        ? userEvent(`m-${i}`, `prompt ${i}`, 1000 + i * 10)
+        : assistantEvent(`m-${i}`, `answer ${i}`, 1000 + i * 10)
+    ));
+    const chat = await mountSwitchHarness({
+      serverId: 'srv-1',
+      sessionId: 'deck_pin_mounted',
+      visible: true,
+      events: items,
+      initialScrollHeight: 2200,
+      initialClientHeight: 200,
+      messagePinsEnabled: true,
+    });
+    expect(chat.scrollTop).toBe(2000);
+
+    // Confirm target row m-116 is ALREADY mounted in the DOM (no context load needed),
+    // so pendingPinnedLocateIdRef clears synchronously once smooth scroll starts.
+    const mountedTarget = chat.container.querySelector('[data-event-id="m-116"]') as HTMLElement | null;
+    expect(mountedTarget).not.toBeNull();
+    const rootRectSpy = vi.spyOn(chat.scrollEl, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, top: 0, left: 0, right: 320, bottom: 200, width: 320, height: 200, toJSON: () => ({}),
+    } as DOMRect);
+    const targetRectSpy = vi.spyOn(mountedTarget!, 'getBoundingClientRect').mockImplementation(() => ({
+      // At scrollTop=2000, placing DOM rect at top = 580 - scrollTop gives contentTop = 580 -> desired center top = 500
+      x: 0, y: 580 - chat.scrollTop, top: 580 - chat.scrollTop, left: 0, right: 320, bottom: 620 - chat.scrollTop, width: 320, height: 40, toJSON: () => ({}),
+    } as DOMRect));
+    const smoothCalls: Array<{ top?: number; behavior?: ScrollBehavior }> = [];
+    const scrollToSpy = vi.fn((opts?: ScrollToOptions) => {
+      smoothCalls.push({ top: opts?.top, behavior: opts?.behavior });
+      if (typeof opts?.top === 'number') {
+        const dest = opts.top;
+        // Simulate asynchronous native smooth scroll completing ~80ms later.
+        window.setTimeout(() => {
+          chat.setGeometry({ scrollTop: dest });
+          fireEvent.scroll(chat.scrollEl);
+        }, 80);
+      }
+    });
+    Object.defineProperty(chat.scrollEl, 'scrollTo', { configurable: true, writable: true, value: scrollToSpy });
+
+    try {
+      // 1) Queue passive bottom pin BEFORE locating.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      chat.setGeometry({ scrollHeight: 2350 });
+      fireEvent.scroll(chat.scrollEl);
+      act(() => { chat.invokeScrollBottom({ passive: true }); });
+
+      // 2) Immediately locate already-mounted target `m-116`: `revealEvent` starts smooth scroll
+      //    async toward 500 and clears `pendingPinnedLocateIdRef` right away while scrollTop is still 2000.
+      act(() => {
+        requestMessagePinNavigation({
+          id: 'pin-mounted-1',
+          serverId: 'srv-1',
+          sessionName: 'deck_pin_mounted',
+          eventId: 'm-116',
+          eventTs: 1000 + 116 * 10,
+          eventType: 'user.message',
+          text: 'prompt 116',
+          createdAt: 1,
+          updatedAt: 1,
+        });
+      });
+
+      await waitFor(() => expect(smoothCalls.length).toBeGreaterThanOrEqual(1));
+      const destTop = smoothCalls[0].top!;
+      expect(smoothCalls[0].behavior).toBe('smooth');
+      expect(destTop).toBeLessThan(1500);
+
+      // 3) Before smooth finishes (80ms) AND after it settles, queued frames + new row ResizeObserver
+      //    measurement enter: old queued bottom pin or new measurement MUST NOT overwrite `destTop`.
+      const row = chat.container.querySelector('[data-virtual-key]') as HTMLElement | null;
+      expect(row).toBeTruthy();
+      chat.setGeometry({ scrollHeight: 2500 });
+      act(() => { fireResize([row!]); });
+      await waitFor(() => expect(chat.scrollTop).toBe(destTop));
+      await chat.drainFrames();
+      expect(chat.scrollTop).toBe(destTop);
+      expect(chat.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+
+      // 4) Explicit `End` resumes follow mode and pins cleanly to the latest bottom (2300).
+      fireEvent.keyDown(chat.scrollEl, { key: 'End' });
+      await chat.drainFrames();
+      expect(chat.scrollTop).toBe(2300);
+      expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
+    } finally {
+      rootRectSpy.mockRestore();
+      targetRectSpy.mockRestore();
+    }
+  });
+
   it('keeps virtualized >24-row chats pinned through A -> B -> C -> A switches, ResizeObserver row measurement, delayed catch-up, and img load', async () => {
     const eventsA = [userEvent('a-1', 'server A', 500)];
     const eventsB = [userEvent('b-1', 'server B', 600)];

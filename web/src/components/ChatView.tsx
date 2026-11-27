@@ -4356,9 +4356,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   useEffect(() => {
     if (!pendingPinnedLocate) return undefined;
     return revealEvent(pendingPinnedLocate.eventId, (root, target) => {
-      const reducedMotion = typeof window.matchMedia === 'function'
-        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-      scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
+      commitExplicitLocateScroll(root, target);
       target.classList.add('chat-pin-located');
       window.setTimeout(() => target.classList.remove('chat-pin-located'), 1_800);
       clearPendingMessagePin(pendingPinnedLocate.id);
@@ -5237,6 +5235,48 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     setShowScrollBtn(true);
     lastScrollActivityRef.current = Date.now();
     captureReaderAnchor();
+  };
+
+  // Explicit message locate (pinned message or last-sent jump) takes scroll
+  // ownership before native smooth scrolling begins: invalidate any queued
+  // passive bottom-pin frame, pause follow mode so pending/new measurements
+  // cannot snap back to the tail after pendingPinnedLocateIdRef clears, and
+  // re-anchor around the locate target rather than the pre-jump bottom row.
+  const commitExplicitLocateScroll = (root: HTMLElement, target: HTMLElement) => {
+    pendingVisibleScrollToBottomRef.current = false;
+    pendingEngageFollowRef.current = false;
+    pendingGrowthRepinRef.current = false;
+    if (pendingScrollFrameRef.current !== null) {
+      cancelAnimationFrame(pendingScrollFrameRef.current);
+      pendingScrollFrameRef.current = null;
+    }
+    if (autoScrollRef.current) {
+      disengageFollow();
+    }
+    const reducedMotion = typeof window !== 'undefined'
+      && typeof window.matchMedia === 'function'
+      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const rectScale = getDomRectToLayoutScale(root);
+    const rootRect = root.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    const targetTopInContent = root.scrollTop + (targetRect.top - rootRect.top) / rectScale;
+    const targetHeight = targetRect.height / rectScale;
+    const centerOffset = Math.max(0, (root.clientHeight - targetHeight) / 2);
+    const maxTop = Math.max(0, root.scrollHeight - root.clientHeight);
+    const desiredTop = Math.min(maxTop, Math.max(0, targetTopInContent - centerOffset));
+    scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
+    const targetEventId = target.getAttribute('data-event-id')
+      ?? target.closest<HTMLElement>('[data-event-id]')?.getAttribute('data-event-id');
+    if (targetEventId) {
+      readerAnchorRef.current = { id: targetEventId, contentTop: targetTopInContent };
+    } else {
+      captureReaderAnchor();
+    }
+    if (desiredTop < root.scrollTop && maxTop - desiredTop > 1) {
+      lastScrollTopRef.current = root.scrollTop;
+      lastScrollHeightRef.current = root.scrollHeight;
+      lastClientHeightRef.current = root.clientHeight;
+    }
   };
 
   // An explicit upward wheel/touch gesture is unambiguous "stop following"
@@ -6323,10 +6363,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               // The last-sent bubble may be outside the virtualizer's mounted
               // range. Reveal it first, then perform the same centered jump.
               revealEvent(lastSentUserMessage.eventId, (root, target) => {
-                const reducedMotion = typeof window !== 'undefined'
-                  && window.matchMedia
-                  && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-                scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
+                commitExplicitLocateScroll(root, target);
               });
             }}
           >
