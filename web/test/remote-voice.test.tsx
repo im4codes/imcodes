@@ -4827,6 +4827,52 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       ws2.emitMessage({ type: 'voice.session.end', sessionId: frame2.sessionId });
       await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
       expect(onSpokenRes).toHaveBeenCalledWith('IM.codes', true);
+
+      // 3. Provisional interim "IM.codes" followed by empty final "" MUST retract instead of resurrecting "IM.codes"
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-retract' });
+      const onRetractRes = vi.fn();
+      const startRetract = VoiceInput.startListening(onRetractRes, undefined, undefined, { projectKey: 'proj-remote-guard' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
+      const ws3 = FakeWebSocket.instances[2]!;
+      ws3.emitOpen();
+      const frame3 = JSON.parse(ws3.sent[0]!) as { sessionId: string };
+      ws3.emitMessage({ type: 'voice.session.ready', sessionId: frame3.sessionId });
+      await expect(startRetract).resolves.toBe(true);
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array([4000, -4000])),
+        level: 0.2,
+      });
+      ws3.emitMessage({ type: 'voice.session.result', sessionId: frame3.sessionId, text: 'IM.codes', isFinal: false });
+      ws3.emitMessage({ type: 'voice.session.result', sessionId: frame3.sessionId, text: '', isFinal: true });
+      ws3.emitMessage({ type: 'voice.session.end', sessionId: frame3.sessionId });
+      await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
+      expect(onRetractRes.mock.calls).toEqual([
+        ['IM.codes', false],
+        ['', true],
+      ]);
+
+      // 4. Real sentence interim "打开 IM.codes" followed by empty final "" preserves "打开 IM.codes"
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-preserve' });
+      const onPreserveRes = vi.fn();
+      const startPreserve = VoiceInput.startListening(onPreserveRes, undefined, undefined, { projectKey: 'proj-remote-guard' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
+      const ws4 = FakeWebSocket.instances[3]!;
+      ws4.emitOpen();
+      const frame4 = JSON.parse(ws4.sent[0]!) as { sessionId: string };
+      ws4.emitMessage({ type: 'voice.session.ready', sessionId: frame4.sessionId });
+      await expect(startPreserve).resolves.toBe(true);
+      streamingBridge.listeners.rawPcmChunk?.({
+        pcmBase64: encodeInt16PcmToBase64(new Int16Array([4000, -4000])),
+        level: 0.2,
+      });
+      ws4.emitMessage({ type: 'voice.session.result', sessionId: frame4.sessionId, text: '打开 IM.codes', isFinal: false });
+      ws4.emitMessage({ type: 'voice.session.result', sessionId: frame4.sessionId, text: '', isFinal: true });
+      ws4.emitMessage({ type: 'voice.session.end', sessionId: frame4.sessionId });
+      await waitFor(() => expect(VoiceInput.isListening()).toBe(false));
+      expect(onPreserveRes.mock.calls).toEqual([
+        ['打开 IM.codes', false],
+        ['打开 IM.codes', true],
+      ]);
     } finally {
       await VoiceInput.stopListening({ abort: true });
       delete (streamingBridge as Record<string, unknown>).startRawPcmCapture;

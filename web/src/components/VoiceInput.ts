@@ -1101,6 +1101,14 @@ function emitOwnerResult(owner: CaptureOwner | null, text: string, isFinal: bool
     currentOwner.emittedPendingSingleHotword = false;
   } else if (filtered.trim().length > 0 && !currentOwner.lastTrustedRealText) {
     currentOwner.emittedPendingSingleHotword = true;
+  } else if (filtered.length === 0) {
+    if (currentOwner.lastTrustedRealText) {
+      if (isFinal) {
+        currentOwner.onResult?.(currentOwner.lastTrustedRealText, true);
+      }
+      return;
+    }
+    currentOwner.emittedPendingSingleHotword = false;
   }
   currentOwner.onResult?.(filtered, isFinal);
 }
@@ -3332,6 +3340,7 @@ export async function startListening(
           targetDeviceId: route.targetDeviceId,
           locale: getVoiceLanguageMode() === 'auto' ? undefined : pickLocale(),
           ...(initialStartPayload.hotwords ? { hotwords: initialStartPayload.hotwords } : {}),
+          ...(compiledHotwords ? { postProcessHotwords: compiledHotwords } : {}),
           ...(initialStartPayload.allowSharedHotwords ? { allowSharedHotwords: true } : {}),
           resolveStartPayload: buildRemoteStartPayload,
           signal: abortCtrl.signal,

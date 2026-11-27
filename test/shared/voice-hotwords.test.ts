@@ -352,7 +352,9 @@ describe('shared voice hotwords', () => {
 
     // Compound ASCII words ('worktree') must NOT match separate ASCII hotwords ('work', 'tree')
     expect(stripVoiceHotwordHallucination('worktree', compiled, { silentAudio: true })).toBe('worktree');
+    expect(stripVoiceHotwordHallucination('worktree', ['work', 'tree'], { silentAudio: true })).toBe('worktree');
     expect(stripVoiceHotwordHallucination('work, tree', compiled, { silentAudio: false })).toBe('');
+    expect(stripVoiceHotwordHallucination('IM.codesIM.codes', ['IM.codes'])).toBe('');
 
     // Normal speech containing hotwords (including multiple hotwords) MUST remain intact
     const intactCases = [
@@ -385,6 +387,14 @@ describe('shared voice hotwords', () => {
     const repeatedPrefixUnmatched = 'a'.repeat(1000);
     const groupTerms = Array.from({ length: 60 }, (_, i) => `global task ${String(i).padStart(2, '0')}`);
     const groupUnmatched = `${'global task '.repeat(80)}x`;
+    const dotATerms = [
+      ...Array.from({ length: 12 }, (_, i) => '.a'.repeat(i + 1)),
+      ...Array.from({ length: 48 }, (_, i) => `tool${i}`),
+    ];
+    const dotAEcho500 = '.a'.repeat(500);
+    const dotAUnmatched500 = `${'.a'.repeat(500)}x`;
+    expect(stripVoiceHotwordHallucination(dotAEcho500, dotATerms)).toBe('');
+    expect(stripVoiceHotwordHallucination(dotAUnmatched500, dotATerms)).toBe(dotAUnmatched500);
 
     // Warm caches before timing
     for (let i = 0; i < 10; i += 1) {
@@ -392,6 +402,8 @@ describe('shared voice hotwords', () => {
       stripVoiceHotwordHallucination(normalText, compiled60);
       stripVoiceHotwordHallucination(repeatedPrefixUnmatched, sharedPrefixRawTerms);
       stripVoiceHotwordHallucination(groupUnmatched, groupTerms);
+      stripVoiceHotwordHallucination(dotAEcho500, dotATerms);
+      stripVoiceHotwordHallucination(dotAUnmatched500, dotATerms);
     }
 
     const start = performance.now();
@@ -401,8 +413,10 @@ describe('shared voice hotwords', () => {
       expect(stripVoiceHotwordHallucination(normalText, compiled60)).toBe(normalText);
       expect(stripVoiceHotwordHallucination(repeatedPrefixUnmatched, sharedPrefixRawTerms)).toBe(repeatedPrefixUnmatched);
       expect(stripVoiceHotwordHallucination(groupUnmatched, groupTerms)).toBe(groupUnmatched);
+      expect(stripVoiceHotwordHallucination(dotAEcho500, dotATerms)).toBe('');
+      expect(stripVoiceHotwordHallucination(dotAUnmatched500, dotATerms)).toBe(dotAUnmatched500);
     }
-    const avgPerCallMs = (performance.now() - start) / (iterations * 4);
+    const avgPerCallMs = (performance.now() - start) / (iterations * 6);
     expect(avgPerCallMs).toBeLessThan(1);
   });
 

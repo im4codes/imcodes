@@ -996,15 +996,17 @@ const HALLUCINATION_INF = 0x3fffffff;
 const HALLUCINATION_ARRAY_CACHE_LIMIT = 32;
 
 interface HallucinationTrieNode {
-  children: Map<number, HallucinationTrieNode>;
+  onlyCode: number;
+  onlyChild: HallucinationTrieNode | null;
+  children: Map<number, HallucinationTrieNode> | null;
   termId: number;
 }
 
 interface CompiledHallucinationMatcher {
   root: HallucinationTrieNode;
-  termStrings: string[];
   termStartsAscii: Uint8Array;
   termEndsAscii: Uint8Array;
+  termFirstCodes: Uint16Array;
 }
 
 const compiledHallucinationCache = new WeakMap<object, CompiledHallucinationMatcher | null>();
@@ -1021,6 +1023,39 @@ function normalizeHotwordMatchText(raw: string): string {
     .toLowerCase();
 }
 
+function createHallucinationTrieNode(): HallucinationTrieNode {
+  return { onlyCode: -1, onlyChild: null, children: null, termId: -1 };
+}
+
+function getTrieChild(node: HallucinationTrieNode, code: number): HallucinationTrieNode | undefined {
+  if (node.onlyCode === code) return node.onlyChild ?? undefined;
+  return node.children?.get(code);
+}
+
+function getOrAddTrieChild(node: HallucinationTrieNode, code: number): HallucinationTrieNode {
+  if (node.onlyCode === code) return node.onlyChild!;
+  if (node.onlyCode === -1 && !node.children) {
+    const child = createHallucinationTrieNode();
+    node.onlyCode = code;
+    node.onlyChild = child;
+    return child;
+  }
+  let map = node.children;
+  if (!map) {
+    map = new Map<number, HallucinationTrieNode>();
+    map.set(node.onlyCode, node.onlyChild!);
+    node.onlyCode = -1;
+    node.onlyChild = null;
+    node.children = map;
+  }
+  let child = map.get(code);
+  if (!child) {
+    child = createHallucinationTrieNode();
+    map.set(code, child);
+  }
+  return child;
+}
+
 function buildHallucinationMatcherFromRawList(rawList: readonly string[]): CompiledHallucinationMatcher | null {
   const seen = new Set<string>();
   const uniqueTerms: string[] = [];
@@ -1034,32 +1069,28 @@ function buildHallucinationMatcherFromRawList(rawList: readonly string[]): Compi
   }
   if (uniqueTerms.length === 0) return null;
 
-  const root: HallucinationTrieNode = { children: new Map(), termId: -1 };
+  const root = createHallucinationTrieNode();
   const termStartsAscii = new Uint8Array(uniqueTerms.length);
   const termEndsAscii = new Uint8Array(uniqueTerms.length);
+  const termFirstCodes = new Uint16Array(uniqueTerms.length);
 
   for (let termId = 0; termId < uniqueTerms.length; termId += 1) {
     const term = uniqueTerms[termId]!;
     termStartsAscii[termId] = ASCII_ALNUM_UNDER_RE.test(term[0]!) ? 1 : 0;
     termEndsAscii[termId] = ASCII_ALNUM_UNDER_RE.test(term[term.length - 1]!) ? 1 : 0;
+    termFirstCodes[termId] = term.charCodeAt(0);
     let node = root;
     for (let i = 0; i < term.length; i += 1) {
-      const code = term.charCodeAt(i);
-      let child = node.children.get(code);
-      if (!child) {
-        child = { children: new Map(), termId: -1 };
-        node.children.set(code, child);
-      }
-      node = child;
+      node = getOrAddTrieChild(node, term.charCodeAt(i));
     }
     node.termId = termId;
   }
 
   return {
     root,
-    termStrings: uniqueTerms,
     termStartsAscii,
     termEndsAscii,
+    termFirstCodes,
   };
 }
 
@@ -1115,37 +1146,53 @@ export function stripVoiceHotwordHallucination(
   // Forward reachable-state DP over a compact Trie:
   // - `cleared[pos]`: min hotword count at start-of-string, after a separator, or after a non-ASCII-word ending.
   // - `endedAscii[pos]`: min hotword count immediately after an ASCII-word-ending hotword without separator.
+  // - `sameTermStates[pos]`: bounded per-position map allowing only immediate same-term adjacency (e.g. "IM.codesIM.codes").
   const cleared = new Int32Array(n + 1);
   const endedAscii = new Int32Array(n + 1);
   cleared.fill(HALLUCINATION_INF);
   endedAscii.fill(HALLUCINATION_INF);
   cleared[0] = 0;
+  let sameTermStates: Array<Map<number, number> | undefined> | null = null;
 
   for (let pos = 0; pos < n; pos += 1) {
     const cCount = cleared[pos]!;
     const aCount = endedAscii[pos]!;
-    if (cCount === HALLUCINATION_INF && aCount === HALLUCINATION_INF) continue;
+    const sameMap = sameTermStates?.[pos];
+    if (sameTermStates) sameTermStates[pos] = undefined;
+    if (cCount === HALLUCINATION_INF && aCount === HALLUCINATION_INF && !sameMap) continue;
 
-    const cp = normText.codePointAt(pos)!;
-    const charStr = String.fromCodePoint(cp);
-    const charLen = cp > 0xffff ? 2 : 1;
     const bestAtPos = cCount < aCount ? cCount : aCount;
+    const cp = normText.codePointAt(pos)!;
+    const charLen = cp > 0xffff ? 2 : 1;
+    const isSep = HOTWORD_HALLUCINATION_SEP_CHAR_RE.test(String.fromCodePoint(cp));
 
-    if (HOTWORD_HALLUCINATION_SEP_CHAR_RE.test(charStr)) {
+    if (isSep) {
+      let sepMin = bestAtPos;
+      if (sameMap) {
+        for (const cost of sameMap.values()) {
+          if (cost < sepMin) sepMin = cost;
+        }
+      }
       const nextPos = pos + charLen;
-      if (bestAtPos < cleared[nextPos]!) {
-        cleared[nextPos] = bestAtPos;
+      if (sepMin < cleared[nextPos]!) {
+        cleared[nextPos] = sepMin;
       }
     }
 
     let node: HallucinationTrieNode | undefined = matcher.root;
     for (let p = pos; p < n; p += 1) {
-      node = node.children.get(normText.charCodeAt(p));
+      node = getTrieChild(node, normText.charCodeAt(p));
       if (!node) break;
       const termId = node.termId;
       if (termId < 0) continue;
 
-      const startCost = matcher.termStartsAscii[termId]! ? cCount : bestAtPos;
+      let startCost = matcher.termStartsAscii[termId]! ? cCount : bestAtPos;
+      if (sameMap) {
+        const sameCost = sameMap.get(termId);
+        if (sameCost !== undefined && sameCost < startCost) {
+          startCost = sameCost;
+        }
+      }
       if (startCost >= HALLUCINATION_INF) continue;
 
       const endPos = p + 1;
@@ -1154,18 +1201,16 @@ export function stripVoiceHotwordHallucination(
         if (nextCost < cleared[endPos]!) cleared[endPos] = nextCost;
       } else {
         if (nextCost < endedAscii[endPos]!) endedAscii[endPos] = nextCost;
-        // Allow immediate back-to-back repetition of the exact same hotword (e.g. "IM.codesIM.codes")
-        // while still blocking distinct ASCII hotwords merged into a real compound word (e.g. "worktree").
-        const termStr = matcher.termStrings[termId]!;
-        let repPos = endPos;
-        let repCost = nextCost;
-        while (repPos + termStr.length <= n && normText.startsWith(termStr, repPos)) {
-          repPos += termStr.length;
-          repCost += 1;
-          if (repPos === n) {
-            if (repCost < cleared[repPos]!) cleared[repPos] = repCost;
-          } else if (repCost < endedAscii[repPos]!) {
-            endedAscii[repPos] = repCost;
+        if (matcher.termStartsAscii[termId]! && normText.charCodeAt(endPos) === matcher.termFirstCodes[termId]!) {
+          if (!sameTermStates) sameTermStates = new Array(n + 1);
+          let targetMap = sameTermStates[endPos];
+          if (!targetMap) {
+            targetMap = new Map<number, number>();
+            sameTermStates[endPos] = targetMap;
+          }
+          const prev = targetMap.get(termId);
+          if (prev === undefined || nextCost < prev) {
+            targetMap.set(termId, nextCost);
           }
         }
       }

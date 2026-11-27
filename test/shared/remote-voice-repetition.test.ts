@@ -149,5 +149,17 @@ describe('sanitizeVoiceTranscriptWithHotwords & resolveSessionTranscriptResult h
     expect(r2).toEqual({ emit: false, text: '', nextLastNonEmptyText: '打开 IM.codes' });
     const r3 = resolveSessionTranscriptResult(`Codex，${'IM.codes。'.repeat(6)}`, true, r2.nextLastNonEmptyText, hotwords);
     expect(r3).toEqual({ emit: true, text: '打开 IM.codes', nextLastNonEmptyText: '打开 IM.codes' });
+
+    // Provisional single hotword interim MUST NOT be cached into lastNonEmptyText or resurrected on empty/echo final
+    const p1 = resolveSessionTranscriptResult('IM.codes', false, '', ['IM.codes']);
+    expect(p1).toEqual({ emit: true, text: 'IM.codes', nextLastNonEmptyText: '' });
+    const p2EchoFinal = resolveSessionTranscriptResult('IM.codes，IM.codes。', true, p1.nextLastNonEmptyText, ['IM.codes']);
+    expect(p2EchoFinal).toEqual({ emit: true, text: '', nextLastNonEmptyText: '' });
+    const p2EmptyFinal = resolveSessionTranscriptResult('', true, p1.nextLastNonEmptyText, ['IM.codes']);
+    expect(p2EmptyFinal).toEqual({ emit: true, text: '', nextLastNonEmptyText: '' });
+
+    // Direct audible single-hotword final still emits cleanly
+    const pSingleFinal = resolveSessionTranscriptResult('IM.codes', true, '', ['IM.codes']);
+    expect(pSingleFinal).toEqual({ emit: true, text: 'IM.codes', nextLastNonEmptyText: '' });
   });
 });

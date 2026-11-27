@@ -7,6 +7,7 @@ import {
   type RemoteVoiceProvidersSnapshot,
   type RemoteVoiceServerFrame,
 } from '@shared/remote-voice.js';
+import type { CompiledVoiceHotwords } from '@shared/voice-hotwords.js';
 import {
   STREAMING_SPEECH_RAW_PCM_EVENT,
   type StreamingSpeechRawPcmEvent,
@@ -566,6 +567,7 @@ export interface StartRemoteVoiceSessionOptions {
   targetDeviceId: string;
   locale?: string;
   hotwords?: string[];
+  postProcessHotwords?: Pick<CompiledVoiceHotwords, 'terms' | 'asrTerms' | 'replacements'> | readonly string[];
   allowSharedHotwords?: boolean;
   resolveStartPayload?: () => StartRemoteVoiceSessionPayloadResolution;
   onResult: (text: string, isFinal: boolean) => void;
@@ -1296,6 +1298,10 @@ export async function startRemoteVoiceSession(
   let endReceived = false;
   let hasDeliveredTranscript = false;
   let lastNonEmptyText = '';
+  let sessionFilterHotwords:
+    | Pick<CompiledVoiceHotwords, 'terms' | 'asrTerms' | 'replacements'>
+    | readonly string[]
+    | undefined = opts.postProcessHotwords ?? opts.hotwords;
   let resolveReady!: (outcome: { ok: boolean; reason?: string }) => void;
   const readyPromise = new Promise<{ ok: boolean; reason?: string }>((res) => {
     resolveReady = res;
@@ -1969,6 +1975,7 @@ export async function startRemoteVoiceSession(
       }
       const startHotwords = livePayload ? livePayload.hotwords : opts.hotwords;
       const startAllowSharedHotwords = livePayload ? livePayload.allowSharedHotwords : opts.allowSharedHotwords;
+      sessionFilterHotwords = opts.postProcessHotwords ?? startHotwords;
       try {
         ws.send(JSON.stringify({
           type: 'voice.session.start',
@@ -2008,7 +2015,7 @@ export async function startRemoteVoiceSession(
         return;
       }
       if (frame.type === 'voice.session.result') {
-        const resolved = resolveSessionTranscriptResult(frame.text, frame.isFinal, lastNonEmptyText);
+        const resolved = resolveSessionTranscriptResult(frame.text, frame.isFinal, lastNonEmptyText, sessionFilterHotwords);
         lastNonEmptyText = resolved.nextLastNonEmptyText;
         if (!resolved.emit) {
           return;

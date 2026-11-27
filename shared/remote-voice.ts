@@ -926,7 +926,23 @@ export function resolveSessionTranscriptResult(
 ): { emit: boolean; text: string; nextLastNonEmptyText: string } {
   const sanitized = sanitizeVoiceTranscriptWithHotwords(rawText, hotwords);
   if (sanitized.trim().length > 0) {
-    return { emit: true, text: sanitized, nextLastNonEmptyText: sanitized };
+    let hasHotwords = false;
+    if (Array.isArray(hotwords)) {
+      hasHotwords = hotwords.length > 0;
+    } else if (hotwords) {
+      const compiled = hotwords as Pick<CompiledVoiceHotwords, 'terms' | 'asrTerms' | 'replacements'>;
+      hasHotwords = (compiled.terms?.length ?? 0) > 0
+        || (compiled.asrTerms?.length ?? 0) > 0
+        || (compiled.replacements?.length ?? 0) > 0;
+    }
+    // An isolated single hotword stays provisional rather than updating fallback history,
+    // so a subsequent echo loop or empty final cannot resurrect it as final text.
+    const isTrusted = !hasHotwords || stripVoiceHotwordHallucination(sanitized, hotwords, { silentAudio: true }).length > 0;
+    return {
+      emit: true,
+      text: sanitized,
+      nextLastNonEmptyText: isTrusted ? sanitized : lastNonEmptyText,
+    };
   }
   if (!isFinal) {
     return { emit: false, text: '', nextLastNonEmptyText: lastNonEmptyText };

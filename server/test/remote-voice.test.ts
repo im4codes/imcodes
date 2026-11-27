@@ -2897,6 +2897,38 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
       { type: 'voice.session.result', sessionId: 'pc-tag-order', text: '打开 IM.codes', isFinal: false },
       { type: 'voice.session.result', sessionId: 'pc-tag-order', text: '打开 IM.codes', isFinal: true },
     ]);
+
+    // 3. PC provider relay: provisional single hotword interim ("IM.codes") must NOT resurrect on empty or echo final
+    for (const [sid, finalRaw] of [
+      ['pc-provisional-echo', 'IM.codes，IM.codes。'],
+      ['pc-provisional-empty', 'language None<asr_text>'],
+    ] as const) {
+      await proto.handleRawMessage(clientWs, 'owner-order', JSON.stringify({
+        type: 'voice.session.start',
+        sessionId: sid,
+        targetDeviceId: 'mac-order',
+        sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+        hotwords: ['IM.codes'],
+      }));
+      await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.ready', sessionId: sid }));
+      await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+        type: 'voice.session.result',
+        sessionId: sid,
+        text: 'IM.codes',
+        isFinal: false,
+      }));
+      await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({
+        type: 'voice.session.result',
+        sessionId: sid,
+        text: finalRaw,
+        isFinal: true,
+      }));
+      await proto.handleRawMessage(providerWs, 'owner-order', JSON.stringify({ type: 'voice.session.end', sessionId: sid }));
+      expect(clientSent.filter((f) => f.sessionId === sid && f.type === 'voice.session.result')).toEqual([
+        { type: 'voice.session.result', sessionId: sid, text: 'IM.codes', isFinal: false },
+        { type: 'voice.session.result', sessionId: sid, text: '', isFinal: true },
+      ]);
+    }
     expect(hub.getActiveSessionCount()).toBe(0);
     hub.stop();
   });

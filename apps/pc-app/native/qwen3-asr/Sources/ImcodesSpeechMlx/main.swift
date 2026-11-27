@@ -688,9 +688,11 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
     let root = HotwordTrieNode()
     var termStartsAscii = [Bool](repeating: false, count: normalizedTerms.count)
     var termEndsAscii = [Bool](repeating: false, count: normalizedTerms.count)
+    var termFirstChars = [Character](repeating: "\0", count: normalizedTerms.count)
     for (termId, norm) in normalizedTerms.enumerated() {
         termStartsAscii[termId] = isAsciiAlnumOrUnderscore(norm[0])
         termEndsAscii[termId] = isAsciiAlnumOrUnderscore(norm[norm.count - 1])
+        termFirstChars[termId] = norm[0]
         var node = root
         for ch in norm {
             if let child = node.children[ch] {
@@ -711,17 +713,26 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
     let inf = 0x3FFF_FFFF
     var cleared = [Int](repeating: inf, count: n + 1)
     var endedAscii = [Int](repeating: inf, count: n + 1)
+    var sameTermStates: [[Int: Int]?]? = nil
     cleared[0] = 0
 
     for pos in 0..<n {
         let cCount = cleared[pos]
         let aCount = endedAscii[pos]
-        if cCount == inf && aCount == inf { continue }
+        let sameMap = sameTermStates?[pos] ?? nil
+        sameTermStates?[pos] = nil
+        if cCount == inf && aCount == inf && sameMap == nil { continue }
         let bestAtPos = min(cCount, aCount)
 
         if isHotwordHallucinationSeparator(chars[pos]) {
-            if bestAtPos < cleared[pos + 1] {
-                cleared[pos + 1] = bestAtPos
+            var sepMin = bestAtPos
+            if let sameMap {
+                for cost in sameMap.values where cost < sepMin {
+                    sepMin = cost
+                }
+            }
+            if sepMin < cleared[pos + 1] {
+                cleared[pos + 1] = sepMin
             }
         }
 
@@ -732,7 +743,10 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
             let termId = cur.termId
             if termId < 0 { continue }
 
-            let startCost = termStartsAscii[termId] ? cCount : bestAtPos
+            var startCost = termStartsAscii[termId] ? cCount : bestAtPos
+            if let sameCost = sameMap?[termId], sameCost < startCost {
+                startCost = sameCost
+            }
             if startCost >= inf { continue }
 
             let endPos = p + 1
@@ -745,25 +759,17 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
                 if nextCost < endedAscii[endPos] {
                     endedAscii[endPos] = nextCost
                 }
-                let termChars = normalizedTerms[termId]
-                var repPos = endPos
-                var repCost = nextCost
-                while repPos + termChars.count <= n {
-                    var sameMatch = true
-                    for k in 0..<termChars.count {
-                        if chars[repPos + k] != termChars[k] {
-                            sameMatch = false
-                            break
-                        }
+                if termStartsAscii[termId] && chars[endPos] == termFirstChars[termId] {
+                    if sameTermStates == nil {
+                        sameTermStates = [[Int: Int]?](repeating: nil, count: n + 1)
                     }
-                    if !sameMatch { break }
-                    repPos += termChars.count
-                    repCost += 1
-                    if repPos == n {
-                        if repCost < cleared[repPos] { cleared[repPos] = repCost }
-                    } else if repCost < endedAscii[repPos] {
-                        endedAscii[repPos] = repCost
+                    var targetMap = sameTermStates![endPos] ?? [:]
+                    if let prev = targetMap[termId] {
+                        if nextCost < prev { targetMap[termId] = nextCost }
+                    } else {
+                        targetMap[termId] = nextCost
                     }
+                    sameTermStates![endPos] = targetMap
                 }
             }
         }
@@ -815,6 +821,7 @@ final class QwenSegmentedDecodeEngine {
     private var activeText = ""
     private var activeTrustedRealText = ""
     private var activePendingSingleHotword = false
+    private var pendingRetractionFinal = false
     private var confirmedTokens: [Int32] = []
     private var lastEmittedText = ""
     private var stopRequested = false
@@ -934,10 +941,11 @@ final class QwenSegmentedDecodeEngine {
             }
 
             let isFinalPass = isStop && isProducerFinished && !hasRemainingPending
-            if isFinalPass && newCount == 0 && (!lastEmittedText.isEmpty || !committedText.isEmpty) {
+            if isFinalPass && newCount == 0 && (!lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal) {
                 let finalCombined = !committedText.isEmpty && !activeText.isEmpty
                     ? joinTranscriptSegments(committedText, activeText)
                     : (!lastEmittedText.isEmpty ? lastEmittedText : committedText)
+                pendingRetractionFinal = false
                 emitJsonFn([
                     "type": "result",
                     "text": finalCombined,
@@ -1008,13 +1016,14 @@ final class QwenSegmentedDecodeEngine {
                         let hitHotwordHallucination = !rawText.isEmpty && text.isEmpty && (preHallucination.isEmpty || !afterRepetition.isEmpty)
                         let hitAnyGuard = text != rawText
 
-                        if hitHotwordHallucination {
+                        if hitHotwordHallucination || (text.isEmpty && (activePendingSingleHotword || !activeTrustedRealText.isEmpty)) {
                             confirmedTokens = []
                             if !activeTrustedRealText.isEmpty {
                                 activeText = activeTrustedRealText
                                 let combined = joinTranscriptSegments(committedText, activeText)
                                 if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
                                     lastEmittedText = combined
+                                    pendingRetractionFinal = false
                                     emitJsonFn([
                                         "type": "result",
                                         "text": combined,
@@ -1025,19 +1034,23 @@ final class QwenSegmentedDecodeEngine {
                                 activeText = ""
                                 activePendingSingleHotword = false
                                 let combined = committedText
-                                if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
-                                    lastEmittedText = combined
-                                    emitJsonFn([
-                                        "type": "result",
-                                        "text": combined,
-                                        "isFinal": isFinalPass,
-                                    ])
-                                } else if combined.isEmpty && !lastEmittedText.isEmpty && isFinalPass {
+                                if !combined.isEmpty {
+                                    if combined != lastEmittedText || isFinalPass {
+                                        lastEmittedText = combined
+                                        pendingRetractionFinal = false
+                                        emitJsonFn([
+                                            "type": "result",
+                                            "text": combined,
+                                            "isFinal": isFinalPass,
+                                        ])
+                                    }
+                                } else if !lastEmittedText.isEmpty || (isFinalPass && pendingRetractionFinal) {
                                     lastEmittedText = ""
+                                    pendingRetractionFinal = !isFinalPass
                                     emitJsonFn([
                                         "type": "result",
                                         "text": "",
-                                        "isFinal": true,
+                                        "isFinal": isFinalPass,
                                     ])
                                 }
                             } else {
@@ -1070,6 +1083,7 @@ final class QwenSegmentedDecodeEngine {
                             let combined = joinTranscriptSegments(committedText, activeText)
                             if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
                                 lastEmittedText = combined
+                                pendingRetractionFinal = false
                                 emitJsonFn([
                                     "type": "result",
                                     "text": combined,
@@ -1085,6 +1099,7 @@ final class QwenSegmentedDecodeEngine {
                     activeText = ""
                     activeTrustedRealText = ""
                     activePendingSingleHotword = false
+                    pendingRetractionFinal = false
                     confirmedTokens = []
                     lock.lock()
                     activeSegment.removeAll(keepingCapacity: true)
