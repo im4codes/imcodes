@@ -73,13 +73,15 @@ const AUDIT_BARE_FINDING_RE = /^\s*(?:(?:\d+[.)、]\s*)|(?:[-*•]\s*)|(?:#{1,6}
 const AUDIT_NUMBERED_ITEM_RE = /^\s*(?:#{1,6}\s*)?(?:\*\*|__)?(\d{1,3})[.)、](?:\*\*|__)?\s+(.+)$/u;
 const AUDIT_BULLET_ITEM_RE = /^\s*[-*•]\s+(.+)$/u;
 const AUDIT_HEADING_OR_RULE_RE = /^\s*(?:#{1,6}\s+\S|[-*_]{3,}\s*$)/u;
+const AUDIT_NON_FINDING_SECTION_RE = /^(?:verification|validation|checks?|tests?|test\s+results?|evidence\s+summary|acceptance|conclusion|result|summary|next\s+steps?|验证(?:结果|摘要|情况)?|检查(?:项|结果)?|测试(?:结果|通过)?|结论|总结|下一步)$/iu;
+const AUDIT_FINDING_SECTION_RE = /^(?:findings?|issues?|problems?|defects?|bugs?|rework\s+items?|audit\s+findings?|blocking\s+findings?|review\s+findings?|发现(?:的问题)?|问题(?:清单|列表)?|缺陷|审计发现|返工(?:项|原因))$/iu;
 const AUDIT_SUMMARY_LINE_RE = /^\s*(?:[-*•]\s*)?(?:\*\*|__)?(?:summary|audit summary|摘要|审计摘要|总体评价|评估|结论)(?:\*\*|__)?\s*[:：]\s*(.*)$/iu;
-const AUDIT_FIELD_RE = /^\s*(?:[-*•]\s*)?(?:\*\*|__)?(?<label>invariant|violat(?:es|ed|ion)|violation\s+of\s+invariant|invariant\s+violated|违反不变量|不变量|location|位置|file(?:\s*\/\s*function)?|文件(?:路径|位置)?|function|evidence(?:\s*\/\s*repro(?:duction)?)?|证据|repro(?:duction)?|复现|proposal|recommendation|auditor\s+proposal|suggest(?:ed)?\s+(?:solution|fix)|solution|fix|建议(?:方案)?|修复(?:建议|方案)|建议|trade[- ]?offs?|权衡|validation(?:\s+summary)?|验证(?:摘要)?|tests?|suite|next step|next steps|下一步|reason|why|原因|返工原因|未通过原因|主要问题|审计意见|返工意见|审查意见)(?:\*\*|__)?\s*[:：]\s*(?:\*\*|__)?(?<value>.*)$/iu;
+const AUDIT_FIELD_RE = /^\s*(?:[-*•]\s*)?(?:\*\*|__)?(?<label>invariant|violat(?:es|ed|ion)|violation\s+of\s+invariant|invariant\s+violated|违反不变量|不变量|location|位置|file(?:\s*\/\s*function)?|function|文件(?:路径|位置)?|evidence(?:\s*\/\s*repro(?:duction)?)?|证据|repro(?:duction)?|复现|proposal|recommendation|auditor\s+proposal|suggest(?:ed)?\s+(?:solution|fix)|solution|fix|建议(?:方案)?|修复(?:建议|方案)|建议|trade[- ]?offs?|权衡|validation(?:\s+summary)?|验证(?:摘要)?|tests?|suite|next step|next steps|下一步|reason|why|原因|返工原因|未通过原因|主要问题|审计意见|返工意见|审查意见)(?:\*\*|__)?\s*[:：]\s*(?:\*\*|__)?(?<value>.*)$/iu;
 const AUDIT_METADATA_LINE_RE = /^\s*(?:\[IM\.codes task\b|<!--|Audited\s+pair\b|(?:status|round|executor|auditor|verdict|blocking)\s*[:=])/iu;
 const AUDIT_INLINE_SEVERITY_RE = /(?:\[(P[0-4])\]|\((P[0-4])\)|\b(P[0-4])\b)/iu;
 
 type AuditFindingFieldKey = keyof Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking' | 'severity'>;
-type AuditDraftFinding = Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'>;
+type AuditDraftFinding = Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'> & { hasExplicitTag?: boolean };
 
 function stripMarkdownBold(value: string): string {
   // Strip `**bold**` emphasis only; never remove `__` so paths/identifiers like `src/a__b.ts` stay intact.
@@ -148,6 +150,7 @@ function parseUntruncatedTextAudit(rawText: string): {
   let pendingBlankLine = false;
   let sawEmptyHeaderField = false;
   let inCodeFence = false;
+  let inNonFindingSection = false;
   let topLevelSection: 'summary' | 'reason' | 'nextStep' | null = null;
   let summary: string | undefined;
   const reasons: string[] = [];
@@ -186,11 +189,12 @@ function parseUntruncatedTextAudit(rawText: string): {
     if (taggedMatch) {
       const severity = taggedMatch[1]?.toUpperCase();
       const body = cleanUntruncatedText(taggedMatch[2]) ?? '';
-      current = { ...(severity ? { severity } : {}), summary: body };
+      current = { ...(severity ? { severity } : {}), summary: body, hasExplicitTag: true };
       findings.push(current);
       currentField = 'summary';
       pendingBlankLine = false;
       sawEmptyHeaderField = !body || body.endsWith(':');
+      inNonFindingSection = false;
       topLevelSection = null;
       continue;
     }
@@ -203,6 +207,7 @@ function parseUntruncatedTextAudit(rawText: string): {
       currentField = undefined;
       pendingBlankLine = false;
       sawEmptyHeaderField = false;
+      inNonFindingSection = false;
       topLevelSection = 'summary';
       continue;
     }
@@ -229,6 +234,7 @@ function parseUntruncatedTextAudit(rawText: string): {
         currentField = undefined;
         pendingBlankLine = false;
         sawEmptyHeaderField = false;
+        inNonFindingSection = true;
         topLevelSection = 'nextStep';
         continue;
       }
@@ -246,13 +252,14 @@ function parseUntruncatedTextAudit(rawText: string): {
         currentField = undefined;
         pendingBlankLine = false;
         sawEmptyHeaderField = false;
+        inNonFindingSection = true;
         topLevelSection = null;
         continue;
       }
     }
 
     const numMatch = line.match(AUDIT_NUMBERED_ITEM_RE);
-    if (numMatch) {
+    if (numMatch && !inNonFindingSection) {
       const isNestedSubStep = Boolean(
         current
         && currentField
@@ -264,7 +271,7 @@ function parseUntruncatedTextAudit(rawText: string): {
         if (body) {
           const sevMatch = body.match(AUDIT_INLINE_SEVERITY_RE);
           const severity = (sevMatch?.[1] ?? sevMatch?.[2] ?? sevMatch?.[3])?.toUpperCase();
-          current = { ...(severity ? { severity } : {}), summary: body };
+          current = { ...(severity ? { severity } : {}), summary: body, hasExplicitTag: false };
           findings.push(current);
           currentField = 'summary';
           pendingBlankLine = false;
@@ -276,7 +283,7 @@ function parseUntruncatedTextAudit(rawText: string): {
     }
 
     const bulletMatch = line.match(AUDIT_BULLET_ITEM_RE);
-    if (bulletMatch) {
+    if (bulletMatch && !inNonFindingSection) {
       const isNestedBullet = Boolean(
         current
         && currentField
@@ -290,7 +297,7 @@ function parseUntruncatedTextAudit(rawText: string): {
         if (body) {
           const sevMatch = body.match(AUDIT_INLINE_SEVERITY_RE);
           const severity = (sevMatch?.[1] ?? sevMatch?.[2] ?? sevMatch?.[3])?.toUpperCase();
-          current = { ...(severity ? { severity } : {}), summary: body };
+          current = { ...(severity ? { severity } : {}), summary: body, hasExplicitTag: false };
           findings.push(current);
           currentField = 'summary';
           pendingBlankLine = false;
@@ -313,7 +320,12 @@ function parseUntruncatedTextAudit(rawText: string): {
       sawEmptyHeaderField = false;
       topLevelSection = null;
       const cleanedHeading = cleanUntruncatedText(line.replace(/^#+\s*/u, ''));
-      if (cleanedHeading && !/^[-*_]{3,}$/u.test(cleanedHeading)) proseLines.push(cleanedHeading);
+      if (cleanedHeading && !/^[-*_]{3,}$/u.test(cleanedHeading)) {
+        const headingKey = cleanedHeading.replace(/[:：]+$/u, '').trim();
+        if (AUDIT_NON_FINDING_SECTION_RE.test(headingKey)) inNonFindingSection = true;
+        else if (AUDIT_FINDING_SECTION_RE.test(headingKey)) inNonFindingSection = false;
+        proseLines.push(cleanedHeading);
+      }
       continue;
     }
 
@@ -355,14 +367,25 @@ function mergeSingleAuditField(saved: string | undefined, parsed: string | undef
   return saved;
 }
 
+function sameFindingSummaryIdentity(a: string, b: string): boolean {
+  const normA = a.replace(/\s+/gu, ' ').trim().toLowerCase();
+  const normB = b.replace(/\s+/gu, ' ').trim().toLowerCase();
+  if (!normA || !normB) return false;
+  const prefix = Math.min(32, normA.length, normB.length);
+  return normA.slice(0, prefix) === normB.slice(0, prefix);
+}
+
 function mergeAuditFindings(
   structuredFull: readonly AuditDraftFinding[],
   parsedFromText: readonly AuditDraftFinding[],
   legacyStructured: readonly AuditDraftFinding[],
 ): AuditDraftFinding[] {
   if (structuredFull.length > 0) {
+    const canSupplementByIndex = parsedFromText.length === structuredFull.length;
     return structuredFull.map((item, idx) => {
-      const supplement = parsedFromText[idx];
+      const supplement = canSupplementByIndex
+        ? parsedFromText[idx]
+        : parsedFromText.find((p) => sameFindingSummaryIdentity(item.summary, p.summary));
       if (!supplement) return item;
       const severity = item.severity ?? supplement.severity;
       const location = item.location ?? supplement.location;
@@ -382,28 +405,31 @@ function mergeAuditFindings(
     });
   }
 
-  if (legacyStructured.length > 0 && parsedFromText.length > 0) {
-    const merged: AuditDraftFinding[] = [];
-    const total = Math.max(legacyStructured.length, parsedFromText.length);
-    for (let i = 0; i < total; i++) {
-      const legacy = legacyStructured[i];
-      const parsed = parsedFromText[i];
-      if (!legacy) {
-        if (parsed) merged.push(parsed);
-        continue;
-      }
-      if (!parsed) {
-        merged.push(legacy);
-        continue;
-      }
-      const severity = legacy.severity ?? parsed.severity;
-      const summary = mergeSingleAuditField(legacy.summary, parsed.summary) ?? '';
-      const location = mergeSingleAuditField(legacy.location, parsed.location);
-      const evidence = mergeSingleAuditField(legacy.evidence, parsed.evidence);
-      const proposal = mergeSingleAuditField(legacy.proposal, parsed.proposal);
-      const invariant = mergeSingleAuditField(legacy.invariant, parsed.invariant);
-      const tradeoffs = mergeSingleAuditField(legacy.tradeoffs, parsed.tradeoffs);
-      merged.push({
+  if (parsedFromText.length > 0) {
+    // `parsedFromText` owns item boundaries and ordering from `fullNoticeText`/`noticeText`.
+    // Only fill missing fields from `legacyStructured` when both parses agree 1-to-1 on every item
+    // so a lossy legacy parse (`parseTaskPairAuditDetails` dropping unbracketed items) can never drop, duplicate, or cross-contaminate items.
+    const parsedHasAnyField = parsedFromText.some((p) => Boolean(p.location || p.proposal || p.evidence || p.invariant || p.tradeoffs));
+    const canFillFromLegacy = legacyStructured.length === parsedFromText.length
+      && parsedFromText.every((p, idx) => {
+        const l = legacyStructured[idx]!;
+        const sevAligned = !p.severity || !l.severity || p.severity === l.severity;
+        if (!sevAligned) return false;
+        return sameFindingSummaryIdentity(p.summary, l.summary) || (legacyStructured.length === 1 && !parsedHasAnyField);
+      });
+    if (!canFillFromLegacy) {
+      return [...parsedFromText];
+    }
+    return parsedFromText.map((parsed, idx) => {
+      const legacy = legacyStructured[idx]!;
+      const severity = parsed.severity ?? legacy.severity;
+      const summary = mergeSingleAuditField(legacy.summary, parsed.summary) ?? parsed.summary;
+      const location = parsed.location ?? legacy.location;
+      const evidence = parsed.evidence ?? legacy.evidence;
+      const proposal = parsed.proposal ?? legacy.proposal;
+      const invariant = parsed.invariant ?? legacy.invariant;
+      const tradeoffs = parsed.tradeoffs ?? legacy.tradeoffs;
+      return {
         ...(severity ? { severity } : {}),
         summary,
         ...(location ? { location } : {}),
@@ -411,12 +437,11 @@ function mergeAuditFindings(
         ...(proposal ? { proposal } : {}),
         ...(invariant ? { invariant } : {}),
         ...(tradeoffs ? { tradeoffs } : {}),
-      });
-    }
-    return merged;
+      };
+    });
   }
 
-  return parsedFromText.length > 0 ? [...parsedFromText] : [...legacyStructured];
+  return [...legacyStructured];
 }
 
 function normalizeStructuredFindings(
@@ -488,8 +513,16 @@ export function extractAuditFindingsFromVerdict(
   const parsedFromText = fullText ? parseUntruncatedTextAudit(fullText) : { findings: [] };
   const structuredFull = normalizeStructuredFindings(lastVerdict.structuredDetails?.findings);
   const legacyStructured = normalizeStructuredFindings(lastVerdict.auditDetails?.findings);
+  const countSum = AUDIT_SEVERITY_LEVELS.reduce((sum, lvl) => {
+    const key = lvl.toLowerCase() as keyof GlobalTaskAuditCounts;
+    return sum + (counts[key] ?? 0);
+  }, 0);
+  // On a zero-finding PASS, never promote unbracketed bullet/numbered verification checklists into findings.
+  const effectiveParsedFindings = lastVerdict.verb === 'PASS' && countSum === 0
+    ? parsedFromText.findings.filter((item) => item.hasExplicitTag)
+    : parsedFromText.findings;
 
-  const rawFindings = mergeAuditFindings(structuredFull, parsedFromText.findings, legacyStructured);
+  const rawFindings = mergeAuditFindings(structuredFull, effectiveParsedFindings, legacyStructured);
 
   const findings: GlobalTaskAuditFindingItem[] = rawFindings.map((item, idx) => ({
     index: idx + 1,
@@ -503,10 +536,6 @@ export function extractAuditFindingsFromVerdict(
     ...(item.tradeoffs ? { tradeoffs: item.tradeoffs } : {}),
   }));
 
-  const countSum = AUDIT_SEVERITY_LEVELS.reduce((sum, lvl) => {
-    const key = lvl.toLowerCase() as keyof GlobalTaskAuditCounts;
-    return sum + (counts[key] ?? 0);
-  }, 0);
   const findingsCount = findings.length > 0 ? findings.length : countSum;
 
   const summary = cleanUntruncatedText(lastVerdict.structuredDetails?.summary, true)

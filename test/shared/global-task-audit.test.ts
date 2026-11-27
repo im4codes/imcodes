@@ -10,6 +10,7 @@ import {
   buildGlobalTaskAuditSummary,
   extractAuditFindingsFromVerdict,
 } from '../../shared/task-pair-brief.js';
+import { parseTaskPairAuditDetails } from '../../shared/task-pair-notification.js';
 import type { TaskPairLastVerdict } from '../../shared/task-pair.js';
 
 describe('global task structured audit summary & extraction', () => {
@@ -325,5 +326,111 @@ describe('global task structured audit summary & extraction', () => {
       round: 4,
       noticeText: 'REWORK without severities',
     }, ['P0'])).toBeUndefined();
+  });
+
+  it('preserves exact order, severity, location, and proposal when real parseTaskPairAuditDetails drops unbracketed items, and keeps zero-finding PASS Verification lines out of findings', () => {
+    const mixedDaemonNotice = [
+      '- [P0] First problem in bridge handler',
+      'Location: server/src/ws/bridge.ts:10',
+      'Proposal: Fix first problem only.',
+      '',
+      '2. Second problem (P0) unbracketed item',
+      'Location: shared/task-pair-brief.ts:255',
+      'Proposal: Fix second problem cleanly.',
+      '',
+      '- [P1] Third problem non-blocking follow-up',
+      'Location: web/src/components/GlobalTaskBriefModal.tsx:415',
+      'Proposal: Fix third problem gently.',
+    ].join('\n');
+
+    // Simulate real daemon service.ts:1049 persistence (`parseTaskPairAuditDetails` misses item #2 and cross-attributes its fields)
+    const persistedAuditDetails = parseTaskPairAuditDetails(mixedDaemonNotice);
+    expect(persistedAuditDetails?.findings).toHaveLength(2);
+
+    const extracted = extractAuditFindingsFromVerdict({
+      verb: 'REWORK',
+      counts: { P0: 2, P1: 1, P2: 0, P3: 0, P4: 0 },
+      judgement: 'consistent',
+      round: 2,
+      noticeText: mixedDaemonNotice.slice(0, 4000),
+      fullNoticeText: mixedDaemonNotice,
+      auditDetails: persistedAuditDetails,
+    }, ['P0']);
+
+    expect(extracted?.findings).toHaveLength(3);
+    expect(extracted?.findings[0]).toMatchObject({
+      index: 1,
+      severity: 'P0',
+      blocking: true,
+      summary: 'First problem in bridge handler',
+      location: 'server/src/ws/bridge.ts:10',
+      proposal: 'Fix first problem only.',
+    });
+    expect(extracted?.findings[1]).toMatchObject({
+      index: 2,
+      severity: 'P0',
+      blocking: true,
+      summary: 'Second problem (P0) unbracketed item',
+      location: 'shared/task-pair-brief.ts:255',
+      proposal: 'Fix second problem cleanly.',
+    });
+    expect(extracted?.findings[2]).toMatchObject({
+      index: 3,
+      severity: 'P1',
+      blocking: false,
+      summary: 'Third problem non-blocking follow-up',
+      location: 'web/src/components/GlobalTaskBriefModal.tsx:415',
+      proposal: 'Fix third problem gently.',
+    });
+
+    // Zero-finding PASS with ## Verification checklist must yield 0 findings (not 2)
+    const zeroPassReply = [
+      'Summary: All acceptance criteria verified and clean.',
+      '',
+      '## Verification',
+      '1. Ran full daemon and shared suites (98/98 passed).',
+      '2. Verified Chromium height parity test (3/3 passed).',
+    ].join('\n');
+    const passDetail = extractAuditFindingsFromVerdict({
+      verb: 'PASS',
+      counts: { P0: 0, P1: 0, P2: 0, P3: 0, P4: 0 },
+      judgement: 'consistent',
+      round: 3,
+      noticeText: zeroPassReply,
+      fullNoticeText: zeroPassReply,
+      auditDetails: parseTaskPairAuditDetails(zeroPassReply),
+    }, ['P0']);
+    expect(passDetail?.findings).toEqual([]);
+    expect(passDetail?.findingsCount).toBe(0);
+    expect(passDetail?.noticeText).toContain('Ran full daemon and shared suites');
+
+    // PASS with P2=1 + ## Verification + ## Findings includes only the P2 finding
+    const passWithFollowUp = [
+      'Summary: Clean PASS with one optional P2 follow-up.',
+      '',
+      '## Verification',
+      '- Passed server tests (16/16).',
+      '- Passed web tests (105/105).',
+      '',
+      '## Findings',
+      '1. [P2] Clarify warning copy',
+      'Proposal: Update copy in next cleanup.',
+    ].join('\n');
+    const passFollowUpDetail = extractAuditFindingsFromVerdict({
+      verb: 'PASS',
+      counts: { P0: 0, P1: 0, P2: 1, P3: 0, P4: 0 },
+      judgement: 'consistent',
+      round: 4,
+      noticeText: passWithFollowUp,
+      fullNoticeText: passWithFollowUp,
+    }, ['P0']);
+    expect(passFollowUpDetail?.findings).toHaveLength(1);
+    expect(passFollowUpDetail?.findings[0]).toMatchObject({
+      index: 1,
+      severity: 'P2',
+      blocking: false,
+      summary: 'Clarify warning copy',
+      proposal: 'Update copy in next cleanup.',
+    });
   });
 });

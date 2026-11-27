@@ -129,7 +129,9 @@ function makeMemDb() {
           executor_label: executorLabel || prev?.executor_label || null,
           auditor_label: auditorLabel || prev?.auditor_label || null,
           auditor: auditor || prev?.auditor || null,
-          live_summary: liveSummary || prev?.live_summary || null,
+          live_summary: liveSummary === '__NULL__'
+            ? null
+            : (liveSummary || prev?.live_summary || null),
           last_audit_json: lastAuditParam === '__NULL__'
             ? null
             : (lastAuditParam || prev?.last_audit_json || null),

@@ -16313,7 +16313,7 @@ export class WsBridge {
         executorModel: typeof item.executorModel === 'string' ? item.executorModel : undefined,
         auditorModel: typeof item.auditorModel === 'string' ? item.auditorModel : undefined,
         auditor: typeof item.auditor === 'string' ? item.auditor : undefined,
-        liveSummary: typeof item.liveSummary === 'string' ? item.liveSummary : undefined,
+        liveSummary: typeof item.liveSummary === 'string' && item.liveSummary.trim() ? item.liveSummary.trim() : null,
         lastAudit: normalizeGlobalTaskAuditSummary(item.lastAudit) ?? null,
         startedAt: typeof item.startedAt === 'number' ? item.startedAt : undefined,
         endedAt: typeof item.endedAt === 'number' ? item.endedAt : undefined,
@@ -16351,6 +16351,7 @@ export class WsBridge {
     const consoleAudit = hasLastAuditField
       ? (pair.lastAudit === null ? null : (normalizeGlobalTaskAuditSummary(pair.lastAudit) ?? null))
       : undefined;
+    const resolvedLiveSummary = liveSummary ?? (hasLastAuditField && consoleAudit === null ? null : undefined);
     return {
       serverId: this.serverId,
       taskId,
@@ -16370,7 +16371,7 @@ export class WsBridge {
       executorModel: typeof pair.executorModel === 'string' ? pair.executorModel : undefined,
       auditorModel: typeof pair.auditorModel === 'string' ? pair.auditorModel : undefined,
       auditor: typeof pair.auditor === 'string' ? pair.auditor : undefined,
-      liveSummary,
+      liveSummary: resolvedLiveSummary,
       ...(consoleAudit !== undefined ? { lastAudit: consoleAudit } : {}),
       startedAt: typeof pair.startedAt === 'number'
         ? pair.startedAt
@@ -16433,10 +16434,12 @@ export class WsBridge {
           : undefined;
         const liveSummary = typeof payload.blockedNote === 'string' && payload.blockedNote.trim()
           ? payload.blockedNote.trim()
-          : (eventLastAudit?.summary
-            || (!verdictRejectedOrHeld && typeof payload.noticeText === 'string' && payload.noticeText.trim()
-              ? payload.noticeText.trim().slice(0, 240)
-              : undefined));
+          : (appliedAuditClear
+            ? null
+            : (eventLastAudit?.summary
+              || (!verdictRejectedOrHeld && typeof payload.noticeText === 'string' && payload.noticeText.trim()
+                ? payload.noticeText.trim().slice(0, 240)
+                : undefined)));
         const { row: saved, changed } = await upsertGlobalTaskSummaryWithChange(db, {
           serverId: this.serverId,
           taskId,

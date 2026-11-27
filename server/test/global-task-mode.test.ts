@@ -256,7 +256,8 @@ class InMemoryGlobalTaskDb {
           const sAuditor = String(auditor ?? '') || null;
           const sExecModel = String(executorModel ?? '') || null;
           const sAuditModel = (sAuditor === 'none' || sAuditor === '__none__') ? null : (String(auditorModel ?? '') || null);
-          const sLive = String(liveSummary ?? '') || null;
+          const rawLiveParam = String(liveSummary ?? '');
+          const sLive = (rawLiveParam === '' || rawLiveParam === '__NULL__') ? null : rawLiveParam;
           const rawLastAuditParam = String(lastAuditParam ?? '');
           const sLastAudit = (rawLastAuditParam === '' || rawLastAuditParam === '__NULL__') ? null : rawLastAuditParam;
           const bTerminal = Boolean(isTerminal);
@@ -314,7 +315,11 @@ class InMemoryGlobalTaskDb {
               executor_model: sExecModel ?? existing.executor_model ?? null,
               auditor_model: (sAuditor === 'none' || sAuditor === '__none__') ? null : (sAuditModel ?? existing.auditor_model ?? null),
               auditor: sAuditor ?? existing.auditor,
-              live_summary: isNewerOrEqual ? (sLive ?? existing.live_summary) : existing.live_summary,
+              live_summary: !isNewerOrEqual
+                ? existing.live_summary
+                : (rawLiveParam === '__NULL__'
+                  ? null
+                  : (rawLiveParam !== '' ? rawLiveParam : existing.live_summary)),
               last_audit_json: !isNewerOrEqual
                 ? (existing.last_audit_json ?? null)
                 : (rawLastAuditParam === '__NULL__'
@@ -1935,7 +1940,7 @@ describe('global-task-mode server engine', () => {
     expect(row?.status).toBe('passed');
     expect(row?.lastAudit).toEqual(passAudit);
 
-    // 6. Applied NEXT_ROUND (effect=next_round, lastAudit=null) clears lastAudit, and fleet_snapshot preserves clear
+    // 6. Applied NEXT_ROUND (effect=next_round, lastAudit=null) clears both lastAudit and stale audit liveSummary (so old PASS text does not resurrect)
     await bridge.ingestGlobalTaskFrame(db, {
       type: TIMELINE_MESSAGES.EVENT,
       event: {
@@ -1955,6 +1960,69 @@ describe('global-task-mode server engine', () => {
     row = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_bridge_consistency');
     expect(row?.status).toBe('working');
     expect(row?.lastAudit).toBeUndefined();
+    expect(row?.liveSummary).toBeUndefined();
+
+    // 6b. Real blocker (blockedNote) stays visible across reopened / NEXT_ROUND / fleet_snapshot without resurrecting old PASS text
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 4100,
+        payload: {
+          taskId: 'tsk_bridge_consistency',
+          verb: 'PASS',
+          effect: 'verdict',
+          verdictJudgement: 'consistent',
+          toStatus: 'passed',
+          round: 3,
+          lastAudit: passAudit,
+        },
+      },
+    });
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 4200,
+        payload: {
+          taskId: 'tsk_bridge_consistency',
+          verb: 'WORKING',
+          effect: 'reopened',
+          toStatus: 'working',
+          round: 3,
+          flags: ['blocked'],
+          blockedNote: 'SSH target unreachable on port 2222',
+          lastAudit: null,
+        },
+      },
+    });
+    row = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_bridge_consistency');
+    expect(row?.lastAudit).toBeUndefined();
+    expect(row?.liveSummary).toBe('SSH target unreachable on port 2222');
+
+    // fleet_snapshot without verdict or blocker clears stale liveSummary
+    await bridge.ingestGlobalTaskFleetSnapshot(db, {
+      type: GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
+      pairs: [
+        {
+          taskId: 'tsk_bridge_consistency',
+          brain: 'deck_proj_brain',
+          projectName: 'imcodes',
+          title: 'Bridge Verdict Consistency',
+          status: 'working',
+          flags: [],
+          round: 3,
+          checklist: { total: 1, implemented: 1, audited: 0 },
+          createdAt: 1000,
+          updatedAt: 4500,
+        },
+      ],
+    });
+    row = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_bridge_consistency');
+    expect(row?.lastAudit).toBeUndefined();
+    expect(row?.liveSummary).toBeUndefined();
 
     await bridge.ingestGlobalTaskFleetSnapshot(db, {
       type: GLOBAL_TASK_FLEET_SNAPSHOT_MSG,

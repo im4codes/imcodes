@@ -44,7 +44,7 @@ export interface GlobalTaskSummaryUpsertInput {
   executorModel?: string;
   auditorModel?: string;
   auditor?: string;
-  liveSummary?: string;
+  liveSummary?: string | null;
   lastAudit?: GlobalTaskAuditSummary | null;
   startedAt?: number;
   endedAt?: number;
@@ -277,7 +277,9 @@ export async function upsertGlobalTaskSummaryWithChange(
   const auditor = cleanOptionalStr(input.auditor) ?? '';
   const executorModel = cleanModelOptional(input.executorModel) ?? '';
   const auditorModel = isNoAuditorSentinel(auditor) ? '' : (cleanModelOptional(input.auditorModel) ?? '');
-  const liveSummary = cleanOptionalStr(input.liveSummary) ?? '';
+  const liveSummary = input.liveSummary === null
+    ? '__NULL__'
+    : (cleanOptionalStr(input.liveSummary) ?? '');
   const normalizedLastAudit = input.lastAudit === undefined
     ? undefined
     : (input.lastAudit === null ? null : (normalizeGlobalTaskAuditSummary(input.lastAudit) ?? null));
@@ -319,7 +321,8 @@ export async function upsertGlobalTaskSummaryWithChange(
       $1, $2, $3, $4, $5, $6,
       $7, CASE WHEN $8 = '' THEN '[]' ELSE $8 END, $9,
       $10, $11, $12,
-      NULLIF($13, ''), NULLIF($14, ''), NULLIF($15, ''), NULLIF($16, ''),
+      NULLIF($13, ''), NULLIF($14, ''), NULLIF($15, ''),
+      CASE WHEN $16 = '' OR $16 = '__NULL__' THEN NULL ELSE $16 END,
       $17, $18, $19, $20, $21, $22,
       NULLIF($23, ''), NULLIF($24, ''),
       CASE WHEN $25 = '' OR $25 = '__NULL__' THEN NULL ELSE $25 END
@@ -343,7 +346,12 @@ export async function upsertGlobalTaskSummaryWithChange(
         WHEN excluded.auditor IN ('${TASK_PAIR_NO_AUDITOR}', '__none__') THEN NULL
         ELSE COALESCE(excluded.auditor_model, global_task_pair_summaries.auditor_model)
       END,
-      live_summary = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at THEN COALESCE(excluded.live_summary, global_task_pair_summaries.live_summary) ELSE global_task_pair_summaries.live_summary END,
+      live_summary = CASE
+        WHEN excluded.updated_at < global_task_pair_summaries.updated_at THEN global_task_pair_summaries.live_summary
+        WHEN $16 = '__NULL__' THEN NULL
+        WHEN $16 <> '' THEN $16
+        ELSE global_task_pair_summaries.live_summary
+      END,
       last_audit_json = CASE
         WHEN excluded.updated_at < global_task_pair_summaries.updated_at THEN global_task_pair_summaries.last_audit_json
         WHEN $25 = '__NULL__' THEN NULL
