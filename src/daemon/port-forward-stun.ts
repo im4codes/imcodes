@@ -186,11 +186,13 @@ export async function probeStunCandidates(
   iceServers: readonly DirectFileTransferIceServerConfig[],
   options: {
     timeoutMs?: number;
+    signal?: AbortSignal;
     lookup?: (hostname: string) => Promise<string>;
   } = {},
 ): Promise<StunMappedEndpoint[]> {
   const servers = extractStunServers(iceServers);
-  if (servers.length === 0) return [];
+  if (servers.length === 0 || options.signal?.aborted) return [];
+  const signal = options.signal;
   const timeoutMs = options.timeoutMs ?? PORT_FORWARD_LIMITS.STUN_PROBE_TIMEOUT_MS;
   const resolveHost = options.lookup ?? (async (hostname: string) => {
     if (isIP(hostname) === 4) return hostname;
@@ -206,6 +208,7 @@ export async function probeStunCandidates(
   }>();
 
   const onMessage = (msg: Buffer, _rinfo: RemoteInfo) => {
+    if (signal?.aborted) return;
     if (msg.length < STUN_HEADER_BYTES) return;
     if (msg.readUInt16BE(0) !== STUN_BINDING_SUCCESS_RESPONSE) return;
     if (msg.readUInt32BE(4) !== STUN_MAGIC_COOKIE) return;
@@ -220,8 +223,23 @@ export async function probeStunCandidates(
   };
 
   socket.on('message', onMessage);
+  const abortResolvers = new Set<() => void>();
+  const onAbort = () => {
+    socket.off('message', onMessage);
+    for (const finishNull of [...abortResolvers]) {
+      finishNull();
+    }
+    abortResolvers.clear();
+    pending.clear();
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+
   try {
     const results = await Promise.all(servers.map((server) => new Promise<StunMappedEndpoint | null>((resolve) => {
+      if (signal?.aborted) {
+        resolve(null);
+        return;
+      }
       const { packet, transactionId } = buildStunBindingRequest();
       const txHex = transactionId.toString('hex');
       let finished = false;
@@ -230,8 +248,12 @@ export async function probeStunCandidates(
         finished = true;
         clearTimeout(timer);
         pending.delete(txHex);
+        abortResolvers.delete(finishAbort);
         resolve(value);
       };
+      const finishAbort = () => finish(null);
+      abortResolvers.add(finishAbort);
+
       const timer = setTimeout(() => finish(null), timeoutMs);
       timer.unref?.();
 
@@ -244,7 +266,10 @@ export async function probeStunCandidates(
 
       void resolveHost(server.host)
         .then((ip) => {
-          if (finished) return;
+          if (finished || signal?.aborted) {
+            finish(null);
+            return;
+          }
           socket.send(packet, server.port, ip, (err) => {
             if (err) finish(null);
           });
@@ -264,6 +289,7 @@ export async function probeStunCandidates(
     }
     return deduped;
   } finally {
+    signal?.removeEventListener('abort', onAbort);
     socket.off('message', onMessage);
   }
 }

@@ -1,4 +1,4 @@
--- Authoritative cross-pod registry and opaque message bus for P2P / relayed port-forwarding tunnels.
+-- Authoritative cross-pod registry and bounded/ordered opaque message bus for P2P / relayed port-forwarding tunnels.
 
 CREATE TABLE IF NOT EXISTS port_forward_endpoints (
   server_id TEXT PRIMARY KEY,
@@ -43,8 +43,19 @@ CREATE TABLE IF NOT EXISTS port_forward_bus_messages (
   seq BIGSERIAL PRIMARY KEY,
   target_pod_id TEXT NOT NULL,
   kind TEXT NOT NULL,
+  tunnel_id TEXT,
+  direction TEXT,
+  byte_size INTEGER NOT NULL DEFAULT 0,
+  expires_at BIGINT NOT NULL DEFAULT 0,
   payload JSONB NOT NULL,
   created_at BIGINT NOT NULL
 );
 
+ALTER TABLE port_forward_bus_messages ADD COLUMN IF NOT EXISTS tunnel_id TEXT;
+ALTER TABLE port_forward_bus_messages ADD COLUMN IF NOT EXISTS direction TEXT;
+ALTER TABLE port_forward_bus_messages ADD COLUMN IF NOT EXISTS byte_size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE port_forward_bus_messages ADD COLUMN IF NOT EXISTS expires_at BIGINT NOT NULL DEFAULT 0;
+
 CREATE INDEX IF NOT EXISTS idx_pf_bus_target_seq ON port_forward_bus_messages (target_pod_id, seq);
+CREATE INDEX IF NOT EXISTS idx_pf_bus_tunnel_dir ON port_forward_bus_messages (tunnel_id, direction) WHERE tunnel_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_pf_bus_expires ON port_forward_bus_messages (expires_at);

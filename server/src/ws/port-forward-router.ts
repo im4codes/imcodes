@@ -21,6 +21,7 @@ import {
   type PortForwardClusterBusMessage,
   type PortForwardClusterStore,
   type PortForwardClusterTunnelRecord,
+  type PortForwardRelayDirection,
 } from './port-forward-cluster.js';
 
 export interface PortForwardBridgeEndpoint {
@@ -31,6 +32,7 @@ export interface PortForwardBridgeEndpoint {
 
 export type PortForwardBridgeLookup = (serverId: string) => PortForwardBridgeEndpoint | undefined;
 export type PortForwardIceServerProvider = (userId: string) => DirectFileTransferIceServerConfig[];
+export type PortForwardCloseSideState = 'pending' | 'acked' | 'offline' | 'timed_out';
 
 export interface PortForwardRouterOpenInput {
   userId: string;
@@ -79,10 +81,17 @@ interface ActiveServerTunnel {
   listenCandidates: PortForwardCandidate[];
   listenPublicKey: string | null;
   listenKeyProof: string | null;
+  listenIdentityPublicKey: string | null;
+  listenIdentitySignature: string | null;
   targetReady: boolean;
   targetCandidates: PortForwardCandidate[];
   targetPublicKey: string | null;
   targetKeyProof: string | null;
+  targetIdentityPublicKey: string | null;
+  targetIdentitySignature: string | null;
+  connectDispatchedToListen: boolean;
+  l2tBackpressured: boolean;
+  t2lBackpressured: boolean;
   activeConnections: number;
   bytesSent: number;
   bytesReceived: number;
@@ -91,6 +100,11 @@ interface ActiveServerTunnel {
   prepareTimer: ReturnType<typeof setTimeout> | null;
   establishTimer: ReturnType<typeof setTimeout> | null;
   ttlTimer: ReturnType<typeof setTimeout> | null;
+  closeAckTimer: ReturnType<typeof setTimeout> | null;
+  listenCloseState: PortForwardCloseSideState;
+  targetCloseState: PortForwardCloseSideState;
+  closePromise: Promise<{ listen: PortForwardCloseSideState; target: PortForwardCloseSideState }> | null;
+  resolveClose: ((res: { listen: PortForwardCloseSideState; target: PortForwardCloseSideState }) => void) | null;
   resolveOpen: ((result: PortForwardRouterOpenResult) => void) | null;
 }
 
@@ -101,10 +115,15 @@ export interface PortForwardRouterOptions {
   getIceServers?: PortForwardIceServerProvider;
   prepareTimeoutMs?: number;
   establishTimeoutMs?: number;
+  closeAckTimeoutMs?: number;
 }
 
 export class PortForwardRouter {
   private readonly tunnels = new Map<string, ActiveServerTunnel>();
+  private readonly closingTunnels = new Map<string, ActiveServerTunnel>();
+  private readonly pendingRemoteCloses = new Map<string, (ok: boolean) => void>();
+  private readonly inboundChains = new Map<string, Promise<void>>();
+  private readonly outboundChains = new Map<string, Promise<void>>();
   private podId: string;
   private clusterStore: PortForwardClusterStore;
   private hasSharedClusterStore: boolean;
@@ -113,6 +132,7 @@ export class PortForwardRouter {
   private getIceServers: PortForwardIceServerProvider;
   private prepareTimeoutMs: number;
   private establishTimeoutMs: number;
+  private closeAckTimeoutMs: number;
 
   constructor(options: PortForwardRouterOptions = {}) {
     this.podId = options.podId ?? `pod_${randomBytes(6).toString('hex')}`;
@@ -122,6 +142,7 @@ export class PortForwardRouter {
     this.getIceServers = options.getIceServers ?? (() => []);
     this.prepareTimeoutMs = options.prepareTimeoutMs ?? PORT_FORWARD_LIMITS.PREPARE_TIMEOUT_MS;
     this.establishTimeoutMs = options.establishTimeoutMs ?? PORT_FORWARD_LIMITS.ESTABLISH_TIMEOUT_MS;
+    this.closeAckTimeoutMs = options.closeAckTimeoutMs ?? PORT_FORWARD_LIMITS.CLOSE_ACK_TIMEOUT_MS;
     this.bindBusSubscription();
   }
 
@@ -144,6 +165,7 @@ export class PortForwardRouter {
     if (options.getIceServers) this.getIceServers = options.getIceServers;
     if (options.prepareTimeoutMs !== undefined) this.prepareTimeoutMs = options.prepareTimeoutMs;
     if (options.establishTimeoutMs !== undefined) this.establishTimeoutMs = options.establishTimeoutMs;
+    if (options.closeAckTimeoutMs !== undefined) this.closeAckTimeoutMs = options.closeAckTimeoutMs;
   }
 
   async startCluster(): Promise<void> {
@@ -160,6 +182,10 @@ export class PortForwardRouter {
     if (this.clusterStore.stop) {
       await this.clusterStore.stop(this.podId);
     }
+    for (const [reqId, resolve] of this.pendingRemoteCloses.entries()) {
+      this.pendingRemoteCloses.delete(reqId);
+      resolve(false);
+    }
     for (const tunnel of [...this.tunnels.values()]) {
       this.failPendingOrCloseTunnel(
         tunnel,
@@ -173,6 +199,14 @@ export class PortForwardRouter {
   private bindBusSubscription(): void {
     this.unsubscribeBus?.();
     this.unsubscribeBus = this.clusterStore.subscribePod(this.podId, (msg) => this.handleBusMessage(msg));
+  }
+
+  private enqueueSerial(map: Map<string, Promise<void>>, key: string, task: () => Promise<void>): void {
+    const prev = map.get(key) ?? Promise.resolve();
+    const next = prev.then(task, task).finally(() => {
+      if (map.get(key) === next) map.delete(key);
+    });
+    map.set(key, next);
   }
 
   onDaemonConnected(serverId: string, generation: number): void {
@@ -196,12 +230,25 @@ export class PortForwardRouter {
           isListen ? 'listen node disconnected' : 'target node disconnected',
         );
       } else {
-        this.closeTunnelInternal(
+        void this.closeTunnelInternal(
           tunnel,
           isListen ? 'listen_node_disconnected' : 'target_node_disconnected',
           !isListen,
           !isTarget,
         );
+      }
+    }
+
+    for (const closing of [...this.closingTunnels.values()]) {
+      const isListen = closing.listenServerId === serverId && closing.listenGeneration === generation;
+      const isTarget = closing.targetServerId === serverId && closing.targetGeneration === generation;
+      if (isListen && closing.listenCloseState === 'pending') {
+        closing.listenCloseState = 'offline';
+        this.maybeSettleClose(closing);
+      }
+      if (isTarget && closing.targetCloseState === 'pending') {
+        closing.targetCloseState = 'offline';
+        this.maybeSettleClose(closing);
       }
     }
 
@@ -235,7 +282,6 @@ export class PortForwardRouter {
     if (!this.hasSharedClusterStore) return null;
     const remote = await this.clusterStore.getEndpoint(serverId);
     if (!remote) return null;
-    // If cluster store points to THIS pod, trust only live local WsBridge state!
     if (remote.podId === this.podId) {
       return localBridge && localBridge.isDaemonConnected()
         ? { podId: this.podId, generation: localBridge.daemonConnectionGeneration() }
@@ -249,22 +295,34 @@ export class PortForwardRouter {
     serverId: string,
     expectedGeneration: number,
     frame: PortForwardWireMessage,
-  ): Promise<boolean> {
+    relayMeta?: { tunnelId: string; direction: PortForwardRelayDirection },
+  ): Promise<{ sent: boolean; overflow: boolean; highWater: boolean }> {
     if (podId === this.podId) {
       const bridge = this.lookupBridge(serverId);
-      if (!bridge || !bridge.isDaemonConnected()) return false;
-      return bridge.trySendPortForward(frame as unknown as Record<string, unknown>, expectedGeneration);
+      if (!bridge || !bridge.isDaemonConnected()) {
+        return { sent: false, overflow: false, highWater: false };
+      }
+      const ok = bridge.trySendPortForward(frame as unknown as Record<string, unknown>, expectedGeneration);
+      return { sent: ok, overflow: false, highWater: false };
     }
     try {
-      await this.clusterStore.sendToPod(podId, {
+      const res = await this.clusterStore.enqueueBusMessage(podId, {
         kind: 'to_endpoint',
         serverId,
         expectedGeneration,
         frame,
+        ...(relayMeta ? {
+          tunnelId: relayMeta.tunnelId,
+          direction: relayMeta.direction,
+          coordinatorPodId: this.podId,
+        } : {}),
       });
-      return true;
+      if (!res.ok) {
+        return { sent: false, overflow: true, highWater: false };
+      }
+      return { sent: true, overflow: false, highWater: res.highWater };
     } catch {
-      return false;
+      return { sent: false, overflow: false, highWater: false };
     }
   }
 
@@ -273,7 +331,6 @@ export class PortForwardRouter {
       case 'to_endpoint': {
         const bridge = this.lookupBridge(msg.serverId);
         if (!bridge || !bridge.isDaemonConnected()) {
-          // Stale endpoint presence or disconnected locally: notify disconnect so coordinator tears down.
           if (msg.frame.type !== PORT_FORWARD_MSG.CLOSE) {
             this.onDaemonDisconnected(msg.serverId, msg.expectedGeneration);
           }
@@ -287,45 +344,103 @@ export class PortForwardRouter {
       }
 
       case 'to_coordinator': {
+        const active = this.tunnels.get(msg.tunnelId) ?? this.closingTunnels.get(msg.tunnelId);
+        if (!active) return;
+        this.processCoordinatorMessage(active, msg.fromServerId, msg.fromGeneration, msg.frame);
+        return;
+      }
+
+      case 'relay_drained': {
         const tunnel = this.tunnels.get(msg.tunnelId);
-        if (!tunnel || tunnel.status === 'closed') return;
-        this.processCoordinatorMessage(tunnel, msg.fromServerId, msg.fromGeneration, msg.frame);
+        if (!tunnel || tunnel.status !== 'active' || tunnel.transportMode !== 'relay') return;
+        const senderPodId = msg.direction === 'l2t' ? tunnel.listenPodId : tunnel.targetPodId;
+        const senderServerId = msg.direction === 'l2t' ? tunnel.listenServerId : tunnel.targetServerId;
+        const senderGeneration = msg.direction === 'l2t' ? tunnel.listenGeneration : tunnel.targetGeneration;
+        const flagKey = msg.direction === 'l2t' ? 'l2tBackpressured' : 't2lBackpressured';
+        if (!tunnel[flagKey]) return;
+        tunnel[flagKey] = false;
+        this.enqueueSerial(this.outboundChains, `${tunnel.tunnelId}:${msg.direction}:bp`, async () => {
+          if (tunnel.status === 'closed') return;
+          await this.sendToEndpoint(senderPodId, senderServerId, senderGeneration, {
+            type: PORT_FORWARD_MSG.RELAY_BACKPRESSURE,
+            tunnelId: tunnel.tunnelId,
+            paused: false,
+          });
+        });
         return;
       }
 
       case 'daemon_disconnected': {
-        const tunnel = this.tunnels.get(msg.tunnelId);
-        if (!tunnel || tunnel.status === 'closed') return;
-        const isListen = tunnel.listenServerId === msg.serverId && tunnel.listenGeneration === msg.generation;
-        const isTarget = tunnel.targetServerId === msg.serverId && tunnel.targetGeneration === msg.generation;
-        if (!isListen && !isTarget) return;
-        if (tunnel.resolveOpen) {
-          this.failPendingTunnel(
-            tunnel,
-            503,
-            PORT_FORWARD_ERRORS.NODE_OFFLINE,
-            isListen ? 'listen node disconnected' : 'target node disconnected',
-          );
-        } else {
-          this.closeTunnelInternal(
-            tunnel,
-            isListen ? 'listen_node_disconnected' : 'target_node_disconnected',
-            !isListen,
-            !isTarget,
-          );
+        const active = this.tunnels.get(msg.tunnelId);
+        if (active && active.status !== 'closed') {
+          const isListen = active.listenServerId === msg.serverId && active.listenGeneration === msg.generation;
+          const isTarget = active.targetServerId === msg.serverId && active.targetGeneration === msg.generation;
+          if (!isListen && !isTarget) return;
+          if (active.resolveOpen) {
+            this.failPendingTunnel(
+              active,
+              503,
+              PORT_FORWARD_ERRORS.NODE_OFFLINE,
+              isListen ? 'listen node disconnected' : 'target node disconnected',
+            );
+          } else {
+            void this.closeTunnelInternal(
+              active,
+              isListen ? 'listen_node_disconnected' : 'target_node_disconnected',
+              !isListen,
+              !isTarget,
+            );
+          }
+          return;
+        }
+        const closing = this.closingTunnels.get(msg.tunnelId);
+        if (closing) {
+          const isListen = closing.listenServerId === msg.serverId && closing.listenGeneration === msg.generation;
+          const isTarget = closing.targetServerId === msg.serverId && closing.targetGeneration === msg.generation;
+          if (isListen && closing.listenCloseState === 'pending') {
+            closing.listenCloseState = 'offline';
+            this.maybeSettleClose(closing);
+          }
+          if (isTarget && closing.targetCloseState === 'pending') {
+            closing.targetCloseState = 'offline';
+            this.maybeSettleClose(closing);
+          }
         }
         return;
       }
 
       case 'close_tunnel': {
-        const tunnel = this.tunnels.get(msg.tunnelId);
-        if (!tunnel || tunnel.status === 'closed') return;
-        this.failPendingOrCloseTunnel(
-          tunnel,
-          409,
-          PORT_FORWARD_ERRORS.TUNNEL_NOT_FOUND,
-          msg.reason,
-        );
+        const local = this.tunnels.get(msg.tunnelId) ?? this.closingTunnels.get(msg.tunnelId);
+        const sendAck = (ok: boolean) => {
+          if (msg.requestId && msg.replyPodId) {
+            void this.clusterStore.sendToPod(msg.replyPodId, {
+              kind: 'close_tunnel_ack',
+              requestId: msg.requestId,
+              tunnelId: msg.tunnelId,
+              ok,
+            }).catch(() => {});
+          }
+        };
+        if (local) {
+          // Do NOT await inside drainPod: CLOSE_ACK arrives through the same pod bus queue!
+          void this.failPendingOrCloseTunnel(
+            local,
+            409,
+            PORT_FORWARD_ERRORS.TUNNEL_NOT_FOUND,
+            msg.reason,
+          ).then(() => sendAck(true), () => sendAck(false));
+        } else {
+          void this.clusterStore.markTunnelClosed(msg.tunnelId).then(() => sendAck(false), () => sendAck(false));
+        }
+        return;
+      }
+
+      case 'close_tunnel_ack': {
+        const resolve = this.pendingRemoteCloses.get(msg.requestId);
+        if (resolve) {
+          this.pendingRemoteCloses.delete(msg.requestId);
+          resolve(msg.ok);
+        }
         return;
       }
     }
@@ -426,10 +541,17 @@ export class PortForwardRouter {
         listenCandidates: [],
         listenPublicKey: null,
         listenKeyProof: null,
+        listenIdentityPublicKey: null,
+        listenIdentitySignature: null,
         targetReady: false,
         targetCandidates: [],
         targetPublicKey: null,
         targetKeyProof: null,
+        targetIdentityPublicKey: null,
+        targetIdentitySignature: null,
+        connectDispatchedToListen: false,
+        l2tBackpressured: false,
+        t2lBackpressured: false,
         activeConnections: 0,
         bytesSent: 0,
         bytesReceived: 0,
@@ -438,6 +560,11 @@ export class PortForwardRouter {
         prepareTimer: null,
         establishTimer: null,
         ttlTimer: null,
+        closeAckTimer: null,
+        listenCloseState: 'pending',
+        targetCloseState: 'pending',
+        closePromise: null,
+        resolveClose: null,
         resolveOpen,
       };
       this.tunnels.set(tunnelId, tunnel);
@@ -486,12 +613,12 @@ export class PortForwardRouter {
         }),
       ]).then(([sentListen, sentTarget]) => {
         if (tunnel.status === 'closed') return;
-        if (!sentListen || !sentTarget) {
+        if (!sentListen.sent || !sentTarget.sent) {
           this.failPendingTunnel(
             tunnel,
             503,
             PORT_FORWARD_ERRORS.NODE_OFFLINE,
-            !sentListen
+            !sentListen.sent
               ? `listen node "${input.listenNode}" disconnected during prepare`
               : `target node "${input.targetNode}" disconnected during prepare`,
           );
@@ -502,6 +629,48 @@ export class PortForwardRouter {
 
   async listTunnels(userId: string, nodeServerId?: string): Promise<PortForwardTunnelSummary[]> {
     return this.clusterStore.listActiveTunnels(userId, nodeServerId);
+  }
+
+  private async closeTunnelRecordAndAwait(record: PortForwardClusterTunnelRecord, reason: string): Promise<void> {
+    const localTunnel = this.tunnels.get(record.tunnelId) ?? this.closingTunnels.get(record.tunnelId);
+    if (localTunnel) {
+      await this.failPendingOrCloseTunnel(
+        localTunnel,
+        409,
+        PORT_FORWARD_ERRORS.TUNNEL_NOT_FOUND,
+        reason,
+      );
+      return;
+    }
+
+    if (record.coordinatorPodId !== this.podId) {
+      const requestId = randomBytes(8).toString('hex');
+      const ackPromise = new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => {
+          if (this.pendingRemoteCloses.delete(requestId)) {
+            resolve(false);
+          }
+        }, this.closeAckTimeoutMs + 500);
+        timer.unref?.();
+        this.pendingRemoteCloses.set(requestId, (ok) => {
+          clearTimeout(timer);
+          resolve(ok);
+        });
+      });
+
+      await this.clusterStore.sendToPod(record.coordinatorPodId, {
+        kind: 'close_tunnel',
+        requestId,
+        replyPodId: this.podId,
+        tunnelId: record.tunnelId,
+        reason,
+      });
+
+      const acked = await ackPromise;
+      if (acked) return;
+    }
+
+    await this.clusterStore.markTunnelClosed(record.tunnelId);
   }
 
   async closeTunnelForUser(
@@ -526,48 +695,14 @@ export class PortForwardRouter {
         error: `tunnel "${tunnelId}" is not owned by caller`,
       };
     }
-    await this.clusterStore.markTunnelClosed(tunnelId);
-    const localTunnel = this.tunnels.get(tunnelId);
-    if (localTunnel) {
-      this.failPendingOrCloseTunnel(
-        localTunnel,
-        409,
-        PORT_FORWARD_ERRORS.TUNNEL_NOT_FOUND,
-        reason,
-      );
-    } else if (record.coordinatorPodId !== this.podId) {
-      await this.clusterStore.sendToPod(record.coordinatorPodId, {
-        kind: 'close_tunnel',
-        tunnelId,
-        reason,
-      });
-    }
+    await this.closeTunnelRecordAndAwait(record, reason);
     return { ok: true, closedTunnelIds: [tunnelId] };
   }
 
   async closeAllForUser(userId: string, nodeServerId?: string, reason = 'closed_by_user'): Promise<string[]> {
     const openTunnels = await this.clusterStore.listOpenTunnelsForUser(userId, nodeServerId);
-    const closedIds: string[] = [];
-    for (const record of openTunnels) {
-      await this.clusterStore.markTunnelClosed(record.tunnelId);
-      const localTunnel = this.tunnels.get(record.tunnelId);
-      if (localTunnel) {
-        this.failPendingOrCloseTunnel(
-          localTunnel,
-          409,
-          PORT_FORWARD_ERRORS.TUNNEL_NOT_FOUND,
-          reason,
-        );
-      } else if (record.coordinatorPodId !== this.podId) {
-        await this.clusterStore.sendToPod(record.coordinatorPodId, {
-          kind: 'close_tunnel',
-          tunnelId: record.tunnelId,
-          reason,
-        });
-      }
-      closedIds.push(record.tunnelId);
-    }
-    return closedIds;
+    await Promise.all(openTunnels.map((record) => this.closeTunnelRecordAndAwait(record, reason)));
+    return openTunnels.map((t) => t.tunnelId);
   }
 
   handleDaemonMessage(fromServerId: string, fromGeneration: number, raw: unknown): boolean {
@@ -579,16 +714,18 @@ export class PortForwardRouter {
     if (!parsed.ok) return true;
     const msg = parsed.value;
 
-    const localTunnel = this.tunnels.get(msg.tunnelId);
+    const localTunnel = this.tunnels.get(msg.tunnelId) ?? this.closingTunnels.get(msg.tunnelId);
     if (localTunnel) {
-      if (localTunnel.status !== 'closed') {
+      this.enqueueSerial(this.inboundChains, `${msg.tunnelId}:${fromServerId}`, async () => {
         this.processCoordinatorMessage(localTunnel, fromServerId, fromGeneration, msg);
-      }
+      });
       return true;
     }
 
     if (this.hasSharedClusterStore) {
-      void this.forwardMessageToCoordinator(fromServerId, fromGeneration, msg);
+      this.enqueueSerial(this.inboundChains, `${msg.tunnelId}:${fromServerId}`, async () => {
+        await this.forwardMessageToCoordinator(fromServerId, fromGeneration, msg);
+      });
     }
     return true;
   }
@@ -600,20 +737,29 @@ export class PortForwardRouter {
   ): Promise<void> {
     try {
       const record = await this.clusterStore.getTunnel(msg.tunnelId);
-      if (!record || record.status === 'closed') return;
+      if (!record) return;
+      if (record.status === 'closed' && msg.type !== PORT_FORWARD_MSG.CLOSE_ACK) return;
+
       if (record.coordinatorPodId === this.podId) {
-        const localTunnel = this.tunnels.get(msg.tunnelId);
-        if (localTunnel && localTunnel.status !== 'closed') {
+        const localTunnel = this.tunnels.get(msg.tunnelId) ?? this.closingTunnels.get(msg.tunnelId);
+        if (localTunnel) {
           this.processCoordinatorMessage(localTunnel, fromServerId, fromGeneration, msg);
         }
         return;
       }
-      await this.clusterStore.sendToPod(record.coordinatorPodId, {
+
+      const direction: PortForwardRelayDirection | undefined =
+        msg.type === PORT_FORWARD_MSG.RELAY_FRAME
+          ? (fromServerId === record.listenServerId ? 'l2t' : 't2l')
+          : undefined;
+
+      await this.clusterStore.enqueueBusMessage(record.coordinatorPodId, {
         kind: 'to_coordinator',
         tunnelId: msg.tunnelId,
         fromServerId,
         fromGeneration,
         frame: msg,
+        ...(direction ? { direction } : {}),
       });
     } catch {
       // Ignore transient cluster lookup failure on closing tunnel.
@@ -626,8 +772,6 @@ export class PortForwardRouter {
     fromGeneration: number,
     msg: PortForwardWireMessage,
   ): void {
-    if (tunnel.status === 'closed') return;
-
     const senderRole: PortForwardRole | null =
       tunnel.listenServerId === fromServerId && tunnel.listenGeneration === fromGeneration
         ? PORT_FORWARD_ROLE.LISTEN
@@ -635,6 +779,19 @@ export class PortForwardRouter {
           ? PORT_FORWARD_ROLE.TARGET
           : null;
     if (!senderRole) return;
+
+    if (msg.type === PORT_FORWARD_MSG.CLOSE_ACK) {
+      if (msg.role !== senderRole) return;
+      if (senderRole === PORT_FORWARD_ROLE.LISTEN) {
+        if (tunnel.listenCloseState === 'pending') tunnel.listenCloseState = 'acked';
+      } else {
+        if (tunnel.targetCloseState === 'pending') tunnel.targetCloseState = 'acked';
+      }
+      this.maybeSettleClose(tunnel);
+      return;
+    }
+
+    if (tunnel.status === 'closed') return;
 
     switch (msg.type) {
       case PORT_FORWARD_MSG.READY: {
@@ -644,12 +801,16 @@ export class PortForwardRouter {
           tunnel.listenCandidates = msg.candidates;
           tunnel.listenPublicKey = msg.publicKey;
           tunnel.listenKeyProof = msg.keyProof;
+          tunnel.listenIdentityPublicKey = msg.identityPublicKey;
+          tunnel.listenIdentitySignature = msg.identitySignature;
           tunnel.boundListenPort = msg.listenPort ?? null;
         } else {
           tunnel.targetReady = true;
           tunnel.targetCandidates = msg.candidates;
           tunnel.targetPublicKey = msg.publicKey;
           tunnel.targetKeyProof = msg.keyProof;
+          tunnel.targetIdentityPublicKey = msg.identityPublicKey;
+          tunnel.targetIdentitySignature = msg.identitySignature;
         }
         if (tunnel.listenReady && tunnel.targetReady) {
           if (tunnel.prepareTimer) {
@@ -661,8 +822,16 @@ export class PortForwardRouter {
             status: 'connecting',
             boundListenPort: tunnel.boundListenPort,
           }).catch(() => {});
-          this.dispatchConnect(tunnel);
+          this.dispatchConnectToTarget(tunnel);
         }
+        return;
+      }
+
+      case PORT_FORWARD_MSG.TARGET_READY: {
+        if (tunnel.status !== 'connecting' || senderRole !== PORT_FORWARD_ROLE.TARGET) return;
+        if (tunnel.connectDispatchedToListen) return;
+        tunnel.connectDispatchedToListen = true;
+        this.dispatchConnectToListen(tunnel);
         return;
       }
 
@@ -675,7 +844,6 @@ export class PortForwardRouter {
           tunnel.targetEstablishedMode = msg.transportMode;
         }
 
-        // Synchronize activation: BOTH endpoints must confirm the exact same transportMode!
         if (!tunnel.listenEstablishedMode || !tunnel.targetEstablishedMode) return;
         if (tunnel.listenEstablishedMode !== tunnel.targetEstablishedMode) {
           this.failPendingTunnel(
@@ -701,7 +869,7 @@ export class PortForwardRouter {
 
         const remainingTtlMs = Math.max(1_000, tunnel.expiresAt - Date.now());
         tunnel.ttlTimer = setTimeout(() => {
-          this.closeTunnelInternal(tunnel, 'ttl_expired', true, true);
+          void this.closeTunnelInternal(tunnel, 'ttl_expired', true, true);
         }, remainingTtlMs);
         tunnel.ttlTimer.unref?.();
 
@@ -729,7 +897,7 @@ export class PortForwardRouter {
             msg.reason ?? 'tunnel closed by endpoint',
           );
         } else {
-          this.closeTunnelInternal(
+          void this.closeTunnelInternal(
             tunnel,
             msg.reason ?? 'remote_closed',
             senderRole !== PORT_FORWARD_ROLE.LISTEN,
@@ -740,31 +908,55 @@ export class PortForwardRouter {
       }
 
       case PORT_FORWARD_MSG.RELAY_FRAME: {
-        // Phase + policy gate:
-        // - Forbidden when transportPref === 'p2p_only'
-        // - Forbidden while 'preparing' or 'closed'
-        // - Forbidden once active under direct_tcp / direct_udp_p2p
         if (tunnel.transportPref === 'p2p_only') return;
         if (tunnel.status !== 'connecting' && !(tunnel.status === 'active' && tunnel.transportMode === 'relay')) {
           return;
         }
 
+        const direction: PortForwardRelayDirection = senderRole === PORT_FORWARD_ROLE.LISTEN ? 'l2t' : 't2l';
         const peerPodId = senderRole === PORT_FORWARD_ROLE.LISTEN ? tunnel.targetPodId : tunnel.listenPodId;
         const peerServerId = senderRole === PORT_FORWARD_ROLE.LISTEN ? tunnel.targetServerId : tunnel.listenServerId;
         const peerGeneration = senderRole === PORT_FORWARD_ROLE.LISTEN ? tunnel.targetGeneration : tunnel.listenGeneration;
+        const senderPodId = senderRole === PORT_FORWARD_ROLE.LISTEN ? tunnel.listenPodId : tunnel.targetPodId;
+        const senderServerId = senderRole === PORT_FORWARD_ROLE.LISTEN ? tunnel.listenServerId : tunnel.targetServerId;
+        const senderGeneration = senderRole === PORT_FORWARD_ROLE.LISTEN ? tunnel.listenGeneration : tunnel.targetGeneration;
+        const bpKey = direction === 'l2t' ? 'l2tBackpressured' : 't2lBackpressured';
 
-        void this.sendToEndpoint(peerPodId, peerServerId, peerGeneration, {
-          type: PORT_FORWARD_MSG.RELAY_FRAME,
-          tunnelId: tunnel.tunnelId,
-          data: msg.data,
-        }).then((sent) => {
-          if (!sent && tunnel.status !== 'closed') {
+        this.enqueueSerial(this.outboundChains, `${tunnel.tunnelId}:${direction}`, async () => {
+          const isTunnelClosed = () => tunnel.status === 'closed';
+          if (isTunnelClosed()) return;
+          const res = await this.sendToEndpoint(
+            peerPodId,
+            peerServerId,
+            peerGeneration,
+            {
+              type: PORT_FORWARD_MSG.RELAY_FRAME,
+              tunnelId: tunnel.tunnelId,
+              data: msg.data,
+            },
+            { tunnelId: tunnel.tunnelId, direction },
+          );
+          if (isTunnelClosed()) return;
+          if (res.overflow) {
+            void this.closeTunnelInternal(tunnel, 'cluster_queue_overflow', true, true);
+            return;
+          }
+          if (!res.sent) {
             this.failPendingOrCloseTunnel(
               tunnel,
               503,
               PORT_FORWARD_ERRORS.NODE_OFFLINE,
               'peer_send_failed',
             );
+            return;
+          }
+          if (res.highWater && !tunnel[bpKey]) {
+            tunnel[bpKey] = true;
+            await this.sendToEndpoint(senderPodId, senderServerId, senderGeneration, {
+              type: PORT_FORWARD_MSG.RELAY_BACKPRESSURE,
+              tunnelId: tunnel.tunnelId,
+              paused: true,
+            });
           }
         });
         return;
@@ -785,9 +977,16 @@ export class PortForwardRouter {
     }
   }
 
-  private dispatchConnect(tunnel: ActiveServerTunnel): void {
-    if (!tunnel.listenPublicKey || !tunnel.listenKeyProof || !tunnel.targetPublicKey || !tunnel.targetKeyProof) {
-      this.failPendingTunnel(tunnel, 502, PORT_FORWARD_ERRORS.INTERNAL_ERROR, 'missing endpoint public keys');
+  private dispatchConnectToTarget(tunnel: ActiveServerTunnel): void {
+    if (!tunnel.listenPublicKey
+      || !tunnel.listenKeyProof
+      || !tunnel.listenIdentityPublicKey
+      || !tunnel.listenIdentitySignature
+      || !tunnel.targetPublicKey
+      || !tunnel.targetKeyProof
+      || !tunnel.targetIdentityPublicKey
+      || !tunnel.targetIdentitySignature) {
+      this.failPendingTunnel(tunnel, 502, PORT_FORWARD_ERRORS.INTERNAL_ERROR, 'missing endpoint keys or signatures');
       return;
     }
 
@@ -801,29 +1000,47 @@ export class PortForwardRouter {
     }, this.establishTimeoutMs);
     tunnel.establishTimer.unref?.();
 
-    void Promise.all([
-      this.sendToEndpoint(tunnel.targetPodId, tunnel.targetServerId, tunnel.targetGeneration, {
-        type: PORT_FORWARD_MSG.CONNECT,
-        tunnelId: tunnel.tunnelId,
-        role: PORT_FORWARD_ROLE.TARGET,
-        peerCandidates: tunnel.listenCandidates,
-        peerPublicKey: tunnel.listenPublicKey,
-        peerKeyProof: tunnel.listenKeyProof,
-        transport: tunnel.transportPref,
-      }),
-      this.sendToEndpoint(tunnel.listenPodId, tunnel.listenServerId, tunnel.listenGeneration, {
-        type: PORT_FORWARD_MSG.CONNECT,
-        tunnelId: tunnel.tunnelId,
-        role: PORT_FORWARD_ROLE.LISTEN,
-        peerCandidates: tunnel.targetCandidates,
-        peerPublicKey: tunnel.targetPublicKey,
-        peerKeyProof: tunnel.targetKeyProof,
-        transport: tunnel.transportPref,
-      }),
-    ]).then(([sentTarget, sentListen]) => {
+    void this.sendToEndpoint(tunnel.targetPodId, tunnel.targetServerId, tunnel.targetGeneration, {
+      type: PORT_FORWARD_MSG.CONNECT,
+      tunnelId: tunnel.tunnelId,
+      role: PORT_FORWARD_ROLE.TARGET,
+      peerCandidates: tunnel.listenCandidates,
+      peerPublicKey: tunnel.listenPublicKey,
+      peerKeyProof: tunnel.listenKeyProof,
+      peerIdentityPublicKey: tunnel.listenIdentityPublicKey,
+      peerIdentitySignature: tunnel.listenIdentitySignature,
+      transport: tunnel.transportPref,
+    }).then((res) => {
       if (tunnel.status === 'closed') return;
-      if (!sentTarget || !sentListen) {
-        this.failPendingTunnel(tunnel, 503, PORT_FORWARD_ERRORS.NODE_OFFLINE, 'node disconnected during connect');
+      if (!res.sent) {
+        this.failPendingTunnel(tunnel, 503, PORT_FORWARD_ERRORS.NODE_OFFLINE, 'target disconnected during connect');
+      }
+    });
+  }
+
+  private dispatchConnectToListen(tunnel: ActiveServerTunnel): void {
+    if (tunnel.status !== 'connecting'
+      || !tunnel.targetPublicKey
+      || !tunnel.targetKeyProof
+      || !tunnel.targetIdentityPublicKey
+      || !tunnel.targetIdentitySignature) {
+      return;
+    }
+
+    void this.sendToEndpoint(tunnel.listenPodId, tunnel.listenServerId, tunnel.listenGeneration, {
+      type: PORT_FORWARD_MSG.CONNECT,
+      tunnelId: tunnel.tunnelId,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      peerCandidates: tunnel.targetCandidates,
+      peerPublicKey: tunnel.targetPublicKey,
+      peerKeyProof: tunnel.targetKeyProof,
+      peerIdentityPublicKey: tunnel.targetIdentityPublicKey,
+      peerIdentitySignature: tunnel.targetIdentitySignature,
+      transport: tunnel.transportPref,
+    }).then((res) => {
+      if (tunnel.status === 'closed') return;
+      if (!res.sent) {
+        this.failPendingTunnel(tunnel, 503, PORT_FORWARD_ERRORS.NODE_OFFLINE, 'listen disconnected during connect');
       }
     });
   }
@@ -839,11 +1056,12 @@ export class PortForwardRouter {
     status: number,
     reason: PortForwardErrorCode,
     error: string,
-  ): void {
+  ): Promise<{ listen: PortForwardCloseSideState; target: PortForwardCloseSideState }> {
     const resolve = tunnel.resolveOpen;
     tunnel.resolveOpen = null;
-    this.closeTunnelInternal(tunnel, reason, true, true);
+    const p = this.closeTunnelInternal(tunnel, reason, true, true);
     resolve?.({ ok: false, status, reason, error });
+    return p;
   }
 
   private failPendingOrCloseTunnel(
@@ -851,11 +1069,24 @@ export class PortForwardRouter {
     pendingStatus: number,
     pendingReason: PortForwardErrorCode,
     reason: string,
-  ): void {
+  ): Promise<{ listen: PortForwardCloseSideState; target: PortForwardCloseSideState }> {
     if (tunnel.resolveOpen) {
-      this.failPendingTunnel(tunnel, pendingStatus, pendingReason, reason);
-    } else {
-      this.closeTunnelInternal(tunnel, reason, true, true);
+      return this.failPendingTunnel(tunnel, pendingStatus, pendingReason, reason);
+    }
+    return this.closeTunnelInternal(tunnel, reason, true, true);
+  }
+
+  private maybeSettleClose(tunnel: ActiveServerTunnel): void {
+    if (!tunnel.resolveClose) return;
+    if (tunnel.listenCloseState !== 'pending' && tunnel.targetCloseState !== 'pending') {
+      if (tunnel.closeAckTimer) {
+        clearTimeout(tunnel.closeAckTimer);
+        tunnel.closeAckTimer = null;
+      }
+      this.closingTunnels.delete(tunnel.tunnelId);
+      const resolve = tunnel.resolveClose;
+      tunnel.resolveClose = null;
+      resolve({ listen: tunnel.listenCloseState, target: tunnel.targetCloseState });
     }
   }
 
@@ -864,8 +1095,8 @@ export class PortForwardRouter {
     reason: string,
     notifyListen: boolean,
     notifyTarget: boolean,
-  ): void {
-    if (tunnel.status === 'closed') return;
+  ): Promise<{ listen: PortForwardCloseSideState; target: PortForwardCloseSideState }> {
+    if (tunnel.closePromise) return tunnel.closePromise;
     tunnel.status = 'closed';
     this.tunnels.delete(tunnel.tunnelId);
     if (tunnel.prepareTimer) {
@@ -880,28 +1111,64 @@ export class PortForwardRouter {
       clearTimeout(tunnel.ttlTimer);
       tunnel.ttlTimer = null;
     }
-    // Safety net: ensure openTunnel can NEVER remain unsettled if closeTunnelInternal was called directly.
     if (tunnel.resolveOpen) {
       const resolve = tunnel.resolveOpen;
       tunnel.resolveOpen = null;
       resolve({ ok: false, status: 409, reason: PORT_FORWARD_ERRORS.TUNNEL_NOT_FOUND, error: reason });
     }
-    void this.clusterStore.markTunnelClosed(tunnel.tunnelId).catch(() => {});
 
-    if (notifyListen) {
-      void this.sendToEndpoint(tunnel.listenPodId, tunnel.listenServerId, tunnel.listenGeneration, {
-        type: PORT_FORWARD_MSG.CLOSE,
-        tunnelId: tunnel.tunnelId,
-        reason,
-      });
-    }
-    if (notifyTarget) {
-      void this.sendToEndpoint(tunnel.targetPodId, tunnel.targetServerId, tunnel.targetGeneration, {
-        type: PORT_FORWARD_MSG.CLOSE,
-        tunnelId: tunnel.tunnelId,
-        reason,
-      });
-    }
+    tunnel.listenCloseState = notifyListen ? 'pending' : 'offline';
+    tunnel.targetCloseState = notifyTarget ? 'pending' : 'offline';
+
+    tunnel.closePromise = new Promise<{ listen: PortForwardCloseSideState; target: PortForwardCloseSideState }>((resolveClose) => {
+      tunnel.resolveClose = resolveClose;
+      this.closingTunnels.set(tunnel.tunnelId, tunnel);
+
+      tunnel.closeAckTimer = setTimeout(() => {
+        if (tunnel.listenCloseState === 'pending') tunnel.listenCloseState = 'timed_out';
+        if (tunnel.targetCloseState === 'pending') tunnel.targetCloseState = 'timed_out';
+        this.maybeSettleClose(tunnel);
+      }, this.closeAckTimeoutMs);
+      tunnel.closeAckTimer.unref?.();
+
+      const closeSide = async (
+        side: 'listen' | 'target',
+        shouldNotify: boolean,
+        podId: string,
+        serverId: string,
+        generation: number,
+      ) => {
+        if (!shouldNotify) return;
+        const ep = await this.resolveEndpoint(serverId);
+        if (!ep || ep.generation !== generation) {
+          if (side === 'listen' && tunnel.listenCloseState === 'pending') tunnel.listenCloseState = 'offline';
+          if (side === 'target' && tunnel.targetCloseState === 'pending') tunnel.targetCloseState = 'offline';
+          this.maybeSettleClose(tunnel);
+          return;
+        }
+        const res = await this.sendToEndpoint(podId, serverId, generation, {
+          type: PORT_FORWARD_MSG.CLOSE,
+          tunnelId: tunnel.tunnelId,
+          reason,
+        });
+        if (!res.sent || (side === 'target' && !tunnel.targetReady)) {
+          if (side === 'listen' && tunnel.listenCloseState === 'pending') tunnel.listenCloseState = 'offline';
+          if (side === 'target' && tunnel.targetCloseState === 'pending') tunnel.targetCloseState = 'offline';
+          this.maybeSettleClose(tunnel);
+        }
+      };
+
+      void (async () => {
+        await this.clusterStore.markTunnelClosed(tunnel.tunnelId).catch(() => {});
+        await Promise.all([
+          closeSide('listen', notifyListen, tunnel.listenPodId, tunnel.listenServerId, tunnel.listenGeneration),
+          closeSide('target', notifyTarget, tunnel.targetPodId, tunnel.targetServerId, tunnel.targetGeneration),
+        ]);
+        this.maybeSettleClose(tunnel);
+      })();
+    });
+
+    return tunnel.closePromise;
   }
 
   private toSummary(tunnel: ActiveServerTunnel): PortForwardTunnelSummary {

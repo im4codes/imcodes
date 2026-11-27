@@ -51,10 +51,13 @@ export const PORT_FORWARD_MSG = {
   PREPARE: 'port_forward.prepare',
   READY: 'port_forward.ready',
   CONNECT: 'port_forward.connect',
+  TARGET_READY: 'port_forward.target_ready',
   ESTABLISHED: 'port_forward.established',
   CLOSE: 'port_forward.close',
+  CLOSE_ACK: 'port_forward.close_ack',
   ERROR: 'port_forward.error',
   RELAY_FRAME: 'port_forward.relay_frame',
+  RELAY_BACKPRESSURE: 'port_forward.relay_backpressure',
   STATS: 'port_forward.stats',
 } as const;
 
@@ -136,6 +139,11 @@ export const PORT_FORWARD_LIMITS = {
   RELAY_WS_HIGH_WATER_BYTES: 2 * 1024 * 1024,
   RELAY_WS_LOW_WATER_BYTES: 512 * 1024,
   RELAY_WS_HARD_CAP_BYTES: 8 * 1024 * 1024,
+  CLUSTER_RELAY_HIGH_WATER_BYTES: 512 * 1024,
+  CLUSTER_RELAY_LOW_WATER_BYTES: 256 * 1024,
+  CLUSTER_RELAY_HARD_CAP_BYTES: 2 * 1024 * 1024,
+  CLUSTER_RELAY_MSG_TTL_MS: 30_000,
+  CLOSE_ACK_TIMEOUT_MS: 2_000,
   MAX_PRECONNECT_TCP_SOCKETS: 32,
 } as const;
 
@@ -258,6 +266,10 @@ export interface PortForwardReadyMessage {
   publicKey: string;
   /** HMAC proof under admission key binding (tunnelId, role, selfServerId, peerServerId, publicKey). */
   keyProof: string;
+  /** Long-term Ed25519 SPKI DER public key (base64url) owned solely by this endpoint. */
+  identityPublicKey: string;
+  /** Ed25519 signature over canonical round transcript (tunnelId, role, IDs, capability, publicKey, candidates). */
+  identitySignature: string;
 }
 
 export interface PortForwardConnectMessage {
@@ -267,7 +279,14 @@ export interface PortForwardConnectMessage {
   peerCandidates: PortForwardCandidate[];
   peerPublicKey: string;
   peerKeyProof: string;
+  peerIdentityPublicKey: string;
+  peerIdentitySignature: string;
   transport: PortForwardTransportPref;
+}
+
+export interface PortForwardTargetReadyMessage {
+  type: typeof PORT_FORWARD_MSG.TARGET_READY;
+  tunnelId: string;
 }
 
 export interface PortForwardEstablishedMessage {
@@ -284,6 +303,12 @@ export interface PortForwardCloseMessage {
   reason?: string;
 }
 
+export interface PortForwardCloseAckMessage {
+  type: typeof PORT_FORWARD_MSG.CLOSE_ACK;
+  tunnelId: string;
+  role: PortForwardRole;
+}
+
 export interface PortForwardErrorMessage {
   type: typeof PORT_FORWARD_MSG.ERROR;
   tunnelId: string;
@@ -298,6 +323,12 @@ export interface PortForwardRelayFrameMessage {
   data: string;
 }
 
+export interface PortForwardRelayBackpressureMessage {
+  type: typeof PORT_FORWARD_MSG.RELAY_BACKPRESSURE;
+  tunnelId: string;
+  paused: boolean;
+}
+
 export interface PortForwardStatsMessage {
   type: typeof PORT_FORWARD_MSG.STATS;
   tunnelId: string;
@@ -310,10 +341,13 @@ export type PortForwardWireMessage =
   | PortForwardPrepareMessage
   | PortForwardReadyMessage
   | PortForwardConnectMessage
+  | PortForwardTargetReadyMessage
   | PortForwardEstablishedMessage
   | PortForwardCloseMessage
+  | PortForwardCloseAckMessage
   | PortForwardErrorMessage
   | PortForwardRelayFrameMessage
+  | PortForwardRelayBackpressureMessage
   | PortForwardStatsMessage;
 
 export interface PortForwardOpenRequest {
@@ -354,6 +388,8 @@ const CAPABILITY_RE = /^[A-Za-z0-9_-]{43}$/;
 const SERVER_ID_RE = /^[A-Za-z0-9._:-]{2,128}$/;
 const ECDH_PUB_RE = /^[A-Za-z0-9_-]{40,128}$/;
 const KEY_PROOF_RE = /^[A-Za-z0-9_-]{32,64}$/;
+const IDENTITY_PUB_RE = /^[A-Za-z0-9_-]{32,128}$/;
+const IDENTITY_SIG_RE = /^[A-Za-z0-9_-]{64,256}$/;
 const HOSTNAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$/;
 const B64_RE = /^[A-Za-z0-9+/=_-]+$/;
 const TRANSPORT_PREF_SET: ReadonlySet<string> = new Set(PORT_FORWARD_TRANSPORT_PREFS);
@@ -628,7 +664,11 @@ export function validatePortForwardWireMessage(
     }
 
     case PORT_FORWARD_MSG.READY: {
-      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'role', 'candidates', 'publicKey', 'keyProof'], ['listenPort'])) {
+      if (!hasAllowedKeys(
+        raw,
+        ['type', 'tunnelId', 'role', 'candidates', 'publicKey', 'keyProof', 'identityPublicKey', 'identitySignature'],
+        ['listenPort'],
+      )) {
         return { ok: false, error: 'invalid_keys' };
       }
       if (raw.role !== PORT_FORWARD_ROLE.LISTEN && raw.role !== PORT_FORWARD_ROLE.TARGET) {
@@ -639,6 +679,12 @@ export function validatePortForwardWireMessage(
       }
       if (typeof raw.keyProof !== 'string' || !KEY_PROOF_RE.test(raw.keyProof)) {
         return { ok: false, error: 'invalid_key_proof' };
+      }
+      if (typeof raw.identityPublicKey !== 'string' || !IDENTITY_PUB_RE.test(raw.identityPublicKey)) {
+        return { ok: false, error: 'invalid_identity_public_key' };
+      }
+      if (typeof raw.identitySignature !== 'string' || !IDENTITY_SIG_RE.test(raw.identitySignature)) {
+        return { ok: false, error: 'invalid_identity_signature' };
       }
       let listenPort: number | undefined;
       if (raw.role === PORT_FORWARD_ROLE.LISTEN) {
@@ -667,12 +713,17 @@ export function validatePortForwardWireMessage(
           candidates,
           publicKey: raw.publicKey,
           keyProof: raw.keyProof,
+          identityPublicKey: raw.identityPublicKey,
+          identitySignature: raw.identitySignature,
         },
       };
     }
 
     case PORT_FORWARD_MSG.CONNECT: {
-      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'role', 'peerCandidates', 'peerPublicKey', 'peerKeyProof', 'transport'])) {
+      if (!hasAllowedKeys(
+        raw,
+        ['type', 'tunnelId', 'role', 'peerCandidates', 'peerPublicKey', 'peerKeyProof', 'peerIdentityPublicKey', 'peerIdentitySignature', 'transport'],
+      )) {
         return { ok: false, error: 'invalid_keys' };
       }
       if (raw.role !== PORT_FORWARD_ROLE.LISTEN && raw.role !== PORT_FORWARD_ROLE.TARGET) {
@@ -683,6 +734,12 @@ export function validatePortForwardWireMessage(
       }
       if (typeof raw.peerKeyProof !== 'string' || !KEY_PROOF_RE.test(raw.peerKeyProof)) {
         return { ok: false, error: 'invalid_peer_key_proof' };
+      }
+      if (typeof raw.peerIdentityPublicKey !== 'string' || !IDENTITY_PUB_RE.test(raw.peerIdentityPublicKey)) {
+        return { ok: false, error: 'invalid_peer_identity_public_key' };
+      }
+      if (typeof raw.peerIdentitySignature !== 'string' || !IDENTITY_SIG_RE.test(raw.peerIdentitySignature)) {
+        return { ok: false, error: 'invalid_peer_identity_signature' };
       }
       const transport = validatePortForwardTransportPref(raw.transport);
       if (!transport) return { ok: false, error: 'invalid_transport' };
@@ -704,9 +761,38 @@ export function validatePortForwardWireMessage(
           peerCandidates,
           peerPublicKey: raw.peerPublicKey,
           peerKeyProof: raw.peerKeyProof,
+          peerIdentityPublicKey: raw.peerIdentityPublicKey,
+          peerIdentitySignature: raw.peerIdentitySignature,
           transport,
         },
       };
+    }
+
+    case PORT_FORWARD_MSG.TARGET_READY: {
+      if (!hasAllowedKeys(raw, ['type', 'tunnelId'])) {
+        return { ok: false, error: 'invalid_keys' };
+      }
+      return { ok: true, value: { type, tunnelId } };
+    }
+
+    case PORT_FORWARD_MSG.CLOSE_ACK: {
+      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'role'])) {
+        return { ok: false, error: 'invalid_keys' };
+      }
+      if (raw.role !== PORT_FORWARD_ROLE.LISTEN && raw.role !== PORT_FORWARD_ROLE.TARGET) {
+        return { ok: false, error: 'invalid_role' };
+      }
+      return { ok: true, value: { type, tunnelId, role: raw.role } };
+    }
+
+    case PORT_FORWARD_MSG.RELAY_BACKPRESSURE: {
+      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'paused'])) {
+        return { ok: false, error: 'invalid_keys' };
+      }
+      if (typeof raw.paused !== 'boolean') {
+        return { ok: false, error: 'invalid_paused' };
+      }
+      return { ok: true, value: { type, tunnelId, paused: raw.paused } };
     }
 
     case PORT_FORWARD_MSG.ESTABLISHED: {

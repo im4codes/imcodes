@@ -89,6 +89,7 @@ import {
 import { receiveMachineDirectUpload, sendMachineDirectFetch } from '../daemon/machine-direct-transfer.js';
 import { isPortForwardMessageType } from '../../shared/port-forward.js';
 import { PortForwardEngine } from '../daemon/port-forward-engine.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 import {
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_MSG,
@@ -1023,9 +1024,12 @@ export function createControlledNodeRuntime(
   let legacyUpgradeRescueCleanupStarted = false;
   let previousUpgradeFailureReported = false;
   const activeMachineDirectTransfers = new Set<string>();
+  const portForwardStateDir = imcodesStateDir();
   const portForwardEngine = new PortForwardEngine({
     sendWs: (msg) => client.send(msg),
     getWsBufferedAmount: () => client.getBufferedAmount(),
+    identityFilePath: join(portForwardStateDir, 'port-forward-identity.json'),
+    trustedPeersFilePath: join(portForwardStateDir, 'port-forward-trusted-peers.json'),
   });
   const reportAuthenticationError = (error: unknown) => {
     try {

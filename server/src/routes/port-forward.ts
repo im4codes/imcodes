@@ -1,8 +1,11 @@
+import { randomBytes } from 'node:crypto';
 import { Hono } from 'hono';
 import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { resolveAuth } from '../security/authorization.js';
 import { describeActionPayload, gateMachineAction } from '../security/machine-action-gate.js';
+import { recordMachineActionAuthorized } from '../security/machine-exec-audit.js';
+import logger from '../util/logger.js';
 import { isSharedOrContributedServer, isWholeServerShareUser } from '../security/server-share-boundary.js';
 import {
   listAccessibleControlledMachines,
@@ -33,8 +36,13 @@ interface ServerRow {
   revoked_at: number | null;
 }
 
+type ControlledAdmission = {
+  delegatedActorUserId?: string;
+  target: { access_source: string | null };
+};
+
 type EndpointResolveResult =
-  | { ok: true; serverId: string; nodeId?: string; nodeRole: string }
+  | { ok: true; serverId: string; nodeId?: string; nodeRole: string; controlledAdmission?: ControlledAdmission }
   | { ok: false; status: 400 | 403 | 404 | 409 | 429; reason: PortForwardErrorCode; error: string };
 
 async function resolveEndpointServer(
@@ -131,6 +139,7 @@ async function resolveEndpointServer(
       serverId: row.id,
       ...(row.node_id ? { nodeId: row.node_id } : {}),
       nodeRole,
+      controlledAdmission: gate.admission,
     };
   }
 
@@ -297,6 +306,39 @@ export function createPortForwardRoutes(
         reason: PORT_FORWARD_ERRORS.INVALID_REQUEST,
         error: 'listenNode and targetNode must be different nodes',
       }, 400);
+    }
+
+    const controlledTargets = [listenResolved, targetResolved].filter(
+      (endpoint): endpoint is typeof endpoint & { controlledAdmission: ControlledAdmission } =>
+        endpoint.nodeRole === NODE_ROLE.CONTROLLED && Boolean(endpoint.controlledAdmission),
+    );
+    if (controlledTargets.length > 0) {
+      const payloadMeta = describeActionPayload(auditDesc);
+      try {
+        for (const endpoint of controlledTargets) {
+          await recordMachineActionAuthorized(c.env.DB, {
+            correlationId: randomBytes(16).toString('hex'),
+            userId: caller.userId,
+            sourceServerId: caller.sourceServerId,
+            targetServerId: endpoint.serverId,
+            ...payloadMeta,
+            shell: MACHINE_ACTION.EXEC,
+            now: caller.now,
+            action: MACHINE_ACTION.EXEC,
+            ...(endpoint.controlledAdmission.delegatedActorUserId
+              ? { delegatedActorUserId: endpoint.controlledAdmission.delegatedActorUserId }
+              : {}),
+            accessSource: endpoint.controlledAdmission.target.access_source,
+          });
+        }
+      } catch (err) {
+        logger.error({ userId: caller.userId, err }, 'Refusing port-forward — durable audit could not be persisted');
+        return c.json({
+          ok: false,
+          reason: PORT_FORWARD_ERRORS.INTERNAL_ERROR,
+          error: 'could not record durable machine action audit',
+        }, 500);
+      }
     }
 
     const result = await router.openTunnel({

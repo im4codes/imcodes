@@ -2387,6 +2387,7 @@ function getDaemonPortForwardEngine(serverLink: ServerLink): PortForwardEngine {
   if (!daemonPortForwardEngine || daemonPortForwardServerLink !== serverLink) {
     daemonPortForwardEngine?.closeAll('server_link_replaced');
     daemonPortForwardServerLink = serverLink;
+    const stateDir = imcodesStateDir();
     daemonPortForwardEngine = new PortForwardEngine({
       sendWs: (msg) => {
         try {
@@ -2396,6 +2397,8 @@ function getDaemonPortForwardEngine(serverLink: ServerLink): PortForwardEngine {
         }
       },
       getWsBufferedAmount: () => serverLink.getWsBufferedAmount(),
+      identityFilePath: nodePath.join(stateDir, 'port-forward-identity.json'),
+      trustedPeersFilePath: nodePath.join(stateDir, 'port-forward-trusted-peers.json'),
     });
   }
   return daemonPortForwardEngine;

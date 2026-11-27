@@ -43,9 +43,15 @@ import {
   deriveAdmissionMacKey,
   deriveE2eTransportKeys,
   generateEphemeralEcdhKeyPair,
+  generateEndpointIdentityKeyPair,
+  loadOrCreatePortForwardIdentity,
+  loadTrustedPeerPublicKeys,
+  signPortForwardTranscript,
   verifyEphemeralKeyProof,
   verifyKeyConfirmationMac,
+  verifyPortForwardTranscript,
   type E2eTransportKeys,
+  type EndpointIdentityKeyPair,
 } from './port-forward-crypto.js';
 import { probeStunCandidates } from './port-forward-stun.js';
 import {
@@ -95,6 +101,12 @@ export interface PortForwardEngineOptions {
   collectInterfaceAddresses?: () => string[];
   probeStun?: typeof probeStunCandidates;
   timeouts?: Partial<PortForwardEngineTimeouts>;
+  /** Local long-term Ed25519 identity keypair or persistent file path (private key never leaves node). */
+  identityKeyPair?: EndpointIdentityKeyPair;
+  identityFilePath?: string;
+  /** Out-of-band relay-independent trusted peer public key resolver or JSON map file. */
+  resolveTrustedPeerPublicKey?: (peerServerId: string) => Promise<string | null> | string | null;
+  trustedPeersFilePath?: string;
   /** Test seam to disallow direct TCP/UDP and force relay or p2p_only failure. */
   disableDirectTcp?: boolean;
   disableDirectUdp?: boolean;
@@ -120,6 +132,8 @@ interface E2eIdentityContext {
   targetServerId: string;
   listenPublicKey: string;
   targetPublicKey: string;
+  listenIdentityPublicKey?: string;
+  targetIdentityPublicKey?: string;
   transportMode: PortForwardTransport;
 }
 
@@ -263,30 +277,6 @@ function decryptAesGcm(
     return Buffer.concat([decipher.update(body), decipher.final()]);
   } catch {
     return null;
-  }
-}
-
-class CounterReplayWindow {
-  private maxCounter = 0n;
-  private bitmap = 0n;
-
-  accept(counter: bigint): boolean {
-    if (counter <= 0n) return false;
-    if (counter > this.maxCounter) return true;
-    const diff = this.maxCounter - counter;
-    if (diff >= 64n) return false;
-    return (this.bitmap & (1n << diff)) === 0n;
-  }
-
-  markSeen(counter: bigint): void {
-    if (counter > this.maxCounter) {
-      const shift = counter - this.maxCounter;
-      this.bitmap = shift >= 64n ? 1n : ((this.bitmap << shift) | 1n) & ((1n << 64n) - 1n);
-      this.maxCounter = counter;
-      return;
-    }
-    const diff = this.maxCounter - counter;
-    if (diff < 64n) this.bitmap |= 1n << diff;
   }
 }
 
@@ -606,7 +596,8 @@ class RelayTransport implements PortForwardCarrier {
   private readonly recvKey: Buffer;
   private readonly sendDirTag: number;
   private readonly recvDirTag: number;
-  private readonly rxReplay = new CounterReplayWindow();
+  private nextRxCounter = 1n;
+  private readonly reorderBuffer = new Map<bigint, Buffer>();
   private readonly muxAccumulator = new PortForwardMuxAccumulator();
   private readonly muxListeners = new Set<(frame: PortForwardMuxFrame) => void>();
   private readonly drainListeners = new Set<() => void>();
@@ -614,6 +605,7 @@ class RelayTransport implements PortForwardCarrier {
   private txCounter = 1n;
   private closed = false;
   private wsBackpressured = false;
+  private clusterBackpressured = false;
   private drainTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(
@@ -651,8 +643,16 @@ class RelayTransport implements PortForwardCarrier {
     return () => this.closeListeners.delete(listener);
   }
 
+  setClusterBackpressured(paused: boolean): void {
+    if (this.closed || this.clusterBackpressured === paused) return;
+    this.clusterBackpressured = paused;
+    if (!paused && this.isWritable()) {
+      for (const listener of [...this.drainListeners]) listener();
+    }
+  }
+
   isWritable(): boolean {
-    if (this.closed) return false;
+    if (this.closed || this.clusterBackpressured) return false;
     const buffered = this.getWsBufferedAmount();
     if (this.wsBackpressured) {
       return buffered <= PORT_FORWARD_LIMITS.RELAY_WS_LOW_WATER_BYTES;
@@ -682,7 +682,7 @@ class RelayTransport implements PortForwardCarrier {
     if (sendOk === false || this.getWsBufferedAmount() >= PORT_FORWARD_LIMITS.RELAY_WS_HIGH_WATER_BYTES) {
       this.armBackpressure();
     }
-    return !this.wsBackpressured;
+    return this.isWritable();
   }
 
   deliverRelayData(base64Data: string): boolean {
@@ -692,7 +692,11 @@ class RelayTransport implements PortForwardCarrier {
       return false;
     }
     const counter = pkt.readBigUInt64BE(0);
-    if (!this.rxReplay.accept(counter)) return false;
+    // Reject duplicates/replays or gaps beyond bounded reorder window BEFORE decrypt/buffering.
+    if (counter < this.nextRxCounter || counter >= this.nextRxCounter + 64n) {
+      return false;
+    }
+    if (this.reorderBuffer.has(counter)) return false;
     const plaintext = decryptAesGcm(
       this.recvKey,
       this.recvDirTag,
@@ -701,11 +705,27 @@ class RelayTransport implements PortForwardCarrier {
       pkt.subarray(RELAY_HEADER_BYTES),
     );
     if (!plaintext) return false;
-    this.rxReplay.markSeen(counter);
+
+    if (counter > this.nextRxCounter) {
+      if (this.reorderBuffer.size >= 64) {
+        this.close('relay_reorder_overflow');
+        return false;
+      }
+      this.reorderBuffer.set(counter, plaintext);
+      return true;
+    }
+
+    // Strict in-order delivery for counter === nextRxCounter and any contiguous buffered frames.
     try {
-      const frames = this.muxAccumulator.push(plaintext);
-      for (const frame of frames) {
-        for (const listener of [...this.muxListeners]) listener(frame);
+      let current: Buffer | undefined = plaintext;
+      while (current) {
+        const frames = this.muxAccumulator.push(current);
+        for (const frame of frames) {
+          for (const listener of [...this.muxListeners]) listener(frame);
+        }
+        this.nextRxCounter += 1n;
+        current = this.reorderBuffer.get(this.nextRxCounter);
+        if (current) this.reorderBuffer.delete(this.nextRxCounter);
       }
       return true;
     } catch {
@@ -717,6 +737,7 @@ class RelayTransport implements PortForwardCarrier {
   close(reason = 'closed'): void {
     if (this.closed) return;
     this.closed = true;
+    this.reorderBuffer.clear();
     if (this.drainTimer) {
       clearInterval(this.drainTimer);
       this.drainTimer = null;
@@ -742,7 +763,9 @@ class RelayTransport implements PortForwardCarrier {
           clearInterval(this.drainTimer);
           this.drainTimer = null;
         }
-        for (const listener of [...this.drainListeners]) listener();
+        if (this.isWritable()) {
+          for (const listener of [...this.drainListeners]) listener();
+        }
       }
     }, 15);
     this.drainTimer.unref?.();
@@ -1223,6 +1246,8 @@ interface ActiveTunnel {
   ecdhPrivateKey: KeyObject | null;
   localPublicKey: string;
   peerPublicKey: string | null;
+  localIdentityPublicKey: string;
+  peerIdentityPublicKey: string | null;
   ecdhSecret: Buffer | null;
   transportPref: PortForwardTransportPref;
   listenHost?: typeof PORT_FORWARD_LIMITS.LISTEN_HOST;
@@ -1253,11 +1278,32 @@ export class PortForwardEngine {
   private readonly timeouts: PortForwardEngineTimeouts;
   private readonly collectAddresses: () => string[];
   private readonly probeStun: typeof probeStunCandidates;
+  private readonly identityKeyPair: EndpointIdentityKeyPair;
 
   constructor(private readonly options: PortForwardEngineOptions) {
     this.timeouts = { ...DEFAULT_TIMEOUTS, ...options.timeouts };
     this.collectAddresses = options.collectInterfaceAddresses ?? defaultCollectInterfaceAddresses;
     this.probeStun = options.probeStun ?? probeStunCandidates;
+    this.identityKeyPair = options.identityKeyPair
+      ?? (options.identityFilePath
+        ? loadOrCreatePortForwardIdentity(options.identityFilePath)
+        : generateEndpointIdentityKeyPair());
+  }
+
+  getIdentityPublicKey(): string {
+    return this.identityKeyPair.publicKeyB64;
+  }
+
+  private async lookupTrustedPeerPublicKey(peerServerId: string): Promise<string | null> {
+    if (this.options.resolveTrustedPeerPublicKey) {
+      const resolved = await this.options.resolveTrustedPeerPublicKey(peerServerId);
+      if (resolved) return resolved;
+    }
+    if (this.options.trustedPeersFilePath) {
+      const map = loadTrustedPeerPublicKeys(this.options.trustedPeersFilePath);
+      return map.get(peerServerId) ?? null;
+    }
+    return null;
   }
 
   listTunnels(): PortForwardEngineTunnelSnapshot[] {
@@ -1302,6 +1348,9 @@ export class PortForwardEngine {
       case PORT_FORWARD_MSG.RELAY_FRAME:
         this.handleRelayFrame(msg.tunnelId, msg.data);
         return true;
+      case PORT_FORWARD_MSG.RELAY_BACKPRESSURE:
+        this.tunnels.get(msg.tunnelId)?.relayFallbackHandle?.setClusterBackpressured(msg.paused);
+        return true;
       default:
         return true;
     }
@@ -1321,10 +1370,8 @@ export class PortForwardEngine {
     for (const sock of tunnel.pendingClientSockets.splice(0)) {
       try { sock.destroy(); } catch { /* ignore */ }
     }
-    if (tunnel.localServer) {
-      closeNetServer(tunnel.localServer);
-      tunnel.localServer = null;
-    }
+    const localServer = tunnel.localServer;
+    tunnel.localServer = null;
     this.cleanupPreparationResources(tunnel, true);
     tunnel.mux?.closeAll(reason);
     tunnel.carrier?.close(reason);
@@ -1336,6 +1383,22 @@ export class PortForwardEngine {
     tunnel.ecdhPrivateKey = null;
     if (notifyServer) {
       this.options.sendWs({ type: PORT_FORWARD_MSG.CLOSE, tunnelId, reason });
+    }
+    const emitCloseAck = () => {
+      this.options.sendWs({
+        type: PORT_FORWARD_MSG.CLOSE_ACK,
+        tunnelId,
+        role: tunnel.role,
+      });
+    };
+    if (localServer) {
+      try {
+        localServer.close(() => emitCloseAck());
+      } catch {
+        emitCloseAck();
+      }
+    } else {
+      emitCloseAck();
     }
     return true;
   }
@@ -1382,6 +1445,8 @@ export class PortForwardEngine {
       targetServerId: isListen ? tunnel.peerServerId : tunnel.selfServerId,
       listenPublicKey: isListen ? tunnel.localPublicKey : tunnel.peerPublicKey!,
       targetPublicKey: isListen ? tunnel.peerPublicKey! : tunnel.localPublicKey,
+      listenIdentityPublicKey: isListen ? tunnel.localIdentityPublicKey : tunnel.peerIdentityPublicKey!,
+      targetIdentityPublicKey: isListen ? tunnel.peerIdentityPublicKey! : tunnel.localIdentityPublicKey,
       transportMode,
     };
   }
@@ -1433,6 +1498,8 @@ export class PortForwardEngine {
       ecdhPrivateKey: ecdh.privateKey,
       localPublicKey: ecdh.publicKeyB64,
       peerPublicKey: null,
+      localIdentityPublicKey: this.identityKeyPair.publicKeyB64,
+      peerIdentityPublicKey: null,
       ecdhSecret: null,
       transportPref: msg.transport,
       ...(msg.role === PORT_FORWARD_ROLE.LISTEN
@@ -1547,6 +1614,7 @@ export class PortForwardEngine {
           }
           const stunEndpoints = await this.probeStun(udpSock, msg.iceServers, {
             timeoutMs: this.timeouts.stunProbeMs,
+            signal: tunnel.abortController.signal,
           }).catch(() => []);
           if (!tunnel.closed) {
             for (const ep of stunEndpoints) {
@@ -1569,15 +1637,27 @@ export class PortForwardEngine {
       peerServerId: tunnel.peerServerId,
       publicKey: tunnel.localPublicKey,
     });
+    const dedupedCandidates = deduplicateCandidates(candidates, PORT_FORWARD_LIMITS.MAX_CANDIDATES);
+    const identitySignature = signPortForwardTranscript(this.identityKeyPair.privateKey, {
+      tunnelId: tunnel.tunnelId,
+      role: tunnel.role,
+      selfServerId: tunnel.selfServerId,
+      peerServerId: tunnel.peerServerId,
+      capability: tunnel.capability,
+      ecdhPublicKey: tunnel.localPublicKey,
+      candidates: dedupedCandidates,
+    });
 
     this.options.sendWs({
       type: PORT_FORWARD_MSG.READY,
       tunnelId: tunnel.tunnelId,
       role: tunnel.role,
       ...(tunnel.role === PORT_FORWARD_ROLE.LISTEN ? { listenPort: tunnel.listenPort! } : {}),
-      candidates: deduplicateCandidates(candidates, PORT_FORWARD_LIMITS.MAX_CANDIDATES),
+      candidates: dedupedCandidates,
       publicKey: tunnel.localPublicKey,
       keyProof,
+      identityPublicKey: tunnel.localIdentityPublicKey,
+      identitySignature,
     });
   }
 
@@ -1658,7 +1738,40 @@ export class PortForwardEngine {
       return;
     }
 
+    // Relay-independent peer identity verification: look up trusted Ed25519 public key locally.
+    const trustedPeerPublicKey = await this.lookupTrustedPeerPublicKey(tunnel.peerServerId);
+    if (!trustedPeerPublicKey) {
+      this.closeTunnel(tunnel.tunnelId, PORT_FORWARD_ERRORS.SCOPED_AUTH, false);
+      this.emitError(
+        tunnel.tunnelId,
+        PORT_FORWARD_ERRORS.SCOPED_AUTH,
+        `untrusted_peer_identity: missing local trusted public key for peer "${tunnel.peerServerId}"`,
+      );
+      return;
+    }
+
+    if (msg.peerIdentityPublicKey !== trustedPeerPublicKey || !verifyPortForwardTranscript(trustedPeerPublicKey, {
+      tunnelId: tunnel.tunnelId,
+      role: peerRole,
+      selfServerId: tunnel.peerServerId,
+      peerServerId: tunnel.selfServerId,
+      capability: tunnel.capability,
+      ecdhPublicKey: msg.peerPublicKey,
+      candidates: msg.peerCandidates,
+    }, msg.peerIdentitySignature)) {
+      this.closeTunnel(tunnel.tunnelId, PORT_FORWARD_ERRORS.SCOPED_AUTH, false);
+      this.emitError(
+        tunnel.tunnelId,
+        PORT_FORWARD_ERRORS.SCOPED_AUTH,
+        `peer identity signature verification failed for "${tunnel.peerServerId}"`,
+      );
+      return;
+    }
+
+    if (tunnel.closed || !tunnel.ecdhPrivateKey) return;
+
     try {
+      tunnel.peerIdentityPublicKey = trustedPeerPublicKey;
       tunnel.peerPublicKey = msg.peerPublicKey;
       tunnel.ecdhSecret = computeEcdhSharedSecret(tunnel.ecdhPrivateKey, msg.peerPublicKey);
       // Ephemeral private key is no longer needed once shared secret is computed.
@@ -1689,15 +1802,25 @@ export class PortForwardEngine {
           transportMode: PORT_FORWARD_TRANSPORT.RELAY,
           listenPort: tunnel.listenPort!,
         });
+      } else {
+        // Signal coordinator that target has ECDH keys and relay responder armed BEFORE listen starts KEY_CONFIRM.
+        this.options.sendWs({
+          type: PORT_FORWARD_MSG.TARGET_READY,
+          tunnelId: tunnel.tunnelId,
+        });
       }
-      // Target in explicit relay mode waits for listen's KEY_CONFIRM via handleRelayFrame.
       return;
     }
 
     if (tunnel.role === PORT_FORWARD_ROLE.LISTEN) {
       await this.connectAsListenArbiter(tunnel, msg);
     } else {
-      await this.connectAsTargetResponder(tunnel, msg);
+      const targetPromise = this.connectAsTargetResponder(tunnel, msg);
+      this.options.sendWs({
+        type: PORT_FORWARD_MSG.TARGET_READY,
+        tunnelId: tunnel.tunnelId,
+      });
+      await targetPromise;
     }
   }
 

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -14,6 +15,7 @@ import {
 import { CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD } from '../../shared/controlled-node-abi.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { OWNER_MACHINE_AUTHORITY_TYPE, SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
+import { generateEndpointIdentityKeyPair } from '../../src/daemon/port-forward-crypto.js';
 import { PortForwardEngine } from '../../src/daemon/port-forward-engine.js';
 import { signJwt } from '../src/security/crypto.js';
 import { issueOwnerMachineAuthority } from '../src/share/shared-machine-authority.js';
@@ -308,13 +310,24 @@ describe('server port-forward router & HTTP control plane', () => {
     app.route(PORT_FORWARD_API_PATH, createPortForwardRoutes(router));
 
     // Attach node sockets directly to WsBridge + router (when not using defaultPortForwardRouter)
+    const trustedKeys = new Map<string, string>();
+    const resolveTrustedPeerPublicKey = (id: string) => trustedKeys.get(id) ?? null;
+    const makeNode = (id: string, tok: string, opts: Partial<ConstructorParameters<typeof PortForwardEngine>[0]> = {}) => {
+      const kp = generateEndpointIdentityKeyPair();
+      trustedKeys.set(id, kp.publicKeyB64);
+      return createFakeNodeSocket(id, tok, router, {
+        identityKeyPair: kp,
+        resolveTrustedPeerPublicKey,
+        ...opts,
+      });
+    };
     const nodes = {
-      full1: createFakeNodeSocket(full1Id, full1Token, router),
-      full2: createFakeNodeSocket(full2Id, full2Token, router),
-      ctl1: createFakeNodeSocket(ctl1Id, ctl1Token, router, { disableDirectTcp: true }),
-      ctl2: createFakeNodeSocket(ctl2Id, ctl2Token, router, { disableDirectTcp: true }),
-      ctlDisabled: createFakeNodeSocket(ctlDisabledId, `tok_dis_${suffix}`, router),
-      foreignFull: createFakeNodeSocket(foreignFullId, foreignToken, router),
+      full1: makeNode(full1Id, full1Token),
+      full2: makeNode(full2Id, full2Token),
+      ctl1: makeNode(ctl1Id, ctl1Token, { disableDirectTcp: true }),
+      ctl2: makeNode(ctl2Id, ctl2Token, { disableDirectTcp: true }),
+      ctlDisabled: makeNode(ctlDisabledId, `tok_dis_${suffix}`),
+      foreignFull: makeNode(foreignFullId, foreignToken),
     };
 
     const connectNode = async (
@@ -675,9 +688,18 @@ describe('server port-forward router & HTTP control plane', () => {
       await podCaller.stopCluster();
     });
 
+    const id1 = generateEndpointIdentityKeyPair();
+    const id2 = generateEndpointIdentityKeyPair();
+    const mpTrusted = new Map<string, string>([
+      [full1Id, id1.publicKeyB64],
+      [full2Id, id2.publicKeyB64],
+    ]);
+
     const listenEngine = new PortForwardEngine({
       disableDirectTcp: true,
       disableDirectUdp: true,
+      identityKeyPair: id1,
+      resolveTrustedPeerPublicKey: (id) => mpTrusted.get(id) ?? null,
       sendWs: (msg) => {
         queueMicrotask(() => podListen.handleDaemonMessage(full1Id, 1, msg));
       },
@@ -685,6 +707,8 @@ describe('server port-forward router & HTTP control plane', () => {
     const targetEngine = new PortForwardEngine({
       disableDirectTcp: true,
       disableDirectUdp: true,
+      identityKeyPair: id2,
+      resolveTrustedPeerPublicKey: (id) => mpTrusted.get(id) ?? null,
       sendWs: (msg) => {
         queueMicrotask(() => podTarget.handleDaemonMessage(full2Id, 1, msg));
       },
@@ -731,6 +755,15 @@ describe('server port-forward router & HTTP control plane', () => {
     const appListen = makeApp(podListen);
     const appTarget = makeApp(podTarget);
 
+    // Allocate a fixed port, open tunnel on it, close via podListen, and IMMEDIATELY rebind with ZERO sleep (P0 #3)!
+    const fixedPort = await new Promise<number>((resolve) => {
+      const s = createTcpServer();
+      s.listen(0, '127.0.0.1', () => {
+        const p = (s.address() as { port: number }).port;
+        s.close(() => resolve(p));
+      });
+    });
+
     // podCaller owns NEITHER listen WS NOR target WS, yet opens tunnel via cluster bus -> podListen <-> podTarget!
     const openRes = await appCaller.request(PORT_FORWARD_API_PATH, {
       method: 'POST',
@@ -741,6 +774,7 @@ describe('server port-forward router & HTTP control plane', () => {
       },
       body: JSON.stringify({
         listenNode: full1Id,
+        listenPort: fixedPort,
         targetNode: full2Id,
         targetPort: backendPort,
         transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
@@ -749,6 +783,7 @@ describe('server port-forward router & HTTP control plane', () => {
     expect(openRes.status).toBe(200);
     const { tunnel } = await openRes.json() as { tunnel: { tunnelId: string; listenPort: number; transportMode: string } };
     expect(tunnel.transportMode).toBe(PORT_FORWARD_TRANSPORT.RELAY);
+    expect(tunnel.listenPort).toBe(fixedPort);
 
     const body = await new Promise<string>((resolve, reject) => {
       const req = httpRequest({ host: '127.0.0.1', port: tunnel.listenPort, path: '/' }, (res) => {
@@ -769,17 +804,16 @@ describe('server port-forward router & HTTP control plane', () => {
     const listData = await listRes.json() as { tunnels: Array<{ tunnelId: string }> };
     expect(listData.tunnels.map((t) => t.tunnelId)).toContain(tunnel.tunnelId);
 
-    // Close via podListen -> tears down coordinator on podCaller and both endpoints!
+    // Close via podListen -> awaits BOTH endpoints CLOSE_ACK before returning 200, so immediate rebind succeeds with 0ms wait!
     const delRes = await appListen.request(`${PORT_FORWARD_API_PATH}/${tunnel.tunnelId}`, {
       method: 'DELETE',
       headers: { 'X-Server-Id': full1Id, authorization: `Bearer ${full1Token}` },
     });
     expect(delRes.status).toBe(200);
-    await new Promise((r) => setTimeout(r, 30));
     expect(await podCaller.listTunnels('user_mp')).toHaveLength(0);
     expect(listenEngine.listTunnels()).toHaveLength(0);
 
-    // Open second tunnel, then disconnect target on podTarget -> podCaller coordinator & listenEngine both tear down.
+    // Open second tunnel on EXACT same fixedPort immediately after DELETE returns!
     const openRes2 = await appCaller.request(PORT_FORWARD_API_PATH, {
       method: 'POST',
       headers: {
@@ -789,6 +823,7 @@ describe('server port-forward router & HTTP control plane', () => {
       },
       body: JSON.stringify({
         listenNode: full1Id,
+        listenPort: fixedPort,
         targetNode: full2Id,
         targetPort: backendPort,
         transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
@@ -824,8 +859,22 @@ describe('server port-forward router & HTTP control plane', () => {
       prepareTimeoutMs: 2_000,
       establishTimeoutMs: 4_000,
     });
-    const n1 = createFakeNodeSocket(full1Id, full1Token, router, { disableDirectTcp: true });
-    const n2 = createFakeNodeSocket(full2Id, full2Token, router, { disableDirectTcp: true });
+    const shId1 = generateEndpointIdentityKeyPair();
+    const shId2 = generateEndpointIdentityKeyPair();
+    const shTrusted = new Map<string, string>([
+      [full1Id, shId1.publicKeyB64],
+      [full2Id, shId2.publicKeyB64],
+    ]);
+    const n1 = createFakeNodeSocket(full1Id, full1Token, router, {
+      disableDirectTcp: true,
+      identityKeyPair: shId1,
+      resolveTrustedPeerPublicKey: (id) => shTrusted.get(id) ?? null,
+    });
+    const n2 = createFakeNodeSocket(full2Id, full2Token, router, {
+      disableDirectTcp: true,
+      identityKeyPair: shId2,
+      resolveTrustedPeerPublicKey: (id) => shTrusted.get(id) ?? null,
+    });
     for (const [sid, tok, node] of [[full1Id, full1Token, n1], [full2Id, full2Token, n2]] as const) {
       node.emitter.on('message', (raw: Buffer) => {
         const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
@@ -993,5 +1042,162 @@ describe('server port-forward router & HTTP control plane', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('serializes cross-pod relay delivery under injected DB latency and bounds paused-pod queues (P0 #2/#4)', async () => {
+    const bigPayload = Buffer.allocUnsafe(384 * 1024);
+    for (let i = 0; i < bigPayload.length; i++) bigPayload[i] = (i * 29 + 7) & 0xff;
+    const expectedHash = createHash('sha256').update(bigPayload).digest('hex');
+
+    const echoServer = createHttpServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        const body = Buffer.concat(chunks);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ len: body.length, sha256: createHash('sha256').update(body).digest('hex') }));
+      });
+    });
+    await new Promise<void>((r) => echoServer.listen(0, '127.0.0.1', () => r()));
+    const echoPort = (echoServer.address() as { port: number }).port;
+    cleanups.push(() => new Promise<void>((r) => echoServer.close(() => r())));
+
+    const baseStore = new InMemoryPortForwardClusterStore();
+    let injectLatency = true;
+    const origGetTunnel = baseStore.getTunnel.bind(baseStore);
+    const origEnqueue = baseStore.enqueueBusMessage.bind(baseStore);
+    let delayStep = 0;
+    baseStore.getTunnel = async (tid) => {
+      if (injectLatency) {
+        // Odd calls delayed 18ms, even calls 2ms -> naive unserialized forwarding would reorder frames!
+        const ms = (++delayStep % 2 === 1) ? 18 : 2;
+        await new Promise((r) => setTimeout(r, ms));
+      }
+      return origGetTunnel(tid);
+    };
+    baseStore.enqueueBusMessage = async (podId, msg) => {
+      if (injectLatency && (msg.kind === 'to_coordinator' || msg.kind === 'to_endpoint')) {
+        const ms = (++delayStep % 2 === 1) ? 14 : 1;
+        await new Promise((r) => setTimeout(r, ms));
+      }
+      return origEnqueue(podId, msg);
+    };
+
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const s1 = `ord_l_${suffix}`;
+    const s2 = `ord_t_${suffix}`;
+    const bridgesA = new Map<string, PortForwardBridgeEndpoint>();
+    const bridgesB = new Map<string, PortForwardBridgeEndpoint>();
+
+    const podCoord = new PortForwardRouter({ podId: 'pod_c_ord', clusterStore: baseStore, prepareTimeoutMs: 5_000, establishTimeoutMs: 10_000 });
+    const podA = new PortForwardRouter({ podId: 'pod_a_ord', clusterStore: baseStore, lookupBridge: (id) => bridgesA.get(id) });
+    const podB = new PortForwardRouter({ podId: 'pod_b_ord', clusterStore: baseStore, lookupBridge: (id) => bridgesB.get(id) });
+
+    const idA = generateEndpointIdentityKeyPair();
+    const idB = generateEndpointIdentityKeyPair();
+    const trusted = new Map([[s1, idA.publicKeyB64], [s2, idB.publicKeyB64]]);
+
+    const engA = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idA,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podA.handleDaemonMessage(s1, 1, m)); },
+    });
+    const engB = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idB,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podB.handleDaemonMessage(s2, 1, m)); },
+    });
+    cleanups.push(async () => {
+      injectLatency = false;
+      await podCoord.closeAllForUser('user_ord');
+      engA.closeAll();
+      engB.closeAll();
+      await podA.stopCluster();
+      await podB.stopCluster();
+      await podCoord.stopCluster();
+    });
+
+    bridgesA.set(s1, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => { void engA.handleMessage(m); return true; },
+    });
+    bridgesB.set(s2, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => { void engB.handleMessage(m); return true; },
+    });
+    podA.onDaemonConnected(s1, 1);
+    podB.onDaemonConnected(s2, 1);
+
+    // Under uneven DB delays, auto -> relay handshake and 384 KiB multi-frame POST arrive 100% in exact byte order!
+    const opened = await podCoord.openTunnel({
+      userId: 'user_ord',
+      listenNode: s1,
+      listenServerId: s1,
+      listenPort: 0,
+      targetNode: s2,
+      targetServerId: s2,
+      targetHost: '127.0.0.1',
+      targetPort: echoPort,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+
+    const postEcho = (port: number) => new Promise<{ len: number; sha256: string }>((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port, path: '/echo', method: 'POST' }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))));
+      });
+      req.on('error', reject);
+      req.end(bigPayload);
+    });
+    expect(await postEcho(opened.tunnel.listenPort)).toEqual({ len: bigPayload.length, sha256: expectedHash });
+
+    // P0 #4: Pause target pod queue drain mid-transfer -> backlog hits HIGH_WATER, propagates RELAY_BACKPRESSURE,
+    // stays strictly <= CLUSTER_RELAY_HARD_CAP_BYTES, then recovers intact on resume!
+    injectLatency = false;
+    await baseStore.setPodDrainPausedForTests('pod_b_ord', true);
+    const pausedPromise = postEcho(opened.tunnel.listenPort);
+
+    for (let i = 0; i < 40; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      const q = await baseStore.getQueuedBytes(opened.tunnel.tunnelId, 'l2t');
+      expect(q).toBeLessThanOrEqual(PORT_FORWARD_LIMITS.CLUSTER_RELAY_HARD_CAP_BYTES);
+      if (q >= PORT_FORWARD_LIMITS.CLUSTER_RELAY_HIGH_WATER_BYTES) break;
+    }
+
+    await new Promise((r) => setTimeout(r, 80));
+    const peakQueued = await baseStore.getQueuedBytes(opened.tunnel.tunnelId, 'l2t');
+    expect(peakQueued).toBeLessThanOrEqual(PORT_FORWARD_LIMITS.CLUSTER_RELAY_HARD_CAP_BYTES);
+
+    await baseStore.setPodDrainPausedForTests('pod_b_ord', false);
+    expect(await pausedPromise).toEqual({ len: bigPayload.length, sha256: expectedHash });
+
+    // Orphan/close cleanup clears queued entries cleanly.
+    await baseStore.setPodDrainPausedForTests('pod_b_ord', true);
+    const overflowReject = await baseStore.enqueueBusMessage('pod_b_ord', {
+      kind: 'to_endpoint',
+      serverId: s2,
+      expectedGeneration: 1,
+      tunnelId: opened.tunnel.tunnelId,
+      direction: 'l2t',
+      frame: {
+        type: PORT_FORWARD_MSG.RELAY_FRAME,
+        tunnelId: opened.tunnel.tunnelId,
+        data: Buffer.alloc(PORT_FORWARD_LIMITS.CLUSTER_RELAY_HARD_CAP_BYTES + 128, 0x41).toString('base64'),
+      },
+    });
+    expect(overflowReject.ok).toBe(false);
+    await podCoord.closeTunnelForUser('user_ord', opened.tunnel.tunnelId);
+    expect(await baseStore.getQueuedBytes(opened.tunnel.tunnelId, 'l2t')).toBe(0);
+    await baseStore.setPodDrainPausedForTests('pod_b_ord', false);
   });
 });

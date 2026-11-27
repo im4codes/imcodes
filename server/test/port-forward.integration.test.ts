@@ -6,13 +6,17 @@
  * cross-pod DELETE, and disconnect cleanup.
  */
 import { createHash, randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
+import { createServer as createTcpServer } from 'node:net';
+import { resolve } from 'node:path';
 import { Hono } from 'hono';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD } from '../../shared/controlled-node-abi.js';
 import {
   PORT_FORWARD_API_PATH,
   PORT_FORWARD_ERRORS,
+  PORT_FORWARD_LIMITS,
   PORT_FORWARD_MSG,
   PORT_FORWARD_TRANSPORT,
   PORT_FORWARD_TRANSPORT_PREF,
@@ -24,6 +28,7 @@ import {
   SHARED_MACHINE_AUTHORITY_HEADER,
   SHARED_MACHINE_AUTHORITY_TYPE,
 } from '../../shared/shared-machine-authority.js';
+import { generateEndpointIdentityKeyPair } from '../../src/daemon/port-forward-crypto.js';
 import { PortForwardEngine } from '../../src/daemon/port-forward-engine.js';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
@@ -70,12 +75,26 @@ let targetCtlEngine!: PortForwardEngine;
 let full2Engine!: PortForwardEngine;
 let targetCtlConnected = true;
 
+let storeCaller!: PostgresPortForwardClusterStore;
+let storeListen!: PostgresPortForwardClusterStore;
+let storeTarget!: PostgresPortForwardClusterStore;
+
 beforeAll(async () => {
   const connStr = process.env.TEST_DATABASE_URL;
   if (!connStr) throw new Error('TEST_DATABASE_URL is required by vitest integration globalSetup');
 
   db = createDatabase(connStr);
   await runMigrations(db);
+  // Seed a pre-existing server record BEFORE re-executing migration 115 idempotently (P0 #5).
+  const preExistingId = `pf_pre_${hex(4)}`;
+  const preUserId = `pf_pre_u_${hex(4)}`;
+  await createUser(db, preUserId);
+  await createServer(db, preExistingId, preUserId, 'pre-existing', sha256('pre-tok'), undefined, NODE_ROLE.FULL);
+  const mig115Sql = readFileSync(resolve(import.meta.dirname, '../src/db/migrations/115_port_forward_tunnels.sql'), 'utf8');
+  await db.exec(mig115Sql);
+  await db.exec(mig115Sql);
+  const persistedServer = await db.queryOne<{ id: string }>(`SELECT id FROM servers WHERE id = $1`, [preExistingId]);
+  expect(persistedServer?.id).toBe(preExistingId);
 
   await createUser(db, ownerId);
   await createUser(db, participantId);
@@ -108,7 +127,6 @@ beforeAll(async () => {
     expiresAt: null,
     now,
   });
-  await setServerShareExecGrant(db, { shareId, serverId: full1.serverId, granted: true, now });
 
   await createServer(db, foreignSrv.serverId, foreignId, 'foreign-1', sha256(foreignSrv.token), undefined, NODE_ROLE.FULL);
 
@@ -118,6 +136,17 @@ beforeAll(async () => {
      VALUES ($1,$2,'ctl-1',$3,'online',$4,$5,true,NULL,'ctl-1','Controlled 1','linux',$6,$7)`,
     [ctl1.serverId, ownerId, sha256(ctl1.token), now, NODE_ROLE.CONTROLLED, ctl1.nodeId, CONTROLLED_NODE_ABI_MODERN],
   );
+  const ctlShareId = `pf_ctl_share_${hex(5)}`;
+  await createOrUpdateShare(db, {
+    id: ctlShareId,
+    target: { kind: 'server', serverId: ctl1.serverId },
+    targetUserId: participantId,
+    role: 'participant',
+    createdBy: ownerId,
+    expiresAt: null,
+    now,
+  });
+  await setServerShareExecGrant(db, { shareId: ctlShareId, serverId: ctl1.serverId, granted: true, now });
   ctlDisabled.nodeId = generateControlledNodeId();
   await db.execute(
     `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, revoked_at, ref_name, display_name, os, node_id, abi_profile)
@@ -127,9 +156,9 @@ beforeAll(async () => {
   // Suppress unused constant lint if header constant isn't referenced via import check
   void CONTROLLED_NODE_ABI_PROFILE_FIELD;
 
-  const storeCaller = new PostgresPortForwardClusterStore(db, connStr);
-  const storeListen = new PostgresPortForwardClusterStore(db, connStr);
-  const storeTarget = new PostgresPortForwardClusterStore(db, connStr);
+  storeCaller = new PostgresPortForwardClusterStore(db, connStr);
+  storeListen = new PostgresPortForwardClusterStore(db, connStr);
+  storeTarget = new PostgresPortForwardClusterStore(db, connStr);
 
   podCaller = new PortForwardRouter({
     podId: `pod_caller_${hex(4)}`,
@@ -155,9 +184,20 @@ beforeAll(async () => {
 
   await Promise.all([podCaller.startCluster(), podListen.startCluster(), podTarget.startCluster()]);
 
+  const idFull1 = generateEndpointIdentityKeyPair();
+  const idCtl1 = generateEndpointIdentityKeyPair();
+  const idFull2 = generateEndpointIdentityKeyPair();
+  const trustedPeerMap = new Map<string, string>([
+    [full1.serverId, idFull1.publicKeyB64],
+    [ctl1.serverId, idCtl1.publicKeyB64],
+    [full2.serverId, idFull2.publicKeyB64],
+  ]);
+
   listenEngine = new PortForwardEngine({
     disableDirectTcp: true,
     disableDirectUdp: true,
+    identityKeyPair: idFull1,
+    resolveTrustedPeerPublicKey: (id) => trustedPeerMap.get(id) ?? null,
     sendWs: (msg) => {
       queueMicrotask(() => podListen.handleDaemonMessage(full1.serverId, 1, msg));
     },
@@ -165,6 +205,8 @@ beforeAll(async () => {
   targetCtlEngine = new PortForwardEngine({
     disableDirectTcp: true,
     disableDirectUdp: true,
+    identityKeyPair: idCtl1,
+    resolveTrustedPeerPublicKey: (id) => trustedPeerMap.get(id) ?? null,
     sendWs: (msg) => {
       queueMicrotask(() => podTarget.handleDaemonMessage(ctl1.serverId, 1, msg));
     },
@@ -172,6 +214,8 @@ beforeAll(async () => {
   full2Engine = new PortForwardEngine({
     disableDirectTcp: true,
     disableDirectUdp: true,
+    identityKeyPair: idFull2,
+    resolveTrustedPeerPublicKey: (id) => trustedPeerMap.get(id) ?? null,
     sendWs: (msg) => {
       queueMicrotask(() => podTarget.handleDaemonMessage(full2.serverId, 1, msg));
     },
@@ -345,25 +389,79 @@ describe('PostgreSQL port-forward cross-layer multi-pod integration', () => {
     expect(pgRow).toEqual({ status: 'active', transport_mode: 'relay' });
 
     const auditRows = await db.query<{ decision: string }>(
-      `SELECT decision FROM machine_action_audit WHERE actor_user_id = $1`,
+      `SELECT decision FROM machine_exec_audit WHERE user_id = $1`,
       [ownerId],
     );
     expect(auditRows.some((r) => r.decision === 'allowed')).toBe(true);
     expect(auditRows.some((r) => r.decision === 'denied')).toBe(true);
 
-    // 5. Cross-pod list & DELETE from podTarget cleanly close PostgreSQL state & listenEngine.
+    // 5. Cross-pod list & DELETE from podTarget cleanly close PostgreSQL state & listenEngine,
+    // enabling immediate fixed-port rebind (0ms sleep, P0 #3).
     const listOnTarget = await appTarget.request(PORT_FORWARD_API_PATH, {
       headers: { 'X-Server-Id': full2.serverId, authorization: `Bearer ${full2.token}` },
     });
     expect(listOnTarget.status).toBe(200);
     expect((await listOnTarget.json() as { tunnels: Array<{ tunnelId: string }> }).tunnels.map((t) => t.tunnelId)).toContain(tunnel.tunnelId);
 
+    const fixedRebindPort = await new Promise<number>((resolve) => {
+      const s = createTcpServer();
+      s.listen(0, '127.0.0.1', () => {
+        const p = (s.address() as { port: number }).port;
+        s.close(() => resolve(p));
+      });
+    });
+    const fixedOpen = await appCaller.request(PORT_FORWARD_API_PATH, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': full1.serverId,
+        authorization: `Bearer ${full1.token}`,
+        [SHARED_MACHINE_AUTHORITY_HEADER]: ownerJwt,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        listenPort: fixedRebindPort,
+        targetNode: ctl1.nodeId,
+        targetPort: echoPort,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      }),
+    });
+    expect(fixedOpen.status).toBe(200);
+    const { tunnel: fixedTunnel } = await fixedOpen.json() as { tunnel: { tunnelId: string; listenPort: number } };
+    expect(fixedTunnel.listenPort).toBe(fixedRebindPort);
+
+    const delFixed = await appTarget.request(`${PORT_FORWARD_API_PATH}/${fixedTunnel.tunnelId}`, {
+      method: 'DELETE',
+      headers: { 'X-Server-Id': full2.serverId, authorization: `Bearer ${full2.token}` },
+    });
+    expect(delFixed.status).toBe(200);
+    // Immediate rebind with 0ms delay must succeed because cross-pod DELETE waited for CLOSE_ACK!
+    const immediateRebind = await appCaller.request(PORT_FORWARD_API_PATH, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': full1.serverId,
+        authorization: `Bearer ${full1.token}`,
+        [SHARED_MACHINE_AUTHORITY_HEADER]: ownerJwt,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        listenPort: fixedRebindPort,
+        targetNode: ctl1.nodeId,
+        targetPort: echoPort,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      }),
+    });
+    expect(immediateRebind.status).toBe(200);
+    const { tunnel: reboundTunnel } = await immediateRebind.json() as { tunnel: { tunnelId: string } };
+    await appTarget.request(`${PORT_FORWARD_API_PATH}/${reboundTunnel.tunnelId}`, {
+      method: 'DELETE',
+      headers: { 'X-Server-Id': full2.serverId, authorization: `Bearer ${full2.token}` },
+    });
+
     const delFromTarget = await appTarget.request(`${PORT_FORWARD_API_PATH}/${tunnel.tunnelId}`, {
       method: 'DELETE',
       headers: { 'X-Server-Id': full2.serverId, authorization: `Bearer ${full2.token}` },
     });
     expect(delFromTarget.status).toBe(200);
-    await new Promise((r) => setTimeout(r, 80));
 
     const closedPgRow = await db.queryOne<{ status: string }>(
       `SELECT status FROM port_forward_tunnels WHERE tunnel_id = $1`,
@@ -372,7 +470,92 @@ describe('PostgreSQL port-forward cross-layer multi-pod integration', () => {
     expect(closedPgRow?.status).toBe('closed');
     expect(listenEngine.listTunnels()).toHaveLength(0);
 
-    // 6. Cross-pod daemon disconnect clears active PG tunnel & tears down remote engine.
+    // 6. PostgreSQL paused-target pod backpressure & hard-cap + ordered multi-frame delivery + orphan reclaim (P0 #2/#4/#5).
+    const postPayload = Buffer.allocUnsafe(300 * 1024);
+    for (let i = 0; i < postPayload.length; i++) postPayload[i] = (i * 19 + 5) & 0xff;
+    const expectedSha = createHash('sha256').update(postPayload).digest('hex');
+
+    const bpEcho = createHttpServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ len: buf.length, sha256: createHash('sha256').update(buf).digest('hex') }));
+      });
+    });
+    await new Promise<void>((r) => bpEcho.listen(0, '127.0.0.1', () => r()));
+    const bpPort = (bpEcho.address() as { port: number }).port;
+    try {
+      const bpOpen = await appCaller.request(PORT_FORWARD_API_PATH, {
+        method: 'POST',
+        headers: {
+          'X-Server-Id': full1.serverId,
+          authorization: `Bearer ${full1.token}`,
+          [SHARED_MACHINE_AUTHORITY_HEADER]: ownerJwt,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ targetNode: ctl1.nodeId, targetPort: bpPort, transport: PORT_FORWARD_TRANSPORT_PREF.RELAY }),
+      });
+      expect(bpOpen.status).toBe(200);
+      const { tunnel: bpTunnel } = await bpOpen.json() as { tunnel: { tunnelId: string; listenPort: number } };
+
+      await storeTarget.setPodDrainPausedForTests(podTarget.getPodId(), true);
+      const postPromise = new Promise<{ len: number; sha256: string }>((resolve, reject) => {
+        const req = httpRequest({ host: '127.0.0.1', port: bpTunnel.listenPort, path: '/', method: 'POST' }, (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))));
+        });
+        req.on('error', reject);
+        req.end(postPayload);
+      });
+      await new Promise((r) => setTimeout(r, 80));
+      const queuedInPg = await storeTarget.getQueuedBytes(bpTunnel.tunnelId, 'l2t');
+      expect(queuedInPg).toBeLessThanOrEqual(PORT_FORWARD_LIMITS.CLUSTER_RELAY_HARD_CAP_BYTES);
+
+      await storeTarget.setPodDrainPausedForTests(podTarget.getPodId(), false);
+      expect(await postPromise).toEqual({ len: postPayload.length, sha256: expectedSha });
+
+      await appTarget.request(`${PORT_FORWARD_API_PATH}/${bpTunnel.tunnelId}`, {
+        method: 'DELETE',
+        headers: { 'X-Server-Id': full2.serverId, authorization: `Bearer ${full2.token}` },
+      });
+      expect(await storeTarget.getQueuedBytes(bpTunnel.tunnelId, 'l2t')).toBe(0);
+    } finally {
+      await storeTarget.setPodDrainPausedForTests(podTarget.getPodId(), false);
+      await new Promise<void>((r) => bpEcho.close(() => r()));
+    }
+
+    // 7. Concurrent PG quota enforcement across pods: advisory lock strictly enforces MAX_TUNNELS_PER_USER.
+    const quotaReqs = Array.from({ length: PORT_FORWARD_LIMITS.MAX_TUNNELS_PER_USER + 3 }, () =>
+      appCaller.request(PORT_FORWARD_API_PATH, {
+        method: 'POST',
+        headers: {
+          'X-Server-Id': full1.serverId,
+          authorization: `Bearer ${full1.token}`,
+          [SHARED_MACHINE_AUTHORITY_HEADER]: ownerJwt,
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ targetNode: ctl1.nodeId, targetPort: echoPort, transport: PORT_FORWARD_TRANSPORT_PREF.RELAY }),
+      }),
+    );
+    const quotaResponses = await Promise.all(quotaReqs);
+    const okCount = quotaResponses.filter((r) => r.status === 200).length;
+    const limitCount = quotaResponses.filter((r) => r.status === 429).length;
+    expect(okCount).toBe(PORT_FORWARD_LIMITS.MAX_TUNNELS_PER_USER);
+    expect(limitCount).toBe(3);
+
+    await appCaller.request(PORT_FORWARD_API_PATH, {
+      method: 'DELETE',
+      headers: {
+        'X-Server-Id': full1.serverId,
+        authorization: `Bearer ${full1.token}`,
+        [SHARED_MACHINE_AUTHORITY_HEADER]: ownerJwt,
+      },
+    });
+
+    // 8. Cross-pod daemon disconnect clears active PG tunnel & tears down remote engine.
     const open2 = await appCaller.request(PORT_FORWARD_API_PATH, {
       method: 'POST',
       headers: {

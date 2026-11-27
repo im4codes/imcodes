@@ -4,6 +4,7 @@ import type { Database } from '../db/client.js';
 import {
   PORT_FORWARD_ERRORS,
   PORT_FORWARD_LIMITS,
+  PORT_FORWARD_MSG,
   type PortForwardTransport,
   type PortForwardTransportPref,
   type PortForwardTunnelSummary,
@@ -47,12 +48,17 @@ export interface PortForwardClusterTunnelRecord {
   updatedAt: number;
 }
 
+export type PortForwardRelayDirection = 'l2t' | 't2l';
+
 export type PortForwardClusterBusMessage =
   | {
       kind: 'to_endpoint';
       serverId: string;
       expectedGeneration: number;
       frame: PortForwardWireMessage;
+      tunnelId?: string;
+      direction?: PortForwardRelayDirection;
+      coordinatorPodId?: string;
     }
   | {
       kind: 'to_coordinator';
@@ -60,6 +66,13 @@ export type PortForwardClusterBusMessage =
       fromServerId: string;
       fromGeneration: number;
       frame: PortForwardWireMessage;
+      direction?: PortForwardRelayDirection;
+    }
+  | {
+      kind: 'relay_drained';
+      tunnelId: string;
+      direction: PortForwardRelayDirection;
+      queuedBytes: number;
     }
   | {
       kind: 'daemon_disconnected';
@@ -71,7 +84,19 @@ export type PortForwardClusterBusMessage =
       kind: 'close_tunnel';
       tunnelId: string;
       reason: string;
+      requestId?: string;
+      replyPodId?: string;
+    }
+  | {
+      kind: 'close_tunnel_ack';
+      requestId: string;
+      tunnelId: string;
+      ok: boolean;
     };
+
+export type PortForwardClusterEnqueueResult =
+  | { ok: true; queuedBytes: number; highWater: boolean }
+  | { ok: false; overflow: true; queuedBytes: number };
 
 export type PortForwardClusterBusHandler = (message: PortForwardClusterBusMessage) => void | Promise<void>;
 
@@ -96,6 +121,14 @@ export interface PortForwardClusterStore {
   listOpenTunnelsForEndpoint(serverId: string, generation: number): Promise<PortForwardClusterTunnelRecord[]>;
   subscribePod(podId: string, handler: PortForwardClusterBusHandler): () => void;
   sendToPod(targetPodId: string, message: PortForwardClusterBusMessage): Promise<void>;
+  enqueueBusMessage(
+    targetPodId: string,
+    message: PortForwardClusterBusMessage,
+  ): Promise<PortForwardClusterEnqueueResult>;
+  cleanupTunnelMessages(tunnelId: string): Promise<void>;
+  reclaimStaleMessages(now?: number): Promise<number>;
+  getQueuedBytes?(tunnelId: string, direction: PortForwardRelayDirection): Promise<number>;
+  setPodDrainPausedForTests?(podId: string, paused: boolean): Promise<void>;
   start?(podId: string, handler: PortForwardClusterBusHandler): Promise<void>;
   stop?(podId: string): Promise<void>;
 }
@@ -125,15 +158,56 @@ export function tunnelRecordToSummary(record: PortForwardClusterTunnelRecord): P
   };
 }
 
+function classifyRelayAccounting(message: PortForwardClusterBusMessage): {
+  isRelayData: boolean;
+  tunnelId?: string;
+  direction?: PortForwardRelayDirection;
+  byteSize: number;
+  coordinatorPodId?: string;
+} {
+  if ((message.kind === 'to_endpoint' || message.kind === 'to_coordinator')
+    && message.frame.type === PORT_FORWARD_MSG.RELAY_FRAME) {
+    return {
+      isRelayData: true,
+      tunnelId: message.frame.tunnelId,
+      direction: message.direction ?? 'l2t',
+      byteSize: Buffer.byteLength(message.frame.data, 'utf8'),
+      coordinatorPodId: message.kind === 'to_endpoint' ? message.coordinatorPodId : undefined,
+    };
+  }
+  const tunnelId = 'tunnelId' in message && typeof message.tunnelId === 'string'
+    ? message.tunnelId
+    : undefined;
+  return {
+    isRelayData: false,
+    ...(tunnelId ? { tunnelId } : {}),
+    byteSize: 0,
+  };
+}
+
+interface InMemoryQueuedItem {
+  seq: number;
+  targetPodId: string;
+  tunnelId?: string;
+  direction?: PortForwardRelayDirection;
+  byteSize: number;
+  expiresAt: number;
+  coordinatorPodId?: string;
+  message: PortForwardClusterBusMessage;
+}
+
 /**
- * In-memory authoritative cluster store & pod message bus.
- * Shared across multiple pod instances in multi-pod unit tests, or used
- * per-router as default standalone store when no database is attached.
+ * In-memory authoritative cluster store & ordered/bounded pod message bus.
+ * Uses explicit per-pod FIFO queues and byte/TTL accounting mirroring PostgreSQL semantics.
  */
 export class InMemoryPortForwardClusterStore implements PortForwardClusterStore {
   private readonly endpoints = new Map<string, PortForwardEndpointPresence>();
   private readonly tunnels = new Map<string, PortForwardClusterTunnelRecord>();
   private readonly subscribers = new Map<string, PortForwardClusterBusHandler>();
+  private readonly podQueues = new Map<string, InMemoryQueuedItem[]>();
+  private readonly drainingPods = new Set<string>();
+  private readonly pausedPods = new Set<string>();
+  private nextSeq = 1;
 
   async registerEndpoint(podId: string, serverId: string, generation: number): Promise<void> {
     this.endpoints.set(serverId, { serverId, podId, generation, updatedAt: Date.now() });
@@ -144,6 +218,17 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
     if (existing && existing.podId === podId && existing.generation === generation) {
       this.endpoints.delete(serverId);
     }
+    const q = this.podQueues.get(podId);
+    if (q) {
+      for (let i = q.length - 1; i >= 0; i--) {
+        const item = q[i]!;
+        if (item.message.kind === 'to_endpoint'
+          && item.message.serverId === serverId
+          && item.message.expectedGeneration === generation) {
+          q.splice(i, 1);
+        }
+      }
+    }
   }
 
   async getEndpoint(serverId: string): Promise<PortForwardEndpointPresence | null> {
@@ -152,6 +237,7 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
 
   async tryCreateTunnel(record: PortForwardClusterTunnelRecord): Promise<{ ok: true } | { ok: false; error: string }> {
     const now = Date.now();
+    await this.reclaimStaleMessages(now);
     let userCount = 0;
     let listenCount = 0;
     let targetCount = 0;
@@ -189,9 +275,11 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
 
   async markTunnelClosed(tunnelId: string, updatedAt = Date.now()): Promise<void> {
     const existing = this.tunnels.get(tunnelId);
-    if (!existing) return;
-    existing.status = 'closed';
-    existing.updatedAt = updatedAt;
+    if (existing) {
+      existing.status = 'closed';
+      existing.updatedAt = updatedAt;
+    }
+    await this.cleanupTunnelMessages(tunnelId);
   }
 
   async getTunnel(tunnelId: string): Promise<PortForwardClusterTunnelRecord | null> {
@@ -247,12 +335,160 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
     };
   }
 
+  async getQueuedBytes(tunnelId: string, direction: PortForwardRelayDirection): Promise<number> {
+    const now = Date.now();
+    let total = 0;
+    for (const q of this.podQueues.values()) {
+      for (const item of q) {
+        if (item.tunnelId === tunnelId && item.direction === direction && item.expiresAt > now) {
+          total += item.byteSize;
+        }
+      }
+    }
+    return total;
+  }
+
+  async cleanupTunnelMessages(tunnelId: string): Promise<void> {
+    for (const q of this.podQueues.values()) {
+      for (let i = q.length - 1; i >= 0; i--) {
+        const item = q[i]!;
+        if (item.tunnelId === tunnelId
+          && (item.message.kind === 'to_endpoint' || item.message.kind === 'to_coordinator')) {
+          q.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  async reclaimStaleMessages(now = Date.now()): Promise<number> {
+    let removed = 0;
+    for (const [podId, q] of this.podQueues.entries()) {
+      for (let i = q.length - 1; i >= 0; i--) {
+        const item = q[i]!;
+        const closedTunnel = item.tunnelId ? this.tunnels.get(item.tunnelId)?.status === 'closed' : false;
+        const deadEndpoint = item.message.kind === 'to_endpoint'
+          && !this.endpoints.has(item.message.serverId)
+          && item.message.frame.type === PORT_FORWARD_MSG.RELAY_FRAME;
+        if (item.expiresAt <= now || (closedTunnel && (item.message.kind === 'to_endpoint' || item.message.kind === 'to_coordinator')) || deadEndpoint) {
+          q.splice(i, 1);
+          removed += 1;
+        }
+      }
+      if (q.length === 0) this.podQueues.delete(podId);
+    }
+    return removed;
+  }
+
+  async setPodDrainPausedForTests(podId: string, paused: boolean): Promise<void> {
+    if (paused) {
+      this.pausedPods.add(podId);
+    } else {
+      this.pausedPods.delete(podId);
+      this.scheduleDrain(podId);
+    }
+  }
+
+  async stop(podId: string): Promise<void> {
+    this.pausedPods.delete(podId);
+    this.subscribers.delete(podId);
+    this.podQueues.delete(podId);
+  }
+
   async sendToPod(targetPodId: string, message: PortForwardClusterBusMessage): Promise<void> {
-    const handler = this.subscribers.get(targetPodId);
-    if (!handler) return;
-    queueMicrotask(() => {
-      void handler(message);
+    await this.enqueueBusMessage(targetPodId, message);
+  }
+
+  async enqueueBusMessage(
+    targetPodId: string,
+    message: PortForwardClusterBusMessage,
+  ): Promise<PortForwardClusterEnqueueResult> {
+    const now = Date.now();
+    await this.reclaimStaleMessages(now);
+    const acc = classifyRelayAccounting(message);
+    let currentBytes = 0;
+
+    if (acc.isRelayData && acc.tunnelId && acc.direction) {
+      currentBytes = await this.getQueuedBytes(acc.tunnelId, acc.direction);
+      if (currentBytes + acc.byteSize > PORT_FORWARD_LIMITS.CLUSTER_RELAY_HARD_CAP_BYTES) {
+        return { ok: false, overflow: true, queuedBytes: currentBytes };
+      }
+    }
+
+    let q = this.podQueues.get(targetPodId);
+    if (!q) {
+      q = [];
+      this.podQueues.set(targetPodId, q);
+    }
+    q.push({
+      seq: this.nextSeq++,
+      targetPodId,
+      ...(acc.tunnelId ? { tunnelId: acc.tunnelId } : {}),
+      ...(acc.direction ? { direction: acc.direction } : {}),
+      byteSize: acc.byteSize,
+      expiresAt: now + PORT_FORWARD_LIMITS.CLUSTER_RELAY_MSG_TTL_MS,
+      ...(acc.coordinatorPodId ? { coordinatorPodId: acc.coordinatorPodId } : {}),
+      message,
     });
+
+    const totalAfter = currentBytes + acc.byteSize;
+    this.scheduleDrain(targetPodId);
+    return {
+      ok: true,
+      queuedBytes: totalAfter,
+      highWater: acc.isRelayData && totalAfter >= PORT_FORWARD_LIMITS.CLUSTER_RELAY_HIGH_WATER_BYTES,
+    };
+  }
+
+  private scheduleDrain(podId: string): void {
+    if (this.drainingPods.has(podId) || this.pausedPods.has(podId)) return;
+    const handler = this.subscribers.get(podId);
+    if (!handler) return;
+    this.drainingPods.add(podId);
+    queueMicrotask(() => {
+      void this.drainPodQueue(podId).finally(() => {
+        this.drainingPods.delete(podId);
+        const remaining = this.podQueues.get(podId);
+        if (remaining && remaining.length > 0 && !this.pausedPods.has(podId) && this.subscribers.has(podId)) {
+          this.scheduleDrain(podId);
+        }
+      });
+    });
+  }
+
+  private async drainPodQueue(podId: string): Promise<void> {
+    const q = this.podQueues.get(podId);
+    if (!q) return;
+    const drainedPairs = new Map<string, { tunnelId: string; direction: PortForwardRelayDirection; coordinatorPodId?: string }>();
+
+    while (q.length > 0 && !this.pausedPods.has(podId)) {
+      const handler = this.subscribers.get(podId);
+      if (!handler) break;
+      const item = q.shift()!;
+      if (item.expiresAt <= Date.now()) continue;
+      if (item.tunnelId && item.direction && item.byteSize > 0) {
+        drainedPairs.set(`${item.tunnelId}:${item.direction}`, {
+          tunnelId: item.tunnelId,
+          direction: item.direction,
+          coordinatorPodId: item.coordinatorPodId,
+        });
+      }
+      await handler(item.message);
+    }
+
+    for (const pair of drainedPairs.values()) {
+      const remainingBytes = await this.getQueuedBytes(pair.tunnelId, pair.direction);
+      if (remainingBytes <= PORT_FORWARD_LIMITS.CLUSTER_RELAY_LOW_WATER_BYTES) {
+        const coordinatorPodId = pair.coordinatorPodId ?? this.tunnels.get(pair.tunnelId)?.coordinatorPodId;
+        if (coordinatorPodId) {
+          await this.enqueueBusMessage(coordinatorPodId, {
+            kind: 'relay_drained',
+            tunnelId: pair.tunnelId,
+            direction: pair.direction,
+            queuedBytes: remainingBytes,
+          });
+        }
+      }
+    }
   }
 }
 
@@ -322,12 +558,11 @@ function rowToTunnelRecord(row: PgTunnelRow): PortForwardClusterTunnelRecord {
 }
 
 /**
- * Authoritative PostgreSQL-backed cluster store & cross-pod bus.
- * Uses `port_forward_endpoints`, `port_forward_tunnels`, and `port_forward_bus_messages`
- * with PG advisory locks for cross-pod quota integrity and `pg_notify` + polling fallback.
+ * Authoritative PostgreSQL-backed cluster store & ordered/bounded cross-pod bus.
  */
 export class PostgresPortForwardClusterStore implements PortForwardClusterStore {
   private readonly subscribers = new Map<string, PortForwardClusterBusHandler>();
+  private readonly pausedPods = new Set<string>();
   private readonly listeners = new Map<string, {
     stop(): Promise<void>;
     wake(): void;
@@ -357,6 +592,14 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
         WHERE server_id = $1 AND pod_id = $2 AND generation = $3`,
       [serverId, podId, generation],
     );
+    await this.db.execute(
+      `DELETE FROM port_forward_bus_messages
+        WHERE target_pod_id = $1
+          AND kind = 'to_endpoint'
+          AND payload->>'serverId' = $2
+          AND (payload->>'expectedGeneration')::bigint = $3`,
+      [podId, serverId, generation],
+    );
   }
 
   async getEndpoint(serverId: string): Promise<PortForwardEndpointPresence | null> {
@@ -384,7 +627,6 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
   async tryCreateTunnel(record: PortForwardClusterTunnelRecord): Promise<{ ok: true } | { ok: false; error: string }> {
     const now = Date.now();
     return this.db.transaction(async (tx) => {
-      // Acquire deterministic sorted advisory locks for user + listen + target servers so concurrent pods serialize quota checks cleanly.
       const lockKeys = Array.from(new Set([
         `pf_user:${record.userId}`,
         `pf_srv:${record.listenServerId}`,
@@ -499,6 +741,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
       `UPDATE port_forward_tunnels SET status = 'closed', updated_at = $1 WHERE tunnel_id = $2`,
       [updatedAt, tunnelId],
     );
+    await this.cleanupTunnelMessages(tunnelId);
   }
 
   async getTunnel(tunnelId: string): Promise<PortForwardClusterTunnelRecord | null> {
@@ -556,6 +799,47 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
     return rows.map(rowToTunnelRecord);
   }
 
+  async getQueuedBytes(tunnelId: string, direction: PortForwardRelayDirection): Promise<number> {
+    const row = await this.db.queryOne<{ total: number | string }>(
+      `SELECT COALESCE(SUM(byte_size), 0)::int AS total
+         FROM port_forward_bus_messages
+        WHERE tunnel_id = $1 AND direction = $2 AND (expires_at = 0 OR expires_at > $3)`,
+      [tunnelId, direction, Date.now()],
+    );
+    return Number(row?.total ?? 0);
+  }
+
+  async cleanupTunnelMessages(tunnelId: string): Promise<void> {
+    await this.db.execute(
+      `DELETE FROM port_forward_bus_messages
+        WHERE tunnel_id = $1 AND kind IN ('to_endpoint', 'to_coordinator')`,
+      [tunnelId],
+    );
+  }
+
+  async reclaimStaleMessages(now = Date.now()): Promise<number> {
+    const rows = await this.db.query<{ seq: number | string }>(
+      `DELETE FROM port_forward_bus_messages m
+        WHERE (m.expires_at > 0 AND m.expires_at <= $1)
+           OR (m.tunnel_id IS NOT NULL AND m.kind IN ('to_endpoint', 'to_coordinator') AND EXISTS (
+             SELECT 1 FROM port_forward_tunnels t
+              WHERE t.tunnel_id = m.tunnel_id AND (t.status = 'closed' OR t.expires_at <= $1)
+           ))
+        RETURNING m.seq`,
+      [now],
+    );
+    return rows.length;
+  }
+
+  async setPodDrainPausedForTests(podId: string, paused: boolean): Promise<void> {
+    if (paused) {
+      this.pausedPods.add(podId);
+    } else {
+      this.pausedPods.delete(podId);
+      this.listeners.get(podId)?.wake();
+    }
+  }
+
   subscribePod(podId: string, handler: PortForwardClusterBusHandler): () => void {
     this.subscribers.set(podId, handler);
     return () => {
@@ -564,25 +848,90 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
   }
 
   async sendToPod(targetPodId: string, message: PortForwardClusterBusMessage): Promise<void> {
-    const localHandler = this.subscribers.get(targetPodId);
-    if (localHandler) {
-      queueMicrotask(() => {
-        void localHandler(message);
+    await this.enqueueBusMessage(targetPodId, message);
+  }
+
+  async enqueueBusMessage(
+    targetPodId: string,
+    message: PortForwardClusterBusMessage,
+  ): Promise<PortForwardClusterEnqueueResult> {
+    const now = Date.now();
+    const acc = classifyRelayAccounting(message);
+    const expiresAt = now + PORT_FORWARD_LIMITS.CLUSTER_RELAY_MSG_TTL_MS;
+
+    if (acc.isRelayData && acc.tunnelId && acc.direction) {
+      const result = await this.db.transaction(async (tx): Promise<PortForwardClusterEnqueueResult> => {
+        await tx.execute('SELECT pg_advisory_xact_lock($1::bigint)', [
+          advisoryLockKey64(`pf_q:${acc.tunnelId}:${acc.direction}`),
+        ]);
+        await tx.execute(
+          `DELETE FROM port_forward_bus_messages m
+            WHERE (m.expires_at > 0 AND m.expires_at <= $1)
+               OR (m.tunnel_id = $2 AND m.kind IN ('to_endpoint', 'to_coordinator') AND EXISTS (
+                 SELECT 1 FROM port_forward_tunnels t WHERE t.tunnel_id = $2 AND t.status = 'closed'
+               ))`,
+          [now, acc.tunnelId],
+        );
+        const row = await tx.queryOne<{ total: number | string }>(
+          `SELECT COALESCE(SUM(byte_size), 0)::int AS total
+             FROM port_forward_bus_messages
+            WHERE tunnel_id = $1 AND direction = $2`,
+          [acc.tunnelId, acc.direction],
+        );
+        const currentBytes = Number(row?.total ?? 0);
+        if (currentBytes + acc.byteSize > PORT_FORWARD_LIMITS.CLUSTER_RELAY_HARD_CAP_BYTES) {
+          return { ok: false, overflow: true, queuedBytes: currentBytes };
+        }
+        await tx.execute(
+          `INSERT INTO port_forward_bus_messages (target_pod_id, kind, tunnel_id, direction, byte_size, expires_at, payload, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8)`,
+          [
+            targetPodId,
+            message.kind,
+            acc.tunnelId,
+            acc.direction,
+            acc.byteSize,
+            expiresAt,
+            JSON.stringify(message),
+            now,
+          ],
+        );
+        const totalAfter = currentBytes + acc.byteSize;
+        return {
+          ok: true,
+          queuedBytes: totalAfter,
+          highWater: totalAfter >= PORT_FORWARD_LIMITS.CLUSTER_RELAY_HIGH_WATER_BYTES,
+        };
       });
-      return;
+      if (!result.ok) return result;
+      await this.notifyPod(targetPodId);
+      return result;
     }
+
     await this.db.execute(
-      `INSERT INTO port_forward_bus_messages (target_pod_id, kind, payload, created_at)
-       VALUES ($1, $2, $3::jsonb, $4)`,
-      [targetPodId, message.kind, JSON.stringify(message), Date.now()],
+      `INSERT INTO port_forward_bus_messages (target_pod_id, kind, tunnel_id, direction, byte_size, expires_at, payload, created_at)
+       VALUES ($1, $2, $3, $4, 0, $5, $6::jsonb, $7)`,
+      [
+        targetPodId,
+        message.kind,
+        acc.tunnelId ?? null,
+        acc.direction ?? null,
+        expiresAt,
+        JSON.stringify(message),
+        now,
+      ],
     );
+    await this.notifyPod(targetPodId);
+    return { ok: true, queuedBytes: 0, highWater: false };
+  }
+
+  private async notifyPod(targetPodId: string): Promise<void> {
     try {
       await this.db.execute('SELECT pg_notify($1, $2)', [PG_BUS_CHANNEL, targetPodId]);
     } catch {
       // Poller fallback drains queued messages even if pg_notify fails.
     }
-    const localListener = this.listeners.get(targetPodId);
-    localListener?.wake();
+    this.listeners.get(targetPodId)?.wake();
   }
 
   async start(podId: string, handler: PortForwardClusterBusHandler): Promise<void> {
@@ -595,31 +944,71 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
     let pgClient: pg.Client | null = null;
 
     const drainPod = async () => {
-      if (stopped || draining) return;
+      if (stopped || draining || this.pausedPods.has(podId)) return;
       draining = true;
       try {
+        await this.db.execute(
+          `DELETE FROM port_forward_bus_messages
+            WHERE target_pod_id = $1 AND expires_at > 0 AND expires_at <= $2`,
+          [podId, Date.now()],
+        );
         for (;;) {
-          if (stopped) break;
-          const rows = await this.db.query<{ seq: number | string; payload: PortForwardClusterBusMessage }>(
+          if (stopped || this.pausedPods.has(podId)) break;
+          const rows = await this.db.query<{
+            seq: number | string;
+            tunnel_id: string | null;
+            direction: PortForwardRelayDirection | null;
+            byte_size: number;
+            payload: PortForwardClusterBusMessage;
+          }>(
             `DELETE FROM port_forward_bus_messages
               WHERE seq IN (
                 SELECT seq FROM port_forward_bus_messages
                  WHERE target_pod_id = $1
                  ORDER BY seq ASC
-                 LIMIT 64
+                 LIMIT 32
               )
-              RETURNING seq, payload`,
+              RETURNING seq, tunnel_id, direction, byte_size, payload`,
             [podId],
           );
           if (rows.length === 0) break;
           rows.sort((a, b) => Number(a.seq) - Number(b.seq));
+          const drainedPairs = new Map<string, {
+            tunnelId: string;
+            direction: PortForwardRelayDirection;
+            coordinatorPodId?: string;
+          }>();
+
           for (const row of rows) {
             const payload = typeof row.payload === 'string'
               ? JSON.parse(row.payload) as PortForwardClusterBusMessage
               : row.payload;
+            if (row.tunnel_id && row.direction && Number(row.byte_size) > 0) {
+              drainedPairs.set(`${row.tunnel_id}:${row.direction}`, {
+                tunnelId: row.tunnel_id,
+                direction: row.direction,
+                coordinatorPodId: payload.kind === 'to_endpoint' ? payload.coordinatorPodId : undefined,
+              });
+            }
             await handler(payload);
           }
-          if (rows.length < 64) break;
+
+          for (const pair of drainedPairs.values()) {
+            const remainingBytes = await this.getQueuedBytes(pair.tunnelId, pair.direction);
+            if (remainingBytes <= PORT_FORWARD_LIMITS.CLUSTER_RELAY_LOW_WATER_BYTES) {
+              const coordinatorPodId = pair.coordinatorPodId
+                ?? (await this.getTunnel(pair.tunnelId))?.coordinatorPodId;
+              if (coordinatorPodId) {
+                await this.enqueueBusMessage(coordinatorPodId, {
+                  kind: 'relay_drained',
+                  tunnelId: pair.tunnelId,
+                  direction: pair.direction,
+                  queuedBytes: remainingBytes,
+                });
+              }
+            }
+          }
+          if (rows.length < 32) break;
         }
       } catch {
         // Retry cleanly on next wake / poll tick.
@@ -681,6 +1070,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
         const c = pgClient;
         pgClient = null;
         if (c) await c.end().catch(() => {});
+        this.pausedPods.delete(podId);
         this.subscribers.delete(podId);
       },
     });
@@ -692,7 +1082,12 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
       this.listeners.delete(podId);
       await entry.stop();
     }
+    this.pausedPods.delete(podId);
     this.subscribers.delete(podId);
+    await this.db.execute(
+      `DELETE FROM port_forward_bus_messages WHERE target_pod_id = $1 AND kind = 'to_endpoint'`,
+      [podId],
+    ).catch(() => {});
   }
 }
 

@@ -1,4 +1,5 @@
-import { createDecipheriv, createHash, createHmac, hkdfSync } from 'node:crypto';
+import { createDecipheriv, createHash, createHmac, hkdfSync, randomBytes } from 'node:crypto';
+import { createSocket } from 'node:dgram';
 import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { connect as tcpConnect, createServer as createTcpServer, type Server as NetServer, type Socket as NetSocket } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
@@ -13,7 +14,15 @@ import {
   type PortForwardCandidate,
   type PortForwardWireMessage,
 } from '../../shared/port-forward.js';
+import {
+  computeEphemeralKeyProof,
+  deriveAdmissionMacKey,
+  generateEndpointIdentityKeyPair,
+  generateEphemeralEcdhKeyPair,
+  signPortForwardTranscript,
+} from '../../src/daemon/port-forward-crypto.js';
 import { PortForwardEngine } from '../../src/daemon/port-forward-engine.js';
+import { probeStunCandidates } from '../../src/daemon/port-forward-stun.js';
 import { PortForwardRouter, type PortForwardBridgeEndpoint } from '../../server/src/ws/port-forward-router.js';
 
 const cleanupCallbacks: Array<() => Promise<void> | void> = [];
@@ -40,6 +49,8 @@ function createPairedEngines(options: {
   });
 
   const capturedMessages: Array<{ from: string; msg: PortForwardWireMessage }> = [];
+  const identityA = options.listenOpts?.identityKeyPair ?? generateEndpointIdentityKeyPair();
+  const identityB = options.targetOpts?.identityKeyPair ?? generateEndpointIdentityKeyPair();
 
   const listenEngine = new PortForwardEngine({
     sendWs: (msg) => {
@@ -49,6 +60,8 @@ function createPairedEngines(options: {
       });
     },
     collectInterfaceAddresses: () => ['127.0.0.1'],
+    identityKeyPair: identityA,
+    resolveTrustedPeerPublicKey: (id) => (id === 'node_b' ? identityB.publicKeyB64 : null),
     timeouts: {
       directTcpMs: 300,
       directTcpPreferenceWaitMs: 60,
@@ -68,6 +81,8 @@ function createPairedEngines(options: {
       });
     },
     collectInterfaceAddresses: () => ['127.0.0.1'],
+    identityKeyPair: identityB,
+    resolveTrustedPeerPublicKey: (id) => (id === 'node_a' ? identityA.publicKeyB64 : null),
     timeouts: {
       directTcpMs: 300,
       directTcpPreferenceWaitMs: 60,
@@ -402,6 +417,8 @@ describe('PortForwardEngine 3-tier transport & mux suites', () => {
       peerCandidates: [{ host: '127.0.0.1', port: 1234, transport: 'tcp', kind: 'host' } satisfies PortForwardCandidate],
       peerPublicKey: 'A'.repeat(44),
       peerKeyProof: 'B'.repeat(43),
+      peerIdentityPublicKey: 'C'.repeat(44),
+      peerIdentitySignature: 'D'.repeat(86),
       transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
     });
     expect(handled).toBe(true);
@@ -685,5 +702,126 @@ describe('PortForwardEngine 3-tier transport & mux suites', () => {
     });
     expect(fastResp).toBe('FAST_OK');
     wsBackpressured = false;
+  });
+
+  it('rejects untrusted or server-substituted peer identities even with valid server capability proof (P0 #1)', async () => {
+    // Case 1: missing local trusted peer identity fails closed with explicit untrusted_peer_identity error.
+    const { router: untrustedRouter } = createPairedEngines({
+      listenOpts: { resolveTrustedPeerPublicKey: () => null },
+    });
+    const missingTrustRes = await untrustedRouter.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: 9000,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(missingTrustRes.ok).toBe(false);
+    if (!missingTrustRes.ok) {
+      expect(missingTrustRes.reason).toBe(PORT_FORWARD_ERRORS.SCOPED_AUTH);
+      expect(missingTrustRes.error).toContain('untrusted_peer_identity');
+    }
+
+    // Case 2: compromised relay knowing `capability` swaps peer X25519 key + mints valid `keyProof` + signs with attacker Ed25519 key.
+    // Endpoint trusting node_b's real Ed25519 key MUST reject it cleanly.
+    const emitted: PortForwardWireMessage[] = [];
+    const listenIdentity = generateEndpointIdentityKeyPair();
+    const realTargetIdentity = generateEndpointIdentityKeyPair();
+    const attackerIdentity = generateEndpointIdentityKeyPair();
+    const attackerEcdh = generateEphemeralEcdhKeyPair();
+
+    const engineA = new PortForwardEngine({
+      sendWs: (m) => { emitted.push(m); },
+      identityKeyPair: listenIdentity,
+      resolveTrustedPeerPublicKey: (id) => (id === 'node_b' ? realTargetIdentity.publicKeyB64 : null),
+    });
+    cleanupCallbacks.push(() => engineA.closeAll());
+
+    const capability = randomBytes(32).toString('base64url');
+    const tunnelId = 'pf_mitm_forged_0001';
+    const admissionMacKey = deriveAdmissionMacKey(capability, tunnelId);
+
+    await engineA.handleMessage({
+      type: PORT_FORWARD_MSG.PREPARE,
+      tunnelId,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      capability,
+      selfServerId: 'node_a',
+      peerServerId: 'node_b',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      iceServers: [],
+      ttlMs: 60_000,
+    });
+
+    const forgedProof = computeEphemeralKeyProof(admissionMacKey, {
+      tunnelId,
+      role: PORT_FORWARD_ROLE.TARGET,
+      selfServerId: 'node_b',
+      peerServerId: 'node_a',
+      publicKey: attackerEcdh.publicKeyB64,
+    });
+    const forgedSig = signPortForwardTranscript(attackerIdentity.privateKey, {
+      tunnelId,
+      role: PORT_FORWARD_ROLE.TARGET,
+      selfServerId: 'node_b',
+      peerServerId: 'node_a',
+      capability,
+      ecdhPublicKey: attackerEcdh.publicKeyB64,
+      candidates: [],
+    });
+
+    await engineA.handleMessage({
+      type: PORT_FORWARD_MSG.CONNECT,
+      tunnelId,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      peerCandidates: [],
+      peerPublicKey: attackerEcdh.publicKeyB64,
+      peerKeyProof: forgedProof,
+      peerIdentityPublicKey: attackerIdentity.publicKeyB64,
+      peerIdentitySignature: forgedSig,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+
+    const errorMsg = emitted.find((m) => m.type === PORT_FORWARD_MSG.ERROR);
+    expect(errorMsg).toBeDefined();
+    if (errorMsg && errorMsg.type === PORT_FORWARD_MSG.ERROR) {
+      expect(errorMsg.reason).toBe(PORT_FORWARD_ERRORS.SCOPED_AUTH);
+      expect(errorMsg.error).toContain('signature verification failed');
+    }
+    expect(engineA.listTunnels()).toHaveLength(0);
+  });
+
+  it('aborts hung STUN probe timers & socket listeners immediately on tunnel cancel mid-PREPARE (P0 #3)', async () => {
+    // Bind a UDP sinkhole that never replies to STUN binding requests
+    const blackhole = createSocket('udp4');
+    await new Promise<void>((r) => blackhole.bind(0, '127.0.0.1', () => r()));
+    cleanupCallbacks.push(() => { try { blackhole.close(); } catch { /* ignore */ } });
+    const blackholePort = blackhole.address().port;
+
+    const probeSock = createSocket('udp4');
+    await new Promise<void>((r) => probeSock.bind(0, '127.0.0.1', () => r()));
+    cleanupCallbacks.push(() => { try { probeSock.close(); } catch { /* ignore */ } });
+
+    const abortController = new AbortController();
+    const start = Date.now();
+    const probePromise = probeStunCandidates(
+      probeSock,
+      [{ urls: `stun:127.0.0.1:${blackholePort}` }],
+      { timeoutMs: 10_000, signal: abortController.signal },
+    );
+    expect(probeSock.listenerCount('message')).toBeGreaterThan(0);
+
+    setTimeout(() => abortController.abort(), 30);
+    const eps = await probePromise;
+    expect(eps).toEqual([]);
+    expect(Date.now() - start).toBeLessThan(1_000);
+    expect(probeSock.listenerCount('message')).toBe(0);
   });
 });
