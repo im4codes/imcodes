@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import pg from 'pg';
+import type { Client as PgClient } from 'pg';
 import type { Database } from '../db/client.js';
 import {
   PORT_FORWARD_ERRORS,
@@ -1205,7 +1205,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
     let stopped = false;
     let draining = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    let pgClient: pg.Client | null = null;
+    let pgClient: PgClient | null = null;
 
     const drainPod = async () => {
       if (stopped || draining || this.pausedPods.has(podId)) return;
@@ -1327,10 +1327,15 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
       timer.unref?.();
     };
 
-    if (this.connectionString) {
+    const connStr = this.connectionString;
+    if (connStr) {
       const connectListener = async () => {
         if (stopped) return;
-        const client = new pg.Client({ connectionString: this.connectionString });
+        const pgMod = await import('pg');
+        if (stopped) return;
+        const ClientCtor = (pgMod.default?.Client ?? pgMod.Client) as (new (opts: { connectionString: string }) => PgClient) | undefined;
+        if (!ClientCtor) return;
+        const client = new ClientCtor({ connectionString: connStr });
         pgClient = client;
         client.on('notification', (n) => {
           if (n.channel === PG_BUS_CHANNEL && (!n.payload || n.payload === podId)) {
