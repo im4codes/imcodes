@@ -614,6 +614,44 @@ describe('CopilotSdkProvider', () => {
     const relayed2 = transportRelayTesting.normalizeUsageUpdatePayload('deck_copilot_usage', usage2, 'gpt-5.4');
     expect(relayed2?.inputTokens).toBe(100);
     expect('cacheTokens' in relayed2!).toBe(false);
+
+    // Case 3: multiple assistant.usage snapshots within ONE turn (cached call followed by uncached call omitting cache fields)
+    // Prior cacheReadTokens/cacheWriteTokens/cost MUST be cleared rather than mixed with the new inputTokens=100.
+    await provider.send(routeId, 'Third');
+    session.emit({
+      type: 'assistant.usage',
+      data: {
+        model: 'gpt-5.4',
+        inputTokens: 1500,
+        outputTokens: 320,
+        cacheReadTokens: 800,
+        cacheWriteTokens: 200,
+        cost: 0.045,
+      },
+    });
+    session.emit({
+      type: 'assistant.usage',
+      data: {
+        model: 'gpt-5.4',
+        inputTokens: 100,
+      },
+    });
+    session.emit({
+      type: 'assistant.message',
+      data: { messageId: 'msg-usage-3', content: 'reply 3', toolRequests: [] },
+    });
+    session.emit({ type: 'session.idle', data: {} });
+
+    expect(messages).toHaveLength(3);
+    const usage3 = (messages[2].metadata.usage ?? {}) as Record<string, number>;
+    expect(usage3).toEqual({
+      input_tokens: 100,
+    });
+    expect(messages[2].metadata.costUsd).toBeUndefined();
+    const relayed3 = transportRelayTesting.normalizeUsageUpdatePayload('deck_copilot_usage', usage3, 'gpt-5.4');
+    expect(relayed3?.inputTokens).toBe(100);
+    expect('cacheTokens' in relayed3!).toBe(false);
+    expect('outputTokens' in relayed3!).toBe(false);
   });
 
   it('uses normalized payload attachments instead of the raw legacy attachments argument', async () => {

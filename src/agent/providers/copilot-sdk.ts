@@ -1194,29 +1194,19 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
         return;
       }
       case 'assistant.usage': {
-        // Capture the full token + cost breakdown from copilot's per-API-call
-        // usage event (schema: copilot-sdk/generated/session-events.d.ts:1554).
-        // Multiple usage events can fire per turn (sub-agent calls); we
-        // overwrite rather than accumulate to match the previous behavior of
-        // currentOutputTokens — accumulation would be more accurate but is a
-        // separate change that needs UI/contract review.
-        if (typeof event.data?.inputTokens === 'number') {
-          state.currentInputTokens = event.data.inputTokens;
-        }
-        if (typeof event.data?.outputTokens === 'number') {
-          state.currentOutputTokens = event.data.outputTokens;
-        }
-        if (typeof event.data?.cacheReadTokens === 'number') {
-          state.currentCacheReadTokens = event.data.cacheReadTokens;
-        }
-        if (typeof event.data?.cacheWriteTokens === 'number') {
-          state.currentCacheWriteTokens = event.data.cacheWriteTokens;
-        }
-        if (typeof event.data?.cost === 'number') {
-          state.currentCostUsd = event.data.cost;
-        }
-        if (isNonEmptyString(event.data?.interactionId)) {
-          state.currentInteractionId = event.data.interactionId;
+        // Capture a coherent per-API-call snapshot from copilot's `assistant.usage`
+        // event (schema: copilot-sdk/generated/session-events.d.ts). Optional fields
+        // (`cacheReadTokens`, `cacheWriteTokens`, `outputTokens`, `cost`) omitted by a
+        // subsequent call in the same turn must clear prior values rather than mixing
+        // an older call's cache/output breakdown with the new call's `inputTokens`.
+        const data = event.data as Record<string, unknown> | undefined;
+        state.currentInputTokens = typeof data?.inputTokens === 'number' ? data.inputTokens : undefined;
+        state.currentOutputTokens = typeof data?.outputTokens === 'number' ? data.outputTokens : undefined;
+        state.currentCacheReadTokens = typeof data?.cacheReadTokens === 'number' ? data.cacheReadTokens : undefined;
+        state.currentCacheWriteTokens = typeof data?.cacheWriteTokens === 'number' ? data.cacheWriteTokens : undefined;
+        state.currentCostUsd = typeof data?.cost === 'number' ? data.cost : undefined;
+        if (isNonEmptyString(data?.interactionId)) {
+          state.currentInteractionId = data.interactionId;
         }
         return;
       }
