@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/preact';
 import { createPortal } from 'preact/compat';
-import { useEffect, useRef } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { P2P_WORKFLOW_MSG } from '@shared/p2p-workflow-messages.js';
 import { DAEMON_STATS_MSG } from '@shared/daemon-stats.js';
 import { clearAllSupervisionTaskConsoleCaches } from '../src/supervision-task-console-cache.js';
@@ -116,6 +116,7 @@ const {
     subSessions: [] as any[],
     visibleSubSessions: [] as any[],
     loadedServerId: null as string | null,
+    enableReactiveHydrateShared: false,
   },
   updateSubLocalMock: vi.fn(),
   authExpiredState: {
@@ -323,15 +324,48 @@ vi.mock('../src/ws-client.js', () => ({
 }));
 
 vi.mock('../src/hooks/useSubSessions.js', () => ({
-  useSubSessions: () => ({
-    ...useSubSessionsState,
-    create: vi.fn(async () => null),
-    close: vi.fn(),
-    hydrateShared: vi.fn(),
-    restart: vi.fn(),
-    rename: vi.fn(),
-    updateLocal: updateSubLocalMock,
-  }),
+  useSubSessions: () => {
+    const [hydrated, setHydrated] = useState<{ serverId: string; list: any[] } | null>(null);
+    const hydrateShared = useCallback((serverIdForShare: string, list: any[]) => {
+      if (!useSubSessionsState.enableReactiveHydrateShared) return;
+      const mapped = list.map((item) => ({
+        id: item.subSessionId,
+        serverId: serverIdForShare,
+        sessionName: item.sessionName ?? `deck_sub_${item.subSessionId}`,
+        type: item.type ?? 'shell',
+        runtimeType: 'process',
+        label: item.title ?? item.type ?? null,
+        parentSession: item.parentSessionName ?? null,
+        state: item.state ?? 'idle',
+        closedAt: null,
+        createdAt: 1,
+        updatedAt: 1,
+      }));
+      setHydrated({ serverId: serverIdForShare, list: mapped });
+    }, []);
+    if (useSubSessionsState.enableReactiveHydrateShared && hydrated) {
+      return {
+        subSessions: hydrated.list,
+        visibleSubSessions: hydrated.list,
+        loadedServerId: hydrated.serverId,
+        create: vi.fn(async () => null),
+        close: vi.fn(),
+        hydrateShared,
+        restart: vi.fn(),
+        rename: vi.fn(),
+        updateLocal: updateSubLocalMock,
+      };
+    }
+    return {
+      ...useSubSessionsState,
+      create: vi.fn(async () => null),
+      close: vi.fn(),
+      hydrateShared,
+      restart: vi.fn(),
+      rename: vi.fn(),
+      updateLocal: updateSubLocalMock,
+    };
+  },
 }));
 
 vi.mock('../src/hooks/useProviderStatus.js', () => ({
@@ -613,7 +647,7 @@ vi.mock('../src/components/Sidebar.js', () => ({
   saveSidebarCollapsed: vi.fn(),
 }));
 vi.mock('../src/components/SessionTree.js', () => ({
-  SessionTree: ({ sessions, subSessions, onSelectSession, onSelectSubSession, onNewSession, onNewSubSession }: any) => (
+  SessionTree: ({ sessions, subSessions, directSharedSubSessions, sharedSubSessionStates, onSelectSession, onSelectSubSession, onNewSession, onNewSubSession }: any) => (
     <div>
       session-tree
       <button onClick={() => onSelectSession?.(sessions?.[0]?.name)}>tree-select-session</button>
@@ -623,6 +657,28 @@ vi.mock('../src/components/SessionTree.js', () => ({
         </button>
       ))}
       <button onClick={() => onSelectSubSession?.(subSessions?.[0])}>tree-select-sub</button>
+      {subSessions?.map((sub: any) => (
+        <button
+          key={`tree-sub-${sub.id}`}
+          data-share-role={sharedSubSessionStates?.get(sub.id)?.effectiveRole ?? ''}
+          onClick={() => onSelectSubSession?.(sub)}
+        >
+          tree-select-sub-{sub.id}
+        </button>
+      ))}
+      {directSharedSubSessions?.length > 0 && (
+        <div data-testid="session-tree-direct-shared">
+          {directSharedSubSessions.map((sub: any) => (
+            <button
+              key={`tree-direct-sub-${sub.id}`}
+              data-share-role={sharedSubSessionStates?.get(sub.id)?.effectiveRole ?? ''}
+              onClick={() => onSelectSubSession?.(sub)}
+            >
+              tree-direct-sub-{sub.id}
+            </button>
+          ))}
+        </div>
+      )}
       <button onClick={onNewSession}>tree-new-session</button>
       <button onClick={onNewSubSession}>tree-new-sub</button>
     </div>
@@ -639,7 +695,13 @@ vi.mock('../src/components/SessionTabs.js', () => ({
       session-tabs
       <button onClick={() => onSelect?.(sessions?.[0]?.name)}>tabs-select</button>
       {sessions?.map((session: any) => (
-        <button key={session.name} onClick={() => onSelect?.(session.name)}>tabs-select-{session.name}</button>
+        <button
+          key={session.name}
+          data-share-role={session.sharedState?.effectiveRole ?? ''}
+          onClick={() => onSelect?.(session.name)}
+        >
+          tabs-select-{session.name}
+        </button>
       ))}
       <button onClick={() => onAlertDismiss?.(sessions?.[0]?.name)}>tabs-dismiss</button>
       <button onClick={onNewSession}>tabs-new-session</button>
@@ -727,6 +789,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
       data-session-state={session.state ?? ''}
       data-supervision-mode={session.supervisionMode ?? ''}
       data-share-target-kind={session.sharedState?.targetKind ?? ''}
+      data-share-role={session.sharedState?.effectiveRole ?? ''}
       data-can-share={String(Boolean(onShareSession))}
       data-requested-model={session.requestedModel ?? ''}
       data-active-model={session.activeModel ?? ''}
@@ -904,6 +967,9 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
       <button onClick={() => onRestoreQuickClosed?.(subSessions?.map((sub: any) => sub.id) ?? [])}>subbar-quick-restore</button>
       <button onClick={() => onVisualOrderChange?.([...(subSessions ?? [])].reverse().map((sub: any) => sub.id))}>subbar-reverse-order</button>
       <button onClick={() => onOpenMaximized?.(subSessions?.[0]?.id)}>subbar-open-max</button>
+      {subSessions?.map((sub: any) => (
+        <button key={`max-${sub.id}`} onClick={() => onOpenMaximized?.(sub.id)}>subbar-open-max-{sub.id}</button>
+      ))}
       <button onClick={onViewAutoDeliver}>subbar-auto-deliver</button>
       <button onClick={onViewCron}>subbar-cron</button>
       <button onClick={onViewDiscussions}>subbar-discussions</button>
@@ -1372,6 +1438,7 @@ beforeEach(() => {
   useSubSessionsState.subSessions = [];
   useSubSessionsState.visibleSubSessions = [];
   useSubSessionsState.loadedServerId = 'srv-1';
+  useSubSessionsState.enableReactiveHydrateShared = false;
   updateSubLocalMock.mockReset();
   authExpiredState.handler = null;
   loginAttemptState.pending = null;
@@ -13900,6 +13967,373 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     vi.mocked(pushMod.stopAndroidBackgroundPushOnLogout).mockClear();
     authExpiredState.handler?.('token expired');
     await waitFor(() => expect(pushMod.stopAndroidBackgroundPushOnLogout).toHaveBeenCalled());
+  });
+
+  it('App merged shared server: preserves sibling tabs across narrow session_list and cancels slow switch B on quick re-click of A', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const entryA = {
+      id: 'share-m-a',
+      serverId: 'srv-shared',
+      serverName: 'Partner Cloud',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Proj A',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_proj_a_brain' },
+      sessionState: 'running',
+      agentType: 'claude-code',
+    } as const;
+    const entryB = {
+      id: 'share-m-b',
+      serverId: 'srv-shared',
+      serverName: 'Partner Cloud',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Proj B',
+      target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_proj_b_brain' },
+      sessionState: 'idle',
+      agentType: 'codex-sdk',
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([entryA, entryB]);
+
+    let resolveSlowB!: (value: unknown) => void;
+    let slowSignal: AbortSignal | undefined;
+    openSharedEntryOptionsMock.mockImplementation((_target: unknown, opts?: { signal?: AbortSignal }) => {
+      slowSignal = opts?.signal;
+    });
+    openSharedEntryMock.mockImplementation((target: { sessionName?: string }) => {
+      if (target.sessionName === 'deck_proj_b_brain') {
+        return new Promise((resolve) => { resolveSlowB = resolve; });
+      }
+      return Promise.resolve({
+        server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+        target: entryA.target,
+        coverage: {
+          effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+          coveringShareIds: [entryA.id], primaryShareId: entryA.id, authorizedAt: Date.now(),
+        },
+        sessions: [
+          { sessionName: 'deck_proj_a_brain', title: 'Proj A', state: 'running', agentType: 'claude-code', activeDispatchId: 'd-a' },
+        ],
+        subSessions: [],
+      });
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/server/srv-shared/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    // Open shared server via unified server icon
+    fireEvent.click(await screen.findByTestId('server-icon-srv-shared'));
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_proj_a_brain?shared=share-m-a'));
+
+    // Both sibling tabs exist despite open returning only A
+    expect(screen.getByText('tabs-select-deck_proj_a_brain')).toBeTruthy();
+    expect(screen.getByText('tabs-select-deck_proj_b_brain')).toBeTruthy();
+
+    // Narrow WS session_list returning only A must NOT drop sibling B
+    const sharedWs = wsInstances[wsInstances.length - 1]!;
+    await act(async () => {
+      sharedWs.emit({
+        type: 'session_list',
+        sessions: [{ name: 'deck_proj_a_brain', project: 'proj_a', role: 'brain', agentType: 'claude-code', state: 'idle', label: 'Proj A' }],
+      });
+    });
+    expect(screen.getByText('tabs-select-deck_proj_b_brain')).toBeTruthy();
+
+    // Click sibling B (slow async open), then immediately re-click already-open A
+    fireEvent.click(screen.getByText('tabs-select-deck_proj_b_brain'));
+    expect(slowSignal?.aborted).toBe(false);
+    fireEvent.click(screen.getByText('tabs-select-deck_proj_a_brain'));
+    expect(slowSignal?.aborted).toBe(true);
+
+    // Late resolution of B must be ignored as superseded; A remains active
+    await act(async () => {
+      resolveSlowB({
+        server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+        target: entryB.target,
+        coverage: {
+          effectiveRole: 'viewer', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+          coveringShareIds: [entryB.id], primaryShareId: entryB.id, authorizedAt: Date.now(),
+        },
+        sessions: [{ sessionName: 'deck_proj_b_brain', title: 'Proj B', state: 'idle', agentType: 'codex-sdk' }],
+        subSessions: [],
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(window.location.hash).toBe('#/srv-shared/deck_proj_a_brain?shared=share-m-a');
+    expect(screen.getByTestId('session-pane-deck_proj_a_brain').getAttribute('data-is-active')).toBe('true');
+  }, 20_000);
+
+  it('App merged shared server: renders parentless & nested subsessions in direct group and awaits open before maximize', async () => {
+    useSubSessionsState.enableReactiveHydrateShared = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const subOne = {
+      id: 'share-sub-orphan',
+      serverId: 'srv-shared',
+      serverName: 'Partner Cloud',
+      role: 'viewer',
+      status: 'active',
+      targetLabel: 'Orphan Worker',
+      target: { kind: 'subsession', serverId: 'srv-shared', subSessionId: 'sub_orphan_1' },
+      agentType: 'shell',
+    } as const;
+    const subNested = {
+      id: 'share-sub-nested',
+      serverId: 'srv-shared',
+      serverName: 'Partner Cloud',
+      role: 'participant',
+      status: 'active',
+      targetLabel: 'Nested Worker',
+      target: { kind: 'subsession', serverId: 'srv-shared', subSessionId: 'sub_nested_2' },
+      agentType: 'codex-sdk',
+      parentSessionName: 'deck_sub_missing_parent',
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([subOne, subNested]);
+
+    openSharedEntryMock.mockImplementation((target: { kind: string; subSessionId?: string }) => {
+      if (target.subSessionId === 'sub_orphan_1') {
+        return Promise.resolve({
+          server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+          target: subOne.target,
+          coverage: {
+            effectiveRole: 'viewer', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+            coveringShareIds: [subOne.id], primaryShareId: subOne.id, authorizedAt: Date.now(),
+          },
+          sessions: [],
+          subSessions: [{ subSessionId: 'sub_orphan_1', sessionName: 'deck_sub_sub_orphan_1', title: 'Orphan Worker', type: 'shell', parentSessionName: null }],
+        });
+      }
+      return Promise.resolve({
+        server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+        target: subNested.target,
+        coverage: {
+          effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+          coveringShareIds: [subNested.id], primaryShareId: subNested.id, authorizedAt: Date.now(),
+        },
+        sessions: [],
+        subSessions: [{ subSessionId: 'sub_nested_2', sessionName: 'deck_sub_sub_nested_2', title: 'Nested Worker', type: 'codex-sdk', parentSessionName: 'deck_sub_missing_parent' }],
+      });
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/server/srv-shared/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId('server-icon-srv-shared'));
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared?shared=share-sub-nested'));
+
+    // Both parentless and nested deck_sub_* sub-sessions are visible in SessionTree direct group & SubSessionBar
+    expect(screen.getByTestId('session-tree-direct-shared')).toBeTruthy();
+    expect(screen.getByText('tree-direct-sub-sub_orphan_1')).toBeTruthy();
+    expect(screen.getByText('tree-direct-sub-sub_nested_2')).toBeTruthy();
+
+    // Switch to orphan first, then trigger maximize on sibling nested sub-session via SubSessionBar
+    fireEvent.click(screen.getByText('tree-direct-sub-sub_orphan_1'));
+    await waitFor(() => expect(screen.getByTestId('sub-session-window-sub_orphan_1')).toBeTruthy());
+
+    let resolveSiblingMax!: (value: unknown) => void;
+    openSharedEntryMock.mockImplementationOnce(() => new Promise((resolve) => { resolveSiblingMax = resolve; }));
+    fireEvent.click(screen.getByText('subbar-open-max-sub_nested_2'));
+    // Window must NOT mount/maximize before open authorization resolves
+    expect(screen.queryByTestId('sub-session-window-sub_nested_2')).toBeNull();
+
+    await act(async () => {
+      resolveSiblingMax({
+        server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+        target: subNested.target,
+        coverage: {
+          effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+          coveringShareIds: [subNested.id], primaryShareId: subNested.id, authorizedAt: Date.now(),
+        },
+        sessions: [],
+        subSessions: [{ subSessionId: 'sub_nested_2', sessionName: 'deck_sub_sub_nested_2', title: 'Nested Worker', type: 'codex-sdk', parentSessionName: 'deck_sub_missing_parent' }],
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const nestedWin = await screen.findByTestId('sub-session-window-sub_nested_2');
+    expect(nestedWin.getAttribute('data-maximized')).toBe('true');
+    expect(nestedWin.getAttribute('data-share-role')).toBe('participant');
+  }, 20_000);
+
+  it('App merged shared server: recovers across 403 revoked A -> unavailable B -> valid C and exits safely when all revoked', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const entryA = {
+      id: 'share-rec-a', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'participant', status: 'active',
+      targetLabel: 'Rec A', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_rec_a_brain' },
+    } as const;
+    const entryB = {
+      id: 'share-rec-b', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'participant', status: 'active',
+      targetLabel: 'Rec B', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_rec_b_brain' },
+    } as const;
+    const entryC = {
+      id: 'share-rec-c', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'viewer', status: 'active',
+      targetLabel: 'Rec C', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_rec_c_brain' },
+    } as const;
+
+    const { ApiError } = await import('../src/api.js');
+    discoverSharedEntriesMock.mockResolvedValue([entryA, entryB, entryC]);
+    openSharedEntryMock.mockImplementation(async (target: { sessionName?: string }) => {
+      if (target.sessionName === 'deck_rec_b_brain') {
+        throw new ApiError(403, JSON.stringify({ error: 'forbidden', reason: 'share-target-unavailable' }));
+      }
+      const idMap: Record<string, { id: string; role: 'participant' | 'viewer'; label: string }> = {
+        deck_rec_a_brain: { id: 'share-rec-a', role: 'participant', label: 'Rec A' },
+        deck_rec_c_brain: { id: 'share-rec-c', role: 'viewer', label: 'Rec C' },
+      };
+      const meta = idMap[target.sessionName ?? 'deck_rec_a_brain']!;
+      return {
+        server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+        target: { kind: 'main', serverId: 'srv-shared', sessionName: target.sessionName },
+        coverage: {
+          effectiveRole: meta.role, historyCutoffAt: 0, nextCoverageRecheckAt: null,
+          coveringShareIds: [meta.id], primaryShareId: meta.id, authorizedAt: Date.now(),
+        },
+        sessions: [{ sessionName: target.sessionName, title: meta.label, state: 'idle', agentType: 'codex-sdk' }],
+        subSessions: [],
+      };
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/server/srv-shared/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId('server-icon-srv-shared'));
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_rec_a_brain?shared=share-rec-a'));
+
+    // Now revoke A on the server; B is still listed but returns 403 target-unavailable; C is valid
+    discoverSharedEntriesMock.mockResolvedValue([entryB, entryC]);
+    fireEvent.click(screen.getByTitle('share.sharedWithMe.refresh'));
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_rec_c_brain?shared=share-rec-c'));
+    expect(screen.queryByText('tabs-select-deck_rec_a_brain')).toBeNull();
+    expect(screen.queryByText('tabs-select-deck_rec_b_brain')).toBeNull();
+    expect(screen.getByText('tabs-select-deck_rec_c_brain')).toBeTruthy();
+
+    // Now revoke C too (0 grants left on srv-shared) -> safely exits shared server back to return server
+    discoverSharedEntriesMock.mockResolvedValue([]);
+    fireEvent.click(screen.getByTitle('share.sharedWithMe.refresh'));
+    await waitFor(() => expect(window.location.hash).not.toContain('srv-shared'));
+    await waitFor(() => expect(wsInstances.at(-1)?.options?.shareTarget ?? null).toBeNull());
+  }, 20_000);
+
+  it('App merged shared server: keeps authoritative participant coverage on overlapping server+main and locks parent SessionPane on subsession open', async () => {
+    useSubSessionsState.enableReactiveHydrateShared = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const mainViewer = {
+      id: 'share-main-v', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'viewer', status: 'active',
+      targetLabel: 'Main V', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_role_brain' },
+    } as const;
+    const subParticipant = {
+      id: 'share-sub-p', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'participant', status: 'active',
+      targetLabel: 'Sub P', target: { kind: 'subsession', serverId: 'srv-shared', subSessionId: 'sub_role_1' },
+      agentType: 'codex-sdk', parentSessionName: 'deck_role_brain',
+    } as const;
+    const mainOverlap = {
+      id: 'share-overlap-v', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'viewer', status: 'active',
+      targetLabel: 'Overlap V', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_overlap_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([mainViewer, subParticipant, mainOverlap]);
+
+    openSharedEntryMock.mockImplementation(async (target: { kind: string; sessionName?: string; subSessionId?: string }) => {
+      if (target.kind === 'main' && target.sessionName === 'deck_overlap_brain') {
+        // Overlapping whole-server participant + narrow main viewer: open returns authoritative participant
+        return {
+          server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+          target: mainOverlap.target,
+          coverage: {
+            effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+            coveringShareIds: [mainOverlap.id], primaryShareId: mainOverlap.id, authorizedAt: Date.now(),
+          },
+          sessions: [{ sessionName: 'deck_overlap_brain', title: 'Overlap V', state: 'running', agentType: 'claude-code' }],
+          subSessions: [],
+        };
+      }
+      if (target.kind === 'main') {
+        return {
+          server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+          target: mainViewer.target,
+          coverage: {
+            effectiveRole: 'viewer', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+            coveringShareIds: [mainViewer.id], primaryShareId: mainViewer.id, authorizedAt: Date.now(),
+          },
+          sessions: [{ sessionName: 'deck_role_brain', title: 'Main V', state: 'running', agentType: 'claude-code' }],
+          subSessions: [],
+        };
+      }
+      return {
+        server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+        target: subParticipant.target,
+        coverage: {
+          effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+          coveringShareIds: [subParticipant.id], primaryShareId: subParticipant.id, authorizedAt: Date.now(),
+        },
+        sessions: [{ sessionName: 'deck_role_brain', title: 'Main V', state: 'running', agentType: 'claude-code' }],
+        subSessions: [{ subSessionId: 'sub_role_1', sessionName: 'deck_sub_sub_role_1', title: 'Sub P', type: 'codex-sdk', parentSessionName: 'deck_role_brain' }],
+      };
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/server/srv-shared/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    // Open mainOverlap where narrow discovery says viewer but server coverage returns participant
+    fireEvent.click((await screen.findAllByText('Overlap V'))[0]!.closest('button')!);
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_overlap_brain?shared=share-overlap-v'));
+    // Must preserve authoritative 'participant' on SessionPane (never downgraded to mainOverlap's 'viewer')
+    expect(screen.getByTestId('session-pane-deck_overlap_brain').getAttribute('data-share-role')).toBe('participant');
+
+    // Switch to mainViewer (viewer), then open child subsession participant grant: sub-window is participant, parent SessionPane MUST lock to viewer!
+    fireEvent.click(screen.getByText('tabs-select-deck_role_brain'));
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_role_brain?shared=share-main-v'));
+    expect(screen.getByTestId('session-pane-deck_role_brain').getAttribute('data-share-role')).toBe('viewer');
+
+    fireEvent.click(screen.getByText('tree-select-sub-sub_role_1'));
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_role_brain?shared=share-sub-p'));
+    const subWin = await screen.findByTestId('sub-session-window-sub_role_1');
+    expect(subWin.getAttribute('data-share-role')).toBe('participant');
+    expect(screen.getByTestId('session-pane-deck_role_brain').getAttribute('data-share-role')).toBe('viewer');
   }, 20_000);
 
   it('keeps cached tabs on early REST [] until authoritative WS session_list, and rejects late REST rollback after WS [A,C] and rapid A->B->A switch', async () => {

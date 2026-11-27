@@ -9,6 +9,12 @@ function shareRoleRank(role: ShareRole): number {
   return role === 'participant' ? 2 : 1;
 }
 
+function maxShareRole(a: ShareRole | null | undefined, b: ShareRole | null | undefined): ShareRole {
+  const rankA = a ? shareRoleRank(a) : 0;
+  const rankB = b ? shareRoleRank(b) : 0;
+  return Math.max(rankA, rankB) >= 2 ? 'participant' : 'viewer';
+}
+
 function shareEntryPriorityRank(entry: SharedEntrySummary): number {
   if (entry.target.kind === 'server') return 30;
   return (entry.role === 'participant' ? 20 : 10) + (entry.target.kind === 'main' ? 2 : 1);
@@ -26,9 +32,14 @@ export function isActiveRestrictedSharedServer(params: {
 export function filterActiveSharedEntriesForServer(
   entries: readonly SharedEntrySummary[],
   serverId: string | null | undefined,
+  excludedEntryIds?: ReadonlySet<string>,
 ): SharedEntrySummary[] {
   if (!serverId) return [];
-  return entries.filter((entry) => entry.status === 'active' && entry.serverId === serverId);
+  return entries.filter(
+    (entry) => entry.status === 'active'
+      && entry.serverId === serverId
+      && !excludedEntryIds?.has(entry.id),
+  );
 }
 
 /**
@@ -41,8 +52,9 @@ export function findSharedEntryForServerTab(
   serverId: string | null | undefined,
   sessionName: string,
   subSessions?: readonly SubSession[],
+  excludedEntryIds?: ReadonlySet<string>,
 ): SharedEntrySummary | null {
-  const active = filterActiveSharedEntriesForServer(entries, serverId);
+  const active = filterActiveSharedEntriesForServer(entries, serverId, excludedEntryIds);
   let bestMain: SharedEntrySummary | null = null;
   for (const entry of active) {
     if (entry.target.kind !== 'main' || entry.target.sessionName !== sessionName) continue;
@@ -74,8 +86,9 @@ export function findSharedEntryForServerSubSession(
   entries: readonly SharedEntrySummary[],
   serverId: string | null | undefined,
   subSessionId: string,
+  excludedEntryIds?: ReadonlySet<string>,
 ): SharedEntrySummary | null {
-  const active = filterActiveSharedEntriesForServer(entries, serverId);
+  const active = filterActiveSharedEntriesForServer(entries, serverId, excludedEntryIds);
   let best: SharedEntrySummary | null = null;
   for (const entry of active) {
     if (entry.target.kind !== 'subsession' || entry.target.subSessionId !== subSessionId) continue;
@@ -96,8 +109,9 @@ export function resolvePreferredSharedEntryForServer(
   serverId: string | null | undefined,
   preferredEntryId: string | null | undefined,
   fallbackEntry?: SharedEntrySummary | null,
+  excludedEntryIds?: ReadonlySet<string>,
 ): SharedEntrySummary | null {
-  const active = filterActiveSharedEntriesForServer(entries, serverId);
+  const active = filterActiveSharedEntriesForServer(entries, serverId, excludedEntryIds);
   if (active.length === 0) return null;
   if (preferredEntryId) {
     const remembered = active.find((entry) => entry.id === preferredEntryId);
@@ -128,16 +142,30 @@ export function resolveRestrictedSubSessionClick(params: {
   isOwnedServer: boolean;
   activeTarget: ShareTarget | null;
   activeEntryId: string | null;
+  activeCoverageRole?: ShareRole | null;
   subSessionId: string;
   subSessions: readonly SubSession[];
+  excludedEntryIds?: ReadonlySet<string>;
 }): { action: 'local' } | { action: 'open'; entry: SharedEntrySummary; openSubSessionId?: string } {
-  const { entries, serverId, isOwnedServer, activeTarget, activeEntryId, subSessionId, subSessions } = params;
+  const {
+    entries,
+    serverId,
+    isOwnedServer,
+    activeTarget,
+    activeEntryId,
+    activeCoverageRole,
+    subSessionId,
+    subSessions,
+    excludedEntryIds,
+  } = params;
   if (!serverId || !isActiveRestrictedSharedServer({ serverId, isOwnedServer, activeTarget })) {
     return { action: 'local' };
   }
   const sub = subSessions.find((item) => item.id === subSessionId);
-  const directSubEntry = findSharedEntryForServerSubSession(entries, serverId, subSessionId);
-  const activeRole: ShareRole = entries.find((entry) => entry.id === activeEntryId)?.role ?? 'viewer';
+  const directSubEntry = findSharedEntryForServerSubSession(entries, serverId, subSessionId, excludedEntryIds);
+  const activeRole: ShareRole = activeCoverageRole
+    ?? entries.find((entry) => entry.id === activeEntryId)?.role
+    ?? 'viewer';
 
   const alreadyOnDirectSub = Boolean(
     directSubEntry
@@ -158,7 +186,7 @@ export function resolveRestrictedSubSessionClick(params: {
     return { action: 'open', entry: directSubEntry };
   }
   if (sub?.parentSession) {
-    const parentEntry = findSharedEntryForServerTab(entries, serverId, sub.parentSession, subSessions);
+    const parentEntry = findSharedEntryForServerTab(entries, serverId, sub.parentSession, subSessions, excludedEntryIds);
     if (parentEntry) {
       return { action: 'open', entry: parentEntry, openSubSessionId: subSessionId };
     }
@@ -199,20 +227,34 @@ export function mergeSharedServerSessions(params: {
   serverId: string | null | undefined;
   isOwnedServer: boolean;
   activeTarget: ShareTarget | null;
+  activeCoverageRole?: ShareRole | null;
   sharedEntries: readonly SharedEntrySummary[];
+  activeEntryRevoked?: boolean;
+  excludedEntryIds?: ReadonlySet<string>;
   liveSessions: readonly SessionInfo[];
   cachedSessions?: ReadonlyMap<string, SessionInfo>;
 }): SessionInfo[] {
-  const { serverId, isOwnedServer, activeTarget, sharedEntries, liveSessions, cachedSessions } = params;
+  const {
+    serverId,
+    isOwnedServer,
+    activeTarget,
+    activeCoverageRole,
+    sharedEntries,
+    activeEntryRevoked,
+    excludedEntryIds,
+    liveSessions,
+    cachedSessions,
+  } = params;
   if (!isActiveRestrictedSharedServer({ serverId, isOwnedServer, activeTarget })) {
     return [...liveSessions];
   }
-  const activeEntries = filterActiveSharedEntriesForServer(sharedEntries, serverId);
+  const activeEntries = filterActiveSharedEntriesForServer(sharedEntries, serverId, excludedEntryIds);
   if (activeEntries.length === 0) {
-    return [...liveSessions];
+    // Only evict live rows when the current entry was confirmed revoked/denied;
+    // a temporarily empty discovery inventory during direct URL restore must
+    // preserve the opened session returned by /api/shares/open.
+    return activeEntryRevoked && activeTarget !== null ? [] : [...liveSessions];
   }
-  // If the user has an active full-server share and hasn't explicitly narrowed to a
-  // single tab share, avoid duplicating/synthesizing tabs over full server WS state.
   if (activeTarget === null && activeEntries.some((entry) => entry.target.kind === 'server')) {
     return [...liveSessions];
   }
@@ -238,32 +280,52 @@ export function mergeSharedServerSessions(params: {
   const merged: SessionInfo[] = [];
   const seenNames = new Set<string>();
 
-  const applyMainGrantOverlay = (session: SessionInfo, entry: SharedEntrySummary): SessionInfo => {
-    if (!session.sharedState || session.sharedState.targetKind === 'main') {
-      const updatedSharedState: SharedStateSummary = session.sharedState
-        ? { ...session.sharedState, effectiveRole: entry.role, scopeLabel: entry.targetLabel }
-        : {
-            targetKind: 'main',
-            effectiveRole: entry.role,
-            status: 'active',
-            scopeLabel: entry.targetLabel,
-            activeDispatchId: null,
-          };
-      return { ...session, sharedState: updatedSharedState };
-    }
-    return session;
+  const applyMainGrantOverlay = (
+    session: SessionInfo,
+    entry: SharedEntrySummary,
+    isLiveSession: boolean,
+  ): SessionInfo => {
+    // For the currently opened main target, preserve the server's authoritative
+    // merged coverage role (e.g. an overlapping server participant + main viewer
+    // grant must NOT be downgraded to the narrow main entry's viewer role).
+    const isAuthoritativeActiveMain = isLiveSession && (
+      activeTarget?.kind === 'main' && activeTarget.sessionName === session.name
+    );
+    const effectiveRole: ShareRole = isAuthoritativeActiveMain
+      ? maxShareRole(activeCoverageRole ?? session.sharedState?.effectiveRole, entry.role)
+      : entry.role;
+    const nextSharedState: SharedStateSummary = session.sharedState
+      ? {
+          ...session.sharedState,
+          effectiveRole,
+          scopeLabel: isAuthoritativeActiveMain
+            ? (session.sharedState.scopeLabel ?? entry.targetLabel)
+            : entry.targetLabel,
+        }
+      : {
+          targetKind: 'main',
+          effectiveRole,
+          status: 'active',
+          scopeLabel: entry.targetLabel,
+          activeDispatchId: null,
+        };
+    return { ...session, sharedState: nextSharedState };
   };
 
   for (const [sessionName, entry] of bestMainGrants) {
     const live = liveByName.get(sessionName);
     if (live) {
-      merged.push(applyMainGrantOverlay(live, entry));
+      // While focused on a child `subsession`, the parent main session acts as a
+      // navigation container (`targetKind === 'subsession'`); keep its navigation
+      // grant badge while `SessionPane` binds pane write controls strictly to exact
+      // main/server authorization.
+      merged.push(applyMainGrantOverlay(live, entry, true));
       seenNames.add(sessionName);
       continue;
     }
     const cached = cachedSessions?.get(sessionName);
     if (cached) {
-      merged.push(applyMainGrantOverlay(cached, entry));
+      merged.push(applyMainGrantOverlay(cached, entry, false));
       seenNames.add(sessionName);
       continue;
     }
@@ -338,16 +400,27 @@ export function mergeSharedServerSubSessions(params: {
   isOwnedServer: boolean;
   activeTarget: ShareTarget | null;
   sharedEntries: readonly SharedEntrySummary[];
+  activeEntryRevoked?: boolean;
+  excludedEntryIds?: ReadonlySet<string>;
   liveSubSessions: readonly SubSession[];
   cachedSubSessions?: ReadonlyMap<string, SubSession>;
 }): SubSession[] {
-  const { serverId, isOwnedServer, activeTarget, sharedEntries, liveSubSessions, cachedSubSessions } = params;
+  const {
+    serverId,
+    isOwnedServer,
+    activeTarget,
+    sharedEntries,
+    activeEntryRevoked,
+    excludedEntryIds,
+    liveSubSessions,
+    cachedSubSessions,
+  } = params;
   if (!isActiveRestrictedSharedServer({ serverId, isOwnedServer, activeTarget }) || !serverId) {
     return [...liveSubSessions];
   }
-  const activeEntries = filterActiveSharedEntriesForServer(sharedEntries, serverId);
+  const activeEntries = filterActiveSharedEntriesForServer(sharedEntries, serverId, excludedEntryIds);
   if (activeEntries.length === 0) {
-    return [...liveSubSessions];
+    return activeEntryRevoked && activeTarget !== null ? [] : [...liveSubSessions];
   }
   if (activeTarget === null && activeEntries.some((entry) => entry.target.kind === 'server')) {
     return [...liveSubSessions];
@@ -355,26 +428,21 @@ export function mergeSharedServerSubSessions(params: {
 
   const bestMainGrants = buildBestMainGrantMap(activeEntries);
   const bestSubGrants = buildBestSubGrantMap(activeEntries);
+  const liveById = new Map<string, SubSession>();
+  for (const live of liveSubSessions) {
+    liveById.set(live.id, live);
+  }
+
   const merged: SubSession[] = [];
   const seenIds = new Set<string>();
 
-  for (const live of liveSubSessions) {
-    merged.push(live);
-    seenIds.add(live.id);
-  }
-
-  if (cachedSubSessions) {
-    for (const [subId, cached] of cachedSubSessions) {
-      if (seenIds.has(subId)) continue;
-      if (bestSubGrants.has(subId) || (cached.parentSession && bestMainGrants.has(cached.parentSession))) {
-        merged.push(cached);
-        seenIds.add(subId);
-      }
-    }
-  }
-
   for (const [subId, entry] of bestSubGrants) {
-    if (seenIds.has(subId)) continue;
+    const live = liveById.get(subId);
+    if (live) {
+      merged.push(live);
+      seenIds.add(subId);
+      continue;
+    }
     const cached = cachedSubSessions?.get(subId);
     if (cached) {
       merged.push(cached);
@@ -408,19 +476,56 @@ export function mergeSharedServerSubSessions(params: {
     seenIds.add(subId);
   }
 
+  for (const live of liveSubSessions) {
+    if (seenIds.has(live.id)) continue;
+    merged.push(live);
+    seenIds.add(live.id);
+  }
+
+  if (cachedSubSessions) {
+    for (const [subId, cached] of cachedSubSessions) {
+      if (seenIds.has(subId)) continue;
+      if (bestSubGrants.has(subId) || (cached.parentSession && bestMainGrants.has(cached.parentSession))) {
+        merged.push(cached);
+        seenIds.add(subId);
+      }
+    }
+  }
+
   return merged;
 }
 
 /**
+ * Extract sub-sessions on a restricted shared-in server whose parent is absent or
+ * not present among `sessions` (e.g. parentless sub-sessions, older servers omitting
+ * `parentSessionName`, or nested `deck_sub_*` sub-sessions without an outer main tab).
+ */
+export function getDirectSharedSubSessions(params: {
+  serverId: string | null | undefined;
+  isOwnedServer: boolean;
+  activeTarget: ShareTarget | null;
+  sessions: readonly SessionInfo[];
+  subSessions: readonly SubSession[];
+}): SubSession[] {
+  if (!isActiveRestrictedSharedServer(params)) return [];
+  const mainNames = new Set(params.sessions.map((session) => session.name));
+  return params.subSessions.filter(
+    (sub) => !sub.parentSession || !mainNames.has(sub.parentSession),
+  );
+}
+
+/**
  * Overlay direct `subsession` grant badges (`viewer` vs `participant`) onto
- * sub-sessions on an active restricted shared server while preserving any
- * owner-managed share indicators when present.
+ * sub-sessions on an active restricted shared server while preserving the
+ * authoritative opened coverage role on covered targets.
  */
 export function buildSharedServerSubSessionStates(params: {
   serverId: string | null | undefined;
   isOwnedServer: boolean;
   activeTarget: ShareTarget | null;
+  activeCoverageRole?: ShareRole | null;
   sharedEntries: readonly SharedEntrySummary[];
+  excludedEntryIds?: ReadonlySet<string>;
   subSessions: readonly SubSession[];
   baseStates: ReadonlyMap<string, SharedStateSummary>;
   activeDispatchIds: ReadonlyMap<string, string>;
@@ -433,16 +538,36 @@ export function buildSharedServerSubSessionStates(params: {
   })) {
     return states;
   }
-  const activeEntries = filterActiveSharedEntriesForServer(params.sharedEntries, params.serverId);
+  const activeEntries = filterActiveSharedEntriesForServer(
+    params.sharedEntries,
+    params.serverId,
+    params.excludedEntryIds,
+  );
   const bestSubGrants = buildBestSubGrantMap(activeEntries);
   for (const sub of params.subSessions) {
     const grant = bestSubGrants.get(sub.id);
-    if (!grant) continue;
+    const isDirectActiveSub = params.activeTarget?.kind === 'subsession'
+      && params.activeTarget.subSessionId === sub.id;
+    const isCoveredByActiveMain = params.activeTarget?.kind === 'main'
+      && sub.parentSession === params.activeTarget.sessionName;
+
+    if (!grant && !isDirectActiveSub) continue;
+
+    let effectiveRole: ShareRole;
+    if (isDirectActiveSub) {
+      effectiveRole = maxShareRole(params.activeCoverageRole, grant?.role);
+    } else if (isCoveredByActiveMain) {
+      effectiveRole = maxShareRole(params.activeCoverageRole, grant?.role);
+    } else {
+      effectiveRole = grant!.role;
+    }
+
+    const existing = states.get(sub.id);
     const summary: SharedStateSummary = {
       targetKind: 'subsession',
-      effectiveRole: grant.role,
+      effectiveRole,
       status: 'active',
-      scopeLabel: grant.targetLabel,
+      scopeLabel: grant?.targetLabel ?? existing?.scopeLabel ?? sub.label ?? sub.type,
       activeDispatchId: params.activeDispatchIds.get(sub.sessionName) ?? null,
     };
     states.set(sub.id, summary);

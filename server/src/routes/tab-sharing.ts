@@ -114,6 +114,7 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
   let sessionState: string | null = null;
   let agentType: string | null = null;
   let parentSessionName: string | null = null;
+  let targetAvailable = false;
   if (share.target.kind === 'server') {
     const row = await db.queryOne<{ name: string; node_role: string | null; status: string | null; last_heartbeat_at: number | null }>(
       'SELECT name, node_role, status, last_heartbeat_at FROM servers WHERE id = $1',
@@ -122,6 +123,7 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     // A controlled server uses the same FK-backed grant store, but is consumed
     // only by /api/machines. Never turn it into a shared daemon/session entry.
     if (row?.node_role === NODE_ROLE.CONTROLLED) return null;
+    targetAvailable = Boolean(row);
     serverName = row?.name ?? null;
     targetLabel = row?.name ?? null;
     serverStatus = row?.status ?? null;
@@ -142,6 +144,7 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
         WHERE s.server_id = $1 AND s.name = $2`,
       [share.serverId, share.target.sessionName],
     );
+    targetAvailable = Boolean(row);
     serverName = row?.server_name ?? null;
     targetLabel = row?.label?.trim() || row?.project_name?.trim() || null;
     sessionState = row?.session_state ?? null;
@@ -154,15 +157,17 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
       label: string | null;
       type: string | null;
       parent_session: string | null;
+      closed_at: number | null;
       status: string | null;
       last_heartbeat_at: number | null;
     }>(
-      `SELECT sv.name AS server_name, ss.label, ss.type, ss.parent_session AS parent_session, sv.status, sv.last_heartbeat_at
+      `SELECT sv.name AS server_name, ss.label, ss.type, ss.parent_session AS parent_session, ss.closed_at AS closed_at, sv.status, sv.last_heartbeat_at
          FROM sub_sessions ss
          JOIN servers sv ON sv.id = ss.server_id
         WHERE ss.server_id = $1 AND ss.id = $2`,
       [share.serverId, share.target.subSessionId],
     );
+    targetAvailable = Boolean(row && row.closed_at == null);
     serverName = row?.server_name ?? null;
     targetLabel = row?.label?.trim() || row?.type?.trim() || null;
     agentType = row?.type ?? null;
@@ -178,8 +183,8 @@ async function recipientShareEntry(db: Env['DB'], share: Awaited<ReturnType<type
     targetRef: shareTargetRef(share.target),
     targetSessionName: shareTargetSessionName(share.target),
     role: share.role,
-    availability: 'available',
-    status: 'active',
+    availability: targetAvailable ? 'available' : 'unavailable',
+    status: targetAvailable ? 'active' : 'target-unavailable',
     targetLabel: targetLabel ?? fallbackTargetLabel(share),
     historyCutoffAt: 0,
     expiresAt: share.expiresAt,

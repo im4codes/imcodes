@@ -114,7 +114,60 @@ describe('GET /api/shares discovery metadata', () => {
     expect(byId.get('share-sub')).toMatchObject({
       agentType: 'codex-sdk',
       parentSessionName: 'deck_projA_brain',
+      status: 'active',
+      availability: 'available',
     });
     expect(byId.get('share-sub')?.sessionState).toBeUndefined();
+  });
+
+  it('marks closed sub-sessions and deleted main sessions as target-unavailable', async () => {
+    const { tabSharingRoutes } = await import('../src/routes/tab-sharing.js');
+    mockListActiveSharesForUser.mockResolvedValueOnce([
+      {
+        id: 'share-closed-sub',
+        serverId: 'srv-1',
+        target: { kind: 'subsession', serverId: 'srv-1', subSessionId: 'subClosed' },
+        role: 'participant',
+        expiresAt: 0,
+      },
+      {
+        id: 'share-deleted-main',
+        serverId: 'srv-1',
+        target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_gone_brain' },
+        role: 'viewer',
+        expiresAt: 0,
+      },
+    ]);
+
+    const queryOne = vi.fn(async (sql: string) => {
+      if (sql.includes('FROM sub_sessions ss')) {
+        return {
+          server_name: 'Server One',
+          label: 'Closed Sub',
+          type: 'shell',
+          parent_session: 'deck_projA_brain',
+          closed_at: 55_000,
+          status: 'online',
+          last_heartbeat_at: 123_456,
+        };
+      }
+      return null;
+    });
+
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      c.env = { DB: { queryOne } as never } as never;
+      await next();
+    });
+    app.route('/api', tabSharingRoutes);
+
+    const res = await app.request('/api/shares');
+    expect(res.status).toBe(200);
+    const body = await res.json() as {
+      shares: Array<{ id: string; status: string; availability: string }>;
+    };
+    const byId = new Map(body.shares.map((s) => [s.id, s]));
+    expect(byId.get('share-closed-sub')).toMatchObject({ status: 'target-unavailable', availability: 'unavailable' });
+    expect(byId.get('share-deleted-main')).toMatchObject({ status: 'target-unavailable', availability: 'unavailable' });
   });
 });

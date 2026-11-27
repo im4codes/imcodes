@@ -35,6 +35,8 @@ interface Props {
   serverId?: string | null;
   sessions: SessionInfo[];
   subSessions: SubSession[];
+  /** Direct/orphan/nested shared sub-sessions with no navigable main parent in `sessions`. */
+  directSharedSubSessions?: SubSession[];
   activeSession: string | null;
   /** Map<sessionName, unreadCount> — supplied by useUnreadCounts */
   unreadCounts: Map<string, number>;
@@ -218,6 +220,7 @@ function SessionTreeInner({
   serverId,
   sessions,
   subSessions,
+  directSharedSubSessions,
   activeSession,
   unreadCounts,
   idleFlashTokens,
@@ -294,10 +297,13 @@ function SessionTreeInner({
   };
 
   const allCollapsed = sessions.length > 0 && sessions.every(s => !expanded.has(s.name));
+  const directSubs = directSharedSubSessions ?? [];
+  const directSubIdSet = useMemo(() => new Set(directSubs.map((sub) => sub.id)), [directSubs]);
   const subSessionsByParent = useMemo(() => {
     const byParent = new Map<string, SubSession[]>();
     const unparented: SubSession[] = [];
     for (const sub of subSessions) {
+      if (directSubIdSet.has(sub.id)) continue;
       if (!sub.parentSession) {
         unparented.push(sub);
         continue;
@@ -307,11 +313,11 @@ function SessionTreeInner({
       else byParent.set(sub.parentSession, [sub]);
     }
     return { byParent, unparented };
-  }, [subSessions]);
+  }, [directSubIdSet, subSessions]);
   // Check if any session has subs
-  const hasSubs = subSessions.length > 0;
+  const hasSubs = subSessions.length > 0 || directSubs.length > 0;
 
-  if (sessions.length === 0) {
+  if (sessions.length === 0 && directSubs.length === 0) {
     return (
       <div class="session-tree-empty">
         {t('sidebar.noSessions', 'No sessions')}
@@ -344,28 +350,7 @@ function SessionTreeInner({
       </div>
 
       <div class="session-tree-scroll">
-      {sessions.map((session) => {
-        const sessionLabel = getSessionLabel(session);
-        const isActive = session.name === activeSession;
-        const isTransport = isTransportRuntime(session);
-        const unread = unreadCounts.get(session.name) ?? 0;
-        const idleFlashToken = idleFlashTokens?.get(session.name) ?? 0;
-
-        // Sub-sessions belonging to this main session. Unparented legacy
-        // entries remain visible under every main session, matching the old
-        // `filter(!parentSession || parentSession === session.name)` behavior
-        // without doing an O(main sessions * sub-sessions) scan each render.
-        const parentedChildren = subSessionsByParent.byParent.get(session.name) ?? [];
-        const children = subSessionsByParent.unparented.length > 0
-          ? [...parentedChildren, ...subSessionsByParent.unparented]
-          : parentedChildren;
-        // Execution clones never render as flat peers — split them into per-run
-        // groups; ordinary sub-sessions still render flat as before.
-        const { normalSubs, cloneGroups } = splitChildren(children);
-        const isCollapsed = !expanded.has(session.name);
-
-        // Render a single sub-session node (shared by the flat list and the
-        // execution-clone groups).
+      {(() => {
         const renderSubNode = (sub: SubSession) => {
           const subLabel = sub.label ? formatLabel(sub.label) : sub.type;
           const subUnread = unreadCounts.get(sub.sessionName) ?? 0;
@@ -387,81 +372,113 @@ function SessionTreeInner({
             />
           );
         };
-
         return (
-          <div key={session.name} role="treeitem" aria-expanded={!isCollapsed && children.length > 0}>
-            {/* Main session node with collapse toggle */}
-            <div class="session-tree-main-row">
-              {children.length > 0 && (
-                <button
-                  type="button"
-                  class="session-tree-toggle"
-                  onClick={(e) => { e.stopPropagation(); toggleCollapse(session.name); }}
-                  title={isCollapsed ? 'Expand' : 'Collapse'}
-                >
-                  {isCollapsed ? '▸' : '▾'}
-                </button>
-              )}
-              <SessionNode
-                label={sessionLabel}
-                agentType={session.agentType}
-                state={session.state}
-                isActive={isActive}
-                isTransport={isTransport}
-                isSub={false}
-                unread={unread}
-                idleFlashToken={idleFlashToken}
-                sharedState={session.sharedState}
-                inP2p={!!p2pSessionLabels?.has(session.name)}
-                onClick={() => onSelectSession(session.name)}
-              />
-              {onNewSubSession && (
-                <button
-                  type="button"
-                  class="session-tree-add-sub-btn"
-                  onClick={(e) => { e.stopPropagation(); onSelectSession(session.name); onNewSubSession(); }}
-                  title={t('session.new_sub', 'New sub-session')}
-                >+</button>
-              )}
-            </div>
+          <>
+            {sessions.map((session) => {
+              const sessionLabel = getSessionLabel(session);
+              const isActive = session.name === activeSession;
+              const isTransport = isTransportRuntime(session);
+              const unread = unreadCounts.get(session.name) ?? 0;
+              const idleFlashToken = idleFlashTokens?.get(session.name) ?? 0;
 
-            {/* Ordinary sub-session nodes (indented) — hidden when collapsed */}
-            {!isCollapsed && normalSubs.map((sub) => renderSubNode(sub))}
+              // Sub-sessions belonging to this main session. Unparented legacy
+              // entries remain visible under every main session, matching the old
+              // `filter(!parentSession || parentSession === session.name)` behavior
+              // without doing an O(main sessions * sub-sessions) scan each render.
+              const parentedChildren = subSessionsByParent.byParent.get(session.name) ?? [];
+              const children = subSessionsByParent.unparented.length > 0
+                ? [...parentedChildren, ...subSessionsByParent.unparented]
+                : parentedChildren;
+              // Execution clones never render as flat peers — split them into per-run
+              // groups; ordinary sub-sessions still render flat as before.
+              const { normalSubs, cloneGroups } = splitChildren(children);
+              const isCollapsed = !expanded.has(session.name);
 
-            {/* Execution-clone groups: collapsed per-parent-run sections. Never
-                flat peers. Each group toggles independently of the main row. */}
-            {!isCollapsed && cloneGroups.map((group) => {
-              const groupKey = cloneGroupKey(session.name, group.parentRunId);
-              // Default state for clone groups is COLLAPSED. We track EXPANDED
-              // groups in a separate set so the default (no entry) reads as
-              // collapsed without seeding the shared `collapsed` set.
-              const isGroupCollapsed = !openCloneGroups.has(groupKey);
               return (
-                <div key={groupKey} class="session-tree-clone-group" role="group">
-                  <button
-                    type="button"
-                    class="session-tree-toggle session-tree-clone-group-toggle"
-                    onClick={(e) => { e.stopPropagation(); toggleCloneGroup(groupKey); }}
-                    title={isGroupCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
-                    aria-expanded={!isGroupCollapsed}
-                  >
-                    <span aria-hidden="true">{isGroupCollapsed ? '▸' : '▾'}</span>
-                    <span class="session-tree-clone-group-label">
-                      {t('session.executionGroup.title', 'Execution workers (run {{run}})', {
-                        run: group.parentRunId === 'unknown'
-                          ? t('session.executionGroup.unknownRun', 'pending')
-                          : group.parentRunId.slice(0, 8),
-                      })}
-                    </span>
-                    <span class="session-tree-clone-group-count">{group.clones.length}</span>
-                  </button>
-                  {!isGroupCollapsed && group.clones.map((sub) => renderSubNode(sub))}
+                <div key={session.name} role="treeitem" aria-expanded={!isCollapsed && children.length > 0}>
+                  {/* Main session node with collapse toggle */}
+                  <div class="session-tree-main-row">
+                    {children.length > 0 && (
+                      <button
+                        type="button"
+                        class="session-tree-toggle"
+                        onClick={(e) => { e.stopPropagation(); toggleCollapse(session.name); }}
+                        title={isCollapsed ? 'Expand' : 'Collapse'}
+                      >
+                        {isCollapsed ? '▸' : '▾'}
+                      </button>
+                    )}
+                    <SessionNode
+                      label={sessionLabel}
+                      agentType={session.agentType}
+                      state={session.state}
+                      isActive={isActive}
+                      isTransport={isTransport}
+                      isSub={false}
+                      unread={unread}
+                      idleFlashToken={idleFlashToken}
+                      sharedState={session.sharedState}
+                      inP2p={!!p2pSessionLabels?.has(session.name)}
+                      onClick={() => onSelectSession(session.name)}
+                    />
+                    {onNewSubSession && (
+                      <button
+                        type="button"
+                        class="session-tree-add-sub-btn"
+                        onClick={(e) => { e.stopPropagation(); onSelectSession(session.name); onNewSubSession(); }}
+                        title={t('session.new_sub', 'New sub-session')}
+                      >+</button>
+                    )}
+                  </div>
+
+                  {/* Ordinary sub-session nodes (indented) — hidden when collapsed */}
+                  {!isCollapsed && normalSubs.map((sub) => renderSubNode(sub))}
+
+                  {/* Execution-clone groups: collapsed per-parent-run sections. Never
+                      flat peers. Each group toggles independently of the main row. */}
+                  {!isCollapsed && cloneGroups.map((group) => {
+                    const groupKey = cloneGroupKey(session.name, group.parentRunId);
+                    // Default state for clone groups is COLLAPSED. We track EXPANDED
+                    // groups in a separate set so the default (no entry) reads as
+                    // collapsed without seeding the shared `collapsed` set.
+                    const isGroupCollapsed = !openCloneGroups.has(groupKey);
+                    return (
+                      <div key={groupKey} class="session-tree-clone-group" role="group">
+                        <button
+                          type="button"
+                          class="session-tree-toggle session-tree-clone-group-toggle"
+                          onClick={(e) => { e.stopPropagation(); toggleCloneGroup(groupKey); }}
+                          title={isGroupCollapsed ? t('sidebar.expand_all', 'Expand all') : t('sidebar.collapse_all', 'Collapse all')}
+                          aria-expanded={!isGroupCollapsed}
+                        >
+                          <span aria-hidden="true">{isGroupCollapsed ? '▸' : '▾'}</span>
+                          <span class="session-tree-clone-group-label">
+                            {t('session.executionGroup.title', 'Execution workers (run {{run}})', {
+                              run: group.parentRunId === 'unknown'
+                                ? t('session.executionGroup.unknownRun', 'pending')
+                                : group.parentRunId.slice(0, 8),
+                            })}
+                          </span>
+                          <span class="session-tree-clone-group-count">{group.clones.length}</span>
+                        </button>
+                        {!isGroupCollapsed && group.clones.map((sub) => renderSubNode(sub))}
+                      </div>
+                    );
+                  })}
                 </div>
               );
             })}
-          </div>
+            {directSubs.length > 0 && (
+              <div class="session-tree-direct-shared" role="group" data-testid="session-tree-direct-shared">
+                <div class="session-tree-direct-shared-header">
+                  {t('share.sharedWithMe.directSubSessions', 'Shared sub-sessions')}
+                </div>
+                {directSubs.map((sub) => renderSubNode(sub))}
+              </div>
+            )}
+          </>
         );
-      })}
+      })()}
       </div>
       {resizable && (
         <div

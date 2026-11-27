@@ -635,6 +635,16 @@ describe('tab sharing APIs', () => {
     expect(subEntry.sessionState).toBeUndefined();
     expect(subEntry.agentType).toBe('shell');
     expect(subEntry.parentSessionName).toBe(sessionName);
+
+    // Closed subsession must report target-unavailable in discovery instead of active
+    await updateSubSession(db, subSessionId, { closedAt: Date.now() });
+    const discoverAfterClose = await app.request('/api/shares', { headers: authHeaders(recipientId) });
+    expect(discoverAfterClose.status).toBe(200);
+    const closedBody = await discoverAfterClose.json() as {
+      shares: Array<{ target: { kind: string }; status: string; availability: string }>;
+    };
+    const closedSub = closedBody.shares.find((s) => s.target.kind === 'subsession');
+    expect(closedSub).toMatchObject({ status: 'target-unavailable', availability: 'unavailable' });
   });
 
   it('opens a shared sub-session with its parent main session for tree rendering', async () => {

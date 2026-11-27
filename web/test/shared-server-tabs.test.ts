@@ -6,6 +6,7 @@ import {
   buildSharedServerSubSessionStates,
   findSharedEntryForServerSubSession,
   findSharedEntryForServerTab,
+  getDirectSharedSubSessions,
   mergeSharedServerSessions,
   mergeSharedServerSubSessions,
   resolvePreferredSharedEntryForServer,
@@ -319,5 +320,96 @@ describe('shared-server-tabs projection & routing', () => {
       subSessionId: 'subB',
       subSessions: [childViewer, otherParentChild],
     })).toEqual({ action: 'open', entry: mainB, openSubSessionId: 'subB' });
+  });
+
+  it('surfaces parentless, legacy-omitted, and nested deck_sub_* subsession shares via getDirectSharedSubSessions', () => {
+    const orphanSub = makeSubEntry({
+      id: 'g-orphan',
+      subSessionId: 'subOrphan',
+      role: 'participant',
+      targetLabel: 'Orphan Sub',
+    });
+    const nestedSub = makeSubEntry({
+      id: 'g-nested',
+      subSessionId: 'subNested',
+      role: 'viewer',
+      targetLabel: 'Nested Sub',
+      parentSessionName: 'deck_sub_parentOnly',
+    });
+
+    const mergedSessions = mergeSharedServerSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'subsession', serverId: 'srv-shared', subSessionId: 'subOrphan' },
+      sharedEntries: [orphanSub, nestedSub],
+      liveSessions: [],
+    });
+    expect(mergedSessions).toEqual([]);
+
+    const mergedSubs = mergeSharedServerSubSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'subsession', serverId: 'srv-shared', subSessionId: 'subOrphan' },
+      sharedEntries: [orphanSub, nestedSub],
+      liveSubSessions: [],
+    });
+    expect(mergedSubs.map((s) => s.id)).toEqual(['subOrphan', 'subNested']);
+
+    const directSubs = getDirectSharedSubSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'subsession', serverId: 'srv-shared', subSessionId: 'subOrphan' },
+      sessions: mergedSessions,
+      subSessions: mergedSubs,
+    });
+    expect(directSubs.map((s) => s.id)).toEqual(['subOrphan', 'subNested']);
+  });
+
+  it('preserves authoritative participant coverage over narrower overlapping viewer grant and evicts on empty loaded discovery', () => {
+    const narrowViewer = makeMainEntry({ id: 'g-v', sessionName: 'deck_projA_brain', role: 'viewer' });
+    const liveAuthorized: SessionInfo = {
+      name: 'deck_projA_brain',
+      project: 'projA',
+      role: 'brain',
+      agentType: 'claude-code',
+      state: 'running',
+      sharedState: {
+        targetKind: 'main',
+        effectiveRole: 'participant',
+        status: 'active',
+        scopeLabel: 'Project A',
+      },
+    };
+
+    const mergedOverlapping = mergeSharedServerSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_projA_brain' },
+      activeCoverageRole: 'participant',
+      sharedEntries: [narrowViewer],
+      activeEntryRevoked: false,
+      liveSessions: [liveAuthorized],
+    });
+    expect(mergedOverlapping[0]?.sharedState?.effectiveRole).toBe('participant');
+
+    // When active entry is confirmed revoked and zero active grants remain, stale live rows are evicted
+    expect(mergeSharedServerSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_projA_brain' },
+      sharedEntries: [],
+      activeEntryRevoked: true,
+      liveSessions: [liveAuthorized],
+    })).toEqual([]);
+
+    // Excluded denied IDs are skipped in fallback resolution
+    const entryC = makeMainEntry({ id: 'g-c', sessionName: 'deck_projC_brain', role: 'viewer' });
+    expect(resolvePreferredSharedEntryForServer(
+      [narrowViewer, entryC],
+      'srv-shared',
+      'g-v',
+      narrowViewer,
+      new Set(['g-v']),
+    )?.id).toBe('g-c');
   });
 });

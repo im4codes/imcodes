@@ -1063,6 +1063,7 @@ export function useSubSessions(
     }
     const cache = new Map<string, boolean>();
     const isUnderActive = (s: SubSession): boolean => {
+      if (s.sessionName === activeSession || s.id === activeSession) return true;
       if (!s.parentSession) return true;
       const visited = new Set<string>();
       let cur: SubSession | undefined = s;
