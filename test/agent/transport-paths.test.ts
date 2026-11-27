@@ -254,21 +254,73 @@ describe('resolveCursorPathForSdk (cursor-agent and agent resolution)', () => {
       process.env.LOCALAPPDATA = tmpDir;
       process.env.USERPROFILE = tmpDir;
 
-      // Skips dir1 POSIX cursor-agent + broken cursor-agent.cmd, picks dir2 official agent.cmd -> 2026.11.22
+      // Skips dir1 POSIX cursor-agent + broken cursor-agent.cmd, picks dir2 official agent.cmd -> powershell.exe -File cursor-agent.ps1
+      const expectedPsSpec = {
+        executable: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+        prependArgs: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', agentPs1],
+      };
       expect(resolveCursorPathForSdk('cursor-agent')).toBe(agentCmd);
+      expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual(expectedPsSpec);
+
+      // When installer staged 2026.11.new alongside 2026.05 with promote-staged hook, official PowerShell entrypoint is preserved
+      const stagedNewDir = path.join(goodDir, 'versions', '2026.12.01-f1e2d3c.new');
+      fs.mkdirSync(stagedNewDir, { recursive: true });
+      fs.writeFileSync(path.join(stagedNewDir, 'node.exe'), 'staged node');
+      fs.writeFileSync(path.join(stagedNewDir, 'index.js'), 'console.log("staged");\n');
+      fs.writeFileSync(path.join(goodDir, 'versions', 'promote-staged.cmd'), '@echo off\r\nexit /b 0\r\n');
+      const ps1WithHook = [
+        '# cursor-agent-promote-staged',
+        '$promoteStaged = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) "versions\\promote-staged.cmd"',
+        'if (Test-Path -LiteralPath $promoteStaged) { & $promoteStaged }',
+        fs.readFileSync(agentPs1, 'utf8'),
+      ].join('\n');
+      fs.writeFileSync(agentPs1, ps1WithHook);
+      expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual(expectedPsSpec);
+
+      // Even if active.txt points to a missing version, static .ps1 launchability fails closed -> bad wrapper rejected
+      const activeTxt = path.join(goodDir, 'versions', 'active.txt');
+      fs.writeFileSync(activeTxt, '2099.01.01-missing\n');
+      expect(resolveCursorCmdLauncher(agentCmd)).toBeNull();
+      fs.unlinkSync(activeTxt);
+
+      // PATHEXT=.PS1;.EXE;.CMD with standalone cursor-agent.ps1 (no .cmd/.exe) must ignore .ps1 and match downstream agent.exe
+      const ps1OnlyDir = path.join(tmpDir, 'ps1-only');
+      const exeFallbackDir = path.join(tmpDir, 'exe-fallback');
+      fs.mkdirSync(ps1OnlyDir, { recursive: true });
+      fs.mkdirSync(exeFallbackDir, { recursive: true });
+      fs.writeFileSync(path.join(ps1OnlyDir, 'cursor-agent.ps1'), 'Write-Output "ps1"\n');
+      const fallbackExe = path.join(exeFallbackDir, 'agent.exe');
+      fs.writeFileSync(fallbackExe, 'fake exe');
+      process.env.PATHEXT = '.PS1;.EXE;.CMD';
+      process.env.PATH = ps1OnlyDir;
+      process.env.LOCALAPPDATA = path.join(tmpDir, 'empty-local');
+      process.env.USERPROFILE = path.join(tmpDir, 'empty-profile');
+      expect(resolveCursorPathForSdk('cursor-agent')).toBe('cursor-agent');
       expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual({
-        executable: newNode,
-        prependArgs: [newIndex],
+        executable: 'cursor-agent',
+        prependArgs: [],
+      });
+      process.env.PATH = `${ps1OnlyDir};${exeFallbackDir}`;
+      expect(resolveCursorPathForSdk('cursor-agent')).toBe(fallbackExe);
+      expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual({
+        executable: fallbackExe,
+        prependArgs: [],
       });
 
-      // Respects versions/active.txt version selection even when 2026.11 exists alongside 2026.05
-      const activeTxt = path.join(goodDir, 'versions', 'active.txt');
-      fs.writeFileSync(activeTxt, '2026.05.05-a1b2c3d\n');
+      // Explicit missing bundled node.exe (even with existing index.js) must reject the broken .cmd and continue search
+      const missingNodeDir = path.join(tmpDir, 'missing-node-cmd');
+      fs.mkdirSync(missingNodeDir, { recursive: true });
+      fs.writeFileSync(path.join(missingNodeDir, 'index.js'), 'console.log("orphan");\n');
+      const missingNodeCmd = path.join(missingNodeDir, 'cursor-agent.cmd');
+      fs.writeFileSync(missingNodeCmd, '"%~dp0missing\\node.exe" "%~dp0index.js" %*\r\n');
+      expect(resolveCursorCmdLauncher(missingNodeCmd)).toBeNull();
+      process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+      process.env.PATH = `${missingNodeDir};${exeFallbackDir}`;
+      expect(resolveCursorPathForSdk('cursor-agent')).toBe(fallbackExe);
       expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual({
-        executable: oldNode,
-        prependArgs: [oldIndex],
+        executable: fallbackExe,
+        prependArgs: [],
       });
-      fs.unlinkSync(activeTxt);
 
       // Preserves fixed argv flags (e.g. --use-system-ca) in native Cursor launcher without dropping them
       const fixedCmd = path.join(goodDir, 'agent-fixed.cmd');

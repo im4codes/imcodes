@@ -15,6 +15,7 @@ import { GROK_CLI_BINARY, GROK_CLI_PATH_ENV } from './providers/grok-sdk.js';
 import { PI_BINARY_ENV, PI_DEFAULT_BINARY } from './providers/pi/runtime.js';
 import {
   getBundledClaudeBinaryCandidates,
+  getSupportedCursorWindowsExts,
   getUnixCursorCandidateDirs,
   getWindowsCursorSearchDirs,
   resolveCursorCmdLauncher,
@@ -375,16 +376,13 @@ async function probeCursorHeadless(deps: AgentAvailabilityProbeDeps): Promise<Ag
     ...(deps.env.PATH ?? '').split(WIN_DELIMITER),
     ...winDirs,
   ]);
-  const pathext = uniqueNonEmpty(
-    (deps.env.PATHEXT ?? DEFAULT_PATHEXT)
-      .split(WIN_DELIMITER)
-      .flatMap((ext) => [ext.toLowerCase(), ext]),
-  );
-  // Only accept executable Windows extensions (.com/.exe/.bat/.cmd) — never extensionless POSIX scripts.
+  const pathext = getSupportedCursorWindowsExts(deps.env.PATHEXT);
+  // Only accept supported executable Windows extensions (.com/.exe/.bat/.cmd) — never extensionless POSIX scripts or raw .ps1.
   // For .cmd/.bat wrappers present on disk, verify Cursor wrapper resolution succeeds before reporting installed.
   for (const bin of ['cursor-agent', 'agent']) {
-    const hasKnownExt = pathext.some((ext) => bin.toLowerCase().endsWith(ext.toLowerCase()));
-    const fileNames = hasKnownExt ? [bin] : pathext.map((ext) => `${bin}${ext}`);
+    const fileNames = pathext.some((ext) => bin.toLowerCase().endsWith(ext.toLowerCase()))
+      ? [bin]
+      : pathext.map((ext) => `${bin}${ext}`);
     for (const dir of searchDirs) {
       for (const fileName of fileNames) {
         const candidate = p.join(dir, fileName);

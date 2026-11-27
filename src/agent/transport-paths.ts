@@ -585,14 +585,18 @@ function findExecutableOnUnixDirs(binName: string, extraDirs: string[]): string 
   return null;
 }
 
-function getWindowsExecutableExts(env: NodeJS.ProcessEnv = process.env): string[] {
-  const pathExtRaw = env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
-  return uniqueNonEmpty(pathExtRaw.split(';').flatMap((e) => [e.toLowerCase(), e]));
+const SUPPORTED_CURSOR_WIN_EXTS = new Set(['.com', '.exe', '.bat', '.cmd']);
+
+export function getSupportedCursorWindowsExts(pathExtRaw?: string): string[] {
+  const raw = pathExtRaw ?? '.COM;.EXE;.BAT;.CMD';
+  const filtered = uniqueNonEmpty(raw.split(';'))
+    .filter((ext) => SUPPORTED_CURSOR_WIN_EXTS.has(ext.toLowerCase()));
+  return uniqueNonEmpty(filtered.flatMap((ext) => [ext.toLowerCase(), ext]));
 }
 
 function listWindowsCandidateFilesInDir(dir: string, bin: string, exts: string[]): string[] {
-  const hasKnownExt = exts.some((ext) => bin.toLowerCase().endsWith(ext.toLowerCase()));
-  const names = hasKnownExt ? [bin] : exts.map((ext) => `${bin}${ext}`);
+  const hasSupportedExt = [...SUPPORTED_CURSOR_WIN_EXTS].some((ext) => bin.toLowerCase().endsWith(ext));
+  const names = hasSupportedExt ? [bin] : exts.map((ext) => `${bin}${ext}`);
   const out: string[] = [];
   for (const fileName of names) {
     const candidate = path.join(dir, fileName);
@@ -625,17 +629,18 @@ function splitCmdTokens(line: string): string[] {
 }
 
 function expandBatchString(rawValue: string, dp0: string, vars: Record<string, string>): string {
+  const resolveVar = (key: string): string | undefined => {
+    const upper = key.toUpperCase();
+    const direct = vars[upper] ?? process.env[key] ?? process.env[upper];
+    if (direct !== undefined) return direct;
+    if (upper === 'SYSTEMROOT') return 'C:\\Windows';
+    return undefined;
+  };
   const expanded = rawValue
     .replace(/%~dp0\\?/gi, `${dp0}${path.sep}`)
     .replace(/%dp0%[\\/]?/gi, `${dp0}${path.sep}`)
-    .replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (_m, key: string) => {
-      const upper = key.toUpperCase();
-      return vars[upper] ?? process.env[key] ?? process.env[upper] ?? _m;
-    })
-    .replace(/!([A-Za-z_][A-Za-z0-9_]*)!/g, (_m, key: string) => {
-      const upper = key.toUpperCase();
-      return vars[upper] ?? process.env[key] ?? process.env[upper] ?? _m;
-    });
+    .replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (m, key: string) => resolveVar(key) ?? m)
+    .replace(/!([A-Za-z_][A-Za-z0-9_]*)!/g, (m, key: string) => resolveVar(key) ?? m);
   return expanded;
 }
 
@@ -725,8 +730,9 @@ function resolveCursorPs1Launcher(ps1Path: string): ResolvedExecutable | null {
 
   const versionsDir = joinSmart(ps1Dir, 'versions');
   try {
-    const entries = readdirSync(versionsDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && CURSOR_PS1_VERSION_RE.test(entry.name))
+    const dirEntries = readdirSync(versionsDir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+    const entries = dirEntries
+      .filter((entry) => CURSOR_PS1_VERSION_RE.test(entry.name))
       .map((entry) => entry.name)
       .sort(compareCursorVersionDirsDesc);
     for (const ver of entries) {
@@ -735,6 +741,22 @@ function resolveCursorPs1Launcher(ps1Path: string): ResolvedExecutable | null {
       const verIndex = joinSmart(verDir, 'index.js');
       if (isRegularFileSync(verNode) && isRegularFileSync(verIndex)) {
         return { executable: verNode, prependArgs: [...fixedFlags, verIndex] };
+      }
+    }
+    // Also accept a staged `.new` update directory when the installer's promote-staged hook is armed.
+    const hasPromoteHook = /promote-staged\.cmd/i.test(content) && isRegularFileSync(joinSmart(versionsDir, 'promote-staged.cmd'));
+    if (hasPromoteHook) {
+      const stagedEntries = dirEntries
+        .filter((entry) => entry.name.endsWith('.new') && CURSOR_PS1_VERSION_RE.test(entry.name.slice(0, -4)))
+        .map((entry) => entry.name.slice(0, -4))
+        .sort(compareCursorVersionDirsDesc);
+      for (const ver of stagedEntries) {
+        const verDir = joinSmart(versionsDir, `${ver}.new`);
+        const verNode = joinSmart(verDir, 'node.exe');
+        const verIndex = joinSmart(verDir, 'index.js');
+        if (isRegularFileSync(verNode) && isRegularFileSync(verIndex)) {
+          return { executable: verNode, prependArgs: [...fixedFlags, verIndex] };
+        }
       }
     }
   } catch {
@@ -826,14 +848,20 @@ export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedEx
     const headBase = baseNameSmart(headRaw).toLowerCase();
 
     // Case A: official Cursor `.cmd` delegating to `%SystemRoot%\...\powershell.exe ... -File "<ps1>" %*`
+    // Preserve the system powershell.exe + `-File <ps1>` entrypoint so the installer's staged
+    // promote hook and `.ps1` active-version selection execute at spawn time while keeping argv array passing.
     if (headBase === 'powershell.exe' || headBase === 'powershell') {
       const fileFlagIdx = cmdTokens.findIndex((t) => /^-file$/i.test(t));
-      const ps1Raw = fileFlagIdx >= 0 ? cmdTokens[fileFlagIdx + 1] : cmdTokens.find((t) => /\.ps1$/i.test(t));
+      const ps1TokenIdx = fileFlagIdx >= 0 ? fileFlagIdx + 1 : cmdTokens.findIndex((t) => /\.ps1$/i.test(t));
+      const ps1Raw = ps1TokenIdx >= 0 ? cmdTokens[ps1TokenIdx] : undefined;
       if (ps1Raw) {
         const ps1Path = normalizeBatchPath(ps1Raw);
-        if (isRegularFileSync(ps1Path)) {
-          const ps1Resolved = resolveCursorPs1Launcher(ps1Path);
-          if (ps1Resolved) return ps1Resolved;
+        if (isRegularFileSync(ps1Path) && resolveCursorPs1Launcher(ps1Path)) {
+          const powershellExe = headRaw.includes('/') || headRaw.includes('\\')
+            ? path.win32.normalize(headRaw)
+            : headRaw;
+          const psArgs = cmdTokens.slice(1).map((tok, i) => (i + 1 === ps1TokenIdx ? ps1Path : tok));
+          return { executable: powershellExe, prependArgs: psArgs };
         }
       }
       continue;
@@ -845,10 +873,12 @@ export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedEx
       if (scriptIdx >= 1) {
         const scriptPath = normalizeBatchPath(cmdTokens[scriptIdx]!);
         if (isRegularFileSync(scriptPath)) {
-          const normHead = normalizeBatchPath(headRaw);
-          const nodeExe = headRaw.includes('/') || headRaw.includes('\\')
-            ? (isRegularFileSync(normHead) ? normHead : process.execPath)
-            : process.execPath;
+          const hasExplicitDir = headRaw.includes('/') || headRaw.includes('\\');
+          const explicitNode = normalizeBatchPath(headRaw);
+          if (hasExplicitDir && !isRegularFileSync(explicitNode)) {
+            continue;
+          }
+          const nodeExe = hasExplicitDir ? explicitNode : process.execPath;
           const fixedArgs = cmdTokens.slice(1, scriptIdx);
           return { executable: nodeExe, prependArgs: [...fixedArgs, scriptPath] };
         }
@@ -907,7 +937,7 @@ export function resolveCursorExecutableForSpawn(nameOrPath = 'cursor-agent'): Re
     return { executable: trimmed, prependArgs: [] };
   }
 
-  const exts = getWindowsExecutableExts();
+  const exts = getSupportedCursorWindowsExts(process.env.PATHEXT);
   const pathDirs = (process.env.PATH ?? '').split(';');
   const searchDirs = [...pathDirs, ...getWindowsCursorSearchDirs()];
   const bins = !trimmed || trimmed === 'cursor-agent' ? ['cursor-agent', 'agent'] : [trimmed];
@@ -942,7 +972,7 @@ export function resolveCursorPathForSdk(name = 'cursor-agent'): string {
     if (isAbsoluteSmart(trimmed) || hasPathSeparator(trimmed)) {
       return trimmed;
     }
-    const exts = getWindowsExecutableExts();
+    const exts = getSupportedCursorWindowsExts(process.env.PATHEXT);
     const pathDirs = (process.env.PATH ?? '').split(';');
     const searchDirs = [...pathDirs, ...getWindowsCursorSearchDirs()];
     const bins = trimmed === 'cursor-agent' ? ['cursor-agent', 'agent'] : [trimmed];

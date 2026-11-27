@@ -451,6 +451,54 @@ describe('CursorHeadlessProvider', () => {
       expect(spawned.file).toBe(fakeNode);
       expect(spawned.args.slice(0, 2)).toEqual(['--use-system-ca', fakeIndex]);
       expect(spawned.args.slice(-2)).toEqual(['--', 'hello windows']);
+
+      // Official .cmd -> .ps1 delegation with staged .new preserves system powershell.exe + -File argv,
+      // and broken explicit-missing-node.cmd falls through cleanly to downstream agent.exe.
+      const psDir = join(tmpRoot, 'official-ps');
+      const psVerOld = join(psDir, 'versions', '2026.05.05-a1b2c3d');
+      const psVerNew = join(psDir, 'versions', '2026.11.22-e9042b2.new');
+      mkdirSync(psVerOld, { recursive: true });
+      mkdirSync(psVerNew, { recursive: true });
+      writeFileSync(join(psVerOld, 'node.exe'), 'node');
+      writeFileSync(join(psVerOld, 'index.js'), 'ok');
+      writeFileSync(join(psVerNew, 'node.exe'), 'node');
+      writeFileSync(join(psVerNew, 'index.js'), 'ok');
+      writeFileSync(join(psDir, 'versions', 'promote-staged.cmd'), '@echo off\r\nexit /b 0\r\n');
+      const ps1File = join(psDir, 'cursor-agent.ps1');
+      writeFileSync(ps1File, [
+        '# cursor-agent-promote-staged',
+        '$promoteStaged = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) "versions\\promote-staged.cmd"',
+        'if (Test-Path -LiteralPath $promoteStaged) { & $promoteStaged }',
+        '$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition',
+        'function Parse-VersionString { param([string]$versionString) $p = $versionString.Split("-")[0].Split("."); return [int]($p[0] + $p[1].PadLeft(2,"0") + $p[2].PadLeft(2,"0")) }',
+        '$versionDir = Get-ChildItem -Path "$scriptPath\\versions"',
+        '& "$nodePath" "$scriptPath\\versions\\$versionName\\index.js" $args',
+      ].join('\n'));
+      writeFileSync(join(psDir, 'cursor-agent.cmd'), [
+        '@echo off',
+        'set "SCRIPT_DIR=%~dp0"',
+        'if "%SCRIPT_DIR:~-1%"=="\\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"',
+        '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\\cursor-agent.ps1" %*',
+      ].join('\r\n'));
+
+      const brokenNodeDir = join(tmpRoot, 'broken-node');
+      mkdirSync(brokenNodeDir, { recursive: true });
+      writeFileSync(join(brokenNodeDir, 'index.js'), 'console.log("x");\n');
+      writeFileSync(join(brokenNodeDir, 'cursor-agent.cmd'), '"%~dp0missing\\node.exe" "%~dp0index.js" %*\r\n');
+
+      process.env.PATH = `${brokenNodeDir};${psDir}`;
+      execCalls.length = 0;
+      const provider2 = new CursorHeadlessProvider();
+      await provider2.connect({});
+      const sid2 = await provider2.createSession({ sessionKey: 'route-win-ps1', cwd: tmpRoot });
+      await provider2.send(sid2, 'run via ps1 hook');
+
+      const expectedPsExe = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+      expect(execCalls.every((c) => c.file === expectedPsExe && c.args.slice(0, 4).join(' ') === `-NoProfile -ExecutionPolicy Bypass -File` && c.args[4] === ps1File)).toBe(true);
+      const psSpawn = harness.lastSpawn();
+      expect(psSpawn.file).toBe(expectedPsExe);
+      expect(psSpawn.args.slice(0, 5)).toEqual(['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1File]);
+      expect(psSpawn.args.slice(-2)).toEqual(['--', 'run via ps1 hook']);
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });
       process.env.PATH = origPath;

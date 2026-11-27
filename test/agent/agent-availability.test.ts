@@ -264,6 +264,44 @@ describe('detectInstalledAgents()', () => {
         },
       });
       expect(withGood['cursor-headless']?.installed).toBe(true);
+
+      // Standalone .ps1 under PATHEXT=.PS1;.EXE;.CMD + broken .cmd naming missing node.exe must BOTH be rejected
+      const ps1Dir = path.join(tmpRoot, 'ps1-only');
+      const missingNodeDir = path.join(tmpRoot, 'missing-node');
+      const exeDir = path.join(tmpRoot, 'exe-good');
+      await mkdir(ps1Dir, { recursive: true });
+      await mkdir(missingNodeDir, { recursive: true });
+      await mkdir(exeDir, { recursive: true });
+      await writeFile(path.join(ps1Dir, 'cursor-agent.ps1'), 'Write-Output "ps1"\n');
+      await writeFile(path.join(missingNodeDir, 'index.js'), 'console.log("x");\n');
+      await writeFile(path.join(missingNodeDir, 'cursor-agent.cmd'), '"%~dp0missing\\node.exe" "%~dp0index.js" %*\r\n');
+
+      const rejectedBadWrappers = await detectInstalledAgents({
+        forceRefresh: true,
+        deps: {
+          platform: 'win32',
+          env: { PATH: `${ps1Dir};${missingNodeDir}`, PATHEXT: '.PS1;.EXE;.CMD' },
+          homeDir: path.join(tmpRoot, 'empty-home'),
+          imcodesHomeDir: path.join(tmpRoot, '.imcodes'),
+          isExecutableFile: execCheck,
+          isProviderConnected: () => false,
+        },
+      });
+      expect(rejectedBadWrappers['cursor-headless']?.installed).toBe(false);
+
+      await writeFile(path.join(exeDir, 'agent.exe'), 'exe');
+      const recoveredWithExe = await detectInstalledAgents({
+        forceRefresh: true,
+        deps: {
+          platform: 'win32',
+          env: { PATH: `${ps1Dir};${missingNodeDir};${exeDir}`, PATHEXT: '.PS1;.EXE;.CMD' },
+          homeDir: path.join(tmpRoot, 'empty-home'),
+          imcodesHomeDir: path.join(tmpRoot, '.imcodes'),
+          isExecutableFile: execCheck,
+          isProviderConnected: () => false,
+        },
+      });
+      expect(recoveredWithExe['cursor-headless']?.installed).toBe(true);
     } finally {
       await rm(tmpRoot, { recursive: true, force: true });
     }
