@@ -33,7 +33,7 @@ import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '@shared/codex-credit-history.js';
 import type { ShareDenialReason, SharedActorEnvelope } from '@shared/tab-sharing.js';
-import type { ShareTarget } from './tab-sharing-ui.js';
+import type { ShareRole, ShareTarget } from './tab-sharing-ui.js';
 import {
   SESSION_GROUP_CLONE_MSG,
   type SessionGroupCloneCancelRequest,
@@ -368,6 +368,7 @@ export type ServerMessage =
   | { type: typeof MEMORY_WS.OBSERVATION_UPDATE_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.OBSERVATION_PROMOTE_RESPONSE; requestId?: string; success: boolean; audit?: Record<string, unknown>; error?: string; errorCode?: MemoryManagementErrorCode }
+  | { type: 'share.role_changed'; reason?: string; effectiveRole: ShareRole; target: ShareTarget }
   | MemoryMcpStatusResponseMessage;
 
 export type {

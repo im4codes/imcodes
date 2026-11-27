@@ -294,6 +294,7 @@ import {
   mergeSharedServerSubSessions,
   resolvePreferredSharedEntryForServer,
   resolveRestrictedSubSessionClick,
+  shareTargetsEqual,
 } from './shared-server-tabs.js';
 import './components/pinnedPanelTypes.js'; // register all panel types
 import {
@@ -944,6 +945,8 @@ interface SharedOpenIntent {
   serverId: string;
   preferredSessionName: string | null;
   subSessionId?: string;
+  openSubSessionId?: string;
+  openSubSessionLayout?: 'normal' | 'maximized';
   source: 'ui' | 'external' | 'startup';
 }
 
@@ -1420,6 +1423,7 @@ function InternalMainApp() {
   const deniedSharedEntryIdsRef = useRef<ReadonlySet<string>>(deniedSharedEntryIds);
   deniedSharedEntryIdsRef.current = deniedSharedEntryIds;
   const observedActiveSharedEntryIdsRef = useRef<Set<string>>(new Set());
+  const observedSharedEntriesByIdRef = useRef<Map<string, SharedEntrySummary>>(new Map());
   const [sharedHashRestorePending, setSharedHashRestorePending] = useState(
     () => Boolean(initialHashStateRef.current.serverId),
   );
@@ -1442,6 +1446,61 @@ function InternalMainApp() {
     if (matching) return matching.status !== 'active';
     return observedActiveSharedEntryIdsRef.current.has(selectedSharedEntryId);
   }, [deniedSharedEntryIds, selectedSharedEntryId, sharedEntries, sharedEntriesLoaded]);
+  const activeSharedEntryConfirmedRevokedRef = useRef(activeSharedEntryConfirmedRevoked);
+  activeSharedEntryConfirmedRevokedRef.current = activeSharedEntryConfirmedRevoked;
+  const revokedSharedTargetsForServer = useMemo(() => {
+    const revokedSessionNames = new Set<string>();
+    const revokedSubSessionIds = new Set<string>();
+    if (!selectedServerId || ownedServerIdsRef.current.has(selectedServerId) || !sharedEntriesLoaded) {
+      return { revokedSessionNames, revokedSubSessionIds };
+    }
+    const currentById = new Map<string, SharedEntrySummary>();
+    const activeEntries: SharedEntrySummary[] = [];
+    for (const entry of sharedEntries) {
+      if (entry.serverId !== selectedServerId) continue;
+      currentById.set(entry.id, entry);
+      if (entry.status === 'active' && !deniedSharedEntryIds.has(entry.id)) {
+        activeEntries.push(entry);
+      }
+    }
+    const activeMainNames = new Set<string>();
+    const activeSubIds = new Set<string>();
+    const hasActiveServerGrant = activeEntries.some((entry) => entry.target.kind === 'server');
+    for (const entry of activeEntries) {
+      if (entry.target.kind === 'main') activeMainNames.add(entry.target.sessionName);
+      if (entry.target.kind === 'subsession') {
+        activeSubIds.add(entry.target.subSessionId);
+        if (entry.parentSessionName) activeMainNames.add(entry.parentSessionName);
+      }
+    }
+    if (!hasActiveServerGrant) {
+      const checkRevoked = (entry: SharedEntrySummary) => {
+        if (entry.target.kind === 'main' && !activeMainNames.has(entry.target.sessionName)) {
+          revokedSessionNames.add(entry.target.sessionName);
+        }
+        if (entry.target.kind === 'subsession' && !activeSubIds.has(entry.target.subSessionId)) {
+          const stillCoveredByParent = Boolean(entry.parentSessionName && activeMainNames.has(entry.parentSessionName));
+          if (!stillCoveredByParent) revokedSubSessionIds.add(entry.target.subSessionId);
+        }
+      };
+      for (const entry of currentById.values()) {
+        if (entry.status !== 'active' || deniedSharedEntryIds.has(entry.id)) checkRevoked(entry);
+      }
+      for (const prev of observedSharedEntriesByIdRef.current.values()) {
+        if (prev.serverId !== selectedServerId) continue;
+        if (!currentById.has(prev.id)) checkRevoked(prev);
+      }
+      if (activeSharedEntryConfirmedRevoked && selectedShareTarget?.kind === 'main' && !activeMainNames.has(selectedShareTarget.sessionName)) {
+        revokedSessionNames.add(selectedShareTarget.sessionName);
+      }
+      if (activeSharedEntryConfirmedRevoked && selectedShareTarget?.kind === 'subsession' && !activeSubIds.has(selectedShareTarget.subSessionId)) {
+        revokedSubSessionIds.add(selectedShareTarget.subSessionId);
+      }
+    }
+    return { revokedSessionNames, revokedSubSessionIds };
+  }, [activeSharedEntryConfirmedRevoked, deniedSharedEntryIds, selectedServerId, selectedShareTarget, sharedEntries, sharedEntriesLoaded]);
+  const revokedSharedTargetsForServerRef = useRef(revokedSharedTargetsForServer);
+  revokedSharedTargetsForServerRef.current = revokedSharedTargetsForServer;
   const [presenceTick, setPresenceTick] = useState(0);
   const [openingSharedEntryId, setOpeningSharedEntryId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -2453,6 +2512,7 @@ function InternalMainApp() {
       visitedSharedSessionsByServerRef.current.clear();
       visitedSharedSubSessionsByServerRef.current.clear();
       observedActiveSharedEntryIdsRef.current.clear();
+      observedSharedEntriesByIdRef.current.clear();
       deniedSharedEntryIdsRef.current = new Set();
       setDeniedSharedEntryIds(new Set());
       setSelectedShareCoverageRole(null);
@@ -2469,6 +2529,7 @@ function InternalMainApp() {
       visitedSharedSessionsByServerRef.current.clear();
       visitedSharedSubSessionsByServerRef.current.clear();
       observedActiveSharedEntryIdsRef.current.clear();
+      observedSharedEntriesByIdRef.current.clear();
       deniedSharedEntryIdsRef.current = new Set();
       setDeniedSharedEntryIds(new Set());
       setSelectedShareCoverageRole(null);
@@ -2511,6 +2572,7 @@ function InternalMainApp() {
       for (const entry of entries) {
         if (entry.status === 'active') {
           observedActiveSharedEntryIdsRef.current.add(entry.id);
+          observedSharedEntriesByIdRef.current.set(entry.id, entry);
         }
       }
       setSharedEntries(entries);
@@ -2689,10 +2751,11 @@ function InternalMainApp() {
       sharedEntries,
       activeEntryRevoked: activeSharedEntryConfirmedRevoked,
       excludedEntryIds: deniedSharedEntryIds,
+      revokedSessionNames: revokedSharedTargetsForServer.revokedSessionNames,
       liveSessions: sessions,
       cachedSessions: selectedServerId ? visitedSharedSessionsByServerRef.current.get(selectedServerId) : undefined,
     }),
-    [activeSharedEntryConfirmedRevoked, deniedSharedEntryIds, selectedServerId, selectedShareCoverageRole, selectedShareTarget, sessions, sharedEntries],
+    [activeSharedEntryConfirmedRevoked, deniedSharedEntryIds, revokedSharedTargetsForServer, selectedServerId, selectedShareCoverageRole, selectedShareTarget, sessions, sharedEntries],
   );
   const navigableMainSessions = useMemo(
     () => mergedMainSessions.filter(isNavigableMainSession),
@@ -3885,6 +3948,7 @@ function InternalMainApp() {
       source?: 'ui' | 'external' | 'startup';
     },
   ) => Promise<SharedOpenResultStatus>) | null>(null);
+  const switchToOwnedServerInAppRef = useRef<((serverId: string, serverName?: string | null) => void) | null>(null);
   const mergedSubSessionsRef = useRef<readonly SubSession[]>([]);
 
   const cancelInFlightSharedOpen = useCallback((opts: {
@@ -3952,6 +4016,11 @@ function InternalMainApp() {
         ...(clickPlan.openSubSessionId ? { openSubSessionId: clickPlan.openSubSessionId } : {}),
         openSubSessionLayout: layout,
       });
+      return true;
+    }
+    if (clickPlan.action === 'none') {
+      // Uncovered/revoked restricted sub-session must not open locally or cancel
+      // an in-flight fallback switch.
       return true;
     }
     cancelInFlightSharedOpen({
@@ -4665,6 +4734,15 @@ function InternalMainApp() {
         });
         return;
       }
+      // Allow retiring main-share route ONLY for genuine live non-revoked
+      // sessions present on the server; clicking a revoked/uncovered tab is a
+      // safe no-op that never cancels an in-flight fallback switch.
+      if (
+        revokedSharedTargetsForServerRef.current.revokedSessionNames.has(name)
+        || !sessionsRef.current.some((session) => session.name === name)
+      ) {
+        return;
+      }
     }
 
     claimExplicitSessionNavigation(name);
@@ -4980,10 +5058,11 @@ function InternalMainApp() {
       sharedEntries,
       activeEntryRevoked: activeSharedEntryConfirmedRevoked,
       excludedEntryIds: deniedSharedEntryIds,
+      revokedSubSessionIds: revokedSharedTargetsForServer.revokedSubSessionIds,
       liveSubSessions: subSessions,
       cachedSubSessions: selectedServerId ? visitedSharedSubSessionsByServerRef.current.get(selectedServerId) : undefined,
     }),
-    [activeSharedEntryConfirmedRevoked, deniedSharedEntryIds, selectedServerId, selectedShareTarget, sharedEntries, subSessions],
+    [activeSharedEntryConfirmedRevoked, deniedSharedEntryIds, revokedSharedTargetsForServer, selectedServerId, selectedShareTarget, sharedEntries, subSessions],
   );
   mergedSubSessionsRef.current = mergedSubSessions;
   const directSharedSubSessions = useMemo(
@@ -5193,6 +5272,25 @@ function InternalMainApp() {
     const returnTarget = sharedReturnServer && ownedServerIdsRef.current.has(sharedReturnServer.id)
       ? sharedReturnServer
       : null;
+    const revokedServerId = selectedServerIdRef.current;
+    sharedOpenAbortRef.current?.abort();
+    sharedOpenAbortRef.current = null;
+    sharedOpenGenerationRef.current += 1;
+    sharedOpenIntentRef.current = null;
+    externalRouteGenerationRef.current += 1;
+    externalRouteInFlightKeyRef.current = null;
+    setOpeningSharedEntryId(null);
+    if (revokedServerId) {
+      visitedSharedSessionsByServerRef.current.delete(revokedServerId);
+      visitedSharedSubSessionsByServerRef.current.delete(revokedServerId);
+    }
+    setSharedReturnServer(null);
+    setShowSharedReturnGuide(false);
+    clearSharedTabRestoreMarker();
+    if (returnTarget && switchToOwnedServerInAppRef.current) {
+      switchToOwnedServerInAppRef.current(returnTarget.id, returnTarget.name);
+      return;
+    }
     resetServerScopedOverlaysAndTargets();
     openSubPersistenceSessionRef.current = null;
     openSubPersistenceServerRef.current = null;
@@ -5203,23 +5301,6 @@ function InternalMainApp() {
     setSelectedShareTarget(null);
     setSelectedShareCoverageRole(null);
     setSelectedSharedEntryId(null);
-    setShowSharedReturnGuide(false);
-    setSharedReturnServer(null);
-    clearSharedTabRestoreMarker();
-    if (returnTarget) {
-      localStorage.setItem('rcc_server', returnTarget.id);
-      if (returnTarget.name) localStorage.setItem('rcc_server_name', returnTarget.name);
-      selectedServerIdRef.current = returnTarget.id;
-      setSelectedServerId(returnTarget.id);
-      setSelectedServerName(returnTarget.name ?? null);
-      const nextRoute = { serverId: returnTarget.id, sessionName: null, sharedEntryId: null };
-      initialHashStateRef.current = nextRoute;
-      sharedHashRestoreStartedRef.current = true;
-      setSharedHashRestorePending(false);
-      writeHashState(nextRoute.serverId, nextRoute.sessionName, nextRoute.sharedEntryId);
-      setManualDashboard(false);
-      return;
-    }
     setManualDashboard(true);
     localStorage.removeItem('rcc_server');
     localStorage.removeItem('rcc_server_name');
@@ -5229,6 +5310,12 @@ function InternalMainApp() {
     setSelectedServerName(null);
     setSessions([]);
     setSessionsLoaded(false);
+    setSharedActiveDispatchIds(new Map());
+    setDaemonStats(null);
+    setDaemonOnline(false);
+    setConnected(false);
+    setConnecting(false);
+    setLatencyMs(null);
     setActiveSession(null, { remember: false, keepSubWindows: true });
     writeHashState(null, null, null);
   }, [resetServerScopedOverlaysAndTargets, setActiveSession, sharedReturnServer]);
@@ -5248,6 +5335,8 @@ function InternalMainApp() {
     const preferredSession = options?.preferredSessionName
       ?? (entry.target.kind === 'main' ? entry.target.sessionName : null);
     const subSessionId = entry.target.kind === 'subsession' ? entry.target.subSessionId : undefined;
+    const openSubSessionId = options?.openSubSessionId;
+    const openSubSessionLayout = options?.openSubSessionLayout ?? 'normal';
 
     const currentIntent = sharedOpenIntentRef.current;
     if (
@@ -5256,6 +5345,8 @@ function InternalMainApp() {
       && currentIntent.targetKind === entry.target.kind
       && currentIntent.preferredSessionName === preferredSession
       && currentIntent.subSessionId === subSessionId
+      && currentIntent.openSubSessionId === openSubSessionId
+      && currentIntent.openSubSessionLayout === openSubSessionLayout
     ) {
       return 'duplicate';
     }
@@ -5278,6 +5369,8 @@ function InternalMainApp() {
       serverId: entry.serverId,
       preferredSessionName: preferredSession,
       subSessionId,
+      openSubSessionId,
+      openSubSessionLayout,
       source,
     };
     const returnServer = options?.restoreFromHash
@@ -5439,6 +5532,8 @@ function InternalMainApp() {
         if (options?.openSubSessionLayout === 'maximized' && !isMobileRef.current) {
           unpinSubSessionPanel(subIdToOpen);
           setSubSessionMaximized(subIdToOpen, true);
+        } else if (options?.openSubSessionLayout === 'normal') {
+          clearSubSessionMaximized(subIdToOpen);
         }
         setOpenSubIds((prev) => (prev.has(subIdToOpen) ? prev : new Set([...prev, subIdToOpen])));
         bringSubToFront(subIdToOpen);
@@ -5448,6 +5543,8 @@ function InternalMainApp() {
         if (options.openSubSessionLayout === 'maximized' && !isMobileRef.current) {
           unpinSubSessionPanel(subIdToOpen);
           setSubSessionMaximized(subIdToOpen, true);
+        } else if (options.openSubSessionLayout === 'normal') {
+          clearSubSessionMaximized(subIdToOpen);
         }
         setOpenSubIds((prev) => (prev.has(subIdToOpen) ? prev : new Set([...prev, subIdToOpen])));
         bringSubToFront(subIdToOpen);
@@ -5484,6 +5581,11 @@ function InternalMainApp() {
       nextDenied.add(entry.id);
       deniedSharedEntryIdsRef.current = nextDenied;
       setDeniedSharedEntryIds(nextDenied);
+      if (entry.target.kind === 'main') {
+        visitedSharedSessionsByServerRef.current.get(entry.serverId)?.delete(entry.target.sessionName);
+      } else if (entry.target.kind === 'subsession') {
+        visitedSharedSubSessionsByServerRef.current.get(entry.serverId)?.delete(entry.target.subSessionId);
+      }
       if (lastSharedEntryIdByServerRef.current.get(entry.serverId) === entry.id) {
         lastSharedEntryIdByServerRef.current.delete(entry.serverId);
       }
@@ -5528,7 +5630,7 @@ function InternalMainApp() {
         setOpeningSharedEntryId(null);
       }
     }
-  }, [bringSubToFront, clearPendingMainChatScroll, clearPendingSubChatScroll, exitRevokedSharedServer, hydrateSharedSubSessions, refreshSharedEntries, resetServerScopedOverlaysAndTargets, resolvedSelectedServerName, scheduleSubChatScrollToBottom, selectedServerId, selectedShareTarget, servers, setActiveSession, setOpenSubIds, setSubSessionMaximized, sharedReturnServer, trans, unpinSubSessionPanel]);
+  }, [bringSubToFront, clearPendingMainChatScroll, clearPendingSubChatScroll, clearSubSessionMaximized, exitRevokedSharedServer, hydrateSharedSubSessions, refreshSharedEntries, resetServerScopedOverlaysAndTargets, resolvedSelectedServerName, scheduleSubChatScrollToBottom, selectedServerId, selectedShareTarget, servers, setActiveSession, setOpenSubIds, setSubSessionMaximized, sharedReturnServer, trans, unpinSubSessionPanel]);
   handleOpenSharedEntryLatestRef.current = handleOpenSharedEntry;
 
   const openSharedServerEntryPreferringLast = useCallback((entry: SharedEntrySummary) => {
@@ -6257,6 +6359,41 @@ function InternalMainApp() {
     const unsub = ws.onMessage((msg) => {
       if (isStaleSocket()) return;
       askAnswerTrackerRef.current?.handle(msg);
+      if (msg.type === 'share.role_changed') {
+        const currentTarget = selectedShareTargetRef.current;
+        const incomingTarget = msg.target;
+        const nextRole = msg.effectiveRole;
+        if (
+          currentTarget
+          && shareTargetsEqual(incomingTarget, currentTarget)
+          && (nextRole === 'viewer' || nextRole === 'participant')
+        ) {
+          selectedShareCoverageRoleRef.current = nextRole;
+          setSelectedShareCoverageRole(nextRole);
+          if (currentTarget.kind === 'server' || currentTarget.kind === 'main') {
+            setSessions((prev) => prev.map((session) => {
+              if (!session.sharedState) return session;
+              if (currentTarget.kind === 'main' && session.name !== currentTarget.sessionName) return session;
+              return {
+                ...session,
+                sharedState: { ...session.sharedState, effectiveRole: nextRole },
+              };
+            }));
+            const serverCache = visitedSharedSessionsByServerRef.current.get(targetServerId);
+            if (serverCache) {
+              for (const [name, cached] of serverCache) {
+                if (!cached.sharedState) continue;
+                if (currentTarget.kind === 'main' && name !== currentTarget.sessionName) continue;
+                serverCache.set(name, {
+                  ...cached,
+                  sharedState: { ...cached.sharedState, effectiveRole: nextRole },
+                });
+              }
+            }
+          }
+          void refreshSharedEntries({ silent: true });
+        }
+      }
       if (msg.type === 'timeline.event' && msg.event.type === 'user.message') {
         // The echo of an answer names the question it settled: close this
         // device's copy of the card (answered from another tab/device).
@@ -6553,7 +6690,9 @@ function InternalMainApp() {
               activeTarget: selectedShareTargetRef.current,
               activeCoverageRole: selectedShareCoverageRoleRef.current,
               sharedEntries: sharedEntriesRef.current,
+              activeEntryRevoked: activeSharedEntryConfirmedRevokedRef.current,
               excludedEntryIds: deniedSharedEntryIdsRef.current,
+              revokedSessionNames: revokedSharedTargetsForServerRef.current.revokedSessionNames,
               liveSessions: mergedSessionList,
               cachedSessions: visitedSharedSessionsByServerRef.current.get(selectedServerId),
             }).filter(isNavigableMainSession)
@@ -8068,6 +8207,7 @@ function InternalMainApp() {
       writeHashState(serverId, null, null);
     }
   }, [resetServerScopedStateForSwitch, selectedShareTarget]);
+  switchToOwnedServerInAppRef.current = switchToOwnedServerInApp;
 
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
     const hadPendingSharedNavigation = Boolean(
@@ -8880,7 +9020,7 @@ function InternalMainApp() {
 
   const canStopProjectForCurrentShare = !selectedShareTarget || (
     selectedShareTarget.kind === 'server'
-    && (selectedShareCoverageRole === 'participant' || sessions.find((session) => session.name === activeSession)?.sharedState?.effectiveRole === 'participant')
+    && (selectedShareCoverageRole ?? sessions.find((session) => session.name === activeSession)?.sharedState?.effectiveRole ?? 'viewer') === 'participant'
   );
 
   const handleStopProject = useCallback((project: string) => {
@@ -8928,14 +9068,8 @@ function InternalMainApp() {
   }
 
   const activeSessionInfo = sessions.find((s) => s.name === activeSession) ?? null;
-  // Session list refreshes can replace the initially hydrated sharedState. Keep
-  // the share entry's role as the durable fallback so a whole-server
-  // participant does not briefly become a viewer (and lose cron controls).
-  const selectedSharedEntry = selectedSharedEntryId
-    ? sharedEntries.find((entry) => entry.id === selectedSharedEntryId)
-    : null;
   const sharedAccessRole = selectedShareTarget
-    ? (selectedShareCoverageRole ?? activeSessionInfo?.sharedState?.effectiveRole ?? selectedSharedEntry?.role ?? 'viewer')
+    ? (selectedShareCoverageRole ?? activeSessionInfo?.sharedState?.effectiveRole ?? 'viewer')
     : null;
   const mainSharedAccessRole = selectedShareTarget?.kind === 'subsession'
     ? 'viewer'

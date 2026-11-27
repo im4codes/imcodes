@@ -411,5 +411,67 @@ describe('shared-server-tabs projection & routing', () => {
       narrowViewer,
       new Set(['g-v']),
     )?.id).toBe('g-c');
+
+    // Counterexample (P0): confirmed viewer coverage is NEVER upgraded by a stale participant discovery summary
+    const staleParticipant = makeMainEntry({ id: 'g-stale-p', sessionName: 'deck_projA_brain', role: 'participant' });
+    const downgradedMain = mergeSharedServerSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_projA_brain' },
+      activeCoverageRole: 'viewer',
+      sharedEntries: [staleParticipant],
+      liveSessions: [liveAuthorized],
+    });
+    expect(downgradedMain[0]?.sharedState?.effectiveRole).toBe('viewer');
+
+    const staleSubParticipant = makeSubEntry({
+      id: 'g-sub-stale',
+      subSessionId: 'subStale',
+      role: 'participant',
+      parentSessionName: 'deck_projA_brain',
+    });
+    const downgradedSubStates = buildSharedServerSubSessionStates({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'subsession', serverId: 'srv-shared', subSessionId: 'subStale' },
+      activeCoverageRole: 'viewer',
+      sharedEntries: [staleSubParticipant],
+      subSessions: [makeSubSession('subStale', 'deck_projA_brain')],
+      baseStates: new Map(),
+      activeDispatchIds: new Map(),
+    });
+    expect(downgradedSubStates.get('subStale')?.effectiveRole).toBe('viewer');
+
+    // Counterexample (P0): revoked live tab/subsession drops immediately while sibling entry C remains active
+    const mergedWithoutRevokedLive = mergeSharedServerSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_projA_brain' },
+      sharedEntries: [entryC],
+      revokedSessionNames: new Set(['deck_projA_brain']),
+      liveSessions: [liveAuthorized],
+    });
+    expect(mergedWithoutRevokedLive.map((s) => s.name)).toEqual(['deck_projC_brain']);
+
+    const mergedSubsWithoutRevokedLive = mergeSharedServerSubSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'subsession', serverId: 'srv-shared', subSessionId: 'subStale' },
+      sharedEntries: [entryC],
+      revokedSubSessionIds: new Set(['subStale']),
+      liveSubSessions: [makeSubSession('subStale', 'deck_projA_brain')],
+    });
+    expect(mergedSubsWithoutRevokedLive).toEqual([]);
+
+    // Uncovered/revoked restricted subsession returns 'none' instead of opening locally
+    expect(resolveRestrictedSubSessionClick({
+      entries: [entryC],
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_projC_brain' },
+      activeEntryId: 'g-c',
+      subSessionId: 'subStale',
+      subSessions: [makeSubSession('subStale', 'deck_projA_brain')],
+    })).toEqual({ action: 'none' });
   });
 });

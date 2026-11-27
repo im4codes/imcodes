@@ -9,10 +9,15 @@ function shareRoleRank(role: ShareRole): number {
   return role === 'participant' ? 2 : 1;
 }
 
-function maxShareRole(a: ShareRole | null | undefined, b: ShareRole | null | undefined): ShareRole {
-  const rankA = a ? shareRoleRank(a) : 0;
-  const rankB = b ? shareRoleRank(b) : 0;
-  return Math.max(rankA, rankB) >= 2 ? 'participant' : 'viewer';
+export function shareTargetsEqual(
+  a: ShareTarget | null | undefined,
+  b: ShareTarget | null | undefined,
+): boolean {
+  if (!a || !b || a.kind !== b.kind || a.serverId !== b.serverId) return false;
+  if (a.kind === 'server') return true;
+  if (a.kind === 'main' && b.kind === 'main') return a.sessionName === b.sessionName;
+  if (a.kind === 'subsession' && b.kind === 'subsession') return a.subSessionId === b.subSessionId;
+  return false;
 }
 
 function shareEntryPriorityRank(entry: SharedEntrySummary): number {
@@ -146,7 +151,7 @@ export function resolveRestrictedSubSessionClick(params: {
   subSessionId: string;
   subSessions: readonly SubSession[];
   excludedEntryIds?: ReadonlySet<string>;
-}): { action: 'local' } | { action: 'open'; entry: SharedEntrySummary; openSubSessionId?: string } {
+}): { action: 'local' } | { action: 'none' } | { action: 'open'; entry: SharedEntrySummary; openSubSessionId?: string } {
   const {
     entries,
     serverId,
@@ -191,7 +196,7 @@ export function resolveRestrictedSubSessionClick(params: {
       return { action: 'open', entry: parentEntry, openSubSessionId: subSessionId };
     }
   }
-  return { action: 'local' };
+  return { action: 'none' };
 }
 
 function buildBestMainGrantMap(activeEntries: readonly SharedEntrySummary[]): Map<string, SharedEntrySummary> {
@@ -231,6 +236,7 @@ export function mergeSharedServerSessions(params: {
   sharedEntries: readonly SharedEntrySummary[];
   activeEntryRevoked?: boolean;
   excludedEntryIds?: ReadonlySet<string>;
+  revokedSessionNames?: ReadonlySet<string>;
   liveSessions: readonly SessionInfo[];
   cachedSessions?: ReadonlyMap<string, SessionInfo>;
 }): SessionInfo[] {
@@ -242,6 +248,7 @@ export function mergeSharedServerSessions(params: {
     sharedEntries,
     activeEntryRevoked,
     excludedEntryIds,
+    revokedSessionNames,
     liveSessions,
     cachedSessions,
   } = params;
@@ -285,14 +292,15 @@ export function mergeSharedServerSessions(params: {
     entry: SharedEntrySummary,
     isLiveSession: boolean,
   ): SessionInfo => {
-    // For the currently opened main target, preserve the server's authoritative
-    // merged coverage role (e.g. an overlapping server participant + main viewer
-    // grant must NOT be downgraded to the narrow main entry's viewer role).
+    // For the currently opened main target, the live open/WS coverage role is
+    // authoritative: never upgrade a confirmed viewer connection with a stale
+    // participant discovery entry, and never downgrade overlapping server
+    // participant coverage to a narrow viewer entry.
     const isAuthoritativeActiveMain = isLiveSession && (
       activeTarget?.kind === 'main' && activeTarget.sessionName === session.name
     );
     const effectiveRole: ShareRole = isAuthoritativeActiveMain
-      ? maxShareRole(activeCoverageRole ?? session.sharedState?.effectiveRole, entry.role)
+      ? (activeCoverageRole ?? session.sharedState?.effectiveRole ?? entry.role)
       : entry.role;
     const nextSharedState: SharedStateSummary = session.sharedState
       ? {
@@ -383,6 +391,7 @@ export function mergeSharedServerSessions(params: {
 
   for (const live of liveSessions) {
     if (seenNames.has(live.name)) continue;
+    if (revokedSessionNames?.has(live.name)) continue;
     merged.push(live);
     seenNames.add(live.name);
   }
@@ -402,6 +411,7 @@ export function mergeSharedServerSubSessions(params: {
   sharedEntries: readonly SharedEntrySummary[];
   activeEntryRevoked?: boolean;
   excludedEntryIds?: ReadonlySet<string>;
+  revokedSubSessionIds?: ReadonlySet<string>;
   liveSubSessions: readonly SubSession[];
   cachedSubSessions?: ReadonlyMap<string, SubSession>;
 }): SubSession[] {
@@ -412,6 +422,7 @@ export function mergeSharedServerSubSessions(params: {
     sharedEntries,
     activeEntryRevoked,
     excludedEntryIds,
+    revokedSubSessionIds,
     liveSubSessions,
     cachedSubSessions,
   } = params;
@@ -478,6 +489,7 @@ export function mergeSharedServerSubSessions(params: {
 
   for (const live of liveSubSessions) {
     if (seenIds.has(live.id)) continue;
+    if (revokedSubSessionIds?.has(live.id)) continue;
     merged.push(live);
     seenIds.add(live.id);
   }
@@ -555,9 +567,9 @@ export function buildSharedServerSubSessionStates(params: {
 
     let effectiveRole: ShareRole;
     if (isDirectActiveSub) {
-      effectiveRole = maxShareRole(params.activeCoverageRole, grant?.role);
+      effectiveRole = params.activeCoverageRole ?? grant?.role ?? 'viewer';
     } else if (isCoveredByActiveMain) {
-      effectiveRole = maxShareRole(params.activeCoverageRole, grant?.role);
+      effectiveRole = params.activeCoverageRole ?? grant?.role ?? 'viewer';
     } else {
       effectiveRole = grant!.role;
     }
