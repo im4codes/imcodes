@@ -263,6 +263,10 @@
       "share-cancel-unsupported": "此分享標籤不支援取消。",
       "share-audit-duplicate": "此操作已記錄。",
       "share-comment-invalid": "無法發布留言。"
+    },
+    "warning": {
+      "device": "安全提醒：共享此裝置將開放該裝置的全部權限，請勿共享包含隱私資料的裝置，僅限開發機等可共用裝置。",
+      "session": "安全提醒：共享會話會讓協作者操作該裝置上的會話與環境，請勿在包含隱私資料的裝置上共享，僅限開發機等可共用裝置。"
     }
   },
   "window": {

@@ -90,6 +90,7 @@ export function ShareSessionDialog({
     : targetChoice === 'server'
     ? (target.serverLabel?.trim() || t('share.target.serverFallback'))
     : target.tabLabel;
+  const isDeviceShare = variant === 'machine' || targetChoice === 'server' || fixedTarget?.kind === 'server';
   const roleHelpPrefix = variant === 'machine' ? 'controlled_nodes.share.role_help' : 'share.roleHelp';
 
   const loadShares = useCallback(async () => {
@@ -180,6 +181,10 @@ export function ShareSessionDialog({
         <div>
           <div class="share-dialog-title">{t(variant === 'machine' ? 'controlled_nodes.share.title' : 'share.dialogTitle')}</div>
           <div class="share-dialog-subtitle">{t(variant === 'machine' ? 'controlled_nodes.share.subtitle' : 'share.dialogSubtitle', { target: targetLabel })}</div>
+        </div>
+
+        <div class="share-security-warning" role="note" data-testid="share-security-warning">
+          <span>{t(isDeviceShare ? 'share.warning.device' : 'share.warning.session')}</span>
         </div>
 
         {hasRemoteDesktopSection && (

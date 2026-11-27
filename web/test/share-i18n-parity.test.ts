@@ -41,4 +41,22 @@ describe('share i18n parity', () => {
       expect(owner, locale).not.toBe('share.role.owner');
     }
   });
+
+  it('defines non-empty security warning texts for device and session sharing in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(
+        readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8'),
+      ) as { share?: { warning?: { device?: unknown; session?: unknown } } };
+      const warning = messages.share?.warning;
+
+      expect(warning, locale).toBeDefined();
+      expect(typeof warning?.device, locale).toBe('string');
+      expect(String(warning?.device).trim(), locale).not.toBe('');
+      expect(warning?.device, locale).not.toBe('share.warning.device');
+
+      expect(typeof warning?.session, locale).toBe('string');
+      expect(String(warning?.session).trim(), locale).not.toBe('');
+      expect(warning?.session, locale).not.toBe('share.warning.session');
+    }
+  });
 });

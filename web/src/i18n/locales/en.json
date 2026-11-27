@@ -263,6 +263,10 @@
       "share-cancel-unsupported": "Cancel is not supported for this shared tab.",
       "share-audit-duplicate": "This action was already recorded.",
       "share-comment-invalid": "The comment could not be posted."
+    },
+    "warning": {
+      "device": "Security notice: Sharing this device grants full device permissions. Do not share devices containing private data — use only for shared development machines or similar non-private devices.",
+      "session": "Security notice: Sharing a session lets collaborators interact with this device's environment. Do not share sessions on devices containing private data — use only for shared development machines or similar non-private devices."
     }
   },
   "window": {

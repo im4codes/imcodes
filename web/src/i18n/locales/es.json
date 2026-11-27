@@ -263,6 +263,10 @@
       "share-cancel-unsupported": "Cancelar no es compatible con esta pestaña compartida.",
       "share-audit-duplicate": "Esta acción ya fue registrada.",
       "share-comment-invalid": "No se pudo publicar el comentario."
+    },
+    "warning": {
+      "device": "Aviso de seguridad: Compartir este dispositivo otorga permisos totales sobre él. No comparta dispositivos que contengan datos privados; úselo únicamente en máquinas de desarrollo compartidas u otros dispositivos no privados.",
+      "session": "Aviso de seguridad: Compartir una sesión permite a los colaboradores interactuar con el entorno y las sesiones de este dispositivo. No comparta sesiones en dispositivos con datos privados; úselo solo en máquinas de desarrollo compartidas u otros dispositivos no privados."
     }
   },
   "window": {

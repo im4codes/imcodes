@@ -263,6 +263,10 @@
       "share-cancel-unsupported": "此共享标签不支持取消。",
       "share-audit-duplicate": "此操作已记录。",
       "share-comment-invalid": "无法发布评论。"
+    },
+    "warning": {
+      "device": "安全提醒：共享此设备将开放该设备的全部权限，请勿共享包含隐私数据的设备，仅限开发机等可共用设备。",
+      "session": "安全提醒：共享会话会让协作者操作该设备上的会话与环境，请勿在包含隐私数据的设备上共享，仅限开发机等可共用设备。"
     }
   },
   "window": {

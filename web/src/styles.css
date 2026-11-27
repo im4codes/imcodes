@@ -690,6 +690,7 @@ html.native-ios-mac .chat-dl-btn {
 .share-dialog { max-width: 520px; }
 .share-dialog-title { font-size: 18px; font-weight: 800; color: #f8fafc; }
 .share-dialog-subtitle { margin-top: 4px; font-size: 12px; line-height: 1.4; color: #94a3b8; }
+.share-security-warning { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid rgba(245,158,11,0.38); border-radius: 8px; background: rgba(120,53,15,0.26); color: #fed7aa; font-size: 12px; line-height: 1.45; overflow-wrap: break-word; }
 .share-dialog-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 4px; border: 1px solid rgba(125,211,252,0.16); border-radius: 9px; background: rgba(8,15,28,0.62); }
 .share-dialog-tab { min-height: 36px; padding: 7px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #94a3b8; font: inherit; font-size: 12px; font-weight: 750; cursor: pointer; }
 .share-dialog-tab:hover { color: #e0f2fe; background: rgba(14,116,144,0.12); }
