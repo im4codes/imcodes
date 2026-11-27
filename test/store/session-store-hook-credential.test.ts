@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   configureSessionStoreWriteAuthority,
+  credentialScrubRetryAttemptsForTests,
   flushStore,
   getSession,
   loadStore,
@@ -17,7 +18,6 @@ import {
   upsertSession,
   waitForCompatExportForTests,
   waitForCredentialBackupCleanupForTests,
-  waitForCredentialScrubRetryForTests,
   waitForSessionStoreSnapshotForTests,
   type SessionRecord,
 } from '../../src/store/session-store.js';
@@ -790,11 +790,15 @@ describe('hookCredential storage and sessions.json isolation', () => {
     const blocker = openSessionDbReadOnly(dbPath)!;
     blocker.db.exec('BEGIN');
     blocker.db.prepare('SELECT count(*) AS n FROM sessions').get();
+    let flushExecSpy!: ReturnType<typeof vi.spyOn>;
     try {
-      setSessionStoreScrubRetryDelayMsForTests(20);
-      await freshStore();
+      resetSessionStoreAuthorityForTests();
+      resetIdentityBackupCleanupForTests();
+      configureSessionStoreWriteAuthority(currentDaemonProcessIdentity());
       setSessionStoreScrubRetryDelayMsForTests(20);
       setSessionStoreBackupIntervalMsForTests(0);
+      await loadStore({ probe: false });
+      await waitForCompatExportForTests();
       const writerConn = sessionStoreWriterConnectionForTests();
       expect(writerConn).not.toBeNull();
       expect(readSessionDbMeta(
@@ -802,7 +806,7 @@ describe('hookCredential storage and sessions.json isolation', () => {
         SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB,
       )).toBe('checkpoint_pending');
 
-      const flushExecSpy = vi.spyOn(writerConn!, 'exec');
+      flushExecSpy = vi.spyOn(writerConn!, 'exec');
       const initialWalSize = existsSync(`${dbPath}-wal`) ? statSync(`${dbPath}-wal`).size : 0;
       const flushStartMs = Date.now();
       for (let i = 0; i < 5; i += 1) {
@@ -821,6 +825,13 @@ describe('hookCredential storage and sessions.json isolation', () => {
       expect(flushExecSpy.mock.calls.map(([sql]) => String(sql))).not.toContain('VACUUM');
       const postFlushWalSize = existsSync(`${dbPath}-wal`) ? statSync(`${dbPath}-wal`).size : 0;
       expect(postFlushWalSize).toBeLessThanOrEqual(initialWalSize + 64 * 1024);
+
+      // F3-R4: let the first REAL scheduled retry fire while WAL is still pinned, so it hits
+      // busy=1 and MUST re-arm the automatic retry timer after releasing scrubRetryInFlight.
+      await vi.waitFor(() => {
+        expect(credentialScrubRetryAttemptsForTests()).toBeGreaterThanOrEqual(1);
+      }, { timeout: 1_500, interval: 10 });
+      expect(flushExecSpy.mock.calls.map(([sql]) => String(sql))).not.toContain('VACUUM');
       // Still pinned -> uncertified -> snapshot must NOT be published!
       expect(existsSync(bakPath)).toBe(false);
     } finally {
@@ -828,13 +839,14 @@ describe('hookCredential storage and sessions.json isolation', () => {
       closeSessionDb(blocker);
     }
 
-    // Once reader releases WAL, decoupled retry certifies SCRUB_DONE and publishes a clean 0600 snapshot
-    // without requiring a redundant VACUUM.
-    const postReleaseSpy = vi.spyOn(sessionStoreWriterConnectionForTests()!, 'exec');
-    await waitForCredentialScrubRetryForTests();
+    // Once reader releases WAL, a subsequent AUTOMATIC scheduled retry certifies SCRUB_DONE
+    // and publishes a clean 0600 snapshot with zero intervening flushes, explicit waits, or VACUUMs.
+    flushExecSpy.mockClear();
+    await vi.waitFor(() => {
+      expect(existsSync(bakPath)).toBe(true);
+    }, { timeout: 1_500, interval: 15 });
     await waitForSessionStoreSnapshotForTests();
-    expect(postReleaseSpy.mock.calls.map(([sql]) => String(sql))).not.toContain('VACUUM');
-    expect(existsSync(bakPath)).toBe(true);
+    expect(flushExecSpy.mock.calls.map(([sql]) => String(sql))).not.toContain('VACUUM');
     if (process.platform !== 'win32') {
       expect(statSync(bakPath).mode & 0o777).toBe(0o600);
     }

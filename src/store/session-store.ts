@@ -1261,45 +1261,53 @@ function scheduleCredentialScrubRetry(targetPath: string, fromFlush = false): vo
 
 function enqueueCredentialScrubRetry(targetPath: string): Promise<void> {
   if (scrubRetryInFlight) return scrubRetryInFlight;
+  let shouldReschedule = false;
   const queued = writeQueue.then(
-    () => runCredentialScrubRetry(targetPath),
-    () => runCredentialScrubRetry(targetPath),
+    () => { shouldReschedule = runCredentialScrubRetry(targetPath); },
+    () => { shouldReschedule = runCredentialScrubRetry(targetPath); },
   );
   const tracked = queued.finally(() => {
     if (scrubRetryInFlight === tracked) scrubRetryInFlight = null;
+    if (shouldReschedule && hasWriteAuthority(targetPath) && dbPath() === targetPath && (!writerDb || writerDb.path === targetPath)) {
+      scheduleCredentialScrubRetry(targetPath);
+    }
   });
   scrubRetryInFlight = tracked;
   writeQueue = tracked.catch(() => {});
   return tracked;
 }
 
-function runCredentialScrubRetry(targetPath: string): void {
-  if (!hasWriteAuthority(targetPath)) return;
-  if (dbPath() !== targetPath) return;
-  if (writerDb && writerDb.path !== targetPath) return;
+function runCredentialScrubRetry(targetPath: string): boolean {
+  if (!hasWriteAuthority(targetPath)) return false;
+  if (dbPath() !== targetPath) return false;
+  if (writerDb && writerDb.path !== targetPath) return false;
   lastScrubRetryAttemptAt = Date.now();
   const handle = writerHandle(targetPath);
   if (readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) === 'done') {
     uncertifiedSnapshotWarnedForPath = null;
     scrubRetryAttempts = 0;
-    return;
+    return false;
   }
   try {
     scrubTransportHookCredentialRows(handle);
   } catch {
-    /* remain uncertified; bounded retry rescheduled below */
+    /* remain uncertified; bounded retry rescheduled after releasing scrubRetryInFlight */
   }
   if (readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) === 'done') {
     uncertifiedSnapshotWarnedForPath = null;
     scrubRetryAttempts = 0;
     maybeStartSnapshot(handle, targetPath);
-    return;
+    return false;
   }
   scrubRetryAttempts += 1;
-  scheduleCredentialScrubRetry(targetPath);
+  return true;
 }
 
-/** Test seam: execute any scheduled credential-scrub retry immediately once unblocked. */
+/** Test seams: inspect automatic retry count and execute any scheduled credential-scrub retry immediately. */
+export function credentialScrubRetryAttemptsForTests(): number {
+  return scrubRetryAttempts;
+}
+
 export async function waitForCredentialScrubRetryForTests(): Promise<void> {
   if (scrubRetryInFlight) {
     await scrubRetryInFlight;
