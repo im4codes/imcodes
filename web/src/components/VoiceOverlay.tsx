@@ -209,6 +209,7 @@ const VoiceWaveform = memo(
   }),
 );
 export const VOICE_HOLD_MS = 350;
+const VOICE_HOLD_MOVE_SLOP_PX = 18;
 export const VOICE_DOUBLE_TAP_MS = 375;
 /** Delay before re-arming the recognizer after it ends a segment by itself. */
 export const NOTEPAD_RESTART_DELAY_MS = 250;
@@ -258,6 +259,7 @@ export function VoiceOverlay({
   const suppressMicClickRef = useRef(false);
   const lastMicTapRef = useRef<number | null>(null);
   const micPointerRef = useRef<number | null>(null);
+  const micStartRef = useRef<{ x: number; y: number } | null>(null);
   // Voice zone: [insertPos, insertPos+voiceLen) is the active voice segment
   const insertPosRef = useRef(0);
   const voiceLenRef = useRef(0);
@@ -581,6 +583,7 @@ export function VoiceOverlay({
       heldRef.current = false;
       lastMicTapRef.current = null;
       micPointerRef.current = null;
+      micStartRef.current = null;
       notepadRef.current = false;
       openRef.current = false;
       openSeqRef.current++;
@@ -1093,6 +1096,7 @@ export function VoiceOverlay({
   const endMicPress = useCallback((pointerId: number, cancelled = false) => {
     if (micPointerRef.current !== pointerId) return;
     micPointerRef.current = null;
+    micStartRef.current = null;
     if (holdTimerRef.current) clearTimeout(holdTimerRef.current);
     holdTimerRef.current = null;
     if (heldRef.current) {
@@ -1545,6 +1549,7 @@ export function VoiceOverlay({
           onPointerDown={(event) => {
             if (event.button !== 0 || micPointerRef.current !== null || notepadRef.current) return;
             micPointerRef.current = event.pointerId;
+            micStartRef.current = { x: event.clientX, y: event.clientY };
             suppressMicClickRef.current = false;
             event.currentTarget.setPointerCapture?.(event.pointerId);
             holdTimerRef.current = setTimeout(() => {
@@ -1553,6 +1558,12 @@ export function VoiceOverlay({
               triggerHaptic('medium', 20);
               if (!listeningRef.current) void handleToggle();
             }, VOICE_HOLD_MS);
+          }}
+          onPointerMove={(event) => {
+            if (micPointerRef.current !== event.pointerId || !holdTimerRef.current || !micStartRef.current) return;
+            if (Math.hypot(event.clientX - micStartRef.current.x, event.clientY - micStartRef.current.y) > VOICE_HOLD_MOVE_SLOP_PX) {
+              endMicPress(event.pointerId, true);
+            }
           }}
           onPointerUp={(event) => endMicPress(event.pointerId)}
           onPointerCancel={(event) => endMicPress(event.pointerId, true)}

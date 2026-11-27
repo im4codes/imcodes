@@ -137,46 +137,57 @@ describe('ChatView mobile navigation gesture isolation', () => {
   it('clears ChatView long-press highlight/menu and prevents follow disengage on 1-finger long-press + drag', () => {
     vi.useFakeTimers();
     window.matchMedia = makeCoarseMatchMedia();
+    const vibrate = vi.fn(() => true);
+    const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
     const actions: string[] = [];
     const detach = attachMobileNavigationGestures({
       isMobile: true,
       onAction: (a) => actions.push(a),
     });
 
-    const { container } = render(
-      <ChatView events={[makeAssistantEvent(1)]} loading={false} sessionId="sess-mobile" />,
-    );
-    act(() => {});
-    makeScrollableChatView(container);
-    const bubble = container.querySelector('.chat-event') as HTMLElement;
-    expect(bubble).toBeTruthy();
+    try {
+      const { container } = render(
+        <ChatView events={[makeAssistantEvent(1)]} loading={false} sessionId="sess-mobile" />,
+      );
+      act(() => {});
+      makeScrollableChatView(container);
+      const bubble = container.querySelector('.chat-event') as HTMLElement;
+      expect(bubble).toBeTruthy();
 
-    act(() => {
-      const s = dispatchTouch(bubble, 'touchstart', [{ identifier: 1, clientX: 140, clientY: 180, target: bubble }]);
-      expect(s.defaultPrevented).toBe(false);
-      // Advance past both 380ms gesture arm AND 400ms ChatView LONG_PRESS_MS
-      vi.advanceTimersByTime(420);
-    });
-    expect(container.querySelector('.chat-highlight')).toBeTruthy();
-    expect(container.querySelector('.chat-sel-menu')).toBeTruthy();
+      act(() => {
+        const s = dispatchTouch(bubble, 'touchstart', [{ identifier: 1, clientX: 140, clientY: 180, target: bubble }]);
+        expect(s.defaultPrevented).toBe(false);
+        // Advance past both 380ms gesture arm AND 400ms ChatView LONG_PRESS_MS
+        vi.advanceTimersByTime(420);
+      });
+      expect(container.querySelector('.chat-highlight')).toBeTruthy();
+      expect(container.querySelector('.chat-sel-menu')).toBeTruthy();
+      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate).toHaveBeenCalledWith(20);
 
-    // Sliding down after long-press engages nav gesture, clears menu/highlight, and suppresses scroll-up intent
-    act(() => {
-      const m = dispatchTouch(bubble, 'touchmove', [{ identifier: 1, clientX: 140, clientY: 260, target: bubble }]);
-      expect(m.defaultPrevented).toBe(true);
-    });
-    expect(container.querySelector('.chat-highlight')).toBeNull();
-    expect(container.querySelector('.chat-sel-menu')).toBeNull();
-    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+      // Sliding down after long-press engages nav gesture, clears menu/highlight, and suppresses scroll-up intent without repeating haptic
+      act(() => {
+        const m = dispatchTouch(bubble, 'touchmove', [{ identifier: 1, clientX: 140, clientY: 260, target: bubble }]);
+        expect(m.defaultPrevented).toBe(true);
+      });
+      expect(container.querySelector('.chat-highlight')).toBeNull();
+      expect(container.querySelector('.chat-sel-menu')).toBeNull();
+      expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+      expect(vibrate).toHaveBeenCalledTimes(1);
 
-    act(() => {
-      const e = dispatchTouch(bubble, 'touchend', []);
-      expect(e.defaultPrevented).toBe(true);
-    });
-    expect(actions).toEqual(['serverNext']);
-    expect(container.querySelector('.chat-scroll-btn')).toBeNull();
-
-    detach();
+      act(() => {
+        const e = dispatchTouch(bubble, 'touchend', []);
+        expect(e.defaultPrevented).toBe(true);
+      });
+      expect(actions).toEqual(['serverNext']);
+      expect(container.querySelector('.chat-scroll-btn')).toBeNull();
+      expect(vibrate).toHaveBeenCalledTimes(1);
+    } finally {
+      detach();
+      if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
+      else delete (navigator as unknown as Record<string, unknown>).vibrate;
+    }
   });
 
   it('preserves ChatView long-press menu without triggering navigation when held without swipe', () => {
@@ -269,6 +280,66 @@ describe('ChatView mobile navigation gesture isolation', () => {
       });
       expect(vibrate).toHaveBeenCalledTimes(1);
     } finally {
+      if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
+      else delete (navigator as unknown as Record<string, unknown>).vibrate;
+    }
+  });
+
+  it('skips haptic when openCtxMenu has no copyable text and still triggers standalone navigation haptic once on fresh touch', () => {
+    vi.useFakeTimers();
+    window.matchMedia = makeCoarseMatchMedia();
+    const vibrate = vi.fn(() => true);
+    const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
+    Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
+    const actions: string[] = [];
+    const detach = attachMobileNavigationGestures({
+      isMobile: true,
+      onAction: (a) => actions.push(a),
+    });
+
+    try {
+      const { container } = render(
+        <ChatView events={[makeAssistantEvent(1)]} loading={false} sessionId="sess-mobile" />,
+      );
+      act(() => {});
+      const chatContainer = container.querySelector('.chat-view') as HTMLElement;
+      const bubble = container.querySelector('.chat-event') as HTMLElement;
+      expect(bubble).toBeTruthy();
+      bubble.textContent = '';
+
+      // 1. Bubble with no copyable text: menu never opens -> no haptic on 420ms hold
+      act(() => {
+        dispatchTouch(bubble, 'touchstart', [{ identifier: 1, clientX: 140, clientY: 180, target: bubble }]);
+        vi.advanceTimersByTime(420);
+      });
+      expect(container.querySelector('.chat-sel-menu')).toBeNull();
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Dragging same touch past nav threshold then triggers standalone navigation haptic once (20ms)
+      act(() => {
+        dispatchTouch(bubble, 'touchmove', [{ identifier: 1, clientX: 140, clientY: 260, target: bubble }]);
+        dispatchTouch(bubble, 'touchend', []);
+      });
+      expect(actions).toEqual(['serverNext']);
+      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate).toHaveBeenCalledWith(20);
+
+      // 2. Subsequent touch with same identifier=1 outside bubble triggers standalone nav haptic once on drag
+      vibrate.mockClear();
+      act(() => {
+        dispatchTouch(chatContainer, 'touchstart', [{ identifier: 1, clientX: 140, clientY: 180, target: chatContainer }]);
+        vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      });
+      expect(vibrate).not.toHaveBeenCalled();
+      act(() => {
+        dispatchTouch(chatContainer, 'touchmove', [{ identifier: 1, clientX: 140, clientY: 260, target: chatContainer }]);
+        dispatchTouch(chatContainer, 'touchend', []);
+      });
+      expect(actions).toEqual(['serverNext', 'serverNext']);
+      expect(vibrate).toHaveBeenCalledTimes(1);
+      expect(vibrate).toHaveBeenCalledWith(20);
+    } finally {
+      detach();
       if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);
       else delete (navigator as unknown as Record<string, unknown>).vibrate;
     }

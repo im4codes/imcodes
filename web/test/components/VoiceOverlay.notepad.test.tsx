@@ -579,7 +579,7 @@ describe('VoiceOverlay recovered notepad and the composer text', () => {
 });
 
 describe('VoiceOverlay mobile microphone gestures', () => {
-  const pointerProperties = ['onpointerdown', 'onpointerup', 'onpointercancel', 'onlostpointercapture'];
+  const pointerProperties = ['onpointerdown', 'onpointermove', 'onpointerup', 'onpointercancel', 'onlostpointercapture'];
   const descriptors = pointerProperties.map(name => Object.getOwnPropertyDescriptor(HTMLElement.prototype, name));
   beforeAll(() => {
     // Same browser-capability shim used by TaskPairPanelWidth: older jsdom
@@ -594,9 +594,9 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     });
   });
   function mic() { return document.querySelector('.voice-overlay-mic') as HTMLButtonElement; }
-  function pointer(type: string, pointerId = 1) {
+  function pointer(type: string, pointerId = 1, coords: { clientX?: number; clientY?: number } = {}) {
     const event = new Event(type, { bubbles: true });
-    Object.assign(event, { pointerId, button: 0 });
+    Object.assign(event, { pointerId, button: 0, clientX: coords.clientX ?? 0, clientY: coords.clientY ?? 0 });
     fireEvent(mic(), event);
   }
   async function openVoice(onSend = vi.fn(() => 'accepted' as const)) {
@@ -671,27 +671,48 @@ describe('VoiceOverlay mobile microphone gestures', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('triggers medium haptic once when mic hold activates and stays silent on short tap', async () => {
+  it('triggers medium haptic once when mic hold activates and cancels hold/haptic on slide-away before activation', async () => {
     const vibrate = vi.fn(() => true);
     const originalVibrateDesc = Object.getOwnPropertyDescriptor(navigator, 'vibrate');
     Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
 
     try {
       await openVoice();
+      fireEvent.click(mic());
+      await vi.advanceTimersByTimeAsync(0); // pause initial listening
+      const startsBefore = voiceApi.startListening.mock.calls.length;
+
       // Short tap: no haptic
-      pointer('pointerdown');
+      pointer('pointerdown', 1, { clientX: 50, clientY: 50 });
       await vi.advanceTimersByTimeAsync(100);
-      pointer('pointerup');
+      pointer('pointerup', 1, { clientX: 50, clientY: 50 });
       await vi.advanceTimersByTimeAsync(350);
       expect(vibrate).not.toHaveBeenCalled();
 
-      // Long press >= 350ms -> medium (20ms) once; pointerup does not repeat
-      pointer('pointerdown');
+      // Slide finger >18px away before 350ms and hold: cancels timer, no haptic, no recording started
+      pointer('pointerdown', 2, { clientX: 50, clientY: 50 });
+      await vi.advanceTimersByTimeAsync(100);
+      pointer('pointermove', 2, { clientX: 50, clientY: 75 });
+      await vi.advanceTimersByTimeAsync(350);
+      expect(vibrate).not.toHaveBeenCalled();
+      expect(voiceApi.startListening).toHaveBeenCalledTimes(startsBefore);
+      pointer('pointerup', 2, { clientX: 50, clientY: 75 });
+      fireEvent.click(mic(), { detail: 1 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(voiceApi.startListening).toHaveBeenCalledTimes(startsBefore);
+
+      // Long press >= 350ms -> medium (20ms) once & starts recording; subsequent move keeps hold until pointerup
+      const stopsBefore = voiceApi.stopListening.mock.calls.length;
+      pointer('pointerdown', 3, { clientX: 50, clientY: 50 });
       await vi.advanceTimersByTimeAsync(350);
       expect(vibrate).toHaveBeenCalledTimes(1);
       expect(vibrate).toHaveBeenCalledWith(20);
-      pointer('pointerup');
+      expect(voiceApi.startListening).toHaveBeenCalledTimes(startsBefore + 1);
+      pointer('pointermove', 3, { clientX: 50, clientY: 90 });
+      expect(voiceApi.stopListening).toHaveBeenCalledTimes(stopsBefore);
+      pointer('pointerup', 3, { clientX: 50, clientY: 90 });
       await vi.advanceTimersByTimeAsync(0);
+      expect(voiceApi.stopListening).toHaveBeenCalledTimes(stopsBefore + 1);
       expect(vibrate).toHaveBeenCalledTimes(1);
     } finally {
       if (originalVibrateDesc) Object.defineProperty(navigator, 'vibrate', originalVibrateDesc);

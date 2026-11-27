@@ -1,5 +1,10 @@
 import { hasDomBlockingOverlay } from './keyboard-shortcuts.js';
-import { triggerHaptic } from './util/haptics.js';
+import {
+  clearTouchHapticTriggered,
+  hasTouchHapticTriggered,
+  markTouchHapticTriggered,
+  triggerHaptic,
+} from './util/haptics.js';
 
 export type MobileNavigationAction = 'serverPrev' | 'serverNext' | 'tabPrev' | 'tabNext';
 export type MobileNavigationDirection = 'up' | 'down' | 'left' | 'right';
@@ -340,6 +345,7 @@ type TrackerPhase =
   | 'locked_out';
 
 export interface TwoFingerSwipeTrackerOptions {
+  readonly document?: Document;
   readonly canTrack?: (target: EventTarget | null | undefined) => boolean;
   readonly onProgress?: (progress: MobileNavigationGestureProgress | null) => void;
   readonly onActiveChange?: (active: boolean) => void;
@@ -391,6 +397,7 @@ export class TwoFingerSwipeTracker {
   private lastCommittedDirection: MobileNavigationDirection | null = null;
   private lastCommittedStep = 0;
   private lastTrigger: MobileNavigationTrigger | null = null;
+  private readonly doc?: Document;
   private readonly canTrack: (target: EventTarget | null | undefined) => boolean;
   private readonly onProgress?: (progress: MobileNavigationGestureProgress | null) => void;
   private readonly onActiveChange?: (active: boolean) => void;
@@ -407,6 +414,7 @@ export class TwoFingerSwipeTracker {
   private readonly clearTimer: (id: ReturnType<typeof setTimeout>) => void;
 
   constructor(options: TwoFingerSwipeTrackerOptions = {}) {
+    this.doc = options.document;
     this.canTrack = options.canTrack ?? (() => true);
     this.onProgress = options.onProgress;
     this.onActiveChange = options.onActiveChange;
@@ -749,7 +757,21 @@ export class TwoFingerSwipeTracker {
     this.enterStopPhase('locked_out', event);
   }
 
+  private clearTrackedTouchHaptics(): void {
+    clearTouchHapticTriggered(this.doc, this.pendingTouchId);
+    for (const id of this.startPoints.keys()) clearTouchHapticTriggered(this.doc, id);
+    for (const id of this.lockedTouches.keys()) clearTouchHapticTriggered(this.doc, id);
+  }
+
+  private clearEventTouchHaptics(touches?: ArrayLike<TouchPointSnapshot>): void {
+    if (!touches) return;
+    for (let i = 0; i < touches.length; i++) {
+      clearTouchHapticTriggered(this.doc, touches[i]?.identifier);
+    }
+  }
+
   reset(): void {
+    this.clearTrackedTouchHaptics();
     this.clearPendingOneFinger();
     this.phase = 'idle';
     this.clearTrackedPoints();
@@ -770,6 +792,7 @@ export class TwoFingerSwipeTracker {
         this.reset();
       }
       const first = event.touches[0];
+      if (first) clearTouchHapticTriggered(this.doc, first.identifier);
       if (!first || !this.canTrackEvent(event)) {
         this.enterStopPhase('locked_out', event);
         return;
@@ -887,7 +910,10 @@ export class TwoFingerSwipeTracker {
       this.lastPoints.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
       this.phase = 'tracking';
       this.setActive(true);
-      triggerHaptic('medium', 20);
+      if (!hasTouchHapticTriggered(this.doc, touch.identifier)) {
+        markTouchHapticTriggered(this.doc, touch.identifier);
+        triggerHaptic('medium', 20);
+      }
       const evaluation = this.evaluateTrackedState();
       this.emitProgress(evaluation.progress);
       return null;
@@ -919,6 +945,7 @@ export class TwoFingerSwipeTracker {
   }
 
   evaluateTouchEnd(event: TouchEventLike): MobileNavigationTrigger | null {
+    this.clearEventTouchHaptics(event.changedTouches);
     const remainingCount = event.touches.length;
     if (this.phase !== 'tracking' && this.phase !== 'direct_horizontal') {
       if (remainingCount === 0) {
@@ -1004,6 +1031,7 @@ export function attachMobileNavigationGestures(options: AttachMobileNavigationGe
   };
 
   const tracker = new TwoFingerSwipeTracker({
+    document: doc,
     canTrack: (target) => canHandleMobileNavigationGesture(target, {
       isMobile: options.isMobile,
       hasBlockingOverlay: options.isBlocked?.() ?? false,

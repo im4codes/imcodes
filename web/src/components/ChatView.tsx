@@ -35,7 +35,11 @@ import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
 import { recordPerfRender } from '../perf-render-debug.js';
 import { localizeChatDownloadError } from '../chat-download-error.js';
 import { copyToClipboard } from '../util/clipboard.js';
-import { triggerHaptic } from '../util/haptics.js';
+import {
+  clearTouchHapticTriggered,
+  markTouchHapticTriggered,
+  triggerHaptic,
+} from '../util/haptics.js';
 import { WEB_UNLOCK_COALESCE_MS } from '@shared/scale-limits.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
@@ -5989,15 +5993,15 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   }, [isTouchDevice]);
 
   // Show custom context menu (Copy/Quote) at given position for given target element.
-  const openCtxMenu = useCallback((target: HTMLElement, clientX: number, clientY: number) => {
+  const openCtxMenu = useCallback((target: HTMLElement, clientX: number, clientY: number): boolean => {
     if (highlightElRef.current) highlightElRef.current.classList.remove('chat-highlight');
     target.classList.add('chat-highlight');
     highlightElRef.current = target;
     setHighlightEl(target);
     const text = extractChatEventText(target);
-    if (!text) return;
+    if (!text) return false;
     const mainRect = getActionMenuContainerRect();
-    if (!mainRect) return;
+    if (!mainRect) return false;
     const position = positionChatActionMenu(clientX, clientY, mainRect);
     menuOpenedAtRef.current = Date.now();
     // Resolve the message this menu was opened on so we can offer "Delete message".
@@ -6012,6 +6016,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       text,
       eventId,
     });
+    return true;
   }, [getActionMenuContainerRect]);
 
   // Desktop: right-click → contextmenu event → custom menu
@@ -6046,11 +6051,28 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     let timer: ReturnType<typeof setTimeout> | null = null;
     let startX = 0, startY = 0;
     let startTarget: HTMLElement | null = null;
+    let activeTouchId: number | null = null;
     let lastTapEventId = '';
     let lastTapTs = 0;
 
+    const clearEndedTouches = (e?: TouchEvent) => {
+      if (e?.changedTouches) {
+        for (let i = 0; i < e.changedTouches.length; i++) {
+          clearTouchHapticTriggered(doc, e.changedTouches[i]?.identifier);
+        }
+      }
+      if (!e || e.touches.length === 0) {
+        clearTouchHapticTriggered(doc, activeTouchId);
+        activeTouchId = null;
+      }
+    };
+
     // Telegram pattern: eat the touchend + subsequent click after menu opens
-    const cancelEvent = (e: Event) => { e.preventDefault(); e.stopPropagation(); };
+    const cancelEvent = (e: Event) => {
+      clearEndedTouches(e as TouchEvent);
+      e.preventDefault();
+      e.stopPropagation();
+    };
 
     const clearPendingLongPress = () => {
       if (timer) {
@@ -6086,6 +6108,9 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         return;
       }
       const t = e.touches[0];
+      const touchId = t?.identifier ?? null;
+      activeTouchId = touchId;
+      clearTouchHapticTriggered(doc, touchId);
       startX = t.clientX; startY = t.clientY;
       startTarget = e.target as HTMLElement;
       clearPendingLongPress();
@@ -6096,7 +6121,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         if (startTarget?.closest?.('.ask-question-timeline-card-interactive')) return;
         const chatEvent = startTarget?.closest?.('.chat-event') as HTMLElement | null;
         if (!chatEvent) return;
-        openCtxMenu(chatEvent, startX, startY);
+        if (!openCtxMenu(chatEvent, startX, startY)) return;
+        markTouchHapticTriggered(doc, touchId);
         triggerHaptic('medium', 20);
         // One-shot: eat the touchend that follows to prevent synthetic click from closing menu
         container.addEventListener('touchend', cancelEvent, { once: true, capture: true });
@@ -6115,10 +6141,11 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       }
     };
 
-    const onTouchEnd = () => {
+    const onTouchEnd = (e: TouchEvent) => {
       // Long-press fired or finger moved? clear timer; double-tap pairing
       // is handled in onClick (which won't fire if cancelEvent ran).
       clearPendingLongPress();
+      clearEndedTouches(e);
     };
 
     const onClick = (e: MouseEvent) => {
@@ -6154,6 +6181,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     container.addEventListener('click', onClick);
     return () => {
       clearPendingLongPress();
+      clearEndedTouches();
       doc.removeEventListener(MOBILE_NAV_GESTURE_ACTIVE_EVENT, onNavGestureActive);
       container.removeEventListener('touchstart', onTouchStart);
       container.removeEventListener('touchmove', onTouchMove);
