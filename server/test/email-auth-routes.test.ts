@@ -892,7 +892,7 @@ describe('email auth routes', () => {
 
   it('includes valid idempotent PostgreSQL DDL in migration 115_user_email_auth.sql', () => {
     const sql = readFileSync(
-      join(process.cwd(), 'src', 'db', 'migrations', '115_user_email_auth.sql'),
+      new URL('../src/db/migrations/115_user_email_auth.sql', import.meta.url),
       'utf8',
     );
     expect(sql).toContain('ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT');
