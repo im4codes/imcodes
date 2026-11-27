@@ -1704,6 +1704,65 @@ describe('KimiV2Provider', () => {
       expect(prompt7).not.toContain('PREF_ALPHA');
       expect(prompt7).not.toContain('SUPERVISION_ALPHA');
       expect(prompt7).not.toContain('DYNAMIC_CONTRACT_ALPHA');
+
+      // Turn 8 + Turn 9 counterexample: earlier `A failed` in the same turn must NOT block a later
+      // verified `B completed` (held behind open `C` until `prompt cancelled` retires `C`) from
+      // emitting `committed` with `compactionSessionVerified: true` and invalidating all runtime caches.
+      const rtStatuses: ProviderStatusUpdate[] = [];
+      provider.onStatus((sid, upd) => {
+        if (sid === 'deck_kimi_rt_cancel') rtStatuses.push(upd);
+      });
+      state.conn!.prompt.mockImplementationOnce(() => new Promise((r) => { resolveTurn = r; }));
+      runtime.send('turn 8', 'msg-rt-8', undefined, preamble, { registeredSystemContract });
+      await vi.waitFor(() => expect(state.conn!.prompt).toHaveBeenCalledTimes(8));
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-abc-A', status: 'in_progress' } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-abc-A', status: 'failed', error: 'transient' } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-abc-B', status: 'in_progress' } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-abc-C', status: 'in_progress' } as never,
+      });
+
+      let stopAbcSettled = false;
+      const stopAbcPromise = runtime.cancel({ waitForProvider: true }).then(() => { stopAbcSettled = true; });
+      await vi.waitFor(() => expect(state.conn!.cancel).toHaveBeenCalledTimes(3));
+
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-abc-B', status: 'completed' } as never,
+      });
+      // C is still active so Stop stays held and compacting status has not emitted committed yet
+      await new Promise((r) => setTimeout(r, 10));
+      expect(stopAbcSettled).toBe(false);
+      expect(rtStatuses.some((s) => s.compactionOutcome === 'committed')).toBe(false);
+
+      resolveTurn({ stopReason: 'cancelled' });
+      await stopAbcPromise;
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+      expect(rtStatuses).toContainEqual({
+        status: null,
+        label: null,
+        compactionOutcome: 'committed',
+        compactionSessionVerified: true,
+      });
+
+      runtime.send('turn 9', 'msg-rt-9', undefined, preamble, { registeredSystemContract });
+      await vi.waitFor(() => expect(state.conn!.prompt).toHaveBeenCalledTimes(9));
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+      const prompt9 = (state.conn!.prompt.mock.calls[8]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+      expect(prompt9).toContain('RUNTIME_IDENTITY_ALPHA');
+      expect(prompt9).toContain('PREF_ALPHA');
+      expect(prompt9).toContain('SUPERVISION_ALPHA');
+      expect(prompt9).toContain('DYNAMIC_CONTRACT_ALPHA');
     } finally {
       await runtime.kill();
       rmSync(tmpDir, { recursive: true, force: true });

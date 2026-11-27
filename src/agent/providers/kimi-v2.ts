@@ -124,7 +124,7 @@ interface PendingTurn {
   sawCompactionEvent?: boolean;
   compactedInTurn?: boolean;
   compactionOutcome?: 'committed' | 'failed';
-  compactionOutcomeEmitted?: boolean;
+  emittedCompactionOutcome?: 'committed' | 'failed';
   compactionSessionVerified?: boolean;
   turnContextUsage?: ProviderUsageUpdate['usage'];
   cancelGraceTimer: ReturnType<typeof setTimeout> | null;
@@ -1882,12 +1882,9 @@ export class KimiV2Provider implements TransportProvider {
     const didCompact = Boolean(turn.compactedInTurn || (turn.isCompact && !turn.sawCompactionEvent && stopReason === 'end_turn'));
     if (didCompact) {
       this.refreshSessionSystemText(state.sessionKey);
-      const outcomeToEmit = !turn.compactionOutcomeEmitted ? 'committed' : undefined;
-      if (outcomeToEmit) turn.compactionOutcomeEmitted = true;
-      this.clearStatus(state.sessionKey, state, outcomeToEmit, Boolean(outcomeToEmit && turn.compactionSessionVerified));
-    } else if (turn.sawCompactionEvent && !turn.compactionOutcomeEmitted) {
-      turn.compactionOutcomeEmitted = true;
-      this.clearStatus(state.sessionKey, state, 'failed');
+      this.emitTerminalCompactionStatus(state, turn, 'committed');
+    } else if (turn.sawCompactionEvent) {
+      this.emitTerminalCompactionStatus(state, turn, 'failed');
     } else {
       this.clearStatus(state.sessionKey, state);
     }
@@ -1917,18 +1914,10 @@ export class KimiV2Provider implements TransportProvider {
     this.clearTurnTimersAndState(state, turn);
     this.clearActiveTools(state);
     this.retireActiveCompactionsForTurn(state);
-    const outcomeToEmit = turn.compactedInTurn && !turn.compactionOutcomeEmitted
+    const desiredOutcome = turn.compactedInTurn
       ? 'committed'
-      : (!turn.compactedInTurn && !turn.compactionOutcomeEmitted && turn.isCompact ? 'failed' : undefined);
-    if (outcomeToEmit) {
-      turn.compactionOutcomeEmitted = true;
-    }
-    this.clearStatus(
-      state.sessionKey,
-      state,
-      outcomeToEmit,
-      Boolean(outcomeToEmit === 'committed' && turn.compactionSessionVerified),
-    );
+      : (turn.isCompact ? 'failed' : undefined);
+    this.emitTerminalCompactionStatus(state, turn, desiredOutcome);
     this.lastErrorCode = code;
     this.emitError(state.sessionKey, {
       code,
@@ -1968,6 +1957,33 @@ export class KimiV2Provider implements TransportProvider {
     if (state.lastStatusSignature === sig) return;
     state.lastStatusSignature = sig;
     for (const cb of this.statusHandlers) cb(sessionId, status);
+  }
+
+  private emitTerminalCompactionStatus(
+    state: KimiSessionState,
+    turn: PendingTurn,
+    desiredOutcome?: 'committed' | 'failed',
+  ): void {
+    let outcomeToEmit = desiredOutcome;
+    if (outcomeToEmit === 'committed') {
+      if (turn.emittedCompactionOutcome === 'committed') {
+        outcomeToEmit = undefined;
+      } else {
+        turn.emittedCompactionOutcome = 'committed';
+      }
+    } else if (outcomeToEmit === 'failed') {
+      if (turn.emittedCompactionOutcome !== undefined) {
+        outcomeToEmit = undefined;
+      } else {
+        turn.emittedCompactionOutcome = 'failed';
+      }
+    }
+    this.clearStatus(
+      state.sessionKey,
+      state,
+      outcomeToEmit,
+      Boolean(outcomeToEmit === 'committed' && turn.compactionSessionVerified),
+    );
   }
 
   private clearStatus(
@@ -2298,8 +2314,7 @@ export class KimiV2Provider implements TransportProvider {
       turn.compactionOutcome = 'committed';
       turn.compactionSessionVerified = true;
       if (state.activeCompactionIds.size === 0) {
-        turn.compactionOutcomeEmitted = true;
-        this.clearStatus(state.sessionKey, state, 'committed', true);
+        this.emitTerminalCompactionStatus(state, turn, 'committed');
       }
       return;
     }
@@ -2310,14 +2325,7 @@ export class KimiV2Provider implements TransportProvider {
         turn.compactionOutcome = 'failed';
       }
       if (state.activeCompactionIds.size === 0) {
-        const outcome = turn.compactedInTurn ? 'committed' : 'failed';
-        turn.compactionOutcomeEmitted = true;
-        this.clearStatus(
-          state.sessionKey,
-          state,
-          outcome,
-          Boolean(outcome === 'committed' && turn.compactionSessionVerified),
-        );
+        this.emitTerminalCompactionStatus(state, turn, turn.compactedInTurn ? 'committed' : 'failed');
       }
       return;
     }
