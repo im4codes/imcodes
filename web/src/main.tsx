@@ -13,6 +13,7 @@ import {
 import { applyNativePlatformClasses, NATIVE_HOST_EVENT } from './native-platform.js';
 import { initGlobalFontScale } from './global-font.js';
 import { applyUiScale, initUiScale, readUiScale } from './ui-scale.js';
+import { installGlobalZoomedInputCaretFix } from './zoom-caret.js';
 import {
   isRemoteDesktopWallWindow,
   readRemoteDesktopWindowServerId,
@@ -51,6 +52,7 @@ marked.use({
 applyNativePlatformClasses();
 initGlobalFontScale();
 initUiScale();
+installGlobalZoomedInputCaretFix();
 window.addEventListener(NATIVE_HOST_EVENT, () => {
   applyNativePlatformClasses();
   applyUiScale(readUiScale());

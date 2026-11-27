@@ -66,6 +66,7 @@ import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { CURSOR_HEADLESS_MODEL_IDS } from '../../../src/shared/models/options.js';
 import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
 import { getActiveCssZoom } from '../ui-scale.js';
+import { placeContentEditableCaretAtPoint } from '../zoom-caret.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
 import { buildAliasSendExtra } from '../util/alias-send.js';
@@ -2601,6 +2602,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     startY: number;
     pointerType: string;
   } | null>(null);
+  const composerTapStateRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  const skipZoomCaretOnNextClickRef = useRef(false);
   const voiceHoldPendingRef = useRef(false);
   const didPrimeVoiceGestureRef = useRef(false);
   const voiceHoldActiveRef = useRef(false);
@@ -7293,6 +7296,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   /** Restore editability and focus the composer on any short tap or failed hold. */
   const fallbackToComposerClick = useCallback((pointerType?: string) => {
     pendingMobileInitialEndFocusRef.current = null;
+    skipZoomCaretOnNextClickRef.current = true;
     if (!mountedRef.current || inputDisabledRef.current) {
       didPrimeVoiceGestureRef.current = false;
       didPrimeVoiceGestureRef.current = false;
@@ -7936,6 +7940,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const handleComposerVoicePointerDown = useCallback((event: PointerEvent) => {
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
+    skipZoomCaretOnNextClickRef.current = false;
+    if (event.isPrimary !== false && (event.button === undefined || event.button === 0)) {
+      composerTapStateRef.current = { x: event.clientX ?? 0, y: event.clientY ?? 0, moved: false };
+    }
     suppressComposerClickFocusRef.current = false;
     if (suppressComposerClickTimerRef.current !== null) {
       clearTimeout(suppressComposerClickTimerRef.current);
@@ -8028,6 +8036,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (handledVoicePointerEventsRef.current.has(event)) return;
     handledVoicePointerEventsRef.current.add(event);
     if (event.isPrimary === false) return;
+    const tap = composerTapStateRef.current;
+    if (tap && !tap.moved && Math.hypot((event.clientX ?? 0) - tap.x, (event.clientY ?? 0) - tap.y) > 6) {
+      tap.moved = true;
+    }
     const ptr = voiceHoldPointerRef.current;
     const tx = voiceHoldTxRef.current;
     if (ptr && event.pointerId !== undefined && event.pointerId !== ptr.id) return;
@@ -8543,6 +8555,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
   const handleBlur = () => {
     pendingMobileInitialEndFocusRef.current = null;
+    composerTapStateRef.current = null;
+    skipZoomCaretOnNextClickRef.current = false;
     updateComposerFocused(false);
     closeQuickSuggestions();
   };
@@ -11821,8 +11835,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             }}
             onFocus={handleFocus}
             onBlur={handleBlur}
-            onClick={() => {
+            onClick={(event) => {
               const el = divRef.current;
+              const tapState = composerTapStateRef.current;
+              composerTapStateRef.current = null;
+              const skipZoomCaretForInitialVoiceTap = skipZoomCaretOnNextClickRef.current;
+              skipZoomCaretOnNextClickRef.current = false;
               if (!el || suppressComposerClickFocusRef.current) {
                 pendingMobileInitialEndFocusRef.current = null;
                 return;
@@ -11851,6 +11869,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     ? { moveCursorToEnd: true }
                     : undefined,
                 );
+              }
+              const clickX = event.clientX === 0 && event.clientY === 0 && tapState ? tapState.x : event.clientX;
+              const clickY = event.clientX === 0 && event.clientY === 0 && tapState ? tapState.y : event.clientY;
+              if (
+                !shouldMoveInitialMobileToEnd
+                && !skipZoomCaretForInitialVoiceTap
+                && !imeComposingRef.current
+                && !tapState?.moved
+                && !event.shiftKey
+                && event.detail <= 1
+                && !(clickX === 0 && clickY === 0 && event.detail === 0)
+                && el.getAttribute('contenteditable') === 'true'
+              ) {
+                placeContentEditableCaretAtPoint(el, clickX, clickY);
               }
             }}
             onPointerDown={handleComposerVoicePointerDown}
