@@ -43,7 +43,7 @@ export const QWEN_NATIVE_AGENT_TOOLS = ['agent', 'task'] as const;
 export const QODER_NATIVE_AGENT_TOOLS = ['Agent'] as const;
 
 /** OpenCode native sub-agent tool. */
-export const OPENCODE_NATIVE_AGENT_TOOLS = ['task'] as const;
+export const OPENCODE_NATIVE_AGENT_TOOLS = ['subagent'] as const;
 
 export const fenceOf = (fenced: boolean): NativeAgentFence => (
   fenced ? NATIVE_AGENT_FENCES.DISABLED : NATIVE_AGENT_FENCES.PROVIDER_DEFAULT
@@ -63,16 +63,16 @@ export class NativeAgentFenceSlot {
     this.resolver = resolver;
   }
 
-/** Query provider capability metadata without withholding native agent tools. */
+/** Query provider fence requirement from the installed resolver. */
   required(providerSessionId: string, sessionName?: string): boolean {
     const resolver = this.resolver;
     if (!resolver) return false;
     try {
-      void resolver(providerSessionId, sessionName);
+      return Boolean(resolver(providerSessionId, sessionName));
     } catch (error) {
       logger.warn({ provider: this.providerId, providerSessionId, error }, 'native agent fence resolver advisory failed');
+      return false;
     }
-    return false;
   }
 
   /**
