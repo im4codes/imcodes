@@ -2,9 +2,9 @@
  * KimiV2Provider — standalone TransportProvider for Kimi Code CLI (`kimi acp`).
  *
  * Aligns `kimi-sdk` with Kimi Code CLI v2 (`@moonshot-ai/kimi-code` 2.8.x)
- * while maintaining full backward compatibility with legacy Python `kimi-cli`
- * 1.x (`kimi acp`). Intentionally standalone from `kimi-sdk.ts` so sibling
- * subclasses (`agy-acp`, `grok-sdk`, `codebuddy`, `hermes-acp`) remain untouched.
+ * while maintaining backward compatibility with legacy Python `kimi-cli` 1.x.
+ * Intentionally standalone from `kimi-sdk.ts` so sibling subclasses
+ * (`agy-acp`, `grok-sdk`, `codebuddy`, `hermes-acp`) remain 100% untouched.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { readFileSync, statSync } from 'node:fs';
@@ -36,6 +36,7 @@ import {
 import {
   CONNECTION_MODES,
   normalizeProviderPayload,
+  PROVIDER_CANCEL_ORIGINS,
   PROVIDER_ERROR_CODES,
   SESSION_OWNERSHIP,
   type ApprovalRequest,
@@ -46,6 +47,7 @@ import {
   type ProviderError,
   type ProviderModelInfo,
   type ProviderModelList,
+  type ProviderStatusUpdate,
   type ProviderUsageUpdate,
   type RemoteSessionInfo,
   type RemoteSessionListOptions,
@@ -60,7 +62,7 @@ import type { ProviderActiveWorkSnapshot, SessionActivityBusyReason } from '../.
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 import { isSessionControlCommandText } from '../../../shared/session-control-commands.js';
-import { SESSION_MODEL_APPLIED, type SessionModelApplied } from '../../../shared/session-model-control.js';
+import { SESSION_MODEL_APPLIED, SESSION_MODEL_APPLY_TIMEOUT_MS, type SessionModelApplied } from '../../../shared/session-model-control.js';
 import { MEMORY_MCP_PROVIDER_STATUS_REASON, MEMORY_MCP_STATUS, type MemoryMcpProviderStatusView } from '../../../shared/memory-ws.js';
 import { createAcpClientConnection, type AcpClientConnection } from './acp-client-adapter.js';
 import { filterAcpJsonLines } from './acp-json-filter.js';
@@ -83,6 +85,8 @@ import logger from '../../util/logger.js';
 
 const INIT_TIMEOUT_MS = 20_000;
 const SESSION_TIMEOUT_MS = 30_000;
+const MODE_MODEL_TIMEOUT_MS = SESSION_MODEL_APPLY_TIMEOUT_MS;
+const CLOSE_TIMEOUT_MS = 5_000;
 const MODEL_PROBE_TTL_MS = 30_000;
 const CANCEL_GRACE_MS = 10_000;
 const MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -103,23 +107,23 @@ type JsonRecord = Record<string, unknown>;
 export interface KimiV2ProviderOptions {
   initTimeoutMs?: number;
   sessionTimeoutMs?: number;
+  modeModelTimeoutMs?: number;
+  closeTimeoutMs?: number;
   cancelGraceMs?: number;
   modelProbeTtlMs?: number;
 }
 
 interface PendingTurn {
+  generation: number;
   messageId: string;
   accumulated: string;
   assistantTextClosed: boolean;
-  userInitiatedCancel: boolean;
-  cancelRejectCode: string | null;
+  cancelled: boolean;
   cancelGraceTimer: ReturnType<typeof setTimeout> | null;
   terminalTarget: object;
+  physicalTerminal: Promise<void>;
+  resolvePhysicalTerminal: () => void;
   settled: boolean;
-  resolve: () => void;
-  reject: (err: Error) => void;
-  settledPromise: Promise<void>;
-  markSettled: () => void;
   wireSlot: Promise<void>;
 }
 
@@ -141,14 +145,22 @@ interface ActiveToolState {
 interface KimiSessionState {
   sessionKey: string;
   providerSessionId: string;
+  boundConnectionGeneration: number;
   cwd: string;
   model?: string;
+  pendingModel?: string;
   mode?: string;
+  sessionUsesConfigOptions: boolean;
+  modelConfigId: string | null;
   systemText?: string;
   lastInjectedSessionSystemKey?: string;
   systemTextInjected: boolean;
   replaying: boolean;
+  promptInFlight: boolean;
+  turnGeneration: number;
   pendingTurn: PendingTurn | null;
+  lastStopTurn: PendingTurn | null;
+  lastStatusSignature: string | null;
   activeTools: Map<string, ActiveToolState>;
   pendingApprovals: Map<string, PendingApproval>;
   mcpServers: AcpMcpServerConfig[];
@@ -165,6 +177,31 @@ interface ExtractedModelCatalog {
   models: ProviderModelInfo[];
   defaultModel?: string;
   hasConfigOption: boolean;
+  configId: string | null;
+}
+
+interface ConnectionCapabilities {
+  agentInfo: { name?: string; version?: string } | null;
+  promptImageSupported: boolean;
+  promptEmbeddedContextSupported: boolean;
+  sessionResumeSupported: boolean;
+  sessionListSupported: boolean;
+  sessionCloseSupported: boolean;
+  loadSessionSupported: boolean;
+  modelSwitchMode: 'configOption' | 'unstableModel' | null;
+}
+
+function defaultConnectionCapabilities(): ConnectionCapabilities {
+  return {
+    agentInfo: null,
+    promptImageSupported: false,
+    promptEmbeddedContextSupported: false,
+    sessionResumeSupported: false,
+    sessionListSupported: false,
+    sessionCloseSupported: false,
+    loadSessionSupported: false,
+    modelSwitchMode: null,
+  };
 }
 
 function asRecord(value: unknown): JsonRecord | null {
@@ -267,9 +304,8 @@ function extractToolOutputText(content: ToolCallContent[] | null | undefined, ra
 
 function extractModelCatalog(resp: unknown): ExtractedModelCatalog {
   const rec = asRecord(resp);
-  if (!rec) return { models: [], hasConfigOption: false };
+  if (!rec) return { models: [], hasConfigOption: false, configId: null };
 
-  // Kimi Code CLI v2 exposes models through ACP `configOptions` (category/id === 'model').
   if (Array.isArray(rec.configOptions)) {
     for (const rawOpt of rec.configOptions) {
       const opt = asRecord(rawOpt);
@@ -296,6 +332,7 @@ function extractModelCatalog(resp: unknown): ExtractedModelCatalog {
         for (const entry of opt.options) pushOption(entry);
       }
       const currentValue = isNonEmptyString(opt.currentValue) ? opt.currentValue.trim() : undefined;
+      const configId = isNonEmptyString(opt.id) ? opt.id.trim() : 'model';
       if (models.length > 0 || currentValue) {
         if (currentValue && !seen.has(currentValue)) {
           models.unshift({ id: currentValue, name: currentValue });
@@ -304,12 +341,12 @@ function extractModelCatalog(resp: unknown): ExtractedModelCatalog {
           models,
           defaultModel: currentValue ?? models[0]?.id,
           hasConfigOption: true,
+          configId,
         };
       }
     }
   }
 
-  // Legacy Kimi CLI 1.x returns `result.models = { availableModels, currentModelId }`.
   const legacyModels = asRecord(rec.models);
   if (legacyModels && Array.isArray(legacyModels.availableModels)) {
     const models: ProviderModelInfo[] = [];
@@ -333,10 +370,11 @@ function extractModelCatalog(resp: unknown): ExtractedModelCatalog {
       models,
       defaultModel: currentModelId ?? models[0]?.id,
       hasConfigOption: false,
+      configId: null,
     };
   }
 
-  return { models: [], hasConfigOption: false };
+  return { models: [], hasConfigOption: false, configId: null };
 }
 
 function inferImageMime(filePath: string): string | null {
@@ -379,25 +417,25 @@ export class KimiV2Provider implements TransportProvider {
 
   private readonly initTimeoutMs: number;
   private readonly sessionTimeoutMs: number;
+  private readonly modeModelTimeoutMs: number;
+  private readonly closeTimeoutMs: number;
   private readonly cancelGraceMs: number;
   private readonly modelProbeTtlMs: number;
 
   private providerConfig: ProviderConfig | null = null;
   private child: ChildProcess | null = null;
   private connection: AcpClientConnection | null = null;
-  private connectingPromise: Promise<void> | null = null;
+  private connectionGeneration = 0;
+  private connectingState: {
+    generation: number;
+    promise: Promise<AcpClientConnection>;
+    envKey: string;
+    fingerprint: string;
+  } | null = null;
   private connectedFingerprint: string | null = null;
   private connectedEnvKey: string | null = null;
+  private connCaps: ConnectionCapabilities = defaultConnectionCapabilities();
   private stderrTail: string[] = [];
-
-  private agentInfo: { name?: string; version?: string } | null = null;
-  private promptImageSupported = false;
-  private promptEmbeddedContextSupported = false;
-  private sessionResumeSupported = false;
-  private sessionListSupported = false;
-  private sessionCloseSupported = false;
-  private loadSessionSupported = false;
-  private useConfigOptionForModel = false;
 
   private readonly routes = new Map<string, AcpRoute>();
   private readonly sessionKeyToProviderId = new Map<string, string>();
@@ -412,6 +450,7 @@ export class KimiV2Provider implements TransportProvider {
   private readonly completeHandlers = new Set<(sessionId: string, message: AgentMessage) => void>();
   private readonly errorHandlers = new Set<(sessionId: string, error: ProviderError) => void>();
   private readonly sessionInfoHandlers = new Set<(sessionId: string, info: SessionInfoUpdate) => void>();
+  private readonly statusHandlers = new Set<(sessionId: string, status: ProviderStatusUpdate) => void>();
   private readonly usageHandlers = new Set<(sessionId: string, update: ProviderUsageUpdate) => void>();
   private readonly toolCallHandlers = new Set<(sessionId: string, tool: ToolCallEvent) => void>();
   private readonly approvalHandlers = new Set<(sessionId: string, req: ApprovalRequest) => void>();
@@ -419,6 +458,8 @@ export class KimiV2Provider implements TransportProvider {
   constructor(options: KimiV2ProviderOptions = {}) {
     this.initTimeoutMs = options.initTimeoutMs ?? INIT_TIMEOUT_MS;
     this.sessionTimeoutMs = options.sessionTimeoutMs ?? SESSION_TIMEOUT_MS;
+    this.modeModelTimeoutMs = options.modeModelTimeoutMs ?? MODE_MODEL_TIMEOUT_MS;
+    this.closeTimeoutMs = options.closeTimeoutMs ?? CLOSE_TIMEOUT_MS;
     this.cancelGraceMs = options.cancelGraceMs ?? CANCEL_GRACE_MS;
     this.modelProbeTtlMs = options.modelProbeTtlMs ?? MODEL_PROBE_TTL_MS;
   }
@@ -443,6 +484,11 @@ export class KimiV2Provider implements TransportProvider {
     return () => { this.sessionInfoHandlers.delete(cb); };
   }
 
+  onStatus(cb: (sessionId: string, status: ProviderStatusUpdate) => void): () => void {
+    this.statusHandlers.add(cb);
+    return () => { this.statusHandlers.delete(cb); };
+  }
+
   onUsage(cb: (sessionId: string, update: ProviderUsageUpdate) => void): () => void {
     this.usageHandlers.add(cb);
     return () => { this.usageHandlers.delete(cb); };
@@ -465,8 +511,9 @@ export class KimiV2Provider implements TransportProvider {
     for (const route of routes) {
       this.rejectPendingApprovals(route.state, new Error('Provider disconnected'));
       if (route.state.pendingTurn) {
-        this.failTurn(route.state, new Error('Provider disconnected'), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
+        this.failTurn(route.state, route.state.pendingTurn, new Error('Provider disconnected'), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
       }
+      this.clearStatus(route.state.sessionKey, route.state);
     }
     this.routes.clear();
     this.sessionKeyToProviderId.clear();
@@ -474,7 +521,10 @@ export class KimiV2Provider implements TransportProvider {
   }
 
   private resolveBinaryCommand(env: NodeJS.ProcessEnv): ResolvedExecutable {
-    const raw = resolveKimiPathForSdk('kimi', env);
+    const explicit = typeof this.providerConfig?.binaryPath === 'string'
+      ? this.providerConfig.binaryPath.trim()
+      : '';
+    const raw = explicit || resolveKimiPathForSdk('kimi', env);
     return resolveExecutableForSpawn(raw);
   }
 
@@ -504,8 +554,10 @@ export class KimiV2Provider implements TransportProvider {
     const child = this.child;
     this.child = null;
     this.connection = null;
+    this.connectingState = null;
     this.connectedFingerprint = null;
     this.connectedEnvKey = null;
+    this.connCaps = defaultConnectionCapabilities();
     if (child) {
       await killProcessTree(child, { ownsProcessGroup: true });
     }
@@ -517,6 +569,11 @@ export class KimiV2Provider implements TransportProvider {
     const fingerprint = computeExecutableFingerprint(bin);
     const envKey = `${env.KIMI_API_KEY ?? ''}\0${env.KIMI_CODE_HOME ?? ''}\0${env.KIMI_CLI_PATH ?? ''}`;
 
+    // Never hand out a partially-initialized connection while initialize() is still in flight.
+    if (this.connectingState) {
+      return this.connectingState.promise;
+    }
+
     if (
       this.connection
       && this.isChildAlive()
@@ -526,20 +583,17 @@ export class KimiV2Provider implements TransportProvider {
       return this.connection;
     }
 
-    if (this.connectingPromise) {
-      await this.connectingPromise;
-      if (this.connection && this.isChildAlive()) return this.connection;
-    }
-
-    // Recycle stale idle child when the binary upgraded on disk.
-    const hasActiveTurns = Array.from(this.routes.values()).some((r) => r.state.pendingTurn !== null);
+    // Recycle stale idle child when executable or auth environment changed.
+    const hasActiveTurns = Array.from(this.routes.values()).some((r) => r.state.promptInFlight);
     if (this.child && !hasActiveTurns) {
       await this.teardownChildProcess();
     }
 
-    const connectTask = (async () => {
+    const generation = ++this.connectionGeneration;
+    const connectPromise = (async (): Promise<AcpClientConnection> => {
       const cwd = normalizeTransportCwd(canonicalizeTransportCwd(sessionConfig?.cwd)) || process.cwd();
       this.stderrTail = [];
+      this.connCaps = defaultConnectionCapabilities();
 
       const child = spawn(bin.executable, [...bin.prependArgs, 'acp'], {
         cwd,
@@ -566,16 +620,25 @@ export class KimiV2Provider implements TransportProvider {
       });
 
       child.once('exit', (code, signal) => {
+        for (const route of this.routes.values()) {
+          if (route.state.pendingTurn && route.state.boundConnectionGeneration === generation) {
+            route.state.pendingTurn.resolvePhysicalTerminal();
+          }
+          if (route.state.lastStopTurn && route.state.boundConnectionGeneration === generation) {
+            route.state.lastStopTurn.resolvePhysicalTerminal();
+          }
+        }
         if (this.child !== child) return;
         this.child = null;
         this.connection = null;
         this.connectedFingerprint = null;
         this.connectedEnvKey = null;
+        this.connCaps = defaultConnectionCapabilities();
         const exitMsg = `kimi acp exited unexpectedly (code=${code ?? 'null'}, signal=${signal ?? 'null'})`;
         for (const route of this.routes.values()) {
           this.rejectPendingApprovals(route.state, new Error(exitMsg));
           if (route.state.pendingTurn) {
-            this.failTurn(route.state, new Error(exitMsg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
+            this.failTurn(route.state, route.state.pendingTurn, new Error(exitMsg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
           }
         }
       });
@@ -596,7 +659,7 @@ export class KimiV2Provider implements TransportProvider {
       const writable = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
       const stream = ndJsonStream(writable, readable);
 
-      const connection = createAcpClientConnection(
+      const candidateConnection = createAcpClientConnection(
         {
           sessionUpdate: async (notification: SessionNotification) => {
             await this.enqueueWireOrder(() => this.handleSessionUpdate(notification));
@@ -607,10 +670,9 @@ export class KimiV2Provider implements TransportProvider {
         },
         stream,
       );
-      this.connection = connection;
 
       const initRace = Promise.race([
-        connection.initialize({
+        candidateConnection.initialize({
           protocolVersion: 1,
           clientCapabilities: {
             fs: {
@@ -630,46 +692,45 @@ export class KimiV2Provider implements TransportProvider {
       }
 
       this.applyInitializeResult(initOutcome.value);
+      this.connection = candidateConnection;
+      return candidateConnection;
     })();
 
-    this.connectingPromise = connectTask;
+    this.connectingState = { generation, promise: connectPromise, envKey, fingerprint };
     try {
-      await connectTask;
+      return await connectPromise;
     } catch (err) {
       await this.teardownChildProcess();
       throw this.normalizeProviderException(err);
     } finally {
-      if (this.connectingPromise === connectTask) {
-        this.connectingPromise = null;
+      if (this.connectingState?.promise === connectPromise) {
+        this.connectingState = null;
       }
     }
-
-    if (!this.connection) {
-      throw new Error('kimi acp connection unavailable after initialize');
-    }
-    return this.connection;
   }
 
   private applyInitializeResult(result: InitializeResponse): void {
     const rec = asRecord(result);
     const agentInfo = asRecord(rec?.agentInfo);
-    this.agentInfo = agentInfo
-      ? {
-          name: isNonEmptyString(agentInfo.name) ? agentInfo.name : undefined,
-          version: isNonEmptyString(agentInfo.version) ? agentInfo.version : undefined,
-        }
-      : null;
-
     const caps = asRecord(rec?.agentCapabilities);
     const promptCaps = asRecord(caps?.promptCapabilities);
     const sessionCaps = asRecord(caps?.sessionCapabilities);
 
-    this.promptImageSupported = promptCaps?.image === true;
-    this.promptEmbeddedContextSupported = promptCaps?.embeddedContext === true;
-    this.loadSessionSupported = caps?.loadSession === true;
-    this.sessionResumeSupported = sessionCaps?.resume != null && sessionCaps.resume !== false;
-    this.sessionListSupported = sessionCaps?.list != null && sessionCaps.list !== false;
-    this.sessionCloseSupported = sessionCaps?.close != null && sessionCaps.close !== false;
+    this.connCaps = {
+      agentInfo: agentInfo
+        ? {
+            name: isNonEmptyString(agentInfo.name) ? agentInfo.name : undefined,
+            version: isNonEmptyString(agentInfo.version) ? agentInfo.version : undefined,
+          }
+        : null,
+      promptImageSupported: promptCaps?.image === true,
+      promptEmbeddedContextSupported: promptCaps?.embeddedContext === true,
+      loadSessionSupported: caps?.loadSession === true,
+      sessionResumeSupported: sessionCaps?.resume != null && sessionCaps.resume !== false,
+      sessionListSupported: sessionCaps?.list != null && sessionCaps.list !== false,
+      sessionCloseSupported: sessionCaps?.close != null && sessionCaps.close !== false,
+      modelSwitchMode: null,
+    };
   }
 
   private normalizeProviderException(err: unknown): Error & { code?: string } {
@@ -717,9 +778,22 @@ export class KimiV2Provider implements TransportProvider {
   }
 
   private registerRoute(providerSessionId: string, state: KimiSessionState): void {
+    const previousProviderId = this.sessionKeyToProviderId.get(state.sessionKey);
+    if (previousProviderId && previousProviderId !== providerSessionId) {
+      const prevRoute = this.routes.get(previousProviderId);
+      if (prevRoute) {
+        prevRoute.stack = prevRoute.stack.filter((k) => k !== state.sessionKey);
+        if (prevRoute.stack.length === 0) {
+          this.routes.delete(previousProviderId);
+        } else {
+          prevRoute.state.sessionKey = prevRoute.stack[prevRoute.stack.length - 1]!;
+        }
+      }
+    }
     const existing = this.routes.get(providerSessionId);
     const stack = existing ? existing.stack.filter((k) => k !== state.sessionKey) : [];
     stack.push(state.sessionKey);
+    state.providerSessionId = providerSessionId;
     this.routes.set(providerSessionId, { providerSessionId, state, stack });
     this.sessionKeyToProviderId.set(state.sessionKey, providerSessionId);
   }
@@ -743,10 +817,19 @@ export class KimiV2Provider implements TransportProvider {
     return { route, becameEmpty: false };
   }
 
-  private cacheModelsFromResponse(resp: unknown): ExtractedModelCatalog {
+  private cacheModelsFromResponse(resp: unknown, state?: KimiSessionState): ExtractedModelCatalog {
     const catalog = extractModelCatalog(resp);
     if (catalog.hasConfigOption) {
-      this.useConfigOptionForModel = true;
+      this.connCaps.modelSwitchMode = 'configOption';
+      if (state) {
+        state.sessionUsesConfigOptions = true;
+        state.modelConfigId = catalog.configId ?? 'model';
+      }
+    } else if (catalog.models.length > 0 && this.connCaps.modelSwitchMode === null) {
+      this.connCaps.modelSwitchMode = 'unstableModel';
+      if (state) {
+        state.sessionUsesConfigOptions = false;
+      }
     }
     if (catalog.models.length > 0 || catalog.defaultModel) {
       this.cachedModels = {
@@ -762,34 +845,176 @@ export class KimiV2Provider implements TransportProvider {
 
   private async switchProviderModel(
     connection: AcpClientConnection,
-    providerSessionId: string,
+    state: KimiSessionState,
     modelId: string,
   ): Promise<void> {
-    if (this.useConfigOptionForModel) {
-      await connection.setSessionConfigOption?.({
-        sessionId: providerSessionId,
-        configId: 'model',
-        value: modelId,
-      });
+    const useConfigOption = state.sessionUsesConfigOptions || this.connCaps.modelSwitchMode === 'configOption';
+    if (useConfigOption) {
+      if (typeof connection.setSessionConfigOption !== 'function') {
+        throw new Error('Provider does not implement setSessionConfigOption');
+      }
+      const outcome = await withTimeoutOutcome(
+        connection.setSessionConfigOption({
+          sessionId: state.providerSessionId,
+          configId: state.modelConfigId ?? 'model',
+          value: modelId,
+        }),
+        this.modeModelTimeoutMs,
+      );
+      if (outcome.timedOut) {
+        throw new Error(`setSessionConfigOption timed out after ${this.modeModelTimeoutMs}ms`);
+      }
       return;
     }
+
     if (typeof connection.unstable_setSessionModel === 'function') {
       try {
-        await connection.unstable_setSessionModel({
-          sessionId: providerSessionId,
-          modelId,
-        });
+        const outcome = await withTimeoutOutcome(
+          connection.unstable_setSessionModel({
+            sessionId: state.providerSessionId,
+            modelId,
+          }),
+          this.modeModelTimeoutMs,
+        );
+        if (outcome.timedOut) {
+          throw new Error(`unstable_setSessionModel timed out after ${this.modeModelTimeoutMs}ms`);
+        }
         return;
       } catch (err) {
         if (!isMethodNotFoundError(err)) throw err;
-        this.useConfigOptionForModel = true;
+        state.sessionUsesConfigOptions = true;
+        state.modelConfigId = state.modelConfigId ?? 'model';
+        this.connCaps.modelSwitchMode = 'configOption';
       }
     }
-    await connection.setSessionConfigOption?.({
-      sessionId: providerSessionId,
-      configId: 'model',
-      value: modelId,
-    });
+
+    if (typeof connection.setSessionConfigOption !== 'function') {
+      throw new Error('Provider supports neither unstable_setSessionModel nor setSessionConfigOption');
+    }
+    const fallbackOutcome = await withTimeoutOutcome(
+      connection.setSessionConfigOption({
+        sessionId: state.providerSessionId,
+        configId: state.modelConfigId ?? 'model',
+        value: modelId,
+      }),
+      this.modeModelTimeoutMs,
+    );
+    if (fallbackOutcome.timedOut) {
+      throw new Error(`setSessionConfigOption timed out after ${this.modeModelTimeoutMs}ms`);
+    }
+  }
+
+  /**
+   * Ensure the provider session is created/resumed/loaded on the active
+   * connection generation before sending or restoring.
+   */
+  private async ensureSessionReady(
+    state: KimiSessionState,
+    connection: AcpClientConnection,
+    options: { allowFresh?: boolean } = {},
+  ): Promise<void> {
+    const allowFresh = options.allowFresh ?? true;
+    if (state.boundConnectionGeneration === this.connectionGeneration && state.providerSessionId) {
+      return;
+    }
+
+    // Reset per-connection session negotiation before rebinding on a new connection.
+    state.sessionUsesConfigOptions = false;
+    state.modelConfigId = null;
+
+    let response: NewSessionResponse | LoadSessionResponse | null = null;
+    let boundId = '';
+
+    if (state.providerSessionId) {
+      const candidateId = state.providerSessionId;
+      if (this.connCaps.sessionResumeSupported && typeof connection.resumeSession === 'function') {
+        this.registerRoute(candidateId, state);
+        try {
+          const outcome = await withTimeoutOutcome(
+            connection.resumeSession({ sessionId: candidateId, cwd: state.cwd, mcpServers: state.mcpServers }),
+            this.sessionTimeoutMs,
+          );
+          if (outcome.timedOut) throw new Error(`kimi acp resumeSession timed out after ${this.sessionTimeoutMs}ms`);
+          response = outcome.value;
+          boundId = candidateId;
+        } catch (err) {
+          this.releaseRoute(state.sessionKey);
+          if (!allowFresh || !isSessionNotFoundError(err)) {
+            throw this.normalizeProviderException(err);
+          }
+        }
+      } else if (this.connCaps.loadSessionSupported && typeof connection.loadSession === 'function') {
+        this.registerRoute(candidateId, state);
+        state.replaying = true;
+        try {
+          const outcome = await withTimeoutOutcome(
+            connection.loadSession({ sessionId: candidateId, cwd: state.cwd, mcpServers: state.mcpServers }),
+            this.sessionTimeoutMs,
+          );
+          if (outcome.timedOut) throw new Error(`kimi acp loadSession timed out after ${this.sessionTimeoutMs}ms`);
+          response = (outcome.value as LoadSessionResponse | undefined) ?? null;
+          boundId = candidateId;
+        } catch (err) {
+          this.releaseRoute(state.sessionKey);
+          if (!allowFresh || !isSessionNotFoundError(err)) {
+            throw this.normalizeProviderException(err);
+          }
+        } finally {
+          state.replaying = false;
+        }
+      } else if (!allowFresh) {
+        const missingErr = new Error(`Cannot restore session ${candidateId}: agent lacks resumeSession and loadSession capabilities`);
+        throw Object.assign(missingErr, { code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND });
+      }
+    }
+
+    if (!boundId) {
+      if (!allowFresh) {
+        const missingErr = new Error('Session not found on provider');
+        throw Object.assign(missingErr, { code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND });
+      }
+      try {
+        const outcome = await withTimeoutOutcome(
+          connection.newSession({ cwd: state.cwd, mcpServers: state.mcpServers }),
+          this.sessionTimeoutMs,
+        );
+        if (outcome.timedOut) {
+          throw new Error(`kimi acp newSession timed out after ${this.sessionTimeoutMs}ms`);
+        }
+        const created = outcome.value;
+        boundId = created.sessionId;
+        response = created;
+        this.registerRoute(boundId, state);
+      } catch (err) {
+        throw this.normalizeProviderException(err);
+      }
+    }
+
+    state.boundConnectionGeneration = this.connectionGeneration;
+
+    const catalog = this.cacheModelsFromResponse(response, state);
+    const desiredModel = state.pendingModel ?? state.model;
+    if (!state.model && catalog.defaultModel) {
+      state.model = catalog.defaultModel;
+    }
+
+    const modes = asRecord(asRecord(response)?.modes);
+    if (isNonEmptyString(modes?.currentModeId)) {
+      state.mode = modes.currentModeId;
+    }
+
+    if (desiredModel && (!catalog.defaultModel || desiredModel !== catalog.defaultModel)) {
+      try {
+        await this.switchProviderModel(connection, state, desiredModel);
+        state.model = desiredModel;
+        state.pendingModel = undefined;
+      } catch (err) {
+        throw this.normalizeProviderException(err);
+      }
+    } else if (desiredModel && desiredModel === catalog.defaultModel) {
+      state.model = desiredModel;
+      state.pendingModel = undefined;
+    }
   }
 
   async createSession(config: SessionConfig): Promise<string> {
@@ -837,7 +1062,6 @@ export class KimiV2Provider implements TransportProvider {
     if (config.skipCreate && requestedResumeId) {
       const existing = this.routes.get(requestedResumeId);
       if (existing) {
-        existing.state.sessionKey = config.sessionKey;
         this.registerRoute(requestedResumeId, existing.state);
         return config.sessionKey;
       }
@@ -846,96 +1070,34 @@ export class KimiV2Provider implements TransportProvider {
     const state: KimiSessionState = {
       sessionKey: config.sessionKey,
       providerSessionId: requestedResumeId ?? '',
+      boundConnectionGeneration: 0,
       cwd,
-      model: requestedModel,
+      model: undefined,
+      pendingModel: requestedModel,
       mode: 'default',
+      sessionUsesConfigOptions: false,
+      modelConfigId: null,
       systemText: systemParts.sessionSystemText,
       systemTextInjected: Boolean(config.startupMemoryAlreadyInjected),
       lastInjectedSessionSystemKey: config.startupMemoryAlreadyInjected
         ? sessionSystemContractKey(systemParts.sessionSystemText)
         : undefined,
       replaying: false,
+      promptInFlight: false,
+      turnGeneration: 0,
       pendingTurn: null,
+      lastStopTurn: null,
+      lastStatusSignature: null,
       activeTools: new Map(),
       pendingApprovals: new Map(),
       mcpServers,
       env: config.env,
     };
 
-    let response: NewSessionResponse | LoadSessionResponse | null = null;
-    let resolvedProviderId = requestedResumeId ?? '';
-
-    if (requestedResumeId && ((this.sessionResumeSupported && typeof connection.resumeSession === 'function') || (this.loadSessionSupported && typeof connection.loadSession === 'function'))) {
-      this.registerRoute(requestedResumeId, state);
-      const tryResume = this.sessionResumeSupported && typeof connection.resumeSession === 'function';
-      try {
-        if (tryResume) {
-          const outcome = await withTimeoutOutcome(
-            connection.resumeSession!({ sessionId: requestedResumeId, cwd, mcpServers }),
-            this.sessionTimeoutMs,
-          );
-          if (outcome.timedOut) throw new Error(`kimi acp resumeSession timed out after ${this.sessionTimeoutMs}ms`);
-          response = outcome.value;
-        } else {
-          state.replaying = true;
-          const outcome = await withTimeoutOutcome(
-            connection.loadSession!({ sessionId: requestedResumeId, cwd, mcpServers }),
-            this.sessionTimeoutMs,
-          );
-          if (outcome.timedOut) throw new Error(`kimi acp loadSession timed out after ${this.sessionTimeoutMs}ms`);
-          response = (outcome.value as LoadSessionResponse | undefined) ?? null;
-        }
-      } catch (err) {
-        this.releaseRoute(config.sessionKey);
-        if (!isSessionNotFoundError(err)) {
-          throw this.normalizeProviderException(err);
-        }
-        resolvedProviderId = '';
-      } finally {
-        state.replaying = false;
-      }
-    }
-
-    if (!resolvedProviderId) {
-      try {
-        const outcome = await withTimeoutOutcome(
-          connection.newSession({ cwd, mcpServers }),
-          this.sessionTimeoutMs,
-        );
-        if (outcome.timedOut) {
-          throw new Error(`kimi acp newSession timed out after ${this.sessionTimeoutMs}ms`);
-        }
-        const created = outcome.value;
-        resolvedProviderId = created.sessionId;
-        response = created;
-        state.providerSessionId = resolvedProviderId;
-        this.registerRoute(resolvedProviderId, state);
-      } catch (err) {
-        throw this.normalizeProviderException(err);
-      }
-    }
-
-    const catalog = this.cacheModelsFromResponse(response);
-    if (!state.model && catalog.defaultModel) {
-      state.model = catalog.defaultModel;
-    }
-
-    const modes = asRecord(asRecord(response)?.modes);
-    if (isNonEmptyString(modes?.currentModeId)) {
-      state.mode = modes.currentModeId;
-    }
-
-    if (requestedModel && (!catalog.defaultModel || requestedModel !== catalog.defaultModel)) {
-      try {
-        await this.switchProviderModel(connection, resolvedProviderId, requestedModel);
-        state.model = requestedModel;
-      } catch (err) {
-        throw this.normalizeProviderException(err);
-      }
-    }
+    await this.ensureSessionReady(state, connection, { allowFresh: true });
 
     this.emitSessionInfo(config.sessionKey, {
-      resumeId: resolvedProviderId,
+      resumeId: state.providerSessionId,
       model: state.model,
     });
 
@@ -951,54 +1113,67 @@ export class KimiV2Provider implements TransportProvider {
         cwd: route.state.cwd,
         env: route.state.env,
       });
-      if (this.sessionResumeSupported && typeof connection.resumeSession === 'function') {
-        const resp = await connection.resumeSession({
-          sessionId: route.providerSessionId,
-          cwd: route.state.cwd,
-          mcpServers: route.state.mcpServers,
-        });
-        this.cacheModelsFromResponse(resp);
-        return true;
-      }
-      if (this.loadSessionSupported && typeof connection.loadSession === 'function') {
-        route.state.replaying = true;
-        try {
-          const resp = await connection.loadSession({
-            sessionId: route.providerSessionId,
-            cwd: route.state.cwd,
-            mcpServers: route.state.mcpServers,
-          });
-          this.cacheModelsFromResponse(resp);
-          return true;
-        } finally {
-          route.state.replaying = false;
-        }
-      }
-      return this.isChildAlive();
+      await this.ensureSessionReady(route.state, connection, { allowFresh: false });
+      return true;
     } catch (err) {
       if (isSessionNotFoundError(err)) return false;
       throw this.normalizeProviderException(err);
     }
   }
 
-  async listSessions(options?: RemoteSessionListOptions): Promise<RemoteSessionInfo[]> {
-    const connection = await this.ensureConnected();
-    if ((!this.sessionListSupported && typeof connection.listSessions !== 'function') || typeof connection.listSessions !== 'function') {
-      return Array.from(this.routes.values()).map((r) => ({
-        key: r.providerSessionId,
-        directory: r.state.cwd,
-        agentId: r.state.model,
-      }));
+  async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
+    try {
+      await this.ensureConnected();
+    } catch {
+      return [];
     }
-    const resp = await connection.listSessions({
-      cwd: options?.directory ? normalizeTransportCwd(canonicalizeTransportCwd(options.directory)) : undefined,
-    });
-    return (resp.sessions ?? []).map((entry) => ({
-      key: entry.sessionId,
-      displayName: entry.title ?? undefined,
-      directory: entry.cwd,
-      updatedAt: entry.updatedAt ? Date.parse(entry.updatedAt) || undefined : undefined,
-    }));
+    const directoryRequested = options.directory !== undefined;
+    const queryDirectory = normalizeTransportCwd(options.directory);
+    const expectedDirectory = canonicalizeTransportCwd(options.directory);
+    if (
+      (directoryRequested && (!queryDirectory || !expectedDirectory))
+      || !this.connection
+      || !this.connCaps.sessionListSupported
+      || typeof this.connection.listSessions !== 'function'
+    ) {
+      return [];
+    }
+
+    const sessions: RemoteSessionInfo[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    do {
+      const outcome = await withTimeoutOutcome(
+        this.connection.listSessions({
+          ...(queryDirectory ? { cwd: queryDirectory } : {}),
+          ...(cursor ? { cursor } : {}),
+        }),
+        this.sessionTimeoutMs,
+      );
+      if (outcome.timedOut) {
+        throw new Error(`kimi acp listSessions timed out after ${this.sessionTimeoutMs}ms`);
+      }
+      const result = outcome.value;
+      for (const entry of result.sessions ?? []) {
+        const directory = canonicalizeTransportCwd(entry.cwd);
+        if (!directory || (expectedDirectory && directory !== expectedDirectory)) continue;
+        const updatedAt = entry.updatedAt ? Date.parse(entry.updatedAt) : Number.NaN;
+        sessions.push({
+          key: entry.sessionId,
+          ...(entry.title ? { displayName: entry.title } : {}),
+          directory: entry.cwd.trim(),
+          ...(Number.isFinite(updatedAt) ? { updatedAt } : {}),
+        });
+      }
+      const nextCursor = typeof result.nextCursor === 'string' && result.nextCursor
+        ? result.nextCursor
+        : undefined;
+      if (!nextCursor || seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    } while (cursor);
+
+    return sessions;
   }
 
   async detachSession(sessionId: string): Promise<void> {
@@ -1006,7 +1181,7 @@ export class KimiV2Provider implements TransportProvider {
     if (!released) return;
     if (released.becameEmpty && released.route.state.pendingTurn) {
       this.rejectPendingApprovals(released.route.state, new Error('Session detached'));
-      this.failTurn(released.route.state, new Error('Session detached'), PROVIDER_ERROR_CODES.CANCELLED, true);
+      this.failTurn(released.route.state, released.route.state.pendingTurn, new Error('Session detached'), PROVIDER_ERROR_CODES.CANCELLED, true);
     }
   }
 
@@ -1018,15 +1193,17 @@ export class KimiV2Provider implements TransportProvider {
 
     this.rejectPendingApprovals(route.state, new Error('Session ended'));
     if (route.state.pendingTurn) {
-      this.failTurn(route.state, new Error('Session ended'), PROVIDER_ERROR_CODES.CANCELLED, true);
+      this.failTurn(route.state, route.state.pendingTurn, new Error('Session ended'), PROVIDER_ERROR_CODES.CANCELLED, true);
     }
-    if (this.sessionCloseSupported && this.connection?.closeSession && this.isChildAlive()) {
-      try {
-        await this.connection.closeSession({ sessionId: route.providerSessionId });
-      } catch {
-        /* best-effort remote close */
-      }
+    this.clearStatus(route.state.sessionKey, route.state);
+
+    if (this.connCaps.sessionCloseSupported && this.connection?.closeSession && this.isChildAlive()) {
+      await withTimeoutOutcome(
+        this.connection.closeSession({ sessionId: route.providerSessionId }),
+        this.closeTimeoutMs,
+      ).catch(() => {});
     }
+
     if (this.routes.size === 0) {
       await this.teardownChildProcess();
     }
@@ -1034,7 +1211,9 @@ export class KimiV2Provider implements TransportProvider {
 
   setSessionAgentId(sessionId: string, agentId: string): void {
     const route = this.resolveRoute(sessionId);
-    if (route) {
+    if (!route) return;
+    route.state.pendingModel = agentId;
+    if (!route.state.promptInFlight && (!this.connection || !this.isChildAlive())) {
       route.state.model = agentId;
     }
   }
@@ -1044,13 +1223,17 @@ export class KimiV2Provider implements TransportProvider {
     if (!route) {
       throw new Error(`Unknown session: ${sessionId}`);
     }
-    route.state.model = agentId;
-    if (!this.connection || !this.isChildAlive()) {
+    const { state } = route;
+    if (!this.connection || !this.isChildAlive() || state.boundConnectionGeneration !== this.connectionGeneration) {
+      state.pendingModel = agentId;
       return SESSION_MODEL_APPLIED.NEXT_START;
     }
-    await this.switchProviderModel(this.connection, route.providerSessionId, agentId);
-    this.emitSessionInfo(route.state.sessionKey, { model: agentId });
-    return route.state.pendingTurn ? SESSION_MODEL_APPLIED.NEXT_START : SESSION_MODEL_APPLIED.LIVE;
+
+    await this.switchProviderModel(this.connection, state, agentId);
+    state.model = agentId;
+    state.pendingModel = undefined;
+    this.emitSessionInfo(state.sessionKey, { model: agentId });
+    return state.promptInFlight ? SESSION_MODEL_APPLIED.NEXT_START : SESSION_MODEL_APPLIED.LIVE;
   }
 
   async listModels(force = false): Promise<ProviderModelList> {
@@ -1059,7 +1242,6 @@ export class KimiV2Provider implements TransportProvider {
       return this.cachedModels;
     }
 
-    // Reuse any already-discovered models from live sessions before spawning an ephemeral probe.
     const anyRoute = this.routes.values().next().value as AcpRoute | undefined;
     if (!force && anyRoute && this.cachedModels?.models.length) {
       return this.cachedModels;
@@ -1075,8 +1257,11 @@ export class KimiV2Provider implements TransportProvider {
         return { models: [], isAuthenticated: false, error: 'Model discovery timed out' };
       }
       const catalog = this.cacheModelsFromResponse(probe.value);
-      if (this.sessionCloseSupported && probe.value.sessionId && connection.closeSession) {
-        void connection.closeSession({ sessionId: probe.value.sessionId }).catch(() => {});
+      if (this.connCaps.sessionCloseSupported && probe.value.sessionId && connection.closeSession) {
+        void withTimeoutOutcome(
+          connection.closeSession({ sessionId: probe.value.sessionId }),
+          this.closeTimeoutMs,
+        ).catch(() => {});
       }
       return {
         models: catalog.models,
@@ -1097,6 +1282,11 @@ export class KimiV2Provider implements TransportProvider {
     }
   }
 
+  /**
+   * Send-start admission boundary: ensures connection and session readiness,
+   * invokes ACP `session/prompt`, then resolves once `prompt` is submitted while
+   * tracking the native prompt completion asynchronously.
+   */
   async send(
     sessionId: string,
     payload: string | ProviderContextPayload,
@@ -1108,66 +1298,78 @@ export class KimiV2Provider implements TransportProvider {
       throw new Error(`Unknown session: ${sessionId}`);
     }
     const { state } = route;
+    if (state.promptInFlight) {
+      throw new Error(`Session ${sessionId} already has an in-flight turn`);
+    }
+
     const normalized = normalizeProviderPayload(payload, attachments, extraSystemPrompt);
-
-    const turnId = `kimi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const terminalTarget = {};
-    let resolveTurn!: () => void;
-    let rejectTurn!: (err: Error) => void;
-    const promise = new Promise<void>((resolve, reject) => {
-      resolveTurn = resolve;
-      rejectTurn = reject;
-    });
-
-    let markSettled!: () => void;
-    const settledPromise = new Promise<void>((resolve) => {
-      markSettled = resolve;
+    const generation = ++state.turnGeneration;
+    let resolvePhysicalTerminal!: () => void;
+    const physicalTerminal = new Promise<void>((resolve) => {
+      resolvePhysicalTerminal = resolve;
     });
 
     const turn: PendingTurn = {
-      messageId: turnId,
+      generation,
+      messageId: `kimi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       accumulated: '',
       assistantTextClosed: false,
-      userInitiatedCancel: false,
-      cancelRejectCode: null,
+      cancelled: false,
       cancelGraceTimer: null,
-      terminalTarget,
+      terminalTarget: {},
+      physicalTerminal,
+      resolvePhysicalTerminal,
       settled: false,
-      resolve: resolveTurn,
-      reject: rejectTurn,
-      settledPromise,
-      markSettled,
       wireSlot: this.reserveWireSlot(),
     };
+
+    state.promptInFlight = true;
     state.pendingTurn = turn;
+    state.lastStopTurn = turn;
+    state.lastStatusSignature = null;
 
-    const connectionReady = this.connection && this.isChildAlive() ? this.connection : null;
-    if (connectionReady) {
-      const contentBlocks = this.prepareTurnPromptBlocks(state, normalized, attachments);
-      void this.drivePrompt(connectionReady, state, turn, contentBlocks);
-      return promise;
-    }
-
-    void (async () => {
-      try {
-        const connection = await this.ensureConnected({
-          sessionKey: state.sessionKey,
-          cwd: state.cwd,
-          env: state.env,
-        });
-        if (turn.settled || turn.userInitiatedCancel) {
-          this.failTurn(state, new Error('Turn cancelled'), PROVIDER_ERROR_CODES.CANCELLED, true);
-          return;
-        }
-        const contentBlocks = this.prepareTurnPromptBlocks(state, normalized, attachments);
-        await this.drivePrompt(connection, state, turn, contentBlocks);
-      } catch (err) {
-        const normalizedErr = this.normalizeProviderException(err);
-        const code = (normalizedErr as { code?: string }).code ?? inferErrorCode(err);
-        this.failTurn(state, normalizedErr, code, code === PROVIDER_ERROR_CODES.CANCELLED);
+    try {
+      const connection = await this.ensureConnected({
+        sessionKey: state.sessionKey,
+        cwd: state.cwd,
+        env: state.env,
+      });
+      if (turn.cancelled || state.turnGeneration !== generation || this.resolveRoute(sessionId)?.state !== state) {
+        throw Object.assign(new Error('Turn cancelled before prompt submission'), { code: PROVIDER_ERROR_CODES.CANCELLED });
       }
-    })();
-    return promise;
+
+      await this.ensureSessionReady(state, connection, { allowFresh: true });
+      if (turn.cancelled || state.turnGeneration !== generation || this.resolveRoute(sessionId)?.state !== state) {
+        throw Object.assign(new Error('Turn cancelled before prompt submission'), { code: PROVIDER_ERROR_CODES.CANCELLED });
+      }
+
+      const contentBlocks = this.prepareTurnPromptBlocks(state, normalized, attachments);
+      const capturedChild = this.child;
+      if (!capturedChild) {
+        throw new Error('kimi acp child process unavailable at prompt boundary');
+      }
+
+      const promptRpc = connection.prompt({
+        sessionId: state.providerSessionId,
+        prompt: contentBlocks,
+      });
+
+      // Only captured child exit or actual ACP prompt RPC completion counts as physical stop proof.
+      const onCapturedExit = () => {
+        turn.resolvePhysicalTerminal();
+      };
+      capturedChild.once('exit', onCapturedExit);
+      capturedChild.once('close', onCapturedExit);
+
+      void this.trackPromptSettlement(promptRpc, capturedChild, onCapturedExit, state, turn);
+    } catch (err) {
+      const normalizedErr = this.normalizeProviderException(err);
+      const code = (normalizedErr as { code?: string }).code ?? inferErrorCode(err);
+      this.failTurn(state, turn, normalizedErr, code, code === PROVIDER_ERROR_CODES.CANCELLED);
+      // No ACP prompt RPC was invoked and no captured child needs stop confirmation.
+      turn.resolvePhysicalTerminal();
+      throw normalizedErr;
+    }
   }
 
   private prepareTurnPromptBlocks(
@@ -1214,7 +1416,7 @@ export class KimiV2Provider implements TransportProvider {
       if (!att.daemonPath) continue;
       const mime = att.mime ?? inferImageMime(att.daemonPath) ?? undefined;
       const isImage = att.type === 'image' || Boolean(mime && mime.startsWith('image/'));
-      if (isImage && this.promptImageSupported) {
+      if (isImage && this.connCaps.promptImageSupported) {
         try {
           const st = statSync(att.daemonPath);
           if (st.isFile() && st.size > 0 && st.size <= MAX_INLINE_IMAGE_BYTES) {
@@ -1241,48 +1443,42 @@ export class KimiV2Provider implements TransportProvider {
     return blocks;
   }
 
-  private async drivePrompt(
-    connection: AcpClientConnection,
+  private async trackPromptSettlement(
+    promptRpc: Promise<PromptResponse>,
+    capturedChild: ChildProcess,
+    onCapturedExit: () => void,
     state: KimiSessionState,
     turn: PendingTurn,
-    prompt: ContentBlock[],
   ): Promise<void> {
     try {
-      const response: PromptResponse = await connection.prompt({
-        sessionId: state.providerSessionId,
-        prompt,
-      });
+      const response = await promptRpc;
       await turn.wireSlot;
-      if (turn.settled) return;
+      if (turn.settled || state.turnGeneration !== turn.generation) return;
       const stopReason: StopReason | undefined = response?.stopReason;
-      if (stopReason === 'cancelled') {
-        const err = new Error('Turn cancelled');
-        this.failTurn(state, err, PROVIDER_ERROR_CODES.CANCELLED, true);
+      if (stopReason === 'cancelled' || turn.cancelled) {
+        this.failTurn(state, turn, new Error('Turn cancelled'), PROVIDER_ERROR_CODES.CANCELLED, true);
         return;
       }
       this.settleTurn(state, turn);
     } catch (err) {
       await turn.wireSlot;
-      if (turn.settled) return;
+      if (turn.settled || state.turnGeneration !== turn.generation) return;
       const normalized = this.normalizeProviderException(err);
-      const code = turn.userInitiatedCancel && turn.cancelRejectCode
-        ? turn.cancelRejectCode
-        : (normalized as { code?: string }).code ?? inferErrorCode(err);
-      this.failTurn(state, normalized, code, code === PROVIDER_ERROR_CODES.CANCELLED);
+      const code = turn.cancelled ? PROVIDER_ERROR_CODES.CANCELLED : (normalized as { code?: string }).code ?? inferErrorCode(err);
+      this.failTurn(state, turn, normalized, code, code === PROVIDER_ERROR_CODES.CANCELLED);
+    } finally {
+      capturedChild.removeListener('exit', onCapturedExit);
+      capturedChild.removeListener('close', onCapturedExit);
+      turn.resolvePhysicalTerminal();
     }
   }
 
   private settleTurn(state: KimiSessionState, turn: PendingTurn): void {
     if (turn.settled) return;
     turn.settled = true;
-    if (turn.cancelGraceTimer) {
-      clearTimeout(turn.cancelGraceTimer);
-      turn.cancelGraceTimer = null;
-    }
-    if (state.pendingTurn === turn) {
-      state.pendingTurn = null;
-    }
+    this.clearTurnTimersAndState(state, turn);
     this.clearActiveTools(state);
+    this.clearStatus(state.sessionKey, state);
     this.emitComplete(state.sessionKey, {
       id: turn.messageId,
       sessionId: state.sessionKey,
@@ -1293,30 +1489,31 @@ export class KimiV2Provider implements TransportProvider {
       status: 'complete',
       ...(state.model ? { metadata: { model: state.model } } : {}),
     });
-    turn.markSettled();
-    turn.resolve();
   }
 
-  private failTurn(state: KimiSessionState, err: Error, code: string, recoverable: boolean): void {
-    const turn = state.pendingTurn;
-    if (!turn || turn.settled) return;
+  private failTurn(state: KimiSessionState, turn: PendingTurn, err: Error, code: string, recoverable: boolean): void {
+    if (turn.settled) return;
     turn.settled = true;
-    if (turn.cancelGraceTimer) {
-      clearTimeout(turn.cancelGraceTimer);
-      turn.cancelGraceTimer = null;
-    }
-    if (state.pendingTurn === turn) {
-      state.pendingTurn = null;
-    }
+    this.clearTurnTimersAndState(state, turn);
     this.clearActiveTools(state);
+    this.clearStatus(state.sessionKey, state);
     this.lastErrorCode = code;
     this.emitError(state.sessionKey, {
       code,
       message: err.message,
       recoverable,
     });
-    turn.markSettled();
-    turn.reject(err);
+  }
+
+  private clearTurnTimersAndState(state: KimiSessionState, turn: PendingTurn): void {
+    if (turn.cancelGraceTimer) {
+      clearTimeout(turn.cancelGraceTimer);
+      turn.cancelGraceTimer = null;
+    }
+    if (state.pendingTurn === turn) {
+      state.pendingTurn = null;
+      state.promptInFlight = false;
+    }
   }
 
   private clearActiveTools(state: KimiSessionState): void {
@@ -1334,51 +1531,98 @@ export class KimiV2Provider implements TransportProvider {
     state.activeTools.clear();
   }
 
+  private emitStatus(sessionId: string, state: KimiSessionState, status: ProviderStatusUpdate): void {
+    const sig = `${status.status ?? ''}\0${status.label ?? ''}`;
+    if (state.lastStatusSignature === sig) return;
+    state.lastStatusSignature = sig;
+    for (const cb of this.statusHandlers) cb(sessionId, status);
+  }
+
+  private clearStatus(sessionId: string, state: KimiSessionState): void {
+    if (state.lastStatusSignature === null) return;
+    state.lastStatusSignature = null;
+    for (const cb of this.statusHandlers) cb(sessionId, { status: null, label: null });
+  }
+
   async cancel(sessionId: string, options?: ProviderCancelOptions): Promise<void> {
     const route = this.resolveRoute(sessionId);
     if (!route) return;
     const { state } = route;
+    this.rejectPendingApprovals(state, new Error('Session cancelled'));
     const turn = state.pendingTurn;
-    if (turn) {
-      turn.userInitiatedCancel = true;
-      turn.cancelRejectCode = options?.reason === 'user_stop' ? PROVIDER_ERROR_CODES.CANCELLED : PROVIDER_ERROR_CODES.CANCELLED;
-      if (!turn.cancelGraceTimer) {
-        turn.cancelGraceTimer = setTimeout(() => {
-          if (state.pendingTurn === turn && !turn.settled) {
-            this.failTurn(state, new Error('kimi acp cancel grace timeout'), PROVIDER_ERROR_CODES.CANCELLED, true);
-          }
-        }, this.cancelGraceMs);
-        turn.cancelGraceTimer.unref?.();
-      }
+    if (!turn || !state.promptInFlight) {
+      this.clearActiveTools(state);
+      this.clearStatus(state.sessionKey, state);
+      return;
     }
-    if (this.connection && this.isChildAlive()) {
+
+    turn.cancelled = true;
+    const generation = turn.generation;
+    const isStaleWatchdog = options?.origin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG;
+
+    if (!turn.cancelGraceTimer) {
+      turn.cancelGraceTimer = setTimeout(() => {
+        void this.handleCancelGraceExpired(route.providerSessionId, state, turn, generation);
+      }, isStaleWatchdog ? Math.min(2_000, this.cancelGraceMs) : this.cancelGraceMs);
+      turn.cancelGraceTimer.unref?.();
+    }
+
+    if (this.connection && this.isChildAlive() && state.providerSessionId) {
       try {
-        await this.connection.cancel({ sessionId: route.providerSessionId });
+        await Promise.race([
+          this.connection.cancel({ sessionId: state.providerSessionId }),
+          new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, Math.min(2_000, this.cancelGraceMs));
+            t.unref?.();
+          }),
+        ]);
       } catch {
         /* ignore cancel RPC failure if child already exited */
       }
     }
   }
 
+  private async handleCancelGraceExpired(
+    providerSessionId: string,
+    state: KimiSessionState,
+    turn: PendingTurn,
+    generation: number,
+  ): Promise<void> {
+    if (this.routes.get(providerSessionId)?.state !== state) return;
+    if (!state.promptInFlight || state.turnGeneration !== generation || state.pendingTurn !== turn) return;
+
+    this.failTurn(
+      state,
+      turn,
+      new Error('kimi acp turn cancelled after cancel grace window'),
+      PROVIDER_ERROR_CODES.CANCELLED,
+      true,
+    );
+    // Physically recycle the wedged process rather than faking a terminal for confirmPromiseStop.
+    await this.teardownChildProcess();
+  }
+
   async cancelAndWait(sessionId: string): Promise<void> {
     const route = this.resolveRoute(sessionId);
     if (!route) return;
     const { state } = route;
-    const turn = state.pendingTurn;
-    if (!turn) return;
-    const connection = this.connection;
-    if (!connection || !this.isChildAlive()) {
-      await turn.settledPromise;
-      return;
+    const turn = state.pendingTurn ?? state.lastStopTurn;
+    if (!turn) {
+      return Promise.reject(new Error('ACP prompt terminal unavailable'));
     }
+    const generation = turn.generation;
+    const isCurrent = () =>
+      this.routes.get(route.providerSessionId)?.state === state
+      && state.turnGeneration === generation;
+
     await confirmPromiseStop(
       turn.terminalTarget,
-      turn.settledPromise,
-      async () => {
-        await this.cancel(sessionId);
+      turn.physicalTerminal,
+      () => {
+        if (!isCurrent()) return Promise.reject(new Error('ACP session owner changed during Stop'));
+        return this.cancel(sessionId);
       },
-      () => this.routes.get(route.providerSessionId)?.state === state
-        && (state.pendingTurn === turn || state.pendingTurn === null),
+      isCurrent,
     );
   }
 
@@ -1416,7 +1660,9 @@ export class KimiV2Provider implements TransportProvider {
       }
 
       case 'agent_thought_chunk': {
-        // Thoughts are internal reasoning chunks in ACP; ignore rather than mixing into visible assistant text.
+        if (state.promptInFlight && !state.pendingTurn?.cancelled) {
+          this.emitStatus(state.sessionKey, state, { status: 'thinking', label: 'Thinking...' });
+        }
         break;
       }
 
@@ -1506,7 +1752,7 @@ export class KimiV2Provider implements TransportProvider {
       }
 
       case 'config_option_update': {
-        const catalog = this.cacheModelsFromResponse({ configOptions: u.configOptions });
+        const catalog = this.cacheModelsFromResponse({ configOptions: u.configOptions }, state);
         if (catalog.defaultModel && catalog.defaultModel !== state.model) {
           state.model = catalog.defaultModel;
           this.emitSessionInfo(state.sessionKey, { model: catalog.defaultModel });
@@ -1630,9 +1876,9 @@ export class KimiV2Provider implements TransportProvider {
     if (!route) return null;
     const { state } = route;
     const activeToolCount = state.activeTools.size;
-    const activeWorkCount = (state.pendingTurn ? 1 : 0) + activeToolCount + state.pendingApprovals.size;
+    const activeWorkCount = (state.promptInFlight ? 1 : 0) + activeToolCount + state.pendingApprovals.size;
     const busyReasons: SessionActivityBusyReason[] = [];
-    if (state.pendingTurn) busyReasons.push('runtime_dispatch');
+    if (state.promptInFlight) busyReasons.push('runtime_dispatch');
     if (activeToolCount > 0) busyReasons.push('open_tool_call');
     if (state.pendingApprovals.size > 0) busyReasons.push('provider_wait');
     return {
@@ -1669,18 +1915,19 @@ export class KimiV2Provider implements TransportProvider {
       connected: Boolean(this.connection && this.isChildAlive()),
       pid: this.child?.pid ?? null,
       providerSessionId: state.providerSessionId,
-      agentInfo: this.agentInfo,
+      connectionGeneration: state.boundConnectionGeneration,
+      agentInfo: this.connCaps.agentInfo,
       capabilities: {
-        resume: this.sessionResumeSupported,
-        list: this.sessionListSupported,
-        close: this.sessionCloseSupported,
-        loadSession: this.loadSessionSupported,
-        image: this.promptImageSupported,
-        embeddedContext: this.promptEmbeddedContextSupported,
+        resume: this.connCaps.sessionResumeSupported,
+        list: this.connCaps.sessionListSupported,
+        close: this.connCaps.sessionCloseSupported,
+        loadSession: this.connCaps.loadSessionSupported,
+        image: this.connCaps.promptImageSupported,
+        embeddedContext: this.connCaps.promptEmbeddedContextSupported,
       },
       model: state.model ?? null,
       mode: state.mode ?? null,
-      inFlightTurn: Boolean(state.pendingTurn),
+      inFlightTurn: state.promptInFlight,
       activeToolCount: state.activeTools.size,
       pendingApprovalCount: state.pendingApprovals.size,
       mcpServerCount: state.mcpServers.length,

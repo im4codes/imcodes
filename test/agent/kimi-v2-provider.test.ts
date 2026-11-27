@@ -6,7 +6,11 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { RequestError } from '@agentclientprotocol/sdk/unstable';
 import type { AcpClientConnection, AcpClientHandlers } from '../../src/agent/providers/acp-client-adapter.js';
-import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
+import { PROVIDER_ERROR_CODES, type ProviderStatusUpdate } from '../../src/agent/transport-provider.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
+import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 
 const {
@@ -17,7 +21,9 @@ const {
   const state = {
     handlers: null as AcpClientHandlers | null,
     conn: null as Record<string, ReturnType<typeof vi.fn>> | null,
+    connQueue: [] as Array<Record<string, ReturnType<typeof vi.fn>>>,
     spawnError: null as (Error & { code?: string }) | null,
+    autoExitOnKill: true,
     children: [] as Array<EventEmitter & {
       stdin: PassThrough;
       stdout: PassThrough;
@@ -32,7 +38,7 @@ const {
   return {
     mockSpawn: vi.fn(),
     mockKillProcessTree: vi.fn(async (child: { killed?: boolean; exitCode?: number | null; emit?: (ev: string, ...args: unknown[]) => void }) => {
-      if (child) {
+      if (child && state.autoExitOnKill) {
         child.killed = true;
         child.exitCode = 0;
         child.emit?.('exit', 0, null);
@@ -53,7 +59,9 @@ vi.mock('node:child_process', async (importOriginal) => {
 vi.mock('../../src/agent/providers/acp-client-adapter.js', () => ({
   createAcpClientConnection: vi.fn((handlers: AcpClientHandlers) => {
     state.handlers = handlers;
-    return state.conn as unknown as AcpClientConnection;
+    const next = state.connQueue.shift() ?? state.conn;
+    state.conn = next;
+    return next as unknown as AcpClientConnection;
   }),
 }));
 
@@ -64,6 +72,10 @@ vi.mock('../../src/util/kill-process-tree.js', async (importOriginal) => {
     killProcessTree: mockKillProcessTree,
   };
 });
+
+vi.mock('../../src/daemon/timeline-emitter.js', () => ({
+  timelineEmitter: { emit: vi.fn() },
+}));
 
 import { KimiV2Provider } from '../../src/agent/providers/kimi-v2.js';
 import { resolveKimiPathForSdk } from '../../src/agent/transport-paths.js';
@@ -82,7 +94,7 @@ function makeFakeChild() {
   emitter.stdin = new PassThrough();
   emitter.stdout = new PassThrough();
   emitter.stderr = new PassThrough();
-  emitter.pid = 42424;
+  emitter.pid = 42424 + state.children.length;
   emitter.exitCode = null;
   emitter.signalCode = null;
   emitter.killed = false;
@@ -140,7 +152,10 @@ function makeMockConn(overrides: Record<string, unknown> = {}) {
           category: 'model',
           type: 'select',
           currentValue: 'kimi-k2.5',
-          options: [{ value: 'kimi-k2.5', name: 'Kimi K2.5' }],
+          options: [
+            { value: 'kimi-k2.5', name: 'Kimi K2.5' },
+            { value: 'kimi-for-coding', name: 'Kimi for Coding' },
+          ],
         },
       ],
     })),
@@ -213,9 +228,14 @@ describe('resolveKimiPathForSdk (v2 + legacy fallback)', () => {
 
 describe('KimiV2Provider', () => {
   beforeEach(() => {
+    resetTransportQueueStoreForTests();
+    resetContextStoreClientForTests();
+    resetAllSummarySyncHistories();
     state.handlers = null;
     state.spawnError = null;
+    state.autoExitOnKill = true;
     state.children = [];
+    state.connQueue = [];
     state.conn = makeMockConn();
     mockSpawn.mockReset();
     mockKillProcessTree.mockClear();
@@ -232,427 +252,441 @@ describe('KimiV2Provider', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
+    resetTransportQueueStoreForTests();
+    resetContextStoreClientForTests();
+    resetAllSummarySyncHistories();
   });
 
-  it('exposes kimi-sdk identity, attachment capability, compact capability, and spawns with detached process group', async () => {
-    const provider = new KimiV2Provider();
-    expect(provider.id).toBe('kimi-sdk');
-    expect(provider.capabilities.attachments).toBe(true);
-    expect(provider.capabilities.compact?.execution).toBe('slash-command');
-    expect(provider.capabilities.compact?.providerCommand).toBe('/compact');
-    expect(provider.capabilities.compact?.reassertsSessionSystemText).toBe(false);
+  it('honors explicit ProviderConfig.binaryPath over KIMI_CLI_PATH and candidate fallbacks', async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'kimi-binpath-'));
+    const origCliPath = process.env.KIMI_CLI_PATH;
+    try {
+      const envBin = path.join(tmpDir, 'env-kimi');
+      const cfgBin = path.join(tmpDir, 'cfg-kimi');
+      writeFileSync(envBin, '#!/bin/sh\necho env\n');
+      writeFileSync(cfgBin, '#!/bin/sh\necho cfg\n');
+      chmodSync(envBin, 0o755);
+      chmodSync(cfgBin, 0o755);
 
-    await provider.connect({});
-    await provider.createSession({ sessionKey: 'sess-1', cwd: os.tmpdir() });
+      process.env.KIMI_CLI_PATH = envBin;
+      const provider = new KimiV2Provider();
+      await provider.connect({ binaryPath: cfgBin });
+      await provider.createSession({ sessionKey: 'sess-bin', cwd: tmpDir });
 
-    expect(mockSpawn).toHaveBeenCalledTimes(1);
-    const [cmd, args, opts] = mockSpawn.mock.calls[0]!;
-    expect(typeof cmd).toBe('string');
-    expect(args).toEqual(['acp']);
-    expect((opts as { detached?: boolean }).detached).toBe(process.platform !== 'win32');
-
-    await provider.disconnect();
-    expect(mockKillProcessTree).toHaveBeenCalledWith(expect.anything(), { ownsProcessGroup: true });
+      expect(mockSpawn).toHaveBeenCalledTimes(1);
+      expect(mockSpawn.mock.calls[0]![0]).toBe(cfgBin);
+      await provider.disconnect();
+    } finally {
+      if (origCliPath === undefined) delete process.env.KIMI_CLI_PATH;
+      else process.env.KIMI_CLI_PATH = origCliPath;
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 
-  it('extracts models from v2 configOptions, caches for 30s, refreshes on force, and switches via setSessionConfigOption', async () => {
-    const provider = new KimiV2Provider();
-    await provider.connect({});
-
-    const infoEvents: Array<{ sessionId: string; info: Record<string, unknown> }> = [];
-    provider.onSessionInfo((sid, info) => infoEvents.push({ sessionId: sid, info: info as Record<string, unknown> }));
-
-    await provider.createSession({ sessionKey: 'sess-models', cwd: os.tmpdir() });
-
-    const list1 = await provider.listModels();
-    expect(list1.isAuthenticated).toBe(true);
-    expect(list1.defaultModel).toBe('kimi-k2.5');
-    expect(list1.models).toEqual([
-      { id: 'kimi-k2.5', name: 'Kimi K2.5' },
-      { id: 'kimi-for-coding', name: 'Kimi for Coding' },
-    ]);
-    // Reused live session catalog without spawning an extra probe
-    expect(state.conn!.newSession).toHaveBeenCalledTimes(1);
-
-    // Apply model via v2 setSessionConfigOption when configOptions present
-    const applied = await provider.applySessionModel('sess-models', 'kimi-for-coding');
-    expect(applied).toBe(SESSION_MODEL_APPLIED.LIVE);
-    expect(state.conn!.setSessionConfigOption).toHaveBeenCalledWith({
-      sessionId: 'kimi-sess-1',
-      configId: 'model',
-      value: 'kimi-for-coding',
-    });
-
-    // Live config_option_update notification updates session model & cache
-    await state.handlers!.sessionUpdate({
-      sessionId: 'kimi-sess-1',
-      update: {
-        sessionUpdate: 'config_option_update',
-        configOptions: [
-          {
-            id: 'model',
-            name: 'Model',
-            category: 'model',
-            type: 'select',
-            currentValue: 'kimi-k2.6',
-            options: [{ value: 'kimi-k2.6', name: 'Kimi K2.6' }],
-          },
-        ],
-      } as never,
-    });
-    expect(infoEvents.some((e) => e.info.model === 'kimi-k2.6')).toBe(true);
-
-    // Force probe invokes newSession + closeSession
-    await provider.listModels(true);
-    expect(state.conn!.newSession).toHaveBeenCalledTimes(2);
-    expect(state.conn!.closeSession).toHaveBeenCalledWith({ sessionId: 'kimi-sess-1' });
-
-    await provider.disconnect();
-  });
-
-  it('supports legacy 1.x model catalog and -32601 fallback from unstable_setSessionModel to setSessionConfigOption', async () => {
+  it('implements send-start admission boundary separately from prompt completion and refuses fake cancel terminal on grace expiry', async () => {
+    vi.useFakeTimers();
+    state.autoExitOnKill = false;
+    let resolvePrompt!: (v: { stopReason: string }) => void;
     state.conn = makeMockConn({
-      initialize: vi.fn(async () => ({
-        protocolVersion: 1,
-        agentInfo: { name: 'Kimi CLI', version: '1.44.0' },
-        agentCapabilities: {
-          loadSession: true,
-          promptCapabilities: { image: false, audio: false, embeddedContext: false },
-        },
-      })),
-      newSession: vi.fn(async () => ({
-        sessionId: 'legacy-1',
-        models: {
-          currentModelId: 'kimi-k1',
-          availableModels: [{ modelId: 'kimi-k1', name: 'Kimi K1' }],
-        },
-      })),
-      unstable_setSessionModel: vi.fn(async () => {
-        throw new RequestError(-32601, 'Method not found');
-      }),
+      prompt: vi.fn(() => new Promise((r) => { resolvePrompt = r; })),
     });
 
-    const provider = new KimiV2Provider();
+    const provider = new KimiV2Provider({ cancelGraceMs: 50 });
+    const completes: Array<{ content: string }> = [];
+    const errors: Array<{ code: string }> = [];
+    provider.onComplete((_, m) => completes.push({ content: m.content }));
+    provider.onError((_, e) => errors.push({ code: e.code }));
+
     await provider.connect({});
-    await provider.createSession({ sessionKey: 'sess-legacy', cwd: os.tmpdir() });
+    await provider.createSession({ sessionKey: 'sess-adm', cwd: os.tmpdir() });
 
-    const list = await provider.listModels();
-    expect(list.defaultModel).toBe('kimi-k1');
-    expect(list.models).toEqual([{ id: 'kimi-k1', name: 'Kimi K1' }]);
+    // send() must resolve right after invoking prompt() even while promptRpc stays pending
+    await expect(provider.send('sess-adm', 'turn A')).resolves.toBeUndefined();
+    expect(state.conn!.prompt).toHaveBeenCalledTimes(1);
+    expect(completes).toHaveLength(0);
 
-    await provider.applySessionModel('sess-legacy', 'kimi-k2.5');
-    expect(state.conn!.unstable_setSessionModel).toHaveBeenCalledOnce();
-    expect(state.conn!.setSessionConfigOption).toHaveBeenCalledWith({
-      sessionId: 'legacy-1',
-      configId: 'model',
-      value: 'kimi-k2.5',
-    });
+    // Busy guard blocks overlapping send() while turn A is still in flight
+    await expect(provider.send('sess-adm', 'turn B')).rejects.toThrow(/in-flight/i);
+
+    // Start cancelAndWait while prompt ignores cancel AND child refuses to exit when grace fires
+    let stopResolved = false;
+    const stopPromise = provider.cancelAndWait('sess-adm').then(() => { stopResolved = true; });
+    await vi.advanceTimersByTimeAsync(100);
+
+    // Grace timer cancelled local in-flight state, emitted error, called killProcessTree,
+    // yet did NOT fake a physical stop proof because captured prompt & child did not exit.
+    expect(mockKillProcessTree).toHaveBeenCalledTimes(1);
+    expect(errors.some((e) => e.code === PROVIDER_ERROR_CODES.CANCELLED)).toBe(true);
+    expect(stopResolved).toBe(false);
+
+    // Settling the original captured prompt physically completes stop confirmation
+    resolvePrompt({ stopReason: 'cancelled' });
+    await stopPromise;
+    expect(stopResolved).toBe(true);
 
     await provider.disconnect();
   });
 
-  it('uses session/resume when resume capability exists, falls back to loadSession with replay suppression, and creates new on session-not-found', async () => {
+  it('coordinates with TransportSessionRuntime for send-start queuing and Stop-and-send confirmation', async () => {
+    let resolveFirst!: (v: { stopReason: string }) => void;
+    let resolveSecond!: (v: { stopReason: string }) => void;
+    const promptFn = vi.fn()
+      .mockImplementationOnce(() => new Promise((r) => { resolveFirst = r; }))
+      .mockImplementationOnce(() => new Promise((r) => { resolveSecond = r; }));
+    state.conn = makeMockConn({ prompt: promptFn });
+
     const provider = new KimiV2Provider();
     await provider.connect({});
+    const runtime = new TransportSessionRuntime(provider, 'deck_kimi_v2_rt');
+    try {
+      await runtime.initialize({ sessionKey: 'deck_kimi_v2_rt', cwd: os.tmpdir() });
+      const sentA = runtime.send('msg A', 'id-a');
+      await vi.waitFor(() => expect(promptFn).toHaveBeenCalledTimes(1));
 
-    // 1. v2 resume path
-    await provider.createSession({ sessionKey: 'sess-resume', cwd: os.tmpdir(), resumeId: 'prev-v2' });
-    expect(state.conn!.resumeSession).toHaveBeenCalledWith({
-      sessionId: 'prev-v2',
+      // While A is in flight, B stays queued and cannot preempt A
+      const sentB = runtime.send('msg B', 'id-b');
+      await Promise.resolve();
+      expect(promptFn).toHaveBeenCalledTimes(1);
+
+      // Stop-and-send waits for physical terminal of A before releasing B
+      let stopDone = false;
+      const cancelPromise = runtime.cancel({ waitForProvider: true }).then(() => { stopDone = true; });
+      await vi.waitFor(() => expect(state.conn!.cancel).toHaveBeenCalledWith({ sessionId: 'kimi-sess-1' }));
+      expect(stopDone).toBe(false);
+      expect(promptFn).toHaveBeenCalledTimes(1);
+
+      resolveFirst({ stopReason: 'cancelled' });
+      await Promise.all([sentA, cancelPromise]);
+      expect(stopDone).toBe(true);
+
+      await vi.waitFor(() => expect(promptFn).toHaveBeenCalledTimes(2));
+      resolveSecond({ stopReason: 'end_turn' });
+      await sentB;
+    } finally {
+      await runtime.kill({ reason: 'test_cleanup' });
+    }
+  });
+
+  it('awaits a single shared initialize across concurrent createSession calls, re-resumes after child crash, and bounds close timeout', async () => {
+    let resolveInit!: (val: unknown) => void;
+    const conn1 = makeMockConn({
+      initialize: vi.fn(() => new Promise((r) => { resolveInit = r; })),
+      newSession: vi.fn()
+        .mockResolvedValueOnce({ sessionId: 's1', configOptions: [] })
+        .mockResolvedValueOnce({ sessionId: 's2', configOptions: [] }),
+    });
+    const conn2 = makeMockConn({
+      resumeSession: vi.fn(async () => ({ configOptions: [] })),
+    });
+    state.connQueue.push(conn1, conn2);
+
+    const provider = new KimiV2Provider({ closeTimeoutMs: 30 });
+    await provider.connect({});
+
+    // Two concurrent createSession calls must share ONE initialize() and wait for capabilities
+    const p1 = provider.createSession({ sessionKey: 'k1', cwd: os.tmpdir() });
+    const p2 = provider.createSession({ sessionKey: 'k2', cwd: os.tmpdir() });
+    await vi.waitFor(() => expect(conn1.initialize).toHaveBeenCalledTimes(1));
+    expect(conn1.newSession).not.toHaveBeenCalled();
+
+    resolveInit({
+      protocolVersion: 1,
+      agentInfo: { name: 'Kimi Code CLI', version: '2.8.1' },
+      agentCapabilities: {
+        loadSession: true,
+        promptCapabilities: { image: true },
+        sessionCapabilities: { list: {}, resume: {}, close: {} },
+      },
+    });
+    await Promise.all([p1, p2]);
+    expect(conn1.initialize).toHaveBeenCalledTimes(1);
+    expect(provider.getSessionDiagnostics('k2')).toMatchObject({ capabilities: { resume: true, image: true } });
+
+    // Crash child 1 unexpectedly; next send on k1 must respawn and resumeSession before prompt!
+    state.children[0]!.exitCode = 1;
+    state.children[0]!.emit('exit', 1, null);
+
+    await provider.send('k1', 'after crash');
+    expect(conn2.initialize).toHaveBeenCalledTimes(1);
+    expect(conn2.resumeSession).toHaveBeenCalledWith({
+      sessionId: 's1',
       cwd: expect.any(String),
       mcpServers: expect.any(Array),
     });
-    expect(state.conn!.loadSession).not.toHaveBeenCalled();
+    expect(conn2.prompt).toHaveBeenCalledTimes(1);
 
-    // 2. Resume returns session-not-found -> falls back to newSession
-    state.conn!.resumeSession.mockRejectedValueOnce(new RequestError(-32002, 'Session not found'));
-    await provider.createSession({ sessionKey: 'sess-missing', cwd: os.tmpdir(), resumeId: 'gone-id' });
+    // closeSession hanging must not block endSession teardown
+    conn2.closeSession.mockImplementationOnce(() => new Promise(() => {}));
+    await provider.endSession('k2');
+    await provider.endSession('k1');
+    expect(mockKillProcessTree).toHaveBeenCalledWith(state.children[1], { ownsProcessGroup: true });
+  });
+
+  it('falls back cleanly to newSession when createSession has resumeId but agent supports neither resume nor load', async () => {
+    state.conn = makeMockConn({
+      initialize: vi.fn(async () => ({
+        protocolVersion: 1,
+        agentInfo: { name: 'Minimal Kimi', version: '1.0.0' },
+        agentCapabilities: {},
+      })),
+      newSession: vi.fn(async () => ({ sessionId: 'fresh-fallback-1' })),
+    });
+
+    const provider = new KimiV2Provider();
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-no-res', cwd: os.tmpdir(), resumeId: 'old-id' });
     expect(state.conn!.newSession).toHaveBeenCalledTimes(1);
-
+    expect(provider.getSessionDiagnostics('sess-no-res')).toMatchObject({ providerSessionId: 'fresh-fallback-1' });
     await provider.disconnect();
+  });
 
-    // 3. Legacy loadSession suppresses replayed chunks
-    const deltas: string[] = [];
+  it('gates listSessions by initialize capability, paginates across cursors, and filters by canonical directory', async () => {
+    // Even though acp-client-adapter always exposes listSessions(), missing sessionCapabilities.list must skip RPC
     state.conn = makeMockConn({
       initialize: vi.fn(async () => ({
         protocolVersion: 1,
         agentInfo: { name: 'Kimi CLI', version: '1.44.0' },
         agentCapabilities: { loadSession: true },
       })),
-      loadSession: vi.fn(async () => {
-        await state.handlers!.sessionUpdate({
-          sessionId: 'legacy-prev',
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: 'replayed history chunk' },
-          } as never,
-        });
-        return {};
-      }),
     });
+    const noListProvider = new KimiV2Provider();
+    await noListProvider.connect({});
+    expect(await noListProvider.listSessions()).toEqual([]);
+    expect(state.conn!.listSessions).not.toHaveBeenCalled();
+    await noListProvider.disconnect();
 
-    const legacyProvider = new KimiV2Provider();
-    legacyProvider.onDelta((_, d) => deltas.push(d.delta));
-    await legacyProvider.connect({});
-    await legacyProvider.createSession({ sessionKey: 'sess-load', cwd: os.tmpdir(), resumeId: 'legacy-prev' });
-    expect(state.conn!.loadSession).toHaveBeenCalledOnce();
-    expect(deltas).toEqual([]);
-
-    await legacyProvider.disconnect();
+    // With list capability: collects multiple pages, stops on repeated cursor, filters cwd
+    const dirA = mkdtempSync(path.join(os.tmpdir(), 'kimi-dir-a-'));
+    const dirB = mkdtempSync(path.join(os.tmpdir(), 'kimi-dir-b-'));
+    try {
+      state.conn = makeMockConn({
+        listSessions: vi.fn()
+          .mockResolvedValueOnce({
+            sessions: [
+              { sessionId: 's-a1', title: 'A1', cwd: dirA, updatedAt: '2026-11-28T00:00:00Z' },
+              { sessionId: 's-b1', title: 'B1', cwd: dirB, updatedAt: '2026-11-28T00:00:00Z' },
+            ],
+            nextCursor: 'c2',
+          })
+          .mockResolvedValueOnce({
+            sessions: [
+              { sessionId: 's-a2', title: 'A2', cwd: dirA, updatedAt: '2026-11-28T01:00:00Z' },
+            ],
+            nextCursor: 'c2', // repeated cursor guard terminates loop
+          }),
+      });
+      const listProvider = new KimiV2Provider();
+      await listProvider.connect({});
+      const listed = await listProvider.listSessions({ directory: dirA });
+      expect(state.conn!.listSessions).toHaveBeenCalledTimes(2);
+      expect(listed.map((s) => s.key)).toEqual(['s-a1', 's-a2']);
+      await listProvider.disconnect();
+    } finally {
+      rmSync(dirA, { recursive: true, force: true });
+      rmSync(dirB, { recursive: true, force: true });
+    }
   });
 
-  it('encodes image attachments as image ContentBlocks when supported and resource_link otherwise', async () => {
-    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'kimi-attach-'));
+  it('keeps existing model when server rejects applySessionModel and renegotiates capabilities on v2 -> v1 reconnect', async () => {
+    const v2Conn = makeMockConn({
+      setSessionConfigOption: vi.fn()
+        .mockRejectedValueOnce(new RequestError(-32602, 'Invalid model'))
+        .mockResolvedValue({ configOptions: [] }),
+    });
+    const v1Conn = makeMockConn({
+      initialize: vi.fn(async () => ({
+        protocolVersion: 1,
+        agentInfo: { name: 'Kimi CLI', version: '1.44.0' },
+        agentCapabilities: { loadSession: true },
+      })),
+      loadSession: vi.fn(async () => ({
+        models: {
+          currentModelId: 'kimi-k1',
+          availableModels: [
+            { modelId: 'kimi-k1', name: 'Kimi K1' },
+            { modelId: 'kimi-k1-pro', name: 'Kimi K1 Pro' },
+          ],
+        },
+      })),
+      unstable_setSessionModel: vi.fn(async () => ({})),
+    });
+    state.connQueue.push(v2Conn, v1Conn);
+
+    const provider = new KimiV2Provider();
+    const completes: Array<{ metadata?: Record<string, unknown> }> = [];
+    provider.onComplete((_, m) => completes.push({ metadata: m.metadata }));
+
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-mod', cwd: os.tmpdir() });
+
+    // Server rejects invalid switch -> state.model must stay 'kimi-k2.5'
+    await expect(provider.applySessionModel('sess-mod', 'bad-model')).rejects.toThrow(/Invalid model/);
+    expect(provider.getSessionDiagnostics('sess-mod')?.model).toBe('kimi-k2.5');
+
+    await provider.send('sess-mod', 'hello');
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+    expect(completes[0]!.metadata?.model).toBe('kimi-k2.5');
+
+    // v2 crashes and reconnects to legacy v1: provider must NOT stick on v2 configOption mode
+    state.children[0]!.exitCode = 1;
+    state.children[0]!.emit('exit', 1, null);
+
+    await provider.send('sess-mod', 'on legacy now');
+    expect(v1Conn.loadSession).toHaveBeenCalledTimes(1);
+
+    await provider.applySessionModel('sess-mod', 'kimi-k1-pro');
+    expect(v1Conn.unstable_setSessionModel).toHaveBeenCalledWith({
+      sessionId: 'kimi-sess-1',
+      modelId: 'kimi-k1-pro',
+    });
+    expect(v1Conn.setSessionConfigOption).not.toHaveBeenCalled();
+
+    await provider.disconnect();
+  });
+
+  it('emits transient thinking status on agent_thought_chunk without polluting assistant content and clears status on turn end', async () => {
+    let resolvePrompt!: (val: { stopReason: string }) => void;
+    state.conn = makeMockConn({
+      prompt: vi.fn(() => new Promise((r) => { resolvePrompt = r; })),
+    });
+
+    const provider = new KimiV2Provider();
+    const statuses: ProviderStatusUpdate[] = [];
+    const deltas: string[] = [];
+    const completes: string[] = [];
+    provider.onStatus((_, s) => statuses.push(s));
+    provider.onDelta((_, d) => deltas.push(d.delta));
+    provider.onComplete((_, m) => completes.push(m.content));
+
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-think', cwd: os.tmpdir() });
+    await provider.send('sess-think', 'reason then answer');
+
+    await state.handlers!.sessionUpdate({
+      sessionId: 'kimi-sess-1',
+      update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'hidden chain of thought' } } as never,
+    });
+    await state.handlers!.sessionUpdate({
+      sessionId: 'kimi-sess-1',
+      update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'more thought' } } as never,
+    });
+    await state.handlers!.sessionUpdate({
+      sessionId: 'kimi-sess-1',
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'visible reply' } } as never,
+    });
+
+    resolvePrompt({ stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+
+    expect(statuses).toEqual([
+      { status: 'thinking', label: 'Thinking...' },
+      { status: null, label: null },
+    ]);
+    expect(deltas).toEqual(['visible reply']);
+    expect(completes).toEqual(['visible reply']);
+
+    await provider.disconnect();
+  });
+
+  it('covers attachments, usage_update {used, size} + tokens, -32000 auth, ENOENT, requestPermission, and detachSession', async () => {
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'kimi-misc-'));
     try {
       const imgPath = path.join(tmpDir, 'shot.png');
       const txtPath = path.join(tmpDir, 'notes.txt');
       writeFileSync(imgPath, Buffer.from('pngbytes'));
       writeFileSync(txtPath, 'hello notes');
 
+      const usages: unknown[] = [];
+      const completes: Array<{ content: string }> = [];
       const provider = new KimiV2Provider();
-      await provider.connect({});
-      await provider.createSession({ sessionKey: 'sess-img', cwd: tmpDir });
+      provider.onUsage((_, u) => usages.push(u));
+      provider.onComplete((_, m) => completes.push({ content: m.content }));
 
-      await provider.send('sess-img', 'look at these', [
+      await provider.connect({});
+      await provider.createSession({ sessionKey: 'sess-misc', cwd: tmpDir });
+
+      state.conn!.prompt.mockImplementationOnce(async () => {
+        await state.handlers!.sessionUpdate({
+          sessionId: 'kimi-sess-1',
+          update: { sessionUpdate: 'usage_update', used: 12000, size: 262144 } as never,
+        });
+        await state.handlers!.sessionUpdate({
+          sessionId: 'kimi-sess-1',
+          update: { sessionUpdate: 'usage_update', tokens: { input: 500, output: 100, cached: 50, limit: 128000 } } as never,
+        });
+        await state.handlers!.sessionUpdate({
+          sessionId: 'kimi-sess-1',
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'done' } } as never,
+        });
+        return { stopReason: 'end_turn' };
+      });
+
+      await provider.send('sess-misc', 'inspect', [
         { id: '1', daemonPath: imgPath, originalName: 'shot.png', mime: 'image/png', type: 'image', size: 8 },
         { id: '2', daemonPath: txtPath, originalName: 'notes.txt', mime: 'text/plain', type: 'file', size: 11 },
       ]);
+      await vi.waitFor(() => expect(completes).toHaveLength(1));
 
       const promptArg = state.conn!.prompt.mock.calls[0]![0] as { prompt: Array<Record<string, unknown>> };
-      expect(promptArg.prompt[0]).toEqual({ type: 'text', text: 'look at these' });
-      expect(promptArg.prompt[1]).toEqual({
-        type: 'image',
-        data: Buffer.from('pngbytes').toString('base64'),
-        mimeType: 'image/png',
-      });
-      expect(promptArg.prompt[2]).toMatchObject({
-        type: 'resource_link',
-        name: 'notes.txt',
-        mimeType: 'text/plain',
-      });
-      expect(String(promptArg.prompt[2]!.uri)).toMatch(/^file:\/\//);
+      expect(promptArg.prompt[1]).toMatchObject({ type: 'image', mimeType: 'image/png' });
+      expect(promptArg.prompt[2]).toMatchObject({ type: 'resource_link', name: 'notes.txt' });
+      expect(usages).toEqual([
+        expect.objectContaining({ usage: { input_tokens: 12000, model_context_window: 262144 } }),
+        expect.objectContaining({
+          usage: {
+            input_tokens: 500,
+            output_tokens: 100,
+            cached_input_tokens: 50,
+            cache_read_input_tokens: 50,
+            model_context_window: 128000,
+          },
+        }),
+      ]);
 
+      // /compact passes raw '/compact' cleanly without context wrapper
+      await provider.send('sess-misc', '/compact');
+      const compactArg = state.conn!.prompt.mock.calls[1]![0] as { prompt: Array<{ text: string }> };
+      expect(compactArg.prompt[0]!.text).toBe('/compact');
+
+      // Approval round-trip & detach without closeSession
+      const approvals: Array<{ id: string }> = [];
+      provider.onApprovalRequest((_, r) => approvals.push({ id: r.id }));
+      const permPromise = state.handlers!.requestPermission({
+        sessionId: 'kimi-sess-1',
+        toolCall: { toolCallId: 'tc-1', title: 'bash', kind: 'execute' },
+        options: [{ optionId: 'approve_once', name: 'Allow', kind: 'allow_once' }],
+      } as never);
+      await provider.respondApproval('sess-misc', approvals[0]!.id, true);
+      expect(await permPromise).toEqual({ outcome: { outcome: 'selected', optionId: 'approve_once' } });
+
+      await provider.detachSession('sess-misc');
+      expect(state.conn!.closeSession).not.toHaveBeenCalled();
       await provider.disconnect();
+
+      // -32000 auth error in listModels + ENOENT on spawn
+      state.conn = makeMockConn({
+        newSession: vi.fn(async () => { throw new RequestError(-32000, 'Authentication required'); }),
+      });
+      const authProvider = new KimiV2Provider();
+      await authProvider.connect({});
+      expect(await authProvider.listModels()).toMatchObject({
+        models: [],
+        isAuthenticated: false,
+        error: expect.stringContaining('/login'),
+      });
+      await authProvider.disconnect();
+
+      state.conn = makeMockConn({ initialize: vi.fn(() => new Promise(() => {})) });
+      state.spawnError = Object.assign(new Error('spawn kimi ENOENT'), { code: 'ENOENT' });
+      const enoentProvider = new KimiV2Provider();
+      await enoentProvider.connect({});
+      await expect(enoentProvider.createSession({ sessionKey: 's-missing', cwd: tmpDir })).rejects.toMatchObject({
+        code: PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        message: expect.stringContaining('@moonshot-ai/kimi-code'),
+      });
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
-  });
-
-  it('maps v2 usage_update { used, size } and legacy { tokens } cleanly, and resets stream/identity on tool_call and /compact', async () => {
-    const provider = new KimiV2Provider();
-    await provider.connect({});
-    await provider.createSession({
-      sessionKey: 'sess-stream',
-      cwd: os.tmpdir(),
-      identityPrompt: 'IDENTITY_CONTRACT_V1',
-    });
-
-    const usages: unknown[] = [];
-    const deltas: Array<{ messageId: string; delta: string }> = [];
-    const completes: Array<{ id: string; content: string }> = [];
-    provider.onUsage((_, u) => usages.push(u));
-    provider.onDelta((_, d) => deltas.push({ messageId: d.messageId, delta: d.delta }));
-    provider.onComplete((_, m) => completes.push({ id: m.id, content: m.content }));
-
-    state.conn!.prompt.mockImplementationOnce(async () => {
-      await state.handlers!.sessionUpdate({
-        sessionId: 'kimi-sess-1',
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Part A' } } as never,
-      });
-      await state.handlers!.sessionUpdate({
-        sessionId: 'kimi-sess-1',
-        update: { sessionUpdate: 'tool_call', toolCallId: 'tc-1', title: 'read_file', kind: 'read', status: 'completed' } as never,
-      });
-      await state.handlers!.sessionUpdate({
-        sessionId: 'kimi-sess-1',
-        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Part B' } } as never,
-      });
-      await state.handlers!.sessionUpdate({
-        sessionId: 'kimi-sess-1',
-        update: { sessionUpdate: 'usage_update', used: 12000, size: 262144 } as never,
-      });
-      await state.handlers!.sessionUpdate({
-        sessionId: 'kimi-sess-1',
-        update: { sessionUpdate: 'usage_update', tokens: { input: 500, output: 100, cached: 50, limit: 128000 } } as never,
-      });
-      return { stopReason: 'end_turn' };
-    });
-
-    await provider.send('sess-stream', {
-      userMessage: 'hi',
-      assembledMessage: 'hi',
-      sessionSystemText: 'IDENTITY_CONTRACT_V1',
-      context: {
-        sessionSystemText: 'IDENTITY_CONTRACT_V1',
-        requiredAuthoredContext: [],
-        advisoryAuthoredContext: [],
-        appliedDocumentVersionIds: [],
-        diagnostics: [],
-      },
-      authority: {
-        namespace: { scope: 'personal', projectId: 'p1' },
-        authoritySource: 'none',
-        freshness: 'missing',
-        fallbackAllowed: true,
-        retryScheduled: false,
-        providerPolicyOutcome: 'allowed',
-        diagnostics: [],
-      },
-      supportClass: 'full-normalized-context-injection',
-      diagnostics: [],
-    });
-
-    // Cross-message streaming rotated messageId after tool_call
-    expect(deltas).toHaveLength(2);
-    expect(deltas[0]!.messageId).not.toBe(deltas[1]!.messageId);
-    expect(completes[0]!.content).toBe('Part B');
-
-    expect(usages).toEqual([
-      expect.objectContaining({
-        model: 'kimi-k2.5',
-        usage: { input_tokens: 12000, model_context_window: 262144 },
-      }),
-      expect.objectContaining({
-        model: 'kimi-k2.5',
-        usage: {
-          input_tokens: 500,
-          output_tokens: 100,
-          cached_input_tokens: 50,
-          cache_read_input_tokens: 50,
-          model_context_window: 128000,
-        },
-      }),
-    ]);
-
-    // /compact passes raw '/compact' and clears cached identity so next turn re-injects
-    await provider.send('sess-stream', '/compact');
-    const compactPrompt = state.conn!.prompt.mock.calls[1]![0] as { prompt: Array<{ text: string }> };
-    expect(compactPrompt.prompt[0]!.text).toBe('/compact');
-
-    await provider.send('sess-stream', {
-      userMessage: 'after compact',
-      assembledMessage: 'after compact',
-      sessionSystemText: 'IDENTITY_CONTRACT_V1',
-      context: {
-        sessionSystemText: 'IDENTITY_CONTRACT_V1',
-        requiredAuthoredContext: [],
-        advisoryAuthoredContext: [],
-        appliedDocumentVersionIds: [],
-        diagnostics: [],
-      },
-      authority: {
-        namespace: { scope: 'personal', projectId: 'p1' },
-        authoritySource: 'none',
-        freshness: 'missing',
-        fallbackAllowed: true,
-        retryScheduled: false,
-        providerPolicyOutcome: 'allowed',
-        diagnostics: [],
-      },
-      supportClass: 'full-normalized-context-injection',
-      diagnostics: [],
-    });
-    const postCompactPrompt = state.conn!.prompt.mock.calls[2]![0] as { prompt: Array<{ text: string }> };
-    expect(postCompactPrompt.prompt[0]!.text).toContain('IDENTITY_CONTRACT_V1');
-
-    await provider.disconnect();
-  });
-
-  it('handles -32000 auth errors in listModels and ENOENT spawn errors cleanly, plus safe getSessionDiagnostics', async () => {
-    state.conn = makeMockConn({
-      newSession: vi.fn(async () => {
-        throw new RequestError(-32000, 'Authentication required');
-      }),
-    });
-    const provider = new KimiV2Provider();
-    await provider.connect({});
-    const unauth = await provider.listModels();
-    expect(unauth.isAuthenticated).toBe(false);
-    expect(unauth.models).toEqual([]);
-    expect(unauth.error).toContain('/login');
-    await provider.disconnect();
-
-    state.conn = makeMockConn({
-      initialize: vi.fn(() => new Promise(() => {})),
-    });
-    state.spawnError = Object.assign(new Error('spawn kimi ENOENT'), { code: 'ENOENT' });
-    const missing = new KimiV2Provider();
-    await missing.connect({});
-    await expect(missing.createSession({ sessionKey: 's-missing', cwd: os.tmpdir() })).rejects.toMatchObject({
-      code: PROVIDER_ERROR_CODES.CONFIG_ERROR,
-      message: expect.stringContaining('@moonshot-ai/kimi-code'),
-    });
-
-    // Safe diagnostics verification
-    state.spawnError = null;
-    state.conn = makeMockConn();
-    const diagProvider = new KimiV2Provider();
-    await diagProvider.connect({ apiKey: 'sk-super-secret-token' });
-    await diagProvider.createSession({
-      sessionKey: 'sess-diag',
-      cwd: os.tmpdir(),
-      env: { SECRET_VAR: 'top-secret' },
-    });
-    const diag = diagProvider.getSessionDiagnostics('sess-diag');
-    const serialized = JSON.stringify(diag);
-    expect(diag).toMatchObject({
-      provider: 'kimi-sdk',
-      implementation: 'kimi-v2',
-      connected: true,
-      providerSessionId: 'kimi-sess-1',
-      model: 'kimi-k2.5',
-      capabilities: { resume: true, image: true },
-    });
-    expect(serialized).not.toContain('sk-super-secret-token');
-    expect(serialized).not.toContain('top-secret');
-    await diagProvider.disconnect();
-  });
-
-  it('supports cancelAndWait, requestPermission/respondApproval, listSessions, and detachSession', async () => {
-    const provider = new KimiV2Provider();
-    await provider.connect({});
-    await provider.createSession({ sessionKey: 'sess-ctrl', cwd: os.tmpdir() });
-
-    const approvals: Array<{ id: string }> = [];
-    provider.onApprovalRequest((_sid, req) => approvals.push({ id: req.id }));
-
-    const permPromise = state.handlers!.requestPermission({
-      sessionId: 'kimi-sess-1',
-      toolCall: { toolCallId: 'tc-perm', title: 'bash', kind: 'execute', rawInput: { cmd: 'ls' } },
-      options: [
-        { optionId: 'approve_once', name: 'Allow once', kind: 'allow_once' },
-        { optionId: 'reject', name: 'Reject', kind: 'reject_once' },
-      ],
-    } as never);
-    expect(approvals).toHaveLength(1);
-    await provider.respondApproval('sess-ctrl', approvals[0]!.id, true);
-    expect(await permPromise).toEqual({ outcome: { outcome: 'selected', optionId: 'approve_once' } });
-
-    const listed = await provider.listSessions();
-    expect(listed).toEqual([
-      expect.objectContaining({ key: 'kimi-sess-1', displayName: 'Repo work' }),
-    ]);
-
-    // cancelAndWait waits for original prompt completion, not cancel RPC return
-    let resolvePrompt!: (val: { stopReason: string }) => void;
-    state.conn!.prompt.mockImplementationOnce(() => new Promise((r) => { resolvePrompt = r; }));
-    const sendPromise = provider.send('sess-ctrl', 'long run').catch((e: Error) => e);
-
-    let waitFinished = false;
-    const stopPromise = provider.cancelAndWait('sess-ctrl').then(() => { waitFinished = true; });
-    await vi.waitFor(() => {
-      expect(state.conn!.cancel).toHaveBeenCalledWith({ sessionId: 'kimi-sess-1' });
-    });
-    expect(waitFinished).toBe(false);
-
-    resolvePrompt({ stopReason: 'cancelled' });
-    await stopPromise;
-    expect(waitFinished).toBe(true);
-    await sendPromise;
-
-    await provider.detachSession('sess-ctrl');
-    expect(state.conn!.closeSession).not.toHaveBeenCalled();
-
-    await provider.disconnect();
   });
 });

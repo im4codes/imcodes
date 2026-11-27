@@ -16,6 +16,7 @@ import {
   resolveCursorCmdLauncherPlan,
   resolveCursorLaunchPlan,
   hasPendingCursorStagedUpdate,
+  resolveKimiPathForSdk,
 } from '../../src/agent/transport-paths.js';
 
 describe('normalizeTransportCwd', () => {
@@ -579,6 +580,43 @@ describe('resolveBinaryOnWindows', () => {
   });
 });
 
+describe('resolveKimiPathForSdk (v2 + legacy fallback)', () => {
+  it('prefers KIMI_CLI_PATH, then KIMI_CODE_HOME/bin, then ~/.kimi-code/bin, before ~/.local/bin', () => {
+    if (process.platform === 'win32') return;
+    const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'kimi-tp-test-'));
+    try {
+      const makeExec = (rel: string): string => {
+        const p = path.join(tmpDir, rel);
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        fs.writeFileSync(p, '#!/bin/sh\nexit 0\n');
+        fs.chmodSync(p, 0o755);
+        return p;
+      };
+      const overrideBin = makeExec('custom/kimi-override');
+      const customHomeBin = makeExec('kimi-home/bin/kimi');
+      const v2Bin = makeExec('.kimi-code/bin/kimi');
+      const legacyBin = makeExec('.local/bin/kimi');
+
+      expect(resolveKimiPathForSdk('kimi', {
+        HOME: tmpDir,
+        KIMI_CODE_HOME: path.join(tmpDir, 'kimi-home'),
+        KIMI_CLI_PATH: overrideBin,
+        PATH: '/usr/bin',
+      })).toBe(overrideBin);
+      expect(resolveKimiPathForSdk('kimi', {
+        HOME: tmpDir,
+        KIMI_CODE_HOME: path.join(tmpDir, 'kimi-home'),
+        PATH: '/usr/bin',
+      })).toBe(customHomeBin);
+      expect(resolveKimiPathForSdk('kimi', { HOME: tmpDir, PATH: '/usr/bin' })).toBe(v2Bin);
+      fs.rmSync(v2Bin);
+      expect(resolveKimiPathForSdk('kimi', { HOME: tmpDir, PATH: '/usr/bin' })).toBe(legacyBin);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('resolveExecutableForSpawn', () => {
   it('returns input unchanged on non-Windows', () => {
     const origPlatform = process.platform;
@@ -689,6 +727,43 @@ describe('resolveClaudeCodePathForSdk', () => {
       process.env.PATH = origPath;
       if (origAppData === undefined) delete process.env.APPDATA; else process.env.APPDATA = origAppData;
       if (origPathExt === undefined) delete process.env.PATHEXT; else process.env.PATHEXT = origPathExt;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('resolveKimiPathForSdk (v2 + legacy fallback)', () => {
+  it('prefers KIMI_CLI_PATH, then KIMI_CODE_HOME/bin, then ~/.kimi-code/bin, before ~/.local/bin', () => {
+    if (process.platform === 'win32') return;
+    const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'kimi-tp-test-'));
+    try {
+      const makeExec = (rel: string): string => {
+        const p = path.join(tmpDir, rel);
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        fs.writeFileSync(p, '#!/bin/sh\nexit 0\n');
+        fs.chmodSync(p, 0o755);
+        return p;
+      };
+      const overrideBin = makeExec('custom/kimi-override');
+      const customHomeBin = makeExec('kimi-home/bin/kimi');
+      const v2Bin = makeExec('.kimi-code/bin/kimi');
+      const legacyBin = makeExec('.local/bin/kimi');
+
+      expect(resolveKimiPathForSdk('kimi', {
+        HOME: tmpDir,
+        KIMI_CODE_HOME: path.join(tmpDir, 'kimi-home'),
+        KIMI_CLI_PATH: overrideBin,
+        PATH: '/usr/bin',
+      })).toBe(overrideBin);
+      expect(resolveKimiPathForSdk('kimi', {
+        HOME: tmpDir,
+        KIMI_CODE_HOME: path.join(tmpDir, 'kimi-home'),
+        PATH: '/usr/bin',
+      })).toBe(customHomeBin);
+      expect(resolveKimiPathForSdk('kimi', { HOME: tmpDir, PATH: '/usr/bin' })).toBe(v2Bin);
+      fs.rmSync(v2Bin);
+      expect(resolveKimiPathForSdk('kimi', { HOME: tmpDir, PATH: '/usr/bin' })).toBe(legacyBin);
+    } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
