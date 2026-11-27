@@ -32,10 +32,15 @@ import {
 import type { RemoteVoiceProviderInfo } from '@shared/remote-voice.js';
 import { applyVoiceHotwordPostProcess, type CompiledVoiceHotwords } from '@shared/voice-hotwords.js';
 import {
+  getActiveVoiceHotwordProject,
   getCompiledVoiceHotwordsForProject,
   getShareHotwordsWithOthers,
+  getVoiceHotwordsScopeSnapshot,
+  isVoiceHotwordsScopeValid,
+  normalizeVoiceHotwordProjectKey,
   resolveRemoteVoiceHotwordsForProvider,
   type VoiceHotwordProjectInput,
+  type VoiceHotwordsScopeSnapshot,
 } from '../voice-hotwords.js';
 import type { PluginListenerHandle } from '@capacitor/core';
 import {
@@ -370,6 +375,8 @@ interface NativeSession {
   deferAudioPause: boolean;
   captureStarted: boolean;
   startInvoked: boolean;
+  accountKey?: string | null;
+  scopeEpoch?: number;
   startedHotwordsKey?: string;
   abortPendingStart?: (() => void) | null;
   handles: PluginListenerHandle[];
@@ -442,6 +449,8 @@ interface WebSession {
   primed: boolean;
   deferAudioPause: boolean;
   captureStarted: boolean;
+  accountKey?: string | null;
+  scopeEpoch?: number;
   lastText: string;
   emittedFinal: boolean;
   earlyError: string | null;
@@ -453,6 +462,9 @@ interface PrimedWebOutcome {
   error: string | null;
   text: string | null;
   endedWithCapture: boolean;
+  accountKey?: string | null;
+  scopeEpoch?: number;
+  startedHotwordsKey?: string;
 }
 
 let _listening = false;
@@ -678,12 +690,19 @@ interface EagerRemoteStartState {
   donePromise: Promise<void>;
   resolveDone: () => void;
 }
+interface HotwordsSessionContext {
+  scope: VoiceHotwordsScopeSnapshot;
+  projectKey: string | null;
+  termsKey: string;
+}
+
 let _pendingRemoteAbort: AbortController | null = null;
 let _pendingRemoteStart: EagerRemoteStartState | null = null;
 let _activeRemoteSession: {
   handle: ActiveRemoteVoiceSessionHandle;
   owner: CaptureOwner;
   generation: number;
+  context: HotwordsSessionContext;
 } | null = null;
 let _pendingRemoteStop: Promise<void> | null = null;
 let _pendingRemoteStopMicReleased: Promise<void> | null = null;
@@ -1168,6 +1187,9 @@ async function attachSessionListeners(
             error: null,
             text: bufferedText,
             endedWithCapture: true,
+            accountKey: session.accountKey,
+            scopeEpoch: session.scopeEpoch,
+            startedHotwordsKey: session.startedHotwordsKey,
           };
         } else {
           clearPrewarmCaches();
@@ -1176,6 +1198,8 @@ async function attachSessionListeners(
             error: _lastError ?? 'Speech recognition stopped before capture started',
             text: null,
             endedWithCapture: false,
+            accountKey: session.accountKey,
+            scopeEpoch: session.scopeEpoch,
           };
         }
         setOwnerListening(session.owner, false);
@@ -1593,6 +1617,54 @@ function canAcceptHotwordsForRecognition(recognition: NativeSpeechRecognition | 
     && recognition !== getPlatformFallbackSpeechRecognition();
 }
 
+function getExpectedNativeRecognitionForHotwords(): NativeSpeechRecognition | undefined {
+  if (isPcAppNativeSpeech()) return undefined;
+  try {
+    return getNativeSpeechRecognition();
+  } catch {
+    return undefined;
+  }
+}
+
+function getExpectedNativeHotwordsKey(terms: readonly string[] | undefined): string {
+  if (isPcAppNativeSpeech()) {
+    return serializeHotwordsTerms(terms);
+  }
+  const canPass = isStreamingSpeechAvailable()
+    && getVoiceRecognitionEngine() !== 'system'
+    && getExpectedNativeRecognitionForHotwords() !== getPlatformFallbackSpeechRecognition();
+  return serializeHotwordsTerms(canPass ? terms : undefined);
+}
+
+function captureHotwordsSessionContext(options?: { projectKey?: VoiceHotwordProjectInput }): {
+  compiledHotwords: CompiledVoiceHotwords;
+  context: HotwordsSessionContext;
+} {
+  const scope = getVoiceHotwordsScopeSnapshot();
+  const hasExplicitProjectKey = Boolean(options && 'projectKey' in options);
+  const projectKey = hasExplicitProjectKey
+    ? normalizeVoiceHotwordProjectKey(options!.projectKey ?? null)
+    : getActiveVoiceHotwordProject();
+  const compiledHotwords = hasExplicitProjectKey
+    ? getCompiledVoiceHotwordsForProject(options!.projectKey ?? null)
+    : getCompiledVoiceHotwordsForProject();
+  return {
+    compiledHotwords,
+    context: {
+      scope,
+      projectKey,
+      termsKey: serializeHotwordsTerms(compiledHotwords.terms),
+    },
+  };
+}
+
+function isSameHotwordsContext(a: HotwordsSessionContext, b: HotwordsSessionContext): boolean {
+  return a.scope.accountKey === b.scope.accountKey
+    && a.scope.epoch === b.scope.epoch
+    && a.projectKey === b.projectKey
+    && a.termsKey === b.termsKey;
+}
+
 async function startListeningInternal(session: NativeSession): Promise<boolean> {
   const { generation } = session;
   const primaryRecognition = session.recognition;
@@ -1815,6 +1887,9 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
       pauseBackgroundAudio();
     }
     const awaitSessionStartCall = (target: NativeSpeechRecognition, opts: Record<string, unknown>): Promise<unknown> => {
+      session.startedHotwordsKey = serializeHotwordsTerms(
+        Array.isArray(opts.hotwords) ? (opts.hotwords as string[]) : undefined,
+      );
       const startCall = withTimeout(
         target.start(opts),
         NATIVE_START_TIMEOUT_MS,
@@ -2049,11 +2124,12 @@ function clearWebStartConfirmTimer(session: WebSession | null): void {
 
 function startWebListening(
   owner: CaptureOwner,
-  options?: { primed?: boolean; deferAudioPause?: boolean; isFallback?: boolean },
+  options?: { primed?: boolean; deferAudioPause?: boolean; isFallback?: boolean; scope?: VoiceHotwordsScopeSnapshot },
 ): boolean {
   const primed = options?.primed === true;
   const deferAudioPause = options?.deferAudioPause === true;
   const isFallback = options?.isFallback === true;
+  const scope = options?.scope ?? getVoiceHotwordsScopeSnapshot();
   const Ctor = getWebSpeechCtor();
   if (!Ctor) {
     if (!primed) {
@@ -2093,6 +2169,8 @@ function startWebListening(
       primed,
       deferAudioPause,
       captureStarted: false,
+      accountKey: scope.accountKey,
+      scopeEpoch: scope.epoch,
       lastText: '',
       emittedFinal: false,
       earlyError: null,
@@ -2144,7 +2222,14 @@ function startWebListening(
             clearWebRecHandlers(rec);
             if (_webSession === session) _webSession = null;
             _generation++;
-            _primedOutcome = { generation: _generation, error: mapped, text: null, endedWithCapture: false };
+            _primedOutcome = {
+              generation: _generation,
+              error: mapped,
+              text: null,
+              endedWithCapture: false,
+              accountKey: session.accountKey,
+              scopeEpoch: session.scopeEpoch,
+            };
             retireOwner(session.owner);
             stopWebLevelMeter();
             try { rec.abort?.(); } catch { /* already ended */ }
@@ -2167,7 +2252,14 @@ function startWebListening(
         if (_webSession === session) _webSession = null;
         _generation++;
         if (session.primed) {
-          _primedOutcome = { generation: _generation, error: err, text: null, endedWithCapture: false };
+          _primedOutcome = {
+            generation: _generation,
+            error: err,
+            text: null,
+            endedWithCapture: false,
+            accountKey: session.accountKey,
+            scopeEpoch: session.scopeEpoch,
+          };
           retireOwner(session.owner);
           stopWebLevelMeter();
           return;
@@ -2192,6 +2284,9 @@ function startWebListening(
           error: null,
           text: session.lastText || null,
           endedWithCapture: true,
+          accountKey: session.accountKey,
+          scopeEpoch: session.scopeEpoch,
+          startedHotwordsKey: '',
         };
         setOwnerListening(session.owner, false);
         retireOwner(session.owner);
@@ -2255,7 +2350,14 @@ function startWebListening(
       _webSession = null;
     }
     if (primed) {
-      _primedOutcome = { generation: ++_generation, error: mapped, text: null, endedWithCapture: false };
+      _primedOutcome = {
+        generation: ++_generation,
+        error: mapped,
+        text: null,
+        endedWithCapture: false,
+        accountKey: scope.accountKey,
+        scopeEpoch: scope.epoch,
+      };
       setOwnerListening(owner, false);
       retireOwner(owner);
       return false;
@@ -2281,14 +2383,13 @@ export function primeWebGesture(options?: { deferAudioPause?: boolean; projectKe
   }
   if (_listening) return false;
   const noop = () => {};
-  const compiledHotwords = options && 'projectKey' in options
-    ? getCompiledVoiceHotwordsForProject(options.projectKey ?? null)
-    : getCompiledVoiceHotwordsForProject();
+  const { compiledHotwords, context } = captureHotwordsSessionContext(options);
   const primedOwner = createCaptureOwner(noop, noop, noop, compiledHotwords);
   claimActiveOwner(primedOwner);
   return startWebListening(primedOwner, {
     primed: true,
     deferAudioPause: options?.deferAudioPause === true,
+    scope: context.scope,
   });
 }
 
@@ -2332,9 +2433,7 @@ function primeNativeGesture(options?: { deferAudioPause?: boolean; projectKey?: 
 
   _primedOutcome = null;
   const noop = () => {};
-  const compiledHotwords = options && 'projectKey' in options
-    ? getCompiledVoiceHotwordsForProject(options.projectKey ?? null)
-    : getCompiledVoiceHotwordsForProject();
+  const { compiledHotwords, context } = captureHotwordsSessionContext(options);
   const primedOwner = createCaptureOwner(noop, noop, noop, compiledHotwords);
   claimActiveOwner(primedOwner);
   const generation = ++_generation;
@@ -2352,6 +2451,8 @@ function primeNativeGesture(options?: { deferAudioPause?: boolean; projectKey?: 
     deferAudioPause: options?.deferAudioPause === true,
     captureStarted: false,
     startInvoked: false,
+    accountKey: context.scope.accountKey,
+    scopeEpoch: context.scope.epoch,
     handles: [],
   };
   const startPromise = startListeningInternal(session);
@@ -2547,10 +2648,18 @@ function consumePrimedOutcome(
   onError?: (error: string) => void,
   isFallback = false,
   hotwords?: CompiledVoiceHotwords,
+  expectedScope?: VoiceHotwordsScopeSnapshot,
+  expectedHotwordsKey?: string,
 ): { handled: true; started: boolean } | { handled: false } {
   if (!_primedOutcome) return { handled: false };
   const outcome = _primedOutcome;
   _primedOutcome = null;
+  if (
+    expectedScope
+    && (outcome.accountKey !== expectedScope.accountKey || outcome.scopeEpoch !== expectedScope.epoch)
+  ) {
+    return { handled: false };
+  }
   if (outcome.error !== null) {
     clearPrewarmCaches();
     _lastError = outcome.error;
@@ -2558,6 +2667,12 @@ function consumePrimedOutcome(
     return { handled: true, started: false };
   }
   if (outcome.endedWithCapture) {
+    if (
+      expectedHotwordsKey !== undefined
+      && (outcome.startedHotwordsKey ?? '') !== expectedHotwordsKey
+    ) {
+      return { handled: false };
+    }
     const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords);
     claimActiveOwner(owner);
     setActiveVoiceService(buildLocalActiveService({ isFallback }));
@@ -2699,6 +2814,14 @@ function beginPendingRemoteStop(
   return stopping;
 }
 
+async function stopMismatchedActiveRemoteSession(): Promise<void> {
+  const active = _activeRemoteSession;
+  if (!active) return;
+  _activeRemoteSession = null;
+  const stopping = beginPendingRemoteStop(active.handle, active.owner, active.generation, true);
+  await stopping;
+}
+
 export interface StartListeningOptions {
   projectKey?: VoiceHotwordProjectInput;
 }
@@ -2709,9 +2832,7 @@ export async function startListening(
   onError?: (error: string) => void,
   options?: StartListeningOptions,
 ): Promise<boolean> {
-  const compiledHotwords = options && 'projectKey' in options
-    ? getCompiledVoiceHotwordsForProject(options.projectKey ?? null)
-    : getCompiledVoiceHotwordsForProject();
+  const { compiledHotwords, context: sessionCtx } = captureHotwordsSessionContext(options);
   const remotePrimary = getRemoteVoiceState().primaryDeviceId;
   if (!isAvailable() && !remotePrimary) {
     const msg = 'Speech recognition is not available';
@@ -2730,7 +2851,7 @@ export async function startListening(
       setActiveVoiceService(buildLocalActiveService());
       if (_pendingRemoteStop) {
         await _pendingRemoteStop;
-        if (startIntent < _lastStopIntent) {
+        if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
           if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
             setActiveVoiceService(null);
           }
@@ -2738,14 +2859,23 @@ export async function startListening(
         }
       }
       if (_activeRemoteSession) {
-        const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
-        claimActiveOwner(owner);
-        _activeRemoteSession.owner = owner;
-        setOwnerListening(owner, true);
-        return true;
+        if (isSameHotwordsContext(_activeRemoteSession.context, sessionCtx)) {
+          const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
+          claimActiveOwner(owner);
+          _activeRemoteSession.owner = owner;
+          setOwnerListening(owner, true);
+          return true;
+        }
+        await stopMismatchedActiveRemoteSession();
+        if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
+          if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+            setActiveVoiceService(null);
+          }
+          return false;
+        }
       }
       const route = await resolveRemoteVoiceRoute();
-      if (startIntent < _lastStopIntent) {
+      if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
         if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
           setActiveVoiceService(null);
         }
@@ -2753,7 +2883,7 @@ export async function startListening(
       }
       if (route.route === 'local_fallback') {
         const initialPcm = await drainRemoteVoiceCapturePrimePcm();
-        if (startIntent < _lastStopIntent) {
+        if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
           if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
             setActiveVoiceService(null);
           }
@@ -2776,10 +2906,11 @@ export async function startListening(
           false,
           initialPcm.length > 0 ? initialPcm : undefined,
           compiledHotwords,
+          sessionCtx,
         );
       }
       const initialPcm = await drainRemoteVoiceCapturePrimePcm();
-      if (startIntent < _lastStopIntent) {
+      if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
         if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
           setActiveVoiceService(null);
         }
@@ -2795,6 +2926,7 @@ export async function startListening(
         false,
         initialPcm.length > 0 ? initialPcm : undefined,
         compiledHotwords,
+        sessionCtx,
       );
     }
 
@@ -2804,18 +2936,30 @@ export async function startListening(
     }
 
     if (_activeRemoteSession && !_pendingRemoteStop) {
-      const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
-      claimActiveOwner(owner);
-      _activeRemoteSession.owner = owner;
-      setOwnerListening(owner, true);
-      return true;
+      if (isSameHotwordsContext(_activeRemoteSession.context, sessionCtx)) {
+        const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
+        claimActiveOwner(owner);
+        _activeRemoteSession.owner = owner;
+        setOwnerListening(owner, true);
+        return true;
+      }
+      await stopMismatchedActiveRemoteSession();
+      if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
+        if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+          setActiveVoiceService(null);
+        }
+        return false;
+      }
     }
 
     while (_pendingRemoteStart) {
       const prevPending = _pendingRemoteStart;
       if (!prevPending.aborted && prevPending.releasedToSend) {
         await prevPending.handoffPromise;
-        if (startIntent < _lastStopIntent) {
+        if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
+          if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+            setActiveVoiceService(null);
+          }
           return false;
         }
         continue;
@@ -2856,7 +3000,7 @@ export async function startListening(
     // Only wait for previous utterance's hardware mic release (~ms), NOT full remote WS drain.
     if (_pendingRemoteStop) {
       await (_pendingRemoteStopMicReleased ?? _pendingRemoteStop);
-      if (eager.aborted || startIntent < _lastStopIntent) {
+      if (eager.aborted || startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
         if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
         if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
           setActiveVoiceService(null);
@@ -2868,14 +3012,26 @@ export async function startListening(
     }
 
     if (_activeRemoteSession && !_pendingRemoteStop) {
-      if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
-      const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
-      claimActiveOwner(owner);
-      _activeRemoteSession.owner = owner;
-      setOwnerListening(owner, true);
-      eager.resolveHandoff();
-      eager.resolveDone();
-      return true;
+      if (isSameHotwordsContext(_activeRemoteSession.context, sessionCtx)) {
+        if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+        const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
+        claimActiveOwner(owner);
+        _activeRemoteSession.owner = owner;
+        setOwnerListening(owner, true);
+        eager.resolveHandoff();
+        eager.resolveDone();
+        return true;
+      }
+      await stopMismatchedActiveRemoteSession();
+      if (eager.aborted || startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
+        if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
+        if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+          setActiveVoiceService(null);
+        }
+        eager.resolveHandoff();
+        eager.resolveDone();
+        return false;
+      }
     }
 
     // Start local PCM capture immediately with zero wait for WS drain or HTTP route refresh.
@@ -2917,7 +3073,7 @@ export async function startListening(
     }
     const route = await routePromise;
 
-    if (eager.aborted || startIntent < _lastStopIntent) {
+    if (eager.aborted || startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
       if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
       cancelRemoteVoiceCapturePrime();
       if (eager.listeningNotified) {
@@ -2956,15 +3112,30 @@ export async function startListening(
       const failedPermissionReason = eager.failedPermission && eager.failedReason
         ? eager.failedReason
         : null;
-      const remoteHotwords = resolveRemoteVoiceHotwordsForProvider(route.provider, compiledHotwords);
-      const allowSharedHotwords = getShareHotwordsWithOthers();
+      const buildRemoteStartPayload = () => {
+        if (!isVoiceHotwordsScopeValid(sessionCtx.scope)) {
+          return { valid: false };
+        }
+        const liveHotwords = getCompiledVoiceHotwordsForProject(sessionCtx.projectKey);
+        const resolvedTerms = resolveRemoteVoiceHotwordsForProvider(route.provider, liveHotwords);
+        const liveAllowShared = getShareHotwordsWithOthers();
+        return {
+          valid: true,
+          ...(resolvedTerms ? { hotwords: resolvedTerms } : {}),
+          ...(liveAllowShared ? { allowSharedHotwords: true } : {}),
+        };
+      };
+      const initialStartPayload = buildRemoteStartPayload();
       const res = failedPermissionReason
         ? (cancelRemoteVoiceCapturePrime(), { ok: false as const, cancelled: false, reason: failedPermissionReason })
-        : await startRemoteVoiceSession({
+        : !initialStartPayload.valid
+          ? (cancelRemoteVoiceCapturePrime(), { ok: false as const, cancelled: true, reason: 'auth_scope_changed' })
+          : await startRemoteVoiceSession({
           targetDeviceId: route.targetDeviceId,
           locale: getVoiceLanguageMode() === 'auto' ? undefined : pickLocale(),
-          ...(remoteHotwords ? { hotwords: remoteHotwords } : {}),
-          ...(allowSharedHotwords ? { allowSharedHotwords: true } : {}),
+          ...(initialStartPayload.hotwords ? { hotwords: initialStartPayload.hotwords } : {}),
+          ...(initialStartPayload.allowSharedHotwords ? { allowSharedHotwords: true } : {}),
+          resolveStartPayload: buildRemoteStartPayload,
           signal: abortCtrl.signal,
           ...(route.provider.providerKind === 'http_asr'
             ? { stopDrainMs: REMOTE_VOICE_CLIENT_HTTP_ASR_STOP_DRAIN_MS }
@@ -2989,7 +3160,7 @@ export async function startListening(
               return;
             }
             if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
-            _activeRemoteSession = { handle, owner, generation };
+            _activeRemoteSession = { handle, owner, generation, context: sessionCtx };
             setOwnerListening(owner, true);
             eager.resolveHandoff();
           },
@@ -3068,6 +3239,7 @@ export async function startListening(
               hadNotified,
               bufferedPcm && bufferedPcm.length > 0 ? bufferedPcm : undefined,
               compiledHotwords,
+              sessionCtx,
             );
             return true;
           },
@@ -3085,9 +3257,14 @@ export async function startListening(
         return true;
       }
 
-      const activeRemote = _activeRemoteSession as { handle: ActiveRemoteVoiceSessionHandle; owner: unknown; generation: number } | null;
+      const activeRemote = _activeRemoteSession as {
+        handle: ActiveRemoteVoiceSessionHandle;
+        owner: unknown;
+        generation: number;
+        context?: HotwordsSessionContext;
+      } | null;
 
-      if (res.cancelled || eager.aborted || (!captureStarted && !eager.releasedToSend && !owner.normalStopRequested && startIntent < _lastStopIntent) || !isOwnerCurrent(owner)) {
+      if (res.cancelled || (!res.ok && res.reason === 'auth_scope_changed') || eager.aborted || (!captureStarted && !eager.releasedToSend && !owner.normalStopRequested && startIntent < _lastStopIntent) || !isOwnerCurrent(owner)) {
         if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
         owner.resolvePreReadyWait?.();
         if (res.ok) {
@@ -3111,7 +3288,7 @@ export async function startListening(
         owner.resolvePreReadyWait?.();
         clearRemoteVoiceFallbackNotice();
         if (activeRemote?.generation !== generation && startIntent >= _lastStopIntent) {
-          _activeRemoteSession = { handle: res.handle, owner, generation };
+          _activeRemoteSession = { handle: res.handle, owner, generation, context: sessionCtx };
           setOwnerListening(owner, true);
         }
         eager.resolveHandoff();
@@ -3198,13 +3375,14 @@ export async function startListening(
         hadNotifiedListening,
         res.bufferedPcm,
         compiledHotwords,
+        sessionCtx,
       );
     }
 
     const isRouteFallback = route.route === 'local_fallback';
     const routeFallbackReason = isRouteFallback ? route.reason : null;
     const initialPcm = await drainRemoteVoiceCapturePrimePcm();
-    if (eager.aborted || (!eager.releasedToSend && startIntent < _lastStopIntent)) {
+    if (eager.aborted || (!eager.releasedToSend && startIntent < _lastStopIntent) || !isVoiceHotwordsScopeValid(sessionCtx.scope)) {
       if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
       if (eager.listeningNotified) {
         eager.listeningNotified = false;
@@ -3293,11 +3471,12 @@ export async function startListening(
       hadNotified,
       initialPcm.length > 0 ? initialPcm : undefined,
       compiledHotwords,
+      sessionCtx,
     );
   }
 
   cancelRemoteVoiceCapturePrime();
-  return startLocalListening(onResult, onListeningChange, onError, startIntent, false, false, undefined, compiledHotwords);
+  return startLocalListening(onResult, onListeningChange, onError, startIntent, false, false, undefined, compiledHotwords, sessionCtx);
 }
 
 async function startLocalListening(
@@ -3309,7 +3488,21 @@ async function startLocalListening(
   alreadyNotifiedListening = false,
   initialPcm?: Int16Array,
   hotwords?: CompiledVoiceHotwords,
+  sessionCtx?: HotwordsSessionContext,
 ): Promise<boolean> {
+  const effectiveScope = sessionCtx?.scope ?? getVoiceHotwordsScopeSnapshot();
+  if (!isVoiceHotwordsScopeValid(effectiveScope)) {
+    if (alreadyNotifiedListening) {
+      _listening = false;
+      syncTtsVoiceSuppression();
+      onListeningChange?.(false);
+    }
+    if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+      setActiveVoiceService(null);
+    }
+    return false;
+  }
+
   if (!isLocalAvailable()) {
     if (alreadyNotifiedListening) {
       _listening = false;
@@ -3325,7 +3518,7 @@ async function startLocalListening(
   if (!isNative()) {
     if (_pendingStop) {
       await _pendingStop;
-      if (startIntent < _lastStopIntent) {
+      if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(effectiveScope)) {
         if (alreadyNotifiedListening) {
           _listening = false;
           syncTtsVoiceSuppression();
@@ -3334,9 +3527,34 @@ async function startLocalListening(
         return false;
       }
     }
-    const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError, isFallback, hotwords);
+    const primedOutcome = consumePrimedOutcome(
+      onResult,
+      onListeningChange,
+      onError,
+      isFallback,
+      hotwords,
+      effectiveScope,
+      '',
+    );
     if (primedOutcome.handled) {
       return primedOutcome.started;
+    }
+    if (
+      _webSession
+      && !_webSession.retired
+      && !_webSession.ended
+      && _webSession.generation === _generation
+      && (_webSession.accountKey !== effectiveScope.accountKey || _webSession.scopeEpoch !== effectiveScope.epoch)
+    ) {
+      await stopWebListening(true);
+      if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(effectiveScope)) {
+        if (alreadyNotifiedListening) {
+          _listening = false;
+          syncTtsVoiceSuppression();
+          onListeningChange?.(false);
+        }
+        return false;
+      }
     }
     const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords);
     if (alreadyNotifiedListening) {
@@ -3370,7 +3588,7 @@ async function startLocalListening(
       return true;
     }
     _primedOutcome = null;
-    return startWebListening(owner, { isFallback });
+    return startWebListening(owner, { isFallback, scope: effectiveScope });
   }
 
   while (_pendingStop) {
@@ -3389,7 +3607,7 @@ async function startLocalListening(
       }
       retireOwner(_activeOwner);
     }
-    if (startIntent < _lastStopIntent) {
+    if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(effectiveScope)) {
       if (alreadyNotifiedListening) {
         _listening = false;
         syncTtsVoiceSuppression();
@@ -3399,7 +3617,16 @@ async function startLocalListening(
     }
   }
 
-  const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError, isFallback, hotwords);
+  const expectedNativeHotwordsKey = getExpectedNativeHotwordsKey(hotwords?.terms);
+  const primedOutcome = consumePrimedOutcome(
+    onResult,
+    onListeningChange,
+    onError,
+    isFallback,
+    hotwords,
+    effectiveScope,
+    expectedNativeHotwordsKey,
+  );
   if (primedOutcome.handled) {
     return primedOutcome.started;
   }
@@ -3415,16 +3642,17 @@ async function startLocalListening(
       ? _nativeSession
       : null);
 
-  if (
-    preCheckAdoptable
-    && preCheckAdoptable.startInvoked
-    && preCheckAdoptable.startedHotwordsKey !== undefined
-  ) {
+  if (preCheckAdoptable) {
+    const scopeMismatch = preCheckAdoptable.accountKey !== effectiveScope.accountKey
+      || preCheckAdoptable.scopeEpoch !== effectiveScope.epoch;
     const requestedHotwordsKey = serializeHotwordsTerms(
       canAcceptHotwordsForRecognition(preCheckAdoptable.recognition) ? hotwords?.terms : undefined,
     );
-    if (preCheckAdoptable.startedHotwordsKey !== requestedHotwordsKey) {
-      // Mismatched native capture (e.g., primed before final project hotwords resolved):
+    const hotwordsMismatch = preCheckAdoptable.startInvoked
+      && preCheckAdoptable.startedHotwordsKey !== undefined
+      && preCheckAdoptable.startedHotwordsKey !== requestedHotwordsKey;
+    if (scopeMismatch || hotwordsMismatch) {
+      // Mismatched native capture (e.g., primed before final project hotwords or auth scope resolved):
       // end the mismatched capture cleanly without tearing down prewarm/model caches, then restart below.
       const mismatchStartPromise = _pendingStart?.session === preCheckAdoptable ? _pendingStart.promise : null;
       if (_pendingStart?.session === preCheckAdoptable) {
@@ -3435,7 +3663,7 @@ async function startLocalListening(
         mismatchStartPromise,
         !preCheckAdoptable.stopStarted,
       );
-      if (startIntent < _lastStopIntent) {
+      if (startIntent < _lastStopIntent || !isVoiceHotwordsScopeValid(effectiveScope)) {
         if (alreadyNotifiedListening) {
           _listening = false;
           syncTtsVoiceSuppression();
@@ -3529,6 +3757,8 @@ async function startLocalListening(
     deferAudioPause: false,
     captureStarted: false,
     startInvoked: false,
+    accountKey: effectiveScope.accountKey,
+    scopeEpoch: effectiveScope.epoch,
     handles: [],
   };
   const startPromise = startListeningInternal(session);

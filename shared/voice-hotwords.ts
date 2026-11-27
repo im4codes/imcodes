@@ -42,8 +42,7 @@ const ASCII_PRINTABLE_RE = /^[\x20-\x7E]+$/;
 const ASCII_WORD_CHAR_RE = /[A-Za-z0-9_/@:-]/;
 const ASCII_RIGHT_BOUNDARY_RE = /[A-Za-z0-9_/@-]/;
 const ASCII_ALNUM_UNDER_RE = /[A-Za-z0-9_]/;
-const URL_CANDIDATE_RE = /(?:https?|wss?|ftp):\/\/[^\s<>"'`\u3000]+/gi;
-const URL_TRAILING_PUNCT_RE = /^[.,;:!?'"\u3002\uff0c\u3001\uff1b\uff1a\uff01\uff1f\u201d\u2019\u300b\u300d\u300f\u3011]$/;
+const URL_CANDIDATE_RE = /(?:https?|wss?|ftp):\/\/[^\s<>"`\u3000]+/gi;
 const REGEX_META_RE = /[.*+?^${}()|[\]\\]/g;
 
 const matcherCache = new WeakMap<object, CompiledMatcher>();
@@ -337,26 +336,44 @@ function passesAsciiBoundary(text: string, offset: number, length: number): bool
   return true;
 }
 
-function trimMatchedUrlEnd(url: string): number {
+const URL_NON_QUOTE_TRAILING_PUNCT_RE = /^[.,;:!?"\u3002\uff0c\u3001\uff1b\uff1a\uff01\uff1f\u201d\u2019\u300b\u300d\u300f\u3011]$/;
+
+function trimMatchedUrlEnd(url: string, wrappedInSingleQuote: boolean): number {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let unmatchedClose: Set<number> | null = null;
+  for (let i = 0; i < url.length; i += 1) {
+    const ch = url[i]!;
+    if (ch === '(') {
+      parenDepth += 1;
+    } else if (ch === ')') {
+      if (parenDepth > 0) parenDepth -= 1;
+      else (unmatchedClose ??= new Set()).add(i);
+    } else if (ch === '[') {
+      bracketDepth += 1;
+    } else if (ch === ']') {
+      if (bracketDepth > 0) bracketDepth -= 1;
+      else (unmatchedClose ??= new Set()).add(i);
+    }
+  }
+
   let end = url.length;
+  let pendingSingleQuoteTrim = wrappedInSingleQuote;
   while (end > 0) {
-    const ch = url[end - 1]!;
-    if (URL_TRAILING_PUNCT_RE.test(ch)) {
+    const idx = end - 1;
+    const ch = url[idx]!;
+    if (URL_NON_QUOTE_TRAILING_PUNCT_RE.test(ch)) {
       end -= 1;
       continue;
     }
-    if (ch === ')' || ch === ']') {
-      const openCh = ch === ')' ? '(' : '[';
-      let depth = 0;
-      for (let i = 0; i < end - 1; i += 1) {
-        const c = url[i]!;
-        if (c === openCh) depth += 1;
-        else if (c === ch && depth > 0) depth -= 1;
-      }
-      if (depth === 0) {
-        end -= 1;
-        continue;
-      }
+    if (ch === "'" && pendingSingleQuoteTrim) {
+      pendingSingleQuoteTrim = false;
+      end -= 1;
+      continue;
+    }
+    if ((ch === ')' || ch === ']') && unmatchedClose?.has(idx)) {
+      end -= 1;
+      continue;
     }
     break;
   }
@@ -368,7 +385,8 @@ function collectUrlSpans(text: string, out: Array<[number, number]>): void {
   URL_CANDIDATE_RE.lastIndex = 0;
   let m: RegExpExecArray | null;
   while ((m = URL_CANDIDATE_RE.exec(text)) !== null) {
-    const trimmedLen = trimMatchedUrlEnd(m[0]);
+    const wrappedInSingleQuote = m.index > 0 && text[m.index - 1] === "'";
+    const trimmedLen = trimMatchedUrlEnd(m[0], wrappedInSingleQuote);
     if (trimmedLen > 0) {
       out.push([m.index, m.index + trimmedLen]);
     }

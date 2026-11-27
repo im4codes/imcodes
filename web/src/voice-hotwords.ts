@@ -29,6 +29,7 @@ export type OpenVoiceHotwordsSettingsHandler = (projectKey?: VoiceHotwordProject
 
 let _authScopeSetExplicitly = false;
 let _authScopeKey: string | null = null;
+let _scopeEpoch = 0;
 let _activeProjectKey: string | null = null;
 let _openSettingsHandler: OpenVoiceHotwordsSettingsHandler | null = null;
 const _changeListeners = new Set<() => void>();
@@ -109,6 +110,7 @@ export function setVoiceHotwordsAuthScope(auth: VoiceHotwordsAuthScope | null | 
   _authScopeSetExplicitly = true;
   _authScopeKey = nextKey;
   if (changed) {
+    _scopeEpoch += 1;
     _activeProjectKey = null;
     notifyChange();
   }
@@ -118,9 +120,27 @@ export function getVoiceHotwordsAuthScopeKey(): string | null {
   return resolveCurrentAccountScopeKey();
 }
 
+export interface VoiceHotwordsScopeSnapshot {
+  accountKey: string | null;
+  epoch: number;
+}
+
+export function getVoiceHotwordsScopeSnapshot(): VoiceHotwordsScopeSnapshot {
+  return {
+    accountKey: resolveCurrentAccountScopeKey(),
+    epoch: _scopeEpoch,
+  };
+}
+
+export function isVoiceHotwordsScopeValid(snapshot: VoiceHotwordsScopeSnapshot): boolean {
+  const currentKey = resolveCurrentAccountScopeKey();
+  return currentKey === snapshot.accountKey && _scopeEpoch === snapshot.epoch;
+}
+
 export function resetVoiceHotwordsScopeForTesting(): void {
   _authScopeSetExplicitly = false;
   _authScopeKey = null;
+  _scopeEpoch += 1;
   _activeProjectKey = null;
   _openSettingsHandler = null;
   notifyChange();

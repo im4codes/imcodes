@@ -2459,6 +2459,43 @@ describe('Web Mobile final drain', () => {
       expect(resB).toHaveBeenLastCalledWith('using BetaTerm here', true);
 
       await VoiceInput.stopListening({ abort: true });
+
+      // 3. Ended native prime with proj-a must be discarded when startListening adopts for proj-b.
+      streamingApi.start.mockClear();
+      streamingApi.stop.mockClear();
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true, projectKey: 'proj-a' })).toBe(true);
+      await waitFor(() => expect(streamingApi.start).toHaveBeenCalledTimes(1));
+      listeners.listeningState?.({ status: 'started' });
+      listeners.partialResults?.({ matches: ['stale alpha term'], isFinal: true });
+      listeners.listeningState?.({ status: 'stopped' });
+
+      const resAfterEnd = vi.fn();
+      await expect(VoiceInput.startListening(resAfterEnd, undefined, undefined, { projectKey: 'proj-b' })).resolves.toBe(true);
+      expect(resAfterEnd).not.toHaveBeenCalled();
+      expect(streamingApi.start).toHaveBeenCalledTimes(2);
+      expect(streamingApi.start.mock.calls[1]?.[0]).toMatchObject({ hotwords: ['BetaTerm'] });
+      listeners.partialResults?.({ matches: ['fresh beta term'], isFinal: true });
+      expect(resAfterEnd).toHaveBeenLastCalledWith('fresh BetaTerm', true);
+      await VoiceInput.stopListening({ abort: true });
+
+      // 4. Native primary fails and falls back to platform speechApi (no hotwords): same-project adoption
+      //    reuses the working fallback session cleanly without spurious mismatch restart.
+      streamingApi.start.mockReset().mockRejectedValueOnce(new Error('offline engine unavailable'));
+      speechApi.start.mockClear().mockResolvedValue({});
+      speechApi.stop.mockClear();
+
+      const resFallback1 = vi.fn();
+      await expect(VoiceInput.startListening(resFallback1, undefined, undefined, { projectKey: 'proj-a' })).resolves.toBe(true);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect((speechApi.start.mock.calls[0]?.[0] as Record<string, unknown> | undefined)?.hotwords).toBeUndefined();
+
+      const resFallback2 = vi.fn();
+      await expect(VoiceInput.startListening(resFallback2, undefined, undefined, { projectKey: 'proj-a' })).resolves.toBe(true);
+      expect(speechApi.start).toHaveBeenCalledTimes(1);
+      expect(speechApi.stop).not.toHaveBeenCalled();
+      listeners.partialResults?.({ matches: ['using alpha term fallback'], isFinal: true });
+      expect(resFallback2).toHaveBeenLastCalledWith('using AlphaTerm fallback', true);
+      await VoiceInput.stopListening({ abort: true });
     } finally {
       hotwordsMod.resetVoiceHotwordsScopeForTesting();
       (globalThis as any).Capacitor = origCap;

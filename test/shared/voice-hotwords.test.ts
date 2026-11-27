@@ -121,6 +121,26 @@ describe('shared voice hotwords', () => {
     expect(out).toBe(pathological);
   });
 
+  it('preserves valid URLs containing single quotes and nested parens while correcting surrounding prose in linear time', () => {
+    const compiled = mergeVoiceHotwords({
+      projectRaw: 'WorkTree\nIM.codes\n爱码 => IM.codes',
+    });
+
+    const singleQuotedPathUrl = "https://en.wikipedia.org/wiki/O'Brien_(worktree)/爱码";
+    expect(() => new URL(singleQuotedPathUrl)).not.toThrow();
+
+    const text = `See ${singleQuotedPathUrl}, '${singleQuotedPathUrl}', and worktree for 爱码 today.`;
+    expect(applyVoiceHotwordPostProcess(text, compiled))
+      .toBe(`See ${singleQuotedPathUrl}, '${singleQuotedPathUrl}', and WorkTree for IM.codes today.`);
+
+    // Unbalanced parens at scale inside URL candidate still run linearly
+    const manyParensUrl = `https://example.com/${'('.repeat(200)}worktree/${')'.repeat(400)} 爱码`;
+    const start = performance.now();
+    const trimmed = applyVoiceHotwordPostProcess(manyParensUrl, compiled);
+    expect(performance.now() - start).toBeLessThan(20);
+    expect(trimmed).toContain('IM.codes');
+  });
+
   it('completes 60 rules across >=500 chars in well under 1ms', () => {
     const rules = Array.from({ length: 60 }, (_, i) => `wrongterm${i} => CorrectTerm_${i}`).join('\n');
     const compiled = mergeVoiceHotwords({ projectRaw: rules });

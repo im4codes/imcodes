@@ -56,9 +56,11 @@ import * as VoiceInput from '../src/components/VoiceInput.js';
 import { VoiceOverlay } from '../src/components/VoiceOverlay.js';
 import { SharedVoiceSection } from '../src/components/SharedVoiceSection.js';
 import {
+  resetVoiceHotwordsScopeForTesting,
   setActiveVoiceHotwordProject,
   setProjectVoiceHotwordsRaw,
   setShareHotwordsWithOthers,
+  setVoiceHotwordsAuthScope,
 } from '../src/voice-hotwords.js';
 import {
   RemoteVoiceProviderController,
@@ -4202,5 +4204,136 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     }));
     controller.stop();
     expect(audio.stopTrack).toHaveBeenCalled();
+  });
+
+  it('aborts remote voice start on async account switch or logout and re-evaluates live sharing consent at WS open', async () => {
+    setupFakeWebAudio();
+    FakeWebSocket.instances.length = 0;
+
+    try {
+      const sharedProvider: RemoteVoiceProvidersSnapshot['providers'][number] = {
+        deviceId: 'other-mac',
+        displayName: 'Shared Mac',
+        model: 'qwen3-1.7b',
+        modelLabel: 'Qwen3-ASR 1.7B',
+        ready: true,
+        busy: false,
+        shareScope: 'server',
+        providerKind: 'pc_app',
+        isOwnDevice: false,
+      };
+      const snapshot: RemoteVoiceProvidersSnapshot = {
+        primaryDeviceId: 'other-mac',
+        canManageServerSharing: false,
+        canShareOwnProviderToServer: false,
+        providers: [sharedProvider],
+      };
+
+      const authA = { userId: 'user-a', baseUrl: 'https://relay.example' };
+      const authB = { userId: 'user-b', baseUrl: 'https://relay.example' };
+
+      // Setup Account A (sharing disabled) and Account B (sharing enabled)
+      setVoiceHotwordsAuthScope(authB);
+      setShareHotwordsWithOthers(true);
+      setProjectVoiceHotwordsRaw('proj-a', 'BetaB');
+
+      setVoiceHotwordsAuthScope(authA);
+      setShareHotwordsWithOthers(false);
+      setProjectVoiceHotwordsRaw('proj-a', 'SecretA');
+
+      // 1a. Switch A -> B while resolveRemoteVoiceRoute (fetchRemoteVoiceProviders) is suspended
+      resetRemoteVoiceClientForTesting({ primaryDeviceId: 'other-mac', fetchedAt: 0, providers: [] });
+      let resolveProviders!: (snap: RemoteVoiceProvidersSnapshot) => void;
+      apiMocks.fetchRemoteVoiceProviders.mockImplementationOnce(
+        () => new Promise<RemoteVoiceProvidersSnapshot>((res) => { resolveProviders = res; }),
+      );
+      const startDuringRoute = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: 'proj-a' });
+      await waitFor(() => expect(resolveProviders).toBeTypeOf('function'));
+      setVoiceHotwordsAuthScope(authB);
+      resolveProviders(snapshot);
+      await expect(startDuringRoute).resolves.toBe(false);
+      expect(apiMocks.fetchRemoteVoiceWsTicket).not.toHaveBeenCalled();
+      expect(FakeWebSocket.instances).toHaveLength(0);
+
+      // 1b. Switch A -> B while fetchRemoteVoiceWsTicket is suspended (after capturing A's hotwords):
+      //     no WebSocket or voice.session.start is sent with A's hotwords + B's consent.
+      setVoiceHotwordsAuthScope(authA);
+      resetRemoteVoiceClientForTesting({ primaryDeviceId: 'other-mac', fetchedAt: Date.now(), providers: [sharedProvider] });
+      apiMocks.fetchRemoteVoiceProviders.mockResolvedValue(snapshot);
+      let resolveTicket1!: (v: { ticket: string }) => void;
+      apiMocks.fetchRemoteVoiceWsTicket.mockImplementationOnce(
+        () => new Promise<{ ticket: string }>((res) => { resolveTicket1 = res; }),
+      );
+      const startDuringTicket = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: 'proj-a' });
+      await waitFor(() => expect(resolveTicket1).toBeTypeOf('function'));
+      setVoiceHotwordsAuthScope(authB);
+      resolveTicket1({ ticket: 'tkt-race-ab' });
+      await expect(startDuringTicket).resolves.toBe(false);
+      expect(FakeWebSocket.instances).toHaveLength(0);
+
+      // 1c. Logout (user-a -> null) after WS created but before open: voice.session.start is never sent
+      setVoiceHotwordsAuthScope(authA);
+      setShareHotwordsWithOthers(true);
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-logout-open' });
+      const startBeforeOpen = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: 'proj-a' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      const wsLogout = FakeWebSocket.instances[0]!;
+      setVoiceHotwordsAuthScope(null);
+      wsLogout.emitOpen();
+      await expect(startBeforeOpen).resolves.toBe(false);
+      expect(wsLogout.sent).toEqual([]);
+
+      // 2. Same account toggles sharing true -> false while fetchTicket is suspended:
+      //    voice.session.start reads live privacy flag at WS open and omits hotwords & allowSharedHotwords.
+      setVoiceHotwordsAuthScope(authA);
+      setShareHotwordsWithOthers(true);
+      let resolveTicket2!: (v: { ticket: string }) => void;
+      apiMocks.fetchRemoteVoiceWsTicket.mockImplementationOnce(
+        () => new Promise<{ ticket: string }>((res) => { resolveTicket2 = res; }),
+      );
+      const startConsentRevoke = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: 'proj-a' });
+      await waitFor(() => expect(resolveTicket2).toBeTypeOf('function'));
+      setShareHotwordsWithOthers(false);
+      resolveTicket2({ ticket: 'tkt-consent-revoked' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+      const wsConsent = FakeWebSocket.instances[1]!;
+      wsConsent.emitOpen();
+      const consentFrame = JSON.parse(wsConsent.sent[0]!) as Record<string, unknown>;
+      expect(consentFrame.hotwords).toBeUndefined();
+      expect(consentFrame.allowSharedHotwords).toBeUndefined();
+      wsConsent.emitMessage({ type: 'voice.session.ready', sessionId: consentFrame.sessionId });
+      await expect(startConsentRevoke).resolves.toBe(true);
+      wsConsent.emitMessage({ type: 'voice.session.end', sessionId: consentFrame.sessionId });
+      await VoiceInput.stopListening({ abort: true });
+
+      // 3. Active remote session reuse rejects project/hotword mismatch: switching proj-a -> proj-b
+      //    stops the active proj-a session cleanly and starts a fresh WS session with proj-b hotwords.
+      setProjectVoiceHotwordsRaw('proj-b', 'OnlyB');
+      setShareHotwordsWithOthers(true);
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-proj-a' });
+      const startProjA = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: 'proj-a' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
+      const wsProjA = FakeWebSocket.instances[2]!;
+      wsProjA.emitOpen();
+      const frameA = JSON.parse(wsProjA.sent[0]!) as Record<string, unknown>;
+      expect(frameA.hotwords).toEqual(['SecretA']);
+      wsProjA.emitMessage({ type: 'voice.session.ready', sessionId: frameA.sessionId });
+      await expect(startProjA).resolves.toBe(true);
+
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-proj-b' });
+      const startProjB = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: 'proj-b' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4));
+      expect(wsProjA.closedWith).not.toBeNull();
+      const wsProjB = FakeWebSocket.instances[3]!;
+      wsProjB.emitOpen();
+      const frameB = JSON.parse(wsProjB.sent[0]!) as Record<string, unknown>;
+      expect(frameB.hotwords).toEqual(['OnlyB']);
+      wsProjB.emitMessage({ type: 'voice.session.ready', sessionId: frameB.sessionId });
+      await expect(startProjB).resolves.toBe(true);
+      wsProjB.emitMessage({ type: 'voice.session.end', sessionId: frameB.sessionId });
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
+      resetVoiceHotwordsScopeForTesting();
+    }
   });
 });

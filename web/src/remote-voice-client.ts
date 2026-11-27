@@ -539,11 +539,18 @@ export interface RemoteVoiceFallbackInfo {
   stoppedByCaller?: boolean;
 }
 
+export interface StartRemoteVoiceSessionPayloadResolution {
+  valid: boolean;
+  hotwords?: string[];
+  allowSharedHotwords?: boolean;
+}
+
 export interface StartRemoteVoiceSessionOptions {
   targetDeviceId: string;
   locale?: string;
   hotwords?: string[];
   allowSharedHotwords?: boolean;
+  resolveStartPayload?: () => StartRemoteVoiceSessionPayloadResolution;
   onResult: (text: string, isFinal: boolean) => void;
   onLevel?: (level: number) => void;
   onCaptureStarted?: (handle: ActiveRemoteVoiceSessionHandle) => void;
@@ -1841,6 +1848,18 @@ export async function startRemoteVoiceSession(
       };
     }
 
+    const preConnectPayload = opts.resolveStartPayload?.();
+    if (preConnectPayload && !preConnectPayload.valid) {
+      cancelled = true;
+      opts.signal?.removeEventListener('abort', onAbortSignal);
+      const drainP = drainOrAbortAudio(true);
+      if (drainP) await drainP;
+      cleanupWs();
+      markMicReleased();
+      fallbackPcmQueue.length = 0;
+      return { ok: false, cancelled: true, reason: 'auth_scope_changed' };
+    }
+
     const wsBase = opts.getWsBaseUrl ? opts.getWsBaseUrl() : getApiBaseUrlSafe();
     const wsUrl = `${wsBase.replace(/^http/, 'ws').replace(/\/$/, '')}${REMOTE_VOICE_WS_PATH}?ticket=${encodeURIComponent(ticketRes.ticket)}`;
     ws = opts.createSocket ? opts.createSocket(wsUrl) : new WebSocket(wsUrl);
@@ -1861,14 +1880,27 @@ export async function startRemoteVoiceSession(
     ws.addEventListener('open', () => {
       wsOpened = true;
       if (cancelled || terminated || !ws) return;
+      const livePayload = opts.resolveStartPayload?.();
+      if (livePayload && !livePayload.valid) {
+        if (beginTermination('auth_scope_changed')) {
+          cancelled = true;
+          runAfterDrain(true, () => {
+            cleanupWs();
+            settleReady({ ok: false, reason: 'auth_scope_changed' });
+          });
+        }
+        return;
+      }
+      const startHotwords = livePayload ? livePayload.hotwords : opts.hotwords;
+      const startAllowSharedHotwords = livePayload ? livePayload.allowSharedHotwords : opts.allowSharedHotwords;
       try {
         ws.send(JSON.stringify({
           type: 'voice.session.start',
           sessionId,
           targetDeviceId: opts.targetDeviceId,
           ...(opts.locale ? { locale: opts.locale } : {}),
-          ...(opts.hotwords && opts.hotwords.length > 0 ? { hotwords: opts.hotwords } : {}),
-          ...(opts.allowSharedHotwords === true ? { allowSharedHotwords: true } : {}),
+          ...(startHotwords && startHotwords.length > 0 ? { hotwords: startHotwords } : {}),
+          ...(startAllowSharedHotwords === true ? { allowSharedHotwords: true } : {}),
           sampleRate: REMOTE_VOICE_SAMPLE_RATE,
         }));
       } catch {
