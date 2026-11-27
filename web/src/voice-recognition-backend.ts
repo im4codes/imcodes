@@ -104,8 +104,9 @@ export type NativeSpeechRecognition = Omit<
     popup?: boolean;
     addPunctuation?: boolean;
     initialPcmBase64?: string;
+    hotwords?: string[];
   }) => Promise<{ matches?: string[] } | void>;
-  transcribePcm?: (options: { pcmBase64: string; language?: string }) => Promise<{ text?: string }>;
+  transcribePcm?: (options: { pcmBase64: string; language?: string; hotwords?: string[] }) => Promise<{ text?: string }>;
   prewarm?: () => Promise<void>;
   performHaptic?: (options?: { style?: HapticFeedbackStyle }) => Promise<void>;
   startRawPcmCapture?: () => Promise<void>;
@@ -308,6 +309,7 @@ export function isNativeTranscribePcmSupported(): boolean {
 export async function transcribeNativePcm(options: {
   pcmBase64: string;
   language?: string;
+  hotwords?: string[];
 }): Promise<{ ok: true; text: string } | { ok: false; unimplemented?: boolean; error: string }> {
   if (!isNativeTranscribePcmSupported()) {
     return { ok: false, unimplemented: true, error: 'transcribePcm not supported' };

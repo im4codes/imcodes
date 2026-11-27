@@ -150,9 +150,9 @@ export interface PcAppBridge {
     getPermissions?: () => Promise<PcAppVoicePermissions>;
     requestPermissions?: () => Promise<PcAppVoicePermissions>;
     openPrivacySettings?: (target: 'microphone' | 'speech') => Promise<boolean>;
-    startListening?: (options?: { locale?: string; initialPcmBase64?: string; finalizeOnly?: boolean }) => Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }>;
+    startListening?: (options?: { locale?: string; initialPcmBase64?: string; finalizeOnly?: boolean; hotwords?: string[] }) => Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }>;
     supportsPcmFinalize?: boolean;
-    finalizePcmListening?: (options: { locale?: string; pcmBase64: string }) => Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }>;
+    finalizePcmListening?: (options: { locale?: string; pcmBase64: string; hotwords?: string[] }) => Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }>;
     stopListening?: (options?: { abort?: boolean }) => Promise<void>;
     getSpeechModel?: () => Promise<PcAppSpeechModelChoice>;
     setSpeechModel?: (model: PcAppSpeechModelChoice) => Promise<PcAppSpeechModelStatus>;
@@ -164,7 +164,7 @@ export interface PcAppBridge {
     setSelectedInputDevice?: (uid: string) => Promise<string>;
     subscribe?: (listener: (event: PcAppVoiceEvent) => void) => () => void;
     getRemoteProviderInfo?: () => Promise<PcAppRemoteVoiceProviderInfo | null>;
-    startRemoteSession?: (options: { sessionId: string; locale?: string }) => Promise<{ ok: boolean; error?: string }>;
+    startRemoteSession?: (options: { sessionId: string; locale?: string; hotwords?: string[] }) => Promise<{ ok: boolean; error?: string }>;
     pushRemotePcm?: (options: { sessionId: string; pcmBase64: string }) => Promise<{ ok: boolean; error?: string }>;
     stopRemoteSession?: (options: { sessionId: string; abort?: boolean }) => Promise<{ ok: boolean; error?: string }>;
     subscribeRemoteEvents?: (listener: (event: PcAppRemoteVoiceEvent) => void) => () => void;

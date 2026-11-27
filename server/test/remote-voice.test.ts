@@ -1174,6 +1174,7 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
       redirect?: RequestRedirect;
       model: string | null;
       language: string | null;
+      prompt: string | null;
       wavMagic: string;
       wavDataBytes: number;
       signal: AbortSignal;
@@ -1194,6 +1195,7 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
         redirect: init?.redirect,
         model: form.get('model') as string | null,
         language: form.get('language') as string | null,
+        prompt: form.get('prompt') as string | null,
         wavMagic: wavBuf.subarray(0, 4).toString('ascii'),
         wavDataBytes: wavBuf.readUInt32LE(40),
         signal,
@@ -2488,5 +2490,143 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
         { hostname: 'mini', deviceName: 'localhost' },
       ),
     ).toBeNull();
+  });
+
+  it('validates, forwards, and isolates per-session hotwords across PC App and HTTP ASR sessions', async () => {
+    expect(parseRemoteVoiceInboundFrame(JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'hw-1',
+      targetDeviceId: 'mac-1',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['  IM.codes\u0000 ', 'im.codes', 'worktree', ''],
+    }))).toEqual({
+      ok: true,
+      frame: {
+        type: 'voice.session.start',
+        sessionId: 'hw-1',
+        targetDeviceId: 'mac-1',
+        sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+        hotwords: ['IM.codes', 'worktree'],
+      },
+    });
+
+    expect(parseRemoteVoiceInboundFrame(JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'hw-bad',
+      targetDeviceId: 'mac-1',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: 'not-an-array',
+    }))).toMatchObject({ ok: false, sessionId: 'hw-bad', code: 'invalid_frame' });
+
+    const fetchCalls: Array<{ prompt: string | null }> = [];
+    const mockFetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const form = init?.body as FormData;
+      fetchCalls.push({ prompt: form.get('prompt') as string | null });
+      return new Response(JSON.stringify({ text: 'ok' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+
+    const hub = new RemoteVoiceHub({
+      readyTimeoutMs: 50,
+      idleTimeoutMs: 50,
+      httpAsrTimeoutMs: 500,
+      fetchFn: mockFetch as unknown as typeof fetch,
+    });
+    hub.setServerAsrServices([
+      {
+        id: 'asr_hw',
+        name: 'ASR Hotwords',
+        baseUrl: 'https://secret-asr.internal/v1',
+        apiKey: '',
+        model: 'whisper-1',
+        enabled: true,
+        source: 'admin',
+      },
+    ], false);
+
+    const providerSent: Array<Record<string, unknown>> = [];
+    const clientASent: Array<Record<string, unknown>> = [];
+    const clientBSent: Array<Record<string, unknown>> = [];
+    const providerWs = { readyState: WebSocket.OPEN, send: (d: string) => providerSent.push(JSON.parse(d)), on: () => {}, close: () => {} } as unknown as WebSocket;
+    const clientAWs = { readyState: WebSocket.OPEN, send: (d: string) => clientASent.push(JSON.parse(d)), on: () => {}, close: () => {} } as unknown as WebSocket;
+    const clientBWs = { readyState: WebSocket.OPEN, send: (d: string) => clientBSent.push(JSON.parse(d)), on: () => {}, close: () => {} } as unknown as WebSocket;
+
+    hub.handleConnection(providerWs, 'owner-1');
+    hub.handleConnection(clientAWs, 'owner-1');
+    hub.handleConnection(clientBWs, 'user-b');
+    hub.setServerSharedProviders([{ ownerUserId: 'owner-1', deviceId: 'mac-shared' }]);
+
+    const proto = hub as unknown as {
+      handleRawMessage: (ws: WebSocket, u: string, raw: string) => Promise<void>;
+    };
+    await proto.handleRawMessage(providerWs, 'owner-1', JSON.stringify({
+      type: 'voice.provider.register',
+      deviceId: 'mac-shared',
+      model: 'qwen3-1.7b',
+      modelLabel: 'Qwen3-ASR 1.7B',
+      ready: true,
+    }));
+
+    // Session 1 (User A) includes hotwords -> forwarded to PC App
+    await proto.handleRawMessage(clientAWs, 'owner-1', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-a',
+      targetDeviceId: 'mac-shared',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes', 'worktree'],
+    }));
+    expect(providerSent.at(-1)).toEqual({
+      type: 'voice.session.start',
+      sessionId: 'pc-a',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes', 'worktree'],
+    });
+    await proto.handleRawMessage(providerWs, 'owner-1', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-a' }));
+
+    // Session 2 (User B) on same PC App without hotwords -> zero leakage
+    await proto.handleRawMessage(clientBWs, 'user-b', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-b',
+      targetDeviceId: 'mac-shared',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+    }));
+    expect(providerSent.at(-1)).toEqual({
+      type: 'voice.session.start',
+      sessionId: 'pc-b',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+    });
+    await proto.handleRawMessage(providerWs, 'owner-1', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-b' }));
+
+    // Concurrent HTTP ASR: User A sends hotwords -> prompt set; User B omits -> prompt absent
+    const pcm = Buffer.alloc(640, 1).toString('base64');
+    await proto.handleRawMessage(clientAWs, 'owner-1', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'http-hw-a',
+      targetDeviceId: 'asr_hw',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['IM.codes', 'codex-sdk'],
+    }));
+    await proto.handleRawMessage(clientBWs, 'user-b', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'http-hw-b',
+      targetDeviceId: 'asr_hw',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+    }));
+    await proto.handleRawMessage(clientAWs, 'owner-1', JSON.stringify({ type: 'voice.session.audio', sessionId: 'http-hw-a', pcmBase64: pcm }));
+    await proto.handleRawMessage(clientBWs, 'user-b', JSON.stringify({ type: 'voice.session.audio', sessionId: 'http-hw-b', pcmBase64: pcm }));
+    await Promise.all([
+      proto.handleRawMessage(clientAWs, 'owner-1', JSON.stringify({ type: 'voice.session.stop', sessionId: 'http-hw-a' })),
+      proto.handleRawMessage(clientBWs, 'user-b', JSON.stringify({ type: 'voice.session.stop', sessionId: 'http-hw-b' })),
+    ]);
+
+    await new Promise((r) => setTimeout(r, 80));
+    expect(fetchCalls).toEqual([
+      { prompt: 'IM.codes, codex-sdk' },
+      { prompt: null },
+    ]);
+    expect(hub.getActiveSessionCount()).toBe(0);
+    hub.stop();
   });
 });

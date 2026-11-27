@@ -1352,12 +1352,16 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             let expectedCall = call
             self.startingCall = call
             let targetLanguage = Qwen3LanguageMapper.resolve(call.getString("language"))
+            let requestHotwords = SpeechDecoder.extractRequestHotwords(
+                array: call.getArray("hotwords", String.self),
+                string: call.getString("hotwords")
+            )
             let owner = self.coordinator.beginStart(
                 warmupSamples: initialSamples.isEmpty ? SpeechInbox.warmupSamples : 0,
                 makeDecode: { [weak self] in
                     guard let self = self,
                           let recognizer = self.ensureRecognizer(),
-                          let decoder = SpeechDecoder(recognizer: recognizer, language: targetLanguage) else { return nil }
+                          let decoder = SpeechDecoder(recognizer: recognizer, language: targetLanguage, hotwords: requestHotwords) else { return nil }
                     return SpeechCoordinator.Decoder(
                         decode: { samples, prefixTokens, shouldContinue in
                             decoder.decode(samples: samples, prefixTokens: prefixTokens, shouldContinue: shouldContinue)
@@ -1478,6 +1482,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             return
         }
         let targetLanguage = Qwen3LanguageMapper.resolve(call.getString("language"))
+        let requestHotwords = SpeechDecoder.extractRequestHotwords(
+            array: call.getArray("hotwords", String.self),
+            string: call.getString("hotwords")
+        )
         DispatchQueue.main.async {
             guard UIApplication.shared.applicationState != .background else {
                 call.reject("Speech requires a foreground app")
@@ -1497,7 +1505,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                     return
                 }
                 guard let recognizer = self.ensureRecognizer(),
-                      let decoder = SpeechDecoder(recognizer: recognizer, language: targetLanguage) else {
+                      let decoder = SpeechDecoder(recognizer: recognizer, language: targetLanguage, hotwords: requestHotwords) else {
                     DispatchQueue.main.async { call.reject("Offline speech model initialization failed") }
                     return
                 }
@@ -3039,9 +3047,60 @@ final class SpeechRecognizer {
 final class SpeechDecoder {
     let recognizer: SpeechRecognizer
     let language: String?
-    init?(recognizer: SpeechRecognizer, language: String? = nil) {
+    let hotwords: String?
+
+    static func extractRequestHotwords(array: [String]?, string: String?) -> String? {
+        let parts: [String]
+        if let array {
+            parts = array
+        } else if let string {
+            parts = string
+                .split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" })
+                .map { String($0) }
+        } else {
+            return nil
+        }
+        let cleaned = parts
+            .map { raw -> String in
+                let stripped = raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+                return String(String.UnicodeScalarView(stripped)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            .filter { !$0.isEmpty }
+        return cleaned.isEmpty ? nil : cleaned.joined(separator: ", ")
+    }
+
+    static func mergeHotwords(base: String?, request: String?) -> String? {
+        var terms: [String] = []
+        var seen = Set<String>()
+        var totalChars = 0
+
+        func appendSource(_ raw: String?) {
+            guard let raw, !raw.isEmpty else { return }
+            for part in raw.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
+                guard terms.count < 60 else { return }
+                let cleaned = String(part).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !cleaned.isEmpty else { continue }
+                let bounded = cleaned.count > 64 ? String(cleaned.prefix(64)).trimmingCharacters(in: .whitespacesAndNewlines) : cleaned
+                guard !bounded.isEmpty else { continue }
+                let key = bounded.lowercased()
+                guard !seen.contains(key) else { continue }
+                let sepLen = terms.isEmpty ? 0 : 2
+                guard totalChars + sepLen + bounded.count <= 1000 else { return }
+                seen.insert(key)
+                terms.append(bounded)
+                totalChars += sepLen + bounded.count
+            }
+        }
+
+        appendSource(base)
+        appendSource(request)
+        return terms.isEmpty ? nil : terms.joined(separator: ", ")
+    }
+
+    init?(recognizer: SpeechRecognizer, language: String? = nil, hotwords: String? = nil) {
         self.recognizer = recognizer
         self.language = language
+        self.hotwords = Self.mergeHotwords(base: recognizer.hotwords, request: hotwords)
     }
     func decode(
         samples: [Float],
@@ -3050,7 +3109,7 @@ final class SpeechDecoder {
     ) -> (text: String, tokens: [Int32])? {
         if samples.isEmpty { return ("", prefixTokens) }
         guard shouldContinue() else { return nil }
-        let options = Qwen3DecodingOptions(maxTokens: 192, language: language, context: recognizer.hotwords)
+        let options = Qwen3DecodingOptions(maxTokens: 192, language: language, context: hotwords)
         do {
             let result = try recognizer.model.transcribeSegmentWithCancellation(
                 audio: samples,

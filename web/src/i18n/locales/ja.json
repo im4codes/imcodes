@@ -2624,7 +2624,20 @@
     "offline_voice_model_unsupported": "この端末では Metal GPU が利用できないため、システム音声認識を使用します。",
     "offline_voice_model_app_update_required": "オフライン音声モデルをダウンロード・管理するには iOS アプリを更新してください。",
     "offline_voice_model_download_error": "オフライン音声モデルのダウンロード開始に失敗しました",
-    "offline_voice_model_delete_error": "オフライン音声モデルの削除に失敗しました"
+    "offline_voice_model_delete_error": "オフライン音声モデルの削除に失敗しました",
+    "voice_hotwords_title": "音声認識キーワード",
+    "voice_hotwords_desc": "プロジェクト固有の用語や置換ルールを設定し、音声認識のヒントと後処理補正に使用します。プロジェクト設定が優先されます。",
+    "voice_hotwords_project_label": "プロジェクトキーワード（{{project}}）",
+    "voice_hotwords_project_empty_title": "プロジェクトキーワード",
+    "voice_hotwords_project_select": "プロジェクトを選択",
+    "voice_hotwords_project_placeholder": "IM.codes\nworktree\ncodex-sdk\nim codes => IM.codes",
+    "voice_hotwords_no_project": "プロジェクト付きセッションを開くと、プロジェクト固有のキーワードを設定できます。",
+    "voice_hotwords_global_label": "グローバルキーワード",
+    "voice_hotwords_global_placeholder": "TypeScript\nAntigravity",
+    "voice_hotwords_hint": "1行に1語、または 誤認識 => 正解（最大60語・1000文字）。",
+    "voice_hotwords_count": "{{count}} / {{max}} 語",
+    "voice_hotwords_share_toggle": "他人が共有する音声デバイスにキーワードを送信",
+    "voice_hotwords_share_desc": "プライバシー保護のためデフォルトは無効です。自身の端末およびサーバーASRには常に送信されます。"
   },
   "capabilities": {
     "eyebrow": "ポータブル AI 機能",

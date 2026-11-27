@@ -2625,7 +2625,20 @@
     "offline_voice_model_unsupported": "当前设备不支持 Metal GPU 加速，将使用系统语音识别。",
     "offline_voice_model_app_update_required": "请更新 iOS 客户端后使用离线语音模型下载与管理功能。",
     "offline_voice_model_download_error": "启动离线语音模型下载失败",
-    "offline_voice_model_delete_error": "删除离线语音模型失败"
+    "offline_voice_model_delete_error": "删除离线语音模型失败",
+    "voice_hotwords_title": "语音识别项目热词",
+    "voice_hotwords_desc": "为当前项目和全局添加专有词汇或纠错映射，在语音识别时作为热词参考并自动纠错。项目词优先于全局词。",
+    "voice_hotwords_project_label": "当前项目热词（{{project}}）",
+    "voice_hotwords_project_empty_title": "项目热词",
+    "voice_hotwords_project_select": "选择项目",
+    "voice_hotwords_project_placeholder": "IM.codes\nworktree\ncodex-sdk\n爱码 => IM.codes",
+    "voice_hotwords_no_project": "打开一个项目会话后，可在此配置该项目的专属热词。",
+    "voice_hotwords_global_label": "全局热词",
+    "voice_hotwords_global_placeholder": "TypeScript\nAntigravity\n爱码 => IM.codes",
+    "voice_hotwords_hint": "每行一个词，或使用 误识词 => 正确词（最多 60 词，1000 字符）。",
+    "voice_hotwords_count": "{{count}} / {{max}} 词",
+    "voice_hotwords_share_toggle": "向他人共享的语音设备发送项目热词",
+    "voice_hotwords_share_desc": "为保护项目词汇隐私默认关闭；本机、自己账号的共享设备与服务端 ASR 默认发送。"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

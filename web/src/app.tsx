@@ -1,5 +1,6 @@
 import { R2RelayToggle } from './components/R2RelayToggle.js';
 import { isPresetCompatibleCrossSdkSwitch } from './components/quick-sdk-model.js';
+import { setActiveVoiceHotwordProject } from './voice-hotwords.js';
 import { setFileRelayUser, setServerR2RelayEnabled } from './r2-relay-preference.js';
 import { suppressHoverPreviewsUntilPointerMove } from './hover-preview-gate.js';
 import { DesktopAuthBridge } from './pages/DesktopAuthBridge.js';
@@ -10562,6 +10563,9 @@ function InternalMainApp() {
     const parentMain = activeSub ? sessions.find((s) => s.name === activeSub.parentSession) : null;
     return activeMain?.project ?? parentMain?.project ?? sessions[0]?.project ?? null;
   }, [activeSession, sessions, subSessionsSlim]);
+  useEffect(() => {
+    setActiveVoiceHotwordProject(cronProject);
+  }, [cronProject]);
   const cronJobCount = useCronJobCount({
     enabled: Boolean(nativeReady && auth && selectedServerId),
     serverId: selectedServerId,
@@ -12407,6 +12411,7 @@ function InternalMainApp() {
             hasPassword={userHasPassword}
             isAdmin={isAdmin}
             serverUrl={auth?.baseUrl ?? nativeServerUrl}
+            activeProjectName={cronProject}
             shortcutOverrides={shortcutOverrides}
             onChangeShortcutOverrides={setShortcutOverrides}
             onBack={() => setShowSettingsPage(false)}

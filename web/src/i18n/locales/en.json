@@ -2625,7 +2625,20 @@
     "offline_voice_model_unsupported": "On-device Qwen3-ASR requires Metal GPU support; using Apple system speech recognition instead.",
     "offline_voice_model_app_update_required": "Please update the iOS app to download and manage the offline speech model.",
     "offline_voice_model_download_error": "Failed to start offline speech model download",
-    "offline_voice_model_delete_error": "Failed to delete offline speech model"
+    "offline_voice_model_delete_error": "Failed to delete offline speech model",
+    "voice_hotwords_title": "Voice Recognition Keywords",
+    "voice_hotwords_desc": "Improve speech recognition accuracy for project terms, symbols, and custom corrections. Project entries take priority over global entries.",
+    "voice_hotwords_project_label": "Project keywords ({{project}})",
+    "voice_hotwords_project_empty_title": "Project keywords",
+    "voice_hotwords_project_select": "Select project",
+    "voice_hotwords_project_placeholder": "IM.codes\nworktree\ncodex-sdk\nim codes => IM.codes",
+    "voice_hotwords_no_project": "Open a session with a project first to configure project-specific keywords.",
+    "voice_hotwords_global_label": "Global keywords",
+    "voice_hotwords_global_placeholder": "TypeScript\nAntigravity\nai ma => IM.codes",
+    "voice_hotwords_hint": "One term per line, or misheard => target (max 60 terms, 1000 chars).",
+    "voice_hotwords_count": "{{count}} / {{max}} terms",
+    "voice_hotwords_share_toggle": "Send keywords to voice devices shared by others",
+    "voice_hotwords_share_desc": "Off by default for privacy. Your own devices and server ASR always receive keywords."
   },
   "capabilities": {
     "eyebrow": "Portable AI capabilities",

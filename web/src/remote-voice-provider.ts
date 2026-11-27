@@ -215,6 +215,7 @@ export class RemoteVoiceProviderController {
       const res = await voice.startRemoteSession?.({
         sessionId: parsed.sessionId,
         ...(parsed.locale ? { locale: parsed.locale } : {}),
+        ...(Array.isArray(parsed.hotwords) && parsed.hotwords.length > 0 ? { hotwords: parsed.hotwords } : {}),
       }).catch(() => ({ ok: false, error: 'not_ready' }));
       const stillValid = this.running
         && this.ws === expectedWs

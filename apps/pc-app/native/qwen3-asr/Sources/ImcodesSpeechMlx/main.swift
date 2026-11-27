@@ -479,6 +479,48 @@ private func readHotwords(from modelDir: URL) -> String? {
     return hotwordsText.isEmpty ? nil : hotwordsText.joined(separator: ", ")
 }
 
+private func mergeSessionHotwords(base: String?, requestHotwords: Any?) -> String? {
+    var terms: [String] = []
+    var seen = Set<String>()
+    var totalChars = 0
+
+    func appendTerm(_ raw: String) {
+        guard terms.count < 60 else { return }
+        let stripped = raw.unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+        let cleaned = String(String.UnicodeScalarView(stripped))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return }
+        let bounded = cleaned.count > 64 ? String(cleaned.prefix(64)).trimmingCharacters(in: .whitespacesAndNewlines) : cleaned
+        guard !bounded.isEmpty else { return }
+        let key = bounded.lowercased()
+        guard !seen.contains(key) else { return }
+        let sepLen = terms.isEmpty ? 0 : 2
+        guard totalChars + sepLen + bounded.count <= 1000 else { return }
+        seen.insert(key)
+        terms.append(bounded)
+        totalChars += sepLen + bounded.count
+    }
+
+    if let base, !base.isEmpty {
+        for part in base.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
+            appendTerm(String(part))
+        }
+    }
+    if let rawString = requestHotwords as? String {
+        for part in rawString.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
+            appendTerm(String(part))
+        }
+    } else if let rawArray = requestHotwords as? [Any] {
+        for item in rawArray {
+            if let text = item as? String {
+                appendTerm(text)
+            }
+        }
+    }
+
+    return terms.isEmpty ? nil : terms.joined(separator: ", ")
+}
+
 private func checkMlxRuntimeAvailable() -> Bool {
     #if !arch(arm64)
     emitJson(["type": "error", "code": "mlx_unsupported", "message": "Qwen3-ASR requires Apple Silicon"])
@@ -1353,9 +1395,10 @@ final class QwenServeRunner {
                 }
                 let localeTag = json["locale"] as? String
                 let deviceUID = json["device"] as? String
+                let utteranceHotwords = mergeSessionHotwords(base: hotwords, requestHotwords: json["hotwords"])
                 let session = QwenStreamingSession(
                     model: model,
-                    hotwords: hotwords,
+                    hotwords: utteranceHotwords,
                     decodeQueue: decodeQueue,
                     unloadOnFinish: false
                 )
@@ -1384,9 +1427,10 @@ final class QwenServeRunner {
                 prefilledPcm.removeAll(keepingCapacity: false)
                 stopActiveSession(abort: true, wait: true)
                 let localeTag = json["locale"] as? String
+                let utteranceHotwords = mergeSessionHotwords(base: hotwords, requestHotwords: json["hotwords"])
                 let session = QwenStreamingSession(
                     model: model,
-                    hotwords: hotwords,
+                    hotwords: utteranceHotwords,
                     decodeQueue: decodeQueue,
                     unloadOnFinish: false
                 )

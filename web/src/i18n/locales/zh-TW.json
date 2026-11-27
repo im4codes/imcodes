@@ -2625,7 +2625,20 @@
     "offline_voice_model_unsupported": "目前裝置不支援 Metal GPU，將改用系統語音辨識。",
     "offline_voice_model_app_update_required": "請更新 iOS 用戶端後再下載與管理離線語音模型。",
     "offline_voice_model_download_error": "啟動離線語音模型下載失敗",
-    "offline_voice_model_delete_error": "刪除離線語音模型失敗"
+    "offline_voice_model_delete_error": "刪除離線語音模型失敗",
+    "voice_hotwords_title": "語音辨識專案熱詞",
+    "voice_hotwords_desc": "為目前專案與全域新增專有詞彙或糾錯對應，在語音辨識時作為熱詞參考並自動糾錯。專案詞優先於全域詞。",
+    "voice_hotwords_project_label": "目前專案熱詞（{{project}}）",
+    "voice_hotwords_project_empty_title": "專案熱詞",
+    "voice_hotwords_project_select": "選擇專案",
+    "voice_hotwords_project_placeholder": "IM.codes\nworktree\ncodex-sdk\n愛碼 => IM.codes",
+    "voice_hotwords_no_project": "開啟專案工作階段後，即可在此設定該專案的專屬熱詞。",
+    "voice_hotwords_global_label": "全域熱詞",
+    "voice_hotwords_global_placeholder": "TypeScript\nAntigravity\n愛碼 => IM.codes",
+    "voice_hotwords_hint": "每行一個詞，或使用 誤識詞 => 正確詞（最多 60 詞，1000 字元）。",
+    "voice_hotwords_count": "{{count}} / {{max}} 詞",
+    "voice_hotwords_share_toggle": "向他人共享的語音裝置傳送專案熱詞",
+    "voice_hotwords_share_desc": "為保護專案詞彙隱私預設關閉；本機、自己帳號的共享裝置與伺服器端 ASR 預設傳送。"
   },
   "capabilities": {
     "eyebrow": "跨 Agent 的 AI 能力",

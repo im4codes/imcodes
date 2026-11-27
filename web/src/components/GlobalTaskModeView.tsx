@@ -2324,6 +2324,7 @@ export function GlobalTaskModeView({
           open
           autoStartListening
           initialText={voiceTarget.initialText ?? ''}
+          projectKey={voiceTarget.projectName ?? null}
           sessionLabel={voiceTarget.taskTitle
             ? `${voiceTarget.serverName} · ${voiceTarget.label} · ${voiceTarget.taskTitle}`
             : `${voiceTarget.serverName} · ${voiceTarget.label}`}

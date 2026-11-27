@@ -73,6 +73,7 @@ import { PasskeyManager } from '../components/PasskeyManager.js';
 import { KeyboardShortcutsSection } from '../components/KeyboardShortcutsSection.js';
 import { SharedVoiceSection } from '../components/SharedVoiceSection.js';
 import { OfflineVoiceModelSection } from '../components/OfflineVoiceModelSection.js';
+import { VoiceHotwordsSection } from '../components/VoiceHotwordsSection.js';
 import type { KeyboardShortcutOverrides } from '../keyboard-shortcuts.js';
 import {
   formatGlobalFontDelta,
@@ -148,6 +149,7 @@ interface Props {
   emailVerified?: boolean;
   isAdmin?: boolean;
   serverUrl?: string | null;
+  activeProjectName?: string | null;
   initialTab?: SettingsTab;
   shortcutOverrides?: KeyboardShortcutOverrides;
   onChangeShortcutOverrides?: (
@@ -167,6 +169,7 @@ export function SettingsPage({
   emailVerified: emailVerifiedProp,
   isAdmin = false,
   serverUrl,
+  activeProjectName,
   initialTab = 'profile',
   shortcutOverrides,
   onChangeShortcutOverrides,
@@ -1126,6 +1129,8 @@ export function SettingsPage({
               <OfflineVoiceModelSection />
 
               <SharedVoiceSection />
+
+              <VoiceHotwordsSection currentProjectName={activeProjectName} />
 
               <div class="settings-card" data-testid="settings-tts-card">
                 <h2 class="settings-card-heading">

@@ -47,6 +47,8 @@ interface Props {
    * Without it nothing is persisted.
    */
   draftScope?: string | null;
+  /** Active project key used to resolve project-scoped ASR hotwords and post-processing. */
+  projectKey?: string | null;
   /** Shown in the review step as where the notepad will be sent. */
   sessionLabel?: string;
   /**
@@ -224,6 +226,7 @@ export function VoiceOverlay({
   initialText,
   autoStartListening = true,
   draftScope,
+  projectKey = null,
   sessionLabel,
   onSendNotepad,
 }: Props) {
@@ -752,7 +755,7 @@ export function VoiceOverlay({
         } else if (startingTokenRef.current === token) {
           pendingErrorWhileStarting = true;
         }
-      });
+      }, ...(projectKey ? [{ projectKey }] : []));
       startCallSettled = true;
       const currentValid = sessionTokenRef.current === token
         && flushingTokenRef.current !== token
@@ -790,7 +793,7 @@ export function VoiceOverlay({
         if (openRef.current) setStarting(false);
       }
     }
-  }, [commitAndStop, setListeningState]);
+  }, [commitAndStop, projectKey, setListeningState]);
 
   /** Recognizer ended a segment on its own in notepad mode: keep going at the end. */
   function scheduleNotepadRestart(): void {

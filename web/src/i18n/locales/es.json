@@ -2625,7 +2625,20 @@
     "offline_voice_model_unsupported": "Qwen3-ASR en el dispositivo requiere GPU Metal; se usará el reconocimiento de voz del sistema de Apple.",
     "offline_voice_model_app_update_required": "Actualiza la app de iOS para descargar y gestionar el modelo de voz sin conexión.",
     "offline_voice_model_download_error": "No se pudo iniciar la descarga del modelo sin conexión",
-    "offline_voice_model_delete_error": "No se pudo eliminar el modelo sin conexión"
+    "offline_voice_model_delete_error": "No se pudo eliminar el modelo sin conexión",
+    "voice_hotwords_title": "Palabras clave de voz",
+    "voice_hotwords_desc": "Mejora la precisión del reconocimiento de voz con términos del proyecto y correcciones personalizadas. El proyecto tiene prioridad sobre lo global.",
+    "voice_hotwords_project_label": "Palabras del proyecto ({{project}})",
+    "voice_hotwords_project_empty_title": "Palabras del proyecto",
+    "voice_hotwords_project_select": "Seleccionar proyecto",
+    "voice_hotwords_project_placeholder": "IM.codes\nworktree\ncodex-sdk\nim codes => IM.codes",
+    "voice_hotwords_no_project": "Abre una sesión con proyecto para configurar palabras clave específicas del proyecto.",
+    "voice_hotwords_global_label": "Palabras clave globales",
+    "voice_hotwords_global_placeholder": "TypeScript\nAntigravity",
+    "voice_hotwords_hint": "Un término por línea, o erróneo => correcto (máx. 60 términos, 1000 caracteres).",
+    "voice_hotwords_count": "{{count}} / {{max}} términos",
+    "voice_hotwords_share_toggle": "Enviar palabras clave a dispositivos de voz compartidos por otros",
+    "voice_hotwords_share_desc": "Desactivado por defecto por privacidad. Tus propios dispositivos y el ASR del servidor siempre las reciben."
   },
   "capabilities": {
     "eyebrow": "Capacidades de IA portátiles",

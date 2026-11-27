@@ -56,6 +56,11 @@ import * as VoiceInput from '../src/components/VoiceInput.js';
 import { VoiceOverlay } from '../src/components/VoiceOverlay.js';
 import { SharedVoiceSection } from '../src/components/SharedVoiceSection.js';
 import {
+  setActiveVoiceHotwordProject,
+  setProjectVoiceHotwordsRaw,
+  setShareHotwordsWithOthers,
+} from '../src/voice-hotwords.js';
+import {
   RemoteVoiceProviderController,
   setLocalPcAppRemoteDeviceIdForTesting,
 } from '../src/remote-voice-provider.js';
@@ -4020,6 +4025,180 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2), { interval: 5 });
     FakeWebSocket.instances[1]!.emitOpen();
     await expect(readyTimeoutP).resolves.toMatchObject({ ok: false, reason: 'ready_timeout' });
+    expect(audio.stopTrack).toHaveBeenCalled();
+  });
+
+  it('enforces cross-account privacy gating on voice.session.start while always applying deterministic post-processing and forwarding in RemoteVoiceProviderController', async () => {
+    const audio = setupFakeWebAudio();
+    FakeWebSocket.instances.length = 0;
+    setProjectVoiceHotwordsRaw('proj-voice', 'IM.codes\nworktree\n爱码 => IM.codes');
+    setActiveVoiceHotwordProject('proj-voice');
+
+    // 1. Others' shared PC App + privacy OFF (default): omits hotwords in voice.session.start, still post-processes returned results
+    setShareHotwordsWithOthers(false);
+    resetRemoteVoiceClientForTesting({
+      primaryDeviceId: 'other-mac',
+      fetchedAt: Date.now(),
+      providers: [
+        {
+          deviceId: 'other-mac',
+          displayName: 'Shared Mac',
+          model: 'qwen3-1.7b',
+          modelLabel: 'Qwen3-ASR 1.7B',
+          ready: true,
+          busy: false,
+          shareScope: 'server',
+          providerKind: 'pc_app',
+          isOwnDevice: false,
+        },
+      ],
+    });
+    apiMocks.fetchRemoteVoiceProviders.mockResolvedValue({
+      primaryDeviceId: 'other-mac',
+      canManageServerSharing: false,
+      canShareOwnProviderToServer: false,
+      providers: [
+        {
+          deviceId: 'other-mac',
+          displayName: 'Shared Mac',
+          model: 'qwen3-1.7b',
+          modelLabel: 'Qwen3-ASR 1.7B',
+          ready: true,
+          busy: false,
+          shareScope: 'server',
+          providerKind: 'pc_app',
+          isOwnDevice: false,
+        },
+      ],
+    });
+    apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-other-private' });
+
+    const privateResults: Array<{ text: string; isFinal: boolean }> = [];
+    const start1 = VoiceInput.startListening(
+      (text, isFinal) => privateResults.push({ text, isFinal }),
+      undefined,
+      undefined,
+      { projectKey: 'proj-voice' },
+    );
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1), { interval: 5 });
+    const ws1 = FakeWebSocket.instances[0]!;
+    ws1.emitOpen();
+    const startFrame1 = JSON.parse(ws1.sent[0]!) as Record<string, unknown>;
+    expect(startFrame1.hotwords).toBeUndefined();
+    ws1.emitMessage({ type: 'voice.session.ready', sessionId: startFrame1.sessionId });
+    await expect(start1).resolves.toBe(true);
+    ws1.emitMessage({
+      type: 'voice.session.result',
+      sessionId: startFrame1.sessionId,
+      text: '在爱码里用WorkTree测试',
+      isFinal: true,
+    });
+    expect(privateResults).toEqual([{ text: '在IM.codes里用worktree测试', isFinal: true }]);
+    ws1.emitMessage({ type: 'voice.session.end', sessionId: startFrame1.sessionId });
+    await VoiceInput.stopListening({ abort: true });
+
+    // 2. Others' shared PC App + privacy ON: sends hotwords cleanly
+    setShareHotwordsWithOthers(true);
+    apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-other-shared' });
+    const start2 = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: 'proj-voice' });
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2), { interval: 5 });
+    const ws2 = FakeWebSocket.instances[1]!;
+    ws2.emitOpen();
+    const startFrame2 = JSON.parse(ws2.sent[0]!) as Record<string, unknown>;
+    expect(startFrame2.hotwords).toEqual(['IM.codes', 'worktree']);
+    ws2.emitMessage({ type: 'voice.session.ready', sessionId: startFrame2.sessionId });
+    await expect(start2).resolves.toBe(true);
+    ws2.emitMessage({ type: 'voice.session.end', sessionId: startFrame2.sessionId });
+    await VoiceInput.stopListening({ abort: true });
+
+    // 3. Own device / HTTP ASR with privacy OFF: sends hotwords cleanly
+    setShareHotwordsWithOthers(false);
+    resetRemoteVoiceClientForTesting({
+      primaryDeviceId: 'env-default',
+      fetchedAt: Date.now(),
+      providers: [
+        {
+          deviceId: 'env-default',
+          displayName: 'Server ASR',
+          model: 'whisper-1',
+          modelLabel: 'Server ASR',
+          ready: true,
+          busy: false,
+          shareScope: 'server',
+          providerKind: 'http_asr',
+          isOwnDevice: false,
+        },
+      ],
+    });
+    apiMocks.fetchRemoteVoiceProviders.mockResolvedValue({
+      primaryDeviceId: 'env-default',
+      canManageServerSharing: false,
+      canShareOwnProviderToServer: false,
+      providers: [
+        {
+          deviceId: 'env-default',
+          displayName: 'Server ASR',
+          model: 'whisper-1',
+          modelLabel: 'Server ASR',
+          ready: true,
+          busy: false,
+          shareScope: 'server',
+          providerKind: 'http_asr',
+          isOwnDevice: false,
+        },
+      ],
+    });
+    apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-http-asr' });
+    const start3 = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: 'proj-voice' });
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3), { interval: 5 });
+    const ws3 = FakeWebSocket.instances[2]!;
+    ws3.emitOpen();
+    const startFrame3 = JSON.parse(ws3.sent[0]!) as Record<string, unknown>;
+    expect(startFrame3.hotwords).toEqual(['IM.codes', 'worktree']);
+    ws3.emitMessage({ type: 'voice.session.ready', sessionId: startFrame3.sessionId });
+    await expect(start3).resolves.toBe(true);
+    ws3.emitMessage({ type: 'voice.session.end', sessionId: startFrame3.sessionId });
+    await VoiceInput.stopListening({ abort: true });
+
+    // 4. RemoteVoiceProviderController forwards hotwords from voice.session.start to voice.startRemoteSession
+    const startRemoteSessionMock = vi.fn(async () => ({ ok: true }));
+    const controller = new RemoteVoiceProviderController({
+      isSupported: () => true,
+      getBridge: () => ({
+        voice: {
+          getRemoteProviderInfo: async () => ({
+            deviceId: 'dev-prov-hw',
+            model: 'qwen3-1.7b',
+            modelLabel: 'Qwen3-ASR 1.7B',
+            ready: true,
+            busy: false,
+          }),
+          subscribeRemoteEvents: () => () => {},
+          startRemoteSession: startRemoteSessionMock,
+          stopRemoteSession: async () => ({ ok: true }),
+        },
+      }),
+      getWsBaseUrl: () => 'https://relay.example',
+      fetchTicket: async () => ({ ticket: 'tkt-prov-hw' }),
+      createSocket: (url) => new FakeWebSocket(url) as unknown as WebSocket,
+    });
+    await controller.start();
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(4), { interval: 5 });
+    const provWs = FakeWebSocket.instances[3]!;
+    provWs.emitOpen();
+    provWs.emitMessage({
+      type: 'voice.session.start',
+      sessionId: 'sess-prov-hw',
+      locale: 'zh-Hans',
+      sampleRate: 16000,
+      hotwords: ['IM.codes', 'worktree'],
+    });
+    await waitFor(() => expect(startRemoteSessionMock).toHaveBeenCalledWith({
+      sessionId: 'sess-prov-hw',
+      locale: 'zh-Hans',
+      hotwords: ['IM.codes', 'worktree'],
+    }));
+    controller.stop();
     expect(audio.stopTrack).toHaveBeenCalled();
   });
 });

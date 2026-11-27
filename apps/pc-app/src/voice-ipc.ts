@@ -13,6 +13,35 @@ const REMOTE_VOICE_BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
 const REMOTE_VOICE_MAX_DEVICE_NAME_CHARS = 64;
 const GENERIC_PC_DEVICE_NAME_RE = /^(?:localhost(?:\.localdomain)?|127\.0\.0\.1|::1)$/i;
+const PC_VOICE_HOTWORDS_MAX_TERMS = 60;
+const PC_VOICE_HOTWORDS_MAX_TERM_CHARS = 64;
+const PC_VOICE_HOTWORDS_MAX_CONTEXT_CHARS = 1000;
+
+export function normalizePcAppVoiceHotwordsContext(raw: unknown): string | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const kept: string[] = [];
+  const seen = new Set<string>();
+  let totalChars = 0;
+  for (const item of raw) {
+    if (typeof item !== 'string') continue;
+    if (kept.length >= PC_VOICE_HOTWORDS_MAX_TERMS) break;
+    const clean = item
+      .replace(/[\u0000-\u001F\u007F]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, PC_VOICE_HOTWORDS_MAX_TERM_CHARS)
+      .trim();
+    if (!clean) continue;
+    const key = /^[\x20-\x7E]+$/.test(clean) ? clean.toLowerCase() : clean;
+    if (seen.has(key)) continue;
+    const sepLen = kept.length === 0 ? 0 : 2;
+    if (totalChars + sepLen + clean.length > PC_VOICE_HOTWORDS_MAX_CONTEXT_CHARS) continue;
+    seen.add(key);
+    kept.push(clean);
+    totalChars += sepLen + clean.length;
+  }
+  return kept.length > 0 ? kept.join(', ') : undefined;
+}
 
 export function normalizePcAppDeviceName(raw: unknown): string | undefined {
   if (typeof raw !== 'string') return undefined;
@@ -1870,6 +1899,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     locale?: string;
     initialPcmBase64?: string;
     finalizeOnly?: boolean;
+    hotwords?: string[];
     source?: 'in-app' | 'global';
     onEvent?: (event: PcAppVoiceEvent) => void;
   }): Promise<{ ok: boolean; error?: string; target?: 'mic' | 'speech' }> => {
@@ -1979,10 +2009,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           activeWorkerUtterance = utterance;
           clearPendingStartIfCurrent();
           try {
+            const hotwordsContext = normalizePcAppVoiceHotwordsContext(options?.hotwords);
             if (finalizeOnly) {
-              const startPcmCmd: { cmd: 'start_pcm'; locale?: string } = { cmd: 'start_pcm' };
+              const startPcmCmd: { cmd: 'start_pcm'; locale?: string; hotwords?: string } = { cmd: 'start_pcm' };
               if (typeof options?.locale === 'string' && options.locale.trim()) {
                 startPcmCmd.locale = options.locale.trim();
+              }
+              if (hotwordsContext) {
+                startPcmCmd.hotwords = hotwordsContext;
               }
               appendVoiceLog(`mlx serve finalizeOnly variant=${variant} chunks=${prefillChunks.length}`);
               worker.proc.stdin?.write(`${JSON.stringify(startPcmCmd)}\n`);
@@ -1992,9 +2026,12 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
               worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'stop' })}\n`);
               return { ok: true };
             }
-            const startCmd: { cmd: 'start'; locale?: string; device?: string } = { cmd: 'start' };
+            const startCmd: { cmd: 'start'; locale?: string; device?: string; hotwords?: string } = { cmd: 'start' };
             if (typeof options?.locale === 'string' && options.locale.trim()) {
               startCmd.locale = options.locale.trim();
+            }
+            if (hotwordsContext) {
+              startCmd.hotwords = hotwordsContext;
             }
             if (selectedInputDevice !== 'auto') {
               startCmd.device = selectedInputDevice;
@@ -2362,6 +2399,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     const startRemoteSession = async (options: {
       sessionId: string;
       locale?: string;
+      hotwords?: string[];
     }): Promise<{ ok: boolean; error?: string }> => {
       const rawSessionId: unknown = options?.sessionId;
       if (!isValidRemoteVoiceId(rawSessionId)) {
@@ -2470,9 +2508,13 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       activeWorkerUtterance = utt;
       activeRemoteSession = { sessionId, utt };
 
-      const startCmd: { cmd: 'start_pcm'; locale?: string } = { cmd: 'start_pcm' };
+      const startCmd: { cmd: 'start_pcm'; locale?: string; hotwords?: string } = { cmd: 'start_pcm' };
       if (typeof options.locale === 'string' && options.locale.trim()) {
         startCmd.locale = options.locale.trim();
+      }
+      const hotwordsContext = normalizePcAppVoiceHotwordsContext(options.hotwords);
+      if (hotwordsContext) {
+        startCmd.hotwords = hotwordsContext;
       }
       try {
         appendVoiceLog(`mlx serve start_pcm variant=${variant} sessionId=${sessionId}`);
@@ -2621,6 +2663,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         locale: typeof obj.locale === 'string' ? obj.locale : undefined,
         initialPcmBase64: typeof obj.initialPcmBase64 === 'string' ? obj.initialPcmBase64 : undefined,
         finalizeOnly: obj.finalizeOnly === true,
+        hotwords: Array.isArray(obj.hotwords) ? obj.hotwords.filter((item): item is string => typeof item === 'string') : undefined,
       });
     });
     ipcMain.handle(PC_APP_VOICE_CHANNELS.stopListening, async (event, opts) => {
@@ -2635,6 +2678,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         locale: typeof obj.locale === 'string' ? obj.locale : undefined,
         initialPcmBase64: typeof obj.pcmBase64 === 'string' ? obj.pcmBase64 : undefined,
         finalizeOnly: true,
+        hotwords: Array.isArray(obj.hotwords) ? obj.hotwords.filter((item): item is string => typeof item === 'string') : undefined,
       });
     });
     ipcMain.handle(PC_APP_VOICE_CHANNELS.getSpeechModel, async (event) => {
@@ -2673,6 +2717,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       return startRemoteSession({
         sessionId: typeof rec.sessionId === 'string' ? rec.sessionId : '',
         locale: typeof rec.locale === 'string' ? rec.locale : undefined,
+        hotwords: Array.isArray(rec.hotwords) ? rec.hotwords.filter((item): item is string => typeof item === 'string') : undefined,
       });
     });
     ipcMain.handle(PC_APP_VOICE_CHANNELS.pushRemotePcm, async (event, opts) => {

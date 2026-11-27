@@ -1,4 +1,5 @@
 import { maskTtsApiKey, validateTtsBaseUrl, type TtsBaseUrlValidationResult } from './tts-config.js';
+import { formatVoiceHotwordsContext, sanitizeRemoteVoiceHotwords } from './voice-hotwords.js';
 
 export const REMOTE_VOICE_WS_PATH = '/api/ws/voice-relay';
 export const REMOTE_VOICE_API_PREFIX = '/api/voice';
@@ -64,6 +65,8 @@ export interface RemoteVoiceProviderInfo {
   isOwnDevice: boolean;
   customNickname?: string | null;
 }
+
+export { formatVoiceHotwordsContext, sanitizeRemoteVoiceHotwords };
 
 export type RemoteVoiceServerAsrSource = 'admin' | 'env';
 
@@ -147,6 +150,7 @@ export type RemoteVoiceSessionStartFrame = {
   targetDeviceId: string;
   locale?: string;
   sampleRate: number;
+  hotwords?: string[];
 };
 
 export type RemoteVoiceSessionAudioFrame = {
@@ -189,7 +193,7 @@ export type RemoteVoiceInboundFrame =
   | RemoteVoicePingFrame;
 
 export type RemoteVoiceForwardedToProviderFrame =
-  | { type: 'voice.session.start'; sessionId: string; locale?: string; sampleRate: number }
+  | { type: 'voice.session.start'; sessionId: string; locale?: string; sampleRate: number; hotwords?: string[] }
   | RemoteVoiceSessionAudioFrame
   | RemoteVoiceSessionStopFrame
   | RemoteVoiceSessionAbortFrame;
@@ -544,6 +548,10 @@ export function parseRemoteVoiceInboundFrame(
         }
         locale = cleanLocale;
       }
+      const parsedHotwords = sanitizeRemoteVoiceHotwords(rec.hotwords);
+      if (!parsedHotwords.ok) {
+        return { ok: false, sessionId, code: REMOTE_VOICE_ERROR_CODES.INVALID_FRAME, message: parsedHotwords.message };
+      }
       return {
         ok: true,
         frame: {
@@ -552,6 +560,7 @@ export function parseRemoteVoiceInboundFrame(
           targetDeviceId,
           ...(locale ? { locale } : {}),
           sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+          ...(parsedHotwords.hotwords ? { hotwords: parsedHotwords.hotwords } : {}),
         },
       };
     }

@@ -51,10 +51,10 @@ if (isHttpContext) {
     requestPermissions: () => ipcRenderer.invoke(VOICE_CHANNELS.requestPermissions),
     openPrivacySettings: (target: 'microphone' | 'speech') =>
       ipcRenderer.invoke(VOICE_CHANNELS.openPrivacySettings, target),
-    startListening: (options?: { locale?: string; initialPcmBase64?: string; finalizeOnly?: boolean }) =>
+    startListening: (options?: { locale?: string; initialPcmBase64?: string; finalizeOnly?: boolean; hotwords?: string[] }) =>
       ipcRenderer.invoke(VOICE_CHANNELS.startListening, options ?? {}),
     supportsPcmFinalize: true,
-    finalizePcmListening: (options: { locale?: string; pcmBase64: string }) =>
+    finalizePcmListening: (options: { locale?: string; pcmBase64: string; hotwords?: string[] }) =>
       ipcRenderer.invoke(VOICE_CHANNELS.finalizePcmListening, options),
     stopListening: (options?: { abort?: boolean }) =>
       ipcRenderer.invoke(VOICE_CHANNELS.stopListening, options ?? {}),
@@ -77,7 +77,7 @@ if (isHttpContext) {
       };
     },
     getRemoteProviderInfo: () => ipcRenderer.invoke(VOICE_CHANNELS.getRemoteProviderInfo),
-    startRemoteSession: (options: { sessionId: string; locale?: string }) =>
+    startRemoteSession: (options: { sessionId: string; locale?: string; hotwords?: string[] }) =>
       ipcRenderer.invoke(VOICE_CHANNELS.startRemoteSession, options ?? {}),
     pushRemotePcm: (options: { sessionId: string; pcmBase64: string }) =>
       ipcRenderer.invoke(VOICE_CHANNELS.pushRemotePcm, options ?? {}),

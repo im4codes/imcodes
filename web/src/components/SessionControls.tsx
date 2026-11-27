@@ -6946,6 +6946,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           showSendWarning(trimmedErr);
         }
       },
+      activeSession?.project ? { projectKey: activeSession.project } : undefined,
     )).then((ok) => {
       if (inlineVoiceTokenRef.current !== token) return;
       if (ok === false && inlineVoiceActiveRef.current) {
@@ -7812,6 +7813,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         (err) => {
           failTransaction(err || 'permission_denied');
         },
+        activeSession?.project ? { projectKey: activeSession.project } : undefined,
       ).then(
         (started) => {
           tx.startSettled = true;
@@ -12521,6 +12523,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       onSendNotepad={handleVoiceNotepadSend}
       draftScope={voiceNotepadDraftScope}
       sessionLabel={composerTargetName}
+      projectKey={activeSession?.project ?? null}
       autoStartListening={voiceOverlayAutoStart}
       initialText={voiceOverlayInitialText !== null ? voiceOverlayInitialText : (divRef.current ? readComposerElementText(divRef.current) : '')}
     />

@@ -542,6 +542,7 @@ export interface RemoteVoiceFallbackInfo {
 export interface StartRemoteVoiceSessionOptions {
   targetDeviceId: string;
   locale?: string;
+  hotwords?: string[];
   onResult: (text: string, isFinal: boolean) => void;
   onLevel?: (level: number) => void;
   onCaptureStarted?: (handle: ActiveRemoteVoiceSessionHandle) => void;
@@ -1865,6 +1866,7 @@ export async function startRemoteVoiceSession(
           sessionId,
           targetDeviceId: opts.targetDeviceId,
           ...(opts.locale ? { locale: opts.locale } : {}),
+          ...(opts.hotwords && opts.hotwords.length > 0 ? { hotwords: opts.hotwords } : {}),
           sampleRate: REMOTE_VOICE_SAMPLE_RATE,
         }));
       } catch {

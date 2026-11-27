@@ -2624,7 +2624,20 @@
     "offline_voice_model_unsupported": "이 기기에서는 Metal GPU가 지원되지 않아 Apple 시스템 음성 인식을 사용합니다.",
     "offline_voice_model_app_update_required": "오프라인 음성 모델을 다운로드하고 관리하려면 iOS 앱을 업데이트하세요.",
     "offline_voice_model_download_error": "오프라인 음성 모델 다운로드를 시작하지 못했습니다",
-    "offline_voice_model_delete_error": "오프라인 음성 모델을 삭제하지 못했습니다"
+    "offline_voice_model_delete_error": "오프라인 음성 모델을 삭제하지 못했습니다",
+    "voice_hotwords_title": "음성 인식 키워드",
+    "voice_hotwords_desc": "프로젝트 전용 용어와 치환 규칙을 등록해 음성 인식 힌트와 후처리 교정에 사용합니다. 프로젝트 키워드가 전역보다 우선합니다.",
+    "voice_hotwords_project_label": "프로젝트 키워드 ({{project}})",
+    "voice_hotwords_project_empty_title": "프로젝트 키워드",
+    "voice_hotwords_project_select": "프로젝트 선택",
+    "voice_hotwords_project_placeholder": "IM.codes\nworktree\ncodex-sdk\nim codes => IM.codes",
+    "voice_hotwords_no_project": "프로젝트 세션을 열면 프로젝트별 키워드를 설정할 수 있습니다.",
+    "voice_hotwords_global_label": "전역 키워드",
+    "voice_hotwords_global_placeholder": "TypeScript\nAntigravity",
+    "voice_hotwords_hint": "한 줄에 한 단어 또는 오인식 => 정답 (최대 60단어, 1000자).",
+    "voice_hotwords_count": "{{count}} / {{max}}개",
+    "voice_hotwords_share_toggle": "다른 사람이 공유한 음성 기기로 키워드 전송",
+    "voice_hotwords_share_desc": "개인정보 보호를 위해 기본적으로 꺼져 있습니다. 본인 기기와 서버 ASR에는 항상 전송됩니다."
   },
   "capabilities": {
     "eyebrow": "이식 가능한 AI 기능",

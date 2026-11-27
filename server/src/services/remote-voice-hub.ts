@@ -12,6 +12,7 @@ import {
   REMOTE_VOICE_SESSION_IDLE_TIMEOUT_MS,
   REMOTE_VOICE_SESSION_READY_TIMEOUT_MS,
   formatDefaultRemoteVoiceNickname,
+  formatVoiceHotwordsContext,
   isValidRemoteVoiceModelRegistration,
   parseProviderNicknamesPref,
   parseRemoteVoiceInboundFrame,
@@ -187,6 +188,7 @@ interface ActiveVoiceSession {
   durationTimer: ReturnType<typeof setTimeout> | null;
   locale?: string;
   sampleRate?: number;
+  hotwords?: string[];
   audioChunks?: Buffer[];
   totalAudioBytes?: number;
   lastNonEmptyText?: string;
@@ -893,7 +895,7 @@ export class RemoteVoiceHub {
   private async startSession(
     clientWs: WebSocket,
     clientUserId: string,
-    frame: { sessionId: string; targetDeviceId: string; locale?: string; sampleRate: number },
+    frame: { sessionId: string; targetDeviceId: string; locale?: string; sampleRate: number; hotwords?: string[] },
   ): Promise<void> {
     if (this.sessions.has(frame.sessionId)) {
       safeSendWs(clientWs, {
@@ -932,6 +934,7 @@ export class RemoteVoiceHub {
         durationTimer: null,
         locale: frame.locale,
         sampleRate: frame.sampleRate,
+        ...(frame.hotwords && frame.hotwords.length > 0 ? { hotwords: [...frame.hotwords] } : {}),
         audioChunks: [],
         totalAudioBytes: 0,
         stopping: false,
@@ -989,6 +992,7 @@ export class RemoteVoiceHub {
       readyTimer: null,
       idleTimer: null,
       durationTimer: null,
+      ...(frame.hotwords && frame.hotwords.length > 0 ? { hotwords: [...frame.hotwords] } : {}),
     };
     provider.activeSessionId = frame.sessionId;
     this.sessions.set(frame.sessionId, session);
@@ -1018,6 +1022,7 @@ export class RemoteVoiceHub {
       sessionId: frame.sessionId,
       ...(frame.locale ? { locale: frame.locale } : {}),
       sampleRate: frame.sampleRate,
+      ...(frame.hotwords && frame.hotwords.length > 0 ? { hotwords: frame.hotwords } : {}),
     });
   }
 
@@ -1151,6 +1156,12 @@ export class RemoteVoiceHub {
     const lang = normalizeAsrLanguage(session.locale);
     if (lang) {
       formData.append('language', lang);
+    }
+    if (session.hotwords && session.hotwords.length > 0) {
+      const prompt = formatVoiceHotwordsContext(session.hotwords);
+      if (prompt) {
+        formData.append('prompt', prompt);
+      }
     }
 
     const abortController = session.abortController ?? new AbortController();
@@ -1312,6 +1323,7 @@ export class RemoteVoiceHub {
     if (session.readyTimer) clearTimeout(session.readyTimer);
     if (session.idleTimer) clearTimeout(session.idleTimer);
     if (session.durationTimer) clearTimeout(session.durationTimer);
+    session.hotwords = undefined;
     if (session.audioChunks) {
       session.audioChunks = [];
       session.totalAudioBytes = 0;

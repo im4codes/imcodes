@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PcAppSpeechModelManifest, PcAppSpeechVariant } from '../src/speech-models.js';
 import {
   createPcAppVoiceController,
+  normalizePcAppVoiceHotwordsContext,
   PC_APP_VOICE_CHANNELS,
   resolvePrivacySettingsUrl,
   type PcAppIpcInvokeEventLike,
@@ -2692,5 +2693,133 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     expect(darwinVoice.getSpeechModelStatusSync().mlxSupported).toBe(true);
     expect(await darwinVoice.getRemoteProviderInfo()).not.toBeNull();
     await darwinVoice.dispose();
+  });
+
+  it('forwards per-utterance hotwords to local and remote MLX commands without modifying hotwords.txt or leaking across sessions', async () => {
+    expect(normalizePcAppVoiceHotwordsContext(['  IM.codes\u0000 ', 'im.codes', 'worktree', ''])).toBe('IM.codes, worktree');
+    const longTerms = Array.from({ length: 80 }, (_, i) => `Term_${i}_${'a'.repeat(30)}`);
+    const boundedCtx = normalizePcAppVoiceHotwordsContext(longTerms)!;
+    expect(boundedCtx.length).toBeLessThanOrEqual(1000);
+    expect(boundedCtx.split(', ').length).toBeLessThanOrEqual(60);
+
+    const tempDir = mkdtempSync(path.join(os.tmpdir(), 'imcodes-voice-hotwords-'));
+    let voice: ReturnType<typeof createPcAppVoiceController> | null = null;
+    try {
+      const weights = Buffer.alloc(10, 1);
+      const sha = createHash('sha256').update(weights).digest('hex');
+      const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+        '0.6b': {
+          choice: 'qwen3-0.6b',
+          variant: '0.6b',
+          repoId: 'aufklarer/test-0.6b',
+          revision: 'rev06',
+          files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+        },
+        '1.7b': {
+          choice: 'qwen3-1.7b',
+          variant: '1.7b',
+          repoId: 'aufklarer/test-1.7b',
+          revision: 'rev17',
+          files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+        },
+      };
+      const modelDir = path.join(tempDir, 'speech-models', '1.7b');
+      mkdirSync(modelDir, { recursive: true });
+      writeFileSync(path.join(modelDir, 'config.json'), weights);
+      const hotwordsFilePath = path.join(modelDir, 'hotwords.txt');
+      writeFileSync(hotwordsFilePath, '', 'utf8');
+      writeFileSync(path.join(tempDir, 'speech-model.json'), JSON.stringify({ version: 1, model: 'qwen3-1.7b' }));
+
+      const mlxBin = path.join(tempDir, 'imcodes-speech-mlx');
+      writeFileSync(mlxBin, '#!/bin/sh\necho ready\n', { mode: 0o755 });
+
+      const spawnedProcs: Array<ReturnType<typeof createFakeChildProcess>> = [];
+      const handlers = new Map<string, (ev: PcAppIpcInvokeEventLike, ...args: unknown[]) => Promise<unknown> | unknown>();
+      const mainWc = { id: 'main-wc' };
+      const trustedEv: PcAppIpcInvokeEventLike = { sender: mainWc, senderFrame: { url: 'https://app.im.codes/' } };
+
+      voice = createPcAppVoiceController({
+        platform: 'darwin',
+        arch: 'arm64',
+        userDataDir: tempDir,
+        speechHelperPath: '/Applications/IM.codes.app/Contents/Resources/imcodes-speech',
+        mlxHelperPath: mlxBin,
+        useResidentMlxWorker: true,
+        isMlxSupported: () => true,
+        isMainWebContents: (s) => s === mainWc,
+        getCurrentTrustedOrigin: () => 'https://app.im.codes',
+        getActiveOrigin: () => 'https://app.im.codes',
+        getTrustedOrigins: () => new Set(['https://app.im.codes']),
+        getSenderUrl: () => 'https://app.im.codes/',
+        sendToRenderer: () => {},
+        getMediaAccessStatus: () => 'granted',
+        askForMediaAccess: async () => true,
+        runHelperAsync: async () => JSON.stringify({ mic: 'granted', speech: 'granted', speechAvailable: true }),
+        spawnHelper: () => {
+          const p = createFakeChildProcess();
+          spawnedProcs.push(p);
+          return p as unknown as ChildProcess;
+        },
+        manifests,
+        resolveDeviceName: () => null,
+      });
+      voice.registerIpc({
+        handle: (ch, fn) => handlers.set(ch, fn),
+        removeHandler: (ch) => handlers.delete(ch),
+      });
+
+      // Wait for resident worker spawn & emit ready
+      await voice.warmSelectedSpeechModel();
+      await vi.waitFor(() => {
+        expect(spawnedProcs).toHaveLength(1);
+      });
+      const proc = spawnedProcs[0]!;
+      proc.stdout.emit('data', '{"type":"ready","variant":"1.7b"}\n');
+
+      // 1) Local startListening passes hotwords cleanly and leaves hotwords.txt untouched
+      const localStart1 = await handlers.get(PC_APP_VOICE_CHANNELS.startListening)!(trustedEv, {
+        locale: 'zh-Hans',
+        hotwords: ['IM.codes', 'worktree'],
+      });
+      expect(localStart1).toEqual({ ok: true });
+      const start1Cmd = JSON.parse(String(proc.stdin.write.mock.calls.at(-1)?.[0]).trim());
+      expect(start1Cmd).toEqual({ cmd: 'start', locale: 'zh-Hans', hotwords: 'IM.codes, worktree' });
+      proc.stdout.emit('data', '{"type":"end"}\n');
+      await voice.stopListening({ abort: true });
+
+      // 2) Next local startListening without hotwords does NOT inherit prior hotwords
+      const localStart2 = await handlers.get(PC_APP_VOICE_CHANNELS.startListening)!(trustedEv, { locale: 'en-US' });
+      expect(localStart2).toEqual({ ok: true });
+      const start2Cmd = JSON.parse(String(proc.stdin.write.mock.calls.at(-1)?.[0]).trim());
+      expect(start2Cmd).toEqual({ cmd: 'start', locale: 'en-US' });
+      proc.stdout.emit('data', '{"type":"end"}\n');
+      await voice.stopListening({ abort: true });
+
+      // 3) Remote session A with hotwords -> start_pcm carries hotwords
+      const rem1 = await handlers.get(PC_APP_VOICE_CHANNELS.startRemoteSession)!(trustedEv, {
+        sessionId: 'rem-hw-1',
+        locale: 'zh-Hans',
+        hotwords: ['IM.codes', 'codex-sdk'],
+      });
+      expect(rem1).toEqual({ ok: true });
+      const rem1Cmd = JSON.parse(String(proc.stdin.write.mock.calls.at(-1)?.[0]).trim());
+      expect(rem1Cmd).toEqual({ cmd: 'start_pcm', locale: 'zh-Hans', hotwords: 'IM.codes, codex-sdk' });
+      proc.stdout.emit('data', '{"type":"end"}\n');
+
+      // 4) Remote session B without hotwords -> zero leakage
+      const rem2 = await handlers.get(PC_APP_VOICE_CHANNELS.startRemoteSession)!(trustedEv, {
+        sessionId: 'rem-hw-2',
+        locale: 'en-US',
+      });
+      expect(rem2).toEqual({ ok: true });
+      const rem2Cmd = JSON.parse(String(proc.stdin.write.mock.calls.at(-1)?.[0]).trim());
+      expect(rem2Cmd).toEqual({ cmd: 'start_pcm', locale: 'en-US' });
+      proc.stdout.emit('data', '{"type":"end"}\n');
+
+      expect(readFileSync(hotwordsFilePath, 'utf8')).toBe('');
+    } finally {
+      if (voice) await voice.dispose();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

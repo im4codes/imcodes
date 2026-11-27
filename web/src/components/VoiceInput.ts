@@ -30,6 +30,8 @@ import {
   type VoiceRecognitionEngine,
 } from '../voice-recognition-backend.js';
 import type { RemoteVoiceProviderInfo } from '@shared/remote-voice.js';
+import { applyVoiceHotwordPostProcess, type CompiledVoiceHotwords } from '@shared/voice-hotwords.js';
+import { getCompiledVoiceHotwordsForProject, resolveRemoteVoiceHotwordsForProvider } from '../voice-hotwords.js';
 import type { PluginListenerHandle } from '@capacitor/core';
 import {
   getPcAppBridge,
@@ -279,12 +281,13 @@ function createPcAppSpeechRecognition(bridge: PcAppBridge): Omit<NativeSpeechRec
       const mapped = mapPerms(perms);
       return { speechRecognition: mapped === 'granted' ? 'granted' : 'denied' };
     },
-    start: async (options?: { language?: string; initialPcmBase64?: string; finalizeOnly?: boolean }) => {
+    start: async (options?: { language?: string; initialPcmBase64?: string; finalizeOnly?: boolean; hotwords?: string[] }) => {
       ensureSubscribed();
       const res = await voice.startListening?.({
         ...(options?.language ? { locale: options.language } : {}),
         ...(options?.initialPcmBase64 ? { initialPcmBase64: options.initialPcmBase64 } : {}),
         ...(options?.finalizeOnly ? { finalizeOnly: true } : {}),
+        ...(options?.hotwords && options.hotwords.length > 0 ? { hotwords: options.hotwords } : {}),
       });
       if (!res || res.ok !== true) {
         if (res?.error === 'permission_denied') {
@@ -328,7 +331,7 @@ function createPcAppSpeechRecognition(bridge: PcAppBridge): Omit<NativeSpeechRec
     },
   } as unknown as Omit<NativeSpeechRecognition, 'start' | 'addListener'> & {
     checkPermissions: () => Promise<{ speechRecognition: 'granted' | 'denied' | 'prompt' }>;
-    start: (options?: { language?: string; initialPcmBase64?: string; finalizeOnly?: boolean }) => Promise<{ matches?: string[] } | void>;
+    start: (options?: { language?: string; initialPcmBase64?: string; finalizeOnly?: boolean; hotwords?: string[] }) => Promise<{ matches?: string[] } | void>;
     addListener: (eventName: string, listenerFunc: (data: any) => void) => Promise<PluginListenerHandle>;
   };
 }
@@ -336,6 +339,7 @@ function createPcAppSpeechRecognition(bridge: PcAppBridge): Omit<NativeSpeechRec
 interface CaptureOwner {
   id: number;
   retired: boolean;
+  hotwords?: CompiledVoiceHotwords;
   notifiedListening?: boolean;
   normalStopRequested?: boolean;
   pendingFallback?: { promise: Promise<void>; abort: () => void };
@@ -728,6 +732,7 @@ async function finalizeBufferedSpeechOnOwner(
   }
   const pcmBase64 = encodeInt16PcmToBase64(bufferedPcm);
   const locale = pickRecognitionLocale();
+  const ownerHotwords = owner.hotwords?.terms;
   if (isPcAppNativeSpeech()) {
     const bridge = getPcAppBridge();
     if (!bridge?.voice) return;
@@ -788,6 +793,7 @@ async function finalizeBufferedSpeechOnOwner(
         const res = await bridge.voice.finalizePcmListening({
           ...(locale ? { locale } : {}),
           pcmBase64,
+          ...(ownerHotwords && ownerHotwords.length > 0 ? { hotwords: ownerHotwords } : {}),
         });
         if (!res || res.ok !== true) {
           throw new Error(res?.error || 'Speech recognition failed to start');
@@ -797,6 +803,7 @@ async function finalizeBufferedSpeechOnOwner(
           ...(locale ? { language: locale } : {}),
           initialPcmBase64: pcmBase64,
           finalizeOnly: true,
+          ...(ownerHotwords && ownerHotwords.length > 0 ? { hotwords: ownerHotwords } : {}),
         });
       }
       if (!signal.aborted) {
@@ -836,6 +843,9 @@ async function finalizeBufferedSpeechOnOwner(
         transcribeNativePcm({
           pcmBase64,
           ...(locale ? { language: locale } : {}),
+          ...(ownerHotwords && ownerHotwords.length > 0 && isStreamingSpeechAvailable() && getVoiceRecognitionEngine() !== 'system'
+            ? { hotwords: ownerHotwords }
+            : {}),
         }),
         NATIVE_STOP_DRAIN_MS,
         'Offline transcription timed out',
@@ -868,10 +878,12 @@ function createCaptureOwner(
   onResult: (text: string, isFinal: boolean) => void,
   onListeningChange?: (listening: boolean) => void,
   onError?: (error: string) => void,
+  hotwords?: CompiledVoiceHotwords,
 ): CaptureOwner {
   return {
     id: ++_ownerSeq,
     retired: false,
+    ...(hotwords ? { hotwords } : {}),
     onResult,
     onListeningChange: onListeningChange ?? null,
     onError: onError ?? null,
@@ -893,7 +905,8 @@ function setOwnerListening(owner: CaptureOwner | null, next: boolean): void {
 
 function emitOwnerResult(owner: CaptureOwner | null, text: string, isFinal: boolean): void {
   if (!isOwnerCurrent(owner)) return;
-  owner!.onResult?.(text, isFinal);
+  const processed = owner!.hotwords ? applyVoiceHotwordPostProcess(text, owner!.hotwords) : text;
+  owner!.onResult?.(processed, isFinal);
 }
 
 const _stoppedSessionRecognitions = new WeakMap<NativeSession, WeakSet<NativeSpeechRecognition>>();
@@ -1815,10 +1828,18 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
     };
 
     session.startInvoked = true;
+    const ownerHotwords = session.owner.hotwords?.terms;
+    const canPassHotwords = isPcAppNativeSpeech()
+      || (isStreamingSpeechAvailable()
+        && getVoiceRecognitionEngine() !== 'system'
+        && recognition !== getPlatformFallbackSpeechRecognition());
     const initialStartOpts = {
       ...startOpts,
       ...(session.initialPcmBase64 && (isPcAppNativeSpeech() || recognition !== getPlatformFallbackSpeechRecognition())
         ? { initialPcmBase64: session.initialPcmBase64 }
+        : {}),
+      ...(canPassHotwords && ownerHotwords && ownerHotwords.length > 0
+        ? { hotwords: ownerHotwords }
         : {}),
     };
     try {
@@ -2503,6 +2524,7 @@ function consumePrimedOutcome(
   onListeningChange?: (listening: boolean) => void,
   onError?: (error: string) => void,
   isFallback = false,
+  hotwords?: CompiledVoiceHotwords,
 ): { handled: true; started: boolean } | { handled: false } {
   if (!_primedOutcome) return { handled: false };
   const outcome = _primedOutcome;
@@ -2514,7 +2536,7 @@ function consumePrimedOutcome(
     return { handled: true, started: false };
   }
   if (outcome.endedWithCapture) {
-    const owner = createCaptureOwner(onResult, onListeningChange, onError);
+    const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords);
     claimActiveOwner(owner);
     setActiveVoiceService(buildLocalActiveService({ isFallback }));
     setOwnerListening(owner, true);
@@ -2655,11 +2677,17 @@ function beginPendingRemoteStop(
   return stopping;
 }
 
+export interface StartListeningOptions {
+  projectKey?: string | null;
+}
+
 export async function startListening(
   onResult: (text: string, isFinal: boolean) => void,
   onListeningChange?: (listening: boolean) => void,
   onError?: (error: string) => void,
+  options?: StartListeningOptions,
 ): Promise<boolean> {
+  const compiledHotwords = getCompiledVoiceHotwordsForProject(options?.projectKey);
   const remotePrimary = getRemoteVoiceState().primaryDeviceId;
   if (!isAvailable() && !remotePrimary) {
     const msg = 'Speech recognition is not available';
@@ -2686,7 +2714,7 @@ export async function startListening(
         }
       }
       if (_activeRemoteSession) {
-        const owner = createCaptureOwner(onResult, onListeningChange, onError);
+        const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
         claimActiveOwner(owner);
         _activeRemoteSession.owner = owner;
         setOwnerListening(owner, true);
@@ -2723,6 +2751,7 @@ export async function startListening(
           true,
           false,
           initialPcm.length > 0 ? initialPcm : undefined,
+          compiledHotwords,
         );
       }
       const initialPcm = await drainRemoteVoiceCapturePrimePcm();
@@ -2741,6 +2770,7 @@ export async function startListening(
         false,
         false,
         initialPcm.length > 0 ? initialPcm : undefined,
+        compiledHotwords,
       );
     }
 
@@ -2750,7 +2780,7 @@ export async function startListening(
     }
 
     if (_activeRemoteSession && !_pendingRemoteStop) {
-      const owner = createCaptureOwner(onResult, onListeningChange, onError);
+      const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
       claimActiveOwner(owner);
       _activeRemoteSession.owner = owner;
       setOwnerListening(owner, true);
@@ -2815,7 +2845,7 @@ export async function startListening(
 
     if (_activeRemoteSession && !_pendingRemoteStop) {
       if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
-      const owner = createCaptureOwner(onResult, onListeningChange, onError);
+      const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
       claimActiveOwner(owner);
       _activeRemoteSession.owner = owner;
       setOwnerListening(owner, true);
@@ -2881,7 +2911,7 @@ export async function startListening(
 
     if (route.route === 'remote') {
       setActiveVoiceService(buildRemoteActiveService(route.provider));
-      const owner = createCaptureOwner(onResult, onListeningChange, onError);
+      const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
       let resolvePreReadyWait!: () => void;
       owner.pendingPreReadyWait = new Promise<void>((res) => {
         resolvePreReadyWait = res;
@@ -2902,11 +2932,13 @@ export async function startListening(
       const failedPermissionReason = eager.failedPermission && eager.failedReason
         ? eager.failedReason
         : null;
+      const remoteHotwords = resolveRemoteVoiceHotwordsForProvider(route.provider, compiledHotwords);
       const res = failedPermissionReason
         ? (cancelRemoteVoiceCapturePrime(), { ok: false as const, cancelled: false, reason: failedPermissionReason })
         : await startRemoteVoiceSession({
           targetDeviceId: route.targetDeviceId,
           locale: getVoiceLanguageMode() === 'auto' ? undefined : pickLocale(),
+          ...(remoteHotwords ? { hotwords: remoteHotwords } : {}),
           signal: abortCtrl.signal,
           ...(route.provider.providerKind === 'http_asr'
             ? { stopDrainMs: REMOTE_VOICE_CLIENT_HTTP_ASR_STOP_DRAIN_MS }
@@ -3009,6 +3041,7 @@ export async function startListening(
               true,
               hadNotified,
               bufferedPcm && bufferedPcm.length > 0 ? bufferedPcm : undefined,
+              compiledHotwords,
             );
             return true;
           },
@@ -3180,7 +3213,7 @@ export async function startListening(
         return false;
       }
       if (initialPcm.length > 0 && canFinalizeBufferedPcm() && !eager.aborted) {
-        const owner = createCaptureOwner(onResult, onListeningChange, onError);
+        const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
         owner.notifiedListening = false;
         claimActiveOwner(owner);
         const finalizeCtrl = new AbortController();
@@ -3232,11 +3265,12 @@ export async function startListening(
       isRouteFallback,
       hadNotified,
       initialPcm.length > 0 ? initialPcm : undefined,
+      compiledHotwords,
     );
   }
 
   cancelRemoteVoiceCapturePrime();
-  return startLocalListening(onResult, onListeningChange, onError, startIntent, false);
+  return startLocalListening(onResult, onListeningChange, onError, startIntent, false, false, undefined, compiledHotwords);
 }
 
 async function startLocalListening(
@@ -3247,6 +3281,7 @@ async function startLocalListening(
   isFallback = false,
   alreadyNotifiedListening = false,
   initialPcm?: Int16Array,
+  hotwords?: CompiledVoiceHotwords,
 ): Promise<boolean> {
   if (!isLocalAvailable()) {
     if (alreadyNotifiedListening) {
@@ -3272,11 +3307,11 @@ async function startLocalListening(
         return false;
       }
     }
-    const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError, isFallback);
+    const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError, isFallback, hotwords);
     if (primedOutcome.handled) {
       return primedOutcome.started;
     }
-    const owner = createCaptureOwner(onResult, onListeningChange, onError);
+    const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords);
     if (alreadyNotifiedListening) {
       owner.notifiedListening = true;
     }
@@ -3337,12 +3372,12 @@ async function startLocalListening(
     }
   }
 
-  const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError, isFallback);
+  const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError, isFallback, hotwords);
   if (primedOutcome.handled) {
     return primedOutcome.started;
   }
 
-  const owner = createCaptureOwner(onResult, onListeningChange, onError);
+  const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords);
   if (alreadyNotifiedListening) {
     owner.notifiedListening = true;
   }

@@ -2624,7 +2624,20 @@
     "offline_voice_model_unsupported": "Для локальной Qwen3-ASR требуется GPU Metal; используется системное распознавание речи Apple.",
     "offline_voice_model_app_update_required": "Обновите приложение для iOS, чтобы загружать и управлять офлайн-моделью речи.",
     "offline_voice_model_download_error": "Не удалось начать загрузку офлайн-модели речи",
-    "offline_voice_model_delete_error": "Не удалось удалить офлайн-модель речи"
+    "offline_voice_model_delete_error": "Не удалось удалить офлайн-модель речи",
+    "voice_hotwords_title": "Ключевые слова для речи",
+    "voice_hotwords_desc": "Повышают точность распознавания терминов проекта и применяют автоисправления. Слова проекта имеют приоритет над глобальными.",
+    "voice_hotwords_project_label": "Слова проекта ({{project}})",
+    "voice_hotwords_project_empty_title": "Слова проекта",
+    "voice_hotwords_project_select": "Выбрать проект",
+    "voice_hotwords_project_placeholder": "IM.codes\nworktree\ncodex-sdk\nim codes => IM.codes",
+    "voice_hotwords_no_project": "Откройте сессию с проектом, чтобы настроить ключевые слова проекта.",
+    "voice_hotwords_global_label": "Глобальные слова",
+    "voice_hotwords_global_placeholder": "TypeScript\nAntigravity",
+    "voice_hotwords_hint": "Одно слово на строку или ошибка => правильно (до 60 слов, 1000 символов).",
+    "voice_hotwords_count": "{{count}} / {{max}} слов",
+    "voice_hotwords_share_toggle": "Отправлять слова на чужие общие голосовые устройства",
+    "voice_hotwords_share_desc": "По умолчанию выключено для приватности. На свои устройства и серверный ASR передаются всегда."
   },
   "capabilities": {
     "eyebrow": "Переносимые возможности ИИ",
