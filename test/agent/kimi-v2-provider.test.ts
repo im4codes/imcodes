@@ -15,6 +15,8 @@ import { resetContextStoreClientForTests } from '../../src/store/context-store-w
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { __testing__ as transportRelayTesting } from '../../src/daemon/transport-relay.js';
+import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
+import { SUPERVISION_CONTRACT_PREAMBLE_END, SUPERVISION_CONTRACT_PREAMBLE_START } from '../../shared/supervision-config.js';
 
 const {
   mockSpawn,
@@ -1100,7 +1102,7 @@ describe('KimiV2Provider', () => {
 
     expect(statusesA).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
-      { status: null, label: null, compactionOutcome: 'committed' },
+      { status: null, label: null, compactionOutcome: 'committed', compactionSessionVerified: true },
     ]);
     expect(statusesB).toEqual([]);
     expect(usagesB).toEqual([]);
@@ -1375,7 +1377,7 @@ describe('KimiV2Provider', () => {
     });
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
-      { status: null, label: null, compactionOutcome: 'committed' },
+      { status: null, label: null, compactionOutcome: 'committed', compactionSessionVerified: true },
     ]);
     // Post-terminal chunk for cmp-B while turn is still open must NOT reopen compacting
     await state.handlers!.sessionUpdate({
@@ -1391,7 +1393,7 @@ describe('KimiV2Provider', () => {
     });
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
-      { status: null, label: null, compactionOutcome: 'committed' },
+      { status: null, label: null, compactionOutcome: 'committed', compactionSessionVerified: true },
     ]);
 
     // 5) Compaction committed BEFORE turn cancel preserves committed truth + re-injection on next turn.
@@ -1412,7 +1414,7 @@ describe('KimiV2Provider', () => {
     expect(errors[2]!.code).toBe(PROVIDER_ERROR_CODES.CANCELLED);
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
-      { status: null, label: null, compactionOutcome: 'committed' },
+      { status: null, label: null, compactionOutcome: 'committed', compactionSessionVerified: true },
     ]);
 
     // Next turn re-injects SYS_C because cmp-pre-cancel committed before cancel!
@@ -1559,7 +1561,7 @@ describe('KimiV2Provider', () => {
     expect(completes).toHaveLength(2);
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
-      { status: null, label: null, compactionOutcome: 'committed' },
+      { status: null, label: null, compactionOutcome: 'committed', compactionSessionVerified: true },
     ]);
 
     // Next turn re-injects SYS_R2 because cmp-cancel-commit committed during cancel!
@@ -1573,5 +1575,138 @@ describe('KimiV2Provider', () => {
     expect((state.conn.prompt.mock.calls.at(-1)![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text).toContain('SYS_R2');
 
     await provider.disconnect();
+  });
+
+  it('invalidates TransportSessionRuntime preference/supervision/contract caches when verified compactionId commits during runtime.cancel(), without restoring working or breaking cancel', async () => {
+    let resolveTurn!: (v: unknown) => void;
+    state.conn = makeMockConn({
+      prompt: vi.fn(() => new Promise((r) => {
+        setTimeout(() => r({ stopReason: 'end_turn' }), 5);
+      })),
+    });
+
+    const provider = new KimiV2Provider();
+    await provider.connect({});
+    const runtime = new TransportSessionRuntime(provider, 'deck_kimi_rt_cancel');
+    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'kimi-rt-cancel-'));
+    try {
+      await runtime.initialize({
+        sessionKey: 'deck_kimi_rt_cancel',
+        cwd: tmpDir,
+        identityPrompt: 'RUNTIME_IDENTITY_ALPHA',
+      });
+
+      const preamble = [
+        `${PREFERENCE_CONTEXT_START}\n- PREF_ALPHA\n${PREFERENCE_CONTEXT_END}`,
+        `${SUPERVISION_CONTRACT_PREAMBLE_START}\nSUPERVISION_ALPHA\n${SUPERVISION_CONTRACT_PREAMBLE_END}`,
+      ].join('\n\n');
+      const registeredSystemContract = {
+        contractId: 'dyn-contract-1',
+        signature: 'sig-v1',
+        body: 'DYNAMIC_CONTRACT_ALPHA',
+      };
+
+      // Turn 1: seeds identity, preference, supervision, and registered contract.
+      runtime.send('turn 1', 'msg-rt-1', undefined, preamble, { registeredSystemContract });
+      await vi.waitFor(() => expect(state.conn!.prompt).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+      const prompt1 = (state.conn!.prompt.mock.calls[0]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+      expect(prompt1).toContain('RUNTIME_IDENTITY_ALPHA');
+      expect(prompt1).toContain('PREF_ALPHA');
+      expect(prompt1).toContain('SUPERVISION_ALPHA');
+      expect(prompt1).toContain('DYNAMIC_CONTRACT_ALPHA');
+
+      // Turn 2: preference, supervision, and registered contract are already deduplicated (dyn-contract-1 registered in Turn 1),
+      // settling KimiV2Provider's steady-state sessionSystemText key.
+      runtime.send('turn 2', 'msg-rt-2', undefined, preamble, { registeredSystemContract });
+      await vi.waitFor(() => expect(state.conn!.prompt).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+      const prompt2 = (state.conn!.prompt.mock.calls[1]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+      expect(prompt2).not.toContain('PREF_ALPHA');
+      expect(prompt2).not.toContain('SUPERVISION_ALPHA');
+      expect(prompt2).not.toContain('DYNAMIC_CONTRACT_ALPHA');
+
+      // Turn 3: steady-state turn deduplicates ALL 4; compaction starts -> runtime.cancel({ waitForProvider: true })
+      // holds _activeDispatchCancelled & _unconfirmedProviderStop -> unknown ID ignored -> matching active ID completed
+      // invalidates all runtime caches WITHOUT releasing Stop barrier or restoring working -> cancelled RPC settles Stop cleanly.
+      state.conn!.prompt.mockImplementationOnce(() => new Promise((r) => { resolveTurn = r; }));
+      runtime.send('turn 3', 'msg-rt-3', undefined, preamble, { registeredSystemContract });
+      await vi.waitFor(() => expect(state.conn!.prompt).toHaveBeenCalledTimes(3));
+      const prompt3 = (state.conn!.prompt.mock.calls[2]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+      expect(prompt3).not.toContain('RUNTIME_IDENTITY_ALPHA');
+      expect(prompt3).not.toContain('PREF_ALPHA');
+      expect(prompt3).not.toContain('SUPERVISION_ALPHA');
+      expect(prompt3).not.toContain('DYNAMIC_CONTRACT_ALPHA');
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-rt-1', status: 'in_progress' } as never,
+      });
+
+      let stopSettled = false;
+      const stopPromise = runtime.cancel({ waitForProvider: true }).then(() => { stopSettled = true; });
+      await vi.waitFor(() => expect(state.conn!.cancel).toHaveBeenCalledTimes(1));
+
+      // Unknown ID arriving during cancel must be rejected and NOT invalidate runtime caches
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-unknown-rt', status: 'completed' } as never,
+      });
+      // Matching active ID completing during cancel invalidates runtime caches without releasing Stop barrier or restoring working status
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-rt-1', status: 'completed' } as never,
+      });
+      await new Promise((r) => setTimeout(r, 10));
+      expect(stopSettled).toBe(false);
+      expect(runtime.getStatus()).not.toBe('streaming');
+
+      resolveTurn({ stopReason: 'cancelled' });
+      await stopPromise;
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+
+      // Turn 4: succeeds cleanly (cancel error did NOT leak) and re-injects all 4 caches.
+      runtime.send('turn 4', 'msg-rt-4', undefined, preamble, { registeredSystemContract });
+      await vi.waitFor(() => expect(state.conn!.prompt).toHaveBeenCalledTimes(4));
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+      const prompt4 = (state.conn!.prompt.mock.calls[3]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+      expect(prompt4).toContain('RUNTIME_IDENTITY_ALPHA');
+      expect(prompt4).toContain('PREF_ALPHA');
+      expect(prompt4).toContain('SUPERVISION_ALPHA');
+      expect(prompt4).toContain('DYNAMIC_CONTRACT_ALPHA');
+
+      // Turn 5: steady-state turn deduplicates preference, supervision, and registered contract again.
+      runtime.send('turn 5', 'msg-rt-5', undefined, preamble, { registeredSystemContract });
+      await vi.waitFor(() => expect(state.conn!.prompt).toHaveBeenCalledTimes(5));
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+
+      // Negative control — Turn 6 cancelled with NO tracked active compactionId:
+      // unknown/stale ID completed during cancel must NOT trigger false re-injection on Turn 7.
+      state.conn!.prompt.mockImplementationOnce(() => new Promise((r) => { resolveTurn = r; }));
+      runtime.send('turn 6', 'msg-rt-6', undefined, preamble, { registeredSystemContract });
+      await vi.waitFor(() => expect(state.conn!.prompt).toHaveBeenCalledTimes(6));
+      await runtime.cancel();
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-rt-1', status: 'completed' } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-sess-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-stale-untracked', status: 'completed' } as never,
+      });
+      resolveTurn({ stopReason: 'cancelled' });
+      await new Promise((r) => setTimeout(r, 10));
+
+      runtime.send('turn 7', 'msg-rt-7', undefined, preamble, { registeredSystemContract });
+      await vi.waitFor(() => expect(state.conn!.prompt).toHaveBeenCalledTimes(7));
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'));
+      const prompt7 = (state.conn!.prompt.mock.calls[6]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+      expect(prompt7).not.toContain('RUNTIME_IDENTITY_ALPHA');
+      expect(prompt7).not.toContain('PREF_ALPHA');
+      expect(prompt7).not.toContain('SUPERVISION_ALPHA');
+      expect(prompt7).not.toContain('DYNAMIC_CONTRACT_ALPHA');
+    } finally {
+      await runtime.kill();
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });

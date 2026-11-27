@@ -1254,6 +1254,8 @@ export class TransportSessionRuntime implements SessionRuntime {
           && !this._stopQueueBarrier
           && this._recoverableRetryTimer === null
           && this._capacityRetryTimer === null;
+        const hasVerifiedCommittedCompaction =
+          status?.compactionOutcome === 'committed' && status?.compactionSessionVerified === true;
         if (hasLiveForegroundTurn) {
           const sameActive = this._compactionObservedDispatch?.dispatchId === this._activeDispatchId
             && this._compactionObservedDispatch?.generation === this._activityGeneration;
@@ -1276,6 +1278,11 @@ export class TransportSessionRuntime implements SessionRuntime {
               };
             }
           }
+        } else if (hasVerifiedCommittedCompaction) {
+          // Even when locally cancelled or behind a Stop confirmation barrier, a verified
+          // committed compaction must invalidate runtime injection caches without touching
+          // session working status, Stop barriers, or next-turn cancellation state.
+          this.reinjectAfterCompaction();
         }
         const canKeepActive = this.hasActiveTurnWork() || activity.backgroundKeepsSessionRunning;
         if (!this._activeDispatchCancelled && status?.status && canKeepActive) {
@@ -5874,6 +5881,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private reinjectAfterCompaction(): void {
     this._lastInjectedPreferenceContextSignature = null;
     this._lastInjectedSupervisionContractSignature = null;
+    this._preferenceContextInjectionAttempt = null;
+    this._supervisionContractInjectionAttempt = null;
     // Codex resumes the SAME thread with fresh baseInstructions; message-side
     // adapters clear their "already injected" marker.
     if (this._providerSessionId) this.provider.refreshSessionSystemText?.(this._providerSessionId);

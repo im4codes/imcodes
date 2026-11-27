@@ -528,6 +528,11 @@ export interface ProviderStatusUpdate {
    * turn later fails/cancels; `failed` clears optimistic compacting state).
    */
   compactionOutcome?: 'committed' | 'failed';
+  /**
+   * Set when the provider verified this `compactionOutcome === 'committed'`
+   * against the active session, connection generation, and tracked compaction ID.
+   */
+  compactionSessionVerified?: boolean;
 }
 
 /** Evidence passed from a transport runtime to a provider rollout backstop. */

@@ -125,6 +125,7 @@ interface PendingTurn {
   compactedInTurn?: boolean;
   compactionOutcome?: 'committed' | 'failed';
   compactionOutcomeEmitted?: boolean;
+  compactionSessionVerified?: boolean;
   turnContextUsage?: ProviderUsageUpdate['usage'];
   cancelGraceTimer: ReturnType<typeof setTimeout> | null;
   terminalTarget: object;
@@ -1883,7 +1884,7 @@ export class KimiV2Provider implements TransportProvider {
       this.refreshSessionSystemText(state.sessionKey);
       const outcomeToEmit = !turn.compactionOutcomeEmitted ? 'committed' : undefined;
       if (outcomeToEmit) turn.compactionOutcomeEmitted = true;
-      this.clearStatus(state.sessionKey, state, outcomeToEmit);
+      this.clearStatus(state.sessionKey, state, outcomeToEmit, Boolean(outcomeToEmit && turn.compactionSessionVerified));
     } else if (turn.sawCompactionEvent && !turn.compactionOutcomeEmitted) {
       turn.compactionOutcomeEmitted = true;
       this.clearStatus(state.sessionKey, state, 'failed');
@@ -1922,7 +1923,12 @@ export class KimiV2Provider implements TransportProvider {
     if (outcomeToEmit) {
       turn.compactionOutcomeEmitted = true;
     }
-    this.clearStatus(state.sessionKey, state, outcomeToEmit);
+    this.clearStatus(
+      state.sessionKey,
+      state,
+      outcomeToEmit,
+      Boolean(outcomeToEmit === 'committed' && turn.compactionSessionVerified),
+    );
     this.lastErrorCode = code;
     this.emitError(state.sessionKey, {
       code,
@@ -1958,7 +1964,7 @@ export class KimiV2Provider implements TransportProvider {
   }
 
   private emitStatus(sessionId: string, state: KimiSessionState, status: ProviderStatusUpdate): void {
-    const sig = `${status.status ?? ''}\0${status.label ?? ''}\0${status.compactionOutcome ?? ''}`;
+    const sig = `${status.status ?? ''}\0${status.label ?? ''}\0${status.compactionOutcome ?? ''}\0${status.compactionSessionVerified ? '1' : ''}`;
     if (state.lastStatusSignature === sig) return;
     state.lastStatusSignature = sig;
     for (const cb of this.statusHandlers) cb(sessionId, status);
@@ -1968,6 +1974,7 @@ export class KimiV2Provider implements TransportProvider {
     sessionId: string,
     state: KimiSessionState,
     compactionOutcome?: 'committed' | 'failed',
+    compactionSessionVerified?: boolean,
   ): void {
     if (state.lastStatusSignature === null && !compactionOutcome) return;
     state.lastStatusSignature = null;
@@ -1976,6 +1983,7 @@ export class KimiV2Provider implements TransportProvider {
         status: null,
         label: null,
         ...(compactionOutcome ? { compactionOutcome } : {}),
+        ...(compactionSessionVerified ? { compactionSessionVerified: true } : {}),
       });
     }
   }
@@ -2288,9 +2296,10 @@ export class KimiV2Provider implements TransportProvider {
       this.refreshSessionSystemText(state.sessionKey);
       turn.compactedInTurn = true;
       turn.compactionOutcome = 'committed';
+      turn.compactionSessionVerified = true;
       if (state.activeCompactionIds.size === 0) {
         turn.compactionOutcomeEmitted = true;
-        this.clearStatus(state.sessionKey, state, 'committed');
+        this.clearStatus(state.sessionKey, state, 'committed', true);
       }
       return;
     }
@@ -2303,7 +2312,12 @@ export class KimiV2Provider implements TransportProvider {
       if (state.activeCompactionIds.size === 0) {
         const outcome = turn.compactedInTurn ? 'committed' : 'failed';
         turn.compactionOutcomeEmitted = true;
-        this.clearStatus(state.sessionKey, state, outcome);
+        this.clearStatus(
+          state.sessionKey,
+          state,
+          outcome,
+          Boolean(outcome === 'committed' && turn.compactionSessionVerified),
+        );
       }
       return;
     }
