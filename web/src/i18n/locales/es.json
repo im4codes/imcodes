@@ -1,4 +1,7 @@
 {
+  "app": {
+    "document_title": "IM.codes — Estación Full-Stack de IA · Tu Escuadrón de IA"
+  },
   "picker": {
     "files": "Archivos"
   },

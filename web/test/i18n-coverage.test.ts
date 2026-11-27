@@ -1330,4 +1330,23 @@ describe('generic i18n coverage guard', () => {
       expect(String(readPath(messages, 'settings.email_change_pw_hint'))).toContain('{{email}}');
     }
   });
+
+  it('keeps app.document_title defined, localized, and distinct across all 7 locales', () => {
+    const titles: Record<string, string> = {};
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      const val = readPath(messages, 'app.document_title');
+      expect(typeof val, `${locale}:app.document_title`).toBe('string');
+      expect((val as string).trim().length, `${locale}:app.document_title`).toBeGreaterThan(0);
+      expect(val as string).not.toContain('The IM for agents');
+      titles[locale] = val as string;
+    }
+    expect(titles.en).toBe('IM.codes — AI Force Workbench · Your Dedicated AI Squad');
+    expect(titles['zh-CN']).toBe('IM.codes — AI 全栈工作台 · 你的专属 AI 战队');
+    expect(titles['zh-TW']).toBe('IM.codes — AI 全端工作台 · 你的專屬 AI 戰隊');
+    expect(titles.ja).toBe('IM.codes — AI フルスタック・ワークベンチ · あなた専属の AI 部隊');
+    expect(titles.ko).toBe('IM.codes — AI 풀스택 워크벤치 · 나만의 AI 전대');
+    expect(titles.es).toBe('IM.codes — Estación Full-Stack de IA · Tu Escuadrón de IA');
+    expect(titles.ru).toBe('IM.codes — Full-Stack AI-платформа · Твой AI-отряд');
+  });
 });

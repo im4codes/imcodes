@@ -1,7 +1,8 @@
 import { pickReadableSessionDisplay } from '@shared/session-display.js';
 import type { SessionInfo } from './types.js';
 
-const APP_TITLE = 'IM.codes — The IM for agents';
+export const APP_TITLE = 'IM.codes — AI Force Workbench · Your Dedicated AI Squad';
+export const DEFAULT_APP_TITLE = APP_TITLE;
 
 export function getSessionTitleLabel(session: SessionInfo | null): string | null {
   if (!session) return null;
@@ -11,11 +12,16 @@ export function getSessionTitleLabel(session: SessionInfo | null): string | null
   ) ?? session.name ?? null;
 }
 
-export function buildDocumentTitle(serverName: string | null, session: SessionInfo | null): string {
+export function buildDocumentTitle(
+  serverName: string | null,
+  session: SessionInfo | null,
+  appTitle?: string,
+): string {
+  const resolvedAppTitle = appTitle?.trim() || APP_TITLE;
   const parts = [
     serverName?.trim() || null,
     getSessionTitleLabel(session),
-    APP_TITLE,
+    resolvedAppTitle,
   ].filter((value): value is string => !!value);
   return parts.join(' · ');
 }
