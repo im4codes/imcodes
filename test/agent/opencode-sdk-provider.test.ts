@@ -37,17 +37,25 @@ function deferred<T>() {
 
 function createAsyncQueue<T>() {
   const values: T[] = [];
-  const waiters: Array<(result: IteratorResult<T>) => void> = [];
+  const waiters: Array<{ resolve: (result: IteratorResult<T>) => void; reject: (error: unknown) => void }> = [];
   let closed = false;
+  let terminalError: unknown = null;
+  let hasTerminalError = false;
   return {
     push(value: T) {
+      if (closed || hasTerminalError) return;
       const waiter = waiters.shift();
-      if (waiter) waiter({ value, done: false });
+      if (waiter) waiter.resolve({ value, done: false });
       else values.push(value);
     },
     close() {
       closed = true;
-      while (waiters.length) waiters.shift()?.({ value: undefined, done: true });
+      while (waiters.length) waiters.shift()?.resolve({ value: undefined, done: true });
+    },
+    fail(error: unknown) {
+      hasTerminalError = true;
+      terminalError = error;
+      while (waiters.length) waiters.shift()?.reject(error);
     },
     stream: {
       [Symbol.asyncIterator]() {
@@ -55,8 +63,9 @@ function createAsyncQueue<T>() {
           next(): Promise<IteratorResult<T>> {
             const value = values.shift();
             if (value !== undefined) return Promise.resolve({ value, done: false });
+            if (hasTerminalError) return Promise.reject(terminalError);
             if (closed) return Promise.resolve({ value: undefined, done: true });
-            return new Promise((resolve) => waiters.push(resolve));
+            return new Promise((resolve, reject) => waiters.push({ resolve, reject }));
           },
         };
       },
@@ -2623,8 +2632,14 @@ describe('OpenCodeSdkProvider', () => {
 
   it('aborts expired-key self-healing cleanly when cancelled mid-recovery without sending a zombie retry', async () => {
     const harness = createHarness();
+    harness.credentials.push({
+      id: 'cred-pre-cancel',
+      integrationID: 'opencode',
+      label: 'pre-cancel',
+      active: true,
+      value: { type: 'key', key: 'sk-pre-cancel' },
+    } as any);
     const credGate = deferred<Array<{ id: string; integrationID: string }>>();
-    harness.client.credential.list.mockImplementationOnce(() => credGate.promise);
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
       options.signal.addEventListener('abort', harness.queue.close, { once: true });
       return { client: harness.client as any, server: harness.server };
@@ -2641,14 +2656,15 @@ describe('OpenCodeSdkProvider', () => {
     });
     await provider.send(routeId, 'hello cancel');
 
+    harness.client.credential.list.mockImplementationOnce(() => credGate.promise);
     harness.queue.push({
       type: 'session.step.failed',
       data: { sessionID: 'oc-session-1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } },
     });
-    await vi.waitFor(() => expect(harness.client.credential.list).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(harness.client.credential.list).toHaveBeenCalledTimes(2));
 
     await provider.cancel(routeId);
-    credGate.resolve([{ id: 'cred-late', integrationID: 'opencode' }]);
+    credGate.resolve([{ id: 'cred-pre-cancel', integrationID: 'opencode' }]);
     await new Promise((r) => setTimeout(r, 20));
 
     expect(harness.client.credential.remove).not.toHaveBeenCalled();
@@ -4473,8 +4489,14 @@ describe('OpenCodeSdkProvider', () => {
   it('preserves a credential activated while credential.list() is pending under real v2.4.2 list shapes and refuses DB deletion when OPENCODE_API_KEY is active', async () => {
     // 1. Real v2.4.2 list shape (NO timestamps: id/integrationID/label/active/value only) + credential activated mid-read
     const h = createHarness();
+    h.credentials.push({
+      id: 'cred-old-real',
+      integrationID: 'opencode',
+      label: 'old',
+      active: true,
+      value: { type: 'key', key: 'sk-old' },
+    } as any);
     const listGate = deferred<Array<Record<string, unknown>>>();
-    h.client.credential.list.mockImplementationOnce(() => listGate.promise);
     h.client.model.list.mockResolvedValue({
       data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }],
     });
@@ -4492,11 +4514,12 @@ describe('OpenCodeSdkProvider', () => {
     const routeId = await p.createSession({ sessionKey: 'route-mid-read-switch', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
     await p.send(routeId, 'hello');
 
+    h.client.credential.list.mockImplementationOnce(() => listGate.promise);
     h.queue.push({
       type: 'session.step.failed',
       data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-att1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } },
     });
-    await vi.waitFor(() => expect(h.client.credential.list).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(h.client.credential.list).toHaveBeenCalledTimes(2));
 
     // Activate new credential AFTER 401 while credential.list() is STILL pending, with ZERO timestamp fields
     h.queue.push({ type: 'credential.switched', data: { integrationID: 'opencode', credentialID: 'cred-new-real' } });
@@ -4619,13 +4642,332 @@ describe('OpenCodeSdkProvider', () => {
     expect(completes).toHaveLength(0);
     expect(errors).toHaveLength(0);
 
-    // 3. Only once Retry's terminal assistant record exists in message.list does ID-less terminal settle strictly once
+    // 3. Only once Retry's terminal assistant record exists in message.list does a single ID-less terminal
+    // recover across transient read errors and settle strictly once (no double push needed)
     listMode = 'terminal-ok';
+    h.client.message.list.mockRejectedValueOnce(new Error('transient sqlite busy'));
     h.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
-    h.queue.push({ type: 'session.idle', data: { sessionID: 'oc-session-1' } });
     await vi.waitFor(() => expect(completes).toHaveLength(1));
     expect(completes[0].content).toBe('Final active output');
     expect(errors).toHaveLength(0);
+    await p.disconnect();
+  });
+
+  it('serializes in-flight sessions.prompt and session.compact admission with route handoff on a shared providerSessionId', async () => {
+    const harness = createHarness();
+    harness.sessions.set('oc-shared-1', { id: 'oc-shared-1', title: 'shared', location: { directory: '/tmp/project' } });
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+
+    const provider = new OpenCodeSdkProvider();
+    await provider.connect({});
+    const routeA = await provider.createSession({
+      sessionKey: 'handoff-lock-a',
+      sessionName: 'deck_handoff_a',
+      cwd: '/tmp/project',
+      skipCreate: true,
+      resumeId: 'oc-shared-1',
+      agentId: DEFAULT_OPENCODE_MODEL_ID,
+    });
+
+    // Gate sessions.prompt inside withProviderSessionLock for routeA
+    const promptGate = deferred<{ id: string; sessionID: string; type: string }>();
+    harness.client.sessions.prompt.mockImplementationOnce(async () => promptGate.promise);
+    const sendA = provider.send(routeA, 'locked prompt A');
+    await vi.waitFor(() => expect(harness.client.sessions.prompt).toHaveBeenCalledOnce());
+
+    // Start handoff to routeB concurrently: must block on the same providerSessionId lock until promptGate resolves
+    let resolvedB = false;
+    const createB = provider.createSession({
+      sessionKey: 'handoff-lock-b',
+      sessionName: 'deck_handoff_b',
+      cwd: '/tmp/project',
+      skipCreate: true,
+      resumeId: 'oc-shared-1',
+      agentId: DEFAULT_OPENCODE_MODEL_ID,
+    }).then((id) => {
+      resolvedB = true;
+      return id;
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+    expect(resolvedB).toBe(false);
+    expect((provider as any).providerToRoute.get('oc-shared-1')).toBe(routeA);
+
+    promptGate.resolve({ id: 'msg-a-1', sessionID: 'oc-shared-1', type: 'user' });
+    await sendA;
+    const routeB = await createB;
+    expect(resolvedB).toBe(true);
+    expect((provider as any).providerToRoute.get('oc-shared-1')).toBe(routeB);
+    expect(harness.client.session.interrupt).toHaveBeenCalledWith({ sessionID: 'oc-shared-1' });
+
+    // Compact admission on stale routeA is also serialized and rejected cleanly after B owns the session
+    await expect(provider.send(routeA, '/compact')).rejects.toThrow(/owner/i);
+    expect(harness.client.session.compact).not.toHaveBeenCalled();
+
+    // Compact on current owner routeB executes inside lock and blocks concurrent routeC handoff until compact resolves
+    const compactGate = deferred<{ id: string }>();
+    harness.client.session.compact.mockImplementationOnce(async () => compactGate.promise);
+    const compactB = provider.send(routeB, '/compact');
+    await vi.waitFor(() => expect(harness.client.session.compact).toHaveBeenCalledOnce());
+
+    let resolvedC = false;
+    const createC = provider.createSession({
+      sessionKey: 'handoff-lock-c',
+      sessionName: 'deck_handoff_c',
+      cwd: '/tmp/project',
+      skipCreate: true,
+      resumeId: 'oc-shared-1',
+      agentId: DEFAULT_OPENCODE_MODEL_ID,
+    }).then((id) => {
+      resolvedC = true;
+      return id;
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(resolvedC).toBe(false);
+    compactGate.resolve({ id: 'msg-compact-b' });
+    await compactB;
+    const routeC = await createC;
+    expect((provider as any).providerToRoute.get('oc-shared-1')).toBe(routeC);
+    await provider.disconnect();
+  });
+
+  it('revokes the active turn generation on feed disconnect so suspended heal and retry RPCs cannot run after recovery', async () => {
+    const h1 = createHarness();
+    const h2 = createHarness();
+    h1.credentials.push({
+      id: 'cred-stale-gen',
+      integrationID: 'opencode',
+      label: 'stale',
+      active: true,
+      value: { type: 'key', key: 'sk-stale-gen' },
+    } as any);
+    let subscribeCalls = 0;
+    const sharedClient = {
+      ...h1.client,
+      events: {
+        subscribe: vi.fn(async () => {
+          subscribeCalls += 1;
+          return subscribeCalls === 1 ? h1.queue.stream : h2.queue.stream;
+        }),
+      },
+    };
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', () => {
+        h1.queue.close();
+        h2.queue.close();
+      }, { once: true });
+      return { client: sharedClient as any, server: h1.server };
+    });
+
+    const p = new OpenCodeSdkProvider();
+    const completes: any[] = [];
+    const errors: any[] = [];
+    p.onComplete((_s, m) => completes.push(m));
+    p.onError((_s, e) => errors.push(e));
+    await p.connect({});
+    const routeId = await p.createSession({ sessionKey: 'route-eof-revoke', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+    await p.send(routeId, 'turn-1');
+
+    // Suspend credential.list() inside tryHeal, then kill stream 1 with an error (simulating EOF/disconnect)
+    const credGate = deferred<Array<Record<string, unknown>>>();
+    sharedClient.credential.list.mockImplementationOnce(() => credGate.promise);
+    h1.queue.push({
+      type: 'session.step.failed',
+      data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-att1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } },
+    });
+    await vi.waitFor(() => expect(sharedClient.credential.list).toHaveBeenCalledTimes(2));
+
+    h1.queue.fail(new Error('unexpected EOF'));
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    expect(errors[0].recoverable).toBe(true);
+
+    // Resolve the suspended credential read AFTER failOnce revoked generation and host feed restarted on stream 2:
+    // neither credential.remove nor a zombie retry prompt may execute.
+    credGate.resolve([{ id: 'cred-stale-gen', integrationID: 'opencode', active: true, value: { type: 'key', key: 'sk-stale-gen' } }]);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(sharedClient.credential.remove).not.toHaveBeenCalled();
+    expect(sharedClient.sessions.prompt).toHaveBeenCalledTimes(1);
+
+    // Next normal send re-attaches cleanly to live stream 2 and completes strictly once
+    await p.send(routeId, 'turn-2');
+    h2.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-att2', ordinal: 0, delta: 'Recovered post-EOF' } });
+    h2.queue.push({ type: 'session.step.ended', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-att2', finish: 'stop' } });
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+    expect(completes[0].content).toBe('Recovered post-EOF');
+    expect(subscribeCalls).toBe(2);
+    await p.disconnect();
+  });
+
+  it('preserves active replacement credentials, in-place rotated keys, ambiguous provenance, and refreshes provenance after feed drops', async () => {
+    const defaultModelCatalog = {
+      data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }],
+    };
+
+    // A. Another active credential already appears in credential.list() BEFORE credential.switched arrives -> preserved!
+    {
+      const h = createHarness();
+      h.client.model.list.mockResolvedValue(defaultModelCatalog);
+      h.credentials.push({ id: 'cred-old', integrationID: 'opencode', label: 'old', active: true, value: { type: 'key', key: 'sk-old' } } as any);
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', h.queue.close, { once: true });
+        return { client: h.client as any, server: h.server };
+      });
+      const p = new OpenCodeSdkProvider();
+      const completes: any[] = [];
+      p.onComplete((_s, m) => completes.push(m));
+      await p.connect({});
+      const r = await p.createSession({ sessionKey: 'prov-a', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+      await p.send(r, 'go');
+
+      // Mutate list directly without pushing credential.switched SSE yet
+      h.credentials.splice(0, h.credentials.length,
+        { id: 'cred-old', integrationID: 'opencode', label: 'old', active: false, value: { type: 'key', key: 'sk-old' } } as any,
+        { id: 'cred-new', integrationID: 'opencode', label: 'new', active: true, value: { type: 'key', key: 'sk-new' } } as any,
+      );
+      h.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+      await vi.waitFor(() => expect(h.client.sessions.prompt).toHaveBeenCalledTimes(2));
+      expect(h.client.credential.remove).not.toHaveBeenCalled();
+      await p.disconnect();
+    }
+
+    // B. Same credential ID updated in-place (value changed, no timestamps, no SSE switched) -> preserved!
+    {
+      const h = createHarness();
+      h.client.model.list.mockResolvedValue(defaultModelCatalog);
+      h.credentials.push({ id: 'cred-same', integrationID: 'opencode', label: 'same', active: true, value: { type: 'key', key: 'sk-v1' } } as any);
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', h.queue.close, { once: true });
+        return { client: h.client as any, server: h.server };
+      });
+      const p = new OpenCodeSdkProvider();
+      await p.connect({});
+      const r = await p.createSession({ sessionKey: 'prov-b', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+      await p.send(r, 'go');
+
+      h.credentials[0] = { id: 'cred-same', integrationID: 'opencode', label: 'same', active: true, value: { type: 'key', key: 'sk-v2' } } as any;
+      h.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+      await vi.waitFor(() => expect(h.client.sessions.prompt).toHaveBeenCalledTimes(2));
+      expect(h.client.credential.remove).not.toHaveBeenCalled();
+      await p.disconnect();
+    }
+
+    // C. Ambiguous multiple active stored opencode credentials at dispatch -> fail safe, delete NONE, emit AUTH_FAILED
+    {
+      const h = createHarness();
+      h.client.model.list.mockResolvedValue(defaultModelCatalog);
+      h.credentials.push(
+        { id: 'cred-1', integrationID: 'opencode', active: true, value: { type: 'key', key: 'sk-1' } } as any,
+        { id: 'cred-2', integrationID: 'opencode', active: true, value: { type: 'key', key: 'sk-2' } } as any,
+      );
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', h.queue.close, { once: true });
+        return { client: h.client as any, server: h.server };
+      });
+      const p = new OpenCodeSdkProvider();
+      const errors: any[] = [];
+      p.onError((_s, e) => errors.push(e));
+      await p.connect({});
+      const r = await p.createSession({ sessionKey: 'prov-c', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+      await p.send(r, 'go');
+
+      h.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+      await vi.waitFor(() => expect(errors).toHaveLength(1));
+      expect(errors[0].code).toBe(PROVIDER_ERROR_CODES.AUTH_FAILED);
+      expect(h.client.credential.remove).not.toHaveBeenCalled();
+      expect(h.client.sessions.prompt).toHaveBeenCalledOnce();
+      await p.disconnect();
+    }
+
+    // D. Feed drop + credential rotation while disconnected refreshes provenance on next send and removes the NEW expired id only
+    {
+      const h1 = createHarness();
+      const h2 = createHarness();
+      h1.client.model.list.mockResolvedValue(defaultModelCatalog);
+      h1.credentials.push({ id: 'cred-a', integrationID: 'opencode', active: true, value: { type: 'key', key: 'sk-a' } } as any);
+      let subCount = 0;
+      const client = {
+        ...h1.client,
+        events: {
+          subscribe: vi.fn(async () => {
+            subCount += 1;
+            return subCount === 1 ? h1.queue.stream : h2.queue.stream;
+          }),
+        },
+      };
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', () => {
+          h1.queue.close();
+          h2.queue.close();
+        }, { once: true });
+        return { client: client as any, server: h1.server };
+      });
+      const p = new OpenCodeSdkProvider();
+      await p.connect({});
+      const r = await p.createSession({ sessionKey: 'prov-d', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+      await p.send(r, 'turn 1');
+      h1.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-1', ordinal: 0, delta: 'ok1' } });
+      h1.queue.push({ type: 'session.step.ended', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-1', finish: 'stop' } });
+      await new Promise((res) => setTimeout(res, 20));
+
+      // Drop stream 1 while switching active credential to cred-b on disk
+      h1.credentials.splice(0, h1.credentials.length,
+        { id: 'cred-a', integrationID: 'opencode', active: false, value: { type: 'key', key: 'sk-a' } } as any,
+        { id: 'cred-b', integrationID: 'opencode', active: true, value: { type: 'key', key: 'sk-b' } } as any,
+      );
+      h1.queue.fail(new Error('stream dropped'));
+      await new Promise((res) => setTimeout(res, 20));
+
+      // Next send refreshes provenance -> binds cred-b -> 401 deletes ONLY cred-b (never cred-a)
+      await p.send(r, 'turn 2');
+      h2.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-2', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+      await vi.waitFor(() => expect(h1.client.credential.remove).toHaveBeenCalledOnce());
+      expect(h1.client.credential.remove).toHaveBeenCalledWith({ credentialID: 'cred-b' });
+      await p.disconnect();
+    }
+  });
+
+  it('fails with recoverable CONNECTION_LOST and clears busy state when retry terminal reconciliation keeps failing to read history', async () => {
+    const h = createHarness();
+    h.client.model.list.mockResolvedValue({
+      data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }],
+    });
+    h.credentials.push({ id: 'cred-cap', integrationID: 'opencode', active: true, value: { type: 'key', key: 'sk-cap' } } as any);
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', h.queue.close, { once: true });
+      return { client: h.client as any, server: h.server };
+    });
+
+    const p = new OpenCodeSdkProvider();
+    const completes: any[] = [];
+    const errors: any[] = [];
+    p.onComplete((_s, m) => completes.push(m));
+    p.onError((_s, e) => errors.push(e));
+    await p.connect({});
+    const routeId = await p.createSession({ sessionKey: 'route-reconcile-cap', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+    await p.send(routeId, 'hello cap');
+
+    h.queue.push({
+      type: 'session.step.failed',
+      data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-att1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } },
+    });
+    await vi.waitFor(() => expect(h.client.sessions.prompt).toHaveBeenCalledTimes(2));
+
+    h.client.message.list.mockRejectedValue(new Error('persistent 503 history unavailable'));
+    h.queue.push({ type: 'session.execution.succeeded', data: { sessionID: 'oc-session-1' } });
+    await vi.waitFor(() => expect(errors).toHaveLength(1), { timeout: 5_000 });
+    expect(errors[0].code).toBe(PROVIDER_ERROR_CODES.CONNECTION_LOST);
+    expect(errors[0].recoverable).toBe(true);
+    expect(completes).toHaveLength(0);
+
+    // Confirm route is no longer stuck busy: subsequent send succeeds cleanly
+    await p.send(routeId, 'follow-up after cap');
+    h.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-follow', ordinal: 0, delta: 'Healthy follow-up' } });
+    h.queue.push({ type: 'session.step.ended', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-follow', finish: 'stop' } });
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+    expect(completes[0].content).toBe('Healthy follow-up');
     await p.disconnect();
   });
 });

@@ -87,6 +87,7 @@ const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 const PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS = [0, 100, 250, 500, 1_000] as const;
 const MISSING_FINAL_RECOVERY_TIMEOUT_MS = 15_000;
 const MISSING_FINAL_RECOVERY_RECHECK_DELAYS_MS = [250, 1_000] as const;
+const RETRY_TERMINAL_RECONCILE_DELAYS_MS = [0, 25, 75, 200, 500] as const;
 const IMCODES_SYSTEM_INSTRUCTION_KEY = 'imcodes-system';
 type PromptAcceptance = 'accepted' | 'absent' | 'unknown';
 const OPENCODE_PERMISSION_EVENT = {
@@ -933,6 +934,8 @@ interface OpenCodeSessionState {
   priorAttemptUserMessageIds: Set<string>;
   openCodeCredSwitchedDuringTurn: boolean;
   openCodeCredChangedIdsDuringTurn: Set<string>;
+  retryTerminalReconcileInFlight: boolean;
+  retryTerminalHint: string | null;
   activeTurnParams: {
     generation: number;
     text: string;
@@ -942,6 +945,7 @@ interface OpenCodeSessionState {
     startedAt: number;
     credEpochAtDispatch: number;
     expectedCredIdAtDispatch: string | null | undefined;
+    expectedCredFingerprintAtDispatch: string | undefined;
     authHealAttempted: boolean;
   } | null;
   missingFinalRecoveryAttempted: boolean;
@@ -1095,6 +1099,14 @@ function errorExplicitCredentialId(error: unknown): string | undefined {
     ?? safeString(metadata?.credentialID)
     ?? safeString(nestedError?.credentialID)
     ?? safeString((nestedError?.data as Record<string, unknown> | undefined)?.credentialID);
+}
+
+function fingerprintCredentialValue(cred: Record<string, any> | undefined): string | undefined {
+  if (!cred || typeof cred !== 'object') return undefined;
+  if (cred.value === undefined) return undefined;
+  return createHash('sha256')
+    .update(JSON.stringify({ id: cred.id ?? null, label: cred.label ?? null, value: cred.value }))
+    .digest('hex');
 }
 
 function errorExplicitCode(error: unknown): string {
@@ -2075,6 +2087,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   private readonly providerSessionLocks = new Map<string, Promise<void>>();
   private openCodeCredentialEpoch = 0;
   private knownActiveOpenCodeCredId: string | null | undefined;
+  private knownActiveOpenCodeCredFingerprint: string | undefined;
+  private openCodeCredentialProvenanceLoaded = false;
+  private openCodeCredentialProvenanceDirty = false;
   private readonly seenEventIds = new Set<string>();
   private readonly hostGroupKey = randomUUID();
   private client: OpenCodeClientLike | null = null;
@@ -2155,6 +2170,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     this.providerSessionLocks.clear();
     this.openCodeCredentialEpoch = 0;
     this.knownActiveOpenCodeCredId = undefined;
+    this.knownActiveOpenCodeCredFingerprint = undefined;
+    this.openCodeCredentialProvenanceLoaded = false;
+    this.openCodeCredentialProvenanceDirty = false;
     this.seenEventIds.clear();
     this.pendingQuestions.clear();
     this.legacyImportInFlight.clear();
@@ -2255,6 +2273,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       priorAttemptUserMessageIds: new Set(),
       openCodeCredSwitchedDuringTurn: false,
       openCodeCredChangedIdsDuringTurn: new Set(),
+      retryTerminalReconcileInFlight: false,
+      retryTerminalHint: null,
       activeTurnParams: null,
       missingFinalRecoveryAttempted: false,
       missingFinalRecoveryInFlight: false,
@@ -2287,6 +2307,19 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       const previousOwner = previousOwnerId ? this.sessions.get(previousOwnerId) : undefined;
       if (previousOwner && previousOwner !== state) {
         previousOwner.syncedMcpSignature = null;
+        if (previousOwner.busy) {
+          previousOwner.cancelled = true;
+          previousOwner.generation += 1;
+          await previousOwner.client.session.interrupt({ sessionID: providerSessionId }).catch(() => {});
+          this.failOnce(
+            previousOwner,
+            providerError(
+              PROVIDER_ERROR_CODES.CANCELLED,
+              `OpenCode route "${previousOwner.routeId}" turn cancelled because ownership transferred to "${routeId}"`,
+              true,
+            ),
+          );
+        }
       }
       // Suspend previous owner executability before binding replacement MCP so no suspended send can clobber MCP during handoff.
       this.providerToRoute.delete(providerSessionId);
@@ -2707,47 +2740,58 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const system = composeProviderSystemText(payload);
     const messageId = openCodePromptMessageId(state.providerSessionId, payload.deliveryId);
     state.deliveryMessageId = messageId;
-    state.activeTurnParams = {
-      generation,
-      text: payload.assembledMessage,
-      files,
-      ...(system ? { system } : {}),
-      messageId,
-      startedAt: Date.now(),
-      credEpochAtDispatch: this.openCodeCredentialEpoch,
-      expectedCredIdAtDispatch: this.knownActiveOpenCodeCredId,
-      authHealAttempted: false,
-    };
+    state.retryTerminalReconcileInFlight = false;
+    state.retryTerminalHint = null;
     try {
       await state.ensureEvents();
-      if (!this.isCurrent(state, generation) || state.cancelled) return;
       this.assertRouteOwner(state);
+      if (!this.isCurrent(state, generation) || state.cancelled) return;
+      if (!this.openCodeCredentialProvenanceLoaded || this.openCodeCredentialProvenanceDirty) {
+        await this.refreshOpenCodeCredentialProvenance(state.client);
+        this.assertRouteOwner(state);
+        if (!this.isCurrent(state, generation) || state.cancelled) return;
+      }
+      state.activeTurnParams = {
+        generation,
+        text: payload.assembledMessage,
+        files,
+        ...(system ? { system } : {}),
+        messageId,
+        startedAt: Date.now(),
+        credEpochAtDispatch: this.openCodeCredentialEpoch,
+        expectedCredIdAtDispatch: this.knownActiveOpenCodeCredId,
+        expectedCredFingerprintAtDispatch: this.knownActiveOpenCodeCredFingerprint,
+        authHealAttempted: false,
+      };
       if (await this.hasAcceptedPrompt(state, messageId)) {
         return;
       }
+      this.assertRouteOwner(state);
       if (!this.isCurrent(state, generation) || state.cancelled) return;
-      const lockedProceed = await this.withProviderSessionLock(state.providerSessionId, async () => {
-        if (!this.isCurrent(state, generation) || state.cancelled) return false;
+      await this.withProviderSessionLock(state.providerSessionId, async () => {
         this.assertRouteOwner(state);
+        if (!this.isCurrent(state, generation) || state.cancelled) return;
         await this.syncSessionMcp(state);
-        if (!this.isCurrent(state, generation) || state.cancelled) return false;
         this.assertRouteOwner(state);
+        if (!this.isCurrent(state, generation) || state.cancelled) return;
         await this.syncSessionModelAndEffort(state);
-        if (!this.isCurrent(state, generation) || state.cancelled) return false;
         this.assertRouteOwner(state);
+        if (!this.isCurrent(state, generation) || state.cancelled) return;
         await this.applySystemInstruction(state, system);
-        if (!this.isCurrent(state, generation) || state.cancelled) return false;
         this.assertRouteOwner(state);
-        return true;
-      });
-      if (!lockedProceed) return;
-      await state.client.sessions.prompt({
-        sessionID: state.providerSessionId,
-        id: messageId,
-        text: payload.assembledMessage,
-        ...(files.length > 0 ? { files } : {}),
+        if (!this.isCurrent(state, generation) || state.cancelled) return;
+        await withOpenCodeRequestTimeout(
+          state.client.sessions.prompt({
+            sessionID: state.providerSessionId,
+            id: messageId,
+            text: payload.assembledMessage,
+            ...(files.length > 0 ? { files } : {}),
+          }),
+          'prompt submission',
+        );
       });
     } catch (error) {
+      this.assertRouteOwner(state);
       if (!this.isCurrent(state, generation) || state.cancelled) return;
       if (isTransientRequestFailure(error)) {
         try {
@@ -2808,32 +2852,35 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
     try {
       await state.ensureEvents();
+      this.assertRouteOwner(state);
       if (!this.isCurrent(state, generation) || state.cancelled) return;
-      const lockedProceed = await this.withProviderSessionLock(state.providerSessionId, async () => {
-        if (!this.isCurrent(state, generation) || state.cancelled) return false;
+      await this.withProviderSessionLock(state.providerSessionId, async () => {
         this.assertRouteOwner(state);
+        if (!this.isCurrent(state, generation) || state.cancelled) return;
         await this.syncSessionModelAndEffort(state);
-        if (!this.isCurrent(state, generation) || state.cancelled) return false;
         this.assertRouteOwner(state);
-        return true;
-      });
-      if (!lockedProceed) return;
-      const result = await compact({ sessionID: state.providerSessionId, id: compactInputId });
-      const resolvedInputId = safeString((result as Record<string, unknown> | undefined)?.id);
-      if (
-        resolvedInputId
-        && resolvedInputId !== state.compactRequest?.inputId
-        && this.isCurrent(state, generation)
-        && state.compactRequest
-        && state.compactRequest.generation === generation
-      ) {
-        if (state.compactRequest.startedInputId && state.compactRequest.startedInputId !== resolvedInputId) {
-          state.compactRequest.manualStarted = false;
-          state.compactRequest.startedInputId = null;
+        if (!this.isCurrent(state, generation) || state.cancelled) return;
+        const result = await withOpenCodeRequestTimeout(
+          compact({ sessionID: state.providerSessionId, id: compactInputId }),
+          'compact',
+        );
+        const resolvedInputId = safeString((result as Record<string, unknown> | undefined)?.id);
+        if (
+          resolvedInputId
+          && resolvedInputId !== state.compactRequest?.inputId
+          && this.isCurrent(state, generation)
+          && state.compactRequest
+          && state.compactRequest.generation === generation
+        ) {
+          if (state.compactRequest.startedInputId && state.compactRequest.startedInputId !== resolvedInputId) {
+            state.compactRequest.manualStarted = false;
+            state.compactRequest.startedInputId = null;
+          }
+          state.compactRequest.inputId = resolvedInputId;
         }
-        state.compactRequest.inputId = resolvedInputId;
-      }
+      });
     } catch (error) {
+      this.assertRouteOwner(state);
       if (!this.isCurrent(state, generation) || state.cancelled || state.compactCompletionEmitted) return;
       const normalized = this.normalizeError(error, 'compact');
       this.failOnce(state, normalized);
@@ -3036,7 +3083,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     let lastObservation: PromptAcceptance = 'unknown';
     for (const delayMs of PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS) {
       await sleep(delayMs);
-      if (!this.isCurrent(state, generation) || state.cancelled) return 'unknown';
+      if (!this.isCurrent(state, generation) || state.cancelled || !this.isRouteOwner(state)) return 'unknown';
       try {
         if (await this.hasAcceptedPrompt(state, messageId)) {
           logger.warn(
@@ -3149,6 +3196,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
               (event) => this.handleEvent(event),
               (error) => {
                 created.broken = true;
+                this.openCodeCredentialProvenanceDirty = true;
                 failClientBusySessions(error);
               },
             );
@@ -3178,6 +3226,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           if (created.currentSubAbort === subAbort) {
             created.broken = true;
           }
+          this.openCodeCredentialProvenanceDirty = true;
           failClientBusySessions(error);
           if (!created.closed && created.refCount > 0 && this.activeClientEventSubs.get(client) === created) {
             void created.ensureLive().catch((recoverErr) => {
@@ -3405,9 +3454,12 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       const credData = (event.data ?? event.properties) as Record<string, any> | undefined;
       if (safeString(credData?.integrationID) === 'opencode') {
         this.openCodeCredentialEpoch += 1;
+        this.knownActiveOpenCodeCredFingerprint = undefined;
+        this.openCodeCredentialProvenanceDirty = true;
         const changedCredId = safeString(credData?.credentialID);
         if (event.type === 'credential.switched') {
           this.knownActiveOpenCodeCredId = changedCredId ?? null;
+          this.openCodeCredentialProvenanceLoaded = true;
         }
         for (const activeState of this.sessions.values()) {
           if (activeState.busy) {
@@ -3583,7 +3635,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       case 'session.step.ended': {
         if (state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (isTerminalFinish(data?.finish) && inRetryLifecycle() && !isCorrelatedRetryEvent()) {
-          void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+          this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
           return;
         }
         if (!ensureRetryReadyForContentEvent(true)) return;
@@ -3600,7 +3652,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           if (isCorrelatedRetryEvent()) {
             state.authHealPhase = 'retry-active';
           } else {
-            void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+            this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
             return;
           }
         }
@@ -3630,7 +3682,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           if (isCorrelatedRetryEvent()) {
             state.authHealPhase = 'retry-active';
           } else {
-            void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+            this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
             return;
           }
         }
@@ -3644,7 +3696,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           if (isCorrelatedRetryEvent()) {
             state.authHealPhase = 'retry-active';
           } else {
-            void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+            this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
             return;
           }
         }
@@ -3655,6 +3707,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         this.stopConfirmations.complete(state);
         if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (inRetryLifecycle() && !isCorrelatedRetryEvent()) {
+          this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
           return;
         }
         if (state.busy && !state.cancelled) {
@@ -3705,7 +3758,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
             if (isCorrelatedRetryEvent()) {
               state.authHealPhase = 'retry-active';
             } else {
-              void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+              this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
               return;
             }
           }
@@ -3778,7 +3831,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           if (isCorrelatedRetryEvent()) {
             state.authHealPhase = 'retry-active';
           } else {
-            void this.reconcileRetryTerminalFrame(state, state.generation, event.type, data);
+            this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
             return;
           }
         }
@@ -4214,72 +4267,152 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     return true;
   }
 
-  private async reconcileRetryTerminalFrame(
+  private async refreshOpenCodeCredentialProvenance(client: OpenCodeClientLike): Promise<void> {
+    const credentialApi = client.credential ?? this.client?.credential;
+    if (!credentialApi?.list) {
+      this.knownActiveOpenCodeCredId = undefined;
+      this.knownActiveOpenCodeCredFingerprint = undefined;
+      this.openCodeCredentialProvenanceLoaded = true;
+      this.openCodeCredentialProvenanceDirty = false;
+      return;
+    }
+    const epochBefore = this.openCodeCredentialEpoch;
+    try {
+      const creds = await withOpenCodeRequestTimeout(credentialApi.list(), 'credential provenance lookup');
+      if (this.openCodeCredentialEpoch !== epochBefore) {
+        // An SSE credential change raced with the lookup; keep dirty so the next turn re-syncs cleanly.
+        this.openCodeCredentialProvenanceDirty = true;
+        return;
+      }
+      const opencodeCreds = creds.filter((cred) => cred?.integrationID === 'opencode' && safeString(cred.id));
+      const activeCreds = opencodeCreds.filter((cred) => cred.active === true);
+      if (activeCreds.length === 1) {
+        const chosen = activeCreds[0] as Record<string, any>;
+        this.knownActiveOpenCodeCredId = safeString(chosen.id)!;
+        this.knownActiveOpenCodeCredFingerprint = fingerprintCredentialValue(chosen);
+      } else if (activeCreds.length === 0 && opencodeCreds.length === 1 && opencodeCreds[0]?.active !== false) {
+        const chosen = opencodeCreds[0] as Record<string, any>;
+        this.knownActiveOpenCodeCredId = safeString(chosen.id)!;
+        this.knownActiveOpenCodeCredFingerprint = fingerprintCredentialValue(chosen);
+      } else if (opencodeCreds.length === 0) {
+        this.knownActiveOpenCodeCredId = null;
+        this.knownActiveOpenCodeCredFingerprint = undefined;
+      } else {
+        this.knownActiveOpenCodeCredId = undefined;
+        this.knownActiveOpenCodeCredFingerprint = undefined;
+      }
+      this.openCodeCredentialProvenanceLoaded = true;
+      this.openCodeCredentialProvenanceDirty = false;
+    } catch {
+      this.knownActiveOpenCodeCredId = undefined;
+      this.knownActiveOpenCodeCredFingerprint = undefined;
+      this.openCodeCredentialProvenanceDirty = true;
+    }
+  }
+
+  private scheduleRetryTerminalReconcile(
     state: OpenCodeSessionState,
     generation: number,
     eventType: string,
-    _data: Record<string, any> | undefined,
-  ): Promise<void> {
-    if (
-      !this.isCurrent(state, generation)
-      || state.cancelled
-      || (state.authHealPhase !== 'retry-dispatched' && state.authHealPhase !== 'retry-active')
-    ) {
-      return;
-    }
-    const retryMessageId = state.deliveryMessageId;
-    let items: Array<Record<string, any>>;
-    try {
-      const res = await withOpenCodeRequestTimeout(
-        state.client.message.list({ sessionID: state.providerSessionId, limit: 20, order: 'desc' }),
-        'auth-heal retry terminal reconciliation',
-      );
-      if (!Array.isArray(res?.data)) return;
-      items = res.data as Array<Record<string, any>>;
-    } catch {
-      // Transient history failure MUST NEVER settle an uncorrelated retry terminal event.
-      return;
-    }
-    if (
-      !this.isCurrent(state, generation)
-      || state.cancelled
-      || (state.authHealPhase !== 'retry-dispatched' && state.authHealPhase !== 'retry-active')
-    ) {
-      return;
-    }
-    if (items.length === 0) {
-      return;
-    }
+  ): void {
+    state.retryTerminalHint = eventType;
+    if (state.retryTerminalReconcileInFlight) return;
+    state.retryTerminalReconcileInFlight = true;
+    void this.reconcileRetryTerminalFrame(state, generation);
+  }
 
-    const retryUserIdx = retryMessageId
-      ? items.findIndex((item) => item?.id === retryMessageId && item?.type === 'user')
-      : -1;
-    const candidatePool = retryUserIdx >= 0 ? items.slice(0, retryUserIdx) : items;
-    const terminalAssistant = candidatePool.find((item) => {
-      if (!isTerminalAssistantMessage(item)) return false;
-      const assistantId = safeString(item.id);
-      const parentId = safeString(item.parentID);
-      if (assistantId && state.priorAttemptAssistantIds.has(assistantId)) return false;
-      if (parentId && state.priorAttemptUserMessageIds.has(parentId)) return false;
-      if (retryMessageId && parentId && parentId !== retryMessageId) return false;
-      return retryUserIdx >= 0 || (retryMessageId !== null && parentId === retryMessageId);
-    });
-    if (!terminalAssistant) {
-      // Stale Attempt-1 terminal frame arrived before Retry persisted a terminal assistant reply.
-      return;
-    }
-    state.authHealPhase = 'retry-active';
-    state.authHealInFlight = false;
-    if (terminalAssistant.error) {
-      this.handleSessionFailure(
+  private async reconcileRetryTerminalFrame(
+    state: OpenCodeSessionState,
+    generation: number,
+  ): Promise<void> {
+    const canContinue = () => (
+      this.isCurrent(state, generation)
+      && !state.cancelled
+      && this.isRouteOwner(state)
+      && !state.completionEmitted
+      && !state.terminalErrorEmitted
+      && (state.authHealPhase === 'retry-dispatched' || state.authHealPhase === 'retry-active')
+    );
+    const retryMessageId = state.deliveryMessageId;
+    let lastReadError: unknown = null;
+    let cleanNonTerminalChecks = 0;
+
+    try {
+      for (const delayMs of RETRY_TERMINAL_RECONCILE_DELAYS_MS) {
+        if (delayMs > 0) await sleep(delayMs);
+        if (!canContinue()) return;
+
+        let items: Array<Record<string, any>>;
+        try {
+          const res = await withOpenCodeRequestTimeout(
+            state.client.message.list({ sessionID: state.providerSessionId, limit: 20, order: 'desc' }),
+            'auth-heal retry terminal reconciliation',
+          );
+          if (!canContinue()) return;
+          if (!Array.isArray(res?.data)) {
+            throw new Error('OpenCode history response missing data array');
+          }
+          items = res.data as Array<Record<string, any>>;
+          lastReadError = null;
+        } catch (error) {
+          lastReadError = error;
+          continue;
+        }
+
+        const retryUserIdx = retryMessageId
+          ? items.findIndex((item) => item?.id === retryMessageId && item?.type === 'user')
+          : -1;
+        const candidatePool = retryUserIdx >= 0 ? items.slice(0, retryUserIdx) : items;
+        const terminalAssistant = candidatePool.find((item) => {
+          if (!isTerminalAssistantMessage(item)) return false;
+          const assistantId = safeString(item.id);
+          const parentId = safeString(item.parentID);
+          if (assistantId && state.priorAttemptAssistantIds.has(assistantId)) return false;
+          if (parentId && state.priorAttemptUserMessageIds.has(parentId)) return false;
+          if (retryMessageId && parentId && parentId !== retryMessageId) return false;
+          return retryUserIdx >= 0 || (retryMessageId !== null && parentId === retryMessageId);
+        });
+
+        if (terminalAssistant) {
+          const hint = state.retryTerminalHint ?? 'session.execution.succeeded';
+          state.authHealPhase = 'retry-active';
+          state.authHealInFlight = false;
+          if (terminalAssistant.error) {
+            this.handleSessionFailure(
+              state,
+              terminalAssistant.error,
+              hint === 'session.step.failed' ? 'step' : 'session',
+            );
+            return;
+          }
+          this.processAssistantMessageRecord(state, terminalAssistant);
+          this.completeOnce(state, hint);
+          return;
+        }
+
+        // The server responded cleanly with no Retry terminal assistant record yet:
+        // allow one short projection-lag recheck, then conclude the hint was stale Attempt-1 noise
+        // so a healthy slow Retry keeps running.
+        cleanNonTerminalChecks += 1;
+        if (cleanNonTerminalChecks >= 2) {
+          return;
+        }
+      }
+
+      if (!canContinue() || lastReadError === null) return;
+      this.failOnce(
         state,
-        terminalAssistant.error,
-        eventType === 'session.step.failed' ? 'step' : 'session',
+        providerError(
+          PROVIDER_ERROR_CODES.CONNECTION_LOST,
+          `OpenCode retry completion could not be confirmed due to repeated history read failures: ${errorMessage(lastReadError)}`,
+          true,
+        ),
       );
-      return;
+    } finally {
+      if (this.isCurrent(state, generation)) {
+        state.retryTerminalReconcileInFlight = false;
+      }
     }
-    this.processAssistantMessageRecord(state, terminalAssistant);
-    this.completeOnce(state, eventType);
   }
 
   private handleSessionFailure(state: OpenCodeSessionState, rawError: unknown, operation: string): void {
@@ -4298,6 +4431,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         state.authHealInFlight = true;
         state.authHealPhase = 'preparing';
         state.authHealRetryAcked = false;
+        state.retryTerminalReconcileInFlight = false;
+        state.retryTerminalHint = null;
         state.priorAttemptUserMessageIds.add(turnParams.messageId);
         if (state.currentMessageId) state.priorAttemptAssistantIds.add(state.currentMessageId);
         turnParams.authHealAttempted = true;
@@ -4346,74 +4481,65 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       let clearedStoredCred = false;
       let preservedNewerCred = state.openCodeCredSwitchedDuringTurn
         || this.openCodeCredentialEpoch !== params.credEpochAtDispatch;
+      const targetCredId = explicitCredId
+        ?? (typeof params.expectedCredIdAtDispatch === 'string' ? params.expectedCredIdAtDispatch : undefined);
+
       if (credentialApi?.list && credentialApi?.remove) {
         const creds = await credentialApi.list();
-        if (aborted()) return;
-        // Flush queued credential.switched / credential.updated SSE microtasks across one event-loop tick before selecting creds to remove.
-        await new Promise<void>((resolveTick) => setTimeout(resolveTick, 0));
         if (aborted()) return;
         const opencodeCreds = creds.filter((cred) => cred?.integrationID === 'opencode' && safeString(cred.id));
         const epochChanged = this.openCodeCredentialEpoch !== params.credEpochAtDispatch
           || state.openCodeCredSwitchedDuringTurn;
         if (epochChanged) preservedNewerCred = true;
 
-        const candidates = explicitCredId
-          ? opencodeCreds.filter((cred) => cred.id === explicitCredId)
-          : (() => {
-            if (epochChanged) {
-              // Only remove a credential explicitly known at dispatch when it was superseded by another cred; never delete newly activated creds.
-              if (typeof params.expectedCredIdAtDispatch === 'string') {
-                return opencodeCreds.filter((cred) => cred.id === params.expectedCredIdAtDispatch);
-              }
-              return [];
-            }
-            if (typeof params.expectedCredIdAtDispatch === 'string') {
-              return opencodeCreds.filter((cred) => cred.id === params.expectedCredIdAtDispatch && cred.active !== false);
-            }
-            if (params.expectedCredIdAtDispatch === null) {
-              return [];
-            }
-            const activeCreds = opencodeCreds.filter((cred) => cred.active === true);
-            if (activeCreds.length === 1) return activeCreds;
-            if (activeCreds.length === 0 && opencodeCreds.length === 1 && opencodeCreds[0]?.active !== false) {
-              return opencodeCreds;
-            }
-            return [];
-          })();
-
-        const targets = candidates.filter((cred) => {
-          if (state.openCodeCredChangedIdsDuringTurn.has(cred.id)) {
-            preservedNewerCred = true;
-            return false;
-          }
-          const rec = cred as Record<string, any>;
-          const rawTs = positiveNumber(rec.time?.updated ?? rec.time?.created ?? rec.updatedAt ?? rec.createdAt);
-          const credTs = rawTs !== undefined && rawTs < 1e12 ? rawTs * 1000 : rawTs;
-          if (credTs !== undefined && credTs > params.startedAt) {
-            preservedNewerCred = true;
-            return false;
-          }
-          return true;
-        });
-
-        for (const cred of targets) {
-          if (aborted()) return;
-          const liveEpochChanged = this.openCodeCredentialEpoch !== params.credEpochAtDispatch
-            || state.openCodeCredChangedIdsDuringTurn.has(cred.id);
-          if (liveEpochChanged && !explicitCredId && cred.id !== params.expectedCredIdAtDispatch) {
-            preservedNewerCred = true;
-            continue;
-          }
-          await credentialApi.remove({ credentialID: cred.id });
-          clearedStoredCred = true;
-          if (this.knownActiveOpenCodeCredId === cred.id) {
-            this.knownActiveOpenCodeCredId = undefined;
-          }
-          if (aborted()) return;
+        // If another stored opencode credential is already active in list() (even before SSE switched arrives),
+        // treat the active selection as replaced only when we knew the pre-turn baseline (`targetCredId` or clean empty store).
+        const anotherActiveCredExists = targetCredId
+          ? opencodeCreds.some((cred) => cred.id !== targetCredId && cred.active === true)
+          : (params.expectedCredIdAtDispatch === null && opencodeCreds.some((cred) => cred.active === true));
+        if (anotherActiveCredExists) {
+          preservedNewerCred = true;
         }
+
+        if (!targetCredId) {
+          if (!preservedNewerCred && opencodeCreds.length > 0) {
+            throw new Error(
+              'Expired OpenCode credential provenance could not be verified for this turn; stored credentials were preserved',
+            );
+          }
+        } else if (state.openCodeCredChangedIdsDuringTurn.has(targetCredId)) {
+          // Same-ID credential was updated/switched during this turn and the SDK lacks conditional remove: preserve it.
+          preservedNewerCred = true;
+        } else {
+          const matched = opencodeCreds.find((cred) => cred.id === targetCredId) as Record<string, any> | undefined;
+          if (!matched) {
+            preservedNewerCred = true;
+          } else {
+            const currentFingerprint = fingerprintCredentialValue(matched);
+            const rawTs = positiveNumber(matched.time?.updated ?? matched.time?.created ?? matched.updatedAt ?? matched.createdAt);
+            const credTs = rawTs !== undefined && rawTs < 1e12 ? rawTs * 1000 : rawTs;
+            const valueChangedInPlace = params.expectedCredFingerprintAtDispatch !== undefined
+              && currentFingerprint !== params.expectedCredFingerprintAtDispatch;
+            const unconfirmableSameIdUpdate = epochChanged && currentFingerprint === undefined;
+            const timestampNewer = credTs !== undefined && credTs > params.startedAt;
+            if (valueChangedInPlace || unconfirmableSameIdUpdate || timestampNewer || anotherActiveCredExists) {
+              preservedNewerCred = true;
+            } else if (!aborted()) {
+              await credentialApi.remove({ credentialID: String(matched.id) });
+              clearedStoredCred = true;
+              this.openCodeCredentialProvenanceDirty = true;
+              if (this.knownActiveOpenCodeCredId === matched.id) {
+                this.knownActiveOpenCodeCredId = undefined;
+                this.knownActiveOpenCodeCredFingerprint = undefined;
+              }
+              if (aborted()) return;
+            }
+          }
+        }
+
         if (!clearedStoredCred && !preservedNewerCred && opencodeCreds.length > 0) {
           throw new Error(
-            'Expired OpenCode credential could not be unambiguously attributed; stored credentials were preserved',
+            'Expired OpenCode credential provenance could not be confirmed; stored credentials were preserved',
           );
         }
       }
@@ -4449,27 +4575,28 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
       await state.ensureEvents();
       if (aborted()) return;
-      const lockedReady = await this.withProviderSessionLock(state.providerSessionId, async () => {
-        if (aborted()) return false;
+      await this.withProviderSessionLock(state.providerSessionId, async () => {
+        if (aborted()) return;
         this.assertRouteOwner(state);
         await this.syncSessionModelAndEffort(state);
-        if (aborted()) return false;
+        if (aborted()) return;
         this.assertRouteOwner(state);
         await this.applySystemInstruction(state, params.system);
-        if (aborted()) return false;
+        if (aborted()) return;
         this.assertRouteOwner(state);
-        return true;
-      });
-      if (!lockedReady) return;
-      this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
-      state.authHealPhase = 'retry-dispatched';
-      state.authHealRetryAcked = false;
-      state.authHealInFlight = false;
-      await state.client.sessions.prompt({
-        sessionID: state.providerSessionId,
-        id: retryMessageId,
-        text: params.text,
-        ...(params.files.length > 0 ? { files: params.files } : {}),
+        this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
+        state.authHealPhase = 'retry-dispatched';
+        state.authHealRetryAcked = false;
+        state.authHealInFlight = false;
+        await withOpenCodeRequestTimeout(
+          state.client.sessions.prompt({
+            sessionID: state.providerSessionId,
+            id: retryMessageId,
+            text: params.text,
+            ...(params.files.length > 0 ? { files: params.files } : {}),
+          }),
+          'auth-heal retry prompt',
+        );
       });
       if (aborted()) return;
       state.authHealRetryAcked = true;
@@ -4499,7 +4626,13 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state.compacting = false;
     state.compactRequest = null;
     state.authHealInFlight = false;
+    state.retryTerminalReconcileInFlight = false;
+    state.retryTerminalHint = null;
     state.activeTurnParams = null;
+    if (!state.cancelled) {
+      // Revoke in-flight turn generation so suspended preprocessing/recovery exits immediately after feed drops or errors.
+      state.generation += 1;
+    }
     this.emitStatus(state.routeId, { status: null, label: null });
     this.emitError(state.routeId, error);
   }
