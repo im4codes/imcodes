@@ -34,7 +34,7 @@ export interface PortForwardBridgeEndpoint {
 export type PortForwardBridgeLookup = (serverId: string) => PortForwardBridgeEndpoint | undefined;
 export type PortForwardIceServerProvider = (userId: string) => DirectFileTransferIceServerConfig[];
 export type PortForwardCloseSideState = 'pending' | 'acked' | 'offline' | 'timed_out';
-export type PortForwardSendFailureReason = 'offline' | 'generation_mismatch' | 'overflow' | 'write_failed';
+export type PortForwardSendFailureReason = 'offline' | 'generation_mismatch' | 'overflow' | 'write_failed' | 'cancelled';
 export interface PortForwardCloseSettlement {
   confirmed: boolean;
   listen: PortForwardCloseSideState;
@@ -104,17 +104,26 @@ function isMessageAdmissibleForStatus(
 
 const CLUSTER_RELAY_RETRY_DELAYS_MS = [15, 45] as const;
 
-function delayMs(ms: number): Promise<void> {
+function delayMs(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
   return new Promise((resolve) => {
-    const t = setTimeout(resolve, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      resolve(false);
+    };
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
     t.unref?.();
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
 interface BoundedQueueItem {
   byteSize: number;
   isRelayData: boolean;
-  run: () => Promise<void>;
+  run: (signal: AbortSignal) => Promise<void>;
 }
 
 interface BoundedQueueBucket {
@@ -122,6 +131,8 @@ interface BoundedQueueBucket {
   queuedBytes: number;
   draining: boolean;
   memHighWater: boolean;
+  cancelled: boolean;
+  abortController: AbortController;
 }
 
 interface IngressSenderPressure {
@@ -237,6 +248,7 @@ export class PortForwardRouter {
   private readonly remoteDeliveryQueues = new Map<string, BoundedQueueBucket>();
   private readonly ingressPressure = new Map<string, IngressSenderPressure>();
   private readonly authorizedRemoteRoutes = new Map<string, PortForwardClusterTunnelRecord>();
+  private readonly closedDeliveryTombstones = new Set<string>();
   private podId: string;
   private clusterStore: PortForwardClusterStore;
   private hasSharedClusterStore: boolean;
@@ -299,9 +311,12 @@ export class PortForwardRouter {
       this.pendingRemoteCloses.delete(reqId);
       resolve({ ok: false, outcome: 'missing' });
     }
-    this.preAuthQueues.clear();
-    this.remoteDeliveryQueues.clear();
+    for (const key of [...this.inboundQueues.keys()]) this.cancelQueueBucket(this.inboundQueues, key);
+    for (const key of [...this.outboundQueues.keys()]) this.cancelQueueBucket(this.outboundQueues, key);
+    for (const key of [...this.preAuthQueues.keys()]) this.cancelQueueBucket(this.preAuthQueues, key);
+    for (const key of [...this.remoteDeliveryQueues.keys()]) this.cancelQueueBucket(this.remoteDeliveryQueues, key);
     this.authorizedRemoteRoutes.clear();
+    this.closedDeliveryTombstones.clear();
     for (const tunnel of [...this.tunnels.values()]) {
       this.failPendingOrCloseTunnel(
         tunnel,
@@ -317,17 +332,46 @@ export class PortForwardRouter {
     this.unsubscribeBus = this.clusterStore.subscribePod(this.podId, (msg) => this.handleBusMessage(msg));
   }
 
+  private markDeliveryTombstone(key: string): void {
+    if (this.closedDeliveryTombstones.has(key)) return;
+    if (this.closedDeliveryTombstones.size >= 4096) {
+      const oldest = this.closedDeliveryTombstones.values().next().value;
+      if (oldest !== undefined) this.closedDeliveryTombstones.delete(oldest);
+    }
+    this.closedDeliveryTombstones.add(key);
+  }
+
+  private cancelQueueBucket(buckets: Map<string, BoundedQueueBucket>, key: string): void {
+    const bucket = buckets.get(key);
+    if (!bucket) return;
+    bucket.cancelled = true;
+    bucket.items.length = 0;
+    bucket.queuedBytes = 0;
+    bucket.memHighWater = false;
+    bucket.abortController.abort();
+    buckets.delete(key);
+  }
+
+  private cancelBucketsByPrefix(buckets: Map<string, BoundedQueueBucket>, prefix: string): void {
+    for (const key of [...buckets.keys()]) {
+      if (key.startsWith(prefix)) this.cancelQueueBucket(buckets, key);
+    }
+  }
+
+  private cancelBucketsBySuffix(buckets: Map<string, BoundedQueueBucket>, suffix: string): void {
+    for (const key of [...buckets.keys()]) {
+      if (key.endsWith(suffix)) {
+        this.markDeliveryTombstone(key);
+        this.cancelQueueBucket(buckets, key);
+      }
+    }
+  }
+
   private cleanupRelayStateForTunnel(tunnelId: string): void {
     const prefix = `${tunnelId}:`;
-    for (const key of this.inboundQueues.keys()) {
-      if (key.startsWith(prefix)) this.inboundQueues.delete(key);
-    }
-    for (const key of this.outboundQueues.keys()) {
-      if (key.startsWith(prefix)) this.outboundQueues.delete(key);
-    }
-    for (const key of this.remoteDeliveryQueues.keys()) {
-      if (key.startsWith(prefix)) this.remoteDeliveryQueues.delete(key);
-    }
+    this.cancelBucketsByPrefix(this.inboundQueues, prefix);
+    this.cancelBucketsByPrefix(this.outboundQueues, prefix);
+    this.cancelBucketsByPrefix(this.remoteDeliveryQueues, prefix);
     for (const key of this.ingressPressure.keys()) {
       if (key.startsWith(prefix)) this.ingressPressure.delete(key);
     }
@@ -438,14 +482,21 @@ export class PortForwardRouter {
     opts: {
       byteSize: number;
       isRelayData: boolean;
-      run: () => Promise<void>;
+      run: (signal: AbortSignal) => Promise<void>;
       onHighWater?: () => void;
       onLowWater?: () => void;
     },
   ): { ok: true } | { ok: false; overflow: true } {
     let bucket = buckets.get(key);
-    if (!bucket) {
-      bucket = { items: [], queuedBytes: 0, draining: false, memHighWater: false };
+    if (!bucket || bucket.cancelled) {
+      bucket = {
+        items: [],
+        queuedBytes: 0,
+        draining: false,
+        memHighWater: false,
+        cancelled: false,
+        abortController: new AbortController(),
+      };
       buckets.set(key, bucket);
     }
 
@@ -473,14 +524,15 @@ export class PortForwardRouter {
       bucket.draining = true;
       void (async () => {
         try {
-          while (bucket.items.length > 0) {
+          while (!bucket.cancelled && bucket.items.length > 0) {
             const item = bucket.items.shift()!;
+            if (bucket.cancelled || bucket.abortController.signal.aborted) break;
             try {
-              await item.run();
+              await item.run(bucket.abortController.signal);
             } catch {
               // Item-level errors are handled inside each task.
             } finally {
-              if (item.isRelayData) {
+              if (!bucket.cancelled && item.isRelayData) {
                 bucket.queuedBytes = Math.max(0, bucket.queuedBytes - item.byteSize);
                 if (bucket.memHighWater && bucket.queuedBytes <= PORT_FORWARD_LIMITS.CLUSTER_RELAY_LOW_WATER_BYTES) {
                   bucket.memHighWater = false;
@@ -491,8 +543,9 @@ export class PortForwardRouter {
           }
         } finally {
           bucket.draining = false;
-          if (bucket.items.length === 0 && bucket.queuedBytes === 0 && !bucket.memHighWater) {
-            if (buckets.get(key) === bucket) buckets.delete(key);
+          if ((bucket.cancelled || (bucket.items.length === 0 && bucket.queuedBytes === 0 && !bucket.memHighWater))
+            && buckets.get(key) === bucket) {
+            buckets.delete(key);
           }
         }
       })();
@@ -535,10 +588,9 @@ export class PortForwardRouter {
     for (const key of this.authorizedRemoteRoutes.keys()) {
       if (key.endsWith(suffix)) this.authorizedRemoteRoutes.delete(key);
     }
-    for (const key of this.remoteDeliveryQueues.keys()) {
-      if (key.endsWith(suffix)) this.remoteDeliveryQueues.delete(key);
-    }
-    this.preAuthQueues.delete(`${serverId}:${this.podId}:${generation}`);
+    this.cancelBucketsBySuffix(this.inboundQueues, suffix);
+    this.cancelBucketsBySuffix(this.remoteDeliveryQueues, suffix);
+    this.cancelQueueBucket(this.preAuthQueues, `${serverId}:${this.podId}:${generation}`);
 
     for (const tunnel of [...this.tunnels.values()]) {
       if (tunnel.status === 'closed') continue;
@@ -627,23 +679,31 @@ export class PortForwardRouter {
     serverId: string,
     expectedGeneration: number,
     frame: PortForwardWireMessage,
+    abortSignal?: AbortSignal,
   ): Promise<'delivered' | PortForwardSendFailureReason> {
     const isRelayData = frame.type === PORT_FORWARD_MSG.RELAY_FRAME;
+    const tombstoneKey = `${frame.tunnelId}:${serverId}:${this.podId}:${expectedGeneration}`;
+    const isCancelled = () =>
+      Boolean(abortSignal?.aborted) || (isRelayData && this.closedDeliveryTombstones.has(tombstoneKey));
     const retryDelays = isRelayData ? HOP2_DELIVERY_RETRY_DELAYS_MS : [];
     for (let attempt = 0; attempt <= retryDelays.length; attempt++) {
+      if (isCancelled()) return 'cancelled';
       const bridge = this.lookupBridge(serverId);
       if (!bridge || !bridge.isDaemonConnected()) return 'offline';
       if (bridge.daemonConnectionGeneration() !== expectedGeneration) return 'generation_mismatch';
+      if (isCancelled()) return 'cancelled';
       const ok = bridge.trySendPortForward(frame as unknown as Record<string, unknown>, expectedGeneration);
       if (ok) return 'delivered';
+      if (isCancelled()) return 'cancelled';
       if (!bridge.isDaemonConnected()) return 'offline';
       if (bridge.daemonConnectionGeneration() !== expectedGeneration) return 'generation_mismatch';
       if (attempt < retryDelays.length) {
         const local = this.tunnels.get(frame.tunnelId) ?? this.closingTunnels.get(frame.tunnelId);
         if (local && (local.status === 'closing' || local.status === 'closed')) {
-          return 'write_failed';
+          return 'cancelled';
         }
-        await delayMs(retryDelays[attempt]!);
+        const continued = await delayMs(retryDelays[attempt]!, abortSignal);
+        if (!continued || isCancelled()) return 'cancelled';
       }
     }
     return 'write_failed';
@@ -713,7 +773,8 @@ export class PortForwardRouter {
 
         if (msg.frame.type === PORT_FORWARD_MSG.CLOSE) {
           if (deliveryKey) {
-            this.remoteDeliveryQueues.delete(deliveryKey);
+            this.markDeliveryTombstone(deliveryKey);
+            this.cancelQueueBucket(this.remoteDeliveryQueues, deliveryKey);
           }
           const bridge = this.lookupBridge(msg.serverId);
           if (!bridge || !bridge.isDaemonConnected() || bridge.daemonConnectionGeneration() !== msg.expectedGeneration) {
@@ -754,9 +815,12 @@ export class PortForwardRouter {
         }
 
         if (msg.frame.type === PORT_FORWARD_MSG.RELAY_FRAME && deliveryKey) {
+          if (this.closedDeliveryTombstones.has(deliveryKey)) return;
           const byteSize = Buffer.byteLength(msg.frame.data, 'utf8');
           const relayFrame = msg.frame;
           const reportRelayDeliveryFailure = async (reason: string) => {
+            this.markDeliveryTombstone(deliveryKey);
+            this.cancelQueueBucket(this.remoteDeliveryQueues, deliveryKey);
             const bridge = this.lookupBridge(msg.serverId);
             if (bridge && bridge.isDaemonConnected() && bridge.daemonConnectionGeneration() === msg.expectedGeneration) {
               const roleGuess = msg.direction === 'l2t' ? PORT_FORWARD_ROLE.TARGET : PORT_FORWARD_ROLE.LISTEN;
@@ -780,10 +844,18 @@ export class PortForwardRouter {
           const enqueued = this.enqueueBounded(this.remoteDeliveryQueues, deliveryKey, {
             byteSize,
             isRelayData: true,
-            run: async () => {
-              const outcome = await this.deliverToLiveBridgeWithRetry(msg.serverId, msg.expectedGeneration, relayFrame);
-              if (outcome === 'delivered') return;
+            run: async (signal) => {
+              if (signal.aborted || this.closedDeliveryTombstones.has(deliveryKey)) return;
+              const outcome = await this.deliverToLiveBridgeWithRetry(
+                msg.serverId,
+                msg.expectedGeneration,
+                relayFrame,
+                signal,
+              );
+              if (outcome === 'delivered' || outcome === 'cancelled') return;
               if (outcome === 'offline' || outcome === 'generation_mismatch') {
+                this.markDeliveryTombstone(deliveryKey);
+                this.cancelQueueBucket(this.remoteDeliveryQueues, deliveryKey);
                 this.onDaemonDisconnected(msg.serverId, msg.expectedGeneration);
                 if (msg.coordinatorPodId) {
                   await this.clusterStore.sendToPod(msg.coordinatorPodId, {
@@ -1200,6 +1272,7 @@ export class PortForwardRouter {
   private async closeTunnelRecordAndAwait(
     record: PortForwardClusterTunnelRecord,
     reason: string,
+    allowRedirect = true,
   ): Promise<{ confirmed: boolean; tunnelId: string }> {
     const localTunnel = this.tunnels.get(record.tunnelId) ?? this.closingTunnels.get(record.tunnelId);
     if (localTunnel) {
@@ -1249,45 +1322,92 @@ export class PortForwardRouter {
       }
     }
 
-    // Coordinator is absent or dead: close endpoints directly & await confirmation if either is still online.
-    let listenEp: { podId: string; generation: number } | null;
-    let targetEp: { podId: string; generation: number } | null;
-    try {
-      [listenEp, targetEp] = await Promise.all([
-        this.resolveEndpoint(record.listenServerId),
-        this.resolveEndpoint(record.targetServerId),
-      ]);
-    } catch {
+    // Coordinator is absent or dead: adopt recovery ownership ONLY against the persisted bound pods/generations
+    // so an unrelated pod presence overwrite can NEVER confirm close while old sockets are still live.
+    const fresh = await this.clusterStore.getTunnel(record.tunnelId).catch(() => null);
+    if (!fresh) {
       return { confirmed: false, tunnelId: record.tunnelId };
     }
-    const listenOnline = Boolean(
-      listenEp && listenEp.podId === record.listenPodId && listenEp.generation === record.listenGeneration,
-    );
-    const targetOnline = Boolean(
-      targetEp && targetEp.podId === record.targetPodId && targetEp.generation === record.targetGeneration,
-    );
-    if (!listenOnline && !targetOnline) {
-      await this.clusterStore.markTunnelClosed(record.tunnelId);
+    if (fresh.status === 'closed') {
       return { confirmed: true, tunnelId: record.tunnelId };
     }
-    if (listenOnline && record.listenPodId) {
-      await this.sendToEndpoint(record.listenPodId, record.listenServerId, record.listenGeneration, {
-        type: PORT_FORWARD_MSG.CLOSE,
-        tunnelId: record.tunnelId,
-        reason,
-        role: PORT_FORWARD_ROLE.LISTEN,
-      }, undefined, record.listenPodId).catch(() => {});
+    if (allowRedirect
+      && fresh.coordinatorPodId
+      && fresh.coordinatorPodId !== record.coordinatorPodId
+      && fresh.coordinatorPodId !== this.podId) {
+      return this.closeTunnelRecordAndAwait(fresh, reason, false);
     }
-    if (targetOnline && record.targetPodId) {
-      await this.sendToEndpoint(record.targetPodId, record.targetServerId, record.targetGeneration, {
-        type: PORT_FORWARD_MSG.CLOSE,
-        tunnelId: record.tunnelId,
-        reason,
-        role: PORT_FORWARD_ROLE.TARGET,
-      }, undefined, record.targetPodId).catch(() => {});
+    if (!fresh.listenPodId || !fresh.targetPodId) {
+      // Legacy record missing persisted pod bindings: never fabricate confirmation.
+      await this.clusterStore.updateTunnel(fresh.tunnelId, { status: 'closing' }).catch(() => {});
+      return { confirmed: false, tunnelId: fresh.tunnelId };
     }
-    await this.clusterStore.updateTunnel(record.tunnelId, { status: 'closing' }).catch(() => {});
-    return { confirmed: false, tunnelId: record.tunnelId };
+    const adopted: ActiveServerTunnel = {
+      tunnelId: fresh.tunnelId,
+      userId: fresh.userId,
+      listenNode: fresh.listenNode,
+      listenServerId: fresh.listenServerId,
+      ...(fresh.listenNodeId ? { listenNodeId: fresh.listenNodeId } : {}),
+      listenPodId: fresh.listenPodId,
+      listenGeneration: fresh.listenGeneration,
+      requestedListenPort: fresh.requestedListenPort,
+      boundListenPort: fresh.boundListenPort,
+      targetNode: fresh.targetNode,
+      targetServerId: fresh.targetServerId,
+      ...(fresh.targetNodeId ? { targetNodeId: fresh.targetNodeId } : {}),
+      targetPodId: fresh.targetPodId,
+      targetGeneration: fresh.targetGeneration,
+      targetHost: fresh.targetHost,
+      targetPort: fresh.targetPort,
+      transportPref: fresh.transportPref,
+      transportMode: fresh.transportMode,
+      listenEstablishedMode: fresh.transportMode,
+      targetEstablishedMode: fresh.transportMode,
+      ...(fresh.label ? { label: fresh.label } : {}),
+      status: 'active',
+      listenReady: true,
+      listenCandidates: [],
+      listenPublicKey: null,
+      listenKeyProof: null,
+      listenIdentityPublicKey: null,
+      listenIdentitySignature: null,
+      targetReady: true,
+      targetCandidates: [],
+      targetPublicKey: null,
+      targetKeyProof: null,
+      targetIdentityPublicKey: null,
+      targetIdentitySignature: null,
+      connectDispatchedToListen: true,
+      l2tBackpressured: false,
+      t2lBackpressured: false,
+      l2tOutMemPaused: false,
+      l2tHop1Paused: false,
+      l2tHop2Paused: false,
+      t2lOutMemPaused: false,
+      t2lHop1Paused: false,
+      t2lHop2Paused: false,
+      activeConnections: fresh.activeConnections,
+      bytesSent: fresh.bytesSent,
+      bytesReceived: fresh.bytesReceived,
+      createdAt: fresh.createdAt,
+      expiresAt: fresh.expiresAt,
+      prepareTimer: null,
+      establishTimer: null,
+      ttlTimer: null,
+      closeAckTimer: null,
+      listenCloseState: 'pending',
+      targetCloseState: 'pending',
+      closeSettled: false,
+      closePromise: null,
+      resolveClose: null,
+      resolveOpen: null,
+    };
+    await this.clusterStore.updateTunnel(fresh.tunnelId, {
+      coordinatorPodId: this.podId,
+      status: 'closing',
+    }).catch(() => {});
+    const settled = await this.closeTunnelInternal(adopted, reason, true, true);
+    return { confirmed: settled.confirmed, tunnelId: fresh.tunnelId };
   }
 
   async closeTunnelForUser(
@@ -1369,6 +1489,10 @@ export class PortForwardRouter {
     if (localTunnel) {
       const memberRole = resolveEndpointMemberRole(localTunnel, fromServerId, this.podId, fromGeneration);
       if (!memberRole || !isMessageAdmissibleForStatus(localTunnel, msg.type, false)) {
+        return true;
+      }
+      if (msg.type === PORT_FORWARD_MSG.CLOSE_ACK) {
+        this.processCoordinatorMessage(localTunnel, fromServerId, this.podId, fromGeneration, msg);
         return true;
       }
       const key = `${msg.tunnelId}:${fromServerId}:${this.podId}:${fromGeneration}`;
@@ -1770,8 +1894,8 @@ export class PortForwardRouter {
           onLowWater: () => {
             void this.updateCoordinatorPressure(tunnel, direction, { outMemPaused: false });
           },
-          run: async () => {
-            const isClosedNow = () => tunnel.status === 'closing' || tunnel.status === 'closed';
+          run: async (signal) => {
+            const isClosedNow = () => signal.aborted || tunnel.status === 'closing' || tunnel.status === 'closed';
             if (isClosedNow()) return;
             const res = await this.sendToEndpoint(
               peerPodId,
@@ -1784,7 +1908,7 @@ export class PortForwardRouter {
               },
               { tunnelId: tunnel.tunnelId, direction },
             );
-            if (isClosedNow()) return;
+            if (isClosedNow() || res.failureReason === 'cancelled') return;
             if (res.overflow) {
               void this.closeTunnelInternal(tunnel, 'cluster_queue_overflow', true, true);
               return;
@@ -1976,6 +2100,11 @@ export class PortForwardRouter {
     tunnel.status = 'closing';
     tunnel.closeSettled = false;
     this.tunnels.delete(tunnel.tunnelId);
+    this.markDeliveryTombstone(`${tunnel.tunnelId}:${tunnel.listenServerId}:${tunnel.listenPodId}:${tunnel.listenGeneration}`);
+    this.markDeliveryTombstone(`${tunnel.tunnelId}:${tunnel.targetServerId}:${tunnel.targetPodId}:${tunnel.targetGeneration}`);
+    this.cancelBucketsByPrefix(this.inboundQueues, `${tunnel.tunnelId}:`);
+    this.cancelBucketsByPrefix(this.outboundQueues, `${tunnel.tunnelId}:`);
+    this.cancelBucketsByPrefix(this.remoteDeliveryQueues, `${tunnel.tunnelId}:`);
     if (tunnel.prepareTimer) {
       clearTimeout(tunnel.prepareTimer);
       tunnel.prepareTimer = null;

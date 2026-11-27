@@ -129,7 +129,7 @@ export interface PortForwardClusterStore {
     tunnelId: string,
     patch: Partial<Pick<
       PortForwardClusterTunnelRecord,
-      'status' | 'transportMode' | 'boundListenPort' | 'activeConnections' | 'bytesSent' | 'bytesReceived' | 'updatedAt'
+      'coordinatorPodId' | 'status' | 'transportMode' | 'boundListenPort' | 'activeConnections' | 'bytesSent' | 'bytesReceived' | 'updatedAt'
     >>,
   ): Promise<void>;
   markTunnelClosed(tunnelId: string, updatedAt?: number): Promise<void>;
@@ -286,7 +286,7 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
     tunnelId: string,
     patch: Partial<Pick<
       PortForwardClusterTunnelRecord,
-      'status' | 'transportMode' | 'boundListenPort' | 'activeConnections' | 'bytesSent' | 'bytesReceived' | 'updatedAt'
+      'coordinatorPodId' | 'status' | 'transportMode' | 'boundListenPort' | 'activeConnections' | 'bytesSent' | 'bytesReceived' | 'updatedAt'
     >>,
   ): Promise<void> {
     const existing = this.tunnels.get(tunnelId);
@@ -817,7 +817,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
     tunnelId: string,
     patch: Partial<Pick<
       PortForwardClusterTunnelRecord,
-      'status' | 'transportMode' | 'boundListenPort' | 'activeConnections' | 'bytesSent' | 'bytesReceived' | 'updatedAt'
+      'coordinatorPodId' | 'status' | 'transportMode' | 'boundListenPort' | 'activeConnections' | 'bytesSent' | 'bytesReceived' | 'updatedAt'
     >>,
   ): Promise<void> {
     const sets: string[] = [];
@@ -826,6 +826,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
       params.push(val);
       sets.push(`${col} = $${params.length}`);
     };
+    if (patch.coordinatorPodId !== undefined) push('coordinator_pod_id', patch.coordinatorPodId);
     if (patch.status !== undefined) push('status', patch.status);
     if (patch.transportMode !== undefined) push('transport_mode', patch.transportMode);
     if (patch.boundListenPort !== undefined) push('bound_listen_port', patch.boundListenPort);
