@@ -8,6 +8,28 @@ UPDATE cron_job_provenance
  WHERE creator_user_id = '__imcodes_external_cli__'
    AND shared = FALSE;
 
+-- Backfill already-stored restricted external-CLI jobs into the versioned
+-- persistence wrapper so un-upgraded schedulers/manual triggers can never unwrap
+-- or elevate them even via skipReload/temporary provenance paths.
+UPDATE cron_jobs j
+   SET action = jsonb_build_object(
+         'type', 'external_cli_restricted',
+         'version', 1,
+         'action', j.action::jsonb
+       )::text
+  FROM cron_job_provenance p
+ WHERE p.job_id = j.id
+   AND p.creator_user_id = '__imcodes_external_cli__'
+   AND j.action ~ '^\s*\{'
+   AND (j.action::jsonb ->> 'type') IS DISTINCT FROM 'external_cli_restricted'
+   AND (
+     (j.action::jsonb ->> 'type') = 'send'
+     OR (
+       (j.action::jsonb ->> 'type') = 'command'
+       AND (j.action::jsonb -> 'selfManaged') = 'true'::jsonb
+     )
+   );
+
 CREATE OR REPLACE FUNCTION protect_external_cli_cron_provenance()
 RETURNS TRIGGER
 LANGUAGE plpgsql

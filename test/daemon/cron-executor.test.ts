@@ -48,7 +48,11 @@ vi.mock('../../src/util/logger.js', () => ({
 
 // ── Imports (after mocks) ─────────────────────────────────────────────────────
 
-import { __setCronProcessCommandSenderForTests, executeCronJob } from '../../src/daemon/cron-executor.js';
+import {
+  __setCronProcessCommandSenderForTests,
+  __setCronSendDispatcherForTests,
+  executeCronJob,
+} from '../../src/daemon/cron-executor.js';
 import { getSession } from '../../src/store/session-store.js';
 import {
   ensureTransportRuntimeAvailable,
@@ -1392,5 +1396,31 @@ describe('executeCronJob', () => {
       [OWNER_MACHINE_AUTHORITY_FIELD]: 'owner-shell-jwt',
     }), mockServerLink);
     expect(cronProcessSendMock).toHaveBeenCalledTimes(1);
+
+    // Fails closed if persisted external_cli_restricted wrapper ever reaches daemon directly
+    // (e.g., from an un-upgraded server manual trigger lacking external_cli unwrapping).
+    const cronSendSpy = vi.fn().mockResolvedValue('sent');
+    __setCronSendDispatcherForTests(cronSendSpy);
+    try {
+      await executeCronJob(makeMsg({
+        executionId: 'exec-wrapped-direct-legacy-trigger',
+        action: {
+          type: 'external_cli_restricted',
+          version: 1,
+          action: { type: 'send', target: 'deck_myapp_brain', message: 'should not deliver' },
+        } as unknown as CronDispatchMessage['action'],
+      }), mockServerLink);
+      expect(cronSendSpy).not.toHaveBeenCalled();
+      expect(transportSend).toHaveBeenCalledTimes(2);
+      expect(cronProcessSendMock).toHaveBeenCalledTimes(1);
+      expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: CRON_MSG.COMMAND_RESULT,
+        executionId: 'exec-wrapped-direct-legacy-trigger',
+        status: 'error',
+        detail: expect.stringContaining('external_cli_restricted'),
+      }));
+    } finally {
+      __setCronSendDispatcherForTests(null);
+    }
   });
 });

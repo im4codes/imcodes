@@ -23,6 +23,8 @@ import {
   normalizeCronExecutionDetail,
   normalizeCronSendActionForInterval,
   registerCronControlAction,
+  unwrapCronActionForRead,
+  wrapExternalCliRestrictedCronAction,
   type CronAction,
 } from '../../../shared/cron-types.js';
 import {
@@ -197,11 +199,49 @@ function isWrongPodStickyServer(jobServerId: string, routeServerId: string | nul
   return routeServerId !== null && jobServerId !== routeServerId;
 }
 
+function parsePersistedCronAction(
+  rawAction: string,
+): { wrapped: boolean; validWrapper: boolean; action: z.infer<typeof cronActionSchema> | undefined } {
+  try {
+    const decoded = unwrapCronActionForRead(JSON.parse(rawAction));
+    if (decoded.wrapped && !decoded.validWrapper) {
+      return { wrapped: true, validWrapper: false, action: undefined };
+    }
+    const parsed = cronActionSchema.safeParse(decoded.action);
+    return {
+      wrapped: decoded.wrapped,
+      validWrapper: decoded.validWrapper,
+      action: parsed.success ? parsed.data : undefined,
+    };
+  } catch {
+    return { wrapped: false, validWrapper: false, action: undefined };
+  }
+}
+
+function unwrapCronActionStringForResponse(rawAction: string): string {
+  const parsed = parsePersistedCronAction(rawAction);
+  if (parsed.wrapped && parsed.validWrapper && parsed.action) {
+    return JSON.stringify(parsed.action);
+  }
+  return rawAction;
+}
+
+function serializeCronActionForStorage(action: CronAction, restrictedExternalCli: boolean): string {
+  return JSON.stringify(restrictedExternalCli ? wrapExternalCliRestrictedCronAction(action) : action);
+}
+
 function normalizeCronExecutionRows<T extends Record<string, unknown>>(rows: T[]): T[] {
   return rows.map((row) => {
-    if (typeof row.detail !== 'string') return row;
-    const detail = normalizeCronExecutionDetail(row.detail);
-    return detail === row.detail ? row : { ...row, detail };
+    let next: T | null = null;
+    if (typeof row.detail === 'string') {
+      const detail = normalizeCronExecutionDetail(row.detail);
+      if (detail !== row.detail) next = { ...row, detail };
+    }
+    if (typeof row.action === 'string') {
+      const unwrappedAction = unwrapCronActionStringForResponse(row.action);
+      if (unwrappedAction !== row.action) next = { ...(next ?? row), action: unwrappedAction };
+    }
+    return next ?? row;
   });
 }
 
@@ -457,11 +497,7 @@ async function resolveCronJobScope(
   ) {
     return { ok: false, reason: 'share-direct-surface-denied' };
   }
-  let action: z.infer<typeof cronActionSchema> | undefined;
-  try {
-    const parsed = cronActionSchema.safeParse(JSON.parse(params.job.action));
-    if (parsed.success) action = parsed.data;
-  } catch { /* malformed legacy jobs are never exposed through shared access */ }
+  const action = parsePersistedCronAction(params.job.action).action;
   if (!await cronScopeCoversPayload(c, params.job.server_id, access.scope, {
     targetRole: params.job.target_role,
     targetSessionName: params.job.target_session_name,
@@ -658,11 +694,7 @@ async function filterCronRowsForSharedScope<T extends {
   if (scope.shared && scope.sharedTargetKind !== 'server' && !scope.projectName) return [];
   const checks = await Promise.all(rows.map(async (row) => {
     if (scope.shared && scope.sharedTargetKind !== 'server' && row.project_name !== scope.projectName) return false;
-    let action: z.infer<typeof cronActionSchema> | undefined;
-    try {
-      const parsed = cronActionSchema.safeParse(JSON.parse(row.action));
-      if (parsed.success) action = parsed.data;
-    } catch { /* malformed legacy rows remain hidden from shared access */ }
+    const action = parsePersistedCronAction(row.action).action;
     return await cronScopeCoversPayload(c, row.server_id, scope, {
       targetRole: row.target_role,
       targetSessionName: row.target_session_name,
@@ -767,7 +799,10 @@ router.get('/', requireCronAuth(), async (c) => {
       externalCliRestricted ? IMCODES_EXTERNAL_CLI_SENDER : null,
     ],
   );
-  const filteredJobs = await filterCronRowsForSharedScope(c, access.scope, jobs, pinnedSessionName);
+  const filteredJobs = (await filterCronRowsForSharedScope(c, access.scope, jobs, pinnedSessionName)).map((job) => ({
+    ...job,
+    action: unwrapCronActionStringForResponse(job.action),
+  }));
   return c.json({
     jobs: externalCliRestricted
       ? filteredJobs.filter((job) => isExternalCliOwnedProvenance({
@@ -857,6 +892,8 @@ router.post('/', requireCronAuth(), async (c) => {
     validation.intervalMs,
   );
 
+  const storedAction = serializeCronActionForStorage(persistedAction, externalCliRestricted);
+
   const requiresProvenance = externalCliRestricted || access.scope.shared || authority.kind === 'participant_daemon' || authority.actorUserId !== access.scope.ownerUserId;
   const provenanceCreatorUserId = externalCliRestricted ? IMCODES_EXTERNAL_CLI_SENDER : authority.actorUserId;
   // Every non-owner provenance row (shared participants AND external_cli) sets shared=TRUE
@@ -867,7 +904,7 @@ router.post('/', requireCronAuth(), async (c) => {
     await tx.execute(
       `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $15)`,
-      [id, serverId, access.scope.ownerUserId, name, cronExpr, access.scope.projectName ?? projectName, targetRole, targetSessionName ?? null, JSON.stringify(persistedAction), timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, completionPolicy, now],
+      [id, serverId, access.scope.ownerUserId, name, cronExpr, access.scope.projectName ?? projectName, targetRole, targetSessionName ?? null, storedAction, timezone ?? null, CRON_STATUS.ACTIVE, validation.nextRunAt, expiresAt ?? null, completionPolicy, now],
     );
     if (requiresProvenance) {
       await tx.execute(
@@ -966,12 +1003,10 @@ router.put('/:id', requireCronAuth(), async (c) => {
 
     const updates = { ...parsed.data };
     if (access.scope.shared) updates.projectName = access.scope.projectName ?? undefined;
-    let existingAction: z.infer<typeof cronActionSchema> | undefined;
-    try {
-      const parsedExisting = cronActionSchema.safeParse(JSON.parse(lockedJob.action));
-      if (parsedExisting.success) existingAction = parsedExisting.data;
-    } catch { /* invalid legacy action remains non-editable through a shared scope */ }
-    if ((externalCliRestricted || lockedIsExternalCli) && !isAllowedExternalCliRestrictedCronAction(updates.action ?? existingAction)) {
+    const existingParsed = parsePersistedCronAction(lockedJob.action);
+    const existingAction = existingParsed.action;
+    const restrictAsExternalCli = externalCliRestricted || lockedIsExternalCli;
+    if (restrictAsExternalCli && !isAllowedExternalCliRestrictedCronAction(updates.action ?? existingAction)) {
       return { kind: 'forbidden', reason: 'external_cli_cron_action_not_allowed' };
     }
     if (!await cronScopeCoversPayload(c, lockedJob.server_id, access.scope, {
@@ -1040,9 +1075,9 @@ router.put('/:id', requireCronAuth(), async (c) => {
 
     if (updates.action === undefined && existingAction && existingAction.type !== 'p2p') {
       const normalizedExistingAction = normalizeCronSendActionForInterval(existingAction, effectiveIntervalMs);
-      if (normalizedExistingAction !== existingAction) {
+      if (normalizedExistingAction !== existingAction || (restrictAsExternalCli && !existingParsed.wrapped)) {
         sets.push(`action = $${idx++}`);
-        vals.push(JSON.stringify(normalizedExistingAction));
+        vals.push(serializeCronActionForStorage(normalizedExistingAction, restrictAsExternalCli));
       }
     }
 
@@ -1066,7 +1101,7 @@ router.put('/:id', requireCronAuth(), async (c) => {
         effectiveIntervalMs,
       );
       sets.push(`action = $${idx++}`);
-      vals.push(JSON.stringify(normalizedAction));
+      vals.push(serializeCronActionForStorage(normalizedAction, restrictAsExternalCli));
     }
     if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
     if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }

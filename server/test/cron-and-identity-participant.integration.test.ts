@@ -16,6 +16,8 @@
  *    - Viewers are denied access (403 share-role-denied)
  *    - Outsiders are forbidden (403)
  */
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { buildApp } from '../src/index.js';
@@ -25,7 +27,8 @@ import { createServer, createSubSession, createUser, upsertDbSession } from '../
 import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { signJwt } from '../src/security/crypto.js';
 import { WsBridge } from '../src/ws/bridge.js';
-import { CRON_STATUS } from '../../shared/cron-types.js';
+import { dispatchJobNow, jobDispatchCron, readCronJobAndProvenanceLocked } from '../src/cron/job-dispatch.js';
+import { CRON_STATUS, wrapExternalCliRestrictedCronAction } from '../../shared/cron-types.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { SESSION_IDENTITY_SCOPES } from '../../shared/session-identity.js';
 import { jobDispatchCron, readCronJobAndProvenanceLocked } from '../src/cron/job-dispatch.js';
@@ -1150,11 +1153,23 @@ describe('PostgreSQL protection for external-CLI cron provenance (migration 120)
     // Both cron_jobs and cron_job_provenance remain completely intact and rolled back.
     const jobRow = await db.queryOne<{ name: string; action: string }>('SELECT name, action FROM cron_jobs WHERE id = $1', [EXT_PROTECTED_JOB]);
     expect(jobRow?.name).toBe('Original Restricted Job');
-    expect(JSON.parse(jobRow!.action)).toMatchObject({ type: 'send', target: SUB_SESSION_NAME, message: 'ping' });
+    // Pre-migration unwrapped external_cli row is upgraded in-place when migration 120 runs.
+    const rawPre120Action = JSON.parse(jobRow!.action) as { type: string; target?: string; message?: string };
+    expect(rawPre120Action).toMatchObject({ type: 'send', target: SUB_SESSION_NAME, message: 'ping' });
+    const mig120Sql = await readFile(join(import.meta.dirname, '../src/db/migrations/120_protect_external_cli_cron_provenance.sql'), 'utf8');
+    await db.transaction(async (tx) => {
+      await tx.exec(mig120Sql);
+    });
+    const wrappedRow = await db.queryOne<{ action: string }>('SELECT action FROM cron_jobs WHERE id = $1', [EXT_PROTECTED_JOB]);
+    expect(JSON.parse(wrappedRow!.action)).toMatchObject({
+      type: 'external_cli_restricted',
+      version: 1,
+      action: { type: 'send', target: SUB_SESSION_NAME, message: 'ping' },
+    });
     const provRow = await db.queryOne<{ creator_user_id: string; shared: boolean }>('SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1', [EXT_PROTECTED_JOB]);
     expect(provRow).toEqual({ creator_user_id: IMCODES_EXTERNAL_CLI_SENDER, shared: true });
 
-    // Dispatch still executes with restricted external_cli sharedActor and no owner authority.
+    // Dispatch via scheduler unwraps and executes with restricted external_cli sharedActor and no owner authority.
     const bridge = WsBridge.get(SERVER_ID);
     const sendSpy = vi.spyOn(bridge, 'sendToDaemon').mockImplementation(() => true);
     vi.spyOn(bridge, 'hasDaemonCapability').mockReturnValue(true);
@@ -1162,22 +1177,37 @@ describe('PostgreSQL protection for external-CLI cron provenance (migration 120)
     const dispatched = sendSpy.mock.calls.map((c) => JSON.parse(c[0] as string) as Record<string, unknown>);
     const extDispatch = dispatched.find((d) => d.jobId === EXT_PROTECTED_JOB);
     expect(extDispatch).toBeDefined();
+    expect(extDispatch!.action).toMatchObject({ type: 'send', target: SUB_SESSION_NAME, message: 'ping' });
     expect((extDispatch!.sharedActor as Record<string, unknown>)?.actorUserId).toBe(IMCODES_EXTERNAL_CLI_SENDER);
     expect(extDispatch!.ownerMachineAuthority).toBeUndefined();
+
+    // Legacy base manual-trigger shape (`skipReload: true` missing IMCODES_EXTERNAL_CLI_SENDER provenance)
+    // must fail closed with 0 dispatches even if invoked on the persisted wrapped job.
+    sendSpy.mockClear();
+    const wrappedJobDb = await db.queryOne('SELECT * FROM cron_jobs WHERE id = $1', [EXT_PROTECTED_JOB]);
+    await expect(dispatchJobNow({ DB: db } as unknown as Env, wrappedJobDb as never, {
+      skipReload: true,
+      verifiedProvenance: { ok: true, row: { creator_user_id: PARTICIPANT_ID, shared: true } },
+    })).rejects.toThrow('share_revoked');
+    await expect(dispatchJobNow({ DB: db } as unknown as Env, wrappedJobDb as never, {
+      skipReload: true,
+      verifiedProvenance: { ok: true, row: null },
+    })).rejects.toThrow('share_revoked');
+    expect(sendSpy).not.toHaveBeenCalled();
   });
 
   it('allows new-server owner maintenance and whole-job cascade deletion while preserving normal user cron workflows', async () => {
     await seedJob({
       id: EXT_MAINT_JOB,
       name: 'New Server Maint Job',
-      action: { type: 'send', target: SUB_SESSION_NAME, message: 'v1' },
+      action: wrapExternalCliRestrictedCronAction({ type: 'send', target: SUB_SESSION_NAME, message: 'v1' }) as unknown as Record<string, unknown>,
       creatorUserId: IMCODES_EXTERNAL_CLI_SENDER,
       shared: true,
     });
     await seedJob({
       id: EXT_CASCADE_JOB,
       name: 'Cascade Delete Job',
-      action: { type: 'send', target: SUB_SESSION_NAME, message: 'bye' },
+      action: wrapExternalCliRestrictedCronAction({ type: 'send', target: SUB_SESSION_NAME, message: 'bye' }) as unknown as Record<string, unknown>,
       creatorUserId: IMCODES_EXTERNAL_CLI_SENDER,
       shared: true,
     });
@@ -1189,7 +1219,7 @@ describe('PostgreSQL protection for external-CLI cron provenance (migration 120)
       shared: true,
     });
 
-    // Owner on new server may rename / edit allowed send action, while provenance stays restricted.
+    // Owner on new server may rename / edit allowed send action, while DB action stays wrapped and provenance stays restricted.
     const allowRes = await app.request(`/api/cron/${EXT_MAINT_JOB}`, {
       method: 'PUT',
       headers: { Authorization: bearer(OWNER_ID), 'Content-Type': 'application/json' },
@@ -1202,6 +1232,37 @@ describe('PostgreSQL protection for external-CLI cron provenance (migration 120)
     expect(allowRes.status).toBe(200);
     const maintProv = await db.queryOne<{ creator_user_id: string; shared: boolean }>('SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1', [EXT_MAINT_JOB]);
     expect(maintProv).toEqual({ creator_user_id: IMCODES_EXTERNAL_CLI_SENDER, shared: true });
+    const maintRow = await db.queryOne<{ action: string }>('SELECT action FROM cron_jobs WHERE id = $1', [EXT_MAINT_JOB]);
+    expect(JSON.parse(maintRow!.action)).toMatchObject({
+      type: 'external_cli_restricted',
+      version: 1,
+      action: { type: 'send', target: SUB_SESSION_NAME, message: 'v2' },
+    });
+
+    // Public list API unwraps the stored action for UI/CLI consumers.
+    const listRes = await app.request(`/api/cron?serverId=${SERVER_ID}`, {
+      method: 'GET',
+      headers: { Authorization: bearer(OWNER_ID) },
+    });
+    expect(listRes.status).toBe(200);
+    const listJson = await listRes.json() as { jobs: Array<{ id: string; action: string }> };
+    const listedExt = listJson.jobs.find((j) => j.id === EXT_MAINT_JOB);
+    expect(listedExt).toBeDefined();
+    expect(JSON.parse(listedExt!.action)).toMatchObject({ type: 'send', target: SUB_SESSION_NAME, message: 'v2' });
+
+    // Current manual trigger endpoint unwraps and dispatches with restricted external_cli sharedActor.
+    const bridge = WsBridge.get(SERVER_ID);
+    const trigSpy = vi.spyOn(bridge, 'sendToDaemon').mockImplementation(() => true);
+    vi.spyOn(bridge, 'hasDaemonCapability').mockReturnValue(true);
+    const trigExtRes = await app.request(`/api/cron/${EXT_MAINT_JOB}/trigger`, {
+      method: 'POST',
+      headers: { Authorization: bearer(OWNER_ID) },
+    });
+    expect(trigExtRes.status).toBe(200);
+    const extManualPayload = JSON.parse(trigSpy.mock.calls.at(-1)![0] as string) as Record<string, unknown>;
+    expect(extManualPayload.action).toMatchObject({ type: 'send', target: SUB_SESSION_NAME, message: 'v2' });
+    expect((extManualPayload.sharedActor as Record<string, unknown>)?.actorUserId).toBe(IMCODES_EXTERNAL_CLI_SENDER);
+    expect(extManualPayload.ownerMachineAuthority).toBeUndefined();
 
     // Owner on new server cannot escalate the restricted job to raw command / p2p.
     const denyRes = await app.request(`/api/cron/${EXT_MAINT_JOB}`, {
@@ -1220,7 +1281,7 @@ describe('PostgreSQL protection for external-CLI cron provenance (migration 120)
     expect(await db.queryOne('SELECT id FROM cron_jobs WHERE id = $1', [EXT_CASCADE_JOB])).toBeNull();
     expect(await db.queryOne('SELECT job_id FROM cron_job_provenance WHERE job_id = $1', [EXT_CASCADE_JOB])).toBeNull();
 
-    // Normal participant-created job can still be edited & reclaimed by owner (deleting normal provenance).
+    // Normal participant-created job keeps unwrapped storage and can still be edited, reclaimed, and manually triggered by owner.
     const normalRes = await app.request(`/api/cron/${NORMAL_SHARED_JOB}`, {
       method: 'PUT',
       headers: { Authorization: bearer(OWNER_ID), 'Content-Type': 'application/json' },
@@ -1230,6 +1291,17 @@ describe('PostgreSQL protection for external-CLI cron provenance (migration 120)
       }),
     });
     expect(normalRes.status).toBe(200);
+    const normalRow = await db.queryOne<{ action: string }>('SELECT action FROM cron_jobs WHERE id = $1', [NORMAL_SHARED_JOB]);
+    expect(JSON.parse(normalRow!.action)).toMatchObject({ type: 'command', command: '/owner-raw' });
     expect(await db.queryOne('SELECT job_id FROM cron_job_provenance WHERE job_id = $1', [NORMAL_SHARED_JOB])).toBeNull();
+    const trigNormalRes = await app.request(`/api/cron/${NORMAL_SHARED_JOB}/trigger`, {
+      method: 'POST',
+      headers: { Authorization: bearer(OWNER_ID) },
+    });
+    expect(trigNormalRes.status).toBe(200);
+    const normalManualPayload = JSON.parse(trigSpy.mock.calls.at(-1)![0] as string) as Record<string, unknown>;
+    expect(normalManualPayload.action).toMatchObject({ type: 'command', command: '/owner-raw' });
+    expect(normalManualPayload.sharedActor).toBeUndefined();
+    expect(typeof normalManualPayload.ownerMachineAuthority).toBe('string');
   });
 });

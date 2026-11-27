@@ -481,9 +481,16 @@ describe('cron API authentication (real auth middleware)', () => {
       expect(state.cronJobs.size).toBe(1);
 
       // Allowed actions (structured send AND selfManaged command) create restricted crons with shared=true (old schedulers fail closed!)
+      // and persist the versioned external_cli_restricted wrapper while keeping public HTTP action unwrapped.
       const created = await request(app, restrictedBase, extCreateSend, extHeaders);
       expect(created.status).toBe(201);
-      const createdJson = await created.json() as { id: string };
+      const createdJson = await created.json() as { id: string; action: Record<string, unknown> };
+      expect(createdJson.action).toMatchObject({ type: 'send', target: 'brain', message: 'ping safely' });
+      expect(JSON.parse(String(state.cronJobs.get(createdJson.id)?.action))).toMatchObject({
+        type: 'external_cli_restricted',
+        version: 1,
+        action: { type: 'send', target: 'brain', message: 'ping safely' },
+      });
       expect(state.cronProvenance.get(createdJson.id)).toMatchObject({
         creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
         shared: true,
@@ -491,17 +498,26 @@ describe('cron API authentication (real auth middleware)', () => {
 
       const createdSelf = await request(app, restrictedBase, extCreateSelfCmd, extHeaders);
       expect(createdSelf.status).toBe(201);
-      const createdSelfJson = await createdSelf.json() as { id: string };
+      const createdSelfJson = await createdSelf.json() as { id: string; action: Record<string, unknown> };
+      expect(createdSelfJson.action).toMatchObject({ type: 'command', selfManaged: true, command: '/status' });
+      expect(JSON.parse(String(state.cronJobs.get(createdSelfJson.id)?.action))).toMatchObject({
+        type: 'external_cli_restricted',
+        version: 1,
+        action: { type: 'command', selfManaged: true, command: '/status' },
+      });
       expect(state.cronProvenance.get(createdSelfJson.id)).toMatchObject({
         creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
         shared: true,
       });
 
-      // List returns only external-CLI-owned jobs, hiding owner's job-1
+      // List returns only external-CLI-owned jobs with unwrapped public actions, hiding owner's job-1
       const listed = await request(app, restrictedBase, ROUTES[0]!, extHeaders);
       expect(listed.status).toBe(200);
-      const listedIds = ((await listed.json()) as { jobs: MockRow[] }).jobs.map((j) => j.id).sort();
-      expect(listedIds).toEqual([createdJson.id, createdSelfJson.id].sort());
+      const listedBody = (await listed.json()) as { jobs: Array<MockRow & { action: string }> };
+      expect(listedBody.jobs.map((j) => j.id).sort()).toEqual([createdJson.id, createdSelfJson.id].sort());
+      for (const listedJob of listedBody.jobs) {
+        expect(['send', 'command']).toContain((JSON.parse(listedJob.action) as { type: string }).type);
+      }
 
       // Execution history routes isolate owner executions and filter before SQL LIMIT
       state.cronExecutions.push(
@@ -587,6 +603,10 @@ describe('cron API authentication (real auth middleware)', () => {
         creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
         shared: true,
       });
+      expect(JSON.parse(String(state.cronJobs.get(createdJson.id)?.action))).toMatchObject({
+        type: 'external_cli_restricted',
+        version: 1,
+      });
 
       // Legacy-scheduler backward compat proof: with shared=true + creator_user_id='external-cli' (not a server member/share holder),
       // an old scheduler lacking special IMCODES_EXTERNAL_CLI_SENDER handling sees shared=true and fails closed ({ authorized: false }).
@@ -613,6 +633,16 @@ describe('cron API authentication (real auth middleware)', () => {
         // Owner manual trigger of restricted job also preserves restricted authority
         const manualExt = await request(app, base, { name: 'owner-trig-ext', method: 'POST', path: `/${createdJson.id}/trigger` }, ownerHeaders);
         expect(manualExt.status).toBe(200);
+        // Legacy manual-trigger shape (`skipReload: true` missing IMCODES_EXTERNAL_CLI_SENDER provenance) fails closed with 0 dispatches
+        const extJobRow = state.cronJobs.get(createdJson.id) as never;
+        await expect(dispatchJobNow(env(state.db), extJobRow, {
+          skipReload: true,
+          verifiedProvenance: { ok: true, row: { creator_user_id: 'usr-ordinary-member', shared: true } },
+        })).rejects.toThrow('share_revoked');
+        await expect(dispatchJobNow(env(state.db), extJobRow, {
+          skipReload: true,
+          verifiedProvenance: { ok: true, row: null },
+        })).rejects.toThrow('share_revoked');
         // Owner manual trigger of normal owner job retains ownerMachineAuthority
         const manualOwner = await request(app, base, { name: 'owner-trig-job1', method: 'POST', path: '/job-1/trigger' }, ownerHeaders);
         expect(manualOwner.status).toBe(200);
@@ -630,6 +660,8 @@ describe('cron API authentication (real auth middleware)', () => {
       expect(sentPayloads).toHaveLength(4);
       for (const idx of [0, 1, 2]) {
         const dispatched = JSON.parse(sentPayloads[idx]!) as Record<string, unknown>;
+        expect(dispatched.action).not.toHaveProperty('version');
+        expect(['send', 'command']).toContain((dispatched.action as { type: string }).type);
         expect(dispatched.sharedActor).toMatchObject({
           actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
           effectiveActorRole: 'participant',

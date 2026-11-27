@@ -23,9 +23,11 @@ import {
   CRON_EXACT_SEND_CAPABILITY_V1,
   CRON_MSG,
   CRON_STATUS,
-  isAllowedExternalCliRestrictedCronAction,
+  EXTERNAL_CLI_RESTRICTED_CRON_ACTION_TYPE,
+  isExternalCliRestrictedPersistedCronAction,
   normalizeCronCompletionPolicy,
   registerCronControlAction,
+  wrapExternalCliRestrictedCronAction,
   type CronAction,
   type CronDispatchMessage,
 } from '../../../shared/cron-types.js';
@@ -47,12 +49,34 @@ type ClaimedCronJob = DbCronJob & {
 };
 
 /** Parse, validate and durably register legacy self-managed actions before use. */
-async function prepareCronAction(env: Env, job: DbCronJob): Promise<PreparedCronAction> {
-  let action: CronAction;
+async function prepareCronAction(
+  env: Env,
+  job: DbCronJob,
+  prov: CronProvenanceRow | null = null,
+): Promise<PreparedCronAction> {
+  let raw: unknown;
   try {
-    action = JSON.parse(job.action) as CronAction;
+    raw = JSON.parse(job.action);
   } catch {
     return { ok: false, reason: 'invalid_action' };
+  }
+  const isExternalCliProv = prov?.creator_user_id === IMCODES_EXTERNAL_CLI_SENDER && prov.shared === true;
+  let action: CronAction;
+  if (isExternalCliProv) {
+    if (!isExternalCliRestrictedPersistedCronAction(raw)) {
+      return { ok: false, reason: 'invalid_external_cli_cron_action' };
+    }
+    action = raw.action;
+  } else {
+    if (
+      raw
+      && typeof raw === 'object'
+      && !Array.isArray(raw)
+      && (raw as { type?: unknown }).type === EXTERNAL_CLI_RESTRICTED_CRON_ACTION_TYPE
+    ) {
+      return { ok: false, reason: 'external_cli_cron_provenance_required' };
+    }
+    action = raw as CronAction;
   }
   if (action.type !== 'command' || action.selfManaged !== true) return { ok: true, action };
   if (typeof action.command !== 'string') return { ok: false, reason: 'missing_authoritative_body' };
@@ -63,7 +87,9 @@ async function prepareCronAction(env: Env, job: DbCronJob): Promise<PreparedCron
   );
   if (!registered.ok) return registered;
   if (registered.migrated) {
-    const nextAction = JSON.stringify(registered.action);
+    const nextAction = JSON.stringify(
+      isExternalCliProv ? wrapExternalCliRestrictedCronAction(registered.action) : registered.action,
+    );
     const result = await env.DB.execute(
       'UPDATE cron_jobs SET action = $1, updated_at = $2 WHERE id = $3 AND action = $4',
       [nextAction, Date.now(), job.id, job.action],
@@ -175,19 +201,27 @@ async function verifySharedCronCreatorStillAuthorized(
   now: number,
   prov: CronProvenanceRow | null,
 ): Promise<SharedCronDispatchAuth> {
-  if (prov?.creator_user_id === IMCODES_EXTERNAL_CLI_SENDER) {
-    let parsedAction: Record<string, unknown> | null = null;
-    try {
-      const parsed = JSON.parse(job.action);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        parsedAction = parsed as Record<string, unknown>;
-      }
-    } catch {
-      return { authorized: false };
+  let parsedRawAction: Record<string, unknown> | null = null;
+  try {
+    const parsed = JSON.parse(job.action);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      parsedRawAction = parsed as Record<string, unknown>;
     }
-    return isAllowedExternalCliRestrictedCronAction(parsedAction)
+  } catch {
+    if (prov?.creator_user_id === IMCODES_EXTERNAL_CLI_SENDER) return { authorized: false };
+  }
+
+  if (prov?.creator_user_id === IMCODES_EXTERNAL_CLI_SENDER) {
+    if (!prov.shared) return { authorized: false };
+    return isExternalCliRestrictedPersistedCronAction(parsedRawAction)
       ? { authorized: true }
       : { authorized: false };
+  }
+
+  // Wrapped external-CLI restricted actions must NEVER be dispatched without verified external-CLI provenance
+  // (e.g. legacy manual trigger shapes with missing or overwritten provenance).
+  if (parsedRawAction?.type === EXTERNAL_CLI_RESTRICTED_CRON_ACTION_TYPE) {
+    return { authorized: false };
   }
 
   if (!prov || !prov.shared || prov.creator_user_id === job.user_id) return { authorized: true };
@@ -503,7 +537,7 @@ export async function dispatchJobNow(
     await logExecution(env, randomHex(12), job.id, 'error', 'share_revoked');
     throw new Error('share_revoked');
   }
-  const prepared = await prepareCronAction(env, job);
+  const prepared = await prepareCronAction(env, job, provenance.row);
   if (!prepared.ok) {
     await logExecution(env, randomHex(12), job.id, 'error', prepared.reason);
     throw new Error(prepared.reason);
@@ -723,7 +757,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
         await logExecution(env, randomHex(12), job.id, 'error', 'share_revoked');
         continue;
       }
-      const prepared = await prepareCronAction(env, job);
+      const prepared = await prepareCronAction(env, job, provenance.row);
       if (!prepared.ok) {
         logger.error({ jobId: job.id, reason: prepared.reason }, 'Cron job has invalid action/control state, marking as error');
         await env.DB.execute('UPDATE cron_jobs SET status = $1 WHERE id = $2', [CRON_STATUS.ERROR, job.id]);

@@ -6,6 +6,9 @@ import type { SharedActorEnvelope } from './tab-sharing.js';
 
 export type CronActionType = 'command' | 'p2p' | 'send';
 
+export const EXTERNAL_CLI_RESTRICTED_CRON_ACTION_TYPE = 'external_cli_restricted' as const;
+export const EXTERNAL_CLI_RESTRICTED_CRON_ACTION_VERSION = 1 as const;
+
 /**
  * Restricted external-CLI cron schedules only permit structured `send` and
  * `selfManaged: true` `command` actions (never raw arbitrary commands or P2P).
@@ -16,6 +19,48 @@ export function isAllowedExternalCliRestrictedCronAction(
   if (!action || typeof action !== 'object') return false;
   if (action.type === 'send') return true;
   return action.type === 'command' && action.selfManaged === true;
+}
+
+export interface ExternalCliRestrictedPersistedCronAction {
+  type: typeof EXTERNAL_CLI_RESTRICTED_CRON_ACTION_TYPE;
+  version: typeof EXTERNAL_CLI_RESTRICTED_CRON_ACTION_VERSION;
+  action: CronSendAction | CronCommandAction;
+}
+
+export function isExternalCliRestrictedPersistedCronAction(
+  raw: unknown,
+): raw is ExternalCliRestrictedPersistedCronAction {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false;
+  const record = raw as Record<string, unknown>;
+  if (record.type !== EXTERNAL_CLI_RESTRICTED_CRON_ACTION_TYPE) return false;
+  if (record.version !== EXTERNAL_CLI_RESTRICTED_CRON_ACTION_VERSION) return false;
+  if (!record.action || typeof record.action !== 'object' || Array.isArray(record.action)) return false;
+  return isAllowedExternalCliRestrictedCronAction(record.action as { type?: unknown; selfManaged?: unknown });
+}
+
+export function wrapExternalCliRestrictedCronAction(
+  action: CronAction,
+): ExternalCliRestrictedPersistedCronAction {
+  if (!isAllowedExternalCliRestrictedCronAction(action)) {
+    throw new Error('external_cli_cron_action_not_allowed');
+  }
+  return {
+    type: EXTERNAL_CLI_RESTRICTED_CRON_ACTION_TYPE,
+    version: EXTERNAL_CLI_RESTRICTED_CRON_ACTION_VERSION,
+    action: action as CronSendAction | CronCommandAction,
+  };
+}
+
+export function unwrapCronActionForRead(
+  raw: unknown,
+): { wrapped: boolean; validWrapper: boolean; action: unknown } {
+  if (raw && typeof raw === 'object' && !Array.isArray(raw) && (raw as { type?: unknown }).type === EXTERNAL_CLI_RESTRICTED_CRON_ACTION_TYPE) {
+    if (isExternalCliRestrictedPersistedCronAction(raw)) {
+      return { wrapped: true, validWrapper: true, action: raw.action };
+    }
+    return { wrapped: true, validWrapper: false, action: null };
+  }
+  return { wrapped: false, validWrapper: false, action: raw };
 }
 
 /** Static capability advertised by daemons supporting exact scoped cron send binding & self-delivery. */
