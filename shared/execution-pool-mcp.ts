@@ -1,7 +1,9 @@
 import {
+  MODEL_TIERS,
   buildSupervisionExecutionCapabilityId,
   normalizeSupervisionExecutionModel,
   SUPERVISION_EXECUTION_POOL_ROLES,
+  type ModelTier,
   type SupervisionExecutionConfig,
   type SupervisionExecutionPoolRole,
 } from './supervision-execution-pool.js';
@@ -21,10 +23,11 @@ export const EXECUTION_POOL_MCP_TOOLS = {
   GET: 'execution_pool_get',
   SET: 'execution_pool_set',
 } as const;
+export const EXECUTION_POOL_SDKS_HOOK_PATH = '/execution-pool-sdks' as const;
 export type ExecutionPoolMcpToolName = typeof EXECUTION_POOL_MCP_TOOLS[keyof typeof EXECUTION_POOL_MCP_TOOLS];
 export const EXECUTION_POOL_MCP_ROLES = SUPERVISION_EXECUTION_POOL_ROLES;
 export type ExecutionPoolMcpRole = SupervisionExecutionPoolRole;
-export const EXECUTION_POOL_MCP_LIMITS = Object.freeze({ MAX_CONCURRENCY: 100 });
+export const EXECUTION_POOL_MCP_LIMITS = Object.freeze({ MAX_CONCURRENCY: 100, MAX_LEARNED_MODEL_TIERS: 100 });
 
 export interface ExecutionPoolMcpEntry {
   model: string;
@@ -33,9 +36,19 @@ export interface ExecutionPoolMcpEntry {
   enabled: boolean;
 }
 
+export interface ExecutionPoolMcpLearnedModelTier {
+  provider: string;
+  model: string;
+  tier: ModelTier;
+  source?: string;
+}
+
 export interface ExecutionPoolMcpPatch {
   entries?: ExecutionPoolMcpEntry[];
   pool?: 'primary' | 'economy';
+  primaryEntries?: ExecutionPoolMcpEntry[];
+  economyEntries?: ExecutionPoolMcpEntry[];
+  learnedModelTiers?: ExecutionPoolMcpLearnedModelTier[];
   autoPairingEnabled?: boolean;
   auditByDefault?: boolean;
   concurrencyCap?: number;
@@ -98,29 +111,85 @@ export function configFromExecutionPoolEntry(entry: ExecutionPoolMcpEntry): Supe
   return { ...base, capabilityId: buildSupervisionExecutionCapabilityId(base) };
 }
 
+function parseExecutionPoolEntries(rawEntries: unknown, fieldName: string): ExecutionPoolMcpEntry[] | { error: string } {
+  if (!Array.isArray(rawEntries)) return { error: `${fieldName} must be an array` };
+  const entries: ExecutionPoolMcpEntry[] = [];
+  for (const raw of rawEntries) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { error: `each item in ${fieldName} must be an object` };
+    const item = raw as Record<string, unknown>;
+    if (typeof item.model !== 'string' || !item.model.trim() || typeof item.provider !== 'string' || !item.provider.trim()) {
+      return { error: 'each entry requires model and provider' };
+    }
+    const lowerProvider = item.provider.trim().toLowerCase();
+    if (lowerProvider === 'gemini' || lowerProvider === 'gemini-sdk') {
+      return { error: `unsupported provider: ${item.provider.trim()}` };
+    }
+    const role = item.role === undefined ? 'both' : item.role;
+    if (!EXECUTION_POOL_MCP_ROLES.includes(role as ExecutionPoolMcpRole)) return { error: `invalid role: ${String(role)}` };
+    if (item.enabled !== undefined && typeof item.enabled !== 'boolean') return { error: 'enabled must be boolean' };
+    entries.push({ model: item.model.trim(), provider: item.provider.trim(), role: role as ExecutionPoolMcpRole, enabled: item.enabled !== false });
+  }
+  return entries;
+}
+
+function parseLearnedModelTiers(rawList: unknown): ExecutionPoolMcpLearnedModelTier[] | { error: string } {
+  if (!Array.isArray(rawList)) return { error: 'learnedModelTiers must be an array' };
+  if (rawList.length > EXECUTION_POOL_MCP_LIMITS.MAX_LEARNED_MODEL_TIERS) {
+    return { error: `learnedModelTiers supports at most ${EXECUTION_POOL_MCP_LIMITS.MAX_LEARNED_MODEL_TIERS} entries` };
+  }
+  const learned: ExecutionPoolMcpLearnedModelTier[] = [];
+  for (const raw of rawList) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { error: 'each learnedModelTiers item must be an object' };
+    const item = raw as Record<string, unknown>;
+    if (typeof item.provider !== 'string' || !item.provider.trim() || typeof item.model !== 'string' || !item.model.trim()) {
+      return { error: 'each learnedModelTiers item requires provider and model' };
+    }
+    const lowerProvider = item.provider.trim().toLowerCase();
+    if (lowerProvider === 'gemini' || lowerProvider === 'gemini-sdk') {
+      return { error: `unsupported provider: ${item.provider.trim()}` };
+    }
+    if (typeof item.tier !== 'string' || !(MODEL_TIERS as readonly string[]).includes(item.tier)) {
+      return { error: `invalid tier: ${String(item.tier)}` };
+    }
+    if (item.source !== undefined && (typeof item.source !== 'string' || !item.source.trim() || item.source.trim().length > 200)) {
+      return { error: 'source must be a non-empty string up to 200 characters' };
+    }
+    learned.push({
+      provider: item.provider.trim(),
+      model: item.model.trim(),
+      tier: item.tier as ModelTier,
+      ...(typeof item.source === 'string' && item.source.trim() ? { source: item.source.trim() } : {}),
+    });
+  }
+  return learned;
+}
+
 export function validateExecutionPoolMcpPatch(input: unknown): ExecutionPoolMcpPatch | { error: string } {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return { error: 'input must be an object' };
   const value = input as Record<string, unknown>;
   const patch: ExecutionPoolMcpPatch = {};
+  if (value.entries !== undefined && (value.primaryEntries !== undefined || value.economyEntries !== undefined)) {
+    return { error: 'cannot combine entries with primaryEntries or economyEntries' };
+  }
   if (value.entries !== undefined) {
-    if (!Array.isArray(value.entries)) return { error: 'entries must be an array' };
-    const entries: ExecutionPoolMcpEntry[] = [];
-    for (const raw of value.entries) {
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { error: 'each entry must be an object' };
-      const item = raw as Record<string, unknown>;
-      if (typeof item.model !== 'string' || !item.model.trim() || typeof item.provider !== 'string' || !item.provider.trim()) {
-        return { error: 'each entry requires model and provider' };
-      }
-      const lowerProvider = item.provider.trim().toLowerCase();
-      if (lowerProvider === 'gemini' || lowerProvider === 'gemini-sdk') {
-        return { error: `unsupported provider: ${item.provider.trim()}` };
-      }
-      const role = item.role === undefined ? 'both' : item.role;
-      if (!EXECUTION_POOL_MCP_ROLES.includes(role as ExecutionPoolMcpRole)) return { error: `invalid role: ${String(role)}` };
-      if (item.enabled !== undefined && typeof item.enabled !== 'boolean') return { error: 'enabled must be boolean' };
-      entries.push({ model: item.model.trim(), provider: item.provider.trim(), role: role as ExecutionPoolMcpRole, enabled: item.enabled !== false });
-    }
-    patch.entries = entries;
+    const parsed = parseExecutionPoolEntries(value.entries, 'entries');
+    if ('error' in parsed) return parsed;
+    patch.entries = parsed;
+  }
+  if (value.primaryEntries !== undefined) {
+    const parsed = parseExecutionPoolEntries(value.primaryEntries, 'primaryEntries');
+    if ('error' in parsed) return parsed;
+    patch.primaryEntries = parsed;
+  }
+  if (value.economyEntries !== undefined) {
+    const parsed = parseExecutionPoolEntries(value.economyEntries, 'economyEntries');
+    if ('error' in parsed) return parsed;
+    patch.economyEntries = parsed;
+  }
+  if (value.learnedModelTiers !== undefined) {
+    const parsed = parseLearnedModelTiers(value.learnedModelTiers);
+    if ('error' in parsed) return parsed;
+    patch.learnedModelTiers = parsed;
   }
   if (value.pool !== undefined) {
     if (value.pool !== 'primary' && value.pool !== 'economy') return { error: 'pool must be primary or economy' };

@@ -16,6 +16,7 @@
 import { isLocalHookRequest } from './hook-request-guard.js';
 import { hookClaimAllowed } from './hook-session-credential.js';
 import { HOOK_SESSION_CREDENTIAL_ERROR } from '../../shared/hook-session-credential.js';
+import { EXECUTION_POOL_SDKS_HOOK_PATH } from '../../shared/execution-pool-mcp.js';
 import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
 import {
   MEMORY_MCP_TOOL_NAMES,
@@ -1824,6 +1825,34 @@ export async function startHookServer(
         logger.warn({ err }, 'sessions/live: failed to assemble live session states');
         res.writeHead(500);
         res.end(JSON.stringify({ ok: false, error: 'failed to assemble live session states' }));
+      }
+      return;
+    }
+
+    if (url === EXECUTION_POOL_SDKS_HOOK_PATH) {
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        if (rejectUnverifiedClaim(from)) return;
+        if (!from || !getSession(from)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'execution pool sdk probe caller identity is unavailable' }));
+          return;
+        }
+        const { probeExecutionPoolSdks } = await import('./sdk-execution-pool-probe.js');
+        const probeResult = await probeExecutionPoolSdks({ callerSessionName: from });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, ...probeResult }));
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
       }
       return;
     }

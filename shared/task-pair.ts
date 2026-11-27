@@ -1116,6 +1116,13 @@ export const TASK_PAIR_ECONOMY_POOL_RULE: string =
 export const TASK_PAIR_ECONOMY_POOL_SHORT_RULE: string =
   'When economy pool configured, pass executionPool="economy" for bounded low-risk/routine tasks (audited via primary pool); complex work uses primary.';
 
+export const TASK_PAIR_UNCONFIGURED_POOL_RECOMMENDATION_RULE: string =
+  'Unconfigured execution pool recommendation (code/development tasks only): when receiving a substantive code/development task and the project execution pool is not configured (executionPoolsState !== "configured"), call execution_pool_get BEFORE pair_create (skip for pure Q&A, non-code document/table/ops tasks, or when the user already declined configuration). '
+  + 'Inspect currentBrain, availableSdks (logged-in SDKs + live model catalogs), unknownModels, needsModelResearch, and recommendedPresets. '
+  + 'UNKNOWN MODEL RESEARCH: if unknownModels is non-empty (or a live catalog contains a newly released model whose flagship/secondary/economy tier is uncertain), NEVER guess tiers or revert to hardcoded legacy models — first search online (e.g. search_web) to verify each unknown model\'s official tier, then call execution_pool_set({ learnedModelTiers: [...] }) to persist that knowledge and refresh recommendedPresets (if web search is unavailable, list the unknown models for user confirmation). '
+  + 'Present the recommended presets (marking the recommended cross-SDK or single-SDK same-vendor fallback preset, executor/auditor/economy models, and any brainModelHint if Brain runs an economy model) plus Custom (showing availableSdks live models) and "Skip for now" options. '
+  + 'Once the user chooses, immediately call execution_pool_set (primaryEntries/economyEntries/autoPairingEnabled/auditByDefault) to save the pool and seamlessly continue executing the user\'s original coding task without asking them to repeat it.';
+
 /**
  * Brain drives pairs with the MCP tools only. The daemon still PARSES a legacy IMCODES_TASK marker from a Brain (existing
  * sessions keep working) but no Brain-facing text teaches or recommends one.
@@ -2997,6 +3004,7 @@ export function buildTaskPairMarkerContract(): string {
     'Waiting costs no model turns: use pair_pause mode=manual for a manual hold, or mode=dependencies with same-project dependsOn ids; pair_resume clears only the manual hold. Dependencies wait for Brain-accepted DONE, not PASS. Paused pairs retain their stage/material/workspace; do not keep replying that you are waiting. pair_create also accepts dependsOn.',
     `Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial code/engineering tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. ${TASK_PAIR_NON_CODE_NO_AUDIT_RULE} ${TASK_PAIR_ECONOMY_POOL_RULE} Explicit user choices always win. With an empty or unconfigured pool the daemon uses idle sub-sessions of the Brain in the SAME provider family that run the secondary model of that family (Anthropic Sonnet, OpenAI Sol, DeepSeek Pro; never another vendor, never the flagship), and pair_create auto-creates missing same-family secondary-tier sub-sessions up to the per-project cap (${TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT}); executor and auditor are different sessions, and when the cap or quota blocks provisioning the daemon tells you how to fix it (create a sub-session, name executor/auditor, or execution_pool_set). Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.`,
     TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE,
+    TASK_PAIR_UNCONFIGURED_POOL_RECOMMENDATION_RULE,
     TASK_PAIR_BRAIN_MCP_ONLY_RULE,
     TASK_PAIR_USER_FACING_TITLE_RULE,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,

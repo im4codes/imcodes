@@ -98,6 +98,8 @@ import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { enqueueDurableResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
 import { registerExecutionPoolMcpTools, type ExecutionPoolMcpToolDeps } from './execution-pool-mcp-tools.js';
+import { EXECUTION_POOL_SDKS_HOOK_PATH } from '../../shared/execution-pool-mcp.js';
+import { probeExecutionPoolSdks, type ExecutionPoolSdkProbeResult } from './sdk-execution-pool-probe.js';
 import { getCachedSupervisorDefaults, refreshSupervisorDefaultsCache, updateSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
 import { fileTransferMcpTimeoutMs } from '../../shared/transport/file-transfer.js';
 import { HOOK_SESSION_CREDENTIAL_ENV } from '../../shared/hook-session-credential.js';
@@ -501,8 +503,36 @@ export function createMemoryMcpServer(
       await refreshSupervisorDefaultsCache();
       return getCachedSupervisorDefaults();
     }),
-    setDefaults: executionPoolToolDeps.setDefaults ?? ((runtimeCaller, mutate) => updateSupervisorDefaultsCache(mutate)),
+    setDefaults: executionPoolToolDeps.setDefaults ?? ((_runtimeCaller, mutate) => updateSupervisorDefaultsCache(mutate)),
     isProjectBrain: executionPoolToolDeps.isProjectBrain ?? supervisionToolDeps.isProjectBrain,
+    probeSdks: executionPoolToolDeps.probeSdks ?? (async (runtimeCaller) => {
+      if (runtimeCaller.sessionName) {
+        const port = await resolveLiveHookPort().catch(() => null);
+        if (port) {
+          try {
+            const response = await postHookSend(
+              port,
+              { from: runtimeCaller.sessionName },
+              EXECUTION_POOL_SDKS_HOOK_PATH,
+              runtimeCaller.sessionName,
+              2_000,
+              false,
+            );
+            if (response.ok === true && response.currentBrain && Array.isArray(response.sdks)) {
+              return {
+                currentBrain: response.currentBrain as ExecutionPoolSdkProbeResult['currentBrain'],
+                sdks: response.sdks as ExecutionPoolSdkProbeResult['sdks'],
+              };
+            }
+          } catch {
+            // Fall back to local probe if hook is unavailable or daemon lacks the route.
+          }
+        }
+      }
+      return probeExecutionPoolSdks({ callerSessionName: runtimeCaller.sessionName ?? undefined });
+    }),
+    ...(executionPoolToolDeps.loadKnowledge ? { loadKnowledge: executionPoolToolDeps.loadKnowledge } : {}),
+    ...(executionPoolToolDeps.saveKnowledge ? { saveKnowledge: executionPoolToolDeps.saveKnowledge } : {}),
   })) registered.set(name, tool);
   // Withheld tools are gone from this connection: not listed, not discoverable
   // through mcp_tool_search and not callable.

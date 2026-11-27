@@ -6,6 +6,7 @@ import {
   TASK_PAIR_ECONOMY_POOL_SHORT_RULE,
   TASK_PAIR_NEEDS_DECISION_RULE,
   TASK_PAIR_SESSION_ISOLATION_AND_POOL_RULE,
+  TASK_PAIR_UNCONFIGURED_POOL_RECOMMENDATION_RULE,
   TASK_PAIR_AUTO_CREATED_SESSION_MAX_PER_PROJECT,
   TASK_PAIR_AUDITOR_PROPOSAL_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
@@ -1029,5 +1030,14 @@ describe('pair contract consistency regressions', () => {
     });
     expect(mcpRejected.intents).toEqual([]);
     expect(mcpRejected.pair?.capCounts.policy_rejection).toBeUndefined();
+  });
+
+  it('includes unconfigured execution pool recommendation and unknown-model web research rule in Brain contract', () => {
+    const contract = buildTaskPairMarkerContract();
+    expect(contract).toContain(TASK_PAIR_UNCONFIGURED_POOL_RECOMMENDATION_RULE);
+    expect(contract).toContain('execution_pool_get');
+    expect(contract).toContain('learnedModelTiers');
+    expect(contract).toContain('unknownModels');
+    expect(contract).toContain('search_web');
   });
 });

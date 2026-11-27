@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildExecutionPoolRecommendations,
   buildSupervisionExecutionCapabilityId,
+  classifySdkModelTiers,
   evaluateSupervisionExecutionBinding,
   mayFinalizeEconomyAssignment,
   migrateLegacySupervisionExecutionPools,
@@ -16,6 +18,8 @@ import {
   SUPERVISION_AUDIT_ROUTING_REASONS,
   resolveSupervisionTierPair,
   supervisionTierPriority,
+  type ExecutionPoolSdkSummary,
+  type LearnedModelTierRecord,
   type SupervisionExecutionConfig,
 } from '../../shared/supervision-execution-pool.js';
 import { SUPERVISION_SUPPORTED_UI_LOCALES } from '../../shared/supervision-config.js';
@@ -694,5 +698,155 @@ describe('deprecated gemini execution pool compatibility', () => {
     const migratedGemini = migrateLegacySupervisionExecutionPools({ backend: 'gemini', model: 'gemini-2.5-pro' });
     expect(migratedGemini.state).toBe('legacy_unconfigured');
     expect(migratedGemini.primaryDevelopmentPool.configs).toEqual([]);
+  });
+});
+
+describe('dynamic model tier classification & cross-SDK recommendations', () => {
+  it('dynamically ranks future versioned models without hardcoded model lists', () => {
+    const codex = classifySdkModelTiers('codex-sdk', [
+      'gpt-6-sol',
+      'gpt-6.2-sol',
+      'gpt-7.5-sol',
+      'gpt-8-sol',
+      'gpt-5.6',
+      'gpt-6-luna',
+      'gpt-8-luna',
+    ]);
+    expect(codex.tiers).toEqual({
+      flagship: 'gpt-8-sol',
+      secondary: 'gpt-8-sol',
+      economy: 'gpt-8-luna',
+    });
+    expect(codex.unknownModels).toEqual([]);
+
+    const codexWithFutureFlagship = classifySdkModelTiers('codex-sdk', [
+      'gpt-8-astra',
+      'gpt-7.5-sol',
+      'gpt-7.5-luna',
+    ]);
+    expect(codexWithFutureFlagship.tiers).toEqual({
+      flagship: 'gpt-8-astra',
+      secondary: 'gpt-7.5-sol',
+      economy: 'gpt-7.5-luna',
+    });
+
+    const agy = classifySdkModelTiers('agy-sdk', [
+      'gemini-4-hydrogen-high',
+      'gemini-5-hydrogen-high',
+      'gemini-6-helium-high',
+      'gemini-3.8-flash-high',
+      'gemini-6-flash-high',
+    ]);
+    expect(agy.tiers).toEqual({
+      flagship: 'gemini-6-helium-high',
+      secondary: 'gemini-5-hydrogen-high',
+      economy: 'gemini-6-flash-high',
+    });
+    expect(agy.unknownModels).toEqual([]);
+
+    const claude = classifySdkModelTiers('claude-code-sdk', [
+      'claude-fable-6',
+      'claude-opus-6',
+      'claude-sonnet-6',
+      'claude-haiku-6',
+    ]);
+    expect(claude.tiers).toEqual({
+      flagship: 'claude-fable-6',
+      secondary: 'claude-sonnet-6',
+      economy: 'claude-haiku-6',
+    });
+  });
+
+  it('never guesses or drops completely unknown model names and applies learned knowledge once updated', () => {
+    const unknownCatalog = ['claude-aurora-7', 'gpt-7-quasar', 'nova-x1'];
+    const before = classifySdkModelTiers('claude-code-sdk', [...unknownCatalog, 'sonnet', 'haiku']);
+    expect(before.models).toEqual(['claude-aurora-7', 'gpt-7-quasar', 'nova-x1', 'sonnet', 'haiku']);
+    expect(before.unknownModels).toEqual(['claude-aurora-7', 'gpt-7-quasar', 'nova-x1']);
+    expect(before.tiers).toEqual({ flagship: 'sonnet', secondary: 'sonnet', economy: 'haiku' });
+
+    const learned: LearnedModelTierRecord[] = [
+      { provider: 'claude-code-sdk', model: 'claude-aurora-7', tier: 'flagship', source: 'web_search', updatedAt: 100 },
+      { provider: 'nova-sdk', model: 'nova-x1', tier: 'economy', source: 'web_search', updatedAt: 101 },
+    ];
+    const after = classifySdkModelTiers('claude-code-sdk', [...unknownCatalog, 'sonnet', 'haiku'], learned);
+    expect(after.unknownModels).toEqual(['gpt-7-quasar', 'nova-x1']);
+    expect(after.tiers).toEqual({
+      flagship: 'claude-aurora-7',
+      secondary: 'sonnet',
+      economy: 'haiku',
+    });
+
+    const novaAfter = classifySdkModelTiers('nova-sdk', ['nova-x1'], learned);
+    expect(novaAfter.unknownModels).toEqual([]);
+    expect(novaAfter.tiers).toEqual({
+      economy: 'nova-x1',
+    });
+  });
+
+  it('recommends balanced cross-SDK presets when >=2 SDK families are logged in', () => {
+    const agyClassified = classifySdkModelTiers('agy-sdk', ['gemini-4-hydrogen-high', 'gemini-3.8-flash-high', 'claude-opus-5-5-high']);
+    const codexClassified = classifySdkModelTiers('codex-sdk', ['gpt-6.2-sol', 'gpt-6-luna']);
+    const sdks: ExecutionPoolSdkSummary[] = [
+      { provider: 'agy-sdk', providerFamily: 'google', loggedIn: true, ...agyClassified, source: 'live_catalog' },
+      { provider: 'codex-sdk', providerFamily: 'openai', loggedIn: true, ...codexClassified, source: 'live_catalog' },
+    ];
+
+    const rec = buildExecutionPoolRecommendations({
+      currentBrain: { provider: 'agy-sdk', providerFamily: 'google', model: 'gemini-4-hydrogen-high' },
+      availableSdks: sdks,
+    });
+    expect(rec.customAllowed).toBe(true);
+    expect(rec.needsModelResearch).toBe(false);
+    expect(rec.recommendedPresets[0]).toMatchObject({
+      id: 'balanced_cross_vendor',
+      recommended: true,
+      autoPairingEnabled: true,
+      auditByDefault: true,
+      primaryEntries: [
+        { provider: 'agy-sdk', model: 'gemini-4-hydrogen-high', role: 'executor', enabled: true },
+        { provider: 'codex-sdk', model: 'gpt-6.2-sol', role: 'auditor', enabled: true },
+      ],
+      economyEntries: [
+        { provider: 'agy-sdk', model: 'gemini-3.8-flash-high', role: 'both', enabled: true },
+      ],
+    });
+    expect(rec.recommendedPresets.some((p) => p.id === 'same_vendor_balanced')).toBe(true);
+  });
+
+  it('automatically switches to same-vendor audit when only one SDK family is logged in and warns when Brain is economy-tier', () => {
+    const claudeClassified = classifySdkModelTiers('claude-code-sdk', ['fable', 'sonnet', 'haiku', 'claude-aurora-7']);
+    const unloggedCodex = classifySdkModelTiers('codex-sdk', ['gpt-6.2-sol']);
+    const sdks: ExecutionPoolSdkSummary[] = [
+      { provider: 'claude-code-sdk', providerFamily: 'anthropic', loggedIn: true, ...claudeClassified, source: 'session_observed' },
+      { provider: 'codex-sdk', providerFamily: 'openai', loggedIn: false, ...unloggedCodex, source: 'static_fallback' },
+    ];
+
+    const rec = buildExecutionPoolRecommendations({
+      currentBrain: { provider: 'claude-code-sdk', providerFamily: 'anthropic', model: 'haiku' },
+      availableSdks: sdks,
+    });
+
+    expect(rec.needsModelResearch).toBe(true);
+    expect(rec.unknownModels).toEqual([{ provider: 'claude-code-sdk', model: 'claude-aurora-7' }]);
+    expect(rec.currentBrain.isEconomy).toBe(true);
+    expect(rec.brainModelHint).toContain('haiku');
+    expect(rec.recommendedPresets[0]).toMatchObject({
+      id: 'same_vendor_balanced',
+      recommended: true,
+      needsModelResearch: true,
+      primaryEntries: [{ provider: 'claude-code-sdk', model: 'sonnet', role: 'both', enabled: true }],
+      economyEntries: [{ provider: 'claude-code-sdk', model: 'haiku', role: 'both', enabled: true }],
+    });
+    expect(rec.recommendedPresets[1]).toMatchObject({
+      id: 'same_vendor_strong_audit',
+      recommended: false,
+      primaryEntries: [
+        { provider: 'claude-code-sdk', model: 'sonnet', role: 'executor', enabled: true },
+        { provider: 'claude-code-sdk', model: 'fable', role: 'auditor', enabled: true },
+      ],
+    });
+    for (const preset of rec.recommendedPresets) {
+      expect(preset.primaryEntries.some((e) => e.provider === 'codex-sdk')).toBe(false);
+    }
   });
 });

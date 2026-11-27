@@ -17,7 +17,15 @@ import {
   normalizeSupervisorDefaultConfig,
   type SupervisorDefaultConfig,
 } from '../../shared/supervision-config.js';
-import type { SupervisionExecutionPoolsConfig } from '../../shared/supervision-execution-pool.js';
+import {
+  MODEL_TIERS,
+  buildExecutionPoolRecommendations,
+  classifySdkModelTiers,
+  type LearnedModelTierRecord,
+  type SupervisionExecutionPoolsConfig,
+} from '../../shared/supervision-execution-pool.js';
+import { loadModelTierKnowledge, upsertModelTierKnowledge, type LearnedModelTierInput } from './model-tier-knowledge.js';
+import { probeExecutionPoolSdks, type ExecutionPoolSdkProbeResult } from './sdk-execution-pool-probe.js';
 
 type ToolResult = Record<string, unknown>;
 type ToolHandler = (input?: unknown) => Promise<ToolResult>;
@@ -27,16 +35,31 @@ export interface ExecutionPoolMcpToolDeps {
   /** Must serialize read → mutate → persist across handler instances. */
   setDefaults?: (caller: McpRuntimeCaller, mutate: SupervisorDefaultsMutation) => Promise<SupervisorDefaultConfig | null> | SupervisorDefaultConfig | null;
   isProjectBrain?: (caller: McpRuntimeCaller) => boolean;
+  probeSdks?: (caller: McpRuntimeCaller) => Promise<ExecutionPoolSdkProbeResult> | ExecutionPoolSdkProbeResult;
+  loadKnowledge?: () => Promise<LearnedModelTierRecord[]> | LearnedModelTierRecord[];
+  saveKnowledge?: (updates: readonly LearnedModelTierInput[]) => Promise<LearnedModelTierRecord[]> | LearnedModelTierRecord[];
 }
+
+const poolEntrySchema = z.strictObject({
+  model: z.string().min(1),
+  provider: z.string().min(1),
+  role: z.enum(['executor', 'auditor', 'both']).optional(),
+  enabled: z.boolean().optional(),
+});
 
 const schemas = {
   [EXECUTION_POOL_MCP_TOOLS.GET]: z.strictObject({}),
   [EXECUTION_POOL_MCP_TOOLS.SET]: z.strictObject({
-    entries: z.array(z.strictObject({
-      model: z.string().min(1), provider: z.string().min(1),
-      role: z.enum(['executor', 'auditor', 'both']).optional(), enabled: z.boolean().optional(),
-    })).optional(),
+    entries: z.array(poolEntrySchema).optional(),
     pool: z.enum(['primary', 'economy']).optional(),
+    primaryEntries: z.array(poolEntrySchema).optional(),
+    economyEntries: z.array(poolEntrySchema).optional(),
+    learnedModelTiers: z.array(z.strictObject({
+      provider: z.string().min(1),
+      model: z.string().min(1),
+      tier: z.enum(MODEL_TIERS),
+      source: z.string().min(1).max(200).optional(),
+    })).max(EXECUTION_POOL_MCP_LIMITS.MAX_LEARNED_MODEL_TIERS).optional(),
     autoPairingEnabled: z.boolean().optional(),
     auditByDefault: z.boolean().optional(),
     concurrencyCap: z.number().int().min(1).max(EXECUTION_POOL_MCP_LIMITS.MAX_CONCURRENCY).optional(),
@@ -50,9 +73,56 @@ function error(message: string, reason: string = MCP_ERROR_REASONS.VALIDATION_FA
   return { status: 'error', reason, message };
 }
 
-function poolOutput(defaults: SupervisorDefaultConfig | null): ToolResult {
-  if (!defaults) return { status: 'ok', configured: false, entries: [], autoPairingEnabled: false, auditByDefault: false, concurrencyCap: null,
-    askUser: 'No execution pool is configured. Ask the user which executor and auditor models to use before enabling auto-pairing.' };
+function buildRecommendationsForOutput(
+  probe: ExecutionPoolSdkProbeResult | null,
+  knowledge: readonly LearnedModelTierRecord[],
+): Record<string, unknown> {
+  if (!probe) return {};
+  const reEvaluatedSdks = probe.sdks.map((sdk) => {
+    const classified = classifySdkModelTiers(sdk.provider, sdk.models, knowledge);
+    return {
+      ...sdk,
+      models: classified.models,
+      tiers: classified.tiers,
+      unknownModels: classified.unknownModels,
+    };
+  });
+  const recs = buildExecutionPoolRecommendations({
+    currentBrain: probe.currentBrain,
+    availableSdks: reEvaluatedSdks,
+    learnedKnowledge: knowledge,
+  });
+  return {
+    currentBrain: recs.currentBrain,
+    availableSdks: recs.availableSdks,
+    unknownModels: recs.unknownModels,
+    needsModelResearch: recs.needsModelResearch,
+    recommendedPresets: recs.recommendedPresets,
+    customAllowed: recs.customAllowed,
+    ...(recs.brainModelHint ? { brainModelHint: recs.brainModelHint } : {}),
+  };
+}
+
+function poolOutput(
+  defaults: SupervisorDefaultConfig | null,
+  probe: ExecutionPoolSdkProbeResult | null,
+  knowledge: readonly LearnedModelTierRecord[],
+  extra?: Record<string, unknown>,
+): ToolResult {
+  const recommendations = buildRecommendationsForOutput(probe, knowledge);
+  if (!defaults) {
+    return {
+      status: 'ok',
+      configured: false,
+      entries: [],
+      autoPairingEnabled: false,
+      auditByDefault: false,
+      concurrencyCap: null,
+      askUser: 'No execution pool is configured. Ask the user which executor and auditor models to use before enabling auto-pairing.',
+      ...recommendations,
+      ...extra,
+    };
+  }
   const pools = defaults.executionPools;
   const entries = [
     ...pools.primaryDevelopmentPool.configs.map((config) => ({ ...executionPoolEntryFromConfig(config), pool: 'primary' as const })),
@@ -62,23 +132,54 @@ function poolOutput(defaults: SupervisorDefaultConfig | null): ToolResult {
     || (defaults.pairEngine === undefined && (defaults.mode === SUPERVISION_MODE.SUPERVISED || defaults.mode === SUPERVISION_MODE.SUPERVISED_AUDIT));
   const auditByDefault = defaults.mode === SUPERVISION_MODE.SUPERVISED_AUDIT;
   const configured = pools.state === 'configured' && entries.length > 0;
-  return { status: 'ok', configured, entries, autoPairingEnabled, auditByDefault,
+  return {
+    status: 'ok',
+    configured,
+    entries,
+    autoPairingEnabled,
+    auditByDefault,
     concurrencyCap: defaults.pairMaxConcurrency ?? pools.primaryDevelopmentPool.controls.maxConcurrency,
-    ...(configured ? {} : { askUser: 'No execution pool is configured. Ask the user which executor and auditor models to use before enabling auto-pairing.' }) };
+    ...(configured ? {} : { askUser: 'No execution pool is configured. Ask the user which executor and auditor models to use before enabling auto-pairing.' }),
+    ...recommendations,
+    ...extra,
+  };
 }
 
 function applyPatch(current: SupervisorDefaultConfig, patch: ExecutionPoolMcpPatch): SupervisorDefaultConfig {
   const targetPool = patch.pool ?? 'primary';
-  const updatedPool = patch.entries ? {
-    ...(targetPool === 'primary' ? current.executionPools.primaryDevelopmentPool : current.executionPools.economyTaskPool),
-    configs: patch.entries.filter((entry) => entry.enabled).map(configFromExecutionPoolEntry),
-  } : undefined;
-  const nextPrimary = targetPool === 'primary' && updatedPool ? updatedPool : current.executionPools.primaryDevelopmentPool;
-  const nextEconomy = targetPool === 'economy' && updatedPool ? updatedPool : current.executionPools.economyTaskPool;
-  const nextPools: SupervisionExecutionPoolsConfig = { ...current.executionPools,
-    state: patch.entries ? (nextPrimary.configs.length > 0 || nextEconomy.configs.length > 0 ? 'configured' : 'legacy_unconfigured') : current.executionPools.state,
-    ...(targetPool === 'primary' && updatedPool ? { primaryDevelopmentPool: updatedPool } : {}),
-    ...(targetPool === 'economy' && updatedPool ? { economyTaskPool: updatedPool } : {}),
+  const batchMode = patch.primaryEntries !== undefined || patch.economyEntries !== undefined;
+  const nextPrimary = batchMode
+    ? (patch.primaryEntries !== undefined
+      ? {
+          ...current.executionPools.primaryDevelopmentPool,
+          configs: patch.primaryEntries.filter((entry) => entry.enabled).map(configFromExecutionPoolEntry),
+        }
+      : current.executionPools.primaryDevelopmentPool)
+    : (patch.entries !== undefined && targetPool === 'primary'
+      ? {
+          ...current.executionPools.primaryDevelopmentPool,
+          configs: patch.entries.filter((entry) => entry.enabled).map(configFromExecutionPoolEntry),
+        }
+      : current.executionPools.primaryDevelopmentPool);
+  const nextEconomy = batchMode
+    ? (patch.economyEntries !== undefined
+      ? {
+          ...current.executionPools.economyTaskPool,
+          configs: patch.economyEntries.filter((entry) => entry.enabled).map(configFromExecutionPoolEntry),
+        }
+      : current.executionPools.economyTaskPool)
+    : (patch.entries !== undefined && targetPool === 'economy'
+      ? {
+          ...current.executionPools.economyTaskPool,
+          configs: patch.entries.filter((entry) => entry.enabled).map(configFromExecutionPoolEntry),
+        }
+      : current.executionPools.economyTaskPool);
+  const entriesChanged = patch.entries !== undefined || patch.primaryEntries !== undefined || patch.economyEntries !== undefined;
+  const nextPools: SupervisionExecutionPoolsConfig = {
+    ...current.executionPools,
+    state: entriesChanged ? (nextPrimary.configs.length > 0 || nextEconomy.configs.length > 0 ? 'configured' : 'legacy_unconfigured') : current.executionPools.state,
+    ...(nextPrimary !== current.executionPools.primaryDevelopmentPool ? { primaryDevelopmentPool: nextPrimary } : {}),
+    ...(nextEconomy !== current.executionPools.economyTaskPool ? { economyTaskPool: nextEconomy } : {}),
   };
   const autoPairingEnabled = patch.autoPairingEnabled ?? (current.pairEngine === 'pairs'
     || (current.pairEngine === undefined && (current.mode === SUPERVISION_MODE.SUPERVISED || current.mode === SUPERVISION_MODE.SUPERVISED_AUDIT)));
@@ -95,19 +196,68 @@ function applyPatch(current: SupervisorDefaultConfig, patch: ExecutionPoolMcpPat
 export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, deps: ExecutionPoolMcpToolDeps = {}): Record<string, ToolHandler> {
   const getDefaults = deps.getDefaults ?? (() => null);
   const setDefaults = deps.setDefaults ?? (() => null);
+  const probeSdks = deps.probeSdks ?? (async (c) => probeExecutionPoolSdks({ callerSessionName: c.sessionName ?? undefined }).catch(() => null));
+  const loadKnowledge = deps.loadKnowledge ?? (() => loadModelTierKnowledge());
+  const saveKnowledge = deps.saveKnowledge ?? ((updates) => upsertModelTierKnowledge(updates));
   const authorized = () => Boolean(caller.sessionName && caller.projectName && deps.isProjectBrain?.(caller));
+
+  const readContext = async () => {
+    const [probe, knowledge] = await Promise.all([
+      Promise.resolve(probeSdks(caller)).catch(() => null),
+      Promise.resolve(loadKnowledge()).catch(() => [] as LearnedModelTierRecord[]),
+    ]);
+    return { probe, knowledge };
+  };
+
   return {
-    [EXECUTION_POOL_MCP_TOOLS.GET]: async () => authorized()
-      ? poolOutput(await getDefaults(caller))
-      : error('execution pool reads require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN),
+    [EXECUTION_POOL_MCP_TOOLS.GET]: async () => {
+      if (!authorized()) return error('execution pool reads require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+      const [defaults, context] = await Promise.all([
+        Promise.resolve(getDefaults(caller)),
+        readContext(),
+      ]);
+      return poolOutput(defaults, context.probe, context.knowledge);
+    },
     [EXECUTION_POOL_MCP_TOOLS.SET]: async (input) => {
       if (!authorized()) return error('execution pool changes require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
       const parsed = validateExecutionPoolMcpPatch(input);
       if ('error' in parsed) return error(parsed.error);
-      // The persistence boundary must read + merge inside its shared queue.
-      const saved = await setDefaults(caller, (current) => applyPatch(current, parsed));
-      if (!saved) return error('execution pool persistence could not be confirmed; read the current preferences before retrying', MCP_ERROR_REASONS.INTERNAL_ERROR);
-      return poolOutput(saved);
+
+      let updatedKnowledgeCount: number | undefined;
+      let latestKnowledge: LearnedModelTierRecord[] | undefined;
+      if (parsed.learnedModelTiers && parsed.learnedModelTiers.length > 0) {
+        latestKnowledge = await Promise.resolve(saveKnowledge(parsed.learnedModelTiers));
+        updatedKnowledgeCount = parsed.learnedModelTiers.length;
+      }
+
+      const hasPoolOrPolicyChange = parsed.entries !== undefined
+        || parsed.primaryEntries !== undefined
+        || parsed.economyEntries !== undefined
+        || parsed.autoPairingEnabled !== undefined
+        || parsed.auditByDefault !== undefined
+        || parsed.concurrencyCap !== undefined;
+
+      let targetDefaults: SupervisorDefaultConfig | null;
+      if (hasPoolOrPolicyChange) {
+        // The persistence boundary must read + merge inside its shared queue.
+        targetDefaults = await setDefaults(caller, (current) => applyPatch(current, parsed));
+        if (!targetDefaults) {
+          return error('execution pool persistence could not be confirmed; read the current preferences before retrying', MCP_ERROR_REASONS.INTERNAL_ERROR);
+        }
+      } else {
+        targetDefaults = await getDefaults(caller);
+      }
+
+      const [probe, loadedKnowledge] = await Promise.all([
+        Promise.resolve(probeSdks(caller)).catch(() => null),
+        latestKnowledge ? Promise.resolve(latestKnowledge) : Promise.resolve(loadKnowledge()).catch(() => [] as LearnedModelTierRecord[]),
+      ]);
+      return poolOutput(
+        targetDefaults,
+        probe,
+        loadedKnowledge,
+        updatedKnowledgeCount !== undefined ? { learnedModelsUpdated: updatedKnowledgeCount } : undefined,
+      );
     },
   };
 }
@@ -115,8 +265,8 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
 export function registerExecutionPoolMcpTools(server: McpServer, caller: McpRuntimeCaller, deps: ExecutionPoolMcpToolDeps = {}): ReadonlyMap<string, RegisteredTool> {
   const handlers = createExecutionPoolMcpToolHandlers(caller, deps);
   const descriptions = {
-    [EXECUTION_POOL_MCP_TOOLS.GET]: 'Read the project execution pool, auto-pairing and audit-by-default policy. If unconfigured, pairs use same-vendor secondary-tier sub-sessions (sonnet, sol); set a pool to choose.',
-    [EXECUTION_POOL_MCP_TOOLS.SET]: 'Update the project execution pool and pairing policy. Only the project Brain/owner may change it.',
+    [EXECUTION_POOL_MCP_TOOLS.GET]: 'Read execution pool, policy, logged-in SDK catalogs, unknown models, and recommended presets.',
+    [EXECUTION_POOL_MCP_TOOLS.SET]: 'Update execution pool (entries/primaryEntries/economyEntries), pairing policy, or learnedModelTiers. Brain/owner only.',
   };
   const registered = new Map<string, RegisteredTool>();
   for (const name of [EXECUTION_POOL_MCP_TOOLS.GET, EXECUTION_POOL_MCP_TOOLS.SET] as const) {
