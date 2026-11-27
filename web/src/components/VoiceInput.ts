@@ -39,6 +39,7 @@ import {
   isVoiceHotwordsScopeValid,
   normalizeVoiceHotwordProjectKey,
   resolveRemoteVoiceHotwordsForProvider,
+  subscribeVoiceHotwordsChange,
   type VoiceHotwordProjectInput,
   type VoiceHotwordsScopeSnapshot,
 } from '../voice-hotwords.js';
@@ -350,6 +351,7 @@ interface CaptureOwner {
   id: number;
   retired: boolean;
   hotwords?: CompiledVoiceHotwords;
+  scope?: VoiceHotwordsScopeSnapshot;
   notifiedListening?: boolean;
   normalStopRequested?: boolean;
   pendingFallback?: { promise: Promise<void>; abort: () => void };
@@ -375,8 +377,8 @@ interface NativeSession {
   deferAudioPause: boolean;
   captureStarted: boolean;
   startInvoked: boolean;
-  accountKey?: string | null;
-  scopeEpoch?: number;
+  accountKey: string | null;
+  scopeEpoch: number;
   startedHotwordsKey?: string;
   abortPendingStart?: (() => void) | null;
   handles: PluginListenerHandle[];
@@ -449,8 +451,8 @@ interface WebSession {
   primed: boolean;
   deferAudioPause: boolean;
   captureStarted: boolean;
-  accountKey?: string | null;
-  scopeEpoch?: number;
+  accountKey: string | null;
+  scopeEpoch: number;
   lastText: string;
   emittedFinal: boolean;
   earlyError: string | null;
@@ -674,9 +676,43 @@ let _webStream: MediaStream | null = null;
 let _webAudioCtx: AudioContext | null = null;
 let _webLevelRAF: number | null = null;
 
+function isSessionScopeValid(session: { accountKey: string | null; scopeEpoch: number }): boolean {
+  return isVoiceHotwordsScopeValid({
+    accountKey: session.accountKey,
+    epoch: session.scopeEpoch,
+  });
+}
+
+function recordPrimedOutcome(params: {
+  generation: number;
+  error: string | null;
+  text: string | null;
+  endedWithCapture: boolean;
+  session?: { accountKey: string | null; scopeEpoch: number };
+  scope?: VoiceHotwordsScopeSnapshot;
+  startedHotwordsKey?: string;
+}): void {
+  const accountKey = params.session
+    ? params.session.accountKey
+    : (params.scope ?? getVoiceHotwordsScopeSnapshot()).accountKey;
+  const scopeEpoch = params.session
+    ? params.session.scopeEpoch
+    : (params.scope ?? getVoiceHotwordsScopeSnapshot()).epoch;
+  _primedOutcome = {
+    generation: params.generation,
+    error: params.error,
+    text: params.text,
+    endedWithCapture: params.endedWithCapture,
+    accountKey,
+    scopeEpoch,
+    ...(params.startedHotwordsKey !== undefined ? { startedHotwordsKey: params.startedHotwordsKey } : {}),
+  };
+}
+
 // --- Shared remote ASR session state ---
 interface EagerRemoteStartState {
   intent: number;
+  scope: VoiceHotwordsScopeSnapshot;
   aborted: boolean;
   releasedToSend: boolean;
   captureStarted: boolean;
@@ -709,6 +745,71 @@ let _pendingRemoteStopMicReleased: Promise<void> | null = null;
 let _pendingRemoteStopAbort: (() => void) | null = null;
 let _pendingFinalizeAbort: (() => void) | null = null;
 let _pendingFinalizePromise: Promise<void> | null = null;
+let _lastObservedAuthScope: VoiceHotwordsScopeSnapshot = getVoiceHotwordsScopeSnapshot();
+
+function invalidateVoiceSessionsOnAuthScopeChange(): void {
+  _primedOutcome = null;
+  _listening = false;
+  if (_webSession) {
+    void stopWebListening(true);
+  }
+  if (_pendingStart || _nativeSession) {
+    const pending = _pendingStart;
+    const session = pending?.session ?? _nativeSession;
+    _pendingStart = null;
+    if (session) {
+      const shouldStop = Boolean(session.startInvoked && !session.stopStarted);
+      void beginNativeSessionAbort(session, shouldStop ? (pending?.promise ?? null) : null, shouldStop);
+    }
+  }
+  if (_pendingRemoteStart && !_pendingRemoteStart.aborted) {
+    const eager = _pendingRemoteStart;
+    _pendingRemoteStart = null;
+    eager.aborted = true;
+    cancelRemoteVoiceCapturePrime();
+    if (eager.listeningNotified) {
+      eager.listeningNotified = false;
+      eager.onListeningChange?.(false);
+    }
+    if (eager.adoptedOwner) {
+      retireOwner(eager.adoptedOwner);
+    }
+    eager.resolveHandoff();
+    eager.resolveDone();
+  }
+  if (_pendingRemoteAbort) {
+    const ctrl = _pendingRemoteAbort;
+    _pendingRemoteAbort = null;
+    ctrl.abort();
+  }
+  if (_activeRemoteSession) {
+    const active = _activeRemoteSession;
+    _activeRemoteSession = null;
+    retireOwner(active.owner);
+    void beginPendingRemoteStop(active.handle, active.owner, active.generation, true);
+  }
+  if (_pendingFinalizeAbort) {
+    const abortFinalize = _pendingFinalizeAbort;
+    _pendingFinalizeAbort = null;
+    abortFinalize();
+  }
+  if (!_activeOwner && !_listening && !_pendingStart && !_activeRemoteSession) {
+    setActiveVoiceService(null);
+  }
+  syncTtsVoiceSuppression();
+}
+
+subscribeVoiceHotwordsChange(() => {
+  const nextScope = getVoiceHotwordsScopeSnapshot();
+  if (
+    nextScope.accountKey === _lastObservedAuthScope.accountKey
+    && nextScope.epoch === _lastObservedAuthScope.epoch
+  ) {
+    return;
+  }
+  _lastObservedAuthScope = nextScope;
+  invalidateVoiceSessionsOnAuthScopeChange();
+});
 
 function trackPendingFinalize(promise: Promise<void>): Promise<void> {
   _pendingFinalizePromise = promise;
@@ -904,11 +1005,13 @@ function createCaptureOwner(
   onListeningChange?: (listening: boolean) => void,
   onError?: (error: string) => void,
   hotwords?: CompiledVoiceHotwords,
+  scope: VoiceHotwordsScopeSnapshot = getVoiceHotwordsScopeSnapshot(),
 ): CaptureOwner {
   return {
     id: ++_ownerSeq,
     retired: false,
     ...(hotwords ? { hotwords } : {}),
+    scope,
     onResult,
     onListeningChange: onListeningChange ?? null,
     onError: onError ?? null,
@@ -916,7 +1019,10 @@ function createCaptureOwner(
 }
 
 function isOwnerCurrent(owner: CaptureOwner | null): boolean {
-  return !!owner && !owner.retired && _activeOwner === owner;
+  return !!owner
+    && !owner.retired
+    && _activeOwner === owner
+    && (!owner.scope || isVoiceHotwordsScopeValid(owner.scope));
 }
 
 function setOwnerListening(owner: CaptureOwner | null, next: boolean): void {
@@ -1119,7 +1225,8 @@ async function attachSessionListeners(
     && !session.retired
     && !session.aborted
     && !session.owner.retired
-    && _nativeSession === session;
+    && _nativeSession === session
+    && isSessionScopeValid(session);
 
   const registrations: Array<readonly [any, (data: any) => void]> = [
     ['partialResults', (data: { matches?: string[]; isFinal?: boolean }) => {
@@ -1182,25 +1289,23 @@ async function attachSessionListeners(
         void cleanupSessionListeners(session);
         _generation++;
         if (hadCapture) {
-          _primedOutcome = {
+          recordPrimedOutcome({
             generation: _generation,
             error: null,
             text: bufferedText,
             endedWithCapture: true,
-            accountKey: session.accountKey,
-            scopeEpoch: session.scopeEpoch,
+            session,
             startedHotwordsKey: session.startedHotwordsKey,
-          };
+          });
         } else {
           clearPrewarmCaches();
-          _primedOutcome = {
+          recordPrimedOutcome({
             generation: _generation,
             error: _lastError ?? 'Speech recognition stopped before capture started',
             text: null,
             endedWithCapture: false,
-            accountKey: session.accountKey,
-            scopeEpoch: session.scopeEpoch,
-          };
+            session,
+          });
         }
         setOwnerListening(session.owner, false);
         retireOwner(session.owner);
@@ -1227,12 +1332,13 @@ async function attachSessionListeners(
         if (_pendingStart?.session === session) _pendingStart = null;
         void cleanupSessionListeners(session);
         _generation++;
-        _primedOutcome = {
+        recordPrimedOutcome({
           generation: _generation,
           error: message,
           text: null,
           endedWithCapture: false,
-        };
+          session,
+        });
         setOwnerListening(session.owner, false);
         retireOwner(session.owner);
         return;
@@ -1675,7 +1781,8 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
     generation === _generation
     && !session.retired
     && !session.aborted
-    && !session.owner.retired;
+    && !session.owner.retired
+    && isSessionScopeValid(session);
 
   const prevSession = _nativeSession;
   if (!isSessionStarting()) return false;
@@ -2027,7 +2134,13 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
       if (session.primed) {
         clearPrewarmCaches();
         _generation++;
-        _primedOutcome = { generation: _generation, error: mapped, text: null, endedWithCapture: false };
+        recordPrimedOutcome({
+          generation: _generation,
+          error: mapped,
+          text: null,
+          endedWithCapture: false,
+          session,
+        });
       } else {
         reportOwnerError(session.owner, mapped);
       }
@@ -2222,14 +2335,13 @@ function startWebListening(
             clearWebRecHandlers(rec);
             if (_webSession === session) _webSession = null;
             _generation++;
-            _primedOutcome = {
+            recordPrimedOutcome({
               generation: _generation,
               error: mapped,
               text: null,
               endedWithCapture: false,
-              accountKey: session.accountKey,
-              scopeEpoch: session.scopeEpoch,
-            };
+              session,
+            });
             retireOwner(session.owner);
             stopWebLevelMeter();
             try { rec.abort?.(); } catch { /* already ended */ }
@@ -2252,14 +2364,13 @@ function startWebListening(
         if (_webSession === session) _webSession = null;
         _generation++;
         if (session.primed) {
-          _primedOutcome = {
+          recordPrimedOutcome({
             generation: _generation,
             error: err,
             text: null,
             endedWithCapture: false,
-            accountKey: session.accountKey,
-            scopeEpoch: session.scopeEpoch,
-          };
+            session,
+          });
           retireOwner(session.owner);
           stopWebLevelMeter();
           return;
@@ -2279,15 +2390,14 @@ function startWebListening(
       if (_webSession === session) _webSession = null;
       _generation++;
       if (session.primed) {
-        _primedOutcome = {
+        recordPrimedOutcome({
           generation: _generation,
           error: null,
           text: session.lastText || null,
           endedWithCapture: true,
-          accountKey: session.accountKey,
-          scopeEpoch: session.scopeEpoch,
+          session,
           startedHotwordsKey: '',
-        };
+        });
         setOwnerListening(session.owner, false);
         retireOwner(session.owner);
         stopWebLevelMeter();
@@ -2327,7 +2437,13 @@ function startWebListening(
         }
         const timeoutErr = 'Speech recognition timed out';
         if (session.primed) {
-          _primedOutcome = { generation: _generation, error: timeoutErr, text: null, endedWithCapture: false };
+          recordPrimedOutcome({
+            generation: _generation,
+            error: timeoutErr,
+            text: null,
+            endedWithCapture: false,
+            session,
+          });
           retireOwner(currentOwner);
           return;
         }
@@ -2350,14 +2466,13 @@ function startWebListening(
       _webSession = null;
     }
     if (primed) {
-      _primedOutcome = {
+      recordPrimedOutcome({
         generation: ++_generation,
         error: mapped,
         text: null,
         endedWithCapture: false,
-        accountKey: scope.accountKey,
-        scopeEpoch: scope.epoch,
-      };
+        scope,
+      });
       setOwnerListening(owner, false);
       retireOwner(owner);
       return false;
@@ -2673,7 +2788,7 @@ function consumePrimedOutcome(
     ) {
       return { handled: false };
     }
-    const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords);
+    const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords, expectedScope);
     claimActiveOwner(owner);
     setActiveVoiceService(buildLocalActiveService({ isFallback }));
     setOwnerListening(owner, true);
@@ -2981,6 +3096,7 @@ export async function startListening(
     });
     const eager: EagerRemoteStartState = {
       intent: startIntent,
+      scope: sessionCtx.scope,
       aborted: false,
       releasedToSend: false,
       captureStarted: false,
@@ -3091,7 +3207,7 @@ export async function startListening(
 
     if (route.route === 'remote') {
       setActiveVoiceService(buildRemoteActiveService(route.provider));
-      const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
+      const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords, sessionCtx.scope);
       let resolvePreReadyWait!: () => void;
       owner.pendingPreReadyWait = new Promise<void>((res) => {
         resolvePreReadyWait = res;
@@ -3116,9 +3232,8 @@ export async function startListening(
         if (!isVoiceHotwordsScopeValid(sessionCtx.scope)) {
           return { valid: false };
         }
-        const liveHotwords = getCompiledVoiceHotwordsForProject(sessionCtx.projectKey);
-        const resolvedTerms = resolveRemoteVoiceHotwordsForProvider(route.provider, liveHotwords);
         const liveAllowShared = getShareHotwordsWithOthers();
+        const resolvedTerms = resolveRemoteVoiceHotwordsForProvider(route.provider, compiledHotwords, liveAllowShared);
         return {
           valid: true,
           ...(resolvedTerms ? { hotwords: resolvedTerms } : {}),
@@ -3144,7 +3259,13 @@ export async function startListening(
             if (_pendingRemoteAbort === abortCtrl) {
               _pendingRemoteAbort = null;
             }
-            if (eager.aborted || (!eager.releasedToSend && startIntent < _lastStopIntent) || abortCtrl.signal.aborted || !isOwnerCurrent(owner)) {
+            if (
+              eager.aborted
+              || !isVoiceHotwordsScopeValid(sessionCtx.scope)
+              || (!eager.releasedToSend && startIntent < _lastStopIntent)
+              || abortCtrl.signal.aborted
+              || !isOwnerCurrent(owner)
+            ) {
               syncTtsVoiceSuppression();
               void handle.stop(true);
               return;
@@ -3177,6 +3298,10 @@ export async function startListening(
             if (_activeRemoteSession?.generation === generation) {
               _activeRemoteSession = null;
               _generation++;
+              if (!isOwnerCurrent(owner)) {
+                _listening = false;
+                syncTtsVoiceSuppression();
+              }
               setOwnerListening(owner, false);
               retireOwner(owner);
             }
@@ -3196,6 +3321,9 @@ export async function startListening(
             }
           },
           onFallback: (reason, info?: RemoteVoiceFallbackInfo) => {
+            if (!isVoiceHotwordsScopeValid(sessionCtx.scope)) {
+              return false;
+            }
             const isActiveMidSession = _activeRemoteSession?.generation === generation && isOwnerCurrent(owner);
             const isPostStopFallback = Boolean(info?.stoppedByCaller) && isOwnerCurrent(owner);
             if (!isActiveMidSession && !isPostStopFallback) return false;
@@ -3250,7 +3378,14 @@ export async function startListening(
       }
       syncTtsVoiceSuppression();
 
-      if ((eager.releasedToSend || owner.normalStopRequested) && captureStarted && res.ok) {
+      if (
+        (eager.releasedToSend || owner.normalStopRequested)
+        && captureStarted
+        && res.ok
+        && !eager.aborted
+        && isVoiceHotwordsScopeValid(sessionCtx.scope)
+        && isOwnerCurrent(owner)
+      ) {
         if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
         owner.resolvePreReadyWait?.();
         eager.resolveHandoff();
@@ -3264,7 +3399,14 @@ export async function startListening(
         context?: HotwordsSessionContext;
       } | null;
 
-      if (res.cancelled || (!res.ok && res.reason === 'auth_scope_changed') || eager.aborted || (!captureStarted && !eager.releasedToSend && !owner.normalStopRequested && startIntent < _lastStopIntent) || !isOwnerCurrent(owner)) {
+      if (
+        res.cancelled
+        || (!res.ok && res.reason === 'auth_scope_changed')
+        || eager.aborted
+        || !isVoiceHotwordsScopeValid(sessionCtx.scope)
+        || (!captureStarted && !eager.releasedToSend && !owner.normalStopRequested && startIntent < _lastStopIntent)
+        || !isOwnerCurrent(owner)
+      ) {
         if (_pendingRemoteStart === eager) _pendingRemoteStart = null;
         owner.resolvePreReadyWait?.();
         if (res.ok) {
@@ -3417,8 +3559,8 @@ export async function startListening(
         eager.resolveDone();
         return false;
       }
-      if (initialPcm.length > 0 && canFinalizeBufferedPcm() && !eager.aborted) {
-        const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords);
+      if (initialPcm.length > 0 && canFinalizeBufferedPcm() && !eager.aborted && isVoiceHotwordsScopeValid(sessionCtx.scope)) {
+        const owner = createCaptureOwner(onResult, onListeningChange, onError, compiledHotwords, sessionCtx.scope);
         owner.notifiedListening = false;
         claimActiveOwner(owner);
         const finalizeCtrl = new AbortController();
@@ -3556,7 +3698,7 @@ async function startLocalListening(
         return false;
       }
     }
-    const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords);
+    const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords, effectiveScope);
     if (alreadyNotifiedListening) {
       owner.notifiedListening = true;
     }
@@ -3674,7 +3816,7 @@ async function startLocalListening(
     }
   }
 
-  const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords);
+  const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords, effectiveScope);
   if (alreadyNotifiedListening) {
     owner.notifiedListening = true;
   }

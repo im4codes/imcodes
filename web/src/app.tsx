@@ -9185,6 +9185,7 @@ function InternalMainApp() {
     const authState: AuthState = { userId, baseUrl: url };
     const nextGeneration = authMutationGenerationRef.current + 1;
     authMutationGenerationRef.current = nextGeneration;
+    configureApi(url);
     configureExpectedUserId(userId);
     setFileRelayUser(userId);
     setServerR2RelayEnabled(r2RelayEnabled === true);

@@ -53,6 +53,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
 });
 
 import * as VoiceInput from '../src/components/VoiceInput.js';
+import { configure as configureApi, configureExpectedUserId } from '../src/api.js';
 import { VoiceOverlay } from '../src/components/VoiceOverlay.js';
 import { SharedVoiceSection } from '../src/components/SharedVoiceSection.js';
 import {
@@ -4333,6 +4334,125 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       wsProjB.emitMessage({ type: 'voice.session.end', sessionId: frameB.sessionId });
       await VoiceInput.stopListening({ abort: true });
     } finally {
+      resetVoiceHotwordsScopeForTesting();
+    }
+  });
+
+  it('syncs auth scope synchronously on configureExpectedUserId, aborts in-flight ready waits, and keeps single hotword snapshot per remote recording', async () => {
+    setupFakeWebAudio();
+    FakeWebSocket.instances.length = 0;
+
+    try {
+      const sharedProvider: RemoteVoiceProvidersSnapshot['providers'][number] = {
+        deviceId: 'other-mac',
+        displayName: 'Shared Mac',
+        model: 'qwen3-1.7b',
+        modelLabel: 'Qwen3-ASR 1.7B',
+        ready: true,
+        busy: false,
+        shareScope: 'server',
+        providerKind: 'pc_app',
+        isOwnDevice: false,
+      };
+      const snapshot: RemoteVoiceProvidersSnapshot = {
+        primaryDeviceId: 'other-mac',
+        canManageServerSharing: false,
+        canShareOwnProviderToServer: false,
+        providers: [sharedProvider],
+      };
+      resetRemoteVoiceClientForTesting({ primaryDeviceId: 'other-mac', fetchedAt: Date.now(), providers: [sharedProvider] });
+      apiMocks.fetchRemoteVoiceProviders.mockResolvedValue(snapshot);
+
+      // 1. Synchronous configureExpectedUserId transition (no direct setVoiceHotwordsAuthScope)
+      //    immediately invalidates an in-flight ticket before WebSocket connects.
+      configureApi('https://relay.example');
+      configureExpectedUserId('user-a');
+      setProjectVoiceHotwordsRaw('proj-a', 'SecretA');
+      setShareHotwordsWithOthers(true);
+
+      let resolveTicketSync!: (v: { ticket: string }) => void;
+      apiMocks.fetchRemoteVoiceWsTicket.mockImplementationOnce(
+        () => new Promise<{ ticket: string }>((res) => { resolveTicketSync = res; }),
+      );
+      const startSyncSwitch = VoiceInput.startListening(vi.fn(), undefined, undefined, { projectKey: 'proj-a' });
+      await waitFor(() => expect(resolveTicketSync).toBeTypeOf('function'));
+      configureExpectedUserId('user-b');
+      resolveTicketSync({ ticket: 'tkt-sync-auth' });
+      await expect(startSyncSwitch).resolves.toBe(false);
+      expect(FakeWebSocket.instances).toHaveLength(0);
+
+      // 2. Account switch AFTER voice.session.start was sent while awaiting voice.session.ready:
+      //    immediately aborts WS, blocks late ready/result frames, and never triggers local fallback.
+      configureExpectedUserId('user-a');
+      setProjectVoiceHotwordsRaw('proj-a', 'SecretA');
+      setShareHotwordsWithOthers(true);
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-mid-ready' });
+      const onResMid = vi.fn();
+      const onListenMid = vi.fn();
+      const startMidReady = VoiceInput.startListening(onResMid, onListenMid, undefined, { projectKey: 'proj-a' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+      const wsMid = FakeWebSocket.instances[0]!;
+      wsMid.emitOpen();
+      const frameMid = JSON.parse(wsMid.sent[0]!) as Record<string, unknown>;
+      expect(frameMid.type).toBe('voice.session.start');
+
+      configureExpectedUserId('user-b');
+      expect(wsMid.closedWith).not.toBeNull();
+      expect(wsMid.sent.some((raw) => JSON.parse(raw).type === 'voice.session.abort')).toBe(true);
+      wsMid.emitMessage({ type: 'voice.session.ready', sessionId: frameMid.sessionId });
+      wsMid.emitMessage({ type: 'voice.session.result', sessionId: frameMid.sessionId, text: 'SecretA leak', isFinal: true });
+      await expect(startMidReady).resolves.toBe(false);
+      expect(onResMid).not.toHaveBeenCalled();
+      expect(streamingBridge.start).not.toHaveBeenCalled();
+      expect(platformBridge.start).not.toHaveBeenCalled();
+
+      // 3. Hotwords edited X -> Y while fetchRemoteVoiceWsTicket is suspended:
+      //    sent frame, post-processing, and active-handle reuse key all stay bound to snapshot X,
+      //    then next recording for Y closes X and starts Y.
+      configureExpectedUserId('user-a');
+      setShareHotwordsWithOthers(true);
+      setProjectVoiceHotwordsRaw('proj-a', 'OldTerm\nold alias => OldTerm');
+
+      let resolveTicketEdit!: (v: { ticket: string }) => void;
+      apiMocks.fetchRemoteVoiceWsTicket.mockImplementationOnce(
+        () => new Promise<{ ticket: string }>((res) => { resolveTicketEdit = res; }),
+      );
+      const resX = vi.fn();
+      const startX = VoiceInput.startListening(resX, undefined, undefined, { projectKey: 'proj-a' });
+      await waitFor(() => expect(resolveTicketEdit).toBeTypeOf('function'));
+
+      // User updates proj-a from X -> Y before ticket returns
+      setProjectVoiceHotwordsRaw('proj-a', 'NewTerm\nnew alias => NewTerm');
+      resolveTicketEdit({ ticket: 'tkt-edit-xy' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(2));
+      const wsX = FakeWebSocket.instances[1]!;
+      wsX.emitOpen();
+      const frameX = JSON.parse(wsX.sent[0]!) as Record<string, unknown>;
+      expect(frameX.hotwords).toEqual(['OldTerm']);
+      wsX.emitMessage({ type: 'voice.session.ready', sessionId: frameX.sessionId });
+      await expect(startX).resolves.toBe(true);
+      wsX.emitMessage({ type: 'voice.session.result', sessionId: frameX.sessionId, text: 'run old alias', isFinal: true });
+      expect(resX).toHaveBeenLastCalledWith('run OldTerm', true);
+
+      // Next start sees Y !== X (no stale reuse of active wsX), closes wsX, and sends Y
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-edit-y' });
+      const resY = vi.fn();
+      const startY = VoiceInput.startListening(resY, undefined, undefined, { projectKey: 'proj-a' });
+      await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(3));
+      expect(wsX.closedWith).not.toBeNull();
+      const wsY = FakeWebSocket.instances[2]!;
+      wsY.emitOpen();
+      const frameY = JSON.parse(wsY.sent[0]!) as Record<string, unknown>;
+      expect(frameY.hotwords).toEqual(['NewTerm']);
+      wsY.emitMessage({ type: 'voice.session.ready', sessionId: frameY.sessionId });
+      await expect(startY).resolves.toBe(true);
+      wsY.emitMessage({ type: 'voice.session.result', sessionId: frameY.sessionId, text: 'run new alias', isFinal: true });
+      expect(resY).toHaveBeenLastCalledWith('run NewTerm', true);
+      wsY.emitMessage({ type: 'voice.session.end', sessionId: frameY.sessionId });
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
+      configureExpectedUserId(null);
+      configureApi('');
       resetVoiceHotwordsScopeForTesting();
     }
   });

@@ -36,6 +36,7 @@ import {
 } from './upload-suspend-wait.js';
 import { FILE_RELAY_MODE, R2_RELAY_API, R2_RELAY_PHASE, R2_RELAY_ERROR, type R2RelayProgress, type R2RelayReady } from '@shared/r2-relay.js';
 import { isServerR2RelayEnabled, readFileRelayMode, setFileRelayUser } from './r2-relay-preference.js';
+import { setVoiceHotwordsAuthScope } from './voice-hotwords.js';
 /**
  * Fetch wrapper with cookie-based auth for the IM.codes API.
  * Credentials are sent automatically via HttpOnly cookie.
@@ -189,9 +190,19 @@ export function getApiKey(): string | null {
  * requests carry this snapshot so an origin-wide cookie changed by another tab
  * cannot silently execute work under a different account.
  */
+function syncVoiceHotwordsAuthScopeFromApi(): void {
+  if (_expectedUserId) {
+    const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '';
+    setVoiceHotwordsAuthScope({ userId: _expectedUserId, baseUrl: _baseUrl || origin || null });
+  } else {
+    setVoiceHotwordsAuthScope(null);
+  }
+}
+
 export function configureExpectedUserId(userId: string | null): void {
   _expectedUserId = typeof userId === 'string' ? (userId.trim() || null) : null;
   setFileRelayUser(_expectedUserId);
+  syncVoiceHotwordsAuthScopeFromApi();
 }
 
 export function getExpectedUserId(): string | null {
@@ -244,6 +255,9 @@ async function getAuthTelemetryHeaders(): Promise<AuthTelemetryHeaders> {
 
 export function configure(baseUrl: string): void {
   _baseUrl = baseUrl.replace(/\/$/, '');
+  if (_expectedUserId) {
+    syncVoiceHotwordsAuthScopeFromApi();
+  }
 }
 
 /** Return the configured API base URL, or the current origin when same-origin. */

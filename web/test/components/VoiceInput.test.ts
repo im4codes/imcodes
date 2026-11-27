@@ -2502,4 +2502,56 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('aborts pending native permission await on account switch and preserves same-account primed errors', async () => {
+    const origCap = (globalThis as any).Capacitor;
+    (globalThis as any).Capacitor = {
+      isNativePlatform: () => true,
+      isPluginAvailable: () => true,
+      getPlatform: () => 'ios',
+    };
+    const hotwordsMod = await import('../../src/voice-hotwords.js');
+    hotwordsMod.resetVoiceHotwordsScopeForTesting();
+
+    try {
+      // 1. Account switch during pending requestPermissions() prevents native start() from running.
+      hotwordsMod.setVoiceHotwordsAuthScope({ userId: 'user-a', baseUrl: 'https://srv.example' });
+      hotwordsMod.setProjectVoiceHotwordsRaw('proj-a', 'SecretA');
+
+      const permDeferred = deferred<{ speechRecognition: 'granted' | 'denied' | 'prompt' }>();
+      streamingApi.requestPermissions.mockReturnValueOnce(permDeferred.promise);
+
+      const resA = vi.fn();
+      const errA = vi.fn();
+      const startP = VoiceInput.startListening(resA, undefined, errA, { projectKey: 'proj-a' });
+      await waitFor(() => expect(streamingApi.requestPermissions).toHaveBeenCalledTimes(1));
+
+      hotwordsMod.setVoiceHotwordsAuthScope({ userId: 'user-b', baseUrl: 'https://srv.example' });
+      permDeferred.resolve({ speechRecognition: 'granted' });
+
+      await expect(startP).resolves.toBe(false);
+      expect(streamingApi.start).not.toHaveBeenCalled();
+      expect(resA).not.toHaveBeenCalled();
+
+      // 2. Primed start failure (recognitionError / start reject) preserves scope so same-account adopt surfaces error.
+      hotwordsMod.setVoiceHotwordsAuthScope({ userId: 'user-a', baseUrl: 'https://srv.example' });
+      streamingApi.requestPermissions.mockResolvedValue({ speechRecognition: 'granted' });
+      await VoiceInput.prewarm({ requestPermission: false });
+
+      streamingApi.start.mockRejectedValueOnce(new Error('permission_denied'));
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true, projectKey: 'proj-a' })).toBe(true);
+      await waitFor(() => expect(streamingApi.start).toHaveBeenCalledTimes(1));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      const errSame = vi.fn();
+      await expect(VoiceInput.startListening(vi.fn(), undefined, errSame, { projectKey: 'proj-a' })).resolves.toBe(false);
+      expect(errSame).toHaveBeenCalledWith('permission_denied');
+      expect(streamingApi.start).toHaveBeenCalledTimes(1);
+    } finally {
+      await VoiceInput.stopListening({ abort: true });
+      hotwordsMod.resetVoiceHotwordsScopeForTesting();
+      (globalThis as any).Capacitor = origCap;
+    }
+  });
+
 });
