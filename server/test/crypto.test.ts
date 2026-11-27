@@ -1,5 +1,15 @@
 import { describe, it, expect } from 'vitest';
-import { sha256Hex, randomHex, signJwt, verifyJwt, encryptBotConfig, decryptBotConfig, timingSafeEqual } from '../src/security/crypto.js';
+import {
+  sha256Hex,
+  randomHex,
+  signJwt,
+  verifyJwt,
+  encryptBotConfig,
+  decryptBotConfig,
+  encryptAliasField,
+  decryptAliasField,
+  timingSafeEqual,
+} from '../src/security/crypto.js';
 
 const KEY = 'test-signing-key-32-bytes-xxxxxxx';
 const ENC_KEY = 'test-encryption-key-32-bytes-xxx';
@@ -97,5 +107,49 @@ describe('timingSafeEqual', () => {
   it('compares UTF-8 byte lengths safely for equal-char-length multibyte strings without throwing', () => {
     expect(timingSafeEqual('aé', 'ab')).toBe(false);
     expect(timingSafeEqual('café', 'café')).toBe(true);
+  });
+});
+
+describe('AES-256-GCM alias field encryption', () => {
+  it('encrypts and decrypts value and description with random IVs', () => {
+    const a = encryptAliasField('ssh root@10.0.0.1', ENC_KEY, 'user-1', 'value');
+    const b = encryptAliasField('ssh root@10.0.0.1', ENC_KEY, 'user-1', 'value');
+    expect(a).not.toBe(b);
+    expect(a).not.toContain('10.0.0.1');
+    expect(decryptAliasField(a, ENC_KEY, 'user-1', 'value')).toBe('ssh root@10.0.0.1');
+
+    const desc = encryptAliasField('生产环境主库 🔐', ENC_KEY, 'user-1', 'description');
+    expect(decryptAliasField(desc, ENC_KEY, 'user-1', 'description')).toBe('生产环境主库 🔐');
+  });
+
+  it('supports empty string plaintext', () => {
+    const enc = encryptAliasField('', ENC_KEY, 'user-1', 'description');
+    expect(Buffer.from(enc, 'base64').length).toBe(12 + 16);
+    expect(decryptAliasField(enc, ENC_KEY, 'user-1', 'description')).toBe('');
+  });
+
+  it('fails closed on missing/blank key, wrong key, or tampered ciphertext', () => {
+    expect(() => encryptAliasField('secret', '', 'user-1', 'value')).toThrow('alias_encryption_unavailable');
+    expect(() => encryptAliasField('secret', '   ', 'user-1', 'value')).toThrow('alias_encryption_unavailable');
+
+    const enc = encryptAliasField('secret', ENC_KEY, 'user-1', 'value');
+    expect(() => decryptAliasField(enc, '', 'user-1', 'value')).toThrow('alias_encryption_unavailable');
+    expect(() => decryptAliasField(enc, 'wrong-key', 'user-1', 'value')).toThrow('alias_decryption_failed');
+    expect(() => decryptAliasField('AAAA', ENC_KEY, 'user-1', 'value')).toThrow('alias_decryption_failed');
+
+    const buf = Buffer.from(enc, 'base64');
+    buf[buf.length - 1] ^= 0xff;
+    expect(() => decryptAliasField(buf.toString('base64'), ENC_KEY, 'user-1', 'value')).toThrow('alias_decryption_failed');
+  });
+
+  it('enforces AAD binding to userId and field (blocks cross-user replay and field swap)', () => {
+    const encValue = encryptAliasField('top-secret', ENC_KEY, 'user-a', 'value');
+    expect(() => decryptAliasField(encValue, ENC_KEY, 'user-b', 'value')).toThrow('alias_decryption_failed');
+    expect(() => decryptAliasField(encValue, ENC_KEY, 'user-a', 'description')).toThrow('alias_decryption_failed');
+  });
+
+  it('uses domain separation from encryptBotConfig', () => {
+    const botBlob = encryptBotConfig({ v: 'secret' }, ENC_KEY);
+    expect(() => decryptAliasField(botBlob, ENC_KEY, 'user-1', 'value')).toThrow('alias_decryption_failed');
   });
 });

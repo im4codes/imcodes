@@ -13,7 +13,7 @@ import {
   type VerificationMachineCursor,
 } from '../db/verification-machine-queries.js';
 import { listControlledMachines } from './machines.js';
-import { getAliasById } from '../db/alias-queries.js';
+import { aliasExistsById } from '../db/alias-queries.js';
 import {
   VERIFICATION_MACHINE_KINDS,
   VERIFICATION_MACHINE_LIMITS,
@@ -157,7 +157,7 @@ verificationMachineRoutes.put('/', async (c) => {
     }
   } else {
     const target = normalizeVerificationMachineTarget(String(body.target));
-    if (!(await getAliasById(c.env.DB, userId, target))) {
+    if (!(await aliasExistsById(c.env.DB, userId, target))) {
       return c.json({ error: 'verification_machine_target_unauthorized' }, 403);
     }
   }

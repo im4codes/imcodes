@@ -105,6 +105,77 @@ export function decryptBotConfig(encrypted: string, encryptionKey: string): Reco
   }
 }
 
+// ── AES-256-GCM user alias field encryption ──────────────────────────────────
+// Uses a domain-separated 256-bit key derived from BOT_ENCRYPTION_KEY via HMAC-SHA256
+// and binds AAD to (user_id, field) so ciphertexts cannot be replayed across users
+// or swapped between `value` and `description`.
+// Format: base64(iv[12] || ciphertext || authTag[16])
+
+const ALIAS_KEY_DOMAIN = 'imcodes:user_aliases:v1';
+
+export type AliasEncryptedField = 'value' | 'description';
+
+function deriveAliasAesKey(encryptionKey: string): Buffer {
+  if (!encryptionKey || !encryptionKey.trim()) {
+    throw new Error('alias_encryption_unavailable');
+  }
+  return createHmac('sha256', encryptionKey).update(ALIAS_KEY_DOMAIN, 'utf8').digest();
+}
+
+function aliasFieldAad(userId: string, field: AliasEncryptedField): Buffer {
+  if (!userId) throw new Error('alias_encryption_unavailable');
+  return Buffer.from(`user_aliases:v1:${userId}:${field}`, 'utf8');
+}
+
+/**
+ * Encrypt a single user alias field (`value` or `description`) with AES-256-GCM,
+ * fresh 12-byte random IV, and AAD bound to `(userId, field)`.
+ */
+export function encryptAliasField(
+  plaintext: string,
+  encryptionKey: string,
+  userId: string,
+  field: AliasEncryptedField,
+): string {
+  const key = deriveAliasAesKey(encryptionKey);
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  cipher.setAAD(aliasFieldAad(userId, field));
+  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+  return Buffer.concat([iv, ciphertext, authTag]).toString('base64');
+}
+
+/**
+ * Decrypt a single user alias field (`value` or `description`) encrypted by
+ * {@link encryptAliasField}. Fails closed on missing key, wrong key, wrong AAD,
+ * or tampered/corrupted ciphertext.
+ */
+export function decryptAliasField(
+  encoded: string,
+  encryptionKey: string,
+  userId: string,
+  field: AliasEncryptedField,
+): string {
+  const key = deriveAliasAesKey(encryptionKey);
+  const combined = Buffer.from(encoded, 'base64');
+  if (combined.length < 12 + 16) {
+    throw new Error('alias_decryption_failed');
+  }
+  const iv = combined.subarray(0, 12);
+  const authTag = combined.subarray(combined.length - 16);
+  const ciphertext = combined.subarray(12, combined.length - 16);
+  try {
+    const decipher = createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAAD(aliasFieldAad(userId, field));
+    decipher.setAuthTag(authTag);
+    const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    return plaintext.toString('utf8');
+  } catch {
+    throw new Error('alias_decryption_failed');
+  }
+}
+
 /** Constant-time string comparison */
 export function timingSafeEqual(a: string, b: string): boolean {
   const bufA = Buffer.from(a, 'utf8');

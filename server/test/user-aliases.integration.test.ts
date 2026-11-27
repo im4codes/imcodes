@@ -3,16 +3,20 @@
  * testcontainers (managed by test/setup/integration-global.ts).
  *
  * Covers the storage contract:
- *   - migration 048 applies; UNIQUE(user_id, name); FK → users ON DELETE CASCADE
+ *   - migration 048 + 119 apply idempotently; UNIQUE(user_id, name); FK -> users ON DELETE CASCADE
  *   - upsert / get-by-name / delete / list (ORDER BY name ASC, bounded limit)
- *   - server-side value normalization (CRLF→LF, NFC) via the shared helpers
- *   - list `q` filter matches name + description as a LITERAL substring, with
- *     `%` / `_` / `\` escaped (a stored literal `%`/`_` is NOT a wildcard)
- *   - strict per-user scoping: user A cannot read/write user B's aliases
+ *   - AES-256-GCM at-rest encryption of `value` and `description` (encryption_version = 1)
+ *   - server-side value normalization (CRLF->LF, NFC) via the shared helpers
+ *   - list `q` filter matches name + decrypted description as a LITERAL substring
+ *   - idempotent startup migration `migratePlaintextAliasesToEncrypted` + concurrency guard
+ *   - strict per-user scoping and AAD tampering fail-closed behavior
  *
  * The alias `value` is never asserted into a log line.
  */
 
+import { readFile } from 'node:fs/promises';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
@@ -23,8 +27,14 @@ import {
   getAliasByName,
   deleteAlias,
   listAliases,
+  migratePlaintextAliasesToEncrypted,
   ALIAS_LIST_LIMIT,
+  ALIAS_ENCRYPTION_VERSION_PLAINTEXT,
+  ALIAS_ENCRYPTION_VERSION_AES_GCM,
 } from '../src/db/alias-queries.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const TEST_ENC_KEY = 'integration-test-bot-encryption-key-32bytes';
 
 let db: Database;
 
@@ -44,14 +54,26 @@ async function freshUser(): Promise<string> {
 }
 
 describe('user_aliases migration', () => {
-  it('creates the table with the expected columns', async () => {
+  it('creates the table with expected columns, encryption_version, and partial index', async () => {
     const rows = await db.query<{ column_name: string }>(
       `SELECT column_name FROM information_schema.columns WHERE table_name = 'user_aliases'`,
     );
     const cols = new Set(rows.map((r) => r.column_name));
-    for (const col of ['id', 'user_id', 'name', 'value', 'description', 'tags', 'source', 'created_at', 'updated_at']) {
+    for (const col of [
+      'id', 'user_id', 'name', 'value', 'description', 'tags', 'source',
+      'encryption_version', 'created_at', 'updated_at',
+    ]) {
       expect(cols.has(col)).toBe(true);
     }
+
+    const indexes = await db.query<{ indexname: string }>(
+      `SELECT indexname FROM pg_indexes WHERE tablename = 'user_aliases'`,
+    );
+    expect(indexes.some((r) => r.indexname === 'idx_user_aliases_unencrypted')).toBe(true);
+
+    // Re-running 119 DDL is idempotent (safe on retry after partial DDL).
+    const ddl = await readFile(join(__dirname, '../src/db/migrations/119_user_aliases_encryption.sql'), 'utf8');
+    await expect(db.exec(ddl)).resolves.toBeUndefined();
   });
 
   it('enforces UNIQUE(user_id, name)', async () => {
@@ -73,7 +95,7 @@ describe('user_aliases migration', () => {
 
   it('cascades on user delete (FK ON DELETE CASCADE)', async () => {
     const userId = await freshUser();
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'gone', value: 'v', source: 'web' });
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'gone', value: 'v', source: 'web' }, TEST_ENC_KEY);
     await db.execute('DELETE FROM users WHERE id = $1', [userId]);
     const remaining = await db.query<{ cnt: number }>(
       'SELECT COUNT(*)::int AS cnt FROM user_aliases WHERE user_id = $1',
@@ -83,8 +105,8 @@ describe('user_aliases migration', () => {
   });
 });
 
-describe('alias-queries roundtrip', () => {
-  it('upsert / get-by-name returns canonical fields with stable id and no user_id', async () => {
+describe('alias-queries roundtrip & at-rest encryption', () => {
+  it('stores ciphertext at rest (encryption_version = 1) and decrypts transparently', async () => {
     const userId = await freshUser();
     const created = await upsertAlias(db, {
       id: randomHex(16),
@@ -94,7 +116,7 @@ describe('alias-queries roundtrip', () => {
       description: 'prod host',
       tags: ['infra', 'prod'],
       source: 'web',
-    });
+    }, TEST_ENC_KEY);
     expect(created.name).toBe('server');
     expect(created.value).toBe('pron.koca.win');
     expect(created.description).toBe('prod host');
@@ -103,15 +125,27 @@ describe('alias-queries roundtrip', () => {
     expect(new Date(created.createdAt).toISOString()).toBe(created.createdAt);
     expect(created.id).toMatch(/^[a-f0-9]{32}$/u);
     expect(created).not.toHaveProperty('user_id');
+    expect(created).not.toHaveProperty('encryption_version');
 
-    const got = await getAliasByName(db, userId, 'server');
+    const raw = await db.queryOne<{ value: string; description: string | null; encryption_version: number }>(
+      'SELECT value, description, encryption_version FROM user_aliases WHERE user_id = $1 AND name = $2',
+      [userId, 'server'],
+    );
+    expect(raw?.encryption_version).toBe(ALIAS_ENCRYPTION_VERSION_AES_GCM);
+    expect(raw?.value).not.toBe('pron.koca.win');
+    expect(raw?.value).not.toContain('pron.koca.win');
+    expect(raw?.description).not.toBe('prod host');
+    expect(raw?.description).not.toContain('prod host');
+
+    const got = await getAliasByName(db, userId, 'server', TEST_ENC_KEY);
     expect(got?.value).toBe('pron.koca.win');
+    expect(got?.description).toBe('prod host');
     expect(got?.tags).toEqual(['infra', 'prod']);
   });
 
   it('upsert on (user_id, name) updates value/description/tags and preserves created_at', async () => {
     const userId = await freshUser();
-    const first = await upsertAlias(db, { id: randomHex(16), userId, name: 'db', value: 'v1', source: 'web' });
+    const first = await upsertAlias(db, { id: randomHex(16), userId, name: 'db', value: 'v1', source: 'web' }, TEST_ENC_KEY);
     await new Promise((r) => setTimeout(r, 3));
     const second = await upsertAlias(db, {
       id: randomHex(16),
@@ -121,7 +155,7 @@ describe('alias-queries roundtrip', () => {
       description: 'updated',
       tags: ['x'],
       source: 'mcp',
-    });
+    }, TEST_ENC_KEY);
     expect(second.value).toBe('v2');
     expect(second.description).toBe('updated');
     expect(second.tags).toEqual(['x']);
@@ -129,7 +163,7 @@ describe('alias-queries roundtrip', () => {
     expect(second.createdAt).toBe(first.createdAt);
     expect(new Date(second.updatedAt).getTime()).toBeGreaterThanOrEqual(new Date(first.updatedAt).getTime());
 
-    const all = await listAliases(db, userId);
+    const all = await listAliases(db, userId, undefined, TEST_ENC_KEY);
     expect(all).toHaveLength(1); // upsert, not a duplicate row
   });
 
@@ -141,77 +175,241 @@ describe('alias-queries roundtrip', () => {
       name: 'multiline',
       value: 'line1\r\nline2\rline3',
       source: 'web',
-    });
+    }, TEST_ENC_KEY);
     expect(created.value).toBe('line1\nline2\nline3');
   });
 
   it('delete removes the row and reports whether one was removed', async () => {
     const userId = await freshUser();
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'temp', value: 'v', source: 'web' });
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'temp', value: 'v', source: 'web' }, TEST_ENC_KEY);
     expect(await deleteAlias(db, userId, 'temp')).toBe(true);
-    expect(await getAliasByName(db, userId, 'temp')).toBeNull();
+    expect(await getAliasByName(db, userId, 'temp', TEST_ENC_KEY)).toBeNull();
     expect(await deleteAlias(db, userId, 'temp')).toBe(false);
   });
 
   it('list orders by name ASC and honors the bounded limit', async () => {
     const userId = await freshUser();
     for (const name of ['charlie', 'alpha', 'bravo']) {
-      await upsertAlias(db, { id: randomHex(16), userId, name, value: 'v', source: 'web' });
+      await upsertAlias(db, { id: randomHex(16), userId, name, value: 'v', source: 'web' }, TEST_ENC_KEY);
     }
-    const all = await listAliases(db, userId);
+    const all = await listAliases(db, userId, undefined, TEST_ENC_KEY);
     expect(all.map((a) => a.name)).toEqual(['alpha', 'bravo', 'charlie']);
 
-    const limited = await listAliases(db, userId, { limit: 2 });
+    const limited = await listAliases(db, userId, { limit: 2 }, TEST_ENC_KEY);
     expect(limited.map((a) => a.name)).toEqual(['alpha', 'bravo']);
 
     // Limit is clamped to ALIAS_LIST_LIMIT (over-large request does not error).
-    const clamped = await listAliases(db, userId, { limit: ALIAS_LIST_LIMIT + 10_000 });
+    const clamped = await listAliases(db, userId, { limit: ALIAS_LIST_LIMIT + 10_000 }, TEST_ENC_KEY);
     expect(clamped).toHaveLength(3);
+  });
+
+  it('fails closed on missing key, wrong key, cross-user replay, and field swap', async () => {
+    const userA = await freshUser();
+    const userB = await freshUser();
+
+    await expect(
+      upsertAlias(db, { id: randomHex(16), userId: userA, name: 'fail', value: 'secret', source: 'web' }, ''),
+    ).rejects.toThrow('alias_encryption_unavailable');
+
+    await upsertAlias(db, {
+      id: randomHex(16),
+      userId: userA,
+      name: 'secret',
+      value: 'secret-val',
+      description: 'secret-desc',
+      source: 'web',
+    }, TEST_ENC_KEY);
+
+    await expect(getAliasByName(db, userA, 'secret', '')).rejects.toThrow('alias_encryption_unavailable');
+    await expect(getAliasByName(db, userA, 'secret', 'wrong-key')).rejects.toThrow('alias_decryption_failed');
+
+    const rawA = await db.queryOne<{ value: string; description: string }>(
+      'SELECT value, description FROM user_aliases WHERE user_id = $1 AND name = $2',
+      [userA, 'secret'],
+    );
+    const now = Date.now();
+    // Cross-user replay: insert userA's ciphertext into userB's row -> AAD mismatch fails closed.
+    await db.execute(
+      `INSERT INTO user_aliases (id, user_id, name, value, description, tags, source, encryption_version, created_at, updated_at)
+       VALUES ($1, $2, 'replayed', $3, $4, '[]'::jsonb, 'web', 1, $5, $5)`,
+      [randomHex(16), userB, rawA!.value, rawA!.description, now],
+    );
+    await expect(getAliasByName(db, userB, 'replayed', TEST_ENC_KEY)).rejects.toThrow('alias_decryption_failed');
+
+    // Field-swap tampering: swap value and description within same user -> AAD mismatch fails closed.
+    await db.execute(
+      'UPDATE user_aliases SET value = $3, description = $4 WHERE user_id = $1 AND name = $2',
+      [userA, 'secret', rawA!.description, rawA!.value],
+    );
+    await expect(getAliasByName(db, userA, 'secret', TEST_ENC_KEY)).rejects.toThrow('alias_decryption_failed');
   });
 });
 
-describe('list q filter — literal substring with LIKE escaping', () => {
+describe('migratePlaintextAliasesToEncrypted', () => {
+  it('migrates legacy plaintext rows in batches, preserves metadata, and is idempotent', async () => {
+    const userId = await freshUser();
+    const t1 = 1_700_000_001_000;
+    const t2 = 1_700_000_002_000;
+    const t3 = 1_700_000_003_000;
+    const id1 = `0001-${randomHex(12)}`;
+    const id2 = `0002-${randomHex(12)}`;
+    const id3 = `0003-${randomHex(12)}`;
+
+    // Seed legacy plaintext rows (encryption_version = 0), including NULL description and literal "enc:v1:test".
+    await db.execute(
+      `INSERT INTO user_aliases (id, user_id, name, value, description, tags, source, encryption_version, created_at, updated_at)
+       VALUES ($1, $2, 'legacy1', 'plain-v1', 'plain-d1', '["t1"]'::jsonb, 'web', 0, $3, $4),
+              ($5, $2, 'legacy2', 'enc:v1:test', NULL, '["t2"]'::jsonb, 'mcp', 0, $3, $4),
+              ($6, $2, 'legacy3', 'plain-v3', 'plain-d3', '[]'::jsonb, 'web', 0, $3, $4)`,
+      [id1, userId, t1, t2, id2, id3],
+    );
+
+    // Also seed an already-encrypted row.
+    const already = await upsertAlias(db, {
+      id: randomHex(16),
+      userId,
+      name: 'already_enc',
+      value: 'already-secret',
+      source: 'web',
+    }, TEST_ENC_KEY);
+
+    // Legacy rows are readable even before migration.
+    const preRead = await getAliasByName(db, userId, 'legacy2', TEST_ENC_KEY);
+    expect(preRead?.value).toBe('enc:v1:test');
+
+    // Run migration with small batchSize = 2.
+    const res1 = await migratePlaintextAliasesToEncrypted(db, TEST_ENC_KEY, 2);
+    expect(res1.migrated).toBeGreaterThanOrEqual(3);
+
+    // Second run is a no-op (idempotent).
+    const res2 = await migratePlaintextAliasesToEncrypted(db, TEST_ENC_KEY, 2);
+    expect(res2).toEqual({ migrated: 0, skipped: 0 });
+
+    const rawRows = await db.query<{
+      id: string;
+      name: string;
+      value: string;
+      description: string | null;
+      encryption_version: number;
+      created_at: number;
+      updated_at: number;
+    }>(
+      `SELECT id, name, value, description, encryption_version, created_at, updated_at
+         FROM user_aliases WHERE user_id = $1 ORDER BY name ASC`,
+      [userId],
+    );
+    for (const r of rawRows) {
+      expect(r.encryption_version).toBe(ALIAS_ENCRYPTION_VERSION_AES_GCM);
+      expect(r.value).not.toContain('plain-');
+      expect(r.value).not.toBe('enc:v1:test');
+    }
+    const raw1 = rawRows.find((r) => r.id === id1)!;
+    expect(Number(raw1.created_at)).toBe(t1);
+    expect(Number(raw1.updated_at)).toBe(t2);
+    const raw2 = rawRows.find((r) => r.id === id2)!;
+    expect(raw2.description).toBeNull();
+
+    const decrypted = await listAliases(db, userId, undefined, TEST_ENC_KEY);
+    expect(decrypted.find((a) => a.name === 'legacy1')).toMatchObject({
+      id: id1,
+      value: 'plain-v1',
+      description: 'plain-d1',
+      tags: ['t1'],
+      source: 'web',
+      createdAt: new Date(t1).toISOString(),
+      updatedAt: new Date(t2).toISOString(),
+    });
+    expect(decrypted.find((a) => a.name === 'legacy2')).toMatchObject({
+      id: id2,
+      value: 'enc:v1:test',
+      tags: ['t2'],
+      source: 'mcp',
+    });
+    expect(decrypted.find((a) => a.name === 'legacy2')?.description).toBeUndefined();
+    expect(decrypted.find((a) => a.name === 'already_enc')?.value).toBe(already.value);
+    expect(t3).toBeGreaterThan(t2);
+  });
+
+  it('respects optimistic concurrency guard when a concurrent writer encrypts a row mid-migration', async () => {
+    const userId = await freshUser();
+    const id = randomHex(16);
+    const now = Date.now();
+    await db.execute(
+      `INSERT INTO user_aliases (id, user_id, name, value, description, tags, source, encryption_version, created_at, updated_at)
+       VALUES ($1, $2, 'race', 'old-plaintext', 'old-desc', '[]'::jsonb, 'web', $3, $4, $4)`,
+      [id, userId, ALIAS_ENCRYPTION_VERSION_PLAINTEXT, now],
+    );
+
+    // Wrap db so right before migration executes its UPDATE on this row, a concurrent writer upserts it.
+    let raced = false;
+    const racingDb: Database = {
+      ...db,
+      query: db.query.bind(db),
+      queryOne: db.queryOne.bind(db),
+      exec: db.exec.bind(db),
+      close: db.close.bind(db),
+      execute: async (sql: string, params?: unknown[]) => {
+        if (!raced && sql.includes('UPDATE user_aliases') && params?.[0] === id) {
+          raced = true;
+          await upsertAlias(db, {
+            id,
+            existingId: id,
+            userId,
+            name: 'race',
+            value: 'newer-concurrent-value',
+            description: 'newer-desc',
+            source: 'web',
+          }, TEST_ENC_KEY);
+        }
+        return db.execute(sql, params);
+      },
+    };
+
+    const result = await migratePlaintextAliasesToEncrypted(racingDb, TEST_ENC_KEY, 10);
+    expect(raced).toBe(true);
+    expect(result.skipped).toBeGreaterThanOrEqual(1);
+
+    const latest = await getAliasByName(db, userId, 'race', TEST_ENC_KEY);
+    expect(latest?.value).toBe('newer-concurrent-value');
+    expect(latest?.description).toBe('newer-desc');
+  });
+});
+
+describe('list q filter — literal substring over decrypted descriptions', () => {
   it('matches over both name and description (case-insensitive, literal)', async () => {
     const userId = await freshUser();
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'prod', value: 'v', description: 'the Live server', source: 'web' });
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'stage', value: 'v', description: 'preprod', source: 'web' });
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'prod', value: 'v', description: 'the Live server', source: 'web' }, TEST_ENC_KEY);
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'stage', value: 'v', description: 'preprod', source: 'web' }, TEST_ENC_KEY);
 
-    // Matches by name.
-    expect((await listAliases(db, userId, { q: 'PROD' })).map((a) => a.name).sort()).toEqual(['prod', 'stage']);
-    // Matches by description only.
-    expect((await listAliases(db, userId, { q: 'live' })).map((a) => a.name)).toEqual(['prod']);
+    expect((await listAliases(db, userId, { q: 'PROD' }, TEST_ENC_KEY)).map((a) => a.name).sort()).toEqual(['prod', 'stage']);
+    expect((await listAliases(db, userId, { q: 'live' }, TEST_ENC_KEY)).map((a) => a.name)).toEqual(['prod']);
   });
 
   it('treats a stored literal % as a character, not a wildcard', async () => {
     const userId = await freshUser();
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'disc50', value: 'v', description: '50% off', source: 'web' });
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'other', value: 'v', description: 'plain text', source: 'web' });
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'disc50', value: 'v', description: '50% off', source: 'web' }, TEST_ENC_KEY);
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'other', value: 'v', description: 'plain text', source: 'web' }, TEST_ENC_KEY);
 
-    // A bare '%' query must NOT act as "match everything" — it matches only the
-    // row whose description contains a literal '%'.
-    const pct = await listAliases(db, userId, { q: '%' });
+    const pct = await listAliases(db, userId, { q: '%' }, TEST_ENC_KEY);
     expect(pct.map((a) => a.name)).toEqual(['disc50']);
-
-    // '50%' matches the literal, not "starts with 50 then anything".
-    expect((await listAliases(db, userId, { q: '50%' })).map((a) => a.name)).toEqual(['disc50']);
+    expect((await listAliases(db, userId, { q: '50%' }, TEST_ENC_KEY)).map((a) => a.name)).toEqual(['disc50']);
   });
 
   it('treats a stored literal _ as a character, not a single-char wildcard', async () => {
     const userId = await freshUser();
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'a_b', value: 'v', source: 'web' });
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'axb', value: 'v', source: 'web' });
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'a_b', value: 'v', source: 'web' }, TEST_ENC_KEY);
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'axb', value: 'v', source: 'web' }, TEST_ENC_KEY);
 
-    // '_' must match only the literal-underscore row, not 'axb'.
-    const res = await listAliases(db, userId, { q: 'a_b' });
+    const res = await listAliases(db, userId, { q: 'a_b' }, TEST_ENC_KEY);
     expect(res.map((a) => a.name)).toEqual(['a_b']);
   });
 
   it('treats a stored literal backslash as a character', async () => {
     const userId = await freshUser();
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'winpath', value: 'v', description: 'C:\\Users', source: 'web' });
-    await upsertAlias(db, { id: randomHex(16), userId, name: 'nopath', value: 'v', description: 'C:/Users', source: 'web' });
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'winpath', value: 'v', description: 'C:\\Users', source: 'web' }, TEST_ENC_KEY);
+    await upsertAlias(db, { id: randomHex(16), userId, name: 'nopath', value: 'v', description: 'C:/Users', source: 'web' }, TEST_ENC_KEY);
 
-    const res = await listAliases(db, userId, { q: '\\Users' });
+    const res = await listAliases(db, userId, { q: '\\Users' }, TEST_ENC_KEY);
     expect(res.map((a) => a.name)).toEqual(['winpath']);
   });
 });
@@ -220,24 +418,20 @@ describe('strict per-user scoping', () => {
   it('user A cannot read, list, or delete user B aliases', async () => {
     const userA = await freshUser();
     const userB = await freshUser();
-    await upsertAlias(db, { id: randomHex(16), userId: userA, name: 'shared', value: 'A-only', source: 'web' });
+    await upsertAlias(db, { id: randomHex(16), userId: userA, name: 'shared', value: 'A-only', source: 'web' }, TEST_ENC_KEY);
 
-    // B's list is empty.
-    expect(await listAliases(db, userB)).toHaveLength(0);
-    // B cannot read A's alias by name.
-    expect(await getAliasByName(db, userB, 'shared')).toBeNull();
-    // B deleting the same name does not touch A's row.
+    expect(await listAliases(db, userB, undefined, TEST_ENC_KEY)).toHaveLength(0);
+    expect(await getAliasByName(db, userB, 'shared', TEST_ENC_KEY)).toBeNull();
     expect(await deleteAlias(db, userB, 'shared')).toBe(false);
-    // A still has it.
-    expect((await getAliasByName(db, userA, 'shared'))?.value).toBe('A-only');
+    expect((await getAliasByName(db, userA, 'shared', TEST_ENC_KEY))?.value).toBe('A-only');
   });
 
   it('same name is independent across users (UNIQUE is per-user)', async () => {
     const userA = await freshUser();
     const userB = await freshUser();
-    await upsertAlias(db, { id: randomHex(16), userId: userA, name: 'host', value: 'A-host', source: 'web' });
-    await upsertAlias(db, { id: randomHex(16), userId: userB, name: 'host', value: 'B-host', source: 'web' });
-    expect((await getAliasByName(db, userA, 'host'))?.value).toBe('A-host');
-    expect((await getAliasByName(db, userB, 'host'))?.value).toBe('B-host');
+    await upsertAlias(db, { id: randomHex(16), userId: userA, name: 'host', value: 'A-host', source: 'web' }, TEST_ENC_KEY);
+    await upsertAlias(db, { id: randomHex(16), userId: userB, name: 'host', value: 'B-host', source: 'web' }, TEST_ENC_KEY);
+    expect((await getAliasByName(db, userA, 'host', TEST_ENC_KEY))?.value).toBe('A-host');
+    expect((await getAliasByName(db, userB, 'host', TEST_ENC_KEY))?.value).toBe('B-host');
   });
 });

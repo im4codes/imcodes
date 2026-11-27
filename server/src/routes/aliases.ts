@@ -30,7 +30,7 @@ import {
 import {
   upsertAlias,
   getAliasByName,
-  getAliasById,
+  aliasExistsById,
   deleteAlias,
   listAliases,
 } from '../db/alias-queries.js';
@@ -45,6 +45,21 @@ aliasRoutes.use('/*', async (c, next) => {
   await next();
   return;
 });
+
+function hasEncryptionKey(env: Env): boolean {
+  return Boolean(env.BOT_ENCRYPTION_KEY && env.BOT_ENCRYPTION_KEY.trim().length > 0);
+}
+
+function handleAliasCryptoError(c: { json: (body: unknown, status?: number) => Response }, err: unknown): Response | null {
+  if (!(err instanceof Error)) return null;
+  if (err.message === 'alias_encryption_unavailable') {
+    return c.json({ error: 'alias_encryption_unavailable' }, 503);
+  }
+  if (err.message === 'alias_decryption_failed' || err.message === 'alias_unsupported_encryption_version') {
+    return c.json({ error: err.message }, 500);
+  }
+  return null;
+}
 
 /**
  * NFC-normalize an already-validated `tags` field into a `string[]` for storage.
@@ -65,8 +80,14 @@ function normalizeRequestTags(raw: unknown): string[] {
 aliasRoutes.get('/', async (c) => {
   const userId = c.get('userId' as never) as string;
   const q = c.req.query('q');
-  const entries: AliasEntry[] = await listAliases(c.env.DB, userId, { q });
-  return c.json({ aliases: entries });
+  try {
+    const entries: AliasEntry[] = await listAliases(c.env.DB, userId, { q }, c.env.BOT_ENCRYPTION_KEY ?? '');
+    return c.json({ aliases: entries });
+  } catch (err) {
+    const handled = handleAliasCryptoError(c, err);
+    if (handled) return handled;
+    throw err;
+  }
 });
 
 /** POST /api/aliases — upsert an alias for the caller (keyed on name). */
@@ -96,6 +117,10 @@ aliasRoutes.post('/', async (c) => {
   const tagsReason = validateAliasTags(body.tags);
   if (tagsReason) return c.json({ error: tagsReason }, 400);
 
+  if (!hasEncryptionKey(c.env)) {
+    return c.json({ error: 'alias_encryption_unavailable' }, 503);
+  }
+
   const name = nfc(rawName);
   const description = rawDescription != null ? nfc(rawDescription) : null;
   const tags = normalizeRequestTags(body.tags);
@@ -103,7 +128,7 @@ aliasRoutes.post('/', async (c) => {
   if (existingId !== undefined && !isAliasId(existingId)) {
     return c.json({ error: ALIAS_REASONS.NOT_FOUND }, 404);
   }
-  if (existingId && !(await getAliasById(c.env.DB, userId, existingId))) {
+  if (existingId && !(await aliasExistsById(c.env.DB, userId, existingId))) {
     return c.json({ error: ALIAS_REASONS.NOT_FOUND }, 404);
   }
 
@@ -111,17 +136,23 @@ aliasRoutes.post('/', async (c) => {
   // Bearer; a browser (web app) uses the session cookie and never sends it.
   const source = c.req.header(SERVER_ID_HEADER) ? 'mcp' : 'web';
 
-  const entry = await upsertAlias(c.env.DB, {
-    id: randomHex(16),
-    userId,
-    name,
-    value: rawValue,
-    description,
-    tags,
-    source,
-    ...(existingId ? { existingId } : {}),
-  });
-  return c.json({ alias: entry });
+  try {
+    const entry = await upsertAlias(c.env.DB, {
+      id: randomHex(16),
+      userId,
+      name,
+      value: rawValue,
+      description,
+      tags,
+      source,
+      ...(existingId ? { existingId } : {}),
+    }, c.env.BOT_ENCRYPTION_KEY);
+    return c.json({ alias: entry });
+  } catch (err) {
+    const handled = handleAliasCryptoError(c, err);
+    if (handled) return handled;
+    throw err;
+  }
 });
 
 /** DELETE /api/aliases/:name — remove the caller's alias by name. */
@@ -147,7 +178,13 @@ aliasRoutes.get('/:name', async (c) => {
   if (nameReason) return c.json({ error: nameReason }, 400);
 
   const name = nfc(rawName);
-  const entry = await getAliasByName(c.env.DB, userId, name);
-  if (!entry) return c.json({ error: ALIAS_REASONS.NOT_FOUND }, 404);
-  return c.json({ alias: entry });
+  try {
+    const entry = await getAliasByName(c.env.DB, userId, name, c.env.BOT_ENCRYPTION_KEY ?? '');
+    if (!entry) return c.json({ error: ALIAS_REASONS.NOT_FOUND }, 404);
+    return c.json({ alias: entry });
+  } catch (err) {
+    const handled = handleAliasCryptoError(c, err);
+    if (handled) return handled;
+    throw err;
+  }
 });

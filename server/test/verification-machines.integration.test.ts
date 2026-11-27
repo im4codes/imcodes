@@ -29,6 +29,8 @@ import {
   type VerificationMachineCursor,
 } from '../src/db/verification-machine-queries.js';
 
+const TEST_ALIAS_ENCRYPTION_KEY = 'verification-machines-test-alias-key-32bytes';
+
 let db: Database;
 
 beforeAll(async () => {
@@ -280,7 +282,7 @@ describe('verification-machine-queries (real PostgreSQL)', () => {
       name: 'prod-211',
       value: 'ssh k@172.16.253.211',
       source: 'web',
-    });
+    }, TEST_ALIAS_ENCRYPTION_KEY);
 
     await upsertVerificationMachine(db, {
       id: randomHex(16),
@@ -324,7 +326,7 @@ describe('verification-machine-queries (real PostgreSQL)', () => {
       name: 'prod-211-renamed',
       value: 'ssh k@172.16.253.211',
       source: 'web',
-    });
+    }, TEST_ALIAS_ENCRYPTION_KEY);
 
     const alphaOnly = await listVerificationMachines(db, userId, 'proj-alpha');
     expect(alphaOnly.map((m) => ({ alias: m.alias, scope: m.scope, scopeKey: m.scopeKey }))).toEqual([
@@ -356,7 +358,7 @@ describe('verification-machine-queries (real PostgreSQL)', () => {
       name: 'shared-ssh-alias',
       value: 'ssh k@172.16.253.211',
       source: 'web',
-    });
+    }, TEST_ALIAS_ENCRYPTION_KEY);
 
     for (let i = 0; i < 55; i += 1) {
       const id = randomHex(16);

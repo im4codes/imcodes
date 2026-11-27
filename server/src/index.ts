@@ -46,6 +46,7 @@ import { isEmailAuthEnabled, loadEnv, type Env, type EnvConfig } from './env.js'
 import { createDatabase, type Database } from './db/client.js';
 import { flushAllSessionTextTailCacheWrites } from './db/queries.js';
 import { runMigrations } from './db/migrate.js';
+import { migratePlaintextAliasesToEncrypted } from './db/alias-queries.js';
 import { randomHex, hashPassword } from './security/crypto.js';
 import { authRoutes, initializeAuthNonceCleanup } from './routes/auth.js';
 import { githubAuthRoutes } from './routes/github-auth.js';
@@ -1540,6 +1541,17 @@ async function main() {
   }
 
   await runMigrations(db);
+  if (env.BOT_ENCRYPTION_KEY?.trim()) {
+    const aliasMigration = await migratePlaintextAliasesToEncrypted(db, env.BOT_ENCRYPTION_KEY);
+    if (aliasMigration.migrated > 0 || aliasMigration.skipped > 0) {
+      logger.info(
+        { migrated: aliasMigration.migrated, skipped: aliasMigration.skipped },
+        'Migrated plaintext user aliases to encrypted storage',
+      );
+    }
+  } else {
+    logger.warn({}, 'BOT_ENCRYPTION_KEY not set — skipping plaintext user alias encryption migration');
+  }
   await ensureDefaultAdmin(db, envConfig);
   await initializeAuthNonceCleanup(db);
   startR2RelayCleanup(envConfig);
