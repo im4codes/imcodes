@@ -445,8 +445,8 @@ footer {
   <div class="dl-group">
     <div class="dl-label" data-i18n="dl_android_label">Android (latest &middot; R2 CDN)</div>
     <div class="dl-links">
-      <a class="dl-btn" href="/api/downloads/latest/android-with-fcm" data-i18n="dl_android_fcm">APK (Google Play / FCM)</a>
-      <a class="dl-btn" href="/api/downloads/latest/android-without-fcm" data-i18n="dl_android_nofcm">APK (No FCM)</a>
+      <a class="dl-btn" href="/api/downloads/latest/android-with-fcm" data-i18n="dl_android_fcm">APK (Google Play)</a>
+      <a class="dl-btn" href="/api/downloads/latest/android-without-fcm" data-i18n="dl_android_nofcm">APK (No Google)</a>
     </div>
   </div>
   <div class="dl-group">
@@ -667,7 +667,7 @@ const I18N = {
     nodes_3: '从浏览器或手机打开支持的 Windows 节点，让人工查看画面或直接远程控制。',
     nodes_4: '独立凭证和所有者控制的执行权限，让每台节点都可限制、可撤销。',
     also_web: '也可作为 <a href="https://app.im.codes">网页版</a> 使用', watch_intro: 'Watch 支持可在手腕上快速查看会话、未读数、OTA 更新状态、推送通知和快捷回复。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供会话列表、未读计数和快捷回复。',
-    dl_android_label: 'Android 最新版（R2 CDN）', dl_android_fcm: 'APK（Google Play / FCM）', dl_android_nofcm: 'APK（无 FCM 纯净版）',
+    dl_android_label: 'Android 最新版（R2 CDN）', dl_android_fcm: 'APK（Google 服务版）', dl_android_nofcm: 'APK（无谷歌独立版）',
     dl_desktop_label: '桌面端安装包最新版（R2 CDN）', dl_desktop_mac: 'macOS Apple Silicon (.pkg)', dl_desktop_mac_intel: 'macOS Intel (.pkg)', dl_desktop_win: 'Windows (.exe)', dl_desktop_deb: 'Linux (.deb)', dl_desktop_sh: 'Linux (.sh)',
     dl_archive_note: '最新版通过 R2 CDN 分发；历史/老版本请前往 <a href="https://github.com/im4codes/imcodes/releases" target="_blank" rel="noopener">GitHub Releases</a> 下载。',
     agents_intro: '支持多个 agent 通过 CLI 和 SDK 两种方式接入。',
@@ -784,7 +784,7 @@ const I18N = {
     nodes_3: '從瀏覽器或手機開啟支援的 Windows 節點，讓人工查看畫面或直接遠端控制。',
     nodes_4: '獨立憑證和擁有者控制的執行權限，讓每台節點都可限制、可撤銷。',
     also_web: '也可作為 <a href="https://app.im.codes">網頁版</a> 使用', watch_intro: 'Watch 支援可在手腕上快速查看會話、未讀數、OTA 更新狀態、推送通知和快捷回覆。', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch App 提供會話列表、未讀計數和快捷回覆。',
-    dl_android_label: 'Android 最新版（R2 CDN）', dl_android_fcm: 'APK（Google Play / FCM）', dl_android_nofcm: 'APK（無 FCM 純淨版）',
+    dl_android_label: 'Android 最新版（R2 CDN）', dl_android_fcm: 'APK（Google 服務版）', dl_android_nofcm: 'APK（無 Google 獨立版）',
     dl_desktop_label: '桌面端安裝包最新版（R2 CDN）', dl_desktop_mac: 'macOS Apple Silicon (.pkg)', dl_desktop_mac_intel: 'macOS Intel (.pkg)', dl_desktop_win: 'Windows (.exe)', dl_desktop_deb: 'Linux (.deb)', dl_desktop_sh: 'Linux (.sh)',
     dl_archive_note: '最新版透過 R2 CDN 分發；歷史／舊版本請前往 <a href="https://github.com/im4codes/imcodes/releases" target="_blank" rel="noopener">GitHub Releases</a> 下載。',
     agents_intro: '支援多個 agent 透過 CLI 和 SDK 兩種方式接入。',
@@ -902,7 +902,7 @@ const I18N = {
     nodes_3: '対応する Windows ノードをブラウザやスマートフォンから開き、人が画面を確認・操作できます。',
     nodes_4: '独立した認証情報と所有者管理の実行権限により、各ノードは限定・取り消し可能です。',
     also_web: '<a href="https://app.im.codes">ウェブ版</a>もあります',
-    dl_android_label: 'Android 最新版（R2 CDN）', dl_android_fcm: 'APK（Google Play / FCM）', dl_android_nofcm: 'APK（FCM なし）',
+    dl_android_label: 'Android 最新版（R2 CDN）', dl_android_fcm: 'APK（Google 対応版）', dl_android_nofcm: 'APK（Google なし版）',
     dl_desktop_label: 'デスクトップインストーラー最新版（R2 CDN）', dl_desktop_mac: 'macOS Apple Silicon (.pkg)', dl_desktop_mac_intel: 'macOS Intel (.pkg)', dl_desktop_win: 'Windows (.exe)', dl_desktop_deb: 'Linux (.deb)', dl_desktop_sh: 'Linux (.sh)',
     dl_archive_note: '最新版は R2 CDN から配信されます。旧バージョンは <a href="https://github.com/im4codes/imcodes/releases" target="_blank" rel="noopener">GitHub Releases</a> をご利用ください。',
     agents_intro: '複数のエージェントが CLI と SDK の両方に対応しています。',
@@ -1020,7 +1020,7 @@ const I18N = {
     nodes_3: '지원되는 Windows 노드를 브라우저나 휴대폰에서 열어 사람이 화면을 보거나 직접 제어할 수 있습니다.',
     nodes_4: '독립 자격 증명과 소유자 관리 실행 권한으로 각 노드를 제한하고 언제든 철회할 수 있습니다.',
     also_web: '<a href="https://app.im.codes">웹 앱</a>으로도 이용 가능', watch_intro: 'Watch 지원으로 손목에서 세션 목록, 읽지 않음 수, OTA 업데이트 상태, 푸시 알림, 빠른 답장을 확인할 수 있습니다.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Watch 앱은 세션 목록, 읽지 않음 수, 빠른 답장을 제공합니다.',
-    dl_android_label: 'Android 최신 버전 (R2 CDN)', dl_android_fcm: 'APK (Google Play / FCM)', dl_android_nofcm: 'APK (FCM 제외)',
+    dl_android_label: 'Android 최신 버전 (R2 CDN)', dl_android_fcm: 'APK (Google 서비스판)', dl_android_nofcm: 'APK (Google 미포함판)',
     dl_desktop_label: '데스크톱 설치 프로그램 최신 버전 (R2 CDN)', dl_desktop_mac: 'macOS Apple Silicon (.pkg)', dl_desktop_mac_intel: 'macOS Intel (.pkg)', dl_desktop_win: 'Windows (.exe)', dl_desktop_deb: 'Linux (.deb)', dl_desktop_sh: 'Linux (.sh)',
     dl_archive_note: '최신 버전은 R2 CDN으로 제공됩니다. 이전 버전은 <a href="https://github.com/im4codes/imcodes/releases" target="_blank" rel="noopener">GitHub Releases</a>에서 다운로드하세요.',
     agents_intro: '여러 에이전트가 CLI와 SDK 두 방식 모두를 지원합니다.',
@@ -1135,7 +1135,7 @@ const I18N = {
     nodes_3: 'Abre nodos Windows compatibles desde el navegador o el móvil para que una persona vea o controle la pantalla.',
     nodes_4: 'Las credenciales independientes y la ejecución controlada por el propietario mantienen cada nodo limitado y revocable.',
     also_web: 'También disponible como <a href="https://app.im.codes">app web</a>', watch_intro: 'La compatibilidad con Watch cubre monitoreo rápido de sesiones, contadores de no leídos, visibilidad de actualizaciones OTA, notificaciones push y respuestas rápidas desde la muñeca.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'La app de Watch incluye lista de sesiones, contadores de no leídos y respuestas rápidas.',
-    dl_android_label: 'Android (última versión · R2 CDN)', dl_android_fcm: 'APK (Google Play / FCM)', dl_android_nofcm: 'APK (Sin FCM)',
+    dl_android_label: 'Android (última versión · R2 CDN)', dl_android_fcm: 'APK (Con Google)', dl_android_nofcm: 'APK (Sin Google)',
     dl_desktop_label: 'Instaladores de escritorio (última versión · R2 CDN)', dl_desktop_mac: 'macOS Apple Silicon (.pkg)', dl_desktop_mac_intel: 'macOS Intel (.pkg)', dl_desktop_win: 'Windows (.exe)', dl_desktop_deb: 'Linux (.deb)', dl_desktop_sh: 'Linux (.sh)',
     dl_archive_note: 'Las últimas versiones se distribuyen por R2 CDN. Las versiones anteriores están en <a href="https://github.com/im4codes/imcodes/releases" target="_blank" rel="noopener">GitHub Releases</a>.',
     agents_intro: 'Varios agentes admiten integración tanto por CLI como por SDK.',
@@ -1250,7 +1250,7 @@ const I18N = {
     nodes_3: 'Открывайте совместимые Windows-узлы в браузере или на телефоне для просмотра и управления человеком.',
     nodes_4: 'Независимые учётные данные и управляемое владельцем выполнение делают каждый узел ограниченным и отзывным.',
     also_web: 'Также доступно как <a href="https://app.im.codes">веб-приложение</a>', watch_intro: 'Поддержка Watch даёт быстрый просмотр сессий, счётчики непрочитанного, статус OTA-обновлений, push-уведомления и быстрые ответы прямо с запястья.', watch_badge: 'iPhone · iPad · Apple Watch', watch_download: 'Приложение для Watch показывает список сессий, счётчики непрочитанного и быстрые ответы.',
-    dl_android_label: 'Android (последняя версия · R2 CDN)', dl_android_fcm: 'APK (Google Play / FCM)', dl_android_nofcm: 'APK (без FCM)',
+    dl_android_label: 'Android (последняя версия · R2 CDN)', dl_android_fcm: 'APK (С Google)', dl_android_nofcm: 'APK (Без Google)',
     dl_desktop_label: 'Установщики для ПК (последняя версия · R2 CDN)', dl_desktop_mac: 'macOS Apple Silicon (.pkg)', dl_desktop_mac_intel: 'macOS Intel (.pkg)', dl_desktop_win: 'Windows (.exe)', dl_desktop_deb: 'Linux (.deb)', dl_desktop_sh: 'Linux (.sh)',
     dl_archive_note: 'Актуальные релизы раздаются через R2 CDN. Старые версии доступны в <a href="https://github.com/im4codes/imcodes/releases" target="_blank" rel="noopener">GitHub Releases</a>.',
     agents_intro: 'Несколько агентов поддерживают интеграции как через CLI, так и через SDK.',
