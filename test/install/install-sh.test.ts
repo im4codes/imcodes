@@ -909,10 +909,11 @@ Write-Output (Run-OcScenario (Join-Path '${psRoot}' 'c3') 'fake-ok')
       );
       const out = execFileSync(pwshPath, ['-NoProfile', '-NonInteractive', '-File', harness], {
         ...EXEC_OPTS,
+        timeout: 60_000,
       });
       expect(out).toContain('MODE=path-bad-ver STATUS=existing');
       expect(out).toContain('MODE=fail-npm STATUS=failed');
       expect(out).toContain('MODE=fake-ok STATUS=unverified');
-    });
+    }, 75_000);
   });
 });

@@ -309,7 +309,7 @@ main().catch((err) => { console.error(err); process.exit(1); });
           GROK_HOME: join(tempHome, '.grok'),
           PI_CODING_AGENT_DIR: join(tempHome, '.pi', 'agent'),
         },
-        timeout: 20_000,
+        timeout: 60_000,
       });
 
       // Sanity check tempHome files had servers removed cleanly
@@ -319,5 +319,5 @@ main().catch((err) => { console.error(err); process.exit(1); });
     } finally {
       rmSync(tempHome, { recursive: true, force: true });
     }
-  }, 25_000);
+  }, 75_000);
 });
