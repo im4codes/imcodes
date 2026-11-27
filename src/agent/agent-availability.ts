@@ -1,5 +1,5 @@
 import { access, stat } from 'node:fs/promises';
-import { constants as fsConstants } from 'node:fs';
+import { constants as fsConstants, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import type { AgentAvailabilityEntry, AgentAvailabilityMap } from '../../shared/agent-availability.js';
@@ -17,6 +17,7 @@ import {
   getBundledClaudeBinaryCandidates,
   getUnixCursorCandidateDirs,
   getWindowsCursorSearchDirs,
+  resolveCursorCmdLauncher,
   resolveNodePackageRoot,
 } from './transport-paths.js';
 
@@ -370,9 +371,39 @@ async function probeCursorHeadless(deps: AgentAvailabilityProbeDeps): Promise<Ag
     return { installed: false, reason: 'cursor-agent / agent CLI not found' };
   }
   const winDirs = getWindowsCursorSearchDirs(deps.env, deps.homeDir || undefined, p.join);
+  const searchDirs = uniqueNonEmpty([
+    ...(deps.env.PATH ?? '').split(WIN_DELIMITER),
+    ...winDirs,
+  ]);
+  const pathext = uniqueNonEmpty(
+    (deps.env.PATHEXT ?? DEFAULT_PATHEXT)
+      .split(WIN_DELIMITER)
+      .flatMap((ext) => [ext.toLowerCase(), ext]),
+  );
+  // Only accept executable Windows extensions (.com/.exe/.bat/.cmd) — never extensionless POSIX scripts.
+  // For .cmd/.bat wrappers present on disk, verify Cursor wrapper resolution succeeds before reporting installed.
   for (const bin of ['cursor-agent', 'agent']) {
-    const resolved = await resolveCommandExecutable(bin, { trailingDirs: winDirs, includeWindowsGlobalNpmDirs: false }, deps);
-    if (resolved) return { installed: true };
+    const hasKnownExt = pathext.some((ext) => bin.toLowerCase().endsWith(ext.toLowerCase()));
+    const fileNames = hasKnownExt ? [bin] : pathext.map((ext) => `${bin}${ext}`);
+    for (const dir of searchDirs) {
+      for (const fileName of fileNames) {
+        const candidate = p.join(dir, fileName);
+        if (!(await deps.isExecutableFile(candidate))) continue;
+        if (/\.(cmd|bat)$/i.test(candidate)) {
+          const diskCandidate = process.platform !== 'win32' && (candidate.startsWith('/') || /^\\[^\\]/.test(candidate))
+            ? candidate.replace(/\\/g, '/')
+            : candidate;
+          let isRealDiskFile = false;
+          try {
+            isRealDiskFile = statSync(diskCandidate).isFile();
+          } catch {
+            isRealDiskFile = false;
+          }
+          if (isRealDiskFile && !resolveCursorCmdLauncher(diskCandidate)) continue;
+        }
+        return { installed: true };
+      }
+    }
   }
   return { installed: false, reason: 'cursor-agent / agent CLI not found' };
 }

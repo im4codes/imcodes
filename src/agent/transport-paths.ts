@@ -518,13 +518,15 @@ function isRegularFileSync(filePath: string): boolean {
 
 function isExecutableFileSync(filePath: string): boolean {
   if (!isRegularFileSync(filePath)) return false;
-  if (process.platform === 'win32') return true;
-  try {
-    accessSync(filePath, fsConstants.X_OK);
-    return true;
-  } catch {
-    return false;
+  if (process.platform !== 'win32') {
+    try {
+      accessSync(filePath, fsConstants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
   }
+  return true;
 }
 
 function getWindowsCursorCandidateDirs(
@@ -583,43 +585,177 @@ function findExecutableOnUnixDirs(binName: string, extraDirs: string[]): string 
   return null;
 }
 
-function resolveWindowsBinaryInDirs(name: string, dirs: string[]): string | null {
-  if (isAbsoluteSmart(name) || hasPathSeparator(name)) {
-    return isRegularFileSync(name) ? name : null;
+function getWindowsExecutableExts(env: NodeJS.ProcessEnv = process.env): string[] {
+  const pathExtRaw = env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
+  return uniqueNonEmpty(pathExtRaw.split(';').flatMap((e) => [e.toLowerCase(), e]));
+}
+
+function listWindowsCandidateFilesInDir(dir: string, bin: string, exts: string[]): string[] {
+  const hasKnownExt = exts.some((ext) => bin.toLowerCase().endsWith(ext.toLowerCase()));
+  const names = hasKnownExt ? [bin] : exts.map((ext) => `${bin}${ext}`);
+  const out: string[] = [];
+  for (const fileName of names) {
+    const candidate = path.join(dir, fileName);
+    if (isRegularFileSync(candidate)) out.push(candidate);
   }
-  const pathExtRaw = process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
-  const exts = uniqueNonEmpty(pathExtRaw.split(';').flatMap((e) => [e.toLowerCase(), e]));
-  const hasExt = exts.some((e) => name.toLowerCase().endsWith(e.toLowerCase()));
-  const extsToTry = hasExt ? [''] : [...exts, ''];
-  for (const dir of uniqueNonEmpty(dirs)) {
-    for (const ext of extsToTry) {
-      const candidate = path.join(dir, name + ext);
-      if (isRegularFileSync(candidate)) return candidate;
+  return out;
+}
+
+function splitCmdTokens(line: string): string[] {
+  const tokens: string[] = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]!;
+    if (ch === '"') {
+      inQuotes = !inQuotes;
+      continue;
     }
+    if (!inQuotes && /\s/.test(ch)) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = '';
+      }
+      continue;
+    }
+    current += ch;
+  }
+  if (current.length > 0) tokens.push(current);
+  return tokens;
+}
+
+function expandBatchString(rawValue: string, dp0: string, vars: Record<string, string>): string {
+  const expanded = rawValue
+    .replace(/%~dp0\\?/gi, `${dp0}${path.sep}`)
+    .replace(/%dp0%[\\/]?/gi, `${dp0}${path.sep}`)
+    .replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (_m, key: string) => {
+      const upper = key.toUpperCase();
+      return vars[upper] ?? process.env[key] ?? process.env[upper] ?? _m;
+    })
+    .replace(/!([A-Za-z_][A-Za-z0-9_]*)!/g, (_m, key: string) => {
+      const upper = key.toUpperCase();
+      return vars[upper] ?? process.env[key] ?? process.env[upper] ?? _m;
+    });
+  return expanded;
+}
+
+function normalizeBatchPath(rawPath: string): string {
+  // Support Windows backslash script separators when tests fake platform='win32' on POSIX temp dirs.
+  if (rawPath.startsWith('/')) {
+    return path.normalize(rawPath.replace(/\\/g, '/'));
+  }
+  return path.normalize(rawPath);
+}
+
+function baseNameSmart(filePath: string): string {
+  return filePath.split(/[\\/]/).at(-1) ?? filePath;
+}
+
+function expandBatchPath(rawValue: string, dp0: string, vars: Record<string, string>): string {
+  const expanded = expandBatchString(rawValue, dp0, vars);
+  return normalizeBatchPath(expanded);
+}
+
+const CURSOR_PS1_VERSION_RE = /^\d{4}\.\d{1,2}\.\d{1,2}(?:-\d{2}-\d{2}-\d{2})?-[a-f0-9]+$/i;
+
+function compareCursorVersionDirsDesc(a: string, b: string): number {
+  const toSortableParts = (ver: string): { dateNum: number; ver: string } => {
+    const datePart = ver.split('-')[0] ?? '';
+    const parts = datePart.split('.');
+    if (parts.length !== 3) return { dateNum: 0, ver };
+    const dateNum = Number(`${parts[0]}${parts[1]!.padStart(2, '0')}${parts[2]!.padStart(2, '0')}`);
+    return { dateNum: Number.isFinite(dateNum) ? dateNum : 0, ver };
+  };
+  const pa = toSortableParts(a);
+  const pb = toSortableParts(b);
+  if (pb.dateNum !== pa.dateNum) return pb.dateNum - pa.dateNum;
+  return b.localeCompare(a, undefined, { numeric: true });
+}
+
+function extractPs1FixedNodeFlags(ps1Content: string): string[] {
+  const match = ps1Content.match(/&\s+["']?\$[A-Za-z_]\w*["']?\s+([^\r\n]+?)\s+["']?\$scriptPath[\\/][^"'\s]*index\.js["']?\s+\$args/i);
+  if (!match?.[1]) return [];
+  return splitCmdTokens(match[1]);
+}
+
+function resolveCursorPs1Launcher(ps1Path: string): ResolvedExecutable | null {
+  let content: string;
+  try {
+    content = readFileSync(ps1Path, 'utf8');
+  } catch {
+    return null;
+  }
+  const ps1Dir = dirnameSmart(ps1Path);
+  const fixedFlags = extractPs1FixedNodeFlags(content);
+
+  // Case 1: flat package layout with node.exe + index.js in scriptPath (cursor-agent.ps1)
+  const flatNode = joinSmart(ps1Dir, 'node.exe');
+  const flatIndex = joinSmart(ps1Dir, 'index.js');
+  if (isRegularFileSync(flatNode) && isRegularFileSync(flatIndex)) {
+    return { executable: flatNode, prependArgs: [...fixedFlags, flatIndex] };
+  }
+
+  // Case 2: active.txt version pin (check both scriptPath\active.txt and scriptPath\versions\active.txt)
+  for (const activeFile of [joinSmart(ps1Dir, 'active.txt'), joinSmart(ps1Dir, 'versions', 'active.txt')]) {
+    if (!isRegularFileSync(activeFile)) continue;
+    let activeVer = '';
+    try {
+      activeVer = readFileSync(activeFile, 'utf8').trim();
+    } catch {
+      return null;
+    }
+    if (!activeVer || /[\\/]/.test(activeVer)) return null;
+    const activeDir = joinSmart(ps1Dir, 'versions', activeVer);
+    const activeNode = joinSmart(activeDir, 'node.exe');
+    const activeIndex = joinSmart(activeDir, 'index.js');
+    if (isRegularFileSync(activeNode) && isRegularFileSync(activeIndex)) {
+      return { executable: activeNode, prependArgs: [...fixedFlags, activeIndex] };
+    }
+    for (const exeName of ['cursor-agent.exe', 'agent.exe']) {
+      const exePath = joinSmart(activeDir, exeName);
+      if (isRegularFileSync(exePath)) return { executable: exePath, prependArgs: [] };
+    }
+    // Fail closed if active.txt points to an incomplete/missing directory.
+    return null;
+  }
+
+  // Case 3: official dist-package cursor-agent.ps1 versioned lookup (only when .ps1 checks $scriptPath\versions + Parse-VersionString/version regex)
+  const hasVersionsLookup = /\$scriptPath[\\/]versions/i.test(content) && (/Parse-VersionString/i.test(content) || /versions/i.test(content));
+  if (!hasVersionsLookup) return null;
+
+  const versionsDir = joinSmart(ps1Dir, 'versions');
+  try {
+    const entries = readdirSync(versionsDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && CURSOR_PS1_VERSION_RE.test(entry.name))
+      .map((entry) => entry.name)
+      .sort(compareCursorVersionDirsDesc);
+    for (const ver of entries) {
+      const verDir = joinSmart(versionsDir, ver);
+      const verNode = joinSmart(verDir, 'node.exe');
+      const verIndex = joinSmart(verDir, 'index.js');
+      if (isRegularFileSync(verNode) && isRegularFileSync(verIndex)) {
+        return { executable: verNode, prependArgs: [...fixedFlags, verIndex] };
+      }
+    }
+  } catch {
+    return null;
   }
   return null;
 }
 
-function findBundledNodeNear(scriptPath: string, dp0: string): string {
-  const scriptDir = dirnameSmart(scriptPath);
-  const siblingNode = joinSmart(scriptDir, 'node.exe');
-  if (isRegularFileSync(siblingNode)) return siblingNode;
-  const dp0Node = joinSmart(dp0, 'node.exe');
-  if (isRegularFileSync(dp0Node)) return dp0Node;
-  return process.execPath;
+function isBatchForwardArgsToken(token: string): boolean {
+  return /^%(?:\*|~?[0-9]+)$/i.test(token);
 }
 
-function expandCmdVars(rawValue: string, dp0: string, vars: Record<string, string>): string {
-  let out = rawValue.replace(/%~dp0\\?/gi, `${dp0}${path.sep}`).replace(/%dp0%[\\/]?/gi, `${dp0}${path.sep}`);
-  out = out.replace(/%([A-Za-z_][A-Za-z0-9_]*)%/g, (_m, key: string) => {
-    const upper = key.toUpperCase();
-    return vars[upper] ?? process.env[key] ?? process.env[upper] ?? _m;
-  });
-  return path.normalize(out);
-}
-
-function parseNativeCmdLauncher(cmdPath: string, depth = 0): ResolvedExecutable | null {
+/** Resolve ONLY Cursor-specific Windows `.cmd`/`.bat` wrappers cleanly.
+ *  Never guesses arbitrary `versions/` folders for unrecognized `.cmd` files,
+ *  and never alters shared non-Cursor provider `resolveExecutableForSpawn()` paths. */
+export function resolveCursorCmdLauncher(cmdPath: string, depth = 0): ResolvedExecutable | null {
   if (depth > 3) return null;
+  const npmScript = parseNpmCmdShim(cmdPath);
+  if (npmScript && isRegularFileSync(npmScript)) {
+    return { executable: process.execPath, prependArgs: [npmScript] };
+  }
   let content: string;
   try {
     content = readFileSync(cmdPath, 'utf8');
@@ -628,100 +764,197 @@ function parseNativeCmdLauncher(cmdPath: string, depth = 0): ResolvedExecutable 
   }
   const dp0 = dirnameSmart(cmdPath);
   const vars: Record<string, string> = {};
-  for (const line of content.split(/\r?\n/)) {
-    const setMatch = line.match(/^\s*set\s+(?:"([A-Za-z_][A-Za-z0-9_]*)=([^"]*)"|([A-Za-z_][A-Za-z0-9_]*)=([^\r\n]+?))\s*$/i);
-    if (!setMatch) continue;
-    const key = (setMatch[1] ?? setMatch[3] ?? '').toUpperCase();
-    const rawVal = (setMatch[2] ?? setMatch[4] ?? '').trim();
-    if (key && rawVal) vars[key] = expandCmdVars(rawVal, dp0, vars);
-  }
+  const lines = content.split(/\r?\n/);
 
-  // Extract explicit quoted/unquoted .js/.mjs/.cjs or .exe/.cmd paths referenced in the launcher.
-  const tokenRe = /"([^"\r\n]+?\.(?:js|mjs|cjs|exe|cmd|bat))"|((?:%~dp0|%dp0%|%[A-Za-z_][A-Za-z0-9_]*%|[A-Za-z]:\\|\.?[\\/])[^\s"\r\n]+?\.(?:js|mjs|cjs|exe|cmd|bat))/gi;
-  let match: RegExpExecArray | null;
-  while ((match = tokenRe.exec(content)) !== null) {
-    const rawToken = match[1] ?? match[2];
-    if (!rawToken) continue;
-    const expanded = expandCmdVars(rawToken, dp0, vars);
-    const lowerBase = path.basename(expanded).toLowerCase();
-    if (!isRegularFileSync(expanded)) continue;
-    if (/\.(?:js|mjs|cjs)$/i.test(expanded)) {
-      return { executable: findBundledNodeNear(expanded, dp0), prependArgs: [expanded] };
-    }
-    if (/\.exe$/i.test(expanded) && lowerBase !== 'node.exe' && lowerBase !== 'powershell.exe' && lowerBase !== 'cmd.exe') {
-      return { executable: expanded, prependArgs: [] };
-    }
-    if (/\.(?:cmd|bat)$/i.test(expanded) && lowerBase !== 'promote-staged.cmd' && expanded.toLowerCase() !== cmdPath.toLowerCase()) {
-      const nested = unwrapWindowsCmdWrapper(expanded, depth + 1);
-      if (nested) return nested;
-    }
-  }
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || /^(@?rem\b|::)/i.test(trimmed)) continue;
 
-  // Official Cursor Windows installer layout fallback (`agent.cmd` / `cursor-agent.cmd` + sibling/versions tree).
-  const baseName = path.basename(cmdPath).toLowerCase();
-  const isCursorWrapper = baseName === 'agent.cmd' || baseName === 'cursor-agent.cmd' || /cursor-agent|index\.js|versions/i.test(content);
-  if (!isCursorWrapper) return null;
-
-  for (const exeName of ['cursor-agent.exe', 'agent.exe']) {
-    const exeCandidate = joinSmart(dp0, exeName);
-    if (isRegularFileSync(exeCandidate)) return { executable: exeCandidate, prependArgs: [] };
-  }
-  const directIndex = joinSmart(dp0, 'index.js');
-  if (isRegularFileSync(directIndex)) {
-    return { executable: findBundledNodeNear(directIndex, dp0), prependArgs: [directIndex] };
-  }
-
-  const versionsDir = joinSmart(dp0, 'versions');
-  try {
-    const entries = readdirSync(versionsDir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.') && !entry.name.endsWith('.new') && !entry.name.endsWith('.previous') && entry.name !== 'pending-launchers')
-      .map((entry) => entry.name)
-      .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }));
-    for (const ver of entries) {
-      const verDir = joinSmart(versionsDir, ver);
-      for (const exeName of ['cursor-agent.exe', 'agent.exe']) {
-        const exeCandidate = joinSmart(verDir, exeName);
-        if (isRegularFileSync(exeCandidate)) return { executable: exeCandidate, prependArgs: [] };
+    // Handle trailing-backslash strip idiom from Cursor's official cursor-agent.cmd:
+    //   if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
+    const stripSlashMatch = trimmed.match(/^if\s+"%([A-Za-z_][A-Za-z0-9_]*):~-1%"\s*==\s*"\\"\s+set\s+"?\1=[^"]*"?/i);
+    if (stripSlashMatch) {
+      const key = stripSlashMatch[1]!.toUpperCase();
+      if (vars[key]?.endsWith('\\') || vars[key]?.endsWith('/')) {
+        vars[key] = vars[key]!.slice(0, -1);
       }
-      const verIndex = joinSmart(verDir, 'index.js');
-      if (isRegularFileSync(verIndex)) {
-        return { executable: findBundledNodeNear(verIndex, dp0), prependArgs: [verIndex] };
+      continue;
+    }
+
+    // Read active version pin if the batch script explicitly reads active.txt into a var:
+    //   set /p ACTIVE_VER=<"%~dp0versions\active.txt"
+    const setPromptMatch = trimmed.match(/^set\s+\/p\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*<\s*"?([^"\r\n]+)"?$/i);
+    if (setPromptMatch) {
+      const varKey = setPromptMatch[1]!.toUpperCase();
+      const activePath = expandBatchPath(setPromptMatch[2]!.trim(), dp0, vars);
+      if (!isRegularFileSync(activePath)) return null;
+      try {
+        const val = readFileSync(activePath, 'utf8').trim();
+        if (!val || /[\\/]/.test(val)) return null;
+        vars[varKey] = val;
+      } catch {
+        return null;
+      }
+      continue;
+    }
+
+    const setMatch = trimmed.match(/^set\s+(?:"([A-Za-z_][A-Za-z0-9_]*)=([^"]*)"|([A-Za-z_][A-Za-z0-9_]*)=([^\r\n]+?))$/i);
+    if (setMatch) {
+      const key = (setMatch[1] ?? setMatch[3] ?? '').toUpperCase();
+      const rawVal = (setMatch[2] ?? setMatch[4] ?? '').trim();
+      if (key && rawVal) {
+        vars[key] = expandBatchString(rawVal, dp0, vars);
+      }
+      continue;
+    }
+
+    // Skip installer staged-promote pre-hook (`if exist "%~dp0versions\promote-staged.cmd" call ...`)
+    if (/promote-staged\.cmd/i.test(trimmed)) continue;
+    if (/^(@?echo|setlocal|endlocal|goto|exit|if\s+errorlevel)\b/i.test(trimmed)) continue;
+
+    // Inspect executable statements that forward CLI arguments (%* / %1) or invoke known launcher targets
+    const rawTokens = splitCmdTokens(trimmed);
+    if (rawTokens.length === 0) continue;
+    const expandedTokens = rawTokens.map((t) => expandBatchString(t, dp0, vars));
+    const hasForwardArgs = expandedTokens.some(isBatchForwardArgsToken);
+    if (!hasForwardArgs && !/powershell(?:\.exe)?$/i.test(expandedTokens[0] ?? '') && !/(?:cursor-agent|agent)\.ps1$/i.test(expandedTokens.join(' '))) {
+      continue;
+    }
+
+    const cmdTokens = expandedTokens.filter((t) => !isBatchForwardArgsToken(t));
+    const headRaw = cmdTokens[0] ?? '';
+    const headBase = baseNameSmart(headRaw).toLowerCase();
+
+    // Case A: official Cursor `.cmd` delegating to `%SystemRoot%\...\powershell.exe ... -File "<ps1>" %*`
+    if (headBase === 'powershell.exe' || headBase === 'powershell') {
+      const fileFlagIdx = cmdTokens.findIndex((t) => /^-file$/i.test(t));
+      const ps1Raw = fileFlagIdx >= 0 ? cmdTokens[fileFlagIdx + 1] : cmdTokens.find((t) => /\.ps1$/i.test(t));
+      if (ps1Raw) {
+        const ps1Path = normalizeBatchPath(ps1Raw);
+        if (isRegularFileSync(ps1Path)) {
+          const ps1Resolved = resolveCursorPs1Launcher(ps1Path);
+          if (ps1Resolved) return ps1Resolved;
+        }
+      }
+      continue;
+    }
+
+    // Case B: direct node invocation with optional fixed flags before `.js`/`.mjs`/`.cjs` entrypoint
+    if (headBase === 'node.exe' || headBase === 'node') {
+      const scriptIdx = cmdTokens.findIndex((t, idx) => idx >= 1 && /\.(?:js|mjs|cjs)$/i.test(t));
+      if (scriptIdx >= 1) {
+        const scriptPath = normalizeBatchPath(cmdTokens[scriptIdx]!);
+        if (isRegularFileSync(scriptPath)) {
+          const normHead = normalizeBatchPath(headRaw);
+          const nodeExe = headRaw.includes('/') || headRaw.includes('\\')
+            ? (isRegularFileSync(normHead) ? normHead : process.execPath)
+            : process.execPath;
+          const fixedArgs = cmdTokens.slice(1, scriptIdx);
+          return { executable: nodeExe, prependArgs: [...fixedArgs, scriptPath] };
+        }
+      }
+      continue;
+    }
+
+    // Case C: direct binary `.exe` invocation with optional fixed flags
+    if (/\.exe$/i.test(headRaw) && headBase !== 'cmd.exe') {
+      const exePath = normalizeBatchPath(headRaw);
+      if (isRegularFileSync(exePath)) {
+        return { executable: exePath, prependArgs: cmdTokens.slice(1) };
+      }
+      continue;
+    }
+
+    // Case D: nested `.cmd`/`.bat` call (`call "..." %*`)
+    if (/^call$/i.test(headBase) && cmdTokens[1] && /\.(?:cmd|bat)$/i.test(cmdTokens[1])) {
+      const nestedCmd = normalizeBatchPath(cmdTokens[1]);
+      if (nestedCmd.toLowerCase() !== cmdPath.toLowerCase() && isRegularFileSync(nestedCmd)) {
+        const nested = resolveCursorCmdLauncher(nestedCmd, depth + 1);
+        if (nested) return { executable: nested.executable, prependArgs: [...nested.prependArgs, ...cmdTokens.slice(2)] };
       }
     }
-  } catch {
-    // No versions directory.
   }
 
   return null;
 }
 
-function unwrapWindowsCmdWrapper(cmdPath: string, depth = 0): ResolvedExecutable | null {
-  const npmScriptPath = parseNpmCmdShim(cmdPath);
-  if (npmScriptPath) {
-    return { executable: process.execPath, prependArgs: [npmScriptPath] };
+function resolveCursorExplicitWindowsTarget(target: string): ResolvedExecutable | null {
+  const trimmed = target.trim();
+  if (!trimmed) return null;
+  if (/\.(exe|com)$/i.test(trimmed)) {
+    return isRegularFileSync(trimmed) ? { executable: trimmed, prependArgs: [] } : null;
   }
-  return parseNativeCmdLauncher(cmdPath, depth);
+  if (/\.(?:js|mjs|cjs)$/i.test(trimmed)) {
+    return isRegularFileSync(trimmed) ? { executable: process.execPath, prependArgs: [trimmed] } : null;
+  }
+  if (/\.(cmd|bat)$/i.test(trimmed)) {
+    return resolveCursorCmdLauncher(trimmed);
+  }
+  return null;
 }
 
-/** Resolve a CLI path for Cursor Agent (`cursor-agent` or `agent`).
- *  Uses executable regular-file checks on Unix and mirrors agent-availability search order. */
+/** Resolve Cursor Agent to a directly-launchable `(executable, prependArgs)` spec.
+ *  Matches `probeCursorHeadless()` candidate order and rejects non-executable/unlaunchable wrappers. */
+export function resolveCursorExecutableForSpawn(nameOrPath = 'cursor-agent'): ResolvedExecutable {
+  const trimmed = nameOrPath.trim();
+  if (process.platform !== 'win32') {
+    return { executable: trimmed || 'cursor-agent', prependArgs: [] };
+  }
+
+  if (trimmed && (isAbsoluteSmart(trimmed) || hasPathSeparator(trimmed))) {
+    const explicitResolved = resolveCursorExplicitWindowsTarget(trimmed);
+    if (explicitResolved) return explicitResolved;
+    return { executable: trimmed, prependArgs: [] };
+  }
+
+  const exts = getWindowsExecutableExts();
+  const pathDirs = (process.env.PATH ?? '').split(';');
+  const searchDirs = [...pathDirs, ...getWindowsCursorSearchDirs()];
+  const bins = !trimmed || trimmed === 'cursor-agent' ? ['cursor-agent', 'agent'] : [trimmed];
+
+  for (const bin of bins) {
+    for (const dir of uniqueNonEmpty(searchDirs)) {
+      for (const candidate of listWindowsCandidateFilesInDir(dir, bin, exts)) {
+        if (/\.(exe|com)$/i.test(candidate)) {
+          return { executable: candidate, prependArgs: [] };
+        }
+        if (/\.(?:js|mjs|cjs)$/i.test(candidate)) {
+          return { executable: process.execPath, prependArgs: [candidate] };
+        }
+        if (/\.(cmd|bat)$/i.test(candidate)) {
+          const unwrapped = resolveCursorCmdLauncher(candidate);
+          if (unwrapped) return unwrapped;
+        }
+      }
+    }
+  }
+
+  return { executable: trimmed || 'cursor-agent', prependArgs: [] };
+}
+
+/** Resolve a CLI path/entry for Cursor Agent (`cursor-agent` or `agent`).
+ *  Uses executable regular-file checks on Unix and grounded launchability checks on Windows,
+ *  mirroring `probeCursorHeadless()` search order. */
 export function resolveCursorPathForSdk(name = 'cursor-agent'): string {
   const trimmed = name.trim();
   if (!trimmed) return name;
   if (process.platform === 'win32') {
+    if (isAbsoluteSmart(trimmed) || hasPathSeparator(trimmed)) {
+      return trimmed;
+    }
+    const exts = getWindowsExecutableExts();
     const pathDirs = (process.env.PATH ?? '').split(';');
     const searchDirs = [...pathDirs, ...getWindowsCursorSearchDirs()];
     const bins = trimmed === 'cursor-agent' ? ['cursor-agent', 'agent'] : [trimmed];
     for (const bin of bins) {
-      const resolved = resolveWindowsBinaryInDirs(bin, searchDirs);
-      if (!resolved) continue;
-      if (/\.(cmd|bat)$/i.test(resolved)) {
-        const unwrapped = unwrapWindowsCmdWrapper(resolved);
-        if (unwrapped) {
-          return unwrapped.prependArgs.length === 0 ? unwrapped.executable : resolved;
+      for (const dir of uniqueNonEmpty(searchDirs)) {
+        for (const candidate of listWindowsCandidateFilesInDir(dir, bin, exts)) {
+          if (/\.(exe|com)$/i.test(candidate)) return candidate;
+          if (/\.(cmd|bat)$/i.test(candidate) && resolveCursorCmdLauncher(candidate)) {
+            return candidate;
+          }
         }
       }
-      return resolved;
     }
     return name;
   }
@@ -756,9 +989,10 @@ export interface ResolvedExecutable {
  *
  *  - On non-Windows: returns the input unchanged.
  *  - On Windows .exe: returns the .exe.
- *  - On Windows .cmd/.bat shim (npm OR native Cursor launcher): extracts the
- *    underlying `node script.js` or native `.exe` invocation so prompts pass
- *    via argv without `shell: true`. */
+ *  - On Windows .cmd npm shim: parses the shim, extracts the underlying
+ *    `node script.js` invocation, and returns `(node.exe, [scriptPath])`.
+ *    This is what the @anthropic-ai/claude-agent-sdk needs because it spawns
+ *    `pathToClaudeCodeExecutable` directly without `shell: true`. */
 export function resolveExecutableForSpawn(name: string): ResolvedExecutable {
   if (process.platform !== 'win32') {
     return { executable: name, prependArgs: [] };
@@ -772,10 +1006,12 @@ export function resolveExecutableForSpawn(name: string): ResolvedExecutable {
   if (/\.(?:js|mjs|cjs)$/i.test(resolved)) {
     return { executable: process.execPath, prependArgs: [resolved] };
   }
-  // .cmd / .bat shim: unwrap npm or native launcher to an executable + script args.
+  // .cmd / .bat npm shim: parse out the underlying node script path.
   if (/\.(cmd|bat)$/i.test(resolved)) {
-    const unwrapped = unwrapWindowsCmdWrapper(resolved);
-    if (unwrapped) return unwrapped;
+    const scriptPath = parseNpmCmdShim(resolved);
+    if (scriptPath) {
+      return { executable: process.execPath, prependArgs: [scriptPath] };
+    }
     // Couldn't parse the shim — return as-is. Caller (e.g. codex-sdk) can
     // still spawn it via shell:true as a fallback.
     return { executable: resolved, prependArgs: [] };

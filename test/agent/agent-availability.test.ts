@@ -206,6 +206,69 @@ describe('detectInstalledAgents()', () => {
     expect(recovered['cursor-headless']?.installed).toBe(true);
   });
 
+  it('skips Windows POSIX/unlaunchable cursor-agent shims in PATH and resolves valid downstream agent.cmd', async () => {
+    const tmpRoot = await mkdtemp(path.join(tmpdir(), 'imcodes-win-cursor-avail-'));
+    try {
+      const badDir = path.join(tmpRoot, 'bad');
+      const goodDir = path.join(tmpRoot, 'good');
+      const verDir = path.join(goodDir, 'versions', '2026.11.22-e9042b2');
+      await mkdir(badDir, { recursive: true });
+      await mkdir(verDir, { recursive: true });
+
+      // Bad dir: extensionless POSIX cursor-agent + unparseable cursor-agent.cmd
+      await writeFile(path.join(badDir, 'cursor-agent'), '#!/bin/sh\n');
+      await writeFile(path.join(badDir, 'cursor-agent.cmd'), '@echo off\r\necho broken\r\n');
+
+      const execCheck = async (filePath: string) => {
+        const diskPath = process.platform !== 'win32' && (filePath.startsWith('/') || /^\\[^\\]/.test(filePath))
+          ? filePath.replace(/\\/g, '/')
+          : filePath;
+        try {
+          const { statSync } = await import('node:fs');
+          return statSync(diskPath).isFile();
+        } catch {
+          return false;
+        }
+      };
+
+      // Only bad dir present -> must report NOT installed
+      const badOnly = await detectInstalledAgents({
+        forceRefresh: true,
+        deps: {
+          platform: 'win32',
+          env: { PATH: badDir, PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+          homeDir: tmpRoot,
+          imcodesHomeDir: path.join(tmpRoot, '.imcodes'),
+          isExecutableFile: execCheck,
+          isProviderConnected: () => false,
+        },
+      });
+      expect(badOnly['cursor-headless']?.installed).toBe(false);
+
+      // Good dir downstream has real Windows node.exe + index.js + valid agent.cmd wrapper
+      await writeFile(path.join(verDir, 'node.exe'), 'node');
+      await writeFile(path.join(verDir, 'index.js'), 'console.log("ok");\n');
+      await writeFile(
+        path.join(goodDir, 'agent.cmd'),
+        '"%~dp0versions\\2026.11.22-e9042b2\\node.exe" --use-system-ca "%~dp0versions\\2026.11.22-e9042b2\\index.js" %*\r\n',
+      );
+      const withGood = await detectInstalledAgents({
+        forceRefresh: true,
+        deps: {
+          platform: 'win32',
+          env: { PATH: `${badDir};${goodDir}`, PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+          homeDir: tmpRoot,
+          imcodesHomeDir: path.join(tmpRoot, '.imcodes'),
+          isExecutableFile: execCheck,
+          isProviderConnected: () => false,
+        },
+      });
+      expect(withGood['cursor-headless']?.installed).toBe(true);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
   it('finds bundled SDK runtimes without global CLIs on sparse daemon PATHs', async () => {
     const deps = createFakeDeps({
       env: { PATH: '/usr/bin' },

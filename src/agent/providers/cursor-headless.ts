@@ -35,8 +35,8 @@ import logger from '../../util/logger.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import {
   normalizeTransportCwd,
+  resolveCursorExecutableForSpawn,
   resolveCursorPathForSdk,
-  resolveExecutableForSpawn,
 } from '../transport-paths.js';
 import {
   parseCursorStreamLine,
@@ -186,7 +186,7 @@ export class CursorHeadlessProvider implements TransportProvider {
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
-    const resolved = resolveExecutableForSpawn(this.resolveBinaryPath(config));
+    const resolved = resolveCursorExecutableForSpawn(this.resolveBinaryPath(config));
     let versionOutput = '';
     try {
       const versionProbe = await this.runExecFile(resolved.executable, [...resolved.prependArgs, '--version'], {
@@ -468,7 +468,7 @@ export class CursorHeadlessProvider implements TransportProvider {
     const sessionSystemText = getProviderSystemTextParts(payload).sessionSystemText;
     const includeSessionSystemText = !!sessionSystemText && state.sessionSystemTextInjected !== sessionSystemText;
     const prompt = this.composePrompt(payload, includeSessionSystemText);
-    const resolved = resolveExecutableForSpawn(this.resolveBinaryPath(this.config));
+    const resolved = resolveCursorExecutableForSpawn(this.resolveBinaryPath(this.config));
     const resumeId = await this.ensureResumeId(state, resolved);
     const args = [
       ...resolved.prependArgs,
@@ -816,7 +816,7 @@ export class CursorHeadlessProvider implements TransportProvider {
   }
 
   private async createRemoteChat(config: SessionConfig, model?: string): Promise<string> {
-    const resolved = resolveExecutableForSpawn(this.resolveBinaryPath(this.config));
+    const resolved = resolveCursorExecutableForSpawn(this.resolveBinaryPath(this.config));
     const { stdout, stderr } = await this.runExecFile(resolved.executable, [...resolved.prependArgs, 'create-chat'], {
       windowsHide: true,
       timeout: CONNECT_PROBE_TIMEOUT_MS,

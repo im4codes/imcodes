@@ -1,5 +1,5 @@
 import * as childProcess from 'node:child_process';
-import { resolveCursorPathForSdk, resolveExecutableForSpawn } from './transport-paths.js';
+import { resolveCursorExecutableForSpawn, resolveCursorPathForSdk } from './transport-paths.js';
 import logger from '../util/logger.js';
 
 const CURSOR_BIN = 'cursor-agent';
@@ -127,7 +127,7 @@ export async function getCursorRuntimeConfig(options: CursorRuntimeConfigOptions
   if (inFlightProbe) return inFlightProbe;
   inFlightProbe = (async () => {
     try {
-      const resolved = resolveExecutableForSpawn(resolveCursorPathForSdk(CURSOR_BIN));
+      const resolved = resolveCursorExecutableForSpawn(resolveCursorPathForSdk(CURSOR_BIN));
       let modelsOut = '';
       try {
         modelsOut = await execFileStdout(resolved.executable, [...resolved.prependArgs, '--list-models']);

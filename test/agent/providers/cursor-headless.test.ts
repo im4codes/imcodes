@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -392,5 +392,74 @@ describe('CursorHeadlessProvider', () => {
     second.child.stdout.write(`${JSON.stringify({ type: 'result', subtype: 'success', session_id: 'cursor-chat-fallback-model', result: 'ok2' })}\n`);
     second.child.emit('close', 0, null);
     await harness.flush();
+  });
+
+  it('skips broken Windows PATH cursor-agent and launches downstream valid agent.cmd entrypoint with fixed flags', async () => {
+    const origPlatform = process.platform;
+    const origPath = process.env.PATH;
+    const origPathExt = process.env.PATHEXT;
+    const origLocalAppData = process.env.LOCALAPPDATA;
+    const origUserProfile = process.env.USERPROFILE;
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'cursor-provider-win-'));
+    tempDirs.push(tmpRoot);
+
+    try {
+      const badDir = join(tmpRoot, 'bad');
+      const goodDir = join(tmpRoot, 'good');
+      const verDir = join(goodDir, 'versions', '2026.11.22-e9042b2');
+      mkdirSync(badDir, { recursive: true });
+      mkdirSync(verDir, { recursive: true });
+
+      writeFileSync(join(badDir, 'cursor-agent'), '#!/bin/sh\n');
+      writeFileSync(join(badDir, 'cursor-agent.cmd'), '@echo off\r\necho broken\r\n');
+
+      const fakeNode = join(verDir, 'node.exe');
+      const fakeIndex = join(verDir, 'index.js');
+      writeFileSync(fakeNode, 'node');
+      writeFileSync(fakeIndex, 'console.log("ok");\n');
+      writeFileSync(
+        join(goodDir, 'agent.cmd'),
+        '"%~dp0versions\\2026.11.22-e9042b2\\node.exe" --use-system-ca "%~dp0versions\\2026.11.22-e9042b2\\index.js" %*\r\n',
+      );
+
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      process.env.PATH = `${badDir};${goodDir}`;
+      process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+      process.env.LOCALAPPDATA = tmpRoot;
+      process.env.USERPROFILE = tmpRoot;
+
+      const execCalls: Array<{ file: string; args: string[] }> = [];
+      cursorHeadlessRuntimeHooks.loadChildProcess = async () => ({
+        execFile: vi.fn((file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+          execCalls.push({ file, args });
+          if (args.includes('--version')) cb(null, '2026.11.22-e9042b2\n', '');
+          else if (args.includes('status')) cb(null, 'Logged in\n', '');
+          else if (args.includes('create-chat')) cb(null, 'cursor-chat-win\n', '');
+          else cb(null, '', '');
+          return { stdin: { end: vi.fn() } } as never;
+        }),
+        spawn: harness.spawn,
+      } as unknown as typeof import('node:child_process'));
+
+      const provider = new CursorHeadlessProvider();
+      await provider.connect({});
+      const sessionId = await provider.createSession({ sessionKey: 'route-win', cwd: tmpRoot });
+      await provider.send(sessionId, 'hello windows');
+
+      expect(execCalls.every((c) => c.file === fakeNode && c.args[0] === '--use-system-ca' && c.args[1] === fakeIndex)).toBe(true);
+      const spawned = harness.lastSpawn();
+      expect(spawned.file).toBe(fakeNode);
+      expect(spawned.args.slice(0, 2)).toEqual(['--use-system-ca', fakeIndex]);
+      expect(spawned.args.slice(-2)).toEqual(['--', 'hello windows']);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+      process.env.PATH = origPath;
+      if (origPathExt === undefined) delete process.env.PATHEXT;
+      else process.env.PATHEXT = origPathExt;
+      if (origLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = origLocalAppData;
+      if (origUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = origUserProfile;
+    }
   });
 });

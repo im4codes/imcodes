@@ -11,6 +11,8 @@ import {
   resolveAgyPathForSdk,
   resolveGrokPathForSdk,
   resolveCursorPathForSdk,
+  resolveCursorExecutableForSpawn,
+  resolveCursorCmdLauncher,
 } from '../../src/agent/transport-paths.js';
 
 describe('normalizeTransportCwd', () => {
@@ -194,7 +196,7 @@ describe('resolveCursorPathForSdk (cursor-agent and agent resolution)', () => {
     }
   });
 
-  it('resolves native Windows agent.cmd launcher to bundled node.exe + index.js without shell:true', () => {
+  it('resolves official Windows cursor-agent.cmd -> .ps1 launcher, respects active.txt and fixed argv, and rejects ungrounded wrappers without affecting non-Cursor shims', () => {
     const origPlatform = process.platform;
     const origPath = process.env.PATH;
     const origPathExt = process.env.PATHEXT;
@@ -202,40 +204,111 @@ describe('resolveCursorPathForSdk (cursor-agent and agent resolution)', () => {
     const origUserProfile = process.env.USERPROFILE;
     const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cursor-win-cmd-'));
     try {
-      const cursorRoot = path.join(tmpDir, 'cursor-agent');
-      const verDir = path.join(cursorRoot, 'versions', '2026.11.22-test');
-      fs.mkdirSync(verDir, { recursive: true });
-      const fakeNode = path.join(verDir, 'node.exe');
-      const fakeIndex = path.join(verDir, 'index.js');
-      fs.writeFileSync(fakeNode, 'fake node');
-      fs.writeFileSync(fakeIndex, 'console.log("ok");\n');
-      // Extensionless POSIX file alongside native agent.cmd (must NOT shadow agent.cmd)
-      fs.writeFileSync(path.join(cursorRoot, 'agent'), '#!/bin/sh\n');
-      const agentCmd = path.join(cursorRoot, 'agent.cmd');
+      const badDir = path.join(tmpDir, 'bad-path');
+      const goodDir = path.join(tmpDir, 'good-path');
+      const vOld = path.join(goodDir, 'versions', '2026.05.05-a1b2c3d');
+      const vNew = path.join(goodDir, 'versions', '2026.11.22-e9042b2');
+      fs.mkdirSync(badDir, { recursive: true });
+      fs.mkdirSync(vOld, { recursive: true });
+      fs.mkdirSync(vNew, { recursive: true });
+
+      const oldNode = path.join(vOld, 'node.exe');
+      const oldIndex = path.join(vOld, 'index.js');
+      const newNode = path.join(vNew, 'node.exe');
+      const newIndex = path.join(vNew, 'index.js');
+      fs.writeFileSync(oldNode, 'old node');
+      fs.writeFileSync(oldIndex, 'console.log("old");\n');
+      fs.writeFileSync(newNode, 'new node');
+      fs.writeFileSync(newIndex, 'console.log("new");\n');
+
+      // Dir 1 shadows cursor-agent with BOTH an extensionless POSIX script AND a broken unlaunchable .cmd
+      fs.writeFileSync(path.join(badDir, 'cursor-agent'), '#!/bin/sh\n');
+      fs.writeFileSync(path.join(badDir, 'cursor-agent.cmd'), '@echo off\r\necho broken wrapper\r\n');
+
+      // Dir 2 has the real Windows release package launcher (`agent.cmd` -> `cursor-agent.ps1`)
+      const agentCmd = path.join(goodDir, 'agent.cmd');
+      const agentPs1 = path.join(goodDir, 'cursor-agent.ps1');
       fs.writeFileSync(agentCmd, [
         '@echo off',
         'rem cursor-agent-promote-staged',
         'if exist "%~dp0versions\\promote-staged.cmd" call "%~dp0versions\\promote-staged.cmd"',
-        '"%~dp0versions\\2026.11.22-test\\node.exe" "--use-system-ca" "%~dp0versions\\2026.11.22-test\\index.js" %*',
+        'if errorlevel 1 exit /b 1',
+        'setlocal enabledelayedexpansion',
+        'set "CURSOR_INVOKED_AS=%~nx0"',
+        'set "SCRIPT_DIR=%~dp0"',
+        'if "%SCRIPT_DIR:~-1%"=="\\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"',
+        '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\\cursor-agent.ps1" %*',
       ].join('\r\n'));
+      fs.writeFileSync(agentPs1, [
+        '$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition',
+        'function Parse-VersionString { param([string]$versionString) $p = $versionString.Split("-")[0].Split("."); return [int]($p[0] + $p[1].PadLeft(2,"0") + $p[2].PadLeft(2,"0")) }',
+        '$versionDir = Get-ChildItem -Path "$scriptPath\\versions" -Directory | Where-Object { $_.Name -match \'^\\d{4}\\.\\d{1,2}\\.\\d{1,2}(-\\d{2}-\\d{2}-\\d{2})?-[a-f0-9]+$\' } | Sort-Object { Parse-VersionString $_.Name } -Descending | Select-Object -First 1',
+        '$versionName = $versionDir.Name',
+        '$nodePath = "$scriptPath\\versions\\$versionName\\node.exe"',
+        '& "$nodePath" "$scriptPath\\versions\\$versionName\\index.js" $args',
+      ].join('\n'));
 
       Object.defineProperty(process, 'platform', { value: 'win32' });
-      process.env.PATH = '';
+      process.env.PATH = `${badDir};${goodDir}`;
       process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
       process.env.LOCALAPPDATA = tmpDir;
       process.env.USERPROFILE = tmpDir;
 
-      const resolved = resolveCursorPathForSdk('cursor-agent');
-      expect(resolved).toBe(agentCmd);
-      const spawnSpec = resolveExecutableForSpawn(resolved);
-      expect(spawnSpec.executable).toBe(fakeNode);
-      expect(spawnSpec.prependArgs).toEqual([fakeIndex]);
+      // Skips dir1 POSIX cursor-agent + broken cursor-agent.cmd, picks dir2 official agent.cmd -> 2026.11.22
+      expect(resolveCursorPathForSdk('cursor-agent')).toBe(agentCmd);
+      expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual({
+        executable: newNode,
+        prependArgs: [newIndex],
+      });
 
-      // Dynamic versioned wrapper without literal path inside agent.cmd still unwraps via versions layout
-      fs.writeFileSync(agentCmd, '@echo off\r\nrem cursor-agent dynamic launcher\r\n');
-      const dynamicSpec = resolveExecutableForSpawn(resolved);
-      expect(dynamicSpec.executable).toBe(fakeNode);
-      expect(dynamicSpec.prependArgs).toEqual([fakeIndex]);
+      // Respects versions/active.txt version selection even when 2026.11 exists alongside 2026.05
+      const activeTxt = path.join(goodDir, 'versions', 'active.txt');
+      fs.writeFileSync(activeTxt, '2026.05.05-a1b2c3d\n');
+      expect(resolveCursorExecutableForSpawn('cursor-agent')).toEqual({
+        executable: oldNode,
+        prependArgs: [oldIndex],
+      });
+      fs.unlinkSync(activeTxt);
+
+      // Preserves fixed argv flags (e.g. --use-system-ca) in native Cursor launcher without dropping them
+      const fixedCmd = path.join(goodDir, 'agent-fixed.cmd');
+      fs.writeFileSync(fixedCmd, [
+        '@echo off',
+        'rem cursor-agent-promote-staged',
+        'if exist "%~dp0versions\\promote-staged.cmd" call "%~dp0versions\\promote-staged.cmd"',
+        'set "NODE_BIN=%~dp0versions\\2026.11.22-e9042b2\\node.exe"',
+        'set "ENTRY=%~dp0versions\\2026.11.22-e9042b2\\index.js"',
+        '"%NODE_BIN%" --use-system-ca "%ENTRY%" %*',
+      ].join('\r\n'));
+      expect(resolveCursorExecutableForSpawn(fixedCmd)).toEqual({
+        executable: newNode,
+        prependArgs: ['--use-system-ca', newIndex],
+      });
+
+      // Ungrounded random .cmd alongside versions/ must NOT guess latest versions/* dir
+      const bogusCmd = path.join(goodDir, 'bogus.cmd');
+      fs.writeFileSync(bogusCmd, '@echo off\r\necho not a valid launcher\r\n');
+      expect(resolveCursorCmdLauncher(bogusCmd)).toBeNull();
+
+      // Shared non-Cursor resolveExecutableForSpawn must keep npm shim semantics even if preflight.exe exists
+      const npmRoot = path.join(tmpDir, 'npm-codex');
+      const codexJsDir = path.join(npmRoot, 'node_modules', '@openai', 'codex', 'bin');
+      fs.mkdirSync(codexJsDir, { recursive: true });
+      const codexJs = path.join(codexJsDir, 'codex.js');
+      const preflightExe = path.join(npmRoot, 'preflight.exe');
+      fs.writeFileSync(codexJs, 'console.log("codex");\n');
+      fs.writeFileSync(preflightExe, 'fake preflight');
+      const codexCmd = path.join(npmRoot, 'codex.cmd');
+      fs.writeFileSync(codexCmd, [
+        '@ECHO off',
+        'if exist "%dp0%\\preflight.exe" "%dp0%\\preflight.exe" --check',
+        'SET dp0=%~dp0',
+        '"%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*',
+      ].join('\r\n'));
+      expect(resolveExecutableForSpawn(codexCmd)).toEqual({
+        executable: process.execPath,
+        prependArgs: [codexJs],
+      });
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });
       process.env.PATH = origPath;
