@@ -43,6 +43,7 @@ interface Props {
   ws: WsClient;
   serverId?: string | null;
   projectDir: string;
+  currentSessionName?: string | null;
   readOnly?: boolean;
   callbackTargets?: RepoCallbackTargetOption[];
   callbacks: CallbackTaskRecord[];
@@ -128,6 +129,7 @@ export function RepoCallbackModal({
   ws,
   serverId,
   projectDir,
+  currentSessionName,
   readOnly = false,
   callbackTargets = [],
   callbacks,
@@ -140,6 +142,12 @@ export function RepoCallbackModal({
   const { t } = useTranslation();
   const tRef = useRef(t);
   tRef.current = t;
+  const currentSessionNameRef = useRef(currentSessionName);
+  currentSessionNameRef.current = currentSessionName;
+  const callbackTargetsRef = useRef(callbackTargets);
+  callbackTargetsRef.current = callbackTargets;
+  const userEditedTargetRef = useRef(false);
+  const loadedConfigStateRef = useRef<{ key: string; hasSavedConfig: boolean } | null>(null);
   const [loading, setLoading] = useState(false);
   const editedSourceTemplateRef = useRef<Partial<Record<RepoCallbackEventType, { scope: RepoCallbackTemplateScope; id: string; name: string }>>>({});
   const [saving, setSaving] = useState(false);
@@ -158,13 +166,25 @@ export function RepoCallbackModal({
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    const configKey = `${serverId ?? ''}\0${projectDir}`;
+    userEditedTargetRef.current = false;
+    loadedConfigStateRef.current = null;
     setLoading(true);
     setFeedback(null);
     loadRepoCallbackPrefs(serverId, projectDir)
       .then((loaded) => {
         if (cancelled) return;
+        loadedConfigStateRef.current = { key: configKey, hasSavedConfig: loaded.hasSavedConfig };
         setGlobalTemplates(loaded.globalPrefs.templates);
-        setDraft(loaded.repoConfig);
+        const curSession = currentSessionNameRef.current;
+        const canBindCurrent = !loaded.hasSavedConfig
+          && Boolean(curSession)
+          && callbackTargetsRef.current.some((opt) => opt.sessionName === curSession);
+        setDraft(
+          canBindCurrent && curSession
+            ? { ...loaded.repoConfig, target: curSession }
+            : loaded.repoConfig,
+        );
       })
       .catch((err) => {
         if (cancelled) return;
@@ -182,6 +202,19 @@ export function RepoCallbackModal({
       cancelled = true;
     };
   }, [open, serverId, projectDir, ws]);
+
+  useEffect(() => {
+    if (!open || userEditedTargetRef.current) return;
+    const loadedState = loadedConfigStateRef.current;
+    const configKey = `${serverId ?? ''}\0${projectDir}`;
+    if (!loadedState || loadedState.key !== configKey || loadedState.hasSavedConfig) return;
+    if (!currentSessionName || !callbackTargets.some((opt) => opt.sessionName === currentSessionName)) return;
+    setDraft((prev) => (
+      prev.target === REPO_CALLBACK_TARGET_BRAIN && !userEditedTargetRef.current
+        ? { ...prev, target: currentSessionName }
+        : prev
+    ));
+  }, [open, serverId, projectDir, currentSessionName, callbackTargets]);
 
   const filteredCallbacks = useMemo(() => {
     return callbacks.filter((cb) => {
@@ -388,6 +421,9 @@ export function RepoCallbackModal({
         if (serverId) {
           const savedServer = await saveRepoCallbackRepoConfig(serverId, nextDraft);
           const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
+          if (loadedConfigStateRef.current?.key === `${serverId}\0${projectDir}`) {
+            loadedConfigStateRef.current.hasSavedConfig = true;
+          }
           setDraft(savedRepo);
           ws.repoCallbackSync?.(projectDir);
           onConfigSaved?.(savedRepo, savedGlobal.templates);
@@ -416,6 +452,9 @@ export function RepoCallbackModal({
         };
         const savedServer = await saveRepoCallbackRepoConfig(serverId!, nextDraft);
         const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
+        if (loadedConfigStateRef.current?.key === `${serverId ?? ''}\0${projectDir}`) {
+          loadedConfigStateRef.current.hasSavedConfig = true;
+        }
         setDraft(savedRepo);
         ws.repoCallbackSync?.(projectDir);
         onConfigSaved?.(savedRepo, globalTemplates);
@@ -489,6 +528,9 @@ export function RepoCallbackModal({
       };
       const savedServer = await saveRepoCallbackRepoConfig(serverId, nextConfig);
       const savedRepo = savedServer.repos[projectDir] ?? nextConfig;
+      if (loadedConfigStateRef.current?.key === `${serverId}\0${projectDir}`) {
+        loadedConfigStateRef.current.hasSavedConfig = true;
+      }
       setDraft(savedRepo);
       ws.repoCallbackSync?.(projectDir);
       onConfigSaved?.(savedRepo, globalTemplates);
@@ -706,7 +748,10 @@ export function RepoCallbackModal({
                   aria-label={t('repo.callback_target_label')}
                   value={draft.target}
                   disabled={readOnly}
-                  onChange={(e) => setDraft((prev) => ({ ...prev, target: (e.target as HTMLSelectElement).value }))}
+                  onChange={(e) => {
+                    userEditedTargetRef.current = true;
+                    setDraft((prev) => ({ ...prev, target: (e.target as HTMLSelectElement).value }));
+                  }}
                   style={{ width: '100%', minWidth: 0, maxWidth: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
                 >
                   <option value={REPO_CALLBACK_TARGET_BRAIN}>{t('repo.callback_target_brain')}</option>

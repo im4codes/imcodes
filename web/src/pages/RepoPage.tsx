@@ -2413,6 +2413,7 @@ function RepoPageInner({ ws, sessionId, projectDir, serverId, callbackTargets, f
           ws={ws}
           serverId={serverId}
           projectDir={projectDir}
+          currentSessionName={sessionId}
           readOnly={readOnly}
           callbackTargets={callbackTargets}
           callbacks={callbacks}

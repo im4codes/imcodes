@@ -6,6 +6,7 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/pr
 import { REPO_MSG } from '@shared/repo-types.js';
 import {
   REPO_CALLBACK_PREF_KEYS,
+  createDefaultRepoCallbackConfig,
   normalizeRepoCallbackRepoConfig,
   repoCallbackServerPrefKey,
   resolveRepoCallbackPromptTemplate,
@@ -197,7 +198,7 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
         { sessionName: 'deck_sub_clone', type: 'codex-sdk', label: 'Clone', cwd: '/work/repo-a', state: 'idle', closedAt: null, executionCloneKind: 'exec', parentRunId: 'run1' },
       ],
     );
-    expect(targets.map((t) => t.sessionName)).toEqual(['deck_sub_triage']);
+    expect(targets.map((t) => t.sessionName)).toEqual(['deck_proj_brain', 'deck_sub_triage']);
 
     const { unmount } = render(
       <RepoPage
@@ -1059,5 +1060,153 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     });
     expect(screen.getByText('Callback Item #1')).toBeTruthy();
     expect(screen.queryByText('Callback Item #11')).toBeNull();
+  });
+
+  it('includes active Brains first, normalizes trailing slashes, defaults unsaved repos to current sessionId, preserves legacy "brain" configs, and keeps edited/offline targets', async () => {
+    // 1. Multiple active Brains in same directory + trailing slash tolerance + stopped filtering + root path check
+    const multiTargets = buildRepoCallbackTargetOptions(
+      '/work/repo-multi/',
+      [
+        { name: 'deck_cd_w1', role: 'w1', label: 'Worker 1', state: 'idle', projectDir: '/work/repo-multi' },
+        { name: 'deck_cd_brain', role: 'brain', project: 'cd', state: 'idle', projectDir: '/work/repo-multi' },
+        { name: 'deck_cd1_brain', role: 'brain', label: 'Alt Brain', project: 'cd1', state: 'running', projectDir: '/work/repo-multi//' },
+        { name: 'deck_stopped_brain', role: 'brain', project: 'dead', state: 'stopped', projectDir: '/work/repo-multi' },
+        { name: 'deck_other_brain', role: 'brain', project: 'other', state: 'idle', projectDir: '/work/other' },
+      ],
+      [
+        { sessionName: 'deck_sub_worker', type: 'codex-sdk', label: 'CI Sub', cwd: '/work/repo-multi', state: 'idle', closedAt: null, parentSession: 'deck_cd_brain' },
+      ],
+    );
+    expect(multiTargets).toEqual([
+      { sessionName: 'deck_cd_brain', label: 'cd (deck_cd_brain)', state: 'idle' },
+      { sessionName: 'deck_cd1_brain', label: 'Alt Brain (deck_cd1_brain)', state: 'running' },
+      { sessionName: 'deck_cd_w1', label: 'Worker 1 (deck_cd_w1)', state: 'idle' },
+      { sessionName: 'deck_sub_worker', label: 'CI Sub (codex-sdk)', state: 'idle' },
+    ]);
+    expect(buildRepoCallbackTargetOptions('/', [{ name: 'root_brain', role: 'brain', state: 'idle', projectDir: '/' }]).map((t) => t.sessionName)).toEqual(['root_brain']);
+
+    // 2. Unsaved repo opened from sessionId="deck_cd_brain": defaults to exact sessionId and persists it
+    const ws = createMockWs();
+    const { rerender, unmount } = render(
+      <RepoPage
+        ws={ws}
+        sessionId="deck_cd_brain"
+        serverId="srv-multi"
+        projectDir="/work/repo-multi"
+        callbackTargets={multiTargets}
+      />,
+    );
+    await openModalAndAwaitPrefs();
+    let targetSelect = screen.getByLabelText('Callback target session') as HTMLSelectElement;
+    expect(targetSelect.value).toBe('deck_cd_brain');
+
+    // Saving immediately without touching dropdown persists the exact current sessionId
+    fireEvent.click(screen.getByText('Save settings'));
+    await waitFor(() => {
+      const serverPrefs = prefStore.get(repoCallbackServerPrefKey('srv-multi')) as {
+        repos: Record<string, { target: string }>;
+      };
+      expect(serverPrefs.repos['/work/repo-multi']?.target).toBe('deck_cd_brain');
+    });
+
+    // Manual edit + subsequent callbackTargets refresh MUST preserve user's edited draft.target
+    changeSelect(targetSelect, 'deck_cd1_brain');
+    await new Promise((r) => setTimeout(r, 0));
+    rerender(
+      <RepoPage
+        ws={ws}
+        sessionId="deck_cd_brain"
+        serverId="srv-multi"
+        projectDir="/work/repo-multi"
+        callbackTargets={[...multiTargets, { sessionName: 'deck_cd2_brain', label: 'cd2 (deck_cd2_brain)', state: 'idle' }]}
+      />,
+    );
+    expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('deck_cd1_brain');
+    fireEvent.click(screen.getByText('Save settings'));
+    await waitFor(() => {
+      const serverPrefs = prefStore.get(repoCallbackServerPrefKey('srv-multi')) as {
+        repos: Record<string, { target: string }>;
+      };
+      expect(serverPrefs.repos['/work/repo-multi']?.target).toBe('deck_cd1_brain');
+    });
+    unmount();
+    cleanup();
+
+    // 3. Existing legacy config target="brain": preserves "brain" on load even when sessionId is passed, then allows switching to exact Brain ID
+    await saveRepoCallbackRepoConfig('srv-legacy', {
+      ...createDefaultRepoCallbackConfig('/work/repo-legacy'),
+      target: 'brain',
+      enabled: true,
+    });
+    const wsLegacy = createMockWs();
+    render(
+      <RepoPage
+        ws={wsLegacy}
+        sessionId="deck_cd_brain"
+        serverId="srv-legacy"
+        projectDir="/work/repo-legacy"
+        callbackTargets={multiTargets}
+      />,
+    );
+    await openModalAndAwaitPrefs();
+    targetSelect = screen.getByLabelText('Callback target session') as HTMLSelectElement;
+    expect(targetSelect.value).toBe('brain');
+
+    changeSelect(targetSelect, 'deck_cd1_brain');
+    await new Promise((r) => setTimeout(r, 0));
+    fireEvent.click(screen.getByText('Save settings'));
+    await waitFor(() => {
+      const serverPrefs = prefStore.get(repoCallbackServerPrefKey('srv-legacy')) as {
+        repos: Record<string, { target: string }>;
+      };
+      expect(serverPrefs.repos['/work/repo-legacy']?.target).toBe('deck_cd1_brain');
+    });
+    cleanup();
+
+    // 4. Saved target pointing to an offline session stays visible in <select> without resetting
+    await saveRepoCallbackRepoConfig('srv-offline', {
+      ...createDefaultRepoCallbackConfig('/work/repo-offline'),
+      target: 'deck_offline_brain',
+    });
+    const wsOffline = createMockWs();
+    render(
+      <RepoPage
+        ws={wsOffline}
+        sessionId="deck_cd_brain"
+        serverId="srv-offline"
+        projectDir="/work/repo-offline"
+        callbackTargets={[]}
+      />,
+    );
+    await openModalAndAwaitPrefs();
+    expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('deck_offline_brain');
+    cleanup();
+
+    // 5. Missing/unmatched sessionId falls back to "brain"; late target hydration updates unsaved modal
+    const wsFallback = createMockWs();
+    const { rerender: rerenderFallback } = render(
+      <RepoPage
+        ws={wsFallback}
+        sessionId="deck_not_in_repo"
+        serverId="srv-fallback"
+        projectDir="/work/repo-fallback"
+        callbackTargets={multiTargets}
+      />,
+    );
+    await openModalAndAwaitPrefs();
+    expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('brain');
+
+    rerenderFallback(
+      <RepoPage
+        ws={wsFallback}
+        sessionId="deck_cd_brain"
+        serverId="srv-fallback"
+        projectDir="/work/repo-fallback"
+        callbackTargets={multiTargets}
+      />,
+    );
+    await waitFor(() => {
+      expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('deck_cd_brain');
+    });
   });
 });

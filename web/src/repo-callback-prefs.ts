@@ -17,6 +17,16 @@ export interface LoadedRepoCallbackPrefs {
   globalPrefs: RepoCallbackGlobalPrefs;
   serverPrefs: RepoCallbackServerPrefs;
   repoConfig: RepoCallbackRepoConfig;
+  hasSavedConfig: boolean;
+}
+
+function normalizeRepoCallbackProjectDir(raw: string | null | undefined): string {
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === '/') return trimmed;
+  if (/^[A-Za-z]:[\\/]+$/.test(trimmed)) return trimmed.slice(0, 3);
+  if (/^[A-Za-z]:$/.test(trimmed)) return trimmed;
+  return trimmed.replace(/[\\/]+$/, '');
 }
 
 export async function loadRepoCallbackPrefs(
@@ -29,8 +39,9 @@ export async function loadRepoCallbackPrefs(
   ]);
   const globalPrefs = normalizeRepoCallbackGlobalPrefs(rawGlobal);
   const serverPrefs = normalizeRepoCallbackServerPrefs(rawServer);
+  const hasSavedConfig = Object.prototype.hasOwnProperty.call(serverPrefs.repos, projectDir);
   const repoConfig = serverPrefs.repos[projectDir] ?? createDefaultRepoCallbackConfig(projectDir);
-  return { globalPrefs, serverPrefs, repoConfig };
+  return { globalPrefs, serverPrefs, repoConfig, hasSavedConfig };
 }
 
 export async function saveRepoCallbackGlobalTemplates(
@@ -73,7 +84,7 @@ export async function saveRepoCallbackRepoConfig(
 
 export function buildRepoCallbackTargetOptions(
   projectDir: string | undefined,
-  sessions?: Array<{ name: string; role?: string; label?: string | null; state?: string; projectDir?: string }>,
+  sessions?: Array<{ name: string; role?: string; label?: string | null; project?: string; state?: string; projectDir?: string }>,
   subSessions?: Array<{
     sessionName: string;
     type?: string;
@@ -86,38 +97,47 @@ export function buildRepoCallbackTargetOptions(
     parentRunId?: string | null;
   }>,
 ): Array<{ sessionName: string; label: string; state?: string }> {
-  if (!projectDir) return [];
+  const targetDir = normalizeRepoCallbackProjectDir(projectDir);
+  if (!targetDir) return [];
   const projectSessionNames = new Set(
     (sessions ?? [])
-      .filter((s) => s.projectDir === projectDir)
+      .filter((s) => normalizeRepoCallbackProjectDir(s.projectDir) === targetDir)
       .map((s) => s.name),
   );
-  const out: Array<{ sessionName: string; label: string; state?: string }> = [];
+  const brainOut: Array<{ sessionName: string; label: string; state?: string }> = [];
+  const workerOut: Array<{ sessionName: string; label: string; state?: string }> = [];
+  const subOut: Array<{ sessionName: string; label: string; state?: string }> = [];
   const seen = new Set<string>();
 
   for (const s of sessions ?? []) {
-    if (s.projectDir !== projectDir || s.role === 'brain' || s.state === 'stopped') continue;
+    if (normalizeRepoCallbackProjectDir(s.projectDir) !== targetDir || s.state === 'stopped') continue;
     if (seen.has(s.name)) continue;
     seen.add(s.name);
-    out.push({
+    const option = {
       sessionName: s.name,
-      label: s.label ? `${s.label} (${s.name})` : s.name,
+      label: s.label ? `${s.label} (${s.name})` : s.project ? `${s.project} (${s.name})` : s.name,
       state: s.state,
-    });
+    };
+    if (s.role === 'brain') {
+      brainOut.push(option);
+    } else {
+      workerOut.push(option);
+    }
   }
 
   for (const sub of subSessions ?? []) {
     if (sub.closedAt != null || sub.state === 'stopped') continue;
     if (sub.executionCloneKind || sub.parentRunId) continue;
-    const belongs = sub.cwd === projectDir || (sub.parentSession ? projectSessionNames.has(sub.parentSession) : false);
+    const belongs = normalizeRepoCallbackProjectDir(sub.cwd) === targetDir
+      || (sub.parentSession ? projectSessionNames.has(sub.parentSession) : false);
     if (!belongs || seen.has(sub.sessionName)) continue;
     seen.add(sub.sessionName);
-    out.push({
+    subOut.push({
       sessionName: sub.sessionName,
       label: sub.label ? `${sub.label}${sub.type ? ` (${sub.type})` : ''}` : sub.sessionName,
       state: sub.state,
     });
   }
 
-  return out;
+  return [...brainOut, ...workerOut, ...subOut];
 }
