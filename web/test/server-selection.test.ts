@@ -273,24 +273,23 @@ describe('mergeServerNavigation', () => {
     expect(result[0].lastHeartbeatAt).toBe(150_000);
   });
 
-  it('does not let older or equal online response revive a server previously marked offline', () => {
-    const previous = [{ id: 'srv-1', name: 'Server One', status: 'offline', lastHeartbeatAt: 200_000 }];
-    const incomingOlder = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 180_000 }];
-    const resultOlder = mergeServerNavigation(incomingOlder, previous, new Set());
-    expect(resultOlder[0].status).toBe('offline');
-    expect(resultOlder[0].lastHeartbeatAt).toBe(200_000);
-
-    const incomingEqual = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 200_000 }];
-    const resultEqual = mergeServerNavigation(incomingEqual, previous, new Set());
-    expect(resultEqual[0].status).toBe('offline');
-    expect(resultEqual[0].lastHeartbeatAt).toBe(200_000);
+  it('keeps server offline when in-flight REST request was started before local offline event', () => {
+    // Local offline event happened at t = 170_000 (statusObservedAt = 170_000, lastHeartbeatAt = 170_000)
+    const previous = [{ id: 'srv-1', name: 'Server One', status: 'offline', lastHeartbeatAt: 170_000, statusObservedAt: 170_000 }];
+    // In-flight REST request started at t = 160_000 (< 170_000) returning online
+    const incomingInFlight = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 165_000 }];
+    const result = mergeServerNavigation(incomingInFlight, previous, new Set(), { requestStartedAt: 160_000 });
+    expect(result[0].status).toBe('offline');
+    expect(result[0].lastHeartbeatAt).toBe(170_000);
   });
 
-  it('allows newer online response with advanced heartbeat to recover an offline server', () => {
-    const previous = [{ id: 'srv-1', name: 'Server One', status: 'offline', lastHeartbeatAt: 200_000 }];
-    const incomingNewer = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 250_000 }];
-    const result = mergeServerNavigation(incomingNewer, previous, new Set());
+  it('allows fresh REST request started after local offline event to restore online even if server clock lags behind local heartbeat', () => {
+    // Local offline event happened at t = 170_000 (statusObservedAt = 170_000, lastHeartbeatAt = 170_000)
+    const previous = [{ id: 'srv-1', name: 'Server One', status: 'offline', lastHeartbeatAt: 170_000, statusObservedAt: 170_000 }];
+    // Fresh REST request dispatched at t = 180_000 (>= 170_000); server Pod clock is slow so its heartbeat is 150_000 (< 170_000)
+    const incomingFresh = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 150_000 }];
+    const result = mergeServerNavigation(incomingFresh, previous, new Set(), { requestStartedAt: 180_000 });
     expect(result[0].status).toBe('online');
-    expect(result[0].lastHeartbeatAt).toBe(250_000);
+    expect(result[0].lastHeartbeatAt).toBe(150_000);
   });
 });

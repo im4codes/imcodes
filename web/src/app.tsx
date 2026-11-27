@@ -2434,7 +2434,7 @@ function InternalMainApp() {
     }
   }, [selectedServerId, trans]);
 
-  const applyServerInventory = useCallback((incoming: ServerInfo[]) => {
+  const applyServerInventory = useCallback((incoming: ServerInfo[], options?: { requestStartedAt?: number }) => {
     // Authoritative ownership, kept apart from `servers` on purpose.
     // `handleOpenSharedEntry` merges the shared server into `servers` so the
     // rest of the UI can render it, which makes that array a MIXED inventory:
@@ -2479,24 +2479,27 @@ function InternalMainApp() {
       knownOwnedServerIdsRef.current = new Set(nextOwnedIds);
     }
 
-    setServers((previous) => mergeServerNavigation(incoming, previous, sharedNavigationServerIdsRef.current));
+    setServers((previous) => mergeServerNavigation(incoming, previous, sharedNavigationServerIdsRef.current, options));
   }, []);
 
   const serverLoadSeqRef = useRef(0);
   const serverLoadAppliedSeqRef = useRef(0);
   const lastServerRefreshAtRef = useRef(0);
+  const authEpochRef = useRef(0);
 
   // Load servers list whenever auth is available
   const loadServers = useCallback(async () => {
     if (!auth) return;
+    const requestEpoch = authEpochRef.current;
+    const requestStartedAt = Date.now();
     const requestSeq = ++serverLoadSeqRef.current;
-    lastServerRefreshAtRef.current = Date.now();
+    lastServerRefreshAtRef.current = requestStartedAt;
     try {
       const [data, machinesData] = await Promise.all([
         apiFetch<{ servers: ServerInfo[] }>('/api/server'),
         apiFetch<{ machines?: Array<{ serverId?: unknown }> }>('/api/machines').catch(() => null),
       ]);
-      if (requestSeq < serverLoadAppliedSeqRef.current) {
+      if (authEpochRef.current !== requestEpoch || requestSeq < serverLoadAppliedSeqRef.current) {
         return;
       }
       serverLoadAppliedSeqRef.current = requestSeq;
@@ -2507,13 +2510,13 @@ function InternalMainApp() {
         controlledMachineServerIdsRef.current = machineIds;
         setControlledMachineServerIds(machineIds);
       }
-      applyServerInventory(data.servers);
+      applyServerInventory(data.servers, { requestStartedAt });
       setServersSynced(true);
     } catch {
       // Preserve the last known list on refresh failures. The request is still
       // considered resolved so the UI can escape the initial connecting gate.
     } finally {
-      if (requestSeq >= serverLoadAppliedSeqRef.current) {
+      if (authEpochRef.current === requestEpoch && requestSeq >= serverLoadAppliedSeqRef.current) {
         setServersLoaded(true);
         setPresenceTick((t) => (t + 1) % 1_000_000);
       }
@@ -2521,8 +2524,7 @@ function InternalMainApp() {
   }, [auth, applyServerInventory]);
 
   useEffect(() => {
-    serverLoadSeqRef.current = 0;
-    serverLoadAppliedSeqRef.current = 0;
+    authEpochRef.current += 1;
     lastServerRefreshAtRef.current = 0;
     setServersLoaded(false);
     setServersSynced(false);
@@ -13337,7 +13339,7 @@ function InternalMainApp() {
         />
       )}
 
-      {serverCtxMenu && (() => {
+      {serverCtxMenu?.server && (() => {
         const isOwned = ownedServerIdsRef.current.has(serverCtxMenu.server.id);
         return (
           <ServerContextMenu

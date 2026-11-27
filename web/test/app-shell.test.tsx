@@ -16155,18 +16155,21 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       fireEvent(document, new Event('visibilitychange'));
     });
     expect(serverRequestCount).toBe(initialRequests + 1);
+    expect(discoverSharedEntriesMock.mock.calls.length).toBe(initialSharedCalls + 1);
 
     // Immediate second focus within 10s: throttled
     await act(async () => {
       fireEvent(window, new Event('focus'));
     });
     expect(serverRequestCount).toBe(initialRequests + 1);
+    expect(discoverSharedEntriesMock.mock.calls.length).toBe(initialSharedCalls + 1);
 
     // 5. Polling triggers next request (reaches 30s interval from mount) (race request 2, offline response pending)
     await act(async () => {
       await vi.advanceTimersByTimeAsync(20_000);
     });
     expect(serverRequestCount).toBe(initialRequests + 2);
+    expect(discoverSharedEntriesMock.mock.calls.length).toBe(initialSharedCalls + 2);
 
     // Focus immediately after polling (e.g. 20ms): throttled because polling updated lastServerRefreshAtRef!
     await act(async () => {
@@ -16175,6 +16178,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       fireEvent(document, new Event('visibilitychange'));
     });
     expect(serverRequestCount).toBe(initialRequests + 2);
+    expect(discoverSharedEntriesMock.mock.calls.length).toBe(initialSharedCalls + 2);
 
     // 6. Out-of-order response resolution: the newer request (returning offline) resolves first
     await act(async () => {
@@ -16209,5 +16213,71 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     expect(document.querySelector('.server-item-dot-offline')).toBeTruthy();
     const onlineDotsAfterLateResponse = document.querySelectorAll('.server-item-dot-online');
     expect(onlineDotsAfterLateResponse.length).toBe(1); // Only Server One is online
+  }, 20_000);
+
+  it('discards late in-flight server list response from previous auth context after account switch', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let deferredUser1Resolve: ((value: any) => void) | null = null;
+    let currentUser = 'user-1';
+
+    loginState.userId = 'user-2';
+    loginState.baseUrl = 'http://localhost';
+    loginAttemptState.mode = 'native';
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: currentUser };
+      if (path === '/api/server') {
+        if (currentUser === 'user-1') {
+          return new Promise((resolve) => {
+            deferredUser1Resolve = resolve;
+          });
+        }
+        return {
+          servers: [
+            { id: 'srv-user-2', name: 'Server Two User 2', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 200 },
+          ],
+        };
+      }
+      if (path === '/api/auth/logout') return {};
+      if (path.startsWith('/api/server/')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const { App } = await importApp();
+    render(<App />);
+
+    // Allow user-1 mount to start loadServers
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(deferredUser1Resolve).toBeTruthy();
+
+    // User 1 logs out
+    currentUser = 'user-2';
+    fireEvent.click(screen.getByRole('button', { name: 'Log Out' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'login-page' })).toBeTruthy());
+
+    // User 2 logs in via login-page
+    fireEvent.click(screen.getByRole('button', { name: 'login-page' }));
+
+    // Wait for User 2 servers to be loaded and rendered
+    await waitFor(() => {
+      expect(document.body.textContent).toContain('Server Two User 2');
+    });
+
+    // Now delayed User 1 server response arrives
+    await act(async () => {
+      deferredUser1Resolve!({
+        servers: [
+          { id: 'srv-user-1', name: 'Server One User 1', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 100 },
+        ],
+      });
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    // Ensure User 1 server did NOT overwrite User 2 server
+    expect(document.body.textContent).toContain('Server Two User 2');
+    expect(document.body.textContent).not.toContain('Server One User 1');
   }, 20_000);
 });

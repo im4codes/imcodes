@@ -77,6 +77,7 @@ export function mergeServerNavigation<T extends SelectableServerInfo>(
   incoming: readonly T[],
   previous: readonly T[],
   activeSharedServerIds: ReadonlySet<string>,
+  options?: { requestStartedAt?: number },
 ): T[] {
   const previousMap = new Map(previous.map((server) => [server.id, server]));
   const mergedIncoming = incoming.map((server) => {
@@ -91,20 +92,23 @@ export function mergeServerNavigation<T extends SelectableServerInfo>(
       return server;
     }
 
-    const prevHb = typeof prevAny.lastHeartbeatAt === 'number' ? prevAny.lastHeartbeatAt : null;
-    const currHb = typeof currAny.lastHeartbeatAt === 'number' ? currAny.lastHeartbeatAt : null;
+    const prevObservedAt = typeof prevAny.statusObservedAt === 'number' ? prevAny.statusObservedAt : null;
+    const requestStartedAt = options?.requestStartedAt ?? null;
 
-    // If previous was explicitly offline, do not let an incoming response with older or equal heartbeat restore online
+    // If previous was explicitly offline:
+    // If a local offline event happened AFTER this REST request started, the incoming response
+    // was in-flight while the offline event occurred (stale relative to the local event), so preserve offline!
+    // But if the request started AFTER or at the local offline event, the REST response is authoritative
+    // and recovers online with its server heartbeat (even if server pod clock lags behind browser).
     if (prevAny.status === 'offline') {
-      if (currHb !== null && prevHb !== null && currHb <= prevHb) {
-        return prev;
-      }
-      if (currHb === null && prevHb !== null) {
+      if (requestStartedAt !== null && prevObservedAt !== null && requestStartedAt < prevObservedAt) {
         return prev;
       }
     }
 
     // Do not regress fresh live heartbeat with older REST timestamp, unless previous was offline
+    const prevHb = typeof prevAny.lastHeartbeatAt === 'number' ? prevAny.lastHeartbeatAt : null;
+    const currHb = typeof currAny.lastHeartbeatAt === 'number' ? currAny.lastHeartbeatAt : null;
     if (prevAny.status !== 'offline' && prevHb !== null && (currHb === null || prevHb > currHb)) {
       return {
         ...server,
