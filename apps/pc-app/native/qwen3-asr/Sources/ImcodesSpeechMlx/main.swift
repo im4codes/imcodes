@@ -838,117 +838,116 @@ private final class HotwordTrieNode {
     var termId: Int = -1
 }
 
-private func isSwiftChainQualifiedHallucination(
-    nodeIdx: Int,
-    nodePrev: [Int],
-    nodeTerm: [Int],
-    requireSentenceEndForDistinct: Bool,
-    hasSentenceEnd: Bool
-) -> Bool {
-    var totalTerms = 0
-    var counts: [Int: Int] = [:]
-    var cur = nodeIdx
-    while cur > 0 {
-        let termId = nodeTerm[cur]
-        if termId >= 0 {
-            totalTerms += 1
-            let next = (counts[termId] ?? 0) + 1
-            counts[termId] = next
-            if next >= 2 { return true }
-        }
-        cur = nodePrev[cur]
-    }
-    return totalTerms >= 3 && (!requireSentenceEndForDistinct || hasSentenceEnd)
+private struct SwiftDistinct3State {
+    var t1: Int = -1
+    var t2: Int = -1
+    var count: Int = 0
 }
 
-private func findSwiftLeadingHallucinationCut(
+private func advanceSwiftDistinct3(_ state: SwiftDistinct3State, termId: Int) -> SwiftDistinct3State {
+    if state.count >= 3 { return state }
+    if state.count == 0 { return SwiftDistinct3State(t1: termId, t2: -1, count: 1) }
+    if state.count == 1 {
+        return state.t1 == termId ? state : SwiftDistinct3State(t1: state.t1, t2: termId, count: 2)
+    }
+    if termId == state.t1 || termId == state.t2 { return state }
+    return SwiftDistinct3State(t1: state.t1, t2: state.t2, count: 3)
+}
+
+private func hasValidSwiftLeadingSep(_ map: SwiftNormalizedClusterMap, pos: Int) -> Bool {
+    guard map.isAsciiAlnum[pos] else { return true }
+    var sepScan = pos
+    while sepScan > 0 {
+        let c = map.clusterStart[sepScan - 1]
+        if !map.isSep[c] { break }
+        for k in c..<sepScan where !map.isIntraWordPunct[k] {
+            return true
+        }
+        sepScan = c
+    }
+    return false
+}
+
+private func isValidSwiftTrailingLeftBoundary(
+    _ map: SwiftNormalizedClusterMap,
+    p: Int,
+    termStartsAscii: Bool
+) -> (valid: Bool, sentEnd: Bool) {
+    var sepScan = p
+    var sentEnd = false
+    var hasRealSep = false
+    while sepScan > 0 {
+        let c = map.clusterStart[sepScan - 1]
+        if !map.isSep[c] { break }
+        for k in c..<sepScan {
+            if map.isSentenceEnd[k] { sentEnd = true }
+            if !map.isIntraWordPunct[k] { hasRealSep = true }
+        }
+        sepScan = c
+    }
+    let hasSepBefore = sepScan < p
+    let beforeSepAscii = sepScan > 0 ? map.isAsciiAlnum[sepScan - 1] : false
+    let valid = hasSepBefore
+        ? !(termStartsAscii && !hasRealSep && beforeSepAscii)
+        : (termStartsAscii && !beforeSepAscii)
+    return (valid, sentEnd)
+}
+
+private func findSwiftLeadingRuleACut(
     map: SwiftNormalizedClusterMap,
     root: HotwordTrieNode,
-    termStartsAscii: [Bool],
-    termEndsAscii: [Bool],
-    termFirstChars: [Character]
+    termEndsAscii: [Bool]
 ) -> Int {
     let chars = map.chars
     let n = chars.count
     guard n > 0 else { return 0 }
 
-    let inf = 0x3FFF_FFFF
-    var clearedCost = [Int](repeating: inf, count: n + 1)
-    var clearedNode = [Int](repeating: -1, count: n + 1)
-    var clearedFromSep = [Bool](repeating: false, count: n + 1)
-    var clearedSepHasEnd = [Bool](repeating: false, count: n + 1)
-    var endedAsciiCost = [Int](repeating: inf, count: n + 1)
-    var endedAsciiNode = [Int](repeating: -1, count: n + 1)
-    var sameTermStates: [[Int: (cost: Int, node: Int)]?]? = nil
-
-    var nodePrev = [-1]
-    var nodeTerm = [-1]
-    clearedCost[0] = 0
-    clearedNode[0] = 0
+    var completedSep = [Bool](repeating: false, count: n + 1)
+    var sepRun = [[Int: Int]?](repeating: nil, count: n + 1)
+    var immediateSame: [[Int: Int]?]? = nil
+    completedSep[0] = true
     var bestCut = 0
 
-    for pos in 0..<n {
-        let cCost = clearedCost[pos]
-        let aCost = endedAsciiCost[pos]
-        let sameMap = sameTermStates?[pos] ?? nil
-        sameTermStates?[pos] = nil
-        if cCost == inf && aCost == inf && sameMap == nil { continue }
+    func recordRun(_ arr: inout [[Int: Int]?], _ pos: Int, _ tid: Int, _ len: Int) {
+        var m = arr[pos] ?? [:]
+        if len > (m[tid] ?? 0) {
+            m[tid] = len
+            arr[pos] = m
+        }
+    }
 
-        var bestCost = cCost
-        var bestNode = clearedNode[pos]
-        if aCost < bestCost {
-            bestCost = aCost
-            bestNode = endedAsciiNode[pos]
-        }
-        if let sameMap {
-            for entry in sameMap.values where entry.cost < bestCost {
-                bestCost = entry.cost
-                bestNode = entry.node
-            }
-        }
+    for pos in 0..<n {
+        let canStartFresh = completedSep[pos]
+        let runMap = sepRun[pos]
+        let immMap = immediateSame?[pos] ?? nil
+        sepRun[pos] = nil
+        immediateSame?[pos] = nil
+        if !canStartFresh && runMap == nil && immMap == nil { continue }
 
         if pos > 0
             && pos == map.clusterStart[pos]
             && !map.isSep[pos]
-            && clearedFromSep[pos]
-            && cCost < inf {
-            var hasValidSep = !map.isAsciiAlnum[pos]
-            if map.isAsciiAlnum[pos] {
-                var sepScan = pos
-                while sepScan > 0 {
-                    let c = map.clusterStart[sepScan - 1]
-                    if !map.isSep[c] { break }
-                    var hasNonIntra = false
-                    for k in c..<sepScan where !map.isIntraWordPunct[k] {
-                        hasNonIntra = true
-                        break
-                    }
-                    if hasNonIntra {
-                        hasValidSep = true
-                        break
-                    }
-                    sepScan = c
-                }
-            }
-            if hasValidSep && isSwiftChainQualifiedHallucination(
-                nodeIdx: clearedNode[pos],
-                nodePrev: nodePrev,
-                nodeTerm: nodeTerm,
-                requireSentenceEndForDistinct: true,
-                hasSentenceEnd: clearedSepHasEnd[pos]
-            ) {
-                bestCut = pos
-            }
+            && canStartFresh
+            && hasValidSwiftLeadingSep(map, pos: pos) {
+            bestCut = pos
         }
 
         if map.isSep[pos] {
-            let nextEnd = (cCost == bestCost && clearedFromSep[pos] && clearedSepHasEnd[pos]) || map.isSentenceEnd[pos]
-            if bestCost < clearedCost[pos + 1]
-                || (bestCost == clearedCost[pos + 1] && (!clearedFromSep[pos + 1] || (nextEnd && !clearedSepHasEnd[pos + 1]))) {
-                clearedCost[pos + 1] = bestCost
-                clearedNode[pos + 1] = bestNode
-                clearedFromSep[pos + 1] = true
-                clearedSepHasEnd[pos + 1] = nextEnd
+            let nextPos = pos + 1
+            if canStartFresh {
+                completedSep[nextPos] = true
+            }
+            if let runMap {
+                for (tid, len) in runMap {
+                    recordRun(&sepRun, nextPos, tid, len)
+                    if len >= 2 { completedSep[nextPos] = true }
+                }
+            }
+            if let immMap {
+                for (tid, len) in immMap {
+                    recordRun(&sepRun, nextPos, tid, len)
+                    if len >= 2 { completedSep[nextPos] = true }
+                }
             }
         }
 
@@ -964,42 +963,124 @@ private func findSwiftLeadingHallucinationCut(
             let endPos = p + 1
             if endPos < n && endPos != map.clusterStart[endPos] { continue }
 
-            var startCost = termStartsAscii[termId] ? cCost : bestCost
-            var startNode = termStartsAscii[termId] ? clearedNode[pos] : bestNode
-            if let sameEntry = sameMap?[termId], sameEntry.cost < startCost {
-                startCost = sameEntry.cost
-                startNode = sameEntry.node
+            var nextLen = canStartFresh ? 1 : 0
+            if let prevRun = runMap?[termId], prevRun >= 1 {
+                nextLen = max(nextLen, prevRun >= 2 ? 2 : prevRun + 1)
             }
-            if startCost >= inf || startNode < 0 { continue }
-
-            let nextCost = startCost + 1
-            let newNode = nodePrev.count
-            nodePrev.append(startNode)
-            nodeTerm.append(termId)
+            if let prevImm = immMap?[termId], prevImm >= 1 {
+                nextLen = max(nextLen, prevImm >= 2 ? 2 : prevImm + 1)
+            }
+            if nextLen == 0 { continue }
 
             if !termEndsAscii[termId] || endPos == n {
-                if nextCost < clearedCost[endPos] {
-                    clearedCost[endPos] = nextCost
-                    clearedNode[endPos] = newNode
-                    clearedFromSep[endPos] = false
-                    clearedSepHasEnd[endPos] = false
-                }
+                recordRun(&sepRun, endPos, termId, nextLen)
             } else {
-                if nextCost < endedAsciiCost[endPos] {
-                    endedAsciiCost[endPos] = nextCost
-                    endedAsciiNode[endPos] = newNode
+                if immediateSame == nil {
+                    immediateSame = [[Int: Int]?](repeating: nil, count: n + 1)
                 }
+                recordRun(&immediateSame!, endPos, termId, nextLen)
+            }
+        }
+    }
+
+    return bestCut
+}
+
+private func findSwiftLeadingRuleBCut(
+    map: SwiftNormalizedClusterMap,
+    root: HotwordTrieNode,
+    termStartsAscii: [Bool],
+    termEndsAscii: [Bool],
+    termFirstChars: [Character]
+) -> Int {
+    let chars = map.chars
+    let n = chars.count
+    guard n > 0 else { return 0 }
+
+    var clearedState = [SwiftDistinct3State?](repeating: nil, count: n + 1)
+    var clearedFromSep = [Bool](repeating: false, count: n + 1)
+    var clearedSepHasEnd = [Bool](repeating: false, count: n + 1)
+    var endedAsciiState = [SwiftDistinct3State?](repeating: nil, count: n + 1)
+    var sameState = [[Int: SwiftDistinct3State]?](repeating: nil, count: n + 1)
+
+    clearedState[0] = SwiftDistinct3State()
+    var bestCut = 0
+
+    func pickBetter(_ a: SwiftDistinct3State?, _ b: SwiftDistinct3State) -> SwiftDistinct3State {
+        guard let a else { return b }
+        return b.count > a.count ? b : a
+    }
+
+    for pos in 0..<n {
+        let cSt = clearedState[pos]
+        let aSt = endedAsciiState[pos]
+        let sMap = sameState[pos]
+        sameState[pos] = nil
+        if cSt == nil && aSt == nil && sMap == nil { continue }
+
+        var bestOpt = cSt
+        if let aSt { bestOpt = pickBetter(bestOpt, aSt) }
+        if let sMap {
+            for st in sMap.values { bestOpt = pickBetter(bestOpt, st) }
+        }
+        guard let bestSt = bestOpt else { continue }
+
+        if pos > 0
+            && pos == map.clusterStart[pos]
+            && !map.isSep[pos]
+            && clearedFromSep[pos]
+            && clearedSepHasEnd[pos]
+            && (cSt?.count ?? 0) >= 3
+            && hasValidSwiftLeadingSep(map, pos: pos) {
+            bestCut = pos
+        }
+
+        if map.isSep[pos] {
+            let nextPos = pos + 1
+            let propagatedFromCleared = cSt != nil && bestSt.count == cSt!.count
+            let nextEnd = (propagatedFromCleared && clearedFromSep[pos] && clearedSepHasEnd[pos]) || map.isSentenceEnd[pos]
+            if !(bestSt.count >= 3 && map.isSentenceEnd[pos] && clearedFromSep[pos] && clearedSepHasEnd[pos]) {
+                let existing = clearedState[nextPos]
+                if existing == nil || bestSt.count > existing!.count || (bestSt.count == existing!.count && nextEnd && !clearedSepHasEnd[nextPos]) {
+                    clearedState[nextPos] = bestSt
+                    clearedFromSep[nextPos] = true
+                    clearedSepHasEnd[nextPos] = nextEnd
+                }
+            }
+        }
+
+        if pos != map.clusterStart[pos] { continue }
+        if clearedFromSep[pos] && clearedSepHasEnd[pos] && (cSt?.count ?? 0) >= 3 {
+            continue
+        }
+
+        var node: HotwordTrieNode? = root
+        for p in pos..<n {
+            node = node?.children[chars[p]]
+            guard let cur = node else { break }
+            let termId = cur.termId
+            if termId < 0 { continue }
+
+            let endPos = p + 1
+            if endPos < n && endPos != map.clusterStart[endPos] { continue }
+
+            var startSt = termStartsAscii[termId] ? cSt : bestSt
+            if let sameEntry = sMap?[termId], (startSt == nil || sameEntry.count > startSt!.count) {
+                startSt = sameEntry
+            }
+            guard let s = startSt else { continue }
+
+            let nextSt = advanceSwiftDistinct3(s, termId: termId)
+            if !termEndsAscii[termId] || endPos == n {
+                clearedState[endPos] = pickBetter(clearedState[endPos], nextSt)
+                clearedFromSep[endPos] = false
+                clearedSepHasEnd[endPos] = false
+            } else {
+                endedAsciiState[endPos] = pickBetter(endedAsciiState[endPos], nextSt)
                 if termStartsAscii[termId] && chars[endPos] == termFirstChars[termId] {
-                    if sameTermStates == nil {
-                        sameTermStates = [[Int: (cost: Int, node: Int)]?](repeating: nil, count: n + 1)
-                    }
-                    var targetMap = sameTermStates![endPos] ?? [:]
-                    if let prev = targetMap[termId] {
-                        if nextCost < prev.cost { targetMap[termId] = (nextCost, newNode) }
-                    } else {
-                        targetMap[termId] = (nextCost, newNode)
-                    }
-                    sameTermStates![endPos] = targetMap
+                    var targetMap = sameState[endPos] ?? [:]
+                    targetMap[termId] = pickBetter(targetMap[termId], nextSt)
+                    sameState[endPos] = targetMap
                 }
             }
         }
@@ -1008,56 +1089,73 @@ private func findSwiftLeadingHallucinationCut(
     return bestCut
 }
 
-private func findSwiftTrailingHallucinationCut(
+private func findSwiftLeadingHallucinationCut(
     map: SwiftNormalizedClusterMap,
-    revRoot: HotwordTrieNode,
+    root: HotwordTrieNode,
     termStartsAscii: [Bool],
     termEndsAscii: [Bool],
-    termLastChars: [Character]
+    termFirstChars: [Character]
+) -> Int {
+    return max(
+        findSwiftLeadingRuleACut(map: map, root: root, termEndsAscii: termEndsAscii),
+        findSwiftLeadingRuleBCut(
+            map: map,
+            root: root,
+            termStartsAscii: termStartsAscii,
+            termEndsAscii: termEndsAscii,
+            termFirstChars: termFirstChars
+        )
+    )
+}
+
+private func findSwiftTrailingRuleACut(
+    map: SwiftNormalizedClusterMap,
+    revRoot: HotwordTrieNode,
+    termStartsAscii: [Bool]
 ) -> Int {
     let chars = map.chars
     let n = chars.count
     guard n > 0 else { return n }
 
-    let inf = 0x3FFF_FFFF
-    var revClearedCost = [Int](repeating: inf, count: n + 1)
-    var revClearedNode = [Int](repeating: -1, count: n + 1)
-    var revStartedAsciiCost = [Int](repeating: inf, count: n + 1)
-    var revStartedAsciiNode = [Int](repeating: -1, count: n + 1)
-    var revSameStates: [[Int: (cost: Int, node: Int)]?]? = nil
-
-    var nodePrev = [-1]
-    var nodeTerm = [-1]
-    revClearedCost[n] = 0
-    revClearedNode[n] = 0
+    var completedSep = [Bool](repeating: false, count: n + 1)
+    var sepRun = [[Int: Int]?](repeating: nil, count: n + 1)
+    var revSame: [[Int: Int]?]? = nil
+    completedSep[n] = true
     var bestTermStart = n
+
+    func recordRun(_ arr: inout [[Int: Int]?], _ pos: Int, _ tid: Int, _ len: Int) {
+        var m = arr[pos] ?? [:]
+        if len > (m[tid] ?? 0) {
+            m[tid] = len
+            arr[pos] = m
+        }
+    }
 
     for pos in stride(from: n, to: 0, by: -1) {
         if pos < n && pos != map.clusterStart[pos] { continue }
-        let cCost = revClearedCost[pos]
-        let aCost = revStartedAsciiCost[pos]
-        let sameMap = revSameStates?[pos] ?? nil
-        revSameStates?[pos] = nil
-        if cCost == inf && aCost == inf && sameMap == nil { continue }
-
-        var bestCost = cCost
-        var bestNode = revClearedNode[pos]
-        if aCost < bestCost {
-            bestCost = aCost
-            bestNode = revStartedAsciiNode[pos]
-        }
-        if let sameMap {
-            for entry in sameMap.values where entry.cost < bestCost {
-                bestCost = entry.cost
-                bestNode = entry.node
-            }
-        }
+        let canEndFresh = completedSep[pos]
+        let runMap = sepRun[pos]
+        let immMap = revSame?[pos] ?? nil
+        sepRun[pos] = nil
+        revSame?[pos] = nil
+        if !canEndFresh && runMap == nil && immMap == nil { continue }
 
         let prevClusterStart = map.clusterStart[pos - 1]
         if map.isSep[prevClusterStart] {
-            if bestCost < revClearedCost[prevClusterStart] {
-                revClearedCost[prevClusterStart] = bestCost
-                revClearedNode[prevClusterStart] = bestNode
+            if canEndFresh {
+                completedSep[prevClusterStart] = true
+            }
+            if let runMap {
+                for (tid, len) in runMap {
+                    recordRun(&sepRun, prevClusterStart, tid, len)
+                    if len >= 2 { completedSep[prevClusterStart] = true }
+                }
+            }
+            if let immMap {
+                for (tid, len) in immMap {
+                    recordRun(&sepRun, prevClusterStart, tid, len)
+                    if len >= 2 { completedSep[prevClusterStart] = true }
+                }
             }
         }
 
@@ -1069,76 +1167,150 @@ private func findSwiftTrailingHallucinationCut(
             if termId < 0 { continue }
             if p != map.clusterStart[p] { continue }
 
-            var rightCost = termEndsAscii[termId] ? cCost : bestCost
-            var rightNode = termEndsAscii[termId] ? revClearedNode[pos] : bestNode
-            if let sameEntry = sameMap?[termId], sameEntry.cost < rightCost {
-                rightCost = sameEntry.cost
-                rightNode = sameEntry.node
+            var nextLen = canEndFresh ? 1 : 0
+            if let prevRun = runMap?[termId], prevRun >= 1 {
+                nextLen = max(nextLen, prevRun >= 2 ? 2 : prevRun + 1)
             }
-            if rightCost >= inf || rightNode < 0 { continue }
-
-            let nextCost = rightCost + 1
-            let newNode = nodePrev.count
-            nodePrev.append(rightNode)
-            nodeTerm.append(termId)
+            if let prevImm = immMap?[termId], prevImm >= 1 {
+                nextLen = max(nextLen, prevImm >= 2 ? 2 : prevImm + 1)
+            }
+            if nextLen == 0 { continue }
 
             if !termStartsAscii[termId] || p == 0 {
-                if nextCost < revClearedCost[p] {
-                    revClearedCost[p] = nextCost
-                    revClearedNode[p] = newNode
-                }
+                recordRun(&sepRun, p, termId, nextLen)
             } else {
-                if nextCost < revStartedAsciiCost[p] {
-                    revStartedAsciiCost[p] = nextCost
-                    revStartedAsciiNode[p] = newNode
+                if revSame == nil {
+                    revSame = [[Int: Int]?](repeating: nil, count: n + 1)
                 }
-                if termEndsAscii[termId] && p > 0 && chars[p - 1] == termLastChars[termId] {
-                    if revSameStates == nil {
-                        revSameStates = [[Int: (cost: Int, node: Int)]?](repeating: nil, count: n + 1)
-                    }
-                    var targetMap = revSameStates![p] ?? [:]
-                    if let prev = targetMap[termId] {
-                        if nextCost < prev.cost { targetMap[termId] = (nextCost, newNode) }
-                    } else {
-                        targetMap[termId] = (nextCost, newNode)
-                    }
-                    revSameStates![p] = targetMap
-                }
+                recordRun(&revSame!, p, termId, nextLen)
             }
 
-            if p > 0 {
-                var sepScan = p
-                var sentEnd = false
-                var hasRealSep = false
-                while sepScan > 0 {
-                    let c = map.clusterStart[sepScan - 1]
-                    if !map.isSep[c] { break }
-                    for k in c..<sepScan {
-                        if map.isSentenceEnd[k] { sentEnd = true }
-                        if !map.isIntraWordPunct[k] { hasRealSep = true }
-                    }
-                    sepScan = c
-                }
-                let hasSepBefore = sepScan < p
-                let beforeSepAscii = sepScan > 0 ? map.isAsciiAlnum[sepScan - 1] : false
-                if isSwiftChainQualifiedHallucination(
-                    nodeIdx: newNode,
-                    nodePrev: nodePrev,
-                    nodeTerm: nodeTerm,
-                    requireSentenceEndForDistinct: true,
-                    hasSentenceEnd: sentEnd
-                ) {
-                    let validBoundary = hasSepBefore
-                        ? !(termStartsAscii[termId] && !hasRealSep && beforeSepAscii)
-                        : (termStartsAscii[termId] && !beforeSepAscii)
-                    if validBoundary && p < bestTermStart {
-                        bestTermStart = p
-                    }
+            if nextLen >= 2 && p > 0 {
+                let (valid, _) = isValidSwiftTrailingLeftBoundary(map, p: p, termStartsAscii: termStartsAscii[termId])
+                if valid && p < bestTermStart {
+                    bestTermStart = p
                 }
             }
         }
     }
 
+    return bestTermStart
+}
+
+private func findSwiftTrailingRuleBCut(
+    map: SwiftNormalizedClusterMap,
+    revRoot: HotwordTrieNode,
+    termStartsAscii: [Bool],
+    termEndsAscii: [Bool],
+    termLastChars: [Character]
+) -> Int {
+    let chars = map.chars
+    let n = chars.count
+    guard n > 0 else { return n }
+
+    var revCleared = [SwiftDistinct3State?](repeating: nil, count: n + 1)
+    var revClearedLocked = [Bool](repeating: false, count: n + 1)
+    var revStartedAscii = [SwiftDistinct3State?](repeating: nil, count: n + 1)
+    var revSame = [[Int: SwiftDistinct3State]?](repeating: nil, count: n + 1)
+
+    revCleared[n] = SwiftDistinct3State()
+    var bestTermStart = n
+
+    func pickBetter(_ a: SwiftDistinct3State?, _ b: SwiftDistinct3State) -> SwiftDistinct3State {
+        guard let a else { return b }
+        return b.count > a.count ? b : a
+    }
+
+    for pos in stride(from: n, to: 0, by: -1) {
+        if pos < n && pos != map.clusterStart[pos] { continue }
+        let cSt = revCleared[pos]
+        let aSt = revStartedAscii[pos]
+        let sMap = revSame[pos]
+        revSame[pos] = nil
+        if cSt == nil && aSt == nil && sMap == nil { continue }
+
+        var bestOpt = cSt
+        if let aSt { bestOpt = pickBetter(bestOpt, aSt) }
+        if let sMap {
+            for st in sMap.values { bestOpt = pickBetter(bestOpt, st) }
+        }
+        guard let bestSt = bestOpt else { continue }
+
+        let prevClusterStart = map.clusterStart[pos - 1]
+        if map.isSep[prevClusterStart] {
+            var sepHasEnd = false
+            for k in prevClusterStart..<pos where map.isSentenceEnd[k] {
+                sepHasEnd = true
+                break
+            }
+            let crossedAfterValid = bestSt.count >= 3 && sepHasEnd
+            if !(bestSt.count >= 3 && revClearedLocked[pos]) {
+                let existing = revCleared[prevClusterStart]
+                if existing == nil || bestSt.count > existing!.count {
+                    revCleared[prevClusterStart] = bestSt
+                    revClearedLocked[prevClusterStart] = revClearedLocked[pos] || crossedAfterValid
+                }
+            }
+        }
+
+        if revClearedLocked[pos] { continue }
+
+        var revNode: HotwordTrieNode? = revRoot
+        for p in stride(from: pos - 1, through: 0, by: -1) {
+            revNode = revNode?.children[chars[p]]
+            guard let cur = revNode else { break }
+            let termId = cur.termId
+            if termId < 0 { continue }
+            if p != map.clusterStart[p] { continue }
+
+            var rightSt = termEndsAscii[termId] ? cSt : bestSt
+            if let sameEntry = sMap?[termId], (rightSt == nil || sameEntry.count > rightSt!.count) {
+                rightSt = sameEntry
+            }
+            guard let r = rightSt else { continue }
+
+            let nextSt = advanceSwiftDistinct3(r, termId: termId)
+            if !termStartsAscii[termId] || p == 0 {
+                revCleared[p] = pickBetter(revCleared[p], nextSt)
+            } else {
+                revStartedAscii[p] = pickBetter(revStartedAscii[p], nextSt)
+                if termEndsAscii[termId] && p > 0 && chars[p - 1] == termLastChars[termId] {
+                    var targetMap = revSame[p] ?? [:]
+                    targetMap[termId] = pickBetter(targetMap[termId], nextSt)
+                    revSame[p] = targetMap
+                }
+            }
+
+            if nextSt.count >= 3 && p > 0 {
+                let (valid, sentEnd) = isValidSwiftTrailingLeftBoundary(map, p: p, termStartsAscii: termStartsAscii[termId])
+                if valid && sentEnd && p < bestTermStart {
+                    bestTermStart = p
+                }
+            }
+        }
+    }
+
+    return bestTermStart
+}
+
+private func findSwiftTrailingHallucinationCut(
+    map: SwiftNormalizedClusterMap,
+    revRoot: HotwordTrieNode,
+    termStartsAscii: [Bool],
+    termEndsAscii: [Bool],
+    termLastChars: [Character]
+) -> Int {
+    let n = map.chars.count
+    guard n > 0 else { return n }
+    let startA = findSwiftTrailingRuleACut(map: map, revRoot: revRoot, termStartsAscii: termStartsAscii)
+    let startB = findSwiftTrailingRuleBCut(
+        map: map,
+        revRoot: revRoot,
+        termStartsAscii: termStartsAscii,
+        termEndsAscii: termEndsAscii,
+        termLastChars: termLastChars
+    )
+    let bestTermStart = min(startA, startB)
     guard bestTermStart < n else { return n }
     var cutNorm = bestTermStart
     while cutNorm > 0 {
@@ -1214,8 +1386,8 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
         revNode.termId = termId
     }
 
-    let wholeMap = buildSwiftNormalizedClusterMap(text)
-    let chars = wholeMap.chars
+    // Whole-string check normalizes the entire text via NFKC directly to preserve cross-codepoint Hangul/combining composition.
+    let chars = normalizeHotwordMatchCharacters(text)
     let n = chars.count
     guard n > 0 else { return text }
 
@@ -1233,7 +1405,7 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
         if cCount == inf && aCount == inf && sameMap == nil { continue }
         let bestAtPos = min(cCount, aCount)
 
-        if wholeMap.isSep[pos] {
+        if isHotwordHallucinationSeparator(chars[pos]) {
             var sepMin = bestAtPos
             if let sameMap {
                 for cost in sameMap.values where cost < sepMin {
@@ -1245,8 +1417,6 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
             }
         }
 
-        if pos != wholeMap.clusterStart[pos] { continue }
-
         var node: HotwordTrieNode? = root
         for p in pos..<n {
             node = node?.children[chars[p]]
@@ -1254,15 +1424,13 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
             let termId = cur.termId
             if termId < 0 { continue }
 
-            let endPos = p + 1
-            if endPos < n && endPos != wholeMap.clusterStart[endPos] { continue }
-
             var startCost = termStartsAscii[termId] ? cCount : bestAtPos
             if let sameCost = sameMap?[termId], sameCost < startCost {
                 startCost = sameCost
             }
             if startCost >= inf { continue }
 
+            let endPos = p + 1
             let nextCost = startCost + 1
             if !termEndsAscii[termId] || endPos == n {
                 if nextCost < cleared[endPos] {
@@ -1296,6 +1464,7 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
     }
 
     var current = text
+    let wholeMap = buildSwiftNormalizedClusterMap(current)
     let leadCutNorm = findSwiftLeadingHallucinationCut(
         map: wholeMap,
         root: root,
@@ -1303,7 +1472,7 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
         termEndsAscii: termEndsAscii,
         termFirstChars: termFirstChars
     )
-    if leadCutNorm > 0 && leadCutNorm < n {
+    if leadCutNorm > 0 && leadCutNorm < wholeMap.chars.count {
         current = String(current[wholeMap.normToRawIndex[leadCutNorm]...])
     }
     guard !current.isEmpty else { return "" }

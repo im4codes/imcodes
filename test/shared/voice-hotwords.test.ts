@@ -433,6 +433,29 @@ describe('shared voice hotwords', () => {
     expect(
       stripVoiceHotwordHallucination('IM.codes，IM.codes。你好世界。IM.codes，IM.codes。', ['IM.codes']),
     ).toBe('你好世界。');
+
+    // Cross-platform shared matrix: non-adjacent A/B/A preservation, preceding sentence protection,
+    // adjacent A/A & sentence-bound A/B/C, Hangul Jamo composition, NFD vs NFC, distinct accents, emoji.
+    expect(
+      stripVoiceHotwordHallucination('IM.codes, Codex, IM.codes 都是我在用的工具', ['IM.codes', 'Codex']),
+    ).toBe('IM.codes, Codex, IM.codes 都是我在用的工具');
+    expect(
+      stripVoiceHotwordHallucination('Codex。IM.codes，IM.codes。你好', ['IM.codes', 'Codex']),
+    ).toBe('Codex。IM.codes，IM.codes。你好');
+    expect(
+      stripVoiceHotwordHallucination('IM.codes，IM.codes。Codex。你好', ['IM.codes', 'Codex']),
+    ).toBe('Codex。你好');
+    expect(
+      stripVoiceHotwordHallucination('打开 Codex，IM.codes，IM.codes。', ['IM.codes', 'Codex']),
+    ).toBe('打开 Codex');
+    expect(
+      stripVoiceHotwordHallucination('先看。Codex。IM.codes, Claude, Qwen。', ['IM.codes', 'Codex', 'Claude', 'Qwen']),
+    ).toBe('先看。Codex。');
+    expect(stripVoiceHotwordHallucination('가, 가', ['가'])).toBe('');
+    expect(stripVoiceHotwordHallucination('가, 가。你好', ['가'])).toBe('你好');
+    expect(stripVoiceHotwordHallucination('Café, Cafe\u0301。你好', ['Café'])).toBe('你好');
+    expect(stripVoiceHotwordHallucination('code\u0301, code。你好', ['code'])).toBe('code\u0301, code。你好');
+    expect(stripVoiceHotwordHallucination('cod\u0301, code。你好', ['code'])).toBe('cod\u0301, code。你好');
     expect(stripVoiceHotwordHallucination('IM.codes', null, { silentAudio: true })).toBe('IM.codes');
 
     // Performance bound: 60 hotwords across ~1000 chars stays sub-millisecond (including shared-prefix unmatchable text)

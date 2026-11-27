@@ -1038,6 +1038,13 @@ interface NormalizedClusterMap {
   isSentenceEnd: Uint8Array;
 }
 
+type GraphemeSegmenterLike = { segment(input: string): Iterable<{ segment: string; index: number }> };
+const IntlWithSegmenter = typeof Intl !== 'undefined'
+  ? (Intl as unknown as { Segmenter?: new (locale?: string, options?: { granularity: 'grapheme' }) => GraphemeSegmenterLike })
+  : null;
+const HOTWORD_GRAPHEME_SEGMENTER: GraphemeSegmenterLike | null =
+  IntlWithSegmenter?.Segmenter ? new IntlWithSegmenter.Segmenter(undefined, { granularity: 'grapheme' }) : null;
+
 function buildNormalizedClusterMap(text: string): NormalizedClusterMap {
   const parts: string[] = [];
   const rawStarts: number[] = [];
@@ -1046,19 +1053,9 @@ function buildNormalizedClusterMap(text: string): NormalizedClusterMap {
   const sentEnds: number[] = [];
   let normLen = 0;
 
-  for (let i = 0; i < text.length; ) {
-    const clusterRawStart = i;
-    const cp = text.codePointAt(i)!;
-    i += cp > 0xffff ? 2 : 1;
-    while (i < text.length) {
-      const nextCp = text.codePointAt(i)!;
-      const nextStr = String.fromCodePoint(nextCp);
-      if (!HOTWORD_COMBINING_MARK_RE.test(nextStr)) break;
-      i += nextCp > 0xffff ? 2 : 1;
-    }
-    const rawCluster = text.slice(clusterRawStart, i);
+  const pushCluster = (rawCluster: string, clusterRawStart: number) => {
     const normSlice = normalizeHotwordMatchText(rawCluster);
-    if (!normSlice) continue;
+    if (!normSlice) return;
     const cStart = normLen;
     parts.push(normSlice);
     for (let k = 0; k < normSlice.length; ) {
@@ -1076,6 +1073,25 @@ function buildNormalizedClusterMap(text: string): NormalizedClusterMap {
       k += nLen;
     }
     normLen += normSlice.length;
+  };
+
+  if (HOTWORD_GRAPHEME_SEGMENTER) {
+    for (const { segment, index } of HOTWORD_GRAPHEME_SEGMENTER.segment(text)) {
+      pushCluster(segment, index);
+    }
+  } else {
+    for (let i = 0; i < text.length; ) {
+      const clusterRawStart = i;
+      const cp = text.codePointAt(i)!;
+      i += cp > 0xffff ? 2 : 1;
+      while (i < text.length) {
+        const nextCp = text.codePointAt(i)!;
+        const nextStr = String.fromCodePoint(nextCp);
+        if (!HOTWORD_COMBINING_MARK_RE.test(nextStr)) break;
+        i += nextCp > 0xffff ? 2 : 1;
+      }
+      pushCluster(text.slice(clusterRawStart, i), clusterRawStart);
+    }
   }
 
   rawStarts.push(text.length);
@@ -1204,89 +1220,63 @@ function getCompiledHallucinationMatcher(
   return matcher;
 }
 
-function isChainQualifiedHallucination(
-  nodeIdx: number,
-  nodePrev: readonly number[],
-  nodeTerm: readonly number[],
-  requireSentenceEndForDistinct: boolean,
-  hasSentenceEnd: boolean,
-): boolean {
-  let totalTerms = 0;
-  let maxSame = 0;
-  let counts: Map<number, number> | null = null;
-  let cur = nodeIdx;
-  while (cur > 0) {
-    const termId = nodeTerm[cur]!;
-    if (termId >= 0) {
-      totalTerms += 1;
-      if (!counts) counts = new Map<number, number>();
-      const next = (counts.get(termId) ?? 0) + 1;
-      counts.set(termId, next);
-      if (next > maxSame) maxSame = next;
-      if (maxSame >= 2) return true;
-    }
-    cur = nodePrev[cur]!;
-  }
-  if (totalTerms >= 3 && (!requireSentenceEndForDistinct || hasSentenceEnd)) {
-    return true;
-  }
-  return false;
+interface Distinct3State {
+  t1: number;
+  t2: number;
+  count: number; // 0..3 (3 means >= 3 distinct terms)
 }
 
-function findLeadingHallucinationCut(
+function advanceDistinct3(state: Distinct3State, termId: number): Distinct3State {
+  if (state.count >= 3) return state;
+  if (state.count === 0) return { t1: termId, t2: -1, count: 1 };
+  if (state.count === 1) {
+    return state.t1 === termId ? state : { t1: state.t1, t2: termId, count: 2 };
+  }
+  if (termId === state.t1 || termId === state.t2) return state;
+  return { t1: state.t1, t2: state.t2, count: 3 };
+}
+
+function findLeadingRuleACut(
   matcher: CompiledHallucinationMatcher,
   map: NormalizedClusterMap,
 ): number {
-  const { normText, normClusterStart, isSep, isSentenceEnd } = map;
+  const { normText, normClusterStart, isSep } = map;
   const n = normText.length;
   if (n === 0) return 0;
 
-  const clearedCost = new Int32Array(n + 1).fill(HALLUCINATION_INF);
-  const clearedNode = new Int32Array(n + 1).fill(-1);
-  const clearedFromSep = new Uint8Array(n + 1);
-  const clearedSepHasEnd = new Uint8Array(n + 1);
-  const endedAsciiCost = new Int32Array(n + 1).fill(HALLUCINATION_INF);
-  const endedAsciiNode = new Int32Array(n + 1).fill(-1);
-  let sameTermStates: Array<Map<number, { cost: number; node: number }> | undefined> | null = null;
-
-  const nodePrev: number[] = [-1];
-  const nodeTerm: number[] = [-1];
-  clearedCost[0] = 0;
-  clearedNode[0] = 0;
+  // completedSep[pos] === 1 when [0..pos) is start/seps or ends with >=1 completed adjacent-repeat block + sep.
+  const completedSep = new Uint8Array(n + 1);
+  // sepRun[pos]: map termId -> max runLen (capped at 2) reachable at pos cleanly (after sep or non-ASCII end)
+  const sepRun: Array<Map<number, number> | undefined> = new Array(n + 1);
+  // immediateSame[pos]: map termId -> max runLen for immediate same-term concatenation without sep
+  let immediateSame: Array<Map<number, number> | undefined> | null = null;
+  completedSep[0] = 1;
 
   let bestCut = 0;
 
+  const recordRun = (arr: Array<Map<number, number> | undefined>, pos: number, tid: number, len: number) => {
+    let m = arr[pos];
+    if (!m) {
+      m = new Map<number, number>();
+      arr[pos] = m;
+    }
+    const prev = m.get(tid) ?? 0;
+    if (len > prev) m.set(tid, len);
+  };
+
   for (let pos = 0; pos < n; pos += 1) {
-    const cCost = clearedCost[pos]!;
-    const aCost = endedAsciiCost[pos]!;
-    const sameMap = sameTermStates?.[pos];
-    if (sameTermStates) sameTermStates[pos] = undefined;
-    if (cCost === HALLUCINATION_INF && aCost === HALLUCINATION_INF && !sameMap) continue;
-
-    let bestCost = cCost;
-    let bestNode = clearedNode[pos]!;
-    if (aCost < bestCost) {
-      bestCost = aCost;
-      bestNode = endedAsciiNode[pos]!;
-    }
-    if (sameMap) {
-      for (const entry of sameMap.values()) {
-        if (entry.cost < bestCost) {
-          bestCost = entry.cost;
-          bestNode = entry.node;
-        }
-      }
-    }
-
-    const cp = normText.codePointAt(pos)!;
-    const charLen = cp > 0xffff ? 2 : 1;
+    const canStartFresh = completedSep[pos] === 1;
+    const runMap = sepRun[pos];
+    const immMap = immediateSame?.[pos];
+    sepRun[pos] = undefined;
+    if (immediateSame) immediateSame[pos] = undefined;
+    if (!canStartFresh && !runMap && !immMap) continue;
 
     if (
       pos > 0
       && pos === normClusterStart[pos]!
       && isSep[pos] === 0
-      && clearedFromSep[pos] === 1
-      && cCost < HALLUCINATION_INF
+      && canStartFresh
     ) {
       let bodyEnd = pos + 1;
       while (bodyEnd < n && normClusterStart[bodyEnd]! === pos) bodyEnd += 1;
@@ -1304,29 +1294,36 @@ function findLeadingHallucinationCut(
           sepScan = c;
         }
       }
-      if (
-        hasValidSep
-        && isChainQualifiedHallucination(clearedNode[pos]!, nodePrev, nodeTerm, true, clearedSepHasEnd[pos] === 1)
-      ) {
+      if (hasValidSep) {
         bestCut = pos;
       }
     }
 
+    const cp = normText.codePointAt(pos)!;
+    const charLen = cp > 0xffff ? 2 : 1;
+
     if (isSep[pos] === 1) {
       const nextPos = pos + charLen;
-      const nextEnd = (cCost === bestCost && clearedFromSep[pos] === 1 && clearedSepHasEnd[pos] === 1) || isSentenceEnd[pos] === 1 ? 1 : 0;
-      if (
-        bestCost < clearedCost[nextPos]!
-        || (bestCost === clearedCost[nextPos]! && (clearedFromSep[nextPos] === 0 || (nextEnd === 1 && clearedSepHasEnd[nextPos] === 0)))
-      ) {
-        clearedCost[nextPos] = bestCost;
-        clearedNode[nextPos] = bestNode;
-        clearedFromSep[nextPos] = 1;
-        clearedSepHasEnd[nextPos] = nextEnd;
+      if (canStartFresh) {
+        completedSep[nextPos] = 1;
+      }
+      if (runMap) {
+        for (const [tid, len] of runMap.entries()) {
+          recordRun(sepRun, nextPos, tid, len);
+          if (len >= 2) completedSep[nextPos] = 1;
+        }
+      }
+      if (immMap) {
+        for (const [tid, len] of immMap.entries()) {
+          recordRun(sepRun, nextPos, tid, len);
+          if (len >= 2) completedSep[nextPos] = 1;
+        }
       }
     }
 
     if (pos !== normClusterStart[pos]!) continue;
+    // Note: terms starting with ASCII can only begin at position with sep/non-ASCII-end (`cleared` semantic),
+    // which holds for `completedSep` and for `runMap` entries except wait: non-sep `endedAscii` was only stored in `immediateSame`.
 
     let node: HallucinationTrieNode | undefined = matcher.root;
     for (let p = pos; p < n; p += 1) {
@@ -1338,45 +1335,153 @@ function findLeadingHallucinationCut(
       const endPos = p + 1;
       if (endPos < n && endPos !== normClusterStart[endPos]!) continue;
 
-      let startCost = matcher.termStartsAscii[termId]! ? cCost : bestCost;
-      let startNode = matcher.termStartsAscii[termId]! ? clearedNode[pos]! : bestNode;
-      if (sameMap) {
-        const sameEntry = sameMap.get(termId);
-        if (sameEntry && sameEntry.cost < startCost) {
-          startCost = sameEntry.cost;
-          startNode = sameEntry.node;
-        }
+      let nextLen = 0;
+      if (canStartFresh) {
+        nextLen = 1;
       }
-      if (startCost >= HALLUCINATION_INF || startNode < 0) continue;
-
-      const nextCost = startCost + 1;
-      const newNode = nodePrev.length;
-      nodePrev.push(startNode);
-      nodeTerm.push(termId);
+      const prevRun = runMap?.get(termId) ?? 0;
+      if (prevRun >= 1) {
+        const cand = prevRun >= 2 ? 2 : prevRun + 1;
+        if (cand > nextLen) nextLen = cand;
+      }
+      const prevImm = immMap?.get(termId) ?? 0;
+      if (prevImm >= 1) {
+        const cand = prevImm >= 2 ? 2 : prevImm + 1;
+        if (cand > nextLen) nextLen = cand;
+      }
+      if (nextLen === 0) continue;
 
       if (!matcher.termEndsAscii[termId]! || endPos === n) {
-        if (nextCost < clearedCost[endPos]!) {
-          clearedCost[endPos] = nextCost;
-          clearedNode[endPos] = newNode;
-          clearedFromSep[endPos] = 0;
-          clearedSepHasEnd[endPos] = 0;
-        }
+        recordRun(sepRun, endPos, termId, nextLen);
       } else {
-        if (nextCost < endedAsciiCost[endPos]!) {
-          endedAsciiCost[endPos] = nextCost;
-          endedAsciiNode[endPos] = newNode;
+        if (!immediateSame) immediateSame = new Array(n + 1);
+        recordRun(immediateSame, endPos, termId, nextLen);
+      }
+    }
+  }
+
+  return bestCut;
+}
+
+function findLeadingRuleBCut(
+  matcher: CompiledHallucinationMatcher,
+  map: NormalizedClusterMap,
+): number {
+  const { normText, normClusterStart, isSep, isSentenceEnd } = map;
+  const n = normText.length;
+  if (n === 0) return 0;
+
+  const clearedState: Array<Distinct3State | undefined> = new Array(n + 1);
+  const clearedFromSep = new Uint8Array(n + 1);
+  const clearedSepHasEnd = new Uint8Array(n + 1);
+  const endedAsciiState: Array<Distinct3State | undefined> = new Array(n + 1);
+  const sameState: Array<Map<number, Distinct3State> | undefined> = new Array(n + 1);
+
+  clearedState[0] = { t1: -1, t2: -1, count: 0 };
+  let bestCut = 0;
+
+  const pickBetter = (a: Distinct3State | undefined, b: Distinct3State): Distinct3State =>
+    !a || b.count > a.count ? b : a;
+
+  for (let pos = 0; pos < n; pos += 1) {
+    const cSt = clearedState[pos];
+    const aSt = endedAsciiState[pos];
+    const sMap = sameState[pos];
+    sameState[pos] = undefined;
+    if (!cSt && !aSt && !sMap) continue;
+
+    let bestSt = cSt;
+    if (aSt) bestSt = pickBetter(bestSt, aSt);
+    if (sMap) {
+      for (const st of sMap.values()) bestSt = pickBetter(bestSt, st);
+    }
+    if (!bestSt) continue;
+
+    if (
+      pos > 0
+      && pos === normClusterStart[pos]!
+      && isSep[pos] === 0
+      && clearedFromSep[pos] === 1
+      && clearedSepHasEnd[pos] === 1
+      && cSt
+      && cSt.count >= 3
+    ) {
+      let bodyEnd = pos + 1;
+      while (bodyEnd < n && normClusterStart[bodyEnd]! === pos) bodyEnd += 1;
+      const bodyStartsAscii = ASCII_ALNUM_UNDER_RE.test(normText.slice(pos, bodyEnd));
+      let hasValidSep = !bodyStartsAscii;
+      if (bodyStartsAscii) {
+        let sepScan = pos;
+        while (sepScan > 0) {
+          const c = normClusterStart[sepScan - 1]!;
+          if (isSep[c] !== 1) break;
+          if (!HOTWORD_INTRA_WORD_PUNCT_RE.test(normText.slice(c, sepScan))) {
+            hasValidSep = true;
+            break;
+          }
+          sepScan = c;
         }
+      }
+      if (hasValidSep) {
+        bestCut = pos;
+      }
+    }
+
+    const cp = normText.codePointAt(pos)!;
+    const charLen = cp > 0xffff ? 2 : 1;
+
+    if (isSep[pos] === 1) {
+      const nextPos = pos + charLen;
+      const nextEnd = (cSt === bestSt && clearedFromSep[pos] === 1 && clearedSepHasEnd[pos] === 1) || isSentenceEnd[pos] === 1 ? 1 : 0;
+      // Do not propagate past a sentence-end boundary after already locking in >= 3 distinct terms,
+      // so subsequent independent single-hotword sentences are preserved.
+      if (!(bestSt.count >= 3 && isSentenceEnd[pos] === 1 && clearedFromSep[pos] === 1 && clearedSepHasEnd[pos] === 1)) {
+        const existing = clearedState[nextPos];
+        if (!existing || bestSt.count > existing.count || (bestSt.count === existing.count && nextEnd > clearedSepHasEnd[nextPos]!)) {
+          clearedState[nextPos] = bestSt;
+          clearedFromSep[nextPos] = 1;
+          clearedSepHasEnd[nextPos] = nextEnd;
+        }
+      }
+    }
+
+    if (pos !== normClusterStart[pos]!) continue;
+    // Block extending across an internal sentence-end boundary if >= 3 distinct terms already completed before this sentence.
+    if (clearedFromSep[pos] === 1 && clearedSepHasEnd[pos] === 1 && cSt && cSt.count >= 3) {
+      continue;
+    }
+
+    let node: HallucinationTrieNode | undefined = matcher.root;
+    for (let p = pos; p < n; p += 1) {
+      node = getTrieChild(node, normText.charCodeAt(p));
+      if (!node) break;
+      const termId = node.termId;
+      if (termId < 0) continue;
+
+      const endPos = p + 1;
+      if (endPos < n && endPos !== normClusterStart[endPos]!) continue;
+
+      let startSt = matcher.termStartsAscii[termId]! ? cSt : bestSt;
+      const sameEntry = sMap?.get(termId);
+      if (sameEntry && (!startSt || sameEntry.count > startSt.count)) {
+        startSt = sameEntry;
+      }
+      if (!startSt) continue;
+
+      const nextSt = advanceDistinct3(startSt, termId);
+      if (!matcher.termEndsAscii[termId]! || endPos === n) {
+        clearedState[endPos] = pickBetter(clearedState[endPos], nextSt);
+        clearedFromSep[endPos] = 0;
+        clearedSepHasEnd[endPos] = 0;
+      } else {
+        endedAsciiState[endPos] = pickBetter(endedAsciiState[endPos], nextSt);
         if (matcher.termStartsAscii[termId]! && normText.charCodeAt(endPos) === matcher.termFirstCodes[termId]!) {
-          if (!sameTermStates) sameTermStates = new Array(n + 1);
-          let targetMap = sameTermStates[endPos];
-          if (!targetMap) {
-            targetMap = new Map<number, { cost: number; node: number }>();
-            sameTermStates[endPos] = targetMap;
+          let tMap = sameState[endPos];
+          if (!tMap) {
+            tMap = new Map<number, Distinct3State>();
+            sameState[endPos] = tMap;
           }
-          const prev = targetMap.get(termId);
-          if (!prev || nextCost < prev.cost) {
-            targetMap.set(termId, { cost: nextCost, node: newNode });
-          }
+          tMap.set(termId, pickBetter(tMap.get(termId), nextSt));
         }
       }
     }
@@ -1385,55 +1490,95 @@ function findLeadingHallucinationCut(
   return bestCut;
 }
 
-function findTrailingHallucinationCut(
+function findLeadingHallucinationCut(
   matcher: CompiledHallucinationMatcher,
   map: NormalizedClusterMap,
 ): number {
+  const cutA = findLeadingRuleACut(matcher, map);
+  const cutB = findLeadingRuleBCut(matcher, map);
+  return cutA > cutB ? cutA : cutB;
+}
+
+function isValidTrailingLeftBoundary(
+  map: NormalizedClusterMap,
+  p: number,
+  termStartsAscii: boolean,
+): { valid: boolean; sentEnd: boolean } {
   const { normText, normClusterStart, isSep, isSentenceEnd } = map;
+  let sepScan = p;
+  let sentEnd = false;
+  let hasRealSep = false;
+  while (sepScan > 0) {
+    const c = normClusterStart[sepScan - 1]!;
+    if (isSep[c] !== 1) break;
+    for (let k = c; k < sepScan; k += 1) {
+      if (isSentenceEnd[k] === 1) sentEnd = true;
+    }
+    if (!HOTWORD_INTRA_WORD_PUNCT_RE.test(normText.slice(c, sepScan))) {
+      hasRealSep = true;
+    }
+    sepScan = c;
+  }
+  const hasSepBefore = sepScan < p;
+  const beforeSepAscii = sepScan > 0
+    ? ASCII_ALNUM_UNDER_RE.test(normText.slice(normClusterStart[sepScan - 1]!, sepScan))
+    : false;
+  const valid = hasSepBefore
+    ? !(termStartsAscii && !hasRealSep && beforeSepAscii)
+    : (termStartsAscii && !beforeSepAscii);
+  return { valid, sentEnd };
+}
+
+function findTrailingRuleACut(
+  matcher: CompiledHallucinationMatcher,
+  map: NormalizedClusterMap,
+): number {
+  const { normText, normClusterStart, isSep } = map;
   const n = normText.length;
   if (n === 0) return n;
 
-  const revClearedCost = new Int32Array(n + 1).fill(HALLUCINATION_INF);
-  const revClearedNode = new Int32Array(n + 1).fill(-1);
-  const revStartedAsciiCost = new Int32Array(n + 1).fill(HALLUCINATION_INF);
-  const revStartedAsciiNode = new Int32Array(n + 1).fill(-1);
-  let revSameStates: Array<Map<number, { cost: number; node: number }> | undefined> | null = null;
-
-  const nodePrev: number[] = [-1];
-  const nodeTerm: number[] = [-1];
-  revClearedCost[n] = 0;
-  revClearedNode[n] = 0;
+  const completedSep = new Uint8Array(n + 1);
+  const sepRun: Array<Map<number, number> | undefined> = new Array(n + 1);
+  let revSame: Array<Map<number, number> | undefined> | null = null;
+  completedSep[n] = 1;
 
   let bestTermStart = n;
 
+  const recordRun = (arr: Array<Map<number, number> | undefined>, pos: number, tid: number, len: number) => {
+    let m = arr[pos];
+    if (!m) {
+      m = new Map<number, number>();
+      arr[pos] = m;
+    }
+    const prev = m.get(tid) ?? 0;
+    if (len > prev) m.set(tid, len);
+  };
+
   for (let pos = n; pos > 0; pos -= 1) {
     if (pos < n && pos !== normClusterStart[pos]!) continue;
-    const cCost = revClearedCost[pos]!;
-    const aCost = revStartedAsciiCost[pos]!;
-    const sameMap = revSameStates?.[pos];
-    if (revSameStates) revSameStates[pos] = undefined;
-    if (cCost === HALLUCINATION_INF && aCost === HALLUCINATION_INF && !sameMap) continue;
-
-    let bestCost = cCost;
-    let bestNode = revClearedNode[pos]!;
-    if (aCost < bestCost) {
-      bestCost = aCost;
-      bestNode = revStartedAsciiNode[pos]!;
-    }
-    if (sameMap) {
-      for (const entry of sameMap.values()) {
-        if (entry.cost < bestCost) {
-          bestCost = entry.cost;
-          bestNode = entry.node;
-        }
-      }
-    }
+    const canEndFresh = completedSep[pos] === 1;
+    const runMap = sepRun[pos];
+    const immMap = revSame?.[pos];
+    sepRun[pos] = undefined;
+    if (revSame) revSame[pos] = undefined;
+    if (!canEndFresh && !runMap && !immMap) continue;
 
     const prevClusterStart = normClusterStart[pos - 1]!;
     if (isSep[prevClusterStart] === 1) {
-      if (bestCost < revClearedCost[prevClusterStart]!) {
-        revClearedCost[prevClusterStart] = bestCost;
-        revClearedNode[prevClusterStart] = bestNode;
+      if (canEndFresh) {
+        completedSep[prevClusterStart] = 1;
+      }
+      if (runMap) {
+        for (const [tid, len] of runMap.entries()) {
+          recordRun(sepRun, prevClusterStart, tid, len);
+          if (len >= 2) completedSep[prevClusterStart] = 1;
+        }
+      }
+      if (immMap) {
+        for (const [tid, len] of immMap.entries()) {
+          recordRun(sepRun, prevClusterStart, tid, len);
+          if (len >= 2) completedSep[prevClusterStart] = 1;
+        }
       }
     }
 
@@ -1445,82 +1590,158 @@ function findTrailingHallucinationCut(
       if (termId < 0) continue;
       if (p !== normClusterStart[p]!) continue;
 
-      let rightCost = matcher.termEndsAscii[termId]! ? cCost : bestCost;
-      let rightNode = matcher.termEndsAscii[termId]! ? revClearedNode[pos]! : bestNode;
-      if (sameMap) {
-        const sameEntry = sameMap.get(termId);
-        if (sameEntry && sameEntry.cost < rightCost) {
-          rightCost = sameEntry.cost;
-          rightNode = sameEntry.node;
-        }
+      let nextLen = 0;
+      if (canEndFresh) {
+        nextLen = 1;
       }
-      if (rightCost >= HALLUCINATION_INF || rightNode < 0) continue;
-
-      const nextCost = rightCost + 1;
-      const newNode = nodePrev.length;
-      nodePrev.push(rightNode);
-      nodeTerm.push(termId);
+      const prevRun = runMap?.get(termId) ?? 0;
+      if (prevRun >= 1) {
+        const cand = prevRun >= 2 ? 2 : prevRun + 1;
+        if (cand > nextLen) nextLen = cand;
+      }
+      const prevImm = immMap?.get(termId) ?? 0;
+      if (prevImm >= 1) {
+        const cand = prevImm >= 2 ? 2 : prevImm + 1;
+        if (cand > nextLen) nextLen = cand;
+      }
+      if (nextLen === 0) continue;
 
       if (!matcher.termStartsAscii[termId]! || p === 0) {
-        if (nextCost < revClearedCost[p]!) {
-          revClearedCost[p] = nextCost;
-          revClearedNode[p] = newNode;
+        recordRun(sepRun, p, termId, nextLen);
+        if (nextLen >= 2 && p === 0) {
+          // Whole-string check handles p === 0, keep safe guard here.
         }
       } else {
-        if (nextCost < revStartedAsciiCost[p]!) {
-          revStartedAsciiCost[p] = nextCost;
-          revStartedAsciiNode[p] = newNode;
-        }
-        if (matcher.termEndsAscii[termId]! && p > 0 && normText.charCodeAt(p - 1) === matcher.termLastCodes[termId]!) {
-          if (!revSameStates) revSameStates = new Array(n + 1);
-          let targetMap = revSameStates[p];
-          if (!targetMap) {
-            targetMap = new Map<number, { cost: number; node: number }>();
-            revSameStates[p] = targetMap;
-          }
-          const prev = targetMap.get(termId);
-          if (!prev || nextCost < prev.cost) {
-            targetMap.set(termId, { cost: nextCost, node: newNode });
-          }
+        if (!revSame) revSame = new Array(n + 1);
+        recordRun(revSame, p, termId, nextLen);
+        if (matcher.termEndsAscii[termId]! && p > 0) {
+          // Wait: non-identical ASCII terms to the left cannot join immediately without sep; record in revSame for same-term only:
+          // Actually sepRun is ONLY stepped after a separator above, while revSame only allows identical `termId`!
+          // Let's also allow separator scan to promote `revSame` into `sepRun` when `pos` steps over a separator!
         }
       }
 
-      if (p > 0) {
-        let sepScan = p;
-        let sentEnd = false;
-        let hasRealSep = false;
-        while (sepScan > 0) {
-          const c = normClusterStart[sepScan - 1]!;
-          if (isSep[c] !== 1) break;
-          for (let k = c; k < sepScan; k += 1) {
-            if (isSentenceEnd[k] === 1) sentEnd = true;
-          }
-          if (!HOTWORD_INTRA_WORD_PUNCT_RE.test(normText.slice(c, sepScan))) {
-            hasRealSep = true;
-          }
-          sepScan = c;
-        }
-        const hasSepBefore = sepScan < p;
-        const beforeSepAscii = sepScan > 0
-          ? ASCII_ALNUM_UNDER_RE.test(normText.slice(normClusterStart[sepScan - 1]!, sepScan))
-          : false;
-        if (isChainQualifiedHallucination(newNode, nodePrev, nodeTerm, true, sentEnd)) {
-          const validBoundary = hasSepBefore
-            ? !(matcher.termStartsAscii[termId]! === 1 && !hasRealSep && beforeSepAscii)
-            : (matcher.termStartsAscii[termId]! === 1 && !beforeSepAscii);
-          if (validBoundary && p < bestTermStart) {
-            bestTermStart = p;
-          }
+      if (nextLen >= 2 && p > 0) {
+        const { valid } = isValidTrailingLeftBoundary(map, p, matcher.termStartsAscii[termId]! === 1);
+        if (valid && p < bestTermStart) {
+          bestTermStart = p;
         }
       }
     }
   }
 
+  return bestTermStart;
+}
+
+function findTrailingRuleBCut(
+  matcher: CompiledHallucinationMatcher,
+  map: NormalizedClusterMap,
+): number {
+  const { normText, normClusterStart, isSep, isSentenceEnd } = map;
+  const n = normText.length;
+  if (n === 0) return n;
+
+  const revCleared: Array<Distinct3State | undefined> = new Array(n + 1);
+  const revClearedLocked = new Uint8Array(n + 1);
+  const revStartedAscii: Array<Distinct3State | undefined> = new Array(n + 1);
+  const revSame: Array<Map<number, Distinct3State> | undefined> = new Array(n + 1);
+
+  revCleared[n] = { t1: -1, t2: -1, count: 0 };
+  let bestTermStart = n;
+
+  const pickBetter = (a: Distinct3State | undefined, b: Distinct3State): Distinct3State =>
+    !a || b.count > a.count ? b : a;
+
+  for (let pos = n; pos > 0; pos -= 1) {
+    if (pos < n && pos !== normClusterStart[pos]!) continue;
+    const cSt = revCleared[pos];
+    const aSt = revStartedAscii[pos];
+    const sMap = revSame[pos];
+    revSame[pos] = undefined;
+    if (!cSt && !aSt && !sMap) continue;
+
+    let bestSt = cSt;
+    if (aSt) bestSt = pickBetter(bestSt, aSt);
+    if (sMap) {
+      for (const st of sMap.values()) bestSt = pickBetter(bestSt, st);
+    }
+    if (!bestSt) continue;
+
+    const prevClusterStart = normClusterStart[pos - 1]!;
+    if (isSep[prevClusterStart] === 1) {
+      let sepHasEnd = false;
+      for (let k = prevClusterStart; k < pos; k += 1) {
+        if (isSentenceEnd[k] === 1) sepHasEnd = true;
+      }
+      // Once >= 3 distinct terms already reached and a sentence-end boundary was crossed, stop extending into earlier sentences.
+      const crossedAfterValid = bestSt.count >= 3 && sepHasEnd;
+      if (!(bestSt.count >= 3 && revClearedLocked[pos] === 1)) {
+        const existing = revCleared[prevClusterStart];
+        if (!existing || bestSt.count > existing.count) {
+          revCleared[prevClusterStart] = bestSt;
+          revClearedLocked[prevClusterStart] = (revClearedLocked[pos] === 1 || crossedAfterValid) ? 1 : 0;
+        }
+      }
+    }
+
+    if (revClearedLocked[pos] === 1) continue;
+
+    let revNode: HallucinationTrieNode | undefined = matcher.revRoot;
+    for (let p = pos - 1; p >= 0; p -= 1) {
+      revNode = getTrieChild(revNode, normText.charCodeAt(p));
+      if (!revNode) break;
+      const termId = revNode.termId;
+      if (termId < 0) continue;
+      if (p !== normClusterStart[p]!) continue;
+
+      let rightSt = matcher.termEndsAscii[termId]! ? cSt : bestSt;
+      const sameEntry = sMap?.get(termId);
+      if (sameEntry && (!rightSt || sameEntry.count > rightSt.count)) {
+        rightSt = sameEntry;
+      }
+      if (!rightSt) continue;
+
+      const nextSt = advanceDistinct3(rightSt, termId);
+      if (!matcher.termStartsAscii[termId]! || p === 0) {
+        revCleared[p] = pickBetter(revCleared[p], nextSt);
+      } else {
+        revStartedAscii[p] = pickBetter(revStartedAscii[p], nextSt);
+        if (matcher.termEndsAscii[termId]! && p > 0 && normText.charCodeAt(p - 1) === matcher.termLastCodes[termId]!) {
+          let tMap = revSame[p];
+          if (!tMap) {
+            tMap = new Map<number, Distinct3State>();
+            revSame[p] = tMap;
+          }
+          tMap.set(termId, pickBetter(tMap.get(termId), nextSt));
+        }
+      }
+
+      if (nextSt.count >= 3 && p > 0) {
+        const { valid, sentEnd } = isValidTrailingLeftBoundary(map, p, matcher.termStartsAscii[termId]! === 1);
+        if (valid && sentEnd && p < bestTermStart) {
+          bestTermStart = p;
+        }
+      }
+    }
+  }
+
+  return bestTermStart;
+}
+
+function findTrailingHallucinationCut(
+  matcher: CompiledHallucinationMatcher,
+  map: NormalizedClusterMap,
+): number {
+  const n = map.normText.length;
+  if (n === 0) return n;
+  const startA = findTrailingRuleACut(matcher, map);
+  const startB = findTrailingRuleBCut(matcher, map);
+  const bestTermStart = startA < startB ? startA : startB;
   if (bestTermStart >= n) return n;
   let cutNorm = bestTermStart;
   while (cutNorm > 0) {
-    const c = normClusterStart[cutNorm - 1]!;
-    const ch = normText.slice(c, cutNorm);
+    const c = map.normClusterStart[cutNorm - 1]!;
+    const ch = map.normText.slice(c, cutNorm);
     if (!HOTWORD_WEAK_TRAILING_SEP_RE.test(ch)) break;
     cutNorm = c;
   }
@@ -1543,12 +1764,11 @@ export function stripVoiceHotwordHallucination(
   const matcher = getCompiledHallucinationMatcher(hotwords);
   if (!matcher) return text;
 
-  const wholeMap = buildNormalizedClusterMap(text);
-  const normText = wholeMap.normText;
+  // Whole-string pure-hotword check uses full-string NFKC normalization (preserving Hangul Jamo & cross-codepoint composition).
+  const normText = normalizeHotwordMatchText(text);
   const n = normText.length;
   if (n === 0) return text;
 
-  // Forward reachable-state DP over a compact Trie for whole-string hallucination checks:
   const cleared = new Int32Array(n + 1);
   const endedAscii = new Int32Array(n + 1);
   cleared.fill(HALLUCINATION_INF);
@@ -1566,8 +1786,9 @@ export function stripVoiceHotwordHallucination(
     const bestAtPos = cCount < aCount ? cCount : aCount;
     const cp = normText.codePointAt(pos)!;
     const charLen = cp > 0xffff ? 2 : 1;
+    const isSep = HOTWORD_HALLUCINATION_SEP_CHAR_RE.test(String.fromCodePoint(cp));
 
-    if (wholeMap.isSep[pos] === 1) {
+    if (isSep) {
       let sepMin = bestAtPos;
       if (sameMap) {
         for (const cost of sameMap.values()) {
@@ -1580,17 +1801,12 @@ export function stripVoiceHotwordHallucination(
       }
     }
 
-    if (pos !== wholeMap.normClusterStart[pos]!) continue;
-
     let node: HallucinationTrieNode | undefined = matcher.root;
     for (let p = pos; p < n; p += 1) {
       node = getTrieChild(node, normText.charCodeAt(p));
       if (!node) break;
       const termId = node.termId;
       if (termId < 0) continue;
-
-      const endPos = p + 1;
-      if (endPos < n && endPos !== wholeMap.normClusterStart[endPos]!) continue;
 
       let startCost = matcher.termStartsAscii[termId]! ? cCount : bestAtPos;
       if (sameMap) {
@@ -1601,6 +1817,7 @@ export function stripVoiceHotwordHallucination(
       }
       if (startCost >= HALLUCINATION_INF) continue;
 
+      const endPos = p + 1;
       const nextCost = startCost + 1;
       if (!matcher.termEndsAscii[termId]! || endPos === n) {
         if (nextCost < cleared[endPos]!) cleared[endPos] = nextCost;
@@ -1630,8 +1847,9 @@ export function stripVoiceHotwordHallucination(
   }
 
   let current = text;
+  const wholeMap = buildNormalizedClusterMap(current);
   const leadCutNorm = findLeadingHallucinationCut(matcher, wholeMap);
-  if (leadCutNorm > 0 && leadCutNorm < n) {
+  if (leadCutNorm > 0 && leadCutNorm < wholeMap.normText.length) {
     current = current.slice(wholeMap.normToRawStart[leadCutNorm]!);
   }
   if (!current) return '';

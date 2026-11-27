@@ -4118,6 +4118,17 @@ do {
     check(stripVoiceHotwordHallucination("code, codeReview", hotwordTerms: ["code"]) == "code, codeReview", "case 10 ascii right intact")
     check(stripVoiceHotwordHallucination("你好，你好吗", hotwordTerms: ["你好"]) == "你好，你好吗", "case 10 cjk boundary intact")
     check(stripVoiceHotwordHallucination("请你对比 IM.codes, Claude, Codex。", hotwordTerms: terms) == "请你对比 IM.codes, Claude, Codex。", "case 10 list intact")
+    // Cross-platform shared matrix (Round 2 P0 #1 & P0 #2):
+    let matrixTerms = ["IM.codes", "Claude", "Codex", "Qwen"]
+    check(stripVoiceHotwordHallucination("IM.codes, Codex, IM.codes 都是我在用的工具", hotwordTerms: matrixTerms) == "IM.codes, Codex, IM.codes 都是我在用的工具", "case 10 A/B/A intact")
+    check(stripVoiceHotwordHallucination("Codex。IM.codes，IM.codes。你好", hotwordTerms: matrixTerms) == "Codex。IM.codes，IM.codes。你好", "case 10 preceding B intact")
+    check(stripVoiceHotwordHallucination("IM.codes，IM.codes。Codex。你好", hotwordTerms: matrixTerms) == "Codex。你好", "case 10 only strip leading A/A")
+    check(stripVoiceHotwordHallucination("打开 Codex，IM.codes，IM.codes。", hotwordTerms: matrixTerms) == "打开 Codex", "case 10 only strip trailing A/A")
+    check(stripVoiceHotwordHallucination("先看。Codex。IM.codes, Claude, Codex。", hotwordTerms: ["IM.codes", "Codex", "Claude"]) == "先看。Codex。", "case 10 B-lock stops before preceding sentence")
+    check(stripVoiceHotwordHallucination("\u{1100}\u{1161}, \u{AC00}", hotwordTerms: ["\u{AC00}"]) == "", "case 10 hangul jamo whole")
+    check(stripVoiceHotwordHallucination("\u{1100}\u{1161}, \u{AC00}。你好", hotwordTerms: ["\u{AC00}"]) == "你好", "case 10 hangul jamo leading")
+    check(stripVoiceHotwordHallucination("Café, Cafe\u{0301}。你好", hotwordTerms: ["Café"]) == "你好", "case 10 latin nfd/nfc")
+    check(stripVoiceHotwordHallucination("code\u{0301}, code。你好", hotwordTerms: ["code"]) == "code\u{0301}, code。你好", "case 10 distinct accent intact")
 }
 print("MAC_SEGMENTED_DECODE:PASS")
 `);
@@ -4153,7 +4164,10 @@ print("MAC_SEGMENTED_DECODE:PASS")
 
     const cppFile = join(root, 'WinSegmentedPipelineFullSuite.cpp');
     const cppBin = join(root, 'win-segmented-pipeline-full');
-    await writeFile(cppFile, `#include <algorithm>
+    await writeFile(cppFile, `#if defined(__APPLE__) && defined(IMCODES_USE_COREFOUNDATION)
+#include <CoreFoundation/CoreFoundation.h>
+#endif
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -4180,7 +4194,12 @@ ${winCpp.slice(pipeStart, pipeEnd)}
 
 ${winTestSrc.slice(testBodyStart)}
 `);
-    await runNativeOrThrow(clangPp, ['-std=c++17', '-Wall', '-Wextra', cppFile, '-o', cppBin], { timeout: 60000 });
+    const cppArgs = ['-std=c++17', '-Wall', '-Wextra'];
+    if (process.platform === 'darwin') {
+      cppArgs.push('-DIMCODES_USE_COREFOUNDATION', '-framework', 'CoreFoundation');
+    }
+    cppArgs.push(cppFile, '-o', cppBin);
+    await runNativeOrThrow(clangPp, cppArgs, { timeout: 60000 });
     expect((await runNativeOrThrow(cppBin, [], { timeout: 60000 })).trim()).toBe('segmented-pipeline tests passed');
   }
 }, 180_000);

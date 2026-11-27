@@ -57,6 +57,7 @@ target_link_libraries(imcodes-speech-win PRIVATE
   avrt
   user32
   advapi32
+  normaliz
 )
 
 if(MSVC)

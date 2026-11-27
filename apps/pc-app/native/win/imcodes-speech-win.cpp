@@ -5,7 +5,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 
+#ifdef _WIN32
 #include <windows.h>
+#include <winnls.h>
 #include <initguid.h>
 #include <mmdeviceapi.h>
 #include <propsys.h>
@@ -13,6 +15,11 @@
 #include <avrt.h>
 #include <dxgi.h>
 #include <functiondiscoverykeys_devpkey.h>
+#endif
+
+#if defined(__APPLE__) && defined(IMCODES_USE_COREFOUNDATION)
+#include <CoreFoundation/CoreFoundation.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -934,10 +941,15 @@ size_t find_pause_split_take_count(
 
 inline bool is_hotword_combining_mark_cp(uint32_t cp) {
   return (cp >= 0x0300 && cp <= 0x036F)
+      || (cp >= 0x0483 && cp <= 0x0489)
+      || (cp >= 0x0591 && cp <= 0x05BD)
+      || (cp >= 0x064B && cp <= 0x065F)
       || (cp >= 0x1AB0 && cp <= 0x1AFF)
       || (cp >= 0x1DC0 && cp <= 0x1DFF)
       || (cp >= 0x20D0 && cp <= 0x20FF)
-      || (cp >= 0xFE20 && cp <= 0xFE2F);
+      || (cp >= 0xFE00 && cp <= 0xFE0F)
+      || (cp >= 0xFE20 && cp <= 0xFE2F)
+      || (cp >= 0x1F3FB && cp <= 0x1F3FF);
 }
 
 inline uint32_t normalize_hotword_cp(uint32_t cp) {
@@ -970,6 +982,7 @@ inline bool is_hotword_ascii_alnum_cp(uint32_t cp) {
 inline bool is_hotword_sep_cp(uint32_t cp) {
   if (cp == ' ' || cp == '\t' || cp == '\r' || cp == '\n') return true;
   if (cp < 0x80) return !is_hotword_ascii_alnum_cp(cp);
+  if (is_hotword_combining_mark_cp(cp)) return false;
   return (cp >= 0x00A0 && cp <= 0x00BF)
       || (cp >= 0x2000 && cp <= 0x206F)
       || cp == 0x20AC
@@ -1021,6 +1034,190 @@ inline void decode_next_utf8_cp(const std::string& s, size_t& i, uint32_t& out_c
   }
 }
 
+using HotwordNfkcNormalizerFn = std::string (*)(const std::string&);
+
+inline HotwordNfkcNormalizerFn& hotword_nfkc_normalizer_override() {
+  static HotwordNfkcNormalizerFn fn = nullptr;
+  return fn;
+}
+
+inline void set_hotword_nfkc_normalizer_for_testing(HotwordNfkcNormalizerFn fn) {
+  hotword_nfkc_normalizer_override() = fn;
+}
+
+std::string default_os_nfkc_lower_utf8(const std::string& input) {
+  if (input.empty()) return {};
+#ifdef _WIN32
+  const int wlen = MultiByteToWideChar(CP_UTF8, 0, input.data(), static_cast<int>(input.size()), nullptr, 0);
+  if (wlen <= 0) return input;
+  std::wstring wsrc(static_cast<size_t>(wlen), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, input.data(), static_cast<int>(input.size()), wsrc.data(), wlen);
+
+  int kclen = NormalizeString(NormalizationKC, wsrc.data(), wlen, nullptr, 0);
+  std::wstring wnfkc;
+  if (kclen > 0) {
+    wnfkc.resize(static_cast<size_t>(kclen), L'\0');
+    const int actual = NormalizeString(NormalizationKC, wsrc.data(), wlen, wnfkc.data(), kclen);
+    if (actual > 0) {
+      wnfkc.resize(static_cast<size_t>(actual));
+    } else {
+      wnfkc = wsrc;
+    }
+  } else {
+    wnfkc = wsrc;
+  }
+
+  std::wstring wlower = wnfkc;
+  if (!wnfkc.empty()) {
+    const int lclen = LCMapStringEx(
+        LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, wnfkc.data(), static_cast<int>(wnfkc.size()), nullptr, 0, nullptr, nullptr, 0);
+    if (lclen > 0) {
+      std::wstring tmp(static_cast<size_t>(lclen), L'\0');
+      const int actual = LCMapStringEx(
+          LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, wnfkc.data(), static_cast<int>(wnfkc.size()), tmp.data(), lclen, nullptr, nullptr, 0);
+      if (actual > 0) {
+        tmp.resize(static_cast<size_t>(actual));
+        wlower = std::move(tmp);
+      }
+    }
+  }
+
+  const int u8len = WideCharToMultiByte(
+      CP_UTF8, 0, wlower.data(), static_cast<int>(wlower.size()), nullptr, 0, nullptr, nullptr);
+  if (u8len <= 0) return input;
+  std::string out(static_cast<size_t>(u8len), '\0');
+  WideCharToMultiByte(
+      CP_UTF8, 0, wlower.data(), static_cast<int>(wlower.size()), out.data(), u8len, nullptr, nullptr);
+  return out;
+#elif defined(__APPLE__) && defined(IMCODES_USE_COREFOUNDATION)
+  CFStringRef src = CFStringCreateWithBytes(
+      kCFAllocatorDefault,
+      reinterpret_cast<const UInt8*>(input.data()),
+      static_cast<CFIndex>(input.size()),
+      kCFStringEncodingUTF8,
+      false);
+  if (!src) return input;
+  CFMutableStringRef mut = CFStringCreateMutableCopy(kCFAllocatorDefault, 0, src);
+  CFRelease(src);
+  if (!mut) return input;
+  CFStringNormalize(mut, kCFStringNormalizationFormKC);
+  CFStringLowercase(mut, nullptr);
+  const CFIndex len = CFStringGetLength(mut);
+  const CFIndex max_bytes = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+  std::string out(static_cast<size_t>(max_bytes), '\0');
+  CFIndex used = 0;
+  CFStringGetBytes(
+      mut,
+      CFRangeMake(0, len),
+      kCFStringEncodingUTF8,
+      0,
+      false,
+      reinterpret_cast<UInt8*>(out.data()),
+      max_bytes,
+      &used);
+  CFRelease(mut);
+  out.resize(static_cast<size_t>(used));
+  return out;
+#else
+  // Portable Hangul Jamo L+V[+T] canonical composition & combining-mark-preserving fallback.
+  std::vector<uint32_t> raw_cps;
+  size_t i = 0;
+  while (i < input.size()) {
+    uint32_t cp = 0;
+    decode_next_utf8_cp(input, i, cp);
+    if (!raw_cps.empty() && cp >= 0x1161 && cp <= 0x1175 && raw_cps.back() >= 0x1100 && raw_cps.back() <= 0x1112) {
+      const uint32_t l_idx = raw_cps.back() - 0x1100;
+      const uint32_t v_idx = cp - 0x1161;
+      raw_cps.back() = 0xAC00 + (l_idx * 21 + v_idx) * 28;
+    } else if (!raw_cps.empty() && cp >= 0x11A8 && cp <= 0x11C2 &&
+               raw_cps.back() >= 0xAC00 && raw_cps.back() <= 0xD7A3 && ((raw_cps.back() - 0xAC00) % 28) == 0) {
+      raw_cps.back() += (cp - 0x11A7);
+    } else {
+      raw_cps.push_back(cp);
+    }
+  }
+  std::string out;
+  out.reserve(input.size());
+  for (uint32_t cp : raw_cps) {
+    append_utf8_cp(out, cp);
+  }
+  return out;
+#endif
+}
+
+std::vector<uint32_t> normalize_hotword_utf8_to_cps(const std::string& input) {
+  if (input.empty()) return {};
+  const HotwordNfkcNormalizerFn custom = hotword_nfkc_normalizer_override();
+  const std::string nfkc = custom ? custom(input) : default_os_nfkc_lower_utf8(input);
+  std::vector<uint32_t> out;
+  out.reserve(nfkc.size());
+  size_t i = 0;
+  while (i < nfkc.size()) {
+    uint32_t cp = 0;
+    decode_next_utf8_cp(nfkc, i, cp);
+    out.push_back(normalize_hotword_cp(cp));
+  }
+  return out;
+}
+
+inline size_t advance_next_grapheme_cluster(const std::string& text, size_t start) {
+  const size_t bytes = text.size();
+  if (start >= bytes) return bytes;
+  size_t i = start;
+  uint32_t first_cp = 0;
+  decode_next_utf8_cp(text, i, first_cp);
+
+  // Regional indicator pairs
+  if (first_cp >= 0x1F1E6 && first_cp <= 0x1F1FF && i < bytes) {
+    size_t peek = i;
+    uint32_t next_cp = 0;
+    decode_next_utf8_cp(text, peek, next_cp);
+    if (next_cp >= 0x1F1E6 && next_cp <= 0x1F1FF) {
+      i = peek;
+    }
+  }
+
+  // Hangul Jamo L* V* T* sequence
+  auto is_jamo_l = [](uint32_t c) { return (c >= 0x1100 && c <= 0x115F) || (c >= 0xA960 && c <= 0xA97C); };
+  auto is_jamo_v = [](uint32_t c) { return (c >= 0x1160 && c <= 0x11A7) || (c >= 0xD7B0 && c <= 0xD7C6); };
+  auto is_jamo_t = [](uint32_t c) { return (c >= 0x11A8 && c <= 0x11FF) || (c >= 0xD7CB && c <= 0xD7FB); };
+  if (is_jamo_l(first_cp) || is_jamo_v(first_cp)) {
+    uint32_t last_hangul = first_cp;
+    while (i < bytes) {
+      size_t peek = i;
+      uint32_t next_cp = 0;
+      decode_next_utf8_cp(text, peek, next_cp);
+      if ((is_jamo_l(last_hangul) && (is_jamo_l(next_cp) || is_jamo_v(next_cp))) ||
+          (is_jamo_v(last_hangul) && (is_jamo_v(next_cp) || is_jamo_t(next_cp))) ||
+          (is_jamo_t(last_hangul) && is_jamo_t(next_cp))) {
+        i = peek;
+        last_hangul = next_cp;
+      } else {
+        break;
+      }
+    }
+  }
+
+  // Combining marks, variation selectors, skin-tone modifiers, and ZWJ emoji joiners
+  while (i < bytes) {
+    size_t peek = i;
+    uint32_t next_cp = 0;
+    decode_next_utf8_cp(text, peek, next_cp);
+    if (is_hotword_combining_mark_cp(next_cp)) {
+      i = peek;
+      continue;
+    }
+    if (next_cp == 0x200D && peek < bytes) {
+      i = peek;
+      uint32_t joined_cp = 0;
+      decode_next_utf8_cp(text, i, joined_cp);
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+
 struct CppNormalizedClusterMap {
   std::vector<uint32_t> cps;
   std::vector<size_t> norm_to_raw_byte;
@@ -1038,25 +1235,22 @@ CppNormalizedClusterMap build_cpp_normalized_cluster_map(const std::string& text
   const size_t bytes = text.size();
   while (i < bytes) {
     const size_t raw_start = i;
-    uint32_t base_cp = 0;
-    decode_next_utf8_cp(text, i, base_cp);
-    while (i < bytes) {
-      size_t peek_i = i;
-      uint32_t next_cp = 0;
-      decode_next_utf8_cp(text, peek_i, next_cp);
-      if (!is_hotword_combining_mark_cp(next_cp)) break;
-      i = peek_i;
-    }
-    const uint32_t norm_cp = normalize_hotword_cp(base_cp);
+    const size_t raw_end = advance_next_grapheme_cluster(text, i);
+    i = raw_end;
+    const std::string raw_cluster = text.substr(raw_start, raw_end - raw_start);
+    const std::vector<uint32_t> norm_cps = normalize_hotword_utf8_to_cps(raw_cluster);
+    if (norm_cps.empty()) continue;
     const size_t c_start = map.cps.size();
-    map.cps.push_back(norm_cp);
-    map.norm_to_raw_byte.push_back(raw_start);
-    map.cluster_start.push_back(c_start);
-    map.is_sep.push_back(is_hotword_sep_cp(norm_cp) ? 1 : 0);
-    map.is_sent_end.push_back(is_hotword_sentence_end_cp(norm_cp) ? 1 : 0);
-    map.is_weak_sep.push_back(is_hotword_weak_trailing_sep_cp(norm_cp) ? 1 : 0);
-    map.is_intra_punct.push_back(is_hotword_intra_word_punct_cp(norm_cp) ? 1 : 0);
-    map.is_ascii_alnum.push_back(is_hotword_ascii_alnum_cp(norm_cp) ? 1 : 0);
+    for (uint32_t norm_cp : norm_cps) {
+      map.cps.push_back(norm_cp);
+      map.norm_to_raw_byte.push_back(raw_start);
+      map.cluster_start.push_back(c_start);
+      map.is_sep.push_back(is_hotword_sep_cp(norm_cp) ? 1 : 0);
+      map.is_sent_end.push_back(is_hotword_sentence_end_cp(norm_cp) ? 1 : 0);
+      map.is_weak_sep.push_back(is_hotword_weak_trailing_sep_cp(norm_cp) ? 1 : 0);
+      map.is_intra_punct.push_back(is_hotword_intra_word_punct_cp(norm_cp) ? 1 : 0);
+      map.is_ascii_alnum.push_back(is_hotword_ascii_alnum_cp(norm_cp) ? 1 : 0);
+    }
   }
   map.norm_to_raw_byte.push_back(bytes);
   map.cluster_start.push_back(map.cps.size());
@@ -1077,92 +1271,104 @@ struct CppHallucinationMatcher {
   std::vector<uint32_t> term_last_cp;
 };
 
-bool is_cpp_chain_qualified(
-    int node_idx,
-    const std::vector<int>& node_prev,
-    const std::vector<int>& node_term,
-    bool require_sent_end,
-    bool has_sent_end) {
-  int total = 0;
-  std::unordered_map<int, int> counts;
-  int cur = node_idx;
-  while (cur > 0) {
-    const int tid = node_term[cur];
-    if (tid >= 0) {
-      total += 1;
-      const int next = ++counts[tid];
-      if (next >= 2) return true;
-    }
-    cur = node_prev[cur];
-  }
-  return total >= 3 && (!require_sent_end || has_sent_end);
+struct CppDistinct3State {
+  int t1{-1};
+  int t2{-1};
+  int count{-1}; // -1 = unreachable, 0 = empty start/end, 1..3 = distinct term count (capped at 3)
+};
+
+inline CppDistinct3State advance_cpp_distinct3(const CppDistinct3State& st, int tid) {
+  if (st.count < 0) return st;
+  if (st.count >= 3) return st;
+  if (st.count == 0) return {tid, -1, 1};
+  if (st.count == 1) return st.t1 == tid ? st : CppDistinct3State{st.t1, tid, 2};
+  if (tid == st.t1 || tid == st.t2) return st;
+  return {st.t1, st.t2, 3};
 }
 
-size_t find_cpp_leading_cut(
+inline bool has_valid_cpp_leading_sep(const CppNormalizedClusterMap& map, size_t pos) {
+  if (map.is_ascii_alnum[pos] == 0) return true;
+  size_t scan = pos;
+  while (scan > 0) {
+    const size_t c = map.cluster_start[scan - 1];
+    if (map.is_sep[c] == 0) break;
+    for (size_t k = c; k < scan; ++k) {
+      if (map.is_intra_punct[k] == 0) return true;
+    }
+    scan = c;
+  }
+  return false;
+}
+
+inline std::pair<bool, bool> is_valid_cpp_trailing_left_boundary(
+    const CppNormalizedClusterMap& map,
+    size_t p,
+    bool term_starts_ascii) {
+  size_t scan = p;
+  bool sent_end = false;
+  bool has_real_sep = false;
+  while (scan > 0) {
+    const size_t c = map.cluster_start[scan - 1];
+    if (map.is_sep[c] == 0) break;
+    for (size_t k = c; k < scan; ++k) {
+      if (map.is_sent_end[k] == 1) sent_end = true;
+      if (map.is_intra_punct[k] == 0) has_real_sep = true;
+    }
+    scan = c;
+  }
+  const bool has_sep_before = scan < p;
+  const bool before_sep_ascii = scan > 0 ? (map.is_ascii_alnum[scan - 1] == 1) : false;
+  const bool valid = has_sep_before
+      ? !(term_starts_ascii && !has_real_sep && before_sep_ascii)
+      : (term_starts_ascii && !before_sep_ascii);
+  return {valid, sent_end};
+}
+
+size_t find_cpp_leading_rule_a_cut(
     const CppHallucinationMatcher& matcher,
     const CppNormalizedClusterMap& map) {
   const size_t n = map.cps.size();
   if (n == 0) return 0;
-  constexpr int kInf = 0x3FFF'FFFF;
-  std::vector<int> cleared_cost(n + 1, kInf);
-  std::vector<int> cleared_node(n + 1, -1);
-  std::vector<uint8_t> cleared_from_sep(n + 1, 0);
-  std::vector<uint8_t> cleared_sep_end(n + 1, 0);
-  std::vector<int> ended_ascii_cost(n + 1, kInf);
-  std::vector<int> ended_ascii_node(n + 1, -1);
-  std::vector<std::unordered_map<int, std::pair<int, int>>> same_states(n + 1);
 
-  std::vector<int> node_prev{-1};
-  std::vector<int> node_term{-1};
-  cleared_cost[0] = 0;
-  cleared_node[0] = 0;
+  std::vector<uint8_t> completed_sep(n + 1, 0);
+  std::vector<std::unordered_map<int, int>> sep_run(n + 1);
+  std::vector<std::unordered_map<int, int>> imm_same(n + 1);
+  completed_sep[0] = 1;
   size_t best_cut = 0;
 
+  auto record_run = [](std::unordered_map<int, int>& m, int tid, int len) {
+    auto it = m.find(tid);
+    if (it == m.end() || len > it->second) m[tid] = len;
+  };
+
   for (size_t pos = 0; pos < n; ++pos) {
-    const int c_cost = cleared_cost[pos];
-    const int a_cost = ended_ascii_cost[pos];
-    auto& same_map = same_states[pos];
-    if (c_cost == kInf && a_cost == kInf && same_map.empty()) continue;
+    const bool can_start_fresh = completed_sep[pos] == 1;
+    auto& run_map = sep_run[pos];
+    auto& imm_map = imm_same[pos];
+    if (!can_start_fresh && run_map.empty() && imm_map.empty()) continue;
 
-    int best_cost = c_cost;
-    int best_node = cleared_node[pos];
-    if (a_cost < best_cost) {
-      best_cost = a_cost;
-      best_node = ended_ascii_node[pos];
-    }
-    for (const auto& kv : same_map) {
-      if (kv.second.first < best_cost) {
-        best_cost = kv.second.first;
-        best_node = kv.second.second;
-      }
-    }
-
-    if (pos > 0 && map.is_sep[pos] == 0 && cleared_from_sep[pos] == 1 && c_cost < kInf) {
-      bool valid_sep = (map.is_ascii_alnum[pos] == 0);
-      if (!valid_sep) {
-        size_t scan = pos;
-        while (scan > 0 && map.is_sep[scan - 1] == 1) {
-          if (map.is_intra_punct[scan - 1] == 0) {
-            valid_sep = true;
-            break;
-          }
-          --scan;
-        }
-      }
-      if (valid_sep && is_cpp_chain_qualified(cleared_node[pos], node_prev, node_term, true, cleared_sep_end[pos] == 1)) {
+    if (pos > 0 && pos == map.cluster_start[pos] && map.is_sep[pos] == 0 && can_start_fresh) {
+      if (has_valid_cpp_leading_sep(map, pos)) {
         best_cut = pos;
       }
     }
 
     if (map.is_sep[pos] == 1) {
-      const uint8_t next_end = ((c_cost == best_cost && cleared_from_sep[pos] == 1 && cleared_sep_end[pos] == 1) || map.is_sent_end[pos] == 1) ? 1 : 0;
-      if (best_cost < cleared_cost[pos + 1] ||
-          (best_cost == cleared_cost[pos + 1] && (cleared_from_sep[pos + 1] == 0 || (next_end == 1 && cleared_sep_end[pos + 1] == 0)))) {
-        cleared_cost[pos + 1] = best_cost;
-        cleared_node[pos + 1] = best_node;
-        cleared_from_sep[pos + 1] = 1;
-        cleared_sep_end[pos + 1] = next_end;
+      if (can_start_fresh) completed_sep[pos + 1] = 1;
+      for (const auto& kv : run_map) {
+        record_run(sep_run[pos + 1], kv.first, kv.second);
+        if (kv.second >= 2) completed_sep[pos + 1] = 1;
       }
+      for (const auto& kv : imm_map) {
+        record_run(sep_run[pos + 1], kv.first, kv.second);
+        if (kv.second >= 2) completed_sep[pos + 1] = 1;
+      }
+    }
+
+    if (pos != map.cluster_start[pos]) {
+      run_map.clear();
+      imm_map.clear();
+      continue;
     }
 
     int cur_node_idx = 0;
@@ -1173,88 +1379,178 @@ size_t find_cpp_leading_cut(
       const int tid = matcher.fwd_nodes[cur_node_idx].term_id;
       if (tid < 0) continue;
 
-      int start_cost = matcher.term_starts_ascii[tid] ? c_cost : best_cost;
-      int start_node = matcher.term_starts_ascii[tid] ? cleared_node[pos] : best_node;
-      const auto same_it = same_map.find(tid);
-      if (same_it != same_map.end() && same_it->second.first < start_cost) {
-        start_cost = same_it->second.first;
-        start_node = same_it->second.second;
-      }
-      if (start_cost >= kInf || start_node < 0) continue;
-
       const size_t end_pos = p + 1;
-      const int next_cost = start_cost + 1;
-      const int new_node = static_cast<int>(node_prev.size());
-      node_prev.push_back(start_node);
-      node_term.push_back(tid);
+      if (end_pos < n && end_pos != map.cluster_start[end_pos]) continue;
+
+      int next_len = can_start_fresh ? 1 : 0;
+      const auto rit = run_map.find(tid);
+      if (rit != run_map.end() && rit->second >= 1) {
+        next_len = std::max(next_len, rit->second >= 2 ? 2 : rit->second + 1);
+      }
+      const auto iit = imm_map.find(tid);
+      if (iit != imm_map.end() && iit->second >= 1) {
+        next_len = std::max(next_len, iit->second >= 2 ? 2 : iit->second + 1);
+      }
+      if (next_len == 0) continue;
 
       if (!matcher.term_ends_ascii[tid] || end_pos == n) {
-        if (next_cost < cleared_cost[end_pos]) {
-          cleared_cost[end_pos] = next_cost;
-          cleared_node[end_pos] = new_node;
-          cleared_from_sep[end_pos] = 0;
-          cleared_sep_end[end_pos] = 0;
-        }
+        record_run(sep_run[end_pos], tid, next_len);
       } else {
-        if (next_cost < ended_ascii_cost[end_pos]) {
-          ended_ascii_cost[end_pos] = next_cost;
-          ended_ascii_node[end_pos] = new_node;
-        }
-        if (matcher.term_starts_ascii[tid] && map.cps[end_pos] == matcher.term_first_cp[tid]) {
-          auto& target = same_states[end_pos];
-          const auto prev = target.find(tid);
-          if (prev == target.end() || next_cost < prev->second.first) {
-            target[tid] = {next_cost, new_node};
-          }
-        }
+        record_run(imm_same[end_pos], tid, next_len);
       }
     }
-    same_map.clear();
+    run_map.clear();
+    imm_map.clear();
   }
   return best_cut;
 }
 
-size_t find_cpp_trailing_cut(
+size_t find_cpp_leading_rule_b_cut(
+    const CppHallucinationMatcher& matcher,
+    const CppNormalizedClusterMap& map) {
+  const size_t n = map.cps.size();
+  if (n == 0) return 0;
+
+  std::vector<CppDistinct3State> cleared_st(n + 1);
+  std::vector<uint8_t> cleared_from_sep(n + 1, 0);
+  std::vector<uint8_t> cleared_sep_end(n + 1, 0);
+  std::vector<CppDistinct3State> ended_ascii_st(n + 1);
+  std::vector<std::unordered_map<int, CppDistinct3State>> same_st(n + 1);
+
+  cleared_st[0].count = 0;
+  size_t best_cut = 0;
+
+  for (size_t pos = 0; pos < n; ++pos) {
+    const CppDistinct3State& c_st = cleared_st[pos];
+    const CppDistinct3State& a_st = ended_ascii_st[pos];
+    const bool has_c = c_st.count >= 0;
+    auto& s_map = same_st[pos];
+    if (!has_c && a_st.count < 0 && s_map.empty()) continue;
+
+    bool has_best = has_c;
+    CppDistinct3State best_st = c_st;
+    if (a_st.count >= 0 && (!has_best || a_st.count > best_st.count)) {
+      has_best = true;
+      best_st = a_st;
+    }
+    for (const auto& kv : s_map) {
+      if (kv.second.count >= 0 && (!has_best || kv.second.count > best_st.count)) {
+        has_best = true;
+        best_st = kv.second;
+      }
+    }
+    if (!has_best) {
+      s_map.clear();
+      continue;
+    }
+
+    if (pos > 0 && pos == map.cluster_start[pos] && map.is_sep[pos] == 0 &&
+        cleared_from_sep[pos] == 1 && cleared_sep_end[pos] == 1 && has_c && c_st.count >= 3) {
+      if (has_valid_cpp_leading_sep(map, pos)) {
+        best_cut = pos;
+      }
+    }
+
+    if (map.is_sep[pos] == 1) {
+      const bool propagated_from_cleared = has_c && best_st.count == c_st.count;
+      const uint8_t next_end = ((propagated_from_cleared && cleared_from_sep[pos] == 1 && cleared_sep_end[pos] == 1) || map.is_sent_end[pos] == 1) ? 1 : 0;
+      if (!(best_st.count >= 3 && map.is_sent_end[pos] == 1 && cleared_from_sep[pos] == 1 && cleared_sep_end[pos] == 1)) {
+        auto& dst = cleared_st[pos + 1];
+        if (best_st.count > dst.count || (best_st.count == dst.count && next_end > cleared_sep_end[pos + 1])) {
+          dst = best_st;
+          cleared_from_sep[pos + 1] = 1;
+          cleared_sep_end[pos + 1] = next_end;
+        }
+      }
+    }
+
+    if (pos != map.cluster_start[pos] || (cleared_from_sep[pos] == 1 && cleared_sep_end[pos] == 1 && has_c && c_st.count >= 3)) {
+      s_map.clear();
+      continue;
+    }
+
+    int cur_node_idx = 0;
+    for (size_t p = pos; p < n; ++p) {
+      const auto it = matcher.fwd_nodes[cur_node_idx].children.find(map.cps[p]);
+      if (it == matcher.fwd_nodes[cur_node_idx].children.end()) break;
+      cur_node_idx = it->second;
+      const int tid = matcher.fwd_nodes[cur_node_idx].term_id;
+      if (tid < 0) continue;
+
+      const size_t end_pos = p + 1;
+      if (end_pos < n && end_pos != map.cluster_start[end_pos]) continue;
+
+      bool has_start = matcher.term_starts_ascii[tid] ? has_c : has_best;
+      CppDistinct3State start_st = matcher.term_starts_ascii[tid] ? c_st : best_st;
+      const auto same_it = s_map.find(tid);
+      if (same_it != s_map.end() && (!has_start || same_it->second.count > start_st.count)) {
+        has_start = true;
+        start_st = same_it->second;
+      }
+      if (!has_start) continue;
+
+      const CppDistinct3State next_st = advance_cpp_distinct3(start_st, tid);
+      if (!matcher.term_ends_ascii[tid] || end_pos == n) {
+        if (next_st.count > cleared_st[end_pos].count) {
+          cleared_st[end_pos] = next_st;
+          cleared_from_sep[end_pos] = 0;
+          cleared_sep_end[end_pos] = 0;
+        }
+      } else {
+        if (next_st.count > ended_ascii_st[end_pos].count) {
+          ended_ascii_st[end_pos] = next_st;
+        }
+        if (matcher.term_starts_ascii[tid] && map.cps[end_pos] == matcher.term_first_cp[tid]) {
+          auto& dst = same_st[end_pos][tid];
+          if (next_st.count > dst.count) dst = next_st;
+        }
+      }
+    }
+    s_map.clear();
+  }
+  return best_cut;
+}
+
+size_t find_cpp_leading_cut(
+    const CppHallucinationMatcher& matcher,
+    const CppNormalizedClusterMap& map) {
+  return std::max(find_cpp_leading_rule_a_cut(matcher, map), find_cpp_leading_rule_b_cut(matcher, map));
+}
+
+size_t find_cpp_trailing_rule_a_cut(
     const CppHallucinationMatcher& matcher,
     const CppNormalizedClusterMap& map) {
   const size_t n = map.cps.size();
   if (n == 0) return n;
-  constexpr int kInf = 0x3FFF'FFFF;
-  std::vector<int> rev_cleared_cost(n + 1, kInf);
-  std::vector<int> rev_cleared_node(n + 1, -1);
-  std::vector<int> rev_ascii_cost(n + 1, kInf);
-  std::vector<int> rev_ascii_node(n + 1, -1);
-  std::vector<std::unordered_map<int, std::pair<int, int>>> rev_same(n + 1);
 
-  std::vector<int> node_prev{-1};
-  std::vector<int> node_term{-1};
-  rev_cleared_cost[n] = 0;
-  rev_cleared_node[n] = 0;
+  std::vector<uint8_t> completed_sep(n + 1, 0);
+  std::vector<std::unordered_map<int, int>> sep_run(n + 1);
+  std::vector<std::unordered_map<int, int>> rev_same(n + 1);
+  completed_sep[n] = 1;
   size_t best_term_start = n;
 
+  auto record_run = [](std::unordered_map<int, int>& m, int tid, int len) {
+    auto it = m.find(tid);
+    if (it == m.end() || len > it->second) m[tid] = len;
+  };
+
   for (size_t pos = n; pos > 0; --pos) {
-    const int c_cost = rev_cleared_cost[pos];
-    const int a_cost = rev_ascii_cost[pos];
-    auto& same_map = rev_same[pos];
-    if (c_cost == kInf && a_cost == kInf && same_map.empty()) continue;
+    if (pos < n && pos != map.cluster_start[pos]) continue;
+    const bool can_end_fresh = completed_sep[pos] == 1;
+    auto& run_map = sep_run[pos];
+    auto& imm_map = rev_same[pos];
+    if (!can_end_fresh && run_map.empty() && imm_map.empty()) continue;
 
-    int best_cost = c_cost;
-    int best_node = rev_cleared_node[pos];
-    if (a_cost < best_cost) {
-      best_cost = a_cost;
-      best_node = rev_ascii_node[pos];
-    }
-    for (const auto& kv : same_map) {
-      if (kv.second.first < best_cost) {
-        best_cost = kv.second.first;
-        best_node = kv.second.second;
+    const size_t prev_c = map.cluster_start[pos - 1];
+    if (map.is_sep[prev_c] == 1) {
+      if (can_end_fresh) completed_sep[prev_c] = 1;
+      for (const auto& kv : run_map) {
+        record_run(sep_run[prev_c], kv.first, kv.second);
+        if (kv.second >= 2) completed_sep[prev_c] = 1;
       }
-    }
-
-    if (map.is_sep[pos - 1] == 1) {
-      if (best_cost < rev_cleared_cost[pos - 1]) {
-        rev_cleared_cost[pos - 1] = best_cost;
-        rev_cleared_node[pos - 1] = best_node;
+      for (const auto& kv : imm_map) {
+        record_run(sep_run[prev_c], kv.first, kv.second);
+        if (kv.second >= 2) completed_sep[prev_c] = 1;
       }
     }
 
@@ -1266,68 +1562,164 @@ size_t find_cpp_trailing_cut(
       cur_rev_idx = it->second;
       const int tid = matcher.rev_nodes[cur_rev_idx].term_id;
       if (tid < 0) continue;
+      if (idx != map.cluster_start[idx]) continue;
 
-      int right_cost = matcher.term_ends_ascii[tid] ? c_cost : best_cost;
-      int right_node = matcher.term_ends_ascii[tid] ? rev_cleared_node[pos] : best_node;
-      const auto same_it = same_map.find(tid);
-      if (same_it != same_map.end() && same_it->second.first < right_cost) {
-        right_cost = same_it->second.first;
-        right_node = same_it->second.second;
+      int next_len = can_end_fresh ? 1 : 0;
+      const auto rit = run_map.find(tid);
+      if (rit != run_map.end() && rit->second >= 1) {
+        next_len = std::max(next_len, rit->second >= 2 ? 2 : rit->second + 1);
       }
-      if (right_cost >= kInf || right_node < 0) continue;
-
-      const int next_cost = right_cost + 1;
-      const int new_node = static_cast<int>(node_prev.size());
-      node_prev.push_back(right_node);
-      node_term.push_back(tid);
+      const auto iit = imm_map.find(tid);
+      if (iit != imm_map.end() && iit->second >= 1) {
+        next_len = std::max(next_len, iit->second >= 2 ? 2 : iit->second + 1);
+      }
+      if (next_len == 0) continue;
 
       if (!matcher.term_starts_ascii[tid] || idx == 0) {
-        if (next_cost < rev_cleared_cost[idx]) {
-          rev_cleared_cost[idx] = next_cost;
-          rev_cleared_node[idx] = new_node;
-        }
+        record_run(sep_run[idx], tid, next_len);
       } else {
-        if (next_cost < rev_ascii_cost[idx]) {
-          rev_ascii_cost[idx] = next_cost;
-          rev_ascii_node[idx] = new_node;
-        }
-        if (matcher.term_ends_ascii[tid] && map.cps[idx - 1] == matcher.term_last_cp[tid]) {
-          auto& target = rev_same[idx];
-          const auto prev = target.find(tid);
-          if (prev == target.end() || next_cost < prev->second.first) {
-            target[tid] = {next_cost, new_node};
-          }
-        }
+        record_run(rev_same[idx], tid, next_len);
       }
 
-      if (idx > 0) {
-        size_t scan = idx;
-        bool sent_end = false;
-        bool has_real_sep = false;
-        while (scan > 0 && map.is_sep[scan - 1] == 1) {
-          if (map.is_sent_end[scan - 1] == 1) sent_end = true;
-          if (map.is_intra_punct[scan - 1] == 0) has_real_sep = true;
-          --scan;
-        }
-        const bool has_sep_before = scan < idx;
-        const bool before_sep_ascii = scan > 0 ? (map.is_ascii_alnum[scan - 1] == 1) : false;
-        if (is_cpp_chain_qualified(new_node, node_prev, node_term, true, sent_end)) {
-          const bool valid_boundary = has_sep_before
-              ? !(matcher.term_starts_ascii[tid] == 1 && !has_real_sep && before_sep_ascii)
-              : (matcher.term_starts_ascii[tid] == 1 && !before_sep_ascii);
-          if (valid_boundary && idx < best_term_start) {
-            best_term_start = idx;
-          }
+      if (next_len >= 2 && idx > 0) {
+        const auto [valid, sent_end] = is_valid_cpp_trailing_left_boundary(map, idx, matcher.term_starts_ascii[tid] == 1);
+        (void)sent_end;
+        if (valid && idx < best_term_start) {
+          best_term_start = idx;
         }
       }
     }
-    same_map.clear();
+    run_map.clear();
+    imm_map.clear();
   }
+  return best_term_start;
+}
 
+size_t find_cpp_trailing_rule_b_cut(
+    const CppHallucinationMatcher& matcher,
+    const CppNormalizedClusterMap& map) {
+  const size_t n = map.cps.size();
+  if (n == 0) return n;
+
+  std::vector<CppDistinct3State> rev_cleared(n + 1);
+  std::vector<uint8_t> rev_cleared_locked(n + 1, 0);
+  std::vector<CppDistinct3State> rev_ascii(n + 1);
+  std::vector<std::unordered_map<int, CppDistinct3State>> rev_same(n + 1);
+
+  rev_cleared[n].count = 0;
+  size_t best_term_start = n;
+
+  for (size_t pos = n; pos > 0; --pos) {
+    if (pos < n && pos != map.cluster_start[pos]) continue;
+    const CppDistinct3State& c_st = rev_cleared[pos];
+    const CppDistinct3State& a_st = rev_ascii[pos];
+    const bool has_c = c_st.count >= 0;
+    auto& s_map = rev_same[pos];
+    if (!has_c && a_st.count < 0 && s_map.empty()) continue;
+
+    bool has_best = has_c;
+    CppDistinct3State best_st = c_st;
+    if (a_st.count >= 0 && (!has_best || a_st.count > best_st.count)) {
+      has_best = true;
+      best_st = a_st;
+    }
+    for (const auto& kv : s_map) {
+      if (kv.second.count >= 0 && (!has_best || kv.second.count > best_st.count)) {
+        has_best = true;
+        best_st = kv.second;
+      }
+    }
+    if (!has_best) {
+      s_map.clear();
+      continue;
+    }
+
+    const size_t prev_c = map.cluster_start[pos - 1];
+    if (map.is_sep[prev_c] == 1) {
+      bool sep_has_end = false;
+      for (size_t k = prev_c; k < pos; ++k) {
+        if (map.is_sent_end[k] == 1) {
+          sep_has_end = true;
+          break;
+        }
+      }
+      const bool crossed_after_valid = best_st.count >= 3 && sep_has_end;
+      if (!(best_st.count >= 3 && rev_cleared_locked[pos] == 1)) {
+        if (best_st.count > rev_cleared[prev_c].count) {
+          rev_cleared[prev_c] = best_st;
+          rev_cleared_locked[prev_c] = (rev_cleared_locked[pos] == 1 || crossed_after_valid) ? 1 : 0;
+        }
+      }
+    }
+
+    if (rev_cleared_locked[pos] == 1) {
+      s_map.clear();
+      continue;
+    }
+
+    int cur_rev_idx = 0;
+    for (size_t p = pos; p > 0; --p) {
+      const size_t idx = p - 1;
+      const auto it = matcher.rev_nodes[cur_rev_idx].children.find(map.cps[idx]);
+      if (it == matcher.rev_nodes[cur_rev_idx].children.end()) break;
+      cur_rev_idx = it->second;
+      const int tid = matcher.rev_nodes[cur_rev_idx].term_id;
+      if (tid < 0) continue;
+      if (idx != map.cluster_start[idx]) continue;
+
+      bool has_right = matcher.term_ends_ascii[tid] ? has_c : has_best;
+      CppDistinct3State right_st = matcher.term_ends_ascii[tid] ? c_st : best_st;
+      const auto same_it = s_map.find(tid);
+      if (same_it != s_map.end() && (!has_right || same_it->second.count > right_st.count)) {
+        has_right = true;
+        right_st = same_it->second;
+      }
+      if (!has_right) continue;
+
+      const CppDistinct3State next_st = advance_cpp_distinct3(right_st, tid);
+      if (!matcher.term_starts_ascii[tid] || idx == 0) {
+        if (next_st.count > rev_cleared[idx].count) rev_cleared[idx] = next_st;
+      } else {
+        if (next_st.count > rev_ascii[idx].count) rev_ascii[idx] = next_st;
+        if (matcher.term_ends_ascii[tid] && idx > 0 && map.cps[idx - 1] == matcher.term_last_cp[tid]) {
+          auto& dst = rev_same[idx][tid];
+          if (next_st.count > dst.count) dst = next_st;
+        }
+      }
+
+      if (next_st.count >= 3 && idx > 0) {
+        const auto [valid, sent_end] = is_valid_cpp_trailing_left_boundary(map, idx, matcher.term_starts_ascii[tid] == 1);
+        if (valid && sent_end && idx < best_term_start) {
+          best_term_start = idx;
+        }
+      }
+    }
+    s_map.clear();
+  }
+  return best_term_start;
+}
+
+size_t find_cpp_trailing_cut(
+    const CppHallucinationMatcher& matcher,
+    const CppNormalizedClusterMap& map) {
+  const size_t n = map.cps.size();
+  if (n == 0) return n;
+  const size_t start_a = find_cpp_trailing_rule_a_cut(matcher, map);
+  const size_t start_b = find_cpp_trailing_rule_b_cut(matcher, map);
+  const size_t best_term_start = std::min(start_a, start_b);
   if (best_term_start >= n) return n;
   size_t cut = best_term_start;
-  while (cut > 0 && map.is_weak_sep[cut - 1] == 1) {
-    --cut;
+  while (cut > 0) {
+    const size_t c = map.cluster_start[cut - 1];
+    bool all_weak = true;
+    for (size_t k = c; k < cut; ++k) {
+      if (map.is_weak_sep[k] == 0) {
+        all_weak = false;
+        break;
+      }
+    }
+    if (!all_weak) break;
+    cut = c;
   }
   return cut;
 }
@@ -1342,16 +1734,16 @@ std::string strip_voice_hotword_hallucination(
   for (const auto& raw : hotword_terms) {
     const std::string trimmed = trim_ascii_ws(raw);
     if (trimmed.empty()) continue;
-    const auto map = build_cpp_normalized_cluster_map(trimmed);
-    if (map.cps.empty()) continue;
+    const std::vector<uint32_t> norm_cps = normalize_hotword_utf8_to_cps(trimmed);
+    if (norm_cps.empty()) continue;
     bool dup = false;
     for (const auto& existing : unique_terms) {
-      if (existing == map.cps) {
+      if (existing == norm_cps) {
         dup = true;
         break;
       }
     }
-    if (!dup) unique_terms.push_back(map.cps);
+    if (!dup) unique_terms.push_back(norm_cps);
   }
   if (unique_terms.empty()) return text;
 
@@ -1400,8 +1792,9 @@ std::string strip_voice_hotword_hallucination(
     matcher.rev_nodes[rcur].term_id = tid;
   }
 
-  const auto whole_map = build_cpp_normalized_cluster_map(text);
-  const size_t n = whole_map.cps.size();
+  // Whole-string check normalizes the full UTF-8 string via Unicode NFKC directly (preserving Hangul Jamo & combining composition).
+  const std::vector<uint32_t> cps = normalize_hotword_utf8_to_cps(text);
+  const size_t n = cps.size();
   if (n == 0) return text;
 
   constexpr int kInf = 0x3FFF'FFFF;
@@ -1417,7 +1810,7 @@ std::string strip_voice_hotword_hallucination(
     if (c_count == kInf && a_count == kInf && same_map.empty()) continue;
     const int best_at_pos = std::min(c_count, a_count);
 
-    if (whole_map.is_sep[pos] == 1) {
+    if (is_hotword_sep_cp(cps[pos])) {
       int sep_min = best_at_pos;
       for (const auto& kv : same_map) {
         if (kv.second < sep_min) sep_min = kv.second;
@@ -1429,7 +1822,7 @@ std::string strip_voice_hotword_hallucination(
 
     int cur_idx = 0;
     for (size_t p = pos; p < n; ++p) {
-      const auto it = matcher.fwd_nodes[cur_idx].children.find(whole_map.cps[p]);
+      const auto it = matcher.fwd_nodes[cur_idx].children.find(cps[p]);
       if (it == matcher.fwd_nodes[cur_idx].children.end()) break;
       cur_idx = it->second;
       const int tid = matcher.fwd_nodes[cur_idx].term_id;
@@ -1448,7 +1841,7 @@ std::string strip_voice_hotword_hallucination(
         if (next_cost < cleared[end_pos]) cleared[end_pos] = next_cost;
       } else {
         if (next_cost < ended_ascii[end_pos]) ended_ascii[end_pos] = next_cost;
-        if (matcher.term_starts_ascii[tid] && whole_map.cps[end_pos] == matcher.term_first_cp[tid]) {
+        if (matcher.term_starts_ascii[tid] && cps[end_pos] == matcher.term_first_cp[tid]) {
           auto& target = same_states[end_pos];
           const auto prev = target.find(tid);
           if (prev == target.end() || next_cost < prev->second) {
@@ -1468,8 +1861,9 @@ std::string strip_voice_hotword_hallucination(
   }
 
   std::string current = text;
+  const auto whole_map = build_cpp_normalized_cluster_map(current);
   const size_t lead_cut = find_cpp_leading_cut(matcher, whole_map);
-  if (lead_cut > 0 && lead_cut < n) {
+  if (lead_cut > 0 && lead_cut < whole_map.cps.size()) {
     current = current.substr(whole_map.norm_to_raw_byte[lead_cut]);
   }
   if (current.empty()) return {};
@@ -1550,6 +1944,7 @@ class SegmentedUtterancePipeline {
     bool utterance_exceeded_final_cap = false;
     std::string committed_text;
     bool committed_has_trusted_real_text = false;
+    bool committed_pending_single_hotword = false;
     std::string active_segment_text;
     std::string active_trusted_real_text;
     bool active_pending_single_hotword = false;
@@ -1686,6 +2081,10 @@ class SegmentedUtterancePipeline {
               active_trusted_real_text = seg_text;
               active_pending_single_hotword = false;
               retracted_segment_single_hotword = false;
+              if (!committed_text.empty()) {
+                committed_has_trusted_real_text = true;
+                committed_pending_single_hotword = false;
+              }
             } else if (active_trusted_real_text.empty()) {
               active_pending_single_hotword = true;
             }
@@ -1697,8 +2096,11 @@ class SegmentedUtterancePipeline {
           if (!effective_seg.empty()) {
             if (!hotword_terms_.empty() && (!active_trusted_real_text.empty() || has_real_non_hotword)) {
               committed_has_trusted_real_text = true;
+              committed_pending_single_hotword = false;
             } else if (hotword_terms_.empty()) {
               committed_has_trusted_real_text = true;
+            } else if (!committed_has_trusted_real_text) {
+              committed_pending_single_hotword = true;
             }
             committed_text = combined;
           }
@@ -1771,12 +2173,16 @@ class SegmentedUtterancePipeline {
         std::vector<float>().swap(utterance_samples);
         std::string final_seg = active_segment_text;
         const std::vector<float> trimmed_tail = trim_silence_edges(segment_samples);
+        bool tail_has_real_non_hotword = false;
         if (segment_samples.size() >= 1600 && !trimmed_tail.empty()) {
           bool hit_hallucination = false;
-          bool has_real_non_hotword = false;
-          const std::string tail_text = sanitize_decoded(decode_fn_(trimmed_tail), hit_hallucination, has_real_non_hotword);
+          const std::string tail_text = sanitize_decoded(decode_fn_(trimmed_tail), hit_hallucination, tail_has_real_non_hotword);
           if (!hotword_terms_.empty()) {
-            const bool blocked_single_only = !tail_text.empty() && !has_real_non_hotword &&
+            if (tail_has_real_non_hotword && !committed_text.empty()) {
+              committed_has_trusted_real_text = true;
+              committed_pending_single_hotword = false;
+            }
+            const bool blocked_single_only = !tail_text.empty() && !tail_has_real_non_hotword &&
                 (retracted_segment_single_hotword || pending_retraction_final || !active_trusted_real_text.empty());
             if (hit_hallucination || blocked_single_only || tail_text.empty()) {
               final_seg = active_trusted_real_text;
@@ -1789,8 +2195,13 @@ class SegmentedUtterancePipeline {
         } else if (!hotword_terms_.empty()) {
           final_seg = active_trusted_real_text;
         }
+        const bool drop_retracted_single_committed =
+            !hotword_terms_.empty() &&
+            committed_pending_single_hotword &&
+            !committed_has_trusted_real_text &&
+            (retracted_segment_single_hotword || pending_retraction_final);
         const std::string base_committed =
-            (hotword_terms_.empty() || committed_has_trusted_real_text) ? committed_text : std::string{};
+            drop_retracted_single_committed ? std::string{} : committed_text;
         final_text = join_transcript_segments(base_committed, final_seg);
       }
       {

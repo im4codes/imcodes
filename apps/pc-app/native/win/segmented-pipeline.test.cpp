@@ -942,18 +942,33 @@ int main() {
     assert(final_text == "你答的对，就这么来。");
   }
 
-  // 17. Direct C++ strip_voice_hotword_hallucination coverage: positive + negative safety cases.
+  // 17. Direct C++ strip_voice_hotword_hallucination coverage: shared cross-platform matrix.
   {
-    const std::vector<std::string> terms{"IM.codes", "Claude Code", "Codex", "代码"};
+    const std::vector<std::string> terms{"IM.codes", "Claude Code", "Codex", "Claude", "Qwen"};
     assert(strip_voice_hotword_hallucination("IM.codes，IM.codes。你答的对，就这么来。", terms) ==
            "你答的对，就这么来。");
     assert(strip_voice_hotword_hallucination("我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。IM.codes，IM.codes。", terms) ==
            "我们是桌面端，在乎那几十兆，不在乎的，我要的是速度。");
     assert(strip_voice_hotword_hallucination("我要的是速度 IM.codes IM.codes", terms) == "我要的是速度");
     assert(strip_voice_hotword_hallucination("我要的是速度，IM.codes，IM.codes。", terms) == "我要的是速度");
-    assert(strip_voice_hotword_hallucination("ＩＭ．ｃｏｄｅｓ，IM.codes。你好，IM.codes，im.codes。", terms) == "你好");
+    assert(strip_voice_hotword_hallucination("ＩＭ．ｃｏｄｅｓ，IM.codes。Café👍🏽，IM.codes，im.codes。", terms) == "Café👍🏽");
     assert(strip_voice_hotword_hallucination("IM.codes, Claude Code, Codex。开始工作", terms) == "开始工作");
     assert(strip_voice_hotword_hallucination("开始工作。IM.codes, Claude Code, Codex。", terms) == "开始工作。");
+    // P0 #1 matrix: A/B/A intact, preceding sentence intact, adjacent A/A only
+    assert(strip_voice_hotword_hallucination("IM.codes, Codex, IM.codes 都是我在用的工具", terms) ==
+           "IM.codes, Codex, IM.codes 都是我在用的工具");
+    assert(strip_voice_hotword_hallucination("Codex。IM.codes，IM.codes。你好", terms) ==
+           "Codex。IM.codes，IM.codes。你好");
+    assert(strip_voice_hotword_hallucination("IM.codes，IM.codes。Codex。你好", terms) ==
+           "Codex。你好");
+    assert(strip_voice_hotword_hallucination("打开 Codex，IM.codes，IM.codes。", terms) == "打开 Codex");
+    assert(strip_voice_hotword_hallucination("先看。Codex。IM.codes, Claude, Qwen。", terms) == "先看。Codex。");
+    // P0 #2 matrix: true NFKC (Hangul Jamo, Latin NFD vs NFC, distinct combining marks kept)
+    assert(strip_voice_hotword_hallucination("\xE1\x84\x80\xE1\x85\xA1, \xEA\xB0\x80", std::vector<std::string>{"\xEA\xB0\x80"}).empty());
+    assert(strip_voice_hotword_hallucination("\xE1\x84\x80\xE1\x85\xA1, \xEA\xB0\x80\xE3\x80\x82\xE4\xBD\xA0\xE5\xA5\xBD", std::vector<std::string>{"\xEA\xB0\x80"}) == "\xE4\xBD\xA0\xE5\xA5\xBD");
+    assert(strip_voice_hotword_hallucination("Caf\xC3\xA9, Cafe\xCC\x81\xE3\x80\x82\xE4\xBD\xA0\xE5\xA5\xBD", std::vector<std::string>{"Caf\xC3\xA9"}) == "\xE4\xBD\xA0\xE5\xA5\xBD");
+    assert(strip_voice_hotword_hallucination("code\xCC\x81, code\xE3\x80\x82\xE4\xBD\xA0\xE5\xA5\xBD", std::vector<std::string>{"code"}) == "code\xCC\x81, code\xE3\x80\x82\xE4\xBD\xA0\xE5\xA5\xBD");
+    assert(strip_voice_hotword_hallucination("cod\xCC\x81, code\xE3\x80\x82\xE4\xBD\xA0\xE5\xA5\xBD", std::vector<std::string>{"code"}) == "cod\xCC\x81, code\xE3\x80\x82\xE4\xBD\xA0\xE5\xA5\xBD");
     // Negative cases must stay intact:
     assert(strip_voice_hotword_hallucination("IM.codes is great", terms) == "IM.codes is great");
     assert(strip_voice_hotword_hallucination("Use IM.codes", terms) == "Use IM.codes");
@@ -962,6 +977,131 @@ int main() {
     assert(strip_voice_hotword_hallucination("你好，你好吗", std::vector<std::string>{"你好"}) == "你好，你好吗");
     assert(strip_voice_hotword_hallucination("请你对比 IM.codes, Claude Code, Codex。", terms) ==
            "请你对比 IM.codes, Claude Code, Codex。");
+
+    // Verify injectable NFKC normalizer hook works cleanly at both full-string and cluster level, then restore default.
+    set_hotword_nfkc_normalizer_for_testing([](const std::string& s) -> std::string {
+      std::string out = s;
+      const std::string kelvin = "\xE2\x84\xAA"; // U+212A Kelvin sign
+      size_t pos = 0;
+      while ((pos = out.find(kelvin, pos)) != std::string::npos) {
+        out.replace(pos, kelvin.size(), "k");
+        pos += 1;
+      }
+      return out;
+    });
+    assert(strip_voice_hotword_hallucination("\xE2\x84\xAA, \xE2\x84\xAA\xE3\x80\x82\xE4\xBD\xA0\xE5\xA5\xBD", std::vector<std::string>{"k"}) ==
+           "\xE4\xBD\xA0\xE5\xA5\xBD");
+    set_hotword_nfkc_normalizer_for_testing(nullptr);
+  }
+
+  // 18. P0 #3 counterexample: >cap cross-segment real single hotword ("IM.codes") + trailing real text ("保留这一句")
+  //     must preserve committed single hotword ("IM.codes保留这一句"), while retracted/noise hotwords never resurrect.
+  {
+    // 18a: seg 1 (16k) -> "IM.codes", seg 2 (8k, >20k cap) -> "保留这一句" => "IM.codes保留这一句"
+    std::vector<std::string> emitted;
+    int call = 0;
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> pipeline(
+        [&](const std::vector<float>&) -> std::string {
+          ++call;
+          if (call == 1) return "IM.codes";
+          return "保留这一句";
+        },
+        [&](const std::string& line) { emitted.push_back(line); },
+        16000,
+        20000,
+        std::vector<std::string>{"IM.codes"});
+
+    pipeline.preload(std::vector<float>(24000, 0.2f));
+    std::thread worker([&]() { pipeline.run_loop(); });
+    pipeline.request_stop(false, true);
+    worker.join();
+
+    std::string final_text;
+    for (const auto& line : emitted) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_text = extract_json_string_field(line, "text").value_or("");
+      }
+    }
+    assert(final_text == "IM.codes保留这一句");
+
+    // 18b: retracted active single hotword in trailing segment after >cap must NOT resurrect while committed real text stays intact
+    std::vector<std::string> emitted_retract;
+    std::mutex mu_r;
+    std::condition_variable cv_r;
+    int pass_r = 0;
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> retract_pipeline(
+        [&](const std::vector<float>&) -> std::string {
+          int p = 0;
+          {
+            std::lock_guard<std::mutex> lock(mu_r);
+            p = ++pass_r;
+          }
+          cv_r.notify_all();
+          if (p == 1) return "先看";
+          if (p == 2) return "IM.codes";
+          if (p == 3) return "IM.codes，IM.codes。";
+          return "IM.codes";
+        },
+        [&](const std::string& line) {
+          std::lock_guard<std::mutex> lock(mu_r);
+          emitted_retract.push_back(line);
+        },
+        32000,
+        40000,
+        std::vector<std::string>{"IM.codes"});
+
+    std::thread worker_r([&]() { retract_pipeline.run_loop(); });
+    retract_pipeline.push(std::vector<float>(32000, 0.2f));
+    wait_until_or_fail(mu_r, cv_r, [&]() { return pass_r >= 1; }, "18b seg 1");
+    retract_pipeline.push(std::vector<float>(kInitialPartialSamples, 0.2f));
+    wait_until_or_fail(mu_r, cv_r, [&]() { return pass_r >= 2; }, "18b seg 2a");
+    retract_pipeline.push(std::vector<float>(kStepPartialSamples, 0.2f));
+    wait_until_or_fail(mu_r, cv_r, [&]() { return pass_r >= 3; }, "18b seg 2b retract");
+    retract_pipeline.request_stop(false, true);
+    worker_r.join();
+
+    std::string final_retract;
+    for (const auto& line : emitted_retract) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_retract = extract_json_string_field(line, "text").value_or("");
+      }
+    }
+    assert(final_retract == "先看");
+
+    // 18c: pure sub-threshold noise across >cap skips decode_fn_ completely and emits ""
+    int noise_calls = 0;
+    std::vector<std::string> emitted_noise;
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> noise_pipeline(
+        [&](const std::vector<float>&) -> std::string {
+          ++noise_calls;
+          return "IM.codes";
+        },
+        [&](const std::string& line) { emitted_noise.push_back(line); },
+        16000,
+        20000,
+        std::vector<std::string>{"IM.codes"});
+
+    noise_pipeline.preload(std::vector<float>(24000, 0.002f));
+    std::thread worker_n([&]() { noise_pipeline.run_loop(); });
+    noise_pipeline.request_stop(false, true);
+    worker_n.join();
+    assert(noise_calls == 0);
+    std::string final_noise;
+    for (const auto& line : emitted_noise) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_noise = extract_json_string_field(line, "text").value_or("");
+      }
+    }
+    assert(final_noise.empty());
   }
 
   std::printf("segmented-pipeline tests passed\n");
