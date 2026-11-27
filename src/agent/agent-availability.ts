@@ -8,6 +8,7 @@ import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { CODEBUDDY_CLI_PATH_ENVIRONMENT_VARIABLE, CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
+import { resolveCopilotExplicitBinaryPath, resolveCopilotRuntimePlatform } from './copilot-runtime-config.js';
 import { getProvider } from './provider-registry.js';
 import { DSH_BINARY_ENV, DSH_DEFAULT_BINARY } from './providers/deepseek-harness/runtime.js';
 import { GROK_CLI_BINARY, GROK_CLI_PATH_ENV } from './providers/grok-sdk.js';
@@ -22,6 +23,7 @@ const DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD';
 export interface AgentAvailabilityProbeDeps {
   platform: NodeJS.Platform;
   arch: NodeJS.Architecture | string;
+  isMusl?: boolean;
   env: NodeJS.ProcessEnv;
   homeDir: string;
   imcodesHomeDir: string;
@@ -62,6 +64,12 @@ function pathModuleFor(platform: NodeJS.Platform) {
   return platform === 'win32' ? path.win32 : path.posix;
 }
 
+function defaultIsLinuxMusl(platform: NodeJS.Platform): boolean {
+  if (platform !== 'linux' || process.platform !== 'linux') return false;
+  const report = process.report?.getReport() as { header?: { glibcVersionRuntime?: unknown } } | undefined;
+  return report?.header !== undefined && report.header.glibcVersionRuntime === undefined;
+}
+
 async function defaultIsExecutableFile(filePath: string, platform: NodeJS.Platform): Promise<boolean> {
   try {
     const info = await stat(filePath);
@@ -89,6 +97,7 @@ function buildDefaultDeps(overrides?: Partial<AgentAvailabilityProbeDeps>): Agen
   return {
     platform,
     arch: overrides?.arch ?? process.arch,
+    ...(overrides?.isMusl !== undefined ? { isMusl: overrides.isMusl } : {}),
     env,
     homeDir: overrides?.homeDir ?? homedir(),
     imcodesHomeDir: overrides?.imcodesHomeDir ?? resolveImcodesHome(),
@@ -306,37 +315,39 @@ async function probeCopilotSdk(deps: AgentAvailabilityProbeDeps): Promise<AgentA
   const sdkRoot = deps.resolvePackageRoot('@microsoft/copilot-sdk');
   if (!sdkRoot) return { installed: false, reason: '@microsoft/copilot-sdk package not installed' };
 
-  // Matches `CopilotSdkProvider.resolveBinaryPath()` + `@microsoft/copilot-sdk` runtime resolution.
-  const configured = deps.env.COPILOT_CLI_PATH?.trim();
-  if (configured && (await deps.isExecutableFile(configured))) return { installed: true };
+  // Shared selection rule with `CopilotSdkProvider.resolveBinaryPath()`:
+  // an explicit absolute executable (or `.js`) via `COPILOT_CLI_PATH` uses
+  // `RuntimeConnection.forSpawnedStdio`, so it does not depend on platform prebuilds.
+  const explicitCli = await resolveCopilotExplicitBinaryPath({
+    env: deps.env,
+    platform: deps.platform,
+    isValidFile: async (filePath) => (
+      filePath.toLowerCase().endsWith('.js')
+        ? deps.fileExists(filePath)
+        : deps.isExecutableFile(filePath)
+    ),
+  });
+  if (explicitCli) return { installed: true };
 
-  if (deps.platform === 'win32') {
-    const winBinary = await resolveCommandExecutable('copilot', { includeWindowsGlobalNpmDirs: true }, deps);
-    if (winBinary) return { installed: true };
+  // Otherwise v2 uses the bundled runtime in `@microsoft/copilot-sdk-<platform>`,
+  // matching `dist/runtimeArtifacts.js#ensureRuntimeBundle` (`COPILOT_CLI_USE_NPM_PACKAGE = false`,
+  // exact host platform/libc only, and requiring both the wrapper executable and `runtime.node`).
+  const isMusl = deps.isMusl ?? defaultIsLinuxMusl(deps.platform);
+  const runtimePlatform = resolveCopilotRuntimePlatform(deps.platform, deps.arch, isMusl);
+  if (!runtimePlatform) {
+    return { installed: false, reason: `Unsupported Copilot runtime platform: ${deps.platform}-${deps.arch}` };
   }
-
-  const platformTokens = deps.platform === 'linux'
-    ? [`linux-${deps.arch}`, `linuxmusl-${deps.arch}`]
-    : [`${deps.platform}-${deps.arch}`];
+  const sdkPlatformRoot = deps.resolvePackageRoot(`@microsoft/copilot-sdk-${runtimePlatform}`);
+  if (!sdkPlatformRoot) {
+    return { installed: false, reason: 'Copilot CLI/runtime not found' };
+  }
   const wrapperName = deps.platform === 'win32' ? 'copilot-runtime.exe' : 'copilot-runtime';
-
-  for (const token of platformTokens) {
-    const sdkPlatformRoot = deps.resolvePackageRoot(`@microsoft/copilot-sdk-${token}`);
-    if (sdkPlatformRoot) {
-      const prebuildDir = p.join(sdkPlatformRoot, 'prebuilds', token);
-      // v2 uses in-process FFI via `runtime.node` by default, or spawned `copilot-runtime[.exe]` + `runtime.node`.
-      if (
-        (await deps.fileExists(p.join(prebuildDir, 'runtime.node')))
-        || ((await deps.fileExists(p.join(prebuildDir, wrapperName)))
-          && (await deps.fileExists(p.join(prebuildDir, 'runtime.node'))))
-      ) {
-        return { installed: true };
-      }
-    }
-    const npmPlatformRoot = deps.resolvePackageRoot(`@github/copilot-${token}`);
-    if (npmPlatformRoot && (await deps.fileExists(p.join(npmPlatformRoot, 'prebuilds', token, 'runtime.node')))) {
-      return { installed: true };
-    }
+  const prebuildDir = p.join(sdkPlatformRoot, 'prebuilds', runtimePlatform);
+  if (
+    (await deps.fileExists(p.join(prebuildDir, wrapperName)))
+    && (await deps.fileExists(p.join(prebuildDir, 'runtime.node')))
+  ) {
+    return { installed: true };
   }
 
   return { installed: false, reason: 'Copilot CLI/runtime not found' };

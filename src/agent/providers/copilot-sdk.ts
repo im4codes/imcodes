@@ -1,7 +1,5 @@
 import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import path from 'node:path';
 import type {
   TransportProvider,
   ProviderCapabilities,
@@ -33,7 +31,7 @@ import {
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
-import { resolveBinaryWithWindowsFallbacks } from '../transport-paths.js';
+import { buildCopilotClientOptions, resolveCopilotExplicitBinaryPathSync } from '../copilot-runtime-config.js';
 import { type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import {
@@ -52,7 +50,6 @@ import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
 import { isAskQuestionToolName } from '../../../shared/ask-question-normalize.js';
 import { INTERACTIVE_QUESTION_TOOL_NAME } from '../../../shared/codex-user-input.js';
 import type {
-  CopilotClientOptions,
   CreateSessionOptions,
   GetAuthStatusResponse,
   GetStatusResponse,
@@ -74,7 +71,6 @@ type PreToolUseHookOutput = Awaited<ReturnType<PreToolUseHookHandler>>;
 const COPILOT_NATIVE_AGENT_TOOL_NAMES: ReadonlySet<string> = new Set(COPILOT_NATIVE_AGENT_TOOLS);
 
 /** The Copilot SDK pre-tool-use hook output this provider returns. */
-const COPILOT_BIN = 'copilot';
 const MIN_PROTOCOL_VERSION = 4;
 const COMPATIBLE_CLI_RANGE = '>=1.0.31';
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
@@ -274,6 +270,38 @@ function buildApprovalDescription(request: Record<string, unknown>): string {
   }
 }
 
+function finiteNonNegative(value: number | undefined): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : undefined;
+}
+
+function buildAnthropicSplitUsage(state: Pick<
+  CopilotSessionState,
+  'currentInputTokens' | 'currentOutputTokens' | 'currentCacheReadTokens' | 'currentCacheWriteTokens'
+>): Record<string, number> | undefined {
+  const totalInput = finiteNonNegative(state.currentInputTokens);
+  const output = finiteNonNegative(state.currentOutputTokens);
+  const cacheRead = finiteNonNegative(state.currentCacheReadTokens);
+  const cacheWrite = finiteNonNegative(state.currentCacheWriteTokens);
+  if (totalInput === undefined && output === undefined && cacheRead === undefined && cacheWrite === undefined) {
+    return undefined;
+  }
+  // Copilot v2 `AssistantUsageData.inputTokens` includes both `cacheReadTokens` and
+  // `cacheWriteTokens`. `transport-relay.ts#normalizeUsageUpdatePayload` computes
+  // `inputTokens = input_tokens + cache_creation_input_tokens`, and `maybeAutoCompact`
+  // sums `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`, so
+  // emit Anthropic-split uncached `input_tokens` (matching `codex-sdk.ts`) while
+  // preserving `cache_read_input_tokens` and `cache_creation_input_tokens`.
+  const uncachedInput = totalInput !== undefined
+    ? Math.max(0, totalInput - (cacheRead ?? 0) - (cacheWrite ?? 0))
+    : undefined;
+  return {
+    ...(uncachedInput !== undefined ? { input_tokens: uncachedInput } : {}),
+    ...(output !== undefined ? { output_tokens: output } : {}),
+    ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
+    ...(cacheWrite !== undefined ? { cache_creation_input_tokens: cacheWrite } : {}),
+  };
+}
+
 function toolFromEvent(event: Record<string, any>): ToolCallEvent | null {
   if (event.type === 'tool.execution_start') {
     return {
@@ -379,14 +407,7 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
   async connect(config: ProviderConfig): Promise<void> {
     const sdk = await copilotSdkRuntimeHooks.loadSdk();
     const resolvedBinary = this.resolveBinaryPath(config);
-    const clientOptions: CopilotClientOptions = resolvedBinary
-      ? {
-          mode: 'coding-agent',
-          runtime: sdk.RuntimeConnection?.forSpawnedStdio
-            ? sdk.RuntimeConnection.forSpawnedStdio({ path: resolvedBinary })
-            : { kind: 'spawned-stdio', path: resolvedBinary },
-        }
-      : { mode: 'coding-agent' };
+    const clientOptions = buildCopilotClientOptions(sdk, resolvedBinary);
     const client = new sdk.CopilotClient(clientOptions) as unknown as CopilotClientLike;
     try {
       await client.start();
@@ -1263,6 +1284,7 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
         }
         if (!state.completionEmittedForCurrentTurn && state.currentMessageId && state.currentText) {
           state.completionEmittedForCurrentTurn = true;
+          const usage = buildAnthropicSplitUsage(state);
           const message: AgentMessage = {
             id: state.currentMessageId,
             sessionId: routeId,
@@ -1273,33 +1295,7 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
             status: 'complete',
             metadata: {
               ...(state.model ? { model: state.model } : {}),
-              // Build usage with whichever fields we captured. transport-relay's
-              // normalizeUsageUpdatePayload reads input_tokens / output_tokens /
-              // cache_read_input_tokens / cache_creation_input_tokens (snake_case);
-              // we already collected copilot's camelCase fields and translate
-              // here so the chat header context bar + context_turn_usage row
-              // pick them up like every other provider.
-              ...(typeof state.currentInputTokens === 'number'
-                || typeof state.currentOutputTokens === 'number'
-                || typeof state.currentCacheReadTokens === 'number'
-                || typeof state.currentCacheWriteTokens === 'number'
-                ? {
-                    usage: {
-                      ...(typeof state.currentInputTokens === 'number'
-                        ? { input_tokens: state.currentInputTokens }
-                        : {}),
-                      ...(typeof state.currentOutputTokens === 'number'
-                        ? { output_tokens: state.currentOutputTokens }
-                        : {}),
-                      ...(typeof state.currentCacheReadTokens === 'number'
-                        ? { cache_read_input_tokens: state.currentCacheReadTokens }
-                        : {}),
-                      ...(typeof state.currentCacheWriteTokens === 'number'
-                        ? { cache_creation_input_tokens: state.currentCacheWriteTokens }
-                        : {}),
-                    },
-                  }
-                : {}),
+              ...(usage ? { usage } : {}),
               ...(typeof state.currentCostUsd === 'number' ? { costUsd: state.currentCostUsd } : {}),
               ...(state.currentInteractionId ? { interactionId: state.currentInteractionId } : {}),
               resumeId: state.sessionId,
@@ -1553,27 +1549,7 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
   }
 
   private resolveBinaryPath(config: ProviderConfig): string | undefined {
-    // In v2 (`@microsoft/copilot-sdk`), omitting `runtime` defaults to the
-    // in-process native runtime (`runtime.node` via FFI). Passing an explicit
-    // `RuntimeConnection.forSpawnedStdio({ path })` requires an existing
-    // executable path, so we only override when:
-    //   1. The caller explicitly passed an absolute binaryPath that exists, OR
-    //   2. On Windows, a PATH-resolved `copilot` binary is an absolute existing file.
-    // Otherwise we return `undefined` so the SDK uses its bundled in-process runtime.
-    if (isNonEmptyString(config.binaryPath)) {
-      const candidate = config.binaryPath.trim();
-      if (path.isAbsolute(candidate) && existsSync(candidate)) return candidate;
-      logger.warn(
-        { provider: this.id, candidate },
-        'Ignoring Copilot binaryPath override (not an absolute file path) — falling back to bundled CLI',
-      );
-      return undefined;
-    }
-    if (process.platform === 'win32') {
-      const resolved = resolveBinaryWithWindowsFallbacks(COPILOT_BIN, []);
-      if (resolved && path.isAbsolute(resolved) && existsSync(resolved)) return resolved;
-    }
-    return undefined;
+    return resolveCopilotExplicitBinaryPathSync({ binaryPath: config.binaryPath });
   }
 
   private resolveDefaultModel(): string | undefined {

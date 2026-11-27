@@ -1,3 +1,6 @@
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const loggerMock = vi.hoisted(() => ({
@@ -25,6 +28,9 @@ const sdkMock = vi.hoisted(() => {
 
 vi.mock('@microsoft/copilot-sdk', () => ({
   CopilotClient: vi.fn().mockImplementation((opts: unknown) => sdkMock.clientFactory(opts)),
+  RuntimeConnection: {
+    forSpawnedStdio: vi.fn((opts: { path?: string }) => ({ kind: 'spawned-stdio', path: opts.path })),
+  },
 }));
 
 import {
@@ -207,5 +213,32 @@ describe('getCopilotRuntimeConfig', () => {
     expect(normalizeCopilotSupportedEfforts(['low', 'xhigh'])).toEqual(['low', 'max']);
     expect(normalizeCopilotSupportedEfforts(['unknown'])).toBeUndefined();
     expect(normalizeCopilotSupportedEfforts(undefined)).toBeUndefined();
+  });
+
+  it('passes COPILOT_CLI_PATH into RuntimeConnection.forSpawnedStdio when an existing executable override is configured', async () => {
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'copilot-rt-cli-'));
+    const customCli = path.join(tempDir, 'copilot-v4');
+    const orig = process.env.COPILOT_CLI_PATH;
+    try {
+      await writeFile(customCli, '#!/bin/sh\nexit 0\n', 'utf8');
+      await chmod(customCli, 0o755);
+      process.env.COPILOT_CLI_PATH = customCli;
+      sdkMock.clientFactory.mockImplementation((opts: unknown) => ({
+        opts,
+        start: vi.fn().mockResolvedValue(undefined),
+        getStatus: vi.fn().mockResolvedValue({ version: '1.0.117' }),
+        getAuthStatus: vi.fn().mockResolvedValue({ isAuthenticated: true }),
+        listModels: vi.fn().mockResolvedValue([]),
+      }));
+      await getCopilotRuntimeConfig(true);
+      expect(sdkMock.clientFactory).toHaveBeenCalledWith({
+        mode: 'coding-agent',
+        runtime: { kind: 'spawned-stdio', path: customCli },
+      });
+    } finally {
+      if (orig === undefined) delete process.env.COPILOT_CLI_PATH;
+      else process.env.COPILOT_CLI_PATH = orig;
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 });

@@ -1,8 +1,130 @@
-import type { Model } from '@microsoft/copilot-sdk';
+import { accessSync, constants as fsConstants, existsSync, statSync } from 'node:fs';
+import { access, stat } from 'node:fs/promises';
+import path from 'node:path';
+import type { CopilotClientOptions, Model } from '@microsoft/copilot-sdk';
 import { normalizeSupportedEffortLevels, type TransportEffortLevel } from '../../shared/effort-levels.js';
 import logger from '../util/logger.js';
 
+export const COPILOT_CLI_PATH_ENV = 'COPILOT_CLI_PATH';
+
 const CACHE_TTL_MS = 60_000;
+
+function pathModuleFor(platform: NodeJS.Platform) {
+  return platform === 'win32' ? path.win32 : path.posix;
+}
+
+function selectExplicitCandidate(
+  configBinaryPath: unknown,
+  env: NodeJS.ProcessEnv,
+): { source: 'binaryPath' | 'env'; candidate: string } | null {
+  const fromConfig = typeof configBinaryPath === 'string' ? configBinaryPath.trim() : '';
+  if (fromConfig) return { source: 'binaryPath', candidate: fromConfig };
+  const fromEnv = typeof env[COPILOT_CLI_PATH_ENV] === 'string' ? env[COPILOT_CLI_PATH_ENV]!.trim() : '';
+  if (fromEnv) return { source: 'env', candidate: fromEnv };
+  return null;
+}
+
+function isValidCopilotCliFileSync(filePath: string, platform: NodeJS.Platform): boolean {
+  try {
+    if (!existsSync(filePath) || !statSync(filePath).isFile()) return false;
+    if (platform === 'win32' || filePath.toLowerCase().endsWith('.js')) return true;
+    accessSync(filePath, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function isValidCopilotCliFileAsync(filePath: string, platform: NodeJS.Platform): Promise<boolean> {
+  try {
+    const info = await stat(filePath);
+    if (!info.isFile()) return false;
+    if (platform === 'win32' || filePath.toLowerCase().endsWith('.js')) return true;
+    await access(filePath, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Resolve an explicit Copilot CLI override for spawned-stdio mode.
+ *
+ * Shared by `CopilotSdkProvider`, `copilot-runtime-config`, and `agent-availability`:
+ * only an explicit `binaryPath` or `COPILOT_CLI_PATH` that is an existing
+ * executable (or `.js` entrypoint) absolute path routes to `forSpawnedStdio`;
+ * otherwise returns `undefined` so v2 uses its bundled in-process FFI runtime
+ * without searching `PATH` (preventing legacy PATH `copilot` binaries from
+ * hijacking startup).
+ */
+export function resolveCopilotExplicitBinaryPathSync(options: {
+  binaryPath?: unknown;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  isValidFile?: (filePath: string) => boolean;
+} = {}): string | undefined {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const picked = selectExplicitCandidate(options.binaryPath, env);
+  if (!picked) return undefined;
+  const p = pathModuleFor(platform);
+  const check = options.isValidFile ?? ((filePath: string) => isValidCopilotCliFileSync(filePath, platform));
+  if (p.isAbsolute(picked.candidate) && check(picked.candidate)) {
+    return picked.candidate;
+  }
+  logger.warn(
+    { source: picked.source, candidate: picked.candidate },
+    'Ignoring Copilot CLI override (not an existing executable absolute file path) — falling back to bundled runtime',
+  );
+  return undefined;
+}
+
+/** Async counterpart to {@link resolveCopilotExplicitBinaryPathSync} for availability probes. */
+export async function resolveCopilotExplicitBinaryPath(options: {
+  binaryPath?: unknown;
+  env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  isValidFile?: (filePath: string) => Promise<boolean>;
+} = {}): Promise<string | undefined> {
+  const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  const picked = selectExplicitCandidate(options.binaryPath, env);
+  if (!picked) return undefined;
+  const p = pathModuleFor(platform);
+  const check = options.isValidFile ?? ((filePath: string) => isValidCopilotCliFileAsync(filePath, platform));
+  if (p.isAbsolute(picked.candidate) && (await check(picked.candidate))) {
+    return picked.candidate;
+  }
+  return undefined;
+}
+
+/**
+ * Matches `@microsoft/copilot-sdk/dist/runtimeArtifacts.js#getRuntimePlatform`
+ * (`linux-<arch>` vs `linuxmusl-<arch>` on Linux, `<darwin|win32>-<arch>` otherwise; x64/arm64 only).
+ */
+export function resolveCopilotRuntimePlatform(
+  platform: NodeJS.Platform,
+  arch: string,
+  musl = false,
+): string | null {
+  if (arch !== 'x64' && arch !== 'arm64') return null;
+  if (platform === 'linux') return `${musl ? 'linuxmusl' : 'linux'}-${arch}`;
+  if (platform === 'darwin' || platform === 'win32') return `${platform}-${arch}`;
+  return null;
+}
+
+export function buildCopilotClientOptions(
+  sdk: { RuntimeConnection?: { forSpawnedStdio?: (opts: { path?: string }) => unknown } },
+  explicitBinaryPath?: string,
+): CopilotClientOptions {
+  if (!explicitBinaryPath) return { mode: 'coding-agent' };
+  return {
+    mode: 'coding-agent',
+    runtime: (sdk.RuntimeConnection?.forSpawnedStdio
+      ? sdk.RuntimeConnection.forSpawnedStdio({ path: explicitBinaryPath })
+      : { kind: 'spawned-stdio', path: explicitBinaryPath }) as CopilotClientOptions['runtime'],
+  };
+}
 
 export interface CopilotModelInfo {
   id: string;
@@ -91,7 +213,8 @@ async function getCopilotClient(): Promise<unknown> {
   if (clientPromise) return clientPromise;
   clientPromise = (async () => {
     const sdk = await import('@microsoft/copilot-sdk');
-    const client = new sdk.CopilotClient({ mode: 'coding-agent' });
+    const explicitBinary = await resolveCopilotExplicitBinaryPath();
+    const client = new sdk.CopilotClient(buildCopilotClientOptions(sdk, explicitBinary));
     await client.start();
     return client;
   })().catch((err) => {

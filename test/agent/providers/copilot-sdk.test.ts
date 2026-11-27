@@ -1,8 +1,13 @@
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CopilotSdkProvider,
   copilotSdkRuntimeHooks,
 } from '../../../src/agent/providers/copilot-sdk.js';
+import { resolveCopilotExplicitBinaryPathSync } from '../../../src/agent/copilot-runtime-config.js';
+import { __testing__ as transportRelayTesting } from '../../../src/daemon/transport-relay.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../../shared/session-control-commands.js';
 import { MEMORY_MCP_STATUS } from '../../../shared/memory-ws.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
@@ -530,21 +535,14 @@ describe('CopilotSdkProvider', () => {
     expect(completions).toEqual(['COPILOT_ATTACHMENT_OK']);
   });
 
-  it('captures input/output/cache token + cost from assistant.usage and emits snake_case metadata.usage', async () => {
-    // Regression: previously only `outputTokens` was captured from the
-    // `assistant.usage` event. The chat header context bar showed "0 / N"
-    // for every copilot turn because input_tokens never reached
-    // transport-relay's normalizeUsageUpdatePayload. The upstream SDK
-    // (copilot-sdk/generated/session-events.d.ts:1554) ships ALL four token
-    // fields plus `cost`; this test pins the full mapping camelCase →
-    // snake_case so the chat bar + context_turn_usage row see real values.
+  it('converts inclusive v2 assistant.usage into Anthropic-split usage so relay/compaction do not double-count cache writes or reads', async () => {
     const harness = createCopilotHarness();
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
     }) as typeof import('@microsoft/copilot-sdk');
 
-    await provider.connect({ binaryPath: 'copilot' });
+    await provider.connect({});
     const routeId = await provider.createSession({ sessionKey: 'route-usage', cwd: '/tmp/project', agentId: 'gpt-5.4' });
 
     const messages: Array<{ sid: string; metadata: Record<string, unknown> }> = [];
@@ -556,6 +554,7 @@ describe('CopilotSdkProvider', () => {
     const session = Array.from(harness.sessions.values())[0];
     expect(session).toBeTruthy();
 
+    // Case 1: full breakdown (1500 total = 500 uncached + 800 cacheRead + 200 cacheWrite)
     session.emit({
       type: 'assistant.usage',
       data: {
@@ -574,14 +573,47 @@ describe('CopilotSdkProvider', () => {
     session.emit({ type: 'session.idle', data: {} });
 
     expect(messages).toHaveLength(1);
-    const usage = (messages[0].metadata.usage ?? {}) as Record<string, unknown>;
-    expect(usage).toMatchObject({
-      input_tokens: 1500,
+    const usage1 = (messages[0].metadata.usage ?? {}) as Record<string, number>;
+    expect(usage1).toEqual({
+      input_tokens: 500,
       output_tokens: 320,
       cache_read_input_tokens: 800,
       cache_creation_input_tokens: 200,
     });
     expect(messages[0].metadata.costUsd).toBe(0.045);
+    const relayed1 = transportRelayTesting.normalizeUsageUpdatePayload('deck_copilot_usage', usage1, 'gpt-5.4');
+    expect(relayed1).toMatchObject({
+      inputTokens: 700, // 500 uncached + 200 cacheWrite (not 1700)
+      cacheTokens: 800,
+      outputTokens: 320,
+    });
+    expect(Number(relayed1!.inputTokens) + Number(relayed1!.cacheTokens)).toBe(1500);
+
+    // Case 2: cacheWrite only (100 total inclusive of 20 cacheWrite -> relay inputTokens stays 100, not 120)
+    await provider.send(routeId, 'Second');
+    session.emit({
+      type: 'assistant.usage',
+      data: {
+        model: 'gpt-5.4',
+        inputTokens: 100,
+        cacheWriteTokens: 20,
+      },
+    });
+    session.emit({
+      type: 'assistant.message',
+      data: { messageId: 'msg-usage-2', content: 'reply 2', toolRequests: [] },
+    });
+    session.emit({ type: 'session.idle', data: {} });
+
+    expect(messages).toHaveLength(2);
+    const usage2 = (messages[1].metadata.usage ?? {}) as Record<string, number>;
+    expect(usage2).toEqual({
+      input_tokens: 80,
+      cache_creation_input_tokens: 20,
+    });
+    const relayed2 = transportRelayTesting.normalizeUsageUpdatePayload('deck_copilot_usage', usage2, 'gpt-5.4');
+    expect(relayed2?.inputTokens).toBe(100);
+    expect('cacheTokens' in relayed2!).toBe(false);
   });
 
   it('uses normalized payload attachments instead of the raw legacy attachments argument', async () => {
@@ -790,6 +822,103 @@ describe('CopilotSdkProvider', () => {
       mode: 'coding-agent',
       runtime: { kind: 'spawned-stdio', path: process.execPath },
     });
+    await provider.disconnect();
+
+    // COPILOT_CLI_PATH with valid absolute executable flows into forSpawnedStdio even when config={}.
+    const tempDir = await mkdtemp(path.join(tmpdir(), 'copilot-cli-env-'));
+    const customCli = path.join(tempDir, 'copilot-v4');
+    const origCopilotCliPath = process.env.COPILOT_CLI_PATH;
+    try {
+      await writeFile(customCli, '#!/bin/sh\nexit 0\n', 'utf8');
+      await chmod(customCli, 0o755);
+      process.env.COPILOT_CLI_PATH = customCli;
+      await provider.connect({});
+      expect(forSpawnedStdio).toHaveBeenCalledWith({ path: customCli });
+      expect(clientCtors[2]).toEqual({
+        mode: 'coding-agent',
+        runtime: { kind: 'spawned-stdio', path: customCli },
+      });
+      await provider.disconnect();
+    } finally {
+      if (origCopilotCliPath === undefined) delete process.env.COPILOT_CLI_PATH;
+      else process.env.COPILOT_CLI_PATH = origCopilotCliPath;
+      await rm(tempDir, { recursive: true, force: true });
+    }
+
+    // Even on Windows with legacy copilot on PATH, {} defaults to bundled v2 runtime (never PATH).
+    expect(resolveCopilotExplicitBinaryPathSync({
+      env: { PATH: 'C:\\legacy-copilot' },
+      platform: 'win32',
+      isValidFile: () => true,
+    })).toBeUndefined();
+    expect(resolveCopilotExplicitBinaryPathSync({
+      env: { COPILOT_CLI_PATH: 'C:\\v4\\copilot.exe' },
+      platform: 'win32',
+      isValidFile: (p) => p === 'C:\\v4\\copilot.exe',
+    })).toBe('C:\\v4\\copilot.exe');
+  });
+
+  it('isolates Stop confirmation, active-turn completion, and tool callbacks across two concurrent sessions', async () => {
+    const harness = createCopilotHarness({ version: '1.0.117', protocolVersion: 4 });
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as unknown as typeof import('@microsoft/copilot-sdk');
+
+    const completions: Array<{ sid: string; content: string }> = [];
+    const errors: Array<{ sid: string; code: string }> = [];
+    const tools: Array<{ sid: string; id: string; name: string; status: string }> = [];
+    provider.onComplete((sid, msg) => completions.push({ sid, content: msg.content }));
+    provider.onError((sid, err) => errors.push({ sid, code: err.code }));
+    provider.onToolCall((sid, tool) => tools.push({ sid, id: tool.id, name: tool.name, status: tool.status }));
+
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'route-stop-a', cwd: '/tmp/pA' });
+    await provider.createSession({ sessionKey: 'route-stop-b', cwd: '/tmp/pB' });
+
+    const sA = harness.sessions.get('session-1')!;
+    const sB = harness.sessions.get('session-2')!;
+    await provider.send('route-stop-a', 'task A');
+    await provider.send('route-stop-b', 'task B');
+
+    sA.emit({ type: 'tool.execution_start', data: { toolCallId: 'tool-a', toolName: 'grep' } });
+    sB.emit({ type: 'tool.execution_start', data: { toolCallId: 'tool-b-1', toolName: 'view' } });
+    sB.emit({ type: 'assistant.message_delta', data: { messageId: 'm-b', deltaContent: 'B working... ' } });
+
+    let aStopSettled = false;
+    const stopA = provider.cancelAndWait('route-stop-a').then(() => {
+      aStopSettled = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sA.abort).toHaveBeenCalledTimes(1);
+    expect(sB.abort).not.toHaveBeenCalled();
+    expect(aStopSettled).toBe(false);
+
+    // Session B continues, runs another tool, and goes idle while A's Stop is still pending.
+    sB.emit({ type: 'tool.execution_complete', data: { toolCallId: 'tool-b-1', toolName: 'view', success: true } });
+    sB.emit({ type: 'tool.execution_start', data: { toolCallId: 'tool-b-2', toolName: 'edit' } });
+    sB.emit({ type: 'tool.execution_complete', data: { toolCallId: 'tool-b-2', toolName: 'edit', success: true } });
+    sB.emit({ type: 'assistant.message', data: { messageId: 'm-b', content: 'B done cleanly', toolRequests: [] } });
+    sB.emit({ type: 'session.idle', data: {} });
+    await vi.advanceTimersByTimeAsync(0);
+
+    // B's idle must NOT settle A's Stop, and B completes normally.
+    expect(aStopSettled).toBe(false);
+    expect(completions).toEqual([{ sid: 'route-stop-b', content: 'B done cleanly' }]);
+
+    // Now A emits its own terminal idle -> only A settles.
+    sA.emit({ type: 'session.idle', data: {} });
+    await stopA;
+    expect(aStopSettled).toBe(true);
+    expect(errors).toEqual([{ sid: 'route-stop-a', code: 'CANCELLED' }]);
+    expect(completions).toEqual([{ sid: 'route-stop-b', content: 'B done cleanly' }]);
+    expect(tools.filter((t) => t.sid === 'route-stop-a').map((t) => t.id)).toEqual(['tool-a']);
+    expect(tools.filter((t) => t.sid === 'route-stop-b').map((t) => t.id)).toEqual([
+      'tool-b-1',
+      'tool-b-1',
+      'tool-b-2',
+      'tool-b-2',
+    ]);
     await provider.disconnect();
   });
 

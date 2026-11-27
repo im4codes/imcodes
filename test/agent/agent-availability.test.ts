@@ -20,6 +20,7 @@ import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 function createFakeDeps(options: {
   platform?: NodeJS.Platform;
   arch?: string;
+  isMusl?: boolean;
   env?: NodeJS.ProcessEnv;
   homeDir?: string;
   imcodesHomeDir?: string;
@@ -35,6 +36,7 @@ function createFakeDeps(options: {
   return {
     platform: options.platform ?? 'linux',
     arch: options.arch ?? 'x64',
+    ...(options.isMusl !== undefined ? { isMusl: options.isMusl } : {}),
     env: options.env ?? { PATH: '/usr/local/bin:/usr/bin' },
     homeDir: options.homeDir ?? '/home/alice',
     imcodesHomeDir: options.imcodesHomeDir ?? '/home/alice/.imcodes',
@@ -378,5 +380,115 @@ describe('detectInstalledAgents()', () => {
     } finally {
       if (origNodePath === undefined) delete process.env.NODE_PATH; else process.env.NODE_PATH = origNodePath;
     }
+  });
+
+  it('aligns copilot-sdk availability strictly with v2 runtimeArtifacts rules and explicit COPILOT_CLI_PATH', async () => {
+    const sdkOnly = { '@microsoft/copilot-sdk': '/opt/imcodes/node_modules/@microsoft/copilot-sdk' };
+
+    // 1. Missing wrapper (`runtime.node` alone) is NOT usable by v2 ensureRuntimeBundle -> false.
+    const missingWrapper = await detectInstalledAgents({
+      deps: createFakeDeps({
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        packages: {
+          ...sdkOnly,
+          '@microsoft/copilot-sdk-linux-x64': '/opt/imcodes/node_modules/@microsoft/copilot-sdk-linux-x64',
+        },
+        files: [
+          '/opt/imcodes/node_modules/@microsoft/copilot-sdk-linux-x64/prebuilds/linux-x64/runtime.node',
+        ],
+      }),
+    });
+    expect(missingWrapper['copilot-sdk']?.installed).toBe(false);
+
+    // 2. Legacy `@github/copilot-*` npm package alone (COPILOT_CLI_USE_NPM_PACKAGE = false) -> false.
+    const legacyNpmOnly = await detectInstalledAgents({
+      deps: createFakeDeps({
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        packages: {
+          ...sdkOnly,
+          '@github/copilot-linux-x64': '/opt/imcodes/node_modules/@github/copilot-linux-x64',
+        },
+        files: [
+          '/opt/imcodes/node_modules/@github/copilot-linux-x64/prebuilds/linux-x64/copilot-runtime',
+          '/opt/imcodes/node_modules/@github/copilot-linux-x64/prebuilds/linux-x64/runtime.node',
+        ],
+      }),
+    });
+    expect(legacyNpmOnly['copilot-sdk']?.installed).toBe(false);
+
+    // 3. Wrong Linux libc package (`linuxmusl-x64` when glibc, or `linux-x64` when musl) -> false.
+    const wrongLibcGlibc = await detectInstalledAgents({
+      deps: createFakeDeps({
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        packages: {
+          ...sdkOnly,
+          '@microsoft/copilot-sdk-linuxmusl-x64': '/opt/imcodes/node_modules/@microsoft/copilot-sdk-linuxmusl-x64',
+        },
+        files: [
+          '/opt/imcodes/node_modules/@microsoft/copilot-sdk-linuxmusl-x64/prebuilds/linuxmusl-x64/copilot-runtime',
+          '/opt/imcodes/node_modules/@microsoft/copilot-sdk-linuxmusl-x64/prebuilds/linuxmusl-x64/runtime.node',
+        ],
+      }),
+    });
+    expect(wrongLibcGlibc['copilot-sdk']?.installed).toBe(false);
+
+    const matchingMusl = await detectInstalledAgents({
+      deps: createFakeDeps({
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: true,
+        packages: {
+          ...sdkOnly,
+          '@microsoft/copilot-sdk-linuxmusl-x64': '/opt/imcodes/node_modules/@microsoft/copilot-sdk-linuxmusl-x64',
+        },
+        files: [
+          '/opt/imcodes/node_modules/@microsoft/copilot-sdk-linuxmusl-x64/prebuilds/linuxmusl-x64/copilot-runtime',
+          '/opt/imcodes/node_modules/@microsoft/copilot-sdk-linuxmusl-x64/prebuilds/linuxmusl-x64/runtime.node',
+        ],
+      }),
+    });
+    expect(matchingMusl['copilot-sdk']?.installed).toBe(true);
+
+    // 4. Windows with legacy `copilot.cmd` on PATH (no `@microsoft/copilot-sdk-win32-x64`) -> false.
+    const winLegacyPath = await detectInstalledAgents({
+      deps: createFakeDeps({
+        platform: 'win32',
+        arch: 'x64',
+        env: { PATH: 'C:\\legacy-cli', PATHEXT: '.EXE;.CMD' },
+        packages: sdkOnly,
+        executables: ['C:\\legacy-cli\\copilot.cmd'],
+      }),
+    });
+    expect(winLegacyPath['copilot-sdk']?.installed).toBe(false);
+
+    // 5. Explicit absolute executable COPILOT_CLI_PATH (with @microsoft/copilot-sdk) -> true; relative -> false.
+    const explicitV4Cli = await detectInstalledAgents({
+      deps: createFakeDeps({
+        platform: 'win32',
+        arch: 'x64',
+        env: { PATH: '', COPILOT_CLI_PATH: 'C:\\v4\\copilot.exe' },
+        packages: sdkOnly,
+        executables: ['C:\\v4\\copilot.exe'],
+      }),
+    });
+    expect(explicitV4Cli['copilot-sdk']?.installed).toBe(true);
+
+    const relativeCli = await detectInstalledAgents({
+      deps: createFakeDeps({
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        env: { PATH: '', COPILOT_CLI_PATH: 'copilot' },
+        packages: sdkOnly,
+        executables: ['copilot'],
+      }),
+    });
+    expect(relativeCli['copilot-sdk']?.installed).toBe(false);
   });
 });
