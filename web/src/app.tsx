@@ -352,6 +352,7 @@ import {
   writeCachedServerSessions,
 } from './session-list-cache.js';
 import {
+  buildAccountScope,
   clearCachedDaemonCapabilities,
   readCachedDaemonCapabilities,
 } from './daemon-capability-cache.js';
@@ -1232,9 +1233,9 @@ function InternalMainApp() {
     clearSharedTabRestoreMarker();
     clearMessagePinsCache();
     clearMessagePinNavigation();
+    clearCachedDaemonCapabilities();
     if (options?.preserveCredentials !== true) {
       clearCachedServerSessions();
-      clearCachedDaemonCapabilities();
     }
     // A shared hash is only a navigation intent. Everything learned under the
     // expired identity is discarded before asynchronous credential cleanup.
@@ -1328,6 +1329,7 @@ function InternalMainApp() {
     setFileRelayUser(null);
     setServerR2RelayEnabled(false);
     clearApiKey();
+    clearCachedDaemonCapabilities();
     try {
       const storedKey = await getAuthKey(url);
       if (!storedKey || !attempt.isCurrent()) return;
@@ -11268,8 +11270,15 @@ function InternalMainApp() {
   };
   const busyDaemonSessionCount = sessions.filter((session) => session.state === 'running' || session.state === 'queued').length;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
-  const hasCachedCapabilities = Boolean(selectedServerId && (readCachedDaemonCapabilities(selectedServerId)?.length ?? 0) > 0);
-  const effectiveDaemonOnline = daemonOnline || (hasCachedCapabilities && (connecting || connected) && isServerOnline(selectedServerInfo));
+  const accountScope = buildAccountScope(auth?.baseUrl, auth?.userId);
+  const cachedCapabilities = selectedServerId ? readCachedDaemonCapabilities(selectedServerId, { accountScope }) : null;
+  const isCached = cachedCapabilities !== null;
+  const serverOnline = isServerOnline(selectedServerInfo);
+  const transitionOnline = isCached && (connecting || connected) && serverOnline;
+  const effectiveDaemonOnline = daemonOnline || transitionOnline;
+  const matchingWs = selectedServerId && wsRef.current && (typeof wsRef.current.targetsServer !== 'function' || wsRef.current.targetsServer(selectedServerId))
+    ? wsRef.current
+    : null;
 
   useEffect(() => {
     if (!auth || !selectedServerId || connected || !isServerOnline(selectedServerInfo)) return;
@@ -11468,10 +11477,11 @@ function InternalMainApp() {
               <DaemonRemoteDesktopControl
                 compact
                 offerLoginScreenSetup={false}
-                ws={wsRef.current}
+                ws={matchingWs}
                 serverId={selectedServerId}
                 serverName={selectedServerInfo?.name}
                 daemonOnline={effectiveDaemonOnline}
+                accountScope={accountScope}
                 onOpen={openRemoteDesktop}
                 canSetUp={!selectedShareTarget}
               />
@@ -11850,10 +11860,11 @@ function InternalMainApp() {
                   <DaemonRemoteDesktopControl
                     compact
                     offerLoginScreenSetup={false}
-                    ws={wsRef.current}
+                    ws={matchingWs}
                     serverId={selectedServerId}
                     serverName={selectedServerInfo?.name}
                     daemonOnline={effectiveDaemonOnline}
+                    accountScope={accountScope}
                     onOpen={openRemoteDesktop}
                     canSetUp={!selectedShareTarget}
                   />
@@ -11978,10 +11989,11 @@ function InternalMainApp() {
                 </button>
                 <DaemonRemoteDesktopControl
                   compact
-                  ws={wsRef.current}
+                  ws={matchingWs}
                   serverId={selectedServerId}
                   serverName={selectedServerInfo?.name}
                   daemonOnline={effectiveDaemonOnline}
+                  accountScope={accountScope}
                   onOpen={openRemoteDesktop}
                   canSetUp={!selectedShareTarget}
                 />
@@ -11995,10 +12007,11 @@ function InternalMainApp() {
                     launch/enable is the first action in this row. */}
                 <DaemonRemoteDesktopControl
                   compact
-                  ws={wsRef.current}
+                  ws={matchingWs}
                   serverId={selectedServerId}
                   serverName={selectedServerInfo?.name}
                   daemonOnline={effectiveDaemonOnline}
+                  accountScope={accountScope}
                   onOpen={openRemoteDesktop}
                   canSetUp={!selectedShareTarget}
                 />

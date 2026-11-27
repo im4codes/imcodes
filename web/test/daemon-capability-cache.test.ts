@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   readCachedDaemonCapabilities,
+  hasCachedDaemonCapabilities,
   writeCachedDaemonCapabilities,
   clearCachedDaemonCapabilities,
+  buildAccountScope,
   __resetDaemonCapabilityCacheForTests,
   DAEMON_CAPABILITY_CACHE_STORAGE_KEY,
   MAX_CACHED_SERVERS,
@@ -28,6 +30,12 @@ describe('daemon-capability-cache', () => {
     }
   });
 
+  it('builds account scope safely from baseUrl and userId', () => {
+    expect(buildAccountScope('http://LocalHost:8080/ ', ' user_1 ')).toBe('http://localhost:8080/#user_1');
+    expect(buildAccountScope('', 'user_1')).toBe('');
+    expect(buildAccountScope(null, undefined)).toBe('');
+  });
+
   it('reads and writes capabilities per serverId', () => {
     const storage = new MockStorage();
     expect(readCachedDaemonCapabilities('srv-1', storage)).toBeNull();
@@ -37,6 +45,34 @@ describe('daemon-capability-cache', () => {
 
     // Another server is isolated
     expect(readCachedDaemonCapabilities('srv-2', storage)).toBeNull();
+  });
+
+  it('isolates capabilities between different account scopes on the same serverId', () => {
+    const storage = new MockStorage();
+    const scopeUser1 = buildAccountScope('http://localhost', 'user-1');
+    const scopeUser2 = buildAccountScope('http://localhost', 'user-2');
+
+    writeCachedDaemonCapabilities('srv-shared', ['remote_desktop'], { storage, accountScope: scopeUser1 });
+    expect(readCachedDaemonCapabilities('srv-shared', { storage, accountScope: scopeUser1 })).toEqual(['remote_desktop']);
+
+    // User 2 sees null (cache miss) for the same serverId
+    expect(readCachedDaemonCapabilities('srv-shared', { storage, accountScope: scopeUser2 })).toBeNull();
+    expect(hasCachedDaemonCapabilities('srv-shared', { storage, accountScope: scopeUser2 })).toBe(false);
+
+    // User 2 writes their own capabilities
+    writeCachedDaemonCapabilities('srv-shared', ['login_screen'], { storage, accountScope: scopeUser2 });
+    expect(readCachedDaemonCapabilities('srv-shared', { storage, accountScope: scopeUser1 })).toEqual(['remote_desktop']);
+    expect(readCachedDaemonCapabilities('srv-shared', { storage, accountScope: scopeUser2 })).toEqual(['login_screen']);
+  });
+
+  it('distinguishes cached empty array from cache miss in hasCachedDaemonCapabilities', () => {
+    const storage = new MockStorage();
+    expect(hasCachedDaemonCapabilities('srv-uncached', storage)).toBe(false);
+    expect(readCachedDaemonCapabilities('srv-uncached', storage)).toBeNull();
+
+    writeCachedDaemonCapabilities('srv-empty', [], storage);
+    expect(hasCachedDaemonCapabilities('srv-empty', storage)).toBe(true);
+    expect(readCachedDaemonCapabilities('srv-empty', storage)).toEqual([]);
   });
 
   it('sanitizes capabilities by trimming, filtering non-strings, and deduplicating', () => {

@@ -90,13 +90,14 @@ const {
 
 type MessageHandler = (message: Record<string, unknown>) => void;
 
-function createSwitchableWsStub(initialCapabilities: string[] | null) {
+function createSwitchableWsStub(initialCapabilities: string[] | null, targetServerId?: string) {
   let currentSnapshot = initialCapabilities ? { capabilities: initialCapabilities } : null;
   const snapshotListeners = new Set<(s: { capabilities: string[] } | null) => void>();
   const messageHandlers = new Set<MessageHandler>();
   const sent: Array<Record<string, unknown>> = [];
 
   const client = {
+    targetsServer: (id: string) => (targetServerId !== undefined ? targetServerId === id : true),
     getDaemonCapabilitySnapshot: () => currentSnapshot,
     onDaemonCapabilitySnapshot: (listener: (s: { capabilities: string[] } | null) => void) => {
       snapshotListeners.add(listener);
@@ -891,6 +892,159 @@ describe('DaemonRemoteDesktopControl', () => {
         canSetUp: false,
       }));
       expect(container.firstChild).toBeNull();
+    });
+
+    it('does not inherit capabilities or write to cache when ws targets old server and serverId is new', () => {
+      // wsA targets 'server_A' with REMOTE_DESKTOP_CAPABILITY
+      const wsA = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_A');
+      // Render component pointing to server_B with wsA (e.g. before effect updates wsRef)
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: wsA.client as never,
+        serverId: 'server_B',
+        serverName: 'Server B',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: false,
+      }));
+
+      // Server B must NOT show Server A's button!
+      expect(container.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+      // Server B's cache must NOT be polluted with Server A's capabilities!
+      expect(readCachedDaemonCapabilities('server_B')).toBeNull();
+    });
+
+    it('discards late ticket mint failure from previous server on switch without polluting new server', async () => {
+      let rejectMintA: (err: unknown) => void = () => {};
+      const mintPendingPromise = new Promise<{ ticket: string }>((_, reject) => {
+        rejectMintA = reject;
+      });
+      const machinesApi = await import('../../src/api/machines.js');
+      const spy = vi.spyOn(machinesApi, 'mintControlledNodeExecutableTicket').mockImplementationOnce(() => mintPendingPromise as never);
+
+      const wsA = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_A');
+      const { container, rerender } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: wsA.client as never,
+        serverId: 'server_A',
+        serverName: 'Server A',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: true,
+      }));
+
+      // Click login screen enable on Server A
+      const buttonsA = container.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttonsA.length).toBe(2);
+      fireEvent.click(buttonsA[1]);
+
+      // Now switch to Server B before mint resolves/rejects
+      const wsB = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_B');
+      rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: wsB.client as never,
+        serverId: 'server_B',
+        serverName: 'Server B',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: true,
+      }));
+
+      const buttonsB = container.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttonsB[1].getAttribute('title')).toBe('remote_desktop.login_screen_hint');
+
+      // Reject Server A's promise
+      await act(async () => {
+        rejectMintA(new Error('Server A network timeout'));
+      });
+
+      // Server B's title must NOT change to login_screen_error_download_failed!
+      const buttonsBAfter = container.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttonsBAfter[1].getAttribute('title')).toBe('remote_desktop.login_screen_hint');
+
+      spy.mockRestore();
+    });
+
+    it('enforces canSetUp=false: hides worker install and login-screen enable buttons for restricted viewers', () => {
+      // 1. Viewer on installable host: worker install button is hidden
+      writeCachedDaemonCapabilities('server_viewer_install', [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      const ws1 = createSwitchableWsStub([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY], 'server_viewer_install');
+      const { container: c1 } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws1.client as never,
+        serverId: 'server_viewer_install',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: false,
+      }));
+      expect(c1.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+
+      // Owner on same installable host: worker install button IS shown
+      const { container: c1Owner } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws1.client as never,
+        serverId: 'server_viewer_install',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+      expect(c1Owner.querySelector('.daemon-remote-desktop-btn')).toBeTruthy();
+      expect(c1Owner.textContent).toContain('remote_desktop.install_worker');
+
+      // 2. Viewer on ready host: open button IS shown, but login-screen enable button is hidden
+      writeCachedDaemonCapabilities('server_viewer_ready', [REMOTE_DESKTOP_CAPABILITY]);
+      const ws2 = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_viewer_ready');
+      const { container: c2 } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws2.client as never,
+        serverId: 'server_viewer_ready',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: false,
+      }));
+      // Only 1 button (the open button), no auxiliary lock/login-screen button
+      const buttonsViewer = c2.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttonsViewer.length).toBe(1);
+      expect(buttonsViewer[0].getAttribute('title')).toBe('remote_desktop.daemon_control');
+
+      // Owner on same ready host: offers both open button AND login screen setup button
+      const { container: c2Owner } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws2.client as never,
+        serverId: 'server_viewer_ready',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        offerLoginScreenSetup: true,
+        canSetUp: true,
+      }));
+      const buttonsOwner = c2Owner.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttonsOwner.length).toBe(2);
+      expect(buttonsOwner[1].getAttribute('title')).toBe('remote_desktop.login_screen_hint');
+    });
+
+    it('prevents stale snapshot callbacks from backfilling cache after teardown', () => {
+      const ws = createSwitchableWsStub(null, 'server_stale');
+      const { unmount } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_stale',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+      }));
+
+      // Unmount the component
+      unmount();
+
+      // Late snapshot fires after teardown
+      act(() => {
+        ws.emitSnapshot([REMOTE_DESKTOP_CAPABILITY]);
+      });
+
+      // Cache for server_stale should NOT be written by unmounted component
+      expect(readCachedDaemonCapabilities('server_stale')).toBeNull();
     });
   });
 });

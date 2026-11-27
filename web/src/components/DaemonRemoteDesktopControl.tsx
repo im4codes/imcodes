@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import {
@@ -97,6 +97,10 @@ export interface DaemonRemoteDesktopControlProps {
    * daemon and the machine link are both owner-only on the server.
    */
   canSetUp?: boolean;
+  /**
+   * Authenticated user/baseUrl scope. Isolates daemon capability cache across accounts.
+   */
+  accountScope?: string | null;
 }
 
 export interface ResolveServerRemoteDesktopTargetInput {
@@ -209,12 +213,33 @@ export function DaemonRemoteDesktopControl({
   offerLoginScreenSetup = true,
   machines,
   canSetUp = true,
+  accountScope,
 }: DaemonRemoteDesktopControlProps) {
   const { t } = useTranslation();
+
+  // Bind connection strictly to the current serverId to avoid reading or persisting cross-server snapshots
+  const matchingWs = ws && serverId && (typeof ws.targetsServer !== 'function' || ws.targetsServer(serverId))
+    ? ws
+    : null;
+
+  const currentServerRef = useRef(serverId);
+  const currentAccountScopeRef = useRef(accountScope);
+  currentServerRef.current = serverId;
+  currentAccountScopeRef.current = accountScope;
+
+  const normalizedServerId = serverId ?? null;
+  const normalizedAccountScope = accountScope ?? null;
+
+  const [activeServerId, setActiveServerId] = useState<string | null>(normalizedServerId);
+  const [activeAccountScope, setActiveAccountScope] = useState<string | null>(normalizedAccountScope);
+
   const [capabilities, setCapabilities] = useState<readonly string[]>(() => {
-    const live = ws?.getDaemonCapabilitySnapshot()?.capabilities;
-    if (live) return live;
-    return readCachedDaemonCapabilities(serverId) ?? [];
+    if (!serverId) return [];
+    if (matchingWs) {
+      const live = matchingWs.getDaemonCapabilitySnapshot()?.capabilities;
+      if (live) return live;
+    }
+    return readCachedDaemonCapabilities(serverId, { accountScope }) ?? [];
   });
   const [install, setInstall] = useState<{ state: RemoteDesktopInstallState; error?: string } | null>(null);
   const [loginScreen, setLoginScreen] = useState<
@@ -224,41 +249,56 @@ export function DaemonRemoteDesktopControl({
   const sharedMachines = useMachines();
   const machineList = machines ?? sharedMachines.machines;
 
-  useEffect(() => {
+  // Synchronous state alignment during render when switching serverId or accountScope
+  if (normalizedServerId !== activeServerId || normalizedAccountScope !== activeAccountScope) {
+    setActiveServerId(normalizedServerId);
+    setActiveAccountScope(normalizedAccountScope);
+    const initialCapabilities = (() => {
+      if (!serverId) return [];
+      if (matchingWs) {
+        const live = matchingWs.getDaemonCapabilitySnapshot()?.capabilities;
+        if (live) return live;
+      }
+      return readCachedDaemonCapabilities(serverId, { accountScope }) ?? [];
+    })();
+    setCapabilities(initialCapabilities);
     setInstall(null);
     setLoginScreen(null);
     setSetupOpen(false);
-  }, [serverId]);
+  }
 
   useEffect(() => {
     if (!serverId) {
       setCapabilities([]);
       return;
     }
-    const live = ws?.getDaemonCapabilitySnapshot();
+    const live = matchingWs?.getDaemonCapabilitySnapshot();
     if (live?.capabilities) {
       setCapabilities(live.capabilities);
-      writeCachedDaemonCapabilities(serverId, live.capabilities);
+      writeCachedDaemonCapabilities(serverId, live.capabilities, { accountScope });
     } else {
-      const cached = readCachedDaemonCapabilities(serverId);
+      const cached = readCachedDaemonCapabilities(serverId, { accountScope });
       if (cached !== null) {
         setCapabilities(cached);
-      } else if (!ws) {
+      } else {
         setCapabilities([]);
       }
     }
-    if (!ws) return;
-    return ws.onDaemonCapabilitySnapshot((snapshot) => {
-      if (snapshot) {
-        setCapabilities(snapshot.capabilities);
-        writeCachedDaemonCapabilities(serverId, snapshot.capabilities);
+    if (!matchingWs) return;
+    return matchingWs.onDaemonCapabilitySnapshot((snapshot) => {
+      if (currentServerRef.current !== serverId || currentAccountScopeRef.current !== accountScope) return;
+      if (snapshot && typeof snapshot === 'object' && 'capabilities' in snapshot && Array.isArray((snapshot as { capabilities: unknown }).capabilities)) {
+        const caps = (snapshot as { capabilities: readonly string[] }).capabilities;
+        setCapabilities(caps);
+        writeCachedDaemonCapabilities(serverId, caps, { accountScope });
       }
     });
-  }, [ws, serverId]);
+  }, [matchingWs, serverId, accountScope]);
 
   useEffect(() => {
-    if (!ws) return;
-    return ws.onMessage((message) => {
+    if (!matchingWs) return;
+    return matchingWs.onMessage((message) => {
+      if (currentServerRef.current !== serverId || currentAccountScopeRef.current !== accountScope) return;
       const state = validateRemoteDesktopInstallStateMessage(message);
       if (state) setInstall({ state: state.state, ...(state.error ? { error: state.error } : {}) });
       const loginScreenState = validateRemoteDesktopLoginScreenStateMessage(message);
@@ -269,7 +309,7 @@ export function DaemonRemoteDesktopControl({
         });
       }
     });
-  }, [ws]);
+  }, [matchingWs, serverId, accountScope]);
 
   const {
     target: resolvedTarget,
@@ -303,22 +343,28 @@ export function DaemonRemoteDesktopControl({
   // owner confirms once, the daemon runs the same install as the copyable
   // command, and the node enrols linked to this daemon.
   const installHereTarget = canSetUp ? readControlledNodeInstallHereTarget(capabilities) : null;
-  const installHere = installHereTarget ? {
+  const installHere = installHereTarget && canSetUp ? {
     state: loginScreen,
     start: () => {
+      const targetServerId = serverId;
+      const targetAccountScope = accountScope;
       setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
       void mintControlledNodeInstallCommand(installHereTarget, serverId)
         .then((minted) => {
-          if (!minted.installCode || !ws) throw new Error('install_code_unavailable');
-          ws.send({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST, installCode: minted.installCode });
+          if (currentServerRef.current !== targetServerId || currentAccountScopeRef.current !== targetAccountScope) return;
+          if (!minted.installCode || !matchingWs) throw new Error('install_code_unavailable');
+          matchingWs.send({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST, installCode: minted.installCode });
         })
-        .catch(() => setLoginScreen({
-          state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
-          error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
-        }));
+        .catch(() => {
+          if (currentServerRef.current !== targetServerId || currentAccountScopeRef.current !== targetAccountScope) return;
+          setLoginScreen({
+            state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+            error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+          });
+        });
     },
   } : undefined;
-  const setup = setupOpen ? (
+  const setup = setupOpen && canSetUp ? (
     <DaemonRemoteDesktopSetup
       serverId={serverId}
       serverName={serverName}
@@ -361,7 +407,8 @@ export function DaemonRemoteDesktopControl({
       || loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING;
     // Only where there is room, and only while no controlled node already shares
     // this machine — in which case that node serves the sign-in screen already.
-    if (!offerLoginScreenSetup || linkedNode || !ready) return control;
+    // Also restricted strictly to users who can set up (owner only, never viewers).
+    if (!offerLoginScreenSetup || linkedNode || !ready || !canSetUp) return control;
     const failed = loginScreen?.state === REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED;
     return (
       <>
@@ -379,19 +426,19 @@ export function DaemonRemoteDesktopControl({
             if (!window.confirm(t('remote_desktop.install_confirm', {
               server: serverName ?? serverId ?? '',
             }))) return;
-            // No group is read or required. Enrolment binds this machine to its
-            // user; a group is an association made afterwards. Gating the
-            // install on one meant a user with no group could not install the
-            // login-screen component at all.
+            const targetServerId = serverId;
+            const targetAccountScope = accountScope;
             setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
             void mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, serverId)
               .then((minted) => {
-                ws?.send({
+                if (currentServerRef.current !== targetServerId || currentAccountScopeRef.current !== targetAccountScope) return;
+                matchingWs?.send({
                   type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
                   ticket: minted.ticket,
                 });
               })
               .catch(() => {
+                if (currentServerRef.current !== targetServerId || currentAccountScopeRef.current !== targetAccountScope) return;
                 setLoginScreen({
                   state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
                   error: 'download_failed',
@@ -433,6 +480,8 @@ export function DaemonRemoteDesktopControl({
     );
   }
 
+  if (!canSetUp) return null;
+
   const downloading = install?.state === REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING;
   const failed = install?.state === REMOTE_DESKTOP_INSTALL_STATE.FAILED;
   const failureLabel = failed
@@ -458,7 +507,7 @@ export function DaemonRemoteDesktopControl({
           server: serverName ?? serverId ?? '',
         }))) return;
         setInstall({ state: REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING });
-        ws?.send({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
+        matchingWs?.send({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
       }}
     >
       {downloading
