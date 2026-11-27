@@ -1855,7 +1855,10 @@ export function resetContextStoreForTests(): void {
   archiveBackfillTimer = null;
   archiveBackfillScheduledForPath = null;
   resetArchiveBackfillSchedulingForTests();
-  if (db) db.close();
+  if (db) {
+    turnUsageSyncBackfillState.delete(db);
+    db.close();
+  }
   db = null;
   currentDbPath = null;
   stagedReconciledForPath = null;
@@ -2522,16 +2525,61 @@ function readTurnUsageSyncRecordForDb(database: DatabaseSyncInstance, rowid: num
   };
 }
 
+interface TurnUsageSyncBackfillState {
+  complete: boolean;
+  maxUsageId: number;
+  dataVersion: number;
+}
+
+// Per-connection steady-state cache for usage-sync backfill. Keyed on the
+// live DatabaseSync instance so closing/reopening automatically resets it, and
+// fenced by `PRAGMA data_version` so external-connection writes invalidate it.
+const turnUsageSyncBackfillState = new WeakMap<DatabaseSyncInstance, TurnUsageSyncBackfillState>();
+
+function readDbDataVersion(database: DatabaseSyncInstance): number {
+  return Number((database.prepare('PRAGMA data_version').get() as { data_version: number | bigint }).data_version);
+}
+
 export function backfillTurnUsageSyncMetadata(limit = 500): { backfilled: number } {
   const database = ensureDb();
   const newestUsage = database.prepare('SELECT id FROM context_turn_usage ORDER BY id DESC LIMIT 1').get() as { id: number } | undefined;
-  if (!newestUsage) return { backfilled: 0 };
+  const currentDataVersion = readDbDataVersion(database);
+  if (!newestUsage) {
+    turnUsageSyncBackfillState.set(database, {
+      complete: true,
+      maxUsageId: 0,
+      dataVersion: currentDataVersion,
+    });
+    return { backfilled: 0 };
+  }
+  const cached = turnUsageSyncBackfillState.get(database);
   const existingSync = database.prepare('SELECT turn_usage_rowid FROM context_turn_usage_sync WHERE turn_usage_rowid = ?').get(newestUsage.id);
   if (existingSync) {
+    if (cached?.complete && cached.dataVersion === currentDataVersion) {
+      if (newestUsage.id !== cached.maxUsageId) {
+        turnUsageSyncBackfillState.set(database, {
+          complete: true,
+          maxUsageId: newestUsage.id,
+          dataVersion: currentDataVersion,
+        });
+      }
+      return { backfilled: 0 };
+    }
     const uCount = (database.prepare('SELECT COUNT(*) as c FROM context_turn_usage').get() as { c: number }).c;
     const sCount = (database.prepare('SELECT COUNT(*) as c FROM context_turn_usage_sync').get() as { c: number }).c;
-    if (uCount === sCount) return { backfilled: 0 };
+    if (uCount === sCount) {
+      turnUsageSyncBackfillState.set(database, {
+        complete: true,
+        maxUsageId: newestUsage.id,
+        dataVersion: currentDataVersion,
+      });
+      return { backfilled: 0 };
+    }
+    turnUsageSyncBackfillState.delete(database);
+  } else {
+    turnUsageSyncBackfillState.delete(database);
   }
+  const boundedLimit = Math.max(1, Math.min(5000, Math.trunc(limit)));
   const rows = database.prepare(`
     SELECT u.id
     FROM context_turn_usage u
@@ -2542,7 +2590,15 @@ export function backfillTurnUsageSyncMetadata(limit = 500): { backfilled: number
     -- backlog fills in behind it (was ASC → recent data starved for hours).
     ORDER BY u.id DESC
     LIMIT ?
-  `).all(Math.max(1, Math.min(5000, Math.trunc(limit)))) as Array<{ id: number }>;
+  `).all(boundedLimit) as Array<{ id: number }>;
+  if (rows.length === 0) {
+    turnUsageSyncBackfillState.set(database, {
+      complete: true,
+      maxUsageId: newestUsage.id,
+      dataVersion: currentDataVersion,
+    });
+    return { backfilled: 0 };
+  }
   let backfilled = 0;
   database.exec('BEGIN IMMEDIATE');
   try {
@@ -2553,7 +2609,12 @@ export function backfillTurnUsageSyncMetadata(limit = 500): { backfilled: number
     }
     database.exec('COMMIT');
   } catch (error) {
-    database.exec('ROLLBACK');
+    try {
+      database.exec('ROLLBACK');
+    } catch {
+      // ignore rollback failure
+    }
+    turnUsageSyncBackfillState.delete(database);
     throw error;
   }
   return { backfilled };
@@ -2756,8 +2817,10 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
   if (inputTokens === 0 && cacheTokens === 0 && outputTokens === 0 && input.costUsd == null) {
     return;
   }
+  let database: DatabaseSyncInstance | null = null;
+  let inTransaction = false;
   try {
-    const database = ensureDb();
+    database = ensureDb();
     const createdAt = input.createdAt ?? Date.now();
     const costUsdMicros = normalizeCostUsdMicros(input.costUsd ?? null);
     const sessionKind = input.sessionKind ?? 'main';
@@ -2770,6 +2833,8 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
     // change). A pure replay (identical values on restart) yields the same
     // payload hash and is therefore a no-op / idempotent. Rows without an
     // event_id don't match the partial unique index, so they always insert.
+    database.exec('BEGIN IMMEDIATE');
+    inTransaction = true;
     database.prepare(`
       INSERT INTO context_turn_usage (
         created_at, session_name, agent_type, model,
@@ -2818,10 +2883,22 @@ export function recordTurnUsage(input: TurnUsageRecord): void {
       ).get(input.sessionName) as { id: number } | undefined;
       rowid = latest?.id ?? null;
     }
-    if (rowid != null) {
-      ensureTurnUsageSyncMetadataForDb(database, rowid);
+    if (rowid == null || !ensureTurnUsageSyncMetadataForDb(database, rowid)) {
+      throw new Error('Failed to persist turn usage sync metadata atomically');
     }
+    database.exec('COMMIT');
+    inTransaction = false;
   } catch (err) {
+    if (database && inTransaction) {
+      try {
+        database.exec('ROLLBACK');
+      } catch {
+        // ignore rollback failure
+      }
+    }
+    if (database) {
+      turnUsageSyncBackfillState.delete(database);
+    }
     // Never break the timeline emitter — log + counter only.
     incrementCounter('mem.turn_usage.record_failed', {});
     warnOncePerHour('mem.turn_usage.record_failed', {

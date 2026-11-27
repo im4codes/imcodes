@@ -23,6 +23,10 @@ type WorkerRequest = {
 }[ProjectionWorkerRequestType];
 
 const PROJECTION_VERSION = 1;
+const WORKER_BUSY_TIMEOUT_MS = 5000;
+const INCREMENTAL_VACUUM_MIN_FREELIST_PAGES = 64;
+const INCREMENTAL_VACUUM_MAX_PAGES = 512;
+const INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS = 50;
 // The worker entry must not import local modules (it loads as raw .ts without a `.js` resolver), so it cannot ask the state-dir
 // resolver itself: the client resolves the paths once and hands them over. There is deliberately no homedir() guess here — a worker
 // that guessed would open the real ~/.imcodes for a scoped daemon.
@@ -63,6 +67,14 @@ function ensureDb(): DatabaseSyncInstance {
   if (db) return db;
   mkdirSync(dirname(dbPath), { recursive: true });
   const instance = new DatabaseSync(dbPath);
+  const initialPageCount = Number(
+    (instance.prepare('PRAGMA page_count').get() as { page_count: number | bigint }).page_count,
+  );
+  if (initialPageCount === 0) {
+    // Must be set before allocating any tables or WAL pages; existing
+    // auto_vacuum = 0 databases stay untouched to avoid blocking startup.
+    instance.exec('PRAGMA auto_vacuum = INCREMENTAL;');
+  }
   instance.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
@@ -72,7 +84,7 @@ function ensureDb(): DatabaseSyncInstance {
     -- and used to trigger the synchronous JSONL fallback. Block-and-retry inside
     -- the worker thread instead (the worker thread is off the main event loop, so
     -- waiting here never stalls command handling).
-    PRAGMA busy_timeout = 5000;
+    PRAGMA busy_timeout = ${WORKER_BUSY_TIMEOUT_MS};
     CREATE TABLE IF NOT EXISTS timeline_projection_events (
       session_id TEXT NOT NULL,
       append_ordinal INTEGER NOT NULL,
@@ -469,6 +481,54 @@ function maybeCheckpoint(): void {
   ensureDb().exec('PRAGMA wal_checkpoint(TRUNCATE);');
 }
 
+/**
+ * Best-effort bounded incremental vacuum for auto_vacuum=INCREMENTAL databases.
+ * Leaves legacy auto_vacuum=0 databases untouched and drops out cleanly on lock contention.
+ */
+export function maybeIncrementalVacuum(
+  database: DatabaseSyncInstance,
+  maxPages = INCREMENTAL_VACUUM_MAX_PAGES,
+  minFreelistPages = INCREMENTAL_VACUUM_MIN_FREELIST_PAGES,
+): { vacuumed: boolean; freelistBefore: number; freelistAfter: number } {
+  const autoVacuum = Number(
+    (database.prepare('PRAGMA auto_vacuum').get() as { auto_vacuum: number | bigint }).auto_vacuum,
+  );
+  if (autoVacuum !== 2) {
+    return { vacuumed: false, freelistBefore: 0, freelistAfter: 0 };
+  }
+  const freelistBefore = Number(
+    (database.prepare('PRAGMA freelist_count').get() as { freelist_count: number | bigint }).freelist_count,
+  );
+  if (freelistBefore < Math.max(1, Math.trunc(minFreelistPages))) {
+    return { vacuumed: false, freelistBefore, freelistAfter: freelistBefore };
+  }
+  const boundedMaxPages = Math.max(1, Math.trunc(maxPages));
+  database.exec(`PRAGMA busy_timeout = ${INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS}`);
+  let vacuumed = false;
+  try {
+    database.exec(`PRAGMA incremental_vacuum(${boundedMaxPages});`);
+    vacuumed = true;
+    // In WAL mode, main database file truncation only lands on disk after a checkpoint;
+    // PASSIVE never blocks concurrent WAL readers.
+    database.exec('PRAGMA wal_checkpoint(PASSIVE);');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!/locked|busy/i.test(msg)) {
+      throw err;
+    }
+  } finally {
+    try {
+      database.exec(`PRAGMA busy_timeout = ${WORKER_BUSY_TIMEOUT_MS}`);
+    } catch {
+      // ignore if database is closing
+    }
+  }
+  const freelistAfter = Number(
+    (database.prepare('PRAGMA freelist_count').get() as { freelist_count: number | bigint }).freelist_count,
+  );
+  return { vacuumed, freelistBefore, freelistAfter };
+}
+
 async function handleRecordAppendedEvent(event: TimelineEvent): Promise<boolean> {
   const fileMeta = currentFileMeta(event.sessionId);
   if (!fileMeta.exists) return false;
@@ -639,13 +699,16 @@ async function handlePruneSessionToAuthoritative(sessionId: string, keepLast: nu
     });
   }
   writesSinceCheckpoint += 1;
+  maybeIncrementalVacuum(database);
   maybeCheckpoint();
   return true;
 }
 
 async function handleDeleteSession(sessionId: string): Promise<boolean> {
+  const database = ensureDb();
   deleteSessionRows(sessionId);
   writesSinceCheckpoint += 1;
+  maybeIncrementalVacuum(database);
   maybeCheckpoint();
   return true;
 }
@@ -675,8 +738,8 @@ function readRetentionConfig(): { days: number; enabledAt: number } | null {
 /** Retention never holds up the writer for the normal 5s lock timeout. */
 function retentionWrite<T>(work: () => T): T {
   const database = ensureDb();
-  database.exec('PRAGMA busy_timeout = 50');
-  try { return work(); } finally { database.exec('PRAGMA busy_timeout = 5000'); }
+  database.exec(`PRAGMA busy_timeout = ${INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS}`);
+  try { return work(); } finally { database.exec(`PRAGMA busy_timeout = ${WORKER_BUSY_TIMEOUT_MS}`); }
 }
 
 function retentionState(): Record<string, unknown> {
@@ -744,6 +807,21 @@ async function runRetention(now = Date.now()): Promise<Record<string, unknown>> 
     // Downtime catches up ONCE; next run returns to the next local 03:00.
     retentionWrite(() => database.prepare(`UPDATE timeline_retention SET last_success = ?, next_run = ?, retry_after = 0,
       runs = runs + 1, last_error = NULL WHERE id = 1`).run(now, nextHistoryCleanupAt(now)));
+    for (let step = 0; step < 32 && stillCurrent(); step += 1) {
+      const vac = maybeIncrementalVacuum(database);
+      if (!vac.vacuumed || vac.freelistAfter < INCREMENTAL_VACUUM_MIN_FREELIST_PAGES || vac.freelistAfter >= vac.freelistBefore) {
+        break;
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    retentionWrite(() => {
+      try {
+        database.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/locked|busy/i.test(msg)) throw err;
+      }
+    });
     return retentionState();
   } catch (err) {
     retentionRetryAfter = now + retention.retryMs;
