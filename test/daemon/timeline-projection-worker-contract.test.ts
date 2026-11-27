@@ -33,15 +33,22 @@ function makeEvent(
 
 describe('timeline projection worker contract', () => {
   let tempHome: string | null = null;
+  const loadedWorkers: Array<() => Promise<void>> = [];
 
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.restoreAllMocks();
-    vi.resetModules();
-    vi.unmock('node:os');
-    vi.unmock('node:worker_threads');
-    if (tempHome) rmSync(tempHome, { recursive: true, force: true });
-    tempHome = null;
+  afterEach(async () => {
+    try {
+      for (const shutdownWorker of loadedWorkers.splice(0)) {
+        await shutdownWorker();
+      }
+    } finally {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+      vi.resetModules();
+      vi.unmock('node:os');
+      vi.unmock('node:worker_threads');
+      if (tempHome) rmSync(tempHome, { recursive: true, force: true });
+      tempHome = null;
+    }
   });
 
   async function loadWorker(options?: {
@@ -54,6 +61,7 @@ describe('timeline projection worker contract', () => {
     const postMessage = vi.fn();
     const close = vi.fn();
     let handler: WorkerHandler | null = null;
+    let isShutDown = false;
 
     const actualWorkerThreads = await vi.importActual<typeof import('node:worker_threads')>('node:worker_threads');
     vi.doMock('node:os', async () => {
@@ -79,9 +87,18 @@ describe('timeline projection worker contract', () => {
     const workerMod = await import('../../src/daemon/timeline-projection-worker.js');
     if (!handler) throw new Error('timeline projection worker did not register a message handler');
 
+    loadedWorkers.push(async () => {
+      if (isShutDown) return;
+      isShutDown = true;
+      await handler!({ id: 'after-each-shutdown', type: 'shutdown', payload: {} });
+    });
+
     async function request(message: Record<string, unknown>) {
       postMessage.mockClear();
       await handler!(message);
+      if (message.type === 'shutdown') {
+        isShutDown = true;
+      }
       expect(postMessage).toHaveBeenCalledTimes(1);
       return postMessage.mock.calls[0]?.[0] as {
         id: string;
