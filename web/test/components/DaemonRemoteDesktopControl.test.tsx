@@ -1308,5 +1308,167 @@ describe('DaemonRemoteDesktopControl', () => {
       // Cache for server_stale should NOT be written by unmounted component
       expect(readCachedDaemonCapabilities('server_stale', { accountScope: TEST_SCOPE })).toBeNull();
     });
+
+    it('toggles canSetUp (owner -> restricted -> owner) on same socket: clears ready button on snapshot [] and preserves subsequent install events', () => {
+      writeCachedDaemonCapabilities('server_perm', [REMOTE_DESKTOP_CAPABILITY], { accountScope: TEST_SCOPE });
+      const ws = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY], 'server_perm');
+      const { container, rerender } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_perm',
+        serverName: 'Perm Server',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+
+      // Initially owner: ready button is shown
+      expect(container.querySelector('.daemon-remote-desktop-btn')).toBeTruthy();
+
+      // Switch to restricted viewer (canSetUp: false)
+      rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_perm',
+        serverName: 'Perm Server',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: false,
+      }));
+
+      // Daemon on same socket publishes authoritative empty capabilities
+      act(() => {
+        ws.emitSnapshot([]);
+      });
+
+      // Ready button must be removed from page, and cache must be updated to []
+      expect(container.querySelector('.daemon-remote-desktop-btn')).toBeNull();
+      expect(readCachedDaemonCapabilities('server_perm', { accountScope: TEST_SCOPE })).toEqual([]);
+
+      // Switch back to owner (canSetUp: true) and daemon advertises installable
+      rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_perm',
+        serverName: 'Perm Server',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+      act(() => {
+        ws.emitSnapshot([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      });
+
+      // Install button is shown and can still handle click and messages
+      const installBtn = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+      expect(installBtn).toBeTruthy();
+      expect(installBtn.textContent).toContain('remote_desktop.install_worker');
+
+      fireEvent.click(installBtn);
+      expect(ws.sent.length).toBe(1);
+      expect(ws.sent[0]).toEqual({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
+      expect(installBtn.querySelector('.connecting-dot')).not.toBeNull();
+
+      // Install state message arriving on socket updates state
+      act(() => {
+        ws.emitMessage({
+          type: REMOTE_DESKTOP_INSTALL_MSG.STATE,
+          state: REMOTE_DESKTOP_INSTALL_STATE.INSTALLED,
+        });
+      });
+      expect(installBtn.querySelector('.connecting-dot')).toBeNull();
+    });
+
+    it('does not enter downloading when clicked with connected=true but raw websocket is CLOSING', () => {
+      const ws = createSwitchableWsStub([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY], 'server_raw_closing');
+      // Mock underlying raw websocket in CLOSING state (2)
+      (ws.client as Record<string, unknown>).ws = { readyState: 2 };
+
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_raw_closing',
+        serverName: 'Raw Closing Server',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+
+      const button = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+      expect(button).toBeTruthy();
+
+      fireEvent.click(button);
+      // No frames sent and does not enter downloading
+      expect(ws.sent.length).toBe(0);
+      expect(button.disabled).toBe(false);
+      expect(button.querySelector('.connecting-dot')).toBeNull();
+    });
+
+    it('does not accept install action when browser connected=true but daemon handshake not yet complete (snapshot null)', () => {
+      writeCachedDaemonCapabilities('server_handshake', [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY], { accountScope: TEST_SCOPE });
+      // ws has connected=true, but getDaemonCapabilitySnapshot() is null (daemon not yet ready)
+      const ws = createSwitchableWsStub(null, 'server_handshake');
+
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_handshake',
+        serverName: 'Handshake Server',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+
+      const button = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+      // Button is visible via cache (no flicker)
+      expect(button).toBeTruthy();
+
+      // Click while daemon handshake is not yet complete: must not accept operation
+      fireEvent.click(button);
+      expect(ws.sent.length).toBe(0);
+      expect(button.disabled).toBe(false);
+      expect(button.querySelector('.connecting-dot')).toBeNull();
+
+      // Once daemon handshake completes:
+      act(() => {
+        ws.emitSnapshot([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      });
+      fireEvent.click(button);
+      expect(ws.sent.length).toBe(1);
+      expect(button.querySelector('.connecting-dot')).not.toBeNull();
+    });
+
+    it('cleans up in-progress downloading operation when daemon disconnects or capabilities clear on same ws', () => {
+      const ws = createSwitchableWsStub([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY], 'server_dc_cleanup');
+
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_dc_cleanup',
+        serverName: 'DC Cleanup Server',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+
+      const button = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+      fireEvent.click(button);
+      expect(button.querySelector('.connecting-dot')).not.toBeNull();
+
+      // Daemon disconnect message arrives on the same ws
+      act(() => {
+        ws.emitMessage({ type: 'daemon.disconnect' });
+      });
+
+      // Downloading state is cleaned up; no longer locked
+      expect(button.querySelector('.connecting-dot')).toBeNull();
+      expect(button.disabled).toBe(false);
+    });
   });
 });

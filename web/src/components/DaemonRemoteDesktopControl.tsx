@@ -17,6 +17,7 @@ import {
   validateRemoteDesktopLoginScreenStateMessage,
   type RemoteDesktopLoginScreenState,
 } from '@shared/remote-desktop-login-screen.js';
+import { DAEMON_MSG } from '@shared/daemon-events.js';
 import type { WsClient } from '../ws-client.js';
 import {
   daemonRemoteDesktopMachine,
@@ -206,9 +207,37 @@ export function resolveServerRemoteDesktopTarget({
 function isWsSendable(ws: WsClient | null | undefined): boolean {
   if (!ws) return false;
   if ('connected' in ws && typeof (ws as { connected?: unknown }).connected === 'boolean') {
-    return Boolean((ws as { connected: boolean }).connected);
+    if (!(ws as { connected: boolean }).connected) return false;
+  }
+  const raw = (ws as unknown as { ws?: { readyState?: number } | null }).ws;
+  if (raw && typeof raw === 'object' && typeof raw.readyState === 'number') {
+    if (raw.readyState !== (typeof WebSocket !== 'undefined' ? WebSocket.OPEN : 1)) {
+      return false;
+    }
   }
   return typeof ws.send === 'function';
+}
+
+function trySendInstallRequest(ws: WsClient | null | undefined, msg: object): boolean {
+  if (!isWsSendable(ws)) return false;
+  const urgent = (ws as unknown as { sendUrgent?: (m: object) => void })?.sendUrgent;
+  if (typeof urgent === 'function') {
+    try {
+      urgent.call(ws, msg);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (typeof ws?.send === 'function') {
+    try {
+      ws.send(msg);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return false;
 }
 
 export function DaemonRemoteDesktopControl({
@@ -238,7 +267,7 @@ export function DaemonRemoteDesktopControl({
   const [activeWs, setActiveWs] = useState<WsClient | null>(matchingWs);
   const [activeCanSetUp, setActiveCanSetUp] = useState<boolean>(canSetUp);
 
-  const operationEpochRef = useRef(0);
+  const installOperationEpochRef = useRef(0);
   const unmountedRef = useRef(false);
 
   const [capabilities, setCapabilities] = useState<readonly string[]>(() => {
@@ -268,7 +297,7 @@ export function DaemonRemoteDesktopControl({
     setActiveAccountScope(normalizedAccountScope);
     setActiveWs(matchingWs);
     setActiveCanSetUp(canSetUp);
-    operationEpochRef.current += 1;
+    installOperationEpochRef.current += 1;
 
     const initialCapabilities = (() => {
       if (!serverId) return [];
@@ -288,12 +317,11 @@ export function DaemonRemoteDesktopControl({
     unmountedRef.current = false;
     return () => {
       unmountedRef.current = true;
-      operationEpochRef.current += 1;
+      installOperationEpochRef.current += 1;
     };
   }, []);
 
   useEffect(() => {
-    const opEpoch = operationEpochRef.current;
     if (!serverId) {
       setCapabilities([]);
       return;
@@ -314,22 +342,43 @@ export function DaemonRemoteDesktopControl({
     }
     if (!matchingWs) return;
     return matchingWs.onDaemonCapabilitySnapshot((snapshot) => {
-      if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
+      if (unmountedRef.current) return;
       if (snapshot && typeof snapshot === 'object' && 'capabilities' in snapshot && Array.isArray((snapshot as { capabilities: unknown }).capabilities)) {
         const caps = (snapshot as { capabilities: readonly string[] }).capabilities;
         setCapabilities(caps);
         if (accountScope) {
           writeCachedDaemonCapabilities(serverId, caps, { accountScope });
         }
+        if (caps.length === 0) {
+          setInstall(null);
+          setLoginScreen(null);
+          installOperationEpochRef.current += 1;
+        }
+      } else if (!snapshot || (snapshot as { capabilities?: unknown }).capabilities === null) {
+        // Snapshot cleared: clean up in-progress install operation so recovery doesn't stay locked
+        setInstall(null);
+        setLoginScreen(null);
+        installOperationEpochRef.current += 1;
       }
     });
-  }, [matchingWs, serverId, accountScope]);
+  }, [matchingWs, serverId, accountScope, canSetUp]);
 
   useEffect(() => {
     if (!matchingWs) return;
-    const opEpoch = operationEpochRef.current;
     return matchingWs.onMessage((message) => {
-      if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
+      if (unmountedRef.current) return;
+      const type = (message as { type?: unknown })?.type;
+      if (
+        type === DAEMON_MSG.DISCONNECTED
+        || type === 'daemon.disconnect'
+        || type === 'daemon.disconnected'
+        || type === 'daemon.offline'
+      ) {
+        setInstall(null);
+        setLoginScreen(null);
+        installOperationEpochRef.current += 1;
+        return;
+      }
       const state = validateRemoteDesktopInstallStateMessage(message);
       if (state) setInstall({ state: state.state, ...(state.error ? { error: state.error } : {}) });
       const loginScreenState = validateRemoteDesktopLoginScreenStateMessage(message);
@@ -340,7 +389,7 @@ export function DaemonRemoteDesktopControl({
         });
       }
     });
-  }, [matchingWs, serverId, accountScope]);
+  }, [matchingWs, serverId, accountScope, canSetUp]);
 
   const {
     target: resolvedTarget,
@@ -381,22 +430,38 @@ export function DaemonRemoteDesktopControl({
       if (!matchingWs || !isWsSendable(matchingWs)) {
         return;
       }
-      const opEpoch = operationEpochRef.current;
+      if (typeof matchingWs.targetsServer === 'function' && !matchingWs.targetsServer(serverId)) {
+        return;
+      }
+      const liveCaps = matchingWs.getDaemonCapabilitySnapshot()?.capabilities;
+      if (!liveCaps || !readControlledNodeInstallHereTarget(liveCaps)) {
+        return;
+      }
+      const opEpoch = installOperationEpochRef.current;
       setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
       void mintControlledNodeInstallCommand(installHereTarget, serverId)
         .then((minted) => {
-          if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
-          if (!minted.installCode || !matchingWs || !isWsSendable(matchingWs)) {
+          if (unmountedRef.current || installOperationEpochRef.current !== opEpoch) return;
+          if (!minted.installCode || !matchingWs || (typeof matchingWs.targetsServer === 'function' && !matchingWs.targetsServer(serverId))) {
             setLoginScreen({
               state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
               error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
             });
             return;
           }
-          matchingWs.send({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST, installCode: minted.installCode });
+          const sent = trySendInstallRequest(matchingWs, {
+            type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+            installCode: minted.installCode,
+          });
+          if (!sent) {
+            setLoginScreen({
+              state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+              error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+            });
+          }
         })
         .catch(() => {
-          if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
+          if (unmountedRef.current || installOperationEpochRef.current !== opEpoch) return;
           setLoginScreen({
             state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
             error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
@@ -467,28 +532,41 @@ export function DaemonRemoteDesktopControl({
             if (!matchingWs || !isWsSendable(matchingWs)) {
               return;
             }
+            if (typeof matchingWs.targetsServer === 'function' && !matchingWs.targetsServer(serverId)) {
+              return;
+            }
+            const liveCaps = matchingWs.getDaemonCapabilitySnapshot()?.capabilities;
+            if (!liveCaps || !liveCaps.includes(REMOTE_DESKTOP_CAPABILITY)) {
+              return;
+            }
             if (!window.confirm(t('remote_desktop.install_confirm', {
               server: serverName ?? serverId ?? '',
             }))) return;
-            const opEpoch = operationEpochRef.current;
+            const opEpoch = installOperationEpochRef.current;
             setLoginScreen({ state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING });
             void mintControlledNodeExecutableTicket({ os: 'win', arch: 'x64' }, serverId)
               .then((minted) => {
-                if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
-                if (!minted.ticket || !matchingWs || !isWsSendable(matchingWs)) {
+                if (unmountedRef.current || installOperationEpochRef.current !== opEpoch) return;
+                if (!minted.ticket || !matchingWs || (typeof matchingWs.targetsServer === 'function' && !matchingWs.targetsServer(serverId))) {
                   setLoginScreen({
                     state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
                     error: 'download_failed',
                   });
                   return;
                 }
-                matchingWs.send({
+                const sent = trySendInstallRequest(matchingWs, {
                   type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
                   ticket: minted.ticket,
                 });
+                if (!sent) {
+                  setLoginScreen({
+                    state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+                    error: 'download_failed',
+                  });
+                }
               })
               .catch(() => {
-                if (unmountedRef.current || operationEpochRef.current !== opEpoch) return;
+                if (unmountedRef.current || installOperationEpochRef.current !== opEpoch) return;
                 setLoginScreen({
                   state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
                   error: 'download_failed',
@@ -552,11 +630,24 @@ export function DaemonRemoteDesktopControl({
         if (!matchingWs || !isWsSendable(matchingWs)) {
           return;
         }
+        if (typeof matchingWs.targetsServer === 'function' && !matchingWs.targetsServer(serverId)) {
+          return;
+        }
+        const liveCaps = matchingWs.getDaemonCapabilitySnapshot()?.capabilities;
+        if (!liveCaps || (!liveCaps.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY) && !liveCaps.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY))) {
+          return;
+        }
         if (!window.confirm(t('remote_desktop.install_confirm', {
           server: serverName ?? serverId ?? '',
         }))) return;
         setInstall({ state: REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING });
-        matchingWs.send({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
+        const sent = trySendInstallRequest(matchingWs, { type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST });
+        if (!sent) {
+          setInstall({
+            state: REMOTE_DESKTOP_INSTALL_STATE.FAILED,
+            error: 'download_failed',
+          });
+        }
       }}
     >
       {downloading
