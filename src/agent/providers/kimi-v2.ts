@@ -91,6 +91,7 @@ const MODEL_PROBE_TTL_MS = 30_000;
 const CANCEL_GRACE_MS = 10_000;
 const MAX_INLINE_IMAGE_BYTES = 10 * 1024 * 1024;
 const STDERR_TAIL_LIMIT = 40;
+const MAX_TRACKED_TERMINAL_COMPACTIONS = 256;
 
 const IMAGE_MIME_BY_EXT: Record<string, string> = {
   '.png': 'image/png',
@@ -121,8 +122,9 @@ interface PendingTurn {
   cancelled: boolean;
   isCompact?: boolean;
   compactedInTurn?: boolean;
-  hasUsageUpdate?: boolean;
-  lastUsage?: ProviderUsageUpdate['usage'];
+  compactionOutcome?: 'committed' | 'failed';
+  compactionOutcomeEmitted?: boolean;
+  turnContextUsage?: ProviderUsageUpdate['usage'];
   cancelGraceTimer: ReturnType<typeof setTimeout> | null;
   terminalTarget: object;
   physicalTerminal: Promise<void>;
@@ -155,6 +157,7 @@ interface KimiSessionState {
   model?: string;
   pendingModel?: string;
   mode?: string;
+  lastContextWindow?: number;
   sessionUsesConfigOptions: boolean;
   modelConfigId: string | null;
   systemText?: string;
@@ -166,6 +169,9 @@ interface KimiSessionState {
   pendingTurn: PendingTurn | null;
   lastStopTurn: PendingTurn | null;
   lastStatusSignature: string | null;
+  compactionTrackerGeneration: number;
+  activeCompactionIds: Set<string>;
+  terminalCompactionIds: Set<string>;
   activeTools: Map<string, ActiveToolState>;
   pendingApprovals: Map<string, PendingApproval>;
   mcpServers: AcpMcpServerConfig[];
@@ -385,30 +391,92 @@ function nonNegativeFiniteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
 }
 
-function extractPromptResponseUsage(response: PromptResponse | null | undefined): ProviderUsageUpdate['usage'] | undefined {
+function positiveFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/** Extract cumulative session-wide `PromptResponse.usage` separately from current-context occupancy. */
+function extractCumulativePromptUsage(response: PromptResponse | null | undefined): Record<string, number> | undefined {
   const usage = asRecord(response?.usage);
   if (!usage) return undefined;
+  const totalTokens = nonNegativeFiniteNumber(usage.totalTokens);
   const inputTokens = nonNegativeFiniteNumber(usage.inputTokens);
   const outputTokens = nonNegativeFiniteNumber(usage.outputTokens);
+  const thoughtTokens = nonNegativeFiniteNumber(usage.thoughtTokens);
   const cachedReadTokens = nonNegativeFiniteNumber(usage.cachedReadTokens);
   const cachedWriteTokens = nonNegativeFiniteNumber(usage.cachedWriteTokens);
-  const meta = asRecord(response?._meta);
-  const metaWindow = nonNegativeFiniteNumber(meta?.model_context_window) ?? nonNegativeFiniteNumber(meta?.size);
   if (
-    inputTokens === undefined
+    totalTokens === undefined
+    && inputTokens === undefined
     && outputTokens === undefined
+    && thoughtTokens === undefined
     && cachedReadTokens === undefined
     && cachedWriteTokens === undefined
-    && (metaWindow === undefined || metaWindow <= 0)
   ) {
     return undefined;
   }
   return {
-    ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
+    ...(totalTokens !== undefined ? { totalTokens } : {}),
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(thoughtTokens !== undefined ? { thoughtTokens } : {}),
+    ...(cachedReadTokens !== undefined ? { cachedReadTokens } : {}),
+    ...(cachedWriteTokens !== undefined ? { cachedWriteTokens } : {}),
+  };
+}
+
+function extractMetaContextWindow(meta: JsonRecord | null | undefined): number | undefined {
+  if (!meta) return undefined;
+  const limit = asRecord(meta.limit);
+  const tokens = asRecord(meta.tokens);
+  return (
+    positiveFiniteNumber(meta.model_context_window)
+    ?? positiveFiniteNumber(meta.contextWindow)
+    ?? positiveFiniteNumber(meta.context_window)
+    ?? positiveFiniteNumber(meta.contextWindowSize)
+    ?? positiveFiniteNumber(meta.maxContextTokens)
+    ?? positiveFiniteNumber(meta.max_context_tokens)
+    ?? positiveFiniteNumber(meta.size)
+    ?? positiveFiniteNumber(tokens?.limit)
+    ?? positiveFiniteNumber(limit?.context)
+    ?? positiveFiniteNumber(limit?.contextWindow)
+  );
+}
+
+/** Extract an explicit Kimi `_meta` current-context occupancy snapshot (never PromptResponse.usage). */
+function extractMetaContextUsage(
+  meta: JsonRecord | null | undefined,
+  fallbackWindow?: number,
+): ProviderUsageUpdate['usage'] | undefined {
+  if (!meta) return undefined;
+  const tokens = asRecord(meta.tokens);
+  const inputTokens =
+    nonNegativeFiniteNumber(meta.used)
+    ?? nonNegativeFiniteNumber(meta.input_tokens)
+    ?? nonNegativeFiniteNumber(meta.inputTokens)
+    ?? nonNegativeFiniteNumber(meta.input)
+    ?? nonNegativeFiniteNumber(tokens?.input);
+  if (inputTokens === undefined) return undefined;
+  const outputTokens =
+    nonNegativeFiniteNumber(meta.output_tokens)
+    ?? nonNegativeFiniteNumber(meta.outputTokens)
+    ?? nonNegativeFiniteNumber(tokens?.output);
+  const cachedReadTokens =
+    nonNegativeFiniteNumber(meta.cache_read_input_tokens)
+    ?? nonNegativeFiniteNumber(meta.cached_input_tokens)
+    ?? nonNegativeFiniteNumber(meta.cachedReadTokens)
+    ?? nonNegativeFiniteNumber(meta.cached)
+    ?? nonNegativeFiniteNumber(tokens?.cached);
+  const cachedWriteTokens =
+    nonNegativeFiniteNumber(meta.cache_creation_input_tokens)
+    ?? nonNegativeFiniteNumber(meta.cachedWriteTokens);
+  const windowSize = extractMetaContextWindow(meta) ?? positiveFiniteNumber(fallbackWindow);
+  return {
+    input_tokens: inputTokens,
     ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
     ...(cachedReadTokens !== undefined ? { cached_input_tokens: cachedReadTokens, cache_read_input_tokens: cachedReadTokens } : {}),
     ...(cachedWriteTokens !== undefined ? { cache_creation_input_tokens: cachedWriteTokens } : {}),
-    ...(metaWindow !== undefined && metaWindow > 0 ? { model_context_window: metaWindow } : {}),
+    ...(windowSize !== undefined ? { model_context_window: windowSize } : {}),
   };
 }
 
@@ -556,6 +624,7 @@ export class KimiV2Provider implements TransportProvider {
       if (state.pendingTurn) {
         this.failTurn(state, state.pendingTurn, new Error('Provider disconnected'), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
       }
+      this.resetSessionCompactionTracking(state);
       this.clearStatus(state.sessionKey, state);
     }
 
@@ -707,6 +776,7 @@ export class KimiV2Provider implements TransportProvider {
             } else {
               this.clearStatus(state.sessionKey, state);
             }
+            this.resetSessionCompactionTracking(state);
           }
         }
       });
@@ -864,11 +934,41 @@ export class KimiV2Provider implements TransportProvider {
     return mappedRouteId ? this.sessions.get(mappedRouteId) : undefined;
   }
 
+  private resetSessionCompactionTracking(state: KimiSessionState, generation?: number): void {
+    state.activeCompactionIds.clear();
+    state.terminalCompactionIds.clear();
+    if (generation !== undefined) {
+      state.compactionTrackerGeneration = generation;
+    }
+  }
+
+  private recordTerminalCompactionId(state: KimiSessionState, compactionId: string): void {
+    state.activeCompactionIds.delete(compactionId);
+    if (!state.terminalCompactionIds.has(compactionId)) {
+      state.terminalCompactionIds.add(compactionId);
+      if (state.terminalCompactionIds.size > MAX_TRACKED_TERMINAL_COMPACTIONS) {
+        const oldest = state.terminalCompactionIds.values().next().value;
+        if (oldest !== undefined) state.terminalCompactionIds.delete(oldest);
+      }
+    }
+  }
+
+  private retireActiveCompactionsForTurn(state: KimiSessionState): void {
+    if (state.activeCompactionIds.size === 0) return;
+    for (const id of state.activeCompactionIds) {
+      this.recordTerminalCompactionId(state, id);
+    }
+    state.activeCompactionIds.clear();
+  }
+
   private bindNativeSession(providerSessionId: string, state: KimiSessionState): void {
     if (this.sessions.get(state.sessionKey) !== state) return;
     const prevProviderId = state.providerSessionId;
     if (prevProviderId && prevProviderId !== providerSessionId && this.acpToRoute.get(prevProviderId) === state.sessionKey) {
       this.acpToRoute.delete(prevProviderId);
+    }
+    if (prevProviderId !== providerSessionId) {
+      this.resetSessionCompactionTracking(state);
     }
     state.providerSessionId = providerSessionId;
     this.sessions.set(state.sessionKey, state);
@@ -1083,9 +1183,15 @@ export class KimiV2Provider implements TransportProvider {
 
       assertOwned();
       state.boundConnectionGeneration = targetConnGen;
+      if (state.compactionTrackerGeneration !== targetConnGen) {
+        this.resetSessionCompactionTracking(state, targetConnGen);
+      }
 
       const catalog = this.cacheModelsFromResponse(response, state);
       const desiredModel = state.pendingModel ?? state.model;
+      if (state.model !== catalog.defaultModel) {
+        state.lastContextWindow = undefined;
+      }
       state.model = catalog.defaultModel;
       state.pendingModel = desiredModel && (!catalog.defaultModel || desiredModel !== catalog.defaultModel)
         ? desiredModel
@@ -1186,6 +1292,7 @@ export class KimiV2Provider implements TransportProvider {
       model: undefined,
       pendingModel: requestedModel,
       mode: 'default',
+      lastContextWindow: undefined,
       sessionUsesConfigOptions: false,
       modelConfigId: null,
       systemText: systemParts.sessionSystemText,
@@ -1199,6 +1306,9 @@ export class KimiV2Provider implements TransportProvider {
       pendingTurn: null,
       lastStopTurn: null,
       lastStatusSignature: null,
+      compactionTrackerGeneration: 0,
+      activeCompactionIds: new Set(),
+      terminalCompactionIds: new Set(),
       activeTools: new Map(),
       pendingApprovals: new Map(),
       mcpServers,
@@ -1298,6 +1408,7 @@ export class KimiV2Provider implements TransportProvider {
       this.rejectPendingApprovals(state, new Error('Session detached'));
       this.failTurn(state, state.pendingTurn, new Error('Session detached'), PROVIDER_ERROR_CODES.CANCELLED, true);
     }
+    this.resetSessionCompactionTracking(state);
     this.clearStatus(state.sessionKey, state);
   }
 
@@ -1310,6 +1421,7 @@ export class KimiV2Provider implements TransportProvider {
     if (state.pendingTurn) {
       this.failTurn(state, state.pendingTurn, new Error('Session ended'), PROVIDER_ERROR_CODES.CANCELLED, true);
     }
+    this.resetSessionCompactionTracking(state);
     this.clearStatus(state.sessionKey, state);
 
     const stillOwnedElsewhere = Boolean(state.providerSessionId && this.acpToRoute.has(state.providerSessionId));
@@ -1353,6 +1465,9 @@ export class KimiV2Provider implements TransportProvider {
     }
 
     await this.switchProviderModel(this.connection, state, agentId);
+    if (state.model !== agentId) {
+      state.lastContextWindow = undefined;
+    }
     state.model = agentId;
     state.pendingModel = undefined;
     this.emitSessionInfo(state.sessionKey, { model: agentId });
@@ -1510,8 +1625,6 @@ export class KimiV2Provider implements TransportProvider {
   ): ContentBlock[] {
     let promptText: string;
     if (isCompact) {
-      state.lastInjectedSessionSystemKey = undefined;
-      state.systemTextInjected = false;
       promptText = '/compact';
     } else {
       const systemParts = getProviderSystemTextParts(normalized);
@@ -1592,19 +1705,46 @@ export class KimiV2Provider implements TransportProvider {
         this.failTurn(state, turn, new Error('Turn cancelled'), PROVIDER_ERROR_CODES.CANCELLED, true);
         return;
       }
-      if (!turn.hasUsageUpdate) {
-        const responseUsage = extractPromptResponseUsage(response);
-        if (responseUsage) {
-          turn.lastUsage = responseUsage;
-          this.emitUsage(state.sessionKey, {
-            messageId: turn.messageId,
-            finalized: true,
-            model: state.model,
-            usage: responseUsage,
-          });
-        }
+      if (stopReason === 'refusal') {
+        this.failTurn(state, turn, new Error('Kimi ACP refused the request'), PROVIDER_ERROR_CODES.PROVIDER_ERROR, false);
+        return;
       }
-      this.settleTurn(state, turn);
+      if (turn.isCompact && turn.compactionOutcome === 'failed' && !turn.compactedInTurn) {
+        this.failTurn(state, turn, new Error('Kimi ACP compaction failed'), PROVIDER_ERROR_CODES.PROVIDER_ERROR, true);
+        return;
+      }
+      // Never merge cumulative PromptResponse.usage.inputTokens into current-context occupancy.
+      // Only use session `usage_update` or an explicit Kimi `_meta` occupancy/window snapshot.
+      const metaRec = asRecord(response?._meta);
+      const metaContextUsage = extractMetaContextUsage(metaRec, state.lastContextWindow);
+      const metaWindowOnly = !metaContextUsage ? extractMetaContextWindow(metaRec) : undefined;
+      const resolvedMetaWindow = metaContextUsage?.model_context_window ?? metaWindowOnly;
+      if (resolvedMetaWindow !== undefined) {
+        state.lastContextWindow = resolvedMetaWindow;
+      }
+      if (metaContextUsage) {
+        turn.turnContextUsage = metaContextUsage;
+        this.emitUsage(state.sessionKey, {
+          messageId: turn.messageId,
+          finalized: true,
+          model: state.model,
+          usage: metaContextUsage,
+        });
+      } else if (metaWindowOnly !== undefined && turn.turnContextUsage) {
+        const patchedUsage: ProviderUsageUpdate['usage'] = {
+          ...turn.turnContextUsage,
+          model_context_window: metaWindowOnly,
+        };
+        turn.turnContextUsage = patchedUsage;
+        this.emitUsage(state.sessionKey, {
+          messageId: turn.messageId,
+          finalized: true,
+          model: state.model,
+          usage: patchedUsage,
+        });
+      }
+      const cumulativeUsage = extractCumulativePromptUsage(response);
+      this.settleTurn(state, turn, cumulativeUsage, stopReason);
     } catch (err) {
       if (err instanceof RequestError) {
         providerResponded = true;
@@ -1661,6 +1801,7 @@ export class KimiV2Provider implements TransportProvider {
       } else {
         this.clearStatus(session.sessionKey, session);
       }
+      this.resetSessionCompactionTracking(session);
     }
 
     if (childStillAlive) {
@@ -1671,21 +1812,31 @@ export class KimiV2Provider implements TransportProvider {
     }
   }
 
-  private settleTurn(state: KimiSessionState, turn: PendingTurn): void {
+  private settleTurn(
+    state: KimiSessionState,
+    turn: PendingTurn,
+    cumulativeUsage?: Record<string, number>,
+    stopReason?: StopReason,
+  ): void {
     if (turn.settled) return;
     turn.settled = true;
     this.clearTurnTimersAndState(state, turn);
     this.clearActiveTools(state);
-    const didCompact = Boolean(turn.isCompact || turn.compactedInTurn);
+    this.retireActiveCompactionsForTurn(state);
+    const didCompact = Boolean(turn.compactedInTurn || (turn.isCompact && turn.compactionOutcome !== 'failed'));
     if (didCompact) {
       this.refreshSessionSystemText(state.sessionKey);
-      this.clearStatus(state.sessionKey, state, !turn.compactedInTurn ? 'committed' : undefined);
+      const outcomeToEmit = !turn.compactionOutcomeEmitted ? 'committed' : undefined;
+      if (outcomeToEmit) turn.compactionOutcomeEmitted = true;
+      this.clearStatus(state.sessionKey, state, outcomeToEmit);
     } else {
       this.clearStatus(state.sessionKey, state);
     }
     const metadata: Record<string, unknown> = {
       ...(state.model ? { model: state.model } : {}),
-      ...(turn.lastUsage ? { usage: turn.lastUsage } : {}),
+      ...(stopReason === 'max_tokens' || stopReason === 'max_turn_requests' ? { stopReason } : {}),
+      ...(turn.turnContextUsage ? { usage: turn.turnContextUsage } : {}),
+      ...(cumulativeUsage ? { cumulativeUsage } : {}),
       ...(didCompact ? { compacted: true } : {}),
     };
     this.emitComplete(state.sessionKey, {
@@ -1706,7 +1857,14 @@ export class KimiV2Provider implements TransportProvider {
     this.rejectPendingApprovals(state, err);
     this.clearTurnTimersAndState(state, turn);
     this.clearActiveTools(state);
-    this.clearStatus(state.sessionKey, state, turn.isCompact && !turn.compactedInTurn ? 'failed' : undefined);
+    this.retireActiveCompactionsForTurn(state);
+    const outcomeToEmit = turn.compactedInTurn && !turn.compactionOutcomeEmitted
+      ? 'committed'
+      : (!turn.compactedInTurn && !turn.compactionOutcomeEmitted && turn.isCompact ? 'failed' : undefined);
+    if (outcomeToEmit) {
+      turn.compactionOutcomeEmitted = true;
+    }
+    this.clearStatus(state.sessionKey, state, outcomeToEmit);
     this.lastErrorCode = code;
     this.emitError(state.sessionKey, {
       code,
@@ -1886,24 +2044,9 @@ export class KimiV2Provider implements TransportProvider {
         break;
       }
 
-      case 'compaction_summary_chunk': {
-        if (!state.pendingTurn?.cancelled) {
-          this.emitStatus(state.sessionKey, state, { status: 'compacting', label: 'Compacting conversation...' });
-        }
-        break;
-      }
-
+      case 'compaction_summary_chunk':
       case 'compaction_update': {
-        const rawStatus = isNonEmptyString(u.status) ? u.status.trim().toLowerCase() : 'in_progress';
-        if (rawStatus === 'completed' || rawStatus === 'complete' || rawStatus === 'done' || rawStatus === 'finished') {
-          this.refreshSessionSystemText(state.sessionKey);
-          if (state.pendingTurn) state.pendingTurn.compactedInTurn = true;
-          this.clearStatus(state.sessionKey, state, 'committed');
-        } else if (rawStatus === 'failed' || rawStatus === 'cancelled' || rawStatus === 'canceled' || rawStatus === 'error') {
-          this.clearStatus(state.sessionKey, state, 'failed');
-        } else if (!state.pendingTurn?.cancelled) {
-          this.emitStatus(state.sessionKey, state, { status: 'compacting', label: 'Compacting conversation...' });
-        }
+        this.handleCompactionSessionUpdate(state, u, u.sessionUpdate);
         break;
       }
 
@@ -1995,6 +2138,7 @@ export class KimiV2Provider implements TransportProvider {
       case 'config_option_update': {
         const catalog = this.cacheModelsFromResponse({ configOptions: u.configOptions }, state);
         if (catalog.defaultModel && catalog.defaultModel !== state.model) {
+          state.lastContextWindow = undefined;
           state.model = catalog.defaultModel;
           this.emitSessionInfo(state.sessionKey, { model: catalog.defaultModel });
         }
@@ -2003,34 +2147,40 @@ export class KimiV2Provider implements TransportProvider {
 
       case 'usage_update': {
         const tokens = asRecord(u.tokens);
-        const used = typeof u.used === 'number'
-          ? u.used
-          : typeof tokens?.input === 'number'
-            ? tokens.input
-            : undefined;
-        const size = typeof u.size === 'number'
-          ? u.size
-          : typeof tokens?.limit === 'number'
-            ? tokens.limit
-            : undefined;
-        const output = typeof tokens?.output === 'number' ? tokens.output : undefined;
-        const cached = typeof tokens?.cached === 'number' ? tokens.cached : undefined;
+        const used = nonNegativeFiniteNumber(u.used) ?? nonNegativeFiniteNumber(tokens?.input);
+        const size = positiveFiniteNumber(u.size) ?? positiveFiniteNumber(tokens?.limit);
+        const output = nonNegativeFiniteNumber(tokens?.output);
+        const cached = nonNegativeFiniteNumber(tokens?.cached);
+        if (size !== undefined) {
+          state.lastContextWindow = size;
+        }
+        const effectiveWindow = size ?? state.lastContextWindow;
 
-        if (used !== undefined || size !== undefined || output !== undefined || cached !== undefined) {
+        if (used !== undefined || output !== undefined || cached !== undefined) {
           const usagePayload: NonNullable<ProviderUsageUpdate['usage']> = {
             ...(used !== undefined ? { input_tokens: used } : {}),
             ...(output !== undefined ? { output_tokens: output } : {}),
             ...(cached !== undefined ? { cached_input_tokens: cached, cache_read_input_tokens: cached } : {}),
-            ...(size !== undefined ? { model_context_window: size } : {}),
+            ...(effectiveWindow !== undefined ? { model_context_window: effectiveWindow } : {}),
           };
           if (state.pendingTurn) {
-            state.pendingTurn.hasUsageUpdate = true;
-            state.pendingTurn.lastUsage = usagePayload;
+            state.pendingTurn.turnContextUsage = usagePayload;
           }
           this.emitUsage(state.sessionKey, {
             messageId: state.pendingTurn?.messageId,
             model: state.model,
             usage: usagePayload,
+          });
+        } else if (effectiveWindow !== undefined && state.pendingTurn?.turnContextUsage) {
+          const patchedUsage: NonNullable<ProviderUsageUpdate['usage']> = {
+            ...state.pendingTurn.turnContextUsage,
+            model_context_window: effectiveWindow,
+          };
+          state.pendingTurn.turnContextUsage = patchedUsage;
+          this.emitUsage(state.sessionKey, {
+            messageId: state.pendingTurn.messageId,
+            model: state.model,
+            usage: patchedUsage,
           });
         }
         break;
@@ -2039,6 +2189,67 @@ export class KimiV2Provider implements TransportProvider {
       default:
         break;
     }
+  }
+
+  private handleCompactionSessionUpdate(
+    state: KimiSessionState,
+    u: JsonRecord,
+    kind: 'compaction_summary_chunk' | 'compaction_update',
+  ): void {
+    const turn = state.pendingTurn;
+    if (
+      !turn
+      || !state.promptInFlight
+      || turn.cancelled
+      || turn.settled
+      || state.boundConnectionGeneration !== this.connectionGeneration
+    ) {
+      return;
+    }
+
+    const compactionId = isNonEmptyString(u.compactionId)
+      ? u.compactionId.trim()
+      : `__turn_${turn.generation}_compaction__`;
+    if (state.terminalCompactionIds.has(compactionId)) {
+      return;
+    }
+
+    if (kind === 'compaction_summary_chunk') {
+      if (!state.activeCompactionIds.has(compactionId)) {
+        state.activeCompactionIds.add(compactionId);
+      }
+      this.emitStatus(state.sessionKey, state, { status: 'compacting', label: 'Compacting conversation...' });
+      return;
+    }
+
+    const rawStatus = isNonEmptyString(u.status) ? u.status.trim().toLowerCase() : 'in_progress';
+    if (rawStatus === 'completed' || rawStatus === 'complete' || rawStatus === 'done' || rawStatus === 'finished') {
+      this.recordTerminalCompactionId(state, compactionId);
+      this.refreshSessionSystemText(state.sessionKey);
+      turn.compactedInTurn = true;
+      turn.compactionOutcome = 'committed';
+      if (state.activeCompactionIds.size === 0) {
+        turn.compactionOutcomeEmitted = true;
+        this.clearStatus(state.sessionKey, state, 'committed');
+      }
+      return;
+    }
+
+    if (rawStatus === 'failed' || rawStatus === 'cancelled' || rawStatus === 'canceled' || rawStatus === 'error') {
+      this.recordTerminalCompactionId(state, compactionId);
+      if (!turn.compactedInTurn) {
+        turn.compactionOutcome = 'failed';
+      }
+      if (state.activeCompactionIds.size === 0) {
+        const outcome = turn.compactedInTurn ? 'committed' : 'failed';
+        turn.compactionOutcomeEmitted = true;
+        this.clearStatus(state.sessionKey, state, outcome);
+      }
+      return;
+    }
+
+    state.activeCompactionIds.add(compactionId);
+    this.emitStatus(state.sessionKey, state, { status: 'compacting', label: 'Compacting conversation...' });
   }
 
   private async handleRequestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
