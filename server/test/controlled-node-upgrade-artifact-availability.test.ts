@@ -616,4 +616,107 @@ describe('controlled-node upgrade artifact availability', () => {
     const winMachine2 = listBody2.machines.find((m) => m.serverId === winId)!;
     expect(winMachine2.updateAvailable).toBe(true);
   });
+
+  it('checks per-arch macOS release manifest for darwin-x64 vs darwin-arm64 and checks both when macOS arch is universal/unknown', async () => {
+    const dir = makeTempDir();
+    const catalog = new ArtifactCatalog();
+    const version = '2026.11.6643-dev.6687';
+    writeLinuxAndMacArtifacts(dir, version);
+    const macUniversal = Buffer.from(`mac-universal-${version}`);
+
+    const writeMacManifest = (arch: 'arm64' | 'x64', nodeSha: string) => {
+      const target = `darwin-${arch}`;
+      writeFileSync(join(dir, `desktop-release-${target}.manifest.json`), JSON.stringify({
+        schemaVersion: 1,
+        releaseVersion: version,
+        gitSha: '1234567abcdef',
+        generatedAt: new Date().toISOString(),
+        targets: {
+          [target]: {
+            target,
+            os: 'darwin',
+            arch,
+            components: {
+              'imcodes-node': {
+                component: 'imcodes-node',
+                version,
+                fileName: 'imcodes-node-macos',
+                sha256: nodeSha,
+                sizeBytes: macUniversal.length,
+                compat: { os: 'darwin', arch: 'universal' },
+              },
+              'remote-desktop': {
+                component: 'remote-desktop',
+                version,
+                fileName: `imcodes-macos-remote-desktop-${arch}.tar.gz`,
+                sha256: 'b'.repeat(64),
+                sizeBytes: 100,
+                compat: { os: 'darwin', arch, protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION },
+              },
+              'open-computer-use': {
+                component: 'open-computer-use',
+                version,
+                fileName: 'open-computer-use.app.zip',
+                sha256: 'c'.repeat(64),
+                sizeBytes: 100,
+                compat: { os: 'darwin', arch: 'universal' },
+              },
+              'daemon-runtime': {
+                component: 'daemon-runtime',
+                version,
+                fileName: `daemon-runtime-${target}.tar.gz`,
+                sha256: 'd'.repeat(64),
+                sizeBytes: 100,
+                compat: { os: 'darwin', arch, nodeVersion: 'v24.16.0' },
+              },
+            },
+          },
+        },
+      }));
+    };
+
+    // arm64 matches, x64 mismatches -> Intel Mac (`x64`) and `universal` catch mismatch; `arm64` stays available.
+    writeMacManifest('arm64', sha256(macUniversal));
+    writeMacManifest('x64', 'f'.repeat(64));
+
+    expect(await checkControlledNodeUpgradeArtifactAvailability({
+      os: CONTROLLED_NODE_OS_MAC, arch: 'x64', artifactDir: dir, artifactCatalog: catalog,
+    })).toEqual({ configured: true, available: false, reason: 'desktop_release_manifest_mismatch' });
+
+    expect(await checkControlledNodeUpgradeArtifactAvailability({
+      os: CONTROLLED_NODE_OS_MAC, arch: 'universal', artifactDir: dir, artifactCatalog: catalog,
+    })).toEqual({ configured: true, available: false, reason: 'desktop_release_manifest_mismatch' });
+
+    expect(await checkControlledNodeUpgradeArtifactAvailability({
+      os: CONTROLLED_NODE_OS_MAC, arch: 'arm64', artifactDir: dir, artifactCatalog: catalog,
+    })).toEqual({ configured: true, available: true });
+
+    // Once both match, x64, arm64, universal, and unrecognized (`unknown`) macOS arches are all available;
+    // linux `unknown` still stays refused (`executable_not_built`).
+    writeMacManifest('x64', sha256(macUniversal));
+    for (const arch of ['x64', 'arm64', 'universal', 'unknown']) {
+      expect(await checkControlledNodeUpgradeArtifactAvailability({
+        os: CONTROLLED_NODE_OS_MAC, arch, artifactDir: dir, artifactCatalog: catalog,
+      })).toEqual({ configured: true, available: true });
+    }
+    expect(await checkControlledNodeUpgradeArtifactAvailability({
+      os: CONTROLLED_NODE_OS_LINUX, arch: 'unknown', artifactDir: dir, artifactCatalog: catalog,
+    })).toEqual({ configured: true, available: false, reason: 'executable_not_built' });
+
+    // Unilateral partial macOS release manifest publication (in either direction) rejects unknown/universal macOS arch.
+    rmSync(join(dir, 'desktop-release-darwin-x64.manifest.json'));
+    for (const arch of ['universal', 'unknown']) {
+      expect(await checkControlledNodeUpgradeArtifactAvailability({
+        os: CONTROLLED_NODE_OS_MAC, arch, artifactDir: dir, artifactCatalog: catalog,
+      })).toEqual({ configured: true, available: false, reason: 'desktop_release_manifest_invalid' });
+    }
+
+    writeMacManifest('x64', sha256(macUniversal));
+    rmSync(join(dir, 'desktop-release-darwin-arm64.manifest.json'));
+    for (const arch of ['universal', 'unknown']) {
+      expect(await checkControlledNodeUpgradeArtifactAvailability({
+        os: CONTROLLED_NODE_OS_MAC, arch, artifactDir: dir, artifactCatalog: catalog,
+      })).toEqual({ configured: true, available: false, reason: 'desktop_release_manifest_invalid' });
+    }
+  });
 });

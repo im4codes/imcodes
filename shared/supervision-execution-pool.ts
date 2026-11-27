@@ -348,6 +348,64 @@ function text(value: unknown): string | undefined {
  * third-party models (MiniMax-M3, qwen3.8-27b), and those must pass through
  * verbatim rather than be folded into a Claude family bucket.
  */
+/**
+ * Explicit known legacy short/migration aliases for Claude execution pool configs.
+ * Any explicit model ID outside this finite compatibility map (such as
+ * `claude-fable-5-1`, `claude-sonnet-5-5`, `claude-fable-6`, `claude-aurora-7`)
+ * is preserved verbatim across capability IDs, persistence, switching, and launch.
+ */
+const CLAUDE_LEGACY_EXECUTION_MODEL_ALIASES: Readonly<Record<string, string>> = {
+  opus: 'opus[1M]',
+  'opus[1m]': 'opus[1M]',
+  fable: 'fable',
+  sonnet: 'sonnet',
+  haiku: 'haiku',
+  'claude-fable-5': 'fable',
+  'claude-mythos-5': 'fable',
+  'claude-opus-5': 'opus[1M]',
+  'claude-opus-5[1m]': 'opus[1M]',
+  'claude-opus-4-8': 'opus[1M]',
+  'claude-opus-4-8[1m]': 'opus[1M]',
+  'claude-opus-4-7': 'opus[1M]',
+};
+
+const CLAUDE_SHORTHAND_CANONICAL_SET = new Set<string>(['fable', 'opus[1M]', 'sonnet', 'haiku']);
+
+/**
+ * Directional match between a configured pool entry model and an observed
+ * runtime/session model for `agentType`:
+ * - Exact canonical equality always matches.
+ * - A canonical Claude shorthand in the pool (`sonnet`, `haiku`, `fable`,
+ *   `opus[1M]`) matches observed versioned Claude IDs of the same family
+ *   (e.g. `claude-sonnet-4-6` matches `sonnet`).
+ * - An explicit versioned Claude ID in the pool (e.g. `claude-sonnet-4-6`,
+ *   `claude-fable-5-1`, `claude-fable-6`) matches strictly that exact model so
+ *   distinct versions in the same family never cross-select.
+ */
+export function supervisionExecutionModelMatches(
+  agentType: string,
+  configModel: string,
+  observedModel: string,
+): boolean {
+  const canonicalConfig = normalizeSupervisionExecutionModel(agentType, configModel);
+  const canonicalObserved = normalizeSupervisionExecutionModel(agentType, observedModel);
+  if (!canonicalConfig || !canonicalObserved) return false;
+  if (canonicalConfig === canonicalObserved) return true;
+  if (isClaudeCodeFamily(agentType) && CLAUDE_SHORTHAND_CANONICAL_SET.has(canonicalConfig)) {
+    return normalizeClaudeCodeModelId(canonicalObserved) === canonicalConfig;
+  }
+  return false;
+}
+
+export function resolveClaudeExecutionModelForSwitch(model: string): string | undefined {
+  const trimmed = model.trim();
+  if (!trimmed) return undefined;
+  const legacyAlias = CLAUDE_LEGACY_EXECUTION_MODEL_ALIASES[trimmed.toLowerCase()];
+  if (legacyAlias) return legacyAlias;
+  if (/^claude-[a-z0-9]/i.test(trimmed)) return trimmed;
+  return undefined;
+}
+
 export function normalizeSupervisionExecutionModel(agentType: string, model: string): string {
   const trimmed = model.trim();
   const lower = trimmed.toLowerCase();
@@ -358,7 +416,7 @@ export function normalizeSupervisionExecutionModel(agentType: string, model: str
     return DEFAULT_CODEX_SESSION_MODEL;
   }
   if (!trimmed || !isClaudeCodeFamily(agentType)) return trimmed;
-  return normalizeClaudeCodeModelId(trimmed) ?? trimmed;
+  return CLAUDE_LEGACY_EXECUTION_MODEL_ALIASES[lower] ?? trimmed;
 }
 
 /** Builds the capabilityId string from `input.model` exactly as given, with no canonicalization. */
@@ -722,11 +780,11 @@ export function evaluateSupervisionObservedIdentity(input: {
     || !input.actual.providerFamily || !input.actual.runtimeType) {
     return { ok: false, reason: 'identity_mismatch' };
   }
-  // Compare in the canonical namespace: `actual.model` is the daemon-OBSERVED id
-  // (e.g. `claude-opus-5`), configs hold the picker id (`opus[1M]`).
+  // Compare in the canonical namespace: explicit IDs match strictly while
+  // canonical Claude shorthands (`sonnet`, `haiku`, `fable`, `opus[1M]`) match
+  // observed versioned IDs in the same family.
   const canonicalConfig = normalizeSupervisionExecutionConfig(input.config);
   if (!canonicalConfig) return { ok: false, reason: 'identity_mismatch' };
-  const observedModel = normalizeSupervisionExecutionModel(input.actual.agentType, input.actual.model);
   const observedPreset = input.actual.ccPresetId === undefined ? undefined : text(input.actual.ccPresetId);
   const observedBackend = normalizeSharedContextRuntimeBackend(input.actual.agentType);
   if (input.actual.ccPresetId !== undefined
@@ -736,7 +794,7 @@ export function evaluateSupervisionObservedIdentity(input: {
   if (canonicalConfig.agentType !== input.actual.agentType
     || canonicalConfig.providerFamily !== input.actual.providerFamily
     || canonicalConfig.runtimeType !== input.actual.runtimeType
-    || canonicalConfig.model !== observedModel
+    || !supervisionExecutionModelMatches(input.actual.agentType, canonicalConfig.model, input.actual.model)
     || canonicalConfig.ccPresetId !== observedPreset) {
     return { ok: false, reason: 'identity_mismatch' };
   }
@@ -755,13 +813,11 @@ export function evaluateSupervisionExecutionBinding(input: {
   if (input.pools.state !== 'configured') return { ok: false, reason: 'pool_unconfigured' };
   if (input.pool === 'economy' && !input.economyPolicy) return { ok: false, reason: 'economy_policy_required' };
   const pool = input.pool === 'primary' ? input.pools.primaryDevelopmentPool : input.pools.economyTaskPool;
-  const observedModel = input.actual.model
-    ? normalizeSupervisionExecutionModel(input.actual.agentType ?? '', input.actual.model)
-    : '';
   const requested = pool.configs.find((config) => config.capabilityId === input.requestedCapabilityId)
     ?? (!input.requestedCapabilityId ? pool.configs.find((config) => config.agentType === input.actual.agentType
       && config.providerFamily === input.actual.providerFamily && config.runtimeType === input.actual.runtimeType
-      && config.model === observedModel && config.ccPresetId === input.actual.ccPresetId) : undefined);
+      && supervisionExecutionModelMatches(input.actual.agentType ?? config.agentType, config.model, input.actual.model ?? '')
+      && config.ccPresetId === input.actual.ccPresetId) : undefined);
   // Order matters: a caller naming a capability that is not in the pool gets
   // `unselected_config`, which must not be masked by an identity reason.
   const preCheck = evaluateSupervisionObservedIdentity({
@@ -876,5 +932,589 @@ export function planSupervisionExecutionCapacity(input: {
       parentStage: input.parentStage,
       leaseExpiresAt: input.now + input.definition.controls.leaseMs,
     },
+  };
+}
+
+export const MODEL_TIERS = ['flagship', 'secondary', 'economy'] as const;
+export type ModelTier = typeof MODEL_TIERS[number];
+
+export interface LearnedModelTierRecord {
+  provider: string;
+  model: string;
+  tier: ModelTier;
+  source?: string;
+  notes?: string;
+  updatedAt: number;
+}
+
+export type ExecutionPoolSdkCatalogSource = 'live_catalog' | 'session_observed' | 'static_fallback';
+
+export interface ExecutionPoolSdkSummary {
+  provider: string;
+  providerFamily: string;
+  loggedIn: boolean;
+  models: string[];
+  tiers: { flagship?: string; secondary?: string; economy?: string };
+  unknownModels: string[];
+  source: ExecutionPoolSdkCatalogSource;
+}
+
+export interface ExecutionPoolRecommendationPresetEntry {
+  provider: string;
+  model: string;
+  role: SupervisionExecutionPoolRole;
+  enabled: boolean;
+}
+
+export interface ExecutionPoolRecommendationPreset {
+  id: string;
+  recommended: boolean;
+  label: string;
+  description: string;
+  primaryEntries: ExecutionPoolRecommendationPresetEntry[];
+  economyEntries: ExecutionPoolRecommendationPresetEntry[];
+  autoPairingEnabled: boolean;
+  auditByDefault: boolean;
+  brainModelHint?: string;
+  needsModelResearch?: boolean;
+}
+
+export interface ExecutionPoolRecommendationsResult {
+  currentBrain: {
+    provider: string;
+    providerFamily: string;
+    model?: string;
+    isEconomy?: boolean;
+  };
+  availableSdks: ExecutionPoolSdkSummary[];
+  unknownModels: Array<{ provider: string; model: string }>;
+  needsModelResearch: boolean;
+  recommendedPresets: ExecutionPoolRecommendationPreset[];
+  customAllowed: true;
+  brainModelHint?: string;
+}
+
+const PROVIDER_KNOWLEDGE_ALIASES: Readonly<Record<string, string>> = {
+  agy: 'agy-sdk',
+  'agy-sdk': 'agy-sdk',
+  google: 'agy-sdk',
+  codex: 'codex-sdk',
+  'codex-sdk': 'codex-sdk',
+  openai: 'codex-sdk',
+  'claude-code': 'claude-code-sdk',
+  'claude-code-sdk': 'claude-code-sdk',
+  'claude-code-cli-sdk': 'claude-code-sdk',
+  anthropic: 'claude-code-sdk',
+  grok: 'grok-sdk',
+  'grok-sdk': 'grok-sdk',
+  xai: 'grok-sdk',
+  copilot: 'copilot-sdk',
+  'copilot-sdk': 'copilot-sdk',
+  github: 'copilot-sdk',
+  kimi: 'kimi-sdk',
+  'kimi-sdk': 'kimi-sdk',
+  moonshot: 'kimi-sdk',
+  qwen: 'qwen',
+  alibaba: 'qwen',
+  deepseek: 'deepseek-harness',
+  'deepseek-harness': 'deepseek-harness',
+  muse: 'muse-code-sdk',
+  'muse-code-sdk': 'muse-code-sdk',
+  opencode: 'opencode-sdk',
+  'opencode-sdk': 'opencode-sdk',
+};
+
+export function normalizeModelTierKnowledgeProvider(provider: string): string {
+  const lower = provider.trim().toLowerCase();
+  return PROVIDER_KNOWLEDGE_ALIASES[lower] ?? lower;
+}
+
+function parseModelVersionParts(modelId: string): number[] {
+  const scrubbed = modelId
+    .toLowerCase()
+    .replace(/\[[^\]]*\]/g, '')
+    .replace(/-\d{8}\b/g, '')
+    .replace(/\b\d+b\b/g, '');
+  const nums: number[] = [];
+  for (const match of scrubbed.matchAll(/(\d+(?:\.\d+)*)/g)) {
+    for (const part of match[1]!.split('.')) {
+      const n = Number(part);
+      if (Number.isFinite(n)) nums.push(n);
+    }
+  }
+  return nums.length > 0 ? nums : [0];
+}
+
+function compareVersionPartsDesc(a: readonly number[], b: readonly number[]): number {
+  const maxLen = Math.max(a.length, b.length);
+  for (let i = 0; i < maxLen; i += 1) {
+    const diff = (b[i] ?? 0) - (a[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function modelBrandPrefix(modelId: string): string {
+  const lower = modelId.trim().toLowerCase();
+  const dash = lower.indexOf('-');
+  return dash > 0 ? lower.slice(0, dash) : lower;
+}
+
+function hasModelToken(base: string, token: string): boolean {
+  return new RegExp(`(?:^|[-_./\\s])${token}(?:$|[-_./\\s\\d])`, 'i').test(base);
+}
+
+function extractEffortWeight(lower: string): number {
+  const clean = lower.replace(/\[[^\]]*\]$/g, '');
+  if (/(?:^|-)high$/i.test(clean)) return 3;
+  if (/(?:^|-)medium$/i.test(clean)) return 2;
+  if (/(?:^|-)low$/i.test(clean)) return 1;
+  return 2;
+}
+
+function stripEffortAndContextSuffixes(lower: string): string {
+  let prev = lower.trim().replace(/\[[^\]]*\]$/g, '');
+  while (true) {
+    const next = prev.replace(/-(?:high|medium|low|free)$/i, '');
+    if (next === prev) return next;
+    prev = next;
+  }
+}
+
+function computeNativeProviderAffinity(providerFamily: string, lowerModel: string): number {
+  if (providerFamily === 'google') {
+    return lowerModel.startsWith('gemini') ? 2 : 1;
+  }
+  if (providerFamily === 'openai') {
+    return /^(?:gpt-\d|o\d|codex)/.test(lowerModel) ? 2 : 1;
+  }
+  if (providerFamily === 'anthropic') {
+    return lowerModel.includes('claude') || /^(?:fable|mythos|opus|sonnet|haiku)(?:$|\[)/.test(lowerModel) ? 2 : 1;
+  }
+  return 2;
+}
+
+interface ClassifiedModelCandidate {
+  model: string;
+  tier: ModelTier;
+  origin: 'learned' | 'heuristic';
+  nativeAffinity: number;
+  version: number[];
+  subRank: number;
+  effortWeight: number;
+  index: number;
+}
+
+function classifyHeuristicTier(
+  providerFamily: string,
+  modelId: string,
+): { tier: ModelTier; subRank: number } | null {
+  const lower = modelId.trim().toLowerCase();
+  if (!lower) return null;
+  const base = stripEffortAndContextSuffixes(lower);
+  if (!base) return null;
+
+  // 1. Economy tier tokens
+  if (
+    hasModelToken(base, 'haiku')
+    || hasModelToken(base, 'flash')
+    || hasModelToken(base, 'luna')
+    || hasModelToken(base, 'mini')
+    || hasModelToken(base, 'nano')
+    || hasModelToken(base, 'lite')
+    || hasModelToken(base, 'spark')
+    || hasModelToken(base, 'fast')
+  ) {
+    return { tier: 'economy', subRank: 2 };
+  }
+  if (base.includes('gemini') && hasModelToken(base, 'argon')) {
+    return { tier: 'economy', subRank: 1 };
+  }
+  if (hasModelToken(base, '27b')) {
+    return { tier: 'economy', subRank: 1 };
+  }
+
+  // 2. Secondary tier tokens
+  if (
+    hasModelToken(base, 'sonnet')
+    || hasModelToken(base, 'sol')
+    || hasModelToken(base, 'hydrogen')
+    || hasModelToken(base, 'standard')
+  ) {
+    return { tier: 'secondary', subRank: 2 };
+  }
+  if (base.startsWith('muse-wonder') && !base.includes('full')) {
+    return { tier: 'secondary', subRank: 1 };
+  }
+  if (base.startsWith('qwen') && (hasModelToken(base, 'plus') || base.includes('coder-next'))) {
+    return { tier: 'secondary', subRank: 1 };
+  }
+
+  // 3. Flagship tier tokens
+  if (hasModelToken(base, 'fable') || hasModelToken(base, 'mythos')) {
+    return { tier: 'flagship', subRank: 3 };
+  }
+  if (
+    hasModelToken(base, 'opus')
+    || hasModelToken(base, 'astra')
+    || hasModelToken(base, 'helium')
+    || hasModelToken(base, 'ultra')
+    || hasModelToken(base, 'max')
+    || hasModelToken(base, 'heavy')
+    || hasModelToken(base, 'reasoner')
+    || base.includes('wonder-full')
+  ) {
+    return { tier: 'flagship', subRank: 2 };
+  }
+  if (hasModelToken(base, 'pro') && (
+    providerFamily === 'google'
+    || providerFamily === 'openai'
+    || providerFamily === 'deepseek'
+    || providerFamily === 'alibaba'
+    || providerFamily === 'xai'
+    || base.startsWith('gemini')
+    || base.startsWith('deepseek')
+    || base.startsWith('gpt')
+    || base.startsWith('grok')
+    || base.startsWith('qwen')
+  )) {
+    return { tier: 'flagship', subRank: 1 };
+  }
+  if (/^gpt-\d+(?:\.\d+)*(?:-codex)?$/i.test(base) || base === 'coder-model') {
+    return { tier: 'flagship', subRank: 1 };
+  }
+
+  // Anything unrecognized MUST be reported in unknownModels rather than guessed.
+  return null;
+}
+
+function compareClassifiedCandidates(a: ClassifiedModelCandidate, b: ClassifiedModelCandidate): number {
+  if (a.nativeAffinity !== b.nativeAffinity) return b.nativeAffinity - a.nativeAffinity;
+  const versionDiff = compareVersionPartsDesc(a.version, b.version);
+  if (versionDiff !== 0) return versionDiff;
+  if (a.origin !== b.origin) return a.origin === 'learned' ? -1 : 1;
+  if (a.subRank !== b.subRank) return b.subRank - a.subRank;
+  if (a.effortWeight !== b.effortWeight) return b.effortWeight - a.effortWeight;
+  return a.index - b.index;
+}
+
+/**
+ * Dynamically classify an SDK's live models into flagship / secondary / economy tiers
+ * without hardcoding fixed model lists.
+ *
+ * Priority:
+ * 1. `learnedKnowledge` entries (persisted from web research / user feedback)
+ * 2. Generic version-aware family/tier heuristics (works for future versions like gpt-8-sol, claude-fable-6)
+ * 3. Any model matching neither is returned verbatim in `unknownModels` (never dropped or guessed).
+ */
+export function classifySdkModelTiers(
+  provider: string,
+  liveModels: readonly string[],
+  learnedKnowledge: readonly LearnedModelTierRecord[] = [],
+): {
+  models: string[];
+  tiers: { flagship?: string; secondary?: string; economy?: string };
+  unknownModels: string[];
+} {
+  const models: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of liveModels) {
+    const trimmed = typeof raw === 'string' ? raw.trim() : '';
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    models.push(trimmed);
+  }
+
+  const normalizedProvider = normalizeModelTierKnowledgeProvider(provider);
+  const providerFamily = resolvePeerAuditProviderFamily({ agentType: provider, providerId: provider });
+  const learnedMap = new Map<string, LearnedModelTierRecord>();
+  for (const record of learnedKnowledge) {
+    const recProvider = normalizeModelTierKnowledgeProvider(record.provider);
+    if (recProvider !== normalizedProvider && record.provider.trim().toLowerCase() !== provider.trim().toLowerCase()) {
+      continue;
+    }
+    const key = record.model.trim().toLowerCase();
+    if (!key) continue;
+    const prev = learnedMap.get(key);
+    if (!prev || record.updatedAt >= prev.updatedAt) {
+      learnedMap.set(key, record);
+    }
+  }
+
+  const buckets: Record<ModelTier, ClassifiedModelCandidate[]> = {
+    flagship: [],
+    secondary: [],
+    economy: [],
+  };
+  const unknownModels: string[] = [];
+
+  for (let i = 0; i < models.length; i += 1) {
+    const model = models[i]!;
+    const lower = model.toLowerCase();
+    const learned = learnedMap.get(lower);
+    const nativeAffinity = computeNativeProviderAffinity(providerFamily, lower);
+    const version = parseModelVersionParts(lower);
+    const effortWeight = extractEffortWeight(lower);
+
+    if (learned) {
+      buckets[learned.tier].push({
+        model,
+        tier: learned.tier,
+        origin: 'learned',
+        nativeAffinity,
+        version,
+        subRank: 10,
+        effortWeight,
+        index: i,
+      });
+      continue;
+    }
+
+    const heuristic = classifyHeuristicTier(providerFamily, model);
+    if (!heuristic) {
+      unknownModels.push(model);
+      continue;
+    }
+    buckets[heuristic.tier].push({
+      model,
+      tier: heuristic.tier,
+      origin: 'heuristic',
+      nativeAffinity,
+      version,
+      subRank: heuristic.subRank,
+      effortWeight,
+      index: i,
+    });
+  }
+
+  for (const tier of MODEL_TIERS) {
+    buckets[tier].sort(compareClassifiedCandidates);
+  }
+
+  const bestFlagship = buckets.flagship[0];
+  const bestSecondary = buckets.secondary[0];
+  const bestEconomy = buckets.economy[0];
+
+  let flagship = bestFlagship?.model;
+  let secondary = bestSecondary?.model;
+  const economy = bestEconomy?.model;
+
+  // In families like Codex where newer generations ship only `-sol` (e.g. gpt-7.5-sol)
+  // without a separate higher-version flagship, promote the newest secondary model as flagship
+  // instead of falling back to an older-generation base model (e.g. gpt-5.6).
+  if (!flagship && secondary) {
+    flagship = secondary;
+  } else if (
+    bestFlagship
+    && bestSecondary
+    && bestFlagship.origin !== 'learned'
+    && modelBrandPrefix(bestFlagship.model) === modelBrandPrefix(bestSecondary.model)
+    && compareVersionPartsDesc(bestSecondary.version, bestFlagship.version) < 0
+  ) {
+    flagship = bestSecondary.model;
+  }
+
+  if (!secondary && flagship) {
+    secondary = flagship;
+  }
+
+  const tiers: { flagship?: string; secondary?: string; economy?: string } = {
+    ...(flagship ? { flagship } : {}),
+    ...(secondary ? { secondary } : {}),
+    ...(economy ? { economy } : {}),
+  };
+
+  return { models, tiers, unknownModels };
+}
+
+function isModelEconomyTier(
+  provider: string,
+  model: string | undefined,
+  summary: ExecutionPoolSdkSummary | undefined,
+  learnedKnowledge: readonly LearnedModelTierRecord[],
+): boolean {
+  if (!model?.trim()) return false;
+  const trimmed = model.trim();
+  if (summary?.tiers.economy && summary.tiers.economy.toLowerCase() === trimmed.toLowerCase()) return true;
+  if (isExcludedDevelopmentModel(trimmed)) return true;
+  const check = classifySdkModelTiers(provider, [trimmed], learnedKnowledge);
+  return check.tiers.economy === trimmed && !check.tiers.secondary && !check.tiers.flagship;
+}
+
+function sdkPreferenceScore(sdk: ExecutionPoolSdkSummary): number {
+  let score = 0;
+  if (sdk.source === 'live_catalog') score += 300;
+  else if (sdk.source === 'session_observed') score += 200;
+  else score += 100;
+  if (sdk.tiers.secondary) score += 40;
+  if (sdk.tiers.flagship) score += 20;
+  if (sdk.provider === 'codex-sdk' || sdk.provider === 'agy-sdk' || sdk.provider === 'claude-code-sdk') score += 15;
+  return score;
+}
+
+/**
+ * Build execution pool preset recommendations from the current Brain SDK and all locally logged-in SDKs.
+ * Recommends cross-vendor audit when >= 2 provider families are logged in, and automatically degrades
+ * to same-vendor audit when only 1 SDK family is available.
+ */
+export function buildExecutionPoolRecommendations(input: {
+  currentBrain: {
+    provider: string;
+    providerFamily?: string;
+    model?: string;
+  };
+  availableSdks: readonly ExecutionPoolSdkSummary[];
+  learnedKnowledge?: readonly LearnedModelTierRecord[];
+}): ExecutionPoolRecommendationsResult {
+  const learnedKnowledge = input.learnedKnowledge ?? [];
+  const normalizedBrainProvider = normalizeModelTierKnowledgeProvider(input.currentBrain.provider);
+  const brainFamily = input.currentBrain.providerFamily?.trim()
+    || resolvePeerAuditProviderFamily({ agentType: input.currentBrain.provider, providerId: input.currentBrain.provider });
+
+  const loggedInSdks = input.availableSdks.filter((sdk) => sdk.loggedIn);
+  const brainSdk = input.availableSdks.find(
+    (sdk) => sdk.provider === input.currentBrain.provider || normalizeModelTierKnowledgeProvider(sdk.provider) === normalizedBrainProvider,
+  ) ?? loggedInSdks.find((sdk) => sdk.providerFamily === brainFamily);
+
+  const primarySdk: ExecutionPoolSdkSummary = brainSdk ?? {
+    provider: input.currentBrain.provider,
+    providerFamily: brainFamily,
+    loggedIn: true,
+    models: input.currentBrain.model ? [input.currentBrain.model] : [],
+    tiers: input.currentBrain.model ? { secondary: input.currentBrain.model, flagship: input.currentBrain.model } : {},
+    unknownModels: [],
+    source: 'session_observed',
+  };
+
+  const unknownModels: Array<{ provider: string; model: string }> = [];
+  for (const sdk of input.availableSdks) {
+    if (!sdk.loggedIn && sdk.provider !== primarySdk.provider) continue;
+    for (const model of sdk.unknownModels) {
+      unknownModels.push({ provider: sdk.provider, model });
+    }
+  }
+  const needsModelResearch = unknownModels.length > 0;
+
+  const isEconomy = isModelEconomyTier(primarySdk.provider, input.currentBrain.model, primarySdk, learnedKnowledge);
+  const recommendedBrainModel = primarySdk.tiers.flagship ?? primarySdk.tiers.secondary;
+  const brainModelHint = isEconomy && recommendedBrainModel && recommendedBrainModel !== input.currentBrain.model
+    ? `Current Brain model (${input.currentBrain.model}) is economy-tier; consider switching Brain to ${recommendedBrainModel} for stronger planning and supervision.`
+    : undefined;
+
+  const crossVendorCandidates = loggedInSdks
+    .filter((sdk) => sdk.providerFamily !== primarySdk.providerFamily && Boolean(sdk.tiers.secondary || sdk.tiers.flagship))
+    .sort((a, b) => sdkPreferenceScore(b) - sdkPreferenceScore(a));
+
+  const primaryExecModel = primarySdk.tiers.secondary ?? primarySdk.tiers.flagship;
+  const primaryFlagModel = primarySdk.tiers.flagship ?? primarySdk.tiers.secondary;
+  const economySdk = primarySdk.tiers.economy ? primarySdk : crossVendorCandidates.find((sdk) => Boolean(sdk.tiers.economy));
+  const economyEntries: ExecutionPoolRecommendationPresetEntry[] = economySdk?.tiers.economy
+    ? [{ provider: economySdk.provider, model: economySdk.tiers.economy, role: 'both', enabled: true }]
+    : [];
+
+  const recommendedPresets: ExecutionPoolRecommendationPreset[] = [];
+  if (primaryExecModel) {
+    if (crossVendorCandidates.length > 0) {
+      const crossSdk = crossVendorCandidates[0]!;
+      const crossSecModel = crossSdk.tiers.secondary ?? crossSdk.tiers.flagship!;
+      const crossFlagModel = crossSdk.tiers.flagship ?? crossSecModel;
+
+      recommendedPresets.push({
+        id: 'balanced_cross_vendor',
+        recommended: true,
+        label: `Balanced Cross-SDK (${primarySdk.provider} ${primaryExecModel} + ${crossSdk.provider} ${crossSecModel})`,
+        description: `Execute with ${primarySdk.provider} (${primaryExecModel}), cross-vendor audit with ${crossSdk.provider} (${crossSecModel}), and route routine tasks to economy tier.`,
+        primaryEntries: [
+          { provider: primarySdk.provider, model: primaryExecModel, role: 'executor', enabled: true },
+          { provider: crossSdk.provider, model: crossSecModel, role: 'auditor', enabled: true },
+        ],
+        economyEntries,
+        autoPairingEnabled: true,
+        auditByDefault: true,
+        ...(brainModelHint ? { brainModelHint } : {}),
+        ...(needsModelResearch ? { needsModelResearch: true } : {}),
+      });
+
+      if (crossFlagModel !== crossSecModel) {
+        recommendedPresets.push({
+          id: 'strong_cross_vendor_audit',
+          recommended: false,
+          label: `Strong Cross-SDK Audit (${primarySdk.provider} ${primaryExecModel} + ${crossSdk.provider} ${crossFlagModel})`,
+          description: `Execute with ${primarySdk.provider} (${primaryExecModel}) and use flagship ${crossSdk.provider} (${crossFlagModel}) for stricter independent audit.`,
+          primaryEntries: [
+            { provider: primarySdk.provider, model: primaryExecModel, role: 'executor', enabled: true },
+            { provider: crossSdk.provider, model: crossFlagModel, role: 'auditor', enabled: true },
+          ],
+          economyEntries,
+          autoPairingEnabled: true,
+          auditByDefault: true,
+          ...(brainModelHint ? { brainModelHint } : {}),
+          ...(needsModelResearch ? { needsModelResearch: true } : {}),
+        });
+      }
+
+      recommendedPresets.push({
+        id: 'same_vendor_balanced',
+        recommended: false,
+        label: `Single-SDK Balanced (${primarySdk.provider} ${primaryExecModel})`,
+        description: `Use ${primarySdk.provider} (${primaryExecModel}) for both execution and independent same-vendor audit sessions to save quota on other SDKs.`,
+        primaryEntries: [
+          { provider: primarySdk.provider, model: primaryExecModel, role: 'both', enabled: true },
+        ],
+        economyEntries,
+        autoPairingEnabled: true,
+        auditByDefault: true,
+        ...(brainModelHint ? { brainModelHint } : {}),
+        ...(needsModelResearch ? { needsModelResearch: true } : {}),
+      });
+    } else {
+      recommendedPresets.push({
+        id: 'same_vendor_balanced',
+        recommended: true,
+        label: `Same-Vendor Balanced (${primarySdk.provider} ${primaryExecModel})`,
+        description: `Only ${primarySdk.provider} is logged in; automatically configured for same-vendor independent audit with ${primaryExecModel}.`,
+        primaryEntries: [
+          { provider: primarySdk.provider, model: primaryExecModel, role: 'both', enabled: true },
+        ],
+        economyEntries,
+        autoPairingEnabled: true,
+        auditByDefault: true,
+        ...(brainModelHint ? { brainModelHint } : {}),
+        ...(needsModelResearch ? { needsModelResearch: true } : {}),
+      });
+
+      if (primaryFlagModel && primaryFlagModel !== primaryExecModel) {
+        recommendedPresets.push({
+          id: 'same_vendor_strong_audit',
+          recommended: false,
+          label: `Same-Vendor Strong Audit (${primarySdk.provider} ${primaryExecModel} + ${primaryFlagModel})`,
+          description: `Only ${primarySdk.provider} is logged in; execute with ${primaryExecModel} and audit with flagship ${primaryFlagModel}.`,
+          primaryEntries: [
+            { provider: primarySdk.provider, model: primaryExecModel, role: 'executor', enabled: true },
+            { provider: primarySdk.provider, model: primaryFlagModel, role: 'auditor', enabled: true },
+          ],
+          economyEntries,
+          autoPairingEnabled: true,
+          auditByDefault: true,
+          ...(brainModelHint ? { brainModelHint } : {}),
+          ...(needsModelResearch ? { needsModelResearch: true } : {}),
+        });
+      }
+    }
+  }
+
+  return {
+    currentBrain: {
+      provider: primarySdk.provider,
+      providerFamily: primarySdk.providerFamily,
+      ...(input.currentBrain.model ? { model: input.currentBrain.model } : {}),
+      isEconomy,
+    },
+    availableSdks: [...input.availableSdks],
+    unknownModels,
+    needsModelResearch,
+    recommendedPresets,
+    customAllowed: true,
+    ...(brainModelHint ? { brainModelHint } : {}),
   };
 }

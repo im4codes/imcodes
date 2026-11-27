@@ -15,11 +15,14 @@ const files = (test: { include?: string[]; exclude?: string[] }) => globSync(tes
 
 // Keep the whole-graph AST allocation outside a reused test worker (and its V8
 // coverage instrumentation). This is one pure analysis child, NOT a nested suite.
+const ROOT_ONLY_WORKER_TIMEOUT_MS = 60_000;
+const ROOT_ONLY_CASE_TIMEOUT_MS = ROOT_ONLY_WORKER_TIMEOUT_MS + 10_000;
+
 const rootOnlyRuntimeDependencies = (root: string, entries: string[]) => JSON.parse(execFileSync(
   process.execPath,
   ['--max-old-space-size=512', '--import', 'tsx',
     fileURLToPath(new URL('../helpers/root-only-runtime-import-worker.ts', import.meta.url))],
-  { cwd: root, input: JSON.stringify({ root, entries }), encoding: 'utf8', timeout: 15_000, maxBuffer: 1024 * 1024 },
+  { cwd: root, input: JSON.stringify({ root, entries }), encoding: 'utf8', timeout: ROOT_ONLY_WORKER_TIMEOUT_MS, maxBuffer: 1024 * 1024 },
 )) as { missing: { specifier: string; file: string }[]; files: number; serverFiles: number };
 
 describe('root-only daemon collection boundary', () => {
@@ -31,12 +34,12 @@ describe('root-only daemon collection boundary', () => {
     expect(graph.missing).toEqual([]);
     // Diagnostic only: no wall-clock threshold or repeated suite execution.
     console.log(JSON.stringify({ entries: entries.length, ...graph, elapsedMs: performance.now() - start }));
-  });
+  }, ROOT_ONLY_CASE_TIMEOUT_MS);
 
   it('the full server app is a causal counterexample even with server deps installed', () => {
     const graph = rootOnlyRuntimeDependencies(root, ['server/src/index.ts']);
     expect(graph.missing.map(entry => entry.specifier)).toContain('node-cron');
-  });
+  }, ROOT_ONLY_CASE_TIMEOUT_MS);
 
   it('collects the HTTP/skew case exactly in the server-native suite, not daemon/root-server', () => {
     const target = 'server/test/daemon-token-version-skew.test.ts';

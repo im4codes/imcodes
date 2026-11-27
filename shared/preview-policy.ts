@@ -1,4 +1,4 @@
-import { COOKIE_CSRF, COOKIE_SESSION } from './cookie-names.js';
+import { COOKIE_CSRF, COOKIE_PREVIEW_ACCESS, COOKIE_SESSION } from './cookie-names.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from './preview-types.js';
 
 export const PREVIEW_SENSITIVE_HEADERS = new Set([
@@ -41,7 +41,7 @@ export const PREVIEW_EMBED_STRIP_RESPONSE_HEADERS = new Set([
 
 export const PREVIEW_COOKIE_PREFIX = '__imc_preview_';
 
-const RESERVED_COOKIE_NAMES = new Set([COOKIE_SESSION, COOKIE_CSRF]);
+const RESERVED_COOKIE_NAMES = new Set([COOKIE_SESSION, COOKIE_CSRF, COOKIE_PREVIEW_ACCESS]);
 
 export function redactPreviewHeaders(headers: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -128,6 +128,55 @@ const WS_UPGRADE_PRESERVE_HEADERS = new Set([
 const WS_UPGRADE_STRIP_HEADERS = new Set([
   'sec-websocket-extensions',
 ]);
+
+// Headers managed by the daemon's WebSocket client (`ws`) during upstream handshake,
+// plus privacy/origin headers overridden or stripped for upstream loopback isolation.
+const WS_UPSTREAM_SKIP_HEADERS = new Set([
+  'host',
+  'origin',
+  'referer',
+  'content-length',
+  'sec-websocket-key',
+  'sec-websocket-version',
+  'sec-websocket-protocol',
+  'sec-websocket-extensions',
+  'connection',
+  'upgrade',
+]);
+
+/**
+ * RFC 6455 sendable Close frame status codes (excl. 1004, 1005, 1006, 1015).
+ * Abnormal codes like 1006 throw RangeError if passed to `ws.close(code)`.
+ */
+export function isSendableWsCloseCode(code: unknown): code is number {
+  if (typeof code !== 'number' || !Number.isInteger(code)) return false;
+  if (code === 1000) return true;
+  if (code >= 1001 && code <= 1014) {
+    return code !== 1004 && code !== 1005 && code !== 1006;
+  }
+  return code >= 3000 && code <= 4999;
+}
+
+/**
+ * Build upstream headers for the daemon's WebSocket connection to `127.0.0.1:<port>`.
+ * Forwards safe sanitized request headers (including mapped `cookie`, `user-agent`,
+ * custom `x-*` headers), strips hop-by-hop/WS-handshake headers managed by `ws`,
+ * forces `host: 127.0.0.1:<port>`, and rewrites `origin` to `http://127.0.0.1:<port>`
+ * so local dev servers (Vite, Next.js, Django, Jupyter, etc.) accept the upgrade.
+ */
+export function buildUpstreamWsHeaders(input: Record<string, string>, port: number): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [rawName, value] of Object.entries(input)) {
+    const name = rawName.toLowerCase();
+    if (WS_UPSTREAM_SKIP_HEADERS.has(name)) continue;
+    if (PREVIEW_STRIP_REQUEST_HEADERS.has(name)) continue;
+    if (PREVIEW_HOP_BY_HOP_HEADERS.has(name)) continue;
+    out[name] = value;
+  }
+  out.host = `127.0.0.1:${port}`;
+  out.origin = `http://127.0.0.1:${port}`;
+  return out;
+}
 
 export function isWebSocketUpgrade(headers: Headers): boolean {
   return headers.get('upgrade')?.toLowerCase() === 'websocket';

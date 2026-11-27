@@ -10,7 +10,7 @@ import {
 import {
   AGY_SDK_PROVIDER_ID, AGY_CLI_BINARY, AGY_CLI_FLAG, AGY_NATIVE_START_NOT_ATTEMPTED,
   AGY_ACP_AGENT_NAME, AGY_ACP_COMMAND, AGY_DEFAULT_MODEL_ID, AGY_FALLBACK_MODEL_IDS,
-  normalizeAgyModelId,
+  normalizeAgyModelId, sanitizeAgyStartupModel,
 } from '../../../shared/agy-agent.js';
 import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 import { execFileOffMain } from '../../util/exec-helper.js';
@@ -88,7 +88,7 @@ export class AgyAcpProvider extends KimiSdkProvider {
 
   override async createSession(config: SessionConfig): Promise<string> {
     const barrier = config.beforeNativeSessionStart;
-    const normalizedAgentId = normalizeAgyModelId(config.agentId);
+    const normalizedAgentId = sanitizeAgyStartupModel(config.agentId);
     return super.createSession({ ...config, agentId: normalizedAgentId, ...(barrier ? {
       beforeNativeSessionStart: async () => {
         try { await barrier(); }

@@ -117,6 +117,10 @@ import {
   sendSubSessionSync,
 } from './subsession-sync.js';
 import {
+  onBackgroundQuotaChanged,
+  type BackgroundQuotaProviderKey,
+} from './quota-background-refresh.js';
+import {
   SUBSESSION_SYNC_BATCH_MAX_ITEMS,
   SUBSESSION_SYNC_BATCH_MSG,
   SUBSESSION_SYNC_REBUILD_CONCURRENCY,
@@ -2085,6 +2089,60 @@ export async function refreshMuseQuotaMetadataForSessions(serverLink?: ServerLin
   await syncSubSessionsForPeriodicRefresh(serverLink, museSessions);
 }
 
+let lastQuotaPushServerLink: ServerLink | null = null;
+const pendingBackgroundQuotaPushKeys = new Set<BackgroundQuotaProviderKey>();
+let backgroundQuotaPushTimer: ReturnType<typeof setTimeout> | null = null;
+
+function sessionMatchesBackgroundQuotaKey(
+  session: SessionRecord,
+  key: BackgroundQuotaProviderKey,
+): boolean {
+  switch (key) {
+    case 'claude-usage-quota':
+      return isClaudeCodeSdkAgentType(session.agentType);
+    case 'agy-usage-quota':
+      return session.agentType === AGY_SDK_PROVIDER_ID;
+    case 'grok-usage-quota':
+      return session.agentType === 'grok-sdk';
+    case 'muse-usage-quota':
+      return session.agentType === 'muse-code-sdk';
+    case 'qwen-runtime-config':
+      return session.agentType === 'qwen';
+  }
+}
+
+async function flushCoalescedBackgroundQuotaPush(): Promise<void> {
+  backgroundQuotaPushTimer = null;
+  const link = lastQuotaPushServerLink;
+  const keys = [...pendingBackgroundQuotaPushKeys];
+  pendingBackgroundQuotaPushKeys.clear();
+  if (!link || keys.length === 0) return;
+
+  const matching = listSessions().filter((s) =>
+    keys.some((key) => sessionMatchesBackgroundQuotaKey(s, key)),
+  );
+  if (matching.length === 0) return;
+
+  if (matching.some((s) => !s.name.startsWith('deck_sub_'))) {
+    await handleGetSessions(link).catch(() => {});
+  }
+  const eligibleSubs = matching.filter(
+    (s) => s.name.startsWith('deck_sub_') && s.state !== 'stopped' && s.state !== 'error',
+  );
+  if (eligibleSubs.length > 0) {
+    await syncSubSessionsForPeriodicRefresh(link, eligibleSubs).catch(() => {});
+  }
+}
+
+onBackgroundQuotaChanged((key) => {
+  pendingBackgroundQuotaPushKeys.add(key);
+  if (backgroundQuotaPushTimer) return;
+  backgroundQuotaPushTimer = setTimeout(() => {
+    void flushCoalescedBackgroundQuotaPush();
+  }, 0);
+  backgroundQuotaPushTimer.unref?.();
+});
+
 // ── @@ token parsing ─────────────────────────────────────────────────────────
 
 /**
@@ -2312,6 +2370,7 @@ export function setRouterContext(ctx: RouterContext): void {
 }
 
 export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
+  lastQuotaPushServerLink = serverLink;
   const cmd = msg && typeof msg === 'object' ? msg as Record<string, unknown> : {};
   const name = resolveSessionCommandName(cmd)
     ?? (cmd.type === 'subsession.start' && typeof cmd.id === 'string' && cmd.id ? subSessionName(cmd.id) : undefined)
@@ -3673,7 +3732,8 @@ async function applyTransportModelSwitch(
         transportRuntime?.setSystemPrompt(presetOverrides.systemPrompt ?? '');
       }
     } else {
-      selectedModel = normalizeClaudeCodeModelId(requestedModel);
+      const { resolveClaudeExecutionModelForSwitch } = await import('../../shared/supervision-execution-pool.js');
+      selectedModel = resolveClaudeExecutionModelForSwitch(requestedModel);
     }
     if (!selectedModel) {
       return refuse(
@@ -7270,6 +7330,7 @@ async function handleResize(cmd: Record<string, unknown>): Promise<void> {
 }
 
 async function handleGetSessions(serverLink: ServerLink): Promise<void> {
+  lastQuotaPushServerLink = serverLink;
   const sessions = await buildSessionList();
   try {
     serverLink.send({ type: 'session_list', daemonVersion: serverLink.daemonVersion, sessions });

@@ -791,4 +791,58 @@ describe('AG provider-switch failure recovery', () => {
       await stopTransportRuntimeSession(displaySubName).catch(() => {});
     }
   });
+
+  it('sanitizes foreign SDK requestedModel across relaunchSessionWithSettings and persisted AGY restore', async () => {
+    await acp('legacy-flash-default');
+    const name = names[0];
+    store.upsertSession({
+      name,
+      projectName: 'realproj',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      providerId: 'codex-sdk',
+      runtimeType: 'transport',
+      providerSessionId: 'codex-route',
+      codexSessionId: 'codex-thread-1',
+      requestedModel: 'gpt-6-sol',
+      activeModel: 'gpt-6-sol',
+      projectDir: home,
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    });
+
+    await relaunchSessionWithSettings(store.getSession(name)!, {
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestedModel: 'gpt-6-sol',
+      identityPrompt: 'fixture',
+    });
+    expect(store.getSession(name)?.requestedModel).toBeUndefined();
+    expect(store.getSession(name)?.activeModel).toBeUndefined();
+    await send(name, 'after-cross-sdk-switch');
+    expect(store.getSession(name)?.activeModel).toBe('gemini-4-hydrogen-high');
+
+    const switchedNativeId = store.getSession(name)!.providerResumeId!;
+    expect(rows().filter((row) => row.method === 'session/set_model' && row.params.modelId === 'gpt-6-sol')).toHaveLength(0);
+
+    // Also heal any legacy persisted AGY record carrying a foreign model before restore.
+    await stopTransportRuntimeSession(name);
+    store.upsertSession({
+      ...store.getSession(name)!,
+      requestedModel: 'opus',
+      activeModel: 'opus',
+      modelDisplay: 'opus',
+      state: 'idle',
+    });
+    await restoreTransportSessions(AGY_SDK_PROVIDER_ID, { sessionName: name, interSessionDelayMs: 0 });
+    expect(store.getSession(name)?.requestedModel).toBeUndefined();
+    expect(store.getSession(name)?.activeModel).toBe('gemini-4-hydrogen-high');
+    await send(name, 'after-healed-restore');
+    const restoredModels = rows()
+      .filter((row) => row.method === 'session/set_model' && row.params.sessionId === switchedNativeId)
+      .map((row) => row.params.modelId);
+    expect(restoredModels).toEqual(['gemini-4-hydrogen-high', 'gemini-4-hydrogen-high']);
+  });
 });

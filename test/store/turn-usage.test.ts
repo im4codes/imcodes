@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
 import {
   recordTurnUsage,
   summarizeTurnUsage,
@@ -15,6 +17,9 @@ import {
   selectTurnUsageSyncBatch,
 } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+
+const require = createRequire(import.meta.url);
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 /**
  * Per-turn SDK usage telemetry — daemon mirrors every `usage.update` timeline
@@ -398,5 +403,197 @@ describe('turn usage server sync metadata', () => {
     });
     expect(retryBatch).toHaveLength(2);
     expect(retryBatch.every((row) => row.lastErrorReason === 'in_flight_stale')).toBe(true);
+  });
+
+  it('skips full-table COUNT(*) on steady-state selectTurnUsageSyncBatch after backfill alignment', () => {
+    const dbPath = join(tempDir, 'context.sqlite');
+    // Seed a single row to ensure schema exists, then bulk insert 2,500 synced usage rows externally.
+    recordTurnUsage({ sessionName: 'seed', model: 'm', inputTokens: 1, outputTokens: 1, eventId: 'seed-0', createdAt: 100 });
+    const seedBatch = selectTurnUsageSyncBatch({ limit: 10, now: 100 });
+    recordTurnUsageSyncResults({
+      now: 100,
+      results: [{ usageFactId: seedBatch[0].usageFactId, status: 'accepted' }],
+    });
+
+    const ext = new DatabaseSync(dbPath);
+    const authorityId = getOrCreateUsageAuthorityId();
+    const insertUsage = ext.prepare(`
+      INSERT INTO context_turn_usage (
+        created_at, session_name, agent_type, model,
+        input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id,
+        provider, session_kind, parent_session_name, metadata_completeness, cost_usd_micros
+      ) VALUES (?, ?, 'codex-sdk', 'gpt-5', 10, 0, 5, 200000, NULL, ?, 'openai', 'main', NULL, 'complete', NULL)
+    `);
+    const insertSync = ext.prepare(`
+      INSERT INTO context_turn_usage_sync (
+        turn_usage_rowid, usage_authority_id, usage_fact_id, payload_hash,
+        sync_status, retry_count, metadata_completeness, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, ?, 'accepted', 0, 'complete', ?, ?)
+    `);
+    ext.exec('BEGIN');
+    for (let i = 1; i <= 2500; i += 1) {
+      const info = insertUsage.run(1_000 + i, 'bulk', `bulk-${i}`) as { lastInsertRowid: number | bigint };
+      const rowid = Number(info.lastInsertRowid);
+      insertSync.run(rowid, authorityId, `usage:${authorityId}:evt:bulk:${i}`, `hash-${i}`, 1_000 + i, 1_000 + i);
+    }
+    ext.exec('COMMIT');
+    ext.close();
+
+    const prepareSpy = vi.spyOn(DatabaseSync.prototype, 'prepare');
+    try {
+      // Cold check after external commit verifies gap once via LEFT JOIN (zero COUNT(*) scans) and warms the cache.
+      expect(selectTurnUsageSyncBatch({ limit: 50, now: 10_000 })).toEqual([]);
+      expect(prepareSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('SELECT COUNT(*)'))).toHaveLength(0);
+      expect(prepareSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('LEFT JOIN context_turn_usage_sync'))).toHaveLength(1);
+
+      prepareSpy.mockClear();
+      // Subsequent steady-state polls and same-connection atomic writes skip both COUNT(*) and LEFT JOIN scans completely.
+      recordTurnUsage({
+        sessionName: 'steady',
+        model: 'gpt-5',
+        inputTokens: 42,
+        outputTokens: 8,
+        eventId: 'steady-live-1',
+        createdAt: 20_000,
+      });
+      const liveBatch = selectTurnUsageSyncBatch({ limit: 50, now: 20_000 });
+      expect(liveBatch).toHaveLength(1);
+      expect(liveBatch[0].fact.sourceEventId).toBe('steady-live-1');
+      recordTurnUsageSyncResults({
+        now: 20_000,
+        results: [{ usageFactId: liveBatch[0].usageFactId, status: 'accepted' }],
+      });
+      expect(selectTurnUsageSyncBatch({ limit: 50, now: 20_100 })).toEqual([]);
+
+      expect(prepareSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('SELECT COUNT(*)'))).toHaveLength(0);
+      expect(prepareSpy.mock.calls.filter(([sql]) => typeof sql === 'string' && sql.includes('LEFT JOIN context_turn_usage_sync'))).toHaveLength(0);
+    } finally {
+      prepareSpy.mockRestore();
+    }
+  });
+
+  it('recovers missing usage rows when an external connection leaves orphan sync rows with foreign_keys=OFF (warm cache and after reopen)', () => {
+    const dbPath = join(tempDir, 'context.sqlite');
+    for (const evt of ['id-1', 'id-2', 'id-3', 'id-4']) {
+      recordTurnUsage({ sessionName: 's', model: 'm', inputTokens: 1, outputTokens: 1, eventId: evt, createdAt: 100 });
+    }
+    const seedBatch = selectTurnUsageSyncBatch({ limit: 10, now: 100 });
+    recordTurnUsageSyncResults({
+      now: 100,
+      results: seedBatch.map((row) => ({ usageFactId: row.usageFactId, status: 'accepted' })),
+    });
+    // Warm the steady-state cache: usage [1,2,3,4], sync [1,2,3,4].
+    expect(selectTurnUsageSyncBatch({ limit: 10, now: 200 })).toEqual([]);
+
+    // External connection with foreign_keys=OFF creates usage=[2,3,4], sync=[1,3,4]:
+    // row 1 in sync is an orphan, row 2 in usage lacks sync, counts are equal (3 === 3), newest row 4 has sync.
+    const ext = new DatabaseSync(dbPath);
+    ext.exec('PRAGMA foreign_keys = OFF; BEGIN;');
+    ext.exec('DELETE FROM context_turn_usage WHERE id = 1;');
+    ext.exec('DELETE FROM context_turn_usage_sync WHERE turn_usage_rowid = 2;');
+    ext.exec('COMMIT;');
+    ext.close();
+
+    // 1) Warm cache invalidated via PRAGMA data_version -> direct LEFT JOIN probe finds and restores id=2.
+    const warmRecovered = selectTurnUsageSyncBatch({ limit: 10, now: 300 });
+    expect(warmRecovered.map((r) => r.turnUsageRowid)).toEqual([2]);
+    expect(warmRecovered[0].fact.sourceEventId).toBe('id-2');
+
+    // 2) Reproduce the exact same [2,3,4] vs [1,3,4] skewed state across DB close/reopen (cold start).
+    const extReopen = new DatabaseSync(dbPath);
+    extReopen.exec('PRAGMA foreign_keys = OFF; DELETE FROM context_turn_usage_sync WHERE turn_usage_rowid = 2;');
+    extReopen.close();
+    resetContextStoreForTests();
+
+    const reopenRecovered = selectTurnUsageSyncBatch({ limit: 10, now: 400 });
+    expect(reopenRecovered.map((r) => r.turnUsageRowid)).toEqual([2]);
+    expect(reopenRecovered[0].fact.sourceEventId).toBe('id-2');
+  });
+
+  it('invalidates warm cache via PRAGMA data_version when an external connection inserts an orphan before a higher synced row', () => {
+    const dbPath = join(tempDir, 'context.sqlite');
+    recordTurnUsage({ sessionName: 'init', model: 'm', inputTokens: 1, outputTokens: 1, eventId: 'init-1', createdAt: 100 });
+    const initBatch = selectTurnUsageSyncBatch({ limit: 10, now: 100 });
+    recordTurnUsageSyncResults({
+      now: 100,
+      results: [{ usageFactId: initBatch[0].usageFactId, status: 'accepted' }],
+    });
+    // Establish warm cache.
+    expect(selectTurnUsageSyncBatch({ limit: 10, now: 200 })).toEqual([]);
+
+    // External connection inserts orphan row (N+1) without sync, then inserts a synced row (N+2).
+    const ext = new DatabaseSync(dbPath);
+    const authorityId = getOrCreateUsageAuthorityId();
+    ext.exec('BEGIN');
+    const orphanRes = ext.prepare(`
+      INSERT INTO context_turn_usage (
+        created_at, session_name, agent_type, model,
+        input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id,
+        provider, session_kind, parent_session_name, metadata_completeness, cost_usd_micros
+      ) VALUES (300, 'orphan-session', 'codex-sdk', 'gpt-5', 7, 0, 3, 200000, NULL, 'orphan-evt', 'openai', 'main', NULL, 'complete', NULL)
+    `).run() as { lastInsertRowid: number | bigint };
+    const newerRes = ext.prepare(`
+      INSERT INTO context_turn_usage (
+        created_at, session_name, agent_type, model,
+        input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id,
+        provider, session_kind, parent_session_name, metadata_completeness, cost_usd_micros
+      ) VALUES (400, 'newer-synced', 'codex-sdk', 'gpt-5', 9, 0, 1, 200000, NULL, 'newer-evt', 'openai', 'main', NULL, 'complete', NULL)
+    `).run() as { lastInsertRowid: number | bigint };
+    const newerId = Number(newerRes.lastInsertRowid);
+    ext.prepare(`
+      INSERT INTO context_turn_usage_sync (
+        turn_usage_rowid, usage_authority_id, usage_fact_id, payload_hash,
+        sync_status, retry_count, metadata_completeness, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, 'hash-newer', 'accepted', 0, 'complete', 400, 400)
+    `).run(newerId, authorityId, `usage:${authorityId}:evt:newer:${newerId}`);
+    ext.exec('COMMIT');
+    ext.close();
+
+    // Must not mask orphan-evt behind newer-evt!
+    const recovered = selectTurnUsageSyncBatch({ limit: 10, now: 500 });
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0].turnUsageRowid).toBe(Number(orphanRes.lastInsertRowid));
+    expect(recovered[0].fact.sourceEventId).toBe('orphan-evt');
+  });
+
+  it('re-verifies backfill after DB close/reset and rolls back context_turn_usage atomically if sync write fails', () => {
+    const dbPath = join(tempDir, 'context.sqlite');
+    recordTurnUsage({ sessionName: 's1', model: 'm', inputTokens: 1, outputTokens: 1, eventId: 's1-1', createdAt: 100 });
+    const first = selectTurnUsageSyncBatch({ limit: 10, now: 100 });
+    recordTurnUsageSyncResults({
+      now: 100,
+      results: [{ usageFactId: first[0].usageFactId, status: 'accepted' }],
+    });
+    expect(selectTurnUsageSyncBatch({ limit: 10, now: 200 })).toEqual([]);
+
+    // Inject sync table failure via trigger and confirm recordTurnUsage rolls back context_turn_usage atomically.
+    const ext = new DatabaseSync(dbPath);
+    ext.exec(`
+      CREATE TRIGGER fail_sync_insert BEFORE INSERT ON context_turn_usage_sync
+      BEGIN
+        SELECT RAISE(ABORT, 'injected_sync_failure');
+      END;
+    `);
+    ext.close();
+
+    recordTurnUsage({ sessionName: 'rolled-back', model: 'm', inputTokens: 5, outputTokens: 5, eventId: 'rb-1', createdAt: 300 });
+    expect(summarizeTurnUsage().total).toBe(1);
+
+    // Drop trigger, insert external raw row, and reopen DB via resetContextStoreForTests.
+    const cleanupExt = new DatabaseSync(dbPath);
+    cleanupExt.exec('DROP TRIGGER fail_sync_insert;');
+    cleanupExt.prepare(`
+      INSERT INTO context_turn_usage (
+        created_at, session_name, agent_type, model,
+        input_tokens, cache_tokens, output_tokens, context_window, cost_usd, event_id,
+        provider, session_kind, parent_session_name, metadata_completeness, cost_usd_micros
+      ) VALUES (400, 'post-reset-orphan', 'codex-sdk', 'gpt-5', 2, 0, 2, 200000, NULL, 'post-reset-evt', 'openai', 'main', NULL, 'complete', NULL)
+    `).run();
+    cleanupExt.close();
+
+    resetContextStoreForTests();
+    const afterReopen = selectTurnUsageSyncBatch({ limit: 10, now: 500 });
+    expect(afterReopen).toHaveLength(1);
+    expect(afterReopen[0].fact.sourceEventId).toBe('post-reset-evt');
   });
 });

@@ -63,4 +63,28 @@ describe('Android FCM package split contract', () => {
     expect(withoutFcmPro).toContain('-dontwarn com.google.android.gms.common.api.ApiException');
     expect(withoutFcmPro).toContain('-dontwarn com.google.android.gms.common.api.Status');
   });
+
+  it('isolates BackgroundPushService and sensitive permissions strictly to withoutFcm manifest', () => {
+    const mainManifest = read('web/android/app/src/main/AndroidManifest.xml');
+    const withFcmManifest = read('web/android/app/src/withFcm/AndroidManifest.xml');
+    const withoutFcmManifest = read('web/android/app/src/withoutFcm/AndroidManifest.xml');
+    for (const token of [
+      'REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
+      'FOREGROUND_SERVICE_REMOTE_MESSAGING',
+      'BackgroundPushService',
+      'BackgroundPushBootReceiver',
+      'without_fcm_backup_rules',
+      'without_fcm_data_extraction_rules',
+    ]) {
+      expect(mainManifest).not.toContain(token);
+      expect(withFcmManifest).not.toContain(token);
+      expect(withoutFcmManifest).toContain(token);
+    }
+    const backupRules = read('web/android/app/src/withoutFcm/res/xml/without_fcm_backup_rules.xml');
+    const dataExtractionRules = read('web/android/app/src/withoutFcm/res/xml/without_fcm_data_extraction_rules.xml');
+    expect(backupRules).toContain('imcodes_bg_push_prefs.xml');
+    expect(dataExtractionRules).toContain('<cloud-backup>');
+    expect(dataExtractionRules).toContain('<device-transfer>');
+    expect(dataExtractionRules).toContain('imcodes_bg_push_prefs.xml');
+  });
 });

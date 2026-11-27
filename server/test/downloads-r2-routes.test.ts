@@ -732,4 +732,78 @@ describe('two-channel R2 distribution, /api/downloads/latest, and Linux/macOS RD
       version: serverVersion,
     })).toBeNull();
   });
+
+  it('supports ?resolve=json on /api/downloads/latest/:target for redirects, local streams, and 404s without altering default responses', async () => {
+    const dir = makeTempDir('imcodes-downloads-resolve-json-');
+    const version = '2026.11.7088';
+    const { pkgBytes, manifest } = writeDesktopAndRdFixtures(dir, version);
+    setR2ManifestFetchForTests(async () => new Response(JSON.stringify(manifest), { status: 200 }));
+
+    const makeAppWithEnv = (extraEnv: Partial<Env>) => {
+      const app = new Hono<{ Bindings: Env }>();
+      app.use('*', async (c, next) => {
+        (c as unknown as { env: Record<string, unknown> }).env = {
+          CONTROLLED_NODE_ARTIFACT_R2_BASE_URL: 'https://cdn.imcodes.example',
+          CONTROLLED_NODE_ARTIFACT_R2_PREFIX: 'releases',
+          ...extraEnv,
+        };
+        await next();
+      });
+      app.route('/api/downloads', createDownloadsRoutes(() => dir));
+      return app;
+    };
+
+    const expectedMacUrl = `https://cdn.imcodes.example/releases/master/imcodes-desktop-${version}-darwin-arm64.pkg?v=${manifest.artifacts['desktop-installer-pkg:mac:arm64'].sha256.slice(0, 16)}`;
+    const r2App = makeAppWithEnv({});
+    const macResolveRes = await r2App.request('/api/downloads/latest/desktop-mac?resolve=json');
+    expect(macResolveRes.status).toBe(200);
+    expect(macResolveRes.headers.get('location')).toBeNull();
+    expect(await macResolveRes.json()).toEqual({
+      ok: true,
+      mode: 'redirect',
+      url: expectedMacUrl,
+    });
+
+    const androidResolveRes = await r2App.request('/api/downloads/latest/android-with-fcm?resolve=json');
+    expect(androidResolveRes.status).toBe(200);
+    expect(await androidResolveRes.json()).toEqual({
+      ok: true,
+      mode: 'redirect',
+      url: 'https://cdn.imcodes.example/releases/master/android/imcodes-with-fcm-latest.apk',
+    });
+
+    const crossChannelDefault = await r2App.request('/api/downloads/latest/desktop-win?channel=dev');
+    expect(crossChannelDefault.status).toBe(302);
+    const crossChannelResolveRes = await r2App.request('/api/downloads/latest/desktop-win?channel=dev&resolve=json');
+    expect(crossChannelResolveRes.status).toBe(200);
+    expect(await crossChannelResolveRes.json()).toEqual({
+      ok: true,
+      mode: 'redirect',
+      url: crossChannelDefault.headers.get('location'),
+    });
+
+    // Default (no resolve=json) still returns 302
+    const macDefaultRes = await r2App.request('/api/downloads/latest/desktop-mac');
+    expect(macDefaultRes.status).toBe(302);
+    expect(macDefaultRes.headers.get('location')).toBe(expectedMacUrl);
+
+    // Local verified stream mode returns mode: 'stream', closes handle, and still streams normally on regular GET
+    const localApp = makeAppWithEnv({ USE_R2_ARTIFACT: 'false' });
+    const localResolveRes = await localApp.request('/api/downloads/latest/desktop-mac?resolve=json');
+    expect(localResolveRes.status).toBe(200);
+    expect(await localResolveRes.json()).toEqual({
+      ok: true,
+      mode: 'stream',
+      url: null,
+    });
+
+    const localStreamRes = await localApp.request('/api/downloads/latest/desktop-mac');
+    expect(localStreamRes.status).toBe(200);
+    expect(localStreamRes.headers.get('content-type')).toBe('application/octet-stream');
+    expect(Buffer.from(await localStreamRes.arrayBuffer())).toEqual(pkgBytes);
+
+    // Unknown target returns 404 even with resolve=json
+    const missingRes = await localApp.request('/api/downloads/latest/unknown-target?resolve=json');
+    expect(missingRes.status).toBe(404);
+  });
 });

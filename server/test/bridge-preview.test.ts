@@ -145,24 +145,47 @@ describe('WsBridge preview relay', () => {
     expect(daemon.sentStrings.some((msg) => msg.includes(`"type":"${PREVIEW_MSG.ABORT}"`) && msg.includes('req-sse'))).toBe(false);
   });
 
-  it('times out an sse-style relay after idle timeout following response start', async () => {
+  it('keeps an sse-style relay alive past STREAM_IDLE_TIMEOUT_MS while non-SSE streams still time out on idle', async () => {
     vi.useFakeTimers();
     const { bridge, daemon } = await setupBridge();
-    const relay = bridge.createPreviewRelay('req-sse-idle', previewId, 25);
 
+    // 1) text/event-stream survives > 120_001ms silence without idle timeout, still delivers subsequent event.
+    const sseRelay = bridge.createPreviewRelay('req-sse-long-idle', previewId, 25);
     daemon.emit('message', Buffer.from(JSON.stringify({
       type: PREVIEW_MSG.RESPONSE_START,
-      requestId: 'req-sse-idle',
+      requestId: 'req-sse-long-idle',
       status: 200,
       headers: { 'content-type': 'text/event-stream' },
     })), false);
 
-    const started = await relay.start;
-    const reader = started.body.getReader();
+    const sseStarted = await sseRelay.start;
+    const sseReader = sseStarted.body.getReader();
+
+    vi.advanceTimersByTime(125_000);
+    daemon.emit('message', packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.RESPONSE_BODY, 'req-sse-long-idle', Buffer.from('data: after-long-think\n\n')), true);
+    const next = await sseReader.read();
+    expect(Buffer.from(next.value ?? []).toString()).toBe('data: after-long-think\n\n');
+    expect(daemon.sentStrings.some((msg) => msg.includes(`"type":"${PREVIEW_MSG.ABORT}"`) && msg.includes('req-sse-long-idle'))).toBe(false);
+
+    // Explicitly tearing down preview closes silent SSE cleanly.
+    bridge.terminatePreviewRelaysForPreview(previewId);
+    await expect(sseReader.read()).rejects.toThrow();
+
+    // 2) Non-SSE streaming (application/x-ndjson) STILL times out at 120_001ms after RESPONSE_START.
+    const ndjsonRelay = bridge.createPreviewRelay('req-ndjson-idle', previewId, 25);
+    daemon.emit('message', Buffer.from(JSON.stringify({
+      type: PREVIEW_MSG.RESPONSE_START,
+      requestId: 'req-ndjson-idle',
+      status: 200,
+      headers: { 'content-type': 'application/x-ndjson' },
+    })), false);
+
+    const ndjsonStarted = await ndjsonRelay.start;
+    const ndjsonReader = ndjsonStarted.body.getReader();
 
     vi.advanceTimersByTime(120_001);
-    await expect(reader.read()).rejects.toThrow('preview relay stream idle timeout');
-    expect(daemon.sentStrings.some((msg) => msg.includes(`"type":"${PREVIEW_MSG.ABORT}"`) && msg.includes('req-sse-idle'))).toBe(true);
+    await expect(ndjsonReader.read()).rejects.toThrow('preview relay stream idle timeout');
+    expect(daemon.sentStrings.some((msg) => msg.includes(`"type":"${PREVIEW_MSG.ABORT}"`) && msg.includes('req-ndjson-idle'))).toBe(true);
   });
 
   it('sends binary request body frames to daemon', async () => {

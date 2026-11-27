@@ -1234,4 +1234,78 @@ describe('local-daemon-control F1-F5 security & lifecycle boundaries', () => {
     expect(legacyChown).not.toHaveBeenCalled();
     expect(fallbackSpawned).toHaveLength(1);
   });
+
+  it('trims trailing newlines from macOS user-discovery commands when running as root instead of misreporting no_active_user', async () => {
+    const root = makeTempDir();
+    const home = join(root, 'Users', 'k');
+    const stateDir = join(home, '.imcodes');
+    const tempDir = join(root, 'var', 'folders', 'xx', 'T') + '/';
+    mkdirSync(stateDir, { recursive: true });
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(stateDir, 'server.json'), JSON.stringify({
+      serverId: 'srv_m3',
+      token: 'tok_m3',
+      workerUrl: 'https://app.example.test',
+    }));
+    writeFileSync(join(stateDir, 'daemon.pid'), `${process.pid}\n`);
+    writeFileSync(join(stateDir, 'daemon-runtime.json'), JSON.stringify({
+      pid: process.pid,
+      startedAt: Date.now() - 5_000,
+      updatedAt: Date.now(),
+      restartCount: 0,
+      version: '2026.11.7415-dev.7109',
+      serverLink: { state: 'connected', updatedAt: Date.now() },
+    }));
+    const bundleDir = createFakeBundle(join(root, 'mac-root'), '2026.11.7415-dev.7109', 'darwin');
+
+    const ctl = createLocalDaemonController({
+      platform: 'darwin',
+      env: {},
+      bundleDirs: [bundleDir],
+      currentUid: () => 0,
+      currentGid: () => 0,
+      isPidAlive: (pid) => pid === process.pid,
+      execText: async (file, args) => {
+        if (file === '/usr/bin/stat' && args.includes('%Su')) return { stdout: 'k\n', stderr: '' };
+        if (file === '/usr/bin/id' && args[0] === '-u') return { stdout: '503\n', stderr: '' };
+        if (file === '/usr/bin/id' && args[0] === '-g') return { stdout: '20\n', stderr: '' };
+        if (file === '/usr/bin/dscl') return { stdout: `NFSHomeDirectory: ${home}\n`, stderr: '' };
+        if (file === '/usr/bin/sudo' && args.includes('DARWIN_USER_TEMP_DIR')) return { stdout: `${tempDir}\n`, stderr: '' };
+        if (file === 'ps') return { stdout: `503 ${join(bundleDir, 'package', 'dist', 'src', 'index.js')} start --foreground\n`, stderr: '' };
+        if (file === '/bin/launchctl' && args[0] === 'print-disabled') {
+          return { stdout: '"imcodes.daemon" => false\n', stderr: '' };
+        }
+        return { stdout: '', stderr: '' };
+      },
+      killProcess: safeKillProcess,
+      spawnDetached: safeSpawnDetached,
+    });
+
+    const status = await ctl.status();
+    expect(status.reason).not.toBe(REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NO_ACTIVE_USER);
+    expect(status.userName).toBe('k');
+    expect(status.installed).toBe(true);
+    expect(status.bound).toBe(true);
+    expect(status.running).toBe(true);
+    expect(status.pid).toBe(process.pid);
+    expect(status.connectionState).toBe(REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED);
+
+    // Embedded newline injection still fails closed as no_active_user.
+    const ctlInjected = createLocalDaemonController({
+      platform: 'darwin',
+      env: {},
+      bundleDirs: [bundleDir],
+      currentUid: () => 0,
+      currentGid: () => 0,
+      isPidAlive: () => false,
+      execText: async (file, args) => {
+        if (file === '/usr/bin/stat' && args.includes('%Su')) return { stdout: 'k\nroot\n', stderr: '' };
+        return { stdout: '', stderr: '' };
+      },
+      killProcess: safeKillProcess,
+      spawnDetached: safeSpawnDetached,
+    });
+    const injectedStatus = await ctlInjected.status();
+    expect(injectedStatus.reason).toBe(REMOTE_DESKTOP_LOCAL_DAEMON_REASON.NO_ACTIVE_USER);
+  });
 });

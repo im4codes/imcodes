@@ -6,14 +6,14 @@ import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig, getGrokSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
-import { getClaudeUsageQuota } from '../agent/claude-usage-quota.js';
+import { getClaudeUsageQuota, peekClaudeUsageQuotaCached } from '../agent/claude-usage-quota.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
 import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
-import { fetchAgyUsageQuota } from '../agent/agy-usage-quota.js';
-import { getGrokUsageQuota } from '../agent/grok-usage-quota.js';
-import { getMuseUsageQuota } from '../agent/muse-usage-quota.js';
+import { fetchAgyUsageQuota, peekAgyUsageQuotaCached } from '../agent/agy-usage-quota.js';
+import { getGrokUsageQuota, peekGrokUsageQuotaCached } from '../agent/grok-usage-quota.js';
+import { getMuseUsageQuota, peekMuseUsageQuotaCached } from '../agent/muse-usage-quota.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { getTransportRuntime } from '../agent/session-manager.js';
@@ -25,6 +25,11 @@ import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 import type { SupervisionHeartbeatSnapshot } from '../../shared/supervision-heartbeat.js';
 import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
+import {
+  scheduleBackgroundQuotaRefresh,
+  serializeQuotaSnapshot,
+  serializeQwenRuntimeSnapshot,
+} from './quota-background-refresh.js';
 
 export interface SessionListItem extends SessionContextBootstrapState, SessionIncognitoConfig {
   name: string;
@@ -255,15 +260,47 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const needsAgySdkHydration = sessions.some((s) => s.agentType === 'agy-sdk');
   const needsGrokSdkHydration = sessions.some((s) => s.agentType === 'grok-sdk');
   const needsMuseSdkHydration = sessions.some((s) => s.agentType === 'muse-code-sdk');
-  const qwenRuntime = needsQwenHydration ? await getQwenRuntimeConfig().catch(() => null) : null;
+  const qwenRuntime = needsQwenHydration ? await getQwenRuntimeConfig({ probe: false }).catch(() => null) : null;
   const claudeSdkRuntime = needsClaudeSdkHydration ? await getClaudeSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
   const grokSdkRuntime = needsGrokSdkHydration ? await getGrokSdkRuntimeConfig().catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig) : null;
-  // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota pulled
-  // from /api/oauth/usage. null → fall back to the SDK rate_limit_event quota.
-  const claudeUsageQuota = needsClaudeSdkHydration ? await getClaudeUsageQuota().catch(() => null) : null;
-  const agyUsageQuota = needsAgySdkHydration ? await fetchAgyUsageQuota().catch(() => null) : null;
-  const grokUsageQuota = needsGrokSdkHydration ? await getGrokUsageQuota().catch(() => null) : null;
-  const museUsageQuota = needsMuseSdkHydration ? await getMuseUsageQuota().catch(() => null) : null;
+  // Strictly cache-first non-blocking quota reads; when stale or missing,
+  // refresh in background via each quota module's single-flight/TTL/backoff gates.
+  const claudeUsageQuota = needsClaudeSdkHydration ? peekClaudeUsageQuotaCached() : null;
+  const agyUsageQuota = needsAgySdkHydration ? peekAgyUsageQuotaCached() : null;
+  const grokUsageQuota = needsGrokSdkHydration ? peekGrokUsageQuotaCached() : null;
+  const museUsageQuota = needsMuseSdkHydration ? peekMuseUsageQuotaCached() : null;
+  if (needsQwenHydration && sessions.some((s) => s.agentType === 'qwen' && !s.ccPreset)) {
+    if (!qwenRuntime?.authLimit || qwenRuntime.authType === QWEN_AUTH_TYPES.UNKNOWN) {
+      scheduleBackgroundQuotaRefresh('qwen-runtime-config', () => getQwenRuntimeConfig({ probe: true }), {
+        beforeSnapshot: serializeQwenRuntimeSnapshot(qwenRuntime),
+        serializeResult: serializeQwenRuntimeSnapshot,
+      });
+    }
+  }
+  if (needsClaudeSdkHydration) {
+    scheduleBackgroundQuotaRefresh('claude-usage-quota', () => getClaudeUsageQuota(), {
+      beforeSnapshot: serializeQuotaSnapshot(claudeUsageQuota),
+      serializeResult: serializeQuotaSnapshot,
+    });
+  }
+  if (needsAgySdkHydration) {
+    scheduleBackgroundQuotaRefresh('agy-usage-quota', () => fetchAgyUsageQuota(), {
+      beforeSnapshot: serializeQuotaSnapshot(agyUsageQuota),
+      serializeResult: serializeQuotaSnapshot,
+    });
+  }
+  if (needsGrokSdkHydration) {
+    scheduleBackgroundQuotaRefresh('grok-usage-quota', () => getGrokUsageQuota(), {
+      beforeSnapshot: serializeQuotaSnapshot(grokUsageQuota),
+      serializeResult: serializeQuotaSnapshot,
+    });
+  }
+  if (needsMuseSdkHydration) {
+    scheduleBackgroundQuotaRefresh('muse-usage-quota', () => getMuseUsageQuota(), {
+      beforeSnapshot: serializeQuotaSnapshot(museUsageQuota),
+      serializeResult: serializeQuotaSnapshot,
+    });
+  }
   const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig({ probe: false }).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
   const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig({ probe: false }).catch(() => null) : null;
   const cursorRuntime = needsCursorHydration ? await getCursorRuntimeConfig({ probe: false }).catch(() => null) : null;
@@ -319,8 +356,10 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
       };
       if (
         hydrated.permissionLabel !== s.permissionLabel
-        || hydrated.quotaLabel !== s.quotaLabel
-        || !providerQuotaMetaEquals(hydrated.quotaMeta, s.quotaMeta)
+        || (agyUsageQuota && (
+          hydrated.quotaLabel !== s.quotaLabel
+          || !providerQuotaMetaEquals(hydrated.quotaMeta, s.quotaMeta)
+        ))
       ) {
         upsertSession({ ...s, ...hydrated, updatedAt: Date.now() });
       }

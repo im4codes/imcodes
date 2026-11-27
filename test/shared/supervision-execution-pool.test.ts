@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  buildExecutionPoolRecommendations,
   buildSupervisionExecutionCapabilityId,
+  classifySdkModelTiers,
   evaluateSupervisionExecutionBinding,
   mayFinalizeEconomyAssignment,
   migrateLegacySupervisionExecutionPools,
@@ -8,7 +10,9 @@ import {
   normalizeSupervisionExecutionModel,
   normalizeSupervisionExecutionPools,
   planSupervisionExecutionCapacity,
+  resolveClaudeExecutionModelForSwitch,
   supervisionExecutionConfigRole,
+  supervisionExecutionModelMatches,
   evaluateSupervisionObservedIdentity,
   evaluateSupervisionAutomationPoolGate,
   buildSupervisionPoolGateGuidance,
@@ -16,8 +20,16 @@ import {
   SUPERVISION_AUDIT_ROUTING_REASONS,
   resolveSupervisionTierPair,
   supervisionTierPriority,
+  evaluateSupervisionExecutionBinding,
+  type ExecutionPoolSdkSummary,
+  type LearnedModelTierRecord,
   type SupervisionExecutionConfig,
 } from '../../shared/supervision-execution-pool.js';
+import { configFromExecutionPoolEntry } from '../../shared/execution-pool-mcp.js';
+import { normalizeClaudeSdkModelForProvider } from '../../src/agent/sdk-runtime-config.js';
+import { configMatchesSession } from '../../src/daemon/supervision-auto-provision.js';
+import { listTaskPairCandidates } from '../../src/daemon/task-pairs/pool.js';
+import type { SessionRecord } from '../../src/store/session-store.js';
 import { SUPERVISION_SUPPORTED_UI_LOCALES } from '../../shared/supervision-config.js';
 
 function config(agentType: string, providerFamily: string, model: string, ccPresetId?: string): SupervisionExecutionConfig {
@@ -694,5 +706,262 @@ describe('deprecated gemini execution pool compatibility', () => {
     const migratedGemini = migrateLegacySupervisionExecutionPools({ backend: 'gemini', model: 'gemini-2.5-pro' });
     expect(migratedGemini.state).toBe('legacy_unconfigured');
     expect(migratedGemini.primaryDevelopmentPool.configs).toEqual([]);
+  });
+});
+
+describe('dynamic model tier classification & cross-SDK recommendations', () => {
+  it('dynamically ranks future versioned models without hardcoded model lists', () => {
+    const codex = classifySdkModelTiers('codex-sdk', [
+      'gpt-6-sol',
+      'gpt-6.2-sol',
+      'gpt-7.5-sol',
+      'gpt-8-sol',
+      'gpt-5.6',
+      'gpt-6-luna',
+      'gpt-8-luna',
+    ]);
+    expect(codex.tiers).toEqual({
+      flagship: 'gpt-8-sol',
+      secondary: 'gpt-8-sol',
+      economy: 'gpt-8-luna',
+    });
+    expect(codex.unknownModels).toEqual([]);
+
+    const codexWithFutureFlagship = classifySdkModelTiers('codex-sdk', [
+      'gpt-8-astra',
+      'gpt-7.5-sol',
+      'gpt-7.5-luna',
+    ]);
+    expect(codexWithFutureFlagship.tiers).toEqual({
+      flagship: 'gpt-8-astra',
+      secondary: 'gpt-7.5-sol',
+      economy: 'gpt-7.5-luna',
+    });
+
+    const agy = classifySdkModelTiers('agy-sdk', [
+      'gemini-4-hydrogen-high',
+      'gemini-5-hydrogen-high',
+      'gemini-6-helium-high',
+      'gemini-3.8-flash-high',
+      'gemini-6-flash-high',
+    ]);
+    expect(agy.tiers).toEqual({
+      flagship: 'gemini-6-helium-high',
+      secondary: 'gemini-5-hydrogen-high',
+      economy: 'gemini-6-flash-high',
+    });
+    expect(agy.unknownModels).toEqual([]);
+
+    const claude = classifySdkModelTiers('claude-code-sdk', [
+      'claude-fable-6',
+      'claude-opus-6',
+      'claude-sonnet-6',
+      'claude-haiku-6',
+    ]);
+    expect(claude.tiers).toEqual({
+      flagship: 'claude-fable-6',
+      secondary: 'claude-sonnet-6',
+      economy: 'claude-haiku-6',
+    });
+  });
+
+  it('never guesses or drops completely unknown model names and applies learned knowledge once updated', () => {
+    const unknownCatalog = ['claude-aurora-7', 'gpt-7-quasar', 'nova-x1'];
+    const before = classifySdkModelTiers('claude-code-sdk', [...unknownCatalog, 'sonnet', 'haiku']);
+    expect(before.models).toEqual(['claude-aurora-7', 'gpt-7-quasar', 'nova-x1', 'sonnet', 'haiku']);
+    expect(before.unknownModels).toEqual(['claude-aurora-7', 'gpt-7-quasar', 'nova-x1']);
+    expect(before.tiers).toEqual({ flagship: 'sonnet', secondary: 'sonnet', economy: 'haiku' });
+
+    const learned: LearnedModelTierRecord[] = [
+      { provider: 'claude-code-sdk', model: 'claude-aurora-7', tier: 'flagship', source: 'web_search', updatedAt: 100 },
+      { provider: 'nova-sdk', model: 'nova-x1', tier: 'economy', source: 'web_search', updatedAt: 101 },
+    ];
+    const after = classifySdkModelTiers('claude-code-sdk', [...unknownCatalog, 'sonnet', 'haiku'], learned);
+    expect(after.unknownModels).toEqual(['gpt-7-quasar', 'nova-x1']);
+    expect(after.tiers).toEqual({
+      flagship: 'claude-aurora-7',
+      secondary: 'sonnet',
+      economy: 'haiku',
+    });
+
+    const novaAfter = classifySdkModelTiers('nova-sdk', ['nova-x1'], learned);
+    expect(novaAfter.unknownModels).toEqual([]);
+    expect(novaAfter.tiers).toEqual({
+      economy: 'nova-x1',
+    });
+  });
+
+  it('recommends balanced cross-SDK presets when >=2 SDK families are logged in', () => {
+    const agyClassified = classifySdkModelTiers('agy-sdk', ['gemini-4-hydrogen-high', 'gemini-3.8-flash-high', 'claude-opus-5-5-high']);
+    const codexClassified = classifySdkModelTiers('codex-sdk', ['gpt-6.2-sol', 'gpt-6-luna']);
+    const sdks: ExecutionPoolSdkSummary[] = [
+      { provider: 'agy-sdk', providerFamily: 'google', loggedIn: true, ...agyClassified, source: 'live_catalog' },
+      { provider: 'codex-sdk', providerFamily: 'openai', loggedIn: true, ...codexClassified, source: 'live_catalog' },
+    ];
+
+    const rec = buildExecutionPoolRecommendations({
+      currentBrain: { provider: 'agy-sdk', providerFamily: 'google', model: 'gemini-4-hydrogen-high' },
+      availableSdks: sdks,
+    });
+    expect(rec.customAllowed).toBe(true);
+    expect(rec.needsModelResearch).toBe(false);
+    expect(rec.recommendedPresets[0]).toMatchObject({
+      id: 'balanced_cross_vendor',
+      recommended: true,
+      autoPairingEnabled: true,
+      auditByDefault: true,
+      primaryEntries: [
+        { provider: 'agy-sdk', model: 'gemini-4-hydrogen-high', role: 'executor', enabled: true },
+        { provider: 'codex-sdk', model: 'gpt-6.2-sol', role: 'auditor', enabled: true },
+      ],
+      economyEntries: [
+        { provider: 'agy-sdk', model: 'gemini-3.8-flash-high', role: 'both', enabled: true },
+      ],
+    });
+    expect(rec.recommendedPresets.some((p) => p.id === 'same_vendor_balanced')).toBe(true);
+  });
+
+  it('automatically switches to same-vendor audit when only one SDK family is logged in and warns when Brain is economy-tier', () => {
+    const claudeClassified = classifySdkModelTiers('claude-code-sdk', ['fable', 'sonnet', 'haiku', 'claude-aurora-7']);
+    const unloggedCodex = classifySdkModelTiers('codex-sdk', ['gpt-6.2-sol']);
+    const sdks: ExecutionPoolSdkSummary[] = [
+      { provider: 'claude-code-sdk', providerFamily: 'anthropic', loggedIn: true, ...claudeClassified, source: 'session_observed' },
+      { provider: 'codex-sdk', providerFamily: 'openai', loggedIn: false, ...unloggedCodex, source: 'static_fallback' },
+    ];
+
+    const rec = buildExecutionPoolRecommendations({
+      currentBrain: { provider: 'claude-code-sdk', providerFamily: 'anthropic', model: 'haiku' },
+      availableSdks: sdks,
+    });
+
+    expect(rec.needsModelResearch).toBe(true);
+    expect(rec.unknownModels).toEqual([{ provider: 'claude-code-sdk', model: 'claude-aurora-7' }]);
+    expect(rec.currentBrain.isEconomy).toBe(true);
+    expect(rec.brainModelHint).toContain('haiku');
+    expect(rec.recommendedPresets[0]).toMatchObject({
+      id: 'same_vendor_balanced',
+      recommended: true,
+      needsModelResearch: true,
+      primaryEntries: [{ provider: 'claude-code-sdk', model: 'sonnet', role: 'both', enabled: true }],
+      economyEntries: [{ provider: 'claude-code-sdk', model: 'haiku', role: 'both', enabled: true }],
+    });
+    expect(rec.recommendedPresets[1]).toMatchObject({
+      id: 'same_vendor_strong_audit',
+      recommended: false,
+      primaryEntries: [
+        { provider: 'claude-code-sdk', model: 'sonnet', role: 'executor', enabled: true },
+        { provider: 'claude-code-sdk', model: 'fable', role: 'auditor', enabled: true },
+      ],
+    });
+    for (const preset of rec.recommendedPresets) {
+      expect(preset.primaryEntries.some((e) => e.provider === 'codex-sdk')).toBe(false);
+    }
+  });
+
+  it('preserves explicit Claude model IDs (same-generation minor versions like claude-fable-5-1 and newer generations like claude-fable-6) while keeping legacy shorthand compatibility', () => {
+    for (const explicitModel of [
+      'claude-fable-5-1',
+      'claude-sonnet-5-5',
+      'claude-fable-5-20261201',
+      'claude-fable-6',
+      'claude-fable-6[1m]',
+      'claude-opus-6',
+      'claude-sonnet-6',
+      'claude-haiku-6',
+    ]) {
+      expect(normalizeSupervisionExecutionModel('claude-code-sdk', explicitModel)).toBe(explicitModel);
+      expect(resolveClaudeExecutionModelForSwitch(explicitModel)).toBe(explicitModel);
+      expect(normalizeClaudeSdkModelForProvider(explicitModel)).toBe(explicitModel);
+      const entryCfg = configFromExecutionPoolEntry({ provider: 'claude-code-sdk', model: explicitModel, role: 'executor', enabled: true });
+      expect(entryCfg).toMatchObject({ agentType: 'claude-code-sdk', providerFamily: 'anthropic', model: explicitModel });
+      expect(buildSupervisionExecutionCapabilityId(entryCfg!)).toContain(explicitModel);
+    }
+    // Legacy shorthands and known migration aliases keep working
+    expect(normalizeSupervisionExecutionModel('claude-code-sdk', 'claude-opus-4-7')).toBe('opus[1M]');
+    expect(normalizeSupervisionExecutionModel('claude-code-sdk', 'claude-opus-5')).toBe('opus[1M]');
+    expect(normalizeSupervisionExecutionModel('claude-code-sdk', 'claude-fable-5')).toBe('fable');
+    expect(resolveClaudeExecutionModelForSwitch('opus')).toBe('opus[1M]');
+    expect(resolveClaudeExecutionModelForSwitch('fable')).toBe('fable');
+    expect(resolveClaudeExecutionModelForSwitch('gpt-6-sol')).toBeUndefined();
+    expect(normalizeClaudeSdkModelForProvider('fable')).toBe('claude-fable-5');
+
+    // Tier classification ranks claude-fable-6 > claude-fable-5-1 > fable
+    const classified = classifySdkModelTiers('claude-code-sdk', ['fable', 'claude-fable-5-1', 'claude-fable-6', 'sonnet', 'haiku']);
+    expect(classified.tiers).toEqual({
+      flagship: 'claude-fable-6',
+      secondary: 'sonnet',
+      economy: 'haiku',
+    });
+  });
+
+  it('directionally matches legacy shorthand pool configs to versioned Claude sessions while keeping explicit IDs strict', () => {
+    const shorthandCfg = config('claude-code-sdk', 'anthropic', 'sonnet');
+    const explicit46Cfg = config('claude-code-sdk', 'anthropic', 'claude-sonnet-4-6');
+    const poolsWithShorthand = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [shorthandCfg] },
+      economyTaskPool: { configs: [] },
+    });
+    const poolsWithExplicit46 = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [explicit46Cfg] },
+      economyTaskPool: { configs: [] },
+    });
+
+    const brain = {
+      name: 'deck_brain_match',
+      projectName: 'p-match',
+      role: 'brain' as const,
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/p-match',
+      state: 'running' as const,
+      runtimeType: 'transport' as const,
+      transportConfig: { supervision: { executionPools: poolsWithShorthand } },
+    } as unknown as SessionRecord;
+    const worker46 = {
+      name: 'deck_sub_sonnet46',
+      parentSession: brain.name,
+      projectName: 'p-match',
+      role: 'w1' as const,
+      agentType: 'claude-code-sdk',
+      providerId: 'claude-code-sdk',
+      projectDir: '/tmp/p-match',
+      state: 'idle' as const,
+      runtimeType: 'transport' as const,
+      activeModel: 'claude-sonnet-4-6',
+      sessionInstanceId: 'inst-s46',
+      runtimeEpoch: 'epoch-s46',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as SessionRecord;
+    const worker45 = { ...worker46, name: 'deck_sub_sonnet45', activeModel: 'claude-sonnet-4-5', sessionInstanceId: 'inst-s45', runtimeEpoch: 'epoch-s45' } as SessionRecord;
+
+    // 1. Legacy shorthand `sonnet` matches versioned `claude-sonnet-4-6` across configMatchesSession, binding, observed identity, and candidate selection
+    expect(supervisionExecutionModelMatches('claude-code-sdk', 'sonnet', 'claude-sonnet-4-6')).toBe(true);
+    expect(configMatchesSession(shorthandCfg, worker46)).toBe(true);
+    expect(evaluateSupervisionObservedIdentity({ config: shorthandCfg, actual: actual(shorthandCfg, { model: 'claude-sonnet-4-6' }), pool: 'primary' })).toEqual({ ok: true });
+    expect(evaluateSupervisionExecutionBinding({ pools: poolsWithShorthand, pool: 'primary', actual: actual(shorthandCfg, { model: 'claude-sonnet-4-6' }) })).toMatchObject({ ok: true, requested: { model: 'sonnet' } });
+    expect(listTaskPairCandidates({ brain: brain.name, role: 'executor', pool: 'primary', exclude: new Set() }, {
+      listSessions: () => [brain, worker46],
+      getSession: (name) => (name === brain.name ? brain : worker46),
+      hasPendingMessages: () => false,
+    }).map((s) => s.name)).toEqual([worker46.name]);
+
+    // 2. Explicit `claude-sonnet-4-6` matches ONLY `claude-sonnet-4-6`, never `claude-sonnet-4-5` or bare `sonnet`
+    expect(supervisionExecutionModelMatches('claude-code-sdk', 'claude-sonnet-4-6', 'claude-sonnet-4-6')).toBe(true);
+    expect(supervisionExecutionModelMatches('claude-code-sdk', 'claude-sonnet-4-6', 'claude-sonnet-4-5')).toBe(false);
+    expect(supervisionExecutionModelMatches('claude-code-sdk', 'claude-sonnet-4-6', 'sonnet')).toBe(false);
+    expect(configMatchesSession(explicit46Cfg, worker46)).toBe(true);
+    expect(configMatchesSession(explicit46Cfg, worker45)).toBe(false);
+    expect(evaluateSupervisionObservedIdentity({ config: explicit46Cfg, actual: actual(explicit46Cfg, { model: 'claude-sonnet-4-5' }), pool: 'primary' })).toEqual({ ok: false, reason: 'identity_mismatch' });
+    expect(evaluateSupervisionExecutionBinding({ pools: poolsWithExplicit46, pool: 'primary', actual: actual(explicit46Cfg, { model: 'claude-sonnet-4-5' }) })).toEqual({ ok: false, reason: 'unselected_config' });
+    const brainExplicit46 = { ...brain, transportConfig: { supervision: { executionPools: poolsWithExplicit46 } } } as unknown as SessionRecord;
+    expect(listTaskPairCandidates({ brain: brainExplicit46.name, role: 'executor', pool: 'primary', exclude: new Set() }, {
+      listSessions: () => [brainExplicit46, worker45, worker46],
+      getSession: (name) => (name === brainExplicit46.name ? brainExplicit46 : name === worker45.name ? worker45 : worker46),
+      hasPendingMessages: () => false,
+    }).map((s) => s.name)).toEqual([worker46.name]);
   });
 });

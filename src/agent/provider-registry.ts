@@ -9,8 +9,31 @@ import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { clearTransportRestoreBackoffForProvider } from './transport-restore-backoff.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
+import {
+  clearProviderRetiring,
+  isProviderRetiring,
+  markProviderRetiring,
+} from './provider-registry-state.js';
 
 const providers = new Map<string, TransportProvider>();
+const providerOps = new Map<string, Promise<void>>();
+interface PendingEnsureEntry {
+  promise: Promise<TransportProvider>;
+  waiters: number;
+}
+const pendingEnsureConnects = new Map<string, PendingEnsureEntry>();
+
+function runSerialized<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const prev = providerOps.get(id) ?? Promise.resolve();
+  const task = prev.catch(() => {}).then(fn);
+  const tail = task.then(() => undefined, () => undefined).finally(() => {
+    if (providerOps.get(id) === tail) {
+      providerOps.delete(id);
+    }
+  });
+  providerOps.set(id, tail);
+  return task;
+}
 
 /** ServerLink reference for sync pipeline — set by daemon startup. */
 let _serverLink: { send(msg: object): void } | null = null;
@@ -20,27 +43,115 @@ export function getProvider(id: string): TransportProvider | undefined {
   return providers.get(id);
 }
 
+/**
+ * Returns true iff `provider` is still the live, non-retiring instance registered for `id`.
+ * `disconnectProviderUnlocked` marks the active instance retiring synchronously before awaiting
+ * `provider.disconnect()` so concurrent launches and syncs cannot publish against a disconnecting gateway.
+ */
+export function isCurrentProvider(id: string, provider: TransportProvider): boolean {
+  return providers.get(id) === provider && !isProviderRetiring(provider);
+}
+
 export function getAllProviders(): TransportProvider[] {
   return [...providers.values()];
 }
 
-export async function ensureProviderConnected(id: string, config: ProviderConfig = {}): Promise<TransportProvider> {
-  const existing = providers.get(id);
-  if (existing) return existing;
-  await connectProvider(id, config);
-  const connected = providers.get(id);
-  if (!connected) throw new Error(`Provider failed to connect: ${id}`);
-  return connected;
+export async function ensureProviderConnected(
+  id: string,
+  config: ProviderConfig = {},
+  options?: { signal?: AbortSignal },
+): Promise<TransportProvider> {
+  if (!providerOps.has(id) && providers.has(id)) {
+    return providers.get(id)!;
+  }
+  const signal = options?.signal;
+  if (signal?.aborted) {
+    throw new Error(`Provider ensure aborted: ${id}`);
+  }
+  let entry = pendingEnsureConnects.get(id);
+  if (!entry) {
+    const created: PendingEnsureEntry = { promise: null!, waiters: 0 };
+    const pending = runSerialized(id, async () => {
+      if (created.waiters <= 0) {
+        if (pendingEnsureConnects.get(id) === created) {
+          pendingEnsureConnects.delete(id);
+        }
+        throw new Error(`Provider ensure superseded before connect: ${id}`);
+      }
+      const current = providers.get(id);
+      if (current) return current;
+      await connectProviderUnlocked(id, config);
+      const connected = providers.get(id);
+      if (!connected) throw new Error(`Provider failed to connect: ${id}`);
+      return connected;
+    }).finally(() => {
+      if (pendingEnsureConnects.get(id) === created) {
+        pendingEnsureConnects.delete(id);
+      }
+    });
+    created.promise = pending;
+    // Prevent unhandled rejection when all aborted callers leave before queued execution.
+    pending.catch(() => {});
+    pendingEnsureConnects.set(id, created);
+    entry = created;
+  }
+
+  const activeEntry = entry;
+  activeEntry.waiters += 1;
+  if (!signal) {
+    try {
+      return await activeEntry.promise;
+    } finally {
+      activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
+    }
+  }
+
+  return await new Promise<TransportProvider>((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
+      if (activeEntry.waiters === 0 && pendingEnsureConnects.get(id) === activeEntry) {
+        pendingEnsureConnects.delete(id);
+      }
+      reject(new Error(`Provider ensure aborted: ${id}`));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    activeEntry.promise.then(
+      (provider) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
+        resolve(provider);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
+        reject(err);
+      },
+    );
+  });
 }
 
-export async function connectProvider(id: string, config: ProviderConfig): Promise<void> {
+async function connectProviderUnlocked(id: string, config: ProviderConfig): Promise<void> {
   // If already connected, disconnect first
   if (providers.has(id)) {
-    await disconnectProvider(id);
+    await disconnectProviderUnlocked(id);
   }
 
   const provider = await createProvider(id, config);
-  await provider.connect(config);
+  try {
+    await provider.connect(config);
+  } catch (err) {
+    await provider.disconnect().catch(() => {});
+    throw err;
+  }
+  clearProviderRetiring(provider);
   providers.set(id, provider);
   // A reconnected provider may now be able to do what it could not before.
   clearTransportRestoreBackoffForProvider(id);
@@ -53,7 +164,7 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
   if (id === 'openclaw' && _serverLink) {
     try {
       const { syncOcSessions } = await import('../daemon/oc-session-sync.js');
-      await syncOcSessions(_serverLink as any);
+      await syncOcSessions(_serverLink as any, { connectTimeProvider: provider });
     } catch (err) {
       logger.warn({ err }, 'OC session auto-sync failed — continuing without materialization');
     }
@@ -70,19 +181,38 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
   }
 }
 
-export async function disconnectProvider(id: string): Promise<void> {
+export function connectProvider(id: string, config: ProviderConfig): Promise<void> {
+  // Invalidate any older ensureProviderConnected coalescer so subsequent ensure callers
+  // wait behind this explicit reconnect rather than resolving with a superseded instance.
+  pendingEnsureConnects.delete(id);
+  return runSerialized(id, () => connectProviderUnlocked(id, config));
+}
+
+async function disconnectProviderUnlocked(id: string): Promise<void> {
   const provider = providers.get(id);
   if (!provider) return;
-  await provider.disconnect();
-  providers.delete(id);
-  broadcastProviderStatus(id, false);
-  logger.info({ provider: id }, 'Provider disconnected');
+  markProviderRetiring(provider);
+  try {
+    await provider.disconnect();
+  } finally {
+    if (providers.get(id) === provider) {
+      providers.delete(id);
+    }
+    broadcastProviderStatus(id, false);
+    logger.info({ provider: id }, 'Provider disconnected');
+  }
+}
+
+export function disconnectProvider(id: string): Promise<void> {
+  // Invalidate any older ensureProviderConnected coalescer so subsequent ensure callers
+  // see the post-disconnect boundary rather than reusing a about-to-be-disconnected handle.
+  pendingEnsureConnects.delete(id);
+  return runSerialized(id, () => disconnectProviderUnlocked(id));
 }
 
 export async function disconnectAll(): Promise<void> {
-  for (const [id] of providers) {
-    await disconnectProvider(id);
-  }
+  const ids = new Set([...providers.keys(), ...providerOps.keys()]);
+  await Promise.all([...ids].map((id) => disconnectProvider(id)));
 }
 
 async function createProvider(id: string, config: ProviderConfig): Promise<TransportProvider> {

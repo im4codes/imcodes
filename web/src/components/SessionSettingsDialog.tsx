@@ -13,7 +13,7 @@ import type { WsClient } from '../ws-client.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
-import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID, sanitizeAgyStartupModel } from '@shared/agy-agent.js';
 import { DAEMON_USER_NOTICE_CODE } from '@shared/daemon-user-notices.js';
 import { loadAgyModelPreference, saveAgyModelPreference } from '../agy-model-preference.js';
 import { isDelegationReplyCapableAgentType } from '@shared/agent-delegation.js';
@@ -578,7 +578,7 @@ export function SessionSettingsDialog({
     if (nextType === 'qwen') return getKnownQwenModelOptions()[0]?.id ?? null;
     const catalog = readCachedTransportModels(`${sessionName.trim()}\0${nextType}\0`, nextType);
     if (nextType === AGY_SDK_PROVIDER_ID) {
-      const stored = loadAgyModelPreference();
+      const stored = sanitizeAgyStartupModel(loadAgyModelPreference());
       if (stored && (!catalog?.models.length || catalog.models.some((model) => model.id === stored))) {
         return stored;
       }
@@ -973,7 +973,7 @@ export function SessionSettingsDialog({
         await supervisorDefaultsPref.save(draftSupervisorDefaults);
       }
 
-      const providerChanged = surface === 'session' && agentType !== type;
+      const providerChanged = surface !== 'supervision' && agentType !== type;
       const nextProviderModel = providerChanged
         ? (providerModelManuallySelectedRef.current ? sessionModel.trim() || null : providerDefaultModel(agentType))
         : null;

@@ -8,6 +8,7 @@ import {
   isAllowedExternalUrl,
   isAllowedPermissionRequest,
   isSameActiveOrigin,
+  isSameOriginDownloadUrl,
   MAIN_WINDOW_WEB_PREFERENCES,
   type WindowOpenHandlerResult,
 } from '../src/security.js';
@@ -70,6 +71,12 @@ class MockSession extends EventEmitter {
     this.clearedOrigins.push(options?.origin);
   }
 }
+
+const mockVoiceDeps = {
+  buildDevHelper: () => null,
+  runHelperSync: () => '[]',
+  runHelperAsync: async () => '[]',
+};
 
 describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
   let tempDir: string;
@@ -473,6 +480,7 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       appName: 'IM.codes',
       userDataDir: tempDir,
       bindDeps: { imcodesHome: tempDir },
+      voiceDeps: mockVoiceDeps,
       createMainWindow: () => win,
       createPromptWindow: () => {
         throw new Error('unused');
@@ -483,32 +491,36 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       showMessageBox: async () => ({ response: 1 }),
     });
 
-    await shell.addAndSelectServer('https://app.im.codes');
-    expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes');
-    expect(wc.url).toBe('https://app.im.codes');
+    try {
+      await shell.addAndSelectServer('https://app.im.codes');
+      expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes');
+      expect(wc.url).toBe('https://app.im.codes');
 
-    // Loaded remote web page must NEVER trigger welcome /add, /connect, or /remove
-    for (const virtualUrl of [
-      'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example&label=Evil',
-      'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fevil.example',
-      'https://imcodes-welcome.local/remove?url=https%3A%2F%2Fapp.im.codes',
-    ]) {
-      const ev = { preventDefault: vi.fn() };
-      wc.emit('will-navigate', ev, virtualUrl);
-      expect(ev.preventDefault).toHaveBeenCalled();
+      // Loaded remote web page must NEVER trigger welcome /add, /connect, or /remove
+      for (const virtualUrl of [
+        'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example&label=Evil',
+        'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fevil.example',
+        'https://imcodes-welcome.local/remove?url=https%3A%2F%2Fapp.im.codes',
+      ]) {
+        const ev = { preventDefault: vi.fn() };
+        wc.emit('will-navigate', ev, virtualUrl);
+        expect(ev.preventDefault).toHaveBeenCalled();
+      }
+      await new Promise((r) => setTimeout(r, 20));
+      expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes');
+      expect(shell.store.list().map((s) => s.origin)).toEqual(['https://app.im.codes']);
+
+      // Even if activeOrigin is cleared, non-data:text/html URL must NOT trigger welcome actions
+      shell.controller.clearActiveOrigin();
+      wc.url = 'https://evil.example/spoof';
+      const spoofEv = { preventDefault: vi.fn() };
+      wc.emit('will-navigate', spoofEv, 'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example');
+      expect(spoofEv.preventDefault).toHaveBeenCalled();
+      await new Promise((r) => setTimeout(r, 20));
+      expect(shell.store.list().map((s) => s.origin)).toEqual(['https://app.im.codes']);
+    } finally {
+      shell.dispose();
     }
-    await new Promise((r) => setTimeout(r, 20));
-    expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes');
-    expect(shell.store.list().map((s) => s.origin)).toEqual(['https://app.im.codes']);
-
-    // Even if activeOrigin is cleared, non-data:text/html URL must NOT trigger welcome actions
-    shell.controller.clearActiveOrigin();
-    wc.url = 'https://evil.example/spoof';
-    const spoofEv = { preventDefault: vi.fn() };
-    wc.emit('will-navigate', spoofEv, 'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example');
-    expect(spoofEv.preventDefault).toHaveBeenCalled();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(shell.store.list().map((s) => s.origin)).toEqual(['https://app.im.codes']);
   });
 
   it('routes external http/https windowOpenHandler links from createPcAppShell to openExternal while keeping virtual and unsafe URLs blocked', async () => {
@@ -533,6 +545,7 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       appName: 'IM.codes',
       userDataDir: tempDir,
       bindDeps: { imcodesHome: tempDir },
+      voiceDeps: mockVoiceDeps,
       createMainWindow: () => win,
       createPromptWindow: () => {
         throw new Error('unused');
@@ -543,26 +556,30 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       showMessageBox: async () => ({ response: 1 }),
     });
 
-    await shell.ensureWindow();
-    expect(wc.windowOpenHandler).toBeTruthy();
+    try {
+      await shell.ensureWindow();
+      expect(wc.windowOpenHandler).toBeTruthy();
 
-    expect(wc.windowOpenHandler!({ url: 'https://example.org/docs' })).toEqual({ action: 'deny' });
-    expect(wc.windowOpenHandler!({ url: 'http://127.0.0.1:4321/preview' })).toEqual({ action: 'deny' });
-    expect(openExternal).toHaveBeenNthCalledWith(1, 'https://example.org/docs');
-    expect(openExternal).toHaveBeenNthCalledWith(2, 'http://127.0.0.1:4321/preview');
+      expect(wc.windowOpenHandler!({ url: 'https://example.org/docs' })).toEqual({ action: 'deny' });
+      expect(wc.windowOpenHandler!({ url: 'http://127.0.0.1:4321/preview' })).toEqual({ action: 'deny' });
+      expect(openExternal).toHaveBeenNthCalledWith(1, 'https://example.org/docs');
+      expect(openExternal).toHaveBeenNthCalledWith(2, 'http://127.0.0.1:4321/preview');
 
-    openExternal.mockClear();
-    expect(wc.windowOpenHandler!({ url: 'file:///etc/passwd' })).toEqual({ action: 'deny' });
-    expect(wc.windowOpenHandler!({ url: 'javascript:alert(1)' })).toEqual({ action: 'deny' });
-    expect(wc.windowOpenHandler!({ url: 'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fapp.im.codes' })).toEqual({ action: 'deny' });
-    expect(openExternal).not.toHaveBeenCalled();
+      openExternal.mockClear();
+      expect(wc.windowOpenHandler!({ url: 'file:///etc/passwd' })).toEqual({ action: 'deny' });
+      expect(wc.windowOpenHandler!({ url: 'javascript:alert(1)' })).toEqual({ action: 'deny' });
+      expect(wc.windowOpenHandler!({ url: 'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fapp.im.codes' })).toEqual({ action: 'deny' });
+      expect(openExternal).not.toHaveBeenCalled();
 
-    // imcodes-welcome.local virtual navigation on the welcome page still connects normally
-    const connectEv = { preventDefault: vi.fn() };
-    wc.emit('will-navigate', connectEv, 'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fapp.im.codes');
-    expect(connectEv.preventDefault).toHaveBeenCalled();
-    await vi.waitFor(() => expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes'));
-    expect(openExternal).not.toHaveBeenCalled();
+      // imcodes-welcome.local virtual navigation on the welcome page still connects normally
+      const connectEv = { preventDefault: vi.fn() };
+      wc.emit('will-navigate', connectEv, 'https://imcodes-welcome.local/connect?url=https%3A%2F%2Fapp.im.codes');
+      expect(connectEv.preventDefault).toHaveBeenCalled();
+      await vi.waitFor(() => expect(shell.controller.getActiveOrigin()).toBe('https://app.im.codes'));
+      expect(openExternal).not.toHaveBeenCalled();
+    } finally {
+      shell.dispose();
+    }
   });
 
   it('allows same-origin popout windows with enforced webPreferences and wires did-create-window security guards onto child windows', async () => {
@@ -589,6 +606,7 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       userDataDir: tempDir,
       preloadPath,
       bindDeps: { imcodesHome: tempDir },
+      voiceDeps: mockVoiceDeps,
       createMainWindow: () => win,
       createPromptWindow: () => {
         throw new Error('unused');
@@ -599,102 +617,106 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       showMessageBox: async () => ({ response: 1 }),
     });
 
-    await shell.addAndSelectServer('https://app.im.codes');
-    await shell.addAndSelectServer('https://second.im.codes');
-    await shell.selectServer('https://app.im.codes');
-    expect(wc.windowOpenHandler).toBeTruthy();
+    try {
+      await shell.addAndSelectServer('https://app.im.codes');
+      await shell.addAndSelectServer('https://second.im.codes');
+      await shell.selectServer('https://app.im.codes');
+      expect(wc.windowOpenHandler).toBeTruthy();
 
-    // Same active origin (e.g. Remote Desktop "Open in new window") returns allow with strict webPreferences
-    const sameOriginResult = wc.windowOpenHandler!({
-      url: 'https://app.im.codes/#/remote-desktop/srv_1',
-    });
-    expect(sameOriginResult).toEqual({
-      action: 'allow',
-      overrideBrowserWindowOptions: {
-        width: 1280,
-        height: 800,
-        minWidth: 800,
-        minHeight: 560,
-        autoHideMenuBar: true,
-        webPreferences: {
-          ...MAIN_WINDOW_WEB_PREFERENCES,
-          preload: preloadPath,
+      // Same active origin (e.g. Remote Desktop "Open in new window") returns allow with strict webPreferences
+      const sameOriginResult = wc.windowOpenHandler!({
+        url: 'https://app.im.codes/#/remote-desktop/srv_1',
+      });
+      expect(sameOriginResult).toEqual({
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 1280,
+          height: 800,
+          minWidth: 800,
+          minHeight: 560,
+          autoHideMenuBar: true,
+          webPreferences: {
+            ...MAIN_WINDOW_WEB_PREFERENCES,
+            preload: preloadPath,
+          },
         },
-      },
-    });
-    expect(openExternal).not.toHaveBeenCalled();
+      });
+      expect(openExternal).not.toHaveBeenCalled();
 
-    // Another saved origin or external URL still returns deny and routes external http/https to openExternal
-    expect(wc.windowOpenHandler!({ url: 'https://second.im.codes/home' })).toEqual({ action: 'deny' });
-    expect(openExternal).toHaveBeenCalledWith('https://second.im.codes/home');
-    openExternal.mockClear();
-    expect(wc.windowOpenHandler!({ url: 'https://docs.im.codes/guide' })).toEqual({ action: 'deny' });
-    expect(openExternal).toHaveBeenCalledWith('https://docs.im.codes/guide');
+      // Another saved origin or external URL still returns deny and routes external http/https to openExternal
+      expect(wc.windowOpenHandler!({ url: 'https://second.im.codes/home' })).toEqual({ action: 'deny' });
+      expect(openExternal).toHaveBeenCalledWith('https://second.im.codes/home');
+      openExternal.mockClear();
+      expect(wc.windowOpenHandler!({ url: 'https://docs.im.codes/guide' })).toEqual({ action: 'deny' });
+      expect(openExternal).toHaveBeenCalledWith('https://docs.im.codes/guide');
 
-    // Emit did-create-window and verify child BrowserWindow enforces navigation, webview, and window-open guards
-    openExternal.mockClear();
-    const childWc = new MockWebContents(session);
-    childWc.url = 'https://app.im.codes/#/remote-desktop/srv_1';
-    wc.emit('did-create-window', { webContents: childWc });
-    expect(childWc.windowOpenHandler).toBeTruthy();
+      // Emit did-create-window and verify child BrowserWindow enforces navigation, webview, and window-open guards
+      openExternal.mockClear();
+      const childWc = new MockWebContents(session);
+      childWc.url = 'https://app.im.codes/#/remote-desktop/srv_1';
+      wc.emit('did-create-window', { webContents: childWc });
+      expect(childWc.windowOpenHandler).toBeTruthy();
 
-    // Child window allows same-active-origin navigation/redirect, blocks untrusted origins, other saved servers, file:, and imcodes-welcome.local
-    for (const eventName of ['will-navigate', 'will-redirect'] as const) {
-      const sameEv = { preventDefault: vi.fn() };
-      childWc.emit(eventName, sameEv, 'https://app.im.codes/#/remote-desktop/srv_2');
-      expect(sameEv.preventDefault).not.toHaveBeenCalled();
+      // Child window allows same-active-origin navigation/redirect, blocks untrusted origins, other saved servers, file:, and imcodes-welcome.local
+      for (const eventName of ['will-navigate', 'will-redirect'] as const) {
+        const sameEv = { preventDefault: vi.fn() };
+        childWc.emit(eventName, sameEv, 'https://app.im.codes/#/remote-desktop/srv_2');
+        expect(sameEv.preventDefault).not.toHaveBeenCalled();
 
-      for (const blockedTarget of [
-        'https://evil.example/phish',
-        'https://second.im.codes/home',
-        'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example',
-        'file:///etc/passwd',
-      ]) {
-        const blockedEv = { preventDefault: vi.fn() };
-        childWc.emit(eventName, blockedEv, blockedTarget);
-        expect(blockedEv.preventDefault).toHaveBeenCalledTimes(1);
+        for (const blockedTarget of [
+          'https://evil.example/phish',
+          'https://second.im.codes/home',
+          'https://imcodes-welcome.local/add?url=https%3A%2F%2Fevil.example',
+          'file:///etc/passwd',
+        ]) {
+          const blockedEv = { preventDefault: vi.fn() };
+          childWc.emit(eventName, blockedEv, blockedTarget);
+          expect(blockedEv.preventDefault).toHaveBeenCalledTimes(1);
+        }
       }
-    }
 
-    // Child window blocks webview attachment
-    const childWebviewEv = { preventDefault: vi.fn() };
-    childWc.emit('will-attach-webview', childWebviewEv);
-    expect(childWebviewEv.preventDefault).toHaveBeenCalledTimes(1);
+      // Child window blocks webview attachment
+      const childWebviewEv = { preventDefault: vi.fn() };
+      childWc.emit('will-attach-webview', childWebviewEv);
+      expect(childWebviewEv.preventDefault).toHaveBeenCalledTimes(1);
 
-    // Child window preserves same-origin popout + external handoff rules
-    expect(childWc.windowOpenHandler!({ url: 'https://app.im.codes/sub' })).toEqual({
-      action: 'allow',
-      overrideBrowserWindowOptions: {
-        width: 1280,
-        height: 800,
-        minWidth: 800,
-        minHeight: 560,
-        autoHideMenuBar: true,
-        webPreferences: {
-          ...MAIN_WINDOW_WEB_PREFERENCES,
-          preload: preloadPath,
+      // Child window preserves same-origin popout + external handoff rules
+      expect(childWc.windowOpenHandler!({ url: 'https://app.im.codes/sub' })).toEqual({
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 1280,
+          height: 800,
+          minWidth: 800,
+          minHeight: 560,
+          autoHideMenuBar: true,
+          webPreferences: {
+            ...MAIN_WINDOW_WEB_PREFERENCES,
+            preload: preloadPath,
+          },
         },
-      },
-    });
-    expect(openExternal).not.toHaveBeenCalled();
+      });
+      expect(openExternal).not.toHaveBeenCalled();
 
-    expect(childWc.windowOpenHandler!({ url: 'https://example.com/external' })).toEqual({ action: 'deny' });
-    expect(openExternal).toHaveBeenCalledWith('https://example.com/external');
+      expect(childWc.windowOpenHandler!({ url: 'https://example.com/external' })).toEqual({ action: 'deny' });
+      expect(openExternal).toHaveBeenCalledWith('https://example.com/external');
 
-    openExternal.mockClear();
-    expect(childWc.windowOpenHandler!({ url: 'https://imcodes-welcome.local/connect' })).toEqual({ action: 'deny' });
-    expect(openExternal).not.toHaveBeenCalled();
+      openExternal.mockClear();
+      expect(childWc.windowOpenHandler!({ url: 'https://imcodes-welcome.local/connect' })).toEqual({ action: 'deny' });
+      expect(openExternal).not.toHaveBeenCalled();
 
-    // Child window created via did-create-window is allowed trusted Remote Desktop permissions while on active origin,
-    // and loses them once destroyed or drifted
-    expect(session.permissionCheckHandler!(childWc, 'fullscreen', 'https://app.im.codes')).toBe(true);
-    expect(session.permissionCheckHandler!(childWc, 'keyboardLock', 'https://app.im.codes')).toBe(true);
-    expect(session.permissionCheckHandler!(childWc, 'geolocation', 'https://app.im.codes')).toBe(false);
-    childWc.url = 'https://evil.example/spoof';
-    expect(session.permissionCheckHandler!(childWc, 'fullscreen', 'https://app.im.codes')).toBe(false);
-    childWc.url = 'https://app.im.codes/#/remote-desktop/srv_1';
-    childWc.emit('destroyed');
-    expect(session.permissionCheckHandler!(childWc, 'fullscreen', 'https://app.im.codes')).toBe(false);
+      // Child window created via did-create-window is allowed trusted Remote Desktop permissions while on active origin,
+      // and loses them once destroyed or drifted
+      expect(session.permissionCheckHandler!(childWc, 'fullscreen', 'https://app.im.codes')).toBe(true);
+      expect(session.permissionCheckHandler!(childWc, 'keyboardLock', 'https://app.im.codes')).toBe(true);
+      expect(session.permissionCheckHandler!(childWc, 'geolocation', 'https://app.im.codes')).toBe(false);
+      childWc.url = 'https://evil.example/spoof';
+      expect(session.permissionCheckHandler!(childWc, 'fullscreen', 'https://app.im.codes')).toBe(false);
+      childWc.url = 'https://app.im.codes/#/remote-desktop/srv_1';
+      childWc.emit('destroyed');
+      expect(session.permissionCheckHandler!(childWc, 'fullscreen', 'https://app.im.codes')).toBe(false);
+    } finally {
+      shell.dispose();
+    }
   });
 
   it('omits preload in same-origin overrideBrowserWindowOptions when shell has no preloadPath', async () => {
@@ -718,6 +740,7 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       appName: 'IM.codes',
       userDataDir: tempDir,
       bindDeps: { imcodesHome: tempDir },
+      voiceDeps: mockVoiceDeps,
       createMainWindow: () => win,
       createPromptWindow: () => {
         throw new Error('unused');
@@ -728,13 +751,17 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       showMessageBox: async () => ({ response: 1 }),
     });
 
-    await shell.addAndSelectServer('https://app.im.codes');
-    const result = wc.windowOpenHandler!({ url: 'https://app.im.codes/#/remote-desktop/srv_1' });
-    expect(result.action).toBe('allow');
-    if (result.action === 'allow') {
-      expect(result.overrideBrowserWindowOptions?.webPreferences).toEqual(MAIN_WINDOW_WEB_PREFERENCES);
-      expect('preload' in (result.overrideBrowserWindowOptions?.webPreferences ?? {})).toBe(false);
-      expect('backgroundThrottling' in (result.overrideBrowserWindowOptions?.webPreferences ?? {})).toBe(false);
+    try {
+      await shell.addAndSelectServer('https://app.im.codes');
+      const result = wc.windowOpenHandler!({ url: 'https://app.im.codes/#/remote-desktop/srv_1' });
+      expect(result.action).toBe('allow');
+      if (result.action === 'allow') {
+        expect(result.overrideBrowserWindowOptions?.webPreferences).toEqual(MAIN_WINDOW_WEB_PREFERENCES);
+        expect('preload' in (result.overrideBrowserWindowOptions?.webPreferences ?? {})).toBe(false);
+        expect('backgroundThrottling' in (result.overrideBrowserWindowOptions?.webPreferences ?? {})).toBe(false);
+      }
+    } finally {
+      shell.dispose();
     }
   });
 
@@ -755,6 +782,7 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       appName: 'IM.codes',
       userDataDir: tempDir,
       bindDeps: { imcodesHome: tempDir },
+      voiceDeps: mockVoiceDeps,
       createMainWindow: (opts) => {
         capturedMainWebPreferences = opts.webPreferences;
         return {
@@ -773,16 +801,92 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       showMessageBox: async () => ({ response: 1 }),
     });
 
-    await shell.addAndSelectServer('https://app.im.codes');
-    expect(capturedMainWebPreferences).toEqual({
-      ...MAIN_WINDOW_WEB_PREFERENCES,
-      backgroundThrottling: false,
+    try {
+      await shell.addAndSelectServer('https://app.im.codes');
+      expect(capturedMainWebPreferences).toEqual({
+        ...MAIN_WINDOW_WEB_PREFERENCES,
+        backgroundThrottling: false,
+      });
+      expect(MAIN_WINDOW_WEB_PREFERENCES).toEqual({
+        nodeIntegration: false,
+        contextIsolation: true,
+        sandbox: true,
+        webviewTag: false,
+      });
+    } finally {
+      shell.dispose();
+    }
+  });
+
+  it('routes same-origin /api/downloads/ URLs to openExternal and denies blank child windows while preserving popout windows and host allowlists', () => {
+    const trusted = new Set(['https://app.im.codes']);
+    const activeOrigin = 'https://app.im.codes';
+
+    expect(isSameOriginDownloadUrl('https://app.im.codes/api/downloads/latest/desktop-mac', activeOrigin, trusted)).toBe(true);
+    expect(isSameOriginDownloadUrl('https://app.im.codes/api/downloads/latest/android-with-fcm?channel=dev', activeOrigin, trusted)).toBe(true);
+    expect(isSameOriginDownloadUrl('https://app.im.codes/api/downloads-other', activeOrigin, trusted)).toBe(false);
+    expect(isSameOriginDownloadUrl('https://app.im.codes/#/remote-desktop/srv_1', activeOrigin, trusted)).toBe(false);
+    expect(isSameOriginDownloadUrl('https://other.im.codes/api/downloads/latest/desktop-mac', activeOrigin, trusted)).toBe(false);
+
+    const session = new MockSession();
+    const wc = new MockWebContents(session);
+    wc.url = 'https://app.im.codes/';
+    const openExternal = vi.fn();
+
+    attachWindowSecurityGuards({
+      webContents: wc,
+      session,
+      getActiveOrigin: () => activeOrigin,
+      getTrustedOrigins: () => trusted,
+      getCurrentTrustedOrigin: () => activeOrigin,
+      openExternal,
+      promptSavePathSync: () => undefined,
     });
-    expect(MAIN_WINDOW_WEB_PREFERENCES).toEqual({
-      nodeIntegration: false,
-      contextIsolation: true,
-      sandbox: true,
-      webviewTag: false,
+
+    const downloadUrl = 'https://app.im.codes/api/downloads/latest/desktop-mac';
+    expect(wc.windowOpenHandler!({ url: downloadUrl })).toEqual({ action: 'deny' });
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    expect(openExternal).toHaveBeenCalledWith(downloadUrl);
+
+    // Embedded credentials are still rejected before openExternal
+    openExternal.mockClear();
+    expect(wc.windowOpenHandler!({ url: 'https://user:pass@app.im.codes/api/downloads/latest/desktop-mac' })).toEqual({
+      action: 'deny',
     });
+    expect(openExternal).not.toHaveBeenCalled();
+
+    // Non-download same-origin popouts still open cleanly
+    expect(wc.windowOpenHandler!({ url: 'https://app.im.codes/#/remote-desktop/srv_1' })).toMatchObject({
+      action: 'allow',
+    });
+    expect(openExternal).not.toHaveBeenCalled();
+
+    // Child windows inherit the same /api/downloads/ external handoff guard
+    const childWc = new MockWebContents(session);
+    childWc.url = 'https://app.im.codes/#/remote-desktop/srv_1';
+    wc.emit('did-create-window', { webContents: childWc });
+    expect(childWc.windowOpenHandler!({ url: downloadUrl })).toEqual({ action: 'deny' });
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    expect(openExternal).toHaveBeenCalledWith(downloadUrl);
+
+    // Explicit externalDocsHosts allowlist is never bypassed by same-origin /api/downloads/
+    const restrictedSession = new MockSession();
+    const restrictedWc = new MockWebContents(restrictedSession);
+    restrictedWc.url = 'https://app.im.codes/';
+    const restrictedOpenExternal = vi.fn();
+
+    attachWindowSecurityGuards({
+      webContents: restrictedWc,
+      session: restrictedSession,
+      getActiveOrigin: () => activeOrigin,
+      getTrustedOrigins: () => trusted,
+      getCurrentTrustedOrigin: () => activeOrigin,
+      openExternal: restrictedOpenExternal,
+      promptSavePathSync: () => undefined,
+      externalDocsHosts: ['docs.im.codes'],
+    });
+
+    expect(restrictedWc.windowOpenHandler!({ url: downloadUrl })).toEqual({ action: 'deny' });
+    expect(restrictedOpenExternal).not.toHaveBeenCalled();
   });
 });

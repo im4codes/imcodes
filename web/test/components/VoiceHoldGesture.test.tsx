@@ -1778,7 +1778,7 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
             build.onLoad({ filter: /.*/, namespace: 'stub' }, (args) => {
               if (args.path === 'voice-input-stub') {
                 return {
-                  contents: 'export const isAvailable=()=>true;export const prewarm=(o)=>window.__voiceMock.prewarm(o);export const primeVoiceGesture=(o)=>window.__voiceMock.primeVoiceGesture?.(o)??window.__voiceMock.primeWebGesture?.(o)??false;export const cancelVoiceGesturePrime=()=>(window.__voiceMock.cancelVoiceGesturePrime??window.__voiceMock.cancelWebGesturePrime)?.();export const triggerHapticFeedback=(m)=>window.__voiceMock.triggerHapticFeedback?.(m)??Promise.resolve();export const primeWebGesture=(o)=>window.__voiceMock.primeWebGesture?.(o)??false;export const cancelWebGesturePrime=()=>window.__voiceMock.cancelWebGesturePrime?.();export const startListening=(...a)=>window.__voiceMock.startListening(...a);export const stopListening=(o)=>window.__voiceMock.stopListening(o);export const onAudioLevel=(cb)=>window.__voiceMock.onAudioLevel(cb);',
+                  contents: 'export const isAvailable=()=>true;export const prewarm=(o)=>window.__voiceMock.prewarm(o);export const primeVoiceGesture=(o)=>window.__voiceMock.primeVoiceGesture?.(o)??window.__voiceMock.primeWebGesture?.(o)??false;export const cancelVoiceGesturePrime=()=>(window.__voiceMock.cancelVoiceGesturePrime??window.__voiceMock.cancelWebGesturePrime)?.();export const triggerHapticFeedback=(m,s)=>window.__voiceMock.triggerHapticFeedback?.(m,s)??Promise.resolve();export const primeWebGesture=(o)=>window.__voiceMock.primeWebGesture?.(o)??false;export const cancelWebGesturePrime=()=>window.__voiceMock.cancelWebGesturePrime?.();export const startListening=(...a)=>window.__voiceMock.startListening(...a);export const stopListening=(o)=>window.__voiceMock.stopListening(o);export const onAudioLevel=(cb)=>window.__voiceMock.onAudioLevel(cb);',
                   loader: 'js',
                 };
               }
@@ -4743,5 +4743,69 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
     } finally {
       resetRemoteVoiceClientForTesting();
     }
+  });
+
+  it('triggers distinct tactile haptics for hold, zone boundary slides, send, edit, and cancel without jitter', async () => {
+    const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+    const renderControls = () => render(
+      <SessionControls
+        ws={ws}
+        activeSession={makeSession()}
+        quickData={makeQuickData()}
+        sessions={[]}
+        subSessions={[]}
+        serverId="srv-1"
+      />,
+    );
+
+    // 1. Hold + slide left (cancel) + slide center (send) + slide right (edit) + release in edit
+    const view1 = renderControls();
+    let input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180, 500, 1);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('edit me');
+    await vi.advanceTimersByTimeAsync(0);
+
+    dispatchPointer(input, 'pointermove', 90, 500, 1);
+    dispatchPointer(input, 'pointermove', 85, 500, 1); // same zone: no extra haptic
+    dispatchPointer(input, 'pointermove', 180, 500, 1);
+    dispatchPointer(input, 'pointermove', 280, 500, 1);
+    dispatchPointer(input, 'pointerup', 280, 500, 1);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(vibrate.mock.calls.map(([ms]) => ms)).toEqual([20, 12, 12, 12, 12]);
+    view1.unmount();
+
+    // 2. Hold + record + release in center -> success haptic (18ms)
+    vibrate.mockClear();
+    const view2 = renderControls();
+    input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('hello send');
+    await vi.advanceTimersByTimeAsync(0);
+    dispatchPointer(input, 'pointerup', 180, 500, 2);
+    await vi.advanceTimersByTimeAsync(350);
+
+    expect(vibrate.mock.calls.map(([ms]) => ms)).toEqual([20, 18]);
+    view2.unmount();
+
+    // 3. Hold + record + slide left + release in cancel -> warning haptic (15ms)
+    vibrate.mockClear();
+    const view3 = renderControls();
+    input = document.querySelector('.controls-input') as HTMLElement;
+    dispatchPointer(input, 'pointerdown', 180, 500, 3);
+    await vi.advanceTimersByTimeAsync(175);
+    voiceMock.listeningHandler?.(true);
+    voiceMock.partialHandler?.('abort me');
+    await vi.advanceTimersByTimeAsync(0);
+    dispatchPointer(input, 'pointermove', 90, 500, 3);
+    dispatchPointer(input, 'pointerup', 90, 500, 3);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(vibrate.mock.calls.map(([ms]) => ms)).toEqual([20, 12, 15]);
+    view3.unmount();
   });
 });

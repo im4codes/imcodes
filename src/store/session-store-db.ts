@@ -35,6 +35,8 @@ export const SESSION_DB_SCHEMA_VERSION = 1;
 export const SESSION_DB_BLOB_TABLE = 'session_blobs';
 export const SESSION_DB_META_LEGACY_IMPORT = 'legacy_json_import';
 export const SESSION_DB_LEGACY_IMPORT_DONE = 'done';
+export const SESSION_DB_META_LEGITIMATE_EMPTY = 'legitimate_empty';
+export const SESSION_DB_LEGITIMATE_EMPTY_VALUE = '1';
 const BUSY_TIMEOUT_MS = 5_000;
 
 export interface SessionDbRow {
@@ -335,7 +337,15 @@ function bindRow(row: SessionDbRow): [string, string, string | null, string, str
  */
 export function commitSessionChanges(
   handle: SessionDbHandle,
-  changes: { upserts: SessionDbRow[]; deletes: string[]; allowEmpty: boolean; /** Some row stopped referring to a blob it had. */ collectBlobs?: boolean },
+  changes: {
+    upserts: SessionDbRow[];
+    deletes: string[];
+    allowEmpty: boolean;
+    /** Explicit administrative clear or confirmed shutdown that intentionally leaves 0 rows. */
+    markLegitimateEmpty?: boolean;
+    /** Some row stopped referring to a blob it had. */
+    collectBlobs?: boolean;
+  },
 ): void {
   if (handle.readOnly) throw new Error('session store connection is read-only');
   const { db } = handle;
@@ -348,9 +358,21 @@ export function commitSessionChanges(
     for (const row of changes.upserts) { noteRowWrite(); upsert.run(...bindRow(row)); }
     for (const name of changes.deletes) { noteRowWrite(); remove.run(name); }
     if (changes.collectBlobs || changes.deletes.length > 0) collectUnreferencedBlobs(handle);
-    if (!changes.allowEmpty && changes.deletes.length > 0 && countSessionRows(handle) === 0) {
-      // Emptying the store is an explicit administrative act, never a side effect.
-      throw new EmptyStoreRefusal();
+    if (changes.upserts.length > 0) {
+      db.prepare('DELETE FROM session_store_meta WHERE key = ?').run(SESSION_DB_META_LEGITIMATE_EMPTY);
+    } else if (changes.deletes.length > 0 && countSessionRows(handle) === 0) {
+      if (!changes.allowEmpty) {
+        // Emptying the store is an explicit administrative act, never a side effect.
+        throw new EmptyStoreRefusal();
+      }
+      if (changes.markLegitimateEmpty) {
+        db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(
+          SESSION_DB_META_LEGITIMATE_EMPTY,
+          SESSION_DB_LEGITIMATE_EMPTY_VALUE,
+        );
+      } else {
+        db.prepare('DELETE FROM session_store_meta WHERE key = ?').run(SESSION_DB_META_LEGITIMATE_EMPTY);
+      }
     }
     db.exec('COMMIT');
   } catch (error) {
@@ -401,6 +423,9 @@ export function importLegacySessions(
       imported += Number(insertMissing.run(...bindRow(row)).changes);
     }
     db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_LEGACY_IMPORT, SESSION_DB_LEGACY_IMPORT_DONE);
+    if (countSessionRows(handle) > 0) {
+      db.prepare('DELETE FROM session_store_meta WHERE key = ?').run(SESSION_DB_META_LEGITIMATE_EMPTY);
+    }
     db.exec('COMMIT');
     return { imported, keptExisting: rows.length - imported };
   } catch (error) {

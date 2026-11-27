@@ -104,11 +104,13 @@ export const PREVIEW_LIMITS = {
    * byte-cap exemption.
    */
   MAX_PREVIEW_STREAM_BUFFER_BYTES: previewLimitFromEnv('PREVIEW_MAX_STREAM_BUFFER_BYTES', 16 * 1024 * 1024),
-  MAX_WS_PER_PREVIEW: 8,
-  MAX_WS_PER_SERVER: 16,
-  MAX_WS_MESSAGE_BYTES: 1_048_576, // 1MB
-  WS_IDLE_TIMEOUT_MS: 300_000, // 5 minutes
-  WS_OPEN_TIMEOUT_MS: 15_000, // 15 seconds
+  MAX_WS_PER_PREVIEW: previewLimitFromEnv('PREVIEW_MAX_WS_PER_PREVIEW', 8),
+  MAX_WS_PER_SERVER: previewLimitFromEnv('PREVIEW_MAX_WS_PER_SERVER', 16),
+  MAX_WS_MESSAGE_BYTES: previewLimitFromEnv('PREVIEW_MAX_WS_MESSAGE_BYTES', 4 * 1024 * 1024), // 4MB
+  WS_IDLE_TIMEOUT_MS: previewLimitFromEnv('PREVIEW_WS_IDLE_TIMEOUT_MS', 300_000), // 5 minutes
+  WS_OPEN_TIMEOUT_MS: previewLimitFromEnv('PREVIEW_WS_OPEN_TIMEOUT_MS', 15_000), // 15 seconds
+  WS_KEEPALIVE_MS: previewLimitFromEnv('PREVIEW_WS_KEEPALIVE_MS', 25_000), // 25 seconds
+  SSE_KEEPALIVE_MS: previewLimitFromEnv('PREVIEW_SSE_KEEPALIVE_MS', 25_000), // 25 seconds
   MAX_WS_PENDING_QUEUE_BYTES: 65_536, // 64KB
 } as const;
 
@@ -231,6 +233,8 @@ export interface PreviewWsErrorMessage {
   type: typeof PREVIEW_MSG.WS_ERROR;
   wsId: string;
   error: string;
+  /** Optional upstream HTTP rejection status when available (backward-compatible). */
+  status?: number;
 }
 
 export function packPreviewBinaryFrame(frameType: PreviewBinaryFrameType, requestId: string, payload: Uint8Array): Buffer {

@@ -14,6 +14,7 @@ import { findInactiveUsers, loadUserSessionValidAfters } from '../security/user-
 import logger from '../util/logger.js';
 import { WsBridge } from './bridge.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
+import { pushStreamHub, type PushStreamHub } from '../services/push-stream-hub.js';
 import { remoteVoiceHub } from '../services/remote-voice-hub.js';
 
 export interface AccountWatchResult {
@@ -43,7 +44,36 @@ export function evictStaleUserBrowserSockets(
   return closed;
 }
 
-/** Close the live connections of every connected user whose account is not active, and stale browser sockets when email auth is enabled. Idempotent. */
+/** Close live SSE push streams whose backing API key was revoked or grace-expired. */
+export async function closeRevokedPushStreams(
+  db: Database,
+  streamHub: PushStreamHub = pushStreamHub,
+  now = Date.now(),
+): Promise<number> {
+  const live = streamHub.collectLiveCredentials();
+  if (live.length === 0) return 0;
+
+  const keyIds = new Set<string>();
+  for (const { credential } of live) {
+    if (credential.kind === 'api_key' && credential.keyId) keyIds.add(credential.keyId);
+  }
+  if (keyIds.size === 0) return 0;
+
+  const rows = await db.query<{ id: string }>(
+    `SELECT id FROM api_keys
+      WHERE id = ANY($1::text[])
+        AND (revoked_at IS NOT NULL OR (grace_expires_at IS NOT NULL AND grace_expires_at <= $2))`,
+    [[...keyIds], now],
+  );
+  if (rows.length === 0) return 0;
+  const invalidKeyIds = new Set(rows.map((r) => r.id));
+
+  return streamHub.closeMatchingSubscriptions((_userId, sub) => (
+    sub.credential?.kind === 'api_key' && invalidKeyIds.has(sub.credential.keyId)
+  ));
+}
+
+/** Close the live connections of every connected user whose account is not active, revoked SSE push streams, and stale browser sockets when email auth is enabled. Idempotent; safe to call from the disable route. */
 export async function closeConnectionsOfInactiveUsers(
   db: Database,
   bridges: Iterable<WsBridge> = WsBridge.getAll().values(),
@@ -53,6 +83,7 @@ export async function closeConnectionsOfInactiveUsers(
   const live = new Set<string>();
   for (const bridge of all) bridge.collectLiveUserIds(live);
   globalTaskHub.collectLiveUserIds(live);
+  pushStreamHub.collectLiveUserIds(live);
   remoteVoiceHub.collectLiveUserIds(live);
   if (live.size === 0) return { inactiveUsers: 0, browserSockets: 0, daemons: 0 };
   const liveIds = [...live];
@@ -60,6 +91,7 @@ export async function closeConnectionsOfInactiveUsers(
   const result: AccountWatchResult = { inactiveUsers: inactive.size, browserSockets: 0, daemons: 0 };
   if (inactive.size > 0) {
     result.browserSockets += globalTaskHub.closeInactiveUserSockets(inactive);
+    result.browserSockets += pushStreamHub.closeInactiveUsers(inactive);
     result.browserSockets += remoteVoiceHub.closeInactiveUserSockets(inactive);
     for (const bridge of all) {
       const closed = bridge.closeConnectionsOfUsers(inactive, userStatusDenialCode(USER_STATUS.DISABLED));
@@ -67,6 +99,14 @@ export async function closeConnectionsOfInactiveUsers(
       if (closed.daemon) result.daemons += 1;
     }
     logger.warn({ ...result }, 'closed live connections of accounts that may no longer act');
+  }
+
+  const revokedPushClosed = await closeRevokedPushStreams(db).catch((err) => {
+    logger.warn({ err }, 'push stream credential watch failed');
+    return 0;
+  });
+  if (inactive.size === 0 && revokedPushClosed > 0) {
+    result.browserSockets += revokedPushClosed;
   }
 
   const shouldEvictSessionReset = options?.emailAuthEnabled ?? isEmailAuthEnabled(process.env);

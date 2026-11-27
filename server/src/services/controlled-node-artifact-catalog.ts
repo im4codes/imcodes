@@ -25,6 +25,8 @@ import {
   controlledNodeDaemonRuntimeTarget,
   controlledNodeReleaseArtifactEntryKey,
   normalizeControlledNodeArtifactPair,
+  resolveControlledNodeRuntimeArch,
+  type ControlledNodeArch,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
 } from '../../../shared/controlled-node-artifacts.js';
@@ -964,6 +966,81 @@ export interface ControlledNodeUpgradeArtifactAvailability {
  * and manual upgrade endpoints stay aligned when an image intentionally omits
  * a platform (e.g. Windows artifacts on `:dev` builds).
  */
+export type NodeDesktopReleaseManifestCheckResult =
+  | { ok: true; releaseManifestSha256?: string }
+  | { ok: false; error: 'desktop_release_manifest_invalid' | 'desktop_release_manifest_mismatch'; reason?: string };
+
+/**
+ * Verify published per-target Desktop Release Manifest alignment for a `node` artifact.
+ * For `mac:universal`, uses the resolved runtime arch when known (returning its pinned
+ * manifest SHA-256), and verifies all published macOS targets (`darwin-arm64`,
+ * `darwin-x64`) while omitting an ambiguous pinned hash when runtime arch is unknown.
+ */
+export async function verifyDesktopReleaseManifestForNodeArtifact(
+  dir: string,
+  artifactOs: ControlledNodeOs,
+  artifactArch: ControlledNodeArtifactArch,
+  descriptor: { version: string; sha256: string; sizeBytes: number },
+  runtimeArch?: ControlledNodeArch | null,
+): Promise<NodeDesktopReleaseManifestCheckResult> {
+  const isUniversalMac = artifactOs === CONTROLLED_NODE_OS_MAC
+    && artifactArch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL;
+  let targetsToCheck: DesktopReleaseTarget[] = [];
+  let emitPinnedHeader = false;
+
+  if (isUniversalMac) {
+    if (runtimeArch) {
+      const target = controlledNodeDaemonRuntimeTarget(artifactOs, runtimeArch);
+      if (target) {
+        targetsToCheck = [target];
+        emitPinnedHeader = true;
+      }
+    } else {
+      targetsToCheck = [CONTROLLED_NODE_ARCH_ARM64, CONTROLLED_NODE_ARCH_X64]
+        .map((candidate) => controlledNodeDaemonRuntimeTarget(artifactOs, candidate))
+        .filter((target): target is DesktopReleaseTarget => target !== null);
+      emitPinnedHeader = false;
+    }
+  } else {
+    const target = controlledNodeDaemonRuntimeTarget(artifactOs, artifactArch);
+    if (target) {
+      targetsToCheck = [target];
+      emitPinnedHeader = true;
+    }
+  }
+
+  let releaseManifestSha256: string | undefined;
+  let sawPublished = false;
+  let sawNotPublished = false;
+  for (const target of targetsToCheck) {
+    const releaseCheck = await openDesktopReleaseManifestArtifact(dir, target);
+    if (releaseCheck.status === 'invalid') {
+      return { ok: false, error: 'desktop_release_manifest_invalid', reason: releaseCheck.reason };
+    }
+    if (releaseCheck.status === 'not_published') {
+      sawNotPublished = true;
+      continue;
+    }
+    sawPublished = true;
+    await releaseCheck.close();
+    const entry = releaseCheck.manifest.targets[target]?.components['imcodes-node'];
+    if (entry && (entry.sha256 !== descriptor.sha256 || entry.sizeBytes !== descriptor.sizeBytes || entry.version !== descriptor.version)) {
+      return { ok: false, error: 'desktop_release_manifest_mismatch' };
+    }
+    if (emitPinnedHeader) {
+      releaseManifestSha256 = releaseCheck.sha256;
+    }
+  }
+  if (isUniversalMac && !runtimeArch && sawPublished && sawNotPublished) {
+    return {
+      ok: false,
+      error: 'desktop_release_manifest_invalid',
+      reason: 'partial_macos_release_manifest',
+    };
+  }
+  return { ok: true, ...(releaseManifestSha256 ? { releaseManifestSha256 } : {}) };
+}
+
 export async function checkControlledNodeUpgradeArtifactAvailability(input: {
   os?: string | null;
   arch?: string | null;
@@ -989,16 +1066,16 @@ export async function checkControlledNodeUpgradeArtifactAvailability(input: {
   }
 
   const rawArch = typeof input.arch === 'string' && input.arch.trim() ? input.arch.trim().toLowerCase() : null;
-  const fallbackArch = os === CONTROLLED_NODE_OS_MAC
-    ? CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL
-    : CONTROLLED_NODE_ARCH_X64;
+  const resolvedArtifactArch = os === CONTROLLED_NODE_OS_MAC
+    ? (resolveControlledNodeRuntimeArch(rawArch) ?? CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL)
+    : (rawArch ?? CONTROLLED_NODE_ARCH_X64);
   const profile = input.abiProfile === undefined || input.abiProfile === null
     ? CONTROLLED_NODE_ABI_MODERN
     : normalizeControlledNodeAbiProfile(input.abiProfile);
   if (!profile) {
     return { configured: true, available: false, reason: 'executable_not_built' };
   }
-  const artifactTarget = normalizeControlledNodeArtifactPair(os, rawArch ?? fallbackArch, profile);
+  const artifactTarget = normalizeControlledNodeArtifactPair(os, resolvedArtifactArch, profile);
   if (!artifactTarget) {
     return { configured: true, available: false, reason: 'executable_not_built' };
   }
@@ -1025,22 +1102,15 @@ export async function checkControlledNodeUpgradeArtifactAvailability(input: {
   }
 
   if (targetAbi === CONTROLLED_NODE_ABI_MODERN) {
-    const nodeReleaseTarget = controlledNodeDaemonRuntimeTarget(
+    const manifestCheck = await verifyDesktopReleaseManifestForNodeArtifact(
+      dir,
       artifactTarget.os,
-      artifactTarget.arch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL ? CONTROLLED_NODE_ARCH_ARM64 : artifactTarget.arch,
+      artifactTarget.arch,
+      v.descriptor,
+      resolveControlledNodeRuntimeArch(rawArch),
     );
-    const releaseCheck = await openDesktopReleaseManifestArtifact(dir, nodeReleaseTarget);
-    if (releaseCheck.status === 'invalid') {
-      return { configured: true, available: false, reason: 'desktop_release_manifest_invalid' };
-    }
-    if (releaseCheck.status === 'ok') {
-      await releaseCheck.close();
-      const entry = nodeReleaseTarget
-        ? releaseCheck.manifest.targets[nodeReleaseTarget]?.components['imcodes-node']
-        : undefined;
-      if (entry && (entry.sha256 !== v.descriptor.sha256 || entry.sizeBytes !== v.descriptor.sizeBytes || entry.version !== v.descriptor.version)) {
-        return { configured: true, available: false, reason: 'desktop_release_manifest_mismatch' };
-      }
+    if (!manifestCheck.ok) {
+      return { configured: true, available: false, reason: manifestCheck.error };
     }
   }
 

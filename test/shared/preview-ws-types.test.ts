@@ -53,8 +53,8 @@ describe('PREVIEW_LIMITS WS constants', () => {
     expect(PREVIEW_LIMITS.MAX_WS_PER_SERVER).toBe(16);
   });
 
-  it('exports MAX_WS_MESSAGE_BYTES as 1MB', () => {
-    expect(PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES).toBe(1_048_576);
+  it('exports MAX_WS_MESSAGE_BYTES as 4MB', () => {
+    expect(PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES).toBe(4 * 1024 * 1024);
   });
 
   it('exports WS_IDLE_TIMEOUT_MS as 5 minutes', () => {
@@ -63,6 +63,11 @@ describe('PREVIEW_LIMITS WS constants', () => {
 
   it('exports WS_OPEN_TIMEOUT_MS as 15 seconds', () => {
     expect(PREVIEW_LIMITS.WS_OPEN_TIMEOUT_MS).toBe(15_000);
+  });
+
+  it('exports WS_KEEPALIVE_MS and SSE_KEEPALIVE_MS as 25 seconds', () => {
+    expect(PREVIEW_LIMITS.WS_KEEPALIVE_MS).toBe(25_000);
+    expect(PREVIEW_LIMITS.SSE_KEEPALIVE_MS).toBe(25_000);
   });
 
   it('exports MAX_WS_PENDING_QUEUE_BYTES as 64KB', () => {

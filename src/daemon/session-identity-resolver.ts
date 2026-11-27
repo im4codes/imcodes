@@ -1,5 +1,6 @@
 import {
   SESSION_IDENTITY_SCOPES,
+  SESSION_IDENTITY_SCOPE_LIST,
   renderSessionIdentityProfiles,
   sessionIdentityProjectKey,
   sessionIdentitySessionKey,
@@ -8,7 +9,14 @@ import {
 import { identityPromptHash } from '../util/identity-prompt-hash.js';
 import { incrementCounter } from '../util/metrics.js';
 import logger from '../util/logger.js';
-import { listLocalSessionIdentityProfiles, putLocalSessionIdentityProfile } from './session-identity-local-store.js';
+import {
+  getLocalSessionIdentityProfilesByKeys,
+  listLocalSessionIdentityMetadata,
+  putLocalSessionIdentityProfile,
+  withLocalSessionIdentityReadSnapshot,
+  type SessionIdentityProfileKey,
+  type SessionIdentityProfileMeta,
+} from './session-identity-local-store.js';
 
 /**
  * The ONE place a session's effective identity prompt is derived.
@@ -30,6 +38,10 @@ export interface IdentitySessionRef {
   pairTaskId?: string;
 }
 
+export interface IdentityDriftSessionRef extends IdentitySessionRef {
+  appliedIdentityHash?: string;
+}
+
 export interface ResolvedIdentity {
   /** The rendered contract, or undefined when no profile applies. */
   prompt: string | undefined;
@@ -44,9 +56,43 @@ export interface IdentityPersistDeps {
 
 export interface IdentityResolverDeps {
   listProfiles?: () => Promise<readonly SessionIdentityProfile[]>;
+  listMetadata?: () => Promise<readonly SessionIdentityProfileMeta[]>;
+  getProfilesByKeys?: (keys: readonly SessionIdentityProfileKey[]) => Promise<readonly SessionIdentityProfile[]>;
   /** This daemon's bound serverId (the SESSION-scope key is `<serverId>:<sessionName>`). */
   boundServerId?: () => Promise<string | undefined>;
   pairTaskIdForSession?: (sessionName: string) => string | undefined;
+}
+
+const SHARE_KEY_HASH_CACHE_MAX = 2048;
+/** Bounded LRU cache mapping `shareKey` -> rendered `hash` ONLY (never caches large `content`/`prompt` strings). */
+const shareKeyHashCache = new Map<string, string | undefined>();
+
+function getCachedShareHash(shareKey: string): { hit: boolean; hash: string | undefined } {
+  if (!shareKeyHashCache.has(shareKey)) return { hit: false, hash: undefined };
+  const hash = shareKeyHashCache.get(shareKey);
+  shareKeyHashCache.delete(shareKey);
+  shareKeyHashCache.set(shareKey, hash);
+  return { hit: true, hash };
+}
+
+function setCachedShareHash(shareKey: string, hash: string | undefined): void {
+  if (shareKeyHashCache.has(shareKey)) {
+    shareKeyHashCache.delete(shareKey);
+  }
+  shareKeyHashCache.set(shareKey, hash);
+  while (shareKeyHashCache.size > SHARE_KEY_HASH_CACHE_MAX) {
+    const oldest = shareKeyHashCache.keys().next().value;
+    if (oldest === undefined) break;
+    shareKeyHashCache.delete(oldest);
+  }
+}
+
+export function resetSessionIdentityResolverCacheForTests(): void {
+  shareKeyHashCache.clear();
+}
+
+export function identityResolverCacheStatsForTests(): { size: number; max: number } {
+  return { size: shareKeyHashCache.size, max: SHARE_KEY_HASH_CACHE_MAX };
 }
 
 async function defaultBoundServerId(): Promise<string | undefined> {
@@ -96,12 +142,12 @@ async function resolvePairTaskId(
   return defaultActivePairTaskIdForSession(session.name);
 }
 
-export function profilesForSession(
-  profiles: readonly SessionIdentityProfile[],
+export function profilesForSession<T extends SessionIdentityProfileMeta>(
+  profiles: readonly T[],
   session: IdentitySessionRef,
   serverId: string,
   pairTaskId?: string,
-): SessionIdentityProfile[] {
+): T[] {
   const sessionKey = sessionIdentitySessionKey(serverId, session.name);
   const projectKey = sessionIdentityProjectKey({
     contextNamespace: session.contextNamespace,
@@ -116,6 +162,139 @@ export function profilesForSession(
   ));
 }
 
+interface SessionWithResolvedKeys<T extends IdentitySessionRef> {
+  session: T;
+  pairTaskId?: string;
+}
+
+const MAX_SPLIT_CONSISTENCY_ATTEMPTS = 3;
+
+async function resolveAllSessionKeys<T extends IdentitySessionRef>(
+  sessions: readonly T[],
+  deps: IdentityResolverDeps,
+): Promise<{ serverId: string; entries: SessionWithResolvedKeys<T>[] }> {
+  const serverId = (await (deps.boundServerId ?? defaultBoundServerId)()) ?? '';
+  const entries: SessionWithResolvedKeys<T>[] = [];
+  for (const session of sessions) {
+    const pairTaskId = await resolvePairTaskId(session, deps);
+    entries.push({ session, pairTaskId });
+  }
+  return { serverId, entries };
+}
+
+function shareKeyForProfiles(applicable: readonly SessionIdentityProfileMeta[]): string {
+  const ordered = [...applicable].sort((a, b) => (
+    (SESSION_IDENTITY_SCOPE_LIST.indexOf(a.scope) - SESSION_IDENTITY_SCOPE_LIST.indexOf(b.scope))
+    || (a.scopeKey < b.scopeKey ? -1 : a.scopeKey > b.scopeKey ? 1 : 0)
+  ));
+  return ordered.map((profile) => `${profile.scope}\0${profile.scopeKey}\0${profile.contentHash}`).join('\n');
+}
+
+function profileMapKey(scope: SessionIdentityProfileMeta['scope'], scopeKey: string): string {
+  return `${scope}\0${scopeKey}`;
+}
+
+function collectGroupKeys(groups: ReadonlyMap<string, SessionIdentityProfileMeta[]>): SessionIdentityProfileKey[] {
+  const neededKeys: SessionIdentityProfileKey[] = [];
+  const seenKeyIds = new Set<string>();
+  for (const applicable of groups.values()) {
+    for (const meta of applicable) {
+      const id = profileMapKey(meta.scope, meta.scopeKey);
+      if (seenKeyIds.has(id)) continue;
+      seenKeyIds.add(id);
+      neededKeys.push({ scope: meta.scope, scopeKey: meta.scopeKey });
+    }
+  }
+  return neededKeys;
+}
+
+function assembleConsistentGroups(
+  groups: ReadonlyMap<string, SessionIdentityProfileMeta[]>,
+  fetched: readonly SessionIdentityProfile[],
+): { rendered: Map<string, ResolvedIdentity>; inconsistentShareKeys: Set<string> } {
+  const byKey = new Map<string, SessionIdentityProfile>();
+  for (const profile of fetched) {
+    byKey.set(profileMapKey(profile.scope, profile.scopeKey), profile);
+  }
+  const rendered = new Map<string, ResolvedIdentity>();
+  const inconsistentShareKeys = new Set<string>();
+  for (const [shareKey, applicable] of groups) {
+    const resolvedProfiles: SessionIdentityProfile[] = [];
+    let consistent = true;
+    for (const meta of applicable) {
+      const loaded = byKey.get(profileMapKey(meta.scope, meta.scopeKey));
+      if (!loaded || loaded.contentHash !== meta.contentHash) {
+        consistent = false;
+        break;
+      }
+      resolvedProfiles.push(loaded);
+    }
+    if (!consistent) {
+      // Never render partial/missing layers or populate cache from a torn snapshot.
+      inconsistentShareKeys.add(shareKey);
+      continue;
+    }
+    const prompt = renderSessionIdentityProfiles(resolvedProfiles);
+    const resolved: ResolvedIdentity = { prompt, hash: identityPromptHash(prompt) };
+    rendered.set(shareKey, resolved);
+    setCachedShareHash(shareKey, resolved.hash);
+  }
+  return { rendered, inconsistentShareKeys };
+}
+
+function evaluateDriftPlan(
+  entries: readonly SessionWithResolvedKeys<IdentityDriftSessionRef>[],
+  metadata: readonly SessionIdentityProfileMeta[],
+  serverId: string,
+): {
+  candidates: Array<{ session: IdentityDriftSessionRef; shareKey: string }>;
+  groupsToLoad: Map<string, SessionIdentityProfileMeta[]>;
+  emptyDrifted: Array<{ name: string; resolved: ResolvedIdentity }>;
+} {
+  const candidates: Array<{ session: IdentityDriftSessionRef; shareKey: string }> = [];
+  const groupsToLoad = new Map<string, SessionIdentityProfileMeta[]>();
+  const emptyDrifted: Array<{ name: string; resolved: ResolvedIdentity }> = [];
+
+  for (const { session, pairTaskId } of entries) {
+    const applicable = profilesForSession(metadata, session, serverId, pairTaskId);
+    const shareKey = shareKeyForProfiles(applicable);
+    const cached = getCachedShareHash(shareKey);
+    if (cached.hit && session.appliedIdentityHash === cached.hash) {
+      continue;
+    }
+    if (applicable.length === 0) {
+      setCachedShareHash(shareKey, undefined);
+      if (session.appliedIdentityHash !== undefined) {
+        emptyDrifted.push({ name: session.name, resolved: { prompt: undefined, hash: undefined } });
+      }
+      continue;
+    }
+    candidates.push({ session, shareKey });
+    if (!groupsToLoad.has(shareKey)) {
+      groupsToLoad.set(shareKey, applicable);
+    }
+  }
+  return { candidates, groupsToLoad, emptyDrifted };
+}
+
+function finalizeDriftedMap(
+  emptyDrifted: ReadonlyArray<{ name: string; resolved: ResolvedIdentity }>,
+  candidates: ReadonlyArray<{ session: IdentityDriftSessionRef; shareKey: string }>,
+  rendered: ReadonlyMap<string, ResolvedIdentity>,
+): Map<string, ResolvedIdentity> {
+  const out = new Map<string, ResolvedIdentity>();
+  for (const { name, resolved } of emptyDrifted) {
+    out.set(name, resolved);
+  }
+  for (const { session, shareKey } of candidates) {
+    const resolved = rendered.get(shareKey);
+    if (resolved && session.appliedIdentityHash !== resolved.hash) {
+      out.set(session.name, resolved);
+    }
+  }
+  return out;
+}
+
 /**
  * Resolve the effective identity of many sessions in one pass. Sessions that share the same set of profiles (the
  * 117 sessions of one user contract) share one rendering. Throws when the identity store cannot be read: a caller that
@@ -125,24 +304,156 @@ export async function resolveEffectiveIdentities(
   sessions: readonly IdentitySessionRef[],
   deps: IdentityResolverDeps = {},
 ): Promise<Map<string, ResolvedIdentity>> {
-  const profiles = await (deps.listProfiles ?? listLocalSessionIdentityProfiles)();
-  const serverId = (await (deps.boundServerId ?? defaultBoundServerId)()) ?? '';
-  const rendered = new Map<string, ResolvedIdentity>();
-  const out = new Map<string, ResolvedIdentity>();
-  for (const session of sessions) {
-    const pairTaskId = await resolvePairTaskId(session, deps);
-    const applicable = profilesForSession(profiles, session, serverId, pairTaskId);
-    // The same profiles at the same revisions render the same text.
-    const shareKey = applicable.map((profile) => `${profile.scope}\0${profile.scopeKey}\0${profile.contentHash}`).join('\n');
-    let resolved = rendered.get(shareKey);
-    if (!resolved) {
-      const prompt = renderSessionIdentityProfiles(applicable);
-      resolved = { prompt, hash: identityPromptHash(prompt) };
-      rendered.set(shareKey, resolved);
+  if (deps.listProfiles) {
+    const [profiles, { serverId, entries }] = await Promise.all([
+      deps.listProfiles(),
+      resolveAllSessionKeys(sessions, deps),
+    ]);
+    const rendered = new Map<string, ResolvedIdentity>();
+    const out = new Map<string, ResolvedIdentity>();
+    for (const { session, pairTaskId } of entries) {
+      const applicable = profilesForSession(profiles, session, serverId, pairTaskId);
+      const shareKey = shareKeyForProfiles(applicable);
+      let resolved = rendered.get(shareKey);
+      if (!resolved) {
+        const prompt = renderSessionIdentityProfiles(applicable);
+        resolved = { prompt, hash: identityPromptHash(prompt) };
+        rendered.set(shareKey, resolved);
+      }
+      out.set(session.name, resolved);
     }
-    out.set(session.name, resolved);
+    return out;
   }
-  return out;
+
+  // Resolve all async server/pair keys BEFORE entering the SQLite read snapshot so
+  // concurrent add+delete updates during async awaits never split the store read.
+  const { serverId, entries } = await resolveAllSessionKeys(sessions, deps);
+
+  const buildGroups = (metadata: readonly SessionIdentityProfileMeta[]) => {
+    const groups = new Map<string, SessionIdentityProfileMeta[]>();
+    const sessionShareKeys: Array<{ name: string; shareKey: string }> = [];
+    for (const { session, pairTaskId } of entries) {
+      const applicable = profilesForSession(metadata, session, serverId, pairTaskId);
+      const shareKey = shareKeyForProfiles(applicable);
+      sessionShareKeys.push({ name: session.name, shareKey });
+      if (!groups.has(shareKey)) {
+        groups.set(shareKey, applicable);
+      }
+    }
+    return { groups, sessionShareKeys };
+  };
+
+  if (!deps.listMetadata && !deps.getProfilesByKeys) {
+    return withLocalSessionIdentityReadSnapshot((reader) => {
+      const { groups, sessionShareKeys } = buildGroups(reader.listMetadata());
+      const keys = collectGroupKeys(groups);
+      const fetched = keys.length > 0 ? reader.getProfilesByKeys(keys) : [];
+      const { rendered, inconsistentShareKeys } = assembleConsistentGroups(groups, fetched);
+      if (inconsistentShareKeys.size > 0) {
+        throw new Error('identity_store_snapshot_inconsistent');
+      }
+      const out = new Map<string, ResolvedIdentity>();
+      for (const { name, shareKey } of sessionShareKeys) {
+        const resolved = rendered.get(shareKey);
+        if (resolved) out.set(name, resolved);
+      }
+      return out;
+    });
+  }
+
+  const listMetadataFn = deps.listMetadata ?? listLocalSessionIdentityMetadata;
+  const getByKeysFn = deps.getProfilesByKeys ?? getLocalSessionIdentityProfilesByKeys;
+  for (let attempt = 1; attempt <= MAX_SPLIT_CONSISTENCY_ATTEMPTS; attempt += 1) {
+    const { groups, sessionShareKeys } = buildGroups(await listMetadataFn());
+    const keys = collectGroupKeys(groups);
+    const fetched = keys.length > 0 ? await getByKeysFn(keys) : [];
+    const { rendered, inconsistentShareKeys } = assembleConsistentGroups(groups, fetched);
+    if (inconsistentShareKeys.size === 0) {
+      const out = new Map<string, ResolvedIdentity>();
+      for (const { name, shareKey } of sessionShareKeys) {
+        const resolved = rendered.get(shareKey);
+        if (resolved) out.set(name, resolved);
+      }
+      return out;
+    }
+  }
+  throw new Error('identity_store_snapshot_inconsistent');
+}
+
+/**
+ * Metadata-first drift detection for periodic sync:
+ * resolves server/pair keys first, then reads lightweight covering-index metadata
+ * and any needed PK content inside one synchronous SQLite WAL read snapshot
+ * (zero `await` inside), hitting `shareKey -> hash` cache in steady state with
+ * zero content reads. Propagates store read errors (fail-closed).
+ */
+export async function resolveDriftedSessionIdentities(
+  sessions: readonly IdentityDriftSessionRef[],
+  deps: IdentityResolverDeps = {},
+): Promise<Map<string, ResolvedIdentity>> {
+  if (deps.listProfiles) {
+    const [profiles, { serverId, entries }] = await Promise.all([
+      deps.listProfiles(),
+      resolveAllSessionKeys(sessions, deps),
+    ]);
+    const rendered = new Map<string, ResolvedIdentity>();
+    const out = new Map<string, ResolvedIdentity>();
+    for (const { session, pairTaskId } of entries) {
+      const applicable = profilesForSession(profiles, session, serverId, pairTaskId);
+      const shareKey = shareKeyForProfiles(applicable);
+      let resolved = rendered.get(shareKey);
+      if (!resolved) {
+        const prompt = renderSessionIdentityProfiles(applicable);
+        resolved = { prompt, hash: identityPromptHash(prompt) };
+        rendered.set(shareKey, resolved);
+      }
+      if (session.appliedIdentityHash !== resolved.hash) {
+        out.set(session.name, resolved);
+      }
+    }
+    return out;
+  }
+
+  const { serverId, entries } = await resolveAllSessionKeys(sessions, deps);
+
+  if (!deps.listMetadata && !deps.getProfilesByKeys) {
+    return withLocalSessionIdentityReadSnapshot((reader) => {
+      const { candidates, groupsToLoad, emptyDrifted } = evaluateDriftPlan(
+        entries,
+        reader.listMetadata(),
+        serverId,
+      );
+      if (candidates.length === 0) {
+        return finalizeDriftedMap(emptyDrifted, candidates, new Map());
+      }
+      const keys = collectGroupKeys(groupsToLoad);
+      const fetched = keys.length > 0 ? reader.getProfilesByKeys(keys) : [];
+      const { rendered } = assembleConsistentGroups(groupsToLoad, fetched);
+      return finalizeDriftedMap(emptyDrifted, candidates, rendered);
+    });
+  }
+
+  const listMetadataFn = deps.listMetadata ?? listLocalSessionIdentityMetadata;
+  const getByKeysFn = deps.getProfilesByKeys ?? getLocalSessionIdentityProfilesByKeys;
+  for (let attempt = 1; attempt <= MAX_SPLIT_CONSISTENCY_ATTEMPTS; attempt += 1) {
+    const { candidates, groupsToLoad, emptyDrifted } = evaluateDriftPlan(
+      entries,
+      await listMetadataFn(),
+      serverId,
+    );
+    if (candidates.length === 0) {
+      return finalizeDriftedMap(emptyDrifted, candidates, new Map());
+    }
+    const keys = collectGroupKeys(groupsToLoad);
+    const fetched = keys.length > 0 ? await getByKeysFn(keys) : [];
+    const { rendered, inconsistentShareKeys } = assembleConsistentGroups(groupsToLoad, fetched);
+    if (inconsistentShareKeys.size === 0 || attempt === MAX_SPLIT_CONSISTENCY_ATTEMPTS) {
+      // If an injected split reader remains torn across all attempts, inconsistentShareKeys are
+      // omitted from `rendered` so affected sessions keep their running `appliedIdentityHash`.
+      return finalizeDriftedMap(emptyDrifted, candidates, rendered);
+    }
+  }
+  return new Map();
 }
 
 /**

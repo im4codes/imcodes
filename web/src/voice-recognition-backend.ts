@@ -90,6 +90,8 @@ export interface NativeOfflineSpeechModelManager {
   ) => Promise<{ remove: () => Promise<void> }>;
 }
 
+export type HapticFeedbackStyle = 'light' | 'medium' | 'selection' | 'success' | 'warning';
+
 export type NativeSpeechRecognition = Omit<
   Pick<SpeechRecognitionPlugin, 'available' | 'checkPermissions' | 'requestPermissions' | 'start' | 'stop' | 'addListener'>,
   'start'
@@ -105,7 +107,7 @@ export type NativeSpeechRecognition = Omit<
   }) => Promise<{ matches?: string[] } | void>;
   transcribePcm?: (options: { pcmBase64: string; language?: string }) => Promise<{ text?: string }>;
   prewarm?: () => Promise<void>;
-  performHaptic?: () => Promise<void>;
+  performHaptic?: (options?: { style?: HapticFeedbackStyle }) => Promise<void>;
   startRawPcmCapture?: () => Promise<void>;
   stopRawPcmCapture?: () => Promise<void>;
   speak?: (options: NativeTtsSpeakOptions) => Promise<void>;
@@ -157,6 +159,28 @@ export function setVoiceRecognitionEngine(engine: VoiceRecognitionEngine): void 
 export function getNativeSpeechRecognition(): NativeSpeechRecognition {
   if (!isStreamingSpeechAvailable()) return SpeechRecognition;
   return getVoiceRecognitionEngine() === 'system' ? SpeechRecognition : StreamingSpeech;
+}
+
+export interface NativeHapticFeedback {
+  performHaptic: (options?: { style?: HapticFeedbackStyle }) => Promise<void>;
+}
+
+const HAPTIC_FEEDBACK_PLUGIN_METHODS = ['performHaptic'] as const;
+
+/** Native haptic feedback bridge exposed by the StreamingSpeech plugin,
+ * independent of the user's selected speech recognition engine ('builtin' vs 'system'). */
+export function getNativeHapticFeedback(): NativeHapticFeedback | null {
+  if (!isStreamingSpeechAvailable()) return null;
+  const capacitor = (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor;
+  if (capacitor?.getPlatform?.() === 'web') return null;
+  const candidate = StreamingSpeech as unknown as Partial<NativeHapticFeedback> & Record<string, unknown>;
+  if (
+    !hasNativePluginMethods(STREAMING_SPEECH_PLUGIN_NAME, candidate, HAPTIC_FEEDBACK_PLUGIN_METHODS)
+    || typeof candidate.performHaptic !== 'function'
+  ) {
+    return null;
+  }
+  return candidate as NativeHapticFeedback;
 }
 
 /** Platform recognizer used as fallback when builtin StreamingSpeech is unavailable or fails to start. */

@@ -18,6 +18,7 @@ import {
   SHARED_CONTEXT_RUNTIME_CAPABILITY_PROTOCOL,
 } from '../../shared/shared-context-runtime-config.js';
 import { setTransportRelaySend } from './transport-relay.js';
+import { cleanupPreviewRelaysForLink } from './preview-relay.js';
 import { setProviderRegistryServerLink } from '../agent/provider-registry.js';
 import { flushPendingSubSessionClosedNotices, setActiveServerLink } from './active-server-link.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
@@ -623,6 +624,7 @@ export class ServerLink {
     // A new authentication attempt replaces all authority learned over the
     // prior socket, even if that socket never delivers a close event.
     clearServerLinkSecurity('connect_replacement');
+    cleanupPreviewRelaysForLink(this);
     // Clean up previous connection if any
     this.stopHeartbeat();
     this.stopWatchdog();
@@ -842,6 +844,7 @@ export class ServerLink {
       clearConnectTimeout();
       const errorMessage = (event as ErrorEvent).message ?? 'unknown';
       clearServerLinkSecurity('socket_error');
+      cleanupPreviewRelaysForLink(this);
       logger.warn({ error: errorMessage }, 'ServerLink: error');
       this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_FAILED, { reason: errorMessage });
       this.recordRuntimeLinkStatus({
@@ -935,6 +938,7 @@ export class ServerLink {
       clearConnectTimeout();
       logger.info({ code: event.code, reason: event.reason }, 'ServerLink: closed');
       clearServerLinkSecurity('socket_close');
+      cleanupPreviewRelaysForLink(this);
       this.recordRuntimeLinkStatus({
         state: 'disconnected',
         lastDisconnectedAt: Date.now(),
@@ -1658,6 +1662,7 @@ export class ServerLink {
 
   disconnect(): void {
     clearServerLinkSecurity('explicit_disconnect');
+    cleanupPreviewRelaysForLink(this);
     this.stopping = true;
     this.stopHeartbeat();
     this.stopWatchdog();
@@ -1888,6 +1893,7 @@ export class ServerLink {
   /** Kill current connection and force immediate reconnect */
   private forceReconnect(reason = 'watchdog_forced_reconnect'): void {
     clearServerLinkSecurity(reason);
+    cleanupPreviewRelaysForLink(this);
     this.stopHeartbeat();
     this.stopWatchdog();
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = undefined; }

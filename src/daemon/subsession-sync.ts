@@ -3,10 +3,10 @@ import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { getQwenOAuthQuotaUsageLabel } from '../agent/provider-quota.js';
 import { getClaudeSdkRuntimeConfig, getGrokSdkRuntimeConfig } from '../agent/sdk-runtime-config.js';
-import { getClaudeUsageQuota } from '../agent/claude-usage-quota.js';
-import { fetchAgyUsageQuota } from '../agent/agy-usage-quota.js';
-import { getGrokUsageQuota } from '../agent/grok-usage-quota.js';
-import { getMuseUsageQuota } from '../agent/muse-usage-quota.js';
+import { getClaudeUsageQuota, peekClaudeUsageQuotaCached } from '../agent/claude-usage-quota.js';
+import { fetchAgyUsageQuota, peekAgyUsageQuotaCached } from '../agent/agy-usage-quota.js';
+import { getGrokUsageQuota, peekGrokUsageQuotaCached } from '../agent/grok-usage-quota.js';
+import { getMuseUsageQuota, peekMuseUsageQuotaCached } from '../agent/muse-usage-quota.js';
 import { getSession, type SessionRecord } from '../store/session-store.js';
 import type { ServerLink } from './server-link.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
@@ -15,6 +15,10 @@ import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
+import {
+  scheduleBackgroundQuotaRefresh,
+  serializeQuotaSnapshot,
+} from './quota-background-refresh.js';
 import { isIncognitoSession } from '../../shared/session-incognito-types.js';
 import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 
@@ -54,10 +58,14 @@ export interface SubSessionSyncSharedCache {
   claudeRuntimeConfig?: Promise<Awaited<ReturnType<typeof getClaudeSdkRuntimeConfig>>>;
   codexRuntimeConfig?: Promise<Awaited<ReturnType<typeof getCodexRuntimeConfig>>>;
   grokRuntimeConfig?: Promise<Awaited<ReturnType<typeof getGrokSdkRuntimeConfig>>>;
-  claudeUsageQuota?: Promise<Awaited<ReturnType<typeof getClaudeUsageQuota>>>;
-  agyUsageQuota?: Promise<Awaited<ReturnType<typeof fetchAgyUsageQuota>>>;
-  grokUsageQuota?: Promise<Awaited<ReturnType<typeof getGrokUsageQuota>>>;
-  museUsageQuota?: Promise<Awaited<ReturnType<typeof getMuseUsageQuota>>>;
+  claudeUsageQuota?: ReturnType<typeof peekClaudeUsageQuotaCached>;
+  agyUsageQuota?: ReturnType<typeof peekAgyUsageQuotaCached>;
+  grokUsageQuota?: ReturnType<typeof peekGrokUsageQuotaCached>;
+  museUsageQuota?: ReturnType<typeof peekMuseUsageQuotaCached>;
+  claudeUsageQuotaChecked?: boolean;
+  agyUsageQuotaChecked?: boolean;
+  grokUsageQuotaChecked?: boolean;
+  museUsageQuotaChecked?: boolean;
   presetModels?: Map<string, Promise<string[] | undefined>>;
 }
 
@@ -150,20 +158,91 @@ export async function buildSubSessionSyncPayload(
           ? await readGrokRuntime()
           : {};
 
-  // Option B (best-effort, ≤1 fetch / 30min): proactive 5h+weekly quota for a
-  // claude-code-sdk sub-session. null → fall back to the rate_limit_event quota.
-  const usageQuota = isClaudeSdkSession(r.agentType)
-    ? await (cache ? (cache.claudeUsageQuota ??= getClaudeUsageQuota().catch(() => null)) : getClaudeUsageQuota().catch(() => null))
-    : null;
-  const agyUsageQuota = r.agentType === 'agy-sdk'
-    ? await (cache ? (cache.agyUsageQuota ??= fetchAgyUsageQuota().catch(() => null)) : fetchAgyUsageQuota().catch(() => null))
-    : null;
-  const grokUsageQuota = r.agentType === 'grok-sdk'
-    ? await (cache ? (cache.grokUsageQuota ??= getGrokUsageQuota().catch(() => null)) : getGrokUsageQuota().catch(() => null))
-    : null;
-  const museUsageQuota = r.agentType === 'muse-code-sdk'
-    ? await (cache ? (cache.museUsageQuota ??= getMuseUsageQuota().catch(() => null)) : getMuseUsageQuota().catch(() => null))
-    : null;
+  // Strictly cache-first non-blocking quota reads; refresh stale/missing entries
+  // asynchronously in the background without blocking subsession.sync builds.
+  let usageQuota: ReturnType<typeof peekClaudeUsageQuotaCached> = null;
+  if (isClaudeSdkSession(r.agentType)) {
+    if (cache) {
+      if (!cache.claudeUsageQuotaChecked) {
+        cache.claudeUsageQuotaChecked = true;
+        cache.claudeUsageQuota = peekClaudeUsageQuotaCached();
+        scheduleBackgroundQuotaRefresh('claude-usage-quota', () => getClaudeUsageQuota(), {
+          beforeSnapshot: serializeQuotaSnapshot(cache.claudeUsageQuota),
+          serializeResult: serializeQuotaSnapshot,
+        });
+      }
+      usageQuota = cache.claudeUsageQuota ?? null;
+    } else {
+      usageQuota = peekClaudeUsageQuotaCached();
+      scheduleBackgroundQuotaRefresh('claude-usage-quota', () => getClaudeUsageQuota(), {
+        beforeSnapshot: serializeQuotaSnapshot(usageQuota),
+        serializeResult: serializeQuotaSnapshot,
+      });
+    }
+  }
+
+  let agyUsageQuota: ReturnType<typeof peekAgyUsageQuotaCached> = null;
+  if (r.agentType === 'agy-sdk') {
+    if (cache) {
+      if (!cache.agyUsageQuotaChecked) {
+        cache.agyUsageQuotaChecked = true;
+        cache.agyUsageQuota = peekAgyUsageQuotaCached();
+        scheduleBackgroundQuotaRefresh('agy-usage-quota', () => fetchAgyUsageQuota(), {
+          beforeSnapshot: serializeQuotaSnapshot(cache.agyUsageQuota),
+          serializeResult: serializeQuotaSnapshot,
+        });
+      }
+      agyUsageQuota = cache.agyUsageQuota ?? null;
+    } else {
+      agyUsageQuota = peekAgyUsageQuotaCached();
+      scheduleBackgroundQuotaRefresh('agy-usage-quota', () => fetchAgyUsageQuota(), {
+        beforeSnapshot: serializeQuotaSnapshot(agyUsageQuota),
+        serializeResult: serializeQuotaSnapshot,
+      });
+    }
+  }
+
+  let grokUsageQuota: ReturnType<typeof peekGrokUsageQuotaCached> = null;
+  if (r.agentType === 'grok-sdk') {
+    if (cache) {
+      if (!cache.grokUsageQuotaChecked) {
+        cache.grokUsageQuotaChecked = true;
+        cache.grokUsageQuota = peekGrokUsageQuotaCached();
+        scheduleBackgroundQuotaRefresh('grok-usage-quota', () => getGrokUsageQuota(), {
+          beforeSnapshot: serializeQuotaSnapshot(cache.grokUsageQuota),
+          serializeResult: serializeQuotaSnapshot,
+        });
+      }
+      grokUsageQuota = cache.grokUsageQuota ?? null;
+    } else {
+      grokUsageQuota = peekGrokUsageQuotaCached();
+      scheduleBackgroundQuotaRefresh('grok-usage-quota', () => getGrokUsageQuota(), {
+        beforeSnapshot: serializeQuotaSnapshot(grokUsageQuota),
+        serializeResult: serializeQuotaSnapshot,
+      });
+    }
+  }
+
+  let museUsageQuota: ReturnType<typeof peekMuseUsageQuotaCached> = null;
+  if (r.agentType === 'muse-code-sdk') {
+    if (cache) {
+      if (!cache.museUsageQuotaChecked) {
+        cache.museUsageQuotaChecked = true;
+        cache.museUsageQuota = peekMuseUsageQuotaCached();
+        scheduleBackgroundQuotaRefresh('muse-usage-quota', () => getMuseUsageQuota(), {
+          beforeSnapshot: serializeQuotaSnapshot(cache.museUsageQuota),
+          serializeResult: serializeQuotaSnapshot,
+        });
+      }
+      museUsageQuota = cache.museUsageQuota ?? null;
+    } else {
+      museUsageQuota = peekMuseUsageQuotaCached();
+      scheduleBackgroundQuotaRefresh('muse-usage-quota', () => getMuseUsageQuota(), {
+        beforeSnapshot: serializeQuotaSnapshot(museUsageQuota),
+        serializeResult: serializeQuotaSnapshot,
+      });
+    }
+  }
   let transportQueue: TransportQueueSnapshotPayload | null = null;
   if (r.runtimeType === 'transport') {
     transportQueue = buildTransportQueueSnapshotPayload(sessionName, 'subsession_sync');

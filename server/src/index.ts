@@ -4,6 +4,7 @@ import { TASK_PAIR_TITLE_AUTHORITY_PATH } from '../../shared/task-pair-title-acc
 import { MachineGroupInvalidationRuntime } from './services/machine-group-invalidation.js';
 import { applyMachineGroupInvalidation, failClosedMachineGroupConnections } from './ws/machine-group-revalidation.js';
 import { globalTaskHub } from './services/global-task-hub.js';
+import { pushStreamHub } from './services/push-stream-hub.js';
 import { globalTasksRoutes } from './routes/global-tasks.js';
 import { remoteVoiceHub } from './services/remote-voice-hub.js';
 import { remoteVoiceRoutes } from './routes/remote-voice.js';
@@ -39,7 +40,7 @@ import { promisify } from 'node:util';
 import { gzip as gzipCallback } from 'node:zlib';
 
 const gzipAsync = promisify(gzipCallback);
-import type { IncomingMessage } from 'node:http';
+import { STATUS_CODES, type IncomingMessage } from 'node:http';
 
 import { isEmailAuthEnabled, loadEnv, type Env, type EnvConfig } from './env.js';
 import { createDatabase, type Database } from './db/client.js';
@@ -737,6 +738,9 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
     }
   });
 
+  // Registered BEFORE `/api` sub-routers whose wildcard `.use('/*')` middleware sets
+  // `Cache-Control: no-store` so proxied HTML/JS/CSS/SSE keep upstream / SSE Cache-Control headers.
+  app.route('/api/server', localWebPreviewRoutes);
   app.route('/api/auth', authRoutes);
   app.route('/api/auth/github', githubAuthRoutes);
   app.route('/api/auth/google', googleAuthRoutes);
@@ -785,11 +789,10 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.route('/api', memoryRoutes);
   app.route('/api', agentSkillsRoutes);
   app.route('/api', agentMcpRoutes);
-  // fileTransferRoutes MUST be first — its token-auth middleware bypasses requireAuth
-  // for iOS downloads (SFSafariViewController has no cookies/Bearer). If mounted after
-  // sessionMgmtRoutes (which has blanket requireAuth on /*), the token path is shadowed.
+  // fileTransferRoutes MUST be first among remaining `/api/server` routers — its
+  // token-auth middleware bypasses requireAuth for iOS downloads (SFSafariViewController
+  // has no cookies/Bearer).
   app.route('/api/server', fileTransferRoutes);
-  app.route('/api/server', localWebPreviewRoutes);
   app.route('/api/server', sessionMgmtRoutes);
   app.route('/api/server', subSessionRoutes);
   app.route('/api/server', discussionRoutes);
@@ -1370,9 +1373,16 @@ async function handlePreviewWsUpgrade(
   // 8. Defer the browser handshake until the daemon reports the upstream-
   //    negotiated subprotocol (run 8a975732-23a P1.5.1), then complete the
   //    handshake echoing exactly that protocol so the browser's
-  //    `WebSocket.protocol` matches the upstream end-to-end. The `ws` library
-  //    echoes whatever `Sec-WebSocket-Protocol` the request carries, so we
-  //    overwrite it to the single negotiated value (or delete it for "none").
+  //    `WebSocket.protocol` matches the upstream end-to-end.
+  let upgradedWsSettled = false;
+  const onPreUpgradeSocketEnd = () => {
+    if (!upgradedWsSettled) {
+      bridge.cancelPendingPreviewWsUpgrade(wsId);
+    }
+  };
+  socket.once('close', onPreUpgradeSocketEnd);
+  socket.once('error', onPreUpgradeSocketEnd);
+
   bridge.beginPreviewWsTunnel({
     wsId,
     previewId,
@@ -1381,23 +1391,56 @@ async function handlePreviewWsUpgrade(
     headers: sanitizedHeaders,
     protocols,
     completeUpgrade: (selectedProtocol) => new Promise((resolve) => {
-      if (socket.destroyed || !socket.writable) {
-        resolve(null);
+      let settled = false;
+      const onUpgradeSocketEnd = () => finish(null);
+      const finish = (ws: import('ws').WebSocket | null) => {
+        if (settled) return;
+        settled = true;
+        upgradedWsSettled = true;
+        socket.off('close', onUpgradeSocketEnd);
+        socket.off('error', onUpgradeSocketEnd);
+        socket.off('close', onPreUpgradeSocketEnd);
+        socket.off('error', onPreUpgradeSocketEnd);
+        resolve(ws);
+      };
+      if (socket.destroyed || !socket.readable || !socket.writable) {
+        finish(null);
         return;
       }
+      socket.once('close', onUpgradeSocketEnd);
+      socket.once('error', onUpgradeSocketEnd);
       if (selectedProtocol) {
         req.headers['sec-websocket-protocol'] = selectedProtocol;
       } else {
         delete req.headers['sec-websocket-protocol'];
       }
       try {
-        wss.handleUpgrade(req, socket, head, (ws) => resolve(ws as unknown as import('ws').WebSocket));
+        wss.handleUpgrade(req, socket, head, (ws) => finish(ws as unknown as import('ws').WebSocket));
+        // ws@8.23.0 may decline/abort silently without calling callback if the socket
+        // loses readability or handshake checks fail internally; settle promptly.
+        queueMicrotask(() => {
+          if (!settled && (socket.destroyed || !socket.readable || !socket.writable)) {
+            finish(null);
+          }
+        });
       } catch (err) {
         logger.warn({ serverId, previewId, wsId, err }, 'Preview WS handleUpgrade failed');
         try { socket.destroy(); } catch { /* ignore */ }
-        resolve(null);
+        finish(null);
       }
     }),
+    rejectUpgrade: (status) => {
+      upgradedWsSettled = true;
+      socket.off('close', onPreUpgradeSocketEnd);
+      socket.off('error', onPreUpgradeSocketEnd);
+      if (socket.destroyed || !socket.writable) return;
+      const safeStatus = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502;
+      const statusText = STATUS_CODES[safeStatus] ?? 'Bad Gateway';
+      try {
+        socket.write(`HTTP/1.1 ${safeStatus} ${statusText}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      } catch { /* ignore */ }
+      try { socket.destroy(); } catch { /* ignore */ }
+    },
   });
 }
 
@@ -1582,6 +1625,7 @@ async function main() {
     setRemoteDesktopShellLaunchContextDispatcher(null);
     stopAccountWatch();
     await globalTaskHub.stop();
+    pushStreamHub.stop();
     remoteVoiceHub.stop();
     await machineGroupInvalidation.stop();
     await managementPrivacyWorker.stop();

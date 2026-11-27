@@ -378,6 +378,11 @@ export interface MemoryMcpToolDeps {
   pairTitleTurn?: () => Promise<TaskPairTitleTurn>;
   /** MCP child only: hand legacy supervision tool calls to the daemon (pairs engine). */
   legacyToolForwarder?: import('./task-pairs/legacy-tools.js').TaskPairLegacyToolForwarder;
+  /** Production stdio seam: execute execution_pool_get/set in the daemon process so pools update synchronously. */
+  invokeDaemonExecutionPoolTool?: (
+    name: import('../../shared/execution-pool-mcp.js').ExecutionPoolMcpToolName,
+    input?: unknown,
+  ) => Promise<Record<string, unknown>> | Record<string, unknown>;
   /**
    * Production stdio seam: execute memory-owning tools in the daemon process,
    * whose process-wide context-store and embedding workers are shared by all

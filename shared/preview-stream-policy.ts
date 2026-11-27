@@ -24,12 +24,16 @@
 /** Response headers as carried on PREVIEW_MSG.RESPONSE_START (`Record<string, string | string[]>`). */
 export type PreviewResponseHeaders = Record<string, string | string[]>;
 
-/** Case-insensitive first-value header lookup over a string|string[] header map. */
-function headerValue(headers: PreviewResponseHeaders, name: string): string {
+/** Case-insensitive first-value header lookup over a string|string[] header map or Web Headers. */
+function headerValue(headers: PreviewResponseHeaders | Headers, name: string): string {
+  if (typeof (headers as Headers).get === 'function') {
+    return (headers as Headers).get(name) ?? '';
+  }
+  const map = headers as PreviewResponseHeaders;
   const target = name.toLowerCase();
-  for (const key of Object.keys(headers)) {
+  for (const key of Object.keys(map)) {
     if (key.toLowerCase() === target) {
-      const v = headers[key];
+      const v = map[key];
       const raw = Array.isArray(v) ? (v[0] ?? '') : (v ?? '');
       return raw;
     }
@@ -38,10 +42,15 @@ function headerValue(headers: PreviewResponseHeaders, name: string): string {
 }
 
 /** Lowercased media type with parameters stripped (e.g. "text/event-stream; charset=utf-8" -> "text/event-stream"). */
-export function contentTypeOf(headers: PreviewResponseHeaders): string {
+export function contentTypeOf(headers: PreviewResponseHeaders | Headers): string {
   const ct = headerValue(headers, 'content-type');
   const semi = ct.indexOf(';');
   return (semi === -1 ? ct : ct.slice(0, semi)).trim().toLowerCase();
+}
+
+/** Returns true iff the response Content-Type is Server-Sent Events (`text/event-stream`). */
+export function isSseResponse(headers: PreviewResponseHeaders | Headers): boolean {
+  return contentTypeOf(headers) === 'text/event-stream';
 }
 
 /** HTML responses are never treated as streaming (they go through buffered HTML rewrite — see A20). */

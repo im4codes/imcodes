@@ -7,4 +7,10 @@
     <string name="bg_upload_channel_name">File uploads</string>
     <string name="bg_upload_notification_title">Uploading files</string>
     <string name="bg_upload_notification_text">Transferring files in the background</string>
+    <string name="bg_push_channel_name">Background push status</string>
+    <string name="bg_push_alert_channel_name">Session notifications</string>
+    <string name="bg_push_notification_title">IM.codes</string>
+    <string name="bg_push_notification_text_connecting">Connecting to push stream…</string>
+    <string name="bg_push_notification_text_connected">Connected — receiving notifications</string>
+    <string name="bg_push_notification_text_waiting_network">Waiting for network</string>
 </resources>

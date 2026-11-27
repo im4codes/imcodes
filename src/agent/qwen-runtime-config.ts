@@ -11,6 +11,7 @@ import {
 
 const QWEN_SETTINGS_PATH = join(homedir(), '.qwen', 'settings.json');
 const CACHE_TTL_MS = 30_000;
+const PROBE_FAILURE_BACKOFF_MS = 5 * 60_000;
 
 interface QwenRuntimeConfig {
   authType: QwenAuthType;
@@ -18,7 +19,18 @@ interface QwenRuntimeConfig {
   authLimit?: string;
 }
 
+export type QwenRuntimeConfigOptions = boolean | {
+  force?: boolean;
+  /**
+   * When false, read only memory cache and `~/.qwen/settings.json` without
+   * awaiting the `qwen auth status` CLI subprocess.
+   */
+  probe?: boolean;
+};
+
 let cached: { expiresAt: number; value: QwenRuntimeConfig } | null = null;
+let inflightProbe: Promise<QwenRuntimeConfig> | null = null;
+let lastProbeFailureAt = 0;
 
 interface QwenSettings {
   security?: {
@@ -121,24 +133,76 @@ function getAvailableModelsFromSettings(settings: QwenSettings | null, authType:
   return dedupe(ids);
 }
 
-export async function getQwenRuntimeConfig(force = false): Promise<QwenRuntimeConfig> {
-  if (!force && cached && cached.expiresAt > Date.now()) {
+function normalizeQwenOptions(options: QwenRuntimeConfigOptions): { force: boolean; probe: boolean } {
+  if (typeof options === 'boolean') return { force: options, probe: true };
+  return {
+    force: options?.force === true,
+    probe: options?.probe !== false,
+  };
+}
+
+export async function getQwenRuntimeConfig(options: QwenRuntimeConfigOptions = false): Promise<QwenRuntimeConfig> {
+  const { force, probe } = normalizeQwenOptions(options);
+  const now = Date.now();
+  if (!force && cached && cached.expiresAt > now) {
     return cached.value;
   }
 
-  const settings = await readSettings();
-  const status = await readAuthStatus();
-  const authTypeFromSettings = detectAuthTypeFromSettings(settings);
-  const authType = isKnownAuthType(authTypeFromSettings)
-    ? authTypeFromSettings
-    : (status?.authType ?? authTypeFromSettings);
-  const availableModels = getAvailableModelsFromSettings(settings, authType);
+  if (!probe) {
+    const settings = await readSettings();
+    const authType = detectAuthTypeFromSettings(settings);
+    const availableModels = getAvailableModelsFromSettings(settings, authType);
+    const value: QwenRuntimeConfig = {
+      authType,
+      availableModels,
+      ...(cached?.value.authLimit ? { authLimit: cached.value.authLimit } : {}),
+    };
+    return value;
+  }
 
-  const value = {
-    authType,
-    availableModels,
-    authLimit: status?.authLimit,
-  };
-  cached = { value, expiresAt: Date.now() + CACHE_TTL_MS };
-  return value;
+  if (!force && now - lastProbeFailureAt < PROBE_FAILURE_BACKOFF_MS) {
+    const settings = await readSettings();
+    const authType = detectAuthTypeFromSettings(settings);
+    return {
+      authType,
+      availableModels: getAvailableModelsFromSettings(settings, authType),
+      ...(cached?.value.authLimit ? { authLimit: cached.value.authLimit } : {}),
+    };
+  }
+
+  if (!force && inflightProbe) return inflightProbe;
+
+  inflightProbe = (async () => {
+    const settings = await readSettings();
+    const status = await readAuthStatus();
+    if (!status) {
+      lastProbeFailureAt = Date.now();
+    } else {
+      lastProbeFailureAt = 0;
+    }
+    const authTypeFromSettings = detectAuthTypeFromSettings(settings);
+    const authType = isKnownAuthType(authTypeFromSettings)
+      ? authTypeFromSettings
+      : (status?.authType ?? authTypeFromSettings);
+    const availableModels = getAvailableModelsFromSettings(settings, authType);
+
+    const value = {
+      authType,
+      availableModels,
+      authLimit: status?.authLimit,
+    };
+    cached = { value, expiresAt: Date.now() + CACHE_TTL_MS };
+    return value;
+  })().finally(() => {
+    inflightProbe = null;
+  });
+
+  return inflightProbe;
+}
+
+/** Test seam — clear cached Qwen runtime config state. */
+export function __resetQwenRuntimeConfigCache(): void {
+  cached = null;
+  inflightProbe = null;
+  lastProbeFailureAt = 0;
 }

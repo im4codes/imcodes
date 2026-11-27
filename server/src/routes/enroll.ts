@@ -58,7 +58,6 @@ import {
   CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
   CONTROLLED_NODE_EXTERNAL_REDIRECT_OPT_IN,
-  CONTROLLED_NODE_ARCH_ARM64,
   CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
   CONTROLLED_NODE_ENROLL_AUDIT_ACTION,
   CONTROLLED_NODE_OS_LINUX,
@@ -83,6 +82,7 @@ import {
   isRemoteDesktopArtifactAsset,
   controlledNodeDaemonRuntimeTarget,
   normalizeControlledNodeArtifactPair,
+  resolveControlledNodeRuntimeArch,
   type AideskLocalUiArtifactAsset,
   type ControlledNodeArtifactArch,
   type ControlledNodeOs,
@@ -120,6 +120,7 @@ import {
   openDaemonRuntimeArtifact,
   openDesktopReleaseManifestArtifact,
   openRemoteDesktopWorkerArtifact,
+  verifyDesktopReleaseManifestForNodeArtifact,
   type ArtifactCatalog,
   type ArtifactDescriptor,
 } from '../services/controlled-node-artifact-catalog.js';
@@ -1819,9 +1820,13 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
       return c.json({ error: 'abi_profile_mismatch' }, 409);
     }
   } else {
-    if ((server.os && server.arch
-        && !isControlledNodeArtifactCompatibleWithRuntime(artifactTarget!.os, artifactTarget!.arch, server.os, server.arch))
-      || (server.os && !server.arch && server.os !== artifactTarget!.os)
+    const compatServerArch = artifactTarget!.os === CONTROLLED_NODE_OS_MAC
+      && artifactTarget!.arch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL
+      ? resolveControlledNodeRuntimeArch(server.arch)
+      : server.arch;
+    if ((server.os && compatServerArch
+        && !isControlledNodeArtifactCompatibleWithRuntime(artifactTarget!.os, artifactTarget!.arch, server.os, compatServerArch))
+      || (server.os && !compatServerArch && server.os !== artifactTarget!.os)
       || (!server.os && server.arch)) {
       return c.json({ error: 'platform_mismatch' }, 403);
     }
@@ -2223,27 +2228,32 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
     }
   }
   await artifactCatalog.persistDescriptor(c.env.DB as Database, v.descriptor).catch(() => {});
+  const isUniversalMacNode = artifactTarget.os === CONTROLLED_NODE_OS_MAC
+    && artifactTarget.arch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL;
   let nodeReleaseManifestSha256: string | undefined;
   if (abiProfile === CONTROLLED_NODE_ABI_MODERN) {
-    const nodeReleaseTarget = controlledNodeDaemonRuntimeTarget(
+    const runtimeArch = isUniversalMacNode
+      ? resolveControlledNodeRuntimeArch(
+          c.req.header(CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH),
+          server.arch,
+        )
+      : null;
+    const manifestCheck = await verifyDesktopReleaseManifestForNodeArtifact(
+      dir,
       artifactTarget.os,
-      artifactTarget.arch === CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL ? CONTROLLED_NODE_ARCH_ARM64 : artifactTarget.arch,
+      artifactTarget.arch,
+      v.descriptor,
+      runtimeArch,
     );
-    const releaseCheck = await openDesktopReleaseManifestArtifact(dir, nodeReleaseTarget);
-    if (releaseCheck.status === 'invalid') {
-      return c.json({ error: 'desktop_release_manifest_invalid', reason: releaseCheck.reason }, 503);
+    if (!manifestCheck.ok) {
+      return c.json(
+        manifestCheck.reason
+          ? { error: manifestCheck.error, reason: manifestCheck.reason }
+          : { error: manifestCheck.error },
+        503,
+      );
     }
-    if (releaseCheck.status === 'ok') {
-      await releaseCheck.close();
-      const targetForCheck = nodeReleaseTarget;
-      if (targetForCheck) {
-        const entry = releaseCheck.manifest.targets[targetForCheck]?.components['imcodes-node'];
-        if (entry && (entry.sha256 !== v.descriptor.sha256 || entry.sizeBytes !== v.descriptor.sizeBytes || entry.version !== v.descriptor.version)) {
-          return c.json({ error: 'desktop_release_manifest_mismatch' }, 503);
-        }
-      }
-      nodeReleaseManifestSha256 = releaseCheck.sha256;
-    }
+    nodeReleaseManifestSha256 = manifestCheck.releaseManifestSha256;
   }
   const opened = isHead ? null : await artifactCatalog.openPinned(dir, v.descriptor);
   if (!isHead && !opened) {
@@ -2273,6 +2283,7 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
       abiProfile,
       authenticodeSignerSha256: v.descriptor.authenticodeSignerSha256,
       releaseManifestSha256: nodeReleaseManifestSha256,
+      ...(isUniversalMacNode ? { extraVary: CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH } : {}),
     },
   );
   if (nodeRedirect) return nodeRedirect;
@@ -2281,6 +2292,9 @@ enrollRoutes.on(['GET', 'HEAD'], '/v2/node-artifact', async (c) => {
   c.header('Content-Type', 'application/octet-stream');
   c.header('Content-Disposition', `attachment; filename="${v.descriptor.filename}"`);
   c.header('Cache-Control', 'private, no-store');
+  if (isUniversalMacNode) {
+    c.header('Vary', CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH);
+  }
   c.header('Referrer-Policy', 'no-referrer');
   c.header('X-Content-Type-Options', 'nosniff');
   c.header('Accept-Ranges', 'none');

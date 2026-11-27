@@ -725,16 +725,21 @@ function cancelVoiceInputGesturePrime(): void {
   if (typeof fn === 'function') fn();
 }
 
-function triggerVoiceHoldHaptic(): void {
+function triggerVoiceHoldHaptic(
+  style: VoiceInput.HapticFeedbackStyle = 'medium',
+  durationMs = 20,
+): void {
   if (Object.prototype.hasOwnProperty.call(VoiceInput, 'triggerHapticFeedback')) {
-    const fn = (VoiceInput as { triggerHapticFeedback?: (ms?: number) => Promise<void> }).triggerHapticFeedback;
+    const fn = (VoiceInput as {
+      triggerHapticFeedback?: (ms?: number, style?: VoiceInput.HapticFeedbackStyle) => Promise<void>;
+    }).triggerHapticFeedback;
     if (typeof fn === 'function') {
-      void fn(20);
+      void fn(durationMs, style);
       return;
     }
   }
   try {
-    navigator.vibrate?.(20);
+    navigator.vibrate?.(durationMs);
   } catch {
     /* ignore */
   }
@@ -7311,7 +7316,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       voiceHoldZoneRef.current = nextZone;
       setVoiceHoldZone(nextZone);
       if (hapticOnChange) {
-        try { navigator.vibrate?.(12); } catch { /* ignore */ }
+        triggerVoiceHoldHaptic('selection', 12);
       }
     }
   }, []);
@@ -7398,6 +7403,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
 
     const abortMode = outcome === 'cancel' || outcome === 'failed';
     if (outcome === 'cancel') {
+      if (tx.didStartRecording) {
+        triggerVoiceHoldHaptic('warning', 15);
+      }
       // Cancel discards immediately: detach the active transaction right away so
       // another hold or short tap never waits on slow/hung native stop/start drains.
       tx.settled = true;
@@ -7491,6 +7499,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           : spoken;
 
         if (outcome === 'edit') {
+          triggerVoiceHoldHaptic('light', 12);
           tx.settled = true;
           tx.phase = 'settled';
           closeVoiceHoldHud();
@@ -7521,6 +7530,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           });
           if (sendOutcome === 'rejected') {
             restoreVoiceHoldToComposer(finalText, tx.pointerType === 'touch');
+          } else {
+            triggerVoiceHoldHaptic('success', 18);
           }
           return;
         }
@@ -7630,7 +7641,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     applyComposerVoiceTouchLock(divRef.current, true);
     try { divRef.current?.blur(); } catch { /* ignore */ }
     try { window.getSelection()?.removeAllRanges(); } catch { /* ignore */ }
-    triggerVoiceHoldHaptic();
+    triggerVoiceHoldHaptic('medium', 20);
 
     // Defer setPointerCapture until hold actually activates so normal taps and scrolling stay interference-free.
     const captureEl = captureTarget instanceof HTMLElement ? captureTarget : divRef.current;
@@ -7773,7 +7784,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
             tx.phase = 'recording';
             if (wasStarting && !tx.readyHapticFired && Date.now() - tx.hudShownAt >= 120) {
               tx.readyHapticFired = true;
-              triggerVoiceHoldHaptic();
+              triggerVoiceHoldHaptic('light', 12);
             }
             if (mountedRef.current) {
               setVoiceHoldPhase('recording');

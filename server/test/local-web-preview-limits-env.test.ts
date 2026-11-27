@@ -60,6 +60,29 @@ describe('T-N1: env-overridable preview limits (timers + per-user/server cap)', 
     expect(PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS).toBe(120_000);
     expect(PREVIEW_LIMITS.RESPONSE_START_TIMEOUT_MS).toBe(30_000);
     expect(PREVIEW_LIMITS.MAX_ACTIVE_PREVIEWS_PER_USER_PER_SERVER).toBe(8);
+    expect(PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES).toBe(4 * 1024 * 1024);
+    expect(PREVIEW_LIMITS.WS_IDLE_TIMEOUT_MS).toBe(300_000);
+    expect(PREVIEW_LIMITS.WS_OPEN_TIMEOUT_MS).toBe(15_000);
+    expect(PREVIEW_LIMITS.WS_KEEPALIVE_MS).toBe(25_000);
+    expect(PREVIEW_LIMITS.SSE_KEEPALIVE_MS).toBe(25_000);
+  });
+
+  it('honors env overrides for WS/SSE limits and keepalives', async () => {
+    vi.stubEnv('PREVIEW_MAX_WS_PER_PREVIEW', '12');
+    vi.stubEnv('PREVIEW_MAX_WS_PER_SERVER', '32');
+    vi.stubEnv('PREVIEW_MAX_WS_MESSAGE_BYTES', '2097152');
+    vi.stubEnv('PREVIEW_WS_IDLE_TIMEOUT_MS', '60000');
+    vi.stubEnv('PREVIEW_WS_OPEN_TIMEOUT_MS', '5000');
+    vi.stubEnv('PREVIEW_WS_KEEPALIVE_MS', '15000');
+    vi.stubEnv('PREVIEW_SSE_KEEPALIVE_MS', '10000');
+    const { PREVIEW_LIMITS } = await import('../../shared/preview-types.js');
+    expect(PREVIEW_LIMITS.MAX_WS_PER_PREVIEW).toBe(12);
+    expect(PREVIEW_LIMITS.MAX_WS_PER_SERVER).toBe(32);
+    expect(PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES).toBe(2_097_152);
+    expect(PREVIEW_LIMITS.WS_IDLE_TIMEOUT_MS).toBe(60_000);
+    expect(PREVIEW_LIMITS.WS_OPEN_TIMEOUT_MS).toBe(5_000);
+    expect(PREVIEW_LIMITS.WS_KEEPALIVE_MS).toBe(15_000);
+    expect(PREVIEW_LIMITS.SSE_KEEPALIVE_MS).toBe(10_000);
   });
 
   // ── Invalid env → default (previewLimitFromEnv: only finite >0 integers win) ─

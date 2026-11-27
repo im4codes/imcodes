@@ -830,6 +830,46 @@ describe('rebuildSubSessions — transport sessions are lazy', () => {
       ccPreset: undefined,
     });
   });
+
+  it('clears foreign SDK requestedModel when switching or rebuilding a sub-session onto agy-sdk while preserving valid AGY models', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_codex_to_agy',
+      agentType: 'codex-sdk',
+      requestedModel: 'gpt-6-sol',
+      activeModel: 'gpt-6-sol',
+      projectDir: '/proj',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+    });
+
+    await rebuildSubSessions([
+      { id: 'codex_to_agy', type: 'agy-sdk', cwd: '/proj' },
+      { id: 'explicit_foreign_to_agy', type: 'agy-sdk', cwd: '/proj', requestedModel: 'opus' },
+      { id: 'valid_agy', type: 'agy-sdk', cwd: '/proj', requestedModel: 'gemini-4-neon-high' },
+    ]);
+
+    const calls = upsertSessionMock.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    expect(calls[0]).toMatchObject({
+      name: 'deck_sub_codex_to_agy',
+      agentType: 'agy-sdk',
+      requestedModel: undefined,
+      activeModel: 'gemini-4-hydrogen-high',
+    });
+    expect(calls[1]).toMatchObject({
+      name: 'deck_sub_explicit_foreign_to_agy',
+      agentType: 'agy-sdk',
+      requestedModel: undefined,
+      activeModel: 'gemini-4-hydrogen-high',
+    });
+    expect(calls[2]).toMatchObject({
+      name: 'deck_sub_valid_agy',
+      agentType: 'agy-sdk',
+      requestedModel: 'gemini-4-neon-high',
+      activeModel: 'gemini-4-neon-high',
+    });
+  });
 });
 
 // ── rebuildSubSessions: legacy gemini records & identity preservation ──────

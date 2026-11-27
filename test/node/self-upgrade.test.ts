@@ -2683,6 +2683,18 @@ describe('refreshControlledNodeRemoteDesktopWorker lightweight precheck', () => 
       fetchImpl: vi.fn(async () => new Response(null, { status: 501 })) as typeof fetch,
     });
     expect(probe501).toEqual({ status: 'unsupported', httpStatus: 501 });
+
+    const seenProbeArch: Array<string | null> = [];
+    await probeControlledNodeArtifactMetadata({
+      credential,
+      target: { os: 'mac', arch: 'universal' },
+      runtimeArch: 'x64',
+      fetchImpl: vi.fn(async (_url: string, init?: RequestInit) => {
+        seenProbeArch.push(new Headers(init?.headers).get(CONTROLLED_NODE_ARTIFACT_HEADERS.RUNTIME_ARCH));
+        return new Response(null, { status: 200 });
+      }) as unknown as typeof fetch,
+    });
+    expect(seenProbeArch).toEqual(['x64']);
   });
 
   it('follows HTTPS 302 external redirects using origin metadata headers and strips auth headers cross-origin', async () => {

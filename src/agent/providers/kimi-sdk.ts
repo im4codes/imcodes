@@ -315,6 +315,10 @@ interface KimiSdkSessionState {
   acpSessionId?: string;
   /** True once newSession or loadSession has returned successfully. */
   loaded: boolean;
+  /** True once newSession or loadSession for the active child has returned a non-empty availableModels catalog. */
+  sessionModelCatalogLoaded?: boolean;
+  /** Wakes a cold-start empty-catalog retry sleep immediately on cancel/disposal. */
+  coldStartRetryWake?: () => void;
   /** True once setSessionMode(default) has been accepted for this session. */
   modeApplied: boolean;
   /** Set while a `prompt` RPC is in flight. */
@@ -520,6 +524,7 @@ const DEFAULT_ACP_CANCEL_GRACE_MS = 3_000;
 const DEFAULT_ACP_SESSION_RPC_TIMEOUT_MS = 30_000;
 const DEFAULT_ACP_MODE_MODEL_RPC_TIMEOUT_MS = 15_000;
 const DEFAULT_ACP_WRITE_TIMEOUT_MS = 10_000;
+const DEFAULT_ACP_COLD_START_CATALOG_RETRY_DELAY_MS = 800;
 const ACP_RPC_TIMEOUT_MARKER = Symbol('acpRpcTimeout');
 
 export interface KimiSdkProviderOptions {
@@ -527,6 +532,19 @@ export interface KimiSdkProviderOptions {
   sessionRpcTimeoutMs?: number;
   modeModelRpcTimeoutMs?: number;
   acpWriteTimeoutMs?: number;
+  coldStartCatalogRetryDelayMs?: number;
+}
+
+function readAcpDelayOption(override: number | undefined, envKey: string, fallback: number): number {
+  if (typeof override === 'number' && Number.isFinite(override) && override >= 0) {
+    return Math.round(override);
+  }
+  const raw = process.env[envKey];
+  if (raw) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return fallback;
 }
 
 function readAcpTimeoutOption(override: number | undefined, envKey: string, fallback: number): number {
@@ -697,6 +715,37 @@ export class KimiSdkProvider implements TransportProvider {
       : this.systemPromptMetaAppendSupported;
   }
 
+  private async teardownIsolatedTransportSlot(transport: IsolatedAcpTransport): Promise<void> {
+    const isolatedChild = transport.child;
+    transport.child = null;
+    transport.connection = null;
+    transport.initPromise = null;
+    transport.sessionListSupported = false;
+    transport.systemPromptMetaAppendSupported = false;
+
+    if (isolatedChild) {
+      // Call killProcessTree even when the root ACP child already exited: same-group
+      // descendants/native workers can outlive the exited leader and must be reaped
+      // before deleting incognitoEnv.homeDir or hibernating a per-session process.
+      const alive = isolatedChild.exitCode === null && isolatedChild.signalCode === null;
+      const exitPromise = alive ? once(isolatedChild, 'exit').catch(() => {}) : null;
+      if (alive) {
+        try { isolatedChild.stdin?.end(); } catch { /* noop */ }
+      }
+      await killProcessTree(isolatedChild, { ownsProcessGroup: true, gracefulMs: 200 });
+      if (exitPromise && isolatedChild.exitCode === null && isolatedChild.signalCode === null) {
+        await Promise.race([
+          exitPromise,
+          new Promise<void>((resolve) => setTimeout(resolve, 500)),
+        ]);
+      }
+    }
+    if (transport.incognitoEnv) {
+      await transport.incognitoEnv.cleanup();
+      transport.incognitoEnv = undefined;
+    }
+  }
+
   private async disposeIsolatedSession(
     state: KimiSdkSessionState,
     opts?: { removeSession?: boolean; bestEffortCloseSession?: boolean; preserveResumeId?: boolean; hibernationReason?: string },
@@ -710,6 +759,9 @@ export class KimiSdkProvider implements TransportProvider {
     }
     const run = (async () => {
       this.clearCancelGraceTimer(state);
+      if (opts?.removeSession) state.cancelled = true;
+      state.coldStartRetryWake?.();
+      state.coldStartRetryWake = undefined;
       this.interruptAndCloseAgyBridges(state.routeId, state);
       if (state.incognito) state.disposed = true;
       const transport = state.isolatedTransport;
@@ -740,6 +792,7 @@ export class KimiSdkProvider implements TransportProvider {
         state.acpSessionId = undefined;
       }
       state.loaded = false;
+      state.sessionModelCatalogLoaded = false;
       state.modeApplied = false;
       state.confirmedModel = undefined;
       state.modelApplyRequest = undefined;
@@ -755,35 +808,8 @@ export class KimiSdkProvider implements TransportProvider {
       }
 
       if (!transport) return;
-      const isolatedChild = transport.child;
       state.isolatedTransport = undefined;
-      transport.child = null;
-      transport.connection = null;
-      transport.initPromise = null;
-      transport.sessionListSupported = false;
-      transport.systemPromptMetaAppendSupported = false;
-
-      if (isolatedChild) {
-        // Call killProcessTree even when the root ACP child already exited: same-group
-        // descendants/native workers can outlive the exited leader and must be reaped
-        // before deleting incognitoEnv.homeDir or hibernating a per-session process.
-        const alive = isolatedChild.exitCode === null && isolatedChild.signalCode === null;
-        const exitPromise = alive ? once(isolatedChild, 'exit').catch(() => {}) : null;
-        if (alive) {
-          try { isolatedChild.stdin?.end(); } catch { /* noop */ }
-        }
-        await killProcessTree(isolatedChild, { ownsProcessGroup: true, gracefulMs: 200 });
-        if (exitPromise && isolatedChild.exitCode === null && isolatedChild.signalCode === null) {
-          await Promise.race([
-            exitPromise,
-            new Promise<void>((resolve) => setTimeout(resolve, 500)),
-          ]);
-        }
-      }
-      if (transport.incognitoEnv) {
-        await transport.incognitoEnv.cleanup();
-        transport.incognitoEnv = undefined;
-      }
+      await this.teardownIsolatedTransportSlot(transport);
     })();
     state.isolatedDisposeInFlight = run;
     try {
@@ -909,6 +935,8 @@ export class KimiSdkProvider implements TransportProvider {
       this.cancelPendingApprovals();
       const states = [...this.sessions.values()];
       for (const state of states) {
+        state.cancelled = true;
+        state.coldStartRetryWake?.();
         this.clearCancelGraceTimer(state);
         this.interruptAndCloseAgyBridges(state.routeId, state);
       }
@@ -958,7 +986,9 @@ export class KimiSdkProvider implements TransportProvider {
     );
     if (prior) {
       this.interruptAndCloseAgyBridges(prior.routeId, prior);
-      if (shouldDisposePrior) prior.cancelled = true;
+      if (shouldDisposePrior || config.fresh) {
+        prior.cancelled = true;
+      }
     }
     setSessionIncognito(routeId, incognito);
     if (config.sessionName && config.sessionName !== routeId) {
@@ -992,6 +1022,9 @@ export class KimiSdkProvider implements TransportProvider {
       beforeNativeSessionStart: config.beforeNativeSessionStart ?? existing?.beforeNativeSessionStart,
       acpSessionId: config.resumeId ?? existing?.acpSessionId,
       loaded: false,
+      sessionModelCatalogLoaded: (!config.fresh && existing?.isolatedTransport)
+        ? Boolean(existing.sessionModelCatalogLoaded)
+        : false,
       modeApplied: false,
       promptInFlight: false,
       promptSubmittedGeneration: null,
@@ -1040,6 +1073,13 @@ export class KimiSdkProvider implements TransportProvider {
       this.releaseAcpRoute(prior.acpSessionId, routeId);
     }
     this.sessions.set(routeId, state);
+    if (prior) {
+      // Unconditionally wake any sleeping cold-start retry on the superseded state
+      // after publishing `state` so the old ready loop observes ownership loss at once
+      // even when its isolatedTransport was already cleared before retry.
+      prior.coldStartRetryWake?.();
+      prior.coldStartRetryWake = undefined;
+    }
     if (state.acpSessionId) {
       this.registerAcpRoute(state.acpSessionId, routeId);
       this.emitSessionInfo(routeId, { resumeId: state.acpSessionId });
@@ -1053,6 +1093,8 @@ export class KimiSdkProvider implements TransportProvider {
   async endSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    state.cancelled = true;
+    state.coldStartRetryWake?.();
     this.clearCancelGraceTimer(state);
     this.cancelPendingApprovals(sessionId);
     if (this.usesIsolatedTransport(state)) {
@@ -1082,6 +1124,8 @@ export class KimiSdkProvider implements TransportProvider {
   async detachSession(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    state.cancelled = true;
+    state.coldStartRetryWake?.();
     this.clearCancelGraceTimer(state);
     this.cancelPendingApprovals(sessionId);
     if (this.usesIsolatedTransport(state)) {
@@ -2315,6 +2359,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
     state.modelRevision++;
     state.stoppedByCancel = true;
+    state.coldStartRetryWake?.();
     const hadBackgroundOrOpenTools = (state.agyBackgroundTasks?.size ?? 0) > 0
       || Boolean(state.agyReactive)
       || (state.agySubagents?.activeCount() ?? 0) > 0
@@ -2612,14 +2657,24 @@ export class KimiSdkProvider implements TransportProvider {
     return [...this.profile.args, ...extraFlags];
   }
 
-  private async startPerSessionAcpServer(sessionId: string, state: KimiSdkSessionState): Promise<void> {
+  private async startPerSessionAcpServer(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    assertOwner?: () => void,
+  ): Promise<void> {
+    assertOwner?.();
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
     }
     if (state.isolatedTransport) {
       await this.disposeIsolatedSession(state, { bestEffortCloseSession: true, preserveResumeId: true });
+      assertOwner?.();
     }
     await this.evictWarmPerSessionsIfNeeded(sessionId);
+    assertOwner?.();
+    if (!this.config) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
+    }
     const transport: IsolatedAcpTransport = {
       child: null,
       connection: null,
@@ -2630,13 +2685,28 @@ export class KimiSdkProvider implements TransportProvider {
     state.isolatedTransport = transport;
     try {
       await this.startAcpServer(this.config, { sessionId, state, transport }, { refreshExecutable: true });
+      assertOwner?.();
     } catch (error) {
-      await this.disposeIsolatedSession(state, { preserveResumeId: true });
+      const currentOwner = this.sessions.get(sessionId);
+      const successorAdoptedTransport = Boolean(
+        currentOwner && currentOwner !== state && currentOwner.isolatedTransport === transport,
+      );
+      if (state.isolatedTransport === transport) {
+        state.isolatedTransport = undefined;
+      }
+      if (!successorAdoptedTransport) {
+        await this.teardownIsolatedTransportSlot(transport);
+      }
       throw error;
     }
   }
 
-  private async startIsolatedAcpServer(sessionId: string, state: KimiSdkSessionState): Promise<void> {
+  private async startIsolatedAcpServer(
+    sessionId: string,
+    state: KimiSdkSessionState,
+    assertOwner?: () => void,
+  ): Promise<void> {
+    assertOwner?.();
     if (!this.config) {
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
     }
@@ -2647,9 +2717,14 @@ export class KimiSdkProvider implements TransportProvider {
       ?? resolveAgySourceHome(state.env, this.config.env as Record<string, string> | undefined);
     if (state.isolatedTransport) {
       await this.disposeIsolatedSession(state);
+      assertOwner?.();
       state.disposed = false;
     }
     await reclaimOrphanedAgyIncognitoHomes().catch(() => 0);
+    assertOwner?.();
+    if (!this.config) {
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, `${this.profile.displayName} ACP server not connected`, false);
+    }
     const incognitoEnv = createAgyIncognitoEnvSync(sourceHome, { skipReclaim: true });
     state.env = { ...(state.env ?? {}), ...incognitoEnv.env };
     const transport: IsolatedAcpTransport = {
@@ -2664,8 +2739,18 @@ export class KimiSdkProvider implements TransportProvider {
     state.isolatedTransport = transport;
     try {
       await this.startAcpServer(this.config, { sessionId, state, transport, incognitoEnv });
+      assertOwner?.();
     } catch (error) {
-      await this.disposeIsolatedSession(state);
+      const currentOwner = this.sessions.get(sessionId);
+      const successorAdoptedTransport = Boolean(
+        currentOwner && currentOwner !== state && currentOwner.isolatedTransport === transport,
+      );
+      if (state.isolatedTransport === transport) {
+        state.isolatedTransport = undefined;
+      }
+      if (!successorAdoptedTransport) {
+        await this.teardownIsolatedTransportSlot(transport);
+      }
       throw error;
     }
   }
@@ -3397,12 +3482,24 @@ export class KimiSdkProvider implements TransportProvider {
 
     let beforeNativeStartRan = false;
     let sharedRecycleRetried = false;
+    let emptyCatalogRetried = false;
+    const isReadyOwnerActive = (): boolean => (
+      this.sessions.get(sessionId) === state
+      && !state.cancelled
+      && (expectedGeneration === undefined || (state.turnGeneration === expectedGeneration && state.settledGeneration < expectedGeneration))
+    );
+    const assertReadyOwner = (): void => {
+      if (!isReadyOwnerActive()) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'ACP session owner changed or stopped', true);
+      }
+    };
 
     while (true) {
+      assertReadyOwner();
       if (state.incognito) {
         const existingTransport = state.isolatedTransport;
         if (!existingTransport?.connection || !existingTransport.child || existingTransport.child.killed || existingTransport.child.exitCode !== null) {
-          await this.startIsolatedAcpServer(sessionId, state);
+          await this.startIsolatedAcpServer(sessionId, state, assertReadyOwner);
         }
       } else if (this.profile.perSessionTransport) {
         this.sharedSessionReadyInFlight.add(sessionId);
@@ -3421,6 +3518,7 @@ export class KimiSdkProvider implements TransportProvider {
         );
         if (alive && (this.hasExecutableFingerprintChanged(existingTransport?.executableFingerprint) || cwdChanged)) {
           await this.disposeIsolatedSession(state, { bestEffortCloseSession: true, preserveResumeId: true });
+          assertReadyOwner();
         }
         if (
           !state.isolatedTransport?.connection
@@ -3428,7 +3526,7 @@ export class KimiSdkProvider implements TransportProvider {
           || state.isolatedTransport.child.killed
           || state.isolatedTransport.child.exitCode !== null
         ) {
-          await this.startPerSessionAcpServer(sessionId, state);
+          await this.startPerSessionAcpServer(sessionId, state, assertReadyOwner);
         }
       } else {
         if (!state.loaded && (this.pendingSharedRecycle || this.hasSharedExecutableChanged())) {
@@ -3454,6 +3552,7 @@ export class KimiSdkProvider implements TransportProvider {
       if (!state.incognito) this.sharedSessionReadyInFlight.add(sessionId);
       const wasLoadedOnEntry = state.loaded;
       let coldStartModelConfigFailed = false;
+      let coldStartCatalogUnavailable = false;
       try {
         await this.initPromiseForState(state);
         this.assertCurrentSession(sessionId, state, connection, expectedGeneration);
@@ -3590,6 +3689,9 @@ export class KimiSdkProvider implements TransportProvider {
               && this.normalizeError(err).code === PROVIDER_ERROR_CODES.CONFIG_ERROR
             ) {
               coldStartModelConfigFailed = true;
+              if (!state.sessionModelCatalogLoaded) {
+                coldStartCatalogUnavailable = true;
+              }
             }
             throw err;
           }
@@ -3624,6 +3726,44 @@ export class KimiSdkProvider implements TransportProvider {
             sharedRecycleRetried = true;
             this.sharedSessionReadyInFlight.delete(sessionId);
             continue;
+          }
+          if (coldStartCatalogUnavailable) {
+            if (!emptyCatalogRetried) {
+              if (!isReadyOwnerActive()) {
+                throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'ACP session owner changed or stopped', true);
+              }
+              const retryDelayMs = readAcpDelayOption(
+                this.acpTimeoutOptions.coldStartCatalogRetryDelayMs,
+                'IMCODES_ACP_COLD_START_CATALOG_RETRY_DELAY_MS',
+                DEFAULT_ACP_COLD_START_CATALOG_RETRY_DELAY_MS,
+              );
+              if (retryDelayMs > 0) {
+                await new Promise<void>((resolve) => {
+                  const timer = setTimeout(() => {
+                    if (state.coldStartRetryWake === wake) state.coldStartRetryWake = undefined;
+                    resolve();
+                  }, retryDelayMs);
+                  timer.unref?.();
+                  const wake = () => {
+                    clearTimeout(timer);
+                    if (state.coldStartRetryWake === wake) state.coldStartRetryWake = undefined;
+                    resolve();
+                  };
+                  state.coldStartRetryWake = wake;
+                });
+              }
+              if (!isReadyOwnerActive()) {
+                throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'ACP session owner changed or stopped', true);
+              }
+              emptyCatalogRetried = true;
+              this.sharedSessionReadyInFlight.delete(sessionId);
+              continue;
+            }
+            throw this.makeError(
+              PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+              `${this.profile.displayName} could not load its model catalog; please retry.`,
+              true,
+            );
           }
         } else if (!state.incognito && !state.loaded && isWorkerSpawnMissingExecutableError(err)) {
           if (this.hasActiveSharedSessionWork(sessionId)) {
@@ -3874,6 +4014,9 @@ export class KimiSdkProvider implements TransportProvider {
   ): void {
     const currentModel = info?.models?.currentModelId;
     const available = Array.isArray(info?.models?.availableModels) ? info.models.availableModels : [];
+    if (available.length > 0) {
+      state.sessionModelCatalogLoaded = true;
+    }
     if (state.modelIsDefault && state.model && available.length > 0) {
       const supported = available.some((m: Record<string, unknown>) => String((m as Record<string, unknown>).modelId ?? (m as Record<string, unknown>).id ?? '') === state.model);
       if (!supported) {

@@ -27306,6 +27306,7 @@ html.native-ios-mac .global-task-mode-entry-btn {
   z-index: 1;
   display: flex;
   flex-direction: column;
+  flex: 1;
   gap: 4px;
   padding: 7px 9px;
   background: rgb(15, 23, 42);
@@ -27771,6 +27772,12 @@ html.native-ios-mac .global-task-mode-entry-btn {
     border-radius: 10px;
   }
 
+  .global-task-card:not(.is-expanded) .global-task-card-main {
+    flex: 1;
+    min-height: 0;
+    align-items: stretch;
+  }
+
   .global-task-card.is-terminal .global-task-card-surface {
     padding: 8px 11px;
     gap: 5px;
@@ -27866,6 +27873,7 @@ html.native-ios-mac .global-task-mode-entry-btn {
     display: flex;
     flex-direction: column;
     gap: 5px;
+    margin-top: auto;
     padding-top: 6px;
     border-top: 1px solid rgba(148, 163, 184, 0.12);
     min-width: 0;
@@ -27896,6 +27904,7 @@ html.native-ios-mac .global-task-mode-entry-btn {
   .global-task-desktop-running-actions {
     display: inline-flex;
     align-items: center;
+    align-self: flex-end;
     gap: 5px;
     flex: 0 0 auto;
     flex-wrap: nowrap;
@@ -28441,6 +28450,12 @@ html.native-ios-mac .global-task-mode-entry-btn {
   align-items: center;
   text-align: center;
 }
+.client-downloads-mobile-card .client-downloads-qr-frame {
+  margin-top: auto;
+}
+.client-downloads-mobile-card .client-downloads-btn-full {
+  margin-top: 0;
+}
 .client-downloads-card-head {
   display: flex;
   align-items: center;
@@ -28544,6 +28559,9 @@ html.native-ios-mac .global-task-mode-entry-btn {
 }
 .client-downloads-qr-frame svg {
   display: block;
+  width: 136px;
+  height: 136px;
+  flex-shrink: 0;
 }
 .client-downloads-footer {
   font-size: 12px;

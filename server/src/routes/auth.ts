@@ -46,6 +46,7 @@ import logger from '../util/logger.js';
 import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
 import { rememberClientTimezone } from '../util/client-timezone.js';
 import { revokeBrowserAccountSession } from '../services/remote-desktop-account-auth.js';
+import { globalTaskHub } from '../services/global-task-hub.js';
 import { r2RelayConfig } from '../services/r2-relay.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -335,6 +336,7 @@ authRoutes.delete('/user/:id/key', async (c) => {
     'UPDATE api_keys SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL',
     [now, userId],
   );
+  await globalTaskHub.notifyPushCredentialRevoked(c.env.DB, { userId, allApiKeys: true });
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAuthAudit(c, { userId, action: 'auth.revoke_keys', ip }, c.env.DB);
@@ -406,6 +408,7 @@ authRoutes.delete('/user/me/keys/:keyId', async (c) => {
     'UPDATE api_keys SET revoked_at = $1 WHERE id = $2 AND user_id = $3',
     [now, keyId, userId],
   );
+  await globalTaskHub.notifyPushCredentialRevoked(c.env.DB, { userId, keyId });
 
   // Kick all daemon WebSocket connections that were bound using this API key
   const boundServers = await c.env.DB.query<{ id: string }>(

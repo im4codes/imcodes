@@ -18,6 +18,8 @@ import {
   resetDaemonUpgradePublicationGateForTest,
 } from '../src/ws/daemon-upgrade-publication-gate.js';
 import * as dbQueries from '../src/db/queries.js';
+import { pushStreamHub } from '../src/services/push-stream-hub.js';
+import { globalTaskHub } from '../src/services/global-task-hub.js';
 import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
@@ -7739,6 +7741,65 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(dispatchPush).not.toHaveBeenCalled();
+    });
+
+    it('dispatches push with suppression flags when mobile client is connected but SSE subscriber is active', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { bridge, daemonWs } = await setupPushBridge();
+
+      // Subscribe an active SSE push stream for withoutFcm delivery
+      const unsubscribe = pushStreamHub.subscribe('user-1', {
+        send: () => true,
+        close: () => {},
+      });
+
+      try {
+        // Connect a mobile browser
+        const mobileWs = new MockWs();
+        bridge.handleBrowserConnection(mobileWs as never, 'user-1', makePushDb('valid-hash'), true);
+
+        daemonWs.emit('message', JSON.stringify({
+          type: 'session.idle', session: 'deck_cd_brain', lastText: 'SSE push needed.',
+        }));
+        await flushAsync();
+
+        expect(dispatchPush).toHaveBeenCalledTimes(1);
+        const callArgs = vi.mocked(dispatchPush).mock.calls[0][0];
+        expect(callArgs).toMatchObject({
+          userId: 'user-1',
+          suppressTokenPush: true,
+          suppressDesktopPush: true,
+          suppressStreamPush: false,
+        });
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it('dispatches push with suppression flags when mobile client is connected and PG is listening', async () => {
+      const { dispatchPush } = await import('../src/routes/push.js');
+      const { bridge, daemonWs } = await setupPushBridge();
+      const pgSpy = vi.spyOn(globalTaskHub, 'isPgListening').mockReturnValue(true);
+
+      try {
+        const mobileWs = new MockWs();
+        bridge.handleBrowserConnection(mobileWs as never, 'user-1', makePushDb('valid-hash'), true);
+
+        daemonWs.emit('message', JSON.stringify({
+          type: 'session.idle', session: 'deck_cd_brain', lastText: 'PG push needed.',
+        }));
+        await flushAsync();
+
+        expect(dispatchPush).toHaveBeenCalledTimes(1);
+        expect(vi.mocked(dispatchPush).mock.calls[0][0]).toMatchObject({
+          userId: 'user-1',
+          suppressTokenPush: true,
+          suppressDesktopPush: true,
+          suppressStreamPush: false,
+        });
+      } finally {
+        pgSpy.mockRestore();
+      }
     });
 
     it('sends push when only desktop browser is connected', async () => {

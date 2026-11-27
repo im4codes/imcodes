@@ -39,12 +39,16 @@ import type { SessionInfoUpdate, ToolCallEvent } from '../../src/agent/transport
 
 const resources: Array<{ provider: AgyAcpProvider; root: string }> = [];
 afterEach(async () => { for (const { provider, root } of resources.splice(0)) { await provider.disconnect(); await rm(root, { recursive: true, force: true }); } vi.unstubAllEnvs(); });
-async function setup(scenario = '', extraEnv: Record<string, string> = {}) {
+async function setup(
+  scenario = '',
+  extraEnv: Record<string, string> = {},
+  providerOptions?: ConstructorParameters<typeof AgyAcpProvider>[1],
+) {
   const root = await mkdtemp(path.join(tmpdir(), 'imcodes-test-agy-acp-'));
   const binary = path.join(root, 'agy');
   const fixture = path.resolve('test/fixtures/agy-acp.mjs');
   await writeFile(binary, `#!/bin/sh\nexec '${process.execPath}' '${fixture}' "$@"\n`, { mode: 0o700 });
-  const provider = new AgyAcpProvider(); resources.push({ provider, root });
+  const provider = new AgyAcpProvider(undefined, providerOptions); resources.push({ provider, root });
   const log = path.join(root, 'rpc.jsonl');
   await provider.connect({ binaryPath: binary, env: { HOME: root, AGY_ACP_FIXTURE_AGENT_NAME: AGY_ACP_AGENT_NAME, AGY_ACP_FIXTURE_LOG: log, AGY_ACP_FIXTURE_SCENARIO: scenario, ...extraEnv } });
   const requests = async () => (await readFile(log, 'utf8').catch(e => e?.code === 'ENOENT' ? '' : Promise.reject(e))).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
@@ -6967,5 +6971,168 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     const t60 = baseTime + 60 * 60_000;
     nowSpy.mockReturnValue(t60);
     expect(runtime.getDiagnosticSnapshot(t60, { sampleBackgroundProgress: true }).lastBackgroundProgressAt).toBe(t32);
+  });
+
+  it('auto-retries cold start once via session/resume when model catalog failed to load on session/new', async () => {
+    const { provider, requests } = await setup('empty-catalog-once', {}, { coldStartCatalogRetryDelayMs: 20 });
+    const id = 'deck_test_agy_empty_catalog_once';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-b' });
+
+    const complete = vi.fn();
+    const errors = vi.fn();
+    provider.onComplete(complete);
+    provider.onError(errors);
+
+    await expect(provider.send(id, 'hello-cold-catalog')).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(errors).not.toHaveBeenCalled();
+    expect(complete.mock.calls[0]?.[1].content).toBe('hello-cold-catalog');
+
+    const rows = await requests();
+    const bootPids = rows.filter((r) => r.fixture === 'boot').map((r) => r.pid);
+    expect(new Set(bootPids).size).toBe(2);
+    expect(rows.filter((r) => r.method === 'session/new')).toHaveLength(1);
+    const resumed = rows.filter((r) => r.method === 'session/resume');
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]?.params.sessionId).toBe('native-1');
+    expect(rows.filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId)).toEqual(['model-b', 'model-b']);
+  });
+
+  it('bounds cold-start empty-catalog retry to once and returns recoverable PROVIDER_ERROR instead of unavailable-model CONFIG_ERROR', async () => {
+    const { provider, requests } = await setup('empty-catalog-always', {}, { coldStartCatalogRetryDelayMs: 20 });
+    const id = 'deck_test_agy_empty_catalog_always';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-b' });
+
+    const errors: Array<{ code: string; message: string; recoverable?: boolean }> = [];
+    provider.onError((_sid, err) => errors.push(err));
+
+    await expect(provider.send(id, 'hello-always-empty')).rejects.toMatchObject({
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      recoverable: true,
+    });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]?.code).toBe(PROVIDER_ERROR_CODES.PROVIDER_ERROR);
+    expect(errors[0]?.recoverable).toBe(true);
+    expect(errors[0]?.message).not.toContain('Selected Antigravity model is unavailable');
+    expect(errors[0]?.message).toContain('could not load its model catalog');
+
+    const rows = await requests();
+    const bootPids = rows.filter((r) => r.fixture === 'boot').map((r) => r.pid);
+    expect(new Set(bootPids).size).toBe(2);
+    expect(rows.filter((r) => r.method === 'session/new')).toHaveLength(1);
+    expect(rows.filter((r) => r.method === 'session/resume')).toHaveLength(1);
+  });
+
+  it('aborts cold-start empty-catalog retry backoff immediately on cancel without spawning a retry child', async () => {
+    const { provider, requests } = await setup('empty-catalog-always', {}, { coldStartCatalogRetryDelayMs: 5_000 });
+    const id = 'deck_test_agy_empty_catalog_cancel';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-b' });
+
+    const errors: Array<{ code: string }> = [];
+    provider.onError((_sid, err) => errors.push(err));
+
+    const sendPromise = provider.send(id, 'cancel-during-backoff');
+    await vi.waitFor(async () => {
+      const rows = await requests();
+      expect(rows.filter((r) => r.method === 'session/set_model')).toHaveLength(1);
+    }, { timeout: 5000 });
+
+    const startMs = Date.now();
+    await provider.cancel(id);
+    await expect(sendPromise).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    expect(Date.now() - startMs).toBeLessThan(1_000);
+
+    const rows = await requests();
+    expect(rows.filter((r) => r.method === 'session/resume')).toHaveLength(0);
+  });
+
+  it('sanitizes foreign SDK models in createSession onto AGY default while keeping applySessionModel strict', async () => {
+    const { provider, requests } = await setup('legacy-flash-default');
+    const id = 'deck_test_agy_foreign_create';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'gpt-6-sol' });
+
+    const complete = vi.fn();
+    provider.onComplete(complete);
+    await expect(provider.send(id, 'after-sanitize')).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+
+    const setModels = (await requests()).filter((r) => r.method === 'session/set_model').map((r) => r.params.modelId);
+    expect(setModels).toEqual(['gemini-4-hydrogen-high']);
+    await expect(provider.applySessionModel(id, 'invalid')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+  });
+
+  it('immediately wakes and cancels a sleeping empty-catalog retry backoff when createSession replaces the route with fresh:true', async () => {
+    const { provider, requests } = await setup('empty-catalog-once', {}, { coldStartCatalogRetryDelayMs: 3_000 });
+    const id = 'deck_test_agy_empty_catalog_replace_backoff';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-b' });
+
+    const errors: Array<{ code: string }> = [];
+    const complete = vi.fn();
+    provider.onError((_sid, err) => errors.push(err));
+    provider.onComplete(complete);
+
+    const oldSend = provider.send(id, 'old-turn');
+    // Wait until the first failed child has been disposed and oldSend enters backoff (isolatedTransport cleared).
+    await vi.waitFor(async () => {
+      const rows = await requests();
+      expect(rows.filter((r) => r.method === 'session/set_model')).toHaveLength(1);
+      const st = (provider as any).sessions.get(id);
+      expect(st?.isolatedTransport).toBeUndefined();
+      expect(st?.coldStartRetryWake).toBeTypeOf('function');
+    }, { timeout: 5000 });
+
+    const replaceStart = Date.now();
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-b', fresh: true });
+    await expect(oldSend).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    expect(Date.now() - replaceStart).toBeLessThan(1_000);
+
+    // Must not have spawned a retry child for the replaced session; replacement fresh session recovers cleanly.
+    const rowsBeforeNewSend = await requests();
+    expect(rowsBeforeNewSend.filter((r) => r.method === 'session/resume')).toHaveLength(0);
+    expect(rowsBeforeNewSend.filter((r) => r.fixture === 'boot')).toHaveLength(1);
+
+    await expect(provider.send(id, 'new-fresh-turn')).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete.mock.calls[0]?.[1].content).toBe('new-fresh-turn');
+  });
+
+  it('aborts retry startPerSessionAcpServer when session ownership is lost during warm-session eviction without spawning a leaked child', async () => {
+    const { provider, requests } = await setup('empty-catalog-once', {}, { coldStartCatalogRetryDelayMs: 20 });
+    const id = 'deck_test_agy_empty_catalog_evict_replace';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-b' });
+
+    let evictEnteredResolve!: () => void;
+    const evictEntered = new Promise<void>((res) => { evictEnteredResolve = res; });
+    let evictGateResolve!: () => void;
+    const evictGate = new Promise<void>((res) => { evictGateResolve = res; });
+    const origEvict = (provider as any).evictWarmPerSessionsIfNeeded.bind(provider);
+    let evictCalls = 0;
+    const evictSpy = vi.spyOn(provider as any, 'evictWarmPerSessionsIfNeeded').mockImplementation(async (...args: unknown[]) => {
+      evictCalls += 1;
+      if (evictCalls === 2) {
+        evictEnteredResolve();
+        await evictGate;
+      }
+      return origEvict(...args);
+    });
+
+    try {
+      const sendPromise = provider.send(id, 'evict-race-turn');
+      await evictEntered;
+
+      // Replace (close/recreate) session ownership while attempt #2 is suspended inside warm eviction.
+      await provider.endSession(id);
+      expect((await requests()).filter((r) => r.fixture === 'boot')).toHaveLength(1);
+
+      evictGateResolve();
+      await expect(sendPromise).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+
+      // Must abort before spawning a second ACP child process.
+      const rows = await requests();
+      expect(rows.filter((r) => r.fixture === 'boot')).toHaveLength(1);
+      expect(rows.filter((r) => r.method === 'session/resume')).toHaveLength(0);
+    } finally {
+      evictSpy.mockRestore();
+    }
   });
 });

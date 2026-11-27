@@ -2,7 +2,10 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   buildQrMatrixPath,
+  isDownloadApiUrl,
+  isPcAppClient,
   openExternalDownloadUrl,
+  openPcAppDownloadUrl,
   resolveClientDownloadUrls,
   type AndroidVariant,
 } from '../client-downloads.js';
@@ -65,9 +68,15 @@ function QrCodeSvg({ value, label, testId }: { value: string; label: string; tes
 }
 
 function handleExternalClick(e: MouseEvent, url: string) {
-  if (!isNative()) return;
-  e.preventDefault();
-  void openExternalDownloadUrl(url);
+  if (isNative()) {
+    e.preventDefault();
+    void openExternalDownloadUrl(url);
+    return;
+  }
+  if (isPcAppClient() && isDownloadApiUrl(url)) {
+    e.preventDefault();
+    void openPcAppDownloadUrl(url);
+  }
 }
 
 export function ClientDownloadsModal({ open, onClose }: Props) {

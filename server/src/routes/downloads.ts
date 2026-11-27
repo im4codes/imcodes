@@ -4,6 +4,12 @@ import { resolve, sep } from 'node:path';
 import { Hono, type Context } from 'hono';
 import type { Env, EnvConfig } from '../env.js';
 import {
+  CLIENT_DOWNLOAD_RESOLVE_MODES,
+  CLIENT_DOWNLOAD_RESOLVE_QUERY_PARAM,
+  CLIENT_DOWNLOAD_RESOLVE_QUERY_VALUE,
+  type ClientDownloadResolveResponse,
+} from '../../../shared/client-downloads.js';
+import {
   extractArtifactDistributionEnv,
   loadReleaseArtifactsManifest,
   resolveArtifactChannel,
@@ -127,6 +133,17 @@ export function createDownloadsRoutes(
     if (!channelQuery.valid) {
       return c.json({ error: 'invalid_channel' }, 400);
     }
+    const resolveJson = c.req.query(CLIENT_DOWNLOAD_RESOLVE_QUERY_PARAM) === CLIENT_DOWNLOAD_RESOLVE_QUERY_VALUE;
+    const respondRedirect = (location: string) => {
+      if (resolveJson) {
+        return c.json<ClientDownloadResolveResponse>(
+          { ok: true, mode: CLIENT_DOWNLOAD_RESOLVE_MODES.REDIRECT, url: location },
+          200,
+        );
+      }
+      c.header('Location', location);
+      return c.body(null, 302);
+    };
 
     const env = extractArtifactDistributionEnv((c.env ?? {}) as Partial<EnvConfig>);
     const dir = artifactDirectory()?.trim();
@@ -137,13 +154,11 @@ export function createDownloadsRoutes(
     if (spec.kind === 'android') {
       const r2Url = resolveR2ObjectUrl(env, `${channel}/${spec.r2Key}`);
       const location = r2Url ?? resolveGitHubReleasesUrl(env, channel);
-      c.header('Location', location);
-      return c.body(null, 302);
+      return respondRedirect(location);
     }
 
     if (channelQuery.channel && channelQuery.channel !== serverChannel) {
-      c.header('Location', resolveGitHubReleasesUrl(env, channelQuery.channel));
-      return c.body(null, 302);
+      return respondRedirect(resolveGitHubReleasesUrl(env, channelQuery.channel));
     }
 
     if (!dir) {
@@ -160,8 +175,7 @@ export function createDownloadsRoutes(
     }
 
     if (resolved.external) {
-      c.header('Location', resolved.external.url);
-      return c.body(null, 302);
+      return respondRedirect(resolved.external.url);
     }
 
     const opened = await openVerifiedLocalInstaller(
@@ -172,6 +186,16 @@ export function createDownloadsRoutes(
     );
     if (!opened) {
       return c.json({ error: 'not_found' }, 404);
+    }
+    if (resolveJson) {
+      try {
+        return c.json<ClientDownloadResolveResponse>(
+          { ok: true, mode: CLIENT_DOWNLOAD_RESOLVE_MODES.STREAM, url: null },
+          200,
+        );
+      } finally {
+        await opened.close();
+      }
     }
 
     const stream = new ReadableStream<Uint8Array>({

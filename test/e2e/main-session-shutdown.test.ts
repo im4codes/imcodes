@@ -18,7 +18,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import { mkdirSync } from 'fs';
 import { newSession, killSession, sessionExists, capturePane, listSessions } from '../../src/agent/tmux.js';
-import { loadStore, flushStore, upsertSession, getSession, removeSession, listSessions as storeSessions } from '../../src/store/session-store.js';
+import { loadStore, flushStore, upsertSession, getSession, removeSession, listSessions as storeSessions, waitForSessionStoreSnapshotForTests } from '../../src/store/session-store.js';
 import { stopProject, restoreFromStore } from '../../src/agent/session-manager.js';
 
 const SKIP = process.env.SKIP_TMUX_TESTS === '1' || !!process.env.CLAUDECODE;
@@ -99,6 +99,10 @@ describe.skipIf(SKIP)('main-session shutdown e2e', () => {
       projectName: SUB_CHILD,
       parentSession: SUB_ROOT,
     }));
+
+    // Persist the tree + snapshot before closing so stopProject exercises real disk deletion and reload.
+    await flushStore();
+    await waitForSessionStoreSnapshotForTests();
 
     const serverLink = { send: () => {} };
     const result = await stopProject(PROJECT, serverLink);

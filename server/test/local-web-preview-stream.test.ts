@@ -333,4 +333,207 @@ describe('V-stream-bytes / V-buffer-cap', () => {
     });
     expect(aborted).toBe(false);
   });
+
+  it('wrapSseKeepaliveStream emits ": keepalive\\n\\n" when silent without dropping delayed data or leaking timers', async () => {
+    const { wrapSseKeepaliveStream } = await import('../src/routes/local-web-preview.js');
+    vi.useFakeTimers();
+
+    let upstreamCtrl!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    const upstream = new ReadableStream<Uint8Array>({
+      start(c) { upstreamCtrl = c; },
+      cancel() { cancelled = true; },
+    });
+
+    const wrapped = wrapSseKeepaliveStream(upstream, 500);
+    const reader = wrapped.getReader();
+
+    // Consumer awaits first chunk while upstream is silent > 500ms → emits keepalive comment.
+    const r1Promise = reader.read();
+    await vi.advanceTimersByTimeAsync(500);
+    const r1 = await r1Promise;
+    expect(r1.done).toBe(false);
+    expect(Buffer.from(r1.value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+
+    // Consumer issues second read while upstream stays silent 300ms, then emits real SSE event.
+    // The in-flight read MUST preserve the real event without losing or duplicating it!
+    const r2Promise = reader.read();
+    await vi.advanceTimersByTimeAsync(300);
+    upstreamCtrl.enqueue(Buffer.from('data: hello\n\n', 'utf8'));
+    const r2 = await r2Promise;
+    expect(r2.done).toBe(false);
+    expect(Buffer.from(r2.value ?? []).toString('utf8')).toBe('data: hello\n\n');
+
+    // Another 500ms silence -> second keepalive comment.
+    const r3Promise = reader.read();
+    await vi.advanceTimersByTimeAsync(500);
+    const r3 = await r3Promise;
+    expect(Buffer.from(r3.value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+
+    // Also test real chunk arriving right AFTER timer resolved pull() (between pulls):
+    // must still be delivered intact on the subsequent read!
+    upstreamCtrl.enqueue(Buffer.from('data: trailing\n\n', 'utf8'));
+    const r4 = await reader.read();
+    expect(Buffer.from(r4.value ?? []).toString('utf8')).toBe('data: trailing\n\n');
+
+    // Cancelling propagates cleanly to upstream and cleans timers.
+    const cancelRead = reader.read();
+    await reader.cancel('client gone');
+    await expect(cancelRead).resolves.toMatchObject({ done: true });
+    expect(cancelled).toBe(true);
+    await vi.advanceTimersByTimeAsync(5000);
+  });
+
+  it('wrapSseKeepaliveStream NEVER injects ": keepalive\\n\\n" mid-line or mid-event across split LF/CRLF chunks', async () => {
+    const { wrapSseKeepaliveStream } = await import('../src/routes/local-web-preview.js');
+    vi.useFakeTimers();
+
+    let upstreamCtrl!: ReadableStreamDefaultController<Uint8Array>;
+    const upstream = new ReadableStream<Uint8Array>({
+      start(c) { upstreamCtrl = c; },
+    });
+
+    const wrapped = wrapSseKeepaliveStream(upstream, 100);
+    const reader = wrapped.getReader();
+    const collected: string[] = [];
+
+    // 1) Split mid-field ("data: hel" then wait > keepaliveMs then "lo\n\n"):
+    //    keepalive MUST NOT be inserted inside "data: hello".
+    upstreamCtrl.enqueue(Buffer.from('data: hel', 'utf8'));
+    const p1 = reader.read();
+    expect(Buffer.from((await p1).value ?? []).toString('utf8')).toBe('data: hel');
+
+    const p2 = reader.read();
+    await vi.advanceTimersByTimeAsync(350); // 3.5x keepaliveMs while mid-line!
+    upstreamCtrl.enqueue(Buffer.from('lo\n\n', 'utf8'));
+    const r2 = await p2;
+    collected.push(Buffer.from(r2.value ?? []).toString('utf8'));
+    expect(collected[0]).toBe('lo\n\n');
+
+    // 2) Now AT blank-line boundary -> silent > 100ms emits valid `: keepalive\n\n`.
+    const p3 = reader.read();
+    await vi.advanceTimersByTimeAsync(100);
+    const r3 = await p3;
+    expect(Buffer.from(r3.value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+
+    // 3) Split mid-event across CRLF (`id: 9\r` then silence then `\n` then silence then `data: ok\r\n` then silence):
+    //    single EOL (even split `\r` + `\n`) MUST NOT emit `: keepalive\n\n` before `data: ok\r\n\r\n`.
+    upstreamCtrl.enqueue(Buffer.from('id: 9\r', 'utf8'));
+    expect(Buffer.from((await reader.read()).value ?? []).toString('utf8')).toBe('id: 9\r');
+    const p4 = reader.read();
+    await vi.advanceTimersByTimeAsync(250);
+    upstreamCtrl.enqueue(Buffer.from('\n', 'utf8'));
+    expect(Buffer.from((await p4).value ?? []).toString('utf8')).toBe('\n');
+
+    const p5a = reader.read();
+    await vi.advanceTimersByTimeAsync(250);
+    upstreamCtrl.enqueue(Buffer.from('data: ok\r\n', 'utf8'));
+    expect(Buffer.from((await p5a).value ?? []).toString('utf8')).toBe('data: ok\r\n');
+
+    const p5b = reader.read();
+    await vi.advanceTimersByTimeAsync(250);
+    upstreamCtrl.enqueue(Buffer.from('\r\n', 'utf8'));
+    expect(Buffer.from((await p5b).value ?? []).toString('utf8')).toBe('\r\n');
+
+    // 4) Now CRLF blank line completed -> next silence emits `: keepalive\n\n` cleanly!
+    const p6 = reader.read();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(Buffer.from((await p6).value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+
+    await reader.cancel();
+  });
+
+  it('keeps pure CR events, delayed/split leading UTF-8 BOM after initial keepalive, and split CRLF intact under WHATWG SSE parsing', async () => {
+    const { wrapSseKeepaliveStream } = await import('../src/routes/local-web-preview.js');
+    vi.useFakeTimers();
+
+    // Spec-exact WHATWG §9.2.5/9.2.6 SSE parser (ignores BOM ONLY via TextDecoder initial strip;
+    // any BOM emitted AFTER an early `: keepalive\n\n` would corrupt `\uFEFFid` / `\uFEFFdata`).
+    function parseWhatwgSse(chunks: Uint8Array[]): Array<{ id: string; data: string }> {
+      const dec = new TextDecoder('utf-8');
+      const text = chunks.map((c) => dec.decode(c, { stream: true })).join('') + dec.decode();
+      // Normalize CRLF -> LF, then remaining CR -> LF per WHATWG EventSource stream decoding.
+      const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+      const events: Array<{ id: string; data: string }> = [];
+      let dataBuf = '';
+      let lastEventId = '';
+      for (const line of lines) {
+        if (line === '') {
+          if (dataBuf !== '') {
+            events.push({
+              id: lastEventId,
+              data: dataBuf.endsWith('\n') ? dataBuf.slice(0, -1) : dataBuf,
+            });
+            dataBuf = '';
+          }
+          continue;
+        }
+        if (line.startsWith(':')) continue;
+        const colon = line.indexOf(':');
+        const field = colon === -1 ? line : line.slice(0, colon);
+        let value = colon === -1 ? '' : line.slice(colon + 1);
+        if (value.startsWith(' ')) value = value.slice(1);
+        if (field === 'data') dataBuf += `${value}\n`;
+        else if (field === 'id' && !value.includes('\0')) lastEventId = value;
+      }
+      return events;
+    }
+
+    // Case A: Initial `: keepalive\n\n` fires BEFORE delayed + split UTF-8 BOM + first event.
+    let ctrlA!: ReadableStreamDefaultController<Uint8Array>;
+    const streamA = wrapSseKeepaliveStream(new ReadableStream<Uint8Array>({ start(c) { ctrlA = c; } }), 100);
+    const readerA = streamA.getReader();
+    const outA: Uint8Array[] = [];
+
+    const firstKeepaliveP = readerA.read();
+    await vi.advanceTimersByTimeAsync(100);
+    const firstKeepalive = await firstKeepaliveP;
+    expect(Buffer.from(firstKeepalive.value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+    outA.push(firstKeepalive.value!);
+
+    // Split UTF-8 BOM `[0xef]`, pause > keepaliveMs (must NOT inject keepalive mid-BOM!), then `[0xbb, 0xbf]id: 7\ndata: bom-ok\n\n`
+    ctrlA.enqueue(new Uint8Array([0xef]));
+    const nextReadP = readerA.read();
+    await vi.advanceTimersByTimeAsync(250);
+    ctrlA.enqueue(Buffer.concat([new Uint8Array([0xbb, 0xbf]), Buffer.from('id: 7\ndata: bom-ok\n\n', 'utf8')]));
+    const afterBom = await nextReadP;
+    expect(Buffer.from(afterBom.value ?? []).toString('utf8')).toBe('id: 7\ndata: bom-ok\n\n');
+    outA.push(afterBom.value!);
+
+    // Case B: Pure CR silent events (`\r\r`) must STILL emit keepalive between silent events and preserve parsed events!
+    ctrlA.enqueue(Buffer.from('id: 8\rdata: pure-cr-1\r\r', 'utf8'));
+    outA.push((await readerA.read()).value!);
+    const crKeepaliveP = readerA.read();
+    await vi.advanceTimersByTimeAsync(100);
+    const crKeepalive = await crKeepaliveP;
+    expect(Buffer.from(crKeepalive.value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+    outA.push(crKeepalive.value!);
+
+    ctrlA.enqueue(Buffer.from('id: 9\rdata: pure-cr-2\r\r', 'utf8'));
+    outA.push((await readerA.read()).value!);
+
+    // Case C: Split CRLF boundary (`\r\n\r` pause `\n`) keeps parsed events valid too.
+    ctrlA.enqueue(Buffer.from('id: 10\r\ndata: crlf-split\r\n\r', 'utf8'));
+    outA.push((await readerA.read()).value!);
+    const midSplitRead = readerA.read();
+    await vi.advanceTimersByTimeAsync(120);
+    outA.push((await midSplitRead).value!); // keepalive after `\r\n\r` empty line
+    ctrlA.enqueue(Buffer.from('\nid: 11\r\ndata: after-split\r\n\r\n', 'utf8'));
+    outA.push((await readerA.read()).value!);
+
+    ctrlA.close();
+    while (true) {
+      const n = await readerA.read();
+      if (n.done) break;
+      outA.push(n.value);
+    }
+
+    expect(parseWhatwgSse(outA)).toEqual([
+      { id: '7', data: 'bom-ok' },
+      { id: '8', data: 'pure-cr-1' },
+      { id: '9', data: 'pure-cr-2' },
+      { id: '10', data: 'crlf-split' },
+      { id: '11', data: 'after-split' },
+    ]);
+  });
 });

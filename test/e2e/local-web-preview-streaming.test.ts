@@ -249,7 +249,7 @@ async function setup() {
     } as Record<string, unknown>, fakeServerLink as never);
   };
 
-  return { bridge, types, serverId, previewId, daemonToBridge, bridgeToDaemon, injectHttpRequest, WsBridge };
+  return { bridge, relay, types, serverId, previewId, daemonToBridge, bridgeToDaemon, injectHttpRequest, WsBridge };
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -566,4 +566,314 @@ describe('E2E: Local Web Preview streaming protocols (real upstreams, real daemo
       && m.reason === types.PREVIEW_ERROR.LIMIT_EXCEEDED,
     )).toBe(true);
   });
+
+  // ── 7. Deferred WS upgrade preserves initial greeting & forwards sanitized headers ─
+  it('delivers initial upstream greeting across deferred WS upgrade and forwards sanitized cookie + rewritten origin', async () => {
+    const receivedHeaders: Array<Record<string, string | string[] | undefined>> = [];
+    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await new Promise<void>((resolve) => wss.on('listening', () => resolve()));
+    wss.on('connection', (ws, req) => {
+      receivedHeaders.push(req.headers as Record<string, string | string[] | undefined>);
+      ws.send(JSON.stringify({ type: 'welcome', seq: 1 }));
+    });
+    const wsPort = (wss.address() as AddressInfo).port;
+    cleanups.push(() => new Promise<void>((res) => wss.close(() => res())));
+
+    const { bridge, previewId, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+
+    const wsId = 'e'.repeat(32);
+    const browserWs = new MockBrowserWs();
+    cleanups.push(() => { try { browserWs.close(); } catch { /* ignore */ } });
+
+    bridge.beginPreviewWsTunnel({
+      wsId,
+      previewId,
+      port: wsPort,
+      path: '/ws',
+      headers: { cookie: 'auth=yes', origin: 'https://public.imcodes.example', 'x-client': 'vite' },
+      protocols: [],
+      completeUpgrade: async () => {
+        // Deliberately delay upgrade by 25ms so upstream's greeting arrives BEFORE browserWs adopts.
+        await new Promise((r) => setTimeout(r, 25));
+        return browserWs as never;
+      },
+    });
+
+    await waitFor(() => browserWs.sentText.some((s) => s.includes('"welcome"')), 10_000, 'welcome greeting');
+    expect(receivedHeaders[0]?.cookie).toBe('auth=yes');
+    expect(receivedHeaders[0]?.['x-client']).toBe('vite');
+    expect(receivedHeaders[0]?.origin).toBe(`http://127.0.0.1:${wsPort}`);
+  });
+
+  // ── 8. Real upstream 401 HTTP rejection on WS invokes rejectUpgrade(401) ──────
+  it('invokes rejectUpgrade with upstream 401 status when upstream rejects WS handshake', async () => {
+    const upstream = await startHttpUpstream((_req, res) => {
+      res.writeHead(401, 'Unauthorized').end('auth required');
+    });
+    cleanups.push(() => upstream.close());
+
+    const { bridge, previewId, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+
+    const wsId = 'f'.repeat(32);
+    const completeUpgrade = vi.fn(async () => new MockBrowserWs() as never);
+    let rejectedStatus: number | undefined;
+    bridge.beginPreviewWsTunnel({
+      wsId,
+      previewId,
+      port: upstream.port,
+      path: '/ws',
+      headers: {},
+      protocols: [],
+      completeUpgrade,
+      rejectUpgrade: (status) => { rejectedStatus = status; },
+    });
+
+    await waitFor(() => rejectedStatus !== undefined, 10_000, 'rejectUpgrade status');
+    expect(rejectedStatus).toBe(401);
+    expect(completeUpgrade).not.toHaveBeenCalled();
+  });
+
+  // ── 9. Real POST fetch() SSE + Last-Event-ID end-to-end ───────────────────────
+  it('relays POST fetch() SSE stream and Last-Event-ID header end-to-end', async () => {
+    let seenMethod = '';
+    let seenLastEventId = '';
+    let seenBody = '';
+    const upstream = await startHttpUpstream(async (req, res) => {
+      seenMethod = req.method ?? '';
+      seenLastEventId = String(req.headers['last-event-id'] ?? '');
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      seenBody = Buffer.concat(chunks).toString('utf8');
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('id: 99\ndata: {"token":"hello"}\n\n');
+      res.end();
+    });
+    cleanups.push(() => upstream.close());
+
+    const { bridge, previewId, types, relay, fakeServerLink, WsBridge } = await (async () => {
+      vi.resetModules();
+      const [bridgeMod, relayMod, typesMod] = await Promise.all([
+        import('../../server/src/ws/bridge.js'),
+        import('../../src/daemon/preview-relay.js'),
+        import('../../shared/preview-types.js'),
+      ]);
+      const srvId = `preview-e2e-post-${Math.random().toString(36).slice(2)}`;
+      const pid = 'preview-' + 'd'.repeat(16);
+      const b = bridgeMod.WsBridge.get(srvId);
+      const link = new DaemonLink();
+      const sLink = {
+        send: (obj: Record<string, unknown>) => { link.emit('message', Buffer.from(JSON.stringify(obj)), false); },
+        sendBinary: (buf: Uint8Array) => { link.emit('message', Buffer.from(buf), true); },
+      };
+      link.route = (data: string | Buffer) => {
+        if (typeof data === 'string') relayMod.handlePreviewCommand(JSON.parse(data), sLink as never);
+        else if (Buffer.isBuffer(data)) relayMod.handlePreviewBinaryFrame(data, sLink as never);
+      };
+      b.handleDaemonConnection(link as never, makeDb(), {} as never);
+      link.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId: srvId, token: 't' })), false);
+      await flushAsync();
+      return { bridge: b, previewId: pid, types: typesMod, relay: relayMod, fakeServerLink: sLink, WsBridge: bridgeMod.WsBridge };
+    })();
+    cleanups.push(() => WsBridge.getAll().clear());
+
+    const requestId = 'post-sse-1';
+    const r = bridge.createPreviewRelay(requestId, previewId, 10_000);
+    relay.handlePreviewCommand({
+      type: types.PREVIEW_MSG.REQUEST,
+      requestId,
+      previewId,
+      port: upstream.port,
+      method: 'POST',
+      path: '/api/chat',
+      headers: { 'content-type': 'application/json', 'last-event-id': '98' },
+      hasBody: true,
+    } as Record<string, unknown>, fakeServerLink as never);
+    relay.handlePreviewBinaryFrame(
+      types.packPreviewBinaryFrame(types.PREVIEW_BINARY_FRAME.REQUEST_BODY, requestId, Buffer.from('{"q":"hi"}')),
+      fakeServerLink as never,
+    );
+    relay.handlePreviewCommand({ type: types.PREVIEW_MSG.REQUEST_END, requestId } as Record<string, unknown>, fakeServerLink as never);
+
+    const started = await r.start;
+    const text = await new Response(started.body).text();
+    expect(seenMethod).toBe('POST');
+    expect(seenLastEventId).toBe('98');
+    expect(seenBody).toBe('{"q":"hi"}');
+    expect(text).toBe('id: 99\ndata: {"token":"hello"}\n\n');
+  });
+
+  // ── 10. Silent SSE survives past shortened STREAM_IDLE_TIMEOUT_MS + safe keepalive boundaries ─
+  it('delivers split SSE events intact across silence > STREAM_IDLE_TIMEOUT_MS with event-boundary keepalives and cleans up on preview expiry', async () => {
+    vi.stubEnv('PREVIEW_STREAM_IDLE_TIMEOUT_MS', '80');
+    vi.stubEnv('PREVIEW_SSE_KEEPALIVE_MS', '30');
+
+    const upstream = await startHttpUpstream((req, res) => {
+      if (!req.url?.startsWith('/long-sse')) { res.writeHead(404).end(); return; }
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      res.write('id: 1\ndata: hel');
+      setTimeout(() => {
+        if (!res.writableEnded) res.write('lo\n\n');
+      }, 60); // split mid-word across 2x SSE_KEEPALIVE_MS -> MUST NOT inject keepalive inside "hello"!
+      setTimeout(() => {
+        if (!res.writableEnded) {
+          res.write('id: 2\ndata: after-idle\n\n');
+          res.end();
+        }
+      }, 220); // >160ms silence past 80ms STREAM_IDLE_TIMEOUT_MS -> MUST still survive!
+    });
+    cleanups.push(() => upstream.close());
+
+    const { bridge, previewId, injectHttpRequest, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+    const { wrapSseKeepaliveStream } = await import('../../server/src/routes/local-web-preview.js');
+
+    const relay = bridge.createPreviewRelay('sse-long-e2e', previewId, 5_000);
+    injectHttpRequest('sse-long-e2e', upstream.port, '/long-sse');
+
+    const started = await relay.start;
+    const wrappedBody = wrapSseKeepaliveStream(started.body);
+    const fullText = await new Response(wrappedBody).text();
+
+    // Must preserve both complete events intact, NEVER split "data: hello", and contain >=1 keepalive between events.
+    expect(fullText).toContain('id: 1\ndata: hello\n\n');
+    expect(fullText).toContain(': keepalive\n\n');
+    expect(fullText).toContain('id: 2\ndata: after-idle\n\n');
+    expect(fullText).not.toMatch(/data: hel: keepalive/);
+
+    // Verify preview expiry tears down an open silent SSE cleanly.
+    const relay2 = bridge.createPreviewRelay('sse-expire-e2e', previewId, 5_000);
+    injectHttpRequest('sse-expire-e2e', upstream.port, '/long-sse');
+    const started2 = await relay2.start;
+    const reader2 = wrapSseKeepaliveStream(started2.body).getReader();
+    bridge.terminatePreviewRelaysForPreview(previewId);
+    await expect(reader2.read()).rejects.toBeTruthy();
+  });
+
+  // ── 11. Scoped Undici bodyTimeout=0 prevents Node fetch UND_ERR_BODY_TIMEOUT on silent SSE ─
+  it('uses scoped Undici Agent(bodyTimeout=0) so silent SSE survives when a bounded bodyTimeout would fail with UND_ERR_BODY_TIMEOUT', async () => {
+    const upstream = await startHttpUpstream((req, res) => {
+      if (!req.url?.startsWith('/undici-silent-sse')) { res.writeHead(404).end(); return; }
+      res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+      res.write('data: one\n\n');
+      setTimeout(() => {
+        if (!res.writableEnded) {
+          res.write('data: two\n\n');
+          res.end();
+        }
+      }, 1400); // > 1000ms Undici fastTimer resolution
+    });
+    cleanups.push(() => upstream.close());
+
+    const { bridge, relay, previewId, injectHttpRequest, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+    cleanups.push(() => relay.__setPreviewFetchBodyTimeoutForTests(null));
+
+    // Counterexample: with a finite Undici bodyTimeout (50ms -> trips on ~1s Undici timer), silent SSE aborts.
+    await relay.__setPreviewFetchBodyTimeoutForTests(50);
+    const failedRelay = bridge.createPreviewRelay('sse-undici-finite', previewId, 10_000);
+    injectHttpRequest('sse-undici-finite', upstream.port, '/undici-silent-sse');
+    const startedFinite = await failedRelay.start;
+    await expect(new Response(startedFinite.body).text()).rejects.toThrow(/TIMEOUT|terminated|Body Timeout/i);
+
+    // Production default (null -> Agent({ bodyTimeout: 0 })): survives 1400ms silence and delivers both events cleanly.
+    await relay.__setPreviewFetchBodyTimeoutForTests(null);
+    const okRelay = bridge.createPreviewRelay('sse-undici-zero', previewId, 10_000);
+    injectHttpRequest('sse-undici-zero', upstream.port, '/undici-silent-sse');
+    const startedZero = await okRelay.start;
+    const text = await new Response(startedZero.body).text();
+    expect(text).toBe('data: one\n\ndata: two\n\n');
+  }, 15_000);
+
+  // ── 12. Cold concurrent first dispatcher acquisition + sustained SSE reader + concurrent request ─
+  it('shares one initialized dispatcher across cold concurrent fetches without closing in-flight requests, and keeps an open SSE reader alive across concurrent requests', async () => {
+    let releaseCold1: (() => void) | null = null;
+    let releaseFirstStream: (() => void) | null = null;
+    const upstream = await startHttpUpstream((req, res) => {
+      if (req.url === '/cold-sse-1') {
+        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        res.write('data: /cold-sse-1-first\n\n');
+        releaseCold1 = () => {
+          if (!res.writableEnded) {
+            res.write('data: /cold-sse-1-second\n\n');
+            res.end();
+          }
+        };
+        return;
+      }
+      if (req.url === '/cold-sse-2') {
+        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        res.end('data: /cold-sse-2-only\n\n');
+        return;
+      }
+      if (req.url === '/long-open-sse') {
+        res.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
+        res.write('data: open-part-1\n\n');
+        releaseFirstStream = () => {
+          if (!res.writableEnded) {
+            res.write('data: open-part-2\n\n');
+            res.end();
+          }
+        };
+        return;
+      }
+      if (req.url === '/concurrent-api') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+        return;
+      }
+      res.writeHead(404).end();
+    });
+    cleanups.push(() => upstream.close());
+
+    // Fresh module graph guarantees cachedDispatcherCtor === undefined & activePreviewDispatcher === null.
+    const { bridge, previewId, injectHttpRequest, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+
+    // 1) Fire two concurrent requests simultaneously in the same tick BEFORE dispatcher is initialized;
+    //    keep cold-1's SSE open while cold-2 finishes, then read cold-1's trailing event.
+    const cold1 = bridge.createPreviewRelay('cold-1', previewId, 10_000);
+    const cold2 = bridge.createPreviewRelay('cold-2', previewId, 10_000);
+    injectHttpRequest('cold-1', upstream.port, '/cold-sse-1');
+    injectHttpRequest('cold-2', upstream.port, '/cold-sse-2');
+    const [started1, started2] = await Promise.all([cold1.start, cold2.start]);
+    const cold1Reader = started1.body.getReader();
+    const cold1First = await cold1Reader.read();
+    expect(Buffer.from(cold1First.value ?? []).toString('utf8')).toBe('data: /cold-sse-1-first\n\n');
+
+    expect(await new Response(started2.body).text()).toBe('data: /cold-sse-2-only\n\n');
+    releaseCold1!();
+    const cold1Tail: string[] = [];
+    while (true) {
+      const n = await cold1Reader.read();
+      if (n.done) break;
+      cold1Tail.push(Buffer.from(n.value).toString('utf8'));
+    }
+    expect(cold1Tail.join('')).toBe('data: /cold-sse-1-second\n\n');
+
+    // 2) Keep one SSE reader actively open & paused mid-stream while another concurrent request runs.
+    const openRelay = bridge.createPreviewRelay('open-sse', previewId, 10_000);
+    injectHttpRequest('open-sse', upstream.port, '/long-open-sse');
+    const startedOpen = await openRelay.start;
+    const openReader = startedOpen.body.getReader();
+    const firstChunk = await openReader.read();
+    expect(Buffer.from(firstChunk.value ?? []).toString('utf8')).toBe('data: open-part-1\n\n');
+
+    const concurrentRelay = bridge.createPreviewRelay('concurrent-after-open', previewId, 10_000);
+    injectHttpRequest('concurrent-after-open', upstream.port, '/concurrent-api');
+    const concurrentStarted = await concurrentRelay.start;
+    const concurrentJson = await new Response(concurrentStarted.body).text();
+    expect(JSON.parse(concurrentJson)).toEqual({ ok: true });
+
+    // Now finish the sustained SSE stream — must STILL be alive and deliver part 2 intact.
+    releaseFirstStream!();
+    const tailChunks: string[] = [];
+    while (true) {
+      const next = await openReader.read();
+      if (next.done) break;
+      tailChunks.push(Buffer.from(next.value).toString('utf8'));
+    }
+    expect(tailChunks.join('')).toBe('data: open-part-2\n\n');
+  }, 15_000);
 });

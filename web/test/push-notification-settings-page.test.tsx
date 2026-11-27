@@ -4,7 +4,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { SettingsPage } from '../src/pages/SettingsPage.js';
-import { resetPushNotificationPreferencesStateForTesting } from '../src/push-notifications.js';
+import {
+  resetAndroidBackgroundPushStateForTesting,
+  resetPushNotificationPreferencesStateForTesting,
+} from '../src/push-notifications.js';
 import {
   DEFAULT_PUSH_NOTIFICATION_TYPES,
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
@@ -642,6 +645,109 @@ describe('SettingsPage push notification settings', () => {
     } finally {
       vi.unstubAllGlobals();
       if (OriginalNotification) globalThis.Notification = OriginalNotification;
+    }
+  });
+
+  it('renders Android BackgroundPush card exclusively on withoutFcm Android and triggers permission requests', async () => {
+    const bgState = {
+      supported: true,
+      hasFcm: false,
+      enabled: false,
+      running: false,
+      connectionState: 'stopped' as const,
+      notificationsGranted: false,
+      batteryOptimizationIgnored: false,
+    };
+    const pluginMock = {
+      getStatus: vi.fn(async () => ({ ...bgState })),
+      requestNotificationPermission: vi.fn(async () => {
+        bgState.notificationsGranted = true;
+        return { supported: true, granted: true };
+      }),
+      requestIgnoreBatteryOptimizations: vi.fn(async () => {
+        bgState.batteryOptimizationIgnored = true;
+        return { supported: true, granted: true };
+      }),
+      start: vi.fn(async () => {
+        bgState.enabled = true;
+        bgState.running = true;
+        bgState.connectionState = 'connected' as never;
+        return { supported: true, started: true };
+      }),
+      stop: vi.fn(async () => {
+        bgState.enabled = false;
+        bgState.running = false;
+        bgState.connectionState = 'stopped';
+        return { supported: true, stopped: true };
+      }),
+      consumePendingNotification: vi.fn(async () => ({ notification: null })),
+      addListener: vi.fn(async () => ({ remove: async () => {} })),
+    };
+
+    try {
+      // withFcm build hides Android BackgroundPush card completely
+      (globalThis as Record<string, unknown>).__PUSH_FCM__ = true;
+      (globalThis as Record<string, unknown>).Capacitor = {
+        isNativePlatform: () => true,
+        getPlatform: () => 'android',
+        Plugins: { BackgroundPush: pluginMock },
+      };
+      resetAndroidBackgroundPushStateForTesting();
+      const withFcmRender = render(
+        <SettingsPage
+          displayName="Ada"
+          username="ada"
+          hasPassword={true}
+          initialTab="notifications"
+          onBack={vi.fn()}
+          onDisplayNameChanged={vi.fn()}
+          onUserAuthUpdated={vi.fn()}
+        />,
+      );
+      expect(screen.queryByTestId('android-bg-push-settings-card')).toBeNull();
+      withFcmRender.unmount();
+
+      // withoutFcm build renders controls and invokes native permission dialogs
+      (globalThis as Record<string, unknown>).__PUSH_FCM__ = false;
+      localStorage.setItem('imcodes.android_background_push_enabled', '0');
+      resetAndroidBackgroundPushStateForTesting();
+      const { initPushNotifications } = await import('../src/push-notifications.js');
+      await initPushNotifications('deck_test_key', 'https://selfhosted.example.com');
+
+      render(
+        <SettingsPage
+          displayName="Ada"
+          username="ada"
+          hasPassword={true}
+          initialTab="notifications"
+          onBack={vi.fn()}
+          onDisplayNameChanged={vi.fn()}
+          onUserAuthUpdated={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByTestId('android-bg-push-settings-card')).toBeDefined();
+      const notifBtn = await screen.findByTestId('android-bg-push-notif-perm-btn');
+      fireEvent.click(notifBtn);
+      await waitFor(() => expect(pluginMock.requestNotificationPermission).toHaveBeenCalledTimes(1));
+      await screen.findByTestId('android-bg-push-notif-granted');
+
+      const batteryBtn = await screen.findByTestId('android-bg-push-battery-btn');
+      fireEvent.click(batteryBtn);
+      await waitFor(() => expect(pluginMock.requestIgnoreBatteryOptimizations).toHaveBeenCalledTimes(1));
+      await screen.findByTestId('android-bg-push-battery-granted');
+
+      const toggle = screen.getByTestId('android-bg-push-toggle') as HTMLInputElement;
+      fireEvent.click(toggle);
+      await waitFor(() => expect(pluginMock.start).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(toggle.checked).toBe(true));
+
+      fireEvent.click(toggle);
+      await waitFor(() => expect(pluginMock.stop).toHaveBeenCalledTimes(1));
+    } finally {
+      delete (globalThis as Record<string, unknown>).__PUSH_FCM__;
+      delete (globalThis as Record<string, unknown>).Capacitor;
+      resetAndroidBackgroundPushStateForTesting();
     }
   });
 });

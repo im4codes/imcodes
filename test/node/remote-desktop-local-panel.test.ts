@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile, chmod } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { JSDOM } from 'jsdom';
+import { JSDOM, VirtualConsole } from 'jsdom';
 import { REMOTE_DESKTOP_ACCESS_MODE } from '../../shared/remote-desktop.js';
 import { AIDESK_PRODUCT_NAME } from '../../shared/aidesk-product.js';
 import { LOCAL_PANEL_EXTERNAL_PATH, LOCAL_PANEL_WINDOW_TITLE } from '../../shared/local-panel-window.js';
@@ -1302,6 +1302,270 @@ describe('local panel Coding Daemon endpoints and UI', () => {
     } finally {
       dom.window.close();
     }
+  });
+
+  it('recovers from 401 session expiration via bounded reload across simulated full navigations, falls back to history.state when sessionStorage throws, and preserves offline handling for 5xx/network errors', async () => {
+    const html = renderLocalPanelPage({
+      publicNodeId: '1234567890',
+      csrf: 'csrf-401',
+      manageUrl: 'https://example.test/m',
+      shareUrl: 'https://example.test/s',
+    });
+
+    const flush = async () => {
+      await new Promise<void>((r) => setImmediate(r));
+      await new Promise<void>((r) => setImmediate(r));
+    };
+
+    type MockFetchHandler = (url: string, init?: RequestInit) => Response | Promise<Response>;
+
+    const mountWindow = (opts: {
+      now: () => number;
+      fetchHandler: MockFetchHandler;
+      sessionMap?: Map<string, string>;
+      throwSessionStorage?: boolean;
+      initialHistoryState?: unknown;
+      throwReplaceState?: boolean;
+      onReload?: (historyState: unknown) => void;
+    }) => {
+      let pollCb: (() => void) | undefined;
+      let activeWin: import('jsdom').DOMWindow | undefined;
+      const reloadSpy = vi.fn(() => {
+        opts.onReload?.(activeWin?.history.state);
+      });
+      const virtualConsole = new VirtualConsole();
+      virtualConsole.on('jsdomError', (err: Error) => {
+        if (err.message.includes('Not implemented: navigation')) {
+          reloadSpy();
+          return;
+        }
+        throw err;
+      });
+      const dom = new JSDOM(html, {
+        url: 'http://127.0.0.1:43751/',
+        runScripts: 'dangerously',
+        virtualConsole,
+        beforeParse(win) {
+          activeWin = win;
+          win.Date.now = opts.now;
+          (win as unknown as { setInterval: (cb: () => void, ms: number) => number }).setInterval = (cb, ms) => {
+            if (ms === 2000) pollCb = cb;
+            return ms;
+          };
+          (win as unknown as { fetch: typeof fetch }).fetch = (async (input: string | URL | Request, init?: RequestInit) =>
+            opts.fetchHandler(String(input), init)) as unknown as typeof fetch;
+          if (opts.initialHistoryState !== undefined) {
+            win.history.replaceState(opts.initialHistoryState, '');
+          }
+          if (opts.throwReplaceState) {
+            win.history.replaceState = () => {
+              throw new win.DOMException('blocked', 'SecurityError');
+            };
+          }
+          if (opts.throwSessionStorage) {
+            Object.defineProperty(win, 'sessionStorage', {
+              configurable: true,
+              get() {
+                throw new win.DOMException('denied', 'SecurityError');
+              },
+            });
+          } else if (opts.sessionMap) {
+            const backing = opts.sessionMap;
+            Object.defineProperty(win, 'sessionStorage', {
+              configurable: true,
+              value: {
+                getItem: (k: string) => (backing.has(k) ? backing.get(k)! : null),
+                setItem: (k: string, v: string) => { backing.set(k, String(v)); },
+                removeItem: (k: string) => { backing.delete(k); },
+              },
+            });
+          }
+        },
+      });
+      return { dom, pollCb: () => pollCb?.(), reloadSpy };
+    };
+
+    const okStateBody = () => new Response(JSON.stringify({
+      publicNodeId: '1234567890',
+      paused: false,
+      connections: [],
+      deviceName: 'RECOVERED-MAC',
+    }), { status: 200 });
+
+    // 1) Initial 401 after daemon restart/upgrade triggers reload without showing offline; recreated page recovers with 200.
+    let currentNow = 1_700_000_000_000;
+    const sharedStorage = new Map<string, string>();
+    let return401 = true;
+    const first = mountWindow({
+      now: () => currentNow,
+      sessionMap: sharedStorage,
+      fetchHandler: (url) => {
+        if (url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH && return401) {
+          return new Response('unauthorized', { status: 401 });
+        }
+        return okStateBody();
+      },
+    });
+    await flush();
+    expect(first.reloadSpy).toHaveBeenCalledTimes(1);
+    expect((first.dom.window.document.getElementById('offlineBanner') as HTMLElement).hidden).toBe(true);
+    first.dom.window.close();
+
+    // Simulated full navigation to new page after reload succeeds with 200
+    return401 = false;
+    currentNow += 500;
+    const recovered = mountWindow({
+      now: () => currentNow,
+      sessionMap: sharedStorage,
+      fetchHandler: () => okStateBody(),
+    });
+    await flush();
+    expect(recovered.reloadSpy).not.toHaveBeenCalled();
+    expect(recovered.dom.window.document.getElementById('deviceName')?.textContent).toBe('RECOVERED-MAC');
+    expect((recovered.dom.window.document.getElementById('offlineBanner') as HTMLElement).hidden).toBe(true);
+    expect(recovered.dom.window.document.getElementById('statusText')?.textContent).toBe('Online');
+    recovered.dom.window.close();
+
+    // 2) Throttling across full navigation on sustained 401 (no reload loop within 5s; allows recovery after >5s).
+    sharedStorage.clear();
+    currentNow = 1_700_000_100_000;
+    const loop1 = mountWindow({
+      now: () => currentNow,
+      sessionMap: sharedStorage,
+      fetchHandler: () => new Response('unauthorized', { status: 401 }),
+    });
+    await flush();
+    expect(loop1.reloadSpy).toHaveBeenCalledTimes(1);
+    loop1.dom.window.close();
+
+    // Full navigation at t + 1s: fresh JS environment hits 401 again -> must NOT reload, degrades to offlineBanner.
+    currentNow += 1_000;
+    const loop2 = mountWindow({
+      now: () => currentNow,
+      sessionMap: sharedStorage,
+      fetchHandler: () => new Response('unauthorized', { status: 401 }),
+    });
+    await flush();
+    expect(loop2.reloadSpy).not.toHaveBeenCalled();
+    expect((loop2.dom.window.document.getElementById('offlineBanner') as HTMLElement).hidden).toBe(false);
+    expect(loop2.dom.window.document.getElementById('statusText')?.textContent).toBe('Offline');
+
+    // Past 5s cooldown, next 401 poll attempts reload again cleanly.
+    currentNow += 5_500;
+    loop2.pollCb();
+    await flush();
+    expect(loop2.reloadSpy).toHaveBeenCalledTimes(1);
+    loop2.dom.window.close();
+
+    // 3a) sessionStorage throws SecurityError -> history.state fallback prevents reload loop across full navigation.
+    currentNow = 1_700_000_200_000;
+    let carriedHistoryState: unknown;
+    const hist1 = mountWindow({
+      now: () => currentNow,
+      throwSessionStorage: true,
+      initialHistoryState: { custom: 'keep-me' },
+      onReload: (hs) => { carriedHistoryState = hs; },
+      fetchHandler: () => new Response('unauthorized', { status: 401 }),
+    });
+    await flush();
+    expect(hist1.reloadSpy).toHaveBeenCalledTimes(1);
+    expect((carriedHistoryState as Record<string, unknown>)?.custom).toBe('keep-me');
+    hist1.dom.window.close();
+
+    // Simulated full navigation with carried history.state & blocked sessionStorage at t + 1s -> throttled!
+    currentNow += 1_000;
+    const hist2 = mountWindow({
+      now: () => currentNow,
+      throwSessionStorage: true,
+      initialHistoryState: carriedHistoryState,
+      fetchHandler: () => new Response('unauthorized', { status: 401 }),
+    });
+    await flush();
+    expect(hist2.reloadSpy).not.toHaveBeenCalled();
+    expect((hist2.dom.window.document.getElementById('offlineBanner') as HTMLElement).hidden).toBe(false);
+    hist2.dom.window.close();
+
+    // 3b) Both sessionStorage AND history.replaceState throw -> fail-closed: zero reloads, no uncaught error, offline shown.
+    currentNow = 1_700_000_300_000;
+    const unpersisted = mountWindow({
+      now: () => currentNow,
+      throwSessionStorage: true,
+      throwReplaceState: true,
+      fetchHandler: () => new Response('unauthorized', { status: 401 }),
+    });
+    await flush();
+    expect(unpersisted.reloadSpy).not.toHaveBeenCalled();
+    expect((unpersisted.dom.window.document.getElementById('offlineBanner') as HTMLElement).hidden).toBe(false);
+    unpersisted.dom.window.close();
+
+    // 4) POST /api/action, GET /api/daemon/logs, and POST /api/open-settings returning 401 also trigger reload; 500 goes offline.
+    for (const scenario of ['action', 'logs', 'settings'] as const) {
+      sharedStorage.clear();
+      currentNow = 1_700_000_400_000;
+      const win = mountWindow({
+        now: () => currentNow,
+        sessionMap: sharedStorage,
+        fetchHandler: (url) => {
+          if (url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.STATE_PATH) {
+            return new Response(JSON.stringify({
+              publicNodeId: '1234567890',
+              paused: false,
+              connections: [],
+              permissions: { screenRecording: 'denied', accessibility: 'granted', fullDiskAccess: 'granted' },
+              daemon: {
+                available: true,
+                installed: true,
+                bound: true,
+                running: true,
+                connectionState: REMOTE_DESKTOP_LOCAL_DAEMON_CONNECTION_STATE.CONNECTED,
+                autostart: REMOTE_DESKTOP_LOCAL_DAEMON_AUTOSTART.ENABLED,
+                runtimeSource: REMOTE_DESKTOP_LOCAL_DAEMON_RUNTIME_SOURCE.BUNDLE,
+                canControl: true,
+                canBind: true,
+                canViewLogs: true,
+              },
+            }), { status: 200 });
+          }
+          if (
+            (scenario === 'action' && url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.ACTION_PATH)
+            || (scenario === 'logs' && url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.DAEMON_LOGS_PATH)
+            || (scenario === 'settings' && url === REMOTE_DESKTOP_LOCAL_MANAGEMENT.OPEN_SETTINGS_PATH)
+          ) {
+            return new Response('unauthorized', { status: 401 });
+          }
+          return new Response(JSON.stringify({ ok: true }), { status: 200 });
+        },
+      });
+      await flush();
+      if (scenario === 'action') {
+        (win.dom.window.document.getElementById('allowSwitch') as HTMLButtonElement).click();
+      } else if (scenario === 'logs') {
+        (win.dom.window.document.getElementById('daemonLogsBtn') as HTMLButtonElement).click();
+      } else {
+        (win.dom.window.document.querySelector('[data-target="screenRecording"]') as HTMLButtonElement).click();
+      }
+      await flush();
+      expect(win.reloadSpy, scenario).toHaveBeenCalledTimes(1);
+      expect((win.dom.window.document.getElementById('offlineBanner') as HTMLElement).hidden, scenario).toBe(true);
+      win.dom.window.close();
+    }
+
+    // 500 error triggers offlineBanner immediately without reload, then clears when 200 returns.
+    sharedStorage.clear();
+    let fail500 = true;
+    const errWin = mountWindow({
+      now: () => currentNow,
+      sessionMap: sharedStorage,
+      fetchHandler: () => (fail500 ? new Response('err', { status: 500 }) : okStateBody()),
+    });
+    await flush();
+    expect(errWin.reloadSpy).not.toHaveBeenCalled();
+    expect((errWin.dom.window.document.getElementById('offlineBanner') as HTMLElement).hidden).toBe(false);
+    fail500 = false;
+    errWin.pollCb();
+    await flush();
+    expect((errWin.dom.window.document.getElementById('offlineBanner') as HTMLElement).hidden).toBe(true);
+    errWin.dom.window.close();
   });
 });
 

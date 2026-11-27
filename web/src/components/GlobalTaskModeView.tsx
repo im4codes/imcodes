@@ -1610,6 +1610,7 @@ export function GlobalTaskModeView({
 
             {!task.isTerminal && !expanded && (
               <div class="global-task-desktop-running-meta" data-testid={`task-mode-running-meta-${task.taskId}`}>
+                {flagChipsEl}
                 <div class="global-task-desktop-running-bar">
                   <div class="global-task-desktop-running-row">
                     <span>{t('taskPair.card_executor')}: {executorDisplay}</span>
@@ -1623,7 +1624,6 @@ export function GlobalTaskModeView({
                     {renderCardActionButtons('running')}
                   </div>
                 </div>
-                {flagChipsEl}
               </div>
             )}
           </div>

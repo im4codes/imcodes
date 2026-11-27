@@ -95,6 +95,23 @@ export function isSameActiveOrigin(
 }
 
 /**
+ * Same-origin `/api/downloads/` links must open externally in the system browser
+ * rather than opening a blank child BrowserWindow inside Electron.
+ */
+export function isSameOriginDownloadUrl(
+  rawUrl: string,
+  activeOrigin: string | null,
+  trustedOrigins: ReadonlySet<string>,
+): boolean {
+  if (!isSameActiveOrigin(rawUrl, activeOrigin, trustedOrigins)) return false;
+  try {
+    return new URL(rawUrl).pathname.startsWith('/api/downloads/');
+  } catch {
+    return false;
+  }
+}
+
+/**
  * External-link policy for opening URLs in the system default browser (§4.7):
  * - Permits valid `https:` and `http:` URLs with a non-empty host and no embedded credentials.
  * - Rejects dangerous/unsupported schemes (`file:`, `javascript:`, `vbscript:`, `data:`, `smb:`, `ftp:`, etc.),
@@ -246,7 +263,15 @@ export function attachChildWindowSecurityGuards(options: ChildWindowSecurityGuar
   });
 
   webContents.setWindowOpenHandler(({ url }) => {
-    if (isSameActiveOrigin(url, getActiveOrigin(), getTrustedOrigins())) {
+    const activeOrigin = getActiveOrigin();
+    const trustedOrigins = getTrustedOrigins();
+    if (isSameOriginDownloadUrl(url, activeOrigin, trustedOrigins)) {
+      if (isAllowedExternalUrl(url, externalDocsHosts)) {
+        void Promise.resolve(openExternal(url)).catch(() => {});
+      }
+      return { action: 'deny' };
+    }
+    if (isSameActiveOrigin(url, activeOrigin, trustedOrigins)) {
       return {
         action: 'allow',
         overrideBrowserWindowOptions: buildChildWindowOptions(preloadPath),

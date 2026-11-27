@@ -1261,6 +1261,7 @@ export function createControlledNodeRuntime(
           credential,
           target: { os: CONTROLLED_NODE_OS_MAC, arch: componentArch },
           asset: CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET,
+          runtimeArch: componentArch,
           fetchImpl,
         });
         if (probe.status === 'ok' && probe.version) {

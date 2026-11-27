@@ -342,7 +342,8 @@ import {
   type PreviewWsErrorMessage,
   type PreviewWsOpenedMessage,
 } from '../../../shared/preview-types.js';
-import { isStreamingResponse } from '../../../shared/preview-stream-policy.js';
+import { isSendableWsCloseCode } from '../../../shared/preview-policy.js';
+import { isSseResponse, isStreamingResponse } from '../../../shared/preview-stream-policy.js';
 import { getSessionRuntimeType } from '../../../shared/agent-types.js';
 import { LocalWebPreviewRegistry, setPreviewActiveRelayHook, setPreviewEvictedHook } from '../preview/registry.js';
 import { updateServerHeartbeat, updateServerStatus, upsertDiscussion, insertDiscussionRound, createSubSession, createSubSessionsBatch, getSubSessionById, isExecutionCloneRow, updateSubSession, upsertOrchestrationRun, updateProviderStatus, clearProviderStatus, updateProviderRemoteSessions, upsertSessionTextTailCacheEvent, scheduleSessionTextTailCacheEvent, flushSessionTextTailCacheForServer, getUserPref, setUserPref, deleteUserPref, getDbSessionsByServer, getUserById, insertDiscussionComment } from '../db/queries.js';
@@ -423,6 +424,7 @@ import {
   type GlobalTaskSummaryUpsertInput,
 } from '../db/global-task-summaries.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
+import { pushStreamHub } from '../services/push-stream-hub.js';
 import {
   adaptSharedContextRuntimeConfigForSupportedBackends,
   LEGACY_SHARED_CONTEXT_RUNTIME_BACKENDS,
@@ -1393,6 +1395,8 @@ type PendingPreviewRequest = {
    * unconsumed-buffer high-watermark below.
    */
   streaming: boolean;
+  /** True iff `RESPONSE_START` Content-Type is `text/event-stream` (exempt from STREAM_IDLE_TIMEOUT_MS). */
+  sse: boolean;
   /**
    * Unconsumed (received-but-not-yet-delivered-to-consumer) bytes — the total
    * byte size of `pendingChunks` (run 8a975732-23a P1.2 / N1 fix 394c114e-11f).
@@ -1447,6 +1451,7 @@ interface WsTunnelState {
   previewId: string;
   idleTimer: ReturnType<typeof setTimeout> | null;
   openTimer: ReturnType<typeof setTimeout> | null;
+  pingTimer: ReturnType<typeof setInterval> | null;
   state: 'pending' | 'active';
   /** Messages queued while waiting for preview.ws.opened. */
   messageQueue: Buffer[];
@@ -3100,8 +3105,17 @@ export class WsBridge {
     previewId: string;
     /** Completes the held-open handshake selecting `protocol`; resolves the upgraded browser socket, null on failure. */
     completeUpgrade: (protocol: string | undefined) => Promise<WebSocket | null>;
+    /** Rejects the held-open handshake with a real HTTP status without upgrading to 101. */
+    rejectUpgrade?: (status: number, reason: string) => void;
     /** Open timeout guarding against a daemon that never replies WS_OPENED/WS_ERROR. */
     openTimer: ReturnType<typeof setTimeout>;
+    /** Distinguishes waiting for WS_OPENED from async completeUpgrade() completion. */
+    state: 'opening' | 'upgrading';
+    /** Daemon -> browser WS_DATA frames arriving during the WS_OPENED -> completeUpgrade window. */
+    incomingQueue: Array<{ isBinary: boolean; payload: Buffer }>;
+    incomingQueueBytes: number;
+    /** Daemon WS_CLOSE/WS_ERROR arriving during the WS_OPENED -> completeUpgrade window. */
+    earlyClose?: { code: number; reason: string };
   }>();
 
   /**
@@ -14188,6 +14202,7 @@ export class WsBridge {
       terminalOutcome: null,
       responseBytes: 0,
       streaming: false,
+      sse: false,
       unconsumedBytes: 0,
       pendingChunks: [],
       timer,
@@ -14683,7 +14698,12 @@ export class WsBridge {
     // the cumulative MAX_RESPONSE_BYTES cap; bounded instead by stream-idle +
     // the unconsumed-buffer high-watermark.
     pending.streaming = isStreamingResponse(msg.headers);
-    this.resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    pending.sse = isSseResponse(msg.headers);
+    if (pending.sse) {
+      clearTimeout(pending.timer);
+    } else {
+      this.resetPreviewTimeout(msg.requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    }
     pending.resolveStart({
       status: msg.status,
       statusText: msg.statusText,
@@ -14741,7 +14761,9 @@ export class WsBridge {
       return;
     }
 
-    this.resetPreviewTimeout(requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    if (!pending.sse) {
+      this.resetPreviewTimeout(requestId, PREVIEW_LIMITS.STREAM_IDLE_TIMEOUT_MS, 'idle');
+    }
     // Slide the preview TTL while a stream is actively delivering data, so a
     // long-lived SSE (> preview_session_idle) is not idle-evicted (P1.3.2).
     // touch() is clamped by the absolute lifetime hard ceiling.
@@ -14864,22 +14886,37 @@ export class WsBridge {
     headers: Record<string, string>;
     protocols: string[];
     completeUpgrade: (protocol: string | undefined) => Promise<WebSocket | null>;
+    rejectUpgrade?: (status: number, reason: string) => void;
   }): void {
-    const { wsId, previewId, port, path, headers, protocols, completeUpgrade } = args;
+    const { wsId, previewId, port, path, headers, protocols, completeUpgrade, rejectUpgrade } = args;
     const openTimer = setTimeout(() => {
       const pending = this.pendingPreviewWsUpgrades.get(wsId);
       if (!pending) return;
       this.pendingPreviewWsUpgrades.delete(wsId);
-      logger.warn({ serverId: this.serverId, wsId, previewId }, 'Preview WS tunnel open timeout (deferred upgrade)');
-      // Fail the handshake without upgrading. completeUpgrade(undefined) is the
-      // caller's signal to reject the socket (it returns null and destroys it).
-      void pending.completeUpgrade(undefined).catch(() => null);
+      pending.incomingQueue = [];
+      pending.incomingQueueBytes = 0;
+      logger.warn({ serverId: this.serverId, wsId, previewId, state: pending.state }, 'Preview WS tunnel open/upgrade timeout (deferred upgrade)');
+      if (pending.state === 'opening') {
+        if (pending.rejectUpgrade) {
+          pending.rejectUpgrade(504, 'open timeout');
+        } else {
+          void pending.completeUpgrade(undefined).catch(() => null);
+        }
+      }
       this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1001, reason: 'open timeout' });
       this.maybeCleanup();
     }, PREVIEW_LIMITS.WS_OPEN_TIMEOUT_MS);
     openTimer.unref?.();
 
-    this.pendingPreviewWsUpgrades.set(wsId, { previewId, completeUpgrade, openTimer });
+    this.pendingPreviewWsUpgrades.set(wsId, {
+      previewId,
+      completeUpgrade,
+      rejectUpgrade,
+      openTimer,
+      state: 'opening',
+      incomingQueue: [],
+      incomingQueueBytes: 0,
+    });
 
     this.sendPreviewControl({
       type: PREVIEW_MSG.WS_OPEN,
@@ -14890,6 +14927,21 @@ export class WsBridge {
       headers,
       protocols,
     });
+  }
+
+  /**
+   * Cancel a pending deferred WS upgrade when the browser socket closes or errors
+   * before `completeUpgrade` adopts an active tunnel. Releases quota and closes upstream.
+   */
+  cancelPendingPreviewWsUpgrade(wsId: string): void {
+    const pending = this.pendingPreviewWsUpgrades.get(wsId);
+    if (!pending) return;
+    this.pendingPreviewWsUpgrades.delete(wsId);
+    clearTimeout(pending.openTimer);
+    pending.incomingQueue = [];
+    pending.incomingQueueBytes = 0;
+    this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1001, reason: 'client disconnected' });
+    this.maybeCleanup();
   }
 
   /**
@@ -14918,6 +14970,7 @@ export class WsBridge {
       previewId,
       idleTimer: null,
       openTimer,
+      pingTimer: null,
       state: 'pending',
       messageQueue: [],
       queueBytes: 0,
@@ -14952,10 +15005,7 @@ export class WsBridge {
 
   /**
    * Adopt an already-upgraded browser socket into an ACTIVE tunnel (run
-   * 8a975732-23a P1.5.1, deferred-upgrade path). The handshake has already been
-   * completed by the caller with the upstream-negotiated `protocol`, and the
-   * daemon's upstream WS is already open, so there is no pending state and no
-   * message queue to flush — we start the idle timer and relay immediately.
+   * 8a975732-23a P1.5.1, deferred-upgrade path).
    */
   private adoptActivePreviewWsTunnel(
     wsId: string,
@@ -14968,6 +15018,7 @@ export class WsBridge {
       previewId,
       idleTimer: null,
       openTimer: null,
+      pingTimer: null,
       state: 'active',
       messageQueue: [],
       queueBytes: 0,
@@ -14986,6 +15037,7 @@ export class WsBridge {
     });
 
     this.resetWsTunnelIdleTimer(wsId);
+    this.startWsTunnelKeepalive(wsId);
     logger.info({ serverId: this.serverId, wsId, previewId, protocol }, 'Preview WS tunnel active (deferred upgrade)');
   }
 
@@ -14993,24 +15045,80 @@ export class WsBridge {
    * Called when daemon sends preview.ws.opened.
    * Transitions tunnel to active state, flushes queued messages.
    */
+  private closeWsTunnelSocket(ws: WebSocket, code?: number, reason?: string): void {
+    const sock = ws as WebSocket & { terminate?: () => void };
+    try {
+      if (isSendableWsCloseCode(code)) {
+        sock.close(code, reason);
+      } else if (typeof sock.terminate === 'function') {
+        sock.terminate();
+      } else {
+        sock.close();
+      }
+    } catch {
+      try {
+        if (typeof sock.terminate === 'function') {
+          sock.terminate();
+        } else {
+          sock.close();
+        }
+      } catch { /* ignore */ }
+    }
+  }
+
   private resolvePreviewWsOpened(msg: PreviewWsOpenedMessage): void {
-    // Deferred-upgrade path (P1.5.1): complete the held-open browser handshake
-    // echoing the upstream-negotiated subprotocol, then promote to an active
-    // tunnel. The browser's WebSocket.protocol now matches the upstream.
+    // Deferred-upgrade path (P1.5.1): keep entry + openTimer in pendingPreviewWsUpgrades
+    // until completeUpgrade() settles so an un-called wss.handleUpgrade cannot leak slots
+    // and early daemon WS_DATA/WS_CLOSE frames are buffered and never dropped.
     const deferred = this.pendingPreviewWsUpgrades.get(msg.wsId);
     if (deferred) {
-      this.pendingPreviewWsUpgrades.delete(msg.wsId);
-      clearTimeout(deferred.openTimer);
+      if (deferred.state !== 'opening') return;
+      deferred.state = 'upgrading';
       void deferred.completeUpgrade(msg.protocol).then((browserWs) => {
+        clearTimeout(deferred.openTimer);
+        const current = this.pendingPreviewWsUpgrades.get(msg.wsId);
+        if (current === deferred) {
+          this.pendingPreviewWsUpgrades.delete(msg.wsId);
+        }
+        if (current !== deferred) {
+          // Cancelled or timed out during upgrade — close socket safely and avoid orphan.
+          if (browserWs) {
+            this.closeWsTunnelSocket(browserWs, 1001, 'closed');
+          }
+          deferred.incomingQueue = [];
+          deferred.incomingQueueBytes = 0;
+          this.maybeCleanup();
+          return;
+        }
         if (!browserWs) {
+          deferred.incomingQueue = [];
+          deferred.incomingQueueBytes = 0;
           // Handshake failed after WS_OPENED — tell daemon to close upstream.
           this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code: 1011, reason: 'handshake failed' });
+          this.maybeCleanup();
           return;
         }
         this.adoptActivePreviewWsTunnel(msg.wsId, deferred.previewId, browserWs, msg.protocol);
+        for (const frame of deferred.incomingQueue) {
+          if (!this.previewWsTunnels.has(msg.wsId)) break;
+          this.relayWsDataToBrowser(msg.wsId, frame.isBinary, frame.payload);
+        }
+        deferred.incomingQueue = [];
+        deferred.incomingQueueBytes = 0;
+        if (deferred.earlyClose && this.previewWsTunnels.has(msg.wsId)) {
+          this.closeWsTunnelSocket(browserWs, deferred.earlyClose.code, deferred.earlyClose.reason);
+          this.cleanupTunnel(msg.wsId);
+        }
       }).catch((err) => {
+        clearTimeout(deferred.openTimer);
+        if (this.pendingPreviewWsUpgrades.get(msg.wsId) === deferred) {
+          this.pendingPreviewWsUpgrades.delete(msg.wsId);
+        }
+        deferred.incomingQueue = [];
+        deferred.incomingQueueBytes = 0;
         logger.warn({ serverId: this.serverId, wsId: msg.wsId, err }, 'Preview WS deferred upgrade failed');
         this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code: 1011, reason: 'handshake failed' });
+        this.maybeCleanup();
       });
       return;
     }
@@ -15041,59 +15149,101 @@ export class WsBridge {
     tunnel.messageQueue = [];
     tunnel.queueBytes = 0;
 
-    // Start idle timer
+    // Start idle + keepalive timers
     this.resetWsTunnelIdleTimer(msg.wsId);
+    this.startWsTunnelKeepalive(msg.wsId);
 
     logger.info({ serverId: this.serverId, wsId: msg.wsId, previewId: tunnel.previewId, protocol: msg.protocol }, 'Preview WS tunnel active');
   }
 
   /**
    * Called when daemon sends preview.ws.error.
-   * Closes browser WS with 1011 and cleans up.
+   * Rejects deferred handshake with HTTP status (no fake 101) or closes active WS with 1011.
    */
   private handlePreviewWsError(msg: PreviewWsErrorMessage): void {
-    // Deferred-upgrade path: daemon rejected the upstream upgrade before
-    // WS_OPENED. Fail the held-open browser handshake without upgrading.
     const deferred = this.pendingPreviewWsUpgrades.get(msg.wsId);
     if (deferred) {
+      if (deferred.state === 'upgrading') {
+        deferred.earlyClose = { code: 1011, reason: 'upstream error' };
+        return;
+      }
       this.pendingPreviewWsUpgrades.delete(msg.wsId);
       clearTimeout(deferred.openTimer);
-      logger.warn({ serverId: this.serverId, wsId: msg.wsId, error: msg.error }, 'Preview WS upstream error before upgrade');
-      void deferred.completeUpgrade(undefined).catch(() => null);
+      const status = typeof msg.status === 'number' && Number.isInteger(msg.status) && msg.status >= 400 && msg.status <= 599
+        ? msg.status
+        : 502;
+      logger.warn({ serverId: this.serverId, wsId: msg.wsId, status, error: msg.error }, 'Preview WS upstream error before upgrade');
+      if (deferred.rejectUpgrade) {
+        deferred.rejectUpgrade(status, msg.error);
+      } else {
+        void deferred.completeUpgrade(undefined).catch(() => null);
+      }
       this.maybeCleanup();
       return;
     }
     const tunnel = this.previewWsTunnels.get(msg.wsId);
     if (!tunnel) return;
     logger.warn({ serverId: this.serverId, wsId: msg.wsId, error: msg.error }, 'Preview WS tunnel error from daemon');
-    try { tunnel.browserWs.close(1011, 'upstream error'); } catch { /* ignore */ }
+    this.closeWsTunnelSocket(tunnel.browserWs, 1011, 'upstream error');
     this.cleanupTunnel(msg.wsId);
   }
 
   /**
    * Called when daemon sends preview.ws.close.
-   * Forwards close frame to browser WS and cleans up.
+   * Rejects pre-open handshake cleanly or defers close until upgrading completes, or closes active WS.
    */
   private handlePreviewWsClose(msg: PreviewWsCloseMessage): void {
-    // Deferred-upgrade path: daemon closed the upstream before WS_OPENED.
     const deferred = this.pendingPreviewWsUpgrades.get(msg.wsId);
     if (deferred) {
+      if (deferred.state === 'upgrading') {
+        deferred.earlyClose = { code: msg.code, reason: msg.reason };
+        return;
+      }
       this.pendingPreviewWsUpgrades.delete(msg.wsId);
       clearTimeout(deferred.openTimer);
-      void deferred.completeUpgrade(undefined).catch(() => null);
+      if (deferred.rejectUpgrade) {
+        deferred.rejectUpgrade(502, msg.reason || 'upstream closed');
+      } else {
+        void deferred.completeUpgrade(undefined).catch(() => null);
+      }
       this.maybeCleanup();
       return;
     }
     const tunnel = this.previewWsTunnels.get(msg.wsId);
     if (!tunnel) return;
-    try { tunnel.browserWs.close(msg.code, msg.reason); } catch { /* ignore */ }
+    this.closeWsTunnelSocket(tunnel.browserWs, msg.code, msg.reason);
     this.cleanupTunnel(msg.wsId);
   }
 
   /**
-   * Relay a WS_DATA frame from daemon to the browser WS.
+   * Relay a WS_DATA frame from daemon to the browser WS (or buffer while deferred upgrade completes).
    */
   private relayWsDataToBrowser(wsId: string, isBinary: boolean, payload: Buffer): void {
+    const deferred = this.pendingPreviewWsUpgrades.get(wsId);
+    if (deferred && deferred.state === 'upgrading') {
+      if (deferred.earlyClose) return;
+      if (payload.length > PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES) {
+        logger.warn({ serverId: this.serverId, wsId, size: payload.length }, 'Preview WS: daemon→browser pre-activation message too large — closing with 1009');
+        deferred.incomingQueue = [];
+        deferred.incomingQueueBytes = 0;
+        deferred.earlyClose = { code: 1009, reason: 'message too large' };
+        this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1009, reason: 'message too large' });
+        return;
+      }
+      const newBytes = deferred.incomingQueueBytes + payload.length;
+      if (newBytes > PREVIEW_LIMITS.MAX_WS_PENDING_QUEUE_BYTES) {
+        logger.warn({ serverId: this.serverId, wsId, size: newBytes }, 'Preview WS: pre-activation incoming queue overflow — closing with 1008');
+        deferred.incomingQueue = [];
+        deferred.incomingQueueBytes = 0;
+        deferred.earlyClose = { code: 1008, reason: 'policy violation' };
+        this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1008, reason: 'policy violation' });
+        return;
+      }
+      deferred.incomingQueue.push({ isBinary, payload: Buffer.from(payload) });
+      deferred.incomingQueueBytes = newBytes;
+      return;
+    }
+
     const tunnel = this.previewWsTunnels.get(wsId);
     if (!tunnel || tunnel.state !== 'active') return;
 
@@ -15195,7 +15345,13 @@ export class WsBridge {
       if (pending.previewId !== previewId) continue;
       this.pendingPreviewWsUpgrades.delete(wsId);
       clearTimeout(pending.openTimer);
-      void pending.completeUpgrade(undefined).catch(() => null);
+      if (pending.state === 'opening') {
+        if (pending.rejectUpgrade) {
+          pending.rejectUpgrade(502, 'preview closed');
+        } else {
+          void pending.completeUpgrade(undefined).catch(() => null);
+        }
+      }
       this.sendPreviewControl({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1001, reason: 'preview closed' });
     }
   }
@@ -15212,7 +15368,13 @@ export class WsBridge {
     for (const [wsId, pending] of [...this.pendingPreviewWsUpgrades]) {
       this.pendingPreviewWsUpgrades.delete(wsId);
       clearTimeout(pending.openTimer);
-      void pending.completeUpgrade(undefined).catch(() => null);
+      if (pending.state === 'opening') {
+        if (pending.rejectUpgrade) {
+          pending.rejectUpgrade(502, reason);
+        } else {
+          void pending.completeUpgrade(undefined).catch(() => null);
+        }
+      }
     }
   }
 
@@ -15225,8 +15387,33 @@ export class WsBridge {
     if (!tunnel) return;
     if (tunnel.idleTimer) { clearTimeout(tunnel.idleTimer); tunnel.idleTimer = null; }
     if (tunnel.openTimer) { clearTimeout(tunnel.openTimer); tunnel.openTimer = null; }
+    if (tunnel.pingTimer) { clearInterval(tunnel.pingTimer); tunnel.pingTimer = null; }
     this.previewWsTunnels.delete(wsId);
     this.maybeCleanup();
+  }
+
+  /**
+   * Start periodic WS ping frames toward the browser to prevent intermediate proxies
+   * (Nginx/Cloudflare 60-100s timeouts) from dropping quiet active connections.
+   * Does NOT reset `idleTimer` so business idle timeout (WS_IDLE_TIMEOUT_MS) still applies.
+   */
+  private startWsTunnelKeepalive(wsId: string): void {
+    const tunnel = this.previewWsTunnels.get(wsId);
+    if (!tunnel) return;
+    if (tunnel.pingTimer) clearInterval(tunnel.pingTimer);
+    tunnel.pingTimer = setInterval(() => {
+      const t = this.previewWsTunnels.get(wsId);
+      if (!t || t.state !== 'active') return;
+      try {
+        const sock = t.browserWs as WebSocket & { ping?: () => void; readyState?: number };
+        if (sock.readyState === 1 && typeof sock.ping === 'function') {
+          sock.ping();
+        }
+      } catch {
+        // ignore ping failure; socket close/error listeners handle cleanup
+      }
+    }, PREVIEW_LIMITS.WS_KEEPALIVE_MS);
+    tunnel.pingTimer.unref?.();
   }
 
   /**
@@ -15466,15 +15653,20 @@ export class WsBridge {
     for (const key of markerKeys) {
       const marker = msg[key];
       if (typeof marker === 'string' && marker.trim()) {
-        return `${eventType}:${sessionName}:marker:${marker.trim()}`;
+        const rawMarker = marker.trim();
+        const candidate = `${eventType}:${sessionName}:marker:${rawMarker}`;
+        return Buffer.byteLength(candidate, 'utf8') <= 128
+          ? candidate
+          : `${eventType}:${sessionName}:marker:${sha256Hex(rawMarker).slice(0, 32)}`;
       }
     }
     if (assistantEventId) return `${eventType}:${sessionName}:assistant:${assistantEventId}`;
     const eventTs = msg.eventTs ?? msg.ts;
+    const bodyDigest = sha256Hex(body).slice(0, 24);
     if (typeof eventTs === 'number' && Number.isFinite(eventTs)) {
-      return `${eventType}:${sessionName}:ts:${eventTs}:${body}`;
+      return `${eventType}:${sessionName}:ts:${eventTs}:${bodyDigest}`;
     }
-    return `${eventType}:${sessionName}:body:${body}`;
+    return `${eventType}:${sessionName}:body:${bodyDigest}`;
   }
 
   private wasPushDelivered(key: string, now: number): boolean {
@@ -15505,6 +15697,22 @@ export class WsBridge {
     return { hasMobileSocket, hasDesktopSocket };
   }
 
+  private buildSocketPushSuppressionFlags(
+    userId: string,
+    presence?: { hasMobileSocket: boolean; hasDesktopSocket: boolean },
+  ): {
+    suppressTokenPush?: boolean;
+    suppressDesktopPush?: boolean;
+    suppressStreamPush: false;
+  } {
+    const { hasMobileSocket, hasDesktopSocket } = presence ?? this.getUserPushSocketPresence(userId);
+    return {
+      ...(hasMobileSocket ? { suppressTokenPush: true } : {}),
+      ...(hasMobileSocket && !hasDesktopSocket ? { suppressDesktopPush: true } : {}),
+      suppressStreamPush: false,
+    };
+  }
+
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
     const server = this.daemonOwnerUserId && this.serverName
       ? { user_id: this.daemonOwnerUserId, name: this.serverName }
@@ -15512,7 +15720,11 @@ export class WsBridge {
     if (!server) return;
 
     const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(server.user_id);
-    if (hasMobileSocket && !hasDesktopSocket) return;
+    if (hasMobileSocket && !hasDesktopSocket && !pushStreamHub.hasSubscribers(server.user_id) && !globalTaskHub.isPgListening()) {
+      return;
+    }
+
+    const suppressionFlags = this.buildSocketPushSuppressionFlags(server.user_id, { hasMobileSocket, hasDesktopSocket });
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');
@@ -15580,7 +15792,7 @@ export class WsBridge {
         body,
         type: pushType,
         eventId: pushKey,
-        ...(hasMobileSocket ? { suppressMobilePush: true } : {}),
+        ...suppressionFlags,
         data: { serverId: this.serverId, session: sessionName, type: eventType },
       }, env);
       this.deliveredPushKeys.set(pushKey, now);
@@ -15603,7 +15815,11 @@ export class WsBridge {
     if (!server) return;
 
     const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(server.user_id);
-    if (hasMobileSocket && !hasDesktopSocket) return;
+    if (hasMobileSocket && !hasDesktopSocket && !pushStreamHub.hasSubscribers(server.user_id) && !globalTaskHub.isPgListening()) {
+      return;
+    }
+
+    const suppressionFlags = this.buildSocketPushSuppressionFlags(server.user_id, { hasMobileSocket, hasDesktopSocket });
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');
@@ -15686,7 +15902,7 @@ export class WsBridge {
         body,
         type: notifType,
         eventId: pushKey,
-        ...(hasMobileSocket ? { suppressMobilePush: true } : {}),
+        ...suppressionFlags,
         data: {
           serverId: this.serverId,
           ...(sessionName ? { session: sessionName } : {}),

@@ -119,6 +119,14 @@ vi.mock('../../src/daemon/session-identity-local-store.js', async (importOrigina
       if (mocks.identityStoreThrows) throw new Error('identity store unavailable');
       return actual.listLocalSessionIdentityProfiles();
     }),
+    listLocalSessionIdentityMetadata: vi.fn(async () => {
+      if (mocks.identityStoreThrows) throw new Error('identity store unavailable');
+      return actual.listLocalSessionIdentityMetadata();
+    }),
+    withLocalSessionIdentityReadSnapshot: vi.fn((fn) => {
+      if (mocks.identityStoreThrows) throw new Error('identity store unavailable');
+      return actual.withLocalSessionIdentityReadSnapshot(fn);
+    }),
   };
 });
 

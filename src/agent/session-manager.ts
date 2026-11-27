@@ -1,7 +1,7 @@
 import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 import { notifySessionTeardown, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { reclaimOrphanedAgyIncognitoHomes } from './agy-incognito-isolation.js';
-import { AGY_DEFAULT_MODEL_ID, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, normalizeAgyModelId } from '../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, sanitizeAgyStartupModel } from '../../shared/agy-agent.js';
 import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
@@ -28,6 +28,11 @@ import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { canonicalizeTransportCwd, normalizeTransportCwd } from './transport-paths.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
+import { isProviderRetiring } from './provider-registry-state.js';
+
+function isRegistryProviderCurrent(id: string, provider: TransportProvider): boolean {
+  return getProvider(id) === provider && !isProviderRetiring(provider);
+}
 import {
   claimTransportRestoreNotice,
   clearTransportRestoreBackoff,
@@ -40,6 +45,7 @@ import {
   PROVIDER_ERROR_CODES,
   type RemoteSessionInfo,
   type SessionInfoUpdate,
+  type TransportProvider,
 } from './transport-provider.js';
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
@@ -56,6 +62,7 @@ import {
   type SessionRecord,
   type SessionState,
 } from '../store/session-store.js';
+import { authorizeClosedSessionRemoval } from '../store/session-removal-auth.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { hookCredentialEnv, mintHookCredential } from '../daemon/hook-session-credential.js';
 import logger from '../util/logger.js';
@@ -532,6 +539,7 @@ export async function stopProject(
             serverLink.send({ type: 'subsession.closed', id, sessionName: record.name });
           }
         }
+        authorizeClosedSessionRemoval(record.name);
         removeSession(record.name);
         clearTransportRestoreBackoff(record.name);
         // Session is gone — free its in-memory timeline ring buffer + dedup maps
@@ -1301,6 +1309,10 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   handoffLaunchGeneration?: number;
   /** Internal: invoked after `postLaunch` and initial context injection finish. */
   onPostLaunchReady?: () => Promise<unknown> | unknown;
+  /** Internal: queue-protected pre-connected provider passed by connect-time sync in provider-registry. */
+  connectTimeProvider?: TransportProvider;
+  /** Internal: source provider whose remote listing authorized this launch; aborts if replaced/disconnected. */
+  expectedProvider?: TransportProvider;
 }
 
 export interface SessionRelaunchOverrides {
@@ -1438,8 +1450,11 @@ export async function relaunchSessionWithSettings(
   // A model id is provider-scoped. An AG switch without an explicit choice
   // must use AG's default, not the previous provider's (possibly invalid) id.
   const enteringAgy = targetAgentType === AGY_SDK_PROVIDER_ID && record.agentType !== AGY_SDK_PROVIDER_ID;
-  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel
+  const rawRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel
     : enteringAgy ? null : (record.requestedModel ?? null);
+  const targetRequestedModel = targetAgentType === AGY_SDK_PROVIDER_ID
+    ? (sanitizeAgyStartupModel(rawRequestedModel) ?? null)
+    : rawRequestedModel;
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
   const targetCcPreset = overrides.ccPreset !== undefined
@@ -2983,7 +2998,7 @@ function healPersistedAgySessionModel(record: SessionRecord): SessionRecord {
     || transportRuntimes.has(record.name)) {
     return record;
   }
-  const explicitModel = normalizeAgyModelId(record.requestedModel);
+  const explicitModel = sanitizeAgyStartupModel(record.requestedModel);
   const targetActiveModel = explicitModel ?? AGY_DEFAULT_MODEL_ID;
   if (record.requestedModel === explicitModel
     && record.activeModel === targetActiveModel
@@ -3343,7 +3358,7 @@ export async function restoreTransportSessions(
         // the SDK rejected it ("model (fable) may not exist"). Idempotent for ids.
         requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
       } else if (s.providerId === AGY_SDK_PROVIDER_ID) {
-        requestedTransportModel = normalizeAgyModelId(requestedTransportModel);
+        requestedTransportModel = sanitizeAgyStartupModel(requestedTransportModel);
       }
       const runtime = new TransportSessionRuntime(
         provider,
@@ -3769,6 +3784,14 @@ export async function restoreTransportSessions(
  * callers cannot both observe "no in-flight".
  */
 const transportLaunchInFlight = new Map<string, Promise<void>>();
+interface TransportLaunchState {
+  agentType: AgentType;
+  /** Pre-connected provider handed directly by connect-time sync. */
+  preConnectedProvider?: TransportProvider;
+  /** Wakes an in-flight launch currently awaiting ensureProviderConnected. */
+  resolveProviderHandoff?: (provider: TransportProvider) => void;
+}
+const transportLaunchStates = new WeakMap<Promise<void>, TransportLaunchState>();
 
 /** How long a launch waits on an earlier in-flight launch of the same session before giving up. */
 export const DEFAULT_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS = 45_000;
@@ -3793,6 +3816,15 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   clearTransportRestoreBackoff(name);
   const inFlight = transportLaunchInFlight.get(name);
   if (inFlight) {
+    const inFlightState = transportLaunchStates.get(inFlight);
+    // If connect-time sync encounters an in-flight launch for the same provider type,
+    // hand it the queue-protected connected provider directly so neither identity/cleanup
+    // preparation nor ensureProviderConnected deadlocks against the registry op holding sync,
+    // while still awaiting `inFlight` to preserve single-runtime ownership and real errors.
+    if (!opts.fresh && opts.connectTimeProvider && inFlightState && inFlightState.agentType === opts.connectTimeProvider.id) {
+      inFlightState.preConnectedProvider = opts.connectTimeProvider;
+      inFlightState.resolveProviderHandoff?.(opts.connectTimeProvider);
+    }
     // A wedged earlier launch must not hold every later launch of this session forever: wait a
     // bounded time, then fail loudly so the caller (and the user) sees why nothing started.
     const waitMs = getTransportLaunchInFlightWaitMs();
@@ -3805,24 +3837,33 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     // A non-fresh caller only needs the session up: if the prior launch
     // registered a runtime, we're done. A fresh caller must proceed (it
     // intentionally tears down + recreates).
-    if (!opts.fresh && transportRuntimes.has(name)) return;
+    if (!opts.fresh && transportRuntimes.has(name)) {
+      if (opts.bindExistingKey) {
+        registerProviderRoute(opts.bindExistingKey, name);
+      }
+      return;
+    }
   }
   const incognito = opts.incognito === true || (!opts.fresh && isIncognitoSession(getSession(name)));
   if (incognito && !supportsSessionIncognito(opts.agentType)) throw new Error(SESSION_INCOGNITO_UNSUPPORTED);
   if (incognito && !opts.fresh && getSession(name)) throw new Error('Incognito session cannot be restored; start a fresh session.');
   opts = { ...opts, ...(incognito ? { incognito: true } : {}) };
   setSessionIncognito(name, incognito);
-  const launch = withSessionPrivacy(name, incognito, () => launchTransportSessionInner(opts));
-  const tracked = launch.then(() => {}, () => {});
+  const launchState: TransportLaunchState = { agentType: opts.agentType };
+  let settleTracked!: () => void;
+  const tracked = new Promise<void>((resolve) => { settleTracked = resolve; });
+  transportLaunchStates.set(tracked, launchState);
   transportLaunchInFlight.set(name, tracked);
+  const launch = withSessionPrivacy(name, incognito, () => launchTransportSessionInner(opts, launchState));
   try {
     await launch;
   } finally {
     if (transportLaunchInFlight.get(name) === tracked) transportLaunchInFlight.delete(name);
+    settleTracked();
   }
 }
 
-async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
+async function launchTransportSessionInner(opts: LaunchOpts, launchState?: TransportLaunchState): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
   // A fresh launch is an explicit replacement. Remove the old runtime before
@@ -3867,7 +3908,45 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     }
   }
 
-  const provider = await ensureProviderConnected(agentType, {});
+  let provider: TransportProvider;
+  const cachedPreConnected = launchState?.preConnectedProvider;
+  if (opts.connectTimeProvider) {
+    provider = opts.connectTimeProvider;
+  } else if (cachedPreConnected && isRegistryProviderCurrent(agentType, cachedPreConnected)) {
+    provider = cachedPreConnected;
+  } else {
+    if (launchState && cachedPreConnected && !isRegistryProviderCurrent(agentType, cachedPreConnected)) {
+      // Handoff only unblocks waiting; if reconnect/disconnect already replaced or retired it, never trust stale handle.
+      launchState.preConnectedProvider = undefined;
+    }
+    if (opts.expectedProvider && !isRegistryProviderCurrent(agentType, opts.expectedProvider)) {
+      throw new Error(`Provider ${agentType} superseded before session launch`);
+    }
+    const controller = new AbortController();
+    const handoffPromise = new Promise<TransportProvider>((resolve) => {
+      if (launchState) launchState.resolveProviderHandoff = resolve;
+    });
+    const ensurePromise = ensureProviderConnected(agentType, {}, { signal: controller.signal });
+    ensurePromise.catch(() => {});
+    try {
+      provider = await Promise.race([ensurePromise, handoffPromise]);
+    } finally {
+      if (launchState) launchState.resolveProviderHandoff = undefined;
+      controller.abort();
+    }
+  }
+  const providerTrackedInRegistry = !opts.connectTimeProvider && isRegistryProviderCurrent(agentType, provider);
+  const isLaunchProviderStale = (): boolean => {
+    const staleSource = Boolean(
+      opts.expectedProvider
+        && (!isRegistryProviderCurrent(agentType, opts.expectedProvider) || provider !== opts.expectedProvider),
+    );
+    const staleRegistry = Boolean(providerTrackedInRegistry && !isRegistryProviderCurrent(agentType, provider));
+    return staleSource || staleRegistry;
+  };
+  if (isLaunchProviderStale()) {
+    throw new Error(`Provider ${agentType} changed before session prepare`);
+  }
 
   const launchRecord = getSession(name);
   const launchRecipient = recipientFromSessionRecord(launchRecord) ?? {
@@ -3931,7 +4010,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     // symmetric with the restore path and command-handler's model-change path.
     requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
   } else if (agentType === AGY_SDK_PROVIDER_ID) {
-    requestedTransportModel = normalizeAgyModelId(requestedTransportModel);
+    requestedTransportModel = sanitizeAgyStartupModel(requestedTransportModel);
   }
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would
@@ -4176,6 +4255,9 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     : mintHookCredential();
   // Create session on provider
   const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
+  if (isLaunchProviderStale()) {
+    throw new Error(`Provider ${agentType} changed before session initialize`);
+  }
   await runtime.initialize({
     ...(opts.incognito ? { incognito: true } : {}),
     sessionKey: effectiveSessionKey,
@@ -4226,6 +4308,10 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   if (agentType === AGY_SDK_PROVIDER_ID && !ownsAgyLaunch(getSession(name))) {
     await runtime.kill({ detachProviderSession: true });
     throw Object.assign(new Error('AG launch owner changed'), { code: PROVIDER_ERROR_CODES.CANCELLED, recoverable: false });
+  }
+  if (isLaunchProviderStale()) {
+    await runtime.kill({ detachProviderSession: true }).catch(() => {});
+    throw new Error(`Provider ${agentType} changed during session launch`);
   }
   const latestSessionInfo = getLatestSessionInfo();
   // Atomic: store runtime + register provider route + persist — rollback all on failure

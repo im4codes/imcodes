@@ -9,6 +9,7 @@ import { isTransportAgent } from '../agent/detect.js';
 import { timelineStore } from './timeline-store.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { createRuntimeEpoch, upsertSession, getSession, removeSession, type SessionRecord } from '../store/session-store.js';
+import { authorizeClosedSessionRemoval } from '../store/session-removal-auth.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { existsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -17,7 +18,7 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { usesProviderResumeId } from '../agent/transport-resume-opts.js';
 import { isCodeBuddyProviderId } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
-import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID, normalizeAgyModelId } from '../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID, sanitizeAgyStartupModel } from '../../shared/agy-agent.js';
 import { isClaudeCodeSdkAgentType, isSessionAgentType, unsupportedAgentTypeError } from '../../shared/agent-types.js';
 
 import logger from '../util/logger.js';
@@ -187,7 +188,9 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
         label: sub.label ?? undefined,
         description: sub.description ?? undefined,
         identityPrompt: sub.identityPrompt ?? undefined,
-        requestedModel: sub.requestedModel ?? undefined,
+        requestedModel: agentType === AGY_SDK_PROVIDER_ID
+          ? sanitizeAgyStartupModel(sub.requestedModel)
+          : (sub.requestedModel ?? undefined),
         qwenModel: sub.qwenModel ?? undefined,
         transportConfig: sub.transportConfig ?? undefined,
         skipCreate: false,
@@ -210,7 +213,9 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       label: sub.label ?? undefined,
       description: sub.description ?? undefined,
       identityPrompt: sub.identityPrompt ?? undefined,
-      requestedModel: sub.requestedModel ?? undefined,
+      requestedModel: agentType === AGY_SDK_PROVIDER_ID
+        ? sanitizeAgyStartupModel(sub.requestedModel)
+        : (sub.requestedModel ?? undefined),
       qwenModel: sub.qwenModel ?? undefined,
       transportConfig: sub.transportConfig ?? undefined,
       bindExistingKey: providerResumeFamily ? undefined : (sub.providerSessionId ?? undefined),
@@ -558,6 +563,7 @@ export async function stopSubSession(
       }
       clearResend(sessionName, 'session_removed');
       clearSessionRestartContinuation(sessionName);
+      authorizeClosedSessionRemoval(sessionName);
       removeSession(sessionName);
       timelineEmitter.forgetSession(sessionName);
       notifySessionTeardown(sessionName);
@@ -680,8 +686,11 @@ export async function rebuildSubSessions(subSessions: SubSessionRecord[]): Promi
       const now = Date.now();
       const targetAgentType = ownsLiveAgy ? existing.agentType : sub.type;
       const isAgySub = targetAgentType === AGY_SDK_PROVIDER_ID;
+      const inheritedRequestedModel = isAgySub && existing && existing.agentType !== AGY_SDK_PROVIDER_ID
+        ? undefined
+        : existing?.requestedModel;
       const rebuiltRequestedModel = isAgySub
-        ? normalizeAgyModelId(sub.requestedModel ?? existing?.requestedModel)
+        ? sanitizeAgyStartupModel(sub.requestedModel ?? inheritedRequestedModel)
         : (sub.requestedModel ?? existing?.requestedModel);
       const candidateActiveModel = sub.activeModel ?? existing?.activeModel;
       const rebuiltActiveModel = isAgySub && !ownsLiveAgy

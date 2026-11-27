@@ -42,14 +42,22 @@ import {
   type PushNotificationType,
 } from '@shared/push-notifications.js';
 import {
+  disableAndroidBackgroundPush,
+  enableAndroidBackgroundPush,
   fetchPushNotificationSettings,
+  getAndroidBackgroundPushStatus,
   getLocalPushNotificationPreferences,
   getLocalPushEnabledServers,
+  isAndroidBackgroundPushSupportedBuild,
+  requestAndroidBatteryOptimizationExemption,
+  requestAndroidNotificationPermission,
+  subscribeAndroidBackgroundPushStatus,
   syncPushNotificationPreferences,
   commitPushEnabledServers,
   subscribePushEnabledServers,
   hasUnsyncedPushNotificationEdits,
   hasUnsyncedPushEnabledServerEdits,
+  type AndroidBackgroundPushStatus,
 } from '../push-notifications.js';
 import {
   getDesktopNotificationPermission,
@@ -342,6 +350,9 @@ export function SettingsPage({
     getLocalDesktopNotificationsEnabled(),
   );
   const [desktopNotifRequesting, setDesktopNotifRequesting] = useState(false);
+  const showAndroidBgPush = typeof isAndroidBackgroundPushSupportedBuild === 'function' && isAndroidBackgroundPushSupportedBuild();
+  const [androidBgStatus, setAndroidBgStatus] = useState<AndroidBackgroundPushStatus | null>(null);
+  const [androidBgBusy, setAndroidBgBusy] = useState(false);
   const [pushEnabledServers, setPushEnabledServers] = useState<string[] | null>(() =>
     getLocalPushEnabledServers(),
   );
@@ -375,6 +386,74 @@ export function SettingsPage({
       setDesktopNotifEnabled(getLocalDesktopNotificationsEnabled());
     } finally {
       setDesktopNotifRequesting(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!showAndroidBgPush) return undefined;
+    let cancelled = false;
+    const unsubscribe = typeof subscribeAndroidBackgroundPushStatus === 'function'
+      ? subscribeAndroidBackgroundPushStatus((status) => {
+        if (!cancelled) setAndroidBgStatus(status);
+      })
+      : () => {};
+    const refresh = () => {
+      if (typeof getAndroidBackgroundPushStatus === 'function') {
+        void getAndroidBackgroundPushStatus().then((status) => {
+          if (!cancelled && status) setAndroidBgStatus(status);
+        }).catch(() => {});
+      }
+    };
+    refresh();
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') refresh();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', onVisibility);
+      unsubscribe();
+    };
+  }, [showAndroidBgPush]);
+
+  const handleToggleAndroidBackgroundPush = async () => {
+    if (androidBgBusy) return;
+    setAndroidBgBusy(true);
+    try {
+      const currentlyEnabled = Boolean(androidBgStatus?.enabled);
+      if (currentlyEnabled) {
+        if (typeof disableAndroidBackgroundPush === 'function') {
+          const next = await disableAndroidBackgroundPush();
+          if (next) setAndroidBgStatus(next);
+        }
+      } else if (typeof enableAndroidBackgroundPush === 'function') {
+        const next = await enableAndroidBackgroundPush();
+        if (next) setAndroidBgStatus(next);
+      }
+    } finally {
+      setAndroidBgBusy(false);
+    }
+  };
+
+  const handleRequestAndroidNotificationPerm = async () => {
+    if (androidBgBusy || typeof requestAndroidNotificationPermission !== 'function') return;
+    setAndroidBgBusy(true);
+    try {
+      const next = await requestAndroidNotificationPermission();
+      if (next) setAndroidBgStatus(next);
+    } finally {
+      setAndroidBgBusy(false);
+    }
+  };
+
+  const handleRequestAndroidBatteryExemption = async () => {
+    if (androidBgBusy || typeof requestAndroidBatteryOptimizationExemption !== 'function') return;
+    setAndroidBgBusy(true);
+    try {
+      const next = await requestAndroidBatteryOptimizationExemption();
+      if (next) setAndroidBgStatus(next);
+    } finally {
+      setAndroidBgBusy(false);
     }
   };
 
@@ -1694,6 +1773,107 @@ export function SettingsPage({
                       {t('settings.push_desktop_enable_btn')}
                     </button>
                   )}
+                </div>
+              )}
+
+              {showAndroidBgPush && (
+                <div class="settings-card" data-testid="android-bg-push-settings-card">
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', marginBottom: '4px' }}>
+                    <div style={inlineLabelStyle}>{t('settings.push_android_bg_label')}</div>
+                    <span
+                      data-testid="android-bg-push-status-badge"
+                      style={{
+                        fontSize: '11px',
+                        fontWeight: '600',
+                        padding: '2px 8px',
+                        borderRadius: '999px',
+                        background: androidBgStatus?.connectionState === 'connected'
+                          ? 'rgba(34, 197, 94, 0.16)'
+                          : androidBgStatus?.connectionState === 'auth_error'
+                            ? 'rgba(239, 68, 68, 0.18)'
+                            : 'rgba(148, 163, 184, 0.16)',
+                        color: androidBgStatus?.connectionState === 'connected'
+                          ? '#4ade80'
+                          : androidBgStatus?.connectionState === 'auth_error'
+                            ? '#f87171'
+                            : '#cbd5e1',
+                      }}
+                    >
+                      {t(
+                        androidBgStatus?.connectionState === 'connected'
+                          ? 'settings.push_android_bg_status_connected'
+                          : androidBgStatus?.connectionState === 'connecting'
+                            ? 'settings.push_android_bg_status_connecting'
+                            : androidBgStatus?.connectionState === 'waiting_network'
+                              ? 'settings.push_android_bg_status_waiting_network'
+                              : androidBgStatus?.connectionState === 'auth_error'
+                                ? 'settings.push_android_bg_status_auth_error'
+                                : 'settings.push_android_bg_status_stopped',
+                      )}
+                    </span>
+                  </div>
+                  <h2 style={{ fontSize: '16px', fontWeight: '600', margin: '0 0 6px', color: '#e2e8f0' }}>
+                    {t('settings.push_android_bg_title')}
+                  </h2>
+                  <p style={{ color: '#94a3b8', fontSize: '13px', lineHeight: 1.5, margin: '0 0 12px' }}>
+                    {t('settings.push_android_bg_desc')}
+                  </p>
+
+                  <label class="settings-checkbox-row" style={{ marginBottom: '12px' }}>
+                    <input
+                      type="checkbox"
+                      aria-label={t('settings.push_android_bg_toggle_title')}
+                      data-testid="android-bg-push-toggle"
+                      checked={Boolean(androidBgStatus?.enabled)}
+                      disabled={androidBgBusy}
+                      onChange={() => void handleToggleAndroidBackgroundPush()}
+                      style={checkboxStyle}
+                    />
+                    <div style={checkboxTextWrapStyle}>
+                      <div style={checkboxTitleStyle}>{t('settings.push_android_bg_toggle_title')}</div>
+                      <div style={checkboxDescStyle}>{t('settings.push_android_bg_toggle_desc')}</div>
+                    </div>
+                  </label>
+
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', alignItems: 'center' }}>
+                    {androidBgStatus?.notificationsGranted ? (
+                      <span
+                        data-testid="android-bg-push-notif-granted"
+                        style={{ color: '#4ade80', fontSize: '12px', fontWeight: '500' }}
+                      >
+                        ✓ {t('settings.push_android_perm_granted')}
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        class="settings-btn-primary"
+                        data-testid="android-bg-push-notif-perm-btn"
+                        disabled={androidBgBusy}
+                        onClick={() => void handleRequestAndroidNotificationPerm()}
+                      >
+                        {t('settings.push_android_notif_perm_btn')}
+                      </button>
+                    )}
+
+                    {androidBgStatus?.batteryOptimizationIgnored ? (
+                      <span
+                        data-testid="android-bg-push-battery-granted"
+                        style={{ color: '#4ade80', fontSize: '12px', fontWeight: '500' }}
+                      >
+                        ✓ {t('settings.push_android_battery_granted')}
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        class="settings-btn-secondary"
+                        data-testid="android-bg-push-battery-btn"
+                        disabled={androidBgBusy}
+                        onClick={() => void handleRequestAndroidBatteryExemption()}
+                      >
+                        {t('settings.push_android_battery_btn')}
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
 
