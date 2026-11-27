@@ -90,6 +90,8 @@ export interface NativeOfflineSpeechModelManager {
   ) => Promise<{ remove: () => Promise<void> }>;
 }
 
+export type HapticFeedbackStyle = 'light' | 'medium' | 'selection' | 'success' | 'warning';
+
 export type NativeSpeechRecognition = Omit<
   Pick<SpeechRecognitionPlugin, 'available' | 'checkPermissions' | 'requestPermissions' | 'start' | 'stop' | 'addListener'>,
   'start'
@@ -105,7 +107,7 @@ export type NativeSpeechRecognition = Omit<
   }) => Promise<{ matches?: string[] } | void>;
   transcribePcm?: (options: { pcmBase64: string; language?: string }) => Promise<{ text?: string }>;
   prewarm?: () => Promise<void>;
-  performHaptic?: () => Promise<void>;
+  performHaptic?: (options?: { style?: HapticFeedbackStyle }) => Promise<void>;
   startRawPcmCapture?: () => Promise<void>;
   stopRawPcmCapture?: () => Promise<void>;
   speak?: (options: NativeTtsSpeakOptions) => Promise<void>;

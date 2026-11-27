@@ -2049,7 +2049,8 @@ describe('Web Mobile final drain', () => {
       vi.useRealTimers();
     }
 
-    // Haptics: Android uses plugin performHaptic when available; iOS / fallback uses navigator.vibrate
+    // Haptics: both Android and iOS Capacitor shells invoke native performHaptic({ style }),
+    // falling back cleanly to navigator.vibrate when missing or rejected (never throwing).
     const vibrateSpy = vi.fn(() => true);
     const origVibrate = navigator.vibrate;
     Object.defineProperty(navigator, 'vibrate', { value: vibrateSpy, configurable: true });
@@ -2058,18 +2059,36 @@ describe('Web Mobile final drain', () => {
     const origCap = (globalThis as any).Capacitor;
     try {
       (globalThis as any).Capacitor = { isNativePlatform: () => true, getPlatform: () => 'android' };
-      await VoiceInput.triggerHapticFeedback(20);
+      await VoiceInput.triggerHapticFeedback(20, 'medium');
       expect(performHaptic).toHaveBeenCalledTimes(1);
+      expect(performHaptic).toHaveBeenLastCalledWith({ style: 'medium' });
       expect(vibrateSpy).not.toHaveBeenCalled();
 
       performHaptic.mockRejectedValueOnce(new Error('haptic disabled'));
-      await VoiceInput.triggerHapticFeedback(20);
+      await VoiceInput.triggerHapticFeedback(20, 'medium');
       expect(vibrateSpy).toHaveBeenCalledWith(20);
 
       vibrateSpy.mockClear();
       (globalThis as any).Capacitor = { isNativePlatform: () => true, getPlatform: () => 'ios' };
-      await VoiceInput.triggerHapticFeedback(20);
-      expect(performHaptic).toHaveBeenCalledTimes(2); // skipped on iOS
+      await VoiceInput.triggerHapticFeedback(12, 'selection');
+      await VoiceInput.triggerHapticFeedback(18, 'success');
+      await VoiceInput.triggerHapticFeedback(15, 'warning');
+      await VoiceInput.triggerHapticFeedback(12, 'light');
+      expect(performHaptic).toHaveBeenCalledTimes(6);
+      expect(performHaptic).toHaveBeenNthCalledWith(3, { style: 'selection' });
+      expect(performHaptic).toHaveBeenNthCalledWith(4, { style: 'success' });
+      expect(performHaptic).toHaveBeenNthCalledWith(5, { style: 'warning' });
+      expect(performHaptic).toHaveBeenNthCalledWith(6, { style: 'light' });
+      expect(vibrateSpy).not.toHaveBeenCalled();
+
+      // Legacy native shell rejecting performHaptic degrades cleanly without throwing
+      performHaptic.mockRejectedValueOnce(new Error('UNIMPLEMENTED'));
+      await expect(VoiceInput.triggerHapticFeedback(15, 'warning')).resolves.toBeUndefined();
+      expect(vibrateSpy).toHaveBeenCalledWith(15);
+
+      vibrateSpy.mockClear();
+      delete (speechApi as any).performHaptic;
+      await expect(VoiceInput.triggerHapticFeedback(20)).resolves.toBeUndefined();
       expect(vibrateSpy).toHaveBeenCalledWith(20);
     } finally {
       delete (speechApi as any).performHaptic;

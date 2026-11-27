@@ -925,17 +925,38 @@ public class StreamingSpeechPlugin extends Plugin {
         }
     }
 
+    private static int resolveAndroidHapticConstant(String style) {
+        if (style == null) {
+            return HapticFeedbackConstants.LONG_PRESS;
+        }
+        switch (style) {
+            case "selection":
+            case "light":
+                return HapticFeedbackConstants.CLOCK_TICK;
+            case "success":
+                return Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                    ? HapticFeedbackConstants.CONFIRM
+                    : HapticFeedbackConstants.VIRTUAL_KEY;
+            case "warning":
+                return HapticFeedbackConstants.VIRTUAL_KEY;
+            case "medium":
+            default:
+                return HapticFeedbackConstants.LONG_PRESS;
+        }
+    }
+
     @PluginMethod
     public void performHaptic(PluginCall call) {
         if (getBridge() == null || getBridge().getWebView() == null) {
             call.resolve();
             return;
         }
+        final int feedbackConstant = resolveAndroidHapticConstant(call.getString("style"));
         View webView = getBridge().getWebView();
         webView.post(() -> {
             try {
                 webView.performHapticFeedback(
-                    HapticFeedbackConstants.LONG_PRESS,
+                    feedbackConstant,
                     HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING
                 );
             } catch (RuntimeException ignored) {

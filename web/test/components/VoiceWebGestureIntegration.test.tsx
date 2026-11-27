@@ -822,10 +822,136 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
       expect(ws.sendSessionCommand).toHaveBeenCalledWith('send', expect.objectContaining({
         text: '安卓秒录完成',
       }));
+      expect(nativeBridge.performHaptic).toHaveBeenCalledWith({ style: 'medium' });
+      expect(nativeBridge.performHaptic).toHaveBeenCalledWith({ style: 'success' });
     } finally {
       audio.remove();
       (globalThis as any).Capacitor = origCap;
       Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    }
+  });
+
+  it('triggers iOS native Taptic Engine haptics across hold, left/right zone slides without jitter, send, edit, and cancel, while degrading cleanly on legacy native rejection', async () => {
+    for (const key of Object.keys(nativeListeners)) delete nativeListeners[key];
+    nativeBridge.available.mockReset().mockResolvedValue({ available: true });
+    nativeBridge.checkPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+    nativeBridge.requestPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+    nativeBridge.start.mockReset().mockResolvedValue(undefined);
+    nativeBridge.stop.mockReset().mockResolvedValue(undefined);
+    nativeBridge.prewarm.mockReset().mockResolvedValue(undefined);
+    nativeBridge.performHaptic.mockReset().mockResolvedValue(undefined);
+    nativeBridge.addListener.mockReset().mockImplementation(async (eventName: string, handler: (data: any) => void) => {
+      nativeListeners[eventName] = handler;
+      return { remove: async () => { if (nativeListeners[eventName] === handler) delete nativeListeners[eventName]; } };
+    });
+
+    const origCap = (globalThis as any).Capacitor;
+    (globalThis as any).Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => 'ios',
+      isPluginAvailable: () => true,
+    };
+
+    try {
+      const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+      const renderControls = () => render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+      const view1 = renderControls();
+      await vi.advanceTimersByTimeAsync(0);
+      let input = document.querySelector('.controls-input') as HTMLElement;
+
+      // 1. Short tap never triggers haptic
+      fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+        clientX: 180, clientY: 500, pointerId: 31, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(40);
+      fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
+        clientX: 180, clientY: 500, pointerId: 31, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(nativeBridge.performHaptic).not.toHaveBeenCalled();
+
+      input.blur();
+      fireEvent.blur(input);
+      await vi.advanceTimersByTimeAsync(0);
+
+      // 2. Hold -> slide left (cancel) -> move within cancel (no extra haptic) -> slide center (send) -> slide right (edit) -> release edit -> light
+      fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+        clientX: 180, clientY: 500, pointerId: 32, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(175);
+      await vi.advanceTimersByTimeAsync(0);
+      nativeListeners.listeningState?.({ status: 'started' });
+      nativeListeners.partialResults?.({ matches: ['iOS震动测试'], isFinal: true });
+      await vi.advanceTimersByTimeAsync(0);
+
+      fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true, cancelable: true }), {
+        clientX: 90, clientY: 500, pointerId: 32, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      // Repeated moves inside cancel zone must NOT jitter
+      fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true, cancelable: true }), {
+        clientX: 80, clientY: 500, pointerId: 32, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true, cancelable: true }), {
+        clientX: 180, clientY: 500, pointerId: 32, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true, cancelable: true }), {
+        clientX: 280, clientY: 500, pointerId: 32, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
+        clientX: 280, clientY: 500, pointerId: 32, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(nativeBridge.performHaptic.mock.calls).toEqual([
+        [{ style: 'medium' }],
+        [{ style: 'selection' }],
+        [{ style: 'selection' }],
+        [{ style: 'selection' }],
+        [{ style: 'light' }],
+      ]);
+      view1.unmount();
+
+      // 3. Re-mount fresh composer & test left-slide cancel -> warning + legacy rejection resilience
+      nativeBridge.performHaptic.mockClear().mockRejectedValue(new Error('UNIMPLEMENTED'));
+      const view2 = renderControls();
+      await vi.advanceTimersByTimeAsync(0);
+      input = document.querySelector('.controls-input') as HTMLElement;
+
+      fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+        clientX: 180, clientY: 500, pointerId: 33, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(175);
+      await vi.advanceTimersByTimeAsync(0);
+      nativeListeners.listeningState?.({ status: 'started' });
+      nativeListeners.partialResults?.({ matches: ['取消句子'], isFinal: false });
+      await vi.advanceTimersByTimeAsync(0);
+
+      fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true, cancelable: true }), {
+        clientX: 90, clientY: 500, pointerId: 33, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+      }));
+      fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
+        clientX: 90, clientY: 500, pointerId: 33, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+      }));
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(nativeBridge.performHaptic.mock.calls).toEqual([
+        [{ style: 'medium' }],
+        [{ style: 'selection' }],
+        [{ style: 'warning' }],
+      ]);
+      expect(ws.sendSessionCommand).not.toHaveBeenCalled();
+      view2.unmount();
+    } finally {
+      (globalThis as any).Capacitor = origCap;
     }
   });
 });

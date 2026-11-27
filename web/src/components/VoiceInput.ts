@@ -2377,22 +2377,24 @@ export function cancelVoiceGesturePrime(): void {
   cancelWebGesturePrime();
 }
 
+export type { HapticFeedbackStyle } from '../voice-recognition-backend.js';
+import type { HapticFeedbackStyle } from '../voice-recognition-backend.js';
+
 /**
- * Trigger short tactile hold confirmation: native Android WebView HapticFeedback when
- * running on Android native shell (works even when navigator.vibrate is blocked/silent),
- * falling back cleanly to `navigator.vibrate`. Never throws.
+ * Trigger short tactile confirmation: native Capacitor `performHaptic({ style })` on
+ * both iOS (Taptic Engine) and Android (HapticFeedback), falling back cleanly to
+ * `navigator.vibrate` on web or when an older native shell lacks `performHaptic`. Never throws.
  */
-export async function triggerHapticFeedback(durationMs = 20): Promise<void> {
+export async function triggerHapticFeedback(
+  durationMs = 20,
+  style: HapticFeedbackStyle = 'medium',
+): Promise<void> {
   if (isCapacitorNative()) {
     try {
-      const cap = (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor;
-      const platform = cap?.getPlatform?.();
-      if (platform !== 'ios') {
-        const recognition = getNativeSpeechRecognition();
-        if (typeof recognition.performHaptic === 'function') {
-          await recognition.performHaptic();
-          return;
-        }
+      const recognition = getNativeSpeechRecognition();
+      if (typeof recognition.performHaptic === 'function') {
+        await recognition.performHaptic({ style });
+        return;
       }
     } catch {
       // Fall back to navigator.vibrate below.

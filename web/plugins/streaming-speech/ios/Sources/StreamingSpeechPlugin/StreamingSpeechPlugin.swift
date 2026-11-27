@@ -841,6 +841,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         CAPPluginMethod(name: "checkPermissions", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "requestPermissions", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "prewarm", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "performHaptic", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "start", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "stop", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "transcribePcm", returnType: CAPPluginReturnPromise),
@@ -2166,6 +2167,39 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             "voiceName": voice.name,
             "voiceIdentifier": voice.identifier,
         ])
+    }
+
+    @objc public func performHaptic(_ call: CAPPluginCall) {
+        let style = call.getString("style") ?? "medium"
+        #if canImport(UIKit)
+        DispatchQueue.main.async {
+            switch style {
+            case "selection":
+                let generator = UISelectionFeedbackGenerator()
+                generator.prepare()
+                generator.selectionChanged()
+            case "light":
+                let generator = UIImpactFeedbackGenerator(style: .light)
+                generator.prepare()
+                generator.impactOccurred()
+            case "success":
+                let generator = UINotificationFeedbackGenerator()
+                generator.prepare()
+                generator.notificationOccurred(.success)
+            case "warning":
+                let generator = UINotificationFeedbackGenerator()
+                generator.prepare()
+                generator.notificationOccurred(.warning)
+            default:
+                let generator = UIImpactFeedbackGenerator(style: .medium)
+                generator.prepare()
+                generator.impactOccurred()
+            }
+            call.resolve()
+        }
+        #else
+        call.resolve()
+        #endif
     }
 
     @objc public func openTtsSettings(_ call: CAPPluginCall) {
