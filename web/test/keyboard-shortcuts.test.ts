@@ -14,6 +14,7 @@ import {
   canHandleOpenSettingsShortcut,
   canHandleReturnToMainWindowShortcut,
   canHandleStandaloneRemoteDesktopTabShortcut,
+  canHandleToggleRemoteDesktopShortcut,
   canHandleToggleTaskModeShortcut,
   chordFromKeyboardEvent,
   cycleOrderedId,
@@ -63,6 +64,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: 'Alt+l',
       subSessionCloseAll: 'Ctrl+0',
       toggleTaskMode: 'Ctrl+Shift+t',
+      toggleRemoteDesktop: 'Ctrl+Shift+d',
     });
 
     expect(getDefaultShortcuts(false)).toEqual({
@@ -72,6 +74,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: 'Alt+l',
       subSessionCloseAll: 'Ctrl+0',
       toggleTaskMode: 'Ctrl+Shift+t',
+      toggleRemoteDesktop: 'Ctrl+Shift+d',
     });
 
     expect(getDefaultSecondaryShortcuts(true)).toEqual({
@@ -81,6 +84,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: 'Ctrl+d',
       subSessionCloseAll: null,
       toggleTaskMode: null,
+      toggleRemoteDesktop: null,
     });
 
     expect(getDefaultSecondaryShortcuts(false)).toEqual({
@@ -90,6 +94,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: null,
       subSessionCloseAll: null,
       toggleTaskMode: null,
+      toggleRemoteDesktop: null,
     });
   });
 
@@ -162,6 +167,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: 'Alt+l',
       subSessionCloseAll: 'Ctrl+0',
       toggleTaskMode: 'Ctrl+Shift+t',
+      toggleRemoteDesktop: 'Ctrl+Shift+d',
     });
     expect(resolveKeyboardShortcuts({ tabPrev: 'Meta+ArrowLeft', tabNext: 'Meta+ArrowRight' }, true)).toEqual({
       serverPrev: 'Alt+i',
@@ -170,6 +176,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: 'Meta+ArrowRight',
       subSessionCloseAll: 'Ctrl+0',
       toggleTaskMode: 'Ctrl+Shift+t',
+      toggleRemoteDesktop: 'Ctrl+Shift+d',
     });
     expect(resolveKeyboardShortcuts(clean, false)).toEqual({
       serverPrev: 'Alt+ArrowUp',
@@ -178,6 +185,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: 'Alt+l',
       subSessionCloseAll: 'Ctrl+0',
       toggleTaskMode: 'Ctrl+Shift+t',
+      toggleRemoteDesktop: 'Ctrl+Shift+d',
     });
 
     // Dual-slot sanitization, legacy backward compatibility, and non-resurrecting clear semantics
@@ -188,6 +196,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: { primary: 'Alt+l', secondary: 'Ctrl+d' },
       subSessionCloseAll: { primary: 'Ctrl+0', secondary: null },
       toggleTaskMode: { primary: 'Ctrl+Shift+t', secondary: null },
+      toggleRemoteDesktop: { primary: 'Ctrl+Shift+d', secondary: null },
     });
 
     const dirtyDual = sanitizeShortcutOverrides({
@@ -213,6 +222,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: { primary: 'Alt+l', secondary: 'Ctrl+ArrowRight' },
       subSessionCloseAll: { primary: 'Ctrl+0', secondary: null },
       toggleTaskMode: { primary: 'Ctrl+Shift+t', secondary: null },
+      toggleRemoteDesktop: { primary: 'Ctrl+Shift+d', secondary: null },
     });
     expect(resolveKeyboardShortcutSlots({}, false)).toEqual({
       serverPrev: { primary: 'Alt+i', secondary: null },
@@ -221,6 +231,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: { primary: 'Alt+l', secondary: null },
       subSessionCloseAll: { primary: 'Ctrl+0', secondary: null },
       toggleTaskMode: { primary: 'Ctrl+Shift+t', secondary: null },
+      toggleRemoteDesktop: { primary: 'Ctrl+Shift+d', secondary: null },
     });
 
     // applyShortcutSlotOverride persists explicit null for cleared non-null defaults and prunes redundant defaults
@@ -467,6 +478,7 @@ describe('keyboard-shortcuts core helpers', () => {
       tabNext: { primary: 'Alt+l', secondary: null },
       subSessionCloseAll: { primary: 'Ctrl+0', secondary: 'Alt+l' },
       toggleTaskMode: { primary: 'Ctrl+Shift+t', secondary: null },
+      toggleRemoteDesktop: { primary: 'Ctrl+Shift+d', secondary: null },
     })).toEqual({
       serverPrev: { secondary: [{ action: 'serverNext', slot: 'secondary' }] },
       serverNext: { secondary: [{ action: 'serverPrev', slot: 'secondary' }] },
@@ -505,6 +517,39 @@ describe('keyboard-shortcuts core helpers', () => {
       { key: 'K', code: 'KeyK', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
       customTaskModeSlots,
     )).toEqual({ action: 'toggleTaskMode', slot: 'secondary', chord: 'Meta+Shift+k' });
+
+    // toggleRemoteDesktop default Ctrl+Shift+D matches both uppercase 'D' and lowercase 'd' on Mac and non-Mac,
+    // stays distinct from macOS tabNext secondary Ctrl+D, and supports custom overrides + clear/conflict
+    expect(formatShortcutKeycaps('Ctrl+Shift+d', true)).toEqual(['⌃', '⇧', 'D']);
+    expect(formatShortcutKeycaps('Ctrl+Shift+d', false)).toEqual(['Ctrl', 'Shift', 'D']);
+    for (const slots of [macSlots, resolveKeyboardShortcutSlots({}, false)]) {
+      expect(matchNavigationShortcutBinding(
+        { key: 'D', code: 'KeyD', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true },
+        slots,
+      )).toEqual({ action: 'toggleRemoteDesktop', slot: 'primary', chord: 'Ctrl+Shift+d' });
+      expect(matchNavigationShortcutBinding(
+        { key: 'd', code: 'KeyD', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true },
+        slots,
+      )).toEqual({ action: 'toggleRemoteDesktop', slot: 'primary', chord: 'Ctrl+Shift+d' });
+    }
+    expect(matchNavigationShortcutBinding(
+      { key: 'd', code: 'KeyD', metaKey: false, ctrlKey: true, altKey: false, shiftKey: false },
+      macSlots,
+    )).toEqual({ action: 'tabNext', slot: 'secondary', chord: 'Ctrl+d' });
+
+    const customRdSlots = resolveKeyboardShortcutSlots({ toggleRemoteDesktop: 'Alt+r', secondary: { toggleRemoteDesktop: 'Meta+Shift+d' } }, true);
+    expect(matchNavigationShortcutBinding(
+      { key: 'D', code: 'KeyD', metaKey: false, ctrlKey: true, altKey: false, shiftKey: true },
+      customRdSlots,
+    )).toBeNull();
+    expect(matchNavigationShortcutBinding(
+      { key: '®', code: 'KeyR', metaKey: false, ctrlKey: false, altKey: true, shiftKey: false },
+      customRdSlots,
+    )).toEqual({ action: 'toggleRemoteDesktop', slot: 'primary', chord: 'Alt+r' });
+    expect(matchNavigationShortcutBinding(
+      { key: 'D', code: 'KeyD', metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
+      customRdSlots,
+    )).toEqual({ action: 'toggleRemoteDesktop', slot: 'secondary', chord: 'Meta+Shift+d' });
   });
 
   it('sorts tabs matching SessionTabs visual order (pinned first, then tabOrder) and cycles with wrap-around', () => {
@@ -1245,6 +1290,102 @@ describe('keyboard-shortcuts core helpers', () => {
     })).toBe(false);
     modal.remove();
 
+    composer.remove();
+  });
+
+  it('allows toggleRemoteDesktop in Workspace, composer, terminals, and Remote Desktop / Wall surfaces while blocking mobile, IME, recording, and modal dialogs', () => {
+    const composer = document.createElement('div');
+    composer.className = 'controls-input';
+    composer.contentEditable = 'true';
+    document.body.appendChild(composer);
+    composer.focus();
+
+    expect(canHandleToggleRemoteDesktopShortcut(composer, composer, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(true);
+
+    const xterm = document.createElement('div');
+    xterm.className = 'xterm';
+    const xtermTa = document.createElement('textarea');
+    xtermTa.className = 'xterm-helper-textarea';
+    xterm.appendChild(xtermTa);
+    document.body.appendChild(xterm);
+    xtermTa.focus();
+    expect(canHandleToggleRemoteDesktopShortcut(xtermTa, xtermTa, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(true);
+    xterm.remove();
+
+    const rdWin = document.createElement('div');
+    rdWin.className = 'remote-desktop-workspace-window';
+    const rdCanvas = document.createElement('canvas');
+    rdCanvas.className = 'remote-desktop-canvas';
+    rdCanvas.setAttribute('data-remote-desktop-surface', 'true');
+    rdCanvas.tabIndex = 0;
+    rdWin.appendChild(rdCanvas);
+    document.body.appendChild(rdWin);
+    rdCanvas.focus();
+    expect(canHandleToggleRemoteDesktopShortcut(rdCanvas, rdCanvas, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(true);
+
+    // Wall picker uses aria-modal="false" and must not act as a blocking dialog
+    const wallWin = document.createElement('div');
+    wallWin.className = 'remote-desktop-wall-window';
+    const wallPicker = document.createElement('div');
+    wallPicker.setAttribute('role', 'dialog');
+    wallPicker.setAttribute('aria-modal', 'false');
+    const wallBtn = document.createElement('button');
+    wallPicker.appendChild(wallBtn);
+    wallWin.appendChild(wallPicker);
+    document.body.appendChild(wallWin);
+    wallBtn.focus();
+    expect(canHandleToggleRemoteDesktopShortcut(wallBtn, wallBtn, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(true);
+    wallWin.remove();
+
+    expect(canHandleToggleRemoteDesktopShortcut(rdCanvas, rdCanvas, {
+      hasBlockingOverlay: false,
+      isMobile: true,
+    })).toBe(false);
+    expect(canHandleToggleRemoteDesktopShortcut(rdCanvas, rdCanvas, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+      isComposing: true,
+    })).toBe(false);
+    expect(canHandleToggleRemoteDesktopShortcut(rdCanvas, rdCanvas, {
+      hasBlockingOverlay: true,
+      isMobile: false,
+    })).toBe(false);
+
+    const recorder = document.createElement('button');
+    recorder.setAttribute('data-shortcut-recording', 'true');
+    document.body.appendChild(recorder);
+    expect(canHandleToggleRemoteDesktopShortcut(recorder, recorder, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(false);
+    recorder.remove();
+
+    const modal = document.createElement('div');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    const modalInput = document.createElement('input');
+    modal.appendChild(modalInput);
+    document.body.appendChild(modal);
+    modalInput.focus();
+    expect(canHandleToggleRemoteDesktopShortcut(modalInput, modalInput, {
+      hasBlockingOverlay: false,
+      isMobile: false,
+    })).toBe(false);
+    modal.remove();
+
+    rdWin.remove();
     composer.remove();
   });
 

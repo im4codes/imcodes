@@ -1007,6 +1007,34 @@ describe('generic i18n coverage guard', () => {
     }
   });
 
+  it('keeps settings.shortcuts.actions.toggle_remote_desktop and remote_desktop.shortcut_no_server translated across all 7 locales', () => {
+    const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as Record<string, any>;
+    const enTitle = String(readPath(enMessages, 'settings.shortcuts.actions.toggle_remote_desktop.title') ?? '');
+    const enDesc = String(readPath(enMessages, 'settings.shortcuts.actions.toggle_remote_desktop.desc') ?? '');
+    const enNoServer = String(readPath(enMessages, 'remote_desktop.shortcut_no_server') ?? '');
+    expect(enTitle.trim().length).toBeGreaterThan(0);
+    expect(enDesc.trim().length).toBeGreaterThan(0);
+    expect(enNoServer.trim().length).toBeGreaterThan(0);
+
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      const title = readPath(messages, 'settings.shortcuts.actions.toggle_remote_desktop.title');
+      const desc = readPath(messages, 'settings.shortcuts.actions.toggle_remote_desktop.desc');
+      const noServer = readPath(messages, 'remote_desktop.shortcut_no_server');
+      expect(title, `${locale}:toggle_remote_desktop.title`).toEqual(expect.any(String));
+      expect(desc, `${locale}:toggle_remote_desktop.desc`).toEqual(expect.any(String));
+      expect(noServer, `${locale}:remote_desktop.shortcut_no_server`).toEqual(expect.any(String));
+      expect((title as string).trim().length, `${locale}:toggle_remote_desktop.title`).toBeGreaterThan(0);
+      expect((desc as string).trim().length, `${locale}:toggle_remote_desktop.desc`).toBeGreaterThan(0);
+      expect((noServer as string).trim().length, `${locale}:remote_desktop.shortcut_no_server`).toBeGreaterThan(0);
+      if (locale !== 'en') {
+        expect(title, `${locale}:toggle_remote_desktop.title translated`).not.toBe(enTitle);
+        expect(desc, `${locale}:toggle_remote_desktop.desc translated`).not.toBe(enDesc);
+        expect(noServer, `${locale}:remote_desktop.shortcut_no_server translated`).not.toBe(enNoServer);
+      }
+    }
+  });
+
   it('keeps askQuestion source/jump keys present and translated across all 7 locales', () => {
     const enMessages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales/en.json'), 'utf8')) as Record<string, any>;
     const keys = ['askQuestion.fromTab', 'askQuestion.fromSubSession', 'askQuestion.goToSession'] as const;

@@ -2405,6 +2405,10 @@
         "toggle_task_mode": {
           "title": "切換任務模式 / 工作台",
           "desc": "在全域任務模式與主工作區視圖之間切換"
+        },
+        "toggle_remote_desktop": {
+          "title": "開啟 / 最小化目前伺服器遠端桌面",
+          "desc": "開啟目前所選伺服器的遠端桌面視窗，或最小化並返回工作台（保持連線不斷開）"
         }
       },
       "subsession_quick": {
@@ -5125,7 +5129,8 @@
     "connect_by_id": "透過 ID 連線",
     "access_password": "遠端桌面存取密碼",
     "citation_offline": "{{name}} 目前離線，無法開啟遠端桌面",
-    "citation_unavailable": "{{name}} 暫不支援或未就緒遠端桌面"
+    "citation_unavailable": "{{name}} 暫不支援或未就緒遠端桌面",
+    "shortcut_no_server": "請先選擇一台伺服器再開啟遠端桌面"
   },
   "taskPair": {
     "chip": "{{writer}}：{{verb}}",

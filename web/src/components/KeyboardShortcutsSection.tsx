@@ -74,6 +74,10 @@ const ACTION_LABELS: Record<ShortcutActionId, { titleKey: string; descKey: strin
     titleKey: 'settings.shortcuts.actions.toggle_task_mode.title',
     descKey: 'settings.shortcuts.actions.toggle_task_mode.desc',
   },
+  toggleRemoteDesktop: {
+    titleKey: 'settings.shortcuts.actions.toggle_remote_desktop.title',
+    descKey: 'settings.shortcuts.actions.toggle_remote_desktop.desc',
+  },
 };
 
 type ModifierGroupId = 'subsession' | 'taskPairSplit';

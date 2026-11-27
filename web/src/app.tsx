@@ -129,6 +129,7 @@ import {
   canHandleGlobalNavigationShortcut,
   canHandleOpenSettingsShortcut,
   canHandleReturnToMainWindowShortcut,
+  canHandleToggleRemoteDesktopShortcut,
   canHandleToggleTaskModeShortcut,
   cycleOrderedId,
   formatShortcutKeycaps,
@@ -252,8 +253,9 @@ import {
   openRemoteDesktopWorkspaceHost,
   reorderRemoteDesktopWorkspaceHost,
 } from './remote-desktop-workspace-state.js';
-import { DaemonRemoteDesktopControl } from './components/DaemonRemoteDesktopControl.js';
+import { DaemonRemoteDesktopControl, resolveServerRemoteDesktopTarget } from './components/DaemonRemoteDesktopControl.js';
 import { listControllableMachines, type MachineListItem } from './api/machines.js';
+import { peekMachinesSnapshot, reloadMachines } from './hooks/useMachines.js';
 import { openRemoteDesktopReference } from './remote-desktop-open.js';
 import { ContextDiagnosticsPanel } from './components/ContextDiagnosticsPanel.js';
 import { NewUserGuide, type NewUserGuideStep } from './components/NewUserGuide.js';
@@ -9568,6 +9570,105 @@ function InternalMainApp() {
   remoteDesktopWorkspaceMinimizedRef.current = remoteDesktopWorkspaceMinimized;
   const remoteDesktopWallMinimizedRef = useRef(remoteDesktopWallMinimized);
   remoteDesktopWallMinimizedRef.current = remoteDesktopWallMinimized;
+  const daemonOnlineRef = useRef(daemonOnline);
+  daemonOnlineRef.current = daemonOnline;
+  const minimizeRemoteDesktopSurface = useCallback((
+    selector: string,
+    setMinimized: (value: boolean) => void,
+  ) => {
+    if (typeof document !== 'undefined' && document.fullscreenElement) {
+      const fsEl = document.fullscreenElement;
+      if ((fsEl.closest(selector) || fsEl.querySelector(selector)) && typeof document.exitFullscreen === 'function') {
+        void document.exitFullscreen().catch(() => {});
+      }
+    }
+    setMinimized(true);
+    if (typeof document !== 'undefined' && document.activeElement instanceof HTMLElement) {
+      if (document.activeElement.closest(selector)) {
+        document.activeElement.blur();
+      }
+    }
+    lastAutoFocusedRef.current = null;
+    setSubQuickFocusTick((prev) => prev + 1);
+  }, []);
+  const toggleCurrentServerRemoteDesktop = useCallback(async (eventTarget: EventTarget | null) => {
+    if (isMobileRef.current) return;
+    const targetEl = eventTarget instanceof Element ? eventTarget : null;
+    const activeEl = typeof document !== 'undefined' ? document.activeElement : null;
+    const wallFocused = Boolean(
+      targetEl?.closest('.remote-desktop-wall-window')
+      || activeEl?.closest('.remote-desktop-wall-window'),
+    );
+
+    if (wallFocused && remoteDesktopWallOpenRef.current && !remoteDesktopWallMinimizedRef.current) {
+      minimizeRemoteDesktopSurface('.remote-desktop-wall-window', setRemoteDesktopWallMinimized);
+      return;
+    }
+    if (remoteDesktopWorkspaceOpenRef.current && !remoteDesktopWorkspaceMinimizedRef.current) {
+      minimizeRemoteDesktopSurface('.remote-desktop-workspace-window', setRemoteDesktopWorkspaceMinimized);
+      return;
+    }
+
+    const serverId = selectedServerIdRef.current;
+    const shareTarget = selectedShareTargetNavRef.current;
+    if (!serverId || manualDashboardRef.current || (shareTarget && shareTarget.kind !== 'server')) {
+      showErrorToast(trans('remote_desktop.shortcut_no_server'));
+      return;
+    }
+
+    const serverName = resolvedSelectedServerNameNavRef.current
+      || serversRef.current.find((srv) => srv.id === serverId)?.name
+      || serverId;
+    const capabilities = wsRef.current?.getDaemonCapabilitySnapshot()?.capabilities ?? [];
+    let machinesSnapshot = peekMachinesSnapshot();
+    if (!machinesSnapshot.loaded) {
+      const refreshed = await reloadMachines().catch(() => null);
+      const nextShareTarget = selectedShareTargetNavRef.current;
+      if (
+        selectedServerIdRef.current !== serverId
+        || manualDashboardRef.current
+        || (nextShareTarget && nextShareTarget.kind !== 'server')
+      ) {
+        return;
+      }
+      if (Array.isArray(refreshed)) {
+        machinesSnapshot = { machines: refreshed, loaded: true };
+      }
+    }
+
+    const resolution = resolveServerRemoteDesktopTarget({
+      serverId,
+      serverName,
+      daemonOnline: daemonOnlineRef.current,
+      capabilities,
+      machines: machinesSnapshot.machines,
+    });
+    if (!resolution.target) {
+      showErrorToast(
+        resolution.unavailableReason === 'offline'
+          ? trans('remote_desktop.citation_offline', { name: serverName })
+          : resolution.unavailableReason === 'no_server'
+            ? trans('remote_desktop.shortcut_no_server')
+            : trans('remote_desktop.citation_unavailable', { name: serverName }),
+      );
+      return;
+    }
+
+    const hostKey = remoteDesktopHostKey(resolution.target);
+    const isWallHost = Boolean(
+      hostKey
+      && !remoteDesktopWorkspaceRef.current.hosts[hostKey]
+      && remoteDesktopWallOpenRef.current
+      && remoteDesktopWallHostKeysRef.current.includes(hostKey),
+    );
+    if (isWallHost && !remoteDesktopWallMinimizedRef.current) {
+      minimizeRemoteDesktopSurface('.remote-desktop-wall-window', setRemoteDesktopWallMinimized);
+      return;
+    }
+    openRemoteDesktop(resolution.target);
+  }, [minimizeRemoteDesktopSurface, openRemoteDesktop, showErrorToast, trans]);
+  const toggleCurrentServerRemoteDesktopRef = useRef(toggleCurrentServerRemoteDesktop);
+  toggleCurrentServerRemoteDesktopRef.current = toggleCurrentServerRemoteDesktop;
   const returnToMainWindow = useCallback(() => {
     if (isMobileRef.current) return;
     if (typeof document !== 'undefined' && document.fullscreenElement && typeof document.exitFullscreen === 'function') {
@@ -9936,6 +10037,7 @@ function InternalMainApp() {
 
   useEffect(() => {
     if (isMobile) return;
+    const suppressedKeyUpCodes = new Set<string>();
     const handler = (e: KeyboardEvent) => {
       if (e.defaultPrevented || isImeComposingKeyEvent(e)) return;
       const matched = matchNavigationShortcutBinding(e, resolvedShortcutSlotsRef.current);
@@ -9971,6 +10073,24 @@ function InternalMainApp() {
         e.preventDefault();
         e.stopPropagation();
         setShowTaskMode((prev) => !prev);
+        return;
+      }
+
+      if (matched?.action === 'toggleRemoteDesktop') {
+        if (!canHandleToggleRemoteDesktopShortcut(e.target, document.activeElement, {
+          hasBlockingOverlay: hasBlockingNavigationOverlayRef.current,
+          isMobile,
+          isComposing: isImeComposingKeyEvent(e),
+        })) {
+          return;
+        }
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.repeat) return;
+        if (e.code) {
+          suppressedKeyUpCodes.add(e.code);
+        }
+        void toggleCurrentServerRemoteDesktopRef.current(e.target);
         return;
       }
 
@@ -10062,8 +10182,24 @@ function InternalMainApp() {
       e.stopPropagation();
     };
 
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (!e.code || !suppressedKeyUpCodes.delete(e.code)) return;
+      e.preventDefault();
+      e.stopPropagation();
+    };
+    const onBlur = () => {
+      suppressedKeyUpCodes.clear();
+    };
+
     window.addEventListener('keydown', handler, true);
-    return () => window.removeEventListener('keydown', handler, true);
+    window.addEventListener('keyup', onKeyUp, true);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      suppressedKeyUpCodes.clear();
+      window.removeEventListener('keydown', handler, true);
+      window.removeEventListener('keyup', onKeyUp, true);
+      window.removeEventListener('blur', onBlur);
+    };
   }, [isMobile, navigateServerByStep, navigateTabByStep]);
 
   useEffect(() => {

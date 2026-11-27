@@ -577,6 +577,9 @@ vi.mock('../src/pages/SettingsPage.js', () => ({
       <button onClick={() => onChangeShortcutOverrides?.({ toggleTaskMode: 'Alt+t' })}>
         settings-toggle-task-mode-alt-t
       </button>
+      <button onClick={() => onChangeShortcutOverrides?.({ toggleRemoteDesktop: 'Alt+r' })}>
+        settings-toggle-remote-desktop-alt-r
+      </button>
       <button onClick={onBack}>settings-back</button>
     </div>
   ),
@@ -1264,8 +1267,14 @@ vi.mock('../src/components/RemoteDesktopPanel.js', () => ({
   ),
 }));
 vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
-  RemoteDesktopWorkspace: ({ minimized, onCloseWorkspace, onMinimize, onRestore, zIndex, onFocus }: any) => (
-    <div data-testid="remote-desktop-workspace" style={{ zIndex }} onMouseDown={onFocus}>
+  RemoteDesktopWorkspace: ({ state, minimized, onCloseWorkspace, onMinimize, onRestore, zIndex, onFocus }: any) => (
+    <div
+      class="remote-desktop-workspace-window"
+      data-testid="remote-desktop-workspace"
+      data-active-tab={state?.activeTabId ?? ''}
+      style={{ zIndex }}
+      onMouseDown={onFocus}
+    >
       remote-desktop-workspace
       <span>remote-desktop-minimized:{String(Boolean(minimized))}</span>
       <button onClick={onMinimize}>remote-desktop-minimize</button>
@@ -1276,10 +1285,11 @@ vi.mock('../src/components/RemoteDesktopWorkspace.js', () => ({
 }));
 vi.mock('../src/components/RemoteDesktopWall.js', () => ({
   REMOTE_DESKTOP_WALL_WINDOW_ID: 'remote-desktop-wall',
-  RemoteDesktopWall: ({ minimized, zIndex, onFocus, onClose, onConnectById }: any) => (
-    <div data-testid="remote-desktop-wall" style={{ zIndex }} onMouseDown={onFocus}>
+  RemoteDesktopWall: ({ minimized, zIndex, onFocus, onClose, onConnectById, onHostKeysChange }: any) => (
+    <div class="remote-desktop-wall-window" data-testid="remote-desktop-wall" style={{ zIndex }} onMouseDown={onFocus}>
       remote-desktop-wall
       <span>remote-desktop-wall-minimized:{String(Boolean(minimized))}</span>
+      <button onClick={() => onHostKeysChange?.(['srv-1'])}>remote-desktop-wall-bind-srv1</button>
       <button onClick={() => onConnectById?.()}>remote-desktop-wall-connect-by-id</button>
       <button onClick={() => onClose?.([])}>remote-desktop-wall-close</button>
     </div>
@@ -10622,6 +10632,262 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     window.dispatchEvent(customAltT);
     expect(customAltT.defaultPrevented).toBe(true);
     await waitFor(() => expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy());
+  }, 25000);
+
+  it('toggles current server Remote Desktop (linked node & daemon RD) with Ctrl+Shift+D, prevents keydown/keyup leaks, restores workbench focus, supports custom bindings, and toasts when unavailable', async () => {
+    const { __resetMachinesForTests } = await import('../src/hooks/useMachines.js');
+    const { REMOTE_DESKTOP_CAPABILITY } = await import('@shared/remote-desktop.js');
+    __resetMachinesForTests();
+
+    const originalPlatform = navigator.platform;
+    const origFsEl = Object.getOwnPropertyDescriptor(document, 'fullscreenElement');
+    const origExitFs = Object.getOwnPropertyDescriptor(document, 'exitFullscreen');
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Linux x86_64' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') {
+          return {
+            servers: [
+              { id: 'srv-1', name: 'Alpha', status: 'online', lastHeartbeatAt: Date.now() },
+              { id: 'srv-2', name: 'Beta', status: 'online', lastHeartbeatAt: Date.now() },
+              { id: 'srv-off', name: 'Gamma Offline', status: 'offline', lastHeartbeatAt: Date.now() - 120_000 },
+            ],
+          };
+        }
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [
+              { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            ],
+          };
+        }
+        if (path === '/api/server/srv-2/sessions') {
+          return {
+            sessions: [
+              { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/beta', state: 'idle' },
+            ],
+          };
+        }
+        if (path === '/api/server/srv-off/sessions') {
+          return {
+            sessions: [
+              { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/gamma', state: 'idle' },
+            ],
+          };
+        }
+        if (path === '/api/machines') {
+          return {
+            machines: [
+              {
+                serverId: 'node-linked-1',
+                nodeId: '1000000201',
+                refName: 'alpha-node',
+                displayName: 'Alpha Node',
+                os: 'win',
+                online: true,
+                execEnabled: true,
+                accessRole: 'owner',
+                capabilities: [REMOTE_DESKTOP_CAPABILITY],
+                hostServerId: 'srv-1',
+              },
+            ],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(mainInput));
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(1));
+      await act(async () => {
+        wsInstances[0]!.emitDaemonCapabilities([REMOTE_DESKTOP_CAPABILITY]);
+        wsInstances[0]!.emit({
+          type: 'session_list',
+          sessions: [
+            { name: 'deck_alpha_brain', project: 'alpha', role: 'brain', agentType: 'codex-sdk', runtimeType: 'transport', state: 'idle' },
+          ],
+        });
+      });
+
+      // Wait for shared machine list fetch so linked node resolution is ready
+      await waitFor(() => {
+        expect(apiFetchMock).toHaveBeenCalledWith('/api/machines');
+      });
+
+      // 1. First Ctrl+Shift+D opens linked controlled node for srv-1
+      const openEvt = new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      mainInput.dispatchEvent(openEvt);
+      expect(openEvt.defaultPrevented).toBe(true);
+      const rdWorkspace = await screen.findByTestId('remote-desktop-workspace');
+      expect(rdWorkspace.getAttribute('data-active-tab')).toBe('node-linked-1');
+      expect(screen.getByText('remote-desktop-minimized:false')).toBeTruthy();
+
+      // 2. Inside RD canvas (+ fullscreen), keydown & keyup for Ctrl+Shift+D do NOT leak into canvas, exit fullscreen, minimize RD, and refocus workbench
+      const rdSurface = document.createElement('canvas');
+      rdSurface.className = 'remote-desktop-canvas';
+      rdSurface.setAttribute('data-remote-desktop-surface', 'true');
+      rdSurface.tabIndex = 0;
+      rdWorkspace.appendChild(rdSurface);
+      rdSurface.focus();
+
+      const canvasKeyDowns: string[] = [];
+      const canvasKeyUps: string[] = [];
+      rdSurface.addEventListener('keydown', (ev) => canvasKeyDowns.push(ev.code));
+      rdSurface.addEventListener('keyup', (ev) => canvasKeyUps.push(ev.code));
+
+      const exitFullscreen = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: rdWorkspace });
+      Object.defineProperty(document, 'exitFullscreen', { configurable: true, value: exitFullscreen });
+
+      const minKeyDown = new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      rdSurface.dispatchEvent(minKeyDown);
+      expect(minKeyDown.defaultPrevented).toBe(true);
+      expect(exitFullscreen).toHaveBeenCalledTimes(1);
+
+      const minKeyUp = new KeyboardEvent('keyup', { key: 'd', code: 'KeyD', ctrlKey: true, shiftKey: false, bubbles: true, cancelable: true });
+      rdSurface.dispatchEvent(minKeyUp);
+      expect(minKeyUp.defaultPrevented).toBe(true);
+      expect(canvasKeyDowns).toEqual([]);
+      expect(canvasKeyUps).toEqual([]);
+
+      await waitFor(() => {
+        expect(screen.getByText('remote-desktop-minimized:true')).toBeTruthy();
+        expect(document.activeElement).toBe(mainInput);
+      });
+      Object.defineProperty(document, 'fullscreenElement', { configurable: true, value: null });
+      rdSurface.remove();
+
+      // 3. Third Ctrl+Shift+D restores the minimized workspace
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByText('remote-desktop-minimized:false')).toBeTruthy());
+
+      // Close workspace cleanly, switch to srv-2 (daemon RD only, no linked node)
+      fireEvent.click(screen.getByText('remote-desktop-close'));
+      await waitFor(() => expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull());
+
+      fireEvent.click(screen.getByTestId('server-icon-srv-2'));
+      await screen.findByTestId('pane-composer-deck_beta_brain');
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+      await act(async () => {
+        wsInstances[wsInstances.length - 1]!.emitDaemonCapabilities([REMOTE_DESKTOP_CAPABILITY]);
+        wsInstances[wsInstances.length - 1]!.emit({
+          type: 'session_list',
+          sessions: [
+            { name: 'deck_beta_brain', project: 'beta', role: 'brain', agentType: 'codex-sdk', runtimeType: 'transport', state: 'idle' },
+          ],
+        });
+      });
+
+      // Custom recorded shortcut Alt+r overrides default Ctrl+Shift+D
+      fireEvent.click(screen.getByText('server-settings'));
+      fireEvent.click(await screen.findByText('settings-toggle-remote-desktop-alt-r'));
+      fireEvent.click(screen.getByText('settings-back'));
+
+      const oldCtrlShiftD = new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(oldCtrlShiftD);
+      expect(oldCtrlShiftD.defaultPrevented).toBe(false);
+      expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull();
+
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', code: 'KeyR', altKey: true, bubbles: true, cancelable: true }));
+      const betaWorkspace = await screen.findByTestId('remote-desktop-workspace');
+      expect(betaWorkspace.getAttribute('data-active-tab')).toBe('srv-2');
+      expect(screen.getByText('remote-desktop-minimized:false')).toBeTruthy();
+
+      // Close and switch to offline/unavailable server -> error toast, no blank workspace
+      fireEvent.click(screen.getByText('remote-desktop-close'));
+      await waitFor(() => expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull());
+      fireEvent.click(screen.getByTestId('server-icon-srv-off'));
+      await screen.findByTestId('pane-composer-deck_gamma_brain');
+
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'r', code: 'KeyR', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(view.container.querySelector('.toast.toast-error')).toBeTruthy());
+      expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull();
+    } finally {
+      __resetMachinesForTests();
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+      if (origFsEl) Object.defineProperty(document, 'fullscreenElement', origFsEl);
+      else delete (document as { fullscreenElement?: Element | null }).fullscreenElement;
+      if (origExitFs) Object.defineProperty(document, 'exitFullscreen', origExitFs);
+      else delete (document as { exitFullscreen?: unknown }).exitFullscreen;
+    }
+  }, 25000);
+
+  it('toggles the same Remote Desktop Wall view when current server target resides only on the Wall', async () => {
+    const { __resetMachinesForTests } = await import('../src/hooks/useMachines.js');
+    const { REMOTE_DESKTOP_CAPABILITY } = await import('@shared/remote-desktop.js');
+    __resetMachinesForTests();
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Linux x86_64' });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') {
+          return {
+            servers: [{ id: 'srv-1', name: 'Alpha', status: 'online', lastHeartbeatAt: Date.now() }],
+          };
+        }
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [
+              { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', project_dir: '/work/alpha', state: 'idle' },
+            ],
+          };
+        }
+        if (path === '/api/machines') return { machines: [] };
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+      const { App } = await importApp();
+      render(<App />);
+      const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
+      await waitFor(() => expect(document.activeElement).toBe(mainInput));
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(1));
+      await act(async () => {
+        wsInstances[0]!.emitDaemonCapabilities([REMOTE_DESKTOP_CAPABILITY]);
+        wsInstances[0]!.emit({
+          type: 'session_list',
+          sessions: [
+            { name: 'deck_alpha_brain', project: 'alpha', role: 'brain', agentType: 'codex-sdk', runtimeType: 'transport', state: 'idle' },
+          ],
+        });
+      });
+
+      // Open Wall and bind srv-1 as hosted only inside Wall (not Workspace)
+      fireEvent.click(await screen.findByText('controlled_nodes.title'));
+      fireEvent.click(await screen.findByText('controlled-nodes-wall'));
+      expect(await screen.findByTestId('remote-desktop-wall')).toBeTruthy();
+      fireEvent.click(screen.getByText('remote-desktop-wall-bind-srv1'));
+
+      // Minimize Wall first with Ctrl+0
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '0', code: 'Digit0', ctrlKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByText('remote-desktop-wall-minimized:true')).toBeTruthy());
+
+      // Press 1 of Ctrl+Shift+D restores the Wall (and does not open Workspace)
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByText('remote-desktop-wall-minimized:false')).toBeTruthy());
+      expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull();
+
+      // Press 2 of Ctrl+Shift+D minimizes the same Wall view
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'D', code: 'KeyD', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByText('remote-desktop-wall-minimized:true')).toBeTruthy());
+      expect(screen.queryByTestId('remote-desktop-workspace')).toBeNull();
+    } finally {
+      __resetMachinesForTests();
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
   }, 25000);
 
   it('blocks tab-switching shortcuts when terminal subwindow header chrome has focus, while preserving chat subwindow navigation', async () => {

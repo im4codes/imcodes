@@ -2404,6 +2404,10 @@
         "toggle_task_mode": {
           "title": "タスクモード / ワークスペース切り替え",
           "desc": "グローバルタスクモードとメインワークスペース表示を切り替えます"
+        },
+        "toggle_remote_desktop": {
+          "title": "現在のサーバーのリモートデスクトップを切り替え",
+          "desc": "選択中のサーバーのリモートデスクトップを開き、もう一度押すと最小化してワークスペースに戻ります"
         }
       },
       "subsession_quick": {
@@ -5124,7 +5128,8 @@
     "connect_by_id": "IDで接続",
     "access_password": "アクセスパスワード",
     "citation_offline": "{{name}} はオフラインのため、リモートデスクトップを開けません",
-    "citation_unavailable": "{{name}} ではリモートデスクトップを利用できません"
+    "citation_unavailable": "{{name}} ではリモートデスクトップを利用できません",
+    "shortcut_no_server": "リモートデスクトップを開くにはサーバーを選択してください"
   },
   "taskPair": {
     "chip": "{{writer}}：{{verb}}",

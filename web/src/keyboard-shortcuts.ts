@@ -7,7 +7,8 @@ export type ShortcutActionId =
   | 'tabPrev'
   | 'tabNext'
   | 'subSessionCloseAll'
-  | 'toggleTaskMode';
+  | 'toggleTaskMode'
+  | 'toggleRemoteDesktop';
 
 export const SHORTCUT_ACTION_IDS: readonly ShortcutActionId[] = [
   'serverPrev',
@@ -16,6 +17,7 @@ export const SHORTCUT_ACTION_IDS: readonly ShortcutActionId[] = [
   'tabNext',
   'subSessionCloseAll',
   'toggleTaskMode',
+  'toggleRemoteDesktop',
 ];
 
 export type ShortcutSlot = 'primary' | 'secondary';
@@ -216,7 +218,7 @@ export function isMacPlatform(nav?: {
   return /Macintosh|Mac OS/i.test(userAgent);
 }
 
-/** Unified default primary shortcut map across all desktop platforms (`Alt+I/K/J/L`, `Ctrl+0`, `Ctrl+Shift+T`). */
+/** Unified default primary shortcut map across all desktop platforms (`Alt+I/K/J/L`, `Ctrl+0`, `Ctrl+Shift+T`, `Ctrl+Shift+D`). */
 export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutActionId, string> {
   void isMac;
   return {
@@ -226,6 +228,7 @@ export function getDefaultShortcuts(isMac = isMacPlatform()): Record<ShortcutAct
     tabNext: 'Alt+l',
     subSessionCloseAll: 'Ctrl+0',
     toggleTaskMode: 'Ctrl+Shift+t',
+    toggleRemoteDesktop: 'Ctrl+Shift+d',
   };
 }
 
@@ -239,6 +242,7 @@ export function getDefaultSecondaryShortcuts(isMac = isMacPlatform()): Record<Sh
       tabNext: 'Ctrl+d',
       subSessionCloseAll: null,
       toggleTaskMode: null,
+      toggleRemoteDesktop: null,
     };
   }
   return {
@@ -248,6 +252,7 @@ export function getDefaultSecondaryShortcuts(isMac = isMacPlatform()): Record<Sh
     tabNext: null,
     subSessionCloseAll: null,
     toggleTaskMode: null,
+    toggleRemoteDesktop: null,
   };
 }
 
@@ -940,12 +945,7 @@ export function matchesOpenSettingsShortcut(
   return e.key === ',' || e.code === 'Comma';
 }
 
-/**
- * Determine whether the global Task Mode <-> Workspace toggle shortcut (`toggleTaskMode`)
- * should run. Active in both Workspace (including composer/terminals) and GlobalTaskModeView,
- * while blocking mobile, IME composition, active shortcut recording, and open modal dialogs/settings.
- */
-export function canHandleToggleTaskModeShortcut(
+function canHandleGlobalOverlayAwareShortcut(
   target: EventTarget | null,
   activeElement: Element | null,
   options: {
@@ -966,6 +966,41 @@ export function canHandleToggleTaskModeShortcut(
     return false;
   }
   return true;
+}
+
+/**
+ * Determine whether the global Task Mode <-> Workspace toggle shortcut (`toggleTaskMode`)
+ * should run. Active in both Workspace (including composer/terminals) and GlobalTaskModeView,
+ * while blocking mobile, IME composition, active shortcut recording, and open modal dialogs/settings.
+ */
+export function canHandleToggleTaskModeShortcut(
+  target: EventTarget | null,
+  activeElement: Element | null,
+  options: {
+    hasBlockingOverlay: boolean;
+    isMobile: boolean;
+    isComposing?: boolean;
+  },
+): boolean {
+  return canHandleGlobalOverlayAwareShortcut(target, activeElement, options);
+}
+
+/**
+ * Determine whether the global current-server Remote Desktop toggle shortcut (`toggleRemoteDesktop`)
+ * should run. Active across the desktop Workspace (including composer, `.xterm` terminals, and open
+ * Remote Desktop / Wall surfaces), while blocking mobile, IME composition, active shortcut recording,
+ * and open modal dialogs/settings.
+ */
+export function canHandleToggleRemoteDesktopShortcut(
+  target: EventTarget | null,
+  activeElement: Element | null,
+  options: {
+    hasBlockingOverlay: boolean;
+    isMobile: boolean;
+    isComposing?: boolean;
+  },
+): boolean {
+  return canHandleGlobalOverlayAwareShortcut(target, activeElement, options);
 }
 
 function isTerminalOrRemoteSurfaceElement(el: Element | null): boolean {

@@ -71,6 +71,8 @@ vi.mock('react-i18next', () => ({
         'settings.shortcuts.actions.subsession_close_all.desc': 'Minimize open windows that support minimizing (sub-sessions, Remote Desktop, Desktop Wall) and close other floating overlays',
         'settings.shortcuts.actions.toggle_task_mode.title': 'Toggle Task Mode / Workspace',
         'settings.shortcuts.actions.toggle_task_mode.desc': 'Switch between Global Task Mode and the main Workspace view',
+        'settings.shortcuts.actions.toggle_remote_desktop.title': 'Toggle Current Server Remote Desktop',
+        'settings.shortcuts.actions.toggle_remote_desktop.desc': 'Open or minimize the active server remote desktop window and return to the workspace',
         'settings.shortcuts.subsession_quick.title': 'Sub-session Quick Shortcuts',
         'settings.shortcuts.subsession_quick.desc': 'Choose modifiers for 1–9 open or minimize.',
         'settings.shortcuts.subsession_quick.open_label': 'Toggle sub-session #',
@@ -139,6 +141,7 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByText('Next Tab')).toBeDefined();
     expect(screen.getByText('Return to Main Window')).toBeDefined();
     expect(screen.getByText('Toggle Task Mode / Workspace')).toBeDefined();
+    expect(screen.getByText('Toggle Current Server Remote Desktop')).toBeDefined();
 
     cleanup();
     render(<KeyboardShortcutsSection isMacOverride={true} />);
@@ -158,6 +161,10 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('⇧');
     expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('T');
     expect(screen.getByTestId('shortcut-record-toggleTaskMode-secondary').textContent).toContain('Not set');
+    expect(screen.getByTestId('shortcut-record-toggleRemoteDesktop').textContent).toContain('⌃');
+    expect(screen.getByTestId('shortcut-record-toggleRemoteDesktop').textContent).toContain('⇧');
+    expect(screen.getByTestId('shortcut-record-toggleRemoteDesktop').textContent).toContain('D');
+    expect(screen.getByTestId('shortcut-record-toggleRemoteDesktop-secondary').textContent).toContain('Not set');
     // macOS secondary defaults preserve Ctrl+W/S/A/D
     expect(screen.getByTestId('shortcut-record-serverPrev-secondary').textContent).toContain('⌃');
     expect(screen.getByTestId('shortcut-record-serverPrev-secondary').textContent).toContain('W');
@@ -230,6 +237,9 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('Ctrl');
     expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('Shift');
     expect(screen.getByTestId('shortcut-record-toggleTaskMode').textContent).toContain('T');
+    expect(screen.getByTestId('shortcut-record-toggleRemoteDesktop').textContent).toContain('Ctrl');
+    expect(screen.getByTestId('shortcut-record-toggleRemoteDesktop').textContent).toContain('Shift');
+    expect(screen.getByTestId('shortcut-record-toggleRemoteDesktop').textContent).toContain('D');
     // Windows / Linux secondary defaults are unassigned
     expect(screen.getByTestId('shortcut-record-tabPrev-secondary').textContent).toContain('Not set');
     expect((screen.getByTestId('shortcut-clear-tabPrev-secondary') as HTMLButtonElement).disabled).toBe(true);
@@ -502,6 +512,36 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(toggleTaskBtn.textContent).toContain('T');
     fireEvent.click(screen.getByTestId('shortcut-clear-toggleTaskMode-secondary'));
     expect(toggleTaskSecondaryBtn.textContent).toContain('Not set');
+
+    // Interactive recording, persistence, conflict reassignment, clear & reset on toggleRemoteDesktop
+    const toggleRdBtn = screen.getByTestId('shortcut-record-toggleRemoteDesktop');
+    expect(toggleRdBtn.textContent).toContain('Ctrl');
+    expect(toggleRdBtn.textContent).toContain('Shift');
+    expect(toggleRdBtn.textContent).toContain('D');
+
+    fireEvent.click(toggleRdBtn);
+    expect(toggleRdBtn.getAttribute('data-shortcut-recording')).toBe('true');
+    fireEvent.keyDown(document, { key: 'r', code: 'KeyR', altKey: true });
+    expect(toggleRdBtn.textContent).toContain('Alt');
+    expect(toggleRdBtn.textContent).toContain('R');
+    expect(saveUserPrefMock).toHaveBeenCalledWith(
+      KEYBOARD_SHORTCUTS_PREF_KEY,
+      expect.stringContaining('"toggleRemoteDesktop":"Alt+r"'),
+      expect.anything(),
+    );
+
+    // Assigning Alt+r onto tabNext clears toggleRemoteDesktop primary cleanly (conflict reassignment)
+    fireEvent.click(screen.getByTestId('shortcut-record-tabNext'));
+    fireEvent.keyDown(document, { key: 'r', code: 'KeyR', altKey: true });
+    expect(toggleRdBtn.textContent).toContain('Not set');
+    fireEvent.click(screen.getByTestId('shortcut-reset-tabNext'));
+
+    fireEvent.click(screen.getByTestId('shortcut-clear-toggleRemoteDesktop'));
+    expect(toggleRdBtn.textContent).toContain('Not set');
+    fireEvent.click(screen.getByTestId('shortcut-reset-toggleRemoteDesktop'));
+    expect(toggleRdBtn.textContent).toContain('Ctrl');
+    expect(toggleRdBtn.textContent).toContain('Shift');
+    expect(toggleRdBtn.textContent).toContain('D');
   });
 
   it('configures Mac inline voice double-tap modifier (Shift/Ctrl/Option/Cmd/Disabled) and persists to keyboard_shortcuts_v1', () => {

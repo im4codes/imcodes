@@ -2405,6 +2405,10 @@
         "toggle_task_mode": {
           "title": "Alternar Modo Tareas / Espacio de trabajo",
           "desc": "Cambiar entre el Modo Tareas global y la vista principal del espacio de trabajo"
+        },
+        "toggle_remote_desktop": {
+          "title": "Alternar escritorio remoto del servidor actual",
+          "desc": "Abre la ventana de escritorio remoto del servidor seleccionado o la minimiza para volver al espacio de trabajo"
         }
       },
       "subsession_quick": {
@@ -5125,7 +5129,8 @@
     "connect_by_id": "Conectar por ID",
     "access_password": "Contraseña de acceso",
     "citation_offline": "{{name}} está sin conexión",
-    "citation_unavailable": "El escritorio remoto no está disponible en {{name}}"
+    "citation_unavailable": "El escritorio remoto no está disponible en {{name}}",
+    "shortcut_no_server": "Selecciona un servidor para abrir el escritorio remoto"
   },
   "taskPair": {
     "chip": "{{writer}}: {{verb}}",

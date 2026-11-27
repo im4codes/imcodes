@@ -95,6 +95,82 @@ export interface DaemonRemoteDesktopControlProps {
   canSetUp?: boolean;
 }
 
+export interface ResolveServerRemoteDesktopTargetInput {
+  serverId: string | null | undefined;
+  serverName?: string | null;
+  daemonOnline: boolean;
+  capabilities?: readonly string[];
+  machines: readonly MachineListItem[];
+}
+
+export interface ServerRemoteDesktopTargetResolution {
+  target: MachineListItem | null;
+  linkedNode: MachineListItem | null;
+  linkedOpenable: boolean;
+  ready: boolean;
+  unavailableReason: 'no_server' | 'offline' | 'unavailable' | null;
+}
+
+/**
+ * Resolve the Remote Desktop target for the currently selected server:
+ * prefer an openable linked controlled node on the same machine so sign-in
+ * screens stay unified, or fall back to the daemon's built-in Remote Desktop.
+ */
+export function resolveServerRemoteDesktopTarget({
+  serverId,
+  serverName,
+  daemonOnline,
+  capabilities = [],
+  machines,
+}: ResolveServerRemoteDesktopTargetInput): ServerRemoteDesktopTargetResolution {
+  const ready = capabilities.includes(REMOTE_DESKTOP_CAPABILITY);
+  if (!serverId) {
+    return {
+      target: null,
+      linkedNode: null,
+      linkedOpenable: false,
+      ready,
+      unavailableReason: 'no_server',
+    };
+  }
+  const linkedNode = machines.find((machine) => machine.hostServerId === serverId) ?? null;
+  const linkedOpenable = linkedNode !== null && canOpenRemoteDesktopMachine(linkedNode);
+  if (!daemonOnline && !linkedOpenable) {
+    return {
+      target: null,
+      linkedNode,
+      linkedOpenable: false,
+      ready,
+      unavailableReason: 'offline',
+    };
+  }
+  if (linkedOpenable && linkedNode) {
+    return {
+      target: linkedNode,
+      linkedNode,
+      linkedOpenable: true,
+      ready,
+      unavailableReason: null,
+    };
+  }
+  if (ready) {
+    return {
+      target: daemonRemoteDesktopMachine(serverId, serverName ?? null),
+      linkedNode,
+      linkedOpenable: false,
+      ready: true,
+      unavailableReason: null,
+    };
+  }
+  return {
+    target: null,
+    linkedNode,
+    linkedOpenable: false,
+    ready: false,
+    unavailableReason: linkedNode && !linkedNode.online ? 'offline' : 'unavailable',
+  };
+}
+
 /**
  * Remote control for the daemon's own machine.
  *
@@ -166,7 +242,18 @@ export function DaemonRemoteDesktopControl({
     });
   }, [ws]);
 
-  const ready = capabilities.includes(REMOTE_DESKTOP_CAPABILITY);
+  const {
+    target: resolvedTarget,
+    linkedNode,
+    linkedOpenable,
+    ready,
+  } = resolveServerRemoteDesktopTarget({
+    serverId,
+    serverName,
+    daemonOnline,
+    capabilities,
+    machines: machineList,
+  });
 
   // A completed login-screen install enrolled a node for this machine; pick it
   // up without the user reloading, since it is what the button steers to next.
@@ -183,12 +270,6 @@ export function DaemonRemoteDesktopControl({
     || capabilities.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY);
   if (!serverId || !daemonOnline) return null;
 
-  // A controlled node enrolled from (or linked to) this daemon is the same
-  // physical machine. Opening it instead of the daemon is what keeps one
-  // desktop to one session, and it is the only one of the two that reaches the
-  // sign-in screen.
-  const linkedNode = machineList.find((machine) => machine.hostServerId === serverId) ?? null;
-  const linkedOpenable = linkedNode !== null && canOpenRemoteDesktopMachine(linkedNode);
   // A Linux or macOS daemon that can install the controlled node itself: the
   // owner confirms once, the daemon runs the same install as the copyable
   // command, and the node enrols linked to this daemon.
@@ -228,10 +309,7 @@ export function DaemonRemoteDesktopControl({
     }
     : undefined;
 
-  if (ready || linkedOpenable) {
-    const target = linkedOpenable && linkedNode
-      ? linkedNode
-      : daemonRemoteDesktopMachine(serverId, serverName ?? null);
+  if (resolvedTarget) {
     const control = (
       <>
         <button
@@ -242,7 +320,7 @@ export function DaemonRemoteDesktopControl({
           aria-label={linkedOpenable && linkedNode
             ? t('remote_desktop.daemon_control_linked', { machine: linkedNode.displayName })
             : t('remote_desktop.daemon_control')}
-          onClick={() => onOpen(target)}
+          onClick={() => onOpen(resolvedTarget)}
           onContextMenu={openSetupFromContextMenu}
         >
           <RemoteDesktopGlyphIcon size={17} />{compact ? '' : ` ${t('remote_desktop.daemon_control')}`}

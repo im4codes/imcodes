@@ -2404,6 +2404,10 @@
         "toggle_task_mode": {
           "title": "작업 모드 / 작업 공간 전환",
           "desc": "전역 작업 모드와 기본 작업 공간 보기 사이를 전환합니다"
+        },
+        "toggle_remote_desktop": {
+          "title": "현재 서버 원격 데스크톱 전환",
+          "desc": "선택한 서버의 원격 데스크톱을 열거나 최소화하고 작업 공간으로 돌아갑니다"
         }
       },
       "subsession_quick": {
@@ -5124,7 +5128,8 @@
     "connect_by_id": "ID로 연결",
     "access_password": "접속 비밀번호",
     "citation_offline": "{{name}}이(가) 오프라인 상태여서 원격 데스크톱을 열 수 없습니다",
-    "citation_unavailable": "{{name}}에서 원격 데스크톱을 사용할 수 없습니다"
+    "citation_unavailable": "{{name}}에서 원격 데스크톱을 사용할 수 없습니다",
+    "shortcut_no_server": "원격 데스크톱을 열려면 먼저 서버를 선택하세요"
   },
   "taskPair": {
     "chip": "{{writer}}: {{verb}}",

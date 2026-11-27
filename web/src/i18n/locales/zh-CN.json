@@ -2405,6 +2405,10 @@
         "toggle_task_mode": {
           "title": "切换任务模式 / 工作台",
           "desc": "在全局任务模式与主工作区视图之间切换"
+        },
+        "toggle_remote_desktop": {
+          "title": "打开 / 最小化当前服务器远程桌面",
+          "desc": "打开当前所选服务器的远程桌面窗口，或最小化并返回工作台（保持连接不断开）"
         }
       },
       "subsession_quick": {
@@ -5135,7 +5139,8 @@
     "connect_by_id": "通过 ID 连接",
     "access_password": "远桌访问密码",
     "citation_offline": "{{name}} 当前离线，无法打开远程桌面",
-    "citation_unavailable": "{{name}} 暂不支持或未就绪远程桌面"
+    "citation_unavailable": "{{name}} 暂不支持或未就绪远程桌面",
+    "shortcut_no_server": "请先选择一台服务器再打开远程桌面"
   },
   "taskPair": {
     "chip": "{{writer}}：{{verb}}",

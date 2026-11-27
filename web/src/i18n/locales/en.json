@@ -2405,6 +2405,10 @@
         "toggle_task_mode": {
           "title": "Toggle Task Mode / Workspace",
           "desc": "Switch between Global Task Mode and the main Workspace view"
+        },
+        "toggle_remote_desktop": {
+          "title": "Toggle Current Server Remote Desktop",
+          "desc": "Open or minimize the active server's remote desktop window and return to the workspace"
         }
       },
       "subsession_quick": {
@@ -5135,7 +5139,8 @@
     "connect_by_id": "Connect by ID",
     "access_password": "Access password",
     "citation_offline": "{{name}} is offline",
-    "citation_unavailable": "Remote desktop is not available on {{name}}"
+    "citation_unavailable": "Remote desktop is not available on {{name}}",
+    "shortcut_no_server": "Select a server to open remote desktop"
   },
   "taskPair": {
     "chip": "{{writer}}: {{verb}}",

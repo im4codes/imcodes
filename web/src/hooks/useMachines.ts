@@ -61,6 +61,20 @@ export function useMachines(query?: string): UseMachinesResult {
   };
 }
 
+/** Read the current shared controllable-machine snapshot without subscribing. */
+export function peekMachinesSnapshot(): { machines: MachineListItem[]; loaded: boolean } {
+  const snapshot = machineResource.peek();
+  return {
+    machines: snapshot.value ?? [],
+    loaded: snapshot.loaded,
+  };
+}
+
+/** Reload shared controllable-machine data into the shared cache. */
+export function reloadMachines(): Promise<MachineListItem[] | null> {
+  return machineResource.reload();
+}
+
 /** Test-only: dispose the shared machine resource between test cases. */
 export function __resetMachinesForTests(): void {
   machineResource.disposeForTests();

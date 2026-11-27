@@ -605,4 +605,67 @@ describe('DaemonRemoteDesktopControl', () => {
       expect(svg.querySelector('path')).toBeTruthy();
     });
   });
+
+  it('resolveServerRemoteDesktopTarget prefers openable linked nodes, falls back to daemon RD, and distinguishes offline vs unavailable', async () => {
+    const { resolveServerRemoteDesktopTarget } = await import('../../src/components/DaemonRemoteDesktopControl.js');
+    const linkedOnline = {
+      serverId: 'node-1',
+      refName: 'winbox',
+      displayName: 'WinBox',
+      online: true,
+      execEnabled: true,
+      accessRole: 'owner' as const,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      hostServerId: 'srv-1',
+    };
+    const linkedOffline = { ...linkedOnline, online: false };
+
+    // Prefers openable linked node even when daemon also has RD capability
+    expect(resolveServerRemoteDesktopTarget({
+      serverId: 'srv-1',
+      serverName: 'Srv 1',
+      daemonOnline: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      machines: [linkedOnline],
+    })).toMatchObject({ target: linkedOnline, linkedOpenable: true, unavailableReason: null });
+
+    // Falls back to daemon RD when linked node is offline or absent
+    expect(resolveServerRemoteDesktopTarget({
+      serverId: 'srv-1',
+      serverName: 'Srv 1',
+      daemonOnline: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      machines: [linkedOffline],
+    })).toMatchObject({
+      target: { serverId: 'srv-1', displayName: 'Srv 1' },
+      linkedOpenable: false,
+      unavailableReason: null,
+    });
+
+    // Offline daemon + offline linked node -> offline reason
+    expect(resolveServerRemoteDesktopTarget({
+      serverId: 'srv-1',
+      serverName: 'Srv 1',
+      daemonOnline: false,
+      capabilities: [],
+      machines: [linkedOffline],
+    })).toMatchObject({ target: null, unavailableReason: 'offline' });
+
+    // Online daemon without RD capability and no openable linked node -> unavailable reason
+    expect(resolveServerRemoteDesktopTarget({
+      serverId: 'srv-1',
+      serverName: 'Srv 1',
+      daemonOnline: true,
+      capabilities: [],
+      machines: [],
+    })).toMatchObject({ target: null, unavailableReason: 'unavailable' });
+
+    // Missing serverId -> no_server reason
+    expect(resolveServerRemoteDesktopTarget({
+      serverId: null,
+      daemonOnline: false,
+      capabilities: [],
+      machines: [],
+    })).toMatchObject({ target: null, unavailableReason: 'no_server' });
+  });
 });
