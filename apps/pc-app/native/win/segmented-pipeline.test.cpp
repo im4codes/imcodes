@@ -978,6 +978,19 @@ int main() {
     assert(strip_voice_hotword_hallucination("请你对比 IM.codes, Claude Code, Codex。", terms) ==
            "请你对比 IM.codes, Claude Code, Codex。");
 
+    // Round 2 cross-sentence Rule A freeze & exact Unicode separator category parity:
+    assert(strip_voice_hotword_hallucination("IM.codes，IM.codes。IM.codes 很好用。", terms) ==
+           "IM.codes 很好用。");
+    assert(strip_voice_hotword_hallucination("我常用 IM.codes。IM.codes，IM.codes。", terms) ==
+           "我常用 IM.codes。");
+    assert(strip_voice_hotword_hallucination("IM.codes。IM.codes。你好", terms) == "你好");
+    assert(strip_voice_hotword_hallucination("你好。IM.codes。IM.codes。", terms) == "你好。");
+    assert(strip_voice_hotword_hallucination("IM.codes，IM.codes。IM.codes，IM.codes。你好", terms) == "你好");
+    assert(strip_voice_hotword_hallucination("你好。IM.codes，IM.codes。IM.codes，IM.codes。", terms) == "你好。");
+    assert(strip_voice_hotword_hallucination("IM.codes，IM.codes。👍🏽可以。", terms) == "👍🏽可以。");
+    assert(strip_voice_hotword_hallucination("IM.codes，IM.codes。〇也是一个数字。", terms) == "〇也是一个数字。");
+    assert(strip_voice_hotword_hallucination("〇。IM.codes，IM.codes。", terms) == "〇。");
+
     // Verify injectable NFKC normalizer hook works cleanly at both full-string and cluster level, then restore default.
     set_hotword_nfkc_normalizer_for_testing([](const std::string& s) -> std::string {
       std::string out = s;
@@ -1102,6 +1115,75 @@ int main() {
       }
     }
     assert(final_noise.empty());
+
+    // 18d: Round 2 P0 #3 counterexample: >cap cross-segment pure single-hotword repeats
+    //      ("IM.codes" in seg 1 + "IM.codes" in seg 2) must sanitize merged text to "".
+    std::vector<std::string> emitted_dup;
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> dup_pipeline(
+        [&](const std::vector<float>&) -> std::string { return "IM.codes"; },
+        [&](const std::string& line) { emitted_dup.push_back(line); },
+        16000,
+        20000,
+        std::vector<std::string>{"IM.codes"});
+    dup_pipeline.preload(std::vector<float>(24000, 0.2f));
+    std::thread worker_d([&]() { dup_pipeline.run_loop(); });
+    dup_pipeline.request_stop(false, true);
+    worker_d.join();
+    std::string final_dup = "UNSET";
+    for (const auto& line : emitted_dup) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_dup = extract_json_string_field(line, "text").value_or("UNSET");
+      }
+    }
+    assert(final_dup.empty());
+
+    // 18e: >cap incremental retraction of cross-segment "IM.codes"+"IM.codes" followed by real text
+    //      must not resurrect retracted "IM.codes".
+    std::vector<std::string> emitted_cross_retract;
+    std::mutex mu_cr;
+    std::condition_variable cv_cr;
+    int pass_cr = 0;
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> cross_retract_pipeline(
+        [&](const std::vector<float>&) -> std::string {
+          int p = 0;
+          {
+            std::lock_guard<std::mutex> lock(mu_cr);
+            p = ++pass_cr;
+          }
+          cv_cr.notify_all();
+          if (p == 1) return "IM.codes";
+          if (p == 2) return "IM.codes";
+          return "保留这一句";
+        },
+        [&](const std::string& line) {
+          std::lock_guard<std::mutex> lock(mu_cr);
+          emitted_cross_retract.push_back(line);
+        },
+        32000,
+        40000,
+        std::vector<std::string>{"IM.codes"});
+    std::thread worker_cr([&]() { cross_retract_pipeline.run_loop(); });
+    cross_retract_pipeline.push(std::vector<float>(32000, 0.2f));
+    wait_until_or_fail(mu_cr, cv_cr, [&]() { return pass_cr >= 1; }, "18e seg 1");
+    cross_retract_pipeline.push(std::vector<float>(kInitialPartialSamples, 0.2f));
+    wait_until_or_fail(mu_cr, cv_cr, [&]() { return pass_cr >= 2; }, "18e seg 2 retract");
+    cross_retract_pipeline.push(std::vector<float>(kStepPartialSamples, 0.2f));
+    wait_until_or_fail(mu_cr, cv_cr, [&]() { return pass_cr >= 3; }, "18e seg 2 real");
+    cross_retract_pipeline.request_stop(false, true);
+    worker_cr.join();
+    std::string final_cr;
+    for (const auto& line : emitted_cross_retract) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_cr = extract_json_string_field(line, "text").value_or("");
+      }
+    }
+    assert(final_cr == "保留这一句");
   }
 
   std::printf("segmented-pipeline tests passed\n");

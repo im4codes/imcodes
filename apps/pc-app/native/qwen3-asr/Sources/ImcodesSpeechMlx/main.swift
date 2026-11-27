@@ -717,8 +717,17 @@ func trimTrailingSilence(
     return Array(samples[clampedStart..<end])
 }
 
+private func isSupportedHotwordSymbol(_ ch: Character) -> Bool {
+    switch ch {
+    case "~", "`", "+", "=", "|", "<", ">", "$", "¥", "€", "£", "°", "^", "\u{2026}", "\u{2022}", "\u{00B7}":
+        return true
+    default:
+        return false
+    }
+}
+
 private func isHotwordHallucinationSeparator(_ ch: Character) -> Bool {
-    return ch.isWhitespace || ch.isPunctuation || ch.isSymbol
+    return ch.isWhitespace || ch.isPunctuation || isSupportedHotwordSymbol(ch)
 }
 
 private func isHotwordSentenceEndChar(_ ch: Character) -> Bool {
@@ -934,19 +943,24 @@ private func findSwiftLeadingRuleACut(
 
         if map.isSep[pos] {
             let nextPos = pos + 1
+            let isSentEnd = map.isSentenceEnd[pos]
             if canStartFresh {
                 completedSep[nextPos] = true
             }
             if let runMap {
                 for (tid, len) in runMap {
-                    recordRun(&sepRun, nextPos, tid, len)
                     if len >= 2 { completedSep[nextPos] = true }
+                    if !(len >= 2 && isSentEnd) {
+                        recordRun(&sepRun, nextPos, tid, len)
+                    }
                 }
             }
             if let immMap {
                 for (tid, len) in immMap {
-                    recordRun(&sepRun, nextPos, tid, len)
                     if len >= 2 { completedSep[nextPos] = true }
+                    if !(len >= 2 && isSentEnd) {
+                        recordRun(&sepRun, nextPos, tid, len)
+                    }
                 }
             }
         }
@@ -1142,19 +1156,28 @@ private func findSwiftTrailingRuleACut(
 
         let prevClusterStart = map.clusterStart[pos - 1]
         if map.isSep[prevClusterStart] {
+            var sepHasEnd = false
+            for k in prevClusterStart..<pos where map.isSentenceEnd[k] {
+                sepHasEnd = true
+                break
+            }
             if canEndFresh {
                 completedSep[prevClusterStart] = true
             }
             if let runMap {
                 for (tid, len) in runMap {
-                    recordRun(&sepRun, prevClusterStart, tid, len)
                     if len >= 2 { completedSep[prevClusterStart] = true }
+                    if !(len >= 2 && sepHasEnd) {
+                        recordRun(&sepRun, prevClusterStart, tid, len)
+                    }
                 }
             }
             if let immMap {
                 for (tid, len) in immMap {
-                    recordRun(&sepRun, prevClusterStart, tid, len)
                     if len >= 2 { completedSep[prevClusterStart] = true }
+                    if !(len >= 2 && sepHasEnd) {
+                        recordRun(&sepRun, prevClusterStart, tid, len)
+                    }
                 }
             }
         }
@@ -1933,22 +1956,51 @@ final class QwenSegmentedDecodeEngine {
                                 )
                             }
                             let baseCommitted = isFinalWholeUtterance ? "" : committedText
-                            let combined = joinTranscriptSegments(baseCommitted, activeText)
-                            if isFinalWholeUtterance && !combined.isEmpty {
-                                committedText = ""
-                            }
-                            if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
-                                lastEmittedText = combined
-                                pendingRetractionFinal = false
-                                if isFinalPass && hasRealNonHotword {
-                                    retractedSegmentSingleHotword = false
+                            let rawCombined = joinTranscriptSegments(baseCommitted, activeText)
+                            let combined = stripVoiceHotwordHallucination(
+                                rawCombined,
+                                hotwordTerms: hotwordTerms,
+                                allowSingle: false
+                            )
+                            if !rawCombined.isEmpty && combined.isEmpty {
+                                // Cross-segment concatenation formed a pure repeated-hotword hallucination:
+                                // retract instead of emitting "IM.codes IM.codes".
+                                activeText = ""
+                                activePendingSingleHotword = false
+                                confirmedTokens = []
+                                activeSegmentTrimStart = nil
+                                if !committedHasTrustedRealText {
+                                    committedText = ""
                                 }
-                                if !emitJsonIfNotAborted([
-                                    "type": "result",
-                                    "text": combined,
-                                    "isFinal": isFinalPass,
-                                ]) {
-                                    break
+                                retractedSegmentSingleHotword = true
+                                if !lastEmittedText.isEmpty || isFinalPass {
+                                    lastEmittedText = ""
+                                    pendingRetractionFinal = !isFinalPass
+                                    if !emitJsonIfNotAborted([
+                                        "type": "result",
+                                        "text": "",
+                                        "isFinal": isFinalPass,
+                                    ]) {
+                                        break
+                                    }
+                                }
+                            } else {
+                                if isFinalWholeUtterance && !combined.isEmpty {
+                                    committedText = ""
+                                }
+                                if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
+                                    lastEmittedText = combined
+                                    pendingRetractionFinal = false
+                                    if isFinalPass && hasRealNonHotword {
+                                        retractedSegmentSingleHotword = false
+                                    }
+                                    if !emitJsonIfNotAborted([
+                                        "type": "result",
+                                        "text": combined,
+                                        "isFinal": isFinalPass,
+                                    ]) {
+                                        break
+                                    }
                                 }
                             }
                         }
@@ -1958,7 +2010,13 @@ final class QwenSegmentedDecodeEngine {
                         break
                     }
                     if isFinalPass && (!lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal) {
-                        let finalCombined = !lastEmittedText.isEmpty ? lastEmittedText : committedText
+                        let rawFinal = !lastEmittedText.isEmpty ? lastEmittedText : committedText
+                        let sanitizedFinal = hotwordTerms.isEmpty
+                            ? rawFinal
+                            : stripVoiceHotwordHallucination(rawFinal, hotwordTerms: hotwordTerms, allowSingle: false)
+                        let finalCombined = (retractedSegmentSingleHotword && !committedHasTrustedRealText && !sanitizedFinal.isEmpty && stripVoiceHotwordHallucination(sanitizedFinal, hotwordTerms: hotwordTerms, allowSingle: true).isEmpty)
+                            ? ""
+                            : sanitizedFinal
                         pendingRetractionFinal = false
                         _ = emitJsonIfNotAborted([
                             "type": "result",
@@ -1969,10 +2027,19 @@ final class QwenSegmentedDecodeEngine {
                 }
 
                 if !isFinalPass && currentLen >= maxSegmentSamples {
+                    let nextCommitted = hotwordTerms.isEmpty
+                        ? joinTranscriptSegments(committedText, activeText)
+                        : stripVoiceHotwordHallucination(
+                            joinTranscriptSegments(committedText, activeText),
+                            hotwordTerms: hotwordTerms,
+                            allowSingle: false
+                        )
                     if !activeTrustedRealText.isEmpty || (hotwordTerms.isEmpty && !activeText.isEmpty) {
                         committedHasTrustedRealText = true
+                    } else if nextCommitted.isEmpty && !committedHasTrustedRealText {
+                        committedHasTrustedRealText = false
                     }
-                    committedText = joinTranscriptSegments(committedText, activeText)
+                    committedText = nextCommitted
                     activeText = ""
                     activeTrustedRealText = ""
                     activePendingSingleHotword = false

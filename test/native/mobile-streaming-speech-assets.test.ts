@@ -4129,6 +4129,44 @@ do {
     check(stripVoiceHotwordHallucination("\u{1100}\u{1161}, \u{AC00}。你好", hotwordTerms: ["\u{AC00}"]) == "你好", "case 10 hangul jamo leading")
     check(stripVoiceHotwordHallucination("Café, Cafe\u{0301}。你好", hotwordTerms: ["Café"]) == "你好", "case 10 latin nfd/nfc")
     check(stripVoiceHotwordHallucination("code\u{0301}, code。你好", hotwordTerms: ["code"]) == "code\u{0301}, code。你好", "case 10 distinct accent intact")
+    // Round 2 cross-sentence Rule A freeze & exact Unicode separator category parity:
+    check(stripVoiceHotwordHallucination("IM.codes，IM.codes。IM.codes 很好用。", hotwordTerms: matrixTerms) == "IM.codes 很好用。", "case 10 cross-sentence fwd intact")
+    check(stripVoiceHotwordHallucination("我常用 IM.codes。IM.codes，IM.codes。", hotwordTerms: matrixTerms) == "我常用 IM.codes。", "case 10 cross-sentence bwd intact")
+    check(stripVoiceHotwordHallucination("IM.codes。IM.codes。你好", hotwordTerms: matrixTerms) == "你好", "case 10 independent period chain fwd")
+    check(stripVoiceHotwordHallucination("你好。IM.codes。IM.codes。", hotwordTerms: matrixTerms) == "你好。", "case 10 independent period chain bwd")
+    check(stripVoiceHotwordHallucination("IM.codes，IM.codes。IM.codes，IM.codes。你好", hotwordTerms: matrixTerms) == "你好", "case 10 two independent repeat blocks fwd")
+    check(stripVoiceHotwordHallucination("你好。IM.codes，IM.codes。IM.codes，IM.codes。", hotwordTerms: matrixTerms) == "你好。", "case 10 two independent repeat blocks bwd")
+    check(stripVoiceHotwordHallucination("IM.codes，IM.codes。👍🏽可以。", hotwordTerms: matrixTerms) == "👍🏽可以。", "case 10 emoji preserved")
+    check(stripVoiceHotwordHallucination("IM.codes，IM.codes。〇也是一个数字。", hotwordTerms: matrixTerms) == "〇也是一个数字。", "case 10 CJK zero 〇 preserved")
+    check(stripVoiceHotwordHallucination("〇。IM.codes，IM.codes。", hotwordTerms: matrixTerms) == "〇。", "case 10 trailing stripped after 〇")
+}
+
+// 11. Swift QwenSegmentedDecodeEngine >cap cross-segment pure hotword repeats must strip to "" instead of emitting "IM.codes IM.codes"
+do {
+    var emitted: [[String: Any]] = []
+    let done = DispatchSemaphore(value: 0)
+    let engine = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 8_000,
+        strideSamples: 8_000,
+        maxSegmentSamples: 16_000,
+        maxFinalReDecodeSamples: 20_000,
+        rollbackTokenCount: 0,
+        expectLanguageHeader: false,
+        hotwordTerms: ["IM.codes"],
+        decodeFn: { _, _, checkCancel in
+            try checkCancel()
+            return QwenSegmentedDecodeResult(text: "IM.codes", tokens: [101])
+        },
+        rollbackPrefixFn: { tokens, _, _ in tokens },
+        emitJsonFn: { payload in emitted.append(payload) },
+        onLoopFinishedFn: { done.signal() }
+    )
+    engine.preload([Float](repeating: 0.2, count: 24_000))
+    DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
+    engine.requestStop(abort: false, producerAlsoFinished: true)
+    check(done.wait(timeout: .now() + 5) == .success, "case 11 done")
+    let finals = emitted.filter { ($0["isFinal"] as? Bool) == true }
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "", "case 11 final must be empty: \\(finals)")
 }
 print("MAC_SEGMENTED_DECODE:PASS")
 `);

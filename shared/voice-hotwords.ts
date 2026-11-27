@@ -1304,19 +1304,26 @@ function findLeadingRuleACut(
 
     if (isSep[pos] === 1) {
       const nextPos = pos + charLen;
+      const isSentEnd = map.isSentenceEnd[pos] === 1;
       if (canStartFresh) {
         completedSep[nextPos] = 1;
       }
       if (runMap) {
         for (const [tid, len] of runMap.entries()) {
-          recordRun(sepRun, nextPos, tid, len);
           if (len >= 2) completedSep[nextPos] = 1;
+          // Freeze an already-qualified run at strong sentence boundaries so a following
+          // single hotword mention in body text cannot inherit the prior run.
+          if (!(len >= 2 && isSentEnd)) {
+            recordRun(sepRun, nextPos, tid, len);
+          }
         }
       }
       if (immMap) {
         for (const [tid, len] of immMap.entries()) {
-          recordRun(sepRun, nextPos, tid, len);
           if (len >= 2) completedSep[nextPos] = 1;
+          if (!(len >= 2 && isSentEnd)) {
+            recordRun(sepRun, nextPos, tid, len);
+          }
         }
       }
     }
@@ -1533,7 +1540,7 @@ function findTrailingRuleACut(
   matcher: CompiledHallucinationMatcher,
   map: NormalizedClusterMap,
 ): number {
-  const { normText, normClusterStart, isSep } = map;
+  const { normText, normClusterStart, isSep, isSentenceEnd } = map;
   const n = normText.length;
   if (n === 0) return n;
 
@@ -1565,19 +1572,32 @@ function findTrailingRuleACut(
 
     const prevClusterStart = normClusterStart[pos - 1]!;
     if (isSep[prevClusterStart] === 1) {
+      let sepHasEnd = false;
+      for (let k = prevClusterStart; k < pos; k += 1) {
+        if (isSentenceEnd[k] === 1) {
+          sepHasEnd = true;
+          break;
+        }
+      }
       if (canEndFresh) {
         completedSep[prevClusterStart] = 1;
       }
       if (runMap) {
         for (const [tid, len] of runMap.entries()) {
-          recordRun(sepRun, prevClusterStart, tid, len);
           if (len >= 2) completedSep[prevClusterStart] = 1;
+          // Freeze an already-qualified trailing run at strong sentence boundaries so an
+          // earlier single hotword mention inside body text cannot inherit it.
+          if (!(len >= 2 && sepHasEnd)) {
+            recordRun(sepRun, prevClusterStart, tid, len);
+          }
         }
       }
       if (immMap) {
         for (const [tid, len] of immMap.entries()) {
-          recordRun(sepRun, prevClusterStart, tid, len);
           if (len >= 2) completedSep[prevClusterStart] = 1;
+          if (!(len >= 2 && sepHasEnd)) {
+            recordRun(sepRun, prevClusterStart, tid, len);
+          }
         }
       }
     }
