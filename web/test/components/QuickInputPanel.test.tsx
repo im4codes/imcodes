@@ -1979,4 +1979,98 @@ describe('useQuickData persistence guard', () => {
     expect(serverSnapshot.sessionHistoryTimestamps?.s1).toEqual({ B: 3000, A: 2000 });
     view.unmount();
   });
+
+  it('publishes rebased state synchronously into live resource when a concurrent edit C happens mid-GET so subsequent edit D + pagehide preserve B and all timestamps', async () => {
+    setMockAuthIdentity('user-1', 'https://host.test/app');
+    let quick!: ReturnType<typeof useQuickData>;
+    function MidFetchEditHarness() {
+      quick = useQuickData();
+      return <div data-testid="hist">{quick.data.history.join(',')}</div>;
+    }
+
+    let serverSnapshot: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
+    let serverVersion = 'v1:0';
+    let getCount = 0;
+    let resolveVisibilityGet!: (val: unknown) => void;
+
+    apiFetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === '/api/quick-data' && (!init?.method || init.method === 'GET')) {
+        getCount += 1;
+        if (getCount === 1) {
+          return Promise.resolve({ data: serverSnapshot, version: serverVersion });
+        }
+        return new Promise((resolve) => {
+          resolveVisibilityGet = resolve;
+        });
+      }
+      if (url === '/api/quick-data' && init?.method === 'PUT') {
+        const parsed = JSON.parse(String(init.body)) as { data: QuickData; expectedVersion?: string };
+        expect(parsed.expectedVersion).toBe('v1:1');
+        if (parsed.expectedVersion !== serverVersion) {
+          const err = new Error('API 409: version_conflict') as Error & { status: number; body: string };
+          err.status = 409;
+          err.body = JSON.stringify({ error: 'version_conflict', data: serverSnapshot, version: serverVersion });
+          return Promise.reject(err);
+        }
+        serverSnapshot = parsed.data;
+        serverVersion = 'v1:2';
+        return Promise.resolve({ ok: true, version: serverVersion });
+      }
+      return Promise.resolve({ ok: true });
+    });
+
+    const view = render(<MidFetchEditHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    // User records A (ts=1000) in 2s debounce window (bound initially to v1:0).
+    vi.setSystemTime(1000);
+    act(() => { quick.recordHistory('A', 's1'); });
+    expect(screen.getByTestId('hist').textContent).toBe('A');
+
+    // Foreground visibility refresh GET starts and suspends mid-flight.
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    await waitFor(() => expect(typeof resolveVisibilityGet).toBe('function'));
+
+    // While GET is still in flight, user records C (ts=1500), bumping shared resource mutationVersion.
+    vi.setSystemTime(1500);
+    act(() => { quick.recordHistory('C', 's1'); });
+    expect(screen.getByTestId('hist').textContent).toBe('C,A');
+
+    // Suspended GET now resolves returning B (ts=2000) / v1:1 committed by another device.
+    serverSnapshot = {
+      history: ['B'],
+      sessionHistory: { s1: ['B'] },
+      historyTimestamps: { B: 2000 },
+      sessionHistoryTimestamps: { s1: { B: 2000 } },
+      commands: [],
+      phrases: [],
+    };
+    serverVersion = 'v1:1';
+    await act(async () => {
+      resolveVisibilityGet({ data: serverSnapshot, version: serverVersion });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Live UI AND localStorage backup MUST BOTH include B (must NOT stay stuck at C,A)!
+    expect(screen.getByTestId('hist').textContent).toBe('B,C,A');
+    const [pendingKey] = listPendingKeysForScope('https://host.test/app|user-1');
+    expect(pendingKey).toBeDefined();
+    const pendingPayload = JSON.parse(localStorage.getItem(pendingKey!)!) as { target: QuickData };
+    expect(pendingPayload.target.history).toEqual(['B', 'C', 'A']);
+
+    // Next edit D (ts=3000) + immediate pagehide MUST include B, C, A, D + all timestamps!
+    vi.setSystemTime(3000);
+    act(() => { quick.recordHistory('D', 's1'); });
+    expect(screen.getByTestId('hist').textContent).toBe('D,B,C,A');
+
+    window.dispatchEvent(new Event('pagehide'));
+    await waitFor(() => expect(serverVersion).toBe('v1:2'));
+    expect(serverSnapshot.history).toEqual(['D', 'B', 'C', 'A']);
+    expect(serverSnapshot.historyTimestamps).toEqual({ D: 3000, B: 2000, C: 1500, A: 1000 });
+    expect(serverSnapshot.sessionHistory.s1).toEqual(['D', 'B', 'C', 'A']);
+    expect(serverSnapshot.sessionHistoryTimestamps?.s1).toEqual({ D: 3000, B: 2000, C: 1500, A: 1000 });
+    view.unmount();
+  });
 });

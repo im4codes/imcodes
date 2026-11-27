@@ -1222,7 +1222,12 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
             ),
           );
         }
-        return applyPendingAdds(rebasedTarget);
+        const rebasedView = applyPendingAdds(rebasedTarget);
+        quickDataResource.mutate(rebasedView);
+        return rebasedView;
+      }
+      if (hadPriorHydration && _inFlightSaves > 0) {
+        return normalizeQuickData(quickDataResource.peek().value ?? applyPendingAdds(server));
       }
       _serverVersion = serverVersion;
       const shouldReplayPending = _debounceTimer === null && _inFlightSaves === 0;
@@ -1309,7 +1314,10 @@ function installQuickDataVisibilityListener(): void {
 }
 
 function updateQuickData(updater: (prev: QuickData) => QuickData, preOp?: PreHydrationOp): void {
-  const prev = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
+  const peeked = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
+  const prev = _pendingSaveTuple !== null && _debounceTimer !== null
+    ? normalizeQuickData(_pendingSaveTuple.target)
+    : peeked;
   const next = updater(prev);
   if (next === prev) return;
   if (!_hasHydratedFromServer) {
