@@ -154,6 +154,128 @@ function loadRawTrustedPeersObject(filePath: string): Record<string, unknown> {
   return {};
 }
 
+function extractTrustedPeerEntryKey(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return trimmed && validateEd25519SpkiPublicKey(trimmed) ? trimmed : null;
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const candidate = (value as { publicKeyB64?: unknown }).publicKeyB64;
+    if (typeof candidate === 'string') {
+      const trimmed = candidate.trim();
+      return trimmed && validateEd25519SpkiPublicKey(trimmed) ? trimmed : null;
+    }
+  }
+  return null;
+}
+
+export type TrustedPeerLookupResult =
+  | { status: 'pinned'; publicKey: string }
+  | { status: 'absent' }
+  | { status: 'missing'; store: Record<string, unknown> }
+  | { status: 'error'; reason: string };
+
+export type PinTrustedPeerIfMissingResult =
+  | { ok: true; created: boolean; publicKey: string }
+  | { ok: false; reason: string; writeFailed?: boolean };
+
+/**
+ * Strictly inspect the local trust store for `peerServerId`, distinguishing an absent store
+ * or readable store missing that peer from unreadable/corrupted stores or malformed peer entries.
+ */
+export function readTrustedPeerLookupStrict(
+  filePath: string,
+  peerServerId: string,
+): TrustedPeerLookupResult {
+  const normalizedId = peerServerId.trim();
+  if (!normalizedId || normalizedId.length > 128 || /[\s\0]/.test(normalizedId)) {
+    return { status: 'error', reason: 'invalid_peer_server_id' };
+  }
+
+  let rawText: string;
+  try {
+    rawText = readFileSync(filePath, 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      return { status: 'absent' };
+    }
+    return { status: 'error', reason: `trust_store_unreadable:${code ?? 'io_error'}` };
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    return { status: 'error', reason: 'trust_store_corrupt_json' };
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { status: 'error', reason: 'trust_store_invalid_shape' };
+  }
+
+  const store = { ...(parsed as Record<string, unknown>) };
+  if (!Object.prototype.hasOwnProperty.call(store, normalizedId)) {
+    return { status: 'missing', store };
+  }
+
+  const publicKey = extractTrustedPeerEntryKey(store[normalizedId]);
+  if (!publicKey) {
+    return { status: 'error', reason: `trust_store_corrupt_entry:${normalizedId}` };
+  }
+  return { status: 'pinned', publicKey };
+}
+
+/**
+ * Atomically persist a TOFU peer public key only when the trust store is absent or readable
+ * without an entry for `peerServerId`. Never overwrites an existing entry or unreadable store.
+ */
+export function pinTrustedPeerIfMissing(
+  filePath: string,
+  peerServerId: string,
+  publicKeyB64: string,
+): PinTrustedPeerIfMissingResult {
+  const normalizedId = peerServerId.trim();
+  if (!normalizedId || normalizedId.length > 128 || /[\s\0]/.test(normalizedId)) {
+    return { ok: false, reason: 'invalid_peer_server_id' };
+  }
+  const normalizedKey = publicKeyB64.trim();
+  if (!validateEd25519SpkiPublicKey(normalizedKey)) {
+    return { ok: false, reason: 'invalid_ed25519_public_key' };
+  }
+
+  const state = readTrustedPeerLookupStrict(filePath, normalizedId);
+  if (state.status === 'error') {
+    return { ok: false, reason: state.reason };
+  }
+  if (state.status === 'pinned') {
+    if (state.publicKey === normalizedKey) {
+      return { ok: true, created: false, publicKey: state.publicKey };
+    }
+    return { ok: false, reason: 'peer_already_pinned_mismatch' };
+  }
+
+  const store: Record<string, unknown> = state.status === 'missing' ? { ...state.store } : {};
+  const fingerprint = computePortForwardIdentityFingerprint(normalizedKey);
+  store[normalizedId] = {
+    algorithm: 'Ed25519',
+    publicKeyB64: normalizedKey,
+    fingerprint,
+    updatedAt: Date.now(),
+  };
+  try {
+    writePrivateJsonAtomic(filePath, store);
+    return { ok: true, created: true, publicKey: normalizedKey };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    return {
+      ok: false,
+      reason: `trust_store_write_failed:${code ?? (err instanceof Error ? err.message : 'io_error')}`,
+      writeFailed: true,
+    };
+  }
+}
+
 /**
  * Read locally pinned peer public keys from disk (relay-independent trust store).
  */
@@ -163,14 +285,8 @@ export function loadTrustedPeerPublicKeys(filePath: string): Map<string, string>
   for (const [k, v] of Object.entries(raw)) {
     const peerId = k.trim();
     if (!peerId) continue;
-    let pub = '';
-    if (typeof v === 'string') {
-      pub = v.trim();
-    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
-      const candidate = (v as { publicKeyB64?: unknown }).publicKeyB64;
-      if (typeof candidate === 'string') pub = candidate.trim();
-    }
-    if (pub && validateEd25519SpkiPublicKey(pub)) {
+    const pub = extractTrustedPeerEntryKey(v);
+    if (pub) {
       map.set(peerId, pub);
     }
   }

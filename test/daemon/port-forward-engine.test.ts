@@ -1,6 +1,6 @@
 import { createDecipheriv, createHash, createHmac, hkdfSync, randomBytes } from 'node:crypto';
 import { createSocket } from 'node:dgram';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
 import { connect as tcpConnect, createServer as createTcpServer, type Server as NetServer, type Socket as NetSocket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -25,6 +25,7 @@ import {
   generateEphemeralEcdhKeyPair,
   loadTrustedPeerPublicKeys,
   signPortForwardTranscript,
+  upsertTrustedPeerPublicKey,
 } from '../../src/daemon/port-forward-crypto.js';
 import { PORT_FORWARD_STRICT_TRUST_ENV, PortForwardEngine } from '../../src/daemon/port-forward-engine.js';
 import { probeStunCandidates } from '../../src/daemon/port-forward-stun.js';
@@ -1207,5 +1208,163 @@ describe('PortForwardEngine 3-tier transport & mux suites', () => {
       strictEngine.closeAll();
       expect(strictMsgs.some((m) => m.type === PORT_FORWARD_MSG.ERROR && m.error.includes('untrusted_peer_identity'))).toBe(true);
     }
+    delete process.env[PORT_FORWARD_STRICT_TRUST_ENV];
+
+    // 6. Custom resolveTrustedPeerPublicKey returning null MUST stay fail-closed even if trustOnFirstUse: true is passed
+    const resolverBypassFile = join(tmpRoot, 'resolver-bypass-peers.json');
+    const resolverMsgs: PortForwardWireMessage[] = [];
+    const resolverEngine = new PortForwardEngine({
+      sendWs: (m) => { resolverMsgs.push(m); },
+      identityKeyPair: idA,
+      trustedPeersFilePath: resolverBypassFile,
+      resolveTrustedPeerPublicKey: () => null,
+      trustOnFirstUse: true,
+    });
+    const tidResolver = 'pf_resolver_no_tofu_01';
+    const capResolver = randomBytes(32).toString('base64url');
+    const macResolver = deriveAdmissionMacKey(capResolver, tidResolver);
+    await resolverEngine.handleMessage({
+      type: PORT_FORWARD_MSG.PREPARE,
+      tunnelId: tidResolver,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      capability: capResolver,
+      selfServerId: 'node_a',
+      peerServerId: 'node_unknown',
+      listenHost: '127.0.0.1',
+      listenPort: 0,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      iceServers: [],
+      ttlMs: 60_000,
+    });
+    await resolverEngine.handleMessage({
+      type: PORT_FORWARD_MSG.CONNECT,
+      tunnelId: tidResolver,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      peerCandidates: [],
+      peerPublicKey: peerBEcdh.publicKeyB64,
+      peerKeyProof: computeEphemeralKeyProof(macResolver, {
+        tunnelId: tidResolver,
+        role: PORT_FORWARD_ROLE.TARGET,
+        selfServerId: 'node_unknown',
+        peerServerId: 'node_a',
+        publicKey: peerBEcdh.publicKeyB64,
+      }),
+      peerIdentityPublicKey: peerB.publicKeyB64,
+      peerIdentitySignature: signPortForwardTranscript(peerB.privateKey, {
+        tunnelId: tidResolver,
+        role: PORT_FORWARD_ROLE.TARGET,
+        selfServerId: 'node_unknown',
+        peerServerId: 'node_a',
+        capability: capResolver,
+        ecdhPublicKey: peerBEcdh.publicKeyB64,
+        candidates: [],
+      }),
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    resolverEngine.closeAll();
+    expect(resolverMsgs.some((m) => m.type === PORT_FORWARD_MSG.ERROR && m.error.includes('untrusted_peer_identity'))).toBe(true);
+    expect(existsSync(resolverBypassFile)).toBe(false);
+
+    // 7. Unreadable or corrupted existing trust store inside a writable directory MUST fail closed and NEVER overwrite existing pins
+    const sendSignedConnect = async (
+      engine: PortForwardEngine,
+      tunnelId: string,
+      peerServerId: string,
+      peerIdent: ReturnType<typeof generateEndpointIdentityKeyPair>,
+    ) => {
+      const cap = randomBytes(32).toString('base64url');
+      const mac = deriveAdmissionMacKey(cap, tunnelId);
+      const ecdh = generateEphemeralEcdhKeyPair();
+      await engine.handleMessage({
+        type: PORT_FORWARD_MSG.PREPARE,
+        tunnelId,
+        role: PORT_FORWARD_ROLE.LISTEN,
+        capability: cap,
+        selfServerId: 'node_a',
+        peerServerId,
+        listenHost: '127.0.0.1',
+        listenPort: 0,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+        iceServers: [],
+        ttlMs: 60_000,
+      });
+      await engine.handleMessage({
+        type: PORT_FORWARD_MSG.CONNECT,
+        tunnelId,
+        role: PORT_FORWARD_ROLE.LISTEN,
+        peerCandidates: [],
+        peerPublicKey: ecdh.publicKeyB64,
+        peerKeyProof: computeEphemeralKeyProof(mac, {
+          tunnelId,
+          role: PORT_FORWARD_ROLE.TARGET,
+          selfServerId: peerServerId,
+          peerServerId: 'node_a',
+          publicKey: ecdh.publicKeyB64,
+        }),
+        peerIdentityPublicKey: peerIdent.publicKeyB64,
+        peerIdentitySignature: signPortForwardTranscript(peerIdent.privateKey, {
+          tunnelId,
+          role: PORT_FORWARD_ROLE.TARGET,
+          selfServerId: peerServerId,
+          peerServerId: 'node_a',
+          capability: cap,
+          ecdhPublicKey: ecdh.publicKeyB64,
+          candidates: [],
+        }),
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      });
+    };
+
+    // 7a. EACCES on existing trust file inside writable dir -> unrelated new peer MUST fail closed and preserve original pin
+    const eaccesDir = join(tmpRoot, 'eacces-writable-dir');
+    const eaccesFile = join(eaccesDir, 'peers.json');
+    const existingPinId = generateEndpointIdentityKeyPair();
+    upsertTrustedPeerPublicKey(eaccesFile, 'node_existing', existingPinId.publicKeyB64);
+    chmodSync(eaccesFile, 0o000);
+    cleanupCallbacks.push(() => {
+      try { chmodSync(eaccesFile, 0o600); } catch { /* ignore */ }
+    });
+    const eaccesMsgs: PortForwardWireMessage[] = [];
+    const eaccesEngine = new PortForwardEngine({
+      sendWs: (m) => { eaccesMsgs.push(m); },
+      identityKeyPair: idA,
+      trustedPeersFilePath: eaccesFile,
+    });
+    await sendSignedConnect(eaccesEngine, 'pf_eacces_new_peer_01', 'node_unrelated_new', peerB);
+    await sendSignedConnect(eaccesEngine, 'pf_eacces_old_peer_02', 'node_existing', peerB);
+    eaccesEngine.closeAll();
+    expect(eaccesMsgs.filter((m) => m.type === PORT_FORWARD_MSG.ERROR && m.reason === PORT_FORWARD_ERRORS.SCOPED_AUTH)).toHaveLength(2);
+    chmodSync(eaccesFile, 0o600);
+    expect(loadTrustedPeerPublicKeys(eaccesFile).get('node_existing')).toBe(existingPinId.publicKeyB64);
+    expect(loadTrustedPeerPublicKeys(eaccesFile).has('node_unrelated_new')).toBe(false);
+
+    // 7b. Corrupt JSON file -> fail closed and keep exact bytes untouched
+    const corruptJsonFile = join(tmpRoot, 'corrupt-json.json');
+    writeFileSync(corruptJsonFile, '{not-valid-json', 'utf8');
+    const corruptJsonMsgs: PortForwardWireMessage[] = [];
+    const corruptJsonEngine = new PortForwardEngine({
+      sendWs: (m) => { corruptJsonMsgs.push(m); },
+      identityKeyPair: idA,
+      trustedPeersFilePath: corruptJsonFile,
+    });
+    await sendSignedConnect(corruptJsonEngine, 'pf_corrupt_json_0001', 'node_unrelated_new', peerB);
+    corruptJsonEngine.closeAll();
+    expect(corruptJsonMsgs.some((m) => m.type === PORT_FORWARD_MSG.ERROR && m.error.includes('trust_store_corrupt_json'))).toBe(true);
+    expect(readFileSync(corruptJsonFile, 'utf8')).toBe('{not-valid-json');
+
+    // 7c. Malformed record for target peer -> fail closed and do not overwrite entry
+    const corruptEntryFile = join(tmpRoot, 'corrupt-entry.json');
+    const corruptPayload = JSON.stringify({ node_corrupt: { publicKeyB64: 'invalid-key' } });
+    writeFileSync(corruptEntryFile, corruptPayload, 'utf8');
+    const corruptEntryMsgs: PortForwardWireMessage[] = [];
+    const corruptEntryEngine = new PortForwardEngine({
+      sendWs: (m) => { corruptEntryMsgs.push(m); },
+      identityKeyPair: idA,
+      trustedPeersFilePath: corruptEntryFile,
+    });
+    await sendSignedConnect(corruptEntryEngine, 'pf_corrupt_entry_001', 'node_corrupt', peerB);
+    corruptEntryEngine.closeAll();
+    expect(corruptEntryMsgs.some((m) => m.type === PORT_FORWARD_MSG.ERROR && m.error.includes('trust_store_corrupt_entry'))).toBe(true);
+    expect(readFileSync(corruptEntryFile, 'utf8')).toBe(corruptPayload);
   });
 });
