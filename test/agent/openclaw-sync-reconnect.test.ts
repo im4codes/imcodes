@@ -208,6 +208,7 @@ import {
 import {
   getTransportRuntime,
   launchTransportSession,
+  resolveSessionName,
   stopTransportRuntimeSession,
   unregisterProviderRoute,
 } from '../../src/agent/session-manager.js';
@@ -556,5 +557,115 @@ describe('OpenClaw reconnect syncOcSessions + registry serialization', () => {
     expect(instanceA.endSessionCalls).toBe(0);
     expect(instanceA.createSessionCalls).toBe(0);
     expect(getTransportRuntime('deck_agent___main')).toBeUndefined();
+  });
+
+  it('aborts ordinary refresh materialization when gateway B replaces A and B returns an empty session list', async () => {
+    const serverLink = { send: vi.fn() };
+    state.listSessionsHook = (inst) => (
+      inst.index === 1
+        ? [{ key: 'agent___main___main', displayName: 'A Only Main' }]
+        : []
+    );
+    await connectProvider('openclaw', { url: 'ws://127.0.0.1:18789', token: 'tok-a' });
+    const instanceA = state.instances[0]!;
+    // Reset A calls after initial connectProvider materialized nothing (wait: let's ensure clean unmaterialized state before refresh).
+    await stopTransportRuntimeSession('deck_agent___main').catch(() => {});
+    unregisterProviderRoute('agent___main___main');
+    state.store.delete('deck_agent___main');
+    instanceA.createSessionCalls = 0;
+
+    let identityEnteredResolve!: () => void;
+    const identityEntered = new Promise<void>((res) => { identityEnteredResolve = res; });
+    let identityGateResolve!: () => void;
+    const identityGate = new Promise<void>((res) => { identityGateResolve = res; });
+    let gatedOnce = false;
+    state.identityHook = async () => {
+      if (!gatedOnce) {
+        gatedOnce = true;
+        identityEnteredResolve();
+        await identityGate;
+      }
+      return undefined;
+    };
+
+    const { syncOcSessions } = await import('../../src/daemon/oc-session-sync.js');
+    // Ordinary refresh lists A-only main session (no local record yet) and blocks on identity prefetch.
+    const refreshPromise = syncOcSessions(serverLink as any);
+    await identityEntered;
+
+    // Concurrent reconnect disconnects A and connects B, which returns an empty list [].
+    const reconnectPromise = connectProvider('openclaw', { url: 'ws://127.0.0.1:18790', token: 'tok-b' });
+    await vi.waitFor(() => {
+      expect(instanceA.disconnected).toBe(true);
+      expect(state.instances.length).toBe(2);
+    });
+    const instanceB = state.instances[1]!;
+
+    identityGateResolve();
+    await Promise.all([refreshPromise, reconnectPromise]);
+
+    // Stale A session MUST NOT be materialized onto replacement gateway B.
+    expect(instanceA.createSessionCalls).toBe(0);
+    expect(instanceB.createSessionCalls).toBe(0);
+    expect(getTransportRuntime('deck_agent___main')).toBeUndefined();
+    expect(state.store.get('deck_agent___main')).toBeUndefined();
+    expect(resolveSessionName('agent___main___main')).toBeUndefined();
+  });
+
+  it('does not reuse a timed-out connectTimeProvider handoff after disconnectProvider before identity completes', async () => {
+    process.env.IMCODES_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS = '80';
+    state.listSessionsResult = [{ key: 'agent___main___main', displayName: 'OpenClaw Main' }];
+
+    let identityEnteredResolve!: () => void;
+    const identityEntered = new Promise<void>((res) => { identityEnteredResolve = res; });
+    let identityGateResolve!: () => void;
+    const identityGate = new Promise<void>((res) => { identityGateResolve = res; });
+    let gatedOnce = false;
+    state.identityHook = async () => {
+      if (!gatedOnce) {
+        gatedOnce = true;
+        identityEnteredResolve();
+        await identityGate;
+      }
+      return undefined;
+    };
+
+    const outerLaunch = launchTransportSession({
+      name: 'deck_agent___main',
+      projectName: 'deck_agent___main',
+      role: 'w1',
+      agentType: 'openclaw',
+      projectDir: '/tmp/oc-main',
+      bindExistingKey: 'agent___main___main',
+      skipCreate: true,
+    });
+    await identityEntered;
+
+    // connectProvider hands P1 to outerLaunch, waits 80ms timeout in syncOcSessions, and finishes.
+    await connectProvider('openclaw', { url: 'ws://127.0.0.1:18789', token: 'tok-1' });
+    const instance1 = state.instances[0]!;
+
+    // Disconnect removes P1 BEFORE identityGate releases.
+    await disconnectProvider('openclaw');
+    expect(instance1.disconnected).toBe(true);
+    expect(getProvider('openclaw')).toBeUndefined();
+
+    identityGateResolve();
+    await outerLaunch;
+
+    // outerLaunch MUST NOT touch disconnected P1; it must connect fresh P2 via ensureProviderConnected.
+    expect(instance1.createSessionCalls).toBe(0);
+    expect(state.instances.length).toBe(2);
+    const instance2 = state.instances[1]!;
+    expect(instance2.disconnected).toBe(false);
+    expect(instance2.createSessionCalls).toBe(1);
+
+    const runtime = getTransportRuntime('deck_agent___main');
+    expect(runtime).toBeDefined();
+    expect(runtime!.send('hello on fresh P2')).toBe('sent');
+    await vi.waitFor(() => {
+      expect(instance2.sendCalls).toHaveLength(1);
+    });
+    expect(instance1.sendCalls).toHaveLength(0);
   });
 });

@@ -132,7 +132,10 @@ export async function syncOcSessions(
     return;
   }
   const isSuperseded = (): boolean => getProvider('openclaw') !== provider;
-  const connectLaunchProvider = connectTimeProvider ? { connectTimeProvider } : {};
+  const syncLaunchProvider = {
+    expectedProvider: provider,
+    ...(connectTimeProvider ? { connectTimeProvider } : {}),
+  };
 
   let sessions: RemoteSessionInfo[];
   try {
@@ -187,7 +190,7 @@ export async function syncOcSessions(
             label: mainLabel,
             projectDir: mainSessionProjectDir(group.agentName),
             bindExistingKey: group.mainSession.key, skipCreate: true, skipStore: true,
-            ...connectLaunchProvider,
+            ...syncLaunchProvider,
           });
           if (isSuperseded()) return;
           upsertSession({ ...mainRecord!, state: 'idle', label: mainLabel, updatedAt: Date.now() });
@@ -214,7 +217,7 @@ export async function syncOcSessions(
               description: normalizeOpenClawDisplayName(group.mainSession.displayName),
               bindExistingKey: group.mainSession.key,
               skipCreate: true,
-              ...connectLaunchProvider,
+              ...syncLaunchProvider,
             };
             await launchTransportSession(opts);
             if (isSuperseded()) return;
@@ -247,7 +250,7 @@ export async function syncOcSessions(
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
-              ...connectLaunchProvider,
+              ...syncLaunchProvider,
             });
             if (isSuperseded()) return;
             const newLabel = preferredOpenClawLabel(storeEntry.label, ch.displayName, ch.key);
@@ -283,7 +286,7 @@ export async function syncOcSessions(
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
-              ...connectLaunchProvider,
+              ...syncLaunchProvider,
             });
             if (isSuperseded()) return;
             // Update store: mark running, set parentSession + label (preserve existing label)
@@ -333,7 +336,7 @@ export async function syncOcSessions(
           bindExistingKey: ch.key,
           skipCreate: true,
           parentSession: mName,
-          ...connectLaunchProvider,
+          ...syncLaunchProvider,
         };
         await launchTransportSession(opts);
         if (isSuperseded()) return;

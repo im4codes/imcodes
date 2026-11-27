@@ -1304,6 +1304,8 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   onPostLaunchReady?: () => Promise<unknown> | unknown;
   /** Internal: queue-protected pre-connected provider passed by connect-time sync in provider-registry. */
   connectTimeProvider?: TransportProvider;
+  /** Internal: source provider whose remote listing authorized this launch; aborts if replaced/disconnected. */
+  expectedProvider?: TransportProvider;
 }
 
 export interface SessionRelaunchOverrides {
@@ -3897,11 +3899,19 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
   }
 
   let provider: TransportProvider;
+  const cachedPreConnected = launchState?.preConnectedProvider;
   if (opts.connectTimeProvider) {
     provider = opts.connectTimeProvider;
-  } else if (launchState?.preConnectedProvider) {
-    provider = launchState.preConnectedProvider;
+  } else if (cachedPreConnected && getProvider(agentType) === cachedPreConnected) {
+    provider = cachedPreConnected;
   } else {
+    if (launchState && cachedPreConnected && getProvider(agentType) !== cachedPreConnected) {
+      // Handoff only unblocks waiting; if reconnect/disconnect already replaced it, never trust stale handle.
+      launchState.preConnectedProvider = undefined;
+    }
+    if (opts.expectedProvider && getProvider(agentType) !== opts.expectedProvider) {
+      throw new Error(`Provider ${agentType} superseded before session launch`);
+    }
     const controller = new AbortController();
     const handoffPromise = new Promise<TransportProvider>((resolve) => {
       if (launchState) launchState.resolveProviderHandoff = resolve;
@@ -3916,6 +3926,23 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     }
   }
   const providerTrackedInRegistry = !opts.connectTimeProvider && getProvider(agentType) === provider;
+  const assertLaunchProviderCurrent = async (
+    stage: string,
+    runtimeToKill?: TransportSessionRuntime,
+  ): Promise<void> => {
+    const liveProvider = getProvider(agentType);
+    const staleSource = Boolean(
+      opts.expectedProvider && (liveProvider !== opts.expectedProvider || provider !== opts.expectedProvider),
+    );
+    const staleRegistry = Boolean(providerTrackedInRegistry && liveProvider !== provider);
+    if (staleSource || staleRegistry) {
+      if (runtimeToKill) {
+        await runtimeToKill.kill({ detachProviderSession: true }).catch(() => {});
+      }
+      throw new Error(`Provider ${agentType} changed ${stage}`);
+    }
+  };
+  await assertLaunchProviderCurrent('before session prepare');
 
   const launchRecord = getSession(name);
   const launchRecipient = recipientFromSessionRecord(launchRecord) ?? {
@@ -4223,12 +4250,7 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     ? existing.hookCredential
     : mintHookCredential();
   // Create session on provider
-  if (providerTrackedInRegistry) {
-    const currentProvider = launchState?.preConnectedProvider ?? getProvider(agentType);
-    if (currentProvider !== provider) {
-      throw new Error(`Provider ${agentType} changed before session initialize`);
-    }
-  }
+  await assertLaunchProviderCurrent('before session initialize');
   const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
   await runtime.initialize({
     ...(opts.incognito ? { incognito: true } : {}),
@@ -4281,13 +4303,7 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     await runtime.kill({ detachProviderSession: true });
     throw Object.assign(new Error('AG launch owner changed'), { code: PROVIDER_ERROR_CODES.CANCELLED, recoverable: false });
   }
-  if (providerTrackedInRegistry) {
-    const currentProvider = launchState?.preConnectedProvider ?? getProvider(agentType);
-    if (currentProvider !== provider) {
-      await runtime.kill({ detachProviderSession: true }).catch(() => {});
-      throw new Error(`Provider ${agentType} changed during session launch`);
-    }
-  }
+  await assertLaunchProviderCurrent('during session launch', runtime);
   const latestSessionInfo = getLatestSessionInfo();
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
