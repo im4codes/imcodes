@@ -8,9 +8,10 @@ import { sendTaskPairMessage, setTaskPairDeliveryDepsForTests } from '../../../s
 import { queuedPairWakeAllowed } from '../../../src/daemon/task-pairs/wake-authority.js';
 import { resolveTransportQueueEntryAdmission } from '../../../src/daemon/delegation-reply-task-liveness.js';
 import { isTaskPairSuspended, TASK_PAIR_MAX_DEPENDENCIES, TASK_PAIR_RESUME_REASON } from '../../../shared/task-pair-suspension.js';
-import { taskPairSideToAct, type TaskPairState } from '../../../shared/task-pair.js';
+import { TASK_PAIR_TIMELINE_EVENT, taskPairSideToAct, type TaskPairState } from '../../../shared/task-pair.js';
 import { getSession, removeSession, upsertSession, type SessionRecord } from '../../../src/store/session-store.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
 
 const P = 'pair-pause-test', B = 'deck_e2e_pause_brain', E = 'deck_e2e_pause_exec', A = 'deck_e2e_pause_aud';
 let now: number, busy: Set<string>, messages: Array<{ target: string; id: string; text: string }>;
@@ -489,5 +490,128 @@ describe('resume note clearing, active-execution settle, and idle reconciliation
     expect(messages[0]!.id).toContain(TASK_PAIR_RESUME_REASON);
     expect(isTaskPairSuspended(get('idle-hook'))).toBe(false);
     expect(get('idle-hook').scheduling?.note).toBeUndefined();
+  });
+});
+
+describe('timeline-event projection symmetry on pause, resume, dependency unlock, and settlement', () => {
+  it('emits distinct epoch-bound PAUSE/RESUME timeline events across multi-epoch cycles and settlements', async () => {
+    const emitted: Array<{ eventId?: string; payload: Record<string, unknown> }> = [];
+    const seen = new Set<string>();
+    const off = timelineEmitter.on((ev) => {
+      if (ev.type !== TASK_PAIR_TIMELINE_EVENT || ev.sessionId !== B) return;
+      if (ev.eventId && seen.has(ev.eventId)) return;
+      if (ev.eventId) seen.add(ev.eventId);
+      emitted.push({ eventId: ev.eventId, payload: ev.payload });
+    });
+    try {
+      save('sym', 'in_audit');
+      // Cycle 1: manual pause -> busy resume -> idle settlement
+      pausePair(P, 'sym', B, 'manual', [], 'hold 1');
+      busy.add(A);
+      resumePair(P, 'sym', B);
+      busy.clear();
+      await automation.reconcileSuspensions();
+
+      // Cycle 2: manual pause -> busy resume -> active worker settlement
+      pausePair(P, 'sym', B, 'manual', [], 'hold 2');
+      busy.add(A);
+      resumePair(P, 'sym', B);
+      taskPairService.applyMarker({
+        project: P,
+        writer: A,
+        marker: { verb: 'CHECK', knownVerb: 'CHECK', taskId: 'sym', attrs: { box: 'audited', items: '1' } },
+        source: 'marker',
+        eventId: 'ev-sym-active-settle',
+      });
+
+      const schedEvents = emitted.filter((e) => e.payload.taskId === 'sym' && (e.payload.verb === 'PAUSE' || e.payload.verb === 'RESUME'));
+      expect(schedEvents.map((e) => e.eventId)).toEqual([
+        `task_pair.event:pause:sym:1:${B}`,
+        `task_pair.event:resume:sym:2:${B}`,
+        `task_pair.event:resume-settled:sym:2:${B}`,
+        `task_pair.event:pause:sym:3:${B}`,
+        `task_pair.event:resume:sym:4:${B}`,
+        `task_pair.event:resume-settled:sym:4:${B}`,
+      ]);
+      expect(schedEvents.map((e) => ({
+        verb: e.payload.verb,
+        fromStatus: e.payload.fromStatus,
+        toStatus: e.payload.toStatus,
+        scheduling: e.payload.scheduling,
+      }))).toEqual([
+        { verb: 'PAUSE', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 1, manual: true, resumePending: false, dependencyCount: 0, details: { brief: { dependsOn: [], note: 'hold 1' } } }) },
+        { verb: 'RESUME', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 2, manual: false, resumePending: true, dependencyCount: 0 }) },
+        { verb: 'RESUME', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 2, manual: false, resumePending: false, dependencyCount: 0 }) },
+        { verb: 'PAUSE', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 3, manual: true, resumePending: false, dependencyCount: 0, details: { brief: { dependsOn: [], note: 'hold 2' } } }) },
+        { verb: 'RESUME', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 4, manual: false, resumePending: true, dependencyCount: 0 }) },
+        { verb: 'RESUME', fromStatus: 'in_audit', toStatus: 'in_audit', scheduling: expect.objectContaining({ epoch: 4, manual: false, resumePending: false, dependencyCount: 0 }) },
+      ]);
+    } finally {
+      off();
+    }
+  });
+
+  it('emits deps-cleared and resume-settled for dependency unlocks, preserves unsatisfied dependencies on manual resume, and ignores non-manual resume', async () => {
+    const emitted: Array<{ eventId?: string; payload: Record<string, unknown> }> = [];
+    const seen = new Set<string>();
+    const off = timelineEmitter.on((ev) => {
+      if (ev.type !== TASK_PAIR_TIMELINE_EVENT || ev.sessionId !== B) return;
+      if (ev.eventId && seen.has(ev.eventId)) return;
+      if (ev.eventId) seen.add(ev.eventId);
+      emitted.push({ eventId: ev.eventId, payload: ev.payload });
+    });
+    try {
+      save('up1', 'working');
+      save('up2', 'working');
+      save('dep-only', 'working');
+      pausePair(P, 'dep-only', B, 'dependencies', ['up1']);
+      const beforeNoopCount = emitted.length;
+      // resumePair on a pair that is not manually paused is a no-op with zero spurious events
+      resumePair(P, 'dep-only', B);
+      expect(emitted).toHaveLength(beforeNoopCount);
+
+      putTaskPairFixture(getTaskPairStore(), P, { ...get('up1'), status: 'done' });
+      await automation.reconcileSuspensions();
+      const depOnlyEvents = emitted.filter((e) => e.payload.taskId === 'dep-only');
+      expect(depOnlyEvents.map((e) => e.eventId)).toEqual([
+        `task_pair.event:pause:dep-only:1:${B}`,
+        `task_pair.event:deps-cleared:dep-only:1:${B}`,
+        `task_pair.event:resume-settled:dep-only:1:${B}`,
+      ]);
+      expect(depOnlyEvents[1]!.payload.scheduling).toMatchObject({ manual: false, dependencyCount: 0, resumePending: true });
+      expect(depOnlyEvents[2]!.payload.scheduling).toMatchObject({ manual: false, dependencyCount: 0, resumePending: false });
+
+      // Resuming a pair with unsatisfied dependsOn transitions paused -> waiting_dependencies without clearing dependsOn
+      save('dep-and-man', 'rework');
+      pausePair(P, 'dep-and-man', B, 'dependencies', ['up2']);
+      pausePair(P, 'dep-and-man', B, 'manual');
+      resumePair(P, 'dep-and-man', B);
+      const depAndManResume = emitted.filter((e) => e.payload.taskId === 'dep-and-man' && e.eventId === `task_pair.event:resume:dep-and-man:3:${B}`);
+      expect(depAndManResume).toHaveLength(1);
+      expect(depAndManResume[0]!.payload).toMatchObject({
+        verb: 'RESUME',
+        fromStatus: 'rework',
+        toStatus: 'rework',
+        scheduling: expect.objectContaining({
+          manual: false,
+          resumePending: false,
+          dependencyCount: 1,
+          details: { brief: expect.objectContaining({ dependsOn: ['up2'] }) },
+        }),
+      });
+
+      putTaskPairFixture(getTaskPairStore(), P, { ...get('up2'), status: 'done' });
+      await automation.reconcileSuspensions();
+      const depAndManIds = emitted.filter((e) => e.payload.taskId === 'dep-and-man').map((e) => e.eventId);
+      expect(depAndManIds).toEqual([
+        `task_pair.event:pause:dep-and-man:1:${B}`,
+        `task_pair.event:pause:dep-and-man:2:${B}`,
+        `task_pair.event:resume:dep-and-man:3:${B}`,
+        `task_pair.event:deps-cleared:dep-and-man:3:${B}`,
+        `task_pair.event:resume-settled:dep-and-man:3:${B}`,
+      ]);
+    } finally {
+      off();
+    }
   });
 });

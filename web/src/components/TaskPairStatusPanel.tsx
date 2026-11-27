@@ -39,6 +39,7 @@ import {
   isAcceptedPanelSnapshot,
   isTaskPairSplittable,
   mergeSnapshotRows,
+  mergeTaskPairTimelinePayload,
   normalizeTaskPairSnapshot,
   type TaskPairConsoleSnapshotDetail,
   type TaskPairPanelRow,
@@ -336,7 +337,11 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       const payload = event.payload as Record<string, unknown>;
       if (typeof payload.taskId === 'string') {
         const old = latest.get(payload.taskId);
-        latest.set(payload.taskId, { payload, startedAt: old?.startedAt ?? event.ts, updatedAt: event.ts });
+        latest.set(payload.taskId, {
+          payload: mergeTaskPairTimelinePayload(old?.payload, payload),
+          startedAt: old?.startedAt ?? event.ts,
+          updatedAt: event.ts,
+        });
       }
     }
     for (const [id, row] of latest.entries()) {

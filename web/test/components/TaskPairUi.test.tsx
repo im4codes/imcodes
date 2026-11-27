@@ -3439,4 +3439,113 @@ describe('SupervisionTaskPairSnapshotBridge warm-cache recovery', () => {
       await browser.close();
     }
   });
+
+  it('transitions timeline-backed TaskPairStatusPanel cleanly across pause, resuming, dependency unlock, settlement, and older-daemon PAUSE without toStatus', () => {
+    const basePayload = {
+      taskId: 'tsk_resume_sync',
+      title: 'Pause Resume Sync',
+      executor: 'deck_sub_exec',
+      auditor: 'deck_sub_aud',
+      round: 1,
+    };
+    const mkEvent = (id: string, ts: number, extra: Record<string, unknown>) => ({
+      eventId: id,
+      sessionId: 'deck_brain',
+      type: TASK_PAIR_TIMELINE_EVENT,
+      seq: ts,
+      ts,
+      epoch: 1,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      payload: { ...basePayload, ...extra },
+    });
+
+    const eStarted = mkEvent('ev-start', 100, { verb: 'STARTED', toStatus: 'working' });
+    const ePaused = mkEvent('pause:tsk_resume_sync:1', 200, {
+      verb: 'PAUSE',
+      fromStatus: 'working',
+      toStatus: 'working',
+      scheduling: { epoch: 1, manual: true, resumePending: false, dependsOn: [], note: 'hold' },
+    });
+    const eResuming = mkEvent('resume:tsk_resume_sync:2', 300, {
+      verb: 'RESUME',
+      fromStatus: 'working',
+      toStatus: 'working',
+      scheduling: { epoch: 2, manual: false, resumePending: true, dependsOn: [] },
+    });
+    const eSettled = mkEvent('resume-settled:tsk_resume_sync:2', 400, {
+      verb: 'RESUME',
+      fromStatus: 'working',
+      toStatus: 'working',
+      scheduling: { epoch: 2, manual: false, resumePending: false, dependsOn: [] },
+    });
+
+    // 1. Step-by-step live panel transitions: working -> paused -> resuming -> working
+    const { container, rerender } = render(<TaskPairStatusPanel events={[eStarted, ePaused]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-paused')).not.toBeNull();
+    expect(container.querySelector('.task-pair-status-group-working')).toBeNull();
+
+    rerender(<TaskPairStatusPanel events={[eStarted, ePaused, eResuming]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-resuming')).not.toBeNull();
+    expect(container.querySelector('.task-pair-status-group-paused')).toBeNull();
+
+    rerender(<TaskPairStatusPanel events={[eStarted, ePaused, eResuming, eSettled]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-working')).not.toBeNull();
+    expect(container.querySelector('.task-pair-status-group-paused')).toBeNull();
+    expect(container.querySelector('.task-pair-status-group-resuming')).toBeNull();
+
+    // 2. Dependency + manual wait -> manual resume keeps waiting_dependencies -> deps-cleared -> resuming -> settled
+    const eAudit = mkEvent('ev-audit', 100, { verb: 'READY_FOR_AUDIT', toStatus: 'in_audit' });
+    const eDepPause = mkEvent('pause:tsk_resume_sync:1', 200, {
+      verb: 'PAUSE',
+      fromStatus: 'in_audit',
+      toStatus: 'in_audit',
+      scheduling: { epoch: 1, manual: true, resumePending: false, dependsOn: ['tsk_up'] },
+    });
+    const eManualResumedWithDep = mkEvent('resume:tsk_resume_sync:2', 300, {
+      verb: 'RESUME',
+      fromStatus: 'in_audit',
+      toStatus: 'in_audit',
+      scheduling: { epoch: 2, manual: false, resumePending: false, dependsOn: ['tsk_up'] },
+    });
+    const eDepsCleared = mkEvent('deps-cleared:tsk_resume_sync:2', 400, {
+      verb: 'RESUME',
+      fromStatus: 'in_audit',
+      toStatus: 'in_audit',
+      scheduling: { epoch: 2, manual: false, resumePending: true, dependsOn: [] },
+    });
+    const eDepSettled = mkEvent('resume-settled:tsk_resume_sync:2', 500, {
+      verb: 'RESUME',
+      fromStatus: 'in_audit',
+      toStatus: 'in_audit',
+      scheduling: { epoch: 2, manual: false, resumePending: false, dependsOn: [] },
+    });
+
+    expect(resolveOrderedTaskPairRows({ snapshot: null, events: [eAudit, eDepPause, eManualResumedWithDep], serverId: 'srv-sync' })[0]?.payload).toMatchObject({
+      toStatus: 'in_audit',
+      scheduling: expect.objectContaining({ manual: false, dependsOn: ['tsk_up'] }),
+    });
+    rerender(<TaskPairStatusPanel events={[eAudit, eDepPause, eManualResumedWithDep]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-waiting_dependencies')).not.toBeNull();
+
+    rerender(<TaskPairStatusPanel events={[eAudit, eDepPause, eManualResumedWithDep, eDepsCleared]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-resuming')).not.toBeNull();
+
+    rerender(<TaskPairStatusPanel events={[eAudit, eDepPause, eManualResumedWithDep, eDepsCleared, eDepSettled]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-audit')).not.toBeNull();
+    expect(container.querySelector('.task-pair-status-group-waiting_dependencies')).toBeNull();
+    expect(container.querySelector('.task-pair-status-group-paused')).toBeNull();
+    expect(container.querySelector('.task-pair-status-group-resuming')).toBeNull();
+
+    // 3. Version-skew fallback: older daemon PAUSE event omitting toStatus still keeps prior valid toStatus
+    const eOldDaemonPause = mkEvent('pause:tsk_resume_sync:9', 600, {
+      verb: 'PAUSE',
+      scheduling: { epoch: 9, manual: true, resumePending: false, dependsOn: [] },
+    });
+    const skewRows = resolveOrderedTaskPairRows({ snapshot: null, events: [eStarted, eOldDaemonPause], serverId: 'srv-sync' });
+    expect(skewRows).toHaveLength(1);
+    expect(skewRows[0]?.payload.toStatus).toBe('working');
+    rerender(<TaskPairStatusPanel events={[eStarted, eOldDaemonPause]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-paused')).not.toBeNull();
+  });
 });

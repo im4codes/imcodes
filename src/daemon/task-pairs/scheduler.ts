@@ -48,6 +48,7 @@ import {
   type TaskPairState,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
+import { emitSchedulingTimelineEvent } from './suspension.js';
 import { taskPairDecisionRevision, isTaskPairMissingExplanation, taskPairMissingExplanationKey } from './decision-context.js';
 import { isPairsEngineProject, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './engine.js';
 import { runIntegrationDriftPass } from './integration-drift.js';
@@ -351,6 +352,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
           const saved = store.patchScheduling(stored.project, stored.state.taskId, s, next, this.#now());
           if (!saved) continue;
           stored = saved; s = next;
+          emitSchedulingTimelineEvent(saved, {
+            writer: 'daemon',
+            role: 'daemon',
+            verb: 'RESUME',
+            eventId: `deps-cleared:${saved.state.taskId}:${next.epoch}`,
+          });
         }
       }
       if (s.manual || s.dependsOn.length || !s.resumePending || (s.resumeRetryAt ?? 0) > this.#now()) continue;
@@ -381,6 +388,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
       }
       const saved = store.patchScheduling(stored.project, stored.state.taskId, s, { ...s, resumePending: false, admitted: false, note: undefined, resumeRetryAt: undefined, resumedAt: this.#now() }, this.#now());
       if (!saved) continue;
+      emitSchedulingTimelineEvent(saved, {
+        writer: 'daemon',
+        role: 'daemon',
+        verb: 'RESUME',
+        eventId: `resume-settled:${saved.state.taskId}:${s.epoch}`,
+      });
       const now = this.#now();
       store.saveLiveness(saved.project, saved.state.taskId, { ...saved.liveness,
         activityExecutorAt: now, activityAuditorAt: now, lastTickAt: now,
