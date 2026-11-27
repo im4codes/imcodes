@@ -4599,7 +4599,7 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
         await Promise.resolve();
       });
 
-      expect(voiceMocks.primeVoiceGesture).toHaveBeenCalledWith({ deferAudioPause: false });
+      expect(voiceMocks.primeVoiceGesture).toHaveBeenCalledWith({ deferAudioPause: false, projectKey: null });
       expect(document.body.querySelector('.voice-overlay')).not.toBeNull();
       expect(voiceMocks.startListening).toHaveBeenCalledTimes(1);
       expect(container.querySelector('.remote-desktop-voice-pill')).toBeNull();

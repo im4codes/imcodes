@@ -105,10 +105,18 @@ describe('toolbar placement & retired supervision task console toggle', () => {
       '{/* Desktop floating file browser */}',
     );
     expect(app).toContain('const canViewTaskConsole = canViewSupervisionTaskConsole(supervisionTaskConsoleVisibility);');
-    expect(app).toMatch(/sharedAccessRole: selectedShareTarget\s*\? \(activeSessionInfo\?\.sharedState\?\.effectiveRole \?\? null\)\s*: null/);
+    expect(app).toMatch(
+      /const sharedAccessRole = selectedShareTarget\s*\?\s*\(selectedShareCoverageRole \?\? activeSessionInfo\?\.sharedState\?\.effectiveRole \?\? 'viewer'\)\s*:\s*null;/,
+    );
+    expect(app).toMatch(
+      /const mainSharedAccessRole = selectedShareTarget\?\.kind === 'subsession'\s*\?\s*'viewer'\s*:\s*sharedAccessRole;/,
+    );
+    expect(app).toMatch(
+      /supervisionTaskConsoleVisibility = \{[\s\S]*?sharedAccessRole:\s*mainSharedAccessRole,?[\s\S]*?\};/,
+    );
     expect(workspace.match(/showSupervisionTaskConsole && canViewTaskConsole && activeSessionInfo/g)).toHaveLength(1);
     expect(workspace).not.toMatch(/role === 'brain'/);
-    expect(workspace).toContain("readOnly={sharedAccessRole === 'viewer'}");
+    expect(workspace).toContain("readOnly={mainSharedAccessRole === 'viewer'}");
     expect(app.match(/<SupervisionTaskConsole(?=\s)/g)).toHaveLength(1);
   });
 
