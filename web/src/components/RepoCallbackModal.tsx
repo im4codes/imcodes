@@ -150,6 +150,7 @@ export function RepoCallbackModal({
   const userEditedTargetRef = useRef(false);
   const loadedConfigStateRef = useRef<{ key: string; hasSavedConfig: boolean } | null>(null);
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const editedSourceTemplateRef = useRef<Partial<Record<RepoCallbackEventType, { scope: RepoCallbackTemplateScope; id: string; name: string }>>>({});
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ kind: 'success' | 'error'; text: string } | null>(null);
@@ -171,10 +172,12 @@ export function RepoCallbackModal({
     userEditedTargetRef.current = false;
     loadedConfigStateRef.current = null;
     setLoading(true);
+    setLoadError(false);
     setFeedback(null);
     loadRepoCallbackPrefs(serverId, projectDir)
       .then((loaded) => {
         if (cancelled) return;
+        setLoadError(false);
         loadedConfigStateRef.current = { key: configKey, hasSavedConfig: loaded.hasSavedConfig };
         setGlobalTemplates(loaded.globalPrefs.templates);
         setDraft((prev) => {
@@ -192,6 +195,8 @@ export function RepoCallbackModal({
       })
       .catch((err) => {
         if (cancelled) return;
+        setLoadError(true);
+        loadedConfigStateRef.current = null;
         setFeedback({ kind: 'error', text: err instanceof Error ? err.message : tRef.current('repo.callback_load_error') });
       })
       .finally(() => {
@@ -371,6 +376,7 @@ export function RepoCallbackModal({
   };
 
   const handleSaveTemplate = async (eventType: RepoCallbackEventType, scope: RepoCallbackTemplateScope) => {
+    if (readOnly || loading || loadError) return;
     const name = templateNameDraft.trim().slice(0, REPO_CALLBACK_MAX_TEMPLATE_NAME_CHARS);
     const prompt = getCurrentPromptText(eventType).trim().slice(0, REPO_CALLBACK_MAX_PROMPT_CHARS);
     if (!name || !prompt) {
@@ -479,6 +485,7 @@ export function RepoCallbackModal({
   };
 
   const handleDeleteSelectedTemplate = async (eventType: RepoCallbackEventType) => {
+    if (readOnly || loading || loadError) return;
     const setting = draft.events[eventType];
     if (!setting.templateId || setting.templateScope === 'default') return;
     if (setting.templateScope === 'repo' && !serverId) {
@@ -522,6 +529,7 @@ export function RepoCallbackModal({
   };
 
   const handleSaveSettings = async () => {
+    if (readOnly || loading || loadError) return;
     if (!serverId) {
       setFeedback({ kind: 'error', text: t('repo.callback_missing_server') });
       return;
@@ -693,7 +701,7 @@ export function RepoCallbackModal({
                 <input
                   type="checkbox"
                   checked={draft.enabled}
-                  disabled={readOnly || loading}
+                  disabled={readOnly || loading || loadError}
                   onChange={(e) => setDraft((prev) => ({ ...prev, enabled: (e.target as HTMLInputElement).checked }))}
                 />
                 <span>{t('repo.callback_enabled')}</span>
@@ -711,7 +719,7 @@ export function RepoCallbackModal({
                 <span>{t('repo.callback_interval_label')}</span>
                 <select
                   value={String(draft.intervalMs)}
-                  disabled={readOnly || loading}
+                  disabled={readOnly || loading || loadError}
                   onChange={(e) => setDraft((prev) => ({ ...prev, intervalMs: Number((e.target as HTMLSelectElement).value) }))}
                   style={{ width: '100%', minWidth: 0, maxWidth: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
                 >
@@ -728,7 +736,7 @@ export function RepoCallbackModal({
                 <select
                   aria-label={t('repo.callback_lookback_label')}
                   value={normalizeRepoCallbackLookbackWindow(draft.lookbackWindow ?? REPO_CALLBACK_DEFAULT_LOOKBACK_WINDOW)}
-                  disabled={readOnly || loading}
+                  disabled={readOnly || loading || loadError}
                   onChange={(e) => {
                     const lookbackWindow: RepoCallbackLookbackWindow = normalizeRepoCallbackLookbackWindow(
                       (e.target as HTMLSelectElement).value,
@@ -750,7 +758,7 @@ export function RepoCallbackModal({
                 <select
                   aria-label={t('repo.callback_target_label')}
                   value={draft.target}
-                  disabled={readOnly || loading}
+                  disabled={readOnly || loading || loadError}
                   onChange={(e) => {
                     userEditedTargetRef.current = true;
                     setDraft((prev) => ({ ...prev, target: (e.target as HTMLSelectElement).value }));
@@ -805,7 +813,7 @@ export function RepoCallbackModal({
                       <input
                         type="checkbox"
                         checked={setting.enabled}
-                        disabled={readOnly || loading}
+                        disabled={readOnly || loading || loadError}
                         onChange={(e) => {
                           const checked = (e.target as HTMLInputElement).checked;
                           setDraft((prev) => ({
@@ -851,7 +859,7 @@ export function RepoCallbackModal({
                         <select
                           aria-label={`${eventLabel(eventType)} ${t('repo.callback_template_label')}`}
                           value={tplKey}
-                          disabled={readOnly || loading}
+                          disabled={readOnly || loading || loadError}
                           onChange={(e) => handleSelectTemplate(eventType, (e.target as HTMLSelectElement).value)}
                           style={{ flex: 1, minWidth: 'min(160px, 100%)', maxWidth: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }}
                         >
@@ -871,7 +879,7 @@ export function RepoCallbackModal({
                           <button
                             type="button"
                             class="btn btn-sm"
-                            disabled={saving || loading}
+                            disabled={saving || loading || loadError}
                             onClick={() => void handleDeleteSelectedTemplate(eventType)}
                             style={{ fontSize: 11, color: '#fca5a5' }}
                           >
@@ -884,7 +892,7 @@ export function RepoCallbackModal({
                         aria-label={`${eventLabel(eventType)} ${t('repo.callback_prompt_label')}`}
                         rows={4}
                         value={getCurrentPromptText(eventType)}
-                        disabled={readOnly || loading}
+                        disabled={readOnly || loading || loadError}
                         placeholder={REPO_CALLBACK_DEFAULT_PROMPTS[eventType]}
                         onInput={(e) => handlePromptChange(eventType, (e.target as HTMLTextAreaElement).value)}
                         style={{
@@ -913,7 +921,7 @@ export function RepoCallbackModal({
                             type="text"
                             aria-label={t('repo.callback_tpl_name_placeholder')}
                             value={templateNameDraft}
-                            disabled={loading}
+                            disabled={loading || loadError}
                             onInput={(e) => setTemplateNameDraft((e.target as HTMLInputElement).value)}
                             placeholder={t('repo.callback_tpl_name_placeholder')}
                             style={{
@@ -932,7 +940,7 @@ export function RepoCallbackModal({
                           <button
                             type="button"
                             class="btn btn-sm"
-                            disabled={saving || loading}
+                            disabled={saving || loading || loadError}
                             onClick={() => void handleSaveTemplate(eventType, 'global')}
                             style={{ fontSize: 11 }}
                           >
@@ -941,7 +949,7 @@ export function RepoCallbackModal({
                           <button
                             type="button"
                             class="btn btn-sm"
-                            disabled={saving || loading}
+                            disabled={saving || loading || loadError}
                             onClick={() => void handleSaveTemplate(eventType, 'repo')}
                             style={{ fontSize: 11 }}
                           >
@@ -961,7 +969,7 @@ export function RepoCallbackModal({
               <button
                 type="button"
                 class="btn btn-primary btn-sm"
-                disabled={saving || loading}
+                disabled={saving || loading || loadError}
                 onClick={() => void handleSaveSettings()}
                 style={{ fontSize: 12, padding: '6px 14px' }}
               >

@@ -25,10 +25,10 @@ export function normalizeRepoCallbackProjectDir(raw: string | null | undefined):
   const trimmed = raw.trim();
   if (!trimmed) return '';
   if (/^\/+$/.test(trimmed)) return '/';
-  if (/^[A-Za-z]:[\\/]*$/.test(trimmed)) {
-    if (/^[A-Za-z]:$/.test(trimmed)) return trimmed;
-    return `${trimmed[0]}:${trimmed[2] === '\\' ? '\\' : '/'}`;
+  if (/^[A-Za-z]:[\\/]+$/.test(trimmed)) {
+    return `${trimmed[0]!.toUpperCase()}:/`;
   }
+  if (/^[A-Za-z]:$/.test(trimmed)) return trimmed.toUpperCase();
   return trimmed.replace(/[\\/]+$/, '');
 }
 
@@ -70,8 +70,8 @@ export async function loadRepoCallbackPrefs(
   projectDir: string,
 ): Promise<LoadedRepoCallbackPrefs> {
   const [rawGlobal, rawServer] = await Promise.all([
-    getUserPref(REPO_CALLBACK_PREF_KEYS.GLOBAL_TEMPLATES),
-    serverId ? getUserPref(repoCallbackServerPrefKey(serverId)) : Promise.resolve(null),
+    getUserPref(REPO_CALLBACK_PREF_KEYS.GLOBAL_TEMPLATES, { strict: true }),
+    serverId ? getUserPref(repoCallbackServerPrefKey(serverId), { strict: true }) : Promise.resolve(null),
   ]);
   const globalPrefs = normalizeRepoCallbackGlobalPrefs(rawGlobal);
   const serverPrefs = normalizeRepoCallbackServerPrefs(rawServer);
@@ -93,7 +93,7 @@ export async function saveRepoCallbackRepoConfig(
   serverId: string,
   config: RepoCallbackRepoConfig,
 ): Promise<RepoCallbackServerPrefs> {
-  const existingRaw = await getUserPref(repoCallbackServerPrefKey(serverId));
+  const existingRaw = await getUserPref(repoCallbackServerPrefKey(serverId), { strict: true });
   const current = normalizeRepoCallbackServerPrefs(existingRaw);
   const nowMs = Date.now();
   const existingKey = findRepoCallbackConfigKey(current.repos, config.projectDir);

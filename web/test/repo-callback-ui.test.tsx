@@ -22,9 +22,10 @@ import {
   findRepoCallbackConfigKey,
   normalizeRepoCallbackProjectDir,
   resolveFloatingRepoPanelScope,
+  saveRepoCallbackGlobalTemplates,
   saveRepoCallbackRepoConfig,
 } from '../src/repo-callback-prefs.js';
-import { getUserPref } from '../src/api.js';
+import { getUserPref, saveUserPref } from '../src/api.js';
 
 const nativeMockState = vi.hoisted(() => ({
   isNative: false,
@@ -1297,7 +1298,7 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     expect(normalizeRepoCallbackProjectDir('/')).toBe('/');
     expect(normalizeRepoCallbackProjectDir('//')).toBe('/');
     expect(normalizeRepoCallbackProjectDir('///')).toBe('/');
-    expect(normalizeRepoCallbackProjectDir('C:\\\\')).toBe('C:\\');
+    expect(normalizeRepoCallbackProjectDir('C:\\\\')).toBe('C:/');
     expect(findRepoCallbackConfigKey({ '/': createDefaultRepoCallbackConfig('/') }, '//')).toBe('/');
     expect(
       buildRepoCallbackTargetOptions('//', [{ name: 'root_b', role: 'brain', state: 'idle', projectDir: '/' }]).map((t) => t.sessionName),
@@ -1405,7 +1406,18 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('brain');
     cleanup();
 
-    // 6. Template deletion persists repo config and sets hasSavedConfig=true so late target updates do not override 'brain'
+    // 6. Template deletion on an UNSAVED repo (pre-populated global template, NEVER calling Save Repo first)
+    //    persists repo config and sets hasSavedConfig=true so late target updates do not override 'brain'
+    await saveRepoCallbackGlobalTemplates([
+      {
+        id: 'tpl_global_del_1',
+        name: 'Global CI Template',
+        scope: 'global',
+        eventType: 'ci_failed',
+        prompt: 'Global prompt {{title}}',
+        updatedAt: 1000,
+      },
+    ]);
     const wsTplDel = createMockWs();
     const { rerender: rerenderTplDel } = render(
       <RepoPage
@@ -1417,10 +1429,8 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
       />,
     );
     await openModalAndAwaitPrefs();
-    // Save a repo template while target is 'brain', then delete it cleanly
-    const tplInput = screen.getByPlaceholderText('Template name (to save/reuse)') as HTMLInputElement;
-    fireEvent.input(tplInput, { target: { value: 'Temp CI Tpl' } });
-    fireEvent.click(screen.getByText('Save Repo'));
+    const ciTplSelect = screen.getByLabelText('New CI failure (Actions / Pipelines) Prompt template') as HTMLSelectElement;
+    changeSelect(ciTplSelect, 'global:tpl_global_del_1');
     await waitFor(() => {
       expect(screen.getByText('repo.callback_tpl_delete')).toBeTruthy();
     });
@@ -1428,7 +1438,6 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     await waitFor(() => {
       expect(screen.queryByText('repo.callback_tpl_delete')).toBeNull();
     });
-    // Now callbackTargets arrives with currentSessionName='deck_cd_brain': saved 'brain' must stay intact
     rerenderTplDel(
       <RepoPage
         ws={wsTplDel}
@@ -1440,5 +1449,110 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     );
     await new Promise((r) => setTimeout(r, 0));
     expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('brain');
+    const tplDelPrefs = prefStore.get(repoCallbackServerPrefKey('srv-tpl-del')) as {
+      repos: Record<string, { target: string }>;
+    };
+    expect(tplDelPrefs.repos['/work/repo-tpl-del']?.target).toBe('brain');
+    cleanup();
+
+    // 7. Windows drive roots C:\ and C:/ unify on compare (while keeping C: drive-relative distinct) and reuse saved C:\ key
+    expect(normalizeRepoCallbackProjectDir('C:\\')).toBe('C:/');
+    expect(normalizeRepoCallbackProjectDir('C:/')).toBe('C:/');
+    expect(normalizeRepoCallbackProjectDir('C:\\\\')).toBe('C:/');
+    expect(normalizeRepoCallbackProjectDir('c://')).toBe('C:/');
+    expect(normalizeRepoCallbackProjectDir('C:')).toBe('C:');
+    expect(
+      buildRepoCallbackTargetOptions('C:\\', [
+        { name: 'win_root_brain', role: 'brain', project: 'win', state: 'idle', projectDir: 'C:/' },
+        { name: 'win_rel_brain', role: 'brain', project: 'rel', state: 'idle', projectDir: 'C:' },
+      ]).map((t) => t.sessionName),
+    ).toEqual(['win_root_brain']);
+
+    await saveRepoCallbackRepoConfig('srv-win-root', {
+      ...createDefaultRepoCallbackConfig('C:\\'),
+      target: 'brain',
+      enabled: true,
+    });
+    const wsWin = createMockWs();
+    const winTargets = buildRepoCallbackTargetOptions('C:/', [
+      { name: 'win_root_brain', role: 'brain', project: 'win', state: 'idle', projectDir: 'C:\\' },
+    ]);
+    render(
+      <RepoPage
+        ws={wsWin}
+        sessionId="win_root_brain"
+        serverId="srv-win-root"
+        projectDir="C:/"
+        callbackTargets={winTargets}
+      />,
+    );
+    await openModalAndAwaitPrefs();
+    const winSelect = screen.getByLabelText('Callback target session') as HTMLSelectElement;
+    expect(winSelect.value).toBe('brain');
+    changeSelect(winSelect, 'win_root_brain');
+    await new Promise((r) => setTimeout(r, 0));
+    fireEvent.click(screen.getByText('Save settings'));
+    await waitFor(() => {
+      const serverPrefs = prefStore.get(repoCallbackServerPrefKey('srv-win-root')) as {
+        repos: Record<string, { projectDir: string; target: string }>;
+      };
+      expect(Object.keys(serverPrefs.repos)).toEqual(['C:\\']);
+      expect(serverPrefs.repos['C:\\']?.target).toBe('win_root_brain');
+      expect(serverPrefs.repos['C:\\']?.projectDir).toBe('C:\\');
+    });
+    cleanup();
+
+    // 8. Strict reads: load failure blocks all writes & preserves saved target on retry; read-before-save error sends no PUT
+    await saveRepoCallbackRepoConfig('srv-strict-err', {
+      ...createDefaultRepoCallbackConfig('/work/repo-strict-err'),
+      target: 'deck_cd1_brain',
+      enabled: true,
+    });
+    vi.mocked(saveUserPref).mockClear();
+    vi.mocked(getUserPref).mockImplementation(async (_key: string, options?: { strict?: boolean }) => {
+      expect(options?.strict).toBe(true);
+      throw new Error('HTTP 500 pref unavailable');
+    });
+
+    const wsErr = createMockWs();
+    render(
+      <RepoPage
+        ws={wsErr}
+        sessionId="deck_cd_brain"
+        serverId="srv-strict-err"
+        projectDir="/work/repo-strict-err"
+        callbackTargets={targetsAB}
+      />,
+    );
+    fireEvent.click(screen.getByText('Monitor & Callback'));
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toContain('HTTP 500 pref unavailable');
+    });
+    expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Save Repo' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Save Global' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    expect(saveUserPref).not.toHaveBeenCalled();
+
+    // Reopen after network recovers -> reloads original saved deck_cd1_brain without clobbering
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }));
+    vi.mocked(getUserPref).mockImplementation(async (key: string) => prefStore.get(key) ?? null);
+    await openModalAndAwaitPrefs();
+    expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('deck_cd1_brain');
+
+    // Read-before-save error inside saveRepoCallbackRepoConfig MUST fail before issuing PUT
+    vi.mocked(saveUserPref).mockClear();
+    vi.mocked(getUserPref).mockImplementationOnce(async (_key: string, options?: { strict?: boolean }) => {
+      expect(options?.strict).toBe(true);
+      throw new Error('HTTP 503 pre-save read failed');
+    });
+    await expect(
+      saveRepoCallbackRepoConfig('srv-strict-err', {
+        ...createDefaultRepoCallbackConfig('/work/repo-strict-err'),
+        target: 'deck_cd_brain',
+      }),
+    ).rejects.toThrow('HTTP 503 pre-save read failed');
+    expect(saveUserPref).not.toHaveBeenCalled();
   });
 });
