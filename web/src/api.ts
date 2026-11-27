@@ -139,6 +139,28 @@ let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
 let _apiKey: string | null = null;
 let _expectedUserId: string | null = null;
+let _authIdentityEpoch = 1;
+const _authIdentityListeners = new Set<() => void>();
+
+function notifyAuthIdentityChange(): void {
+  _authIdentityEpoch += 1;
+  for (const listener of [..._authIdentityListeners]) {
+    try {
+      listener();
+    } catch { /* ignore listener errors */ }
+  }
+}
+
+export function getAuthIdentityEpoch(): number {
+  return _authIdentityEpoch;
+}
+
+export function subscribeAuthIdentityChange(listener: () => void): () => void {
+  _authIdentityListeners.add(listener);
+  return () => {
+    _authIdentityListeners.delete(listener);
+  };
+}
 type AuthTelemetryHeaders = {
   'X-Platform': string;
   'X-App-Version': string;
@@ -210,9 +232,12 @@ function syncVoiceHotwordsAuthScopeFromApi(): void {
 }
 
 export function configureExpectedUserId(userId: string | null): void {
-  _expectedUserId = typeof userId === 'string' ? (userId.trim() || null) : null;
+  const normalized = typeof userId === 'string' ? (userId.trim() || null) : null;
+  const changed = normalized !== _expectedUserId;
+  _expectedUserId = normalized;
   setFileRelayUser(_expectedUserId);
   syncVoiceHotwordsAuthScopeFromApi();
+  if (changed) notifyAuthIdentityChange();
 }
 
 export function getExpectedUserId(): string | null {
@@ -264,10 +289,13 @@ async function getAuthTelemetryHeaders(): Promise<AuthTelemetryHeaders> {
 }
 
 export function configure(baseUrl: string): void {
-  _baseUrl = baseUrl.replace(/\/$/, '');
+  const normalized = baseUrl.replace(/\/$/, '');
+  const changed = normalized !== _baseUrl;
+  _baseUrl = normalized;
   if (_expectedUserId) {
     syncVoiceHotwordsAuthScopeFromApi();
   }
+  if (changed) notifyAuthIdentityChange();
 }
 
 /** Return the configured API base URL, or the current origin when same-origin. */

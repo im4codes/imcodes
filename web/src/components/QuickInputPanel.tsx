@@ -3,7 +3,7 @@ import { machineGroupsOf, machinesInGroup, resolveMachineGroup, useRememberedMac
 import { useState, useRef, useEffect, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
-import { apiFetch } from '../api.js';
+import * as apiModule from '../api.js';
 import { createSharedResource, type SharedResource } from '../stores/shared-resource.js';
 import { FileBrowser } from './file-browser-lazy.js';
 import { useAliases } from '../hooks/useAliases.js';
@@ -227,58 +227,183 @@ export function getAccountHistory(data: QuickData): string[] {
 
 // ── Hook ──────────────────────────────────────────────────────────────────
 
+interface AuthoritativeAuthScope {
+  userId: string;
+  baseUrl: string;
+  scopeKey: string;
+  epoch: number;
+}
+
+interface AuthBinding {
+  scope: AuthoritativeAuthScope | null;
+  epoch: number;
+}
+
+interface PendingQuickDataSnapshot {
+  v: 2;
+  scopeKey: string;
+  saveRevision: number;
+  baseline: QuickData;
+  target: QuickData;
+  removedAllTexts?: string[];
+}
+
+type PreHydrationOp =
+  | { type: 'record_history'; text: string; sessionName?: string; ts: number }
+  | { type: 'remove_history'; text: string }
+  | { type: 'remove_session_history'; sessionName: string; text: string }
+  | { type: 'clear_history' }
+  | { type: 'clear_session_history'; sessionName: string }
+  | { type: 'add_command'; cmd: string }
+  | { type: 'remove_command'; cmd: string }
+  | { type: 'add_phrase'; phrase: string }
+  | { type: 'remove_phrase'; phrase: string };
+
 let _debounceTimer: ReturnType<typeof setTimeout> | null = null;
 let _hasHydratedFromServer = false;
 let _mutatedBeforeHydration = false;
 let _visibilityInstalled = false;
 let _visibilityHandler: (() => void) | null = null;
 let _pageHideHandler: (() => void) | null = null;
+let _authUnsubscribe: (() => void) | null = null;
 let _saveRevision = 0;
 let _inFlightSaves = 0;
+let _baseline: QuickData | null = null;
+let _boundBinding: AuthBinding | null = null;
+const _pendingRemovedAllTexts = new Set<string>();
+let _preHydrationOps: PreHydrationOp[] = [];
 
 const QUICK_DATA_PENDING_KEY_PREFIX = 'imcodes.quick_data.pending:';
 const KEEPALIVE_SAFE_BODY_BYTES = 60_000;
 
-function getQuickDataPendingStorageKey(): string | null {
-  if (typeof localStorage === 'undefined') return null;
-  try {
-    const rawAuth = localStorage.getItem('rcc_auth');
-    if (rawAuth) {
-      const parsed = JSON.parse(rawAuth) as { userId?: unknown; baseUrl?: unknown } | null;
-      const userId = typeof parsed?.userId === 'string' ? parsed.userId.trim() : '';
-      const baseUrl = typeof parsed?.baseUrl === 'string' ? parsed.baseUrl.trim() : '';
-      if (userId) return `${QUICK_DATA_PENDING_KEY_PREFIX}${baseUrl}:${userId}`;
-    }
-  } catch { /* ignore */ }
-  const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : 'default';
-  return `${QUICK_DATA_PENDING_KEY_PREFIX}${origin}:anon`;
+function apiFetch<T = unknown>(path: string, opts?: RequestInit): Promise<T> {
+  return opts === undefined ? apiModule.apiFetch<T>(path) : apiModule.apiFetch<T>(path, opts);
 }
 
-function writePendingSnapshot(data: QuickData): void {
-  const key = getQuickDataPendingStorageKey();
-  if (!key) return;
+function normalizeAuthBaseUrl(baseUrl: string | null | undefined): string {
+  if (typeof baseUrl !== 'string') return '';
+  const trimmed = baseUrl.trim().replace(/\/+$/, '');
+  if (!trimmed) return '';
   try {
-    localStorage.setItem(key, JSON.stringify(data));
-  } catch { /* ignore quota/private mode errors */ }
+    return new URL(trimmed).origin.toLowerCase();
+  } catch {
+    return trimmed.toLowerCase();
+  }
 }
 
-function readPendingSnapshot(): QuickData | null {
-  const key = getQuickDataPendingStorageKey();
-  if (!key) return null;
+function readExpectedUserIdFromApi(): string | null {
   try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return null;
-    return normalizeQuickData(JSON.parse(raw));
+    const fn = (apiModule as { getExpectedUserId?: unknown }).getExpectedUserId;
+    if (typeof fn !== 'function') return null;
+    const raw = (fn as () => string | null)();
+    return typeof raw === 'string' && raw.trim() ? raw.trim() : null;
   } catch {
     return null;
   }
 }
 
-function clearPendingSnapshot(): void {
-  const key = getQuickDataPendingStorageKey();
-  if (!key) return;
+function readApiBaseUrlFromApi(): string {
   try {
-    localStorage.removeItem(key);
+    const fn = (apiModule as { getApiBaseUrl?: unknown }).getApiBaseUrl;
+    if (typeof fn === 'function') {
+      const raw = (fn as () => string)();
+      if (typeof raw === 'string') return normalizeAuthBaseUrl(raw);
+    }
+  } catch { /* ignore */ }
+  const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '';
+  return normalizeAuthBaseUrl(origin);
+}
+
+function readAuthIdentityEpochFromApi(): number {
+  try {
+    const fn = (apiModule as { getAuthIdentityEpoch?: unknown }).getAuthIdentityEpoch;
+    if (typeof fn === 'function') {
+      const val = (fn as () => number)();
+      if (typeof val === 'number' && Number.isFinite(val)) return val;
+    }
+  } catch { /* ignore */ }
+  return 0;
+}
+
+function getAuthoritativeAuthScope(): AuthoritativeAuthScope | null {
+  const userId = readExpectedUserIdFromApi();
+  if (!userId) return null;
+  const baseUrl = readApiBaseUrlFromApi();
+  const epoch = readAuthIdentityEpochFromApi();
+  return {
+    userId,
+    baseUrl,
+    scopeKey: `${baseUrl}|${userId}`,
+    epoch,
+  };
+}
+
+function captureCurrentBinding(): AuthBinding {
+  const scope = getAuthoritativeAuthScope();
+  return {
+    scope,
+    epoch: scope ? scope.epoch : readAuthIdentityEpochFromApi(),
+  };
+}
+
+function isBindingCurrent(binding: AuthBinding | null): boolean {
+  if (!binding) return false;
+  const current = captureCurrentBinding();
+  if (binding.epoch !== current.epoch) return false;
+  if (!binding.scope && !current.scope) return true;
+  if (!binding.scope || !current.scope) return false;
+  return binding.scope.scopeKey === current.scope.scopeKey;
+}
+
+function getQuickDataPendingStorageKey(scope: AuthoritativeAuthScope | null): string | null {
+  if (!scope || typeof localStorage === 'undefined') return null;
+  return `${QUICK_DATA_PENDING_KEY_PREFIX}${encodeURIComponent(scope.scopeKey)}`;
+}
+
+function writePendingSnapshot(scope: AuthoritativeAuthScope | null, snapshot: PendingQuickDataSnapshot): void {
+  const key = getQuickDataPendingStorageKey(scope);
+  if (!key || !scope || snapshot.scopeKey !== scope.scopeKey) return;
+  try {
+    localStorage.setItem(key, JSON.stringify(snapshot));
+  } catch { /* ignore quota/private mode errors */ }
+}
+
+function readPendingSnapshot(scope: AuthoritativeAuthScope | null): PendingQuickDataSnapshot | null {
+  const key = getQuickDataPendingStorageKey(scope);
+  if (!key || !scope) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PendingQuickDataSnapshot> | null;
+    if (!parsed || typeof parsed !== 'object' || parsed.v !== 2 || parsed.scopeKey !== scope.scopeKey) {
+      return null;
+    }
+    return {
+      v: 2,
+      scopeKey: scope.scopeKey,
+      saveRevision: typeof parsed.saveRevision === 'number' && Number.isFinite(parsed.saveRevision) ? parsed.saveRevision : 0,
+      baseline: normalizeQuickData(parsed.baseline),
+      target: normalizeQuickData(parsed.target),
+      ...(Array.isArray(parsed.removedAllTexts)
+        ? { removedAllTexts: parsed.removedAllTexts.filter((item): item is string => typeof item === 'string') }
+        : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingSnapshotIfRevision(scope: AuthoritativeAuthScope | null, expectedRevision: number): void {
+  const key = getQuickDataPendingStorageKey(scope);
+  if (!key || !scope) return;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as Partial<PendingQuickDataSnapshot> | null;
+    if (!parsed || parsed.v !== 2 || parsed.scopeKey !== scope.scopeKey) return;
+    if (parsed.saveRevision === expectedRevision) {
+      localStorage.removeItem(key);
+    }
   } catch { /* ignore */ }
 }
 
@@ -291,6 +416,38 @@ function clearAllPendingSnapshotsForTests(): void {
       if (k && k.startsWith(QUICK_DATA_PENDING_KEY_PREFIX)) keys.push(k);
     }
     for (const k of keys) localStorage.removeItem(k);
+  } catch { /* ignore */ }
+}
+
+function resetInMemoryQuickDataForAuthChange(revalidateSubscribers: boolean): void {
+  if (_debounceTimer) {
+    clearTimeout(_debounceTimer);
+    _debounceTimer = null;
+  }
+  _hasHydratedFromServer = false;
+  _mutatedBeforeHydration = false;
+  _saveRevision += 1;
+  _baseline = null;
+  _boundBinding = captureCurrentBinding();
+  _pendingRemovedAllTexts.clear();
+  _preHydrationOps = [];
+  _pendingPhraseAdds.clear();
+  _pendingCommandAdds.clear();
+  quickDataResource.mutate(EMPTY_QUICK_DATA);
+  if (revalidateSubscribers && quickDataResource.hasSubscribers()) {
+    quickDataResource.invalidate();
+  }
+}
+
+function ensureAuthChangeSubscription(): void {
+  if (_authUnsubscribe) return;
+  try {
+    const fn = (apiModule as { subscribeAuthIdentityChange?: unknown }).subscribeAuthIdentityChange;
+    if (typeof fn === 'function') {
+      _authUnsubscribe = (fn as (listener: () => void) => () => void)(() => {
+        resetInMemoryQuickDataForAuthChange(true);
+      });
+    }
   } catch { /* ignore */ }
 }
 
@@ -339,36 +496,6 @@ export function normalizeQuickData(raw: unknown): QuickData {
   );
 }
 
-function mergeLocalFirst(local: string[], server: string[], max: number): string[] {
-  const merged: string[] = [];
-  const seen = new Set<string>();
-  for (const item of [...local, ...server]) {
-    if (seen.has(item)) continue;
-    seen.add(item);
-    merged.push(item);
-    if (merged.length >= max) break;
-  }
-  return merged;
-}
-
-function mergeTimestampRecords(
-  a?: Record<string, number>,
-  b?: Record<string, number>,
-): Record<string, number> | undefined {
-  if (!a && !b) return undefined;
-  const merged = new Map<string, number>();
-  for (const src of [a, b]) {
-    if (!src) continue;
-    for (const [key, raw] of Object.entries(src)) {
-      const ts = validTimestamp(raw);
-      if (ts === undefined) continue;
-      const existing = merged.get(key);
-      merged.set(key, existing === undefined ? ts : Math.max(existing, ts));
-    }
-  }
-  return merged.size > 0 ? Object.fromEntries(merged) : undefined;
-}
-
 function unionServerLocal(server: string[], local: string[]): string[] {
   const merged: string[] = [];
   const seen = new Set<string>();
@@ -380,32 +507,167 @@ function unionServerLocal(server: string[], local: string[]): string[] {
   return merged;
 }
 
-export function mergeQuickDataForHydration(server: QuickData, local: QuickData): QuickData {
-  const sessionHistoryMap = new Map<string, string[]>(Object.entries(server.sessionHistory));
+function mergeOrderedHistoryLists(
+  baselineList: readonly string[],
+  localList: readonly string[],
+  serverList: readonly string[],
+  localTsMap: Record<string, number> | undefined,
+  serverTsMap: Record<string, number> | undefined,
+  removedAllSet: ReadonlySet<string>,
+  max: number,
+): { entries: string[]; timestamps: Record<string, number> | undefined } {
+  const localSet = new Set(localList);
+  const removed = new Set<string>();
+  for (const item of baselineList) {
+    if (!localSet.has(item)) removed.add(item);
+  }
+  for (const item of removedAllSet) {
+    if (!localSet.has(item)) removed.add(item);
+  }
+  const survivingServer = serverList.filter((item) => !removed.has(item));
+  const combined: string[] = [];
+  const seen = new Set<string>();
+  for (const item of [...localList, ...survivingServer]) {
+    if (seen.has(item)) continue;
+    seen.add(item);
+    combined.push(item);
+  }
+  const tsMap = new Map<string, number>();
+  for (const item of combined) {
+    const localTs = validTimestamp(readOwnRecordValue(localTsMap, item));
+    const serverTs = validTimestamp(readOwnRecordValue(serverTsMap, item));
+    const best = localTs !== undefined && serverTs !== undefined
+      ? Math.max(localTs, serverTs)
+      : (localTs ?? serverTs);
+    if (best !== undefined) tsMap.set(item, best);
+  }
+  const ordered = tsMap.size > 0
+    ? combined
+        .map((item, idx) => ({ item, idx, ts: tsMap.get(item) ?? -1 }))
+        .sort((a, b) => (b.ts !== a.ts ? b.ts - a.ts : a.idx - b.idx))
+        .map((entry) => entry.item)
+    : combined;
+  const entries = ordered.slice(0, max);
+  const timestamps = pruneTimestampMap(entries, Object.fromEntries(tsMap));
+  return { entries, timestamps };
+}
+
+function mergeCustomListThreeWay(
+  baselineList: readonly string[],
+  localList: readonly string[],
+  serverList: readonly string[],
+): string[] {
+  const localSet = new Set(localList);
+  const removed = new Set(baselineList.filter((item) => !localSet.has(item)));
+  const added = localList.filter((item) => !baselineList.includes(item));
+  return unionServerLocal(serverList.filter((item) => !removed.has(item)), added);
+}
+
+export function mergeQuickDataThreeWay(
+  baseline: QuickData,
+  local: QuickData,
+  server: QuickData,
+  removedAllTexts?: readonly string[],
+): QuickData {
+  const removedAllSet = new Set<string>(removedAllTexts ?? []);
+  const globalMerged = mergeOrderedHistoryLists(
+    baseline.history,
+    local.history,
+    server.history,
+    local.historyTimestamps,
+    server.historyTimestamps,
+    removedAllSet,
+    GLOBAL_HISTORY_MAX,
+  );
+  const sessionNames = new Set([
+    ...Object.keys(baseline.sessionHistory),
+    ...Object.keys(local.sessionHistory),
+    ...Object.keys(server.sessionHistory),
+  ]);
+  const sessionHistoryMap = new Map<string, string[]>();
   const sessionTsMap = new Map<string, Record<string, number>>();
-  for (const session of new Set([...Object.keys(server.sessionHistory), ...Object.keys(local.sessionHistory)])) {
-    sessionHistoryMap.set(
-      session,
-      mergeLocalFirst(
-        readOwnRecordValue(local.sessionHistory, session) ?? [],
-        readOwnRecordValue(server.sessionHistory, session) ?? [],
-        SESSION_HISTORY_MAX,
-      ),
-    );
-    const mergedMap = mergeTimestampRecords(
-      readOwnRecordValue(server.sessionHistoryTimestamps, session),
+  for (const session of sessionNames) {
+    const mergedSession = mergeOrderedHistoryLists(
+      readOwnRecordValue(baseline.sessionHistory, session) ?? [],
+      readOwnRecordValue(local.sessionHistory, session) ?? [],
+      readOwnRecordValue(server.sessionHistory, session) ?? [],
       readOwnRecordValue(local.sessionHistoryTimestamps, session),
+      readOwnRecordValue(server.sessionHistoryTimestamps, session),
+      removedAllSet,
+      SESSION_HISTORY_MAX,
     );
-    if (mergedMap) sessionTsMap.set(session, mergedMap);
+    sessionHistoryMap.set(session, mergedSession.entries);
+    if (mergedSession.timestamps) sessionTsMap.set(session, mergedSession.timestamps);
   }
   return buildQuickDataWithPrunedTimestamps(
-    mergeLocalFirst(local.history, server.history, GLOBAL_HISTORY_MAX),
+    globalMerged.entries,
     Object.fromEntries(sessionHistoryMap),
-    mergeTimestampRecords(server.historyTimestamps, local.historyTimestamps),
+    globalMerged.timestamps,
     Object.fromEntries(sessionTsMap),
-    unionServerLocal(server.commands, local.commands),
-    unionServerLocal(server.phrases, local.phrases),
+    mergeCustomListThreeWay(baseline.commands, local.commands, server.commands),
+    mergeCustomListThreeWay(baseline.phrases, local.phrases, server.phrases),
   );
+}
+
+export function mergeQuickDataForHydration(server: QuickData, local: QuickData): QuickData {
+  return mergeQuickDataThreeWay(EMPTY_QUICK_DATA, local, server);
+}
+
+function applyPreHydrationOp(data: QuickData, op: PreHydrationOp): QuickData {
+  switch (op.type) {
+    case 'record_history':
+      return recordHistoryEntry(data, op.text, op.sessionName, op.ts);
+    case 'remove_history': {
+      const nextSessionHistoryMap = new Map<string, string[]>();
+      for (const [session, list] of Object.entries(data.sessionHistory)) {
+        nextSessionHistoryMap.set(session, list.filter((h) => h !== op.text));
+      }
+      return buildQuickDataWithPrunedTimestamps(
+        data.history.filter((h) => h !== op.text),
+        Object.fromEntries(nextSessionHistoryMap),
+        data.historyTimestamps,
+        data.sessionHistoryTimestamps,
+        data.commands,
+        data.phrases,
+      );
+    }
+    case 'remove_session_history': {
+      const sh = readOwnRecordValue(data.sessionHistory, op.sessionName) ?? [];
+      return buildQuickDataWithPrunedTimestamps(
+        data.history,
+        mapWithEntry(data.sessionHistory, op.sessionName, sh.filter((h) => h !== op.text)),
+        data.historyTimestamps,
+        data.sessionHistoryTimestamps,
+        data.commands,
+        data.phrases,
+      );
+    }
+    case 'clear_history':
+      return buildQuickDataWithPrunedTimestamps([], {}, undefined, undefined, data.commands, data.phrases);
+    case 'clear_session_history':
+      return buildQuickDataWithPrunedTimestamps(
+        data.history,
+        mapWithEntry(data.sessionHistory, op.sessionName, []),
+        data.historyTimestamps,
+        data.sessionHistoryTimestamps,
+        data.commands,
+        data.phrases,
+      );
+    case 'add_command':
+      return data.commands.includes(op.cmd) ? data : { ...data, commands: [...data.commands, op.cmd] };
+    case 'remove_command':
+      return { ...data, commands: data.commands.filter((c) => c !== op.cmd) };
+    case 'add_phrase':
+      return data.phrases.includes(op.phrase) ? data : { ...data, phrases: [...data.phrases, op.phrase] };
+    case 'remove_phrase':
+      return { ...data, phrases: data.phrases.filter((p) => p !== op.phrase) };
+  }
+}
+
+function applyPreHydrationOps(base: QuickData, ops: readonly PreHydrationOp[]): QuickData {
+  let acc = base;
+  for (const op of ops) acc = applyPreHydrationOp(acc, op);
+  return acc;
 }
 
 /**
@@ -429,43 +691,75 @@ function utf8ByteLength(str: string): number {
   return str.length * 3;
 }
 
+function buildPendingSnapshotRecord(
+  scope: AuthoritativeAuthScope,
+  rev: number,
+  target: QuickData,
+  extraRemovedAll?: readonly string[],
+): PendingQuickDataSnapshot {
+  const removedSet = new Set<string>(_pendingRemovedAllTexts);
+  if (extraRemovedAll) {
+    for (const item of extraRemovedAll) removedSet.add(item);
+  }
+  const targetGlobal = new Set(target.history);
+  for (const item of Array.from(removedSet)) {
+    if (targetGlobal.has(item)) removedSet.delete(item);
+  }
+  return {
+    v: 2,
+    scopeKey: scope.scopeKey,
+    saveRevision: rev,
+    baseline: _baseline ?? EMPTY_QUICK_DATA,
+    target,
+    ...(removedSet.size > 0 ? { removedAllTexts: Array.from(removedSet) } : {}),
+  };
+}
+
 function scheduleSave(data: QuickData, canPersist: boolean): void {
   if (!canPersist) return;
+  const binding = _boundBinding ?? captureCurrentBinding();
+  if (!isBindingCurrent(binding)) return;
   const rev = ++_saveRevision;
-  writePendingSnapshot(data);
+  if (binding.scope) {
+    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data));
+  }
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
     _debounceTimer = null;
-    runSave(data, { revision: rev });
+    runSave(data, { revision: rev, binding });
   }, 2000);
 }
 
 /**
- * Fire a PUT for the supplied snapshot. Snapshots the pending-add sets so
- * a successful response can drop only the items that were actually
- * persisted, while concurrent mutations during the in-flight PUT are
- * preserved for the next save cycle.
+ * Fire a PUT for the supplied snapshot. Snapshots the pending sets and the
+ * authoritative auth binding so a successful response clears ONLY matching
+ * revision/account state and concurrent mutations or identity changes are
+ * preserved safely.
  */
-function runSave(data: QuickData, opts?: { keepalive?: boolean; revision?: number }): void {
-  const rev = opts?.revision ?? _saveRevision;
+function runSave(data: QuickData, opts: { keepalive?: boolean; revision: number; binding: AuthBinding }): void {
+  if (!isBindingCurrent(opts.binding)) return;
+  const rev = opts.revision;
   const snapPhraseAdds = new Set(_pendingPhraseAdds);
   const snapCommandAdds = new Set(_pendingCommandAdds);
+  const snapRemovedAll = new Set(_pendingRemovedAllTexts);
   const init: RequestInit = { method: 'PUT', body: JSON.stringify({ data }) };
-  if (opts?.keepalive) init.keepalive = true;
+  if (opts.keepalive) init.keepalive = true;
   _inFlightSaves += 1;
   apiFetch('/api/quick-data', init)
     .then(() => {
-      // Persisted — remove just the items that were in the in-flight
-      // snapshot. New adds that arrived during the PUT remain pending and
-      // will be flushed by the next debounced save.
+      if (!isBindingCurrent(opts.binding)) return;
       for (const p of snapPhraseAdds) _pendingPhraseAdds.delete(p);
       for (const c of snapCommandAdds) _pendingCommandAdds.delete(c);
-      if (_saveRevision === rev) clearPendingSnapshot();
+      for (const r of snapRemovedAll) _pendingRemovedAllTexts.delete(r);
+      _baseline = data;
+      if (_saveRevision === rev) {
+        clearPendingSnapshotIfRevision(opts.binding.scope, rev);
+      }
     })
     .catch((err) => {
       console.error('[quick-data] save failed:', err);
-      // Pending sets + localStorage snapshot keep the in-flight items so
-      // the next scheduleSave, unload flush, or next-load hydration retries them.
+      // Pending sets + account-bound localStorage snapshot keep unconfirmed
+      // changes (including deletes/clears) for safe reload replay.
     })
     .finally(() => {
       _inFlightSaves = Math.max(0, _inFlightSaves - 1);
@@ -474,23 +768,27 @@ function runSave(data: QuickData, opts?: { keepalive?: boolean; revision?: numbe
 
 /**
  * Flush a pending debounced save during page hide / unload.
- * Stores an account-scoped pending snapshot before attempting network delivery;
+ * Stores an account-bound pending snapshot before attempting network delivery;
  * uses `fetch(..., { keepalive: true })` when under Chromium's 64 KiB cap, and
- * falls back to a standard PUT + persisted local retry when a 200-entry
- * snapshot exceeds the keepalive body limit.
+ * falls back to a standard PUT + persisted local retry when a large snapshot
+ * exceeds the keepalive body limit.
  */
 function flushPendingSave(): void {
   if (!_debounceTimer || !_hasHydratedFromServer) return;
   clearTimeout(_debounceTimer);
   _debounceTimer = null;
+  const binding = _boundBinding;
+  if (!isBindingCurrent(binding) || !binding) return;
   const rev = _saveRevision;
   const data = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
-  writePendingSnapshot(data);
+  if (binding.scope) {
+    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data));
+  }
   const body = JSON.stringify({ data });
   if (utf8ByteLength(body) <= KEEPALIVE_SAFE_BODY_BYTES) {
-    runSave(data, { keepalive: true, revision: rev });
+    runSave(data, { keepalive: true, revision: rev, binding });
   } else {
-    runSave(data, { revision: rev });
+    runSave(data, { revision: rev, binding });
   }
 }
 
@@ -499,41 +797,70 @@ function flushPendingSave(): void {
 // so TS needs the type up front to avoid `implicitly any` in the cycle.
 let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickData>({
   fetcher: async () => {
+    ensureAuthChangeSubscription();
+    const fetchBinding = captureCurrentBinding();
     try {
       const res = await apiFetch<{ data: QuickData }>('/api/quick-data');
+      if (!isBindingCurrent(fetchBinding)) {
+        return normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
+      }
       const server = normalizeQuickData(res.data);
+      const hadPriorHydration = _hasHydratedFromServer;
       _hasHydratedFromServer = true;
+      _boundBinding = fetchBinding;
       const shouldReplayPending = _debounceTimer === null && _inFlightSaves === 0;
-      const pendingLocal = shouldReplayPending ? readPendingSnapshot() : null;
+      const pendingLocal = shouldReplayPending ? readPendingSnapshot(fetchBinding.scope) : null;
       if (_mutatedBeforeHydration || pendingLocal) {
+        const preOps = _preHydrationOps.splice(0);
         _mutatedBeforeHydration = false;
-        const inMemory = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
-        const withPending = pendingLocal ? mergeQuickDataForHydration(server, pendingLocal) : server;
-        const merged = mergeQuickDataForHydration(withPending, inMemory);
+        let merged = pendingLocal
+          ? mergeQuickDataThreeWay(pendingLocal.baseline, pendingLocal.target, server, pendingLocal.removedAllTexts)
+          : server;
+        if (preOps.length > 0) {
+          merged = applyPreHydrationOps(merged, preOps);
+        }
+        _baseline = server;
+        if (pendingLocal?.removedAllTexts) {
+          const mergedGlobal = new Set(merged.history);
+          for (const item of pendingLocal.removedAllTexts) {
+            if (!mergedGlobal.has(item)) _pendingRemovedAllTexts.add(item);
+          }
+        }
         quickDataResource.mutate(merged);
-        if (pendingLocal) {
+        if (pendingLocal && fetchBinding.scope) {
           const rev = ++_saveRevision;
-          runSave(merged, { revision: rev });
+          writePendingSnapshot(
+            fetchBinding.scope,
+            buildPendingSnapshotRecord(fetchBinding.scope, rev, merged, pendingLocal.removedAllTexts),
+          );
+          runSave(merged, { revision: rev, binding: fetchBinding });
         }
         return applyPendingAdds(merged);
       }
+      _baseline = server;
+      if (hadPriorHydration && _debounceTimer !== null) {
+        return normalizeQuickData(quickDataResource.peek().value ?? applyPendingAdds(server));
+      }
       // Re-fetch path: ensure optimistic phrase/command additions that
-      // haven't yet been persisted survive the refresh. Without this, a
-      // visibility-triggered invalidate would replace the in-memory value
-      // with server data and erase the user's just-added entry from the UI.
+      // haven't yet been persisted survive the refresh.
       return applyPendingAdds(server);
     } catch {
+      if (!isBindingCurrent(fetchBinding)) {
+        return EMPTY_QUICK_DATA;
+      }
       // Don't wipe the in-memory value on transient fetch errors — keep
-      // whatever is currently in the resource (or local pending snapshot / EMPTY).
+      // whatever is currently in the resource (or verified account target / EMPTY).
       if (_hasHydratedFromServer) {
         return normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
       }
-      return readPendingSnapshot() ?? EMPTY_QUICK_DATA;
+      const pending = readPendingSnapshot(fetchBinding.scope);
+      return pending ? pending.target : EMPTY_QUICK_DATA;
     }
   },
 });
 
 function installQuickDataVisibilityListener(): void {
+  ensureAuthChangeSubscription();
   if (_visibilityInstalled || typeof document === 'undefined') return;
   _visibilityHandler = () => {
     if (document.visibilityState === 'visible' && quickDataResource.hasSubscribers()) {
@@ -557,11 +884,14 @@ function installQuickDataVisibilityListener(): void {
   _visibilityInstalled = true;
 }
 
-function updateQuickData(updater: (prev: QuickData) => QuickData): void {
+function updateQuickData(updater: (prev: QuickData) => QuickData, preOp?: PreHydrationOp): void {
   const prev = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
   const next = updater(prev);
   if (next === prev) return;
-  if (!_hasHydratedFromServer) _mutatedBeforeHydration = true;
+  if (!_hasHydratedFromServer) {
+    _mutatedBeforeHydration = true;
+    if (preOp) _preHydrationOps.push(preOp);
+  }
   quickDataResource.set(next);
   scheduleSave(next, _hasHydratedFromServer);
 }
@@ -584,7 +914,13 @@ export interface UseQuickDataResult {
 // object useQuickData() returns must keep its identity between renders, or
 // every memoized consumer (panes, windows, cards, composers) re-renders with it.
 const recordHistory = (text: string, sessionName?: string) => {
-  updateQuickData((prev) => recordHistoryEntry(prev, text, sessionName));
+  const trimmed = text.trim();
+  const ts = Math.trunc(Date.now());
+  if (trimmed) _pendingRemovedAllTexts.delete(trimmed);
+  updateQuickData(
+    (prev) => recordHistoryEntry(prev, text, sessionName, ts),
+    trimmed ? { type: 'record_history', text: trimmed, sessionName, ts } : undefined,
+  );
 };
 
 const addCommand = (cmd: string) => {
@@ -594,27 +930,40 @@ const addCommand = (cmd: string) => {
   // (a no-op `set` doesn't trigger one, but defensive ordering keeps
   // the invariant simple) sees the addition.
   _pendingCommandAdds.add(trimmed);
-  updateQuickData((prev) => prev.commands.includes(trimmed) ? prev : { ...prev, commands: [...prev.commands, trimmed] });
+  updateQuickData(
+    (prev) => prev.commands.includes(trimmed) ? prev : { ...prev, commands: [...prev.commands, trimmed] },
+    { type: 'add_command', cmd: trimmed },
+  );
 };
 
 const addPhrase = (phrase: string) => {
   const trimmed = phrase.trim();
   if (!trimmed) return;
   _pendingPhraseAdds.add(trimmed);
-  updateQuickData((prev) => prev.phrases.includes(trimmed) ? prev : { ...prev, phrases: [...prev.phrases, trimmed] });
+  updateQuickData(
+    (prev) => prev.phrases.includes(trimmed) ? prev : { ...prev, phrases: [...prev.phrases, trimmed] },
+    { type: 'add_phrase', phrase: trimmed },
+  );
 };
 
 const removeCommand = (cmd: string) => {
   // If the user adds-then-removes inside the debounce window, drop the
   // pending entry — there is nothing to preserve across a refresh.
   _pendingCommandAdds.delete(cmd);
-  updateQuickData((prev) => prev.commands.includes(cmd) ? { ...prev, commands: prev.commands.filter((c) => c !== cmd) } : prev);
+  updateQuickData(
+    (prev) => prev.commands.includes(cmd) ? { ...prev, commands: prev.commands.filter((c) => c !== cmd) } : prev,
+    { type: 'remove_command', cmd },
+  );
 };
 const removePhrase = (phrase: string) => {
   _pendingPhraseAdds.delete(phrase);
-  updateQuickData((prev) => prev.phrases.includes(phrase) ? { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) } : prev);
+  updateQuickData(
+    (prev) => prev.phrases.includes(phrase) ? { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) } : prev,
+    { type: 'remove_phrase', phrase },
+  );
 };
 const removeHistory = (text: string) => {
+  _pendingRemovedAllTexts.add(text);
   updateQuickData((prev) => {
     const inGlobal = prev.history.includes(text);
     let inAnySession = false;
@@ -636,7 +985,7 @@ const removeHistory = (text: string) => {
       prev.commands,
       prev.phrases,
     );
-  });
+  }, { type: 'remove_history', text });
 };
 const removeSessionHistory = (sessionName: string, text: string) => {
   updateQuickData((prev) => {
@@ -650,7 +999,7 @@ const removeSessionHistory = (sessionName: string, text: string) => {
       prev.commands,
       prev.phrases,
     );
-  });
+  }, { type: 'remove_session_history', sessionName, text });
 };
 const clearHistory = () => {
   updateQuickData((prev) => {
@@ -659,7 +1008,7 @@ const clearHistory = () => {
       return prev;
     }
     return buildQuickDataWithPrunedTimestamps([], {}, undefined, undefined, prev.commands, prev.phrases);
-  });
+  }, { type: 'clear_history' });
 };
 const clearSessionHistory = (sessionName: string) => {
   updateQuickData((prev) => (readOwnRecordValue(prev.sessionHistory, sessionName) ?? []).length === 0
@@ -671,7 +1020,7 @@ const clearSessionHistory = (sessionName: string) => {
         prev.sessionHistoryTimestamps,
         prev.commands,
         prev.phrases,
-      ));
+      ), { type: 'clear_session_history', sessionName });
 };
 
 
@@ -691,8 +1040,16 @@ export function __simulateReloadForTests(): void {
   _mutatedBeforeHydration = false;
   _saveRevision = 0;
   _inFlightSaves = 0;
+  _baseline = null;
+  _boundBinding = null;
+  _pendingRemovedAllTexts.clear();
+  _preHydrationOps = [];
   _pendingPhraseAdds.clear();
   _pendingCommandAdds.clear();
+  if (_authUnsubscribe) {
+    try { _authUnsubscribe(); } catch { /* ignore */ }
+    _authUnsubscribe = null;
+  }
   if (_visibilityHandler && typeof document !== 'undefined') {
     document.removeEventListener('visibilitychange', _visibilityHandler);
   }

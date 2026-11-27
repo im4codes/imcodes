@@ -7,6 +7,17 @@ import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-libra
 import { useState } from 'preact/hooks';
 
 const apiFetchMock = vi.fn();
+let mockExpectedUserId: string | null = null;
+let mockApiBaseUrl = 'https://im.test';
+let mockAuthIdentityEpoch = 1;
+const mockAuthIdentityListeners = new Set<() => void>();
+
+function setMockAuthIdentity(userId: string | null, baseUrl = mockApiBaseUrl): void {
+  mockExpectedUserId = userId;
+  mockApiBaseUrl = baseUrl;
+  mockAuthIdentityEpoch += 1;
+  for (const listener of [...mockAuthIdentityListeners]) listener();
+}
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -48,6 +59,13 @@ vi.mock('../../src/components/file-browser-lazy.js', async () => {
 });
 vi.mock('../../src/api.js', () => ({
   apiFetch: (...args: unknown[]) => apiFetchMock(...args),
+  getExpectedUserId: () => mockExpectedUserId,
+  getApiBaseUrl: () => mockApiBaseUrl,
+  getAuthIdentityEpoch: () => mockAuthIdentityEpoch,
+  subscribeAuthIdentityChange: (listener: () => void) => {
+    mockAuthIdentityListeners.add(listener);
+    return () => { mockAuthIdentityListeners.delete(listener); };
+  },
 }));
 
 import {
@@ -832,11 +850,21 @@ describe('QuickInputPanel history scope', () => {
 describe('useQuickData persistence guard', () => {
   beforeEach(() => {
     apiFetchMock.mockReset();
+    localStorage.clear();
+    mockExpectedUserId = null;
+    mockApiBaseUrl = 'https://im.test';
+    mockAuthIdentityEpoch = 1;
+    mockAuthIdentityListeners.clear();
     vi.useFakeTimers();
   });
 
   afterEach(() => {
     __resetQuickDataForTests();
+    localStorage.clear();
+    mockExpectedUserId = null;
+    mockApiBaseUrl = 'https://im.test';
+    mockAuthIdentityEpoch = 1;
+    mockAuthIdentityListeners.clear();
     vi.useRealTimers();
     cleanup();
   });
@@ -1315,8 +1343,9 @@ describe('useQuickData persistence guard', () => {
     return record && Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
   }
 
-  it('persists a >64KB 200-entry snapshot across pagehide without keepalive failure and replays it to server on reload scoped by account', async () => {
-    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'https://im.test' }));
+  it('persists a >64KB 200-entry snapshot across pagehide without keepalive failure and replays it to server on reload scoped by authoritative API account', async () => {
+    setMockAuthIdentity('user-1', 'https://im.test');
+    const pendingKeyUser1 = `imcodes.quick_data.pending:${encodeURIComponent('https://im.test|user-1')}`;
     const initial200 = Array.from({ length: 200 }, (_, i) => `long-item-${i}-${'x'.repeat(240)}`);
     const serverData: QuickData = {
       history: initial200,
@@ -1353,11 +1382,12 @@ describe('useQuickData persistence guard', () => {
     await Promise.resolve();
     expect(apiFetchMock).toHaveBeenCalledTimes(2);
     expect((apiFetchMock.mock.calls[1][1] as RequestInit).keepalive).toBeUndefined();
+    expect(localStorage.getItem(pendingKeyUser1)).not.toBeNull();
 
     // Account isolation: user-2 does NOT see user-1's unconfirmed backup.
     view.unmount();
     __simulateReloadForTests();
-    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-2', baseUrl: 'https://im.test' }));
+    setMockAuthIdentity('user-2', 'https://im.test');
     apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
     const viewUser2 = render(<BigHarness />);
     await waitFor(() => expect(quick.loaded).toBe(true));
@@ -1366,7 +1396,7 @@ describe('useQuickData persistence guard', () => {
 
     // Switch back to user-1 and reload: server still returns old snapshot, but backup restores + replays PUT 200 and clears local backup.
     __simulateReloadForTests();
-    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'https://im.test' }));
+    setMockAuthIdentity('user-1', 'https://im.test');
     apiFetchMock.mockResolvedValueOnce({ data: serverData });
     apiFetchMock.mockResolvedValueOnce({ ok: true });
 
@@ -1380,7 +1410,205 @@ describe('useQuickData persistence guard', () => {
     expect(apiFetchMock.mock.calls[4][0]).toBe('/api/quick-data');
     expect((apiFetchMock.mock.calls[4][1] as RequestInit).method).toBe('PUT');
     await waitFor(() => {
-      expect(localStorage.getItem('imcodes.quick_data.pending:https://im.test:user-1')).toBeNull();
+      expect(localStorage.getItem(pendingKeyUser1)).toBeNull();
     });
+  });
+
+  it('replays failed deletes and clears (This Session, All single delete, All clear) without restoring deleted items or timestamps while preserving concurrent device additions', async () => {
+    setMockAuthIdentity('user-1', 'https://im.test');
+    let quick!: ReturnType<typeof useQuickData>;
+    function ReplayHarness() {
+      quick = useQuickData();
+      return <div data-testid="loaded">{String(quick.loaded)}</div>;
+    }
+
+    const baseServer: QuickData = {
+      history: ['shared-cmd', 'keep-cmd'],
+      sessionHistory: { 'sess-a': ['shared-cmd', 'a-only'], 'sess-b': ['b-only'] },
+      historyTimestamps: { 'shared-cmd': 1000, 'keep-cmd': 2000 },
+      sessionHistoryTimestamps: {
+        'sess-a': { 'shared-cmd': 1000, 'a-only': 1500 },
+        'sess-b': { 'b-only': 2500 },
+      },
+      commands: [],
+      phrases: [],
+    };
+
+    // 1. Clear "This Session" (sess-a) + 503 on pagehide -> reload (with concurrent Device B addition) keeps sess-a empty & timestamps pruned.
+    apiFetchMock.mockResolvedValueOnce({ data: baseServer });
+    apiFetchMock.mockRejectedValueOnce(new Error('503 Service Unavailable'));
+    const view1 = render(<ReplayHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    act(() => { quick.clearSessionHistory('sess-a'); });
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+
+    view1.unmount();
+    __simulateReloadForTests();
+    const serverWithDeviceB: QuickData = {
+      ...baseServer,
+      history: ['device-b-new', 'shared-cmd', 'keep-cmd'],
+      sessionHistory: { ...baseServer.sessionHistory, 'sess-c': ['device-b-new'] },
+      historyTimestamps: { ...baseServer.historyTimestamps, 'device-b-new': 5000 },
+      sessionHistoryTimestamps: { ...baseServer.sessionHistoryTimestamps, 'sess-c': { 'device-b-new': 5000 } },
+    };
+    apiFetchMock.mockResolvedValueOnce({ data: serverWithDeviceB });
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+
+    const view1Reload = render(<ReplayHarness />);
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(4));
+    expect(quick.data.sessionHistory['sess-a']).toEqual([]);
+    expect(quick.data.sessionHistoryTimestamps?.['sess-a']).toBeUndefined();
+    expect(quick.data.history).toEqual(['device-b-new', 'keep-cmd', 'shared-cmd']);
+    expect(quick.data.sessionHistory['sess-c']).toEqual(['device-b-new']);
+    const put1 = JSON.parse((apiFetchMock.mock.calls[3][1] as RequestInit).body as string).data as QuickData;
+    expect(put1.sessionHistory['sess-a']).toEqual([]);
+    expect(put1.sessionHistoryTimestamps?.['sess-a']).toBeUndefined();
+    expect(put1.history).toContain('device-b-new');
+    view1Reload.unmount();
+
+    // 2. Single "All" delete ('shared-cmd') + 503 on pagehide -> reload does NOT revive 'shared-cmd' or its timestamps.
+    __resetQuickDataForTests();
+    apiFetchMock.mockReset();
+    apiFetchMock.mockResolvedValueOnce({ data: baseServer });
+    apiFetchMock.mockRejectedValueOnce(new Error('503 Service Unavailable'));
+    const view2 = render(<ReplayHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    act(() => { quick.removeHistory('shared-cmd'); });
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+
+    view2.unmount();
+    __simulateReloadForTests();
+    apiFetchMock.mockResolvedValueOnce({ data: baseServer });
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+    const view2Reload = render(<ReplayHarness />);
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(4));
+    expect(quick.data.history).toEqual(['keep-cmd']);
+    expect(quick.data.historyTimestamps).toEqual({ 'keep-cmd': 2000 });
+    expect(quick.data.sessionHistory['sess-a']).toEqual(['a-only']);
+    expect(quick.data.sessionHistoryTimestamps?.['sess-a']).toEqual({ 'a-only': 1500 });
+    const put2 = JSON.parse((apiFetchMock.mock.calls[3][1] as RequestInit).body as string).data as QuickData;
+    expect(put2.history).toEqual(['keep-cmd']);
+    expect(put2.historyTimestamps).toEqual({ 'keep-cmd': 2000 });
+    view2Reload.unmount();
+
+    // 3. Clear "All" + 503 on pagehide -> reload removes all prior records & timestamps while keeping concurrent Device B additions.
+    __resetQuickDataForTests();
+    apiFetchMock.mockReset();
+    apiFetchMock.mockResolvedValueOnce({ data: baseServer });
+    apiFetchMock.mockRejectedValueOnce(new Error('503 Service Unavailable'));
+    const view3 = render(<ReplayHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    act(() => { quick.clearHistory(); });
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+
+    view3.unmount();
+    __simulateReloadForTests();
+    apiFetchMock.mockResolvedValueOnce({ data: serverWithDeviceB });
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+    render(<ReplayHarness />);
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(4));
+    expect(quick.data.history).toEqual(['device-b-new']);
+    expect(quick.data.historyTimestamps).toEqual({ 'device-b-new': 5000 });
+    expect(quick.data.sessionHistory['sess-a']).toEqual([]);
+    expect(quick.data.sessionHistory['sess-b']).toEqual([]);
+    expect(quick.data.sessionHistory['sess-c']).toEqual(['device-b-new']);
+    expect(quick.data.sessionHistoryTimestamps).toEqual({ 'sess-c': { 'device-b-new': 5000 } });
+    const put3 = JSON.parse((apiFetchMock.mock.calls[3][1] as RequestInit).body as string).data as QuickData;
+    expect(put3.history).toEqual(['device-b-new']);
+    expect(put3.historyTimestamps).toEqual({ 'device-b-new': 5000 });
+  });
+
+  it('isolates same-origin two-tab login changes, rejects shared anon fallback when identity is unknown, and ignores stale async completions', async () => {
+    let quick!: ReturnType<typeof useQuickData>;
+    function AuthHarness() {
+      quick = useQuickData();
+      return <div data-testid="hist">{quick.data.history.join(',')}</div>;
+    }
+
+    // 1. Unknown identity (expectedUserId === null) must never write to any shared 'anon' key.
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
+    apiFetchMock.mockRejectedValueOnce(new Error('offline'));
+    const anonView = render(<AuthHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+    act(() => { quick.recordHistory('anon-secret', 's0'); });
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+    expect(localStorage.length).toBe(0);
+    anonView.unmount();
+
+    // 2. Two-tab same-origin scenario: Tab A loads as user-A; Tab B overwrites shared localStorage.rcc_auth to user-B.
+    __resetQuickDataForTests();
+    apiFetchMock.mockReset();
+    setMockAuthIdentity('user-A', 'https://im.test');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-A', baseUrl: 'https://im.test' }));
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
+    apiFetchMock.mockRejectedValueOnce(new Error('expected_user_id_mismatch'));
+
+    const tabAView = render(<AuthHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    // Tab B logs in on the same origin, overwriting shared localStorage rcc_auth while Tab A's API identity remains user-A.
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-B', baseUrl: 'https://im.test' }));
+    act(() => { quick.recordHistory('user-A-private-secret', 'sess-a'); });
+
+    // Debounced backup and pagehide PUT fail under identity guard; pending backup stays ONLY in user-A's namespace.
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+    const keyUserA = `imcodes.quick_data.pending:${encodeURIComponent('https://im.test|user-A')}`;
+    const keyUserB = `imcodes.quick_data.pending:${encodeURIComponent('https://im.test|user-B')}`;
+    expect(localStorage.getItem(keyUserA)).not.toBeNull();
+    expect(localStorage.getItem(keyUserB)).toBeNull();
+    for (let i = 0; i < localStorage.length; i++) {
+      expect(localStorage.key(i)).not.toContain('anon');
+    }
+
+    // Tab B opens cleanly as user-B: sees empty server state, NEVER reads user-A's backup, and sends NO PUT.
+    tabAView.unmount();
+    __simulateReloadForTests();
+    apiFetchMock.mockReset();
+    setMockAuthIdentity('user-B', 'https://im.test');
+    apiFetchMock.mockResolvedValueOnce({ data: { history: ['b-own'], sessionHistory: {}, commands: [], phrases: [] } });
+    const tabBView = render(<AuthHarness />);
+    await waitFor(() => expect(screen.getByTestId('hist').textContent).toBe('b-own'));
+    expect(apiFetchMock).toHaveBeenCalledTimes(1); // Only GET, no PUT carrying user-A data!
+
+    // 3. Stale in-flight async PUT from user-A resolving after switching to user-B must not wipe user-B's pending write.
+    tabBView.unmount();
+    __resetQuickDataForTests();
+    apiFetchMock.mockReset();
+    setMockAuthIdentity('user-A', 'https://im.test');
+    let resolveInFlightPut!: (val: unknown) => void;
+    apiFetchMock
+      .mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } })
+      .mockReturnValueOnce(new Promise((resolve) => { resolveInFlightPut = resolve; }))
+      .mockResolvedValueOnce({ data: { history: ['b-initial'], sessionHistory: {}, commands: [], phrases: [] } })
+      .mockRejectedValueOnce(new Error('503'));
+
+    const switchView = render(<AuthHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+    act(() => { quick.recordHistory('a-inflight', 's1'); });
+    vi.advanceTimersByTime(2000);
+    expect(apiFetchMock).toHaveBeenCalledTimes(2); // GET + in-flight PUT for user-A
+
+    // Switch authoritative identity to user-B while user-A's PUT is still in flight, then write pending backup for user-B.
+    act(() => { setMockAuthIdentity('user-B', 'https://im.test'); });
+    await waitFor(() => expect(screen.getByTestId('hist').textContent).toBe('b-initial'));
+    act(() => { quick.recordHistory('b-pending', 's2'); });
+    expect(localStorage.getItem(keyUserB)).not.toBeNull();
+
+    // User-A's old PUT now resolves — must NOT touch user-B's UI or user-B's pending backup!
+    await act(async () => {
+      resolveInFlightPut({ ok: true });
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('hist').textContent).toBe('b-pending,b-initial');
+    expect(localStorage.getItem(keyUserB)).not.toBeNull();
+    switchView.unmount();
   });
 });
