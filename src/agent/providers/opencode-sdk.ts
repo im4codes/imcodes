@@ -158,6 +158,7 @@ export interface OpenCodeClientLike {
     }): Promise<void>;
     compact(input: { sessionID: string; id?: string }, requestOptions?: { signal?: AbortSignal }): Promise<Record<string, unknown>>;
     interrupt(input: { sessionID: string }): Promise<{ interrupted?: boolean } | void>;
+    active?(): Promise<Record<string, unknown>>;
     inbox?: {
       list(input: { sessionID: string }): Promise<Array<Record<string, unknown>> | { data?: Array<Record<string, unknown>> }>;
       cancel?(input: { sessionID: string; inboxID: string }): Promise<void>;
@@ -2354,6 +2355,12 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       runtimeConfig: { ...config },
       nativeAgentFence: fenceOf(nativeAgentsFenced),
     };
+    const preLockOwnerId = this.providerToRoute.get(providerSessionId);
+    const preLockOwner = preLockOwnerId ? this.sessions.get(preLockOwnerId) : undefined;
+    const preLockOwnerWasBusy = Boolean(preLockOwner && preLockOwner !== state && preLockOwner.busy);
+    if (preLockOwner && preLockOwner !== state) {
+      preLockOwner.pendingAdmissionAbort?.abort();
+    }
     await this.withProviderSessionLock(providerSessionId, async () => {
       this.sessions.set(routeId, state);
       const previousOwnerId = this.providerToRoute.get(providerSessionId);
@@ -2361,7 +2368,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       if (previousOwner && previousOwner !== state) {
         previousOwner.syncedMcpSignature = null;
         previousOwner.pendingAdmissionAbort?.abort();
-        if (previousOwner.busy) {
+        if (previousOwner.busy || preLockOwnerWasBusy) {
           previousOwner.cancelled = true;
           previousOwner.generation += 1;
           await previousOwner.client.session.interrupt({ sessionID: providerSessionId }).catch(() => {});
@@ -2409,6 +2416,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   private async closeOrDetachRoute(sessionId: string, interruptBusyOwner: boolean): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    const preLockWasBusy = Boolean(interruptBusyOwner && state.busy);
+    state.pendingAdmissionAbort?.abort();
     let removedSoleProviderRoute = false;
     await this.withProviderSessionLock(state.providerSessionId, async () => {
       if (this.sessions.get(sessionId) !== state) return;
@@ -2428,7 +2437,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       else this.providerRouteOrder.delete(state.providerSessionId);
 
       removedSoleProviderRoute = wasOwner && remainingRoutes.length === 0;
-      if (interruptBusyOwner && state.busy && removedSoleProviderRoute) {
+      if (interruptBusyOwner && (state.busy || preLockWasBusy) && removedSoleProviderRoute) {
         await state.client.session.interrupt({ sessionID: state.providerSessionId }).catch(() => {});
       }
       if (wasOwner) {
@@ -4544,18 +4553,38 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         );
         return;
       }
-      if (state.retryTerminalHint === 'session.execution.failed') {
-        const normalized = state.retryTerminalError
-          ? this.normalizeError(state.retryTerminalError, 'session')
-          : providerError(
-            PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-            'OpenCode retry execution failed before generating an assistant response',
-            true,
-          );
-        this.failOnce(state, normalized.recoverable ? normalized : { ...normalized, recoverable: true });
-        return;
-      }
-      if (state.retryTerminalHint === 'session.execution.interrupted') {
+      if (state.retryTerminalHint === 'session.execution.failed' || state.retryTerminalHint === 'session.execution.interrupted') {
+        if (typeof state.client.session.active === 'function') {
+          let activeMap: Record<string, unknown> | null = null;
+          try {
+            const rawActive = await withOpenCodeRequestTimeout(
+              state.client.session.active(),
+              'auth-heal retry active check',
+            );
+            if (!canContinue() || state.retryActivitySeq !== activitySeqAtStart) return;
+            activeMap = rawActive && typeof rawActive === 'object' && 'data' in rawActive && rawActive.data && typeof rawActive.data === 'object'
+              ? (rawActive.data as Record<string, unknown>)
+              : (rawActive && typeof rawActive === 'object' ? rawActive : null);
+          } catch {
+            // Active status check failed -> execution status unknown -> preserve active retry turn.
+            return;
+          }
+          if (!activeMap || Object.prototype.hasOwnProperty.call(activeMap, state.providerSessionId)) {
+            // Session is still running (quiet pre-first-byte/tool phase) or status unknown -> do not fail Retry.
+            return;
+          }
+        }
+        if (state.retryTerminalHint === 'session.execution.failed') {
+          const normalized = state.retryTerminalError
+            ? this.normalizeError(state.retryTerminalError, 'session')
+            : providerError(
+              PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+              'OpenCode retry execution failed before generating an assistant response',
+              true,
+            );
+          this.failOnce(state, normalized.recoverable ? normalized : { ...normalized, recoverable: true });
+          return;
+        }
         this.failOnce(
           state,
           providerError(

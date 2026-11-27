@@ -154,6 +154,7 @@ function createHarness() {
       switchModel: vi.fn(async () => undefined),
       compact: vi.fn(async () => ({ id: 'msg-compact-1' })),
       interrupt: vi.fn(async () => ({ interrupted: true })),
+      active: vi.fn(async () => ({})),
       message: {
         get: vi.fn(async (input: any) => {
           const msg = messages.get(input?.messageID);
@@ -4672,65 +4673,52 @@ describe('OpenCodeSdkProvider', () => {
       agentId: DEFAULT_OPENCODE_MODEL_ID,
     });
 
-    // Gate sessions.prompt inside withProviderSessionLock for routeA
+    // Pending sessions.prompt inside withProviderSessionLock for routeA is aborted immediately by routeB takeover (not hung for 15s)
     const promptGate = deferred<{ id: string; sessionID: string; type: string }>();
     harness.client.sessions.prompt.mockImplementationOnce(async () => promptGate.promise);
-    const sendA = provider.send(routeA, 'locked prompt A');
+    const sendAResult = provider.send(routeA, 'locked prompt A').then(
+      () => 'resolved',
+      () => 'rejected',
+    );
     await vi.waitFor(() => expect(harness.client.sessions.prompt).toHaveBeenCalledOnce());
 
-    // Start handoff to routeB concurrently: must block on the same providerSessionId lock until promptGate resolves
-    let resolvedB = false;
-    const createB = provider.createSession({
+    const routeB = await provider.createSession({
       sessionKey: 'handoff-lock-b',
       sessionName: 'deck_handoff_b',
       cwd: '/tmp/project',
       skipCreate: true,
       resumeId: 'oc-shared-1',
       agentId: DEFAULT_OPENCODE_MODEL_ID,
-    }).then((id) => {
-      resolvedB = true;
-      return id;
     });
-
-    await new Promise((r) => setTimeout(r, 30));
-    expect(resolvedB).toBe(false);
-    expect((provider as any).providerToRoute.get('oc-shared-1')).toBe(routeA);
-
-    promptGate.resolve({ id: 'msg-a-1', sessionID: 'oc-shared-1', type: 'user' });
-    await sendA;
-    const routeB = await createB;
-    expect(resolvedB).toBe(true);
+    await expect(sendAResult).resolves.toBe('rejected');
     expect((provider as any).providerToRoute.get('oc-shared-1')).toBe(routeB);
     expect(harness.client.session.interrupt).toHaveBeenCalledWith({ sessionID: 'oc-shared-1' });
+    promptGate.resolve({ id: 'msg-a-1', sessionID: 'oc-shared-1', type: 'user' });
 
-    // Compact admission on stale routeA is also serialized and rejected cleanly after B owns the session
+    // Compact admission on stale routeA is rejected cleanly after B owns the session
     await expect(provider.send(routeA, '/compact')).rejects.toThrow(/owner/i);
     expect(harness.client.session.compact).not.toHaveBeenCalled();
 
-    // Compact on current owner routeB executes inside lock and blocks concurrent routeC handoff until compact resolves
+    // Pending compact on current owner routeB is also aborted immediately when routeC takes over ownership
     const compactGate = deferred<{ id: string }>();
     harness.client.session.compact.mockImplementationOnce(async () => compactGate.promise);
-    const compactB = provider.send(routeB, '/compact');
+    const compactBResult = provider.send(routeB, '/compact').then(
+      () => 'resolved',
+      () => 'rejected',
+    );
     await vi.waitFor(() => expect(harness.client.session.compact).toHaveBeenCalledOnce());
 
-    let resolvedC = false;
-    const createC = provider.createSession({
+    const routeC = await provider.createSession({
       sessionKey: 'handoff-lock-c',
       sessionName: 'deck_handoff_c',
       cwd: '/tmp/project',
       skipCreate: true,
       resumeId: 'oc-shared-1',
       agentId: DEFAULT_OPENCODE_MODEL_ID,
-    }).then((id) => {
-      resolvedC = true;
-      return id;
     });
-    await new Promise((r) => setTimeout(r, 30));
-    expect(resolvedC).toBe(false);
-    compactGate.resolve({ id: 'msg-compact-b' });
-    await compactB;
-    const routeC = await createC;
+    await expect(compactBResult).resolves.toBe('rejected');
     expect((provider as any).providerToRoute.get('oc-shared-1')).toBe(routeC);
+    compactGate.resolve({ id: 'msg-compact-b' });
     await provider.disconnect();
   });
 
@@ -5267,6 +5255,137 @@ describe('OpenCodeSdkProvider', () => {
       h.queue.push({ type: 'session.step.ended', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-retry-live', finish: 'stop' } });
       await vi.waitFor(() => expect(completes).toHaveLength(1));
       expect(completes[0].content).toBe('Live retry succeeded');
+      expect(errors).toHaveLength(0);
+      await p.disconnect();
+    }
+  });
+
+  it('aborts in-flight SDK admission signal immediately on endSession and route handoff before timeout', async () => {
+    // 1. endSession (close) while sessions.prompt is still waiting on network: aborts signal immediately without waiting 15s timeout
+    {
+      const h = createHarness();
+      const promptGate = deferred<{ id: string; sessionID: string; type: string }>();
+      let observedSignal: AbortSignal | undefined;
+      let promptCalls = 0;
+      h.client.sessions.prompt = (async (_input: any, opts?: { signal?: AbortSignal }) => {
+        promptCalls += 1;
+        observedSignal = opts?.signal;
+        return promptGate.promise;
+      }) as any;
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', h.queue.close, { once: true });
+        return { client: h.client as any, server: h.server };
+      });
+      const p = new OpenCodeSdkProvider();
+      await p.connect({});
+      const r = await p.createSession({ sessionKey: 'close-pre-timeout', cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+
+      const sendP = p.send(r, 'hanging send before close').catch(() => 'rejected');
+      await vi.waitFor(() => expect(promptCalls).toBe(1));
+      expect(observedSignal?.aborted).toBe(false);
+
+      await p.endSession(r);
+      expect(observedSignal?.aborted).toBe(true);
+      promptGate.resolve({ id: 'late-close', sessionID: 'oc-session-1', type: 'user' });
+      await sendP;
+      await p.disconnect();
+    }
+
+    // 2. Concurrent routeB takeover while routeA sessions.prompt is suspended: pre-lock aborts A signal immediately before timeout
+    {
+      const h = createHarness();
+      h.sessions.set('oc-handoff-imm', { id: 'oc-handoff-imm', title: 'imm', location: { directory: '/tmp/project' } });
+      const promptGate = deferred<{ id: string; sessionID: string; type: string }>();
+      let observedSignal: AbortSignal | undefined;
+      let promptCalls = 0;
+      h.client.sessions.prompt = (async (_input: any, opts?: { signal?: AbortSignal }) => {
+        promptCalls += 1;
+        observedSignal = opts?.signal;
+        return promptGate.promise;
+      }) as any;
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', h.queue.close, { once: true });
+        return { client: h.client as any, server: h.server };
+      });
+      const p = new OpenCodeSdkProvider();
+      await p.connect({});
+      const routeA = await p.createSession({
+        sessionKey: 'imm-a',
+        sessionName: 'deck_imm_a',
+        cwd: '/tmp/project',
+        skipCreate: true,
+        resumeId: 'oc-handoff-imm',
+        agentId: DEFAULT_OPENCODE_MODEL_ID,
+      });
+
+      const sendA = p.send(routeA, 'slow before handoff').catch(() => 'rejected');
+      await vi.waitFor(() => expect(promptCalls).toBe(1));
+      expect(observedSignal?.aborted).toBe(false);
+
+      const routeBPromise = p.createSession({
+        sessionKey: 'imm-b',
+        sessionName: 'deck_imm_b',
+        cwd: '/tmp/project',
+        skipCreate: true,
+        resumeId: 'oc-handoff-imm',
+        agentId: DEFAULT_OPENCODE_MODEL_ID,
+      });
+      await vi.waitFor(() => expect(observedSignal?.aborted).toBe(true));
+      const routeB = await routeBPromise;
+      expect((p as any).providerToRoute.get('oc-handoff-imm')).toBe(routeB);
+
+      promptGate.resolve({ id: 'late-handoff', sessionID: 'oc-handoff-imm', type: 'user' });
+      await expect(sendA).resolves.toBe('rejected');
+      await p.disconnect();
+    }
+  });
+
+  it('keeps quiet running retry alive via session.active() after leaving inbox until late first-byte completes once', async () => {
+    const defaultModelCatalog = {
+      data: [{ id: DEFAULT_OPENCODE_MODEL_ID, modelID: 'big-pickle', providerID: 'opencode', enabled: true, type: 'chat' }],
+    };
+
+    // 1. Retry already left inbox (inbox.list === []), no assistant/first-byte yet, session.active() reports running -> stays alive!
+    // 2. Also session.active() throwing (unknown execution state) keeps turn alive!
+    for (const mode of ['active-running', 'active-unknown'] as const) {
+      const h = createHarness();
+      h.client.model.list.mockResolvedValue(defaultModelCatalog);
+      h.credentials.push({ id: `cred-${mode}`, integrationID: 'opencode', active: true, value: { type: 'key', key: 'sk-old' } } as any);
+      (h.client.session as any).inbox = { list: vi.fn(async () => []) };
+      if (mode === 'active-running') {
+        h.client.session.active.mockResolvedValue({ 'oc-session-1': { type: 'running' } });
+      } else {
+        h.client.session.active.mockRejectedValue(new Error('transient status rpc unavailable'));
+      }
+      openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+        options.signal.addEventListener('abort', h.queue.close, { once: true });
+        return { client: h.client as any, server: h.server };
+      });
+
+      const p = new OpenCodeSdkProvider();
+      const completes: any[] = [];
+      const errors: any[] = [];
+      p.onComplete((_s, m) => completes.push(m));
+      p.onError((_s, e) => errors.push(e));
+      await p.connect({});
+      const r = await p.createSession({ sessionKey: `quiet-${mode}`, cwd: '/tmp/project', agentId: DEFAULT_OPENCODE_MODEL_ID });
+      await p.send(r, 'hello');
+
+      h.queue.push({ type: 'session.step.failed', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-att1', error: { type: 'provider.auth', status: 401, message: 'api_key_expired' } } });
+      await vi.waitFor(() => expect(h.client.sessions.prompt).toHaveBeenCalledTimes(2));
+
+      // Late Attempt-1 ID-less execution.failed arrives while Retry left inbox and is quiet (>950ms before first byte)
+      h.queue.push({ type: 'session.execution.failed', data: { sessionID: 'oc-session-1', error: { message: 'late attempt 1 noise' } } });
+      await new Promise((res) => setTimeout(res, 1_000));
+      expect(h.client.session.active).toHaveBeenCalled();
+      expect(errors).toHaveLength(0);
+      expect(completes).toHaveLength(0);
+
+      // Late first-byte + completion arrive and settle strictly once
+      h.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-late-first-byte', ordinal: 0, delta: `Late first byte (${mode})` } });
+      h.queue.push({ type: 'session.step.ended', data: { sessionID: 'oc-session-1', assistantMessageID: 'msg-late-first-byte', finish: 'stop' } });
+      await vi.waitFor(() => expect(completes).toHaveLength(1));
+      expect(completes[0].content).toBe(`Late first byte (${mode})`);
       expect(errors).toHaveLength(0);
       await p.disconnect();
     }
