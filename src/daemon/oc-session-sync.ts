@@ -5,8 +5,8 @@
  * as IM.codes main sessions + sub-sessions. Distinct from the catalog cache
  * (provider.sync_sessions) which only stores the list for UI display.
  */
-import * as providerRegistry from '../agent/provider-registry.js';
-const { getProvider } = providerRegistry;
+import { getProvider } from '../agent/provider-registry.js';
+import { isProviderRetiring } from '../agent/provider-registry-state.js';
 import {
   launchTransportSession,
   isProviderSessionBound,
@@ -132,11 +132,7 @@ export async function syncOcSessions(
     logger.debug('oc-sync: no openclaw provider or no listSessions capability');
     return;
   }
-  const isSuperseded = (): boolean => (
-    typeof providerRegistry.isCurrentProvider === 'function'
-      ? !providerRegistry.isCurrentProvider('openclaw', provider)
-      : getProvider('openclaw') !== provider
-  );
+  const isSuperseded = (): boolean => getProvider('openclaw') !== provider || isProviderRetiring(provider);
   const syncLaunchProvider = {
     expectedProvider: provider,
     ...(connectTimeProvider ? { connectTimeProvider } : {}),

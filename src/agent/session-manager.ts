@@ -27,13 +27,11 @@ import {
 import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { canonicalizeTransportCwd, normalizeTransportCwd } from './transport-paths.js';
-import * as providerRegistry from './provider-registry.js';
-const { ensureProviderConnected, getProvider } = providerRegistry;
+import { ensureProviderConnected, getProvider } from './provider-registry.js';
+import { isProviderRetiring } from './provider-registry-state.js';
 
 function isRegistryProviderCurrent(id: string, provider: TransportProvider): boolean {
-  return typeof providerRegistry.isCurrentProvider === 'function'
-    ? providerRegistry.isCurrentProvider(id, provider)
-    : getProvider(id) === provider;
+  return getProvider(id) === provider && !isProviderRetiring(provider);
 }
 import {
   claimTransportRestoreNotice,
