@@ -14,6 +14,11 @@ export class ProcessSessionRuntime implements SessionRuntime {
   ) {}
 
   async send(message: string): Promise<void> {
+    const isShellLike = this.agentType === 'shell' || this.agentType === 'script';
+    if (isShellLike) {
+      await sendKeys(this.sessionName, message, { verbatim: true });
+      return;
+    }
     await sendKeys(this.sessionName, message);
   }
 

@@ -43,6 +43,7 @@ import { getTransportQueueStore } from './transport-queue-store.js';
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { hookCredentialEnv, mintHookCredential } from './hook-session-credential.js';
 import { registerTmuxSessionResource, releaseSessionResources, resourceOwnerEnv } from './session-resource-service.js';
+import { cleanupShellHistoryFile, shellHistoryEnv } from '../agent/shell-history.js';
 import { markSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { isNativeAgentFenceRequiredForLaunch } from './native-collaboration-guard.js';
 import { processLaunchFence } from '../agent/native-agent-fence.js';
@@ -346,9 +347,11 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     IMCODES_SESSION: sessionName,
     ...resourceOwnerEnv({ sessionName, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
     ...hookCredentialEnv(hookCredential),
+    ...shellHistoryEnv(sessionName, agentType, sub.shellBin),
   });
 
-  const releaseRecovery = (!sub.fresh && agentType !== 'shell' && agentType !== 'script')
+  const isShellLike = agentType === 'shell' || agentType === 'script';
+  const releaseRecovery = (!sub.fresh && !isShellLike)
     ? claimProcessRestartContinuationRecovery(sessionName, resourceRuntimeEpoch)
     : undefined;
   let recoveryHandedOff = false;
@@ -371,15 +374,17 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     const { terminalStreamer } = await import('./terminal-streamer.js');
     void terminalStreamer.rebindSession(sessionName);
 
-    // Auto-dismiss startup prompts, then inject init message
+    // Auto-dismiss startup prompts, then inject init message (never for interactive shell/script panes)
     const initParts: string[] = [];
-    if (sub.description) initParts.push(sub.description);
-    const initIdentity = sub.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name: sessionName, projectName });
-    if (initIdentity) initParts.push(initIdentity);
-    if (presetInitMessage) initParts.push(presetInitMessage);
-    if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
-    if (sub.fresh) {
-      retireRestartContinuation(sessionName);
+    if (!isShellLike) {
+      if (sub.description) initParts.push(sub.description);
+      const initIdentity = sub.identityPrompt ?? await resolveEffectiveIdentityPrompt({ name: sessionName, projectName });
+      if (initIdentity) initParts.push(initIdentity);
+      if (presetInitMessage) initParts.push(presetInitMessage);
+      if (sub.ccInitPrompt) initParts.push(sub.ccInitPrompt);
+      if (sub.fresh) {
+        retireRestartContinuation(sessionName);
+      }
     }
     const injectInit = async () => {
       try {
@@ -391,12 +396,13 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
             (key: string) => sendKey(sessionName, key),
           ).catch(() => {});
         }
+        if (isShellLike) return;
         if (initParts.length > 0) {
           const { sendKeys } = await import('../agent/tmux.js');
           const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
           try { await sendKeys(sessionName, initMsg); } catch { /* ignore */ }
         }
-        if (!sub.fresh && agentType !== 'shell' && agentType !== 'script') {
+        if (!sub.fresh) {
           try {
             const { sendKeys } = await import('../agent/tmux.js');
             await dispatchProcessRestartContinuation({
@@ -433,7 +439,7 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       parentSession: sub.parentSession ?? undefined,
       ccPreset: sub.ccPreset ?? undefined,
       description: sub.description ?? undefined,
-      ...(sub.identityPrompt ? { appliedIdentityHash: identityPromptHash(sub.identityPrompt) } : {}),
+      ...(sub.identityPrompt && !isShellLike ? { appliedIdentityHash: identityPromptHash(sub.identityPrompt) } : {}),
       provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,
       ...(sub.pairCreatedMetadata ? { pairCreatedMetadata: sub.pairCreatedMetadata } : {}),
       // shellBin (already host-normalized above) persisted for shell/script so a
@@ -565,6 +571,9 @@ export async function stopSubSession(
       clearSessionRestartContinuation(sessionName);
       authorizeClosedSessionRemoval(sessionName);
       removeSession(sessionName);
+      if (record.agentType === 'shell') {
+        cleanupShellHistoryFile(sessionName);
+      }
       timelineEmitter.forgetSession(sessionName);
       notifySessionTeardown(sessionName);
       if (isIncognitoSession(record) || isIncognitoSessionName(sessionName)) {

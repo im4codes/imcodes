@@ -151,6 +151,7 @@ import { getAuthenticatedCapabilityOwner } from '../capability/capability-author
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 import { imcodesStateDirEnv } from '../util/imcodes-state-dir.js';
+import { cleanupShellHistoryFile, shellHistoryEnv } from './shell-history.js';
 import { extractSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 import { beginCrossVendorHandoffState, isCrossVendorHandoffLaunchCurrent, normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
@@ -541,6 +542,9 @@ export async function stopProject(
         }
         authorizeClosedSessionRemoval(record.name);
         removeSession(record.name);
+        if (record.agentType === 'shell') {
+          cleanupShellHistoryFile(record.name);
+        }
         clearTransportRestoreBackoff(record.name);
         // Session is gone — free its in-memory timeline ring buffer + dedup maps
         // (otherwise they leak for every session that ever ran), and drop any
@@ -648,6 +652,9 @@ export async function initOnStartup(): Promise<void> {
       // a leaked process cannot survive merely because enumeration failed.
       await killSession(record.name).catch(() => {});
       removeSession(record.name);
+      if (record.agentType === 'shell') {
+        cleanupShellHistoryFile(record.name);
+      }
       emitSessionPersist(null, record.name);
     }
     if (leaked.length > 0) {
@@ -1133,19 +1140,15 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     role: record.role,
     parentSession: record.parentSession,
   });
-  const cmd = driver.buildResumeCommand(record.name, {
+  const launchOpts = {
     cwd: projectDir,
+    ...(effectiveRecord.shellBin ? { shellBin: effectiveRecord.shellBin } : {}),
     ccSessionId,
     codexSessionId: effectiveRecord.codexSessionId,
     opencodeSessionId: effectiveRecord.opencodeSessionId,
     nativeAgentsFenced,
-  }) ?? driver.buildLaunchCommand(record.name, {
-    cwd: projectDir,
-    ccSessionId,
-    codexSessionId: effectiveRecord.codexSessionId,
-    opencodeSessionId: effectiveRecord.opencodeSessionId,
-    nativeAgentsFenced,
-  });
+  };
+  const cmd = driver.buildResumeCommand(record.name, launchOpts) ?? driver.buildLaunchCommand(record.name, launchOpts);
 
   const resourceSessionInstanceId = record.sessionInstanceId?.trim() || randomUUID();
   const resourceRuntimeEpoch = randomUUID();
@@ -1159,6 +1162,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   // doesn't need to parse POSIX `export` syntax.  On tmux/wezterm, prepend `export` to cmd.
   // A respawn always starts a new process, so it gets a new hook credential (the old process's copy stops working).
   const hookCredential = mintHookCredential();
+  const isShellLike = effectiveRecord.agentType === 'shell' || effectiveRecord.agentType === 'script';
   const mergedEnv: Record<string, string> = {
     ...imcodesStateDirEnv(),
     IMCODES_SESSION: record.name,
@@ -1168,12 +1172,13 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
       runtimeEpoch: resourceRuntimeEpoch,
     }),
     ...hookCredentialEnv(hookCredential),
+    ...shellHistoryEnv(record.name, effectiveRecord.agentType, effectiveRecord.shellBin),
   };
   if (record.ccPreset && record.agentType === 'claude-code') {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
     Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset, ccSessionId));
   }
-  const releaseRecovery = (record.agentType !== 'shell' && record.agentType !== 'script')
+  const releaseRecovery = !isShellLike
     ? claimProcessRestartContinuationRecovery(record.name, resourceRuntimeEpoch)
     : undefined;
   let recoveryHandedOff = false;
@@ -1230,6 +1235,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
             (key: string) => sendKey(record.name, key),
           ).catch(() => {});
         }
+        if (isShellLike) return;
         const initParts: string[] = [];
         if (record.description) initParts.push(record.description);
         const identityPrompt = await resolveEffectiveIdentityPrompt(record);
@@ -1273,6 +1279,8 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   extraEnv?: Record<string, string>;
   /** When true, start fresh without resuming last conversation. */
   fresh?: boolean;
+  /** Custom shell/script binary path for `shell` and `script` drivers. */
+  shellBin?: string;
   /** CC session UUID for --session-id / --resume. Generated if absent for CC sessions. */
   ccSessionId?: string;
   /** Codex session UUID for `codex resume <UUID>`. */
@@ -1466,8 +1474,11 @@ export async function relaunchSessionWithSettings(
   const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
   const effectiveHandoffConfig = forceHandoff ? { ...handoffConfig, enabled: true } : handoffConfig;
   const wantsHandoff = !isPrivate && shouldCreateCrossVendorHandoff(record, targetAgentType, targetRuntimeType, targetFresh, forceHandoff) && effectiveHandoffConfig.enabled;
+  const isShellLikeTarget = targetAgentType === 'shell' || targetAgentType === 'script';
   const [resolvedIdentityPrompt, cutoffEvents] = await Promise.all([
-    overrides.identityPrompt !== undefined ? Promise.resolve(overrides.identityPrompt) : resolveEffectiveIdentityPrompt(record),
+    overrides.identityPrompt !== undefined
+      ? Promise.resolve(overrides.identityPrompt)
+      : (isShellLikeTarget ? Promise.resolve(null) : resolveEffectiveIdentityPrompt(record)),
     wantsHandoff ? timelineStore.readPreferred(record.name, { limit: 1 }).catch(() => []) : Promise.resolve([]),
   ]);
   assertSessionOwnership();
@@ -1536,6 +1547,7 @@ export async function relaunchSessionWithSettings(
         ? { providerResumeId: record.providerResumeId }
         : {}),
       ...compatibleIds,
+      ...(record.shellBin && isShellLikeTarget ? { shellBin: record.shellBin } : {}),
       ...(record.parentSession ? { parentSession: record.parentSession } : {}),
       ...(record.userCreated ? { userCreated: true } : {}),
       ...(targetFresh ? { fresh: true } : {}),
@@ -4643,6 +4655,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     IMCODES_SESSION: name,
     ...resourceOwnerEnv({ sessionName: name, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
     ...hookCredentialEnv(hookCredential),
+    ...shellHistoryEnv(name, agentType, opts.shellBin),
   };
   // A missing tmux pane can be a non-fresh crash restart of the same logical
   // conversation. Only explicit fresh launches or genuinely new records reset
@@ -4703,7 +4716,15 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
     const launchStart = Date.now();
     nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({ sessionName: name, role, parentSession: opts.parentSession });
-    const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, opencodeSessionId, nativeAgentsFenced });
+    const launchCmd = driver.buildLaunchCommand(name, {
+      cwd: projectDir,
+      fresh,
+      ...(opts.shellBin ? { shellBin: opts.shellBin } : {}),
+      ccSessionId,
+      codexSessionId,
+      opencodeSessionId,
+      nativeAgentsFenced,
+    });
     try {
       await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
     } catch (error) {
@@ -4794,7 +4815,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       } : {}),
       ...(label ? { label } : {}),
       ...(opts.description ? { description: opts.description } : {}),
-      ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
+      ...(opts.identityPrompt && agentType !== 'shell' && agentType !== 'script' ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
       ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
       ...(opts.userCreated ? { userCreated: true } : {}),
       ...(existing?.crossVendorHandoff ? {
@@ -4829,7 +4850,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         ...(opencodeSessionId ? { opencodeSessionId } : {}),
         ...(opts.qwenModel ? { qwenModel: opts.qwenModel } : {}),
         ...(opts.description ? { description: opts.description } : {}),
-        ...(opts.identityPrompt ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
+        ...(opts.identityPrompt && agentType !== 'shell' && agentType !== 'script' ? { appliedIdentityHash: identityPromptHash(opts.identityPrompt) } : {}),
         ...(opts.parentSession ? { parentSession: opts.parentSession } : {}),
         ...(opts.userCreated ? { userCreated: true } : {}),
         ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),

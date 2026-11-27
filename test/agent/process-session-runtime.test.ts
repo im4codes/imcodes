@@ -101,6 +101,6 @@ describe('ProcessSessionRuntime', () => {
   it('uses the session name passed in constructor', async () => {
     const other = new ProcessSessionRuntime('deck_otherapp_w1', 'shell');
     await other.send('run tests');
-    expect(sendKeys).toHaveBeenCalledWith('deck_otherapp_w1', 'run tests');
+    expect(sendKeys).toHaveBeenCalledWith('deck_otherapp_w1', 'run tests', { verbatim: true });
   });
 });

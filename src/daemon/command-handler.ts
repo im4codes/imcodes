@@ -9189,7 +9189,7 @@ async function deliverAskAnswer(
   // Process/TUI path: ESC to dismiss the dialog, then send the answer text + Enter.
   await sendKey(sessionName, 'Escape');
   await new Promise<void>((r) => setTimeout(r, 150));
-  await sendKeys(sessionName, answer);
+  await sendKeys(sessionName, answer, resolveProcessSendOptions(sessionName, record.agentType));
   return ASK_ANSWER_DELIVERY.TERMINAL;
 }
 

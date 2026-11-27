@@ -4,6 +4,8 @@ export type DeleteBufferFn = () => Promise<void>;
 
 export interface LaunchOptions {
   cwd?: string;
+  /** Custom shell/script binary path for `shell` and `script` drivers. */
+  shellBin?: string;
   /** When true, start a fresh session without resuming the last conversation. */
   fresh?: boolean;
   /** CC session UUID for --session-id / --resume (CC sub-sessions only) */
