@@ -7060,4 +7060,79 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
     expect(setModels).toEqual(['gemini-4-hydrogen-high']);
     await expect(provider.applySessionModel(id, 'invalid')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
   });
+
+  it('immediately wakes and cancels a sleeping empty-catalog retry backoff when createSession replaces the route with fresh:true', async () => {
+    const { provider, requests } = await setup('empty-catalog-once', {}, { coldStartCatalogRetryDelayMs: 3_000 });
+    const id = 'deck_test_agy_empty_catalog_replace_backoff';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-b' });
+
+    const errors: Array<{ code: string }> = [];
+    const complete = vi.fn();
+    provider.onError((_sid, err) => errors.push(err));
+    provider.onComplete(complete);
+
+    const oldSend = provider.send(id, 'old-turn');
+    // Wait until the first failed child has been disposed and oldSend enters backoff (isolatedTransport cleared).
+    await vi.waitFor(async () => {
+      const rows = await requests();
+      expect(rows.filter((r) => r.method === 'session/set_model')).toHaveLength(1);
+      const st = (provider as any).sessions.get(id);
+      expect(st?.isolatedTransport).toBeUndefined();
+      expect(st?.coldStartRetryWake).toBeTypeOf('function');
+    }, { timeout: 5000 });
+
+    const replaceStart = Date.now();
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-b', fresh: true });
+    await expect(oldSend).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    expect(Date.now() - replaceStart).toBeLessThan(1_000);
+
+    // Must not have spawned a retry child for the replaced session; replacement fresh session recovers cleanly.
+    const rowsBeforeNewSend = await requests();
+    expect(rowsBeforeNewSend.filter((r) => r.method === 'session/resume')).toHaveLength(0);
+    expect(rowsBeforeNewSend.filter((r) => r.fixture === 'boot')).toHaveLength(1);
+
+    await expect(provider.send(id, 'new-fresh-turn')).resolves.toBeUndefined();
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1), { timeout: 5000 });
+    expect(complete.mock.calls[0]?.[1].content).toBe('new-fresh-turn');
+  });
+
+  it('aborts retry startPerSessionAcpServer when session ownership is lost during warm-session eviction without spawning a leaked child', async () => {
+    const { provider, requests } = await setup('empty-catalog-once', {}, { coldStartCatalogRetryDelayMs: 20 });
+    const id = 'deck_test_agy_empty_catalog_evict_replace';
+    await provider.createSession({ sessionKey: id, sessionName: id, cwd: process.cwd(), agentId: 'model-b' });
+
+    let evictEnteredResolve!: () => void;
+    const evictEntered = new Promise<void>((res) => { evictEnteredResolve = res; });
+    let evictGateResolve!: () => void;
+    const evictGate = new Promise<void>((res) => { evictGateResolve = res; });
+    const origEvict = (provider as any).evictWarmPerSessionsIfNeeded.bind(provider);
+    let evictCalls = 0;
+    const evictSpy = vi.spyOn(provider as any, 'evictWarmPerSessionsIfNeeded').mockImplementation(async (...args: unknown[]) => {
+      evictCalls += 1;
+      if (evictCalls === 2) {
+        evictEnteredResolve();
+        await evictGate;
+      }
+      return origEvict(...args);
+    });
+
+    try {
+      const sendPromise = provider.send(id, 'evict-race-turn');
+      await evictEntered;
+
+      // Replace (close/recreate) session ownership while attempt #2 is suspended inside warm eviction.
+      await provider.endSession(id);
+      expect((await requests()).filter((r) => r.fixture === 'boot')).toHaveLength(1);
+
+      evictGateResolve();
+      await expect(sendPromise).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+
+      // Must abort before spawning a second ACP child process.
+      const rows = await requests();
+      expect(rows.filter((r) => r.fixture === 'boot')).toHaveLength(1);
+      expect(rows.filter((r) => r.method === 'session/resume')).toHaveLength(0);
+    } finally {
+      evictSpy.mockRestore();
+    }
+  });
 });
