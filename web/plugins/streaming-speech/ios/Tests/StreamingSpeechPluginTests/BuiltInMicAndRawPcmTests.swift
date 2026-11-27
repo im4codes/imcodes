@@ -212,4 +212,92 @@ final class BuiltInMicAndRawPcmTests: XCTestCase {
         XCTAssertNil(controller.takePendingIfCurrent(token: token2))
         XCTAssertTrue(controller.takePendingIfCurrent(token: token3) === call3)
     }
+
+    func testExpiredRawPcmSuccessOrErrorCannotReleaseNewerTapOrPhoneCaptureOccupancy() {
+        final class FakeCapCall {
+            var resolved = 0
+            var rejected: [String] = []
+        }
+
+        let controller = RawPcmStartController<FakeCapCall>()
+
+        // Round-trip race: start(A) installs tap A on audioQueue and queues completion to main.
+        // Before A's main completion runs: stop(A) invalidates A, then start(B) begins on main
+        // and runs on audioQueue after stop(A), installing tap B (ownerB) with rawPcmActiveOwner = ownerB.
+        let callA = FakeCapCall()
+        let (tokenA, _) = controller.beginStart(callA)
+        let ownerA: UInt64 = 1
+
+        var activeRawPcmTapOwner: UInt64? = ownerA
+        var activeAsrTapOwner: UInt64? = nil
+        var rawPcmActiveOwner: UInt64 = ownerA
+        var phoneCaptureActive = true
+
+        // stop(A) runs on main then audioQueue.
+        let cancelledA = controller.invalidateAndTakePending()
+        XCTAssertTrue(cancelledA === callA)
+        cancelledA?.rejected.append("Raw PCM capture stopped before ready")
+        rawPcmActiveOwner = 0
+        activeRawPcmTapOwner = nil
+
+        // start(B) runs on main then audioQueue, installing tap B (raw PCM, so activeAsrTapOwner == nil).
+        let callB = FakeCapCall()
+        let (tokenB, _) = controller.beginStart(callB)
+        let ownerB: UInt64 = 2
+        rawPcmActiveOwner = ownerB
+        activeRawPcmTapOwner = ownerB
+        phoneCaptureActive = true
+
+        // 1) Expired main success callback for A runs: takePendingIfCurrent(tokenA) returns nil,
+        // so A MUST NOT clear B's rawPcmActiveOwner or enqueue audioQueue teardown against B's tap.
+        XCTAssertNil(controller.takePendingIfCurrent(token: tokenA))
+        XCTAssertFalse(
+            RawPcmCaptureLifecyclePolicy.shouldRollbackTapOnAudioQueue(
+                expectedOwner: ownerA,
+                activeRawPcmTapOwner: activeRawPcmTapOwner,
+                activeAsrTapOwner: activeAsrTapOwner
+            )
+        )
+        XCTAssertEqual(rawPcmActiveOwner, ownerB)
+        XCTAssertEqual(activeRawPcmTapOwner, ownerB)
+        XCTAssertTrue(phoneCaptureActive)
+        XCTAssertTrue(controller.isExpected(token: tokenB))
+
+        // B settles normally on main.
+        let settledB = controller.takePendingIfCurrent(token: tokenB)
+        settledB?.resolved += 1
+        XCTAssertEqual(callB.resolved, 1)
+
+        // 2) Expired error callback for A (e.g., permission/engine error) arriving after stop(A)+start(C)
+        // while C is still starting on audioQueue (rawPcmActiveOwner == 0, activeMainOwner == 0):
+        // A cannot consume C's pending token, so A MUST NOT release SharedSpeechRecognizerStore phoneCaptureActive.
+        let callExpired = FakeCapCall()
+        let (tokenExpired, _) = controller.beginStart(callExpired)
+        _ = controller.invalidateAndTakePending()
+        let callC = FakeCapCall()
+        let (tokenC, _) = controller.beginStart(callC)
+        rawPcmActiveOwner = 0
+        let consumedExpired = controller.takePendingIfCurrent(token: tokenExpired)
+        XCTAssertNil(consumedExpired)
+        XCTAssertFalse(
+            RawPcmCaptureLifecyclePolicy.shouldReleasePhoneCaptureOnError(
+                consumedPendingStart: consumedExpired != nil,
+                activeMainOwner: 0,
+                isRawPcmCaptureActive: rawPcmActiveOwner != 0,
+                hasPendingRawPcmStart: controller.hasPendingStart
+            )
+        )
+        // Whereas if C itself fails and consumes tokenC with no other owners active, occupancy releases cleanly.
+        let consumedC = controller.takePendingIfCurrent(token: tokenC)
+        XCTAssertTrue(consumedC === callC)
+        XCTAssertTrue(
+            RawPcmCaptureLifecyclePolicy.shouldReleasePhoneCaptureOnError(
+                consumedPendingStart: consumedC != nil,
+                activeMainOwner: 0,
+                isRawPcmCaptureActive: rawPcmActiveOwner != 0,
+                hasPendingRawPcmStart: controller.hasPendingStart
+            )
+        )
+        _ = activeAsrTapOwner
+    }
 }

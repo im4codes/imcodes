@@ -4575,7 +4575,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     }
   });
 
-  it('bounds hung native startRawPcmCapture() and stopRawPcmCapture() promises so voice state never deadlocks', async () => {
+  it('bounds hung native startRawPcmCapture() and stopRawPcmCapture() promises while preserving non-timeout WebAudio fallback after stopOnReady', async () => {
     vi.useFakeTimers();
     const {
       REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS,
@@ -4587,21 +4587,52 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       isNativePlatform: () => true,
       isPluginAvailable: (name: string) => name === 'StreamingSpeech',
     });
-    const getUserMedia = vi.fn();
-    vi.stubGlobal('navigator', {
-      mediaDevices: { getUserMedia },
-      maxTouchPoints: 0,
-      language: 'en-US',
-      languages: ['en-US'],
-    });
-    vi.stubGlobal('AudioContext', undefined);
 
-    const stopRawPcmCapture = vi.fn(() => new Promise<void>(() => {}));
-    const startRawPcmCapture = vi.fn(() => new Promise<void>(() => {}));
-    Object.assign(streamingBridge, { startRawPcmCapture, stopRawPcmCapture });
+    let fakeAudio = setupFakeWebAudio();
 
     try {
-      // Case 1: Hung startRawPcmCapture during prime + stopOnReady settles within start timeout, calls cleanup, and never triggers getUserMedia
+      // Case 1A (counterexample): Normal non-timeout native rejection ("Raw PCM capture could not start") AFTER stopOnReady
+      // MUST fall back to available WebAudio, capture pre-roll, and stop tracks cleanly instead of discarding recording.
+      let rejectGenericStart!: () => void;
+      const startGenericFail = vi.fn(() => new Promise<void>((_, rej) => {
+        rejectGenericStart = () => rej(new Error('Raw PCM capture could not start'));
+      }));
+      const stopNoop = vi.fn(async () => {});
+      Object.assign(streamingBridge, { startRawPcmCapture: startGenericFail, stopRawPcmCapture: stopNoop });
+
+      const prevAudioContextCtor = (globalThis as { AudioContext?: typeof AudioContext }).AudioContext!;
+      vi.stubGlobal('AudioContext', class FallbackPreRollAudioContext extends prevAudioContextCtor {
+        override createGain = (() => ({
+          gain: { value: 1 },
+          connect: () => {
+            fakeAudio.emitSamples(new Float32Array(2048).fill(0.25));
+            return {} as AudioNode;
+          },
+          disconnect: vi.fn(),
+        })) as typeof prevAudioContextCtor.prototype.createGain;
+      });
+
+      const onGenericPrimeError = vi.fn();
+      expect(primeRemoteVoiceCapture({ allowPrompt: true, onError: onGenericPrimeError })).toBe(true);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(startGenericFail).toHaveBeenCalledTimes(1);
+      const finishGenericP = finishRemoteVoiceCapturePrime();
+      rejectGenericStart();
+      await finishGenericP;
+
+      expect(fakeAudio.getUserMedia).toHaveBeenCalledTimes(1);
+      expect(fakeAudio.stopTrack).toHaveBeenCalledTimes(1);
+      expect(onGenericPrimeError).not.toHaveBeenCalled();
+
+      // Case 1B (counterexample): Hung native startRawPcmCapture() WITH WebAudio available (canWebAudio === true)
+      // times out at REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS after stopOnReady, cleans up native, completes finish,
+      // and MUST NOT call getUserMedia to start a late mic after release.
+      resetRemoteVoiceClientForTesting();
+      fakeAudio = setupFakeWebAudio();
+      const stopRawPcmCapture = vi.fn(() => new Promise<void>(() => {}));
+      const startRawPcmCapture = vi.fn(() => new Promise<void>(() => {}));
+      Object.assign(streamingBridge, { startRawPcmCapture, stopRawPcmCapture });
+
       const onPrimeError = vi.fn();
       expect(primeRemoteVoiceCapture({ allowPrompt: true, onError: onPrimeError })).toBe(true);
       const finishP = finishRemoteVoiceCapturePrime();
@@ -4611,11 +4642,12 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
 
       expect(startRawPcmCapture).toHaveBeenCalledTimes(1);
       expect(stopRawPcmCapture).toHaveBeenCalledTimes(1);
-      expect(getUserMedia).not.toHaveBeenCalled();
-      expect(onPrimeError).toHaveBeenCalledWith('native_raw_pcm_start_timeout', false);
+      expect(fakeAudio.getUserMedia).not.toHaveBeenCalled();
+      expect(onPrimeError).toHaveBeenCalledWith('NativeRawPcmTimeoutError: native_raw_pcm_start_timeout', false);
 
       // Case 2: Hung startRawPcmCapture in direct startRemoteVoiceSession fails boundedly with native_raw_pcm_start_timeout
       resetRemoteVoiceClientForTesting();
+      vi.stubGlobal('AudioContext', undefined);
       FakeWebSocket.instances.length = 0;
       startRawPcmCapture.mockClear();
       stopRawPcmCapture.mockClear();
@@ -4633,7 +4665,10 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       const wsHang = FakeWebSocket.instances[0]!;
       wsHang.emitOpen();
       await vi.advanceTimersByTimeAsync(REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS + 50);
-      await expect(directHangP).resolves.toMatchObject({ ok: false, reason: 'native_raw_pcm_start_timeout' });
+      await expect(directHangP).resolves.toMatchObject({
+        ok: false,
+        reason: 'NativeRawPcmTimeoutError: native_raw_pcm_start_timeout',
+      });
       expect(stopRawPcmCapture).toHaveBeenCalledTimes(1);
 
       // Case 3: Native start succeeds, then stopRawPcmCapture hangs forever -> handle.stop() completes within stop timeout and releases state

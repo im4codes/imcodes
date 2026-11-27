@@ -319,9 +319,21 @@ describe('Qwen3-ASR mobile assets', () => {
     // ARC safety & start/stop race guards for raw PCM capture: never capture CAPPluginCall weakly
     expect(ios).not.toMatch(/\[\s*weak\s+call\b|,\s*weak\s+call\b/);
     expect(ios).toContain('final class RawPcmStartController<Call: AnyObject>');
+    expect(ios).toContain('enum RawPcmCaptureLifecyclePolicy');
+    expect(ios).toContain('private var activeRawPcmTapOwner: UInt64?');
     expect(ios).toContain('startController.isExpected(token: startToken)');
     expect(ios).toContain('startController.takePendingIfCurrent(token: startToken)');
     expect(ios).toContain('rawPcmStartController.invalidateAndTakePending()');
+    expect(ios).toContain('self.finishRawPcmStartErrorOnMain(');
+    const startRawPcmBody = ios.slice(
+      ios.indexOf('func startRawPcmCapture('),
+      ios.indexOf('func stopRawPcmCapture('),
+    );
+    const mainResolveStartIdx = startRawPcmBody.indexOf('if let settled = startController.takePendingIfCurrent(token: startToken)');
+    expect(mainResolveStartIdx).toBeGreaterThan(-1);
+    const mainResolveBlock = startRawPcmBody.slice(mainResolveStartIdx, mainResolveStartIdx + 240);
+    expect(mainResolveBlock).not.toContain('self.audioQueue.async');
+    expect(mainResolveBlock).not.toContain('self.stopCaptureAudioOnAudioQueue');
     const cancelWatchdogBody = ios.slice(
       ios.indexOf('private func cancelWarmupWatchdog()'),
       ios.indexOf('private func settleStartingCall('),

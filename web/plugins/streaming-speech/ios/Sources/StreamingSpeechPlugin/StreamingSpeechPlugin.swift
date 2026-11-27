@@ -204,7 +204,29 @@ enum TtsVoiceSelector {
     }
 }
 
-// MARK: - Raw PCM Capture Start Controller
+// MARK: - Raw PCM Capture Lifecycle Policy & Start Controller
+
+enum RawPcmCaptureLifecyclePolicy {
+    static func shouldReleasePhoneCaptureOnError(
+        consumedPendingStart: Bool,
+        activeMainOwner: UInt64,
+        isRawPcmCaptureActive: Bool,
+        hasPendingRawPcmStart: Bool
+    ) -> Bool {
+        consumedPendingStart
+            && activeMainOwner == 0
+            && !isRawPcmCaptureActive
+            && !hasPendingRawPcmStart
+    }
+
+    static func shouldRollbackTapOnAudioQueue(
+        expectedOwner: UInt64,
+        activeRawPcmTapOwner: UInt64?,
+        activeAsrTapOwner: UInt64?
+    ) -> Bool {
+        activeAsrTapOwner == nil && activeRawPcmTapOwner == expectedOwner
+    }
+}
 
 /// Thread-safe start-token and at-most-once settlement tracker for raw PCM capture.
 /// Keeps a strong reference to the pending call until ownership is explicitly consumed for
@@ -947,6 +969,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
     private var warmHoldIdleWorkItem: DispatchWorkItem? // audioQueue only
     private var warmHoldGeneration: UInt64 = 0 // audioQueue only
     private var activeAsrTapOwner: UInt64? // audioQueue only
+    private var activeRawPcmTapOwner: UInt64? // audioQueue only
     private let rawPcmLock = NSLock()
     private var rawPcmGeneration: UInt64 = 0
     private var rawPcmActiveOwner: UInt64 = 0
@@ -1293,6 +1316,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
 
     private func installTapAndStartOnAudioQueue(owner: UInt64) throws {
         activeAsrTapOwner = owner
+        activeRawPcmTapOwner = nil
         try installInputTapAndStartOnAudioQueue { [weak self] buffer, mono, converter in
             self?.consume(buffer, owner: owner, converter: converter, mono: mono)
         }
@@ -1300,6 +1324,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
 
     private func installRawPcmTapAndStartOnAudioQueue(owner: UInt64) throws {
         activeAsrTapOwner = nil
+        activeRawPcmTapOwner = owner
         try installInputTapAndStartOnAudioQueue { [weak self] buffer, mono, converter in
             self?.consumeRawPcm(buffer, owner: owner, converter: converter, mono: mono)
         }
@@ -1337,6 +1362,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
     private func stopCaptureAudioOnAudioQueue(deactivateSession: Bool, forceTeardown: Bool, allowWarmHold: Bool = true) {
         dispatchPrecondition(condition: .onQueue(audioQueue))
         activeAsrTapOwner = nil
+        activeRawPcmTapOwner = nil
         cancelWarmHoldDeactivationOnAudioQueue()
         if tapInstalled {
             engine?.inputNode.removeTap(onBus: 0)
@@ -1641,15 +1667,15 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                     let session = AVAudioSession.sharedInstance()
                     guard session.recordPermission == .granted else {
                         DispatchQueue.main.async {
-                            let settled = startController.takePendingIfCurrent(token: startToken)
-                            if self.activeMainOwner == 0 && !self.isRawPcmCaptureActive {
-                                SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
-                            }
-                            settled?.reject("Microphone permission denied")
+                            self.finishRawPcmStartErrorOnMain(
+                                token: startToken,
+                                message: "Microphone permission denied"
+                            )
                         }
                         return
                     }
                     guard startController.isExpected(token: startToken) else { return }
+                    var startedOwner: UInt64? = nil
                     do {
                         self.cancelWarmHoldDeactivationOnAudioQueue()
                         try self.configureAudioSessionCategoryIfNeeded(session: session)
@@ -1674,6 +1700,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                             return self.rawPcmGeneration
                         }()
                         guard let owner = owner else { return }
+                        startedOwner = owner
                         try self.installRawPcmTapAndStartOnAudioQueue(owner: owner)
                         guard startController.isExpected(token: startToken) else {
                             self.rawPcmLock.lock()
@@ -1682,7 +1709,11 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                                 self.rawPcmEncoder.reset()
                             }
                             self.rawPcmLock.unlock()
-                            if self.activeAsrTapOwner == nil {
+                            if RawPcmCaptureLifecyclePolicy.shouldRollbackTapOnAudioQueue(
+                                expectedOwner: owner,
+                                activeRawPcmTapOwner: self.activeRawPcmTapOwner,
+                                activeAsrTapOwner: self.activeAsrTapOwner
+                            ) {
                                 self.stopCaptureAudioOnAudioQueue(deactivateSession: false, forceTeardown: false)
                             }
                             return
@@ -1690,32 +1721,26 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                         DispatchQueue.main.async {
                             if let settled = startController.takePendingIfCurrent(token: startToken) {
                                 settled.resolve()
-                            } else {
-                                // Stop arrived while resolving on main; tear down the newly installed tap.
-                                self.rawPcmLock.lock()
-                                if self.rawPcmActiveOwner == owner {
-                                    self.rawPcmActiveOwner = 0
-                                    self.rawPcmEncoder.reset()
-                                }
-                                self.rawPcmLock.unlock()
-                                self.audioQueue.async { [weak self] in
-                                    guard let self = self, self.activeAsrTapOwner == nil else { return }
-                                    self.stopCaptureAudioOnAudioQueue(deactivateSession: false, forceTeardown: false)
-                                }
                             }
                         }
                     } catch {
-                        self.rawPcmLock.lock()
-                        self.rawPcmActiveOwner = 0
-                        self.rawPcmEncoder.reset()
-                        self.rawPcmLock.unlock()
-                        self.stopCaptureAudioOnAudioQueue(deactivateSession: true, forceTeardown: true)
-                        DispatchQueue.main.async {
-                            let settled = startController.takePendingIfCurrent(token: startToken)
-                            if self.activeMainOwner == 0 && !self.isRawPcmCaptureActive {
-                                SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
+                        if let owner = startedOwner {
+                            self.rawPcmLock.lock()
+                            if self.rawPcmActiveOwner == owner {
+                                self.rawPcmActiveOwner = 0
+                                self.rawPcmEncoder.reset()
                             }
-                            settled?.reject("Raw PCM capture could not start", nil, error)
+                            self.rawPcmLock.unlock()
+                        }
+                        if self.activeAsrTapOwner == nil && (startedOwner == nil || self.activeRawPcmTapOwner == startedOwner) {
+                            self.stopCaptureAudioOnAudioQueue(deactivateSession: true, forceTeardown: true)
+                        }
+                        DispatchQueue.main.async {
+                            self.finishRawPcmStartErrorOnMain(
+                                token: startToken,
+                                message: "Raw PCM capture could not start",
+                                error: error
+                            )
                         }
                     }
                 }
@@ -1734,11 +1759,10 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                     }
                     guard allowed else {
                         DispatchQueue.main.async {
-                            let settled = startController.takePendingIfCurrent(token: startToken)
-                            if self.activeMainOwner == 0 && !self.isRawPcmCaptureActive {
-                                SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
-                            }
-                            settled?.reject("Microphone permission denied")
+                            self.finishRawPcmStartErrorOnMain(
+                                token: startToken,
+                                message: "Microphone permission denied"
+                            )
                         }
                         return
                     }
@@ -1748,6 +1772,26 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             } else {
                 startOnAudioQueue()
             }
+        }
+    }
+
+    private func finishRawPcmStartErrorOnMain(token: UInt64, message: String, error: Error? = nil) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let settled = rawPcmStartController.takePendingIfCurrent(token: token) else {
+            return
+        }
+        if RawPcmCaptureLifecyclePolicy.shouldReleasePhoneCaptureOnError(
+            consumedPendingStart: true,
+            activeMainOwner: activeMainOwner,
+            isRawPcmCaptureActive: isRawPcmCaptureActive,
+            hasPendingRawPcmStart: rawPcmStartController.hasPendingStart
+        ) {
+            SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
+        }
+        if let error = error {
+            settled.reject(message, nil, error)
+        } else {
+            settled.reject(message)
         }
     }
 

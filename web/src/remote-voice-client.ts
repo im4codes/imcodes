@@ -42,6 +42,21 @@ export const REMOTE_VOICE_CLIENT_HTTP_ASR_STOP_DRAIN_MS = 28_000;
 export const REMOTE_VOICE_FRESHNESS_TIMEOUT_MS = 800;
 export const REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS = 10_000;
 export const REMOTE_VOICE_NATIVE_CAPTURE_STOP_TIMEOUT_MS = 3_000;
+export const NATIVE_RAW_PCM_START_TIMEOUT_ERROR = 'native_raw_pcm_start_timeout';
+export const NATIVE_RAW_PCM_STOP_TIMEOUT_ERROR = 'native_raw_pcm_stop_timeout';
+
+class NativeRawPcmTimeoutError extends Error {
+  readonly isNativeRawPcmTimeout = true;
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'NativeRawPcmTimeoutError';
+  }
+}
+
+export function isNativeRawPcmTimeoutError(err: unknown): boolean {
+  return err instanceof NativeRawPcmTimeoutError;
+}
 const REMOTE_VOICE_CACHE_FRESH_MS = 5_000;
 const PCM_TARGET_CHUNK_SAMPLES = 1_600; // 100ms @ 16kHz = 3200 bytes
 const MAX_PRE_READY_PCM_SAMPLES = REMOTE_VOICE_SAMPLE_RATE * 15; // 15s cap (~480KB)
@@ -697,7 +712,7 @@ function withBoundedTimeout<T>(
     timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      reject(new Error(timeoutMessage));
+      reject(new NativeRawPcmTimeoutError(timeoutMessage));
     }, timeoutMs);
     Promise.resolve(promise).then(
       (value) => {
@@ -726,13 +741,13 @@ async function startNativeRawPcmCaptureWithTimeout(
   await withBoundedTimeout(
     listenerP,
     REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS,
-    'native_raw_pcm_start_timeout',
+    NATIVE_RAW_PCM_START_TIMEOUT_ERROR,
   );
   if (!shouldStart()) return false;
   await withBoundedTimeout(
     nativeState.bridge.startRawPcmCapture(),
     REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS,
-    'native_raw_pcm_start_timeout',
+    NATIVE_RAW_PCM_START_TIMEOUT_ERROR,
   );
   return true;
 }
@@ -751,7 +766,7 @@ async function teardownNativeCapture(native: NativeCaptureState, awaitStop: bool
       await withBoundedTimeout(
         native.bridge.stopRawPcmCapture(),
         REMOTE_VOICE_NATIVE_CAPTURE_STOP_TIMEOUT_MS,
-        'native_raw_pcm_stop_timeout',
+        NATIVE_RAW_PCM_STOP_TIMEOUT_ERROR,
       );
     } catch { /* ignore */ }
     await Promise.resolve();
@@ -1137,12 +1152,13 @@ export function primeRemoteVoiceCapture(options?: PrimeRemoteVoiceCaptureOptions
         void teardownNativeCapture(nativeState, false);
         prime.native = null;
         const permissionDenied = isMicPermissionDeniedError(err);
+        const timedOut = isNativeRawPcmTimeoutError(err);
         if (isCapacitorUnimplementedError(err)) {
           markNativeRawPcmCaptureUnsupported();
         }
         if (permissionDenied) {
           _remoteMicPermissionKnownGranted = false;
-        } else if (!prime.cancelled && (!prime.stopOnReady || isCapacitorUnimplementedError(err)) && canWebAudio) {
+        } else if (!prime.cancelled && !(timedOut && prime.stopOnReady) && canWebAudio) {
           return startWebPrime();
         }
         const reason = formatMicCaptureErrorReason(err);
