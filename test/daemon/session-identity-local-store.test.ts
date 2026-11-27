@@ -6,7 +6,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   getLocalSessionIdentityProfile,
+  getLocalSessionIdentityProfilesByKeys,
   identityStoreReadStatsForTests,
+  listLocalSessionIdentityMetadata,
   listLocalSessionIdentityProfiles,
   localSessionIdentityDbPath,
   localSessionIdentityStorePath,
@@ -340,6 +342,116 @@ describe('daemon-local session identity store', () => {
     } finally {
       vi.useRealTimers();
       try { pinReader.close(); } catch { /* ignore */ }
+    }
+  });
+
+  it('lists metadata without reading content, batch-reads only requested PKs, and propagates DB read errors (fail-closed)', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    const savedUser = await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'U'.repeat(20_000), source: 'web' });
+    const savedProj = await putLocalSessionIdentityProfile({ scope: 'project', scopeKey: 'proj-a', content: 'P'.repeat(20_000), source: 'mcp' });
+    await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: 'srv-1:unused', content: 'S'.repeat(20_000), source: 'mcp' });
+
+    const beforeStats = identityStoreReadStatsForTests();
+    const meta = await listLocalSessionIdentityMetadata();
+    expect(meta).toHaveLength(3);
+    for (const entry of meta) {
+      expect(entry).not.toHaveProperty('content');
+      expect(entry.contentHash).toMatch(/^[a-f0-9]{64}$/u);
+    }
+    const afterMetaStats = identityStoreReadStatsForTests();
+    expect(afterMetaStats.metaScans).toBe(beforeStats.metaScans + 1);
+    expect(afterMetaStats.listScans).toBe(beforeStats.listScans);
+    expect(afterMetaStats.pkReads).toBe(beforeStats.pkReads);
+
+    expect(await getLocalSessionIdentityProfilesByKeys([])).toEqual([]);
+    expect(identityStoreReadStatsForTests().pkReads).toBe(afterMetaStats.pkReads);
+
+    // Duplicate keys deduplicate into exact unique PK reads
+    const fetched = await getLocalSessionIdentityProfilesByKeys([
+      { scope: 'user', scopeKey: '' },
+      { scope: 'project', scopeKey: 'proj-a' },
+      { scope: 'user', scopeKey: '' },
+      { scope: 'session', scopeKey: 'srv-1:missing' },
+    ]);
+    expect(fetched).toEqual([savedUser, savedProj]);
+    const afterPkStats = identityStoreReadStatsForTests();
+    expect(afterPkStats.pkReads).toBe(afterMetaStats.pkReads + 3);
+    expect(afterPkStats.listScans).toBe(beforeStats.listScans);
+
+    // Unreadable/corrupted DB propagates instead of returning [] (fail-closed)
+    resetIdentityStoreCacheForTests();
+    await writeFile(localSessionIdentityDbPath(), 'not a valid sqlite database');
+    await expect(listLocalSessionIdentityMetadata()).rejects.toThrow();
+    await expect(getLocalSessionIdentityProfilesByKeys([{ scope: 'user', scopeKey: '' }])).rejects.toThrow();
+  });
+
+  it('enables auto_vacuum=INCREMENTAL for newly created DBs, reclaims dead pages after deletes, and opens legacy auto_vacuum=0 DBs safely', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    const large = 'A'.repeat(180_000);
+    for (let i = 0; i < 6; i += 1) {
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: `srv-1:drop-${i}`, content: `${i}:${large}`, source: 'mcp' });
+    }
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'keep', source: 'web' });
+
+    const inspectDb = new DatabaseSync(localSessionIdentityDbPath());
+    try {
+      const av = inspectDb.prepare('PRAGMA auto_vacuum').get() as { auto_vacuum?: number };
+      expect(av.auto_vacuum).toBe(2);
+    } finally {
+      inspectDb.close();
+    }
+
+    const beforeBytes = statSync(localSessionIdentityDbPath()).size;
+    await removeSessionIdentitiesForSession('drop-0');
+    const checkSingleDelete = new DatabaseSync(localSessionIdentityDbPath());
+    try {
+      const flSingle = checkSingleDelete.prepare('PRAGMA freelist_count').get() as { freelist_count?: number };
+      expect(Number(flSingle.freelist_count ?? -1)).toBe(0);
+    } finally {
+      checkSingleDelete.close();
+    }
+
+    const pruned = await pruneOrphanedSessionIdentityProfiles(new Set());
+    expect(pruned).toBe(5);
+
+    const checkAfter = new DatabaseSync(localSessionIdentityDbPath());
+    try {
+      const fl = checkAfter.prepare('PRAGMA freelist_count').get() as { freelist_count?: number };
+      // Bounded incremental_vacuum(64) reclaims 64 pages without blocking on all ~220 freed pages at once
+      const freelist = Number(fl.freelist_count ?? 0);
+      expect(freelist).toBeGreaterThan(0);
+      expect(freelist).toBeLessThan(200);
+    } finally {
+      checkAfter.close();
+    }
+    const afterBytes = statSync(localSessionIdentityDbPath()).size;
+    expect(afterBytes).toBeLessThan(beforeBytes);
+
+    // Pre-existing legacy auto_vacuum = 0 DB must open cleanly without blocking VACUUM
+    resetIdentityStoreCacheForTests();
+    await rm(home, { recursive: true, force: true });
+    await mkdir(home, { recursive: true });
+    const legacyDb = new DatabaseSync(localSessionIdentityDbPath());
+    legacyDb.exec(`
+      PRAGMA auto_vacuum = NONE;
+      CREATE TABLE session_identity_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE session_identity_profiles (
+        scope TEXT NOT NULL, scope_key TEXT NOT NULL, content TEXT NOT NULL, content_hash TEXT NOT NULL,
+        revision INTEGER NOT NULL, updated_at INTEGER NOT NULL, source TEXT NOT NULL, source_file TEXT,
+        PRIMARY KEY (scope, scope_key)
+      );
+      INSERT INTO session_identity_profiles VALUES ('user', '', 'legacy', 'h', 1, 100, 'web', NULL);
+    `);
+    legacyDb.close();
+
+    expect(await getLocalSessionIdentityProfile('user', '')).toMatchObject({ content: 'legacy' });
+    expect(await removeLocalSessionIdentityProfile('user', '')).toBe(true);
+    const legacyCheck = new DatabaseSync(localSessionIdentityDbPath());
+    try {
+      const av = legacyCheck.prepare('PRAGMA auto_vacuum').get() as { auto_vacuum?: number };
+      expect(av.auto_vacuum).toBe(0);
+    } finally {
+      legacyCheck.close();
     }
   });
 });

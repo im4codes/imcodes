@@ -1,5 +1,27 @@
-import { describe, expect, it, vi } from 'vitest';
-import { syncSessionIdentities, syncSessionIdentity, syncSessionIdentitiesForCommand } from '../../src/daemon/session-identity-sync.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  syncSessionIdentities,
+  syncSessionIdentity,
+  syncSessionIdentitiesForCommand,
+  startSessionIdentitySync,
+  stopSessionIdentitySync,
+} from '../../src/daemon/session-identity-sync.js';
+import {
+  identityStoreReadStatsForTests,
+  localSessionIdentityDbPath,
+  putLocalSessionIdentityProfile,
+  resetIdentityStoreCacheForTests,
+} from '../../src/daemon/session-identity-local-store.js';
+import {
+  identityResolverCacheStatsForTests,
+  resolveDriftedSessionIdentities,
+  resetSessionIdentityResolverCacheForTests,
+} from '../../src/daemon/session-identity-resolver.js';
+import * as watchdog from '../../src/daemon/event-loop-watchdog.js';
 import { identityPromptHash } from '../../src/util/identity-prompt-hash.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
@@ -177,5 +199,232 @@ describe('local-only session identity reconciliation', () => {
       boundServerId: async () => 'srv-9',
     });
     expect(result).toEqual({ status: 'error', checked: 0, changed: 0, message: 'session identity target is unavailable' });
+  });
+});
+
+describe('metadata-first steady-state session identity reconciliation', () => {
+  const createdDirs: string[] = [];
+
+  afterEach(() => {
+    stopSessionIdentitySync();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+    resetIdentityStoreCacheForTests();
+    resetSessionIdentityResolverCacheForTests();
+    while (createdDirs.length > 0) {
+      const dir = createdDirs.pop()!;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  function makeIsolatedHome(): string {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-identity-sync-scale-'));
+    createdDirs.push(dir);
+    return dir;
+  }
+
+  it('triggers zero content reads and zero listScans in steady state across 50 x 220KB profiles (>11MB), and only fetches changed PKs on drift', async () => {
+    const home = makeIsolatedHome();
+    vi.stubEnv('IMCODES_HOME', home);
+    resetIdentityStoreCacheForTests();
+    resetSessionIdentityResolverCacheForTests();
+
+    const userContent = `user-global:${'U'.repeat(90_000)}`;
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: userContent, source: 'web' });
+    const projContent = `proj-rules:${'P'.repeat(220_000)}`;
+    await putLocalSessionIdentityProfile({ scope: 'project', scopeKey: 'repo-1', content: projContent, source: 'mcp' });
+
+    const liveSessions: SessionRecord[] = [];
+    for (let i = 0; i < 50; i += 1) {
+      const name = `deck_proj_worker_${i}`;
+      const sessContent = `worker-${i}:${'W'.repeat(220_000)}`;
+      await putLocalSessionIdentityProfile({ scope: 'session', scopeKey: `srv-9:${name}`, content: sessContent, source: 'mcp' });
+      liveSessions.push(session({ name }));
+    }
+    // Also seed 5 stale stopped-session profiles that active sync should never even touch
+    for (let i = 0; i < 5; i += 1) {
+      await putLocalSessionIdentityProfile({
+        scope: 'session',
+        scopeKey: `srv-9:deck_dead_${i}`,
+        content: `dead-${i}:${'D'.repeat(220_000)}`,
+        source: 'mcp',
+      });
+    }
+
+    const applyIdentity = vi.fn((name: string, prompt: string | undefined) => {
+      const rec = liveSessions.find((s) => s.name === name);
+      if (rec) rec.appliedIdentityHash = identityPromptHash(prompt);
+      return { applied: true };
+    });
+
+    const beforeCold = identityStoreReadStatsForTests();
+    const cold = await syncSessionIdentities({
+      listLocalSessions: () => liveSessions,
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+    });
+    expect(cold).toEqual({ status: 'ok', checked: 50, changed: 50 });
+    expect(applyIdentity).toHaveBeenCalledTimes(50);
+
+    const afterCold = identityStoreReadStatsForTests();
+    // Cold pass uses metadata + targeted PK reads ONLY (1 user + 1 project + 50 live sessions = 52 PK reads; dead profiles skipped)
+    expect(afterCold.listScans).toBe(beforeCold.listScans);
+    expect(afterCold.metaScans).toBe(beforeCold.metaScans + 1);
+    expect(afterCold.pkReads).toBe(beforeCold.pkReads + 52);
+
+    applyIdentity.mockClear();
+
+    // Steady state pass 2 & 3: ZERO content/PK reads, ZERO full scans!
+    const steady1 = await syncSessionIdentities({
+      listLocalSessions: () => liveSessions,
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+    });
+    const steady2 = await syncSessionIdentities({
+      listLocalSessions: () => liveSessions,
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+    });
+    expect(steady1).toEqual({ status: 'ok', checked: 50, changed: 0 });
+    expect(steady2).toEqual({ status: 'ok', checked: 50, changed: 0 });
+    expect(applyIdentity).not.toHaveBeenCalled();
+
+    const afterSteady = identityStoreReadStatsForTests();
+    expect(afterSteady.listScans).toBe(afterCold.listScans);
+    expect(afterSteady.pkReads).toBe(afterCold.pkReads);
+    expect(afterSteady.metaScans).toBe(afterCold.metaScans + 2);
+
+    // Mutate ONE session profile -> loads ONLY the 3 PKs relevant to that drifted session (user + project + worker_7)
+    await putLocalSessionIdentityProfile({
+      scope: 'session',
+      scopeKey: 'srv-9:deck_proj_worker_7',
+      content: 'worker-7-updated',
+      source: 'mcp',
+    });
+    const updateRes = await syncSessionIdentities({
+      listLocalSessions: () => liveSessions,
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+    });
+    expect(updateRes).toEqual({ status: 'ok', checked: 50, changed: 1 });
+    expect(applyIdentity).toHaveBeenCalledTimes(1);
+    expect(applyIdentity).toHaveBeenCalledWith(
+      'deck_proj_worker_7',
+      expect.stringContaining('worker-7-updated'),
+      { refresh: true },
+    );
+
+    const afterOneUpdate = identityStoreReadStatsForTests();
+    expect(afterOneUpdate.listScans).toBe(afterSteady.listScans);
+    expect(afterOneUpdate.pkReads).toBe(afterSteady.pkReads + 3);
+  });
+
+  it('invalidates shareKey cache immediately when pairTaskId changes', async () => {
+    const home = makeIsolatedHome();
+    vi.stubEnv('IMCODES_HOME', home);
+    resetIdentityStoreCacheForTests();
+    resetSessionIdentityResolverCacheForTests();
+
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'base-user', source: 'web' });
+    await putLocalSessionIdentityProfile({ scope: 'pair', scopeKey: 'tsk_round_1', content: 'pair-one', source: 'mcp' });
+    await putLocalSessionIdentityProfile({ scope: 'pair', scopeKey: 'tsk_round_2', content: 'pair-two', source: 'mcp' });
+
+    let activePairId: string | undefined = 'tsk_round_1';
+    const worker = session({ name: 'deck_proj_sub' });
+    const applyIdentity = vi.fn((_name: string, prompt: string | undefined) => {
+      worker.appliedIdentityHash = identityPromptHash(prompt);
+      return { applied: true };
+    });
+
+    await syncSessionIdentities({
+      listLocalSessions: () => [worker],
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+      pairTaskIdForSession: () => activePairId,
+    });
+    expect(applyIdentity).toHaveBeenLastCalledWith('deck_proj_sub', expect.stringContaining('pair-one'), { refresh: true });
+
+    // Steady state with same pairTaskId: 0 extra PK reads
+    const beforeSteady = identityStoreReadStatsForTests();
+    const resSteady = await syncSessionIdentities({
+      listLocalSessions: () => [worker],
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+      pairTaskIdForSession: () => activePairId,
+    });
+    expect(resSteady).toEqual({ status: 'ok', checked: 1, changed: 0 });
+    expect(identityStoreReadStatsForTests().pkReads).toBe(beforeSteady.pkReads);
+
+    // Pair reassignment changes pairTaskId -> shareKey changes -> applies pair-two immediately
+    activePairId = 'tsk_round_2';
+    const resSwitch = await syncSessionIdentities({
+      listLocalSessions: () => [worker],
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+      pairTaskIdForSession: () => activePairId,
+    });
+    expect(resSwitch).toEqual({ status: 'ok', checked: 1, changed: 1 });
+    expect(applyIdentity).toHaveBeenLastCalledWith('deck_proj_sub', expect.stringContaining('pair-two'), { refresh: true });
+  });
+
+  it('fails closed when local SQLite identity store is unreadable via default metadata path', async () => {
+    const home = makeIsolatedHome();
+    vi.stubEnv('IMCODES_HOME', home);
+    resetIdentityStoreCacheForTests();
+    resetSessionIdentityResolverCacheForTests();
+
+    await putLocalSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'valid', source: 'web' });
+    resetIdentityStoreCacheForTests();
+    await writeFile(localSessionIdentityDbPath(), 'corrupted sqlite bytes');
+
+    const applyIdentity = vi.fn(() => ({ applied: true }));
+    const live = [session({ appliedIdentityHash: 'keep-existing-hash' })];
+    await expect(syncSessionIdentities({
+      listLocalSessions: () => live,
+      applyIdentity,
+      boundServerId: async () => 'srv-9',
+    })).rejects.toThrow();
+    expect(applyIdentity).not.toHaveBeenCalled();
+    expect(live[0]!.appliedIdentityHash).toBe('keep-existing-hash');
+  });
+
+  it('bounds shareKey -> hash cache at max entries and stores only hash digests without large content', async () => {
+    resetSessionIdentityResolverCacheForTests();
+    const bigContent = 'H'.repeat(50_000);
+    const metaFor = (i: number): SessionIdentityProfile[] => [{
+      scope: 'session',
+      scopeKey: `srv-9:sess-${i}`,
+      content: bigContent,
+      contentHash: `hash-${i}`,
+      revision: 1,
+      updatedAt: 1,
+      source: 'mcp',
+    }];
+
+    const total = 2200;
+    for (let i = 0; i < total; i += 1) {
+      const s: SessionRecord = session({ name: `sess-${i}` });
+      await resolveDriftedSessionIdentities([s], {
+        boundServerId: async () => 'srv-9',
+        listMetadata: async () => metaFor(i).map(({ content: _c, ...m }) => m),
+        getProfilesByKeys: async () => metaFor(i),
+      });
+    }
+
+    const stats = identityResolverCacheStatsForTests();
+    expect(stats.size).toBe(stats.max);
+    expect(stats.max).toBe(2048);
+  });
+
+  it('wraps periodic startSessionIdentitySync cycle inside runPeriodicPass("session-identity-sync", ...)', async () => {
+    const home = makeIsolatedHome();
+    vi.stubEnv('IMCODES_HOME', home);
+    resetIdentityStoreCacheForTests();
+
+    const runPassSpy = vi.spyOn(watchdog, 'runPeriodicPass');
+    startSessionIdentitySync();
+    await vi.waitFor(() => {
+      expect(runPassSpy).toHaveBeenCalledWith('session-identity-sync', expect.any(Function));
+    });
   });
 });

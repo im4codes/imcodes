@@ -1,11 +1,14 @@
 import { applyEffectiveSessionIdentity } from '../agent/session-manager.js';
 import { listSessions, onSessionRemoved } from '../store/session-store.js';
+import { runPeriodicPass } from './event-loop-watchdog.js';
 import {
+  getLocalSessionIdentityProfilesByKeys,
+  listLocalSessionIdentityMetadata,
   listLocalSessionIdentityProfiles,
   pruneOrphanedSessionIdentityProfiles,
   removeSessionIdentitiesForSession,
 } from './session-identity-local-store.js';
-import { resolveEffectiveIdentities, type IdentityResolverDeps } from './session-identity-resolver.js';
+import { resolveDriftedSessionIdentities, type IdentityResolverDeps } from './session-identity-resolver.js';
 
 /**
  * Periodic LOCAL reconciliation only -- a safety net that recomputes every
@@ -28,16 +31,22 @@ export interface SessionIdentitySyncResult {
 
 export interface SessionIdentitySyncDeps {
   listLocalProfiles?: typeof listLocalSessionIdentityProfiles;
+  listLocalMetadata?: typeof listLocalSessionIdentityMetadata;
+  getLocalProfilesByKeys?: typeof getLocalSessionIdentityProfilesByKeys;
   listLocalSessions?: typeof listSessions;
   applyIdentity?: typeof applyEffectiveSessionIdentity;
   /** This daemon's own bound serverId (for the SESSION-scope key). */
   boundServerId?: () => Promise<string | undefined>;
+  pairTaskIdForSession?: (sessionName: string) => string | undefined;
 }
 
 function resolverDeps(deps: SessionIdentitySyncDeps): IdentityResolverDeps {
   return {
-    listProfiles: deps.listLocalProfiles ?? listLocalSessionIdentityProfiles,
+    ...(deps.listLocalProfiles ? { listProfiles: deps.listLocalProfiles } : {}),
+    ...(deps.listLocalMetadata ? { listMetadata: deps.listLocalMetadata } : {}),
+    ...(deps.getLocalProfilesByKeys ? { getProfilesByKeys: deps.getLocalProfilesByKeys } : {}),
     ...(deps.boundServerId ? { boundServerId: deps.boundServerId } : {}),
+    ...(deps.pairTaskIdForSession ? { pairTaskIdForSession: deps.pairTaskIdForSession } : {}),
   };
 }
 
@@ -61,10 +70,10 @@ export async function syncSessionIdentities(
   syncInFlight = (async () => {
     const sessions = (deps.listLocalSessions ?? listSessions)().filter((session) => session.state !== 'stopped');
     // Throws when the identity store is unreadable: nothing is applied on a failed read (never "no identity").
-    const resolved = await resolveEffectiveIdentities(sessions, resolverDeps(deps));
+    const drifted = await resolveDriftedSessionIdentities(sessions, resolverDeps(deps));
     let changed = 0;
     for (const session of sessions) {
-      const identity = resolved.get(session.name);
+      const identity = drifted.get(session.name);
       if (!identity || session.appliedIdentityHash === identity.hash) continue;
       (deps.applyIdentity ?? applyEffectiveSessionIdentity)(session.name, identity.prompt, { refresh: true });
       changed += 1;
@@ -86,7 +95,7 @@ export async function syncSessionIdentity(
   const session = (deps.listLocalSessions ?? listSessions)()
     .find((candidate) => candidate.name === sessionName && candidate.state !== 'stopped');
   if (!session) return { status: 'error', checked: 0, changed: 0, message: 'session identity target is unavailable' };
-  const identity = (await resolveEffectiveIdentities([session], resolverDeps(deps))).get(session.name);
+  const identity = (await resolveDriftedSessionIdentities([session], resolverDeps(deps))).get(session.name);
   if (!identity || session.appliedIdentityHash === identity.hash) {
     return { status: 'ok', checked: 1, changed: 0 };
   }
@@ -150,10 +159,13 @@ export function startSessionIdentitySync(
     const result = await syncSessionIdentities();
     if (result.status === 'error' && result.message) onError(result.message);
   };
-  void runCycle();
-  syncTimer = setInterval(() => {
-    void runCycle();
-  }, SESSION_IDENTITY_SYNC_INTERVAL_MS);
+  const runTrackedCycle = () => {
+    void runPeriodicPass('session-identity-sync', runCycle).catch((err) => {
+      onError(err instanceof Error ? err.message : String(err));
+    });
+  };
+  runTrackedCycle();
+  syncTimer = setInterval(runTrackedCycle, SESSION_IDENTITY_SYNC_INTERVAL_MS);
   syncTimer.unref?.();
 }
 

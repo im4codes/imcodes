@@ -315,6 +315,7 @@ export class TransportQueueStore {
     const boundedBusyTimeout = Math.max(0, Math.min(60_000, Math.floor(busyTimeoutMs)));
     this.db.exec(`
       PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
       PRAGMA busy_timeout = ${boundedBusyTimeout};
 
       CREATE TABLE IF NOT EXISTS queue_meta (

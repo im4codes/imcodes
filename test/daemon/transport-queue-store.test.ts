@@ -1837,4 +1837,18 @@ describe('dropTaskPairEntries', () => {
       wakeAggId,
     ]);
   });
+
+  it('configures WAL mode with PRAGMA synchronous = NORMAL (1) to avoid per-commit WAL fsync stalls', () => {
+    const dbPath = join(dir, 'sync-mode.sqlite');
+    const syncStore = new TransportQueueStore({ dbPath });
+    try {
+      const storeDb = (syncStore as unknown as { db: InstanceType<typeof DatabaseSync> }).db;
+      const journal = storeDb.prepare('PRAGMA journal_mode').get() as { journal_mode?: string };
+      const sync = storeDb.prepare('PRAGMA synchronous').get() as { synchronous?: number };
+      expect(journal.journal_mode?.toLowerCase()).toBe('wal');
+      expect(sync.synchronous).toBe(1);
+    } finally {
+      syncStore.close();
+    }
+  });
 });
