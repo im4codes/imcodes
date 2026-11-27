@@ -85,7 +85,7 @@ type ControlledTabsProps = Omit<Props, 'tabOrder' | 'setTabOrder' | 'tabOrderHyd
   tabOrderHydrated: boolean;
 };
 
-function SessionTabsControlled({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr, tabOrder, setTabOrder, tabOrderHydrated }: ControlledTabsProps) {
+function SessionTabsControlled({ sessions, activeSession, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr, tabOrder, setTabOrder, tabOrderHydrated }: ControlledTabsProps) {
   recordPerfRender('SessionTabs');
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
@@ -472,9 +472,6 @@ function SessionTabsControlled({ sessions, activeSession, connected, latencyMs, 
         const classes = ['tab', isBrain ? 'brain' : '', s.incognito ? 'incognito' : '', isActive ? 'active' : '', stateClass, hasAlert ? 'alert' : '', isPinned ? 'pinned' : ''].filter(Boolean).join(' ');
         const isDragOver = dragOverIdx === idx;
 
-        // WS latency shown inline on the active tab
-        const latencyColor = latencyMs == null ? '#4ade80' : latencyMs < 150 ? '#4ade80' : latencyMs < 400 ? '#f59e0b' : '#ef4444';
-
         return (
           <div
             key={s.name}
@@ -552,11 +549,6 @@ function SessionTabsControlled({ sessions, activeSession, connected, latencyMs, 
                 {p2pSessionLabels?.has(s.name) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
                 <SharedStateIndicator state={s.sharedState} compact iconOnly />
                 {/* tool call indicator removed — too flashy */}
-                {isActive && (
-                  <span class="tab-ws-dot" style={{ color: connected ? latencyColor : '#ef4444' }} title={connected ? (latencyMs != null ? `${latencyMs}ms` : 'Connected') : 'Disconnected'}>
-                    ●{connected && latencyMs != null && <span class="tab-latency">{latencyMs}ms</span>}
-                  </span>
-                )}
               </button>
             )}
           </div>

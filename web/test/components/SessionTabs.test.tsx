@@ -1326,43 +1326,33 @@ describe('SessionTabs', () => {
     expect(tab3AgentBadge).toBeNull();
   });
 
-  it('positions .tab-ws-dot and .tab-latency at bottom-right corner out-of-flow without altering active tab interactions', () => {
+  it('ensures .tab-ws-dot, .tab-latency, and idle green dots are completely removed from tabs and styles', () => {
     const cssText = readTabStyles();
 
-    // 1. Assert CSS rules for bottom-right corner overlay
+    // 1. Assert CSS rules for WS dot, latency, and idle green dots are completely absent
     const wsDotRule = cssText.match(/(?:^|\n)\.tab-ws-dot\s*\{[^}]+\}/)?.[0] ?? '';
     const latencyRule = cssText.match(/(?:^|\n)\.tab-latency\s*\{[^}]+\}/)?.[0] ?? '';
+    const idleDotRule = cssText.match(/(?:^|\n)\.tab\.idle:not\(\.active\)::after\s*\{[^}]+\}/)?.[0] ?? '';
+    const legacyIdleRule = cssText.match(/(?:^|\n)\.tab\.idle::after\s*\{[^}]+\}/)?.[0] ?? '';
     const androidWsDotRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab-ws-dot\s*\{[^}]+\}/)?.[0] ?? '';
     const androidLatencyRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab-latency\s*\{[^}]+\}/)?.[0] ?? '';
+    const androidIdleRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab\.idle:not\(\.active\)::after\s*\{[^}]+\}/)?.[0] ?? '';
 
-    // .tab-ws-dot must be bottom-right, absolute, pointer-events: none, margin: 0, non-negative bottom
-    expect(wsDotRule).toContain('position: absolute');
-    expect(wsDotRule).toMatch(/bottom:\s*1px/);
-    expect(wsDotRule).toMatch(/right:\s*2px/);
-    expect(wsDotRule).toContain('pointer-events: none');
-    expect(wsDotRule).toContain('margin: 0');
-    expect(wsDotRule).not.toContain('margin-left');
-    expect(wsDotRule).toContain('white-space: nowrap');
-    expect(wsDotRule).toContain('z-index: 3');
+    expect(wsDotRule).toBe('');
+    expect(latencyRule).toBe('');
+    expect(idleDotRule).toBe('');
+    expect(legacyIdleRule).toBe('');
+    expect(androidWsDotRule).toBe('');
+    expect(androidLatencyRule).toBe('');
+    expect(androidIdleRule).toBe('');
 
-    // .tab-latency must have margin: 0, line-height: 1
-    expect(latencyRule).toContain('margin: 0');
-    expect(latencyRule).toContain('line-height: 1');
-
-    // Android compact rules must exist with non-negative bottom
-    expect(androidWsDotRule).toContain('bottom: 1px');
-    expect(androidWsDotRule).toContain('right: 2px');
-    expect(androidWsDotRule).toContain('font-size: 6px');
-    expect(androidLatencyRule).toContain('font-size: 7px');
-
-    // 2. Render SessionTabs and verify .tab-ws-dot rendering across connected/latency states
+    // 2. Render SessionTabs and verify no tab renders .tab-ws-dot or .tab-latency across connected/latency states
     const onSelect = vi.fn();
     const sessions = makeSessions([
       { name: 'sess_active', label: 'Active Tab', state: 'idle' },
       { name: 'sess_inactive', label: 'Inactive Tab', state: 'idle' },
     ]);
 
-    // Case A: Active + Connected + latencyMs=12
     const { rerender } = render(
       <SessionTabs
         sessions={sessions}
@@ -1377,52 +1367,16 @@ describe('SessionTabs', () => {
     );
 
     const tabsA = screen.getAllByRole('tab');
-    const activeDotA = tabsA[0].querySelector('.tab-ws-dot');
-    const inactiveDotA = tabsA[1].querySelector('.tab-ws-dot');
-    expect(activeDotA).not.toBeNull();
-    expect(activeDotA?.getAttribute('title')).toBe('12ms');
-    expect(activeDotA?.querySelector('.tab-latency')?.textContent).toBe('12ms');
-    expect(inactiveDotA).toBeNull();
+    expect(tabsA[0].querySelector('.tab-ws-dot')).toBeNull();
+    expect(tabsA[0].querySelector('.tab-latency')).toBeNull();
+    expect(tabsA[1].querySelector('.tab-ws-dot')).toBeNull();
+    expect(tabsA[1].querySelector('.tab-latency')).toBeNull();
 
     // Active tab click still cleanly selects sess_active without pointer obstruction
     fireEvent.click(tabsA[0]);
     expect(onSelect).toHaveBeenCalledWith('sess_active');
 
-    // Case B: Active + Connected + latencyMs=0 (0ms is valid latency, must not fall back to Connected)
-    rerender(
-      <SessionTabs
-        sessions={sessions}
-        activeSession="sess_active"
-        connected={true}
-        latencyMs={0}
-        latencyColor="#34d399"
-        onSelect={vi.fn()}
-        sessionsLoaded={true}
-        {...defaultProps}
-      />,
-    );
-    const activeDotB = screen.getAllByRole('tab')[0].querySelector('.tab-ws-dot');
-    expect(activeDotB?.getAttribute('title')).toBe('0ms');
-    expect(activeDotB?.querySelector('.tab-latency')?.textContent).toBe('0ms');
-
-    // Case C: Active + Connected + latencyMs=null
-    rerender(
-      <SessionTabs
-        sessions={sessions}
-        activeSession="sess_active"
-        connected={true}
-        latencyMs={null}
-        latencyColor="#34d399"
-        onSelect={vi.fn()}
-        sessionsLoaded={true}
-        {...defaultProps}
-      />,
-    );
-    const activeDotC = screen.getAllByRole('tab')[0].querySelector('.tab-ws-dot');
-    expect(activeDotC?.getAttribute('title')).toBe('Connected');
-    expect(activeDotC?.querySelector('.tab-latency')).toBeNull();
-
-    // Case D: Active + Disconnected (connected=false)
+    // Case B: Disconnected state
     rerender(
       <SessionTabs
         sessions={sessions}
@@ -1435,12 +1389,12 @@ describe('SessionTabs', () => {
         {...defaultProps}
       />,
     );
-    const activeDotD = screen.getAllByRole('tab')[0].querySelector('.tab-ws-dot');
-    expect(activeDotD?.getAttribute('title')).toBe('Disconnected');
-    expect(activeDotD?.querySelector('.tab-latency')).toBeNull();
+    const tabsB = screen.getAllByRole('tab');
+    expect(tabsB[0].querySelector('.tab-ws-dot')).toBeNull();
+    expect(tabsB[0].querySelector('.tab-latency')).toBeNull();
   });
 
-  it('enforces min-width not less than 5 characters on .tab and positions inactive idle dot at bottom-right corner', () => {
+  it('enforces min-width not less than 5 characters on .tab and renders .tab.busy with bottom marquee animation', () => {
     const cssText = readTabStyles();
 
     // 1. .tab min-width at least 5ch plus padding and centered content
@@ -1448,34 +1402,19 @@ describe('SessionTabs', () => {
     expect(tabRule).toContain('min-width: calc(5ch + 30px)');
     expect(tabRule).toContain('justify-content: center');
 
-    // 2. Inactive idle dot (.tab.idle:not(.active)::after) must be positioned absolute bottom-right
-    const idleDotRule = cssText.match(/(?:^|\n)\.tab\.idle:not\(\.active\)::after\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(idleDotRule).toContain("content: '●'");
-    expect(idleDotRule).toContain('position: absolute');
-    expect(idleDotRule).toMatch(/bottom:\s*1px/);
-    expect(idleDotRule).toMatch(/right:\s*2px/);
-    expect(idleDotRule).toContain('pointer-events: none');
-    expect(idleDotRule).toContain('margin: 0');
-    expect(idleDotRule).toContain('line-height: 1');
-    expect(idleDotRule).toContain('z-index: 3');
-    expect(idleDotRule).not.toContain('margin-left');
-
-    // 3. Legacy unconstrained .tab.idle::after must not exist (avoiding double-dot on active idle tabs)
-    const legacyIdleRule = cssText.match(/(?:^|\n)\.tab\.idle::after\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(legacyIdleRule).toBe('');
-
-    // 4. Busy spinner continues to use rotating icon
+    // 2. .tab.busy::after uses bottom high-contrast marquee animation instead of 7px spinning circle
     const busyRule = cssText.match(/(?:^|\n)\.tab\.busy::after\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(busyRule).toContain("content: '◌'");
-    expect(busyRule).toContain('animation: spin');
+    expect(busyRule).toContain('position: absolute');
+    expect(busyRule).toContain('bottom: 0');
+    expect(busyRule).toContain('height: 3px');
+    expect(busyRule).toContain('z-index: 3');
+    expect(busyRule).toContain('pointer-events: none');
+    expect(busyRule).toContain('animation: tab-busy-marquee');
+    expect(busyRule).not.toContain("content: '◌'");
+    expect(cssText).toContain('@keyframes tab-busy-marquee');
+    expect(cssText).toMatch(/@media\s*\(prefers-reduced-motion:\s*reduce\)\s*\{[\s\S]*?\.tab\.busy::after\s*\{[\s\S]*?animation:\s*none;/);
 
-    // 5. Android platform rules for inactive idle dot
-    const androidIdleRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab\.idle:not\(\.active\)::after\s*\{[^}]+\}/)?.[0] ?? '';
-    expect(androidIdleRule).toMatch(/bottom:\s*1px/);
-    expect(androidIdleRule).toMatch(/right:\s*2px/);
-    expect(androidIdleRule).toContain('font-size: 6px');
-
-    // 6. Render test with short labels, active idle, inactive idle, and busy
+    // 3. Render test with short labels, active idle, inactive idle, and busy
     const sessions = makeSessions([
       { name: 'sess_short_active', label: 'cd', state: 'idle' },
       { name: 'sess_short_inactive', label: 'sh', state: 'idle' },
@@ -1501,10 +1440,9 @@ describe('SessionTabs', () => {
     expect(tabs[0].className).toContain('tab');
     expect(tabs[0].className).toContain('active');
     expect(tabs[0].className).toContain('idle');
-    expect(tabs[0].querySelector('.tab-ws-dot')).not.toBeNull();
-    expect(tabs[0].querySelector('.tab-ws-dot')?.textContent).toContain('23ms');
+    expect(tabs[0].querySelector('.tab-ws-dot')).toBeNull();
 
-    // Tab 2: Inactive + idle (CSS ::after renders green dot, DOM must NOT have .tab-ws-dot)
+    // Tab 2: Inactive + idle (no green dot in DOM or CSS)
     expect(tabs[1].className).toContain('tab');
     expect(tabs[1].className).not.toContain('active');
     expect(tabs[1].className).toContain('idle');

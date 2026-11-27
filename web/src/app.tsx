@@ -133,6 +133,7 @@ import { MobileSharedEntriesMenu } from './components/MobileSharedEntriesMenu.js
 import { MobileServerMenuToolbar, type MobileServerMenuTab } from './components/MobileServerMenuToolbar.js';
 import { MobileRemoteDesktopMenuList } from './components/MobileRemoteDesktopMenuList.js';
 import { SharedStateIndicator } from './components/SharedStateIndicator.js';
+import { ServerLatencyIndicator } from './components/ServerLatencyIndicator.js';
 import {
   KEYBOARD_SHORTCUTS_PREF_KEY,
   canHandleGlobalNavigationShortcut,
@@ -11795,6 +11796,11 @@ function InternalMainApp() {
                   ) : (
                     <SharedStateIndicator state={selectedServerSharedOutState} iconOnly variant="shared-out" />
                   )}
+                  <ServerLatencyIndicator
+                    connected={connected}
+                    latencyMs={latencyMs}
+                    className="mobile-server-latency"
+                  />
                   <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
                 </button>
                 {showMobileServerMenu && (
@@ -12011,6 +12017,11 @@ function InternalMainApp() {
             {/* Desktop local preview shortcut — available even before a session is active */}
             {!isMobile && selectedServerId && !resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
+                <ServerLatencyIndicator
+                  connected={connected}
+                  latencyMs={latencyMs}
+                  className="desktop-server-latency"
+                />
                 <button
                   class="view-toggle"
                   title={trans('localWebPreview.title')}
@@ -12035,6 +12046,11 @@ function InternalMainApp() {
             {/* Desktop view mode toggle — mobile uses the one in mobile-server-bar */}
             {!isMobile && resolvedActiveSessionExists && (
               <div class="desktop-view-toggle">
+                <ServerLatencyIndicator
+                  connected={connected}
+                  latencyMs={latencyMs}
+                  className="desktop-server-latency"
+                />
                 {/* Left of the file-manager button, on purpose: remote-desktop
                     launch/enable is the first action in this row. */}
                 <DaemonRemoteDesktopControl
