@@ -1019,4 +1019,211 @@ describe('KimiV2Provider', () => {
       rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('maps compaction_update, compaction_summary_chunk, and PromptResponse.usage fallback with multi-session isolation', async () => {
+    let sessCounter = 0;
+    const statusesA: ProviderStatusUpdate[] = [];
+    const statusesB: ProviderStatusUpdate[] = [];
+    const usagesA: unknown[] = [];
+    const usagesB: unknown[] = [];
+    const completesA: Array<{ metadata?: Record<string, unknown> }> = [];
+    const completesB: Array<{ metadata?: Record<string, unknown> }> = [];
+
+    state.conn = makeMockConn({
+      newSession: vi.fn(async () => ({ sessionId: `kimi-iso-${++sessCounter}` })),
+    });
+
+    const provider = new KimiV2Provider();
+    provider.onStatus((sid, s) => {
+      if (sid === 'sess-a') statusesA.push(s);
+      if (sid === 'sess-b') statusesB.push(s);
+    });
+    provider.onUsage((sid, u) => {
+      if (sid === 'sess-a') usagesA.push(u);
+      if (sid === 'sess-b') usagesB.push(u);
+    });
+    provider.onComplete((sid, m) => {
+      if (sid === 'sess-a') completesA.push({ metadata: m.metadata });
+      if (sid === 'sess-b') completesB.push({ metadata: m.metadata });
+    });
+
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-a', cwd: os.tmpdir() });
+    await provider.createSession({ sessionKey: 'sess-b', cwd: os.tmpdir() });
+
+    expect(state.conn.initialize).toHaveBeenCalledWith(expect.objectContaining({
+      clientCapabilities: expect.objectContaining({
+        session: { compaction: {} },
+      }),
+    }));
+
+    // Turn 1 on sess-a: compaction_update in_progress -> compaction_summary_chunk -> thought (must not clobber compacting) -> completed,
+    // plus PromptResponse.usage fallback when no usage_update was emitted.
+    state.conn.prompt.mockImplementationOnce(async () => {
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-1', status: 'in_progress' } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: 'compaction_summary_chunk', compactionId: 'cmp-1', content: { type: 'text', text: 'Summary' } } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thinking' } } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-1', status: 'completed' } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: '_vendor_ext_update', extra: 1 } as never,
+      });
+      return {
+        stopReason: 'end_turn',
+        usage: { totalTokens: 150, inputTokens: 100, outputTokens: 30, cachedReadTokens: 15, cachedWriteTokens: 5 },
+      };
+    });
+
+    await provider.send('sess-a', {
+      context: { sessionSystemText: 'SYS_A' },
+      assembledMessage: 'hello a',
+      sessionSystemText: 'SYS_A',
+    } as never);
+    await vi.waitFor(() => expect(completesA).toHaveLength(1));
+
+    expect(statusesA).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null, compactionOutcome: 'committed' },
+    ]);
+    expect(statusesB).toEqual([]);
+    expect(usagesB).toEqual([]);
+    expect(usagesA).toEqual([
+      expect.objectContaining({
+        finalized: true,
+        usage: {
+          input_tokens: 100,
+          output_tokens: 30,
+          cached_input_tokens: 15,
+          cache_read_input_tokens: 15,
+          cache_creation_input_tokens: 5,
+        },
+      }),
+    ]);
+    expect(completesA[0]!.metadata).toMatchObject({ compacted: true });
+
+    // Because compaction committed in Turn 1, Turn 2 on sess-a re-injects SYS_A;
+    // then compaction_update failed must emit compactionOutcome: 'failed' WITHOUT clearing systemTextInjected.
+    statusesA.length = 0;
+    state.conn.prompt.mockImplementationOnce(async () => {
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-2', status: 'in_progress' } as never,
+      });
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-2', status: 'failed', error: 'summary failed' } as never,
+      });
+      return { stopReason: 'end_turn' };
+    });
+
+    await provider.send('sess-a', {
+      context: { sessionSystemText: 'SYS_A' },
+      assembledMessage: 'turn 2',
+      sessionSystemText: 'SYS_A',
+    } as never);
+    await vi.waitFor(() => expect(completesA).toHaveLength(2));
+    const turn2Prompt = (state.conn.prompt.mock.calls[1]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+    expect(turn2Prompt).toContain('SYS_A');
+    expect(statusesA).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null, compactionOutcome: 'failed' },
+    ]);
+
+    // Turn 3 on sess-a does NOT re-inject SYS_A because Turn 2's compaction failed,
+    // and when usage_update already fired in-turn, PromptResponse.usage fallback does not duplicate/overwrite it.
+    usagesA.length = 0;
+    state.conn.prompt.mockImplementationOnce(async () => {
+      await state.handlers!.sessionUpdate({
+        sessionId: 'kimi-iso-1',
+        update: { sessionUpdate: 'usage_update', used: 2000, size: 128000 } as never,
+      });
+      return {
+        stopReason: 'end_turn',
+        usage: { totalTokens: 9999, inputTokens: 8888, outputTokens: 1111 },
+      };
+    });
+    await provider.send('sess-a', {
+      context: { sessionSystemText: 'SYS_A' },
+      assembledMessage: 'turn 3',
+      sessionSystemText: 'SYS_A',
+    } as never);
+    await vi.waitFor(() => expect(completesA).toHaveLength(3));
+    const turn3Prompt = (state.conn.prompt.mock.calls[2]![0] as { prompt: Array<{ text: string }> }).prompt[0]!.text;
+    expect(turn3Prompt).not.toContain('SYS_A');
+    expect(usagesA).toEqual([
+      expect.objectContaining({ usage: { input_tokens: 2000, model_context_window: 128000 } }),
+    ]);
+
+    await provider.disconnect();
+  });
+
+  it('emits compacting for /compact turns and always clears status on completion, cancel, and child crash', async () => {
+    let resolveCompact!: (v: unknown) => void;
+    state.conn = makeMockConn({
+      prompt: vi.fn(() => new Promise((r) => { resolveCompact = r; })),
+    });
+
+    const provider = new KimiV2Provider({ cancelGraceMs: 50 });
+    const statuses: ProviderStatusUpdate[] = [];
+    const completes: Array<{ metadata?: Record<string, unknown> }> = [];
+    const errors: Array<{ code: string }> = [];
+    provider.onStatus((_, s) => statuses.push(s));
+    provider.onComplete((_, m) => completes.push({ metadata: m.metadata }));
+    provider.onError((_, e) => errors.push({ code: e.code }));
+
+    await provider.connect({});
+    await provider.createSession({ sessionKey: 'sess-compact', cwd: os.tmpdir() });
+
+    // 1) /compact completes without compaction_update -> emits compacting then committed clear.
+    await provider.send('sess-compact', '/compact');
+    expect(statuses).toEqual([{ status: 'compacting', label: 'Compacting conversation...' }]);
+    resolveCompact({ stopReason: 'end_turn' });
+    await vi.waitFor(() => expect(completes).toHaveLength(1));
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null, compactionOutcome: 'committed' },
+    ]);
+    expect(completes[0]!.metadata).toMatchObject({ compacted: true });
+
+    // 2) /compact cancelled -> clears status cleanly with failed outcome.
+    statuses.length = 0;
+    state.conn.prompt.mockImplementationOnce(() => new Promise(() => {}));
+    await provider.send('sess-compact', '/compact');
+    expect(statuses).toEqual([{ status: 'compacting', label: 'Compacting conversation...' }]);
+    await provider.cancel('sess-compact');
+    await vi.waitFor(() => expect(errors).toHaveLength(1));
+    expect(statuses).toEqual([
+      { status: 'compacting', label: 'Compacting conversation...' },
+      { status: null, label: null, compactionOutcome: 'failed' },
+    ]);
+
+    // 3) Child crash while compaction_update is active clears status cleanly.
+    statuses.length = 0;
+    state.conn = makeMockConn({ prompt: vi.fn(() => new Promise(() => {})) });
+    await provider.send('sess-compact', 'normal work');
+    await state.handlers!.sessionUpdate({
+      sessionId: 'kimi-sess-1',
+      update: { sessionUpdate: 'compaction_update', compactionId: 'cmp-crash', status: 'in_progress' } as never,
+    });
+    expect(statuses).toEqual([{ status: 'compacting', label: 'Compacting conversation...' }]);
+    const liveChild = state.children.at(-1)!;
+    liveChild.exitCode = 1;
+    liveChild.emit('exit', 1, null);
+    await vi.waitFor(() => expect(errors).toHaveLength(2));
+    expect(statuses.at(-1)).toEqual({ status: null, label: null });
+
+    await provider.disconnect();
+  });
 });

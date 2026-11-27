@@ -119,6 +119,10 @@ interface PendingTurn {
   accumulated: string;
   assistantTextClosed: boolean;
   cancelled: boolean;
+  isCompact?: boolean;
+  compactedInTurn?: boolean;
+  hasUsageUpdate?: boolean;
+  lastUsage?: ProviderUsageUpdate['usage'];
   cancelGraceTimer: ReturnType<typeof setTimeout> | null;
   terminalTarget: object;
   physicalTerminal: Promise<void>;
@@ -375,6 +379,37 @@ function extractModelCatalog(resp: unknown): ExtractedModelCatalog {
 function inferImageMime(filePath: string): string | null {
   const ext = path.extname(filePath).toLowerCase();
   return IMAGE_MIME_BY_EXT[ext] ?? null;
+}
+
+function nonNegativeFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function extractPromptResponseUsage(response: PromptResponse | null | undefined): ProviderUsageUpdate['usage'] | undefined {
+  const usage = asRecord(response?.usage);
+  if (!usage) return undefined;
+  const inputTokens = nonNegativeFiniteNumber(usage.inputTokens);
+  const outputTokens = nonNegativeFiniteNumber(usage.outputTokens);
+  const cachedReadTokens = nonNegativeFiniteNumber(usage.cachedReadTokens);
+  const cachedWriteTokens = nonNegativeFiniteNumber(usage.cachedWriteTokens);
+  const meta = asRecord(response?._meta);
+  const metaWindow = nonNegativeFiniteNumber(meta?.model_context_window) ?? nonNegativeFiniteNumber(meta?.size);
+  if (
+    inputTokens === undefined
+    && outputTokens === undefined
+    && cachedReadTokens === undefined
+    && cachedWriteTokens === undefined
+    && (metaWindow === undefined || metaWindow <= 0)
+  ) {
+    return undefined;
+  }
+  return {
+    ...(inputTokens !== undefined ? { input_tokens: inputTokens } : {}),
+    ...(outputTokens !== undefined ? { output_tokens: outputTokens } : {}),
+    ...(cachedReadTokens !== undefined ? { cached_input_tokens: cachedReadTokens, cache_read_input_tokens: cachedReadTokens } : {}),
+    ...(cachedWriteTokens !== undefined ? { cache_creation_input_tokens: cachedWriteTokens } : {}),
+    ...(metaWindow !== undefined && metaWindow > 0 ? { model_context_window: metaWindow } : {}),
+  };
 }
 
 function computeExecutableFingerprint(bin: ResolvedExecutable): string {
@@ -666,8 +701,12 @@ export class KimiV2Provider implements TransportProvider {
         const exitMsg = `kimi acp exited unexpectedly (code=${code ?? 'null'}, signal=${signal ?? 'null'})`;
         for (const state of this.sessions.values()) {
           this.rejectPendingApprovals(state, new Error(exitMsg));
-          if (state.pendingTurn && state.boundConnectionGeneration === generation) {
-            this.failTurn(state, state.pendingTurn, new Error(exitMsg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
+          if (state.boundConnectionGeneration === generation) {
+            if (state.pendingTurn) {
+              this.failTurn(state, state.pendingTurn, new Error(exitMsg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
+            } else {
+              this.clearStatus(state.sessionKey, state);
+            }
           }
         }
       });
@@ -714,6 +753,9 @@ export class KimiV2Provider implements TransportProvider {
             fs: {
               readTextFile: true,
               writeTextFile: true,
+            },
+            session: {
+              compaction: {},
             },
           },
           clientInfo: { name: 'imcodes', version: '1.0.0' },
@@ -1256,6 +1298,7 @@ export class KimiV2Provider implements TransportProvider {
       this.rejectPendingApprovals(state, new Error('Session detached'));
       this.failTurn(state, state.pendingTurn, new Error('Session detached'), PROVIDER_ERROR_CODES.CANCELLED, true);
     }
+    this.clearStatus(state.sessionKey, state);
   }
 
   async endSession(sessionId: string): Promise<void> {
@@ -1289,6 +1332,14 @@ export class KimiV2Provider implements TransportProvider {
     if (!state.promptInFlight && (!this.connection || !this.isChildAlive())) {
       state.model = agentId;
     }
+  }
+
+  /** Clear injected system-text tracking after compaction or identity changes. */
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.resolveState(sessionId);
+    if (!state) return;
+    state.lastInjectedSessionSystemKey = undefined;
+    state.systemTextInjected = false;
   }
 
   async applySessionModel(sessionId: string, agentId: string): Promise<SessionModelApplied> {
@@ -1374,6 +1425,8 @@ export class KimiV2Provider implements TransportProvider {
     }
 
     const normalized = normalizeProviderPayload(payload, attachments, extraSystemPrompt);
+    const isCompact = typeof normalized.userMessage === 'string'
+      && isSessionControlCommandText(normalized.userMessage, 'compact');
     const generation = ++state.turnGeneration;
     let resolvePhysicalTerminal!: () => void;
     const physicalTerminal = new Promise<void>((resolve) => {
@@ -1386,6 +1439,7 @@ export class KimiV2Provider implements TransportProvider {
       accumulated: '',
       assistantTextClosed: false,
       cancelled: false,
+      isCompact,
       cancelGraceTimer: null,
       terminalTarget: {},
       physicalTerminal,
@@ -1398,6 +1452,9 @@ export class KimiV2Provider implements TransportProvider {
     state.pendingTurn = turn;
     state.lastStopTurn = turn;
     state.lastStatusSignature = null;
+    if (isCompact) {
+      this.emitStatus(state.sessionKey, state, { status: 'compacting', label: 'Compacting conversation...' });
+    }
 
     try {
       const connection = await this.ensureConnected({
@@ -1414,7 +1471,7 @@ export class KimiV2Provider implements TransportProvider {
         throw Object.assign(new Error('Turn cancelled before prompt submission'), { code: PROVIDER_ERROR_CODES.CANCELLED });
       }
 
-      const contentBlocks = this.prepareTurnPromptBlocks(state, normalized, attachments);
+      const contentBlocks = this.prepareTurnPromptBlocks(state, normalized, attachments, isCompact);
       const capturedChild = this.child;
       if (!capturedChild) {
         throw new Error('kimi acp child process unavailable at prompt boundary');
@@ -1449,8 +1506,8 @@ export class KimiV2Provider implements TransportProvider {
     state: KimiSessionState,
     normalized: ProviderContextPayload,
     attachments?: TransportAttachment[],
+    isCompact = typeof normalized.userMessage === 'string' && isSessionControlCommandText(normalized.userMessage, 'compact'),
   ): ContentBlock[] {
-    const isCompact = isSessionControlCommandText(normalized.userMessage, 'compact');
     let promptText: string;
     if (isCompact) {
       state.lastInjectedSessionSystemKey = undefined;
@@ -1535,6 +1592,18 @@ export class KimiV2Provider implements TransportProvider {
         this.failTurn(state, turn, new Error('Turn cancelled'), PROVIDER_ERROR_CODES.CANCELLED, true);
         return;
       }
+      if (!turn.hasUsageUpdate) {
+        const responseUsage = extractPromptResponseUsage(response);
+        if (responseUsage) {
+          turn.lastUsage = responseUsage;
+          this.emitUsage(state.sessionKey, {
+            messageId: turn.messageId,
+            finalized: true,
+            model: state.model,
+            usage: responseUsage,
+          });
+        }
+      }
       this.settleTurn(state, turn);
     } catch (err) {
       if (err instanceof RequestError) {
@@ -1589,6 +1658,8 @@ export class KimiV2Provider implements TransportProvider {
       if (session === originState) continue;
       if (session.pendingTurn && !session.pendingTurn.settled) {
         this.failTurn(session, session.pendingTurn, new Error(msg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
+      } else {
+        this.clearStatus(session.sessionKey, session);
       }
     }
 
@@ -1605,7 +1676,18 @@ export class KimiV2Provider implements TransportProvider {
     turn.settled = true;
     this.clearTurnTimersAndState(state, turn);
     this.clearActiveTools(state);
-    this.clearStatus(state.sessionKey, state);
+    const didCompact = Boolean(turn.isCompact || turn.compactedInTurn);
+    if (didCompact) {
+      this.refreshSessionSystemText(state.sessionKey);
+      this.clearStatus(state.sessionKey, state, !turn.compactedInTurn ? 'committed' : undefined);
+    } else {
+      this.clearStatus(state.sessionKey, state);
+    }
+    const metadata: Record<string, unknown> = {
+      ...(state.model ? { model: state.model } : {}),
+      ...(turn.lastUsage ? { usage: turn.lastUsage } : {}),
+      ...(didCompact ? { compacted: true } : {}),
+    };
     this.emitComplete(state.sessionKey, {
       id: turn.messageId,
       sessionId: state.sessionKey,
@@ -1614,7 +1696,7 @@ export class KimiV2Provider implements TransportProvider {
       content: turn.accumulated,
       timestamp: Date.now(),
       status: 'complete',
-      ...(state.model ? { metadata: { model: state.model } } : {}),
+      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
     });
   }
 
@@ -1624,7 +1706,7 @@ export class KimiV2Provider implements TransportProvider {
     this.rejectPendingApprovals(state, err);
     this.clearTurnTimersAndState(state, turn);
     this.clearActiveTools(state);
-    this.clearStatus(state.sessionKey, state);
+    this.clearStatus(state.sessionKey, state, turn.isCompact && !turn.compactedInTurn ? 'failed' : undefined);
     this.lastErrorCode = code;
     this.emitError(state.sessionKey, {
       code,
@@ -1660,16 +1742,26 @@ export class KimiV2Provider implements TransportProvider {
   }
 
   private emitStatus(sessionId: string, state: KimiSessionState, status: ProviderStatusUpdate): void {
-    const sig = `${status.status ?? ''}\0${status.label ?? ''}`;
+    const sig = `${status.status ?? ''}\0${status.label ?? ''}\0${status.compactionOutcome ?? ''}`;
     if (state.lastStatusSignature === sig) return;
     state.lastStatusSignature = sig;
     for (const cb of this.statusHandlers) cb(sessionId, status);
   }
 
-  private clearStatus(sessionId: string, state: KimiSessionState): void {
-    if (state.lastStatusSignature === null) return;
+  private clearStatus(
+    sessionId: string,
+    state: KimiSessionState,
+    compactionOutcome?: 'committed' | 'failed',
+  ): void {
+    if (state.lastStatusSignature === null && !compactionOutcome) return;
     state.lastStatusSignature = null;
-    for (const cb of this.statusHandlers) cb(sessionId, { status: null, label: null });
+    for (const cb of this.statusHandlers) {
+      cb(sessionId, {
+        status: null,
+        label: null,
+        ...(compactionOutcome ? { compactionOutcome } : {}),
+      });
+    }
   }
 
   async cancel(sessionId: string, options?: ProviderCancelOptions): Promise<void> {
@@ -1788,8 +1880,29 @@ export class KimiV2Provider implements TransportProvider {
       }
 
       case 'agent_thought_chunk': {
-        if (state.promptInFlight && !state.pendingTurn?.cancelled) {
+        if (state.promptInFlight && !state.pendingTurn?.cancelled && state.lastStatusSignature?.startsWith('compacting\0') !== true) {
           this.emitStatus(state.sessionKey, state, { status: 'thinking', label: 'Thinking...' });
+        }
+        break;
+      }
+
+      case 'compaction_summary_chunk': {
+        if (!state.pendingTurn?.cancelled) {
+          this.emitStatus(state.sessionKey, state, { status: 'compacting', label: 'Compacting conversation...' });
+        }
+        break;
+      }
+
+      case 'compaction_update': {
+        const rawStatus = isNonEmptyString(u.status) ? u.status.trim().toLowerCase() : 'in_progress';
+        if (rawStatus === 'completed' || rawStatus === 'complete' || rawStatus === 'done' || rawStatus === 'finished') {
+          this.refreshSessionSystemText(state.sessionKey);
+          if (state.pendingTurn) state.pendingTurn.compactedInTurn = true;
+          this.clearStatus(state.sessionKey, state, 'committed');
+        } else if (rawStatus === 'failed' || rawStatus === 'cancelled' || rawStatus === 'canceled' || rawStatus === 'error') {
+          this.clearStatus(state.sessionKey, state, 'failed');
+        } else if (!state.pendingTurn?.cancelled) {
+          this.emitStatus(state.sessionKey, state, { status: 'compacting', label: 'Compacting conversation...' });
         }
         break;
       }
@@ -1904,15 +2017,20 @@ export class KimiV2Provider implements TransportProvider {
         const cached = typeof tokens?.cached === 'number' ? tokens.cached : undefined;
 
         if (used !== undefined || size !== undefined || output !== undefined || cached !== undefined) {
+          const usagePayload: NonNullable<ProviderUsageUpdate['usage']> = {
+            ...(used !== undefined ? { input_tokens: used } : {}),
+            ...(output !== undefined ? { output_tokens: output } : {}),
+            ...(cached !== undefined ? { cached_input_tokens: cached, cache_read_input_tokens: cached } : {}),
+            ...(size !== undefined ? { model_context_window: size } : {}),
+          };
+          if (state.pendingTurn) {
+            state.pendingTurn.hasUsageUpdate = true;
+            state.pendingTurn.lastUsage = usagePayload;
+          }
           this.emitUsage(state.sessionKey, {
             messageId: state.pendingTurn?.messageId,
             model: state.model,
-            usage: {
-              ...(used !== undefined ? { input_tokens: used } : {}),
-              ...(output !== undefined ? { output_tokens: output } : {}),
-              ...(cached !== undefined ? { cached_input_tokens: cached, cache_read_input_tokens: cached } : {}),
-              ...(size !== undefined ? { model_context_window: size } : {}),
-            },
+            usage: usagePayload,
           });
         }
         break;

@@ -19,7 +19,7 @@ function createDuplexStreams(): { clientStream: Stream; agentStream: Stream } {
   };
 }
 
-describe('acp-client-adapter (@agentclientprotocol/sdk 2.9.1 /unstable)', () => {
+describe('acp-client-adapter (@agentclientprotocol/sdk 2.12.0 /unstable)', () => {
   it('bridges client requests, wildcard extension notifications, and write tracking over App API', async () => {
     const { clientStream, agentStream } = createDuplexStreams();
     const seenMethods: string[] = [];
@@ -253,5 +253,19 @@ describe('acp-client-adapter (@agentclientprotocol/sdk 2.9.1 /unstable)', () => 
     expect(tools).toHaveLength(2);
     expect((tools[0] as any).input).toEqual({ plan: [{ content: 'Step 1', status: 'in_progress' }] });
     expect((tools[1] as any).input).toEqual({ plan: [{ content: 'Plan markdown summary', status: 'in_progress' }] });
+
+    // Unknown `_`-prefixed and compaction_update / compaction_summary_chunk variants do not throw.
+    expect(() => (provider as any).handleSessionUpdate({
+      sessionId: 'acp-plan-1',
+      update: { sessionUpdate: 'compaction_update', compactionId: 'c1', status: 'in_progress' },
+    })).not.toThrow();
+    expect(() => (provider as any).handleSessionUpdate({
+      sessionId: 'acp-plan-1',
+      update: { sessionUpdate: 'compaction_summary_chunk', compactionId: 'c1', content: { type: 'text', text: 'sum' } },
+    })).not.toThrow();
+    expect(() => (provider as any).handleSessionUpdate({
+      sessionId: 'acp-plan-1',
+      update: { sessionUpdate: '_vendor_custom_event', payload: { ok: true } },
+    })).not.toThrow();
   });
 });
