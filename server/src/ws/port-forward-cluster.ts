@@ -11,7 +11,11 @@ import {
   type PortForwardWireMessage,
 } from '../../../shared/port-forward.js';
 
-export type PortForwardClusterStatus = 'preparing' | 'connecting' | 'active' | 'closed';
+export type PortForwardClusterStatus = 'preparing' | 'connecting' | 'active' | 'closing' | 'closed';
+
+export type PortForwardRelayHop = 'to_coordinator' | 'to_endpoint';
+
+export type PortForwardRemoteCloseAckOutcome = 'confirmed' | 'timed_out' | 'missing';
 
 export interface PortForwardEndpointPresence {
   serverId: string;
@@ -72,6 +76,7 @@ export type PortForwardClusterBusMessage =
       kind: 'relay_drained';
       tunnelId: string;
       direction: PortForwardRelayDirection;
+      hop: PortForwardRelayHop;
       queuedBytes: number;
     }
   | {
@@ -92,6 +97,7 @@ export type PortForwardClusterBusMessage =
       requestId: string;
       tunnelId: string;
       ok: boolean;
+      outcome: PortForwardRemoteCloseAckOutcome;
     };
 
 export type PortForwardClusterEnqueueResult =
@@ -127,7 +133,7 @@ export interface PortForwardClusterStore {
   ): Promise<PortForwardClusterEnqueueResult>;
   cleanupTunnelMessages(tunnelId: string): Promise<void>;
   reclaimStaleMessages(now?: number): Promise<number>;
-  getQueuedBytes?(tunnelId: string, direction: PortForwardRelayDirection): Promise<number>;
+  getQueuedBytes?(tunnelId: string, direction: PortForwardRelayDirection, hop?: PortForwardRelayHop): Promise<number>;
   setPodDrainPausedForTests?(podId: string, paused: boolean): Promise<void>;
   start?(podId: string, handler: PortForwardClusterBusHandler): Promise<void>;
   stop?(podId: string): Promise<void>;
@@ -162,6 +168,7 @@ function classifyRelayAccounting(message: PortForwardClusterBusMessage): {
   isRelayData: boolean;
   tunnelId?: string;
   direction?: PortForwardRelayDirection;
+  hop?: PortForwardRelayHop;
   byteSize: number;
   coordinatorPodId?: string;
 } {
@@ -171,6 +178,7 @@ function classifyRelayAccounting(message: PortForwardClusterBusMessage): {
       isRelayData: true,
       tunnelId: message.frame.tunnelId,
       direction: message.direction ?? 'l2t',
+      hop: message.kind,
       byteSize: Buffer.byteLength(message.frame.data, 'utf8'),
       coordinatorPodId: message.kind === 'to_endpoint' ? message.coordinatorPodId : undefined,
     };
@@ -190,6 +198,7 @@ interface InMemoryQueuedItem {
   targetPodId: string;
   tunnelId?: string;
   direction?: PortForwardRelayDirection;
+  hop?: PortForwardRelayHop;
   byteSize: number;
   expiresAt: number;
   coordinatorPodId?: string;
@@ -335,12 +344,21 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
     };
   }
 
-  async getQueuedBytes(tunnelId: string, direction: PortForwardRelayDirection): Promise<number> {
+  async getQueuedBytes(
+    tunnelId: string,
+    direction: PortForwardRelayDirection,
+    hop?: PortForwardRelayHop,
+  ): Promise<number> {
     const now = Date.now();
     let total = 0;
     for (const q of this.podQueues.values()) {
       for (const item of q) {
-        if (item.tunnelId === tunnelId && item.direction === direction && item.expiresAt > now) {
+        if (
+          item.tunnelId === tunnelId
+          && item.direction === direction
+          && (!hop || item.hop === hop)
+          && item.expiresAt > now
+        ) {
           total += item.byteSize;
         }
       }
@@ -407,8 +425,8 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
     const acc = classifyRelayAccounting(message);
     let currentBytes = 0;
 
-    if (acc.isRelayData && acc.tunnelId && acc.direction) {
-      currentBytes = await this.getQueuedBytes(acc.tunnelId, acc.direction);
+    if (acc.isRelayData && acc.tunnelId && acc.direction && acc.hop) {
+      currentBytes = await this.getQueuedBytes(acc.tunnelId, acc.direction, acc.hop);
       if (currentBytes + acc.byteSize > PORT_FORWARD_LIMITS.CLUSTER_RELAY_HARD_CAP_BYTES) {
         return { ok: false, overflow: true, queuedBytes: currentBytes };
       }
@@ -424,6 +442,7 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
       targetPodId,
       ...(acc.tunnelId ? { tunnelId: acc.tunnelId } : {}),
       ...(acc.direction ? { direction: acc.direction } : {}),
+      ...(acc.hop ? { hop: acc.hop } : {}),
       byteSize: acc.byteSize,
       expiresAt: now + PORT_FORWARD_LIMITS.CLUSTER_RELAY_MSG_TTL_MS,
       ...(acc.coordinatorPodId ? { coordinatorPodId: acc.coordinatorPodId } : {}),
@@ -458,17 +477,23 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
   private async drainPodQueue(podId: string): Promise<void> {
     const q = this.podQueues.get(podId);
     if (!q) return;
-    const drainedPairs = new Map<string, { tunnelId: string; direction: PortForwardRelayDirection; coordinatorPodId?: string }>();
+    const drainedPairs = new Map<string, {
+      tunnelId: string;
+      direction: PortForwardRelayDirection;
+      hop: PortForwardRelayHop;
+      coordinatorPodId?: string;
+    }>();
 
     while (q.length > 0 && !this.pausedPods.has(podId)) {
       const handler = this.subscribers.get(podId);
       if (!handler) break;
       const item = q.shift()!;
       if (item.expiresAt <= Date.now()) continue;
-      if (item.tunnelId && item.direction && item.byteSize > 0) {
-        drainedPairs.set(`${item.tunnelId}:${item.direction}`, {
+      if (item.tunnelId && item.direction && item.hop && item.byteSize > 0) {
+        drainedPairs.set(`${item.tunnelId}:${item.direction}:${item.hop}`, {
           tunnelId: item.tunnelId,
           direction: item.direction,
+          hop: item.hop,
           coordinatorPodId: item.coordinatorPodId,
         });
       }
@@ -476,7 +501,7 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
     }
 
     for (const pair of drainedPairs.values()) {
-      const remainingBytes = await this.getQueuedBytes(pair.tunnelId, pair.direction);
+      const remainingBytes = await this.getQueuedBytes(pair.tunnelId, pair.direction, pair.hop);
       if (remainingBytes <= PORT_FORWARD_LIMITS.CLUSTER_RELAY_LOW_WATER_BYTES) {
         const coordinatorPodId = pair.coordinatorPodId ?? this.tunnels.get(pair.tunnelId)?.coordinatorPodId;
         if (coordinatorPodId) {
@@ -484,6 +509,7 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
             kind: 'relay_drained',
             tunnelId: pair.tunnelId,
             direction: pair.direction,
+            hop: pair.hop,
             queuedBytes: remainingBytes,
           });
         }
@@ -799,13 +825,24 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
     return rows.map(rowToTunnelRecord);
   }
 
-  async getQueuedBytes(tunnelId: string, direction: PortForwardRelayDirection): Promise<number> {
-    const row = await this.db.queryOne<{ total: number | string }>(
-      `SELECT COALESCE(SUM(byte_size), 0)::int AS total
-         FROM port_forward_bus_messages
-        WHERE tunnel_id = $1 AND direction = $2 AND (expires_at = 0 OR expires_at > $3)`,
-      [tunnelId, direction, Date.now()],
-    );
+  async getQueuedBytes(
+    tunnelId: string,
+    direction: PortForwardRelayDirection,
+    hop?: PortForwardRelayHop,
+  ): Promise<number> {
+    const row = hop
+      ? await this.db.queryOne<{ total: number | string }>(
+          `SELECT COALESCE(SUM(byte_size), 0)::int AS total
+             FROM port_forward_bus_messages
+            WHERE tunnel_id = $1 AND direction = $2 AND kind = $3 AND (expires_at = 0 OR expires_at > $4)`,
+          [tunnelId, direction, hop, Date.now()],
+        )
+      : await this.db.queryOne<{ total: number | string }>(
+          `SELECT COALESCE(SUM(byte_size), 0)::int AS total
+             FROM port_forward_bus_messages
+            WHERE tunnel_id = $1 AND direction = $2 AND (expires_at = 0 OR expires_at > $3)`,
+          [tunnelId, direction, Date.now()],
+        );
     return Number(row?.total ?? 0);
   }
 
@@ -859,10 +896,11 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
     const acc = classifyRelayAccounting(message);
     const expiresAt = now + PORT_FORWARD_LIMITS.CLUSTER_RELAY_MSG_TTL_MS;
 
-    if (acc.isRelayData && acc.tunnelId && acc.direction) {
+    if (acc.isRelayData && acc.tunnelId && acc.direction && acc.hop) {
+      const hop = acc.hop;
       const result = await this.db.transaction(async (tx): Promise<PortForwardClusterEnqueueResult> => {
         await tx.execute('SELECT pg_advisory_xact_lock($1::bigint)', [
-          advisoryLockKey64(`pf_q:${acc.tunnelId}:${acc.direction}`),
+          advisoryLockKey64(`pf_q:${acc.tunnelId}:${acc.direction}:${hop}`),
         ]);
         await tx.execute(
           `DELETE FROM port_forward_bus_messages m
@@ -875,8 +913,8 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
         const row = await tx.queryOne<{ total: number | string }>(
           `SELECT COALESCE(SUM(byte_size), 0)::int AS total
              FROM port_forward_bus_messages
-            WHERE tunnel_id = $1 AND direction = $2`,
-          [acc.tunnelId, acc.direction],
+            WHERE tunnel_id = $1 AND direction = $2 AND kind = $3`,
+          [acc.tunnelId, acc.direction, hop],
         );
         const currentBytes = Number(row?.total ?? 0);
         if (currentBytes + acc.byteSize > PORT_FORWARD_LIMITS.CLUSTER_RELAY_HARD_CAP_BYTES) {
@@ -956,6 +994,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
           if (stopped || this.pausedPods.has(podId)) break;
           const rows = await this.db.query<{
             seq: number | string;
+            kind: string;
             tunnel_id: string | null;
             direction: PortForwardRelayDirection | null;
             byte_size: number;
@@ -968,7 +1007,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
                  ORDER BY seq ASC
                  LIMIT 32
               )
-              RETURNING seq, tunnel_id, direction, byte_size, payload`,
+              RETURNING seq, kind, tunnel_id, direction, byte_size, payload`,
             [podId],
           );
           if (rows.length === 0) break;
@@ -976,6 +1015,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
           const drainedPairs = new Map<string, {
             tunnelId: string;
             direction: PortForwardRelayDirection;
+            hop: PortForwardRelayHop;
             coordinatorPodId?: string;
           }>();
 
@@ -983,10 +1023,12 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
             const payload = typeof row.payload === 'string'
               ? JSON.parse(row.payload) as PortForwardClusterBusMessage
               : row.payload;
-            if (row.tunnel_id && row.direction && Number(row.byte_size) > 0) {
-              drainedPairs.set(`${row.tunnel_id}:${row.direction}`, {
+            const hop = row.kind === 'to_coordinator' || row.kind === 'to_endpoint' ? row.kind : null;
+            if (row.tunnel_id && row.direction && hop && Number(row.byte_size) > 0) {
+              drainedPairs.set(`${row.tunnel_id}:${row.direction}:${hop}`, {
                 tunnelId: row.tunnel_id,
                 direction: row.direction,
+                hop,
                 coordinatorPodId: payload.kind === 'to_endpoint' ? payload.coordinatorPodId : undefined,
               });
             }
@@ -994,7 +1036,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
           }
 
           for (const pair of drainedPairs.values()) {
-            const remainingBytes = await this.getQueuedBytes(pair.tunnelId, pair.direction);
+            const remainingBytes = await this.getQueuedBytes(pair.tunnelId, pair.direction, pair.hop);
             if (remainingBytes <= PORT_FORWARD_LIMITS.CLUSTER_RELAY_LOW_WATER_BYTES) {
               const coordinatorPodId = pair.coordinatorPodId
                 ?? (await this.getTunnel(pair.tunnelId))?.coordinatorPodId;
@@ -1003,6 +1045,7 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
                   kind: 'relay_drained',
                   tunnelId: pair.tunnelId,
                   direction: pair.direction,
+                  hop: pair.hop,
                   queuedBytes: remainingBytes,
                 });
               }

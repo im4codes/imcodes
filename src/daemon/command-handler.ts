@@ -537,6 +537,11 @@ import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
 import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
 import { isPortForwardMessageType } from '../../shared/port-forward.js';
 import { PortForwardEngine } from './port-forward-engine.js';
+import { loadOrCreatePortForwardIdentity } from './port-forward-crypto.js';
+import {
+  PORT_FORWARD_IDENTITY_BASENAME,
+  PORT_FORWARD_TRUSTED_PEERS_BASENAME,
+} from './port-forward-trust-cli.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { handlePreviewCommand } from './preview-relay.js';
@@ -2371,6 +2376,11 @@ function expandTilde(p: string): string {
 /** Set the router context for handling inbound chat messages. Must be called before messages arrive. */
 export function setRouterContext(ctx: RouterContext): void {
   routerCtx = ctx;
+  try {
+    loadOrCreatePortForwardIdentity(nodePath.join(imcodesStateDir(), PORT_FORWARD_IDENTITY_BASENAME));
+  } catch {
+    // Non-fatal: PortForwardEngine also generates/loads lazily if state dir is temporarily unwritable.
+  }
 }
 
 export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
@@ -2397,8 +2407,8 @@ function getDaemonPortForwardEngine(serverLink: ServerLink): PortForwardEngine {
         }
       },
       getWsBufferedAmount: () => serverLink.getWsBufferedAmount(),
-      identityFilePath: nodePath.join(stateDir, 'port-forward-identity.json'),
-      trustedPeersFilePath: nodePath.join(stateDir, 'port-forward-trusted-peers.json'),
+      identityFilePath: nodePath.join(stateDir, PORT_FORWARD_IDENTITY_BASENAME),
+      trustedPeersFilePath: nodePath.join(stateDir, PORT_FORWARD_TRUSTED_PEERS_BASENAME),
     });
   }
   return daemonPortForwardEngine;

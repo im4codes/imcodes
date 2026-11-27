@@ -11,7 +11,7 @@ import {
   verify as cryptoVerify,
   type KeyObject,
 } from 'node:crypto';
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type {
   PortForwardCandidate,
@@ -102,28 +102,132 @@ export function loadOrCreatePortForwardIdentity(filePath: string): EndpointIdent
   return kp;
 }
 
+/** Validate that `publicKeyB64` is a base64url DER SPKI Ed25519 public key. */
+export function validateEd25519SpkiPublicKey(publicKeyB64: string): boolean {
+  const trimmed = publicKeyB64.trim();
+  if (!trimmed || !/^[A-Za-z0-9_-]{32,128}$/.test(trimmed)) return false;
+  try {
+    const key = createPublicKey({
+      key: Buffer.from(trimmed, 'base64url'),
+      format: 'der',
+      type: 'spki',
+    });
+    return key.asymmetricKeyType === 'ed25519';
+  } catch {
+    return false;
+  }
+}
+
+/** Deterministic SHA-256 fingerprint for out-of-band verification / display. */
+export function computePortForwardIdentityFingerprint(publicKeyB64: string): string {
+  const der = Buffer.from(publicKeyB64.trim(), 'base64url');
+  return `sha256:${createHash('sha256').update(der).digest('hex')}`;
+}
+
+function writePrivateJsonAtomic(filePath: string, data: unknown): void {
+  mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
+  const tmpPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    writeFileSync(tmpPath, `${JSON.stringify(data, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+    chmodSync(tmpPath, 0o600);
+    renameSync(tmpPath, filePath);
+    chmodSync(filePath, 0o600);
+  } catch (err) {
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      // ignore cleanup error
+    }
+    throw err;
+  }
+}
+
+function loadRawTrustedPeersObject(filePath: string): Record<string, unknown> {
+  try {
+    const raw = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      return { ...(raw as Record<string, unknown>) };
+    }
+  } catch {
+    // Missing or unreadable trust file -> treat as empty store.
+  }
+  return {};
+}
+
 /**
  * Read locally pinned peer public keys from disk (relay-independent trust store).
  */
 export function loadTrustedPeerPublicKeys(filePath: string): Map<string, string> {
   const map = new Map<string, string>();
-  try {
-    const raw = JSON.parse(readFileSync(filePath, 'utf8')) as unknown;
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return map;
-    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
-      if (typeof v === 'string' && v.trim()) {
-        map.set(k.trim(), v.trim());
-      } else if (v && typeof v === 'object' && !Array.isArray(v)) {
-        const pub = (v as { publicKeyB64?: unknown }).publicKeyB64;
-        if (typeof pub === 'string' && pub.trim()) {
-          map.set(k.trim(), pub.trim());
-        }
-      }
+  const raw = loadRawTrustedPeersObject(filePath);
+  for (const [k, v] of Object.entries(raw)) {
+    const peerId = k.trim();
+    if (!peerId) continue;
+    let pub = '';
+    if (typeof v === 'string') {
+      pub = v.trim();
+    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const candidate = (v as { publicKeyB64?: unknown }).publicKeyB64;
+      if (typeof candidate === 'string') pub = candidate.trim();
     }
-  } catch {
-    // Missing trust store returns empty map -> fail closed when peer key is absent.
+    if (pub && validateEd25519SpkiPublicKey(pub)) {
+      map.set(peerId, pub);
+    }
   }
   return map;
+}
+
+/**
+ * Owner-authorized relay-independent trust registration: atomically pin a validated
+ * Ed25519 SPKI public key for a peer serverId in the local trust store.
+ */
+export function upsertTrustedPeerPublicKey(
+  filePath: string,
+  peerServerId: string,
+  publicKeyB64: string,
+): { peerServerId: string; publicKey: string; fingerprint: string; created: boolean } {
+  const normalizedId = peerServerId.trim();
+  if (!normalizedId || normalizedId.length > 128 || /[\s\0]/.test(normalizedId)) {
+    throw new Error('invalid_peer_server_id');
+  }
+  const normalizedKey = publicKeyB64.trim();
+  if (!validateEd25519SpkiPublicKey(normalizedKey)) {
+    throw new Error('invalid_ed25519_public_key');
+  }
+  const store = loadRawTrustedPeersObject(filePath);
+  const created = !Object.prototype.hasOwnProperty.call(store, normalizedId);
+  const fingerprint = computePortForwardIdentityFingerprint(normalizedKey);
+  store[normalizedId] = {
+    algorithm: 'Ed25519',
+    publicKeyB64: normalizedKey,
+    fingerprint,
+    updatedAt: Date.now(),
+  };
+  writePrivateJsonAtomic(filePath, store);
+  return { peerServerId: normalizedId, publicKey: normalizedKey, fingerprint, created };
+}
+
+export function removeTrustedPeerPublicKey(filePath: string, peerServerId: string): boolean {
+  const normalizedId = peerServerId.trim();
+  if (!normalizedId) return false;
+  const store = loadRawTrustedPeersObject(filePath);
+  if (!Object.prototype.hasOwnProperty.call(store, normalizedId)) return false;
+  delete store[normalizedId];
+  writePrivateJsonAtomic(filePath, store);
+  return true;
+}
+
+export function listTrustedPeerPublicKeys(
+  filePath: string,
+): Array<{ peerServerId: string; publicKey: string; fingerprint: string }> {
+  const map = loadTrustedPeerPublicKeys(filePath);
+  return [...map.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([peerServerId, publicKey]) => ({
+      peerServerId,
+      publicKey,
+      fingerprint: computePortForwardIdentityFingerprint(publicKey),
+    }));
 }
 
 export function canonicalPortForwardTranscript(params: PortForwardTranscriptParams): string {

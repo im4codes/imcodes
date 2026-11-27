@@ -4,7 +4,8 @@ import { REMOTE_DESKTOP_TRAFFIC } from '../../shared/remote-desktop-traffic.js';
 import { CONTROLLED_NODE_ABI_GLIBC217, CONTROLLED_NODE_RUNTIME_ABI_PROFILE } from '../../shared/controlled-node-abi.js';
 import { CONTROLLED_NODE_INSTALL_SUBCOMMAND } from '../../shared/controlled-node-install.js';
 import type { EnrollmentBlob } from '../../shared/remote-exec.js';
-import { parseInstallSubcommandArgs, readEnrollmentBlobFromStdin } from './install-cli.js';
+import { parseInstallSubcommandArgs, parseInstallTrustPeers, readEnrollmentBlobFromStdin } from './install-cli.js';
+import { controlledNodePortForwardStateDir, runPortForwardCliCommand } from '../daemon/port-forward-trust-cli.js';
 import { AIDESK_UI_LOG } from '../../shared/aidesk-ui-log.js';
 import { execFileSync } from 'node:child_process';
 import { bootstrapControlledNodeWithDisposition, defaultBootstrapDeps, journalPathFor, markServiceHealthy } from './bootstrap.js';
@@ -242,6 +243,17 @@ async function main(): Promise<void> {
     });
     return;
   }
+  if (process.argv[2] === 'port-forward') {
+    const credentialPath = defaultCredentialPath();
+    process.exitCode = await runPortForwardCliCommand(process.argv.slice(3), {
+      role: 'controlled',
+      stateDir: controlledNodePortForwardStateDir(credentialPath),
+      credentialPath,
+      stdout: (text) => { process.stdout.write(text); },
+      stderr: (text) => { process.stderr.write(text); },
+    });
+    return;
+  }
   if (process.argv[2] === LOCAL_PANEL_TIMING.CLI_FLAG) {
     process.stdout.write(`${describeLocalPanelTiming()}\n`);
     return;
@@ -262,6 +274,7 @@ async function main(): Promise<void> {
     process.platform, process.execPath, defaultStagedExecutablePath(),
   );
   const isInstallCommand = parseInstallSubcommandArgs(process.argv);
+  const trustedPeers = isInstallCommand ? parseInstallTrustPeers(process.argv) : [];
   const stdinEnrollmentBlob = isInstallCommand ? await readEnrollmentBlobFromStdin() : null;
   if (installerLaunch && (stdinEnrollmentBlob || await readEnrollmentBlob()) && !await warnBeforeInstall(stdinEnrollmentBlob)) {
     process.stdout.write(`${controlledNodeInstallDeclined(installerLocale())}\n`);
@@ -272,6 +285,7 @@ async function main(): Promise<void> {
   const deps = {
     ...defaultBootstrapDeps(now),
     ...(stdinEnrollmentBlob ? { enrollmentBlob: stdinEnrollmentBlob } : {}),
+    ...(trustedPeers.length > 0 ? { trustedPeers } : {}),
   };
   if (installerLaunch) {
     process.stdout.write(`${controlledNodeInstallStatus(installerLocale())}\n`);
@@ -293,6 +307,11 @@ async function main(): Promise<void> {
       serverUrl: bootstrap.credential.serverUrl,
       publisherTrustError: bootstrap.publisherTrustError,
     })}\n`);
+    if (bootstrap.portForwardIdentityPublicKey) {
+      process.stdout.write(
+        `Port-forward identity key (${bootstrap.credential.serverId}): ${bootstrap.portForwardIdentityPublicKey}${bootstrap.portForwardIdentityFingerprint ? ` (${bootstrap.portForwardIdentityFingerprint})` : ''}\n`,
+      );
+    }
   }
   if (bootstrap.disposition === 'handoff_complete' || stdinEnrollmentBlob !== null) {
     await holdConsoleForReader();

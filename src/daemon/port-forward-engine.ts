@@ -1275,6 +1275,7 @@ interface ActiveTunnel {
 
 export class PortForwardEngine {
   private readonly tunnels = new Map<string, ActiveTunnel>();
+  private readonly recentClosedRoles = new Map<string, PortForwardRole>();
   private readonly timeouts: PortForwardEngineTimeouts;
   private readonly collectAddresses: () => string[];
   private readonly probeStun: typeof probeStunCandidates;
@@ -1342,9 +1343,20 @@ export class PortForwardEngine {
       case PORT_FORWARD_MSG.CONNECT:
         await this.handleConnect(msg);
         return true;
-      case PORT_FORWARD_MSG.CLOSE:
-        this.closeTunnel(msg.tunnelId, msg.reason ?? 'remote_close', false);
+      case PORT_FORWARD_MSG.CLOSE: {
+        const closed = this.closeTunnel(msg.tunnelId, msg.reason ?? 'remote_close', false);
+        if (!closed) {
+          const ackRole = this.recentClosedRoles.get(msg.tunnelId) ?? msg.role;
+          if (ackRole) {
+            this.options.sendWs({
+              type: PORT_FORWARD_MSG.CLOSE_ACK,
+              tunnelId: msg.tunnelId,
+              role: ackRole,
+            });
+          }
+        }
         return true;
+      }
       case PORT_FORWARD_MSG.RELAY_FRAME:
         this.handleRelayFrame(msg.tunnelId, msg.data);
         return true;
@@ -1361,6 +1373,11 @@ export class PortForwardEngine {
     if (!tunnel || tunnel.closed) return false;
     tunnel.closed = true;
     this.tunnels.delete(tunnelId);
+    this.recentClosedRoles.set(tunnelId, tunnel.role);
+    if (this.recentClosedRoles.size > 512) {
+      const oldest = this.recentClosedRoles.keys().next().value;
+      if (oldest) this.recentClosedRoles.delete(oldest);
+    }
     clearTimeout(tunnel.ttlTimer);
     if (tunnel.statsTimer) {
       clearInterval(tunnel.statsTimer);

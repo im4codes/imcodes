@@ -569,8 +569,9 @@ describe('PortForwardEngine 3-tier transport & mux suites', () => {
     });
 
     await new Promise((r) => setTimeout(r, 40));
-    const closedIds = await router.closeAllForUser('u1');
-    expect(closedIds).toHaveLength(1);
+    const closeRes = await router.closeAllForUser('u1');
+    expect(closeRes.confirmed).toBe(true);
+    expect(closeRes.closedTunnelIds).toHaveLength(1);
 
     // P0 #5: openPromise MUST settle promptly rather than staying pending!
     const openResult = await openPromise;

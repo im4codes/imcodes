@@ -871,6 +871,26 @@ program
   });
 
 program
+  .command('port-forward')
+  .description('Manage relay-independent Ed25519 identity & trusted peers for MCP P2P port forwarding')
+  .argument('[args...]', 'Subcommand: identity | trust add <peerServerId> <publicKey> | trust remove <peerServerId> | trust list')
+  .option('--json', 'Output JSON')
+  .allowUnknownOption(false)
+  .action(async (args: string[] = [], opts?: { json?: boolean }) => {
+    const { runPortForwardCliCommand } = await import('./daemon/port-forward-trust-cli.js');
+    const cliArgs = opts?.json ? [...args, '--json'] : args;
+    const stateDir = imcodesStateDir();
+    const code = await runPortForwardCliCommand(cliArgs, {
+      role: 'full',
+      stateDir,
+      credentialPath: join(stateDir, 'server.json'),
+      stdout: (text) => { process.stdout.write(text); },
+      stderr: (text) => { process.stderr.write(text); },
+    });
+    if (code !== 0) process.exit(code);
+  });
+
+program
   .command('setup')
   .description('Deploy IM.codes server + daemon on this machine (Docker required)')
   .option('--domain <domain>', 'Domain name for HTTPS (e.g. imc.example.com; auto-detected from .env when running --onlyoffice)')

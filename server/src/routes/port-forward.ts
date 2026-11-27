@@ -403,7 +403,13 @@ export function createPortForwardRoutes(
     }
     const res = await router.closeTunnelForUser(caller.userId, tunnelId);
     if (!res.ok) {
-      return c.json({ ok: false, reason: res.reason, error: res.error }, res.status as 403 | 404);
+      return c.json({
+        ok: false,
+        reason: res.reason,
+        error: res.error,
+        ...(res.closedTunnelIds ? { closedTunnelIds: res.closedTunnelIds } : {}),
+        ...(res.unconfirmedTunnelIds ? { unconfirmedTunnelIds: res.unconfirmedTunnelIds } : {}),
+      }, res.status as 403 | 404 | 504);
     }
     return c.json({ ok: true, closedCount: res.closedTunnelIds.length, closedTunnelIds: res.closedTunnelIds });
   });
@@ -426,8 +432,18 @@ export function createPortForwardRoutes(
         ? caller.sourceServerId
         : ((await resolveMachineTargetServerId(c.env.DB, ref)) ?? ref);
     }
-    const closedTunnelIds = await router.closeAllForUser(caller.userId, filterServerId);
-    return c.json({ ok: true, closedCount: closedTunnelIds.length, closedTunnelIds });
+    const closeResult = await router.closeAllForUser(caller.userId, filterServerId);
+    if (!closeResult.confirmed) {
+      return c.json({
+        ok: false,
+        reason: PORT_FORWARD_ERRORS.TIMEOUT,
+        error: `close confirmation timed out before endpoints released sockets (${closeResult.unconfirmedTunnelIds.join(', ')})`,
+        closedCount: closeResult.closedTunnelIds.length,
+        closedTunnelIds: closeResult.closedTunnelIds,
+        unconfirmedTunnelIds: closeResult.unconfirmedTunnelIds,
+      }, 504);
+    }
+    return c.json({ ok: true, closedCount: closeResult.closedTunnelIds.length, closedTunnelIds: closeResult.closedTunnelIds });
   });
 
   return routes;

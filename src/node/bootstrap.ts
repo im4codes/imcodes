@@ -54,6 +54,16 @@ import {
   recoverWindowsUpgradeJournalBackup,
   recoverWindowsUpgradeTransaction,
 } from './upgrade-transaction.js';
+import {
+  computePortForwardIdentityFingerprint,
+  loadOrCreatePortForwardIdentity,
+} from '../daemon/port-forward-crypto.js';
+import {
+  applyTrustedPeerPins,
+  controlledNodePortForwardStateDir,
+  PORT_FORWARD_IDENTITY_BASENAME,
+  type TrustedPeerPinInput,
+} from '../daemon/port-forward-trust-cli.js';
 
 /** Install journal lives beside the credential in the protected directory. */
 export function journalPathFor(credentialPath = defaultCredentialPath()): string {
@@ -125,6 +135,10 @@ export interface ControlledNodeBootstrapDeps {
   credentialPath: string;
   stagedExecutablePath: string;
   sourceExecutablePath: string;
+  /** Optional owner-supplied relay-independent trusted peers (e.g. `--trust-peer`). */
+  trustedPeers?: readonly TrustedPeerPinInput[];
+  /** Explicit state directory for persistent port-forward Ed25519 identity & trusted peers. */
+  portForwardStateDir?: string;
   now: number;
   warn: (message: string) => void;
   recoverInterruptedUpgrade?: (journal: InstallJournal) => Promise<{
@@ -148,6 +162,8 @@ export type BootstrapResult =
        * anchor will refuse to launch until it is.
        */
       publisherTrustError?: string;
+      portForwardIdentityPublicKey?: string;
+      portForwardIdentityFingerprint?: string;
     }
   | {
       credential: null;
@@ -202,6 +218,7 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     writeInstallPhase,
     journalPath: journalPathFor(credentialPath),
     credentialPath,
+    portForwardStateDir: controlledNodePortForwardStateDir(credentialPath),
     stagedExecutablePath: defaultStagedExecutablePath(),
     sourceExecutablePath,
     now,
@@ -838,6 +855,25 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
   }
   const stableRuntime = await deps.isStableRuntime(journal);
 
+function ensureBootstrapPortForwardTrust(
+  deps: ControlledNodeBootstrapDeps,
+): { portForwardIdentityPublicKey?: string; portForwardIdentityFingerprint?: string } {
+  if (!deps.portForwardStateDir) return {};
+  try {
+    const kp = loadOrCreatePortForwardIdentity(join(deps.portForwardStateDir, PORT_FORWARD_IDENTITY_BASENAME));
+    if (deps.trustedPeers && deps.trustedPeers.length > 0) {
+      applyTrustedPeerPins(deps.portForwardStateDir, deps.trustedPeers);
+    }
+    return {
+      portForwardIdentityPublicKey: kp.publicKeyB64,
+      portForwardIdentityFingerprint: computePortForwardIdentityFingerprint(kp.publicKeyB64),
+    };
+  } catch (err) {
+    if (deps.trustedPeers && deps.trustedPeers.length > 0) throw err;
+    return {};
+  }
+}
+
   if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
     // A transient maintenance failure on an already healthy stable runtime must
     // not turn the node into a watchdog crash loop; keep serving and retry on
@@ -848,7 +884,13 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
     );
     journal = await ensureServiceStartRequested(deps, journal, { startService: false });
     journal = await reconcileStableServicePersistence(deps, journal);
-    return { credential: existing, disposition: 'run_runtime', journal, publisherTrustError };
+    return {
+      credential: existing,
+      disposition: 'run_runtime',
+      journal,
+      publisherTrustError,
+      ...ensureBootstrapPortForwardTrust(deps),
+    };
   }
 
   // Anything left here is the downloaded installer, not the service: the stable
@@ -887,6 +929,7 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
       disposition: stableRuntime ? 'run_runtime' : 'handoff_complete',
       journal,
       publisherTrustError,
+      ...ensureBootstrapPortForwardTrust(deps),
     };
   }
 
@@ -914,10 +957,11 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
     const enrolled = await ensureEnrolled(deps, journal, resolved.blob, identity);
     journal = enrolled.journal;
     const credential = enrolled.credential;
+    const pfTrust = ensureBootstrapPortForwardTrust(deps);
 
     journal = await ensureServiceStartRequested(deps, journal);
 
-    return { credential, disposition: 'handoff_complete', journal, publisherTrustError };
+    return { credential, disposition: 'handoff_complete', journal, publisherTrustError, ...pfTrust };
   } finally {
     if (source) await source.close().catch(() => {});
   }

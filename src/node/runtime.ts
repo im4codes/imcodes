@@ -89,7 +89,12 @@ import {
 import { receiveMachineDirectUpload, sendMachineDirectFetch } from '../daemon/machine-direct-transfer.js';
 import { isPortForwardMessageType } from '../../shared/port-forward.js';
 import { PortForwardEngine } from '../daemon/port-forward-engine.js';
-import { imcodesStateDir } from '../util/imcodes-state-dir.js';
+import {
+  controlledNodePortForwardStateDir,
+  PORT_FORWARD_IDENTITY_BASENAME,
+  PORT_FORWARD_TRUSTED_PEERS_BASENAME,
+} from '../daemon/port-forward-trust-cli.js';
+import { defaultCredentialPath } from './enrollment.js';
 import {
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_MSG,
@@ -466,6 +471,8 @@ export interface ControlledNodeRuntimeOptions {
   fetchImpl?: typeof fetch;
   /** Persisted before construction; the runtime owns enforcement, not storage. */
   remoteDesktopAccessPaused?: boolean;
+  credentialPath?: string;
+  portForwardStateDir?: string;
 }
 
 export interface ControlledNodeRuntimeClient extends AuthenticatedWebSocketClient {
@@ -1024,12 +1031,13 @@ export function createControlledNodeRuntime(
   let legacyUpgradeRescueCleanupStarted = false;
   let previousUpgradeFailureReported = false;
   const activeMachineDirectTransfers = new Set<string>();
-  const portForwardStateDir = imcodesStateDir();
+  const portForwardStateDir = options.portForwardStateDir
+    ?? controlledNodePortForwardStateDir(options.credentialPath ?? defaultCredentialPath());
   const portForwardEngine = new PortForwardEngine({
     sendWs: (msg) => client.send(msg),
     getWsBufferedAmount: () => client.getBufferedAmount(),
-    identityFilePath: join(portForwardStateDir, 'port-forward-identity.json'),
-    trustedPeersFilePath: join(portForwardStateDir, 'port-forward-trusted-peers.json'),
+    identityFilePath: join(portForwardStateDir, PORT_FORWARD_IDENTITY_BASENAME),
+    trustedPeersFilePath: join(portForwardStateDir, PORT_FORWARD_TRUSTED_PEERS_BASENAME),
   });
   const reportAuthenticationError = (error: unknown) => {
     try {

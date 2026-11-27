@@ -15,6 +15,11 @@ import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
 import { daemonFatalReportNodeOptions } from '../../shared/daemon-memory-guard.js';
 import { reportExcludeEnvFlagUsable } from '../util/report-privacy.js';
+import {
+  computePortForwardIdentityFingerprint,
+  loadOrCreatePortForwardIdentity,
+} from '../daemon/port-forward-crypto.js';
+import { PORT_FORWARD_IDENTITY_BASENAME } from '../daemon/port-forward-trust-cli.js';
 
 /** Resolve the instance state directory lazily so scoped daemons never read or
  * write the default user's credentials when IMCODES_HOME is overridden. */
@@ -114,11 +119,14 @@ export async function bindFlow(bindUrl: string, deviceName?: string, _opts?: { f
   const creds: ServerCredentials = { serverId, token, workerUrl, serverName, boundAt: Date.now() };
   await mkdir(credentialsDir(), { recursive: true });
   await writeFile(credentialsPath(), JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
+  const pfIdentity = loadOrCreatePortForwardIdentity(join(credentialsDir(), PORT_FORWARD_IDENTITY_BASENAME));
+  const pfFingerprint = computePortForwardIdentityFingerprint(pfIdentity.publicKeyB64);
   logger.info({ serverId, serverName }, 'Daemon bound');
 
   await ensureServiceInstalled();
 
-  console.log(`\nBound! Device "${serverName}" is ready.`);
+  console.log(`\nBound! Device "${serverName}" (${serverId}) is ready.`);
+  console.log(`Port-forward identity key: ${pfIdentity.publicKeyB64} (${pfFingerprint})`);
   console.log(`Open ${workerUrl} to see it online.`);
 }
 

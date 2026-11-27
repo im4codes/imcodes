@@ -5,21 +5,59 @@ import {
   parseEnrollmentPayloadJson,
 } from '../../shared/controlled-node-install.js';
 import type { EnrollmentBlob } from '../../shared/remote-exec.js';
+import { parseTrustPeerSpec, type TrustedPeerPinInput } from '../daemon/port-forward-trust-cli.js';
+
+export const CONTROLLED_NODE_TRUST_PEER_FLAG = '--trust-peer' as const;
 
 /**
- * Inspect `process.argv` for the `install --enroll-stdin` subcommand.
- * Returns `true` when stdin-based enrollment is requested, `false` for other modes,
- * and throws fail-closed on unsupported flags or extra arguments (never accepting
- * tokens via CLI arguments).
+ * Inspect `process.argv` for the `install --enroll-stdin` subcommand and optional
+ * repeatable `--trust-peer <peerServerId>=<publicKey>` pins.
+ * Fails closed on unsupported flags or extra positional arguments.
  */
 export function parseInstallSubcommandArgs(argv: readonly string[]): boolean {
   if (argv[2] !== CONTROLLED_NODE_INSTALL_SUBCOMMAND) {
     return false;
   }
-  if (argv.length !== 4 || argv[3] !== CONTROLLED_NODE_ENROLL_STDIN_FLAG) {
-    throw new Error(`usage: imcodes-node ${CONTROLLED_NODE_INSTALL_SUBCOMMAND} ${CONTROLLED_NODE_ENROLL_STDIN_FLAG}`);
+  const usage = `usage: imcodes-node ${CONTROLLED_NODE_INSTALL_SUBCOMMAND} ${CONTROLLED_NODE_ENROLL_STDIN_FLAG} [--trust-peer <peerServerId>=<publicKey>]`;
+  let sawEnrollStdin = false;
+  for (let i = 3; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === CONTROLLED_NODE_ENROLL_STDIN_FLAG) {
+      if (sawEnrollStdin) throw new Error(usage);
+      sawEnrollStdin = true;
+      continue;
+    }
+    if (arg === CONTROLLED_NODE_TRUST_PEER_FLAG) {
+      const value = argv[++i];
+      if (!value) throw new Error(usage);
+      parseTrustPeerSpec(value);
+      continue;
+    }
+    if (arg.startsWith(`${CONTROLLED_NODE_TRUST_PEER_FLAG}=`)) {
+      parseTrustPeerSpec(arg.slice(CONTROLLED_NODE_TRUST_PEER_FLAG.length + 1));
+      continue;
+    }
+    throw new Error(usage);
+  }
+  if (!sawEnrollStdin) {
+    throw new Error(usage);
   }
   return true;
+}
+
+export function parseInstallTrustPeers(argv: readonly string[]): TrustedPeerPinInput[] {
+  if (argv[2] !== CONTROLLED_NODE_INSTALL_SUBCOMMAND) return [];
+  const pins: TrustedPeerPinInput[] = [];
+  for (let i = 3; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === CONTROLLED_NODE_TRUST_PEER_FLAG) {
+      const value = argv[++i];
+      if (value) pins.push(parseTrustPeerSpec(value));
+    } else if (arg.startsWith(`${CONTROLLED_NODE_TRUST_PEER_FLAG}=`)) {
+      pins.push(parseTrustPeerSpec(arg.slice(CONTROLLED_NODE_TRUST_PEER_FLAG.length + 1)));
+    }
+  }
+  return pins;
 }
 
 /**

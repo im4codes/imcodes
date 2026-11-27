@@ -301,6 +301,7 @@ export interface PortForwardCloseMessage {
   type: typeof PORT_FORWARD_MSG.CLOSE;
   tunnelId: string;
   reason?: string;
+  role?: PortForwardRole;
 }
 
 export interface PortForwardCloseAckMessage {
@@ -826,11 +827,14 @@ export function validatePortForwardWireMessage(
     }
 
     case PORT_FORWARD_MSG.CLOSE: {
-      if (!hasAllowedKeys(raw, ['type', 'tunnelId'], ['reason'])) {
+      if (!hasAllowedKeys(raw, ['type', 'tunnelId'], ['reason', 'role'])) {
         return { ok: false, error: 'invalid_keys' };
       }
       if (raw.reason !== undefined && (typeof raw.reason !== 'string' || raw.reason.length > 128)) {
         return { ok: false, error: 'invalid_reason' };
+      }
+      if (raw.role !== undefined && raw.role !== PORT_FORWARD_ROLE.LISTEN && raw.role !== PORT_FORWARD_ROLE.TARGET) {
+        return { ok: false, error: 'invalid_role' };
       }
       return {
         ok: true,
@@ -838,6 +842,7 @@ export function validatePortForwardWireMessage(
           type,
           tunnelId,
           ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
+          ...(raw.role !== undefined ? { role: raw.role } : {}),
         },
       };
     }

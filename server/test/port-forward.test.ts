@@ -256,6 +256,7 @@ describe('server port-forward router & HTTP control plane', () => {
 
   async function setupTopology(options: {
     prepareTimeoutMs?: number;
+    closeAckTimeoutMs?: number;
     useLegacySilentTarget?: boolean;
     useDefaultRouter?: boolean;
     sharedServerIds?: string[];
@@ -300,6 +301,7 @@ describe('server port-forward router & HTTP control plane', () => {
           lookupBridge: (id) => WsBridge.find(id),
           prepareTimeoutMs: options.prepareTimeoutMs ?? 2_000,
           establishTimeoutMs: 4_000,
+          ...(options.closeAckTimeoutMs !== undefined ? { closeAckTimeoutMs: options.closeAckTimeoutMs } : {}),
         });
 
     const app = new Hono();
@@ -980,7 +982,7 @@ describe('server port-forward router & HTTP control plane', () => {
   });
 
   it('settles openTunnel immediately on mid-PREPARE close, tears down on listen disconnect, and expires on TTL (P0 #5/#8)', async () => {
-    const env = await setupTopology({ useLegacySilentTarget: true, prepareTimeoutMs: 5_000 });
+    const env = await setupTopology({ useLegacySilentTarget: true, prepareTimeoutMs: 5_000, closeAckTimeoutMs: 80 });
     const started = Date.now();
     const pendingOpen = env.router.openTunnel({
       userId: 'user_a',
@@ -995,8 +997,9 @@ describe('server port-forward router & HTTP control plane', () => {
       transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
     });
     await new Promise((r) => setTimeout(r, 30));
-    const closedIds = await env.router.closeAllForUser('user_a', undefined, 'user_abort');
-    expect(closedIds).toHaveLength(1);
+    const closeRes = await env.router.closeAllForUser('user_a', undefined, 'user_abort');
+    expect(closeRes.confirmed).toBe(false);
+    expect(closeRes.unconfirmedTunnelIds).toHaveLength(1);
     const result = await pendingOpen;
     expect(result.ok).toBe(false);
     expect(Date.now() - started).toBeLessThan(2_000);
@@ -1199,5 +1202,321 @@ describe('server port-forward router & HTTP control plane', () => {
     await podCoord.closeTunnelForUser('user_ord', opened.tunnel.tunnelId);
     expect(await baseStore.getQueuedBytes(opened.tunnel.tunnelId, 'l2t')).toBe(0);
     await baseStore.setPodDrainPausedForTests('pod_b_ord', false);
+  });
+
+  it('rejects close with 504 timeout when an online endpoint delays CLOSE_ACK, keeps tunnel retryable, and rebinds immediately once delivery resumes (P0 #2)', async () => {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const sListen = `close_l_${suffix}`;
+    const sTarget = `close_t_${suffix}`;
+    const store = new InMemoryPortForwardClusterStore();
+    const listenBridges = new Map<string, PortForwardBridgeEndpoint>();
+    const targetBridges = new Map<string, PortForwardBridgeEndpoint>();
+
+    const podCoord = new PortForwardRouter({
+      podId: 'pod_c_close',
+      clusterStore: store,
+      closeAckTimeoutMs: 60,
+      prepareTimeoutMs: 2_000,
+      establishTimeoutMs: 4_000,
+    });
+    const podListen = new PortForwardRouter({
+      podId: 'pod_l_close',
+      clusterStore: store,
+      closeAckTimeoutMs: 60,
+      lookupBridge: (id) => listenBridges.get(id),
+    });
+    const podTarget = new PortForwardRouter({
+      podId: 'pod_t_close',
+      clusterStore: store,
+      closeAckTimeoutMs: 60,
+      lookupBridge: (id) => targetBridges.get(id),
+    });
+
+    const idL = generateEndpointIdentityKeyPair();
+    const idT = generateEndpointIdentityKeyPair();
+    const trusted = new Map([[sListen, idL.publicKeyB64], [sTarget, idT.publicKeyB64]]);
+
+    const engListen = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idL,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podListen.handleDaemonMessage(sListen, 1, m)); },
+    });
+    const engTarget = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idT,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podTarget.handleDaemonMessage(sTarget, 1, m)); },
+    });
+    cleanups.push(async () => {
+      engListen.closeAll();
+      engTarget.closeAll();
+      await podListen.stopCluster();
+      await podTarget.stopCluster();
+      await podCoord.stopCluster();
+    });
+
+    let dropCloseToListen = true;
+    const delayedCloseFrames: Record<string, unknown>[] = [];
+    listenBridges.set(sListen, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => {
+        if (m.type === PORT_FORWARD_MSG.CLOSE && dropCloseToListen) {
+          delayedCloseFrames.push(m);
+          return true; // WS accepted/delayed delivery, endpoint is still online!
+        }
+        void engListen.handleMessage(m);
+        return true;
+      },
+    });
+    targetBridges.set(sTarget, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => { void engTarget.handleMessage(m); return true; },
+    });
+    podListen.onDaemonConnected(sListen, 1);
+    podTarget.onDaemonConnected(sTarget, 1);
+
+    const fixedProbe = createTcpServer();
+    await new Promise<void>((r) => fixedProbe.listen(0, '127.0.0.1', () => r()));
+    const fixedPort = (fixedProbe.address() as { port: number }).port;
+    await new Promise<void>((r) => fixedProbe.close(() => r()));
+
+    const opened = await podCoord.openTunnel({
+      userId: 'user_close',
+      listenNode: sListen,
+      listenServerId: sListen,
+      listenPort: fixedPort,
+      targetNode: sTarget,
+      targetServerId: sTarget,
+      targetHost: '127.0.0.1',
+      targetPort: 9999,
+      ttlSeconds: 60,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    expect(engListen.listTunnels()).toHaveLength(1);
+
+    // 1. Single-close from remote pod while CLOSE delivery to listen endpoint is delayed past closeAckTimeoutMs:
+    //    MUST NOT return fake success (`confirmed: false`, status 504), and listener stays alive (`liveListenerCount === 1`).
+    const firstClose = await podTarget.closeTunnelForUser('user_close', opened.tunnel.tunnelId);
+    expect(firstClose.ok).toBe(false);
+    if (!firstClose.ok) {
+      expect(firstClose.status).toBe(504);
+      expect(firstClose.reason).toBe(PORT_FORWARD_ERRORS.TIMEOUT);
+      expect(firstClose.unconfirmedTunnelIds).toEqual([opened.tunnel.tunnelId]);
+    }
+    expect(engListen.listTunnels()).toHaveLength(1);
+    expect(delayedCloseFrames.length).toBeGreaterThanOrEqual(1);
+
+    // Bulk close ALSO reports unconfirmed timeout rather than fake closed=true.
+    const bulkTimeout = await podTarget.closeAllForUser('user_close');
+    expect(bulkTimeout.confirmed).toBe(false);
+    expect(bulkTimeout.unconfirmedTunnelIds).toEqual([opened.tunnel.tunnelId]);
+    expect(bulkTimeout.closedTunnelIds).toEqual([]);
+    expect(engListen.listTunnels()).toHaveLength(1);
+
+    // 2. Restore WS delivery and retry close -> confirmed, listener count drops to 0, immediate fixed-port rebind succeeds!
+    dropCloseToListen = false;
+    const retryClose = await podTarget.closeTunnelForUser('user_close', opened.tunnel.tunnelId);
+    expect(retryClose).toEqual({ ok: true, closedTunnelIds: [opened.tunnel.tunnelId] });
+    expect(engListen.listTunnels()).toHaveLength(0);
+
+    const rebound = await podCoord.openTunnel({
+      userId: 'user_close',
+      listenNode: sListen,
+      listenServerId: sListen,
+      listenPort: fixedPort,
+      targetNode: sTarget,
+      targetServerId: sTarget,
+      targetHost: '127.0.0.1',
+      targetPort: 9999,
+      ttlSeconds: 60,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(rebound.ok).toBe(true);
+    if (rebound.ok) {
+      expect(rebound.tunnel.listenPort).toBe(fixedPort);
+      await podCoord.closeTunnelForUser('user_close', rebound.tunnel.tunnelId);
+    }
+
+    // 3. Also verify a live target still in PREPARE (!targetReady) is NOT treated as offline during close.
+    let dropTargetAll = true;
+    targetBridges.set(sTarget, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => {
+        if (dropTargetAll) return true;
+        void engTarget.handleMessage(m);
+        return true;
+      },
+    });
+    const pendingMid = podCoord.openTunnel({
+      userId: 'user_close',
+      listenNode: sListen,
+      listenServerId: sListen,
+      listenPort: 0,
+      targetNode: sTarget,
+      targetServerId: sTarget,
+      targetHost: '127.0.0.1',
+      targetPort: 9999,
+      ttlSeconds: 60,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    await new Promise((r) => setTimeout(r, 25));
+    const listBefore = await podCoord.closeAllForUser('user_close');
+    expect(listBefore.confirmed).toBe(false);
+    expect(listBefore.unconfirmedTunnelIds).toHaveLength(1);
+    expect(engListen.listTunnels()).toHaveLength(0);
+    dropTargetAll = false;
+    const retryMid = await podCoord.closeAllForUser('user_close');
+    expect(retryMid.confirmed).toBe(true);
+    expect(retryMid.closedTunnelIds).toHaveLength(1);
+    const midRes = await pendingMid;
+    expect(midRes.ok).toBe(false);
+  });
+
+  it('bounds in-process ingress FIFO before blocked DB enqueue, propagates backpressure, and closes cleanly on overflow (P0 #3)', async () => {
+    const baseStore = new InMemoryPortForwardClusterStore();
+    const origEnqueue = baseStore.enqueueBusMessage.bind(baseStore);
+    let gateResolve: (() => void) | null = null;
+    let blockHop1Db = false;
+
+    baseStore.enqueueBusMessage = async (podId, msg) => {
+      if (blockHop1Db && msg.kind === 'to_coordinator' && msg.frame.type === PORT_FORWARD_MSG.RELAY_FRAME) {
+        await new Promise<void>((resolve) => {
+          const prev = gateResolve;
+          gateResolve = () => {
+            prev?.();
+            resolve();
+          };
+        });
+      }
+      return origEnqueue(podId, msg);
+    };
+
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const s1 = `bp_l_${suffix}`;
+    const s2 = `bp_t_${suffix}`;
+    const senderEvents: Array<Record<string, unknown>> = [];
+    const targetEvents: Array<Record<string, unknown>> = [];
+    const bridgesA = new Map<string, PortForwardBridgeEndpoint>();
+    const bridgesB = new Map<string, PortForwardBridgeEndpoint>();
+
+    const podCoord = new PortForwardRouter({ podId: 'pod_c_bp', clusterStore: baseStore, prepareTimeoutMs: 2_000, establishTimeoutMs: 4_000 });
+    const podA = new PortForwardRouter({ podId: 'pod_a_bp', clusterStore: baseStore, lookupBridge: (id) => bridgesA.get(id) });
+    const podB = new PortForwardRouter({ podId: 'pod_b_bp', clusterStore: baseStore, lookupBridge: (id) => bridgesB.get(id) });
+
+    const idL = generateEndpointIdentityKeyPair();
+    const idT = generateEndpointIdentityKeyPair();
+    const trusted = new Map([[s1, idL.publicKeyB64], [s2, idT.publicKeyB64]]);
+
+    const engL = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idL,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podA.handleDaemonMessage(s1, 1, m)); },
+    });
+    const engT = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idT,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podB.handleDaemonMessage(s2, 1, m)); },
+    });
+    cleanups.push(async () => {
+      gateResolve?.();
+      engL.closeAll();
+      engT.closeAll();
+      await podA.stopCluster();
+      await podB.stopCluster();
+      await podCoord.stopCluster();
+    });
+
+    bridgesA.set(s1, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => {
+        senderEvents.push(m);
+        void engL.handleMessage(m);
+        return true;
+      },
+    });
+    bridgesB.set(s2, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => {
+        targetEvents.push(m);
+        void engT.handleMessage(m);
+        return true;
+      },
+    });
+    podA.onDaemonConnected(s1, 1);
+    podB.onDaemonConnected(s2, 1);
+
+    const opened = await podCoord.openTunnel({
+      userId: 'user_bp',
+      listenNode: s1,
+      listenServerId: s1,
+      listenPort: 0,
+      targetNode: s2,
+      targetServerId: s2,
+      targetHost: '127.0.0.1',
+      targetPort: 9999,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const tid = opened.tunnel.tunnelId;
+
+    // 1. Block hop-1 DB enqueue completely; push valid multi-frame burst crossing HIGH_WATER while DB is blocked ->
+    //    ingress FIFO MUST synchronously fire RELAY_BACKPRESSURE { paused: true } without waiting on DB!
+    blockHop1Db = true;
+    senderEvents.length = 0;
+    const chunkB64 = Buffer.alloc(32 * 1024, 0x5a).toString('base64');
+    for (let i = 0; i < 16; i++) {
+      podA.handleDaemonMessage(s1, 1, {
+        type: PORT_FORWARD_MSG.RELAY_FRAME,
+        tunnelId: tid,
+        data: chunkB64,
+      });
+    }
+    expect(senderEvents.some((m) => m.type === PORT_FORWARD_MSG.RELAY_BACKPRESSURE && m.paused === true)).toBe(true);
+
+    // Release DB gate and allow drain below LOW_WATER -> emits RELAY_BACKPRESSURE { paused: false }!
+    blockHop1Db = false;
+    const releaseFirst = gateResolve;
+    gateResolve = null;
+    releaseFirst?.();
+    await new Promise((r) => setTimeout(r, 80));
+    expect(senderEvents.some((m) => m.type === PORT_FORWARD_MSG.RELAY_BACKPRESSURE && m.paused === false)).toBe(true);
+
+    // 2. Block hop-1 DB enqueue again and push valid multi-frame burst exceeding HARD_CAP -> bounded overflow immediately
+    //    closes tunnel (BOTH endpoints receive CLOSE; no silent dropped frame hanging until TTL!).
+    blockHop1Db = true;
+    senderEvents.length = 0;
+    targetEvents.length = 0;
+    for (let i = 0; i < 64; i++) {
+      podA.handleDaemonMessage(s1, 1, {
+        type: PORT_FORWARD_MSG.RELAY_FRAME,
+        tunnelId: tid,
+        data: chunkB64,
+      });
+    }
+    blockHop1Db = false;
+    gateResolve?.();
+    gateResolve = null;
+    await new Promise((r) => setTimeout(r, 100));
+    expect(senderEvents.some((m) => m.type === PORT_FORWARD_MSG.CLOSE && m.reason === 'ingress_queue_overflow')).toBe(true);
+    expect(targetEvents.some((m) => m.type === PORT_FORWARD_MSG.CLOSE && m.reason === 'ingress_queue_overflow')).toBe(true);
+    expect(await podCoord.listTunnels('user_bp')).toHaveLength(0);
+    expect(engL.listTunnels()).toHaveLength(0);
+    expect(engT.listTunnels()).toHaveLength(0);
   });
 });
