@@ -204,12 +204,14 @@ function stringifyToolResult(value: unknown): string | undefined {
   try { return JSON.stringify(value); } catch { return String(value); }
 }
 
-function modelInfo(value: unknown): { id?: string; name?: string; provider?: string } {
+function modelInfo(value: unknown): { id?: string; name?: string; provider?: string; contextWindow?: number } {
   const model = asRecord(value);
+  const contextWindow = numeric(model?.contextWindow);
   return {
     id: typeof model?.id === 'string' ? model.id : undefined,
     name: typeof model?.name === 'string' ? model.name : undefined,
     provider: typeof model?.provider === 'string' ? model.provider : undefined,
+    ...(contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {}),
   };
 }
 
@@ -531,8 +533,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
           this.resetTurn(state);
           return;
         }
-        state.sessionSystemTextInjected = undefined;
-        state.pendingSessionSystemText = undefined;
+        this.refreshSessionSystemText(sessionId);
         const data = asRecord(response.data);
         const completion: AgentMessage = {
           id: `${state.routeId}:context-compaction:${Date.now()}`,
@@ -629,10 +630,12 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
       const modelId = slash > 0 ? model.slice(slash + 1) : model;
       if (provider && modelId) {
         void this.request(state, { type: PI_RPC_COMMAND.SET_MODEL, provider, modelId })
-          .then(() => {
-            state.model = modelId;
-            state.provider = provider;
-            this.emitInfo(sessionId, { model: modelId });
+          .then((response) => {
+            const switched = modelInfo(response.data);
+            state.model = switched.id ?? modelId;
+            state.provider = switched.provider ?? provider;
+            this.recordModelContextWindow(state.provider, state.model, switched.contextWindow);
+            this.emitInfo(sessionId, { model: state.model });
             void this.syncAvailableThinkingLevels(state);
           })
           .catch(() => {
@@ -698,10 +701,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
         const rawName = typeof record?.name === 'string' && record.name.trim() ? record.name.trim() : rawId;
         const name = provider && !rawName.startsWith(provider) ? `${provider} · ${rawName}` : rawName;
         const contextWindow = numeric(record?.contextWindow);
-        if (contextWindow !== undefined && contextWindow > 0) {
-          this.modelContextWindows.set(id, contextWindow);
-          this.modelContextWindows.set(rawId, contextWindow);
-        }
+        this.recordModelContextWindow(provider, rawId, contextWindow);
         models.push({
           id,
           name,
@@ -1141,7 +1141,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
         this.emitStatus(sessionId, state, { status: 'working', label: 'Compacting...' });
         return;
       case PI_RPC_FRAME.COMPACTION_END:
-        state.sessionSystemTextInjected = undefined;
+        this.refreshSessionSystemText(sessionId);
         if (!state.compacting) {
           if (state.turnActive) {
             this.emitStatus(sessionId, state, { status: 'working', label: null });
@@ -1249,11 +1249,21 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     for (const cb of this.completeCallbacks) cb(state.routeId, completion);
   }
 
+  private recordModelContextWindow(provider: string | undefined, modelId: string | undefined, contextWindow: number | undefined): void {
+    const rawId = modelId?.trim();
+    if (!rawId || contextWindow === undefined || !Number.isFinite(contextWindow) || contextWindow <= 0) return;
+    const prov = provider?.trim();
+    const id = prov && !rawId.includes('/') ? `${prov}/${rawId}` : rawId;
+    this.modelContextWindows.set(id, contextWindow);
+    this.modelContextWindows.set(rawId, contextWindow);
+  }
+
   private applyStateResponse(state: PiSessionState, value: unknown): void {
     const data = asRecord(value);
     const model = modelInfo(data?.model);
     if (model.id) state.model = model.id;
     if (model.provider) state.provider = model.provider;
+    this.recordModelContextWindow(state.provider, state.model, model.contextWindow);
     const effort = data?.thinkingLevel;
     if (isTransportEffortLevel(effort)) state.effort = effort;
     this.emitInfo(state.routeId, {

@@ -6,7 +6,7 @@ import { imcodesStateDir } from '../../../util/imcodes-state-dir.js';
 
 export const PI_BINARY_ENV = 'IMCODES_PI_BIN';
 export const PI_DEFAULT_BINARY = 'pi';
-export const PI_SUPPORTED_PACKAGE = '@earendil-works/pi-coding-agent@1.6.0';
+export const PI_SUPPORTED_PACKAGE = '@earendil-works/pi-coding-agent@1.7.0';
 export const PI_INSTALL_COMMAND = `npm install -g --ignore-scripts ${PI_SUPPORTED_PACKAGE}`;
 
 export function resolvePiBinary(): string {

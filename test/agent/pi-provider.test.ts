@@ -30,6 +30,7 @@ import {
   resolvePiExtensionEntry,
 } from '../../src/agent/providers/pi/runtime.js';
 import {
+  PI_ASSISTANT_EVENT,
   PI_MCP_CONFIG_ENV,
   PI_PROVIDER_API_KEY_ENV,
   PI_RPC_COMMAND,
@@ -401,8 +402,8 @@ describe('PiProvider', () => {
     }
   });
 
-  it('targets Pi 1.6.0, dynamically lists/caches models, hot-switches idle models, and clamps unsupported thinking levels', async () => {
-    expect(PI_SUPPORTED_PACKAGE).toBe('@earendil-works/pi-coding-agent@1.6.0');
+  it('targets Pi 1.7.0, dynamically lists/caches models, hot-switches idle models, and clamps unsupported thinking levels', async () => {
+    expect(PI_SUPPORTED_PACKAGE).toBe('@earendil-works/pi-coding-agent@1.7.0');
     expect(await provider.listModels()).toEqual({ models: [] });
 
     let availableModels = [
@@ -733,5 +734,152 @@ describe('PiProvider', () => {
     expect(clearIdx).toBeGreaterThan(-1);
     expect(abortIdx).toBeGreaterThan(clearIdx);
     expect(errors).toHaveLength(0);
+  });
+
+  it('populates contextWindow from get_state/set_model for Pi 1.7.0 exact usage and handles threshold compaction', async () => {
+    const usageUpdates: Array<{ usage?: Record<string, unknown>; model?: string }> = [];
+    const statuses: ProviderStatusUpdate[] = [];
+    provider.onUsage((_id, u) => usageUpdates.push(u as { usage?: Record<string, unknown>; model?: string }));
+    provider.onStatus((_id, s) => statuses.push(s));
+
+    child.onCommand = (cmd) => {
+      if (cmd.type === PI_RPC_COMMAND.GET_STATE) {
+        return {
+          success: true,
+          data: {
+            sessionId: 'pi-170-session',
+            model: { id: 'claude-sonnet-4', provider: 'anthropic', contextWindow: 200_000 },
+            thinkingLevel: 'medium',
+          },
+        };
+      }
+      if (cmd.type === PI_RPC_COMMAND.SET_MODEL) {
+        return {
+          success: true,
+          data: { id: 'gpt-6.2', provider: 'openai', contextWindow: 400_000 },
+        };
+      }
+      return undefined;
+    };
+
+    const sessionId = await start();
+    await provider.send(sessionId, {
+      userMessage: 'usage check',
+      assembledMessage: 'usage check',
+      sessionSystemText: 'SYS_CONTRACT_170',
+      turnSystemText: undefined,
+      systemText: 'SYS_CONTRACT_170',
+      messagePreamble: undefined,
+      context: {
+        sessionSystemText: 'SYS_CONTRACT_170',
+        turnSystemText: undefined,
+        systemText: 'SYS_CONTRACT_170',
+        messagePreamble: undefined,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: { namespace: { scope: 'personal', projectId: 'p1' }, authoritySource: 'none', freshness: 'missing', fallbackAllowed: true, retryScheduled: false, providerPolicyOutcome: 'allowed', diagnostics: [] },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    // Streaming message_update picks up contextWindow learned from get_state without listModels()
+    child.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_UPDATE,
+      usage: {
+        input: 1200,
+        output: 45,
+        cacheRead: 300,
+        cacheWrite: 150,
+        cacheWrite1h: 50,
+        reasoning: 10,
+        totalTokens: 1695,
+      },
+      assistantMessageEvent: { type: PI_ASSISTANT_EVENT.TEXT_DELTA, contentIndex: 0, delta: 'Hi' },
+    });
+    expect(usageUpdates.at(-1)).toMatchObject({
+      model: 'claude-sonnet-4',
+      usage: {
+        input_tokens: 1200,
+        output_tokens: 45,
+        cache_read_input_tokens: 300,
+        cache_creation_input_tokens: 150,
+        model_context_window: 200_000,
+      },
+    });
+
+    // Threshold auto-compaction updates status cleanly during active turn and clears injected contract
+    child.emitFrame({ type: PI_RPC_FRAME.COMPACTION_START, reason: 'threshold' });
+    expect(statuses.at(-1)).toEqual({ status: 'working', label: 'Compacting...' });
+    child.emitFrame({
+      type: PI_RPC_FRAME.COMPACTION_END,
+      reason: 'threshold',
+      result: {
+        summary: 'auto compacted',
+        firstKeptEntryId: 'entry-99',
+        tokensBefore: 160_000,
+        estimatedTokensAfter: 24_000,
+      },
+      aborted: false,
+      willRetry: false,
+    });
+    expect(statuses.at(-1)).toEqual({ status: 'working', label: null });
+
+    child.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await flush();
+
+    // Switching model while idle records the new model's contextWindow from SET_MODEL response
+    provider.setSessionAgentId(sessionId, 'openai/gpt-6.2');
+    await flush();
+
+    await provider.send(sessionId, {
+      userMessage: 'after auto-compact',
+      assembledMessage: 'after auto-compact',
+      sessionSystemText: 'SYS_CONTRACT_170',
+      turnSystemText: undefined,
+      systemText: 'SYS_CONTRACT_170',
+      messagePreamble: undefined,
+      context: {
+        sessionSystemText: 'SYS_CONTRACT_170',
+        turnSystemText: undefined,
+        systemText: 'SYS_CONTRACT_170',
+        messagePreamble: undefined,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: { namespace: { scope: 'personal', projectId: 'p1' }, authoritySource: 'none', freshness: 'missing', fallbackAllowed: true, retryScheduled: false, providerPolicyOutcome: 'allowed', diagnostics: [] },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    const promptsAfterCompaction = child.written.filter((c) => c.type === PI_RPC_COMMAND.PROMPT);
+    expect(String(promptsAfterCompaction.at(-1)?.message)).toContain('SYS_CONTRACT_170');
+
+    child.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: {
+        role: 'assistant',
+        model: 'gpt-6.2',
+        content: [{ type: 'text', text: 'done' }],
+        usage: { input: 500, output: 20, cacheRead: 100, cacheWrite: 0, totalTokens: 620 },
+      },
+    });
+    child.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await flush();
+
+    expect(usageUpdates.at(-1)).toMatchObject({
+      model: 'gpt-6.2',
+      usage: {
+        input_tokens: 500,
+        output_tokens: 20,
+        cache_read_input_tokens: 100,
+        cache_creation_input_tokens: 0,
+        model_context_window: 400_000,
+      },
+    });
   });
 });
