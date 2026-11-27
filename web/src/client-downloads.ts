@@ -1,6 +1,7 @@
 import { encode } from 'uqr';
 import { getApiBaseUrl } from './api.js';
 import { DEFAULT_SERVER_URL, isNative } from './native.js';
+import { isPcAppDesktop } from './native-platform.js';
 
 export const IOS_APP_STORE_URL = 'https://apps.apple.com/us/app/im-codes/id6761014424';
 export const GITHUB_RELEASES_URL = 'https://github.com/im4codes/imcodes/releases';
@@ -103,6 +104,110 @@ export function buildQrMatrixPath(data: string, border = 3): QrMatrixSvgData {
     }
   }
   return { size: qr.size, path: commands.join('') };
+}
+
+const PC_APP_DOWNLOAD_RESOLVE_TIMEOUT_MS = 5000;
+
+export function isPcAppClient(): boolean {
+  if (isNative()) return false;
+  if (isPcAppDesktop()) return true;
+  if (typeof navigator !== 'undefined' && /\bElectron\//i.test(navigator.userAgent ?? '')) {
+    return true;
+  }
+  return false;
+}
+
+export function isSafeHttpDownloadUrl(rawUrl: string): boolean {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(rawUrl);
+    return (parsed.protocol === 'https:' || parsed.protocol === 'http:') && !parsed.username && !parsed.password;
+  } catch {
+    return false;
+  }
+}
+
+export function isDownloadApiUrl(rawUrl: string): boolean {
+  if (!isSafeHttpDownloadUrl(rawUrl)) {
+    if (typeof window === 'undefined' || !rawUrl.startsWith('/api/downloads/')) return false;
+  }
+  try {
+    const base = typeof window !== 'undefined' ? window.location?.href : undefined;
+    const parsed = new URL(rawUrl, base);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    if (parsed.username || parsed.password) return false;
+    if (!parsed.pathname.startsWith('/api/downloads/')) return false;
+    const windowOrigin = typeof window !== 'undefined' ? normalizeHttpOrigin(window.location?.origin) : null;
+    return parsed.origin === resolveDownloadOrigin() || (windowOrigin !== null && parsed.origin === windowOrigin);
+  } catch {
+    return false;
+  }
+}
+
+function triggerSamePageDownload(url: string): void {
+  if (typeof document === 'undefined' || !document.body) {
+    if (typeof window !== 'undefined') {
+      window.open(url, '_blank', 'noopener,noreferrer');
+    }
+    return;
+  }
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = '';
+  anchor.style.display = 'none';
+  document.body.appendChild(anchor);
+  try {
+    anchor.click();
+  } finally {
+    anchor.remove();
+  }
+}
+
+export async function openPcAppDownloadUrl(url: string): Promise<void> {
+  if (!isDownloadApiUrl(url)) return;
+  const base = typeof window !== 'undefined' ? window.location?.href : 'http://localhost';
+  let resolveUrl: URL;
+  try {
+    resolveUrl = new URL(url, base);
+  } catch {
+    return;
+  }
+  resolveUrl.searchParams.set('resolve', 'json');
+
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller
+    ? setTimeout(() => {
+        controller.abort();
+      }, PC_APP_DOWNLOAD_RESOLVE_TIMEOUT_MS)
+    : null;
+
+  try {
+    const res = await fetch(resolveUrl.toString(), {
+      signal: controller?.signal,
+      credentials: 'same-origin',
+    });
+    const contentType = typeof res.headers?.get === 'function' ? (res.headers.get('content-type') ?? '') : '';
+    if (!res.ok || (contentType && !contentType.toLowerCase().includes('json'))) {
+      await res.body?.cancel?.().catch(() => {});
+      triggerSamePageDownload(url);
+      return;
+    }
+    const payload = (await res.json()) as { ok?: unknown; mode?: unknown; url?: unknown } | null;
+    if (payload?.ok === true && payload.mode === 'redirect' && typeof payload.url === 'string') {
+      if (isSafeHttpDownloadUrl(payload.url)) {
+        if (typeof window !== 'undefined') {
+          window.open(payload.url, '_blank', 'noopener,noreferrer');
+        }
+        return;
+      }
+      return;
+    }
+    triggerSamePageDownload(url);
+  } catch {
+    triggerSamePageDownload(url);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
 }
 
 export async function openExternalDownloadUrl(url: string): Promise<void> {

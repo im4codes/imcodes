@@ -8,6 +8,7 @@ import {
   isAllowedExternalUrl,
   isAllowedPermissionRequest,
   isSameActiveOrigin,
+  isSameOriginDownloadUrl,
   MAIN_WINDOW_WEB_PREFERENCES,
   type WindowOpenHandlerResult,
 } from '../src/security.js';
@@ -784,5 +785,77 @@ describe('PC App V1 exact-origin trust and §4.7 security guards', () => {
       sandbox: true,
       webviewTag: false,
     });
+  });
+
+  it('routes same-origin /api/downloads/ URLs to openExternal and denies blank child windows while preserving popout windows and host allowlists', () => {
+    const trusted = new Set(['https://app.im.codes']);
+    const activeOrigin = 'https://app.im.codes';
+
+    expect(isSameOriginDownloadUrl('https://app.im.codes/api/downloads/latest/desktop-mac', activeOrigin, trusted)).toBe(true);
+    expect(isSameOriginDownloadUrl('https://app.im.codes/api/downloads/latest/android-with-fcm?channel=dev', activeOrigin, trusted)).toBe(true);
+    expect(isSameOriginDownloadUrl('https://app.im.codes/api/downloads-other', activeOrigin, trusted)).toBe(false);
+    expect(isSameOriginDownloadUrl('https://app.im.codes/#/remote-desktop/srv_1', activeOrigin, trusted)).toBe(false);
+    expect(isSameOriginDownloadUrl('https://other.im.codes/api/downloads/latest/desktop-mac', activeOrigin, trusted)).toBe(false);
+
+    const session = new MockSession();
+    const wc = new MockWebContents(session);
+    wc.url = 'https://app.im.codes/';
+    const openExternal = vi.fn();
+
+    attachWindowSecurityGuards({
+      webContents: wc,
+      session,
+      getActiveOrigin: () => activeOrigin,
+      getTrustedOrigins: () => trusted,
+      getCurrentTrustedOrigin: () => activeOrigin,
+      openExternal,
+      promptSavePathSync: () => undefined,
+    });
+
+    const downloadUrl = 'https://app.im.codes/api/downloads/latest/desktop-mac';
+    expect(wc.windowOpenHandler!({ url: downloadUrl })).toEqual({ action: 'deny' });
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    expect(openExternal).toHaveBeenCalledWith(downloadUrl);
+
+    // Embedded credentials are still rejected before openExternal
+    openExternal.mockClear();
+    expect(wc.windowOpenHandler!({ url: 'https://user:pass@app.im.codes/api/downloads/latest/desktop-mac' })).toEqual({
+      action: 'deny',
+    });
+    expect(openExternal).not.toHaveBeenCalled();
+
+    // Non-download same-origin popouts still open cleanly
+    expect(wc.windowOpenHandler!({ url: 'https://app.im.codes/#/remote-desktop/srv_1' })).toMatchObject({
+      action: 'allow',
+    });
+    expect(openExternal).not.toHaveBeenCalled();
+
+    // Child windows inherit the same /api/downloads/ external handoff guard
+    const childWc = new MockWebContents(session);
+    childWc.url = 'https://app.im.codes/#/remote-desktop/srv_1';
+    wc.emit('did-create-window', { webContents: childWc });
+    expect(childWc.windowOpenHandler!({ url: downloadUrl })).toEqual({ action: 'deny' });
+    expect(openExternal).toHaveBeenCalledTimes(1);
+    expect(openExternal).toHaveBeenCalledWith(downloadUrl);
+
+    // Explicit externalDocsHosts allowlist is never bypassed by same-origin /api/downloads/
+    const restrictedSession = new MockSession();
+    const restrictedWc = new MockWebContents(restrictedSession);
+    restrictedWc.url = 'https://app.im.codes/';
+    const restrictedOpenExternal = vi.fn();
+
+    attachWindowSecurityGuards({
+      webContents: restrictedWc,
+      session: restrictedSession,
+      getActiveOrigin: () => activeOrigin,
+      getTrustedOrigins: () => trusted,
+      getCurrentTrustedOrigin: () => activeOrigin,
+      openExternal: restrictedOpenExternal,
+      promptSavePathSync: () => undefined,
+      externalDocsHosts: ['docs.im.codes'],
+    });
+
+    expect(restrictedWc.windowOpenHandler!({ url: downloadUrl })).toEqual({ action: 'deny' });
+    expect(restrictedOpenExternal).not.toHaveBeenCalled();
   });
 });

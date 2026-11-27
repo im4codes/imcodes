@@ -23,6 +23,9 @@ import {
 afterEach(() => {
   cleanup();
   configure('');
+  delete (globalThis as Record<string, unknown>).__IMCODES_PC_APP__;
+  delete (globalThis as Record<string, unknown>).Capacitor;
+  vi.restoreAllMocks();
 });
 
 describe('ClientDownloadsModal', () => {
@@ -134,5 +137,58 @@ describe('ClientDownloadsModal', () => {
     expect(css).toMatch(/\.client-downloads-mobile-card\s+\.client-downloads-qr-frame\s*\{[^}]*margin-top:\s*auto/s);
     expect(css).toMatch(/\.client-downloads-mobile-card\s+\.client-downloads-btn-full\s*\{[^}]*margin-top:\s*0/s);
     expect(css).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*\.client-downloads-mobile-grid\s*\{[^}]*grid-template-columns:\s*1fr/s);
+  });
+
+  it('intercepts same-origin /api/downloads/ clicks in Electron PC App via ?resolve=json while preserving external links and normal web browser clicks', async () => {
+    configure('https://app.im.codes');
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      mode: 'redirect',
+      url: 'https://dl.im.codes/releases/master/imcodes-desktop-v1.0.0-arm64.pkg',
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+
+    // 1. Standard web browser (no __IMCODES_PC_APP__): leaves default <a> behavior untouched
+    const { getByTestId, unmount } = render(<ClientDownloadsModal open onClose={() => {}} />);
+    const webMacLink = getByTestId('download-link-mac-arm64');
+    const webClickEvent = new MouseEvent('click', { bubbles: true, cancelable: true });
+    webMacLink.dispatchEvent(webClickEvent);
+    expect(webClickEvent.defaultPrevented).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(openSpy).not.toHaveBeenCalled();
+    unmount();
+
+    // 2. Electron PC App: intercepts /api/downloads/ clicks, resolves external URL, and opens via window.open
+    (globalThis as Record<string, unknown>).__IMCODES_PC_APP__ = { isElectron: true };
+    const pcRender = render(<ClientDownloadsModal open onClose={() => {}} />);
+    const pcMacLink = pcRender.getByTestId('download-link-mac-arm64');
+    const pcClickEvent = new MouseEvent('click', { bubbles: true, cancelable: true });
+    pcMacLink.dispatchEvent(pcClickEvent);
+    expect(pcClickEvent.defaultPrevented).toBe(true);
+
+    await vi.waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://app.im.codes/api/downloads/latest/desktop-mac?resolve=json',
+        expect.objectContaining({ credentials: 'same-origin' }),
+      );
+      expect(openSpy).toHaveBeenCalledWith(
+        'https://dl.im.codes/releases/master/imcodes-desktop-v1.0.0-arm64.pkg',
+        '_blank',
+        'noopener,noreferrer',
+      );
+    });
+
+    // External store/GitHub links are NOT intercepted in PC App (security.ts windowOpenHandler sends them to openExternal directly)
+    fetchMock.mockClear();
+    const githubLink = pcRender.getByTestId('download-link-github-releases');
+    const githubEv = new MouseEvent('click', { bubbles: true, cancelable: true });
+    githubLink.dispatchEvent(githubEv);
+    expect(githubEv.defaultPrevented).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
   });
 });

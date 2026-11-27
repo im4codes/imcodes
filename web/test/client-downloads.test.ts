@@ -1,13 +1,17 @@
 /**
  * @vitest-environment jsdom
  */
-import { describe, expect, it, afterEach } from 'vitest';
+import { describe, expect, it, afterEach, vi } from 'vitest';
 import { configure } from '../src/api.js';
 import {
   buildQrMatrixPath,
   CLIENT_DOWNLOAD_PATHS,
   IOS_APP_STORE_URL,
+  isDownloadApiUrl,
+  isPcAppClient,
+  isSafeHttpDownloadUrl,
   normalizeHttpOrigin,
+  openPcAppDownloadUrl,
   resolveClientDownloadUrls,
   resolveDownloadOrigin,
 } from '../src/client-downloads.js';
@@ -31,6 +35,10 @@ function setWindowOrigin(origin: string) {
 
 afterEach(() => {
   configure('');
+  delete (globalThis as Record<string, unknown>).__IMCODES_PC_APP__;
+  delete (globalThis as Record<string, unknown>).Capacitor;
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   Object.defineProperty(window, 'location', {
     configurable: true,
     value: originalLocation,
@@ -91,5 +99,92 @@ describe('client-downloads helpers', () => {
         expect((locale.client_downloads as Record<string, string>)[key]?.trim().length, `${name}.${key} empty`).toBeGreaterThan(0);
       }
     }
+  });
+
+  it('detects PC App Electron clients without misclassifying Capacitor or standard web browsers', () => {
+    expect(isPcAppClient()).toBe(false);
+
+    (globalThis as Record<string, unknown>).__IMCODES_PC_APP__ = { isElectron: true };
+    expect(isPcAppClient()).toBe(true);
+
+    // Capacitor native runtime wins over __IMCODES_PC_APP__
+    (globalThis as Record<string, unknown>).Capacitor = { isNativePlatform: () => true };
+    expect(isPcAppClient()).toBe(false);
+  });
+
+  it('validates download API URLs and resolves PC App downloads for redirect, stream, unsafe URLs, and old-server fallbacks', async () => {
+    setWindowOrigin('https://host.im.codes');
+    configure('https://host.im.codes');
+
+    expect(isDownloadApiUrl('https://host.im.codes/api/downloads/latest/desktop-mac')).toBe(true);
+    expect(isDownloadApiUrl('https://evil.example/api/downloads/latest/desktop-mac')).toBe(false);
+    expect(isDownloadApiUrl('https://github.com/im4codes/imcodes/releases')).toBe(false);
+    expect(isSafeHttpDownloadUrl('https://dl.im.codes/file.pkg')).toBe(true);
+    expect(isSafeHttpDownloadUrl('javascript:alert(1)')).toBe(false);
+    expect(isSafeHttpDownloadUrl('file:///etc/passwd')).toBe(false);
+
+    const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
+    const clickedAnchors: Array<{ href: string; download: string }> = [];
+    const clickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      clickedAnchors.push({ href: this.href, download: this.download });
+    });
+
+    // 1. mode: 'redirect' opens valid https URL via window.open
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      mode: 'redirect',
+      url: 'https://dl.im.codes/releases/master/imcodes-desktop.pkg',
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    await openPcAppDownloadUrl('https://host.im.codes/api/downloads/latest/desktop-mac');
+    expect(openSpy).toHaveBeenCalledTimes(1);
+    expect(openSpy).toHaveBeenCalledWith('https://dl.im.codes/releases/master/imcodes-desktop.pkg', '_blank', 'noopener,noreferrer');
+    expect(clickedAnchors).toHaveLength(0);
+
+    // 2. Rejects dangerous redirect URLs (javascript:, file:) without opening or falling back
+    openSpy.mockClear();
+    for (const badUrl of ['javascript:alert(1)', 'file:///etc/passwd']) {
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+        ok: true,
+        mode: 'redirect',
+        url: badUrl,
+      }), { status: 200, headers: { 'content-type': 'application/json' } })));
+      await openPcAppDownloadUrl('https://host.im.codes/api/downloads/latest/desktop-mac');
+      expect(openSpy).not.toHaveBeenCalled();
+      expect(clickedAnchors).toHaveLength(0);
+    }
+
+    // 3. mode: 'stream' triggers hidden same-page <a download> click and cleans up DOM
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      mode: 'stream',
+      url: null,
+    }), { status: 200, headers: { 'content-type': 'application/json' } })));
+    await openPcAppDownloadUrl('https://host.im.codes/api/downloads/latest/desktop-win');
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(clickedAnchors).toEqual([{ href: 'https://host.im.codes/api/downloads/latest/desktop-win', download: '' }]);
+    expect(document.body.querySelectorAll('a[download]')).toHaveLength(0);
+
+    // 4. Non-JSON response (e.g. old server streaming binary directly) cancels body and falls back to <a download>
+    clickedAnchors.length = 0;
+    const cancelSpy = vi.fn(async () => {});
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      headers: { get: (k: string) => (k.toLowerCase() === 'content-type' ? 'application/octet-stream' : null) },
+      body: { cancel: cancelSpy },
+    })));
+    await openPcAppDownloadUrl('https://host.im.codes/api/downloads/latest/desktop-linux-deb');
+    expect(cancelSpy).toHaveBeenCalledTimes(1);
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(clickedAnchors).toEqual([{ href: 'https://host.im.codes/api/downloads/latest/desktop-linux-deb', download: '' }]);
+
+    // 5. Fetch error / old server rejection falls back to <a download>
+    clickedAnchors.length = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new Error('network_failure');
+    }));
+    await openPcAppDownloadUrl('https://host.im.codes/api/downloads/latest/desktop-linux-sh');
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(clickedAnchors).toEqual([{ href: 'https://host.im.codes/api/downloads/latest/desktop-linux-sh', download: '' }]);
+    clickSpy.mockRestore();
   });
 });
