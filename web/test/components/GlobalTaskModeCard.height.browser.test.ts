@@ -537,4 +537,211 @@ describe('GlobalTaskModeView card real Chromium zero-extra-height parity', () =>
       await browser.close();
     }
   });
+
+  it('aligns running meta and action buttons flush at bottom across cards of different heights in the same grid row', { timeout: 90000 }, async () => {
+    const require = createRequire(import.meta.url);
+    const { chromium } = require('playwright') as typeof import('playwright');
+    const systemChromePath = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    const executablePath = existsSync(chromium.executablePath())
+      ? chromium.executablePath()
+      : (existsSync(systemChromePath) ? systemChromePath : null);
+    if (!executablePath) {
+      return;
+    }
+    const { build } = require('esbuild') as typeof import('esbuild');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const webDir = resolve(here, '../..');
+    const repoRoot = resolve(webDir, '..');
+    const viewPath = resolve(webDir, 'src/components/GlobalTaskModeView.tsx');
+    const i18nPath = resolve(webDir, 'src/i18n/index.ts');
+    const storePath = resolve(webDir, 'src/global-task-mode-store.ts');
+    const headBaseCss = readFileSync(resolve(webDir, 'src/styles.css'), 'utf8');
+    const headBriefCss = readFileSync(resolve(webDir, 'src/components/global-task-mode-brief.css'), 'utf8');
+
+    const harnessEntry = `
+      import { render } from 'preact';
+      import i18n from ${JSON.stringify(i18nPath)};
+      import { globalTaskModeStore, clearGlobalTaskModeSessionState } from ${JSON.stringify(storePath)};
+      import { GlobalTaskModeView } from ${JSON.stringify(viewPath)};
+      class NoopWebSocket {
+        static CONNECTING = 0; static OPEN = 1; static CLOSING = 2; static CLOSED = 3;
+        readyState = 1; send() {} close() {} addEventListener() {} removeEventListener() {}
+      }
+      window.WebSocket = NoopWebSocket;
+      window.__mountCards = async (tasks, cardWidthPx) => {
+        await i18n.changeLanguage('en');
+        clearGlobalTaskModeSessionState();
+        globalTaskModeStore.setState({
+          loading: false,
+          connected: true,
+          connecting: false,
+          servers: [{ id: 'srv-1', name: tasks[0].serverName, online: true }],
+          brains: [],
+          tasks,
+        });
+        const root = document.getElementById('root');
+        root.style.width = cardWidthPx ? (cardWidthPx + 'px') : '100%';
+        render(null, root);
+        render(<GlobalTaskModeView onExit={() => {}} onJumpToSession={() => {}} />, root);
+        await new Promise((r) => setTimeout(r, 40));
+      };
+    `;
+
+    const buildResult = await build({
+      absWorkingDir: webDir,
+      stdin: { contents: harnessEntry, resolveDir: webDir, loader: 'tsx' },
+      bundle: true,
+      write: false,
+      outfile: 'harness.js',
+      jsx: 'automatic',
+      jsxImportSource: 'preact',
+      platform: 'browser',
+      alias: {
+        react: 'preact/compat',
+        'react-dom': 'preact/compat',
+        '@shared': resolve(repoRoot, 'shared'),
+      },
+      plugins: [
+        {
+          name: 'ignore-css',
+          setup(pluginBuild) {
+            pluginBuild.onLoad({ filter: /\.css$/ }, () => ({ contents: '', loader: 'css' }));
+          },
+        },
+      ],
+    });
+    const bundle = buildResult.outputFiles.find((f) => f.path.endsWith('.js'))!.text;
+
+    const now = Date.now();
+    const longTask = {
+      serverId: 'srv-1',
+      serverName: 'Production East Cluster Alpha',
+      serverOnline: true,
+      projectName: 'Main Architectural Platform',
+      brainSession: 'deck_cd_brain',
+      brainLabel: 'Main Lead Architect',
+      taskId: 'tsk_align_long',
+      title: 'This is an exceptionally detailed and long task title designed to wrap across multiple lines in desktop two-column grid',
+      status: 'working',
+      flags: ['flag-alpha', 'flag-beta'],
+      round: 2,
+      checklist: { total: 8, implemented: 4, audited: 2 },
+      liveSummary: 'Step 4 of 8: Reconciling service state across Linux systemctl and macOS launchctl targets.',
+      latestBrainEvent: { text: 'Directing executor to run integration smoke tests on worker nodes.', eventId: 'evt-long' },
+      executorLabel: 'LeadExec',
+      auditorLabel: 'SeniorAud',
+      executorModel: 'claude-opus-4-6',
+      auditorModel: 'gpt-6.2-sol',
+      createdAt: now - 300_000,
+      updatedAt: now - 10_000,
+      isTerminal: false,
+      needsAttention: false,
+    };
+
+    const shortTask = {
+      serverId: 'srv-1',
+      serverName: 'M3',
+      serverOnline: true,
+      projectName: 'Quick',
+      brainSession: 'deck_cd_brain',
+      brainLabel: 'Quick',
+      taskId: 'tsk_align_short',
+      title: 'Quick check',
+      status: 'working',
+      flags: [],
+      round: 0,
+      checklist: { total: 0, implemented: 0, audited: 0 },
+      executorLabel: 'Exec',
+      auditorLabel: 'none',
+      executorModel: 'sol',
+      auditorModel: undefined,
+      createdAt: now - 60_000,
+      updatedAt: now - 5_000,
+      isTerminal: false,
+      needsAttention: false,
+    };
+
+    const distAssetsDir = resolve(webDir, 'dist/assets');
+    const builtCssName = existsSync(distAssetsDir)
+      ? readdirSync(distAssetsDir).find((name) => /^index-.*\.css$/.test(name))
+      : undefined;
+    const cssVariants = [
+      `${headBriefCss}\n${headBaseCss}`,
+      ...(builtCssName ? [readFileSync(resolve(distAssetsDir, builtCssName), 'utf8')] : []),
+    ];
+
+    const browser = await chromium.launch({ executablePath, headless: true });
+    try {
+      const page = await browser.newPage({ colorScheme: 'dark', reducedMotion: 'reduce' });
+      await page.route('https://imcodes.test/**', async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'text/html; charset=utf-8',
+          body: '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head><body style="margin:0;background:#080d16;"><div id="root"></div></body></html>',
+        });
+      });
+
+      for (const css of cssVariants) {
+        // Desktop 1280px viewport renders active tasks in a 2-column grid
+        await page.setViewportSize({ width: 1280, height: 800 });
+        await page.goto('https://imcodes.test/', { waitUntil: 'domcontentloaded' });
+        await page.addStyleTag({ content: css });
+        await page.addScriptTag({ content: bundle });
+        await page.evaluate(async ({ tasks }) => {
+          const w = window as unknown as { __mountCards: (t: unknown, w: number) => Promise<void> };
+          await w.__mountCards(tasks, 0);
+        }, { tasks: [longTask, shortTask] });
+
+        const metrics = await page.evaluate(({ longId, shortId }) => {
+          const cardLong = document.querySelector(`[data-testid="task-mode-card-${longId}"]`) as HTMLElement;
+          const cardShort = document.querySelector(`[data-testid="task-mode-card-${shortId}"]`) as HTMLElement;
+          const metaLong = cardLong.querySelector(`[data-testid="task-mode-running-meta-${longId}"]`) as HTMLElement;
+          const metaShort = cardShort.querySelector(`[data-testid="task-mode-running-meta-${shortId}"]`) as HTMLElement;
+          const briefLong = cardLong.querySelector(`[data-testid="task-mode-running-brief-${longId}"]`) as HTMLElement;
+          const briefShort = cardShort.querySelector(`[data-testid="task-mode-running-brief-${shortId}"]`) as HTMLElement;
+          const jumpLong = cardLong.querySelector(`[data-testid="task-mode-running-jump-${longId}"]`) as HTMLElement;
+          const jumpShort = cardShort.querySelector(`[data-testid="task-mode-running-jump-${shortId}"]`) as HTMLElement;
+
+          const rectCardLong = cardLong.getBoundingClientRect();
+          const rectCardShort = cardShort.getBoundingClientRect();
+          const rectMetaLong = metaLong.getBoundingClientRect();
+          const rectMetaShort = metaShort.getBoundingClientRect();
+          const rectBriefLong = briefLong.getBoundingClientRect();
+          const rectBriefShort = briefShort.getBoundingClientRect();
+          const rectJumpLong = jumpLong.getBoundingClientRect();
+          const rectJumpShort = jumpShort.getBoundingClientRect();
+
+          return {
+            cardLongHeight: rectCardLong.height,
+            cardShortHeight: rectCardShort.height,
+            cardLongBottom: rectCardLong.bottom,
+            cardShortBottom: rectCardShort.bottom,
+            metaLongBottom: rectMetaLong.bottom,
+            metaShortBottom: rectMetaShort.bottom,
+            briefLongBottom: rectBriefLong.bottom,
+            briefShortBottom: rectBriefShort.bottom,
+            jumpLongBottom: rectJumpLong.bottom,
+            jumpShortBottom: rectJumpShort.bottom,
+            metaLongOffsetFromBottom: rectCardLong.bottom - rectMetaLong.bottom,
+            metaShortOffsetFromBottom: rectCardShort.bottom - rectMetaShort.bottom,
+          };
+        }, { longId: longTask.taskId, shortId: shortTask.taskId });
+
+        // Both cards in the same grid row are stretched to identical card height and bottom boundary
+        expect(Math.abs(metrics.cardLongHeight - metrics.cardShortHeight)).toBeLessThanOrEqual(1);
+        expect(Math.abs(metrics.cardLongBottom - metrics.cardShortBottom)).toBeLessThanOrEqual(1);
+        expect(metrics.cardLongHeight).toBeGreaterThan(160);
+
+        // Shorter card's running meta and buttons align flush with the taller card's running meta and buttons at bottom
+        expect(Math.abs(metrics.metaLongBottom - metrics.metaShortBottom)).toBeLessThanOrEqual(2);
+        expect(Math.abs(metrics.briefLongBottom - metrics.briefShortBottom)).toBeLessThanOrEqual(2);
+        expect(Math.abs(metrics.jumpLongBottom - metrics.jumpShortBottom)).toBeLessThanOrEqual(2);
+
+        // Both running meta elements sit flush against the card surface bottom (12px padding)
+        expect(Math.abs(metrics.metaLongOffsetFromBottom - metrics.metaShortOffsetFromBottom)).toBeLessThanOrEqual(2);
+      }
+    } finally {
+      await browser.close();
+    }
+  });
 });
