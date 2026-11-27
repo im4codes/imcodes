@@ -3,6 +3,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
+import { useLayoutEffect } from 'preact/hooks';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { CODEX_MODEL_IDS, selectLatestCodexSolModel } from '../../../src/shared/models/options.js';
@@ -1569,6 +1570,79 @@ describe('NewSessionDialog', () => {
       <NewSessionDialog serverId="srv-c" ws={wsC as any} onClose={onClose} onSessionStarted={onSessionStarted} isProviderConnected={() => false} />,
     );
     expect(dirInput.value).toBe('/custom/locked/path');
+  });
+
+  it('never routes a stale pending Enter start from node A into node B when A resolves during B commit before A cleanup', async () => {
+    const wsA = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'req-a-interleave'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+    const wsB = {
+      ...makeWs(),
+      fsListDir: vi.fn(() => 'req-b-interleave'),
+      forgetOwnedDataRequest: vi.fn(),
+    };
+
+    function InterleaveHarness({ target }: { target: 'a' | 'b' }) {
+      const activeWs = target === 'a' ? wsA : wsB;
+      const activeServerId = target === 'a' ? 'srv-a' : 'srv-b';
+      useLayoutEffect(() => {
+        if (target === 'b') {
+          // Fires after B render commits and BEFORE A's useEffect cleanup runs
+          wsA.emit({
+            type: 'fs.ls_response',
+            requestId: 'req-a-interleave',
+            status: 'ok',
+            entries: [{ name: 'wu_lun', isDir: true }],
+          });
+        }
+      }, [target]);
+      return (
+        <NewSessionDialog
+          serverId={activeServerId}
+          ws={activeWs as any}
+          onClose={vi.fn()}
+          onSessionStarted={vi.fn()}
+          isProviderConnected={() => false}
+        />
+      );
+    }
+
+    const rendered = render(<InterleaveHarness target="a" />);
+    const projectInput = screen.getByPlaceholderText('my-project') as HTMLInputElement;
+    const dirInput = screen.getByPlaceholderText('~/.imcodes/projects/my-project') as HTMLInputElement;
+
+    fireEvent.input(projectInput, { target: { value: '无论' } });
+    fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Enter' });
+    expect(wsA.sendSessionCommand).not.toHaveBeenCalled();
+
+    // Switch to B; useLayoutEffect delivers A's fs.ls_response while B is committed
+    rendered.rerender(<InterleaveHarness target="b" />);
+
+    expect(wsA.sendSessionCommand).not.toHaveBeenCalled();
+    expect(wsB.sendSessionCommand).not.toHaveBeenCalled();
+    expect(dirInput.value).toBe('~/.imcodes/projects/wu_lun');
+
+    // Session on B starts ONLY when user explicitly submits on B (and resolves with B's listing)
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(wsB.sendSessionCommand).not.toHaveBeenCalled();
+
+    act(() => wsB.emit({
+      type: 'fs.ls_response',
+      requestId: 'req-b-interleave',
+      status: 'ok',
+      entries: [
+        { name: 'wu_lun', isDir: true },
+        { name: 'wu_lun_1', isDir: true },
+      ],
+    }));
+    expect(wsA.sendSessionCommand).not.toHaveBeenCalled();
+    expect(wsB.sendSessionCommand).toHaveBeenCalledTimes(1);
+    expect(wsB.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: '无论',
+      dir: '~/.imcodes/projects/wu_lun_2',
+    }));
   });
 
   it('mounts safely without throwing when ws mock lacks onMessage and still auto-populates default dir', async () => {

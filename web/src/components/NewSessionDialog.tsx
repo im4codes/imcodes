@@ -83,6 +83,15 @@ const MUSE_SDK_MODEL_FALLBACK = ["muse-spark-1.3", "muse-spark", "muse-wonder", 
 const AGY_SDK_MODEL_FALLBACK = [...AGY_MODEL_IDS] as const;
 export const PROJECT_DIR_LIST_TIMEOUT_MS = 3_000;
 const EMPTY_PROJECT_ENTRIES: string[] = [];
+
+type ConnectionOwner = {
+  ws: WsClient | null;
+  serverId: string | undefined;
+};
+
+const isSameConnectionOwner = (a: ConnectionOwner | null, b: ConnectionOwner): boolean =>
+  a !== null && a.ws === b.ws && a.serverId === b.serverId;
+
 const responsiveDialogStyle = {
   // Hard-cap against the visual viewport instead of relying on flex padding.
   // iOS can still render a 380px fixed-ish dialog inside a 390px viewport,
@@ -141,21 +150,25 @@ export function NewSessionDialog({
   const [dirManuallyEdited, setDirManuallyEdited] = useState(false);
   const [projectDirListing, setProjectDirListing] = useState<{
     ws: WsClient | null;
+    serverId: string | undefined;
     status: "ready" | "loading";
     entries: string[];
-  }>({ ws: null, status: "ready", entries: [] });
-  const [awaitingDirQueryStart, setAwaitingDirQueryStart] = useState(false);
+  }>({ ws: null, serverId: undefined, status: "ready", entries: EMPTY_PROJECT_ENTRIES });
+  const [pendingDirQueryStart, setPendingDirQueryStart] = useState<ConnectionOwner | null>(null);
   const projectRef = useRef(project);
   projectRef.current = project;
   const dirRef = useRef(dir);
   dirRef.current = dir;
   const dirManuallyEditedRef = useRef(dirManuallyEdited);
   dirManuallyEditedRef.current = dirManuallyEdited;
-  const awaitingDirQueryStartRef = useRef(awaitingDirQueryStart);
-  awaitingDirQueryStartRef.current = awaitingDirQueryStart;
-  const startSessionWithDirRef = useRef<(resolvedDir: string) => void>(() => {});
-  const activeListingMatchesWs = projectDirListing.ws === ws;
-  const existingProjectEntries = activeListingMatchesWs ? projectDirListing.entries : [];
+  const currentOwner: ConnectionOwner = { ws, serverId };
+  const currentOwnerRef = useRef<ConnectionOwner>(currentOwner);
+  currentOwnerRef.current = currentOwner;
+  const pendingDirQueryStartRef = useRef<ConnectionOwner | null>(pendingDirQueryStart);
+  const startSessionWithDirRef = useRef<(resolvedDir: string, expectedOwner?: ConnectionOwner) => void>(() => {});
+  const activeListingMatchesOwner = isSameConnectionOwner(projectDirListing, currentOwner);
+  const existingProjectEntries = activeListingMatchesOwner ? projectDirListing.entries : EMPTY_PROJECT_ENTRIES;
+  const awaitingDirQueryStart = isSameConnectionOwner(pendingDirQueryStart, currentOwner);
   const canQueryProjectDirs = Boolean(
     ws
     && ws.connected
@@ -163,7 +176,7 @@ export function NewSessionDialog({
     && typeof ws.onMessage === "function",
   );
   const projectDirQueryPending = canQueryProjectDirs
-    && (!activeListingMatchesWs || projectDirListing.status === "loading");
+    && (!activeListingMatchesOwner || projectDirListing.status === "loading");
   const [gitRemoteUrl, setGitRemoteUrl] = useState("");
   const [agentType, setAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
   const [lastUnlockedAgentType, setLastUnlockedAgentType] = useState<AgentType>(AGY_SDK_PROVIDER_ID);
@@ -439,11 +452,17 @@ export function NewSessionDialog({
   const wsConnected = Boolean(ws?.connected);
 
   useEffect(() => {
-    awaitingDirQueryStartRef.current = false;
-    setAwaitingDirQueryStart(false);
+    const owner: ConnectionOwner = { ws, serverId };
+    if (
+      pendingDirQueryStartRef.current
+      && (!isSameConnectionOwner(pendingDirQueryStartRef.current, owner) || !wsConnected)
+    ) {
+      pendingDirQueryStartRef.current = null;
+      setPendingDirQueryStart(null);
+    }
 
     if (!ws || !wsConnected || typeof ws.fsListDir !== "function" || typeof ws.onMessage !== "function") {
-      setProjectDirListing({ ws: ws ?? null, status: "ready", entries: EMPTY_PROJECT_ENTRIES });
+      setProjectDirListing({ ws: ws ?? null, serverId, status: "ready", entries: EMPTY_PROJECT_ENTRIES });
       if (!dirManuallyEditedRef.current) {
         setDir(projectRef.current.trim() ? buildReadableProjectDir(projectRef.current, EMPTY_PROJECT_ENTRIES) : DEFAULT_PROJECTS_DIR_PREFIX);
       }
@@ -455,19 +474,20 @@ export function NewSessionDialog({
     let pendingRequestId: string | null = null;
     let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
-    setProjectDirListing({ ws, status: "loading", entries: EMPTY_PROJECT_ENTRIES });
+    setProjectDirListing({ ws, serverId, status: "loading", entries: EMPTY_PROJECT_ENTRIES });
     if (!dirManuallyEditedRef.current) {
       setDir(projectRef.current.trim() ? buildReadableProjectDir(projectRef.current, EMPTY_PROJECT_ENTRIES) : DEFAULT_PROJECTS_DIR_PREFIX);
     }
 
     const settleListing = (names: string[]) => {
       if (disposed || settled) return;
+      if (!isSameConnectionOwner(currentOwnerRef.current, owner)) return;
       settled = true;
       if (timeoutId) {
         clearTimeout(timeoutId);
         timeoutId = null;
       }
-      setProjectDirListing({ ws, status: "ready", entries: names });
+      setProjectDirListing({ ws, serverId, status: "ready", entries: names });
       const currentProject = projectRef.current;
       const nextDir = !dirManuallyEditedRef.current && currentProject.trim()
         ? buildReadableProjectDir(currentProject, names)
@@ -475,15 +495,16 @@ export function NewSessionDialog({
       if (!dirManuallyEditedRef.current && currentProject.trim()) {
         setDir(nextDir);
       }
-      if (awaitingDirQueryStartRef.current) {
-        awaitingDirQueryStartRef.current = false;
-        setAwaitingDirQueryStart(false);
-        startSessionWithDirRef.current(nextDir);
+      if (isSameConnectionOwner(pendingDirQueryStartRef.current, owner)) {
+        pendingDirQueryStartRef.current = null;
+        setPendingDirQueryStart(null);
+        startSessionWithDirRef.current(nextDir, owner);
       }
     };
 
     const unsub = ws.onMessage((msg) => {
       if (disposed || msg.type !== "fs.ls_response") return;
+      if (!isSameConnectionOwner(currentOwnerRef.current, owner)) return;
       const lsMsg = msg as { requestId?: unknown; status?: unknown; entries?: Array<{ name?: unknown }> };
       if (!pendingRequestId || lsMsg.requestId !== pendingRequestId) return;
       pendingRequestId = null;
@@ -528,13 +549,13 @@ export function NewSessionDialog({
         ws.forgetOwnedDataRequest?.(pendingRequestId);
         pendingRequestId = null;
       }
-      if (awaitingDirQueryStartRef.current) {
-        awaitingDirQueryStartRef.current = false;
-        setAwaitingDirQueryStart(false);
+      if (isSameConnectionOwner(pendingDirQueryStartRef.current, owner)) {
+        pendingDirQueryStartRef.current = null;
+        setPendingDirQueryStart(null);
       }
       unsub?.();
     };
-  }, [ws, wsConnected]);
+  }, [ws, wsConnected, serverId]);
 
   // Recover the refresh button cleanly when an older daemon never replies to session.detect_agents.
   useEffect(() => {
@@ -698,7 +719,10 @@ export function NewSessionDialog({
     }
   };
 
-  const startSessionWithDir = (resolvedDir: string) => {
+  const startSessionWithDir = (resolvedDir: string, expectedOwner?: ConnectionOwner) => {
+    if (expectedOwner && !isSameConnectionOwner(currentOwnerRef.current, expectedOwner)) {
+      return;
+    }
     const trimmedProject = projectRef.current.trim();
     const trimmedDir = resolvedDir.trim();
     if (!trimmedProject) {
@@ -824,7 +848,7 @@ export function NewSessionDialog({
   startSessionWithDirRef.current = startSessionWithDir;
 
   const handleStart = () => {
-    if (starting || awaitingDirQueryStartRef.current) return;
+    if (starting || isSameConnectionOwner(pendingDirQueryStartRef.current, currentOwner)) return;
     if (!project.trim()) {
       setError(t("new_session.project_required"));
       return;
@@ -864,8 +888,9 @@ export function NewSessionDialog({
       return;
     }
     if (!dirManuallyEdited && projectDirQueryPending) {
-      awaitingDirQueryStartRef.current = true;
-      setAwaitingDirQueryStart(true);
+      const owner: ConnectionOwner = { ws, serverId };
+      pendingDirQueryStartRef.current = owner;
+      setPendingDirQueryStart(owner);
       setError("");
       return;
     }
@@ -1049,7 +1074,7 @@ export function NewSessionDialog({
   }, [agentType, qwenCompatibleApiPresetSelected]);
 
   const handleKey = (e: KeyboardEvent) => {
-    if (e.key === "Enter" && !starting && !awaitingDirQueryStartRef.current) handleStart();
+    if (e.key === "Enter" && !starting && !isSameConnectionOwner(pendingDirQueryStartRef.current, currentOwner)) handleStart();
   };
 
   return (
@@ -1060,8 +1085,10 @@ export function NewSessionDialog({
           <button
             class="dialog-close"
             onClick={() => {
-              awaitingDirQueryStartRef.current = false;
-              setAwaitingDirQueryStart(false);
+              if (isSameConnectionOwner(pendingDirQueryStartRef.current, currentOwner)) {
+                pendingDirQueryStartRef.current = null;
+                setPendingDirQueryStart(null);
+              }
               onClose();
             }}
             disabled={starting}
@@ -2274,8 +2301,10 @@ export function NewSessionDialog({
           <button
             class="btn btn-secondary"
             onClick={() => {
-              awaitingDirQueryStartRef.current = false;
-              setAwaitingDirQueryStart(false);
+              if (isSameConnectionOwner(pendingDirQueryStartRef.current, currentOwner)) {
+                pendingDirQueryStartRef.current = null;
+                setPendingDirQueryStart(null);
+              }
               onClose();
             }}
             disabled={starting}
