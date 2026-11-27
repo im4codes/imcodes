@@ -40,6 +40,7 @@ import {
   PROVIDER_ERROR_CODES,
   type RemoteSessionInfo,
   type SessionInfoUpdate,
+  type TransportProvider,
 } from './transport-provider.js';
 import { setupCCStopHook } from './signal.js';
 import { setupCodexNotify, setupOpenCodePlugin } from './notify-setup.js';
@@ -1301,6 +1302,8 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   handoffLaunchGeneration?: number;
   /** Internal: invoked after `postLaunch` and initial context injection finish. */
   onPostLaunchReady?: () => Promise<unknown> | unknown;
+  /** Internal: pre-connected provider passed by connect-time sync to avoid re-entering provider-registry lock. */
+  provider?: TransportProvider;
 }
 
 export interface SessionRelaunchOverrides {
@@ -3769,6 +3772,7 @@ export async function restoreTransportSessions(
  * callers cannot both observe "no in-flight".
  */
 const transportLaunchInFlight = new Map<string, Promise<void>>();
+const transportLaunchAwaitingProvider = new Map<string, string>();
 
 /** How long a launch waits on an earlier in-flight launch of the same session before giving up. */
 export const DEFAULT_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS = 45_000;
@@ -3793,6 +3797,16 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   clearTransportRestoreBackoff(name);
   const inFlight = transportLaunchInFlight.get(name);
   if (inFlight) {
+    // Break the indirect registry -> oc-session-sync -> launchTransportSession cycle:
+    // if the in-flight launch for this session is currently awaiting ensureProviderConnected
+    // for the same pre-connected provider, return immediately so sync can finish and the
+    // outer launch can proceed with the now-connected provider.
+    if (!opts.fresh && opts.provider && transportLaunchAwaitingProvider.get(name) === opts.provider.id) {
+      if (opts.bindExistingKey) {
+        registerProviderRoute(opts.bindExistingKey, name);
+      }
+      return;
+    }
     // A wedged earlier launch must not hold every later launch of this session forever: wait a
     // bounded time, then fail loudly so the caller (and the user) sees why nothing started.
     const waitMs = getTransportLaunchInFlightWaitMs();
@@ -3867,7 +3881,19 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     }
   }
 
-  const provider = await ensureProviderConnected(agentType, {});
+  let provider: TransportProvider;
+  if (opts.provider) {
+    provider = opts.provider;
+  } else {
+    transportLaunchAwaitingProvider.set(name, agentType);
+    try {
+      provider = await ensureProviderConnected(agentType, {});
+    } finally {
+      if (transportLaunchAwaitingProvider.get(name) === agentType) {
+        transportLaunchAwaitingProvider.delete(name);
+      }
+    }
+  }
 
   const launchRecord = getSession(name);
   const launchRecipient = recipientFromSessionRecord(launchRecord) ?? {

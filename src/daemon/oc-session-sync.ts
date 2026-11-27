@@ -163,6 +163,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
             label: mainLabel,
             projectDir: mainSessionProjectDir(group.agentName),
             bindExistingKey: group.mainSession.key, skipCreate: true, skipStore: true,
+            provider,
           });
           upsertSession({ ...mainRecord!, state: 'idle', label: mainLabel, updatedAt: Date.now() });
           logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: reconnected main session runtime');
@@ -186,6 +187,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               description: normalizeOpenClawDisplayName(group.mainSession.displayName),
               bindExistingKey: group.mainSession.key,
               skipCreate: true,
+              provider,
             };
             await launchTransportSession(opts);
             created++;
@@ -215,6 +217,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
+              provider,
             });
             const newLabel = preferredOpenClawLabel(storeEntry.label, ch.displayName, ch.key);
             upsertSession({ ...storeEntry, state: 'idle', parentSession: mName, label: newLabel, updatedAt: Date.now() });
@@ -248,6 +251,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
+              provider,
             });
             // Update store: mark running, set parentSession + label (preserve existing label)
             const reconnLabel = preferredOpenClawLabel(existingInStore.label, ch.displayName, ch.key);
@@ -295,6 +299,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
           bindExistingKey: ch.key,
           skipCreate: true,
           parentSession: mName,
+          provider,
         };
         await launchTransportSession(opts);
         created++;

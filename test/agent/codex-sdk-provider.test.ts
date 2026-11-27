@@ -271,6 +271,41 @@ const childProcessMock = vi.hoisted(() => {
 });
 
 const hookPortMock = vi.hoisted(() => ({ port: null as number | null }));
+const fsStatGate = vi.hoisted(() => ({
+  active: false,
+  entered: false,
+  promise: null as Promise<void> | null,
+  resolve: null as (() => void) | null,
+  reset() {
+    this.active = false;
+    this.entered = false;
+    this.promise = null;
+    this.resolve = null;
+  },
+  arm() {
+    this.active = true;
+    this.entered = false;
+    this.promise = new Promise<void>((res) => {
+      this.resolve = res;
+    });
+  },
+}));
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    stat: async (...args: Parameters<typeof actual.stat>) => {
+      const target = String(args[0] ?? '');
+      if (fsStatGate.active && target.endsWith('auth.json')) {
+        fsStatGate.entered = true;
+        fsStatGate.active = false;
+        await fsStatGate.promise;
+      }
+      return actual.stat(...args);
+    },
+  };
+});
 
 vi.mock('node:child_process', () => ({
   spawn: childProcessMock.spawn,
@@ -8993,6 +9028,7 @@ describe('Codex context budget protects IM.codes system and supervision instruct
 
 describe('CodexSdkProvider normalChannel startup serialization', () => {
   afterEach(async () => {
+    fsStatGate.reset();
     childProcessMock.setHoldInitialize(false);
     childProcessMock.releaseHeldInitializes();
     await disconnectActiveCodexProviders();
@@ -9063,5 +9099,40 @@ describe('CodexSdkProvider normalChannel startup serialization', () => {
     expect(spawned).toHaveLength(1);
     expect(spawned[0]!.child.killed).toBe(true);
     expect(provider.getMemoryMcpStatus().connected).toBe(false);
+  });
+
+  it('aborts in-flight connect() before spawn when disconnect() fires during pre-spawn auth stat and preserves subsequent reconnect config/process', async () => {
+    const provider = createCodexProvider();
+    const startIdx = childProcessMock.children.length;
+    fsStatGate.arm();
+
+    const connect1 = provider.connect({
+      binaryPath: 'codex',
+      env: { CODEX_HOME: '/tmp/codex-prespawn-gate-test' },
+    });
+    await waitForCondition(() => fsStatGate.entered);
+    expect(childProcessMock.children.slice(startIdx)).toHaveLength(0);
+
+    // Trigger disconnect while connect1 is paused before spawn, then also enqueue a new
+    // active connect2 immediately while disconnect is still draining connect1.
+    const disconnectPromise = provider.disconnect();
+    const connect2 = provider.connect({
+      binaryPath: 'codex',
+      env: { CODEX_HOME: '/tmp/codex-prespawn-gate-test' },
+    });
+
+    // Release pre-spawn stat gate: connect1 must abort BEFORE spawning any child or starting timers.
+    fsStatGate.resolve!();
+
+    await expect(connect1).rejects.toThrow(/disconnected/i);
+    await Promise.all([disconnectPromise, connect2]);
+
+    // Exactly 1 child was spawned (solely from connect2; connect1 never spawned).
+    const spawned = childProcessMock.children.slice(startIdx);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]!.child.killed).toBe(false);
+    expect(provider.getMemoryMcpStatus().connected).toBe(true);
+    expect((provider as unknown as { config: unknown }).config).not.toBeNull();
+    expect((provider as unknown as { idleThreadSweepTimer: unknown }).idleThreadSweepTimer).not.toBeNull();
   });
 });
