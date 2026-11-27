@@ -25,7 +25,7 @@ vi.mock('../../src/util/logger.js', () => ({
   },
 }));
 
-import { getQwenRuntimeConfig } from '../../src/agent/qwen-runtime-config.js';
+import { __resetQwenRuntimeConfigCache, getQwenRuntimeConfig } from '../../src/agent/qwen-runtime-config.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 
 describe('getQwenRuntimeConfig', () => {
@@ -157,5 +157,20 @@ describe('getQwenRuntimeConfig', () => {
       'MiniMax-M2.5',
       'deepseek-v3.2',
     ]);
+  });
+
+  it('does not spawn qwen CLI when probe=false', async () => {
+    __resetQwenRuntimeConfigCache();
+    childProcessMock.execFile.mockImplementation(() => {
+      throw new Error('qwen CLI should not be spawned when probe=false');
+    });
+    fsMock.readFile.mockResolvedValue(JSON.stringify({
+      security: { auth: { selectedType: 'qwen-oauth' } },
+    }));
+
+    const config = await getQwenRuntimeConfig({ probe: false });
+    expect(config.authType).toBe(QWEN_AUTH_TYPES.OAUTH);
+    expect(config.availableModels).toEqual(['coder-model']);
+    expect(childProcessMock.execFile).not.toHaveBeenCalled();
   });
 });

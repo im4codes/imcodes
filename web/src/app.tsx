@@ -316,11 +316,17 @@ import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
   isNavigableMainSession,
   isSubSessionName,
+  mergeRestSessionEntry,
   mergeSessionListEntry,
   parseMainSessionName,
   resolveSharedSessionProject,
   type IncomingSessionListEntry,
 } from './session-list-merge.js';
+import {
+  clearCachedServerSessions,
+  readCachedServerSessions,
+  writeCachedServerSessions,
+} from './session-list-cache.js';
 import { isAskQuestionSessionVisible, type AskQuestionSessionVisibilityState } from './ask-question-visibility.js';
 import { resolveSessionInfoRuntimeType, resolveSubSessionRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
@@ -1176,6 +1182,9 @@ function InternalMainApp() {
     clearSharedTabRestoreMarker();
     clearMessagePinsCache();
     clearMessagePinNavigation();
+    if (options?.preserveCredentials !== true) {
+      clearCachedServerSessions();
+    }
     // A shared hash is only a navigation intent. Everything learned under the
     // expired identity is discarded before asynchronous credential cleanup.
     setAuth(null);
@@ -2561,7 +2570,7 @@ function InternalMainApp() {
       setSessions((prev) => {
         const mergedLoaded = mapped.map((s) => {
           const existing = prev.find((p) => p.name === s.name);
-          return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
+          return mergeRestSessionEntry(s, existing);
         });
         const loadedNames = new Set(mergedLoaded.map((s) => s.name));
         const incogByName = new Map<string, SessionInfo>();
@@ -2593,7 +2602,13 @@ function InternalMainApp() {
     return () => { cancelled = true; clearTimeout(timer); ctrl.abort(); };
   }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
 
-  const [sessions, setSessions] = useState<SessionInfo[]>([]);
+  const [sessions, setSessions] = useState<SessionInfo[]>(() => {
+    const initialServerId = initialHashStateRef.current.serverId;
+    if (!initialServerId || initialHashStateRef.current.sharedEntryId || initialSharedTabRestoreRef.current) {
+      return [];
+    }
+    return readCachedServerSessions(initialServerId);
+  });
   const [sharedActiveDispatchIds, setSharedActiveDispatchIds] = useState<Map<string, string>>(() => new Map());
   const navigableMainSessions = useMemo(
     () => sessions.filter(isNavigableMainSession),
@@ -2645,9 +2660,22 @@ function InternalMainApp() {
     sessionsLoadedRef.current = next;
     setSessionsLoadedRaw(next);
   }, []);
-  const [activeSession, setActiveSessionState] = useState<string | null>(
-    () => initialHashStateRef.current.sessionName,
-  );
+  const [activeSession, setActiveSessionState] = useState<string | null>(() => {
+    if (initialHashStateRef.current.sessionName) return initialHashStateRef.current.sessionName;
+    const initialServerId = initialHashStateRef.current.serverId;
+    if (!initialServerId || initialHashStateRef.current.sharedEntryId || initialSharedTabRestoreRef.current) {
+      return null;
+    }
+    const navigableCached = sessions.filter(isNavigableMainSession);
+    if (navigableCached.length === 0) return null;
+    const remembered = readServerSession(initialServerId);
+    return resolveServerSessionSnapshot(
+      initialServerId,
+      remembered,
+      navigableCached.map((s) => ({ serverId: initialServerId, sessionName: s.name })),
+      remembered,
+    ) ?? navigableCached[0]!.name;
+  });
 
   // Sync URL hash with current server + session so each tab has its own URL
   useEffect(() => {
@@ -6026,6 +6054,9 @@ function InternalMainApp() {
           const existing = prev.find((p) => p.name === s.name);
           return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
         }));
+        if (!selectedShareTarget && selectedServerIdRef.current === selectedServerId) {
+          writeCachedServerSessions(selectedServerId, mergedSessionList);
+        }
         setSessionsLoaded(true);
         // If the active top-level session disappeared or is a hidden worker,
         // navigate back to the owning brain session instead of surfacing W1/W2
@@ -7325,6 +7356,7 @@ function InternalMainApp() {
     clearSharedTabRestoreMarker();
     clearMessagePinsCache();
     clearMessagePinNavigation();
+    clearCachedServerSessions();
     configureExpectedUserId(null);
     setFileRelayUser(null);
     setServerR2RelayEnabled(false);
@@ -7399,7 +7431,10 @@ function InternalMainApp() {
   const lastNavIntentKeyRef = useRef<string | null>(null);
   const lastAutoFocusedRef = useRef<{ key: string; element: HTMLDivElement } | null>(null);
 
-  const resetServerScopedStateForSwitch = useCallback((nextServerId?: string | null) => {
+  const resetServerScopedStateForSwitch = useCallback((
+    nextServerId?: string | null,
+    options?: { restoreCachedOwnedSessions?: boolean },
+  ): SessionInfo[] => {
     staleSubSessionsSnapshotRef.current = rawSubSessionsRef.current;
     managedSharesGenerationRef.current += 1;
     explicitSelectionServerRef.current = null;
@@ -7415,7 +7450,15 @@ function InternalMainApp() {
     const restoredIncogMain = nextServerId
       ? (incognitoMainSessionsByServerRef.current.get(nextServerId) ?? [])
       : [];
-    setSessions(restoredIncogMain);
+    const cachedOwnedMain = options?.restoreCachedOwnedSessions && nextServerId
+      ? readCachedServerSessions(nextServerId)
+      : [];
+    const cachedOwnedNames = new Set(cachedOwnedMain.map((s) => s.name));
+    const initialSwitchSessions = [
+      ...cachedOwnedMain,
+      ...restoredIncogMain.filter((s) => !cachedOwnedNames.has(s.name)),
+    ];
+    setSessions(initialSwitchSessions);
     setSessionsLoaded(false);
     // Clear only active view state without erasing per-server incognito caches/open windows.
     openSubPersistenceSessionRef.current = null;
@@ -7460,6 +7503,7 @@ function InternalMainApp() {
     setRepoContexts(restoredRepoContexts ? new Map(restoredRepoContexts) : new Map());
     repoContextsOwnerServerIdRef.current = nextServerId ?? null;
     setManagedShares([]);
+    return initialSwitchSessions;
   }, [resetServerScopedOverlaysAndTargets, setActiveSession]);
 
   const switchToOwnedServerInApp = useCallback((serverId: string, serverName?: string | null) => {
@@ -7509,8 +7553,15 @@ function InternalMainApp() {
     selectedServerIdRef.current = serverId;
     setSelectedServerId(serverId);
     setSelectedServerName(serverName ?? null);
-    resetServerScopedStateForSwitch(serverId);
-    writeHashState(serverId, null, null);
+    const initialSwitchSessions = resetServerScopedStateForSwitch(serverId, { restoreCachedOwnedSessions: true });
+    const navigableSwitchNames = initialSwitchSessions
+      .filter(isNavigableMainSession)
+      .map((session) => session.name);
+    if (navigableSwitchNames.length > 0) {
+      restoreLastTabRef.current(serverId, navigableSwitchNames);
+    } else {
+      writeHashState(serverId, null, null);
+    }
   }, [resetServerScopedStateForSwitch, selectedShareTarget]);
 
   const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {

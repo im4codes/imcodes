@@ -742,4 +742,21 @@ describe('mergeSessionListEntry — supervision heartbeat projection', () => {
     }));
     expect(merged.supervisionHeartbeat).toBeNull();
   });
+
+  it('preserves muse-code-sdk provider quota when a subsequent session_list entry temporarily omits it', () => {
+    const withQuota = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      agentType: 'muse-code-sdk',
+      quotaLabel: '5h 5% · 7d 20%',
+      quotaMeta: {
+        primary: { usedPercent: 5, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      },
+    }, undefined);
+    const sparse = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      agentType: 'muse-code-sdk',
+    }, withQuota);
+    expect(sparse.quotaLabel).toBe('5h 5% · 7d 20%');
+    expect(sparse.quotaMeta).toEqual(withQuota.quotaMeta);
+  });
 });

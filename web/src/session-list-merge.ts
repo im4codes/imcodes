@@ -67,6 +67,8 @@ export interface IncomingSessionListEntry {
   qwenAuthLimit?: string;
   qwenAvailableModels?: string[];
   codexAvailableModels?: string[];
+  copilotAvailableModels?: string[];
+  cursorAvailableModels?: string[];
   modelDisplay?: string;
   planLabel?: string | null;
   quotaLabel?: string | null;
@@ -159,11 +161,16 @@ export function mergeSessionListEntry(
         : undefined;
   const isCodexFamily = incoming.agentType === 'codex' || incoming.agentType === 'codex-sdk';
   const providerChanged = existing != null && incoming.agentType !== existing.agentType;
-  // Codex AND claude-code-sdk AND agy-sdk AND grok-sdk surface provider quota that the daemon may omit on
+  // Codex AND claude-code-sdk AND agy-sdk AND grok-sdk AND muse-code-sdk surface provider quota that the daemon may omit on
   // a given session_list pass (idle / 30-min throttle / a transient B failure);
   // preserve the last known value so the footer doesn't flicker blank between
   // updates instead of dropping it to undefined.
-  const preservesProviderQuota = isCodexFamily || incoming.agentType === 'claude-code-sdk' || incoming.agentType === AGY_SDK_PROVIDER_ID || incoming.agentType === 'grok-sdk';
+  const preservesProviderQuota =
+    isCodexFamily
+    || incoming.agentType === 'claude-code-sdk'
+    || incoming.agentType === AGY_SDK_PROVIDER_ID
+    || incoming.agentType === 'grok-sdk'
+    || incoming.agentType === 'muse-code-sdk';
   const pendingSyncPatch = !isOlderGeneration && hasTransportPendingSyncSnapshot(incoming as unknown as Record<string, unknown>)
     ? buildTransportPendingSyncPatch({
       transportPendingMessages: existing?.transportPendingMessages,
@@ -227,6 +234,8 @@ export function mergeSessionListEntry(
     qwenAuthLimit: incoming.qwenAuthLimit ?? existing?.qwenAuthLimit,
     qwenAvailableModels: incoming.qwenAvailableModels ?? existing?.qwenAvailableModels,
     codexAvailableModels: incoming.codexAvailableModels ?? existing?.codexAvailableModels,
+    copilotAvailableModels: incoming.copilotAvailableModels ?? existing?.copilotAvailableModels,
+    cursorAvailableModels: incoming.cursorAvailableModels ?? existing?.cursorAvailableModels,
     modelDisplay: incoming.modelDisplay ?? incoming.activeModel ?? (providerChanged ? undefined : existing?.modelDisplay),
     planLabel: incoming.planLabel ?? (preservesProviderQuota ? existing?.planLabel : undefined),
     quotaLabel: incoming.quotaLabel ?? (preservesProviderQuota ? existing?.quotaLabel : undefined),
@@ -263,4 +272,52 @@ export function mergeSessionListEntry(
     executionTemplateIneligibleReason:
       incoming.executionTemplateIneligibleReason ?? existing?.executionTemplateIneligibleReason,
   };
+}
+
+/**
+ * Merge a lightweight REST `/api/server/:id/sessions` row into existing state
+ * (either from `session-list-cache` or an already-arrived WS `session_list`),
+ * preserving cached/live model display and quota metadata that the Postgres
+ * REST row omits instead of overwriting them back to `undefined`.
+ */
+export function mergeRestSessionEntry(
+  restEntry: SessionInfo,
+  existing: SessionInfo | undefined,
+): SessionInfo {
+  if (!existing) return restEntry;
+  const providerChanged = restEntry.agentType !== existing.agentType;
+  const nextState: SessionInfo['state'] =
+    existing.state && existing.state !== 'unknown'
+      ? existing.state
+      : restEntry.state;
+  const merged = mergeSessionListEntry(
+    {
+      ...restEntry,
+      state: nextState,
+      ...(providerChanged
+        ? {}
+        : {
+            ccPreset: restEntry.ccPreset ?? existing.ccPreset,
+            qwenModel: restEntry.qwenModel ?? existing.qwenModel,
+            requestedModel: restEntry.requestedModel ?? existing.requestedModel,
+            activeModel: restEntry.activeModel ?? existing.activeModel,
+            qwenAuthType: restEntry.qwenAuthType ?? existing.qwenAuthType,
+            qwenAuthLimit: restEntry.qwenAuthLimit ?? existing.qwenAuthLimit,
+            qwenAvailableModels: restEntry.qwenAvailableModels ?? existing.qwenAvailableModels,
+            codexAvailableModels: restEntry.codexAvailableModels ?? existing.codexAvailableModels,
+            copilotAvailableModels: restEntry.copilotAvailableModels ?? existing.copilotAvailableModels,
+            cursorAvailableModels: restEntry.cursorAvailableModels ?? existing.cursorAvailableModels,
+            modelDisplay: restEntry.modelDisplay ?? existing.modelDisplay,
+            planLabel: restEntry.planLabel ?? existing.planLabel,
+            quotaLabel: restEntry.quotaLabel ?? existing.quotaLabel,
+            quotaUsageLabel: restEntry.quotaUsageLabel ?? existing.quotaUsageLabel,
+            quotaMeta: restEntry.quotaMeta ?? existing.quotaMeta,
+            codexCreditsBalance: restEntry.codexCreditsBalance ?? existing.codexCreditsBalance,
+            codexCreditsHasCredits: restEntry.codexCreditsHasCredits ?? existing.codexCreditsHasCredits,
+            codexCreditsUnlimited: restEntry.codexCreditsUnlimited ?? existing.codexCreditsUnlimited,
+          }),
+    } as IncomingSessionListEntry,
+    existing,
+  );
+  return merged;
 }
