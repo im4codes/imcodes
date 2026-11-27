@@ -351,6 +351,10 @@ import {
   readCachedServerSessions,
   writeCachedServerSessions,
 } from './session-list-cache.js';
+import {
+  clearCachedDaemonCapabilities,
+  readCachedDaemonCapabilities,
+} from './daemon-capability-cache.js';
 import { isAskQuestionSessionVisible, type AskQuestionSessionVisibilityState } from './ask-question-visibility.js';
 import { resolveSessionInfoRuntimeType, resolveSubSessionRuntimeType } from './runtime-type.js';
 import { useSyncedPreference } from './hooks/useSyncedPreference.js';
@@ -1230,6 +1234,7 @@ function InternalMainApp() {
     clearMessagePinNavigation();
     if (options?.preserveCredentials !== true) {
       clearCachedServerSessions();
+      clearCachedDaemonCapabilities();
     }
     // A shared hash is only a navigation intent. Everything learned under the
     // expired identity is discarded before asynchronous credential cleanup.
@@ -8232,6 +8237,7 @@ function InternalMainApp() {
     clearMessagePinsCache();
     clearMessagePinNavigation();
     clearCachedServerSessions();
+    clearCachedDaemonCapabilities();
     configureExpectedUserId(null);
     setFileRelayUser(null);
     setServerR2RelayEnabled(false);
@@ -11262,6 +11268,8 @@ function InternalMainApp() {
   };
   const busyDaemonSessionCount = sessions.filter((session) => session.state === 'running' || session.state === 'queued').length;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
+  const hasCachedCapabilities = Boolean(selectedServerId && (readCachedDaemonCapabilities(selectedServerId)?.length ?? 0) > 0);
+  const effectiveDaemonOnline = daemonOnline || (hasCachedCapabilities && (connecting || connected) && isServerOnline(selectedServerInfo));
 
   useEffect(() => {
     if (!auth || !selectedServerId || connected || !isServerOnline(selectedServerInfo)) return;
@@ -11463,7 +11471,7 @@ function InternalMainApp() {
                 ws={wsRef.current}
                 serverId={selectedServerId}
                 serverName={selectedServerInfo?.name}
-                daemonOnline={daemonOnline}
+                daemonOnline={effectiveDaemonOnline}
                 onOpen={openRemoteDesktop}
                 canSetUp={!selectedShareTarget}
               />
@@ -11845,7 +11853,7 @@ function InternalMainApp() {
                     ws={wsRef.current}
                     serverId={selectedServerId}
                     serverName={selectedServerInfo?.name}
-                    daemonOnline={daemonOnline}
+                    daemonOnline={effectiveDaemonOnline}
                     onOpen={openRemoteDesktop}
                     canSetUp={!selectedShareTarget}
                   />
@@ -11973,7 +11981,7 @@ function InternalMainApp() {
                   ws={wsRef.current}
                   serverId={selectedServerId}
                   serverName={selectedServerInfo?.name}
-                  daemonOnline={daemonOnline}
+                  daemonOnline={effectiveDaemonOnline}
                   onOpen={openRemoteDesktop}
                   canSetUp={!selectedShareTarget}
                 />
@@ -11990,7 +11998,7 @@ function InternalMainApp() {
                   ws={wsRef.current}
                   serverId={selectedServerId}
                   serverName={selectedServerInfo?.name}
-                  daemonOnline={daemonOnline}
+                  daemonOnline={effectiveDaemonOnline}
                   onOpen={openRemoteDesktop}
                   canSetUp={!selectedShareTarget}
                 />
@@ -13184,7 +13192,7 @@ function InternalMainApp() {
               sub={sub}
               ws={wsRef.current}
               connected={connected}
-              daemonOnline={daemonOnline}
+              daemonOnline={effectiveDaemonOnline}
               onOpenRemoteDesktop={openRemoteDesktop}
               remoteDesktopCanSetUp={!selectedShareTarget}
               canManageFileShares={canManageServerFileShares}

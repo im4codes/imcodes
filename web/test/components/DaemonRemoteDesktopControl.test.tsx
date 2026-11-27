@@ -82,8 +82,46 @@ const {
 } = await import('@shared/remote-desktop-platform.js');
 const { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } = await import('@shared/remote-desktop-access.js');
 const { DaemonRemoteDesktopControl, RemoteDesktopGlyphIcon } = await import('../../src/components/DaemonRemoteDesktopControl.js');
+const {
+  clearCachedDaemonCapabilities,
+  readCachedDaemonCapabilities,
+  writeCachedDaemonCapabilities,
+} = await import('../../src/daemon-capability-cache.js');
 
 type MessageHandler = (message: Record<string, unknown>) => void;
+
+function createSwitchableWsStub(initialCapabilities: string[] | null) {
+  let currentSnapshot = initialCapabilities ? { capabilities: initialCapabilities } : null;
+  const snapshotListeners = new Set<(s: { capabilities: string[] } | null) => void>();
+  const messageHandlers = new Set<MessageHandler>();
+  const sent: Array<Record<string, unknown>> = [];
+
+  const client = {
+    getDaemonCapabilitySnapshot: () => currentSnapshot,
+    onDaemonCapabilitySnapshot: (listener: (s: { capabilities: string[] } | null) => void) => {
+      snapshotListeners.add(listener);
+      listener(currentSnapshot);
+      return () => { snapshotListeners.delete(listener); };
+    },
+    onMessage: (handler: MessageHandler) => {
+      messageHandlers.add(handler);
+      return () => { messageHandlers.delete(handler); };
+    },
+    send: (message: Record<string, unknown>) => { sent.push(message); },
+  };
+
+  return {
+    client,
+    sent,
+    emitMessage: (message: Record<string, unknown>) => {
+      for (const handler of messageHandlers) handler(message);
+    },
+    emitSnapshot: (capabilities: string[] | null) => {
+      currentSnapshot = capabilities ? { capabilities } : null;
+      for (const listener of snapshotListeners) listener(currentSnapshot);
+    },
+  };
+}
 
 function wsStub(capabilities: string[]) {
   const messageHandlers = new Set<MessageHandler>();
@@ -687,5 +725,172 @@ describe('DaemonRemoteDesktopControl', () => {
       capabilities: [],
       machines: [],
     })).toMatchObject({ target: null, unavailableReason: 'no_server' });
+  });
+
+  describe('server switching, capability caching, and state isolation', () => {
+    beforeEach(() => {
+      clearCachedDaemonCapabilities();
+    });
+
+    it('keeps remote desktop button visible without flash on server switch A -> B -> A when snapshot is initially null', async () => {
+      // 1. Initial visit to Server A: ws connects and reports REMOTE_DESKTOP_CAPABILITY
+      const wsA = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY]);
+      const { container, rerender } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: wsA.client as never,
+        serverId: 'server_A',
+        serverName: 'Server A',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+      }));
+
+      // Server A button is visible and ready
+      expect(container.querySelector('.daemon-remote-desktop-btn')).toBeTruthy();
+
+      // 2. Switch to Server B: initial ws has null snapshot before hello, but server B has cached REMOTE_DESKTOP_INSTALLABLE_CAPABILITY
+      writeCachedDaemonCapabilities('server_B', [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      const wsB = createSwitchableWsStub(null); // null before hello arrives
+      rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: wsB.client as never,
+        serverId: 'server_B',
+        serverName: 'Server B',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+      }));
+
+      // Server B uses cached installable capability immediately without vanishing to null
+      expect(container.querySelector('.daemon-remote-desktop-btn')).toBeTruthy();
+      expect(container.textContent).toContain('remote_desktop.install_worker');
+
+      // Server B hello arrives and confirms capabilities
+      act(() => {
+        wsB.emitSnapshot([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      });
+      expect(container.querySelector('.daemon-remote-desktop-btn')).toBeTruthy();
+
+      // 3. Switch back to Server A: wsA is fresh or reconnected with null snapshot before hello
+      const wsA2 = createSwitchableWsStub(null); // null before hello
+      rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: wsA2.client as never,
+        serverId: 'server_A',
+        serverName: 'Server A',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+      }));
+
+      // Server A button does NOT vanish to null; it immediately restores from cache!
+      const btnA = container.querySelector('.daemon-remote-desktop-btn');
+      expect(btnA).toBeTruthy();
+      expect(btnA?.getAttribute('title')).toBe('remote_desktop.daemon_control');
+
+      // When Server A hello arrives, stays stable
+      act(() => {
+        wsA2.emitSnapshot([REMOTE_DESKTOP_CAPABILITY]);
+      });
+      expect(container.querySelector('.daemon-remote-desktop-btn')).toBeTruthy();
+    });
+
+    it('updates button state and cache when live capabilities change (e.g. revoked or uninstalled)', async () => {
+      // Server was previously cached with REMOTE_DESKTOP_CAPABILITY
+      writeCachedDaemonCapabilities('server_revoked', [REMOTE_DESKTOP_CAPABILITY]);
+      const ws = createSwitchableWsStub(null);
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_revoked',
+        serverName: 'Revoked Host',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+
+      // Initially shows ready button from cache
+      expect(container.querySelector('.daemon-remote-desktop-btn')).toBeTruthy();
+      expect(container.querySelector('.is-setup-required')).toBeNull();
+
+      // Daemon connects and authoritative snapshot reveals capabilities are now empty (uninstalled)
+      act(() => {
+        ws.emitSnapshot([]);
+      });
+
+      // Button converges to is-setup-required and cache is updated
+      expect(container.querySelector('.daemon-remote-desktop-btn.is-setup-required')).toBeTruthy();
+      expect(readCachedDaemonCapabilities('server_revoked')).toEqual([]);
+    });
+
+    it('hides button when daemon is explicitly offline, even if capabilities are cached', () => {
+      writeCachedDaemonCapabilities('server_offline', [REMOTE_DESKTOP_CAPABILITY]);
+      const ws = createSwitchableWsStub([REMOTE_DESKTOP_CAPABILITY]);
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_offline',
+        daemonOnline: false,
+        onOpen: vi.fn(),
+        machines: [],
+      }));
+
+      expect(container.firstChild).toBeNull();
+    });
+
+    it('resets install, loginScreen, and setupOpen state on serverId switch so states do not leak from A to B', async () => {
+      const wsA = createSwitchableWsStub([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      const { container, rerender } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: wsA.client as never,
+        serverId: 'server_A',
+        serverName: 'Server A',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+      }));
+
+      // Trigger install downloading state on Server A
+      const installBtn = container.querySelector('.daemon-remote-desktop-btn')!;
+      fireEvent.click(installBtn);
+      act(() => {
+        wsA.emitMessage({
+          type: REMOTE_DESKTOP_INSTALL_MSG.STATE,
+          state: REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING,
+        });
+      });
+      expect(container.textContent).toContain('remote_desktop.installing');
+
+      // Now switch to Server B
+      const wsB = createSwitchableWsStub([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      rerender(h(DaemonRemoteDesktopControl as never, {
+        ws: wsB.client as never,
+        serverId: 'server_B',
+        serverName: 'Server B',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+      }));
+
+      // Server B must NOT show "installing" from Server A!
+      expect(container.textContent).not.toContain('remote_desktop.installing');
+      expect(container.textContent).toContain('remote_desktop.install_worker');
+    });
+
+    it('clears capability cache on logout preventing cross-account state leakage', () => {
+      writeCachedDaemonCapabilities('server_user1', [REMOTE_DESKTOP_CAPABILITY]);
+      expect(readCachedDaemonCapabilities('server_user1')).toEqual([REMOTE_DESKTOP_CAPABILITY]);
+
+      // Logout called
+      clearCachedDaemonCapabilities();
+      expect(readCachedDaemonCapabilities('server_user1')).toBeNull();
+
+      // Cold mount without live snapshot does not show button for new user
+      const ws = createSwitchableWsStub(null);
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_user1',
+        daemonOnline: true,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: false,
+      }));
+      expect(container.firstChild).toBeNull();
+    });
   });
 });

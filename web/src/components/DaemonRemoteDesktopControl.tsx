@@ -27,6 +27,10 @@ import {
 import { useMachines } from '../hooks/useMachines.js';
 import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
 import { DaemonRemoteDesktopSetup } from './DaemonRemoteDesktopSetup.js';
+import {
+  readCachedDaemonCapabilities,
+  writeCachedDaemonCapabilities,
+} from '../daemon-capability-cache.js';
 
 export interface RemoteDesktopGlyphIconProps {
   size?: number;
@@ -207,7 +211,11 @@ export function DaemonRemoteDesktopControl({
   canSetUp = true,
 }: DaemonRemoteDesktopControlProps) {
   const { t } = useTranslation();
-  const [capabilities, setCapabilities] = useState<readonly string[]>([]);
+  const [capabilities, setCapabilities] = useState<readonly string[]>(() => {
+    const live = ws?.getDaemonCapabilitySnapshot()?.capabilities;
+    if (live) return live;
+    return readCachedDaemonCapabilities(serverId) ?? [];
+  });
   const [install, setInstall] = useState<{ state: RemoteDesktopInstallState; error?: string } | null>(null);
   const [loginScreen, setLoginScreen] = useState<
     { state: RemoteDesktopLoginScreenState; error?: string } | null
@@ -217,15 +225,36 @@ export function DaemonRemoteDesktopControl({
   const machineList = machines ?? sharedMachines.machines;
 
   useEffect(() => {
-    if (!ws) {
+    setInstall(null);
+    setLoginScreen(null);
+    setSetupOpen(false);
+  }, [serverId]);
+
+  useEffect(() => {
+    if (!serverId) {
       setCapabilities([]);
       return;
     }
-    setCapabilities(ws.getDaemonCapabilitySnapshot()?.capabilities ?? []);
+    const live = ws?.getDaemonCapabilitySnapshot();
+    if (live?.capabilities) {
+      setCapabilities(live.capabilities);
+      writeCachedDaemonCapabilities(serverId, live.capabilities);
+    } else {
+      const cached = readCachedDaemonCapabilities(serverId);
+      if (cached !== null) {
+        setCapabilities(cached);
+      } else if (!ws) {
+        setCapabilities([]);
+      }
+    }
+    if (!ws) return;
     return ws.onDaemonCapabilitySnapshot((snapshot) => {
-      setCapabilities(snapshot?.capabilities ?? []);
+      if (snapshot) {
+        setCapabilities(snapshot.capabilities);
+        writeCachedDaemonCapabilities(serverId, snapshot.capabilities);
+      }
     });
-  }, [ws]);
+  }, [ws, serverId]);
 
   useEffect(() => {
     if (!ws) return;

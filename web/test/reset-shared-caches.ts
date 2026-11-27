@@ -25,4 +25,8 @@ export async function resetWebSharedCachesForTests(): Promise<void> {
     const { resetHoverPreviewGateForTests } = await import('../src/hover-preview-gate.js');
     resetHoverPreviewGateForTests();
   } catch { /* optional */ }
+  try {
+    const { __resetDaemonCapabilityCacheForTests } = await import('../src/daemon-capability-cache.js');
+    __resetDaemonCapabilityCacheForTests();
+  } catch { /* optional */ }
 }
