@@ -148,6 +148,7 @@ export function resolveRestrictedSubSessionClick(params: {
   activeTarget: ShareTarget | null;
   activeEntryId: string | null;
   activeCoverageRole?: ShareRole | null;
+  authorizedScopedSubIds?: ReadonlySet<string>;
   subSessionId: string;
   subSessions: readonly SubSession[];
   excludedEntryIds?: ReadonlySet<string>;
@@ -159,6 +160,7 @@ export function resolveRestrictedSubSessionClick(params: {
     activeTarget,
     activeEntryId,
     activeCoverageRole,
+    authorizedScopedSubIds,
     subSessionId,
     subSessions,
     excludedEntryIds,
@@ -180,9 +182,15 @@ export function resolveRestrictedSubSessionClick(params: {
   );
   if (alreadyOnDirectSub) return { action: 'local' };
 
+  const isCoveredByActiveScope = Boolean(
+    authorizedScopedSubIds?.has(subSessionId)
+    && (activeTarget?.kind === 'main' || activeTarget?.kind === 'subsession' || activeTarget?.kind === 'server'),
+  );
   const coveredByMainAtSameOrHigherRole = Boolean(
-    activeTarget?.kind === 'main'
-    && sub?.parentSession === activeTarget.sessionName
+    (isCoveredByActiveScope
+      || (authorizedScopedSubIds === undefined
+        && activeTarget?.kind === 'main'
+        && sub?.parentSession === activeTarget.sessionName))
     && (!directSubEntry || shareRoleRank(directSubEntry.role) <= shareRoleRank(activeRole)),
   );
   if (coveredByMainAtSameOrHigherRole) return { action: 'local' };
@@ -536,6 +544,7 @@ export function buildSharedServerSubSessionStates(params: {
   isOwnedServer: boolean;
   activeTarget: ShareTarget | null;
   activeCoverageRole?: ShareRole | null;
+  authorizedScopedSubIds?: ReadonlySet<string>;
   sharedEntries: readonly SharedEntrySummary[];
   excludedEntryIds?: ReadonlySet<string>;
   subSessions: readonly SubSession[];
@@ -560,16 +569,24 @@ export function buildSharedServerSubSessionStates(params: {
     const grant = bestSubGrants.get(sub.id);
     const isDirectActiveSub = params.activeTarget?.kind === 'subsession'
       && params.activeTarget.subSessionId === sub.id;
-    const isCoveredByActiveMain = params.activeTarget?.kind === 'main'
-      && sub.parentSession === params.activeTarget.sessionName;
+    const isCoveredByActiveScope = Boolean(
+      (params.activeTarget?.kind === 'main' || params.activeTarget?.kind === 'subsession')
+      && (params.authorizedScopedSubIds?.has(sub.id)
+        || (params.authorizedScopedSubIds === undefined
+          && params.activeTarget.kind === 'main'
+          && sub.parentSession === params.activeTarget.sessionName)),
+    );
 
-    if (!grant && !isDirectActiveSub) continue;
+    if (!grant && !isDirectActiveSub && !isCoveredByActiveScope) continue;
 
+    const activeRole = params.activeCoverageRole ?? grant?.role ?? 'viewer';
     let effectiveRole: ShareRole;
     if (isDirectActiveSub) {
-      effectiveRole = params.activeCoverageRole ?? grant?.role ?? 'viewer';
-    } else if (isCoveredByActiveMain) {
-      effectiveRole = params.activeCoverageRole ?? grant?.role ?? 'viewer';
+      effectiveRole = activeRole;
+    } else if (isCoveredByActiveScope) {
+      effectiveRole = grant && shareRoleRank(grant.role) > shareRoleRank(activeRole)
+        ? grant.role
+        : activeRole;
     } else {
       effectiveRole = grant!.role;
     }

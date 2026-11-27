@@ -14812,4 +14812,139 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     });
     expect(screen.getByTestId('session-pane-deck_live_brain').getAttribute('data-share-role')).toBe('viewer');
   }, 20_000);
+
+  it('App merged shared server: opens recursively covered nested subsession M->X->Y read-only without direct grant while keeping out-of-scope subs blocked', async () => {
+    useSubSessionsState.enableReactiveHydrateShared = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const mainM = {
+      id: 'share-main-m', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'viewer', status: 'active',
+      targetLabel: 'Main M', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_m_brain' },
+    } as const;
+    const outEntry = {
+      id: 'share-main-other', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'viewer', status: 'active',
+      targetLabel: 'Other Main', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_other_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([mainM, outEntry]);
+
+    openSharedEntryMock.mockImplementation(async (target: { sessionName?: string }) => {
+      if (target.sessionName === 'deck_other_brain') {
+        return {
+          server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+          target: outEntry.target,
+          coverage: {
+            effectiveRole: 'viewer', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+            coveringShareIds: [outEntry.id], primaryShareId: outEntry.id, authorizedAt: Date.now(),
+          },
+          sessions: [{ sessionName: 'deck_other_brain', title: 'Other Main', state: 'idle', agentType: 'claude-code' }],
+          subSessions: [
+            { subSessionId: 'sub_other', sessionName: 'deck_sub_sub_other', title: 'Other Sub', type: 'shell', parentSessionName: 'deck_other_brain' },
+          ],
+        };
+      }
+      return {
+        server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+        target: mainM.target,
+        coverage: {
+          effectiveRole: 'viewer', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+          coveringShareIds: [mainM.id], primaryShareId: mainM.id, authorizedAt: Date.now(),
+        },
+        sessions: [{ sessionName: 'deck_m_brain', title: 'Main M', state: 'running', agentType: 'claude-code' }],
+        subSessions: [
+          { subSessionId: 'sub_x', sessionName: 'deck_sub_sub_x', title: 'Child X', type: 'shell', parentSessionName: 'deck_m_brain' },
+          { subSessionId: 'sub_y', sessionName: 'deck_sub_sub_y', title: 'Nested Y', type: 'codex-sdk', parentSessionName: 'deck_sub_sub_x' },
+        ],
+      };
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/server/srv-shared/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    // Visit Other Main once to cache sub_other, then revoke outEntry so sub_other is out-of-scope
+    fireEvent.click(await screen.findByTestId('server-icon-srv-shared'));
+    fireEvent.click(await screen.findByText('tabs-select-deck_other_brain'));
+    await waitFor(() => expect(screen.getByText('tree-select-sub-sub_other')).toBeTruthy());
+
+    // Revoke outEntry on refresh and switch to Main M (returns X under M and nested Y under deck_sub_sub_x)
+    discoverSharedEntriesMock.mockResolvedValue([mainM]);
+    fireEvent.click(screen.getByTitle('share.sharedWithMe.refresh'));
+    await waitFor(() => expect(screen.queryByText('tabs-select-deck_other_brain')).toBeNull());
+    fireEvent.click(screen.getByText('tabs-select-deck_m_brain'));
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_m_brain?shared=share-main-m'));
+
+    // Nested Y has parent deck_sub_sub_x (not in visibleMainSessions), so it appears in direct-shared group AND SubSessionBar
+    expect(await screen.findByText('tree-direct-sub-sub_y')).toBeTruthy();
+    expect(screen.queryByText('tree-select-sub-sub_other')).toBeNull();
+
+    // Clicking nested Y opens SubSessionWindow locally without another /shares/open call and locks role to viewer
+    const openCountBeforeY = openSharedEntryMock.mock.calls.length;
+    fireEvent.click(screen.getByText('tree-direct-sub-sub_y'));
+    const yWin = await screen.findByTestId('sub-session-window-sub_y');
+    expect(yWin.getAttribute('data-share-role')).toBe('viewer');
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(openCountBeforeY);
+
+    // Maximizing nested Y also works smoothly
+    fireEvent.click(screen.getByText('subbar-open-max-sub_y'));
+    await waitFor(() => expect(screen.getByTestId('sub-session-window-sub_y').getAttribute('data-maximized')).toBe('true'));
+  }, 20_000);
+
+  it('App merged shared server: downgrades /open participant to viewer when ticket snapshot role is viewer', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const entry = {
+      id: 'share-ticket-down', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'participant', status: 'active',
+      targetLabel: 'Ticket Down', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_t_brain' },
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([entry]);
+    openSharedEntryMock.mockResolvedValue({
+      server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+      target: entry.target,
+      coverage: {
+        effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+        coveringShareIds: [entry.id], primaryShareId: entry.id, authorizedAt: Date.now(),
+      },
+      sessions: [{ sessionName: 'deck_t_brain', title: 'Ticket Down', state: 'running', agentType: 'claude-code' }],
+      subSessions: [],
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/server/srv-shared/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    fireEvent.click(await screen.findByTestId('server-icon-srv-shared'));
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_t_brain?shared=share-ticket-down'));
+    expect(screen.getByTestId('session-pane-deck_t_brain').getAttribute('data-share-role')).toBe('participant');
+
+    // WsClient delivers share-ticket-snapshot from /api/shares/ws-ticket claims on socket open/reconnect
+    await waitFor(() => expect(wsInstances.at(-1)?.options?.shareTarget).toEqual(entry.target));
+    const ws = wsInstances.at(-1)!;
+    await act(async () => {
+      ws.emit({
+        type: 'share.role_changed',
+        reason: 'share-ticket-snapshot',
+        effectiveRole: 'viewer',
+        target: entry.target,
+      });
+    });
+    expect(screen.getByTestId('session-pane-deck_t_brain').getAttribute('data-share-role')).toBe('viewer');
+  }, 20_000);
 });

@@ -32,8 +32,14 @@ import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '@shared/codex-credit-history.js';
-import type { ShareDenialReason, SharedActorEnvelope } from '@shared/tab-sharing.js';
+import type {
+  ShareAuthorizationSnapshot,
+  ShareDenialReason,
+  ShareScopedTicketClaims,
+  SharedActorEnvelope,
+} from '@shared/tab-sharing.js';
 import type { ShareRole, ShareTarget } from './tab-sharing-ui.js';
+import { shareTargetsEqual } from './shared-server-tabs.js';
 import {
   SESSION_GROUP_CLONE_MSG,
   type SessionGroupCloneCancelRequest,
@@ -567,6 +573,7 @@ export class WsClient {
   private baseUrl: string;
   private serverId: string;
   private shareTarget: ShareTarget | null;
+  private shareCoverageSnapshot: ShareAuthorizationSnapshot | null = null;
   private _connected = false;
   /**
    * Terminal keystrokes awaiting an OPEN socket. Terminal input is the one
@@ -806,7 +813,12 @@ export class WsClient {
     }
     this._connected = false;
     this._probePending = false;
+    this.shareCoverageSnapshot = null;
     this.setDaemonCapabilitySnapshot(null);
+  }
+
+  getShareCoverageSnapshot(): ShareAuthorizationSnapshot | null {
+    return this.shareCoverageSnapshot;
   }
 
   send(msg: object): void {
@@ -2404,6 +2416,7 @@ export class WsClient {
 
     // Get a short-lived ws-ticket before connecting.
     let ticket: string;
+    let pendingShareSnapshot: ShareAuthorizationSnapshot | null = null;
     const ticketAbort = new AbortController();
     this.wsTicketAbort = ticketAbort;
     let ticketTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2415,9 +2428,9 @@ export class WsClient {
         }, WS_TICKET_TIMEOUT_MS);
         this.wsTicketTimer = ticketTimer;
       });
-      const data = await Promise.race([
+      const data = await Promise.race<{ ticket: string; claims?: ShareScopedTicketClaims }>([
         this.shareTarget
-          ? apiFetch<{ ticket: string }>('/api/shares/ws-ticket', {
+          ? apiFetch<{ ticket: string; claims?: ShareScopedTicketClaims }>('/api/shares/ws-ticket', {
             method: 'POST',
             body: JSON.stringify({ target: this.shareTarget }),
             signal: ticketAbort.signal,
@@ -2430,6 +2443,18 @@ export class WsClient {
         ticketTimeout,
       ]);
       ticket = data.ticket;
+      if (this.shareTarget && data.claims) {
+        const claims = data.claims;
+        const snap = claims.snapshot;
+        if (
+          claims.serverId === this.serverId
+          && snap
+          && shareTargetsEqual(snap.target, this.shareTarget)
+          && (snap.effectiveRole === 'viewer' || snap.effectiveRole === 'participant')
+        ) {
+          pendingShareSnapshot = snap;
+        }
+      }
     } catch (err) {
       if (generation !== this.socketGeneration) return;
       this._connecting = false;
@@ -2497,6 +2522,15 @@ export class WsClient {
       // been rebuilt — the remembered size is no longer known-applied.
       this.lastSentResize.clear();
       this.replayAllSubscriptionsForNewSocket();
+      this.shareCoverageSnapshot = pendingShareSnapshot;
+      if (pendingShareSnapshot) {
+        this.dispatch({
+          type: 'share.role_changed',
+          reason: 'share-ticket-snapshot',
+          effectiveRole: pendingShareSnapshot.effectiveRole,
+          target: pendingShareSnapshot.target,
+        });
+      }
       this.dispatch({
         type: 'session.event',
         event: 'connected',

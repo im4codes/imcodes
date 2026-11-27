@@ -3943,4 +3943,183 @@ describe('WsClient', () => {
       }
     });
   });
+
+  describe('share ticket coverage snapshot', () => {
+    it('emits authoritative viewer role from /api/shares/ws-ticket claims on initial open and reconnect', async () => {
+      vi.useFakeTimers();
+      try {
+        const target = { kind: 'main' as const, serverId: 'srv-1', sessionName: 'deck_shared_brain' };
+        let ticketIndex = 0;
+        const responses = [
+          {
+            ticket: 't-init-viewer',
+            claims: {
+              type: 'share-ws-ticket',
+              sub: 'user-2',
+              jti: 'jti-1',
+              serverId: 'srv-1',
+              target,
+              snapshot: {
+                target,
+                effectiveRole: 'viewer',
+                historyCutoffAt: 0,
+                nextCoverageRecheckAt: null,
+                coveringShareIds: ['s-viewer'],
+                primaryShareId: 's-viewer',
+                authorizedAt: 1000,
+              },
+              issuedAt: 1000,
+              expiresAt: 31_000,
+            },
+          },
+          {
+            ticket: 't-reconnect-participant',
+            claims: {
+              type: 'share-ws-ticket',
+              sub: 'user-2',
+              jti: 'jti-2',
+              serverId: 'srv-1',
+              target,
+              snapshot: {
+                target,
+                effectiveRole: 'participant',
+                historyCutoffAt: 0,
+                nextCoverageRecheckAt: null,
+                coveringShareIds: ['s-part'],
+                primaryShareId: 's-part',
+                authorizedAt: 2000,
+              },
+              issuedAt: 2000,
+              expiresAt: 32_000,
+            },
+          },
+          {
+            ticket: 't-reconnect-downgraded-viewer',
+            claims: {
+              type: 'share-ws-ticket',
+              sub: 'user-2',
+              jti: 'jti-3',
+              serverId: 'srv-1',
+              target,
+              snapshot: {
+                target,
+                effectiveRole: 'viewer',
+                historyCutoffAt: 0,
+                nextCoverageRecheckAt: null,
+                coveringShareIds: ['s-viewer'],
+                primaryShareId: 's-viewer',
+                authorizedAt: 3000,
+              },
+              issuedAt: 3000,
+              expiresAt: 33_000,
+            },
+          },
+        ];
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async () => ({
+            ok: true,
+            json: async () => responses[Math.min(ticketIndex++, responses.length - 1)],
+          })),
+        );
+
+        const client = new WsClient('http://localhost:8787', 'srv-1', { shareTarget: target });
+        const roleEvents: Array<{ reason?: string; effectiveRole: string; target: unknown }> = [];
+        client.onMessage((msg) => {
+          if (msg.type === 'share.role_changed') {
+            roleEvents.push({ reason: msg.reason, effectiveRole: msg.effectiveRole, target: msg.target });
+          }
+        });
+
+        client.connect();
+        await vi.advanceTimersByTimeAsync(0);
+        const sock1 = lastWs!;
+        sock1.emit('open');
+        expect(client.getShareCoverageSnapshot()?.effectiveRole).toBe('viewer');
+        expect(roleEvents).toHaveLength(1);
+        expect(roleEvents[0]).toMatchObject({ reason: 'share-ticket-snapshot', effectiveRole: 'viewer', target });
+
+        // Reconnect #1 gets participant ticket -> open emits participant
+        sock1.emit('close', { code: 1006, reason: 'drop-1' });
+        await vi.advanceTimersByTimeAsync(2_000);
+        const sock2 = lastWs!;
+        expect(sock2).not.toBe(sock1);
+        sock2.emit('open');
+        expect(client.getShareCoverageSnapshot()?.effectiveRole).toBe('participant');
+        expect(roleEvents[1]).toMatchObject({ reason: 'share-ticket-snapshot', effectiveRole: 'participant', target });
+
+        // Reconnect #2 during participant->viewer downgrade gets viewer ticket -> emits viewer even without WsBridge share.role_changed
+        sock2.emit('close', { code: 1006, reason: 'drop-2' });
+        await vi.advanceTimersByTimeAsync(2_000);
+        const sock3 = lastWs!;
+        expect(sock3).not.toBe(sock2);
+        sock3.emit('open');
+        expect(client.getShareCoverageSnapshot()?.effectiveRole).toBe('viewer');
+        expect(roleEvents[2]).toMatchObject({ reason: 'share-ticket-snapshot', effectiveRole: 'viewer', target });
+
+        client.disconnect();
+        expect(client.getShareCoverageSnapshot()).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('ignores mismatched or legacy ws-ticket responses lacking matching claims.snapshot', async () => {
+      vi.useFakeTimers();
+      try {
+        const target = { kind: 'main' as const, serverId: 'srv-1', sessionName: 'deck_shared_brain' };
+        let call = 0;
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async () => ({
+            ok: true,
+            json: async () => (call++ === 0
+              ? { ticket: 't-legacy' }
+              : {
+                  ticket: 't-mismatch',
+                  claims: {
+                    type: 'share-ws-ticket',
+                    sub: 'user-2',
+                    jti: 'jti-x',
+                    serverId: 'srv-other',
+                    target: { kind: 'main', serverId: 'srv-other', sessionName: 'deck_shared_brain' },
+                    snapshot: {
+                      target: { kind: 'main', serverId: 'srv-other', sessionName: 'deck_shared_brain' },
+                      effectiveRole: 'participant',
+                      historyCutoffAt: 0,
+                      nextCoverageRecheckAt: null,
+                      coveringShareIds: ['s-x'],
+                      primaryShareId: 's-x',
+                      authorizedAt: 1000,
+                    },
+                    issuedAt: 1000,
+                    expiresAt: 31_000,
+                  },
+                }),
+          })),
+        );
+
+        const client = new WsClient('http://localhost:8787', 'srv-1', { shareTarget: target });
+        const roleEvents: unknown[] = [];
+        client.onMessage((msg) => {
+          if (msg.type === 'share.role_changed') roleEvents.push(msg);
+        });
+
+        client.connect();
+        await vi.advanceTimersByTimeAsync(0);
+        lastWs!.emit('open');
+        expect(client.getShareCoverageSnapshot()).toBeNull();
+        expect(roleEvents).toEqual([]);
+
+        lastWs!.emit('close', { code: 1006, reason: 'drop' });
+        await vi.advanceTimersByTimeAsync(2_000);
+        lastWs!.emit('open');
+        expect(client.getShareCoverageSnapshot()).toBeNull();
+        expect(roleEvents).toEqual([]);
+        client.disconnect();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });

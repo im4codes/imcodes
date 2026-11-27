@@ -470,8 +470,53 @@ describe('shared-server-tabs projection & routing', () => {
       isOwnedServer: false,
       activeTarget: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_projC_brain' },
       activeEntryId: 'g-c',
+      authorizedScopedSubIds: new Set(),
       subSessionId: 'subStale',
       subSessions: [makeSubSession('subStale', 'deck_projA_brain')],
     })).toEqual({ action: 'none' });
+
+    // Counterexample (Round 3 P0 #1): recursively covered nested subsession M -> X -> Y
+    // without a direct grant opens locally and inherits activeCoverageRole
+    const subX = makeSubSession('subX', 'deck_projC_brain');
+    const subY = makeSubSession('subY', 'deck_sub_subX');
+    const subOutside = makeSubSession('subOutside', 'deck_sub_other');
+    const scopedIds = new Set(['subX', 'subY']);
+    expect(resolveRestrictedSubSessionClick({
+      entries: [entryC],
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_projC_brain' },
+      activeEntryId: 'g-c',
+      activeCoverageRole: 'viewer',
+      authorizedScopedSubIds: scopedIds,
+      subSessionId: 'subY',
+      subSessions: [subX, subY, subOutside],
+    })).toEqual({ action: 'local' });
+
+    expect(resolveRestrictedSubSessionClick({
+      entries: [entryC],
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_projC_brain' },
+      activeEntryId: 'g-c',
+      activeCoverageRole: 'viewer',
+      authorizedScopedSubIds: scopedIds,
+      subSessionId: 'subOutside',
+      subSessions: [subX, subY, subOutside],
+    })).toEqual({ action: 'none' });
+
+    const nestedStates = buildSharedServerSubSessionStates({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_projC_brain' },
+      activeCoverageRole: 'viewer',
+      authorizedScopedSubIds: scopedIds,
+      sharedEntries: [entryC],
+      subSessions: [subX, subY, subOutside],
+      baseStates: new Map(),
+      activeDispatchIds: new Map(),
+    });
+    expect(nestedStates.get('subY')?.effectiveRole).toBe('viewer');
+    expect(nestedStates.has('subOutside')).toBe(false);
   });
 });

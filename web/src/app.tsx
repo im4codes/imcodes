@@ -1424,6 +1424,10 @@ function InternalMainApp() {
   deniedSharedEntryIdsRef.current = deniedSharedEntryIds;
   const observedActiveSharedEntryIdsRef = useRef<Set<string>>(new Set());
   const observedSharedEntriesByIdRef = useRef<Map<string, SharedEntrySummary>>(new Map());
+  const [authorizedScopedSubState, setAuthorizedScopedSubState] = useState<{
+    targetKey: string | null;
+    ids: ReadonlySet<string>;
+  }>(() => ({ targetKey: null, ids: new Set() }));
   const [sharedHashRestorePending, setSharedHashRestorePending] = useState(
     () => Boolean(initialHashStateRef.current.serverId),
   );
@@ -1501,6 +1505,19 @@ function InternalMainApp() {
   }, [activeSharedEntryConfirmedRevoked, deniedSharedEntryIds, selectedServerId, selectedShareTarget, sharedEntries, sharedEntriesLoaded]);
   const revokedSharedTargetsForServerRef = useRef(revokedSharedTargetsForServer);
   revokedSharedTargetsForServerRef.current = revokedSharedTargetsForServer;
+  const scopedAuthorizedSubIds = useMemo<ReadonlySet<string>>(() => {
+    const activeTargetKey = selectedShareTarget ? shareTargetKey(selectedShareTarget) : null;
+    if (!activeTargetKey || authorizedScopedSubState.targetKey !== activeTargetKey) {
+      return new Set<string>();
+    }
+    const next = new Set<string>();
+    for (const id of authorizedScopedSubState.ids) {
+      if (!revokedSharedTargetsForServer.revokedSubSessionIds.has(id)) next.add(id);
+    }
+    return next;
+  }, [authorizedScopedSubState, revokedSharedTargetsForServer.revokedSubSessionIds, selectedShareTarget]);
+  const scopedAuthorizedSubIdsRef = useRef<ReadonlySet<string>>(scopedAuthorizedSubIds);
+  scopedAuthorizedSubIdsRef.current = scopedAuthorizedSubIds;
   const [presenceTick, setPresenceTick] = useState(0);
   const [openingSharedEntryId, setOpeningSharedEntryId] = useState<string | null>(null);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -4007,6 +4024,7 @@ function InternalMainApp() {
       activeTarget: selectedShareTargetRef.current,
       activeEntryId: selectedSharedEntryIdRef.current,
       activeCoverageRole: selectedShareCoverageRoleRef.current,
+      authorizedScopedSubIds: scopedAuthorizedSubIdsRef.current,
       subSessionId: id,
       subSessions: mergedSubSessionsRef.current,
       excludedEntryIds: deniedSharedEntryIdsRef.current,
@@ -5208,13 +5226,14 @@ function InternalMainApp() {
       isOwnedServer: ownedServerIdsRef.current.has(selectedServerId),
       activeTarget: selectedShareTarget,
       activeCoverageRole: selectedShareCoverageRole,
+      authorizedScopedSubIds: scopedAuthorizedSubIds,
       sharedEntries,
       excludedEntryIds: deniedSharedEntryIds,
       subSessions: mergedSubSessions,
       baseStates: states,
       activeDispatchIds: sharedActiveDispatchIds,
     });
-  }, [deniedSharedEntryIds, managedSharedSessionStateByName, managedSharedStateByTarget, mergedSubSessions, selectedServerId, selectedServerSharedOutState, selectedShareCoverageRole, selectedShareTarget, sharedActiveDispatchIds, sharedEntries]);
+  }, [deniedSharedEntryIds, managedSharedSessionStateByName, managedSharedStateByTarget, mergedSubSessions, scopedAuthorizedSubIds, selectedServerId, selectedServerSharedOutState, selectedShareCoverageRole, selectedShareTarget, sharedActiveDispatchIds, sharedEntries]);
 
   const resetServerScopedOverlaysAndTargets = useCallback((preservePendingNavForServerId?: string | null) => {
     askAnswerTrackerRef.current?.dispose();
@@ -5466,6 +5485,10 @@ function InternalMainApp() {
       wsAuthoritativeServerEpochRef.current = null;
       setSelectedShareTarget(opened.target);
       setSelectedShareCoverageRole(opened.coverage.effectiveRole);
+      setAuthorizedScopedSubState({
+        targetKey: shareTargetKey(opened.target),
+        ids: new Set(opened.subSessions.map((sub) => sub.subSessionId)),
+      });
       setSelectedSharedEntryId(entry.id);
       lastSharedEntryIdByServerRef.current.set(opened.server.id, entry.id);
       rememberSharedTab(entry);
@@ -6368,6 +6391,7 @@ function InternalMainApp() {
           && shareTargetsEqual(incomingTarget, currentTarget)
           && (nextRole === 'viewer' || nextRole === 'participant')
         ) {
+          const roleChanged = selectedShareCoverageRoleRef.current !== nextRole;
           selectedShareCoverageRoleRef.current = nextRole;
           setSelectedShareCoverageRole(nextRole);
           if (currentTarget.kind === 'server' || currentTarget.kind === 'main') {
@@ -6391,7 +6415,9 @@ function InternalMainApp() {
               }
             }
           }
-          void refreshSharedEntries({ silent: true });
+          if (roleChanged) {
+            void refreshSharedEntries({ silent: true });
+          }
         }
       }
       if (msg.type === 'timeline.event' && msg.event.type === 'user.message') {
@@ -6417,6 +6443,12 @@ function InternalMainApp() {
           ? m.id
           : (rawSession.startsWith('deck_sub_') ? rawSession.slice('deck_sub_'.length) : '');
         if (removedId) {
+          setAuthorizedScopedSubState((prev) => {
+            if (!prev.ids.has(removedId)) return prev;
+            const next = new Set(prev.ids);
+            next.delete(removedId);
+            return { ...prev, ids: next };
+          });
           if (selectedServerId) {
             for (const [key, ids] of incognitoOpenSubWindowsRef.current) {
               if (key.startsWith(`${selectedServerId}:`)) {
@@ -7038,6 +7070,22 @@ function InternalMainApp() {
         const items = msg.type === SUBSESSION_CREATED_BATCH_MSG
           ? (Array.isArray(msg.items) ? msg.items : [])
           : [msg];
+        const activeTarget = selectedShareTargetRef.current;
+        const activeTargetKey = activeTarget ? shareTargetKey(activeTarget) : null;
+        if (activeTargetKey) {
+          const createdIds = items
+            .map((item) => (typeof item.id === 'string' ? item.id : ''))
+            .filter(Boolean);
+          if (createdIds.length > 0) {
+            setAuthorizedScopedSubState((prev) => {
+              if (prev.targetKey !== activeTargetKey) return prev;
+              if (createdIds.every((id) => prev.ids.has(id))) return prev;
+              const next = new Set(prev.ids);
+              for (const id of createdIds) next.add(id);
+              return { ...prev, ids: next };
+            });
+          }
+        }
         for (const item of items) {
           if (isIncognitoSession(item)) continue;
           watchProjectionStore.addSubSession({
