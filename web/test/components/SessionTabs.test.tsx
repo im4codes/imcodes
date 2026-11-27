@@ -1392,4 +1392,84 @@ describe('SessionTabs', () => {
     expect(activeDotD?.getAttribute('title')).toBe('Disconnected');
     expect(activeDotD?.querySelector('.tab-latency')).toBeNull();
   });
+
+  it('enforces min-width not less than 5 characters on .tab and positions inactive idle dot at bottom-right corner', () => {
+    const cssText = readTabStyles();
+
+    // 1. .tab min-width at least 5ch plus padding and centered content
+    const tabRule = cssText.match(/(?:^|\n)\.tab\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(tabRule).toContain('min-width: calc(5ch + 30px)');
+    expect(tabRule).toContain('justify-content: center');
+
+    // 2. Inactive idle dot (.tab.idle:not(.active)::after) must be positioned absolute bottom-right
+    const idleDotRule = cssText.match(/(?:^|\n)\.tab\.idle:not\(\.active\)::after\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(idleDotRule).toContain("content: '●'");
+    expect(idleDotRule).toContain('position: absolute');
+    expect(idleDotRule).toMatch(/bottom:\s*1px/);
+    expect(idleDotRule).toMatch(/right:\s*2px/);
+    expect(idleDotRule).toContain('pointer-events: none');
+    expect(idleDotRule).toContain('margin: 0');
+    expect(idleDotRule).toContain('line-height: 1');
+    expect(idleDotRule).toContain('z-index: 3');
+    expect(idleDotRule).not.toContain('margin-left');
+
+    // 3. Legacy unconstrained .tab.idle::after must not exist (avoiding double-dot on active idle tabs)
+    const legacyIdleRule = cssText.match(/(?:^|\n)\.tab\.idle::after\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(legacyIdleRule).toBe('');
+
+    // 4. Busy spinner continues to use rotating icon
+    const busyRule = cssText.match(/(?:^|\n)\.tab\.busy::after\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(busyRule).toContain("content: '◌'");
+    expect(busyRule).toContain('animation: spin');
+
+    // 5. Android platform rules for inactive idle dot
+    const androidIdleRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab\.idle:not\(\.active\)::after\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(androidIdleRule).toMatch(/bottom:\s*1px/);
+    expect(androidIdleRule).toMatch(/right:\s*2px/);
+    expect(androidIdleRule).toContain('font-size: 6px');
+
+    // 6. Render test with short labels, active idle, inactive idle, and busy
+    const sessions = makeSessions([
+      { name: 'sess_short_active', label: 'cd', state: 'idle' },
+      { name: 'sess_short_inactive', label: 'sh', state: 'idle' },
+      { name: 'sess_busy', label: 'worker', state: 'running' },
+    ]);
+    const onSelect = vi.fn();
+    render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="sess_short_active"
+        connected={true}
+        latencyMs={23}
+        onSelect={onSelect}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+
+    const tabs = screen.getAllByRole('tab');
+    expect(tabs).toHaveLength(3);
+
+    // Tab 1: Active + idle
+    expect(tabs[0].className).toContain('tab');
+    expect(tabs[0].className).toContain('active');
+    expect(tabs[0].className).toContain('idle');
+    expect(tabs[0].querySelector('.tab-ws-dot')).not.toBeNull();
+    expect(tabs[0].querySelector('.tab-ws-dot')?.textContent).toContain('23ms');
+
+    // Tab 2: Inactive + idle (CSS ::after renders green dot, DOM must NOT have .tab-ws-dot)
+    expect(tabs[1].className).toContain('tab');
+    expect(tabs[1].className).not.toContain('active');
+    expect(tabs[1].className).toContain('idle');
+    expect(tabs[1].querySelector('.tab-ws-dot')).toBeNull();
+
+    // Tab 3: Inactive + busy
+    expect(tabs[2].className).toContain('tab');
+    expect(tabs[2].className).toContain('busy');
+    expect(tabs[2].querySelector('.tab-ws-dot')).toBeNull();
+
+    // Clicking inactive tab selects it cleanly
+    fireEvent.click(tabs[1]);
+    expect(onSelect).toHaveBeenCalledWith('sess_short_inactive');
+  });
 });
