@@ -8,6 +8,7 @@ import {
   flushStore,
   getSession,
   loadStore,
+  markSessionStoreAuthoritative,
   resetIdentityBackupCleanupForTests,
   resetSessionStoreAuthorityForTests,
   setSessionStoreBackupIntervalMsForTests,
@@ -206,6 +207,22 @@ describe('hookCredential storage and sessions.json isolation', () => {
     // Unclaimed local CLI & legacy credential-less process session compatibility remain intact.
     expect(hookClaimAllowed(undefined, {})).toBe(true);
     expect(hookClaimAllowed('deck_p_legacy_nocred', {})).toBe(true);
+
+    // F1-R2: Marking authoritative preserves non-enumerable transport credentials across BOTH
+    // default loadStore() reloads AND direct/spread upsertSession calls on the loaded record,
+    // while explicit `hookCredential: undefined` still clears it.
+    markSessionStoreAuthoritative();
+    const hydratedLoaded = getSession('deck_t_brain')!;
+    upsertSession(hydratedLoaded);
+    expect(getSession('deck_t_brain')?.hookCredential).toBe(reloadedCred);
+    upsertSession({ ...getSession('deck_t_brain')!, state: 'running' });
+    expect(getSession('deck_t_brain')?.hookCredential).toBe(reloadedCred);
+    await loadStore();
+    expect(getSession('deck_t_brain')?.hookCredential).toBe(reloadedCred);
+    expect(hookClaimAllowed('deck_t_brain', { [HOOK_SESSION_CREDENTIAL_HEADER]: reloadedCred! })).toBe(true);
+
+    upsertSession({ ...getSession('deck_t_brain')!, hookCredential: undefined });
+    expect(getSession('deck_t_brain')?.hookCredential).toBeUndefined();
 
     // Process sessions retain daemon-restart continuity.
     expect(getSession('deck_p_w1')?.hookCredential).toBe(processCred);
@@ -665,5 +682,123 @@ describe('hookCredential storage and sessions.json isolation', () => {
     expect(persistedSessions(home)['deck_mig_t']).not.toHaveProperty('hookCredential');
     expect(persistedSessions(home)['deck_mig_p']?.['hookCredential']).toBe('mig-p-secret');
     expect(readFileSync(join(dir, 'sessions.json'), 'utf8')).not.toContain('hookCredential');
+  });
+
+  it('physically compacts a legitimately empty pre-upgrade DB and snapshot with deleted bytes (F3-R2) and blocks uncertified snapshot publication', async () => {
+    const emptyDbCanary = 'f3r2-empty-db-deleted-secret-canary-9876';
+    const emptyBakCanary = 'f3r2-empty-bak-deleted-secret-canary-6543';
+    const dbPath = sessionDbPathForHome(home);
+
+    // Simulate a pre-upgrade DB (secure_delete=0 default) where rows were inserted, deleted,
+    // WAL checkpointed and truncated, and closed cleanly: rows=0, walBytes=0, mainContainsCanary=true, marker=null.
+    const oldDb = openSessionDbForWrite(dbPath);
+    try {
+      commitSessionChanges(oldDb, {
+        upserts: [{
+          name: 'deck_f3r2_gone',
+          projectName: 'realproj',
+          parentSession: null,
+          agentType: 'codex-sdk',
+          state: 'idle',
+          updatedAt: 1,
+          payload: JSON.stringify(record('deck_f3r2_gone', { runtimeType: 'transport', hookCredential: emptyDbCanary })),
+        }],
+        deletes: [],
+        allowEmpty: true,
+      });
+      commitSessionChanges(oldDb, { upserts: [], deletes: ['deck_f3r2_gone'], allowEmpty: true });
+      markLegacyImportDone(oldDb);
+      oldDb.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } finally {
+      closeSessionDb(oldDb);
+    }
+    expect(existsSync(`${dbPath}-wal`)).toBe(false);
+    expect(readFileSync(dbPath).toString('latin1')).toContain(emptyDbCanary);
+
+    // Also plant an empty legacy .bak.1 with deleted canary bytes in main free pages (rows=0, walBytes=0).
+    const bakPath = `${dbPath}.bak.1`;
+    const oldBak = openSessionDbForWrite(bakPath);
+    try {
+      commitSessionChanges(oldBak, {
+        upserts: [{
+          name: 'deck_f3r2_bak_gone',
+          projectName: 'realproj',
+          parentSession: null,
+          agentType: 'codex-sdk',
+          state: 'idle',
+          updatedAt: 1,
+          payload: JSON.stringify(record('deck_f3r2_bak_gone', { runtimeType: 'transport', hookCredential: emptyBakCanary })),
+        }],
+        deletes: [],
+        allowEmpty: true,
+      });
+      commitSessionChanges(oldBak, { upserts: [], deletes: ['deck_f3r2_bak_gone'], allowEmpty: true });
+      oldBak.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } finally {
+      closeSessionDb(oldBak);
+    }
+    expect(existsSync(`${bakPath}-wal`)).toBe(false);
+    expect(readFileSync(bakPath).toString('latin1')).toContain(emptyBakCanary);
+
+    // Prevent restoreFromDatabaseSnapshot from triggering because oldBak is also 0 rows;
+    // loadStore must compact BOTH the empty live DB and empty legacy .bak.1 and set SCRUB_DONE.
+    await freshStore();
+    await waitForCredentialBackupCleanupForTests();
+
+    const reader = openSessionDbReadOnly(dbPath)!;
+    try {
+      expect(readSessionDbMeta(reader, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB)).toBe('done');
+    } finally {
+      closeSessionDb(reader);
+    }
+    expect(dbStateBytes(dbPath)).not.toContain(emptyDbCanary);
+    expect(dbStateBytes(bakPath)).not.toContain(emptyBakCanary);
+
+    // F3-R2 part 2: Never publish physical snapshots while credential cleanup is uncertified (VACUUM/checkpoint blocked).
+    await rm(bakPath, { force: true });
+    const pinHandle = openSessionDbForWrite(dbPath);
+    try {
+      commitSessionChanges(pinHandle, {
+        upserts: [{
+          name: 'deck_f3r2_active_t',
+          projectName: 'realproj',
+          parentSession: null,
+          agentType: 'codex-sdk',
+          state: 'idle',
+          updatedAt: 1,
+          payload: JSON.stringify(record('deck_f3r2_active_t', { runtimeType: 'transport', hookCredential: emptyDbCanary })),
+        }],
+        deletes: [],
+        allowEmpty: true,
+      });
+      pinHandle.db.prepare('DELETE FROM session_store_meta WHERE key = ?').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB);
+      pinHandle.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    } finally {
+      closeSessionDb(pinHandle);
+    }
+
+    // Hold a read transaction so startup scrub stays at vacuum_pending.
+    const blocker = openSessionDbReadOnly(dbPath)!;
+    blocker.db.exec('BEGIN');
+    blocker.db.prepare('SELECT count(*) AS n FROM sessions').get();
+    try {
+      await freshStore();
+      setSessionStoreBackupIntervalMsForTests(0);
+      upsertSession(record('deck_f3r2_p_new', { role: 'w1', agentType: 'claude-code', hookCredential: 'keep-f3r2-proc', updatedAt: 50 }));
+      await flushStore();
+      await waitForSessionStoreSnapshotForTests();
+      // Still pinned -> uncertified -> snapshot must NOT be published!
+      expect(existsSync(bakPath)).toBe(false);
+    } finally {
+      blocker.db.exec('COMMIT');
+      closeSessionDb(blocker);
+    }
+
+    // Once reader releases WAL, next flush certifies SCRUB_DONE and publishes a clean 0600 snapshot.
+    upsertSession(record('deck_f3r2_p_new', { role: 'w1', agentType: 'claude-code', hookCredential: 'keep-f3r2-proc', updatedAt: 51 }));
+    await flushStore();
+    await waitForSessionStoreSnapshotForTests();
+    expect(existsSync(bakPath)).toBe(true);
+    expect(dbStateBytes(bakPath)).not.toContain(emptyDbCanary);
   });
 });

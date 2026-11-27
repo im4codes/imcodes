@@ -112,7 +112,7 @@ async function readSessionRecordForHome(
   sessionName: string,
 ): Promise<Pick<SessionRecord, 'state' | 'sessionInstanceId' | 'runtimeEpoch'> | undefined> {
   if (homeDir === imcodesStateDir(process.env)) {
-    await loadStore();
+    await loadStore({ probe: false });
     return getSession(sessionName);
   }
   const dbFile = join(homeDir, SESSION_DB_FILE);

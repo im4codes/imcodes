@@ -11,6 +11,7 @@ import { closeHookServer, startHookServer } from '../../src/daemon/hook-server.j
 import { MEMORY_MCP_HTTP_PATH } from '../../src/daemon/memory-mcp-http.js';
 import { HOOK_SESSION_CREDENTIAL_ENV, HOOK_SESSION_CREDENTIAL_HEADER } from '../../shared/hook-session-credential.js';
 import { hookClaimAllowed } from '../../src/daemon/hook-session-credential.js';
+import { createResourceOwnerHookWithEpochRefresh } from '../../src/daemon/shared-machine-authority.js';
 import {
   launchTransportSession,
   restoreTransportSessions,
@@ -221,6 +222,68 @@ describe('Codex transport launch/restore HTTP MCP credential binding', () => {
       requestInit: { headers: rebootedEntry.http_headers },
     }));
     await expect(clientRebooted.callTool({ name: 'search_memory', arguments: { query: 'rebooted' } }))
+      .resolves.toMatchObject({ structuredContent: { status: 'ok', session: 'deck_codexcred_brain' } });
+
+    // F1-R2: In an authoritative daemon, an in-process loadStore() (e.g. via createResourceOwnerHookWithEpochRefresh)
+    // must NOT overwrite live memory or rotate transport hookCredentials, and existing HTTP MCP clients stay valid.
+    store.markSessionStoreAuthoritative();
+    const loadedForUpsert = store.getSession('deck_codexcred_brain')!;
+    // Direct upsert of the hydrated/live record AND spread upsert both preserve hookCredential.
+    store.upsertSession(loadedForUpsert);
+    expect(store.getSession('deck_codexcred_brain')?.hookCredential).toBe(preRestoreCred);
+    store.upsertSession({ ...store.getSession('deck_codexcred_brain')!, state: 'running' });
+    expect(store.getSession('deck_codexcred_brain')?.hookCredential).toBe(preRestoreCred);
+
+    await store.loadStore();
+    expect(store.getSession('deck_codexcred_brain')?.hookCredential).toBe(preRestoreCred);
+
+    // Exercise the actual createResourceOwnerHookWithEpochRefresh retry path against a bumped runtimeEpoch.
+    let seenEpoch: string | undefined;
+    const srv = hookServer!;
+    const prevListeners = srv.listeners('request');
+    srv.removeAllListeners('request');
+    srv.on('request', (req, res) => {
+      if (req.url === '/test-epoch-hook') {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+          const parsed = JSON.parse(body || '{}') as { runtimeEpoch?: string };
+          seenEpoch = parsed.runtimeEpoch;
+          if (parsed.runtimeEpoch === 'stale-epoch-1') {
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'stale_runtime' }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, refreshedEpoch: parsed.runtimeEpoch }));
+        });
+        return;
+      }
+      for (const fn of prevListeners) (fn as (r: typeof req, s: typeof res) => void)(req, res);
+    });
+
+    const latestBeforeBump = store.getSession('deck_codexcred_brain')!;
+    store.upsertSession({ ...latestBeforeBump, runtimeEpoch: 'bumped-epoch-2' });
+    const hookPost = createResourceOwnerHookWithEpochRefresh({
+      resourceOwner: {
+        sessionName: 'deck_codexcred_brain',
+        sessionInstanceId: latestBeforeBump.sessionInstanceId!,
+        runtimeEpoch: 'stale-epoch-1',
+      },
+      callerSessionName: 'deck_codexcred_brain',
+      hookPath: '/test-epoch-hook',
+      staleRuntimeError: 'stale_runtime',
+      env: {
+        ...process.env,
+        [HOOK_SESSION_CREDENTIAL_ENV]: preRestoreCred!,
+        IMCODES_HOOK_PORT: String(hookPort),
+      },
+      requireHookPort: async () => hookPort,
+    });
+    await expect(hookPost({})).resolves.toMatchObject({ ok: true, refreshedEpoch: 'bumped-epoch-2' });
+    expect(seenEpoch).toBe('bumped-epoch-2');
+    expect(store.getSession('deck_codexcred_brain')?.hookCredential).toBe(preRestoreCred);
+    await expect(clientRebooted.callTool({ name: 'search_memory', arguments: { query: 'after-epoch-refresh' } }))
       .resolves.toMatchObject({ structuredContent: { status: 'ok', session: 'deck_codexcred_brain' } });
     await clientRebooted.close().catch(() => {});
   });

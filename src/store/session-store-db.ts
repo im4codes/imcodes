@@ -11,7 +11,7 @@
  * this file only reads and writes rows.
  */
 import { createRequire } from 'node:module';
-import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, renameSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, renameSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 import logger from '../util/logger.js';
@@ -337,7 +337,7 @@ export function scrubTransportHookCredentialRows(handle: SessionDbHandle): { scr
         if (hadBlobRef) blobRefRemoved = true;
         scrubbedRows += 1;
       }
-      if (scrubbedRows > 0) {
+      if (scrubbedRows > 0 || marker === null) {
         if (blobRefRemoved) collectUnreferencedBlobs(handle);
         db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_PENDING_VACUUM);
       }
@@ -347,18 +347,13 @@ export function scrubTransportHookCredentialRows(handle: SessionDbHandle): { scr
       throw error;
     }
   }
-  const hasWalBytes = existsSync(`${handle.path}-wal`) && (() => {
-    try { return statSync(`${handle.path}-wal`).size > 0; } catch { return false; }
-  })();
-  const needsUpgradeCompaction = marker === null && (countSessionRows(handle) > 0 || hasWalBytes);
-  if (needsUpgradeCompaction) {
-    db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_PENDING_VACUUM);
-  }
-  if (scrubbedRows === 0 && marker !== SCRUB_PENDING_VACUUM && !needsUpgradeCompaction) {
-    if (marker === null) {
-      db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_DONE);
-    }
+  if (scrubbedRows === 0 && marker === SCRUB_DONE) {
     return { scrubbedRows: 0, compacted: false };
+  }
+  if (marker !== SCRUB_PENDING_VACUUM) {
+    // An uncertified existing DB (even with 0 current rows and 0 WAL bytes, e.g. secure_delete=0
+    // deleted rows in main free pages) must compact + checkpoint cleanly before SCRUB_DONE is recorded.
+    db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_PENDING_VACUUM);
   }
   const compacted = compactSessionDb(handle);
   if (compacted) db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_DONE);

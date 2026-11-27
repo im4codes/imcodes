@@ -70,6 +70,7 @@ import {
   SESSIONS_JSON_COMPAT_EXPORT_MAX_BYTES,
   SESSION_DB_BACKUP_COUNT,
   SESSION_DB_BACKUP_TMP_SUFFIX,
+  SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB,
   SESSION_HOOK_CREDENTIAL_FIELD,
   SESSION_HOOK_CREDENTIAL_MARKER,
   SESSION_IDENTITY_PROMPT_FIELD,
@@ -856,9 +857,10 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   // authority's database after that rotation.
   const targetPath = dbPath();
   assertNotRealImcodesPathInTests(targetPath, SESSION_DB_FILE);
-  // The authoritative owner already holds the newest state; a read-only refresh
-  // there is a no-op rather than a disk overwrite of live memory.
-  if (options.probe === false && storeAuthoritative) return store;
+  // The authoritative owner already holds the live in-memory state (including
+  // in-memory-only transport credentials); reloading from disk mid-daemon would
+  // wipe live credentials and race background snapshots.
+  if (storeAuthoritative) return store;
   await drainPendingWritesForRead();
   const canWrite = hasWriteAuthority(targetPath);
   let dirty = false;
@@ -1217,6 +1219,17 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
  */
 function maybeStartSnapshot(handle: SessionDbHandle, targetPath: string): void {
   if (backupInFlight || committedPayloads.size === 0) return;
+  if (readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) !== 'done') {
+    // Attempt certification if an earlier startup scrub stayed pending (e.g. reader released WAL);
+    // never publish a physical snapshot while credential cleanup/compaction remains uncertified.
+    try {
+      scrubTransportHookCredentialRows(handle);
+    } catch { /* reported below if still uncertified */ }
+    if (readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) !== 'done') {
+      logger.warn({ targetPath }, 'Skipping session database snapshot until transport credential scrub and compaction complete');
+      return;
+    }
+  }
   if (lastBackupAt === 0) {
     try { lastBackupAt = statSync(`${targetPath}.bak.1`).mtimeMs; } catch { lastBackupAt = 1; }
   }
@@ -1627,12 +1640,15 @@ export function upsertSession(record: SessionRecord): void {
       ? AGY_NATIVE_SESSION_STATE.STARTED
       : record.agyNativeSessionState ?? (sameAgyRoute ? existing.agyNativeSessionState : undefined)
     : undefined;
-  const preservedTransportHookCred = !('hookCredential' in record)
-    && existing
-    && isTransportSessionRecord(existing as unknown as Record<string, unknown>)
-    && existing.hookCredential
-    ? existing.hookCredential
-    : undefined;
+  const incomingHookCredDesc = Object.getOwnPropertyDescriptor(record, 'hookCredential');
+  const explicitClearHookCred = Boolean(incomingHookCredDesc) && record.hookCredential === undefined;
+  const resolvedTransportHookCred = explicitClearHookCred
+    ? undefined
+    : (typeof record.hookCredential === 'string' && record.hookCredential.length > 0
+      ? record.hookCredential
+      : (existing && isTransportSessionRecord(existing as unknown as Record<string, unknown>) && existing.hookCredential
+        ? existing.hookCredential
+        : undefined));
   const nextSessionRecord: SessionRecord = {
     ...incoming,
     // Privacy cannot be erased by a metadata rebuild that omits the flag.
@@ -1647,9 +1663,11 @@ export function upsertSession(record: SessionRecord): void {
     ...(pairCreatedMetadata !== undefined ? { pairCreatedMetadata } : {}),
     updatedAt: Date.now(),
   };
-  if (preservedTransportHookCred) {
+  if (explicitClearHookCred) {
+    delete nextSessionRecord.hookCredential;
+  } else if (resolvedTransportHookCred && incomingHookCredDesc?.enumerable !== true) {
     Object.defineProperty(nextSessionRecord, 'hookCredential', {
-      value: preservedTransportHookCred,
+      value: resolvedTransportHookCred,
       enumerable: false,
       writable: true,
       configurable: true,
