@@ -1058,6 +1058,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           && error.code === PROVIDER_ERROR_CODES.CANCELLED
           && this.consumeExternalCompletionGraceCancel();
         if (consumedStopIgnore || consumedExternalGraceIgnore) {
+          this._compactionObservedGeneration = null;
           if (consumedStopIgnore) this._cancelledProviderErrorsToIgnore--;
           logger.warn(
             {
@@ -1120,6 +1121,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             'transport runtime got provider error without active turn',
           );
           if (this._pendingMessages.length === 0) {
+            this._compactionObservedGeneration = null;
             this.clearStalePendingCancelFallbackTimer();
             this._activeDispatchCancelled = false;
             this._activeDispatchProviderStarted = false;
@@ -1231,21 +1233,25 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(this.provider.onStatus ? [this.provider.onStatus((sid: string, status: ProviderStatusUpdate) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        const activity = this.getActivitySnapshot();
         // Providers also compact on their own mid-turn (Claude's
-        // compact_boundary, Codex's inline auto-compaction). Bind observation
-        // to the live active turn generation so late/idle or cancelled/failed
-        // compaction never leaks into the next ordinary turn.
-        if (
-          status?.status === 'compacting'
-          && this._activeDispatchId !== null
+        // compact_boundary, Codex's inline auto-compaction, including
+        // provider-initiated foreground turns such as retained task wakes).
+        // Bind observation to the active generation when live foreground work
+        // exists, so idle late frames or cancelled/failed turns cannot leak.
+        const hasProviderForegroundWork = activity.blockingWorkCount > 0
+          && !!activity.providerSnapshot
+          && !this.hasLocallyCancelledActivityGeneration(activity.providerSnapshot);
+        const hasLiveForegroundTurn = (this.hasLocalTurnInFlight() || hasProviderForegroundWork)
           && !this._activeDispatchCancelled
           && !this._currentActivityGenerationLocallyCancelled
           && !this._unconfirmedProviderStop
-          && this.hasLocalTurnInFlight()
-        ) {
+          && !this._stopQueueBarrier
+          && this._recoverableRetryTimer === null
+          && this._capacityRetryTimer === null;
+        if (status?.status === 'compacting' && hasLiveForegroundTurn) {
           this._compactionObservedGeneration = this._activityGeneration;
         }
-        const activity = this.getActivitySnapshot();
         const canKeepActive = this.hasActiveTurnWork() || activity.backgroundKeepsSessionRunning;
         if (!this._activeDispatchCancelled && status?.status && canKeepActive) {
           const nextStatus: AgentStatus = status.status === 'waiting' ? 'tool_running' : 'thinking';

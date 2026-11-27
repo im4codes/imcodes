@@ -133,6 +133,8 @@ interface QoderSessionState {
   activeNotificationAdmissions: Map<string, Promise<AgentDelegationNotificationResult>>;
   usageTracker?: UsageRequestTracker;
   lastAssistantUsage?: NonNullable<ProviderUsageUpdate['usage']>;
+  sawSubagentActivityInTurn: boolean;
+  mainRequestCountInTurn: number;
   compacting: boolean;
   /**
    * The native-agent fence the in-flight query was started with. Qoder
@@ -314,6 +316,15 @@ function usageDiffersFromTotal(
     || exactUsage.cache_creation_input_tokens !== totalUsage.cache_creation_input_tokens
     || exactUsage.cached_input_tokens !== totalUsage.cached_input_tokens
   );
+}
+
+function hasOtherModelInModelUsage(modelUsage: unknown, activeModel?: string): boolean {
+  if (!isRecord(modelUsage)) return false;
+  const trimmedActive = activeModel?.trim();
+  const keys = Object.keys(modelUsage).map((key) => key.trim()).filter(Boolean);
+  if (keys.length === 0) return false;
+  if (!trimmedActive) return keys.length > 1;
+  return keys.some((key) => key !== trimmedActive);
 }
 
 function mcpStatusFromQoder(statuses: QoderMcpServerStatus[] | undefined): MemoryMcpProviderStatusView {
@@ -527,6 +538,8 @@ export class QoderSdkProvider implements TransportProvider {
       activeTurnSettled: null,
       resolveActiveTurnSettled: null,
       activeNotificationAdmissions: new Map(),
+      sawSubagentActivityInTurn: false,
+      mainRequestCountInTurn: 0,
       compacting: false,
     };
     this.sessions.set(routeId, state);
@@ -574,6 +587,8 @@ export class QoderSdkProvider implements TransportProvider {
     state.currentText = '';
     state.usageTracker = undefined;
     state.lastAssistantUsage = undefined;
+    state.sawSubagentActivityInTurn = false;
+    state.mainRequestCountInTurn = 0;
     state.compacting = false;
     state.activeTools.clear();
     state.toolBlocksByIndex.clear();
@@ -1143,6 +1158,9 @@ export class QoderSdkProvider implements TransportProvider {
     }
     const parentToolUseId = 'parent_tool_use_id' in msg ? readString(msg.parent_tool_use_id) : undefined;
     const isSubagent = parentToolUseId !== undefined;
+    if (isSubagent && (msg.type === 'stream_event' || msg.type === 'assistant')) {
+      state.sawSubagentActivityInTurn = true;
+    }
     switch (msg.type) {
       case 'system':
         this.handleSystemMessage(sessionId, state, msg);
@@ -1252,23 +1270,19 @@ export class QoderSdkProvider implements TransportProvider {
       const rawRequestId = usage ? readString(usage.request_id) : undefined;
       state.currentMessageId = messageId;
       state.currentText = '';
-      state.lastAssistantUsage = undefined;
-      state.usageTracker = {
-        messageId: rawMessageId,
-        requestId: rawRequestId,
-        model: model ?? state.effectiveModel,
-        streamOpen: true,
-        sealedByAssistant: false,
-      };
       if (model && model !== state.effectiveModel) {
         state.effectiveModel = model;
         this.emitSessionInfo(sessionId, { model });
       }
+      this.reconcileMainRequest(state, {
+        source: 'message_start',
+        messageId: rawMessageId,
+        requestId: rawRequestId,
+        model: model ?? state.effectiveModel,
+      });
       if (usage) {
         this.recordLiveUsage(sessionId, state, usage, {
-          source: 'message_start',
           messageId: rawMessageId,
-          requestId: rawRequestId,
           model,
           emitMessageId: messageId,
         });
@@ -1279,15 +1293,25 @@ export class QoderSdkProvider implements TransportProvider {
       if (isSubagent) return;
       const delta = isRecord(event.delta) ? event.delta : undefined;
       const usage = isRecord(event.usage) ? event.usage : isRecord(delta?.usage) ? delta.usage : undefined;
-      if (usage) {
-        const deltaMessageId = readString(event.message_id);
-        const deltaRequestId = readString(usage.request_id) ?? readString(event.request_id);
-        const deltaModel = readString(event.model) ?? readString(delta?.model);
-        const fallbackMessageId = state.usageTracker?.messageId ?? state.currentMessageId ?? `${sessionId}:qoder:${generation}`;
-        this.recordLiveUsage(sessionId, state, usage, {
+      const deltaMessageId = readString(event.message_id);
+      const deltaRequestId = (usage ? readString(usage.request_id) : undefined) ?? readString(event.request_id);
+      const deltaModel = readString(event.model) ?? readString(delta?.model);
+      const isAnonymous = !deltaMessageId && !deltaRequestId;
+      if (isAnonymous) {
+        if (!state.usageTracker?.streamOpen) return;
+        if (deltaModel && state.usageTracker.model && deltaModel !== state.usageTracker.model) return;
+      } else {
+        this.reconcileMainRequest(state, {
           source: 'message_delta',
           messageId: deltaMessageId,
           requestId: deltaRequestId,
+          model: deltaModel,
+        });
+      }
+      if (usage) {
+        const fallbackMessageId = state.usageTracker?.messageId ?? state.currentMessageId ?? `${sessionId}:qoder:${generation}`;
+        this.recordLiveUsage(sessionId, state, usage, {
+          messageId: deltaMessageId,
           model: deltaModel,
           emitMessageId: deltaMessageId ?? fallbackMessageId,
         });
@@ -1407,9 +1431,20 @@ export class QoderSdkProvider implements TransportProvider {
     if (msg.isVisibleInTranscriptOnly === true) return;
     const message = isRecord(msg.message) ? msg.message : undefined;
     const model = readString(message?.model);
-    if (!isSubagent && model && model !== state.effectiveModel) {
-      state.effectiveModel = model;
-      this.emitSessionInfo(sessionId, { model });
+    const usage = !isSubagent && isRecord(message?.usage) ? message.usage : undefined;
+    const asstMessageId = readString(message?.id);
+    const asstRequestId = usage ? readString(usage.request_id) : undefined;
+    if (!isSubagent) {
+      if (model && model !== state.effectiveModel) {
+        state.effectiveModel = model;
+        this.emitSessionInfo(sessionId, { model });
+      }
+      this.reconcileMainRequest(state, {
+        source: 'assistant',
+        messageId: asstMessageId,
+        requestId: asstRequestId,
+        model: model ?? state.effectiveModel,
+      });
     }
     const content = Array.isArray(message?.content) ? message.content : [];
     for (const block of content) {
@@ -1452,54 +1487,44 @@ export class QoderSdkProvider implements TransportProvider {
         });
       }
     }
-    const usage = !isSubagent && isRecord(message?.usage) ? message.usage : undefined;
     if (usage) {
-      const asstMessageId = readString(message?.id);
-      const asstRequestId = readString(usage.request_id);
       this.recordLiveUsage(sessionId, state, usage, {
-        source: 'assistant',
         messageId: asstMessageId,
-        requestId: asstRequestId,
         model,
         emitMessageId: asstMessageId ?? readString(msg.uuid) ?? state.currentMessageId ?? `${sessionId}:qoder:${generation}`,
       });
     }
   }
 
-  private recordLiveUsage(
-    sessionId: string,
+  private reconcileMainRequest(
     state: QoderSessionState,
-    rawUsage: unknown,
     meta: {
       source: 'message_start' | 'message_delta' | 'assistant';
       messageId?: string;
       requestId?: string;
       model?: string;
-      emitMessageId?: string;
     },
-  ): void {
-    const emitModel = meta.model ?? state.effectiveModel;
-    const normalized = normalizeProviderUsage(rawUsage, undefined, emitModel);
-    if (!normalized) return;
-
+  ): boolean {
     const tracker = state.usageTracker;
+    const targetModel = meta.model ?? state.effectiveModel;
+    const modelMatches = !meta.model || !tracker?.model || meta.model === tracker.model;
     let sameRequest = false;
-    if (tracker && state.lastAssistantUsage !== undefined) {
-      const modelMatches = !meta.model || !tracker.model || meta.model === tracker.model;
-      if (modelMatches) {
-        if (meta.source === 'message_start') {
-          sameRequest = false;
-        } else if (meta.requestId && tracker.requestId) {
-          sameRequest = meta.requestId === tracker.requestId;
-        } else if (meta.messageId && tracker.messageId) {
-          sameRequest = meta.messageId === tracker.messageId;
-        } else if (meta.source === 'message_delta') {
-          sameRequest = (!meta.requestId || !tracker.requestId) && (!meta.messageId || !tracker.messageId);
-        } else if (meta.source === 'assistant') {
-          sameRequest = !tracker.sealedByAssistant
-            && (!meta.requestId || !tracker.requestId)
-            && (!meta.messageId || !tracker.messageId);
-        }
+
+    if (tracker && modelMatches) {
+      if (meta.source === 'message_start') {
+        sameRequest = false;
+      } else if (meta.requestId && tracker.requestId) {
+        sameRequest = meta.requestId === tracker.requestId;
+      } else if (meta.messageId && tracker.messageId) {
+        sameRequest = meta.messageId === tracker.messageId;
+      } else if (meta.source === 'message_delta') {
+        sameRequest = tracker.streamOpen
+          && (!meta.requestId || !tracker.requestId)
+          && (!meta.messageId || !tracker.messageId);
+      } else if (meta.source === 'assistant') {
+        sameRequest = !tracker.sealedByAssistant
+          && (!meta.requestId || !tracker.requestId)
+          && (!meta.messageId || !tracker.messageId);
       }
     }
 
@@ -1508,19 +1533,36 @@ export class QoderSdkProvider implements TransportProvider {
       if (meta.messageId && !tracker.messageId) tracker.messageId = meta.messageId;
       if (meta.model && !tracker.model) tracker.model = meta.model;
       if (meta.source === 'assistant') tracker.sealedByAssistant = true;
-    } else {
-      state.usageTracker = {
-        messageId: meta.messageId,
-        requestId: meta.requestId,
-        model: emitModel,
-        streamOpen: meta.source !== 'assistant' ? (tracker?.streamOpen ?? false) : false,
-        sealedByAssistant: meta.source === 'assistant',
-      };
+      return true;
     }
 
-    const effective = sameRequest
-      ? mergeProviderUsage(state.lastAssistantUsage, normalized)
-      : { ...normalized };
+    state.mainRequestCountInTurn += 1;
+    state.lastAssistantUsage = undefined;
+    state.usageTracker = {
+      messageId: meta.messageId,
+      requestId: meta.requestId,
+      model: targetModel,
+      streamOpen: meta.source === 'message_start',
+      sealedByAssistant: meta.source === 'assistant',
+    };
+    return false;
+  }
+
+  private recordLiveUsage(
+    sessionId: string,
+    state: QoderSessionState,
+    rawUsage: unknown,
+    meta: {
+      messageId?: string;
+      model?: string;
+      emitMessageId?: string;
+    },
+  ): void {
+    const emitModel = meta.model ?? state.effectiveModel;
+    const normalized = normalizeProviderUsage(rawUsage, undefined, emitModel);
+    if (!normalized) return;
+
+    const effective = mergeProviderUsage(state.lastAssistantUsage, normalized);
     state.lastAssistantUsage = effective;
     this.emitUsage(sessionId, {
       ...(meta.emitMessageId ? { messageId: meta.emitMessageId } : {}),
@@ -1536,20 +1578,24 @@ export class QoderSdkProvider implements TransportProvider {
     messageId: string,
   ): NonNullable<ProviderUsageUpdate['usage']> | undefined {
     const numTurns = readNumber(msg.num_turns);
-    const isSingleTurn = numTurns === undefined || numTurns <= 1;
-    const previous = state.lastAssistantUsage;
     const resultUsage = normalizeProviderUsage(msg.usage, msg.modelUsage, state.effectiveModel);
+    const resultAttributionSafe = !state.sawSubagentActivityInTurn
+      && state.mainRequestCountInTurn <= 1
+      && (numTurns === undefined || numTurns <= 1)
+      && !hasOtherModelInModelUsage(msg.modelUsage, state.effectiveModel);
+    const previous = state.lastAssistantUsage;
     let exactUsage: NonNullable<ProviderUsageUpdate['usage']> | undefined;
     if (previous) {
-      const matchedWindow = previous.model_context_window ?? extractModelContextWindow(msg.modelUsage, state.effectiveModel);
+      const explicitOrMatchedWindow = previous.model_context_window
+        ?? (state.effectiveModel || resultAttributionSafe ? resultUsage?.model_context_window : undefined);
       exactUsage = {
         ...previous,
-        ...(isSingleTurn && previous.output_tokens === undefined && resultUsage?.output_tokens !== undefined
+        ...(resultAttributionSafe && previous.output_tokens === undefined && resultUsage?.output_tokens !== undefined
           ? { output_tokens: resultUsage.output_tokens }
           : {}),
-        ...(matchedWindow !== undefined ? { model_context_window: matchedWindow } : {}),
+        ...(explicitOrMatchedWindow !== undefined ? { model_context_window: explicitOrMatchedWindow } : {}),
       };
-    } else if (isSingleTurn) {
+    } else if (resultAttributionSafe) {
       exactUsage = resultUsage ? { ...resultUsage } : undefined;
     }
     if (!exactUsage) return undefined;
@@ -1611,6 +1657,8 @@ export class QoderSdkProvider implements TransportProvider {
     state.compacting = false;
     state.usageTracker = undefined;
     state.lastAssistantUsage = undefined;
+    state.sawSubagentActivityInTurn = false;
+    state.mainRequestCountInTurn = 0;
     state.activeQuery = undefined;
     this.denyPendingApprovals(state, 'Qoder turn completed');
     this.emitComplete(sessionId, message);
@@ -1628,6 +1676,8 @@ export class QoderSdkProvider implements TransportProvider {
     state.compacting = false;
     state.usageTracker = undefined;
     state.lastAssistantUsage = undefined;
+    state.sawSubagentActivityInTurn = false;
+    state.mainRequestCountInTurn = 0;
     state.activeQuery = undefined;
     this.denyPendingApprovals(state, error.message);
     this.emitError(sessionId, error);
@@ -1649,6 +1699,8 @@ export class QoderSdkProvider implements TransportProvider {
     state.compacting = false;
     state.usageTracker = undefined;
     state.lastAssistantUsage = undefined;
+    state.sawSubagentActivityInTurn = false;
+    state.mainRequestCountInTurn = 0;
     state.activeTools.clear();
     state.toolBlocksByIndex.clear();
     if (wasActive) {

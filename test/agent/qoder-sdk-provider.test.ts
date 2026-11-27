@@ -1347,6 +1347,245 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
       input_tokens: 50000,
       output_tokens: 500,
     });
+
+    // F1 causal counterexample: num_turns=1 WITH subagent + missing/input-only main usage must NOT leak cumulative result counts
+    const usagesBeforeF1 = events.usages.length;
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'init', session_id: 'qoder-req-1', model: 'performance' },
+      {
+        type: 'assistant',
+        parent_tool_use_id: 'toolu_sub_single',
+        uuid: 'sub-single-1',
+        message: {
+          id: 'sub-single-msg-1',
+          role: 'assistant',
+          model: 'sub-small',
+          content: [{ type: 'text', text: 'sub' }],
+          usage: { input_tokens: 75, output_tokens: 4 },
+        },
+      },
+      {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        uuid: 'main-no-usage',
+        message: {
+          id: 'main-single-no-usage',
+          role: 'assistant',
+          model: 'performance',
+          content: [{ type: 'text', text: 'Done' }],
+        },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Done',
+        uuid: 'res-single-with-sub',
+        num_turns: 1,
+        usage: { input_tokens: 12075, output_tokens: 14 },
+      },
+    ]);
+
+    await p.send(route, 'single turn with subagent and missing main usage');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(3));
+
+    expect(events.usages).toHaveLength(usagesBeforeF1);
+    expect(events.completions[2].message.metadata.usage).toBeUndefined();
+    expect(events.completions[2].message.metadata.totalUsage).toMatchObject({
+      input_tokens: 12075,
+      output_tokens: 14,
+    });
+
+    // F1 causal counterexample 2: main has input-only + subagent + num_turns=1 -> cumulative output must NOT backfill
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'init', session_id: 'qoder-req-1', model: 'performance' },
+      {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        uuid: 'main-input-only',
+        message: {
+          id: 'main-input-only-1',
+          role: 'assistant',
+          model: 'performance',
+          content: [{ type: 'text', text: 'Working' }],
+          usage: { input_tokens: 12000 },
+        },
+      },
+      {
+        type: 'assistant',
+        parent_tool_use_id: 'toolu_sub_partial',
+        uuid: 'sub-partial',
+        message: {
+          id: 'sub-partial-1',
+          role: 'assistant',
+          model: 'sub-small',
+          content: [{ type: 'text', text: 'sub' }],
+          usage: { input_tokens: 75, output_tokens: 9 },
+        },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Done partial',
+        uuid: 'res-single-sub-partial',
+        num_turns: 1,
+        usage: { input_tokens: 12075, output_tokens: 19 },
+        modelUsage: {
+          performance: {
+            inputTokens: 12000,
+            outputTokens: 10,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 256000,
+            maxOutputTokens: 16384,
+          },
+          'sub-small': {
+            inputTokens: 75,
+            outputTokens: 9,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.001,
+            contextWindow: 8000,
+            maxOutputTokens: 4096,
+          },
+        },
+      },
+    ]);
+
+    await p.send(route, 'single turn with subagent and input-only main');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(4));
+
+    expect(events.usages.at(-1)?.usage).toEqual({
+      messageId: 'res-single-sub-partial',
+      finalized: true,
+      model: 'performance',
+      usage: {
+        input_tokens: 12000,
+        model_context_window: 256000,
+      },
+    });
+    expect(events.completions[3].message.metadata.usage).toEqual({
+      input_tokens: 12000,
+      model_context_window: 256000,
+    });
+
+    // F2 causal counterexamples:
+    // (a) assistant A has usage, assistant B omits usage (new message.id), plus explicit empty usage request transition
+    // (b) anonymous message_delta after message_stop must not mutate closed snapshot
+    // (c) explicit result.usage.model_context_window must be preserved even when assistant omits modelUsage
+    const usagesBeforeAtoB = events.usages.length;
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'init', session_id: 'qoder-req-1', model: 'performance' },
+      {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        uuid: 'asst-a',
+        message: {
+          id: 'req-A',
+          role: 'assistant',
+          model: 'performance',
+          content: [{ type: 'text', text: 'A' }],
+          usage: { input_tokens: 12000, cache_read_input_tokens: 4000, output_tokens: 5 },
+        },
+      },
+      {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        uuid: 'asst-b',
+        message: {
+          id: 'req-B',
+          role: 'assistant',
+          model: 'performance',
+          content: [{ type: 'text', text: 'B' }],
+        },
+      },
+      {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        uuid: 'asst-c',
+        message: {
+          id: 'req-C',
+          role: 'assistant',
+          model: 'performance',
+          content: [{ type: 'text', text: 'C' }],
+          usage: {},
+        },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'C',
+        uuid: 'res-a-to-b',
+        num_turns: 2,
+        usage: { input_tokens: 20000, output_tokens: 50 },
+      },
+    ]);
+
+    await p.send(route, 'request B without usage clears A');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(5));
+
+    // Only live emission from req-A; no finalized emission with req-A's stale 12000/4000
+    expect(events.usages).toHaveLength(usagesBeforeAtoB + 1);
+    expect(events.completions[4].message.metadata.usage).toBeUndefined();
+    expect(events.completions[4].message.metadata.totalUsage).toMatchObject({
+      input_tokens: 20000,
+      output_tokens: 50,
+    });
+
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'init', session_id: 'qoder-req-1', model: 'performance' },
+      {
+        type: 'stream_event',
+        parent_tool_use_id: null,
+        event: {
+          type: 'message_start',
+          message: {
+            id: 'req-win-1',
+            model: 'performance',
+            usage: { input_tokens: 12000, output_tokens: 10 },
+          },
+        },
+      },
+      { type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_stop' } },
+      {
+        type: 'stream_event',
+        parent_tool_use_id: null,
+        event: {
+          type: 'message_delta',
+          usage: { output_tokens: 99 },
+        },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Window ok',
+        uuid: 'res-explicit-window',
+        num_turns: 2,
+        usage: { input_tokens: 25000, output_tokens: 40, model_context_window: 256000 },
+      },
+    ]);
+
+    await p.send(route, 'closed delta ignored and result explicit window preserved');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(6));
+
+    // Anonymous post-message_stop delta must not overwrite output_tokens=10 with 99; explicit result window=256000 preserved
+    expect(events.usages.at(-1)?.usage).toEqual({
+      messageId: 'res-explicit-window',
+      finalized: true,
+      model: 'performance',
+      usage: {
+        input_tokens: 12000,
+        output_tokens: 10,
+        model_context_window: 256000,
+      },
+    });
+    expect(events.completions[5].message.metadata.usage).toEqual({
+      input_tokens: 12000,
+      output_tokens: 10,
+      model_context_window: 256000,
+    });
   });
 
   it('drops post-terminal compact_boundary, status, and stream frames emitted after completion in the same generation', async () => {

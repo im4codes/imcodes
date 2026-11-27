@@ -4275,6 +4275,30 @@ describe('TransportSessionRuntime', () => {
     const afterRealCompactPayload = mock.provider.send.mock.calls[7]?.[1] as Record<string, unknown>;
     expect(afterRealCompactPayload.messagePreamble).toContain('Use pnpm');
     expect(String(afterRealCompactPayload.assembledMessage)).toContain('Use pnpm');
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    // 6. Provider-initiated foreground turn (live provider snapshot, no local dispatch — e.g. retained task wake)
+    // must still observe mid-turn compacting and re-inject on the next user turn after normal completion.
+    let providerActive = true;
+    mock.provider.getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: providerActive ? 1 : 0,
+      activeToolCount: 0,
+      busyReasons: providerActive ? ['retained_task_wake'] : [],
+      updatedAt: Date.now(),
+    })) as never;
+
+    mock.fireStatus('sess-1', { status: 'compacting' });
+    providerActive = false;
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('after provider-initiated compaction', 'cmp-guard-9', undefined, preferencePreamble);
+    await flushDispatch();
+    const afterProviderCompactPayload = mock.provider.send.mock.calls[8]?.[1] as Record<string, unknown>;
+    expect(afterProviderCompactPayload.messagePreamble).toContain('Use pnpm');
+    expect(String(afterProviderCompactPayload.assembledMessage)).toContain('Use pnpm');
   });
 
   it('drops first-turn startup memory built before the project turned injection off, without a restart', async () => {
