@@ -593,7 +593,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
           if (payload.baseUpdatedAt === cur.updatedAt) {
             const committedRev = nextRev();
             srv.projects[payload.projectKey] = {
-              raw: payload.raw,
+              raw: payload.confirmOnly ? cur.raw : payload.raw,
               updatedAt: committedRev,
               source: 'web',
               ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
@@ -614,7 +614,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
           let applied = false;
           if (payload.baseUpdatedAt === srv.user.updatedAt) {
             srv.user = {
-              raw: payload.raw,
+              raw: payload.confirmOnly ? srv.user.raw : payload.raw,
               updatedAt: nextRev(),
               source: 'web',
               ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
@@ -633,7 +633,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
         let applied = false;
         if (payload.baseUpdatedAt === srv.shareWithOthers.updatedAt) {
           srv.shareWithOthers = {
-            enabled: payload.enabled,
+            enabled: payload.confirmOnly ? srv.shareWithOthers.enabled : payload.enabled,
             updatedAt: nextRev(),
             ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
           };
@@ -935,7 +935,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
         const cur = srv.projects[payload.projectKey] ?? { raw: '', updatedAt: 0 };
         if (payload.baseUpdatedAt === cur.updatedAt) {
           srv.projects[payload.projectKey] = {
-            raw: payload.raw,
+            raw: payload.confirmOnly ? cur.raw : payload.raw,
             updatedAt: nextRev(),
             source: 'web',
             ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
@@ -948,7 +948,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       } else if (payload.scope === 'user') {
         if (payload.baseUpdatedAt === srv.user.updatedAt) {
           srv.user = {
-            raw: payload.raw,
+            raw: payload.confirmOnly ? srv.user.raw : payload.raw,
             updatedAt: nextRev(),
             source: 'web',
             ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
@@ -961,7 +961,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       } else if (payload.scope === 'share') {
         if (payload.baseUpdatedAt === srv.shareWithOthers.updatedAt) {
           srv.shareWithOthers = {
-            enabled: payload.enabled,
+            enabled: payload.confirmOnly ? srv.shareWithOthers.enabled : payload.enabled,
             updatedAt: nextRev(),
             ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
           };
@@ -1063,7 +1063,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
         const cur = srv.projects[payload.projectKey] ?? { raw: '', updatedAt: 0 };
         if (payload.baseUpdatedAt === cur.updatedAt) {
           srv.projects[payload.projectKey] = {
-            raw: payload.raw,
+            raw: payload.confirmOnly ? cur.raw : payload.raw,
             updatedAt: nextRev(),
             source: 'web',
             ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
@@ -1076,7 +1076,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       } else if (payload.scope === 'user') {
         if (payload.baseUpdatedAt === srv.user.updatedAt) {
           srv.user = {
-            raw: payload.raw,
+            raw: payload.confirmOnly ? srv.user.raw : payload.raw,
             updatedAt: nextRev(),
             source: 'web',
             ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
@@ -1089,7 +1089,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       } else if (payload.scope === 'share') {
         if (payload.baseUpdatedAt === srv.shareWithOthers.updatedAt) {
           srv.shareWithOthers = {
-            enabled: payload.enabled,
+            enabled: payload.confirmOnly ? srv.shareWithOthers.enabled : payload.enabled,
             updatedAt: nextRev(),
             ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
           };
@@ -1180,5 +1180,112 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
     expect(getGlobalVoiceHotwordsRaw()).toBe('');
     expect(srv.shareWithOthers.enabled).toBe(false);
     expect(getShareHotwordsWithOthers()).toBe(false);
+  });
+
+  it('drops superseded local values on recovery, sending only latest revoked false without replaying old true', async () => {
+    let rev = 100;
+    const nextRev = () => {
+      rev += 1;
+      return rev;
+    };
+    const projKey = 'srv:srv-1::no-replay-superseded';
+    const srv: any = {
+      version: 1,
+      user: { raw: 'SafeUserInit', updatedAt: 100, source: 'web' },
+      projects: { [projKey]: { raw: 'SafeProjInit', updatedAt: 100, source: 'web' } },
+      shareWithOthers: { enabled: false, updatedAt: 100 },
+    };
+
+    const sharePayloadsSent: boolean[] = [];
+    const projPayloadsSent: string[] = [];
+    const userPayloadsSent: string[] = [];
+    let offlineBeforeReach = false;
+
+    const fetchRecord = vi.fn(async () => structuredClone(srv));
+    const updateRecord = vi.fn(async (payload: any) => {
+      if (payload.scope === 'share') sharePayloadsSent.push(payload.enabled);
+      else if (payload.scope === 'project') projPayloadsSent.push(payload.raw);
+      else if (payload.scope === 'user') userPayloadsSent.push(payload.raw);
+
+      if (offlineBeforeReach) {
+        throw new Error('offline_before_server_reach');
+      }
+
+      let applied = false;
+      const appliedScopes: any = {};
+      if (payload.scope === 'share') {
+        if (payload.baseUpdatedAt === srv.shareWithOthers.updatedAt) {
+          srv.shareWithOthers = {
+            enabled: payload.enabled,
+            updatedAt: nextRev(),
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && srv.shareWithOthers.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        appliedScopes.shareWithOthers = applied;
+      } else if (payload.scope === 'project') {
+        const cur = srv.projects[payload.projectKey] ?? { raw: '', updatedAt: 0 };
+        if (payload.baseUpdatedAt === cur.updatedAt) {
+          srv.projects[payload.projectKey] = {
+            raw: payload.raw,
+            updatedAt: nextRev(),
+            source: 'web',
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && cur.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        appliedScopes.projects = { [payload.projectKey]: applied };
+      } else if (payload.scope === 'user') {
+        if (payload.baseUpdatedAt === srv.user.updatedAt) {
+          srv.user = {
+            raw: payload.raw,
+            updatedAt: nextRev(),
+            source: 'web',
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && srv.user.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        appliedScopes.user = applied;
+      }
+      return { ok: true, applied, appliedScopes, record: structuredClone(srv) };
+    });
+
+    setVoiceHotwordsAuthScope({ userId: 'user-noreplay', baseUrl: 'https://noreplay.example' });
+    registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
+    await syncVoiceHotwordsFromServer();
+    expect(getShareHotwordsWithOthers()).toBe(false);
+
+    // 1. User enables sharing & enters superseded words while offline before reaching server
+    offlineBeforeReach = true;
+    setShareHotwordsWithOthers(true);
+    setProjectVoiceHotwordsRaw(projKey, 'SupersededProjTerm');
+    setGlobalVoiceHotwordsRaw('SupersededUserTerm');
+    await flushVoiceHotwordsPush();
+
+    // User immediately revokes sharing back to false & writes final safe words locally
+    setShareHotwordsWithOthers(false);
+    setProjectVoiceHotwordsRaw(projKey, 'FinalLatestProj');
+    setGlobalVoiceHotwordsRaw('FinalLatestUser');
+
+    // 2. Reconnect: MUST send ONLY latest false / FinalLatest*, NEVER replay old true / Superseded*!
+    offlineBeforeReach = false;
+    sharePayloadsSent.length = 0;
+    projPayloadsSent.length = 0;
+    userPayloadsSent.length = 0;
+
+    await flushVoiceHotwordsPush();
+    expect(sharePayloadsSent).toEqual([false]);
+    expect(projPayloadsSent).toEqual(['FinalLatestProj']);
+    expect(userPayloadsSent).toEqual(['FinalLatestUser']);
+    expect(srv.shareWithOthers.enabled).toBe(false);
+    expect(getShareHotwordsWithOthers()).toBe(false);
+    expect(srv.projects[projKey].raw).toBe('FinalLatestProj');
+    expect(srv.user.raw).toBe('FinalLatestUser');
   });
 });
