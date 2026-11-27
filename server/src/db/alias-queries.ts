@@ -282,8 +282,10 @@ export async function listAliases(
 
 /**
  * Idempotently encrypt all legacy plaintext rows (`encryption_version = 0`) in
- * bounded batches. Uses keyset pagination and an optimistic `encryption_version = 0`
- * predicate so concurrent writes or multi-pod startups never clobber newer data.
+ * bounded batches. Each batch runs in a short transaction locking candidate rows
+ * with `FOR UPDATE` and also enforces a value + NULL-safe description CAS predicate,
+ * retrying any row modified concurrently while still at `encryption_version = 0`
+ * so older writers or parallel pods never get overwritten with stale plaintext.
  */
 export async function migratePlaintextAliasesToEncrypted(
   db: Database,
@@ -294,36 +296,31 @@ export async function migratePlaintextAliasesToEncrypted(
     return { migrated: 0, skipped: 0 };
   }
   const limit = Math.max(1, Math.trunc(batchSize));
+  const MAX_ROW_CAS_RETRIES = 5;
   let migrated = 0;
   let skipped = 0;
   let lastId = '';
 
-  while (true) {
-    const rows = await db.query<DbAliasMigrationRow>(
-      `SELECT id, user_id, value, description
-         FROM user_aliases
-        WHERE encryption_version = $1
-          AND id > $2
-        ORDER BY id ASC
-        LIMIT $3`,
-      [ALIAS_ENCRYPTION_VERSION_PLAINTEXT, lastId, limit],
-    );
-    if (rows.length === 0) break;
-
-    for (const row of rows) {
-      lastId = row.id;
+  const migrateSingleRow = async (
+    tx: Database,
+    initialRow: DbAliasMigrationRow,
+  ): Promise<'migrated' | 'skipped'> => {
+    let row: DbAliasMigrationRow | null = initialRow;
+    for (let attempt = 0; attempt < MAX_ROW_CAS_RETRIES && row; attempt += 1) {
       const encryptedValue = encryptAliasField(row.value, encryptionKey, row.user_id, 'value');
       const encryptedDescription = row.description != null
         ? encryptAliasField(row.description, encryptionKey, row.user_id, 'description')
         : null;
-      const res = await db.execute(
+      const res = await tx.execute(
         `UPDATE user_aliases
             SET value = $3,
                 description = $4,
                 encryption_version = $5
           WHERE id = $1
             AND user_id = $2
-            AND encryption_version = $6`,
+            AND encryption_version = $6
+            AND value = $7
+            AND description IS NOT DISTINCT FROM $8`,
         [
           row.id,
           row.user_id,
@@ -331,16 +328,60 @@ export async function migratePlaintextAliasesToEncrypted(
           encryptedDescription,
           ALIAS_ENCRYPTION_VERSION_AES_GCM,
           ALIAS_ENCRYPTION_VERSION_PLAINTEXT,
+          row.value,
+          row.description,
         ],
       );
-      if ((res.changes ?? 0) > 0) {
-        migrated += 1;
-      } else {
-        skipped += 1;
-      }
-    }
+      if ((res.changes ?? 0) > 0) return 'migrated';
 
-    if (rows.length < limit) break;
+      const latest: (DbAliasMigrationRow & { encryption_version: number }) | null =
+        await tx.queryOne<DbAliasMigrationRow & { encryption_version: number }>(
+          `SELECT id, user_id, value, description, encryption_version
+             FROM user_aliases
+            WHERE id = $1 AND user_id = $2`,
+          [row.id, row.user_id],
+        );
+      if (!latest || Number(latest.encryption_version) !== ALIAS_ENCRYPTION_VERSION_PLAINTEXT) {
+        return 'skipped';
+      }
+      row = latest;
+    }
+    return 'skipped';
+  };
+
+  while (true) {
+    const batchResult = await db.transaction(async (tx) => {
+      const rows = await tx.query<DbAliasMigrationRow>(
+        `SELECT id, user_id, value, description
+           FROM user_aliases
+          WHERE encryption_version = $1
+            AND id > $2
+          ORDER BY id ASC
+          LIMIT $3
+          FOR UPDATE`,
+        [ALIAS_ENCRYPTION_VERSION_PLAINTEXT, lastId, limit],
+      );
+      if (rows.length === 0) {
+        return { count: 0, batchMigrated: 0, batchSkipped: 0, nextLastId: lastId };
+      }
+
+      let batchMigrated = 0;
+      let batchSkipped = 0;
+      let nextLastId = lastId;
+      for (const row of rows) {
+        nextLastId = row.id;
+        const outcome = await migrateSingleRow(tx, row);
+        if (outcome === 'migrated') batchMigrated += 1;
+        else batchSkipped += 1;
+      }
+      return { count: rows.length, batchMigrated, batchSkipped, nextLastId };
+    });
+
+    if (batchResult.count === 0) break;
+    migrated += batchResult.batchMigrated;
+    skipped += batchResult.batchSkipped;
+    lastId = batchResult.nextLastId;
+    if (batchResult.count < limit) break;
   }
 
   return { migrated, skipped };

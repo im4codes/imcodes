@@ -32,32 +32,38 @@ export function isMigrationFile(file: string): boolean {
 }
 
 export async function runMigrations(db: Database): Promise<void> {
-  // Ensure migrations tracking table exists
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS _migrations (
-      name       TEXT PRIMARY KEY,
-      applied_at BIGINT NOT NULL
-    )
-  `);
+  await db.transaction(async (tx) => {
+    // Serialize concurrent startup migrations across replicas on a single connection
+    // before touching or reading `_migrations`, then re-read inside the lock.
+    await tx.queryOne("SELECT pg_advisory_xact_lock(hashtextextended('imcodes:_migrations', 0))");
 
-  // Get already-applied migrations
-  const results = await db.query<{ name: string }>('SELECT name FROM _migrations ORDER BY name');
-  const applied = new Set(results.map((r) => r.name));
+    await tx.exec(`
+      CREATE TABLE IF NOT EXISTS _migrations (
+        name       TEXT PRIMARY KEY,
+        applied_at BIGINT NOT NULL
+      )
+    `);
 
-  // Discover migration files sorted by numeric prefix
-  const files = sortMigrations(
-    (await readdir(MIGRATIONS_DIR)).filter(isMigrationFile),
-  );
+    const results = await tx.query<{ name: string }>('SELECT name FROM _migrations ORDER BY name');
+    const applied = new Set(results.map((r) => r.name));
 
-  for (const file of files) {
-    if (applied.has(file)) continue;
+    const files = sortMigrations(
+      (await readdir(MIGRATIONS_DIR)).filter(isMigrationFile),
+    );
 
-    console.log(`[migrate] Applying ${file}...`);
-    const sql = await readFile(join(MIGRATIONS_DIR, file), 'utf-8');
-    await db.exec(sql);
-    await db.execute('INSERT INTO _migrations (name, applied_at) VALUES ($1, $2)', [file, Date.now()]);
-    console.log(`[migrate] Applied ${file}`);
-  }
+    for (const file of files) {
+      if (applied.has(file)) continue;
+
+      console.log(`[migrate] Applying ${file}...`);
+      const sql = await readFile(join(MIGRATIONS_DIR, file), 'utf-8');
+      await tx.exec(sql);
+      await tx.execute(
+        'INSERT INTO _migrations (name, applied_at) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING',
+        [file, Date.now()],
+      );
+      console.log(`[migrate] Applied ${file}`);
+    }
+  });
 
   console.log('[migrate] All migrations up to date');
 }

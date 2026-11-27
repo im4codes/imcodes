@@ -18,12 +18,14 @@ import { readFile } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { readdir } from 'node:fs/promises';
 import { createDatabase, type Database } from '../src/db/client.js';
-import { runMigrations } from '../src/db/migrate.js';
+import { isMigrationFile, runMigrations } from '../src/db/migrate.js';
 import { createUser } from '../src/db/queries.js';
 import { randomHex } from '../src/security/crypto.js';
 import {
   upsertAlias,
+  getAliasById,
   getAliasByName,
   deleteAlias,
   listAliases,
@@ -74,6 +76,44 @@ describe('user_aliases migration', () => {
     // Re-running 119 DDL is idempotent (safe on retry after partial DDL).
     const ddl = await readFile(join(__dirname, '../src/db/migrations/119_user_aliases_encryption.sql'), 'utf8');
     await expect(db.exec(ddl)).resolves.toBeUndefined();
+  });
+
+  it('serializes concurrent runMigrations across two connections from partial 119 DDL with no tracking row', async () => {
+    const dbName = `imcodes_alias_conc_${randomHex(6)}`;
+    await db.exec(`CREATE DATABASE "${dbName}"`);
+    const url = new URL(process.env.TEST_DATABASE_URL!);
+    url.pathname = `/${dbName}`;
+    const connA = createDatabase(url.toString());
+    const connB = createDatabase(url.toString());
+    try {
+      await connA.exec('CREATE TABLE _migrations (name TEXT PRIMARY KEY, applied_at BIGINT NOT NULL)');
+      const migrationsDir = join(__dirname, '../src/db/migrations');
+      const files = (await readdir(migrationsDir))
+        .filter(isMigrationFile)
+        .filter((f) => parseInt(f, 10) < 119)
+        .sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+      for (const file of files) {
+        await connA.exec(await readFile(join(migrationsDir, file), 'utf8'));
+        await connA.execute('INSERT INTO _migrations (name, applied_at) VALUES ($1, $2)', [file, Date.now()]);
+      }
+      // Simulate partial 119 DDL (column exists, partial index absent, no _migrations row for 119).
+      await connA.exec('ALTER TABLE user_aliases ADD COLUMN IF NOT EXISTS encryption_version SMALLINT NOT NULL DEFAULT 0');
+
+      await Promise.all([runMigrations(connA), runMigrations(connB)]);
+
+      const recorded = await connA.query<{ name: string }>(
+        `SELECT name FROM _migrations WHERE name = '119_user_aliases_encryption.sql'`,
+      );
+      expect(recorded).toHaveLength(1);
+      const indexes = await connA.query<{ indexname: string }>(
+        `SELECT indexname FROM pg_indexes WHERE tablename = 'user_aliases' AND indexname = 'idx_user_aliases_unencrypted'`,
+      );
+      expect(indexes).toHaveLength(1);
+    } finally {
+      await connA.close();
+      await connB.close();
+      await db.exec(`DROP DATABASE "${dbName}"`);
+    }
   });
 
   it('enforces UNIQUE(user_id, name)', async () => {
@@ -330,32 +370,75 @@ describe('migratePlaintextAliasesToEncrypted', () => {
     expect(t3).toBeGreaterThan(t2);
   });
 
-  it('respects optimistic concurrency guard when a concurrent writer encrypts a row mid-migration', async () => {
+  it('respects CAS on value+description and retries rows modified while still encryption_version = 0', async () => {
     const userId = await freshUser();
     const id = randomHex(16);
     const now = Date.now();
     await db.execute(
       `INSERT INTO user_aliases (id, user_id, name, value, description, tags, source, encryption_version, created_at, updated_at)
-       VALUES ($1, $2, 'race', 'old-plaintext', 'old-desc', '[]'::jsonb, 'web', $3, $4, $4)`,
+       VALUES ($1, $2, 'race_v0', 'old-plaintext', NULL, '[]'::jsonb, 'web', $3, $4, $4)`,
       [id, userId, ALIAS_ENCRYPTION_VERSION_PLAINTEXT, now],
     );
 
-    // Wrap db so right before migration executes its UPDATE on this row, a concurrent writer upserts it.
-    let raced = false;
-    const racingDb: Database = {
-      ...db,
+    // Simulate a baseline v0 writer mutating value/description (still encryption_version = 0)
+    // between SELECT and UPDATE: CAS must reject the stale encrypt, re-read, and encrypt latest.
+    let racedV0 = false;
+    const casTestingDb = {
       query: db.query.bind(db),
       queryOne: db.queryOne.bind(db),
       exec: db.exec.bind(db),
       close: db.close.bind(db),
+      transaction: async <T>(fn: (tx: Database) => Promise<T>) => fn(casTestingDb as unknown as Database),
       execute: async (sql: string, params?: unknown[]) => {
-        if (!raced && sql.includes('UPDATE user_aliases') && params?.[0] === id) {
-          raced = true;
+        if (!racedV0 && sql.includes('UPDATE user_aliases') && params?.[0] === id) {
+          racedV0 = true;
+          // Exact baseline SQL (by id): writes new plaintext and leaves encryption_version = 0.
+          await db.execute(
+            `UPDATE user_aliases
+                SET name = $3, value = $4, description = $5, tags = $6::jsonb,
+                    source = $7, updated_at = $8
+              WHERE user_id = $1 AND id = $2`,
+            [userId, id, 'race_v0', 'newer-v0-plaintext', 'newer-v0-desc', '[]', 'web', Date.now()],
+          );
+        }
+        return db.execute(sql, params);
+      },
+    } as unknown as Database;
+
+    const result = await migratePlaintextAliasesToEncrypted(casTestingDb, TEST_ENC_KEY, 10);
+    expect(racedV0).toBe(true);
+    expect(result.migrated).toBeGreaterThanOrEqual(1);
+
+    const latest = await getAliasByName(db, userId, 'race_v0', TEST_ENC_KEY);
+    expect(latest?.value).toBe('newer-v0-plaintext');
+    expect(latest?.description).toBe('newer-v0-desc');
+  });
+
+  it('skips without clobbering when a concurrent v1 writer upgrades the row mid-migration', async () => {
+    const userId = await freshUser();
+    const id = randomHex(16);
+    const now = Date.now();
+    await db.execute(
+      `INSERT INTO user_aliases (id, user_id, name, value, description, tags, source, encryption_version, created_at, updated_at)
+       VALUES ($1, $2, 'race_v1', 'old-plaintext', 'old-desc', '[]'::jsonb, 'web', $3, $4, $4)`,
+      [id, userId, ALIAS_ENCRYPTION_VERSION_PLAINTEXT, now],
+    );
+
+    let racedV1 = false;
+    const racingDb = {
+      query: db.query.bind(db),
+      queryOne: db.queryOne.bind(db),
+      exec: db.exec.bind(db),
+      close: db.close.bind(db),
+      transaction: async <T>(fn: (tx: Database) => Promise<T>) => fn(racingDb as unknown as Database),
+      execute: async (sql: string, params?: unknown[]) => {
+        if (!racedV1 && sql.includes('UPDATE user_aliases') && params?.[0] === id) {
+          racedV1 = true;
           await upsertAlias(db, {
             id,
             existingId: id,
             userId,
-            name: 'race',
+            name: 'race_v1',
             value: 'newer-concurrent-value',
             description: 'newer-desc',
             source: 'web',
@@ -363,15 +446,149 @@ describe('migratePlaintextAliasesToEncrypted', () => {
         }
         return db.execute(sql, params);
       },
-    };
+    } as unknown as Database;
 
     const result = await migratePlaintextAliasesToEncrypted(racingDb, TEST_ENC_KEY, 10);
-    expect(raced).toBe(true);
+    expect(racedV1).toBe(true);
     expect(result.skipped).toBeGreaterThanOrEqual(1);
 
-    const latest = await getAliasByName(db, userId, 'race', TEST_ENC_KEY);
+    const latest = await getAliasByName(db, userId, 'race_v1', TEST_ENC_KEY);
     expect(latest?.value).toBe('newer-concurrent-value');
     expect(latest?.description).toBe('newer-desc');
+  });
+
+  it('covers baseline 68e2ac6b73 SQL write entrypoints, pre/post backfill interleaving, and old-read vs new-read on the same PK', async () => {
+    const userId = await freshUser();
+    const pkA = randomHex(16);
+    const pkB = randomHex(16);
+    const t0 = Date.now();
+
+    // 1. Pre-cutover baseline writes (both SQL entrypoints from 68e2ac6b73):
+    //    Entry #1: INSERT ... ON CONFLICT (user_id, name) DO UPDATE
+    await db.execute(
+      `INSERT INTO user_aliases (id, user_id, name, value, description, tags, source, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+       ON CONFLICT (user_id, name) DO UPDATE SET
+         value = EXCLUDED.value,
+         description = EXCLUDED.description,
+         tags = EXCLUDED.tags,
+         source = EXCLUDED.source,
+         updated_at = EXCLUDED.updated_at`,
+      [pkA, userId, 'entry_upsert', 'v0-initial', 'desc-initial', '["old"]', 'web', t0, t0],
+    );
+    await db.execute(
+      `INSERT INTO user_aliases (id, user_id, name, value, description, tags, source, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+       ON CONFLICT (user_id, name) DO UPDATE SET
+         value = EXCLUDED.value,
+         description = EXCLUDED.description,
+         tags = EXCLUDED.tags,
+         source = EXCLUDED.source,
+         updated_at = EXCLUDED.updated_at`,
+      [pkB, userId, 'entry_id', 'v0-id-initial', 'desc-id-initial', '[]', 'web', t0, t0],
+    );
+    //    Entry #2: UPDATE by id (baseline SQL)
+    await db.execute(
+      `UPDATE user_aliases
+          SET name = $3, value = $4, description = $5, tags = $6::jsonb,
+              source = $7, updated_at = $8
+        WHERE user_id = $1 AND id = $2`,
+      [userId, pkB, 'entry_id_renamed', 'v0-id-updated', null, '["renamed"]', 'mcp', t0 + 1],
+    );
+
+    // 2. Old baseline SELECT on the same PKs before cutover/backfill reads plaintext cleanly.
+    const oldReadA = await db.queryOne<{ id: string; name: string; value: string; description: string | null }>(
+      `SELECT id, name, value, description, tags, source, created_at, updated_at
+         FROM user_aliases WHERE user_id = $1 AND id = $2`,
+      [userId, pkA],
+    );
+    const oldReadB = await db.queryOne<{ id: string; name: string; value: string; description: string | null }>(
+      `SELECT id, name, value, description, tags, source, created_at, updated_at
+         FROM user_aliases WHERE user_id = $1 AND id = $2`,
+      [userId, pkB],
+    );
+    expect(oldReadA).toMatchObject({ id: pkA, name: 'entry_upsert', value: 'v0-initial', description: 'desc-initial' });
+    expect(oldReadB).toMatchObject({ id: pkB, name: 'entry_id_renamed', value: 'v0-id-updated', description: null });
+
+    // 3. Interleave baseline ON CONFLICT DO UPDATE (changing non-null description -> NULL) and
+    //    baseline UPDATE-by-id (changing NULL description -> non-null) right before backfill's CAS UPDATE.
+    let racedA = false;
+    let racedB = false;
+    const interleavedDb = {
+      query: db.query.bind(db),
+      queryOne: db.queryOne.bind(db),
+      exec: db.exec.bind(db),
+      close: db.close.bind(db),
+      transaction: async <T>(fn: (tx: Database) => Promise<T>) => fn(interleavedDb as unknown as Database),
+      execute: async (sql: string, params?: unknown[]) => {
+        if (!racedA && sql.includes('UPDATE user_aliases') && params?.[0] === pkA) {
+          racedA = true;
+          await db.execute(
+            `INSERT INTO user_aliases (id, user_id, name, value, description, tags, source, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+             ON CONFLICT (user_id, name) DO UPDATE SET
+               value = EXCLUDED.value,
+               description = EXCLUDED.description,
+               tags = EXCLUDED.tags,
+               source = EXCLUDED.source,
+               updated_at = EXCLUDED.updated_at`,
+            [randomHex(16), userId, 'entry_upsert', 'v0-upsert-raced', null, '["raced"]', 'web', t0, t0 + 2],
+          );
+        }
+        if (!racedB && sql.includes('UPDATE user_aliases') && params?.[0] === pkB) {
+          racedB = true;
+          await db.execute(
+            `UPDATE user_aliases
+                SET name = $3, value = $4, description = $5, tags = $6::jsonb,
+                    source = $7, updated_at = $8
+              WHERE user_id = $1 AND id = $2`,
+            [userId, pkB, 'entry_id_renamed', 'v0-id-raced', 'desc-now-non-null', '["raced-b"]', 'web', t0 + 3],
+          );
+        }
+        return db.execute(sql, params);
+      },
+    } as unknown as Database;
+
+    const migRes = await migratePlaintextAliasesToEncrypted(interleavedDb, TEST_ENC_KEY, 10);
+    expect(racedA).toBe(true);
+    expect(racedB).toBe(true);
+    expect(migRes.migrated).toBeGreaterThanOrEqual(2);
+
+    // 4. Post-cutover new reads on the SAME PKs decrypt the latest values with encryption_version = 1.
+    const newReadA = await getAliasById(db, userId, pkA, TEST_ENC_KEY);
+    const newReadB = await getAliasById(db, userId, pkB, TEST_ENC_KEY);
+    expect(newReadA).toMatchObject({ id: pkA, name: 'entry_upsert', value: 'v0-upsert-raced' });
+    expect(newReadA?.description).toBeUndefined();
+    expect(newReadB).toMatchObject({
+      id: pkB,
+      name: 'entry_id_renamed',
+      value: 'v0-id-raced',
+      description: 'desc-now-non-null',
+    });
+
+    // 5. Post-cutover new writes on the same PKs keep encryption_version = 1 and ciphertext at rest.
+    const postWriteA = await upsertAlias(db, {
+      id: randomHex(16),
+      userId,
+      name: 'entry_upsert',
+      value: 'v1-after-cutover',
+      description: 'v1-desc',
+      source: 'web',
+    }, TEST_ENC_KEY);
+    expect(postWriteA.id).toBe(pkA);
+    expect(postWriteA.value).toBe('v1-after-cutover');
+
+    const postWriteB = await upsertAlias(db, {
+      id: randomHex(16),
+      existingId: pkB,
+      userId,
+      name: 'entry_id_v1',
+      value: 'v1-id-after-cutover',
+      description: null,
+      source: 'mcp',
+    }, TEST_ENC_KEY);
+    expect(postWriteB.id).toBe(pkB);
+    expect((await getAliasById(db, userId, pkB, TEST_ENC_KEY))?.value).toBe('v1-id-after-cutover');
   });
 });
 
