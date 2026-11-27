@@ -21,7 +21,7 @@ import {
 } from '../../shared/supervision-execution-pool.js';
 import { detectInstalledAgents } from '../agent/agent-availability.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
-import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
+import { COPILOT_FALLBACK_MODEL_IDS, getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
 import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { getCodexHome } from '../util/codex-rollout-path.js';
 import { detectLocalAuthContext, hasLocalAuthCandidate, type LocalAuthContext } from '../agent/local-auth-context.js';
@@ -249,6 +249,8 @@ function staticFallbackModelsForSdk(sdkProvider: string): readonly string[] {
       return QWEN_MODEL_IDS;
     case 'muse-code-sdk':
       return MUSE_MODEL_IDS;
+    case 'copilot-sdk':
+      return COPILOT_FALLBACK_MODEL_IDS;
     default:
       return [];
   }
@@ -377,16 +379,36 @@ export async function probeExecutionPoolSdks(
 
     let providerList: ProbeableProviderList | null = liveProvider?.getCachedModels?.() ?? null;
     if (!providerList && sdkProvider === 'copilot-sdk' && copilotCfg) {
-      providerList = {
-        models: copilotCfg.isAuthenticated && !copilotCfg.probeError ? copilotCfg.models.map((m) => ({ id: m.id })) : [],
-        isAuthenticated: copilotCfg.isAuthenticated,
-        ...(copilotCfg.probeError ? { error: copilotCfg.probeError } : {}),
-      };
+      if (copilotCfg.isAuthenticated === true && !copilotCfg.probeError) {
+        providerList = {
+          models: copilotCfg.models.map((m) => ({ id: m.id })),
+          isAuthenticated: true,
+        };
+      } else if (copilotCfg.isColdFallback === true) {
+        // Cold unobserved cache: leave providerList null so local credential checks
+        // can still run without treating unprobed fallback as an explicit auth refusal.
+        providerList = null;
+      } else {
+        providerList = {
+          models: [],
+          isAuthenticated: false,
+          ...(copilotCfg.probeError ? { error: copilotCfg.probeError } : {}),
+        };
+      }
     } else if (!providerList && sdkProvider === 'cursor-headless' && cursorCfg) {
-      providerList = {
-        models: cursorCfg.isAuthenticated ? cursorCfg.availableModels.map((id) => ({ id })) : [],
-        isAuthenticated: cursorCfg.isAuthenticated,
-      };
+      if (cursorCfg.isAuthenticated === true) {
+        providerList = {
+          models: cursorCfg.availableModels.map((id) => ({ id })),
+          isAuthenticated: true,
+        };
+      } else if (cursorCfg.isColdFallback === true) {
+        providerList = null;
+      } else {
+        providerList = {
+          models: [],
+          isAuthenticated: false,
+        };
+      }
     } else if (
       !providerList
       && SAFE_CONNECTED_LIST_MODELS_SDKS.has(sdkProvider)

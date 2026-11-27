@@ -1,7 +1,7 @@
 import { CODEX_FAMILY, getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from './agent-types.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit.js';
 import { AGY_CLI_BINARY, AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from './agy-agent.js';
-import { DEFAULT_CODEX_SESSION_MODEL } from '../src/shared/models/options.js';
+import { DEFAULT_CODEX_SESSION_MODEL, normalizeClaudeCodeModelId } from '../src/shared/models/options.js';
 import {
   doesSharedContextBackendSupportPresets,
   normalizeSharedContextRuntimeBackend,
@@ -368,6 +368,34 @@ const CLAUDE_LEGACY_EXECUTION_MODEL_ALIASES: Readonly<Record<string, string>> = 
   'claude-opus-4-8[1m]': 'opus[1M]',
   'claude-opus-4-7': 'opus[1M]',
 };
+
+const CLAUDE_SHORTHAND_CANONICAL_SET = new Set<string>(['fable', 'opus[1M]', 'sonnet', 'haiku']);
+
+/**
+ * Directional match between a configured pool entry model and an observed
+ * runtime/session model for `agentType`:
+ * - Exact canonical equality always matches.
+ * - A canonical Claude shorthand in the pool (`sonnet`, `haiku`, `fable`,
+ *   `opus[1M]`) matches observed versioned Claude IDs of the same family
+ *   (e.g. `claude-sonnet-4-6` matches `sonnet`).
+ * - An explicit versioned Claude ID in the pool (e.g. `claude-sonnet-4-6`,
+ *   `claude-fable-5-1`, `claude-fable-6`) matches strictly that exact model so
+ *   distinct versions in the same family never cross-select.
+ */
+export function supervisionExecutionModelMatches(
+  agentType: string,
+  configModel: string,
+  observedModel: string,
+): boolean {
+  const canonicalConfig = normalizeSupervisionExecutionModel(agentType, configModel);
+  const canonicalObserved = normalizeSupervisionExecutionModel(agentType, observedModel);
+  if (!canonicalConfig || !canonicalObserved) return false;
+  if (canonicalConfig === canonicalObserved) return true;
+  if (isClaudeCodeFamily(agentType) && CLAUDE_SHORTHAND_CANONICAL_SET.has(canonicalConfig)) {
+    return normalizeClaudeCodeModelId(canonicalObserved) === canonicalConfig;
+  }
+  return false;
+}
 
 export function resolveClaudeExecutionModelForSwitch(model: string): string | undefined {
   const trimmed = model.trim();
@@ -752,11 +780,11 @@ export function evaluateSupervisionObservedIdentity(input: {
     || !input.actual.providerFamily || !input.actual.runtimeType) {
     return { ok: false, reason: 'identity_mismatch' };
   }
-  // Compare in the canonical namespace: `actual.model` is the daemon-OBSERVED id
-  // (e.g. `claude-opus-5`), configs hold the picker id (`opus[1M]`).
+  // Compare in the canonical namespace: explicit IDs match strictly while
+  // canonical Claude shorthands (`sonnet`, `haiku`, `fable`, `opus[1M]`) match
+  // observed versioned IDs in the same family.
   const canonicalConfig = normalizeSupervisionExecutionConfig(input.config);
   if (!canonicalConfig) return { ok: false, reason: 'identity_mismatch' };
-  const observedModel = normalizeSupervisionExecutionModel(input.actual.agentType, input.actual.model);
   const observedPreset = input.actual.ccPresetId === undefined ? undefined : text(input.actual.ccPresetId);
   const observedBackend = normalizeSharedContextRuntimeBackend(input.actual.agentType);
   if (input.actual.ccPresetId !== undefined
@@ -766,7 +794,7 @@ export function evaluateSupervisionObservedIdentity(input: {
   if (canonicalConfig.agentType !== input.actual.agentType
     || canonicalConfig.providerFamily !== input.actual.providerFamily
     || canonicalConfig.runtimeType !== input.actual.runtimeType
-    || canonicalConfig.model !== observedModel
+    || !supervisionExecutionModelMatches(input.actual.agentType, canonicalConfig.model, input.actual.model)
     || canonicalConfig.ccPresetId !== observedPreset) {
     return { ok: false, reason: 'identity_mismatch' };
   }
@@ -785,13 +813,11 @@ export function evaluateSupervisionExecutionBinding(input: {
   if (input.pools.state !== 'configured') return { ok: false, reason: 'pool_unconfigured' };
   if (input.pool === 'economy' && !input.economyPolicy) return { ok: false, reason: 'economy_policy_required' };
   const pool = input.pool === 'primary' ? input.pools.primaryDevelopmentPool : input.pools.economyTaskPool;
-  const observedModel = input.actual.model
-    ? normalizeSupervisionExecutionModel(input.actual.agentType ?? '', input.actual.model)
-    : '';
   const requested = pool.configs.find((config) => config.capabilityId === input.requestedCapabilityId)
     ?? (!input.requestedCapabilityId ? pool.configs.find((config) => config.agentType === input.actual.agentType
       && config.providerFamily === input.actual.providerFamily && config.runtimeType === input.actual.runtimeType
-      && config.model === observedModel && config.ccPresetId === input.actual.ccPresetId) : undefined);
+      && supervisionExecutionModelMatches(input.actual.agentType ?? config.agentType, config.model, input.actual.model ?? '')
+      && config.ccPresetId === input.actual.ccPresetId) : undefined);
   // Order matters: a caller naming a capability that is not in the pool gets
   // `unselected_config`, which must not be masked by an identity reason.
   const preCheck = evaluateSupervisionObservedIdentity({

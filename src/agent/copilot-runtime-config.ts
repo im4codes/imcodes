@@ -25,6 +25,8 @@ export interface CopilotRuntimeConfig {
   models: CopilotModelInfo[];
   /** True when `getAuthStatus()` reported authenticated. */
   isAuthenticated: boolean;
+  /** True only when returning an unprobed cold fallback instead of a real auth probe result. */
+  isColdFallback?: boolean;
   /** Resolved Copilot CLI version string, if the probe succeeded. */
   cliVersion?: string;
   /** Probe error message when the SDK couldn't start — surfaced for diagnostics. */
@@ -82,6 +84,7 @@ function fallbackRuntimeConfig(): CopilotRuntimeConfig {
     availableModels: [...FALLBACK_COPILOT_MODEL_IDS],
     models: FALLBACK_COPILOT_MODEL_IDS.map((id) => ({ id })),
     isAuthenticated: false,
+    isColdFallback: true,
   };
 }
 

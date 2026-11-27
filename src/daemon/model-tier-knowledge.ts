@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { dirname } from 'node:path';
 import {
   MODEL_TIERS,
   normalizeModelTierKnowledgeProvider,
@@ -9,7 +9,13 @@ import {
 } from '../../shared/supervision-execution-pool.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 import { imcodesStatePath } from '../util/imcodes-state-dir.js';
+import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
+
+const require = createRequire(import.meta.url);
+suppressSqliteExperimentalWarning();
+const sqlite = require('node:sqlite') as typeof import('node:sqlite');
+const { DatabaseSync } = sqlite;
 
 export const MODEL_TIER_KNOWLEDGE_PATH_ENV = 'IMCODES_MODEL_TIER_KNOWLEDGE_PATH' as const;
 const MODEL_TIER_KNOWLEDGE_FILE = 'model-tier-knowledge.json';
@@ -18,12 +24,9 @@ const MAX_KNOWLEDGE_RECORDS = 500;
 const MAX_SOURCE_CHARS = 200;
 const MAX_NOTES_CHARS = 300;
 const KNOWLEDGE_LOCK_TIMEOUT_MS = 5_000;
-const CORRUPT_LOCK_GRACE_MS = 1_000;
-const SLEEP_INT32 = new Int32Array(new SharedArrayBuffer(4));
 
 export interface UpsertModelTierKnowledgeOptions {
   lockTimeoutMs?: number;
-  corruptLockGraceMs?: number;
 }
 
 export interface LearnedModelTierInput {
@@ -119,128 +122,102 @@ export function loadModelTierKnowledge(filePath = resolveModelTierKnowledgePath(
   }
 }
 
-function isProcessAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+function isSqliteBusyError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === 'ERR_SQLITE_ERROR' && /database is locked|SQLITE_BUSY/i.test(msg)
+    || /database is locked|SQLITE_BUSY/i.test(msg);
+}
+
+/**
+ * Acquire an OS-kernel transactional lock via SQLite `BEGIN IMMEDIATE` on a
+ * companion `.lock.db` file so concurrent processes serialize strictly without
+ * fragile lock-directory deletion or stale-age races. OS kernel releases the
+ * descriptor lock immediately if any holder crashes.
+ */
+function withSqliteKnowledgeLockSync<T>(
+  filePath: string,
+  options: UpsertModelTierKnowledgeOptions,
+  fn: () => T,
+): T {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const lockDbPath = `${filePath}.lock.db`;
+  const timeoutMs = Math.max(1, Math.floor(options.lockTimeoutMs ?? KNOWLEDGE_LOCK_TIMEOUT_MS));
+  const db = new DatabaseSync(lockDbPath);
+  let inTx = false;
   try {
-    process.kill(pid, 0);
-    return true;
+    db.exec(`PRAGMA busy_timeout = ${timeoutMs};`);
+    try {
+      db.exec('BEGIN IMMEDIATE;');
+      inTx = true;
+    } catch (err) {
+      if (isSqliteBusyError(err)) {
+        throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDbPath}`);
+      }
+      throw err;
+    }
+    const result = fn();
+    db.exec('COMMIT;');
+    inTx = false;
+    return result;
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
-}
-
-interface KnowledgeLockOwner {
-  pid: number;
-  token: string;
-  createdAt: number;
-}
-
-function readKnowledgeLockOwner(lockDirPath: string): KnowledgeLockOwner | null {
-  try {
-    const ownerFile = join(lockDirPath, 'owner.json');
-    if (!existsSync(ownerFile)) return null;
-    const raw = readFileSync(ownerFile, 'utf8');
-    if (!raw.trim()) return null;
-    const parsed = JSON.parse(raw) as Partial<KnowledgeLockOwner>;
-    if (
-      typeof parsed.pid === 'number'
-      && Number.isSafeInteger(parsed.pid)
-      && parsed.pid > 0
-      && typeof parsed.token === 'string'
-      && parsed.token.length > 0
-      && typeof parsed.createdAt === 'number'
-      && Number.isFinite(parsed.createdAt)
-    ) {
-      return parsed as KnowledgeLockOwner;
+    if (inTx) {
+      try {
+        db.exec('ROLLBACK;');
+      } catch { /* ignore rollback error */ }
     }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-function tryBreakStaleKnowledgeLock(lockDirPath: string, corruptLockGraceMs: number): boolean {
-  try {
-    const owner = readKnowledgeLockOwner(lockDirPath);
-    if (owner) {
-      // Never break a lock held by a still-live OS process, regardless of age.
-      if (isProcessAlive(owner.pid)) return false;
-      rmSync(lockDirPath, { recursive: true, force: true });
-      return true;
-    }
-    // Owner metadata missing or corrupt/truncated (e.g. crash right after mkdir):
-    // allow a short grace window for a fresh acquirer to finish renaming owner.json,
-    // then reclaim the orphaned lock directory.
-    const stat = statSync(lockDirPath);
-    if (Date.now() - stat.mtimeMs >= corruptLockGraceMs) {
-      rmSync(lockDirPath, { recursive: true, force: true });
-      return true;
-    }
-  } catch {
-    return false;
-  }
-  return false;
-}
-
-function tryAcquireKnowledgeLock(lockDirPath: string): (() => void) | null {
-  try {
-    mkdirSync(lockDirPath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return null;
     throw err;
+  } finally {
+    try {
+      db.close();
+    } catch { /* ignore close error */ }
   }
-  const token = randomUUID();
-  const ownerFile = join(lockDirPath, 'owner.json');
-  const tmpOwnerFile = join(lockDirPath, `owner.json.tmp-${process.pid}-${token}`);
+}
+
+async function withSqliteKnowledgeLockAsync<T>(
+  filePath: string,
+  options: UpsertModelTierKnowledgeOptions,
+  fn: () => T,
+): Promise<T> {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const lockDbPath = `${filePath}.lock.db`;
+  const timeoutMs = Math.max(1, Math.floor(options.lockTimeoutMs ?? KNOWLEDGE_LOCK_TIMEOUT_MS));
+  const deadline = Date.now() + timeoutMs;
+  const db = new DatabaseSync(lockDbPath);
   try {
-    writeFileSync(tmpOwnerFile, JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), 'utf8');
-    renameSync(tmpOwnerFile, ownerFile);
-  } catch {
-    try {
-      rmSync(tmpOwnerFile, { force: true });
-    } catch { /* ignore cleanup */ }
-  }
-  return () => {
-    try {
-      const current = readKnowledgeLockOwner(lockDirPath);
-      if (!current || current.token !== token || current.pid !== process.pid) return;
-      rmSync(lockDirPath, { recursive: true, force: true });
-    } catch { /* ignore release error */ }
-  };
-}
-
-function acquireKnowledgeLockSync(filePath: string, options: UpsertModelTierKnowledgeOptions = {}): () => void {
-  mkdirSync(dirname(filePath), { recursive: true });
-  const lockDirPath = `${filePath}.lock`;
-  const timeoutMs = options.lockTimeoutMs ?? KNOWLEDGE_LOCK_TIMEOUT_MS;
-  const corruptGraceMs = options.corruptLockGraceMs ?? CORRUPT_LOCK_GRACE_MS;
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    const release = tryAcquireKnowledgeLock(lockDirPath);
-    if (release) return release;
-    if (tryBreakStaleKnowledgeLock(lockDirPath, corruptGraceMs)) continue;
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDirPath}`);
+    db.exec('PRAGMA busy_timeout = 0;');
+    let inTx = false;
+    while (true) {
+      try {
+        db.exec('BEGIN IMMEDIATE;');
+        inTx = true;
+        break;
+      } catch (err) {
+        if (!isSqliteBusyError(err)) throw err;
+        if (Date.now() >= deadline) {
+          throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDbPath}`);
+        }
+        const jitter = 5 + Math.floor(Math.random() * 11);
+        await new Promise((resolve) => setTimeout(resolve, jitter));
+      }
     }
-    Atomics.wait(SLEEP_INT32, 0, 0, 10);
-  }
-}
-
-async function acquireKnowledgeLockAsync(filePath: string, options: UpsertModelTierKnowledgeOptions = {}): Promise<() => void> {
-  mkdirSync(dirname(filePath), { recursive: true });
-  const lockDirPath = `${filePath}.lock`;
-  const timeoutMs = options.lockTimeoutMs ?? KNOWLEDGE_LOCK_TIMEOUT_MS;
-  const corruptGraceMs = options.corruptLockGraceMs ?? CORRUPT_LOCK_GRACE_MS;
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    const release = tryAcquireKnowledgeLock(lockDirPath);
-    if (release) return release;
-    if (tryBreakStaleKnowledgeLock(lockDirPath, corruptGraceMs)) continue;
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDirPath}`);
+    try {
+      const result = fn();
+      db.exec('COMMIT;');
+      inTx = false;
+      return result;
+    } catch (err) {
+      if (inTx) {
+        try {
+          db.exec('ROLLBACK;');
+        } catch { /* ignore rollback error */ }
+      }
+      throw err;
     }
-    const jitter = 5 + Math.floor(Math.random() * 11);
-    await new Promise((resolve) => setTimeout(resolve, jitter));
+  } finally {
+    try {
+      db.close();
+    } catch { /* ignore close error */ }
   }
 }
 
@@ -295,12 +272,11 @@ export function upsertModelTierKnowledgeSync(
   options: UpsertModelTierKnowledgeOptions = {},
 ): LearnedModelTierRecord[] {
   assertNotRealImcodesPathInTests(filePath, MODEL_TIER_KNOWLEDGE_FILE);
-  const release = acquireKnowledgeLockSync(filePath, options);
-  try {
-    return performLockedKnowledgeUpsert(updates, filePath, now);
-  } finally {
-    release();
-  }
+  return withSqliteKnowledgeLockSync(
+    filePath,
+    options,
+    () => performLockedKnowledgeUpsert(updates, filePath, now),
+  );
 }
 
 export async function upsertModelTierKnowledge(
@@ -310,14 +286,11 @@ export async function upsertModelTierKnowledge(
   options: UpsertModelTierKnowledgeOptions = {},
 ): Promise<LearnedModelTierRecord[]> {
   assertNotRealImcodesPathInTests(filePath, MODEL_TIER_KNOWLEDGE_FILE);
-  const run = writeChain.catch(() => {}).then(async () => {
-    const release = await acquireKnowledgeLockAsync(filePath, options);
-    try {
-      return performLockedKnowledgeUpsert(updates, filePath, now);
-    } finally {
-      release();
-    }
-  });
+  const run = writeChain.catch(() => {}).then(() => withSqliteKnowledgeLockAsync(
+    filePath,
+    options,
+    () => performLockedKnowledgeUpsert(updates, filePath, now),
+  ));
   writeChain = run.then(() => undefined, () => undefined);
   return run;
 }

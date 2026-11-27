@@ -513,4 +513,49 @@ describe('execution pool MCP tools', () => {
     expect(probeSdks).not.toHaveBeenCalled();
     expect(setDefaults).not.toHaveBeenCalled();
   });
+
+  it('switches askUser guidance to ask-user-first without announcing an active pool when only unknown models exist and recommendedPresets is empty', async () => {
+    const { classifySdkModelTiers } = await import('../../shared/supervision-execution-pool.js');
+    const classified = classifySdkModelTiers('codex-sdk', ['nova-x1']);
+    expect(classified.unknownModels).toEqual(['nova-x1']);
+    expect(classified.tiers).toEqual({});
+
+    const handlers = createExecutionPoolMcpToolHandlers(caller, {
+      getDefaults: () => normalizeSupervisorDefaultConfig({
+        backend: 'codex-sdk',
+        model: 'nova-x1',
+        executionPools: {
+          state: 'legacy_unconfigured',
+          primaryDevelopmentPool: { configs: [] },
+          economyTaskPool: { configs: [] },
+        },
+      }),
+      isProjectBrain: () => true,
+      loadKnowledge: () => [],
+      probeSdks: () => ({
+        currentBrain: { provider: 'codex-sdk', providerFamily: 'openai', model: 'nova-x1' },
+        sdks: [
+          {
+            provider: 'codex-sdk',
+            providerFamily: 'openai',
+            loggedIn: true,
+            ...classified,
+            source: 'live_catalog',
+          },
+        ],
+      }),
+    });
+
+    const res = await handlers.execution_pool_get();
+    expect(res).toMatchObject({
+      status: 'ok',
+      configured: false,
+      needsModelResearch: true,
+      unknownModels: [{ provider: 'codex-sdk', model: 'nova-x1' }],
+      recommendedPresets: [],
+    });
+    expect(String(res.askUser)).toContain('recommendedPresets remains empty');
+    expect(String(res.askUser)).toContain('ask the user');
+    expect(String(res.askUser)).not.toContain('without waiting for approval');
+  });
 });

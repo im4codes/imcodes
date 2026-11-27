@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -564,47 +565,186 @@ describe('probeExecutionPoolSdks', () => {
     }
   });
 
-  it('never breaks a live paused lock holder, validates owner tokens, and recovers from truncated owner.json', async () => {
+  it('distinguishes cold unprobed Copilot/Cursor caches from explicit auth refusals and uses local credentials when cold', async () => {
+    const dir = makeTmpDir();
+    const homeDir = join(dir, 'home');
+    const brainSession = {
+      name: 'deck_brain',
+      projectName: 'p',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/p',
+      state: 'running',
+      activeModel: 'sonnet',
+      ccSessionId: 'cc-sess-1',
+      sessionInstanceId: 'inst-brain',
+      runtimeEpoch: 'epoch-brain',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as SessionRecord;
+
+    const { __copilotRuntimeConfigInternals, COPILOT_FALLBACK_MODEL_IDS, getCopilotRuntimeConfig } = await import('../../src/agent/copilot-runtime-config.js');
+    const { __cursorRuntimeConfigInternals, getCursorRuntimeConfig } = await import('../../src/agent/cursor-runtime-config.js');
+    __copilotRuntimeConfigInternals.clearCache();
+    __cursorRuntimeConfigInternals.clearCache();
+
+    // 1. Cold cache + local GITHUB_TOKEN -> copilot-sdk uses local auth check & surfaces COPILOT_FALLBACK_MODEL_IDS as static_fallback
+    const coldWithToken = await probeExecutionPoolSdks({
+      callerSessionName: 'deck_brain',
+      deps: {
+        env: { HOME: homeDir, GITHUB_TOKEN: 'ghp_test_token_123', ANTHROPIC_API_KEY: 'sk-ant-test' },
+        homeDir,
+        listSessions: () => [brainSession],
+        getSession: () => brainSession,
+        detectInstalledAgents: async () => ({
+          'claude-code-sdk': { installed: true },
+          'copilot-sdk': { installed: true },
+          'cursor-headless': { installed: true },
+        } as any),
+        getCopilotRuntimeConfig,
+        getCursorRuntimeConfig,
+        fileExists: () => false,
+        readFile: () => '',
+        loadKnowledge: () => [],
+      },
+    });
+    const copilotColdAuth = coldWithToken.sdks.find((s) => s.provider === 'copilot-sdk');
+    expect(copilotColdAuth).toMatchObject({
+      provider: 'copilot-sdk',
+      loggedIn: true,
+      source: 'static_fallback',
+      models: [...COPILOT_FALLBACK_MODEL_IDS],
+    });
+    expect(coldWithToken.sdks.find((s) => s.provider === 'cursor-headless')?.loggedIn).toBe(false);
+
+    // 2. Explicit probed auth refusal (isColdFallback absent, isAuthenticated: false) -> stays loggedIn: false even with GITHUB_TOKEN
+    const explicitRefusal = await probeExecutionPoolSdks({
+      callerSessionName: 'deck_brain',
+      deps: {
+        env: { HOME: homeDir, GITHUB_TOKEN: 'ghp_test_token_123', ANTHROPIC_API_KEY: 'sk-ant-test' },
+        homeDir,
+        listSessions: () => [brainSession],
+        getSession: () => brainSession,
+        detectInstalledAgents: async () => ({
+          'claude-code-sdk': { installed: true },
+          'copilot-sdk': { installed: true },
+          'cursor-headless': { installed: true },
+        } as any),
+        getCopilotRuntimeConfig: async () => ({
+          availableModels: [...COPILOT_FALLBACK_MODEL_IDS],
+          models: COPILOT_FALLBACK_MODEL_IDS.map((id) => ({ id })),
+          isAuthenticated: false,
+        }),
+        getCursorRuntimeConfig: async () => ({
+          availableModels: [],
+          isAuthenticated: false,
+        }),
+        detectLocalAuthContext: async (providerId) => ({
+          providerId,
+          method: 'env-token',
+          source: 'env:GITHUB_TOKEN',
+          authenticated: true,
+          reusable: true,
+          env: {},
+        }),
+        fileExists: () => false,
+        readFile: () => '',
+        loadKnowledge: () => [],
+      },
+    });
+    expect(explicitRefusal.sdks.find((s) => s.provider === 'copilot-sdk')?.loggedIn).toBe(false);
+    expect(explicitRefusal.sdks.find((s) => s.provider === 'cursor-headless')?.loggedIn).toBe(false);
+  });
+
+  it('serializes across live paused holders and recovers cleanly across interleaved post-crash processes without breaking live locks', async () => {
     const dir = makeTmpDir();
     const knowledgeFile = join(dir, 'model-tier-knowledge.json');
-    const lockDir = `${knowledgeFile}.lock`;
-    const ownerFile = join(lockDir, 'owner.json');
+    const lockDbPath = `${knowledgeFile}.lock.db`;
+    const moduleUrl = pathToFileURL(resolve(process.cwd(), 'src/daemon/model-tier-knowledge.ts')).href;
+    const tsxLoader = pathToFileURL(resolve(process.cwd(), 'node_modules/tsx/dist/loader.mjs')).href;
+    const require = createRequire(import.meta.url);
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
-    // 1. Live holder with 15s-old createdAt MUST NOT be broken by another writer
-    mkdirSync(lockDir, { recursive: true });
-    writeFileSync(ownerFile, JSON.stringify({
-      pid: process.pid,
-      token: 'live-holder-token',
-      createdAt: Date.now() - 15_000,
-    }), 'utf8');
+    // 1. Live holder in another OS process pauses inside BEGIN IMMEDIATE -> waiting writer with short timeout fails boundedly without breaking live lock
+    const holderReadyScript = [
+      `import { createRequire } from 'node:module';`,
+      `const require = createRequire(import.meta.url);`,
+      `const { DatabaseSync } = require('node:sqlite');`,
+      `const db = new DatabaseSync(${JSON.stringify(lockDbPath)});`,
+      `db.exec('BEGIN IMMEDIATE;');`,
+      `process.stdout.write('LOCKED\\n');`,
+      `await new Promise((r) => setTimeout(r, 350));`,
+      `db.exec('COMMIT;');`,
+      `db.close();`,
+    ].join('\n');
+    const holder = spawn(process.execPath, ['--input-type=module', '-e', holderReadyScript], {
+      cwd: process.cwd(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const holderExitPromise = new Promise<void>((resolveExit, rejectExit) => {
+      holder.on('exit', (code) => (code === 0 ? resolveExit() : rejectExit(new Error(`holder exited ${code}`))));
+    });
+    await new Promise<void>((resolveReady, rejectReady) => {
+      holder.stdout.on('data', (chunk) => {
+        if (String(chunk).includes('LOCKED')) resolveReady();
+      });
+      holder.on('error', rejectReady);
+    });
 
     await expect(upsertModelTierKnowledge(
-      [{ provider: 'codex-sdk', model: 'gpt-timeout-blocked', tier: 'secondary' }],
+      [{ provider: 'codex-sdk', model: 'gpt-blocked-by-live-holder', tier: 'secondary' }],
       knowledgeFile,
       1_000,
-      { lockTimeoutMs: 80 },
+      { lockTimeoutMs: 60 },
     )).rejects.toThrow(/Timed out acquiring model-tier-knowledge lock/);
 
-    // Live holder lock directory and token remain untouched
-    expect(JSON.parse(readFileSync(ownerFile, 'utf8'))).toMatchObject({
-      pid: process.pid,
-      token: 'live-holder-token',
+    // Wait for live holder to finish cleanly
+    await holderExitPromise;
+
+    // 2. Simulated crash: holder acquires BEGIN IMMEDIATE and dies with SIGKILL;
+    // two concurrent recovery workers C & D interleave immediately — OS kernel releases dead lock,
+    // SQLite serializes C & D strictly so neither steals the other's live lock and both records survive.
+    const crashHolder = spawn(process.execPath, ['--input-type=module', '-e', [
+      `import { createRequire } from 'node:module';`,
+      `const require = createRequire(import.meta.url);`,
+      `const { DatabaseSync } = require('node:sqlite');`,
+      `const db = new DatabaseSync(${JSON.stringify(lockDbPath)});`,
+      `db.exec('CREATE TABLE IF NOT EXISTS _k (id INTEGER PRIMARY KEY); BEGIN IMMEDIATE; INSERT INTO _k (id) VALUES (1);');`,
+      `process.stdout.write('CRASH_READY\\n');`,
+      `setInterval(() => {}, 1000);`,
+    ].join('\n')], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] });
+    await new Promise<void>((resolveReady, rejectReady) => {
+      crashHolder.stdout.on('data', (chunk) => {
+        if (String(chunk).includes('CRASH_READY')) resolveReady();
+      });
+      crashHolder.on('error', rejectReady);
     });
-    rmSync(lockDir, { recursive: true, force: true });
+    crashHolder.kill('SIGKILL');
+    await new Promise<void>((resolveExit) => { crashHolder.on('exit', () => resolveExit()); });
+    expect(typeof DatabaseSync).toBe('function');
 
-    // 2. Crash-truncated owner.json with stale mtime recovers safely instead of hanging forever
-    mkdirSync(lockDir, { recursive: true });
-    writeFileSync(ownerFile, '{"pid":999999,"tok', 'utf8');
-    const past = new Date(Date.now() - 2_000);
-    utimesSync(lockDir, past, past);
+    const runRecoveryWorker = (provider: string, model: string, tier: string) => new Promise<void>((resolveWorker, rejectWorker) => {
+      const script = [
+        `import { upsertModelTierKnowledge } from ${JSON.stringify(moduleUrl)};`,
+        `await upsertModelTierKnowledge([{ provider: ${JSON.stringify(provider)}, model: ${JSON.stringify(model)}, tier: ${JSON.stringify(tier)}, source: 'recovery' }], ${JSON.stringify(knowledgeFile)});`,
+      ].join('\n');
+      const child = spawn(process.execPath, ['--import', tsxLoader, '--input-type=module', '-e', script], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.on('data', (c) => { stderr += String(c); });
+      child.on('error', rejectWorker);
+      child.on('exit', (code) => (code === 0 ? resolveWorker() : rejectWorker(new Error(`recovery ${model} failed ${code}: ${stderr}`))));
+    });
 
-    const recovered = await upsertModelTierKnowledge(
-      [{ provider: 'claude-code-sdk', model: 'claude-recovered-1', tier: 'flagship', source: 'recovery' }],
-      knowledgeFile,
-      2_000,
-      { corruptLockGraceMs: 50, lockTimeoutMs: 500 },
-    );
-    expect(recovered.map((r) => r.model)).toEqual(['claude-recovered-1']);
-    expect(loadModelTierKnowledge(knowledgeFile).map((r) => r.model)).toEqual(['claude-recovered-1']);
+    await Promise.all([
+      runRecoveryWorker('claude-code-sdk', 'claude-recovery-c', 'flagship'),
+      runRecoveryWorker('codex-sdk', 'gpt-recovery-d', 'secondary'),
+    ]);
+
+    expect(loadModelTierKnowledge(knowledgeFile).map((r) => r.model).sort()).toEqual(['claude-recovery-c', 'gpt-recovery-d']);
   });
 });

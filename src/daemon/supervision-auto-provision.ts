@@ -12,7 +12,7 @@ import {
   DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS,
   normalizeSupervisionExecutionPools,
   normalizeSupervisionExecutionConfig,
-  normalizeSupervisionExecutionModel,
+  supervisionExecutionModelMatches,
   type SupervisionAuditDegradedReason,
   type SupervisionExecutionConfig,
   type SupervisionProvisionFailureReason,
@@ -221,7 +221,7 @@ export function configMatchesSession(
     && (session.runtimeType ?? 'process') === config.runtimeType
     && resolvePeerAuditProviderFamily(session) === config.providerFamily
     && typeof model === 'string'
-    && normalizeSupervisionExecutionModel(session.agentType, model) === config.model
+    && supervisionExecutionModelMatches(session.agentType, config.model, model)
     && session.ccPreset === config.ccPresetId
     && sessionMatchesProvisionedIdentity(session, identityPrompt);
 }

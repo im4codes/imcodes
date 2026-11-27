@@ -12,6 +12,7 @@ import {
   planSupervisionExecutionCapacity,
   resolveClaudeExecutionModelForSwitch,
   supervisionExecutionConfigRole,
+  supervisionExecutionModelMatches,
   evaluateSupervisionObservedIdentity,
   evaluateSupervisionAutomationPoolGate,
   buildSupervisionPoolGateGuidance,
@@ -19,12 +20,16 @@ import {
   SUPERVISION_AUDIT_ROUTING_REASONS,
   resolveSupervisionTierPair,
   supervisionTierPriority,
+  evaluateSupervisionExecutionBinding,
   type ExecutionPoolSdkSummary,
   type LearnedModelTierRecord,
   type SupervisionExecutionConfig,
 } from '../../shared/supervision-execution-pool.js';
 import { configFromExecutionPoolEntry } from '../../shared/execution-pool-mcp.js';
 import { normalizeClaudeSdkModelForProvider } from '../../src/agent/sdk-runtime-config.js';
+import { configMatchesSession } from '../../src/daemon/supervision-auto-provision.js';
+import { listTaskPairCandidates } from '../../src/daemon/task-pairs/pool.js';
+import type { SessionRecord } from '../../src/store/session-store.js';
 import { SUPERVISION_SUPPORTED_UI_LOCALES } from '../../shared/supervision-config.js';
 
 function config(agentType: string, providerFamily: string, model: string, ccPresetId?: string): SupervisionExecutionConfig {
@@ -887,5 +892,76 @@ describe('dynamic model tier classification & cross-SDK recommendations', () => 
       secondary: 'sonnet',
       economy: 'haiku',
     });
+  });
+
+  it('directionally matches legacy shorthand pool configs to versioned Claude sessions while keeping explicit IDs strict', () => {
+    const shorthandCfg = config('claude-code-sdk', 'anthropic', 'sonnet');
+    const explicit46Cfg = config('claude-code-sdk', 'anthropic', 'claude-sonnet-4-6');
+    const poolsWithShorthand = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [shorthandCfg] },
+      economyTaskPool: { configs: [] },
+    });
+    const poolsWithExplicit46 = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [explicit46Cfg] },
+      economyTaskPool: { configs: [] },
+    });
+
+    const brain = {
+      name: 'deck_brain_match',
+      projectName: 'p-match',
+      role: 'brain' as const,
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/p-match',
+      state: 'running' as const,
+      runtimeType: 'transport' as const,
+      transportConfig: { supervision: { executionPools: poolsWithShorthand } },
+    } as unknown as SessionRecord;
+    const worker46 = {
+      name: 'deck_sub_sonnet46',
+      parentSession: brain.name,
+      projectName: 'p-match',
+      role: 'w1' as const,
+      agentType: 'claude-code-sdk',
+      providerId: 'claude-code-sdk',
+      projectDir: '/tmp/p-match',
+      state: 'idle' as const,
+      runtimeType: 'transport' as const,
+      activeModel: 'claude-sonnet-4-6',
+      sessionInstanceId: 'inst-s46',
+      runtimeEpoch: 'epoch-s46',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as SessionRecord;
+    const worker45 = { ...worker46, name: 'deck_sub_sonnet45', activeModel: 'claude-sonnet-4-5', sessionInstanceId: 'inst-s45', runtimeEpoch: 'epoch-s45' } as SessionRecord;
+
+    // 1. Legacy shorthand `sonnet` matches versioned `claude-sonnet-4-6` across configMatchesSession, binding, observed identity, and candidate selection
+    expect(supervisionExecutionModelMatches('claude-code-sdk', 'sonnet', 'claude-sonnet-4-6')).toBe(true);
+    expect(configMatchesSession(shorthandCfg, worker46)).toBe(true);
+    expect(evaluateSupervisionObservedIdentity({ config: shorthandCfg, actual: actual(shorthandCfg, { model: 'claude-sonnet-4-6' }), pool: 'primary' })).toEqual({ ok: true });
+    expect(evaluateSupervisionExecutionBinding({ pools: poolsWithShorthand, pool: 'primary', actual: actual(shorthandCfg, { model: 'claude-sonnet-4-6' }) })).toMatchObject({ ok: true, requested: { model: 'sonnet' } });
+    expect(listTaskPairCandidates({ brain: brain.name, role: 'executor', pool: 'primary', exclude: new Set() }, {
+      listSessions: () => [brain, worker46],
+      getSession: (name) => (name === brain.name ? brain : worker46),
+      hasPendingMessages: () => false,
+    }).map((s) => s.name)).toEqual([worker46.name]);
+
+    // 2. Explicit `claude-sonnet-4-6` matches ONLY `claude-sonnet-4-6`, never `claude-sonnet-4-5` or bare `sonnet`
+    expect(supervisionExecutionModelMatches('claude-code-sdk', 'claude-sonnet-4-6', 'claude-sonnet-4-6')).toBe(true);
+    expect(supervisionExecutionModelMatches('claude-code-sdk', 'claude-sonnet-4-6', 'claude-sonnet-4-5')).toBe(false);
+    expect(supervisionExecutionModelMatches('claude-code-sdk', 'claude-sonnet-4-6', 'sonnet')).toBe(false);
+    expect(configMatchesSession(explicit46Cfg, worker46)).toBe(true);
+    expect(configMatchesSession(explicit46Cfg, worker45)).toBe(false);
+    expect(evaluateSupervisionObservedIdentity({ config: explicit46Cfg, actual: actual(explicit46Cfg, { model: 'claude-sonnet-4-5' }), pool: 'primary' })).toEqual({ ok: false, reason: 'identity_mismatch' });
+    expect(evaluateSupervisionExecutionBinding({ pools: poolsWithExplicit46, pool: 'primary', actual: actual(explicit46Cfg, { model: 'claude-sonnet-4-5' }) })).toEqual({ ok: false, reason: 'unselected_config' });
+    const brainExplicit46 = { ...brain, transportConfig: { supervision: { executionPools: poolsWithExplicit46 } } } as unknown as SessionRecord;
+    expect(listTaskPairCandidates({ brain: brainExplicit46.name, role: 'executor', pool: 'primary', exclude: new Set() }, {
+      listSessions: () => [brainExplicit46, worker45, worker46],
+      getSession: (name) => (name === brainExplicit46.name ? brainExplicit46 : name === worker45.name ? worker45 : worker46),
+      hasPendingMessages: () => false,
+    }).map((s) => s.name)).toEqual([worker46.name]);
   });
 });

@@ -15,6 +15,8 @@ export interface CursorRuntimeConfig {
   loggedInAs?: string;
   /** True when the CLI reported an authenticated state. */
   isAuthenticated: boolean;
+  /** True only when returning an unprobed cold empty default instead of a real CLI probe result. */
+  isColdFallback?: boolean;
 }
 
 let cached: { expiresAt: number; value: CursorRuntimeConfig } | null = null;
@@ -42,6 +44,7 @@ function emptyRuntimeConfig(): CursorRuntimeConfig {
   return {
     availableModels: [],
     isAuthenticated: false,
+    isColdFallback: true,
   };
 }
 

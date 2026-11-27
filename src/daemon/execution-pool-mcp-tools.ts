@@ -112,8 +112,11 @@ function buildRecommendationsForOutput(
   };
 }
 
-const UNCONFIGURED_POOL_GUIDANCE =
-  'No execution pool is configured. For code/development tasks, reuse already classified models, research only unknownModels online and save learnedModelTiers, auto-apply the recommended: true preset with execution_pool_set without waiting for approval, notify the user of the active models and how to change them in chat or Settings → Execution Pool, and continue the task.';
+const UNCONFIGURED_POOL_AUTO_GUIDANCE =
+  'No execution pool is configured. For code/development tasks, reuse already classified models, verify only unknownModels online and save learnedModelTiers if possible, auto-apply the recommended: true preset with execution_pool_set without waiting for approval, notify the user of the active models and how to change them in chat or Settings → Execution Pool ONLY after execution_pool_set succeeds, and continue the task.';
+
+const UNCONFIGURED_POOL_ASK_ONLY_GUIDANCE =
+  'No execution pool is configured and no usable recommended preset is available yet. If unknownModels exist, attempt online verification and save learnedModelTiers; if recommendedPresets remains empty, do NOT guess or announce an active pool — ask the user which models to configure and call execution_pool_set only after confirmation.';
 
 function poolOutput(
   defaults: SupervisorDefaultConfig | null,
@@ -122,6 +125,8 @@ function poolOutput(
   extra?: Record<string, unknown>,
 ): ToolResult {
   const recommendations = buildRecommendationsForOutput(probe, knowledge);
+  const hasUsablePreset = Array.isArray(recommendations.recommendedPresets) && recommendations.recommendedPresets.length > 0;
+  const unconfiguredGuidance = hasUsablePreset ? UNCONFIGURED_POOL_AUTO_GUIDANCE : UNCONFIGURED_POOL_ASK_ONLY_GUIDANCE;
   if (!defaults) {
     return {
       status: 'ok',
@@ -130,7 +135,7 @@ function poolOutput(
       autoPairingEnabled: false,
       auditByDefault: false,
       concurrencyCap: null,
-      askUser: UNCONFIGURED_POOL_GUIDANCE,
+      askUser: unconfiguredGuidance,
       ...recommendations,
       ...extra,
     };
@@ -151,7 +156,7 @@ function poolOutput(
     autoPairingEnabled,
     auditByDefault,
     concurrencyCap: defaults.pairMaxConcurrency ?? pools.primaryDevelopmentPool.controls.maxConcurrency,
-    ...(configured ? {} : { askUser: UNCONFIGURED_POOL_GUIDANCE }),
+    ...(configured ? {} : { askUser: unconfiguredGuidance }),
     ...recommendations,
     ...extra,
   };
