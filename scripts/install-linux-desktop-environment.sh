@@ -776,6 +776,20 @@ export HOME="$TARGET_HOME"
 export XDG_SESSION_TYPE="x11"
 export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/$RUNTIME_DIR_NAME}"
 
+# Ensure snap binaries are in PATH if missing
+if [[ ":\${PATH:-}:" != *":/snap/bin:"* ]]; then
+  export PATH="\${PATH:+\${PATH}:}/snap/bin"
+fi
+
+# Ensure snap and flatpak applications appear in XFCE menus and XDG discovery
+export XDG_DATA_DIRS="\${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+if [[ ":\$XDG_DATA_DIRS:" != *":/var/lib/snapd/desktop:"* ]]; then
+  export XDG_DATA_DIRS="\${XDG_DATA_DIRS}:/var/lib/snapd/desktop"
+fi
+if [[ ":\$XDG_DATA_DIRS:" != *":/var/lib/flatpak/exports/share:"* ]]; then
+  export XDG_DATA_DIRS="\${XDG_DATA_DIRS}:/var/lib/flatpak/exports/share"
+fi
+
 exec dbus-launch --exit-with-session bash -c '
   pulseaudio --start --exit-idle-time=-1 2>/dev/null || true
   exec startxfce4

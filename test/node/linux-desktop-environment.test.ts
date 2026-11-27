@@ -73,11 +73,56 @@ describe.skipIf(process.platform === 'win32')('real Bash desktop installer (no h
     expect(service).not.toContain('Whisker Menu + firefox');
     const session = await readFile(join(fixture.root, 'usr/local/lib/imcodes/imcodes-desktop-session.sh'), 'utf8');
     expect(session).toContain('export XDG_SESSION_TYPE="x11"');
+    expect(session).toMatch(/export XDG_DATA_DIRS="\$\{XDG_DATA_DIRS:-.*?usr\/local\/share:\/usr\/share\}"/);
+    expect(session).toContain('/var/lib/snapd/desktop');
+    expect(session).toContain('/var/lib/flatpak/exports/share');
+    expect(session).toContain('/snap/bin');
     expect(session).not.toContain('xfce4-panel --add');
     expect(session).not.toContain('firefox &');
     expect(session).toContain('exec startxfce4');
     expect((await readFile(join(fixture.root, 'usr/local/lib/imcodes/desktop-display'), 'utf8')).trim()).toBe(':99');
     if (args.length === 0) expect(result.output).toContain('firefox already installed');
+  });
+
+  it('configures XDG_DATA_DIRS and PATH in imcodes-desktop-session.sh for snap and flatpak apps', async () => {
+    const fixture = await desktopShellFixture(dirs, { firefox: true });
+    const result = await fixture.run(script, ['--no-firefox']);
+    expect(result.code).toBe(0);
+
+    const sessionPath = join(fixture.root, 'usr/local/lib/imcodes/imcodes-desktop-session.sh');
+    const session = await readFile(sessionPath, 'utf8');
+
+    expect(session).toMatch(/export XDG_DATA_DIRS="\$\{XDG_DATA_DIRS:-.*?usr\/local\/share:\/usr\/share\}"/);
+    expect(session).toContain('/var/lib/snapd/desktop');
+    expect(session).toContain('/var/lib/flatpak/exports/share');
+    expect(session).toContain('/snap/bin');
+
+    // Run the environment setup logic extracted from the session script in bash to verify runtime behavior
+    const envSetup = session.split('exec dbus-launch')[0];
+
+    // 1. Default (unset) environment
+    const testDefault = spawnSync('bash', ['-euo', 'pipefail', '-c', `
+unset PATH
+unset XDG_DATA_DIRS
+${envSetup}
+echo "PATH=$PATH"
+echo "XDG_DATA_DIRS=$XDG_DATA_DIRS"
+`], { encoding: 'utf8' });
+    expect(testDefault.status).toBe(0);
+    expect(testDefault.stdout).toContain('PATH=/snap/bin');
+    expect(testDefault.stdout).toMatch(/XDG_DATA_DIRS=.*?usr\/local\/share:\/usr\/share:\/var\/lib\/snapd\/desktop:\/var\/lib\/flatpak\/exports\/share/);
+
+    // 2. Existing environment preserving custom dirs without duplicating snap/flatpak entries
+    const testExisting = spawnSync('bash', ['-euo', 'pipefail', '-c', `
+export PATH="/custom/bin:/snap/bin"
+export XDG_DATA_DIRS="/custom/share:/var/lib/snapd/desktop"
+${envSetup}
+echo "PATH=$PATH"
+echo "XDG_DATA_DIRS=$XDG_DATA_DIRS"
+`], { encoding: 'utf8' });
+    expect(testExisting.status).toBe(0);
+    expect(testExisting.stdout).toContain('PATH=/custom/bin:/snap/bin\n');
+    expect(testExisting.stdout).toContain('XDG_DATA_DIRS=/custom/share:/var/lib/snapd/desktop:/var/lib/flatpak/exports/share\n');
   });
 
   it('installs Firefox via Mozilla APT repo with bounded curl timeouts and seeds helpers.rc as target user', async () => {
