@@ -140,6 +140,32 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
     }
   });
 
+  it('strictly matches recursive key sets across all 7 supported locales with en.json', () => {
+    function getKeys(obj: unknown, prefix = ''): string[] {
+      if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return [prefix];
+      const keys: string[] = [];
+      for (const [k, v] of Object.entries(obj)) {
+        const full = prefix ? `${prefix}.${k}` : k;
+        if (v && typeof v === 'object' && !Array.isArray(v)) {
+          keys.push(...getKeys(v, full));
+        } else {
+          keys.push(full);
+        }
+      }
+      return keys;
+    }
+
+    const enKeys = new Set(getKeys(en));
+    const allLocales: Record<string, unknown> = { 'zh-CN': zhCN, 'zh-TW': zhTW, ja, ko, es, ru };
+    for (const [loc, data] of Object.entries(allLocales)) {
+      const locKeys = new Set(getKeys(data));
+      const missing = [...enKeys].filter((k) => !locKeys.has(k));
+      const extra = [...locKeys].filter((k) => !enKeys.has(k));
+      expect(missing, `${loc} missing keys compared to en.json`).toEqual([]);
+      expect(extra, `${loc} extra keys compared to en.json`).toEqual([]);
+    }
+  });
+
   it('isolates global/project hotwords and consent across same-origin accounts (A -> B -> A), cross-server same-named projects, and explicit no-project entries', () => {
     const origin = 'https://app.im.codes';
     // Account A signs in
