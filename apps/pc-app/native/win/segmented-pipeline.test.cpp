@@ -641,6 +641,7 @@ int main() {
       assert(loop.handle_line("{\"cmd\":\"start\"}"));
       raw_sess->wait_in_open();
       assert(loop.handle_line("{\"cmd\":\"stop\"}"));
+      raw_sess->wait_for_finish();
       assert(!loop.handle_line("{\"cmd\":\"shutdown\"}"));
       assert(open_called);
       assert(decoded_samples > 0);
