@@ -99,7 +99,7 @@ function extractJoinedProvenance(row: CronJobWithJoinedProvenance): CronProvenan
   };
 }
 
-async function readCronJobProvenance(db: Database, jobId: string): Promise<CronProvenanceLookup> {
+export async function readCronJobProvenance(db: Database, jobId: string): Promise<CronProvenanceLookup> {
   if (typeof (db as { queryOne?: unknown })?.queryOne !== 'function') {
     return { ok: true, row: null };
   }

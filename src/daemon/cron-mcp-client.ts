@@ -169,8 +169,17 @@ function cleanRuntimeServerId(serverId: string | null | undefined): string | nul
   return typeof serverId === 'string' && serverId.trim() ? serverId.trim() : null;
 }
 
-function cronUrl(endpoint: CronServerEndpoint, runtimeServerId: string, suffix: string, method: DaemonHttpMethod): string {
-  return daemonApiUrl(cleanBaseUrl(endpoint.workerUrl), method, `/api/server/${encodeURIComponent(runtimeServerId)}/cron${suffix}`);
+function cronUrl(
+  endpoint: CronServerEndpoint,
+  runtimeServerId: string,
+  suffix: string,
+  method: DaemonHttpMethod,
+  restrictedExternalCli = false,
+): string {
+  const path = restrictedExternalCli
+    ? `/api/server/${encodeURIComponent(runtimeServerId)}/cron-restricted${suffix}`
+    : `/api/server/${encodeURIComponent(runtimeServerId)}/cron${suffix}`;
+  return daemonApiUrl(cleanBaseUrl(endpoint.workerUrl), method, path);
 }
 
 async function getEndpoint(
@@ -257,7 +266,6 @@ async function requestCron(
 ): Promise<CronMcpResult<{ body: unknown }>> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const method = ((init.method ?? 'GET').toUpperCase()) as DaemonHttpMethod;
-  const url = cronUrl(endpoint, runtimeServerId, pathSuffix, method);
   const deviceTimezone = normalizeClientTimezone(
     options.deviceTimezone !== undefined
       ? options.deviceTimezone
@@ -280,11 +288,13 @@ async function requestCron(
       return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'shared machine authority unavailable');
     }
   }
+  const useRestrictedRoute = restrictedExternalCli && !sharedMachineAuthority;
+  const url = cronUrl(endpoint, runtimeServerId, pathSuffix, method, useRestrictedRoute);
   const headers = {
     // The credential names the BOUND server (the token belongs to it); the route names the server the job is for.
     ...daemonServerAuthHeaders(endpoint),
     ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
-    ...(restrictedExternalCli && !sharedMachineAuthority ? { [CRON_RESTRICTED_ACTOR_HEADER]: CRON_RESTRICTED_ACTOR_EXTERNAL_CLI } : {}),
+    ...(useRestrictedRoute ? { [CRON_RESTRICTED_ACTOR_HEADER]: CRON_RESTRICTED_ACTOR_EXTERNAL_CLI } : {}),
     'Content-Type': 'application/json',
     ...(deviceTimezone ? { [DEVICE_TIMEZONE_HEADER]: deviceTimezone } : {}),
     ...init.headers,

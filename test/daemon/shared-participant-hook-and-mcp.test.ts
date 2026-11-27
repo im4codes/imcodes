@@ -104,6 +104,7 @@ function requestHook(
   path: string,
   sender?: string,
   body?: unknown,
+  extraHeaders?: Record<string, string>,
 ) {
   return new Promise<{ status: number; body: Record<string, unknown> }>((resolve, reject) => {
     const data = body === undefined ? '' : JSON.stringify(body);
@@ -119,6 +120,7 @@ function requestHook(
           ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
           : {}),
         ...(sender ? { 'x-imcodes-session': sender } : {}),
+        ...extraHeaders,
       },
     }, (res) => {
       let raw = '';
@@ -474,6 +476,74 @@ describe('hook-server shared participant isolation', () => {
     expect(mockDispatchHookSend.mock.calls.at(-1)?.[0]).toMatchObject({
       from: IMCODES_EXTERNAL_CLI_SENDER,
       senderRecord: null,
+    });
+  });
+
+  it('verifies hookCredential against canonical session identity on label claims and propagates canonical identity on authenticated labels', async () => {
+    const { HOOK_SESSION_CREDENTIAL_ERROR, HOOK_SESSION_CREDENTIAL_HEADER } = await import('../../shared/hook-session-credential.js');
+    participantTurns.clear();
+    mockDispatchHookSend.mockClear();
+    mockStopSessionNow.mockClear();
+
+    const credBrain = {
+      name: 'deck_cred_brain',
+      projectName: 'proj-cred',
+      label: 'CredBrain',
+      state: 'idle',
+      hookCredential: 'cred-brain-secret',
+      contextNamespace: { scope: 'personal' as const, projectId: 'proj_cred', userId: 'owner_user_1' },
+    };
+    const credWorker = {
+      name: 'deck_cred_w1',
+      projectName: 'proj-cred',
+      label: 'CredWorker',
+      state: 'idle',
+      hookCredential: 'cred-w1-secret',
+      contextNamespace: { scope: 'personal' as const, projectId: 'proj_cred', userId: 'owner_user_1' },
+    };
+    sessionsMap.set(credBrain.name, credBrain);
+    sessionsMap.set(credWorker.name, credWorker);
+
+    // Unauthenticated label claim (and header label claim) against credentialed session must fail closed 403 across all 3 routes + /send "/stop"
+    for (const attempt of [
+      { path: '/send', body: { from: 'CredBrain', to: 'deck_cred_w1', message: 'hi' } },
+      { path: SEND_COMMAND_HOOK_PATH, body: { from: 'CredBrain', to: 'deck_cred_w1', message: '/status' } },
+      { path: '/send', body: { from: 'CredBrain', to: 'deck_cred_w1', message: '/stop' } },
+      { path: '/stop', body: { from: 'CredBrain', to: 'deck_cred_w1' } },
+    ] as const) {
+      const noCred = await requestHook(port, 'POST', attempt.path, undefined, attempt.body);
+      expect(noCred).toEqual({ status: 403, body: { ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR } });
+      const wrongCred = await requestHook(port, 'POST', attempt.path, 'CredBrain', attempt.body, {
+        [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-wrong',
+      });
+      expect(wrongCred).toEqual({ status: 403, body: { ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR } });
+    }
+    expect(mockDispatchHookSend).not.toHaveBeenCalled();
+    expect(mockStopSessionNow).not.toHaveBeenCalled();
+
+    // Ambiguous unauthenticated label never resolves a trusted sender
+    sessionsMap.set('deck_amb_1', { name: 'deck_amb_1', projectName: 'proj-cred', label: 'DupLabel', state: 'idle' });
+    sessionsMap.set('deck_amb_2', { name: 'deck_amb_2', projectName: 'proj-cred', label: 'DupLabel', state: 'idle' });
+    const ambIdle = await requestHook(port, 'POST', '/send', undefined, { from: 'DupLabel', to: 'deck_cred_w1', message: 'hi' });
+    expect(ambIdle.status).toBe(404);
+    participantTurns.set('deck_shared_main', { actorUserId: 'part-user-1', authority: null });
+    const ambDuringPart = await requestHook(port, 'POST', '/send', undefined, { from: 'DupLabel', to: 'deck_cred_w1', message: 'hi' });
+    expect(ambDuringPart).toEqual({ status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } });
+    expect(mockDispatchHookSend).not.toHaveBeenCalled();
+
+    // Authenticated label sender passes canonical session identity (name + senderRecord) to dispatchHookSend even while participant turn is active
+    const authLabelSend = await requestHook(port, 'POST', '/send', undefined, {
+      from: 'CredWorker',
+      to: 'deck_cred_brain',
+      message: 'authorized callback',
+    }, {
+      [HOOK_SESSION_CREDENTIAL_HEADER]: 'cred-w1-secret',
+    });
+    expect(authLabelSend.status).toBe(200);
+    expect(mockDispatchHookSend).toHaveBeenCalledTimes(1);
+    expect(mockDispatchHookSend.mock.calls[0]?.[0]).toMatchObject({
+      from: 'deck_cred_w1',
+      senderRecord: credWorker,
     });
   });
 

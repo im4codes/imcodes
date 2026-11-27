@@ -16,6 +16,7 @@ import { CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH } from './controlled-node-artifac
 import { USAGE_INGEST_ROUTE_SUFFIX } from './usage-analytics.js';
 import { PORT_FORWARD_API_PATH } from './port-forward.js';
 import { VOICE_HOTWORDS_API_PATH } from './voice-hotwords.js';
+import { CRON_RESTRICTED_ROUTE_SEGMENT } from './shared-machine-authority.js';
 
 export const DAEMON_TOKEN_ROUTE_NOT_ALLOWED = 'daemon_token_route_not_allowed';
 export type DaemonHttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
@@ -119,11 +120,19 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   full('DELETE', `${CLOUD_DOCS_API_PATH}/:id`),
   full('GET', RECENT_DOCUMENTS_API_PATH),
   // Current and released clients use the serverId mount for pod affinity.
-  ...[`${server}/cron`].flatMap((cron) => [
-    full('GET', cron), full('POST', cron),
-    full('PUT', `${cron}/:id`), full('DELETE', `${cron}/:id`),
-    full('PATCH', `${cron}/:id/status`),
-  ]),
+  full('GET', `${server}/cron`),
+  full('POST', `${server}/cron`),
+  full('PUT', `${server}/cron/:id`),
+  full('DELETE', `${server}/cron/:id`),
+  full('PATCH', `${server}/cron/:id/status`),
+  // Dedicated external-CLI restricted cron mount: old servers without this entry fail closed 403/404.
+  full('GET', `${server}/${CRON_RESTRICTED_ROUTE_SEGMENT}`),
+  full('POST', `${server}/${CRON_RESTRICTED_ROUTE_SEGMENT}`),
+  full('PUT', `${server}/${CRON_RESTRICTED_ROUTE_SEGMENT}/:id`),
+  full('DELETE', `${server}/${CRON_RESTRICTED_ROUTE_SEGMENT}/:id`),
+  full('PATCH', `${server}/${CRON_RESTRICTED_ROUTE_SEGMENT}/:id/status`),
+  full('GET', `${server}/${CRON_RESTRICTED_ROUTE_SEGMENT}/executions`),
+  full('GET', `${server}/${CRON_RESTRICTED_ROUTE_SEGMENT}/:id/executions`),
 ];
 
 const compiled = DAEMON_TOKEN_ROUTES.map((route) => ({

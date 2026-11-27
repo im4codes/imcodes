@@ -758,20 +758,19 @@ program
     // Try hook server IPC first (preferred — daemon handles target resolution, queuing, etc.)
     const hookPort = await resolveLiveHookPort();
     if (hookPort) {
+      const detectedFrom = await detectSenderSession().catch(() => '');
+      const from = detectedFrom || IMCODES_EXTERNAL_CLI_SENDER;
+
+      if (opts.reply && !detectedFrom) {
+        console.error('Error: --reply requires a managed sender session. Set IMCODES_SESSION to the session that should receive the reply, or omit --reply.');
+        process.exit(1);
+      }
+
+      let res: Record<string, unknown> | null = null;
       try {
-        const detectedFrom = await detectSenderSession().catch(() => '');
-        const from = detectedFrom || IMCODES_EXTERNAL_CLI_SENDER;
-
-        if (opts.reply) {
-          if (!detectedFrom) {
-            console.error('Error: --reply requires a managed sender session. Set IMCODES_SESSION to the session that should receive the reply, or omit --reply.');
-            process.exit(1);
-          }
-        }
-
         if (opts.all) {
           // Broadcast mode
-          const res = await postToHookServer(hookPort, sendPath, {
+          res = await postToHookServer(hookPort, sendPath, {
             from,
             to: '*',
             message,
@@ -779,13 +778,9 @@ program
             ...(opts.reply ? { reply: true } : {}),
             depth: 0,
           });
-          printSendResult(res);
-          return;
-        }
-
-        if (opts.type) {
+        } else if (opts.type) {
           // Target by agent type
-          const res = await postToHookServer(hookPort, sendPath, {
+          res = await postToHookServer(hookPort, sendPath, {
             from,
             to: opts.type,
             message,
@@ -793,24 +788,24 @@ program
             ...(opts.reply ? { reply: true } : {}),
             depth: 0,
           });
-          printSendResult(res);
-          return;
+        } else {
+          // Standard target (label or session name)
+          res = await postToHookServer(hookPort, sendPath, {
+            from,
+            to: resolvedTarget!,
+            message,
+            ...(files ? { files } : {}),
+            ...(opts.reply ? { reply: true } : {}),
+            depth: 0,
+          });
         }
-
-        // Standard target (label or session name)
-        const res = await postToHookServer(hookPort, sendPath, {
-          from,
-          to: resolvedTarget!,
-          message,
-          ...(files ? { files } : {}),
-          ...(opts.reply ? { reply: true } : {}),
-          depth: 0,
-        });
-        printSendResult(res);
-        return;
       } catch (err) {
         // Hook server unavailable — fall back to direct tmux send
         logger.debug({ err }, 'Hook server unavailable, falling back to direct send');
+      }
+      if (res) {
+        printSendResult(res);
+        return;
       }
     }
 

@@ -5974,6 +5974,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   const callerRecord = input.senderRecord !== undefined
     ? (input.senderRecord ?? undefined)
     : (d.getSession(input.from) ?? undefined);
+  const canonicalCallerSessionName = callerRecord?.name ?? input.from;
   const now = d.now();
 
   // ── Provider-limit gate ────────────────────────────────────────────────
@@ -5989,7 +5990,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
     const refusal = buildDelegationRefusal(
       [blocked],
       getSiblingSessions(
-        { userId: input.from, sessionName: input.from, projectName: callerRecord?.projectName ?? null, projectRoot: null },
+        { userId: canonicalCallerSessionName, sessionName: canonicalCallerSessionName, projectName: callerRecord?.projectName ?? null, projectRoot: null },
         hookSessions,
       ),
       hookGate.availability,
@@ -6033,9 +6034,9 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
     const message = buildSessionDispatchMessage({
       message: input.message,
       files: fileRefs.files,
-      from: input.from,
+      from: canonicalCallerSessionName,
       fromLabel: callerRecord?.label,
-      replyTo: input.reply ? input.from : null,
+      replyTo: input.reply ? canonicalCallerSessionName : null,
       ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
       ...(input.command ? { command: true } : {}),
     });
@@ -6043,8 +6044,8 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       const actorOption = callerRecord
         ? buildSharedServerMemberSharedActorOption(
             {
-              userId: input.from,
-              sessionName: input.from,
+              userId: canonicalCallerSessionName,
+              sessionName: canonicalCallerSessionName,
               projectName: callerRecord.projectName ?? null,
               projectRoot: input.projectRoot ?? callerRecord.projectDir ?? null,
             },

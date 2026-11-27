@@ -366,6 +366,24 @@ function resolveSenderRecord(from: string, allSessions: SessionRecord[]): Sessio
   return null;
 }
 
+type VerifiedHookSender =
+  | { kind: 'verified'; session: SessionRecord }
+  | { kind: 'credential_rejected' }
+  | { kind: 'ambiguous' }
+  | { kind: 'external' };
+
+function resolveVerifiedHookSender(
+  from: string,
+  headers: http.IncomingHttpHeaders,
+  allSessions: SessionRecord[],
+): VerifiedHookSender {
+  const resolved = resolveSenderRecord(from, allSessions);
+  if (resolved === 'ambiguous') return { kind: 'ambiguous' };
+  if (!resolved) return { kind: 'external' };
+  if (!hookClaimAllowed(resolved.name, headers)) return { kind: 'credential_rejected' };
+  return { kind: 'verified', session: resolved };
+}
+
 /**
  * Active shared-session participant turns must block unauthenticated external CLI sends
  * (`/send`, `/send-command`, `/stop`) so shell commands in a participant turn cannot strip
@@ -419,9 +437,15 @@ export function isSiblingSessionOf(candidate: SessionRecord, fromRecord: Session
     || candidate.parentSession === fromRecord.name;
 }
 
-export function resolveTarget(from: string, to: string): ResolveResult {
+export function resolveTarget(
+  from: string,
+  to: string,
+  preResolvedFromRecord?: SessionRecord | null | 'ambiguous',
+): ResolveResult {
   const allSessions = listSessions();
-  const fromRecord = resolveSenderRecord(from, allSessions);
+  const fromRecord = preResolvedFromRecord !== undefined
+    ? preResolvedFromRecord
+    : resolveSenderRecord(from, allSessions);
 
   if (fromRecord === 'ambiguous') {
     return {
@@ -697,6 +721,7 @@ function validSupervisionSendBinding(value: unknown): value is NonNullable<SendR
 async function handleSend(
   body: SendRequest,
   commandMode = false,
+  headers: http.IncomingHttpHeaders = {},
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const { from, to, message, depth = 0 } = body;
 
@@ -745,13 +770,24 @@ async function handleSend(
   }
 
   const allSessions = listSessions();
-  const sender = resolveSenderRecord(from, allSessions);
-  if (sender === null && hasActiveSharedParticipantTurn(allSessions)) {
+  const senderAuth = resolveVerifiedHookSender(from, headers, allSessions);
+  if (senderAuth.kind === 'credential_rejected') {
+    return { status: 403, body: { ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR } };
+  }
+  const senderRecord = senderAuth.kind === 'verified' ? senderAuth.session : null;
+  if (!senderRecord && hasActiveSharedParticipantTurn(allSessions)) {
     return { status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } };
   }
 
+  const canonicalFrom = senderRecord ? senderRecord.name : from;
+  const resolvedSenderArg: SessionRecord | null | 'ambiguous' = senderAuth.kind === 'verified'
+    ? senderAuth.session
+    : senderAuth.kind === 'ambiguous'
+      ? 'ambiguous'
+      : null;
+
   // Resolve target
-  const result = resolveTarget(from, to);
+  const result = resolveTarget(canonicalFrom, to, resolvedSenderArg);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
   }
@@ -792,19 +828,18 @@ async function handleSend(
 
   // Ordinary messages retain abuse protection. Urgent /stop was handled above
   // on the priority path and must never consume or wait on this bucket.
-  if (!checkRateLimit(from)) {
-    return { status: 429, body: { ok: false, error: 'rate limit exceeded', retryAfterMs: ordinaryRateLimitRetryAfterMs(from) } };
+  if (!checkRateLimit(canonicalFrom)) {
+    return { status: 429, body: { ok: false, error: 'rate limit exceeded', retryAfterMs: ordinaryRateLimitRetryAfterMs(canonicalFrom) } };
   }
   // Record only after exact target validation; failed requests do not pollute
   // the ordinary send bucket.
-  recordSend(from);
+  recordSend(canonicalFrom);
 
-  const senderRecord = sender && sender !== 'ambiguous' ? sender : null;
   const projectRoot = senderRecord ? senderRecord.projectDir : null;
   let dispatch;
   try {
     dispatch = await dispatchHookSend({
-      from,
+      from: canonicalFrom,
       targetRecords: result.targets,
       message,
       files: body.files,
@@ -881,17 +916,30 @@ interface StopRequest {
  * send_stop MCP tool so a busy session (which would otherwise just queue a
  * message) can be interrupted.
  */
-async function handleStop(body: StopRequest): Promise<{ status: number; body: Record<string, unknown> }> {
+async function handleStop(
+  body: StopRequest,
+  headers: http.IncomingHttpHeaders = {},
+): Promise<{ status: number; body: Record<string, unknown> }> {
   const { from, to } = body;
   if (!from || !to) {
     return { status: 400, body: { ok: false, error: 'missing required fields: from, to' } };
   }
   const allSessions = listSessions();
-  const sender = resolveSenderRecord(from, allSessions);
-  if (sender === null && hasActiveSharedParticipantTurn(allSessions)) {
+  const senderAuth = resolveVerifiedHookSender(from, headers, allSessions);
+  if (senderAuth.kind === 'credential_rejected') {
+    return { status: 403, body: { ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR } };
+  }
+  const senderRecord = senderAuth.kind === 'verified' ? senderAuth.session : null;
+  if (!senderRecord && hasActiveSharedParticipantTurn(allSessions)) {
     return { status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } };
   }
-  const result = resolveTarget(from, to);
+  const canonicalFrom = senderRecord ? senderRecord.name : from;
+  const resolvedSenderArg: SessionRecord | null | 'ambiguous' = senderAuth.kind === 'verified'
+    ? senderAuth.session
+    : senderAuth.kind === 'ambiguous'
+      ? 'ambiguous'
+      : null;
+  const result = resolveTarget(canonicalFrom, to, resolvedSenderArg);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
   }
@@ -1150,7 +1198,9 @@ export async function startHookServer(
     // checked the same way on the routes that read one).
     const claimedHeader = req.headers['x-imcodes-session'];
     const rejectUnverifiedClaim = (claimed: string | undefined): boolean => {
-      if (hookClaimAllowed(claimed, req.headers)) return false;
+      const resolved = claimed ? resolveSenderRecord(claimed, listSessions()) : null;
+      const canonicalClaim = resolved && resolved !== 'ambiguous' ? resolved.name : claimed;
+      if (hookClaimAllowed(canonicalClaim, req.headers)) return false;
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR }));
       return true;
@@ -1593,7 +1643,7 @@ export async function startHookServer(
         const body = await readBody(req);
         const parsed = JSON.parse(body) as SendRequest;
         if (rejectUnverifiedClaim(typeof parsed.from === 'string' ? parsed.from : undefined)) return;
-        const result = await handleSend(parsed, url === SEND_COMMAND_HOOK_PATH);
+        const result = await handleSend(parsed, url === SEND_COMMAND_HOOK_PATH, req.headers);
         const retryAfterMs = result.status === 429 && typeof result.body.retryAfterMs === 'number' ? result.body.retryAfterMs : undefined;
         res.writeHead(result.status, {
           'Content-Type': 'application/json',
@@ -1905,7 +1955,7 @@ export async function startHookServer(
         const body = await readBody(req);
         const parsed = JSON.parse(body) as StopRequest;
         if (rejectUnverifiedClaim(typeof parsed.from === 'string' ? parsed.from : undefined)) return;
-        const result = await handleStop(parsed);
+        const result = await handleStop(parsed, req.headers);
         res.writeHead(result.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(result.body));
       } catch (err) {

@@ -31,7 +31,9 @@ function normalize(sql: string): string {
 function makeDb(servers: ServerRow[]) {
   const cronJobs = new Map<string, MockRow>();
   const cronProvenance = new Map<string, MockRow>();
+  const cronExecutions: MockRow[] = [];
   const writes: string[] = [];
+  const queryLog: Array<{ sql: string; params: unknown[] }> = [];
   const find = (id: unknown) => servers.find((server) => server.id === id);
   const db = {
     queryOne: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T | null> => {
@@ -45,7 +47,22 @@ function makeDb(servers: ServerRow[]) {
         const server = find(params[0]);
         return (server ? { user_id: server.user_id, owner_status: 'active', actor_status: 'active' } : null) as T | null;
       }
+      if (s.includes('s.user_id') && s.includes('from servers s')) {
+        const server = find(params[0]);
+        return (server ? { user_id: server.user_id, user_status: 'active' } : null) as T | null;
+      }
       if (s.includes('exists (select 1 from servers')) return { exists: Boolean(find(params[0])) } as T;
+      if (s.includes('from cron_jobs j left join cron_job_provenance')) {
+        const job = cronJobs.get(params[0] as string);
+        if (!job) return null;
+        const prov = cronProvenance.get(params[0] as string);
+        return {
+          ...job,
+          prov_creator_user_id: prov?.creator_user_id ?? null,
+          prov_shared: prov ? Boolean(prov.shared) : null,
+          prov_present: Boolean(prov),
+        } as T;
+      }
       if (s.includes('from cron_job_provenance where job_id')) {
         return (cronProvenance.get(params[0] as string) ?? null) as T | null;
       }
@@ -56,13 +73,69 @@ function makeDb(servers: ServerRow[]) {
       return null;
     },
     query: async <T = unknown>(sql: string, params: unknown[] = []): Promise<T[]> => {
+      queryLog.push({ sql, params });
       const s = normalize(sql);
+      if (s.includes('from cron_executions')) {
+        if (s.includes('where job_id = $1')) {
+          return cronExecutions
+            .filter((e) => e.job_id === params[0])
+            .sort((a, b) => Number(b.created_at) - Number(a.created_at))
+            .slice(0, Number(params[1] ?? 20)) as T[];
+        }
+        const ownerUserId = params[0] as string;
+        const serverId = params[1] as string | null;
+        const projectName = params[2] as string | null;
+        const isLatest = s.includes('distinct on');
+        const limit = isLatest ? Number.POSITIVE_INFINITY : Number(params[3] ?? 50);
+        const extFilter = (isLatest ? params[3] : params[4]) as string | null | undefined;
+        const filtered = cronExecutions
+          .map((exec) => {
+            const job = cronJobs.get(String(exec.job_id ?? ''));
+            if (!job || job.user_id !== ownerUserId) return null;
+            if (serverId && job.server_id !== serverId) return null;
+            if (projectName && job.project_name !== projectName) return null;
+            const prov = cronProvenance.get(String(job.id ?? ''));
+            if (extFilter && (prov?.creator_user_id !== extFilter || Boolean(prov?.shared))) return null;
+            return {
+              ...exec,
+              job_name: job.name,
+              server_id: job.server_id,
+              project_name: job.project_name,
+              cron_expr: job.cron_expr,
+              target_role: job.target_role,
+              target_session_name: job.target_session_name,
+              action: job.action,
+              creator_user_id: prov?.creator_user_id ?? job.user_id,
+              creator_name: null,
+              creator_is_shared: Boolean(prov?.shared),
+            };
+          })
+          .filter((row): row is NonNullable<typeof row> => row !== null)
+          .sort((a, b) => Number(b.created_at) - Number(a.created_at));
+        if (isLatest) {
+          const seen = new Set<string>();
+          return filtered.filter((row) => {
+            const id = String(row.job_id);
+            if (seen.has(id)) return false;
+            seen.add(id);
+            return true;
+          }) as T[];
+        }
+        return filtered.slice(0, limit) as T[];
+      }
       if (s.includes('from cron_jobs')) {
+        const extFilter = params[3] as string | null | undefined;
         return [...cronJobs.values()]
-          .filter((job) => job.user_id === params[0])
+          .filter((job) => {
+            if (job.user_id !== params[0]) return false;
+            const prov = cronProvenance.get(job.id as string);
+            if (extFilter && (prov?.creator_user_id !== extFilter || Boolean(prov?.shared))) return false;
+            return true;
+          })
           .map((job) => ({
             ...job,
             creator_user_id: cronProvenance.get(job.id as string)?.creator_user_id ?? job.user_id,
+            creator_is_shared: Boolean(cronProvenance.get(job.id as string)?.shared),
           })) as T[];
       }
       return [] as T[];
@@ -78,6 +151,17 @@ function makeDb(servers: ServerRow[]) {
           next_run_at: params[11], expires_at: params[12], completion_policy: params[13], created_at: params[14], updated_at: params[14], last_run_at: null,
         });
       }
+      if (s.includes('update cron_jobs set')) {
+        const job = cronJobs.get(params[params.length - 1] as string);
+        if (job) {
+          const setClause = s.slice(s.indexOf('set ') + 4, s.indexOf(' where '));
+          const parts = setClause.split(',').map((p) => p.trim());
+          parts.forEach((part, idx) => {
+            const col = part.split('=')[0]!.trim();
+            job[col] = params[idx];
+          });
+        }
+      }
       if (s.includes('insert into cron_job_provenance')) {
         cronProvenance.set(params[0] as string, {
           job_id: params[0],
@@ -87,6 +171,15 @@ function makeDb(servers: ServerRow[]) {
           shared: s.includes('true') ? true : Boolean(params[4]),
         });
       }
+      if (s.includes('insert into cron_executions')) {
+        cronExecutions.push({
+          id: params[0],
+          job_id: params[1],
+          status: params[2],
+          detail: params[3] ?? null,
+          created_at: params[4],
+        });
+      }
       if (s.includes('delete from cron_job_provenance')) cronProvenance.delete(params[0] as string);
       if (s.includes('delete from cron_jobs')) cronJobs.delete(params[0] as string);
       return { changes: 1 };
@@ -94,7 +187,7 @@ function makeDb(servers: ServerRow[]) {
     exec: async () => {},
     close: async () => {},
   } as unknown as Database;
-  return { db, cronJobs, cronProvenance, writes };
+  return { db, cronJobs, cronProvenance, cronExecutions, writes, queryLog };
 }
 
 const OWNER = 'user-owner';
@@ -122,8 +215,8 @@ function env(db: Database): Env {
   } as Env;
 }
 
-async function buildApp(db: Database) {
-  const { cronApiRoutes } = await import('../src/routes/cron-api.js');
+async function buildApp(db: Database, opts?: { includeRestrictedMount?: boolean }) {
+  const { cronApiRoutes, cronRestrictedApiRoutes } = await import('../src/routes/cron-api.js');
   const app = new Hono<{ Bindings: Env }>();
   app.use('*', async (c, next) => {
     if (!c.env) (c as unknown as { env: Env }).env = {} as Env;
@@ -132,6 +225,9 @@ async function buildApp(db: Database) {
   });
   app.route('/api/cron', cronApiRoutes);
   app.route('/api/server/:serverId/cron', cronApiRoutes);
+  if (opts?.includeRestrictedMount !== false) {
+    app.route('/api/server/:serverId/cron-restricted', cronRestrictedApiRoutes);
+  }
   return app;
 }
 
@@ -307,27 +403,40 @@ describe('cron API authentication (real auth middleware)', () => {
       expect(await res.text()).not.toContain('Owner job');
     });
 
-    it('external-CLI restricted cron header creates non-owner provenance, isolates owner jobs, and dispatches with participant restriction', async () => {
-      const { CRON_RESTRICTED_ACTOR_EXTERNAL_CLI, CRON_RESTRICTED_ACTOR_HEADER } = await import('../../shared/shared-machine-authority.js');
+    it('external-CLI restricted cron uses dedicated cron-restricted route, filters execution histories before pagination, preserves restriction across owner edits/triggers, and fails closed on old servers', async () => {
+      const { CRON_RESTRICTED_ACTOR_EXTERNAL_CLI, CRON_RESTRICTED_ACTOR_HEADER, CRON_RESTRICTED_ROUTE_SEGMENT } = await import('../../shared/shared-machine-authority.js');
       const { IMCODES_EXTERNAL_CLI_SENDER } = await import('../../shared/imcodes-send.js');
       const { dispatchJobNow } = await import('../src/cron/job-dispatch.js');
       const { WsBridge } = await import('../src/ws/bridge.js');
 
+      const restrictedBase = `/api/server/${VICTIM_SERVER}/${CRON_RESTRICTED_ROUTE_SEGMENT}`;
+      const daemon = daemonServerAuthHeaders({ serverId: VICTIM_SERVER, token: TOKENS.victim });
       const extHeaders = {
-        ...daemonServerAuthHeaders({ serverId: VICTIM_SERVER, token: TOKENS.victim }),
+        ...daemon,
         [CRON_RESTRICTED_ACTOR_HEADER]: CRON_RESTRICTED_ACTOR_EXTERNAL_CLI,
       };
 
-      // Interactive browser user cannot forge external_cli cron header (cookie userId = ATTACKER is refused)
+      // Old server without cron-restricted mount refuses before any DB write (and ordinary /cron refuses external_cli header)
+      const oldServerApp = await buildApp(state.db, { includeRestrictedMount: false });
+      const oldRejected = await request(oldServerApp, restrictedBase, ROUTES[1]!, extHeaders);
+      expect([403, 404]).toContain(oldRejected.status);
+      expect(state.writes).toEqual([]);
+      expect(state.cronJobs.size).toBe(1);
+
+      const headerOnOldCron = await request(app, base, ROUTES[1]!, extHeaders);
+      expect(headerOnOldCron.status).toBe(403);
+      expect(state.writes).toEqual([]);
+
+      // Interactive browser user or headerless owner daemon cannot access cron-restricted
       const attackerJwt = signJwt({ sub: ATTACKER, role: 'owner' }, SIGNING_KEY, 3600);
-      const forged = await request(app, base, ROUTES[1]!, {
+      expect((await request(app, restrictedBase, ROUTES[1]!, {
         Cookie: `${COOKIE_SESSION}=${encodeURIComponent(attackerJwt)}`,
         [CRON_RESTRICTED_ACTOR_HEADER]: CRON_RESTRICTED_ACTOR_EXTERNAL_CLI,
-      });
-      expect(forged.status).toBe(403);
+      })).status).toBe(403);
+      expect((await request(app, restrictedBase, ROUTES[1]!, daemon)).status).toBe(403);
 
       // External-CLI restricted turn creates a cron with creator_user_id = IMCODES_EXTERNAL_CLI_SENDER, shared = false
-      const created = await request(app, base, ROUTES[1]!, extHeaders);
+      const created = await request(app, restrictedBase, ROUTES[1]!, extHeaders);
       expect(created.status).toBe(201);
       const createdJson = await created.json() as { id: string };
       expect(state.cronProvenance.get(createdJson.id)).toMatchObject({
@@ -336,27 +445,67 @@ describe('cron API authentication (real auth middleware)', () => {
       });
 
       // List returns only external-CLI-owned jobs, hiding owner's job-1
-      const listed = await request(app, base, ROUTES[0]!, extHeaders);
+      const listed = await request(app, restrictedBase, ROUTES[0]!, extHeaders);
       expect(listed.status).toBe(200);
       const listedIds = ((await listed.json()) as { jobs: MockRow[] }).jobs.map((j) => j.id);
       expect(listedIds).toEqual([createdJson.id]);
 
+      // Execution history routes isolate owner executions and filter before SQL LIMIT
+      state.cronExecutions.push(
+        { id: 'exec-ext-1', job_id: createdJson.id, status: 'sent', detail: 'ext-ok', created_at: 100 },
+        { id: 'exec-owner-newer-1', job_id: 'job-1', status: 'error', detail: 'owner-secret-1', created_at: 200 },
+        { id: 'exec-owner-newer-2', job_id: 'job-1', status: 'error', detail: 'owner-secret-2', created_at: 300 },
+      );
+      const execAll = await request(app, restrictedBase, { name: 'ext-exec-all', method: 'GET', path: '/executions?mode=all&limit=1' }, extHeaders);
+      expect(execAll.status).toBe(200);
+      const execAllJson = await execAll.json() as { executions: MockRow[] };
+      expect(execAllJson.executions.map((e) => e.id)).toEqual(['exec-ext-1']);
+
+      const execLatest = await request(app, restrictedBase, { name: 'ext-exec-latest', method: 'GET', path: '/executions?mode=latest' }, extHeaders);
+      expect(execLatest.status).toBe(200);
+      const execLatestJson = await execLatest.json() as { executions: MockRow[] };
+      expect(execLatestJson.executions.map((e) => e.id)).toEqual(['exec-ext-1']);
+
+      const ownerJobExecsDenied = await request(app, restrictedBase, { name: 'ext-owner-job-exec', method: 'GET', path: '/job-1/executions' }, extHeaders);
+      expect(ownerJobExecsDenied.status).toBe(403);
+      const extJobExecsAllowed = await request(app, restrictedBase, { name: 'ext-own-job-exec', method: 'GET', path: `/${createdJson.id}/executions` }, extHeaders);
+      expect(extJobExecsAllowed.status).toBe(200);
+      expect(((await extJobExecsAllowed.json()) as { executions: MockRow[] }).executions.map((e) => e.id)).toEqual(['exec-ext-1']);
+
+      // Normal owner reads full execution history as before
+      const ownerJwt = signJwt({ sub: OWNER, role: 'owner' }, SIGNING_KEY, 3600);
+      const ownerHeaders = { Cookie: `${COOKIE_SESSION}=${encodeURIComponent(ownerJwt)}` };
+      const ownerAll = await request(app, base, { name: 'owner-exec-all', method: 'GET', path: '/executions?mode=all' }, ownerHeaders);
+      expect(ownerAll.status).toBe(200);
+      expect(((await ownerAll.json()) as { executions: MockRow[] }).executions.map((e) => e.id)).toEqual([
+        'exec-owner-newer-2',
+        'exec-owner-newer-1',
+        'exec-ext-1',
+      ]);
+      const ownerJob1Execs = await request(app, base, { name: 'owner-job1-exec', method: 'GET', path: '/job-1/executions' }, ownerHeaders);
+      expect(ownerJob1Execs.status).toBe(200);
+      expect(((await ownerJob1Execs.json()) as { executions: MockRow[] }).executions).toHaveLength(2);
+
       // External-CLI turn cannot modify, pause, trigger, or delete owner's job-1
       for (const call of [ROUTES[2]!, ROUTES[3]!, ROUTES[4]!, ROUTES[5]!]) {
-        const res = await request(app, base, call, extHeaders);
+        const res = await request(app, restrictedBase, call, extHeaders);
         expect(res.status, call.name).toBe(403);
       }
       expect(state.cronJobs.has('job-1')).toBe(true);
 
-      // External-CLI turn can update its own cron while keeping restricted provenance intact
-      const selfUpdate = await request(app, base, { name: 'self-update', method: 'PUT', path: `/${createdJson.id}`, body: { name: 'Updated CLI' } }, extHeaders);
-      expect(selfUpdate.status).toBe(200);
+      // Owner renaming the restricted job keeps restricted external-CLI provenance as upper bound across scheduled + manual triggers
+      const ownerRename = await request(app, base, {
+        name: 'owner-rename-ext',
+        method: 'PUT',
+        path: `/${createdJson.id}`,
+        body: { name: 'Owner Renamed CLI Job' },
+      }, ownerHeaders);
+      expect(ownerRename.status).toBe(200);
       expect(state.cronProvenance.get(createdJson.id)).toMatchObject({
         creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
         shared: false,
       });
 
-      // Dispatching that job emits restricted sharedActor and NEVER ownerMachineAuthority
       const sentPayloads: string[] = [];
       const bridge = WsBridge.get(VICTIM_SERVER);
       const origConnected = bridge.isDaemonConnected.bind(bridge);
@@ -364,24 +513,36 @@ describe('cron API authentication (real auth middleware)', () => {
       bridge.isDaemonConnected = () => true;
       bridge.sendToDaemon = (raw: string) => { sentPayloads.push(raw); };
       try {
-        const storedJob = state.cronJobs.get(createdJson.id) as never;
-        await dispatchJobNow(env(state.db), storedJob, {
-          skipReload: true,
-          verifiedProvenance: { ok: true, row: { creator_user_id: IMCODES_EXTERNAL_CLI_SENDER, shared: false } },
-        });
+        // Reload-based scheduled dispatch preserves restricted authority
+        await dispatchJobNow(env(state.db), state.cronJobs.get(createdJson.id) as never);
+        // Owner manual trigger of restricted job also preserves restricted authority
+        const manualExt = await request(app, base, { name: 'owner-trig-ext', method: 'POST', path: `/${createdJson.id}/trigger` }, ownerHeaders);
+        expect(manualExt.status).toBe(200);
+        // Owner manual trigger of normal owner job retains ownerMachineAuthority
+        const manualOwner = await request(app, base, { name: 'owner-trig-job1', method: 'POST', path: '/job-1/trigger' }, ownerHeaders);
+        expect(manualOwner.status).toBe(200);
       } finally {
         bridge.isDaemonConnected = origConnected;
         bridge.sendToDaemon = origSend;
       }
-      expect(sentPayloads).toHaveLength(1);
-      const dispatched = JSON.parse(sentPayloads[0]!) as Record<string, unknown>;
-      expect(dispatched.sharedActor).toMatchObject({
-        actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
-        effectiveActorRole: 'participant',
-        origin: 'server-member',
+      expect(sentPayloads).toHaveLength(3);
+      for (const idx of [0, 1]) {
+        const dispatched = JSON.parse(sentPayloads[idx]!) as Record<string, unknown>;
+        expect(dispatched.sharedActor).toMatchObject({
+          actorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+          effectiveActorRole: 'participant',
+          origin: 'server-member',
+        });
+        expect(dispatched.ownerMachineAuthority).toBeUndefined();
+        expect(dispatched.sharedMachineAuthority).toBeUndefined();
+      }
+      const ownerDispatched = JSON.parse(sentPayloads[2]!) as Record<string, unknown>;
+      expect(ownerDispatched.sharedActor).toBeUndefined();
+      expect(typeof ownerDispatched.ownerMachineAuthority).toBe('string');
+      expect(state.cronProvenance.get(createdJson.id)).toMatchObject({
+        creator_user_id: IMCODES_EXTERNAL_CLI_SENDER,
+        shared: false,
       });
-      expect(dispatched.ownerMachineAuthority).toBeUndefined();
-      expect(dispatched.sharedMachineAuthority).toBeUndefined();
     });
   });
 });

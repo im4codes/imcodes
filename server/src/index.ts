@@ -70,7 +70,7 @@ import { outboundRoutes } from './routes/outbound.js';
 import { botRoutes } from './routes/bot.js';
 import { teamRoutes } from './routes/team.js';
 import { sharedContextRoutes } from './routes/shared-context.js';
-import { cronApiRoutes } from './routes/cron-api.js';
+import { cronApiRoutes, cronRestrictedApiRoutes } from './routes/cron-api.js';
 import { pushRoutes } from './routes/push.js';
 import { quickDataRoutes } from './routes/quick-data.js';
 import { watchRoutes } from './routes/watch.js';
@@ -770,6 +770,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.route('/api/shared-context', sharedContextRoutes);
   app.route('/api/cron', cronApiRoutes);
   app.route('/api/server/:serverId/cron', cronApiRoutes);
+  app.route('/api/server/:serverId/cron-restricted', cronRestrictedApiRoutes);
   app.route('/api/push', pushRoutes);
   app.route('/api/quick-data', quickDataRoutes);
   app.route('/api', watchRoutes);

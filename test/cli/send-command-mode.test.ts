@@ -248,6 +248,16 @@ describe('imcodes send --command', () => {
       await run('deck_proj_w1', 'hello there');
       expect(mocks.sendKeys).toHaveBeenCalledWith('deck_proj_w1', 'hello there');
     });
+
+    it('hook answering with a structured JSON 403 refusal: exits non-zero and NEVER falls back to direct tmux', async () => {
+      delete process.env.IMCODES_SESSION;
+      const exit = exitSpy();
+      respond = () => ({ status: 403, body: { ok: false, error: 'external_send_blocked_during_participant_turn' } });
+      await expect(run('deck_proj_w1', 'hello there')).rejects.toThrow('exit:1');
+      expect(mocks.sendKeys).not.toHaveBeenCalled();
+      expect(errors.join('\n')).toContain('external_send_blocked_during_participant_turn');
+      expect(exit).toHaveBeenCalledWith(1);
+    });
   });
 
   it('documents the flag in --help', () => {

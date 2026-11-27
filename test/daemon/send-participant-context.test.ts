@@ -331,5 +331,24 @@ describe('dispatch of a participant-stamped message', () => {
     );
     expect(await poolHandlers.execution_pool_get()).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
     expect(await poolHandlers.execution_pool_set({ concurrencyCap: 2 })).toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+
+    // Authenticated label caller uses canonical callerRecord.name when looking up participant turn permissions
+    const workerSender = record('deck_proj_w2', { runtimeType: 'transport', label: 'LabeledWorker' });
+    mocks.sessions.set(workerSender.name, workerSender);
+    mocks.runtimes.set(workerSender.name, senderRuntime(['participant-label-1'], 'part-jwt-label'));
+    const labelRes = await dispatchHookSend({
+      from: 'LabeledWorker',
+      targetRecords: [transportTarget],
+      message: 'from label sender',
+      senderRecord: workerSender,
+    }, deps);
+    expect(labelRes.delivered).toEqual([transportTarget.name]);
+    const labelMeta = transportSend.mock.calls.at(-1)![4] as Record<string, unknown>;
+    expect(labelMeta.sharedActor).toMatchObject({
+      actorUserId: 'participant-label-1',
+      effectiveActorRole: 'participant',
+    });
+    expect(labelMeta.sharedMachineAuthority).toBe('part-jwt-label');
+    expect(labelMeta.ownerMachineAuthority).toBeUndefined();
   });
 });

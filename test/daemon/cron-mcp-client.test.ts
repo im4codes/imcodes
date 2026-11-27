@@ -581,8 +581,13 @@ describe('cron MCP client', () => {
     });
   });
 
-  it('attaches X-IMCodes-Cron-Actor: external_cli without shared machine authority when loadCronAuthority marks an external-CLI turn', async () => {
-    const fetchImpl = vi.fn(async () => okJson({ id: 'job-ext-cli' }));
+  it('routes restricted external-CLI crons to the dedicated cron-restricted endpoint and never falls back to /cron on legacy rejection', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(okJson({ id: 'job-ext-cli' }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ error: 'forbidden', reason: 'daemon_token_route_not_allowed' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+      }));
 
     const result = await cronMcpCreateSelf({
       name: 'Restricted check',
@@ -598,9 +603,30 @@ describe('cron MCP client', () => {
     });
 
     expect(result.status).toBe('ok');
-    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toContain('/api/server/srv-bound/cron-restricted');
+    expect(url).not.toContain('/api/server/srv-bound/cron?');
     const headers = init.headers as Record<string, string>;
     expect(headers[CRON_RESTRICTED_ACTOR_HEADER]).toBe(CRON_RESTRICTED_ACTOR_EXTERNAL_CLI);
     expect(headers[SHARED_MACHINE_AUTHORITY_HEADER]).toBeUndefined();
+
+    const legacyRejected = await cronMcpCreateSelf({
+      name: 'Legacy rejected check',
+      cronExpr: '*/20 * * * *',
+      projectName: 'proj',
+      targetRole: 'brain',
+      message: 'check status',
+    }, {
+      ...boundIdentity,
+      fetchImpl,
+      loadCronAuthority: async () => ({ authority: null, restrictedExternalCli: true }),
+    });
+
+    expect(legacyRejected).toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect((fetchImpl.mock.calls[1] as [string, RequestInit])[0]).toContain('/api/server/srv-bound/cron-restricted');
   });
 });

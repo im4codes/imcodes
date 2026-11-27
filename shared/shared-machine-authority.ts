@@ -12,6 +12,7 @@ export const SHARED_MACHINE_AUTHORITY_HOOK_PATH = '/shared-machine-authority' as
 /** Purpose marker sent only by cron MCP authority resolution so external-CLI turns can create restricted crons while keeping machine/alias hooks fail-closed. */
 export const SHARED_MACHINE_AUTHORITY_CRON_PURPOSE = 'cron' as const;
 export const SHARED_MACHINE_AUTHORITY_EXTERNAL_CLI_ACTOR_KIND = 'external_cli' as const;
+export const CRON_RESTRICTED_ROUTE_SEGMENT = 'cron-restricted' as const;
 export const CRON_RESTRICTED_ACTOR_HEADER = 'x-imcodes-cron-actor' as const;
 export const CRON_RESTRICTED_ACTOR_EXTERNAL_CLI = 'external_cli' as const;
 /** Hook response used when a stdio child still carries a pre-restart epoch. */
