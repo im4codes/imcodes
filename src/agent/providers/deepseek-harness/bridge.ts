@@ -41,6 +41,7 @@ import {
 
 interface DshSession {
   id: string;
+  requestContext?(): { provider?: string; model?: string; contextWindow?: number } | undefined;
 }
 
 interface DshAgent {
@@ -105,6 +106,32 @@ function readString(value: unknown): string | undefined {
 
 function readNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function readPositiveNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+interface DshRequestContextSnapshot {
+  model?: string;
+  contextWindow?: number;
+}
+
+function readRequestContextSnapshot(raw: unknown): DshRequestContextSnapshot {
+  const record = asRecord(raw);
+  const model = readString(record?.model);
+  const contextWindow = readPositiveNumber(record?.contextWindow);
+  return {
+    ...(model ? { model } : {}),
+    ...(contextWindow !== undefined ? { contextWindow } : {}),
+  };
+}
+
+function readToolError(rawError: unknown): string | undefined {
+  if (typeof rawError === 'string' && rawError) return rawError;
+  const record = asRecord(rawError);
+  if (!record) return undefined;
+  return readString(record.message) ?? readString(record.code);
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -204,8 +231,9 @@ function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
   // per reasoning token would push thousands of lines the daemon's status
   // dedupe discards after the first.
   let reasoningAnnounced = false;
-  let latestContextWindow: number | undefined;
-  let latestModel: string | undefined;
+  // Initialized from persisted session context (dsh 0.2.x resume) and replaced
+  // atomically on each `request/context` event so route switches clear stale values.
+  let currentRequestContext = readRequestContextSnapshot(agent.session.requestContext?.());
 
   const emitUsage = (rawUsage: unknown, finalized = false): void => {
     const usage = asRecord(rawUsage);
@@ -222,9 +250,26 @@ function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
       ...(cacheReadTokens !== undefined ? { cacheReadTokens } : {}),
       ...(cacheWriteTokens !== undefined ? { cacheWriteTokens } : {}),
       ...(totalTokens !== undefined ? { totalTokens } : {}),
-      ...(latestContextWindow !== undefined ? { contextWindow: latestContextWindow } : {}),
-      ...(latestModel ? { model: latestModel } : {}),
+      ...(currentRequestContext.contextWindow !== undefined ? { contextWindow: currentRequestContext.contextWindow } : {}),
+      ...(currentRequestContext.model ? { model: currentRequestContext.model } : {}),
       ...(finalized ? { finalized: true } : {}),
+    });
+  };
+
+  const emitToolResult = (
+    id: string,
+    toolName: string,
+    isError: boolean,
+    content: unknown,
+    rawError?: unknown,
+  ): void => {
+    const output = collectText(content) || (isError ? readToolError(rawError) : undefined);
+    emit({
+      type: DSH_BRIDGE_EVENT.TOOL,
+      id,
+      name: toolName,
+      status: isError ? DSH_BRIDGE_TOOL_STATUS.ERROR : DSH_BRIDGE_TOOL_STATUS.COMPLETE,
+      ...(output ? { output } : {}),
     });
   };
 
@@ -263,10 +308,7 @@ function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
     const data = event.data ?? {};
 
     if (event.type === DSH_SESSION_EVENT.REQUEST_CONTEXT) {
-      const contextWindow = readNumber(data.contextWindow);
-      const model = readString(data.model);
-      if (contextWindow !== undefined && contextWindow > 0) latestContextWindow = contextWindow;
-      if (model) latestModel = model;
+      currentRequestContext = readRequestContextSnapshot(data);
       return;
     }
 
@@ -276,7 +318,11 @@ function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
     }
 
     if (event.type === DSH_SESSION_EVENT.COMPACTION_END) {
-      emit({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false });
+      emit({
+        type: DSH_BRIDGE_EVENT.COMPACTING,
+        active: false,
+        ...(data.error === undefined ? { committed: true } : {}),
+      });
       return;
     }
 
@@ -314,22 +360,36 @@ function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
       // Compaction/surface rewrites emit replaced historical results; only live appends are new tool outputs.
       if (event.surfaceOp !== undefined && event.surfaceOp !== 'append') return;
       const message = asRecord(data.message);
-      const blocks = Array.isArray(message?.content) ? message.content : [];
+      if (!message) return;
+      const emittedIds = new Set<string>();
+      // First-class `role: 'tool'` result (`dsh-llm` createToolResultMessage):
+      // `toolCallId` and `isError` live on `message`, while `content` holds result blocks directly.
+      const topLevelId = readString(message.toolCallId);
+      if (topLevelId) {
+        emittedIds.add(topLevelId);
+        emitToolResult(
+          topLevelId,
+          readString(message.toolName) ?? '',
+          message.isError === true,
+          message.content,
+          data.error,
+        );
+      }
+      // Fallback for block-wrapped `tool-result` payloads without duplicating any id already emitted above.
+      const blocks = Array.isArray(message.content) ? message.content : [];
       for (const block of blocks) {
         const record = asRecord(block);
         if (!record || record.type !== 'tool-result') continue;
         const id = readString(record.toolCallId);
-        if (!id) continue;
-        // Tool results are the largest payloads in the stream; walk once.
-        const output = collectText(record.content);
-        emit({
-          type: DSH_BRIDGE_EVENT.TOOL,
+        if (!id || emittedIds.has(id)) continue;
+        emittedIds.add(id);
+        emitToolResult(
           id,
-          // The daemon keys tool cards by id; the name came with tool/call.
-          name: readString(record.toolName) ?? '',
-          status: record.isError === true ? DSH_BRIDGE_TOOL_STATUS.ERROR : DSH_BRIDGE_TOOL_STATUS.COMPLETE,
-          ...(output ? { output } : {}),
-        });
+          readString(record.toolName) ?? '',
+          record.isError === true,
+          record.content,
+          data.error,
+        );
       }
       return;
     }
@@ -390,12 +450,13 @@ async function start(ctx: DshPluginContext): Promise<void> {
   subscribe(ctx, agent);
   await agent.whenIdle();
 
+  const readyModel = (resumed ? readString(agent.session.requestContext?.()?.model) : undefined) ?? effectiveModel;
   emit({
     type: DSH_BRIDGE_EVENT.READY,
     sessionId: agent.session.id,
     resumed,
     ...(selection.provider ? { provider: selection.provider } : {}),
-    ...(effectiveModel ? { model: effectiveModel } : {}),
+    ...(readyModel ? { model: readyModel } : {}),
   });
 
   const rl = createInterface({ input: process.stdin });

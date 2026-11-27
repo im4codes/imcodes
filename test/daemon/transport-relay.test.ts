@@ -951,6 +951,42 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(usageCalls[1][3]).toMatchObject({ eventId: 'transport:sess-1:msg-final-usage:usage' });
     });
 
+    it('keeps eventId, model, and contextWindow aligned across SessionInfo + onUsage + onComplete rewrite', () => {
+      let currentSession: Record<string, unknown> = { name: 'sess-1', activeModel: 'model-a' };
+      getSessionMock.mockImplementation(() => currentSession as never);
+      const { provider, fireUsage, fireComplete } = makeMockProvider();
+      let infoCb: ((sid: string, info: { model?: string }) => void) | undefined;
+      (provider as { onSessionInfo?: (cb: (sid: string, info: { model?: string }) => void) => void }).onSessionInfo = (cb) => {
+        infoCb = cb;
+        return () => {};
+      };
+      wireProviderToRelay(provider);
+
+      // Simulate runtime.onSessionInfoChange updating activeModel on route switch before usage.
+      infoCb?.('sess-1', { model: 'model-b' });
+      currentSession = { name: 'sess-1', activeModel: 'model-b' };
+
+      fireUsage('sess-1', {
+        messageId: 'msg-route-switch',
+        model: 'model-b',
+        usage: { input_tokens: 500, output_tokens: 20, model_context_window: 200_000 },
+      });
+      fireComplete('sess-1', makeMessage({
+        id: 'msg-route-switch',
+        metadata: {
+          model: 'model-b',
+          usage: { input_tokens: 500, output_tokens: 20, model_context_window: 200_000 },
+        },
+      }));
+
+      const usageCalls = emitMock.mock.calls.filter(c => c[1] === 'usage.update');
+      expect(usageCalls).toHaveLength(2);
+      expect(usageCalls[0][2]).toMatchObject({ model: 'model-b', contextWindow: 200_000, streaming: true });
+      expect(usageCalls[1][2]).toMatchObject({ model: 'model-b', contextWindow: 200_000 });
+      expect(usageCalls[0][3]).toMatchObject({ eventId: 'transport:sess-1:msg-route-switch:usage' });
+      expect(usageCalls[1][3]).toMatchObject({ eventId: 'transport:sess-1:msg-route-switch:usage' });
+    });
+
     it('emits final completion immediately even when a throttled delta is pending', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));

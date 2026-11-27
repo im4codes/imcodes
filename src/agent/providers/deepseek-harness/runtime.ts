@@ -134,6 +134,8 @@ export interface DshOverlayOptions {
   llm?: DshLlmConfig;
   /** Withhold native agent tools (`DSH_NATIVE_AGENT_ROW_IDS`) for a managed session. */
   nativeAgentsFenced?: boolean;
+  /** Effective child `DSH_PERMISSION_MODE` written into `sandbox-policy`. */
+  permissionMode?: string;
 }
 
 interface DshPatchRow {
@@ -154,17 +156,20 @@ interface DshPatchRow {
  * its value must never be serialized into this on-disk overlay.
  */
 export function buildDshOverlay(
-  options: Pick<DshOverlayOptions, 'memoryMcp' | 'llm' | 'nativeAgentsFenced'>,
+  options: Pick<DshOverlayOptions, 'memoryMcp' | 'llm' | 'nativeAgentsFenced' | 'permissionMode'>,
 ): DshPatchRow[] {
   const rows: DshPatchRow[] = [
     ...DSH_DISABLED_ROW_IDS,
     ...(options.nativeAgentsFenced ? DSH_NATIVE_AGENT_ROW_IDS : []),
   ].map((id) => ({ id, disabled: true }));
+  const mode = options.permissionMode !== undefined
+    ? (options.permissionMode.trim() || 'workspace-write')
+    : (process.env.DSH_PERMISSION_MODE?.trim() || 'workspace-write');
   // Decouple `sandbox-policy` from `headlessStartup` before inserting our own plugins.
   rows.push({
     id: DSH_SANDBOX_POLICY_ROW_ID,
     inject: [],
-    config: { mode: process.env.DSH_PERMISSION_MODE?.trim() || 'workspace-write' },
+    config: { mode },
   });
   const insert: DshPatchRow[] = [];
   if (options.memoryMcp) {

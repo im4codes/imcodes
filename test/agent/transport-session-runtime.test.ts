@@ -211,6 +211,7 @@ describe('TransportSessionRuntime memory provenance', () => {
 
     async function setup(reasserts: boolean | undefined) {
       let complete: ((sessionId: string, message: AgentMessage) => void) | undefined;
+      let onError: ((sessionId: string, err: { code: string; message: string; recoverable: boolean }) => void) | undefined;
       const provider = makeProvider();
       provider.capabilities.compact = {
         execution: 'sdk-rpc',
@@ -224,13 +225,22 @@ describe('TransportSessionRuntime memory provenance', () => {
         complete = callback;
         return () => undefined;
       };
+      provider.onError = (callback) => {
+        onError = callback;
+        return () => undefined;
+      };
       provider.onStatus = (callback) => {
         (provider as unknown as { __status?: typeof callback }).__status = callback;
         return () => undefined;
       };
       const runtime = new TransportSessionRuntime(provider, 'deck_auto_compact');
       await runtime.initialize({ sessionKey: 'deck_auto_compact', identityPrompt: 'identity survives compaction' });
-      return { provider, runtime, complete: (m: AgentMessage) => complete?.('provider-session-1', m) };
+      return {
+        provider,
+        runtime,
+        complete: (m: AgentMessage) => complete?.('provider-session-1', m),
+        fail: (err: { code: string; message: string; recoverable: boolean }) => onError?.('provider-session-1', err),
+      };
     }
 
     it('never auto-compacts a nearly full context, even when the env override is set', async () => {
@@ -259,6 +269,38 @@ describe('TransportSessionRuntime memory provenance', () => {
       (provider as unknown as { __status?: (sid: string, update: ProviderStatusUpdate) => void }).__status?.('provider-session-1', { status: 'compacting' });
       complete(turnDone('turn-1', 60_000));
       expect(provider.refreshSessionSystemText).toHaveBeenCalledWith('provider-session-1');
+    });
+
+    it('does not leak compacting observation into the next normal turn after cancel or error', async () => {
+      const { provider, runtime, complete, fail } = await setup(true);
+      try {
+        // Turn A observes compacting, then fails with onError (e.g. child exit / turn error).
+        runtime.send('turn A', 'work-err');
+        await waitForProviderSend(provider);
+        (provider as unknown as { __status?: (sid: string, update: ProviderStatusUpdate) => void }).__status?.('provider-session-1', { status: 'compacting' });
+        fail({ code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'child exited', recoverable: true });
+
+        // Turn B completes normally without compaction: must NOT trigger reinjectAfterCompaction.
+        runtime.send('turn B', 'work-ok');
+        await vi.waitFor(() => expect(provider.send).toHaveBeenCalledTimes(2), { timeout: 2_000 });
+        complete(turnDone('turn-b', 10_000));
+        await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
+        expect(provider.refreshSessionSystemText).not.toHaveBeenCalled();
+
+        // Turn C observes compacting, is locally cancelled while Turn D starts; Turn D normal completion must stay clean.
+        runtime.send('turn C', 'work-cancel');
+        await vi.waitFor(() => expect(provider.send).toHaveBeenCalledTimes(3), { timeout: 2_000 });
+        (provider as unknown as { __status?: (sid: string, update: ProviderStatusUpdate) => void }).__status?.('provider-session-1', { status: 'compacting' });
+        await runtime.cancel();
+
+        runtime.send('turn D', 'work-d');
+        await vi.waitFor(() => expect(provider.send).toHaveBeenCalledTimes(4), { timeout: 2_000 });
+        complete(turnDone('turn-d', 10_000));
+        await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
+        expect(provider.refreshSessionSystemText).not.toHaveBeenCalled();
+      } finally {
+        await runtime.kill();
+      }
     });
 
     it('uses the model\'s known window when the provider reports none, as Claude does', async () => {

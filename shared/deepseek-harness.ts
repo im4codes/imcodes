@@ -141,6 +141,8 @@ export interface DshBridgeUsageEvent {
 export interface DshBridgeCompactingEvent {
   type: typeof DSH_BRIDGE_EVENT.COMPACTING;
   active: boolean;
+  /** True on `active: false` when compaction committed without error. */
+  committed?: boolean;
 }
 
 export interface DshBridgeTurnEndEvent {

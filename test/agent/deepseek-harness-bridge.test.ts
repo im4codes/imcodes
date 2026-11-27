@@ -27,18 +27,19 @@ type AssistantStreamListener = (payload: { agent?: { session?: { id: string } };
 const OWN_SESSION = { id: 'session-own' };
 const OTHER_SESSION = { id: 'session-other' };
 
-function makeAgent() {
+function makeAgent(sessionOverrides: { requestContext?: () => Record<string, unknown> | undefined } = {}) {
   const followups: unknown[] = [];
   const steers: unknown[] = [];
   const cancelCauses: Array<{ kind: string } | undefined> = [];
   let cancelled = 0;
+  const session = { ...OWN_SESSION, ...sessionOverrides };
   return {
     followups,
     steers,
     cancelCauses,
     cancelCount: () => cancelled,
     agent: {
-      session: OWN_SESSION,
+      session,
       whenIdle: vi.fn().mockResolvedValue(undefined),
       followup: (message: unknown) => { followups.push(message); },
       steer: (message: unknown) => { steers.push(message); },
@@ -102,8 +103,11 @@ describe('deepseek-harness bridge', () => {
     vi.unstubAllEnvs();
   });
 
-  async function boot(overrides: Record<string, unknown> = {}) {
-    const agentBits = makeAgent();
+  async function boot(
+    overrides: Record<string, unknown> = {},
+    sessionOverrides: { requestContext?: () => Record<string, unknown> | undefined } = {},
+  ) {
+    const agentBits = makeAgent(sessionOverrides);
     const harness = makeCtx(agentBits.agent, overrides);
     apply(harness.ctx as never);
     // apply() kicks off an async start(); let it settle.
@@ -209,7 +213,7 @@ describe('deepseek-harness bridge', () => {
     expect(frames.filter((f) => f.type === DSH_BRIDGE_EVENT.REASONING)).toHaveLength(2);
   });
 
-  it('maps tool call and tool result payloads, parsing the JSON arguments string', async () => {
+  it('maps real dsh role=tool tool/result payloads without duplicating nested blocks', async () => {
     const harness = await boot();
     frames.length = 0;
 
@@ -219,51 +223,132 @@ describe('deepseek-harness bridge', () => {
     });
     harness.emit({
       type: DSH_SESSION_EVENT.TOOL_RESULT,
+      surfaceOp: 'append',
+      data: {
+        message: {
+          role: 'tool',
+          toolCallId: 'call_a',
+          content: [{ type: 'text', text: 'hi\n' }],
+          isError: false,
+        },
+      },
+    });
+    harness.emit({
+      type: DSH_SESSION_EVENT.TOOL_RESULT,
+      surfaceOp: 'append',
+      data: {
+        message: {
+          role: 'tool',
+          toolCallId: 'call_err',
+          content: [{ type: 'text', text: 'permission denied' }],
+          isError: true,
+        },
+      },
+    });
+    // Fallback nested block shape when no top-level toolCallId is present.
+    harness.emit({
+      type: DSH_SESSION_EVENT.TOOL_RESULT,
       data: {
         message: {
           role: 'user',
           content: [{
             type: 'tool-result',
-            toolCallId: 'call_a',
-            content: [{ type: 'text', text: 'hi\n' }],
+            toolCallId: 'call_legacy',
+            content: [{ type: 'text', text: 'legacy\n' }],
             isError: false,
           }],
         },
       },
     });
 
-    expect(frames[0]).toEqual({
-      type: DSH_BRIDGE_EVENT.TOOL,
-      id: 'call_a',
-      name: 'bash',
-      status: DSH_BRIDGE_TOOL_STATUS.RUNNING,
-      input: { command: 'echo hi' },
-    });
-    expect(frames[1]).toMatchObject({
-      type: DSH_BRIDGE_EVENT.TOOL,
-      id: 'call_a',
-      status: DSH_BRIDGE_TOOL_STATUS.COMPLETE,
-      output: 'hi\n',
-    });
+    expect(frames).toEqual([
+      {
+        type: DSH_BRIDGE_EVENT.TOOL,
+        id: 'call_a',
+        name: 'bash',
+        status: DSH_BRIDGE_TOOL_STATUS.RUNNING,
+        input: { command: 'echo hi' },
+      },
+      {
+        type: DSH_BRIDGE_EVENT.TOOL,
+        id: 'call_a',
+        name: '',
+        status: DSH_BRIDGE_TOOL_STATUS.COMPLETE,
+        output: 'hi\n',
+      },
+      {
+        type: DSH_BRIDGE_EVENT.TOOL,
+        id: 'call_err',
+        name: '',
+        status: DSH_BRIDGE_TOOL_STATUS.ERROR,
+        output: 'permission denied',
+      },
+      {
+        type: DSH_BRIDGE_EVENT.TOOL,
+        id: 'call_legacy',
+        name: '',
+        status: DSH_BRIDGE_TOOL_STATUS.COMPLETE,
+        output: 'legacy\n',
+      },
+    ]);
   });
 
-  it('marks a failed tool result as an error', async () => {
-    const harness = await boot();
-    frames.length = 0;
-
-    harness.emit({
-      type: DSH_SESSION_EVENT.TOOL_RESULT,
-      data: {
-        message: {
-          content: [{
-            type: 'tool-result', toolCallId: 'call_b',
-            content: [{ type: 'text', text: 'denied' }], isError: true,
-          }],
-        },
-      },
+  it('initializes requestContext on resume and atomically replaces it across route switches', async () => {
+    vi.stubEnv(DSH_BRIDGE_RESUME_ENV, 'session-resumed');
+    const harness = await boot({}, {
+      requestContext: () => ({ provider: 'route-a', model: 'model-a', contextWindow: 131_072 }),
     });
 
-    expect(frames[0]).toMatchObject({ status: DSH_BRIDGE_TOOL_STATUS.ERROR, output: 'denied' });
+    // READY already reflects persisted session context even before any new request/context event.
+    expect(frames[0]).toMatchObject({ type: DSH_BRIDGE_EVENT.READY, resumed: true, model: 'model-a' });
+    frames.length = 0;
+
+    // Resumed turn emits usage with no new request/context event: keeps persisted 131_072 window.
+    harness.emitStream({
+      type: 'chunk',
+      chunk: { type: 'usage', usage: { inputTokens: 100, outputTokens: 10 } },
+    });
+    // Route switch to model B that omits contextWindow must CLEAR 131_072 instead of leaking it.
+    harness.emit({
+      type: DSH_SESSION_EVENT.REQUEST_CONTEXT,
+      data: { provider: 'route-b', model: 'model-b' },
+    });
+    harness.emitStream({
+      type: 'chunk',
+      chunk: { type: 'usage', usage: { inputTokens: 200, outputTokens: 20 } },
+    });
+    // Route switch to model C with a different explicit window updates atomically.
+    harness.emit({
+      type: DSH_SESSION_EVENT.REQUEST_CONTEXT,
+      data: { provider: 'route-c', model: 'model-c', contextWindow: 200_000 },
+    });
+    harness.emitStream({
+      type: 'chunk',
+      chunk: { type: 'usage', usage: { inputTokens: 300, outputTokens: 30 } },
+    });
+
+    expect(frames).toEqual([
+      {
+        type: DSH_BRIDGE_EVENT.USAGE,
+        inputTokens: 100,
+        outputTokens: 10,
+        contextWindow: 131_072,
+        model: 'model-a',
+      },
+      {
+        type: DSH_BRIDGE_EVENT.USAGE,
+        inputTokens: 200,
+        outputTokens: 20,
+        model: 'model-b',
+      },
+      {
+        type: DSH_BRIDGE_EVENT.USAGE,
+        inputTokens: 300,
+        outputTokens: 30,
+        contextWindow: 200_000,
+        model: 'model-c',
+      },
+    ]);
   });
 
   it('forwards usage counters', async () => {
@@ -347,9 +432,11 @@ describe('deepseek-harness bridge', () => {
       data: { message: { role: 'tool', content: [{ type: 'tool-result', toolCallId: 'old-1', content: [{ type: 'text', text: 'stale' }] }] } },
     });
     harness.emit({ type: DSH_SESSION_EVENT.COMPACTION_END, data: { compactionId: 'cmp-1', status: 'committed' } });
+    harness.emit({ type: DSH_SESSION_EVENT.COMPACTION_END, data: { compactionId: 'cmp-2', error: { message: 'aborted' } } });
 
     expect(frames).toEqual([
       { type: DSH_BRIDGE_EVENT.COMPACTING, active: true },
+      { type: DSH_BRIDGE_EVENT.COMPACTING, active: false, committed: true },
       { type: DSH_BRIDGE_EVENT.COMPACTING, active: false },
     ]);
   });

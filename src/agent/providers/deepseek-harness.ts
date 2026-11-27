@@ -150,6 +150,8 @@ interface DeepseekHarnessSessionState {
   toolNames: Map<string, string>;
   /** Stored in the ProviderUsageUpdate shape so it is mapped exactly once. */
   lastUsage?: ProviderUsageUpdate['usage'];
+  /** Model associated with `lastUsage`, echoed onto the matching completion frame. */
+  lastUsageModel?: string;
   /** Session-scoped context already folded into this harness conversation. */
   sessionSystemTextInjected?: string;
   /** Session context sent this turn, promoted to `injected` only once it settles. */
@@ -374,6 +376,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     state.toolNames.clear();
     // Stale counters would otherwise be stamped onto a turn that reports none.
     state.lastUsage = undefined;
+    state.lastUsageModel = undefined;
     if (!this.write(state, { type: DSH_BRIDGE_COMMAND.PROMPT, text })) {
       state.turnActive = false;
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'dsh bridge stdin is unavailable', true);
@@ -424,6 +427,14 @@ export class DeepseekHarnessProvider implements TransportProvider {
 
   async restoreSession(sessionId: string): Promise<boolean> {
     return this.sessions.has(sessionId);
+  }
+
+  /** Clear injected system-text tracking after compaction or identity changes. */
+  refreshSessionSystemText(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state) return;
+    state.sessionSystemTextInjected = undefined;
+    state.pendingSessionSystemText = undefined;
   }
 
   /**
@@ -488,6 +499,23 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // pending so an admission check during the write sees this spawn's fence.
     const nativeAgentsFenced = this.nativeAgentFence.required(state.routeId, state.sessionName);
     state.pendingChildNativeAgentFence = fenceOf(nativeAgentsFenced);
+    const resumeId = state.harnessSessionId;
+    // Compute the exact child env once so `sandbox-policy` in the overlay matches
+    // the effective `DSH_PERMISSION_MODE` seen by the spawned child process.
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(state.env ?? {}),
+      [DSH_BRIDGE_CWD_ENV]: state.cwd,
+      ...(resumeId ? { [DSH_BRIDGE_RESUME_ENV]: resumeId } : {}),
+      // The harness picks the model when it creates the agent, so IM.codes
+      // pins it here too. A ccPreset's route metadata rides the overlay while
+      // its credential stays out of that file and enters only this child.
+      ...(state.requestedModel ? { [DSH_BRIDGE_MODEL_ENV]: state.requestedModel } : {}),
+      ...(state.llmConfig?.apiKey
+        ? { [DSH_PROVIDER_API_KEY_ENV]: state.llmConfig.apiKey }
+        : {}),
+    };
+    const permissionMode = childEnv.DSH_PERMISSION_MODE?.trim() || 'workspace-write';
     let overlayPath: string;
     try {
       overlayPath = await writeDshOverlay({
@@ -495,12 +523,12 @@ export class DeepseekHarnessProvider implements TransportProvider {
         ...(state.memoryMcp ? { memoryMcp: state.memoryMcp } : {}),
         ...(state.llmConfig ? { llm: state.llmConfig } : {}),
         nativeAgentsFenced,
+        permissionMode,
       });
     } catch (error) {
       state.pendingChildNativeAgentFence = undefined;
       throw error;
     }
-    const resumeId = state.harnessSessionId;
     // On Windows `dsh` is an npm .cmd shim, which bare spawn() cannot execute;
     // this resolves it to `node <script>` the same way every other local-SDK
     // provider does.
@@ -512,19 +540,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
       // workers of the incident were unreachable on PPID=1.
       detached: process.platform !== 'win32',
       cwd: state.cwd,
-      env: {
-        ...process.env,
-        ...(state.env ?? {}),
-        [DSH_BRIDGE_CWD_ENV]: state.cwd,
-        ...(resumeId ? { [DSH_BRIDGE_RESUME_ENV]: resumeId } : {}),
-        // The harness picks the model when it creates the agent, so IM.codes
-        // pins it here too. A ccPreset's route metadata rides the overlay while
-        // its credential stays out of that file and enters only this child.
-        ...(state.requestedModel ? { [DSH_BRIDGE_MODEL_ENV]: state.requestedModel } : {}),
-        ...(state.llmConfig?.apiKey
-          ? { [DSH_PROVIDER_API_KEY_ENV]: state.llmConfig.apiKey }
-          : {}),
-      },
+      env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -796,7 +812,12 @@ export class DeepseekHarnessProvider implements TransportProvider {
           ...(event.contextWindow !== undefined ? { model_context_window: event.contextWindow } : {}),
         };
         const model = event.model ?? state.model;
+        if (event.model && event.model !== state.model) {
+          state.model = event.model;
+          this.emitSessionInfo(sessionId, { model: event.model });
+        }
         state.lastUsage = usage;
+        state.lastUsageModel = model;
         for (const cb of this.usageCallbacks) {
           cb(sessionId, {
             usage,
@@ -812,6 +833,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
         if (event.active) {
           this.emitStatus(sessionId, state, { status: 'compacting', label: 'Compacting conversation...' });
         } else {
+          if (event.committed) this.refreshSessionSystemText(sessionId);
           this.clearStatus(sessionId, state);
         }
         return;
@@ -880,6 +902,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     const finalText = state.committedSegments.length
       ? state.committedSegments.join('')
       : state.currentText;
+    const completionModel = state.lastUsageModel ?? state.model;
     const completion: AgentMessage = {
       id: state.currentMessageId ?? `${state.routeId}:${randomUUID()}`,
       sessionId,
@@ -893,7 +916,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
       timestamp: Date.now(),
       status: 'complete',
       metadata: {
-        ...(state.model ? { model: state.model } : {}),
+        ...(completionModel ? { model: completionModel } : {}),
         ...(state.lastUsage ? { usage: state.lastUsage } : {}),
       },
     };
@@ -907,6 +930,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     state.committedSegments = [];
     state.currentMessageId = null;
     state.pendingSessionSystemText = undefined;
+    state.lastUsageModel = undefined;
     state.compacting = false;
   }
 

@@ -26,6 +26,7 @@ vi.mock('../../src/agent/providers/deepseek-harness/runtime.js', async (importOr
 });
 
 import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import {
   DSH_AGENT_DEFAULT_MODEL_ROW_ID,
   DSH_BRIDGE_COMMAND,
@@ -357,26 +358,37 @@ describe('DeepseekHarnessProvider', () => {
     expect(errors).toHaveLength(0);
   });
 
-  it('maps tool lifecycle and backfills the name onto the result', async () => {
+  it('propagates role=tool tool/result frames from the bridge plugin through provider callbacks without duplication', async () => {
     const sessionId = await startSession();
-    await provider.send(sessionId, 'run a tool');
+    await provider.send(sessionId, 'run tool');
     child.emitEvent({
       type: DSH_BRIDGE_EVENT.TOOL, id: 'call_1', name: 'bash',
       status: DSH_BRIDGE_TOOL_STATUS.RUNNING, input: { command: 'echo hi' },
     });
-    // tool/result carries no tool name in the harness payload.
     child.emitEvent({
       type: DSH_BRIDGE_EVENT.TOOL, id: 'call_1', name: '',
       status: DSH_BRIDGE_TOOL_STATUS.COMPLETE, output: 'hi\n',
     });
+    child.emitEvent({
+      type: DSH_BRIDGE_EVENT.TOOL, id: 'call_2', name: 'bash',
+      status: DSH_BRIDGE_TOOL_STATUS.RUNNING,
+    });
+    child.emitEvent({
+      type: DSH_BRIDGE_EVENT.TOOL, id: 'call_2', name: '',
+      status: DSH_BRIDGE_TOOL_STATUS.ERROR, output: 'denied',
+    });
     await flush();
 
-    expect(tools).toHaveLength(2);
+    expect(tools).toHaveLength(4);
     expect(tools[0].tool).toMatchObject({ id: 'call_1', name: 'bash', status: 'running', input: { command: 'echo hi' } });
     expect(tools[1].tool).toMatchObject({ id: 'call_1', name: 'bash', status: 'complete', output: 'hi\n' });
+    expect(tools[2].tool).toMatchObject({ id: 'call_2', name: 'bash', status: 'running' });
+    expect(tools[3].tool).toMatchObject({ id: 'call_2', name: 'bash', status: 'error', output: 'denied' });
   });
 
-  it('forwards usage including cacheWriteTokens, model_context_window, and finalized flag', async () => {
+  it('syncs usage model to SessionInfo and echoes the same model onto completion metadata', async () => {
+    const sessionInfos: Array<Record<string, unknown>> = [];
+    provider.onSessionInfo((_s, info) => { sessionInfos.push(info as Record<string, unknown>); });
     const sessionId = await startSession();
     await provider.send(sessionId, 'hi');
     child.emitEvent({
@@ -386,15 +398,16 @@ describe('DeepseekHarnessProvider', () => {
       cacheReadTokens: 4608,
       cacheWriteTokens: 512,
       contextWindow: 131_072,
-      model: 'deepseek-v4',
+      model: 'minimax-m3',
       finalized: true,
     });
     child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'done' });
     child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
     await flush();
 
+    expect(sessionInfos.some((i) => i.model === 'minimax-m3')).toBe(true);
     expect(usages[0]).toMatchObject({
-      model: 'deepseek-v4',
+      model: 'minimax-m3',
       finalized: true,
       usage: {
         input_tokens: 100,
@@ -405,6 +418,7 @@ describe('DeepseekHarnessProvider', () => {
       },
     });
     expect(completions[0].message.metadata).toMatchObject({
+      model: 'minimax-m3',
       usage: {
         input_tokens: 100,
         output_tokens: 20,
@@ -413,6 +427,40 @@ describe('DeepseekHarnessProvider', () => {
         model_context_window: 131_072,
       },
     });
+    expect(usages[0].messageId).toBe(completions[0].message.id);
+  });
+
+  it('re-injects sessionSystemText after committed compaction even if the turn then fails', async () => {
+    const sessionId = await startSession();
+    await provider.send(sessionId, {
+      context: { sessionSystemText: 'IDENTITY_CONTRACT' },
+      assembledMessage: 'turn 1',
+      sessionSystemText: 'IDENTITY_CONTRACT',
+    } as never);
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'ok' });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
+    await flush();
+
+    // Turn 2: compaction commits, then the turn fails before completion.
+    await provider.send(sessionId, {
+      context: { sessionSystemText: 'IDENTITY_CONTRACT' },
+      assembledMessage: 'turn 2',
+      sessionSystemText: 'IDENTITY_CONTRACT',
+    } as never);
+    expect(String((child.commands().at(-1) as { text?: string })?.text)).not.toContain('IDENTITY_CONTRACT');
+    expect(String((child.commands().at(-1) as { text?: string })?.text)).toContain('turn 2');
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false, committed: true });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.ERROR, message: 'upstream failed' });
+    await flush();
+
+    // Turn 3 must re-inject IDENTITY_CONTRACT because Turn 2 compacted cleanly before failing.
+    await provider.send(sessionId, {
+      context: { sessionSystemText: 'IDENTITY_CONTRACT' },
+      assembledMessage: 'turn 3',
+      sessionSystemText: 'IDENTITY_CONTRACT',
+    } as never);
+    expect(String((child.commands().at(-1) as { text?: string })?.text)).toContain('IDENTITY_CONTRACT');
   });
 
   it('tracks compacting status and clears it on compaction end or child exit', async () => {
@@ -434,6 +482,46 @@ describe('DeepseekHarnessProvider', () => {
       { status: 'compacting', label: 'Compacting conversation...' },
       { status: null, label: null },
     ]);
+  });
+
+  it('prevents aborted compaction from leaking across TransportSessionRuntime turns while reinjecting after normal compaction', async () => {
+    const runtime = new TransportSessionRuntime(provider, 'deck_dsh_runtime_compaction');
+    const refreshSpy = vi.spyOn(provider, 'refreshSessionSystemText');
+    try {
+      await runtime.initialize({
+        sessionKey: 'deck_dsh_runtime_compaction',
+        sessionName: 'deck_dsh_runtime_compaction',
+        identityPrompt: 'CONTRACT_SURVIVES',
+      });
+
+      // Turn 1: starts compacting, then fails with error (uncommitted compaction).
+      runtime.send('turn 1', 'm1');
+      await vi.waitFor(() => expect(child.commands().some((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toBe(true), { timeout: 2_000 });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.ERROR, message: 'turn failed' });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
+
+      // Turn 2: ordinary completion must NOT inherit Turn 1's compacting observation.
+      runtime.send('turn 2', 'm2');
+      await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(2), { timeout: 2_000 });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'ok-2' });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
+      expect(refreshSpy).not.toHaveBeenCalled();
+
+      // Turn 3: normal compaction commits and completes -> reinjectAfterCompaction calls refreshSessionSystemText.
+      runtime.send('turn 3', 'm3');
+      await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(3), { timeout: 2_000 });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false, committed: true });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'ok-3' });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
+      expect(refreshSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      await runtime.kill();
+    }
   });
 
   it('reports a failed turn as a recoverable provider error, not a completion', async () => {
@@ -521,6 +609,27 @@ describe('DeepseekHarnessProvider', () => {
 
     const env = (spawnMock.mock.calls[0][2] as { env: Record<string, string> }).env;
     expect(env[DSH_BRIDGE_RESUME_ENV]).toBeUndefined();
+  });
+
+  it('passes effective child DSH_PERMISSION_MODE to the overlay without leaking full env', async () => {
+    vi.stubEnv('DSH_PERMISSION_MODE', 'danger-full-access');
+    const sessionId = await startSession({ env: { DSH_PERMISSION_MODE: 'read-only', SECRET_TOKEN: 'keep-out' } });
+    await provider.send(sessionId, 'hi');
+    await flush();
+
+    expect(writeDshOverlayMock).toHaveBeenCalledWith(expect.objectContaining({ permissionMode: 'read-only' }));
+    const overlayCall = writeDshOverlayMock.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(overlayCall.env).toBeUndefined();
+    const childEnv = (spawnMock.mock.calls[0][2] as { env: Record<string, string> }).env;
+    expect(childEnv.DSH_PERMISSION_MODE).toBe('read-only');
+
+    const overlayRows = buildDshOverlay({ permissionMode: 'read-only' });
+    expect(overlayRows).toContainEqual({
+      id: DSH_SANDBOX_POLICY_ROW_ID,
+      inject: [],
+      config: { mode: 'read-only' },
+    });
+    expect(JSON.stringify(overlayRows)).not.toContain('keep-out');
   });
 
   it('ignores non-protocol stdout without disturbing the stream', async () => {
