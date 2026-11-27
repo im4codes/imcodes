@@ -26,6 +26,7 @@ import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import { signJwt } from '../src/security/crypto.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import { CRON_STATUS } from '../../shared/cron-types.js';
+import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { SESSION_IDENTITY_SCOPES } from '../../shared/session-identity.js';
 import { jobDispatchCron, readCronJobAndProvenanceLocked } from '../src/cron/job-dispatch.js';
 import type { Env } from '../src/env.js';
@@ -1051,5 +1052,184 @@ describe('PostgreSQL READ COMMITTED lock-wait pairing: EvalPlanQual prevention',
     expect(byJob.get(EPQ_JOB_SCHED)?.exactTargetSessionName).toBe(SUB_SESSION_NAME);
     expect(byJob.get(EPQ_JOB_RECOVER)?.action).toMatchObject({ target: SUB_SESSION_NAME, message: 'v2-recover-trusted' });
     expect(byJob.get(EPQ_JOB_RECOVER)?.exactTargetSessionName).toBe(SUB_SESSION_NAME);
+  });
+});
+
+describe('PostgreSQL protection for external-CLI cron provenance (migration 120)', () => {
+  const EXT_PROTECTED_JOB = 'cron-ext-pg-protect-001';
+  const EXT_MAINT_JOB = 'cron-ext-pg-maint-002';
+  const EXT_CASCADE_JOB = 'cron-ext-pg-cascade-003';
+  const NORMAL_SHARED_JOB = 'cron-normal-pg-maint-004';
+
+  afterEach(async () => {
+    const ids = [EXT_PROTECTED_JOB, EXT_MAINT_JOB, EXT_CASCADE_JOB, NORMAL_SHARED_JOB];
+    await db.execute('DELETE FROM cron_executions WHERE job_id = ANY($1::text[])', [ids]);
+    // Deleting cron_jobs cascades FK deletion to cron_job_provenance cleanly.
+    await db.execute('DELETE FROM cron_jobs WHERE id = ANY($1::text[])', [ids]);
+  });
+
+  async function seedJob(opts: {
+    id: string;
+    name: string;
+    action: Record<string, unknown>;
+    creatorUserId: string;
+    shared: boolean;
+    nextRunAt?: number | null;
+  }) {
+    const now = Date.now();
+    await db.execute(
+      `INSERT INTO cron_jobs (id, user_id, server_id, name, cron_expr, project_name, target_role, target_session_name, action, status, next_run_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)`,
+      [
+        opts.id,
+        OWNER_ID,
+        SERVER_ID,
+        opts.name,
+        '0 9 * * *',
+        PROJECT_NAME,
+        'brain',
+        MAIN_SESSION,
+        JSON.stringify(opts.action),
+        CRON_STATUS.ACTIVE,
+        opts.nextRunAt ?? null,
+        now,
+      ],
+    );
+    await db.execute(
+      `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [opts.id, opts.creatorUserId, SERVER_ID, PROJECT_NAME, opts.shared, now],
+    );
+  }
+
+  it('rejects shared=false inserts, blocks legacy base owner/participant PUT mutations while keeping provenance intact, and keeps dispatch restricted', async () => {
+    const past = Date.now() - 10_000;
+    await seedJob({
+      id: EXT_PROTECTED_JOB,
+      name: 'Original Restricted Job',
+      action: { type: 'send', target: SUB_SESSION_NAME, message: 'ping' },
+      creatorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+      shared: true,
+      nextRunAt: past,
+    });
+
+    // Direct DB insert with shared=false for external_cli must be rejected.
+    await expect(db.execute(
+      `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+       VALUES ($1, $2, $3, $4, FALSE, $5)`,
+      [EXT_MAINT_JOB, IMCODES_EXTERNAL_CLI_SENDER, SERVER_ID, PROJECT_NAME, Date.now()],
+    )).rejects.toThrow(/external_cli_cron_provenance_requires_shared/);
+
+    // Simulate legacy base owner PUT /:id transaction: UPDATE cron_jobs + DELETE FROM cron_job_provenance WHERE job_id = $1.
+    await expect(db.transaction(async (tx) => {
+      await tx.execute(
+        'UPDATE cron_jobs SET name = $1, action = $2, updated_at = $3 WHERE id = $4',
+        ['Escalated Owner Rename', JSON.stringify({ type: 'command', command: 'whoami' }), Date.now(), EXT_PROTECTED_JOB],
+      );
+      await tx.execute('DELETE FROM cron_job_provenance WHERE job_id = $1', [EXT_PROTECTED_JOB]);
+    })).rejects.toThrow(/external_cli_cron_provenance_protected/);
+
+    // Simulate legacy base shared-participant PUT /:id overwriting creator_user_id to PARTICIPANT_ID.
+    await expect(db.transaction(async (tx) => {
+      await tx.execute(
+        'UPDATE cron_jobs SET name = $1, updated_at = $2 WHERE id = $3',
+        ['Reassigned Creator', Date.now(), EXT_PROTECTED_JOB],
+      );
+      await tx.execute(
+        `INSERT INTO cron_job_provenance (job_id, creator_user_id, server_id, project_name, shared, created_at)
+         VALUES ($1, $2, $3, $4, TRUE, $5)
+         ON CONFLICT (job_id) DO UPDATE
+           SET creator_user_id = EXCLUDED.creator_user_id,
+               server_id = EXCLUDED.server_id,
+               project_name = EXCLUDED.project_name,
+               shared = TRUE`,
+        [EXT_PROTECTED_JOB, PARTICIPANT_ID, SERVER_ID, PROJECT_NAME, Date.now()],
+      );
+    })).rejects.toThrow(/external_cli_cron_provenance_immutable/);
+
+    // Both cron_jobs and cron_job_provenance remain completely intact and rolled back.
+    const jobRow = await db.queryOne<{ name: string; action: string }>('SELECT name, action FROM cron_jobs WHERE id = $1', [EXT_PROTECTED_JOB]);
+    expect(jobRow?.name).toBe('Original Restricted Job');
+    expect(JSON.parse(jobRow!.action)).toMatchObject({ type: 'send', target: SUB_SESSION_NAME, message: 'ping' });
+    const provRow = await db.queryOne<{ creator_user_id: string; shared: boolean }>('SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1', [EXT_PROTECTED_JOB]);
+    expect(provRow).toEqual({ creator_user_id: IMCODES_EXTERNAL_CLI_SENDER, shared: true });
+
+    // Dispatch still executes with restricted external_cli sharedActor and no owner authority.
+    const bridge = WsBridge.get(SERVER_ID);
+    const sendSpy = vi.spyOn(bridge, 'sendToDaemon').mockImplementation(() => true);
+    vi.spyOn(bridge, 'hasDaemonCapability').mockReturnValue(true);
+    await jobDispatchCron({ DB: db } as unknown as Env);
+    const dispatched = sendSpy.mock.calls.map((c) => JSON.parse(c[0] as string) as Record<string, unknown>);
+    const extDispatch = dispatched.find((d) => d.jobId === EXT_PROTECTED_JOB);
+    expect(extDispatch).toBeDefined();
+    expect((extDispatch!.sharedActor as Record<string, unknown>)?.actorUserId).toBe(IMCODES_EXTERNAL_CLI_SENDER);
+    expect(extDispatch!.ownerMachineAuthority).toBeUndefined();
+  });
+
+  it('allows new-server owner maintenance and whole-job cascade deletion while preserving normal user cron workflows', async () => {
+    await seedJob({
+      id: EXT_MAINT_JOB,
+      name: 'New Server Maint Job',
+      action: { type: 'send', target: SUB_SESSION_NAME, message: 'v1' },
+      creatorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+      shared: true,
+    });
+    await seedJob({
+      id: EXT_CASCADE_JOB,
+      name: 'Cascade Delete Job',
+      action: { type: 'send', target: SUB_SESSION_NAME, message: 'bye' },
+      creatorUserId: IMCODES_EXTERNAL_CLI_SENDER,
+      shared: true,
+    });
+    await seedJob({
+      id: NORMAL_SHARED_JOB,
+      name: 'Normal Shared Job',
+      action: { type: 'command', command: '/status' },
+      creatorUserId: PARTICIPANT_ID,
+      shared: true,
+    });
+
+    // Owner on new server may rename / edit allowed send action, while provenance stays restricted.
+    const allowRes = await app.request(`/api/cron/${EXT_MAINT_JOB}`, {
+      method: 'PUT',
+      headers: { Authorization: bearer(OWNER_ID), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'New Server Renamed Job',
+        projectName: PROJECT_NAME,
+        action: { type: 'send', target: SUB_SESSION_NAME, message: 'v2' },
+      }),
+    });
+    expect(allowRes.status).toBe(200);
+    const maintProv = await db.queryOne<{ creator_user_id: string; shared: boolean }>('SELECT creator_user_id, shared FROM cron_job_provenance WHERE job_id = $1', [EXT_MAINT_JOB]);
+    expect(maintProv).toEqual({ creator_user_id: IMCODES_EXTERNAL_CLI_SENDER, shared: true });
+
+    // Owner on new server cannot escalate the restricted job to raw command / p2p.
+    const denyRes = await app.request(`/api/cron/${EXT_MAINT_JOB}`, {
+      method: 'PUT',
+      headers: { Authorization: bearer(OWNER_ID), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: { type: 'p2p', mode: 'audit', topic: 'bad', participants: ['brain'] } }),
+    });
+    expect(denyRes.status).toBe(403);
+
+    // Whole-job DELETE /api/cron/:id cascades deletion of cron_jobs + cron_job_provenance cleanly.
+    const delRes = await app.request(`/api/cron/${EXT_CASCADE_JOB}`, {
+      method: 'DELETE',
+      headers: { Authorization: bearer(OWNER_ID) },
+    });
+    expect(delRes.status).toBe(200);
+    expect(await db.queryOne('SELECT id FROM cron_jobs WHERE id = $1', [EXT_CASCADE_JOB])).toBeNull();
+    expect(await db.queryOne('SELECT job_id FROM cron_job_provenance WHERE job_id = $1', [EXT_CASCADE_JOB])).toBeNull();
+
+    // Normal participant-created job can still be edited & reclaimed by owner (deleting normal provenance).
+    const normalRes = await app.request(`/api/cron/${NORMAL_SHARED_JOB}`, {
+      method: 'PUT',
+      headers: { Authorization: bearer(OWNER_ID), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: 'Owner Reclaimed Normal Job',
+        action: { type: 'command', command: '/owner-raw' },
+      }),
+    });
+    expect(normalRes.status).toBe(200);
+    expect(await db.queryOne('SELECT job_id FROM cron_job_provenance WHERE job_id = $1', [NORMAL_SHARED_JOB])).toBeNull();
   });
 });

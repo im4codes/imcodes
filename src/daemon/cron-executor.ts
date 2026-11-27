@@ -263,16 +263,43 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     }
   }
 
-  if (sharedActor?.actorUserId === IMCODES_EXTERNAL_CLI_SENDER && !isAllowedExternalCliRestrictedCronAction(action)) {
-    logger.warn({ jobId, actionType: (action as { type?: unknown }).type }, 'Cron: unsupported action rejected for external_cli');
-    sendCommandResult(serverLink, {
-      type: CRON_MSG.COMMAND_RESULT,
-      jobId,
-      executionId,
-      status: 'error',
-      detail: 'Cron restricted action rejected: external_cli only allows structured send or selfManaged command',
-    });
-    return;
+  if (sharedActor?.actorUserId === IMCODES_EXTERNAL_CLI_SENDER) {
+    if (!isAllowedExternalCliRestrictedCronAction(action)) {
+      logger.warn({ jobId, actionType: (action as { type?: unknown }).type }, 'Cron: unsupported action rejected for external_cli');
+      sendCommandResult(serverLink, {
+        type: CRON_MSG.COMMAND_RESULT,
+        jobId,
+        executionId,
+        status: 'error',
+        detail: 'Cron restricted action rejected: external_cli only allows structured send or selfManaged command',
+      });
+      return;
+    }
+    if (action.type === 'command') {
+      if (action.selfManaged !== true || isRawCommandSessionAgentType(session.agentType)) {
+        logger.warn({ jobId, sessionName: name, agentType: session.agentType }, 'Cron: external_cli command rejected for raw-command target');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: 'Cron restricted command rejected: external_cli selfManaged command requires a managed agent target',
+        });
+        return;
+      }
+      const control = validateRegisteredCronControlAction(action, jobId);
+      if (!control.ok) {
+        logger.error({ jobId, sessionName: name, reason: control.reason }, 'Cron: invalid registered control state for external_cli');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: `Cron registered control rejected: ${control.reason}`,
+        });
+        return;
+      }
+    }
   }
 
   // Busy check — skip tmux detection for transport sessions

@@ -1316,7 +1316,7 @@ describe('executeCronJob', () => {
       status: 'error',
     }));
 
-    // Allowed #1: selfManaged command executes with restricted sharedActor and zero machine authorities
+    // Disallowed: selfManaged=true under external_cli targeting raw command agentTypes (shell / script)
     const registered = registerCronControlAction({
       type: 'command',
       command: 'check status safely',
@@ -1324,6 +1324,42 @@ describe('executeCronJob', () => {
     }, 'job-1', CRON_COMPLETION_POLICY.UNTIL_COMPLETE);
     expect(registered.ok).toBe(true);
     if (!registered.ok) throw new Error('unexpected registration failure');
+
+    for (const rawAgentType of ['shell', 'script'] as const) {
+      (getSession as ReturnType<typeof vi.fn>).mockReturnValueOnce(makeSession({
+        runtimeType: 'process',
+        agentType: rawAgentType,
+      }));
+      await executeCronJob(makeMsg({
+        executionId: `exec-ext-raw-target-${rawAgentType}`,
+        sharedActor: extActor,
+        action: registered.action,
+        completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      }), mockServerLink);
+      expect(cronProcessSendMock).not.toHaveBeenCalled();
+      expect(transportSend).not.toHaveBeenCalled();
+      expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: CRON_MSG.COMMAND_RESULT,
+        executionId: `exec-ext-raw-target-${rawAgentType}`,
+        status: 'error',
+      }));
+    }
+
+    // Disallowed: unregistered control payload under external_cli must also be rejected before delivery
+    await executeCronJob(makeMsg({
+      executionId: 'exec-ext-unregistered-cmd',
+      sharedActor: extActor,
+      action: { type: 'command', command: 'spoofed', selfManaged: true },
+    }), mockServerLink);
+    expect(cronProcessSendMock).not.toHaveBeenCalled();
+    expect(transportSend).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: CRON_MSG.COMMAND_RESULT,
+      executionId: 'exec-ext-unregistered-cmd',
+      status: 'error',
+    }));
+
+    // Allowed #1: selfManaged command on managed target executes with restricted sharedActor and zero machine authorities
     await executeCronJob(makeMsg({
       executionId: 'exec-ext-self-cmd',
       sharedActor: extActor,
@@ -1336,7 +1372,7 @@ describe('executeCronJob', () => {
     expect(meta.sharedMachineAuthority).toBeUndefined();
     expect(meta.ownerMachineAuthority).toBeUndefined();
 
-    // Allowed #2: normal owner raw command still runs without external_cli rejection
+    // Allowed #2: normal owner raw command still runs (both managed transport and process shell/script targets)
     await executeCronJob(makeMsg({
       executionId: 'exec-owner-raw',
       action: { type: 'command', command: '/status' },
@@ -1344,5 +1380,17 @@ describe('executeCronJob', () => {
     }), mockServerLink);
     expect(transportSend).toHaveBeenCalledTimes(2);
     expect((transportSend.mock.calls[1]![4] as Record<string, unknown>).ownerMachineAuthority).toBe('owner-jwt');
+
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValueOnce(makeSession({
+      runtimeType: 'process',
+      agentType: 'shell',
+    }));
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValueOnce('idle');
+    await executeCronJob(makeMsg({
+      executionId: 'exec-owner-raw-shell',
+      action: { type: 'command', command: 'echo ok' },
+      [OWNER_MACHINE_AUTHORITY_FIELD]: 'owner-shell-jwt',
+    }), mockServerLink);
+    expect(cronProcessSendMock).toHaveBeenCalledTimes(1);
   });
 });
