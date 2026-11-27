@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
@@ -17,8 +18,13 @@ const MAX_KNOWLEDGE_RECORDS = 500;
 const MAX_SOURCE_CHARS = 200;
 const MAX_NOTES_CHARS = 300;
 const KNOWLEDGE_LOCK_TIMEOUT_MS = 5_000;
-const KNOWLEDGE_LOCK_STALE_MS = 10_000;
+const CORRUPT_LOCK_GRACE_MS = 1_000;
 const SLEEP_INT32 = new Int32Array(new SharedArrayBuffer(4));
+
+export interface UpsertModelTierKnowledgeOptions {
+  lockTimeoutMs?: number;
+  corruptLockGraceMs?: number;
+}
 
 export interface LearnedModelTierInput {
   provider: string;
@@ -123,21 +129,50 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function tryBreakStaleKnowledgeLock(lockDirPath: string): boolean {
+interface KnowledgeLockOwner {
+  pid: number;
+  token: string;
+  createdAt: number;
+}
+
+function readKnowledgeLockOwner(lockDirPath: string): KnowledgeLockOwner | null {
   try {
     const ownerFile = join(lockDirPath, 'owner.json');
-    if (existsSync(ownerFile)) {
-      const parsed = JSON.parse(readFileSync(ownerFile, 'utf8')) as { pid?: unknown; createdAt?: unknown };
-      const pid = typeof parsed.pid === 'number' ? parsed.pid : null;
-      const createdAt = typeof parsed.createdAt === 'number' ? parsed.createdAt : null;
-      if ((pid !== null && !isProcessAlive(pid)) || (createdAt !== null && Date.now() - createdAt >= KNOWLEDGE_LOCK_STALE_MS)) {
-        rmSync(lockDirPath, { recursive: true, force: true });
-        return true;
-      }
-      return false;
+    if (!existsSync(ownerFile)) return null;
+    const raw = readFileSync(ownerFile, 'utf8');
+    if (!raw.trim()) return null;
+    const parsed = JSON.parse(raw) as Partial<KnowledgeLockOwner>;
+    if (
+      typeof parsed.pid === 'number'
+      && Number.isSafeInteger(parsed.pid)
+      && parsed.pid > 0
+      && typeof parsed.token === 'string'
+      && parsed.token.length > 0
+      && typeof parsed.createdAt === 'number'
+      && Number.isFinite(parsed.createdAt)
+    ) {
+      return parsed as KnowledgeLockOwner;
     }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function tryBreakStaleKnowledgeLock(lockDirPath: string, corruptLockGraceMs: number): boolean {
+  try {
+    const owner = readKnowledgeLockOwner(lockDirPath);
+    if (owner) {
+      // Never break a lock held by a still-live OS process, regardless of age.
+      if (isProcessAlive(owner.pid)) return false;
+      rmSync(lockDirPath, { recursive: true, force: true });
+      return true;
+    }
+    // Owner metadata missing or corrupt/truncated (e.g. crash right after mkdir):
+    // allow a short grace window for a fresh acquirer to finish renaming owner.json,
+    // then reclaim the orphaned lock directory.
     const stat = statSync(lockDirPath);
-    if (Date.now() - stat.mtimeMs >= KNOWLEDGE_LOCK_STALE_MS) {
+    if (Date.now() - stat.mtimeMs >= corruptLockGraceMs) {
       rmSync(lockDirPath, { recursive: true, force: true });
       return true;
     }
@@ -154,24 +189,36 @@ function tryAcquireKnowledgeLock(lockDirPath: string): (() => void) | null {
     if ((err as NodeJS.ErrnoException).code === 'EEXIST') return null;
     throw err;
   }
+  const token = randomUUID();
+  const ownerFile = join(lockDirPath, 'owner.json');
+  const tmpOwnerFile = join(lockDirPath, `owner.json.tmp-${process.pid}-${token}`);
   try {
-    writeFileSync(join(lockDirPath, 'owner.json'), JSON.stringify({ pid: process.pid, createdAt: Date.now() }), 'utf8');
-  } catch { /* ignore owner metadata write failure */ }
+    writeFileSync(tmpOwnerFile, JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), 'utf8');
+    renameSync(tmpOwnerFile, ownerFile);
+  } catch {
+    try {
+      rmSync(tmpOwnerFile, { force: true });
+    } catch { /* ignore cleanup */ }
+  }
   return () => {
     try {
+      const current = readKnowledgeLockOwner(lockDirPath);
+      if (!current || current.token !== token || current.pid !== process.pid) return;
       rmSync(lockDirPath, { recursive: true, force: true });
     } catch { /* ignore release error */ }
   };
 }
 
-function acquireKnowledgeLockSync(filePath: string): () => void {
+function acquireKnowledgeLockSync(filePath: string, options: UpsertModelTierKnowledgeOptions = {}): () => void {
   mkdirSync(dirname(filePath), { recursive: true });
   const lockDirPath = `${filePath}.lock`;
-  const deadline = Date.now() + KNOWLEDGE_LOCK_TIMEOUT_MS;
+  const timeoutMs = options.lockTimeoutMs ?? KNOWLEDGE_LOCK_TIMEOUT_MS;
+  const corruptGraceMs = options.corruptLockGraceMs ?? CORRUPT_LOCK_GRACE_MS;
+  const deadline = Date.now() + timeoutMs;
   while (true) {
     const release = tryAcquireKnowledgeLock(lockDirPath);
     if (release) return release;
-    if (tryBreakStaleKnowledgeLock(lockDirPath)) continue;
+    if (tryBreakStaleKnowledgeLock(lockDirPath, corruptGraceMs)) continue;
     if (Date.now() >= deadline) {
       throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDirPath}`);
     }
@@ -179,14 +226,16 @@ function acquireKnowledgeLockSync(filePath: string): () => void {
   }
 }
 
-async function acquireKnowledgeLockAsync(filePath: string): Promise<() => void> {
+async function acquireKnowledgeLockAsync(filePath: string, options: UpsertModelTierKnowledgeOptions = {}): Promise<() => void> {
   mkdirSync(dirname(filePath), { recursive: true });
   const lockDirPath = `${filePath}.lock`;
-  const deadline = Date.now() + KNOWLEDGE_LOCK_TIMEOUT_MS;
+  const timeoutMs = options.lockTimeoutMs ?? KNOWLEDGE_LOCK_TIMEOUT_MS;
+  const corruptGraceMs = options.corruptLockGraceMs ?? CORRUPT_LOCK_GRACE_MS;
+  const deadline = Date.now() + timeoutMs;
   while (true) {
     const release = tryAcquireKnowledgeLock(lockDirPath);
     if (release) return release;
-    if (tryBreakStaleKnowledgeLock(lockDirPath)) continue;
+    if (tryBreakStaleKnowledgeLock(lockDirPath, corruptGraceMs)) continue;
     if (Date.now() >= deadline) {
       throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDirPath}`);
     }
@@ -243,9 +292,10 @@ export function upsertModelTierKnowledgeSync(
   updates: readonly LearnedModelTierInput[],
   filePath = resolveModelTierKnowledgePath(),
   now = Date.now(),
+  options: UpsertModelTierKnowledgeOptions = {},
 ): LearnedModelTierRecord[] {
   assertNotRealImcodesPathInTests(filePath, MODEL_TIER_KNOWLEDGE_FILE);
-  const release = acquireKnowledgeLockSync(filePath);
+  const release = acquireKnowledgeLockSync(filePath, options);
   try {
     return performLockedKnowledgeUpsert(updates, filePath, now);
   } finally {
@@ -257,10 +307,11 @@ export async function upsertModelTierKnowledge(
   updates: readonly LearnedModelTierInput[],
   filePath = resolveModelTierKnowledgePath(),
   now = Date.now(),
+  options: UpsertModelTierKnowledgeOptions = {},
 ): Promise<LearnedModelTierRecord[]> {
   assertNotRealImcodesPathInTests(filePath, MODEL_TIER_KNOWLEDGE_FILE);
   const run = writeChain.catch(() => {}).then(async () => {
-    const release = await acquireKnowledgeLockAsync(filePath);
+    const release = await acquireKnowledgeLockAsync(filePath, options);
     try {
       return performLockedKnowledgeUpsert(updates, filePath, now);
     } finally {

@@ -1032,12 +1032,15 @@ describe('pair contract consistency regressions', () => {
     expect(mcpRejected.pair?.capCounts.policy_rejection).toBeUndefined();
   });
 
-  it('includes unconfigured execution pool recommendation and unknown-model web research rule in Brain contract', () => {
+  it('includes unconfigured execution pool auto-config, no redundant research for known models, and unknown-model web research rule in Brain contract', () => {
     const contract = buildTaskPairMarkerContract();
     expect(contract).toContain(TASK_PAIR_UNCONFIGURED_POOL_RECOMMENDATION_RULE);
     expect(contract).toContain('execution_pool_get');
+    expect(contract).toContain('execution_pool_set');
     expect(contract).toContain('learnedModelTiers');
     expect(contract).toContain('unknownModels');
     expect(contract).toContain('search_web');
+    expect(contract).toContain('recommended: true');
+    expect(contract).toContain('Settings → Execution Pool');
   });
 });

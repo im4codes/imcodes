@@ -3,6 +3,10 @@ import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import type { SupervisorDefaultsMutation } from './supervisor-defaults-cache.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
+import { HookAuthorityUnavailableError } from './hook-port.js';
+import { HookRateLimitError } from './shared-machine-authority.js';
+import { DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR } from './memory-mcp-error-codes.js';
+import { HOOK_SESSION_CREDENTIAL_ERROR } from '../../shared/hook-session-credential.js';
 import {
   EXECUTION_POOL_MCP_TOOLS,
   EXECUTION_POOL_MCP_LIMITS,
@@ -108,6 +112,9 @@ function buildRecommendationsForOutput(
   };
 }
 
+const UNCONFIGURED_POOL_GUIDANCE =
+  'No execution pool is configured. For code/development tasks, reuse already classified models, research only unknownModels online and save learnedModelTiers, auto-apply the recommended: true preset with execution_pool_set without waiting for approval, notify the user of the active models and how to change them in chat or Settings → Execution Pool, and continue the task.';
+
 function poolOutput(
   defaults: SupervisorDefaultConfig | null,
   probe: ExecutionPoolSdkProbeResult | null,
@@ -123,7 +130,7 @@ function poolOutput(
       autoPairingEnabled: false,
       auditByDefault: false,
       concurrencyCap: null,
-      askUser: 'No execution pool is configured. Ask the user which executor and auditor models to use before enabling auto-pairing.',
+      askUser: UNCONFIGURED_POOL_GUIDANCE,
       ...recommendations,
       ...extra,
     };
@@ -144,7 +151,7 @@ function poolOutput(
     autoPairingEnabled,
     auditByDefault,
     concurrencyCap: defaults.pairMaxConcurrency ?? pools.primaryDevelopmentPool.controls.maxConcurrency,
-    ...(configured ? {} : { askUser: 'No execution pool is configured. Ask the user which executor and auditor models to use before enabling auto-pairing.' }),
+    ...(configured ? {} : { askUser: UNCONFIGURED_POOL_GUIDANCE }),
     ...recommendations,
     ...extra,
   };
@@ -214,17 +221,79 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
     return { probe, knowledge };
   };
 
-  const invokeThroughDaemon = async (
-    name: typeof EXECUTION_POOL_MCP_TOOLS[keyof typeof EXECUTION_POOL_MCP_TOOLS],
-    input: unknown,
-    localFallback: () => Promise<ToolResult>,
-  ): Promise<ToolResult> => {
+  const classifyDaemonRpcError = (err: unknown): {
+    kind: 'legacy_404' | 'unreachable_or_timeout' | 'auth_refusal' | 'other';
+    message: string;
+  } => {
+    const message = err instanceof Error ? err.message : String(err);
+    const statusCode = (err as { statusCode?: unknown } | null)?.statusCode;
+    const errCode = (err as { code?: unknown } | null)?.code;
+    if (statusCode === 404 || /\bstatus 404\b/i.test(message)) {
+      return { kind: 'legacy_404', message };
+    }
+    if (
+      statusCode === 401
+      || statusCode === 403
+      || statusCode === 409
+      || statusCode === 429
+      || err instanceof HookRateLimitError
+      || message === DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR
+      || message.startsWith(HOOK_SESSION_CREDENTIAL_ERROR)
+      || message === 'daemon_execution_pool_identity_unavailable'
+      || /forbidden|unauthorized|invalid caller|scope_forbidden/i.test(message)
+    ) {
+      return { kind: 'auth_refusal', message };
+    }
+    if (
+      err instanceof HookAuthorityUnavailableError
+      || (err instanceof Error && err.name === 'HookAuthorityUnavailableError')
+      || (typeof errCode === 'string' && ['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EHOSTUNREACH'].includes(errCode))
+      || /timed out|ECONNREFUSED|ECONNRESET|ETIMEDOUT|socket hang up|hook server is unavailable|hook authority/i.test(message)
+    ) {
+      return { kind: 'unreachable_or_timeout', message };
+    }
+    return { kind: 'other', message };
+  };
+
+  const invokeGetThroughDaemon = async (localFallback: () => Promise<ToolResult>): Promise<ToolResult> => {
+    if (!authorized()) {
+      return error('execution pool reads require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+    }
     if (!deps.invokeDaemonTool) return localFallback();
     try {
-      return await deps.invokeDaemonTool(name, input);
+      return await deps.invokeDaemonTool(EXECUTION_POOL_MCP_TOOLS.GET, {});
     } catch (err) {
-      if (err instanceof Error && /\bstatus 404\b/.test(err.message)) {
+      const classified = classifyDaemonRpcError(err);
+      if (classified.kind === 'legacy_404' || classified.kind === 'unreachable_or_timeout') {
         return localFallback();
+      }
+      if (classified.kind === 'auth_refusal') {
+        return error(classified.message, MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+      }
+      throw err;
+    }
+  };
+
+  const invokeSetThroughDaemon = async (input: unknown, localFallback: () => Promise<ToolResult>): Promise<ToolResult> => {
+    if (!authorized()) {
+      return error('execution pool changes require the project Brain/owner session', MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+    }
+    if (!deps.invokeDaemonTool) return localFallback();
+    try {
+      return await deps.invokeDaemonTool(EXECUTION_POOL_MCP_TOOLS.SET, input);
+    } catch (err) {
+      const classified = classifyDaemonRpcError(err);
+      if (classified.kind === 'legacy_404') {
+        return localFallback();
+      }
+      if (classified.kind === 'auth_refusal') {
+        return error(classified.message, MCP_ERROR_REASONS.SCOPE_FORBIDDEN);
+      }
+      if (classified.kind === 'unreachable_or_timeout') {
+        return error(
+          `execution pool update could not be confirmed by the main daemon (${classified.message}); read execution_pool_get before retrying`,
+          MCP_ERROR_REASONS.INTERNAL_ERROR,
+        );
       }
       throw err;
     }
@@ -282,8 +351,8 @@ export function createExecutionPoolMcpToolHandlers(caller: McpRuntimeCaller, dep
   };
 
   return {
-    [EXECUTION_POOL_MCP_TOOLS.GET]: () => invokeThroughDaemon(EXECUTION_POOL_MCP_TOOLS.GET, {}, localGet),
-    [EXECUTION_POOL_MCP_TOOLS.SET]: (input) => invokeThroughDaemon(EXECUTION_POOL_MCP_TOOLS.SET, input, () => localSet(input)),
+    [EXECUTION_POOL_MCP_TOOLS.GET]: () => invokeGetThroughDaemon(localGet),
+    [EXECUTION_POOL_MCP_TOOLS.SET]: (input) => invokeSetThroughDaemon(input, () => localSet(input)),
   };
 }
 

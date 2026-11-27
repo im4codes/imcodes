@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -9,6 +9,7 @@ import {
   upsertModelTierKnowledge,
 } from '../../src/daemon/model-tier-knowledge.js';
 import { probeExecutionPoolSdks } from '../../src/daemon/sdk-execution-pool-probe.js';
+import { AGY_NATIVE_SESSION_STATE } from '../../shared/agy-agent.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
 const tempDirs: string[] = [];
@@ -349,10 +350,9 @@ describe('probeExecutionPoolSdks', () => {
             if (id === 'copilot-sdk') {
               return {
                 id: 'copilot-sdk',
-                listModels: async () => ({
-                  isAuthenticated: true,
-                  models: [{ id: 'claude-sonnet-6' }, { id: 'gpt-5-mini' }],
-                }),
+                listModels: async () => {
+                  throw new Error('copilot listModels must not be called passively');
+                },
               };
             }
             if (id === 'agy-sdk') {
@@ -363,6 +363,14 @@ describe('probeExecutionPoolSdks', () => {
               };
             }
             return undefined;
+          },
+          getCopilotRuntimeConfig: async (opts) => {
+            expect(opts).toEqual({ probe: false });
+            return {
+              isAuthenticated: true,
+              availableModels: ['claude-sonnet-6', 'gpt-5-mini'],
+              models: [{ id: 'claude-sonnet-6' }, { id: 'gpt-5-mini' }],
+            };
           },
           getCodexRuntimeConfig: async () => ({ availableModels: ['gpt-7.5'], planLabel: 'Pro' }),
           fileExists: (p) => files.has(p),
@@ -431,5 +439,172 @@ describe('probeExecutionPoolSdks', () => {
 
     const reloaded = loadModelTierKnowledge(knowledgeFile);
     expect(reloaded.map((r) => r.model).sort()).toEqual(['claude-proc-alpha', 'gpt-proc-beta']);
+  });
+
+  it('excludes UNSTARTED native AGY sessions and cold copilot/cursor caches without spawning headless CLIs', async () => {
+    const dir = makeTmpDir();
+    const homeDir = join(dir, 'home');
+    const imcodesDir = join(dir, '.imcodes');
+    const brainSession = {
+      name: 'deck_brain',
+      projectName: 'p',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      projectDir: '/p',
+      state: 'running',
+      activeModel: 'gpt-6-sol',
+      codexSessionId: 'codex-thread-1',
+      sessionInstanceId: 'inst-brain',
+      runtimeEpoch: 'epoch-brain',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as SessionRecord;
+
+    // Exact session-manager.ts:4322-4356 shape for a newly created UNSTARTED AGY session
+    const unstartedAgy = {
+      name: 'deck_sub_agy_unstarted',
+      projectName: 'p',
+      role: 'w1',
+      agentType: 'agy-sdk',
+      providerId: 'agy-sdk',
+      runtimeType: 'transport',
+      projectDir: '/p',
+      state: 'idle',
+      requestedModel: 'gemini-4-hydrogen-high',
+      activeModel: 'gemini-4-hydrogen-high',
+      modelDisplay: 'gemini-4-hydrogen-high',
+      agyNativeSessionState: AGY_NATIVE_SESSION_STATE.UNSTARTED,
+      sessionInstanceId: 'inst-agy-unstarted',
+      runtimeEpoch: 'epoch-agy-unstarted',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+    } as unknown as SessionRecord;
+
+    const copilotListSpy = vi.fn(async () => ({ isAuthenticated: true, models: [{ id: 'should-not-spawn-copilot' }] }));
+    const cursorListSpy = vi.fn(async () => ({ isAuthenticated: true, models: [{ id: 'should-not-spawn-cursor' }] }));
+    const { __copilotRuntimeConfigInternals, getCopilotRuntimeConfig } = await import('../../src/agent/copilot-runtime-config.js');
+    const { __cursorRuntimeConfigInternals, getCursorRuntimeConfig } = await import('../../src/agent/cursor-runtime-config.js');
+    __copilotRuntimeConfigInternals.clearCache();
+    __cursorRuntimeConfigInternals.clearCache();
+
+    const prevImcodesHome = process.env.IMCODES_HOME;
+    process.env.IMCODES_HOME = imcodesDir;
+    try {
+      const coldResult = await probeExecutionPoolSdks({
+        callerSessionName: 'deck_brain',
+        deps: {
+          env: { HOME: homeDir },
+          homeDir,
+          listSessions: () => [brainSession, unstartedAgy],
+          getSession: (name) => (name === 'deck_brain' ? brainSession : unstartedAgy),
+          detectInstalledAgents: async () => ({
+            'codex-sdk': { installed: true },
+            'agy-sdk': { installed: true },
+            'copilot-sdk': { installed: true },
+            'cursor-headless': { installed: true },
+          } as any),
+          detectLocalAuthContext: async (providerId) => ({
+            providerId,
+            method: 'unsupported',
+            source: 'none',
+            authenticated: providerId === 'codex-sdk',
+            reusable: providerId === 'codex-sdk',
+            env: {},
+          }),
+          getProvider: (id) => {
+            if (id === 'copilot-sdk') return { id: 'copilot-sdk', listModels: copilotListSpy };
+            if (id === 'cursor-headless') return { id: 'cursor-headless', listModels: cursorListSpy };
+            return undefined;
+          },
+          getCodexRuntimeConfig: async () => ({ availableModels: ['gpt-6.2-sol', 'gpt-6-luna'], planLabel: 'Pro' }),
+          getCopilotRuntimeConfig,
+          getCursorRuntimeConfig,
+          fileExists: () => false,
+          readFile: () => '',
+          loadKnowledge: () => [],
+        },
+      });
+
+      expect(copilotListSpy).not.toHaveBeenCalled();
+      expect(cursorListSpy).not.toHaveBeenCalled();
+      expect(coldResult.sdks.find((s) => s.provider === 'codex-sdk')?.loggedIn).toBe(true);
+      expect(coldResult.sdks.find((s) => s.provider === 'agy-sdk')?.loggedIn).toBe(false);
+      expect(coldResult.sdks.find((s) => s.provider === 'copilot-sdk')?.loggedIn).toBe(false);
+      expect(coldResult.sdks.find((s) => s.provider === 'cursor-headless')?.loggedIn).toBe(false);
+
+      // Conversely, an explicitly STARTED native AGY session IS counted as loggedIn
+      const startedAgy = { ...unstartedAgy, agyNativeSessionState: AGY_NATIVE_SESSION_STATE.STARTED } as unknown as SessionRecord;
+      const startedResult = await probeExecutionPoolSdks({
+        callerSessionName: 'deck_brain',
+        deps: {
+          env: { HOME: homeDir },
+          homeDir,
+          listSessions: () => [brainSession, startedAgy],
+          getSession: (name) => (name === 'deck_brain' ? brainSession : startedAgy),
+          detectInstalledAgents: async () => ({ 'codex-sdk': { installed: true }, 'agy-sdk': { installed: true } } as any),
+          detectLocalAuthContext: async (providerId) => ({
+            providerId, method: 'unsupported', source: 'none', authenticated: providerId === 'codex-sdk', reusable: false, env: {},
+          }),
+          getCodexRuntimeConfig: async () => ({ availableModels: ['gpt-6.2-sol'], planLabel: 'Pro' }),
+          getCopilotRuntimeConfig,
+          getCursorRuntimeConfig,
+          fileExists: () => false,
+          readFile: () => '',
+          loadKnowledge: () => [],
+        },
+      });
+      expect(startedResult.sdks.find((s) => s.provider === 'agy-sdk')?.loggedIn).toBe(true);
+    } finally {
+      if (prevImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = prevImcodesHome;
+    }
+  });
+
+  it('never breaks a live paused lock holder, validates owner tokens, and recovers from truncated owner.json', async () => {
+    const dir = makeTmpDir();
+    const knowledgeFile = join(dir, 'model-tier-knowledge.json');
+    const lockDir = `${knowledgeFile}.lock`;
+    const ownerFile = join(lockDir, 'owner.json');
+
+    // 1. Live holder with 15s-old createdAt MUST NOT be broken by another writer
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(ownerFile, JSON.stringify({
+      pid: process.pid,
+      token: 'live-holder-token',
+      createdAt: Date.now() - 15_000,
+    }), 'utf8');
+
+    await expect(upsertModelTierKnowledge(
+      [{ provider: 'codex-sdk', model: 'gpt-timeout-blocked', tier: 'secondary' }],
+      knowledgeFile,
+      1_000,
+      { lockTimeoutMs: 80 },
+    )).rejects.toThrow(/Timed out acquiring model-tier-knowledge lock/);
+
+    // Live holder lock directory and token remain untouched
+    expect(JSON.parse(readFileSync(ownerFile, 'utf8'))).toMatchObject({
+      pid: process.pid,
+      token: 'live-holder-token',
+    });
+    rmSync(lockDir, { recursive: true, force: true });
+
+    // 2. Crash-truncated owner.json with stale mtime recovers safely instead of hanging forever
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(ownerFile, '{"pid":999999,"tok', 'utf8');
+    const past = new Date(Date.now() - 2_000);
+    utimesSync(lockDir, past, past);
+
+    const recovered = await upsertModelTierKnowledge(
+      [{ provider: 'claude-code-sdk', model: 'claude-recovered-1', tier: 'flagship', source: 'recovery' }],
+      knowledgeFile,
+      2_000,
+      { corruptLockGraceMs: 50, lockTimeoutMs: 500 },
+    );
+    expect(recovered.map((r) => r.model)).toEqual(['claude-recovered-1']);
+    expect(loadModelTierKnowledge(knowledgeFile).map((r) => r.model)).toEqual(['claude-recovered-1']);
   });
 });

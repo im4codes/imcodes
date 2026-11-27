@@ -1,7 +1,7 @@
 import { CODEX_FAMILY, getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from './agent-types.js';
 import { resolvePeerAuditProviderFamily } from './peer-audit.js';
 import { AGY_CLI_BINARY, AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from './agy-agent.js';
-import { DEFAULT_CODEX_SESSION_MODEL, normalizeClaudeCodeModelId } from '../src/shared/models/options.js';
+import { DEFAULT_CODEX_SESSION_MODEL } from '../src/shared/models/options.js';
 import {
   doesSharedContextBackendSupportPresets,
   normalizeSharedContextRuntimeBackend,
@@ -348,10 +348,34 @@ function text(value: unknown): string | undefined {
  * third-party models (MiniMax-M3, qwen3.8-27b), and those must pass through
  * verbatim rather than be folded into a Claude family bucket.
  */
-const CLAUDE_FUTURE_VERSIONED_MODEL_RE = /^claude-(?:(?:fable|mythos|opus|sonnet|haiku)-(?:[6-9]|\d{2,})|(?:[6-9]|\d{2,})-(?:fable|mythos|opus|sonnet|haiku))(?:$|[-._[\]])/i;
+/**
+ * Explicit known legacy short/migration aliases for Claude execution pool configs.
+ * Any explicit model ID outside this finite compatibility map (such as
+ * `claude-fable-5-1`, `claude-sonnet-5-5`, `claude-fable-6`, `claude-aurora-7`)
+ * is preserved verbatim across capability IDs, persistence, switching, and launch.
+ */
+const CLAUDE_LEGACY_EXECUTION_MODEL_ALIASES: Readonly<Record<string, string>> = {
+  opus: 'opus[1M]',
+  'opus[1m]': 'opus[1M]',
+  fable: 'fable',
+  sonnet: 'sonnet',
+  haiku: 'haiku',
+  'claude-fable-5': 'fable',
+  'claude-mythos-5': 'fable',
+  'claude-opus-5': 'opus[1M]',
+  'claude-opus-5[1m]': 'opus[1M]',
+  'claude-opus-4-8': 'opus[1M]',
+  'claude-opus-4-8[1m]': 'opus[1M]',
+  'claude-opus-4-7': 'opus[1M]',
+};
 
-export function isFutureVersionedClaudeModelId(model: string): boolean {
-  return CLAUDE_FUTURE_VERSIONED_MODEL_RE.test(model.trim());
+export function resolveClaudeExecutionModelForSwitch(model: string): string | undefined {
+  const trimmed = model.trim();
+  if (!trimmed) return undefined;
+  const legacyAlias = CLAUDE_LEGACY_EXECUTION_MODEL_ALIASES[trimmed.toLowerCase()];
+  if (legacyAlias) return legacyAlias;
+  if (/^claude-[a-z0-9]/i.test(trimmed)) return trimmed;
+  return undefined;
 }
 
 export function normalizeSupervisionExecutionModel(agentType: string, model: string): string {
@@ -364,8 +388,7 @@ export function normalizeSupervisionExecutionModel(agentType: string, model: str
     return DEFAULT_CODEX_SESSION_MODEL;
   }
   if (!trimmed || !isClaudeCodeFamily(agentType)) return trimmed;
-  if (isFutureVersionedClaudeModelId(trimmed)) return trimmed;
-  return normalizeClaudeCodeModelId(trimmed) ?? trimmed;
+  return CLAUDE_LEGACY_EXECUTION_MODEL_ALIASES[lower] ?? trimmed;
 }
 
 /** Builds the capabilityId string from `input.model` exactly as given, with no canonicalization. */

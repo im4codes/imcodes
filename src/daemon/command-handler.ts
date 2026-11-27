@@ -3673,14 +3673,8 @@ async function applyTransportModelSwitch(
         transportRuntime?.setSystemPrompt(presetOverrides.systemPrompt ?? '');
       }
     } else {
-      const trimmedClaude = requestedModel.trim();
-      const { isFutureVersionedClaudeModelId } = await import('../../shared/supervision-execution-pool.js');
-      if (isFutureVersionedClaudeModelId(trimmedClaude)) {
-        selectedModel = trimmedClaude;
-      } else {
-        selectedModel = normalizeClaudeCodeModelId(trimmedClaude)
-          ?? (/^claude-[a-z0-9]/i.test(trimmedClaude) ? trimmedClaude : undefined);
-      }
+      const { resolveClaudeExecutionModelForSwitch } = await import('../../shared/supervision-execution-pool.js');
+      selectedModel = resolveClaudeExecutionModelForSwitch(requestedModel);
     }
     if (!selectedModel) {
       return refuse(

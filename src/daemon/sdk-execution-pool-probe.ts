@@ -7,7 +7,7 @@ import {
   isClaudeCodeFamily,
   isCodexFamily,
 } from '../../shared/agent-types.js';
-import { AGY_FALLBACK_MODEL_IDS, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
+import { AGY_FALLBACK_MODEL_IDS, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID } from '../../shared/agy-agent.js';
 import { AGY_USAGE_MAX_PERSISTED_AGE_MS } from '../../shared/agy-usage.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
 import { resolvePeerAuditProviderFamily } from '../../shared/peer-audit.js';
@@ -21,6 +21,8 @@ import {
 } from '../../shared/supervision-execution-pool.js';
 import { detectInstalledAgents } from '../agent/agent-availability.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
+import { getCopilotRuntimeConfig } from '../agent/copilot-runtime-config.js';
+import { getCursorRuntimeConfig } from '../agent/cursor-runtime-config.js';
 import { getCodexHome } from '../util/codex-rollout-path.js';
 import { detectLocalAuthContext, hasLocalAuthCandidate, type LocalAuthContext } from '../agent/local-auth-context.js';
 import { getProvider } from '../agent/provider-registry.js';
@@ -49,10 +51,9 @@ const CANDIDATE_SDKS = [
   HERMES_AGENT_PROVIDER_ID,
 ] as const;
 
-const SKIP_LIVE_LIST_MODELS_SDKS = new Set<string>([
-  'claude-code-sdk',
-  CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
-  'codex-sdk',
+const SAFE_CONNECTED_LIST_MODELS_SDKS = new Set<string>([
+  'opencode-sdk',
+  'pi',
 ]);
 
 export interface ExecutionPoolBrainSnapshot {
@@ -85,6 +86,8 @@ export interface SdkExecutionPoolProbeDeps {
     listModels?: (force?: boolean) => Promise<ProbeableProviderList | null | undefined>;
   }) | undefined;
   getCodexRuntimeConfig?: typeof getCodexRuntimeConfig;
+  getCopilotRuntimeConfig?: typeof getCopilotRuntimeConfig;
+  getCursorRuntimeConfig?: typeof getCursorRuntimeConfig;
   fileExists?: (path: string) => boolean;
   readFile?: (path: string) => string;
   loadKnowledge?: () => LearnedModelTierRecord[];
@@ -199,6 +202,10 @@ function isLiveSessionRecord(session: SessionRecord): boolean {
   return session.state !== 'error' && session.state !== 'stopped';
 }
 
+function isUnstartedNativeAgySession(session: SessionRecord): boolean {
+  return (session as { agyNativeSessionState?: unknown }).agyNativeSessionState === AGY_NATIVE_SESSION_STATE.UNSTARTED;
+}
+
 function sessionObservedModelsForSdk(sessions: readonly SessionRecord[], sdkProvider: string): string[] {
   const collected: string[] = [];
   const push = (val: unknown) => {
@@ -208,7 +215,7 @@ function sessionObservedModelsForSdk(sessions: readonly SessionRecord[], sdkProv
   };
   for (const session of sessions) {
     if (!matchesProviderFamilyOrCanonical(session.agentType, sdkProvider)) continue;
-    if (!isLiveSessionRecord(session)) continue;
+    if (!isLiveSessionRecord(session) || isUnstartedNativeAgySession(session)) continue;
     push(session.activeModel);
     if (!session.activeModel && hasVerifiedSessionRuntimeEvidence(session)) {
       push(session.requestedModel);
@@ -248,17 +255,24 @@ function staticFallbackModelsForSdk(sdkProvider: string): readonly string[] {
 }
 
 function hasVerifiedSessionRuntimeEvidence(session: SessionRecord): boolean {
-  if (session.activeModel?.trim()) return true;
-  if (
+  // Native AGY sessions pre-populate activeModel/idle/runtimeEpoch at creation
+  // while still UNSTARTED; only an explicitly STARTED session or real provider
+  // auth/run/resume telemetry counts as logged-in proof.
+  if (isUnstartedNativeAgySession(session)) return false;
+  if ((session as { agyNativeSessionState?: unknown }).agyNativeSessionState === AGY_NATIVE_SESSION_STATE.STARTED) {
+    return true;
+  }
+  if (session.state === 'running') return true;
+  return Boolean(
     session.ccSessionId?.trim()
     || session.codexSessionId?.trim()
     || session.geminiSessionId?.trim()
     || session.opencodeSessionId?.trim()
-  ) {
-    return true;
-  }
-  return (session.state === 'idle' || session.state === 'running')
-    && Boolean(session.sessionInstanceId?.trim() && session.runtimeEpoch?.trim());
+    || (session as { providerResumeId?: string }).providerResumeId?.trim()
+    || session.planLabel?.trim()
+    || session.quotaLabel?.trim()
+    || session.quotaMeta,
+  );
 }
 
 function hasVerifiedActiveSessionForSdk(
@@ -274,16 +288,6 @@ function hasVerifiedActiveSessionForSdk(
   });
 }
 
-function isStaticMuseFallbackList(
-  sdkProvider: string,
-  providerList: ProbeableProviderList | null | undefined,
-  hasActiveSession: boolean,
-): boolean {
-  if (sdkProvider !== 'muse-code-sdk' || hasActiveSession || !providerList?.models?.length) return false;
-  if (providerList.models.length !== MUSE_MODEL_IDS.length) return false;
-  return providerList.models.every((m, idx) => m.id === MUSE_MODEL_IDS[idx]);
-}
-
 /**
  * Lightweight, non-blocking local + live-cache SDK availability & model catalog probe.
  * Never spawns heavy CLI processes and never emits tokens/credentials.
@@ -294,6 +298,8 @@ export async function probeExecutionPoolSdks(
   const deps = options.deps ?? {};
   const env = deps.env ?? process.env;
   const nowMs = (deps.now ?? Date.now)();
+  const wallDeadlineMs = Date.now() + PROBE_TIMEOUT_MS;
+  const remainingProbeMs = (): number => Math.max(1, wallDeadlineMs - Date.now());
   const homeDir = deps.homeDir ?? env.HOME?.trim() ?? homedir();
   const fileExists = deps.fileExists ?? existsSync;
   const readFileFn = deps.readFile ?? ((p: string) => readFileSync(p, 'utf8'));
@@ -305,6 +311,8 @@ export async function probeExecutionPoolSdks(
     listModels?: (force?: boolean) => Promise<ProbeableProviderList | null | undefined>;
   } | undefined);
   const loadCodexCfg = deps.getCodexRuntimeConfig ?? getCodexRuntimeConfig;
+  const loadCopilotCfg = deps.getCopilotRuntimeConfig ?? getCopilotRuntimeConfig;
+  const loadCursorCfg = deps.getCursorRuntimeConfig ?? getCursorRuntimeConfig;
   const loadKnowledge = deps.loadKnowledge ?? (() => loadModelTierKnowledge());
   const authProbe = deps.detectLocalAuthContext ?? detectLocalAuthContext;
 
@@ -321,19 +329,31 @@ export async function probeExecutionPoolSdks(
 
   const installedAgents = await withTimeout(
     (deps.detectInstalledAgents ?? (() => detectInstalledAgents()))(),
-    PROBE_TIMEOUT_MS,
+    remainingProbeMs(),
     {} as AgentAvailabilityMap,
   );
   const knowledge = loadKnowledge();
 
-  // Codex cold file/cache check (does NOT spawn app-server)
+  // Strictly passive / non-spawning runtime config cache reads
   const codexHome = getCodexHome(env);
   const codexModelsCacheExists = fileExists(join(codexHome, 'models_cache.json'));
-  const codexCfg = await withTimeout(
-    loadCodexCfg({ probe: false, useFileCatalogOnCold: true }),
-    PROBE_TIMEOUT_MS,
-    {} as Awaited<ReturnType<typeof getCodexRuntimeConfig>>,
-  );
+  const [codexCfg, copilotCfg, cursorCfg] = await Promise.all([
+    withTimeout(
+      loadCodexCfg({ probe: false, useFileCatalogOnCold: true }),
+      remainingProbeMs(),
+      {} as Awaited<ReturnType<typeof getCodexRuntimeConfig>>,
+    ),
+    withTimeout(
+      loadCopilotCfg({ probe: false }),
+      remainingProbeMs(),
+      null as Awaited<ReturnType<typeof getCopilotRuntimeConfig>> | null,
+    ),
+    withTimeout(
+      loadCursorCfg({ probe: false }),
+      remainingProbeMs(),
+      null as Awaited<ReturnType<typeof getCursorRuntimeConfig>> | null,
+    ),
+  ]);
 
   // Determine candidate provider list (always keep currentBrainProvider even if non-standard)
   const candidateProviders: string[] = [...CANDIDATE_SDKS];
@@ -356,22 +376,31 @@ export async function probeExecutionPoolSdks(
     const healthySession = hasVerifiedActiveSessionForSdk(sessions, sdkProvider, options.callerSessionName);
 
     let providerList: ProbeableProviderList | null = liveProvider?.getCachedModels?.() ?? null;
-    if (
+    if (!providerList && sdkProvider === 'copilot-sdk' && copilotCfg) {
+      providerList = {
+        models: copilotCfg.isAuthenticated && !copilotCfg.probeError ? copilotCfg.models.map((m) => ({ id: m.id })) : [],
+        isAuthenticated: copilotCfg.isAuthenticated,
+        ...(copilotCfg.probeError ? { error: copilotCfg.probeError } : {}),
+      };
+    } else if (!providerList && sdkProvider === 'cursor-headless' && cursorCfg) {
+      providerList = {
+        models: cursorCfg.isAuthenticated ? cursorCfg.availableModels.map((id) => ({ id })) : [],
+        isAuthenticated: cursorCfg.isAuthenticated,
+      };
+    } else if (
       !providerList
-      && !liveProvider?.getCachedModels
+      && SAFE_CONNECTED_LIST_MODELS_SDKS.has(sdkProvider)
       && typeof liveProvider?.listModels === 'function'
       && (installed || healthySession || isBrainSdk)
-      && !SKIP_LIVE_LIST_MODELS_SDKS.has(sdkProvider)
     ) {
       providerList = (await withTimeout(
         Promise.resolve().then(() => liveProvider.listModels!(false)).catch(() => null),
-        PROBE_TIMEOUT_MS,
+        remainingProbeMs(),
         null,
       )) ?? null;
     }
 
-    const staticMuseFallback = isStaticMuseFallbackList(sdkProvider, providerList, healthySession || isBrainSdk);
-    const effectiveProviderList = staticMuseFallback ? null : providerList;
+    const effectiveProviderList = providerList;
     const explicitUnauthenticated = effectiveProviderList?.isAuthenticated === false;
 
     let loggedIn = isBrainSdk || healthySession;
@@ -387,7 +416,7 @@ export async function probeExecutionPoolSdks(
         if (hasValidClaudeLocalAuth(nowMs, env, homeDir, fileExists, readFileFn)) {
           loggedIn = true;
         } else if (hasLocalAuthCandidate(sdkProvider, env)) {
-          const ctx = await withTimeout(authProbe(sdkProvider, env), PROBE_TIMEOUT_MS, {
+          const ctx = await withTimeout(authProbe(sdkProvider, env), remainingProbeMs(), {
             providerId: sdkProvider, method: 'unsupported', source: 'none', authenticated: false, reusable: false, env: {},
           });
           loggedIn = ctx.authenticated;
@@ -396,7 +425,7 @@ export async function probeExecutionPoolSdks(
         if (effectiveProviderList?.isAuthenticated === true || Boolean(codexCfg.planLabel)) {
           loggedIn = true;
         } else {
-          const ctx = await withTimeout(authProbe(sdkProvider, env), PROBE_TIMEOUT_MS, {
+          const ctx = await withTimeout(authProbe(sdkProvider, env), remainingProbeMs(), {
             providerId: sdkProvider, method: 'unsupported', source: 'none', authenticated: false, reusable: false, env: {},
           });
           loggedIn = ctx.authenticated;
@@ -408,7 +437,7 @@ export async function probeExecutionPoolSdks(
         ) {
           loggedIn = true;
         } else if (hasLocalAuthCandidate(sdkProvider, env)) {
-          const ctx = await withTimeout(authProbe(sdkProvider, env), PROBE_TIMEOUT_MS, {
+          const ctx = await withTimeout(authProbe(sdkProvider, env), remainingProbeMs(), {
             providerId: sdkProvider, method: 'unsupported', source: 'none', authenticated: false, reusable: false, env: {},
           });
           loggedIn = ctx.authenticated;

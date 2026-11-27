@@ -4,13 +4,13 @@ import {
   buildSupervisionExecutionCapabilityId,
   classifySdkModelTiers,
   evaluateSupervisionExecutionBinding,
-  isFutureVersionedClaudeModelId,
   mayFinalizeEconomyAssignment,
   migrateLegacySupervisionExecutionPools,
   normalizeSupervisionExecutionConfig,
   normalizeSupervisionExecutionModel,
   normalizeSupervisionExecutionPools,
   planSupervisionExecutionCapacity,
+  resolveClaudeExecutionModelForSwitch,
   supervisionExecutionConfigRole,
   evaluateSupervisionObservedIdentity,
   evaluateSupervisionAutomationPoolGate,
@@ -853,25 +853,35 @@ describe('dynamic model tier classification & cross-SDK recommendations', () => 
     }
   });
 
-  it('preserves future versioned Claude models (claude-fable-6, claude-opus-6, etc.) end-to-end without collapsing to v5/v4 aliases', () => {
-    for (const futureModel of ['claude-fable-6', 'claude-fable-6[1m]', 'claude-opus-6', 'claude-sonnet-6', 'claude-haiku-6']) {
-      expect(isFutureVersionedClaudeModelId(futureModel)).toBe(true);
-      expect(normalizeSupervisionExecutionModel('claude-code-sdk', futureModel)).toBe(futureModel);
-      expect(normalizeClaudeSdkModelForProvider(futureModel)).toBe(futureModel);
-      const entryCfg = configFromExecutionPoolEntry({ provider: 'claude-code-sdk', model: futureModel, role: 'executor', enabled: true });
-      expect(entryCfg).toMatchObject({ agentType: 'claude-code-sdk', providerFamily: 'anthropic', model: futureModel });
-      expect(buildSupervisionExecutionCapabilityId(entryCfg!)).toContain(futureModel);
+  it('preserves explicit Claude model IDs (same-generation minor versions like claude-fable-5-1 and newer generations like claude-fable-6) while keeping legacy shorthand compatibility', () => {
+    for (const explicitModel of [
+      'claude-fable-5-1',
+      'claude-sonnet-5-5',
+      'claude-fable-5-20261201',
+      'claude-fable-6',
+      'claude-fable-6[1m]',
+      'claude-opus-6',
+      'claude-sonnet-6',
+      'claude-haiku-6',
+    ]) {
+      expect(normalizeSupervisionExecutionModel('claude-code-sdk', explicitModel)).toBe(explicitModel);
+      expect(resolveClaudeExecutionModelForSwitch(explicitModel)).toBe(explicitModel);
+      expect(normalizeClaudeSdkModelForProvider(explicitModel)).toBe(explicitModel);
+      const entryCfg = configFromExecutionPoolEntry({ provider: 'claude-code-sdk', model: explicitModel, role: 'executor', enabled: true });
+      expect(entryCfg).toMatchObject({ agentType: 'claude-code-sdk', providerFamily: 'anthropic', model: explicitModel });
+      expect(buildSupervisionExecutionCapabilityId(entryCfg!)).toContain(explicitModel);
     }
-    // Legacy v4/v5 compatibility preserved
-    expect(isFutureVersionedClaudeModelId('claude-opus-4-7')).toBe(false);
-    expect(isFutureVersionedClaudeModelId('claude-opus-5')).toBe(false);
+    // Legacy shorthands and known migration aliases keep working
     expect(normalizeSupervisionExecutionModel('claude-code-sdk', 'claude-opus-4-7')).toBe('opus[1M]');
     expect(normalizeSupervisionExecutionModel('claude-code-sdk', 'claude-opus-5')).toBe('opus[1M]');
     expect(normalizeSupervisionExecutionModel('claude-code-sdk', 'claude-fable-5')).toBe('fable');
+    expect(resolveClaudeExecutionModelForSwitch('opus')).toBe('opus[1M]');
+    expect(resolveClaudeExecutionModelForSwitch('fable')).toBe('fable');
+    expect(resolveClaudeExecutionModelForSwitch('gpt-6-sol')).toBeUndefined();
     expect(normalizeClaudeSdkModelForProvider('fable')).toBe('claude-fable-5');
 
-    // Tier classification ranks claude-fable-6 above fable alias
-    const classified = classifySdkModelTiers('claude-code-sdk', ['fable', 'claude-fable-6', 'sonnet', 'haiku']);
+    // Tier classification ranks claude-fable-6 > claude-fable-5-1 > fable
+    const classified = classifySdkModelTiers('claude-code-sdk', ['fable', 'claude-fable-5-1', 'claude-fable-6', 'sonnet', 'haiku']);
     expect(classified.tiers).toEqual({
       flagship: 'claude-fable-6',
       secondary: 'sonnet',

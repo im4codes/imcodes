@@ -5412,22 +5412,25 @@ describe('handleWebCommand transport queue behavior', () => {
       expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck_sub_idle', requestedModel: 'sonnet' }));
     });
 
-    it('preserves explicit future versioned Claude model IDs end-to-end without collapsing to fable/opus aliases', async () => {
-      const setAgentId = vi.fn();
-      getSessionMock.mockReturnValue({
-        name: 'deck_sub_cc1', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', activeModel: 'sonnet',
-      });
-      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-cc1', setAgentId, pendingCount: 0 });
+    it('preserves explicit Claude model IDs (claude-fable-5-1 and claude-fable-6) end-to-end without collapsing to fable/opus aliases', async () => {
+      for (const explicitModel of ['claude-fable-5-1', 'claude-fable-6']) {
+        const setAgentId = vi.fn();
+        upsertSessionMock.mockClear();
+        getSessionMock.mockReturnValue({
+          name: 'deck_sub_cc1', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', activeModel: 'sonnet',
+        });
+        getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-cc1', setAgentId, pendingCount: 0 });
 
-      const result = await switchSessionModelNow('deck_sub_cc1', 'claude-fable-6');
+        const result = await switchSessionModelNow('deck_sub_cc1', explicitModel);
 
-      expect(result).toMatchObject({ ok: true, model: 'claude-fable-6', previousModel: 'sonnet' });
-      expect(setAgentId).toHaveBeenCalledWith('claude-fable-6');
-      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
-        name: 'deck_sub_cc1',
-        requestedModel: 'claude-fable-6',
-        activeModel: 'claude-fable-6',
-      }));
+        expect(result).toMatchObject({ ok: true, model: explicitModel, previousModel: 'sonnet' });
+        expect(setAgentId).toHaveBeenCalledWith(explicitModel);
+        expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+          name: 'deck_sub_cc1',
+          requestedModel: explicitModel,
+          activeModel: explicitModel,
+        }));
+      }
     });
 
     it('refuses an unknown model for a validated provider and returns the valid list', async () => {

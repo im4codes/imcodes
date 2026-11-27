@@ -21,6 +21,7 @@ import { SUPERVISION_MODE, normalizeSupervisorDefaultConfig } from '../../shared
 import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
 import { HOOK_SESSION_CREDENTIAL_ENV } from '../../shared/hook-session-credential.js';
 import { IMCODES_RUNTIME_EPOCH_ENV, IMCODES_SESSION_INSTANCE_ID_ENV } from '../../shared/session-resource-lifecycle.js';
+import { HookAuthorityUnavailableError } from '../../src/daemon/hook-port.js';
 
 const tmpKnowledgeDirs: string[] = [];
 function makeKnowledgeFile(): string {
@@ -141,7 +142,7 @@ describe('execution pool MCP tools', () => {
   });
   it('refuses mutation from a non-Brain and reports unconfigured pools', async () => {
     const handlers = createExecutionPoolMcpToolHandlers(caller, { getDefaults: () => null, isProjectBrain: () => true });
-    await expect(handlers.execution_pool_get()).resolves.toMatchObject({ status: 'ok', configured: false, askUser: expect.stringContaining('Ask the user') });
+    await expect(handlers.execution_pool_get()).resolves.toMatchObject({ status: 'ok', configured: false, askUser: expect.stringContaining('execution_pool_set') });
     const unauthorized = createExecutionPoolMcpToolHandlers(caller, { getDefaults: () => defaults(), isProjectBrain: () => false });
     await expect(unauthorized.execution_pool_set({ autoPairingEnabled: true })).resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
     await expect(unauthorized.execution_pool_get()).resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
@@ -418,5 +419,98 @@ describe('execution pool MCP tools', () => {
       vi.unstubAllGlobals();
       vi.restoreAllMocks();
     }
+  });
+
+  it('falls back to local execution_pool_get on ECONNREFUSED, timeout, and legacy 404 while refusing auth rejections and ambiguous SET commits', async () => {
+    let saved = defaults();
+    const setDefaults = vi.fn(async (_caller, mutate) => { saved = mutate(saved); return saved; });
+    const probeSdks = vi.fn(async () => ({
+      currentBrain: { provider: 'claude-code-sdk', providerFamily: 'anthropic', model: 'sonnet' },
+      sdks: [],
+    }));
+
+    // 1. Legacy 404 -> both GET and SET safely fall back to local handlers
+    const handlers404 = createExecutionPoolMcpToolHandlers(caller, {
+      getDefaults: () => saved,
+      setDefaults,
+      probeSdks,
+      isProjectBrain: () => true,
+      invokeDaemonTool: async () => {
+        const err = new Error('hook send failed with status 404') as Error & { statusCode?: number };
+        err.statusCode = 404;
+        throw err;
+      },
+    });
+    await expect(handlers404.execution_pool_get()).resolves.toMatchObject({ status: 'ok', configured: true });
+    await expect(handlers404.execution_pool_set({ autoPairingEnabled: false })).resolves.toMatchObject({ status: 'ok', autoPairingEnabled: false });
+    expect(probeSdks).toHaveBeenCalledTimes(2);
+    expect(setDefaults).toHaveBeenCalledTimes(1);
+
+    // 2. Hook unreachable (ECONNREFUSED / HookAuthorityUnavailableError) -> GET falls back locally; SET preserves daemon boundary
+    setDefaults.mockClear();
+    const handlersConnRefused = createExecutionPoolMcpToolHandlers(caller, {
+      getDefaults: () => saved,
+      setDefaults,
+      probeSdks,
+      isProjectBrain: () => true,
+      invokeDaemonTool: async () => {
+        const err = new Error('connect ECONNREFUSED 127.0.0.1:59999') as NodeJS.ErrnoException;
+        err.code = 'ECONNREFUSED';
+        throw err;
+      },
+    });
+    await expect(handlersConnRefused.execution_pool_get()).resolves.toMatchObject({ status: 'ok', configured: true });
+    await expect(handlersConnRefused.execution_pool_set({ autoPairingEnabled: true })).resolves.toMatchObject({
+      status: 'error',
+      reason: 'internal_error',
+    });
+    expect(setDefaults).not.toHaveBeenCalled();
+
+    const handlersHookUnavailable = createExecutionPoolMcpToolHandlers(caller, {
+      getDefaults: () => saved,
+      setDefaults,
+      probeSdks,
+      isProjectBrain: () => true,
+      invokeDaemonTool: async () => {
+        throw new HookAuthorityUnavailableError('hook_port_missing', '/execution-pool/tool', 'missing');
+      },
+    });
+    await expect(handlersHookUnavailable.execution_pool_get()).resolves.toMatchObject({ status: 'ok', configured: true });
+
+    // 3. Hook request timeout -> GET falls back locally; SET does NOT blindly rewrite ambiguous commit outcome
+    const handlersTimeout = createExecutionPoolMcpToolHandlers(caller, {
+      getDefaults: () => saved,
+      setDefaults,
+      probeSdks,
+      isProjectBrain: () => true,
+      invokeDaemonTool: async () => {
+        throw new Error('hook request timed out after 120000ms');
+      },
+    });
+    await expect(handlersTimeout.execution_pool_get()).resolves.toMatchObject({ status: 'ok', configured: true });
+    await expect(handlersTimeout.execution_pool_set({ autoPairingEnabled: true })).resolves.toMatchObject({
+      status: 'error',
+      reason: 'internal_error',
+      message: expect.stringContaining('read execution_pool_get before retrying'),
+    });
+    expect(setDefaults).not.toHaveBeenCalled();
+
+    // 4. Auth / scope refusal (403) -> NEVER falls back on GET or SET
+    probeSdks.mockClear();
+    const handlersAuthDenied = createExecutionPoolMcpToolHandlers(caller, {
+      getDefaults: () => saved,
+      setDefaults,
+      probeSdks,
+      isProjectBrain: () => true,
+      invokeDaemonTool: async () => {
+        const err = new Error('daemon_execution_pool_identity_unavailable') as Error & { statusCode?: number };
+        err.statusCode = 403;
+        throw err;
+      },
+    });
+    await expect(handlersAuthDenied.execution_pool_get()).resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+    await expect(handlersAuthDenied.execution_pool_set({ autoPairingEnabled: true })).resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+    expect(probeSdks).not.toHaveBeenCalled();
+    expect(setDefaults).not.toHaveBeenCalled();
   });
 });

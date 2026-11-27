@@ -85,7 +85,9 @@ export async function postHookSend(
               reject(error);
               return;
             }
-            reject(new Error(typeof parsed.error === 'string' ? parsed.error : `hook send failed with status ${res.statusCode ?? 0}`));
+            const err = new Error(typeof parsed.error === 'string' ? parsed.error : `hook send failed with status ${res.statusCode ?? 0}`) as Error & { statusCode?: number };
+            err.statusCode = statusCode;
+            reject(err);
             return;
           }
           resolve(parsed);
