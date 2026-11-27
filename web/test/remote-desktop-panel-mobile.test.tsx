@@ -5139,6 +5139,88 @@ describe('remote desktop mobile keyboard voice hold-to-talk', () => {
     });
   });
 
+  describe('RemoteDesktopPanel mobile fullscreen button visibility', () => {
+    it('omits toolbar fullscreen button on mobile devices even when fullscreen is supported, but keeps it on desktop', async () => {
+      const originalRequestFullscreen = Object.getOwnPropertyDescriptor(Element.prototype, 'requestFullscreen');
+      const originalFullscreenEnabled = Object.getOwnPropertyDescriptor(document, 'fullscreenEnabled');
+      const originalUserAgent = Object.getOwnPropertyDescriptor(navigator, 'userAgent');
+      const originalInnerWidth = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+
+      Object.defineProperty(Element.prototype, 'requestFullscreen', {
+        configurable: true,
+        value: vi.fn(async () => {}),
+      });
+      Object.defineProperty(document, 'fullscreenEnabled', { configurable: true, value: true });
+
+      try {
+        // 1. Desktop: fullscreen button is rendered
+        const desktopRendered = await renderPanel();
+        const desktopButtons = Array.from(desktopRendered.container.querySelectorAll('.remote-desktop-view-switch button'))
+          .map((b) => b.textContent?.trim());
+        expect(desktopButtons).toContain('remote_desktop.fullscreen');
+        cleanup();
+
+        // 2. Mobile device (iPhone user agent): fullscreen button is omitted
+        Object.defineProperty(navigator, 'userAgent', {
+          configurable: true,
+          value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+        });
+        const mobileRendered = await renderPanel();
+        const mobileButtons = Array.from(mobileRendered.container.querySelectorAll('.remote-desktop-view-switch button'))
+          .map((b) => b.textContent?.trim());
+        expect(mobileButtons).not.toContain('remote_desktop.fullscreen');
+        cleanup();
+
+        // 3. Desktop browser resized narrow (width <= 720, non-touch desktop): fullscreen button is kept
+        Object.defineProperty(navigator, 'userAgent', {
+          configurable: true,
+          value: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        });
+        Object.defineProperty(window, 'innerWidth', { configurable: true, value: 500 });
+        const narrowDesktop = await renderPanel();
+        const narrowButtons = Array.from(narrowDesktop.container.querySelectorAll('.remote-desktop-view-switch button'))
+          .map((b) => b.textContent?.trim());
+        expect(narrowButtons).toContain('remote_desktop.fullscreen');
+        cleanup();
+
+        // 4. Native host bridge injection updates reactively
+        const reactiveRendered = await renderPanel();
+        expect(Array.from(reactiveRendered.container.querySelectorAll('.remote-desktop-view-switch button'))
+          .map((b) => b.textContent?.trim())).toContain('remote_desktop.fullscreen');
+
+        // Switch to Capacitor mobile
+        (globalThis as typeof globalThis & { Capacitor?: unknown }).Capacitor = {
+          isNativePlatform: () => true,
+          getPlatform: () => 'android',
+        };
+        await act(async () => {
+          window.dispatchEvent(new Event('imcodes:native-host'));
+        });
+        expect(Array.from(reactiveRendered.container.querySelectorAll('.remote-desktop-view-switch button'))
+          .map((b) => b.textContent?.trim())).not.toContain('remote_desktop.fullscreen');
+
+        // Revert Capacitor
+        delete (globalThis as typeof globalThis & { Capacitor?: unknown }).Capacitor;
+        await act(async () => {
+          window.dispatchEvent(new Event('imcodes:native-host'));
+        });
+        expect(Array.from(reactiveRendered.container.querySelectorAll('.remote-desktop-view-switch button'))
+          .map((b) => b.textContent?.trim())).toContain('remote_desktop.fullscreen');
+        cleanup();
+      } finally {
+        if (originalRequestFullscreen) Object.defineProperty(Element.prototype, 'requestFullscreen', originalRequestFullscreen);
+        else delete (Element.prototype as { requestFullscreen?: unknown }).requestFullscreen;
+        if (originalFullscreenEnabled) Object.defineProperty(document, 'fullscreenEnabled', originalFullscreenEnabled);
+        else delete (document as { fullscreenEnabled?: boolean }).fullscreenEnabled;
+        if (originalUserAgent) Object.defineProperty(navigator, 'userAgent', originalUserAgent);
+        else delete (navigator as { userAgent?: string }).userAgent;
+        if (originalInnerWidth) Object.defineProperty(window, 'innerWidth', originalInnerWidth);
+        else delete (window as { innerWidth?: number }).innerWidth;
+        delete (globalThis as typeof globalThis & { Capacitor?: unknown }).Capacitor;
+      }
+    });
+  });
+
   describe('global tri-state modifier bar', () => {
     it('renders CTRL ALT SHIFT CMD/WIN without combo_mode toggle across all keyboard pages and handles oneshot/locked canvas clicks', async () => {
       const macRendered = await renderPanel(undefined, [...MAC_TARGET_CAPABILITIES]);

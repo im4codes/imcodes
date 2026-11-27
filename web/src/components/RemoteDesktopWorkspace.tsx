@@ -43,6 +43,7 @@ import { CloudDocsMainChatFloat, type CloudDocsMainChatContext } from './CloudDo
 import { RemoteDesktopMenuBarRestoreButton } from './RemoteDesktopMenuBarControls.js';
 import { REMOTE_DESKTOP_OVERLAY_CLASS } from '../remote-desktop-pointer-overlay.js';
 import { isMobileKeyboardInputTarget } from '../mobile-keyboard.js';
+import { isMobileDevice, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { getActiveCssZoom } from '../ui-scale.js';
 import { boundedVisualViewportHeight } from '../visual-viewport.js';
 import './remote-desktop-workspace.css';
@@ -140,6 +141,8 @@ export function RemoteDesktopWorkspace({
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const minimizeOriginRef = useRef<RemoteDesktopMinimizeOrigin | null>(null);
   const wasMinimizedRef = useRef(minimized);
+  const [mobileDevice, setMobileDevice] = useState(() => isMobileDevice());
+  useEffect(() => subscribeDeviceLayoutChange(() => setMobileDevice(isMobileDevice()), { includeResize: false }), []);
   const [mobileKeyboardOpenByHost, setMobileKeyboardOpenByHost] = useState<Record<string, boolean>>({});
   const [systemKeyboardOpen, setSystemKeyboardOpen] = useState<boolean>(() => detectSystemKeyboardOpen());
 
@@ -404,7 +407,7 @@ export function RemoteDesktopWorkspace({
               title={t('remote_desktop.workspace_open_new_window')}
             ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11 4h5v5M16 4l-7 7M14 11v5H4V6h5" /></svg></button>
           )}
-          {fullscreen.supported && (
+          {fullscreen.supported && !mobileDevice && (
             <button
               class="remote-desktop-workspace-chrome-button remote-desktop-workspace-fullscreen"
               type="button"

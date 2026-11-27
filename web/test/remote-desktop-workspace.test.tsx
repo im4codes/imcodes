@@ -891,6 +891,97 @@ describe('RemoteDesktopWorkspace', () => {
     expect(screen.queryByRole('button', { name: 'remote_desktop.workspace_fullscreen' })).toBeNull();
   });
 
+  it('omits fullscreen button on mobile devices even when fullscreen is supported, but keeps it on desktop', async () => {
+    installFullscreenStub({ enabled: true });
+    let state = createRemoteDesktopWorkspaceState();
+    state = openRemoteDesktopWorkspaceHost(state, machine('a'));
+    const { manager } = setupManager();
+
+    // 1. Desktop (standard jsdom)
+    const desktopResult = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(desktopResult.container.querySelector('.remote-desktop-workspace-fullscreen')).not.toBeNull();
+    desktopResult.unmount();
+
+    // 2. Mobile device (e.g. iPhone user agent)
+    const origUserAgent = navigator.userAgent;
+    try {
+      Object.defineProperty(navigator, 'userAgent', {
+        configurable: true,
+        value: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+      });
+      const mobileResult = render(<RemoteDesktopWorkspace
+        state={state}
+        manager={manager}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+      expect(mobileResult.container.querySelector('.remote-desktop-workspace-fullscreen')).toBeNull();
+      mobileResult.unmount();
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: origUserAgent });
+    }
+
+    // 3. Desktop browser resized narrow (e.g. width <= 720, non-touch) keeps fullscreen button
+    const origInnerWidth = window.innerWidth;
+    try {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 400 });
+      const narrowDesktopResult = render(<RemoteDesktopWorkspace
+        state={state}
+        manager={manager}
+        onOpenHost={vi.fn()}
+        onActivateTab={vi.fn()}
+        onCloseHost={vi.fn()}
+        onReorderHost={vi.fn()}
+        onCloseWorkspace={vi.fn()}
+      />);
+      expect(narrowDesktopResult.container.querySelector('.remote-desktop-workspace-fullscreen')).not.toBeNull();
+      narrowDesktopResult.unmount();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: origInnerWidth });
+    }
+
+    // 4. Native host bridge injection updates reactively
+    const reactiveResult = render(<RemoteDesktopWorkspace
+      state={state}
+      manager={manager}
+      onOpenHost={vi.fn()}
+      onActivateTab={vi.fn()}
+      onCloseHost={vi.fn()}
+      onReorderHost={vi.fn()}
+      onCloseWorkspace={vi.fn()}
+    />);
+    expect(reactiveResult.container.querySelector('.remote-desktop-workspace-fullscreen')).not.toBeNull();
+
+    // Simulate Capacitor mobile platform
+    (globalThis as typeof globalThis & { Capacitor?: unknown }).Capacitor = {
+      isNativePlatform: () => true,
+      getPlatform: () => 'ios',
+    };
+    await act(async () => {
+      window.dispatchEvent(new Event('imcodes:native-host'));
+    });
+    expect(reactiveResult.container.querySelector('.remote-desktop-workspace-fullscreen')).toBeNull();
+
+    // Revert Capacitor
+    delete (globalThis as typeof globalThis & { Capacitor?: unknown }).Capacitor;
+    await act(async () => {
+      window.dispatchEvent(new Event('imcodes:native-host'));
+    });
+    expect(reactiveResult.container.querySelector('.remote-desktop-workspace-fullscreen')).not.toBeNull();
+    reactiveResult.unmount();
+  });
+
   it('auto-mounts resizable active-session mini chat in workspace corner, persists height, preserves text selection/contextmenu, and blocks desktop pointer bleed', async () => {
     localStorage.clear();
     let state = createRemoteDesktopWorkspaceState();

@@ -113,6 +113,7 @@ import { copyToClipboardWhenReady } from '../util/clipboard.js';
 import type { WsClient } from '../ws-client.js';
 import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
 import { fullscreenContainerFor, useFullscreen } from '../hooks/useFullscreen.js';
+import { isMobileDevice, subscribeDeviceLayoutChange } from '../mobile-device.js';
 import { keyboardLockSupported, useKeyboardLock } from '../hooks/useKeyboardLock.js';
 import {
   REMOTE_DESKTOP_BROWSER_DIAGNOSTIC_EVENT,
@@ -802,6 +803,8 @@ export function RemoteDesktopPanel({
   // sometimes sits inside a fullscreen workspace, so this follows the
   // containing element rather than identity.
   const [insideFullscreen, setInsideFullscreen] = useState(false);
+  const [mobileDevice, setMobileDevice] = useState(() => isMobileDevice());
+  useEffect(() => subscribeDeviceLayoutChange(() => setMobileDevice(isMobileDevice()), { includeResize: false }), []);
   useEffect(() => {
     const syncFullscreen = () => {
       setInsideFullscreen(fullscreenContainerFor(panelRef.current) !== null);
@@ -4043,7 +4046,7 @@ export function RemoteDesktopPanel({
           <div class="remote-desktop-view-switch" role="group" aria-label={t('remote_desktop.scale_label')}>
             <button type="button" aria-pressed={viewScale === 'fit'} onClick={() => setViewScale('fit')}>{t('remote_desktop.fit')}</button>
             <button type="button" aria-pressed={viewScale === 'actual'} onClick={() => setViewScale('actual')}>{t('remote_desktop.actual_size')}</button>
-            {fullscreen.supported && (
+            {fullscreen.supported && !mobileDevice && (
               <button
                 type="button"
                 aria-pressed={fullscreen.active}
