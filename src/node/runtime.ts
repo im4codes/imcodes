@@ -1024,9 +1024,8 @@ export function createControlledNodeRuntime(
   let previousUpgradeFailureReported = false;
   const activeMachineDirectTransfers = new Set<string>();
   const portForwardEngine = new PortForwardEngine({
-    sendWs: (msg) => {
-      client.send(msg);
-    },
+    sendWs: (msg) => client.send(msg),
+    getWsBufferedAmount: () => client.getBufferedAmount(),
   });
   const reportAuthenticationError = (error: unknown) => {
     try {

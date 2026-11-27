@@ -128,6 +128,7 @@ import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
 import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
 import { RemoteDesktopRouter } from './remote-desktop-router.js';
 import { defaultPortForwardRouter } from './port-forward-router.js';
+import { PORT_FORWARD_LIMITS, PORT_FORWARD_MSG } from '../../../shared/port-forward.js';
 import type {
   RemoteDesktopGuestDeliveryResult,
   RemoteDesktopGuestOutboxAuthorityMatch,
@@ -6529,6 +6530,7 @@ export class WsBridge {
         }
         this.resetLegacyUpgradeRescueForGeneration(connectionGeneration);
         this.authenticated = true;
+        defaultPortForwardRouter.onDaemonConnected(this.serverId, connectionGeneration);
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
         const advertisedRuntimeBackends = Array.isArray(msg[SHARED_CONTEXT_RUNTIME_CAPABILITY_PROTOCOL.AUTH_BACKENDS_FIELD])
           ? (msg[SHARED_CONTEXT_RUNTIME_CAPABILITY_PROTOCOL.AUTH_BACKENDS_FIELD] as unknown[])
@@ -13640,6 +13642,11 @@ export class WsBridge {
   trySendPortForward(message: Record<string, unknown>, expectedGeneration?: number): boolean {
     if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
     if (expectedGeneration !== undefined && this.daemonGeneration !== expectedGeneration) return false;
+    if (message.type === PORT_FORWARD_MSG.RELAY_FRAME
+      && typeof this.daemonWs.bufferedAmount === 'number'
+      && this.daemonWs.bufferedAmount >= PORT_FORWARD_LIMITS.RELAY_WS_HARD_CAP_BYTES) {
+      return false;
+    }
     try {
       this.daemonWs.send(JSON.stringify(message));
       return true;

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { Hono } from 'hono';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   PORT_FORWARD_API_PATH,
   PORT_FORWARD_ERRORS,
@@ -13,11 +13,14 @@ import {
 } from '../../shared/port-forward.js';
 import { CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_ABI_PROFILE_FIELD } from '../../shared/controlled-node-abi.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+import { OWNER_MACHINE_AUTHORITY_TYPE, SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import { PortForwardEngine } from '../../src/daemon/port-forward-engine.js';
 import { signJwt } from '../src/security/crypto.js';
+import { issueOwnerMachineAuthority } from '../src/share/shared-machine-authority.js';
 import { createPortForwardRoutes } from '../src/routes/port-forward.js';
 import { WsBridge } from '../src/ws/bridge.js';
-import { PortForwardRouter, defaultPortForwardRouter } from '../src/ws/port-forward-router.js';
+import { InMemoryPortForwardClusterStore } from '../src/ws/port-forward-cluster.js';
+import { PortForwardRouter, defaultPortForwardRouter, type PortForwardBridgeEndpoint } from '../src/ws/port-forward-router.js';
 import type { Database } from '../src/db/client.js';
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
@@ -83,7 +86,7 @@ function createFakeNodeSocket(
   return { bridge, emitter, engine, token };
 }
 
-function createInMemoryDb(users: MockUser[], servers: MockServer[]): Database {
+function createInMemoryDb(users: MockUser[], servers: MockServer[], sharedServerIds = new Set<string>()): Database {
   const auditInserts: unknown[] = [];
 
   const query = async <T = Record<string, unknown>>(sql: string, params: unknown[] = []): Promise<T[]> => {
@@ -184,12 +187,35 @@ function createInMemoryDb(users: MockUser[], servers: MockServer[]): Database {
       return (u ? [{ status: u.status }] : []) as T[];
     }
 
+    if (s.includes('FROM server_shares ss') && s.includes('ss.target_user_id = $2')) {
+      return [{ shared: false }] as T[];
+    }
+
+    if (s.includes('AS shared') && s.includes('FROM server_shares')) {
+      const serverId = String(params[0] ?? '');
+      return [{ shared: sharedServerIds.has(serverId) }] as T[];
+    }
+
+    if (s.includes('SELECT s.user_id, u.status AS user_status') && s.includes('FROM servers s')) {
+      const serverId = String(params[0] ?? '');
+      const actorId = String(params[1] ?? '');
+      const row = servers.find((x) => x.id === serverId);
+      const user = users.find((u) => u.id === actorId);
+      return (row ? [{ user_id: row.user_id, user_status: user?.status ?? 'active' }] : []) as T[];
+    }
+
+    if (s.includes('SELECT project_name FROM sessions WHERE server_id = $1')) {
+      return [{ project_name: 'demo-proj' }] as T[];
+    }
+
     if (s.includes('SELECT 1 FROM server_shares')) {
-      return [] as T[];
+      const serverId = String(params[0] ?? '');
+      return (sharedServerIds.has(serverId) ? [{ 1: 1 }] : []) as T[];
     }
 
     if (s.includes('SELECT id FROM servers WHERE id = $1 AND team_id IS NOT NULL')) {
-      return [] as T[];
+      const serverId = String(params[0] ?? '');
+      return (sharedServerIds.has(serverId) ? [{ id: serverId }] : []) as T[];
     }
 
     if (s.includes('SELECT 1 FROM machine_groups')) {
@@ -230,6 +256,7 @@ describe('server port-forward router & HTTP control plane', () => {
     prepareTimeoutMs?: number;
     useLegacySilentTarget?: boolean;
     useDefaultRouter?: boolean;
+    sharedServerIds?: string[];
   } = {}) {
     const suffix = Math.random().toString(36).slice(2, 8);
     const full1Token = `tok_full1_${suffix}`;
@@ -262,7 +289,8 @@ describe('server port-forward router & HTTP control plane', () => {
       { id: foreignFullId, user_id: 'user_b', node_role: 'full', node_id: null, ref_name: null, exec_enabled: true, revoked_at: null, token_hash: sha256(foreignToken), team_id: null },
     ];
 
-    const db = createInMemoryDb(users, servers);
+    const sharedSet = new Set(options.sharedServerIds ?? []);
+    const db = createInMemoryDb(users, servers, sharedSet);
     const signingKey = 'test-signing-key-32-chars-minimum-x';
     const router = options.useDefaultRouter
       ? defaultPortForwardRouter
@@ -332,9 +360,9 @@ describe('server port-forward router & HTTP control plane', () => {
     await connectNode(nodes.ctlDisabled, ctlDisabledId, `tok_dis_${suffix}`, 'controlled');
     await connectNode(nodes.foreignFull, foreignFullId, foreignToken, 'full');
 
-    cleanups.push(() => {
-      router.closeAllForUser('user_a');
-      router.closeAllForUser('user_b');
+    cleanups.push(async () => {
+      await router.closeAllForUser('user_a');
+      await router.closeAllForUser('user_b');
       for (const n of Object.values(nodes)) n.emitter.close();
     });
 
@@ -516,12 +544,12 @@ describe('server port-forward router & HTTP control plane', () => {
     });
     expect(openRes.status).toBe(200);
     const { tunnel } = await openRes.json() as { tunnel: { tunnelId: string; listenPort: number } };
-    expect(env.router.listTunnels('user_a')).toHaveLength(1);
+    expect(await env.router.listTunnels('user_a')).toHaveLength(1);
 
     env.nodes.ctl1.emitter.close();
     await new Promise((r) => setTimeout(r, 30));
 
-    expect(env.router.listTunnels('user_a')).toHaveLength(0);
+    expect(await env.router.listTunnels('user_a')).toHaveLength(0);
     expect(env.nodes.full1.engine.listTunnels()).toHaveLength(0);
     void tunnel;
   });
@@ -589,5 +617,381 @@ describe('server port-forward router & HTTP control plane', () => {
     });
     expect(forwardedToTarget).toBe(false);
     void PORT_FORWARD_TRANSPORT;
+  });
+
+  it('routes tunnels, RELAY_FRAME, list/close, quota, and disconnects across 3 completely isolated pods (P0 #2)', async () => {
+    const backend = createHttpServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok-multipod');
+    });
+    await new Promise<void>((resolve) => backend.listen(0, '127.0.0.1', () => resolve()));
+    const backendPort = (backend.address() as { port: number }).port;
+    cleanups.push(() => new Promise<void>((resolve) => backend.close(() => resolve())));
+
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const full1Id = `mp_listen_${suffix}`;
+    const full2Id = `mp_target_${suffix}`;
+    const full1Token = `mp_tok1_${suffix}`;
+    const full2Token = `mp_tok2_${suffix}`;
+
+    const db = createInMemoryDb(
+      [{ id: 'user_mp', status: 'active' }],
+      [
+        { id: full1Id, user_id: 'user_mp', node_role: 'full', node_id: null, ref_name: null, exec_enabled: true, revoked_at: null, token_hash: sha256(full1Token), team_id: null },
+        { id: full2Id, user_id: 'user_mp', node_role: 'full', node_id: null, ref_name: null, exec_enabled: true, revoked_at: null, token_hash: sha256(full2Token), team_id: null },
+      ],
+    );
+
+    const clusterStore = new InMemoryPortForwardClusterStore();
+    const podCallerBridges = new Map<string, PortForwardBridgeEndpoint>();
+    const podListenBridges = new Map<string, PortForwardBridgeEndpoint>();
+    const podTargetBridges = new Map<string, PortForwardBridgeEndpoint>();
+
+    const podCaller = new PortForwardRouter({
+      podId: 'pod_caller',
+      clusterStore,
+      lookupBridge: (id) => podCallerBridges.get(id),
+      prepareTimeoutMs: 2_000,
+      establishTimeoutMs: 4_000,
+    });
+    const podListen = new PortForwardRouter({
+      podId: 'pod_listen',
+      clusterStore,
+      lookupBridge: (id) => podListenBridges.get(id),
+      prepareTimeoutMs: 2_000,
+      establishTimeoutMs: 4_000,
+    });
+    const podTarget = new PortForwardRouter({
+      podId: 'pod_target',
+      clusterStore,
+      lookupBridge: (id) => podTargetBridges.get(id),
+      prepareTimeoutMs: 2_000,
+      establishTimeoutMs: 4_000,
+    });
+    cleanups.push(async () => {
+      await podCaller.closeAllForUser('user_mp');
+      await podListen.stopCluster();
+      await podTarget.stopCluster();
+      await podCaller.stopCluster();
+    });
+
+    const listenEngine = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      sendWs: (msg) => {
+        queueMicrotask(() => podListen.handleDaemonMessage(full1Id, 1, msg));
+      },
+    });
+    const targetEngine = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      sendWs: (msg) => {
+        queueMicrotask(() => podTarget.handleDaemonMessage(full2Id, 1, msg));
+      },
+    });
+    cleanups.push(() => {
+      listenEngine.closeAll('test_end');
+      targetEngine.closeAll('test_end');
+    });
+
+    let listenConnected = true;
+    let targetConnected = true;
+    podListenBridges.set(full1Id, {
+      isDaemonConnected: () => listenConnected,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (msg) => {
+        if (!listenConnected) return false;
+        void listenEngine.handleMessage(msg);
+        return true;
+      },
+    });
+    podTargetBridges.set(full2Id, {
+      isDaemonConnected: () => targetConnected,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (msg) => {
+        if (!targetConnected) return false;
+        void targetEngine.handleMessage(msg);
+        return true;
+      },
+    });
+    podListen.onDaemonConnected(full1Id, 1);
+    podTarget.onDaemonConnected(full2Id, 1);
+
+    const makeApp = (router: PortForwardRouter) => {
+      const app = new Hono();
+      app.use('*', async (c, next) => {
+        (c as unknown as { env: { DB: Database } }).env = { DB: db };
+        await next();
+      });
+      app.route(PORT_FORWARD_API_PATH, createPortForwardRoutes(router));
+      return app;
+    };
+
+    const appCaller = makeApp(podCaller);
+    const appListen = makeApp(podListen);
+    const appTarget = makeApp(podTarget);
+
+    // podCaller owns NEITHER listen WS NOR target WS, yet opens tunnel via cluster bus -> podListen <-> podTarget!
+    const openRes = await appCaller.request(PORT_FORWARD_API_PATH, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': full1Id,
+        authorization: `Bearer ${full1Token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        listenNode: full1Id,
+        targetNode: full2Id,
+        targetPort: backendPort,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      }),
+    });
+    expect(openRes.status).toBe(200);
+    const { tunnel } = await openRes.json() as { tunnel: { tunnelId: string; listenPort: number; transportMode: string } };
+    expect(tunnel.transportMode).toBe(PORT_FORWARD_TRANSPORT.RELAY);
+
+    const body = await new Promise<string>((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port: tunnel.listenPort, path: '/' }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    expect(body).toBe('ok-multipod');
+
+    // list via podTarget sees authoritative tunnel coordinated by podCaller.
+    const listRes = await appTarget.request(PORT_FORWARD_API_PATH, {
+      headers: { 'X-Server-Id': full2Id, authorization: `Bearer ${full2Token}` },
+    });
+    expect(listRes.status).toBe(200);
+    const listData = await listRes.json() as { tunnels: Array<{ tunnelId: string }> };
+    expect(listData.tunnels.map((t) => t.tunnelId)).toContain(tunnel.tunnelId);
+
+    // Close via podListen -> tears down coordinator on podCaller and both endpoints!
+    const delRes = await appListen.request(`${PORT_FORWARD_API_PATH}/${tunnel.tunnelId}`, {
+      method: 'DELETE',
+      headers: { 'X-Server-Id': full1Id, authorization: `Bearer ${full1Token}` },
+    });
+    expect(delRes.status).toBe(200);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(await podCaller.listTunnels('user_mp')).toHaveLength(0);
+    expect(listenEngine.listTunnels()).toHaveLength(0);
+
+    // Open second tunnel, then disconnect target on podTarget -> podCaller coordinator & listenEngine both tear down.
+    const openRes2 = await appCaller.request(PORT_FORWARD_API_PATH, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': full1Id,
+        authorization: `Bearer ${full1Token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        listenNode: full1Id,
+        targetNode: full2Id,
+        targetPort: backendPort,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      }),
+    });
+    expect(openRes2.status).toBe(200);
+    targetConnected = false;
+    podTarget.onDaemonDisconnected(full2Id, 1);
+    await new Promise((r) => setTimeout(r, 40));
+    expect(await podCaller.listTunnels('user_mp')).toHaveLength(0);
+    expect(listenEngine.listTunnels()).toHaveLength(0);
+    listenConnected = false;
+    void PORT_FORWARD_TRANSPORT;
+  });
+
+  it('fails closed on shared/contributed hosts for POST, GET, DELETE /:id, and DELETE / without owner authority (P0 #3)', async () => {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const full1Id = `sh_full1_${suffix}`;
+    const full2Id = `sh_full2_${suffix}`;
+    const full1Token = `sh_tok1_${suffix}`;
+    const full2Token = `sh_tok2_${suffix}`;
+    const signingKey = 'shared-auth-signing-key-32-chars-xxx';
+    const db = createInMemoryDb(
+      [{ id: 'user_owner', status: 'active' }],
+      [
+        { id: full1Id, user_id: 'user_owner', node_role: 'full', node_id: null, ref_name: null, exec_enabled: true, revoked_at: null, token_hash: sha256(full1Token), team_id: 'team_1' },
+        { id: full2Id, user_id: 'user_owner', node_role: 'full', node_id: null, ref_name: null, exec_enabled: true, revoked_at: null, token_hash: sha256(full2Token), team_id: null },
+      ],
+      new Set([full1Id]),
+    );
+    const router = new PortForwardRouter({
+      lookupBridge: (id) => WsBridge.find(id),
+      prepareTimeoutMs: 2_000,
+      establishTimeoutMs: 4_000,
+    });
+    const n1 = createFakeNodeSocket(full1Id, full1Token, router, { disableDirectTcp: true });
+    const n2 = createFakeNodeSocket(full2Id, full2Token, router, { disableDirectTcp: true });
+    for (const [sid, tok, node] of [[full1Id, full1Token, n1], [full2Id, full2Token, n2]] as const) {
+      node.emitter.on('message', (raw: Buffer) => {
+        const parsed = JSON.parse(raw.toString('utf8')) as Record<string, unknown>;
+        if (typeof parsed.type === 'string' && parsed.type.startsWith('port_forward.')) {
+          router.handleDaemonMessage(sid, node.bridge.daemonConnectionGeneration(), parsed);
+        }
+      });
+      node.bridge.handleDaemonConnection(node.emitter as never, db, {} as never);
+      node.emitter.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId: sid, token: tok, daemonVersion: '0.1.2' })), false);
+      for (let i = 0; i < 40 && !node.bridge.isDaemonConnected(); i++) await new Promise((r) => setTimeout(r, 10));
+    }
+    cleanups.push(async () => {
+      await router.closeAllForUser('user_owner');
+      n1.emitter.close();
+      n2.emitter.close();
+    });
+
+    const app = new Hono();
+    app.use('*', async (c, next) => {
+      (c as unknown as { env: { DB: Database; JWT_SIGNING_KEY: string } }).env = { DB: db, JWT_SIGNING_KEY: signingKey };
+      await next();
+    });
+    app.route(PORT_FORWARD_API_PATH, createPortForwardRoutes(router));
+
+    // All 4 routes MUST fail closed (403 target_forbidden) when authority header is absent on a shared host!
+    const postAbsent = await app.request(PORT_FORWARD_API_PATH, {
+      method: 'POST',
+      headers: { 'X-Server-Id': full1Id, authorization: `Bearer ${full1Token}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ targetNode: full2Id, targetPort: 8080, transport: PORT_FORWARD_TRANSPORT_PREF.RELAY }),
+    });
+    expect(postAbsent.status).toBe(403);
+    expect((await postAbsent.json() as { reason: string }).reason).toBe(PORT_FORWARD_ERRORS.TARGET_FORBIDDEN);
+
+    const getAbsent = await app.request(PORT_FORWARD_API_PATH, {
+      headers: { 'X-Server-Id': full1Id, authorization: `Bearer ${full1Token}` },
+    });
+    expect(getAbsent.status).toBe(403);
+
+    const delOneAbsent = await app.request(`${PORT_FORWARD_API_PATH}/pf_missing`, {
+      method: 'DELETE',
+      headers: { 'X-Server-Id': full1Id, authorization: `Bearer ${full1Token}` },
+    });
+    expect(delOneAbsent.status).toBe(403);
+
+    const delAllAbsent = await app.request(PORT_FORWARD_API_PATH, {
+      method: 'DELETE',
+      headers: { 'X-Server-Id': full1Id, authorization: `Bearer ${full1Token}` },
+    });
+    expect(delAllAbsent.status).toBe(403);
+
+    // With valid signed owner turn authority header, all routes work normally!
+    const ownerAuthJwt = issueOwnerMachineAuthority({
+      type: OWNER_MACHINE_AUTHORITY_TYPE,
+      sub: 'user_owner',
+      sourceServerId: full1Id,
+      sessionName: 'deck_owner_brain',
+      projectName: 'demo-proj',
+      actionId: 'act_pf_1',
+    }, signingKey);
+
+    const postAllowed = await app.request(PORT_FORWARD_API_PATH, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': full1Id,
+        authorization: `Bearer ${full1Token}`,
+        [SHARED_MACHINE_AUTHORITY_HEADER]: ownerAuthJwt,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ targetNode: full2Id, targetPort: 8080, transport: PORT_FORWARD_TRANSPORT_PREF.RELAY }),
+    });
+    expect(postAllowed.status).toBe(200);
+    const { tunnel } = await postAllowed.json() as { tunnel: { tunnelId: string } };
+
+    const getAllowed = await app.request(PORT_FORWARD_API_PATH, {
+      headers: {
+        'X-Server-Id': full1Id,
+        authorization: `Bearer ${full1Token}`,
+        [SHARED_MACHINE_AUTHORITY_HEADER]: ownerAuthJwt,
+      },
+    });
+    expect(getAllowed.status).toBe(200);
+    expect((await getAllowed.json() as { tunnels: unknown[] }).tunnels).toHaveLength(1);
+
+    const delOneAllowed = await app.request(`${PORT_FORWARD_API_PATH}/${tunnel.tunnelId}`, {
+      method: 'DELETE',
+      headers: {
+        'X-Server-Id': full1Id,
+        authorization: `Bearer ${full1Token}`,
+        [SHARED_MACHINE_AUTHORITY_HEADER]: ownerAuthJwt,
+      },
+    });
+    expect(delOneAllowed.status).toBe(200);
+
+    const delAllAllowed = await app.request(PORT_FORWARD_API_PATH, {
+      method: 'DELETE',
+      headers: {
+        'X-Server-Id': full1Id,
+        authorization: `Bearer ${full1Token}`,
+        [SHARED_MACHINE_AUTHORITY_HEADER]: ownerAuthJwt,
+      },
+    });
+    expect(delAllAllowed.status).toBe(200);
+  });
+
+  it('settles openTunnel immediately on mid-PREPARE close, tears down on listen disconnect, and expires on TTL (P0 #5/#8)', async () => {
+    const env = await setupTopology({ useLegacySilentTarget: true, prepareTimeoutMs: 5_000 });
+    const started = Date.now();
+    const pendingOpen = env.router.openTunnel({
+      userId: 'user_a',
+      listenNode: env.full1Id,
+      listenServerId: env.full1Id,
+      listenPort: 0,
+      targetNode: env.ctl2NodeId,
+      targetServerId: env.ctl2Id,
+      targetHost: '127.0.0.1',
+      targetPort: 9999,
+      ttlSeconds: 60,
+      transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    const closedIds = await env.router.closeAllForUser('user_a', undefined, 'user_abort');
+    expect(closedIds).toHaveLength(1);
+    const result = await pendingOpen;
+    expect(result.ok).toBe(false);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(await env.router.listTunnels('user_a')).toHaveLength(0);
+
+    // Listen-side disconnect tears down target engine cleanly + short TTL closes both sides.
+    const healthy = await setupTopology({ useDefaultRouter: true });
+    const resListenDrop = await healthy.app.request(PORT_FORWARD_API_PATH, {
+      method: 'POST',
+      headers: {
+        'X-Server-Id': healthy.full1Id,
+        authorization: `Bearer ${healthy.full1Token}`,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ targetNode: healthy.ctl1NodeId, targetPort: 8080, transport: PORT_FORWARD_TRANSPORT_PREF.RELAY }),
+    });
+    expect(resListenDrop.status).toBe(200);
+    healthy.nodes.full1.emitter.close();
+    await new Promise((r) => setTimeout(r, 40));
+    expect(await healthy.router.listTunnels('user_a')).toHaveLength(0);
+    expect(healthy.nodes.ctl1.engine.listTunnels()).toHaveLength(0);
+
+    // TTL auto-expiration closes router and engine cleanly.
+    const ttlEnv = await setupTopology();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const ttlRes = await ttlEnv.router.openTunnel({
+        userId: 'user_a',
+        listenNode: ttlEnv.full2Id,
+        listenServerId: ttlEnv.full2Id,
+        listenPort: 0,
+        targetNode: ttlEnv.ctl1NodeId,
+        targetServerId: ttlEnv.ctl1Id,
+        targetHost: '127.0.0.1',
+        targetPort: 8080,
+        ttlSeconds: PORT_FORWARD_LIMITS.MIN_TTL_SECONDS,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      });
+      expect(ttlRes.ok).toBe(true);
+      await vi.advanceTimersByTimeAsync((PORT_FORWARD_LIMITS.MIN_TTL_SECONDS + 1) * 1000);
+      expect(await ttlEnv.router.listTunnels('user_a')).toHaveLength(0);
+      expect(ttlEnv.nodes.full2.engine.listTunnels()).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

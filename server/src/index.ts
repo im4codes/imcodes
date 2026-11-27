@@ -60,6 +60,8 @@ import { machinesRoutes } from './routes/machines.js';
 import { machineExecRoutes } from './routes/machine-exec.js';
 import { machineComputerUseRoutes } from './routes/machine-computer-use.js';
 import { portForwardRoutes } from './routes/port-forward.js';
+import { defaultPortForwardRouter } from './ws/port-forward-router.js';
+import { PostgresPortForwardClusterStore } from './ws/port-forward-cluster.js';
 import { PORT_FORWARD_API_PATH } from '../../shared/port-forward.js';
 import { serverRoutes } from './routes/server.js';
 import { webhookRoutes } from './routes/webhook.js';
@@ -1509,6 +1511,12 @@ async function main() {
   ]);
 
   const podId = getPodIdentity();
+  defaultPortForwardRouter.configure({
+    podId,
+    clusterStore: new PostgresPortForwardClusterStore(db, envConfig.DATABASE_URL),
+    lookupBridge: (serverId) => WsBridge.find(serverId),
+  });
+  await defaultPortForwardRouter.startCluster();
   const guestOutboxAdapter = new PostgresRemoteDesktopGuestOutboxDeliveryAdapter(
     db,
     (serverId) => WsBridge.remoteDesktopGuestOutboxTarget(serverId),
@@ -1585,6 +1593,7 @@ async function main() {
     setRemoteDesktopManagementPrivacyDispatcher(null);
     setRemoteDesktopShellLaunchContextDispatcher(null);
     stopAccountWatch();
+    await defaultPortForwardRouter.stopCluster();
     await globalTaskHub.stop();
     pushStreamHub.stop();
     remoteVoiceHub.stop();

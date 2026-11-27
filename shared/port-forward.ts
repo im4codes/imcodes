@@ -127,6 +127,16 @@ export const PORT_FORWARD_LIMITS = {
   MAX_TCP_ENCRYPTED_FRAME_BYTES: 64 * 1024,
   MAX_RELAY_FRAME_B64_BYTES: 128 * 1024,
   MAX_LIST_TUNNELS: 64,
+  MAX_STREAM_RECV_BUFFER_BYTES: 512 * 1024,
+  CARRIER_HIGH_WATER_BYTES: 1024 * 1024,
+  CARRIER_HARD_CAP_BYTES: 8 * 1024 * 1024,
+  UDP_HIGH_WATER_PACKETS: 256,
+  UDP_LOW_WATER_PACKETS: 128,
+  UDP_HARD_CAP_PACKETS: 1024,
+  RELAY_WS_HIGH_WATER_BYTES: 2 * 1024 * 1024,
+  RELAY_WS_LOW_WATER_BYTES: 512 * 1024,
+  RELAY_WS_HARD_CAP_BYTES: 8 * 1024 * 1024,
+  MAX_PRECONNECT_TCP_SOCKETS: 32,
 } as const;
 
 export const PORT_FORWARD_SELF_ALIASES = ['self', 'local', 'localhost', 'this'] as const;
@@ -144,6 +154,8 @@ export const PORT_FORWARD_MUX_TYPE = {
   WINDOW_UPDATE: 7,
   PING: 8,
   PONG: 9,
+  KEY_CONFIRM: 10,
+  KEY_CONFIRM_ACK: 11,
 } as const;
 
 export type PortForwardMuxType =
@@ -223,7 +235,10 @@ export interface PortForwardPrepareMessage {
   type: typeof PORT_FORWARD_MSG.PREPARE;
   tunnelId: string;
   role: PortForwardRole;
+  /** Server-minted admission token (punch/TCP hello proof & HKDF salt; never alone derives traffic keys). */
   capability: string;
+  selfServerId: string;
+  peerServerId: string;
   listenHost?: typeof PORT_FORWARD_LIMITS.LISTEN_HOST;
   listenPort?: number;
   targetHost?: string;
@@ -239,6 +254,10 @@ export interface PortForwardReadyMessage {
   role: PortForwardRole;
   listenPort?: number;
   candidates: PortForwardCandidate[];
+  /** Ephemeral X25519 SPKI DER public key (base64url) generated locally by the node. */
+  publicKey: string;
+  /** HMAC proof under admission key binding (tunnelId, role, selfServerId, peerServerId, publicKey). */
+  keyProof: string;
 }
 
 export interface PortForwardConnectMessage {
@@ -246,14 +265,17 @@ export interface PortForwardConnectMessage {
   tunnelId: string;
   role: PortForwardRole;
   peerCandidates: PortForwardCandidate[];
+  peerPublicKey: string;
+  peerKeyProof: string;
   transport: PortForwardTransportPref;
 }
 
 export interface PortForwardEstablishedMessage {
   type: typeof PORT_FORWARD_MSG.ESTABLISHED;
   tunnelId: string;
+  role: PortForwardRole;
   transportMode: PortForwardTransport;
-  listenPort: number;
+  listenPort?: number;
 }
 
 export interface PortForwardCloseMessage {
@@ -329,6 +351,9 @@ export interface PortForwardTunnelSummary {
 
 const TUNNEL_ID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const CAPABILITY_RE = /^[A-Za-z0-9_-]{43}$/;
+const SERVER_ID_RE = /^[A-Za-z0-9._:-]{2,128}$/;
+const ECDH_PUB_RE = /^[A-Za-z0-9_-]{40,128}$/;
+const KEY_PROOF_RE = /^[A-Za-z0-9_-]{32,64}$/;
 const HOSTNAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$/;
 const B64_RE = /^[A-Za-z0-9+/=_-]+$/;
 const TRANSPORT_PREF_SET: ReadonlySet<string> = new Set(PORT_FORWARD_TRANSPORT_PREFS);
@@ -517,7 +542,7 @@ export function validatePortForwardWireMessage(
     case PORT_FORWARD_MSG.PREPARE: {
       if (!hasAllowedKeys(
         raw,
-        ['type', 'tunnelId', 'role', 'capability', 'transport', 'iceServers', 'ttlMs'],
+        ['type', 'tunnelId', 'role', 'capability', 'selfServerId', 'peerServerId', 'transport', 'iceServers', 'ttlMs'],
         ['listenHost', 'listenPort', 'targetHost', 'targetPort'],
       )) {
         return { ok: false, error: 'invalid_keys' };
@@ -527,6 +552,13 @@ export function validatePortForwardWireMessage(
       }
       if (typeof raw.capability !== 'string' || !CAPABILITY_RE.test(raw.capability)) {
         return { ok: false, error: 'invalid_capability' };
+      }
+      if (typeof raw.selfServerId !== 'string'
+        || !SERVER_ID_RE.test(raw.selfServerId)
+        || typeof raw.peerServerId !== 'string'
+        || !SERVER_ID_RE.test(raw.peerServerId)
+        || raw.selfServerId === raw.peerServerId) {
+        return { ok: false, error: 'invalid_endpoint_server_id' };
       }
       const transport = validatePortForwardTransportPref(raw.transport);
       if (!transport) return { ok: false, error: 'invalid_transport' };
@@ -561,6 +593,8 @@ export function validatePortForwardWireMessage(
             tunnelId,
             role: PORT_FORWARD_ROLE.LISTEN,
             capability: raw.capability,
+            selfServerId: raw.selfServerId,
+            peerServerId: raw.peerServerId,
             listenHost: PORT_FORWARD_LIMITS.LISTEN_HOST,
             listenPort,
             transport,
@@ -582,6 +616,8 @@ export function validatePortForwardWireMessage(
           tunnelId,
           role: PORT_FORWARD_ROLE.TARGET,
           capability: raw.capability,
+          selfServerId: raw.selfServerId,
+          peerServerId: raw.peerServerId,
           targetHost,
           targetPort,
           transport,
@@ -592,11 +628,17 @@ export function validatePortForwardWireMessage(
     }
 
     case PORT_FORWARD_MSG.READY: {
-      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'role', 'candidates'], ['listenPort'])) {
+      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'role', 'candidates', 'publicKey', 'keyProof'], ['listenPort'])) {
         return { ok: false, error: 'invalid_keys' };
       }
       if (raw.role !== PORT_FORWARD_ROLE.LISTEN && raw.role !== PORT_FORWARD_ROLE.TARGET) {
         return { ok: false, error: 'invalid_role' };
+      }
+      if (typeof raw.publicKey !== 'string' || !ECDH_PUB_RE.test(raw.publicKey)) {
+        return { ok: false, error: 'invalid_public_key' };
+      }
+      if (typeof raw.keyProof !== 'string' || !KEY_PROOF_RE.test(raw.keyProof)) {
+        return { ok: false, error: 'invalid_key_proof' };
       }
       let listenPort: number | undefined;
       if (raw.role === PORT_FORWARD_ROLE.LISTEN) {
@@ -623,16 +665,24 @@ export function validatePortForwardWireMessage(
           role: raw.role,
           ...(listenPort !== undefined ? { listenPort } : {}),
           candidates,
+          publicKey: raw.publicKey,
+          keyProof: raw.keyProof,
         },
       };
     }
 
     case PORT_FORWARD_MSG.CONNECT: {
-      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'role', 'peerCandidates', 'transport'])) {
+      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'role', 'peerCandidates', 'peerPublicKey', 'peerKeyProof', 'transport'])) {
         return { ok: false, error: 'invalid_keys' };
       }
       if (raw.role !== PORT_FORWARD_ROLE.LISTEN && raw.role !== PORT_FORWARD_ROLE.TARGET) {
         return { ok: false, error: 'invalid_role' };
+      }
+      if (typeof raw.peerPublicKey !== 'string' || !ECDH_PUB_RE.test(raw.peerPublicKey)) {
+        return { ok: false, error: 'invalid_peer_public_key' };
+      }
+      if (typeof raw.peerKeyProof !== 'string' || !KEY_PROOF_RE.test(raw.peerKeyProof)) {
+        return { ok: false, error: 'invalid_peer_key_proof' };
       }
       const transport = validatePortForwardTransportPref(raw.transport);
       if (!transport) return { ok: false, error: 'invalid_transport' };
@@ -647,26 +697,44 @@ export function validatePortForwardWireMessage(
       }
       return {
         ok: true,
-        value: { type, tunnelId, role: raw.role, peerCandidates, transport },
+        value: {
+          type,
+          tunnelId,
+          role: raw.role,
+          peerCandidates,
+          peerPublicKey: raw.peerPublicKey,
+          peerKeyProof: raw.peerKeyProof,
+          transport,
+        },
       };
     }
 
     case PORT_FORWARD_MSG.ESTABLISHED: {
-      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'transportMode', 'listenPort'])) {
+      if (!hasAllowedKeys(raw, ['type', 'tunnelId', 'role', 'transportMode'], ['listenPort'])) {
         return { ok: false, error: 'invalid_keys' };
+      }
+      if (raw.role !== PORT_FORWARD_ROLE.LISTEN && raw.role !== PORT_FORWARD_ROLE.TARGET) {
+        return { ok: false, error: 'invalid_role' };
       }
       if (typeof raw.transportMode !== 'string' || !TRANSPORT_SET.has(raw.transportMode)) {
         return { ok: false, error: 'invalid_transport_mode' };
       }
-      const listenPort = validatePortForwardPort(raw.listenPort, false);
-      if (listenPort === null) return { ok: false, error: 'invalid_listen_port' };
+      let listenPort: number | undefined;
+      if (raw.role === PORT_FORWARD_ROLE.LISTEN) {
+        const parsed = validatePortForwardPort(raw.listenPort, false);
+        if (parsed === null) return { ok: false, error: 'invalid_listen_port' };
+        listenPort = parsed;
+      } else if (raw.listenPort !== undefined) {
+        return { ok: false, error: 'unexpected_listen_port' };
+      }
       return {
         ok: true,
         value: {
           type,
           tunnelId,
+          role: raw.role,
           transportMode: raw.transportMode as PortForwardTransport,
-          listenPort,
+          ...(listenPort !== undefined ? { listenPort } : {}),
         },
       };
     }

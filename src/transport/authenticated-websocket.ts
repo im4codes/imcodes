@@ -1,5 +1,6 @@
 export interface AuthenticatedWebSocketLike {
   readonly readyState: number;
+  readonly bufferedAmount?: number;
   send(data: string): void;
   close(code?: number, reason?: string): void;
   terminate?: () => void;
@@ -111,6 +112,10 @@ export class AuthenticatedWebSocketClient {
   reconnect(): void {
     if (this.stopped || !this.socket) return;
     this.failSocket(this.socket, 'manual_reconnect');
+  }
+
+  getBufferedAmount(): number {
+    return typeof this.socket?.bufferedAmount === 'number' ? this.socket.bufferedAmount : 0;
   }
 
   send(message: unknown): boolean {

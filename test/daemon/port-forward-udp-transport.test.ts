@@ -14,9 +14,21 @@ import {
 } from '../../src/daemon/port-forward-stun.js';
 import {
   ReliableUdpTransport,
+  UDP_P2P_MAGIC,
+  UDP_P2P_PKT,
+  decryptUdpArqPacket,
   deriveTunnelCryptoKeys,
+  encryptUdpArqPacket,
   runUdpHolePunch,
 } from '../../src/daemon/port-forward-udp-transport.js';
+import {
+  computeEcdhSharedSecret,
+  computeKeyConfirmationMac,
+  deriveAdmissionMacKey,
+  deriveE2eTransportKeys,
+  generateEphemeralEcdhKeyPair,
+  verifyKeyConfirmationMac,
+} from '../../src/daemon/port-forward-crypto.js';
 
 const socketsToClose: DgramSocket[] = [];
 const transportsToClose: ReliableUdpTransport[] = [];
@@ -303,5 +315,113 @@ describe('RFC 5389 STUN client + UDP simultaneous hole punching + ARQ reliable t
       tA.onClose((reason) => resolve(reason));
     });
     expect(closedReason).toBe('udp_dead_link');
+  });
+
+  it('derives E2E-exclusive per-transport X25519 keys opaque to relay capability and bounds UDP send/ACK windows', async () => {
+    const alice = generateEphemeralEcdhKeyPair();
+    const bob = generateEphemeralEcdhKeyPair();
+    const secretA = computeEcdhSharedSecret(alice.privateKey, bob.publicKeyB64);
+    const secretB = computeEcdhSharedSecret(bob.privateKey, alice.publicKeyB64);
+    expect(secretA.equals(secretB)).toBe(true);
+
+    const capability = Buffer.alloc(32, 0x55).toString('base64url');
+    const tunnelId = 'pf_e2e_separation_01';
+    const admissionKey = deriveAdmissionMacKey(capability, tunnelId);
+
+    const udpKeysA = deriveE2eTransportKeys({
+      ecdhSecret: secretA,
+      capability,
+      tunnelId,
+      listenServerId: 'srv_listen',
+      targetServerId: 'srv_target',
+      listenPublicKey: alice.publicKeyB64,
+      targetPublicKey: bob.publicKeyB64,
+      transportMode: 'direct_udp_p2p',
+    });
+    const relayKeysA = deriveE2eTransportKeys({
+      ecdhSecret: secretA,
+      capability,
+      tunnelId,
+      listenServerId: 'srv_listen',
+      targetServerId: 'srv_target',
+      listenPublicKey: alice.publicKeyB64,
+      targetPublicKey: bob.publicKeyB64,
+      transportMode: 'relay',
+    });
+
+    // Different transports and directions never share keys; admission capability cannot derive E2E traffic keys.
+    expect(udpKeysA.listenToTargetKey.equals(udpKeysA.targetToListenKey)).toBe(false);
+    expect(udpKeysA.listenToTargetKey.equals(relayKeysA.listenToTargetKey)).toBe(false);
+    expect(udpKeysA.listenToTargetKey.equals(admissionKey)).toBe(false);
+
+    const tag = computeKeyConfirmationMac(udpKeysA.confirmListenToTargetKey, {
+      tunnelId,
+      listenServerId: 'srv_listen',
+      targetServerId: 'srv_target',
+      listenPublicKey: alice.publicKeyB64,
+      targetPublicKey: bob.publicKeyB64,
+      transportMode: 'direct_udp_p2p',
+      direction: 'l2t',
+    });
+    expect(verifyKeyConfirmationMac(relayKeysA.confirmListenToTargetKey, {
+      tunnelId,
+      listenServerId: 'srv_listen',
+      targetServerId: 'srv_target',
+      listenPublicKey: alice.publicKeyB64,
+      targetPublicKey: bob.publicKeyB64,
+      transportMode: 'relay',
+      direction: 'l2t',
+    }, tag)).toBe(false);
+
+    // Server attacker possessing capability + tunnelId alone cannot decrypt E2E ARQ packet.
+    const encrypted = encryptUdpArqPacket(udpKeysA.listenToTargetKey, 0x4c540001, tunnelId, UDP_P2P_PKT.ARQ_DATA, 1n, Buffer.from('secret'));
+    const serverGuessedKeys = deriveTunnelCryptoKeys(capability, tunnelId);
+    expect(decryptUdpArqPacket(serverGuessedKeys.listenToTargetKey, 0x4c540001, tunnelId, encrypted)).toBeNull();
+
+    // High-water write pause & forged out-of-window ARQ_ACK rejection + hard-cap overflow close.
+    const senderSock = await bindUdp();
+    const attackerSock = await bindUdp();
+    const tA = new ReliableUdpTransport({
+      socket: senderSock.socket,
+      tunnelId,
+      role: PORT_FORWARD_ROLE.LISTEN,
+      keys: {
+        punchMacKey: admissionKey,
+        listenToTargetKey: udpKeysA.listenToTargetKey,
+        targetToListenKey: udpKeysA.targetToListenKey,
+      },
+      peerHost: '127.0.0.1',
+      peerPort: attackerSock.port,
+      heartbeatIntervalMs: 5_000,
+      deadLinkTimeoutMs: 20_000,
+    });
+    transportsToClose.push(tA);
+
+    // Send 260 single-packet frames -> crosses UDP_HIGH_WATER_PACKETS (256), making isWritable() false.
+    let becameUnwritable = false;
+    for (let i = 0; i < 260; i++) {
+      if (!tA.sendMuxFrame(encodePortForwardMuxFrame(PORT_FORWARD_MUX_TYPE.DATA, 1, Buffer.alloc(100, i & 0xff)))) {
+        becameUnwritable = true;
+      }
+    }
+    expect(becameUnwritable).toBe(true);
+    expect(tA.isWritable()).toBe(false);
+
+    // Inject forged ACK for out-of-window future sequence 0x0fffffff -> must be ignored without clearing inFlight.
+    const forgedAckInner = Buffer.allocUnsafe(10);
+    forgedAckInner.writeUInt32BE(0x0fffffff, 0);
+    forgedAckInner.writeUInt32BE(0xffffffff, 4);
+    forgedAckInner.writeUInt16BE(256, 8);
+    const forgedAckPkt = encryptUdpArqPacket(udpKeysA.targetToListenKey, 0x544c0002, tunnelId, UDP_P2P_PKT.ARQ_ACK, 1n, forgedAckInner);
+    attackerSock.socket.send(forgedAckPkt, senderSock.port, '127.0.0.1');
+    await new Promise((r) => setTimeout(r, 30));
+    expect(tA.isWritable()).toBe(false);
+
+    // Pushing past UDP_HARD_CAP_PACKETS (1024) closes cleanly with udp_send_queue_overflow.
+    const closePromise = new Promise<string>((resolve) => tA.onClose(resolve));
+    for (let i = 0; i < 900; i++) {
+      tA.sendMuxFrame(encodePortForwardMuxFrame(PORT_FORWARD_MUX_TYPE.DATA, 1, Buffer.alloc(100, 1)));
+    }
+    expect(await closePromise).toBe('udp_send_queue_overflow');
   });
 });

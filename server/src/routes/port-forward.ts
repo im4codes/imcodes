@@ -227,9 +227,42 @@ export function createPortForwardRoutes(
     };
   };
 
+  const requireOwnerSourceAuthority = async (
+    db: Database,
+    caller: {
+      sourceServerId: string;
+      operational: { delegatedActorUserId?: string; authorityKind: 'absent' | 'owner' | 'participant' };
+      now: number;
+    },
+    actionLabel: string,
+  ): Promise<{ ok: true } | { ok: false; status: 403; reason: PortForwardErrorCode; error: string }> => {
+    if (caller.operational.authorityKind === 'participant' || caller.operational.delegatedActorUserId) {
+      return {
+        ok: false,
+        status: 403,
+        reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
+        error: `shared session participant cannot ${actionLabel}`,
+      };
+    }
+    if (caller.operational.authorityKind === 'absent'
+      && await isSharedOrContributedServer(db, caller.sourceServerId, caller.now)) {
+      return {
+        ok: false,
+        status: 403,
+        reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
+        error: `shared host requires per-turn owner authority to ${actionLabel}`,
+      };
+    }
+    return { ok: true };
+  };
+
   routes.post('/', async (c) => {
     const caller = await authenticateCaller(c);
     if (!caller.ok) return c.json({ ok: false, reason: caller.reason, error: caller.error }, caller.status);
+    const sourceAuth = await requireOwnerSourceAuthority(c.env.DB, caller, 'open tunnels');
+    if (!sourceAuth.ok) {
+      return c.json({ ok: false, reason: sourceAuth.reason, error: sourceAuth.error }, sourceAuth.status);
+    }
 
     const rawBody = await c.req.text().catch(() => '');
     if (Buffer.byteLength(rawBody, 'utf8') > PORT_FORWARD_LIMITS.MAX_CONTROL_BYTES) {
@@ -294,8 +327,9 @@ export function createPortForwardRoutes(
   routes.get('/', async (c) => {
     const caller = await authenticateCaller(c);
     if (!caller.ok) return c.json({ ok: false, reason: caller.reason, error: caller.error }, caller.status);
-    if (caller.operational.authorityKind === 'participant' || caller.operational.delegatedActorUserId) {
-      return c.json({ ok: false, reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN, error: 'shared participant cannot list tunnels' }, 403);
+    const sourceAuth = await requireOwnerSourceAuthority(c.env.DB, caller, 'list tunnels');
+    if (!sourceAuth.ok) {
+      return c.json({ ok: false, reason: sourceAuth.reason, error: sourceAuth.error }, sourceAuth.status);
     }
     const rawNode = c.req.query('node');
     let filterServerId: string | undefined;
@@ -310,21 +344,22 @@ export function createPortForwardRoutes(
         filterServerId = (await resolveMachineTargetServerId(c.env.DB, ref)) ?? ref;
       }
     }
-    const tunnels = router.listTunnels(caller.userId, filterServerId);
+    const tunnels = await router.listTunnels(caller.userId, filterServerId);
     return c.json({ ok: true, tunnels });
   });
 
   routes.delete('/:tunnelId', async (c) => {
     const caller = await authenticateCaller(c);
     if (!caller.ok) return c.json({ ok: false, reason: caller.reason, error: caller.error }, caller.status);
-    if (caller.operational.authorityKind === 'participant' || caller.operational.delegatedActorUserId) {
-      return c.json({ ok: false, reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN, error: 'shared participant cannot close tunnels' }, 403);
+    const sourceAuth = await requireOwnerSourceAuthority(c.env.DB, caller, 'close tunnels');
+    if (!sourceAuth.ok) {
+      return c.json({ ok: false, reason: sourceAuth.reason, error: sourceAuth.error }, sourceAuth.status);
     }
     const tunnelId = c.req.param('tunnelId');
     if (!tunnelId) {
       return c.json({ ok: false, reason: PORT_FORWARD_ERRORS.INVALID_REQUEST, error: 'tunnelId is required' }, 400);
     }
-    const res = router.closeTunnelForUser(caller.userId, tunnelId);
+    const res = await router.closeTunnelForUser(caller.userId, tunnelId);
     if (!res.ok) {
       return c.json({ ok: false, reason: res.reason, error: res.error }, res.status as 403 | 404);
     }
@@ -334,8 +369,9 @@ export function createPortForwardRoutes(
   routes.delete('/', async (c) => {
     const caller = await authenticateCaller(c);
     if (!caller.ok) return c.json({ ok: false, reason: caller.reason, error: caller.error }, caller.status);
-    if (caller.operational.authorityKind === 'participant' || caller.operational.delegatedActorUserId) {
-      return c.json({ ok: false, reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN, error: 'shared participant cannot close tunnels' }, 403);
+    const sourceAuth = await requireOwnerSourceAuthority(c.env.DB, caller, 'close tunnels');
+    if (!sourceAuth.ok) {
+      return c.json({ ok: false, reason: sourceAuth.reason, error: sourceAuth.error }, sourceAuth.status);
     }
     const rawNode = c.req.query('node');
     let filterServerId: string | undefined;
@@ -348,7 +384,7 @@ export function createPortForwardRoutes(
         ? caller.sourceServerId
         : ((await resolveMachineTargetServerId(c.env.DB, ref)) ?? ref);
     }
-    const closedTunnelIds = router.closeAllForUser(caller.userId, filterServerId);
+    const closedTunnelIds = await router.closeAllForUser(caller.userId, filterServerId);
     return c.json({ ok: true, closedCount: closedTunnelIds.length, closedTunnelIds });
   });
 

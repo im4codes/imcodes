@@ -2390,11 +2390,12 @@ function getDaemonPortForwardEngine(serverLink: ServerLink): PortForwardEngine {
     daemonPortForwardEngine = new PortForwardEngine({
       sendWs: (msg) => {
         try {
-          serverLink.send(msg);
+          return serverLink.trySend(msg);
         } catch {
-          // Link closed; disconnect cleanup tears down active tunnels.
+          return false;
         }
       },
+      getWsBufferedAmount: () => serverLink.getWsBufferedAmount(),
     });
   }
   return daemonPortForwardEngine;

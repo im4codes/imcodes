@@ -951,6 +951,10 @@ export class ServerLink {
     });
   }
 
+  getWsBufferedAmount(): number {
+    return typeof this.ws?.bufferedAmount === 'number' ? this.ws.bufferedAmount : 0;
+  }
+
   send(msg: unknown): void {
     if (this.shouldDeferDataPlaneSend(msg)) {
       if (this.enqueueDataPlaneSend(msg)) this.scheduleDataPlaneFlush();

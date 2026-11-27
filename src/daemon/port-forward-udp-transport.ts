@@ -46,7 +46,6 @@ const INITIAL_RTO_MS = 120;
 const MIN_RTO_MS = 60;
 const MAX_RTO_MS = 1_500;
 const SEND_WINDOW_PACKETS = 64;
-const MAX_BUFFERED_OUTGOING_PACKETS = 512;
 
 export interface TunnelCryptoKeys {
   punchMacKey: Buffer;
@@ -463,6 +462,7 @@ export class ReliableUdpTransport implements PortForwardCarrier {
   private rtoMs = INITIAL_RTO_MS;
   private lastInboundAt = Date.now();
   private closed = false;
+  private writePaused = false;
 
   private readonly muxListeners = new Set<(frame: PortForwardMuxFrame) => void>();
   private readonly drainListeners = new Set<() => void>();
@@ -537,18 +537,25 @@ export class ReliableUdpTransport implements PortForwardCarrier {
   }
 
   isWritable(): boolean {
-    return !this.closed && (this.inFlight.size + this.pendingChunks.length) < MAX_BUFFERED_OUTGOING_PACKETS;
+    return !this.closed && (this.inFlight.size + this.pendingChunks.length) < PORT_FORWARD_LIMITS.UDP_HIGH_WATER_PACKETS;
   }
 
   sendMuxFrame(frame: Buffer): boolean {
     if (this.closed) return false;
     const maxChunk = PORT_FORWARD_LIMITS.MAX_UDP_CHUNK_BYTES;
+    const neededPackets = Math.ceil(Math.max(1, frame.length) / maxChunk);
+    if ((this.inFlight.size + this.pendingChunks.length + neededPackets) > PORT_FORWARD_LIMITS.UDP_HARD_CAP_PACKETS) {
+      this.close('udp_send_queue_overflow');
+      return false;
+    }
     for (let offset = 0; offset < frame.length; offset += maxChunk) {
       const slice = Buffer.from(frame.subarray(offset, Math.min(offset + maxChunk, frame.length)));
       this.pendingChunks.push(slice);
     }
     this.flushSendQueue();
-    return this.isWritable();
+    const writable = this.isWritable();
+    if (!writable) this.writePaused = true;
+    return writable;
   }
 
   sendKeepalivePing(): void {
@@ -672,11 +679,16 @@ export class ReliableUdpTransport implements PortForwardCarrier {
   }
 
   private processAck(ackSeq: number, sackMask: number): void {
+    // Reject out-of-window ACK sequences so cumulative sliding stays strictly bounded to in-flight window.
+    if (seqBefore(ackSeq, this.txUnackedSeq) || seqAfter(ackSeq, this.txNextSeq)) {
+      return;
+    }
     const now = Date.now();
-    const wasWritable = this.isWritable();
     let ackedAny = false;
+    let steps = 0;
+    const maxSteps = this.sendWindowPackets + 1;
 
-    while (seqBefore(this.txUnackedSeq, ackSeq)) {
+    while (seqBefore(this.txUnackedSeq, ackSeq) && steps++ < maxSteps) {
       const entry = this.inFlight.get(this.txUnackedSeq);
       if (entry) {
         if (entry.retries === 0) {
@@ -693,6 +705,7 @@ export class ReliableUdpTransport implements PortForwardCarrier {
       for (let bit = 0; bit < 32; bit++) {
         if ((sackMask & (1 << bit)) === 0) continue;
         const sackedSeq = (ackSeq + 1 + bit) >>> 0;
+        if (!seqBefore(sackedSeq, this.txNextSeq)) continue;
         if (this.inFlight.delete(sackedSeq)) {
           ackedAny = true;
         }
@@ -707,7 +720,9 @@ export class ReliableUdpTransport implements PortForwardCarrier {
 
     if (ackedAny) {
       this.flushSendQueue();
-      if (!wasWritable && this.isWritable()) {
+      const queued = this.inFlight.size + this.pendingChunks.length;
+      if (this.writePaused && queued <= PORT_FORWARD_LIMITS.UDP_LOW_WATER_PACKETS && !this.closed) {
+        this.writePaused = false;
         for (const listener of [...this.drainListeners]) listener();
       }
     }

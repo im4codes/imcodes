@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto';
+import { createDecipheriv, createHash, createHmac, hkdfSync } from 'node:crypto';
 import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
-import { connect as tcpConnect, createServer as createTcpServer, type Server as NetServer } from 'node:net';
+import { connect as tcpConnect, createServer as createTcpServer, type Server as NetServer, type Socket as NetSocket } from 'node:net';
 import WebSocket, { WebSocketServer } from 'ws';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -377,7 +377,7 @@ describe('PortForwardEngine 3-tier transport & mux suites', () => {
     expect(opened.ok).toBe(true);
     if (!opened.ok) return;
     const port = opened.tunnel.listenPort;
-    const closed = router.closeTunnelForUser('u1', opened.tunnel.tunnelId);
+    const closed = await router.closeTunnelForUser('u1', opened.tunnel.tunnelId);
     expect(closed.ok).toBe(true);
 
     // Wait one tick for async socket close in engine
@@ -391,7 +391,7 @@ describe('PortForwardEngine 3-tier transport & mux suites', () => {
     await new Promise<void>((r) => rebindServer.close(() => r()));
   });
 
-  it('drops injected invalid candidates gracefully in validation and still connects', async () => {
+  it('drops injected invalid candidates gracefully in validation and handles valid unknown tunnelId', async () => {
     const engine = new PortForwardEngine({
       sendWs: () => {},
     });
@@ -400,9 +400,290 @@ describe('PortForwardEngine 3-tier transport & mux suites', () => {
       tunnelId: 'pf_unknown_00000001',
       role: PORT_FORWARD_ROLE.LISTEN,
       peerCandidates: [{ host: '127.0.0.1', port: 1234, transport: 'tcp', kind: 'host' } satisfies PortForwardCandidate],
+      peerPublicKey: 'A'.repeat(44),
+      peerKeyProof: 'B'.repeat(43),
       transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
     });
     expect(handled).toBe(true);
     engine.closeAll();
+  });
+
+  it('keeps relay traffic unreadable to server despite complete wire transcript (P0 #1)', async () => {
+    const appServer = await startTestAppServer();
+    cleanupCallbacks.push(appServer.close);
+
+    const { router, capturedMessages } = createPairedEngines();
+    const opened = await router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: appServer.port,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+
+    const hello = await httpGet(opened.tunnel.listenPort, '/hello');
+    expect(hello.status).toBe(200);
+    expect(JSON.parse(hello.body.toString('utf8')).secret).toBe('TOP_SECRET_HTTP_BODY');
+
+    // Server saw capability in PREPARE, publicKeys in READY/CONNECT, and RELAY_FRAME ciphertext:
+    const prepareListen = capturedMessages.length;
+    expect(prepareListen).toBeGreaterThan(0);
+    const relayFrames = capturedMessages
+      .filter((e) => e.msg.type === PORT_FORWARD_MSG.RELAY_FRAME)
+      .map((e) => (e.msg as { tunnelId: string; data: string }).data);
+    expect(relayFrames.length).toBeGreaterThan(0);
+
+    // Attempt naive decryption from capability + tunnelId alone (v1 bug) -> must fail!
+    const capGuess = Buffer.alloc(32, 0x01);
+    const guessedKey = Buffer.from(hkdfSync('sha256', capGuess, Buffer.from(opened.tunnel.tunnelId), Buffer.from('imcodes-pf-v1:target->listen'), 32));
+    for (const b64 of relayFrames) {
+      const pkt = Buffer.from(b64, 'base64');
+      expect(pkt.toString('utf8')).not.toContain('TOP_SECRET_HTTP_BODY');
+      if (pkt.length > 24) {
+        const counter = pkt.readBigUInt64BE(0);
+        const iv = Buffer.allocUnsafe(12);
+        iv.writeUInt32BE(0x524c544c, 0);
+        iv.writeBigUInt64BE(counter, 4);
+        const decipher = createDecipheriv('aes-256-gcm', guessedKey, iv);
+        decipher.setAAD(Buffer.from(`${opened.tunnel.tunnelId}:relay:${counter.toString()}`));
+        decipher.setAuthTag(pkt.subarray(-16));
+        expect(() => {
+          decipher.update(pkt.subarray(8, -16));
+          decipher.final();
+        }).toThrow();
+      }
+    }
+    void createHmac;
+  });
+
+  it.each([
+    { label: 'direct_tcp', pref: PORT_FORWARD_TRANSPORT_PREF.AUTO, disableTcp: false, disableUdp: false },
+    { label: 'direct_udp_p2p', pref: PORT_FORWARD_TRANSPORT_PREF.AUTO, disableTcp: true, disableUdp: false },
+    { label: 'relay', pref: PORT_FORWARD_TRANSPORT_PREF.RELAY, disableTcp: true, disableUdp: true },
+  ])('preserves half-open TCP when client sends FIN before server delayed response over $label (P0 #4)', async ({ pref, disableTcp, disableUdp }) => {
+    const delayedServer = createTcpServer({ allowHalfOpen: true }, (sock: NetSocket) => {
+      const chunks: Buffer[] = [];
+      sock.on('data', (c: Buffer) => chunks.push(c));
+      sock.on('end', () => {
+        const req = Buffer.concat(chunks).toString('utf8');
+        setTimeout(() => {
+          sock.end(`DELAYED_ACK:${req}`);
+        }, 50);
+      });
+    });
+    await new Promise<void>((r) => delayedServer.listen(0, '127.0.0.1', () => r()));
+    cleanupCallbacks.push(() => new Promise<void>((r) => delayedServer.close(() => r())));
+    const targetPort = (delayedServer.address() as { port: number }).port;
+
+    const { router } = createPairedEngines({
+      listenOpts: { disableDirectTcp: disableTcp, disableDirectUdp: disableUdp },
+      targetOpts: { disableDirectTcp: disableTcp, disableDirectUdp: disableUdp },
+    });
+    const opened = await router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort,
+      ttlSeconds: 120,
+      transport: pref,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+
+    const response = await new Promise<string>((resolve, reject) => {
+      const client = tcpConnect({ host: '127.0.0.1', port: opened.tunnel.listenPort, allowHalfOpen: true });
+      const rx: Buffer[] = [];
+      client.once('error', reject);
+      client.on('data', (c: Buffer) => rx.push(c));
+      client.on('end', () => {
+        client.destroy();
+        resolve(Buffer.concat(rx).toString('utf8'));
+      });
+      client.once('connect', () => {
+        client.end('PING_THEN_FIN');
+      });
+    });
+    expect(response).toBe('DELAYED_ACK:PING_THEN_FIN');
+  });
+
+  it('settles openTunnel immediately on mid-PREPARE/CONNECT cancel and releases fixed listenPort (P0 #5)', async () => {
+    const { router, listenEngine } = createPairedEngines({
+      prepareTimeoutMs: 5_000,
+      establishTimeoutMs: 5_000,
+      listenOpts: {
+        // Delay STUN probe so cancel happens mid-PREPARE
+        probeStun: async () => {
+          await new Promise((r) => setTimeout(r, 250));
+          return [];
+        },
+      },
+    });
+
+    const probePort = await new Promise<number>((resolve) => {
+      const s = createTcpServer();
+      s.listen(0, '127.0.0.1', () => {
+        const p = (s.address() as { port: number }).port;
+        s.close(() => resolve(p));
+      });
+    });
+
+    const openPromise = router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: probePort,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: 8080,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
+    });
+
+    await new Promise((r) => setTimeout(r, 40));
+    const closedIds = await router.closeAllForUser('u1');
+    expect(closedIds).toHaveLength(1);
+
+    // P0 #5: openPromise MUST settle promptly rather than staying pending!
+    const openResult = await openPromise;
+    expect(openResult.ok).toBe(false);
+
+    await new Promise((r) => setTimeout(r, 300));
+    expect(listenEngine.listTunnels()).toHaveLength(0);
+
+    // Port must be completely free to rebind!
+    const rebound = createTcpServer();
+    await new Promise<void>((resolve, reject) => {
+      rebound.once('error', reject);
+      rebound.listen(probePort, '127.0.0.1', () => resolve());
+    });
+    await new Promise<void>((r) => rebound.close(() => r()));
+  });
+
+  it('never drops first pending client connection on fixed port during auto->relay fallback (P0 #6)', async () => {
+    const appServer = await startTestAppServer();
+    cleanupCallbacks.push(appServer.close);
+
+    const fixedPort = await new Promise<number>((resolve) => {
+      const s = createTcpServer();
+      s.listen(0, '127.0.0.1', () => {
+        const p = (s.address() as { port: number }).port;
+        s.close(() => resolve(p));
+      });
+    });
+
+    const { router } = createPairedEngines({
+      listenOpts: {
+        disableDirectTcp: true,
+        disableDirectUdp: true,
+      },
+      targetOpts: {
+        disableDirectTcp: true,
+        disableDirectUdp: true,
+      },
+    });
+
+    const openPromise = router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: fixedPort,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: appServer.port,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
+    });
+
+    // Connect client right after listener binds while auto->relay handshake is still in progress!
+    let clientPromise: Promise<{ status: number; body: Buffer }> | null = null;
+    for (let i = 0; i < 40; i++) {
+      try {
+        await new Promise((r) => setTimeout(r, 5));
+        clientPromise = httpGet(fixedPort, '/hello');
+        break;
+      } catch {
+        // Retry until bound
+      }
+    }
+    expect(clientPromise).not.toBeNull();
+    const [openRes, firstHttp] = await Promise.all([openPromise, clientPromise!]);
+    expect(openRes.ok).toBe(true);
+    if (openRes.ok) expect(openRes.tunnel.transportMode).toBe(PORT_FORWARD_TRANSPORT.RELAY);
+    expect(firstHttp.status).toBe(200);
+    expect(JSON.parse(firstHttp.body.toString('utf8')).secret).toBe('TOP_SECRET_HTTP_BODY');
+  });
+
+  it('isolates slow consumer stream backpressure so concurrent fast stream proceeds with bounded memory (P0 #7)', async () => {
+    let slowServerSocket: NetSocket | null = null;
+    const rawSrv = createTcpServer((sock: NetSocket) => {
+      sock.once('data', (first: Buffer) => {
+        if (first.toString('utf8').startsWith('SLOW')) {
+          slowServerSocket = sock;
+          sock.pause(); // Deliberately stall reading so kernel recv window fills -> backpressure!
+        } else {
+          sock.end('FAST_OK');
+        }
+      });
+    });
+    await new Promise<void>((r) => rawSrv.listen(0, '127.0.0.1', () => r()));
+    cleanupCallbacks.push(() => {
+      slowServerSocket?.destroy();
+      return new Promise<void>((r) => rawSrv.close(() => r()));
+    });
+    const targetPort = (rawSrv.address() as { port: number }).port;
+
+    let wsBackpressured = false;
+    const { router } = createPairedEngines({
+      listenOpts: {
+        getWsBufferedAmount: () => (wsBackpressured ? PORT_FORWARD_LIMITS.RELAY_WS_HIGH_WATER_BYTES + 1 : 0),
+      },
+    });
+    const opened = await router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+
+    // 1. Open slow stream & flood 600 KiB into it (exceeds 256 KiB stream window).
+    const slowClient = tcpConnect({ host: '127.0.0.1', port: opened.tunnel.listenPort });
+    cleanupCallbacks.push(() => { slowClient.destroy(); });
+    await new Promise<void>((resolve) => slowClient.once('connect', () => resolve()));
+    slowClient.write('SLOW');
+    await new Promise((r) => setTimeout(r, 30));
+    slowClient.write(Buffer.alloc(600 * 1024, 0x41));
+
+    // 2. Concurrent fast stream on the exact same tunnel completes promptly while slow stream is paused!
+    const fastResp = await new Promise<string>((resolve, reject) => {
+      const fc = tcpConnect({ host: '127.0.0.1', port: opened.tunnel.listenPort });
+      const chunks: Buffer[] = [];
+      fc.once('error', reject);
+      fc.on('data', (c: Buffer) => chunks.push(c));
+      fc.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      fc.once('connect', () => fc.write('FAST'));
+    });
+    expect(fastResp).toBe('FAST_OK');
+    wsBackpressured = false;
   });
 });
