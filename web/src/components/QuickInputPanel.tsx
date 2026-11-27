@@ -289,6 +289,7 @@ let _authUnsubscribe: (() => void) | null = null;
 let _saveRevision = 0;
 let _inFlightSaves = 0;
 let _baseline: QuickData | null = null;
+let _serverVersion: string | null = null;
 let _boundBinding: AuthBinding | null = null;
 const _inFlightControllers = new Set<AbortController>();
 const _pendingRemovedAllTexts = new Set<string>();
@@ -497,6 +498,7 @@ function resetInMemoryQuickDataForAuthChange(revalidateSubscribers: boolean): vo
   _mutatedBeforeHydration = false;
   _saveRevision += 1;
   _baseline = null;
+  _serverVersion = null;
   _boundBinding = captureCurrentBinding();
   _pendingRemovedAllTexts.clear();
   _preHydrationOps = [];
@@ -795,6 +797,7 @@ function buildPendingSnapshotRecord(
   target: QuickData,
   extraRemovedAll?: readonly string[],
   clientId = _clientInstanceId,
+  baselineOverride?: QuickData,
 ): PendingQuickDataSnapshot {
   const removedSet = new Set<string>(_pendingRemovedAllTexts);
   if (extraRemovedAll) {
@@ -810,10 +813,41 @@ function buildPendingSnapshotRecord(
     clientId,
     scopeKey: scope.scopeKey,
     updatedAt: Date.now(),
-    baseline: _baseline ?? EMPTY_QUICK_DATA,
+    baseline: baselineOverride ?? _baseline ?? EMPTY_QUICK_DATA,
     target,
     ...(removedSet.size > 0 ? { removedAllTexts: Array.from(removedSet) } : {}),
   };
+}
+
+function buildPutBody(data: QuickData, expectedVersion: string | null | undefined): string {
+  return expectedVersion
+    ? JSON.stringify({ data, expectedVersion })
+    : JSON.stringify({ data });
+}
+
+const MAX_CAS_CONFLICT_RETRIES = 4;
+
+async function resolveVersionConflictSnapshot(
+  err: unknown,
+  signal: AbortSignal,
+): Promise<{ data: QuickData; version: string } | null> {
+  if (!err || typeof err !== 'object') return null;
+  if ((err as { status?: unknown }).status !== 409) return null;
+  const rawBody = (err as { body?: unknown }).body;
+  if (typeof rawBody === 'string') {
+    if (rawBody.includes('auth_identity_changed') || rawBody.includes('expected_user_id_mismatch')) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(rawBody) as { data?: unknown; version?: unknown };
+      if (parsed && parsed.data && typeof parsed.version === 'string' && parsed.version) {
+        return { data: normalizeQuickData(parsed.data), version: parsed.version };
+      }
+    } catch { /* fall back to GET */ }
+  }
+  const latest = await apiFetch<{ data: QuickData; version?: string }>('/api/quick-data', { signal });
+  if (typeof latest?.version !== 'string' || !latest.version) return null;
+  return { data: normalizeQuickData(latest.data), version: latest.version };
 }
 
 function scheduleSave(data: QuickData, canPersist: boolean): void {
@@ -826,21 +860,32 @@ function scheduleSave(data: QuickData, canPersist: boolean): void {
   const rev = ++_saveRevision;
   const clientId = _clientInstanceId;
   const entryId = makePendingEntryId(clientId, rev);
+  const baselineSnapshot = _baseline ?? EMPTY_QUICK_DATA;
+  const expectedVersion = _serverVersion;
+  const removedAllTexts = Array.from(_pendingRemovedAllTexts);
   if (binding.scope) {
-    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data, undefined, clientId));
+    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data, removedAllTexts, clientId, baselineSnapshot));
   }
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
     _debounceTimer = null;
-    runSave(data, { revision: rev, entryId, clientId, binding });
+    runSave(data, {
+      revision: rev,
+      entryId,
+      clientId,
+      binding,
+      baselineSnapshot,
+      expectedVersion,
+      removedAllTexts,
+    });
   }, 2000);
 }
 
 /**
- * Fire a PUT for the supplied snapshot. Carries the binding's AbortSignal and
- * verifies binding + cross-tab unique entryId before mutating state or clearing
- * localStorage slots, so concurrent tabs and late retries never wipe newer or
- * cross-account work.
+ * Fire a PUT for the supplied snapshot. Enforces optimistic CAS (`expectedVersion`)
+ * when supported by the server: on 409 conflict, fetches/reads the latest server
+ * snapshot, rebases this operation's 3-way delta onto it, updates local backup &
+ * UI safely, and retries without overwriting newer out-of-order commits.
  */
 function runSave(
   data: QuickData,
@@ -850,6 +895,9 @@ function runSave(
     entryId: string;
     clientId: string;
     binding: AuthBinding;
+    baselineSnapshot: QuickData;
+    expectedVersion: string | null;
+    removedAllTexts: readonly string[];
     consolidatedSlots?: readonly PendingQuickDataSlot[];
   },
 ): void {
@@ -861,37 +909,124 @@ function runSave(
   const snapCommandAdds = new Set(_pendingCommandAdds);
   const snapRemovedAll = new Set(_pendingRemovedAllTexts);
   const ctrl = opts.binding.controller;
-  const init: RequestInit = { method: 'PUT', body: JSON.stringify({ data }), signal: ctrl.signal };
-  if (opts.keepalive) init.keepalive = true;
   _inFlightControllers.add(ctrl);
   _inFlightSaves += 1;
-  apiFetch('/api/quick-data', init)
-    .then(() => {
-      if (!isBindingCurrent(opts.binding)) return;
-      for (const p of snapPhraseAdds) _pendingPhraseAdds.delete(p);
-      for (const c of snapCommandAdds) _pendingCommandAdds.delete(c);
-      for (const r of snapRemovedAll) _pendingRemovedAllTexts.delete(r);
-      _baseline = data;
-      if (opts.binding.scope) {
-        const ownKey = getQuickDataPendingStorageKey(opts.binding.scope, opts.clientId);
-        if (ownKey) {
-          clearPendingSlotIfEntryId(ownKey, opts.binding.scope.scopeKey, opts.entryId);
-        }
-        if (opts.consolidatedSlots) {
-          for (const slot of opts.consolidatedSlots) {
-            clearPendingSlotIfEntryId(slot.storageKey, opts.binding.scope.scopeKey, slot.entryId);
+
+  void (async () => {
+    let currTarget = data;
+    let currBaseline = opts.baselineSnapshot;
+    let currExpectedVersion = opts.expectedVersion;
+    const currRemovedAll = opts.removedAllTexts;
+
+    try {
+      for (let attempt = 0; attempt <= MAX_CAS_CONFLICT_RETRIES; attempt += 1) {
+        if (!isBindingCurrent(opts.binding)) return;
+        const init: RequestInit = {
+          method: 'PUT',
+          body: buildPutBody(currTarget, currExpectedVersion),
+          signal: ctrl.signal,
+        };
+        if (opts.keepalive && attempt === 0) init.keepalive = true;
+
+        try {
+          const putRes = await apiFetch<{ ok?: boolean; version?: string } | undefined>('/api/quick-data', init);
+          if (!isBindingCurrent(opts.binding)) return;
+          for (const p of snapPhraseAdds) _pendingPhraseAdds.delete(p);
+          for (const c of snapCommandAdds) _pendingCommandAdds.delete(c);
+          for (const r of snapRemovedAll) _pendingRemovedAllTexts.delete(r);
+          _baseline = currTarget;
+          if (typeof putRes?.version === 'string' && putRes.version) {
+            _serverVersion = putRes.version;
           }
+          if (attempt > 0 && _saveRevision === opts.revision) {
+            quickDataResource.mutate(currTarget);
+          }
+          if (opts.binding.scope) {
+            const ownKey = getQuickDataPendingStorageKey(opts.binding.scope, opts.clientId);
+            if (ownKey) {
+              clearPendingSlotIfEntryId(ownKey, opts.binding.scope.scopeKey, opts.entryId);
+            }
+            if (opts.consolidatedSlots) {
+              for (const slot of opts.consolidatedSlots) {
+                clearPendingSlotIfEntryId(slot.storageKey, opts.binding.scope.scopeKey, slot.entryId);
+              }
+            }
+          }
+          return;
+        } catch (err) {
+          if (ctrl.signal.aborted || !isBindingCurrent(opts.binding)) return;
+          let conflict: { data: QuickData; version: string } | null = null;
+          try {
+            conflict = await resolveVersionConflictSnapshot(err, ctrl.signal);
+          } catch {
+            return;
+          }
+          if (!conflict) {
+            console.error('[quick-data] save failed:', err);
+            return;
+          }
+          if (ctrl.signal.aborted || !isBindingCurrent(opts.binding)) return;
+
+          _baseline = conflict.data;
+          _serverVersion = conflict.version;
+
+          if (_saveRevision !== opts.revision) {
+            // A newer local edit already superseded this save in this tab; rebase
+            // the live target onto latest server state and let the newer save commit.
+            const liveLocal = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
+            const liveRebased = mergeQuickDataThreeWay(
+              currBaseline,
+              liveLocal,
+              conflict.data,
+              Array.from(_pendingRemovedAllTexts),
+            );
+            quickDataResource.mutate(liveRebased);
+            if (opts.binding.scope) {
+              writePendingSnapshot(
+                opts.binding.scope,
+                buildPendingSnapshotRecord(
+                  opts.binding.scope,
+                  _saveRevision,
+                  liveRebased,
+                  Array.from(_pendingRemovedAllTexts),
+                  opts.clientId,
+                  conflict.data,
+                ),
+              );
+            }
+            return;
+          }
+
+          if (attempt >= MAX_CAS_CONFLICT_RETRIES) {
+            console.error('[quick-data] save conflict retry budget exhausted');
+            return;
+          }
+
+          const rebasedTarget = mergeQuickDataThreeWay(currBaseline, currTarget, conflict.data, currRemovedAll);
+          quickDataResource.mutate(rebasedTarget);
+          if (opts.binding.scope) {
+            writePendingSnapshot(
+              opts.binding.scope,
+              buildPendingSnapshotRecord(
+                opts.binding.scope,
+                opts.revision,
+                rebasedTarget,
+                currRemovedAll,
+                opts.clientId,
+                conflict.data,
+              ),
+            );
+          }
+          currBaseline = conflict.data;
+          currTarget = rebasedTarget;
+          currExpectedVersion = conflict.version;
         }
       }
-    })
-    .catch((err) => {
-      if (ctrl.signal.aborted) return;
-      console.error('[quick-data] save failed:', err);
-    })
-    .finally(() => {
+    } finally {
       _inFlightControllers.delete(ctrl);
       _inFlightSaves = Math.max(0, _inFlightSaves - 1);
-    });
+    }
+  })();
 }
 
 /**
@@ -911,15 +1046,35 @@ function flushPendingSave(): void {
   const rev = _saveRevision;
   const clientId = _clientInstanceId;
   const entryId = makePendingEntryId(clientId, rev);
+  const baselineSnapshot = _baseline ?? EMPTY_QUICK_DATA;
+  const expectedVersion = _serverVersion;
+  const removedAllTexts = Array.from(_pendingRemovedAllTexts);
   const data = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
   if (binding.scope) {
-    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data, undefined, clientId));
+    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data, removedAllTexts, clientId, baselineSnapshot));
   }
-  const body = JSON.stringify({ data });
+  const body = buildPutBody(data, expectedVersion);
   if (utf8ByteLength(body) <= KEEPALIVE_SAFE_BODY_BYTES) {
-    runSave(data, { keepalive: true, revision: rev, entryId, clientId, binding });
+    runSave(data, {
+      keepalive: true,
+      revision: rev,
+      entryId,
+      clientId,
+      binding,
+      baselineSnapshot,
+      expectedVersion,
+      removedAllTexts,
+    });
   } else {
-    runSave(data, { revision: rev, entryId, clientId, binding });
+    runSave(data, {
+      revision: rev,
+      entryId,
+      clientId,
+      binding,
+      baselineSnapshot,
+      expectedVersion,
+      removedAllTexts,
+    });
   }
 }
 
@@ -957,15 +1112,17 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
     const ctrl = fetchBinding.controller;
     _inFlightControllers.add(ctrl);
     try {
-      const res = await apiFetch<{ data: QuickData }>('/api/quick-data', { signal: ctrl.signal });
+      const res = await apiFetch<{ data: QuickData; version?: string }>('/api/quick-data', { signal: ctrl.signal });
       if (!isBindingCurrent(fetchBinding)) {
         abortBindingAndInFlightRequests(fetchBinding);
         return normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
       }
       const server = normalizeQuickData(res.data);
+      const serverVersion = typeof res.version === 'string' && res.version ? res.version : null;
       const hadPriorHydration = _hasHydratedFromServer;
       _hasHydratedFromServer = true;
       _boundBinding = fetchBinding;
+      _serverVersion = serverVersion;
       const shouldReplayPending = _debounceTimer === null && _inFlightSaves === 0;
       const pendingSlots = shouldReplayPending ? readPendingSnapshots(fetchBinding.scope) : [];
       if (_mutatedBeforeHydration || pendingSlots.length > 0) {
@@ -992,13 +1149,16 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
           const entryId = makePendingEntryId(clientId, rev);
           writePendingSnapshot(
             fetchBinding.scope,
-            buildPendingSnapshotRecord(fetchBinding.scope, rev, merged, consolidated.removedAllTexts, clientId),
+            buildPendingSnapshotRecord(fetchBinding.scope, rev, merged, consolidated.removedAllTexts, clientId, server),
           );
           runSave(merged, {
             revision: rev,
             entryId,
             clientId,
             binding: fetchBinding,
+            baselineSnapshot: server,
+            expectedVersion: serverVersion,
+            removedAllTexts: consolidated.removedAllTexts,
             consolidatedSlots: pendingSlots,
           });
         }
@@ -1208,6 +1368,7 @@ export function __simulateReloadForTests(opts?: { clientId?: string }): void {
   _saveRevision = 0;
   _inFlightSaves = 0;
   _baseline = null;
+  _serverVersion = null;
   _boundBinding = null;
   _pendingRemovedAllTexts.clear();
   _preHydrationOps = [];

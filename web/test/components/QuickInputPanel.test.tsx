@@ -1774,4 +1774,137 @@ describe('useQuickData persistence guard', () => {
     await waitFor(() => expect(screen.getByTestId('hist').textContent).toBe('tab-2,tab-1'));
     await waitFor(() => expect(listPendingKeysForScope(scopeKey)).toEqual([]));
   });
+
+  it('prevents delayed stale-version PUT B from overwriting committed [B, A] replay and preserves both entries and timestamps after 409 rebase', async () => {
+    setMockAuthIdentity('user-1', 'https://host.test/app');
+    let quick!: ReturnType<typeof useQuickData>;
+    function CasHarness() {
+      quick = useQuickData();
+      return <div data-testid="hist">{quick.data.history.join(',')}</div>;
+    }
+
+    // Simulated atomic CAS server store: rejects stale expectedVersion with 409 + { error, data, version }.
+    const emptyData: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
+    let serverSnapshot: QuickData = emptyData;
+    let serverVersion = 'v1:0';
+    let nextVer = 1;
+    let suspendNextPutResolve: ((res: unknown) => void) | null = null;
+
+    const installCasMock = (options?: { suspendPut?: boolean }) => {
+      apiFetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url === '/api/quick-data' && (!init?.method || init.method === 'GET')) {
+          return { data: serverSnapshot, version: serverVersion };
+        }
+        if (url === '/api/quick-data' && init?.method === 'PUT') {
+          const parsedBody = JSON.parse(String(init.body)) as { data: QuickData; expectedVersion?: string };
+          const commit = () => {
+            if (parsedBody.expectedVersion && parsedBody.expectedVersion !== serverVersion) {
+              const err = new Error('API 409: version_conflict') as Error & { status: number; body: string };
+              err.status = 409;
+              err.body = JSON.stringify({ error: 'version_conflict', data: serverSnapshot, version: serverVersion });
+              throw err;
+            }
+            serverSnapshot = parsedBody.data;
+            serverVersion = `v1:${++nextVer}`;
+            return { ok: true, version: serverVersion };
+          };
+          if (options?.suspendPut) {
+            options.suspendPut = false;
+            return await new Promise((resolve, reject) => {
+              suspendNextPutResolve = () => {
+                try {
+                  resolve(commit());
+                } catch (e) {
+                  reject(e);
+                }
+              };
+            });
+          }
+          return commit();
+        }
+        return { ok: true };
+      });
+    };
+
+    // Tab A adds A -> offline -> slot stays in localStorage.
+    __simulateReloadForTests({ clientId: 'tab-a' });
+    apiFetchMock
+      .mockResolvedValueOnce({ data: serverSnapshot, version: serverVersion })
+      .mockRejectedValueOnce(new Error('offline'));
+    const viewA = render(<CasHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+    vi.setSystemTime(1000);
+    act(() => { quick.recordHistory('A', 's1'); });
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+    viewA.unmount();
+
+    // Inject Tab B's pending slot alongside Tab A's slot as if Tab B also started from v1:0,
+    // fired PUT(expectedVersion='v1:0', data=[B]) which is suspended mid-flight!
+    const scopeKey = 'https://host.test/app|user-1';
+    localStorage.setItem(`imcodes.quick_data.pending:${encodeURIComponent(scopeKey)}:tab-b`, JSON.stringify({
+      v: 3,
+      entryId: 'tab-b:1',
+      clientId: 'tab-b',
+      scopeKey,
+      updatedAt: 2000,
+      baseline: emptyData,
+      target: {
+        history: ['B'],
+        sessionHistory: { s1: ['B'] },
+        historyTimestamps: { B: 2000 },
+        sessionHistoryTimestamps: { s1: { B: 2000 } },
+        commands: [],
+        phrases: [],
+      },
+    }));
+
+    // Tab C opens, consolidates [B, A], sends PUT expectedVersion='v1:0' -> commits [B, A] at 'v1:2', clears BOTH slots!
+    __simulateReloadForTests({ clientId: 'tab-c' });
+    installCasMock();
+    const viewC = render(<CasHarness />);
+    await waitFor(() => expect(screen.getByTestId('hist').textContent).toBe('B,A'));
+    await waitFor(() => expect(listPendingKeysForScope(scopeKey)).toEqual([]));
+    expect(serverSnapshot.history).toEqual(['B', 'A']);
+    expect(serverSnapshot.historyTimestamps).toEqual({ B: 2000, A: 1000 });
+    expect(serverVersion).toBe('v1:2');
+    viewC.unmount();
+
+    // Now test the exact delayed-B PUT scenario: suppose a client holding stale expectedVersion='v1:0' and only ['B']
+    // finally delivers its delayed PUT after [B, A] already landed at 'v1:2':
+    __simulateReloadForTests({ clientId: 'tab-b-delayed' });
+    apiFetchMock.mockReset();
+    apiFetchMock.mockResolvedValueOnce({ data: emptyData, version: 'v1:0' });
+    const delayedView = render(<CasHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    vi.setSystemTime(2000);
+    act(() => { quick.recordHistory('B', 's1'); });
+    installCasMock({ suspendPut: true });
+    vi.advanceTimersByTime(2000); // fires Tab B's PUT with expectedVersion='v1:0' -> suspended before server commit!
+    await waitFor(() => expect(typeof suspendNextPutResolve).toBe('function'));
+
+    // While Tab B's PUT is suspended, server already advanced to [B, A] at v1:2 (from Tab C replay).
+    // Now Tab B's stale PUT finally reaches server: gets 409 conflict, rebases onto [B, A], retries at v1:2 -> succeeds keeping BOTH B and A!
+    await act(async () => {
+      suspendNextPutResolve?.(undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(serverSnapshot.history).toEqual(['B', 'A']));
+    expect(serverSnapshot.historyTimestamps).toEqual({ B: 2000, A: 1000 });
+    expect(serverSnapshot.sessionHistory.s1).toEqual(['B', 'A']);
+    expect(serverSnapshot.sessionHistoryTimestamps?.s1).toEqual({ B: 2000, A: 1000 });
+    delayedView.unmount();
+
+    // Tab D reopens from clean server -> still sees both B and A with original timestamps!
+    __resetQuickDataForTests();
+    apiFetchMock.mockReset();
+    installCasMock();
+    render(<CasHarness />);
+    await waitFor(() => expect(screen.getByTestId('hist').textContent).toBe('B,A'));
+    expect(quick.data.historyTimestamps).toEqual({ B: 2000, A: 1000 });
+    expect(quick.data.sessionHistoryTimestamps?.s1).toEqual({ B: 2000, A: 1000 });
+  });
 });

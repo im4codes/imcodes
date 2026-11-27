@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { parseSyncedPreference } from '../../../shared/synced-preference.js';
 import { USER_STATUS, type UserStatus } from '../../../shared/user-status.js';
 import type { Database } from './client.js';
@@ -1425,15 +1426,44 @@ export async function replaceSessionTextTailCache(
 // ── Quick data ────────────────────────────────────────────────────────────
 
 const EMPTY_QUICK_DATA: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
+export const QUICK_DATA_ABSENT_VERSION = 'v1:absent';
 
-export async function getQuickData(db: Database, userId: string): Promise<QuickData> {
-  const row = await db.queryOne<{ data: string }>('SELECT data FROM user_quick_data WHERE user_id = $1', [userId]);
-  if (!row) return { ...EMPTY_QUICK_DATA };
+export interface QuickDataSnapshotRecord {
+  data: QuickData;
+  version: string;
+}
+
+export function computeQuickDataVersion(rawData: string, updatedAt: number): string {
+  const digest = createHash('sha256').update(`${updatedAt}:${rawData}`).digest('hex').slice(0, 24);
+  return `v1:${digest}`;
+}
+
+function parseQuickDataRow(rawData: string): QuickData {
   try {
-    return JSON.parse(row.data) as QuickData;
+    return JSON.parse(rawData) as QuickData;
   } catch {
     return { ...EMPTY_QUICK_DATA };
   }
+}
+
+export async function getQuickDataSnapshot(db: Database, userId: string): Promise<QuickDataSnapshotRecord> {
+  const row = await db.queryOne<{ data: string; updated_at: number }>(
+    'SELECT data, updated_at FROM user_quick_data WHERE user_id = $1',
+    [userId],
+  );
+  if (!row) {
+    return { data: { ...EMPTY_QUICK_DATA }, version: QUICK_DATA_ABSENT_VERSION };
+  }
+  const updatedAt = Number(row.updated_at ?? 0);
+  return {
+    data: parseQuickDataRow(row.data),
+    version: computeQuickDataVersion(row.data, updatedAt),
+  };
+}
+
+export async function getQuickData(db: Database, userId: string): Promise<QuickData> {
+  const snapshot = await getQuickDataSnapshot(db, userId);
+  return snapshot.data;
 }
 
 export async function upsertQuickData(db: Database, userId: string, data: QuickData): Promise<void> {
@@ -1441,6 +1471,69 @@ export async function upsertQuickData(db: Database, userId: string, data: QuickD
     'INSERT INTO user_quick_data (user_id, data, updated_at) VALUES ($1, $2, $3) ON CONFLICT(user_id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at',
     [userId, JSON.stringify(data), Date.now()],
   );
+}
+
+export async function upsertQuickDataConditional(
+  db: Database,
+  userId: string,
+  data: QuickData,
+  expectedVersion: string,
+): Promise<{ ok: true; data: QuickData; version: string } | { ok: false; current: QuickDataSnapshotRecord }> {
+  return db.transaction(async (tx) => {
+    const currentRow = await tx.queryOne<{ data: string; updated_at: number }>(
+      'SELECT data, updated_at FROM user_quick_data WHERE user_id = $1',
+      [userId],
+    );
+    const nextRaw = JSON.stringify(data);
+    if (!currentRow) {
+      if (expectedVersion !== QUICK_DATA_ABSENT_VERSION) {
+        return { ok: false, current: { data: { ...EMPTY_QUICK_DATA }, version: QUICK_DATA_ABSENT_VERSION } };
+      }
+      const nextUpdatedAt = Date.now();
+      const insertRes = await tx.execute(
+        `INSERT INTO user_quick_data (user_id, data, updated_at)
+         VALUES ($1, $2, $3)
+         ON CONFLICT(user_id) DO NOTHING`,
+        [userId, nextRaw, nextUpdatedAt],
+      );
+      if ((insertRes.changes ?? 0) === 0) {
+        return { ok: false, current: await getQuickDataSnapshot(tx, userId) };
+      }
+      return {
+        ok: true,
+        data,
+        version: computeQuickDataVersion(nextRaw, nextUpdatedAt),
+      };
+    }
+
+    const currentUpdatedAt = Number(currentRow.updated_at ?? 0);
+    const currentVersion = computeQuickDataVersion(currentRow.data, currentUpdatedAt);
+    if (currentVersion !== expectedVersion) {
+      return {
+        ok: false,
+        current: {
+          data: parseQuickDataRow(currentRow.data),
+          version: currentVersion,
+        },
+      };
+    }
+
+    const nextUpdatedAt = Math.max(Date.now(), currentUpdatedAt + 1);
+    const updateRes = await tx.execute(
+      `UPDATE user_quick_data
+          SET data = $1, updated_at = $2
+        WHERE user_id = $3 AND updated_at = $4 AND data = $5`,
+      [nextRaw, nextUpdatedAt, userId, currentRow.updated_at, currentRow.data],
+    );
+    if ((updateRes.changes ?? 0) === 0) {
+      return { ok: false, current: await getQuickDataSnapshot(tx, userId) };
+    }
+    return {
+      ok: true,
+      data,
+      version: computeQuickDataVersion(nextRaw, nextUpdatedAt),
+    };
+  });
 }
 
 // ── Sub-sessions ──────────────────────────────────────────────────────────

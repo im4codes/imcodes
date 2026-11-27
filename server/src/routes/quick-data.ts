@@ -2,7 +2,11 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../env.js';
 import { requireAuth } from '../security/authorization.js';
-import { getQuickData, upsertQuickData } from '../db/queries.js';
+import {
+  getQuickDataSnapshot,
+  upsertQuickData,
+  upsertQuickDataConditional,
+} from '../db/queries.js';
 
 export const quickDataRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -116,14 +120,14 @@ function pruneSessionHistoryTimestamps(
   return pruned.size > 0 ? Object.fromEntries(pruned) : undefined;
 }
 
-/** GET /api/quick-data — load user's quick data */
+/** GET /api/quick-data — load user's quick data and CAS version token */
 quickDataRoutes.get('/', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const data = await getQuickData(c.env.DB, userId);
-  return c.json({ data });
+  const snapshot = await getQuickDataSnapshot(c.env.DB, userId);
+  return c.json({ data: snapshot.data, version: snapshot.version });
 });
 
-/** PUT /api/quick-data — replace the user's quick data snapshot */
+/** PUT /api/quick-data — replace the user's quick data snapshot (with optional CAS version check) */
 quickDataRoutes.put('/', async (c) => {
   const userId = c.get('userId' as never) as string;
 
@@ -134,7 +138,20 @@ quickDataRoutes.put('/', async (c) => {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
-  const parsed = quickDataSchema.safeParse((body as Record<string, unknown>)?.data ?? body);
+  let dataCandidate: unknown = body;
+  let expectedVersion: string | undefined;
+  if (isPlainRecord(body) && 'data' in body) {
+    dataCandidate = body.data;
+    if (body.expectedVersion !== undefined) {
+      const ver = z.string().min(1).max(128).safeParse(body.expectedVersion);
+      if (!ver.success) {
+        return c.json({ error: 'invalid_data', detail: ver.error.flatten() }, 400);
+      }
+      expectedVersion = ver.data;
+    }
+  }
+
+  const parsed = quickDataSchema.safeParse(dataCandidate);
   if (!parsed.success) {
     return c.json({ error: 'invalid_data', detail: parsed.error.flatten() }, 400);
   }
@@ -153,6 +170,17 @@ quickDataRoutes.put('/', async (c) => {
     commands: parsed.data.commands,
     phrases: parsed.data.phrases,
   };
+
+  if (expectedVersion !== undefined) {
+    const result = await upsertQuickDataConditional(c.env.DB, userId, next, expectedVersion);
+    if (!result.ok) {
+      return c.json(
+        { error: 'version_conflict', data: result.current.data, version: result.current.version },
+        409,
+      );
+    }
+    return c.json({ ok: true, version: result.version });
+  }
 
   await upsertQuickData(c.env.DB, userId, next);
   return c.json({ ok: true });

@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Hono } from 'hono';
 
-const getQuickDataMock = vi.fn();
+const getQuickDataSnapshotMock = vi.fn();
 const upsertQuickDataMock = vi.fn();
+const upsertQuickDataConditionalMock = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: any, next: any) => {
@@ -12,8 +13,10 @@ vi.mock('../src/security/authorization.js', () => ({
 }));
 
 vi.mock('../src/db/queries.js', () => ({
-  getQuickData: (...args: unknown[]) => getQuickDataMock(...args),
+  getQuickDataSnapshot: (...args: unknown[]) => getQuickDataSnapshotMock(...args),
+  getQuickData: async (...args: unknown[]) => (await getQuickDataSnapshotMock(...args)).data,
   upsertQuickData: (...args: unknown[]) => upsertQuickDataMock(...args),
+  upsertQuickDataConditional: (...args: unknown[]) => upsertQuickDataConditionalMock(...args),
 }));
 
 import { quickDataRoutes } from '../src/routes/quick-data.js';
@@ -28,11 +31,14 @@ app.route('/api/quick-data', quickDataRoutes);
 describe('quick-data routes', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    getQuickDataMock.mockResolvedValue({
-      history: ['keep history'],
-      sessionHistory: { 'deck_a': ['keep session'] },
-      commands: ['/status'],
-      phrases: ['old phrase', 'keep phrase'],
+    getQuickDataSnapshotMock.mockResolvedValue({
+      data: {
+        history: ['keep history'],
+        sessionHistory: { 'deck_a': ['keep session'] },
+        commands: ['/status'],
+        phrases: ['old phrase', 'keep phrase'],
+      },
+      version: 'v1:initial',
     });
   });
 
@@ -200,11 +206,59 @@ describe('quick-data routes', () => {
     expect(Object.hasOwn(saved.sessionHistoryTimestamps.audit, '__proto__')).toBe(true);
     expect(saved.sessionHistoryTimestamps.audit['__proto__']).toBe(2345);
 
-    getQuickDataMock.mockResolvedValueOnce(saved);
+    getQuickDataSnapshotMock.mockResolvedValueOnce({ data: saved, version: 'v1:proto' });
     const getRes = await app.request('/api/quick-data');
     expect(getRes.status).toBe(200);
     const getJsonText = await getRes.text();
     expect(getJsonText).toContain('"__proto__":1234');
     expect(getJsonText).toContain('"__proto__":2345');
+  });
+
+  it('returns version token on GET and enforces CAS version on PUT (200 on match, 409 with latest data/version on stale)', async () => {
+    const getRes = await app.request('/api/quick-data');
+    expect(getRes.status).toBe(200);
+    expect(await getRes.json()).toMatchObject({ version: 'v1:initial' });
+
+    const updatedData = {
+      history: ['B', 'A'],
+      sessionHistory: { s1: ['B', 'A'] },
+      historyTimestamps: { B: 2000, A: 1000 },
+      sessionHistoryTimestamps: { s1: { B: 2000, A: 1000 } },
+      commands: [],
+      phrases: [],
+    };
+    upsertQuickDataConditionalMock.mockResolvedValueOnce({
+      ok: true,
+      data: updatedData,
+      version: 'v1:after-ba',
+    });
+
+    const casOk = await app.request('/api/quick-data', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: updatedData, expectedVersion: 'v1:initial' }),
+    });
+    expect(casOk.status).toBe(200);
+    expect(await casOk.json()).toEqual({ ok: true, version: 'v1:after-ba' });
+    expect(upsertQuickDataConditionalMock).toHaveBeenCalledWith({}, 'test-user', updatedData, 'v1:initial');
+
+    upsertQuickDataConditionalMock.mockResolvedValueOnce({
+      ok: false,
+      current: { data: updatedData, version: 'v1:after-ba' },
+    });
+    const stalePut = await app.request('/api/quick-data', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        data: { history: ['B'], sessionHistory: { s1: ['B'] }, commands: [], phrases: [] },
+        expectedVersion: 'v1:initial',
+      }),
+    });
+    expect(stalePut.status).toBe(409);
+    expect(await stalePut.json()).toEqual({
+      error: 'version_conflict',
+      data: updatedData,
+      version: 'v1:after-ba',
+    });
   });
 });

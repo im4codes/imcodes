@@ -481,4 +481,52 @@ describe('db queries contracts', () => {
     expect(upsertParams?.[4]).toBe(queries.SESSION_TEXT_TAIL_CACHE_LIMIT);
     expect(upsertParams?.[5]).toBe(queries.SESSION_TEXT_TAIL_TEXT_MAX_CHARS);
   });
+
+  it('rejects stale conditional quick-data snapshots atomically so delayed puts cannot overwrite committed [B, A] replay', async () => {
+    let row: { data: string; updated_at: number } | null = {
+      data: JSON.stringify({ history: [], sessionHistory: {}, commands: [], phrases: [] }),
+      updated_at: 1000,
+    };
+    const db = {
+      execute: vi.fn(async (sql: string, params: unknown[]) => {
+        if (sql.includes('UPDATE user_quick_data') && row && row.updated_at === params[3] && row.data === params[4]) {
+          row = { data: params[0] as string, updated_at: params[1] as number };
+          return { changes: 1 };
+        }
+        return { changes: 0 };
+      }),
+      queryOne: vi.fn(async () => row),
+      transaction: vi.fn(async (fn: (tx: any) => Promise<unknown>) => fn(db)),
+    } as any;
+
+    const initial = await queries.getQuickDataSnapshot(db, 'user-1');
+    const replayed = {
+      history: ['B', 'A'],
+      sessionHistory: { s1: ['B', 'A'] },
+      historyTimestamps: { B: 2000, A: 1000 },
+      sessionHistoryTimestamps: { s1: { B: 2000, A: 1000 } },
+      commands: [],
+      phrases: [],
+    };
+    const replayRes = await queries.upsertQuickDataConditional(db, 'user-1', replayed, initial.version);
+    expect(replayRes.ok).toBe(true);
+
+    const staleTabB = {
+      history: ['B'],
+      sessionHistory: { s1: ['B'] },
+      historyTimestamps: { B: 2000 },
+      sessionHistoryTimestamps: { s1: { B: 2000 } },
+      commands: [],
+      phrases: [],
+    };
+    const delayedRes = await queries.upsertQuickDataConditional(db, 'user-1', staleTabB, initial.version);
+    expect(delayedRes).toEqual({
+      ok: false,
+      current: {
+        data: replayed,
+        version: (replayRes as { ok: true; version: string }).version,
+      },
+    });
+    expect(await queries.getQuickData(db, 'user-1')).toEqual(replayed);
+  });
 });
