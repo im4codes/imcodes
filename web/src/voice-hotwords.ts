@@ -61,6 +61,9 @@ export interface VoiceHotwordsSyncClient {
 interface PendingWriteRecord {
   id: string;
   editGen: number;
+  baseUpdatedAt?: number;
+  raw?: string;
+  enabled?: boolean;
 }
 
 interface AccountSyncQueueState {
@@ -158,10 +161,19 @@ function coercePendingWriteRecord(input: unknown): PendingWriteRecord | null {
   const obj = candidate as Record<string, unknown>;
   const id = typeof obj.id === 'string' ? obj.id.trim() : '';
   const editGen = coerceNum(obj.editGen);
-  if (id && id.length <= 64 && editGen > 0) {
-    return { id, editGen };
-  }
-  return null;
+  if (!id || id.length > 64 || editGen <= 0) return null;
+  const baseUpdatedAt = typeof obj.baseUpdatedAt === 'number' && Number.isFinite(obj.baseUpdatedAt) && obj.baseUpdatedAt >= 0
+    ? Math.floor(obj.baseUpdatedAt)
+    : undefined;
+  const raw = typeof obj.raw === 'string' ? obj.raw : undefined;
+  const enabled = typeof obj.enabled === 'boolean' ? obj.enabled : undefined;
+  return {
+    id,
+    editGen,
+    ...(baseUpdatedAt !== undefined ? { baseUpdatedAt } : {}),
+    ...(raw !== undefined ? { raw } : {}),
+    ...(enabled !== undefined ? { enabled } : {}),
+  };
 }
 
 function coercePendingWriteMap(input: unknown): Record<string, PendingWriteRecord> {
@@ -638,9 +650,9 @@ export function setShareHotwordsWithOthers(enabled: boolean): void {
 }
 
 type PendingScopePush =
-  | { kind: 'user'; editGen: number; baseUpdatedAt: number; sentRaw: string; payload: VoiceHotwordsPutRequest }
-  | { kind: 'project'; projectKey: string; editGen: number; baseUpdatedAt: number; sentRaw: string; payload: VoiceHotwordsPutRequest }
-  | { kind: 'share'; editGen: number; baseUpdatedAt: number; sentEnabled: boolean; payload: VoiceHotwordsPutRequest };
+  | { kind: 'user'; editGen: number; baseUpdatedAt: number; sentRaw: string; isPendingReplay?: boolean; payload: VoiceHotwordsPutRequest }
+  | { kind: 'project'; projectKey: string; editGen: number; baseUpdatedAt: number; sentRaw: string; isPendingReplay?: boolean; payload: VoiceHotwordsPutRequest }
+  | { kind: 'share'; editGen: number; baseUpdatedAt: number; sentEnabled: boolean; isPendingReplay?: boolean; payload: VoiceHotwordsPutRequest };
 
 function collectDirtyScopePushes(accountKey: string, meta: LocalVoiceHotwordsSyncMeta): PendingScopePush[] {
   const out: PendingScopePush[] = [];
@@ -652,20 +664,46 @@ function collectDirtyScopePushes(accountKey: string, meta: LocalVoiceHotwordsSyn
     meta.userEditGen > meta.userConfirmedGen
     && meta.userRejectedEditGen !== meta.userEditGen
     && !meta.userCapacityBlocked
-    && localGlobal.length <= VOICE_HOTWORDS_MAX_RAW_CHARS
   ) {
-    out.push({
-      kind: 'user',
-      editGen: meta.userEditGen,
-      baseUpdatedAt: meta.userBaseServerUpdatedAt,
-      sentRaw: localGlobal,
-      payload: {
-        scope: 'user',
-        raw: localGlobal,
-        mode: 'replace',
-        baseUpdatedAt: meta.userBaseServerUpdatedAt,
-      },
-    });
+    const pending = meta.userPendingWrite;
+    if (
+      pending
+      && pending.editGen > meta.userConfirmedGen
+      && pending.editGen < meta.userEditGen
+      && typeof pending.raw === 'string'
+      && pending.raw.length <= VOICE_HOTWORDS_MAX_RAW_CHARS
+    ) {
+      const replayBase = pending.baseUpdatedAt ?? meta.userBaseServerUpdatedAt;
+      out.push({
+        kind: 'user',
+        editGen: pending.editGen,
+        baseUpdatedAt: replayBase,
+        sentRaw: pending.raw,
+        isPendingReplay: true,
+        payload: {
+          scope: 'user',
+          raw: pending.raw,
+          mode: 'replace',
+          baseUpdatedAt: replayBase,
+        },
+      });
+    } else if (localGlobal.length <= VOICE_HOTWORDS_MAX_RAW_CHARS) {
+      const baseUpdatedAt = pending?.editGen === meta.userEditGen && pending.baseUpdatedAt !== undefined
+        ? pending.baseUpdatedAt
+        : meta.userBaseServerUpdatedAt;
+      out.push({
+        kind: 'user',
+        editGen: meta.userEditGen,
+        baseUpdatedAt,
+        sentRaw: localGlobal,
+        payload: {
+          scope: 'user',
+          raw: localGlobal,
+          mode: 'replace',
+          baseUpdatedAt,
+        },
+      });
+    }
   }
 
   for (const key of Object.keys(meta.projEditGen)) {
@@ -674,9 +712,38 @@ function collectDirtyScopePushes(accountKey: string, meta: LocalVoiceHotwordsSyn
     if (editGen <= confirmedGen) continue;
     if (getOwnDictValue(meta.projRejectedEditGen, key) === editGen) continue;
     if (getOwnDictValue(meta.projCapacityBlocked, key) === true) continue;
+    const pending = getOwnDictValue(meta.projPendingWrite, key);
+    const metaBase = getOwnDictValue(meta.projBaseServerUpdatedAt, key) ?? 0;
+    if (
+      pending
+      && pending.editGen > confirmedGen
+      && pending.editGen < editGen
+      && typeof pending.raw === 'string'
+      && pending.raw.length <= VOICE_HOTWORDS_MAX_RAW_CHARS
+    ) {
+      const replayBase = pending.baseUpdatedAt ?? metaBase;
+      out.push({
+        kind: 'project',
+        projectKey: key,
+        editGen: pending.editGen,
+        baseUpdatedAt: replayBase,
+        sentRaw: pending.raw,
+        isPendingReplay: true,
+        payload: {
+          scope: 'project',
+          projectKey: key,
+          raw: pending.raw,
+          mode: 'replace',
+          baseUpdatedAt: replayBase,
+        },
+      });
+      continue;
+    }
     const raw = getOwnDictValue(localProjects, key) ?? '';
     if (raw.length > VOICE_HOTWORDS_MAX_RAW_CHARS) continue;
-    const baseUpdatedAt = getOwnDictValue(meta.projBaseServerUpdatedAt, key) ?? 0;
+    const baseUpdatedAt = pending?.editGen === editGen && pending.baseUpdatedAt !== undefined
+      ? pending.baseUpdatedAt
+      : metaBase;
     out.push({
       kind: 'project',
       projectKey: key,
@@ -694,17 +761,42 @@ function collectDirtyScopePushes(accountKey: string, meta: LocalVoiceHotwordsSyn
   }
 
   if (meta.shareEditGen > meta.shareConfirmedGen && !meta.shareCapacityBlocked) {
-    out.push({
-      kind: 'share',
-      editGen: meta.shareEditGen,
-      baseUpdatedAt: meta.shareBaseServerUpdatedAt,
-      sentEnabled: localShare,
-      payload: {
-        scope: 'share',
-        enabled: localShare,
-        baseUpdatedAt: meta.shareBaseServerUpdatedAt,
-      },
-    });
+    const pending = meta.sharePendingWrite;
+    if (
+      pending
+      && pending.editGen > meta.shareConfirmedGen
+      && pending.editGen < meta.shareEditGen
+      && typeof pending.enabled === 'boolean'
+    ) {
+      const replayBase = pending.baseUpdatedAt ?? meta.shareBaseServerUpdatedAt;
+      out.push({
+        kind: 'share',
+        editGen: pending.editGen,
+        baseUpdatedAt: replayBase,
+        sentEnabled: pending.enabled,
+        isPendingReplay: true,
+        payload: {
+          scope: 'share',
+          enabled: pending.enabled,
+          baseUpdatedAt: replayBase,
+        },
+      });
+    } else {
+      const baseUpdatedAt = pending?.editGen === meta.shareEditGen && pending.baseUpdatedAt !== undefined
+        ? pending.baseUpdatedAt
+        : meta.shareBaseServerUpdatedAt;
+      out.push({
+        kind: 'share',
+        editGen: meta.shareEditGen,
+        baseUpdatedAt,
+        sentEnabled: localShare,
+        payload: {
+          scope: 'share',
+          enabled: localShare,
+          baseUpdatedAt,
+        },
+      });
+    }
   }
 
   return out;
@@ -729,19 +821,28 @@ function mintVoiceHotwordsWriteId(): string {
 
 function resolveOrAllocatePendingWrite(
   current: PendingWriteRecord | null | undefined,
-  editGen: number,
+  item: PendingScopePush,
 ): { writeId: string; record: PendingWriteRecord; changed: boolean } {
-  if (current && current.editGen === editGen) {
+  if (current && current.editGen === item.editGen) {
     return { writeId: current.id, record: current, changed: false };
   }
   const writeId = mintVoiceHotwordsWriteId();
-  return { writeId, record: { id: writeId, editGen }, changed: true };
+  return {
+    writeId,
+    record: {
+      id: writeId,
+      editGen: item.editGen,
+      baseUpdatedAt: item.baseUpdatedAt,
+      ...(item.kind === 'share' ? { enabled: item.sentEnabled } : { raw: item.sentRaw }),
+    },
+    changed: true,
+  };
 }
 
 function prepareScopePushWriteId(accountKey: string, item: PendingScopePush): string {
   const meta = readSyncMeta(accountKey);
   if (item.kind === 'user') {
-    const res = resolveOrAllocatePendingWrite(meta.userPendingWrite, item.editGen);
+    const res = resolveOrAllocatePendingWrite(meta.userPendingWrite, item);
     if (res.changed) {
       meta.userPendingWrite = res.record;
       writeSyncMeta(accountKey, meta);
@@ -749,7 +850,7 @@ function prepareScopePushWriteId(accountKey: string, item: PendingScopePush): st
     return res.writeId;
   }
   if (item.kind === 'share') {
-    const res = resolveOrAllocatePendingWrite(meta.sharePendingWrite, item.editGen);
+    const res = resolveOrAllocatePendingWrite(meta.sharePendingWrite, item);
     if (res.changed) {
       meta.sharePendingWrite = res.record;
       writeSyncMeta(accountKey, meta);
@@ -757,7 +858,7 @@ function prepareScopePushWriteId(accountKey: string, item: PendingScopePush): st
     return res.writeId;
   }
   const existing = getOwnDictValue(meta.projPendingWrite, item.projectKey);
-  const res = resolveOrAllocatePendingWrite(existing, item.editGen);
+  const res = resolveOrAllocatePendingWrite(existing, item);
   if (res.changed) {
     setOwnDictValue(meta.projPendingWrite, item.projectKey, res.record);
     writeSyncMeta(accountKey, meta);
@@ -788,20 +889,6 @@ function clearScopePendingWriteIfMatches(
   if (mutated) writeSyncMeta(accountKey, meta);
 }
 
-function hasAmbiguousPriorPendingWrite(meta: LocalVoiceHotwordsSyncMeta, pushes: PendingScopePush[]): boolean {
-  for (const item of pushes) {
-    if (item.kind === 'user') {
-      if (meta.userPendingWrite && meta.userPendingWrite.editGen < item.editGen) return true;
-    } else if (item.kind === 'share') {
-      if (meta.sharePendingWrite && meta.sharePendingWrite.editGen < item.editGen) return true;
-    } else {
-      const pending = getOwnDictValue(meta.projPendingWrite, item.projectKey);
-      if (pending && pending.editGen < item.editGen) return true;
-    }
-  }
-  return false;
-}
-
 function resolveScopeAppliedFlag(
   item: PendingScopePush,
   topApplied: unknown,
@@ -826,7 +913,6 @@ function reconcileWithServerRecord(
   markInitialMigrated = false,
 ): { pendingPushes: PendingScopePush[]; changedUi: boolean; caughtUpFromOwnWrite: boolean } {
   const meta = readSyncMeta(accountKey);
-  const fromServerFetch = confirmed === undefined;
   if (markInitialMigrated) {
     // Re-enable capacity-blocked scopes once a fresh server snapshot arrives
     meta.userCapacityBlocked = false;
@@ -931,9 +1017,6 @@ function reconcileWithServerRecord(
           meta.userCapacityBlocked = false;
           meta.userPendingWrite = null;
         }
-      } else if (fromServerFetch && meta.userPendingWrite) {
-        // Authoritative GET shows server did not advance beyond prevBaseTs: prior pendingWrite never committed
-        meta.userPendingWrite = null;
       }
     } else if (!meta.initialMigrationDone && localGlobal.length > 0 && srvTs === 0) {
       if (localGlobal.length <= VOICE_HOTWORDS_MAX_RAW_CHARS) {
@@ -1065,8 +1148,6 @@ function reconcileWithServerRecord(
           deleteOwnDictKey(meta.projCapacityBlocked, key);
           deleteOwnDictKey(meta.projPendingWrite, key);
         }
-      } else if (fromServerFetch && pendingWrite) {
-        deleteOwnDictKey(meta.projPendingWrite, key);
       }
     } else if (!meta.initialMigrationDone && localRaw.length > 0 && srvTs === 0) {
       if (!isOversizedLocal) {
@@ -1175,8 +1256,6 @@ function reconcileWithServerRecord(
           meta.shareCapacityBlocked = false;
           meta.sharePendingWrite = null;
         }
-      } else if (fromServerFetch && meta.sharePendingWrite) {
-        meta.sharePendingWrite = null;
       }
     } else if (!meta.initialMigrationDone && localShare && srvTs === 0) {
       meta.shareEditGen += 1;
@@ -1208,10 +1287,8 @@ function reconcileWithServerRecord(
   };
 }
 
-function isSameScopePush(a: PendingScopePush, b: PendingScopePush): boolean {
-  if (a.kind !== b.kind) return false;
-  if (a.kind === 'project' && b.kind === 'project') return a.projectKey === b.projectKey;
-  return true;
+function scopePushKey(item: PendingScopePush): string {
+  return item.kind === 'project' ? `project:${item.projectKey}` : item.kind;
 }
 
 async function executeIsolatedPushes(
@@ -1224,14 +1301,17 @@ async function executeIsolatedPushes(
   if (!accountKey || !expectedUserId || !_syncClient) return false;
 
   let hasRemainingDirtyEdit = false;
-  for (const initialItem of initialPushes) {
-    let item: PendingScopePush | undefined = initialItem;
+  const targetScopes = initialPushes.map(scopePushKey);
+
+  for (const targetKey of targetScopes) {
     let catchupRetries = 2;
 
-    while (item) {
+    while (true) {
       if (!isVoiceHotwordsScopeValid(snapshot) || signal.aborted) return false;
-      const currentItem: PendingScopePush = item;
-      item = undefined;
+      const currentMeta = readSyncMeta(accountKey);
+      const currentItem = collectDirtyScopePushes(accountKey, currentMeta)
+        .find((push) => scopePushKey(push) === targetKey);
+      if (!currentItem) break;
 
       try {
         const writeId = prepareScopePushWriteId(accountKey, currentItem);
@@ -1279,11 +1359,10 @@ async function executeIsolatedPushes(
         const post = reconcileWithServerRecord(accountKey, serverRecord, confirmed);
         if (post.changedUi) notifyChange();
 
-        if (post.caughtUpFromOwnWrite && catchupRetries > 0) {
-          const matchingNext: PendingScopePush | undefined = post.pendingPushes.find((nextPush) => isSameScopePush(nextPush, currentItem));
-          if (matchingNext) {
+        if ((post.caughtUpFromOwnWrite || currentItem.isPendingReplay) && catchupRetries > 0) {
+          const matchingNext = post.pendingPushes.find((nextPush) => scopePushKey(nextPush) === targetKey);
+          if (matchingNext && !matchingNext.isPendingReplay) {
             catchupRetries -= 1;
-            item = matchingNext;
             continue;
           }
         }
@@ -1299,6 +1378,7 @@ async function executeIsolatedPushes(
         ) {
           hasRemainingDirtyEdit = true;
         }
+        break;
       } catch (err) {
         if (!isVoiceHotwordsScopeValid(snapshot) || signal.aborted) return false;
         if (isCapacityError(err)) {
@@ -1324,6 +1404,7 @@ async function executeIsolatedPushes(
           }
           writeSyncMeta(accountKey, latestMeta);
         }
+        break;
       }
     }
   }
@@ -1377,29 +1458,9 @@ export async function flushVoiceHotwordsPush(): Promise<void> {
   if (!_syncClient || !isRemoteSyncEligibleAccountKey(accountKey) || !snapshot.userId) return;
 
   await enqueueAccountSyncOperation(snapshot, async (signal) => {
-    let meta = readSyncMeta(accountKey);
-    let pushes = collectDirtyScopePushes(accountKey, meta);
+    const meta = readSyncMeta(accountKey);
+    const pushes = collectDirtyScopePushes(accountKey, meta);
     if (pushes.length === 0) return;
-
-    if (hasAmbiguousPriorPendingWrite(meta, pushes)) {
-      try {
-        const serverRecord = await _syncClient?.fetchRecord({
-          expectedUserId: snapshot.userId!,
-          signal,
-        });
-        if (!serverRecord || !isVoiceHotwordsScopeValid(snapshot) || signal.aborted) return;
-        const reconciled = reconcileWithServerRecord(accountKey, serverRecord, undefined, true);
-        if (reconciled.changedUi) {
-          notifyChange();
-        }
-        meta = readSyncMeta(accountKey);
-        pushes = reconciled.pendingPushes;
-        if (pushes.length === 0) return;
-      } catch {
-        // Network/offline error resolving earlier pending write: retain pendingWriteId untouched for reconnect recovery
-        return;
-      }
-    }
 
     const needsReschedule = await executeIsolatedPushes(snapshot, pushes, signal);
     if (needsReschedule && isVoiceHotwordsScopeValid(snapshot)) {

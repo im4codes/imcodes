@@ -804,7 +804,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       await flushVoiceHotwordsPush();
       expect(srv.projects[projKey].raw).toBe('DirectFlushEdit4');
       expect(getProjectVoiceHotwordsRaw(projKey)).toBe('DirectFlushEdit4');
-      expect(projectPutBases).toEqual([baseBeforeLost3, revAfterLost3]);
+      expect(projectPutBases).toEqual([baseBeforeLost3, baseBeforeLost3, revAfterLost3]);
     } finally {
       vi.useRealTimers();
     }
@@ -1034,6 +1034,150 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
     await syncVoiceHotwordsFromServer();
     expect(srv.projects[projKey].raw).toBe('');
     expect(getProjectVoiceHotwordsRaw(projKey)).toBe('');
+    expect(srv.shareWithOthers.enabled).toBe(false);
+    expect(getShareHotwordsWithOthers()).toBe(false);
+  });
+
+  it('recovers when PUT drops before commit, GET sees old base V100, and PUT #1 commits late at V101 across project/user/share while preserving external clear priority', async () => {
+    let rev = 100;
+    const nextRev = () => {
+      rev += 1;
+      return rev;
+    };
+    const projKey = 'srv:srv-1::delayed-commit-proj';
+    const srv: any = {
+      version: 1,
+      user: { raw: 'User100', updatedAt: 100, source: 'web' },
+      projects: { [projKey]: { raw: 'Proj100', updatedAt: 100, source: 'web' } },
+      shareWithOthers: { enabled: true, updatedAt: 100 },
+    };
+
+    const delayedCommits: Array<() => void> = [];
+    let dropBeforeCommit = false;
+    let simulateExternalClearInsteadOfDelayedCommit = false;
+
+    const applyServerPatch = (payload: any) => {
+      let applied = false;
+      const appliedScopes: any = {};
+      if (payload.scope === 'project') {
+        const cur = srv.projects[payload.projectKey] ?? { raw: '', updatedAt: 0 };
+        if (payload.baseUpdatedAt === cur.updatedAt) {
+          srv.projects[payload.projectKey] = {
+            raw: payload.raw,
+            updatedAt: nextRev(),
+            source: 'web',
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && cur.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        appliedScopes.projects = { [payload.projectKey]: applied };
+      } else if (payload.scope === 'user') {
+        if (payload.baseUpdatedAt === srv.user.updatedAt) {
+          srv.user = {
+            raw: payload.raw,
+            updatedAt: nextRev(),
+            source: 'web',
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && srv.user.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        appliedScopes.user = applied;
+      } else if (payload.scope === 'share') {
+        if (payload.baseUpdatedAt === srv.shareWithOthers.updatedAt) {
+          srv.shareWithOthers = {
+            enabled: payload.enabled,
+            updatedAt: nextRev(),
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && srv.shareWithOthers.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        appliedScopes.shareWithOthers = applied;
+      }
+      return { ok: true, applied, appliedScopes, record: structuredClone(srv) };
+    };
+
+    const fetchRecord = vi.fn(async () => {
+      // Independent GET sees pre-commit V100 while delayed PUT is still queued behind transaction lock
+      return structuredClone(srv);
+    });
+
+    const updateRecord = vi.fn(async (payload: any) => {
+      if (dropBeforeCommit) {
+        delayedCommits.push(() => {
+          applyServerPatch(payload);
+        });
+        throw new Error('connection_dropped_before_commit');
+      }
+      // Inside server transaction lock: any previously queued commit lands BEFORE this PUT executes (or MCP beat both)
+      while (delayedCommits.length > 0) {
+        const commitFn = delayedCommits.shift()!;
+        if (!simulateExternalClearInsteadOfDelayedCommit) {
+          commitFn();
+        }
+      }
+      if (simulateExternalClearInsteadOfDelayedCommit) {
+        simulateExternalClearInsteadOfDelayedCommit = false;
+        srv.projects[projKey] = { raw: '', updatedAt: nextRev(), source: 'mcp' };
+        srv.user = { raw: '', updatedAt: nextRev(), source: 'mcp' };
+        srv.shareWithOthers = { enabled: false, updatedAt: nextRev() };
+      }
+      return applyServerPatch(payload);
+    });
+
+    setVoiceHotwordsAuthScope({ userId: 'user-delayed', baseUrl: 'https://delayed.example' });
+    registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
+    await syncVoiceHotwordsFromServer();
+
+    // Part 1: Drop connection BEFORE server commit across project, user, share -> GET reads V100 -> delayed PUT #1 commits V101 -> Edit #2 MUST still commit!
+    dropBeforeCommit = true;
+    setProjectVoiceHotwordsRaw(projKey, 'ProjDelayed1');
+    setGlobalVoiceHotwordsRaw('UserDelayed1');
+    setShareHotwordsWithOthers(false);
+    await flushVoiceHotwordsPush();
+    dropBeforeCommit = false;
+
+    // Server still at V100 right now while delayed commits wait in server lock!
+    expect(srv.projects[projKey].updatedAt).toBe(100);
+    expect(srv.user.updatedAt).toBe(100);
+    expect(srv.shareWithOthers.updatedAt).toBe(100);
+
+    // Edit #2 locally, then run GET (sees V100!) followed by its push (where delayed commits land at V101+ right before retry/Edit #2)
+    setProjectVoiceHotwordsRaw(projKey, 'ProjEdit2');
+    setGlobalVoiceHotwordsRaw('UserEdit2');
+    setShareHotwordsWithOthers(true);
+    await syncVoiceHotwordsFromServer();
+
+    expect(srv.projects[projKey].raw).toBe('ProjEdit2');
+    expect(getProjectVoiceHotwordsRaw(projKey)).toBe('ProjEdit2');
+    expect(srv.user.raw).toBe('UserEdit2');
+    expect(getGlobalVoiceHotwordsRaw()).toBe('UserEdit2');
+    expect(srv.shareWithOthers.enabled).toBe(true);
+    expect(getShareHotwordsWithOthers()).toBe(true);
+
+    // Part 2: External clear/revoke beats both delayed PUT #1 and Edit #2 when MCP lands first
+    dropBeforeCommit = true;
+    setProjectVoiceHotwordsRaw(projKey, 'ProjDelayed2');
+    setGlobalVoiceHotwordsRaw('UserDelayed2');
+    setShareHotwordsWithOthers(false);
+    await flushVoiceHotwordsPush();
+    dropBeforeCommit = false;
+
+    setProjectVoiceHotwordsRaw(projKey, 'ProjEdit3');
+    setGlobalVoiceHotwordsRaw('UserEdit3');
+    setShareHotwordsWithOthers(true);
+    simulateExternalClearInsteadOfDelayedCommit = true;
+    await syncVoiceHotwordsFromServer();
+
+    expect(srv.projects[projKey].raw).toBe('');
+    expect(getProjectVoiceHotwordsRaw(projKey)).toBe('');
+    expect(srv.user.raw).toBe('');
+    expect(getGlobalVoiceHotwordsRaw()).toBe('');
     expect(srv.shareWithOthers.enabled).toBe(false);
     expect(getShareHotwordsWithOthers()).toBe(false);
   });
