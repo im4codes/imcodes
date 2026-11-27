@@ -9,7 +9,8 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { buildCodexMcpThreadConfig } from '../../src/agent/providers/codex-sdk.js';
 import { closeHookServer, startHookServer } from '../../src/daemon/hook-server.js';
 import { MEMORY_MCP_HTTP_PATH } from '../../src/daemon/memory-mcp-http.js';
-import { HOOK_SESSION_CREDENTIAL_ENV } from '../../shared/hook-session-credential.js';
+import { HOOK_SESSION_CREDENTIAL_ENV, HOOK_SESSION_CREDENTIAL_HEADER } from '../../shared/hook-session-credential.js';
+import { hookClaimAllowed } from '../../src/daemon/hook-session-credential.js';
 import {
   launchTransportSession,
   restoreTransportSessions,
@@ -195,17 +196,25 @@ describe('Codex transport launch/restore HTTP MCP credential binding', () => {
       .resolves.toMatchObject({ structuredContent: { status: 'ok', session: 'deck_codexcred_brain' } });
     await clientRestored.close().catch(() => {});
 
-    // Simulate a true daemon restart: reload from SQLite where no transport hookCredential was written,
-    // then restoreTransportSessions mints a fresh credential in memory and /mcp accepts only the new one.
+    // Simulate a true daemon restart: reload from SQLite where no transport hookCredential was written.
+    // F1: loadStore immediately mints a fresh in-memory credential before restoreTransportSessions runs,
+    // rejecting anonymous/stale/wrong claims right away, and restoreTransportSessions reuses that credential.
     await stopTransportRuntimeSession('deck_codexcred_brain');
     await store.flushStore();
     store.resetSessionStoreAuthorityForTests();
     await store.loadStore({ probe: false });
-    expect(store.getSession('deck_codexcred_brain')?.hookCredential).toBeUndefined();
+    const preRestoreCred = store.getSession('deck_codexcred_brain')?.hookCredential;
+    expect(preRestoreCred).toMatch(/^[0-9a-f]{64}$/);
+    expect(preRestoreCred).not.toBe(restoredRecord.hookCredential);
+    expect(persistedSessions(home)['deck_codexcred_brain']).not.toHaveProperty('hookCredential');
+    expect(hookClaimAllowed('deck_codexcred_brain', {})).toBe(false);
+    expect(hookClaimAllowed('deck_codexcred_brain', { [HOOK_SESSION_CREDENTIAL_HEADER]: restoredRecord.hookCredential! })).toBe(false);
+    expect(hookClaimAllowed('deck_codexcred_brain', { [HOOK_SESSION_CREDENTIAL_HEADER]: 'wrong' })).toBe(false);
+    expect(hookClaimAllowed('deck_codexcred_brain', { [HOOK_SESSION_CREDENTIAL_HEADER]: preRestoreCred! })).toBe(true);
+
     await restoreTransportSessions('codex-sdk', { sessionName: 'deck_codexcred_brain', concurrency: 1, interSessionDelayMs: 0 });
     const rebootedRecord = store.getSession('deck_codexcred_brain')!;
-    expect(rebootedRecord.hookCredential).toBeTruthy();
-    expect(rebootedRecord.hookCredential).not.toBe(restoredRecord.hookCredential);
+    expect(rebootedRecord.hookCredential).toBe(preRestoreCred);
     const rebootedEntry = (buildCodexMcpThreadConfig(capturedConfigs.at(-1)!) as Record<string, any>).mcp_servers['imcodes-memory'];
     const clientRebooted = new Client({ name: 'codex-rebooted', version: '1' });
     await clientRebooted.connect(new StreamableHTTPClientTransport(new URL(rebootedEntry.url), {

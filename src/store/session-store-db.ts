@@ -11,9 +11,10 @@
  * this file only reads and writes rows.
  */
 import { createRequire } from 'node:module';
-import { chmodSync, existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, renameSync, rmSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
+import logger from '../util/logger.js';
 
 import {
   SESSION_DB_META_IDENTITY_SCRUB,
@@ -103,20 +104,36 @@ const SCHEMA_SQL = `
   ) WITHOUT ROWID;
 `;
 
-function enforceOwnerOnlyFileMode(path: string): void {
+function enforceOwnerOnlyFileMode(path: string, opts: { allowMissing?: boolean } = {}): void {
   if (process.platform === 'win32') return;
-  try { chmodSync(path, 0o600); } catch { /* absent or unsupported */ }
+  try {
+    chmodSync(path, 0o600);
+  } catch (error) {
+    const code = (error as { code?: string } | null)?.code;
+    if (opts.allowMissing && code === 'ENOENT') return;
+    logger.warn({ err: error, path }, 'Failed to enforce owner-only permissions (0600) on session store file');
+    throw error;
+  }
 }
 
 function enforceSessionDbFileModes(dbPath: string): void {
   enforceOwnerOnlyFileMode(dbPath);
-  enforceOwnerOnlyFileMode(`${dbPath}-wal`);
-  enforceOwnerOnlyFileMode(`${dbPath}-shm`);
+  enforceOwnerOnlyFileMode(`${dbPath}-wal`, { allowMissing: true });
+  enforceOwnerOnlyFileMode(`${dbPath}-shm`, { allowMissing: true });
 }
 
 /** Open the writer connection, creating the file and schema. */
 export function openSessionDbForWrite(path: string): SessionDbHandle {
   mkdirSync(dirname(path), { recursive: true });
+  if (process.platform !== 'win32') {
+    try {
+      const fd = openSync(path, 'wx', 0o600);
+      closeSync(fd);
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code !== 'EEXIST') throw error;
+    }
+    enforceOwnerOnlyFileMode(path);
+  }
   const db = new DatabaseSync(path);
   try {
     db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
@@ -330,19 +347,37 @@ export function scrubTransportHookCredentialRows(handle: SessionDbHandle): { scr
       throw error;
     }
   }
-  if (scrubbedRows === 0 && marker !== SCRUB_PENDING_VACUUM) return { scrubbedRows: 0, compacted: false };
+  const hasWalBytes = existsSync(`${handle.path}-wal`) && (() => {
+    try { return statSync(`${handle.path}-wal`).size > 0; } catch { return false; }
+  })();
+  const needsUpgradeCompaction = marker === null && (countSessionRows(handle) > 0 || hasWalBytes);
+  if (needsUpgradeCompaction) {
+    db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_PENDING_VACUUM);
+  }
+  if (scrubbedRows === 0 && marker !== SCRUB_PENDING_VACUUM && !needsUpgradeCompaction) {
+    if (marker === null) {
+      db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_DONE);
+    }
+    return { scrubbedRows: 0, compacted: false };
+  }
   const compacted = compactSessionDb(handle);
   if (compacted) db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB, SCRUB_DONE);
   return { scrubbedRows, compacted };
 }
 
-/** VACUUM and truncate the log, whatever the free-page thresholds; false when it could not run (the caller retries later). */
+/** VACUUM and truncate the log, verifying no reader pinned the WAL (`busy === 0`). */
 function compactSessionDb(handle: SessionDbHandle): boolean {
   try {
     handle.db.exec('VACUUM');
-    handle.db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    const row = handle.db.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as
+      | { busy?: number | bigint; log?: number | bigint; checkpointed?: number | bigint }
+      | undefined;
     enforceSessionDbFileModes(handle.path);
-    return true;
+    if (!row) return false;
+    const busy = Number(row.busy ?? 1);
+    const log = Number(row.log ?? 0);
+    const checkpointed = Number(row.checkpointed ?? 0);
+    return busy === 0 && (log <= 0 || checkpointed >= log);
   } catch {
     return false;
   }
@@ -519,14 +554,27 @@ export function markLegacyImportDone(handle: SessionDbHandle): void {
  * while the daemon keeps writing. Uses the SQLite backup API where this Node
  * has it, and VACUUM INTO (also consistent) otherwise.
  */
-export async function snapshotSessionDb(handle: SessionDbHandle, destination: string): Promise<void> {
-  if (typeof sqlite.backup === 'function') {
-    await sqlite.backup(handle.db, destination);
-    enforceOwnerOnlyFileMode(destination);
-    return;
+export async function snapshotSessionDb(
+  handle: SessionDbHandle,
+  destination: string,
+  options: { preferVacuumInto?: boolean } = {},
+): Promise<void> {
+  const parentDir = dirname(destination);
+  mkdirSync(parentDir, { recursive: true });
+  const stagingDir = mkdtempSync(join(parentDir, '.bak-staging-'));
+  try {
+    if (process.platform !== 'win32') chmodSync(stagingDir, 0o700);
+    const stagedFile = join(stagingDir, 'snapshot.sqlite');
+    if (!options.preferVacuumInto && typeof sqlite.backup === 'function') {
+      await sqlite.backup(handle.db, stagedFile);
+    } else {
+      handle.db.exec(`VACUUM INTO '${stagedFile.replace(/'/g, "''")}'`);
+    }
+    enforceOwnerOnlyFileMode(stagedFile);
+    renameSync(stagedFile, destination);
+  } finally {
+    rmSync(stagingDir, { recursive: true, force: true });
   }
-  handle.db.exec(`VACUUM INTO '${destination.replace(/'/g, "''")}'`);
-  enforceOwnerOnlyFileMode(destination);
 }
 
 /** Row count of a snapshot file, or null when it is not a usable session database. */

@@ -1,12 +1,12 @@
 import { setSessionIncognito } from '../../shared/session-incognito-context.js';
 import { isIncognitoSession, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_SESSION_STATE, type AgyNativeSessionState } from '../../shared/agy-agent.js';
-import { statSync } from 'node:fs';
+import { statSync, readdirSync, rmSync } from 'node:fs';
 import { Worker } from 'node:worker_threads';
 import { mkdir, readFile, rename, rm } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { dirname, join } from 'path';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import type { QwenAuthType } from '../../shared/qwen-auth.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
@@ -76,9 +76,9 @@ import {
   SESSION_IDENTITY_PROMPT_REF_FIELD,
 } from '../../shared/session-store-compat.js';
 import { registerMemoryProbe } from '../daemon/memory-probes.js';
-import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, removeStoredIdentity, removeTransportHookCredential } from './session-record-blobs.js';
+import { blobHashesOfPayload, externalizeSessionRecord, hasGenericBlobRefs, hydrateSessionRecord, isTransportSessionRecord, removeStoredIdentity, removeTransportHookCredential } from './session-record-blobs.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
-import { cleanupIdentityBackups, cleanupLegacyCredentialBackups, type IdentityBackupCleanupDeps } from './session-identity-backups.js';
+import { cleanupIdentityBackups, cleanupLegacyCredentialBackups, redactLegacyJsonCredentialFile, type IdentityBackupCleanupDeps } from './session-identity-backups.js';
 import {
   areClosedSessionRemovalsAuthorized,
   authorizeClosedSessionRemoval,
@@ -751,12 +751,12 @@ function startIdentityBackupCleanup(targetPath: string, opts: { identity: boolea
     }
     if (opts.credential) {
       const credResult = await cleanupLegacyCredentialBackups(targetPath, jsonPath, identityBackupCleanupDeps);
-      if (credResult.removed.length > 0) {
+      if (credResult.removed.length > 0 || credResult.sanitized.length > 0) {
         if (dbPath() === targetPath) lastBackupAt = 0;
-        logger.info({ removed: credResult.removed }, 'Removed old session backups that held persisted hook credentials');
+        logger.info({ removed: credResult.removed, sanitized: credResult.sanitized }, 'Cleaned old session backups that held persisted hook credentials');
       }
       if (credResult.failed.length > 0) {
-        logger.warn({ failed: credResult.failed }, 'Old session backups holding persisted hook credentials could not be removed; the next start retries');
+        logger.warn({ failed: credResult.failed }, 'Old session backups holding persisted hook credentials could not be cleaned; the next start retries');
       }
     }
   })().catch((error) => { logger.warn({ err: error }, 'Cleaning old session backups failed; the next start retries'); });
@@ -825,6 +825,30 @@ async function readWithoutAuthority(targetPath: string): Promise<Record<string, 
   }
 }
 
+function installFreshTransportCredentials(sessions: Record<string, SessionRecord>): void {
+  for (const session of Object.values(sessions)) {
+    if (isTransportSessionRecord(session as unknown as Record<string, unknown>) && !session.hookCredential?.trim()) {
+      Object.defineProperty(session, 'hookCredential', {
+        value: randomBytes(32).toString('hex'),
+        enumerable: false,
+        writable: true,
+        configurable: true,
+      });
+    }
+  }
+}
+
+function cleanupStaleBackupStagingDirs(targetPath: string): void {
+  try {
+    const dir = dirname(targetPath);
+    for (const entry of readdirSync(dir)) {
+      if (entry.startsWith('.bak-staging-')) {
+        rmSync(join(dir, entry), { recursive: true, force: true });
+      }
+    }
+  } catch { /* best effort on unreadable/missing dir */ }
+}
+
 export async function loadStore(options: LoadStoreOptions = {}): Promise<SessionStore> {
   // Bind every asynchronous consequence of this load to the same store path.
   // HOME is stable in production, but test workers deliberately rotate it;
@@ -841,12 +865,13 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   try {
     if (canWrite) {
       await mkdir(dirname(targetPath), { recursive: true });
+      cleanupStaleBackupStagingDirs(targetPath);
       const handle = writerHandle(targetPath);
       // An export from an earlier load must finish (bounded) before this one reads and freezes
       // sessions.json, so a late file replacement can never land between its read and its rename.
       await settleCompatExportBeforeMigration();
       await migrateLegacyJson(handle);
-      // The identity prompt is not session state: rows an older build stored it in are cleaned BEFORE they are read.
+      // The identity prompt and persisted transport hook credentials are not durable state: clean BEFORE reading.
       const identityScrub = removeStoredIdentityFromDatabase(handle);
       const credentialScrub = removeTransportHookCredentialsFromDatabase(handle);
       let payloads = readSessionPayloads(handle);
@@ -858,9 +883,25 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
         if (restored) { payloads = restored; dirty = true; }
       }
       committedPayloads = payloads;
-      store = { sessions: recordsFromPayloads(payloads, readSessionBlobs(handle)) };
-      // Older processes see the migrated sessions at once -- but only once they ARE migrated.
-      if (legacyImportDone(handle)) scheduleCompatExport(targetPath, true);
+      const loadedSessions = recordsFromPayloads(payloads, readSessionBlobs(handle));
+      // Mint fresh in-memory hookCredentials BEFORE publishing store.sessions so hook handlers enforce
+      // credentials immediately on startup (even before delayed/lazy transport restore connects).
+      installFreshTransportCredentials(loadedSessions);
+      store = { sessions: loadedSessions };
+      // Only after a durable SQLite import: strip any remaining credentials in sessions.json and its
+      // daemon-frozen .migrated-to-sqlite rollback file (independent of compat export sunset or size budget),
+      // then schedule compat export and background backup sanitization.
+      if (legacyImportDone(handle)) {
+        const liveJson = legacyJsonPath();
+        const frozenJson = `${liveJson}${LEGACY_JSON_FROZEN_SUFFIX}`;
+        for (const candidate of [liveJson, frozenJson]) {
+          const redacted = await redactLegacyJsonCredentialFile(candidate);
+          if (redacted.error) {
+            logger.warn({ path: candidate, error: redacted.error }, 'Failed to redact hook credentials in legacy JSON file');
+          }
+        }
+        scheduleCompatExport(targetPath, true);
+      }
       // Only once the live database is clean AND the import of sessions.json is done (those backups are its source until then).
       if (legacyImportDone(handle) && (identityScrub || credentialScrub)) {
         startIdentityBackupCleanup(targetPath, {
@@ -1211,8 +1252,8 @@ const COMPAT_WORKER_SOURCE = `
   const fs = require('node:fs');
   parentPort.on('message', (job) => {
     try {
-      fs.writeFileSync(job.tmp, job.head + job.parts.join(',') + job.tail, { mode: 0o600 });
-      if (process.platform !== 'win32') try { fs.chmodSync(job.tmp, 0o600); } catch (_) { /* best effort */ }
+      fs.writeFileSync(job.tmp, job.head + job.parts.join(',') + job.tail, { flag: 'wx', mode: 0o600 });
+      if (process.platform !== 'win32') fs.chmodSync(job.tmp, 0o600);
       fs.renameSync(job.tmp, job.path);
       parentPort.postMessage({ id: job.id, ok: true });
     } catch (error) {
@@ -1586,7 +1627,13 @@ export function upsertSession(record: SessionRecord): void {
       ? AGY_NATIVE_SESSION_STATE.STARTED
       : record.agyNativeSessionState ?? (sameAgyRoute ? existing.agyNativeSessionState : undefined)
     : undefined;
-  store.sessions[record.name] = {
+  const preservedTransportHookCred = !('hookCredential' in record)
+    && existing
+    && isTransportSessionRecord(existing as unknown as Record<string, unknown>)
+    && existing.hookCredential
+    ? existing.hookCredential
+    : undefined;
+  const nextSessionRecord: SessionRecord = {
     ...incoming,
     // Privacy cannot be erased by a metadata rebuild that omits the flag.
     ...(isIncognitoSession(existing) || isIncognitoSession(record) ? { incognito: true } : {}),
@@ -1600,6 +1647,15 @@ export function upsertSession(record: SessionRecord): void {
     ...(pairCreatedMetadata !== undefined ? { pairCreatedMetadata } : {}),
     updatedAt: Date.now(),
   };
+  if (preservedTransportHookCred) {
+    Object.defineProperty(nextSessionRecord, 'hookCredential', {
+      value: preservedTransportHookCred,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+  }
+  store.sessions[record.name] = nextSessionRecord;
   setSessionIncognito(record.name, isIncognitoSession(store.sessions[record.name]));
   sessionValuesCache = null;
   markDirty(record.name);

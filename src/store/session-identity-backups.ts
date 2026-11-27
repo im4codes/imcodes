@@ -12,7 +12,8 @@
  * (name, size) so the owner decides.
  */
 import { existsSync } from 'node:fs';
-import { lstat, open, readdir, rm } from 'node:fs/promises';
+import { chmod, lstat, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import {
   LEGACY_JSON_BACKUP_COUNT,
@@ -20,12 +21,18 @@ import {
   SESSION_DB_BACKUP_COUNT,
   SESSION_DB_BACKUP_INFIX,
   SESSION_DB_BACKUP_TMP_SUFFIX,
+  SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB,
   SESSION_HOOK_CREDENTIAL_FIELD,
   SESSION_HOOK_CREDENTIAL_MARKER,
   SESSION_IDENTITY_PROMPT_MARKER,
 } from '../../shared/session-store-compat.js';
-import { isTransportSessionRecord, SESSION_BLOB_REFS_FIELD } from './session-record-blobs.js';
-import { readSnapshotPayloads } from './session-store-db.js';
+import {
+  closeSessionDb,
+  openSessionDbForWrite,
+  openSessionDbReadOnly,
+  readSessionDbMeta,
+  scrubTransportHookCredentialRows,
+} from './session-store-db.js';
 
 const SCAN_CHUNK_BYTES = 1024 * 1024;
 
@@ -123,42 +130,121 @@ export async function cleanupIdentityBackups(
   return result;
 }
 
-async function snapshotContainsTransportHookCredential(path: string): Promise<boolean> {
+const SQLITE_MAGIC_HEADER = Buffer.from('SQLite format 3\0', 'ascii');
+
+async function isSqliteDatabaseFile(path: string): Promise<boolean> {
+  try {
+    const file = await open(path, 'r');
+    try {
+      const header = Buffer.alloc(SQLITE_MAGIC_HEADER.length);
+      const { bytesRead } = await file.read(header, 0, header.length, 0);
+      return bytesRead === header.length && header.equals(SQLITE_MAGIC_HEADER);
+    } finally {
+      await file.close().catch(() => undefined);
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function enforceOwnerModeAsync(path: string): Promise<void> {
+  if (process.platform === 'win32') return;
+  await chmod(path, 0o600);
+}
+
+function readCertifiedCleanSnapshotMeta(path: string): boolean {
   const walExisted = existsSync(`${path}-wal`);
   const shmExisted = existsSync(`${path}-shm`);
+  if (walExisted || shmExisted) return false;
+  let handle = null as ReturnType<typeof openSessionDbReadOnly>;
   try {
-    const payloads = readSnapshotPayloads(path);
-    if (!payloads) return false;
-    for (const payload of payloads.values()) {
-      if (!payload.includes(SESSION_HOOK_CREDENTIAL_MARKER)) continue;
-      try {
-        const parsed = JSON.parse(payload) as Record<string, unknown>;
-        if (!isTransportSessionRecord(parsed)) continue;
-        if (SESSION_HOOK_CREDENTIAL_FIELD in parsed) return true;
-        const refs = parsed[SESSION_BLOB_REFS_FIELD];
-        if (refs && typeof refs === 'object' && !Array.isArray(refs) && SESSION_HOOK_CREDENTIAL_FIELD in refs) {
-          return true;
-        }
-      } catch { /* unreadable row skipped */ }
-    }
+    handle = openSessionDbReadOnly(path);
+    return handle !== null && readSessionDbMeta(handle, SESSION_DB_META_TRANSPORT_CREDENTIAL_SCRUB) === 'done';
+  } catch {
     return false;
   } finally {
-    if (!walExisted) await rm(`${path}-wal`, { force: true }).catch(() => undefined);
-    if (!shmExisted) await rm(`${path}-shm`, { force: true }).catch(() => undefined);
+    closeSessionDb(handle);
+    if (!walExisted) void rm(`${path}-wal`, { force: true }).catch(() => undefined);
+    if (!shmExisted) void rm(`${path}-shm`, { force: true }).catch(() => undefined);
+  }
+}
+
+async function fileOrWalContainsMarker(path: string, marker: string): Promise<boolean> {
+  if (await fileContainsText(path, marker)) return true;
+  if (existsSync(`${path}-wal`)) {
+    try {
+      if (await fileContainsText(`${path}-wal`, marker)) return true;
+    } catch { /* ignore unreadable wal probe */ }
+  }
+  return false;
+}
+
+/**
+ * Upgrade-only redaction for `sessions.json` and daemon-generated `sessions.json.migrated-to-sqlite`.
+ * Runs after a durable SQLite import, independent of normal compat-export sunset/size budgets,
+ * stripping `hookCredential` while preserving all recoverable session records and atomic 0o600 mode.
+ */
+export async function redactLegacyJsonCredentialFile(
+  filePath: string,
+): Promise<{ redacted: boolean; error?: string }> {
+  const bytes = await regularFileSize(filePath);
+  if (bytes === null) return { redacted: false };
+  try {
+    await enforceOwnerModeAsync(filePath);
+  } catch (error) {
+    return { redacted: false, error: error instanceof Error ? error.message : String(error) };
+  }
+  try {
+    if (!await fileContainsText(filePath, SESSION_HOOK_CREDENTIAL_MARKER)) return { redacted: false };
+    const raw = await readFile(filePath, 'utf8');
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { redacted: false, error: 'legacy JSON root is not an object' };
+    }
+    const root = parsed as Record<string, unknown>;
+    const sessions = root['sessions'];
+    if (!sessions || typeof sessions !== 'object' || Array.isArray(sessions)) {
+      return { redacted: false };
+    }
+    let changed = false;
+    for (const entry of Object.values(sessions as Record<string, unknown>)) {
+      if (entry && typeof entry === 'object' && !Array.isArray(entry) && SESSION_HOOK_CREDENTIAL_FIELD in entry) {
+        delete (entry as Record<string, unknown>)[SESSION_HOOK_CREDENTIAL_FIELD];
+        changed = true;
+      }
+    }
+    if (!changed) return { redacted: false };
+    const tmp = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(tmp, JSON.stringify(root), { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      await enforceOwnerModeAsync(tmp);
+      await rename(tmp, filePath);
+      return { redacted: true };
+    } catch (error) {
+      await rm(tmp, { force: true }).catch(() => undefined);
+      throw error;
+    }
+  } catch (error) {
+    return { redacted: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
 /**
  * Remove daemon rotation files (`sessions.json.*`, `sessions.json.<pid>.<uuid>.tmp`) that still
- * hold any `hookCredential`, and SQLite backup snapshots (`sessions.sqlite.bak.*`) that still hold
- * legacy persisted `hookCredential` values for transport sessions.
+ * hold any `hookCredential`, sanitize/compact legacy SQLite backup snapshots (`sessions.sqlite.bak.*`,
+ * removing transport credentials from rows, free pages, and WAL while preserving process-session
+ * backups), and normalize retained daemon rotation copy permissions to `0o600`.
  */
 export async function cleanupLegacyCredentialBackups(
   databasePath: string,
   jsonPath: string,
   deps: IdentityBackupCleanupDeps = {},
-): Promise<Pick<IdentityBackupCleanupResult, 'removed' | 'failed'>> {
-  const result: Pick<IdentityBackupCleanupResult, 'removed' | 'failed'> = { removed: [], failed: [] };
+): Promise<Pick<IdentityBackupCleanupResult, 'removed' | 'failed'> & { sanitized: Array<{ name: string; bytes: number }> }> {
+  const result: Pick<IdentityBackupCleanupResult, 'removed' | 'failed'> & { sanitized: Array<{ name: string; bytes: number }> } = {
+    removed: [],
+    sanitized: [],
+    failed: [],
+  };
   const directory = dirname(databasePath);
   const dbFile = basename(databasePath);
   const jsonFile = basename(jsonPath);
@@ -177,14 +263,62 @@ export async function cleanupLegacyCredentialBackups(
     const bytes = await regularFileSize(path);
     if (bytes === null) continue;
     try {
-      if (!await fileContainsText(path, SESSION_HOOK_CREDENTIAL_MARKER)) continue;
       const isDbSnapshot = name === dbBackupTmpName || name.startsWith(dbBackupPrefix);
-      const shouldRemove = isDbSnapshot
-        ? (await snapshotContainsTransportHookCredential(path)) || name === dbBackupTmpName
-        : true;
-      if (!shouldRemove) continue;
-      await removeFile(path);
-      result.removed.push({ name, bytes });
+      if (!isDbSnapshot) {
+        if (await fileContainsText(path, SESSION_HOOK_CREDENTIAL_MARKER)) {
+          await removeFile(path);
+          result.removed.push({ name, bytes });
+        } else {
+          await enforceOwnerModeAsync(path);
+        }
+        continue;
+      }
+
+      if (name === dbBackupTmpName) {
+        if (await fileOrWalContainsMarker(path, SESSION_HOOK_CREDENTIAL_MARKER)) {
+          await removeFile(path);
+          await rm(`${path}-wal`, { force: true }).catch(() => undefined);
+          await rm(`${path}-shm`, { force: true }).catch(() => undefined);
+          result.removed.push({ name, bytes });
+        } else {
+          await enforceOwnerModeAsync(path);
+        }
+        continue;
+      }
+
+      if (!await isSqliteDatabaseFile(path)) {
+        if (await fileOrWalContainsMarker(path, SESSION_HOOK_CREDENTIAL_MARKER)) {
+          await removeFile(path);
+          result.removed.push({ name, bytes });
+        } else {
+          await enforceOwnerModeAsync(path);
+        }
+        continue;
+      }
+
+      if (readCertifiedCleanSnapshotMeta(path)) {
+        await enforceOwnerModeAsync(path);
+        continue;
+      }
+
+      // Legacy or uncertified SQLite backup snapshot: enforce 0o600, scrub transport credentials,
+      // VACUUM free pages, and verify WAL truncation (busy === 0) while preserving process continuity.
+      let bakHandle: ReturnType<typeof openSessionDbForWrite> | null = null;
+      let scrubOutcome: { scrubbedRows: number; compacted: boolean } | null = null;
+      try {
+        bakHandle = openSessionDbForWrite(path);
+        scrubOutcome = scrubTransportHookCredentialRows(bakHandle);
+      } finally {
+        closeSessionDb(bakHandle);
+      }
+      if (!scrubOutcome.compacted) {
+        result.failed.push({ name, error: 'snapshot WAL checkpoint busy; retry deferred' });
+        continue;
+      }
+      await rm(`${path}-wal`, { force: true }).catch(() => undefined);
+      await rm(`${path}-shm`, { force: true }).catch(() => undefined);
+      await enforceOwnerModeAsync(path);
+      result.sanitized.push({ name, bytes });
     } catch (error) {
       result.failed.push({ name, error: error instanceof Error ? error.message : String(error) });
     }
