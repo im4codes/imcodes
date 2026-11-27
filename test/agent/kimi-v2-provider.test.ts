@@ -416,30 +416,71 @@ describe('KimiV2Provider', () => {
       await runtime.kill({ reason: 'test_cleanup' });
     }
 
-    // Stream/transport rejection while captured child is STILL ALIVE must NOT settle cancelAndWait until child exits
+    // Stream/transport rejection while captured child is STILL ALIVE must trigger bounded reclaim,
+    // keep cancelAndWait unconfirmed until child physically exits, drain runtime queue after exit,
+    // and establish a fresh child connection on subsequent send.
     vi.useRealTimers();
     let rejectPrompt!: (e: Error) => void;
-    state.conn = makeMockConn({
+    let resolveNextPrompt!: (v: { stopReason: string }) => void;
+    const deadConn = makeMockConn({
       prompt: vi.fn(() => new Promise((_, rej) => { rejectPrompt = rej; })),
     });
-    const streamProvider = new KimiV2Provider({ cancelGraceMs: 60_000 });
+    const freshConn = makeMockConn({
+      resumeSession: vi.fn(async () => ({ configOptions: [] })),
+      prompt: vi.fn(() => new Promise((r) => { resolveNextPrompt = r; })),
+    });
+    state.connQueue.push(deadConn, freshConn);
+
+    let finishControlledKill!: () => void;
+    const controlledKillStarted = new Promise<void>((resolveStarted) => {
+      mockKillProcessTree.mockImplementationOnce(async (child: { killed?: boolean; exitCode?: number | null; emit?: (ev: string, ...args: unknown[]) => void }) => {
+        resolveStarted();
+        await new Promise<void>((r) => { finishControlledKill = r; });
+        if (child) {
+          child.killed = true;
+          child.exitCode = 0;
+          child.emit?.('exit', 0, null);
+        }
+      });
+    });
+
+    const streamProvider = new KimiV2Provider({ cancelGraceMs: 60_000, closeTimeoutMs: 5_000 });
     await streamProvider.connect({});
-    await streamProvider.createSession({ sessionKey: 'sess-alive', cwd: os.tmpdir() });
-    await streamProvider.send('sess-alive', 'disconnect mid-flight');
+    const streamRuntime = new TransportSessionRuntime(streamProvider, 'deck_kimi_v2_dead_stream');
+    try {
+      await streamRuntime.initialize({ sessionKey: 'deck_kimi_v2_dead_stream', cwd: os.tmpdir() });
+      streamRuntime.send('turn on dying stream', 'dead-a');
+      await vi.waitFor(() => expect(deadConn.prompt).toHaveBeenCalledTimes(1));
 
-    const capturedChild = state.children[state.children.length - 1]!;
-    let stopSettled = false;
-    const stopWait = streamProvider.cancelAndWait('sess-alive').then(() => { stopSettled = true; });
-    rejectPrompt(new Error('stream pipe closed unexpectedly'));
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(stopSettled).toBe(false);
+      let stopSettled = false;
+      const stopWait = streamProvider.cancelAndWait('deck_kimi_v2_dead_stream').then(() => { stopSettled = true; });
+      const lateProofFn = vi.fn();
+      const lateProof = streamProvider.cancelAndWait('deck_kimi_v2_dead_stream');
+      onConfirmedProviderStop(lateProof, lateProofFn);
 
-    capturedChild.exitCode = 1;
-    capturedChild.emit('exit', 1, null);
-    await stopWait;
-    expect(stopSettled).toBe(true);
-    await streamProvider.disconnect();
+      // Stream rejects with non-RequestError while child process stays alive -> triggers reclaim
+      rejectPrompt(new Error('stream pipe closed unexpectedly'));
+      await controlledKillStarted;
+      await Promise.resolve();
+      expect(stopSettled).toBe(false);
+      expect(lateProofFn).not.toHaveBeenCalled();
+
+      // Dead child finally exits via controlled kill -> confirms original stop proof
+      finishControlledKill();
+      await Promise.all([stopWait, lateProof]);
+      expect(stopSettled).toBe(true);
+      expect(lateProofFn).toHaveBeenCalledTimes(1);
+
+      // Next send establishes a brand-new child + connection instead of reusing the dead stream
+      const queuedNext = streamRuntime.send('recover after dead stream', 'fresh-b');
+      await vi.waitFor(() => expect(freshConn.prompt).toHaveBeenCalledTimes(1));
+
+      resolveNextPrompt({ stopReason: 'end_turn' });
+      await queuedNext;
+      expect(streamProvider.getSessionDiagnostics('deck_kimi_v2_dead_stream')?.connected).toBe(true);
+    } finally {
+      await streamRuntime.kill({ reason: 'test_cleanup' });
+    }
   });
 
   it('keeps bindExistingKey local route separate from native resumeId and emits updated resumeId on reconnect fallback', async () => {
@@ -543,6 +584,60 @@ describe('KimiV2Provider', () => {
     expect(deltas).toEqual([]);
 
     await provider.disconnect();
+  });
+
+  it('prevents disconnect during delayed teardown and endSession during delayed newSession from reviving retired processes or routes', async () => {
+    const conn1 = makeMockConn();
+    state.connQueue.push(conn1);
+
+    const provider = new KimiV2Provider();
+    await provider.connect({ env: { KIMI_API_KEY: 'v1' } } as never);
+    await provider.createSession({ sessionKey: 's-old', cwd: os.tmpdir(), env: { KIMI_API_KEY: 'v1' } });
+    await provider.detachSession('s-old');
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+
+    let resolveTeardownKill!: () => void;
+    mockKillProcessTree.mockImplementationOnce(async (child: { killed?: boolean; exitCode?: number | null; emit?: (ev: string, ...args: unknown[]) => void }) => {
+      await new Promise<void>((r) => { resolveTeardownKill = r; });
+      if (child) {
+        child.killed = true;
+        child.exitCode = 0;
+        child.emit?.('exit', 0, null);
+      }
+    });
+
+    // Start createSession that stalls awaiting teardownChildProcess(), then call disconnect()
+    const inFlightCreate = provider.createSession({ sessionKey: 's-zombie', cwd: os.tmpdir(), env: { KIMI_API_KEY: 'v2' } }).catch((e: Error) => e);
+    await vi.waitFor(() => expect(resolveTeardownKill).toBeTypeOf('function'));
+
+    await provider.disconnect();
+    expect(provider.getSessionDiagnostics('s-zombie')).toBeNull();
+
+    // Release delayed teardown kill -> must NOT spawn or publish child/connection on retired provider
+    resolveTeardownKill();
+    const createErr = await inFlightCreate;
+    expect(createErr).toBeInstanceOf(Error);
+    expect(mockSpawn).toHaveBeenCalledTimes(1);
+    expect(provider.getSessionDiagnostics('s-zombie')).toBeNull();
+
+    // Delayed newSession finishing after endSession must not resurrect the ended route
+    let resolveDelayedNew!: (v: unknown) => void;
+    const delayedConn = makeMockConn({
+      newSession: vi.fn(() => new Promise((r) => { resolveDelayedNew = r; })),
+    });
+    state.connQueue.push(delayedConn);
+    const provider2 = new KimiV2Provider();
+    await provider2.connect({});
+    const delayedCreate = provider2.createSession({ sessionKey: 's-ended', cwd: os.tmpdir() }).catch((e: Error) => e);
+    await vi.waitFor(() => expect(resolveDelayedNew).toBeTypeOf('function'));
+    await provider2.endSession('s-ended');
+
+    resolveDelayedNew({ sessionId: 'zombie-native-id', configOptions: [] });
+    const endedResult = await delayedCreate;
+    expect(endedResult).toBeInstanceOf(Error);
+    expect(provider2.getSessionDiagnostics('s-ended')).toBeNull();
+    expect(provider2.getSessionDiagnostics('zombie-native-id')).toBeNull();
+    await provider2.disconnect();
   });
 
   it('keeps pendingModel unconfirmed after failed switch on reconnect so next send retries model before prompt without recreating session', async () => {

@@ -420,6 +420,7 @@ export class KimiV2Provider implements TransportProvider {
   private providerConfig: ProviderConfig | null = null;
   private child: ChildProcess | null = null;
   private connection: AcpClientConnection | null = null;
+  private lifecycleEpoch = 0;
   private connectionGeneration = 0;
   private connectingState: {
     generation: number;
@@ -502,7 +503,19 @@ export class KimiV2Provider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
+    this.lifecycleEpoch++;
+    this.connectionGeneration++;
+    const childToKill = this.child;
+    this.child = null;
+    this.connection = null;
+    this.connectingState = null;
+    this.connectedFingerprint = null;
+    this.connectedEnvKey = null;
+    this.connCaps = defaultConnectionCapabilities();
+
     const states = Array.from(this.sessions.values());
+    this.sessions.clear();
+    this.acpToRoute.clear();
     for (const state of states) {
       this.rejectPendingApprovals(state, new Error('Provider disconnected'));
       if (state.pendingTurn) {
@@ -510,9 +523,10 @@ export class KimiV2Provider implements TransportProvider {
       }
       this.clearStatus(state.sessionKey, state);
     }
-    this.sessions.clear();
-    this.acpToRoute.clear();
-    await this.teardownChildProcess();
+
+    if (childToKill) {
+      await killProcessTree(childToKill, { ownsProcessGroup: true });
+    }
   }
 
   private resolveBinaryCommand(env: NodeJS.ProcessEnv): ResolvedExecutable {
@@ -545,9 +559,15 @@ export class KimiV2Provider implements TransportProvider {
     return Boolean(this.child && this.child.exitCode === null && this.child.signalCode === null && !this.child.killed);
   }
 
-  private async teardownChildProcess(expectedChild?: ChildProcess | null): Promise<void> {
+  private async teardownChildProcess(expectedChild?: ChildProcess | null, expectedGeneration?: number): Promise<void> {
     if (expectedChild && this.child !== expectedChild) {
       await killProcessTree(expectedChild, { ownsProcessGroup: true });
+      return;
+    }
+    if (expectedGeneration !== undefined && this.connectionGeneration !== expectedGeneration) {
+      if (expectedChild) {
+        await killProcessTree(expectedChild, { ownsProcessGroup: true });
+      }
       return;
     }
     const child = this.child;
@@ -581,8 +601,10 @@ export class KimiV2Provider implements TransportProvider {
       return this.connection;
     }
 
+    const epoch = this.lifecycleEpoch;
     const generation = ++this.connectionGeneration;
     let spawnedChild: ChildProcess | null = null;
+    const isActiveConnect = () => this.lifecycleEpoch === epoch && this.connectionGeneration === generation;
 
     // Publish the in-flight connection transaction synchronously BEFORE awaiting teardown,
     // so concurrent createSession/send callers share this exact recycle + initialize pass.
@@ -590,6 +612,10 @@ export class KimiV2Provider implements TransportProvider {
       const hasActiveTurns = Array.from(this.sessions.values()).some((s) => s.promptInFlight);
       if (this.child && !hasActiveTurns) {
         await this.teardownChildProcess();
+      }
+
+      if (!isActiveConnect()) {
+        throw new Error('Provider disconnected or connection superseded before spawn');
       }
 
       const cwd = normalizeTransportCwd(canonicalizeTransportCwd(sessionConfig?.cwd)) || process.cwd();
@@ -613,7 +639,7 @@ export class KimiV2Provider implements TransportProvider {
       });
 
       child.stderr?.on('data', (chunk: Buffer | string) => {
-        if (this.child !== child || this.connectionGeneration !== generation) return;
+        if (this.child !== child || !isActiveConnect()) return;
         const text = chunk.toString('utf8');
         for (const line of text.split(/\r?\n/)) {
           if (!line.trim()) continue;
@@ -631,7 +657,7 @@ export class KimiV2Provider implements TransportProvider {
             state.lastStopTurn.resolvePhysicalTerminal();
           }
         }
-        if (this.child !== child || this.connectionGeneration !== generation) return;
+        if (this.child !== child || !isActiveConnect()) return;
         this.child = null;
         this.connection = null;
         this.connectedFingerprint = null;
@@ -647,7 +673,7 @@ export class KimiV2Provider implements TransportProvider {
       });
 
       if (!child.stdout || !child.stdin) {
-        await this.teardownChildProcess(child);
+        await this.teardownChildProcess(child, generation);
         throw new Error('Failed to open stdio pipes for kimi acp');
       }
 
@@ -662,7 +688,7 @@ export class KimiV2Provider implements TransportProvider {
       const writable = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
       const stream = ndJsonStream(writable, readable);
 
-      const isCurrentGeneration = () => this.connectionGeneration === generation && this.child === child;
+      const isCurrentGeneration = () => isActiveConnect() && this.child === child;
       const candidateConnection = createAcpClientConnection(
         {
           sessionUpdate: async (notification: SessionNotification) => {
@@ -698,12 +724,12 @@ export class KimiV2Provider implements TransportProvider {
 
       const initOutcome = await withTimeoutOutcome(initRace, this.initTimeoutMs);
       if (initOutcome.timedOut) {
-        await this.teardownChildProcess(child);
+        await this.teardownChildProcess(child, generation);
         throw new Error(`kimi acp initialize timed out after ${this.initTimeoutMs}ms`);
       }
 
       if (!isCurrentGeneration()) {
-        await this.teardownChildProcess(child);
+        await killProcessTree(child, { ownsProcessGroup: true });
         throw new Error('kimi acp connection superseded before initialization completed');
       }
 
@@ -716,10 +742,8 @@ export class KimiV2Provider implements TransportProvider {
     try {
       return await connectPromise;
     } catch (err) {
-      if (spawnedChild && this.child === spawnedChild && this.connectionGeneration === generation) {
-        await this.teardownChildProcess(spawnedChild);
-      } else if (spawnedChild) {
-        await killProcessTree(spawnedChild, { ownsProcessGroup: true });
+      if (spawnedChild) {
+        await this.teardownChildProcess(spawnedChild, generation);
       }
       throw this.normalizeProviderException(err);
     } finally {
@@ -800,6 +824,7 @@ export class KimiV2Provider implements TransportProvider {
   }
 
   private bindNativeSession(providerSessionId: string, state: KimiSessionState): void {
+    if (this.sessions.get(state.sessionKey) !== state) return;
     const prevProviderId = state.providerSessionId;
     if (prevProviderId && prevProviderId !== providerSessionId && this.acpToRoute.get(prevProviderId) === state.sessionKey) {
       this.acpToRoute.delete(prevProviderId);
@@ -916,7 +941,19 @@ export class KimiV2Provider implements TransportProvider {
     options: { allowFresh?: boolean } = {},
   ): Promise<void> {
     const allowFresh = options.allowFresh ?? true;
-    const needsNativeBind = state.boundConnectionGeneration !== this.connectionGeneration || !state.providerSessionId;
+    const epoch = this.lifecycleEpoch;
+    const targetConnGen = this.connectionGeneration;
+    const assertOwned = () => {
+      if (this.lifecycleEpoch !== epoch || this.sessions.get(state.sessionKey) !== state) {
+        throw Object.assign(new Error('Session ended or provider disconnected during setup'), { code: PROVIDER_ERROR_CODES.CANCELLED });
+      }
+      if (this.connection !== connection || this.connectionGeneration !== targetConnGen) {
+        throw Object.assign(new Error('Connection superseded during session setup'), { code: PROVIDER_ERROR_CODES.CONNECTION_LOST });
+      }
+    };
+
+    assertOwned();
+    const needsNativeBind = state.boundConnectionGeneration !== targetConnGen || !state.providerSessionId;
 
     if (!needsNativeBind && !state.pendingModel) {
       return;
@@ -939,10 +976,12 @@ export class KimiV2Provider implements TransportProvider {
               connection.resumeSession({ sessionId: candidateId, cwd: state.cwd, mcpServers: state.mcpServers }),
               this.sessionTimeoutMs,
             );
+            assertOwned();
             if (outcome.timedOut) throw new Error(`kimi acp resumeSession timed out after ${this.sessionTimeoutMs}ms`);
             response = outcome.value;
             boundId = candidateId;
           } catch (err) {
+            assertOwned();
             if (!allowFresh || !isSessionNotFoundError(err)) {
               throw this.normalizeProviderException(err);
             }
@@ -955,10 +994,12 @@ export class KimiV2Provider implements TransportProvider {
               connection.loadSession({ sessionId: candidateId, cwd: state.cwd, mcpServers: state.mcpServers }),
               this.sessionTimeoutMs,
             );
+            assertOwned();
             if (outcome.timedOut) throw new Error(`kimi acp loadSession timed out after ${this.sessionTimeoutMs}ms`);
             response = (outcome.value as LoadSessionResponse | undefined) ?? null;
             boundId = candidateId;
           } catch (err) {
+            assertOwned();
             if (!allowFresh || !isSessionNotFoundError(err)) {
               throw this.normalizeProviderException(err);
             }
@@ -981,6 +1022,12 @@ export class KimiV2Provider implements TransportProvider {
             connection.newSession({ cwd: state.cwd, mcpServers: state.mcpServers }),
             this.sessionTimeoutMs,
           );
+          if (this.lifecycleEpoch !== epoch || this.sessions.get(state.sessionKey) !== state || this.connection !== connection || this.connectionGeneration !== targetConnGen) {
+            if (!outcome.timedOut && outcome.value?.sessionId && typeof connection.closeSession === 'function') {
+              void connection.closeSession({ sessionId: outcome.value.sessionId }).catch(() => {});
+            }
+            assertOwned();
+          }
           if (outcome.timedOut) {
             throw new Error(`kimi acp newSession timed out after ${this.sessionTimeoutMs}ms`);
           }
@@ -993,7 +1040,8 @@ export class KimiV2Provider implements TransportProvider {
         }
       }
 
-      state.boundConnectionGeneration = this.connectionGeneration;
+      assertOwned();
+      state.boundConnectionGeneration = targetConnGen;
 
       const catalog = this.cacheModelsFromResponse(response, state);
       const desiredModel = state.pendingModel ?? state.model;
@@ -1020,6 +1068,7 @@ export class KimiV2Provider implements TransportProvider {
       const requested = state.pendingModel;
       try {
         await this.switchProviderModel(connection, state, requested);
+        assertOwned();
         state.model = requested;
         state.pendingModel = undefined;
         this.emitSessionInfo(state.sessionKey, { model: requested });
@@ -1030,7 +1079,11 @@ export class KimiV2Provider implements TransportProvider {
   }
 
   async createSession(config: SessionConfig): Promise<string> {
+    const epoch = this.lifecycleEpoch;
     await config.beforeNativeSessionStart?.();
+    if (this.lifecycleEpoch !== epoch) {
+      throw new Error('Provider disconnected during session initialization');
+    }
 
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const prior = this.sessions.get(routeId);
@@ -1041,6 +1094,9 @@ export class KimiV2Provider implements TransportProvider {
     }
 
     const connection = await this.ensureConnected(config);
+    if (this.lifecycleEpoch !== epoch) {
+      throw new Error('Provider disconnected during session initialization');
+    }
     const cwd = normalizeTransportCwd(canonicalizeTransportCwd(config.cwd)) || process.cwd();
     const mcpServers = getDefaultAcpMcpServers(config);
     const systemParts = getProviderSystemTextParts({
@@ -1365,6 +1421,7 @@ export class KimiV2Provider implements TransportProvider {
         throw new Error('kimi acp child process unavailable at prompt boundary');
       }
 
+      const boundGeneration = this.connectionGeneration;
       const promptRpc = connection.prompt({
         sessionId: state.providerSessionId,
         prompt: contentBlocks,
@@ -1379,7 +1436,7 @@ export class KimiV2Provider implements TransportProvider {
       capturedChild.once('exit', onCapturedExit);
       capturedChild.once('close', onCapturedExit);
 
-      void this.trackPromptSettlement(promptRpc, capturedChild, onCapturedExit, state, turn);
+      void this.trackPromptSettlement(promptRpc, capturedChild, boundGeneration, onCapturedExit, state, turn);
     } catch (err) {
       const normalizedErr = this.normalizeProviderException(err);
       const code = (normalizedErr as { code?: string }).code ?? inferErrorCode(err);
@@ -1463,6 +1520,7 @@ export class KimiV2Provider implements TransportProvider {
   private async trackPromptSettlement(
     promptRpc: Promise<PromptResponse>,
     capturedChild: ChildProcess,
+    capturedGeneration: number,
     onCapturedExit: () => void,
     state: KimiSessionState,
     turn: PendingTurn,
@@ -1484,6 +1542,9 @@ export class KimiV2Provider implements TransportProvider {
         providerResponded = true;
       }
       await turn.wireSlot;
+      if (!providerResponded) {
+        this.reclaimDeadAcpTransport(capturedChild, capturedGeneration, state, err);
+      }
       if (turn.settled || state.turnGeneration !== turn.generation) return;
       const normalized = this.normalizeProviderException(err);
       const code = turn.cancelled ? PROVIDER_ERROR_CODES.CANCELLED : (normalized as { code?: string }).code ?? inferErrorCode(err);
@@ -1495,6 +1556,48 @@ export class KimiV2Provider implements TransportProvider {
         capturedChild.removeListener('close', onCapturedExit);
         turn.resolvePhysicalTerminal();
       }
+    }
+  }
+
+  /**
+   * When the ACP stream/pipe fails while the OS child process is still alive:
+   * 1) Invalidate the broken connection so future sends never reuse it.
+   * 2) Fail sibling turns sharing that dead connection.
+   * 3) Trigger bounded physical reclaim (`killProcessTree`) without clearing
+   *    physical stop proof until the captured child actually exits.
+   */
+  private reclaimDeadAcpTransport(
+    brokenChild: ChildProcess,
+    brokenGeneration: number,
+    originState: KimiSessionState,
+    cause: unknown,
+  ): void {
+    const childStillAlive = brokenChild.exitCode === null && brokenChild.signalCode === null;
+    if (this.child === brokenChild && this.connectionGeneration === brokenGeneration) {
+      this.connectionGeneration++;
+      this.child = null;
+      this.connection = null;
+      this.connectingState = null;
+      this.connectedFingerprint = null;
+      this.connectedEnvKey = null;
+      this.connCaps = defaultConnectionCapabilities();
+    }
+
+    const msg = cause instanceof Error ? cause.message : 'ACP transport stream closed';
+    for (const sibling of this.sessions.values()) {
+      if (sibling === originState) continue;
+      if (sibling.boundConnectionGeneration !== brokenGeneration) continue;
+      this.rejectPendingApprovals(sibling, new Error(msg));
+      if (sibling.pendingTurn && !sibling.pendingTurn.settled) {
+        this.failTurn(sibling, sibling.pendingTurn, new Error(msg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
+      }
+    }
+
+    if (childStillAlive) {
+      void withTimeoutOutcome(
+        killProcessTree(brokenChild, { ownsProcessGroup: true }),
+        this.closeTimeoutMs,
+      ).catch(() => {});
     }
   }
 
