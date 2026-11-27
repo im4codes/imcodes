@@ -15,6 +15,7 @@ import {
   AGY_MODEL_IDS,
   CLAUDE_CODE_MODEL_IDS,
   CODEX_MODEL_IDS,
+  CURSOR_HEADLESS_MODEL_IDS,
   mergeModelSuggestions,
 } from '../../../src/shared/models/options.js';
 import {
@@ -34,7 +35,7 @@ import {
   type SessionAgentSurface,
 } from './session-agent-options.js';
 
-export const QUICK_CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['auto', 'composer-2.5-fast', 'composer-2.5', 'gpt-5.4', 'claude-4.5-sonnet'] as const;
+export const QUICK_CURSOR_HEADLESS_MODEL_SUGGESTIONS = [...CURSOR_HEADLESS_MODEL_IDS] as const;
 export const QUICK_COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 export const QUICK_MUSE_SDK_MODEL_SUGGESTIONS = ['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast'] as const;
 export const QUICK_AGY_SDK_MODEL_SUGGESTIONS = [...AGY_MODEL_IDS] as const;

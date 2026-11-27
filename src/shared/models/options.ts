@@ -33,6 +33,9 @@ export const DEFAULT_CODEX_SESSION_MODEL = 'gpt-6-sol' as const;
 export const CODEX_MODEL_IDS = [DEFAULT_CODEX_SESSION_MODEL, 'gpt-6.2-sol', 'gpt-5.6-sol', 'gpt-5.6', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', DEFAULT_CODEX_AUTOMATION_MODEL, 'gpt-5.2'] as const;
 export type CodexModelId = typeof CODEX_MODEL_IDS[number];
 
+/** Cursor CLI model IDs verified directly in the installed CLI (`5268.index.js` / `5727.index.js`); other account-authorized models come from runtime `--list-models`. */
+export const CURSOR_HEADLESS_MODEL_IDS = ['auto', 'composer-2.5-fast', 'composer-2.5'] as const;
+
 /**
  * Pattern match for a Codex/OpenAI-shaped model id that the static
  * `CODEX_MODEL_IDS` list doesn't know about yet (a newly released model such

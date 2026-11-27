@@ -265,6 +265,26 @@ describe('parseCursorStreamLine', () => {
       kind: 'result.error',
       message: 'rate limit exceeded',
     });
+
+    // Pre-tool flush carries both timestamp_ms and model_call_id -> skipped to avoid duplicate delta
+    expect(parseCursorStreamLine(JSON.stringify({
+      type: 'assistant',
+      session_id: 'cursor-chat-2026',
+      model_call_id: 'mc_1',
+      timestamp_ms: 1234,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'One segment.' }] },
+    }))).toBeNull();
+
+    // Untimestamped record with model_call_id still serves as assistant.final fallback
+    expect(parseCursorStreamLine(JSON.stringify({
+      type: 'assistant',
+      session_id: 'cursor-chat-2026',
+      model_call_id: 'mc_1',
+      message: { role: 'assistant', content: [{ type: 'text', text: 'Final text.' }] },
+    }))).toMatchObject({
+      kind: 'assistant.final',
+      text: 'Final text.',
+    });
   });
 
   it('ignores invalid or irrelevant records', () => {

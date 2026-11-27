@@ -367,4 +367,30 @@ describe('CursorHeadlessProvider', () => {
     expect(statuses).toContain('thinking');
     expect(statuses.at(-1)).toBeNull();
   });
+
+  it('forwards verified fallback model ids cleanly to --model on start and model switch', async () => {
+    const provider = new CursorHeadlessProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sessionId = await provider.createSession({
+      sessionKey: 'route-fallback-model',
+      cwd: '/tmp/project',
+      agentId: 'composer-2.5-fast',
+      resumeId: 'cursor-chat-fallback-model',
+    });
+
+    await provider.send(sessionId, 'start with fast');
+    const first = harness.lastSpawn();
+    expect(first.args[first.args.indexOf('--model') + 1]).toBe('composer-2.5-fast');
+    first.child.stdout.write(`${JSON.stringify({ type: 'result', subtype: 'success', session_id: 'cursor-chat-fallback-model', result: 'ok' })}\n`);
+    first.child.emit('close', 0, null);
+    await harness.flush();
+
+    provider.setSessionAgentId(sessionId, 'composer-2.5');
+    await provider.send(sessionId, 'switch to composer 2.5');
+    const second = harness.lastSpawn();
+    expect(second.args[second.args.indexOf('--model') + 1]).toBe('composer-2.5');
+    second.child.stdout.write(`${JSON.stringify({ type: 'result', subtype: 'success', session_id: 'cursor-chat-fallback-model', result: 'ok2' })}\n`);
+    second.child.emit('close', 0, null);
+    await harness.flush();
+  });
 });

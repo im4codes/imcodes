@@ -37,6 +37,7 @@ import {
 import {
   AGY_MODEL_IDS,
   CODEX_MODEL_IDS,
+  CURSOR_HEADLESS_MODEL_IDS,
   DEFAULT_CLAUDE_CODE_MODEL_ID,
   DEFAULT_OPENCODE_MODEL_ID,
   mergeModelSuggestions,
@@ -58,7 +59,7 @@ import { IncognitoCreateOption } from './IncognitoCreateOption.js';
 
 /** Upper bound on how many identical sub-sessions one launch can request at once. */
 const MAX_SUB_SESSION_LAUNCH_COUNT = 20;
-const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['auto', 'composer-2.5-fast', 'composer-2.5', 'gpt-5.4', 'claude-4.5-sonnet'] as const;
+const CURSOR_HEADLESS_MODEL_SUGGESTIONS = [...CURSOR_HEADLESS_MODEL_IDS] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
 const MUSE_SDK_MODEL_SUGGESTIONS = ['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast'] as const;

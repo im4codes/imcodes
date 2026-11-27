@@ -1177,11 +1177,11 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /cursor_headless/i }));
-    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.4' } });
+    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'composer-2.5-fast' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('cursor-headless', undefined, '/tmp', undefined, {
-      requestedModel: 'gpt-5.4',
+      requestedModel: 'composer-2.5-fast',
     });
   });
 

@@ -11883,18 +11883,18 @@ afterEach(() => {
           name: 'cursor-headless-session',
           agentType: 'cursor-headless',
           runtimeType: 'transport',
-          activeModel: 'gpt-5.4',
+          activeModel: 'composer-2.5-fast',
         })}
         quickData={makeQuickData() as any}
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /^gpt-5\.4$/i }));
-    fireEvent.click(screen.getAllByRole('button', { name: /gpt-5\.4/i })[1]!);
+    fireEvent.click(screen.getByTestId('session-model-trigger'));
+    fireEvent.click(screen.getByRole('button', { name: /composer-2\.5$/i }));
 
     expectSendPayload(ws, {
       sessionName: 'cursor-headless-session',
-      text: '/model gpt-5.4',
+      text: '/model composer-2.5',
     });
   });
 

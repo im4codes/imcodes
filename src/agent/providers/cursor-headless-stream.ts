@@ -311,6 +311,15 @@ function parseCursorRecord(record: unknown, fallbackSessionId?: string): CursorP
     // parser classified every fragment as `assistant.final`, so nothing streamed
     // and the whole answer appeared at once only when `result` arrived.
     if (typeof record.timestamp_ms === 'number') {
+      // Cursor CLI flushes accumulated segment text right before tool_call / retry
+      // with BOTH `timestamp_ms` and `model_call_id`. Those characters were already
+      // emitted via incremental `textDelta` events; emitting another delta would
+      // duplicate the segment when appended after an earlier segment. Skip it while
+      // preserving legacy `timestamp_ms` deltas without `model_call_id` and
+      // untimestamped final segment records.
+      if (typeof record.model_call_id === 'string' && record.model_call_id.length > 0) {
+        return null;
+      }
       return {
         kind: 'assistant.delta',
         raw: record,

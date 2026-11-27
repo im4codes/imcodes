@@ -13,7 +13,12 @@ import { getProvider } from './provider-registry.js';
 import { DSH_BINARY_ENV, DSH_DEFAULT_BINARY } from './providers/deepseek-harness/runtime.js';
 import { GROK_CLI_BINARY, GROK_CLI_PATH_ENV } from './providers/grok-sdk.js';
 import { PI_BINARY_ENV, PI_DEFAULT_BINARY } from './providers/pi/runtime.js';
-import { getBundledClaudeBinaryCandidates, resolveNodePackageRoot } from './transport-paths.js';
+import {
+  getBundledClaudeBinaryCandidates,
+  getUnixCursorCandidateDirs,
+  getWindowsCursorSearchDirs,
+  resolveNodePackageRoot,
+} from './transport-paths.js';
 
 const CACHE_TTL_MS = 60_000;
 const DEFAULT_PER_AGENT_TIMEOUT_MS = 3_000;
@@ -356,30 +361,17 @@ async function probeCopilotSdk(deps: AgentAvailabilityProbeDeps): Promise<AgentA
 async function probeCursorHeadless(deps: AgentAvailabilityProbeDeps): Promise<AgentAvailabilityEntry> {
   const p = pathModuleFor(deps.platform);
   if (deps.platform !== 'win32') {
-    // Matches `resolveCursorPathForSdk()`: PATH first, then ~/.local/bin / ~/.cursor/bin / common bin dirs for `cursor-agent` or `agent`.
-    const trailingDirs = uniqueNonEmpty([
-      deps.homeDir ? p.join(deps.homeDir, '.local', 'bin') : undefined,
-      deps.homeDir ? p.join(deps.homeDir, '.cursor', 'bin') : undefined,
-      deps.homeDir ? p.join(deps.homeDir, '.npm-global', 'bin') : undefined,
-      '/opt/homebrew/bin',
-      '/usr/local/bin',
-      '/usr/bin',
-      '/bin',
-    ]);
+    // Matches `resolveCursorPathForSdk()` candidate dirs and order: PATH first, then candidate dirs for `cursor-agent` then `agent`.
+    const trailingDirs = getUnixCursorCandidateDirs(deps.homeDir || undefined, p.join);
     for (const bin of ['cursor-agent', 'agent']) {
       const resolved = await resolveCommandExecutable(bin, { trailingDirs, includeWindowsGlobalNpmDirs: false }, deps);
       if (resolved) return { installed: true };
     }
     return { installed: false, reason: 'cursor-agent / agent CLI not found' };
   }
-  const winDirs = uniqueNonEmpty([
-    deps.env.LOCALAPPDATA ? p.join(deps.env.LOCALAPPDATA, 'cursor-agent') : undefined,
-    deps.env.LOCALAPPDATA ? p.join(deps.env.LOCALAPPDATA, 'Programs', 'cursor-agent') : undefined,
-    deps.homeDir ? p.join(deps.homeDir, '.local', 'bin') : undefined,
-    deps.homeDir ? p.join(deps.homeDir, '.cursor', 'bin') : undefined,
-  ]);
+  const winDirs = getWindowsCursorSearchDirs(deps.env, deps.homeDir || undefined, p.join);
   for (const bin of ['cursor-agent', 'agent']) {
-    const resolved = await resolveCommandExecutable(bin, { trailingDirs: winDirs, includeWindowsGlobalNpmDirs: true }, deps);
+    const resolved = await resolveCommandExecutable(bin, { trailingDirs: winDirs, includeWindowsGlobalNpmDirs: false }, deps);
     if (resolved) return { installed: true };
   }
   return { installed: false, reason: 'cursor-agent / agent CLI not found' };

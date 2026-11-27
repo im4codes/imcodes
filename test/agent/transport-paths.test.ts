@@ -150,6 +150,104 @@ describe('resolveCursorPathForSdk (cursor-agent and agent resolution)', () => {
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
     }
   });
+
+  it('skips non-executable 0644 cursor-agent files in PATH and picks downstream executable cursor-agent or agent', () => {
+    if (process.platform === 'win32') return;
+    const origHome = process.env.HOME;
+    const origPath = process.env.PATH;
+    const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cursor-exec-'));
+    try {
+      const badDir = path.join(tmpDir, 'bad-bin');
+      const goodDir = path.join(tmpDir, 'good-bin');
+      const localBin = path.join(tmpDir, '.local', 'bin');
+      fs.mkdirSync(badDir, { recursive: true });
+      fs.mkdirSync(goodDir, { recursive: true });
+      fs.mkdirSync(localBin, { recursive: true });
+
+      // Non-executable 0644 file shadowing PATH
+      const nonExecCursor = path.join(badDir, 'cursor-agent');
+      fs.writeFileSync(nonExecCursor, '#!/bin/sh\nexit 0\n');
+      fs.chmodSync(nonExecCursor, 0o644);
+
+      process.env.HOME = tmpDir;
+      process.env.PATH = badDir;
+      expect(resolveCursorPathForSdk('cursor-agent')).toBe('cursor-agent');
+
+      // Fallback executable agent in ~/.local/bin wins over non-executable PATH entry
+      const localAgent = path.join(localBin, 'agent');
+      fs.writeFileSync(localAgent, '#!/bin/sh\nexit 0\n');
+      fs.chmodSync(localAgent, 0o755);
+      expect(resolveCursorPathForSdk('cursor-agent')).toBe(localAgent);
+
+      // Downstream executable cursor-agent in PATH wins over fallback agent
+      const execCursor = path.join(goodDir, 'cursor-agent');
+      fs.writeFileSync(execCursor, '#!/bin/sh\nexit 0\n');
+      fs.chmodSync(execCursor, 0o755);
+      process.env.PATH = `${badDir}:${goodDir}`;
+      expect(resolveCursorPathForSdk('cursor-agent')).toBe(execCursor);
+    } finally {
+      if (origHome === undefined) delete process.env.HOME;
+      else process.env.HOME = origHome;
+      if (origPath === undefined) delete process.env.PATH;
+      else process.env.PATH = origPath;
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('resolves native Windows agent.cmd launcher to bundled node.exe + index.js without shell:true', () => {
+    const origPlatform = process.platform;
+    const origPath = process.env.PATH;
+    const origPathExt = process.env.PATHEXT;
+    const origLocalAppData = process.env.LOCALAPPDATA;
+    const origUserProfile = process.env.USERPROFILE;
+    const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'cursor-win-cmd-'));
+    try {
+      const cursorRoot = path.join(tmpDir, 'cursor-agent');
+      const verDir = path.join(cursorRoot, 'versions', '2026.11.22-test');
+      fs.mkdirSync(verDir, { recursive: true });
+      const fakeNode = path.join(verDir, 'node.exe');
+      const fakeIndex = path.join(verDir, 'index.js');
+      fs.writeFileSync(fakeNode, 'fake node');
+      fs.writeFileSync(fakeIndex, 'console.log("ok");\n');
+      // Extensionless POSIX file alongside native agent.cmd (must NOT shadow agent.cmd)
+      fs.writeFileSync(path.join(cursorRoot, 'agent'), '#!/bin/sh\n');
+      const agentCmd = path.join(cursorRoot, 'agent.cmd');
+      fs.writeFileSync(agentCmd, [
+        '@echo off',
+        'rem cursor-agent-promote-staged',
+        'if exist "%~dp0versions\\promote-staged.cmd" call "%~dp0versions\\promote-staged.cmd"',
+        '"%~dp0versions\\2026.11.22-test\\node.exe" "--use-system-ca" "%~dp0versions\\2026.11.22-test\\index.js" %*',
+      ].join('\r\n'));
+
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      process.env.PATH = '';
+      process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+      process.env.LOCALAPPDATA = tmpDir;
+      process.env.USERPROFILE = tmpDir;
+
+      const resolved = resolveCursorPathForSdk('cursor-agent');
+      expect(resolved).toBe(agentCmd);
+      const spawnSpec = resolveExecutableForSpawn(resolved);
+      expect(spawnSpec.executable).toBe(fakeNode);
+      expect(spawnSpec.prependArgs).toEqual([fakeIndex]);
+
+      // Dynamic versioned wrapper without literal path inside agent.cmd still unwraps via versions layout
+      fs.writeFileSync(agentCmd, '@echo off\r\nrem cursor-agent dynamic launcher\r\n');
+      const dynamicSpec = resolveExecutableForSpawn(resolved);
+      expect(dynamicSpec.executable).toBe(fakeNode);
+      expect(dynamicSpec.prependArgs).toEqual([fakeIndex]);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+      process.env.PATH = origPath;
+      if (origPathExt === undefined) delete process.env.PATHEXT;
+      else process.env.PATHEXT = origPathExt;
+      if (origLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = origLocalAppData;
+      if (origUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = origUserProfile;
+      try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    }
+  });
 });
 
 describe('parseNpmCmdShim', () => {

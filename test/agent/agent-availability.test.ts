@@ -188,6 +188,24 @@ describe('detectInstalledAgents()', () => {
     expect(winResult['cursor-headless']?.installed).toBe(true);
   });
 
+  it('skips PATH-shadowed non-executable cursor-agent files consistently with runtime launch', async () => {
+    const blockedOnlyDeps = createFakeDeps({
+      env: { PATH: '/bad-bin:/usr/bin' },
+      files: ['/bad-bin/cursor-agent'],
+      executables: [],
+    });
+    const blockedOnly = await detectInstalledAgents({ deps: blockedOnlyDeps });
+    expect(blockedOnly['cursor-headless']?.installed).toBe(false);
+
+    const shadowedWithFallbackDeps = createFakeDeps({
+      env: { PATH: '/bad-bin:/good-bin' },
+      files: ['/bad-bin/cursor-agent'],
+      executables: ['/good-bin/cursor-agent'],
+    });
+    const recovered = await detectInstalledAgents({ deps: shadowedWithFallbackDeps });
+    expect(recovered['cursor-headless']?.installed).toBe(true);
+  });
+
   it('finds bundled SDK runtimes without global CLIs on sparse daemon PATHs', async () => {
     const deps = createFakeDeps({
       env: { PATH: '/usr/bin' },

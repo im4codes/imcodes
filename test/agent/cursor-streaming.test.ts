@@ -183,4 +183,52 @@ describe('CursorHeadlessProvider streaming accumulator', () => {
     expect(statuses.indexOf('connecting')).toBeLessThan(statuses.indexOf('thinking'));
     expect(statuses[statuses.length - 1]).toBeNull();
   });
+
+  it('skips Cursor pre-tool model_call_id assistant flushes so multi-segment turns do not duplicate text', async () => {
+    const provider = new CursorHeadlessProvider();
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    const sessionId = await provider.createSession({
+      sessionKey: 'route-cursor-pretool-flush',
+      cwd: '/tmp/project',
+      resumeId: 'cursor-chat-pretool',
+    });
+
+    const deltas: string[] = [];
+    const completed: string[] = [];
+    provider.onDelta((_sid, delta) => deltas.push(delta.delta));
+    provider.onComplete((_sid, msg) => completed.push(msg.content));
+
+    await provider.send(sessionId, 'run two segments with tools');
+    const spawned = harness.lastSpawn();
+    const write = (record: Record<string, unknown>) => {
+      spawned.child.stdout.write(`${JSON.stringify(record)}\n`);
+    };
+
+    write({ type: 'system', subtype: 'init', session_id: 'cursor-chat-pretool', model: 'Auto' });
+    // Segment 1 deltas
+    write({ type: 'assistant', session_id: 'cursor-chat-pretool', message: { role: 'assistant', content: [{ type: 'text', text: 'One' }] }, timestamp_ms: 1 });
+    write({ type: 'assistant', session_id: 'cursor-chat-pretool', message: { role: 'assistant', content: [{ type: 'text', text: ' segment.' }] }, timestamp_ms: 2 });
+    // Pre-tool flush (carries BOTH timestamp_ms and model_call_id)
+    write({ type: 'assistant', session_id: 'cursor-chat-pretool', message: { role: 'assistant', content: [{ type: 'text', text: 'One segment.' }] }, model_call_id: 'mc_1', timestamp_ms: 3 });
+    write({ type: 'tool_call', subtype: 'started', call_id: 'c1', model_call_id: 'mc_1', tool_call: { readToolCall: { args: { path: 'a.ts' } } } });
+    write({ type: 'tool_call', subtype: 'completed', call_id: 'c1', model_call_id: 'mc_1', tool_call: { readToolCall: { args: { path: 'a.ts' }, result: { success: { content: 'ok' } } } } });
+    // Segment 2 deltas
+    write({ type: 'assistant', session_id: 'cursor-chat-pretool', message: { role: 'assistant', content: [{ type: 'text', text: 'Two' }] }, timestamp_ms: 4 });
+    write({ type: 'assistant', session_id: 'cursor-chat-pretool', message: { role: 'assistant', content: [{ type: 'text', text: ' segments.' }] }, timestamp_ms: 5 });
+    // Pre-tool flush before second tool (must NOT append 'Two segments.' a second time)
+    write({ type: 'assistant', session_id: 'cursor-chat-pretool', message: { role: 'assistant', content: [{ type: 'text', text: 'Two segments.' }] }, model_call_id: 'mc_2', timestamp_ms: 6 });
+    write({ type: 'tool_call', subtype: 'started', call_id: 'c2', model_call_id: 'mc_2', tool_call: { shellToolCall: { args: { command: 'true' } } } });
+    write({ type: 'tool_call', subtype: 'completed', call_id: 'c2', model_call_id: 'mc_2', tool_call: { shellToolCall: { args: { command: 'true' }, result: { success: { stdout: '' } } } } });
+    write({ type: 'result', subtype: 'success', is_error: false, result: 'One segment.Two segments.', session_id: 'cursor-chat-pretool' });
+    spawned.child.emit('close', 0, null);
+    await harness.flush();
+
+    expect(deltas).toEqual([
+      'One',
+      'One segment.',
+      'One segment.Two',
+      'One segment.Two segments.',
+    ]);
+    expect(completed).toEqual(['One segment.Two segments.']);
+  });
 });

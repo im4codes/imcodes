@@ -63,6 +63,7 @@ import { listAgentSkills } from '../api/agent-skills.js';
 import type { AgentSkillEntry } from '@shared/agent-skills.js';
 import { agentSkillSourceLabel, buildAgentSkillMarker } from '@shared/agent-skill-references.js';
 import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
+import { CURSOR_HEADLESS_MODEL_IDS } from '../../../src/shared/models/options.js';
 import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
 import { getActiveCssZoom } from '../ui-scale.js';
 import { useAliases } from '../hooks/useAliases.js';
@@ -2046,7 +2047,7 @@ type P2pMode = string; // 'solo' | single modes | combo pipelines like 'brainsto
 const MODEL_STORAGE_KEY = 'imcodes-model';
 const QWEN_MODEL_STORAGE_KEY = 'imcodes-qwen-model';
 const CODEX_MODELS: CodexModelChoice[] = [...CODEX_MODEL_IDS];
-const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['auto', 'composer-2.5-fast', 'composer-2.5', 'gpt-5.4', 'claude-4.5-sonnet'] as const;
+const CURSOR_HEADLESS_MODEL_SUGGESTIONS = [...CURSOR_HEADLESS_MODEL_IDS] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const MUSE_SDK_MODEL_SUGGESTIONS = ['muse-spark-1.3', 'muse-spark', 'muse-wonder', 'muse-fast'] as const;
 const AGY_SDK_MODEL_SUGGESTIONS = [...AGY_MODEL_IDS] as const;

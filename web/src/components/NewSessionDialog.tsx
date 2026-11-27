@@ -59,6 +59,7 @@ import {
 import {
   AGY_MODEL_IDS,
   CODEX_MODEL_IDS,
+  CURSOR_HEADLESS_MODEL_IDS,
   DEFAULT_CLAUDE_CODE_MODEL_ID,
   DEFAULT_OPENCODE_MODEL_ID,
   mergeModelSuggestions,
@@ -83,7 +84,7 @@ import { requestSessionIdentityRefresh } from '../session-identity-refresh.js';
 
 // Fallback suggestions used only when the daemon probe returns an empty list
 // (offline/unauthenticated). The live list comes from the dynamic models hook.
-const CURSOR_HEADLESS_MODEL_FALLBACK = ["auto", "composer-2.5-fast", "composer-2.5", "gpt-5.4", "claude-4.5-sonnet"] as const;
+const CURSOR_HEADLESS_MODEL_FALLBACK = [...CURSOR_HEADLESS_MODEL_IDS] as const;
 const COPILOT_SDK_MODEL_FALLBACK = ["gpt-5.4", "gpt-5.4-mini"] as const;
 const CODEX_SDK_MODEL_FALLBACK = [...CODEX_MODEL_IDS] as const;
 const MUSE_SDK_MODEL_FALLBACK = ["muse-spark-1.3", "muse-spark", "muse-wonder", "muse-fast", "wander"] as const;
