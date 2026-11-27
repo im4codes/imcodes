@@ -21,6 +21,8 @@ export interface DbUser {
   username: string | null;
   password_hash: string | null;
   display_name: string | null;
+  email?: string | null;
+  email_verified_at?: number | null;
   password_must_change: boolean | null;
   is_admin: boolean;
   status: UserStatus;
@@ -262,6 +264,17 @@ export async function getUserById(db: Database, id: string): Promise<DbUser | nu
 
 export async function getUserByUsername(db: Database, username: string): Promise<DbUser | null> {
   return db.queryOne<DbUser>('SELECT * FROM users WHERE username = $1', [username]);
+}
+
+export async function getUserByEmail(db: Database, email: string): Promise<DbUser | null> {
+  return db.queryOne<DbUser>('SELECT * FROM users WHERE LOWER(email) = $1', [email.trim().toLowerCase()]);
+}
+
+export async function getUserByVerifiedEmail(db: Database, email: string): Promise<DbUser | null> {
+  return db.queryOne<DbUser>(
+    'SELECT * FROM users WHERE LOWER(email) = $1 AND email_verified_at IS NOT NULL',
+    [email.trim().toLowerCase()],
+  );
 }
 
 export async function listAllUsers(db: Database): Promise<DbUser[]> {

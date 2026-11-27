@@ -108,6 +108,7 @@ import {
   type WorkerSessionSyncStatus,
 } from '../../shared/worker-session-snapshot.js';
 import { buildWorkerSessionSyncPlan, type WorkerSessionSyncPlanInput } from './worker-session-sync-plan.js';
+import { maybeBootstrapWelcomeSession, type WelcomeWorkerSyncOutcomeLike } from './welcome-session-bootstrap.js';
 import { buildTransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { getStaleSessionCompressionRun, resolveSessionCompressionWatchRuns } from '../context/summary-compressor.js';
 import {
@@ -1863,11 +1864,45 @@ export async function startup(): Promise<DaemonContext> {
     runStartupEmbeddingBackfill,
     startupBackgroundBaseDelayMs + STARTUP_EMBEDDING_BACKFILL_DELAY_MS,
   );
+  scheduleDaemonStartupBackgroundTask(
+    'welcome default session bootstrap',
+    () => runWelcomeBootstrapNonBlocking(serverLink, Boolean(creds), startupWorkerSessionSyncOutcome),
+    startupBackgroundBaseDelayMs,
+  );
 
   return ctx;
 }
 
-async function reconcileRuntimesAfterWorkerSessionSync(
+export async function runWelcomeBootstrapNonBlocking(
+  serverLink: ServerLink | null,
+  hasWorkerCreds: boolean,
+  workerSyncOutcome: WelcomeWorkerSyncOutcomeLike | null,
+): Promise<void> {
+  if (process.env.VITEST || process.env.NODE_ENV === 'test') return;
+  try {
+    await maybeBootstrapWelcomeSession({
+      hasWorkerCreds,
+      workerSyncOutcome,
+      onSessionCreated: async () => {
+        if (!serverLink) return;
+        try {
+          const sessions = await buildSessionList();
+          serverLink.send({
+            type: 'session_list',
+            daemonVersion: serverLink.daemonVersion,
+            sessions,
+          });
+        } catch (err) {
+          logger.debug({ err }, 'welcome bootstrap session_list broadcast skipped');
+        }
+      },
+    });
+  } catch (err) {
+    logger.warn({ err }, 'welcome bootstrap failed (non-blocking)');
+  }
+}
+
+export async function reconcileRuntimesAfterWorkerSessionSync(
   serverLink: ServerLink | null,
   outcome: WorkerSessionSyncOutcome,
 ): Promise<void> {
@@ -1901,6 +1936,7 @@ async function reconcileRuntimesAfterWorkerSessionSync(
       logger.warn({ err }, 'Worker session sync recovery session_list broadcast failed');
     }
   }
+  void runWelcomeBootstrapNonBlocking(serverLink, true, outcome);
 }
 
 function hasRestorableLocalTransportSessions(

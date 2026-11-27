@@ -43,6 +43,9 @@ export function csrfMiddleware() {
     // Password registration — same rationale as login
     if (path === '/api/auth/password/register') { await next(); return; }
 
+    // Unauthenticated email OTP & password reset flows must work even if a stale cookie remains
+    if (path === '/api/auth/password/reset' || path === '/api/auth/email/send-code') { await next(); return; }
+
     // Token exchange — native app exchanges a one-time nonce for an API key
     // after passkey auth. No session exists yet, and the nonce itself is single-use.
     if (path === '/api/auth/token-exchange') { await next(); return; }

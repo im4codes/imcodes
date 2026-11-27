@@ -10,6 +10,10 @@
 #   Force mirror / direct source, or pass flags:
 #     curl -fsSL https://im.codes/install.sh | bash -s -- --channel dev --source mirror
 #
+#   Skip optional OpenCode CLI auto-install:
+#     curl -fsSL https://im.codes/install.sh | bash -s -- --skip-opencode
+#     # or: IMCODES_SKIP_OPENCODE=1
+#
 # Behavior (no sudo):
 #   1. Source auto-detect: probes a host reachable only on unrestricted networks.
 #      If unreachable, assumes a restricted-network region and uses the mirror
@@ -18,7 +22,9 @@
 #      only when npm is missing do we install Node (portable tarball).
 #   3. Installs with a plain dist-tag (imcodes@<channel>) — no version pin and no
 #      custom upgrade logic; the daemon's own auto-upgrade takes over from here.
-#      To keep that auto-upgrade working without sudo, we fall back to a
+#      Also installs official OpenCode CLI (opencode-ai) if not already present
+#      (idempotent, non-blocking, opt-out via --skip-opencode).
+#      To keep auto-upgrade working without sudo, we fall back to a
 #      user-writable npm prefix when the global one isn't writable; in a
 #      restricted-network region we record the mirror registry in
 #      ~/.imcodes/install.json (NOT the global ~/.npmrc) so the daemon passes it
@@ -30,6 +36,7 @@ CHANNEL="${IMCODES_CHANNEL:-}"
 SOURCE="${IMCODES_SOURCE:-}"
 NODE_MAJOR="${IMCODES_NODE_MAJOR:-24}"
 INSTALL_ROOT="${IMCODES_INSTALL_ROOT:-$HOME/.imcodes}"
+SKIP_OPENCODE="${IMCODES_SKIP_OPENCODE:-}"
 
 # ── Validate NODE_MAJOR ───────────────────────────────────────────────────────
 if [[ ! "$NODE_MAJOR" =~ ^[0-9]+$ ]]; then
@@ -39,10 +46,11 @@ fi
 # ── Parse flags ───────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
   case "$1" in
-    --channel)      CHANNEL="${2:-}"; shift 2 ;;
-    --source)       SOURCE="${2:-}"; shift 2 ;;
-    --node-major)   NODE_MAJOR="${2:-}"; shift 2 ;;
-    --install-root) INSTALL_ROOT="${2:-}"; shift 2 ;;
+    --channel)       CHANNEL="${2:-}"; shift 2 ;;
+    --source)        SOURCE="${2:-}"; shift 2 ;;
+    --node-major)    NODE_MAJOR="${2:-}"; shift 2 ;;
+    --install-root)  INSTALL_ROOT="${2:-}"; shift 2 ;;
+    --skip-opencode) SKIP_OPENCODE="1"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 1 ;;
   esac
 done
@@ -195,6 +203,140 @@ try_install_from_r2() {
   return 0
 }
 
+opencode_skip_enabled() {
+  local raw="${SKIP_OPENCODE:-${IMCODES_SKIP_OPENCODE:-}}"
+  local norm
+  norm=$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')
+  case "$norm" in
+    1|true|yes) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+opencode_bin_path() {
+  if have opencode; then
+    command -v opencode
+    return 0
+  fi
+  if [ -n "${HOME:-}" ] && [ -x "$HOME/.opencode/bin/opencode" ]; then
+    printf '%s\n' "$HOME/.opencode/bin/opencode"
+    return 0
+  fi
+  return 1
+}
+
+opencode_is_installed() {
+  opencode_bin_path >/dev/null 2>&1
+}
+
+OPENCODE_PATH_DIR="${OPENCODE_PATH_DIR:-}"
+_add_path_var() {
+  local var_name="$1" d="${2:-}" cur=""
+  [ -n "$d" ] || return 0
+  case ":${PATH:-}:" in
+    *":$d:"*) ;;
+    *) export PATH="$d${PATH:+:$PATH}" ;;
+  esac
+  eval "cur=\"\${$var_name:-}\""
+  if [ -z "$cur" ]; then
+    eval "$var_name=\"\$d\""
+  else
+    case ":$cur:" in
+      *":$d:"*) ;;
+      *) eval "$var_name=\"\${cur}:\$d\"" ;;
+    esac
+  fi
+}
+
+add_managed_path_dir() {
+  _add_path_var PATH_DIR "${1:-}"
+}
+
+add_opencode_path_dir() {
+  _add_path_var OPENCODE_PATH_DIR "${1:-}"
+}
+
+upsert_rc_path_block() {
+  local rc="$1" path_val="$2" begin="$3" end="$4" esc_path block tmp_rc=""
+  esc_path=$(printf '%s' "$path_val" | sed "s/'/'\\\\''/g")
+  block=$(printf '%s\nexport PATH='\''%s'\'':"$PATH"\n%s' "$begin" "$esc_path" "$end")
+  if [ -f "$rc" ] && grep -qF "$begin" "$rc" 2>/dev/null; then
+    tmp_rc="$(mktemp)" || return 1
+    if ! awk -v b="$begin" -v e="$end" '
+      $0==b {skip=1}
+      skip==0 {print}
+      $0==e {skip=0}
+    ' "$rc" > "$tmp_rc"; then
+      rm -f "$tmp_rc"
+      return 1
+    fi
+    if ! ( printf '\n%s\n' "$block" >> "$tmp_rc" && cat "$tmp_rc" > "$rc" ); then
+      rm -f "$tmp_rc"
+      return 1
+    fi
+    rm -f "$tmp_rc"
+  else
+    printf '\n%s\n' "$block" >> "$rc" || return 1
+  fi
+  return 0
+}
+
+OPENCODE_STATUS=""
+try_install_opencode_cli() {
+  local npm_bin="${1:-npm}" npm_reg="${2:-https://registry.npmjs.org/}"
+  if opencode_skip_enabled; then
+    note "skipping OpenCode CLI install (opted out via --skip-opencode / IMCODES_SKIP_OPENCODE)"
+    OPENCODE_STATUS="skipped"
+    return 0
+  fi
+
+  local oc_ver=""
+  if have opencode; then
+    oc_ver=$(opencode --version 2>/dev/null | head -n1 || true)
+    ok "found opencode${oc_ver:+ $oc_ver} ($(command -v opencode)) — keeping existing install"
+    OPENCODE_STATUS="existing"
+    return 0
+  fi
+
+  if [ -n "${HOME:-}" ] && [ -x "$HOME/.opencode/bin/opencode" ]; then
+    add_opencode_path_dir "$HOME/.opencode/bin"
+    if have opencode; then
+      oc_ver=$(opencode --version 2>/dev/null | head -n1 || true)
+      ok "found opencode${oc_ver:+ $oc_ver} ($HOME/.opencode/bin/opencode, added to PATH) — keeping existing install"
+      OPENCODE_STATUS="existing"
+    else
+      note "WARNING: found $HOME/.opencode/bin/opencode, but could not expose 'opencode' on PATH"
+      OPENCODE_STATUS="unverified"
+    fi
+    return 0
+  fi
+
+  step "Installing OpenCode CLI (opencode-ai) ..."
+  if "$npm_bin" install -g opencode-ai --no-fund --no-audit --registry "$npm_reg"; then
+    if ! have opencode; then
+      local oc_prefix=""
+      oc_prefix=$("$npm_bin" prefix -g 2>/dev/null | head -n1 || true)
+      if [ -n "$oc_prefix" ] && [ -x "$oc_prefix/bin/opencode" ]; then
+        add_opencode_path_dir "$oc_prefix/bin"
+      fi
+    fi
+    if have opencode; then
+      oc_ver=$(opencode --version 2>/dev/null | head -n1 || true)
+      ok "opencode CLI installed${oc_ver:+ ($oc_ver)}"
+      OPENCODE_STATUS="installed"
+    else
+      note "WARNING: opencode-ai npm install finished, but 'opencode' was not found on PATH — IM.codes was installed cleanly."
+      note "  Check npm global bin or retry manually: $npm_bin install -g opencode-ai --registry $npm_reg"
+      OPENCODE_STATUS="unverified"
+    fi
+  else
+    note "WARNING: OpenCode CLI install failed (non-blocking) — IM.codes was installed cleanly. To retry manually later:"
+    note "  $npm_bin install -g opencode-ai --registry $npm_reg"
+    OPENCODE_STATUS="failed"
+  fi
+  return 0
+}
+
 # Test hook: when sourced with IMCODES_INSTALL_LIB=1 (unit tests), stop here so
 # the pure helpers above are available without running the installer's
 # imperative flow. A normal `curl … | bash` or direct run never sets this var.
@@ -293,10 +435,9 @@ else
   tar -xzf "$tmp/node.tar.gz" -C "$node_dir"
   rm -rf "$tmp"
   node_home="$node_dir/$pkg"
-  PATH_DIR="$node_home/bin"
-  export PATH="$PATH_DIR:$PATH"
-  NPM="$PATH_DIR/npm"
-  ok "node $("$PATH_DIR/node" -v) installed"
+  add_managed_path_dir "$node_home/bin"
+  NPM="$node_home/bin/npm"
+  ok "node $("$node_home/bin/node" -v) installed"
 fi
 
 # ── Existing npm whose global dir isn't writable: use a user prefix (no sudo) ──
@@ -310,8 +451,7 @@ if [ "$NPM" = npm ]; then
     step "Global npm dir not writable — using a user prefix (no sudo): $prefix"
     mkdir -p "$prefix"
     npm config set prefix "$prefix"
-    PATH_DIR="$prefix/bin"
-    export PATH="$PATH_DIR:$PATH"
+    add_managed_path_dir "$prefix/bin"
     ok "npm prefix -> $prefix"
   fi
 fi
@@ -351,6 +491,9 @@ else
   "$NPM" install -g "imcodes@$CHANNEL" --no-fund --no-audit --registry "$NPM_REGISTRY"
 fi
 
+# ── Install official OpenCode CLI (idempotent, opt-out, non-blocking) ─────────
+try_install_opencode_cli "$NPM" "$NPM_REGISTRY"
+
 # ── Persist PATH to shell rc files (only when we added a dir) ──────────────────
 #    Written as a single managed block delimited by begin/end markers so a re-run
 #    (e.g. a Node major bump) REPLACES the old block instead of accumulating dead,
@@ -359,27 +502,30 @@ fi
 if [ -n "$PATH_DIR" ]; then
   begin="# >>> IM.codes installer >>>"
   end="# <<< IM.codes installer <<<"
-  # Escape any single quote in the path using the '\'' idiom, then emit
-  #   export PATH='<path>':"$PATH"
-  esc_path=$(printf '%s' "$PATH_DIR" | sed "s/'/'\\\\''/g")
-  block=$(printf '%s\nexport PATH='\''%s'\'':"$PATH"\n%s' "$begin" "$esc_path" "$end")
   for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile"; do
     # Only update files that already exist, except .profile (the POSIX login
     # default) which we may create. Avoids leaving empty rc files for shells the
     # user doesn't use.
     if [ -e "$rc" ] || [ "$rc" = "$HOME/.profile" ]; then
-      if [ -f "$rc" ] && grep -qF "$begin" "$rc" 2>/dev/null; then
-        tmp_rc="$(mktemp)"
-        awk -v b="$begin" -v e="$end" '
-          $0==b {skip=1}
-          skip==0 {print}
-          $0==e {skip=0}
-        ' "$rc" > "$tmp_rc"
-        printf '\n%s\n' "$block" >> "$tmp_rc"
-        cat "$tmp_rc" > "$rc"
-        rm -f "$tmp_rc"
-      else
-        printf '\n%s\n' "$block" >> "$rc"
+      upsert_rc_path_block "$rc" "$PATH_DIR" "$begin" "$end"
+    fi
+  done
+fi
+
+# Dedicated best-effort block for OpenCode CLI PATH so it never clobbers the main
+# `# >>> IM.codes installer >>>` block on re-installs and never aborts install on
+# read-only rc files.
+openCodePathPersistFailed=0
+esc_oc_path=""
+if [ -n "$OPENCODE_PATH_DIR" ]; then
+  oc_begin="# >>> IM.codes OpenCode CLI >>>"
+  oc_end="# <<< IM.codes OpenCode CLI <<<"
+  esc_oc_path=$(printf '%s' "$OPENCODE_PATH_DIR" | sed "s/'/'\\\\''/g")
+  for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.zprofile"; do
+    if [ -e "$rc" ] || [ "$rc" = "$HOME/.profile" ]; then
+      if ! ( upsert_rc_path_block "$rc" "$OPENCODE_PATH_DIR" "$oc_begin" "$oc_end" ) 2>/dev/null; then
+        openCodePathPersistFailed=1
+        note "WARNING: could not persist OpenCode PATH in $rc (non-blocking) — add manually: export PATH='$esc_oc_path':\"\$PATH\""
       fi
     fi
   done
@@ -387,9 +533,28 @@ fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 installed="$(imcodes --version 2>/dev/null || true)"
-printf "\n  ${G}imcodes installed  %s${N}\n\n" "$installed"
+printf "\n  ${G}imcodes installed  %s${N}\n" "$installed"
+case "$OPENCODE_STATUS" in
+  installed|existing)
+    if [ "$openCodePathPersistFailed" = "1" ]; then
+      note "OpenCode CLI: installed; add its bin directory to PATH for shells whose startup file could not be updated:"
+      note "  export PATH='$esc_oc_path':\"\$PATH\""
+    else
+      ok "OpenCode CLI: ready (built-in free models available with zero signup, subject to upstream rate limits & evaluation terms)"
+    fi ;;
+  skipped)
+    note "OpenCode CLI: skipped (install anytime with: npm install -g opencode-ai)" ;;
+  unverified)
+    note "OpenCode CLI: installed by npm, but 'opencode' was not found on PATH (verify npm global bin / open a new shell)" ;;
+  *)
+    note "OpenCode CLI: not installed (IM.codes daemon works normally; retry: npm install -g opencode-ai)" ;;
+esac
+echo ""
 echo "  Next steps:"
-[ -n "$PATH_DIR" ] && echo "    1) Restart your shell  (or: export PATH=\"$PATH_DIR:\$PATH\")"
+hint_path=""
+[ -n "$PATH_DIR" ] && hint_path="$PATH_DIR"
+[ -n "$OPENCODE_PATH_DIR" ] && hint_path="${hint_path:+$hint_path:}$OPENCODE_PATH_DIR"
+[ -n "$hint_path" ] && echo "    1) Restart your shell  (or: export PATH=\"$hint_path:\$PATH\")"
 echo "    2) imcodes bind     # connect this machine to your IM.codes server"
 echo "    3) imcodes          # start the daemon (it keeps itself up to date)"
 echo ""

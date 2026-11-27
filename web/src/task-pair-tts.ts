@@ -27,6 +27,8 @@ export interface TaskPairTtsAnnouncement {
 const IGNORED_VERBS = new Set<string>([
   TASK_PAIR_CHECK_VERB,
   'CLAIM',
+  'PAUSE',
+  'RESUME',
   TASK_PAIR_TITLE_EVENT_VERB,
   TASK_PAIR_MATERIAL_EVENT_VERB,
   TASK_PAIR_CHECKLIST_AUTO_TICK_VERB,

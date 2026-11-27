@@ -99,7 +99,7 @@ export interface SessionPaneProps {
   /** Called with the terminal focus function. */
   onFocusFn?: (fn: () => void) => void;
   /** Called with the chat scroll-to-bottom function. */
-  onChatScrollFn?: (fn: () => void) => void;
+  onChatScrollFn?: (fn: (opts?: { passive?: boolean }) => boolean | void) => void;
   /** Called with the chat input element ref so app.tsx can route keystrokes to it. */
   onInputRef?: (el: HTMLDivElement | null) => void;
   /** Called with the terminal diff applier for this session. */
@@ -119,6 +119,7 @@ export interface SessionPaneProps {
   onToggleSessionPin?: (sessionName: string) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  onSessionSaved?: (fields: { type?: string; requestedModel?: string | null; activeModel?: string | null; modelDisplay?: string | null; ccPreset?: string | null }) => void;
   /** Called after shortcut/action button clicks — use to restore xterm focus. */
   onAfterAction?: () => void;
   /** Open a file preview in the shared floating preview host. */
@@ -184,6 +185,7 @@ export function SessionPane({
   onToggleSessionPin,
   onViewRepo,
   onTransportConfigSaved,
+  onSessionSaved,
   onAfterAction,
   onPreviewFile,
   onOpenLocalWebPreview,
@@ -385,8 +387,8 @@ export function SessionPane({
   }, [isTransportSession, liveSessionState, session]);
 
   // ── Chat scroll + input ref ─────────────────────────────────────────────────
-  const chatScrollFnRef = useRef<(() => void) | null>(null);
-  const setChatScrollFn = useCallback((fn: () => void) => {
+  const chatScrollFnRef = useRef<((opts?: { passive?: boolean }) => boolean | void) | null>(null);
+  const setChatScrollFn = useCallback((fn: (opts?: { passive?: boolean }) => boolean | void) => {
     chatScrollFnRef.current = fn;
     onChatScrollFn?.(fn);
   }, [onChatScrollFn]);
@@ -634,6 +636,7 @@ export function SessionPane({
           stopBlockedByPinned={stopBlockedByPinned}
           onToggleSessionPin={onToggleSessionPin}
           onTransportConfigSaved={onTransportConfigSaved}
+          onSessionSaved={onSessionSaved}
           sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}
           quickData={quickData}
           detectedModel={effectiveDetectedModel}

@@ -48,7 +48,7 @@ describe('LoginPage + real apiFetch auth error propagation', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    render(<LoginPage serverUrl="https://wrong-server.example" onLogin={vi.fn()} />);
+    render(<LoginPage serverUrl="https://wrong-server.example" emailAuthEnabled={false} onLogin={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
     fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
     fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'wrong-pass' } });
@@ -68,7 +68,7 @@ describe('LoginPage + real apiFetch auth error propagation', () => {
       .mockResolvedValueOnce(jsonResponse({ error: 'account_disabled' }, 403));
     vi.stubGlobal('fetch', fetchMock);
 
-    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} />);
+    render(<LoginPage serverUrl="https://app.im.codes" emailAuthEnabled={false} onLogin={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
     fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
     fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'bad' } });
@@ -86,7 +86,7 @@ describe('LoginPage + real apiFetch auth error propagation', () => {
       .mockResolvedValueOnce(jsonResponse({ error: 'invalid_old_password' }, 401));
     vi.stubGlobal('fetch', fetchMock);
 
-    render(<LoginPage serverUrl="https://app.im.codes" onLogin={vi.fn()} />);
+    render(<LoginPage serverUrl="https://app.im.codes" emailAuthEnabled={false} onLogin={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: 'login.password_signin' }));
     fireEvent.input(screen.getByPlaceholderText('login.username_placeholder'), { target: { value: 'alice' } });
     fireEvent.input(screen.getByPlaceholderText('login.password_placeholder'), { target: { value: 'stale-temp-pw' } });

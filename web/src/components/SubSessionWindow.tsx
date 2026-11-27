@@ -114,6 +114,7 @@ interface Props {
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  onSessionSaved?: (fields: { type?: string; requestedModel?: string | null; activeModel?: string | null; modelDisplay?: string | null; ccPreset?: string | null }) => void;
   onLiveSessionStateChange?: (state: SubSession['state']) => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
@@ -142,7 +143,7 @@ interface Props {
   /** Optional: register this sub-session's composer `.controls-input` element with app.tsx. */
   onInputRef?: (el: HTMLDivElement | null) => void;
   /** Optional: register this sub-session's chat scroll-to-bottom callback with app.tsx. */
-  onChatScrollFn?: (fn: () => void) => void;
+  onChatScrollFn?: (fn: (opts?: { passive?: boolean }) => boolean | void) => void;
   /** Optional: called to pin this sub-session to the sidebar. Passes current viewMode. */
   onPin?: (viewMode: 'terminal' | 'chat') => void;
   sessions?: SessionInfo[];
@@ -314,7 +315,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, onAskAnswer, onViewModeChange, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick, zIndex, onFocus, onChatScrollFn, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, pendingTaskQuote, onPendingTaskQuoteConsumed, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, onAskAnswer, onViewModeChange, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onSessionSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick, zIndex, onFocus, onChatScrollFn, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, pendingTaskQuote, onPendingTaskQuoteConsumed, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
   const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(sharedState);
@@ -568,11 +569,11 @@ export function SubSessionWindow({
   const viewModeRef = useRef(viewMode);
   viewModeRef.current = viewMode;
   const termScrollRef = useRef<(() => void) | null>(null);
-  const chatScrollRef = useRef<(() => void) | null>(null);
+  const chatScrollRef = useRef<((opts?: { passive?: boolean }) => boolean | void) | null>(null);
   const onChatScrollFnRef = useRef(onChatScrollFn);
   onChatScrollFnRef.current = onChatScrollFn;
   const onTermScrollBottomFn = useCallback((fn: () => void) => { termScrollRef.current = fn; }, []);
-  const onChatScrollBottomFn = useCallback((fn: () => void) => {
+  const onChatScrollBottomFn = useCallback((fn: (opts?: { passive?: boolean }) => boolean | void) => {
     chatScrollRef.current = fn;
     onChatScrollFnRef.current?.(fn);
   }, []);
@@ -590,7 +591,7 @@ export function SubSessionWindow({
     }
     if (typeof requestAnimationFrame === 'function') {
       const id = requestAnimationFrame(() => {
-        chatScrollRef.current?.();
+        chatScrollRef.current?.({ passive: true });
       });
       return () => cancelAnimationFrame(id);
     }
@@ -1285,6 +1286,7 @@ export function SubSessionWindow({
             onRemoteDesktopClick={onRemoteDesktopClick ? stableOnRemoteDesktopClick : undefined}
             serverId={serverId}
             scopeTaskPairs={showTaskPairPanel}
+            hideTaskPairPanel={!showTaskPairPanel}
             taskPairPanelVisitKey={taskPairPanelVisitKey}
             canManageFileShares={effectiveCanManageFileShares}
             onQuote={addQuote}
@@ -1392,6 +1394,7 @@ export function SubSessionWindow({
         hideWorkflowControls
         canManageFileShares={effectiveCanManageFileShares}
         onTransportConfigSaved={onTransportConfigSaved}
+        onSessionSaved={onSessionSaved}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
         activeThinking={!!activeThinkingTs}
         activeTransportTurn={activeTimelineTurn}

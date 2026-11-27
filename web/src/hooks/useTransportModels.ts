@@ -143,6 +143,22 @@ function normalizeCatalog(entry: CachedTransportModelCatalog | null | undefined,
   };
 }
 
+function hasNonEmptyPresetSuffix(catalogIdentity: string): boolean {
+  const parts = catalogIdentity.split('\0');
+  return parts.length >= 3 && (parts[parts.length - 1]?.trim().length ?? 0) > 0;
+}
+
+export function buildTransportModelCatalogIdentity(options: {
+  agentType?: string | null;
+  ccPreset?: string | null;
+  sessionName?: string | null;
+  targetScope?: string | null;
+}): string {
+  const scope = options.targetScope?.trim() ?? '';
+  const baseIdentity = `${options.sessionName?.trim() ?? ''}\0${options.agentType ?? ''}\0${options.ccPreset?.trim().toLowerCase() ?? ''}`;
+  return scope ? `${scope}\0${baseIdentity}` : baseIdentity;
+}
+
 export function readCachedTransportModels(
   catalogIdentity: string,
   agentType?: string | null,
@@ -150,10 +166,12 @@ export function readCachedTransportModels(
 ): CachedTransportModelCatalog | null {
   const storage = getSessionStorage();
   const hasTargetScope = Boolean(targetScope?.trim());
+  const hasPreset = hasNonEmptyPresetSuffix(catalogIdentity);
   // Creation dialogs pass an explicit targetScope so preset and non-preset
   // routes stay strictly isolated under the full catalogIdentity. Unscoped
-  // callers preserve the existing session -> provider cache precedence.
-  const keys = !hasTargetScope && agentType
+  // callers preserve the existing session -> provider cache precedence ONLY when
+  // no custom preset is active so preset catalogs never poison first-party reads.
+  const keys = !hasTargetScope && !hasPreset && agentType
     ? [catalogIdentity, `\0${agentType}\0`]
     : [catalogIdentity];
   for (const key of keys) {
@@ -171,6 +189,9 @@ export function readCachedTransportModels(
       } catch { /* corrupt or inaccessible storage: use the next cache or fallback */ }
     }
   }
+  // Custom presets resolve their own third-party endpoints and model IDs from
+  // the daemon; never synthesize first-party static models on a cold preset cache.
+  if (hasPreset) return null;
   const fallback = getStaticFallbackModels(agentType);
   return fallback ? {
     models: fallback.models,
@@ -188,8 +209,9 @@ export function writeCachedTransportModels(
   const catalog = normalizeCatalog(entry, agentType);
   if (!catalog) return;
   const hasTargetScope = Boolean(targetScope?.trim());
+  const hasPreset = hasNonEmptyPresetSuffix(catalogIdentity);
   memoryModelCatalogCache.set(catalogIdentity, catalog);
-  if (!hasTargetScope && agentType) {
+  if (!hasTargetScope && !hasPreset && agentType) {
     memoryModelCatalogCache.set(`\0${agentType}\0`, catalog);
   }
   const storage = getSessionStorage();
@@ -197,7 +219,7 @@ export function writeCachedTransportModels(
     try {
       const serialized = JSON.stringify(catalog);
       storage.setItem(STORAGE_PREFIX + catalogIdentity, serialized);
-      if (!hasTargetScope && agentType) {
+      if (!hasTargetScope && !hasPreset && agentType) {
         storage.setItem(STORAGE_PREFIX + `\0${agentType}\0`, serialized);
       }
     } catch { /* quota exceeded or storage disabled */ }
@@ -219,6 +241,23 @@ export function supportsDynamicTransportModels(
  *  expose. Hardcoded suggestions drift; this hook keeps the picker in sync.
  *  The fetch is lazy: pass `undefined`/`null` for `agentType` to suspend it.
  */
+function buildInitialModelState(
+  catalogIdentity: string,
+  agentType: string | undefined | null,
+  scope: string,
+): TransportModelState {
+  if (!supportsDynamicTransportModels(agentType)) {
+    return { models: [], loading: false };
+  }
+  const cached = readCachedTransportModels(catalogIdentity, agentType, scope);
+  return {
+    models: cached?.models ?? [],
+    defaultModel: cached?.defaultModel,
+    isAuthenticated: cached?.isAuthenticated,
+    loading: false,
+  };
+}
+
 export function useTransportModels(
   ws: WsClient | null,
   agentType: string | undefined | null,
@@ -231,21 +270,24 @@ export function useTransportModels(
   // completely different providers and model sets. Never retain or fall back
   // to another node's entries while switching targets.
   const scope = targetScope?.trim() ?? '';
-  const baseIdentity = `${sessionName?.trim() ?? ''}\0${agentType ?? ''}\0${ccPreset?.trim().toLowerCase() ?? ''}`;
-  const catalogIdentity = scope ? `${scope}\0${baseIdentity}` : baseIdentity;
-  const [state, setState] = useState<TransportModelState>(() => {
-    const cached = readCachedTransportModels(catalogIdentity, agentType, scope);
-    return {
-      models: cached?.models ?? [],
-      defaultModel: cached?.defaultModel,
-      isAuthenticated: cached?.isAuthenticated,
-      loading: false,
-    };
+  const catalogIdentity = buildTransportModelCatalogIdentity({
+    agentType,
+    ccPreset,
+    sessionName,
+    targetScope: scope,
   });
+  const [stateEntry, setStateEntry] = useState<{ identity: string; state: TransportModelState }>(() => ({
+    identity: catalogIdentity,
+    state: buildInitialModelState(catalogIdentity, agentType, scope),
+  }));
   const latestRequestId = useRef<string | null>(null);
   const acceptedReplySequence = useRef(0);
   const currentCatalogIdentity = useRef(catalogIdentity);
   const wsConnected = !!ws?.connected;
+
+  const activeState = stateEntry.identity === catalogIdentity
+    ? stateEntry.state
+    : buildInitialModelState(catalogIdentity, agentType, scope);
 
   const fetchModels = useCallback(
     (force: boolean) => {
@@ -253,19 +295,25 @@ export function useTransportModels(
       currentCatalogIdentity.current = catalogIdentity;
       const cached = readCachedTransportModels(catalogIdentity, agentType, scope);
       const retainCatalog = (loading: boolean, error?: string) => {
-        setState((prev) => ({
-          ...(!providerChanged && prev.models.length > 0 ? prev : {
-            models: cached?.models ?? [],
-            defaultModel: cached?.defaultModel,
-            isAuthenticated: cached?.isAuthenticated,
-          }),
-          loading,
-          error,
-        }));
+        setStateEntry((prev) => {
+          const sameIdentity = prev.identity === catalogIdentity && !providerChanged;
+          return {
+            identity: catalogIdentity,
+            state: {
+              ...(sameIdentity && prev.state.models.length > 0 ? prev.state : {
+                models: cached?.models ?? [],
+                defaultModel: cached?.defaultModel,
+                isAuthenticated: cached?.isAuthenticated,
+              }),
+              loading,
+              error,
+            },
+          };
+        });
       };
       if (!supportsDynamicTransportModels(agentType)) {
         latestRequestId.current = null;
-        setState({ models: [], loading: false });
+        setStateEntry({ identity: catalogIdentity, state: { models: [], loading: false } });
         return;
       }
       // A refresh can race a disconnect. Keep this target's last good catalog
@@ -318,7 +366,7 @@ export function useTransportModels(
       return;
     }
     if (!supportsDynamicTransportModels(agentType)) {
-      setState({ models: [], loading: false });
+      setStateEntry({ identity: catalogIdentity, state: { models: [], loading: false } });
       latestRequestId.current = null;
       currentCatalogIdentity.current = catalogIdentity;
       return;
@@ -349,16 +397,24 @@ export function useTransportModels(
         ...(typeof raw.isAuthenticated === 'boolean' ? { isAuthenticated: raw.isAuthenticated } : {}),
       }, agentType);
       if (catalog) writeCachedTransportModels(catalogIdentity, agentType, catalog, scope);
-      setState((prev) => ({
-        ...(catalog ?? prev),
-        error: undefined,
-        ...(!catalog && typeof raw.defaultModel === 'string' ? { defaultModel: raw.defaultModel } : {}),
-        ...(typeof raw.isAuthenticated === 'boolean'
-          ? { isAuthenticated: raw.isAuthenticated }
-          : {}),
-        ...(typeof raw.error === 'string' ? { error: raw.error } : {}),
-        loading: false,
-      }));
+      setStateEntry((prev) => {
+        const base = prev.identity === catalogIdentity
+          ? prev.state
+          : buildInitialModelState(catalogIdentity, agentType, scope);
+        return {
+          identity: catalogIdentity,
+          state: {
+            ...(catalog ?? base),
+            error: undefined,
+            ...(!catalog && typeof raw.defaultModel === 'string' ? { defaultModel: raw.defaultModel } : {}),
+            ...(typeof raw.isAuthenticated === 'boolean'
+              ? { isAuthenticated: raw.isAuthenticated }
+              : {}),
+            ...(typeof raw.error === 'string' ? { error: raw.error } : {}),
+            loading: false,
+          },
+        };
+      });
     });
 
     // Grok, Hermes, Antigravity, and OpenCode require a live provider catalog
@@ -378,7 +434,7 @@ export function useTransportModels(
   }, [ws, wsConnected, agentType, ccPreset, catalogIdentity, scope, fetchModels]);
 
   return {
-    ...state,
+    ...activeState,
     refresh: () => fetchModels(true),
   };
 }

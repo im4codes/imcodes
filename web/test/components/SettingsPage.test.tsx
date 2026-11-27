@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { apiFetch } from '../../src/api.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -326,5 +327,61 @@ describe('SettingsPage', () => {
     expect(authSessionArg.url).not.toContain('/api/auth/passkey/native');
     expect(passkeyVerifyBeginMock).not.toHaveBeenCalled();
     expect(startAuthenticationMock).not.toHaveBeenCalled();
+  });
+
+  it('shows bind-email card and requires email verification code for password change when emailAuthEnabled is true', async () => {
+    const apiFetchMock = vi.mocked(apiFetch);
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/email/config') return { emailAuthEnabled: true };
+      if (path === '/api/auth/user/me') return { id: 'u1', username: 'alice', email: null, email_verified: false };
+      if (path === '/api/auth/email/send-code') return { ok: true };
+      if (path === '/api/auth/email/bind') return { ok: true, email: 'alice@example.com', email_verified: true };
+      return { ok: false };
+    });
+    passwordChangeMock.mockResolvedValueOnce(undefined);
+
+    render(
+      <SettingsPage
+        displayName="Alice"
+        username="alice"
+        hasPassword
+        initialTab="security"
+        onBack={vi.fn()}
+        onDisplayNameChanged={vi.fn()}
+        onUserAuthUpdated={vi.fn()}
+      />,
+    );
+
+    const emailCard = await screen.findByTestId('settings-email-card');
+    expect(emailCard).toBeDefined();
+
+    // Bind email
+    fireEvent.input(screen.getByPlaceholderText('settings.email_placeholder'), { target: { value: 'alice@example.com' } });
+    fireEvent.click(screen.getByRole('button', { name: 'settings.send_email_code' }));
+    await waitFor(() => {
+      expect(apiFetchMock).toHaveBeenCalledWith(
+        '/api/auth/email/send-code',
+        expect.objectContaining({ method: 'POST' }),
+      );
+    });
+    fireEvent.input(screen.getByPlaceholderText('settings.email_code_placeholder'), { target: { value: '123456' } });
+    fireEvent.click(screen.getByRole('button', { name: 'settings.bind_email_btn' }));
+
+    await waitFor(() => {
+      expect(screen.getByText('settings.email_bound_success')).toBeDefined();
+      expect(screen.getByText('alice@example.com')).toBeDefined();
+    });
+    expect(screen.queryByRole('button', { name: 'settings.change_email_btn' })).toBeNull();
+
+    // Now Change Password displays verification code input and passes 3rd emailCode argument
+    fireEvent.input(screen.getByPlaceholderText('settings.old_password'), { target: { value: 'OldPass1!' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.new_password'), { target: { value: 'NewPass2!' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.confirm_password'), { target: { value: 'NewPass2!' } });
+    fireEvent.input(screen.getByPlaceholderText('settings.email_code_placeholder'), { target: { value: '654321' } });
+    fireEvent.click(screen.getByRole('button', { name: 'settings.change_password_btn' }));
+
+    await waitFor(() => {
+      expect(passwordChangeMock).toHaveBeenCalledWith('OldPass1!', 'NewPass2!', '654321');
+    });
   });
 });

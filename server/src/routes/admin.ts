@@ -3,12 +3,14 @@
  */
 
 import { Hono } from 'hono';
+import { z } from 'zod';
 import type { Env } from '../env.js';
 import { getUserById, listAllUsers, updateUserStatus, disableUserEndingSessions, deleteUser, countActiveAdmins, getAllSettings, setSetting } from '../db/queries.js';
 import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
 import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
 import { closeConnectionsOfInactiveUsers } from '../ws/account-watch.js';
+import { EmailServiceError, getEmailConfigStatus, sendEmail } from '../services/email.js';
 
 export const adminRoutes = new Hono<{ Bindings: Env }>();
 
@@ -135,4 +137,82 @@ adminRoutes.put('/settings', async (c) => {
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAudit({ userId: c.get('adminUserId' as never) as string, action: 'admin.update_settings', ip, details: changed }, c.env.DB);
   return c.json({ ok: true });
+});
+
+// ── Email status & test send ──────────────────────────────────────────────
+
+const emailTestSchema = z.object({
+  // Preserve raw string (no .trim()) so sendEmail detects leading/trailing CR/LF/NUL injection before normalizing.
+  to: z.string().min(1),
+  subject: z.string().optional(),
+  text: z.string().optional(),
+  html: z.string().optional(),
+  provider: z.enum(['auto', 'aws_ses', 'aliyun_dm']).optional(),
+});
+
+adminRoutes.get('/email/status', (c) => {
+  return c.json(getEmailConfigStatus(c.env));
+});
+
+adminRoutes.post('/email/test', async (c) => {
+  const rawBody = await c.req.json().catch(() => null);
+  const parsed = emailTestSchema.safeParse(rawBody);
+  if (!parsed.success) {
+    return c.json({ error: 'invalid_body' }, 400);
+  }
+
+  const { to, subject, text, html, provider } = parsed.data;
+  const effectiveSubject = subject ?? 'IM.codes Email Delivery Test';
+  const effectiveText =
+    text === undefined && html === undefined
+      ? 'This is a test email from IM.codes server email service.'
+      : text;
+
+  try {
+    const result = await sendEmail(
+      c.env,
+      {
+        to,
+        subject: effectiveSubject,
+        ...(effectiveText !== undefined ? { text: effectiveText } : {}),
+        ...(html !== undefined ? { html } : {}),
+      },
+      provider && provider !== 'auto' ? { provider } : undefined,
+    );
+    const trimmedTo = to.trim();
+    const at = trimmedTo.lastIndexOf('@');
+    const recipientDomain = at === -1 ? 'unknown' : trimmedTo.slice(at + 1).toLowerCase();
+    const ip = c.get('clientIp' as never) as string ?? 'unknown';
+    await logAudit(
+      {
+        userId: c.get('adminUserId' as never) as string,
+        action: 'admin.email_test',
+        ip,
+        details: {
+          provider: result.provider,
+          fallbackUsed: result.fallbackUsed,
+          recipientDomain,
+          messageId: result.messageId,
+        },
+      },
+      c.env.DB,
+    );
+    return c.json({
+      ok: true,
+      provider: result.provider,
+      messageId: result.messageId,
+      fallbackUsed: result.fallbackUsed,
+    });
+  } catch (err) {
+    if (err instanceof EmailServiceError) {
+      if (err.code === 'email_invalid_input') {
+        return c.json({ error: err.code, message: err.message }, 400);
+      }
+      if (err.code === 'email_not_configured' || err.code === 'email_provider_not_configured') {
+        return c.json({ error: err.code, message: err.message }, 503);
+      }
+      return c.json({ error: err.code, message: err.message }, 502);
+    }
+    return c.json({ error: 'email_send_failed', message: 'Failed to send test email' }, 502);
+  }
 });

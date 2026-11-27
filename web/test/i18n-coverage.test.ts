@@ -1272,4 +1272,62 @@ describe('generic i18n coverage guard', () => {
       expect(String(readPath(messages, 'pc_app_update.error_body'))).toContain('{{error}}');
     }
   });
+
+  it('keeps email-auth login.* and settings.* keys localized across all 7 locales', () => {
+    const keys = [
+      'login.username_or_email_placeholder',
+      'login.email_placeholder',
+      'login.email_code_placeholder',
+      'login.send_email_code',
+      'login.resend_email_code',
+      'login.forgot_password',
+      'login.forgot_password_hint',
+      'login.reset_password_btn',
+      'login.password_reset_success',
+      'login.password_register_email_hint',
+      'login.email_auth_disabled',
+      'login.invalid_email',
+      'login.email_taken',
+      'login.email_required',
+      'login.email_code_required',
+      'login.email_code_invalid',
+      'login.email_code_expired',
+      'login.email_code_rate_limited',
+      'login.email_not_verified',
+      'login.email_send_failed',
+      'settings.email_title',
+      'settings.email_verified_badge',
+      'settings.email_unbound_hint',
+      'settings.email_placeholder',
+      'settings.email_code_placeholder',
+      'settings.send_email_code',
+      'settings.resend_email_code',
+      'settings.bind_email_btn',
+      'settings.change_email_btn',
+      'settings.email_bound_success',
+      'settings.email_change_pw_hint',
+      'settings.email_taken',
+      'settings.invalid_email',
+      'settings.email_code_required',
+      'settings.email_code_invalid',
+      'settings.email_code_expired',
+      'settings.email_code_rate_limited',
+      'settings.email_not_verified',
+      'settings.email_already_verified',
+      'settings.email_send_failed',
+    ];
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as Record<string, any>;
+      for (const key of keys) {
+        const val = readPath(messages, key);
+        expect(typeof val, `${locale}:${key}`).toBe('string');
+        expect((val as string).trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+      expect(String(readPath(messages, 'login.resend_email_code'))).toContain('{{seconds}}');
+      expect(String(readPath(messages, 'login.email_code_rate_limited'))).toContain('{{seconds}}');
+      expect(String(readPath(messages, 'settings.resend_email_code'))).toContain('{{seconds}}');
+      expect(String(readPath(messages, 'settings.email_code_rate_limited'))).toContain('{{seconds}}');
+      expect(String(readPath(messages, 'settings.email_change_pw_hint'))).toContain('{{email}}');
+    }
+  });
 });

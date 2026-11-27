@@ -220,6 +220,11 @@ export function classifyTaskPairNotificationType(
     return PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE;
   }
 
+  // Task resume / scheduling-clear projections never trigger push notifications:
+  if (v === 'RESUME') {
+    return null;
+  }
+
   // Task paused / awaiting decision:
   if (v === 'PAUSE' || scheduling?.manual === true) {
     return PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED;

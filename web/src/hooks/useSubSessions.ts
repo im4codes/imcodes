@@ -1032,7 +1032,7 @@ export function useSubSessions(
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
   const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession,
     'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'state' | 'authoritativeIdleAt' | 'transportConfig'
-    | 'requestedModel' | 'activeModel' | 'modelDisplay'
+    | 'ccPresetId' | 'requestedModel' | 'activeModel' | 'modelDisplay'
   >>) => {
     setSubSessions((prev) => {
       const idx = prev.findIndex((s) => s.id === id);

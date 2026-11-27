@@ -5,6 +5,8 @@ import {
   MODEL_DROPDOWN_TRIGGER_GAP_PX,
   MODEL_DROPDOWN_VIEWPORT_HEIGHT_CAP_RATIO,
   readSafeAreaBottomPx,
+  readSafeAreaLeftPx,
+  readSafeAreaRightPx,
   readSafeAreaTopPx,
 } from '../src/util/model-dropdown-style.js';
 
@@ -272,5 +274,93 @@ describe('computeModelDropdownStyle', () => {
 
     expect(readSafeAreaTopPx(document)).toBe(59);
     expect(readSafeAreaBottomPx(document)).toBe(34);
+  });
+
+  it('clamps wide two-column split menus inside desktop, 390px, and 320px viewports', () => {
+    // 1440x900 desktop: left-half trigger opens flush; center-right shifts safely; far-right aligns right
+    const desktopLeft = computeModelDropdownStyle(
+      { top: 820, bottom: 852, left: 100, right: 180, width: 80 },
+      { innerWidth: 1440, innerHeight: 900, safeAreaTop: 0 },
+      { minWidth: 340, preferredWidth: 416 },
+    );
+    expect(desktopLeft.left).toBe('100px');
+    expect(desktopLeft.minWidth).toBe('340px');
+    expect(desktopLeft.maxWidth).toBe('1332px');
+
+    const desktopFarRight = computeModelDropdownStyle(
+      { top: 820, bottom: 852, left: 1340, right: 1420, width: 80 },
+      { innerWidth: 1440, innerHeight: 900, safeAreaTop: 0 },
+      { minWidth: 340, preferredWidth: 416 },
+    );
+    expect(desktopFarRight.right).toBe('20px');
+    expect(desktopFarRight.left).toBe('auto');
+
+    // 390x844 mobile: trigger near right side shifts inward so 374px menu fits within [8, 382]
+    const mobile390Right = computeModelDropdownStyle(
+      { top: 760, bottom: 794, left: 240, right: 320, width: 80 },
+      { innerWidth: 390, innerHeight: 844, safeAreaTop: 47, safeAreaBottom: 34 },
+      { minWidth: 280, preferredWidth: 374, viewportHeightCapRatio: 0.46, maxHeightPx: 340 },
+    );
+    expect(mobile390Right.right).toBe('8px');
+    expect(mobile390Right.maxWidth).toBe('374px');
+    expect(mobile390Right.minWidth).toBe('280px');
+    expect(evalCssPx(mobile390Right.maxHeight, { sat: 47 })).toBe(340);
+
+    // 390x844 mobile: trigger on left half shifts left inset to 8px when preferredWidth = 374
+    const mobile390Left = computeModelDropdownStyle(
+      { top: 760, bottom: 794, left: 30, right: 110, width: 80 },
+      { innerWidth: 390, innerHeight: 844, safeAreaTop: 47, safeAreaBottom: 34 },
+      { minWidth: 280, preferredWidth: 374, viewportHeightCapRatio: 0.46, maxHeightPx: 340 },
+    );
+    expect(mobile390Left.left).toBe('8px');
+    expect(mobile390Left.maxWidth).toBe('374px');
+
+    // 320x568 ultra-narrow mobile: clamps both maxWidth and preferred/min width inside [8, 312]
+    const mobile320 = computeModelDropdownStyle(
+      { top: 500, bottom: 534, left: 180, right: 260, width: 80 },
+      { innerWidth: 320, innerHeight: 568, safeAreaTop: 0, safeAreaBottom: 0 },
+      { minWidth: 280, preferredWidth: 374, viewportHeightCapRatio: 0.46, maxHeightPx: 340 },
+    );
+    expect(mobile320.right).toBe('8px');
+    expect(mobile320.maxWidth).toBe('304px');
+    expect(mobile320.minWidth).toBe('280px');
+    expect(evalCssPx(mobile320.maxHeight)).toBe(Math.floor(568 * 0.46));
+
+    // Short keyboard-open mobile viewport stays bounded above trigger and below safeAreaTop
+    const mobileKeyboard = computeModelDropdownStyle(
+      { top: 330, bottom: 364, left: 180, right: 260, width: 80 },
+      { innerWidth: 390, innerHeight: 844, visualViewportWidth: 390, visualViewportHeight: 390, safeAreaTop: 47, safeAreaBottom: 34 },
+      { minWidth: 280, preferredWidth: 374, viewportHeightCapRatio: 0.46, maxHeightPx: 340 },
+    );
+    expect(evalCssPx(mobileKeyboard.maxHeight, { sat: 47 })).toBe(179);
+
+    // Non-zero horizontal safe areas + VisualViewport offsetLeft/offsetTop intersection
+    const notchedLandscape = computeModelDropdownStyle(
+      { top: 320, bottom: 352, left: 300, right: 380, width: 80 },
+      {
+        innerWidth: 390,
+        innerHeight: 844,
+        visualViewportWidth: 350,
+        visualViewportHeight: 420,
+        visualViewportOffsetLeft: 20,
+        visualViewportOffsetTop: 24,
+        safeAreaTop: 47,
+        safeAreaBottom: 34,
+        safeAreaLeft: 22,
+        safeAreaRight: 22,
+      },
+      { minWidth: 280, preferredWidth: 374, viewportHeightCapRatio: 0.46, maxHeightPx: 340 },
+    );
+    // visibleRight = 370 => rightInsetFromLayoutRight = max(20, 22) + 8 = 30; leftSafeBoundary = max(20, 22) + 8 = 30
+    expect(notchedLandscape.right).toBe('30px');
+    expect(notchedLandscape.maxWidth).toBe('330px');
+    expect(evalCssPx(notchedLandscape.maxHeight, { sat: 47, sab: 34 })).toBe(193);
+
+    document.documentElement.style.setProperty('--sal', '22px');
+    document.documentElement.style.setProperty('--sar', '22px');
+    expect(readSafeAreaLeftPx(document)).toBe(22);
+    expect(readSafeAreaRightPx(document)).toBe(22);
+    document.documentElement.style.removeProperty('--sal');
+    document.documentElement.style.removeProperty('--sar');
   });
 });

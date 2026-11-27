@@ -1013,6 +1013,8 @@ describe('TaskPairStatusPanel', () => {
     const originalRaf = window.requestAnimationFrame;
     const originalObserver = globalThis.ResizeObserver;
     const originalViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    const originalInnerWidth = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 650 });
     Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
     const frames: FrameRequestCallback[] = [];
@@ -1056,6 +1058,7 @@ describe('TaskPairStatusPanel', () => {
       globalThis.ResizeObserver = originalObserver;
       if (originalViewport) Object.defineProperty(window, 'visualViewport', originalViewport);
       else delete (window as { visualViewport?: unknown }).visualViewport;
+      if (originalInnerWidth) Object.defineProperty(window, 'innerWidth', originalInnerWidth);
     }
   });
 
@@ -1360,15 +1363,12 @@ describe('TaskPairStatusPanel', () => {
     expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
   });
 
-  const readCss = () => {
-    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
-    return readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
-  };
   const cssRule = (css: string, selector: string) =>
     new RegExp(`${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
 
   it('shrinks a collapsed titlebar panel to its strip instead of keeping the expanded height', () => {
-    const css = readCss();
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
     const desktop = cssRule(css, '.chat-titlebar > .task-pair-status-panel.is-collapsed');
     expect(desktop).toMatch(/height:\s*auto/);
     expect(desktop).toMatch(/max-height:\s*none/);
@@ -1378,7 +1378,8 @@ describe('TaskPairStatusPanel', () => {
   });
 
   it('keeps the collapsed mobile strip borderless and no taller than the titlebar line', () => {
-    const css = readCss();
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
     // Keyed on .is-mobile, not a width query: wide mobile WebViews must match too.
     const mobile = css.slice(0, css.indexOf('@media (max-width: 720px) {\n  .task-pair-status-panel {'));
     const container = cssRule(mobile, '.task-pair-status-panel.is-mobile.is-collapsed');
@@ -1392,7 +1393,8 @@ describe('TaskPairStatusPanel', () => {
   });
 
   it('fills its parent height with the rows list owning the scroll, not a fixed height on the panel', () => {
-    const css = readCss();
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
     const panelRule = cssRule(css, '.task-pair-status-panel');
     expect(panelRule).toMatch(/bottom:\s*0/);
     expect(panelRule).toMatch(/display:\s*flex/);
@@ -1405,7 +1407,8 @@ describe('TaskPairStatusPanel', () => {
   });
 
   it('anchors the expanded panel to chat-main and reserves scroll room for the final row', () => {
-    const css = readCss();
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
     const directPanel = /\.chat-main > \.task-pair-status-panel:not\(\.is-collapsed\) \{([^}]*)\}/.exec(css)?.[1] ?? '';
     expect(directPanel).toMatch(/top:\s*40px/);
     expect(directPanel).toMatch(/bottom:\s*0/);
@@ -1417,7 +1420,8 @@ describe('TaskPairStatusPanel', () => {
   });
 
   it('starts below the sidebar toolbar cluster instead of z-index-stacking over it (which would still block its clicks)', () => {
-    const css = readCss();
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
     // .chat-top-actions floats at top:6px, its tallest button is 24px, and the
     // count badge extends 4px above that -- roughly y=2..30. The panel must
     // start at or below that band so the toolbar's buttons stay reachable
@@ -1429,7 +1433,8 @@ describe('TaskPairStatusPanel', () => {
   });
 
   it('keeps the desktop collapsed toolbar in titlebar flow while expanding below controls', () => {
-    const css = readCss();
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*position:\s*static/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*margin:\s*0 0 0 auto/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*max-width:\s*100%/);
@@ -1441,7 +1446,8 @@ describe('TaskPairStatusPanel', () => {
   });
 
   it('gives the panel an opaque background from tokens that are actually defined, so it never renders transparent over the toolbar or chat text', () => {
-    const css = readCss();
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
     const rootVars = new Set(
       [...cssRule(css, ':root').matchAll(/--([\w-]+):/g)].map((match) => match[1]),
     );
@@ -1540,7 +1546,8 @@ describe('TaskPairStatusPanel', () => {
   });
 
   it('derives the panel width, .chat-view padding-right, and the pinned "last sent" margin-right from one shared token, so they can never drift apart again', () => {
-    const css = readCss();
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
     const varRef = (rule: string) => /var\(\s*(--[\w-]+)/.exec(rule)?.[1];
     const panelRule = cssRule(css, '.task-pair-status-panel');
     // Both the panel's own max-width and its min()-clamped width must read the
@@ -1550,26 +1557,32 @@ describe('TaskPairStatusPanel', () => {
     // how wide the panel actually renders.
     expect(varRef(/max-width:\s*([^;]+);/.exec(panelRule)?.[1] ?? '')).toBe('--task-pair-panel-width');
     expect(varRef(/width:\s*([^;]+);/.exec(panelRule)?.[1] ?? '')).toBe('--task-pair-panel-width');
-    const chatViewRule = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-view \{([^}]*)\}/.exec(css)?.[1] ?? '';
-    const lastSentRule = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-pinned-last-sent \{([^}]*)\}/.exec(css)?.[1] ?? '';
-    const scrollBtnRule = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-scroll-btn \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const hostPrefix = '\\.chat-view-wrap > \\.chat-main:has\\(> \\.task-pair-status-panel:not\\(\\.is-collapsed\\):not\\(\\.is-fullscreen\\):not\\(\\.is-overlay\\)\\)';
+    const chatViewRule = new RegExp(`${hostPrefix} > \\.chat-scroll-region > \\.chat-view,[\\s\\S]*?${hostPrefix} > \\.chat-view \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+    const askDockRule = new RegExp(`${hostPrefix} > \\.chat-pending-ask-dock \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+    const lastSentRule = new RegExp(`${hostPrefix} > \\.chat-pinned-last-sent \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+    const scrollBtnRule = new RegExp(`${hostPrefix} > \\.chat-scroll-region > \\.chat-scroll-btn,[\\s\\S]*?${hostPrefix} > \\.chat-scroll-btn \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
     expect(varRef(chatViewRule)).toBe('--task-pair-panel-width');
+    expect(varRef(askDockRule)).toBe('--task-pair-panel-width');
     expect(varRef(lastSentRule)).toBe('--task-pair-panel-width');
     expect(varRef(scrollBtnRule)).toBe('--task-pair-panel-width');
     expect(scrollBtnRule).toContain('calc(var(--task-pair-panel-width) + 12px)');
     expect(scrollBtnRule).toContain('calc(100% - 48px)');
 
-    // Collapsed, mobile-fullscreen, and mobile media query reset .chat-scroll-btn back to right: 12px.
-    const collapsedScrollBtn = /\.chat-view-wrap:has\(\.task-pair-status-panel\.is-collapsed\) \.chat-scroll-btn \{([^}]*)\}/.exec(css)?.[1] ?? '';
-    const mobileFullscreenScrollBtn = /\.chat-view-wrap:has\(\.task-pair-status-panel\.is-mobile\.is-fullscreen\) \.chat-scroll-btn \{([^}]*)\}/.exec(css)?.[1] ?? '';
-    expect(collapsedScrollBtn).toMatch(/right:\s*12px\s*;/);
-    expect(mobileFullscreenScrollBtn).toMatch(/right:\s*12px\s*;/);
+    // No un-scoped .chat-view-wrap:has(...) layout reservation rules remain for chat content/scroll/dock.
+    expect(css).not.toMatch(/\.chat-view-wrap:has\([^)]*\)\s+\.(chat-view|chat-pending-ask-dock|chat-pinned-last-sent|chat-scroll-btn)\b/);
 
-    const scrollBtnOffsetIdx = css.indexOf('.chat-view-wrap:has(.task-pair-status-panel) .chat-scroll-btn');
+    const scrollBtnOffsetIdx = css.indexOf('.chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-scroll-btn');
     const mobileBlockStart = css.indexOf('@media (max-width: 720px)', scrollBtnOffsetIdx);
     expect(mobileBlockStart).toBeGreaterThan(scrollBtnOffsetIdx);
     const mobileCss = css.slice(mobileBlockStart);
-    const mobileScrollBtn = /\.chat-view-wrap:has\(\.task-pair-status-panel\) \.chat-scroll-btn \{([^}]*)\}/.exec(mobileCss)?.[1] ?? '';
+    const mobileChatView = new RegExp(`${hostPrefix} > \\.chat-scroll-region > \\.chat-view,[\\s\\S]*?${hostPrefix} > \\.chat-view \\{([^}]*)\\}`).exec(mobileCss)?.[1] ?? '';
+    const mobileAskDock = new RegExp(`${hostPrefix} > \\.chat-pending-ask-dock \\{([^}]*)\\}`).exec(mobileCss)?.[1] ?? '';
+    const mobileLastSent = new RegExp(`${hostPrefix} > \\.chat-pinned-last-sent \\{([^}]*)\\}`).exec(mobileCss)?.[1] ?? '';
+    const mobileScrollBtn = new RegExp(`${hostPrefix} > \\.chat-scroll-region > \\.chat-scroll-btn,[\\s\\S]*?${hostPrefix} > \\.chat-scroll-btn \\{([^}]*)\\}`).exec(mobileCss)?.[1] ?? '';
+    expect(mobileChatView).toMatch(/padding-right:\s*12px\s*;/);
+    expect(mobileAskDock).toMatch(/padding-right:\s*10px\s*;/);
+    expect(mobileLastSent).toMatch(/margin-right:\s*10px\s*;/);
     expect(mobileScrollBtn).toMatch(/right:\s*12px\s*;/);
 
     const rootVars = new Set([...cssRule(css, ':root').matchAll(/--([\w-]+):/g)].map((match) => match[1]));
@@ -3096,5 +3109,443 @@ describe('SupervisionTaskPairSnapshotBridge warm-cache recovery', () => {
       vi.unstubAllGlobals();
       localStorage.clear();
     }
+  });
+
+  it('auto-collapses narrow desktop scoped sub-session panes without overwriting serverWideChoice, overlays when manually opened, and preserves wide main chat and jsdom 0px', () => {
+    localStorage.clear();
+    localStorage.setItem(collapsedStorageKey('srv-narrow', false), '0');
+    const events = [{
+      eventId: 'narrow-1',
+      type: TASK_PAIR_TIMELINE_EVENT,
+      ts: 1_000,
+      payload: { taskId: 't-narrow', title: 'Narrow pane task', toStatus: 'working', executor: 'deck_sub_narrow' },
+    }] as unknown as TimelineEvent[];
+
+    // 1. Narrow desktop .chat-main (480px) with scopeSessionId auto-collapses without mutating localStorage.
+    let currentWidth = 480;
+    const resizeCallbacks: Array<() => void> = [];
+    const origResizeObserver = globalThis.ResizeObserver;
+    const origGetRect = HTMLElement.prototype.getBoundingClientRect;
+    globalThis.ResizeObserver = class {
+      constructor(cb: () => void) { resizeCallbacks.push(cb); }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    } as never;
+    HTMLElement.prototype.getBoundingClientRect = function () {
+      if (this.classList?.contains('chat-main')) {
+        return { width: currentWidth, height: 600, top: 0, left: 0, right: currentWidth, bottom: 600, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+      }
+      return origGetRect.call(this);
+    };
+
+    try {
+      const host = document.createElement('div');
+      host.className = 'chat-view-wrap';
+      const mainEl = document.createElement('div');
+      mainEl.className = 'chat-main';
+      const titlebar = document.createElement('div');
+      titlebar.className = 'chat-titlebar';
+      const mountPoint = document.createElement('div');
+      mainEl.appendChild(titlebar);
+      mainEl.appendChild(mountPoint);
+      host.appendChild(mainEl);
+      document.body.appendChild(host);
+
+      const scopedView = render(
+        <TaskPairStatusPanel events={events} serverId="srv-narrow" scopeSessionId="deck_sub_narrow" mobileAnchor={titlebar} />,
+        { container: mountPoint },
+      );
+      let panel = mainEl.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-collapsed')).toBe(true);
+      expect(panel.classList.contains('is-overlay')).toBe(false);
+      expect(panel.parentElement).toBe(titlebar);
+      expect(localStorage.getItem(collapsedStorageKey('srv-narrow', false))).toBe('0');
+
+      // 2. Clicking the collapsed toggle opens it as an overlay in .chat-main without crushing .chat-view or mutating localStorage.
+      fireEvent.click(panel.querySelector('.task-pair-status-toggle') as HTMLElement);
+      panel = mainEl.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-collapsed')).toBe(false);
+      expect(panel.classList.contains('is-overlay')).toBe(true);
+      expect(panel.parentElement).toBe(mountPoint);
+      expect(localStorage.getItem(collapsedStorageKey('srv-narrow', false))).toBe('0');
+
+      // 3. Widening >= 680px restores desktop docked mode (non-overlay, non-collapsed from serverWideChoice='0').
+      currentWidth = 900;
+      act(() => { resizeCallbacks.forEach((cb) => cb()); });
+      panel = mainEl.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-collapsed')).toBe(false);
+      expect(panel.classList.contains('is-overlay')).toBe(false);
+      expect(panel.parentElement).toBe(mountPoint);
+
+      // 4. Shrinking back below 680px auto-collapses again.
+      currentWidth = 520;
+      act(() => { resizeCallbacks.forEach((cb) => cb()); });
+      panel = mainEl.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-collapsed')).toBe(true);
+      expect(panel.classList.contains('is-overlay')).toBe(false);
+
+      // 5. jsdom 0px measurement must NOT trigger narrow auto-collapse.
+      currentWidth = 0;
+      act(() => { resizeCallbacks.forEach((cb) => cb()); });
+      panel = mainEl.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-collapsed')).toBe(false);
+      expect(panel.classList.contains('is-overlay')).toBe(false);
+
+      scopedView.unmount();
+      host.remove();
+
+      // 6. Wide desktop main chat (scopeSessionId === undefined) stays docked & expanded even if .chat-main < 680px.
+      currentWidth = 600;
+      const mainHost = document.createElement('div');
+      mainHost.className = 'chat-view-wrap';
+      const mainPane = document.createElement('div');
+      mainPane.className = 'chat-main';
+      mainHost.appendChild(mainPane);
+      document.body.appendChild(mainHost);
+      const mainView = render(<TaskPairStatusPanel events={events} serverId="srv-narrow" />, { container: mainPane });
+      const mainPanel = mainPane.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(mainPanel.classList.contains('is-collapsed')).toBe(false);
+      expect(mainPanel.classList.contains('is-overlay')).toBe(false);
+      mainView.unmount();
+      mainHost.remove();
+    } finally {
+      globalThis.ResizeObserver = origResizeObserver;
+      HTMLElement.prototype.getBoundingClientRect = origGetRect;
+      localStorage.clear();
+    }
+  });
+
+  it('applies narrow scoped protection on 820px touch tablet and under 125% UI zoom (550px layout / 687.5px rect) without overwriting main-chat choice', async () => {
+    const { applyUiScale } = await import('../../src/ui-scale.js');
+    localStorage.clear();
+    localStorage.setItem(collapsedStorageKey('srv-tablet', true), '0');
+    localStorage.setItem(collapsedStorageKey('srv-tablet', false), '0');
+    const events = [{
+      eventId: 'tablet-narrow-1',
+      type: TASK_PAIR_TIMELINE_EVENT,
+      ts: 1_000,
+      payload: { taskId: 't-tablet', title: 'Tablet narrow task', toStatus: 'working', executor: 'deck_sub_tablet' },
+    }] as unknown as TimelineEvent[];
+
+    const origInnerWidth = Object.getOwnPropertyDescriptor(window, 'innerWidth');
+    const origMatchMedia = window.matchMedia;
+    const origResizeObserver = globalThis.ResizeObserver;
+    const origGetRect = HTMLElement.prototype.getBoundingClientRect;
+    const uaSpy = vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)');
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 820 });
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: (media: string) => ({ matches: media.includes('coarse'), media, addEventListener: () => {}, removeEventListener: () => {} }) });
+    let currentRectWidth = 480;
+    const resizeCallbacks: Array<() => void> = [];
+    globalThis.ResizeObserver = class {
+      constructor(cb: () => void) { resizeCallbacks.push(cb); }
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    } as never;
+    HTMLElement.prototype.getBoundingClientRect = function () {
+      if (this.classList?.contains('chat-main')) {
+        return { width: currentRectWidth, height: 600, top: 0, left: 0, right: currentRectWidth, bottom: 600, x: 0, y: 0, toJSON: () => ({}) } as DOMRect;
+      }
+      return origGetRect.call(this);
+    };
+
+    try {
+      const host = document.createElement('div');
+      host.className = 'layout layout-mobile layout-mobile-expanded';
+      const wrap = document.createElement('div');
+      wrap.className = 'chat-view-wrap';
+      const mainEl = document.createElement('div');
+      mainEl.className = 'chat-main';
+      const titlebar = document.createElement('div');
+      titlebar.className = 'chat-titlebar';
+      const mountPoint = document.createElement('div');
+      mainEl.appendChild(titlebar);
+      mainEl.appendChild(mountPoint);
+      wrap.appendChild(mainEl);
+      host.appendChild(wrap);
+      document.body.appendChild(host);
+
+      // 1. 820px touch tablet + 480px scoped pane -> defaults collapsed even with mobile serverWideChoice='0'
+      const tabletView = render(
+        <TaskPairStatusPanel events={events} serverId="srv-tablet" scopeSessionId="deck_sub_tablet" mobileAnchor={titlebar} />,
+        { container: mountPoint },
+      );
+      let panel = mainEl.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-mobile')).toBe(true);
+      expect(panel.classList.contains('is-collapsed')).toBe(true);
+      expect(panel.classList.contains('is-overlay')).toBe(false);
+      expect(localStorage.getItem(collapsedStorageKey('srv-tablet', true))).toBe('0');
+
+      // 2. Clicking opens it as an overlay (.is-mobile.is-overlay) inside titlebar without mutating localStorage
+      fireEvent.click(panel.querySelector('.task-pair-status-compact') as HTMLElement);
+      panel = mainEl.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-collapsed')).toBe(false);
+      expect(panel.classList.contains('is-overlay')).toBe(true);
+      expect(localStorage.getItem(collapsedStorageKey('srv-tablet', true))).toBe('0');
+      tabletView.unmount();
+
+      // 3. Desktop under 125% UI scale: 550px layout width has rect.width = 687.5 (would fail >= 680 without scale conversion)
+      uaSpy.mockReturnValue('Mozilla/5.0 (X11; Linux x86_64)');
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+      applyUiScale(125);
+      currentRectWidth = 687.5;
+      const zoomedView = render(
+        <TaskPairStatusPanel events={events} serverId="srv-tablet" scopeSessionId="deck_sub_tablet" mobileAnchor={titlebar} />,
+        { container: mountPoint },
+      );
+      panel = mainEl.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-desktop')).toBe(true);
+      expect(panel.classList.contains('is-collapsed')).toBe(true);
+      fireEvent.click(panel.querySelector('.task-pair-status-toggle') as HTMLElement);
+      panel = mainEl.querySelector('[data-testid="task-pair-status-panel"]') as HTMLElement;
+      expect(panel.classList.contains('is-collapsed')).toBe(false);
+      expect(panel.classList.contains('is-overlay')).toBe(true);
+      expect(localStorage.getItem(collapsedStorageKey('srv-tablet', false))).toBe('0');
+      zoomedView.unmount();
+      host.remove();
+    } finally {
+      applyUiScale(100);
+      uaSpy.mockRestore();
+      if (origInnerWidth) Object.defineProperty(window, 'innerWidth', origInnerWidth);
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: origMatchMedia });
+      globalThis.ResizeObserver = origResizeObserver;
+      HTMLElement.prototype.getBoundingClientRect = origGetRect;
+      localStorage.clear();
+    }
+  });
+
+  it('in real Chromium never crushes narrow desktop .chat-view/.chat-pinned-last-sent/.chat-scroll-btn while preserving wide docked spacing and nested-pane isolation', { timeout: 30000 }, async () => {
+    const { createRequire } = await import('node:module');
+    const { existsSync } = await import('node:fs');
+    const require = createRequire(import.meta.url);
+    let chromium: (typeof import('playwright'))['chromium'];
+    try {
+      ({ chromium } = require('playwright') as typeof import('playwright'));
+    } catch {
+      return;
+    }
+    if (!existsSync(chromium.executablePath())) return;
+
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
+    const html = `<!doctype html><html><head><meta charset="utf-8"><style>${css}</style></head><body>
+      <div class="layout" data-testid="layout">
+        <div class="chat-view-wrap" data-testid="wrap" style="--task-pair-panel-width:300px;width:480px;height:600px;">
+          <div class="chat-main" data-testid="main">
+            <div class="chat-titlebar" data-testid="titlebar" style="height:40px;">titlebar</div>
+            <div class="chat-pinned-last-sent" data-testid="pinned">last sent</div>
+            <div class="chat-scroll-region">
+              <div class="chat-view" data-testid="chat-view">
+                <div class="chat-event" data-testid="msg">hello</div>
+                <div class="chat-view-wrap" data-testid="nested-wrap" style="--task-pair-panel-width:300px;width:480px;height:200px;">
+                  <div class="chat-main" data-testid="nested-main">
+                    <div class="chat-titlebar" style="height:30px;">nested</div>
+                    <div class="chat-pinned-last-sent" data-testid="nested-pinned">nested pinned</div>
+                    <div class="chat-scroll-region">
+                      <div class="chat-view" data-testid="nested-chat-view">nested msg</div>
+                      <button class="chat-scroll-btn" data-testid="nested-scroll-btn" type="button">↓</button>
+                    </div>
+                    <div class="chat-pending-ask-dock" data-testid="nested-ask-dock">nested ask</div>
+                  </div>
+                </div>
+              </div>
+              <button class="chat-scroll-btn" data-testid="scroll-btn" type="button">↓</button>
+            </div>
+            <div class="chat-pending-ask-dock" data-testid="ask-dock">ask</div>
+          </div>
+        </div>
+      </div>
+    </body></html>`;
+
+    const browser = await chromium.launch({ headless: true });
+    try {
+      const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+      await page.setContent(html);
+
+      const measure = (prefix = '') => page.evaluate((p) => {
+        const q = (id: string) => document.querySelector(`[data-testid="${p}${id}"]`)!;
+        return {
+          chatViewPadRight: parseFloat(getComputedStyle(q('chat-view')).paddingRight),
+          askDockPadRight: parseFloat(getComputedStyle(q('ask-dock')).paddingRight),
+          pinnedMarginRight: parseFloat(getComputedStyle(q('pinned')).marginRight),
+          scrollBtnRight: parseFloat(getComputedStyle(q('scroll-btn')).right),
+        };
+      }, prefix);
+
+      // 1. Panel collapsed inside .chat-titlebar -> no 312px padding anywhere
+      await page.evaluate(() => {
+        const panel = document.createElement('aside');
+        panel.className = 'task-pair-status-panel is-desktop is-collapsed';
+        panel.setAttribute('data-testid', 'panel');
+        document.querySelector('[data-testid="titlebar"]')!.appendChild(panel);
+      });
+      expect(await measure()).toEqual({ chatViewPadRight: 12, askDockPadRight: 12, pinnedMarginRight: 10, scrollBtnRight: 12 });
+
+      // 2. Narrow desktop overlay (.is-overlay inside .chat-main) -> no 312px padding anywhere
+      await page.evaluate(() => {
+        document.querySelector('[data-testid="panel"]')?.remove();
+        const panel = document.createElement('aside');
+        panel.className = 'task-pair-status-panel is-desktop is-overlay';
+        panel.setAttribute('data-testid', 'panel');
+        document.querySelector('[data-testid="main"]')!.appendChild(panel);
+      });
+      expect(await measure()).toEqual({ chatViewPadRight: 12, askDockPadRight: 12, pinnedMarginRight: 10, scrollBtnRight: 12 });
+
+      // 3. Mobile fullscreen (.is-mobile.is-fullscreen) -> no 312px padding anywhere
+      await page.evaluate(() => {
+        document.querySelector('[data-testid="panel"]')?.remove();
+        const panel = document.createElement('aside');
+        panel.className = 'task-pair-status-panel is-mobile is-fullscreen';
+        panel.setAttribute('data-testid', 'panel');
+        document.querySelector('[data-testid="main"]')!.appendChild(panel);
+      });
+      expect(await measure()).toEqual({ chatViewPadRight: 12, askDockPadRight: 12, pinnedMarginRight: 10, scrollBtnRight: 12 });
+
+      // 4. Parent 810px docked panel + nested 480px pane with ZERO panel -> parent reserves 312px, nested pane stays 12/12/10/12
+      await page.evaluate(() => {
+        (document.querySelector('[data-testid="wrap"]') as HTMLElement).style.width = '810px';
+        const panel = document.querySelector('[data-testid="panel"]')!;
+        panel.className = 'task-pair-status-panel is-desktop';
+      });
+      expect(await measure()).toEqual({ chatViewPadRight: 312, askDockPadRight: 312, pinnedMarginRight: 312, scrollBtnRight: 312 });
+      expect(await measure('nested-')).toEqual({ chatViewPadRight: 12, askDockPadRight: 12, pinnedMarginRight: 10, scrollBtnRight: 12 });
+
+      // 5. Expanded mobile (820px) scoped narrow 480px overlay in .chat-titlebar -> no 312px/372px padding; wide docked main panel -> reserves space
+      await page.setViewportSize({ width: 820, height: 900 });
+      await page.evaluate(() => {
+        document.querySelector('[data-testid="layout"]')!.className = 'layout layout-mobile layout-mobile-expanded';
+        (document.querySelector('[data-testid="wrap"]') as HTMLElement).style.width = '480px';
+        document.querySelector('[data-testid="panel"]')?.remove();
+        const panel = document.createElement('aside');
+        panel.className = 'task-pair-status-panel is-mobile is-overlay';
+        panel.setAttribute('data-testid', 'panel');
+        document.querySelector('[data-testid="titlebar"]')!.appendChild(panel);
+      });
+      expect(await measure()).toEqual({ chatViewPadRight: 12, askDockPadRight: 12, pinnedMarginRight: 10, scrollBtnRight: 12 });
+
+      await page.evaluate(() => {
+        (document.querySelector('[data-testid="wrap"]') as HTMLElement).style.width = '820px';
+        document.querySelector('[data-testid="panel"]')?.remove();
+        const panel = document.createElement('aside');
+        panel.className = 'task-pair-status-panel is-mobile';
+        panel.setAttribute('data-testid', 'panel');
+        document.querySelector('[data-testid="main"]')!.appendChild(panel);
+      });
+      expect(await measure()).toEqual({ chatViewPadRight: 312, askDockPadRight: 312, pinnedMarginRight: 312, scrollBtnRight: 312 });
+      expect(await measure('nested-')).toEqual({ chatViewPadRight: 12, askDockPadRight: 12, pinnedMarginRight: 10, scrollBtnRight: 12 });
+    } finally {
+      await browser.close();
+    }
+  });
+
+  it('transitions timeline-backed TaskPairStatusPanel cleanly across pause, resuming, dependency unlock, settlement, and older-daemon PAUSE without toStatus', () => {
+    const basePayload = {
+      taskId: 'tsk_resume_sync',
+      title: 'Pause Resume Sync',
+      executor: 'deck_sub_exec',
+      auditor: 'deck_sub_aud',
+      round: 1,
+    };
+    const mkEvent = (id: string, ts: number, extra: Record<string, unknown>) => ({
+      eventId: id,
+      sessionId: 'deck_brain',
+      type: TASK_PAIR_TIMELINE_EVENT,
+      seq: ts,
+      ts,
+      epoch: 1,
+      source: 'daemon' as const,
+      confidence: 'high' as const,
+      payload: { ...basePayload, ...extra },
+    });
+
+    const eStarted = mkEvent('ev-start', 100, { verb: 'STARTED', toStatus: 'working' });
+    const ePaused = mkEvent('pause:tsk_resume_sync:1', 200, {
+      verb: 'PAUSE',
+      fromStatus: 'working',
+      toStatus: 'working',
+      scheduling: { epoch: 1, manual: true, resumePending: false, dependsOn: [], note: 'hold' },
+    });
+    const eResuming = mkEvent('resume:tsk_resume_sync:2', 300, {
+      verb: 'RESUME',
+      fromStatus: 'working',
+      toStatus: 'working',
+      scheduling: { epoch: 2, manual: false, resumePending: true, dependsOn: [] },
+    });
+    const eSettled = mkEvent('resume-settled:tsk_resume_sync:2', 400, {
+      verb: 'RESUME',
+      fromStatus: 'working',
+      toStatus: 'working',
+      scheduling: { epoch: 2, manual: false, resumePending: false, dependsOn: [] },
+    });
+
+    // 1. Step-by-step live panel transitions: working -> paused -> resuming -> working
+    const { container, rerender } = render(<TaskPairStatusPanel events={[eStarted, ePaused]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-paused')).not.toBeNull();
+    expect(container.querySelector('.task-pair-status-group-working')).toBeNull();
+
+    rerender(<TaskPairStatusPanel events={[eStarted, ePaused, eResuming]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-resuming')).not.toBeNull();
+    expect(container.querySelector('.task-pair-status-group-paused')).toBeNull();
+
+    rerender(<TaskPairStatusPanel events={[eStarted, ePaused, eResuming, eSettled]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-working')).not.toBeNull();
+    expect(container.querySelector('.task-pair-status-group-paused')).toBeNull();
+    expect(container.querySelector('.task-pair-status-group-resuming')).toBeNull();
+
+    // 2. Dependency + manual wait -> manual resume keeps waiting_dependencies -> deps-cleared -> resuming -> settled
+    const eAudit = mkEvent('ev-audit', 100, { verb: 'READY_FOR_AUDIT', toStatus: 'in_audit' });
+    const eDepPause = mkEvent('pause:tsk_resume_sync:1', 200, {
+      verb: 'PAUSE',
+      fromStatus: 'in_audit',
+      toStatus: 'in_audit',
+      scheduling: { epoch: 1, manual: true, resumePending: false, dependsOn: ['tsk_up'] },
+    });
+    const eManualResumedWithDep = mkEvent('resume:tsk_resume_sync:2', 300, {
+      verb: 'RESUME',
+      fromStatus: 'in_audit',
+      toStatus: 'in_audit',
+      scheduling: { epoch: 2, manual: false, resumePending: false, dependsOn: ['tsk_up'] },
+    });
+    const eDepsCleared = mkEvent('deps-cleared:tsk_resume_sync:2', 400, {
+      verb: 'RESUME',
+      fromStatus: 'in_audit',
+      toStatus: 'in_audit',
+      scheduling: { epoch: 2, manual: false, resumePending: true, dependsOn: [] },
+    });
+    const eDepSettled = mkEvent('resume-settled:tsk_resume_sync:2', 500, {
+      verb: 'RESUME',
+      fromStatus: 'in_audit',
+      toStatus: 'in_audit',
+      scheduling: { epoch: 2, manual: false, resumePending: false, dependsOn: [] },
+    });
+
+    expect(resolveOrderedTaskPairRows({ snapshot: null, events: [eAudit, eDepPause, eManualResumedWithDep], serverId: 'srv-sync' })[0]?.payload).toMatchObject({
+      toStatus: 'in_audit',
+      scheduling: expect.objectContaining({ manual: false, dependsOn: ['tsk_up'] }),
+    });
+    rerender(<TaskPairStatusPanel events={[eAudit, eDepPause, eManualResumedWithDep]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-waiting_dependencies')).not.toBeNull();
+
+    rerender(<TaskPairStatusPanel events={[eAudit, eDepPause, eManualResumedWithDep, eDepsCleared]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-resuming')).not.toBeNull();
+
+    rerender(<TaskPairStatusPanel events={[eAudit, eDepPause, eManualResumedWithDep, eDepsCleared, eDepSettled]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-audit')).not.toBeNull();
+    expect(container.querySelector('.task-pair-status-group-waiting_dependencies')).toBeNull();
+    expect(container.querySelector('.task-pair-status-group-paused')).toBeNull();
+    expect(container.querySelector('.task-pair-status-group-resuming')).toBeNull();
+
+    // 3. Version-skew fallback: older daemon PAUSE event omitting toStatus still keeps prior valid toStatus
+    const eOldDaemonPause = mkEvent('pause:tsk_resume_sync:9', 600, {
+      verb: 'PAUSE',
+      scheduling: { epoch: 9, manual: true, resumePending: false, dependsOn: [] },
+    });
+    const skewRows = resolveOrderedTaskPairRows({ snapshot: null, events: [eStarted, eOldDaemonPause], serverId: 'srv-sync' });
+    expect(skewRows).toHaveLength(1);
+    expect(skewRows[0]?.payload.toStatus).toBe('working');
+    rerender(<TaskPairStatusPanel events={[eStarted, eOldDaemonPause]} serverId="srv-sync" />);
+    expect(container.querySelector('.task-pair-status-group-paused')).not.toBeNull();
   });
 });

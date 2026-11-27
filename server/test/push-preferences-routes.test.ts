@@ -989,6 +989,51 @@ describe('push preferences and registration routes', () => {
       expect(classifyTaskPairNotificationType({ verb: 'READY_FOR_AUDIT', effect: 'duplicate_ready' })).toBeNull();
       expect(classifyTaskPairNotificationType({ effect: 'in_audit_guarded' })).toBeNull();
     });
+
+    it('suppresses push notifications on RESUME and same-status scheduling projections', () => {
+      expect(classifyTaskPairNotificationType({
+        verb: 'RESUME',
+        effect: 'recorded',
+        fromStatus: 'working',
+        toStatus: 'working',
+        scheduling: { manual: false, resumePending: true, epoch: 2 },
+      })).toBeNull();
+      expect(classifyTaskPairNotificationType({
+        verb: 'RESUME',
+        effect: 'recorded',
+        fromStatus: 'in_audit',
+        toStatus: 'in_audit',
+        scheduling: { manual: false, resumePending: false, epoch: 2 },
+      })).toBeNull();
+      // Dependency unlock while still manually paused uses effect='recorded' so both new and older baseline servers suppress push
+      expect(classifyTaskPairNotificationType({
+        verb: 'RESUME',
+        effect: 'recorded',
+        fromStatus: 'working',
+        toStatus: 'working',
+        scheduling: { manual: true, epoch: 2 },
+      })).toBeNull();
+      expect(classifyTaskPairNotificationType({
+        verb: 'LEGACY_UNRECOGNIZED_SCHED',
+        effect: 'recorded',
+        fromStatus: 'working',
+        toStatus: 'working',
+        scheduling: { manual: true, epoch: 2 },
+      })).toBeNull();
+      // PAUSE on in_audit stays PAUSED (never misclassified as AUDIT)
+      expect(classifyTaskPairNotificationType({
+        verb: 'PAUSE',
+        effect: 'scheduled',
+        fromStatus: 'in_audit',
+        toStatus: 'in_audit',
+        scheduling: { manual: true, epoch: 1 },
+      })).toBe(PUSH_NOTIFICATION_TYPE_TASK_PAIR_PAUSED);
+      // Same-status audit transition without verb also stays suppressed
+      expect(classifyTaskPairNotificationType({
+        fromStatus: 'in_audit',
+        toStatus: 'in_audit',
+      })).toBeNull();
+    });
   });
 
   describe('WsBridge task pair push deduplication and multi-session suppression', () => {

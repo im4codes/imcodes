@@ -843,8 +843,10 @@ export async function clearSessionIdentityProfile(
 const NON_SESSION_AUTH_PATHS = new Set([
   '/api/auth/refresh',
   '/api/auth/register',
+  '/api/auth/email/config',
   '/api/auth/password/login',
   '/api/auth/password/register',
+  '/api/auth/password/reset',
   '/api/auth/token-exchange',
   '/api/auth/logout',
   '/api/auth/passkey/native',
@@ -2054,6 +2056,8 @@ export interface MeResponse {
   id: string;
   username: string | null;
   display_name: string | null;
+  email?: string | null;
+  email_verified?: boolean;
   is_admin: boolean;
   status: string;
   has_password: boolean;
@@ -2240,10 +2244,24 @@ export async function passkeyLoginCompleteNative(
   });
 }
 
-export async function passwordRegister(username: string, password: string, displayName?: string, native?: boolean): Promise<{ ok: boolean; pending?: boolean; apiKey?: string; keyId?: string; userId?: string }> {
+export async function passwordRegister(
+  username: string,
+  password: string,
+  displayName?: string,
+  native?: boolean,
+  email?: string,
+  emailCode?: string,
+): Promise<{ ok: boolean; pending?: boolean; apiKey?: string; keyId?: string; userId?: string }> {
   return apiFetch('/api/auth/password/register', {
     method: 'POST',
-    body: JSON.stringify({ username, password, ...(displayName ? { displayName } : {}), ...(native ? { native: true } : {}) }),
+    body: JSON.stringify({
+      username,
+      password,
+      ...(displayName ? { displayName } : {}),
+      ...(native ? { native: true } : {}),
+      ...(email ? { email } : {}),
+      ...(emailCode ? { emailCode } : {}),
+    }),
   });
 }
 
@@ -2254,12 +2272,24 @@ export async function passwordLogin(username: string, password: string, native?:
   });
 }
 
-export async function passwordChange(oldPassword: string, newPassword: string): Promise<void> {
+export async function passwordChange(oldPassword: string, newPassword: string, emailCode?: string): Promise<void> {
   await apiFetch('/api/auth/password/change', {
     method: 'POST',
-    body: JSON.stringify({ oldPassword, newPassword }),
+    body: JSON.stringify({
+      ...(oldPassword ? { oldPassword } : {}),
+      newPassword,
+      ...(emailCode ? { emailCode } : {}),
+    }),
   });
 }
+
+export {
+  fetchEmailAuthConfig,
+  sendEmailVerificationCode,
+  bindUserEmail,
+  passwordResetWithEmail,
+  type EmailAuthConfigResponse,
+} from './api/email-auth.js';
 
 export async function passwordSetupWithPasskey(
   username: string,

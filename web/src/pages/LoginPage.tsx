@@ -11,11 +11,23 @@ import {
   passwordLogin,
   passwordChange,
   passwordRegister,
-  ApiError,
 } from '../api.js';
+import {
+  extractAuthErrorDetails,
+  fetchEmailAuthConfig,
+  mapEmailAuthErrorCode,
+  passwordResetWithEmail,
+  sendEmailVerificationCode,
+} from '../api/email-auth.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
 import { AUTH_ERROR_CODES } from '@shared/auth-error-codes.js';
+import {
+  EMAIL_AUTH_PURPOSE,
+  EMAIL_OTP_RESEND_COOLDOWN_SECONDS,
+  isValidEmail,
+  isValidEmailOtp,
+} from '@shared/email-auth.js';
 import { LOGIN_SESSION_NOT_STUCK_KEY } from '../login-session-not-stuck.js';
 
 export interface LoginAuthAttempt {
@@ -35,6 +47,8 @@ interface Props {
   initialMode?: LoginMode;
   /** Disable external OAuth when a caller must resume exact in-tab state. */
   showGithub?: boolean;
+  /** Deployment email-auth availability override (when omitted, queried from /api/auth/email/config). */
+  emailAuthEnabled?: boolean;
   /**
    * True only once the app's own mount-verification has confirmed a just-
    * completed login did not keep its session (a 401 after the flag a login
@@ -45,7 +59,7 @@ interface Props {
   sessionNotStuck?: boolean;
 }
 
-type LoginMode = 'buttons' | 'register' | 'password' | 'password_register' | 'change_password';
+type LoginMode = 'buttons' | 'register' | 'password' | 'password_register' | 'change_password' | 'forgot_password';
 
 // localStorage keys for the optional "remember password" feature on the
 // password login form. Cleartext storage is opt-in via the checkbox; the
@@ -94,6 +108,7 @@ export function LoginPage({
   completionMode = 'reload',
   initialMode = 'buttons',
   showGithub = true,
+  emailAuthEnabled: emailAuthEnabledProp,
   sessionNotStuck = false,
 }: Props) {
   const completeWebLogin = (options?: { markSessionNotStuck?: boolean }) => {
@@ -104,8 +119,14 @@ export function LoginPage({
     }
     window.location.reload();
   };
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [mode, setMode] = useState<LoginMode>(initialMode);
+  const [emailAuthEnabled, setEmailAuthEnabled] = useState(emailAuthEnabledProp === true);
+  const [email, setEmail] = useState('');
+  const [emailCode, setEmailCode] = useState('');
+  const [emailSending, setEmailSending] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [resetSuccessMsg, setResetSuccessMsg] = useState<string | null>(null);
   const [displayName, setDisplayName] = useState('');
   const [deviceName, setDeviceName] = useState('');
   // Hydrate username + password from localStorage when the user previously
@@ -132,15 +153,9 @@ export function LoginPage({
   const [passkeySupported, setPasskeySupported] = useState(false);
   const [rememberPassword, setRememberPassword] = useState(readRememberPreference);
   const authErrorMessage = (err: unknown, options?: { mapOldPasswordError?: boolean }): string => {
-    const apiError = err instanceof ApiError ? err : null;
-    const body = apiError?.body ?? '';
-    let code = apiError?.code ?? null;
-    let retryAfterMs: number | null = null;
-    try {
-      const parsed = JSON.parse(body) as { error?: unknown; retryAfterMs?: unknown };
-      if (!code && typeof parsed.error === 'string') code = parsed.error;
-      if (typeof parsed.retryAfterMs === 'number') retryAfterMs = parsed.retryAfterMs;
-    } catch { /* non-JSON error body */ }
+    const { code, retryAfterMs, apiError } = extractAuthErrorDetails(err);
+    const emailMsg = mapEmailAuthErrorCode(t, 'login', code, retryAfterMs);
+    if (emailMsg) return emailMsg;
     if (code === AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS) {
       const minutes = Math.max(1, Math.ceil((retryAfterMs ?? 60_000) / 60_000));
       return t('login.too_many_attempts', { minutes });
@@ -205,6 +220,32 @@ export function LoginPage({
     // On web, show passkey buttons whenever the browser supports WebAuthn.
     setPasskeySupported(isNative() || (typeof window !== 'undefined' && !!window.PublicKeyCredential));
   }, []);
+
+  useEffect(() => {
+    if (emailAuthEnabledProp !== undefined) {
+      setEmailAuthEnabled(emailAuthEnabledProp);
+      return;
+    }
+    let cancelled = false;
+    void fetchEmailAuthConfig()
+      .then((res) => {
+        if (!cancelled && res && typeof res.emailAuthEnabled === 'boolean') {
+          setEmailAuthEnabled(res.emailAuthEnabled);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [emailAuthEnabledProp]);
+
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const timer = setTimeout(() => {
+      setResendCooldown((prev) => (prev > 0 ? prev - 1 : 0));
+    }, 1000);
+    return () => clearTimeout(timer);
+  }, [resendCooldown]);
 
   const handleOAuthProvider = (provider: 'github' | 'google') => {
     const attempt = startAuthAttempt();
@@ -402,8 +443,44 @@ export function LoginPage({
     }
   };
 
+  const handleSendEmailCode = async (purpose: typeof EMAIL_AUTH_PURPOSE.REGISTER | typeof EMAIL_AUTH_PURPOSE.PASSWORD_RESET) => {
+    if (!isValidEmail(email)) {
+      setError(t('login.invalid_email'));
+      return;
+    }
+    setEmailSending(true);
+    setError(null);
+    setResetSuccessMsg(null);
+    try {
+      await sendEmailVerificationCode({
+        email: email.trim(),
+        purpose,
+        lang: i18n?.language,
+      });
+      setResendCooldown(EMAIL_OTP_RESEND_COOLDOWN_SECONDS);
+    } catch (err: unknown) {
+      setError(authErrorMessage(err));
+    } finally {
+      setEmailSending(false);
+    }
+  };
+
   const handlePasswordRegister = async () => {
     if (!username.trim() || !password) return;
+    if (emailAuthEnabled) {
+      if (!email.trim()) {
+        setError(t('login.email_required'));
+        return;
+      }
+      if (!isValidEmail(email)) {
+        setError(t('login.invalid_email'));
+        return;
+      }
+      if (!isValidEmailOtp(emailCode)) {
+        setError(t('login.email_code_required'));
+        return;
+      }
+    }
     if (password !== confirmPassword) {
       setError(t('login.passwords_mismatch'));
       return;
@@ -419,7 +496,14 @@ export function LoginPage({
     setError(null);
     try {
       const native = isNative();
-      const res = await passwordRegister(username.trim(), password, displayName.trim() || undefined, native);
+      const res = await passwordRegister(
+        username.trim(),
+        password,
+        displayName.trim() || undefined,
+        native,
+        emailAuthEnabled ? email.trim() : undefined,
+        emailAuthEnabled ? emailCode.trim() : undefined,
+      );
       if (!attempt.isCurrent()) return;
       if (res.pending) {
         setMode('buttons');
@@ -453,6 +537,49 @@ export function LoginPage({
       } else {
         setError(authErrorMessage(err));
       }
+    } finally {
+      attempt.finish();
+      if (attempt.isCurrent()) setLoading(false);
+    }
+  };
+
+  const handleResetPasswordWithEmail = async () => {
+    if (!isValidEmail(email)) {
+      setError(t('login.invalid_email'));
+      return;
+    }
+    if (!isValidEmailOtp(emailCode)) {
+      setError(t('login.email_code_required'));
+      return;
+    }
+    if (!newPassword || newPassword !== confirmPassword) {
+      setError(t('login.passwords_mismatch'));
+      return;
+    }
+    const complexity = validatePasswordComplexity(newPassword);
+    if (!complexity.valid) {
+      setError(t(`login.${complexity.errorKey}`));
+      return;
+    }
+    const attempt = startAuthAttempt();
+    if (!attempt) return;
+    setLoading(true);
+    setError(null);
+    setResetSuccessMsg(null);
+    try {
+      await passwordResetWithEmail(email.trim(), emailCode.trim(), newPassword);
+      if (!attempt.isCurrent()) return;
+      persistRememberedCredentials(rememberPassword, email.trim(), newPassword);
+      setUsername(email.trim());
+      setPassword('');
+      setNewPassword('');
+      setConfirmPassword('');
+      setEmailCode('');
+      setResetSuccessMsg(t('login.password_reset_success'));
+      setMode('password');
+    } catch (err: unknown) {
+      if (!attempt.isCurrent()) return;
+      setError(authErrorMessage(err));
     } finally {
       attempt.finish();
       if (attempt.isCurrent()) setLoading(false);
@@ -522,6 +649,11 @@ export function LoginPage({
         {error && (
           <div style={{ color: '#f87171', marginBottom: 16, textAlign: 'center', fontSize: 14 }}>
             {error}
+          </div>
+        )}
+        {resetSuccessMsg && (
+          <div style={{ color: '#4ade80', marginBottom: 16, textAlign: 'center', fontSize: 14 }}>
+            {resetSuccessMsg}
           </div>
         )}
 
@@ -606,7 +738,7 @@ export function LoginPage({
               class="input"
               style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
               type="text"
-              placeholder={t('login.username_placeholder')}
+              placeholder={emailAuthEnabled ? t('login.username_or_email_placeholder') : t('login.username_placeholder')}
               value={username}
               onInput={(e) => setUsername((e.target as HTMLInputElement).value)}
               autoFocus
@@ -620,32 +752,50 @@ export function LoginPage({
               onInput={(e) => setPassword((e.target as HTMLInputElement).value)}
               onKeyDown={(e) => e.key === 'Enter' && handlePasswordLogin()}
             />
-            <label
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                marginBottom: 16,
-                color: '#94a3b8',
-                fontSize: 13,
-                cursor: 'pointer',
-                userSelect: 'none',
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={rememberPassword}
-                onChange={(e) => {
-                  const next = (e.target as HTMLInputElement).checked;
-                  setRememberPassword(next);
-                  // Persist the toggle immediately so unchecking wipes saved
-                  // creds even if the user never completes a login attempt.
-                  persistRememberedCredentials(next, username.trim(), password);
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 16 }}>
+              <label
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  color: '#94a3b8',
+                  fontSize: 13,
+                  cursor: 'pointer',
+                  userSelect: 'none',
                 }}
-                style={{ cursor: 'pointer' }}
-              />
-              {t('login.remember_password')}
-            </label>
+              >
+                <input
+                  type="checkbox"
+                  checked={rememberPassword}
+                  onChange={(e) => {
+                    const next = (e.target as HTMLInputElement).checked;
+                    setRememberPassword(next);
+                    // Persist the toggle immediately so unchecking wipes saved
+                    // creds even if the user never completes a login attempt.
+                    persistRememberedCredentials(next, username.trim(), password);
+                  }}
+                  style={{ cursor: 'pointer' }}
+                />
+                {t('login.remember_password')}
+              </label>
+              {emailAuthEnabled && (
+                <button
+                  type="button"
+                  style={{ background: 'none', border: 'none', color: '#60a5fa', fontSize: 13, cursor: 'pointer', padding: 0 }}
+                  onClick={() => {
+                    setMode('forgot_password');
+                    setError(null);
+                    setResetSuccessMsg(null);
+                    setEmailCode('');
+                    setNewPassword('');
+                    setConfirmPassword('');
+                  }}
+                  disabled={loading}
+                >
+                  {t('login.forgot_password')}
+                </button>
+              )}
+            </div>
             <button
               class="btn btn-primary"
               style={{ width: '100%', marginBottom: 10 }}
@@ -657,7 +807,14 @@ export function LoginPage({
             <button
               class="btn btn-ghost"
               style={{ width: '100%', marginBottom: 10 }}
-              onClick={() => { setMode('password_register'); setError(null); setPassword(''); setConfirmPassword(''); }}
+              onClick={() => {
+                setMode('password_register');
+                setError(null);
+                setResetSuccessMsg(null);
+                setPassword('');
+                setConfirmPassword('');
+                setEmailCode('');
+              }}
               disabled={loading}
             >
               {t('login.password_register')}
@@ -665,7 +822,7 @@ export function LoginPage({
             <button
               class="btn btn-ghost"
               style={{ width: '100%' }}
-              onClick={() => { setMode('buttons'); setError(null); }}
+              onClick={() => { setMode('buttons'); setError(null); setResetSuccessMsg(null); }}
               disabled={loading}
             >
               {t('common.cancel')}
@@ -676,7 +833,7 @@ export function LoginPage({
         {mode === 'password_register' && (
           <>
             <p style={{ color: '#94a3b8', fontSize: 13, marginBottom: 16 }}>
-              {t('login.password_register_hint')}
+              {emailAuthEnabled ? t('login.password_register_email_hint') : t('login.password_register_hint')}
             </p>
             <input
               class="input"
@@ -697,6 +854,39 @@ export function LoginPage({
               onInput={(e) => setUsername((e.target as HTMLInputElement).value)}
               maxLength={32}
             />
+            {emailAuthEnabled && (
+              <>
+                <input
+                  class="input"
+                  style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
+                  type="email"
+                  placeholder={t('login.email_placeholder')}
+                  value={email}
+                  onInput={(e) => setEmail((e.target as HTMLInputElement).value)}
+                />
+                <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+                  <input
+                    class="input"
+                    style={{ flex: 1, minWidth: 0, boxSizing: 'border-box' }}
+                    type="text"
+                    inputMode="numeric"
+                    maxLength={6}
+                    placeholder={t('login.email_code_placeholder')}
+                    value={emailCode}
+                    onInput={(e) => setEmailCode((e.target as HTMLInputElement).value)}
+                  />
+                  <button
+                    type="button"
+                    class="btn btn-secondary"
+                    style={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+                    onClick={() => handleSendEmailCode(EMAIL_AUTH_PURPOSE.REGISTER)}
+                    disabled={emailSending || resendCooldown > 0 || !email.trim()}
+                  >
+                    {resendCooldown > 0 ? t('login.resend_email_code', { seconds: resendCooldown }) : t('login.send_email_code')}
+                  </button>
+                </div>
+              </>
+            )}
             <input
               class="input"
               style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
@@ -718,9 +908,86 @@ export function LoginPage({
               class="btn btn-primary"
               style={{ width: '100%', marginBottom: 10 }}
               onClick={handlePasswordRegister}
-              disabled={loading || !username.trim() || !password || !confirmPassword}
+              disabled={
+                loading
+                || !username.trim()
+                || !password
+                || !confirmPassword
+                || (emailAuthEnabled && (!email.trim() || !isValidEmailOtp(emailCode)))
+              }
             >
               {loading ? t('common.loading') : t('login.password_register_btn')}
+            </button>
+            <button
+              class="btn btn-ghost"
+              style={{ width: '100%' }}
+              onClick={() => { setMode('password'); setError(null); }}
+              disabled={loading}
+            >
+              {t('common.cancel')}
+            </button>
+          </>
+        )}
+
+        {mode === 'forgot_password' && (
+          <>
+            <p style={{ color: '#94a3b8', fontSize: 13, marginBottom: 16 }}>
+              {t('login.forgot_password_hint')}
+            </p>
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
+              type="email"
+              placeholder={t('login.email_placeholder')}
+              value={email}
+              onInput={(e) => setEmail((e.target as HTMLInputElement).value)}
+              autoFocus
+            />
+            <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+              <input
+                class="input"
+                style={{ flex: 1, minWidth: 0, boxSizing: 'border-box' }}
+                type="text"
+                inputMode="numeric"
+                maxLength={6}
+                placeholder={t('login.email_code_placeholder')}
+                value={emailCode}
+                onInput={(e) => setEmailCode((e.target as HTMLInputElement).value)}
+              />
+              <button
+                type="button"
+                class="btn btn-secondary"
+                style={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+                onClick={() => handleSendEmailCode(EMAIL_AUTH_PURPOSE.PASSWORD_RESET)}
+                disabled={emailSending || resendCooldown > 0 || !email.trim()}
+              >
+                {resendCooldown > 0 ? t('login.resend_email_code', { seconds: resendCooldown }) : t('login.send_email_code')}
+              </button>
+            </div>
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 10, boxSizing: 'border-box' }}
+              type="password"
+              placeholder={t('login.new_password_placeholder')}
+              value={newPassword}
+              onInput={(e) => setNewPassword((e.target as HTMLInputElement).value)}
+            />
+            <input
+              class="input"
+              style={{ width: '100%', marginBottom: 16, boxSizing: 'border-box' }}
+              type="password"
+              placeholder={t('login.confirm_password_placeholder')}
+              value={confirmPassword}
+              onInput={(e) => setConfirmPassword((e.target as HTMLInputElement).value)}
+              onKeyDown={(e) => e.key === 'Enter' && handleResetPasswordWithEmail()}
+            />
+            <button
+              class="btn btn-primary"
+              style={{ width: '100%', marginBottom: 10 }}
+              onClick={handleResetPasswordWithEmail}
+              disabled={loading || !email.trim() || !isValidEmailOtp(emailCode) || !newPassword || !confirmPassword}
+            >
+              {loading ? t('common.loading') : t('login.reset_password_btn')}
             </button>
             <button
               class="btn btn-ghost"

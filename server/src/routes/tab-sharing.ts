@@ -5,6 +5,7 @@ import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { randomHex, signJwt } from '../security/crypto.js';
 import { requireAuth, resolveServerMembershipRole } from '../security/authorization.js';
+import { evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
 import { pauseRevokedSharedCronJobs } from '../security/server-share-boundary.js';
 import { getDbSessionsByServer, getSubSessionsByServer } from '../db/queries.js';
 import { resolveUserByIdentifier } from '../db/user-lookup.js';
@@ -377,6 +378,10 @@ tabSharingRoutes.post('/shares/ws-ticket', requireAuth(), async (c) => {
   if (await isControlledNodeShareTarget(c.env.DB, target)) {
     return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
   }
+  const userAccess = await loadUserAccess(c.env.DB, userId);
+  const callerIssuedAt = c.get('authIssuedAt' as never) as number | undefined;
+  const userDecision = evaluateUserAccess(userAccess, callerIssuedAt);
+  if (!userDecision.ok) return c.json({ error: userDecision.code }, 403);
   const issuedAt = Date.now();
   const snapshot = await resolveEffectiveShareCoverage(c.env.DB, { userId, target, now: issuedAt });
   if (!snapshot) return c.json({ error: 'forbidden', reason: 'share-revoked' }, 403);
@@ -395,6 +400,7 @@ tabSharingRoutes.post('/shares/ws-ticket', requireAuth(), async (c) => {
     snapshot,
     issuedAt,
     expiresAt,
+    sva: userAccess?.sessionsValidAfter ?? 0,
   };
   const ttlSeconds = Math.max(1, Math.ceil((expiresAt - issuedAt) / 1000));
   const ticket = signJwt(claims as unknown as Record<string, unknown>, c.env.JWT_SIGNING_KEY, ttlSeconds);

@@ -242,6 +242,7 @@ export class RemoteVoiceHub {
   private readonly fetchFn: typeof fetch;
 
   private readonly userSockets = new Map<string, Set<WebSocket>>();
+  private readonly socketSessionEpochs = new Map<WebSocket, number>();
   private readonly socketProviderKeys = new Map<WebSocket, { userId: string; deviceId: string }>();
   private readonly providers = new Map<string, Map<string, ProviderConnection>>();
   private readonly sessions = new Map<string, ActiveVoiceSession>();
@@ -599,6 +600,28 @@ export class RemoteVoiceHub {
     return closed;
   }
 
+  closeBrowserSocketsForSessionReset(userValidAfter: ReadonlyMap<string, number>, reason = 'session_revoked'): number {
+    let closed = 0;
+    for (const [userId, minValidAfter] of userValidAfter) {
+      if (minValidAfter <= 0) continue;
+      const sockets = this.userSockets.get(userId);
+      if (!sockets) continue;
+      for (const ws of [...sockets]) {
+        if (this.socketProviderKeys.has(ws)) continue;
+        const socketEpoch = this.socketSessionEpochs.get(ws) ?? 0;
+        if (socketEpoch >= minValidAfter) continue;
+        this.teardownSocket(ws, userId, REMOTE_VOICE_ERROR_CODES.UNAUTHORIZED);
+        try {
+          ws.close(4003, reason);
+        } catch {
+          // Ignore close errors.
+        }
+        closed += 1;
+      }
+    }
+    return closed;
+  }
+
   stop(): void {
     if (this.providerLivenessTimer) {
       clearInterval(this.providerLivenessTimer);
@@ -637,7 +660,7 @@ export class RemoteVoiceHub {
     this.db = undefined;
   }
 
-  handleConnection(ws: WebSocket, userId: string, db?: Database, env?: ServerAsrEnvInput): void {
+  handleConnection(ws: WebSocket, userId: string, db?: Database, env?: ServerAsrEnvInput, sessionEpoch = 0): void {
     if (db) {
       this.db = db;
     }
@@ -651,6 +674,7 @@ export class RemoteVoiceHub {
         }).catch(() => {});
       }
     }
+    this.socketSessionEpochs.set(ws, sessionEpoch);
     let sockets = this.userSockets.get(userId);
     if (!sockets) {
       sockets = new Set<WebSocket>();
@@ -1302,6 +1326,7 @@ export class RemoteVoiceHub {
   }
 
   private teardownSocket(ws: WebSocket, userId: string, disconnectErrorCode: RemoteVoiceErrorCode): void {
+    this.socketSessionEpochs.delete(ws);
     const sockets = this.userSockets.get(userId);
     if (sockets) {
       sockets.delete(ws);

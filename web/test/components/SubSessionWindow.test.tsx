@@ -272,9 +272,11 @@ describe('SubSessionWindow metadata wiring', () => {
       onFocus: vi.fn(),
     };
     const view = render(<SubSessionWindow {...baseProps} />);
-    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0].scopeTaskPairs).toBe(true);
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({ scopeTaskPairs: true, hideTaskPairPanel: false });
     view.rerender(<SubSessionWindow {...baseProps} taskPairPanelVisitKey="split-task" />);
-    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({ scopeTaskPairs: true, sessionId: baseProps.sub.sessionName, taskPairPanelVisitKey: 'split-task' });
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({ scopeTaskPairs: true, hideTaskPairPanel: false, sessionId: baseProps.sub.sessionName, taskPairPanelVisitKey: 'split-task' });
+    view.rerender(<SubSessionWindow {...baseProps} showTaskPairPanel={false} taskPairPanelVisitKey="split-task" />);
+    expect(chatViewPropsSpy.mock.calls.at(-1)?.[0]).toMatchObject({ scopeTaskPairs: false, hideTaskPairPanel: true, sessionId: baseProps.sub.sessionName });
   });
 
   it('shows the pair task title as the main heading and keeps the session subtitle and role visible', () => {

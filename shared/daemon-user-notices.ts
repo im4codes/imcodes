@@ -64,6 +64,7 @@ export const DAEMON_USER_NOTICE_CODE = {
   COMPACT_FAILED: 'compact_failed',
   SESSION_INLINE_ERROR: 'session_inline_error',
   TURN_STOPPED_FOR_QUEUE: 'turn_stopped_for_queue',
+  WELCOME_OPENCODE_FREE_MODEL: 'welcome_opencode_free_model',
 } as const;
 
 export type DaemonUserNoticeCode = typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE];
@@ -109,6 +110,7 @@ export const DAEMON_USER_NOTICE_PARAM_KEYS: Readonly<Partial<Record<DaemonUserNo
   [DAEMON_USER_NOTICE_CODE.MESSAGE_SEND_FAILED]: ['detail'],
   [DAEMON_USER_NOTICE_CODE.COMPACT_FAILED]: ['detail'],
   [DAEMON_USER_NOTICE_CODE.SESSION_INLINE_ERROR]: ['detail'],
+  [DAEMON_USER_NOTICE_CODE.WELCOME_OPENCODE_FREE_MODEL]: ['model'],
 };
 
 const MAX_PARAM_LENGTH = 80;
@@ -277,6 +279,8 @@ export function formatDaemonUserNoticeEnglish(
       return 'The session reported an error.';
     case DAEMON_USER_NOTICE_CODE.TURN_STOPPED_FOR_QUEUE:
       return 'Stopped previous turn — sending queued message(s).';
+    case DAEMON_USER_NOTICE_CODE.WELCOME_OPENCODE_FREE_MODEL:
+      return `Using free starter model (${stringParam(params, 'model')}, third-party service; inputs may be used to improve models) — avoid sensitive code, or switch to your own SDK/model below anytime.`;
   }
 }
 

@@ -90,12 +90,12 @@ beforeAll(async () => {
   const preUserId = `pf_pre_u_${hex(4)}`;
   await createUser(db, preUserId);
   await createServer(db, preExistingId, preUserId, 'pre-existing', sha256('pre-tok'), undefined, NODE_ROLE.FULL);
-  const mig115Sql = readFileSync(resolve(import.meta.dirname, '../src/db/migrations/115_port_forward_tunnels.sql'), 'utf8');
-  const mig116Sql = readFileSync(resolve(import.meta.dirname, '../src/db/migrations/116_port_forward_tunnel_pods.sql'), 'utf8');
-  await db.exec(mig115Sql);
-  await db.exec(mig115Sql);
+  const mig116Sql = readFileSync(resolve(import.meta.dirname, '../src/db/migrations/116_port_forward_tunnels.sql'), 'utf8');
+  const mig117Sql = readFileSync(resolve(import.meta.dirname, '../src/db/migrations/117_port_forward_tunnel_pods.sql'), 'utf8');
   await db.exec(mig116Sql);
   await db.exec(mig116Sql);
+  await db.exec(mig117Sql);
+  await db.exec(mig117Sql);
   const persistedServer = await db.queryOne<{ id: string }>(`SELECT id FROM servers WHERE id = $1`, [preExistingId]);
   expect(persistedServer?.id).toBe(preExistingId);
 

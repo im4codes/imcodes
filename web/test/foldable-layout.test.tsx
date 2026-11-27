@@ -158,9 +158,9 @@ describe('Foldable & iPhone Duo responsive behavior', () => {
     expect(css).toContain('.layout-mobile-expanded .supervision-task-console.is-mobile');
     expect(css).toContain('.layout-mobile-expanded:has(.supervision-task-console.is-mobile) > .main { margin-right: min(440px, 48vw); min-width: 0; }');
     expect(css).toContain('.layout-mobile-expanded .chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)');
-    expect(css).toContain('.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-view');
-    expect(css).toContain('.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-pinned-last-sent');
-    expect(css).toContain('.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-scroll-btn');
+    expect(css).toContain('.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-view');
+    expect(css).toContain('.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-pinned-last-sent');
+    expect(css).toContain('.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-scroll-btn');
     // Narrow phone overlay scrim stays intact
     expect(css).toContain('.mobile-sidebar-overlay.open { pointer-events: auto; background: rgba(0,0,0,0.5); }');
     expect(css).toContain('.layout-mobile-expanded .mobile-server-menu-remote-grid');

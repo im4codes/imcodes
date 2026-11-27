@@ -90,6 +90,8 @@ import { CODEX_FAST_OFF_COMMAND, isCodexFastServiceTier } from '@shared/codex-se
 import {
   computeModelDropdownStyle,
   readSafeAreaBottomPx,
+  readSafeAreaLeftPx,
+  readSafeAreaRightPx,
   readSafeAreaTopPx,
 } from '../util/model-dropdown-style.js';
 
@@ -196,6 +198,10 @@ import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { shortModelLabel } from '../model-label.js';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
+import { QuickSdkModelMenu, type QuickSdkSavedFields } from './QuickSdkModelMenu.js';
+import { isQuickSdkSwitchAllowed, supportsQuickModelTrigger } from './quick-sdk-model.js';
+import { findQuickSdkChoice, getQuickSwitchableSdkGroups } from './quick-sdk-model.js';
+import { getSessionAgentLabel } from './session-agent-options.js';
 import { loadCodexModelPreference, loadLegacyCodexModelPreferenceForModelessSession, saveCodexModelPreference } from '../codex-model-preference.js';
 import { saveAgyModelPreference } from '../agy-model-preference.js';
 import { dispatchSessionModelSwitch } from '../session-model-switch.js';
@@ -962,6 +968,8 @@ interface Props {
   onOverlayOpenChange?: (open: boolean) => void;
   /** Optional local optimistic update when transport config changes through quick controls. */
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
+  /** Optional local optimistic update when quick SDK+model switcher changes provider/model. */
+  onSessionSaved?: (fields: QuickSdkSavedFields) => void;
   /** Gate version-sensitive panels when the loaded frontend is stale. */
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
   /** Reports the current composer text to parent surfaces (e.g. footer actions). */
@@ -2365,7 +2373,7 @@ const ComposerTargetBubble = memo(function ComposerTargetBubble({
   );
 });
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, hideWorkflowControls = false, onSend, onRemoveOptimisticMessage, onSendFailed, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, taskQuote, onRemoveTaskQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, hideWorkflowControls = false, onSend, onRemoveOptimisticMessage, onSendFailed, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, taskQuote, onRemoveTaskQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onSessionSaved, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
   const baseOpenNodeGroups = useNodeGroupsNav(onOpenNodeGroups);
   const handleOpenNodeGroupsFromBrowser = useCallback(() => {
     onMobileFileBrowserClose?.();
@@ -3662,6 +3670,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // session. Viewers and inactive shares remain read-only.
   const disabled = participantControlDisabled;
   const modelSwitchDisabled = participantControlDisabled;
+  const [quickSdkSwitching, setQuickSdkSwitching] = useState(false);
+  const quickSdkSplitAllowed = isQuickSdkSwitchAllowed({
+    activeSession,
+    serverId,
+    activeSessionIncognito,
+    canSharedSessionSend,
+    modelSwitchDisabled,
+  });
+  const effectiveModelSwitchDisabled = modelSwitchDisabled || quickSdkSwitching;
+  useEffect(() => {
+    if (effectiveModelSwitchDisabled && modelOpen) {
+      setModelOpen(false);
+    }
+  }, [effectiveModelSwitchDisabled, modelOpen]);
   const isClaudeCode = activeSession?.agentType === 'claude-code' || activeSession?.agentType === 'claude-code-sdk';
   const isShellLike = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const isTransport = effectiveRuntimeType === 'transport';
@@ -3724,6 +3746,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       ? activeSession.ccPreset
       : undefined,
     activeSession?.name,
+    serverId,
   );
   const genericTransportModelSuggestions: readonly string[] = useMemo(() => {
     if (dynamicTransportModels.models.length > 0) {
@@ -5185,16 +5208,25 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (!trigger) return undefined;
     const rect = trigger.getBoundingClientRect();
     const viewport = window.visualViewport;
+    const effectiveWidth = viewport?.width ? Math.min(window.innerWidth, viewport.width) : window.innerWidth;
+    const isNarrowViewport = effectiveWidth > 0 && effectiveWidth <= 640;
     return computeModelDropdownStyle(rect, {
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
       visualViewportWidth: viewport?.width,
       visualViewportHeight: viewport?.height,
       visualViewportOffsetTop: viewport?.offsetTop,
+      visualViewportOffsetLeft: viewport?.offsetLeft,
       safeAreaTop: readSafeAreaTopPx(),
       safeAreaBottom: readSafeAreaBottomPx(),
-    });
-  }, [modelLayoutTick, modelOpen]);
+      safeAreaLeft: readSafeAreaLeftPx(),
+      safeAreaRight: readSafeAreaRightPx(),
+    }, quickSdkSplitAllowed ? {
+      minWidth: isNarrowViewport ? 280 : 340,
+      preferredWidth: isNarrowViewport ? 374 : 416,
+      ...(isNarrowViewport ? { viewportHeightCapRatio: 0.46, maxHeightPx: 340 } : {}),
+    } : undefined);
+  }, [modelLayoutTick, modelOpen, quickSdkSplitAllowed]);
 
   const renderModelDropdown = useCallback((content: ComponentChildren) => {
     const dropdown = (
@@ -9306,7 +9338,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const dispatchModelSwitch = (nextModel: string): boolean => {
-    if (!ws || !activeSession) return false;
+    if (!ws || !activeSession || effectiveModelSwitchDisabled) return false;
     dispatchSessionModelSwitch({
       sendMessage: (text) => sendSessionMessage(text),
       setSubSessionModel: (sessionName, modelId, cwd) => ws.subSessionSetModel(sessionName, modelId, cwd),
@@ -10230,28 +10262,42 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
+              data-testid="session-model-trigger"
               ref={modelButtonRef}
               onClick={() => toggleModelMenu({
                 refreshDynamic: activeSession?.agentType === 'claude-code-sdk',
               })}
-              disabled={modelSwitchDisabled}
+              disabled={effectiveModelSwitchDisabled}
               title={displayedClaudeModel ? `Model: ${displayedClaudeModel}` : 'Model: Unknown — tap to select'}
               style={{ color: displayedClaudeModel ? '#a78bfa' : '#6b7280', fontSize: 10 }}
             >
-              {claudePinnedModel ? (shortModelLabel(claudePinnedModel) ?? claudePinnedModel) : (displayedClaudeModel ?? 'unknown')}
+              {quickSdkSwitching
+                ? t('session.quickSwitch.switching')
+                : (claudePinnedModel ? (shortModelLabel(claudePinnedModel) ?? claudePinnedModel) : (displayedClaudeModel ?? 'unknown'))}
             </button>
             {modelOpen && renderModelDropdown(
-              <>
-                {claudeModelSuggestions.map((m) => (
-                  <button
-                    key={m}
-                    class={`menu-item ${displayedClaudeModel === m ? 'menu-item-active' : ''}`}
-                    onClick={() => handleModelSelect(m)}
-                  >
-                    {displayedClaudeModel === m ? '● ' : '○ '}{m.charAt(0).toUpperCase() + m.slice(1)}
-                  </button>
-                ))}
-              </>
+              <QuickSdkModelMenu
+                ws={ws}
+                activeSession={activeSession}
+                serverId={serverId}
+                subSessionId={subSessionId}
+                modelOpen={modelOpen}
+                splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
+                switching={quickSdkSwitching}
+                onSwitchingChange={setQuickSdkSwitching}
+                currentSdk={activeSession?.agentType ?? 'claude-code'}
+                currentModel={displayedClaudeModel}
+                sameSdkItems={claudeModelSuggestions.map((m) => ({
+                  id: m,
+                  label: m.charAt(0).toUpperCase() + m.slice(1),
+                }))}
+                onSelectSameSdkModel={(m) => handleModelSelect(m as ModelChoice)}
+                onClose={() => setModelOpen(false)}
+                onAfterAction={onAfterAction}
+                onSessionSaved={onSessionSaved}
+                onSwitchError={showSendWarning}
+              />
             )}
           </div>
         )}
@@ -10259,28 +10305,39 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
+              data-testid="session-model-trigger"
               ref={modelButtonRef}
               onClick={() => toggleModelMenu({
                 refreshDynamic: activeSession?.agentType === 'codex-sdk',
               })}
-              disabled={modelSwitchDisabled}
+              disabled={effectiveModelSwitchDisabled}
               title={displayedCodexModel ? `Model: ${displayedCodexModel}` : 'Model: default — tap to select'}
               style={{ color: displayedCodexModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
-              {shortModelLabel(displayedCodexModel) ?? displayedCodexModel ?? 'default'}
+              {quickSdkSwitching
+                ? t('session.quickSwitch.switching')
+                : (shortModelLabel(displayedCodexModel) ?? displayedCodexModel ?? 'default')}
             </button>
             {modelOpen && renderModelDropdown(
-              <>
-                {codexModelSuggestions.map((m) => (
-                  <button
-                    key={m}
-                    class={`menu-item ${displayedCodexModel === m ? 'menu-item-active' : ''}`}
-                    onClick={() => handleCodexModelSelect(m)}
-                  >
-                    {displayedCodexModel === m ? '● ' : '○ '}{m}
-                  </button>
-                ))}
-              </>
+              <QuickSdkModelMenu
+                ws={ws}
+                activeSession={activeSession}
+                serverId={serverId}
+                subSessionId={subSessionId}
+                modelOpen={modelOpen}
+                splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
+                switching={quickSdkSwitching}
+                onSwitchingChange={setQuickSdkSwitching}
+                currentSdk={activeSession?.agentType ?? 'codex'}
+                currentModel={displayedCodexModel}
+                sameSdkItems={codexModelSuggestions.map((m) => ({ id: m }))}
+                onSelectSameSdkModel={(m) => handleCodexModelSelect(m as CodexModelChoice)}
+                onClose={() => setModelOpen(false)}
+                onAfterAction={onAfterAction}
+                onSessionSaved={onSessionSaved}
+                onSwitchError={showSendWarning}
+              />
             )}
           </div>
         )}
@@ -10304,29 +10361,40 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
+              data-testid="session-model-trigger"
               ref={modelButtonRef}
               onClick={() => setModelOpen((o) => !o)}
-              disabled={modelSwitchDisabled}
+              disabled={effectiveModelSwitchDisabled}
               title={qwenModel
                 ? t('session.qwen_model_title', { tier: qwenTierLabel, model: qwenModel })
                 : t('session.qwen_source_title', { tier: qwenTierLabel })}
               style={{ color: qwenModel ? '#f59e0b' : '#6b7280', fontSize: 10 }}
             >
-              {qwenTierLabel}
+              {quickSdkSwitching ? t('session.quickSwitch.switching') : qwenTierLabel}
             </button>
             {modelOpen && renderModelDropdown(
-              <>
-                {qwenChoices.map((m) => (
-                  <button
-                    key={m.id}
-                    class={`menu-item ${qwenModel === m.id ? 'menu-item-active' : ''}`}
-                    onClick={() => handleQwenModelSelect(m.id as QwenModelChoice)}
-                    title={m.description || m.id}
-                  >
-                    {qwenModel === m.id ? '● ' : '○ '}{m.id}
-                  </button>
-                ))}
-              </>
+              <QuickSdkModelMenu
+                ws={ws}
+                activeSession={activeSession}
+                serverId={serverId}
+                subSessionId={subSessionId}
+                modelOpen={modelOpen}
+                splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
+                switching={quickSdkSwitching}
+                onSwitchingChange={setQuickSdkSwitching}
+                currentSdk={activeSession?.agentType ?? 'qwen'}
+                currentModel={qwenModel}
+                sameSdkItems={qwenChoices.map((m) => ({
+                  id: m.id,
+                  title: m.description || m.id,
+                }))}
+                onSelectSameSdkModel={(m) => handleQwenModelSelect(m as QwenModelChoice)}
+                onClose={() => setModelOpen(false)}
+                onAfterAction={onAfterAction}
+                onSessionSaved={onSessionSaved}
+                onSwitchError={showSendWarning}
+              />
             )}
           </div>
         )}
@@ -10334,26 +10402,82 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           <div class="shortcuts-model" ref={modelRef}>
             <button
               class="shortcut-btn"
+              data-testid="session-model-trigger"
               ref={modelButtonRef}
               onClick={() => toggleModelMenu({ refreshDynamic: true })}
-              disabled={modelSwitchDisabled}
+              disabled={effectiveModelSwitchDisabled}
               title={genericTransportModel ? `Model: ${genericTransportModel}` : 'Model: default — tap to select'}
               style={{ color: genericTransportModel ? '#34d399' : '#6b7280', fontSize: 10 }}
             >
-              {shortModelLabel(genericTransportModel) ?? genericTransportModel ?? 'default'}
+              {quickSdkSwitching
+                ? t('session.quickSwitch.switching')
+                : (shortModelLabel(genericTransportModel) ?? genericTransportModel ?? 'default')}
             </button>
             {modelOpen && renderModelDropdown(
-              <>
-                {genericTransportModelSuggestions.map((m) => (
-                  <button
-                    key={m}
-                    class={`menu-item ${genericTransportModel === m ? 'menu-item-active' : ''}`}
-                    onClick={() => handleGenericTransportModelSelect(m)}
-                  >
-                    {genericTransportModel === m ? '● ' : '○ '}{m}
-                  </button>
-                ))}
-              </>
+              <QuickSdkModelMenu
+                ws={ws}
+                activeSession={activeSession}
+                serverId={serverId}
+                subSessionId={subSessionId}
+                modelOpen={modelOpen}
+                splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
+                switching={quickSdkSwitching}
+                onSwitchingChange={setQuickSdkSwitching}
+                currentSdk={activeSession?.agentType ?? ''}
+                currentModel={genericTransportModel}
+                sameSdkItems={genericTransportModelSuggestions.map((m) => ({ id: m }))}
+                onSelectSameSdkModel={handleGenericTransportModelSelect}
+                onClose={() => setModelOpen(false)}
+                onAfterAction={onAfterAction}
+                onSessionSaved={onSessionSaved}
+                onSwitchError={showSendWarning}
+              />
+            )}
+          </div>
+        )}
+        {!isClaudeCode && !isCodex && !isQwen && !supportsGenericTransportModelSelect && supportsQuickModelTrigger(activeSession?.agentType, quickSdkSplitAllowed) && activeSession && (
+          <div class="shortcuts-model" ref={modelRef}>
+            {(() => {
+              const choice = findQuickSdkChoice(
+                getQuickSwitchableSdkGroups(activeSession.agentType, subSessionId ? 'sub-session' : 'new-session'),
+                activeSession.agentType,
+              );
+              const sdkLabel = choice ? getSessionAgentLabel(t, choice) : activeSession.agentType;
+              return (
+                <button
+                  class="shortcut-btn"
+                  data-testid="session-model-trigger"
+                  ref={modelButtonRef}
+                  onClick={() => toggleModelMenu({ refreshDynamic: false })}
+                  disabled={effectiveModelSwitchDisabled}
+                  title={`SDK: ${sdkLabel}`}
+                  style={{ color: '#22d3ee', fontSize: 10 }}
+                >
+                  {quickSdkSwitching ? t('session.quickSwitch.switching') : (shortModelLabel(genericTransportModel) ?? genericTransportModel ?? sdkLabel)}
+                </button>
+              );
+            })()}
+            {modelOpen && renderModelDropdown(
+              <QuickSdkModelMenu
+                ws={ws}
+                activeSession={activeSession}
+                serverId={serverId}
+                subSessionId={subSessionId}
+                modelOpen={modelOpen}
+                splitAllowed={quickSdkSplitAllowed}
+                disabled={effectiveModelSwitchDisabled}
+                switching={quickSdkSwitching}
+                onSwitchingChange={setQuickSdkSwitching}
+                currentSdk={activeSession.agentType}
+                currentModel={genericTransportModel}
+                sameSdkItems={genericTransportModel ? [{ id: genericTransportModel }] : []}
+                onSelectSameSdkModel={() => setModelOpen(false)}
+                onClose={() => setModelOpen(false)}
+                onAfterAction={onAfterAction}
+                onSessionSaved={onSessionSaved}
+                onSwitchError={showSendWarning}
+              />
             )}
           </div>
         )}

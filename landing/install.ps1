@@ -9,6 +9,10 @@
 #   Force mirror / direct source, or pass params explicitly:
 #     & ([scriptblock]::Create((irm https://im.codes/install.ps1))) -Channel dev -Source mirror
 #
+#   Skip optional OpenCode CLI auto-install:
+#     & ([scriptblock]::Create((irm https://im.codes/install.ps1))) -SkipOpenCode
+#     # or: $env:IMCODES_SKIP_OPENCODE = '1'
+#
 # Behavior (no admin required):
 #   1. Source auto-detect: probes a host that only resolves on unrestricted
 #      networks. If unreachable, assumes a restricted-network region and uses
@@ -17,7 +21,9 @@
 #      gate). Only when npm is missing do we install Node (portable zip).
 #   3. Installs the daemon with a plain dist-tag: npm install -g imcodes@<channel>.
 #      No version pinning and no custom upgrade logic — the daemon's own
-#      auto-upgrade handles updates from here on. In a restricted-network region
+#      auto-upgrade handles updates from here on. Also installs official OpenCode
+#      CLI (opencode-ai) if not already present (idempotent, non-blocking, opt-out
+#      via -SkipOpenCode). In a restricted-network region
 #      the mirror registry is recorded in ~/.imcodes/install.json (NOT the global
 #      ~/.npmrc) so the daemon passes it explicitly on its own `npm i -g` without
 #      affecting other npm projects.
@@ -26,10 +32,11 @@
 
 [CmdletBinding()]
 param(
-  [string]$Channel    = $env:IMCODES_CHANNEL,   # latest | dev          (default: latest)
-  [string]$Source     = $env:IMCODES_SOURCE,    # auto | mirror | direct (default: auto)
-  [string]$NodeMajor  = '24',
-  [string]$InstallRoot = "$env:LOCALAPPDATA\imcodes"
+  [string]$Channel      = $env:IMCODES_CHANNEL,   # latest | dev          (default: latest)
+  [string]$Source       = $env:IMCODES_SOURCE,    # auto | mirror | direct (default: auto)
+  [string]$NodeMajor    = '24',
+  [string]$InstallRoot  = "$env:LOCALAPPDATA\imcodes",
+  [switch]$SkipOpenCode
 )
 
 $ErrorActionPreference = 'Stop'
@@ -46,10 +53,46 @@ if ($Channel -notin @('latest','dev'))           { throw "Invalid -Channel '$Cha
 if ($Source  -notin @('auto','mirror','direct'))  { throw "Invalid -Source '$Source' (use: auto | mirror | direct)" }
 if ($NodeMajor -notmatch '^\d+$')                { throw "Invalid -NodeMajor '$NodeMajor' (must be an integer)" }
 if ($PSVersionTable.PSVersion.Major -lt 5)       { throw "Windows PowerShell 5.1+ is required." }
+$skipOpenCodeEffective = $SkipOpenCode.IsPresent -or (
+  ([string]$env:IMCODES_SKIP_OPENCODE).Trim().ToLower() -in @('1','true','yes')
+)
 
 function Write-Step($m) { Write-Host "==> $m" -ForegroundColor Cyan }
 function Write-Ok($m)   { Write-Host "    $m"  -ForegroundColor Green }
 function Write-Note($m) { Write-Host "    $m"  -ForegroundColor Yellow }
+
+function Add-UserPathEntry([string]$Dir) {
+  if (-not $Dir) { return }
+  $trimmed = $Dir.TrimEnd('\')
+  $userPathRaw = [Environment]::GetEnvironmentVariable('Path', 'User')
+  $userEntries = @()
+  if ($userPathRaw) {
+    $userEntries = @($userPathRaw -split ';' | Where-Object { $_ -and $_.Trim() -ne '' })
+  }
+  $existsUser = $false
+  foreach ($e in $userEntries) {
+    if ($e.TrimEnd('\').Equals($trimmed, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $existsUser = $true
+      break
+    }
+  }
+  if (-not $existsUser) {
+    $newUserPath = if ($userPathRaw) { "$trimmed;$userPathRaw" } else { $trimmed }
+    [Environment]::SetEnvironmentVariable('Path', $newUserPath, 'User')
+    Write-Ok "added to user PATH: $trimmed"
+  }
+  $procEntries = @($env:Path -split ';' | Where-Object { $_ -and $_.Trim() -ne '' })
+  $existsProc = $false
+  foreach ($e in $procEntries) {
+    if ($e.TrimEnd('\').Equals($trimmed, [System.StringComparison]::OrdinalIgnoreCase)) {
+      $existsProc = $true
+      break
+    }
+  }
+  if (-not $existsProc) {
+    $env:Path = if ($env:Path) { "$trimmed;$env:Path" } else { $trimmed }
+  }
+}
 
 Write-Host ""
 Write-Host "  IM.codes daemon installer" -ForegroundColor White
@@ -176,12 +219,7 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
 
   # Persist to user PATH (no admin) so a freshly-launched daemon can find node/npm
   # for its own auto-upgrade; also make it available in the current session.
-  $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-  if (($userPath -split ';') -notcontains $nodeHome) {
-    [Environment]::SetEnvironmentVariable('Path', "$nodeHome;$userPath", 'User')
-    Write-Ok "added to user PATH: $nodeHome"
-  }
-  $env:Path = "$nodeHome;$env:Path"
+  Add-UserPathEntry $nodeHome
   $npmExe   = Join-Path $nodeHome 'npm.cmd'
   Write-Ok "node $(& "$nodeHome\node.exe" -v) installed"
 }
@@ -202,11 +240,7 @@ if ($npmExe -eq 'npm') {
     New-Item -ItemType Directory -Force -Path $prefix | Out-Null
     Write-Step "Global npm dir not writable — using a user prefix (no admin): $prefix"
     & npm config set prefix $prefix
-    $userPath = [Environment]::GetEnvironmentVariable('Path','User')
-    if (($userPath -split ';') -notcontains $prefix) {
-      [Environment]::SetEnvironmentVariable('Path', "$prefix;$userPath", 'User')
-    }
-    $env:Path = "$prefix;$env:Path"
+    Add-UserPathEntry $prefix
     Write-Ok "npm prefix -> $prefix"
   }
 }
@@ -279,11 +313,110 @@ if (-not $installedFromR2) {
   if ($LASTEXITCODE -ne 0) { throw "npm install failed (exit $LASTEXITCODE)" }
 }
 
+# ── OpenCode CLI (official opencode-ai, idempotent & non-blocking) ────────────
+function Get-OpenCodeVersion([string]$BinPath) {
+  try {
+    $out = & $BinPath --version 2>$null | Select-Object -First 1
+    if ($null -eq $out) { return '' }
+    return ([string]$out).Trim()
+  } catch {
+    return ''
+  }
+}
+
+$openCodeStatus = 'failed'
+try {
+  if ($skipOpenCodeEffective) {
+    Write-Note "skipping OpenCode CLI install (opted out via -SkipOpenCode / IMCODES_SKIP_OPENCODE)"
+    $openCodeStatus = 'skipped'
+  } else {
+    $ocCmd = Get-Command opencode -ErrorAction SilentlyContinue
+    $userOcDir = Join-Path $env:USERPROFILE '.opencode\bin'
+    $userOcExe = Join-Path $userOcDir 'opencode.exe'
+    if ($ocCmd) {
+      $ocVer = Get-OpenCodeVersion $ocCmd.Source
+      if ($ocVer) {
+        Write-Ok "found opencode $ocVer ($($ocCmd.Source)) — keeping existing install"
+      } else {
+        Write-Ok "found existing opencode CLI ($($ocCmd.Source)) — keeping existing install"
+      }
+      $openCodeStatus = 'existing'
+    } elseif (Test-Path -LiteralPath $userOcExe) {
+      Add-UserPathEntry $userOcDir
+      $ocCmd = Get-Command opencode -ErrorAction SilentlyContinue
+      if ($ocCmd) {
+        $ocVer = Get-OpenCodeVersion $ocCmd.Source
+        if ($ocVer) {
+          Write-Ok "found opencode $ocVer ($userOcExe, added to PATH) — keeping existing install"
+        } else {
+          Write-Ok "found existing opencode CLI ($userOcExe, added to PATH) — keeping existing install"
+        }
+        $openCodeStatus = 'existing'
+      } else {
+        Write-Note "WARNING: found $userOcExe, but could not verify 'opencode' on PATH"
+        $openCodeStatus = 'unverified'
+      }
+    } else {
+      Write-Step "Installing OpenCode CLI (opencode-ai) ..."
+      & $npmExe install -g opencode-ai --no-fund --no-audit --registry $npmRegistry
+      if ($LASTEXITCODE -eq 0) {
+        $ocCmd = Get-Command opencode -ErrorAction SilentlyContinue
+        if (-not $ocCmd) {
+          $ocPrefix = ''
+          try {
+            $p = & $npmExe prefix -g 2>$null | Select-Object -First 1
+            if ($p) { $ocPrefix = ([string]$p).Trim() }
+          } catch {
+            $ocPrefix = ''
+          }
+          if ($ocPrefix) {
+            $hasShim = (Test-Path -LiteralPath (Join-Path $ocPrefix 'opencode.cmd')) -or (Test-Path -LiteralPath (Join-Path $ocPrefix 'opencode.exe'))
+            if ($hasShim) {
+              Add-UserPathEntry $ocPrefix
+              $ocCmd = Get-Command opencode -ErrorAction SilentlyContinue
+            }
+          }
+        }
+        if ($ocCmd) {
+          $ocVer = Get-OpenCodeVersion $ocCmd.Source
+          if ($ocVer) {
+            Write-Ok "opencode CLI installed ($ocVer)"
+          } else {
+            Write-Ok "opencode CLI installed"
+          }
+          $openCodeStatus = 'installed'
+        } else {
+          Write-Note "WARNING: opencode-ai npm install finished, but 'opencode' was not found on PATH — IM.codes was installed cleanly."
+          Write-Note "  Check your npm global prefix or retry manually: $npmExe install -g opencode-ai --registry $npmRegistry"
+          $openCodeStatus = 'unverified'
+        }
+      } else {
+        Write-Note "WARNING: OpenCode CLI install exited $LASTEXITCODE (non-blocking) — IM.codes was installed cleanly. To retry manually later:"
+        Write-Note "  $npmExe install -g opencode-ai --registry $npmRegistry"
+        $openCodeStatus = 'failed'
+      }
+    }
+  }
+} catch {
+  Write-Note "WARNING: OpenCode CLI install failed (non-blocking: $($_.Exception.Message)) — IM.codes was installed cleanly. To retry manually later:"
+  Write-Note "  $npmExe install -g opencode-ai --registry $npmRegistry"
+  $openCodeStatus = 'failed'
+}
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 $installed = ''
 try { $installed = (& imcodes --version) 2>$null } catch {}
 Write-Host ""
 Write-Host "  imcodes installed  $installed" -ForegroundColor Green
+if ($openCodeStatus -in @('installed', 'existing')) {
+  Write-Host "  OpenCode CLI: ready (built-in free models available with zero signup, subject to upstream rate limits & evaluation terms)" -ForegroundColor Green
+} elseif ($openCodeStatus -eq 'skipped') {
+  Write-Host "  OpenCode CLI: skipped (install anytime with: npm install -g opencode-ai)" -ForegroundColor Yellow
+} elseif ($openCodeStatus -eq 'unverified') {
+  Write-Host "  OpenCode CLI: installed by npm, but 'opencode' was not found on PATH (verify npm global bin / open a new shell)" -ForegroundColor Yellow
+} else {
+  Write-Host "  OpenCode CLI: not installed (IM.codes works normally; retry: npm install -g opencode-ai)" -ForegroundColor Yellow
+}
 Write-Host ""
 Write-Host "  Next steps:" -ForegroundColor White
 Write-Host "    1) Open a NEW terminal (so the updated PATH takes effect)" -ForegroundColor Gray

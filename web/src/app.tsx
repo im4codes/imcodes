@@ -1,4 +1,5 @@
 import { R2RelayToggle } from './components/R2RelayToggle.js';
+import { isPresetCompatibleCrossSdkSwitch } from './components/quick-sdk-model.js';
 import { setFileRelayUser, setServerR2RelayEnabled } from './r2-relay-preference.js';
 import { suppressHoverPreviewsUntilPointerMove } from './hover-preview-gate.js';
 import { DesktopAuthBridge } from './pages/DesktopAuthBridge.js';
@@ -4066,8 +4067,9 @@ function InternalMainApp() {
   }, [bringSubToFront, routeSubSessionOpenIfRestricted, setOpenSubIds, setSubSessionMaximized, unpinSubSessionPanel]);
 
   // Per-session chat scroll functions — registered by SessionPane and SubSessionWindow.
-  const chatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
-  const subChatScrollFnsRef = useRef<Map<string, () => void>>(new Map());
+  type ChatScrollCallback = (opts?: { passive?: boolean }) => boolean | void;
+  const chatScrollFnsRef = useRef<Map<string, ChatScrollCallback>>(new Map());
+  const subChatScrollFnsRef = useRef<Map<string, ChatScrollCallback>>(new Map());
   const pendingChatScrollSessionRef = useRef<string | null>(null);
   const pendingChatScrollRafRef = useRef<number | null>(null);
   const settleChatScrollRafRef = useRef<number | null>(null);
@@ -4129,8 +4131,8 @@ function InternalMainApp() {
     cancelSubChatScrollRafs();
   }, [cancelMainChatScrollRafs, cancelSubChatScrollRafs]);
 
-  const runRegisteredMainChatScroll = useCallback((name: string, fn: () => void, scheduleSettle: boolean): boolean => {
-    const handled = (fn as () => boolean | void)();
+  const runRegisteredMainChatScroll = useCallback((name: string, fn: ChatScrollCallback, scheduleSettle: boolean): boolean => {
+    const handled = fn();
     if (handled === false) {
       chatScrollFnsRef.current.delete(name);
       return false;
@@ -4149,15 +4151,15 @@ function InternalMainApp() {
       settleChatScrollRafRef.current = requestAnimationFrame(() => {
         settleChatScrollRafRef.current = null;
         if (pendingChatScrollSessionRef.current !== null && pendingChatScrollSessionRef.current !== name) return;
-        const latest = chatScrollFnsRef.current.get(name) as (() => boolean | void) | undefined;
-        latest?.();
+        const latest = chatScrollFnsRef.current.get(name);
+        latest?.({ passive: true });
       });
     }
     return true;
   }, []);
 
-  const runRegisteredSubChatScroll = useCallback((id: string, fn: () => void, scheduleSettle: boolean): boolean => {
-    const handled = (fn as () => boolean | void)();
+  const runRegisteredSubChatScroll = useCallback((id: string, fn: ChatScrollCallback, scheduleSettle: boolean): boolean => {
+    const handled = fn();
     if (handled === false) {
       subChatScrollFnsRef.current.delete(id);
       return false;
@@ -4173,8 +4175,8 @@ function InternalMainApp() {
       if (existingSettle !== undefined) cancelAnimationFrame(existingSettle);
       const settleRaf = requestAnimationFrame(() => {
         settleSubScrollRafsRef.current.delete(id);
-        const latest = subChatScrollFnsRef.current.get(id) as (() => boolean | void) | undefined;
-        latest?.();
+        const latest = subChatScrollFnsRef.current.get(id);
+        latest?.({ passive: true });
       });
       settleSubScrollRafsRef.current.set(id, settleRaf);
     }
@@ -4189,7 +4191,7 @@ function InternalMainApp() {
         pendingChatScrollRafRef.current = null;
         if (pendingChatScrollSessionRef.current !== name) return;
         const fn = chatScrollFnsRef.current.get(name);
-        if (fn && runRegisteredMainChatScroll(name, fn, false)) {
+        if (fn && runRegisteredMainChatScroll(name, fn, true)) {
           return;
         }
         if (remainingRetries > 0) {
@@ -4197,7 +4199,7 @@ function InternalMainApp() {
         }
       });
     };
-    tryScroll(3);
+    tryScroll(8);
   }, [cancelMainChatScrollRafs, runRegisteredMainChatScroll]);
 
   const scheduleSubChatScrollToBottom = useCallback((id: string) => {
@@ -4208,7 +4210,7 @@ function InternalMainApp() {
         pendingSubScrollRafsRef.current.delete(id);
         if (!pendingSubScrollIdsRef.current.has(id)) return;
         const fn = subChatScrollFnsRef.current.get(id);
-        if (fn && runRegisteredSubChatScroll(id, fn, false)) {
+        if (fn && runRegisteredSubChatScroll(id, fn, true)) {
           return;
         }
         if (remainingRetries > 0) {
@@ -4217,7 +4219,7 @@ function InternalMainApp() {
       });
       pendingSubScrollRafsRef.current.set(id, rafId);
     };
-    tryScroll(3);
+    tryScroll(8);
   }, [cancelSubChatScrollRafs, runRegisteredSubChatScroll]);
 
   const maximizeOpenSubSession = useCallback((id: string) => {
@@ -11726,6 +11728,26 @@ function InternalMainApp() {
                     session.name === s.name ? { ...session, transportConfig } : session
                   )));
                 }}
+                onSessionSaved={(fields) => {
+                  setSessions((prev) => prev.map((session) => {
+                    if (session.name !== s.name) return session;
+                    const updated = { ...session };
+                    if (fields.type !== undefined) {
+                      updated.agentType = fields.type;
+                      updated.runtimeType = getSessionRuntimeType(fields.type);
+                      if (fields.type !== session.agentType) delete updated.qwenModel;
+                    }
+                    if (fields.ccPreset === null) delete updated.ccPreset;
+                    else if (fields.ccPreset !== undefined) updated.ccPreset = fields.ccPreset;
+                    if (fields.requestedModel === null) delete updated.requestedModel;
+                    else if (fields.requestedModel !== undefined) updated.requestedModel = fields.requestedModel;
+                    if (fields.activeModel === null) delete updated.activeModel;
+                    else if (fields.activeModel !== undefined) updated.activeModel = fields.activeModel;
+                    if (fields.modelDisplay === null) delete updated.modelDisplay;
+                    else if (fields.modelDisplay !== undefined) updated.modelDisplay = fields.modelDisplay;
+                    return updated;
+                  }));
+                }}
                 onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
                 onOpenLocalWebPreview={openLocalWebPreviewFromChat}
                 onCloudDocClick={openCloudDocPreview}
@@ -12840,6 +12862,14 @@ function InternalMainApp() {
               onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
+              onSessionSaved={(fields) => updateSubLocal(sub.id, {
+                type: fields.type !== undefined ? fields.type : undefined,
+                runtimeType: fields.type !== undefined ? getSessionRuntimeType(fields.type) : undefined,
+                ccPresetId: fields.ccPreset !== undefined ? fields.ccPreset : undefined,
+                requestedModel: fields.requestedModel,
+                activeModel: fields.activeModel,
+                modelDisplay: fields.modelDisplay,
+              })}
               onLiveSessionStateChange={(liveState) => updateSubLocal(sub.id, {
                 state: liveState,
                 ...(liveState === 'idle'
@@ -13079,6 +13109,9 @@ function InternalMainApp() {
               updateSubLocal(settingsTarget.subId, {
                 type: fields.type !== undefined ? fields.type : undefined,
                 runtimeType: fields.type !== undefined ? getSessionRuntimeType(fields.type) : undefined,
+                ...(fields.type !== undefined && !isPresetCompatibleCrossSdkSwitch(settingsTarget.type, fields.type)
+                  ? { ccPresetId: null }
+                  : {}),
                 label: fields.label !== undefined ? (fields.label ?? null) : undefined,
                 description: fields.description !== undefined ? (fields.description ?? null) : undefined,
                 cwd: fields.cwd !== undefined ? (fields.cwd ?? null) : undefined,
@@ -13096,6 +13129,7 @@ function InternalMainApp() {
                   updated.agentType = fields.type;
                   updated.runtimeType = getSessionRuntimeType(fields.type);
                   if (fields.type !== s.agentType) delete updated.qwenModel;
+                  if (!isPresetCompatibleCrossSdkSwitch(s.agentType, fields.type)) delete updated.ccPreset;
                 }
                 if (fields.label !== undefined) updated.label = fields.label ?? null;
                 if (fields.description !== undefined) updated.description = fields.description ?? null;

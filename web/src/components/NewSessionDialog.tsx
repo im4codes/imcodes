@@ -6,7 +6,8 @@ import type { WsClient } from "../ws-client.js";
 import { FileBrowser } from "./file-browser-lazy.js";
 import { parseString, usePref } from "../hooks/usePref.js";
 import { PREF_KEY_DEFAULT_SHELL } from "../constants/prefs.js";
-import { sanitizeProjectName, buildDefaultProjectDir, DEFAULT_PROJECTS_DIR_PREFIX } from "@shared/sanitize-project-name.js";
+import { sanitizeProjectName, DEFAULT_PROJECTS_DIR_PREFIX } from "@shared/sanitize-project-name.js";
+import { buildReadableProjectDir } from "../util/project-dir-slug.js";
 import { AGENT_AVAILABILITY_MSG, type AgentAvailabilityMap } from "@shared/agent-availability.js";
 import {
   getSessionAgentGroups,
@@ -888,7 +889,7 @@ export function NewSessionDialog({
               const nextProject = (e.target as HTMLInputElement).value;
               setProject(nextProject);
               if (!dirManuallyEdited) {
-                setDir(buildDefaultProjectDir(nextProject));
+                setDir(buildReadableProjectDir(nextProject));
               }
               setError("");
             }}

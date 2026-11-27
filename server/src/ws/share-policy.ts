@@ -1061,6 +1061,7 @@ export function parseShareWsTicketClaims(payload: Record<string, unknown> | null
     snapshot,
     issuedAt: payload.issuedAt,
     expiresAt: payload.expiresAt,
+    ...(typeof payload.sva === 'number' && Number.isFinite(payload.sva) ? { sva: payload.sva } : {}),
   };
 }
 

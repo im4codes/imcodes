@@ -1,7 +1,20 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startAuthentication } from '@simplewebauthn/browser';
-import { ApiError, apiFetch, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName } from '../api.js';
+import { ApiError, apiFetch, passwordChange, passkeyVerifyBegin, passwordSetupWithPasskey, updateDisplayName, type MeResponse } from '../api.js';
+import {
+  bindUserEmail,
+  extractAuthErrorDetails,
+  fetchEmailAuthConfig,
+  mapEmailAuthErrorCode,
+  sendEmailVerificationCode,
+} from '../api/email-auth.js';
+import {
+  EMAIL_AUTH_PURPOSE,
+  EMAIL_OTP_RESEND_COOLDOWN_SECONDS,
+  isValidEmail,
+  isValidEmailOtp,
+} from '@shared/email-auth.js';
 import {
   TTS_DEFAULT_MODEL,
   TTS_DEFAULT_RESPONSE_FORMAT,
@@ -130,6 +143,9 @@ interface Props {
   displayName: string | null;
   username: string | null;
   hasPassword: boolean;
+  emailAuthEnabled?: boolean;
+  userEmail?: string | null;
+  emailVerified?: boolean;
   isAdmin?: boolean;
   serverUrl?: string | null;
   initialTab?: SettingsTab;
@@ -146,6 +162,9 @@ export function SettingsPage({
   displayName,
   username,
   hasPassword,
+  emailAuthEnabled: emailAuthEnabledProp,
+  userEmail: userEmailProp,
+  emailVerified: emailVerifiedProp,
   isAdmin = false,
   serverUrl,
   initialTab = 'profile',
@@ -305,8 +324,21 @@ export function SettingsPage({
   const [oldPw, setOldPw] = useState('');
   const [newPw, setNewPw] = useState('');
   const [confirmPw, setConfirmPw] = useState('');
+  const [pwEmailCode, setPwEmailCode] = useState('');
+  const [pwEmailSending, setPwEmailSending] = useState(false);
+  const [pwEmailCooldown, setPwEmailCooldown] = useState(0);
   const [pwSaving, setPwSaving] = useState(false);
   const [pwMsg, setPwMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const [emailAuthEnabled, setEmailAuthEnabled] = useState(emailAuthEnabledProp === true);
+  const [boundEmail, setBoundEmail] = useState<string | null>(userEmailProp ?? null);
+  const [boundEmailVerified, setBoundEmailVerified] = useState(emailVerifiedProp === true);
+  const [bindEmailInput, setBindEmailInput] = useState('');
+  const [bindEmailCode, setBindEmailCode] = useState('');
+  const [bindEmailSending, setBindEmailSending] = useState(false);
+  const [bindEmailCooldown, setBindEmailCooldown] = useState(0);
+  const [bindEmailSaving, setBindEmailSaving] = useState(false);
+  const [bindEmailMsg, setBindEmailMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
   const [pushPreferences, setPushPreferences] = useState<PushNotificationType[]>(() =>
     getLocalPushNotificationPreferences(),
@@ -694,6 +726,123 @@ export function SettingsPage({
     }
   };
 
+  useEffect(() => {
+    if (emailAuthEnabledProp !== undefined) setEmailAuthEnabled(emailAuthEnabledProp);
+    if (userEmailProp !== undefined) setBoundEmail(userEmailProp);
+    if (emailVerifiedProp !== undefined) setBoundEmailVerified(emailVerifiedProp);
+    if (activeTab !== 'security') return;
+    let cancelled = false;
+    if (emailAuthEnabledProp === undefined) {
+      void fetchEmailAuthConfig()
+        .then((res) => {
+          if (!cancelled && res && typeof res.emailAuthEnabled === 'boolean') {
+            setEmailAuthEnabled(res.emailAuthEnabled);
+          }
+        })
+        .catch(() => {});
+    }
+    if (userEmailProp === undefined) {
+      void apiFetch<MeResponse>('/api/auth/user/me')
+        .then((me) => {
+          if (!cancelled && me && typeof me.id === 'string') {
+            setBoundEmail(me.email ?? null);
+            setBoundEmailVerified(Boolean(me.email_verified));
+          }
+        })
+        .catch(() => {});
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, emailAuthEnabledProp, userEmailProp, emailVerifiedProp]);
+
+  useEffect(() => {
+    if (bindEmailCooldown <= 0) return;
+    const timer = setTimeout(() => setBindEmailCooldown((prev) => (prev > 0 ? prev - 1 : 0)), 1000);
+    return () => clearTimeout(timer);
+  }, [bindEmailCooldown]);
+
+  useEffect(() => {
+    if (pwEmailCooldown <= 0) return;
+    const timer = setTimeout(() => setPwEmailCooldown((prev) => (prev > 0 ? prev - 1 : 0)), 1000);
+    return () => clearTimeout(timer);
+  }, [pwEmailCooldown]);
+
+  const settingsAuthErrorMessage = (err: unknown, fallbackKey: string): string => {
+    const { code, retryAfterMs } = extractAuthErrorDetails(err);
+    const emailMsg = mapEmailAuthErrorCode(t, 'settings', code, retryAfterMs);
+    if (emailMsg) return emailMsg;
+    if (code === AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS) {
+      const minutes = Math.max(1, Math.ceil((retryAfterMs ?? 60_000) / 60_000));
+      return t('login.too_many_attempts', { minutes });
+    }
+    return t(fallbackKey);
+  };
+
+  const handleSendBindEmailCode = async () => {
+    setBindEmailMsg(null);
+    if (!isValidEmail(bindEmailInput)) {
+      setBindEmailMsg({ type: 'err', text: t('settings.invalid_email') });
+      return;
+    }
+    setBindEmailSending(true);
+    try {
+      await sendEmailVerificationCode({
+        email: bindEmailInput.trim(),
+        purpose: EMAIL_AUTH_PURPOSE.BIND_EMAIL,
+        lang: currentLang,
+      });
+      setBindEmailCooldown(EMAIL_OTP_RESEND_COOLDOWN_SECONDS);
+    } catch (err) {
+      setBindEmailMsg({ type: 'err', text: settingsAuthErrorMessage(err, 'settings.email_send_failed') });
+    } finally {
+      setBindEmailSending(false);
+    }
+  };
+
+  const handleBindEmail = async () => {
+    setBindEmailMsg(null);
+    if (!isValidEmail(bindEmailInput)) {
+      setBindEmailMsg({ type: 'err', text: t('settings.invalid_email') });
+      return;
+    }
+    if (!isValidEmailOtp(bindEmailCode)) {
+      setBindEmailMsg({ type: 'err', text: t('settings.email_code_required') });
+      return;
+    }
+    setBindEmailSaving(true);
+    try {
+      const res = await bindUserEmail(bindEmailInput.trim(), bindEmailCode.trim());
+      setBoundEmail(res.email);
+      setBoundEmailVerified(Boolean(res.email_verified));
+      setBindEmailInput('');
+      setBindEmailCode('');
+      setBindEmailMsg({ type: 'ok', text: t('settings.email_bound_success') });
+    } catch (err) {
+      setBindEmailMsg({ type: 'err', text: settingsAuthErrorMessage(err, 'settings.email_code_invalid') });
+    } finally {
+      setBindEmailSaving(false);
+    }
+  };
+
+  const handleSendChangePwEmailCode = async () => {
+    setPwMsg(null);
+    setPwEmailSending(true);
+    try {
+      await sendEmailVerificationCode({
+        purpose: EMAIL_AUTH_PURPOSE.PASSWORD_CHANGE,
+        lang: currentLang,
+      });
+      setPwEmailCooldown(EMAIL_OTP_RESEND_COOLDOWN_SECONDS);
+    } catch (err) {
+      setPwMsg({ type: 'err', text: settingsAuthErrorMessage(err, 'settings.email_send_failed') });
+    } finally {
+      setPwEmailSending(false);
+    }
+  };
+
+  const requiresEmailChangeCode = emailAuthEnabled && boundEmailVerified && Boolean(boundEmail);
+
   const handleChangePw = async () => {
     setPwMsg(null);
     if (newPw !== confirmPw) {
@@ -705,15 +854,24 @@ export function SettingsPage({
       setPwMsg({ type: 'err', text: t(`settings.${complexity.errorKey}`) });
       return;
     }
+    if (requiresEmailChangeCode && !isValidEmailOtp(pwEmailCode)) {
+      setPwMsg({ type: 'err', text: t('settings.email_code_required') });
+      return;
+    }
     setPwSaving(true);
     try {
-      await passwordChange(oldPw, newPw);
+      if (requiresEmailChangeCode) {
+        await passwordChange(oldPw, newPw, pwEmailCode.trim());
+      } else {
+        await passwordChange(oldPw, newPw);
+      }
       setPwMsg({ type: 'ok', text: t('settings.password_changed') });
       setOldPw('');
       setNewPw('');
       setConfirmPw('');
-    } catch {
-      setPwMsg({ type: 'err', text: t('settings.password_error') });
+      setPwEmailCode('');
+    } catch (err) {
+      setPwMsg({ type: 'err', text: settingsAuthErrorMessage(err, 'settings.password_error') });
     } finally {
       setPwSaving(false);
     }
@@ -2001,18 +2159,132 @@ export function SettingsPage({
                     onInput={(e) => setConfirmPw((e.target as HTMLInputElement).value)}
                     class="settings-input"
                   />
+                  {requiresEmailChangeCode && (
+                    <>
+                      <p style={{ color: '#94a3b8', fontSize: '12px', lineHeight: 1.5, marginTop: 0, marginBottom: '8px' }}>
+                        {t('settings.email_change_pw_hint', { email: boundEmail })}
+                      </p>
+                      <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={6}
+                          placeholder={t('settings.email_code_placeholder')}
+                          value={pwEmailCode}
+                          onInput={(e) => setPwEmailCode((e.target as HTMLInputElement).value)}
+                          class="settings-input"
+                          style={{ marginBottom: 0, flex: '1 1 auto', minWidth: 0 }}
+                        />
+                        <button
+                          type="button"
+                          onClick={handleSendChangePwEmailCode}
+                          disabled={pwEmailSending || pwEmailCooldown > 0}
+                          class="settings-btn-secondary"
+                          style={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+                        >
+                          {pwEmailCooldown > 0
+                            ? t('settings.resend_email_code', { seconds: pwEmailCooldown })
+                            : t('settings.send_email_code')}
+                        </button>
+                      </div>
+                    </>
+                  )}
                   <button
                     type="button"
                     onClick={handleChangePw}
-                    disabled={pwSaving || !oldPw || !newPw || !confirmPw}
+                    disabled={pwSaving || !oldPw || !newPw || !confirmPw || (requiresEmailChangeCode && !isValidEmailOtp(pwEmailCode))}
                     class="settings-btn-primary settings-submit-btn"
-                    style={{ opacity: (!oldPw || !newPw || !confirmPw) ? '0.5' : '1' }}
+                    style={{
+                      opacity: (!oldPw || !newPw || !confirmPw || (requiresEmailChangeCode && !isValidEmailOtp(pwEmailCode)))
+                        ? '0.5'
+                        : '1',
+                    }}
                   >
                     {pwSaving ? t('common.loading') : t('settings.change_password_btn')}
                   </button>
                   {pwMsg && (
                     <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(pwMsg.type) }}>
                       {pwMsg.text}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {emailAuthEnabled && (
+                <div class="settings-card" data-testid="settings-email-card">
+                  <h2 class="settings-card-heading">
+                    {t('settings.email_title')}
+                  </h2>
+                  {boundEmail && boundEmailVerified ? (
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', flexWrap: 'wrap' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', minWidth: 0 }}>
+                        <span style={{ color: '#e2e8f0', fontSize: '14px', overflowWrap: 'anywhere' }}>{boundEmail}</span>
+                        <span
+                          style={{
+                            fontSize: '11px',
+                            fontWeight: 600,
+                            color: '#4ade80',
+                            background: 'rgba(34, 197, 94, 0.14)',
+                            border: '1px solid rgba(34, 197, 94, 0.35)',
+                            borderRadius: '4px',
+                            padding: '1px 6px',
+                          }}
+                        >
+                          {t('settings.email_verified_badge')}
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <p style={{ color: '#94a3b8', fontSize: '13px', lineHeight: 1.5, marginTop: 0, marginBottom: '12px' }}>
+                        {t('settings.email_unbound_hint')}
+                      </p>
+                      <input
+                        type="email"
+                        placeholder={t('settings.email_placeholder')}
+                        value={bindEmailInput}
+                        onInput={(e) => setBindEmailInput((e.target as HTMLInputElement).value)}
+                        class="settings-input"
+                      />
+                      <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+                        <input
+                          type="text"
+                          inputMode="numeric"
+                          maxLength={6}
+                          placeholder={t('settings.email_code_placeholder')}
+                          value={bindEmailCode}
+                          onInput={(e) => setBindEmailCode((e.target as HTMLInputElement).value)}
+                          class="settings-input"
+                          style={{ marginBottom: 0, flex: '1 1 auto', minWidth: 0 }}
+                        />
+                        <button
+                          type="button"
+                          onClick={handleSendBindEmailCode}
+                          disabled={bindEmailSending || bindEmailCooldown > 0 || !bindEmailInput.trim()}
+                          class="settings-btn-secondary"
+                          style={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+                        >
+                          {bindEmailCooldown > 0
+                            ? t('settings.resend_email_code', { seconds: bindEmailCooldown })
+                            : t('settings.send_email_code')}
+                        </button>
+                      </div>
+                      <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          onClick={handleBindEmail}
+                          disabled={bindEmailSaving || !bindEmailInput.trim() || !isValidEmailOtp(bindEmailCode)}
+                          class="settings-btn-primary settings-submit-btn"
+                          style={{ opacity: (!bindEmailInput.trim() || !isValidEmailOtp(bindEmailCode)) ? '0.5' : '1' }}
+                        >
+                          {bindEmailSaving ? t('common.loading') : t('settings.bind_email_btn')}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                  {bindEmailMsg && (
+                    <div style={{ marginTop: '8px', fontSize: '13px', color: messageColor(bindEmailMsg.type) }}>
+                      {bindEmailMsg.text}
                     </div>
                   )}
                 </div>

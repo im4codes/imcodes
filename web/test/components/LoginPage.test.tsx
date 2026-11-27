@@ -57,6 +57,7 @@ const ApiErrorMock = vi.hoisted(() => class ApiErrorMock extends Error {
 });
 
 vi.mock('../../src/api.js', () => ({
+  apiFetch: vi.fn().mockResolvedValue({ emailAuthEnabled: false }),
   configureApiKey: (...args: unknown[]) => configureApiKeyMock(...args),
   exchangeNonceWithRetry: (...args: unknown[]) => exchangeNonceWithRetryMock(...args),
   passkeyLoginBegin: (...args: unknown[]) => passkeyLoginBeginMock(...args),

@@ -1,4 +1,5 @@
 import type { Database } from './db/client.js';
+import { getEmailConfigStatus } from './services/email.js';
 
 /** Environment config loaded from process.env (no DB, that's injected at runtime). */
 export interface EnvConfig {
@@ -59,6 +60,25 @@ export interface EnvConfig {
   ASR_API_KEY?: string;
   ASR_MODEL?: string;
   ASR_NAME?: string;
+
+  // Optional dual-channel transactional email (Amazon SES v2 + Alibaba Cloud DirectMail)
+  AWS_SES_ACCESS_KEY_ID?: string;
+  AWS_SES_SECRET_ACCESS_KEY?: string;
+  AWS_SES_REGION?: string;
+  AWS_SES_FROM?: string;
+  AWS_SES_ENDPOINT?: string;
+
+  ALIYUN_DM_ACCESS_KEY_ID?: string;
+  ALIYUN_DM_ACCESS_KEY_SECRET?: string;
+  /** DirectMail region (default: ap-southeast-1 Singapore, ICP-free). */
+  ALIYUN_DM_REGION?: string;
+  ALIYUN_DM_FROM?: string;
+  ALIYUN_DM_FROM_ALIAS?: string;
+  ALIYUN_DM_ENDPOINT?: string;
+
+  EMAIL_CN_DOMAINS?: string;
+  /** On SES sets ReplyToAddresses; on DirectMail enables ReplyToAddress=true using the console-configured address (ReplyAddress not set). */
+  EMAIL_REPLY_TO?: string;
 
   // Server URL (used to build webhook URLs)
   SERVER_URL: string;
@@ -138,6 +158,8 @@ export interface EnvConfig {
   // Password auth
   /** Default admin password when auto-creating admin user. Default: 'imcodes' */
   DEFAULT_ADMIN_PASSWORD?: string;
+  /** Deployment toggle for email-verified registration, password change, and forgot-password reset ('true' to enable). */
+  EMAIL_AUTH_ENABLED?: string;
 
   // Landing page
   /** Host that serves the landing page instead of the app (e.g. im.codes). */
@@ -209,6 +231,20 @@ export function loadEnv(): EnvConfig {
     ASR_API_KEY: process.env.ASR_API_KEY,
     ASR_MODEL: process.env.ASR_MODEL,
     ASR_NAME: process.env.ASR_NAME,
+    AWS_SES_ACCESS_KEY_ID: process.env.AWS_SES_ACCESS_KEY_ID,
+    AWS_SES_SECRET_ACCESS_KEY: process.env.AWS_SES_SECRET_ACCESS_KEY,
+    AWS_SES_REGION: process.env.AWS_SES_REGION || 'us-east-1',
+    AWS_SES_FROM: process.env.AWS_SES_FROM,
+    AWS_SES_ENDPOINT: process.env.AWS_SES_ENDPOINT,
+    ALIYUN_DM_ACCESS_KEY_ID: process.env.ALIYUN_DM_ACCESS_KEY_ID,
+    ALIYUN_DM_ACCESS_KEY_SECRET: process.env.ALIYUN_DM_ACCESS_KEY_SECRET,
+    ALIYUN_DM_REGION: process.env.ALIYUN_DM_REGION || 'ap-southeast-1',
+    ALIYUN_DM_FROM: process.env.ALIYUN_DM_FROM,
+    ALIYUN_DM_FROM_ALIAS: process.env.ALIYUN_DM_FROM_ALIAS,
+    ALIYUN_DM_ENDPOINT: process.env.ALIYUN_DM_ENDPOINT,
+    EMAIL_CN_DOMAINS: process.env.EMAIL_CN_DOMAINS,
+    EMAIL_REPLY_TO: process.env.EMAIL_REPLY_TO,
+    EMAIL_AUTH_ENABLED: process.env.EMAIL_AUTH_ENABLED,
     SERVER_URL: process.env.SERVER_URL ?? `http://localhost:${process.env.PORT ?? 19138}`,
     ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
     TRUSTED_PROXIES: process.env.TRUSTED_PROXIES,
@@ -246,4 +282,12 @@ export function loadEnv(): EnvConfig {
     NODE_ENV: process.env.NODE_ENV,
     ENVIRONMENT: process.env.ENVIRONMENT,
   };
+}
+
+/**
+ * True only when both the deployment opt-in (`EMAIL_AUTH_ENABLED=true`) AND at least
+ * one transactional email provider is validly configured.
+ */
+export function isEmailAuthEnabled(env: Partial<EnvConfig>): boolean {
+  return env.EMAIL_AUTH_ENABLED?.trim().toLowerCase() === 'true' && getEmailConfigStatus(env).configured;
 }

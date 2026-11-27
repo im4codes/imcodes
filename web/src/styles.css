@@ -2184,6 +2184,256 @@ html.native-ios-mac .chat-dl-btn {
 .menu-dropdown-models { width: max-content; min-width: min(200px, calc(var(--imcodes-ui-vw, 100vw) - 16px)); max-width: calc(var(--imcodes-ui-vw, 100vw) - 16px); max-height: min(calc(var(--imcodes-ui-vh, 100vh) * 0.55), calc(var(--vvh, var(--imcodes-ui-dvh, var(--imcodes-ui-vh, 100vh))) - max(var(--sat, 0px), env(safe-area-inset-top, 0px)) - env(safe-area-inset-bottom, 0px) - 24px)); z-index: 2147483646; }
 .menu-dropdown-models .menu-item,
 .menu-dropdown .menu-item { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.menu-dropdown-models:has(.quick-sdk-model-split) {
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: min(416px, calc(var(--imcodes-ui-vw, 100vw) - 16px));
+  overflow: hidden !important;
+  padding: 0;
+  border-radius: 10px;
+  border: 1px solid rgba(125, 211, 252, 0.28);
+  background: radial-gradient(circle at 12% 0%, rgba(34, 211, 238, 0.08), transparent 46%),
+    radial-gradient(circle at 96% 100%, rgba(167, 139, 250, 0.08), transparent 44%),
+    linear-gradient(170deg, rgba(17, 27, 45, 0.96) 0%, rgba(8, 13, 22, 0.98) 100%);
+  box-shadow: 0 18px 46px rgba(2, 6, 23, 0.72), inset 0 1px 0 rgba(125, 211, 252, 0.14);
+  -webkit-backdrop-filter: blur(16px);
+  backdrop-filter: blur(16px);
+}
+.quick-sdk-model-split {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  min-width: 0;
+  width: min(414px, 100%);
+  max-width: 100%;
+  height: min(370px, 50vh);
+  max-height: 100%;
+  overflow: hidden;
+  color: #e2e8f0;
+}
+.quick-sdk-model-sdks {
+  flex: 0 0 clamp(118px, 36%, 150px);
+  width: clamp(118px, 36%, 150px);
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: rgba(8, 13, 22, 0.56);
+  border-right: 1px solid var(--chrome-line-soft);
+}
+.quick-sdk-model-models {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+}
+.quick-sdk-col-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-height: 30px;
+  padding: 6px 10px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #7dd3fc;
+  border-bottom: 1px solid var(--chrome-line-soft);
+  background: rgba(13, 20, 34, 0.72);
+}
+.quick-sdk-col-header-models {
+  color: #cbd5e1;
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+.quick-sdk-col-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  font-weight: 700;
+  color: #f1f5f9;
+}
+.quick-sdk-handoff-badge {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 56%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 700;
+  color: #6ee7b7;
+  background: rgba(16, 185, 129, 0.14);
+  border: 1px solid rgba(52, 211, 153, 0.32);
+  white-space: nowrap;
+}
+.quick-sdk-col-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+  padding: 4px;
+}
+.quick-sdk-group-divider {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--chrome-line-soft);
+}
+.quick-sdk-item {
+  width: 100%;
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 12px;
+  font-weight: 500;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.quick-sdk-item:hover {
+  background: rgba(30, 41, 59, 0.72);
+  color: #e2e8f0;
+}
+.quick-sdk-item.is-preview {
+  background: linear-gradient(135deg, rgba(34, 211, 238, 0.16), rgba(16, 185, 129, 0.08));
+  border-color: rgba(34, 211, 238, 0.42);
+  color: #f8fafc;
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.12);
+}
+.quick-sdk-item.is-current:not(.is-preview) {
+  color: #c4b5fd;
+}
+.quick-sdk-item-icon {
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1;
+}
+.quick-sdk-item-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.quick-sdk-item-dot {
+  flex-shrink: 0;
+  font-size: 8px;
+  color: #34d399;
+}
+.menu-dropdown-models .quick-sdk-model-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  min-height: 36px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  font-size: 12px;
+  line-height: 1.25;
+}
+.quick-sdk-model-item-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.menu-dropdown-models .quick-sdk-model-item:hover:not(:disabled) {
+  background: rgba(51, 65, 85, 0.65);
+  color: #f8fafc;
+}
+.menu-dropdown-models .quick-sdk-default-item {
+  margin-bottom: 4px;
+  border: 1px solid rgba(52, 211, 153, 0.34);
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.14), rgba(34, 211, 238, 0.06));
+  color: #a7f3d0;
+  font-weight: 600;
+}
+.menu-dropdown-models .quick-sdk-default-item:hover:not(:disabled) {
+  background: linear-gradient(135deg, rgba(16, 185, 129, 0.24), rgba(34, 211, 238, 0.1));
+  border-color: rgba(52, 211, 153, 0.54);
+  color: #ecfdf5;
+}
+.quick-sdk-default-tag {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: rgba(8, 13, 22, 0.56);
+  border: 1px solid rgba(52, 211, 153, 0.24);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  color: #6ee7b7;
+}
+.quick-sdk-status-row,
+.quick-sdk-empty-row {
+  padding: 8px 10px;
+  font-size: 11px;
+  color: #94a3b8;
+  line-height: 1.35;
+}
+@media (max-width: 640px) {
+  .menu-dropdown-models:has(.quick-sdk-model-split) {
+    width: min(374px, calc(var(--imcodes-ui-vw, 100vw) - 16px));
+  }
+  .quick-sdk-model-split {
+    width: min(372px, 100%);
+    height: min(340px, 46vh);
+    max-height: 100%;
+  }
+  .quick-sdk-model-sdks {
+    flex: 0 0 clamp(96px, 34%, 126px);
+    width: clamp(96px, 34%, 126px);
+  }
+  .quick-sdk-item,
+  .menu-dropdown-models .quick-sdk-model-item {
+    min-height: 40px;
+  }
+}
+@media (max-width: 359px) {
+  .quick-sdk-model-sdks {
+    flex: 0 0 clamp(88px, 34%, 106px);
+    width: clamp(88px, 34%, 106px);
+  }
+  .quick-sdk-item,
+  .menu-dropdown-models .quick-sdk-model-item {
+    min-height: 38px;
+    padding-left: 7px;
+    padding-right: 7px;
+  }
+  .menu-dropdown-models .quick-sdk-default-item {
+    font-size: 11px;
+    gap: 4px;
+  }
+  .quick-sdk-default-tag {
+    max-width: 88px;
+    font-size: 9.5px;
+    padding: 1px 4px;
+  }
+}
 .menu-dropdown-openspec { width: max-content; min-width: min(380px, calc(var(--imcodes-ui-vw, 100vw) - 24px)); max-width: calc(var(--imcodes-ui-vw, 100vw) - 24px); overscroll-behavior: contain; display: flex; flex-direction: column; z-index: 2147483646; }
 .menu-dropdown-openspec-inline { position: absolute; right: 0; bottom: calc(100% + 4px); }
 .menu-dropdown-openspec .menu-item,
@@ -20142,6 +20392,10 @@ button.quick-agent-delegation-preset.active {
 .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
   height: auto; max-height: var(--task-pair-panel-max-h, min(calc(var(--imcodes-ui-vh, 100vh) * 0.65), calc(var(--imcodes-ui-dvh) - 160px))); z-index: 20;
 }
+.chat-titlebar > .task-pair-status-panel.is-mobile.is-overlay:not(.is-collapsed) {
+  border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
+  box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
+}
 .chat-titlebar > .task-pair-status-panel.is-collapsed {
   /* Keep the collapsed strip in the titlebar flex flow on desktop too. The
      expanded rows remain positioned below the titlebar by the rule above. */
@@ -20162,6 +20416,13 @@ button.quick-agent-delegation-preset.active {
 .chat-main > .task-pair-status-panel:not(.is-collapsed) {
   position: absolute; top: 40px; right: 0; bottom: 0; height: auto; max-height: none;
   width: min(var(--task-pair-panel-width), 100%); max-width: var(--task-pair-panel-width); overflow: hidden;
+}
+.chat-main > .task-pair-status-panel.is-overlay:not(.is-collapsed) {
+  top: 40px; right: 8px; bottom: auto; height: auto; max-height: calc(100% - 48px);
+  width: min(var(--task-pair-panel-width, 300px), calc(100% - 16px)); max-width: calc(100% - 16px);
+  z-index: 20; overflow: hidden;
+  border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
+  box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
 }
 .chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
   bottom: auto; max-height: var(--task-pair-panel-max-h, calc(100% - 48px)); z-index: 20;
@@ -20190,26 +20451,20 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-icon.is-zero { opacity: .38; }
 .task-pair-status-icon.is-highlighted { color: var(--status-waiting-text, #fbbf24); border-color: color-mix(in srgb, currentColor 52%, transparent); background: color-mix(in srgb, currentColor 12%, transparent); }
 .task-pair-status-icon b { font-size: 10px; font-weight: 700; }
-.chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: calc(var(--task-pair-panel-width) + 12px); }
-.chat-view-wrap:has(.task-pair-status-panel) .chat-pending-ask-dock { padding-right: calc(var(--task-pair-panel-width) + 12px); }
+.chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-view,
+.chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-view { padding-right: calc(var(--task-pair-panel-width) + 12px); }
+.chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-pending-ask-dock { padding-right: calc(var(--task-pair-panel-width) + 12px); }
 /* The pinned "last sent" banner is a flow sibling of the panel (not inside
    .chat-view), so the .chat-view padding-right above never reaches it -- it
    still spans the full wrap width and its right edge sits under the panel.
    Reserve the same width here so the banner and the panel never overlap. */
-.chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: calc(var(--task-pair-panel-width) + 12px); }
-/* The floating scroll-to-bottom button is positioned inside .chat-main
+.chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-pinned-last-sent { margin-right: calc(var(--task-pair-panel-width) + 12px); }
+/* The floating scroll-to-bottom button is positioned inside .chat-scroll-region
    (`right: 12px; z-index: 10`), so an expanded desktop panel (`z-index: 12`)
    would otherwise cover it completely. Shift it left of the panel while
    clamping inside narrow desktop panes so it stays visible in `.chat-main`. */
-.chat-view-wrap:has(.task-pair-status-panel) .chat-scroll-btn { right: min(calc(var(--task-pair-panel-width) + 12px), max(12px, calc(100% - 48px))); }
-.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-view { padding-right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-pending-ask-dock { padding-right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-pinned-last-sent { margin-right: 10px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-scroll-btn { right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-view { padding-right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-pending-ask-dock { padding-right: 12px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-pinned-last-sent { margin-right: 10px; }
-.chat-view-wrap:has(.task-pair-status-panel.is-mobile.is-fullscreen) .chat-scroll-btn { right: 12px; }
+.chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-scroll-btn,
+.chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-btn { right: min(calc(var(--task-pair-panel-width) + 12px), max(12px, calc(100% - 48px))); }
 /* Owner rule: the collapsed mobile task status is a bare inline strip in
    the titlebar -- no border/background, no expand button, and it must not
    make the titlebar any taller. Keyed on the panel's .is-mobile class (not a
@@ -20303,10 +20558,12 @@ button.quick-agent-delegation-preset.active {
   .chat-main > .task-pair-status-panel.is-collapsed {
     position: absolute; top: 4px; right: 8px; bottom: auto; height: auto; max-height: none; overflow: visible;
   }
-  .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
-  .chat-view-wrap:has(.task-pair-status-panel) .chat-pending-ask-dock { padding-right: 10px; }
-  .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: 10px; }
-  .chat-view-wrap:has(.task-pair-status-panel) .chat-scroll-btn { right: 12px; }
+  .chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-view,
+  .chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-view { padding-right: 12px; }
+  .chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-pending-ask-dock { padding-right: 10px; }
+  .chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-pinned-last-sent { margin-right: 10px; }
+  .chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-scroll-btn,
+  .chat-view-wrap > .chat-main:has(> .task-pair-status-panel:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-btn { right: 12px; }
   .chat-pending-ask-dock { padding: 6px 10px 8px; }
   /* Compact single-line "last sent" banner on mobile (tap to expand). */
   .chat-pinned-last-sent { flex-direction: row; align-items: center; gap: 6px; min-width: 0; padding: 4px 8px; }
@@ -20376,16 +20633,24 @@ button.quick-agent-delegation-preset.active {
   z-index: 12;
   overflow: hidden;
 }
-.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-view {
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-view,
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-view,
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-view,
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-view {
   padding-right: calc(min(var(--task-pair-panel-width, 360px), 46vw) + 12px);
 }
-.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-pending-ask-dock {
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-pending-ask-dock,
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-pending-ask-dock {
   padding-right: calc(min(var(--task-pair-panel-width, 360px), 46vw) + 12px);
 }
-.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-pinned-last-sent {
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-pinned-last-sent,
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-pinned-last-sent {
   margin-right: calc(min(var(--task-pair-panel-width, 360px), 46vw) + 12px);
 }
-.layout-mobile-expanded .chat-view-wrap:has(.chat-main > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen)) .chat-scroll-btn {
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-scroll-btn,
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-btn,
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-region > .chat-scroll-btn,
+.layout-mobile-expanded .chat-view-wrap > .chat-main:has(> .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed):not(.is-fullscreen):not(.is-overlay)) > .chat-scroll-btn {
   right: min(calc(min(var(--task-pair-panel-width, 360px), 46vw) + 12px), max(12px, calc(100% - 48px)));
 }
 .task-pair-status-group { margin: 0 0 6px; }
@@ -26015,6 +26280,7 @@ html.native-ios-mac .view-toggle.mobile-cloud-docs-marquee-btn {
 :is(html.native-ios-mac, html.native-mac-desktop) .mobile-swipe-edge-indicator,
 :is(html.native-ios-mac, html.native-mac-desktop) .chat-tts-settings-popover,
 :is(html.native-ios-mac, html.native-mac-desktop) .chat-sel-menu,
+:is(html.native-ios-mac, html.native-mac-desktop) .menu-dropdown-models:has(.quick-sdk-model-split),
 :is(html.native-ios-mac, html.native-mac-desktop) .client-downloads-overlay,
 :is(html.native-ios-mac, html.native-mac-desktop) .pc-app-update-banner {
   -webkit-backdrop-filter: none;

@@ -106,8 +106,9 @@ describe('task-pair-tts localization & lifecycle formatting', () => {
 
   it('ignores internal bookkeeping verbs and produces round-aware cross-source dedup keys', () => {
     const t = makeTranslator(en);
-    for (const ignored of ['CHECK', 'CLAIM', 'TITLE', 'MATERIAL', 'CHECKLIST_AUTO_TICK', 'PAIR_DELIVERY', 'PAIR_DISPATCH', 'BRAIN_NOTICE', 'BRIEF_UPDATED', 'SEND']) {
+    for (const ignored of ['CHECK', 'CLAIM', 'PAUSE', 'RESUME', 'TITLE', 'MATERIAL', 'CHECKLIST_AUTO_TICK', 'PAIR_DELIVERY', 'PAIR_DISPATCH', 'BRAIN_NOTICE', 'BRIEF_UPDATED', 'SEND']) {
       expect(formatTaskPairTtsAnnouncement(t, { taskId: 'tsk_1', title: 'A', verb: ignored, toStatus: 'working' })).toBeNull();
+      expect(formatTaskPairTtsAnnouncement(t, { taskId: 'tsk_1', title: 'A', verb: ignored, toStatus: 'in_audit' })).toBeNull();
     }
     expect(formatTaskPairTtsAnnouncement(t, { taskId: 'tsk_1', title: 'A', verb: 'NOTICE' })).toBeNull();
 

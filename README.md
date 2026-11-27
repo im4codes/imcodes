@@ -2,26 +2,26 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**The IM for agents. AI remote desktop, shared memory, OpenSpec Auto Deliver, managed MCP tools, supervised execution, and cross-agent audit across AI providers.**
+**Self-hosted, source-available, zero-lock-in AI Force workbench: cross-vendor Task Pairs & Execution Pool, behind-NAT Controlled Nodes & Computer Use, built-in 4K Remote Desktop, Cloud Docs + ONLYOFFICE, and Team Sharing.**
 
-> Two heads are better than one.<br>
-> But minds in concert don't answer fate, they author it.<br>
+> Stop chatting with one AI. Command an AI Force.<br>
+> One workbench — every model, every machine, under your command.<br>
 > — IM.codes
 
-IM.codes connects AI agents not only to coding sessions, but also to the computers where work happens. Enroll supported machines as restricted **Controlled Nodes**, then let an authorized agent directly operate one or many computers with scoped commands, file transfer, and typed Computer Use. When a person needs to see or take over, capable Windows nodes also provide browser-based remote desktop from desktop or mobile.
-
-Alongside machine control, IM.codes gives coding agents one shared memory layer and one managed MCP tool surface across providers. It turns completed work into reusable context across [Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), [Gemini CLI](https://github.com/google-gemini/gemini-cli), GitHub Copilot, Cursor, OpenCode, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), and more. Terminal access, file and Git views, localhost preview, notifications, multi-agent workflows, OpenSpec Auto Deliver, Auto supervision, and cross-provider Team audit keep both human and agent work visible and connected.
+IM.codes unifies your AI agents, computers, and team documents in one real-time workbench. **Self-hosted, source-available ([BSL 1.1](#license)), and built with zero vendor lock-in** — your memory, code, docs, and tools stay in your own infrastructure, and you can mix or swap any AI model or provider freely ([Claude Code](https://github.com/anthropics/claude-code), [Codex](https://github.com/openai/codex), Antigravity CLI, [OpenClaw](https://openclaw.com), [Qwen](https://github.com/QwenLM/qwen-agent), GitHub Copilot, Cursor, OpenCode, and more).
 
 > **Disclaimer:** This is an actively developed personal source-available project. There are no warranties, no SLA, and no guarantees of stability, security, or backward compatibility. Use at your own risk.
 
-## Controlled Nodes: AI Remote Desktop
+## Core Pillars Overview
 
-Turn supported computers into AI-operated nodes without making each machine a full IM.codes source server.
-
-- **One AI, multiple computers.** Enroll multiple machines and let one agent—or a team of agents—operate them directly to get work done.
-- **Real computer actions.** Run scoped commands, move individual files, and control desktop applications through typed Computer Use tools.
-- **Remote desktop when humans need it.** Open a capable Windows node from a browser or mobile device to view the screen or take control directly.
-- **Scoped and revocable.** Every node has independent credentials, remains separate from normal server/session lists, and can have execution access disabled or revoked by its owner.
+| Pillar | What It Delivers |
+|---|---|
+| **Task Pairs & Cross-Vendor Execution Pool (`Pair`)** | Flagship Brain decomposes goals into dependent Briefs & checklists, dispatches isolated `Executor × Auditor` pairs in native Split View, eliminates single-model blind spots, and spreads usage across providers and switches within your configured Execution Pool when rate limits occur with structured `PASS` / `REWORK` convergence. |
+| **Controlled Nodes & AI Computer Use (`OCU`)** | Turn behind-NAT Linux, Windows, and macOS machines into AI-operated nodes — no public IP, VPN, or port forwarding. Scoped `exec_remote`, direct/relay file transfers, and typed GUI/CDP browser automation via `computer_use_call` (`^^(nodeId)`). |
+| **Built-in 4K Remote Desktop** | Built directly into IM.codes with no separate remote-desktop add-on fees under your IM.codes license. Open live 4K desktops across Windows, macOS, and Linux from any browser or phone, monitor up to 4 hosts on the Desktop Wall, and stay in ultimate human control anytime. |
+| **Cloud Docs & Collaborative Editing** | Built-in Cloud Docs + ONLYOFFICE + DocBuilder. Store specs, runbooks, and AI Skills, inject any doc straight into chat with `&`, and collaboratively create, convert, and edit DOCX/XLSX/PPTX/Markdown. |
+| **Team Sharing & Access Control** | Share Controlled Nodes, live sessions/sub-sessions, and Cloud Docs per user or group (`viewer` or `participant`) with one-click revoke; private groups keep personal and family machines isolated. |
+| **3-Screen & iPhone Duo Sync** | Seamless desktop, tablet, **iPhone Duo / Foldable** dual-screen span, mobile, and Apple Watch continuity with synced tabs, panels, and push notifications. |
 
 ## Screenshots
 
@@ -32,6 +32,9 @@ Turn supported computers into AI-operated nodes without making each machine a fu
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes0.png"><img src="landing/imcodes0.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes1.png"><img src="landing/imcodes1.png" width="24%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes2.png"><img src="landing/imcodes2.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-nodes.png"><img src="landing/imcodes-nodes.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-clouddocs.png"><img src="landing/imcodes-clouddocs.png" width="24%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes3.png"><img src="landing/imcodes3.png" width="24%" /></a>
 </p>
 
 ### iPad / Tablet
@@ -41,18 +44,25 @@ Turn supported computers into AI-operated nodes without making each machine a fu
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-ipad3.png"><img src="landing/imcodes-ipad3.png" width="48%" /></a>
 </p>
 
+### iPhone Duo / Foldable
+
+<p>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-duo1.png"><img src="landing/imcodes-duo1.png" width="48%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-duo2.png"><img src="landing/imcodes-duo2.png" width="48%" /></a>
+</p>
+
 ### Mobile
 
 <p>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="landing/imcodes-m6.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="landing/imcodes-m7.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="landing/imcodes-m8.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="landing/imcodes-m5.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="landing/imcodes-m0.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m1.png"><img src="landing/imcodes-m1.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m2.png"><img src="landing/imcodes-m2.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m3.png"><img src="landing/imcodes-m3.png" width="18%" /></a>
 <a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m4.png"><img src="landing/imcodes-m4.png" width="18%" /></a>
-<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m0.png"><img src="landing/imcodes-m0.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m5.png"><img src="landing/imcodes-m5.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m6.png"><img src="landing/imcodes-m6.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m7.png"><img src="landing/imcodes-m7.png" width="18%" /></a>
+<a href="https://raw.githubusercontent.com/im4codes/imcodes/master/landing/imcodes-m8.png"><img src="landing/imcodes-m8.png" width="18%" /></a>
 </p>
 
 ### Apple Watch
@@ -64,6 +74,38 @@ Turn supported computers into AI-operated nodes without making each machine a fu
 </p>
 
 Watch support covers quick session monitoring, unread counts, push notifications, and quick replies directly from the wrist.
+
+## Task Pairs & Cross-Vendor Execution Pool
+
+Command multiple AI models as a disciplined engineering team rather than relying on one model in a single chat window.
+
+- **Brain decomposition & dependency control.** A flagship Brain breaks requirements into dependent Briefs and numbered `[ ][ ]` checklists (`pair_create`, `pair_task_update`), dispatching work into isolated git worktrees or scoped task directories.
+- **Cross-vendor Execution Pool.** Mix flagship and secondary tiers across providers (Claude Code, Codex, Antigravity CLI, Qwen, and more) so different models cross-check blind spots and spread usage across providers and switch within your configured Execution Pool when rate limits occur.
+- **Native Split View (`Executor × Auditor`).** Watch the Executor implement and the independent Auditor verify side-by-side with live checklist ticks and structured `PASS` / `REWORK` convergence (`pair_verdict`).
+- **Global Task Mode & zero lock-in.** Orchestrate multi-phase pipelines across servers and swap models or providers whenever you want.
+
+## Controlled Nodes & Built-in 4K Remote Desktop
+
+Turn Linux, Windows, and macOS computers behind NAT into AI-operated nodes and human-accessible remote desktops — no public IP, no VPN, and no port forwarding.
+
+- **One AI Force, many machines.** Type `^` (or insert `^^(nodeId)`) to target enrolled nodes from any conversation. Agents run scoped `exec_remote` commands, transfer files directly or via relay, and automate desktop apps or CDP browsers via `computer_use_call` and [Open Computer Use](https://github.com/iFurySt/open-codex-computer-use) (Leo, MIT).
+- **Built-in 4K Remote Desktop.** Open live remote desktops across Windows, macOS, and Linux right from your browser or phone with touch navigation, virtual mouse, and display/quality controls.
+- **4-Tile Multi-Host Desktop Wall.** Monitor and interact with up to four remote machines side-by-side on one screen — the human owner always stays in ultimate control.
+- **Scoped and revocable.** Every node uses independent credentials, remains isolated from normal server/session lists, and can have execution or remote desktop access disabled or revoked in one click.
+
+## Cloud Docs & Collaborative Editing
+
+Keep specifications, runbooks, architecture notes, and AI Skills alongside your code in built-in Cloud Docs powered by ONLYOFFICE and DocBuilder.
+
+- **Instant chat injection via `&` picker.** Type `&` in the composer to reference any Cloud Doc, or let SDK agents read, create, edit, convert, and share documents via the managed `cloud_docs` MCP tool.
+- **ONLYOFFICE + DocBuilder.** Collaboratively edit DOCX, XLSX, PPTX, and Markdown directly in the workbench, convert formats, and share read/edit access across your team.
+
+## Team Sharing & Collaborative Workspaces
+
+Share Controlled Nodes, live coding tabs, sub-sessions, and Cloud Docs per user or group without giving up control of your infrastructure.
+
+- **Granular roles.** Grant `viewer` for read-only observation/review or `participant` when teammates should send prompts or operate covered nodes. Shared messages carry clear actor labels.
+- **One-click revoke & private groups.** Downgrade or revoke access anytime, and use private groups to keep personal or family machines strictly isolated from shared team workspaces.
 
 ## Download
 
@@ -188,7 +230,7 @@ Auto supervision splits configuration into two layers. Backend, model, and timeo
 
 Single-model output shouldn't be trusted blindly. Team discussions let multiple agents — across different providers and thinking styles — collaborate on the same codebase before a single line is written. Each round follows a customizable multi-phase pipeline where every agent reads all prior contributions and builds on them. Different models catch different classes of issues: one spots a race condition, another flags a missing migration, a third questions the API design. This cross-provider scrutiny catches problems a single model often misses before implementation, reducing rework cycles.
 
-Built-in modes include `audit` (structured audit → review → plan pipeline), `review`, `discuss`, and `brainstorm` — or define your own phase sequence. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, Gemini CLI, and Qwen, including sandboxed agents. Configure participants, round counts, modes, and per-session Team settings via `@@all(config)` or the UI.
+Built-in modes include `audit` (structured audit → review → plan pipeline), `review`, `discuss`, and `brainstorm` — or define your own phase sequence. Ring progress indicator shows round/hop completion in the sidebar. Works across Claude Code, Codex, Antigravity CLI, and Qwen, including sandboxed agents. Configure participants, round counts, modes, and per-session Team settings via `@@all(config)` or the UI.
 
 ### Streaming Transport Agents
 
@@ -282,7 +324,7 @@ Daemon self-upgrades via npm. Trigger from the web UI for one device or all devi
 - Not another AI IDE
 - Not just a chat wrapper
 - Not just a remote terminal client
-- Not a replacement for Claude Code, Codex, Gemini CLI, OpenClaw, or Qwen
+- Not a replacement for Claude Code, Codex, Antigravity CLI, OpenClaw, or Qwen
 - It is the messaging/control layer around them
 
 ## Architecture
@@ -294,7 +336,7 @@ Server (self-hosted)
         ↓ WebSocket
 Daemon (your machine)
         ↓ tmux / transport / managed MCP
-AI Agents (Claude Code / Codex / Gemini CLI / OpenClaw)
+AI Agents (Claude Code / Codex / Antigravity CLI / OpenClaw)
         ↔ imcodes send (agent-to-agent)
 ```
 
@@ -440,11 +482,11 @@ Check the daemon watchdog log for errors:
 - **Windows (experimental)**: Native support via ConPTY (built-in on Windows 10+). Just `irm https://im.codes/install.ps1 | iex` (fallback: `npm install -g imcodes`) — no extra software needed. WSL also works.
 - Node.js >= 22
 - Terminal multiplexer: [tmux](https://github.com/tmux/tmux) (Linux/macOS). Windows uses ConPTY (auto-detected, built-in).
-- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code) (CLI or SDK), [Codex](https://github.com/openai/codex) (CLI or SDK), [Gemini CLI](https://github.com/google-gemini/gemini-cli), [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
+- At least one AI coding agent: [Claude Code](https://github.com/anthropics/claude-code) (CLI or SDK), [Codex](https://github.com/openai/codex) (CLI or SDK), Antigravity CLI, [OpenClaw](https://openclaw.com), or [Qwen](https://github.com/QwenLM/qwen-agent)
 
 ## About
 
-This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
+This is a personal project. I haven't written any code myself — it was built almost entirely by [Claude Code](https://github.com/anthropics/claude-code), with significant contributions from [Codex](https://github.com/openai/codex) and Antigravity CLI.
 
 ## Disclaimer
 

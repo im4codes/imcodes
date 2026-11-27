@@ -722,4 +722,58 @@ describe('ChatView render capability contract', () => {
     expect(reExpanded.classList.contains('is-collapsed')).toBe(false);
     expect(reExpanded.parentElement).toBe(main);
   });
+
+  it('preserves READY_FOR_AUDIT and REWORK cards when followed by same-status PAUSE and RESUME scheduling projections', () => {
+    const ready = {
+      ...ev('task_pair.event'),
+      eventId: 'ready-1',
+      ts: 100,
+      payload: { taskId: 'tsk_sched_keep', title: 'Keep lifecycle', verb: 'READY_FOR_AUDIT', toStatus: 'in_audit' },
+    } as unknown as TimelineEvent;
+    const pauseAudit = {
+      ...ev('task_pair.event'),
+      eventId: 'pause:tsk_sched_keep:1',
+      ts: 200,
+      payload: { taskId: 'tsk_sched_keep', title: 'Keep lifecycle', verb: 'PAUSE', fromStatus: 'in_audit', toStatus: 'in_audit', effect: 'scheduled' },
+    } as unknown as TimelineEvent;
+    const resumeAudit = {
+      ...ev('task_pair.event'),
+      eventId: 'resume:tsk_sched_keep:2',
+      ts: 300,
+      payload: { taskId: 'tsk_sched_keep', title: 'Keep lifecycle', verb: 'RESUME', fromStatus: 'in_audit', toStatus: 'in_audit', effect: 'recorded' },
+    } as unknown as TimelineEvent;
+    const rework = {
+      ...ev('task_pair.event'),
+      eventId: 'rework-1',
+      ts: 400,
+      payload: { taskId: 'tsk_sched_keep', title: 'Keep lifecycle', verb: 'REWORK', toStatus: 'rework' },
+    } as unknown as TimelineEvent;
+    const pauseRework = {
+      ...ev('task_pair.event'),
+      eventId: 'pause:tsk_sched_keep:3',
+      ts: 500,
+      payload: { taskId: 'tsk_sched_keep', title: 'Keep lifecycle', verb: 'PAUSE', fromStatus: 'rework', toStatus: 'rework', effect: 'scheduled' },
+    } as unknown as TimelineEvent;
+    const resumeRework = {
+      ...ev('task_pair.event'),
+      eventId: 'resume:tsk_sched_keep:4',
+      ts: 600,
+      payload: { taskId: 'tsk_sched_keep', title: 'Keep lifecycle', verb: 'RESUME', fromStatus: 'rework', toStatus: 'rework', effect: 'recorded' },
+    } as unknown as TimelineEvent;
+
+    const items = __buildViewItemsForTests([ready, pauseAudit, resumeAudit, rework, pauseRework, resumeRework], true);
+    const renderedIds = items
+      .filter((item): item is Extract<typeof item, { type: 'event' }> => item.type === 'event')
+      .map((item) => item.event.eventId);
+    expect(renderedIds).toContain('ready-1');
+    expect(renderedIds).toContain('rework-1');
+    expect(renderedIds).toEqual([
+      'ready-1',
+      'pause:tsk_sched_keep:1',
+      'resume:tsk_sched_keep:2',
+      'rework-1',
+      'pause:tsk_sched_keep:3',
+      'resume:tsk_sched_keep:4',
+    ]);
+  });
 });

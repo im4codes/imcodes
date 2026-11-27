@@ -26,6 +26,34 @@ export function validatePairDependencies(project: string, taskId: string, input:
 export function initialPairWait(writer: string, dependsOn: string[], now = Date.now()): TaskPairScheduling {
   return { epoch: 1, manual: false, dependsOn, since: now, writer };
 }
+export function emitSchedulingTimelineEvent(
+  saved: StoredTaskPair,
+  opts: {
+    writer: string;
+    role: 'brain' | 'daemon';
+    verb: 'PAUSE' | 'RESUME';
+    eventId: string;
+    noticeText?: string;
+  },
+): void {
+  try {
+    emitTaskPairTimelineEvent({
+      taskId: saved.state.taskId,
+      writer: opts.writer,
+      role: opts.role,
+      source: 'daemon',
+      verb: opts.verb,
+      fromStatus: saved.state.status,
+      toStatus: saved.state.status,
+      effect: opts.verb === 'RESUME' ? 'recorded' : 'scheduled',
+      unusual: false,
+      ...(opts.noticeText ? { noticeText: opts.noticeText } : {}),
+    }, saved.state, opts.eventId);
+  } catch {
+    // observers never break scheduling transitions
+  }
+}
+
 export function pausePair(project: string, taskId: string, writer: string, mode: 'manual' | 'dependencies', dependsOn: unknown = undefined, note?: string) {
   const store = getTaskPairStore();
   const pair = store.getPair(project, taskId);
@@ -37,20 +65,13 @@ export function pausePair(project: string, taskId: string, writer: string, mode:
   const next: TaskPairScheduling = { epoch: (prev?.epoch ?? 0) + 1, manual, dependsOn: deps, resumePending: !manual && deps.length === 0, since: Date.now(), writer, ...(note ? { note } : {}) };
   const saved = store.patchScheduling(project, taskId, prev, next, Date.now());
   if (!saved) throw new Error('pair changed; retry pause');
-  try {
-    emitTaskPairTimelineEvent({
-      taskId: saved.state.taskId,
-      writer,
-      role: 'brain',
-      source: 'daemon',
-      verb: 'PAUSE',
-      effect: 'scheduled',
-      unusual: false,
-      ...(note ? { noticeText: note } : {}),
-    }, saved.state, `pause:${saved.state.taskId}:${next.epoch}`);
-  } catch {
-    // observers never break pause
-  }
+  emitSchedulingTimelineEvent(saved, {
+    writer,
+    role: 'brain',
+    verb: 'PAUSE',
+    eventId: `pause:${saved.state.taskId}:${next.epoch}`,
+    ...(note ? { noticeText: note } : {}),
+  });
   return saved;
 }
 export function resumePair(project: string, taskId: string, writer: string) {
@@ -70,6 +91,12 @@ export function resumePair(project: string, taskId: string, writer: string) {
   };
   const saved = store.patchScheduling(project, taskId, prev, next, Date.now());
   if (!saved) throw new Error('pair changed; retry resume');
+  emitSchedulingTimelineEvent(saved, {
+    writer,
+    role: 'brain',
+    verb: 'RESUME',
+    eventId: `resume:${saved.state.taskId}:${next.epoch}`,
+  });
   return saved;
 }
 
@@ -95,7 +122,7 @@ export function settleResumedSchedulingIfActive(
   const side = taskPairSideToAct({ ...sideState, scheduling: undefined });
   const active = side === 'auditor' ? sideState.auditor : side === 'executor' ? sideState.executor : undefined;
   if (!active || active === TASK_PAIR_NO_AUDITOR || opts.actor !== active) return undefined;
-  return store.patchScheduling(project, taskId, s, {
+  const saved = store.patchScheduling(project, taskId, s, {
     ...s,
     resumePending: false,
     admitted: false,
@@ -103,4 +130,13 @@ export function settleResumedSchedulingIfActive(
     resumeRetryAt: undefined,
     resumedAt: now,
   }, now);
+  if (saved) {
+    emitSchedulingTimelineEvent(saved, {
+      writer: 'daemon',
+      role: 'daemon',
+      verb: 'RESUME',
+      eventId: `resume-settled:${saved.state.taskId}:${s.epoch}`,
+    });
+  }
+  return saved;
 }

@@ -2779,6 +2779,8 @@ export class WsBridge {
 
   /** browser socket → userId (for session ownership checks) */
   private browserUserIds = new Map<WebSocket, string>();
+  /** browser socket → user's sessions_valid_after epoch at connection time */
+  private browserSessionEpochs = new Map<WebSocket, number>();
   /** Sockets admitted through Owner/Participant controlled-machine access. */
   private controlledTargetBrowserSockets = new Set<WebSocket>();
   private readonly controlledBrowserReads: ControlledBrowserReadGate;
@@ -7332,6 +7334,7 @@ export class WsBridge {
       target: ShareTarget;
       snapshot: EffectiveCoverage;
       isMobile?: boolean;
+      sessionEpoch?: number;
     },
   ): void {
     const effectiveTarget = options.snapshot.serverParticipantAuthority === true
@@ -7351,7 +7354,7 @@ export class WsBridge {
       coveredProjectDirs,
     });
     this.syncShareSweepRegistration();
-    this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false);
+    this.handleBrowserConnection(ws, userId, db, options.isMobile ?? false, false, options.sessionEpoch ?? 0);
     void this.refreshShareActorDisplayName(ws);
     void this.refreshShareCoveredSessions(ws);
   }
@@ -7558,6 +7561,7 @@ export class WsBridge {
     db: Database,
     isMobile = false,
     controlledTarget = false,
+    sessionEpoch = 0,
   ): void {
     this.db = db;
     this.browserSockets.add(ws);
@@ -7566,6 +7570,7 @@ export class WsBridge {
     this.transportSubscriptions.set(ws, new Set());
     this.timelineSubscriptions.set(ws, new Map());
     this.browserUserIds.set(ws, userId);
+    this.browserSessionEpochs.set(ws, sessionEpoch);
     if (controlledTarget) {
       this.controlledTargetBrowserSockets.add(ws);
       this.controlledBrowserReads.register(ws, userId);
@@ -7638,6 +7643,7 @@ export class WsBridge {
     }
 
     const processBrowserMessage = async (data: unknown): Promise<void> => {
+      if (!this.browserUserIds.has(ws)) return;
       let raw = (data as Buffer).toString();
       if (Buffer.byteLength(raw, 'utf8') > MAX_BROWSER_PAYLOAD) {
         logger.warn({ serverId: this.serverId }, 'Browser message too large — dropped');
@@ -11546,6 +11552,7 @@ export class WsBridge {
     this.browserSockets.delete(ws);
     this.mobileSockets.delete(ws);
     this.browserUserIds.delete(ws);
+    this.browserSessionEpochs.delete(ws);
     this.controlledTargetBrowserSockets.delete(ws);
     this.controlledBrowserReads.remove(ws);
     this.browserShareStates.delete(ws);
@@ -13447,6 +13454,24 @@ export class WsBridge {
     const daemon = Boolean(this.daemonWs && this.daemonOwnerUserId && userIds.has(this.daemonOwnerUserId));
     if (daemon) this.kickDaemon({ code: ACCOUNT_WS_CLOSE_CODE, reason });
     return { browserSockets, daemon };
+  }
+
+  /**
+   * Close browser sockets whose session epoch precedes `userValidAfter.get(userId)` (e.g. password reset/change),
+   * while preserving independent daemon connections.
+   */
+  closeBrowserSocketsForSessionReset(userValidAfter: ReadonlyMap<string, number>, reason = 'session_revoked'): number {
+    let closed = 0;
+    for (const [ws, userId] of [...this.browserUserIds]) {
+      const minValidAfter = userValidAfter.get(userId);
+      if (minValidAfter === undefined || minValidAfter <= 0) continue;
+      const socketEpoch = this.browserSessionEpochs.get(ws) ?? 0;
+      if (socketEpoch >= minValidAfter) continue;
+      closed += 1;
+      this.cleanupBrowserSocket(ws);
+      try { ws.close(ACCOUNT_WS_CLOSE_CODE, reason); } catch { /* already closing */ }
+    }
+    return closed;
   }
 
   /** Force-close the daemon WebSocket. Use after token rotation to evict the stale connection. */

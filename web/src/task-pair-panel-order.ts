@@ -240,6 +240,17 @@ export function isTaskPairSplittable(payload: Record<string, unknown>): boolean 
     && payload.auditor !== 'none';
 }
 
+export function mergeTaskPairTimelinePayload(
+  oldPayload: Record<string, unknown> | undefined,
+  nextPayload: Record<string, unknown>,
+): Record<string, unknown> {
+  if (isValidTaskPairStatus(nextPayload.toStatus)) return nextPayload;
+  if (oldPayload && isValidTaskPairStatus(oldPayload.toStatus)) {
+    return { ...nextPayload, toStatus: oldPayload.toStatus };
+  }
+  return nextPayload;
+}
+
 export function resolveOrderedTaskPairRows({
   snapshot,
   events,
@@ -275,7 +286,7 @@ export function resolveOrderedTaskPairRows({
       if (typeof payload.taskId === 'string') {
         const old = latest.get(payload.taskId);
         latest.set(payload.taskId, {
-          payload,
+          payload: mergeTaskPairTimelinePayload(old?.payload, payload),
           startedAt: old?.startedAt ?? event.ts,
           updatedAt: event.ts,
         });

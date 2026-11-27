@@ -12,6 +12,7 @@ import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
 import { AGENT_AVAILABILITY_MSG } from '../../../shared/agent-availability.js';
 import { sanitizeProjectName } from '../../../shared/sanitize-project-name.js';
+import { buildReadableProjectDir } from '../../src/util/project-dir-slug.js';
 
 const {
   fetchSessionIdentityProfileMock,
@@ -1310,7 +1311,7 @@ describe('NewSessionDialog', () => {
     expect(select2.value).toBe('gemini-4-argon-high');
   });
 
-  it('defaults dir to ~/.imcodes/projects/ and auto-fills ~/.imcodes/projects/<sanitized> while typing project name', () => {
+  it('defaults dir to ~/.imcodes/projects/ and auto-fills ~/.imcodes/projects/<readable-slug> while typing project name', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
     const projectInput = screen.getByPlaceholderText('my-project') as HTMLInputElement;
@@ -1322,7 +1323,8 @@ describe('NewSessionDialog', () => {
     expect(dirInput.value).toBe('~/.imcodes/projects/my_app');
 
     fireEvent.input(projectInput, { target: { value: '我的项目' } });
-    expect(dirInput.value).toBe(`~/.imcodes/projects/${sanitizeProjectName('我的项目')}`);
+    expect(dirInput.value).toBe(buildReadableProjectDir('我的项目'));
+    expect(dirInput.value).toMatch(/^~\/\.imcodes\/projects\/wo_de_xiang_mu--[0-9a-z]{8}$/);
 
     fireEvent.input(projectInput, { target: { value: '../../etc/passwd' } });
     expect(dirInput.value).toBe('~/.imcodes/projects/etc_passwd');
@@ -1790,5 +1792,59 @@ describe('NewSessionDialog', () => {
       models: [{ id: 'gpt-6.5-sol' }, { id: 'gpt-6-sol' }],
     }));
     await waitFor(() => expect((screen.getAllByRole('combobox')[1] as HTMLSelectElement).value).toBe('gpt-6.5-sol'));
+  });
+
+  it('auto-populates readable ASCII working directory for non-ASCII project names without collisions while preserving sanitizeProjectName and manual dir lock', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog serverId="srv-cjk" ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const projectInput = screen.getByPlaceholderText('my-project') as HTMLInputElement;
+    const dirInput = screen.getByPlaceholderText('~/.imcodes/projects/my-project') as HTMLInputElement;
+
+    fireEvent.input(projectInput, { target: { value: '我的项目' } });
+    const zhDir = dirInput.value;
+    expect(zhDir).toMatch(/^~\/\.imcodes\/projects\/wo_de_xiang_mu--[0-9a-z]{8}$/);
+
+    fireEvent.input(projectInput, { target: { value: 'wo_de_xiang_mu' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/wo_de_xiang_mu');
+    expect(dirInput.value).not.toBe(zhDir);
+
+    fireEvent.input(projectInput, { target: { value: '市' } });
+    const shi1Dir = dirInput.value;
+    fireEvent.input(projectInput, { target: { value: '是' } });
+    const shi2Dir = dirInput.value;
+    expect(shi1Dir).toMatch(/^~\/\.imcodes\/projects\/shi--[0-9a-z]{8}$/);
+    expect(shi2Dir).toMatch(/^~\/\.imcodes\/projects\/shi--[0-9a-z]{8}$/);
+    expect(shi1Dir).not.toBe(shi2Dir);
+
+    const long1 = `${'a'.repeat(65)}1`;
+    const long2 = `${'a'.repeat(65)}2`;
+    fireEvent.input(projectInput, { target: { value: long1 } });
+    const longDir1 = dirInput.value;
+    fireEvent.input(projectInput, { target: { value: long2 } });
+    const longDir2 = dirInput.value;
+    expect(longDir1).not.toBe(longDir2);
+
+    fireEvent.input(projectInput, { target: { value: '日本語テスト' } });
+    expect(dirInput.value).toMatch(/^~\/\.imcodes\/projects\/ri_ben_yu_tesuto--[0-9a-z]{8}$/);
+
+    // Empty/whitespace resets back to base projects dir.
+    fireEvent.input(projectInput, { target: { value: '   ' } });
+    expect(dirInput.value).toBe('~/.imcodes/projects/');
+
+    // Submitting keeps raw project name; internal sanitizeProjectName stays untouched (uXXXX).
+    fireEvent.input(projectInput, { target: { value: '我的项目' } });
+    expect(dirInput.value).toBe(zhDir);
+    expect(sanitizeProjectName('我的项目')).toBe('u6211_u7684_u9879_u76ee');
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: '我的项目',
+      dir: zhDir,
+    }));
+
+    // Once directory is manually edited, further project name changes do not overwrite dir.
+    fireEvent.input(dirInput, { target: { value: '/custom/work/path' } });
+    fireEvent.input(projectInput, { target: { value: '另一个项目' } });
+    expect(dirInput.value).toBe('/custom/work/path');
   });
 });

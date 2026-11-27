@@ -274,9 +274,11 @@ export function taskPairNotificationKey(payload: Record<string, unknown>): strin
   if (!taskId || payload.aggregate === true || isTaskPairAggregateId(taskId)) return undefined;
   const rawStatus = typeof payload.toStatus === 'string' ? payload.toStatus.trim().toLowerCase() : '';
   const rawVerb = typeof payload.verb === 'string' ? payload.verb.trim().toUpperCase() : '';
-  // A neutral notice states no lifecycle, so it is never merged with (or
-  // hidden behind) a lifecycle event of the same task.
+  // Neutral notices and scheduling projections (PAUSE/RESUME) state no lifecycle
+  // transition, so they must never overwrite or hide behind lifecycle events
+  // such as READY_FOR_AUDIT or REWORK that share the same toStatus.
   if (rawVerb === TASK_PAIR_NOTICE_VERB && !rawStatus) return undefined;
+  if (rawVerb === 'PAUSE' || rawVerb === 'RESUME') return undefined;
   // Structured events normally carry toStatus while assistant notices often
   // only carry a verb. Normalize both forms to the same lifecycle identity so
   // cross-source delivery (for example DISPATCH + working) collapses safely.

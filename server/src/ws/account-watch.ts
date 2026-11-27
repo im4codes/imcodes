@@ -8,8 +8,9 @@
  * statement per pod, none when nobody is connected, whatever the number of connections.
  */
 import type { Database } from '../db/client.js';
+import { isEmailAuthEnabled, type EnvConfig } from '../env.js';
 import { ACCOUNT_CONNECTION_WATCH_INTERVAL_MS, USER_STATUS, userStatusDenialCode } from '../../../shared/user-status.js';
-import { findInactiveUsers } from '../security/user-status.js';
+import { findInactiveUsers, loadUserSessionValidAfters } from '../security/user-status.js';
 import logger from '../util/logger.js';
 import { WsBridge } from './bridge.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
@@ -20,6 +21,27 @@ export interface AccountWatchResult {
   inactiveUsers: number;
   browserSockets: number;
   daemons: number;
+}
+
+/**
+ * Immediately close live browser sockets for a user whose session epoch advanced (e.g. password reset/change),
+ * while preserving independent daemon connections. Other replicas learn on the next `closeConnectionsOfInactiveUsers` tick.
+ */
+export function evictStaleUserBrowserSockets(
+  userId: string,
+  sessionsValidAfter: number,
+  bridges: Iterable<WsBridge> = WsBridge.getAll().values(),
+  reason = 'session_revoked',
+): number {
+  if (!userId || sessionsValidAfter <= 0) return 0;
+  const epochMap = new Map([[userId, sessionsValidAfter]]);
+  let closed = 0;
+  closed += globalTaskHub.closeBrowserSocketsForSessionReset(epochMap, reason);
+  closed += remoteVoiceHub.closeBrowserSocketsForSessionReset(epochMap, reason);
+  for (const bridge of bridges) {
+    closed += bridge.closeBrowserSocketsForSessionReset(epochMap, reason);
+  }
+  return closed;
 }
 
 /** Close live SSE push streams whose backing API key was revoked or grace-expired. */
@@ -51,10 +73,11 @@ export async function closeRevokedPushStreams(
   ));
 }
 
-/** Close the live connections of every connected user whose account is not active. Idempotent; safe to call from the disable route. */
+/** Close the live connections of every connected user whose account is not active, revoked SSE push streams, and stale browser sockets when email auth is enabled. Idempotent; safe to call from the disable route. */
 export async function closeConnectionsOfInactiveUsers(
   db: Database,
   bridges: Iterable<WsBridge> = WsBridge.getAll().values(),
+  options?: { emailAuthEnabled?: boolean },
 ): Promise<AccountWatchResult> {
   const all = [...bridges];
   const live = new Set<string>();
@@ -63,41 +86,61 @@ export async function closeConnectionsOfInactiveUsers(
   pushStreamHub.collectLiveUserIds(live);
   remoteVoiceHub.collectLiveUserIds(live);
   if (live.size === 0) return { inactiveUsers: 0, browserSockets: 0, daemons: 0 };
-  const inactive = await findInactiveUsers(db, [...live]);
-  let closed = 0;
+  const liveIds = [...live];
+  const inactive = await findInactiveUsers(db, liveIds);
+  const result: AccountWatchResult = { inactiveUsers: inactive.size, browserSockets: 0, daemons: 0 };
   if (inactive.size > 0) {
-    const result: AccountWatchResult = { inactiveUsers: inactive.size, browserSockets: 0, daemons: 0 };
     result.browserSockets += globalTaskHub.closeInactiveUserSockets(inactive);
     result.browserSockets += pushStreamHub.closeInactiveUsers(inactive);
     result.browserSockets += remoteVoiceHub.closeInactiveUserSockets(inactive);
     for (const bridge of all) {
-      const bridgeClosed = bridge.closeConnectionsOfUsers(inactive, userStatusDenialCode(USER_STATUS.DISABLED));
-      result.browserSockets += bridgeClosed.browserSockets;
-      if (bridgeClosed.daemon) result.daemons += 1;
+      const closed = bridge.closeConnectionsOfUsers(inactive, userStatusDenialCode(USER_STATUS.DISABLED));
+      result.browserSockets += closed.browserSockets;
+      if (closed.daemon) result.daemons += 1;
     }
-    await closeRevokedPushStreams(db).catch((err) =>
-      logger.warn({ err }, 'push stream credential watch failed'),
-    );
     logger.warn({ ...result }, 'closed live connections of accounts that may no longer act');
-    return result;
   }
-  closed = await closeRevokedPushStreams(db).catch((err) => {
+
+  const revokedPushClosed = await closeRevokedPushStreams(db).catch((err) => {
     logger.warn({ err }, 'push stream credential watch failed');
     return 0;
   });
-  return { inactiveUsers: 0, browserSockets: closed, daemons: 0 };
+  if (inactive.size === 0 && revokedPushClosed > 0) {
+    result.browserSockets += revokedPushClosed;
+  }
+
+  const shouldEvictSessionReset = options?.emailAuthEnabled ?? isEmailAuthEnabled(process.env);
+  if (shouldEvictSessionReset) {
+    const activeLiveIds = liveIds.filter((id) => !inactive.has(id));
+    const sessionValidAfters = await loadUserSessionValidAfters(db, activeLiveIds);
+    if (sessionValidAfters.size > 0) {
+      let evicted = 0;
+      evicted += globalTaskHub.closeBrowserSocketsForSessionReset(sessionValidAfters);
+      evicted += remoteVoiceHub.closeBrowserSocketsForSessionReset(sessionValidAfters);
+      for (const bridge of all) {
+        evicted += bridge.closeBrowserSocketsForSessionReset(sessionValidAfters);
+      }
+      if (evicted > 0) {
+        result.browserSockets += evicted;
+        logger.warn({ evictedBrowserSockets: evicted }, 'closed stale browser connections after session epoch advance');
+      }
+    }
+  }
+  return result;
 }
 
 /** Start the periodic check; returns the stop function. The timer never keeps the process alive. */
 export function startAccountConnectionWatch(
   db: Database,
   intervalMs: number = ACCOUNT_CONNECTION_WATCH_INTERVAL_MS,
+  env: Partial<EnvConfig> = process.env,
 ): () => void {
   let running = false;
+  const emailAuthEnabled = isEmailAuthEnabled(env);
   const timer = setInterval(() => {
     if (running) return;
     running = true;
-    closeConnectionsOfInactiveUsers(db)
+    closeConnectionsOfInactiveUsers(db, undefined, { emailAuthEnabled })
       .catch((err) => logger.warn({ err }, 'account connection watch failed (retried next tick)'))
       .finally(() => { running = false; });
   }, intervalMs);

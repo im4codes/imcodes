@@ -42,7 +42,7 @@ import { gzip as gzipCallback } from 'node:zlib';
 const gzipAsync = promisify(gzipCallback);
 import { STATUS_CODES, type IncomingMessage } from 'node:http';
 
-import { loadEnv, type Env, type EnvConfig } from './env.js';
+import { isEmailAuthEnabled, loadEnv, type Env, type EnvConfig } from './env.js';
 import { createDatabase, type Database } from './db/client.js';
 import { flushAllSessionTextTailCacheWrites } from './db/queries.js';
 import { runMigrations } from './db/migrate.js';
@@ -949,7 +949,7 @@ async function authenticateUserWsTicketUpgrade(
   url: URL,
   env: Env,
   expectedTicketType: string,
-): Promise<string | null> {
+): Promise<{ userId: string; sessionsValidAfter: number } | null> {
   const origin = req.headers['origin'] ?? '';
   if (!validateOrigin(origin, env)) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
@@ -974,6 +974,7 @@ async function authenticateUserWsTicketUpgrade(
     socket.destroy();
     return null;
   }
+  let sessionsValidAfter = 0;
   try {
     const access = await loadUserAccess(env.DB, payload.sub);
     const decision = evaluateUserAccess(
@@ -986,12 +987,13 @@ async function authenticateUserWsTicketUpgrade(
       socket.destroy();
       return null;
     }
+    sessionsValidAfter = access?.sessionsValidAfter ?? 0;
   } catch {
     socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
     socket.destroy();
     return null;
   }
-  return payload.sub;
+  return { userId: payload.sub, sessionsValidAfter };
 }
 
 export function setupWebSocketUpgrade(server: import('node:http').Server, env: Env) {
@@ -1014,19 +1016,19 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
     }
 
     if (url.pathname === GLOBAL_TASK_WS_PATH) {
-      const userId = await authenticateUserWsTicketUpgrade(req, socket, url, env, GLOBAL_TASK_WS_TICKET_TYPE);
-      if (!userId) return;
+      const wsAuth = await authenticateUserWsTicketUpgrade(req, socket, url, env, GLOBAL_TASK_WS_TICKET_TYPE);
+      if (!wsAuth) return;
       wss.handleUpgrade(req, socket, head, (ws) => {
-        void globalTaskHub.handleConnection(ws, userId, env.DB);
+        void globalTaskHub.handleConnection(ws, wsAuth.userId, env.DB, wsAuth.sessionsValidAfter);
       });
       return;
     }
 
     if (url.pathname === REMOTE_VOICE_WS_PATH) {
-      const userId = await authenticateUserWsTicketUpgrade(req, socket, url, env, REMOTE_VOICE_WS_TICKET_TYPE);
-      if (!userId) return;
+      const wsAuth = await authenticateUserWsTicketUpgrade(req, socket, url, env, REMOTE_VOICE_WS_TICKET_TYPE);
+      if (!wsAuth) return;
       wss.handleUpgrade(req, socket, head, (ws) => {
-        remoteVoiceHub.handleConnection(ws, userId, env.DB, env);
+        remoteVoiceHub.handleConnection(ws, wsAuth.userId, env.DB, env, wsAuth.sessionsValidAfter);
       });
       return;
     }
@@ -1158,6 +1160,27 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
           socket.destroy();
           return;
         }
+        const emailAuthEnabled = isEmailAuthEnabled(env);
+        let shareSessionEpoch = emailAuthEnabled ? (shareTicket.sva ?? 0) : 0;
+        try {
+          const shareUserAccess = await loadUserAccess(env.DB, shareTicket.sub);
+          const shareUserDecision = evaluateUserAccess(shareUserAccess);
+          const epochStale = emailAuthEnabled && shareUserAccess !== null && shareUserAccess.sessionsValidAfter > 0 && (
+            typeof shareTicket.sva === 'number'
+              ? shareUserAccess.sessionsValidAfter > shareTicket.sva
+              : shareTicket.issuedAt < shareUserAccess.sessionsValidAfter
+          );
+          if (!shareUserDecision.ok || epochStale) {
+            socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+            socket.destroy();
+            return;
+          }
+          shareSessionEpoch = emailAuthEnabled ? (shareUserAccess?.sessionsValidAfter ?? shareSessionEpoch) : 0;
+        } catch {
+          socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n');
+          socket.destroy();
+          return;
+        }
         const coverage = await resolveShareCoverageFromDb({
           db: env.DB,
           serverId,
@@ -1182,6 +1205,7 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
             target: shareTicket.target,
             snapshot: coverage,
             isMobile,
+            sessionEpoch: shareSessionEpoch,
           });
         });
         return;
@@ -1194,6 +1218,23 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
       const jti = payload.jti as string;
       if (!jti || !rateLimiter.consumeJti(jti, 30_000)) {
         socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return;
+      }
+
+      const emailAuthEnabled = isEmailAuthEnabled(env);
+      let sessionsValidAfter = 0;
+      try {
+        const access = await loadUserAccess(env.DB, payload.sub as string);
+        const decision = evaluateUserAccess(
+          access,
+          emailAuthEnabled && typeof payload.iat === 'number' ? payload.iat : undefined,
+        );
+        const epochStale = emailAuthEnabled && typeof payload.sva === 'number' && access !== null && access.sessionsValidAfter > payload.sva;
+        if (!decision.ok || epochStale) {
+          socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n'); socket.destroy(); return;
+        }
+        sessionsValidAfter = emailAuthEnabled ? (access?.sessionsValidAfter ?? 0) : 0;
+      } catch {
+        socket.write('HTTP/1.1 500 Internal Server Error\r\n\r\n'); socket.destroy(); return;
       }
 
       let websocketAccess: Awaited<ReturnType<typeof resolveServerWebSocketAccess>>;
@@ -1212,6 +1253,7 @@ export function setupWebSocketUpgrade(server: import('node:http').Server, env: E
           env.DB,
           isMobile,
           websocketAccess?.kind === 'controlled',
+          sessionsValidAfter,
         );
       });
     }
@@ -1579,7 +1621,7 @@ async function main() {
 
   setupWebSocketUpgrade(httpServer as unknown as import('node:http').Server, env);
   // Every replica closes the live connections of accounts that were disabled (on any replica) within a few seconds.
-  const stopAccountWatch = startAccountConnectionWatch(db);
+  const stopAccountWatch = startAccountConnectionWatch(db, undefined, env);
 
   // Graceful shutdown — terminate the embedding worker so it doesn't keep
   // the process alive after SIGTERM (k8s rolling restart, docker stop, etc).

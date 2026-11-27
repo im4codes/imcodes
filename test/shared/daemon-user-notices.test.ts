@@ -106,6 +106,7 @@ describe('daemon user notice contract', () => {
       [DAEMON_USER_NOTICE_CODE.MESSAGE_SEND_FAILED, ['detail']],
       [DAEMON_USER_NOTICE_CODE.COMPACT_FAILED, ['detail']],
       [DAEMON_USER_NOTICE_CODE.SESSION_INLINE_ERROR, ['detail']],
+      [DAEMON_USER_NOTICE_CODE.WELCOME_OPENCODE_FREE_MODEL, ['model']],
     ];
     for (const [code, expectedKeys] of dynamic) {
       expect(DAEMON_USER_NOTICE_PARAM_KEYS[code as keyof typeof DAEMON_USER_NOTICE_PARAM_KEYS], code)
