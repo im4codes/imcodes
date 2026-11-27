@@ -344,6 +344,40 @@ export function resolveContentEditableCaretAtPoint(
 }
 
 /**
+ * Apply a pre-resolved `{ node, offset }` collapsed caret inside `root`, verifying
+ * `node` is still contained in `root` and any active selection is collapsed.
+ * Safe when layout shifts between pre-focus hit-testing and post-focus selection placement.
+ */
+export function applyContentEditableCaretTarget(
+  root: HTMLElement | null,
+  target: { node: Node; offset: number } | null,
+): boolean {
+  if (!root || !target || !target.node || !root.contains(target.node)) return false;
+  const doc = root.ownerDocument;
+  const win = doc?.defaultView;
+  if (!doc || !win || typeof win.getSelection !== 'function' || typeof doc.createRange !== 'function') {
+    return false;
+  }
+  const sel = win.getSelection();
+  if (!sel || (sel.rangeCount > 0 && !sel.isCollapsed)) return false;
+
+  const clampedOffset = target.node.nodeType === Node.TEXT_NODE
+    ? snapCodePointStart((target.node as Text).data, target.offset)
+    : Math.max(0, Math.min(target.offset, target.node.childNodes.length));
+
+  try {
+    const range = doc.createRange();
+    range.setStart(target.node, clampedOffset);
+    range.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(range);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Place the collapsed caret inside `root` (`contenteditable="true"`) from viewport `(clientX, clientY)`
  * when CSS zoom is active. Returns `true` if a calibrated caret range was applied.
  */
@@ -361,18 +395,7 @@ export function placeContentEditableCaretAtPoint(
   if (!sel || (sel.rangeCount > 0 && !sel.isCollapsed)) return false;
 
   const target = resolveContentEditableCaretAtPoint(root, clientX, clientY, metrics);
-  if (!target) return false;
-
-  try {
-    const range = doc.createRange();
-    range.setStart(target.node, target.offset);
-    range.collapse(true);
-    sel.removeAllRanges();
-    sel.addRange(range);
-    return true;
-  } catch {
-    return false;
-  }
+  return applyContentEditableCaretTarget(root, target);
 }
 
 let cachedMirrorEl: HTMLDivElement | null = null;

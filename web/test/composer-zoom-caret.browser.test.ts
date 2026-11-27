@@ -222,6 +222,91 @@ describe('composer caret positioning under UI zoom (real Chromium)', () => {
 
         await page.close();
       }
+
+      // Real Chromium bottom-layout shift test (390x844, 125% zoom, focusin hides .subcard-bar):
+      // Pre-focus pointerdown resolution preserves row 2 target even when focusin shifts composer down.
+      const shiftPage = await browser.newPage({ viewport: { width: 390, height: 844 }, hasTouch: true });
+      const shiftHtml = `<!doctype html><html><head><meta charset="utf-8"><style>${css}</style><style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; }
+        .test-shift-shell { position: fixed; top: 0; left: 0; width: var(--imcodes-ui-vw, 100%); height: var(--imcodes-ui-dvh, 100%); display: flex; flex-direction: column; }
+        .test-chat-spacer { flex: 1; min-height: 0; }
+        .subcard-bar-mock { height: 48px; flex-shrink: 0; background: #1e293b; }
+        html.input-focused .subcard-bar-mock { display: none; }
+        .controls-composer { display: flex; width: 100%; box-sizing: border-box; flex: 0 0 auto; }
+        .controls-input { min-height: 44px; max-height: 84px; }
+      </style></head><body>
+        <div class="test-shift-shell">
+          <div class="test-chat-spacer">chat</div>
+          <div class="controls-composer">
+            <div class="controls-input" contenteditable="true" spellcheck="false">first row alpha 12345\nsecond row 文字 testcase</div>
+          </div>
+          <div class="subcard-bar-mock">subcard</div>
+        </div>
+      </body></html>`;
+      await shiftPage.route('https://imcodes.test/**', (route) => route.fulfill({ contentType: 'text/html', body: shiftHtml }));
+      await shiftPage.goto('https://imcodes.test/');
+      await shiftPage.addScriptTag({ content: bundleCode });
+      await shiftPage.evaluate(() => {
+        window.__uiScale.writeUiScale(125);
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        let preCaret: { node: Node; offset: number } | null = null;
+        let moved = false;
+        let downX = 0;
+        let downY = 0;
+        document.addEventListener('focusin', (e) => {
+          if (e.target === el) document.documentElement.classList.add('input-focused');
+        });
+        el.addEventListener('pointerdown', (e) => {
+          downX = e.clientX;
+          downY = e.clientY;
+          moved = false;
+          preCaret = window.__zoomCaret.resolveContentEditableCaretAtPoint(el, e.clientX, e.clientY);
+        });
+        el.addEventListener('pointermove', (e) => {
+          if (Math.hypot(e.clientX - downX, e.clientY - downY) > 6) moved = true;
+        });
+        el.addEventListener('click', (e) => {
+          if (!moved && !e.shiftKey && e.detail <= 1) {
+            const ok = preCaret ? window.__zoomCaret.applyContentEditableCaretTarget(el, preCaret) : false;
+            if (!ok) window.__zoomCaret.placeContentEditableCaretAtPoint(el, e.clientX, e.clientY);
+          }
+          preCaret = null;
+        });
+      });
+      await shiftPage.waitForTimeout(80);
+
+      const shiftTarget = await shiftPage.evaluate(() => {
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        const tn = el.firstChild as Text;
+        const row2Start = tn.data.indexOf('\n') + 1;
+        const expectedOffset = row2Start + 8;
+        const r = document.createRange();
+        r.setStart(tn, expectedOffset);
+        r.setEnd(tn, expectedOffset + 1);
+        const rc = r.getClientRects()[0];
+        return {
+          expectedOffset,
+          beforeTop: el.getBoundingClientRect().top,
+          x: rc.left + 1,
+          y: rc.top + rc.height / 2,
+        };
+      });
+      await shiftPage.mouse.click(shiftTarget.x, shiftTarget.y);
+      const afterShift = await shiftPage.evaluate(() => {
+        const el = document.querySelector('.controls-input') as HTMLElement;
+        const sel = window.getSelection();
+        return {
+          focusedClass: document.documentElement.classList.contains('input-focused'),
+          afterTop: el.getBoundingClientRect().top,
+          isCollapsed: sel?.isCollapsed,
+          offset: sel?.anchorOffset ?? -1,
+        };
+      });
+      expect(afterShift.focusedClass).toBe(true);
+      expect(afterShift.afterTop).toBeGreaterThan(shiftTarget.beforeTop + 15);
+      expect(afterShift.isCollapsed).toBe(true);
+      expect(Math.abs(afterShift.offset - shiftTarget.expectedOffset)).toBeLessThanOrEqual(1);
+      await shiftPage.close();
     } finally {
       await browser.close();
     }

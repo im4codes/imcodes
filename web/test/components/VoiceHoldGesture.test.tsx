@@ -4937,6 +4937,108 @@ describe('Mobile composer hold-to-talk & 3-zone gesture HUD', () => {
 
       spyB.mockRestore();
       viewB.unmount();
+
+      // Layout-shift counterexample (mirrors app.tsx focusin toggling html.input-focused, shifting bottom composer +58px):
+      // Pre-focus tap on row 2 ("second row 文字 testcase", offset 8 -> total offset line1.length + 1 + 8) MUST NOT land on row 1 after focus shifts geometry!
+      const twoRowLine1 = 'first row alpha 12345';
+      const twoRowLine2 = 'second row 文字 testcase';
+      const twoRowDraft = `${twoRowLine1}\n${twoRowLine2}`;
+      const row2TargetOffset = twoRowLine1.length + 1 + 8;
+
+      const preRow2X = (20 + 8 * 10 + 2) * zoom;
+      const preRow2Y = 406 * zoom;
+      // Shift by 30px upon focus so post-focus row 1 (top=402..422) overlaps preRow2Y (406).
+      const installOverlapShiftGeometry = (input: HTMLElement) => {
+        const tn = input.firstChild as Text;
+        const shiftPx = () => (document.activeElement === input ? 30 : 0);
+        input.getBoundingClientRect = () => {
+          const s = shiftPx();
+          return {
+            left: 10, top: 364.5 + s, right: 290, bottom: 420.5 + s, width: 280, height: 56, x: 10, y: 364.5 + s, toJSON: () => ({}),
+          } as DOMRect;
+        };
+        return vi.spyOn(document, 'createRange').mockImplementation(() => {
+          const r = origCreateRange();
+          r.getClientRects = (() => {
+            if (r.startContainer === tn && r.endContainer === tn) {
+              const s = shiftPx();
+              const row1Top = 372 + s;
+              const row2Top = 396 + s;
+              if (r.startOffset === 0 && r.endOffset === twoRowDraft.length) {
+                return [
+                  { left: 20, top: row1Top, right: 20 + twoRowLine1.length * 10, bottom: row1Top + 20, width: twoRowLine1.length * 10, height: 20, x: 20, y: row1Top, toJSON: () => ({}) },
+                  { left: 20, top: row2Top, right: 20 + twoRowLine2.length * 10, bottom: row2Top + 20, width: twoRowLine2.length * 10, height: 20, x: 20, y: row2Top, toJSON: () => ({}) },
+                ] as unknown as DOMRectList;
+              }
+              if (r.endOffset > r.startOffset) {
+                const isRow2 = r.startOffset > twoRowLine1.length;
+                const col = isRow2 ? r.startOffset - (twoRowLine1.length + 1) : r.startOffset;
+                const l = 20 + col * 10;
+                const top = isRow2 ? row2Top : row1Top;
+                const w = twoRowDraft[r.startOffset] === '\n' ? 0 : 10;
+                return [{ left: l, top, right: l + w, bottom: top + 20, width: w, height: 20, x: l, y: top, toJSON: () => ({}) }] as unknown as DOMRectList;
+              }
+            }
+            return [] as unknown as DOMRectList;
+          }) as unknown as () => DOMRectList;
+          return r;
+        });
+      };
+
+      // Counterexample Variant 1: VoiceInput available -> short tap on row 2 before focus shifts layout must land on row 2 (offset 30), NOT row 1 (offset 8)
+      voiceMock.isAvailable.mockReturnValue(true);
+      const viewShiftVoice = render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+      const inputShiftVoice = document.querySelector('.controls-input') as HTMLElement;
+      inputShiftVoice.textContent = twoRowDraft;
+      const tnShiftVoice = inputShiftVoice.firstChild as Text;
+      const spyShiftVoice = installOverlapShiftGeometry(inputShiftVoice);
+
+      dispatchPrimary(inputShiftVoice, 'pointerdown', preRow2X, preRow2Y, 74);
+      await vi.advanceTimersByTimeAsync(50);
+      dispatchPrimary(inputShiftVoice, 'pointerup', preRow2X, preRow2Y, 74);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(window.getSelection()?.focusNode).toBe(tnShiftVoice);
+      expect(window.getSelection()?.focusOffset).toBe(row2TargetOffset);
+      spyShiftVoice.mockRestore();
+      viewShiftVoice.unmount();
+
+      // Counterexample Variant 2: VoiceInput unavailable -> native focus runs between pointerdown and click shifting layout -> caret must STILL land on row 2 (offset 30)
+      voiceMock.isAvailable.mockReturnValue(false);
+      const viewShiftNative = render(
+        <SessionControls
+          ws={ws}
+          activeSession={makeSession()}
+          quickData={makeQuickData()}
+          sessions={[]}
+          subSessions={[]}
+          serverId="srv-1"
+        />,
+      );
+      const inputShiftNative = document.querySelector('.controls-input') as HTMLElement;
+      inputShiftNative.textContent = twoRowDraft;
+      const tnShiftNative = inputShiftNative.firstChild as Text;
+      const spyShiftNative = installOverlapShiftGeometry(inputShiftNative);
+
+      dispatchPrimary(inputShiftNative, 'pointerdown', preRow2X, preRow2Y, 75);
+      // Native focus happens before click (shifting row 1 onto preRow2Y)
+      inputShiftNative.focus();
+      fireEvent.focus(inputShiftNative);
+      dispatchPrimary(inputShiftNative, 'pointerup', preRow2X, preRow2Y, 75);
+      fireEvent.click(inputShiftNative, { clientX: preRow2X, clientY: preRow2Y, detail: 1 });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(window.getSelection()?.focusNode).toBe(tnShiftNative);
+      expect(window.getSelection()?.focusOffset).toBe(row2TargetOffset);
+      spyShiftNative.mockRestore();
+      viewShiftNative.unmount();
     } finally {
       applyUiScale(100);
       document.documentElement.getBoundingClientRect = origRootGetRect;

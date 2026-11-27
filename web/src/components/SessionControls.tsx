@@ -66,7 +66,11 @@ import { FS_SESSION_ROOT_PATH } from '../../../src/shared/transport/fs.js';
 import { CURSOR_HEADLESS_MODEL_IDS } from '../../../src/shared/models/options.js';
 import { QuickAgentDelegationDialog, type QuickAgentDelegationCandidate } from './QuickAgentDelegationDialog.js';
 import { getActiveCssZoom } from '../ui-scale.js';
-import { placeContentEditableCaretAtPoint } from '../zoom-caret.js';
+import {
+  applyContentEditableCaretTarget,
+  placeContentEditableCaretAtPoint,
+  resolveContentEditableCaretAtPoint,
+} from '../zoom-caret.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { insertAliasMarkerAtCaret } from '../util/alias-insert.js';
 import { buildAliasSendExtra } from '../util/alias-send.js';
@@ -2602,7 +2606,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     startY: number;
     pointerType: string;
   } | null>(null);
-  const composerTapStateRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
+  const composerTapStateRef = useRef<{
+    x: number;
+    y: number;
+    moved: boolean;
+    preFocusCaret: { node: Node; offset: number } | null;
+  } | null>(null);
   const skipZoomCaretOnNextClickRef = useRef(false);
   const voiceHoldPendingRef = useRef(false);
   const didPrimeVoiceGestureRef = useRef(false);
@@ -7296,7 +7305,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   /** Restore editability and focus the composer on any short tap or failed hold. */
   const fallbackToComposerClick = useCallback((
     pointerType?: string,
-    tapCoords?: { x: number; y: number } | null,
+    tapCoords?: { x: number; y: number; preFocusCaret?: { node: Node; offset: number } | null } | null,
   ) => {
     pendingMobileInitialEndFocusRef.current = null;
     skipZoomCaretOnNextClickRef.current = true;
@@ -7323,11 +7332,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       && tapCoords
       && !tapState?.moved
       && !imeComposingRef.current
-      && !(tapCoords.x === 0 && tapCoords.y === 0)
       && (el.textContent?.length ?? 0) > 0
       && el.getAttribute('contenteditable') === 'true'
     ) {
-      placeContentEditableCaretAtPoint(el, tapCoords.x, tapCoords.y);
+      const targetCaret = tapCoords.preFocusCaret ?? tapState?.preFocusCaret ?? null;
+      const applied = targetCaret ? applyContentEditableCaretTarget(el, targetCaret) : false;
+      if (!applied && !(tapCoords.x === 0 && tapCoords.y === 0)) {
+        placeContentEditableCaretAtPoint(el, tapCoords.x, tapCoords.y);
+      }
     }
   }, [armTouchTapCompatMouseShield, focusComposerForTyping]);
 
@@ -7959,7 +7971,20 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     handledVoicePointerEventsRef.current.add(event);
     skipZoomCaretOnNextClickRef.current = false;
     if (event.isPrimary !== false && (event.button === undefined || event.button === 0)) {
-      composerTapStateRef.current = { x: event.clientX ?? 0, y: event.clientY ?? 0, moved: false };
+      const el = divRef.current;
+      const active = typeof document !== 'undefined' ? document.activeElement : null;
+      const isAlreadyFocused = !!el && (active === el || (active !== null && el.contains(active)));
+      const tapX = event.clientX ?? 0;
+      const tapY = event.clientY ?? 0;
+      // Resolve caret target before focus/focusin triggers mobile layout shift (e.g. hiding subcard-bar).
+      const preFocusCaret = el
+        && !isAlreadyFocused
+        && !imeComposingRef.current
+        && (el.textContent?.length ?? 0) > 0
+        && !(tapX === 0 && tapY === 0)
+        ? resolveContentEditableCaretAtPoint(el, tapX, tapY)
+        : null;
+      composerTapStateRef.current = { x: tapX, y: tapY, moved: false, preFocusCaret };
     }
     suppressComposerClickFocusRef.current = false;
     if (suppressComposerClickTimerRef.current !== null) {
@@ -8172,11 +8197,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       clearComposerVoiceWindowListeners();
       // Any short release or pending pointercancel before active recording focuses typing immediately,
       // then cleans up any primed gesture after focus is in place.
+      // Resolve caret on pre-focus layout right before focusComposerForTyping triggers focusin shift.
+      const el = divRef.current;
+      const tapState = composerTapStateRef.current;
+      const tapX = event.clientX ?? ptr?.startX ?? 0;
+      const tapY = event.clientY ?? ptr?.startY ?? 0;
+      const preFocusCaret = !cancelled
+        && !tapState?.moved
+        && el
+        && document.activeElement !== el
+        && !imeComposingRef.current
+        && (el.textContent?.length ?? 0) > 0
+        && !(tapX === 0 && tapY === 0)
+        ? (resolveContentEditableCaretAtPoint(el, tapX, tapY) ?? tapState?.preFocusCaret ?? null)
+        : null;
       const tapCoords = !cancelled
-        ? {
-            x: event.clientX ?? ptr?.startX ?? 0,
-            y: event.clientY ?? ptr?.startY ?? 0,
-          }
+        ? { x: tapX, y: tapY, preFocusCaret }
         : null;
       fallbackToComposerClick(resolvedPointerType, tapCoords);
       return;
@@ -11905,7 +11941,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 && (el.textContent?.length ?? 0) > 0
                 && el.getAttribute('contenteditable') === 'true'
               ) {
-                placeContentEditableCaretAtPoint(el, clickX, clickY);
+                const appliedPreFocus = tapState?.preFocusCaret
+                  ? applyContentEditableCaretTarget(el, tapState.preFocusCaret)
+                  : false;
+                if (!appliedPreFocus) {
+                  placeContentEditableCaretAtPoint(el, clickX, clickY);
+                }
               }
             }}
             onPointerDown={handleComposerVoicePointerDown}
