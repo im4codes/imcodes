@@ -128,10 +128,7 @@ describe('Android withoutFcm native BackgroundPush integration', () => {
     expect(pluginMock.stop).toHaveBeenCalledTimes(1);
     expect(disabledStatus?.enabled).toBe(false);
 
-    const reEnabledStatus = await enableAndroidBackgroundPush({
-      apiKey: 'api-key-android',
-      serverUrl: 'https://selfhosted.example.com',
-    });
+    const reEnabledStatus = await enableAndroidBackgroundPush();
     expect(reEnabledStatus?.enabled).toBe(true);
     expect(reEnabledStatus?.running).toBe(true);
 
@@ -185,7 +182,7 @@ describe('Android withoutFcm native BackgroundPush integration', () => {
     expect(pluginMock.start).not.toHaveBeenCalled();
   });
 
-  it('P0-3: fences stale deferred permissions, avoids mixing partial credential pairs, and refuses start after logout/server-switch', async () => {
+  it('P0-3: fences stale deferred permissions across logout and server switches without overwriting newer server auth', async () => {
     let resolvePerm!: (val: { supported: boolean; granted: boolean }) => void;
     pluginMock.requestNotificationPermission.mockImplementationOnce(
       () => new Promise<{ supported: boolean; granted: boolean }>((r) => {
@@ -201,7 +198,7 @@ describe('Android withoutFcm native BackgroundPush integration', () => {
     } = await import('../src/push-notifications.js');
     resetAndroidBackgroundPushStateForTesting();
 
-    // Start init while permission prompt stays open
+    // Start init on Server A while permission prompt stays open
     const initPromise = initPushNotifications('old-key-a', 'https://server-a.example.com');
     await vi.waitFor(() => expect(pluginMock.requestNotificationPermission).toHaveBeenCalledTimes(1));
 
@@ -219,10 +216,33 @@ describe('Android withoutFcm native BackgroundPush integration', () => {
     await enableAndroidBackgroundPush();
     expect(pluginMock.start).not.toHaveBeenCalled();
 
-    // Partial credential update (Server B URL without Server B key) MUST NOT combine with stale key A
+    // Settings enable on A pending permission -> switch to B -> settle stale A: A must NOT start or overwrite B
+    currentStatus.notificationsGranted = false;
+    let resolveSettingsPerm!: (val: { supported: boolean; granted: boolean }) => void;
+    pluginMock.requestNotificationPermission
+      .mockResolvedValueOnce({ supported: true, granted: true }) // for init(A)
+      .mockImplementationOnce(() => new Promise((r) => {
+        resolveSettingsPerm = r;
+      }));
     await initPushNotifications('key-a', 'https://server-a.example.com');
     pluginMock.start.mockClear();
-    await enableAndroidBackgroundPush({ serverUrl: 'https://server-b.example.com' });
+
+    const staleEnablePromise = enableAndroidBackgroundPush();
+    await vi.waitFor(() => expect(resolveSettingsPerm).toBeTypeOf('function'));
+
+    // Switch to Server B cleanly
+    await stopAndroidBackgroundPushOnLogout();
+    currentStatus.notificationsGranted = true;
+    await initPushNotifications('key-b', 'https://server-b.example.com');
+    expect(pluginMock.start).toHaveBeenLastCalledWith({
+      serverUrl: 'https://server-b.example.com',
+      apiKey: 'key-b',
+    });
+    pluginMock.start.mockClear();
+
+    // Settle stale Server A toggle -> must NOT start A or overwrite B
+    resolveSettingsPerm({ supported: true, granted: true });
+    await staleEnablePromise;
     expect(pluginMock.start).not.toHaveBeenCalled();
   });
 
@@ -236,39 +256,5 @@ describe('Android withoutFcm native BackgroundPush integration', () => {
 
     await initPushNotifications('api-key', 'http://remote.example.com');
     expect(pluginMock.start).not.toHaveBeenCalled();
-  });
-
-  it('P0-2: sends client.presence foreground=false/true over open WebSocket on notifyBackgrounded/notifyForegrounded', async () => {
-    const sentPayloads: string[] = [];
-    const mockWsInstance = {
-      readyState: 1,
-      send: vi.fn((data: string) => sentPayloads.push(data)),
-      close: vi.fn(),
-      addEventListener: vi.fn(),
-    };
-    vi.stubGlobal('WebSocket', class {
-      static OPEN = 1;
-      constructor() {
-        return mockWsInstance as never;
-      }
-    });
-
-    try {
-      const { WsClient } = await import('../src/ws-client.js');
-      const client = new WsClient('https://app.im.codes', 'srv-1');
-      (client as any).ws = mockWsInstance;
-      (client as any)._connected = true;
-
-      client.notifyBackgrounded();
-      client.notifyForegrounded();
-
-      expect(sentPayloads.map((p) => JSON.parse(p))).toEqual([
-        { type: 'client.presence', foreground: false },
-        { type: 'client.presence', foreground: true },
-      ]);
-      expect(mockWsInstance.close).not.toHaveBeenCalled();
-    } finally {
-      vi.unstubAllGlobals();
-    }
   });
 });

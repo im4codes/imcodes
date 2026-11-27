@@ -22,7 +22,7 @@ export interface AccountWatchResult {
   daemons: number;
 }
 
-/** Close live SSE push streams whose backing API key was revoked/grace-expired or whose JWT session ended. */
+/** Close live SSE push streams whose backing API key was revoked or grace-expired. */
 export async function closeRevokedPushStreams(
   db: Database,
   streamHub: PushStreamHub = pushStreamHub,
@@ -32,66 +32,23 @@ export async function closeRevokedPushStreams(
   if (live.length === 0) return 0;
 
   const keyIds = new Set<string>();
-  const jwtUserIds = new Set<string>();
-  const jwtHashes = new Set<string>();
-  for (const { userId, credential } of live) {
+  for (const { credential } of live) {
     if (credential.kind === 'api_key' && credential.keyId) keyIds.add(credential.keyId);
-    if (credential.kind === 'jwt') {
-      jwtUserIds.add(userId);
-      if (credential.sessionHash) jwtHashes.add(credential.sessionHash);
-    }
   }
+  if (keyIds.size === 0) return 0;
 
-  const invalidKeyIds = new Set<string>();
-  if (keyIds.size > 0) {
-    const rows = await db.query<{ id: string }>(
-      `SELECT id FROM api_keys
-        WHERE id = ANY($1::text[])
-          AND (revoked_at IS NOT NULL OR (grace_expires_at IS NOT NULL AND grace_expires_at <= $2))`,
-      [[...keyIds], now],
-    );
-    for (const r of rows) invalidKeyIds.add(r.id);
-  }
+  const rows = await db.query<{ id: string }>(
+    `SELECT id FROM api_keys
+      WHERE id = ANY($1::text[])
+        AND (revoked_at IS NOT NULL OR (grace_expires_at IS NOT NULL AND grace_expires_at <= $2))`,
+    [[...keyIds], now],
+  );
+  if (rows.length === 0) return 0;
+  const invalidKeyIds = new Set(rows.map((r) => r.id));
 
-  const minValidAfterByUser = new Map<string, number>();
-  if (jwtUserIds.size > 0) {
-    const rows = await db.query<{ id: string; sessions_valid_after: string | number }>(
-      'SELECT id, sessions_valid_after FROM users WHERE id = ANY($1::text[])',
-      [[...jwtUserIds]],
-    );
-    for (const r of rows) {
-      const val = Number(r.sessions_valid_after ?? 0) || 0;
-      if (val > 0) minValidAfterByUser.set(r.id, val);
-    }
-  }
-
-  const revokedSessionHashes = new Set<string>();
-  if (jwtHashes.size > 0) {
-    const rows = await db.query<{ session_hash: string }>(
-      `SELECT session_hash FROM remote_desktop_web_session_revocations
-        WHERE session_hash = ANY($1::text[]) AND expires_at > $2`,
-      [[...jwtHashes], now],
-    );
-    for (const r of rows) revokedSessionHashes.add(r.session_hash);
-  }
-
-  if (invalidKeyIds.size === 0 && minValidAfterByUser.size === 0 && revokedSessionHashes.size === 0) {
-    return 0;
-  }
-
-  return streamHub.closeMatchingSubscriptions((userId, sub) => {
-    const cred = sub.credential;
-    if (!cred) return false;
-    if (cred.kind === 'api_key' && cred.keyId && invalidKeyIds.has(cred.keyId)) {
-      return true;
-    }
-    if (cred.kind === 'jwt') {
-      if (cred.sessionHash && revokedSessionHashes.has(cred.sessionHash)) return true;
-      const validAfter = minValidAfterByUser.get(userId);
-      if (validAfter && typeof cred.issuedAt === 'number' && cred.issuedAt * 1000 < validAfter) return true;
-    }
-    return false;
-  });
+  return streamHub.closeMatchingSubscriptions((_userId, sub) => (
+    sub.credential?.kind === 'api_key' && invalidKeyIds.has(sub.credential.keyId)
+  ));
 }
 
 /** Close the live connections of every connected user whose account is not active. Idempotent; safe to call from the disable route. */

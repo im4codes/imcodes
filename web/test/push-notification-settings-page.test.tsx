@@ -709,12 +709,10 @@ describe('SettingsPage push notification settings', () => {
 
       // withoutFcm build renders controls and invokes native permission dialogs
       (globalThis as Record<string, unknown>).__PUSH_FCM__ = false;
-      localStorage.setItem('deck_server_url', 'https://selfhosted.example.com');
-      localStorage.setItem(
-        `deck_auth_key_v2:${encodeURIComponent('https://selfhosted.example.com')}`,
-        'deck_test_key',
-      );
+      localStorage.setItem('imcodes.android_background_push_enabled', '0');
       resetAndroidBackgroundPushStateForTesting();
+      const { initPushNotifications } = await import('../src/push-notifications.js');
+      await initPushNotifications('deck_test_key', 'https://selfhosted.example.com');
 
       render(
         <SettingsPage

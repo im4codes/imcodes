@@ -12,14 +12,13 @@
  * servers detect "I have no push credentials configured" and relay everything
  * via POST /api/push/relay back to the central server.
  */
-import { USER_STATUS, isUserStatusActive } from '../../../shared/user-status.js';
+import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
 import { timingSafeEqual, sha256Hex } from '../security/crypto.js';
-import { getCookieFromHeader, requireAuth } from '../security/authorization.js';
-import { evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
-import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
+import { requireAuth } from '../security/authorization.js';
+import { loadUserAccess } from '../security/user-status.js';
 import { MemoryRateLimiter } from '../ws/rate-limiter.js';
 import { SignJWT, importPKCS8 } from 'jose';
 import logger from '../util/logger.js';
@@ -49,8 +48,6 @@ export const pushRoutes = new Hono<{
     userId: string;
     role: string;
     keyId?: string;
-    authIssuedAt?: number;
-    authServerId?: string;
   };
 }>();
 
@@ -63,97 +60,56 @@ export function isValidApnsDeviceToken(token: string): boolean {
   return APNS_DEVICE_TOKEN_RE.test(token);
 }
 
-function resolveRequestCredential(
-  c: { req: { header(name: string): string | undefined }; get(key: never): unknown },
-): PushStreamCredential {
-  const keyId = c.get('keyId' as never) as string | undefined;
-  if (keyId) {
-    return { kind: 'api_key', keyId };
-  }
-  const serverId = c.get('authServerId' as never) as string | undefined;
-  if (serverId) {
-    return { kind: 'daemon', serverId };
-  }
-  const issuedAt = c.get('authIssuedAt' as never) as number | undefined;
-  const authHeader = c.req.header('Authorization');
-  let rawJwt: string | undefined;
-  if (authHeader?.startsWith('Bearer ')) {
-    rawJwt = authHeader.slice(7).trim();
-  } else {
-    rawJwt = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
-  }
-  const sessionHash = rawJwt ? sha256Hex(rawJwt) : undefined;
-  if (issuedAt !== undefined || sessionHash) {
-    return {
-      kind: 'jwt',
-      ...(issuedAt !== undefined ? { issuedAt } : {}),
-      ...(sessionHash ? { sessionHash } : {}),
-    };
-  }
-  return { kind: 'unknown' };
-}
-
-export async function isPushStreamCredentialActive(
+async function checkPushStreamApiKeyState(
   db: Database,
   userId: string,
-  credential: PushStreamCredential,
-): Promise<boolean> {
+  keyId: string,
+): Promise<{ ok: true } | { ok: false; status: 401 | 403; error: string }> {
   const access = await loadUserAccess(db, userId);
-  if (!evaluateUserAccess(access, credential.issuedAt).ok) {
-    return false;
+  if (!access) {
+    return { ok: false, status: 401, error: 'unauthorized' };
   }
-  if (credential.kind === 'api_key' && credential.keyId) {
-    const row = await db.queryOne<{ id: string }>(
-      `SELECT id FROM api_keys
-        WHERE id = $1 AND user_id = $2
-          AND revoked_at IS NULL
-          AND (grace_expires_at IS NULL OR grace_expires_at > $3)`,
-      [credential.keyId, userId, Date.now()],
-    );
-    return row != null;
+  if (!isUserStatusActive(access.status)) {
+    return { ok: false, status: 403, error: userStatusDenialCode(access.status) };
   }
-  if (credential.kind === 'jwt' && credential.sessionHash) {
-    const revoked = await db.queryOne<{ session_hash: string }>(
-      `SELECT session_hash FROM remote_desktop_web_session_revocations
-        WHERE session_hash = $1 AND user_id = $2 AND expires_at > $3`,
-      [credential.sessionHash, userId, Date.now()],
-    );
-    return revoked == null;
+  const row = await db.queryOne<{ id: string }>(
+    `SELECT id FROM api_keys
+      WHERE id = $1 AND user_id = $2
+        AND revoked_at IS NULL
+        AND (grace_expires_at IS NULL OR grace_expires_at > $3)`,
+    [keyId, userId, Date.now()],
+  );
+  if (!row) {
+    return { ok: false, status: 401, error: 'unauthorized' };
   }
-  if (credential.kind === 'daemon' && credential.serverId) {
-    const srv = await db.queryOne<{ revoked_at: number | null }>(
-      'SELECT revoked_at FROM servers WHERE id = $1',
-      [credential.serverId],
-    );
-    return srv != null && srv.revoked_at == null;
-  }
-  return true;
+  return { ok: true };
 }
 
 // Auth required for register/unregister/preferences/stream; relay is protected by optional PUSH_RELAY_SECRET + rate limit
 pushRoutes.use('/register', requireAuth());
 pushRoutes.use('/unregister', requireAuth());
 pushRoutes.use('/preferences', requireAuth());
-pushRoutes.use('/stream', requireAuth());
+pushRoutes.use('/stream', requireAuth({ refuseDaemonCredential: true }));
 
 // GET /api/push/stream — lightweight SSE push stream for native clients without FCM (e.g. Android withoutFcm)
 pushRoutes.get('/stream', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const credential = resolveRequestCredential(c);
-  let access: Awaited<ReturnType<typeof loadUserAccess>>;
-  try {
-    access = await loadUserAccess(c.env.DB, userId);
-  } catch (err) {
-    logger.warn({ err, userId }, 'Push stream user access lookup failed');
-    return c.json({ error: 'service_unavailable' }, 503);
-  }
-  if (!access) {
+  const keyId = c.get('keyId' as never) as string | undefined;
+  if (!keyId) {
+    // Restrict background SSE push stream to native API key Bearer credentials with a real keyId.
     return c.json({ error: 'unauthorized' }, 401);
   }
-  const decision = evaluateUserAccess(access, credential.issuedAt);
-  if (!decision.ok) {
-    return c.json({ error: decision.code }, 403);
+  let state: Awaited<ReturnType<typeof checkPushStreamApiKeyState>>;
+  try {
+    state = await checkPushStreamApiKeyState(c.env.DB, userId, keyId);
+  } catch (err) {
+    logger.warn({ err, userId, keyId }, 'Push stream API key verification failed');
+    return c.json({ error: 'service_unavailable' }, 503);
   }
+  if (!state.ok) {
+    return c.json({ error: state.error }, state.status);
+  }
+  const credential: PushStreamCredential = { kind: 'api_key', keyId };
 
   const encoder = new TextEncoder();
   const signal = c.req.raw.signal;
@@ -232,10 +188,10 @@ pushRoutes.get('/stream', async (c) => {
 
       keepaliveTimer = setInterval(() => {
         if (cleaned) return;
-        void isPushStreamCredentialActive(c.env.DB, userId, credential)
-          .then((active) => {
+        void checkPushStreamApiKeyState(c.env.DB, userId, keyId)
+          .then((nextState) => {
             if (cleaned) return;
-            if (!active) {
+            if (!nextState.ok) {
               cleanup();
               return;
             }
@@ -246,7 +202,7 @@ pushRoutes.get('/stream', async (c) => {
           .catch((err) => {
             // Transient DB hiccup must not revoke/abort an active SSE session prematurely;
             // keepalive continues and next tick re-checks DB state.
-            logger.warn({ err, userId }, 'Push stream credential revalidation failed (transient)');
+            logger.warn({ err, userId, keyId }, 'Push stream API key revalidation failed (transient)');
             if (!cleaned && !sendChunk(': keepalive\n\n')) {
               cleanup();
             }
@@ -596,10 +552,17 @@ async function getAccessiblePushServerIds(db: Database, userId: string): Promise
 
 function resolvePushEventId(payload: PushPayload, targetServerId: string | null): string {
   const explicit = typeof payload.eventId === 'string' ? payload.eventId.trim() : '';
-  if (explicit) return explicit;
+  if (explicit) {
+    return Buffer.byteLength(explicit, 'utf8') <= 128
+      ? explicit
+      : `evt_${sha256Hex(explicit).slice(0, 32)}`;
+  }
   const scope = payload.data?.session ?? payload.data?.taskId ?? '';
   const eventType = payload.data?.type ?? payload.type ?? 'push';
-  return `${eventType}:${targetServerId ?? ''}:${scope}:${payload.title}:${payload.body}`;
+  const raw = `${eventType}:${targetServerId ?? ''}:${scope}:${payload.title}:${payload.body}`;
+  return Buffer.byteLength(raw, 'utf8') <= 128
+    ? raw
+    : `evt_${sha256Hex(raw).slice(0, 32)}`;
 }
 
 /**
@@ -614,7 +577,6 @@ export async function dispatchPush(
   maybeEnv?: Env,
   hubOverrides?: {
     globalHub?: typeof globalTaskHub;
-    streamHub?: typeof pushStreamHub;
   },
 ): Promise<void> {
   let db: Database;
@@ -628,7 +590,6 @@ export async function dispatchPush(
     env = maybeEnv!;
   }
   const taskHub = hubOverrides?.globalHub ?? globalTaskHub;
-  const streamHub = hubOverrides?.streamHub ?? pushStreamHub;
 
   const targetServerId = resolvePushPayloadServerId(payload);
 
@@ -738,12 +699,10 @@ export async function dispatchPush(
 
   if (!wantsTokenMobile && !wantsStreamMobile) return;
 
-  const shouldIncrementBadge = wantsTokenMobile
-    || (wantsStreamMobile && (streamHub.hasSubscribers(payload.userId) || taskHub.isPgListening()));
-
-  // Atomically increment badge count once on the source replica before publishing
+  // Atomically increment shared user badge_count ONLY for matching mobile push tokens (APNs/FCM/JPush).
+  // SSE-only clients must never inflate APNs/FCM badges or trigger spurious DB writes when no replica has SSE.
   let badgeCount: number | undefined;
-  if (shouldIncrementBadge) {
+  if (wantsTokenMobile) {
     badgeCount = 1;
     try {
       const rows = await db.query<{ badge_count: number }>(

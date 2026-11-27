@@ -325,43 +325,25 @@ export function subscribeAndroidBackgroundPushStatus(
   };
 }
 
-export async function enableAndroidBackgroundPush(credentials?: {
-  apiKey?: string | null;
-  serverUrl?: string | null;
-}): Promise<AndroidBackgroundPushStatus | null> {
-  let boundAuth: { apiKey: string; serverUrl: string } | null = null;
-  let myGen = androidBgAuthGeneration;
-
-  if (credentials !== undefined) {
-    const rawKey = credentials.apiKey?.trim() ?? '';
-    const normalizedUrl = normalizeAndroidBgServerUrl(credentials.serverUrl);
-    if (rawKey && normalizedUrl) {
-      myGen = ++androidBgAuthGeneration;
-      boundAuth = { apiKey: rawKey, serverUrl: normalizedUrl };
-      activeAndroidBgAuth = boundAuth;
-    } else if (credentials.apiKey !== undefined || credentials.serverUrl !== undefined) {
-      // Explicit partial/invalid credential context must never combine with a different active auth pair.
-      return getAndroidBackgroundPushStatus();
-    } else {
-      boundAuth = activeAndroidBgAuth ? { ...activeAndroidBgAuth } : null;
-    }
-  } else {
-    boundAuth = activeAndroidBgAuth ? { ...activeAndroidBgAuth } : null;
-  }
+export async function enableAndroidBackgroundPush(): Promise<AndroidBackgroundPushStatus | null> {
+  // Only App-generation-verified initAndroidBackgroundPush() may bind credentials;
+  // Settings toggle captures the currently bound auth snapshot + generation atomically.
+  const myGen = androidBgAuthGeneration;
+  const boundAuth = activeAndroidBgAuth ? { ...activeAndroidBgAuth } : null;
 
   const plugin = await getBackgroundPushPlugin();
   if (!plugin) return null;
-  if (myGen !== androidBgAuthGeneration) return null;
+  if (!isAndroidBgAuthCurrent(myGen, boundAuth)) return null;
 
   setLocalAndroidBackgroundPushEnabled(true);
   let status = await plugin.getStatus();
-  if (myGen !== androidBgAuthGeneration) return null;
+  if (!isAndroidBgAuthCurrent(myGen, boundAuth)) return null;
   if (!status.notificationsGranted) {
     const req = await plugin.requestNotificationPermission();
-    if (myGen !== androidBgAuthGeneration) return null;
+    if (!isAndroidBgAuthCurrent(myGen, boundAuth)) return null;
     if (!req?.granted) {
       status = await plugin.getStatus();
-      if (myGen !== androidBgAuthGeneration) return null;
+      if (!isAndroidBgAuthCurrent(myGen, boundAuth)) return null;
       pushSupported = false;
       emitAndroidBgStatus(status);
       return status;
@@ -376,9 +358,9 @@ export async function enableAndroidBackgroundPush(credentials?: {
       pushSupported = Boolean(startRes?.started);
     });
   }
-  if (myGen !== androidBgAuthGeneration) return null;
+  if (!isAndroidBgAuthCurrent(myGen, boundAuth)) return null;
   status = await plugin.getStatus();
-  if (myGen !== androidBgAuthGeneration) return null;
+  if (!isAndroidBgAuthCurrent(myGen, boundAuth)) return null;
   emitAndroidBgStatus(status);
   return status;
 }

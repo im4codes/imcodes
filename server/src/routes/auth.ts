@@ -23,7 +23,6 @@ import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
 import { rememberClientTimezone } from '../util/client-timezone.js';
 import { revokeBrowserAccountSession } from '../services/remote-desktop-account-auth.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
-import { getCookieFromHeader } from '../security/authorization.js';
 import { r2RelayConfig } from '../services/r2-relay.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -1073,18 +1072,14 @@ authRoutes.post('/password/change', async (c) => {
         'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
         [randomHex(16), userId, sha256Hex(refreshRaw), randomHex(16), txNow + 30 * 24 * 3600 * 1000, txNow],
       );
-      return { ok: true as const, accessToken, refreshRaw, newValidAfter };
+      return { ok: true as const, accessToken, refreshRaw };
     }
-    return { ok: true as const, accessToken: null, refreshRaw: null, newValidAfter };
+    return { ok: true as const, accessToken: null, refreshRaw: null };
   });
 
   if (!changeTx.ok) {
     return c.json({ error: changeTx.error }, changeTx.status);
   }
-  await globalTaskHub.notifyPushCredentialRevoked(c.env.DB, {
-    userId,
-    minIssuedAtMs: changeTx.newValidAfter,
-  });
 
   if (changeTx.accessToken && changeTx.refreshRaw) {
     const isSecure = c.env.NODE_ENV === 'production';
@@ -1124,25 +1119,12 @@ authRoutes.post('/logout', async (c) => {
   deleteCookie(c, 'rcc_refresh', { path: '/' });
   deleteCookie(c, COOKIE_CSRF, { path: '/' });
 
-  const cookieToken = getCookieFromHeader(c.req.header('cookie'), COOKIE_SESSION);
-  const bearerHeader = c.req.header('Authorization');
-  const bearerJwt = bearerHeader?.startsWith('Bearer ') && !bearerHeader.slice(7).startsWith('deck_')
-    ? bearerHeader.slice(7).trim()
-    : undefined;
-  const sessionToken = cookieToken || bearerJwt;
-
   // Invalidate all active refresh tokens for the user
   if (userId) {
     await c.env.DB.execute(
       'UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL',
       [Date.now(), userId],
     );
-    if (sessionToken) {
-      await globalTaskHub.notifyPushCredentialRevoked(c.env.DB, {
-        userId,
-        sessionHash: sha256Hex(sessionToken),
-      });
-    }
   }
 
   return c.json({ ok: true });

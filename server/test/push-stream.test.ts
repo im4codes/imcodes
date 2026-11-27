@@ -7,7 +7,9 @@ import {
   PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
+  PUSH_PLATFORM_IOS,
 } from '../../shared/push-notifications.js';
+import { GLOBAL_TASK_PG_NOTIFY_MAX_BYTES } from '../../shared/global-task-mode.js';
 
 const mockDb = {
   query: vi.fn(),
@@ -24,6 +26,7 @@ vi.mock('../src/security/authorization.js', async (importOriginal) => {
       if (authHeader === 'Bearer valid-user-1') {
         c.set('userId', 'user-1');
         c.set('role', 'owner');
+        c.set('keyId', 'key-1');
         return next();
       }
       if (authHeader === 'Bearer valid-user-1-key-a') {
@@ -38,9 +41,16 @@ vi.mock('../src/security/authorization.js', async (importOriginal) => {
         c.set('keyId', 'key-b');
         return next();
       }
+      if (authHeader === 'Bearer valid-user-jwt') {
+        c.set('userId', 'user-1');
+        c.set('role', 'owner');
+        c.set('authIssuedAt', Math.floor(Date.now() / 1000));
+        return next();
+      }
       if (authHeader === 'Bearer valid-user-2') {
         c.set('userId', 'user-2');
         c.set('role', 'owner');
+        c.set('keyId', 'key-2');
         return next();
       }
       return c.json({ error: 'unauthorized' }, 401);
@@ -52,6 +62,8 @@ import { dispatchPush, pushRoutes } from '../src/routes/push.js';
 import { GlobalTaskHub, globalTaskHub } from '../src/services/global-task-hub.js';
 import { closeRevokedPushStreams } from '../src/ws/account-watch.js';
 import { WsBridge } from '../src/ws/bridge.js';
+import { sha256Hex, signJwt } from '../src/security/crypto.js';
+import { ACCOUNT_SESSION_JWT_TYPE } from '../src/security/account-session-jwt.js';
 import {
   MAX_PUSH_STREAMS_PER_USER,
   PUSH_STREAM_MAX_BUFFERED_CHUNKS,
@@ -83,9 +95,14 @@ describe('GET /api/push/stream and pushStreamHub', () => {
     vi.useRealTimers();
   });
 
-  it('rejects unauthenticated requests with 401, disabled users with 403, and transient DB failures with 503', async () => {
+  it('rejects unauthenticated requests, JWT-only sessions, disabled users (403), and transient DB failures (503)', async () => {
     const unauth = await app.request('/api/push/stream');
     expect(unauth.status).toBe(401);
+
+    const jwtOnly = await app.request('/api/push/stream', {
+      headers: { Authorization: 'Bearer valid-user-jwt' },
+    });
+    expect(jwtOnly.status).toBe(401);
 
     mockDb.queryOne.mockResolvedValueOnce({ status: 'disabled', sessions_valid_after: 0 });
     const disabled = await app.request('/api/push/stream', {
@@ -101,7 +118,9 @@ describe('GET /api/push/stream and pushStreamHub', () => {
   });
 
   it('streams SSE headers, initial comment, dispatched events without push_tokens, and cleans up on abort', async () => {
-    mockDb.queryOne.mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 });
+    mockDb.queryOne
+      .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 })
+      .mockResolvedValueOnce({ id: 'key-1' });
 
     const abortController = new AbortController();
     const res = await app.request('/api/push/stream', {
@@ -122,17 +141,15 @@ describe('GET /api/push/stream and pushStreamHub', () => {
     expect(firstChunk.done).toBe(false);
     expect(decoder.decode(firstChunk.value)).toBe(': connected\n\n');
 
-    // Empty push_tokens row for active user on allowed server + enabled notification type -> delivers via SSE stream
-    mockDb.query
-      .mockResolvedValueOnce([{
-        user_status: 'active',
-        push_enabled_server_ids: ['srv-1'],
-        push_notification_types: [...DEFAULT_PUSH_NOTIFICATION_TYPES],
-        token: null,
-        platform: null,
-        notification_types: null,
-      }])
-      .mockResolvedValueOnce([{ badge_count: 3 }]);
+    // Empty push_tokens row for active user on allowed server + enabled notification type -> delivers via SSE stream without incrementing token badge_count
+    mockDb.query.mockResolvedValueOnce([{
+      user_status: 'active',
+      push_enabled_server_ids: ['srv-1'],
+      push_notification_types: [...DEFAULT_PUSH_NOTIFICATION_TYPES],
+      token: null,
+      platform: null,
+      notification_types: null,
+    }]);
 
     await dispatchPush({
       userId: 'user-1',
@@ -155,11 +172,10 @@ describe('GET /api/push/stream and pushStreamHub', () => {
       title: 'host · proj · codex',
       body: 'Build succeeded',
       type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
-      badge: 3,
       data: { serverId: 'srv-1', session: 'deck_proj_brain', type: 'session.idle' },
     });
 
-    // Disabled notification type (task_pair_audit) is filtered before badge increment / publish
+    // Disabled notification type (task_pair_audit) is filtered before publish
     mockDb.query.mockResolvedValueOnce([{
       user_status: 'active',
       push_enabled_server_ids: ['srv-1'],
@@ -175,7 +191,7 @@ describe('GET /api/push/stream and pushStreamHub', () => {
       title: 'audit',
       body: 'intermediate',
     }, { DB: mockDb } as never);
-    expect(mockDb.query).toHaveBeenCalledTimes(3); // 1 dispatch SELECT + 1 badge UPDATE + 1 filtered SELECT
+    expect(mockDb.query).toHaveBeenCalledTimes(2); // 1 allowed dispatch SELECT + 1 filtered SELECT, zero badge_count UPDATE
 
     // Muted server filters regular notifications, while remote_desktop bypasses server mute
     mockDb.query.mockResolvedValueOnce([{
@@ -195,16 +211,14 @@ describe('GET /api/push/stream and pushStreamHub', () => {
     }, { DB: mockDb } as never);
     expect(pushStreamHub.subscriberCount('user-1')).toBe(1);
 
-    mockDb.query
-      .mockResolvedValueOnce([{
-        user_status: 'active',
-        push_enabled_server_ids: ['srv-1'],
-        push_notification_types: [...DEFAULT_PUSH_NOTIFICATION_TYPES],
-        token: null,
-        platform: null,
-        notification_types: null,
-      }])
-      .mockResolvedValueOnce([{ badge_count: 4 }]);
+    mockDb.query.mockResolvedValueOnce([{
+      user_status: 'active',
+      push_enabled_server_ids: ['srv-1'],
+      push_notification_types: [...DEFAULT_PUSH_NOTIFICATION_TYPES],
+      token: null,
+      platform: null,
+      notification_types: null,
+    }]);
     await dispatchPush({
       userId: 'user-1',
       serverId: 'srv-muted',
@@ -242,13 +256,13 @@ describe('GET /api/push/stream and pushStreamHub', () => {
     expect(pushStreamHub.subscriberCount('user-1')).toBe(0);
   });
 
-  it('P0-1: delivers SSE across two isolated replica hubs without source local subscribers and increments badge_count once', async () => {
+  it('P0-1: delivers SSE across two isolated replica hubs with zero phantom badge increments when no token matches, and keeps oversized session.error within PG NOTIFY byte cap', async () => {
     const streamHubA = new PushStreamHub();
     const streamHubB = new PushStreamHub();
     const globalHubA = new GlobalTaskHub({ pushStreamHub: streamHubA });
     const globalHubB = new GlobalTaskHub({ pushStreamHub: streamHubB });
 
-    // Simulate PG LISTEN active on replica A and pipe pg_notify frames to both replicas
+    // Simulate PG LISTEN active on replica A and enforce realistic PG NOTIFY payload byte cap
     vi.spyOn(globalHubA, 'isPgListening').mockReturnValue(true);
     const receivedOnB: string[] = [];
     streamHubB.subscribe('user-multi', {
@@ -261,8 +275,10 @@ describe('GET /api/push/stream and pushStreamHub', () => {
     expect(streamHubA.hasSubscribers('user-multi')).toBe(false);
     expect(streamHubB.hasSubscribers('user-multi')).toBe(true);
 
+    const notifiedPayloads: string[] = [];
     const replicaDb = {
       query: vi.fn()
+        // 1) Tokenless SSE-only user -> delivered to Pod B, zero badge_count UPDATE
         .mockResolvedValueOnce([{
           user_status: 'active',
           push_enabled_server_ids: ['srv-a'],
@@ -271,11 +287,32 @@ describe('GET /api/push/stream and pushStreamHub', () => {
           platform: null,
           notification_types: null,
         }])
-        .mockResolvedValueOnce([{ badge_count: 7 }]),
+        // 2) Negative badge control: iOS token enabled ONLY for task_complete, global allows task_pair_done, 0 SSE everywhere -> zero badge_count UPDATE
+        .mockResolvedValueOnce([{
+          user_status: 'active',
+          push_enabled_server_ids: ['srv-a'],
+          push_notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE, PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE],
+          token: 'ios-tok-only-a',
+          platform: PUSH_PLATFORM_IOS,
+          notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE],
+        }])
+        // 3) Oversized 9500-byte session.error without explicit eventId -> bounded ID + body delivered to Pod B
+        .mockResolvedValueOnce([{
+          user_status: 'active',
+          push_enabled_server_ids: ['srv-a'],
+          push_notification_types: [...DEFAULT_PUSH_NOTIFICATION_TYPES],
+          token: null,
+          platform: null,
+          notification_types: null,
+        }]),
       queryOne: vi.fn(),
       execute: vi.fn(async (sql: string, params: unknown[]) => {
         if (sql.includes('pg_notify')) {
           const payload = String(params[1]);
+          if (Buffer.byteLength(payload, 'utf8') > GLOBAL_TASK_PG_NOTIFY_MAX_BYTES) {
+            throw new Error(`pg_notify payload string too long (${Buffer.byteLength(payload, 'utf8')} bytes)`);
+          }
+          notifiedPayloads.push(payload);
           await globalHubA.handleNotifyPayload(payload, replicaDb as never);
           await globalHubB.handleNotifyPayload(payload, replicaDb as never);
         }
@@ -295,15 +332,50 @@ describe('GET /api/push/stream and pushStreamHub', () => {
       },
       { DB: replicaDb } as never,
       undefined,
-      { globalHub: globalHubA, streamHub: streamHubA },
+      { globalHub: globalHubA },
+    );
+    expect(receivedOnB).toHaveLength(1);
+    expect(receivedOnB[0]).toContain('"id":"evt-cross-1"');
+
+    // Negative badge control: PG LISTEN true + no SSE subscribers + no matching token -> ZERO badge_count UPDATE
+    await dispatchPush(
+      {
+        userId: 'user-ios-only-a',
+        serverId: 'srv-a',
+        eventId: 'evt-unmatched-b',
+        type: PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
+        title: 'Pod A · pair',
+        body: 'Unmatched token type',
+        data: { serverId: 'srv-a', session: 'deck_proj_brain' },
+      },
+      { DB: replicaDb } as never,
+      undefined,
+      { globalHub: globalHubA },
     );
 
-    // badge_count updated ONCE on source replica A; never re-incremented on replica B
+    // 9500-byte error body with fallback ID (no eventId) -> still fits <= 4000 bytes and arrives on Pod B with serverId/session
+    await dispatchPush(
+      {
+        userId: 'user-multi',
+        serverId: 'srv-a',
+        type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+        title: 'Pod A · error',
+        body: `Error: ${'X'.repeat(9500)}`,
+        data: { serverId: 'srv-a', session: 'deck_proj_err', type: 'session.error' },
+      },
+      { DB: replicaDb } as never,
+      undefined,
+      { globalHub: globalHubA },
+    );
+
     const badgeQueries = replicaDb.query.mock.calls.filter(([sql]: [string]) => sql.includes('badge_count'));
-    expect(badgeQueries).toHaveLength(1);
-    expect(receivedOnB).toHaveLength(1);
-    expect(receivedOnB[0]).toContain('"badge":7');
-    expect(receivedOnB[0]).toContain('"id":"evt-cross-1"');
+    expect(badgeQueries).toHaveLength(0);
+    expect(receivedOnB).toHaveLength(2);
+    expect(receivedOnB[1]).toContain('"serverId":"srv-a"');
+    expect(receivedOnB[1]).toContain('"session":"deck_proj_err"');
+    for (const raw of notifiedPayloads) {
+      expect(Buffer.byteLength(raw, 'utf8')).toBeLessThanOrEqual(GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
+    }
   });
 
   it('P0-2: delivers SSE on real WsBridge session.idle and task_pair.event entries even while mobile WebSocket stays OPEN in background', async () => {
@@ -344,8 +416,6 @@ describe('GET /api/push/stream and pushStreamHub', () => {
     mobileWs.close = vi.fn();
 
     bridge.handleBrowserConnection(mobileWs, 'user-ws-bg', mockBridgeDb, true);
-    mobileWs.emit('message', Buffer.from(JSON.stringify({ type: 'client.presence', foreground: false })));
-    await Promise.resolve();
 
     const mockEnv = { DB: mockBridgeDb } as any; // no APNS/FCM/JPUSH keys, no PUSH_RELAY_URL -> would throw or fetch if token push attempted
     const fetchSpy = vi.spyOn(globalThis, 'fetch');
@@ -387,10 +457,12 @@ describe('GET /api/push/stream and pushStreamHub', () => {
     }
   });
 
-  it('P0-5: revoking API key A closes only key A SSE streams while keeping key B for same user, and handles grace expiry / logout', async () => {
+  it('P0-5: enforces native API-key-only auth with real requireAuth middleware, revokes key A while keeping key B, and closes expired grace keys', async () => {
     mockDb.queryOne
       .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 })
-      .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 });
+      .mockResolvedValueOnce({ id: 'key-a' })
+      .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 })
+      .mockResolvedValueOnce({ id: 'key-b' });
 
     const abortA = new AbortController();
     const abortB = new AbortController();
@@ -429,12 +501,55 @@ describe('GET /api/push/stream and pushStreamHub', () => {
     expect(pushStreamHub.subscriberCount('user-1')).toBe(0);
     const afterExpireB = await readerB.read();
     expect(afterExpireB.done).toBe(true);
+
+    // Verify real unmocked requireAuth middleware rejects JWT Bearer, expired JWT, and revoked API key while allowing active API key
+    const { Hono: RealHono } = await import('hono');
+    const authMod = await vi.importActual<typeof import('../src/security/authorization.js')>('../src/security/authorization.js');
+    const jwtKey = 'test-signing-key-32-bytes-minimum!!';
+    const validKey = 'deck_real_api_key_active';
+    const validKeyHash = sha256Hex(validKey);
+    const realDb = {
+      queryOne: vi.fn(async (sql: string, params?: unknown[]) => {
+        if (sql.includes('FROM api_keys') && sql.includes('key_hash')) {
+          return params?.[0] === validKeyHash ? { id: 'real-key-id', user_id: 'real-u1', user_status: 'active' } : null;
+        }
+        if (sql.includes('SELECT status, sessions_valid_after FROM users')) {
+          return { status: 'active', sessions_valid_after: 0 };
+        }
+        if (sql.includes('FROM api_keys')) {
+          return params?.[0] === 'real-key-id' ? { id: 'real-key-id' } : null;
+        }
+        return null;
+      }),
+      query: vi.fn(async () => []),
+      execute: vi.fn(async () => ({ changes: 1 })),
+    };
+    const realApp = new RealHono();
+    realApp.use('/*', async (c, next) => {
+      (c as any).env = { DB: realDb, JWT_SIGNING_KEY: jwtKey };
+      return next();
+    });
+    realApp.use('/api/push/stream', authMod.requireAuth({ refuseDaemonCredential: true }));
+    realApp.get('/api/push/stream', (c) => {
+      const keyId = c.get('keyId' as never) as string | undefined;
+      if (!keyId) return c.json({ error: 'unauthorized' }, 401);
+      return c.json({ ok: true, keyId }, 200);
+    });
+
+    const signedJwt = signJwt({ sub: 'real-u1', type: ACCOUNT_SESSION_JWT_TYPE, iat: Math.floor(Date.now() / 1000) }, jwtKey, 3600);
+    const expiredJwt = signJwt({ sub: 'real-u1', type: ACCOUNT_SESSION_JWT_TYPE, iat: Math.floor(Date.now() / 1000) - 7200 }, jwtKey, -10);
+    expect((await realApp.request('/api/push/stream', { headers: { Authorization: `Bearer ${signedJwt}` } })).status).toBe(401);
+    expect((await realApp.request('/api/push/stream', { headers: { Authorization: `Bearer ${expiredJwt}` } })).status).toBe(401);
+    expect((await realApp.request('/api/push/stream', { headers: { Authorization: 'Bearer deck_revoked_key' } })).status).toBe(401);
+    expect((await realApp.request('/api/push/stream', { headers: { Authorization: `Bearer ${validKey}` } })).status).toBe(200);
   });
 
   it('P0-6: closes slow stalled SSE reader at bounded backpressure threshold without blocking healthy reader', async () => {
     mockDb.queryOne
       .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 })
-      .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 });
+      .mockResolvedValueOnce({ id: 'key-a' })
+      .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 })
+      .mockResolvedValueOnce({ id: 'key-b' });
 
     const resSlow = await app.request('/api/push/stream', {
       headers: { Authorization: 'Bearer valid-user-1-key-a' },

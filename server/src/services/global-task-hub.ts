@@ -1,4 +1,5 @@
 import { WebSocket } from 'ws';
+import { createHash } from 'node:crypto';
 import {
   GLOBAL_TASK_BRAIN_TEXT_MAX_CHARS,
   GLOBAL_TASK_MODE_MSG,
@@ -74,8 +75,6 @@ type GlobalTaskNotifyEnvelope =
     userId: string;
     keyId?: string;
     allApiKeys?: boolean;
-    sessionHash?: string;
-    minIssuedAtMs?: number;
     ts: number;
   }
   | { kind: 'access_changed'; userId?: string; serverId?: string; ts: number };
@@ -83,6 +82,48 @@ type GlobalTaskNotifyEnvelope =
 const RECONNECT_INITIAL_MS = 1000;
 const RECONNECT_MAX_MS = 30_000;
 const MAX_MUTED_IDS = 1000;
+const MAX_NOTIFICATION_EVENT_ID_BYTES = 128;
+const MAX_NOTIFICATION_TITLE_CHARS = 200;
+const MAX_NOTIFICATION_DATA_FIELD_CHARS = 256;
+const ALLOWED_PUSH_STREAM_DATA_KEYS = new Set(['serverId', 'session', 'taskId', 'type']);
+const utf8Encoder = new TextEncoder();
+
+function boundNotificationEventId(rawId: string): string {
+  const trimmed = rawId.trim();
+  if (!trimmed) return `evt_${Date.now()}`;
+  if (utf8Encoder.encode(trimmed).length <= MAX_NOTIFICATION_EVENT_ID_BYTES) {
+    return trimmed;
+  }
+  const digest = createHash('sha256').update(trimmed, 'utf8').digest('hex').slice(0, 32);
+  return `evt_${digest}`;
+}
+
+function sanitizePushStreamData(data: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!data || typeof data !== 'object') return undefined;
+  const out: Record<string, string> = {};
+  for (const key of ALLOWED_PUSH_STREAM_DATA_KEYS) {
+    const val = data[key];
+    if (typeof val !== 'string' || !val) continue;
+    out[key] = truncateGlobalBrainText(val, MAX_NOTIFICATION_DATA_FIELD_CHARS);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function serializeBoundedPushEnvelope<T extends { title: string; body: string }>(
+  obj: T,
+  maxBytes: number = GLOBAL_TASK_PG_NOTIFY_MAX_BYTES,
+): string {
+  let boundedJson = serializeBoundedPgNotifyPayload(obj, 'body', maxBytes);
+  if (utf8Encoder.encode(boundedJson).length <= maxBytes) {
+    return boundedJson;
+  }
+  const emptyBodyObj: T = { ...obj, body: '' };
+  boundedJson = serializeBoundedPgNotifyPayload(emptyBodyObj, 'title', maxBytes);
+  if (utf8Encoder.encode(boundedJson).length <= maxBytes) {
+    return boundedJson;
+  }
+  return JSON.stringify({ ...emptyBodyObj, title: truncateGlobalBrainText(obj.title, 48) });
+}
 
 function safeSendWs(ws: WebSocket, frame: GlobalTaskServerFrame): void {
   if (ws.readyState !== WebSocket.OPEN) return;
@@ -498,20 +539,22 @@ export class GlobalTaskHub {
   ): Promise<void> {
     if (!input.userId || !input.eventId || !input.title) return;
     const activeDb = db ?? this.db ?? null;
-    const notifyObj: Record<string, unknown> = {
-      kind: 'notification',
+    const boundedTitle = truncateGlobalBrainText(input.title, MAX_NOTIFICATION_TITLE_CHARS) || 'Notification';
+    const boundedEventId = boundNotificationEventId(input.eventId);
+    const notifyObj = {
+      kind: 'notification' as const,
       userId: input.userId,
-      eventId: input.eventId,
-      title: input.title,
+      eventId: boundedEventId,
+      title: boundedTitle,
       body: input.body ?? '',
       ...(input.notificationType ? { notificationType: input.notificationType } : {}),
-      ...(input.serverId ? { serverId: input.serverId } : {}),
-      ...(input.session ? { session: input.session } : {}),
-      ...(input.taskId ? { taskId: input.taskId } : {}),
-      ...(input.eventType ? { eventType: input.eventType } : {}),
+      ...(input.serverId ? { serverId: truncateGlobalBrainText(input.serverId, MAX_NOTIFICATION_DATA_FIELD_CHARS) } : {}),
+      ...(input.session ? { session: truncateGlobalBrainText(input.session, MAX_NOTIFICATION_DATA_FIELD_CHARS) } : {}),
+      ...(input.taskId ? { taskId: truncateGlobalBrainText(input.taskId, MAX_NOTIFICATION_DATA_FIELD_CHARS) } : {}),
+      ...(input.eventType ? { eventType: truncateGlobalBrainText(input.eventType, MAX_NOTIFICATION_DATA_FIELD_CHARS) } : {}),
       ts: Number(input.ts ?? Date.now()) || Date.now(),
     };
-    const boundedJson = serializeBoundedPgNotifyPayload(notifyObj, 'body', GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
+    const boundedJson = serializeBoundedPushEnvelope(notifyObj, GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
     await emitGlobalTaskPgNotify(activeDb, boundedJson);
 
     if (!this.pgListening) {
@@ -545,18 +588,21 @@ export class GlobalTaskHub {
   ): Promise<void> {
     if (!input.userId || !input.eventId || !input.title) return;
     const activeDb = db ?? this.db ?? null;
-    const notifyObj: Record<string, unknown> = {
-      kind: 'push_stream',
+    const boundedTitle = truncateGlobalBrainText(input.title, MAX_NOTIFICATION_TITLE_CHARS) || 'Notification';
+    const boundedEventId = boundNotificationEventId(input.eventId);
+    const boundedData = sanitizePushStreamData(input.data);
+    const notifyObj = {
+      kind: 'push_stream' as const,
       userId: input.userId,
-      eventId: input.eventId,
-      title: input.title,
+      eventId: boundedEventId,
+      title: boundedTitle,
       body: input.body ?? '',
       ...(input.notificationType ? { notificationType: input.notificationType } : {}),
       ...(input.badge != null ? { badge: input.badge } : {}),
-      ...(input.data ? { data: input.data } : {}),
+      ...(boundedData ? { data: boundedData } : {}),
       ts: Number(input.ts ?? Date.now()) || Date.now(),
     };
-    const boundedJson = serializeBoundedPgNotifyPayload(notifyObj, 'body', GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
+    const boundedJson = serializeBoundedPushEnvelope(notifyObj, GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
     await emitGlobalTaskPgNotify(activeDb, boundedJson);
 
     if (!this.pgListening) {
@@ -578,8 +624,6 @@ export class GlobalTaskHub {
       userId: string;
       keyId?: string;
       allApiKeys?: boolean;
-      sessionHash?: string;
-      minIssuedAtMs?: number;
     },
   ): Promise<void> {
     if (!input.userId) return;
@@ -589,8 +633,6 @@ export class GlobalTaskHub {
       userId: input.userId,
       ...(input.keyId ? { keyId: input.keyId } : {}),
       ...(input.allApiKeys ? { allApiKeys: true } : {}),
-      ...(input.sessionHash ? { sessionHash: input.sessionHash } : {}),
-      ...(typeof input.minIssuedAtMs === 'number' ? { minIssuedAtMs: input.minIssuedAtMs } : {}),
       ts: Date.now(),
     };
     await emitGlobalTaskPgNotify(activeDb, JSON.stringify(envelope));
@@ -605,8 +647,6 @@ export class GlobalTaskHub {
       userId: string;
       keyId?: string;
       allApiKeys?: boolean;
-      sessionHash?: string;
-      minIssuedAtMs?: number;
     },
   ): void {
     if (input.keyId) {
@@ -614,12 +654,6 @@ export class GlobalTaskHub {
     }
     if (input.allApiKeys) {
       this.pushStreamTarget.closeByAllUserApiKeys(input.userId);
-    }
-    if (input.sessionHash || typeof input.minIssuedAtMs === 'number') {
-      this.pushStreamTarget.closeByJwtSession(input.userId, {
-        ...(input.sessionHash ? { sessionHash: input.sessionHash } : {}),
-        ...(typeof input.minIssuedAtMs === 'number' ? { minIssuedAtMs: input.minIssuedAtMs } : {}),
-      });
     }
   }
 

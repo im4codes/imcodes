@@ -14,7 +14,7 @@ import {
   sanitizeTtsVoicesByLang,
   type TtsResponseFormat,
 } from '@shared/tts-config.js';
-import { getServerUrl, isNative } from '../native.js';
+import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
 import { AUTH_ERROR_CODES } from '@shared/auth-error-codes.js';
 import {
@@ -395,13 +395,7 @@ export function SettingsPage({
           if (next) setAndroidBgStatus(next);
         }
       } else if (typeof enableAndroidBackgroundPush === 'function') {
-        const serverUrl = typeof getServerUrl === 'function' ? await getServerUrl().catch(() => null) : null;
-        let apiKey: string | null = null;
-        if (serverUrl) {
-          const { getAuthKey } = await import('../biometric-auth.js');
-          apiKey = await getAuthKey(serverUrl).catch(() => null);
-        }
-        const next = await enableAndroidBackgroundPush({ apiKey, serverUrl });
+        const next = await enableAndroidBackgroundPush();
         if (next) setAndroidBgStatus(next);
       }
     } finally {

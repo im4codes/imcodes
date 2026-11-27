@@ -18,11 +18,8 @@ export interface PushStreamEvent {
 }
 
 export interface PushStreamCredential {
-  kind: 'api_key' | 'jwt' | 'daemon' | 'unknown';
-  keyId?: string;
-  issuedAt?: number;
-  sessionHash?: string;
-  serverId?: string;
+  kind: 'api_key';
+  keyId: string;
 }
 
 export interface PushStreamSubscription {
@@ -159,7 +156,7 @@ export class PushStreamHub {
   closeByApiKey(userId: string, keyId: string): number {
     if (!keyId) return 0;
     return this.closeMatchingSubscriptions(
-      (uid, sub) => (!userId || uid === userId) && sub.credential?.kind === 'api_key' && sub.credential.keyId === keyId,
+      (uid, sub) => (!userId || uid === userId) && sub.credential?.keyId === keyId,
     );
   }
 
@@ -168,18 +165,6 @@ export class PushStreamHub {
     return this.closeMatchingSubscriptions(
       (uid, sub) => uid === userId && sub.credential?.kind === 'api_key',
     );
-  }
-
-  closeByJwtSession(userId: string, opts?: { sessionHash?: string; minIssuedAtMs?: number }): number {
-    if (!userId) return 0;
-    return this.closeMatchingSubscriptions((uid, sub) => {
-      if (uid !== userId || sub.credential?.kind !== 'jwt') return false;
-      if (opts?.sessionHash && sub.credential.sessionHash === opts.sessionHash) return true;
-      if (typeof opts?.minIssuedAtMs === 'number' && typeof sub.credential.issuedAt === 'number') {
-        return sub.credential.issuedAt * 1000 < opts.minIssuedAtMs;
-      }
-      return false;
-    });
   }
 
   closeInactiveUsers(inactiveUserIds: ReadonlySet<string>): number {

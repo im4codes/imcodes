@@ -2496,7 +2496,6 @@ export class WsClient {
       // been rebuilt — the remembered size is no longer known-applied.
       this.lastSentResize.clear();
       this.replayAllSubscriptionsForNewSocket();
-      this.sendClientPresence();
       this.dispatch({
         type: 'session.event',
         event: 'connected',
@@ -2892,18 +2891,6 @@ export class WsClient {
     this.clearPendingPingSample();
   }
 
-  private sendClientPresence(): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this._connected) return;
-    try {
-      this.ws.send(JSON.stringify({
-        type: 'client.presence',
-        foreground: !this.isBackgrounded(),
-      }));
-    } catch {
-      // ignore transient send errors; next open/transition will resync presence
-    }
-  }
-
   /**
    * Clear pending RTT/heartbeat/resume watchdogs and pause probing while the
    * native app is inactive (`isActive: false`), even if DOM `visibilityState`
@@ -2913,7 +2900,6 @@ export class WsClient {
   notifyBackgrounded(): void {
     this._nativeBackgrounded = true;
     this.clearBackgroundWatchdogs();
-    this.sendClientPresence();
   }
 
   /**
@@ -2922,7 +2908,6 @@ export class WsClient {
   notifyForegrounded(): void {
     this._nativeBackgrounded = false;
     this._pageSuspended = false;
-    this.sendClientPresence();
   }
 
   private sendHeartbeatPing(): void {
@@ -3037,7 +3022,6 @@ export class WsClient {
       this._visibilityListener = () => {
         if (!this.isDocumentHidden()) {
           this._pageSuspended = false;
-          this.sendClientPresence();
           return;
         }
         // Desktop browsers aggressively throttle background timers. A ping sent
@@ -3046,7 +3030,6 @@ export class WsClient {
         // churn. Foreground resume still runs probeConnection() immediately,
         // but now also requires two missed pongs before reconnecting.
         this.clearBackgroundWatchdogs();
-        this.sendClientPresence();
       };
       document.addEventListener('visibilitychange', this._visibilityListener);
     }
@@ -3054,7 +3037,6 @@ export class WsClient {
       this._freezeListener = () => {
         this._pageSuspended = true;
         this.clearBackgroundWatchdogs();
-        this.sendClientPresence();
       };
       document.addEventListener('freeze', this._freezeListener);
     }
@@ -3063,25 +3045,18 @@ export class WsClient {
         this._pageHideListener = () => {
           this._pageSuspended = true;
           this.clearBackgroundWatchdogs();
-          this.sendClientPresence();
         };
         window.addEventListener('pagehide', this._pageHideListener);
       }
       if (!this._pageShowListener) {
         this._pageShowListener = () => {
-          if (!this.isDocumentHidden()) {
-            this._pageSuspended = false;
-            this.sendClientPresence();
-          }
+          if (!this.isDocumentHidden()) this._pageSuspended = false;
         };
         window.addEventListener('pageshow', this._pageShowListener);
       }
       if (!this._focusListener) {
         this._focusListener = () => {
-          if (!this.isDocumentHidden()) {
-            this._pageSuspended = false;
-            this.sendClientPresence();
-          }
+          if (!this.isDocumentHidden()) this._pageSuspended = false;
         };
         window.addEventListener('focus', this._focusListener);
       }

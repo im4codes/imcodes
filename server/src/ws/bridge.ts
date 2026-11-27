@@ -2703,8 +2703,6 @@ export class WsBridge {
    */
   private consoleSubscriptions = new Map<WebSocket, Map<string, { subscriptionId: string; projectName: string; coordinatorSessionName: string }>>();
   private mobileSockets = new Set<WebSocket>();
-  /** Explicit client foreground presence reported via `client.presence`; defaults to true for legacy clients. */
-  private mobileSocketForeground = new Map<WebSocket, boolean>();
   private queue: Array<{ message: string; queuedAt: number }> = [];
   private authTimer: ReturnType<typeof setTimeout> | null = null;
   /**
@@ -7544,10 +7542,7 @@ export class WsBridge {
   ): void {
     this.db = db;
     this.browserSockets.add(ws);
-    if (isMobile) {
-      this.mobileSockets.add(ws);
-      this.mobileSocketForeground.set(ws, true);
-    }
+    if (isMobile) this.mobileSockets.add(ws);
     this.browserSubscriptions.set(ws, new Map());
     this.transportSubscriptions.set(ws, new Set());
     this.timelineSubscriptions.set(ws, new Map());
@@ -7641,13 +7636,6 @@ export class WsBridge {
       if (msg.type === 'ping') {
         const hasValidId = (typeof msg.id === 'number' && Number.isFinite(msg.id)) || typeof msg.id === 'string';
         safeSend(ws, JSON.stringify(hasValidId ? { type: 'pong', id: msg.id } : { type: 'pong' }));
-        return;
-      }
-
-      if (msg.type === 'client.presence') {
-        if (this.mobileSockets.has(ws) && typeof msg.foreground === 'boolean') {
-          this.mobileSocketForeground.set(ws, msg.foreground);
-        }
         return;
       }
 
@@ -11538,7 +11526,6 @@ export class WsBridge {
     this.releaseBrowserConsoleSubscriptions(ws);
     this.browserSockets.delete(ws);
     this.mobileSockets.delete(ws);
-    this.mobileSocketForeground.delete(ws);
     this.browserUserIds.delete(ws);
     this.controlledTargetBrowserSockets.delete(ws);
     this.controlledBrowserReads.remove(ws);
@@ -15640,15 +15627,20 @@ export class WsBridge {
     for (const key of markerKeys) {
       const marker = msg[key];
       if (typeof marker === 'string' && marker.trim()) {
-        return `${eventType}:${sessionName}:marker:${marker.trim()}`;
+        const rawMarker = marker.trim();
+        const candidate = `${eventType}:${sessionName}:marker:${rawMarker}`;
+        return Buffer.byteLength(candidate, 'utf8') <= 128
+          ? candidate
+          : `${eventType}:${sessionName}:marker:${sha256Hex(rawMarker).slice(0, 32)}`;
       }
     }
     if (assistantEventId) return `${eventType}:${sessionName}:assistant:${assistantEventId}`;
     const eventTs = msg.eventTs ?? msg.ts;
+    const bodyDigest = sha256Hex(body).slice(0, 24);
     if (typeof eventTs === 'number' && Number.isFinite(eventTs)) {
-      return `${eventType}:${sessionName}:ts:${eventTs}:${body}`;
+      return `${eventType}:${sessionName}:ts:${eventTs}:${bodyDigest}`;
     }
-    return `${eventType}:${sessionName}:body:${body}`;
+    return `${eventType}:${sessionName}:body:${bodyDigest}`;
   }
 
   private wasPushDelivered(key: string, now: number): boolean {
