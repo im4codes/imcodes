@@ -545,4 +545,134 @@ describe('daemon WS tunnel relay', () => {
     // wsId in the reply should preserve the original format the server sent.
     expect(openedCall?.[0]).toMatchObject({ type: PREVIEW_MSG.WS_OPENED, wsId: uuidWsId });
   });
+
+  // ── Upstream WS header forwarding + Origin rewrite ────────────────────────
+
+  it('forwards safe headers (cookie, x-custom, user-agent), strips ws handshake/auth headers, and rewrites origin to loopback', async () => {
+    const wsId = makeWsId();
+    const serverLink = createServerLink();
+    const capturedHeaders: Array<Record<string, string | string[] | undefined>> = [];
+
+    upstream.wss.on('connection', (_ws, req) => {
+      capturedHeaders.push(req.headers as Record<string, string | string[] | undefined>);
+    });
+
+    handlePreviewCommand({
+      type: PREVIEW_MSG.WS_OPEN,
+      wsId,
+      previewId: TEST_PREVIEW_ID,
+      port: upstream.port,
+      path: '/ws',
+      headers: {
+        cookie: 'sid=session123; theme=dark',
+        'user-agent': 'MockBrowser/1.0',
+        'x-custom-header': 'custom-val',
+        origin: 'https://im.codes',
+        host: 'im.codes',
+        authorization: 'Bearer should-be-stripped',
+        'sec-websocket-key': 'stale-browser-key==',
+        'sec-websocket-version': '13',
+        'sec-websocket-protocol': 'stale',
+        connection: 'Upgrade',
+        upgrade: 'websocket',
+      },
+      protocols: [],
+    }, serverLink as never);
+
+    await waitFor(() => serverLink.send.mock.calls.some((c) => (c[0] as { type: string }).type === PREVIEW_MSG.WS_OPENED));
+    expect(capturedHeaders).toHaveLength(1);
+    const hdr = capturedHeaders[0];
+    expect(hdr.cookie).toBe('sid=session123; theme=dark');
+    expect(hdr['user-agent']).toBe('MockBrowser/1.0');
+    expect(hdr['x-custom-header']).toBe('custom-val');
+    expect(hdr.host).toBe(`127.0.0.1:${upstream.port}`);
+    expect(hdr.origin).toBe(`http://127.0.0.1:${upstream.port}`);
+    expect(hdr.authorization).toBeUndefined();
+    expect(hdr['sec-websocket-key']).not.toBe('stale-browser-key==');
+  });
+
+  // ── Upstream unexpected-response HTTP status forwarding ───────────────────
+
+  it('includes upstream HTTP status code on WS_ERROR for unexpected-response (401/403)', async () => {
+    const { createServer } = await import('node:http');
+    const httpSrv = createServer((_req, res) => {
+      res.writeHead(401, 'Unauthorized').end('denied');
+    });
+    await new Promise<void>((resolve) => httpSrv.listen(0, '127.0.0.1', resolve));
+    const port = (httpSrv.address() as AddressInfo).port;
+    try {
+      const wsId = makeWsId();
+      const serverLink = createServerLink();
+      handlePreviewCommand({
+        type: PREVIEW_MSG.WS_OPEN,
+        wsId,
+        previewId: TEST_PREVIEW_ID,
+        port,
+        path: '/auth-ws',
+        headers: {},
+        protocols: [],
+      }, serverLink as never);
+
+      await waitFor(() => serverLink.send.mock.calls.some((c) => (c[0] as { type: string }).type === PREVIEW_MSG.WS_ERROR), 3000);
+      const errCall = serverLink.send.mock.calls.find((c) => (c[0] as { type: string }).type === PREVIEW_MSG.WS_ERROR);
+      expect(errCall?.[0]).toMatchObject({
+        type: PREVIEW_MSG.WS_ERROR,
+        wsId,
+        status: 401,
+      });
+      // Should NOT also emit WS_CLOSE right behind pre-open WS_ERROR.
+      await new Promise((r) => setTimeout(r, 30));
+      expect(serverLink.send.mock.calls.some((c) => (c[0] as { type: string }).type === PREVIEW_MSG.WS_CLOSE)).toBe(false);
+    } finally {
+      await new Promise<void>((resolve) => httpSrv.close(() => resolve()));
+    }
+  });
+
+  // ── Upstream WS ping keepalive + timer cleanup ────────────────────────────
+
+  it('sends periodic WS ping frames to upstream and clears ping timer on close', async () => {
+    const prevKeepalive = process.env.PREVIEW_WS_KEEPALIVE_MS;
+    process.env.PREVIEW_WS_KEEPALIVE_MS = '30';
+    vi.resetModules();
+    try {
+      const relay = await import('../../src/daemon/preview-relay.js');
+      const types = await import('../../shared/preview-types.js');
+      const wsId = makeWsId();
+      const serverLink = createServerLink();
+      let pings = 0;
+
+      upstream.wss.on('connection', (ws) => {
+        ws.on('ping', () => { pings++; });
+      });
+
+      relay.handlePreviewCommand({
+        type: types.PREVIEW_MSG.WS_OPEN,
+        wsId,
+        previewId: TEST_PREVIEW_ID,
+        port: upstream.port,
+        path: '/',
+        headers: {},
+        protocols: [],
+      }, serverLink as never);
+
+      await waitFor(() => serverLink.send.mock.calls.some((c) => (c[0] as { type: string }).type === types.PREVIEW_MSG.WS_OPENED));
+      await waitFor(() => pings >= 2, 2000);
+      expect(pings).toBeGreaterThanOrEqual(2);
+
+      relay.handlePreviewCommand({
+        type: types.PREVIEW_MSG.WS_CLOSE,
+        wsId,
+        code: 1000,
+        reason: 'done',
+      }, serverLink as never);
+      await new Promise((r) => setTimeout(r, 80));
+      const frozenPings = pings;
+      await new Promise((r) => setTimeout(r, 80));
+      expect(pings).toBe(frozenPings);
+    } finally {
+      if (prevKeepalive === undefined) delete process.env.PREVIEW_WS_KEEPALIVE_MS;
+      else process.env.PREVIEW_WS_KEEPALIVE_MS = prevKeepalive;
+      vi.resetModules();
+    }
+  });
 });

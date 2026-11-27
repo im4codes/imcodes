@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   LOOPBACK_HOSTS,
   appendPreviewAccessTokenIfMissing,
+  buildUpstreamWsHeaders,
   defaultPortForProtocol,
   filterPreviewResponseHeaders,
   isWebSocketUpgrade,
@@ -557,5 +558,33 @@ describe('preview XSS escaping and credential header stripping', () => {
     expect(sanitized['x-server-id']).toBeUndefined();
     expect(sanitized['x-shared-machine-authority']).toBeUndefined();
     expect(sanitized['x-app-custom']).toBe('keep-me');
+  });
+
+  it('drops COOKIE_PREVIEW_ACCESS on rewriteSetCookieHeader and builds safe upstream WS headers', async () => {
+    const { COOKIE_PREVIEW_ACCESS } = await import('../../shared/cookie-names.js');
+    expect(rewriteSetCookieHeader({ previewId: 'p', serverId: 's', header: `${COOKIE_PREVIEW_ACCESS}=x; Path=/` })).toBeNull();
+
+    const wsHeaders = buildUpstreamWsHeaders({
+      host: 'im.codes',
+      origin: 'https://im.codes',
+      cookie: 'app_session=123',
+      'user-agent': 'UA',
+      'x-custom': 'val',
+      'sec-websocket-key': 'old-key',
+      'sec-websocket-version': '13',
+      'sec-websocket-protocol': 'chat',
+      'sec-websocket-extensions': 'permessage-deflate',
+      connection: 'Upgrade',
+      upgrade: 'websocket',
+      authorization: 'Bearer leak',
+    }, 5173);
+
+    expect(wsHeaders).toEqual({
+      cookie: 'app_session=123',
+      'user-agent': 'UA',
+      'x-custom': 'val',
+      host: '127.0.0.1:5173',
+      origin: 'http://127.0.0.1:5173',
+    });
   });
 });

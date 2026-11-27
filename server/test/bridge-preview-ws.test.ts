@@ -530,5 +530,158 @@ describe('WsBridge preview WS tunnels', () => {
       // pending upgrade cleared → no tunnel
       expect(bridge.getServerWsCount()).toBe(0);
     });
+
+    it('calls rejectUpgrade with HTTP status (403/502/504) instead of upgrading on upstream reject, legacy error, open timeout, or pre-open close', async () => {
+      vi.useFakeTimers();
+      const { bridge, daemon } = await setupBridge();
+
+      // 1) Upstream 403 rejection
+      const wsId1 = '1'.repeat(32);
+      const complete1 = vi.fn(async () => new MockWs() as never);
+      const reject1 = vi.fn();
+      bridge.beginPreviewWsTunnel({
+        wsId: wsId1, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: [],
+        completeUpgrade: complete1,
+        rejectUpgrade: reject1,
+      });
+      daemon.emit('message', Buffer.from(JSON.stringify({
+        type: PREVIEW_MSG.WS_ERROR, wsId: wsId1, error: 'upstream rejected: 403 Forbidden', status: 403,
+      })), false);
+      await flushAsync();
+      expect(complete1).not.toHaveBeenCalled();
+      expect(reject1).toHaveBeenCalledWith(403, expect.stringContaining('403'));
+      expect(bridge.getServerWsCount()).toBe(0);
+
+      // 2) Legacy daemon WS_ERROR without status falls back safely to 502
+      const wsId2 = '2'.repeat(32);
+      const reject2 = vi.fn();
+      bridge.beginPreviewWsTunnel({
+        wsId: wsId2, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: [],
+        completeUpgrade: async () => new MockWs() as never,
+        rejectUpgrade: reject2,
+      });
+      daemon.emit('message', Buffer.from(JSON.stringify({
+        type: PREVIEW_MSG.WS_ERROR, wsId: wsId2, error: 'connection refused',
+      })), false);
+      await flushAsync();
+      expect(reject2).toHaveBeenCalledWith(502, 'connection refused');
+
+      // 3) Open timeout rejects with 504 (not 101)
+      const wsId3 = '3'.repeat(32);
+      const complete3 = vi.fn(async () => new MockWs() as never);
+      const reject3 = vi.fn();
+      bridge.beginPreviewWsTunnel({
+        wsId: wsId3, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: [],
+        completeUpgrade: complete3,
+        rejectUpgrade: reject3,
+      });
+      vi.advanceTimersByTime(PREVIEW_LIMITS.WS_OPEN_TIMEOUT_MS + 10);
+      await flushAsync();
+      expect(complete3).not.toHaveBeenCalled();
+      expect(reject3).toHaveBeenCalledWith(504, 'open timeout');
+      expect(bridge.getServerWsCount()).toBe(0);
+    });
+
+    it('buffers daemon→browser frames arriving between WS_OPENED and async completeUpgrade resolution and flushes in order', async () => {
+      const { bridge, daemon } = await setupBridge();
+      const browserWs = new MockWs();
+      let resolveUpgrade!: (ws: MockWs | null) => void;
+
+      bridge.beginPreviewWsTunnel({
+        wsId, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: ['vite-hmr'],
+        completeUpgrade: () => new Promise((resolve) => {
+          resolveUpgrade = (ws) => resolve(ws as never);
+        }),
+      });
+
+      // Upstream opens, then immediately sends 2 frames BEFORE completeUpgrade resolves.
+      daemon.emit('message', Buffer.from(JSON.stringify({
+        type: PREVIEW_MSG.WS_OPENED, wsId, protocol: 'vite-hmr',
+      })), false);
+      daemon.emit('message', packPreviewWsFrame(wsId, false, Buffer.from('greeting-1')), true);
+      daemon.emit('message', packPreviewWsFrame(wsId, true, Buffer.from([0xca, 0xfe])), true);
+      await flushAsync();
+
+      expect(browserWs.sent).toHaveLength(0);
+
+      // Now async wss.handleUpgrade completes.
+      resolveUpgrade(browserWs);
+      await flushAsync();
+
+      expect(browserWs.sent).toHaveLength(2);
+      expect((browserWs.sent[0] as Buffer).toString('utf8')).toBe('greeting-1');
+      expect(browserWs.sent[1]).toEqual(Buffer.from([0xca, 0xfe]));
+    });
+
+    it('enforces MAX_WS_PENDING_QUEUE_BYTES during upgrading window and honours early WS_CLOSE after queued frames', async () => {
+      const { bridge, daemon } = await setupBridge();
+      const browserWs = new MockWs();
+      let resolveUpgrade!: (ws: MockWs | null) => void;
+
+      bridge.beginPreviewWsTunnel({
+        wsId, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: [],
+        completeUpgrade: () => new Promise((resolve) => {
+          resolveUpgrade = (ws) => resolve(ws as never);
+        }),
+      });
+
+      daemon.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.WS_OPENED, wsId })), false);
+      daemon.emit('message', packPreviewWsFrame(wsId, false, Buffer.from('last-words')), true);
+      daemon.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.WS_CLOSE, wsId, code: 1000, reason: 'bye' })), false);
+      await flushAsync();
+
+      resolveUpgrade(browserWs);
+      await flushAsync();
+
+      expect(browserWs.sent.map((b) => (b as Buffer).toString('utf8'))).toEqual(['last-words']);
+      expect(browserWs.closed).toBe(true);
+      expect(browserWs.closedCode).toBe(1000);
+      expect(browserWs.closedReason).toBe('bye');
+
+      // Overflow during upgrading window closes with 1008.
+      const wsId2 = '9'.repeat(32);
+      const browserWs2 = new MockWs();
+      let resolveUpgrade2!: (ws: MockWs | null) => void;
+      bridge.beginPreviewWsTunnel({
+        wsId: wsId2, previewId, port: 3000, path: '/ws',
+        headers: {}, protocols: [],
+        completeUpgrade: () => new Promise((resolve) => {
+          resolveUpgrade2 = (ws) => resolve(ws as never);
+        }),
+      });
+      daemon.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.WS_OPENED, wsId: wsId2 })), false);
+      daemon.emit('message', packPreviewWsFrame(wsId2, true, Buffer.alloc(PREVIEW_LIMITS.MAX_WS_PENDING_QUEUE_BYTES + 1, 0x11)), true);
+      await flushAsync();
+
+      resolveUpgrade2(browserWs2);
+      await flushAsync();
+      expect(browserWs2.closed).toBe(true);
+      expect(browserWs2.closedCode).toBe(1008);
+    });
+
+    it('sends periodic ping keepalives on active browser WS and stops cleanly on close', async () => {
+      vi.useFakeTimers();
+      const { bridge, daemon } = await setupBridge();
+      const ping = vi.fn();
+      const browserWs = Object.assign(new MockWs(), { ping });
+
+      bridge.createPreviewWsTunnel(wsId, previewId, 3000, '/', browserWs as never, {}, []);
+      daemon.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.WS_OPENED, wsId })), false);
+      await flushAsync();
+
+      vi.advanceTimersByTime(PREVIEW_LIMITS.WS_KEEPALIVE_MS * 2 + 10);
+      expect(ping).toHaveBeenCalledTimes(2);
+
+      // Closing tunnel stops future pings cleanly (no timer leak).
+      browserWs.close(1000, 'client done');
+      const frozen = ping.mock.calls.length;
+      vi.advanceTimersByTime(PREVIEW_LIMITS.WS_KEEPALIVE_MS * 3);
+      expect(ping).toHaveBeenCalledTimes(frozen);
+    });
   });
 });

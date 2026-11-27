@@ -5,6 +5,7 @@
  * We evaluate the script string in jsdom and verify URL rewriting behavior.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { buildPreviewRuntimePatch } from '../../server/src/preview/policy.js';
 
 // Simulate the variables that buildPreviewRuntimePatch injects.
 const PREFIX = '/api/server/server1/local-web/preview123';
@@ -12,18 +13,14 @@ const PREVIEW_PORT = 3000;
 const ACCESS_TOKEN = 'tok-abc';
 
 /**
- * Build a minimal runtime patch script string that matches the structure
- * produced by buildPreviewRuntimePatch, but extracted so we can test it
- * in isolation without importing the server-side module.
- *
- * The function MUST stay in sync with the actual patch script in
- * server/src/preview/policy.ts — if you change the patch, update this too.
+ * Extract the real IIFE from `buildPreviewRuntimePatch` so jsdom tests always run
+ * against the authoritative production runtime patch (no duplicated inline copy).
  */
 function buildTestScript(prefix: string, port: number, accessToken: string | null): string {
-  const prefixJson = JSON.stringify(prefix);
-  const portJson = JSON.stringify(port);
-  const tokenJson = accessToken !== null ? JSON.stringify(accessToken) : 'null';
-  return `(function(){var PREFIX=${prefixJson};var PREVIEW_PORT=${portJson};var ACCESS_TOKEN=${tokenJson};var TOKEN_PARAM='preview_access_token';window.__IMCODES_PREVIEW_PATCHED__=false;function isLoopbackHost(host){return host==='127.0.0.1'||host==='localhost'||host==='[::1]'||host==='::1';}if(typeof window.WebSocket==='function'){var OriginalWebSocket=window.WebSocket;function rewriteWsUrl(url){var wsScheme=window.location.protocol==='http:'?'ws://':'wss://';var base=wsScheme+window.location.host;if(typeof url==='string'&&url.startsWith('/')){var path=url;var sep=path.indexOf('?')===-1?'?':'&';return base+PREFIX+path+(ACCESS_TOKEN?(sep+TOKEN_PARAM+'='+encodeURIComponent(ACCESS_TOKEN)):'');}try{var parsed=new URL(url);var parsedPort=Number(parsed.port||(parsed.protocol==='wss:'?'443':'80'));if((parsed.protocol==='ws:'||parsed.protocol==='wss:')&&isLoopbackHost(parsed.hostname)&&parsedPort===PREVIEW_PORT){var sep2=(parsed.search?'&':'?');return base+PREFIX+parsed.pathname+parsed.search+(ACCESS_TOKEN?(sep2+TOKEN_PARAM+'='+encodeURIComponent(ACCESS_TOKEN)):'');}}catch(_e){}return url;}function PatchedWebSocket(url,protocols){var rewrittenUrl=rewriteWsUrl(url);if(protocols!==undefined){return new OriginalWebSocket(rewrittenUrl,protocols);}return new OriginalWebSocket(rewrittenUrl);}PatchedWebSocket.prototype=OriginalWebSocket.prototype;PatchedWebSocket.CONNECTING=OriginalWebSocket.CONNECTING;PatchedWebSocket.OPEN=OriginalWebSocket.OPEN;PatchedWebSocket.CLOSING=OriginalWebSocket.CLOSING;PatchedWebSocket.CLOSED=OriginalWebSocket.CLOSED;window.WebSocket=PatchedWebSocket;}})();`;
+  const html = buildPreviewRuntimePatch(prefix, port, accessToken ?? undefined);
+  const match = html.match(/^<script data-imcodes-preview-runtime>([\s\S]*)<\/script>$/);
+  if (!match) throw new Error('Failed to extract runtime patch script');
+  return `(function(){window.__IMCODES_PREVIEW_PATCHED__=false;${match[1]}})();`;
 }
 
 // ── Mock WebSocket ─────────────────────────────────────────────────────────
@@ -55,9 +52,9 @@ function installPatch(prefix = PREFIX, port = PREVIEW_PORT, token: string | null
   (0, eval)(script);
 }
 
-function getLastSocket(url: string, protocols?: string | string[]): MockWebSocket {
+function getLastSocket(url: string | URL, protocols?: string | string[]): MockWebSocket {
   const ctor = window.WebSocket as unknown as typeof MockWebSocket;
-  return new ctor(url, protocols) as unknown as MockWebSocket;
+  return new (ctor as unknown as new (u: string | URL, p?: string | string[]) => MockWebSocket)(url, protocols);
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -147,6 +144,56 @@ describe('WebSocket constructor patch — URL rewriting', () => {
     const sock = getLastSocket(`ws://localhost:${PREVIEW_PORT}/ws`);
     expect(sock.url).not.toContain('preview_access_token');
     expect(sock.url).toContain(`wss://im.codes${PREFIX}/ws`);
+  });
+
+  it('rewrites same-origin wss://<location.host>/ws URLs (Vite/Next/FastAPI HMR pattern)', () => {
+    installPatch();
+    const sock = getLastSocket('wss://im.codes/ws?token=app1');
+    expect(sock.url).toBe(`wss://im.codes${PREFIX}/ws?token=app1&preview_access_token=tok-abc`);
+  });
+
+  it('rewrites same-origin ws:// URLs when page host is localhost:8080 over http:', () => {
+    Object.defineProperty(window, 'location', {
+      writable: true,
+      value: { protocol: 'http:', host: 'localhost:8080', origin: 'http://localhost:8080', href: `http://localhost:8080${PREFIX}/` },
+    });
+    installPatch();
+    const sock = getLastSocket('ws://localhost:8080/hmr');
+    expect(sock.url).toBe(`ws://localhost:8080${PREFIX}/hmr?preview_access_token=tok-abc`);
+  });
+
+  it('rewrites relative WS path without leading slash (e.g. "ws/chat")', () => {
+    Object.defineProperty(window, 'location', {
+      writable: true,
+      value: { protocol: 'https:', host: 'im.codes', origin: 'https://im.codes', href: `https://im.codes${PREFIX}/app/` },
+    });
+    installPatch();
+    const sock = getLastSocket('ws/chat?room=2');
+    expect(sock.url).toBe(`wss://im.codes${PREFIX}/app/ws/chat?room=2&preview_access_token=tok-abc`);
+  });
+
+  it('rewrites URL instances passed to new WebSocket(new URL(...)) and leaves external URL objects untouched', () => {
+    installPatch();
+    const sameOriginObj = new URL('wss://im.codes/ws?x=1');
+    expect(getLastSocket(sameOriginObj).url).toBe(`wss://im.codes${PREFIX}/ws?x=1&preview_access_token=tok-abc`);
+
+    const loopbackObj = new URL(`ws://127.0.0.1:${PREVIEW_PORT}/hmr`);
+    expect(getLastSocket(loopbackObj).url).toBe(`wss://im.codes${PREFIX}/hmr?preview_access_token=tok-abc`);
+
+    const externalObj = new URL('wss://echo.websocket.org/ws');
+    expect(getLastSocket(externalObj).url).toBe(externalObj);
+  });
+
+  it('is idempotent for reconnect URLs already containing PREFIX or preview_access_token', () => {
+    installPatch();
+    const alreadyComplete = `wss://im.codes${PREFIX}/ws?preview_access_token=tok-abc`;
+    expect(getLastSocket(alreadyComplete).url).toBe(alreadyComplete);
+
+    const prefixedNoToken = `wss://im.codes${PREFIX}/ws`;
+    expect(getLastSocket(prefixedNoToken).url).toBe(alreadyComplete);
+
+    const relPrefixed = `${PREFIX}/ws?room=1`;
+    expect(getLastSocket(relPrefixed).url).toBe(`wss://im.codes${PREFIX}/ws?room=1&preview_access_token=tok-abc`);
   });
 });
 

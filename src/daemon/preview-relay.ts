@@ -17,7 +17,7 @@ import {
   type PreviewWsOpenMessage,
   type PreviewWsCloseMessage,
 } from '../../shared/preview-types.js';
-import { normalizePreviewUpstreamPath } from '../../shared/preview-policy.js';
+import { buildUpstreamWsHeaders, normalizePreviewUpstreamPath } from '../../shared/preview-policy.js';
 import { isStreamingResponse } from '../../shared/preview-stream-policy.js';
 
 type PendingPreviewRequest = {
@@ -48,27 +48,43 @@ const LOOPBACK_HOST = '127.0.0.1';
 // but we cross-check to defend against confused-deputy scenarios.
 const previewPortRegistry = new Map<string, number>();
 
-// ── Active WS tunnels: wsId (dashless hex) → upstream WebSocket ──────────────
-const activeWsTunnels = new Map<string, WebSocket>();
+// ── Active WS tunnels: wsId (dashless hex) → upstream WebSocket + ping timer ─
+type ActiveWsTunnel = {
+  ws: WebSocket;
+  pingTimer: ReturnType<typeof setInterval> | null;
+};
+const activeWsTunnels = new Map<string, ActiveWsTunnel>();
 
 /** Normalize wsId to dashless 32-char hex (UUIDs have dashes, raw hex does not). */
 function normalizeWsId(wsId: string): string {
   return wsId.replace(/-/g, '');
 }
 
-function sendWsError(serverLink: ServerLink, wsId: string, error: string): void {
+function sendWsError(serverLink: ServerLink, wsId: string, error: string, status?: number): void {
   try {
-    serverLink.send({ type: PREVIEW_MSG.WS_ERROR, wsId, error });
+    serverLink.send(status !== undefined
+      ? { type: PREVIEW_MSG.WS_ERROR, wsId, error, status }
+      : { type: PREVIEW_MSG.WS_ERROR, wsId, error });
   } catch {
     // disconnected
   }
 }
 
-function cleanupWsTunnel(wsId: string): void {
-  const ws = activeWsTunnels.get(wsId);
+function removeWsTunnelEntry(wsId: string): ActiveWsTunnel | undefined {
+  const entry = activeWsTunnels.get(wsId);
+  if (!entry) return undefined;
+  if (entry.pingTimer) {
+    clearInterval(entry.pingTimer);
+    entry.pingTimer = null;
+  }
   activeWsTunnels.delete(wsId);
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.close(); } catch { /* ignore */ }
+  return entry;
+}
+
+function cleanupWsTunnel(wsId: string): void {
+  const entry = removeWsTunnelEntry(wsId);
+  if (entry && entry.ws.readyState === WebSocket.OPEN) {
+    try { entry.ws.close(); } catch { /* ignore */ }
   }
 }
 
@@ -327,21 +343,30 @@ function handlePreviewWsOpen(msg: PreviewWsOpenMessage, serverLink: ServerLink):
   const upstreamUrl = `ws://${LOOPBACK_HOST}:${msg.port}${sanitizedPath}`;
   logger.debug({ wsId, url: upstreamUrl }, 'Preview WS: connecting to upstream');
 
-  // Connect to upstream. Pass subprotocols if provided; strip Sec-WebSocket-Extensions
-  // (extension negotiation cannot be preserved end-to-end through a message-level relay).
+  // Connect to upstream. Forward sanitized request headers (including mapped cookie & custom headers),
+  // strip ws-managed handshake headers, rewrite origin to loopback, and keep alive with periodic ping.
   const protocols = Array.isArray(msg.protocols) && msg.protocols.length > 0 ? msg.protocols : undefined;
   const upstreamWs = new WebSocket(upstreamUrl, protocols, {
-    headers: { host: `${LOOPBACK_HOST}:${msg.port}` },
+    headers: buildUpstreamWsHeaders(msg.headers ?? {}, msg.port),
   });
 
   // Track before open fires, so WS_CLOSE from server during handshake is handled.
-  activeWsTunnels.set(wsId, upstreamWs);
+  const tunnelEntry: ActiveWsTunnel = { ws: upstreamWs, pingTimer: null };
+  activeWsTunnels.set(wsId, tunnelEntry);
 
   let opened = false;
+  let settled = false;
 
   upstreamWs.on('open', () => {
     opened = true;
+    settled = true;
     logger.debug({ wsId }, 'Preview WS: upstream connected');
+    tunnelEntry.pingTimer = setInterval(() => {
+      if (upstreamWs.readyState === WebSocket.OPEN) {
+        try { upstreamWs.ping(); } catch { /* ignore */ }
+      }
+    }, PREVIEW_LIMITS.WS_KEEPALIVE_MS);
+    tunnelEntry.pingTimer.unref?.();
     try {
       serverLink.send({
         type: PREVIEW_MSG.WS_OPENED,
@@ -355,15 +380,18 @@ function handlePreviewWsOpen(msg: PreviewWsOpenMessage, serverLink: ServerLink):
   });
 
   upstreamWs.on('unexpected-response', (_req, res) => {
-    if (opened) return;
-    const status = res.statusCode ?? 0;
+    if (opened || settled) return;
+    settled = true;
+    const rawStatus = res.statusCode ?? 0;
+    const status = rawStatus >= 400 && rawStatus <= 599 ? rawStatus : 502;
     const statusText = res.statusMessage ?? '';
+    try { res.resume?.(); } catch { /* ignore */ }
     const errMsg = statusText
       ? `upstream rejected: ${status} ${statusText}`
       : `upstream rejected: ${status}`;
     logger.warn({ wsId, status }, 'Preview WS: upstream rejected upgrade');
     cleanupWsTunnel(wsId);
-    sendWsError(serverLink, msg.wsId, errMsg);
+    sendWsError(serverLink, msg.wsId, errMsg, status);
   });
 
   upstreamWs.on('error', (err) => {
@@ -372,6 +400,8 @@ function handlePreviewWsOpen(msg: PreviewWsOpenMessage, serverLink: ServerLink):
       logger.warn({ wsId, err: err.message }, 'Preview WS: upstream error after open');
       return;
     }
+    if (settled) return;
+    settled = true;
     cleanupWsTunnel(wsId);
     sendWsError(serverLink, msg.wsId, `connection failed: ${err.message}`);
   });
@@ -393,7 +423,8 @@ function handlePreviewWsOpen(msg: PreviewWsOpenMessage, serverLink: ServerLink):
   upstreamWs.on('close', (code, reasonBuf) => {
     const reason = Buffer.isBuffer(reasonBuf) ? reasonBuf.toString('utf8') : String(reasonBuf ?? '');
     logger.debug({ wsId, code, reason }, 'Preview WS: upstream closed');
-    activeWsTunnels.delete(wsId);
+    removeWsTunnelEntry(wsId);
+    if (!opened && settled) return;
     try {
       serverLink.send({ type: PREVIEW_MSG.WS_CLOSE, wsId: msg.wsId, code, reason });
     } catch { /* ignore */ }
@@ -404,11 +435,10 @@ function handlePreviewWsOpen(msg: PreviewWsOpenMessage, serverLink: ServerLink):
 
 function handlePreviewWsCloseFromServer(msg: PreviewWsCloseMessage): void {
   const wsId = normalizeWsId(msg.wsId);
-  const ws = activeWsTunnels.get(wsId);
-  if (!ws) return;
-  activeWsTunnels.delete(wsId);
+  const entry = removeWsTunnelEntry(wsId);
+  if (!entry) return;
   try {
-    ws.close(msg.code, msg.reason);
+    entry.ws.close(msg.code, msg.reason);
   } catch { /* ignore */ }
 }
 
@@ -444,10 +474,9 @@ function handlePreviewWsDataFrame(data: Buffer, serverLink: ServerLink): boolean
 
   // Enforce message size limit from server → upstream direction.
   if (parsed.payload.length > PREVIEW_LIMITS.MAX_WS_MESSAGE_BYTES) {
-    const ws = activeWsTunnels.get(parsed.wsId);
-    if (ws) {
-      activeWsTunnels.delete(parsed.wsId);
-      try { ws.close(1009, 'Message Too Big'); } catch { /* ignore */ }
+    const entry = removeWsTunnelEntry(parsed.wsId);
+    if (entry) {
+      try { entry.ws.close(1009, 'Message Too Big'); } catch { /* ignore */ }
     }
     try {
       serverLink.send({ type: PREVIEW_MSG.WS_CLOSE, wsId: parsed.wsId, code: 1009, reason: 'Message Too Big' });
@@ -455,7 +484,7 @@ function handlePreviewWsDataFrame(data: Buffer, serverLink: ServerLink): boolean
     return true;
   }
 
-  const upstreamWs = activeWsTunnels.get(parsed.wsId);
+  const upstreamWs = activeWsTunnels.get(parsed.wsId)?.ws;
   if (!upstreamWs) return true; // tunnel already closed — silently discard
 
   if (upstreamWs.readyState !== WebSocket.OPEN) return true;

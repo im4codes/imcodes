@@ -286,19 +286,79 @@ describe('local web preview runtime — EventSource patch (behavioral)', () => {
     expect(ESClass.CLOSED).toBe(2);
   });
 
-  it('leaves a non-string URL arg untouched (documented known limitation, no throw)', () => {
-    const { ESClass, lastES } = runPatchedRuntime();
-    const urlObj = new URL(`http://127.0.0.1:${PREVIEW_PORT}/events`);
+  it('rewrites a URL object arg in EventSource(new URL(...)) while leaving external URL objects untouched', () => {
+    const { ESClass, lastES } = runPatchedRuntime({ accessToken: 'tok123' });
+    const urlObj = new URL(`http://127.0.0.1:${PREVIEW_PORT}/events?stream=1`);
     expect(() => new ESClass(urlObj)).not.toThrow();
-    // The URL object is forwarded as-is (not reliably rewritten) — known limit.
-    expect(lastES()!.url).toBe(urlObj);
+    expect(lastES()!.url).toBe(`${PREFIX}/events?stream=1&preview_access_token=tok123`);
+
+    const sameOriginObj = new URL('https://im.codes/sse');
+    new ESClass(sameOriginObj);
+    expect(lastES()!.url).toBe(`${PREFIX}/sse?preview_access_token=tok123`);
+
+    const externalObj = new URL('https://api.example.com/events');
+    new ESClass(externalObj);
+    expect(lastES()!.url).toBe(externalObj);
   });
 
-  it('does not regress the WebSocket patch (absolute loopback ws still rewritten)', () => {
-    const { WSClass, lastWsUrl } = runPatchedRuntime({ accessToken: 'tok123' });
+  it('keeps EventSource & fetch rewriting idempotent when URL already has PREFIX or preview_access_token', () => {
+    const { ESClass, lastES, win } = runPatchedRuntime({ accessToken: 'tok123' });
+    new ESClass(`https://im.codes${PREFIX}/events`);
+    expect(lastES()!.url).toBe(`${PREFIX}/events?preview_access_token=tok123`);
+
+    new ESClass(`${PREFIX}/events?preview_access_token=existing`);
+    expect(lastES()!.url).toBe(`${PREFIX}/events?preview_access_token=existing`);
+
+    // Verify fetch(new URL(...)) also rewrites cleanly (e.g. POST SSE fetch()).
+    const capturedFetch: Array<unknown> = [];
+    // Re-run with custom fetch spy captured before patch installs:
+    void win;
+    const html = rewritePreviewHtmlDocument('<html><head></head><body></body></html>', SERVER_ID, PREVIEW_ID, PREVIEW_PORT, 'tok123');
+    const iifeMatch = html.match(/<script data-imcodes-preview-runtime>([\s\S]*?)<\/script>/);
+    const fetchWin: any = {
+      location: { href: `https://im.codes${PREFIX}/`, origin: 'https://im.codes', protocol: 'https:', host: 'im.codes' },
+      fetch: (input: unknown) => { capturedFetch.push(input); },
+      EventSource: undefined,
+      WebSocket: undefined,
+      open: undefined,
+      Location: undefined,
+      document: { addEventListener: () => {} },
+      Request: class {},
+      URL,
+      URLSearchParams,
+    };
+    const xhrStub: any = function () {};
+    xhrStub.prototype = { open: function () {} };
+    // eslint-disable-next-line no-new-func
+    new Function('window', 'document', 'history', 'XMLHttpRequest', 'URL', 'URLSearchParams', 'Request', iifeMatch![1])(
+      fetchWin, fetchWin.document, { pushState: () => {}, replaceState: () => {} }, xhrStub, URL, URLSearchParams, fetchWin.Request,
+    );
+    fetchWin.fetch(new URL(`http://127.0.0.1:${PREVIEW_PORT}/api/chat`));
+    expect(capturedFetch[0]).toBe(`${PREFIX}/api/chat?preview_access_token=tok123`);
+  });
+
+  it('rewrites same-origin WebSocket, relative "ws/chat", URL object, and idempotent reconnect URLs', () => {
+    const { WSClass, lastWsUrl } = runPatchedRuntime({ accessToken: 'tok123', locationHref: `https://im.codes${PREFIX}/sub/` });
     new WSClass(`ws://127.0.0.1:${PREVIEW_PORT}/hmr`);
-    const url = lastWsUrl() as string;
-    expect(url).toContain(`im.codes${PREFIX}/hmr`);
-    expect(url).toContain('preview_access_token=tok123');
+    expect(lastWsUrl()).toBe(`wss://im.codes${PREFIX}/hmr?preview_access_token=tok123`);
+
+    new WSClass('wss://im.codes/ws');
+    expect(lastWsUrl()).toBe(`wss://im.codes${PREFIX}/ws?preview_access_token=tok123`);
+
+    new WSClass('ws/chat');
+    expect(lastWsUrl()).toBe(`wss://im.codes${PREFIX}/sub/ws/chat?preview_access_token=tok123`);
+
+    new WSClass(new URL('wss://im.codes/hmr?v=2'));
+    expect(lastWsUrl()).toBe(`wss://im.codes${PREFIX}/hmr?v=2&preview_access_token=tok123`);
+
+    const reconnect = `wss://im.codes${PREFIX}/ws?preview_access_token=tok123`;
+    new WSClass(reconnect);
+    expect(lastWsUrl()).toBe(reconnect);
+
+    // Non-matching boundaries stay untouched.
+    new WSClass('wss://echo.websocket.org/ws');
+    expect(lastWsUrl()).toBe('wss://echo.websocket.org/ws');
+    new WSClass(`ws://127.0.0.1:${PREVIEW_PORT + 1}/ws`);
+    expect(lastWsUrl()).toBe(`ws://127.0.0.1:${PREVIEW_PORT + 1}/ws`);
   });
 });

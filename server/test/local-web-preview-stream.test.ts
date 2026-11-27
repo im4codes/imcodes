@@ -333,4 +333,54 @@ describe('V-stream-bytes / V-buffer-cap', () => {
     });
     expect(aborted).toBe(false);
   });
+
+  it('wrapSseKeepaliveStream emits ": keepalive\\n\\n" when silent without dropping delayed data or leaking timers', async () => {
+    const { wrapSseKeepaliveStream } = await import('../src/routes/local-web-preview.js');
+    vi.useFakeTimers();
+
+    let upstreamCtrl!: ReadableStreamDefaultController<Uint8Array>;
+    let cancelled = false;
+    const upstream = new ReadableStream<Uint8Array>({
+      start(c) { upstreamCtrl = c; },
+      cancel() { cancelled = true; },
+    });
+
+    const wrapped = wrapSseKeepaliveStream(upstream, 500);
+    const reader = wrapped.getReader();
+
+    // Consumer awaits first chunk while upstream is silent > 500ms → emits keepalive comment.
+    const r1Promise = reader.read();
+    await vi.advanceTimersByTimeAsync(500);
+    const r1 = await r1Promise;
+    expect(r1.done).toBe(false);
+    expect(Buffer.from(r1.value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+
+    // Consumer issues second read while upstream stays silent 300ms, then emits real SSE event.
+    // The in-flight read MUST preserve the real event without losing or duplicating it!
+    const r2Promise = reader.read();
+    await vi.advanceTimersByTimeAsync(300);
+    upstreamCtrl.enqueue(Buffer.from('data: hello\n\n', 'utf8'));
+    const r2 = await r2Promise;
+    expect(r2.done).toBe(false);
+    expect(Buffer.from(r2.value ?? []).toString('utf8')).toBe('data: hello\n\n');
+
+    // Another 500ms silence -> second keepalive comment.
+    const r3Promise = reader.read();
+    await vi.advanceTimersByTimeAsync(500);
+    const r3 = await r3Promise;
+    expect(Buffer.from(r3.value ?? []).toString('utf8')).toBe(': keepalive\n\n');
+
+    // Also test real chunk arriving right AFTER timer resolved pull() (between pulls):
+    // must still be delivered intact on the subsequent read!
+    upstreamCtrl.enqueue(Buffer.from('data: trailing\n\n', 'utf8'));
+    const r4 = await reader.read();
+    expect(Buffer.from(r4.value ?? []).toString('utf8')).toBe('data: trailing\n\n');
+
+    // Cancelling propagates cleanly to upstream and cleans timers.
+    const cancelRead = reader.read();
+    await reader.cancel('client gone');
+    await expect(cancelRead).resolves.toMatchObject({ done: true });
+    expect(cancelled).toBe(true);
+    await vi.advanceTimersByTimeAsync(5000);
+  });
 });

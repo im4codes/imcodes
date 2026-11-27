@@ -395,4 +395,76 @@ describe('local web preview routes', () => {
     expect(html).not.toContain('alert(1)');
     expect(html).toContain('var ACCESS_TOKEN=null;');
   });
+
+  it('sets X-Accel-Buffering: no and Cache-Control: no-cache, no-transform on text/event-stream responses when unset, preserving Last-Event-ID and POST SSE', async () => {
+    const daemon = new MockDaemonWs();
+    WsBridge.get(serverId).handleDaemonConnection(daemon as never, db as never, makeEnv(db) as never);
+    daemon.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId, token: 'daemon-token' })), false);
+    await new Promise((r) => setTimeout(r, 5));
+
+    const createRes = await app.request(`/api/server/${serverId}/local-web-preview`, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer deck_test_key', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ port: 3000, path: '/' }),
+    });
+    const created = await createRes.json() as { preview: { id: string; accessToken: string } };
+
+    daemon.autoRespond = false;
+    const recordedRequests: Array<Record<string, unknown>> = [];
+    let mockRespHeaders: Record<string, string> = { 'content-type': 'text/event-stream; charset=utf-8' };
+    const origSend = daemon.send.bind(daemon);
+    daemon.send = (data: string | Buffer, optsOrCb?: unknown, callback?: (err?: Error) => void) => {
+      origSend(data, optsOrCb, callback);
+      if (typeof data === 'string') {
+        const msg = JSON.parse(data) as Record<string, unknown>;
+        if (msg.type === PREVIEW_MSG.REQUEST) recordedRequests.push(msg);
+        if (msg.type === PREVIEW_MSG.REQUEST_END && typeof msg.requestId === 'string') {
+          const requestId = msg.requestId;
+          const headersSnapshot = { ...mockRespHeaders };
+          queueMicrotask(() => {
+            daemon.emit('message', Buffer.from(JSON.stringify({
+              type: PREVIEW_MSG.RESPONSE_START,
+              requestId,
+              status: 200,
+              headers: headersSnapshot,
+            })), false);
+            daemon.emit('message', packPreviewBinaryFrame(PREVIEW_BINARY_FRAME.RESPONSE_BODY, requestId, Buffer.from('id: 43\ndata: ok\n\n')), true);
+            daemon.emit('message', Buffer.from(JSON.stringify({ type: PREVIEW_MSG.RESPONSE_END, requestId })), false);
+          });
+        }
+      }
+    };
+
+    const sseRes = await app.request(
+      `/api/server/${serverId}/local-web/${created.preview.id}/chat?${PREVIEW_ACCESS_TOKEN_QUERY_PARAM}=${created.preview.accessToken}`,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'last-event-id': '42',
+          accept: 'text/event-stream',
+        },
+        body: JSON.stringify({ prompt: 'hi' }),
+      },
+    );
+    expect(sseRes.status).toBe(200);
+    expect(sseRes.headers.get('x-accel-buffering')).toBe('no');
+    expect(sseRes.headers.get('cache-control')).toBe('no-cache, no-transform');
+    expect(await sseRes.text()).toBe('id: 43\ndata: ok\n\n');
+    expect(recordedRequests[0]?.headers).toMatchObject({ 'last-event-id': '42' });
+
+    // When upstream explicitly sets Cache-Control / X-Accel-Buffering, preserve them without overwriting.
+    mockRespHeaders = {
+      'content-type': 'text/event-stream',
+      'cache-control': 'private, no-cache',
+      'x-accel-buffering': 'yes',
+    };
+    const ssePreserved = await app.request(
+      `/api/server/${serverId}/local-web/${created.preview.id}/events?${PREVIEW_ACCESS_TOKEN_QUERY_PARAM}=${created.preview.accessToken}`,
+      { method: 'GET' },
+    );
+    expect(ssePreserved.status).toBe(200);
+    expect(ssePreserved.headers.get('cache-control')).toBe('private, no-cache');
+    expect(ssePreserved.headers.get('x-accel-buffering')).toBe('yes');
+  });
 });

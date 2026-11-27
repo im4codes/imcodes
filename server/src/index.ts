@@ -39,7 +39,7 @@ import { promisify } from 'node:util';
 import { gzip as gzipCallback } from 'node:zlib';
 
 const gzipAsync = promisify(gzipCallback);
-import type { IncomingMessage } from 'node:http';
+import { STATUS_CODES, type IncomingMessage } from 'node:http';
 
 import { loadEnv, type Env, type EnvConfig } from './env.js';
 import { createDatabase, type Database } from './db/client.js';
@@ -737,6 +737,9 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
     }
   });
 
+  // Registered BEFORE `/api` sub-routers whose wildcard `.use('/*')` middleware sets
+  // `Cache-Control: no-store` so proxied HTML/JS/CSS/SSE keep upstream / SSE Cache-Control headers.
+  app.route('/api/server', localWebPreviewRoutes);
   app.route('/api/auth', authRoutes);
   app.route('/api/auth/github', githubAuthRoutes);
   app.route('/api/auth/google', googleAuthRoutes);
@@ -785,11 +788,10 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.route('/api', memoryRoutes);
   app.route('/api', agentSkillsRoutes);
   app.route('/api', agentMcpRoutes);
-  // fileTransferRoutes MUST be first — its token-auth middleware bypasses requireAuth
-  // for iOS downloads (SFSafariViewController has no cookies/Bearer). If mounted after
-  // sessionMgmtRoutes (which has blanket requireAuth on /*), the token path is shadowed.
+  // fileTransferRoutes MUST be first among remaining `/api/server` routers — its
+  // token-auth middleware bypasses requireAuth for iOS downloads (SFSafariViewController
+  // has no cookies/Bearer).
   app.route('/api/server', fileTransferRoutes);
-  app.route('/api/server', localWebPreviewRoutes);
   app.route('/api/server', sessionMgmtRoutes);
   app.route('/api/server', subSessionRoutes);
   app.route('/api/server', discussionRoutes);
@@ -1356,6 +1358,15 @@ async function handlePreviewWsUpgrade(
         resolve(null);
       }
     }),
+    rejectUpgrade: (status) => {
+      if (socket.destroyed || !socket.writable) return;
+      const safeStatus = Number.isInteger(status) && status >= 400 && status <= 599 ? status : 502;
+      const statusText = STATUS_CODES[safeStatus] ?? 'Bad Gateway';
+      try {
+        socket.write(`HTTP/1.1 ${safeStatus} ${statusText}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+      } catch { /* ignore */ }
+      try { socket.destroy(); } catch { /* ignore */ }
+    },
   });
 }
 

@@ -566,4 +566,141 @@ describe('E2E: Local Web Preview streaming protocols (real upstreams, real daemo
       && m.reason === types.PREVIEW_ERROR.LIMIT_EXCEEDED,
     )).toBe(true);
   });
+
+  // ── 7. Deferred WS upgrade preserves initial greeting & forwards sanitized headers ─
+  it('delivers initial upstream greeting across deferred WS upgrade and forwards sanitized cookie + rewritten origin', async () => {
+    const receivedHeaders: Array<Record<string, string | string[] | undefined>> = [];
+    const wss = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await new Promise<void>((resolve) => wss.on('listening', () => resolve()));
+    wss.on('connection', (ws, req) => {
+      receivedHeaders.push(req.headers as Record<string, string | string[] | undefined>);
+      ws.send(JSON.stringify({ type: 'welcome', seq: 1 }));
+    });
+    const wsPort = (wss.address() as AddressInfo).port;
+    cleanups.push(() => new Promise<void>((res) => wss.close(() => res())));
+
+    const { bridge, previewId, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+
+    const wsId = 'e'.repeat(32);
+    const browserWs = new MockBrowserWs();
+    cleanups.push(() => { try { browserWs.close(); } catch { /* ignore */ } });
+
+    bridge.beginPreviewWsTunnel({
+      wsId,
+      previewId,
+      port: wsPort,
+      path: '/ws',
+      headers: { cookie: 'auth=yes', origin: 'https://public.imcodes.example', 'x-client': 'vite' },
+      protocols: [],
+      completeUpgrade: async () => {
+        // Deliberately delay upgrade by 25ms so upstream's greeting arrives BEFORE browserWs adopts.
+        await new Promise((r) => setTimeout(r, 25));
+        return browserWs as never;
+      },
+    });
+
+    await waitFor(() => browserWs.sentText.some((s) => s.includes('"welcome"')), 10_000, 'welcome greeting');
+    expect(receivedHeaders[0]?.cookie).toBe('auth=yes');
+    expect(receivedHeaders[0]?.['x-client']).toBe('vite');
+    expect(receivedHeaders[0]?.origin).toBe(`http://127.0.0.1:${wsPort}`);
+  });
+
+  // ── 8. Real upstream 401 HTTP rejection on WS invokes rejectUpgrade(401) ──────
+  it('invokes rejectUpgrade with upstream 401 status when upstream rejects WS handshake', async () => {
+    const upstream = await startHttpUpstream((_req, res) => {
+      res.writeHead(401, 'Unauthorized').end('auth required');
+    });
+    cleanups.push(() => upstream.close());
+
+    const { bridge, previewId, WsBridge } = await setup();
+    cleanups.push(() => WsBridge.getAll().clear());
+
+    const wsId = 'f'.repeat(32);
+    const completeUpgrade = vi.fn(async () => new MockBrowserWs() as never);
+    let rejectedStatus: number | undefined;
+    bridge.beginPreviewWsTunnel({
+      wsId,
+      previewId,
+      port: upstream.port,
+      path: '/ws',
+      headers: {},
+      protocols: [],
+      completeUpgrade,
+      rejectUpgrade: (status) => { rejectedStatus = status; },
+    });
+
+    await waitFor(() => rejectedStatus !== undefined, 10_000, 'rejectUpgrade status');
+    expect(rejectedStatus).toBe(401);
+    expect(completeUpgrade).not.toHaveBeenCalled();
+  });
+
+  // ── 9. Real POST fetch() SSE + Last-Event-ID end-to-end ───────────────────────
+  it('relays POST fetch() SSE stream and Last-Event-ID header end-to-end', async () => {
+    let seenMethod = '';
+    let seenLastEventId = '';
+    let seenBody = '';
+    const upstream = await startHttpUpstream(async (req, res) => {
+      seenMethod = req.method ?? '';
+      seenLastEventId = String(req.headers['last-event-id'] ?? '');
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(Buffer.from(c));
+      seenBody = Buffer.concat(chunks).toString('utf8');
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write('id: 99\ndata: {"token":"hello"}\n\n');
+      res.end();
+    });
+    cleanups.push(() => upstream.close());
+
+    const { bridge, previewId, types, relay, fakeServerLink, WsBridge } = await (async () => {
+      vi.resetModules();
+      const [bridgeMod, relayMod, typesMod] = await Promise.all([
+        import('../../server/src/ws/bridge.js'),
+        import('../../src/daemon/preview-relay.js'),
+        import('../../shared/preview-types.js'),
+      ]);
+      const srvId = `preview-e2e-post-${Math.random().toString(36).slice(2)}`;
+      const pid = 'preview-' + 'd'.repeat(16);
+      const b = bridgeMod.WsBridge.get(srvId);
+      const link = new DaemonLink();
+      const sLink = {
+        send: (obj: Record<string, unknown>) => { link.emit('message', Buffer.from(JSON.stringify(obj)), false); },
+        sendBinary: (buf: Uint8Array) => { link.emit('message', Buffer.from(buf), true); },
+      };
+      link.route = (data: string | Buffer) => {
+        if (typeof data === 'string') relayMod.handlePreviewCommand(JSON.parse(data), sLink as never);
+        else if (Buffer.isBuffer(data)) relayMod.handlePreviewBinaryFrame(data, sLink as never);
+      };
+      b.handleDaemonConnection(link as never, makeDb(), {} as never);
+      link.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId: srvId, token: 't' })), false);
+      await flushAsync();
+      return { bridge: b, previewId: pid, types: typesMod, relay: relayMod, fakeServerLink: sLink, WsBridge: bridgeMod.WsBridge };
+    })();
+    cleanups.push(() => WsBridge.getAll().clear());
+
+    const requestId = 'post-sse-1';
+    const r = bridge.createPreviewRelay(requestId, previewId, 10_000);
+    relay.handlePreviewCommand({
+      type: types.PREVIEW_MSG.REQUEST,
+      requestId,
+      previewId,
+      port: upstream.port,
+      method: 'POST',
+      path: '/api/chat',
+      headers: { 'content-type': 'application/json', 'last-event-id': '98' },
+      hasBody: true,
+    } as Record<string, unknown>, fakeServerLink as never);
+    relay.handlePreviewBinaryFrame(
+      types.packPreviewBinaryFrame(types.PREVIEW_BINARY_FRAME.REQUEST_BODY, requestId, Buffer.from('{"q":"hi"}')),
+      fakeServerLink as never,
+    );
+    relay.handlePreviewCommand({ type: types.PREVIEW_MSG.REQUEST_END, requestId } as Record<string, unknown>, fakeServerLink as never);
+
+    const started = await r.start;
+    const text = await new Response(started.body).text();
+    expect(seenMethod).toBe('POST');
+    expect(seenLastEventId).toBe('98');
+    expect(seenBody).toBe('{"q":"hi"}');
+    expect(text).toBe('id: 99\ndata: {"token":"hello"}\n\n');
+  });
 });

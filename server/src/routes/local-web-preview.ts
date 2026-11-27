@@ -26,10 +26,85 @@ import {
   type CreatePreviewRequest,
 } from '../../../shared/preview-types.js';
 import { WsBridge } from '../ws/bridge.js';
+import { isSseResponse } from '../../../shared/preview-stream-policy.js';
 import { randomHex } from '../security/crypto.js';
 import logger from '../util/logger.js';
 import { z } from 'zod';
 import { COOKIE_PREVIEW_ACCESS } from '../../../shared/cookie-names.js';
+
+/**
+ * Wrap an upstream SSE `ReadableStream` to emit `: keepalive\n\n` comment frames
+ * when no upstream chunk arrives within `keepaliveMs` while the consumer is pulling.
+ * Strictly pull-driven (`Promise.race` over one single `reader.read()`) so
+ * downstream backpressure and upstream abort/error/close propagation are preserved 1:1.
+ */
+export function wrapSseKeepaliveStream(
+  body: ReadableStream<Uint8Array>,
+  keepaliveMs: number = PREVIEW_LIMITS.SSE_KEEPALIVE_MS,
+): ReadableStream<Uint8Array> {
+  const reader = body.getReader();
+  const keepaliveChunk = Buffer.from(': keepalive\n\n', 'utf8');
+  type ReadOutcome =
+    | { ok: true; res: Awaited<ReturnType<typeof reader.read>> }
+    | { ok: false; err: unknown };
+  let pendingRead: Promise<ReadOutcome> | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let closed = false;
+
+  const clearKeepaliveTimer = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  const ensureRead = (): Promise<ReadOutcome> => {
+    if (!pendingRead) {
+      pendingRead = reader.read().then(
+        (res) => ({ ok: true as const, res }),
+        (err) => ({ ok: false as const, err }),
+      );
+    }
+    return pendingRead;
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      if (closed) return;
+      const readPromise = ensureRead();
+      const timerPromise = new Promise<'keepalive'>((res) => {
+        clearKeepaliveTimer();
+        timer = setTimeout(() => res('keepalive'), keepaliveMs);
+        timer.unref?.();
+      });
+      const winner = await Promise.race([readPromise, timerPromise]);
+      clearKeepaliveTimer();
+      if (closed) return;
+      if (winner === 'keepalive') {
+        // Leave pendingRead intact so the next pull awaits the same in-flight read without losing data.
+        controller.enqueue(keepaliveChunk);
+        return;
+      }
+      pendingRead = null;
+      if (!winner.ok) {
+        closed = true;
+        controller.error(winner.err);
+        return;
+      }
+      if (winner.res.done) {
+        closed = true;
+        controller.close();
+        return;
+      }
+      controller.enqueue(winner.res.value);
+    },
+    cancel(reason) {
+      closed = true;
+      clearKeepaliveTimer();
+      return reader.cancel(reason);
+    },
+  });
+}
 
 export const localWebPreviewRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
 
@@ -316,7 +391,18 @@ localWebPreviewRoutes.all('/:id/local-web/:previewId/*', async (c) => {
       });
     }
 
-    return new Response(started.body, {
+    const sse = isSseResponse(responseHeaders);
+    if (sse) {
+      if (!responseHeaders.has('x-accel-buffering')) {
+        responseHeaders.set('x-accel-buffering', 'no');
+      }
+      if (!responseHeaders.has('cache-control')) {
+        responseHeaders.set('cache-control', 'no-cache, no-transform');
+      }
+    }
+
+    const responseBody = sse ? wrapSseKeepaliveStream(started.body) : started.body;
+    return new Response(responseBody, {
       status: started.status,
       statusText: started.statusText,
       headers: responseHeaders,
