@@ -15506,4 +15506,281 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     expect(evt.defaultPrevented).toBe(false);
     expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull();
   }, 15_000);
+
+  it('returns from Dashboard to A / incognito B / C by original slot without cache renumbering, keeps incognito out of storage/URL, and refuses to pick replacement when target disappears', async () => {
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+
+    const sessionA = { name: 'deck_alpha_brain', project: 'alpha', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' };
+    const sessionBIncog = { name: 'deck_incog_mid_brain', project: 'incog-mid', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', incognito: true };
+    const sessionC = { name: 'deck_gamma_brain', project: 'gamma', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle' };
+
+    try {
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') {
+          return {
+            servers: [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() }],
+          };
+        }
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [
+              { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+              { name: 'deck_gamma_brain', project_name: 'gamma', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+            ],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(1));
+      const ws1 = wsInstances[wsInstances.length - 1]!;
+      ws1.connected = true;
+      await act(async () => {
+        ws1.emit({ type: 'session.event', event: 'connected' });
+        ws1.emit({ type: 'session_list', sessions: [sessionA, sessionBIncog, sessionC] });
+      });
+
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_incog_mid_brain')).toBeTruthy());
+      // Persistent cache drops incognito B, retaining only [A, C]
+      expect(readCachedServerSessions('srv-1').map((s) => s.name)).toEqual(['deck_alpha_brain', 'deck_gamma_brain']);
+
+      // 1. Go to Dashboard -> Alt+2 selects incognito B (slot 2), NOT cached slot 2 (C)
+      fireEvent.click(screen.getByText('server-home'));
+      await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
+
+      const alt2ToIncog = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(alt2ToIncog);
+      expect(alt2ToIncog.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+      const ws2 = wsInstances[wsInstances.length - 1]!;
+      ws2.connected = true;
+      await act(async () => {
+        ws2.emit({ type: 'session.event', event: 'connected' });
+        ws2.emit({ type: 'session_list', sessions: [sessionA, sessionBIncog, sessionC] });
+      });
+
+      await waitFor(() => {
+        expect(screen.getByTestId('session-pane-deck_incog_mid_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('false');
+      });
+      // Incognito active tab must never leak into URL hash, tab route, or localStorage
+      expect(window.location.hash).toBe('#/srv-1');
+      expect(localStorage.getItem('rcc_session')).toBeNull();
+      expect(JSON.stringify({ ...localStorage })).not.toContain('deck_incog_mid_brain');
+      expect(JSON.parse(sessionStorage.getItem('rcc_tab_route_v1')!).sessionName).toBeNull();
+
+      // 2. Return to Dashboard -> Alt+3 switches cleanly to C
+      fireEvent.click(screen.getByText('server-home'));
+      await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
+
+      const alt3ToC = new KeyboardEvent('keydown', { key: '£', code: 'Digit3', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(alt3ToC);
+      expect(alt3ToC.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(3));
+      const ws3 = wsInstances[wsInstances.length - 1]!;
+      ws3.connected = true;
+      await act(async () => {
+        ws3.emit({ type: 'session.event', event: 'connected' });
+        ws3.emit({ type: 'session_list', sessions: [sessionA, sessionBIncog, sessionC] });
+      });
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
+
+      // 3. Switch to A first, go to Dashboard, then B disappears on srv-1 while C shifts to index 2:
+      // pressing Alt+2 (formerly B) must NOT switch to C!
+      fireEvent.click(within(screen.getByTestId('app-shell-session-tabs')).getByText('tabs-select-deck_alpha_brain'));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+      fireEvent.click(screen.getByText('server-home'));
+      await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
+
+      const alt2MissingIncog = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(alt2MissingIncog);
+      expect(alt2MissingIncog.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(4));
+      const ws4 = wsInstances[wsInstances.length - 1]!;
+      ws4.connected = true;
+      await act(async () => {
+        ws4.emit({ type: 'session.event', event: 'connected' });
+        ws4.emit({ type: 'session_list', sessions: [sessionA, sessionC] });
+      });
+      await waitFor(() => {
+        expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
+        expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('false');
+      });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 20_000);
+
+  it('never persists a single incognito tab name across Dashboard round-trip via Alt+1', async () => {
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
+
+    const soloIncog = { name: 'deck_solo_incog_brain', project: 'solo-incog', role: 'brain', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', incognito: true };
+
+    try {
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') {
+          return { servers: [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() }] };
+        }
+        if (path === '/api/server/srv-1/sessions') {
+          return { sessions: [] };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(1));
+      const ws1 = wsInstances[wsInstances.length - 1]!;
+      ws1.connected = true;
+      await act(async () => {
+        ws1.emit({ type: 'session.event', event: 'connected' });
+        ws1.emit({ type: 'session_list', sessions: [soloIncog] });
+      });
+
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_solo_incog_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(readCachedServerSessions('srv-1')).toEqual([]);
+      expect(window.location.hash).toBe('#/srv-1');
+
+      // Leave to Dashboard and press Alt+1
+      fireEvent.click(screen.getByText('server-home'));
+      await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
+
+      const alt1SoloIncog = new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(alt1SoloIncog);
+      expect(alt1SoloIncog.defaultPrevented).toBe(true);
+
+      await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
+      const ws2 = wsInstances[wsInstances.length - 1]!;
+      ws2.connected = true;
+      await act(async () => {
+        ws2.emit({ type: 'session.event', event: 'connected' });
+        ws2.emit({ type: 'session_list', sessions: [soloIncog] });
+      });
+
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_solo_incog_brain').getAttribute('data-is-active')).toBe('true'));
+      expect(localStorage.getItem('rcc_session')).toBeNull();
+      expect(JSON.stringify({ ...localStorage })).not.toContain('deck_solo_incog_brain');
+      expect(JSON.parse(sessionStorage.getItem('rcc_tab_route_v1')!).sessionName).toBeNull();
+      expect(window.location.hash).toBe('#/srv-1');
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15_000);
+
+  it('keeps Ctrl+1, Ctrl+Shift+1, and tab navigation guarded when Task Mode overlays a PTY terminal tab while allowing Alt+2 to exit and switch tabs', async () => {
+    useSubSessionsState.subSessions = [
+      {
+        id: 'sub-tm-pty',
+        serverId: 'srv-1',
+        sessionName: 'deck_sub_tm_pty',
+        parentSession: 'deck_alpha_brain',
+        type: 'claude-code-sdk',
+        runtimeType: 'transport',
+        label: 'TM Sub',
+        state: 'idle',
+      },
+    ];
+    useSubSessionsState.visibleSubSessions = useSubSessionsState.subSessions;
+
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, 'platform', { configurable: true, value: 'Win32' });
+
+    try {
+      apiFetchMock.mockImplementation(async (path: string) => {
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') {
+          return { servers: [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() }] };
+        }
+        if (path === '/api/server/srv-1/sessions') {
+          return {
+            sessions: [
+              // Desktop PTY main session -> viewMode defaults to 'terminal'
+              { name: 'deck_alpha_brain', project_name: 'alpha', role: 'brain', agent_type: 'claude-code', runtime_type: 'process', state: 'idle' },
+              { name: 'deck_beta_brain', project_name: 'beta', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', state: 'idle' },
+            ],
+          };
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      render(<App />);
+
+      const alphaPane = await screen.findByTestId('session-pane-deck_alpha_brain');
+      await waitFor(() => expect(alphaPane.getAttribute('data-is-active')).toBe('true'));
+
+      // Set up task-pair snapshot so Ctrl+Shift+1 would trigger if unguarded
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+        authoritative: true,
+        serverId: 'srv-1',
+        tasks: [
+          { taskId: 'task-pty-1', title: 'PTY Pair', status: 'working', updatedAt: 10, pair: { status: 'working', executor: 'deck_sub_tm_pty', auditor: 'deck_sub_tm_pty' } },
+        ],
+      };
+
+      // Open real Task Mode overlay over PTY terminal tab & move focus onto an overlay button
+      fireEvent.click(await screen.findByTestId('desktop-task-mode-btn'));
+      const overlay = await screen.findByTestId('global-task-mode-overlay');
+      const overlayFocusable = document.createElement('button');
+      overlayFocusable.textContent = 'tm-focus-item';
+      overlay.appendChild(overlayFocusable);
+      overlayFocusable.focus();
+      expect(document.activeElement).toBe(overlayFocusable);
+
+      // Ctrl+1, Ctrl+Shift+1, and Alt+l MUST stay blocked by the underlying PTY terminal viewMode guard
+      const ctrl1Evt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
+      overlayFocusable.dispatchEvent(ctrl1Evt);
+      expect(ctrl1Evt.defaultPrevented).toBe(false);
+      expect(screen.queryByTestId('sub-session-window-sub-tm-pty')).toBeNull();
+
+      const ctrlShift1Evt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
+      overlayFocusable.dispatchEvent(ctrlShift1Evt);
+      expect(ctrlShift1Evt.defaultPrevented).toBe(false);
+      expect(screen.queryByTestId('sub-session-window-sub-tm-pty')).toBeNull();
+
+      const altLEvt = new KeyboardEvent('keydown', { key: 'l', code: 'KeyL', altKey: true, bubbles: true, cancelable: true });
+      overlayFocusable.dispatchEvent(altLEvt);
+      expect(altLEvt.defaultPrevented).toBe(false);
+      expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('false');
+      expect(localStorage.getItem('rcc_session')).toBe('deck_alpha_brain');
+      expect(window.location.hash).toBe('#/srv-1/deck_alpha_brain');
+      expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy();
+
+      // Alt+2 (mainTabMatch) still exits Task Mode cleanly and switches to tab #2
+      const alt2ExitEvt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      overlayFocusable.dispatchEvent(alt2ExitEvt);
+      expect(alt2ExitEvt.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
+        expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+      });
+    } finally {
+      Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
+    }
+  }, 15_000);
 });
