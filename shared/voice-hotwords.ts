@@ -11,9 +11,11 @@ export const VOICE_HOTWORDS_MAX_ALIASES = 60;
 export const VOICE_HOTWORDS_API_PATH = '/api/voice-hotwords' as const;
 export const VOICE_HOTWORDS_PREF_KEY = 'voice_hotwords_v1' as const;
 export const VOICE_HOTWORDS_MAX_RAW_CHARS = 8192;
+export const VOICE_HOTWORDS_MAX_ENTRIES = 200;
 export const VOICE_HOTWORDS_MAX_PROJECT_KEY_CHARS = 256;
 export const VOICE_HOTWORDS_MAX_PROJECTS = 100;
 export const VOICE_HOTWORDS_MAX_STORAGE_BYTES = 60 * 1024;
+export const VOICE_HOTWORDS_MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
 
 export const VOICE_HOTWORDS_MCP_TOOLS = Object.freeze({
   GET: 'voice_hotwords_get',
@@ -61,6 +63,15 @@ export interface VoiceHotwordsSharePatch {
 }
 
 export interface VoiceHotwordsPutRequest {
+  scope?: 'user' | 'project' | 'share' | 'sync';
+  raw?: string;
+  entries?: string[];
+  mode?: 'replace' | 'merge';
+  clientUpdatedAt?: number;
+  projectKey?: string;
+  serverId?: string;
+  projectName?: string;
+  enabled?: boolean;
   user?: VoiceHotwordsScopePatch;
   project?: VoiceHotwordsProjectPatch;
   projects?: Record<string, VoiceHotwordsScopePatch>;
@@ -71,11 +82,15 @@ export interface VoiceHotwordsGetResponse {
   record: VoiceHotwordsSyncRecord;
   projectKey?: string;
   project?: VoiceHotwordsScopeState;
+  compiled?: CompiledVoiceHotwords;
 }
 
 export interface VoiceHotwordsPutResponse {
   ok: true;
   record: VoiceHotwordsSyncRecord;
+  projectKey?: string;
+  project?: VoiceHotwordsScopeState;
+  compiled?: CompiledVoiceHotwords;
 }
 
 export interface VoiceHotwordProjectRef {
@@ -809,11 +824,50 @@ export function mergeVoiceHotwordRawText(
   return out.join('\n');
 }
 
+export function createNullProtoDict<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+export function hasOwnDictKey(obj: unknown, key: string): boolean {
+  return Boolean(obj && typeof obj === 'object' && Object.prototype.hasOwnProperty.call(obj, key));
+}
+
+export function getOwnDictValue<T>(obj: Record<string, T> | null | undefined, key: string): T | undefined {
+  return hasOwnDictKey(obj, key) ? obj![key] : undefined;
+}
+
+export function setOwnDictValue<T>(obj: Record<string, T>, key: string, value: T): void {
+  Object.defineProperty(obj, key, {
+    value,
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
+}
+
+export function deleteOwnDictKey(obj: Record<string, unknown>, key: string): void {
+  if (hasOwnDictKey(obj, key)) {
+    delete obj[key];
+  }
+}
+
+export function entriesToVoiceHotwordRawText(entries: readonly string[]): string {
+  const lines: string[] = [];
+  for (const item of entries) {
+    const cleaned = normalizeVoiceHotwordRawText(item)
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    lines.push(...cleaned);
+  }
+  return lines.join('\n');
+}
+
 export function createEmptyVoiceHotwordsSyncRecord(): VoiceHotwordsSyncRecord {
   return {
     version: 1,
     user: { raw: '', updatedAt: 0 },
-    projects: {},
+    projects: createNullProtoDict<VoiceHotwordsScopeState>(),
     shareWithOthers: { enabled: false, updatedAt: 0 },
   };
 }
@@ -849,12 +903,12 @@ export function coerceVoiceHotwordsSyncRecord(input: unknown): VoiceHotwordsSync
     return empty;
   }
   const obj = input as Record<string, unknown>;
-  const projects: Record<string, VoiceHotwordsScopeState> = {};
+  const projects = createNullProtoDict<VoiceHotwordsScopeState>();
   if (obj.projects && typeof obj.projects === 'object' && !Array.isArray(obj.projects)) {
     for (const [key, val] of Object.entries(obj.projects as Record<string, unknown>)) {
       const cleanKey = normalizeVoiceHotwordProjectKey(key);
       if (!cleanKey || !isValidVoiceHotwordProjectKey(cleanKey)) continue;
-      projects[cleanKey] = coerceScopeState(val);
+      setOwnDictValue(projects, cleanKey, coerceScopeState(val));
     }
   }
   const shareObj = obj.shareWithOthers && typeof obj.shareWithOthers === 'object' && !Array.isArray(obj.shareWithOthers)
@@ -872,24 +926,14 @@ export function coerceVoiceHotwordsSyncRecord(input: unknown): VoiceHotwordsSync
 }
 
 /**
- * Compact empty tombstones (oldest first) so unused deleted project keys do not consume
- * the {@link VOICE_HOTWORDS_MAX_PROJECTS} slot budget. Never drops non-empty active lists.
+ * Tombstone-preserving project budget check: never evicts empty tombstones so deleted
+ * projects cannot be resurrected by reconnecting offline clients; rejects new keys when full.
  */
-export function compactVoiceHotwordsProjects(
+export function canStoreVoiceHotwordProjectKey(
   projects: Record<string, VoiceHotwordsScopeState>,
+  projectKey: string,
   maxProjects: number = VOICE_HOTWORDS_MAX_PROJECTS,
-): Record<string, VoiceHotwordsScopeState> {
-  const keys = Object.keys(projects);
-  if (keys.length <= maxProjects) return projects;
-  const emptyKeysByAge = keys
-    .filter((k) => !projects[k]?.raw)
-    .sort((a, b) => (projects[a]?.updatedAt ?? 0) - (projects[b]?.updatedAt ?? 0));
-  const next = { ...projects };
-  let remaining = keys.length;
-  for (const key of emptyKeysByAge) {
-    if (remaining <= maxProjects) break;
-    delete next[key];
-    remaining -= 1;
-  }
-  return next;
+): boolean {
+  if (hasOwnDictKey(projects, projectKey)) return true;
+  return Object.keys(projects).length < maxProjects;
 }

@@ -2,8 +2,9 @@
  * Server-synchronized voice hotwords endpoint (`/api/voice-hotwords`).
  *
  * Reuses `user_preferences` (`VOICE_HOTWORDS_PREF_KEY`) with per-user advisory
- * transaction locking, per-scope LWW timestamps, atomic merge/replace writes,
- * empty-string deletion tombstones, and participant-turn denial.
+ * transaction locking, null-prototype project dictionaries, per-scope LWW timestamps
+ * with clock-skew clamping, atomic merge/replace writes, tombstone preservation,
+ * and participant-turn denial.
  */
 
 import { Hono } from 'hono';
@@ -13,19 +14,28 @@ import { requireAuth } from '../security/authorization.js';
 import { daemonScopeFailure, resolveDaemonCallerAuthority } from '../security/daemon-scope.js';
 import { SERVER_ID_HEADER } from '../../../shared/http-header-names.js';
 import {
-  VOICE_HOTWORDS_MAX_PROJECTS,
+  VOICE_HOTWORDS_MAX_CLOCK_SKEW_MS,
+  VOICE_HOTWORDS_MAX_ENTRIES,
   VOICE_HOTWORDS_MAX_RAW_CHARS,
   VOICE_HOTWORDS_MAX_STORAGE_BYTES,
   VOICE_HOTWORDS_PREF_KEY,
+  canStoreVoiceHotwordProjectKey,
   coerceVoiceHotwordsSyncRecord,
-  compactVoiceHotwordsProjects,
+  createNullProtoDict,
+  decodeVoiceHotwordProjectKey,
+  encodeVoiceHotwordProjectKey,
+  entriesToVoiceHotwordRawText,
+  getOwnDictValue,
+  hasOwnDictKey,
   isValidVoiceHotwordProjectKey,
   mergeVoiceHotwordRawText,
+  mergeVoiceHotwords,
   normalizeVoiceHotwordProjectKey,
   normalizeVoiceHotwordRawText,
-  type VoiceHotwordsPutRequest,
+  setOwnDictValue,
   type VoiceHotwordsScopePatch,
   type VoiceHotwordsScopeState,
+  type VoiceHotwordsSharePatch,
   type VoiceHotwordsSource,
 } from '../../../shared/voice-hotwords.js';
 
@@ -52,34 +62,138 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function parseTimestamp(value: unknown): number | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
-    throw new VoiceHotwordsValidationError(400, 'invalid_timestamp');
+function assertAllowedKeys(obj: Record<string, unknown>, allowed: readonly string[]): void {
+  const allowedSet = new Set(allowed);
+  for (const key of Object.keys(obj)) {
+    if (!allowedSet.has(key)) {
+      throw new VoiceHotwordsValidationError(400, 'unknown_field');
+    }
   }
-  return Math.floor(value);
 }
 
-function parseMode(value: unknown): 'replace' | 'merge' {
-  if (value === undefined || value === 'replace') return 'replace';
-  if (value === 'merge') return 'merge';
+function parseTimestamp(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+    throw new VoiceHotwordsValidationError(400, 'invalid_timestamp');
+  }
+  return value;
+}
+
+function parseMode(value: unknown, defaultMode: 'replace' | 'merge' = 'replace'): 'replace' | 'merge' {
+  if (value === undefined) return defaultMode;
+  if (value === 'replace' || value === 'merge') return value;
   throw new VoiceHotwordsValidationError(400, 'invalid_mode');
 }
 
-function parseScopePatch(rawPatch: unknown): VoiceHotwordsScopePatch {
+function resolveRawInput(raw: unknown, entries: unknown): string {
+  const hasRaw = raw !== undefined;
+  const hasEntries = entries !== undefined;
+  if (hasRaw && hasEntries) {
+    throw new VoiceHotwordsValidationError(400, 'conflicting_fields');
+  }
+  if (!hasRaw && !hasEntries) {
+    throw new VoiceHotwordsValidationError(400, 'missing_hotwords');
+  }
+  if (hasRaw) {
+    if (typeof raw !== 'string') {
+      throw new VoiceHotwordsValidationError(400, 'invalid_raw');
+    }
+    if (raw.length > VOICE_HOTWORDS_MAX_RAW_CHARS) {
+      throw new VoiceHotwordsValidationError(400, 'raw_too_long');
+    }
+    return raw;
+  }
+  if (!Array.isArray(entries)) {
+    throw new VoiceHotwordsValidationError(400, 'invalid_entries');
+  }
+  if (entries.length > VOICE_HOTWORDS_MAX_ENTRIES) {
+    throw new VoiceHotwordsValidationError(400, 'too_many_entries');
+  }
+  for (const item of entries) {
+    if (typeof item !== 'string') {
+      throw new VoiceHotwordsValidationError(400, 'invalid_entries');
+    }
+  }
+  const joined = entriesToVoiceHotwordRawText(entries);
+  if (joined.length > VOICE_HOTWORDS_MAX_RAW_CHARS) {
+    throw new VoiceHotwordsValidationError(400, 'raw_too_long');
+  }
+  return joined;
+}
+
+function resolveProjectTargetFromParams(params: {
+  projectKey?: unknown;
+  projectName?: unknown;
+  serverId?: unknown;
+}): string {
+  const hasKey = params.projectKey !== undefined;
+  const hasName = params.projectName !== undefined;
+  const hasServer = params.serverId !== undefined;
+
+  if (hasKey && typeof params.projectKey !== 'string') {
+    throw new VoiceHotwordsValidationError(400, 'invalid_project_key');
+  }
+  if (hasName && typeof params.projectName !== 'string') {
+    throw new VoiceHotwordsValidationError(400, 'invalid_project_key');
+  }
+  if (hasServer && typeof params.serverId !== 'string') {
+    throw new VoiceHotwordsValidationError(400, 'invalid_project_key');
+  }
+
+  let fromKey: string | null = null;
+  if (hasKey) {
+    fromKey = normalizeVoiceHotwordProjectKey(params.projectKey as string);
+    if (!fromKey || !isValidVoiceHotwordProjectKey(fromKey)) {
+      throw new VoiceHotwordsValidationError(400, 'invalid_project_key');
+    }
+  }
+
+  let fromName: string | null = null;
+  if (hasName) {
+    fromName = encodeVoiceHotwordProjectKey(
+      params.projectName as string,
+      hasServer ? (params.serverId as string) : null,
+    );
+    if (!fromName || !isValidVoiceHotwordProjectKey(fromName)) {
+      throw new VoiceHotwordsValidationError(400, 'invalid_project_key');
+    }
+  } else if (hasServer && !hasKey) {
+    throw new VoiceHotwordsValidationError(400, 'missing_project_name');
+  }
+
+  if (fromKey && fromName && fromKey !== fromName) {
+    throw new VoiceHotwordsValidationError(400, 'conflicting_project_target');
+  }
+  if (fromKey && hasServer && !hasName) {
+    const decoded = decodeVoiceHotwordProjectKey(fromKey);
+    const cleanServer = (params.serverId as string).trim();
+    if (cleanServer && decoded?.serverId !== cleanServer) {
+      throw new VoiceHotwordsValidationError(400, 'conflicting_project_target');
+    }
+  }
+
+  const resolved = fromKey ?? fromName;
+  if (!resolved) {
+    throw new VoiceHotwordsValidationError(400, 'invalid_project_key');
+  }
+  return resolved;
+}
+
+function parseScopePatch(rawPatch: unknown, allowProjectFields = false): VoiceHotwordsScopePatch {
   if (!isPlainObject(rawPatch)) {
     throw new VoiceHotwordsValidationError(400, 'invalid_patch');
   }
-  if (typeof rawPatch.raw !== 'string') {
-    throw new VoiceHotwordsValidationError(400, 'invalid_raw');
-  }
-  if (rawPatch.raw.length > VOICE_HOTWORDS_MAX_RAW_CHARS) {
-    throw new VoiceHotwordsValidationError(400, 'raw_too_long');
-  }
+  assertAllowedKeys(
+    rawPatch,
+    allowProjectFields
+      ? ['projectKey', 'serverId', 'projectName', 'raw', 'entries', 'mode', 'clientUpdatedAt']
+      : ['raw', 'entries', 'mode', 'clientUpdatedAt'],
+  );
+  const raw = resolveRawInput(rawPatch.raw, rawPatch.entries);
   const mode = parseMode(rawPatch.mode);
   const clientUpdatedAt = parseTimestamp(rawPatch.clientUpdatedAt);
   return {
-    raw: rawPatch.raw,
+    raw,
     mode,
     ...(clientUpdatedAt !== undefined ? { clientUpdatedAt } : {}),
   };
@@ -91,9 +205,15 @@ function applyScopePatch(
   source: VoiceHotwordsSource,
   now: number,
 ): { next: VoiceHotwordsScopeState; changed: boolean } {
-  if (patch.clientUpdatedAt !== undefined && patch.clientUpdatedAt <= existing.updatedAt) {
+  const cappedIncoming = patch.clientUpdatedAt !== undefined
+    ? Math.min(patch.clientUpdatedAt, now + VOICE_HOTWORDS_MAX_CLOCK_SKEW_MS)
+    : undefined;
+
+  if (cappedIncoming !== undefined && existing.updatedAt > 0 && cappedIncoming <= existing.updatedAt) {
+    // Strictly stale or tie: server wins
     return { next: existing, changed: false };
   }
+
   const incomingRaw = normalizeVoiceHotwordRawText(patch.raw);
   const nextRaw = patch.mode === 'merge'
     ? mergeVoiceHotwordRawText(existing.raw, incomingRaw)
@@ -101,13 +221,15 @@ function applyScopePatch(
   if (nextRaw.length > VOICE_HOTWORDS_MAX_RAW_CHARS) {
     throw new VoiceHotwordsValidationError(400, 'raw_too_long');
   }
-  const isInitialExplicitClear = existing.updatedAt === 0 && nextRaw === '' && patch.mode === 'replace';
-  if (nextRaw === existing.raw && (existing.updatedAt > 0 || !isInitialExplicitClear)) {
+
+  if (patch.mode === 'merge' && !incomingRaw && existing.updatedAt > 0 && nextRaw === existing.raw) {
     return { next: existing, changed: false };
   }
-  const nextUpdatedAt = patch.clientUpdatedAt !== undefined
-    ? patch.clientUpdatedAt
+
+  const nextUpdatedAt = cappedIncoming !== undefined
+    ? Math.max(existing.updatedAt + 1, cappedIncoming || now)
     : Math.max(existing.updatedAt + 1, now);
+
   return {
     next: {
       raw: nextRaw,
@@ -128,28 +250,172 @@ async function readUserHotwordsRecord(db: Env['DB'], userId: string) {
   }
 }
 
-/** GET /api/voice-hotwords?projectKey=... */
+interface ParsedPutPlan {
+  reqScope?: 'user' | 'project' | 'share' | 'sync';
+  singleProjectKey?: string;
+  user?: VoiceHotwordsScopePatch;
+  projects: Record<string, VoiceHotwordsScopePatch>;
+  shareWithOthers?: VoiceHotwordsSharePatch;
+}
+
+function parsePutRequest(body: Record<string, unknown>): ParsedPutPlan {
+  const projects = createNullProtoDict<VoiceHotwordsScopePatch>();
+  if (Object.keys(body).length === 0) {
+    throw new VoiceHotwordsValidationError(400, 'empty_patch');
+  }
+
+  if (body.scope !== undefined) {
+    if (body.scope === 'user') {
+      assertAllowedKeys(body, ['scope', 'raw', 'entries', 'mode', 'clientUpdatedAt']);
+      return {
+        reqScope: 'user',
+        user: {
+          raw: resolveRawInput(body.raw, body.entries),
+          mode: parseMode(body.mode),
+          ...(body.clientUpdatedAt !== undefined ? { clientUpdatedAt: parseTimestamp(body.clientUpdatedAt) } : {}),
+        },
+        projects,
+      };
+    }
+
+    if (body.scope === 'project') {
+      assertAllowedKeys(body, ['scope', 'projectKey', 'serverId', 'projectName', 'raw', 'entries', 'mode', 'clientUpdatedAt']);
+      const key = resolveProjectTargetFromParams({
+        projectKey: body.projectKey,
+        projectName: body.projectName,
+        serverId: body.serverId,
+      });
+      setOwnDictValue(projects, key, {
+        raw: resolveRawInput(body.raw, body.entries),
+        mode: parseMode(body.mode),
+        ...(body.clientUpdatedAt !== undefined ? { clientUpdatedAt: parseTimestamp(body.clientUpdatedAt) } : {}),
+      });
+      return {
+        reqScope: 'project',
+        singleProjectKey: key,
+        projects,
+      };
+    }
+
+    if (body.scope === 'share') {
+      assertAllowedKeys(body, ['scope', 'enabled', 'clientUpdatedAt']);
+      if (typeof body.enabled !== 'boolean') {
+        throw new VoiceHotwordsValidationError(400, 'invalid_share_patch');
+      }
+      const clientUpdatedAt = parseTimestamp(body.clientUpdatedAt);
+      return {
+        reqScope: 'share',
+        projects,
+        shareWithOthers: {
+          enabled: body.enabled,
+          ...(clientUpdatedAt !== undefined ? { clientUpdatedAt } : {}),
+        },
+      };
+    }
+
+    if (body.scope !== 'sync') {
+      throw new VoiceHotwordsValidationError(400, 'invalid_scope');
+    }
+    assertAllowedKeys(body, ['scope', 'user', 'project', 'projects', 'shareWithOthers']);
+  } else {
+    assertAllowedKeys(body, ['user', 'project', 'projects', 'shareWithOthers']);
+  }
+
+  const plan: ParsedPutPlan = {
+    ...(body.scope === 'sync' ? { reqScope: 'sync' as const } : {}),
+    projects,
+  };
+  let hasAnyNested = false;
+
+  if (body.user !== undefined) {
+    plan.user = parseScopePatch(body.user, false);
+    hasAnyNested = true;
+  }
+  if (body.project !== undefined) {
+    if (!isPlainObject(body.project)) {
+      throw new VoiceHotwordsValidationError(400, 'invalid_project_patch');
+    }
+    const key = resolveProjectTargetFromParams({
+      projectKey: body.project.projectKey,
+      projectName: body.project.projectName,
+      serverId: body.project.serverId,
+    });
+    setOwnDictValue(projects, key, parseScopePatch(body.project, true));
+    plan.singleProjectKey = key;
+    hasAnyNested = true;
+  }
+  if (body.projects !== undefined) {
+    if (!isPlainObject(body.projects)) {
+      throw new VoiceHotwordsValidationError(400, 'invalid_projects_map');
+    }
+    for (const [rawKey, val] of Object.entries(body.projects)) {
+      const normalizedKey = normalizeVoiceHotwordProjectKey(rawKey);
+      if (!normalizedKey || !isValidVoiceHotwordProjectKey(normalizedKey)) {
+        throw new VoiceHotwordsValidationError(400, 'invalid_project_key');
+      }
+      setOwnDictValue(projects, normalizedKey, parseScopePatch(val, false));
+    }
+    hasAnyNested = true;
+  }
+  if (body.shareWithOthers !== undefined) {
+    if (!isPlainObject(body.shareWithOthers) || typeof body.shareWithOthers.enabled !== 'boolean') {
+      throw new VoiceHotwordsValidationError(400, 'invalid_share_patch');
+    }
+    assertAllowedKeys(body.shareWithOthers, ['enabled', 'clientUpdatedAt']);
+    const clientUpdatedAt = parseTimestamp(body.shareWithOthers.clientUpdatedAt);
+    plan.shareWithOthers = {
+      enabled: body.shareWithOthers.enabled,
+      ...(clientUpdatedAt !== undefined ? { clientUpdatedAt } : {}),
+    };
+    hasAnyNested = true;
+  }
+
+  if (!hasAnyNested) {
+    throw new VoiceHotwordsValidationError(400, 'empty_patch');
+  }
+  if (body.projects !== undefined) {
+    delete plan.singleProjectKey;
+  }
+  return plan;
+}
+
+/** GET /api/voice-hotwords?projectKey=... or ?serverId=...&projectName=... */
 voiceHotwordsRoutes.get('/', async (c) => {
   const userId = c.get('userId' as never) as string;
   const rawProjectKey = c.req.query('projectKey');
+  const rawProjectName = c.req.query('projectName');
+  const rawServerId = c.req.query('serverId');
+
   let projectKey: string | undefined;
-  if (rawProjectKey !== undefined) {
-    const normalized = normalizeVoiceHotwordProjectKey(rawProjectKey);
-    if (!normalized || !isValidVoiceHotwordProjectKey(normalized)) {
-      return c.json({ error: 'invalid_project_key' }, 400);
+  if (rawProjectKey !== undefined || rawProjectName !== undefined || rawServerId !== undefined) {
+    try {
+      projectKey = resolveProjectTargetFromParams({
+        projectKey: rawProjectKey,
+        projectName: rawProjectName,
+        serverId: rawServerId,
+      });
+    } catch (err) {
+      if (err instanceof VoiceHotwordsValidationError) {
+        return c.json({ error: err.code }, err.status);
+      }
+      throw err;
     }
-    projectKey = normalized;
   }
 
   const record = await readUserHotwordsRecord(c.env.DB, userId);
+  if (!projectKey) {
+    return c.json({ record });
+  }
+  const project = getOwnDictValue(record.projects, projectKey) ?? { raw: '', updatedAt: 0 };
+  const compiled = mergeVoiceHotwords({
+    projectRaw: project.raw,
+    globalRaw: record.user.raw,
+  });
   return c.json({
     record,
-    ...(projectKey
-      ? {
-          projectKey,
-          project: record.projects[projectKey] ?? { raw: '', updatedAt: 0 },
-        }
-      : {}),
+    projectKey,
+    project,
+    compiled,
   });
 });
 
@@ -157,9 +423,14 @@ voiceHotwordsRoutes.get('/', async (c) => {
 voiceHotwordsRoutes.put('/', async (c) => {
   const userId = c.get('userId' as never) as string;
 
+  const rawBodyText = await c.req.text();
+  if (Buffer.byteLength(rawBodyText, 'utf8') > VOICE_HOTWORDS_MAX_STORAGE_BYTES) {
+    return c.json({ error: 'payload_too_large' }, 400);
+  }
+
   let body: Record<string, unknown>;
   try {
-    const parsed = await c.req.json();
+    const parsed = JSON.parse(rawBodyText);
     if (!isPlainObject(parsed)) {
       return c.json({ error: 'invalid_payload' }, 400);
     }
@@ -168,52 +439,9 @@ voiceHotwordsRoutes.put('/', async (c) => {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
-  let reqPatch: VoiceHotwordsPutRequest;
+  let plan: ParsedPutPlan;
   try {
-    const parsed: VoiceHotwordsPutRequest = {};
-    if (body.user !== undefined) {
-      parsed.user = parseScopePatch(body.user);
-    }
-    if (body.project !== undefined) {
-      if (!isPlainObject(body.project)) {
-        throw new VoiceHotwordsValidationError(400, 'invalid_project_patch');
-      }
-      const normalizedKey = typeof body.project.projectKey === 'string'
-        ? normalizeVoiceHotwordProjectKey(body.project.projectKey)
-        : null;
-      if (!normalizedKey || !isValidVoiceHotwordProjectKey(normalizedKey)) {
-        throw new VoiceHotwordsValidationError(400, 'invalid_project_key');
-      }
-      parsed.project = {
-        projectKey: normalizedKey,
-        ...parseScopePatch(body.project),
-      };
-    }
-    if (body.projects !== undefined) {
-      if (!isPlainObject(body.projects)) {
-        throw new VoiceHotwordsValidationError(400, 'invalid_projects_map');
-      }
-      const normalizedProjects: Record<string, VoiceHotwordsScopePatch> = {};
-      for (const [rawKey, val] of Object.entries(body.projects)) {
-        const normalizedKey = normalizeVoiceHotwordProjectKey(rawKey);
-        if (!normalizedKey || !isValidVoiceHotwordProjectKey(normalizedKey)) {
-          throw new VoiceHotwordsValidationError(400, 'invalid_project_key');
-        }
-        normalizedProjects[normalizedKey] = parseScopePatch(val);
-      }
-      parsed.projects = normalizedProjects;
-    }
-    if (body.shareWithOthers !== undefined) {
-      if (!isPlainObject(body.shareWithOthers) || typeof body.shareWithOthers.enabled !== 'boolean') {
-        throw new VoiceHotwordsValidationError(400, 'invalid_share_patch');
-      }
-      const clientUpdatedAt = parseTimestamp(body.shareWithOthers.clientUpdatedAt);
-      parsed.shareWithOthers = {
-        enabled: body.shareWithOthers.enabled,
-        ...(clientUpdatedAt !== undefined ? { clientUpdatedAt } : {}),
-      };
-    }
-    reqPatch = parsed;
+    plan = parsePutRequest(body);
   } catch (err) {
     if (err instanceof VoiceHotwordsValidationError) {
       return c.json({ error: err.code }, err.status);
@@ -235,49 +463,48 @@ voiceHotwordsRoutes.put('/', async (c) => {
       let changed = false;
 
       let nextUser = current.user;
-      if (reqPatch.user) {
-        const applied = applyScopePatch(current.user, reqPatch.user, source, now);
+      if (plan.user) {
+        const applied = applyScopePatch(current.user, plan.user, source, now);
         nextUser = applied.next;
         if (applied.changed) changed = true;
       }
 
-      let nextProjects = { ...current.projects };
-      const projectEntries: Array<[string, VoiceHotwordsScopePatch]> = [];
-      if (reqPatch.projects) {
-        for (const [key, patch] of Object.entries(reqPatch.projects)) {
-          projectEntries.push([key, patch]);
-        }
-      }
-      if (reqPatch.project) {
-        projectEntries.push([reqPatch.project.projectKey, reqPatch.project]);
+      const nextProjects = createNullProtoDict<VoiceHotwordsScopeState>();
+      for (const key of Object.keys(current.projects)) {
+        const existingVal = getOwnDictValue(current.projects, key);
+        if (existingVal) setOwnDictValue(nextProjects, key, existingVal);
       }
 
-      for (const [projectKey, patch] of projectEntries) {
-        const existingScope = nextProjects[projectKey] ?? { raw: '', updatedAt: 0 };
+      for (const projectKey of Object.keys(plan.projects)) {
+        const patch = getOwnDictValue(plan.projects, projectKey);
+        if (!patch) continue;
+        if (!canStoreVoiceHotwordProjectKey(nextProjects, projectKey)) {
+          throw new VoiceHotwordsValidationError(400, 'too_many_projects');
+        }
+        const existingScope = hasOwnDictKey(nextProjects, projectKey)
+          ? (getOwnDictValue(nextProjects, projectKey) ?? { raw: '', updatedAt: 0 })
+          : { raw: '', updatedAt: 0 };
         const applied = applyScopePatch(existingScope, patch, source, now);
         if (applied.changed) {
-          nextProjects[projectKey] = applied.next;
+          setOwnDictValue(nextProjects, projectKey, applied.next);
           changed = true;
         }
       }
 
-      nextProjects = compactVoiceHotwordsProjects(nextProjects, VOICE_HOTWORDS_MAX_PROJECTS);
-      if (Object.keys(nextProjects).length > VOICE_HOTWORDS_MAX_PROJECTS) {
-        throw new VoiceHotwordsValidationError(400, 'too_many_projects');
-      }
-
       let nextShare = current.shareWithOthers;
-      if (reqPatch.shareWithOthers) {
-        const incomingTs = reqPatch.shareWithOthers.clientUpdatedAt;
-        if (incomingTs === undefined || incomingTs > current.shareWithOthers.updatedAt) {
-          const isInitialExplicitFalse = current.shareWithOthers.updatedAt === 0 && !reqPatch.shareWithOthers.enabled && incomingTs !== undefined && incomingTs > 0;
-          if (reqPatch.shareWithOthers.enabled !== current.shareWithOthers.enabled || current.shareWithOthers.updatedAt === 0 || isInitialExplicitFalse) {
-            nextShare = {
-              enabled: reqPatch.shareWithOthers.enabled,
-              updatedAt: incomingTs ?? Math.max(current.shareWithOthers.updatedAt + 1, now),
-            };
-            changed = true;
-          }
+      if (plan.shareWithOthers) {
+        const cappedShareTs = plan.shareWithOthers.clientUpdatedAt !== undefined
+          ? Math.min(plan.shareWithOthers.clientUpdatedAt, now + VOICE_HOTWORDS_MAX_CLOCK_SKEW_MS)
+          : undefined;
+        if (cappedShareTs === undefined || current.shareWithOthers.updatedAt === 0 || cappedShareTs > current.shareWithOthers.updatedAt) {
+          const nextTs = cappedShareTs !== undefined
+            ? Math.max(current.shareWithOthers.updatedAt + 1, cappedShareTs || now)
+            : Math.max(current.shareWithOthers.updatedAt + 1, now);
+          nextShare = {
+            enabled: plan.shareWithOthers.enabled,
+            updatedAt: nextTs,
+          };
+          changed = true;
         }
       }
 
@@ -303,6 +530,29 @@ voiceHotwordsRoutes.put('/', async (c) => {
       return nextRecord;
     });
 
+    if (plan.singleProjectKey) {
+      const proj = getOwnDictValue(resultRecord.projects, plan.singleProjectKey) ?? { raw: '', updatedAt: 0 };
+      return c.json({
+        ok: true,
+        record: resultRecord,
+        projectKey: plan.singleProjectKey,
+        project: proj,
+        compiled: mergeVoiceHotwords({
+          projectRaw: proj.raw,
+          globalRaw: resultRecord.user.raw,
+        }),
+      });
+    }
+    if (plan.reqScope === 'user') {
+      return c.json({
+        ok: true,
+        record: resultRecord,
+        compiled: mergeVoiceHotwords({
+          projectRaw: '',
+          globalRaw: resultRecord.user.raw,
+        }),
+      });
+    }
     return c.json({ ok: true, record: resultRecord });
   } catch (err) {
     if (err instanceof VoiceHotwordsValidationError) {

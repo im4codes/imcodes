@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
+  VOICE_HOTWORDS_MAX_RAW_CHARS,
   VOICE_HOTWORDS_MAX_TERMS,
   mergeVoiceHotwords,
   parseVoiceHotwordsInput,
@@ -191,10 +192,11 @@ export function VoiceHotwordsSection({
             <textarea
               key={selectedProject}
               data-testid="voice-hotwords-project-input"
+              maxLength={VOICE_HOTWORDS_MAX_RAW_CHARS}
               value={projectRaw}
               placeholder={t('settings.voice_hotwords_project_placeholder')}
               onInput={(e) => {
-                const next = (e.currentTarget as HTMLTextAreaElement).value;
+                const next = (e.currentTarget as HTMLTextAreaElement).value.slice(0, VOICE_HOTWORDS_MAX_RAW_CHARS);
                 setProjectRaw(next);
                 setProjectVoiceHotwordsRaw(selectedProject, next);
               }}
@@ -216,10 +218,11 @@ export function VoiceHotwordsSection({
           </div>
           <textarea
             data-testid="voice-hotwords-global-input"
+            maxLength={VOICE_HOTWORDS_MAX_RAW_CHARS}
             value={globalRaw}
             placeholder={t('settings.voice_hotwords_global_placeholder')}
             onInput={(e) => {
-              const next = (e.currentTarget as HTMLTextAreaElement).value;
+              const next = (e.currentTarget as HTMLTextAreaElement).value.slice(0, VOICE_HOTWORDS_MAX_RAW_CHARS);
               setGlobalRaw(next);
               setGlobalVoiceHotwordsRaw(next);
             }}

@@ -19,6 +19,7 @@ import {
   getProjectVoiceHotwordsRaw,
   getShareHotwordsWithOthers,
   getVoiceHotwordsAuthScopeKey,
+  listVoiceHotwordProjectKeys,
   registerOpenVoiceHotwordsSettingsHandler,
   registerVoiceHotwordsSyncClient,
   resetVoiceHotwordsScopeForTesting,
@@ -32,6 +33,12 @@ import {
   syncVoiceHotwordsFromServer,
   type VoiceHotwordProjectInput,
 } from '../src/voice-hotwords.js';
+import {
+  configure as configureApi,
+  configureExpectedUserId,
+  fetchVoiceHotwords,
+  updateVoiceHotwords,
+} from '../src/api.js';
 import { VoiceHotwordsSection } from '../src/components/VoiceHotwordsSection.js';
 import { VoiceOverlay } from '../src/components/VoiceOverlay.js';
 import { SettingsPage } from '../src/pages/SettingsPage.js';
@@ -274,69 +281,111 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
     }
   });
 
-  it('syncs bidirectionally with server via LWW, migrates legacy local data, respects tombstones, aborts on account switch, and tolerates 404', async () => {
+  it('syncs bidirectionally with server via LWW, handles same-ms ties, tombstones, per-scope isolation, proto keys, and cold-start safety', async () => {
     vi.useFakeTimers();
     try {
-      // Seed legacy pre-sync local data for user-1 before registering sync client
+      // Prototype-colliding legacy project keys work cleanly through get/set/list
+      for (const protoKey of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+        setProjectVoiceHotwordsRaw(protoKey, `Term_${protoKey}`);
+        expect(getProjectVoiceHotwordsRaw(protoKey)).toBe(`Term_${protoKey}`);
+      }
+      expect(listVoiceHotwordProjectKeys()).toEqual(['__proto__', 'constructor', 'hasOwnProperty', 'toString']);
+
+      // Cold-start safety: before setVoiceHotwordsAuthScope confirms identity, sync MUST NOT fire
+      const fetchRecord = vi.fn(async () => ({
+        version: 1 as const,
+        user: { raw: '', updatedAt: 0 },
+        projects: {},
+        shareWithOthers: { enabled: false, updatedAt: 0 },
+      }));
+      const updateRecord = vi.fn(async () => ({
+        version: 1 as const,
+        user: { raw: '', updatedAt: 0 },
+        projects: {},
+        shareWithOthers: { enabled: false, updatedAt: 0 },
+      }));
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'stale-cached', baseUrl: 'https://sync.example' }));
+      registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
+      await syncVoiceHotwordsFromServer();
+      expect(fetchRecord).not.toHaveBeenCalled();
+
+      // Now confirm user-1 and test full bidirectional LWW sync + legacy migration + tombstones + per-scope isolation
       setVoiceHotwordsAuthScope({ userId: 'user-1', baseUrl: 'https://sync.example' });
       setGlobalVoiceHotwordsRaw('LegacyGlobal');
       setProjectVoiceHotwordsRaw('srv:srv-1::app', 'LegacyProj');
+      setProjectVoiceHotwordsRaw('srv:srv-1::bad_overflow', 'ValidThenBad');
+      setProjectVoiceHotwordsRaw('srv:srv-1::oversized', 'x'.repeat(9000));
+      setShareHotwordsWithOthers(true);
 
-      // Simulate pre-existing empty localStorage tombstone vs newer server clear, plus fresh user/project scopes
-      const serverState = {
-        version: 1 as const,
+      const serverState: any = {
+        version: 1,
         user: { raw: '', updatedAt: 0 },
         projects: {
-          'srv:srv-1::app': { raw: '', updatedAt: Date.now() + 10_000 }, // server explicitly cleared later -> must beat legacy
-          'srv:srv-1::other': { raw: 'FromMcp', updatedAt: 500, source: 'mcp' as const },
+          'srv:srv-1::app': { raw: '', updatedAt: Date.now() + 10_000 }, // empty tombstone beats legacy
+          'srv:srv-1::other': { raw: 'FromMcp', updatedAt: 500, source: 'mcp' },
         },
         shareWithOthers: { enabled: true, updatedAt: 500 },
       };
 
-      const fetchRecord = vi.fn(async () => structuredClone(
+      fetchRecord.mockImplementation(async () => structuredClone(
         getVoiceHotwordsAuthScopeKey()?.endsWith('|user-1')
           ? serverState
-          : { version: 1 as const, user: { raw: '', updatedAt: 0 }, projects: {}, shareWithOthers: { enabled: false, updatedAt: 0 } },
+          : { version: 1, user: { raw: '', updatedAt: 0 }, projects: {}, shareWithOthers: { enabled: false, updatedAt: 0 } },
       ));
-      const updateRecord = vi.fn(async (payload: any) => {
-        if (payload.user) {
-          serverState.user = { raw: payload.user.raw, updatedAt: payload.user.clientUpdatedAt ?? Date.now() };
+      updateRecord.mockImplementation(async (payload: any) => {
+        // Simulate server rejecting one project with 400 too_many_projects while accepting user/share scopes independently
+        if (payload.scope === 'project' && payload.projectKey === 'srv:srv-1::bad_overflow') {
+          const err = new Error('too_many_projects') as Error & { status: number };
+          err.status = 400;
+          throw err;
         }
-        if (payload.projects) {
-          for (const [k, v] of Object.entries<any>(payload.projects)) {
-            serverState.projects[k] = { raw: v.raw, updatedAt: v.clientUpdatedAt ?? Date.now() };
-          }
-        }
-        if (payload.shareWithOthers) {
-          serverState.shareWithOthers = { enabled: payload.shareWithOthers.enabled, updatedAt: payload.shareWithOthers.clientUpdatedAt ?? Date.now() };
+        if (payload.scope === 'user') {
+          serverState.user = { raw: payload.raw, updatedAt: payload.clientUpdatedAt ?? Date.now() };
+        } else if (payload.scope === 'project') {
+          serverState.projects[payload.projectKey] = { raw: payload.raw, updatedAt: payload.clientUpdatedAt ?? Date.now() };
+        } else if (payload.scope === 'share') {
+          serverState.shareWithOthers = { enabled: payload.enabled, updatedAt: payload.clientUpdatedAt ?? Date.now() };
         }
         return structuredClone(serverState);
       });
 
-      registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
       await syncVoiceHotwordsFromServer();
 
-      // Legacy user global migrated upward; newer server empty tombstone prevented app resurrection; new MCP project pulled; share consent pulled
-      expect(updateRecord).toHaveBeenCalledWith(expect.objectContaining({
-        user: expect.objectContaining({ raw: 'LegacyGlobal', mode: 'replace' }),
-      }), expect.anything());
-      expect(getGlobalVoiceHotwordsRaw()).toBe('LegacyGlobal');
+      // Oversized & 400-rejected project MUST keep local raw WITHOUT blocking user/share migration!
+      expect(serverState.user.raw).toBe('LegacyGlobal');
       expect(getProjectVoiceHotwordsRaw('srv:srv-1::app')).toBe('');
       expect(getProjectVoiceHotwordsRaw('srv:srv-1::other')).toBe('FromMcp');
-      expect(getShareHotwordsWithOthers()).toBe(true);
+      expect(getProjectVoiceHotwordsRaw('srv:srv-1::oversized').length).toBe(9000);
+      expect(getProjectVoiceHotwordsRaw('srv:srv-1::bad_overflow')).toBe('ValidThenBad');
 
-      // Local edit debounces push at 300ms
-      setProjectVoiceHotwordsRaw('srv:srv-1::other', 'FromMcp\nLocalEdited');
-      expect(updateRecord).toHaveBeenCalledTimes(1);
+      // Revoking shareWithOthers=false MUST succeed even alongside oversized/rejected projects
+      setShareHotwordsWithOthers(false);
       await vi.advanceTimersByTimeAsync(350);
-      expect(updateRecord).toHaveBeenCalledTimes(2);
-      expect(serverState.projects['srv:srv-1::other'].raw).toBe('FromMcp\nLocalEdited');
+      expect(serverState.shareWithOthers.enabled).toBe(false);
 
-      // Switching accounts mid-flight aborts old pull and prevents cross-account leakage
-      let rejectOrResolveOld: ((val: any) => void) | null = null;
-      fetchRecord.mockImplementationOnce((signal?: AbortSignal) => new Promise((resolve) => {
-        rejectOrResolveOld = resolve;
-        signal?.addEventListener('abort', () => resolve({
+      // Same-millisecond LWW tie resolution: server wins ties -> local MUST converge to server's winning value!
+      const nowFixed = Date.now() + 50_000;
+      vi.setSystemTime(nowFixed);
+      setGlobalVoiceHotwordsRaw('ClientTieChoice');
+      updateRecord.mockImplementationOnce(async () => ({
+        ...structuredClone(serverState),
+        user: { raw: 'ServerTieWinner', updatedAt: nowFixed },
+      }));
+      await flushVoiceHotwordsPush();
+      expect(getGlobalVoiceHotwordsRaw()).toBe('ServerTieWinner');
+
+      // Non-dirty previously-synced local cache whose key is absent from server does NOT resurrect on re-sync
+      setProjectVoiceHotwordsRaw('srv:srv-1::evicted', 'OldTerm');
+      await flushVoiceHotwordsPush();
+      delete serverState.projects['srv:srv-1::evicted'];
+      await syncVoiceHotwordsFromServer();
+      expect(getProjectVoiceHotwordsRaw('srv:srv-1::evicted')).toBe('');
+
+      // Account switch mid-flight aborts old pull and prevents cross-account leakage
+      let resolveSlow: ((val: any) => void) | null = null;
+      fetchRecord.mockImplementationOnce((opts) => new Promise((resolve) => {
+        resolveSlow = resolve;
+        opts.signal?.addEventListener('abort', () => resolve({
           version: 1,
           user: { raw: 'StaleUserOneLeak', updatedAt: 999_999_999 },
           projects: {},
@@ -345,7 +394,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       }));
       const slowSync = syncVoiceHotwordsFromServer();
       setVoiceHotwordsAuthScope({ userId: 'user-2', baseUrl: 'https://sync.example' });
-      rejectOrResolveOld?.({
+      resolveSlow?.({
         version: 1,
         user: { raw: 'StaleUserOneLeak', updatedAt: 999_999_999 },
         projects: {},
@@ -355,7 +404,7 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       expect(getGlobalVoiceHotwordsRaw()).toBe('');
       expect(getShareHotwordsWithOthers()).toBe(false);
 
-      // Returning null (404 graceful degradation) must not break local storage
+      // 404 degradation keeps local writes intact
       fetchRecord.mockResolvedValueOnce(null as any);
       updateRecord.mockResolvedValueOnce(null as any);
       setGlobalVoiceHotwordsRaw('OfflineOr404Term');
@@ -363,6 +412,40 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       expect(getGlobalVoiceHotwordsRaw()).toBe('OfflineOr404Term');
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it('api wrapper fails closed before network when expectedUserId is unconfirmed or mismatched', async () => {
+    const originalFetch = globalThis.fetch;
+    const mockFetch = vi.fn(async () => new Response(JSON.stringify({
+      ok: true,
+      record: {
+        version: 1,
+        user: { raw: 'ApiSynced', updatedAt: 10 },
+        projects: {},
+        shareWithOthers: { enabled: false, updatedAt: 0 },
+      },
+    }), { status: 200 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+    try {
+      configureApi('https://api-test.example');
+      configureExpectedUserId(null);
+
+      await expect(fetchVoiceHotwords()).rejects.toThrow('voice_hotwords_unconfirmed_user');
+      await expect(updateVoiceHotwords({ scope: 'user', raw: 'Bad' })).rejects.toThrow('voice_hotwords_unconfirmed_user');
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      configureExpectedUserId('user-real');
+      await expect(fetchVoiceHotwords({ expectedUserId: 'user-other' })).rejects.toThrow('voice_hotwords_unconfirmed_user');
+      expect(mockFetch).not.toHaveBeenCalled();
+
+      const rec = await fetchVoiceHotwords({ expectedUserId: 'user-real' });
+      expect(rec?.user.raw).toBe('ApiSynced');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    } finally {
+      configureExpectedUserId(null);
+      globalThis.fetch = originalFetch;
     }
   });
 });

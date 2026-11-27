@@ -5,11 +5,15 @@ import {
   VOICE_HOTWORDS_MAX_PROJECTS,
   VOICE_HOTWORDS_MAX_TERMS,
   applyVoiceHotwordPostProcess,
+  canStoreVoiceHotwordProjectKey,
   coerceVoiceHotwordsSyncRecord,
-  compactVoiceHotwordsProjects,
+  createNullProtoDict,
   decodeVoiceHotwordProjectKey,
   encodeVoiceHotwordProjectKey,
+  entriesToVoiceHotwordRawText,
   formatVoiceHotwordsContext,
+  getOwnDictValue,
+  hasOwnDictKey,
   isValidVoiceHotwordProjectKey,
   mergeVoiceHotwordRawText,
   mergeVoiceHotwords,
@@ -18,6 +22,7 @@ import {
   parseVoiceHotwordsInput,
   sanitizeRemoteVoiceHotwords,
   sanitizeVoiceHotwordText,
+  setOwnDictValue,
 } from '../../shared/voice-hotwords.js';
 
 describe('shared voice hotwords', () => {
@@ -284,36 +289,27 @@ describe('shared voice hotwords', () => {
     expect(merged).toBe('IM.codes\n错别词 => IM.codes\nWorkTree\ncodex-sdk\n新术语 => NewTerm');
   });
 
-  it('coerces sync records safely and compacts oldest empty tombstones before exceeding max projects', () => {
-    const coerced = coerceVoiceHotwordsSyncRecord({
-      version: 99,
-      user: { raw: 'GlobalTerm\r\n', updatedAt: 100.8, source: 'mcp' },
-      projects: {
-        valid: { raw: 'ProjTerm', updatedAt: 200, source: 'web' },
-        'bad\nkey': { raw: 'Ignored', updatedAt: 300 },
-      },
-      shareWithOthers: { enabled: true, updatedAt: 50 },
-    });
-    expect(coerced).toEqual({
-      version: 1,
-      user: { raw: 'GlobalTerm\n', updatedAt: 100, source: 'mcp' },
-      projects: {
-        valid: { raw: 'ProjTerm', updatedAt: 200, source: 'web' },
-      },
-      shareWithOthers: { enabled: true, updatedAt: 50 },
-    });
+  it('handles prototype-colliding legacy project keys safely and preserves empty tombstones up to max projects', () => {
+    const protoJson = '{"version":1,"user":{"raw":"GlobalTerm\\r\\n","updatedAt":100.8,"source":"mcp"},"projects":{"valid":{"raw":"ProjTerm","updatedAt":200,"source":"web"},"__proto__":{"raw":"ProtoTerm","updatedAt":210},"constructor":{"raw":"CtorTerm","updatedAt":220},"toString":{"raw":"StrTerm","updatedAt":230},"bad\\nkey":{"raw":"Ignored","updatedAt":300}},"shareWithOthers":{"enabled":true,"updatedAt":50}}';
+    const coerced = coerceVoiceHotwordsSyncRecord(JSON.parse(protoJson));
+    expect(Object.getPrototypeOf(coerced.projects)).toBeNull();
+    expect(hasOwnDictKey(coerced.projects, '__proto__')).toBe(true);
+    expect(getOwnDictValue(coerced.projects, '__proto__')).toEqual({ raw: 'ProtoTerm', updatedAt: 210 });
+    expect(getOwnDictValue(coerced.projects, 'constructor')).toEqual({ raw: 'CtorTerm', updatedAt: 220 });
+    expect(getOwnDictValue(coerced.projects, 'toString')).toEqual({ raw: 'StrTerm', updatedAt: 230 });
+    expect(getOwnDictValue(coerced.projects, 'valueOf')).toBeUndefined();
+    expect(hasOwnDictKey(coerced.projects, 'bad\nkey')).toBe(false);
+    expect(coerced.user).toEqual({ raw: 'GlobalTerm\n', updatedAt: 100, source: 'mcp' });
+    expect(coerced.shareWithOthers).toEqual({ enabled: true, updatedAt: 50 });
 
-    const projects: Record<string, { raw: string; updatedAt: number }> = {
-      tombOld: { raw: '', updatedAt: 10 },
-      tombNew: { raw: '', updatedAt: 20 },
-    };
-    for (let i = 0; i < VOICE_HOTWORDS_MAX_PROJECTS; i += 1) {
-      projects[`p${i}`] = { raw: `Term${i}`, updatedAt: 100 + i };
+    expect(entriesToVoiceHotwordRawText(['  IM.codes ', '错别词 => IM.codes'])).toBe('IM.codes\n错别词 => IM.codes');
+
+    const projects = createNullProtoDict<{ raw: string; updatedAt: number }>();
+    setOwnDictValue(projects, 'tombOld', { raw: '', updatedAt: 10 });
+    for (let i = 0; i < VOICE_HOTWORDS_MAX_PROJECTS - 1; i += 1) {
+      setOwnDictValue(projects, `p${i}`, { raw: `Term${i}`, updatedAt: 100 + i });
     }
-    const compacted = compactVoiceHotwordsProjects(projects, VOICE_HOTWORDS_MAX_PROJECTS);
-    expect(Object.keys(compacted).length).toBe(VOICE_HOTWORDS_MAX_PROJECTS);
-    expect(compacted.tombOld).toBeUndefined();
-    expect(compacted.tombNew).toBeUndefined();
-    expect(compacted.p0).toEqual({ raw: 'Term0', updatedAt: 100 });
+    expect(canStoreVoiceHotwordProjectKey(projects, 'tombOld')).toBe(true);
+    expect(canStoreVoiceHotwordProjectKey(projects, 'brand-new')).toBe(false);
   });
 });

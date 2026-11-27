@@ -61,6 +61,13 @@ import {
   PEER_AUDIT_VALIDATION_KINDS,
   PEER_AUDIT_VALIDATION_OUTCOMES,
 } from './peer-audit.js';
+import {
+  VOICE_HOTWORDS_MAX_ENTRIES,
+  VOICE_HOTWORDS_MAX_RAW_CHARS,
+  VOICE_HOTWORDS_MAX_TERM_CHARS,
+  VOICE_HOTWORDS_MCP_TOOLS,
+} from './voice-hotwords.js';
+export { VOICE_HOTWORDS_MCP_TOOLS };
 import { CRON_COMPLETION_POLICY } from './cron-types.js';
 import {
   AGENT_DELEGATION_PURPOSES,
@@ -1665,6 +1672,40 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     }, ['status', 'closedCount', 'closedTunnelIds']),
   },
 };
+
+export const VOICE_HOTWORDS_MCP_TOOL_CONTRACTS = Object.freeze({
+  [VOICE_HOTWORDS_MCP_TOOLS.GET]: {
+    name: VOICE_HOTWORDS_MCP_TOOLS.GET,
+    description: 'Read synced voice ASR hotwords; project scope binds strictly to caller context.',
+    inputSchema: objectSchema({
+      scope: stringSchema('Target scope (default all).', { enum: ['all', 'project', 'user'] }),
+    }),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok on success.', { enum: ['ok'] }),
+      scope: stringSchema('Returned scope.', { enum: ['all', 'project', 'user'] }),
+    }, ['status', 'scope']),
+  },
+  [VOICE_HOTWORDS_MCP_TOOLS.SET]: {
+    name: VOICE_HOTWORDS_MCP_TOOLS.SET,
+    description: 'Write or merge synced voice ASR hotwords (supports plain terms and "wrong => right" aliases; project binds to caller).',
+    inputSchema: objectSchema({
+      scope: stringSchema('Target scope.', { enum: ['project', 'user'] }),
+      raw: stringSchema('Newline-separated terms/aliases; empty with replace clears.', { maxLength: VOICE_HOTWORDS_MAX_RAW_CHARS }),
+      entries: {
+        type: 'array',
+        description: 'Alternative array of terms/aliases; empty with replace clears.',
+        items: stringSchema('Single term or "wrong => right" alias.', { maxLength: VOICE_HOTWORDS_MAX_TERM_CHARS * 3 }),
+        maxItems: VOICE_HOTWORDS_MAX_ENTRIES,
+      },
+      mode: stringSchema('Default merge; replace overwrites.', { enum: ['merge', 'replace'] }),
+    }, ['scope']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok on success.', { enum: ['ok'] }),
+      scope: stringSchema('Written scope.', { enum: ['project', 'user'] }),
+      mode: stringSchema('Applied mode.', { enum: ['merge', 'replace'] }),
+    }, ['status', 'scope', 'mode']),
+  },
+} as const);
 
 export interface MemoryMcpErrorResult extends Record<string, unknown> {
   status: 'error';

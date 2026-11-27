@@ -10,6 +10,7 @@ import {
 import { createVoiceHotwordsMcpToolHandlers } from '../../src/daemon/voice-hotwords-mcp-tools.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { MCP_TOOL_DISCOVERY_NAME } from '../../shared/mcp-tool-discovery.js';
+import { VOICE_HOTWORDS_MCP_TOOL_CONTRACTS } from '../../shared/memory-mcp-contracts.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import {
   VOICE_HOTWORDS_API_PATH,
@@ -69,7 +70,10 @@ describe('voice hotwords MCP client & tools', () => {
     });
 
     const setRes = await voiceHotwordsMcpSet({
-      project: { projectKey: 'srv:srv-1::codedeck', raw: 'codex-sdk', mode: 'merge' },
+      scope: 'project',
+      projectKey: 'srv:srv-1::codedeck',
+      raw: 'codex-sdk',
+      mode: 'merge',
     }, opts);
     expect(setRes.status).toBe('ok');
     if (setRes.status === 'ok') {
@@ -87,7 +91,7 @@ describe('voice hotwords MCP client & tools', () => {
     });
   });
 
-  it('defaults projectName/serverId from caller, supports user & project scopes, and denies participant turns', async () => {
+  it('projects requested scope cleanly, rejects project writes without caller binding, and denies participant turns', async () => {
     const getMock = vi.fn().mockResolvedValue({
       status: 'ok',
       record: {
@@ -105,7 +109,7 @@ describe('voice hotwords MCP client & tools', () => {
         version: 1,
         user: { raw: 'Antigravity', updatedAt: 10, source: 'web' },
         projects: {
-          'srv:srv-1::codedeck': { raw: 'IM.codes\n错别词 => IM.codes\nworktree', updatedAt: 30, source: 'mcp' },
+          'srv:srv-1::codedeck': { raw: '', updatedAt: 30, source: 'mcp' },
         },
         shareWithOthers: { enabled: false, updatedAt: 0 },
       },
@@ -116,62 +120,132 @@ describe('voice hotwords MCP client & tools', () => {
       setVoiceHotwords: setMock,
     });
 
-    const got = await handlers.voice_hotwords_get({ scope: 'effective' });
+    // Default scope is 'all'
+    const allRes = await handlers.voice_hotwords_get({});
     expect(getMock).toHaveBeenCalledWith({}, 'srv:srv-1::codedeck');
-    expect(got).toMatchObject({
+    expect(allRes).toMatchObject({
       status: 'ok',
-      scope: 'effective',
+      scope: 'all',
       projectKey: 'srv:srv-1::codedeck',
-      compiled: {
-        terms: ['IM.codes', 'Antigravity'],
-        replacements: [{ from: '错别词', to: 'IM.codes' }],
-      },
+      user: { raw: 'Antigravity' },
+      project: { raw: 'IM.codes\n错别词 => IM.codes' },
+      compiled: { terms: ['IM.codes', 'Antigravity'] },
     });
 
-    const setRes = await handlers.voice_hotwords_set({
+    // scope='project' MUST NOT return user field or user terms in compiled
+    const projOnly = await handlers.voice_hotwords_get({ scope: 'project' });
+    expect(projOnly).not.toHaveProperty('user');
+    expect(projOnly).toMatchObject({
+      status: 'ok',
       scope: 'project',
-      hotwords: 'worktree',
+      compiled: { terms: ['IM.codes'] },
+    });
+
+    // scope='user' MUST NOT return project field or project terms in compiled
+    const userOnly = await handlers.voice_hotwords_get({ scope: 'user' });
+    expect(userOnly).not.toHaveProperty('project');
+    expect(userOnly).toMatchObject({
+      status: 'ok',
+      scope: 'user',
+      compiled: { terms: ['Antigravity'] },
+    });
+
+    // Clear with empty entries[] + mode='replace'
+    const clearRes = await handlers.voice_hotwords_set({
+      scope: 'project',
+      entries: [],
+      mode: 'replace',
     });
     expect(setMock).toHaveBeenCalledWith({
-      project: { projectKey: 'srv:srv-1::codedeck', raw: 'worktree', mode: 'merge' },
-    }, {});
-    expect(setRes).toMatchObject({
-      status: 'ok',
       scope: 'project',
       projectKey: 'srv:srv-1::codedeck',
-      mode: 'merge',
-    });
+      raw: '',
+      mode: 'replace',
+    }, {});
+    expect(clearRes).toMatchObject({ status: 'ok', entry: { raw: '' } });
 
+    // Caller with pre-encoded srv:... projectName keeps its encoding without double-prefixing
+    const encodedCallerHandlers = createVoiceHotwordsMcpToolHandlers({
+      ...caller,
+      projectName: 'srv:srv-remote::custom-proj',
+      serverId: 'srv-other',
+    }, { getVoiceHotwords: getMock, setVoiceHotwords: setMock });
+    await encodedCallerHandlers.voice_hotwords_get({ scope: 'all' });
+    expect(getMock).toHaveBeenLastCalledWith({}, 'srv:srv-remote::custom-proj');
+
+    // Unbound projectName: scope='project' fails, scope='all' omits project cleanly
+    const unboundHandlers = createVoiceHotwordsMcpToolHandlers({
+      userId: 'user-1',
+      sessionName: 'deck_global_brain',
+      namespace: { scope: 'personal', userId: 'user-1' },
+    }, { getVoiceHotwords: getMock, setVoiceHotwords: setMock });
+    expect(await unboundHandlers.voice_hotwords_get({ scope: 'project' })).toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    expect(await unboundHandlers.voice_hotwords_set({ scope: 'project', raw: 'foo' })).toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+    const unboundAll = await unboundHandlers.voice_hotwords_get({});
+    expect(unboundAll).toMatchObject({ status: 'ok', scope: 'all', projectKey: null });
+    expect(unboundAll).not.toHaveProperty('project');
+
+    // Participant turn denied
     const participantHandlers = createVoiceHotwordsMcpToolHandlers({
       ...caller,
       isParticipantTurn: true,
-    }, {
-      getVoiceHotwords: getMock,
-      setVoiceHotwords: setMock,
-    });
+    }, { getVoiceHotwords: getMock, setVoiceHotwords: setMock });
     expect(await participantHandlers.voice_hotwords_get({})).toMatchObject({
       status: 'error',
       reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
     });
-    expect(await participantHandlers.voice_hotwords_set({ scope: 'user', hotwords: 'X' })).toMatchObject({
+    expect(await participantHandlers.voice_hotwords_set({ scope: 'user', raw: 'X' })).toMatchObject({
       status: 'error',
       reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
     });
   });
 
-  it('discovers and invokes voice_hotwords_get/set via mcp_tool_search on demand without polluting default bootstrap', async () => {
+  it('discovers and enforces strict shared schemas over real MCP transport (all, raw/entries, empty replace, reject override args)', async () => {
     const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        record: {
+          version: 1,
+          user: { raw: 'GlobalWord', updatedAt: 10, source: 'web' },
+          projects: {
+            'srv:srv-1::codedeck': { raw: 'ProjWord', updatedAt: 20, source: 'web' },
+          },
+          shareWithOthers: { enabled: false, updatedAt: 0 },
+        },
+      }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({
         ok: true,
         record: {
           version: 1,
-          user: { raw: 'UserTerm', updatedAt: 100, source: 'mcp' },
-          projects: {},
+          user: { raw: 'GlobalWord\nEntryOne\n错词 => RightWord', updatedAt: 50, source: 'mcp' },
+          projects: {
+            'srv:srv-1::codedeck': { raw: 'ProjWord', updatedAt: 20, source: 'web' },
+          },
+          shareWithOthers: { enabled: false, updatedAt: 0 },
+        },
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        ok: true,
+        record: {
+          version: 1,
+          user: { raw: 'GlobalWord\nEntryOne\n错词 => RightWord', updatedAt: 50, source: 'mcp' },
+          projects: {
+            'srv:srv-1::codedeck': { raw: '', updatedAt: 60, source: 'mcp' },
+          },
           shareWithOthers: { enabled: false, updatedAt: 0 },
         },
       }), { status: 200 }));
 
-    const server = createMemoryMcpServer(caller, {}, {
+    // Contracts exist in shared/memory-mcp-contracts.ts
+    expect(VOICE_HOTWORDS_MCP_TOOL_CONTRACTS[VOICE_HOTWORDS_MCP_TOOLS.GET]).toBeDefined();
+    expect(VOICE_HOTWORDS_MCP_TOOL_CONTRACTS[VOICE_HOTWORDS_MCP_TOOLS.SET]).toBeDefined();
+
+    const server = createMemoryMcpServer(caller, {
       voiceHotwordsClientOptions: {
         endpoint: { serverId: 'srv-1', workerUrl: 'https://worker.example.invalid', token: 'tok-1' },
         fetchImpl: fetchMock,
@@ -192,19 +266,59 @@ describe('voice hotwords MCP client & tools', () => {
       });
       expect(searchRes.isError).not.toBe(true);
 
-      const activeNames = (await client.listTools()).tools.map((t) => t.name);
-      expect(activeNames).toContain(VOICE_HOTWORDS_MCP_TOOLS.GET);
-      expect(activeNames).toContain(VOICE_HOTWORDS_MCP_TOOLS.SET);
+      const tools = (await client.listTools()).tools;
+      const getSchema = tools.find((t) => t.name === VOICE_HOTWORDS_MCP_TOOLS.GET)?.inputSchema as any;
+      const setSchema = tools.find((t) => t.name === VOICE_HOTWORDS_MCP_TOOLS.SET)?.inputSchema as any;
+      expect(getSchema?.properties?.scope?.enum).toEqual(['all', 'project', 'user']);
+      expect(getSchema?.properties?.projectName).toBeUndefined();
+      expect(getSchema?.properties?.serverId).toBeUndefined();
+      expect(setSchema?.properties?.raw).toBeDefined();
+      expect(setSchema?.properties?.entries).toBeDefined();
+      expect(setSchema?.properties?.hotwords).toBeUndefined();
+      expect(setSchema?.properties?.projectName).toBeUndefined();
+      expect(setSchema?.properties?.serverId).toBeUndefined();
 
-      const callRes = await client.callTool({
-        name: VOICE_HOTWORDS_MCP_TOOLS.SET,
-        arguments: { scope: 'user', hotwords: 'UserTerm', mode: 'replace' },
+      // Default GET uses 'all'
+      const defaultGet = await client.callTool({ name: VOICE_HOTWORDS_MCP_TOOLS.GET, arguments: {} });
+      expect(defaultGet.isError).not.toBe(true);
+      expect(defaultGet.structuredContent).toMatchObject({
+        status: 'ok',
+        scope: 'all',
+        projectKey: 'srv:srv-1::codedeck',
+        user: { raw: 'GlobalWord' },
+        project: { raw: 'ProjWord' },
       });
-      expect(callRes.isError).not.toBe(true);
-      expect(callRes.structuredContent).toMatchObject({
+
+      // Strict schema rejects projectName / serverId override attempts
+      const rejectedOverride = await client.callTool({
+        name: VOICE_HOTWORDS_MCP_TOOLS.SET,
+        arguments: { scope: 'project', projectName: 'other', raw: 'Hack' },
+      });
+      expect(rejectedOverride.isError).toBe(true);
+
+      // entries[] merge on user scope
+      const setEntries = await client.callTool({
+        name: VOICE_HOTWORDS_MCP_TOOLS.SET,
+        arguments: { scope: 'user', entries: ['EntryOne', '错词 => RightWord'] },
+      });
+      expect(setEntries.isError).not.toBe(true);
+      expect(setEntries.structuredContent).toMatchObject({
         status: 'ok',
         scope: 'user',
-        entry: { raw: 'UserTerm', updatedAt: 100, source: 'mcp' },
+        mode: 'merge',
+      });
+
+      // empty replace clear on bound project
+      const clearProj = await client.callTool({
+        name: VOICE_HOTWORDS_MCP_TOOLS.SET,
+        arguments: { scope: 'project', raw: '', mode: 'replace' },
+      });
+      expect(clearProj.isError).not.toBe(true);
+      expect(clearProj.structuredContent).toMatchObject({
+        status: 'ok',
+        scope: 'project',
+        projectKey: 'srv:srv-1::codedeck',
+        entry: { raw: '' },
       });
     } finally {
       await client.close();

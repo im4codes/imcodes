@@ -5,6 +5,7 @@ import {
   MEMORY_MCP_TOOL_CONTRACTS,
   MEMORY_MCP_TOOL_NAME_LIST,
   MEMORY_MCP_TOOL_NAMES,
+  VOICE_HOTWORDS_MCP_TOOL_CONTRACTS,
   SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS,
   SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
   SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
@@ -151,6 +152,11 @@ describe('memory MCP shared contracts', () => {
       'port_forward_list',
       'port_forward_close',
     ]);
+    expect(VOICE_HOTWORDS_MCP_TOOL_CONTRACTS.voice_hotwords_get.inputSchema.properties?.scope?.enum).toEqual([
+      'all', 'project', 'user',
+    ]);
+    expect(VOICE_HOTWORDS_MCP_TOOL_CONTRACTS.voice_hotwords_set.inputSchema.properties).toHaveProperty('raw');
+    expect(VOICE_HOTWORDS_MCP_TOOL_CONTRACTS.voice_hotwords_set.inputSchema.properties).toHaveProperty('entries');
     expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS).filter((name) => MEMORY_MCP_TOOL_NAME_LIST.includes(name as never)))
       .toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
   });

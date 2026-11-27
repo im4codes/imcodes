@@ -5563,28 +5563,18 @@
     },
     {
       "name": "voice_hotwords_get",
-      "description": "Read synced voice ASR hotwords for project or user scope.",
+      "description": "Read synced voice ASR hotwords; project scope binds strictly to caller context.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "scope": {
-            "description": "Scope (default effective).",
+            "description": "Target scope (default all).",
             "type": "string",
             "enum": [
-              "effective",
+              "all",
               "project",
               "user"
             ]
-          },
-          "projectName": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
-          },
-          "serverId": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
           }
         },
         "$schema": "http://json-schema.org/draft-07/schema#",
@@ -5596,7 +5586,7 @@
     },
     {
       "name": "voice_hotwords_set",
-      "description": "Write or merge synced voice ASR hotwords for project or user scope.",
+      "description": "Write or merge synced voice ASR hotwords (supports plain terms and \"wrong => right\" aliases; project binds to caller).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -5607,10 +5597,19 @@
               "user"
             ]
           },
-          "hotwords": {
+          "raw": {
+            "description": "Newline-separated terms/aliases; empty with replace clears.",
             "type": "string",
-            "maxLength": 8192,
-            "description": "Lines: \"term\" or \"wrong => right\"."
+            "maxLength": 8192
+          },
+          "entries": {
+            "description": "Alternative array of terms/aliases; empty with replace clears.",
+            "maxItems": 200,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 192
+            }
           },
           "mode": {
             "description": "Default merge; replace overwrites.",
@@ -5619,21 +5618,10 @@
               "merge",
               "replace"
             ]
-          },
-          "projectName": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
-          },
-          "serverId": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
           }
         },
         "required": [
-          "scope",
-          "hotwords"
+          "scope"
         ],
         "$schema": "http://json-schema.org/draft-07/schema#",
         "additionalProperties": false

@@ -39,6 +39,7 @@ import { isServerR2RelayEnabled, readFileRelayMode, setFileRelayUser } from './r
 import {
   registerVoiceHotwordsSyncClient,
   setVoiceHotwordsAuthScope,
+  type VoiceHotwordsSyncRequestOptions,
 } from './voice-hotwords.js';
 import {
   VOICE_HOTWORDS_API_PATH,
@@ -199,10 +200,10 @@ export function getApiKey(): string | null {
  * cannot silently execute work under a different account.
  */
 function syncVoiceHotwordsAuthScopeFromApi(): void {
-  if (_expectedUserId) {
+  if (_expectedUserId && (!isNative() || Boolean(_baseUrl))) {
     const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '';
     setVoiceHotwordsAuthScope({ userId: _expectedUserId, baseUrl: _baseUrl || origin || null });
-  } else {
+  } else if (!_expectedUserId) {
     setVoiceHotwordsAuthScope(null);
   }
 }
@@ -2217,12 +2218,18 @@ export async function saveUserPref(key: string, value: unknown, options: { signa
   emitUserPrefChanged(key, value);
 }
 
-export async function fetchVoiceHotwords(options: { projectKey?: string; signal?: AbortSignal } = {}): Promise<VoiceHotwordsSyncRecord | null> {
+export async function fetchVoiceHotwords(
+  options: { projectKey?: string; expectedUserId?: string; signal?: AbortSignal } = {},
+): Promise<VoiceHotwordsSyncRecord | null> {
+  const expected = options.expectedUserId ?? _expectedUserId;
+  if (!expected || expected !== _expectedUserId) {
+    throw new Error('voice_hotwords_unconfirmed_user');
+  }
   const qs = options.projectKey ? `?projectKey=${encodeURIComponent(options.projectKey)}` : '';
   try {
     const res = await apiFetch<{ record?: VoiceHotwordsSyncRecord }>(`${VOICE_HOTWORDS_API_PATH}${qs}`, {
       signal: options.signal,
-      headers: _expectedUserId ? { [EXPECTED_USER_ID_HEADER]: _expectedUserId } : undefined,
+      headers: { [EXPECTED_USER_ID_HEADER]: expected },
     });
     return res?.record ?? null;
   } catch (err) {
@@ -2233,12 +2240,16 @@ export async function fetchVoiceHotwords(options: { projectKey?: string; signal?
 
 export async function updateVoiceHotwords(
   payload: VoiceHotwordsPutRequest,
-  options: { signal?: AbortSignal } = {},
+  options: { expectedUserId?: string; signal?: AbortSignal } = {},
 ): Promise<VoiceHotwordsSyncRecord | null> {
+  const expected = options.expectedUserId ?? _expectedUserId;
+  if (!expected || expected !== _expectedUserId) {
+    throw new Error('voice_hotwords_unconfirmed_user');
+  }
   try {
     const res = await apiFetch<{ record?: VoiceHotwordsSyncRecord }>(VOICE_HOTWORDS_API_PATH, {
       signal: options.signal,
-      headers: _expectedUserId ? { [EXPECTED_USER_ID_HEADER]: _expectedUserId } : undefined,
+      headers: { [EXPECTED_USER_ID_HEADER]: expected },
       method: 'PUT',
       body: JSON.stringify(payload),
     });
@@ -2250,8 +2261,8 @@ export async function updateVoiceHotwords(
 }
 
 registerVoiceHotwordsSyncClient({
-  fetchRecord: (signal) => fetchVoiceHotwords({ signal }),
-  updateRecord: (payload, signal) => updateVoiceHotwords(payload, { signal }),
+  fetchRecord: (opts: VoiceHotwordsSyncRequestOptions) => fetchVoiceHotwords(opts),
+  updateRecord: (payload, opts: VoiceHotwordsSyncRequestOptions) => updateVoiceHotwords(payload, opts),
 });
 
 // ── Passkey (WebAuthn) API ─────────────────────────────────────────────────
