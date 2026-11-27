@@ -482,7 +482,7 @@ html.native-ios-mac .chat-dl-btn {
 .tab-session-error { margin-left: 4px; font-size: 11px; line-height: 1; flex-shrink: 0; }
 .tab.pinned { box-shadow: inset 0 1px 0 rgba(245,158,11,0.28); }
 .tab { min-height: 34px; padding: 0 15px; cursor: pointer; color: #7b8797; border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0; white-space: nowrap; font-size: 12px; font-weight: 600; transition: color 0.14s, background 0.14s, border-color 0.14s, box-shadow 0.14s; background: rgba(15,23,42,0.38); display: flex; align-items: center; position: relative; overflow: visible; }
-.session-tab-seq { position: absolute; top: -3px; left: -3px; font-size: 9px; font-weight: 700; line-height: 1; padding: 1px 3px; border-radius: 4px; background: rgba(15,23,42,0.94); border: 1px solid rgba(125,211,252,0.38); color: #bae6fd; z-index: 3; pointer-events: none; font-variant-numeric: tabular-nums; box-sizing: border-box; }
+.session-tab-seq { position: absolute; top: -3px; left: 0; font-size: 9px; font-weight: 700; line-height: 1; padding: 1px 3px; border-radius: 4px; background: rgba(15,23,42,0.94); border: 1px solid rgba(125,211,252,0.38); color: #bae6fd; z-index: 3; pointer-events: none; font-variant-numeric: tabular-nums; box-sizing: border-box; }
 .tab.active .session-tab-seq { border-color: rgba(34,211,238,0.72); color: #e0f2fe; }
 .tab.brain .session-tab-seq { border-color: rgba(167,139,250,0.48); color: #ddd6fe; }
 .tab.brain.active .session-tab-seq { border-color: rgba(167,139,250,0.82); color: #ede9fe; }
@@ -26567,7 +26567,10 @@ html.native-mac-desktop .remote-desktop-window-blocked {
     font-size: 8px;
   }
 
-  html[data-native-platform="android"] .subsession-card-seq,
+  html[data-native-platform="android"] .subsession-card-seq {
+    font-size: 8px;
+  }
+
   html[data-native-platform="android"] .session-tab-seq {
     font-size: 8px;
     padding: 0 3px;

@@ -28,6 +28,7 @@ import {
   isMacPlatform,
   normalizeModifierToken,
   normalizeShortcutChordString,
+  parseModifierDigitChord,
   resolveKeyboardShortcutSlots,
   resolveMacVoiceInlineModifier,
   resolveMainTabQuickModifiers,
@@ -212,23 +213,67 @@ function KeyboardShortcutsSectionInner({
     [mainTabModifiers, isMac, defaultMainTabModifiers],
   );
 
-  const modifierGroupConflicts = useMemo(() => {
+  const formatTargetLabel = (target: ShortcutSlotTarget) => {
+    const actionLabel = t(ACTION_LABELS[target.action].titleKey as 'settings.shortcuts.actions.server_prev.title');
+    const slotLabel = t(
+      target.slot === 'primary' ? 'settings.shortcuts.slot_primary' : 'settings.shortcuts.slot_secondary',
+    );
+    return `${actionLabel} (${slotLabel})`;
+  };
+
+  const { modifierGroupConflicts, actionDigitGroupConflicts } = useMemo(() => {
     const resolvedByGroup: Record<ModifierGroupId, ShortcutModifierKey[]> = {
       subsession: subSessionModifiers,
       taskPairSplit: taskPairSplitModifiers,
       mainTab: mainTabModifiers,
     };
-    const out = {} as Record<ModifierGroupId, string | null>;
+    const groupConflictLists: Record<ModifierGroupId, string[]> = {
+      subsession: [],
+      taskPairSplit: [],
+      mainTab: [],
+    };
+    const actionLists = {} as Record<ShortcutActionId, string[]>;
+    for (const action of SHORTCUT_ACTION_IDS) {
+      actionLists[action] = [];
+    }
+
     for (const id of MODIFIER_GROUP_IDS) {
-      const others = MODIFIER_GROUP_IDS
-        .filter((other) => other !== id && areShortcutModifiersEqual(resolvedByGroup[id], resolvedByGroup[other], resolvedByGroup[id]))
-        .map((other) => t(MODIFIER_GROUP_HANDLERS[other].titleKey));
-      out[id] = others.length > 0
-        ? t('settings.shortcuts.conflict_warning', { actions: others.join(', ') })
+      for (const other of MODIFIER_GROUP_IDS) {
+        if (other !== id && areShortcutModifiersEqual(resolvedByGroup[id], resolvedByGroup[other], resolvedByGroup[id])) {
+          groupConflictLists[id].push(t(MODIFIER_GROUP_HANDLERS[other].titleKey));
+        }
+      }
+      for (const action of SHORTCUT_ACTION_IDS) {
+        for (const slot of SHORTCUT_SLOTS) {
+          const digitChord = parseModifierDigitChord(resolvedSlots[action][slot]);
+          if (
+            digitChord
+            && areShortcutModifiersEqual(digitChord.modifiers, resolvedByGroup[id], resolvedByGroup[id])
+          ) {
+            const slotLabel = formatTargetLabel({ action, slot });
+            if (!groupConflictLists[id].includes(slotLabel)) {
+              groupConflictLists[id].push(slotLabel);
+            }
+            const groupTitle = t(MODIFIER_GROUP_HANDLERS[id].titleKey);
+            if (!actionLists[action].includes(groupTitle)) {
+              actionLists[action].push(groupTitle);
+            }
+          }
+        }
+      }
+    }
+
+    const outGroups = {} as Record<ModifierGroupId, string | null>;
+    for (const id of MODIFIER_GROUP_IDS) {
+      outGroups[id] = groupConflictLists[id].length > 0
+        ? t('settings.shortcuts.conflict_warning', { actions: groupConflictLists[id].join(', ') })
         : null;
     }
-    return out;
-  }, [subSessionModifiers, taskPairSplitModifiers, mainTabModifiers, t]);
+    return {
+      modifierGroupConflicts: outGroups,
+      actionDigitGroupConflicts: actionLists,
+    };
+  }, [subSessionModifiers, taskPairSplitModifiers, mainTabModifiers, resolvedSlots, t]);
 
   const macVoiceModifier = useMemo(
     () => resolveMacVoiceInlineModifier(cleanOverrides),
@@ -319,14 +364,6 @@ function KeyboardShortcutsSectionInner({
   const handleResetMacVoiceModifier = () => {
     setStatusNotice(null);
     onChangeOverrides((prev) => applyMacVoiceInlineModifier(prev, DEFAULT_MAC_VOICE_INLINE_MODIFIER));
-  };
-
-  const formatTargetLabel = (target: ShortcutSlotTarget) => {
-    const actionLabel = t(ACTION_LABELS[target.action].titleKey as 'settings.shortcuts.actions.server_prev.title');
-    const slotLabel = t(
-      target.slot === 'primary' ? 'settings.shortcuts.slot_primary' : 'settings.shortcuts.slot_secondary',
-    );
-    return `${actionLabel} (${slotLabel})`;
   };
 
   useEffect(() => {
@@ -741,16 +778,20 @@ function KeyboardShortcutsSectionInner({
           const actionTitle = t(labels.titleKey as 'settings.shortcuts.actions.server_prev.title');
           const actionDesc = t(labels.descKey as 'settings.shortcuts.actions.server_prev.desc');
           const isRowRecording = recordingTarget?.action === action;
-          const actionConflicts = [
+          const slotConflictLabels = [
             ...(conflicts[action]?.primary ?? []),
             ...(conflicts[action]?.secondary ?? []),
+          ].map((other) => formatTargetLabel(other));
+          const allConflictLabels = [
+            ...slotConflictLabels,
+            ...actionDigitGroupConflicts[action].filter((label) => !slotConflictLabels.includes(label)),
           ];
 
           return (
             <div
               key={action}
               ref={isRowRecording ? recorderContainerRef : undefined}
-              class={`settings-shortcut-row${isRowRecording ? ' is-recording' : ''}${actionConflicts.length > 0 ? ' has-conflict' : ''}`}
+              class={`settings-shortcut-row${isRowRecording ? ' is-recording' : ''}${allConflictLabels.length > 0 ? ' has-conflict' : ''}`}
               data-testid={`shortcut-row-${action}`}
               data-shortcut-recording={isRowRecording ? 'true' : undefined}
             >
@@ -761,12 +802,10 @@ function KeyboardShortcutsSectionInner({
                 <div class="settings-shortcut-desc">
                   {actionDesc}
                 </div>
-                {actionConflicts.length > 0 && (
+                {allConflictLabels.length > 0 && (
                   <div class="settings-shortcut-conflict" data-testid={`shortcut-conflict-${action}`}>
                     {t('settings.shortcuts.conflict_warning', {
-                      actions: actionConflicts
-                        .map((other) => formatTargetLabel(other))
-                        .join(', '),
+                      actions: allConflictLabels.join(', '),
                     })}
                   </div>
                 )}

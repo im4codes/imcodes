@@ -1298,6 +1298,20 @@ export function formatSubSessionQuickModifierKeycaps(
   return formatShortcutModifierKeycaps(modifiers, isMac, DEFAULT_SUBSESSION_QUICK_MODIFIERS);
 }
 
+/**
+ * If a canonical single-slot chord has the form `<Modifiers>+1..9` (digit 1..9 with >= 1 modifier),
+ * return its modifier list and 1-based digit so UIs can detect conflicts with modifier+digit groups.
+ */
+export function parseModifierDigitChord(
+  chord: string | null | undefined,
+): { modifiers: ShortcutModifierKey[]; digit: number } | null {
+  const parsed = parseShortcutChord(chord);
+  if (!parsed || !/^[1-9]$/.test(parsed.key)) return null;
+  const modifiers = SHORTCUT_MODIFIER_KEYS.filter((mod) => parsed[mod]);
+  if (modifiers.length === 0) return null;
+  return { modifiers, digit: Number(parsed.key) };
+}
+
 export type SubSessionQuickShortcutMatch = { kind: 'open'; index: number };
 export type TaskPairSplitQuickShortcutMatch = { kind: 'toggleSplit'; index: number };
 export type MainTabQuickShortcutMatch = { kind: 'selectMainTab'; index: number };

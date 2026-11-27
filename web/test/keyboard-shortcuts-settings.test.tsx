@@ -714,5 +714,27 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('maintab-mod-alt').getAttribute('aria-pressed')).toBe('true');
     expect(screen.queryByTestId('maintab-quick-conflict')).toBeNull();
     expect(screen.queryByTestId('maintab-mod-reset')).toBeNull();
+
+    // Cross-conflict: recording Alt+1 in a regular slot (tabNext) must warn on BOTH tabNext and mainTab group;
+    // changing to Alt+0 or changing mainTab modifiers to Ctrl+Alt clears both warnings cleanly.
+    fireEvent.click(screen.getByTestId('shortcut-record-tabNext'));
+    fireEvent.keyDown(document, { key: '¡', code: 'Digit1', altKey: true });
+    expect(screen.getByTestId('shortcut-conflict-tabNext').textContent).toContain('Main Tab Quick Switch Shortcuts');
+    expect(screen.getByTestId('maintab-quick-conflict').textContent).toContain('Next Tab');
+
+    fireEvent.click(screen.getByTestId('shortcut-record-tabNext'));
+    fireEvent.keyDown(document, { key: 'º', code: 'Digit0', altKey: true });
+    expect(screen.queryByTestId('shortcut-conflict-tabNext')).toBeNull();
+    expect(screen.queryByTestId('maintab-quick-conflict')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('shortcut-record-tabNext'));
+    fireEvent.keyDown(document, { key: '¡', code: 'Digit1', altKey: true });
+    expect(screen.getByTestId('shortcut-conflict-tabNext').textContent).toContain('Main Tab Quick Switch Shortcuts');
+    expect(screen.getByTestId('maintab-quick-conflict').textContent).toContain('Next Tab');
+
+    fireEvent.click(screen.getByTestId('maintab-mod-record'));
+    fireEvent.keyDown(document, { key: '1', code: 'Digit1', ctrlKey: true, altKey: true });
+    expect(screen.queryByTestId('shortcut-conflict-tabNext')).toBeNull();
+    expect(screen.queryByTestId('maintab-quick-conflict')).toBeNull();
   });
 });

@@ -41,6 +41,7 @@ import {
   matchSubSessionQuickShortcut,
   matchTaskPairSplitQuickShortcut,
   normalizeShortcutChordString,
+  parseModifierDigitChord,
   parseShortcutChord,
   resolveFocusedKeyboardViewMode,
   resolveKeyboardShortcuts,
@@ -1097,6 +1098,11 @@ describe('keyboard-shortcuts core helpers', () => {
       metaKey: false,
       isComposing: true,
     }, ['alt'])).toBeNull();
+
+    expect(parseModifierDigitChord('Alt+1')).toEqual({ modifiers: ['alt'], digit: 1 });
+    expect(parseModifierDigitChord('Ctrl+Shift+9')).toEqual({ modifiers: ['ctrl', 'shift'], digit: 9 });
+    expect(parseModifierDigitChord('Alt+0')).toBeNull();
+    expect(parseModifierDigitChord('Alt+j')).toBeNull();
   });
 
   it('allows non-text input controls and non-modal aria-modal="false" dialogs while blocking text inputs and modals', () => {

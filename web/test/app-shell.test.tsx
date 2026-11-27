@@ -15408,10 +15408,11 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(modalEvt.defaultPrevented).toBe(false);
       modal.remove();
 
-      // Out-of-bounds Alt+5 with 2 tabs is a safe no-op
+      // Out-of-bounds Alt+5 (macOS Option+5 = '∞') in workspace Composer MUST be consumed
+      // (preventDefault() so '∞' is never typed into Composer) while staying a safe no-op!
       const oobEvt = new KeyboardEvent('keydown', { key: '∞', code: 'Digit5', altKey: true, bubbles: true, cancelable: true });
       mainInput.dispatchEvent(oobEvt);
-      expect(oobEvt.defaultPrevented).toBe(false);
+      expect(oobEvt.defaultPrevented).toBe(true);
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
       // macOS Option+2 (key='™', code='Digit2') switches cleanly to deck_beta_brain
@@ -15435,18 +15436,40 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
       });
 
-      // Open Task Mode, then press Alt+1 (key='¡', code='Digit1') -> exits Task Mode and switches to deck_alpha_brain
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', code: 'KeyK', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true }));
-      const taskModeOverlay = await screen.findByText(/global task mode|任务模式/i).catch(() => null);
-      void taskModeOverlay;
+      // Open Task Mode via real desktop-task-mode-btn, verify global-task-mode-overlay is present,
+      // then press Alt+1 (key='¡', code='Digit1') -> overlay disappears & switches to deck_alpha_brain
+      fireEvent.click(await screen.findByTestId('desktop-task-mode-btn'));
+      expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
       const backTo1FromTaskMode = new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
       window.dispatchEvent(backTo1FromTaskMode);
       expect(backTo1FromTaskMode.defaultPrevented).toBe(true);
       await waitFor(() => {
+        expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
         expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
       });
 
-      // Customize mainTabQuickModifiers to ['ctrl', 'alt']: plain Alt+2 stops switching, Ctrl+Alt+2 switches!
+      // Click real server-home entry -> enters Dashboard; verify workspace tabs unmounted,
+      // Alt+5 keeps Dashboard safely, and Alt+2 returns directly to srv-1 tab #2 (deck_beta_brain)!
+      fireEvent.click(screen.getByText('server-home'));
+      await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
+      const dashOobEvt = new KeyboardEvent('keydown', { key: '∞', code: 'Digit5', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(dashOobEvt);
+      expect(dashOobEvt.defaultPrevented).toBe(true);
+      expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull();
+
+      const returnFromDashToTab2 = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(returnFromDashToTab2);
+      expect(returnFromDashToTab2.defaultPrevented).toBe(true);
+      await waitFor(() => {
+        expect(screen.getByTestId('app-shell-session-tabs')).toBeTruthy();
+        expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
+      });
+
+      // Switch back to Tab #1 first, then customize mainTabQuickModifiers to ['ctrl', 'alt']:
+      // plain Alt+2 stops switching, Ctrl+Alt+2 switches!
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true }));
+      await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
+
       fireEvent.click(screen.getByText('server-settings'));
       fireEvent.click(await screen.findByText('settings-maintab-ctrl-alt'));
       fireEvent.click(screen.getByText('settings-back'));
@@ -15465,5 +15488,22 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     } finally {
       Object.defineProperty(navigator, 'platform', { configurable: true, value: originalPlatform });
     }
+  }, 15_000);
+
+  it('keeps Alt+1..9 inert when no server/workspace has been entered (fresh Dashboard safe fallback)', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/auth/user/me') return Promise.resolve({ id: 'user-1' });
+      if (path === '/api/server') return Promise.resolve({ servers: [] });
+      if (path.startsWith('/api/preferences')) return Promise.resolve({ preferences: {} });
+      return Promise.resolve({});
+    });
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
+    const evt = new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
+    window.dispatchEvent(evt);
+    expect(evt.defaultPrevented).toBe(false);
+    expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull();
   }, 15_000);
 });

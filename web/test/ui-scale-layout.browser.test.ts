@@ -1548,4 +1548,180 @@ Gtk.main()
       await browser.close();
     }
   }, 60_000);
+
+  it('keeps SessionTabs top-left corner badges zero-growth and unclipped at left scroll edge, narrow viewports, and two-digit labels in real Chromium', { timeout: 45000 }, async () => {
+    const require = createRequire(import.meta.url);
+    const { chromium } = require('playwright') as typeof import('playwright');
+    const executablePath = resolveChromiumExecutable(chromium);
+    if (!executablePath) {
+      return;
+    }
+    const { build } = require('esbuild') as typeof import('esbuild');
+    const here = dirname(fileURLToPath(import.meta.url));
+    const css = readFileSync(resolve(here, '../src/styles.css'), 'utf8');
+    const sessionTabsPath = resolve(here, '../src/components/SessionTabs.tsx');
+
+    const compiled = await build({
+      stdin: {
+        contents: `
+          import { render } from 'preact';
+          import { SessionTabs } from ${JSON.stringify(sessionTabsPath)};
+
+          window.__mountTabs = (activeName) => {
+            const mount = document.getElementById('tabs-mount');
+            const sessions = Array.from({ length: 18 }, (_, i) => ({
+              name: \`sess_\${i + 1}\`,
+              project: \`proj-\${i + 1}\`,
+              label: i === 9 ? 'tenth-tab' : \`tab-\${i + 1}\`,
+              role: i === 0 ? 'brain' : \`w\${i}\`,
+              agentType: i === 0 ? 'claude-code-sdk' : 'codex-sdk',
+              state: 'idle',
+            }));
+            render(
+              <SessionTabs
+                sessions={sessions}
+                activeSession={activeName}
+                connected={true}
+                latencyMs={18}
+                onSelect={() => {}}
+                onNewSession={() => {}}
+                onStopProject={() => {}}
+                onRestartProject={() => {}}
+                sessionsLoaded={true}
+                pinned={new Set(['sess_1'])}
+                setPinnedArr={() => {}}
+              />,
+              mount,
+            );
+          };
+        `,
+        resolveDir: resolve(here, '..'),
+        loader: 'tsx',
+      },
+      bundle: true,
+      format: 'iife',
+      write: false,
+      jsx: 'automatic',
+      jsxImportSource: 'preact',
+      plugins: [
+        {
+          name: 'tabs-browser-stubs',
+          setup(buildCtx) {
+            buildCtx.onResolve({ filter: /^react-i18next$/ }, () => ({ path: 'react-i18next', namespace: 'tabs-stub' }));
+            buildCtx.onResolve({ filter: /^\.\.\/api\.js$/ }, () => ({ path: 'api-stub', namespace: 'tabs-stub' }));
+            buildCtx.onLoad({ filter: /.*/, namespace: 'tabs-stub' }, (args) => ({
+              contents: args.path === 'react-i18next'
+                ? 'export const useTranslation = () => ({ t: (_k, d) => (typeof d === "string" ? d : _k) });'
+                : 'export const getUserPref = async () => null; export const saveUserPref = async () => {};',
+              loader: 'js',
+            }));
+          },
+        },
+      ],
+    });
+    const bundleCode = compiled.outputFiles[0]!.text;
+    const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;background:#080d16;"><div class="layout" style="width:100vw;height:100vh;"><main class="main" style="width:100%;min-width:0;display:flex;flex-direction:column;"><div id="tabs-mount" style="width:100%;min-width:0;"></div></main></div></body></html>`;
+
+    const browser = await chromium.launch({ headless: true, executablePath });
+    try {
+      const viewports = [
+        { width: 1280, height: 800, mobile: false },
+        { width: 460, height: 700, mobile: false },
+        { width: 360, height: 780, mobile: true },
+      ];
+      for (const vp of viewports) {
+        const page = await browser.newPage({ viewport: { width: vp.width, height: vp.height } });
+        await page.route('https://imcodes.test/**', (route) => route.fulfill({ contentType: 'text/html', body: html }));
+        await page.goto('https://imcodes.test/');
+        await page.addStyleTag({ content: css });
+        await page.addScriptTag({ content: bundleCode });
+        await page.evaluate((isMob) => {
+          document.documentElement.classList.toggle('is-mobile', isMob);
+          (window as unknown as { __mountTabs: (name: string) => void }).__mountTabs('sess_10');
+        }, vp.mobile);
+        await page.waitForSelector('.tab-bar .tab .session-tab-seq');
+
+        // 1. Compare real rendered non-zero dimensions with corner badges visible vs hidden
+        const dims = await page.evaluate(() => {
+          const bar = document.querySelector('.tab-bar') as HTMLElement;
+          const tabs = [...bar.querySelectorAll<HTMLElement>('.tab')];
+          const measure = () => ({
+            barHeight: bar.getBoundingClientRect().height,
+            tabs: tabs.map((t) => ({
+              width: t.getBoundingClientRect().width,
+              height: t.getBoundingClientRect().height,
+            })),
+          });
+          const withBadges = measure();
+          const hideStyle = document.createElement('style');
+          hideStyle.textContent = '.session-tab-seq { display: none !important; }';
+          document.head.appendChild(hideStyle);
+          void bar.offsetHeight;
+          const withoutBadges = measure();
+          hideStyle.remove();
+          return { withBadges, withoutBadges };
+        });
+
+        expect(dims.withBadges.barHeight).toBeGreaterThanOrEqual(42);
+        expect(Math.abs(dims.withBadges.barHeight - dims.withoutBadges.barHeight)).toBeLessThan(0.01);
+        expect(dims.withBadges.tabs).toHaveLength(18);
+        for (let i = 0; i < dims.withBadges.tabs.length; i++) {
+          expect(dims.withBadges.tabs[i]!.width).toBeGreaterThan(40);
+          expect(dims.withBadges.tabs[i]!.height).toBeGreaterThanOrEqual(34);
+          expect(Math.abs(dims.withBadges.tabs[i]!.width - dims.withoutBadges.tabs[i]!.width)).toBeLessThan(0.01);
+          expect(Math.abs(dims.withBadges.tabs[i]!.height - dims.withoutBadges.tabs[i]!.height)).toBeLessThan(0.01);
+        }
+
+        // 2. Scroll Tab #10 flush to left edge of .tab-bar; verify Tab #10 and two-digit badge '10' are unclipped
+        const edgeCheck = await page.evaluate(() => {
+          const bar = document.querySelector('.tab-bar') as HTMLElement;
+          const tab1 = document.querySelector('[data-testid="session-tab-seq-sess_1"]')?.closest('.tab') as HTMLElement;
+          const badge1 = document.querySelector('[data-testid="session-tab-seq-sess_1"]') as HTMLElement;
+          bar.scrollLeft = 0;
+          const bBar0 = bar.getBoundingClientRect();
+          const b1 = badge1.getBoundingClientRect();
+          const t1 = tab1.getBoundingClientRect();
+
+          const badge10 = document.querySelector('[data-testid="session-tab-seq-sess_10"]') as HTMLElement;
+          const tab10 = badge10.closest('.tab') as HTMLElement;
+          const tab10Wrap = tab10.closest('.tab-wrap') as HTMLElement;
+          bar.scrollLeft = tab10Wrap.offsetLeft;
+          const bBar10 = bar.getBoundingClientRect();
+          const b10 = badge10.getBoundingClientRect();
+          const t10 = tab10.getBoundingClientRect();
+
+          return {
+            tab1Text: badge1.textContent,
+            badge1LeftOk: b1.left >= bBar0.left - 0.5 && b1.left >= t1.left - 0.5,
+            badge1TopOk: b1.top >= bBar0.top - 0.5,
+            badge1SizeOk: b1.width > 0 && b1.height > 0,
+            tab10Text: badge10.textContent,
+            debugRects: { bar: bBar10, tab10: t10, badge10: b10, scrollLeft: bar.scrollLeft, wrapOffsetLeft: tab10Wrap.offsetLeft },
+            tab10VisibleOk: t10.left >= bBar10.left - 0.5 && t10.right <= bBar10.right + 0.5,
+            badge10LeftOk: b10.left >= bBar10.left - 0.5 && b10.left >= t10.left - 0.5,
+            badge10TopOk: b10.top >= bBar10.top - 0.5,
+            badge10RightOk: b10.right <= bBar10.right + 0.5,
+            badge10BottomOk: b10.bottom <= bBar10.bottom + 0.5,
+            badge10SizeOk: b10.width > 0 && b10.height > 0,
+          };
+        });
+
+        expect(edgeCheck.tab1Text).toBe('1');
+        expect(edgeCheck.badge1LeftOk).toBe(true);
+        expect(edgeCheck.badge1TopOk).toBe(true);
+        expect(edgeCheck.badge1SizeOk).toBe(true);
+        expect(edgeCheck.tab10Text).toBe('10');
+        expect(edgeCheck.tab10VisibleOk, JSON.stringify(edgeCheck.debugRects)).toBe(true);
+        expect(edgeCheck.badge10LeftOk).toBe(true);
+        expect(edgeCheck.badge10TopOk).toBe(true);
+        expect(edgeCheck.badge10RightOk).toBe(true);
+        expect(edgeCheck.badge10BottomOk).toBe(true);
+        expect(edgeCheck.badge10SizeOk).toBe(true);
+
+        await page.close();
+      }
+    } finally {
+      await browser.close();
+    }
+  }, 45_000);
 });

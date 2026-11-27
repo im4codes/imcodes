@@ -1287,6 +1287,7 @@ function InternalMainApp() {
     setSharedEntriesError(null);
     setManagedShares([]);
     setManualDashboard(false);
+    dashboardReturnWorkspaceRef.current = null;
     setAutoEnteringRecent(false);
     try {
       // If an invalidated login was already inside a native credential write,
@@ -3186,6 +3187,20 @@ function InternalMainApp() {
     () => sortSessionsByTabOrder(visibleMainSessions, tabOrder, pinnedTabs),
     [visibleMainSessions, tabOrder, pinnedTabs],
   );
+  const unifiedServersNavRef = useRef<typeof unifiedServers>([]);
+  const orderedTabsNavRef = useRef(orderedVisibleMainSessions);
+  orderedTabsNavRef.current = orderedVisibleMainSessions;
+  const resolvedSelectedServerNameNavRef = useRef<string | null>(null);
+  const selectedShareTargetNavRef = useRef<typeof selectedShareTarget>(null);
+  const tabOrderRef = useRef(tabOrder);
+  tabOrderRef.current = tabOrder;
+  const pinnedTabsRef = useRef(pinnedTabs);
+  pinnedTabsRef.current = pinnedTabs;
+  const dashboardReturnWorkspaceRef = useRef<{
+    serverId: string;
+    serverName: string | null;
+    orderedTabNames: string[];
+  } | null>(null);
   const [shortcutOverrides, setShortcutOverrides] = useSyncedPreference<KeyboardShortcutOverrides>(
     KEYBOARD_SHORTCUTS_PREF_KEY,
     {},
@@ -5530,6 +5545,7 @@ function InternalMainApp() {
       lastSharedEntryIdByServerRef.current.set(opened.server.id, entry.id);
       rememberSharedTab(entry);
       setManualDashboard(false);
+      dashboardReturnWorkspaceRef.current = null;
       selectedServerIdRef.current = opened.server.id;
       setSelectedServerId(opened.server.id);
       setSelectedServerName(opened.server.name);
@@ -8234,8 +8250,13 @@ function InternalMainApp() {
     return initialSwitchSessions;
   }, [resetServerScopedOverlaysAndTargets, setActiveSession]);
 
-  const switchToOwnedServerInApp = useCallback((serverId: string, serverName?: string | null) => {
+  const switchToOwnedServerInApp = useCallback((
+    serverId: string,
+    serverName?: string | null,
+    options?: { targetSessionName?: string },
+  ) => {
     setManualDashboard(false);
+    dashboardReturnWorkspaceRef.current = null;
     setSelectedShareTarget(null);
     setSelectedShareCoverageRole(null);
     setSelectedSharedEntryId(null);
@@ -8286,15 +8307,25 @@ function InternalMainApp() {
     const navigableSwitchNames = initialSwitchSessions
       .filter(isNavigableMainSession)
       .map((session) => session.name);
-    if (navigableSwitchNames.length > 0) {
+    const explicitTarget = options?.targetSessionName;
+    if (explicitTarget && (navigableSwitchNames.length === 0 || navigableSwitchNames.includes(explicitTarget))) {
+      explicitSelectionServerRef.current = serverId;
+      initialHashStateRef.current = { serverId, sessionName: explicitTarget, sharedEntryId: null };
+      setActiveSession(explicitTarget, { remember: false });
+      writeHashState(serverId, explicitTarget, null);
+    } else if (navigableSwitchNames.length > 0) {
       restoreLastTabRef.current(serverId, navigableSwitchNames);
     } else {
       writeHashState(serverId, null, null);
     }
-  }, [resetServerScopedStateForSwitch, selectedShareTarget]);
+  }, [resetServerScopedStateForSwitch, selectedShareTarget, setActiveSession]);
   switchToOwnedServerInAppRef.current = switchToOwnedServerInApp;
 
-  const handleSelectServer = useCallback(async (serverId: string, serverName?: string) => {
+  const handleSelectServer = useCallback(async (
+    serverId: string,
+    serverName?: string,
+    options?: { targetSessionName?: string },
+  ) => {
     const hadPendingSharedNavigation = Boolean(
       sharedOpenAbortRef.current
       || sharedOpenIntentRef.current
@@ -8330,7 +8361,7 @@ function InternalMainApp() {
       return;
     }
 
-    switchToOwnedServerInApp(serverId, serverName);
+    switchToOwnedServerInApp(serverId, serverName, options);
   }, [manualDashboard, selectedShareTarget, selectedSharedEntryId, switchToOwnedServerInApp]);
 
   const handleSelectServerForShare = useCallback((serverId: string) => {
@@ -9072,6 +9103,16 @@ function InternalMainApp() {
     autoEntryRunRef.current++;
     const prevServer = selectedServerIdRef.current;
     const currentSession = activeSessionRef.current;
+    const prevOwnedServer = prevServer && !selectedShareTargetNavRef.current
+      ? unifiedServersNavRef.current.find((srv) => srv.id === prevServer && !srv.isSharedIn)
+      : undefined;
+    dashboardReturnWorkspaceRef.current = prevOwnedServer && orderedTabsNavRef.current.length > 0
+      ? {
+          serverId: prevOwnedServer.id,
+          serverName: prevOwnedServer.name ?? resolvedSelectedServerNameNavRef.current ?? null,
+          orderedTabNames: orderedTabsNavRef.current.map((s) => s.name),
+        }
+      : null;
     if (prevServer && currentSession) {
       const isCurrentIncog = isIncognitoTimelineSession(prevServer, currentSession)
         || sessionsRef.current.some((s) => s.name === currentSession && s.incognito === true);
@@ -9560,9 +9601,7 @@ function InternalMainApp() {
   const dismissServerSwitchWatermark = useCallback(() => {
     setServerSwitchWatermark(null);
   }, []);
-  const unifiedServersNavRef = useRef(unifiedServers);
   unifiedServersNavRef.current = unifiedServers;
-  const orderedTabsNavRef = useRef(orderedVisibleMainSessions);
   orderedTabsNavRef.current = orderedVisibleMainSessions;
   const resolvedShortcutSlotsRef = useRef(resolvedShortcutSlots);
   resolvedShortcutSlotsRef.current = resolvedShortcutSlots;
@@ -9572,6 +9611,8 @@ function InternalMainApp() {
   resolvedTaskPairSplitModifiersRef.current = resolvedTaskPairSplitModifiers;
   const resolvedMainTabQuickModifiersRef = useRef(resolvedMainTabQuickModifiers);
   resolvedMainTabQuickModifiersRef.current = resolvedMainTabQuickModifiers;
+  tabOrderRef.current = tabOrder;
+  pinnedTabsRef.current = pinnedTabs;
   const showTaskModeRef = useRef(showTaskMode);
   showTaskModeRef.current = showTaskMode;
   useEffect(() => {
@@ -9819,9 +9860,7 @@ function InternalMainApp() {
   selectMainSessionTabNavRef.current = selectMainSessionTab;
   const manualDashboardRef = useRef(manualDashboard);
   manualDashboardRef.current = manualDashboard;
-  const selectedShareTargetNavRef = useRef(selectedShareTarget);
   selectedShareTargetNavRef.current = selectedShareTarget;
-  const resolvedSelectedServerNameNavRef = useRef(resolvedSelectedServerName);
   resolvedSelectedServerNameNavRef.current = resolvedSelectedServerName;
   const viewModeNavRef = useRef(viewMode);
   viewModeNavRef.current = viewMode;
@@ -10133,7 +10172,9 @@ function InternalMainApp() {
         focusedSubType: subRecord?.type ?? null,
         focusedSubSessionName: subRecord?.sessionName ?? null,
         inputRefs: inputRefsMap.current,
-        fallbackMainViewMode: viewModeNavRef.current,
+        fallbackMainViewMode: (!selectedServerIdRef.current || manualDashboardRef.current || showTaskModeRef.current)
+          ? 'chat'
+          : viewModeNavRef.current,
       });
 
       if (!canHandleGlobalNavigationShortcut(e.target, document.activeElement, {
@@ -10196,11 +10237,54 @@ function InternalMainApp() {
       }
 
       if (mainTabMatch) {
-        if (!selectedServerIdRef.current) return;
-        const targetTab = orderedTabsNavRef.current[mainTabMatch.index];
-        if (!targetTab) return;
+        if (!selectedServerIdRef.current) {
+          if (!manualDashboardRef.current) return;
+          const returnCtx = dashboardReturnWorkspaceRef.current;
+          const liveOwnedServer = returnCtx
+            ? unifiedServersNavRef.current.find((srv) => srv.id === returnCtx.serverId && !srv.isSharedIn)
+            : undefined;
+          if (!returnCtx || !liveOwnedServer) return;
+          // Inside an authorized Dashboard-return workspace context: always consume the digit shortcut
+          // even if out-of-range so macOS Option+Digit cannot fall through to printable characters.
+          e.preventDefault();
+          e.stopPropagation();
+          suppressHoverPreviewsUntilPointerMove();
+          const cachedNavigable = readCachedServerSessions(returnCtx.serverId).filter(isNavigableMainSession);
+          const validOrderedNames = cachedNavigable.length > 0
+            ? sortSessionsByTabOrder(cachedNavigable, tabOrderRef.current, pinnedTabsRef.current).map((s) => s.name)
+            : returnCtx.orderedTabNames;
+          const targetName = validOrderedNames[mainTabMatch.index];
+          if (!targetName) return;
+          dashboardReturnWorkspaceRef.current = null;
+          const cachedSession = cachedNavigable.find((s) => s.name === targetName);
+          const sessionLabel = cachedSession
+            ? (cachedSession.label || cachedSession.project || cachedSession.name)
+            : targetName;
+          const serverName = liveOwnedServer.name || returnCtx.serverName || returnCtx.serverId;
+          const keycaps = [
+            ...formatShortcutModifierKeycaps(resolvedMainTabQuickModifiersRef.current, isMacPlatform()),
+            String(mainTabMatch.index + 1),
+          ];
+          setServerSwitchWatermark((prev) => ({
+            serverId: returnCtx.serverId,
+            serverName,
+            sessionName: sessionLabel,
+            switchKind: 'session',
+            shortcutKeycaps: keycaps,
+            nonce: (prev?.nonce ?? 0) + 1,
+          }));
+          void handleSelectServerNavRef.current(returnCtx.serverId, liveOwnedServer.name, {
+            targetSessionName: targetName,
+          });
+          return;
+        }
+
+        // Active workspace exists: consume Option+Digit immediately (even if index is out-of-range)
+        // so macOS never inserts printable Option characters into the focused composer.
         e.preventDefault();
         e.stopPropagation();
+        const targetTab = orderedTabsNavRef.current[mainTabMatch.index];
+        if (!targetTab) return;
         suppressHoverPreviewsUntilPointerMove();
         const wasInDashboard = manualDashboardRef.current;
         if (wasInDashboard) {
