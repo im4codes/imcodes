@@ -407,9 +407,9 @@ test('renders sub-session sequence badges, opens & focuses composer via configur
     { id: 'sub-e2e-2', inside: true, bottomLeft: true, sameHeightAsUnbadged: true, floating: true },
   ]);
 
-  // Ctrl+1 while focused in main composer opens sub-e2e-1 and auto-focuses its .controls-input
+  // Alt+1 while focused in main composer opens sub-e2e-1 and auto-focuses its .controls-input
   await page.locator('.controls-input').first().click();
-  await page.keyboard.press('Control+Digit1');
+  await page.keyboard.press('Alt+Digit1');
   const subWin1 = page.locator('.subsession-window[data-subsession-id="sub-e2e-1"]');
   await expect(subWin1).toBeVisible();
   await expect(subWin1.locator('.controls-input')).toBeFocused();
@@ -418,19 +418,19 @@ test('renders sub-session sequence badges, opens & focuses composer via configur
   await page.keyboard.type('hello sub one');
   await expect(subWin1.locator('.controls-input')).toContainText('hello sub one');
 
-  // Ctrl+2 opens sub-e2e-2 and auto-focuses sub-session 2's composer
-  await page.keyboard.press('Control+Digit2');
+  // Alt+2 opens sub-e2e-2 and auto-focuses sub-session 2's composer
+  await page.keyboard.press('Alt+Digit2');
   const subWin2 = page.locator('.subsession-window[data-subsession-id="sub-e2e-2"]');
   await expect(subWin2).toBeVisible();
   await expect(subWin2.locator('.controls-input')).toBeFocused();
 
-  // Repeated Ctrl+2 toggles sub-e2e-2 closed while leaving sub-e2e-1 open
-  await page.keyboard.press('Control+Digit2');
+  // Repeated Alt+2 toggles sub-e2e-2 closed while leaving sub-e2e-1 open
+  await page.keyboard.press('Alt+Digit2');
   await expect(subWin2).toBeHidden();
   await expect(subWin1).toBeVisible();
 
-  // Ctrl+2 again re-opens sub-e2e-2, then Ctrl+0 closes all open sub-session windows
-  await page.keyboard.press('Control+Digit2');
+  // Alt+2 again re-opens sub-e2e-2, then Ctrl+0 closes all open sub-session windows
+  await page.keyboard.press('Alt+Digit2');
   await expect(subWin2).toBeVisible();
   await page.keyboard.press('Control+Digit0');
   await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
@@ -445,13 +445,16 @@ test('renders sub-session sequence badges, opens & focuses composer via configur
   await page.getByTestId('shortcut-record-subSessionCloseAll').click();
   await page.keyboard.press('Alt+Shift+KeyX');
   await expect(page.getByTestId('shortcut-record-subSessionCloseAll')).toContainText('X');
+  await page.getByTestId('subsession-mod-ctrl').click();
   await page.getByTestId('subsession-mod-shift').click();
+  await page.getByTestId('subsession-mod-alt').click();
+  await expect(page.getByTestId('subsession-quick-preview-open')).toContainText('Ctrl');
   await expect(page.getByTestId('subsession-quick-preview-open')).toContainText('Shift');
   await page.locator('.settings-back-btn').click();
 
-  // Plain Ctrl+1 and Ctrl+0 no longer trigger, while Ctrl+Shift+1 toggles open/close and Alt+Shift+X closes all
+  // Plain Alt+1 and Ctrl+0 no longer trigger, while Ctrl+Shift+1 toggles open/close and Alt+Shift+X closes all
   await page.locator('.controls-input').first().click();
-  await page.keyboard.press('Control+Digit1');
+  await page.keyboard.press('Alt+Digit1');
   await expect(page.locator('.subsession-window:visible')).toHaveCount(0);
 
   await page.keyboard.press('Control+Shift+Digit1');

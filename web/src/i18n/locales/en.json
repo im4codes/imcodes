@@ -2485,7 +2485,7 @@
       },
       "main_tab_quick": {
         "title": "Main Tab Quick Switch Shortcuts",
-        "desc": "Choose which modifier keys combine with number keys 1–9 to switch to the numbered main tab, or press again on the active tab to collapse floating sub-sessions.",
+        "desc": "Choose which modifier keys combine with number keys 1–9 to switch to the numbered main tab, or press again on the active tab to collapse floating sub-sessions (default Ctrl).",
         "open_label": "Switch to main tab #",
         "modifiers_aria": "Main tab quick switch shortcut modifier keys",
         "reset_aria": "Reset main tab quick switch shortcut modifiers",

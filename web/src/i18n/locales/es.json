@@ -2485,7 +2485,7 @@
       },
       "main_tab_quick": {
         "title": "Atajos rápidos de pestaña principal",
-        "desc": "Elige las teclas modificadoras que se combinan con 1–9 para cambiar a la pestaña principal numerada, o púlsalo de nuevo en la pestaña activa para contraer subsesiones flotantes (por defecto Alt).",
+        "desc": "Elige las teclas modificadoras que se combinan con 1–9 para cambiar a la pestaña principal numerada, o púlsalo de nuevo en la pestaña activa para contraer subsesiones flotantes (por defecto Ctrl).",
         "open_label": "Cambiar a la pestaña principal #",
         "modifiers_aria": "Teclas modificadoras para atajos rápidos de pestaña principal",
         "reset_aria": "Restablecer modificadores de pestaña principal",

@@ -10367,10 +10367,12 @@ function InternalMainApp() {
 
       if (quickSubMatch) {
         if (!selectedServerIdRef.current || manualDashboardRef.current) return;
-        const targetSub = orderedVisibleSubSessionsRef.current[quickSubMatch.index];
-        if (!targetSub) return;
+        // Active workspace exists: consume Option/Alt+Digit immediately (even if index is out-of-range)
+        // so macOS never inserts printable Option characters into the focused composer.
         e.preventDefault();
         e.stopPropagation();
+        const targetSub = orderedVisibleSubSessionsRef.current[quickSubMatch.index];
+        if (!targetSub) return;
         lastAutoFocusedRef.current = null;
         if (openSubIdsRef.current.has(targetSub.id)) {
           minimizeSubSessionWindowRef.current(targetSub.id);

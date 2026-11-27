@@ -401,34 +401,32 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     const shiftBtn = screen.getByTestId('subsession-mod-shift') as HTMLButtonElement;
     const resetAllBtn = screen.getByTestId('shortcuts-reset-all') as HTMLButtonElement;
 
-    // Default: only Ctrl active, disabled as last modifier, preview shows Ctrl + 1–9 (no static + 0 preview)
-    expect(ctrlBtn.getAttribute('aria-pressed')).toBe('true');
-    expect(ctrlBtn.disabled).toBe(true);
-    expect(altBtn.getAttribute('aria-pressed')).toBe('false');
+    // Default: only Alt active, disabled as last modifier, preview shows Alt + 1–9 (no static + 0 preview)
+    expect(altBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(altBtn.disabled).toBe(true);
+    expect(ctrlBtn.getAttribute('aria-pressed')).toBe('false');
     expect(resetAllBtn.disabled).toBe(true);
     expect(screen.queryByTestId('subsession-mod-reset')).toBeNull();
-    expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('Ctrl');
+    expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('Alt');
     expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('1–9');
     expect(screen.queryByTestId('subsession-quick-preview-close')).toBeNull();
 
-    // Toggle Alt on -> Ctrl + Alt active; now Ctrl is unlocked
-    fireEvent.click(altBtn);
-    expect(ctrlBtn.getAttribute('aria-pressed')).toBe('true');
-    expect(ctrlBtn.disabled).toBe(false);
+    // Toggle Ctrl on -> Ctrl + Alt active; now Alt is unlocked
+    fireEvent.click(ctrlBtn);
     expect(altBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(altBtn.disabled).toBe(false);
+    expect(ctrlBtn.getAttribute('aria-pressed')).toBe('true');
     expect(resetAllBtn.disabled).toBe(false);
     expect(screen.getByTestId('subsession-mod-reset')).toBeTruthy();
 
-    // Uncheck Ctrl -> only Alt active (Alt is now locked last)
-    fireEvent.click(ctrlBtn);
-    expect(ctrlBtn.getAttribute('aria-pressed')).toBe('false');
-    expect(altBtn.getAttribute('aria-pressed')).toBe('true');
-    expect(altBtn.disabled).toBe(true);
+    // Uncheck Alt -> only Ctrl active (Ctrl is now locked last)
+    fireEvent.click(altBtn);
+    expect(altBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(ctrlBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(ctrlBtn.disabled).toBe(true);
 
     // Switch to Ctrl+Shift -> verify preview + persisted preference survive reload
-    fireEvent.click(ctrlBtn);
     fireEvent.click(shiftBtn);
-    fireEvent.click(altBtn);
     expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('Ctrl');
     expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('Shift');
     const stored = JSON.parse(localStorage.getItem(`rcc_sync_${KEYBOARD_SHORTCUTS_PREF_KEY}`) ?? '{}');
@@ -441,9 +439,10 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
     expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('⌃');
     expect(screen.getByTestId('subsession-quick-preview-open').textContent).toContain('⇧');
 
-    // Per-section reset restores default Ctrl only
+    // Per-section reset restores default Alt only
     fireEvent.click(screen.getByTestId('subsession-mod-reset'));
-    expect((screen.getByTestId('subsession-mod-ctrl') as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId('subsession-mod-alt') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTestId('subsession-mod-ctrl').getAttribute('aria-pressed')).toBe('false');
     expect(screen.getByTestId('subsession-mod-shift').getAttribute('aria-pressed')).toBe('false');
     expect(screen.queryByTestId('subsession-mod-reset')).toBeNull();
     expect((screen.getByTestId('shortcuts-reset-all') as HTMLButtonElement).disabled).toBe(true);
@@ -648,10 +647,17 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
       expect.anything(),
     );
 
-    // Setting task-pair split to ['ctrl'] collides with sub-session quick modifiers -> conflict warning on both sections
+    // Setting task-pair split to ['ctrl'] collides with main-tab quick modifiers -> conflict warning on both sections
     fireEvent.click(screen.getByTestId('taskpair-split-mod-record'));
     fireEvent.keyDown(document, { key: 'Control', ctrlKey: true });
     fireEvent.keyUp(document, { key: 'Control', ctrlKey: false });
+    expect(screen.getByTestId('taskpair-split-conflict').textContent).toContain('Main Tab Quick Switch Shortcuts');
+    expect(screen.getByTestId('maintab-quick-conflict').textContent).toContain('Task Pair Split View Shortcuts');
+
+    // Setting task-pair split to ['alt'] collides with sub-session quick modifiers -> conflict warning on both sections
+    fireEvent.click(screen.getByTestId('taskpair-split-mod-record'));
+    fireEvent.keyDown(document, { key: 'Alt', altKey: true });
+    fireEvent.keyUp(document, { key: 'Alt', altKey: false });
     expect(screen.getByTestId('taskpair-split-conflict').textContent).toContain('Sub-session Quick Shortcuts');
     expect(screen.getByTestId('subsession-quick-conflict').textContent).toContain('Task Pair Split View Shortcuts');
 
@@ -683,9 +689,9 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
 
     const mainTabSection = screen.getByTestId('maintab-quick-shortcuts-section');
     expect(mainTabSection).toBeTruthy();
-    expect(screen.getByTestId('maintab-mod-alt').getAttribute('aria-pressed')).toBe('true');
-    expect((screen.getByTestId('maintab-mod-alt') as HTMLButtonElement).disabled).toBe(true);
-    expect(screen.getByTestId('maintab-quick-preview').textContent).toContain('⌥');
+    expect(screen.getByTestId('maintab-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
+    expect((screen.getByTestId('maintab-mod-ctrl') as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByTestId('maintab-quick-preview').textContent).toContain('⌃');
     expect(screen.getByTestId('maintab-quick-preview').textContent).toContain('1–9');
     expect(screen.queryByTestId('maintab-mod-reset')).toBeNull();
 
@@ -702,33 +708,41 @@ describe('SettingsPage shortcuts tab & interactive key recorder', () => {
       expect.anything(),
     );
 
-    // Colliding with sub-session quick modifiers (Ctrl) surfaces conflict warning on both sections
+    // Colliding with sub-session quick modifiers (Alt) surfaces conflict warning on both sections
     fireEvent.click(screen.getByTestId('maintab-mod-record'));
-    fireEvent.keyDown(document, { key: 'Control', ctrlKey: true });
-    fireEvent.keyUp(document, { key: 'Control', ctrlKey: false });
+    fireEvent.keyDown(document, { key: 'Alt', altKey: true });
+    fireEvent.keyUp(document, { key: 'Alt', altKey: false });
     expect(screen.getByTestId('maintab-quick-conflict').textContent).toContain('Sub-session Quick Shortcuts');
     expect(screen.getByTestId('subsession-quick-conflict').textContent).toContain('Main Tab Quick Switch Shortcuts');
 
-    // Reset restores ['alt'] and clears conflict
+    // Reset restores ['ctrl'] and clears conflict
     fireEvent.click(screen.getByTestId('maintab-mod-reset'));
-    expect(screen.getByTestId('maintab-mod-alt').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByTestId('maintab-mod-ctrl').getAttribute('aria-pressed')).toBe('true');
     expect(screen.queryByTestId('maintab-quick-conflict')).toBeNull();
     expect(screen.queryByTestId('maintab-mod-reset')).toBeNull();
 
-    // Cross-conflict: recording Alt+1 in a regular slot (tabNext) must warn on BOTH tabNext and mainTab group;
-    // changing to Alt+0 or changing mainTab modifiers to Ctrl+Alt clears both warnings cleanly.
+    // Cross-conflict: recording Ctrl+1 in a regular slot (tabNext) must warn on BOTH tabNext and mainTab group,
+    // and recording Alt+1 (Option+1) in tabNext must warn on BOTH tabNext and subSession group;
+    // changing to Ctrl+0 or changing modifiers to Ctrl+Alt clears warnings cleanly.
     fireEvent.click(screen.getByTestId('shortcut-record-tabNext'));
-    fireEvent.keyDown(document, { key: '¡', code: 'Digit1', altKey: true });
+    fireEvent.keyDown(document, { key: '1', code: 'Digit1', ctrlKey: true });
     expect(screen.getByTestId('shortcut-conflict-tabNext').textContent).toContain('Main Tab Quick Switch Shortcuts');
     expect(screen.getByTestId('maintab-quick-conflict').textContent).toContain('Next Tab');
 
     fireEvent.click(screen.getByTestId('shortcut-record-tabNext'));
-    fireEvent.keyDown(document, { key: 'º', code: 'Digit0', altKey: true });
-    expect(screen.queryByTestId('shortcut-conflict-tabNext')).toBeNull();
+    fireEvent.keyDown(document, { key: '¡', code: 'Digit1', altKey: true });
+    expect(screen.getByTestId('shortcut-conflict-tabNext').textContent).toContain('Sub-session Quick Shortcuts');
+    expect(screen.getByTestId('subsession-quick-conflict').textContent).toContain('Next Tab');
     expect(screen.queryByTestId('maintab-quick-conflict')).toBeNull();
 
     fireEvent.click(screen.getByTestId('shortcut-record-tabNext'));
-    fireEvent.keyDown(document, { key: '¡', code: 'Digit1', altKey: true });
+    fireEvent.keyDown(document, { key: '0', code: 'Digit0', ctrlKey: true });
+    expect(screen.queryByTestId('shortcut-conflict-tabNext')).toBeNull();
+    expect(screen.queryByTestId('subsession-quick-conflict')).toBeNull();
+    expect(screen.queryByTestId('maintab-quick-conflict')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('shortcut-record-tabNext'));
+    fireEvent.keyDown(document, { key: '1', code: 'Digit1', ctrlKey: true });
     expect(screen.getByTestId('shortcut-conflict-tabNext').textContent).toContain('Main Tab Quick Switch Shortcuts');
     expect(screen.getByTestId('maintab-quick-conflict').textContent).toContain('Next Tab');
 

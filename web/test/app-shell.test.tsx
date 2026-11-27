@@ -10212,22 +10212,28 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(emptyCloseEvt.defaultPrevented).toBe(true);
       expect(screen.queryByTestId('sub-session-window-sub-quick-1')).toBeNull();
 
-      // Ctrl+1 from main composer -> opens sub-quick-1 and auto-focuses sub-quick-1 composer
-      const open1Evt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
+      // Alt+1 from main composer (including macOS Option glyph) -> opens sub-quick-1 and auto-focuses sub-quick-1 composer
+      const open1Evt = new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
       mainInput.dispatchEvent(open1Evt);
       expect(open1Evt.defaultPrevented).toBe(true);
       const sub1Input = await screen.findByTestId('sub-window-controls-input-sub-quick-1');
       await waitFor(() => expect(document.activeElement).toBe(sub1Input));
 
-      // Ctrl+2 while sub-quick-1 composer is focused -> opens sub-quick-2 and auto-focuses sub-quick-2 composer
-      const open2Evt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      // Out-of-bounds Alt+5 (macOS Option+5 = '∞') in active workspace MUST still be consumed without opening anything
+      const oobSubEvt = new KeyboardEvent('keydown', { key: '∞', code: 'Digit5', altKey: true, bubbles: true, cancelable: true });
+      mainInput.dispatchEvent(oobSubEvt);
+      expect(oobSubEvt.defaultPrevented).toBe(true);
+      expect(screen.queryByTestId('sub-session-window-sub-quick-2')).toBeNull();
+
+      // Alt+2 while sub-quick-1 composer is focused -> opens sub-quick-2 and auto-focuses sub-quick-2 composer
+      const open2Evt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
       sub1Input.dispatchEvent(open2Evt);
       expect(open2Evt.defaultPrevented).toBe(true);
       const sub2Input = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
       await waitFor(() => expect(document.activeElement).toBe(sub2Input));
 
-      // Re-pressing Ctrl+2 toggles sub-quick-2 closed (minimized) and returns focus to sub1Input
-      const toggleClose2Evt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      // Re-pressing Alt+2 toggles sub-quick-2 closed (minimized) and returns focus to sub1Input
+      const toggleClose2Evt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
       sub2Input.dispatchEvent(toggleClose2Evt);
       expect(toggleClose2Evt.defaultPrevented).toBe(true);
       await waitFor(() => {
@@ -10236,8 +10242,8 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         expect(document.activeElement).toBe(sub1Input);
       });
 
-      // Re-pressing Ctrl+2 opens & auto-focuses sub-quick-2 again
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true }));
+      // Re-pressing Alt+2 opens & auto-focuses sub-quick-2 again
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', altKey: true, bubbles: true, cancelable: true }));
       const reopenedSub2Input = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
       await waitFor(() => {
         expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
@@ -10276,9 +10282,9 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       xterm.remove();
 
       // Re-open sub-quick-1 and sub-quick-2 before testing Ctrl+0 from sub-session composer
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', altKey: true, bubbles: true, cancelable: true }));
       await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-quick-1').getAttribute('data-visible')).toBe('true'));
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', altKey: true, bubbles: true, cancelable: true }));
       const sub2Reopened = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
       await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true'));
 
@@ -10292,9 +10298,9 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('false');
       });
 
-      // Reverse visual order -> Ctrl+1 now opens sub-quick-2 and focuses its input
+      // Reverse visual order -> Alt+1 now opens sub-quick-2 and focuses its input
       fireEvent.click(screen.getByText('subbar-reverse-order'));
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', altKey: true, bubbles: true, cancelable: true }));
       const reorderedFirstInput = await screen.findByTestId('sub-window-controls-input-sub-quick-2');
       await waitFor(() => {
         expect(screen.getByTestId('sub-session-window-sub-quick-2').getAttribute('data-visible')).toBe('true');
@@ -10363,7 +10369,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => expect(document.activeElement).toBe(mainInput));
 
       // Open sub-session, ControlledNodes -> RemoteDesktopWorkspace + RemoteDesktopWall, and CloudDocs
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', altKey: true, bubbles: true, cancelable: true }));
       await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-rd-1').getAttribute('data-visible')).toBe('true'));
 
       fireEvent.click(await screen.findByText('controlled_nodes.title'));
@@ -10379,7 +10385,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       fireEvent.click(screen.getByTestId('desktop-cloud-docs-btn'));
       expect(await screen.findByTestId('floating-panel-cloud-docs')).toBeTruthy();
 
-      // Inside Remote Desktop surface / fullscreen: Alt+k and Ctrl+1 remain blocked, while Ctrl+0 exits fullscreen, minimizes RD + Wall + sub-sessions, and closes CloudDocs + ControlledNodes
+      // Inside Remote Desktop surface / fullscreen: Alt+k and Alt+1 remain blocked, while Ctrl+0 exits fullscreen, minimizes RD + Wall + sub-sessions, and closes CloudDocs + ControlledNodes
       const rdSurface = document.createElement('canvas');
       rdSurface.className = 'remote-desktop-canvas';
       rdSurface.setAttribute('data-remote-desktop-surface', 'true');
@@ -10395,7 +10401,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       rdSurface.dispatchEvent(navInRdEvt);
       expect(navInRdEvt.defaultPrevented).toBe(false);
 
-      const quickSubInRdEvt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
+      const quickSubInRdEvt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
       rdSurface.dispatchEvent(quickSubInRdEvt);
       expect(quickSubInRdEvt.defaultPrevented).toBe(false);
 
@@ -10533,9 +10539,9 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         expect(screen.getByTestId('sub-session-window-sub-2').getAttribute('data-visible')).toBe('false');
       });
 
-      // Plain Ctrl+1 still opens sub-session 1 cleanly without triggering split view
+      // Plain Alt+1 still opens sub-session 1 cleanly without triggering split view
       alphaComposer.focus();
-      const plainSub1 = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, shiftKey: false, bubbles: true, cancelable: true });
+      const plainSub1 = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', altKey: true, shiftKey: false, bubbles: true, cancelable: true });
       alphaComposer.dispatchEvent(plainSub1);
       expect(plainSub1.defaultPrevented).toBe(true);
       await waitFor(() => {
@@ -11061,8 +11067,8 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
       expect(document.activeElement).toBe(fbCheckbox);
 
-      // 3) Quick sub-session Ctrl+2 and pair split Ctrl+Shift+1 work while FloatingPanel is open
-      const quickSub2 = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      // 3) Quick sub-session Alt+2 and pair split Ctrl+Shift+1 work while FloatingPanel is open
+      const quickSub2 = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
       fbButton.focus();
       fbButton.dispatchEvent(quickSub2);
       expect(quickSub2.defaultPrevented).toBe(true);
@@ -14006,10 +14012,10 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'), { timeout: 5000 });
       await waitFor(() => expect(autoRegisterChatScrollState.mainCalls).toContain('deck_alpha_brain'), { timeout: 5000 });
 
-      // 2) Shortcut sub-session open/focus (Ctrl+1) -> sub-scroll-1 scrolls to bottom even with delayed (>100ms) registration; Ctrl+0 closes all and scrolls main back to bottom
+      // 2) Shortcut sub-session open/focus (Alt+1) -> sub-scroll-1 scrolls to bottom even with delayed (>100ms) registration; Ctrl+0 closes all and scrolls main back to bottom
       autoRegisterChatScrollState.subCalls = [];
       autoRegisterChatScrollState.staleSubOnce.add('sub-scroll-1');
-      alphaInput.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      alphaInput.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', altKey: true, bubbles: true, cancelable: true }));
       const sub1Input = await screen.findByTestId('sub-window-controls-input-sub-scroll-1', undefined, { timeout: 5000 });
       await waitFor(() => expect(autoRegisterChatScrollState.subCalls).toContain('sub-scroll-1'), { timeout: 5000 });
 
@@ -15370,7 +15376,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     expect(screen.getByTestId('session-pane-deck_m_brain').getAttribute('data-share-role')).toBe('viewer');
   }, 20_000);
 
-  it('switches main session tabs with Alt+1..9 (macOS Option chars), collapses floating sub-sessions on re-press, exits Task Mode, and respects recording/modal guards and custom modifiers', async () => {
+  it('switches main session tabs with Ctrl+1..9, collapses floating sub-sessions on re-press, exits Task Mode, and respects recording/modal guards and custom modifiers (including macOS Option+Digit)', async () => {
     const originalPlatform = navigator.platform;
     Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
 
@@ -15392,8 +15398,8 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const mainInput = await screen.findByTestId('pane-composer-deck_alpha_brain');
       await waitFor(() => expect(document.activeElement).toBe(mainInput));
 
-      // Blocking guards: IME composition, active shortcut recording, and dialogs must NOT trigger Alt+2
-      const imeEvt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, isComposing: true, bubbles: true, cancelable: true });
+      // Blocking guards: IME composition, active shortcut recording, and dialogs must NOT trigger Ctrl+2
+      const imeEvt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, isComposing: true, bubbles: true, cancelable: true });
       mainInput.dispatchEvent(imeEvt);
       expect(imeEvt.defaultPrevented).toBe(false);
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
@@ -15401,7 +15407,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       const recorder = document.createElement('button');
       recorder.setAttribute('data-shortcut-recording', 'true');
       document.body.appendChild(recorder);
-      const recEvt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      const recEvt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
       recorder.dispatchEvent(recEvt);
       expect(recEvt.defaultPrevented).toBe(false);
       recorder.remove();
@@ -15410,20 +15416,19 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       modal.setAttribute('role', 'dialog');
       modal.setAttribute('aria-modal', 'true');
       document.body.appendChild(modal);
-      const modalEvt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      const modalEvt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
       window.dispatchEvent(modalEvt);
       expect(modalEvt.defaultPrevented).toBe(false);
       modal.remove();
 
-      // Out-of-bounds Alt+5 (macOS Option+5 = '∞') in workspace Composer MUST be consumed
-      // (preventDefault() so '∞' is never typed into Composer) while staying a safe no-op!
-      const oobEvt = new KeyboardEvent('keydown', { key: '∞', code: 'Digit5', altKey: true, bubbles: true, cancelable: true });
+      // Out-of-bounds Ctrl+5 in workspace Composer MUST be consumed while staying a safe no-op!
+      const oobEvt = new KeyboardEvent('keydown', { key: '5', code: 'Digit5', ctrlKey: true, bubbles: true, cancelable: true });
       mainInput.dispatchEvent(oobEvt);
       expect(oobEvt.defaultPrevented).toBe(true);
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
-      // macOS Option+2 (key='™', code='Digit2') switches cleanly to deck_beta_brain
-      const switchTo2Evt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      // Ctrl+2 switches cleanly to deck_beta_brain
+      const switchTo2Evt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
       mainInput.dispatchEvent(switchTo2Evt);
       expect(switchTo2Evt.defaultPrevented).toBe(true);
       await waitFor(() => {
@@ -15431,11 +15436,11 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
         expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('false');
       });
 
-      // Open floating sub-session on deck_beta_brain via Ctrl+1, then press Alt+2 again to collapse it cleanly (never stops session!)
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
+      // Open floating sub-session on deck_beta_brain via Alt+1 (macOS Option+1 = '¡'), then press Ctrl+2 again to collapse it cleanly (never stops session!)
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true }));
       await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-main-1').getAttribute('data-visible')).toBe('true'));
 
-      const collapseOnActiveTabEvt = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      const collapseOnActiveTabEvt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
       window.dispatchEvent(collapseOnActiveTabEvt);
       expect(collapseOnActiveTabEvt.defaultPrevented).toBe(true);
       await waitFor(() => {
@@ -15444,10 +15449,10 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       });
 
       // Open Task Mode via real desktop-task-mode-btn, verify global-task-mode-overlay is present,
-      // then press Alt+1 (key='¡', code='Digit1') -> overlay disappears & switches to deck_alpha_brain
+      // then press Ctrl+1 -> overlay disappears & switches to deck_alpha_brain
       fireEvent.click(await screen.findByTestId('desktop-task-mode-btn'));
       expect(await screen.findByTestId('global-task-mode-overlay')).toBeTruthy();
-      const backTo1FromTaskMode = new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
+      const backTo1FromTaskMode = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
       window.dispatchEvent(backTo1FromTaskMode);
       expect(backTo1FromTaskMode.defaultPrevented).toBe(true);
       await waitFor(() => {
@@ -15456,15 +15461,15 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       });
 
       // Click real server-home entry -> enters Dashboard; verify workspace tabs unmounted,
-      // Alt+5 keeps Dashboard safely, and Alt+2 returns directly to srv-1 tab #2 (deck_beta_brain)!
+      // Ctrl+5 keeps Dashboard safely, and Ctrl+2 returns directly to srv-1 tab #2 (deck_beta_brain)!
       fireEvent.click(screen.getByText('server-home'));
       await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
-      const dashOobEvt = new KeyboardEvent('keydown', { key: '∞', code: 'Digit5', altKey: true, bubbles: true, cancelable: true });
+      const dashOobEvt = new KeyboardEvent('keydown', { key: '5', code: 'Digit5', ctrlKey: true, bubbles: true, cancelable: true });
       window.dispatchEvent(dashOobEvt);
       expect(dashOobEvt.defaultPrevented).toBe(true);
       expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull();
 
-      const returnFromDashToTab2 = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
+      const returnFromDashToTab2 = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
       window.dispatchEvent(returnFromDashToTab2);
       expect(returnFromDashToTab2.defaultPrevented).toBe(true);
       await waitFor(() => {
@@ -15473,17 +15478,17 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       });
 
       // Switch back to Tab #1 first, then customize mainTabQuickModifiers to ['ctrl', 'alt']:
-      // plain Alt+2 stops switching, Ctrl+Alt+2 switches!
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true }));
+      // plain Ctrl+2 stops switching, Ctrl+Alt+2 (including macOS Option+2 glyph) switches!
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true }));
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
 
       fireEvent.click(screen.getByText('server-settings'));
       fireEvent.click(await screen.findByText('settings-maintab-ctrl-alt'));
       fireEvent.click(screen.getByText('settings-back'));
 
-      const ignoredAlt2 = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
-      window.dispatchEvent(ignoredAlt2);
-      expect(ignoredAlt2.defaultPrevented).toBe(false);
+      const ignoredCtrl2 = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ignoredCtrl2);
+      expect(ignoredCtrl2.defaultPrevented).toBe(false);
       expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true');
 
       const customCtrlAlt2 = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', ctrlKey: true, altKey: true, bubbles: true, cancelable: true });
@@ -15497,7 +15502,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     }
   }, 15_000);
 
-  it('keeps Alt+1..9 inert when no server/workspace has been entered (fresh Dashboard safe fallback)', async () => {
+  it('keeps Ctrl+1..9 inert when no server/workspace has been entered (fresh Dashboard safe fallback)', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     apiFetchMock.mockImplementation((path: string) => {
       if (path === '/api/auth/user/me') return Promise.resolve({ id: 'user-1' });
@@ -15508,7 +15513,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     const { App } = await importApp();
     render(<App />);
     await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
-    const evt = new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
+    const evt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
     window.dispatchEvent(evt);
     expect(evt.defaultPrevented).toBe(false);
     expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull();
@@ -15568,14 +15573,14 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       // Persistent cache drops incognito B, retaining only [A, C]
       expect(readCachedServerSessions('srv-1').map((s) => s.name)).toEqual(['deck_alpha_brain', 'deck_gamma_brain']);
 
-      // 1. Go to Dashboard -> Alt+2 selects incognito B (slot 2), NOT cached slot 2 (C),
+      // 1. Go to Dashboard -> Ctrl+2 selects incognito B (slot 2), NOT cached slot 2 (C),
       // and MUST NOT activate B between REST resolve and delayed WS session_list!
       fireEvent.click(screen.getByText('server-home'));
       await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
 
-      const alt2ToIncog = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
-      window.dispatchEvent(alt2ToIncog);
-      expect(alt2ToIncog.defaultPrevented).toBe(true);
+      const ctrl2ToIncog = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrl2ToIncog);
+      expect(ctrl2ToIncog.defaultPrevented).toBe(true);
 
       await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(2));
       await act(async () => {
@@ -15609,13 +15614,13 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(JSON.stringify({ ...localStorage })).not.toContain('deck_incog_mid_brain');
       expect(JSON.parse(sessionStorage.getItem('rcc_tab_route_v1')!).sessionName).toBeNull();
 
-      // 2. Return to Dashboard -> Alt+3 switches cleanly to C (REST confirms C directly)
+      // 2. Return to Dashboard -> Ctrl+3 switches cleanly to C (REST confirms C directly)
       fireEvent.click(screen.getByText('server-home'));
       await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
 
-      const alt3ToC = new KeyboardEvent('keydown', { key: '£', code: 'Digit3', altKey: true, bubbles: true, cancelable: true });
-      window.dispatchEvent(alt3ToC);
-      expect(alt3ToC.defaultPrevented).toBe(true);
+      const ctrl3ToC = new KeyboardEvent('keydown', { key: '3', code: 'Digit3', ctrlKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrl3ToC);
+      expect(ctrl3ToC.defaultPrevented).toBe(true);
 
       await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(3));
       await act(async () => {
@@ -15636,15 +15641,15 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_gamma_brain').getAttribute('data-is-active')).toBe('true'));
 
       // 3. Switch to A first, go to Dashboard, then B disappears on srv-1 while C shifts to index 2:
-      // B must NOT activate between REST [A, C] and WS [A, C], and pressing Alt+2 must fall back to A (never C)!
+      // B must NOT activate between REST [A, C] and WS [A, C], and pressing Ctrl+2 must fall back to A (never C)!
       fireEvent.click(within(screen.getByTestId('app-shell-session-tabs')).getByText('tabs-select-deck_alpha_brain'));
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
       fireEvent.click(screen.getByText('server-home'));
       await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
 
-      const alt2MissingIncog = new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
-      window.dispatchEvent(alt2MissingIncog);
-      expect(alt2MissingIncog.defaultPrevented).toBe(true);
+      const ctrl2MissingIncog = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrl2MissingIncog);
+      expect(ctrl2MissingIncog.defaultPrevented).toBe(true);
 
       await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(4));
       await act(async () => {
@@ -15674,7 +15679,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     }
   }, 20_000);
 
-  it('never persists a single incognito tab name across Dashboard round-trip via Alt+1', async () => {
+  it('never persists a single incognito tab name across Dashboard round-trip via Ctrl+1', async () => {
     const originalPlatform = navigator.platform;
     Object.defineProperty(navigator, 'platform', { configurable: true, value: 'MacIntel' });
 
@@ -15711,13 +15716,13 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(readCachedServerSessions('srv-1')).toEqual([]);
       expect(window.location.hash).toBe('#/srv-1');
 
-      // Leave to Dashboard and press Alt+1
+      // Leave to Dashboard and press Ctrl+1
       fireEvent.click(screen.getByText('server-home'));
       await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
 
-      const alt1SoloIncog = new KeyboardEvent('keydown', { key: '¡', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
-      window.dispatchEvent(alt1SoloIncog);
-      expect(alt1SoloIncog.defaultPrevented).toBe(true);
+      const ctrl1SoloIncog = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
+      window.dispatchEvent(ctrl1SoloIncog);
+      expect(ctrl1SoloIncog.defaultPrevented).toBe(true);
 
       await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(2));
       const ws2 = wsInstances[wsInstances.length - 1]!;
@@ -15737,7 +15742,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     }
   }, 15_000);
 
-  it('keeps Ctrl+1, Ctrl+Shift+1, and tab navigation guarded when Task Mode overlays a PTY terminal tab while allowing Alt+2 to exit and switch tabs', async () => {
+  it('keeps Alt+1, Ctrl+Shift+1, and tab navigation guarded when Task Mode overlays a PTY terminal tab while allowing Ctrl+2 to exit and switch tabs', async () => {
     useSubSessionsState.subSessions = [
       {
         id: 'sub-tm-pty',
@@ -15802,10 +15807,10 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       overlayFocusable.focus();
       expect(document.activeElement).toBe(overlayFocusable);
 
-      // Ctrl+1, Ctrl+Shift+1, and Alt+l MUST stay blocked by the underlying PTY terminal viewMode guard
-      const ctrl1Evt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', ctrlKey: true, bubbles: true, cancelable: true });
-      overlayFocusable.dispatchEvent(ctrl1Evt);
-      expect(ctrl1Evt.defaultPrevented).toBe(false);
+      // Alt+1, Ctrl+Shift+1, and Alt+l MUST stay blocked by the underlying PTY terminal viewMode guard
+      const alt1Evt = new KeyboardEvent('keydown', { key: '1', code: 'Digit1', altKey: true, bubbles: true, cancelable: true });
+      overlayFocusable.dispatchEvent(alt1Evt);
+      expect(alt1Evt.defaultPrevented).toBe(false);
       expect(screen.queryByTestId('sub-session-window-sub-tm-pty')).toBeNull();
 
       const ctrlShift1Evt = new KeyboardEvent('keydown', { key: '!', code: 'Digit1', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true });
@@ -15821,10 +15826,10 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       expect(window.location.hash).toBe('#/srv-1/deck_alpha_brain');
       expect(screen.getByTestId('global-task-mode-overlay')).toBeTruthy();
 
-      // Alt+2 (mainTabMatch) still exits Task Mode cleanly and switches to tab #2
-      const alt2ExitEvt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', altKey: true, bubbles: true, cancelable: true });
-      overlayFocusable.dispatchEvent(alt2ExitEvt);
-      expect(alt2ExitEvt.defaultPrevented).toBe(true);
+      // Ctrl+2 (mainTabMatch) still exits Task Mode cleanly and switches to tab #2
+      const ctrl2ExitEvt = new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true });
+      overlayFocusable.dispatchEvent(ctrl2ExitEvt);
+      expect(ctrl2ExitEvt.defaultPrevented).toBe(true);
       await waitFor(() => {
         expect(screen.queryByTestId('global-task-mode-overlay')).toBeNull();
         expect(screen.getByTestId('session-pane-deck_beta_brain').getAttribute('data-is-active')).toBe('true');
@@ -15886,11 +15891,11 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
       expect(readCachedServerSessions('srv-1').map((s) => s.name)).toEqual(['deck_alpha_brain', 'deck_cached_c_brain']);
 
-      // 1. Go to Dashboard, press Alt+2 (cached C), REST returns only [A] (omits C):
+      // 1. Go to Dashboard, press Ctrl+2 (cached C), REST returns only [A] (omits C):
       // C MUST remain inactive until WS confirms [A, C].
       fireEvent.click(screen.getByText('server-home'));
       await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true }));
 
       await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(2));
       await act(async () => {
@@ -15912,13 +15917,13 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       });
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_cached_c_brain').getAttribute('data-is-active')).toBe('true'));
 
-      // 2. Switch back to A, return to Dashboard, press Alt+2 (cached C), REST returns only [A],
+      // 2. Switch back to A, return to Dashboard, press Ctrl+2 (cached C), REST returns only [A],
       // and WS confirms C was removed and replaced in slot 2 by D: C stays inactive, falls back to A (never D!).
       fireEvent.click(within(screen.getByTestId('app-shell-session-tabs')).getByText('tabs-select-deck_alpha_brain'));
       await waitFor(() => expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-is-active')).toBe('true'));
       fireEvent.click(screen.getByText('server-home'));
       await waitFor(() => expect(screen.queryByTestId('app-shell-session-tabs')).toBeNull());
-      window.dispatchEvent(new KeyboardEvent('keydown', { key: '™', code: 'Digit2', altKey: true, bubbles: true, cancelable: true }));
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: '2', code: 'Digit2', ctrlKey: true, bubbles: true, cancelable: true }));
 
       await waitFor(() => expect(restResolvers.length).toBeGreaterThanOrEqual(3));
       await act(async () => {

@@ -56,9 +56,9 @@ export type ResolvedShortcutSlotConflicts = Partial<
  */
 export type ShortcutModifierKey = 'ctrl' | 'alt' | 'shift' | 'meta';
 export const SHORTCUT_MODIFIER_KEYS: readonly ShortcutModifierKey[] = ['ctrl', 'alt', 'shift', 'meta'];
-export const DEFAULT_SUBSESSION_QUICK_MODIFIERS: readonly ShortcutModifierKey[] = ['ctrl'];
+export const DEFAULT_SUBSESSION_QUICK_MODIFIERS: readonly ShortcutModifierKey[] = ['alt'];
 export const DEFAULT_TASK_PAIR_SPLIT_MODIFIERS: readonly ShortcutModifierKey[] = ['ctrl', 'shift'];
-export const DEFAULT_MAIN_TAB_QUICK_MODIFIERS: readonly ShortcutModifierKey[] = ['alt'];
+export const DEFAULT_MAIN_TAB_QUICK_MODIFIERS: readonly ShortcutModifierKey[] = ['ctrl'];
 export type MacVoiceInlineModifier = ShortcutModifierKey | null;
 export const DEFAULT_MAC_VOICE_INLINE_MODIFIER: ShortcutModifierKey = 'shift';
 
@@ -1161,7 +1161,7 @@ function applyModifierCombinationOverride(
   return next;
 }
 
-/** Return the default modifier combination (`Ctrl`) for sub-session digit shortcuts. */
+/** Return the default modifier combination (`Alt`) for sub-session digit shortcuts. */
 export function getDefaultSubSessionQuickModifiers(): ShortcutModifierKey[] {
   return [...DEFAULT_SUBSESSION_QUICK_MODIFIERS];
 }
@@ -1171,7 +1171,7 @@ export function getDefaultTaskPairSplitModifiers(): ShortcutModifierKey[] {
   return [...DEFAULT_TASK_PAIR_SPLIT_MODIFIERS];
 }
 
-/** Return the default modifier combination (`Alt`) for main session tab digit shortcuts. */
+/** Return the default modifier combination (`Ctrl`) for main session tab digit shortcuts. */
 export function getDefaultMainTabQuickModifiers(): ShortcutModifierKey[] {
   return [...DEFAULT_MAIN_TAB_QUICK_MODIFIERS];
 }
@@ -1213,7 +1213,7 @@ export function areMainTabQuickModifiersEqual(
   return areModifierCombinationsEqual(a, b, DEFAULT_MAIN_TAB_QUICK_MODIFIERS);
 }
 
-/** Resolve active sub-session quick-shortcut modifiers from stored overrides (defaults to `['ctrl']`). */
+/** Resolve active sub-session quick-shortcut modifiers from stored overrides (defaults to `['alt']`). */
 export function resolveSubSessionQuickModifiers(
   overrides: KeyboardShortcutOverrides | null | undefined,
 ): ShortcutModifierKey[] {
@@ -1227,14 +1227,14 @@ export function resolveTaskPairSplitModifiers(
   return sanitizeSubSessionQuickModifiers(overrides?.taskPairSplitModifiers) ?? getDefaultTaskPairSplitModifiers();
 }
 
-/** Resolve active main-tab quick-switch modifiers from stored overrides (defaults to `['alt']`). */
+/** Resolve active main-tab quick-switch modifiers from stored overrides (defaults to `['ctrl']`). */
 export function resolveMainTabQuickModifiers(
   overrides: KeyboardShortcutOverrides | null | undefined,
 ): ShortcutModifierKey[] {
   return sanitizeSubSessionQuickModifiers(overrides?.mainTabQuickModifiers) ?? getDefaultMainTabQuickModifiers();
 }
 
-/** Update `subSessionQuickModifiers` on an override object, omitting it when back to default `['ctrl']`. */
+/** Update `subSessionQuickModifiers` on an override object, omitting it when back to default `['alt']`. */
 export function applySubSessionQuickModifiers(
   overrides: KeyboardShortcutOverrides | null | undefined,
   modifiers: readonly ShortcutModifierKey[],
@@ -1260,7 +1260,7 @@ export function applyTaskPairSplitModifiers(
   );
 }
 
-/** Update `mainTabQuickModifiers` on an override object, omitting it when back to default `['alt']`. */
+/** Update `mainTabQuickModifiers` on an override object, omitting it when back to default `['ctrl']`. */
 export function applyMainTabQuickModifiers(
   overrides: KeyboardShortcutOverrides | null | undefined,
   modifiers: readonly ShortcutModifierKey[],
@@ -1358,8 +1358,8 @@ function matchModifierDigitIndex(
 
 /**
  * Match `<Modifier> + 1..9` (toggle/open+focus N-th sub-session) against the user's
- * configured modifier combination. Matches exact modifier sets and checks `e.code`
- * (`Digit1..9`, `Numpad1..9`) before `e.key` so Shift-modified combos still match digits.
+ * configured modifier combination (`['alt']` by default). Matches exact modifier sets and checks `e.code`
+ * (`Digit1..9`, `Numpad1..9`) before `e.key` so Shift/Option-modified combos still match digits.
  * Close-all (`subSessionCloseAll`) is bound as a customizable shortcut action.
  */
 export function matchSubSessionQuickShortcut(
@@ -1390,7 +1390,7 @@ export function matchTaskPairSplitQuickShortcut(
 
 /**
  * Match `<Modifier> + 1..9` (switch/open N-th main session tab or collapse floating sub-sessions
- * when already active on that tab) against the user's configured modifier combination (`['alt']` by default).
+ * when already active on that tab) against the user's configured modifier combination (`['ctrl']` by default).
  */
 export function matchMainTabQuickShortcut(
   e: Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'> & {
