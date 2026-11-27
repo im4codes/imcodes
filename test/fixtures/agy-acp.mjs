@@ -126,7 +126,11 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
           setTimeout(respondNew, 10);
           return;
         }
-        ok(req.id, { sessionId, models });
+        const sessionModels = scenario === 'empty-catalog-always'
+          || (scenario === 'empty-catalog-once' && !(logPath && fs.existsSync(logPath + '.empty-catalog-retried')))
+          ? { availableModels: [] }
+          : models;
+        ok(req.id, { sessionId, models: sessionModels });
       };
       return setTimeout(respondNew, scenario === 'late-new' ? 150 : 0);
     }
@@ -143,7 +147,10 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
         }
         if (scenario === 'resume-history') note(p.sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'OLD_ERROR from history' } });
         if (scenario === 'resume-empty-metadata') return ok(req.id, {});
-        return ok(req.id, { sessionId: p.sessionId, models });
+        const sessionModels = scenario === 'empty-catalog-always'
+          ? { availableModels: [] }
+          : models;
+        return ok(req.id, { sessionId: p.sessionId, models: sessionModels });
       };
       return respondResume();
     }
@@ -153,7 +160,13 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
           ? (!fs.existsSync(logPath + '.model-failed') && (fs.writeFileSync(logPath + '.model-failed', 'failed'), true))
           : modelAttempts++ === 0
       );
+      const emptyCatalogOnce = scenario === 'empty-catalog-once' && (
+        logPath
+          ? (!fs.existsSync(logPath + '.empty-catalog-retried') && (fs.writeFileSync(logPath + '.empty-catalog-retried', '1'), true))
+          : modelAttempts++ === 0
+      );
       if (p.modelId === 'invalid' || (scenario === 'unsupported-carbon' && p.modelId === 'gemini-4-carbon-medium') || scenario === 'model-error'
+        || scenario === 'empty-catalog-always' || emptyCatalogOnce
         || modelErrorOnce) return error(req.id, 'Unknown model');
       if (scenario === 'model-unsupported') return error(req.id, 'Method unavailable');
       const respond = () => {

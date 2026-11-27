@@ -20,6 +20,7 @@ import {
   isAgyModelId,
   normalizeAgyModelId,
   resolveEffectiveAgyModelId,
+  sanitizeAgyStartupModel,
 } from '../../shared/agy-agent.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
@@ -310,6 +311,58 @@ describe('agy-sdk helpers', () => {
     expect(normalizeAgyModelId('gemini-4-carbon-medium')).toBe('gemini-4-carbon-medium');
     expect(normalizeAgyModelId('model-a')).toBe('model-a');
     expect(normalizeAgyModelId('invalid')).toBe('invalid');
+  });
+
+  it('sanitizes foreign SDK models while preserving valid AGY models and test stubs', () => {
+    for (const valid of [
+      'gemini-4-hydrogen-high',
+      'gemini-4-neon-high',
+      'gemini-4-carbon-medium',
+      'gemini-3.8-flash-high',
+      'claude-opus-5-5-high',
+      'claude-sonnet-5-5-medium',
+      'claude-opus-4-6-thinking',
+      'gpt-oss-120b-medium',
+      'model-a',
+      'model-b',
+      'invalid',
+    ]) {
+      expect(sanitizeAgyStartupModel(valid), valid).toBe(valid);
+    }
+    expect(sanitizeAgyStartupModel('Gemini 4 Neon (High)')).toBe('gemini-4-neon-high');
+    expect(sanitizeAgyStartupModel('Claude Opus 5.5 (Low)')).toBe('claude-opus-5-5-low');
+
+    for (const foreign of [
+      'gpt-6-sol',
+      'gpt-5.4',
+      'gpt-5.3-codex',
+      'o3',
+      'o4-mini',
+      'codex-mini',
+      'opus',
+      'sonnet',
+      'haiku',
+      'fable',
+      'opus[1M]',
+      'claude-opus-4-8[1m]',
+      'claude-sonnet-4-5-20250929',
+      'claude-3-5-sonnet-20241022',
+      'qwen3-coder-plus',
+      'coder-model',
+      'kimi-k2.5',
+      'deepseek-chat',
+      'grok-4',
+      'muse-wonder-1.0',
+      'MiniMax-M3',
+      'glm-5',
+      'hy3',
+      'opencode/big-pickle',
+      'default',
+      'auto',
+      'agy-sdk',
+    ]) {
+      expect(sanitizeAgyStartupModel(foreign), foreign).toBeUndefined();
+    }
   });
 
   it('encodes one NDJSON user line', () => {

@@ -315,6 +315,10 @@ interface KimiSdkSessionState {
   acpSessionId?: string;
   /** True once newSession or loadSession has returned successfully. */
   loaded: boolean;
+  /** True once newSession or loadSession for the active child has returned a non-empty availableModels catalog. */
+  sessionModelCatalogLoaded?: boolean;
+  /** Wakes a cold-start empty-catalog retry sleep immediately on cancel/disposal. */
+  coldStartRetryWake?: () => void;
   /** True once setSessionMode(default) has been accepted for this session. */
   modeApplied: boolean;
   /** Set while a `prompt` RPC is in flight. */
@@ -520,6 +524,7 @@ const DEFAULT_ACP_CANCEL_GRACE_MS = 3_000;
 const DEFAULT_ACP_SESSION_RPC_TIMEOUT_MS = 30_000;
 const DEFAULT_ACP_MODE_MODEL_RPC_TIMEOUT_MS = 15_000;
 const DEFAULT_ACP_WRITE_TIMEOUT_MS = 10_000;
+const DEFAULT_ACP_COLD_START_CATALOG_RETRY_DELAY_MS = 800;
 const ACP_RPC_TIMEOUT_MARKER = Symbol('acpRpcTimeout');
 
 export interface KimiSdkProviderOptions {
@@ -527,6 +532,19 @@ export interface KimiSdkProviderOptions {
   sessionRpcTimeoutMs?: number;
   modeModelRpcTimeoutMs?: number;
   acpWriteTimeoutMs?: number;
+  coldStartCatalogRetryDelayMs?: number;
+}
+
+function readAcpDelayOption(override: number | undefined, envKey: string, fallback: number): number {
+  if (typeof override === 'number' && Number.isFinite(override) && override >= 0) {
+    return Math.round(override);
+  }
+  const raw = process.env[envKey];
+  if (raw) {
+    const parsed = Number.parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+  }
+  return fallback;
 }
 
 function readAcpTimeoutOption(override: number | undefined, envKey: string, fallback: number): number {
@@ -710,6 +728,8 @@ export class KimiSdkProvider implements TransportProvider {
     }
     const run = (async () => {
       this.clearCancelGraceTimer(state);
+      state.coldStartRetryWake?.();
+      state.coldStartRetryWake = undefined;
       this.interruptAndCloseAgyBridges(state.routeId, state);
       if (state.incognito) state.disposed = true;
       const transport = state.isolatedTransport;
@@ -740,6 +760,7 @@ export class KimiSdkProvider implements TransportProvider {
         state.acpSessionId = undefined;
       }
       state.loaded = false;
+      state.sessionModelCatalogLoaded = false;
       state.modeApplied = false;
       state.confirmedModel = undefined;
       state.modelApplyRequest = undefined;
@@ -958,7 +979,10 @@ export class KimiSdkProvider implements TransportProvider {
     );
     if (prior) {
       this.interruptAndCloseAgyBridges(prior.routeId, prior);
-      if (shouldDisposePrior) prior.cancelled = true;
+      if (shouldDisposePrior) {
+        prior.cancelled = true;
+        prior.coldStartRetryWake?.();
+      }
     }
     setSessionIncognito(routeId, incognito);
     if (config.sessionName && config.sessionName !== routeId) {
@@ -992,6 +1016,9 @@ export class KimiSdkProvider implements TransportProvider {
       beforeNativeSessionStart: config.beforeNativeSessionStart ?? existing?.beforeNativeSessionStart,
       acpSessionId: config.resumeId ?? existing?.acpSessionId,
       loaded: false,
+      sessionModelCatalogLoaded: (!config.fresh && existing?.isolatedTransport)
+        ? Boolean(existing.sessionModelCatalogLoaded)
+        : false,
       modeApplied: false,
       promptInFlight: false,
       promptSubmittedGeneration: null,
@@ -2315,6 +2342,7 @@ export class KimiSdkProvider implements TransportProvider {
     }
     state.modelRevision++;
     state.stoppedByCancel = true;
+    state.coldStartRetryWake?.();
     const hadBackgroundOrOpenTools = (state.agyBackgroundTasks?.size ?? 0) > 0
       || Boolean(state.agyReactive)
       || (state.agySubagents?.activeCount() ?? 0) > 0
@@ -3397,6 +3425,12 @@ export class KimiSdkProvider implements TransportProvider {
 
     let beforeNativeStartRan = false;
     let sharedRecycleRetried = false;
+    let emptyCatalogRetried = false;
+    const isReadyOwnerActive = (): boolean => (
+      this.sessions.get(sessionId) === state
+      && !state.cancelled
+      && (expectedGeneration === undefined || (state.turnGeneration === expectedGeneration && state.settledGeneration < expectedGeneration))
+    );
 
     while (true) {
       if (state.incognito) {
@@ -3454,6 +3488,7 @@ export class KimiSdkProvider implements TransportProvider {
       if (!state.incognito) this.sharedSessionReadyInFlight.add(sessionId);
       const wasLoadedOnEntry = state.loaded;
       let coldStartModelConfigFailed = false;
+      let coldStartCatalogUnavailable = false;
       try {
         await this.initPromiseForState(state);
         this.assertCurrentSession(sessionId, state, connection, expectedGeneration);
@@ -3590,6 +3625,9 @@ export class KimiSdkProvider implements TransportProvider {
               && this.normalizeError(err).code === PROVIDER_ERROR_CODES.CONFIG_ERROR
             ) {
               coldStartModelConfigFailed = true;
+              if (!state.sessionModelCatalogLoaded) {
+                coldStartCatalogUnavailable = true;
+              }
             }
             throw err;
           }
@@ -3624,6 +3662,44 @@ export class KimiSdkProvider implements TransportProvider {
             sharedRecycleRetried = true;
             this.sharedSessionReadyInFlight.delete(sessionId);
             continue;
+          }
+          if (coldStartCatalogUnavailable) {
+            if (!emptyCatalogRetried) {
+              if (!isReadyOwnerActive()) {
+                throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'ACP session owner changed or stopped', true);
+              }
+              const retryDelayMs = readAcpDelayOption(
+                this.acpTimeoutOptions.coldStartCatalogRetryDelayMs,
+                'IMCODES_ACP_COLD_START_CATALOG_RETRY_DELAY_MS',
+                DEFAULT_ACP_COLD_START_CATALOG_RETRY_DELAY_MS,
+              );
+              if (retryDelayMs > 0) {
+                await new Promise<void>((resolve) => {
+                  const timer = setTimeout(() => {
+                    if (state.coldStartRetryWake === wake) state.coldStartRetryWake = undefined;
+                    resolve();
+                  }, retryDelayMs);
+                  timer.unref?.();
+                  const wake = () => {
+                    clearTimeout(timer);
+                    if (state.coldStartRetryWake === wake) state.coldStartRetryWake = undefined;
+                    resolve();
+                  };
+                  state.coldStartRetryWake = wake;
+                });
+              }
+              if (!isReadyOwnerActive()) {
+                throw this.makeError(PROVIDER_ERROR_CODES.CANCELLED, 'ACP session owner changed or stopped', true);
+              }
+              emptyCatalogRetried = true;
+              this.sharedSessionReadyInFlight.delete(sessionId);
+              continue;
+            }
+            throw this.makeError(
+              PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+              `${this.profile.displayName} could not load its model catalog; please retry.`,
+              true,
+            );
           }
         } else if (!state.incognito && !state.loaded && isWorkerSpawnMissingExecutableError(err)) {
           if (this.hasActiveSharedSessionWork(sessionId)) {
@@ -3874,6 +3950,9 @@ export class KimiSdkProvider implements TransportProvider {
   ): void {
     const currentModel = info?.models?.currentModelId;
     const available = Array.isArray(info?.models?.availableModels) ? info.models.availableModels : [];
+    if (available.length > 0) {
+      state.sessionModelCatalogLoaded = true;
+    }
     if (state.modelIsDefault && state.model && available.length > 0) {
       const supported = available.some((m: Record<string, unknown>) => String((m as Record<string, unknown>).modelId ?? (m as Record<string, unknown>).id ?? '') === state.model);
       if (!supported) {

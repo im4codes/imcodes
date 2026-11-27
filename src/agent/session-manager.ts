@@ -1,7 +1,7 @@
 import { isIncognitoSession, supportsSessionIncognito, SESSION_INCOGNITO_UNSUPPORTED, type SessionIncognitoConfig } from '../../shared/session-incognito-types.js';
 import { notifySessionTeardown, setSessionIncognito, withSessionPrivacy } from '../../shared/session-incognito-context.js';
 import { reclaimOrphanedAgyIncognitoHomes } from './agy-incognito-isolation.js';
-import { AGY_DEFAULT_MODEL_ID, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, normalizeAgyModelId } from '../../shared/agy-agent.js';
+import { AGY_DEFAULT_MODEL_ID, AGY_NATIVE_SESSION_STATE, AGY_SDK_PROVIDER_ID, sanitizeAgyStartupModel } from '../../shared/agy-agent.js';
 import { agyNativeStartNotAttemptedError, persistAgyNativeSessionStart } from './agy-session-persistence.js';
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { paceByEventLoopHealth } from '../util/event-loop-backpressure.js';
@@ -1448,8 +1448,11 @@ export async function relaunchSessionWithSettings(
   // A model id is provider-scoped. An AG switch without an explicit choice
   // must use AG's default, not the previous provider's (possibly invalid) id.
   const enteringAgy = targetAgentType === AGY_SDK_PROVIDER_ID && record.agentType !== AGY_SDK_PROVIDER_ID;
-  const targetRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel
+  const rawRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel
     : enteringAgy ? null : (record.requestedModel ?? null);
+  const targetRequestedModel = targetAgentType === AGY_SDK_PROVIDER_ID
+    ? (sanitizeAgyStartupModel(rawRequestedModel) ?? null)
+    : rawRequestedModel;
   const targetEffort = overrides.effort !== undefined ? overrides.effort : (record.effort ?? null);
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
   const targetCcPreset = overrides.ccPreset !== undefined
@@ -2993,7 +2996,7 @@ function healPersistedAgySessionModel(record: SessionRecord): SessionRecord {
     || transportRuntimes.has(record.name)) {
     return record;
   }
-  const explicitModel = normalizeAgyModelId(record.requestedModel);
+  const explicitModel = sanitizeAgyStartupModel(record.requestedModel);
   const targetActiveModel = explicitModel ?? AGY_DEFAULT_MODEL_ID;
   if (record.requestedModel === explicitModel
     && record.activeModel === targetActiveModel
@@ -3353,7 +3356,7 @@ export async function restoreTransportSessions(
         // the SDK rejected it ("model (fable) may not exist"). Idempotent for ids.
         requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
       } else if (s.providerId === AGY_SDK_PROVIDER_ID) {
-        requestedTransportModel = normalizeAgyModelId(requestedTransportModel);
+        requestedTransportModel = sanitizeAgyStartupModel(requestedTransportModel);
       }
       const runtime = new TransportSessionRuntime(
         provider,
@@ -4005,7 +4008,7 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     // symmetric with the restore path and command-handler's model-change path.
     requestedTransportModel = normalizeClaudeSdkModelForProvider(requestedTransportModel);
   } else if (agentType === AGY_SDK_PROVIDER_ID) {
-    requestedTransportModel = normalizeAgyModelId(requestedTransportModel);
+    requestedTransportModel = sanitizeAgyStartupModel(requestedTransportModel);
   }
   // Preserve existing transportConfig (including supervision) when opts doesn't override.
   // Only fall through to `undefined` if nothing is set — never force `{}`, which would

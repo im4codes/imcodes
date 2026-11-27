@@ -2307,4 +2307,20 @@ describe('SessionSettingsDialog supervision', () => {
     fireEvent.click(screen.getByRole('button', { name: /save/i }));
     await waitFor(() => expect(patchSessionMock).toHaveBeenLastCalledWith('srv-1', 'deck_proj_brain', { label: 'New Brain' }));
   });
+
+  it('triggers providerChanged even when surface prop is omitted and sanitizes polluted agy-model preference', async () => {
+    localStorage.setItem('imcodes-agy-model', 'gpt-6-sol');
+    const onSaved = vi.fn();
+    render(<SessionSettingsDialog serverId="srv-1" sessionName="deck_proj_brain" label="Brain" description="" cwd="/proj"
+      type="codex-sdk" activeModel="gpt-6-sol" requestedModel="gpt-6-sol" transportConfig={null}
+      onClose={vi.fn()} onSaved={onSaved} />);
+    changeSelect(screen.getByTestId('session-agent-type'), AGY_SDK_PROVIDER_ID);
+    await waitFor(() => expect((screen.getByLabelText('label') as HTMLSelectElement).value).toBe(AGY_DEFAULT_MODEL_ID));
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+    await waitFor(() => expect(patchSessionMock).toHaveBeenCalledWith('srv-1', 'deck_proj_brain', {
+      agentType: AGY_SDK_PROVIDER_ID,
+      requestedModel: AGY_DEFAULT_MODEL_ID,
+      activeModel: null,
+    }));
+  });
 });

@@ -170,6 +170,52 @@ export function normalizeAgyModelId(rawModel?: string | null): string | undefine
   return trimmed;
 }
 
+const AGY_CLAUDE_MODEL_RE = /^claude-(?:opus|sonnet)-(?:5-5(?:-(?:low|medium|high))?|\d+(?:[.-]\d+)*-thinking)$/i;
+
+/**
+ * Filters known foreign SDK / preset model IDs out when entering or launching
+ * `agy-sdk` so cross-provider switches fall back to AGY's default model while
+ * keeping valid AGY models (including `gpt-oss-*`, `gemini-*`, AGY Claude
+ * models) and test stub IDs intact.
+ */
+export function sanitizeAgyStartupModel(rawModel?: string | null): string | undefined {
+  const normalized = normalizeAgyModelId(rawModel);
+  if (!normalized) return undefined;
+  const lower = normalized.toLowerCase();
+
+  if (
+    isAgyModelId(lower)
+    || /^gpt-oss-/i.test(lower)
+    || AGY_CLAUDE_MODEL_RE.test(lower)
+  ) {
+    return normalized;
+  }
+
+  const isForeignModel =
+    lower === 'default'
+    || lower === 'auto'
+    || lower === 'coder-model'
+    || lower === 'opus'
+    || lower === 'sonnet'
+    || lower === 'haiku'
+    || lower === 'fable'
+    || lower.includes('[1m]')
+    || /^gpt-\d/i.test(lower)
+    || /^o\d(?:$|[-_.])/i.test(lower)
+    || /^codex(?:$|[-_.])/i.test(lower)
+    || /^claude-/i.test(lower)
+    || /^qwen/i.test(lower)
+    || /^kimi/i.test(lower)
+    || /^deepseek/i.test(lower)
+    || /^grok/i.test(lower)
+    || /^muse/i.test(lower)
+    || /^minimax/i.test(lower)
+    || /^glm/i.test(lower)
+    || /^hy\d/i.test(lower)
+    || lower.includes('/');
+  return isForeignModel ? undefined : normalized;
+}
+
 /**
  * Resolves the effective AGY model id for runtime/CLI execution, falling back to
  * `AGY_DEFAULT_MODEL_ID` whenever no explicit model was selected or a bare backend
