@@ -204,6 +204,62 @@ enum TtsVoiceSelector {
     }
 }
 
+// MARK: - Raw PCM Capture Start Controller
+
+/// Thread-safe start-token and at-most-once settlement tracker for raw PCM capture.
+/// Keeps a strong reference to the pending call until ownership is explicitly consumed for
+/// settlement, and invalidates any in-flight start token synchronously on stop/supersede.
+final class RawPcmStartController<Call: AnyObject> {
+    private let lock = NSLock()
+    private var approvedToken: UInt64 = 0
+    private var pendingCall: Call?
+    private var pendingToken: UInt64 = 0
+
+    var hasPendingStart: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingCall != nil
+    }
+
+    func beginStart(_ call: Call) -> (token: UInt64, superseded: Call?) {
+        lock.lock()
+        defer { lock.unlock() }
+        let superseded = pendingCall
+        approvedToken &+= 1
+        let token = approvedToken
+        pendingCall = call
+        pendingToken = token
+        return (token, superseded)
+    }
+
+    func isExpected(token: UInt64) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return approvedToken == token && pendingToken == token && pendingCall != nil
+    }
+
+    func invalidateAndTakePending() -> Call? {
+        lock.lock()
+        defer { lock.unlock() }
+        approvedToken &+= 1
+        let call = pendingCall
+        pendingCall = nil
+        pendingToken = 0
+        return call
+    }
+
+    func takePendingIfCurrent(token: UInt64) -> Call? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard approvedToken == token, pendingToken == token, let call = pendingCall else {
+            return nil
+        }
+        pendingCall = nil
+        pendingToken = 0
+        return call
+    }
+}
+
 // MARK: - Background TTS Lifecycle Policy
 
 enum TtsLifecycleEvent: Equatable {
@@ -903,7 +959,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
     // Call & lifecycle tracking on main thread.
     private var activeMainOwner: UInt64 = 0
     private var startingCall: CAPPluginCall? // main-thread only
-    private var rawPcmStartingCall: CAPPluginCall? // main-thread only
+    private let rawPcmStartController = RawPcmStartController<CAPPluginCall>()
     private var warmupWatchdog: DispatchWorkItem? // main-thread only
     // System TTS synthesizer & utterance generation tracking (main-thread only).
     private var speechSynthesizer: AVSpeechSynthesizer?
@@ -960,7 +1016,9 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         NotificationCenter.default.removeObserver(self)
         warmupWatchdog?.cancel()
         warmupWatchdog = nil
-        rawPcmStartingCall = nil
+        if let pendingRawStart = rawPcmStartController.invalidateAndTakePending() {
+            pendingRawStart.reject("Raw PCM capture plugin deallocated")
+        }
         rawPcmLock.lock()
         rawPcmActiveOwner = 0
         rawPcmEncoder.reset()
@@ -980,11 +1038,6 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
     private func cancelWarmupWatchdog() {
         warmupWatchdog?.cancel()
         warmupWatchdog = nil
-        rawPcmStartingCall = nil
-        rawPcmLock.lock()
-        rawPcmActiveOwner = 0
-        rawPcmEncoder.reset()
-        rawPcmLock.unlock()
     }
     private func settleStartingCall(errorMessage: String? = nil) {
         cancelWarmupWatchdog()
@@ -1337,7 +1390,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             if self.ttsSpeaking || (self.speechSynthesizer?.isSpeaking ?? false) {
                 self.stopTtsPlaybackOnMain(deactivateSession: false)
             }
-            if self.isRawPcmCaptureActive || self.rawPcmStartingCall != nil {
+            if self.isRawPcmCaptureActive || self.rawPcmStartController.hasPendingStart {
                 self.stopRawPcmCaptureOnMain(nil, deactivateSession: false, flush: false)
             }
             if self.activeMainOwner != 0 || self.startingCall != nil {
@@ -1555,10 +1608,6 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                 self.settleStartingCall(errorMessage: "Offline speech superseded by raw PCM capture")
                 self.endCapture(nil, deactivateSession: false)
             }
-            if let existingStart = self.rawPcmStartingCall {
-                self.rawPcmStartingCall = nil
-                existingStart.reject("Raw PCM capture superseded by new session")
-            }
             if self.isRawPcmCaptureActive {
                 self.stopRawPcmCaptureOnMain(nil, deactivateSession: false, flush: false)
             }
@@ -1567,27 +1616,40 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                 code: "phone_mic_busy"
             )
             SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(true)
-            self.rawPcmStartingCall = call
+            let startController = self.rawPcmStartController
+            let (startToken, superseded) = startController.beginStart(call)
+            superseded?.reject("Raw PCM capture superseded by new session")
 
-            let startOnAudioQueue = { [weak self, weak call] in
-                guard let self = self else { return }
-                self.audioQueue.async { [weak self, weak call] in
-                    guard let self = self else { return }
-                    let session = AVAudioSession.sharedInstance()
-                    guard session.recordPermission == .granted else {
+            let startOnAudioQueue = { [weak self] in
+                guard let self = self else {
+                    if let unsettled = startController.takePendingIfCurrent(token: startToken) {
                         DispatchQueue.main.async {
-                            if self.rawPcmStartingCall === call {
-                                self.rawPcmStartingCall = nil
+                            unsettled.reject("Raw PCM capture plugin unavailable")
+                        }
+                    }
+                    return
+                }
+                self.audioQueue.async { [weak self] in
+                    guard let self = self else {
+                        if let unsettled = startController.takePendingIfCurrent(token: startToken) {
+                            DispatchQueue.main.async {
+                                unsettled.reject("Raw PCM capture plugin unavailable")
                             }
-                            if self.activeMainOwner == 0 && !self.isRawPcmCaptureActive {
-                                SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
-                            }
-                            call?.reject("Microphone permission denied")
                         }
                         return
                     }
-                    let stillExpected = DispatchQueue.main.sync { self.rawPcmStartingCall === call }
-                    guard stillExpected else { return }
+                    let session = AVAudioSession.sharedInstance()
+                    guard session.recordPermission == .granted else {
+                        DispatchQueue.main.async {
+                            let settled = startController.takePendingIfCurrent(token: startToken)
+                            if self.activeMainOwner == 0 && !self.isRawPcmCaptureActive {
+                                SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
+                            }
+                            settled?.reject("Microphone permission denied")
+                        }
+                        return
+                    }
+                    guard startController.isExpected(token: startToken) else { return }
                     do {
                         self.cancelWarmHoldDeactivationOnAudioQueue()
                         try self.configureAudioSessionCategoryIfNeeded(session: session)
@@ -1600,19 +1662,46 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                         if session.isInputGainSettable, session.inputGain != 1.0 {
                             try? session.setInputGain(1.0)
                         }
-                        let owner: UInt64 = {
+                        let owner: UInt64? = {
                             self.rawPcmLock.lock()
                             defer { self.rawPcmLock.unlock() }
+                            guard startController.isExpected(token: startToken) else {
+                                return nil
+                            }
                             self.rawPcmGeneration &+= 1
                             self.rawPcmActiveOwner = self.rawPcmGeneration
                             self.rawPcmEncoder.reset()
                             return self.rawPcmGeneration
                         }()
+                        guard let owner = owner else { return }
                         try self.installRawPcmTapAndStartOnAudioQueue(owner: owner)
+                        guard startController.isExpected(token: startToken) else {
+                            self.rawPcmLock.lock()
+                            if self.rawPcmActiveOwner == owner {
+                                self.rawPcmActiveOwner = 0
+                                self.rawPcmEncoder.reset()
+                            }
+                            self.rawPcmLock.unlock()
+                            if self.activeAsrTapOwner == nil {
+                                self.stopCaptureAudioOnAudioQueue(deactivateSession: false, forceTeardown: false)
+                            }
+                            return
+                        }
                         DispatchQueue.main.async {
-                            if self.rawPcmStartingCall === call {
-                                self.rawPcmStartingCall = nil
-                                call?.resolve()
+                            if let settled = startController.takePendingIfCurrent(token: startToken) {
+                                settled.resolve()
+                            } else {
+                                // Stop arrived while resolving on main; tear down the newly installed tap.
+                                self.rawPcmLock.lock()
+                                if self.rawPcmActiveOwner == owner {
+                                    self.rawPcmActiveOwner = 0
+                                    self.rawPcmEncoder.reset()
+                                }
+                                self.rawPcmLock.unlock()
+                                self.audioQueue.async { [weak self] in
+                                    guard let self = self, self.activeAsrTapOwner == nil else { return }
+                                    self.stopCaptureAudioOnAudioQueue(deactivateSession: false, forceTeardown: false)
+                                }
                             }
                         }
                     } catch {
@@ -1622,13 +1711,11 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                         self.rawPcmLock.unlock()
                         self.stopCaptureAudioOnAudioQueue(deactivateSession: true, forceTeardown: true)
                         DispatchQueue.main.async {
-                            if self.rawPcmStartingCall === call {
-                                self.rawPcmStartingCall = nil
-                            }
-                            if self.activeMainOwner == 0 {
+                            let settled = startController.takePendingIfCurrent(token: startToken)
+                            if self.activeMainOwner == 0 && !self.isRawPcmCaptureActive {
                                 SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
                             }
-                            call?.reject("Raw PCM capture could not start", nil, error)
+                            settled?.reject("Raw PCM capture could not start", nil, error)
                         }
                     }
                 }
@@ -1636,19 +1723,26 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
 
             let permission = AVAudioSession.sharedInstance().recordPermission
             if permission == .undetermined {
-                self.requestRecordPermission { allowed in
-                    guard allowed else {
-                        DispatchQueue.main.async {
-                            if self.rawPcmStartingCall === call {
-                                self.rawPcmStartingCall = nil
+                self.requestRecordPermission { [weak self] allowed in
+                    guard let self = self else {
+                        if let unsettled = startController.takePendingIfCurrent(token: startToken) {
+                            DispatchQueue.main.async {
+                                unsettled.reject("Raw PCM capture plugin unavailable")
                             }
-                            if self.activeMainOwner == 0 && !self.isRawPcmCaptureActive {
-                                SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
-                            }
-                            call.reject("Microphone permission denied")
                         }
                         return
                     }
+                    guard allowed else {
+                        DispatchQueue.main.async {
+                            let settled = startController.takePendingIfCurrent(token: startToken)
+                            if self.activeMainOwner == 0 && !self.isRawPcmCaptureActive {
+                                SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
+                            }
+                            settled?.reject("Microphone permission denied")
+                        }
+                        return
+                    }
+                    guard startController.isExpected(token: startToken) else { return }
                     startOnAudioQueue()
                 }
             } else {
@@ -1671,8 +1765,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         allowWarmHold: Bool = true
     ) {
         dispatchPrecondition(condition: .onQueue(.main))
-        if let pending = rawPcmStartingCall {
-            rawPcmStartingCall = nil
+        if let pending = rawPcmStartController.invalidateAndTakePending() {
             pending.reject("Raw PCM capture stopped before ready")
         }
         let flushedChunk: RawPcmEncodedChunk? = {
@@ -1689,11 +1782,15 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
         if activeMainOwner == 0 {
             SharedSpeechRecognizerStore.shared.setPhoneCaptureActive(false)
         }
-        audioQueue.async { [weak self, weak call] in
+        audioQueue.async { [weak self] in
             guard let self = self else {
                 DispatchQueue.main.async { call?.resolve() }
                 return
             }
+            self.rawPcmLock.lock()
+            self.rawPcmActiveOwner = 0
+            self.rawPcmEncoder.reset()
+            self.rawPcmLock.unlock()
             if self.activeAsrTapOwner == nil {
                 self.stopCaptureAudioOnAudioQueue(deactivateSession: deactivateSession, forceTeardown: forceTeardown, allowWarmHold: allowWarmHold)
             }
@@ -1781,7 +1878,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
 
     private func handleLifecycleEventOnMain(_ event: TtsLifecycleEvent) {
         dispatchPrecondition(condition: .onQueue(.main))
-        let hasRawPcm = isRawPcmCaptureActive || rawPcmStartingCall != nil
+        let hasRawPcm = isRawPcmCaptureActive || rawPcmStartController.hasPendingStart
         let hasActiveCapture = (activeMainOwner != 0 || startingCall != nil || coordinator.hasActiveCapture || hasRawPcm)
         let decision = TtsBackgroundLifecyclePolicy.decide(
             event: event,
@@ -1904,7 +2001,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
             }
             DispatchQueue.main.async {
                 guard wasCapturing else { return }
-                if self.isRawPcmCaptureActive || self.rawPcmStartingCall != nil {
+                if self.isRawPcmCaptureActive || self.rawPcmStartController.hasPendingStart {
                     self.stopRawPcmCaptureOnMain(nil, deactivateSession: true, flush: false, forceTeardown: true)
                 }
                 if self.startingCall != nil {
@@ -2080,7 +2177,7 @@ public class StreamingSpeechPlugin: CAPPlugin, CAPBridgedPlugin, AVSpeechSynthes
                 call.reject("TTS plugin unavailable")
                 return
             }
-            if self.isRawPcmCaptureActive || self.rawPcmStartingCall != nil {
+            if self.isRawPcmCaptureActive || self.rawPcmStartController.hasPendingStart {
                 self.stopRawPcmCaptureOnMain(nil, deactivateSession: true, flush: false, forceTeardown: true)
             }
             if self.activeMainOwner != 0 || self.startingCall != nil {

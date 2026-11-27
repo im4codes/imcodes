@@ -316,6 +316,17 @@ describe('Qwen3-ASR mobile assets', () => {
     expect(ios).toContain('guard warmupRemaining == 0');
     expect(ios).toContain('self.settleStartingCall()');
     expect(ios).toContain('startingCall = nil');
+    // ARC safety & start/stop race guards for raw PCM capture: never capture CAPPluginCall weakly
+    expect(ios).not.toMatch(/\[\s*weak\s+call\b|,\s*weak\s+call\b/);
+    expect(ios).toContain('final class RawPcmStartController<Call: AnyObject>');
+    expect(ios).toContain('startController.isExpected(token: startToken)');
+    expect(ios).toContain('startController.takePendingIfCurrent(token: startToken)');
+    expect(ios).toContain('rawPcmStartController.invalidateAndTakePending()');
+    const cancelWatchdogBody = ios.slice(
+      ios.indexOf('private func cancelWarmupWatchdog()'),
+      ios.indexOf('private func settleStartingCall('),
+    );
+    expect(cancelWatchdogBody).not.toContain('rawPcm');
     expect(ios).not.toContain('if self.engine?.isRunning == true { call.resolve(); return }');
     expect(ios).toContain('self.endCapture(nil, deactivateSession: false)');
     expect(ios).toContain('.AVAudioEngineConfigurationChange');

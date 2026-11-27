@@ -4574,4 +4574,113 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
       resetVoiceHotwordsScopeForTesting();
     }
   });
+
+  it('bounds hung native startRawPcmCapture() and stopRawPcmCapture() promises so voice state never deadlocks', async () => {
+    vi.useFakeTimers();
+    const {
+      REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS,
+      REMOTE_VOICE_NATIVE_CAPTURE_STOP_TIMEOUT_MS,
+    } = await import('../src/remote-voice-client.js');
+
+    vi.stubGlobal('Capacitor', {
+      getPlatform: () => 'ios',
+      isNativePlatform: () => true,
+      isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+    });
+    const getUserMedia = vi.fn();
+    vi.stubGlobal('navigator', {
+      mediaDevices: { getUserMedia },
+      maxTouchPoints: 0,
+      language: 'en-US',
+      languages: ['en-US'],
+    });
+    vi.stubGlobal('AudioContext', undefined);
+
+    const stopRawPcmCapture = vi.fn(() => new Promise<void>(() => {}));
+    const startRawPcmCapture = vi.fn(() => new Promise<void>(() => {}));
+    Object.assign(streamingBridge, { startRawPcmCapture, stopRawPcmCapture });
+
+    try {
+      // Case 1: Hung startRawPcmCapture during prime + stopOnReady settles within start timeout, calls cleanup, and never triggers getUserMedia
+      const onPrimeError = vi.fn();
+      expect(primeRemoteVoiceCapture({ allowPrompt: true, onError: onPrimeError })).toBe(true);
+      const finishP = finishRemoteVoiceCapturePrime();
+
+      await vi.advanceTimersByTimeAsync(REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS + 50);
+      await finishP;
+
+      expect(startRawPcmCapture).toHaveBeenCalledTimes(1);
+      expect(stopRawPcmCapture).toHaveBeenCalledTimes(1);
+      expect(getUserMedia).not.toHaveBeenCalled();
+      expect(onPrimeError).toHaveBeenCalledWith('native_raw_pcm_start_timeout', false);
+
+      // Case 2: Hung startRawPcmCapture in direct startRemoteVoiceSession fails boundedly with native_raw_pcm_start_timeout
+      resetRemoteVoiceClientForTesting();
+      FakeWebSocket.instances.length = 0;
+      startRawPcmCapture.mockClear();
+      stopRawPcmCapture.mockClear();
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-start-hang' });
+
+      const directHangP = startRemoteVoiceSession({
+        targetDeviceId: 'dev-m3',
+        readyTimeoutMs: 20_000,
+        onResult: vi.fn(),
+        onError: vi.fn(),
+        onEnd: vi.fn(),
+        getWsBaseUrl: () => 'https://relay.example',
+      });
+      await vi.advanceTimersByTimeAsync(1);
+      const wsHang = FakeWebSocket.instances[0]!;
+      wsHang.emitOpen();
+      await vi.advanceTimersByTimeAsync(REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS + 50);
+      await expect(directHangP).resolves.toMatchObject({ ok: false, reason: 'native_raw_pcm_start_timeout' });
+      expect(stopRawPcmCapture).toHaveBeenCalledTimes(1);
+
+      // Case 3: Native start succeeds, then stopRawPcmCapture hangs forever -> handle.stop() completes within stop timeout and releases state
+      resetRemoteVoiceClientForTesting();
+      FakeWebSocket.instances.length = 0;
+      const resolvedStart = vi.fn(async () => {});
+      const hungStop = vi.fn(() => new Promise<void>(() => {}));
+      Object.assign(streamingBridge, { startRawPcmCapture: resolvedStart, stopRawPcmCapture: hungStop });
+      apiMocks.fetchRemoteVoiceWsTicket.mockResolvedValueOnce({ ticket: 'tkt-stop-hang' });
+
+      const onOkResult = vi.fn();
+      const okStartP = startRemoteVoiceSession({
+        targetDeviceId: 'dev-m3',
+        onResult: onOkResult,
+        onError: vi.fn(),
+        onEnd: vi.fn(),
+        getWsBaseUrl: () => 'https://relay.example',
+      });
+      await vi.advanceTimersByTimeAsync(1);
+      const ws = FakeWebSocket.instances[0]!;
+      ws.emitOpen();
+      const startOkMsg = JSON.parse(ws.sent[0]!) as { sessionId: string };
+      ws.emitMessage({ type: 'voice.session.ready', sessionId: startOkMsg.sessionId });
+      const started = await okStartP;
+      expect(started.ok).toBe(true);
+      if (!started.ok) return;
+
+      let stopResolved = false;
+      const stopP = started.handle.stop(false).then((r) => {
+        stopResolved = true;
+        return r;
+      });
+      await vi.advanceTimersByTimeAsync(REMOTE_VOICE_NATIVE_CAPTURE_STOP_TIMEOUT_MS - 100);
+      expect(hungStop).toHaveBeenCalledTimes(1);
+      expect(stopResolved).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(200);
+      ws.emitMessage({ type: 'voice.session.result', sessionId: startOkMsg.sessionId, text: 'ok', isFinal: true });
+      ws.emitMessage({ type: 'voice.session.end', sessionId: startOkMsg.sessionId });
+      await stopP;
+      expect(stopResolved).toBe(true);
+      expect(onOkResult).toHaveBeenCalledWith('ok', true);
+    } finally {
+      vi.useRealTimers();
+      delete (streamingBridge as Record<string, unknown>).startRawPcmCapture;
+      delete (streamingBridge as Record<string, unknown>).stopRawPcmCapture;
+      vi.unstubAllGlobals();
+    }
+  });
 });

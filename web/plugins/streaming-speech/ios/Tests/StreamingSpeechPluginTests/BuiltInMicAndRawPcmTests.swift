@@ -141,4 +141,75 @@ final class BuiltInMicAndRawPcmTests: XCTestCase {
         XCTAssertFalse(decodedInputs.isEmpty)
         XCTAssertEqual(decodedInputs.last?.count, totalSamples)
     }
+
+    func testRawPcmStartControllerRetainsCallAcrossOwnershipTakeAndPreventsDoubleSettle() {
+        final class FakeCapCall {
+            var resolveCount = 0
+            var rejectMessages: [String] = []
+            func resolve() { resolveCount += 1 }
+            func reject(_ msg: String) { rejectMessages.append(msg) }
+        }
+
+        let controller = RawPcmStartController<FakeCapCall>()
+        var settledCall: FakeCapCall? = {
+            var externalCall: FakeCapCall? = FakeCapCall()
+            weak var weakRef = externalCall
+            let (token, superseded) = controller.beginStart(externalCall!)
+            XCTAssertNil(superseded)
+            XCTAssertTrue(controller.hasPendingStart)
+            XCTAssertTrue(controller.isExpected(token: token))
+
+            // Drop the caller's local ref just like Capacitor returning from @objc startRawPcmCapture.
+            externalCall = nil
+            XCTAssertNotNil(weakRef)
+
+            // Consuming ownership clears internal state first, yet strong return value keeps call alive.
+            let taken = controller.takePendingIfCurrent(token: token)
+            XCTAssertFalse(controller.hasPendingStart)
+            XCTAssertFalse(controller.isExpected(token: token))
+            XCTAssertNotNil(taken)
+            XCTAssertNotNil(weakRef)
+
+            // Duplicate settle attempt must return nil.
+            XCTAssertNil(controller.takePendingIfCurrent(token: token))
+            XCTAssertNil(controller.invalidateAndTakePending())
+            taken?.resolve()
+            return taken
+        }()
+
+        XCTAssertEqual(settledCall?.resolveCount, 1)
+        XCTAssertEqual(settledCall?.rejectMessages, [])
+        settledCall = nil
+    }
+
+    func testRawPcmStartControllerInvalidatesInFlightStartOnConcurrentStopOrSupersede() {
+        final class FakeCapCall {
+            var resolved = 0
+            var rejected: [String] = []
+        }
+
+        let controller = RawPcmStartController<FakeCapCall>()
+        let call1 = FakeCapCall()
+        let (token1, sup1) = controller.beginStart(call1)
+        XCTAssertNil(sup1)
+
+        // Concurrent stop invalidates token1 synchronously before audioQueue installs tap.
+        let cancelled = controller.invalidateAndTakePending()
+        XCTAssertTrue(cancelled === call1)
+        cancelled?.rejected.append("Raw PCM capture stopped before ready")
+        XCTAssertFalse(controller.isExpected(token: token1))
+        XCTAssertNil(controller.takePendingIfCurrent(token: token1))
+
+        // Superseding an active pending start returns prior call once and invalidates its token.
+        let call2 = FakeCapCall()
+        let (token2, sup2) = controller.beginStart(call2)
+        XCTAssertNil(sup2)
+        let call3 = FakeCapCall()
+        let (token3, sup3) = controller.beginStart(call3)
+        XCTAssertTrue(sup3 === call2)
+        XCTAssertFalse(controller.isExpected(token: token2))
+        XCTAssertTrue(controller.isExpected(token: token3))
+        XCTAssertNil(controller.takePendingIfCurrent(token: token2))
+        XCTAssertTrue(controller.takePendingIfCurrent(token: token3) === call3)
+    }
 }

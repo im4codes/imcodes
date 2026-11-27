@@ -40,6 +40,8 @@ export const REMOTE_VOICE_CLIENT_READY_TIMEOUT_MS = 3_000;
 export const REMOTE_VOICE_CLIENT_STOP_DRAIN_MS = 5_000;
 export const REMOTE_VOICE_CLIENT_HTTP_ASR_STOP_DRAIN_MS = 28_000;
 export const REMOTE_VOICE_FRESHNESS_TIMEOUT_MS = 800;
+export const REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS = 10_000;
+export const REMOTE_VOICE_NATIVE_CAPTURE_STOP_TIMEOUT_MS = 3_000;
 const REMOTE_VOICE_CACHE_FRESH_MS = 5_000;
 const PCM_TARGET_CHUNK_SAMPLES = 1_600; // 100ms @ 16kHz = 3200 bytes
 const MAX_PRE_READY_PCM_SAMPLES = REMOTE_VOICE_SAMPLE_RATE * 15; // 15s cap (~480KB)
@@ -589,6 +591,7 @@ interface AudioFrameSink {
 interface NativeCaptureState {
   bridge: NativeRawPcmCapture;
   listenerPromise: Promise<{ remove: () => Promise<void> }> | null;
+  stopped?: boolean;
 }
 
 interface PrimedRemoteVoiceCapture {
@@ -683,23 +686,88 @@ export function decodeBase64ToInt16Pcm(pcmBase64: string): Int16Array {
   return out;
 }
 
+function withBoundedTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+    Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+async function startNativeRawPcmCaptureWithTimeout(
+  nativeState: NativeCaptureState,
+  onChunk: (ev: StreamingSpeechRawPcmEvent) => void,
+  shouldStart: () => boolean,
+): Promise<boolean> {
+  const listenerP = nativeState.bridge.addListener(STREAMING_SPEECH_RAW_PCM_EVENT, onChunk);
+  nativeState.listenerPromise = listenerP;
+  await withBoundedTimeout(
+    listenerP,
+    REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS,
+    'native_raw_pcm_start_timeout',
+  );
+  if (!shouldStart()) return false;
+  await withBoundedTimeout(
+    nativeState.bridge.startRawPcmCapture(),
+    REMOTE_VOICE_NATIVE_CAPTURE_START_TIMEOUT_MS,
+    'native_raw_pcm_start_timeout',
+  );
+  return true;
+}
+
 function removeNativeListener(listenerPromise: Promise<{ remove: () => Promise<void> }> | null): void {
   if (!listenerPromise) return;
   void listenerPromise.then((handle) => handle?.remove?.()).catch(() => {});
 }
 
 async function teardownNativeCapture(native: NativeCaptureState, awaitStop: boolean): Promise<void> {
+  if (native.stopped) return;
+  native.stopped = true;
   const listenerPromise = native.listenerPromise;
   if (awaitStop) {
     try {
-      await native.bridge.stopRawPcmCapture();
+      await withBoundedTimeout(
+        native.bridge.stopRawPcmCapture(),
+        REMOTE_VOICE_NATIVE_CAPTURE_STOP_TIMEOUT_MS,
+        'native_raw_pcm_stop_timeout',
+      );
     } catch { /* ignore */ }
     await Promise.resolve();
     native.listenerPromise = null;
     if (listenerPromise) {
       try {
-        const handle = await listenerPromise;
-        await handle?.remove?.();
+        const handle = await withBoundedTimeout(
+          listenerPromise,
+          REMOTE_VOICE_NATIVE_CAPTURE_STOP_TIMEOUT_MS,
+          'native_raw_pcm_listener_timeout',
+        );
+        await withBoundedTimeout(
+          handle?.remove?.() ?? Promise.resolve(),
+          REMOTE_VOICE_NATIVE_CAPTURE_STOP_TIMEOUT_MS,
+          'native_raw_pcm_listener_remove_timeout',
+        );
       } catch { /* ignore */ }
     }
     return;
@@ -1027,20 +1095,18 @@ export function primeRemoteVoiceCapture(options?: PrimeRemoteVoiceCaptureOptions
 
   if (nativeCapture && prime.native) {
     const nativeState = prime.native;
-    const listenerP = nativeCapture.addListener(STREAMING_SPEECH_RAW_PCM_EVENT, (ev: StreamingSpeechRawPcmEvent) => {
-      if (prime.cancelled || !prime.sink.active) return;
-      const samples = decodeBase64ToInt16Pcm(ev.pcmBase64);
-      const level = typeof ev.level === 'number' && Number.isFinite(ev.level) ? ev.level : 0;
-      prime.sink.onFrame(level, samples);
-    });
-    nativeState.listenerPromise = listenerP;
-    prime.micPromise = listenerP
-      .then(() => {
-        if (prime.cancelled) return null;
-        return nativeCapture.startRawPcmCapture();
-      })
-      .then(async () => {
-        if (prime.cancelled) {
+    prime.micPromise = startNativeRawPcmCaptureWithTimeout(
+      nativeState,
+      (ev: StreamingSpeechRawPcmEvent) => {
+        if (prime.cancelled || !prime.sink.active) return;
+        const samples = decodeBase64ToInt16Pcm(ev.pcmBase64);
+        const level = typeof ev.level === 'number' && Number.isFinite(ev.level) ? ev.level : 0;
+        prime.sink.onFrame(level, samples);
+      },
+      () => !prime.cancelled,
+    )
+      .then(async (started) => {
+        if (!started || prime.cancelled) {
           void teardownNativeCapture(nativeState, false);
           return null;
         }
@@ -1076,7 +1142,7 @@ export function primeRemoteVoiceCapture(options?: PrimeRemoteVoiceCaptureOptions
         }
         if (permissionDenied) {
           _remoteMicPermissionKnownGranted = false;
-        } else if (!prime.cancelled && canWebAudio) {
+        } else if (!prime.cancelled && (!prime.stopOnReady || isCapacitorUnimplementedError(err)) && canWebAudio) {
           return startWebPrime();
         }
         const reason = formatMicCaptureErrorReason(err);
@@ -1745,36 +1811,30 @@ export async function startRemoteVoiceSession(
         promise: Promise.resolve(),
       };
       pendingDirectNative = pendingEntry;
-      const listenerP = nativeCapture.addListener(STREAMING_SPEECH_RAW_PCM_EVENT, (ev: StreamingSpeechRawPcmEvent) => {
-        if (cancelled || !directSink.active) return;
-        const samples = decodeBase64ToInt16Pcm(ev.pcmBase64);
-        const level = typeof ev.level === 'number' && Number.isFinite(ev.level) ? ev.level : 0;
-        directSink.onFrame(level, samples);
-      });
-      nativeState.listenerPromise = listenerP;
-      micPromise = listenerP
-        .then(() => {
-          if (cancelled || terminated || setupFailed || stoppedByCaller) {
-            if (pendingDirectNative === pendingEntry) pendingDirectNative = null;
+      micPromise = startNativeRawPcmCaptureWithTimeout(
+        nativeState,
+        (ev: StreamingSpeechRawPcmEvent) => {
+          if (cancelled || !directSink.active) return;
+          const samples = decodeBase64ToInt16Pcm(ev.pcmBase64);
+          const level = typeof ev.level === 'number' && Number.isFinite(ev.level) ? ev.level : 0;
+          directSink.onFrame(level, samples);
+        },
+        () => !(cancelled || terminated || setupFailed || stoppedByCaller),
+      )
+        .then((started) => {
+          if (pendingDirectNative === pendingEntry) pendingDirectNative = null;
+          if (!started || cancelled) {
             directSink.active = false;
             void teardownNativeCapture(nativeState, false);
             return null;
           }
-          return nativeCapture.startRawPcmCapture().then(() => {
-            if (pendingDirectNative === pendingEntry) pendingDirectNative = null;
-            if (cancelled) {
-              directSink.active = false;
-              void teardownNativeCapture(nativeState, false);
-              return null;
-            }
-            _remoteMicPermissionKnownGranted = true;
-            activeSink = directSink;
-            activeNative = nativeState;
-            if (!terminated && !setupFailed && !stoppedByCaller) {
-              opts.onCaptureStarted?.(handle);
-            }
-            return null;
-          });
+          _remoteMicPermissionKnownGranted = true;
+          activeSink = directSink;
+          activeNative = nativeState;
+          if (!terminated && !setupFailed && !stoppedByCaller) {
+            opts.onCaptureStarted?.(handle);
+          }
+          return null;
         })
         .catch((err) => {
           if (pendingDirectNative === pendingEntry) pendingDirectNative = null;
