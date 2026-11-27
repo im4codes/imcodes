@@ -56,7 +56,14 @@ import {
   type CcPreset,
   type CcPresetAuthType,
 } from "@shared/cc-presets.js";
-import { AGY_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions, resolveCodexAutoDefaultModel } from "../../../src/shared/models/options.js";
+import {
+  AGY_MODEL_IDS,
+  CODEX_MODEL_IDS,
+  DEFAULT_CLAUDE_CODE_MODEL_ID,
+  DEFAULT_OPENCODE_MODEL_ID,
+  mergeModelSuggestions,
+  resolveCodexAutoDefaultModel,
+} from "../../../src/shared/models/options.js";
 import { loadAgyModelPreference, saveAgyModelPreference } from "../agy-model-preference.js";
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from "@shared/git-remote-url.js";
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from "@shared/agent-types.js";
@@ -1002,14 +1009,26 @@ export function NewSessionDialog({
   });
 
   const codexModelManuallySelectedRef = useRef(false);
-  const lastCodexTargetRef = useRef<string | WsClient | null>(serverId?.trim() || ws || null);
+  const claudeCodeModelManuallySelectedRef = useRef(false);
+  const openCodeModelManuallySelectedRef = useRef(false);
+  const lastTargetRef = useRef<string | WsClient | null>(serverId?.trim() || ws || null);
   useEffect(() => {
     const nextTarget = serverId?.trim() || ws || null;
-    if (lastCodexTargetRef.current && nextTarget && lastCodexTargetRef.current !== nextTarget) {
+    if (lastTargetRef.current && nextTarget && lastTargetRef.current !== nextTarget) {
       codexModelManuallySelectedRef.current = false;
-      if (agentType === "codex-sdk" && !selectedCcPreset) setRequestedModel("");
+      claudeCodeModelManuallySelectedRef.current = false;
+      openCodeModelManuallySelectedRef.current = false;
+      if (
+        (agentType === "codex-sdk" ||
+          agentType === "claude-code-sdk" ||
+          agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE ||
+          agentType === "opencode-sdk") &&
+        !selectedCcPreset
+      ) {
+        setRequestedModel("");
+      }
     }
-    lastCodexTargetRef.current = nextTarget;
+    lastTargetRef.current = nextTarget;
   }, [agentType, selectedCcPreset, serverId, ws]);
 
   useEffect(() => {
@@ -1021,6 +1040,37 @@ export function NewSessionDialog({
       const trimmed = current.trim();
       if (codexModelManuallySelectedRef.current && trimmed) return trimmed;
       return resolveCodexAutoDefaultModel(modelSuggestions, transportModels.defaultModel) ?? "";
+    });
+  }, [agentType, selectedCcPreset, modelSuggestions, transportModels.defaultModel, serverId]);
+
+  useEffect(() => {
+    const isClaudeCode = agentType === "claude-code-sdk" || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE;
+    if (!isClaudeCode || selectedCcPreset) {
+      claudeCodeModelManuallySelectedRef.current = false;
+      return;
+    }
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (claudeCodeModelManuallySelectedRef.current && trimmed) return trimmed;
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(DEFAULT_CLAUDE_CODE_MODEL_ID)) {
+        return DEFAULT_CLAUDE_CODE_MODEL_ID;
+      }
+      return transportModels.defaultModel ?? modelSuggestions[0] ?? DEFAULT_CLAUDE_CODE_MODEL_ID;
+    });
+  }, [agentType, selectedCcPreset, modelSuggestions, transportModels.defaultModel, serverId]);
+
+  useEffect(() => {
+    if (agentType !== "opencode-sdk" || selectedCcPreset) {
+      openCodeModelManuallySelectedRef.current = false;
+      return;
+    }
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (openCodeModelManuallySelectedRef.current && trimmed) return trimmed;
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(DEFAULT_OPENCODE_MODEL_ID)) {
+        return DEFAULT_OPENCODE_MODEL_ID;
+      }
+      return transportModels.defaultModel ?? modelSuggestions[0] ?? DEFAULT_OPENCODE_MODEL_ID;
     });
   }, [agentType, selectedCcPreset, modelSuggestions, transportModels.defaultModel, serverId]);
 
@@ -1393,6 +1443,12 @@ export function NewSessionDialog({
                   if (agentType === "codex-sdk" && !selectedCcPreset) {
                     codexModelManuallySelectedRef.current = val.trim().length > 0;
                   }
+                  if ((agentType === "claude-code-sdk" || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) && !selectedCcPreset) {
+                    claudeCodeModelManuallySelectedRef.current = val.trim().length > 0;
+                  }
+                  if (agentType === "opencode-sdk" && !selectedCcPreset) {
+                    openCodeModelManuallySelectedRef.current = val.trim().length > 0;
+                  }
                   setRequestedModel(val);
                 }}
                 style={{
@@ -1429,6 +1485,12 @@ export function NewSessionDialog({
                   if (agentType === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
                   if (agentType === "codex-sdk" && !selectedCcPreset) {
                     codexModelManuallySelectedRef.current = val.trim().length > 0;
+                  }
+                  if ((agentType === "claude-code-sdk" || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) && !selectedCcPreset) {
+                    claudeCodeModelManuallySelectedRef.current = val.trim().length > 0;
+                  }
+                  if (agentType === "opencode-sdk" && !selectedCcPreset) {
+                    openCodeModelManuallySelectedRef.current = val.trim().length > 0;
                   }
                   setRequestedModel(val);
                 }}

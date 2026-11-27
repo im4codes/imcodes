@@ -30,8 +30,8 @@ describe('ClaudeCodeSdkProvider.listModels', () => {
     // credentials files or API keys.
     expect(result.isAuthenticated).toBe(false);
     expect(result.error).toContain('Claude local auth unavailable');
-    // Default model is the first in the list
-    expect(result.defaultModel).toBe(result.models[0]?.id);
+    // Default model is opus[1M]
+    expect(result.defaultModel).toBe('opus[1M]');
   });
 
   it('force=true still returns the same static list', async () => {
@@ -40,6 +40,16 @@ describe('ClaudeCodeSdkProvider.listModels', () => {
     const a = await provider.listModels(false);
     const b = await provider.listModels(true);
     expect(b.models.map((m) => m.id)).toEqual(a.models.map((m) => m.id));
+  });
+});
+
+describe('ClaudeCodeCliSdkProvider.listModels', () => {
+  it('returns the static Claude model roster with opus[1M] as defaultModel', async () => {
+    const { ClaudeCodeCliSdkProvider } = await import('../../../src/agent/providers/claude-code-cli-sdk.js');
+    const provider = new ClaudeCodeCliSdkProvider();
+    const result = await provider.listModels();
+    expect(result.models.length).toBeGreaterThan(0);
+    expect(result.defaultModel).toBe('opus[1M]');
   });
 });
 

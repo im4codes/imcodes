@@ -1,3 +1,4 @@
+import { DEFAULT_CLAUDE_CODE_MODEL_ID } from '../../shared/models/options.js';
 import { setSessionIncognito, withSessionPrivacy } from '../../../shared/session-incognito-context.js';
 import { confirmPromiseStop, bindCapturedChildStop, confirmCapturedChildExit } from '../provider-stop-confirmation.js';
 import { randomUUID } from 'node:crypto';
@@ -583,7 +584,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     const auth = await detectLocalAuthContext(this.id);
     return {
       models: models.map((id) => ({ id })),
-      defaultModel: models[0],
+      defaultModel: models.includes(DEFAULT_CLAUDE_CODE_MODEL_ID) ? DEFAULT_CLAUDE_CODE_MODEL_ID : models[0],
       isAuthenticated: auth.authenticated && auth.reusable,
       ...(!(auth.authenticated && auth.reusable) ? { error: `Claude local auth unavailable: ${auth.reason ?? 'unknown reason'}` } : {}),
       ...(cfg.planLabel ? {} : {}), // planLabel lives in session-info, not model list

@@ -34,7 +34,14 @@ import {
   type CcPreset,
   type CcPresetAuthType,
 } from '@shared/cc-presets.js';
-import { AGY_MODEL_IDS, CODEX_MODEL_IDS, mergeModelSuggestions, resolveCodexAutoDefaultModel } from '../../../src/shared/models/options.js';
+import {
+  AGY_MODEL_IDS,
+  CODEX_MODEL_IDS,
+  DEFAULT_CLAUDE_CODE_MODEL_ID,
+  DEFAULT_OPENCODE_MODEL_ID,
+  mergeModelSuggestions,
+  resolveCodexAutoDefaultModel,
+} from '../../../src/shared/models/options.js';
 import { loadAgyModelPreference, saveAgyModelPreference } from '../agy-model-preference.js';
 import {
   CODEBUDDY_CHINA_DEFAULT_MODEL,
@@ -477,14 +484,26 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
   });
 
   const codexModelManuallySelectedRef = useRef(false);
-  const lastCodexTargetRef = useRef<string | WsClient | null>(serverId?.trim() || ws || null);
+  const claudeCodeModelManuallySelectedRef = useRef(false);
+  const openCodeModelManuallySelectedRef = useRef(false);
+  const lastTargetRef = useRef<string | WsClient | null>(serverId?.trim() || ws || null);
   useEffect(() => {
     const nextTarget = serverId?.trim() || ws || null;
-    if (lastCodexTargetRef.current && nextTarget && lastCodexTargetRef.current !== nextTarget) {
+    if (lastTargetRef.current && nextTarget && lastTargetRef.current !== nextTarget) {
       codexModelManuallySelectedRef.current = false;
-      if (type === 'codex-sdk' && !selectedCcPreset) setRequestedModel('');
+      claudeCodeModelManuallySelectedRef.current = false;
+      openCodeModelManuallySelectedRef.current = false;
+      if (
+        (type === 'codex-sdk' ||
+          type === 'claude-code-sdk' ||
+          type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE ||
+          type === 'opencode-sdk') &&
+        !selectedCcPreset
+      ) {
+        setRequestedModel('');
+      }
     }
-    lastCodexTargetRef.current = nextTarget;
+    lastTargetRef.current = nextTarget;
   }, [serverId, selectedCcPreset, type, ws]);
 
   useEffect(() => {
@@ -496,6 +515,37 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
       const trimmed = current.trim();
       if (codexModelManuallySelectedRef.current && trimmed) return trimmed;
       return resolveCodexAutoDefaultModel(modelSuggestions, transportModels.defaultModel) ?? '';
+    });
+  }, [type, selectedCcPreset, modelSuggestions, transportModels.defaultModel, serverId]);
+
+  useEffect(() => {
+    const isClaudeCode = type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE;
+    if (!isClaudeCode || selectedCcPreset) {
+      claudeCodeModelManuallySelectedRef.current = false;
+      return;
+    }
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (claudeCodeModelManuallySelectedRef.current && trimmed) return trimmed;
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(DEFAULT_CLAUDE_CODE_MODEL_ID)) {
+        return DEFAULT_CLAUDE_CODE_MODEL_ID;
+      }
+      return transportModels.defaultModel ?? modelSuggestions[0] ?? DEFAULT_CLAUDE_CODE_MODEL_ID;
+    });
+  }, [type, selectedCcPreset, modelSuggestions, transportModels.defaultModel, serverId]);
+
+  useEffect(() => {
+    if (type !== 'opencode-sdk' || selectedCcPreset) {
+      openCodeModelManuallySelectedRef.current = false;
+      return;
+    }
+    setRequestedModel((current) => {
+      const trimmed = current.trim();
+      if (openCodeModelManuallySelectedRef.current && trimmed) return trimmed;
+      if (modelSuggestions.length === 0 || modelSuggestions.includes(DEFAULT_OPENCODE_MODEL_ID)) {
+        return DEFAULT_OPENCODE_MODEL_ID;
+      }
+      return transportModels.defaultModel ?? modelSuggestions[0] ?? DEFAULT_OPENCODE_MODEL_ID;
     });
   }, [type, selectedCcPreset, modelSuggestions, transportModels.defaultModel, serverId]);
 
@@ -1004,10 +1054,19 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
                     if (type === 'codex-sdk' && !selectedCcPreset) {
                       codexModelManuallySelectedRef.current = val.trim().length > 0;
                     }
+                    if ((type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) && !selectedCcPreset) {
+                      claudeCodeModelManuallySelectedRef.current = val.trim().length > 0;
+                    }
+                    if (type === 'opencode-sdk' && !selectedCcPreset) {
+                      openCodeModelManuallySelectedRef.current = val.trim().length > 0;
+                    }
                     setRequestedModel(val);
                   }}
                   style={{ width: '100%' }}
                 >
+                  {requestedModel.trim() && !modelSuggestions.includes(requestedModel.trim()) && (
+                    <option value={requestedModel.trim()}>{requestedModel.trim()}</option>
+                  )}
                   {modelSuggestions.map((model) => (
                     <option key={model} value={model}>{model}</option>
                   ))}
@@ -1023,6 +1082,12 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
                     if (type === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
                     if (type === 'codex-sdk' && !selectedCcPreset) {
                       codexModelManuallySelectedRef.current = val.trim().length > 0;
+                    }
+                    if ((type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) && !selectedCcPreset) {
+                      claudeCodeModelManuallySelectedRef.current = val.trim().length > 0;
+                    }
+                    if (type === 'opencode-sdk' && !selectedCcPreset) {
+                      openCodeModelManuallySelectedRef.current = val.trim().length > 0;
                     }
                     setRequestedModel(val);
                   }}

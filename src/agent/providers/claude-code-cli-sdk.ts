@@ -19,7 +19,7 @@ import { buildClaudeAgentEnv } from '../env-isolation.js';
 import { gateChildStream } from '../../util/event-loop-backpressure.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../../shared/agent-types.js';
-import { CLAUDE_CODE_MODEL_IDS } from '../../shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, DEFAULT_CLAUDE_CODE_MODEL_ID } from '../../shared/models/options.js';
 
 export const CLAUDE_CODE_CLI_SDK_ID = CLAUDE_CODE_CLI_SDK_AGENT_TYPE;
 export const CLAUDE_CODE_CLI_SDK_ARGS = [
@@ -143,7 +143,10 @@ export class ClaudeCodeCliSdkProvider implements TransportProvider {
     this.config = { ...config, binaryPath };
   }
   async listModels(): Promise<ProviderModelList> {
-    return { models: CLAUDE_CODE_MODEL_IDS.map((id) => ({ id })), defaultModel: CLAUDE_CODE_MODEL_IDS[0] };
+    return {
+      models: CLAUDE_CODE_MODEL_IDS.map((id) => ({ id })),
+      defaultModel: CLAUDE_CODE_MODEL_IDS.includes(DEFAULT_CLAUDE_CODE_MODEL_ID) ? DEFAULT_CLAUDE_CODE_MODEL_ID : CLAUDE_CODE_MODEL_IDS[0],
+    };
   }
   async disconnect(): Promise<void> { for (const id of this.sessions.keys()) await this.endSession(id); this.config = null; }
   async createSession(config: SessionConfig): Promise<string> {

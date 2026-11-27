@@ -17,6 +17,7 @@ import {
 } from '@shared/agy-agent.js';
 import {
   CLAUDE_CODE_MODEL_IDS,
+  DEFAULT_CLAUDE_CODE_MODEL_ID,
   CODEX_MODEL_IDS,
   MUSE_MODEL_IDS,
 } from '../../../src/shared/models/options.js';
@@ -81,7 +82,7 @@ export function getStaticFallbackModels(agentType: string | undefined | null): T
   if (agentType === 'claude-code-sdk' || agentType === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) {
     return {
       models: CLAUDE_CODE_MODEL_IDS.map((id) => ({ id })),
-      defaultModel: CLAUDE_CODE_MODEL_IDS[0],
+      defaultModel: DEFAULT_CLAUDE_CODE_MODEL_ID,
       loading: false,
     };
   }

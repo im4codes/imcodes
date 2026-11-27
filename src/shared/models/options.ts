@@ -5,6 +5,8 @@ import { AGY_FALLBACK_MODEL_IDS } from '../../../shared/agy-agent.js';
 // the picker surfaces the strongest model at the top.
 export const CLAUDE_CODE_MODEL_IDS = ['fable', 'opus[1M]', 'sonnet', 'haiku'] as const;
 export type ClaudeCodeModelId = typeof CLAUDE_CODE_MODEL_IDS[number];
+export const DEFAULT_CLAUDE_CODE_MODEL_ID: ClaudeCodeModelId = 'opus[1M]';
+export const DEFAULT_OPENCODE_MODEL_ID = 'opencode/big-pickle' as const;
 
 export function normalizeClaudeCodeModelId(value: string | null | undefined): ClaudeCodeModelId | undefined {
   if (!value) return undefined;

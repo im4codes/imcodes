@@ -864,6 +864,43 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
+  it('defaults to opus[1M] for claude-code-sdk and big-pickle for opencode-sdk', async () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+        allowedAgentTypes={['claude-code-sdk', 'opencode-sdk']}
+      />,
+    );
+
+    // 1. claude-code-sdk clicked -> defaults to opus[1M]
+    fireEvent.click(screen.getByRole('button', { name: /claude_code_sdk/i }));
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenLastCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.objectContaining({
+      requestedModel: 'opus[1M]',
+    }));
+
+    // 2. opencode-sdk clicked -> defaults to opencode/big-pickle
+    fireEvent.click(screen.getByRole('button', { name: /opencode_sdk/i }));
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenLastCalledWith('opencode-sdk', undefined, '/tmp', undefined, expect.objectContaining({
+      requestedModel: 'opencode/big-pickle',
+    }));
+
+    // 3. Switch back to claude-code-sdk -> back to opus[1M] without cross contamination
+    fireEvent.click(screen.getByRole('button', { name: /claude_code_sdk/i }));
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenLastCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.objectContaining({
+      requestedModel: 'opus[1M]',
+    }));
+  });
+
   it('passes requestedModel for Hermes ACP sub-sessions', () => {
     const onStart = vi.fn();
     render(

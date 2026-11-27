@@ -695,7 +695,7 @@ describe('NewSessionDialog', () => {
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
     const ccPayload = ws.sendSessionCommand.mock.calls[0]?.[1];
     expect(ccPayload?.agentType).toBe('claude-code-sdk');
-    expect(ccPayload?.requestedModel).toBeUndefined();
+    expect(ccPayload?.requestedModel).toBe('opus[1M]');
 
     // Switch back to agy-sdk, then toggle custom provider mode on & off: restores agy-sdk
     selectAgent(AGY_SDK_PROVIDER_ID);
@@ -2161,5 +2161,78 @@ describe('NewSessionDialog', () => {
     fireEvent.input(dirInput, { target: { value: '/custom/work/path' } });
     fireEvent.input(projectInput, { target: { value: '另一个项目' } });
     expect(dirInput.value).toBe('/custom/work/path');
+  });
+
+  it('defaults to opus[1M] for claude-code-sdk without preset', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    selectAgent('claude-code-sdk');
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'test-cc' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'claude-code-sdk',
+      requestedModel: 'opus[1M]',
+    }));
+  });
+
+  it('defaults to opencode/big-pickle for opencode-sdk without preset', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    selectAgent('opencode-sdk');
+    await waitFor(() => expect(getAgentButton('opencode-sdk').getAttribute('aria-pressed')).toBe('true'));
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'test-oc' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'opencode-sdk',
+      requestedModel: 'opencode/big-pickle',
+    }));
+  });
+
+  it('switching between claude-code-sdk and opencode-sdk updates defaults without residue, and preserves manual edits', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    const getModelSelect = () => {
+      const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+      return selects.find((s) => Array.from(s.options).some((o) => o.value === 'opus[1M]'));
+    };
+
+    // 1. Select claude-code-sdk -> opus[1M]
+    selectAgent('claude-code-sdk');
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+    await waitFor(() => expect(getModelSelect()?.value).toBe('opus[1M]'));
+
+    // 2. Switch to opencode-sdk -> opencode/big-pickle
+    selectAgent('opencode-sdk');
+    await waitFor(() => expect(getAgentButton('opencode-sdk').getAttribute('aria-pressed')).toBe('true'));
+    const ocInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    expect(ocInput.value).toBe('opencode/big-pickle');
+
+    // 3. Switch back to claude-code-sdk -> opus[1M]
+    selectAgent('claude-code-sdk');
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+    await waitFor(() => expect(getModelSelect()?.value).toBe('opus[1M]'));
+
+    // 4. Manually edit to sonnet -> preserved across catalog messages
+    const ccSelect2 = getModelSelect()!;
+    fireEvent.input(ccSelect2, { target: { value: 'sonnet' } });
+    expect(ccSelect2.value).toBe('sonnet');
+    const onMessageHandler = ws.onMessage.mock.calls[0]?.[0];
+    if (onMessageHandler) {
+      act(() => {
+        onMessageHandler({
+          type: 'transport.list_models',
+          agentType: 'claude-code-sdk',
+          models: [{ id: 'fable' }, { id: 'opus[1M]' }, { id: 'sonnet' }, { id: 'haiku' }],
+          defaultModel: 'opus[1M]',
+        });
+      });
+    }
+    expect(ccSelect2.value).toBe('sonnet');
   });
 });
