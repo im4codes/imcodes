@@ -3748,7 +3748,7 @@ describe('sdk transport session restore', () => {
         providerSessionId: 'route-cx-stalled-tok',
         codexSessionId: 'codex-thread-stalled-tok',
         crossVendorHandoff: {
-          config: { timeoutMs: 250 },
+          config: { timeoutMs: 1500 },
         },
       };
       mocks.store.set(name, record);

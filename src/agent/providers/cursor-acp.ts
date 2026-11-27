@@ -161,7 +161,7 @@ interface WireSlot {
 interface PendingTurn {
   generation: number;
   messageId: string;
-  terminalTarget: {};
+  terminalTarget: object;
   physicalTerminal: Promise<void>;
   resolvePhysicalTerminal: () => void;
   dispatched: boolean;
@@ -799,6 +799,16 @@ export class CursorAcpProvider implements TransportProvider {
     } catch (err) {
       return { models: [], isAuthenticated: false, error: formatErrorMessage(err) };
     }
+  }
+
+  /**
+   * Returns false only when actively connected to an ACP agent that omitted
+   * `sessionCapabilities.list`. Disconnected state returns true so transient
+   * disconnects still retry `listSessions()` / reconnect instead of triggering
+   * permanent restore backoff.
+   */
+  canListSessions(): boolean {
+    return !this.connection || Boolean(this.connection.listSessions && this.sessionListSupported);
   }
 
   async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {

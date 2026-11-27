@@ -3246,7 +3246,7 @@ export async function restoreTransportSessions(
       const unusedAgy = s.providerId === AGY_SDK_PROVIDER_ID
         && s.agyNativeSessionState === AGY_NATIVE_SESSION_STATE.UNSTARTED;
       if (usesProviderResumeId(s.providerId) && !s.providerResumeId && !unusedAgy) {
-        if (!provider.listSessions) {
+        if (!provider.listSessions || provider.canListSessions?.() === false) {
           noteUnboundRestore(s, 'provider_cannot_list_sessions', 'Transport restore requires a durable provider id but the provider cannot list sessions');
           return;
         }

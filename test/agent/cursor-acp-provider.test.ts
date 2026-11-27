@@ -1751,4 +1751,39 @@ describe('CursorAcpProvider', () => {
 
     await provider.disconnect();
   });
+
+  it('reports canListSessions()=true when disconnected or session/list supported, and false only when connected without list capability', async () => {
+    let advertiseList = true;
+    installHarness((req, proc) => {
+      if (req.method === 'initialize') {
+        proc.reply(req.id!, {
+          protocolVersion: 1,
+          agentCapabilities: {
+            loadSession: true,
+            sessionCapabilities: advertiseList ? { list: {} } : {},
+          },
+          authMethods: [{ id: 'cursor_login', name: 'Cursor Login' }],
+        });
+      } else if (req.method === 'authenticate') {
+        proc.reply(req.id!, {});
+      }
+    });
+
+    const provider = new CursorAcpProvider();
+    expect(provider.canListSessions()).toBe(true);
+
+    advertiseList = true;
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    expect(provider.canListSessions()).toBe(true);
+
+    await provider.disconnect();
+    expect(provider.canListSessions()).toBe(true);
+
+    advertiseList = false;
+    await provider.connect({ binaryPath: 'cursor-agent' });
+    expect(provider.canListSessions()).toBe(false);
+
+    await provider.disconnect();
+    expect(provider.canListSessions()).toBe(true);
+  });
 });

@@ -857,6 +857,13 @@ export interface TransportProvider {
   listSessions?(options?: RemoteSessionListOptions): Promise<RemoteSessionInfo[]>;
 
   /**
+   * Optional runtime check indicating whether the provider can enumerate
+   * sessions right now. Returning false triggers permanent unbound restore
+   * backoff rather than treating missing session discovery as transient.
+   */
+  canListSessions?(): boolean;
+
+  /**
    * Return the list of models available for this provider.
    *
    * Providers that support a model picker MUST implement this method.

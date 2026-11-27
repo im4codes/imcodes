@@ -7,6 +7,7 @@ const mocks = vi.hoisted(() => {
   const cursorSpawns: Array<{
     file: string;
     args: string[];
+    acpRequests: Array<{ method: string; params: Record<string, unknown> }>;
     child: EventEmitter & {
       stdout: PassThrough;
       stderr: PassThrough;
@@ -51,8 +52,42 @@ vi.mock("node:child_process", async (importOriginal) => {
   const spawn = vi.fn((file: string, args: string[]) => {
     const stdout = new PassThrough();
     const stderr = new PassThrough();
+    const acpRequests: Array<{ method: string; params: Record<string, unknown> }> = [];
+    let stdinBuf = "";
     const stdin = new Writable({
-      write(_chunk, _enc, cb) {
+      write(chunk, _enc, cb) {
+        stdinBuf += chunk.toString();
+        let nl: number;
+        while ((nl = stdinBuf.indexOf("\n")) !== -1) {
+          const line = stdinBuf.slice(0, nl).trim();
+          stdinBuf = stdinBuf.slice(nl + 1);
+          if (!line) continue;
+          try {
+            const msg = JSON.parse(line) as { id?: number | string; method?: string; params?: Record<string, unknown> };
+            if (msg.method) acpRequests.push({ method: msg.method, params: msg.params ?? {} });
+            if (msg.id !== undefined && msg.method === "initialize") {
+              stdout.write(`${JSON.stringify({
+                jsonrpc: "2.0",
+                id: msg.id,
+                result: {
+                  protocolVersion: 1,
+                  agentCapabilities: { loadSession: true, sessionCapabilities: {}, promptCapabilities: { image: true } },
+                  authMethods: [{ id: "cursor_login", name: "Cursor Login" }],
+                },
+              })}\n`);
+            } else if (msg.id !== undefined && msg.method === "session/load") {
+              stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} })}\n`);
+            } else if (msg.id !== undefined && msg.method === "session/set_model") {
+              stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: {} })}\n`);
+            } else if (msg.id !== undefined && msg.method === "session/new") {
+              stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "cursor-chat-restored" } })}\n`);
+            } else if (msg.id !== undefined && msg.method === "session/prompt") {
+              stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } })}\n`);
+            }
+          } catch {
+            // ignore non-json test writes
+          }
+        }
         cb();
       },
     });
@@ -69,10 +104,13 @@ vi.mock("node:child_process", async (importOriginal) => {
     child.killed = false;
     child.kill = vi.fn((signal?: string) => {
       child.killed = true;
-      queueMicrotask(() => child.emit("close", 0, signal ?? "SIGTERM"));
+      queueMicrotask(() => {
+        child.emit("exit", 0, signal ?? "SIGTERM");
+        child.emit("close", 0, signal ?? "SIGTERM");
+      });
       return true;
     });
-    mocks.cursorSpawns.push({ file, args, child });
+    mocks.cursorSpawns.push({ file, args, acpRequests, child });
     queueMicrotask(() => child.emit("spawn"));
     return child as never;
   });
@@ -258,6 +296,7 @@ vi.mock("../../src/agent/brain-dispatcher.js", () => ({
 import {
   connectProvider,
   disconnectAll,
+  getProvider,
 } from "../../src/agent/provider-registry.js";
 import {
   ensureTransportRuntimeForPendingResend,
@@ -266,7 +305,7 @@ import {
 } from "../../src/agent/session-manager.js";
 import { buildTransportResumeLaunchOpts } from "../../src/agent/transport-resume-opts.js";
 import { clearAllResend, enqueueResend, getResendCount } from "../../src/daemon/transport-resend-queue.js";
-import { resetTransportRestoreBackoffForTests } from "../../src/agent/transport-restore-backoff.js";
+import { resetTransportRestoreBackoffForTests, transportRestoreBackoffSize } from "../../src/agent/transport-restore-backoff.js";
 import { DAEMON_USER_NOTICE_CODE } from "../../shared/daemon-user-notices.js";
 
 const flush = async () => {
@@ -317,7 +356,11 @@ describe("unbound-send notice end to end (real cursor-headless provider)", { tim
     await flush();
     expect(getTransportRuntime(name)?.providerSessionId).toBeTruthy();
     expect(getResendCount(name)).toBe(0); // delivered
-    expect(mocks.cursorSpawns.some((spawn) => spawn.args.join(" ").includes("please continue the task"))).toBe(true);
+    expect(mocks.cursorSpawns.some((spawn) =>
+      spawn.acpRequests.some(
+        (req) => req.method === "session/prompt" && JSON.stringify(req.params).includes("please continue the task"),
+      ),
+    )).toBe(true);
 
     await ensureTransportRuntimeForPendingResend(name, SEND); // later sends: runtime bound, nothing to say
     expect(notices()).toHaveLength(1);
@@ -332,5 +375,21 @@ describe("unbound-send notice end to end (real cursor-headless provider)", { tim
     await flush();
     expect(getTransportRuntime(name)?.providerSessionId).toBe(`route-${name}`);
     expect(notices()).toHaveLength(0);
+  });
+
+  it("disconnected cursor-headless returns canListSessions()=true and does not trigger permanent unbound backoff or notice", async () => {
+    const name = "deck_cursor_disconnected_brain";
+    mocks.store.set(name, cursorRecord(name));
+    await connectProvider("cursor-headless", {});
+    const provider = getProvider("cursor-headless")!;
+    expect(provider.canListSessions?.()).toBe(false);
+
+    await provider.disconnect();
+    expect(provider.canListSessions?.()).toBe(true);
+
+    await ensureTransportRuntimeForPendingResend(name, SEND);
+    await flush();
+    expect(notices()).toHaveLength(0);
+    expect(transportRestoreBackoffSize()).toBe(0);
   });
 });

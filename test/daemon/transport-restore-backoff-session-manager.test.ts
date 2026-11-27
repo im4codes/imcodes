@@ -9,10 +9,10 @@ const mocks = vi.hoisted(() => ({
   emits: [] as Array<{ session: string; type: string; payload: Record<string, unknown> }>,
 }));
 
-// cursor-headless cannot list sessions (the real provider has no listSessions);
-// copilot-sdk can, so a listSessions failure there is a transient failure.
-vi.mock('../../src/agent/providers/cursor-headless.js', () => ({
-  CursorHeadlessProvider: class {
+// cursor-headless uses CursorAcpProvider (this mock omits listSessions to model a provider that
+// cannot list sessions); copilot-sdk can, so a listSessions failure there is a transient failure.
+vi.mock('../../src/agent/providers/cursor-acp.js', () => ({
+  CursorAcpProvider: class {
     id = 'cursor-headless';
     async connect(): Promise<void> {}
     async disconnect(): Promise<void> {}
