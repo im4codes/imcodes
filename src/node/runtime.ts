@@ -87,6 +87,8 @@ import {
   validateMachineDirectUploadRequest,
 } from '../../shared/machine-direct-file-transfer.js';
 import { receiveMachineDirectUpload, sendMachineDirectFetch } from '../daemon/machine-direct-transfer.js';
+import { isPortForwardMessageType } from '../../shared/port-forward.js';
+import { PortForwardEngine } from '../daemon/port-forward-engine.js';
 import {
   REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_MSG,
@@ -1021,6 +1023,11 @@ export function createControlledNodeRuntime(
   let legacyUpgradeRescueCleanupStarted = false;
   let previousUpgradeFailureReported = false;
   const activeMachineDirectTransfers = new Set<string>();
+  const portForwardEngine = new PortForwardEngine({
+    sendWs: (msg) => {
+      client.send(msg);
+    },
+  });
   const reportAuthenticationError = (error: unknown) => {
     try {
       options.onAuthenticationError?.(error);
@@ -1931,6 +1938,7 @@ export function createControlledNodeRuntime(
     },
     onClose: () => {
       worker.abortAll();
+      portForwardEngine.closeAll('daemon_disconnected');
       pruneLegacyRemoteDesktopSessions(options.now?.() ?? Date.now());
       // Keep live P2P Remote Desktop peers alive across transient Relay WS
       // reconnects within each host's bounded grace/lease window.
@@ -2093,6 +2101,10 @@ export function createControlledNodeRuntime(
       if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
         const reply = await computerUseWorker.handle(message);
         if (reply) client.send({ type: DAEMON_MSG.COMPUTER_USE_RESULT, ...reply });
+        return;
+      }
+      if (isPortForwardMessageType(message.type)) {
+        await portForwardEngine.handleMessage(message);
         return;
       }
       if (message.type === REMOTE_DESKTOP_PERMISSION_MSG.REQUEST) {

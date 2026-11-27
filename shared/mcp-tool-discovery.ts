@@ -149,6 +149,16 @@ export const MCP_TOOL_GROUPS: readonly McpToolGroupDefinition[] = Object.freeze(
       MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
     ]),
   }),
+  Object.freeze({
+    id: 'port-forwarding',
+    aliases: Object.freeze(['port forward', 'port forwarding', 'p2p', 'tunnel', '端口转发', '端口映射']),
+    summary: 'Open, list, and close E2E encrypted P2P/relay TCP port-forwarding tunnels (port_forward_open, port_forward_list, port_forward_close).',
+    tools: Object.freeze([
+      MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN,
+      MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_LIST,
+      MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE,
+    ]),
+  }),
 ]);
 
 

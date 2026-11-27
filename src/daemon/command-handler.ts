@@ -535,6 +535,8 @@ import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.
 import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
 import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
 import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
+import { isPortForwardMessageType } from '../../shared/port-forward.js';
+import { PortForwardEngine } from './port-forward-engine.js';
 import { REPO_MSG } from '../shared/repo-types.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { handlePreviewCommand } from './preview-relay.js';
@@ -780,6 +782,8 @@ let processAutomationHooksRegistered = false;
 let detectAgentsRequestSeq = 0;
 let latestPublishedDetectAgentsSeq = 0;
 let latestPublishedDetectAgentsEpoch = 0;
+let daemonPortForwardEngine: PortForwardEngine | null = null;
+let daemonPortForwardServerLink: ServerLink | null = null;
 
 function inFlightSessionSendKey(sessionName: string, clientMessageId: string): string {
   return `${sessionName}\u0000${clientMessageId}`;
@@ -2379,6 +2383,29 @@ export function handleWebCommand(msg: unknown, serverLink: ServerLink): void {
   withSessionPrivacy(name, cmd.incognito === true || isIncognitoSession(name ? getSession(name) : undefined), () => handleWebCommandInternal(msg, serverLink));
 }
 
+function getDaemonPortForwardEngine(serverLink: ServerLink): PortForwardEngine {
+  if (!daemonPortForwardEngine || daemonPortForwardServerLink !== serverLink) {
+    daemonPortForwardEngine?.closeAll('server_link_replaced');
+    daemonPortForwardServerLink = serverLink;
+    daemonPortForwardEngine = new PortForwardEngine({
+      sendWs: (msg) => {
+        try {
+          serverLink.send(msg);
+        } catch {
+          // Link closed; disconnect cleanup tears down active tunnels.
+        }
+      },
+    });
+  }
+  return daemonPortForwardEngine;
+}
+
+export function closeDaemonPortForwards(reason = 'shutdown'): void {
+  daemonPortForwardEngine?.closeAll(reason);
+  daemonPortForwardEngine = null;
+  daemonPortForwardServerLink = null;
+}
+
 function handleWebCommandInternal(msg: unknown, serverLink: ServerLink): void {
   // Input validation: anything that isn't a non-null object goes
   // straight to the floor.  We log a debug ping for arrays / primitives
@@ -2394,6 +2421,11 @@ function handleWebCommandInternal(msg: unknown, serverLink: ServerLink): void {
 
   if (isDirectFileTransferMessageType(cmd.type)) {
     void handleDirectFileTransferCommand(cmd, serverLink);
+    return;
+  }
+
+  if (isPortForwardMessageType(cmd.type)) {
+    void getDaemonPortForwardEngine(serverLink).handleMessage(cmd);
     return;
   }
 

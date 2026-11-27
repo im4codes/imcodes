@@ -60,10 +60,14 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // Adding `send_im_message` (host-collision-safe alias of `send_message`) adds
 // one full `send_message` schema (~4.1 KiB authored / ~6 KiB raw with SDK
 // framing on full stdio: 62,614 authored / 70,654 raw bytes measured).
-// Keep tight reviewable headroom above that measured surface.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 64_500;
-// Raw = authored + the MCP SDK framing (measured 70,654 bytes on full stdio).
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 72_500;
+// Adding the 3 on-demand port-forwarding tools (`port_forward_open`,
+// `port_forward_list`, `port_forward_close` + group:port-forwarding) adds
+// ~5.2 KiB authored / ~5.7 KiB raw on full stdio (76,377 raw bytes measured);
+// keep tight reviewable headroom above that measured surface while leaving
+// MCP_TOOL_SURFACE_BOOTSTRAP_BUDGET_BYTES unchanged (on-demand only).
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 70_000;
+// Raw = authored + the MCP SDK framing (measured 76,377 bytes on full stdio).
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 78_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

@@ -59,6 +59,8 @@ import { CONTROLLED_NODE_INSTALL_COMMAND_PATH } from './services/controlled-node
 import { machinesRoutes } from './routes/machines.js';
 import { machineExecRoutes } from './routes/machine-exec.js';
 import { machineComputerUseRoutes } from './routes/machine-computer-use.js';
+import { portForwardRoutes } from './routes/port-forward.js';
+import { PORT_FORWARD_API_PATH } from '../../shared/port-forward.js';
 import { serverRoutes } from './routes/server.js';
 import { webhookRoutes } from './routes/webhook.js';
 import { outboundRoutes } from './routes/outbound.js';
@@ -754,6 +756,7 @@ export function buildApp(env: Env, options: BuildAppOptions = {}) {
   app.route(TASK_PAIR_TITLE_AUTHORITY_PATH, taskPairTitleAuthorityRoutes);
   app.route('/api/machine/exec', machineExecRoutes);
   app.route('/api/machine/computer-use', machineComputerUseRoutes);
+  app.route(PORT_FORWARD_API_PATH, portForwardRoutes);
   app.route('/api/server', serverRoutes);
   app.route('/webhook', webhookRoutes);
   app.route('/api/outbound', outboundRoutes);

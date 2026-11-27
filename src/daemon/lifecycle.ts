@@ -28,7 +28,7 @@ import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
 import { closeDaemonRemoteDesktop, refreshDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
-import { handleWebCommand, pushSessionModelProjection, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions, refreshMuseQuotaMetadataForSessions } from './command-handler.js';
+import { handleWebCommand, closeDaemonPortForwards, pushSessionModelProjection, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata, refreshAgyQuotaMetadataForSessions, refreshGrokQuotaMetadataForSessions, refreshMuseQuotaMetadataForSessions } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { dispatchReadyAuditSweep } from './send-tool.js';
 import { initFileTransfer, startCleanupTimer } from './file-transfer-handler.js';
@@ -1029,11 +1029,15 @@ export async function startup(): Promise<DaemonContext> {
     const capabilitySourceConvergenceStore = new CapabilitySourceConvergenceStore();
     const capabilityServicesByOwner = new Map<string, DaemonCapabilityServiceAdapter>();
     const capabilitySyncServicesByOwner = new Map<string, CapabilitySyncService>();
-    setServerLinkDisconnectSecurityHandler(createServerLinkDisconnectSecurityHandler({
+    const disconnectSecurityCleanup = createServerLinkDisconnectSecurityHandler({
       serverId,
       capabilityServicesByOwner,
       capabilitySyncServicesByOwner,
-    }));
+    });
+    setServerLinkDisconnectSecurityHandler(() => {
+      disconnectSecurityCleanup();
+      closeDaemonPortForwards('server_link_disconnected');
+    });
     const capabilitySyncServiceForOwner = (ownerId: string): CapabilitySyncService => {
       let service = capabilitySyncServicesByOwner.get(ownerId);
       if (!service) {
@@ -2109,6 +2113,7 @@ async function performShutdown(exitCode: number): Promise<void> {
     },
     container: async () => {
       logger.info({ shutdownPhase: 'container' }, 'Daemon shutdown phase container started');
+      closeDaemonPortForwards('daemon_shutdown');
       await shutdownDirectFileTransfers();
       await cgroupValidationProbes?.stopPhase('container');
       logger.info({ shutdownPhase: 'container' }, 'Daemon shutdown phase container completed');

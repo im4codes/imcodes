@@ -127,6 +127,7 @@ import { PEER_AUDIT_COMMAND_ERRORS, PEER_AUDIT_MESSAGES } from '../../../shared/
 import { PeerAuditUnicastRouter } from './peer-audit-unicast-router.js';
 import { DirectFileTransferRouter } from './direct-file-transfer-router.js';
 import { RemoteDesktopRouter } from './remote-desktop-router.js';
+import { defaultPortForwardRouter } from './port-forward-router.js';
 import type {
   RemoteDesktopGuestDeliveryResult,
   RemoteDesktopGuestOutboxAuthorityMatch,
@@ -3255,6 +3256,12 @@ export class WsBridge {
     return WsBridge.instances.get(serverId);
   }
 
+  static {
+    defaultPortForwardRouter.configure({
+      lookupBridge: (serverId) => WsBridge.find(serverId),
+    });
+  }
+
   /** Update cached server display name when renamed via HTTP API. */
   setServerName(name: string): void {
     const trimmed = name.trim();
@@ -6193,6 +6200,7 @@ export class WsBridge {
       // generation's request waiters before swapping `daemonWs`; otherwise the
       // old socket's identity-guarded close handler cannot see or drain them.
       this.rejectAllPendingFileTransfers('daemon_disconnected');
+      defaultPortForwardRouter.onDaemonDisconnected(this.serverId, replacedGeneration);
       try { this.daemonWs.close(1001, 'replaced'); } catch { /* ignore */ }
     }
     this.daemonWs = ws;
@@ -6864,6 +6872,9 @@ export class WsBridge {
       if (this.remoteDesktopRouter.handleDaemon(msg, connectionGeneration)) {
         return;
       }
+      if (defaultPortForwardRouter.handleDaemonMessage(this.serverId, connectionGeneration, msg)) {
+        return;
+      }
 
       // 10.2 — a CONTROLLED node's WS is a strict allowlist surface: it may ONLY
       // deliver validated remote-desktop signaling, bounded session-readiness
@@ -7231,6 +7242,7 @@ export class WsBridge {
         this.rejectAllPendingHttpTimelineRequests('daemon_disconnected');
         this.rejectAllPendingPreviewRequests('daemon_disconnected');
         this.rejectAllPendingOpenSpecAutoDeliverRequests('daemon_offline');
+        defaultPortForwardRouter.onDaemonDisconnected(this.serverId, connectionGeneration);
         // Close all preview WS tunnels — daemon is gone
         this.closeAllPreviewWsTunnels(1001, 'daemon disconnected');
         // Clear provider statuses — daemon is gone, providers are unreachable
@@ -7296,6 +7308,7 @@ export class WsBridge {
       this.rejectAllPendingMemorySourcesRequests('daemon_error');
       this.rejectAllPendingHttpTimelineRequests('daemon_error');
       this.rejectAllPendingPreviewRequests('daemon_error');
+      defaultPortForwardRouter.onDaemonDisconnected(this.serverId, connectionGeneration);
     });
   }
 
@@ -13623,6 +13636,18 @@ export class WsBridge {
     }
   }
 
+  /** Port-forward control and encrypted relay frames are live-socket bound and never queued. */
+  trySendPortForward(message: Record<string, unknown>, expectedGeneration?: number): boolean {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return false;
+    if (expectedGeneration !== undefined && this.daemonGeneration !== expectedGeneration) return false;
+    try {
+      this.daemonWs.send(JSON.stringify(message));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private trySendRemoteDesktopConsent(command: RemoteDesktopConsentDispatchCommand): boolean {
     const parsed = validateRemoteDesktopConsentMessage(command.message);
     if (!parsed.ok || parsed.value.type === REMOTE_DESKTOP_CONSENT_MSG.RESULT) return false;
@@ -13906,6 +13931,7 @@ export class WsBridge {
       || (typeof parsedType === 'string' && parsedType.startsWith('remote_desktop.'))
       || (typeof parsedType === 'string' && parsedType.startsWith('management_privacy.'))
       || (typeof parsedType === 'string' && parsedType.startsWith('capability.'))
+      || (typeof parsedType === 'string' && parsedType.startsWith('port_forward.'))
     ) {
       logger.warn({ serverId: this.serverId, type: parsedType }, 'Dropped control command sent via generic sendToDaemon');
       return;

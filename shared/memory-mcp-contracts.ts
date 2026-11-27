@@ -33,6 +33,11 @@ import {
 } from './computer-use.js';
 import { FILE_TRANSFER_PATH_MAX_BYTES } from './transport/file-transfer.js';
 import {
+  PORT_FORWARD_LIMITS,
+  PORT_FORWARD_TRANSPORTS,
+  PORT_FORWARD_TRANSPORT_PREFS,
+} from './port-forward.js';
+import {
   TASK_PAIR_WORKSPACE_PARAMETER_DESCRIPTION,
   TASK_PAIR_WORKSPACE_PICK_GUIDANCE,
   TASK_PAIR_WORKSPACE_REQUESTS,
@@ -185,6 +190,9 @@ export const MEMORY_MCP_TOOL_NAMES = {
   COMPUTER_USE_DOCS: 'computer_use_docs',
   COMPUTER_USE_CALL: 'computer_use_call',
   CLOUD_DOCS: 'cloud_docs',
+  PORT_FORWARD_OPEN: 'port_forward_open',
+  PORT_FORWARD_LIST: 'port_forward_list',
+  PORT_FORWARD_CLOSE: 'port_forward_close',
 } as const;
 
 /** Structured pair close actions; lifecycle semantics are delegated to the marker state machine. */
@@ -267,6 +275,9 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
   MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+  MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN,
+  MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_LIST,
+  MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE,
 ] as const satisfies readonly MemoryMcpToolName[];
 
 /**
@@ -324,6 +335,9 @@ export const FULL_ONLY_MCP_TOOLS: ReadonlySet<MemoryMcpToolName> = new Set([
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_DOCS,
   MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,
   MEMORY_MCP_TOOL_NAMES.CLOUD_DOCS,
+  MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN,
+  MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_LIST,
+  MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE,
 ]);
 
 /** Whether a tool is available to a node of the given role. */
@@ -1569,6 +1583,86 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       command: stringSchema('Single CLI command string split cleanly (quotes & Windows backslashes preserved), e.g. "read doc_123 --max-chars 4000". Defaults to "--help" when both args and command are omitted.'),
     }),
     outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN]: {
+    name: MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN,
+    description: 'Open an E2E-encrypted port-forward tunnel between any two authorized online nodes (direct TCP -> NAT UDP P2P -> encrypted WS relay). Binds 127.0.0.1 on listenNode. FULL nodes only.',
+    inputSchema: objectSchema({
+      targetNode: stringSchema('Target node: 10-digit nodeId, ^^(nodeId), serverId, or self.', { minLength: 1, maxLength: 128 }),
+      targetPort: numberSchema('Target TCP port on targetHost (1..65535).', { minimum: 1, maximum: 65_535 }),
+      listenNode: stringSchema('Listen node (default "self"): nodeId, serverId, or self.', { minLength: 1, maxLength: 128 }),
+      listenPort: numberSchema('Loopback listen port on 127.0.0.1 (0 for ephemeral).', { minimum: 0, maximum: 65_535 }),
+      targetHost: stringSchema('Target host reachable from targetNode (default "127.0.0.1").', { minLength: 1, maxLength: PORT_FORWARD_LIMITS.MAX_HOST_LENGTH }),
+      ttlSeconds: numberSchema(`Tunnel TTL in seconds (default ${PORT_FORWARD_LIMITS.DEFAULT_TTL_SECONDS}).`, { minimum: PORT_FORWARD_LIMITS.MIN_TTL_SECONDS, maximum: PORT_FORWARD_LIMITS.MAX_TTL_SECONDS }),
+      transport: stringSchema(`Transport preference: ${PORT_FORWARD_TRANSPORT_PREFS.join(' | ')} (default auto).`, { enum: [...PORT_FORWARD_TRANSPORT_PREFS] }),
+      label: stringSchema('Optional short tunnel label.', { maxLength: PORT_FORWARD_LIMITS.MAX_LABEL_LENGTH }),
+    }, ['targetNode', 'targetPort']),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok on success.', { enum: ['ok'] }),
+      tunnelId: stringSchema('Tunnel id.'),
+      listenNode: stringSchema('Resolved listen node identifier.'),
+      listenNodeId: stringSchema('Canonical nodeId of listen node when controlled.'),
+      listenHost: stringSchema('Bound loopback host (127.0.0.1).'),
+      listenPort: numberSchema('Bound loopback port.', { minimum: 1, maximum: 65_535 }),
+      localEndpoint: stringSchema('Bound 127.0.0.1:<port> endpoint.'),
+      targetNode: stringSchema('Resolved target node identifier.'),
+      targetNodeId: stringSchema('Canonical nodeId of target node when controlled.'),
+      targetHost: stringSchema('Target host.'),
+      targetPort: numberSchema('Target port.', { minimum: 1, maximum: 65_535 }),
+      transportMode: stringSchema('Selected transport.', { enum: [...PORT_FORWARD_TRANSPORTS] }),
+      expiresAt: numberSchema('Expiry timestamp (epoch ms).', { minimum: 0 }),
+      label: stringSchema('Optional label.'),
+    }, ['status', 'tunnelId', 'listenNode', 'listenHost', 'listenPort', 'localEndpoint', 'targetNode', 'targetHost', 'targetPort', 'transportMode', 'expiresAt']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_LIST]: {
+    name: MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_LIST,
+    description: 'List active E2E-encrypted port-forward tunnels owned by this account. FULL nodes only.',
+    inputSchema: objectSchema({
+      node: stringSchema('Optional filter by nodeId, serverId, or self.', { minLength: 1, maxLength: 128 }),
+    }),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok on success.', { enum: ['ok'] }),
+      tunnels: {
+        type: 'array',
+        maxItems: PORT_FORWARD_LIMITS.MAX_LIST_TUNNELS,
+        items: objectSchema({
+          tunnelId: stringSchema('Tunnel id.'),
+          listenNode: stringSchema('Listen node identifier.'),
+          listenNodeId: stringSchema('Listen canonical nodeId.'),
+          listenHost: stringSchema('Bound host (127.0.0.1).'),
+          listenPort: numberSchema('Bound port.', { minimum: 1, maximum: 65_535 }),
+          localEndpoint: stringSchema('127.0.0.1:<port>.'),
+          targetNode: stringSchema('Target node identifier.'),
+          targetNodeId: stringSchema('Target canonical nodeId.'),
+          targetHost: stringSchema('Target host.'),
+          targetPort: numberSchema('Target port.', { minimum: 1, maximum: 65_535 }),
+          transportMode: stringSchema('Active transport.', { enum: [...PORT_FORWARD_TRANSPORTS] }),
+          activeConnections: numberSchema('Active TCP streams.', { minimum: 0 }),
+          bytesSent: numberSchema('Total bytes sent.', { minimum: 0 }),
+          bytesReceived: numberSchema('Total bytes received.', { minimum: 0 }),
+          createdAt: numberSchema('Created epoch ms.', { minimum: 0 }),
+          expiresAt: numberSchema('Expiry epoch ms.', { minimum: 0 }),
+          label: stringSchema('Optional label.'),
+        }, ['tunnelId', 'listenNode', 'listenHost', 'listenPort', 'localEndpoint', 'targetNode', 'targetHost', 'targetPort', 'transportMode', 'activeConnections', 'bytesSent', 'bytesReceived', 'createdAt', 'expiresAt']),
+      },
+    }, ['status', 'tunnels']),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE]: {
+    name: MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE,
+    description: 'Close one port-forward tunnel by tunnelId or all active tunnels (all=true). FULL nodes only.',
+    inputSchema: objectSchema({
+      tunnelId: stringSchema('Tunnel id to close.', { minLength: 1, maxLength: 64 }),
+      all: booleanSchema('Set true to close all active tunnels.'),
+      node: stringSchema('Optional node filter when all=true.', { minLength: 1, maxLength: 128 }),
+    }),
+    outputSchema: objectSchema({
+      status: stringSchema('Always ok on success.', { enum: ['ok'] }),
+      closedCount: numberSchema('Number of closed tunnels.', { minimum: 0 }),
+      closedTunnelIds: {
+        type: 'array',
+        items: stringSchema('Closed tunnel id.'),
+      },
+    }, ['status', 'closedCount', 'closedTunnelIds']),
   },
 };
 

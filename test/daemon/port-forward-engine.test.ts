@@ -1,0 +1,408 @@
+import { createHash } from 'node:crypto';
+import { createServer as createHttpServer, request as httpRequest, type IncomingMessage, type ServerResponse } from 'node:http';
+import { connect as tcpConnect, createServer as createTcpServer, type Server as NetServer } from 'node:net';
+import WebSocket, { WebSocketServer } from 'ws';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  PORT_FORWARD_ERRORS,
+  PORT_FORWARD_LIMITS,
+  PORT_FORWARD_MSG,
+  PORT_FORWARD_ROLE,
+  PORT_FORWARD_TRANSPORT,
+  PORT_FORWARD_TRANSPORT_PREF,
+  type PortForwardCandidate,
+  type PortForwardWireMessage,
+} from '../../shared/port-forward.js';
+import { PortForwardEngine } from '../../src/daemon/port-forward-engine.js';
+import { PortForwardRouter, type PortForwardBridgeEndpoint } from '../../server/src/ws/port-forward-router.js';
+
+const cleanupCallbacks: Array<() => Promise<void> | void> = [];
+
+afterEach(async () => {
+  while (cleanupCallbacks.length > 0) {
+    const fn = cleanupCallbacks.pop()!;
+    await fn();
+  }
+});
+
+function createPairedEngines(options: {
+  listenOpts?: Partial<ConstructorParameters<typeof PortForwardEngine>[0]>;
+  targetOpts?: Partial<ConstructorParameters<typeof PortForwardEngine>[0]>;
+  prepareTimeoutMs?: number;
+  establishTimeoutMs?: number;
+} = {}) {
+  const bridges = new Map<string, PortForwardBridgeEndpoint>();
+  const router = new PortForwardRouter({
+    lookupBridge: (id) => bridges.get(id),
+    getIceServers: () => [],
+    prepareTimeoutMs: options.prepareTimeoutMs ?? 3_000,
+    establishTimeoutMs: options.establishTimeoutMs ?? 5_000,
+  });
+
+  const capturedMessages: Array<{ from: string; msg: PortForwardWireMessage }> = [];
+
+  const listenEngine = new PortForwardEngine({
+    sendWs: (msg) => {
+      capturedMessages.push({ from: 'node_a', msg });
+      queueMicrotask(() => {
+        router.handleDaemonMessage('node_a', 1, msg);
+      });
+    },
+    collectInterfaceAddresses: () => ['127.0.0.1'],
+    timeouts: {
+      directTcpMs: 300,
+      directTcpPreferenceWaitMs: 60,
+      directTcpTargetDialDelayMs: 25,
+      udpPunchMs: 500,
+      udpPunchIntervalMs: 30,
+      stunProbeMs: 100,
+    },
+    ...options.listenOpts,
+  });
+
+  const targetEngine = new PortForwardEngine({
+    sendWs: (msg) => {
+      capturedMessages.push({ from: 'node_b', msg });
+      queueMicrotask(() => {
+        router.handleDaemonMessage('node_b', 1, msg);
+      });
+    },
+    collectInterfaceAddresses: () => ['127.0.0.1'],
+    timeouts: {
+      directTcpMs: 300,
+      directTcpPreferenceWaitMs: 60,
+      directTcpTargetDialDelayMs: 25,
+      udpPunchMs: 500,
+      udpPunchIntervalMs: 30,
+      stunProbeMs: 100,
+    },
+    ...options.targetOpts,
+  });
+
+  const makeBridge = (serverId: string, engine: PortForwardEngine): PortForwardBridgeEndpoint => {
+    let connected = true;
+    return {
+      isDaemonConnected: () => connected,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (message) => {
+        if (!connected) return false;
+        void engine.handleMessage(message);
+        return true;
+      },
+      // helper attached for disconnect tests
+      ...({ disconnect: () => { connected = false; router.onDaemonDisconnected(serverId, 1); } } as object),
+    };
+  };
+
+  const bridgeA = makeBridge('node_a', listenEngine);
+  const bridgeB = makeBridge('node_b', targetEngine);
+  bridges.set('node_a', bridgeA);
+  bridges.set('node_b', bridgeB);
+
+  cleanupCallbacks.push(() => {
+    listenEngine.closeAll('test_end');
+    targetEngine.closeAll('test_end');
+  });
+
+  return { router, listenEngine, targetEngine, capturedMessages, bridgeA, bridgeB };
+}
+
+async function startTestAppServer(): Promise<{
+  port: number;
+  close: () => Promise<void>;
+}> {
+  const bigPayload = Buffer.allocUnsafe(1_500_000);
+  for (let i = 0; i < bigPayload.length; i++) bigPayload[i] = (i * 17 + 3) & 0xff;
+  const bigHash = createHash('sha256').update(bigPayload).digest('hex');
+
+  const httpServer = createHttpServer((req: IncomingMessage, res: ServerResponse) => {
+    if (req.url === '/hello') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, secret: 'TOP_SECRET_HTTP_BODY' }));
+      return;
+    }
+    if (req.url === '/large') {
+      res.writeHead(200, {
+        'content-type': 'application/octet-stream',
+        'x-sha256': bigHash,
+        'content-length': String(bigPayload.length),
+      });
+      res.end(bigPayload);
+      return;
+    }
+    if (req.url === '/echo' && req.method === 'POST') {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/octet-stream' });
+        res.end(Buffer.concat(chunks));
+      });
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  const wss = new WebSocketServer({ server: httpServer, path: '/ws' });
+  wss.on('connection', (ws) => {
+    ws.on('message', (data, isBinary) => {
+      ws.send(isBinary ? data : `echo:${data.toString()}`);
+    });
+  });
+
+  await new Promise<void>((resolve) => {
+    httpServer.listen(0, '127.0.0.1', () => resolve());
+  });
+  const addr = httpServer.address();
+  const port = typeof addr === 'object' && addr ? addr.port : 0;
+
+  return {
+    port,
+    close: () => new Promise<void>((resolve) => {
+      wss.close(() => httpServer.close(() => resolve()));
+    }),
+  };
+}
+
+function httpGet(port: number, path: string): Promise<{ status: number; headers: Record<string, string | string[] | undefined>; body: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port, path, method: 'GET' }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => resolve({
+        status: res.statusCode ?? 0,
+        headers: res.headers,
+        body: Buffer.concat(chunks),
+      }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function runFullTrafficSuite(listenPort: number): Promise<void> {
+  // 1. HTTP GET JSON
+  const hello = await httpGet(listenPort, '/hello');
+  expect(hello.status).toBe(200);
+  expect(JSON.parse(hello.body.toString('utf8'))).toEqual({ ok: true, secret: 'TOP_SECRET_HTTP_BODY' });
+
+  // 2. WebSocket bidirectional communication
+  await new Promise<void>((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${listenPort}/ws`);
+    ws.once('error', reject);
+    ws.once('open', () => ws.send('hello-tunnel'));
+    ws.once('message', (data) => {
+      expect(data.toString()).toBe('echo:hello-tunnel');
+      ws.close();
+      resolve();
+    });
+  });
+
+  // 3. Concurrent multi-stream large payload integrity
+  const parallelResponses = await Promise.all(
+    Array.from({ length: 5 }, () => httpGet(listenPort, '/large')),
+  );
+  for (const res of parallelResponses) {
+    expect(res.status).toBe(200);
+    const actualHash = createHash('sha256').update(res.body).digest('hex');
+    expect(actualHash).toBe(res.headers['x-sha256']);
+  }
+}
+
+describe('PortForwardEngine 3-tier transport & mux suites', () => {
+  it.each([
+    { label: 'direct_tcp (auto LAN)', pref: PORT_FORWARD_TRANSPORT_PREF.AUTO, expected: PORT_FORWARD_TRANSPORT.DIRECT_TCP, disableTcp: false, disableUdp: false },
+    { label: 'direct_udp_p2p (STUN/UDP)', pref: PORT_FORWARD_TRANSPORT_PREF.AUTO, expected: PORT_FORWARD_TRANSPORT.DIRECT_UDP_P2P, disableTcp: true, disableUdp: false },
+    { label: 'relay fallback (auto when P2P blocked)', pref: PORT_FORWARD_TRANSPORT_PREF.AUTO, expected: PORT_FORWARD_TRANSPORT.RELAY, disableTcp: true, disableUdp: true },
+    { label: 'explicit relay', pref: PORT_FORWARD_TRANSPORT_PREF.RELAY, expected: PORT_FORWARD_TRANSPORT.RELAY, disableTcp: false, disableUdp: false },
+  ])('forwards HTTP, WebSocket, and concurrent 1.5MB binary streams over $label', async ({ pref, expected, disableTcp, disableUdp }) => {
+    const appServer = await startTestAppServer();
+    cleanupCallbacks.push(appServer.close);
+
+    // Note: in `PortForwardEngine`, candidates omit 127.0.0.1 by default unless injected in `collectInterfaceAddresses`.
+    // Test overriding `collectInterfaceAddresses` to `['127.0.0.1']` drives real loopback direct TCP / UDP!
+    const { router, capturedMessages } = createPairedEngines({
+      listenOpts: { disableDirectTcp: disableTcp, disableDirectUdp: disableUdp },
+      targetOpts: { disableDirectTcp: disableTcp, disableDirectUdp: disableUdp },
+    });
+
+    const opened = await router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: appServer.port,
+      ttlSeconds: 120,
+      transport: pref,
+      label: expected,
+    });
+
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    expect(opened.tunnel.transportMode).toBe(expected);
+    expect(opened.tunnel.listenHost).toBe(PORT_FORWARD_LIMITS.LISTEN_HOST);
+    expect(opened.tunnel.localEndpoint).toBe(`127.0.0.1:${opened.tunnel.listenPort}`);
+
+    await runFullTrafficSuite(opened.tunnel.listenPort);
+
+    if (expected === PORT_FORWARD_TRANSPORT.RELAY) {
+      // Relay ciphertext must never leak plaintext HTTP body on WS wire!
+      const relayPayloads = capturedMessages
+        .filter((e) => e.msg.type === PORT_FORWARD_MSG.RELAY_FRAME)
+        .map((e) => (e.msg as { data: string }).data);
+      expect(relayPayloads.length).toBeGreaterThan(0);
+      for (const b64 of relayPayloads) {
+        expect(Buffer.from(b64, 'base64').toString('utf8')).not.toContain('TOP_SECRET_HTTP_BODY');
+      }
+    }
+  }, 20_000);
+
+  it('rejects with p2p_failed and does not fall back to relay when transport=p2p_only fails', async () => {
+    const { router } = createPairedEngines({
+      listenOpts: { disableDirectTcp: true, disableDirectUdp: true },
+      targetOpts: { disableDirectTcp: true, disableDirectUdp: true },
+    });
+
+    const opened = await router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: 9999,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.P2P_ONLY,
+    });
+
+    expect(opened.ok).toBe(false);
+    if (opened.ok) return;
+    expect(opened.reason).toBe(PORT_FORWARD_ERRORS.P2P_FAILED);
+  });
+
+  it('supports symmetrical reverse direction (node_b listens -> node_a targets) and rejects unreachable target port cleanly per stream', async () => {
+    const appServer = await startTestAppServer();
+    cleanupCallbacks.push(appServer.close);
+
+    const { router } = createPairedEngines({
+      listenOpts: { disableDirectTcp: true, disableDirectUdp: false },
+      targetOpts: { disableDirectTcp: true, disableDirectUdp: false },
+    });
+
+    // B listens, A hosts target
+    const opened = await router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_b',
+      listenServerId: 'node_b',
+      listenPort: 0,
+      targetNode: 'node_a',
+      targetServerId: 'node_a',
+      targetHost: '127.0.0.1',
+      targetPort: appServer.port,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    expect(opened.tunnel.transportMode).toBe(PORT_FORWARD_TRANSPORT.DIRECT_UDP_P2P);
+
+    const hello = await httpGet(opened.tunnel.listenPort, '/hello');
+    expect(hello.status).toBe(200);
+
+    // Also test OPEN_ERR on a separate tunnel targeting an unused port: client socket closes cleanly without crashing tunnel
+    const badTarget = await router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: 59997,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(badTarget.ok).toBe(true);
+    if (!badTarget.ok) return;
+    await new Promise<void>((resolve) => {
+      const s = tcpConnect({ host: '127.0.0.1', port: badTarget.tunnel.listenPort });
+      s.once('close', () => resolve());
+      s.once('error', () => resolve());
+    });
+  });
+
+  it('releases listenPort immediately upon close so the exact same port can be rebound, and fails fast on EADDRINUSE', async () => {
+    const occupiedServer: NetServer = createTcpServer();
+    cleanupCallbacks.push(() => new Promise<void>((r) => occupiedServer.close(() => r())));
+    const occupiedPort = await new Promise<number>((resolve) => {
+      occupiedServer.listen(0, '127.0.0.1', () => {
+        const addr = occupiedServer.address();
+        resolve(typeof addr === 'object' && addr ? addr.port : 0);
+      });
+    });
+
+    const { router } = createPairedEngines();
+    const conflict = await router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: occupiedPort,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: 80,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(conflict.ok).toBe(false);
+    if (!conflict.ok) expect(conflict.reason).toBe(PORT_FORWARD_ERRORS.LISTEN_PORT_IN_USE);
+
+    // Open ephemeral, close, and immediately rebind the exact released port!
+    const opened = await router.openTunnel({
+      userId: 'u1',
+      listenNode: 'node_a',
+      listenServerId: 'node_a',
+      listenPort: 0,
+      targetNode: 'node_b',
+      targetServerId: 'node_b',
+      targetHost: '127.0.0.1',
+      targetPort: 80,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const port = opened.tunnel.listenPort;
+    const closed = router.closeTunnelForUser('u1', opened.tunnel.tunnelId);
+    expect(closed.ok).toBe(true);
+
+    // Wait one tick for async socket close in engine
+    await new Promise((r) => setTimeout(r, 30));
+
+    const rebindServer = createTcpServer();
+    await new Promise<void>((resolve, reject) => {
+      rebindServer.once('error', reject);
+      rebindServer.listen(port, '127.0.0.1', () => resolve());
+    });
+    await new Promise<void>((r) => rebindServer.close(() => r()));
+  });
+
+  it('drops injected invalid candidates gracefully in validation and still connects', async () => {
+    const engine = new PortForwardEngine({
+      sendWs: () => {},
+    });
+    const handled = await engine.handleMessage({
+      type: PORT_FORWARD_MSG.CONNECT,
+      tunnelId: 'pf_unknown_00000001',
+      role: PORT_FORWARD_ROLE.LISTEN,
+      peerCandidates: [{ host: '127.0.0.1', port: 1234, transport: 'tcp', kind: 'host' } satisfies PortForwardCandidate],
+      transport: PORT_FORWARD_TRANSPORT_PREF.AUTO,
+    });
+    expect(handled).toBe(true);
+    engine.closeAll();
+  });
+});

@@ -14,6 +14,7 @@ import {
 import { WORKER_SESSION_SNAPSHOT_ROUTE_SEGMENT } from './worker-session-snapshot.js';
 import { CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH } from './controlled-node-artifacts.js';
 import { USAGE_INGEST_ROUTE_SUFFIX } from './usage-analytics.js';
+import { PORT_FORWARD_API_PATH } from './port-forward.js';
 
 export const DAEMON_TOKEN_ROUTE_NOT_ALLOWED = 'daemon_token_route_not_allowed';
 export type DaemonHttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
@@ -68,6 +69,10 @@ export const DAEMON_TOKEN_ROUTES: readonly DaemonTokenRoute[] = [
   full('HEAD', CONTROLLED_NODE_ARTIFACT_UPGRADE_PATH),
   full('POST', '/api/machine/exec'),
   full('POST', '/api/machine/computer-use'),
+  full('POST', PORT_FORWARD_API_PATH),
+  full('GET', PORT_FORWARD_API_PATH),
+  full('DELETE', PORT_FORWARD_API_PATH),
+  full('DELETE', `${PORT_FORWARD_API_PATH}/:tunnelId`),
   full('POST', `${server}/machine-direct-upload`),
   full('POST', `${server}/machine-direct-fetch`),
   full('POST', `${server}/machine-file-handle`),

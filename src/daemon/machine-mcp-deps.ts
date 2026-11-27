@@ -21,6 +21,12 @@ import { FILE_PATH_HANDLE_ERROR } from '../../shared/transport/file-transfer.js'
 import { execRemote as clientExecRemote, listMachines as clientListMachines, MachineControlPlaneError } from './machine-exec-client.js';
 import { computerUseCall as clientComputerUseCall } from './computer-use-client.js';
 import { fetchFileFromMachine as clientFetchFileFromMachine, sendFileToMachine as clientSendFileToMachine } from './machine-file-client.js';
+import {
+  closePortForward as clientClosePortForward,
+  listPortForwards as clientListPortForwards,
+  openPortForward as clientOpenPortForward,
+} from './port-forward-client.js';
+import { PORT_FORWARD_ERRORS, type PortForwardErrorCode } from '../../shared/port-forward.js';
 import { runComputerUseTool } from '../node/computer-use-runner.js';
 import type { SessionResourceOwnerIdentity } from '../../shared/session-resource-lifecycle.js';
 import type { ComputerUseToolResult, MachineFileToolResult, MachineToolDeps, MachineSummaryForTool, MachineExecToolResult } from './memory-mcp-tools.js';
@@ -52,6 +58,9 @@ export interface DaemonMachineToolDepsOverrides {
   sendFileToMachine?: typeof clientSendFileToMachine;
   fetchFileFromMachine?: typeof clientFetchFileFromMachine;
   computerUseCall?: typeof clientComputerUseCall;
+  openPortForward?: typeof clientOpenPortForward;
+  listPortForwards?: typeof clientListPortForwards;
+  closePortForward?: typeof clientClosePortForward;
   localComputerUseCall?: (input: { tool: Parameters<NonNullable<MachineToolDeps['computerUseCall']>>[0]['tool']; arguments?: Record<string, unknown>; timeoutMs?: number; signal?: AbortSignal }) => Promise<ComputerUseToolResult> | ComputerUseToolResult;
   resourceOwner?: SessionResourceOwnerIdentity | null;
   loadSharedMachineAuthority?: () => Promise<string | null>;
@@ -95,6 +104,36 @@ async function defaultLocalComputerUseCall(input: { tool: Parameters<NonNullable
   return { outcome: result.ok ? 'completed' : 'tool_error', result };
 }
 
+function portForwardFailureReason(reason: PortForwardErrorCode): MCPErrorReason {
+  switch (reason) {
+    case PORT_FORWARD_ERRORS.EXEC_DISABLED:
+      return MCP_ERROR_REASONS.EXEC_DISABLED;
+    case PORT_FORWARD_ERRORS.TARGET_FORBIDDEN:
+      return MCP_ERROR_REASONS.SCOPE_FORBIDDEN;
+    case PORT_FORWARD_ERRORS.SCOPED_AUTH:
+      return MCP_ERROR_REASONS.IDENTITY_REJECTED;
+    case PORT_FORWARD_ERRORS.RATE_LIMITED:
+    case PORT_FORWARD_ERRORS.LIMIT_EXCEEDED:
+      return MCP_ERROR_REASONS.RATE_LIMITED;
+    case PORT_FORWARD_ERRORS.NODE_NOT_FOUND:
+      return MCP_ERROR_REASONS.MACHINE_NOT_FOUND;
+    case PORT_FORWARD_ERRORS.NODE_AMBIGUOUS:
+      return MCP_ERROR_REASONS.MACHINE_AMBIGUOUS;
+    case PORT_FORWARD_ERRORS.NODE_OFFLINE:
+      return MCP_ERROR_REASONS.EXEC_OFFLINE;
+    case PORT_FORWARD_ERRORS.INVALID_REQUEST:
+      return MCP_ERROR_REASONS.VALIDATION_FAILED;
+    case PORT_FORWARD_ERRORS.LISTEN_PORT_IN_USE:
+    case PORT_FORWARD_ERRORS.TARGET_UNSUPPORTED:
+    case PORT_FORWARD_ERRORS.P2P_FAILED:
+    case PORT_FORWARD_ERRORS.TIMEOUT:
+    case PORT_FORWARD_ERRORS.TUNNEL_NOT_FOUND:
+      return MCP_ERROR_REASONS.TARGET_UNAVAILABLE;
+    default:
+      return MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE;
+  }
+}
+
 /** Build the FULL-node machine tool deps from the daemon's own credential. */
 export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOverrides = {}): MachineToolDeps {
   const load = overrides.loadCredential ?? loadDaemonCredential;
@@ -103,6 +142,9 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
   const computerUse = overrides.computerUseCall ?? clientComputerUseCall;
   const sendFile = overrides.sendFileToMachine ?? clientSendFileToMachine;
   const fetchFile = overrides.fetchFileFromMachine ?? clientFetchFileFromMachine;
+  const pfOpen = overrides.openPortForward ?? clientOpenPortForward;
+  const pfList = overrides.listPortForwards ?? clientListPortForwards;
+  const pfClose = overrides.closePortForward ?? clientClosePortForward;
   const localComputerUse = overrides.localComputerUseCall ?? defaultLocalComputerUseCall;
   const resourceOwner = overrides.resourceOwner ?? undefined;
   const loadSharedMachineAuthority = overrides.loadSharedMachineAuthority ?? (async () => null);
@@ -357,6 +399,61 @@ export function createDaemonMachineToolDeps(overrides: DaemonMachineToolDepsOver
             error: `machine dispatch refused: ${httpReason ?? 'unknown'}`,
           }
         : result;
+    },
+
+    async portForwardOpen(input) {
+      const creds = await load();
+      if (!creds) return { ok: false, reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
+      const sharedMachineAuthority = await loadSharedMachineAuthority();
+      const res = await pfOpen({
+        serverUrl: creds.serverUrl,
+        sourceServerId: creds.serverId,
+        sourceToken: creds.token,
+        ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+        ...input,
+      });
+      if (!res.ok) {
+        return { ok: false, reason: portForwardFailureReason(res.reason), error: `[${res.reason}] ${res.error}` };
+      }
+      return { ok: true, tunnel: res.tunnel };
+    },
+
+    async portForwardList(input) {
+      const creds = await load();
+      if (!creds) return { ok: false, reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
+      const sharedMachineAuthority = await loadSharedMachineAuthority();
+      const res = await pfList({
+        serverUrl: creds.serverUrl,
+        sourceServerId: creds.serverId,
+        sourceToken: creds.token,
+        ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+        ...(input?.node ? { node: input.node } : {}),
+        ...(input?.signal ? { signal: input.signal } : {}),
+      });
+      if (!res.ok) {
+        return { ok: false, reason: portForwardFailureReason(res.reason), error: `[${res.reason}] ${res.error}` };
+      }
+      return { ok: true, tunnels: res.tunnels };
+    },
+
+    async portForwardClose(input) {
+      const creds = await load();
+      if (!creds) return { ok: false, reason: MCP_ERROR_REASONS.FEATURE_DISABLED, error: 'daemon is not bound to a server' };
+      const sharedMachineAuthority = await loadSharedMachineAuthority();
+      const res = await pfClose({
+        serverUrl: creds.serverUrl,
+        sourceServerId: creds.serverId,
+        sourceToken: creds.token,
+        ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+        ...(input.tunnelId ? { tunnelId: input.tunnelId } : {}),
+        ...(input.all ? { all: input.all } : {}),
+        ...(input.node ? { node: input.node } : {}),
+        ...(input.signal ? { signal: input.signal } : {}),
+      });
+      if (!res.ok) {
+        return { ok: false, reason: portForwardFailureReason(res.reason), error: `[${res.reason}] ${res.error}` };
+      }
+      return { ok: true, closedCount: res.closedCount, closedTunnelIds: res.closedTunnelIds };
     },
   };
 }

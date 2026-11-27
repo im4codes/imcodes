@@ -3,6 +3,18 @@ import { SESSION_INCOGNITO_MEMORY_DISABLED } from '../../shared/session-incognit
 import { TASK_PAIR_DECISION_LIMITS, validateTaskPairDecisionDetails, type TaskPairDecisionDetails } from '../../shared/task-pair-decision.js';
 import { splitCliArgs } from '../cli/cloud-docs.js';
 import type { CloudDocsToolDeps } from './cloud-docs-mcp-deps.js';
+import {
+  PORT_FORWARD_LIMITS,
+  PORT_FORWARD_TRANSPORTS,
+  PORT_FORWARD_TRANSPORT_PREFS,
+  validatePortForwardHost,
+  validatePortForwardNodeRef,
+  validatePortForwardPort,
+  validatePortForwardTransportPref,
+  validatePortForwardTtlSeconds,
+  type PortForwardTransportPref,
+  type PortForwardTunnelSummary,
+} from '../../shared/port-forward.js';
 import { readSessionTextMessages, readSessionSummaries, readSessionToolEvents, resolveHistorySession, canReadSessionHistory } from './session-history.js';
 import { SESSION_TEXT_HISTORY_DEFAULT_LIMIT, SESSION_TEXT_HISTORY_MAX_LIMIT, SESSION_HISTORY_KINDS } from '../../shared/session-history.js';
 import { pausePair, resumePair, initialPairWait, validatePairDependencies } from './task-pairs/suspension.js';
@@ -560,6 +572,18 @@ export type MachineFileToolResult =
   | { ok: true; size: number; attachmentId: string; transport: MachineFileTransferTransport; remotePath?: string; destinationPath?: string }
   | { ok: false; reason: MCPErrorReason; error?: string };
 
+export type PortForwardOpenToolResult =
+  | { ok: true; tunnel: PortForwardTunnelSummary }
+  | { ok: false; reason: MCPErrorReason; error?: string };
+
+export type PortForwardListToolResult =
+  | { ok: true; tunnels: PortForwardTunnelSummary[] }
+  | { ok: false; reason: MCPErrorReason; error?: string };
+
+export type PortForwardCloseToolResult =
+  | { ok: true; closedCount: number; closedTunnelIds: string[] }
+  | { ok: false; reason: MCPErrorReason; error?: string };
+
 export interface MachineToolDeps {
   listMachines: (input: { includeOffline?: boolean }) => Promise<MachineSummaryForTool[]> | MachineSummaryForTool[];
   execRemote: (input: {
@@ -589,6 +613,27 @@ export interface MachineToolDeps {
     timeoutMs?: number;
     signal?: AbortSignal;
   }) => Promise<ComputerUseToolResult> | ComputerUseToolResult;
+  portForwardOpen?: (input: {
+    listenNode?: string;
+    targetNode: string;
+    listenPort?: number;
+    targetHost?: string;
+    targetPort: number;
+    ttlSeconds?: number;
+    transport?: PortForwardTransportPref;
+    label?: string;
+    signal?: AbortSignal;
+  }) => Promise<PortForwardOpenToolResult> | PortForwardOpenToolResult;
+  portForwardList?: (input: {
+    node?: string;
+    signal?: AbortSignal;
+  }) => Promise<PortForwardListToolResult> | PortForwardListToolResult;
+  portForwardClose?: (input: {
+    tunnelId?: string;
+    all?: boolean;
+    node?: string;
+    signal?: AbortSignal;
+  }) => Promise<PortForwardCloseToolResult> | PortForwardCloseToolResult;
 }
 
 export interface MachineListToolSuccess extends Record<string, unknown> {
@@ -5425,6 +5470,145 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         ...(result.data !== undefined ? { data: result.data } : {}),
       };
     },
+    [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN]: async (input, context) => {
+      if (!deps.machineDeps?.portForwardOpen) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'port forwarding is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['listenNode', 'targetNode', 'listenPort', 'targetHost', 'targetPort', 'ttlSeconds', 'transport', 'label']);
+      const targetNode = validatePortForwardNodeRef(args.targetNode);
+      if (!targetNode) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'targetNode is required');
+      const targetPort = validatePortForwardPort(args.targetPort, false);
+      if (targetPort === null) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'targetPort must be an integer in [1, 65535]');
+      let listenNode: string | undefined;
+      if (args.listenNode !== undefined) {
+        const validated = validatePortForwardNodeRef(args.listenNode);
+        if (!validated) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid listenNode');
+        listenNode = validated;
+      }
+      let listenPort: number | undefined;
+      if (args.listenPort !== undefined) {
+        const validated = validatePortForwardPort(args.listenPort, true);
+        if (validated === null) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'listenPort must be an integer in [0, 65535]');
+        listenPort = validated;
+      }
+      let targetHost: string | undefined;
+      if (args.targetHost !== undefined) {
+        const validated = validatePortForwardHost(args.targetHost);
+        if (!validated) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid targetHost');
+        targetHost = validated;
+      }
+      let ttlSeconds: number | undefined;
+      if (args.ttlSeconds !== undefined) {
+        const validated = validatePortForwardTtlSeconds(args.ttlSeconds);
+        if (validated === null) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `ttlSeconds must be an integer in [${PORT_FORWARD_LIMITS.MIN_TTL_SECONDS}, ${PORT_FORWARD_LIMITS.MAX_TTL_SECONDS}]`);
+        ttlSeconds = validated;
+      }
+      let transport: PortForwardTransportPref | undefined;
+      if (args.transport !== undefined) {
+        const validated = validatePortForwardTransportPref(args.transport);
+        if (!validated) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'transport must be auto, p2p_only, or relay');
+        transport = validated;
+      }
+      const label = stringArg(args, 'label');
+      if (args.label !== undefined && typeof args.label !== 'string') {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'label must be a string');
+      }
+      if (label && label.length > PORT_FORWARD_LIMITS.MAX_LABEL_LENGTH) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `label must be at most ${PORT_FORWARD_LIMITS.MAX_LABEL_LENGTH} characters`);
+      }
+
+      const result = await deps.machineDeps.portForwardOpen({
+        ...(listenNode !== undefined ? { listenNode } : {}),
+        targetNode,
+        ...(listenPort !== undefined ? { listenPort } : {}),
+        ...(targetHost !== undefined ? { targetHost } : {}),
+        targetPort,
+        ...(ttlSeconds !== undefined ? { ttlSeconds } : {}),
+        ...(transport !== undefined ? { transport } : {}),
+        ...(label !== undefined ? { label } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      if (!result.ok) return error(result.reason, result.error);
+      const t = result.tunnel;
+      return {
+        status: 'ok',
+        tunnelId: t.tunnelId,
+        listenNode: t.listenNode,
+        ...(t.listenNodeId ? { listenNodeId: t.listenNodeId } : {}),
+        listenHost: t.listenHost,
+        listenPort: t.listenPort,
+        localEndpoint: t.localEndpoint,
+        targetNode: t.targetNode,
+        ...(t.targetNodeId ? { targetNodeId: t.targetNodeId } : {}),
+        targetHost: t.targetHost,
+        targetPort: t.targetPort,
+        transportMode: t.transportMode,
+        expiresAt: t.expiresAt,
+        ...(t.label ? { label: t.label } : {}),
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_LIST]: async (input, context) => {
+      if (!deps.machineDeps?.portForwardList) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'port forwarding is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['node']);
+      let node: string | undefined;
+      if (args.node !== undefined) {
+        const validated = validatePortForwardNodeRef(args.node);
+        if (!validated) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid node filter');
+        node = validated;
+      }
+      const result = await deps.machineDeps.portForwardList({
+        ...(node !== undefined ? { node } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      if (!result.ok) return error(result.reason, result.error);
+      return {
+        status: 'ok',
+        tunnels: result.tunnels.map((t) => ({
+          tunnelId: t.tunnelId,
+          listenNode: t.listenNode,
+          ...(t.listenNodeId ? { listenNodeId: t.listenNodeId } : {}),
+          listenHost: t.listenHost,
+          listenPort: t.listenPort,
+          localEndpoint: t.localEndpoint,
+          targetNode: t.targetNode,
+          ...(t.targetNodeId ? { targetNodeId: t.targetNodeId } : {}),
+          targetHost: t.targetHost,
+          targetPort: t.targetPort,
+          transportMode: t.transportMode,
+          activeConnections: t.activeConnections,
+          bytesSent: t.bytesSent,
+          bytesReceived: t.bytesReceived,
+          createdAt: t.createdAt,
+          expiresAt: t.expiresAt,
+          ...(t.label ? { label: t.label } : {}),
+        })),
+      };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE]: async (input, context) => {
+      if (!deps.machineDeps?.portForwardClose) return error(MCP_ERROR_REASONS.FEATURE_DISABLED, 'port forwarding is not available on this node');
+      const args = pickAllowedMcpArgs(input, ['tunnelId', 'all', 'node']);
+      const tunnelId = stringArg(args, 'tunnelId');
+      const all = boolArg(args, 'all') ?? false;
+      let node: string | undefined;
+      if (args.node !== undefined) {
+        const validated = validatePortForwardNodeRef(args.node);
+        if (!validated) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'invalid node filter');
+        node = validated;
+      }
+      if (!tunnelId && !all) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'tunnelId or all=true is required');
+      }
+      const result = await deps.machineDeps.portForwardClose({
+        ...(tunnelId ? { tunnelId } : {}),
+        ...(all ? { all: true } : {}),
+        ...(node !== undefined ? { node } : {}),
+        ...(context?.signal ? { signal: context.signal } : {}),
+      });
+      if (!result.ok) return error(result.reason, result.error);
+      return {
+        status: 'ok',
+        closedCount: result.closedCount,
+        closedTunnelIds: result.closedTunnelIds,
+      };
+    },
   };
   if (deps.invokeDaemonMemoryTool) {
     for (const name of MEMORY_MCP_DAEMON_TOOL_NAMES) {
@@ -5969,6 +6153,24 @@ const schemas = {
     args: z.array(z.string()).optional(),
     command: z.string().optional(),
   }),
+  [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN]: z.strictObject({
+    targetNode: z.string().min(1).max(128),
+    targetPort: z.number().int().min(1).max(65_535),
+    listenNode: z.string().min(1).max(128).optional(),
+    listenPort: z.number().int().min(0).max(65_535).optional(),
+    targetHost: z.string().min(1).max(PORT_FORWARD_LIMITS.MAX_HOST_LENGTH).optional(),
+    ttlSeconds: z.number().int().min(PORT_FORWARD_LIMITS.MIN_TTL_SECONDS).max(PORT_FORWARD_LIMITS.MAX_TTL_SECONDS).optional(),
+    transport: z.enum(PORT_FORWARD_TRANSPORT_PREFS).optional(),
+    label: z.string().max(PORT_FORWARD_LIMITS.MAX_LABEL_LENGTH).optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_LIST]: z.strictObject({
+    node: z.string().min(1).max(128).optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE]: z.strictObject({
+    tunnelId: z.string().min(1).max(64).optional(),
+    all: z.boolean().optional(),
+    node: z.string().min(1).max(128).optional(),
+  }),
 } as const;
 
 /**
@@ -6049,6 +6251,49 @@ const machineToolOutputSchemas: Partial<Record<MemoryMcpToolName, z.ZodTypeAny>>
     if ((value.outcome === 'completed' || value.outcome === 'tool_error') !== (value.result !== undefined)) {
       ctx.addIssue({ code: 'custom', message: 'computer_use_call outcome/result mismatch' });
     }
+  }),
+  [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_OPEN]: z.strictObject({
+    status: z.literal('ok'),
+    tunnelId: z.string().min(1),
+    listenNode: z.string().min(1),
+    listenNodeId: z.string().min(1).optional(),
+    listenHost: z.literal(PORT_FORWARD_LIMITS.LISTEN_HOST),
+    listenPort: z.number().int().min(1).max(65_535),
+    localEndpoint: z.string().min(1),
+    targetNode: z.string().min(1),
+    targetNodeId: z.string().min(1).optional(),
+    targetHost: z.string().min(1),
+    targetPort: z.number().int().min(1).max(65_535),
+    transportMode: z.enum(PORT_FORWARD_TRANSPORTS),
+    expiresAt: z.number().nonnegative(),
+    label: z.string().optional(),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_LIST]: z.strictObject({
+    status: z.literal('ok'),
+    tunnels: z.array(z.strictObject({
+      tunnelId: z.string().min(1),
+      listenNode: z.string().min(1),
+      listenNodeId: z.string().min(1).optional(),
+      listenHost: z.literal(PORT_FORWARD_LIMITS.LISTEN_HOST),
+      listenPort: z.number().int().min(1).max(65_535),
+      localEndpoint: z.string().min(1),
+      targetNode: z.string().min(1),
+      targetNodeId: z.string().min(1).optional(),
+      targetHost: z.string().min(1),
+      targetPort: z.number().int().min(1).max(65_535),
+      transportMode: z.enum(PORT_FORWARD_TRANSPORTS),
+      activeConnections: z.number().int().nonnegative(),
+      bytesSent: z.number().int().nonnegative(),
+      bytesReceived: z.number().int().nonnegative(),
+      createdAt: z.number().nonnegative(),
+      expiresAt: z.number().nonnegative(),
+      label: z.string().optional(),
+    })).max(PORT_FORWARD_LIMITS.MAX_LIST_TUNNELS),
+  }),
+  [MEMORY_MCP_TOOL_NAMES.PORT_FORWARD_CLOSE]: z.strictObject({
+    status: z.literal('ok'),
+    closedCount: z.number().int().nonnegative(),
+    closedTunnelIds: z.array(z.string()),
   }),
 } as const;
 
