@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
+import { EventEmitter } from 'node:events';
 import {
   DEFAULT_PUSH_NOTIFICATION_TYPES,
   PUSH_NOTIFICATION_TYPE_REMOTE_DESKTOP,
   PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
   PUSH_NOTIFICATION_TYPE_TASK_PAIR_AUDIT,
+  PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE,
 } from '../../shared/push-notifications.js';
 
 const mockDb = {
@@ -13,35 +15,49 @@ const mockDb = {
   execute: vi.fn(),
 };
 
-vi.mock('../src/security/authorization.js', () => ({
-  requireAuth: () => async (c: any, next: any) => {
-    const authHeader = c.req.header('Authorization');
-    if (authHeader === 'Bearer valid-user-1') {
-      c.set('userId', 'user-1');
-      c.set('role', 'owner');
-      return next();
-    }
-    if (authHeader === 'Bearer valid-user-2') {
-      c.set('userId', 'user-2');
-      c.set('role', 'owner');
-      return next();
-    }
-    return c.json({ error: 'unauthorized' }, 401);
-  },
-}));
-
-const { notifyPushNotificationMock } = vi.hoisted(() => ({
-  notifyPushNotificationMock: vi.fn(async () => {}),
-}));
-
-vi.mock('../src/services/global-task-hub.js', () => ({
-  globalTaskHub: {
-    notifyPushNotification: notifyPushNotificationMock,
-  },
-}));
+vi.mock('../src/security/authorization.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/security/authorization.js')>();
+  return {
+    ...actual,
+    requireAuth: () => async (c: any, next: any) => {
+      const authHeader = c.req.header('Authorization');
+      if (authHeader === 'Bearer valid-user-1') {
+        c.set('userId', 'user-1');
+        c.set('role', 'owner');
+        return next();
+      }
+      if (authHeader === 'Bearer valid-user-1-key-a') {
+        c.set('userId', 'user-1');
+        c.set('role', 'member');
+        c.set('keyId', 'key-a');
+        return next();
+      }
+      if (authHeader === 'Bearer valid-user-1-key-b') {
+        c.set('userId', 'user-1');
+        c.set('role', 'member');
+        c.set('keyId', 'key-b');
+        return next();
+      }
+      if (authHeader === 'Bearer valid-user-2') {
+        c.set('userId', 'user-2');
+        c.set('role', 'owner');
+        return next();
+      }
+      return c.json({ error: 'unauthorized' }, 401);
+    },
+  };
+});
 
 import { dispatchPush, pushRoutes } from '../src/routes/push.js';
-import { MAX_PUSH_STREAMS_PER_USER, pushStreamHub } from '../src/services/push-stream-hub.js';
+import { GlobalTaskHub, globalTaskHub } from '../src/services/global-task-hub.js';
+import { closeRevokedPushStreams } from '../src/ws/account-watch.js';
+import { WsBridge } from '../src/ws/bridge.js';
+import {
+  MAX_PUSH_STREAMS_PER_USER,
+  PUSH_STREAM_MAX_BUFFERED_CHUNKS,
+  PushStreamHub,
+  pushStreamHub,
+} from '../src/services/push-stream-hub.js';
 
 const app = new Hono();
 app.use('/*', async (c, next) => {
@@ -53,17 +69,21 @@ app.use('/*', async (c, next) => {
 app.route('/api/push', pushRoutes);
 
 describe('GET /api/push/stream and pushStreamHub', () => {
+  let notifyPushNotificationSpy: ReturnType<typeof vi.spyOn>;
+
   beforeEach(() => {
     vi.clearAllMocks();
     pushStreamHub.stop();
+    notifyPushNotificationSpy = vi.spyOn(globalTaskHub, 'notifyPushNotification').mockResolvedValue();
   });
 
   afterEach(() => {
+    notifyPushNotificationSpy.mockRestore();
     pushStreamHub.stop();
     vi.useRealTimers();
   });
 
-  it('rejects unauthenticated requests with 401 and disabled users with 403', async () => {
+  it('rejects unauthenticated requests with 401, disabled users with 403, and transient DB failures with 503', async () => {
     const unauth = await app.request('/api/push/stream');
     expect(unauth.status).toBe(401);
 
@@ -72,6 +92,12 @@ describe('GET /api/push/stream and pushStreamHub', () => {
       headers: { Authorization: 'Bearer valid-user-1' },
     });
     expect(disabled.status).toBe(403);
+
+    mockDb.queryOne.mockRejectedValueOnce(new Error('PG connection timeout'));
+    const transientErr = await app.request('/api/push/stream', {
+      headers: { Authorization: 'Bearer valid-user-1' },
+    });
+    expect(transientErr.status).toBe(503);
   });
 
   it('streams SSE headers, initial comment, dispatched events without push_tokens, and cleans up on abort', async () => {
@@ -208,12 +234,235 @@ describe('GET /api/push/stream and pushStreamHub', () => {
       body: 'Mobile already viewing',
       suppressMobilePush: true,
     }, { DB: mockDb } as never);
-    expect(notifyPushNotificationMock).toHaveBeenCalledTimes(3); // task_complete (srv-1), remote_desktop (srv-muted), suppressed mobile
+    expect(notifyPushNotificationSpy).toHaveBeenCalledTimes(3); // task_complete (srv-1), remote_desktop (srv-muted), suppressed mobile
 
     // Aborting signal removes subscriber immediately
     abortController.abort();
     await reader.cancel().catch(() => {});
     expect(pushStreamHub.subscriberCount('user-1')).toBe(0);
+  });
+
+  it('P0-1: delivers SSE across two isolated replica hubs without source local subscribers and increments badge_count once', async () => {
+    const streamHubA = new PushStreamHub();
+    const streamHubB = new PushStreamHub();
+    const globalHubA = new GlobalTaskHub({ pushStreamHub: streamHubA });
+    const globalHubB = new GlobalTaskHub({ pushStreamHub: streamHubB });
+
+    // Simulate PG LISTEN active on replica A and pipe pg_notify frames to both replicas
+    vi.spyOn(globalHubA, 'isPgListening').mockReturnValue(true);
+    const receivedOnB: string[] = [];
+    streamHubB.subscribe('user-multi', {
+      send: (frame) => {
+        receivedOnB.push(frame);
+        return true;
+      },
+      close: () => {},
+    });
+    expect(streamHubA.hasSubscribers('user-multi')).toBe(false);
+    expect(streamHubB.hasSubscribers('user-multi')).toBe(true);
+
+    const replicaDb = {
+      query: vi.fn()
+        .mockResolvedValueOnce([{
+          user_status: 'active',
+          push_enabled_server_ids: ['srv-a'],
+          push_notification_types: [...DEFAULT_PUSH_NOTIFICATION_TYPES],
+          token: null,
+          platform: null,
+          notification_types: null,
+        }])
+        .mockResolvedValueOnce([{ badge_count: 7 }]),
+      queryOne: vi.fn(),
+      execute: vi.fn(async (sql: string, params: unknown[]) => {
+        if (sql.includes('pg_notify')) {
+          const payload = String(params[1]);
+          await globalHubA.handleNotifyPayload(payload, replicaDb as never);
+          await globalHubB.handleNotifyPayload(payload, replicaDb as never);
+        }
+        return { changes: 1 };
+      }),
+    } as any;
+
+    await dispatchPush(
+      {
+        userId: 'user-multi',
+        serverId: 'srv-a',
+        eventId: 'evt-cross-1',
+        type: PUSH_NOTIFICATION_TYPE_TASK_COMPLETE,
+        title: 'Pod A · proj',
+        body: 'Delivered to Pod B',
+        data: { serverId: 'srv-a', session: 'deck_proj_brain' },
+      },
+      { DB: replicaDb } as never,
+      undefined,
+      { globalHub: globalHubA, streamHub: streamHubA },
+    );
+
+    // badge_count updated ONCE on source replica A; never re-incremented on replica B
+    const badgeQueries = replicaDb.query.mock.calls.filter(([sql]: [string]) => sql.includes('badge_count'));
+    expect(badgeQueries).toHaveLength(1);
+    expect(receivedOnB).toHaveLength(1);
+    expect(receivedOnB[0]).toContain('"badge":7');
+    expect(receivedOnB[0]).toContain('"id":"evt-cross-1"');
+  });
+
+  it('P0-2: delivers SSE on real WsBridge session.idle and task_pair.event entries even while mobile WebSocket stays OPEN in background', async () => {
+    const receivedFrames: string[] = [];
+    pushStreamHub.subscribe('user-ws-bg', {
+      send: (frame) => {
+        receivedFrames.push(frame);
+        return true;
+      },
+      close: () => {},
+    });
+
+    const mockBridgeDb = {
+      queryOne: vi.fn(async () => ({ user_id: 'user-ws-bg', name: 'my-host' })),
+      query: vi.fn(async (sql: string) => {
+        if (sql.includes('FROM users')) {
+          return [{
+            user_status: 'active',
+            push_enabled_server_ids: ['srv-ws-1'],
+            push_notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE, PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE],
+            token: 'apns-tok-1',
+            platform: 'ios',
+            notification_types: [PUSH_NOTIFICATION_TYPE_TASK_COMPLETE, PUSH_NOTIFICATION_TYPE_TASK_PAIR_DONE],
+          }];
+        }
+        if (sql.includes('badge_count')) {
+          return [{ badge_count: 1 }];
+        }
+        return [];
+      }),
+      execute: vi.fn(async () => ({ changes: 1 })),
+    } as any;
+
+    const bridge = WsBridge.get('srv-ws-1');
+    const mobileWs = new EventEmitter() as any;
+    mobileWs.readyState = 1; // WebSocket.OPEN
+    mobileWs.send = vi.fn();
+    mobileWs.close = vi.fn();
+
+    bridge.handleBrowserConnection(mobileWs, 'user-ws-bg', mockBridgeDb, true);
+    mobileWs.emit('message', Buffer.from(JSON.stringify({ type: 'client.presence', foreground: false })));
+    await Promise.resolve();
+
+    const mockEnv = { DB: mockBridgeDb } as any; // no APNS/FCM/JPUSH keys, no PUSH_RELAY_URL -> would throw or fetch if token push attempted
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+
+    try {
+      await (bridge as any).dispatchEventPush(mockBridgeDb, mockEnv, {
+        type: 'session.idle',
+        session: 'deck_proj_brain',
+        lastText: 'Finished work while app backgrounded',
+        eventId: 'evt-bg-idle-1',
+      });
+
+      await (bridge as any).dispatchTaskPairPush(
+        mockBridgeDb,
+        mockEnv,
+        'deck_proj_brain',
+        {
+          taskId: 'tsk_bg_1',
+          title: 'Background pair',
+          verb: 'DONE',
+          toStatus: 'done',
+          round: 1,
+        },
+        'evt-bg-pair-1',
+        Date.now(),
+      );
+
+      // Both task status (session.idle) AND pair hook (task_pair.event) delivered to SSE despite open mobile WS,
+      // while legacy token push remained suppressed (no fetch calls).
+      expect(receivedFrames).toHaveLength(2);
+      expect(receivedFrames[0]).toContain('Finished work while app backgrounded');
+      expect(receivedFrames[1]).toContain('tsk_bg_1');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(notifyPushNotificationSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+      mobileWs.emit('close');
+      bridge.dispose();
+    }
+  });
+
+  it('P0-5: revoking API key A closes only key A SSE streams while keeping key B for same user, and handles grace expiry / logout', async () => {
+    mockDb.queryOne
+      .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 })
+      .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 });
+
+    const abortA = new AbortController();
+    const abortB = new AbortController();
+    const resA = await app.request('/api/push/stream', {
+      headers: { Authorization: 'Bearer valid-user-1-key-a' },
+      signal: abortA.signal,
+    });
+    const resB = await app.request('/api/push/stream', {
+      headers: { Authorization: 'Bearer valid-user-1-key-b' },
+      signal: abortB.signal,
+    });
+    expect(resA.status).toBe(200);
+    expect(resB.status).toBe(200);
+    expect(pushStreamHub.subscriberCount('user-1')).toBe(2);
+
+    const readerA = resA.body!.getReader();
+    const readerB = resB.body!.getReader();
+    await readerA.read(); // : connected
+    await readerB.read(); // : connected
+
+    // Revoke key-a -> only key-a closes, key-b stays connected
+    await globalTaskHub.notifyPushCredentialRevoked(mockDb as never, { userId: 'user-1', keyId: 'key-a' });
+    expect(pushStreamHub.subscriberCount('user-1')).toBe(1);
+    const afterRevokeA = await readerA.read();
+    expect(afterRevokeA.done).toBe(true);
+
+    // key-b still receives events
+    pushStreamHub.publish('user-1', { id: 'evt-key-b', title: 'B', body: 'Still alive' });
+    const chunkB = await readerB.read();
+    expect(new TextDecoder().decode(chunkB.value)).toContain('evt-key-b');
+
+    // Grace expiry check via account-watch closes remaining expired key-b stream
+    mockDb.query.mockResolvedValueOnce([{ id: 'key-b' }]);
+    const closedExpired = await closeRevokedPushStreams(mockDb as never, pushStreamHub, Date.now());
+    expect(closedExpired).toBe(1);
+    expect(pushStreamHub.subscriberCount('user-1')).toBe(0);
+    const afterExpireB = await readerB.read();
+    expect(afterExpireB.done).toBe(true);
+  });
+
+  it('P0-6: closes slow stalled SSE reader at bounded backpressure threshold without blocking healthy reader', async () => {
+    mockDb.queryOne
+      .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 })
+      .mockResolvedValueOnce({ status: 'active', sessions_valid_after: 0 });
+
+    const resSlow = await app.request('/api/push/stream', {
+      headers: { Authorization: 'Bearer valid-user-1-key-a' },
+    });
+    const resFast = await app.request('/api/push/stream', {
+      headers: { Authorization: 'Bearer valid-user-1-key-b' },
+    });
+    const slowReader = resSlow.body!.getReader();
+    const fastReader = resFast.body!.getReader();
+    const decoder = new TextDecoder();
+    // Drain initial : connected on fastReader only; leave slowReader unread
+    expect(decoder.decode((await fastReader.read()).value)).toBe(': connected\n\n');
+    expect(pushStreamHub.subscriberCount('user-1')).toBe(2);
+
+    const fastEvents: string[] = [];
+    for (let i = 0; i < PUSH_STREAM_MAX_BUFFERED_CHUNKS + 4; i += 1) {
+      pushStreamHub.publish('user-1', { id: `bp-${i}`, title: 'T', body: `msg-${i}` });
+      const chunk = await fastReader.read();
+      fastEvents.push(decoder.decode(chunk.value));
+    }
+
+    // Slow reader was automatically closed & unsubscribed; fast reader received every single event
+    expect(pushStreamHub.subscriberCount('user-1')).toBe(1);
+    expect(fastEvents).toHaveLength(PUSH_STREAM_MAX_BUFFERED_CHUNKS + 4);
+
+    // Cancel slowReader so buffered queued chunks release cleanly
+    await slowReader.cancel().catch(() => {});
+    await fastReader.cancel().catch(() => {});
   });
 
   it('evicts the oldest subscriber when exceeding MAX_PUSH_STREAMS_PER_USER and removes failed writers', async () => {

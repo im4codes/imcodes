@@ -73,10 +73,18 @@ describe('Android FCM package split contract', () => {
       'FOREGROUND_SERVICE_REMOTE_MESSAGING',
       'BackgroundPushService',
       'BackgroundPushBootReceiver',
+      'without_fcm_backup_rules',
+      'without_fcm_data_extraction_rules',
     ]) {
       expect(mainManifest).not.toContain(token);
       expect(withFcmManifest).not.toContain(token);
       expect(withoutFcmManifest).toContain(token);
     }
+    const backupRules = read('web/android/app/src/withoutFcm/res/xml/without_fcm_backup_rules.xml');
+    const dataExtractionRules = read('web/android/app/src/withoutFcm/res/xml/without_fcm_data_extraction_rules.xml');
+    expect(backupRules).toContain('imcodes_bg_push_prefs.xml');
+    expect(dataExtractionRules).toContain('<cloud-backup>');
+    expect(dataExtractionRules).toContain('<device-transfer>');
+    expect(dataExtractionRules).toContain('imcodes_bg_push_prefs.xml');
   });
 });

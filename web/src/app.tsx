@@ -1152,6 +1152,7 @@ function InternalMainApp() {
     // has completed. Native credential deletion is unconditional, so allowing a
     // fresh login while it is in flight could delete the newly stored key.
     const releaseCleanupGate = holdAuthCredentialCleanupGate();
+    const stopPushPromise = isNative() ? stopAndroidBackgroundPushOnLogout().catch(() => {}) : Promise.resolve();
     authMutationGenerationRef.current += 1;
     const staleAuthAttempts = [...activeAuthAttemptSettlementsRef.current];
     sharedOpenAbortRef.current?.abort();
@@ -1237,7 +1238,7 @@ function InternalMainApp() {
     try {
       // If an invalidated login was already inside a native credential write,
       // let it settle first so this cleanup is guaranteed to be the last writer.
-      await Promise.allSettled(staleAuthAttempts);
+      await Promise.allSettled([...staleAuthAttempts, stopPushPromise]);
       if (!options?.preserveCredentials) {
         await clearStoredAuthForServer(options?.credentialServerUrl);
       }
@@ -1920,9 +1921,18 @@ function InternalMainApp() {
   // Native: init push notifications after login
   useEffect(() => {
     if (!auth || !isNative()) return;
+    let cancelled = false;
+    const expectedAuth = { userId: auth.userId, baseUrl: auth.baseUrl };
+    const expectedGeneration = authMutationGenerationRef.current;
     getAuthKey(auth.baseUrl).then((key) => {
-      if (key) initPushNotifications(key, auth.baseUrl).catch(console.warn);
-    });
+      if (cancelled || !key) return;
+      if (authMutationGenerationRef.current !== expectedGeneration) return;
+      if (authRef.current?.userId !== expectedAuth.userId || authRef.current?.baseUrl !== expectedAuth.baseUrl) return;
+      initPushNotifications(key, expectedAuth.baseUrl).catch(console.warn);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [auth]);
 
   // Native: clear server-side push badge whenever the app becomes visible with
@@ -7287,6 +7297,8 @@ function InternalMainApp() {
     externalRouteInFlightKeyRef.current = null;
     setOpeningSharedEntryId(null);
     if (isNative()) {
+      // Stop native push immediately without waiting on remote key revocation I/O.
+      const stopPushPromise = stopAndroidBackgroundPushOnLogout().catch(() => {});
       // Native: revoke API key server-side, clear biometric storage
       const credentialServerUrl = auth?.baseUrl ?? nativeServerUrl;
       try {
@@ -7298,7 +7310,7 @@ function InternalMainApp() {
       // Local authority revocation must continue even if Secure Storage is
       // unavailable. In particular, server switching must never carry the old
       // in-memory/localStorage identity into ServerSetupPage.
-      await stopAndroidBackgroundPushOnLogout().catch(() => {});
+      await stopPushPromise;
       await clearStoredAuthForServer(credentialServerUrl);
       clearApiKey();
     } else {

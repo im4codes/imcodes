@@ -13,6 +13,7 @@ import {
 } from '../../../shared/global-task-mode.js';
 import type { PushNotificationType } from '../../../shared/push-notifications.js';
 import type { Database } from '../db/client.js';
+import { pushStreamHub, type PushStreamHub } from './push-stream-hub.js';
 import {
   emitGlobalTaskPgNotify,
   getGlobalTaskSummaryForServerTask,
@@ -57,6 +58,26 @@ type GlobalTaskNotifyEnvelope =
     eventType?: string;
     ts: number;
   }
+  | {
+    kind: 'push_stream';
+    userId: string;
+    eventId: string;
+    title: string;
+    body: string;
+    notificationType?: PushNotificationType;
+    badge?: number;
+    data?: Record<string, string>;
+    ts: number;
+  }
+  | {
+    kind: 'push_credential_revoked';
+    userId: string;
+    keyId?: string;
+    allApiKeys?: boolean;
+    sessionHash?: string;
+    minIssuedAtMs?: number;
+    ts: number;
+  }
   | { kind: 'access_changed'; userId?: string; serverId?: string; ts: number };
 
 const RECONNECT_INITIAL_MS = 1000;
@@ -86,6 +107,11 @@ export class GlobalTaskHub {
   private pgListening = false;
   private connectionString: string | undefined;
   private db: Database | undefined;
+  private pushStreamTarget: PushStreamHub;
+
+  constructor(options?: { pushStreamHub?: PushStreamHub }) {
+    this.pushStreamTarget = options?.pushStreamHub ?? pushStreamHub;
+  }
 
   isPgListening(): boolean {
     return this.pgListening;
@@ -504,6 +530,99 @@ export class GlobalTaskHub {
     }
   }
 
+  async notifyPushStream(
+    db: Database | null,
+    input: {
+      userId: string;
+      eventId: string;
+      title: string;
+      body: string;
+      notificationType?: PushNotificationType;
+      badge?: number;
+      data?: Record<string, string>;
+      ts?: number;
+    },
+  ): Promise<void> {
+    if (!input.userId || !input.eventId || !input.title) return;
+    const activeDb = db ?? this.db ?? null;
+    const notifyObj: Record<string, unknown> = {
+      kind: 'push_stream',
+      userId: input.userId,
+      eventId: input.eventId,
+      title: input.title,
+      body: input.body ?? '',
+      ...(input.notificationType ? { notificationType: input.notificationType } : {}),
+      ...(input.badge != null ? { badge: input.badge } : {}),
+      ...(input.data ? { data: input.data } : {}),
+      ts: Number(input.ts ?? Date.now()) || Date.now(),
+    };
+    const boundedJson = serializeBoundedPgNotifyPayload(notifyObj, 'body', GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
+    await emitGlobalTaskPgNotify(activeDb, boundedJson);
+
+    if (!this.pgListening) {
+      const parsed = JSON.parse(boundedJson) as Extract<GlobalTaskNotifyEnvelope, { kind: 'push_stream' }>;
+      this.pushStreamTarget.publish(parsed.userId, {
+        id: parsed.eventId,
+        title: parsed.title,
+        body: parsed.body,
+        ...(parsed.notificationType ? { type: parsed.notificationType } : {}),
+        ...(parsed.badge != null ? { badge: parsed.badge } : {}),
+        ...(parsed.data ? { data: parsed.data } : {}),
+      });
+    }
+  }
+
+  async notifyPushCredentialRevoked(
+    db: Database | null,
+    input: {
+      userId: string;
+      keyId?: string;
+      allApiKeys?: boolean;
+      sessionHash?: string;
+      minIssuedAtMs?: number;
+    },
+  ): Promise<void> {
+    if (!input.userId) return;
+    const activeDb = db ?? this.db ?? null;
+    const envelope: GlobalTaskNotifyEnvelope = {
+      kind: 'push_credential_revoked',
+      userId: input.userId,
+      ...(input.keyId ? { keyId: input.keyId } : {}),
+      ...(input.allApiKeys ? { allApiKeys: true } : {}),
+      ...(input.sessionHash ? { sessionHash: input.sessionHash } : {}),
+      ...(typeof input.minIssuedAtMs === 'number' ? { minIssuedAtMs: input.minIssuedAtMs } : {}),
+      ts: Date.now(),
+    };
+    await emitGlobalTaskPgNotify(activeDb, JSON.stringify(envelope));
+
+    if (!this.pgListening) {
+      this.applyPushCredentialRevoked(envelope);
+    }
+  }
+
+  private applyPushCredentialRevoked(
+    input: {
+      userId: string;
+      keyId?: string;
+      allApiKeys?: boolean;
+      sessionHash?: string;
+      minIssuedAtMs?: number;
+    },
+  ): void {
+    if (input.keyId) {
+      this.pushStreamTarget.closeByApiKey(input.userId, input.keyId);
+    }
+    if (input.allApiKeys) {
+      this.pushStreamTarget.closeByAllUserApiKeys(input.userId);
+    }
+    if (input.sessionHash || typeof input.minIssuedAtMs === 'number') {
+      this.pushStreamTarget.closeByJwtSession(input.userId, {
+        ...(input.sessionHash ? { sessionHash: input.sessionHash } : {}),
+        ...(typeof input.minIssuedAtMs === 'number' ? { minIssuedAtMs: input.minIssuedAtMs } : {}),
+      });
+    }
+  }
+
   async handleNotifyPayload(rawPayload: string, dbOverride?: Database): Promise<void> {
     let parsed: GlobalTaskNotifyEnvelope;
     try {
@@ -554,6 +673,25 @@ export class GlobalTaskHub {
         ...(parsed.eventType ? { eventType: parsed.eventType } : {}),
         ts: Number(parsed.ts ?? Date.now()) || Date.now(),
       });
+      return;
+    }
+
+    if (parsed.kind === 'push_stream') {
+      if (!parsed.userId || !parsed.eventId || !parsed.title) return;
+      this.pushStreamTarget.publish(parsed.userId, {
+        id: parsed.eventId,
+        title: parsed.title,
+        body: typeof parsed.body === 'string' ? parsed.body : '',
+        ...(parsed.notificationType ? { type: parsed.notificationType } : {}),
+        ...(typeof parsed.badge === 'number' ? { badge: parsed.badge } : {}),
+        ...(parsed.data ? { data: parsed.data } : {}),
+      });
+      return;
+    }
+
+    if (parsed.kind === 'push_credential_revoked') {
+      if (!parsed.userId) return;
+      this.applyPushCredentialRevoked(parsed);
       return;
     }
 

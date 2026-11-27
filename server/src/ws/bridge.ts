@@ -2703,6 +2703,8 @@ export class WsBridge {
    */
   private consoleSubscriptions = new Map<WebSocket, Map<string, { subscriptionId: string; projectName: string; coordinatorSessionName: string }>>();
   private mobileSockets = new Set<WebSocket>();
+  /** Explicit client foreground presence reported via `client.presence`; defaults to true for legacy clients. */
+  private mobileSocketForeground = new Map<WebSocket, boolean>();
   private queue: Array<{ message: string; queuedAt: number }> = [];
   private authTimer: ReturnType<typeof setTimeout> | null = null;
   /**
@@ -7542,7 +7544,10 @@ export class WsBridge {
   ): void {
     this.db = db;
     this.browserSockets.add(ws);
-    if (isMobile) this.mobileSockets.add(ws);
+    if (isMobile) {
+      this.mobileSockets.add(ws);
+      this.mobileSocketForeground.set(ws, true);
+    }
     this.browserSubscriptions.set(ws, new Map());
     this.transportSubscriptions.set(ws, new Set());
     this.timelineSubscriptions.set(ws, new Map());
@@ -7636,6 +7641,13 @@ export class WsBridge {
       if (msg.type === 'ping') {
         const hasValidId = (typeof msg.id === 'number' && Number.isFinite(msg.id)) || typeof msg.id === 'string';
         safeSend(ws, JSON.stringify(hasValidId ? { type: 'pong', id: msg.id } : { type: 'pong' }));
+        return;
+      }
+
+      if (msg.type === 'client.presence') {
+        if (this.mobileSockets.has(ws) && typeof msg.foreground === 'boolean') {
+          this.mobileSocketForeground.set(ws, msg.foreground);
+        }
         return;
       }
 
@@ -11526,6 +11538,7 @@ export class WsBridge {
     this.releaseBrowserConsoleSubscriptions(ws);
     this.browserSockets.delete(ws);
     this.mobileSockets.delete(ws);
+    this.mobileSocketForeground.delete(ws);
     this.browserUserIds.delete(ws);
     this.controlledTargetBrowserSockets.delete(ws);
     this.controlledBrowserReads.remove(ws);
@@ -15666,14 +15679,26 @@ export class WsBridge {
     return { hasMobileSocket, hasDesktopSocket };
   }
 
+  private buildSocketPushSuppressionFlags(userId: string): {
+    suppressTokenPush?: boolean;
+    suppressDesktopPush?: boolean;
+    suppressStreamPush: false;
+  } {
+    const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(userId);
+    return {
+      ...(hasMobileSocket ? { suppressTokenPush: true } : {}),
+      ...(hasMobileSocket && !hasDesktopSocket ? { suppressDesktopPush: true } : {}),
+      suppressStreamPush: false,
+    };
+  }
+
   private async dispatchEventPush(db: Database, env: Env, msg: Record<string, unknown>): Promise<void> {
     const server = this.daemonOwnerUserId && this.serverName
       ? { user_id: this.daemonOwnerUserId, name: this.serverName }
       : await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
-    const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(server.user_id);
-    if (hasMobileSocket && !hasDesktopSocket) return;
+    const suppressionFlags = this.buildSocketPushSuppressionFlags(server.user_id);
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');
@@ -15741,7 +15766,7 @@ export class WsBridge {
         body,
         type: pushType,
         eventId: pushKey,
-        ...(hasMobileSocket ? { suppressMobilePush: true } : {}),
+        ...suppressionFlags,
         data: { serverId: this.serverId, session: sessionName, type: eventType },
       }, env);
       this.deliveredPushKeys.set(pushKey, now);
@@ -15763,8 +15788,7 @@ export class WsBridge {
       : await db.queryOne<{ user_id: string; name: string }>('SELECT user_id, name FROM servers WHERE id = $1', [this.serverId]);
     if (!server) return;
 
-    const { hasMobileSocket, hasDesktopSocket } = this.getUserPushSocketPresence(server.user_id);
-    if (hasMobileSocket && !hasDesktopSocket) return;
+    const suppressionFlags = this.buildSocketPushSuppressionFlags(server.user_id);
 
     const { dispatchPush } = await import('../routes/push.js').catch((err) => {
       logger.error({ err }, 'Failed to import push module — push notifications disabled');
@@ -15847,7 +15871,7 @@ export class WsBridge {
         body,
         type: notifType,
         eventId: pushKey,
-        ...(hasMobileSocket ? { suppressMobilePush: true } : {}),
+        ...suppressionFlags,
         data: {
           serverId: this.serverId,
           ...(sessionName ? { session: sessionName } : {}),

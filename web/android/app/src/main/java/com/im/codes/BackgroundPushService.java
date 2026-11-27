@@ -9,6 +9,7 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.net.ConnectivityManager;
@@ -16,6 +17,8 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.os.Build;
 import android.os.IBinder;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -29,8 +32,11 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
+import java.net.URI;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -67,11 +73,15 @@ public class BackgroundPushService extends Service {
 
     private static final int CONNECT_TIMEOUT_MS = 15_000;
     private static final int READ_TIMEOUT_MS = 75_000;
+    static final long STABLE_CONNECTION_MS = 10_000L;
     private static final long[] BACKOFF_MS = { 2_000L, 4_000L, 8_000L, 15_000L, 30_000L, 60_000L };
 
     private static final AtomicInteger ALERT_ID_SEQ = new AtomicInteger(0);
+    private static final AtomicInteger ACTIVE_SERVICE_GENERATION = new AtomicInteger(0);
     private static volatile boolean serviceRunning = false;
     private static volatile String currentConnectionState = STATE_STOPPED;
+    @Nullable
+    private static volatile BackgroundPushService activeInstance = null;
 
     private final Object stateLock = new Object();
     private volatile boolean stopped = false;
@@ -99,9 +109,19 @@ public class BackgroundPushService extends Service {
         if (!p.getBoolean(KEY_ENABLED, false)) {
             return false;
         }
-        String serverUrl = normalizeServerUrl(p.getString(KEY_SERVER_URL, null));
+        String rawUrl = p.getString(KEY_SERVER_URL, null);
+        String serverUrl = normalizeServerUrl(context, rawUrl);
         String apiKey = p.getString(KEY_API_KEY, null);
-        return serverUrl != null && apiKey != null && !apiKey.trim().isEmpty();
+        if (serverUrl == null || apiKey == null || apiKey.trim().isEmpty()) {
+            // Purge legacy/invalid cleartext config on restore instead of carrying it forward
+            p.edit()
+                    .putBoolean(KEY_ENABLED, false)
+                    .remove(KEY_API_KEY)
+                    .remove(KEY_SERVER_URL)
+                    .commit();
+            return false;
+        }
+        return true;
     }
 
     public static boolean isRunning() {
@@ -127,11 +147,14 @@ public class BackgroundPushService extends Service {
         if (BuildConfig.HAS_FCM || context == null) {
             return false;
         }
-        String serverUrl = normalizeServerUrl(rawServerUrl);
+        String serverUrl = normalizeServerUrl(context, rawServerUrl);
         String apiKey = rawApiKey != null ? rawApiKey.trim() : "";
         if (serverUrl == null || apiKey.isEmpty()) {
             return false;
         }
+
+        // Synchronously invalidate any earlier connection generation before persisting new creds.
+        ACTIVE_SERVICE_GENERATION.incrementAndGet();
 
         SharedPreferences.Editor editor = prefs(context).edit()
                 .putBoolean(KEY_ENABLED, true)
@@ -171,6 +194,7 @@ public class BackgroundPushService extends Service {
         if (context == null) {
             return;
         }
+        ACTIVE_SERVICE_GENERATION.incrementAndGet();
         prefs(context).edit()
                 .putBoolean(KEY_ENABLED, false)
                 .remove(KEY_API_KEY)
@@ -180,6 +204,10 @@ public class BackgroundPushService extends Service {
                 .commit();
         currentConnectionState = STATE_STOPPED;
         serviceRunning = false;
+        BackgroundPushService instance = activeInstance;
+        if (instance != null) {
+            instance.invalidateWorkerAndConnection();
+        }
         BackgroundPushPlugin.notifyStateChanged(STATE_STOPPED, false);
         if (BuildConfig.HAS_FCM) {
             return;
@@ -199,41 +227,51 @@ public class BackgroundPushService extends Service {
         }
 
         ensureNotificationChannels();
+        activeInstance = this;
         stopped = false;
-        updateConnectionState(STATE_CONNECTING);
-
-        Notification notification = buildStatusNotification(STATE_CONNECTING);
-        try {
-            if (Build.VERSION.SDK_INT >= 34) {
-                startForeground(STATUS_NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
-            } else {
-                startForeground(STATUS_NOTIFICATION_ID, notification);
+        final int serviceGen = ACTIVE_SERVICE_GENERATION.get();
+        synchronized (stateLock) {
+            final int nextWorkerGen = workerGeneration + 1;
+            stopped = false;
+            updateConnectionState(serviceGen, workerGeneration, STATE_CONNECTING);
+            Notification notification = buildStatusNotification(STATE_CONNECTING);
+            try {
+                if (Build.VERSION.SDK_INT >= 34) {
+                    startForeground(STATUS_NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING);
+                } else {
+                    startForeground(STATUS_NOTIFICATION_ID, notification);
+                }
+            } catch (RuntimeException e) {
+                Log.w(TAG, "startForeground failed for BackgroundPushService", e);
+                stopForegroundAndSelf(startId);
+                return START_NOT_STICKY;
             }
-        } catch (RuntimeException e) {
-            Log.w(TAG, "startForeground failed for BackgroundPushService", e);
-            stopForegroundAndSelf(startId);
-            return START_NOT_STICKY;
+            serviceRunning = true;
+            registerNetworkCallback();
+            restartWorker(serviceGen, nextWorkerGen);
         }
-
-        serviceRunning = true;
-        registerNetworkCallback();
-        restartWorker();
         BackgroundPushPlugin.notifyStateChanged(currentConnectionState, true);
         return START_STICKY;
     }
 
     @Override
     public void onTimeout(int startId) {
+        ACTIVE_SERVICE_GENERATION.incrementAndGet();
         stopForegroundAndSelf(startId);
     }
 
     @Override
     public void onTimeout(int startId, int fgsType) {
+        ACTIVE_SERVICE_GENERATION.incrementAndGet();
         stopForegroundAndSelf(startId);
     }
 
     @Override
     public void onDestroy() {
+        ACTIVE_SERVICE_GENERATION.incrementAndGet();
+        if (activeInstance == this) {
+            activeInstance = null;
+        }
         stopped = true;
         serviceRunning = false;
         currentConnectionState = STATE_STOPPED;
@@ -250,24 +288,42 @@ public class BackgroundPushService extends Service {
         return null;
     }
 
-    private void restartWorker() {
+    private void invalidateWorkerAndConnection() {
+        stopped = true;
+        stopWorker();
+    }
+
+    private void restartWorker(int serviceGen, int nextWorkerGen) {
         stopWorker();
         synchronized (stateLock) {
-            final int gen = ++workerGeneration;
-            workerThread = new Thread(() -> runStreamLoop(gen), "imcodes-bg-push-sse");
+            stopped = false;
+            workerGeneration = nextWorkerGen;
+            workerThread = new Thread(() -> runStreamLoop(serviceGen, nextWorkerGen), "imcodes-bg-push-sse");
             workerThread.setDaemon(true);
             workerThread.start();
         }
     }
 
     private void stopWorker() {
-        HttpURLConnection conn = activeConnection;
+        final HttpURLConnection conn = activeConnection;
         activeConnection = null;
         if (conn != null) {
-            try {
-                conn.disconnect();
-            } catch (RuntimeException ignored) {
-                // ignore
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                Thread closer = new Thread(() -> {
+                    try {
+                        conn.disconnect();
+                    } catch (Throwable ignored) {
+                        // ignore
+                    }
+                }, "imcodes-bg-push-disconnect");
+                closer.setDaemon(true);
+                closer.start();
+            } else {
+                try {
+                    conn.disconnect();
+                } catch (Throwable ignored) {
+                    // ignore
+                }
             }
         }
         Thread t;
@@ -282,29 +338,30 @@ public class BackgroundPushService extends Service {
         }
     }
 
-    private void runStreamLoop(int myGeneration) {
+    private void runStreamLoop(int myServiceGen, int myWorkerGen) {
         int backoffIdx = 0;
-        while (!stopped && isCurrentWorker(myGeneration) && isConfiguredAndEnabled(this)) {
+        while (isActiveGeneration(myServiceGen, myWorkerGen) && isConfiguredAndEnabled(this)) {
             if (!isNetworkCurrentlyAvailable()) {
-                updateConnectionState(STATE_WAITING_NETWORK);
-                waitForRetryOrNetwork(myGeneration, 30_000L);
+                updateConnectionState(myServiceGen, myWorkerGen, STATE_WAITING_NETWORK);
+                waitForRetryOrNetwork(myServiceGen, myWorkerGen, 30_000L);
                 continue;
             }
 
             SharedPreferences p = prefs(this);
-            String serverUrl = normalizeServerUrl(p.getString(KEY_SERVER_URL, null));
+            String serverUrl = normalizeServerUrl(this, p.getString(KEY_SERVER_URL, null));
             String apiKey = p.getString(KEY_API_KEY, null);
             if (serverUrl == null || apiKey == null || apiKey.trim().isEmpty()) {
                 break;
             }
 
-            boolean connectedOnce = false;
+            final StreamSessionTracker tracker = new StreamSessionTracker(SystemClock::elapsedRealtime);
             HttpURLConnection conn = null;
             try {
-                updateConnectionState(STATE_CONNECTING);
+                updateConnectionState(myServiceGen, myWorkerGen, STATE_CONNECTING);
                 URL url = new URL(serverUrl + "/api/push/stream");
                 conn = (HttpURLConnection) url.openConnection();
                 conn.setRequestMethod("GET");
+                conn.setInstanceFollowRedirects(false);
                 conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
                 conn.setReadTimeout(READ_TIMEOUT_MS);
                 conn.setUseCaches(false);
@@ -315,23 +372,32 @@ public class BackgroundPushService extends Service {
                 conn.setRequestProperty("Connection", "keep-alive");
 
                 activeConnection = conn;
+                if (!isActiveGeneration(myServiceGen, myWorkerGen)) {
+                    break;
+                }
                 int status = conn.getResponseCode();
                 if (status == 401 || status == 403) {
-                    Log.w(TAG, "Push stream authentication rejected with HTTP " + status);
-                    updateConnectionState(STATE_AUTH_ERROR);
+                    if (isActiveGeneration(myServiceGen, myWorkerGen)) {
+                        Log.w(TAG, "Push stream authentication rejected with HTTP " + status);
+                        updateConnectionState(myServiceGen, myWorkerGen, STATE_AUTH_ERROR);
+                    }
                     break;
+                }
+                if (status >= 300 && status < 400) {
+                    throw new IOException("Redirect refused (" + status + ")");
                 }
                 if (status < 200 || status >= 300) {
                     Log.w(TAG, "Push stream connection failed with HTTP " + status);
                     throw new IOException("HTTP " + status);
                 }
+                String contentType = conn.getContentType();
+                if (!isSseContentType(contentType)) {
+                    throw new IOException("Unexpected Content-Type: " + contentType);
+                }
 
-                connectedOnce = true;
-                backoffIdx = 0;
-                updateConnectionState(STATE_CONNECTED);
-                readSseStream(conn, myGeneration);
+                readSseStream(conn, myServiceGen, myWorkerGen, tracker);
             } catch (Exception e) {
-                if (!stopped && isCurrentWorker(myGeneration)) {
+                if (isActiveGeneration(myServiceGen, myWorkerGen)) {
                     Log.w(TAG, "Push SSE stream disconnected: " + e.getMessage());
                 }
             } finally {
@@ -347,35 +413,48 @@ public class BackgroundPushService extends Service {
                 }
             }
 
-            if (stopped || !isCurrentWorker(myGeneration) || !isConfiguredAndEnabled(this)) {
+            if (!isActiveGeneration(myServiceGen, myWorkerGen) || !isConfiguredAndEnabled(this)) {
                 break;
             }
             if (STATE_AUTH_ERROR.equals(currentConnectionState)) {
                 break;
             }
-            long delayMs = connectedOnce ? BACKOFF_MS[0] : BACKOFF_MS[Math.min(backoffIdx, BACKOFF_MS.length - 1)];
-            if (!connectedOnce && backoffIdx < BACKOFF_MS.length - 1) {
-                backoffIdx++;
-            }
-            updateConnectionState(isNetworkCurrentlyAvailable() ? STATE_CONNECTING : STATE_WAITING_NETWORK);
-            waitForRetryOrNetwork(myGeneration, delayMs);
+            boolean resetBackoff = tracker.shouldResetBackoff();
+            long delayMs = computeRetryDelayMs(backoffIdx, resetBackoff);
+            backoffIdx = nextBackoffIndex(backoffIdx, resetBackoff);
+            updateConnectionState(
+                    myServiceGen,
+                    myWorkerGen,
+                    isNetworkCurrentlyAvailable() ? STATE_CONNECTING : STATE_WAITING_NETWORK);
+            waitForRetryOrNetwork(myServiceGen, myWorkerGen, delayMs);
         }
     }
 
-    private void readSseStream(HttpURLConnection conn, int myGeneration) throws IOException {
+    private void readSseStream(
+            HttpURLConnection conn,
+            int myServiceGen,
+            int myWorkerGen,
+            StreamSessionTracker tracker) throws IOException {
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
             String eventId = null;
             String eventType = null;
             StringBuilder dataBuf = new StringBuilder();
             String line;
-            while (!stopped && isCurrentWorker(myGeneration) && (line = reader.readLine()) != null) {
+            while (isActiveGeneration(myServiceGen, myWorkerGen) && (line = reader.readLine()) != null) {
+                if (!isActiveGeneration(myServiceGen, myWorkerGen)) {
+                    break;
+                }
+                if (!tracker.hasReceivedValidFrame() && isValidSseProtocolLine(line)) {
+                    tracker.markFrameReceived();
+                    updateConnectionState(myServiceGen, myWorkerGen, STATE_CONNECTED);
+                }
                 if (line.isEmpty()) {
-                    if (dataBuf.length() > 0) {
+                    if (dataBuf.length() > 0 && isActiveGeneration(myServiceGen, myWorkerGen)) {
                         String finalType = eventType != null ? eventType : "message";
                         String payloadData = dataBuf.toString();
                         if ("push".equals(finalType)) {
-                            handlePushEvent(eventId, payloadData);
+                            handlePushEvent(myServiceGen, myWorkerGen, eventId, payloadData);
                         }
                     }
                     eventId = null;
@@ -420,7 +499,10 @@ public class BackgroundPushService extends Service {
         }
     }
 
-    private void handlePushEvent(@Nullable String eventId, String jsonStr) {
+    private void handlePushEvent(int myServiceGen, int myWorkerGen, @Nullable String eventId, String jsonStr) {
+        if (!isActiveGeneration(myServiceGen, myWorkerGen)) {
+            return;
+        }
         try {
             JSONObject obj = new JSONObject(jsonStr);
             String title = obj.optString("title", getString(R.string.bg_push_notification_title));
@@ -429,18 +511,23 @@ public class BackgroundPushService extends Service {
             String serverId = data != null ? data.optString("serverId", "") : "";
             String session = data != null ? data.optString("session", "") : "";
 
-            showAlertNotification(eventId, title, body, serverId, session);
+            showAlertNotification(myServiceGen, myWorkerGen, eventId, title, body, serverId, session);
         } catch (Exception e) {
             Log.w(TAG, "Failed to parse push SSE event", e);
         }
     }
 
     private void showAlertNotification(
+            int myServiceGen,
+            int myWorkerGen,
             @Nullable String eventId,
             String title,
             String body,
             String serverId,
             String session) {
+        if (!isActiveGeneration(myServiceGen, myWorkerGen)) {
+            return;
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
                 && ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                         != PackageManager.PERMISSION_GRANTED) {
@@ -485,7 +572,9 @@ public class BackgroundPushService extends Service {
                 .setContentIntent(contentIntent);
 
         try {
-            manager.notify(notificationId, builder.build());
+            if (isActiveGeneration(myServiceGen, myWorkerGen)) {
+                manager.notify(notificationId, builder.build());
+            }
         } catch (RuntimeException e) {
             Log.w(TAG, "Failed to post alert notification", e);
         }
@@ -560,7 +649,10 @@ public class BackgroundPushService extends Service {
                 .build();
     }
 
-    private void updateConnectionState(String nextState) {
+    private void updateConnectionState(int myServiceGen, int myWorkerGen, String nextState) {
+        if (!isActiveGeneration(myServiceGen, myWorkerGen)) {
+            return;
+        }
         boolean changed = !nextState.equals(currentConnectionState);
         currentConnectionState = nextState;
         if (serviceRunning) {
@@ -578,15 +670,19 @@ public class BackgroundPushService extends Service {
         }
     }
 
+    private boolean isActiveGeneration(int myServiceGen, int myWorkerGen) {
+        return !stopped && ACTIVE_SERVICE_GENERATION.get() == myServiceGen && isCurrentWorker(myWorkerGen);
+    }
+
     private boolean isCurrentWorker(int myGeneration) {
         synchronized (stateLock) {
             return myGeneration == workerGeneration;
         }
     }
 
-    private void waitForRetryOrNetwork(int myGeneration, long delayMs) {
+    private void waitForRetryOrNetwork(int myServiceGen, int myWorkerGen, long delayMs) {
         synchronized (stateLock) {
-            if (stopped || myGeneration != workerGeneration) {
+            if (!isActiveGeneration(myServiceGen, myWorkerGen)) {
                 return;
             }
             try {
@@ -694,18 +790,127 @@ public class BackgroundPushService extends Service {
         return context.getApplicationContext().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
     }
 
+    private static boolean isDebugBuild(@Nullable Context context) {
+        if (context == null || context.getApplicationInfo() == null) {
+            return false;
+        }
+        return (context.getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0;
+    }
+
+    private static boolean isLoopbackHost(@Nullable String host) {
+        if (host == null) {
+            return false;
+        }
+        String lower = host.trim().toLowerCase(Locale.ROOT);
+        return "localhost".equals(lower)
+                || "127.0.0.1".equals(lower)
+                || "::1".equals(lower)
+                || "[::1]".equals(lower);
+    }
+
     @Nullable
-    private static String normalizeServerUrl(@Nullable String raw) {
+    static String normalizeServerUrl(@Nullable Context context, @Nullable String raw) {
+        return normalizeServerUrl(raw, isDebugBuild(context));
+    }
+
+    @Nullable
+    static String normalizeServerUrl(@Nullable String raw, boolean allowDebugLoopback) {
         if (raw == null) {
             return null;
         }
         String trimmed = raw.trim();
-        if (!(trimmed.startsWith("https://") || trimmed.startsWith("http://"))) {
+        if (trimmed.isEmpty()) {
             return null;
         }
         while (trimmed.endsWith("/")) {
             trimmed = trimmed.substring(0, trimmed.length() - 1);
         }
-        return trimmed.isEmpty() ? null : trimmed;
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        URI uri;
+        try {
+            uri = new URI(trimmed);
+        } catch (URISyntaxException e) {
+            return null;
+        }
+        String scheme = uri.getScheme();
+        String host = uri.getHost();
+        if (scheme == null || host == null || host.isEmpty() || uri.getUserInfo() != null) {
+            return null;
+        }
+        if ("https".equalsIgnoreCase(scheme)) {
+            return trimmed;
+        }
+        if ("http".equalsIgnoreCase(scheme) && allowDebugLoopback && isLoopbackHost(host)) {
+            return trimmed;
+        }
+        return null;
+    }
+
+    static boolean isSseContentType(@Nullable String contentType) {
+        if (contentType == null) {
+            return false;
+        }
+        String normalized = contentType.trim().toLowerCase(Locale.ROOT);
+        return normalized.equals("text/event-stream") || normalized.startsWith("text/event-stream;");
+    }
+
+    static boolean isValidSseProtocolLine(@Nullable String line) {
+        if (line == null || line.isEmpty()) {
+            return false;
+        }
+        return line.startsWith(":")
+                || line.startsWith("id:")
+                || line.startsWith("event:")
+                || line.startsWith("data:")
+                || line.startsWith("retry:");
+    }
+
+    static long computeRetryDelayMs(int backoffIdx, boolean resetBackoff) {
+        if (resetBackoff) {
+            return BACKOFF_MS[0];
+        }
+        int clamped = Math.max(0, Math.min(backoffIdx, BACKOFF_MS.length - 1));
+        return BACKOFF_MS[clamped];
+    }
+
+    static int nextBackoffIndex(int backoffIdx, boolean resetBackoff) {
+        if (resetBackoff) {
+            return 0;
+        }
+        return Math.min(backoffIdx + 1, BACKOFF_MS.length - 1);
+    }
+
+    interface Clock {
+        long elapsedMs();
+    }
+
+    static final class StreamSessionTracker {
+        private final Clock clock;
+        private boolean frameReceived = false;
+        private long firstFrameAtMs = -1L;
+
+        StreamSessionTracker(Clock clock) {
+            this.clock = clock;
+        }
+
+        boolean hasReceivedValidFrame() {
+            return frameReceived;
+        }
+
+        void markFrameReceived() {
+            if (!frameReceived) {
+                frameReceived = true;
+                firstFrameAtMs = clock.elapsedMs();
+            }
+        }
+
+        boolean shouldResetBackoff() {
+            if (!frameReceived || firstFrameAtMs < 0L) {
+                return false;
+            }
+            return (clock.elapsedMs() - firstFrameAtMs) >= STABLE_CONNECTION_MS;
+        }
     }
 }

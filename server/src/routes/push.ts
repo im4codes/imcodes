@@ -12,13 +12,14 @@
  * servers detect "I have no push credentials configured" and relay everything
  * via POST /api/push/relay back to the central server.
  */
-import { USER_STATUS, isUserStatusActive, userStatusDenialCode } from '../../../shared/user-status.js';
+import { USER_STATUS, isUserStatusActive } from '../../../shared/user-status.js';
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import type { Database } from '../db/client.js';
-import { requireAuth } from '../security/authorization.js';
-import { loadUserAccess } from '../security/user-status.js';
-import { timingSafeEqual } from '../security/crypto.js';
+import { timingSafeEqual, sha256Hex } from '../security/crypto.js';
+import { getCookieFromHeader, requireAuth } from '../security/authorization.js';
+import { evaluateUserAccess, loadUserAccess } from '../security/user-status.js';
+import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { MemoryRateLimiter } from '../ws/rate-limiter.js';
 import { SignJWT, importPKCS8 } from 'jose';
 import logger from '../util/logger.js';
@@ -40,9 +41,18 @@ import {
 import { listAccessibleControlledMachines } from '../share/machine-access.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
 import { globalTaskHub } from '../services/global-task-hub.js';
-import { PUSH_STREAM_KEEPALIVE_MS, pushStreamHub } from '../services/push-stream-hub.js';
+import { PUSH_STREAM_KEEPALIVE_MS, PUSH_STREAM_MAX_BUFFERED_CHUNKS, pushStreamHub, type PushStreamCredential } from '../services/push-stream-hub.js';
 
-export const pushRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
+export const pushRoutes = new Hono<{
+  Bindings: Env;
+  Variables: {
+    userId: string;
+    role: string;
+    keyId?: string;
+    authIssuedAt?: number;
+    authServerId?: string;
+  };
+}>();
 
 const APNS_DEVICE_TOKEN_RE = /^[0-9a-fA-F]{64,200}$/;
 const pushRelayRateLimiter = new MemoryRateLimiter();
@@ -51,6 +61,73 @@ const PUSH_RELAY_RATE_WINDOW_MS = 60_000;
 
 export function isValidApnsDeviceToken(token: string): boolean {
   return APNS_DEVICE_TOKEN_RE.test(token);
+}
+
+function resolveRequestCredential(
+  c: { req: { header(name: string): string | undefined }; get(key: never): unknown },
+): PushStreamCredential {
+  const keyId = c.get('keyId' as never) as string | undefined;
+  if (keyId) {
+    return { kind: 'api_key', keyId };
+  }
+  const serverId = c.get('authServerId' as never) as string | undefined;
+  if (serverId) {
+    return { kind: 'daemon', serverId };
+  }
+  const issuedAt = c.get('authIssuedAt' as never) as number | undefined;
+  const authHeader = c.req.header('Authorization');
+  let rawJwt: string | undefined;
+  if (authHeader?.startsWith('Bearer ')) {
+    rawJwt = authHeader.slice(7).trim();
+  } else {
+    rawJwt = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
+  }
+  const sessionHash = rawJwt ? sha256Hex(rawJwt) : undefined;
+  if (issuedAt !== undefined || sessionHash) {
+    return {
+      kind: 'jwt',
+      ...(issuedAt !== undefined ? { issuedAt } : {}),
+      ...(sessionHash ? { sessionHash } : {}),
+    };
+  }
+  return { kind: 'unknown' };
+}
+
+export async function isPushStreamCredentialActive(
+  db: Database,
+  userId: string,
+  credential: PushStreamCredential,
+): Promise<boolean> {
+  const access = await loadUserAccess(db, userId);
+  if (!evaluateUserAccess(access, credential.issuedAt).ok) {
+    return false;
+  }
+  if (credential.kind === 'api_key' && credential.keyId) {
+    const row = await db.queryOne<{ id: string }>(
+      `SELECT id FROM api_keys
+        WHERE id = $1 AND user_id = $2
+          AND revoked_at IS NULL
+          AND (grace_expires_at IS NULL OR grace_expires_at > $3)`,
+      [credential.keyId, userId, Date.now()],
+    );
+    return row != null;
+  }
+  if (credential.kind === 'jwt' && credential.sessionHash) {
+    const revoked = await db.queryOne<{ session_hash: string }>(
+      `SELECT session_hash FROM remote_desktop_web_session_revocations
+        WHERE session_hash = $1 AND user_id = $2 AND expires_at > $3`,
+      [credential.sessionHash, userId, Date.now()],
+    );
+    return revoked == null;
+  }
+  if (credential.kind === 'daemon' && credential.serverId) {
+    const srv = await db.queryOne<{ revoked_at: number | null }>(
+      'SELECT revoked_at FROM servers WHERE id = $1',
+      [credential.serverId],
+    );
+    return srv != null && srv.revoked_at == null;
+  }
+  return true;
 }
 
 // Auth required for register/unregister/preferences/stream; relay is protected by optional PUSH_RELAY_SECRET + rate limit
@@ -62,12 +139,20 @@ pushRoutes.use('/stream', requireAuth());
 // GET /api/push/stream — lightweight SSE push stream for native clients without FCM (e.g. Android withoutFcm)
 pushRoutes.get('/stream', async (c) => {
   const userId = c.get('userId' as never) as string;
-  const access = await loadUserAccess(c.env.DB, userId).catch(() => null);
+  const credential = resolveRequestCredential(c);
+  let access: Awaited<ReturnType<typeof loadUserAccess>>;
+  try {
+    access = await loadUserAccess(c.env.DB, userId);
+  } catch (err) {
+    logger.warn({ err, userId }, 'Push stream user access lookup failed');
+    return c.json({ error: 'service_unavailable' }, 503);
+  }
   if (!access) {
     return c.json({ error: 'unauthorized' }, 401);
   }
-  if (!isUserStatusActive(access.status)) {
-    return c.json({ error: userStatusDenialCode(access.status) }, 403);
+  const decision = evaluateUserAccess(access, credential.issuedAt);
+  if (!decision.ok) {
+    return c.json({ error: decision.code }, 403);
   }
 
   const encoder = new TextEncoder();
@@ -82,6 +167,12 @@ pushRoutes.get('/stream', async (c) => {
 
       const sendChunk = (chunk: string): boolean => {
         if (cleaned) return false;
+        const desired = controller.desiredSize;
+        if (desired !== null && desired <= -PUSH_STREAM_MAX_BUFFERED_CHUNKS) {
+          logger.warn({ userId, desiredSize: desired }, 'Closing slow SSE push stream consumer');
+          cleanup();
+          return false;
+        }
         try {
           controller.enqueue(encoder.encode(chunk));
           return true;
@@ -129,6 +220,7 @@ pushRoutes.get('/stream', async (c) => {
       unsubscribe = pushStreamHub.subscribe(userId, {
         send: sendChunk,
         close: cleanup,
+        credential,
       });
 
       signal.addEventListener('abort', onAbort, { once: true });
@@ -139,9 +231,26 @@ pushRoutes.get('/stream', async (c) => {
       }
 
       keepaliveTimer = setInterval(() => {
-        if (!sendChunk(': keepalive\n\n')) {
-          cleanup();
-        }
+        if (cleaned) return;
+        void isPushStreamCredentialActive(c.env.DB, userId, credential)
+          .then((active) => {
+            if (cleaned) return;
+            if (!active) {
+              cleanup();
+              return;
+            }
+            if (!sendChunk(': keepalive\n\n')) {
+              cleanup();
+            }
+          })
+          .catch((err) => {
+            // Transient DB hiccup must not revoke/abort an active SSE session prematurely;
+            // keepalive continues and next tick re-checks DB state.
+            logger.warn({ err, userId }, 'Push stream credential revalidation failed (transient)');
+            if (!cleaned && !sendChunk(': keepalive\n\n')) {
+              cleanup();
+            }
+          });
       }, PUSH_STREAM_KEEPALIVE_MS);
       if (typeof (keepaliveTimer as { unref?: () => void }).unref === 'function') {
         (keepaliveTimer as { unref: () => void }).unref();
@@ -452,6 +561,8 @@ export interface PushPayload {
   serverId?: string;
   eventId?: string;
   suppressMobilePush?: boolean;
+  suppressTokenPush?: boolean;
+  suppressStreamPush?: boolean;
   suppressDesktopPush?: boolean;
 }
 
@@ -497,7 +608,15 @@ function resolvePushEventId(payload: PushPayload, targetServerId: string | null)
  */
 export async function dispatchPush(payload: PushPayload, env: Env): Promise<void>;
 export async function dispatchPush(payload: PushPayload, db: Database, env?: Env): Promise<void>;
-export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database, maybeEnv?: Env): Promise<void> {
+export async function dispatchPush(
+  payload: PushPayload,
+  envOrDb: Env | Database,
+  maybeEnv?: Env,
+  hubOverrides?: {
+    globalHub?: typeof globalTaskHub;
+    streamHub?: typeof pushStreamHub;
+  },
+): Promise<void> {
   let db: Database;
   let env: Env;
 
@@ -508,6 +627,8 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
     db = envOrDb as Database;
     env = maybeEnv!;
   }
+  const taskHub = hubOverrides?.globalHub ?? globalTaskHub;
+  const streamHub = hubOverrides?.streamHub ?? pushStreamHub;
 
   const targetServerId = resolvePushPayloadServerId(payload);
 
@@ -575,13 +696,15 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   const desktopAllowed = userNotificationTypes !== null
     ? (!payload.type || userNotificationTypes.includes(payload.type))
     : (matchingTokens.length > 0 || !payload.type);
-  const streamAllowed = userNotificationTypes !== null
-    ? (!payload.type || userNotificationTypes.includes(payload.type))
-    : (!payload.type || DEFAULT_PUSH_NOTIFICATION_TYPES.includes(payload.type) || matchingTokens.length > 0);
+  const streamAllowed = desktopAllowed;
 
   const wantsDesktop = desktopAllowed && !payload.suppressDesktopPush;
-  const wantsTokenMobile = matchingTokens.length > 0 && !payload.suppressMobilePush;
-  const wantsStreamMobile = streamAllowed && !payload.suppressMobilePush && pushStreamHub.hasSubscribers(payload.userId);
+  const wantsTokenMobile = matchingTokens.length > 0 && !payload.suppressMobilePush && !payload.suppressTokenPush;
+  const wantsStreamMobile = streamAllowed && (
+    payload.suppressStreamPush === false
+      ? true
+      : (!payload.suppressMobilePush && !payload.suppressStreamPush)
+  );
 
   if (!wantsDesktop && !wantsTokenMobile && !wantsStreamMobile) return;
 
@@ -597,7 +720,7 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
   const eventId = resolvePushEventId(payload, targetServerId);
 
   if (wantsDesktop) {
-    await globalTaskHub.notifyPushNotification(db, {
+    await taskHub.notifyPushNotification(db, {
       userId: payload.userId,
       eventId,
       title: payload.title,
@@ -615,27 +738,37 @@ export async function dispatchPush(payload: PushPayload, envOrDb: Env | Database
 
   if (!wantsTokenMobile && !wantsStreamMobile) return;
 
-  // Atomically increment badge count and read the new value
-  let badgeCount = 1;
-  try {
-    const rows = await db.query<{ badge_count: number }>(
-      'UPDATE users SET badge_count = badge_count + 1 WHERE id = $1 RETURNING badge_count',
-      [payload.userId],
-    );
-    if (rows.length > 0) badgeCount = rows[0].badge_count;
-  } catch (err) {
-    logger.warn({ err, userId: payload.userId }, 'Failed to increment badge_count — falling back to 1');
+  const shouldIncrementBadge = wantsTokenMobile
+    || (wantsStreamMobile && (streamHub.hasSubscribers(payload.userId) || taskHub.isPgListening()));
+
+  // Atomically increment badge count once on the source replica before publishing
+  let badgeCount: number | undefined;
+  if (shouldIncrementBadge) {
+    badgeCount = 1;
+    try {
+      const rows = await db.query<{ badge_count: number }>(
+        'UPDATE users SET badge_count = badge_count + 1 WHERE id = $1 RETURNING badge_count',
+        [payload.userId],
+      );
+      if (rows.length > 0) badgeCount = rows[0].badge_count;
+    } catch (err) {
+      logger.warn({ err, userId: payload.userId }, 'Failed to increment badge_count — falling back to 1');
+    }
+    payload.badge = badgeCount;
   }
-  payload.badge = badgeCount;
 
   if (wantsStreamMobile) {
-    pushStreamHub.publish(payload.userId, {
-      id: eventId,
+    await taskHub.notifyPushStream(db, {
+      userId: payload.userId,
+      eventId,
       title: payload.title,
       body: payload.body,
-      ...(payload.type ? { type: payload.type } : {}),
-      badge: badgeCount,
+      ...(payload.type ? { notificationType: payload.type } : {}),
+      ...(badgeCount != null ? { badge: badgeCount } : {}),
       ...(payload.data ? { data: payload.data } : {}),
+      ts: Date.now(),
+    }).catch((err) => {
+      logger.warn({ err, userId: payload.userId }, 'SSE pushStream notification emit failed');
     });
   }
 

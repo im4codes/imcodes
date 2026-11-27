@@ -6,6 +6,7 @@
 
 export const MAX_PUSH_STREAMS_PER_USER = 5;
 export const PUSH_STREAM_KEEPALIVE_MS = 30_000;
+export const PUSH_STREAM_MAX_BUFFERED_CHUNKS = 16;
 
 export interface PushStreamEvent {
   id: string;
@@ -16,9 +17,18 @@ export interface PushStreamEvent {
   data?: Record<string, string>;
 }
 
+export interface PushStreamCredential {
+  kind: 'api_key' | 'jwt' | 'daemon' | 'unknown';
+  keyId?: string;
+  issuedAt?: number;
+  sessionHash?: string;
+  serverId?: string;
+}
+
 export interface PushStreamSubscription {
   send: (sseFrame: string) => boolean;
   close: () => void;
+  credential?: PushStreamCredential;
 }
 
 function sanitizeSseId(id: string): string {
@@ -114,6 +124,62 @@ export class PushStreamHub {
     for (const [userId, subs] of this.subscribers) {
       if (subs.size > 0) out.add(userId);
     }
+  }
+
+  collectLiveCredentials(): Array<{ userId: string; credential: PushStreamCredential }> {
+    const out: Array<{ userId: string; credential: PushStreamCredential }> = [];
+    for (const [userId, subs] of this.subscribers) {
+      for (const sub of subs) {
+        if (sub.credential) out.push({ userId, credential: sub.credential });
+      }
+    }
+    return out;
+  }
+
+  closeMatchingSubscriptions(predicate: (userId: string, sub: PushStreamSubscription) => boolean): number {
+    let closed = 0;
+    for (const [userId, subs] of [...this.subscribers]) {
+      for (const sub of [...subs]) {
+        if (!predicate(userId, sub)) continue;
+        subs.delete(sub);
+        closed += 1;
+        try {
+          sub.close();
+        } catch {
+          // ignore
+        }
+      }
+      if (subs.size === 0) {
+        this.subscribers.delete(userId);
+      }
+    }
+    return closed;
+  }
+
+  closeByApiKey(userId: string, keyId: string): number {
+    if (!keyId) return 0;
+    return this.closeMatchingSubscriptions(
+      (uid, sub) => (!userId || uid === userId) && sub.credential?.kind === 'api_key' && sub.credential.keyId === keyId,
+    );
+  }
+
+  closeByAllUserApiKeys(userId: string): number {
+    if (!userId) return 0;
+    return this.closeMatchingSubscriptions(
+      (uid, sub) => uid === userId && sub.credential?.kind === 'api_key',
+    );
+  }
+
+  closeByJwtSession(userId: string, opts?: { sessionHash?: string; minIssuedAtMs?: number }): number {
+    if (!userId) return 0;
+    return this.closeMatchingSubscriptions((uid, sub) => {
+      if (uid !== userId || sub.credential?.kind !== 'jwt') return false;
+      if (opts?.sessionHash && sub.credential.sessionHash === opts.sessionHash) return true;
+      if (typeof opts?.minIssuedAtMs === 'number' && typeof sub.credential.issuedAt === 'number') {
+        return sub.credential.issuedAt * 1000 < opts.minIssuedAtMs;
+      }
+      return false;
+    });
   }
 
   closeInactiveUsers(inactiveUserIds: ReadonlySet<string>): number {

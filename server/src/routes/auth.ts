@@ -22,6 +22,8 @@ import logger from '../util/logger.js';
 import { CLIENT_TIMEZONE_HEADER } from '../../../shared/http-header-names.js';
 import { rememberClientTimezone } from '../util/client-timezone.js';
 import { revokeBrowserAccountSession } from '../services/remote-desktop-account-auth.js';
+import { globalTaskHub } from '../services/global-task-hub.js';
+import { getCookieFromHeader } from '../security/authorization.js';
 import { r2RelayConfig } from '../services/r2-relay.js';
 
 export const authRoutes = new Hono<{ Bindings: Env; Variables: { userId: string; role: string } }>();
@@ -295,6 +297,7 @@ authRoutes.delete('/user/:id/key', async (c) => {
     'UPDATE api_keys SET revoked_at = $1 WHERE user_id = $2 AND revoked_at IS NULL',
     [now, userId],
   );
+  await globalTaskHub.notifyPushCredentialRevoked(c.env.DB, { userId, allApiKeys: true });
 
   const ip = c.get('clientIp' as never) as string ?? 'unknown';
   await logAuthAudit(c, { userId, action: 'auth.revoke_keys', ip }, c.env.DB);
@@ -366,6 +369,7 @@ authRoutes.delete('/user/me/keys/:keyId', async (c) => {
     'UPDATE api_keys SET revoked_at = $1 WHERE id = $2 AND user_id = $3',
     [now, keyId, userId],
   );
+  await globalTaskHub.notifyPushCredentialRevoked(c.env.DB, { userId, keyId });
 
   // Kick all daemon WebSocket connections that were bound using this API key
   const boundServers = await c.env.DB.query<{ id: string }>(
@@ -1069,14 +1073,18 @@ authRoutes.post('/password/change', async (c) => {
         'INSERT INTO refresh_tokens (id, user_id, token_hash, family_id, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)',
         [randomHex(16), userId, sha256Hex(refreshRaw), randomHex(16), txNow + 30 * 24 * 3600 * 1000, txNow],
       );
-      return { ok: true as const, accessToken, refreshRaw };
+      return { ok: true as const, accessToken, refreshRaw, newValidAfter };
     }
-    return { ok: true as const, accessToken: null, refreshRaw: null };
+    return { ok: true as const, accessToken: null, refreshRaw: null, newValidAfter };
   });
 
   if (!changeTx.ok) {
     return c.json({ error: changeTx.error }, changeTx.status);
   }
+  await globalTaskHub.notifyPushCredentialRevoked(c.env.DB, {
+    userId,
+    minIssuedAtMs: changeTx.newValidAfter,
+  });
 
   if (changeTx.accessToken && changeTx.refreshRaw) {
     const isSecure = c.env.NODE_ENV === 'production';
@@ -1116,12 +1124,25 @@ authRoutes.post('/logout', async (c) => {
   deleteCookie(c, 'rcc_refresh', { path: '/' });
   deleteCookie(c, COOKIE_CSRF, { path: '/' });
 
+  const cookieToken = getCookieFromHeader(c.req.header('cookie'), COOKIE_SESSION);
+  const bearerHeader = c.req.header('Authorization');
+  const bearerJwt = bearerHeader?.startsWith('Bearer ') && !bearerHeader.slice(7).startsWith('deck_')
+    ? bearerHeader.slice(7).trim()
+    : undefined;
+  const sessionToken = cookieToken || bearerJwt;
+
   // Invalidate all active refresh tokens for the user
   if (userId) {
     await c.env.DB.execute(
       'UPDATE refresh_tokens SET used_at = $1 WHERE user_id = $2 AND used_at IS NULL',
       [Date.now(), userId],
     );
+    if (sessionToken) {
+      await globalTaskHub.notifyPushCredentialRevoked(c.env.DB, {
+        userId,
+        sessionHash: sha256Hex(sessionToken),
+      });
+    }
   }
 
   return c.json({ ok: true });

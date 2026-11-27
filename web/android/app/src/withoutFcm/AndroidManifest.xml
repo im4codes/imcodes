@@ -4,7 +4,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <application>
+    <application
+        android:fullBackupContent="@xml/without_fcm_backup_rules"
+        android:dataExtractionRules="@xml/without_fcm_data_extraction_rules">
         <service
             android:name=".BackgroundPushService"
             android:exported="false"

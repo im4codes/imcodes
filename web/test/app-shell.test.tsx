@@ -13844,4 +13844,60 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     });
     expect(screen.getByTestId('server-icon-srv-1').getAttribute('data-status')).toBe('offline');
   });
+
+  it('P0-3: stops native background push before hanging key-revocation I/O, on change_server, and fences deferred getAuthKey after logout', async () => {
+    const pushMod = await import('../src/push-notifications.js');
+    vi.mocked(pushMod.initPushNotifications).mockClear();
+    vi.mocked(pushMod.stopAndroidBackgroundPushOnLogout).mockClear();
+
+    let resolvePushAuthKey!: (key: string | null) => void;
+    let resolveDeleteKey!: () => void;
+    nativeState.value = true;
+    getServerUrlMock.mockResolvedValue('https://server-a.example');
+    let authKeyCalls = 0;
+    getAuthKeyMock.mockImplementation(() => {
+      authKeyCalls += 1;
+      if (authKeyCalls === 1) {
+        return Promise.resolve('initial-key-a');
+      }
+      return new Promise<string | null>((r) => {
+        resolvePushAuthKey = r;
+      });
+    });
+    getAuthKeyIdMock.mockResolvedValue('hanging-key-id');
+    apiFetchMock.mockImplementation(async (path: string, init?: { method?: string }) => {
+      if (path === '/api/auth/user/me') return { id: 'user-race' };
+      if (path === '/api/server') return { servers: [] };
+      if (path === '/api/auth/user/me/keys/hanging-key-id' && init?.method === 'DELETE') {
+        return new Promise<Record<string, unknown>>((r) => {
+          resolveDeleteKey = () => r({ ok: true });
+        });
+      }
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    await waitFor(() => expect(authKeyCalls).toBeGreaterThanOrEqual(2));
+    fireEvent.click(await screen.findByText('Log Out'));
+
+    // stopAndroidBackgroundPushOnLogout runs BEFORE hanging DELETE key request settles
+    await waitFor(() => expect(pushMod.stopAndroidBackgroundPushOnLogout).toHaveBeenCalled());
+    // Resolve deferred getAuthKey after logout started -> initPushNotifications must NOT run with stale key
+    resolvePushAuthKey('stale-key-a');
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(pushMod.initPushNotifications).not.toHaveBeenCalled();
+
+    // Unblock hanging DELETE so logout finishes cleanly
+    await waitFor(() => expect(resolveDeleteKey).toBeTypeOf('function'));
+    resolveDeleteKey();
+    expect(await screen.findByRole('button', { name: 'login-page' })).toBeTruthy();
+
+    // Also verify clearAuthState via expired auth stops native background push
+    vi.mocked(pushMod.stopAndroidBackgroundPushOnLogout).mockClear();
+    authExpiredState.handler?.('token expired');
+    await waitFor(() => expect(pushMod.stopAndroidBackgroundPushOnLogout).toHaveBeenCalled());
+  }, 20_000);
 });
