@@ -1907,4 +1907,76 @@ describe('useQuickData persistence guard', () => {
     expect(quick.data.historyTimestamps).toEqual({ B: 2000, A: 1000 });
     expect(quick.data.sessionHistoryTimestamps?.s1).toEqual({ B: 2000, A: 1000 });
   });
+
+  it('rebases pending debounce tuple atomically on visibilitychange refresh before immediate pagehide so concurrent B/v1 is not overwritten', async () => {
+    setMockAuthIdentity('user-1', 'https://host.test/app');
+    let quick!: ReturnType<typeof useQuickData>;
+    function VisibilityPagehideHarness() {
+      quick = useQuickData();
+      return <div data-testid="hist">{quick.data.history.join(',')}</div>;
+    }
+
+    let serverSnapshot: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
+    let serverVersion = 'v1:0';
+    let getCount = 0;
+
+    apiFetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === '/api/quick-data' && (!init?.method || init.method === 'GET')) {
+        getCount += 1;
+        if (getCount === 2) {
+          // Concurrent device committed B at v1:1 before visibilitychange GET ran.
+          serverSnapshot = {
+            history: ['B'],
+            sessionHistory: { s1: ['B'] },
+            historyTimestamps: { B: 3000 },
+            sessionHistoryTimestamps: { s1: { B: 3000 } },
+            commands: [],
+            phrases: [],
+          };
+          serverVersion = 'v1:1';
+        }
+        return { data: serverSnapshot, version: serverVersion };
+      }
+      if (url === '/api/quick-data' && init?.method === 'PUT') {
+        const parsed = JSON.parse(String(init.body)) as { data: QuickData; expectedVersion?: string };
+        expect(parsed.expectedVersion).toBe('v1:1');
+        if (parsed.expectedVersion !== serverVersion) {
+          const err = new Error('API 409: version_conflict') as Error & { status: number; body: string };
+          err.status = 409;
+          err.body = JSON.stringify({ error: 'version_conflict', data: serverSnapshot, version: serverVersion });
+          throw err;
+        }
+        serverSnapshot = parsed.data;
+        serverVersion = 'v1:2';
+        return { ok: true, version: serverVersion };
+      }
+      return { ok: true };
+    });
+
+    const view = render(<VisibilityPagehideHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    // User adds A within 2s debounce window (bound initially to v1:0).
+    vi.setSystemTime(2000);
+    act(() => { quick.recordHistory('A', 's1'); });
+    expect(screen.getByTestId('hist').textContent).toBe('A');
+
+    // Visibilitychange refreshes from server -> sees B/v1:1 and rebases pending tuple to [B, A] / v1:1.
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true });
+    await act(async () => {
+      document.dispatchEvent(new Event('visibilitychange'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('hist').textContent).toBe('B,A');
+
+    // Immediate pagehide flushes using the rebased tuple -> B and A + both timestamps are preserved!
+    window.dispatchEvent(new Event('pagehide'));
+    await waitFor(() => expect(serverVersion).toBe('v1:2'));
+    expect(serverSnapshot.history).toEqual(['B', 'A']);
+    expect(serverSnapshot.historyTimestamps).toEqual({ B: 3000, A: 2000 });
+    expect(serverSnapshot.sessionHistory.s1).toEqual(['B', 'A']);
+    expect(serverSnapshot.sessionHistoryTimestamps?.s1).toEqual({ B: 3000, A: 2000 });
+    view.unmount();
+  });
 });

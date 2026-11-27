@@ -17,8 +17,10 @@ vi.mock('../src/components/file-browser-lazy.js', () => ({
 
 import { EXPECTED_USER_ID_HEADER } from '../../shared/http-header-names.js';
 import {
+  apiFetch,
   configure,
   configureExpectedUserId,
+  onAuthExpired,
   resetRefreshStateForTesting,
 } from '../src/api.js';
 import {
@@ -39,6 +41,7 @@ describe('quick-data 401 refresh retry isolation across account/server switches'
 
   afterEach(() => {
     __resetQuickDataForTests();
+    onAuthExpired(() => undefined);
     configureExpectedUserId(null);
     configure('');
     resetRefreshStateForTesting();
@@ -145,5 +148,94 @@ describe('quick-data 401 refresh retry isolation across account/server switches'
     }
     expect(keys.some((k) => k.includes(encodeURIComponent('https://host.test/tenant-a|user-a')))).toBe(true);
     expect(keys.some((k) => k.includes(encodeURIComponent('https://host.test/tenant-b|user-b')))).toBe(false);
+  });
+
+  it('does not trigger onAuthExpired when 409 version_conflict payload contains auth_identity_changed or expected_user_id_mismatch as ordinary history text, while still triggering logout on real top-level 409 identity errors', async () => {
+    const authExpiredCalls: Array<string | undefined> = [];
+    onAuthExpired((reason) => {
+      authExpiredCalls.push(reason);
+    });
+
+    configure('https://host.test/app');
+    configureExpectedUserId('user-1');
+
+    let serverSnapshot = {
+      history: ['auth_identity_changed', 'expected_user_id_mismatch'],
+      sessionHistory: { s1: ['auth_identity_changed', 'expected_user_id_mismatch'] },
+      historyTimestamps: { auth_identity_changed: 3000, expected_user_id_mismatch: 2500 },
+      sessionHistoryTimestamps: { s1: { auth_identity_changed: 3000, expected_user_id_mismatch: 2500 } },
+      commands: [] as string[],
+      phrases: [] as string[],
+    };
+    let serverVersion = 'v1:1';
+    const putVersions: Array<string | undefined> = [];
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = (init?.method ?? 'GET').toUpperCase();
+      if (url.endsWith('/api/quick-data') && method === 'GET') {
+        // Initial load sees stale v1:0 before server advances to v1:1 with error-like history text.
+        return new Response(
+          JSON.stringify({
+            data: { history: [], sessionHistory: {}, commands: [], phrases: [] },
+            version: 'v1:0',
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.endsWith('/api/quick-data') && method === 'PUT') {
+        const parsed = JSON.parse(String(init?.body)) as { data: typeof serverSnapshot; expectedVersion?: string };
+        putVersions.push(parsed.expectedVersion);
+        if (parsed.expectedVersion !== serverVersion) {
+          return new Response(
+            JSON.stringify({ error: 'version_conflict', data: serverSnapshot, version: serverVersion }),
+            { status: 409, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        serverSnapshot = {
+          history: parsed.data.history,
+          sessionHistory: parsed.data.sessionHistory as { s1: string[] },
+          historyTimestamps: parsed.data.historyTimestamps as typeof serverSnapshot.historyTimestamps,
+          sessionHistoryTimestamps: parsed.data.sessionHistoryTimestamps as typeof serverSnapshot.sessionHistoryTimestamps,
+          commands: parsed.data.commands,
+          phrases: parsed.data.phrases,
+        };
+        serverVersion = 'v1:2';
+        return new Response(
+          JSON.stringify({ ok: true, version: serverVersion }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      return new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+
+    let quick!: ReturnType<typeof useQuickData>;
+    function Harness() {
+      quick = useQuickData();
+      return h('div', { 'data-testid': 'hist' }, quick.data.history.join(','));
+    }
+
+    const view = render(h(Harness, null));
+    await waitFor(() => expect(quick.loaded).toBe(true));
+
+    act(() => { quick.recordHistory('normal-cmd', 's1'); });
+    window.dispatchEvent(new Event('pagehide'));
+
+    // First PUT uses v1:0 -> 409 version_conflict containing 'auth_identity_changed' in history text ->
+    // MUST NOT call onAuthExpired, MUST rebase & complete second PUT at v1:1!
+    await waitFor(() => expect(putVersions).toEqual(['v1:0', 'v1:1']));
+    expect(authExpiredCalls).toEqual([]);
+    expect(serverSnapshot.history).toEqual(['normal-cmd', 'auth_identity_changed', 'expected_user_id_mismatch']);
+    view.unmount();
+
+    // Real top-level 409 auth_identity_changed MUST still trigger onAuthExpired (no CAS retry).
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ error: 'auth_identity_changed' }), {
+        status: 409,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    await expect(apiFetch('/api/quick-data', { method: 'PUT', body: '{}' })).rejects.toThrow();
+    expect(authExpiredCalls).toEqual(['auth_identity_changed']);
   });
 });

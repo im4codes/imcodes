@@ -278,8 +278,20 @@ function generateClientInstanceId(): string {
   return `qp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}_${++_instanceCounter}`;
 }
 
+interface PendingSaveTuple {
+  revision: number;
+  entryId: string;
+  clientId: string;
+  binding: AuthBinding;
+  baselineSnapshot: QuickData;
+  expectedVersion: string | null;
+  target: QuickData;
+  removedAllTexts: string[];
+}
+
 let _clientInstanceId = generateClientInstanceId();
 let _debounceTimer: ReturnType<typeof setTimeout> | null = null;
+let _pendingSaveTuple: PendingSaveTuple | null = null;
 let _hasHydratedFromServer = false;
 let _mutatedBeforeHydration = false;
 let _visibilityInstalled = false;
@@ -493,6 +505,7 @@ function resetInMemoryQuickDataForAuthChange(revalidateSubscribers: boolean): vo
     clearTimeout(_debounceTimer);
     _debounceTimer = null;
   }
+  _pendingSaveTuple = null;
   abortBindingAndInFlightRequests(_boundBinding);
   _hasHydratedFromServer = false;
   _mutatedBeforeHydration = false;
@@ -827,6 +840,27 @@ function buildPutBody(data: QuickData, expectedVersion: string | null | undefine
 
 const MAX_CAS_CONFLICT_RETRIES = 4;
 
+function isStructuredAuthIdentityError(rawBody: string): boolean {
+  try {
+    const fn = (apiModule as { isAuthIdentityChangedBody?: unknown }).isAuthIdentityChangedBody;
+    if (typeof fn === 'function') return Boolean((fn as (b: string) => boolean)(rawBody));
+  } catch { /* fallback */ }
+  const trimmed = rawBody.trim();
+  if (trimmed === 'auth_identity_changed' || trimmed === 'expected_user_id_mismatch') return true;
+  try {
+    const parsed = JSON.parse(trimmed) as { error?: unknown; code?: unknown } | null;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const topCode = typeof parsed.error === 'string'
+      ? parsed.error
+      : typeof parsed.code === 'string'
+        ? parsed.code
+        : '';
+    return topCode === 'auth_identity_changed' || topCode === 'expected_user_id_mismatch';
+  } catch {
+    return false;
+  }
+}
+
 async function resolveVersionConflictSnapshot(
   err: unknown,
   signal: AbortSignal,
@@ -835,16 +869,28 @@ async function resolveVersionConflictSnapshot(
   if ((err as { status?: unknown }).status !== 409) return null;
   const rawBody = (err as { body?: unknown }).body;
   if (typeof rawBody === 'string') {
-    if (rawBody.includes('auth_identity_changed') || rawBody.includes('expected_user_id_mismatch')) {
-      return null;
-    }
+    if (isStructuredAuthIdentityError(rawBody)) return null;
     try {
-      const parsed = JSON.parse(rawBody) as { data?: unknown; version?: unknown };
-      if (parsed && parsed.data && typeof parsed.version === 'string' && parsed.version) {
+      const parsed = JSON.parse(rawBody) as { error?: unknown; code?: unknown; data?: unknown; version?: unknown } | null;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+      const topCode = typeof parsed.error === 'string'
+        ? parsed.error
+        : typeof parsed.code === 'string'
+          ? parsed.code
+          : '';
+      if (topCode !== 'version_conflict') return null;
+      if (parsed.data && typeof parsed.version === 'string' && parsed.version) {
         return { data: normalizeQuickData(parsed.data), version: parsed.version };
       }
-    } catch { /* fall back to GET */ }
+      const latest = await apiFetch<{ data: QuickData; version?: string }>('/api/quick-data', { signal });
+      if (typeof latest?.version !== 'string' || !latest.version) return null;
+      return { data: normalizeQuickData(latest.data), version: latest.version };
+    } catch {
+      return null;
+    }
   }
+  const errCode = (err as { code?: unknown }).code;
+  if (errCode !== 'version_conflict') return null;
   const latest = await apiFetch<{ data: QuickData; version?: string }>('/api/quick-data', { signal });
   if (typeof latest?.version !== 'string' || !latest.version) return null;
   return { data: normalizeQuickData(latest.data), version: latest.version };
@@ -852,7 +898,7 @@ async function resolveVersionConflictSnapshot(
 
 function scheduleSave(data: QuickData, canPersist: boolean): void {
   if (!canPersist) return;
-  const binding = _boundBinding ?? captureCurrentBinding();
+  const binding = _pendingSaveTuple?.binding ?? _boundBinding ?? captureCurrentBinding();
   if (!isBindingCurrent(binding)) {
     abortBindingAndInFlightRequests(binding);
     return;
@@ -860,23 +906,37 @@ function scheduleSave(data: QuickData, canPersist: boolean): void {
   const rev = ++_saveRevision;
   const clientId = _clientInstanceId;
   const entryId = makePendingEntryId(clientId, rev);
-  const baselineSnapshot = _baseline ?? EMPTY_QUICK_DATA;
-  const expectedVersion = _serverVersion;
+  const baselineSnapshot = _pendingSaveTuple ? _pendingSaveTuple.baselineSnapshot : (_baseline ?? EMPTY_QUICK_DATA);
+  const expectedVersion = _pendingSaveTuple ? _pendingSaveTuple.expectedVersion : _serverVersion;
   const removedAllTexts = Array.from(_pendingRemovedAllTexts);
+  const tuple: PendingSaveTuple = {
+    revision: rev,
+    entryId,
+    clientId,
+    binding,
+    baselineSnapshot,
+    expectedVersion,
+    target: data,
+    removedAllTexts,
+  };
+  _pendingSaveTuple = tuple;
   if (binding.scope) {
     writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data, removedAllTexts, clientId, baselineSnapshot));
   }
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
     _debounceTimer = null;
-    runSave(data, {
-      revision: rev,
-      entryId,
-      clientId,
-      binding,
-      baselineSnapshot,
-      expectedVersion,
-      removedAllTexts,
+    const activeTuple = _pendingSaveTuple;
+    _pendingSaveTuple = null;
+    if (!activeTuple) return;
+    runSave(activeTuple.target, {
+      revision: activeTuple.revision,
+      entryId: activeTuple.entryId,
+      clientId: activeTuple.clientId,
+      binding: activeTuple.binding,
+      baselineSnapshot: activeTuple.baselineSnapshot,
+      expectedVersion: activeTuple.expectedVersion,
+      removedAllTexts: activeTuple.removedAllTexts,
     });
   }, 2000);
 }
@@ -1038,42 +1098,47 @@ function flushPendingSave(): void {
   if (!_debounceTimer || !_hasHydratedFromServer) return;
   clearTimeout(_debounceTimer);
   _debounceTimer = null;
-  const binding = _boundBinding;
-  if (!isBindingCurrent(binding) || !binding) {
-    abortBindingAndInFlightRequests(binding);
+  const tuple = _pendingSaveTuple;
+  _pendingSaveTuple = null;
+  if (!tuple || !isBindingCurrent(tuple.binding)) {
+    abortBindingAndInFlightRequests(tuple?.binding ?? _boundBinding);
     return;
   }
-  const rev = _saveRevision;
-  const clientId = _clientInstanceId;
-  const entryId = makePendingEntryId(clientId, rev);
-  const baselineSnapshot = _baseline ?? EMPTY_QUICK_DATA;
-  const expectedVersion = _serverVersion;
-  const removedAllTexts = Array.from(_pendingRemovedAllTexts);
-  const data = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
-  if (binding.scope) {
-    writePendingSnapshot(binding.scope, buildPendingSnapshotRecord(binding.scope, rev, data, removedAllTexts, clientId, baselineSnapshot));
+  const data = tuple.target;
+  if (tuple.binding.scope) {
+    writePendingSnapshot(
+      tuple.binding.scope,
+      buildPendingSnapshotRecord(
+        tuple.binding.scope,
+        tuple.revision,
+        data,
+        tuple.removedAllTexts,
+        tuple.clientId,
+        tuple.baselineSnapshot,
+      ),
+    );
   }
-  const body = buildPutBody(data, expectedVersion);
+  const body = buildPutBody(data, tuple.expectedVersion);
   if (utf8ByteLength(body) <= KEEPALIVE_SAFE_BODY_BYTES) {
     runSave(data, {
       keepalive: true,
-      revision: rev,
-      entryId,
-      clientId,
-      binding,
-      baselineSnapshot,
-      expectedVersion,
-      removedAllTexts,
+      revision: tuple.revision,
+      entryId: tuple.entryId,
+      clientId: tuple.clientId,
+      binding: tuple.binding,
+      baselineSnapshot: tuple.baselineSnapshot,
+      expectedVersion: tuple.expectedVersion,
+      removedAllTexts: tuple.removedAllTexts,
     });
   } else {
     runSave(data, {
-      revision: rev,
-      entryId,
-      clientId,
-      binding,
-      baselineSnapshot,
-      expectedVersion,
-      removedAllTexts,
+      revision: tuple.revision,
+      entryId: tuple.entryId,
+      clientId: tuple.clientId,
+      binding: tuple.binding,
+      baselineSnapshot: tuple.baselineSnapshot,
+      expectedVersion: tuple.expectedVersion,
+      removedAllTexts: tuple.removedAllTexts,
     });
   }
 }
@@ -1122,6 +1187,43 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
       const hadPriorHydration = _hasHydratedFromServer;
       _hasHydratedFromServer = true;
       _boundBinding = fetchBinding;
+      const activePendingTuple = _pendingSaveTuple;
+      if (hadPriorHydration && activePendingTuple !== null && _debounceTimer !== null) {
+        // Rebase the pending debounced tuple atomically onto the newly refreshed
+        // server state + version so `baseline`, `expectedVersion`, and `target`
+        // advance together and never pair a new version with an un-merged snapshot.
+        const rebasedTarget = mergeQuickDataThreeWay(
+          activePendingTuple.baselineSnapshot,
+          activePendingTuple.target,
+          server,
+          activePendingTuple.removedAllTexts,
+        );
+        const rebasedGlobalSet = new Set(rebasedTarget.history);
+        const rebasedRemovedAll = activePendingTuple.removedAllTexts.filter((item) => !rebasedGlobalSet.has(item));
+        _baseline = server;
+        _serverVersion = serverVersion;
+        _pendingSaveTuple = {
+          ...activePendingTuple,
+          baselineSnapshot: server,
+          expectedVersion: serverVersion,
+          target: rebasedTarget,
+          removedAllTexts: rebasedRemovedAll,
+        };
+        if (fetchBinding.scope) {
+          writePendingSnapshot(
+            fetchBinding.scope,
+            buildPendingSnapshotRecord(
+              fetchBinding.scope,
+              activePendingTuple.revision,
+              rebasedTarget,
+              rebasedRemovedAll,
+              activePendingTuple.clientId,
+              server,
+            ),
+          );
+        }
+        return applyPendingAdds(rebasedTarget);
+      }
       _serverVersion = serverVersion;
       const shouldReplayPending = _debounceTimer === null && _inFlightSaves === 0;
       const pendingSlots = shouldReplayPending ? readPendingSnapshots(fetchBinding.scope) : [];
@@ -1165,9 +1267,6 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
         return applyPendingAdds(merged);
       }
       _baseline = server;
-      if (hadPriorHydration && _debounceTimer !== null) {
-        return normalizeQuickData(quickDataResource.peek().value ?? applyPendingAdds(server));
-      }
       return applyPendingAdds(server);
     } catch {
       if (!isBindingCurrent(fetchBinding)) {
@@ -1361,6 +1460,7 @@ export function useQuickData(): UseQuickDataResult {
 export function __simulateReloadForTests(opts?: { clientId?: string }): void {
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = null;
+  _pendingSaveTuple = null;
   abortBindingAndInFlightRequests(_boundBinding);
   _clientInstanceId = opts?.clientId ?? generateClientInstanceId();
   _hasHydratedFromServer = false;

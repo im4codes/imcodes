@@ -954,6 +954,35 @@ async function read401BodyBounded(
   }
 }
 
+export function isAuthIdentityChangedBody(body: string): boolean {
+  const trimmed = body.trim();
+  if (!trimmed) return false;
+  if (trimmed === AUTH_IDENTITY_ERRORS.CHANGED || trimmed === 'expected_user_id_mismatch') {
+    return true;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as { error?: unknown; code?: unknown } | null;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+    const topCode = typeof parsed.error === 'string'
+      ? parsed.error
+      : typeof parsed.code === 'string'
+        ? parsed.code
+        : '';
+    return topCode === AUTH_IDENTITY_ERRORS.CHANGED || topCode === 'expected_user_id_mismatch';
+  } catch {
+    return false;
+  }
+}
+
+async function throw409ApiError(res: Response, signal?: AbortSignal | null): Promise<never> {
+  const body = await readResponseTextWithSignal(res, signal);
+  throwIfAborted(signal);
+  if (isAuthIdentityChangedBody(body)) {
+    _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+  }
+  throw new ApiError(res.status, body);
+}
+
 function assertSameRequestBinding(
   startBaseUrl: string,
   startExpectedUserId: string | null,
@@ -978,12 +1007,7 @@ export async function apiFetch<T = unknown>(
   throwIfAborted(opts.signal);
 
   if (res.status === 409) {
-    const body = await readResponseTextWithSignal(res, opts.signal);
-    throwIfAborted(opts.signal);
-    if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
-      _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
-    }
-    throw new ApiError(res.status, body);
+    return await throw409ApiError(res, opts.signal);
   }
 
   if (res.status === 401) {
@@ -1021,12 +1045,7 @@ export async function apiFetch<T = unknown>(
         const retryRes = await rawFetch(path, opts);
         throwIfAborted(opts.signal);
         if (retryRes.status === 409) {
-          const body = await readResponseTextWithSignal(retryRes, opts.signal);
-          throwIfAborted(opts.signal);
-          if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
-            _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
-          }
-          throw new ApiError(retryRes.status, body);
+          return await throw409ApiError(retryRes, opts.signal);
         }
         if (!retryRes.ok) {
           const body = await readResponseTextWithSignal(retryRes, opts.signal);
@@ -1066,12 +1085,7 @@ export async function apiFetch<T = unknown>(
         const retryRes = await rawFetch(path, opts);
         throwIfAborted(opts.signal);
         if (retryRes.status === 409) {
-          const body = await readResponseTextWithSignal(retryRes, opts.signal);
-          throwIfAborted(opts.signal);
-          if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
-            _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
-          }
-          throw new ApiError(retryRes.status, body);
+          return await throw409ApiError(retryRes, opts.signal);
         }
         if (!retryRes.ok) {
           const body = await readResponseTextWithSignal(retryRes, opts.signal);
@@ -1152,12 +1166,7 @@ export async function apiFetch<T = unknown>(
           const retryRes = await rawFetch(path, opts);
           throwIfAborted(opts.signal);
           if (retryRes.status === 409) {
-            const retryBody = await readResponseTextWithSignal(retryRes, opts.signal);
-            throwIfAborted(opts.signal);
-            if (retryBody.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
-              _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
-            }
-            throw new ApiError(retryRes.status, retryBody);
+            return await throw409ApiError(retryRes, opts.signal);
           }
           if (!retryRes.ok) {
             const retryBody = await readResponseTextWithSignal(retryRes, opts.signal);
@@ -4723,12 +4732,7 @@ export async function synthesizeServerTtsSpeech(
   throwIfAborted(signal);
 
   if (res.status === 409) {
-    const errBody = await readResponseTextWithSignal(res, signal);
-    throwIfAborted(signal);
-    if (errBody.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
-      _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
-    }
-    throw new ApiError(res.status, errBody);
+    return await throw409ApiError(res, signal);
   }
 
   if (res.status === 401) {
