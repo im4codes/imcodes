@@ -48,6 +48,7 @@ describe('getCopilotRuntimeConfig', () => {
     expect(config.availableModels).toEqual([...COPILOT_FALLBACK_MODEL_IDS]);
     expect(config.models).toEqual(COPILOT_FALLBACK_MODEL_IDS.map((id) => ({ id })));
     expect(config.isAuthenticated).toBe(false);
+    expect(config.isColdFallback).toBe(true);
     expect(sdkMock.clientFactory).not.toHaveBeenCalled();
   });
 

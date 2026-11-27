@@ -106,6 +106,7 @@ describe('cursor-runtime-config parsers', () => {
       expect(config).toEqual({
         availableModels: [],
         isAuthenticated: false,
+        isColdFallback: true,
       });
       expect(childProcessMock.execFile).not.toHaveBeenCalled();
     });
@@ -129,6 +130,7 @@ describe('cursor-runtime-config parsers', () => {
       expect(config.defaultModel).toBe('gpt-5.2');
       expect(config.isAuthenticated).toBe(true);
       expect(config.loggedInAs).toBe('tester@example.com');
+      expect(config.isColdFallback).toBeUndefined();
     });
 
     it('returns a safe fallback when both probes fail', async () => {
@@ -143,6 +145,7 @@ describe('cursor-runtime-config parsers', () => {
       expect(config.isAuthenticated).toBe(false);
       expect(config.loggedInAs).toBeUndefined();
       expect(config.defaultModel).toBeUndefined();
+      expect(config.isColdFallback).toBeUndefined();
     });
   });
 });
