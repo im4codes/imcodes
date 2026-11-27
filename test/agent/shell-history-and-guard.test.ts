@@ -100,8 +100,12 @@ vi.mock('../../src/daemon/cross-vendor-handoff.js', async (importOriginal) => {
 });
 
 import {
+  buildShellHistoryLaunchArgs,
   cleanupShellHistoryFile,
   isShellLikeAgentType,
+  resolveFishDataDir,
+  resolveFishHistoryFilePath,
+  resolveFishHistoryName,
   resolveShellBin,
   resolveShellHistoryDir,
   resolveShellHistoryFilePath,
@@ -155,24 +159,56 @@ describe('shell history isolation & prompt-injection guard', () => {
     expect(zshEnv.HISTFILE).toBe(join(dir, 'deck_sub_zsh1.history'));
     expect(zshEnv.IMCODES_SHELL_HISTFILE).toBe(zshEnv.HISTFILE);
     expect(zshEnv.ZDOTDIR).toBe(join(dir, 'zdotdir'));
+    expect(zshEnv.IMCODES_ZSH_WRAPPER_DIR).toBe(join(dir, 'zdotdir'));
     expect(zshEnv.IMCODES_ORIG_ZDOTDIR).toBe('/tmp/custom-zdotdir');
+    expect(zshEnv.XDG_DATA_HOME).toBeUndefined();
+    expect(env1.XDG_DATA_HOME).toBeUndefined();
     expect(existsSync(join(dir, 'zdotdir', '.zshrc'))).toBe(true);
 
-    // Shared resolveShellBin on Windows picks process.env.SHELL POSIX shells too
+    // Fish gets scoped XDG_DATA_HOME + valid non-default fish_history launch args, without touching other shells
+    const fishEnv = shellHistoryEnv('deck-sub-fish-1', 'shell', '/usr/bin/fish');
+    const fishName = resolveFishHistoryName('deck-sub-fish-1');
+    const fishNameUnderscore = resolveFishHistoryName('deck_sub_fish_1');
+    expect(fishName).toMatch(/^[A-Za-z_][A-Za-z0-9_]*$/);
+    expect(fishName).not.toBe('fish');
+    expect(fishName).not.toBe(fishNameUnderscore);
+    expect(fishEnv).toEqual({ XDG_DATA_HOME: resolveFishDataDir() });
+    expect(resolveFishHistoryFilePath('deck-sub-fish-1')).toBe(
+      join(resolveFishDataDir(), 'fish', `${fishName}_history`),
+    );
+    expect(buildShellHistoryLaunchArgs('/usr/bin/fish', 'deck-sub-fish-1')).toBe(
+      ` -C 'set -g fish_history ${fishName}'`,
+    );
+
+    // Shared resolveShellBin on Windows picks process.env.SHELL POSIX shells too + emits Git Bash --rcfile
     const origPlatform = process.platform;
     try {
       Object.defineProperty(process, 'platform', { value: 'win32' });
+      const driver = new ShellDriver();
       vi.stubEnv('SHELL', 'C:\\Program Files\\Git\\bin\\bash.exe');
       expect(resolveShellBin()).toBe('C:\\Program Files\\Git\\bin\\bash.exe');
       const winPosix = shellHistoryEnv('deck_sub_win_bash', 'shell');
       expect(winPosix.HISTFILE).toBe(join(dir, 'deck_sub_win_bash.history'));
+      expect(winPosix.IMCODES_SHELL_HISTFILE).toBe(winPosix.HISTFILE);
+      const winPosixCmd = driver.buildLaunchCommand('deck_sub_win_bash');
+      const expectedWinRc = join(dir, 'bash-rc.sh').replace(/\\/g, '/');
+      expect(winPosixCmd).toBe(`"C:\\Program Files\\Git\\bin\\bash.exe" --rcfile "${expectedWinRc}"`);
+      const explicitGitBashCmd = driver.buildLaunchCommand('deck_sub_win_bash2', {
+        shellBin: 'C:\\Program Files\\Git\\bin\\bash.exe',
+      });
+      expect(explicitGitBashCmd).toBe(`"C:\\Program Files\\Git\\bin\\bash.exe" --rcfile "${expectedWinRc}"`);
 
-      // Native Windows shells keep {}
+      // Native Windows shells keep {} and unchanged launch commands without --rcfile/-C
       vi.stubEnv('SHELL', '');
       vi.stubEnv('COMSPEC', 'C:\\Windows\\System32\\cmd.exe');
       expect(shellHistoryEnv('deck_sub_cmd_default', 'shell')).toEqual({});
       expect(shellHistoryEnv('deck_sub_pwsh', 'shell', 'powershell.exe')).toEqual({});
       expect(shellHistoryEnv('deck_sub_pwsh7', 'shell', 'C:\\Program Files\\PowerShell\\7\\pwsh.exe')).toEqual({});
+      expect(driver.buildLaunchCommand('deck_sub_cmd_default')).toBe('C:\\Windows\\System32\\cmd.exe');
+      expect(driver.buildLaunchCommand('deck_sub_pwsh', { shellBin: 'powershell.exe' })).toBe('powershell.exe');
+      expect(driver.buildLaunchCommand('deck_sub_pwsh7', { shellBin: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe' })).toBe(
+        '"C:\\Program Files\\PowerShell\\7\\pwsh.exe"',
+      );
     } finally {
       Object.defineProperty(process, 'platform', { value: origPlatform });
     }
@@ -456,5 +492,177 @@ describe('shell history isolation & prompt-injection guard', () => {
     expect(readFileSync(env1.HISTFILE, 'utf8')).not.toContain('ONLY_IN_SH2_TOKEN');
     expect(readFileSync(env2.HISTFILE, 'utf8')).toContain('ONLY_IN_SH2_TOKEN');
     expect(readFileSync(env2.HISTFILE, 'utf8')).not.toContain('ONLY_IN_SH1_TOKEN');
+  });
+
+  it('zsh wrapper preserves relocated ZDOTDIR from .zshenv/.zprofile so later .zshrc still enforces per-session HISTFILE', () => {
+    const fakeHome = join(stateDir, 'zsh-home');
+    const relocatedDir = join(fakeHome, '.config', 'zsh');
+    mkdirSync(relocatedDir, { recursive: true });
+    const sharedZshHist = join(fakeHome, '.zsh_history');
+    writeFileSync(sharedZshHist, ': 1:0;echo SHARED_ZSH\n', 'utf8');
+
+    // User ~/.zshenv relocates ZDOTDIR without having set ZDOTDIR beforehand.
+    writeFileSync(join(fakeHome, '.zshenv'), `export ZDOTDIR="${relocatedDir}"\nexport ZSH_ENV_RAN=yes\n`, 'utf8');
+    // Relocated .zshrc relies on $ZDOTDIR pointing to relocatedDir AND tries to force HISTFILE back to shared.
+    writeFileSync(join(relocatedDir, 'extra.zsh'), 'export ZSH_EXTRA_RAN=yes\n', 'utf8');
+    writeFileSync(
+      join(relocatedDir, '.zshrc'),
+      `. "$ZDOTDIR/extra.zsh"\nexport HISTFILE="${sharedZshHist}"\nexport ZSH_RC_RAN=yes\n`,
+      'utf8',
+    );
+    writeFileSync(join(relocatedDir, '.zlogin'), 'export ZSH_LOGIN_RAN=yes\n', 'utf8');
+
+    vi.stubEnv('ZDOTDIR', '');
+    const zshEnv = shellHistoryEnv('deck_sub_zsh_reloc', 'shell', '/bin/zsh');
+
+    const runZshSequence = (loginFlag: 0 | 1) => {
+      const script = [
+        `__opt_interactive=1`,
+        `__opt_login=${loginFlag}`,
+        `eval '[() {
+          if test "$1" = "!" && test "$2" = "-o"; then
+            case "$3" in
+              interactive) test "$__opt_interactive" -eq 0 && return 0 || return 1 ;;
+              login) test "$__opt_login" -eq 0 && return 0 || return 1 ;;
+            esac
+          elif test "$1" = "-o"; then
+            case "$2" in
+              interactive) test "$__opt_interactive" -eq 1 && return 0 || return 1 ;;
+              login) test "$__opt_login" -eq 1 && return 0 || return 1 ;;
+            esac
+          fi
+          local args=("$@")
+          local n=\${#args[@]}
+          if test "$n" -ge 1 && test "\${args[$((n-1))]}" = "]"; then
+            unset "args[$((n-1))]"
+          fi
+          builtin test "\${args[@]}"
+        }'`,
+        `. "$ZDOTDIR/.zshenv"`,
+        loginFlag ? `. "$ZDOTDIR/.zprofile"` : '',
+        `. "$ZDOTDIR/.zshrc"`,
+        loginFlag ? `. "$ZDOTDIR/.zlogin"` : '',
+        `printf 'HISTFILE=%s\\nZDOTDIR=%s\\nFLAGS=%s:%s:%s:%s\\n' "$HISTFILE" "\${ZDOTDIR:-UNSET}" "\${ZSH_ENV_RAN:-no}" "\${ZSH_RC_RAN:-no}" "\${ZSH_EXTRA_RAN:-no}" "\${ZSH_LOGIN_RAN:-no}"`,
+      ].filter(Boolean).join('\n');
+
+      const res = spawnSync('bash', ['-c', script], {
+        env: {
+          PATH: process.env.PATH,
+          HOME: fakeHome,
+          ...zshEnv,
+        },
+        encoding: 'utf8',
+      });
+      expect(res.status).toBe(0);
+      return res.stdout;
+    };
+
+    const nonLoginOut = runZshSequence(0);
+    expect(nonLoginOut).toContain(`HISTFILE=${zshEnv.HISTFILE}`);
+    expect(nonLoginOut).toContain(`ZDOTDIR=${relocatedDir}`);
+    expect(nonLoginOut).toContain('FLAGS=yes:yes:yes:no');
+
+    const loginOut = runZshSequence(1);
+    expect(loginOut).toContain(`HISTFILE=${zshEnv.HISTFILE}`);
+    expect(loginOut).toContain(`ZDOTDIR=${relocatedDir}`);
+    expect(loginOut).toContain('FLAGS=yes:yes:yes:yes');
+  });
+
+  it('real interactive fish with shared config.fish keeps sh1/sh2/shared isolated and cleans only target session file', () => {
+    const fishCheck = spawnSync('which', ['fish'], { encoding: 'utf8' });
+    if (fishCheck.status !== 0 || !fishCheck.stdout.trim()) return;
+    const fishBin = fishCheck.stdout.trim();
+
+    const fakeHome = join(stateDir, 'fish-home');
+    const fakeCfg = join(fakeHome, '.config', 'fish');
+    const fakeSharedData = join(fakeHome, '.local', 'share', 'fish');
+    mkdirSync(fakeCfg, { recursive: true });
+    mkdirSync(fakeSharedData, { recursive: true });
+
+    const sharedFishHist = join(fakeSharedData, 'fish_history');
+    writeFileSync(sharedFishHist, '- cmd: echo SHARED_FISH_UNTOUCHED\n  when: 1700000000\n', 'utf8');
+    // Hostile config.fish forces fish_history back to shared name and sets marker proving config.fish still loads.
+    writeFileSync(
+      join(fakeCfg, 'config.fish'),
+      'set -gx FISH_CFG_MARKER yes\nset -gx fish_history fish\n',
+      'utf8',
+    );
+
+    const driver = new ShellDriver();
+    const s1 = 'deck_sub_fish_real1';
+    const s2 = 'deck-sub-fish-real2';
+    const cmd1 = driver.buildLaunchCommand(s1, { shellBin: fishBin });
+    const cmd2 = driver.buildLaunchCommand(s2, { shellBin: fishBin });
+    const env1 = shellHistoryEnv(s1, 'shell', fishBin);
+    const env2 = shellHistoryEnv(s2, 'shell', fishBin);
+    const hist1 = resolveFishHistoryFilePath(s1)!;
+    const hist2 = resolveFishHistoryFilePath(s2)!;
+
+    const runInteractiveFish = (launchCmd: string, extraEnv: Record<string, string>, commands: string[]) => {
+      const py = [
+        'import fcntl, os, pty, select, subprocess, sys, termios, time',
+        'cmd = sys.argv[1]',
+        'cmds = sys.argv[2:]',
+        'm, s = pty.openpty()',
+        'def preexec():',
+        '    os.setsid()',
+        '    fcntl.ioctl(s, termios.TIOCSCTTY, 0)',
+        'p = subprocess.Popen(["/bin/sh", "-c", f"{cmd} -i"], stdin=s, stdout=s, stderr=s, close_fds=True, preexec_fn=preexec)',
+        'os.close(s)',
+        'time.sleep(0.4)',
+        'for c in cmds:',
+        '    os.write(m, (c + "\\r").encode())',
+        '    time.sleep(0.35)',
+        'os.write(m, b"exit\\r")',
+        'out = bytearray()',
+        'deadline = time.time() + 5.0',
+        'while time.time() < deadline:',
+        '    r, _, _ = select.select([m], [], [], 0.1)',
+        '    if r:',
+        '        try:',
+        '            chunk = os.read(m, 4096)',
+        '            if not chunk: break',
+        '            out.extend(chunk)',
+        '        except OSError: break',
+        '    elif p.poll() is not None:',
+        '        break',
+        'p.wait(timeout=5)',
+        'os.close(m)',
+        'sys.stdout.write(out.decode(errors="replace"))',
+      ].join('\n');
+      const res = spawnSync('python3', ['-c', py, launchCmd, ...commands], {
+        env: {
+          PATH: process.env.PATH,
+          HOME: fakeHome,
+          TERM: 'xterm-256color',
+          XDG_CONFIG_HOME: join(fakeHome, '.config'),
+          ...extraEnv,
+        },
+        encoding: 'utf8',
+      });
+      expect(res.status).toBe(0);
+      return res.stdout;
+    };
+
+    const out1 = runInteractiveFish(cmd1, env1, ['echo CFG=$FISH_CFG_MARKER HIST=$fish_history', 'echo ONLY_IN_FISH_1']);
+    const out2 = runInteractiveFish(cmd2, env2, ['history', 'echo ONLY_IN_FISH_2']);
+    const out1Restart = runInteractiveFish(cmd1, env1, ['history']);
+
+    expect(out1).toContain(`CFG=yes HIST=${resolveFishHistoryName(s1)}`);
+    expect(out2).not.toContain('SHARED_FISH_UNTOUCHED');
+    expect(out2).not.toContain('ONLY_IN_FISH_1');
+    expect(out1Restart).toContain('ONLY_IN_FISH_1');
+    expect(out1Restart).not.toContain('SHARED_FISH_UNTOUCHED');
+    expect(out1Restart).not.toContain('ONLY_IN_FISH_2');
+    expect(readFileSync(sharedFishHist, 'utf8')).toBe('- cmd: echo SHARED_FISH_UNTOUCHED\n  when: 1700000000\n');
+    expect(readFileSync(hist1, 'utf8')).toContain('ONLY_IN_FISH_1');
+    expect(readFileSync(hist1, 'utf8')).not.toContain('ONLY_IN_FISH_2');
+    expect(readFileSync(hist2, 'utf8')).toContain('ONLY_IN_FISH_2');
+    expect(readFileSync(hist2, 'utf8')).not.toContain('ONLY_IN_FISH_1');
+
+    // Closing s1 deletes only s1's Fish history file, preserving s2's file.
+    cleanupShellHistoryFile(s1);
+    expect(existsSync(hist1)).toBe(false);
+    expect(existsSync(hist2)).toBe(true);
   });
 });

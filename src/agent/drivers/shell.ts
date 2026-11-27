@@ -8,11 +8,11 @@ export class ShellDriver implements AgentDriver {
   readonly promptChar = '$';
   readonly spinnerChars: string[] = [];
 
-  buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
+  buildLaunchCommand(sessionName: string, opts?: LaunchOptions): string {
     const bin = resolveShellBin(opts?.shellBin);
     const cwd = cwdPrefix(opts?.cwd);
     const quotedBin = process.platform === 'win32' && /\s/.test(bin) ? `"${bin}"` : bin;
-    const rcArgs = buildShellHistoryLaunchArgs(bin);
+    const rcArgs = buildShellHistoryLaunchArgs(bin, sessionName);
     return `${cwd}${quotedBin}${rcArgs}`;
   }
 
