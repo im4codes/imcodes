@@ -3867,6 +3867,70 @@ describe('RemoteDesktopPanel mobile gestures', () => {
       expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
       act(() => { pointer(ring, 'pointerup', { pointerId: 130, clientX: 200, clientY: 150 }); });
     });
+
+    it('does not send right-click or vibrate when canvas touch began in VIEW mode even if inputEnabled becomes true during countdown', async () => {
+      vi.useFakeTimers();
+      const { stage } = await renderPanel();
+      const standardDisplays = [
+        {
+          id: 'display-primary', label: 'Display 1', primary: true, available: true,
+          width: 1920, height: 1080, dpiScale: 2.25, rotation: 0,
+        },
+      ];
+
+      // Switch to VIEW mode
+      act(() => clientHooks[0]!.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+        inputEpoch: 1,
+        inputEnabled: false,
+        atomicButtonClick: true,
+        displays: standardDisplays,
+        selectedDisplayId: 'display-primary',
+        layoutRevision: 1,
+        stream: null,
+      }));
+
+      pointerClick.mockClear();
+      pointerButton.mockClear();
+      voiceMocks.triggerHapticFeedback.mockClear();
+
+      // Touch down in VIEW mode
+      pointer(stage, 'pointerdown', { pointerId: 140, clientX: 200, clientY: 150 });
+      // Advance 200ms
+      act(() => { vi.advanceTimersByTime(200); });
+
+      // Permission recovered to CONTROL / inputEnabled: true
+      act(() => clientHooks[0]!.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.DIRECT,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 2,
+        inputEnabled: true,
+        atomicButtonClick: true,
+        displays: standardDisplays,
+        selectedDisplayId: 'display-primary',
+        layoutRevision: 1,
+        stream: null,
+      }));
+
+      // Push timer past 550ms
+      act(() => { vi.advanceTimersByTime(350); });
+      expect(pointerClick).not.toHaveBeenCalled();
+      expect(pointerButton).not.toHaveBeenCalled();
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+
+      pointer(stage, 'pointerup', { pointerId: 140, clientX: 200, clientY: 150 });
+
+      // Now a fresh long press initiated in CONTROL mode succeeds
+      pointerClick.mockClear();
+      voiceMocks.triggerHapticFeedback.mockClear();
+      pointer(stage, 'pointerdown', { pointerId: 141, clientX: 200, clientY: 150 });
+      act(() => { vi.advanceTimersByTime(550); });
+      pointer(stage, 'pointerup', { pointerId: 141, clientX: 200, clientY: 150 });
+      expect(pointerClick).toHaveBeenCalledWith('right', 0.5, 0.5);
+      expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledWith(20, 'medium');
+      expect(voiceMocks.triggerHapticFeedback).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('does not show a redundant right-click button when the touch ring owns right-click', async () => {

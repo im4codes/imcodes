@@ -2490,7 +2490,7 @@ export function RemoteDesktopPanel({
       gesture.longPressTimer = setTimeout(() => {
         const current = touchGestureRef.current;
         const stage = stageRef.current;
-        if (current !== gesture || current.moved || !stage || !inputEnabledRef.current) return;
+        if (current !== gesture || current.moved || !stage || !snapshot.inputEnabled || !inputEnabledRef.current) return;
         const rect = stage.getBoundingClientRect();
         const metrics = resolveCssZoomMetrics(document, window, stage);
         const clientPt = stageLocalCssToClientPoint(current.start.x, current.start.y, rect, metrics);
