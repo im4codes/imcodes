@@ -1,4 +1,4 @@
-import type { ModelInfo } from '@github/copilot-sdk';
+import type { Model } from '@microsoft/copilot-sdk';
 import { normalizeSupportedEffortLevels, type TransportEffortLevel } from '../../shared/effort-levels.js';
 import logger from '../util/logger.js';
 
@@ -39,24 +39,23 @@ let cached: { expiresAt: number; value: CopilotRuntimeConfig } | null = null;
  *  Keep in sync with the official Copilot CLI docs — these are only used when
  *  we truly can't reach the SDK, so offline devs still have a working list. */
 const FALLBACK_COPILOT_MODEL_IDS = [
-  'gpt-5',
-  'gpt-5-mini',
-  'claude-sonnet-4.5',
-  'claude-opus-4.5',
+  'gpt-5.4',
+  'gpt-5.4-mini',
+  'claude-sonnet-4.6',
+  'claude-opus-4.6',
 ];
 
 // ── Singleton CopilotClient ──────────────────────────────────────────────────
 //
-// The `@github/copilot-sdk` CopilotClient owns a `copilot --headless` node
-// subprocess (~160MB RSS). Earlier revisions called `new CopilotClient() →
-// start() → stop()` on every probe, but `stop()` does not reliably reap the
-// headless child — the daemon observed 13+ leaked copilot procs in 2 minutes,
-// burning ~2GB. So we maintain ONE client for the daemon's lifetime and
-// simply re-invoke `getStatus`/`listModels`/`getAuthStatus` against it.
+// The `@microsoft/copilot-sdk` CopilotClient hosts the native Copilot runtime
+// (in-process via FFI by default in v2, or a headless subprocess). Earlier
+// revisions called `new CopilotClient() → start() → stop()` on every probe,
+// leaking runtimes across repeated probes. So we maintain ONE client for the
+// daemon's lifetime and re-invoke `getStatus`/`listModels`/`getAuthStatus` against it.
 //
 // `clientPromise` also doubles as a concurrent-call dedupe: multiple probes
 // racing through the cache-miss branch await the same init, instead of each
-// spawning its own subprocess.
+// starting its own runtime.
 
 let clientPromise: Promise<unknown> | null = null;
 let inFlightProbe: Promise<CopilotRuntimeConfig> | null = null;
@@ -91,8 +90,8 @@ function fallbackRuntimeConfig(): CopilotRuntimeConfig {
 async function getCopilotClient(): Promise<unknown> {
   if (clientPromise) return clientPromise;
   clientPromise = (async () => {
-    const sdk = await import('@github/copilot-sdk');
-    const client = new sdk.CopilotClient();
+    const sdk = await import('@microsoft/copilot-sdk');
+    const client = new sdk.CopilotClient({ mode: 'coding-agent' });
     await client.start();
     return client;
   })().catch((err) => {
@@ -123,7 +122,7 @@ async function probeCopilotSdk(): Promise<CopilotRuntimeConfig> {
     }
     const models: CopilotModelInfo[] = [];
     try {
-      const raw = await client.listModels() as ModelInfo[] | unknown;
+      const raw = await client.listModels() as Model[] | unknown;
       if (Array.isArray(raw)) {
         for (const entry of raw) {
           if (!entry || typeof entry.id !== 'string') continue;

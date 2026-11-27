@@ -79,7 +79,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   return { ...actual, execFile, spawn };
 });
 
-vi.mock("@github/copilot-sdk", () => {
+vi.mock("@microsoft/copilot-sdk", () => {
   class FakeSession {
     sessionId: string;
     handlers = new Set<(event: Record<string, unknown>) => void>();
@@ -119,7 +119,7 @@ vi.mock("@github/copilot-sdk", () => {
     async start(): Promise<void> {}
     async stop(): Promise<void> {}
     async getStatus(): Promise<{ version: string; protocolVersion: number }> {
-      return { version: "1.0.31", protocolVersion: 3 };
+      return { version: "1.0.117", protocolVersion: 4 };
     }
     async getAuthStatus(): Promise<{
       isAuthenticated: boolean;
@@ -137,13 +137,13 @@ vi.mock("@github/copilot-sdk", () => {
       return new FakeSession(sessionId);
     }
     async listSessions(filter?: Record<string, unknown>): Promise<
-      Array<{ sessionId: string; summary?: string; context?: { cwd: string } }>
+      Array<{ sessionId: string; summary?: string; context?: { workingDirectory: string } }>
     > {
       mocks.copilotListFilters.push(filter);
       return [{
         sessionId: "copilot-session-restore",
         summary: "restored",
-        context: { cwd: "/tmp/copilot-restore" },
+        context: { workingDirectory: "/tmp/copilot-restore" },
       }];
     }
     async deleteSession(_sessionId: string): Promise<void> {}

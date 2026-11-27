@@ -303,10 +303,10 @@ async function probeQoderSdk(deps: AgentAvailabilityProbeDeps): Promise<AgentAva
 
 async function probeCopilotSdk(deps: AgentAvailabilityProbeDeps): Promise<AgentAvailabilityEntry> {
   const p = pathModuleFor(deps.platform);
-  const sdkRoot = deps.resolvePackageRoot('@github/copilot-sdk');
-  if (!sdkRoot) return { installed: false, reason: '@github/copilot-sdk package not installed' };
+  const sdkRoot = deps.resolvePackageRoot('@microsoft/copilot-sdk');
+  if (!sdkRoot) return { installed: false, reason: '@microsoft/copilot-sdk package not installed' };
 
-  // Matches `CopilotSdkProvider.resolveBinaryPath()` + `@github/copilot-sdk` `ensureRuntimeBundle()`.
+  // Matches `CopilotSdkProvider.resolveBinaryPath()` + `@microsoft/copilot-sdk` runtime resolution.
   const configured = deps.env.COPILOT_CLI_PATH?.trim();
   if (configured && (await deps.isExecutableFile(configured))) return { installed: true };
 
@@ -321,12 +321,14 @@ async function probeCopilotSdk(deps: AgentAvailabilityProbeDeps): Promise<AgentA
   const wrapperName = deps.platform === 'win32' ? 'copilot-runtime.exe' : 'copilot-runtime';
 
   for (const token of platformTokens) {
-    const sdkPlatformRoot = deps.resolvePackageRoot(`@github/copilot-sdk-${token}`);
+    const sdkPlatformRoot = deps.resolvePackageRoot(`@microsoft/copilot-sdk-${token}`);
     if (sdkPlatformRoot) {
       const prebuildDir = p.join(sdkPlatformRoot, 'prebuilds', token);
+      // v2 uses in-process FFI via `runtime.node` by default, or spawned `copilot-runtime[.exe]` + `runtime.node`.
       if (
-        (await deps.fileExists(p.join(prebuildDir, wrapperName)))
-        && (await deps.fileExists(p.join(prebuildDir, 'runtime.node')))
+        (await deps.fileExists(p.join(prebuildDir, 'runtime.node')))
+        || ((await deps.fileExists(p.join(prebuildDir, wrapperName)))
+          && (await deps.fileExists(p.join(prebuildDir, 'runtime.node'))))
       ) {
         return { installed: true };
       }

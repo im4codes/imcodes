@@ -203,6 +203,12 @@ describe('package-lock filtering and node_modules pruning', () => {
     expect(shouldKeepPackageLockEntry('node_modules/@github/copilot-linuxmusl-x64', {
       optional: true, os: ['linux'], cpu: ['x64'],
     }, linuxX64)).toBe(false);
+    expect(shouldKeepPackageLockEntry('node_modules/@microsoft/copilot-sdk-linuxmusl-x64', {
+      optional: true, os: ['linux'], cpu: ['x64'],
+    }, linuxX64)).toBe(false);
+    expect(shouldKeepPackageLockEntry('node_modules/@microsoft/copilot-sdk-linux-x64', {
+      optional: true, os: ['linux'], cpu: ['x64'],
+    }, linuxX64)).toBe(true);
     expect(shouldKeepPackageLockEntry('node_modules/@img/colour', {}, linuxX64)).toBe(true);
     expect(shouldKeepPackageLockEntry('node_modules/@img/sharp-linux-x64', {
       optional: true, os: ['linux'], cpu: ['x64'],

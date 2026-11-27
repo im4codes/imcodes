@@ -23,7 +23,7 @@ const sdkMock = vi.hoisted(() => {
   };
 });
 
-vi.mock('@github/copilot-sdk', () => ({
+vi.mock('@microsoft/copilot-sdk', () => ({
   CopilotClient: vi.fn().mockImplementation((opts: unknown) => sdkMock.clientFactory(opts)),
 }));
 
@@ -57,7 +57,7 @@ describe('getCopilotRuntimeConfig', () => {
     sdkMock.clientFactory.mockReturnValue({
       start: vi.fn().mockResolvedValue(undefined),
       stop,
-      getStatus: vi.fn().mockResolvedValue({ version: '1.0.31', protocolVersion: 3 }),
+      getStatus: vi.fn().mockResolvedValue({ version: '1.0.117', protocolVersion: 4 }),
       getAuthStatus: vi.fn().mockResolvedValue({ isAuthenticated: true }),
       listModels: vi.fn().mockResolvedValue([
         { id: 'gpt-5', name: 'GPT-5', capabilities: { supports: { reasoningEffort: true } } },
@@ -66,13 +66,14 @@ describe('getCopilotRuntimeConfig', () => {
     });
 
     const config = await getCopilotRuntimeConfig(true);
+    expect(sdkMock.clientFactory).toHaveBeenCalledWith({ mode: 'coding-agent' });
     expect(config.availableModels).toEqual(['gpt-5', 'claude-sonnet-4.5']);
     expect(config.models).toEqual([
       { id: 'gpt-5', name: 'GPT-5', supportsReasoningEffort: true },
       { id: 'claude-sonnet-4.5', name: 'Claude Sonnet 4.5' },
     ]);
     expect(config.isAuthenticated).toBe(true);
-    expect(config.cliVersion).toBe('1.0.31');
+    expect(config.cliVersion).toBe('1.0.117');
     expect(config.probeError).toBeUndefined();
     // Singleton design: the CopilotClient is kept alive for the daemon's
     // lifetime (see clientPromise in copilot-runtime-config.ts). stop() must

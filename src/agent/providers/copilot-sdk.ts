@@ -51,26 +51,45 @@ import { PendingQuestionRegistry, type InteractiveQuestionAnswerer } from '../pe
 import { ASK_QUESTION_WAIT_MS } from '../../../shared/ask-question-timing.js';
 import { isAskQuestionToolName } from '../../../shared/ask-question-normalize.js';
 import { INTERACTIVE_QUESTION_TOOL_NAME } from '../../../shared/codex-user-input.js';
+import type {
+  CopilotClientOptions,
+  CreateSessionOptions,
+  GetAuthStatusResponse,
+  GetStatusResponse,
+  MessageOptions,
+  Model,
+  PermissionRequestResult,
+  ResumeSessionOptions,
+  SessionHooks,
+  SessionListFilter,
+  SessionMetadata,
+  UserInputRequest,
+  UserInputResponse,
+} from '@microsoft/copilot-sdk';
+
+type PreToolUseHookHandler = NonNullable<SessionHooks['onPreToolUse']>;
+type PreToolUseHookInput = Parameters<PreToolUseHookHandler>[0];
+type PreToolUseHookOutput = Awaited<ReturnType<PreToolUseHookHandler>>;
 
 const COPILOT_NATIVE_AGENT_TOOL_NAMES: ReadonlySet<string> = new Set(COPILOT_NATIVE_AGENT_TOOLS);
 
 /** The Copilot SDK pre-tool-use hook output this provider returns. */
 const COPILOT_BIN = 'copilot';
-const MIN_PROTOCOL_VERSION = 3;
-const COMPATIBLE_CLI_RANGE = '^1.0.31';
+const MIN_PROTOCOL_VERSION = 4;
+const COMPATIBLE_CLI_RANGE = '>=1.0.31';
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 
 export interface CopilotSdkRuntimeHooks {
-  loadSdk(): Promise<typeof import('@github/copilot-sdk')>;
+  loadSdk(): Promise<typeof import('@microsoft/copilot-sdk')>;
 }
 
 export const copilotSdkRuntimeHooks: CopilotSdkRuntimeHooks = {
-  loadSdk: async () => import('@github/copilot-sdk'),
+  loadSdk: async () => import('@microsoft/copilot-sdk'),
 };
 
 type CopilotSessionLike = {
   sessionId: string;
-  send(options: Record<string, unknown>): Promise<string | void>;
+  send(options: MessageOptions): Promise<string | void>;
   abort(): Promise<void>;
   setModel(model: string, options?: Record<string, unknown>): Promise<void>;
   on(handler: (event: Record<string, any>) => void): () => void;
@@ -89,24 +108,13 @@ type CopilotSessionLike = {
 type CopilotClientLike = {
   start(): Promise<void>;
   stop(): Promise<Error[] | void>;
-  getStatus(): Promise<{ version: string; protocolVersion: number }>;
-  getAuthStatus(): Promise<{ isAuthenticated: boolean; statusMessage?: string }>;
-  createSession(config: Record<string, unknown>): Promise<CopilotSessionLike>;
-  resumeSession(sessionId: string, config: Record<string, unknown>): Promise<CopilotSessionLike>;
-  listSessions(filter?: Record<string, unknown>): Promise<Array<{
-    sessionId: string;
-    summary?: string;
-    modifiedTime?: Date | string | number;
-    context?: { cwd?: string };
-  }>>;
+  getStatus(): Promise<GetStatusResponse>;
+  getAuthStatus(): Promise<GetAuthStatusResponse>;
+  createSession(config: CreateSessionOptions): Promise<CopilotSessionLike>;
+  resumeSession(sessionId: string, config: ResumeSessionOptions): Promise<CopilotSessionLike>;
+  listSessions(filter?: SessionListFilter): Promise<SessionMetadata[]>;
   deleteSession(sessionId: string): Promise<void>;
-  listModels(): Promise<Array<{
-    id: string;
-    name?: string;
-    capabilities?: { supports?: { reasoningEffort?: boolean } };
-    supportedReasoningEfforts?: string[];
-    defaultReasoningEffort?: string;
-  }>>;
+  listModels(): Promise<Model[]>;
 };
 
 type CopilotOperation = 'idle' | 'turn' | 'compact' | 'cancelling';
@@ -127,7 +135,7 @@ interface PendingApproval {
   requestId: string;
   generation: number;
   timer: ReturnType<typeof setTimeout> | null;
-  resolve: (result: Record<string, unknown>) => void;
+  resolve: (result: PermissionRequestResult) => void;
 }
 
 interface CopilotSessionState {
@@ -144,12 +152,8 @@ interface CopilotSessionState {
   currentText: string;
   completionEmittedForCurrentTurn: boolean;
   /** Per-turn token usage from copilot's `assistant.usage` event. The
-   *  upstream `@github/copilot` SDK ships ALL four fields (verified against
-   *  copilot-sdk/generated/session-events.d.ts:1554-1580) but the previous
-   *  implementation only read `outputTokens`, leaving every copilot turn at
-   *  input_tokens=0/cache=0 in `context_turn_usage`. The chat-header context
-   *  bar showed "0 / N" because transport-relay's normalize step couldn't
-   *  find any input_tokens to display. */
+   *  upstream `@microsoft/copilot-sdk` ships ALL four fields (verified against
+   *  generated/session-events.d.ts) — read them all cleanly. */
   currentOutputTokens?: number;
   currentInputTokens?: number;
   currentCacheReadTokens?: number;
@@ -196,12 +200,13 @@ function mapEffortToCopilot(effort: TransportEffortLevel | undefined): 'low' | '
 
 function isCompatibleCopilotCliVersion(version: string | undefined): boolean {
   if (!isNonEmptyString(version)) return false;
-  const match = version.trim().match(/^(\d+)\.(\d+)\.(\d+)$/);
+  const match = version.trim().match(/^(\d+)\.(\d+)\.(\d+)/);
   if (!match) return false;
   const major = Number(match[1]);
   const minor = Number(match[2]);
   const patch = Number(match[3]);
-  if (major !== 1) return false;
+  if (major > 1) return true;
+  if (major < 1) return false;
   return minor > 0 || patch >= 31;
 }
 
@@ -215,10 +220,10 @@ function stringifyUnknown(value: unknown): string | undefined {
   }
 }
 
-function toAttachmentPayload(attachments: TransportAttachment[] | undefined): Array<Record<string, unknown>> | undefined {
+function toAttachmentPayload(attachments: TransportAttachment[] | undefined): MessageOptions['attachments'] | undefined {
   if (!attachments?.length) return undefined;
   return attachments.map((attachment) => ({
-    type: 'file',
+    type: 'file' as const,
     path: attachment.daemonPath,
     ...(attachment.originalName ? { displayName: attachment.originalName } : {}),
   }));
@@ -236,7 +241,11 @@ function buildApprovalDescription(request: Record<string, unknown>): string {
       return command ? `Allow shell command: ${command}` : 'Allow shell command';
     }
     case 'write': {
-      const filePath = isNonEmptyString(request.filePath) ? request.filePath : undefined;
+      const filePath = isNonEmptyString(request.fileName)
+        ? request.fileName
+        : isNonEmptyString(request.filePath)
+          ? request.filePath
+          : undefined;
       return filePath ? `Allow file write: ${filePath}` : 'Allow file write';
     }
     case 'url': {
@@ -253,7 +262,11 @@ function buildApprovalDescription(request: Record<string, unknown>): string {
       return `Allow custom tool ${toolName}`;
     }
     case 'read': {
-      const filePath = isNonEmptyString(request.filePath) ? request.filePath : undefined;
+      const filePath = isNonEmptyString(request.path)
+        ? request.path
+        : isNonEmptyString(request.filePath)
+          ? request.filePath
+          : undefined;
       return filePath ? `Allow file read: ${filePath}` : 'Allow file read';
     }
     default:
@@ -333,7 +346,7 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
 
   private config: ProviderConfig | null = null;
   private approvalTimeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS;
-  private sdk: typeof import('@github/copilot-sdk') | null = null;
+  private sdk: typeof import('@microsoft/copilot-sdk') | null = null;
   private client: CopilotClientLike | null = null;
   private sessions = new Map<string, CopilotSessionState>();
   private readonly questions = new PendingQuestionRegistry<{ answer: string; wasFreeform: boolean }>();
@@ -366,9 +379,15 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
   async connect(config: ProviderConfig): Promise<void> {
     const sdk = await copilotSdkRuntimeHooks.loadSdk();
     const resolvedBinary = this.resolveBinaryPath(config);
-    const client = new sdk.CopilotClient(
-      resolvedBinary ? { connection: { kind: 'stdio', path: resolvedBinary } } : undefined,
-    ) as unknown as CopilotClientLike;
+    const clientOptions: CopilotClientOptions = resolvedBinary
+      ? {
+          mode: 'coding-agent',
+          runtime: sdk.RuntimeConnection?.forSpawnedStdio
+            ? sdk.RuntimeConnection.forSpawnedStdio({ path: resolvedBinary })
+            : { kind: 'spawned-stdio', path: resolvedBinary },
+        }
+      : { mode: 'coding-agent' };
+    const client = new sdk.CopilotClient(clientOptions) as unknown as CopilotClientLike;
     try {
       await client.start();
       const status = await client.getStatus();
@@ -994,17 +1013,23 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
   async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
     const client = this.assertConnected();
     const directory = typeof options.directory === 'string' ? options.directory.trim() : '';
-    const sessions = await client.listSessions(directory ? { cwd: directory } : undefined);
+    const sessions = await client.listSessions(directory ? { workingDirectory: directory } : undefined);
     return sessions
       .filter((session) => !this.poisonedSessionIds.has(session.sessionId))
-      .map((session) => ({
-        key: session.sessionId,
-        ...(session.summary ? { displayName: session.summary } : {}),
-        ...(typeof session.context?.cwd === 'string' && session.context.cwd.trim()
-          ? { directory: session.context.cwd.trim() }
-          : {}),
-        ...(session.modifiedTime ? { updatedAt: new Date(session.modifiedTime).getTime() } : {}),
-      }));
+      .map((session) => {
+        const ctx = session.context as { workingDirectory?: unknown; cwd?: unknown } | undefined;
+        const rawDir = typeof ctx?.workingDirectory === 'string'
+          ? ctx.workingDirectory
+          : typeof ctx?.cwd === 'string'
+            ? ctx.cwd
+            : '';
+        return {
+          key: session.sessionId,
+          ...(session.summary ? { displayName: session.summary } : {}),
+          ...(rawDir.trim() ? { directory: rawDir.trim() } : {}),
+          ...(session.modifiedTime ? { updatedAt: new Date(session.modifiedTime).getTime() } : {}),
+        };
+      });
   }
 
   private async createSdkSession(config: SessionConfig, model?: string, effort?: TransportEffortLevel): Promise<CopilotSessionLike> {
@@ -1017,19 +1042,37 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
     return client.resumeSession(sessionId, this.buildSessionConfig(config, model, effort));
   }
 
-  private buildSessionConfig(config: SessionConfig, model?: string, effort?: TransportEffortLevel): Record<string, unknown> {
+  private buildSessionConfig(
+    config: SessionConfig,
+    model?: string,
+    effort?: TransportEffortLevel,
+  ): CreateSessionOptions & ResumeSessionOptions {
     const routeId = config.bindExistingKey ?? config.sessionKey;
+    const mappedEffort = mapEffortToCopilot(effort);
     return {
       workingDirectory: config.cwd,
       ...(model ? { model } : {}),
-      ...(mapEffortToCopilot(effort) ? { reasoningEffort: mapEffortToCopilot(effort) } : {}),
-      mcpServers: getDefaultMcpServers(config),
-      onPermissionRequest: (request: Record<string, unknown>) => this.handlePermissionRequest(routeId, request),
-      onUserInputRequest: (request: Record<string, unknown>) => this.handleUserInputRequest(routeId, request),
+      ...(mappedEffort ? { inference: { reasoningEffort: mappedEffort } } : {}),
+      mcp: {
+        servers: getDefaultMcpServers(config),
+      },
+      permissions: {
+        onRequest: (request) => this.handlePermissionRequest(routeId, request as unknown as Record<string, unknown>),
+      },
+      interaction: {
+        onUserInputRequest: (request: UserInputRequest) =>
+          this.handleUserInputRequest(routeId, request as unknown as Record<string, unknown>),
+      },
+      events: {
+        streaming: true,
+      },
       // Created and resumed sessions both carry it: the CLI asks before every
       // tool, independently of the permission mode.
       hooks: {
-        onPreToolUse: (input: unknown) => this.evaluateNativeAgentToolUse(routeId, input),
+        handlers: {
+          onPreToolUse: (input: PreToolUseHookInput): PreToolUseHookOutput | undefined =>
+            this.evaluateNativeAgentToolUse(routeId, input),
+        },
       },
     };
   }
@@ -1290,7 +1333,7 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
     routeId: string,
     request: Record<string, unknown>,
     generationOverride?: number,
-  ): Promise<Record<string, unknown>> {
+  ): Promise<PermissionRequestResult> {
     const state = this.getSessionState(routeId);
     if (!state) {
       return { kind: 'denied-no-approval-rule-and-could-not-request-from-user' };
@@ -1304,7 +1347,7 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
       return { kind: 'denied-no-approval-rule-and-could-not-request-from-user' };
     }
     this.emitStatus(routeId, { status: 'permission', label: 'Waiting for approval' });
-    return await new Promise<Record<string, unknown>>((resolve) => {
+    return await new Promise<PermissionRequestResult>((resolve) => {
       const timer = setTimeout(() => {
         const pending = state.pendingApprovals.get(requestId);
         if (!pending || pending.generation !== generation) return;
@@ -1325,7 +1368,7 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
   private async handleUserInputRequest(
     routeId: string,
     request: Record<string, unknown>,
-  ): Promise<{ answer: string; wasFreeform: boolean }> {
+  ): Promise<UserInputResponse> {
     const state = this.getSessionState(routeId);
     const question = typeof request.question === 'string' ? request.question.trim() : '';
     if (!state || state.cancelRequested || !question) {
@@ -1510,14 +1553,13 @@ export class CopilotSdkProvider implements TransportProvider, InteractiveQuestio
   }
 
   private resolveBinaryPath(config: ProviderConfig): string | undefined {
-    // The Copilot SDK requires `cliPath` to be an absolute path to an existing
-    // file (it runs `existsSync` before spawning). Passing just the name
-    // `"copilot"` makes the SDK fail with "Copilot CLI not found at copilot."
-    //
-    // We only override the SDK's bundled CLI when:
+    // In v2 (`@microsoft/copilot-sdk`), omitting `runtime` defaults to the
+    // in-process native runtime (`runtime.node` via FFI). Passing an explicit
+    // `RuntimeConnection.forSpawnedStdio({ path })` requires an existing
+    // executable path, so we only override when:
     //   1. The caller explicitly passed an absolute binaryPath that exists, OR
-    //   2. On Windows, the PATH-resolved binary is an absolute existing file.
-    // Otherwise we return `undefined` so the SDK falls back to its bundled CLI binary.
+    //   2. On Windows, a PATH-resolved `copilot` binary is an absolute existing file.
+    // Otherwise we return `undefined` so the SDK uses its bundled in-process runtime.
     if (isNonEmptyString(config.binaryPath)) {
       const candidate = config.binaryPath.trim();
       if (path.isAbsolute(candidate) && existsSync(candidate)) return candidate;

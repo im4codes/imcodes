@@ -18,7 +18,7 @@ import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../../src/agent/transport-p
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /**
- * Build a fake @github/copilot-sdk whose CopilotClient hands back a session
+ * Build a fake @microsoft/copilot-sdk whose CopilotClient hands back a session
  * that captures the single event handler passed to `on(handler)`. The test
  * drives that captured handler with a hand-built event sequence to exercise
  * the `assistant.message_delta` accumulator-reset across message boundaries.
@@ -41,9 +41,8 @@ function makeFakeSdk() {
   class FakeCopilotClient {
     start = vi.fn().mockResolvedValue(undefined);
     stop = vi.fn().mockResolvedValue(undefined);
-    // 1.0.31 / protocol 3 are the minimum compatible values the provider's
-    // connect() guard accepts (isCompatibleCopilotCliVersion + MIN_PROTOCOL_VERSION).
-    getStatus = vi.fn().mockResolvedValue({ version: '1.0.31', protocolVersion: 3 });
+    // 1.0.117 / protocol 4 match @microsoft/copilot-sdk v2 requirements in connect().
+    getStatus = vi.fn().mockResolvedValue({ version: '1.0.117', protocolVersion: 4 });
     getAuthStatus = vi.fn().mockResolvedValue({ isAuthenticated: true });
     listModels = vi.fn().mockResolvedValue([]);
     createSession = vi.fn().mockResolvedValue(session);
@@ -54,7 +53,7 @@ function makeFakeSdk() {
   return {
     captured,
     session,
-    sdk: { CopilotClient: FakeCopilotClient } as unknown as typeof import('@github/copilot-sdk'),
+    sdk: { CopilotClient: FakeCopilotClient } as unknown as typeof import('@microsoft/copilot-sdk'),
   };
 }
 
@@ -265,7 +264,7 @@ describe('CopilotSdkProvider streaming accumulator', () => {
     class CapturingClient {
       start = vi.fn().mockResolvedValue(undefined);
       stop = vi.fn().mockResolvedValue(undefined);
-      getStatus = vi.fn().mockResolvedValue({ version: '1.0.31', protocolVersion: 3 });
+      getStatus = vi.fn().mockResolvedValue({ version: '1.0.117', protocolVersion: 4 });
       getAuthStatus = vi.fn().mockResolvedValue({ isAuthenticated: true });
       listModels = vi.fn().mockResolvedValue([]);
       createSession = vi.fn().mockImplementation(async (cfg: Record<string, any>) => {
@@ -279,7 +278,7 @@ describe('CopilotSdkProvider streaming accumulator', () => {
       listSessions = vi.fn().mockResolvedValue([]);
       deleteSession = vi.fn().mockResolvedValue(undefined);
     }
-    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue({ CopilotClient: CapturingClient } as unknown as typeof import('@github/copilot-sdk'));
+    copilotSdkRuntimeHooks.loadSdk = vi.fn().mockResolvedValue({ CopilotClient: CapturingClient } as unknown as typeof import('@microsoft/copilot-sdk'));
 
     const provider = new CopilotSdkProvider();
     const tools: Array<{ sessionId: string; tool: any }> = [];
@@ -291,7 +290,8 @@ describe('CopilotSdkProvider streaming accumulator', () => {
       cwd: '/tmp/project',
     });
 
-    expect(typeof capturedConfig?.onUserInputRequest).toBe('function');
+    const onUserInputRequest = capturedConfig?.interaction?.onUserInputRequest;
+    expect(typeof onUserInputRequest).toBe('function');
 
     // Native ask_user tool execution events must not emit duplicate cards alongside onUserInputRequest
     fake.captured.handler?.({
@@ -305,7 +305,7 @@ describe('CopilotSdkProvider streaming accumulator', () => {
     expect(tools).toHaveLength(0);
 
     // 1. Choice answer -> wasFreeform: false
-    const p1 = capturedConfig!.onUserInputRequest({
+    const p1 = onUserInputRequest({
       question: 'Choose mode?',
       choices: ['Fast', 'Safe'],
       allowFreeform: true,
@@ -325,7 +325,7 @@ describe('CopilotSdkProvider streaming accumulator', () => {
     await expect(p1).resolves.toEqual({ answer: 'Fast', wasFreeform: false });
 
     // 2. Freeform answer -> wasFreeform: true
-    const p2 = capturedConfig!.onUserInputRequest({
+    const p2 = onUserInputRequest({
       question: 'Choose mode?',
       choices: ['Fast', 'Safe'],
     });
@@ -333,12 +333,12 @@ describe('CopilotSdkProvider streaming accumulator', () => {
     await expect(p2).resolves.toEqual({ answer: 'Custom plan', wasFreeform: true });
 
     // 3. Cancel & disconnect release pending wait with fallback
-    const p3 = capturedConfig!.onUserInputRequest({ question: 'Cancelled?' });
+    const p3 = onUserInputRequest({ question: 'Cancelled?' });
     await provider.cancel('route-copilot-ask');
     await expect(p3).resolves.toEqual({ answer: '', wasFreeform: true });
     expect(provider.answerPendingQuestion('deck_cop_brain', 'Late')).toBe(false);
 
-    const p4 = capturedConfig!.onUserInputRequest({ question: 'Disconnected?' });
+    const p4 = onUserInputRequest({ question: 'Disconnected?' });
     await provider.disconnect();
     await expect(p4).resolves.toEqual({ answer: '', wasFreeform: true });
   });

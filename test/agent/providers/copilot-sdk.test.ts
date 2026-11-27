@@ -17,6 +17,26 @@ vi.mock('../../../src/util/logger.js', () => ({
 }));
 
 type FakeSessionConfig = Record<string, unknown> & {
+  permissions?: {
+    onRequest?: (request: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  };
+  interaction?: {
+    onUserInputRequest?: (request: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  };
+  hooks?: {
+    handlers?: {
+      onPreToolUse?: (input: Record<string, unknown>) => unknown;
+    };
+  };
+  mcp?: {
+    servers?: Record<string, unknown>;
+  };
+  inference?: {
+    reasoningEffort?: string;
+  };
+  events?: {
+    streaming?: boolean;
+  };
   onPermissionRequest?: (request: Record<string, unknown>) => Promise<Record<string, unknown>> | Record<string, unknown>;
 };
 
@@ -72,8 +92,8 @@ function createCopilotHarness(options?: {
     start = vi.fn(async () => {});
     stop = vi.fn(async () => {});
     getStatus = vi.fn(async () => ({
-      version: options?.version ?? '1.0.31',
-      protocolVersion: options?.protocolVersion ?? 3,
+      version: options?.version ?? '1.0.117',
+      protocolVersion: options?.protocolVersion ?? 4,
     }));
     getAuthStatus = vi.fn(async () => ({
       isAuthenticated: options?.authenticated ?? true,
@@ -96,15 +116,15 @@ function createCopilotHarness(options?: {
       listSessionFilters.push(filter);
       return [...sessions.values()]
         .filter((session) => (
-          typeof filter?.cwd !== 'string'
-          || session.config.workingDirectory === filter.cwd
+          typeof filter?.workingDirectory !== 'string'
+          || session.config.workingDirectory === filter.workingDirectory
         ))
         .map((session) => ({
           sessionId: session.sessionId,
           summary: `summary:${session.sessionId}`,
           modifiedTime: new Date('2026-01-01T00:00:00Z'),
           context: {
-            cwd: String(session.config.workingDirectory ?? ''),
+            workingDirectory: String(session.config.workingDirectory ?? ''),
           },
         }));
     });
@@ -141,7 +161,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     expect(provider.getMemoryMcpStatus()).toMatchObject({
       providerId: 'copilot-sdk',
@@ -164,7 +184,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
     const deltas: Array<{ sessionId: string; text: string }> = [];
     provider.onDelta((sessionId, delta) => deltas.push({ sessionId, text: delta.delta }));
     await provider.connect({ binaryPath: 'copilot' });
@@ -206,7 +226,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     const approvals: Array<Record<string, unknown>> = [];
     provider.onApprovalRequest((_, req) => approvals.push(req as Record<string, unknown>));
@@ -214,7 +234,7 @@ describe('CopilotSdkProvider', () => {
     const routeId = await provider.createSession({ sessionKey: 'route-1', cwd: '/tmp/project', agentId: 'gpt-5.4' });
 
     const client = (provider as unknown as { client?: InstanceType<typeof harness.FakeClient> }).client;
-    const permissionHandler = harness.createdConfigs[0]?.onPermissionRequest as ((request: Record<string, unknown>) => Promise<Record<string, unknown>>) | undefined;
+    const permissionHandler = harness.createdConfigs[0]?.permissions?.onRequest;
     expect(permissionHandler).toBeTypeOf('function');
 
     const pending = permissionHandler?.({ kind: 'shell', fullCommandText: 'printf hello' });
@@ -237,7 +257,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     await provider.connect({ binaryPath: 'copilot' });
     await provider.createSession({ sessionKey: 'route-2', cwd: '/tmp/project' });
@@ -254,7 +274,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     provider.onApprovalRequest(() => {});
     await provider.connect({ binaryPath: 'copilot', approvalTimeoutMs: 50 });
@@ -275,7 +295,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     const statuses: Array<Record<string, unknown>> = [];
     const completions: Array<Record<string, unknown>> = [];
@@ -317,7 +337,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     const completions: Array<Record<string, unknown>> = [];
     provider.onComplete((_, message) => completions.push(message as Record<string, unknown>));
@@ -360,7 +380,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     const errors: string[] = [];
     provider.onError((_, error) => errors.push(error.message));
@@ -384,7 +404,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     const completions: string[] = [];
     const errors: string[] = [];
@@ -413,7 +433,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     await provider.connect({ binaryPath: 'copilot' });
     const routeId = await provider.createSession({ sessionKey: 'route-4', cwd: '/tmp/project', agentId: 'gpt-5.4' });
@@ -452,7 +472,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     await provider.connect({ binaryPath: 'copilot' });
     await provider.createSession({ sessionKey: 'route-a', cwd: '/tmp/project-a' });
@@ -464,7 +484,7 @@ describe('CopilotSdkProvider', () => {
         directory: '/tmp/project-b',
       }),
     ]);
-    expect(harness.listSessionFilters).toEqual([{ cwd: '/tmp/project-b' }]);
+    expect(harness.listSessionFilters).toEqual([{ workingDirectory: '/tmp/project-b' }]);
   });
 
   it('waits for idle before completing a tool-driven turn with an initially empty assistant message', async () => {
@@ -472,7 +492,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     await provider.connect({ binaryPath: 'copilot' });
     const routeId = await provider.createSession({ sessionKey: 'route-5', cwd: '/tmp/project', agentId: 'gpt-5.4' });
@@ -522,7 +542,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     await provider.connect({ binaryPath: 'copilot' });
     const routeId = await provider.createSession({ sessionKey: 'route-usage', cwd: '/tmp/project', agentId: 'gpt-5.4' });
@@ -569,7 +589,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     await provider.connect({ binaryPath: 'copilot' });
     const routeId = await provider.createSession({ sessionKey: 'route-attachments', cwd: '/tmp/project' });
@@ -619,7 +639,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     await provider.connect({ binaryPath: 'copilot' });
     const routeId = await provider.createSession({ sessionKey: 'route-late-taint', cwd: '/tmp/project', agentId: 'gpt-5.4' });
@@ -647,7 +667,7 @@ describe('CopilotSdkProvider', () => {
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as typeof import('@microsoft/copilot-sdk');
 
     await provider.connect({ binaryPath: 'copilot' });
     const routeId = await provider.createSession({ sessionKey: 'route-metadata', cwd: '/tmp/project', agentId: 'gpt-5.4' });
@@ -674,13 +694,22 @@ describe('CopilotSdkProvider', () => {
     });
   });
 
-  it('rejects incompatible versions and unauthenticated clients at connect time', async () => {
+  it('rejects incompatible versions, protocol v3, and unauthenticated clients at connect time', async () => {
     const incompatibleHarness = createCopilotHarness({ version: '0.9.0' });
     const incompatibleProvider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: incompatibleHarness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as unknown as typeof import('@microsoft/copilot-sdk');
     await expect(incompatibleProvider.connect({ binaryPath: 'copilot' })).rejects.toMatchObject({
+      code: 'CONFIG_ERROR',
+    });
+
+    const oldProtocolHarness = createCopilotHarness({ version: '1.0.117', protocolVersion: 3 });
+    const oldProtocolProvider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: oldProtocolHarness.FakeClient,
+    }) as unknown as typeof import('@microsoft/copilot-sdk');
+    await expect(oldProtocolProvider.connect({ binaryPath: 'copilot' })).rejects.toMatchObject({
       code: 'CONFIG_ERROR',
     });
 
@@ -688,18 +717,18 @@ describe('CopilotSdkProvider', () => {
     const authProvider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: authHarness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as unknown as typeof import('@microsoft/copilot-sdk');
     await expect(authProvider.connect({ binaryPath: 'copilot' })).rejects.toMatchObject({
       code: 'AUTH_FAILED',
     });
   });
 
-  it('passes xhigh for max effort on createSession, resumeSession, and setModel/setSessionEffort', async () => {
-    const harness = createCopilotHarness({ version: '1.0.112' });
+  it('passes xhigh for max effort inside v2 inference options on createSession, resumeSession, and setModel/setSessionEffort', async () => {
+    const harness = createCopilotHarness({ version: '1.0.117', protocolVersion: 4 });
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: harness.FakeClient,
-    }) as typeof import('@github/copilot-sdk');
+    }) as unknown as typeof import('@microsoft/copilot-sdk');
 
     await provider.connect({ binaryPath: 'copilot' });
     const routeId = await provider.createSession({
@@ -710,7 +739,8 @@ describe('CopilotSdkProvider', () => {
     });
     expect(harness.createdConfigs[0]).toMatchObject({
       model: 'gpt-5.4',
-      reasoningEffort: 'xhigh',
+      inference: { reasoningEffort: 'xhigh' },
+      events: { streaming: true },
     });
 
     provider.setSessionEffort(routeId, 'high');
@@ -727,12 +757,13 @@ describe('CopilotSdkProvider', () => {
     });
     expect(harness.resumedConfigs[0]?.config).toMatchObject({
       model: 'gpt-5.4',
-      reasoningEffort: 'xhigh',
+      inference: { reasoningEffort: 'xhigh' },
+      events: { streaming: true },
     });
   });
 
-  it('passes an explicit absolute binaryPath via 1.0.34 stdio connection.path', async () => {
-    const harness = createCopilotHarness({ version: '1.0.112' });
+  it('uses mode=coding-agent by default and RuntimeConnection.forSpawnedStdio when an explicit absolute binaryPath is given', async () => {
+    const harness = createCopilotHarness({ version: '1.0.117', protocolVersion: 4 });
     const clientCtors: unknown[] = [];
     const CapturingClient = class extends harness.FakeClient {
       constructor(opts?: unknown) {
@@ -740,15 +771,85 @@ describe('CopilotSdkProvider', () => {
         clientCtors.push(opts);
       }
     };
+    const forSpawnedStdio = vi.fn((opts: { path?: string }) => ({ kind: 'spawned-stdio', path: opts.path }));
     const provider = new CopilotSdkProvider();
     copilotSdkRuntimeHooks.loadSdk = async () => ({
       CopilotClient: CapturingClient,
-    }) as unknown as typeof import('@github/copilot-sdk');
+      RuntimeConnection: { forSpawnedStdio },
+    }) as unknown as typeof import('@microsoft/copilot-sdk');
 
+    // Without an external binary on PATH/config, falls back to v2 in-process runtime (`mode: 'coding-agent'` only).
+    await provider.connect({ binaryPath: 'copilot' });
+    expect(clientCtors[0]).toEqual({ mode: 'coding-agent' });
+    await provider.disconnect();
+
+    // Explicit existing binary path routes through RuntimeConnection.forSpawnedStdio.
     await provider.connect({ binaryPath: process.execPath });
-    expect(clientCtors[0]).toEqual({
-      connection: { kind: 'stdio', path: process.execPath },
+    expect(forSpawnedStdio).toHaveBeenCalledWith({ path: process.execPath });
+    expect(clientCtors[1]).toEqual({
+      mode: 'coding-agent',
+      runtime: { kind: 'spawned-stdio', path: process.execPath },
     });
+    await provider.disconnect();
+  });
+
+  it('wires v2 mcp.servers, hooks.handlers.onPreToolUse native-agent gate, v2 write/read approval labels, and isolates concurrent sessions', async () => {
+    const harness = createCopilotHarness({ version: '1.0.117', protocolVersion: 4 });
+    const provider = new CopilotSdkProvider();
+    copilotSdkRuntimeHooks.loadSdk = async () => ({
+      CopilotClient: harness.FakeClient,
+    }) as unknown as typeof import('@microsoft/copilot-sdk');
+
+    const gateEvents: Array<{ sessionId: string; toolName: string; requestText: string }> = [];
+    provider.setNativeCollaborationGate((sessionId, event) => {
+      gateEvents.push({ sessionId, toolName: event.toolName, requestText: event.requestText });
+    });
+
+    const deltas: Array<{ sid: string; text: string }> = [];
+    const approvals: Array<{ sid: string; id: string; desc: string; tool?: string }> = [];
+    provider.onDelta((sid, delta) => deltas.push({ sid, text: delta.delta }));
+    provider.onApprovalRequest((sid, req) => approvals.push({ sid, id: req.id, desc: req.description, tool: req.tool }));
+
+    await provider.connect({ binaryPath: 'copilot' });
+    const r1 = await provider.createSession({ sessionKey: 'route-iso-1', cwd: '/tmp/p1' });
+    const r2 = await provider.createSession({ sessionKey: 'route-iso-2', cwd: '/tmp/p2' });
+    expect(r1).toBe('route-iso-1');
+    expect(r2).toBe('route-iso-2');
+
+    // v2 MCP + hook wiring
+    expect(harness.createdConfigs[0]?.mcp?.servers).toHaveProperty('imcodes-memory');
+    const preHook1 = harness.createdConfigs[0]?.hooks?.handlers?.onPreToolUse;
+    expect(preHook1).toBeTypeOf('function');
+    preHook1?.({ toolName: 'task', toolArgs: { prompt: 'delegate work' } });
+    expect(gateEvents).toEqual([
+      { sessionId: 'route-iso-1', toolName: 'task', requestText: 'delegate work' },
+    ]);
+
+    // Concurrent session delta & approval isolation
+    const s1 = harness.sessions.get('session-1')!;
+    const s2 = harness.sessions.get('session-2')!;
+    s1.emit({ type: 'assistant.message_delta', data: { messageId: 'm-s1', deltaContent: 'from-s1' } });
+    s2.emit({ type: 'assistant.message_delta', data: { messageId: 'm-s2', deltaContent: 'from-s2' } });
+    expect(deltas).toEqual([
+      { sid: 'route-iso-1', text: 'from-s1' },
+      { sid: 'route-iso-2', text: 'from-s2' },
+    ]);
+
+    const pWrite = harness.createdConfigs[0]!.permissions!.onRequest!({ kind: 'write', fileName: 'src/a.ts' });
+    const pRead = harness.createdConfigs[1]!.permissions!.onRequest!({ kind: 'read', path: 'README.md' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(approvals).toHaveLength(2);
+    expect(approvals[0]).toMatchObject({ sid: 'route-iso-1', desc: 'Allow file write: src/a.ts', tool: 'write' });
+    expect(approvals[1]).toMatchObject({ sid: 'route-iso-2', desc: 'Allow file read: README.md', tool: 'read' });
+
+    // Responding on wrong route rejects cleanly without settling the other session's pending approval.
+    await expect(provider.respondApproval('route-iso-2', approvals[0].id, true)).rejects.toMatchObject({
+      message: expect.stringContaining('Unknown approval request'),
+    });
+    await provider.respondApproval('route-iso-1', approvals[0].id, true);
+    await provider.respondApproval('route-iso-2', approvals[1].id, false);
+    await expect(pWrite).resolves.toEqual({ kind: 'approved' });
+    await expect(pRead).resolves.toEqual({ kind: 'denied-interactively-by-user' });
     await provider.disconnect();
   });
 });

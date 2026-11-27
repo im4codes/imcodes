@@ -1,6 +1,9 @@
 import { EventEmitter } from 'node:events';
 
 type SessionConfig = Record<string, unknown> & {
+  permissions?: {
+    onRequest?: (request: Record<string, unknown>, invocation: { sessionId: string }) => Promise<unknown> | unknown;
+  };
   onPermissionRequest?: (request: Record<string, unknown>, invocation: { sessionId: string }) => Promise<unknown> | unknown;
 };
 
@@ -53,7 +56,7 @@ export function createCopilotSdkHarness() {
       listModels: 0,
       deleteSession: [],
     },
-    status: { version: '1.0.31', protocolVersion: 3 },
+    status: { version: '1.0.117', protocolVersion: 4 },
     auth: { isAuthenticated: true, statusMessage: 'Logged in' },
     models: [{ id: 'gpt-5.4' }, { id: 'gpt-5.4-mini' }],
     startError: null,
@@ -101,7 +104,7 @@ export function createCopilotSdkHarness() {
     }
 
     requestPermission(request: Record<string, unknown>): Promise<unknown> {
-      const handler = this.config.onPermissionRequest;
+      const handler = this.config.permissions?.onRequest ?? this.config.onPermissionRequest;
       if (!handler) {
         return Promise.resolve({ kind: 'denied-no-approval-rule-and-could-not-request-from-user' });
       }
@@ -163,6 +166,12 @@ export function createCopilotSdkHarness() {
     async resumeSession(sessionId: string, config: SessionConfig): Promise<FakeCopilotSession> {
       const existing = sessions.find((session) => session.sessionId === sessionId);
       if (existing) {
+        if (config.permissions?.onRequest) {
+          existing.config.permissions = {
+            ...existing.config.permissions,
+            onRequest: config.permissions.onRequest,
+          };
+        }
         existing.config.onPermissionRequest = config.onPermissionRequest ?? existing.config.onPermissionRequest;
         return existing as unknown as FakeCopilotSession;
       }
