@@ -4441,6 +4441,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // set state right after is unchanged.
   const pendingScrollFrameRef = useRef<number | null>(null);
   const pendingEngageFollowRef = useRef(false);
+  const pendingGrowthRepinRef = useRef(false);
   const pendingVisibleScrollToBottomRef = useRef(false);
   const isMountedRef = useRef(true);
   const hasInitialPinCompletedRef = useRef(false);
@@ -4470,6 +4471,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
 
   const pinScrollToBottomNow = (el: HTMLDivElement, clampToBottom = false) => {
     markProgrammaticScroll();
+    pendingGrowthRepinRef.current = false;
     el.scrollTop = clampToBottom && el.clientHeight > 0
       ? Math.max(0, el.scrollHeight - el.clientHeight)
       : el.scrollHeight;
@@ -4499,6 +4501,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (!visibleRef.current) {
       if (engageFollow) {
         pendingVisibleScrollToBottomRef.current = true;
+      } else {
+        pendingGrowthRepinRef.current = false;
       }
       return undefined;
     }
@@ -4506,6 +4510,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (!el) {
       if (engageFollow) {
         pendingVisibleScrollToBottomRef.current = true;
+      } else {
+        pendingGrowthRepinRef.current = false;
       }
       return undefined;
     }
@@ -4517,6 +4523,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       pendingScrollFrameRef.current = null;
       const shouldEngage = pendingEngageFollowRef.current;
       pendingEngageFollowRef.current = false;
+      pendingGrowthRepinRef.current = false;
       if (!visibleRef.current) {
         if (shouldEngage) {
           pendingVisibleScrollToBottomRef.current = true;
@@ -4648,6 +4655,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       const targetTop = Math.max(0, root.scrollHeight - root.clientHeight);
       if (Math.abs(root.scrollTop - targetTop) > 1) {
         markProgrammaticScroll();
+        pendingGrowthRepinRef.current = false;
         root.scrollTop = targetTop;
         lastScrollTopRef.current = root.scrollTop;
         lastScrollHeightRef.current = root.scrollHeight;
@@ -4668,6 +4676,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     });
     if (correction?.kind === 'pin') {
       markProgrammaticScroll();
+      pendingGrowthRepinRef.current = false;
       root.scrollTop = correction.targetTop;
       lastScrollTopRef.current = root.scrollTop;
       lastScrollHeightRef.current = root.scrollHeight;
@@ -4993,6 +5002,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const resetFollowRefsForSwitch = (engageFollow: boolean) => {
     autoScrollRef.current = true;
     pendingEngageFollowRef.current = engageFollow;
+    pendingGrowthRepinRef.current = false;
     hasInitialScrolledRef.current = false;
     hasInitialPinCompletedRef.current = false;
     userScrollUpUntilRef.current = 0;
@@ -5024,7 +5034,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const renderBecameVisible = !preview && !renderVisibleRef.current && visible && !pendingPinnedLocateIdRef.current;
   renderVisibleRef.current = visible;
   if (renderBecameVisible) {
-    resetFollowRefsForSwitch(false);
+    resetFollowRefsForSwitch(pendingVisibleScrollToBottomRef.current);
   }
 
   // Clear React state + load-older timer synchronously in layout effect when (serverId, sessionId) changes.
@@ -5060,7 +5070,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       scrollToBottom(true);
     }
     if (preview) return;
-    if (becameVisible && !pendingPinnedLocateIdRef.current) {
+    if (becameVisible && !hasPendingVisibleScroll && !pendingPinnedLocateIdRef.current) {
       resetFollowRefsForSwitch(false);
       resetFollowUiStateForSwitch();
     }
@@ -5135,6 +5145,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
         || contentBecameVisible
         || el.scrollTop === 0
         || el.scrollHeight > lastScrollHeightRef.current
+        || (lastClientHeightRef.current > 0 && el.clientHeight < lastClientHeightRef.current)
       )
     ) {
       if (!hasInitialPinCompletedRef.current || contentBecameVisible || el.scrollTop === 0) {
@@ -5198,6 +5209,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // threshold and the explicit wheel/touch up-gesture handlers below.
   const disengageFollow = () => {
     pendingEngageFollowRef.current = false;
+    pendingGrowthRepinRef.current = false;
     if (!autoScrollRef.current) return;
     autoScrollRef.current = false;
     newSinceUnfollowRef.current = 0;
@@ -5393,6 +5405,12 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       && (lastScrollHeightRef.current - lastScrollTopRef.current - prevClientHeight) < 24
       && Math.abs(scrollTop - lastScrollTopRef.current) <= 2
       && layoutChanged;
+    const stationaryDuringGrowthOrBaseline = Math.abs(scrollTop - lastScrollTopRef.current) <= 2
+      && (
+        wasPinnedBeforeLayoutShift
+        || pendingGrowthRepinRef.current
+        || (layoutChanged && lastScrollHeightRef.current === 0)
+      );
     const hydrationGrowthLag = !preview
       && wasAutoFollowing
       && !hasExplicitUserScrollUp
@@ -5402,15 +5420,19 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       && (
         (awaitingInitialPin && scrollTop >= lastScrollTopRef.current)
         || (scrollTop === 0 && lastScrollTopRef.current === 0 && scrollHeight > lastScrollHeightRef.current)
-        || wasPinnedBeforeLayoutShift
+        || stationaryDuringGrowthOrBaseline
       );
     if (transientTopJump || hydrationGrowthLag) {
       lastScrollTopRef.current = scrollTop;
       lastScrollHeightRef.current = scrollHeight;
       lastClientHeightRef.current = clientHeight;
       setShowScrollBtn(false);
+      pendingGrowthRepinRef.current = true;
       scheduleFollowFrame(() => {
-        if (!autoScrollRef.current || hasActiveUserScrollIntent() || isTouchInteracting()) return;
+        if (!autoScrollRef.current || hasActiveUserScrollIntent() || isTouchInteracting()) {
+          pendingGrowthRepinRef.current = false;
+          return;
+        }
         scrollToBottom(false);
       });
       return;
@@ -5556,6 +5578,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       const target = Math.max(0, el.scrollHeight - el.clientHeight);
       if (target - el.scrollTop <= 1) return;
       markProgrammaticScroll();
+      pendingGrowthRepinRef.current = false;
       el.scrollTop = target;
       lastScrollTopRef.current = el.scrollTop;
       lastScrollHeightRef.current = el.scrollHeight;
@@ -6313,6 +6336,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           // without inserting it into the natural tab order.
           tabIndex={preview ? undefined : -1}
           onKeyDown={preview ? undefined : (e: KeyboardEvent) => {
+            if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey) return;
             if (e.key === 'End') {
               e.preventDefault();
               scrollToBottom(true);

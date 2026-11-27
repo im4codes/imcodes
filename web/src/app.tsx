@@ -3889,7 +3889,7 @@ function InternalMainApp() {
         pendingChatScrollRafRef.current = null;
         if (pendingChatScrollSessionRef.current !== name) return;
         const fn = chatScrollFnsRef.current.get(name);
-        if (fn && runRegisteredMainChatScroll(name, fn, false)) {
+        if (fn && runRegisteredMainChatScroll(name, fn, true)) {
           return;
         }
         if (remainingRetries > 0) {
@@ -3897,7 +3897,7 @@ function InternalMainApp() {
         }
       });
     };
-    tryScroll(3);
+    tryScroll(8);
   }, [cancelMainChatScrollRafs, runRegisteredMainChatScroll]);
 
   const scheduleSubChatScrollToBottom = useCallback((id: string) => {
@@ -3908,7 +3908,7 @@ function InternalMainApp() {
         pendingSubScrollRafsRef.current.delete(id);
         if (!pendingSubScrollIdsRef.current.has(id)) return;
         const fn = subChatScrollFnsRef.current.get(id);
-        if (fn && runRegisteredSubChatScroll(id, fn, false)) {
+        if (fn && runRegisteredSubChatScroll(id, fn, true)) {
           return;
         }
         if (remainingRetries > 0) {
@@ -3917,7 +3917,7 @@ function InternalMainApp() {
       });
       pendingSubScrollRafsRef.current.set(id, rafId);
     };
-    tryScroll(3);
+    tryScroll(8);
   }, [cancelSubChatScrollRafs, runRegisteredSubChatScroll]);
 
   const maximizeOpenSubSession = useCallback((id: string) => {
