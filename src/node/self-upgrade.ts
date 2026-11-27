@@ -2845,6 +2845,15 @@ export async function startControlledNodeSelfUpgrade(
           if (x64Manifest.releaseVersion !== arm64Manifest.releaseVersion || x64Manifest.gitSha !== arm64Manifest.gitSha) {
             throw new Error('release_manifest_cross_arch_mismatch');
           }
+          const arm64Target = arm64Manifest.targets['darwin-arm64'];
+          const x64Target = x64Manifest.targets['darwin-x64'];
+          for (const universalComponent of ['imcodes-node', 'open-computer-use'] as const) {
+            const a = arm64Target?.components[universalComponent];
+            const b = x64Target?.components[universalComponent];
+            if (!a || !b || a.sha256 !== b.sha256 || a.sizeBytes !== b.sizeBytes || a.version !== b.version) {
+              throw new Error(`release_manifest_${universalComponent}_cross_arch_mismatch`);
+            }
+          }
           releaseManifest = x64Manifest;
         }
         if (!releaseManifest) {

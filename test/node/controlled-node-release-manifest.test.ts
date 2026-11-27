@@ -539,6 +539,7 @@ describe('controlled-node self-upgrade release manifest verification', () => {
     const buildMacFetch = (
       pinnedMode: 'match_runtime_header' | 'old_server_arm64_pin' | 'garbage_pin' | 'omit_header',
       manifests: { x64: { bytes: Buffer; sha: string }; arm64: { bytes: Buffer; sha: string } } = { x64: rmX64, arm64: rmArm64 },
+      helperMode: 'ok' | 'missing_404' = 'ok',
     ) => {
       const seenHeaders: Array<{ url: string; runtimeArch: string | null }> = [];
       const fetchImpl = vi.fn(async (url: string, init?: RequestInit) => {
@@ -559,6 +560,9 @@ describe('controlled-node self-upgrade release manifest verification', () => {
           });
         }
         if (url.includes(`asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.COMPUTER_USE_HELPER}`)) {
+          if (helperMode === 'missing_404') {
+            return new Response('not found', { status: 404 });
+          }
           return new Response(ocuBytes, {
             status: 200,
             headers: {
@@ -706,5 +710,47 @@ describe('controlled-node self-upgrade release manifest verification', () => {
     });
     expect(compatRes).toMatchObject({ ok: true, targetVersion: version, artifactSha256: nodeSha });
     expect(scheduledCompat).toHaveLength(1);
+
+    // 8. Reused helper (404 from helper endpoint) with split candidate files on disk:
+    //    `darwin-universal/` matches pinned arm64 manifest while flat path matches x64 manifest -> MUST reject cross-arch mismatch!
+    const splitHelperDir = makeTempDir('cn-rm-mac-x64-split-helper-');
+    const altOcuBytes = Buffer.from(`mac-alt-${version}`, 'utf8');
+    expect(altOcuBytes.length).toBe(ocuBytes.length); // same size, different SHA-256
+    mkdirSync(join(splitHelperDir, 'computer-use-helper', 'darwin-universal'), { recursive: true });
+    writeFileSync(join(splitHelperDir, 'computer-use-helper', 'darwin-universal', 'open-computer-use.app.zip'), ocuBytes);
+    writeFileSync(join(splitHelperDir, 'computer-use-helper', 'open-computer-use.app.zip'), altOcuBytes);
+    const rmX64AltOcu = makeMacReleaseManifest('x64', { ocuSha: sha256(altOcuBytes) });
+    const splitMock = buildMacFetch('old_server_arm64_pin', { x64: rmX64AltOcu, arm64: rmArm64 }, 'missing_404');
+    const scheduledSplit: string[] = [];
+    await expect(startControlledNodeSelfUpgrade(credential, version, {
+      platform: 'darwin',
+      arch: 'x64',
+      execPath: join(splitHelperDir, 'imcodes-node-macos'),
+      journalPath: join(splitHelperDir, 'install-journal.json'),
+      tmpdir: () => splitHelperDir,
+      spawnDetached: (_cmd, args) => { scheduledSplit.push(args[0] ?? ''); },
+      sleep: async () => {},
+      fetchImpl: splitMock.fetchImpl as unknown as typeof fetch,
+    })).rejects.toThrow('release_manifest_open-computer-use_cross_arch_mismatch');
+    expect(scheduledSplit).toHaveLength(0);
+
+    // 9. Reused helper (404 from helper endpoint) with single consistent helper matching BOTH arm64 & x64 manifests -> succeeds!
+    const sharedHelperDir = makeTempDir('cn-rm-mac-x64-shared-helper-');
+    mkdirSync(join(sharedHelperDir, 'computer-use-helper', 'darwin-universal'), { recursive: true });
+    writeFileSync(join(sharedHelperDir, 'computer-use-helper', 'darwin-universal', 'open-computer-use.app.zip'), ocuBytes);
+    const sharedMock = buildMacFetch('old_server_arm64_pin', { x64: rmX64, arm64: rmArm64 }, 'missing_404');
+    const scheduledShared: string[] = [];
+    const sharedRes = await startControlledNodeSelfUpgrade(credential, version, {
+      platform: 'darwin',
+      arch: 'x64',
+      execPath: join(sharedHelperDir, 'imcodes-node-macos'),
+      journalPath: join(sharedHelperDir, 'install-journal.json'),
+      tmpdir: () => sharedHelperDir,
+      spawnDetached: (_cmd, args) => { scheduledShared.push(args[0] ?? ''); },
+      sleep: async () => {},
+      fetchImpl: sharedMock.fetchImpl as unknown as typeof fetch,
+    });
+    expect(sharedRes).toMatchObject({ ok: true, targetVersion: version, artifactSha256: nodeSha });
+    expect(scheduledShared).toHaveLength(1);
   });
 });
