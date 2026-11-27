@@ -1037,14 +1037,15 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
         input_tokens: 14500,
         cache_read_input_tokens: 4000,
         cache_creation_input_tokens: 0,
-        output_tokens: 125,
+        output_tokens: 80,
         model_context_window: 256000,
       },
     });
-    expect(events.completions[0].message.metadata.usage).toMatchObject({
+    expect(events.completions[0].message.metadata.usage).toEqual({
       input_tokens: 14500,
       cache_read_input_tokens: 4000,
-      output_tokens: 125,
+      cache_creation_input_tokens: 0,
+      output_tokens: 80,
       model_context_window: 256000,
     });
     expect(events.completions[0].message.metadata.totalUsage).toMatchObject({
@@ -1052,6 +1053,329 @@ describe('Qoder SDK readiness and streaming fixtures', () => {
       output_tokens: 125,
     });
     expect(p.getSessionDiagnostics(route)).toMatchObject({ unknownMessageCount: 0 });
+  });
+
+  it('isolates subagent usage/models from main session and does not guess mismatched modelUsage contextWindow', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    const events = collect(p);
+
+    // 1. Main stream 12000/256000 -> subagent stream/assistant 75/8000 -> main result preserves parent model & usage
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'init', session_id: 'qoder-sub-1', model: 'performance' },
+      {
+        type: 'stream_event',
+        parent_tool_use_id: null,
+        event: {
+          type: 'message_start',
+          message: {
+            id: 'main-msg-1',
+            model: 'performance',
+            usage: { input_tokens: 12000, cache_read_input_tokens: 0, output_tokens: 5 },
+          },
+        },
+      },
+      {
+        type: 'stream_event',
+        parent_tool_use_id: 'toolu_sub_1',
+        event: {
+          type: 'message_start',
+          message: {
+            id: 'sub-msg-1',
+            model: 'qoder-fast-sub',
+            usage: { input_tokens: 75, cache_read_input_tokens: 0, output_tokens: 2 },
+          },
+        },
+      },
+      {
+        type: 'stream_event',
+        parent_tool_use_id: 'toolu_sub_1',
+        event: {
+          type: 'content_block_delta',
+          index: 0,
+          delta: { type: 'text_delta', text: 'sub-delta' },
+        },
+      },
+      {
+        type: 'assistant',
+        parent_tool_use_id: 'toolu_sub_1',
+        uuid: 'sub-asst-1',
+        message: {
+          id: 'sub-msg-1',
+          role: 'assistant',
+          model: 'qoder-fast-sub',
+          content: [{ type: 'text', text: 'sub-full' }],
+          usage: { input_tokens: 75, output_tokens: 9 },
+        },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Main complete',
+        uuid: 'res-sub-1',
+        num_turns: 1,
+        usage: { input_tokens: 12075, cache_read_input_tokens: 0, output_tokens: 14 },
+        modelUsage: {
+          'qoder-fast-sub': {
+            inputTokens: 75,
+            outputTokens: 9,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.001,
+            contextWindow: 8000,
+            maxOutputTokens: 4096,
+          },
+          performance: {
+            inputTokens: 12000,
+            outputTokens: 5,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.01,
+            contextWindow: 256000,
+            maxOutputTokens: 16384,
+          },
+        },
+      },
+    ]);
+
+    await p.send(route, 'subagent test');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(1));
+
+    expect(events.sessionInfos.some((e) => e.info.model === 'qoder-fast-sub')).toBe(false);
+    expect(events.deltas.some((e) => e.delta.delta === 'sub-delta')).toBe(true);
+    expect(events.usages).toHaveLength(2);
+    expect(events.usages.every((e) => e.usage.model === 'performance')).toBe(true);
+    expect(events.usages[1].usage).toEqual({
+      messageId: 'res-sub-1',
+      finalized: true,
+      model: 'performance',
+      usage: {
+        input_tokens: 12000,
+        cache_read_input_tokens: 0,
+        output_tokens: 5,
+        model_context_window: 256000,
+      },
+    });
+    expect(events.completions[0].message.metadata.model).toBe('performance');
+    expect(events.completions[0].message.metadata.usage).toEqual(events.usages[1].usage.usage);
+
+    // 2. When active model key is absent from modelUsage, never pick an unrelated model's contextWindow
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'init', session_id: 'qoder-sub-1', model: 'performance' },
+      {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        uuid: 'main-asst-2',
+        message: {
+          id: 'main-msg-2',
+          role: 'assistant',
+          model: 'performance',
+          content: [{ type: 'text', text: 'Done' }],
+          usage: { input_tokens: 9000, output_tokens: 15 },
+        },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Done',
+        uuid: 'res-sub-2',
+        num_turns: 1,
+        usage: { input_tokens: 9000, output_tokens: 15 },
+        modelUsage: {
+          'unrelated-subagent': {
+            inputTokens: 75,
+            outputTokens: 9,
+            cacheReadInputTokens: 0,
+            cacheCreationInputTokens: 0,
+            webSearchRequests: 0,
+            costUSD: 0.001,
+            contextWindow: 8000,
+            maxOutputTokens: 4096,
+          },
+        },
+      },
+    ]);
+
+    await p.send(route, 'missing key test');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(2));
+
+    expect(events.completions[1].message.metadata.usage).toEqual({
+      input_tokens: 9000,
+      output_tokens: 15,
+    });
+    expect(events.usages.at(-1)?.usage.usage.model_context_window).toBeUndefined();
+  });
+
+  it('scopes usage snapshots per request, honors explicit zero resets, and avoids multi-turn cumulative spoofing', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    const events = collect(p);
+
+    // Request 1 sets cache_read_input_tokens=4000 then explicit 0 in delta;
+    // Request 2 has new id and output-only usage (must not inherit Request 1 input_tokens);
+    // Multi-turn result shares identical finalized snapshot between onUsage & metadata.usage,
+    // leaving cumulative result.usage in metadata.totalUsage.
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'init', session_id: 'qoder-req-1', model: 'performance' },
+      {
+        type: 'stream_event',
+        parent_tool_use_id: null,
+        event: {
+          type: 'message_start',
+          message: {
+            id: 'req-msg-1',
+            model: 'performance',
+            usage: { request_id: 'req-1', input_tokens: 12000, cache_read_input_tokens: 4000, output_tokens: 1 },
+          },
+        },
+      },
+      {
+        type: 'stream_event',
+        parent_tool_use_id: null,
+        event: {
+          type: 'message_delta',
+          usage: { request_id: 'req-1', cache_read_input_tokens: 0, output_tokens: 20 },
+        },
+      },
+      { type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_stop' } },
+      {
+        type: 'assistant',
+        parent_tool_use_id: null,
+        uuid: 'asst-req-2',
+        message: {
+          id: 'req-msg-2',
+          role: 'assistant',
+          model: 'performance',
+          content: [{ type: 'text', text: 'Step 2' }],
+          usage: { request_id: 'req-2', output_tokens: 30 },
+        },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Step 2',
+        uuid: 'res-multi-1',
+        num_turns: 2,
+        usage: {
+          input_tokens: 26500,
+          cache_read_input_tokens: 8000,
+          cache_creation_input_tokens: 500,
+          cached_input_tokens: 8000,
+          output_tokens: 50,
+        },
+        modelUsage: {
+          performance: {
+            inputTokens: 26500,
+            outputTokens: 50,
+            cacheReadInputTokens: 8000,
+            cacheCreationInputTokens: 500,
+            webSearchRequests: 0,
+            costUSD: 0.02,
+            contextWindow: 256000,
+            maxOutputTokens: 16384,
+          },
+        },
+      },
+    ]);
+
+    await p.send(route, 'multi request');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(1));
+
+    // Zero reset on Request 1 delta
+    expect(events.usages[1].usage.usage).toEqual({
+      input_tokens: 12000,
+      cache_read_input_tokens: 0,
+      output_tokens: 20,
+    });
+    // Request 2 must not inherit Request 1's input_tokens
+    expect(events.usages[2].usage.usage).toEqual({
+      output_tokens: 30,
+    });
+    // Finalized usage & metadata.usage share exact Request 2 snapshot + model window; totalUsage kept separate
+    expect(events.usages[3].usage).toEqual({
+      messageId: 'res-multi-1',
+      finalized: true,
+      model: 'performance',
+      usage: {
+        output_tokens: 30,
+        model_context_window: 256000,
+      },
+    });
+    expect(events.completions[0].message.metadata.usage).toEqual(events.usages[3].usage.usage);
+    expect(events.completions[0].message.metadata.usage).not.toHaveProperty('cached_input_tokens');
+    expect(events.completions[0].message.metadata.totalUsage).toMatchObject({
+      input_tokens: 26500,
+      cache_read_input_tokens: 8000,
+      cached_input_tokens: 8000,
+      output_tokens: 50,
+    });
+
+    // Multi-request turn with NO main-thread request snapshot must leave metadata.usage unknown
+    const usagesBefore = events.usages.length;
+    sdkMock.state.scripts.push([
+      { type: 'system', subtype: 'init', session_id: 'qoder-req-1', model: 'performance' },
+      {
+        type: 'assistant',
+        parent_tool_use_id: 'toolu_only_sub',
+        uuid: 'sub-only',
+        message: {
+          id: 'sub-only-1',
+          role: 'assistant',
+          model: 'sub-small',
+          content: [{ type: 'text', text: 'sub' }],
+          usage: { input_tokens: 75, output_tokens: 4 },
+        },
+      },
+      {
+        type: 'result',
+        subtype: 'success',
+        result: 'Done without main usage',
+        uuid: 'res-multi-no-main',
+        num_turns: 3,
+        usage: { input_tokens: 50000, output_tokens: 500 },
+      },
+    ]);
+
+    await p.send(route, 'multi request no main snapshot');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(2));
+
+    expect(events.usages).toHaveLength(usagesBefore);
+    expect(events.completions[1].message.metadata.usage).toBeUndefined();
+    expect(events.completions[1].message.metadata.totalUsage).toMatchObject({
+      input_tokens: 50000,
+      output_tokens: 500,
+    });
+  });
+
+  it('drops post-terminal compact_boundary, status, and stream frames emitted after completion in the same generation', async () => {
+    const p = await makeProvider();
+    const route = await createReadySession(p);
+    const events = collect(p);
+
+    sdkMock.state.scripts.push([
+      { type: 'result', subtype: 'success', result: 'terminal', uuid: 'res-terminal-1' },
+      { type: 'system', subtype: 'compact_boundary' },
+      { type: 'system', subtype: 'status', status: 'compacting' },
+      {
+        type: 'stream_event',
+        parent_tool_use_id: null,
+        event: {
+          type: 'message_start',
+          message: { id: 'late-msg', model: 'late-model', usage: { input_tokens: 999 } },
+        },
+      },
+    ]);
+
+    await p.send(route, 'done early');
+    await vi.waitFor(() => expect(events.completions).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(events.statuses.filter((e) => e.status.status === 'compacting')).toHaveLength(0);
+    expect(events.statuses.at(-1)?.status).toEqual({ status: null, label: null });
+    expect(events.usages).toHaveLength(0);
+    expect(events.sessionInfos.some((e) => e.info.model === 'late-model')).toBe(false);
   });
 
   it('handles SDK status compacting/null transitions, clears on cancel/error/endSession, and ignores transcript-only replays', async () => {

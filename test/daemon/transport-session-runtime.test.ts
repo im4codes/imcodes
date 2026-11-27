@@ -4216,6 +4216,67 @@ describe('TransportSessionRuntime', () => {
     );
   });
 
+  it('clears compacting observation across error, cancel, and idle boundaries while still re-injecting on completed compaction', async () => {
+    const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
+
+    // 1. Seed preference context and verify second normal turn skips duplicate injection.
+    runtime.send('seed turn', 'cmp-guard-1', undefined, preferencePreamble);
+    await flushDispatch();
+    expect((mock.provider.send.mock.calls[0]?.[1] as Record<string, unknown>).messagePreamble).toContain('Use pnpm');
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    // 2. Provider reports compacting, then fails with provider error -> must NOT leak into next turn.
+    runtime.send('turn fails mid compact', 'cmp-guard-2', undefined, preferencePreamble);
+    await flushDispatch();
+    expect((mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>).messagePreamble).toBeUndefined();
+    mock.fireStatus('sess-1', { status: 'compacting' });
+    mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'failed during compaction', recoverable: true });
+    await flushDispatch();
+
+    runtime.send('ordinary after errored compaction', 'cmp-guard-3', undefined, preferencePreamble);
+    await flushDispatch();
+    expect((mock.provider.send.mock.calls[2]?.[1] as Record<string, unknown>).messagePreamble).toBeUndefined();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    // 3. Provider reports compacting, then user triggers STOP cancel -> must NOT leak into next turn.
+    runtime.send('turn cancelled mid compact', 'cmp-guard-4', undefined, preferencePreamble);
+    await flushDispatch();
+    expect((mock.provider.send.mock.calls[3]?.[1] as Record<string, unknown>).messagePreamble).toBeUndefined();
+    mock.fireStatus('sess-1', { status: 'compacting' });
+    await runtime.cancel();
+    await flushDispatch();
+
+    runtime.send('ordinary after cancelled compaction', 'cmp-guard-5', undefined, preferencePreamble);
+    await flushDispatch();
+    expect((mock.provider.send.mock.calls[4]?.[1] as Record<string, unknown>).messagePreamble).toBeUndefined();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    // 4. Late status: 'compacting' while idle must NOT taint subsequent turn completion.
+    mock.fireStatus('sess-1', { status: 'compacting' });
+    runtime.send('turn after late idle compacting', 'cmp-guard-6', undefined, preferencePreamble);
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('ordinary after late idle compacting', 'cmp-guard-7', undefined, preferencePreamble);
+    await flushDispatch();
+    expect((mock.provider.send.mock.calls[6]?.[1] as Record<string, unknown>).messagePreamble).toBeUndefined();
+
+    // 5. Real mid-turn compacting that completes cleanly still triggers re-injection on the next turn.
+    mock.fireStatus('sess-1', { status: 'compacting' });
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('ordinary after real completed compaction', 'cmp-guard-8', undefined, preferencePreamble);
+    await flushDispatch();
+    const afterRealCompactPayload = mock.provider.send.mock.calls[7]?.[1] as Record<string, unknown>;
+    expect(afterRealCompactPayload.messagePreamble).toContain('Use pnpm');
+    expect(String(afterRealCompactPayload.assembledMessage)).toContain('Use pnpm');
+  });
+
   it('drops first-turn startup memory built before the project turned injection off, without a restart', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'deck_startup_toggle_brain');

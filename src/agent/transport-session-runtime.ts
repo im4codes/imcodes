@@ -790,8 +790,8 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _recoverableDispatchRetries = 0;
   /** When this runtime last compacted on its own (see maybeAutoCompact). */
   private _lastAutoCompactAt = 0;
-  /** The provider reported compacting during the current turn. */
-  private _compactionObservedInTurn = false;
+  /** Activity generation during which the provider reported compacting. */
+  private _compactionObservedGeneration: number | null = null;
   // Pending backoff timer for the next auto-retry drain. While set, the session
   // counts as having active turn work (so new sends queue in order behind the
   // message being retried) and presents an in-progress status, not idle.
@@ -940,6 +940,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // The captured strong source publishes its physical proof separately.
         if (this._unconfirmedProviderStop) return;
         if (this._activeDispatchCancelled) {
+          this._compactionObservedGeneration = null;
           this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
           this.clearStalePendingCancelFallbackTimer();
           this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
@@ -970,11 +971,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         // Compaction is recognized three ways: the provider tagged the
         // completion; the turn answered a `/compact` the runtime dispatched
         // (Claude's slash command completes untagged); or the provider
-        // reported compacting during the turn (its own auto-compaction).
+        // reported compacting during the current active generation.
         const compacted = isTransportCompactionCompletion(message)
           || this.activeDispatchIsCompactCommand()
-          || this._compactionObservedInTurn;
-        this._compactionObservedInTurn = false;
+          || this._compactionObservedGeneration === this._activityGeneration;
+        this._compactionObservedGeneration = null;
         if (compacted) this.reinjectAfterCompaction();
         this.clearStalePendingCancelFallbackTimer();
         // Some providers emit onComplete synchronously while sendProviderTurn is
@@ -1156,6 +1157,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // the next drain; never fail over or switch provider here.
         if (capacityRetryEligible && this.requeueAndScheduleCapacityRetry(error)) {
           this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
+          this._compactionObservedGeneration = null;
           this._sending = false;
           this._activeTurn?.reject(error);
           this._activeTurn = null;
@@ -1172,6 +1174,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // Not retryable (permanent, or unclassified): a capacity episode that was in progress ends here.
         if (this._activeDispatchEntries.length > 0) this.cancelCapacityRetry(false);
         this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
+        this._compactionObservedGeneration = null;
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
@@ -1229,9 +1232,19 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
         // Providers also compact on their own mid-turn (Claude's
-        // compact_boundary, Codex's inline auto-compaction). Remember it so the
-        // turn's completion re-injects what compaction may have summarized.
-        if (status?.status === 'compacting') this._compactionObservedInTurn = true;
+        // compact_boundary, Codex's inline auto-compaction). Bind observation
+        // to the live active turn generation so late/idle or cancelled/failed
+        // compaction never leaks into the next ordinary turn.
+        if (
+          status?.status === 'compacting'
+          && this._activeDispatchId !== null
+          && !this._activeDispatchCancelled
+          && !this._currentActivityGenerationLocallyCancelled
+          && !this._unconfirmedProviderStop
+          && this.hasLocalTurnInFlight()
+        ) {
+          this._compactionObservedGeneration = this._activityGeneration;
+        }
         const activity = this.getActivitySnapshot();
         const canKeepActive = this.hasActiveTurnWork() || activity.backgroundKeepsSessionRunning;
         if (!this._activeDispatchCancelled && status?.status && canKeepActive) {
@@ -2176,6 +2189,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     );
 
     this._sending = false;
+    this._compactionObservedGeneration = null;
     this.commitActiveSummarySyncReservation(dispatchId ?? undefined);
     this._activeTurn?.resolve();
     this._activeTurn = null;
@@ -4053,6 +4067,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (dispatchId !== null) {
       this._locallyCancelledDispatchIds.add(dispatchId);
       this._activeDispatchCancelled = true;
+      this._compactionObservedGeneration = null;
     }
     if (
       !this._activeTurn
@@ -4222,6 +4237,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._unconfirmedProviderStop = false;
     this._locallyCancelledActivityGenerations.clear();
     this._currentActivityGenerationLocallyCancelled = false;
+    this._compactionObservedGeneration = null;
     this._externalCompletionSettlementsToIgnore = 0;
     this._externalCompletionGraceCancelsToIgnore = 0;
     this._externalCompletionGraceCancelDispatchId = null;
@@ -4471,6 +4487,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       'transport runtime sdk turn lost recovery failed',
     );
     this._sending = false;
+    this._compactionObservedGeneration = null;
     this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn?.reject(failure);
     this._activeTurn = null;
@@ -4510,6 +4527,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     );
     this.closeOpenTools('errored', 'provider_error');
     this._sending = false;
+    this._compactionObservedGeneration = null;
     this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn?.resolve();
     this._activeTurn = null;
@@ -4605,6 +4623,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       'transport runtime accepted sdk turn lost recovery; re-queueing original dispatch for safe replay',
     );
     this._sending = false;
+    this._compactionObservedGeneration = null;
     this.settleActiveDispatchHandoffs(this._activeDispatchEntries, { reason: 'safe_replay' });
     this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn.resolve();
@@ -4992,6 +5011,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   ): void {
     const dispatchId = ++this._nextDispatchId;
     this._activityGeneration++;
+    this._compactionObservedGeneration = null;
     this._lastCompletedTurn = null;
     this._currentActivityGenerationLocallyCancelled = false;
     this.closeOpenTools('abandoned', 'generation_rollover', { olderThanGeneration: this._activityGeneration });
@@ -6112,6 +6132,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       return;
     }
     this.markCurrentActivityGenerationLocallyCancelled();
+    this._compactionObservedGeneration = null;
     if (!this._activeTurn && !this._sending) {
       this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
       this.closeOpenTools('cancelled', 'user_cancelled');

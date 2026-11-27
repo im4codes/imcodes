@@ -95,6 +95,14 @@ interface ActiveToolBlock {
   input?: unknown;
 }
 
+interface UsageRequestTracker {
+  messageId?: string;
+  requestId?: string;
+  model?: string;
+  streamOpen: boolean;
+  sealedByAssistant: boolean;
+}
+
 interface QoderSessionState {
   routeId: string;
   sessionName?: string;
@@ -123,6 +131,7 @@ interface QoderSessionState {
   activeTurnSettled: Promise<void> | null;
   resolveActiveTurnSettled: (() => void) | null;
   activeNotificationAdmissions: Map<string, Promise<AgentDelegationNotificationResult>>;
+  usageTracker?: UsageRequestTracker;
   lastAssistantUsage?: NonNullable<ProviderUsageUpdate['usage']>;
   compacting: boolean;
   /**
@@ -239,19 +248,13 @@ function readNonNegativeTokenCount(value: unknown): number | undefined {
 }
 
 function extractModelContextWindow(modelUsage: unknown, activeModel?: string): number | undefined {
-  if (!isRecord(modelUsage)) return undefined;
-  const candidates: Array<Record<string, unknown>> = [];
-  if (activeModel && isRecord(modelUsage[activeModel])) {
-    candidates.push(modelUsage[activeModel]);
-  }
-  for (const entry of Object.values(modelUsage)) {
-    if (isRecord(entry)) candidates.push(entry);
-  }
-  for (const candidate of candidates) {
-    const windowSize = readNumber(candidate.contextWindow);
-    if (windowSize !== undefined && windowSize > 0) return Math.round(windowSize);
-  }
-  return undefined;
+  if (!isRecord(modelUsage) || !activeModel) return undefined;
+  const trimmed = activeModel.trim();
+  if (!trimmed) return undefined;
+  const candidate = modelUsage[trimmed];
+  if (!isRecord(candidate)) return undefined;
+  const windowSize = readNumber(candidate.contextWindow);
+  return windowSize !== undefined && windowSize > 0 ? Math.round(windowSize) : undefined;
 }
 
 function normalizeProviderUsage(
@@ -266,7 +269,8 @@ function normalizeProviderUsage(
     const cacheRead = readNonNegativeTokenCount(usage.cache_read_input_tokens);
     const cacheCreation = readNonNegativeTokenCount(usage.cache_creation_input_tokens);
     const cachedInput = readNonNegativeTokenCount(usage.cached_input_tokens);
-    const explicitWindow = readNonNegativeTokenCount(usage.model_context_window);
+    const explicitWindow = readNonNegativeTokenCount(usage.model_context_window)
+      ?? readNonNegativeTokenCount(usage.contextWindow);
     if (input !== undefined) out.input_tokens = input;
     if (output !== undefined) out.output_tokens = output;
     if (cacheRead !== undefined) out.cache_read_input_tokens = cacheRead;
@@ -281,12 +285,35 @@ function normalizeProviderUsage(
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-function usageContextTokenSum(usage: NonNullable<ProviderUsageUpdate['usage']> | undefined): number {
-  if (!usage) return 0;
-  return (usage.input_tokens ?? 0)
-    + (usage.cache_read_input_tokens ?? 0)
-    + (usage.cache_creation_input_tokens ?? 0)
-    + (usage.cached_input_tokens ?? 0);
+function mergeProviderUsage(
+  previous: NonNullable<ProviderUsageUpdate['usage']> | undefined,
+  next: NonNullable<ProviderUsageUpdate['usage']>,
+): NonNullable<ProviderUsageUpdate['usage']> {
+  if (!previous) return { ...next };
+  return {
+    ...previous,
+    ...(next.input_tokens !== undefined ? { input_tokens: next.input_tokens } : {}),
+    ...(next.output_tokens !== undefined ? { output_tokens: next.output_tokens } : {}),
+    ...(next.cache_read_input_tokens !== undefined ? { cache_read_input_tokens: next.cache_read_input_tokens } : {}),
+    ...(next.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: next.cache_creation_input_tokens } : {}),
+    ...(next.cached_input_tokens !== undefined ? { cached_input_tokens: next.cached_input_tokens } : {}),
+    ...(next.model_context_window !== undefined ? { model_context_window: next.model_context_window } : {}),
+  };
+}
+
+function usageDiffersFromTotal(
+  exactUsage: NonNullable<ProviderUsageUpdate['usage']> | undefined,
+  totalUsage: NonNullable<ProviderUsageUpdate['usage']> | undefined,
+): boolean {
+  if (!totalUsage) return false;
+  if (!exactUsage) return true;
+  return (
+    exactUsage.input_tokens !== totalUsage.input_tokens
+    || exactUsage.output_tokens !== totalUsage.output_tokens
+    || exactUsage.cache_read_input_tokens !== totalUsage.cache_read_input_tokens
+    || exactUsage.cache_creation_input_tokens !== totalUsage.cache_creation_input_tokens
+    || exactUsage.cached_input_tokens !== totalUsage.cached_input_tokens
+  );
 }
 
 function mcpStatusFromQoder(statuses: QoderMcpServerStatus[] | undefined): MemoryMcpProviderStatusView {
@@ -545,6 +572,7 @@ export class QoderSdkProvider implements TransportProvider {
     state.completedGeneration = null;
     state.currentMessageId = null;
     state.currentText = '';
+    state.usageTracker = undefined;
     state.lastAssistantUsage = undefined;
     state.compacting = false;
     state.activeTools.clear();
@@ -1107,21 +1135,23 @@ export class QoderSdkProvider implements TransportProvider {
   }
 
   private handleMessage(sessionId: string, state: QoderSessionState, generation: number, msg: QoderSdkMessage): void {
-    if (!isRecord(msg)) return;
+    if (!isRecord(msg) || this.isStale(state, generation)) return;
     const qoderSessionId = readString(msg.session_id);
     if (qoderSessionId && !state.qoderSessionId) {
       state.qoderSessionId = qoderSessionId;
       this.emitSessionInfo(sessionId, { resumeId: undefined, model: state.effectiveModel });
     }
+    const parentToolUseId = 'parent_tool_use_id' in msg ? readString(msg.parent_tool_use_id) : undefined;
+    const isSubagent = parentToolUseId !== undefined;
     switch (msg.type) {
       case 'system':
         this.handleSystemMessage(sessionId, state, msg);
         return;
       case 'stream_event':
-        this.handleStreamEvent(sessionId, state, generation, msg.event);
+        this.handleStreamEvent(sessionId, state, generation, msg.event, isSubagent, parentToolUseId);
         return;
       case 'assistant':
-        this.handleAssistantMessage(sessionId, state, msg);
+        this.handleAssistantMessage(sessionId, state, generation, msg, isSubagent, parentToolUseId);
         return;
       case 'result':
         this.handleResultMessage(sessionId, state, generation, msg);
@@ -1202,33 +1232,72 @@ export class QoderSdkProvider implements TransportProvider {
     this.recordUnknown(state, `system:${String(msg.subtype)}`);
   }
 
-  private handleStreamEvent(sessionId: string, state: QoderSessionState, generation: number, event: unknown): void {
+  private handleStreamEvent(
+    sessionId: string,
+    state: QoderSessionState,
+    generation: number,
+    event: unknown,
+    isSubagent = false,
+    parentToolUseId?: string,
+  ): void {
     if (!isRecord(event)) return;
     const type = readString(event.type);
     if (type === 'message_start') {
+      if (isSubagent) return;
       const message = isRecord(event.message) ? event.message : undefined;
-      const messageId = readString(message?.id) ?? `${sessionId}:qoder:${generation}`;
+      const rawMessageId = readString(message?.id);
+      const messageId = rawMessageId ?? `${sessionId}:qoder:${generation}`;
+      const model = readString(message?.model);
+      const usage = isRecord(message?.usage) ? message.usage : undefined;
+      const rawRequestId = usage ? readString(usage.request_id) : undefined;
       state.currentMessageId = messageId;
       state.currentText = '';
-      const model = readString(message?.model);
+      state.lastAssistantUsage = undefined;
+      state.usageTracker = {
+        messageId: rawMessageId,
+        requestId: rawRequestId,
+        model: model ?? state.effectiveModel,
+        streamOpen: true,
+        sealedByAssistant: false,
+      };
       if (model && model !== state.effectiveModel) {
         state.effectiveModel = model;
         this.emitSessionInfo(sessionId, { model });
       }
-      if (isRecord(message?.usage)) {
-        this.recordLiveUsage(sessionId, state, message.usage, messageId, model);
+      if (usage) {
+        this.recordLiveUsage(sessionId, state, usage, {
+          source: 'message_start',
+          messageId: rawMessageId,
+          requestId: rawRequestId,
+          model,
+          emitMessageId: messageId,
+        });
       }
       return;
     }
     if (type === 'message_delta') {
+      if (isSubagent) return;
       const delta = isRecord(event.delta) ? event.delta : undefined;
       const usage = isRecord(event.usage) ? event.usage : isRecord(delta?.usage) ? delta.usage : undefined;
       if (usage) {
-        this.recordLiveUsage(sessionId, state, usage, state.currentMessageId ?? `${sessionId}:qoder:${generation}`);
+        const deltaMessageId = readString(event.message_id);
+        const deltaRequestId = readString(usage.request_id) ?? readString(event.request_id);
+        const deltaModel = readString(event.model) ?? readString(delta?.model);
+        const fallbackMessageId = state.usageTracker?.messageId ?? state.currentMessageId ?? `${sessionId}:qoder:${generation}`;
+        this.recordLiveUsage(sessionId, state, usage, {
+          source: 'message_delta',
+          messageId: deltaMessageId,
+          requestId: deltaRequestId,
+          model: deltaModel,
+          emitMessageId: deltaMessageId ?? fallbackMessageId,
+        });
       }
       return;
     }
     if (type === 'message_stop') {
+      if (!isSubagent && state.usageTracker) {
+        state.usageTracker.streamOpen = false;
+      }
       return;
     }
     if (type === 'content_block_start') {
@@ -1258,6 +1327,17 @@ export class QoderSdkProvider implements TransportProvider {
       const deltaType = readString(delta.type);
       if (deltaType === 'text_delta') {
         const text = readString(delta.text) ?? '';
+        if (isSubagent) {
+          this.emitDelta(sessionId, {
+            messageId: parentToolUseId
+              ? `${state.currentMessageId ?? `${sessionId}:qoder:${generation}`}:subagent:${parentToolUseId}`
+              : `${state.currentMessageId ?? `${sessionId}:qoder:${generation}`}:subagent`,
+            type: 'text',
+            delta: text,
+            role: 'assistant',
+          });
+          return;
+        }
         state.currentText += text;
         const messageId = state.currentMessageId ?? `${sessionId}:qoder:${generation}`;
         state.currentMessageId = messageId;
@@ -1316,11 +1396,18 @@ export class QoderSdkProvider implements TransportProvider {
     this.recordUnknown(state, `stream_event:${type ?? 'unknown'}`);
   }
 
-  private handleAssistantMessage(sessionId: string, state: QoderSessionState, msg: Record<string, unknown>): void {
+  private handleAssistantMessage(
+    sessionId: string,
+    state: QoderSessionState,
+    generation: number,
+    msg: Record<string, unknown>,
+    isSubagent = false,
+    parentToolUseId?: string,
+  ): void {
     if (msg.isVisibleInTranscriptOnly === true) return;
     const message = isRecord(msg.message) ? msg.message : undefined;
     const model = readString(message?.model);
-    if (model && model !== state.effectiveModel) {
+    if (!isSubagent && model && model !== state.effectiveModel) {
       state.effectiveModel = model;
       this.emitSessionInfo(sessionId, { model });
     }
@@ -1329,10 +1416,21 @@ export class QoderSdkProvider implements TransportProvider {
       if (!isRecord(block)) continue;
       if (block.type === 'text') {
         const text = readString(block.text) ?? '';
-        if (!text || text === state.currentText) continue;
+        if (!text) continue;
+        if (isSubagent) {
+          this.emitDelta(sessionId, {
+            messageId: readString(msg.uuid)
+              ?? `${state.currentMessageId ?? `${sessionId}:qoder:${generation}`}:subagent:${parentToolUseId ?? 'sub'}`,
+            type: 'text',
+            delta: text,
+            role: 'assistant',
+          });
+          continue;
+        }
+        if (text === state.currentText) continue;
         state.currentText = text;
         this.emitDelta(sessionId, {
-          messageId: state.currentMessageId ?? readString(msg.uuid) ?? `${sessionId}:qoder:${state.activeGeneration}`,
+          messageId: state.currentMessageId ?? readString(msg.uuid) ?? `${sessionId}:qoder:${generation}`,
           type: 'text',
           delta: state.currentText,
           role: 'assistant',
@@ -1354,18 +1452,17 @@ export class QoderSdkProvider implements TransportProvider {
         });
       }
     }
-    const usage = isRecord(message?.usage) ? message.usage : undefined;
+    const usage = !isSubagent && isRecord(message?.usage) ? message.usage : undefined;
     if (usage) {
-      this.emitSessionInfo(sessionId, {
-        model: state.effectiveModel,
-      });
-      this.recordLiveUsage(
-        sessionId,
-        state,
-        usage,
-        readString(msg.uuid) ?? state.currentMessageId ?? undefined,
+      const asstMessageId = readString(message?.id);
+      const asstRequestId = readString(usage.request_id);
+      this.recordLiveUsage(sessionId, state, usage, {
+        source: 'assistant',
+        messageId: asstMessageId,
+        requestId: asstRequestId,
         model,
-      );
+        emitMessageId: asstMessageId ?? readString(msg.uuid) ?? state.currentMessageId ?? `${sessionId}:qoder:${generation}`,
+      });
     }
   }
 
@@ -1373,29 +1470,62 @@ export class QoderSdkProvider implements TransportProvider {
     sessionId: string,
     state: QoderSessionState,
     rawUsage: unknown,
-    messageId?: string,
-    modelOverride?: string,
+    meta: {
+      source: 'message_start' | 'message_delta' | 'assistant';
+      messageId?: string;
+      requestId?: string;
+      model?: string;
+      emitMessageId?: string;
+    },
   ): void {
-    const model = modelOverride ?? state.effectiveModel;
-    const normalized = normalizeProviderUsage(rawUsage, undefined, model);
+    const emitModel = meta.model ?? state.effectiveModel;
+    const normalized = normalizeProviderUsage(rawUsage, undefined, emitModel);
     if (!normalized) return;
-    const previous = state.lastAssistantUsage;
-    const effective: NonNullable<ProviderUsageUpdate['usage']> =
-      usageContextTokenSum(normalized) === 0 && usageContextTokenSum(previous) > 0
-        ? {
-            ...previous,
-            ...normalized,
-            ...(previous?.input_tokens !== undefined ? { input_tokens: previous.input_tokens } : {}),
-            ...(previous?.cache_read_input_tokens !== undefined ? { cache_read_input_tokens: previous.cache_read_input_tokens } : {}),
-            ...(previous?.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: previous.cache_creation_input_tokens } : {}),
-            ...(previous?.cached_input_tokens !== undefined ? { cached_input_tokens: previous.cached_input_tokens } : {}),
-          }
-        : normalized;
+
+    const tracker = state.usageTracker;
+    let sameRequest = false;
+    if (tracker && state.lastAssistantUsage !== undefined) {
+      const modelMatches = !meta.model || !tracker.model || meta.model === tracker.model;
+      if (modelMatches) {
+        if (meta.source === 'message_start') {
+          sameRequest = false;
+        } else if (meta.requestId && tracker.requestId) {
+          sameRequest = meta.requestId === tracker.requestId;
+        } else if (meta.messageId && tracker.messageId) {
+          sameRequest = meta.messageId === tracker.messageId;
+        } else if (meta.source === 'message_delta') {
+          sameRequest = (!meta.requestId || !tracker.requestId) && (!meta.messageId || !tracker.messageId);
+        } else if (meta.source === 'assistant') {
+          sameRequest = !tracker.sealedByAssistant
+            && (!meta.requestId || !tracker.requestId)
+            && (!meta.messageId || !tracker.messageId);
+        }
+      }
+    }
+
+    if (sameRequest && tracker) {
+      if (meta.requestId && !tracker.requestId) tracker.requestId = meta.requestId;
+      if (meta.messageId && !tracker.messageId) tracker.messageId = meta.messageId;
+      if (meta.model && !tracker.model) tracker.model = meta.model;
+      if (meta.source === 'assistant') tracker.sealedByAssistant = true;
+    } else {
+      state.usageTracker = {
+        messageId: meta.messageId,
+        requestId: meta.requestId,
+        model: emitModel,
+        streamOpen: meta.source !== 'assistant' ? (tracker?.streamOpen ?? false) : false,
+        sealedByAssistant: meta.source === 'assistant',
+      };
+    }
+
+    const effective = sameRequest
+      ? mergeProviderUsage(state.lastAssistantUsage, normalized)
+      : { ...normalized };
     state.lastAssistantUsage = effective;
     this.emitUsage(sessionId, {
-      ...(messageId ? { messageId } : {}),
+      ...(meta.emitMessageId ? { messageId: meta.emitMessageId } : {}),
       usage: { ...effective },
-      ...(model ? { model } : {}),
+      ...(emitModel ? { model: emitModel } : {}),
     });
   }
 
@@ -1405,24 +1535,31 @@ export class QoderSdkProvider implements TransportProvider {
     msg: Record<string, unknown>,
     messageId: string,
   ): NonNullable<ProviderUsageUpdate['usage']> | undefined {
+    const numTurns = readNumber(msg.num_turns);
+    const isSingleTurn = numTurns === undefined || numTurns <= 1;
     const previous = state.lastAssistantUsage;
     const resultUsage = normalizeProviderUsage(msg.usage, msg.modelUsage, state.effectiveModel);
-    if (!previous && !resultUsage) return undefined;
-    const effective: NonNullable<ProviderUsageUpdate['usage']> =
-      previous && usageContextTokenSum(previous) > 0
-        ? {
-            ...previous,
-            ...(resultUsage?.output_tokens !== undefined ? { output_tokens: resultUsage.output_tokens } : {}),
-            ...(resultUsage?.model_context_window !== undefined ? { model_context_window: resultUsage.model_context_window } : {}),
-          }
-        : { ...(resultUsage ?? previous) };
+    let exactUsage: NonNullable<ProviderUsageUpdate['usage']> | undefined;
+    if (previous) {
+      const matchedWindow = previous.model_context_window ?? extractModelContextWindow(msg.modelUsage, state.effectiveModel);
+      exactUsage = {
+        ...previous,
+        ...(isSingleTurn && previous.output_tokens === undefined && resultUsage?.output_tokens !== undefined
+          ? { output_tokens: resultUsage.output_tokens }
+          : {}),
+        ...(matchedWindow !== undefined ? { model_context_window: matchedWindow } : {}),
+      };
+    } else if (isSingleTurn) {
+      exactUsage = resultUsage ? { ...resultUsage } : undefined;
+    }
+    if (!exactUsage) return undefined;
     this.emitUsage(sessionId, {
       messageId,
       finalized: true,
-      usage: { ...effective },
+      usage: { ...exactUsage },
       ...(state.effectiveModel ? { model: state.effectiveModel } : {}),
     });
-    return effective;
+    return exactUsage;
   }
 
   private handleResultMessage(sessionId: string, state: QoderSessionState, generation: number, msg: Record<string, unknown>): void {
@@ -1430,19 +1567,10 @@ export class QoderSdkProvider implements TransportProvider {
     const messageId = readString(msg.uuid) ?? state.currentMessageId ?? `${sessionId}:qoder-result:${generation}`;
     if (msg.subtype === 'success') {
       const content = readString(msg.result) ?? state.currentText;
-      const previousUsage = state.lastAssistantUsage;
-      const rawUsageMeta = normalizeUsage(msg.usage);
+      const rawTotalMeta = normalizeUsage(msg.usage);
+      const rawTotalUsage = normalizeProviderUsage(msg.usage);
       const finalizedUsage = this.finalizeTurnUsage(sessionId, state, msg, messageId);
-      const modelContextWindow = extractModelContextWindow(msg.modelUsage, state.effectiveModel);
-      const usageMeta = previousUsage || modelContextWindow !== undefined
-        ? (finalizedUsage ? { usage: { ...(isRecord(rawUsageMeta?.usage) ? rawUsageMeta.usage : {}), ...finalizedUsage } } : rawUsageMeta)
-        : rawUsageMeta;
-      const rawTotal = normalizeProviderUsage(msg.usage);
-      const hasDistinctTotal = Boolean(
-        previousUsage
-        && rawUsageMeta?.usage
-        && usageContextTokenSum(previousUsage) !== usageContextTokenSum(rawTotal),
-      );
+      const hasDistinctTotal = Boolean(rawTotalMeta?.usage && usageDiffersFromTotal(finalizedUsage, rawTotalUsage));
       this.finishWithComplete(sessionId, state, generation, {
         id: messageId,
         sessionId,
@@ -1454,8 +1582,8 @@ export class QoderSdkProvider implements TransportProvider {
         metadata: {
           provider: this.id,
           ...(state.effectiveModel ? { model: state.effectiveModel } : {}),
-          ...usageMeta,
-          ...(hasDistinctTotal ? { totalUsage: rawUsageMeta!.usage } : {}),
+          ...(finalizedUsage ? { usage: { ...finalizedUsage } } : {}),
+          ...(hasDistinctTotal ? { totalUsage: rawTotalMeta!.usage } : {}),
           ...(isSessionControlCommandText(content, 'compact') ? { [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' } : {}),
         },
       });
@@ -1472,7 +1600,7 @@ export class QoderSdkProvider implements TransportProvider {
   }
 
   private finishWithComplete(sessionId: string, state: QoderSessionState, generation: number, message: AgentMessage): void {
-    if (this.isStale(state, generation) || state.completedGeneration === generation) return;
+    if (this.isStale(state, generation)) return;
     state.completedGeneration = generation;
     this.settleActiveTurn(state);
     state.activeInput?.close();
@@ -1481,6 +1609,7 @@ export class QoderSdkProvider implements TransportProvider {
     state.inFlight = false;
     state.cancelled = false;
     state.compacting = false;
+    state.usageTracker = undefined;
     state.lastAssistantUsage = undefined;
     state.activeQuery = undefined;
     this.denyPendingApprovals(state, 'Qoder turn completed');
@@ -1497,6 +1626,7 @@ export class QoderSdkProvider implements TransportProvider {
     state.activeNotificationAdmissions.clear();
     state.inFlight = false;
     state.compacting = false;
+    state.usageTracker = undefined;
     state.lastAssistantUsage = undefined;
     state.activeQuery = undefined;
     this.denyPendingApprovals(state, error.message);
@@ -1517,6 +1647,7 @@ export class QoderSdkProvider implements TransportProvider {
     state.activeQuery = undefined;
     state.inFlight = false;
     state.compacting = false;
+    state.usageTracker = undefined;
     state.lastAssistantUsage = undefined;
     state.activeTools.clear();
     state.toolBlocksByIndex.clear();
@@ -1534,7 +1665,7 @@ export class QoderSdkProvider implements TransportProvider {
   }
 
   private isStale(state: QoderSessionState, generation: number): boolean {
-    return state.activeGeneration !== generation || state.cancelled;
+    return state.activeGeneration !== generation || state.cancelled || state.completedGeneration === generation;
   }
 
   private normalizeQoderError(err: unknown): ProviderError {
