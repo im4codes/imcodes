@@ -881,6 +881,8 @@ export function RemoteDesktopPanel({
   const suppressDisplayTabClickRef = useRef(false);
   const suppressDisplayTabClickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const previousInputEnabledRef = useRef(false);
+  const inputEnabledRef = useRef(snapshot.inputEnabled);
+  inputEnabledRef.current = snapshot.inputEnabled;
   const mediaPresentedRef = useRef(false);
   const mediaStreamGenerationRef = useRef<number | null>(null);
   const mediaRecoveringRef = useRef(false);
@@ -2045,7 +2047,9 @@ export function RemoteDesktopPanel({
         suppressDisplayTabClickRef.current = false;
         suppressDisplayTabClickTimerRef.current = null;
       }, 1_000);
-      void triggerHapticFeedback(20, 'medium');
+      if (inputEnabledRef.current) {
+        void triggerHapticFeedback(20, 'medium');
+      }
       openDisplayModeMenu(displayId, target, start.x, start.y);
     }, 550);
     displayTabLongPressRef.current = { displayId, pointerId, start, timer };
@@ -2356,7 +2360,7 @@ export function RemoteDesktopPanel({
       longPressTimer: null,
     };
     press.longPressTimer = setTimeout(() => {
-      if (touchRingPressRef.current !== press || press.moved) return;
+      if (touchRingPressRef.current !== press || press.moved || !inputEnabledRef.current) return;
       press.longPressFired = true;
       // Armed for as long as it is held, not a momentary flash.
       if (touchRingArmedTimerRef.current) clearTimeout(touchRingArmedTimerRef.current);
@@ -2486,7 +2490,7 @@ export function RemoteDesktopPanel({
       gesture.longPressTimer = setTimeout(() => {
         const current = touchGestureRef.current;
         const stage = stageRef.current;
-        if (current !== gesture || current.moved || !stage || !snapshot.inputEnabled) return;
+        if (current !== gesture || current.moved || !stage || !inputEnabledRef.current) return;
         const rect = stage.getBoundingClientRect();
         const metrics = resolveCssZoomMetrics(document, window, stage);
         const clientPt = stageLocalCssToClientPoint(current.start.x, current.start.y, rect, metrics);

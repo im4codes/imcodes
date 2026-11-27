@@ -2719,6 +2719,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
   });
 
   it('moves the ring and its bound cursor marker to wherever the screen is tapped, and taps the ring there to left-click', async () => {
+    vi.useFakeTimers();
     const { container, stage, getByLabelText } = await renderPanel();
     act(() => {
       // clientY stays on the vertical center so the video's 16:9-into-4:3
@@ -2743,6 +2744,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     expect(ring.style.getPropertyValue('--touch-ring-y')).toBe(`${150 + 72}px`);
 
     pointerClick.mockClear();
+    voiceMocks.triggerHapticFeedback.mockClear();
     act(() => {
       pointer(ring, 'pointerdown', { pointerId: 12, clientX: 300, clientY: 150 });
       pointer(ring, 'pointerup', { pointerId: 12, clientX: 300, clientY: 150 });
@@ -2750,6 +2752,8 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // Even though the ring itself is drawn lower, the click it fires lands at
     // the cursor marker's (true, unoffset) position.
     expect(pointerClick).toHaveBeenCalledWith('left', 0.75, 0.5);
+    await act(async () => { await vi.advanceTimersByTimeAsync(600); });
+    expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
   });
 
   it('drags the touch-mode ring to move the remote cursor relatively, without clicking', async () => {
@@ -2776,6 +2780,7 @@ describe('RemoteDesktopPanel mobile gestures', () => {
     // The drag itself moved the cursor; release must not additionally click.
     expect(pointerClick).not.toHaveBeenCalled();
     expect(pointerButton).not.toHaveBeenCalled();
+    expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
   });
 
   it('holds the ring without moving and right-clicks on release', async () => {
@@ -3750,6 +3755,117 @@ describe('RemoteDesktopPanel mobile gestures', () => {
         pointer(displayTab, 'pointerup', { pointerId: 111, clientX: 100, clientY: 60 });
       });
       expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+    });
+
+    it('opens resolution menu on display tab long press in viewing mode without triggering haptic feedback, and suppresses haptics if mode switches to viewing during countdown', async () => {
+      vi.useFakeTimers();
+      const { getByRole } = await renderPanel();
+      const displayTab = getByRole('tab', { name: 'remote_desktop.display_name_main' });
+
+      const standardDisplays = [
+        {
+          id: 'display-primary', label: 'Display 1', primary: true, available: true,
+          width: 1920, height: 1080, dpiScale: 2.25, rotation: 0,
+        },
+        {
+          id: 'display-second', label: 'Display 2', primary: false, available: true,
+          width: 2560, height: 1440, dpiScale: 1.5, rotation: 0,
+        },
+      ];
+
+      // 1. In view-only mode from the start: menu opens, but 0 haptic feedback
+      act(() => clientHooks[0]!.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.CONNECTED,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+        inputEpoch: 1,
+        inputEnabled: false,
+        displays: standardDisplays,
+        selectedDisplayId: 'display-primary',
+        layoutRevision: 1,
+        stream: null,
+      }));
+      voiceMocks.triggerHapticFeedback.mockClear();
+
+      act(() => {
+        pointer(displayTab, 'pointerdown', { pointerId: 120, clientX: 80, clientY: 60 });
+      });
+      await act(async () => { await vi.advanceTimersByTimeAsync(550); });
+      expect(getByRole('menu')).not.toBeNull();
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+
+      act(() => {
+        pointer(displayTab, 'pointerup', { pointerId: 120, clientX: 80, clientY: 60 });
+      });
+
+      // 2. Starts in control mode (inputEnabled: true), but switches to viewing mode during the 550ms timer
+      act(() => clientHooks[0]!.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.CONNECTED,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+        inputEpoch: 2,
+        inputEnabled: true,
+        displays: standardDisplays,
+        selectedDisplayId: 'display-primary',
+        layoutRevision: 2,
+        stream: null,
+      }));
+      voiceMocks.triggerHapticFeedback.mockClear();
+
+      act(() => {
+        pointer(displayTab, 'pointerdown', { pointerId: 121, clientX: 80, clientY: 60 });
+      });
+      // Switch to viewing mode halfway through the timer (at 200ms)
+      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+      act(() => clientHooks[0]!.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.CONNECTED,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+        inputEpoch: 3,
+        inputEnabled: false,
+        displays: standardDisplays,
+        selectedDisplayId: 'display-primary',
+        layoutRevision: 3,
+        stream: null,
+      }));
+      // Complete the 550ms timer
+      await act(async () => { await vi.advanceTimersByTimeAsync(350); });
+      expect(getByRole('menu')).not.toBeNull();
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+
+      act(() => {
+        pointer(displayTab, 'pointerup', { pointerId: 121, clientX: 80, clientY: 60 });
+      });
+    });
+
+    it('suppresses touch ring armed haptic feedback if inputEnabled switches to false during countdown', async () => {
+      vi.useFakeTimers();
+      const { stage, getByLabelText } = await renderPanel();
+      act(() => {
+        pointer(stage, 'pointerdown', { pointerId: 8, clientX: 200, clientY: 150 });
+        pointer(stage, 'pointerup', { pointerId: 8, clientX: 200, clientY: 150 });
+      });
+      const ring = getByLabelText('remote_desktop.touch_ring');
+      voiceMocks.triggerHapticFeedback.mockClear();
+
+      act(() => { pointer(ring, 'pointerdown', { pointerId: 130, clientX: 200, clientY: 150 }); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+      // Switch to viewing mode
+      act(() => clientHooks[0]!.onSnapshot({
+        state: REMOTE_DESKTOP_STATE.CONNECTED,
+        mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+        inputEpoch: 2,
+        inputEnabled: false,
+        displays: [
+          {
+            id: 'display-primary', label: 'Display 1', primary: true, available: true,
+            width: 1920, height: 1080, dpiScale: 2.25, rotation: 0,
+          },
+        ],
+        selectedDisplayId: 'display-primary',
+        layoutRevision: 2,
+        stream: null,
+      }));
+      await act(async () => { await vi.advanceTimersByTimeAsync(350); });
+      expect(voiceMocks.triggerHapticFeedback).not.toHaveBeenCalled();
+      act(() => { pointer(ring, 'pointerup', { pointerId: 130, clientX: 200, clientY: 150 }); });
     });
   });
 
