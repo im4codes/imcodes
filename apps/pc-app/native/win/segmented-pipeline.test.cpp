@@ -1184,6 +1184,35 @@ int main() {
       }
     }
     assert(final_cr == "保留这一句");
+
+    // 18f: Round 3 counterexample — >cap real prior sentence ending with single hotword + trailing single hotword
+    //      must NOT re-run edge slicing across committed body text ("我常用 IM.codes。IM.codes").
+    std::vector<std::string> emitted_keep_tail;
+    int call_keep_tail = 0;
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> keep_tail_pipeline(
+        [&](const std::vector<float>&) -> std::string {
+          ++call_keep_tail;
+          if (call_keep_tail == 1) return "我常用 IM.codes。";
+          return "IM.codes";
+        },
+        [&](const std::string& line) { emitted_keep_tail.push_back(line); },
+        16000,
+        20000,
+        std::vector<std::string>{"IM.codes"});
+    keep_tail_pipeline.preload(std::vector<float>(24000, 0.2f));
+    std::thread worker_kt([&]() { keep_tail_pipeline.run_loop(); });
+    keep_tail_pipeline.request_stop(false, true);
+    worker_kt.join();
+    std::string final_kt;
+    for (const auto& line : emitted_keep_tail) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_kt = extract_json_string_field(line, "text").value_or("");
+      }
+    }
+    assert(final_kt == "我常用 IM.codes。IM.codes");
   }
 
   std::printf("segmented-pipeline tests passed\n");

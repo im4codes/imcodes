@@ -1801,7 +1801,8 @@ size_t find_cpp_trailing_cut(
 std::string strip_voice_hotword_hallucination(
     const std::string& text,
     const std::vector<std::string>& hotword_terms,
-    bool allow_single = false) {
+    bool allow_single = false,
+    bool whole_only = false) {
   if (text.empty() || hotword_terms.empty()) return text;
 
   std::vector<std::vector<uint32_t>> unique_terms;
@@ -1933,6 +1934,7 @@ std::string strip_voice_hotword_hallucination(
     if (allow_single && min_matches == 1) return {};
     return text;
   }
+  if (whole_only) return text;
 
   std::string current = text;
   const auto whole_map = build_cpp_normalized_cluster_map(current);
@@ -2029,7 +2031,7 @@ class SegmentedUtterancePipeline {
 
     auto sanitize_combined_text = [&](const std::string& raw_combined) -> std::string {
       if (hotword_terms_.empty() || raw_combined.empty()) return raw_combined;
-      return strip_voice_hotword_hallucination(raw_combined, hotword_terms_, false);
+      return strip_voice_hotword_hallucination(raw_combined, hotword_terms_, false, true);
     };
 
     auto text_has_real_non_hotword = [&](const std::string& t) -> bool {

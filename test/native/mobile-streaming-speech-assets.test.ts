@@ -4167,6 +4167,40 @@ do {
     check(done.wait(timeout: .now() + 5) == .success, "case 11 done")
     let finals = emitted.filter { ($0["isFinal"] as? Bool) == true }
     check(finals.count == 1 && (finals[0]["text"] as? String) == "", "case 11 final must be empty: \\(finals)")
+
+    // 11b: Round 3 counterexample — >cap real prior sentence ending with single hotword + trailing single hotword
+    //      must NOT re-run edge slicing across committed body segments ("我常用 IM.codes。IM.codes").
+    var emittedKeep: [[String: Any]] = []
+    let doneKeep = DispatchSemaphore(value: 0)
+    let passLockKeep = NSLock()
+    var callKeep = 0
+    let keepEngine = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 8_000,
+        strideSamples: 8_000,
+        maxSegmentSamples: 16_000,
+        maxFinalReDecodeSamples: 20_000,
+        rollbackTokenCount: 0,
+        expectLanguageHeader: false,
+        hotwordTerms: ["IM.codes"],
+        decodeFn: { _, _, checkCancel in
+            try checkCancel()
+            passLockKeep.lock()
+            callKeep += 1
+            let idx = callKeep
+            passLockKeep.unlock()
+            if idx == 1 { return QwenSegmentedDecodeResult(text: "我常用 IM.codes。", tokens: [101]) }
+            return QwenSegmentedDecodeResult(text: "IM.codes", tokens: [102])
+        },
+        rollbackPrefixFn: { tokens, _, _ in tokens },
+        emitJsonFn: { payload in emittedKeep.append(payload) },
+        onLoopFinishedFn: { doneKeep.signal() }
+    )
+    keepEngine.preload([Float](repeating: 0.2, count: 24_000))
+    DispatchQueue.global(qos: .userInitiated).async { keepEngine.runLoop() }
+    keepEngine.requestStop(abort: false, producerAlsoFinished: true)
+    check(doneKeep.wait(timeout: .now() + 5) == .success, "case 11b done")
+    let keepFinals = emittedKeep.filter { ($0["isFinal"] as? Bool) == true }
+    check(keepFinals.count == 1 && (keepFinals[0]["text"] as? String) == "我常用 IM.codes。IM.codes", "case 11b preserved tail hotword mismatch: \\(keepFinals)")
 }
 print("MAC_SEGMENTED_DECODE:PASS")
 `);

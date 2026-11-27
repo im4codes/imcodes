@@ -1357,7 +1357,7 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordsContext: String?, al
     return stripVoiceHotwordHallucination(text, hotwordTerms: splitTerms, allowSingle: allowSingle)
 }
 
-func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allowSingle: Bool = false) -> String {
+func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allowSingle: Bool = false, wholeOnly: Bool = false) -> String {
     guard !text.isEmpty, !hotwordTerms.isEmpty else { return text }
 
     var seen = Set<[Character]>()
@@ -1485,6 +1485,7 @@ func stripVoiceHotwordHallucination(_ text: String, hotwordTerms: [String], allo
         if allowSingle && minMatches == 1 { return "" }
         return text
     }
+    if wholeOnly { return text }
 
     var current = text
     let wholeMap = buildSwiftNormalizedClusterMap(current)
@@ -1960,7 +1961,8 @@ final class QwenSegmentedDecodeEngine {
                             let combined = stripVoiceHotwordHallucination(
                                 rawCombined,
                                 hotwordTerms: hotwordTerms,
-                                allowSingle: false
+                                allowSingle: false,
+                                wholeOnly: true
                             )
                             if !rawCombined.isEmpty && combined.isEmpty {
                                 // Cross-segment concatenation formed a pure repeated-hotword hallucination:
@@ -2013,7 +2015,7 @@ final class QwenSegmentedDecodeEngine {
                         let rawFinal = !lastEmittedText.isEmpty ? lastEmittedText : committedText
                         let sanitizedFinal = hotwordTerms.isEmpty
                             ? rawFinal
-                            : stripVoiceHotwordHallucination(rawFinal, hotwordTerms: hotwordTerms, allowSingle: false)
+                            : stripVoiceHotwordHallucination(rawFinal, hotwordTerms: hotwordTerms, allowSingle: false, wholeOnly: true)
                         let finalCombined = (retractedSegmentSingleHotword && !committedHasTrustedRealText && !sanitizedFinal.isEmpty && stripVoiceHotwordHallucination(sanitizedFinal, hotwordTerms: hotwordTerms, allowSingle: true).isEmpty)
                             ? ""
                             : sanitizedFinal
@@ -2032,7 +2034,8 @@ final class QwenSegmentedDecodeEngine {
                         : stripVoiceHotwordHallucination(
                             joinTranscriptSegments(committedText, activeText),
                             hotwordTerms: hotwordTerms,
-                            allowSingle: false
+                            allowSingle: false,
+                            wholeOnly: true
                         )
                     if !activeTrustedRealText.isEmpty || (hotwordTerms.isEmpty && !activeText.isEmpty) {
                         committedHasTrustedRealText = true
