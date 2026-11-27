@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
-  chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, lstatSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
@@ -344,6 +344,9 @@ describe('node-datachannel optional dependency decoupling', () => {
       name: 'node-datachannel', version: '0.32.3', type: 'module', main: './index.js',
     }));
     writeFileSync(join(depDir, 'index.js'), "throw new Error('preexisting broken addon');\n");
+    if (process.platform !== 'win32') {
+      symlinkSync('./missing.node', join(depDir, 'dangling-link.node'));
+    }
     writeFileSync(fakeNpmJs, [
       "const { appendFileSync, mkdirSync, writeFileSync } = require('node:fs');",
       "const { join } = require('node:path');",
@@ -392,6 +395,10 @@ describe('node-datachannel optional dependency decoupling', () => {
     expect(JSON.parse(readFileSync(join(pinoDir, 'package.json'), 'utf8'))).toEqual({ name: 'pino', version: '9.0.0' });
     expect(readFileSync(join(pinoDir, 'pino.js'), 'utf8')).toBe('export default function pino() {}\n');
     expect(readFileSync(join(depDir, 'index.js'), 'utf8')).toBe("throw new Error('preexisting broken addon');\n");
+    if (process.platform !== 'win32') {
+      expect(lstatSync(join(depDir, 'dangling-link.node')).isSymbolicLink()).toBe(true);
+      expect(readlinkSync(join(depDir, 'dangling-link.node'))).toBe('./missing.node');
+    }
     expect(existsSync(join(depDir, 'build', 'partial.o'))).toBe(false);
     expect(readdirSync(join(pkgRoot, 'node_modules')).filter((name) => name.startsWith('.node-datachannel-'))).toEqual([]);
 
@@ -405,11 +412,76 @@ describe('node-datachannel optional dependency decoupling', () => {
       });
       expect(stagingFailed).toEqual({ available: false, attempted: true, repaired: false, reason: 'verification_failed' });
       expect(readFileSync(join(depDir, 'index.js'), 'utf8')).toBe("throw new Error('preexisting broken addon');\n");
+      if (process.platform !== 'win32') {
+        expect(lstatSync(join(depDir, 'dangling-link.node')).isSymbolicLink()).toBe(true);
+        expect(readlinkSync(join(depDir, 'dangling-link.node'))).toBe('./missing.node');
+      }
       expect(existsSync(join(depDir, 'build', 'partial.o'))).toBe(false);
       expect(readFileSync(join(pinoDir, 'pino.js'), 'utf8')).toBe('export default function pino() {}\n');
       expect(readdirSync(join(pkgRoot, 'node_modules')).filter((name) => name.startsWith('.node-datachannel-'))).toEqual([]);
     } finally {
       delete process.env.TEST_BROKEN_STAGING;
+    }
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('skips in-place rebuild when snapshot fails on an unreadable file and preserves original package and pino', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes ndc snapshot-eacces-'));
+    cleanup.push(root);
+    const pkgRoot = join(root, 'pkg');
+    const pinoDir = join(pkgRoot, 'node_modules', 'pino');
+    const depDir = join(pkgRoot, 'node_modules', 'node-datachannel');
+    const unreadableFile = join(depDir, 'unreadable.bin');
+    const npmLogPath = join(root, 'npm-calls.jsonl');
+    const fakeNpmJs = join(root, 'fake-npm.cjs');
+    const fakeNpmWrapper = join(root, 'npm');
+
+    mkdirSync(pinoDir, { recursive: true });
+    mkdirSync(depDir, { recursive: true });
+    writeFileSync(join(pkgRoot, 'package.json'), JSON.stringify({
+      name: 'imcodes',
+      private: true,
+      optionalDependencies: { 'node-datachannel': '^0.32.3' },
+    }));
+    writeFileSync(join(pinoDir, 'package.json'), JSON.stringify({ name: 'pino', version: '9.0.0' }));
+    writeFileSync(join(pinoDir, 'pino.js'), 'export default function pino() {}\n');
+    writeFileSync(join(depDir, 'package.json'), JSON.stringify({
+      name: 'node-datachannel', version: '0.32.3', type: 'module', main: './index.js',
+    }));
+    writeFileSync(join(depDir, 'index.js'), "throw new Error('original broken addon');\n");
+    writeFileSync(unreadableFile, 'secret');
+    chmodSync(unreadableFile, 0o000);
+    writeFileSync(fakeNpmJs, [
+      "const { appendFileSync, writeFileSync } = require('node:fs');",
+      "const { join } = require('node:path');",
+      "const args = process.argv.slice(2);",
+      `appendFileSync(${JSON.stringify(npmLogPath)}, JSON.stringify({ subcmd: args[0], args, cwd: process.cwd() }) + '\\n');`,
+      "if (args[0] === 'rebuild') {",
+      "  writeFileSync(join(process.cwd(), 'node_modules', 'node-datachannel', 'index.js'), 'overwritten by rebuild');",
+      "  process.exit(2);",
+      "}",
+      "process.exit(217);",
+    ].join('\n'));
+    writeFileSync(fakeNpmWrapper, `#!/usr/bin/env sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeNpmJs)} "$@"\n`, { mode: 0o755 });
+
+    try {
+      const logs: string[] = [];
+      const result = repairNodeDatachannel({
+        packageRoot: pkgRoot,
+        npmCommand: fakeNpmWrapper,
+        npmCli: fakeNpmJs,
+        log: (line) => logs.push(line),
+      });
+      expect(result).toEqual({ available: false, attempted: true, repaired: false, reason: 'verification_failed' });
+      const calls = readFileSync(npmLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { subcmd: string; args: string[]; cwd: string });
+      expect(calls.map((c) => c.subcmd)).toEqual(['install']);
+      expect(calls[0].args[calls[0].args.indexOf('--prefix') + 1]).not.toBe(resolve(pkgRoot));
+      expect(logs.some((line) => line.includes('skipping in-place rebuild'))).toBe(true);
+      expect(readFileSync(join(depDir, 'index.js'), 'utf8')).toBe("throw new Error('original broken addon');\n");
+      expect(JSON.parse(readFileSync(join(pinoDir, 'package.json'), 'utf8'))).toEqual({ name: 'pino', version: '9.0.0' });
+      expect(readFileSync(join(pinoDir, 'pino.js'), 'utf8')).toBe('export default function pino() {}\n');
+      expect(readdirSync(join(pkgRoot, 'node_modules')).filter((name) => name.startsWith('.node-datachannel-'))).toEqual([]);
+    } finally {
+      chmodSync(unreadableFile, 0o644);
     }
   });
 
