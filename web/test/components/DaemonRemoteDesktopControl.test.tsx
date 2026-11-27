@@ -1470,5 +1470,152 @@ describe('DaemonRemoteDesktopControl', () => {
       expect(button.querySelector('.connecting-dot')).toBeNull();
       expect(button.disabled).toBe(false);
     });
+
+    it('cancels pending ticket send when snapshot retracts ready capability during in-flight mint', async () => {
+      let resolveTicket: (val: { ticket: string }) => void = () => {};
+      const pendingMint = new Promise<{ ticket: string }>((resolve) => {
+        resolveTicket = resolve;
+      });
+      const machinesApi = await import('../../src/api/machines.js');
+      const spy = vi.spyOn(machinesApi, 'mintControlledNodeExecutableTicket').mockImplementationOnce(() => pendingMint as never);
+
+      const ws = createSwitchableWsStub(
+        [REMOTE_DESKTOP_CAPABILITY, REMOTE_DESKTOP_INSTALLABLE_CAPABILITY],
+        'server_retract_ready',
+      );
+
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_retract_ready',
+        serverName: 'Retract Ready Server',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+
+      // Click login screen enable button
+      const buttons = container.querySelectorAll('.daemon-remote-desktop-btn');
+      expect(buttons.length).toBe(2);
+      fireEvent.click(buttons[1]);
+      expect(buttons[1].querySelector('.connecting-dot')).not.toBeNull();
+
+      // Snapshot update removes REMOTE_DESKTOP_CAPABILITY, leaving only INSTALLABLE
+      act(() => {
+        ws.emitSnapshot([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]);
+      });
+
+      // Now resolve the ticket mint
+      await act(async () => {
+        resolveTicket({ ticket: 'late_ticket_123' });
+      });
+
+      // Assert: NO frame was sent because required capability was retracted!
+      expect(ws.sent.length).toBe(0);
+
+      spy.mockRestore();
+    });
+
+    it('cancels pending install-here send when snapshot replaces or retracts install-here target', async () => {
+      let resolveInstallCode: (val: { installCode: string }) => void = () => {};
+      const pendingMint = new Promise<{ installCode: string }>((resolve) => {
+        resolveInstallCode = resolve;
+      });
+      const machinesApi = await import('../../src/api/machines.js');
+      const spy = vi.spyOn(machinesApi, 'mintControlledNodeInstallCommand').mockImplementationOnce(() => pendingMint as never);
+
+      const linuxX64Cap = controlledNodeInstallHereCapability({ os: 'linux', arch: 'x64' });
+      const darwinArm64Cap = controlledNodeInstallHereCapability({ os: 'darwin', arch: 'arm64' });
+
+      const ws = createSwitchableWsStub([linuxX64Cap], 'server_retract_install_here');
+
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_retract_install_here',
+        serverName: 'Install Here Server',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+
+      // Right-click opens setup dialog
+      const btn = container.querySelector('.daemon-remote-desktop-btn') as HTMLButtonElement;
+      fireEvent.contextMenu(btn);
+
+      // In setup dialog, click install here start button
+      const startBtn = container.querySelector('.controlled-node-install-here-btn') as HTMLButtonElement;
+      if (startBtn) {
+        fireEvent.click(startBtn);
+      }
+
+      // Snapshot updates target artifact to darwin-arm64
+      act(() => {
+        ws.emitSnapshot([darwinArm64Cap]);
+      });
+
+      // Resolve mint promise
+      await act(async () => {
+        resolveInstallCode({ installCode: 'sh -c late_install' });
+      });
+
+      // No frame sent
+      expect(ws.sent.length).toBe(0);
+
+      spy.mockRestore();
+    });
+
+    it('does not cancel in-flight ticket send when unrelated capabilities are added or removed', async () => {
+      let resolveTicket: (val: { ticket: string }) => void = () => {};
+      const pendingMint = new Promise<{ ticket: string }>((resolve) => {
+        resolveTicket = resolve;
+      });
+      const machinesApi = await import('../../src/api/machines.js');
+      const spy = vi.spyOn(machinesApi, 'mintControlledNodeExecutableTicket').mockImplementationOnce(() => pendingMint as never);
+
+      const ws = createSwitchableWsStub(
+        [REMOTE_DESKTOP_CAPABILITY, REMOTE_DESKTOP_INSTALLABLE_CAPABILITY],
+        'server_unrelated_caps',
+      );
+
+      const { container } = render(h(DaemonRemoteDesktopControl as never, {
+        ws: ws.client as never,
+        serverId: 'server_unrelated_caps',
+        serverName: 'Unrelated Caps Server',
+        daemonOnline: true,
+        accountScope: TEST_SCOPE,
+        onOpen: vi.fn(),
+        machines: [],
+        canSetUp: true,
+      }));
+
+      const buttons = container.querySelectorAll('.daemon-remote-desktop-btn');
+      fireEvent.click(buttons[1]);
+
+      // Snapshot adds an unrelated capability (e.g. encoder), keeping REMOTE_DESKTOP_CAPABILITY
+      act(() => {
+        ws.emitSnapshot([
+          REMOTE_DESKTOP_CAPABILITY,
+          REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
+          REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+        ]);
+      });
+
+      // Resolve ticket
+      await act(async () => {
+        resolveTicket({ ticket: 'valid_ticket_456' });
+      });
+
+      // Because REMOTE_DESKTOP_CAPABILITY was preserved, the ticket IS sent!
+      expect(ws.sent.length).toBe(1);
+      expect(ws.sent[0]).toEqual({
+        type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+        ticket: 'valid_ticket_456',
+      });
+
+      spy.mockRestore();
+    });
   });
 });

@@ -110,7 +110,7 @@ export function readControlledNodeInstallHereTarget(
   capabilities: readonly string[],
 ): ControlledNodeArtifactPair | null {
   for (const capability of capabilities) {
-    if (!capability.startsWith(INSTALL_HERE_CAPABILITY_PREFIX)) continue;
+    if (typeof capability !== 'string' || !capability.startsWith(INSTALL_HERE_CAPABILITY_PREFIX)) continue;
     const named = capability.slice(INSTALL_HERE_CAPABILITY_PREFIX.length);
     const target = CONTROLLED_NODE_CANONICAL_ARTIFACTS.find(
       (artifact) => `${artifact.os}-${artifact.arch}` === named,
