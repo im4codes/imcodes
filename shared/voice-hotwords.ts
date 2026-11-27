@@ -37,11 +37,13 @@ export interface VoiceHotwordsScopeState {
   raw: string;
   updatedAt: number;
   source?: VoiceHotwordsSource;
+  lastWriteId?: string;
 }
 
 export interface VoiceHotwordsShareState {
   enabled: boolean;
   updatedAt: number;
+  lastWriteId?: string;
 }
 
 export interface VoiceHotwordsSyncRecord {
@@ -56,6 +58,7 @@ export interface VoiceHotwordsScopePatch {
   mode?: 'replace' | 'merge';
   clientUpdatedAt?: number;
   baseUpdatedAt?: number;
+  writeId?: string;
 }
 
 export interface VoiceHotwordsProjectPatch extends VoiceHotwordsScopePatch {
@@ -66,6 +69,7 @@ export interface VoiceHotwordsSharePatch {
   enabled: boolean;
   clientUpdatedAt?: number;
   baseUpdatedAt?: number;
+  writeId?: string;
 }
 
 export interface VoiceHotwordsPutRequest {
@@ -75,6 +79,7 @@ export interface VoiceHotwordsPutRequest {
   mode?: 'replace' | 'merge';
   clientUpdatedAt?: number;
   baseUpdatedAt?: number;
+  writeId?: string;
   projectKey?: string;
   serverId?: string;
   projectName?: string;
@@ -83,6 +88,12 @@ export interface VoiceHotwordsPutRequest {
   project?: VoiceHotwordsProjectPatch;
   projects?: Record<string, VoiceHotwordsScopePatch>;
   shareWithOthers?: VoiceHotwordsSharePatch;
+}
+
+export interface VoiceHotwordsAppliedScopes {
+  user?: boolean;
+  projects?: Record<string, boolean>;
+  shareWithOthers?: boolean;
 }
 
 export interface VoiceHotwordsGetResponse {
@@ -95,6 +106,8 @@ export interface VoiceHotwordsGetResponse {
 export interface VoiceHotwordsPutResponse {
   ok: true;
   record: VoiceHotwordsSyncRecord;
+  applied?: boolean;
+  appliedScopes?: VoiceHotwordsAppliedScopes;
   projectKey?: string;
   project?: VoiceHotwordsScopeState;
   compiled?: CompiledVoiceHotwords;
@@ -908,6 +921,13 @@ function coerceSource(value: unknown): VoiceHotwordsSource | undefined {
   return value === 'web' || value === 'mcp' ? value : undefined;
 }
 
+function coerceWriteId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 64 || ASCII_CONTROL_TEST_RE.test(trimmed)) return undefined;
+  return trimmed;
+}
+
 function coerceScopeState(value: unknown): VoiceHotwordsScopeState {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     return { raw: '', updatedAt: 0 };
@@ -916,10 +936,12 @@ function coerceScopeState(value: unknown): VoiceHotwordsScopeState {
   const raw = normalizeVoiceHotwordRawText(obj.raw);
   const updatedAt = coerceTimestamp(obj.updatedAt);
   const source = coerceSource(obj.source);
+  const lastWriteId = coerceWriteId(obj.lastWriteId);
   return {
     raw,
     updatedAt,
     ...(source ? { source } : {}),
+    ...(lastWriteId ? { lastWriteId } : {}),
   };
 }
 
@@ -940,6 +962,7 @@ export function coerceVoiceHotwordsSyncRecord(input: unknown): VoiceHotwordsSync
   const shareObj = obj.shareWithOthers && typeof obj.shareWithOthers === 'object' && !Array.isArray(obj.shareWithOthers)
     ? obj.shareWithOthers as Record<string, unknown>
     : null;
+  const shareWriteId = coerceWriteId(shareObj?.lastWriteId);
   return {
     version: 1,
     user: coerceScopeState(obj.user),
@@ -947,6 +970,7 @@ export function coerceVoiceHotwordsSyncRecord(input: unknown): VoiceHotwordsSync
     shareWithOthers: {
       enabled: shareObj?.enabled === true,
       updatedAt: coerceTimestamp(shareObj?.updatedAt),
+      ...(shareWriteId ? { lastWriteId: shareWriteId } : {}),
     },
   };
 }

@@ -44,6 +44,7 @@ import {
 import {
   VOICE_HOTWORDS_API_PATH,
   type VoiceHotwordsPutRequest,
+  type VoiceHotwordsPutResponse,
   type VoiceHotwordsSyncRecord,
 } from '@shared/voice-hotwords.js';
 /**
@@ -202,9 +203,9 @@ export function getApiKey(): string | null {
 function syncVoiceHotwordsAuthScopeFromApi(): void {
   if (_expectedUserId && (!isNative() || Boolean(_baseUrl))) {
     const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : '';
-    setVoiceHotwordsAuthScope({ userId: _expectedUserId, baseUrl: _baseUrl || origin || null });
+    setVoiceHotwordsAuthScope({ userId: _expectedUserId, baseUrl: _baseUrl || origin || null }, { sync: false });
   } else if (!_expectedUserId) {
-    setVoiceHotwordsAuthScope(null);
+    setVoiceHotwordsAuthScope(null, { sync: false });
   }
 }
 
@@ -2241,19 +2242,19 @@ export async function fetchVoiceHotwords(
 export async function updateVoiceHotwords(
   payload: VoiceHotwordsPutRequest,
   options: { expectedUserId?: string; signal?: AbortSignal } = {},
-): Promise<VoiceHotwordsSyncRecord | null> {
+): Promise<VoiceHotwordsPutResponse | null> {
   const expected = options.expectedUserId ?? _expectedUserId;
   if (!expected || expected !== _expectedUserId) {
     throw new Error('voice_hotwords_unconfirmed_user');
   }
   try {
-    const res = await apiFetch<{ record?: VoiceHotwordsSyncRecord }>(VOICE_HOTWORDS_API_PATH, {
+    const res = await apiFetch<VoiceHotwordsPutResponse>(VOICE_HOTWORDS_API_PATH, {
       signal: options.signal,
       headers: { [EXPECTED_USER_ID_HEADER]: expected },
       method: 'PUT',
       body: JSON.stringify(payload),
     });
-    return res?.record ?? null;
+    return res?.record ? res : null;
   } catch (err) {
     if (err instanceof ApiError && err.status === 404) return null;
     throw err;

@@ -551,4 +551,262 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
       vi.useRealTimers();
     }
   });
+
+  it('prevents stale-PUT + mid-flight-edit resurrection after external clear and recovers committed writes across serialization/lost replies', async () => {
+    vi.useFakeTimers();
+    try {
+      let rev = 100;
+      const nextRev = () => {
+        rev += 1;
+        return rev;
+      };
+      const projKey = 'srv:srv-1::race-app';
+      const srv: any = {
+        version: 1,
+        user: { raw: 'OldUser', updatedAt: 100, source: 'web' },
+        projects: { [projKey]: { raw: 'OldProj', updatedAt: 100, source: 'web' } },
+        shareWithOthers: { enabled: true, updatedAt: 100 },
+      };
+
+      const projectPutBases: Array<number | undefined> = [];
+      const projectCommittedRevs: number[] = [];
+      const userPutBases: Array<number | undefined> = [];
+      const sharePutBases: Array<number | undefined> = [];
+      let delayNextPut: {
+        started: Promise<void>;
+        markStarted: () => void;
+        release: () => void;
+        signalAborted?: boolean;
+      } | null = null;
+      let dropNextPutReplyAfterCommit = false;
+
+      const recordPutBase = (payload: any) => {
+        if (payload.scope === 'project') projectPutBases.push(payload.baseUpdatedAt);
+        else if (payload.scope === 'user') userPutBases.push(payload.baseUpdatedAt);
+        else if (payload.scope === 'share') sharePutBases.push(payload.baseUpdatedAt);
+      };
+
+      const applyServerPut = (payload: any) => {
+        if (payload.scope === 'project') {
+          const cur = srv.projects[payload.projectKey] ?? { raw: '', updatedAt: 0 };
+          let applied = false;
+          if (payload.baseUpdatedAt === cur.updatedAt) {
+            const committedRev = nextRev();
+            srv.projects[payload.projectKey] = {
+              raw: payload.raw,
+              updatedAt: committedRev,
+              source: 'web',
+              ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+            };
+            projectCommittedRevs.push(committedRev);
+            applied = true;
+          } else if (payload.writeId && cur.lastWriteId === payload.writeId) {
+            applied = true;
+          }
+          return {
+            ok: true,
+            applied,
+            appliedScopes: { projects: { [payload.projectKey]: applied } },
+            record: structuredClone(srv),
+          };
+        }
+        if (payload.scope === 'user') {
+          let applied = false;
+          if (payload.baseUpdatedAt === srv.user.updatedAt) {
+            srv.user = {
+              raw: payload.raw,
+              updatedAt: nextRev(),
+              source: 'web',
+              ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+            };
+            applied = true;
+          } else if (payload.writeId && srv.user.lastWriteId === payload.writeId) {
+            applied = true;
+          }
+          return {
+            ok: true,
+            applied,
+            appliedScopes: { user: applied },
+            record: structuredClone(srv),
+          };
+        }
+        let applied = false;
+        if (payload.baseUpdatedAt === srv.shareWithOthers.updatedAt) {
+          srv.shareWithOthers = {
+            enabled: payload.enabled,
+            updatedAt: nextRev(),
+            ...(payload.writeId ? { lastWriteId: payload.writeId } : {}),
+          };
+          applied = true;
+        } else if (payload.writeId && srv.shareWithOthers.lastWriteId === payload.writeId) {
+          applied = true;
+        }
+        return {
+          ok: true,
+          applied,
+          appliedScopes: { shareWithOthers: applied },
+          record: structuredClone(srv),
+        };
+      };
+
+      const fetchRecord = vi.fn(async () => structuredClone(srv));
+      const updateRecord = vi.fn(async (payload: any, opts: { signal?: AbortSignal }) => {
+        recordPutBase(payload);
+        if (delayNextPut) {
+          const gate = delayNextPut;
+          delayNextPut = null;
+          let releaseFn!: () => void;
+          const waitRelease = new Promise<void>((r) => {
+            releaseFn = r;
+          });
+          gate.release = releaseFn;
+          gate.markStarted();
+          await waitRelease;
+          gate.signalAborted = Boolean(opts.signal?.aborted);
+        }
+        const result = applyServerPut(payload);
+        if (dropNextPutReplyAfterCommit) {
+          dropNextPutReplyAfterCommit = false;
+          throw new Error('simulated_network_drop_after_commit');
+        }
+        return result;
+      });
+
+      setVoiceHotwordsAuthScope({ userId: 'user-race', baseUrl: 'https://race.example' });
+      registerVoiceHotwordsSyncClient({ fetchRecord, updateRecord });
+      await syncVoiceHotwordsFromServer();
+      expect(getProjectVoiceHotwordsRaw(projKey)).toBe('OldProj');
+
+      // Direction 1: Edit #1 delayed in flight, edit #2 locally, external MCP clears at V101, delayed PUT #1 rejected (applied: false) -> MUST NOT resend edit #2 on V101!
+      let markStarted!: () => void;
+      const started = new Promise<void>((r) => {
+        markStarted = r;
+      });
+      const gate = { started, markStarted, release: () => {}, signalAborted: false };
+      delayNextPut = gate;
+
+      setProjectVoiceHotwordsRaw(projKey, 'Edit1Proj');
+      const flush1 = flushVoiceHotwordsPush();
+      await started;
+
+      // User keeps typing edit #2 while PUT #1 is in flight & debounce timer runs, then MCP clears server to V101
+      setProjectVoiceHotwordsRaw(projKey, 'Edit2Proj');
+      await vi.advanceTimersByTimeAsync(350);
+      expect(projectPutBases).toEqual([100]); // serialized: second debounce did not start or abort before first settled!
+
+      srv.projects[projKey] = { raw: '', updatedAt: nextRev(), source: 'mcp' }; // no lastWriteId (101)
+      gate.release();
+      await flush1;
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(gate.signalAborted).toBe(false);
+      expect(projectPutBases).toEqual([100]); // NEVER [100, 101]!
+      expect(srv.projects[projKey].raw).toBe('');
+      expect(getProjectVoiceHotwordsRaw(projKey)).toBe('');
+
+      // Same Direction-1 invariant for user and share scopes
+      const userBase = nextRev();
+      const shareBase = nextRev();
+      srv.user = { raw: 'User100', updatedAt: userBase, source: 'web' };
+      srv.shareWithOthers = { enabled: true, updatedAt: shareBase };
+      await syncVoiceHotwordsFromServer();
+
+      let markUserStarted!: () => void;
+      const userStarted = new Promise<void>((r) => {
+        markUserStarted = r;
+      });
+      const userGate = { started: userStarted, markStarted: markUserStarted, release: () => {}, signalAborted: false };
+      delayNextPut = userGate;
+      setGlobalVoiceHotwordsRaw('UserEdit1');
+      const userFlush1 = flushVoiceHotwordsPush();
+      await userStarted;
+      setGlobalVoiceHotwordsRaw('UserEdit2');
+      srv.user = { raw: '', updatedAt: nextRev(), source: 'mcp' };
+      userGate.release();
+      await userFlush1;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(userPutBases).toEqual([userBase]);
+      expect(srv.user.raw).toBe('');
+      expect(getGlobalVoiceHotwordsRaw()).toBe('');
+
+      let markShareStarted!: () => void;
+      const shareStarted = new Promise<void>((r) => {
+        markShareStarted = r;
+      });
+      const shareGate = { started: shareStarted, markStarted: markShareStarted, release: () => {}, signalAborted: false };
+      delayNextPut = shareGate;
+      setShareHotwordsWithOthers(false);
+      const shareFlush1 = flushVoiceHotwordsPush();
+      await shareStarted;
+      setShareHotwordsWithOthers(true);
+      srv.shareWithOthers = { enabled: false, updatedAt: nextRev() };
+      shareGate.release();
+      await shareFlush1;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(sharePutBases).toEqual([shareBase]);
+      expect(srv.shareWithOthers.enabled).toBe(false);
+      expect(getShareHotwordsWithOthers()).toBe(false);
+
+      // Direction 2a: Own PUT #1 commits in flight while concurrent debounce + pull arrive -> neither aborts PUT #1, edit #2 commits on top!
+      projectPutBases.length = 0;
+      projectCommittedRevs.length = 0;
+      const revBefore2a = srv.projects[projKey].updatedAt;
+      let mark2aStarted!: () => void;
+      const started2a = new Promise<void>((r) => {
+        mark2aStarted = r;
+      });
+      const gate2a = { started: started2a, markStarted: mark2aStarted, release: () => {}, signalAborted: false };
+      delayNextPut = gate2a;
+      setProjectVoiceHotwordsRaw(projKey, 'OwnCommit1');
+      const flush2a = flushVoiceHotwordsPush();
+      await started2a;
+
+      setProjectVoiceHotwordsRaw(projKey, 'OwnCommit2');
+      const pullDuringPut = syncVoiceHotwordsFromServer();
+      await vi.advanceTimersByTimeAsync(350);
+      gate2a.release();
+      await flush2a;
+      await pullDuringPut;
+      await vi.advanceTimersByTimeAsync(350);
+
+      expect(gate2a.signalAborted).toBe(false);
+      expect(srv.projects[projKey].raw).toBe('OwnCommit2');
+      expect(getProjectVoiceHotwordsRaw(projKey)).toBe('OwnCommit2');
+      expect(projectPutBases).toEqual([revBefore2a, projectCommittedRevs[0]]);
+
+      // Direction 2b: PUT #1 commits on server (with lastWriteId) then reply drops before client sees it -> edit #2 recovers via GET OR direct PUT without being discarded!
+      projectPutBases.length = 0;
+      projectCommittedRevs.length = 0;
+      const baseBeforeLost1 = srv.projects[projKey].updatedAt;
+      dropNextPutReplyAfterCommit = true;
+      setProjectVoiceHotwordsRaw(projKey, 'CommittedLostReply1');
+      await flushVoiceHotwordsPush();
+      const revAfterLost1 = srv.projects[projKey].updatedAt;
+      expect(srv.projects[projKey].raw).toBe('CommittedLostReply1');
+
+      // Local edit #2 while Web still thinks base is old -> GET recognizes own lastWriteId and pushes edit #2 cleanly
+      setProjectVoiceHotwordsRaw(projKey, 'EditAfterLostReply2');
+      await syncVoiceHotwordsFromServer();
+      expect(srv.projects[projKey].raw).toBe('EditAfterLostReply2');
+      expect(getProjectVoiceHotwordsRaw(projKey)).toBe('EditAfterLostReply2');
+      expect(projectPutBases).toEqual([baseBeforeLost1, revAfterLost1]);
+
+      // Direct flush recovery (no GET beforehand) when prior PUT committed & dropped before local edit #2
+      projectPutBases.length = 0;
+      projectCommittedRevs.length = 0;
+      const baseBeforeLost3 = srv.projects[projKey].updatedAt;
+      dropNextPutReplyAfterCommit = true;
+      setProjectVoiceHotwordsRaw(projKey, 'CommittedLostReply3');
+      await flushVoiceHotwordsPush();
+      const revAfterLost3 = srv.projects[projKey].updatedAt;
+
+      setProjectVoiceHotwordsRaw(projKey, 'DirectFlushEdit4');
+      await flushVoiceHotwordsPush();
+      expect(srv.projects[projKey].raw).toBe('DirectFlushEdit4');
+      expect(getProjectVoiceHotwordsRaw(projKey)).toBe('DirectFlushEdit4');
+      expect(projectPutBases).toEqual([baseBeforeLost3, baseBeforeLost3, revAfterLost3]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

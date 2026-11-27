@@ -516,4 +516,140 @@ describe('/api/voice-hotwords routes and reserved preference key', () => {
       headers: cookieHeaders('user-1', true),
     })).status).toBe(403);
   });
+
+  it('returns applied/appliedScopes, preserves idempotent writeId replays, and rejects stale writes with applied=false across user/project/share', async () => {
+    const { db } = makeMemDb();
+    const app = buildApp(makeEnv(db));
+
+    // Seed initial user, project, and share state
+    const seedRes = await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({
+        scope: 'sync',
+        user: { raw: 'SeedUser', baseUpdatedAt: 0, writeId: 'w_seed_u' },
+        projects: { codedeck: { raw: 'SeedProj', baseUpdatedAt: 0, writeId: 'w_seed_p' } },
+        shareWithOthers: { enabled: true, baseUpdatedAt: 0, writeId: 'w_seed_s' },
+      }),
+    });
+    expect(seedRes.status).toBe(200);
+    const seedJson = await seedRes.json() as {
+      appliedScopes: { user?: boolean; projects?: Record<string, boolean>; shareWithOthers?: boolean };
+      record: {
+        user: { updatedAt: number; lastWriteId?: string; raw: string };
+        projects: Record<string, { updatedAt: number; lastWriteId?: string; raw: string }>;
+        shareWithOthers: { updatedAt: number; lastWriteId?: string; enabled: boolean };
+      };
+    };
+    expect(seedJson.appliedScopes).toEqual({
+      user: true,
+      projects: { codedeck: true },
+      shareWithOthers: true,
+    });
+    expect(seedJson.record.user.lastWriteId).toBe('w_seed_u');
+    expect(seedJson.record.projects.codedeck.lastWriteId).toBe('w_seed_p');
+    expect(seedJson.record.shareWithOthers.lastWriteId).toBe('w_seed_s');
+
+    // Replay same writeIds against now-moved baseUpdatedAt -> idempotent applied=true without bumping updatedAt
+    const replayProj = await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({
+        scope: 'project',
+        projectKey: 'codedeck',
+        raw: 'SeedProj',
+        mode: 'replace',
+        baseUpdatedAt: 0,
+        writeId: 'w_seed_p',
+      }),
+    });
+    expect(replayProj.status).toBe(200);
+    const replayJson = await replayProj.json() as {
+      applied: boolean;
+      appliedScopes: { projects?: Record<string, boolean> };
+      record: { projects: Record<string, { updatedAt: number }> };
+    };
+    expect(replayJson.applied).toBe(true);
+    expect(replayJson.appliedScopes.projects?.codedeck).toBe(true);
+    expect(replayJson.record.projects.codedeck.updatedAt).toBe(seedJson.record.projects.codedeck.updatedAt);
+
+    // External MCP clear advances updatedAt and clears lastWriteId
+    const mcpClear = await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: daemonHeaders,
+      body: JSON.stringify({
+        scope: 'sync',
+        user: { raw: '' },
+        projects: { codedeck: { raw: '' } },
+        shareWithOthers: { enabled: false },
+      }),
+    });
+    expect(mcpClear.status).toBe(200);
+    const clearedJson = await mcpClear.json() as {
+      record: {
+        user: { updatedAt: number; lastWriteId?: string; raw: string };
+        projects: Record<string, { updatedAt: number; lastWriteId?: string; raw: string }>;
+        shareWithOthers: { updatedAt: number; lastWriteId?: string; enabled: boolean };
+      };
+    };
+    expect(clearedJson.record.user.lastWriteId).toBeUndefined();
+    expect(clearedJson.record.projects.codedeck.lastWriteId).toBeUndefined();
+    expect(clearedJson.record.shareWithOthers.lastWriteId).toBeUndefined();
+
+    // Delayed Web PUT with old base + new writeId returns HTTP 200 with applied=false and does NOT resurrect
+    const staleUser = await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({
+        scope: 'user',
+        raw: 'StaleUser',
+        mode: 'replace',
+        baseUpdatedAt: seedJson.record.user.updatedAt,
+        writeId: 'w_stale_u',
+      }),
+    });
+    const staleProj = await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({
+        scope: 'project',
+        projectKey: 'codedeck',
+        raw: 'StaleProj',
+        mode: 'replace',
+        baseUpdatedAt: seedJson.record.projects.codedeck.updatedAt,
+        writeId: 'w_stale_p',
+      }),
+    });
+    const staleShare = await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({
+        scope: 'share',
+        enabled: true,
+        baseUpdatedAt: seedJson.record.shareWithOthers.updatedAt,
+        writeId: 'w_stale_s',
+      }),
+    });
+    const staleUserJson = await staleUser.json() as { applied: boolean; record: { user: { raw: string } } };
+    const staleProjJson = await staleProj.json() as { applied: boolean; project: { raw: string } };
+    const staleShareJson = await staleShare.json() as { applied: boolean; record: { shareWithOthers: { enabled: boolean } } };
+    expect(staleUserJson.applied).toBe(false);
+    expect(staleUserJson.record.user.raw).toBe('');
+    expect(staleProjJson.applied).toBe(false);
+    expect(staleProjJson.project.raw).toBe('');
+    expect(staleShareJson.applied).toBe(false);
+    expect(staleShareJson.record.shareWithOthers.enabled).toBe(false);
+
+    // Invalid writeId (> 64 chars or control chars) rejected with 400
+    expect((await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({ scope: 'user', raw: 'x', writeId: 'w'.repeat(65) }),
+    })).status).toBe(400);
+    expect((await app.request(VOICE_HOTWORDS_API_PATH, {
+      method: 'PUT',
+      headers: cookieHeaders('user-1', true),
+      body: JSON.stringify({ scope: 'user', raw: 'x', writeId: 'bad\nwrite' }),
+    })).status).toBe(400);
+  });
 });
