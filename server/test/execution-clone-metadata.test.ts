@@ -49,6 +49,7 @@ vi.mock('../../src/agent/sdk-runtime-config.js', () => ({
 }));
 vi.mock('../../src/agent/claude-usage-quota.js', () => ({
   getClaudeUsageQuota: async () => null,
+  peekClaudeUsageQuotaCached: () => null,
 }));
 
 // Import AFTER the mocks are registered.

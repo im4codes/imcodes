@@ -11,6 +11,7 @@ vi.mock('../../src/agent/session-manager.js', () => ({
 
 vi.mock('../../src/agent/agy-usage-quota.js', () => ({
   fetchAgyUsageQuota: vi.fn(async () => null),
+  peekAgyUsageQuotaCached: vi.fn(() => null),
   recordAgyQuotaActivity: vi.fn(),
 }));
 

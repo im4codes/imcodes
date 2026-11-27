@@ -789,6 +789,9 @@ let latestPublishedDetectAgentsSeq = 0;
 let latestPublishedDetectAgentsEpoch = 0;
 let daemonPortForwardEngine: PortForwardEngine | null = null;
 let daemonPortForwardServerLink: ServerLink | null = null;
+let lastQuotaPushServerLink: ServerLink | null = null;
+const pendingBackgroundQuotaPushKeys = new Set<BackgroundQuotaProviderKey>();
+let backgroundQuotaPushTimer: ReturnType<typeof setTimeout> | null = null;
 
 function inFlightSessionSendKey(sessionName: string, clientMessageId: string): string {
   return `${sessionName}\u0000${clientMessageId}`;
@@ -2097,10 +2100,6 @@ export async function refreshMuseQuotaMetadataForSessions(serverLink?: ServerLin
   if (!serverLink) return;
   await syncSubSessionsForPeriodicRefresh(serverLink, museSessions);
 }
-
-let lastQuotaPushServerLink: ServerLink | null = null;
-const pendingBackgroundQuotaPushKeys = new Set<BackgroundQuotaProviderKey>();
-let backgroundQuotaPushTimer: ReturnType<typeof setTimeout> | null = null;
 
 function sessionMatchesBackgroundQuotaKey(
   session: SessionRecord,
