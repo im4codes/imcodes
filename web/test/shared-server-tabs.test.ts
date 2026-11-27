@@ -165,6 +165,23 @@ describe('shared-server-tabs projection & routing', () => {
       sharedEntries: [entryA, entryB],
       liveSessions: [liveA],
     })).toEqual([liveA]);
+
+    // Before /api/shares/open authorizes a share target for this server (activeTarget === null
+    // or activeTarget belongs to a different server), discovery entries must NEVER synthesize panes.
+    expect(mergeSharedServerSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: null,
+      sharedEntries: [entryA, entryB],
+      liveSessions: [],
+    })).toEqual([]);
+    expect(mergeSharedServerSessions({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: { kind: 'main', serverId: 'srv-other', sessionName: 'deck_other_brain' },
+      sharedEntries: [entryA, entryB],
+      liveSessions: [],
+    })).toEqual([]);
   });
 
   it('deduplicates multiple grants for the same session/subsession preferring participant over viewer', () => {
@@ -518,5 +535,52 @@ describe('shared-server-tabs projection & routing', () => {
     });
     expect(nestedStates.get('subY')?.effectiveRole).toBe('viewer');
     expect(nestedStates.has('subOutside')).toBe(false);
+
+    // Counterexample (Round 4 P0): open subsession covered by main after main downgrades to viewer
+    // MUST report 'viewer' connection role even when an independent 'participant' grant remains in sharedEntries
+    const mainTarget = { kind: 'main' as const, serverId: 'srv-shared', sessionName: 'deck_projC_brain' };
+    const indPartSub = makeSubEntry({
+      id: 'g-subX-part',
+      subSessionId: 'subX',
+      role: 'participant',
+      parentSessionName: 'deck_projC_brain',
+    });
+    const downgradedConnectionStates = buildSharedServerSubSessionStates({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: mainTarget,
+      activeCoverageRole: 'viewer',
+      authorizedScopedSubIds: scopedIds,
+      sharedEntries: [entryC, indPartSub],
+      subSessions: [subX, subY],
+      baseStates: new Map(),
+      activeDispatchIds: new Map(),
+    });
+    expect(downgradedConnectionStates.get('subX')?.effectiveRole).toBe('viewer');
+
+    const downgradedNavStates = buildSharedServerSubSessionStates({
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: mainTarget,
+      activeCoverageRole: 'viewer',
+      authorizedScopedSubIds: scopedIds,
+      sharedEntries: [entryC, indPartSub],
+      subSessions: [subX, subY],
+      baseStates: new Map(),
+      activeDispatchIds: new Map(),
+      mode: 'navigation',
+    });
+    expect(downgradedNavStates.get('subX')?.effectiveRole).toBe('participant');
+    expect(resolveRestrictedSubSessionClick({
+      entries: [entryC, indPartSub],
+      serverId: 'srv-shared',
+      isOwnedServer: false,
+      activeTarget: mainTarget,
+      activeEntryId: 'g-c',
+      activeCoverageRole: 'viewer',
+      authorizedScopedSubIds: scopedIds,
+      subSessionId: 'subX',
+      subSessions: [subX, subY],
+    })).toEqual({ action: 'open', entry: indPartSub });
   });
 });

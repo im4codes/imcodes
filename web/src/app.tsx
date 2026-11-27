@@ -5205,7 +5205,7 @@ function InternalMainApp() {
       localStorage.setItem(OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY, appOpenSpecAutoRunbarCompact ? '1' : '0');
     } catch { /* ignore */ }
   }, [appOpenSpecAutoRunbarCompact]);
-  const managedSharedSubSessionStateById = useMemo(() => {
+  const managedSharedSubSessionBaseStates = useMemo(() => {
     const states = new Map<string, SharedStateSummary>();
     if (!selectedServerId) return states;
     for (const sub of mergedSubSessions) {
@@ -5221,19 +5221,33 @@ function InternalMainApp() {
       states.set(sub.id, withActiveDispatch);
       states.set(sub.sessionName, withActiveDispatch);
     }
-    return buildSharedServerSubSessionStates({
+    return states;
+  }, [managedSharedSessionStateByName, managedSharedStateByTarget, mergedSubSessions, selectedServerId, selectedServerSharedOutState, sharedActiveDispatchIds]);
+
+  const computeSharedSubSessionStates = useCallback((mode: 'connection' | 'navigation') => (
+    buildSharedServerSubSessionStates({
       serverId: selectedServerId,
-      isOwnedServer: ownedServerIdsRef.current.has(selectedServerId),
+      isOwnedServer: Boolean(selectedServerId && ownedServerIdsRef.current.has(selectedServerId)),
       activeTarget: selectedShareTarget,
       activeCoverageRole: selectedShareCoverageRole,
       authorizedScopedSubIds: scopedAuthorizedSubIds,
       sharedEntries,
       excludedEntryIds: deniedSharedEntryIds,
       subSessions: mergedSubSessions,
-      baseStates: states,
+      baseStates: managedSharedSubSessionBaseStates,
       activeDispatchIds: sharedActiveDispatchIds,
-    });
-  }, [deniedSharedEntryIds, managedSharedSessionStateByName, managedSharedStateByTarget, mergedSubSessions, scopedAuthorizedSubIds, selectedServerId, selectedServerSharedOutState, selectedShareCoverageRole, selectedShareTarget, sharedActiveDispatchIds, sharedEntries]);
+      mode,
+    })
+  ), [deniedSharedEntryIds, managedSharedSubSessionBaseStates, mergedSubSessions, scopedAuthorizedSubIds, selectedServerId, selectedShareCoverageRole, selectedShareTarget, sharedActiveDispatchIds, sharedEntries]);
+
+  const managedSharedSubSessionStateById = useMemo(
+    () => computeSharedSubSessionStates('connection'),
+    [computeSharedSubSessionStates],
+  );
+  const managedSharedSubSessionNavStateById = useMemo(
+    () => computeSharedSubSessionStates('navigation'),
+    [computeSharedSubSessionStates],
+  );
 
   const resetServerScopedOverlaysAndTargets = useCallback((preservePendingNavForServerId?: string | null) => {
     askAnswerTrackerRef.current?.dispose();
@@ -10998,7 +11012,7 @@ function InternalMainApp() {
               sessions={visibleMainSessions}
               subSessions={mergedSubSessions}
               directSharedSubSessions={directSharedSubSessions}
-              sharedSubSessionStates={managedSharedSubSessionStateById}
+              sharedSubSessionStates={managedSharedSubSessionNavStateById}
               activeSession={activeSession}
               unreadCounts={unreadCounts}
               idleFlashTokens={idleFlashTokens}
@@ -11987,7 +12001,7 @@ function InternalMainApp() {
                 sessions={visibleMainSessions}
                 subSessions={mergedSubSessions}
                 directSharedSubSessions={directSharedSubSessions}
-                sharedSubSessionStates={managedSharedSubSessionStateById}
+                sharedSubSessionStates={managedSharedSubSessionNavStateById}
                 activeSession={activeSession}
                 unreadCounts={unreadCounts}
                 idleFlashTokens={idleFlashTokens}

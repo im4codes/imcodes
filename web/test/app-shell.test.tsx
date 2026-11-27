@@ -14947,4 +14947,95 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     });
     expect(screen.getByTestId('session-pane-deck_t_brain').getAttribute('data-share-role')).toBe('viewer');
   }, 20_000);
+
+  it('App merged shared server: locks already-open covered subsession on main participant->viewer downgrade until re-click opens independent participant grant', async () => {
+    useSubSessionsState.enableReactiveHydrateShared = true;
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const mainPart = {
+      id: 'share-main-p', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'participant', status: 'active',
+      targetLabel: 'Main P', target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_m_brain' },
+    } as const;
+    const indSubPart = {
+      id: 'share-sub-p', serverId: 'srv-shared', serverName: 'Partner Cloud', role: 'participant', status: 'active',
+      targetLabel: 'Sub P', target: { kind: 'subsession', serverId: 'srv-shared', subSessionId: 'sub_cov_p' },
+      agentType: 'shell', parentSessionName: 'deck_m_brain',
+    } as const;
+    discoverSharedEntriesMock.mockResolvedValue([mainPart, indSubPart]);
+
+    openSharedEntryMock.mockImplementation(async (target: { kind: string; subSessionId?: string }) => {
+      if (target.kind === 'subsession') {
+        return {
+          server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+          target: indSubPart.target,
+          coverage: {
+            effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+            coveringShareIds: [indSubPart.id], primaryShareId: indSubPart.id, authorizedAt: Date.now(),
+          },
+          sessions: [{ sessionName: 'deck_m_brain', title: 'Main P', state: 'running', agentType: 'claude-code' }],
+          subSessions: [
+            { subSessionId: 'sub_cov_p', sessionName: 'deck_sub_sub_cov_p', title: 'Sub P', type: 'shell', parentSessionName: 'deck_m_brain' },
+          ],
+        };
+      }
+      return {
+        server: { id: 'srv-shared', name: 'Partner Cloud', status: 'online', lastHeartbeatAt: Date.now() },
+        target: mainPart.target,
+        coverage: {
+          effectiveRole: 'participant', historyCutoffAt: 0, nextCoverageRecheckAt: null,
+          coveringShareIds: [mainPart.id], primaryShareId: mainPart.id, authorizedAt: Date.now(),
+        },
+        sessions: [{ sessionName: 'deck_m_brain', title: 'Main P', state: 'running', agentType: 'claude-code' }],
+        subSessions: [
+          { subSessionId: 'sub_cov_p', sessionName: 'deck_sub_sub_cov_p', title: 'Sub P', type: 'shell', parentSessionName: 'deck_m_brain' },
+        ],
+      };
+    });
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') return sessionList();
+      if (path === '/api/server/srv-shared/sessions') return { sessions: [] };
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    // Open Main P (participant), then open covered sub_cov_p locally (no second /shares/open call)
+    fireEvent.click((await screen.findAllByText('Main P'))[0]!.closest('button')!);
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_m_brain?shared=share-main-p'));
+    const openCallsAfterMain = openSharedEntryMock.mock.calls.length;
+    fireEvent.click(await screen.findByText('tree-select-sub-sub_cov_p'));
+    const subWin = await screen.findByTestId('sub-session-window-sub_cov_p');
+    expect(subWin.getAttribute('data-share-role')).toBe('participant');
+    expect(openSharedEntryMock).toHaveBeenCalledTimes(openCallsAfterMain);
+
+    // Main connection downgrades to viewer while independent sub-session participant grant remains in sharedEntries
+    await waitFor(() => expect(wsInstances.at(-1)?.options?.shareTarget).toEqual(mainPart.target));
+    const mainWs = wsInstances.at(-1)!;
+    await act(async () => {
+      mainWs.emit({
+        type: 'share.role_changed',
+        reason: 'share-role-changed',
+        effectiveRole: 'viewer',
+        target: mainPart.target,
+      });
+    });
+
+    // Both parent pane AND already-open subsession window must drop to viewer (even with share-sub-p still listed)
+    expect(screen.getByTestId('session-pane-deck_m_brain').getAttribute('data-share-role')).toBe('viewer');
+    expect(screen.getByTestId('sub-session-window-sub_cov_p').getAttribute('data-share-role')).toBe('viewer');
+    // Tree navigation badge still shows switchable participant grant
+    expect(screen.getByText('tree-select-sub-sub_cov_p').getAttribute('data-share-role')).toBe('participant');
+
+    // Re-clicking the subsession switches via /api/shares/open to the independent sub-session participant grant
+    fireEvent.click(screen.getByText('tree-select-sub-sub_cov_p'));
+    await waitFor(() => expect(window.location.hash).toBe('#/srv-shared/deck_m_brain?shared=share-sub-p'));
+    expect(screen.getByTestId('sub-session-window-sub_cov_p').getAttribute('data-share-role')).toBe('participant');
+    expect(screen.getByTestId('session-pane-deck_m_brain').getAttribute('data-share-role')).toBe('viewer');
+  }, 20_000);
 });

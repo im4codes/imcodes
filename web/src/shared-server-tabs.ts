@@ -30,8 +30,8 @@ export function isActiveRestrictedSharedServer(params: {
   isOwnedServer: boolean;
   activeTarget: ShareTarget | null;
 }): boolean {
-  if (!params.serverId || params.isOwnedServer) return false;
-  return params.activeTarget?.kind !== 'server';
+  if (!params.serverId || params.isOwnedServer || !params.activeTarget) return false;
+  return params.activeTarget.serverId === params.serverId && params.activeTarget.kind !== 'server';
 }
 
 export function filterActiveSharedEntriesForServer(
@@ -550,6 +550,12 @@ export function buildSharedServerSubSessionStates(params: {
   subSessions: readonly SubSession[];
   baseStates: ReadonlyMap<string, SharedStateSummary>;
   activeDispatchIds: ReadonlyMap<string, string>;
+  /**
+   * 'connection' (default): reports the effective role enforced on the currently
+   * active WS connection so open panes stay strictly read-only on downgrade.
+   * 'navigation': reports higher switchable direct grant roles for tree badges.
+   */
+  mode?: 'connection' | 'navigation';
 }): Map<string, SharedStateSummary> {
   const states = new Map<string, SharedStateSummary>(params.baseStates);
   if (!isActiveRestrictedSharedServer({
@@ -579,12 +585,14 @@ export function buildSharedServerSubSessionStates(params: {
 
     if (!grant && !isDirectActiveSub && !isCoveredByActiveScope) continue;
 
-    const activeRole = params.activeCoverageRole ?? grant?.role ?? 'viewer';
+    const activeRole = params.activeCoverageRole ?? 'viewer';
     let effectiveRole: ShareRole;
     if (isDirectActiveSub) {
-      effectiveRole = activeRole;
+      effectiveRole = params.activeCoverageRole ?? grant?.role ?? 'viewer';
     } else if (isCoveredByActiveScope) {
-      effectiveRole = grant && shareRoleRank(grant.role) > shareRoleRank(activeRole)
+      effectiveRole = params.mode === 'navigation'
+        && grant
+        && shareRoleRank(grant.role) > shareRoleRank(activeRole)
         ? grant.role
         : activeRole;
     } else {
