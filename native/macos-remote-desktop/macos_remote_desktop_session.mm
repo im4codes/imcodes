@@ -666,9 +666,7 @@ class MacosRemoteDesktopSession::Impl final
     const bool control =
         authority.mode == common::TransportSessionMode::kControl;
     if (control &&
-        (!RefreshReadinessLocked() || !core_.readiness().ControlReady() ||
-         (dependencies_.transport != nullptr &&
-          !transport_core_.control_ready()))) {
+        (!RefreshReadinessLocked() || !core_.readiness().ControlReady())) {
       return false;
     }
     if (!transport_core_.UpdateMode(authority, now)) {
@@ -676,10 +674,14 @@ class MacosRemoteDesktopSession::Impl final
       return false;
     }
     requested_controllers_ = control ? 1 : 0;
-    if (!core_.SetControlActive(control))
+    const bool activate_control =
+        control && (dependencies_.transport == nullptr ||
+                    transport_core_.control_ready());
+    if (!core_.SetControlActive(activate_control))
       return false;
+    const std::uint32_t active_controllers = activate_control ? 1 : 0;
     if (!dependencies_.adapters.disclosure.Show(viewers_,
-                                                requested_controllers_)) {
+                                                active_controllers)) {
       TerminateLocked(Error(TerminalErrorCode::kDisclosureUnavailable,
                             "disclosure failed to reflect controller state"),
                       MacosSessionEndReason::kDisclosureLost);
@@ -687,7 +689,7 @@ class MacosRemoteDesktopSession::Impl final
     }
     last_transport_time_ = now;
     SyncAudioStateLocked();
-    EmitLocked(control
+    EmitLocked(activate_control
                    ? MacosRemoteDesktopSessionEventType::kControlEnabled
                    : MacosRemoteDesktopSessionEventType::kControlDowngraded);
     return true;
@@ -894,6 +896,9 @@ class MacosRemoteDesktopSession::Impl final
       return false;
     }
     last_transport_time_ = now;
+    if (state == common::PeerConnectionState::kConnected) {
+      return TryPromotePendingControlLocked();
+    }
     return true;
   }
 
@@ -910,11 +915,8 @@ class MacosRemoteDesktopSession::Impl final
     // all open. Promote through the same SessionCore/disclosure path only at
     // that boundary; otherwise the signaling status can claim input before a
     // payload has any authenticated path to the input ledger.
-    if (state == common::DataChannelState::kOpen &&
-        requested_controllers_ > 0 && transport_core_.control_ready() &&
-        core_.state() == SessionState::kViewing &&
-        !SetControlActiveLocked(true, last_transport_time_)) {
-      return false;
+    if (state == common::DataChannelState::kOpen) {
+      return TryPromotePendingControlLocked();
     }
     return true;
   }
@@ -1267,11 +1269,32 @@ class MacosRemoteDesktopSession::Impl final
     return true;
   }
 
+  [[nodiscard]] bool TransportChannelsReadyLocked() const noexcept {
+    return transport_core_.started() && !transport_core_.terminal() &&
+           transport_core_.peer_state() ==
+               common::PeerConnectionState::kConnected &&
+           transport_core_.required_channels_ready();
+  }
+
+  bool TryPromotePendingControlLocked() {
+    if (requested_controllers_ == 0 || !transport_core_.control_ready() ||
+        core_.state() != SessionState::kViewing) {
+      return true;
+    }
+    if (!RefreshReadinessLocked()) {
+      return false;
+    }
+    if (!core_.readiness().ControlReady()) {
+      return SetControlActiveLocked(false, last_transport_time_);
+    }
+    return SetControlActiveLocked(true, last_transport_time_);
+  }
+
   bool SetControlActiveLocked(bool active, common::TransportTime now) {
     if (active && requested_controllers_ == 0)
       return false;
     if (active && dependencies_.transport != nullptr &&
-        !transport_core_.control_ready()) {
+        !TransportChannelsReadyLocked()) {
       return false;
     }
     const common::RouteAuthority* current = transport_core_.authority();

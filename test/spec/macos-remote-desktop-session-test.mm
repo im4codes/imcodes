@@ -1603,6 +1603,258 @@ void TestLoginWindowForbidsAudioWhilePreservingAquaAudioAndVideo() {
   }
 }
 
+void TestApplyModeAuthorityRoundTripsAndPendingChannelPromotion() {
+  // 1. Multi-round Control <-> View <-> Control switching via ApplyModeAuthority.
+  {
+    Fixture fixture;
+    macos::MacosRemoteDesktopStartRequest request = Request(/*controllers=*/1);
+    Require(fixture.session.Start(request), "round-trip fixture must start");
+    ConnectTransport(fixture, request);
+    Require(fixture.session.state() == common::SessionState::kControlling,
+            "initial Control route must become controlling");
+
+    common::RouteAuthority current = *request.route_authority;
+    common::InputSequence input_seq = 1;
+    std::int64_t now_ms = 200;
+
+    for (int round = 0; round < 3; ++round) {
+      const common::TopologyRevision revision = fixture.session.topology()->revision;
+      Require(fixture.session.ApplyKey({{.controller_id = "controller-a",
+                                         .epoch = current.input_epoch,
+                                         .sequence = input_seq++,
+                                         .topology_revision = revision},
+                                        "KeyA",
+                                        true}) == common::InputResult::kApplied,
+              "key down must apply while controlling");
+
+      const int release_before = fixture.input.release_all_count;
+      ++current.input_epoch;
+      current.mode = common::TransportSessionMode::kView;
+      now_ms += 20;
+      Require(fixture.session.ApplyModeAuthority(current, {.unix_ms = now_ms, .monotonic_ms = now_ms}),
+              "Control -> View mode switch must succeed");
+      Require(fixture.session.state() == common::SessionState::kViewing,
+              "Control -> View must transition session to kViewing");
+      Require(fixture.session.transport_diagnostics().mode == common::TransportSessionMode::kView,
+              "Control -> View must update transport diagnostics to kView");
+      Require(fixture.input.release_all_count > release_before && fixture.input.held_keys.empty(),
+              "Control -> View must release held input state");
+      Require(fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 0},
+              "Control -> View must update disclosure controller count to 0");
+      Require(fixture.session.ApplyKey({{.controller_id = "controller-a",
+                                         .epoch = current.input_epoch,
+                                         .sequence = input_seq++,
+                                         .topology_revision = revision},
+                                        "KeyB",
+                                        true}) == common::InputResult::kCapabilityUnavailable,
+              "View mode must reject key injection");
+
+      ++current.input_epoch;
+      current.mode = common::TransportSessionMode::kControl;
+      now_ms += 20;
+      Require(fixture.session.ApplyModeAuthority(current, {.unix_ms = now_ms, .monotonic_ms = now_ms}),
+              "View -> Control mode switch must succeed without protocol_error");
+      Require(fixture.session.state() == common::SessionState::kControlling,
+              "View -> Control must restore kControlling");
+      Require(fixture.session.transport_diagnostics().mode == common::TransportSessionMode::kControl,
+              "View -> Control must update transport diagnostics to kControl");
+      Require(fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 1},
+              "View -> Control must update disclosure controller count to 1");
+    }
+
+    // Invalid epoch regression / skip, expired lease, and mismatched identity must still fail.
+    common::RouteAuthority regressed = current;
+    regressed.mode = common::TransportSessionMode::kView;
+    --regressed.input_epoch;
+    Require(!fixture.session.ApplyModeAuthority(regressed, {.unix_ms = now_ms + 10, .monotonic_ms = now_ms + 10}),
+            "regressed input_epoch must still be rejected");
+
+    common::RouteAuthority skipped = current;
+    skipped.mode = common::TransportSessionMode::kView;
+    skipped.input_epoch += 2;
+    Require(!fixture.session.ApplyModeAuthority(skipped, {.unix_ms = now_ms + 20, .monotonic_ms = now_ms + 20}),
+            "skipped input_epoch must still be rejected");
+
+    common::RouteAuthority wrong_identity = current;
+    wrong_identity.mode = common::TransportSessionMode::kView;
+    ++wrong_identity.input_epoch;
+    wrong_identity.identity.session_id = "other-session";
+    Require(!fixture.session.ApplyModeAuthority(wrong_identity, {.unix_ms = now_ms + 30, .monotonic_ms = now_ms + 30}),
+            "mismatched route identity must still be rejected");
+  }
+
+  // 2. Starting in kView, then promoting to kControl after transport connects.
+  {
+    Fixture fixture;
+    const macos::MacosRemoteDesktopStartRequest view_request = Request(/*controllers=*/0);
+    Require(fixture.session.Start(view_request), "initial View fixture should start");
+    const common::TransportCallbackStamp stamp = StampFor(view_request);
+    Require(fixture.session.OnPeerConnectionState(stamp, common::PeerConnectionState::kConnected,
+                                                  {.unix_ms = 110, .monotonic_ms = 110}),
+            "peer connection should succeed in View");
+    for (const common::DataChannelKind channel :
+         {common::DataChannelKind::kControl, common::DataChannelKind::kKeyboard,
+          common::DataChannelKind::kPointer}) {
+      Require(fixture.session.OnDataChannelState(stamp, channel, common::DataChannelState::kOpen),
+              "channels should open cleanly in View");
+    }
+    Require(fixture.session.state() == common::SessionState::kViewing,
+            "connected transport in View mode must remain kViewing");
+
+    common::RouteAuthority promote = *view_request.route_authority;
+    promote.mode = common::TransportSessionMode::kControl;
+    promote.input_epoch = 1;
+    Require(fixture.session.ApplyModeAuthority(promote, {.unix_ms = 120, .monotonic_ms = 120}),
+            "first promotion from View -> Control must succeed");
+    Require(fixture.session.state() == common::SessionState::kControlling &&
+                fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 1},
+            "promoted session must become controlling with disclosure controller count 1");
+  }
+
+  // 3. ApplyModeAuthority(kControl) before data channels are all open stays in View,
+  //    then promotes automatically when missing channels open.
+  {
+    Fixture fixture;
+    const macos::MacosRemoteDesktopStartRequest view_request = Request(/*controllers=*/0);
+    Require(fixture.session.Start(view_request), "pending-channels fixture should start");
+    const common::TransportCallbackStamp stamp = StampFor(view_request);
+    Require(fixture.session.OnPeerConnectionState(stamp, common::PeerConnectionState::kConnected,
+                                                  {.unix_ms = 110, .monotonic_ms = 110}) &&
+                fixture.session.OnDataChannelState(stamp, common::DataChannelKind::kControl,
+                                                   common::DataChannelState::kOpen),
+            "partial channel setup should succeed");
+
+    common::RouteAuthority promote = *view_request.route_authority;
+    promote.mode = common::TransportSessionMode::kControl;
+    promote.input_epoch = 1;
+    Require(fixture.session.ApplyModeAuthority(promote, {.unix_ms = 120, .monotonic_ms = 120}),
+            "ApplyModeAuthority(kControl) must accept authority before all channels open");
+    Require(fixture.session.state() == common::SessionState::kViewing &&
+                fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 0},
+            "control must remain inactive while keyboard/pointer channels are not open");
+    const common::TopologyRevision revision = fixture.session.topology()->revision;
+    Require(fixture.session.ApplyKey({Stamp(1, revision), "KeyA", true}) ==
+                common::InputResult::kCapabilityUnavailable,
+            "input must be refused until all required channels open");
+
+    Require(fixture.session.OnDataChannelState(stamp, common::DataChannelKind::kKeyboard,
+                                               common::DataChannelState::kOpen) &&
+                fixture.session.state() == common::SessionState::kViewing,
+            "control must still wait until final required channel opens");
+    Require(fixture.session.OnDataChannelState(stamp, common::DataChannelKind::kPointer,
+                                               common::DataChannelState::kOpen) &&
+                fixture.session.state() == common::SessionState::kControlling &&
+                fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 1},
+            "opening final required channel must automatically promote to Control");
+  }
+
+  // 4. Reverse order: all data channels open BEFORE PeerConnection reaches kConnected.
+  {
+    Fixture fixture;
+    const macos::MacosRemoteDesktopStartRequest view_request = Request(/*controllers=*/0);
+    Require(fixture.session.Start(view_request), "peer-last fixture should start");
+    const common::TransportCallbackStamp stamp = StampFor(view_request);
+    for (const common::DataChannelKind channel :
+         {common::DataChannelKind::kControl, common::DataChannelKind::kKeyboard,
+          common::DataChannelKind::kPointer}) {
+      Require(fixture.session.OnDataChannelState(stamp, channel, common::DataChannelState::kOpen),
+              "channels opening before kConnected should succeed");
+    }
+    common::RouteAuthority promote = *view_request.route_authority;
+    promote.mode = common::TransportSessionMode::kControl;
+    promote.input_epoch = 1;
+    Require(fixture.session.ApplyModeAuthority(promote, {.unix_ms = 115, .monotonic_ms = 115}) &&
+                fixture.session.state() == common::SessionState::kViewing &&
+                fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 0},
+            "ApplyModeAuthority(kControl) before kConnected must hold View");
+    Require(fixture.session.OnPeerConnectionState(stamp, common::PeerConnectionState::kConnected,
+                                                  {.unix_ms = 120, .monotonic_ms = 120}) &&
+                fixture.session.state() == common::SessionState::kControlling &&
+                fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 1},
+            "PeerConnection becoming kConnected must promote waiting Control mode");
+  }
+
+  // 5. Missing Accessibility keeps ApplyModeAuthority(kControl) failing closed.
+  {
+    Fixture fixture;
+    const macos::MacosRemoteDesktopStartRequest view_request = Request(/*controllers=*/0);
+    Require(fixture.session.Start(view_request), "missing-accessibility fixture should start");
+    const common::TransportCallbackStamp stamp = StampFor(view_request);
+    Require(fixture.session.OnPeerConnectionState(stamp, common::PeerConnectionState::kConnected,
+                                                  {.unix_ms = 110, .monotonic_ms = 110}),
+            "peer connected");
+    for (const common::DataChannelKind channel :
+         {common::DataChannelKind::kControl, common::DataChannelKind::kKeyboard,
+          common::DataChannelKind::kPointer}) {
+      Require(fixture.session.OnDataChannelState(stamp, channel, common::DataChannelState::kOpen),
+              "channels opened");
+    }
+    fixture.readiness_gate.remove_input = true;
+    common::RouteAuthority promote = *view_request.route_authority;
+    promote.mode = common::TransportSessionMode::kControl;
+    promote.input_epoch = 1;
+    Require(!fixture.session.ApplyModeAuthority(promote, {.unix_ms = 120, .monotonic_ms = 120}) &&
+                fixture.session.state() == common::SessionState::kViewing &&
+                fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 0},
+            "missing Accessibility must keep ApplyModeAuthority(kControl) failing closed");
+  }
+
+  // 6. SetControlActive(false) -> SetControlActive(true) succeeds when transport ready,
+  //    and still refuses when transport channels/peer are not ready.
+  {
+    Fixture fixture;
+    const macos::MacosRemoteDesktopStartRequest request = Request(/*controllers=*/1);
+    Require(fixture.session.Start(request), "SetControlActive toggle fixture should start");
+    Require(!fixture.session.SetControlActive(true, {.unix_ms = 105, .monotonic_ms = 105}) &&
+                fixture.session.state() == common::SessionState::kViewing,
+            "SetControlActive(true) must stay false while transport is not ready");
+    ConnectTransport(fixture, request);
+    Require(fixture.session.state() == common::SessionState::kControlling,
+            "transport connect should allow Control");
+    Require(fixture.session.SetControlActive(false, {.unix_ms = 140, .monotonic_ms = 140}) &&
+                fixture.session.state() == common::SessionState::kViewing &&
+                fixture.session.transport_diagnostics().mode == common::TransportSessionMode::kView,
+            "SetControlActive(false) must downgrade to View");
+    Require(fixture.session.SetControlActive(true, {.unix_ms = 150, .monotonic_ms = 150}) &&
+                fixture.session.state() == common::SessionState::kControlling &&
+                fixture.session.transport_diagnostics().mode == common::TransportSessionMode::kControl &&
+                fixture.disclosure.shows.back() == std::pair<std::uint32_t, std::uint32_t>{2, 1},
+            "SetControlActive(true) must reactivate Control after downgrade when transport is ready");
+
+    // Partial channels (missing pointer open) must refuse SetControlActive(true).
+    Fixture partial;
+    const macos::MacosRemoteDesktopStartRequest partial_req = Request(/*controllers=*/1);
+    Require(partial.session.Start(partial_req), "partial-channel fixture should start");
+    const common::TransportCallbackStamp partial_stamp = StampFor(partial_req);
+    Require(partial.session.OnPeerConnectionState(partial_stamp, common::PeerConnectionState::kConnected,
+                                                  {.unix_ms = 110, .monotonic_ms = 110}) &&
+                partial.session.OnDataChannelState(partial_stamp, common::DataChannelKind::kControl,
+                                                   common::DataChannelState::kOpen) &&
+                partial.session.OnDataChannelState(partial_stamp, common::DataChannelKind::kKeyboard,
+                                                   common::DataChannelState::kOpen) &&
+                partial.session.OnDataChannelState(partial_stamp, common::DataChannelKind::kPointer,
+                                                   common::DataChannelState::kConnecting),
+            "partial open + connecting pointer");
+    Require(!partial.session.SetControlActive(true, {.unix_ms = 120, .monotonic_ms = 120}) &&
+                partial.session.state() == common::SessionState::kViewing,
+            "SetControlActive(true) must refuse while a required channel is not open");
+
+    // Disconnected PeerConnection after SetControlActive(false) must refuse SetControlActive(true).
+    Require(fixture.session.SetControlActive(false, {.unix_ms = 160, .monotonic_ms = 160}),
+            "downgrade before peer disconnect");
+    Require(fixture.session.OnPeerConnectionState(StampFor(request), common::PeerConnectionState::kDisconnected,
+                                                  {.unix_ms = 165, .monotonic_ms = 165}),
+            "peer disconnect callback succeeds cleanly");
+    Require(!fixture.session.SetControlActive(true, {.unix_ms = 170, .monotonic_ms = 170}) &&
+                fixture.session.state() == common::SessionState::kViewing,
+            "SetControlActive(true) must still refuse while peer connection is disconnected");
+    const common::TopologyRevision revision = fixture.session.topology()->revision;
+    Require(fixture.session.ApplyKey({Stamp(1, revision), "KeyA", true}) ==
+                common::InputResult::kCapabilityUnavailable,
+            "input frame must remain rejected while peer connection is disconnected");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1621,5 +1873,6 @@ int main() {
   TestDisplaySwitchAndTopologyChangePreserveAudioIntent();
   TestAudioCompletionOverlapWithRouteDestructionDoesNotDeadlock();
   TestLoginWindowForbidsAudioWhilePreservingAquaAudioAndVideo();
+  TestApplyModeAuthorityRoundTripsAndPendingChannelPromotion();
   return 0;
 }
