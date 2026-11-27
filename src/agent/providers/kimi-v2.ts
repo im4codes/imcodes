@@ -1584,12 +1584,12 @@ export class KimiV2Provider implements TransportProvider {
     }
 
     const msg = cause instanceof Error ? cause.message : 'ACP transport stream closed';
-    for (const sibling of this.sessions.values()) {
-      if (sibling === originState) continue;
-      if (sibling.boundConnectionGeneration !== brokenGeneration) continue;
-      this.rejectPendingApprovals(sibling, new Error(msg));
-      if (sibling.pendingTurn && !sibling.pendingTurn.settled) {
-        this.failTurn(sibling, sibling.pendingTurn, new Error(msg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
+    for (const session of this.sessions.values()) {
+      if (session.boundConnectionGeneration !== brokenGeneration) continue;
+      this.rejectPendingApprovals(session, new Error(msg));
+      if (session === originState) continue;
+      if (session.pendingTurn && !session.pendingTurn.settled) {
+        this.failTurn(session, session.pendingTurn, new Error(msg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true);
       }
     }
 
@@ -1622,6 +1622,7 @@ export class KimiV2Provider implements TransportProvider {
   private failTurn(state: KimiSessionState, turn: PendingTurn, err: Error, code: string, recoverable: boolean): void {
     if (turn.settled) return;
     turn.settled = true;
+    this.rejectPendingApprovals(state, err);
     this.clearTurnTimersAndState(state, turn);
     this.clearActiveTools(state);
     this.clearStatus(state.sessionKey, state);

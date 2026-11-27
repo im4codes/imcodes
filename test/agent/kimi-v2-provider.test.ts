@@ -452,6 +452,14 @@ describe('KimiV2Provider', () => {
       streamRuntime.send('turn on dying stream', 'dead-a');
       await vi.waitFor(() => expect(deadConn.prompt).toHaveBeenCalledTimes(1));
 
+      // Trigger pending approval on origin route so we verify dead stream clears provider_wait on origin too
+      const originApprovalPromise = state.handlers!.requestPermission({
+        sessionId: 'kimi-sess-1',
+        toolCall: { toolCallId: 'tc-dead', title: 'bash', kind: 'execute' },
+        options: [{ optionId: 'approve_once', name: 'Allow', kind: 'allow_once' }],
+      } as never).catch((e: Error) => e);
+      expect(streamProvider.getActiveWorkSnapshot('deck_kimi_v2_dead_stream')?.busyReasons).toContain('provider_wait');
+
       let stopSettled = false;
       const stopWait = streamProvider.cancelAndWait('deck_kimi_v2_dead_stream').then(() => { stopSettled = true; });
       const lateProofFn = vi.fn();
@@ -462,6 +470,11 @@ describe('KimiV2Provider', () => {
       rejectPrompt(new Error('stream pipe closed unexpectedly'));
       await controlledKillStarted;
       await Promise.resolve();
+      expect(await originApprovalPromise).toBeInstanceOf(Error);
+      expect(streamProvider.getActiveWorkSnapshot('deck_kimi_v2_dead_stream')).toMatchObject({
+        activeWorkCount: 0,
+        busyReasons: [],
+      });
       expect(stopSettled).toBe(false);
       expect(lateProofFn).not.toHaveBeenCalled();
 
