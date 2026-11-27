@@ -1,7 +1,9 @@
 import { ProviderStopConfirmation } from '../provider-stop-confirmation.js';
 import { createHash, randomUUID } from 'node:crypto';
-import { createServer } from 'node:net';
+import { mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import type { OpenCodeEvent } from '@opencode/sdk';
 import type {
   ApprovalRequest,
   ProviderCapabilities,
@@ -37,6 +39,7 @@ import {
 import { composeProviderSystemText } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import logger from '../../util/logger.js';
+import { imcodesStatePath } from '../../util/imcodes-state-dir.js';
 import { NativeAgentFenceSlot, OPENCODE_NATIVE_AGENT_TOOLS, fenceOf } from '../native-agent-fence.js';
 import {
   NATIVE_AGENT_ADMISSION_MODES,
@@ -51,7 +54,6 @@ import {
 } from '../../../shared/agent-delegation.js';
 import type { InteractiveQuestionAnswerer } from '../pending-question-registry.js';
 import {
-  normalizeAskQuestionsPayload,
   parseAskQuestionAnswers,
   type AskQuestionItem,
 } from '../../../shared/ask-question-normalize.js';
@@ -69,26 +71,25 @@ import {
 
 const LOOPBACK_HOST = '127.0.0.1';
 const MODEL_CACHE_TTL_MS = 30_000;
+const PLUGIN_WARMUP_MAX_WAIT_MS = 4_000;
+const PLUGIN_WARMUP_POLL_MS = 75;
 // OpenCode loads its models.dev catalog (including each model's `limit.context`)
-// asynchronously after an `opencode serve` process starts. A session created in
-// that window primes the model→context-window map from a catalog that still
-// lacks limits, so usage frames ship without an authoritative window and the UI
-// falls back to a 1M guess. When a live usage frame can't resolve its model's
-// window we force one throttled catalog refetch so the next frame self-heals.
+// asynchronously after an OpenCode host starts. A session created in that window
+// primes the model→context-window map from a catalog that still lacks limits,
+// so usage frames ship without an authoritative window and the UI falls back to
+// a 1M guess. When a live usage frame can't resolve its model's window we force
+// one throttled catalog refetch so the next frame self-heals.
 const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 const PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS = [0, 100, 250, 500, 1_000] as const;
 const MISSING_FINAL_RECOVERY_TIMEOUT_MS = 15_000;
 const MISSING_FINAL_RECOVERY_RECHECK_DELAYS_MS = [250, 1_000] as const;
+const IMCODES_SYSTEM_INSTRUCTION_KEY = 'imcodes-system';
 type PromptAcceptance = 'accepted' | 'absent' | 'unknown';
 const OPENCODE_PERMISSION_EVENT = {
-  LEGACY_UPDATED: 'permission.updated',
   ASKED: 'permission.asked',
   V2_ASKED: 'permission.v2.asked',
-} as const;
-const OPENCODE_PERMISSION_REPLY_MODE = {
-  LEGACY: 'legacy',
-  REQUEST: 'request',
+  LEGACY_UPDATED: 'permission.updated',
 } as const;
 const MISSING_FINAL_RECOVERY_PROMPT = [
   'The previous tool step finished, but you returned no final response.',
@@ -96,38 +97,103 @@ const MISSING_FINAL_RECOVERY_PROMPT = [
   'Do not repeat completed tool calls unless the existing result is insufficient.',
 ].join(' ');
 
-type SdkResult<T> = Promise<{ data: T; response?: { status?: number } }>;
+export interface OpenCodeSessionInfoLike {
+  id: string;
+  title?: string;
+  location?: { directory?: string };
+  time?: { created?: number; updated?: number };
+}
 
-interface OpenCodeClientLike {
+export interface OpenCodeProviderInfoLike {
+  id: string;
+  name?: string;
+  activation?: string;
+}
+
+export interface OpenCodeModelInfoLike {
+  id?: string;
+  modelID: string;
+  providerID: string;
+  name?: string;
+  enabled?: boolean;
+  type?: string;
+  limit?: { context?: number; output?: number };
+  variants?: Array<{ id?: string; name?: string; disabled?: boolean }>;
+  capabilities?: { reasoning?: boolean };
+}
+
+export interface OpenCodeClientLike {
+  sessions: {
+    create(input: {
+      location: { directory: string };
+      title?: string;
+      permissions?: Array<{ action: string; resource: string; effect: 'allow' | 'deny' | 'ask' }>;
+    }): Promise<OpenCodeSessionInfoLike>;
+    get(input: { sessionID: string }): Promise<OpenCodeSessionInfoLike>;
+    prompt(input: Record<string, unknown>): Promise<Record<string, unknown>>;
+  };
   session: {
-    create(options: Record<string, unknown>): SdkResult<Record<string, any>>;
-    get(options: Record<string, unknown>): SdkResult<Record<string, any>>;
-    list(options?: Record<string, unknown>): SdkResult<Array<Record<string, any>>>;
-    message(options: Record<string, unknown>): SdkResult<Record<string, any>>;
-    messages(options: Record<string, unknown>): SdkResult<Array<Record<string, any>>>;
-    prompt(options: Record<string, unknown>): SdkResult<Record<string, any>>;
-    promptAsync(options: Record<string, unknown>): SdkResult<void>;
-    abort(options: Record<string, unknown>): SdkResult<boolean>;
-    summarize?(options: Record<string, unknown>, requestOptions?: Record<string, unknown>): SdkResult<boolean>;
+    list(input?: { directory?: string }): Promise<{ data?: OpenCodeSessionInfoLike[]; cursor?: unknown }>;
+    switchModel(input: {
+      sessionID: string;
+      model: { providerID: string; id: string; variant?: string };
+    }): Promise<void>;
+    compact(input: { sessionID: string }): Promise<Record<string, unknown>>;
+    interrupt(input: { sessionID: string }): Promise<{ interrupted?: boolean } | void>;
+    message: {
+      get(input: { sessionID: string; messageID: string }): Promise<Record<string, unknown>>;
+    };
+    form?: {
+      reply(input: {
+        sessionID: string;
+        formID: string;
+        answer: Record<string, string | number | boolean | string[]>;
+      }): Promise<void>;
+      cancel(input: { sessionID: string; formID: string }): Promise<void>;
+    };
+  };
+  message: {
+    list(input: {
+      sessionID: string;
+      limit?: number;
+      order?: 'asc' | 'desc';
+    }): Promise<{ data?: Array<Record<string, unknown>>; cursor?: unknown }>;
+  };
+  model: {
+    list(input?: { location?: { directory?: string } }): Promise<{ data?: OpenCodeModelInfoLike[] }>;
+    default(input?: { location?: { directory?: string } }): Promise<{ data?: OpenCodeModelInfoLike | null }>;
   };
   provider: {
-    list(options?: Record<string, unknown>): SdkResult<Record<string, any>>;
+    list(input?: { location?: { directory?: string } }): Promise<{ data?: OpenCodeProviderInfoLike[] }>;
   };
-  event: {
-    subscribe(options?: Record<string, unknown>): Promise<{ stream: AsyncIterable<Record<string, any>> }>;
+  permission: {
+    reply(input: {
+      sessionID: string;
+      requestID: string;
+      decision: 'once' | 'always' | 'reject';
+    }): Promise<void>;
   };
-  permission?: {
-    reply(options: Record<string, unknown>): SdkResult<boolean>;
+  events: {
+    subscribe(
+      options?: Record<string, unknown>,
+      requestOptions?: { signal?: AbortSignal },
+    ): AsyncIterable<OpenCodeEvent | Record<string, unknown>> | Promise<AsyncIterable<OpenCodeEvent | Record<string, unknown>> | { stream: AsyncIterable<OpenCodeEvent | Record<string, unknown>> }>;
   };
-  question?: {
-    reply(options: Record<string, unknown>, requestOptions?: Record<string, unknown>): SdkResult<boolean>;
-    reject?(options: Record<string, unknown>, requestOptions?: Record<string, unknown>): SdkResult<boolean>;
+  experimental?: {
+    session?: {
+      instructions?: {
+        entry?: {
+          put(input: { sessionID: string; key: string; value: string }): Promise<void>;
+          remove(input: { sessionID: string; key: string }): Promise<void>;
+        };
+      };
+      wait?(input: { sessionID: string }): Promise<void>;
+    };
   };
-  postSessionIdPermissionsPermissionId(options: Record<string, unknown>): SdkResult<boolean>;
-  notificationSession?: {
-    prompt(options: Record<string, unknown>, requestOptions?: Record<string, unknown>): SdkResult<Record<string, any>>;
-    summarize?(options: Record<string, unknown>, requestOptions?: Record<string, unknown>): SdkResult<boolean>;
+  plugin?: {
+    list(input?: { location?: { directory?: string } }): Promise<{ data?: Array<Record<string, unknown>> }>;
   };
+  close?: () => Promise<void> | void;
 }
 
 interface OpenCodeServerLike {
@@ -135,8 +201,19 @@ interface OpenCodeServerLike {
   close(): void;
 }
 
+export interface OpenCodeSdkStartOptions {
+  hostname: string;
+  port: number;
+  timeout: number;
+  signal: AbortSignal;
+  config?: Record<string, unknown>;
+  databasePath?: string;
+  directory?: string;
+  warmupCatalog?: boolean;
+}
+
 export interface OpenCodeSdkRuntimeHooks {
-  start(options: { hostname: string; port: number; timeout: number; signal: AbortSignal; config?: Record<string, unknown> }): Promise<{
+  start(options: OpenCodeSdkStartOptions): Promise<{
     client: OpenCodeClientLike;
     server: OpenCodeServerLike;
   }>;
@@ -144,35 +221,72 @@ export interface OpenCodeSdkRuntimeHooks {
 
 export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
   async start(options) {
-    const [sdk, v2Sdk] = await Promise.all([
-      import('@opencode-ai/sdk'),
-      import('@opencode-ai/sdk/v2/client'),
-    ]);
-    const started = await sdk.createOpencode(options);
-    const v2Client = v2Sdk.createOpencodeClient({ baseUrl: started.server.url });
-    const v2Summarize = typeof v2Client.session?.summarize === 'function'
-      ? v2Client.session.summarize.bind(v2Client.session)
-      : undefined;
-    if (v2Summarize) {
-      started.client.session = Object.assign(
-        Object.create(Object.getPrototypeOf(started.client.session)),
-        started.client.session,
-        { summarize: v2Summarize },
-      );
+    // Dynamic import keeps the controlled-node thin bundle free of `@opencode/sdk` native addons.
+    const { OpenCode } = await import('@opencode/sdk');
+    if (options.signal.aborted) {
+      const abortErr = new Error('OpenCode startup aborted');
+      abortErr.name = 'AbortError';
+      throw abortErr;
     }
-    Object.assign(started.client, {
-      permission: v2Client.permission,
-      question: v2Client.question,
-      notificationSession: v2Client.session,
+
+    const dbPath = options.databasePath?.trim()
+      || process.env.IMCODES_OPENCODE_DB_PATH?.trim()
+      || imcodesStatePath('opencode-sdk.db');
+    if (dbPath !== ':memory:') {
+      await mkdir(dirname(dbPath), { recursive: true });
+    }
+
+    const content = options.config
+      ? JSON.stringify({ $schema: 'https://opencode.ai/config.json', ...options.config })
+      : undefined;
+
+    const opencode = await OpenCode.create({
+      database: { path: dbPath },
+      fs: { filewatcher: false },
+      ...(content ? { config: { content } } : {}),
     });
-    return started as unknown as {
-      client: OpenCodeClientLike;
-      server: OpenCodeServerLike;
+
+    let closed = false;
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      void opencode.close().catch(() => {});
+    };
+    if (options.signal.aborted) {
+      close();
+      const abortErr = new Error('OpenCode startup aborted');
+      abortErr.name = 'AbortError';
+      throw abortErr;
+    }
+    options.signal.addEventListener('abort', close, { once: true });
+
+    if (options.warmupCatalog) {
+      // `PluginSupervisor` registers internal provider/model plugins asynchronously
+      // after `OpenCode.create()` returns; poll the target location so initial `listModels()`
+      // sees the populated catalog immediately after `connect()`.
+      const warmupLocation = { directory: safeString(options.directory) ?? process.cwd() };
+      const warmupMs = Math.min(options.timeout || 10_000, PLUGIN_WARMUP_MAX_WAIT_MS);
+      const deadline = Date.now() + warmupMs;
+      while (Date.now() < deadline && !options.signal.aborted) {
+        try {
+          const [providersRes, modelsRes] = await Promise.all([
+            opencode.provider.list({ location: warmupLocation }),
+            opencode.model.list({ location: warmupLocation }),
+          ]);
+          if ((providersRes?.data?.length ?? 0) > 0 && (modelsRes?.data?.length ?? 0) > 0) break;
+        } catch {
+          break;
+        }
+        await sleep(PLUGIN_WARMUP_POLL_MS);
+      }
+    }
+
+    return {
+      client: opencode as unknown as OpenCodeClientLike,
+      server: { url: `http://${LOOPBACK_HOST}:${options.port}`, close },
     };
   },
 };
-
-type OpenCodePermissionReplyMode = typeof OPENCODE_PERMISSION_REPLY_MODE[keyof typeof OPENCODE_PERMISSION_REPLY_MODE];
 
 interface NormalizedOpenCodePermission {
   id: string;
@@ -180,17 +294,12 @@ interface NormalizedOpenCodePermission {
   title?: string;
   pattern?: string;
   callId?: string;
-  replyMode: OpenCodePermissionReplyMode;
 }
 
-interface PendingOpenCodePermission {
-  timer: ReturnType<typeof setTimeout>;
-  replyMode: OpenCodePermissionReplyMode;
-}
-
-interface PendingOpenCodeQuestion {
+interface PendingOpenCodeForm {
   requestId: string;
   questions: AskQuestionItem[];
+  fields: Array<{ key: string; type: string }>;
   callId?: string;
 }
 
@@ -206,6 +315,8 @@ interface OpenCodeSessionState {
   cwd: string;
   model?: string;
   effort?: TransportEffortLevel;
+  appliedModelSignature: string | null;
+  systemInstructionSet: boolean;
   busy: boolean;
   compacting: boolean;
   compactCompletionEmitted: boolean;
@@ -219,9 +330,9 @@ interface OpenCodeSessionState {
   silentToolResult: string | null;
   deliveryMessageId: string | null;
   currentMessageId: string | null;
-  messageRoles: Map<string, 'user' | 'assistant'>;
-  pendingParts: Map<string, Array<{ part: Record<string, any>; delta?: string }>>;
   textParts: Map<string, string>;
+  toolNames: Map<string, string>;
+  toolInputs: Map<string, unknown>;
   toolSignatures: Map<string, string>;
   surfacedQuestionCallIds: Set<string>;
   lastUsageSignature: string | null;
@@ -231,9 +342,9 @@ interface OpenCodeSessionState {
   server: OpenCodeServerLike;
   abort: AbortController;
   eventLoop: Promise<void>;
-  pendingPermissions: Map<string, PendingOpenCodePermission>;
+  pendingPermissions: Map<string, ReturnType<typeof setTimeout>>;
   runtimeConfig: SessionConfig;
-  /** The native-agent fence this session's own OpenCode server was started with. */
+  /** The native-agent fence this session's own OpenCode runtime was started with. */
   nativeAgentFence: NativeAgentFence;
 }
 
@@ -267,6 +378,9 @@ function withOpenCodeRequestTimeout<T>(promise: Promise<T>, operation: string): 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === 'string') return error;
+  if (error && typeof error === 'object' && typeof (error as Record<string, unknown>).message === 'string') {
+    return (error as Record<string, unknown>).message as string;
+  }
   try { return JSON.stringify(error); } catch { return String(error); }
 }
 
@@ -294,7 +408,12 @@ function errorHttpStatus(error: unknown): number | undefined {
 
 function isNotFoundError(error: unknown): boolean {
   if (errorHttpStatus(error) === 404) return true;
-  return /\b404\b/.test(errorMessage(error));
+  if (error && typeof error === 'object') {
+    const name = (error as { name?: unknown }).name;
+    if (typeof name === 'string' && name.includes('NotFound')) return true;
+  }
+  const msg = errorMessage(error);
+  return /\b404\b/.test(msg) || /\bnot found\b/i.test(msg);
 }
 
 function openCodePromptMessageId(providerSessionId: string, deliveryId: string | undefined): string {
@@ -320,23 +439,26 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-function isTerminalAssistantMessage(info: Record<string, any> | undefined): boolean {
-  if (!info || info.role !== 'assistant') return false;
-  if (info.error) return true;
-  const finish = safeString(info.finish)?.toLowerCase();
-  // OpenCode completes a separate assistant message for every model/tool step.
-  // Those intermediate messages carry both time.completed and finish=tool-calls
-  // (or finish=unknown), while the same user turn continues with another
-  // assistant message. Only an explicit final finish ends the IM.codes turn;
-  // session.idle remains the fallback for providers that omit a final reason.
-  return finish !== undefined && finish !== 'tool-calls' && finish !== 'unknown';
+function isTerminalFinish(finish: unknown): boolean {
+  const normalized = safeString(finish)?.toLowerCase();
+  // OpenCode finishes each intermediate tool-call step with `tool-calls` (or `unknown`).
+  // Only an explicit terminal finish ends the turn; `session.execution.succeeded` and
+  // `session.idle` remain the fallback for steps omitting a terminal finish.
+  return normalized !== undefined && normalized !== 'tool-calls' && normalized !== 'unknown';
+}
+
+function isTerminalAssistantMessage(msg: Record<string, any> | undefined): boolean {
+  if (!msg || msg.type !== 'assistant') return false;
+  if (msg.error) return true;
+  return isTerminalFinish(msg.finish);
 }
 
 function sessionIdFromEvent(event: Record<string, any>): string | undefined {
-  const properties = event.properties;
-  return safeString(properties?.sessionID)
-    ?? safeString(properties?.part?.sessionID)
-    ?? safeString(properties?.info?.sessionID);
+  const data = event.data ?? event.properties;
+  return safeString(data?.sessionID)
+    ?? safeString(data?.form?.sessionID)
+    ?? safeString(data?.part?.sessionID)
+    ?? safeString(data?.info?.sessionID);
 }
 
 function permissionPattern(value: unknown): string | undefined {
@@ -347,39 +469,101 @@ function permissionPattern(value: unknown): string | undefined {
 
 function normalizePermissionEvent(
   eventType: unknown,
-  properties: Record<string, any> | undefined,
+  payload: Record<string, any> | undefined,
 ): NormalizedOpenCodePermission | undefined {
-  const id = safeString(properties?.id);
+  const id = safeString(payload?.id);
   if (!id) return undefined;
-  if (eventType === OPENCODE_PERMISSION_EVENT.LEGACY_UPDATED) {
-    return {
-      id,
-      operation: safeString(properties?.type),
-      title: safeString(properties?.title),
-      pattern: permissionPattern(properties?.pattern),
-      callId: safeString(properties?.callID),
-      replyMode: OPENCODE_PERMISSION_REPLY_MODE.LEGACY,
-    };
-  }
   if (eventType === OPENCODE_PERMISSION_EVENT.ASKED) {
     return {
       id,
-      operation: safeString(properties?.permission),
-      pattern: permissionPattern(properties?.patterns),
-      callId: safeString(properties?.tool?.callID),
-      replyMode: OPENCODE_PERMISSION_REPLY_MODE.REQUEST,
+      operation: safeString(payload?.action) ?? safeString(payload?.permission),
+      title: safeString(payload?.message),
+      pattern: permissionPattern(payload?.resources ?? payload?.patterns),
+      callId: safeString(payload?.source?.callID ?? payload?.tool?.callID),
     };
   }
   if (eventType === OPENCODE_PERMISSION_EVENT.V2_ASKED) {
     return {
       id,
-      operation: safeString(properties?.action),
-      pattern: permissionPattern(properties?.resources),
-      callId: safeString(properties?.source?.callID),
-      replyMode: OPENCODE_PERMISSION_REPLY_MODE.REQUEST,
+      operation: safeString(payload?.action),
+      title: safeString(payload?.message),
+      pattern: permissionPattern(payload?.resources),
+      callId: safeString(payload?.source?.callID),
+    };
+  }
+  if (eventType === OPENCODE_PERMISSION_EVENT.LEGACY_UPDATED) {
+    return {
+      id,
+      operation: safeString(payload?.type),
+      title: safeString(payload?.title),
+      pattern: permissionPattern(payload?.pattern),
+      callId: safeString(payload?.callID),
     };
   }
   return undefined;
+}
+
+function normalizeFormToQuestions(form: Record<string, any> | undefined): {
+  requestId: string;
+  questions: AskQuestionItem[];
+  fields: Array<{ key: string; type: string }>;
+} | undefined {
+  const requestId = safeString(form?.id);
+  if (!requestId || !Array.isArray(form?.fields) || form.fields.length === 0) return undefined;
+  const header = safeString(form.title) ?? 'Question';
+  const questions: AskQuestionItem[] = [];
+  const fields: Array<{ key: string; type: string }> = [];
+  for (const field of form.fields) {
+    if (!field || typeof field !== 'object') continue;
+    const key = safeString(field.key);
+    const type = safeString(field.type) ?? 'string';
+    if (!key) continue;
+    const questionText = safeString(field.title) ?? safeString(field.description) ?? key;
+    const rawOptions: unknown[] | undefined = Array.isArray(field.options) ? field.options : undefined;
+    const mappedOptions = rawOptions
+      ?.map((opt: any): { label: string; description?: string } | undefined => {
+        const label = safeString(opt?.label ?? opt?.value ?? opt);
+        if (!label) return undefined;
+        const description = safeString(opt?.description);
+        return description ? { label, description } : { label };
+      })
+      .filter((item): item is { label: string; description?: string } => item !== undefined);
+    const options = mappedOptions && mappedOptions.length > 0 ? mappedOptions : undefined;
+    questions.push({
+      header,
+      question: questionText,
+      ...(options ? { options } : {}),
+      ...(type === 'multiselect' ? { multiSelect: true } : {}),
+    });
+    fields.push({ key, type });
+  }
+  if (questions.length === 0) return undefined;
+  return { requestId, questions, fields };
+}
+
+function formatFormAnswerRecord(
+  fields: Array<{ key: string; type: string }>,
+  parsedAnswers: string[][],
+  rawFallback: string,
+): Record<string, string | number | boolean | string[]> {
+  const record: Record<string, string | number | boolean | string[]> = {};
+  for (let i = 0; i < fields.length; i++) {
+    const field = fields[i]!;
+    const selected = parsedAnswers[i] ?? [];
+    if (field.type === 'multiselect') {
+      record[field.key] = selected;
+    } else if (field.type === 'boolean') {
+      const token = (selected[0] ?? rawFallback).trim().toLowerCase();
+      record[field.key] = token === 'true' || token === 'yes' || token === '1' || token === 'y';
+    } else if (field.type === 'number' || field.type === 'integer') {
+      const raw = selected[0] ?? rawFallback;
+      const num = Number(raw);
+      record[field.key] = Number.isFinite(num) ? num : raw;
+    } else {
+      record[field.key] = selected[0] ?? rawFallback;
+    }
+  }
+  return record;
 }
 
 function parseModelIdentity(value: string | undefined): { providerID: string; modelID: string } | undefined {
@@ -393,7 +577,17 @@ function parseModelIdentity(value: string | undefined): { providerID: string; mo
 function extractModelReasoningMeta(model: Record<string, any> | undefined): OpenCodeModelReasoningMeta {
   const disabledVariants = new Set<string>();
   const variantKeys: string[] = [];
-  if (model?.variants && typeof model.variants === 'object' && !Array.isArray(model.variants)) {
+  if (Array.isArray(model?.variants)) {
+    for (const variant of model.variants) {
+      const id = safeString(typeof variant === 'string' ? variant : variant?.id);
+      if (!id) continue;
+      if (variant && typeof variant === 'object' && variant.disabled === true) {
+        disabledVariants.add(id);
+        continue;
+      }
+      variantKeys.push(id);
+    }
+  } else if (model?.variants && typeof model.variants === 'object') {
     for (const [key, value] of Object.entries(model.variants as Record<string, any>)) {
       const normalizedKey = safeString(key);
       if (!normalizedKey) continue;
@@ -420,7 +614,8 @@ function extractModelReasoningMeta(model: Record<string, any> | undefined): Open
   const combinedKeys = [...new Set([...effortValues, ...variantKeys])];
   const supportedEffortLevels = normalizeSupportedEffortLevels(combinedKeys);
   const supportsReasoning = Boolean(
-    model?.reasoning
+    model?.capabilities?.reasoning
+    || model?.reasoning
     || combinedKeys.length > 0
     || (supportedEffortLevels && supportedEffortLevels.length > 0),
   );
@@ -432,30 +627,47 @@ function extractModelReasoningMeta(model: Record<string, any> | undefined): Open
   };
 }
 
+function extractToolContentText(content: unknown): string | undefined {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return undefined;
+  const parts: string[] = [];
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue;
+    const record = item as Record<string, unknown>;
+    if (record.type === 'text' && typeof record.text === 'string') {
+      parts.push(record.text);
+    } else if (typeof record.text === 'string') {
+      parts.push(record.text);
+    } else {
+      try { parts.push(JSON.stringify(record)); } catch { /* ignore */ }
+    }
+  }
+  return parts.length > 0 ? parts.join('\n') : undefined;
+}
+
 function providerError(code: string, message: string, recoverable: boolean, details?: unknown): ProviderError {
   return { code, message, recoverable, ...(details === undefined ? {} : { details }) };
 }
 
-async function reserveLoopbackPort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.unref();
-    server.once('error', reject);
-    server.listen(0, LOOPBACK_HOST, () => {
-      const address = server.address();
-      const port = typeof address === 'object' && address ? address.port : 0;
-      server.close((error) => error ? reject(error) : resolve(port));
-    });
+function promptFiles(attachments: TransportAttachment[] | undefined): Array<{
+  uri: string;
+  source: { type: 'uri'; uri: string };
+  name?: string;
+}> {
+  return (attachments ?? []).map((attachment) => {
+    const uri = pathToFileURL(attachment.daemonPath).href;
+    return {
+      uri,
+      source: { type: 'uri' as const, uri },
+      ...(attachment.originalName ? { name: attachment.originalName } : {}),
+    };
   });
 }
 
-function attachmentParts(attachments: TransportAttachment[] | undefined): Array<Record<string, unknown>> {
-  return (attachments ?? []).map((attachment) => ({
-    type: 'file',
-    mime: attachment.mime || (attachment.type === 'image' ? 'image/*' : 'application/octet-stream'),
-    ...(attachment.originalName ? { filename: attachment.originalName } : {}),
-    url: pathToFileURL(attachment.daemonPath).href,
-  }));
+function textPartKey(messageId: unknown, ordinal: unknown): string {
+  const msg = safeString(messageId) ?? 'assistant';
+  const ord = typeof ordinal === 'number' && Number.isFinite(ordinal) ? ordinal : 0;
+  return `${msg}:${ord}`;
 }
 
 export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuestionAnswerer {
@@ -484,16 +696,16 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       restartDurable: true,
       replayAfterAcceptance: 'deduplicated',
     },
-    // Every session runs its own OpenCode server; a managed session's server
-    // starts with `tools.task=false`.
     nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
   };
 
   private client: OpenCodeClientLike | null = null;
   private server: OpenCodeServerLike | null = null;
   private lifecycleAbort: AbortController | null = null;
+  private databasePath: string | undefined;
+  private catalogDirectory = process.cwd();
   private sessions = new Map<string, OpenCodeSessionState>();
-  private readonly pendingQuestions = new Map<string, PendingOpenCodeQuestion>();
+  private readonly pendingQuestions = new Map<string, PendingOpenCodeForm>();
   private readonly nativeAgentFence = new NativeAgentFenceSlot('opencode-sdk');
   private providerToRoute = new Map<string, string>();
   private providerRouteOrder = new Map<string, string[]>();
@@ -515,14 +727,21 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   async connect(config: ProviderConfig): Promise<void> {
     if (this.client && this.server) return;
     const abort = new AbortController();
-    const port = positiveNumber(config.port) || await reserveLoopbackPort();
+    const port = positiveNumber(config.port) || 0;
     const timeout = positiveNumber(config.startupTimeoutMs) || 10_000;
+    const databasePath = safeString(config.databasePath);
+    const catalogDirectory = safeString(config.cwd) ?? process.cwd();
+    this.databasePath = databasePath;
+    this.catalogDirectory = catalogDirectory;
     try {
       const started = await openCodeSdkRuntimeHooks.start({
         hostname: LOOPBACK_HOST,
         port,
         timeout,
         signal: abort.signal,
+        directory: catalogDirectory,
+        warmupCatalog: true,
+        ...(databasePath ? { databasePath } : {}),
       });
       const url = new URL(started.server.url);
       if (url.hostname !== LOOPBACK_HOST && url.hostname !== 'localhost' && url.hostname !== '::1') {
@@ -574,46 +793,44 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
   async createSession(config: SessionConfig): Promise<string> {
     this.assertConnected();
-    // Usage events contain token counts but not the model limit. Prime the
-    // provider catalog before the session starts so the first usage frame can
-    // carry OpenCode's authoritative context window instead of a guessed UI
-    // fallback. listModels() is locally cached and fails closed to an empty
-    // catalog without preventing session creation.
     if (!this.modelCache) await this.listModels(false);
     const routeId = config.bindExistingKey ?? config.sessionKey;
     const existing = this.sessions.get(routeId);
     if (existing && !config.fresh) {
       if (safeString(config.agentId)) existing.model = config.agentId!.trim();
       if (config.effort) existing.effort = config.effort;
+      existing.appliedModelSignature = null;
       this.emitSessionInfo(existing);
       return routeId;
     }
     if (existing) await this.endSession(routeId);
 
     const cwd = safeString(config.cwd) ?? process.cwd();
-    // Decided on the launch path, before the server exists: the route is not
-    // registered with the daemon yet, so the IM.codes session name is passed.
     const nativeAgentsFenced = this.nativeAgentFence.required(routeId, config.sessionName);
     const sessionRuntime = await this.startSessionRuntime(config, cwd, nativeAgentsFenced);
     let info: Record<string, any>;
     if (config.skipCreate && safeString(config.resumeId)) {
       try {
-        info = (await sessionRuntime.client.session.get({
-          path: { id: config.resumeId },
-          query: { directory: cwd },
-          throwOnError: true,
-        })).data;
+        info = await sessionRuntime.client.sessions.get({ sessionID: config.resumeId! });
       } catch (error) {
         await this.closeStartedRuntime(sessionRuntime);
         throw this.normalizeError(error, 'restore');
       }
     } else {
       try {
-        info = (await sessionRuntime.client.session.create({
-          query: { directory: cwd },
-          body: { title: safeString(config.label) ?? config.sessionName ?? config.sessionKey },
-          throwOnError: true,
-        })).data;
+        info = await sessionRuntime.client.sessions.create({
+          location: { directory: cwd },
+          title: safeString(config.label) ?? config.sessionName ?? config.sessionKey,
+          ...(nativeAgentsFenced
+            ? {
+              permissions: OPENCODE_NATIVE_AGENT_TOOLS.map((action) => ({
+                action,
+                resource: '*',
+                effect: 'deny' as const,
+              })),
+            }
+            : {}),
+        });
       } catch (error) {
         await this.closeStartedRuntime(sessionRuntime);
         throw this.normalizeError(error, 'create');
@@ -630,6 +847,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       cwd,
       model: safeString(config.agentId),
       effort: config.effort,
+      appliedModelSignature: null,
+      systemInstructionSet: false,
       busy: false,
       compacting: false,
       compactCompletionEmitted: false,
@@ -643,9 +862,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       silentToolResult: null,
       deliveryMessageId: null,
       currentMessageId: null,
-      messageRoles: new Map(),
-      pendingParts: new Map(),
       textParts: new Map(),
+      toolNames: new Map(),
+      toolInputs: new Map(),
       toolSignatures: new Map(),
       surfacedQuestionCallIds: new Set(),
       lastUsageSignature: null,
@@ -662,6 +881,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     this.sessions.set(routeId, state);
     this.registerProviderRoute(providerSessionId, routeId);
     state.eventLoop = this.consumeEvents(sessionRuntime.stream, sessionRuntime.abort.signal);
+    if (state.model || state.effort) {
+      await this.syncSessionModelAndEffort(state).catch(() => {});
+    }
     this.emitSessionInfo(state);
     return routeId;
   }
@@ -672,11 +894,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     this.sessions.delete(state.routeId);
     const removedSoleProviderRoute = this.releaseProviderRoute(state);
     if (state.busy && removedSoleProviderRoute) {
-      await state.client.session.abort({
-        path: { id: state.providerSessionId },
-        query: { directory: state.cwd },
-        throwOnError: true,
-      }).catch(() => {});
+      await state.client.session.interrupt({ sessionID: state.providerSessionId }).catch(() => {});
     }
     await this.closeSessionState(state);
   }
@@ -692,8 +910,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   async restoreSession(sessionId: string): Promise<boolean> {
     const client = this.assertConnected();
     try {
-      const response = await client.session.get({ path: { id: sessionId }, throwOnError: true });
-      return safeString(response.data?.id) === sessionId;
+      const session = await client.sessions.get({ sessionID: sessionId });
+      return safeString(session?.id) === sessionId;
     } catch {
       return false;
     }
@@ -702,16 +920,19 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
     const client = this.assertConnected();
     const directory = safeString(options.directory);
-    const result = await client.session.list({
-      ...(directory ? { query: { directory } } : {}),
-      throwOnError: true,
+    const result = await client.session.list(directory ? { directory } : undefined);
+    const rows = Array.isArray(result?.data) ? result.data : [];
+    return rows.map((session) => {
+      const displayName = safeString(session.title);
+      const dir = safeString(session.location?.directory);
+      const updatedAt = positiveNumber(session.time?.updated);
+      return {
+        key: String(session.id),
+        ...(displayName ? { displayName } : {}),
+        ...(dir ? { directory: dir } : {}),
+        ...(updatedAt !== undefined ? { updatedAt } : {}),
+      };
     });
-    return result.data.map((session) => ({
-      key: String(session.id),
-      ...(safeString(session.title) ? { displayName: session.title.trim() } : {}),
-      ...(safeString(session.directory) ? { directory: session.directory.trim() } : {}),
-      ...(positiveNumber(session.time?.updated) !== undefined ? { updatedAt: session.time.updated } : {}),
-    }));
   }
 
   async listModels(force = false): Promise<ProviderModelList> {
@@ -720,42 +941,55 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     }
     try {
       const client = this.assertConnected();
-      const result = await client.provider.list({ throwOnError: true });
-      const connected = new Set(Array.isArray(result.data?.connected) ? result.data.connected : []);
-      const providers = Array.isArray(result.data?.all) ? result.data.all : [];
+      const location = { directory: this.catalogDirectory };
+      const [providersRes, modelsRes, defaultRes] = await Promise.all([
+        client.provider.list({ location }),
+        client.model.list({ location }),
+        client.model.default({ location }).catch(() => ({ location, data: null })),
+      ]);
+      const activeProviders = (Array.isArray(providersRes?.data) ? providersRes.data : [])
+        .filter((provider) => provider.activation !== 'disabled');
+      const providerNames = new Map(activeProviders.map((provider) => [provider.id, provider.name || provider.id]));
+      const rawModels = Array.isArray(modelsRes?.data) ? modelsRes.data : [];
       const nextContextWindows = new Map<string, number>();
       const nextReasoningMeta = new Map<string, OpenCodeModelReasoningMeta>();
-      const models = providers
-        .filter((provider) => connected.has(provider.id))
-        .flatMap((provider) => Object.values(provider.models ?? {}).map((model: any) => {
-          const id = `${provider.id}/${model.id}`;
+      const models = rawModels
+        .filter((model) => model && model.enabled !== false && (!model.type || model.type === 'chat'))
+        .map((model) => {
+          const id = `${model.providerID}/${model.modelID}`;
+          const providerName = providerNames.get(model.providerID) ?? model.providerID;
           const contextWindow = positiveNumber(model.limit?.context);
           if (contextWindow !== undefined && contextWindow > 0) nextContextWindows.set(id, contextWindow);
-          const reasoningMeta = extractModelReasoningMeta(model);
+          const reasoningMeta = extractModelReasoningMeta(model as unknown as Record<string, any>);
           nextReasoningMeta.set(id, reasoningMeta);
           return {
             id,
-            name: `${provider.name} · ${model.name ?? model.id}`,
+            name: `${providerName} · ${model.name ?? model.modelID}`,
             ...(reasoningMeta.supportsReasoning ? { supportsReasoningEffort: true } : {}),
             ...(reasoningMeta.supportedEffortLevels ? { supportedEffortLevels: reasoningMeta.supportedEffortLevels } : {}),
           };
-        }))
+        })
         .sort((a, b) => a.name.localeCompare(b.name));
-      const firstProvider = providers.find((provider) => connected.has(provider.id));
-      const defaultModelId = firstProvider ? result.data?.default?.[firstProvider.id] : undefined;
+
+      const defaultModelData = defaultRes?.data;
+      const defaultModel = defaultModelData?.providerID && defaultModelData?.modelID
+        ? `${defaultModelData.providerID}/${defaultModelData.modelID}`
+        : models[0]?.id;
+      const isAuthenticated = activeProviders.length > 0 || models.length > 0;
       const value: ProviderModelList = {
         models,
-        isAuthenticated: connected.size > 0,
-        ...(firstProvider && defaultModelId ? { defaultModel: `${firstProvider.id}/${defaultModelId}` } : {}),
-        ...(connected.size === 0 ? { error: 'OpenCode has no connected model provider' } : {}),
+        isAuthenticated,
+        ...(defaultModel ? { defaultModel } : {}),
+        ...(!isAuthenticated ? { error: 'OpenCode has no connected model provider' } : {}),
       };
       // Merge rather than replace so an authoritative window, once learned,
       // survives a later cold/partial/failed refresh or a transient provider
-      // disconnect that drops the model from `connected`. reset() clears the
-      // map when the provider fully disconnects.
+      // disconnect. disconnect() clears the map when the provider closes.
       for (const [id, windowTokens] of nextContextWindows) this.modelContextWindows.set(id, windowTokens);
       for (const [id, meta] of nextReasoningMeta) this.modelReasoningMeta.set(id, meta);
-      this.modelCache = { at: Date.now(), value };
+      if (isAuthenticated) {
+        this.modelCache = { at: Date.now(), value };
+      }
       return value;
     } catch (error) {
       return { models: [], isAuthenticated: false, error: errorMessage(error) };
@@ -763,11 +997,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   /**
-   * OpenCode's per-model `limit.context` can be absent from the first catalog
-   * snapshot after a server starts (models.dev loads asynchronously). When a
-   * live usage frame cannot resolve its model's window, force one throttled
-   * catalog refetch so the next frame carries the authoritative limit instead
-   * of the UI's 1M fallback. No-op once the window is known.
+   * When a live usage frame cannot resolve its model's window, force one
+   * throttled catalog refetch so the next frame carries the authoritative
+   * limit instead of the UI's 1M fallback. No-op once the window is known.
    */
   private scheduleContextWindowRefresh(model: string): void {
     if (this.modelContextWindows.has(model)) return;
@@ -785,6 +1017,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const state = this.sessions.get(sessionId);
     if (!state || !agentId.trim()) return;
     state.model = agentId.trim();
+    state.appliedModelSignature = null;
     this.emitSessionInfo(state);
   }
 
@@ -792,6 +1025,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const state = this.sessions.get(sessionId);
     if (!state) return;
     state.effort = effort;
+    state.appliedModelSignature = null;
     this.emitSessionInfo(state);
   }
 
@@ -812,6 +1046,43 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     return clampTransportEffort(effort, OPENCODE_SDK_EFFORT_LEVELS);
   }
 
+  private async syncSessionModelAndEffort(state: OpenCodeSessionState): Promise<void> {
+    const targetModelId = state.model ?? (state.effort ? this.modelCache?.value.defaultModel : undefined);
+    const parsed = parseModelIdentity(targetModelId);
+    if (!parsed) return;
+    const variant = this.resolvePromptVariant(state);
+    const sig = `${parsed.providerID}/${parsed.modelID}:${variant ?? ''}`;
+    if (state.appliedModelSignature === sig) return;
+    await state.client.session.switchModel({
+      sessionID: state.providerSessionId,
+      model: {
+        providerID: parsed.providerID,
+        id: parsed.modelID,
+        ...(variant ? { variant } : {}),
+      },
+    });
+    state.appliedModelSignature = sig;
+  }
+
+  private async applySystemInstruction(state: OpenCodeSessionState, system: string | undefined): Promise<void> {
+    const entryApi = state.client.experimental?.session?.instructions?.entry;
+    if (!entryApi) return;
+    if (system) {
+      await entryApi.put({
+        sessionID: state.providerSessionId,
+        key: IMCODES_SYSTEM_INSTRUCTION_KEY,
+        value: system,
+      });
+      state.systemInstructionSet = true;
+    } else if (state.systemInstructionSet) {
+      await entryApi.remove({
+        sessionID: state.providerSessionId,
+        key: IMCODES_SYSTEM_INSTRUCTION_KEY,
+      }).catch(() => {});
+      state.systemInstructionSet = false;
+    }
+  }
+
   async send(
     sessionId: string,
     payloadOrMessage: string | ProviderContextPayload,
@@ -827,8 +1098,6 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       await this.compactSession(state);
       return;
     }
-    const model = parseModelIdentity(state.model);
-    const variant = this.resolvePromptVariant(state);
     const generation = ++state.generation;
     state.busy = true;
     state.compacting = false;
@@ -842,19 +1111,16 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state.silentToolResult = null;
     state.deliveryMessageId = null;
     state.currentMessageId = null;
-    state.messageRoles.clear();
-    state.pendingParts.clear();
     state.textParts.clear();
+    state.toolNames.clear();
+    state.toolInputs.clear();
     state.toolSignatures.clear();
     state.lastUsageSignature = null;
     state.lastUsage = undefined;
     state.lastUsageMessageId = null;
     this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
 
-    const parts: Array<Record<string, unknown>> = [
-      { type: 'text', text: payload.assembledMessage },
-      ...attachmentParts(payload.attachments),
-    ];
+    const files = promptFiles(payload.attachments);
     const system = composeProviderSystemText(payload);
     const messageId = openCodePromptMessageId(state.providerSessionId, payload.deliveryId);
     state.deliveryMessageId = messageId;
@@ -863,17 +1129,15 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       if (!this.isCurrent(state, generation) || state.cancelled) return;
-      await state.client.session.promptAsync({
-        path: { id: state.providerSessionId },
-        query: { directory: state.cwd },
-        body: {
-          messageID: messageId,
-          ...(model ? { model } : {}),
-          ...(variant ? { variant } : {}),
-          ...(system ? { system } : {}),
-          parts,
-        },
-        throwOnError: true,
+      await this.syncSessionModelAndEffort(state);
+      if (!this.isCurrent(state, generation) || state.cancelled) return;
+      await this.applySystemInstruction(state, system);
+      if (!this.isCurrent(state, generation) || state.cancelled) return;
+      await state.client.sessions.prompt({
+        sessionID: state.providerSessionId,
+        id: messageId,
+        text: payload.assembledMessage,
+        ...(files.length > 0 ? { files } : {}),
       });
     } catch (error) {
       if (!this.isCurrent(state, generation) || state.cancelled) return;
@@ -900,22 +1164,19 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   private async compactSession(state: OpenCodeSessionState): Promise<void> {
-    const summarize = typeof state.client.session.summarize === 'function'
-      ? state.client.session.summarize.bind(state.client.session)
-      : typeof state.client.notificationSession?.summarize === 'function'
-        ? state.client.notificationSession.summarize.bind(state.client.notificationSession)
-        : undefined;
-    if (!summarize) {
+    const compact = typeof state.client.session?.compact === 'function'
+      ? state.client.session.compact.bind(state.client.session)
+      : undefined;
+    if (!compact) {
       const error = providerError(
         PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-        'OpenCode compact failed: SDK session.summarize is unavailable',
+        'OpenCode compact failed: SDK session.compact is unavailable',
         false,
       );
       this.emitError(state.routeId, error);
       throw error;
     }
 
-    const model = parseModelIdentity(state.model);
     const generation = ++state.generation;
     state.busy = true;
     state.compacting = true;
@@ -926,20 +1187,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     this.emitStatus(state.routeId, { status: 'compacting', label: 'Compacting conversation...' });
 
     try {
-      const result = await summarize({
-        sessionID: state.providerSessionId,
-        directory: state.cwd,
-        ...(model ? { providerID: model.providerID, modelID: model.modelID } : {}),
-      }, { throwOnError: true });
+      await this.syncSessionModelAndEffort(state);
       if (!this.isCurrent(state, generation) || state.cancelled) return;
-      if (result?.data === false) {
-        throw providerError(
-          PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-          'OpenCode compact failed: session.summarize returned false',
-          true,
-        );
-      }
-      this.completeCompactOnce(state, 'session.summarize');
+      await compact({ sessionID: state.providerSessionId });
     } catch (error) {
       if (!this.isCurrent(state, generation) || state.cancelled || state.compactCompletionEmitted) return;
       const normalized = this.normalizeError(error, 'compact');
@@ -983,14 +1233,13 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   ): Promise<AgentDelegationNotificationResult> {
     const state = this.sessions.get(sessionId);
     if (!state?.busy || state.cancelled) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
-    if (!state.client.notificationSession) return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
-    await state.client.notificationSession.prompt({
+    await state.client.sessions.prompt({
       sessionID: state.providerSessionId,
       id: notification.notificationId,
-      prompt: { text: notification.text },
+      text: notification.text,
       delivery: 'steer',
       resume: true,
-    }, { throwOnError: true });
+    });
     // A successful prompt RPC is the irreversible provider admission ACK.
     // Do not post-check generation/idle after success: doing so would retain
     // and replay a message that OpenCode has already accepted.
@@ -1016,14 +1265,15 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       const pending = this.pendingQuestions.get(routeId);
       if (!pending) return false;
       this.pendingQuestions.delete(routeId);
-      const answers = parseAskQuestionAnswers(pending.questions, answer);
-      if (!state.client.question?.reply) return false;
-      void state.client.question.reply({
-        requestID: pending.requestId,
-        directory: state.cwd,
-        answers,
-      }, { throwOnError: true }).catch((error) => {
-        logger.warn({ provider: this.id, sessionId: routeId, requestId: pending.requestId, error }, 'OpenCode question reply failed');
+      const parsed = parseAskQuestionAnswers(pending.questions, answer);
+      const formAnswer = formatFormAnswerRecord(pending.fields, parsed, answer);
+      if (!state.client.session?.form?.reply) return false;
+      void state.client.session.form.reply({
+        sessionID: state.providerSessionId,
+        formID: pending.requestId,
+        answer: formAnswer,
+      }).catch((error) => {
+        logger.warn({ provider: this.id, sessionId: routeId, requestId: pending.requestId, error }, 'OpenCode form reply failed');
       });
       return true;
     }
@@ -1040,11 +1290,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state.compacting = false;
     state.generation += 1;
     try {
-      await state.client.session.abort({
-        path: { id: state.providerSessionId },
-        query: { directory: state.cwd },
-        throwOnError: true,
-      });
+      await state.client.session.interrupt({ sessionID: state.providerSessionId });
     } finally {
       this.failOnce(state, providerError(
         PROVIDER_ERROR_CODES.CANCELLED,
@@ -1100,38 +1346,22 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   async respondApproval(sessionId: string, requestId: string, approved: boolean): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) throw providerError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown OpenCode SDK session: ${sessionId}`, false);
-    const pending = state.pendingPermissions.get(requestId);
-    if (pending) clearTimeout(pending.timer);
+    const timer = state.pendingPermissions.get(requestId);
+    if (timer) clearTimeout(timer);
     state.pendingPermissions.delete(requestId);
-    await this.replyPermission(
-      state,
-      requestId,
-      approved,
-      pending?.replyMode ?? OPENCODE_PERMISSION_REPLY_MODE.LEGACY,
-    );
+    await this.replyPermission(state, requestId, approved);
   }
 
   private async replyPermission(
     state: OpenCodeSessionState,
     requestId: string,
     approved: boolean,
-    replyMode: OpenCodePermissionReplyMode,
   ): Promise<void> {
     try {
-      if (replyMode === OPENCODE_PERMISSION_REPLY_MODE.REQUEST && state.client.permission) {
-        await state.client.permission.reply({
-          path: { requestID: requestId },
-          query: { directory: state.cwd },
-          body: { reply: approved ? 'once' : 'reject' },
-          throwOnError: true,
-        });
-        return;
-      }
-      await state.client.postSessionIdPermissionsPermissionId({
-        path: { id: state.providerSessionId, permissionID: requestId },
-        query: { directory: state.cwd },
-        body: { response: approved ? 'once' : 'reject' },
-        throwOnError: true,
+      await state.client.permission.reply({
+        sessionID: state.providerSessionId,
+        requestID: requestId,
+        decision: approved ? 'once' : 'reject',
       });
     } catch (error) {
       throw this.normalizeError(error, 'permission');
@@ -1140,13 +1370,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
   private async hasAcceptedPrompt(state: OpenCodeSessionState, messageId: string): Promise<boolean> {
     try {
-      const result = await state.client.session.message({
-        path: { id: state.providerSessionId, messageID: messageId },
-        query: { directory: state.cwd },
-        throwOnError: true,
-      });
-      return safeString(result.data?.info?.id) === messageId
-        && result.data?.info?.role === 'user';
+      const msg = await state.client.session.message.get({
+        sessionID: state.providerSessionId,
+        messageID: messageId,
+      }) as Record<string, any> | undefined;
+      return safeString(msg?.id) === messageId && msg?.type === 'user';
     } catch (error) {
       if (isNotFoundError(error)) return false;
       throw error;
@@ -1204,8 +1432,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   /**
-   * The fence of the live server serving this route: fixed when that server
-   * started. A relaunch starts a new server and decides again.
+   * The fence of the live runtime serving this route: fixed when that runtime
+   * started. A relaunch starts a new runtime and decides again.
    */
   async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
     return this.sessions.get(providerSessionId)?.nativeAgentFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
@@ -1218,26 +1446,34 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     stream: AsyncIterable<Record<string, any>>;
   }> {
     const abort = new AbortController();
-    const port = await reserveLoopbackPort();
     const mcpServers = getDefaultMcpServers(config);
     let started: Awaited<ReturnType<OpenCodeSdkRuntimeHooks['start']>> | null = null;
-    const mcp = Object.fromEntries(Object.entries(mcpServers).map(([name, server]) => [name, {
+    const mcpServersConfig = Object.fromEntries(Object.entries(mcpServers).map(([name, server]) => [name, {
       type: 'local',
       command: [server.command, ...server.args],
       environment: server.env,
-      enabled: true,
+      disabled: false,
     }]));
     try {
       started = await openCodeSdkRuntimeHooks.start({
         hostname: LOOPBACK_HOST,
-        port,
+        port: 0,
         timeout: 10_000,
         signal: abort.signal,
+        directory: cwd,
+        warmupCatalog: true,
+        ...(this.databasePath ? { databasePath: this.databasePath } : {}),
         config: {
           share: 'disabled',
-          mcp,
+          mcp: { servers: mcpServersConfig },
           ...(nativeAgentsFenced
-            ? { tools: Object.fromEntries(OPENCODE_NATIVE_AGENT_TOOLS.map((tool) => [tool, false])) }
+            ? {
+              permissions: OPENCODE_NATIVE_AGENT_TOOLS.map((action) => ({
+                action,
+                resource: '*',
+                effect: 'deny',
+              })),
+            }
             : {}),
         },
       });
@@ -1245,11 +1481,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       if (url.hostname !== LOOPBACK_HOST && url.hostname !== 'localhost' && url.hostname !== '::1') {
         throw providerError(PROVIDER_ERROR_CODES.CONFIG_ERROR, 'OpenCode SDK session server did not bind to loopback', false);
       }
-      const subscription = await started.client.event.subscribe({
-        query: { directory: cwd },
-        signal: abort.signal,
-      });
-      return { client: started.client, server: started.server, abort, stream: subscription.stream };
+      const subscription = await started.client.events.subscribe({}, { signal: abort.signal }) as unknown as
+        | AsyncIterable<Record<string, any>>
+        | { stream: AsyncIterable<Record<string, any>> };
+      const stream = 'stream' in subscription ? subscription.stream : subscription;
+      return { client: started.client, server: started.server, abort, stream };
     } catch (error) {
       abort.abort();
       started?.server.close();
@@ -1267,7 +1503,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
   private async closeSessionState(state: OpenCodeSessionState): Promise<void> {
     this.clearPendingQuestion(state, true);
-    for (const pending of state.pendingPermissions.values()) clearTimeout(pending.timer);
+    for (const timer of state.pendingPermissions.values()) clearTimeout(timer);
     state.pendingPermissions.clear();
     state.surfacedQuestionCallIds.clear();
     state.abort.abort();
@@ -1302,31 +1538,178 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   private handleEvent(event: Record<string, any>): void {
+    if (event.type === 'model.updated' || event.type === 'provider.updated') {
+      this.modelCache = null;
+      return;
+    }
     const providerSessionId = sessionIdFromEvent(event);
     if (!providerSessionId) return;
     const routeId = this.providerToRoute.get(providerSessionId);
     const state = routeId ? this.sessions.get(routeId) : undefined;
     if (!state) return;
+    const data = (event.data ?? event.properties) as Record<string, any> | undefined;
+
     switch (event.type) {
-      case 'message.part.updated':
-        this.processPart(state, event.properties?.part, event.properties?.delta);
-        return;
-      case 'message.updated':
-        if (this.processMessage(state, event.properties?.info)) {
-          this.completeOnce(state, 'message.updated');
+      case 'session.step.started': {
+        if (!state.busy) return;
+        state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
+        const providerID = safeString(data?.model?.providerID);
+        const modelID = safeString(data?.model?.id);
+        if (providerID && modelID) {
+          const model = `${providerID}/${modelID}`;
+          if (state.model !== model) {
+            state.model = model;
+            this.emitSessionInfo(state);
+          }
         }
         return;
-      case OPENCODE_PERMISSION_EVENT.LEGACY_UPDATED:
+      }
+      case 'session.text.started': {
+        if (!state.busy) return;
+        state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
+        const key = textPartKey(data?.assistantMessageID, data?.ordinal);
+        if (!state.textParts.has(key)) state.textParts.set(key, '');
+        return;
+      }
+      case 'session.text.delta': {
+        if (!state.busy) return;
+        state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
+        const key = textPartKey(data?.assistantMessageID, data?.ordinal);
+        const previous = state.textParts.get(key) ?? '';
+        const chunk = typeof data?.delta === 'string' ? data.delta : '';
+        if (!chunk) return;
+        state.textParts.set(key, previous + chunk);
+        this.emitTextDelta(state);
+        return;
+      }
+      case 'session.text.ended': {
+        if (!state.busy) return;
+        state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
+        const key = textPartKey(data?.assistantMessageID, data?.ordinal);
+        if (typeof data?.text === 'string' && state.textParts.get(key) !== data.text) {
+          state.textParts.set(key, data.text);
+          this.emitTextDelta(state);
+        }
+        return;
+      }
+      case 'session.reasoning.started':
+      case 'session.reasoning.delta': {
+        if (!state.busy) return;
+        this.emitStatus(state.routeId, { status: 'thinking', label: 'OpenCode is thinking…' });
+        return;
+      }
+      case 'session.tool.input.started': {
+        if (!state.busy) return;
+        const id = safeString(data?.id);
+        const name = safeString(data?.name);
+        if (id && name) state.toolNames.set(id, name);
+        return;
+      }
+      case 'session.tool.called': {
+        if (!state.busy) return;
+        const id = safeString(data?.id) ?? randomUUID();
+        const name = state.toolNames.get(id) ?? safeString(data?.name) ?? safeString(data?.native?.tool) ?? 'tool';
+        state.toolNames.set(id, name);
+        if (data?.input !== undefined) state.toolInputs.set(id, data.input);
+        this.emitToolCallEvent(state, { id, name, status: 'running', input: data?.input });
+        return;
+      }
+      case 'session.tool.success': {
+        if (!state.busy) return;
+        const id = safeString(data?.id) ?? randomUUID();
+        const name = state.toolNames.get(id) ?? safeString(data?.name) ?? safeString(data?.native?.tool) ?? 'tool';
+        const output = extractToolContentText(data?.content);
+        this.emitToolCallEvent(state, {
+          id,
+          name,
+          status: 'complete',
+          input: state.toolInputs.get(id),
+          output,
+        });
+        return;
+      }
+      case 'session.tool.failed': {
+        if (!state.busy) return;
+        const id = safeString(data?.id) ?? randomUUID();
+        const name = state.toolNames.get(id) ?? safeString(data?.name) ?? safeString(data?.native?.tool) ?? 'tool';
+        const output = extractToolContentText(data?.content)
+          ?? safeString(data?.error?.message)
+          ?? (data?.error ? errorMessage(data.error) : undefined);
+        this.emitToolCallEvent(state, {
+          id,
+          name,
+          status: 'error',
+          input: state.toolInputs.get(id),
+          output,
+        });
+        return;
+      }
+      case 'session.usage.updated': {
+        this.emitUsage(state, state.currentMessageId, data?.tokens, data?.cost, false);
+        return;
+      }
+      case 'session.step.ended': {
+        state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
+        this.emitUsage(state, data?.assistantMessageID, data?.tokens, data?.cost, true);
+        if (isTerminalFinish(data?.finish)) {
+          this.completeOnce(state, 'session.step.ended');
+        }
+        return;
+      }
+      case 'session.step.failed': {
+        state.currentMessageId = safeString(data?.assistantMessageID) ?? state.currentMessageId;
+        this.emitUsage(state, data?.assistantMessageID, data?.tokens, data?.cost, true);
+        this.failOnce(state, this.normalizeError(data?.error, 'step'));
+        return;
+      }
+      case 'session.execution.started': {
+        if (state.busy && !state.compacting) {
+          this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
+        }
+        return;
+      }
+      case 'session.execution.succeeded': {
+        this.stopConfirmations.complete(state);
+        if (state.compacting) {
+          this.completeCompactOnce(state, 'session.execution.succeeded');
+          return;
+        }
+        this.completeOnce(state, 'session.execution.succeeded');
+        return;
+      }
+      case 'session.execution.failed': {
+        this.stopConfirmations.complete(state);
+        this.failOnce(state, this.normalizeError(data?.error, 'session'));
+        return;
+      }
+      case 'session.execution.interrupted': {
+        this.stopConfirmations.complete(state);
+        if (state.busy && !state.cancelled) {
+          this.failOnce(state, providerError(
+            PROVIDER_ERROR_CODES.CANCELLED,
+            `OpenCode execution interrupted (${safeString(data?.reason) ?? 'user'})`,
+            true,
+          ));
+        }
+        return;
+      }
+      case 'session.retry.scheduled': {
+        if (!state.busy || state.compacting) return;
+        const msg = safeString(data?.error?.message) ?? `OpenCode is retrying (attempt ${data?.attempt ?? 1})…`;
+        this.emitStatus(state.routeId, { status: 'retrying', label: msg });
+        return;
+      }
       case OPENCODE_PERMISSION_EVENT.ASKED:
       case OPENCODE_PERMISSION_EVENT.V2_ASKED:
-        this.processPermission(state, normalizePermissionEvent(event.type, event.properties));
+      case OPENCODE_PERMISSION_EVENT.LEGACY_UPDATED:
+        this.processPermission(state, normalizePermissionEvent(event.type, data));
         return;
-      case 'question.asked':
-        this.processQuestionAsked(state, event.properties);
+      case 'form.created':
+        this.processFormCreated(state, data?.form);
         return;
-      case 'question.replied':
-      case 'question.rejected': {
-        const requestId = safeString(event.properties?.requestID);
+      case 'form.replied':
+      case 'form.cancelled': {
+        const requestId = safeString(data?.id);
         const pending = this.pendingQuestions.get(state.routeId);
         if (pending && (!requestId || pending.requestId === requestId)) {
           this.pendingQuestions.delete(state.routeId);
@@ -1334,7 +1717,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.status': {
-        const status = event.properties?.status;
+        const status = data?.status;
         if (state.compacting) {
           if (status?.type === 'idle') this.stopConfirmations.complete(state);
           return;
@@ -1344,22 +1727,29 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
           this.completeOnce(state, 'session.status');
           return;
         }
-        // A delayed/stale `busy` or `retry` frame can arrive AFTER the turn has
-        // already completed — e.g. when the running tool restarts the network
-        // (an OpenClash/VPN restart) and OpenCode flushes its event stream out
-        // of order. Re-emitting a progress label here strands the footer on
-        // "OpenCode is working…" even though the session is idle. Only surface
-        // progress while a turn is actually live; send() re-arms state.busy for
-        // the next turn, and completeOnce/failOnce clear it.
+        // Only surface progress while a turn is live; delayed/out-of-order busy/retry
+        // frames after turn settlement must not strand the footer indicator.
         if (!state.busy) return;
         if (status?.type === 'busy') this.emitStatus(state.routeId, { status: 'working', label: 'OpenCode is working…' });
         else if (status?.type === 'retry') this.emitStatus(state.routeId, { status: 'retrying', label: safeString(status.message) ?? 'OpenCode is retrying…' });
         return;
       }
+      case 'session.compaction.started':
+        if (state.compacting && !state.cancelled) {
+          this.emitStatus(state.routeId, { status: 'compacting', label: 'Compacting conversation...' });
+        }
+        return;
+      case 'session.compaction.ended':
       case 'session.compacted':
         this.stopConfirmations.complete(state);
         if (state.compacting && !state.cancelled) {
-          this.completeCompactOnce(state, 'session.compacted');
+          this.completeCompactOnce(state, event.type);
+        }
+        return;
+      case 'session.compaction.failed':
+        this.stopConfirmations.complete(state);
+        if (state.compacting && !state.cancelled) {
+          this.failOnce(state, this.normalizeError(data?.error, 'compact'));
         }
         return;
       case 'session.idle':
@@ -1367,95 +1757,52 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         if (state.compacting) return;
         this.completeOnce(state, 'session.idle');
         return;
-      case 'session.error': {
-        this.failOnce(state, this.normalizeError(event.properties?.error, 'session'));
-        return;
-      }
       default:
         return;
     }
   }
 
-  private processPromptResult(state: OpenCodeSessionState, result: Record<string, any>): boolean {
-    const terminal = this.processMessage(state, result?.info);
-    if (Array.isArray(result?.parts)) {
-      for (const part of result.parts) this.processPart(state, part);
-    }
-    return terminal;
-  }
-
-  private processMessage(state: OpenCodeSessionState, info: Record<string, any> | undefined): boolean {
-    if (!info) return false;
-    const messageId = safeString(info.id);
-    const role = info.role === 'user'
-      ? 'user'
-      : info.role === 'assistant'
-        ? 'assistant'
-        : undefined;
-    if (!messageId || !role) return false;
-    state.messageRoles.set(messageId, role);
-    const pendingParts = state.pendingParts.get(messageId);
-    state.pendingParts.delete(messageId);
-    if (role !== 'assistant') return false;
-    state.currentMessageId = messageId;
-    for (const pending of pendingParts ?? []) {
-      this.processAssistantPart(state, pending.part, pending.delta);
-    }
-    if (safeString(info.modelID) && safeString(info.providerID)) {
-      const model = `${info.providerID}/${info.modelID}`;
+  private processAssistantMessageRecord(state: OpenCodeSessionState, msg: Record<string, any> | undefined): boolean {
+    if (!msg || msg.type !== 'assistant') return false;
+    state.currentMessageId = safeString(msg.id) ?? state.currentMessageId;
+    if (safeString(msg.model?.providerID) && safeString(msg.model?.id)) {
+      const model = `${msg.model.providerID}/${msg.model.id}`;
       if (state.model !== model) {
         state.model = model;
         this.emitSessionInfo(state);
       }
     }
-    this.emitUsage(state, info.id, info.tokens, info.cost, true);
-    if (info.error) {
-      this.failOnce(state, this.normalizeError(info.error, 'message'));
+    this.emitUsage(state, msg.id, msg.tokens, msg.cost, true);
+    if (Array.isArray(msg.content)) {
+      let ordinal = 0;
+      for (const item of msg.content) {
+        if (!item || typeof item !== 'object') continue;
+        if (item.type === 'text' && typeof item.text === 'string') {
+          const key = textPartKey(msg.id, ordinal++);
+          if (state.textParts.get(key) !== item.text) {
+            state.textParts.set(key, item.text);
+            this.emitTextDelta(state);
+          }
+        } else if (item.type === 'tool') {
+          const id = safeString(item.id) ?? randomUUID();
+          const name = safeString(item.name) ?? 'tool';
+          const toolState = item.state ?? {};
+          const status: ToolCallEvent['status'] = toolState.status === 'completed'
+            ? 'complete'
+            : toolState.status === 'error'
+              ? 'error'
+              : 'running';
+          const output = status === 'error'
+            ? (extractToolContentText(toolState.content) ?? safeString(toolState.error?.message))
+            : extractToolContentText(toolState.content);
+          this.emitToolCallEvent(state, { id, name, status, input: toolState.input, output });
+        }
+      }
     }
-    return isTerminalAssistantMessage(info);
-  }
-
-  private processPart(state: OpenCodeSessionState, part: Record<string, any> | undefined, delta?: string): void {
-    if (!part || safeString(part.sessionID) !== state.providerSessionId) return;
-    const messageId = safeString(part.messageID);
-    if (!messageId) return;
-    const role = state.messageRoles.get(messageId);
-    if (role === 'user') return;
-    if (role !== 'assistant') {
-      const pendingParts = state.pendingParts.get(messageId) ?? [];
-      pendingParts.push({ part, ...(delta === undefined ? {} : { delta }) });
-      state.pendingParts.set(messageId, pendingParts);
-      return;
+    if (msg.error) {
+      this.failOnce(state, this.normalizeError(msg.error, 'message'));
     }
-    this.processAssistantPart(state, part, delta);
-  }
-
-  private processAssistantPart(state: OpenCodeSessionState, part: Record<string, any>, delta?: string): void {
-    // The prompt result can settle the turn before the SSE stream flushes its
-    // duplicate reasoning/text/tool parts. Do not let those stale parts revive
-    // "thinking" or publish data after completeOnce/failOnce cleared `busy`.
-    if (!state.busy) return;
-    state.currentMessageId = safeString(part.messageID) ?? state.currentMessageId;
-    if (part.type === 'text') {
-      const partId = safeString(part.id) ?? randomUUID();
-      const previous = state.textParts.get(partId) ?? '';
-      const text = typeof part.text === 'string' ? part.text : previous + (delta ?? '');
-      if (text === previous) return;
-      state.textParts.set(partId, text);
-      this.emitTextDelta(state);
-      return;
-    }
-    if (part.type === 'reasoning') {
-      this.emitStatus(state.routeId, { status: 'thinking', label: 'OpenCode is thinking…' });
-      return;
-    }
-    if (part.type === 'tool') {
-      this.emitTool(state, part);
-      return;
-    }
-    if (part.type === 'step-finish') {
-      this.emitUsage(state, part.messageID, part.tokens, part.cost, false);
-    }
+    return isTerminalAssistantMessage(msg);
   }
 
   private emitTextDelta(state: OpenCodeSessionState): void {
@@ -1466,61 +1813,55 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     for (const callback of this.deltaCallbacks) callback(state.routeId, update);
   }
 
-  private emitTool(state: OpenCodeSessionState, part: Record<string, any>): void {
-    const toolState = part.state ?? {};
-    const status: ToolCallEvent['status'] = toolState.status === 'completed'
-      ? 'complete'
-      : toolState.status === 'error'
-        ? 'error'
-        : 'running';
-    const id = safeString(part.callID) ?? safeString(part.id) ?? randomUUID();
-    const rawToolName = safeString(part.tool) ?? 'tool';
-    if (rawToolName === 'question' && (status === 'running' || state.surfacedQuestionCallIds.has(id))) {
+  private emitToolCallEvent(
+    state: OpenCodeSessionState,
+    params: { id: string; name: string; status: ToolCallEvent['status']; input?: unknown; output?: string },
+  ): void {
+    if ((params.name === 'question' || params.name === 'form') && (params.status === 'running' || state.surfacedQuestionCallIds.has(params.id))) {
       return;
     }
-    const signature = JSON.stringify([status, toolState.input, toolState.output, toolState.error]);
-    if (state.toolSignatures.get(id) === signature) return;
-    state.toolSignatures.set(id, signature);
+    const signature = JSON.stringify([params.status, params.input, params.output]);
+    if (state.toolSignatures.get(params.id) === signature) return;
+    state.toolSignatures.set(params.id, signature);
     const event: ToolCallEvent = {
-      id,
-      name: rawToolName,
-      status,
-      ...(toolState.input !== undefined ? { input: toolState.input } : {}),
-      ...(typeof toolState.output === 'string' ? { output: toolState.output } : {}),
-      ...(status === 'error' && safeString(toolState.error) ? { output: toolState.error } : {}),
+      id: params.id,
+      name: params.name,
+      status: params.status,
+      ...(params.input !== undefined ? { input: params.input } : {}),
+      ...(params.output !== undefined ? { output: params.output } : {}),
       detail: {
         kind: 'opencode.tool',
-        summary: safeString(toolState.title) ?? safeString(part.tool) ?? 'tool',
-        input: toolState.input,
-        output: toolState.output ?? toolState.error,
+        summary: params.name,
+        input: params.input,
+        output: params.output,
         meta: { provider: this.id, providerSessionId: state.providerSessionId },
       },
     };
     for (const callback of this.toolCallbacks) callback(state.routeId, event);
     if (
-      status === 'complete'
+      params.status === 'complete'
       && state.cronControlActive
-      && isCronSilentResult(toolState.output)
+      && isCronSilentResult(params.output)
     ) {
       state.silentToolResult = CRON_CONTROL_PROTOCOL.SILENT_RESULT;
       this.finishOnce(state, CRON_CONTROL_PROTOCOL.SILENT_RESULT, 'cron.tool.silent');
-      // Do not abort the provider turn here. An asynchronous abort can race
-      // with the next queued turn and cancel unrelated work. finishOnce makes
-      // SILENT terminal for IM.codes and generation guards ignore late events.
     }
   }
 
-  private processQuestionAsked(state: OpenCodeSessionState, properties: Record<string, any> | undefined): void {
-    const requestId = safeString(properties?.id);
-    const questions = normalizeAskQuestionsPayload(properties?.questions);
-    if (!requestId || questions.length === 0) return;
-    const callId = safeString(properties?.tool?.callID);
+  private processFormCreated(state: OpenCodeSessionState, form: Record<string, any> | undefined): void {
+    const normalized = normalizeFormToQuestions(form);
+    if (!normalized) return;
+    const { requestId, questions, fields } = normalized;
+    const callId = safeString(form?.metadata?.callID);
     if (callId) state.surfacedQuestionCallIds.add(callId);
     const previous = this.pendingQuestions.get(state.routeId);
-    if (previous && previous.requestId !== requestId && state.client.question?.reject) {
-      void state.client.question.reject({ requestID: previous.requestId, directory: state.cwd }, { throwOnError: true }).catch(() => {});
+    if (previous && previous.requestId !== requestId && state.client.session?.form?.cancel) {
+      void state.client.session.form.cancel({
+        sessionID: state.providerSessionId,
+        formID: previous.requestId,
+      }).catch(() => {});
     }
-    this.pendingQuestions.set(state.routeId, { requestId, questions, ...(callId ? { callId } : {}) });
+    this.pendingQuestions.set(state.routeId, { requestId, questions, fields, ...(callId ? { callId } : {}) });
     const event: ToolCallEvent = {
       id: callId ?? requestId,
       name: INTERACTIVE_QUESTION_TOOL_NAME,
@@ -1530,18 +1871,21 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     for (const callback of this.toolCallbacks) callback(state.routeId, event);
   }
 
-  private clearPendingQuestion(state: OpenCodeSessionState, rejectPending: boolean): void {
+  private clearPendingQuestion(state: OpenCodeSessionState, cancelPending: boolean): void {
     const pending = this.pendingQuestions.get(state.routeId);
     if (!pending) return;
     this.pendingQuestions.delete(state.routeId);
-    if (rejectPending && state.client.question?.reject) {
-      void state.client.question.reject({ requestID: pending.requestId, directory: state.cwd }, { throwOnError: true }).catch(() => {});
+    if (cancelPending && state.client.session?.form?.cancel) {
+      void state.client.session.form.cancel({
+        sessionID: state.providerSessionId,
+        formID: pending.requestId,
+      }).catch(() => {});
     }
   }
 
   private processPermission(state: OpenCodeSessionState, permission: NormalizedOpenCodePermission | undefined): void {
     if (!permission) return;
-    const { id, operation, title, pattern, callId, replyMode } = permission;
+    const { id, operation, title, pattern, callId } = permission;
     const request: ApprovalRequest = {
       id,
       description: title ?? `Allow OpenCode ${operation ?? 'operation'}${pattern ? `: ${pattern}` : ''}`,
@@ -1552,29 +1896,20 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       ...(pattern ? { inputPreview: pattern.slice(0, 300) } : {}),
     };
     if (this.approvalCallbacks.length === 0) {
-      void this.replyPermission(state, id, false, replyMode).catch((error) => {
+      void this.replyPermission(state, id, false).catch((error) => {
         this.emitError(state.routeId, this.normalizeError(error, 'permission rejection'));
       });
       return;
     }
-    const prior = state.pendingPermissions.get(id);
-    if (prior) {
-      if (replyMode === OPENCODE_PERMISSION_REPLY_MODE.REQUEST
-        && prior.replyMode !== OPENCODE_PERMISSION_REPLY_MODE.REQUEST) {
-        state.pendingPermissions.set(id, { ...prior, replyMode });
-      }
-      return;
-    }
+    if (state.pendingPermissions.has(id)) return;
     const timer = setTimeout(() => {
-      const pending = state.pendingPermissions.get(id);
-      if (!pending) return;
-      state.pendingPermissions.delete(id);
-      void this.replyPermission(state, id, false, pending.replyMode).catch((error) => {
+      if (!state.pendingPermissions.delete(id)) return;
+      void this.replyPermission(state, id, false).catch((error) => {
         this.emitError(state.routeId, this.normalizeError(error, 'permission timeout'));
       });
     }, this.approvalTimeoutMs);
     timer.unref?.();
-    state.pendingPermissions.set(id, { timer, replyMode });
+    state.pendingPermissions.set(id, timer);
     for (const callback of this.approvalCallbacks) callback(state.routeId, request);
   }
 
@@ -1588,11 +1923,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const cacheWriteTokens = positiveNumber(tokens.cache?.write) ?? 0;
     const normalizedMessageId = safeString(messageId);
 
-    // OpenCode emits an initial assistant message with an all-zero token
-    // placeholder before the authoritative step-finish/final message. Expose
-    // the provider context limit without publishing that placeholder as a
-    // finalized zero-token snapshot, which would otherwise win the completion
-    // race and leave the persisted timeline at 0 usage.
+    // OpenCode emits zero-token snapshots before the step finishes. Expose the
+    // authoritative context limit without publishing a finalized 0-usage frame.
     if (inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens === 0) {
       if (state.lastUsage || modelContextWindow === undefined) return;
       const metadataOnlyUsage = { model_context_window: modelContextWindow };
@@ -1639,9 +1971,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         this.finishOnce(state, state.silentToolResult, 'cron.tool.silent');
         return;
       }
-      // A terminal message.updated frame can precede its text part. Wait for
-      // prompt.result or an idle authority before deciding the turn is empty.
-      if (source === 'message.updated' || state.missingFinalRecoveryInFlight) return;
+      // Wait for step/execution completion if `session.step.ended` arrived without text.
+      if (source === 'session.step.ended' || state.missingFinalRecoveryInFlight) return;
       if (!state.missingFinalRecoveryAttempted) {
         this.recoverMissingFinalOnce(state);
         return;
@@ -1752,11 +2083,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state: OpenCodeSessionState,
     recoveryMessageId: string,
   ): Promise<boolean> {
-    await withOpenCodeRequestTimeout(state.client.session.get({
-      path: { id: state.providerSessionId },
-      query: { directory: state.cwd },
-      throwOnError: true,
-    }), 'session health check');
+    await withOpenCodeRequestTimeout(
+      state.client.sessions.get({ sessionID: state.providerSessionId }),
+      'session health check',
+    );
 
     const accepted = await withOpenCodeRequestTimeout(
       this.hasAcceptedPrompt(state, recoveryMessageId),
@@ -1764,58 +2094,57 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     );
     if (accepted) return this.loadAcceptedRecoveryResult(state, recoveryMessageId);
 
-    const model = parseModelIdentity(state.model);
-    const variant = this.resolvePromptVariant(state);
-    const result = await withOpenCodeRequestTimeout(state.client.session.prompt({
-      path: { id: state.providerSessionId },
-      query: { directory: state.cwd },
-      body: {
-        messageID: recoveryMessageId,
-        ...(model ? { model } : {}),
-        ...(variant ? { variant } : {}),
-        parts: [{ type: 'text', text: MISSING_FINAL_RECOVERY_PROMPT }],
-      },
-      throwOnError: true,
-    }), 'missing final recovery prompt');
-    return this.processPromptResult(state, result.data);
+    await this.syncSessionModelAndEffort(state);
+    await withOpenCodeRequestTimeout(
+      state.client.sessions.prompt({
+        sessionID: state.providerSessionId,
+        id: recoveryMessageId,
+        text: MISSING_FINAL_RECOVERY_PROMPT,
+      }),
+      'missing final recovery prompt',
+    );
+    if (state.client.experimental?.session?.wait) {
+      await withOpenCodeRequestTimeout(
+        state.client.experimental.session.wait({ sessionID: state.providerSessionId }),
+        'missing final recovery wait',
+      );
+    }
+    return this.loadAcceptedRecoveryResult(state, recoveryMessageId);
   }
 
   private async loadAcceptedRecoveryResult(
     state: OpenCodeSessionState,
     recoveryMessageId: string,
   ): Promise<boolean> {
-    const result = await withOpenCodeRequestTimeout(state.client.session.messages({
-      path: { id: state.providerSessionId },
-      query: { directory: state.cwd, limit: 100 },
-      throwOnError: true,
-    }), 'missing final recovery reconciliation');
-    const recovered = [...result.data].reverse().find((message) => (
-      message?.info?.role === 'assistant'
-      && safeString(message.info.parentID) === recoveryMessageId
-      && isTerminalAssistantMessage(message.info)
-    ));
-    return recovered ? this.processPromptResult(state, recovered) : false;
+    if (state.completionEmitted) return true;
+    const res = await withOpenCodeRequestTimeout(
+      state.client.message.list({ sessionID: state.providerSessionId, limit: 100, order: 'desc' }),
+      'missing final recovery reconciliation',
+    );
+    const items = Array.isArray(res?.data) ? (res.data as Array<Record<string, any>>) : [];
+    const recoveryUserIdx = items.findIndex((item) => item?.id === recoveryMessageId && item?.type === 'user');
+    const searchPool = recoveryUserIdx >= 0 ? items.slice(0, recoveryUserIdx) : items;
+    const recovered = searchPool.find((item) => isTerminalAssistantMessage(item));
+    if (!recovered) return false;
+    return this.processAssistantMessageRecord(state, recovered)
+      && Boolean([...state.textParts.values()].join('').trim());
   }
 
   private async restartSessionRuntime(state: OpenCodeSessionState, generation: number): Promise<boolean> {
-    // A replacement server never drops a fence the session already had, and
-    // picks one up when managed authority requires it now.
+    // A replacement runtime preserves any active fence for this session.
     const nativeAgentsFenced = state.nativeAgentFence === NATIVE_AGENT_FENCES.DISABLED
       || this.nativeAgentFence.required(state.routeId, state.runtimeConfig.sessionName);
     const replacement = await this.startSessionRuntime(state.runtimeConfig, state.cwd, nativeAgentsFenced);
     try {
-      await withOpenCodeRequestTimeout(replacement.client.session.get({
-        path: { id: state.providerSessionId },
-        query: { directory: state.cwd },
-        throwOnError: true,
-      }), 'session reconnect verification');
+      await withOpenCodeRequestTimeout(
+        replacement.client.sessions.get({ sessionID: state.providerSessionId }),
+        'session reconnect verification',
+      );
     } catch (error) {
       await this.closeStartedRuntime(replacement);
       throw error;
     }
 
-    // Cancellation or a newer send may win while the replacement server is
-    // starting. Never attach that stale runtime after its owning turn ended.
     if (!this.isCurrent(state, generation) || state.cancelled) {
       await this.closeStartedRuntime(replacement);
       return false;
@@ -1836,7 +2165,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     void previous.eventLoop.catch(() => {});
     logger.warn(
       { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId },
-      'OpenCode session server reconnected during missing-final recovery',
+      'OpenCode session runtime reconnected during missing-final recovery',
     );
     return true;
   }
@@ -1880,25 +2209,54 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     if (error && typeof error === 'object' && 'code' in error && 'recoverable' in error && 'message' in error) {
       return error as ProviderError;
     }
+    const status = errorHttpStatus(error);
     const message = errorMessage(error);
     const lower = message.toLowerCase();
-    if (lower.includes('enoent') || lower.includes('not found') && lower.includes('opencode')) {
+    const errorType = error && typeof error === 'object' ? safeString((error as { type?: unknown }).type)?.toLowerCase() ?? '' : '';
+    const errorName = error && typeof error === 'object' ? safeString((error as { name?: unknown }).name)?.toLowerCase() ?? '' : '';
+
+    if (
+      lower.includes('enoent')
+      || lower.includes('err_module_not_found')
+      || (lower.includes('opencode') && (lower.includes('cannot find package') || (lower.includes('not found') && lower.includes('package'))))
+    ) {
       return providerError(
         PROVIDER_ERROR_CODES.CONFIG_ERROR,
-        'OpenCode executable is not installed or not available on PATH. Install OpenCode before using the OpenCode SDK agent.',
+        'OpenCode SDK runtime is unavailable. Ensure `@opencode/sdk` (>= 2.4.2) is installed; if connecting to an external OpenCode server, upgrade it via `opencode upgrade --major`.',
         false,
       );
     }
-    if (lower.includes('providerautherror') || lower.includes('unauthorized') || lower.includes('authentication') || lower.includes('401')) {
+    if (lower.includes('unsupportedcontenttype') || (errorName === 'clienterror' && (status === 404 || status === 405 || lower.includes('unexpectedstatus')))) {
+      return providerError(
+        PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        `OpenCode ${operation} failed against an incompatible OpenCode v1 endpoint: ${message}. Upgrade the OpenCode runtime to v2 (opencode upgrade --major).`,
+        false,
+      );
+    }
+    if (
+      errorName.includes('signedout')
+      || errorName.includes('ssorequired')
+      || lower.includes('providerautherror')
+      || lower.includes('unauthorized')
+      || lower.includes('authentication')
+      || status === 401
+      || status === 403
+    ) {
       return providerError(PROVIDER_ERROR_CODES.AUTH_FAILED, `OpenCode ${operation} failed: ${message}`, false);
     }
-    if (lower.includes('rate') && lower.includes('limit') || lower.includes('429')) {
+    if (
+      errorType.includes('free-limit')
+      || errorType.includes('rate-limit')
+      || lower.includes('free usage limit')
+      || (lower.includes('rate') && lower.includes('limit'))
+      || status === 429
+    ) {
       return providerError(PROVIDER_ERROR_CODES.RATE_LIMITED, `OpenCode ${operation} failed: ${message}`, true);
     }
     if (lower.includes('abort') || lower.includes('cancel')) {
       return providerError(PROVIDER_ERROR_CODES.CANCELLED, `OpenCode ${operation} cancelled`, true);
     }
-    if (lower.includes('404') || lower.includes('session') && lower.includes('not found')) {
+    if (errorName.includes('sessionnotfound') || status === 404 || (lower.includes('session') && lower.includes('not found'))) {
       return providerError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `OpenCode session was not found during ${operation}`, false);
     }
     if (isTransientRequestFailure(error)) {

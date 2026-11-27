@@ -409,13 +409,15 @@ async function probeCursorHeadless(deps: AgentAvailabilityProbeDeps): Promise<Ag
 
 async function probeOpenCode(deps: AgentAvailabilityProbeDeps, requireSdkPackage: boolean): Promise<AgentAvailabilityEntry> {
   if (requireSdkPackage) {
-    const rootMain = deps.resolvePackageRoot('@opencode-ai/sdk', '@opencode-ai/sdk');
-    const rootV2 = deps.resolvePackageRoot('@opencode-ai/sdk/v2/client', '@opencode-ai/sdk');
-    if (!rootMain || !rootV2) {
-      return { installed: false, reason: '@opencode-ai/sdk package not installed' };
+    // `@opencode/sdk` v2 runs an embedded host in-process (`OpenCode.create()`)
+    // and does not spawn the external `opencode` CLI binary.
+    const rootMain = deps.resolvePackageRoot('@opencode/sdk', '@opencode/sdk');
+    if (!rootMain) {
+      return { installed: false, reason: '@opencode/sdk package not installed' };
     }
+    return { installed: true };
   }
-  // Matches `@opencode-ai/sdk` `createOpencodeServer()` (`cross-spawn('opencode')`) and `OpenCodeDriver`: PATH only.
+  // Matches `OpenCodeDriver` (`opencode` tmux PTY CLI): PATH only.
   return probeBinary(deps, 'opencode', { includeWindowsGlobalNpmDirs: false }, 'opencode CLI not found');
 }
 

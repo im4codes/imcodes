@@ -317,60 +317,103 @@ function createOpenCodeRestoreHarness() {
       await new Promise<void>((resolve) => signal?.addEventListener('abort', () => resolve(), { once: true }));
     },
   };
+  const sessionsApi = {
+    create: vi.fn(async (options: any) => {
+      const directory = options?.location?.directory;
+      const session = {
+        id: 'unexpected-new-session',
+        title: options?.title ?? 'unexpected',
+        ...(directory ? { location: { directory }, directory } : {}),
+      };
+      remoteSessions.set(session.id, session);
+      return session;
+    }),
+    get: vi.fn(async (options: any) => {
+      const session = remoteSessions.get(String(options?.sessionID));
+      if (!session) throw new Error('404 session not found');
+      return session;
+    }),
+    prompt: vi.fn(async () => ({ id: 'msg-user-1', status: 'queued' })),
+  };
   const client = {
+    sessions: sessionsApi,
     session: {
-      create: vi.fn(async (options: any) => {
-        const session = {
-          id: 'unexpected-new-session',
-          title: options.body?.title ?? 'unexpected',
-          directory: options.query?.directory,
-        };
-        remoteSessions.set(session.id, session);
-        return { data: session };
-      }),
-      get: vi.fn(async (options: any) => {
-        const session = remoteSessions.get(String(options.path?.id));
-        if (!session) throw new Error('404 session not found');
-        return { data: session };
-      }),
       list: vi.fn(async (options: any) => ({
-        data: [...remoteSessions.values()].filter((session) => (
-          !options.query?.directory || session.directory === options.query.directory
-        )),
+        data: [...remoteSessions.values()]
+          .filter((session) => {
+            const dir = session.location?.directory ?? session.directory;
+            return !options?.directory || dir === options.directory;
+          })
+          .map((session) => ({
+            ...session,
+            ...(!session.location && session.directory ? { location: { directory: session.directory } } : {}),
+          })),
+        cursor: {},
       })),
-      abort: vi.fn(async () => ({ data: true })),
-      message: vi.fn(async () => {
-        throw new Error('404 message not found', { cause: { status: 404 } });
-      }),
-      prompt: vi.fn(),
-      promptAsync: vi.fn(async () => ({ data: undefined, response: { status: 204 } })),
+      switchModel: vi.fn(async () => undefined),
+      interrupt: vi.fn(async () => ({ interrupted: true })),
+      compact: vi.fn(async () => ({ id: 'msg-compact-1' })),
+      message: {
+        get: vi.fn(async () => {
+          throw new Error('404 message not found', { cause: { status: 404 } });
+        }),
+      },
+      form: {
+        reply: vi.fn(async () => undefined),
+        cancel: vi.fn(async () => undefined),
+      },
+    },
+    message: {
+      list: vi.fn(async () => ({ data: [], cursor: {} })),
     },
     provider: {
       list: vi.fn(async () => ({
+        data: [{
+          id: 'opencode',
+          name: 'OpenCode',
+          activation: 'enabled',
+        }],
+      })),
+    },
+    model: {
+      list: vi.fn(async () => ({
+        data: [{
+          id: 'opencode/deepseek-v4-flash-free',
+          modelID: 'deepseek-v4-flash-free',
+          providerID: 'opencode',
+          name: 'DeepSeek V4 Flash Free',
+          enabled: true,
+          type: 'chat',
+          limit: { context: 128_000, output: 16_384 },
+          variants: [],
+        }],
+      })),
+      default: vi.fn(async () => ({
         data: {
-          connected: ['opencode'],
-          default: { opencode: 'deepseek-v4-flash-free' },
-          all: [{
-            id: 'opencode',
-            name: 'OpenCode',
-            models: {
-              'deepseek-v4-flash-free': {
-                id: 'deepseek-v4-flash-free',
-                name: 'DeepSeek V4 Flash Free',
-                limit: { context: 128_000 },
-              },
-            },
-          }],
+          id: 'opencode/deepseek-v4-flash-free',
+          modelID: 'deepseek-v4-flash-free',
+          providerID: 'opencode',
+          name: 'DeepSeek V4 Flash Free',
         },
       })),
     },
-    event: {
+    events: {
       subscribe: vi.fn(async () => ({ stream })),
     },
     permission: {
-      reply: vi.fn(async () => ({ data: true })),
+      reply: vi.fn(async () => undefined),
     },
-    postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+    experimental: {
+      session: {
+        instructions: {
+          entry: {
+            put: vi.fn(async () => undefined),
+            remove: vi.fn(async () => undefined),
+          },
+        },
+        wait: vi.fn(async () => undefined),
+      },
+    },
   };
   const server = { url: 'http://127.0.0.1:45678', close: vi.fn() };
   openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
@@ -1007,15 +1050,13 @@ describe('sdk transport session restore', () => {
     const runtime = await ensureTransportRuntimeAvailable(name);
 
     expect(runtime?.providerSessionId).toBe('legacy-local-route');
-    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
-      path: { id: 'remote-monitor-session' },
-      query: { directory: '/tmp/service-monitor' },
+    expect(harness.client.sessions.get).toHaveBeenCalledWith(expect.objectContaining({
+      sessionID: 'remote-monitor-session',
     }));
     expect(harness.client.session.list).toHaveBeenCalledWith({
-      query: { directory: '/tmp/service-monitor' },
-      throwOnError: true,
+      directory: '/tmp/service-monitor',
     });
-    expect(harness.client.session.create).not.toHaveBeenCalled();
+    expect(harness.client.sessions.create).not.toHaveBeenCalled();
     expect(mocks.store.get(name)?.providerResumeId).toBe('remote-monitor-session');
   });
 
@@ -1061,18 +1102,15 @@ describe('sdk transport session restore', () => {
 
     expect(runtime?.providerSessionId).toBe('legacy-symlink-route');
     expect(harness.client.session.list).toHaveBeenCalledWith({
-      query: { directory: canonicalDirectory },
-      throwOnError: true,
+      directory: canonicalDirectory,
     });
     expect(harness.client.session.list).toHaveBeenCalledWith({
-      query: { directory: normalizedAlias },
-      throwOnError: true,
+      directory: normalizedAlias,
     });
-    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
-      path: { id: 'remote-symlink-monitor' },
-      query: { directory: normalizedAlias },
+    expect(harness.client.sessions.get).toHaveBeenCalledWith(expect.objectContaining({
+      sessionID: 'remote-symlink-monitor',
     }));
-    expect(harness.client.session.create).not.toHaveBeenCalled();
+    expect(harness.client.sessions.create).not.toHaveBeenCalled();
     expect(mocks.store.get(name)?.providerResumeId).toBe('remote-symlink-monitor');
   });
 
@@ -1107,7 +1145,7 @@ describe('sdk transport session restore', () => {
     await expect(ensureTransportRuntimeAvailable(name)).resolves.toBeUndefined();
 
     expect(harness.client.session.list).not.toHaveBeenCalled();
-    expect(harness.client.session.get).not.toHaveBeenCalled();
+    expect(harness.client.sessions.get).not.toHaveBeenCalled();
     expect(mocks.store.get(name)?.providerResumeId).toBeUndefined();
   });
 
@@ -1160,7 +1198,7 @@ describe('sdk transport session restore', () => {
       data: [{
         id: 'remote-monitor-session',
         title: '监控',
-        directory: '/tmp/service-monitor',
+        location: { directory: '/tmp/service-monitor' },
         time: { updated: Date.now() },
       }],
     });
@@ -1169,14 +1207,14 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get(name)?.sessionInstanceId).toBe('instance-new');
     expect(mocks.store.get(name)?.providerResumeId).toBeUndefined();
     expect(getTransportRuntime(name)).toBeUndefined();
-    expect(harness.client.session.get).not.toHaveBeenCalled();
+    expect(harness.client.sessions.get).not.toHaveBeenCalled();
   });
 
   it('does not let SessionInfo from an initializing restore pollute a same-name replacement', async () => {
     const harness = createOpenCodeRestoreHarness();
     const getStarted = deferred<void>();
-    const getResult = deferred<{ data: Record<string, any> }>();
-    harness.client.session.get.mockImplementationOnce(async () => {
+    const getResult = deferred<Record<string, any>>();
+    harness.client.sessions.get.mockImplementationOnce(async () => {
       getStarted.resolve();
       return getResult.promise;
     });
@@ -1227,11 +1265,9 @@ describe('sdk transport session restore', () => {
       updatedAt: Date.now(),
     });
     getResult.resolve({
-      data: {
-        id: 'remote-monitor-session',
-        title: '监控',
-        directory: '/tmp/service-monitor',
-      },
+      id: 'remote-monitor-session',
+      title: '监控',
+      location: { directory: '/tmp/service-monitor' },
     });
     await restore;
 
@@ -1244,14 +1280,14 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get(name)?.activeModel).toBeUndefined();
     expect(getTransportRuntime(name)).toBeUndefined();
     expect(getResendCount(name)).toBe(1);
-    expect(harness.client.session.prompt).not.toHaveBeenCalled();
+    expect(harness.client.sessions.prompt).not.toHaveBeenCalled();
   });
 
   it('abandons an initializing restore when the same session changes runtime authority', async () => {
     const harness = createOpenCodeRestoreHarness();
     const getStarted = deferred<void>();
-    const getResult = deferred<{ data: Record<string, any> }>();
-    harness.client.session.get.mockImplementationOnce(async () => {
+    const getResult = deferred<Record<string, any>>();
+    harness.client.sessions.get.mockImplementationOnce(async () => {
       getStarted.resolve();
       return getResult.promise;
     });
@@ -1295,11 +1331,9 @@ describe('sdk transport session restore', () => {
       updatedAt: Date.now(),
     });
     getResult.resolve({
-      data: {
-        id: 'remote-monitor-session',
-        title: '旧监控',
-        directory: '/tmp/service-monitor',
-      },
+      id: 'remote-monitor-session',
+      title: '旧监控',
+      location: { directory: '/tmp/service-monitor' },
     });
     await restore;
 
@@ -1359,7 +1393,7 @@ describe('sdk transport session restore', () => {
     expect(getTransportRuntime('deck_service_monitor_b')).toBeUndefined();
     expect(mocks.store.get('deck_service_monitor_a')?.providerResumeId).toBeUndefined();
     expect(mocks.store.get('deck_service_monitor_b')?.providerResumeId).toBeUndefined();
-    expect(harness.client.session.get).not.toHaveBeenCalled();
+    expect(harness.client.sessions.get).not.toHaveBeenCalled();
   });
 
   it('refuses a legacy claim when another local record already owns the provider conversation', async () => {
@@ -1451,7 +1485,7 @@ describe('sdk transport session restore', () => {
 
     expect(getTransportRuntime('deck_service_duplicate_a')).toBeUndefined();
     expect(getTransportRuntime('deck_service_duplicate_b')).toBeUndefined();
-    expect(harness.client.session.get).not.toHaveBeenCalled();
+    expect(harness.client.sessions.get).not.toHaveBeenCalled();
   });
 
   it('scopes legacy OpenCode title recovery to the stored project directory', async () => {
@@ -1492,12 +1526,11 @@ describe('sdk transport session restore', () => {
 
     expect(runtime?.providerSessionId).toBe('legacy-local-route-scoped');
     expect(mocks.store.get(name)?.providerResumeId).toBe('service-project-monitor');
-    expect(harness.client.session.get).toHaveBeenCalledWith(expect.objectContaining({
-      path: { id: 'service-project-monitor' },
-      query: { directory: '/tmp/service-monitor' },
+    expect(harness.client.sessions.get).toHaveBeenCalledWith(expect.objectContaining({
+      sessionID: 'service-project-monitor',
     }));
-    expect(harness.client.session.get).not.toHaveBeenCalledWith(expect.objectContaining({
-      path: { id: 'other-project-monitor' },
+    expect(harness.client.sessions.get).not.toHaveBeenCalledWith(expect.objectContaining({
+      sessionID: 'other-project-monitor',
     }));
   });
 
@@ -1565,7 +1598,7 @@ describe('sdk transport session restore', () => {
       requestedModel: 'opencode/deepseek-v4-flash-free',
     });
 
-    expect(harness.client.session.create).toHaveBeenCalledOnce();
+    expect(harness.client.sessions.create).toHaveBeenCalledOnce();
     expect(mocks.store.get('deck_opencode_new_brain')).toMatchObject({
       providerSessionId: expect.any(String),
       providerResumeId: 'unexpected-new-session',

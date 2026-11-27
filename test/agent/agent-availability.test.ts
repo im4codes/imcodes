@@ -116,7 +116,7 @@ describe('detectInstalledAgents()', () => {
       expect(withOpenCode['claude-code-sdk']?.installed).toBe(true);
     }
 
-    // Without opencode on PATH, real opencode-sdk ESM import resolution stays valid while missing binary yields false:
+    // Without opencode CLI on PATH, @opencode/sdk v2 still resolves in-process while the PTY CLI yields false:
     const withoutOpenCode = await detectInstalledAgents({
       deps: {
         env: { PATH: path.join(tempRoot, 'empty-bin') },
@@ -125,7 +125,7 @@ describe('detectInstalledAgents()', () => {
         isProviderConnected: () => false,
       },
     });
-    expect(withoutOpenCode['opencode-sdk']?.installed).toBe(false);
+    expect(withoutOpenCode['opencode-sdk']?.installed).toBe(true);
     expect(withoutOpenCode['opencode']?.installed).toBe(false);
   });
 
@@ -327,8 +327,7 @@ describe('detectInstalledAgents()', () => {
         '@qoder-ai/qoder-agent-sdk': '/opt/imcodes/node_modules/@qoder-ai/qoder-agent-sdk',
         '@microsoft/copilot-sdk': '/opt/imcodes/node_modules/@microsoft/copilot-sdk',
         '@microsoft/copilot-sdk-linux-x64': '/opt/imcodes/node_modules/@microsoft/copilot-sdk-linux-x64',
-        '@opencode-ai/sdk': '/opt/imcodes/node_modules/@opencode-ai/sdk',
-        '@opencode-ai/sdk/v2/client': '/opt/imcodes/node_modules/@opencode-ai/sdk',
+        '@opencode/sdk': '/opt/imcodes/node_modules/@opencode/sdk',
       },
     });
 
@@ -338,6 +337,7 @@ describe('detectInstalledAgents()', () => {
     expect(result[AGY_SDK_PROVIDER_ID]?.installed).toBe(true);
     expect(result['qoder-sdk']?.installed).toBe(true);
     expect(result['copilot-sdk']?.installed).toBe(true);
+    expect(result['opencode-sdk']?.installed).toBe(true);
     expect(result['grok-sdk']?.installed).toBe(true);
     expect(result[HERMES_AGENT_PROVIDER_ID]?.installed).toBe(true);
   });
