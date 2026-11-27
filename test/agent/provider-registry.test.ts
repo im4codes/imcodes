@@ -3,9 +3,11 @@ import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
 
-const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockClaudeCodeCliSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider, MockMuseCodeSdkProvider } = vi.hoisted(() => {
+const { mockConnect, mockDisconnect, mockWireProviderToRelay, mockBroadcastProviderStatus, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockClaudeCodeCliSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider, MockMuseCodeSdkProvider } = vi.hoisted(() => {
   const mockConnect = vi.fn().mockResolvedValue(undefined);
   const mockDisconnect = vi.fn().mockResolvedValue(undefined);
+  const mockWireProviderToRelay = vi.fn();
+  const mockBroadcastProviderStatus = vi.fn();
   const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
     id: 'openclaw',
     connectionMode: 'persistent',
@@ -345,8 +347,13 @@ const { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, Moc
     createSession: vi.fn().mockResolvedValue('session-muse'),
     endSession: vi.fn().mockResolvedValue(undefined),
   }));
-  return { mockConnect, mockDisconnect, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockClaudeCodeCliSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider, MockMuseCodeSdkProvider };
+  return { mockConnect, mockDisconnect, mockWireProviderToRelay, mockBroadcastProviderStatus, MockOpenClawProvider, MockQwenProvider, MockClaudeCodeSdkProvider, MockClaudeCodeCliSdkProvider, MockCodexSdkProvider, MockQoderSdkProvider, MockCursorHeadlessProvider, MockCopilotSdkProvider, MockOpenCodeSdkProvider, MockKimiSdkProvider, MockHermesAcpProvider, MockGrokSdkProvider, MockAgySdkProvider, MockDeepseekHarnessProvider, MockPiProvider, MockMuseCodeSdkProvider };
 });
+
+vi.mock('../../src/daemon/transport-relay.js', () => ({
+  wireProviderToRelay: mockWireProviderToRelay,
+  broadcastProviderStatus: mockBroadcastProviderStatus,
+}));
 
 vi.mock('../../src/agent/providers/muse-code-sdk.js', () => ({
   MuseCodeSdkProvider: MockMuseCodeSdkProvider,
@@ -767,5 +774,187 @@ describe('disconnectAll', () => {
 
   it('is safe to call when nothing is connected', async () => {
     await expect(disconnectAll()).resolves.toBeUndefined();
+  });
+});
+
+function createDeferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+describe('concurrent provider lifecycle serialization', () => {
+  it('counterexample: coalesces 7 concurrent ensureProviderConnected calls into a single provider connect & relay wire', async () => {
+    const connectGate = createDeferred<void>();
+    mockConnect.mockImplementationOnce(() => connectGate.promise);
+
+    const calls = Array.from({ length: 7 }, () => ensureProviderConnected('codex-sdk', {}));
+    await vi.waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+    });
+
+    connectGate.resolve();
+    const results = await Promise.all(calls);
+
+    expect(MockCodexSdkProvider).toHaveBeenCalledTimes(1);
+    expect(mockConnect).toHaveBeenCalledTimes(1);
+    expect(mockWireProviderToRelay).toHaveBeenCalledTimes(1);
+    expect(mockDisconnect).not.toHaveBeenCalled();
+    expect(getAllProviders().filter((p) => p.id === 'codex-sdk')).toHaveLength(1);
+    for (const provider of results) {
+      expect(provider).toBe(results[0]);
+    }
+
+    // Fast path when idle and already connected returns the cached instance without re-connecting.
+    const fast = await ensureProviderConnected('codex-sdk', {});
+    expect(fast).toBe(results[0]);
+    expect(mockConnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('serializes concurrent connectProvider calls so superseded instances are cleanly disconnected', async () => {
+    const firstGate = createDeferred<void>();
+    const secondGate = createDeferred<void>();
+    mockConnect
+      .mockImplementationOnce(() => firstGate.promise)
+      .mockImplementationOnce(() => secondGate.promise);
+
+    const p1 = connectProvider('codex-sdk', { ...CONFIG, apiKey: 'first' });
+    const p2 = connectProvider('codex-sdk', { ...CONFIG, apiKey: 'second' });
+
+    await vi.waitFor(() => {
+      expect(MockCodexSdkProvider).toHaveBeenCalledTimes(1);
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+    });
+
+    firstGate.resolve();
+    await p1;
+
+    await vi.waitFor(() => {
+      expect(mockDisconnect).toHaveBeenCalledTimes(1);
+      expect(MockCodexSdkProvider).toHaveBeenCalledTimes(2);
+      expect(mockConnect).toHaveBeenCalledTimes(2);
+    });
+
+    secondGate.resolve();
+    await p2;
+
+    const firstInstance = MockCodexSdkProvider.mock.results[0]!.value;
+    const secondInstance = MockCodexSdkProvider.mock.results[1]!.value;
+    expect(getProvider('codex-sdk')).toBe(secondInstance);
+    expect(getAllProviders().filter((p) => p.id === 'codex-sdk')).toHaveLength(1);
+    expect(firstInstance).not.toBe(secondInstance);
+  });
+
+  it('disconnectProvider and disconnectAll wait for mid-flight connectProvider and leave no leaked provider', async () => {
+    const gate1 = createDeferred<void>();
+    mockConnect.mockImplementationOnce(() => gate1.promise);
+
+    const connecting = connectProvider('codex-sdk', CONFIG);
+    await vi.waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+    });
+
+    const disconnecting = disconnectProvider('codex-sdk');
+    gate1.resolve();
+    await Promise.all([connecting, disconnecting]);
+
+    expect(mockDisconnect).toHaveBeenCalledTimes(1);
+    expect(getProvider('codex-sdk')).toBeUndefined();
+
+    // Repeat with disconnectAll() while a connect is mid-flight.
+    const gate2 = createDeferred<void>();
+    mockConnect.mockImplementationOnce(() => gate2.promise);
+    const connecting2 = ensureProviderConnected('codex-sdk', CONFIG);
+    await vi.waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledTimes(2);
+    });
+
+    const disconnectingAll = disconnectAll();
+    gate2.resolve();
+    const [, ] = await Promise.all([connecting2, disconnectingAll]);
+
+    expect(mockDisconnect).toHaveBeenCalledTimes(2);
+    expect(getProvider('codex-sdk')).toBeUndefined();
+    expect(getAllProviders()).toEqual([]);
+  });
+
+  it('invalidates ensure coalescer across queued disconnectProvider and explicit connectProvider boundaries', async () => {
+    const ensure1Gate = createDeferred<void>();
+    mockConnect.mockImplementationOnce(() => ensure1Gate.promise);
+
+    const ensure1 = ensureProviderConnected('codex-sdk', { ...CONFIG, apiKey: 'first' });
+    await vi.waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+    });
+
+    const queuedDisconnect = disconnectProvider('codex-sdk');
+    // Arriving after disconnectProvider is queued must NOT reuse ensure1's about-to-be-disconnected instance.
+    const ensure2 = ensureProviderConnected('codex-sdk', { ...CONFIG, apiKey: 'after-disconnect' });
+
+    ensure1Gate.resolve();
+    const [firstProvider, secondProvider] = await Promise.all([ensure1, ensure2, queuedDisconnect]).then(([a, b]) => [a, b]);
+
+    expect(firstProvider).not.toBe(secondProvider);
+    expect(mockDisconnect).toHaveBeenCalledTimes(1);
+    expect(getProvider('codex-sdk')).toBe(secondProvider);
+
+    // Same boundary guarantee across explicit connectProvider(id, newConfig):
+    const ensure3Gate = createDeferred<void>();
+    mockConnect.mockImplementationOnce(() => ensure3Gate.promise);
+    await disconnectProvider('codex-sdk');
+    vi.clearAllMocks();
+
+    mockConnect.mockImplementationOnce(() => ensure3Gate.promise);
+    const ensure3 = ensureProviderConnected('codex-sdk', { ...CONFIG, apiKey: 'old' });
+    await vi.waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledTimes(1);
+    });
+    const explicitReconnect = connectProvider('codex-sdk', { ...CONFIG, apiKey: 'new' });
+    const ensure4 = ensureProviderConnected('codex-sdk', { ...CONFIG, apiKey: 'caller' });
+
+    ensure3Gate.resolve();
+    const [pOld, pNew] = await Promise.all([ensure3, ensure4, explicitReconnect]).then(([a, b]) => [a, b]);
+
+    expect(pOld).not.toBe(pNew);
+    expect(mockDisconnect).toHaveBeenCalledTimes(1);
+    expect(getProvider('codex-sdk')).toBe(pNew);
+  });
+
+  it('cleans up failed connect attempts and allows subsequent ensureProviderConnected calls to recover', async () => {
+    mockConnect.mockRejectedValueOnce(new Error('spawn failed'));
+
+    await expect(ensureProviderConnected('codex-sdk', CONFIG)).rejects.toThrow('spawn failed');
+    expect(mockDisconnect).toHaveBeenCalledTimes(1);
+    expect(getProvider('codex-sdk')).toBeUndefined();
+    expect(mockWireProviderToRelay).not.toHaveBeenCalled();
+
+    const recovered = await ensureProviderConnected('codex-sdk', CONFIG);
+    expect(recovered).toBeDefined();
+    expect(getProvider('codex-sdk')).toBe(recovered);
+    expect(mockConnect).toHaveBeenCalledTimes(2);
+    expect(mockWireProviderToRelay).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not serialize unrelated provider ids behind a pending connect', async () => {
+    const codexGate = createDeferred<void>();
+    mockConnect.mockImplementationOnce(() => codexGate.promise);
+
+    const codexPending = ensureProviderConnected('codex-sdk', CONFIG);
+    await vi.waitFor(() => {
+      expect(MockCodexSdkProvider).toHaveBeenCalledTimes(1);
+    });
+
+    const openCodeReady = await ensureProviderConnected('opencode-sdk', CONFIG);
+    expect(openCodeReady.id).toBe('opencode-sdk');
+    expect(getProvider('opencode-sdk')).toBe(openCodeReady);
+    expect(getProvider('codex-sdk')).toBeUndefined();
+
+    codexGate.resolve();
+    const codexReady = await codexPending;
+    expect(codexReady.id).toBe('codex-sdk');
   });
 });

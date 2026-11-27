@@ -11,6 +11,20 @@ import { clearTransportRestoreBackoffForProvider } from './transport-restore-bac
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
 const providers = new Map<string, TransportProvider>();
+const providerOps = new Map<string, Promise<void>>();
+const pendingEnsureConnects = new Map<string, Promise<TransportProvider>>();
+
+function runSerialized<T>(id: string, fn: () => Promise<T>): Promise<T> {
+  const prev = providerOps.get(id) ?? Promise.resolve();
+  const task = prev.catch(() => {}).then(fn);
+  const tail = task.then(() => undefined, () => undefined).finally(() => {
+    if (providerOps.get(id) === tail) {
+      providerOps.delete(id);
+    }
+  });
+  providerOps.set(id, tail);
+  return task;
+}
 
 /** ServerLink reference for sync pipeline — set by daemon startup. */
 let _serverLink: { send(msg: object): void } | null = null;
@@ -25,22 +39,41 @@ export function getAllProviders(): TransportProvider[] {
 }
 
 export async function ensureProviderConnected(id: string, config: ProviderConfig = {}): Promise<TransportProvider> {
-  const existing = providers.get(id);
-  if (existing) return existing;
-  await connectProvider(id, config);
-  const connected = providers.get(id);
-  if (!connected) throw new Error(`Provider failed to connect: ${id}`);
-  return connected;
+  if (!providerOps.has(id) && providers.has(id)) {
+    return providers.get(id)!;
+  }
+  const inFlight = pendingEnsureConnects.get(id);
+  if (inFlight) return inFlight;
+
+  const pending = runSerialized(id, async () => {
+    const current = providers.get(id);
+    if (current) return current;
+    await connectProviderUnlocked(id, config);
+    const connected = providers.get(id);
+    if (!connected) throw new Error(`Provider failed to connect: ${id}`);
+    return connected;
+  }).finally(() => {
+    if (pendingEnsureConnects.get(id) === pending) {
+      pendingEnsureConnects.delete(id);
+    }
+  });
+  pendingEnsureConnects.set(id, pending);
+  return pending;
 }
 
-export async function connectProvider(id: string, config: ProviderConfig): Promise<void> {
+async function connectProviderUnlocked(id: string, config: ProviderConfig): Promise<void> {
   // If already connected, disconnect first
   if (providers.has(id)) {
-    await disconnectProvider(id);
+    await disconnectProviderUnlocked(id);
   }
 
   const provider = await createProvider(id, config);
-  await provider.connect(config);
+  try {
+    await provider.connect(config);
+  } catch (err) {
+    await provider.disconnect().catch(() => {});
+    throw err;
+  }
   providers.set(id, provider);
   // A reconnected provider may now be able to do what it could not before.
   clearTransportRestoreBackoffForProvider(id);
@@ -70,19 +103,35 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
   }
 }
 
-export async function disconnectProvider(id: string): Promise<void> {
+export function connectProvider(id: string, config: ProviderConfig): Promise<void> {
+  // Invalidate any older ensureProviderConnected coalescer so subsequent ensure callers
+  // wait behind this explicit reconnect rather than resolving with a superseded instance.
+  pendingEnsureConnects.delete(id);
+  return runSerialized(id, () => connectProviderUnlocked(id, config));
+}
+
+async function disconnectProviderUnlocked(id: string): Promise<void> {
   const provider = providers.get(id);
   if (!provider) return;
-  await provider.disconnect();
-  providers.delete(id);
-  broadcastProviderStatus(id, false);
-  logger.info({ provider: id }, 'Provider disconnected');
+  try {
+    await provider.disconnect();
+  } finally {
+    providers.delete(id);
+    broadcastProviderStatus(id, false);
+    logger.info({ provider: id }, 'Provider disconnected');
+  }
+}
+
+export function disconnectProvider(id: string): Promise<void> {
+  // Invalidate any older ensureProviderConnected coalescer so subsequent ensure callers
+  // see the post-disconnect boundary rather than reusing a about-to-be-disconnected handle.
+  pendingEnsureConnects.delete(id);
+  return runSerialized(id, () => disconnectProviderUnlocked(id));
 }
 
 export async function disconnectAll(): Promise<void> {
-  for (const [id] of providers) {
-    await disconnectProvider(id);
-  }
+  const ids = new Set([...providers.keys(), ...providerOps.keys()]);
+  await Promise.all([...ids].map((id) => disconnectProvider(id)));
 }
 
 async function createProvider(id: string, config: ProviderConfig): Promise<TransportProvider> {

@@ -8990,3 +8990,78 @@ describe('Codex context budget protects IM.codes system and supervision instruct
     expect(tail).not.toContain('injected context truncated');
   });
 });
+
+describe('CodexSdkProvider normalChannel startup serialization', () => {
+  afterEach(async () => {
+    childProcessMock.setHoldInitialize(false);
+    childProcessMock.releaseHeldInitializes();
+    await disconnectActiveCodexProviders();
+  });
+
+  it('serializes concurrent connect() calls on the same CodexSdkProvider without leaking child processes', async () => {
+    const provider = createCodexProvider();
+    const startIdx = childProcessMock.children.length;
+    childProcessMock.setHoldInitialize(true);
+
+    const p1 = provider.connect({ binaryPath: 'codex' });
+    const p2 = provider.connect({ binaryPath: 'codex' });
+
+    await waitForCondition(() => childProcessMock.children.length === startIdx + 1);
+    await new Promise<void>((r) => realSetImmediate(r));
+    expect(childProcessMock.children.slice(startIdx)).toHaveLength(1);
+
+    childProcessMock.setHoldInitialize(false);
+    childProcessMock.releaseHeldInitializes();
+    await Promise.all([p1, p2]);
+
+    const spawned = childProcessMock.children.slice(startIdx);
+    expect(spawned).toHaveLength(2);
+    expect(spawned[0]!.child.killed).toBe(true);
+    expect(spawned[1]!.child.killed).toBe(false);
+  });
+
+  it('serializes concurrent restartAppServerPreservingSessions against in-flight connect() on normalChannel', async () => {
+    const provider = createCodexProvider();
+    const startIdx = childProcessMock.children.length;
+    childProcessMock.setHoldInitialize(true);
+
+    const connectPromise = provider.connect({ binaryPath: 'codex' });
+    await waitForCondition(() => childProcessMock.children.length === startIdx + 1);
+
+    (provider as unknown as { config: Record<string, unknown> }).config = { binaryPath: 'codex' };
+    const restartPromise = (provider as unknown as {
+      restartAppServerPreservingSessions(reason: string): Promise<void>;
+    }).restartAppServerPreservingSessions('concurrent-connect-restart');
+
+    await new Promise<void>((r) => realSetImmediate(r));
+    expect(childProcessMock.children.slice(startIdx)).toHaveLength(1);
+
+    childProcessMock.setHoldInitialize(false);
+    childProcessMock.releaseHeldInitializes();
+    await Promise.all([connectPromise, restartPromise]);
+
+    const spawned = childProcessMock.children.slice(startIdx);
+    expect(spawned).toHaveLength(2);
+    expect(spawned[0]!.child.killed).toBe(true);
+    expect(spawned[1]!.child.killed).toBe(false);
+  });
+
+  it('aborts queued connect() without spawning when disconnect() interrupts an in-flight connect()', async () => {
+    const provider = createCodexProvider();
+    const startIdx = childProcessMock.children.length;
+    childProcessMock.setHoldInitialize(true);
+
+    const p1 = provider.connect({ binaryPath: 'codex' });
+    const p2 = provider.connect({ binaryPath: 'codex' });
+
+    await waitForCondition(() => childProcessMock.children.length === startIdx + 1);
+    await provider.disconnect();
+
+    await expect(p1).rejects.toThrow(/disconnected/i);
+    await expect(p2).rejects.toThrow(/disconnected/i);
+    const spawned = childProcessMock.children.slice(startIdx);
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]!.child.killed).toBe(true);
+    expect(provider.getMemoryMcpStatus().connected).toBe(false);
+  });
+});

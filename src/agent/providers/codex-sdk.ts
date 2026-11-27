@@ -2762,6 +2762,7 @@ interface CodexAppServerChannel {
   cleanup: Promise<void> | null;
   generation: number;
   startInFlight: Promise<void> | null;
+  startChain: Promise<void> | null;
   disabledMcpKeys: string[];
   threadToSession: Map<string, string>;
   /** Durable threadIds currently loaded/resident in this child generation (physical residency, shared across session rebinds). */
@@ -2790,6 +2791,7 @@ function createAppServerChannel(kind: CodexAppServerChannelKind): CodexAppServer
     cleanup: null,
     generation: 0,
     startInFlight: null,
+    startChain: null,
     disabledMcpKeys: [],
     threadToSession: new Map(),
     residentThreadIds: new Set(),
@@ -2841,6 +2843,7 @@ export class CodexSdkProvider implements TransportProvider {
   private readonly nativeAgentFence = new NativeAgentFenceSlot('codex-sdk');
   private readonly normalChannel = createAppServerChannel('normal');
   private readonly incognitoChannel = createAppServerChannel('incognito');
+  private disconnectGeneration = 0;
   private get child(): ChildProcessWithoutNullStreams | null {
     return this.normalChannel.child;
   }
@@ -2907,20 +2910,41 @@ export class CodexSdkProvider implements TransportProvider {
     return sessionId;
   }
 
-  async connect(config: ProviderConfig): Promise<void> {
-    const binaryPath = this.resolveBinaryPath(config);
-    // Resolve the binary (handles npm .cmd shims on Windows) and verify it.
-    const resolved = resolveExecutableForSpawn(binaryPath);
-    await access(resolved.executable, fsConstants.X_OK).catch(async () => {
-      // Fall back to spawn-based version probe (works for things on PATH).
-      const { execFile } = await import('node:child_process');
-      await new Promise<void>((resolve, reject) => {
-        execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
-      });
+  private runChannelStart(channel: CodexAppServerChannel, fn: () => Promise<void>): Promise<void> {
+    const prev = channel.startChain ?? Promise.resolve();
+    const task = prev.catch(() => {}).then(fn);
+    const tail = task.then(() => undefined, () => undefined).finally(() => {
+      if (channel.startChain === tail) {
+        channel.startChain = null;
+      }
     });
-    await this.startChannelAppServer(this.normalChannel, binaryPath, config, { clearSessions: true });
-    this.startIdleThreadSweepTimer();
-    logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
+    channel.startChain = tail;
+    return task;
+  }
+
+  async connect(config: ProviderConfig): Promise<void> {
+    const opGen = this.disconnectGeneration;
+    await this.runChannelStart(this.normalChannel, async () => {
+      if (this.disconnectGeneration !== opGen) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server disconnected', false);
+      }
+      const binaryPath = this.resolveBinaryPath(config);
+      // Resolve the binary (handles npm .cmd shims on Windows) and verify it.
+      const resolved = resolveExecutableForSpawn(binaryPath);
+      await access(resolved.executable, fsConstants.X_OK).catch(async () => {
+        // Fall back to spawn-based version probe (works for things on PATH).
+        const { execFile } = await import('node:child_process');
+        await new Promise<void>((resolve, reject) => {
+          execFile(resolved.executable, [...resolved.prependArgs, '--version'], { windowsHide: true }, (err) => (err ? reject(err) : resolve()));
+        });
+      });
+      if (this.disconnectGeneration !== opGen) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server disconnected', false);
+      }
+      await this.startChannelAppServerUnlocked(this.normalChannel, binaryPath, config, { clearSessions: true });
+      this.startIdleThreadSweepTimer();
+      logger.info({ provider: this.id, resolved: resolved.executable, prepend: resolved.prependArgs }, 'Codex SDK provider connected via app-server');
+    });
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
@@ -3042,10 +3066,15 @@ export class CodexSdkProvider implements TransportProvider {
   }
 
   async disconnect(): Promise<void> {
+    this.disconnectGeneration += 1;
     this.stopIdleThreadSweepTimer();
     await Promise.all([
       this.stopChannelAppServer(this.normalChannel, { clearSessions: true }),
       this.stopChannelAppServer(this.incognitoChannel, { clearSessions: true }),
+    ]);
+    await Promise.all([
+      this.normalChannel.startChain?.catch(() => {}),
+      this.incognitoChannel.startChain?.catch(() => {}),
     ]);
     this.config = null;
   }
@@ -3992,6 +4021,22 @@ export class CodexSdkProvider implements TransportProvider {
     options: { clearSessions: boolean },
     allowIncognitoConfigRetry = true,
   ): Promise<void> {
+    const opGen = this.disconnectGeneration;
+    return this.runChannelStart(channel, () => {
+      if (this.disconnectGeneration !== opGen) {
+        throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Codex app-server disconnected', false);
+      }
+      return this.startChannelAppServerUnlocked(channel, binaryPath, config, options, allowIncognitoConfigRetry);
+    });
+  }
+
+  private async startChannelAppServerUnlocked(
+    channel: CodexAppServerChannel,
+    binaryPath: string,
+    config: ProviderConfig,
+    options: { clearSessions: boolean },
+    allowIncognitoConfigRetry = true,
+  ): Promise<void> {
     await this.stopChannelAppServer(channel, { clearSessions: options.clearSessions }).catch(() => {});
     // Resolve npm .cmd shims into (node.exe, [scriptPath]) so spawn works
     // without shell:true (which has its own quoting issues on Windows).
@@ -4062,7 +4107,7 @@ export class CodexSdkProvider implements TransportProvider {
           const discoveredNew = remainingEnabled.some((key) => !disabledIncognitoKeys.includes(key));
           if (allowIncognitoConfigRetry && discoveredNew) {
             channel.disabledMcpKeys = merged;
-            await this.startChannelAppServer(channel, binaryPath, config, options, false);
+            await this.startChannelAppServerUnlocked(channel, binaryPath, config, options, false);
             return;
           }
           throw new Error('Incognito session blocked: IM.codes memory MCP could not be disabled at Codex app-server boundary');
