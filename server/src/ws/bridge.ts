@@ -412,7 +412,9 @@ import {
 import {
   TASK_PAIR_TIMELINE_EVENT,
   SUBSESSION_NAME_PREFIX,
+  isAppliedVerdict,
   isAutoCreatedSubSessionName,
+  type TaskPairVerdictJudgement,
 } from '../../../shared/task-pair.js';
 import { TASK_PAIR_CLOSE_MSG } from '../../../shared/task-pair-close.js';
 import { TASK_PAIR_BRIEF_MSG } from '../../../shared/task-pair-brief.js';
@@ -421,8 +423,6 @@ import {
   isGlobalTaskTerminalStatus,
   normalizeGlobalTaskAuditSummary,
 } from '../../../shared/global-task-mode.js';
-import { buildGlobalTaskAuditSummary } from '../../../shared/task-pair-brief.js';
-import type { TaskPairLastVerdict, TaskPairSeverityCounts } from '../../../shared/task-pair.js';
 import {
   upsertGlobalTaskSummariesBatchChanges,
   upsertGlobalTaskSummaryWithChange,
@@ -16347,7 +16347,10 @@ export class WsBridge {
     const liveSummary = typeof task.currentAction === 'string' && task.currentAction.trim()
       ? task.currentAction.trim()
       : (typeof pair.blockedNote === 'string' && pair.blockedNote.trim() ? pair.blockedNote.trim() : undefined);
-    const consoleAudit = normalizeGlobalTaskAuditSummary(pair.lastAudit);
+    const hasLastAuditField = Object.prototype.hasOwnProperty.call(pair, 'lastAudit');
+    const consoleAudit = hasLastAuditField
+      ? (pair.lastAudit === null ? null : (normalizeGlobalTaskAuditSummary(pair.lastAudit) ?? null))
+      : undefined;
     return {
       serverId: this.serverId,
       taskId,
@@ -16368,7 +16371,7 @@ export class WsBridge {
       auditorModel: typeof pair.auditorModel === 'string' ? pair.auditorModel : undefined,
       auditor: typeof pair.auditor === 'string' ? pair.auditor : undefined,
       liveSummary,
-      ...(consoleAudit ? { lastAudit: consoleAudit } : {}),
+      ...(consoleAudit !== undefined ? { lastAudit: consoleAudit } : {}),
       startedAt: typeof pair.startedAt === 'number'
         ? pair.startedAt
         : (typeof task.startedAt === 'number' ? task.startedAt : undefined),
@@ -16410,36 +16413,28 @@ export class WsBridge {
           ? (payload.checklist as Record<string, unknown>)
           : null;
         const verbUpper = typeof payload.verb === 'string' ? payload.verb.trim().toUpperCase() : '';
-        const eventBlocking = Array.isArray(payload.blocking)
-          ? payload.blocking.filter((b): b is string => typeof b === 'string')
+        const effectStr = typeof payload.effect === 'string' ? payload.effect.trim() : '';
+        const judgementRaw = typeof payload.verdictJudgement === 'string'
+          ? payload.verdictJudgement.trim() as TaskPairVerdictJudgement
           : undefined;
-        let eventLastAudit = normalizeGlobalTaskAuditSummary(payload.lastAudit);
-        if (!eventLastAudit && (verbUpper === 'PASS' || verbUpper === 'REWORK')) {
-          const countsObj = (payload.severityCounts && typeof payload.severityCounts === 'object')
-            ? payload.severityCounts as Partial<TaskPairSeverityCounts & Record<string, unknown>>
-            : undefined;
-          const syntheticVerdict: TaskPairLastVerdict = {
-            verb: verbUpper,
-            counts: {
-              P0: Number(countsObj?.P0 ?? countsObj?.p0 ?? 0) || 0,
-              P1: Number(countsObj?.P1 ?? countsObj?.p1 ?? 0) || 0,
-              P2: Number(countsObj?.P2 ?? countsObj?.p2 ?? 0) || 0,
-              P3: Number(countsObj?.P3 ?? countsObj?.p3 ?? 0) || 0,
-              P4: Number(countsObj?.P4 ?? countsObj?.p4 ?? 0) || 0,
-            },
-            judgement: 'consistent',
-            round: typeof payload.round === 'number' ? payload.round : 0,
-            ...(typeof payload.noticeText === 'string' ? { noticeText: payload.noticeText } : {}),
-            ...(payload.auditDetails && typeof payload.auditDetails === 'object'
-              ? { auditDetails: payload.auditDetails as TaskPairLastVerdict['auditDetails'] }
-              : {}),
-          };
-          eventLastAudit = buildGlobalTaskAuditSummary(syntheticVerdict, eventBlocking);
-        }
+        const isVerdictVerb = verbUpper === 'PASS' || verbUpper === 'REWORK';
+        const verdictRejectedOrHeld = isVerdictVerb && (
+          effectStr === 'recorded'
+          || effectStr === 'verdict_held'
+          || (judgementRaw !== undefined && !isAppliedVerdict(judgementRaw))
+        );
+        const hasExplicitLastAuditKey = Object.prototype.hasOwnProperty.call(payload, 'lastAudit');
+        const normalizedEventAudit = normalizeGlobalTaskAuditSummary(payload.lastAudit);
+        const appliedAuditClear = (hasExplicitLastAuditKey && payload.lastAudit === null && (effectStr === 'next_round' || effectStr === 'reopened'))
+          || (verbUpper === 'NEXT_ROUND' && effectStr === 'next_round')
+          || effectStr === 'reopened';
+        const eventLastAudit = !verdictRejectedOrHeld && normalizedEventAudit
+          ? normalizedEventAudit
+          : undefined;
         const liveSummary = typeof payload.blockedNote === 'string' && payload.blockedNote.trim()
           ? payload.blockedNote.trim()
           : (eventLastAudit?.summary
-            || (typeof payload.noticeText === 'string' && payload.noticeText.trim()
+            || (!verdictRejectedOrHeld && typeof payload.noticeText === 'string' && payload.noticeText.trim()
               ? payload.noticeText.trim().slice(0, 240)
               : undefined));
         const { row: saved, changed } = await upsertGlobalTaskSummaryWithChange(db, {
@@ -16464,7 +16459,7 @@ export class WsBridge {
           auditorModel: typeof payload.auditorModel === 'string' ? payload.auditorModel : undefined,
           auditor: typeof payload.auditor === 'string' ? payload.auditor : undefined,
           liveSummary,
-          ...(verbUpper === 'NEXT_ROUND'
+          ...(appliedAuditClear
             ? { lastAudit: null }
             : (eventLastAudit ? { lastAudit: eventLastAudit } : {})),
           startedAt: typeof payload.startedAt === 'number'

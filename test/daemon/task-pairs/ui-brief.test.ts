@@ -207,4 +207,116 @@ describe('TaskPairService.getPairBriefForUi', () => {
     expect(briefRes.lastAudit!.findings[1]!.summary).toContain(tailSentinel);
     expect(briefRes.lastAudit!.findings[1]!.proposal).toContain(tailProposal);
   });
+
+  it('does not project unapplied/held verdicts to brief or timeline events, and clears lastAudit on applied NEXT_ROUND', async () => {
+    const { timelineEmitter } = await import('../../../src/daemon/timeline-emitter.js');
+    const emitted: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    const off = timelineEmitter.on((ev) => {
+      if (ev.sessionId === BRAIN && ev.type === 'task_pair.event') {
+        emitted.push({ type: ev.type, payload: ev.payload });
+      }
+    });
+    try {
+      service.applyMarker({
+        project: PROJECT,
+        writer: BRAIN,
+        marker: {
+          verb: 'DISPATCH',
+          knownVerb: 'DISPATCH',
+          taskId: 'tsk_held_flow',
+          attrs: { executor: EXEC, auditor: AUD, title: 'Held Verdict Lifecycle' },
+          brief: '- [x][ ] 1. Task',
+        },
+        source: 'mcp',
+        eventId: 'ev-held-dispatch',
+        suppressAutomaticBrief: true,
+      });
+
+      service.applyMarker({
+        project: PROJECT,
+        writer: EXEC,
+        marker: {
+          verb: 'READY_FOR_AUDIT',
+          knownVerb: 'READY_FOR_AUDIT',
+          taskId: 'tsk_held_flow',
+          attrs: { path: '/tmp/dir' },
+        },
+        source: 'timeline',
+        eventId: 'ev-held-ready',
+      });
+
+      // Inconsistent PASS (with p0=1) is held -> brief.lastAudit must be undefined & event must NOT emit lastAudit
+      const heldTransition = service.applyMarker({
+        project: PROJECT,
+        writer: AUD,
+        marker: {
+          verb: 'PASS',
+          knownVerb: 'PASS',
+          taskId: 'tsk_held_flow',
+          attrs: { p0: '1' },
+        },
+        source: 'timeline',
+        turnText: '[P0] Still failing check\n<!-- IMCODES_TASK PASS tsk_held_flow p0=1 -->',
+        eventId: 'ev-held-pass',
+      });
+      expect(heldTransition.effect).toBe('verdict_held');
+      expect(service.getPairBriefForUi('tsk_held_flow').lastAudit).toBeUndefined();
+      expect(emitted.at(-1)?.payload.effect).toBe('verdict_held');
+      expect(emitted.at(-1)?.payload.lastAudit).toBeUndefined();
+
+      // Rejected NEXT_ROUND while in_audit (effect=recorded) must NOT clear audit state
+      const rejectedNext = service.applyMarker({
+        project: PROJECT,
+        writer: BRAIN,
+        marker: {
+          verb: 'NEXT_ROUND',
+          knownVerb: 'NEXT_ROUND',
+          taskId: 'tsk_held_flow',
+          attrs: {},
+        },
+        source: 'mcp',
+        eventId: 'ev-rejected-next-round',
+      });
+      expect(rejectedNext.effect).toBe('recorded');
+      expect(emitted.at(-1)?.payload.lastAudit).toBeUndefined();
+
+      // Applied PASS emits consistent lastAudit
+      const passTransition = service.applyMarker({
+        project: PROJECT,
+        writer: AUD,
+        marker: {
+          verb: 'PASS',
+          knownVerb: 'PASS',
+          taskId: 'tsk_held_flow',
+          attrs: { p0: '0' },
+        },
+        source: 'timeline',
+        turnText: 'Summary: Clean pass.\n<!-- IMCODES_TASK PASS tsk_held_flow p0=0 -->',
+        eventId: 'ev-applied-pass',
+      });
+      expect(passTransition.effect).toBe('verdict');
+      expect(service.getPairBriefForUi('tsk_held_flow').lastAudit?.verb).toBe('PASS');
+      expect(emitted.at(-1)?.payload.lastAudit).toMatchObject({ verb: 'PASS', round: 1, blockingCount: 0 });
+
+      // Applied NEXT_ROUND emits explicit lastAudit: null and clears getPairBriefForUi().lastAudit
+      const nextRound = service.applyMarker({
+        project: PROJECT,
+        writer: BRAIN,
+        marker: {
+          verb: 'NEXT_ROUND',
+          knownVerb: 'NEXT_ROUND',
+          taskId: 'tsk_held_flow',
+          attrs: {},
+        },
+        source: 'mcp',
+        eventId: 'ev-applied-next-round',
+      });
+      expect(nextRound.effect).toBe('next_round');
+      expect(service.getPairBriefForUi('tsk_held_flow').lastAudit).toBeUndefined();
+      expect(emitted.at(-1)?.payload.effect).toBe('next_round');
+      expect(emitted.at(-1)?.payload.lastAudit).toBeNull();
+    } finally {
+      off();
+    }
+  });
 });

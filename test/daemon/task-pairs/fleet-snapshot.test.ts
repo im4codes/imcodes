@@ -302,4 +302,27 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
     expect(blockedPair?.liveSummary).toBe('SSH target unreachable on port 2222');
     expect(blockedPair?.lastAudit?.blockingCount).toBe(1);
   });
+
+  it('omits lastAudit and held noticeText on fleet snapshot when lastVerdict is inconsistent/held', () => {
+    store.savePair('proj', makePairState({
+      taskId: 'tsk_held_pass',
+      status: 'in_audit',
+      round: 4,
+      blocking: ['P0'],
+      lastVerdict: {
+        verb: 'PASS',
+        counts: { P0: 1, P1: 0, P2: 0, P3: 0, P4: 0 },
+        judgement: 'inconsistent',
+        round: 4,
+        noticeText: 'Held PASS should not display as Passed',
+      },
+      updatedAt: 9_800,
+    }));
+
+    const frame = buildGlobalTaskFleetSnapshotPayload(10_000);
+    const heldPair = frame.pairs.find((p) => p.taskId === 'tsk_held_pass');
+    expect(heldPair?.status).toBe('in_audit');
+    expect(heldPair?.lastAudit).toBeUndefined();
+    expect(heldPair?.liveSummary).toBeUndefined();
+  });
 });

@@ -1780,4 +1780,202 @@ describe('global-task-mode server engine', () => {
     });
     expect(cleared?.lastAudit).toBeUndefined();
   });
+
+  it('ignores rejected/held PASS events and unapplied NEXT_ROUND in bridge ingest while honoring applied PASS, fleet_snapshot, and applied NEXT_ROUND', async () => {
+    const bridge = new WsBridge('srv-a') as unknown as {
+      db: Database;
+      ingestGlobalTaskFleetSnapshot(db: Database, msg: Record<string, unknown>): Promise<void>;
+      ingestGlobalTaskFrame(db: Database, msg: Record<string, unknown>): Promise<void>;
+    };
+    bridge.db = db;
+
+    const reworkAudit = {
+      verb: 'REWORK' as const,
+      round: 2,
+      counts: { p0: 1, p1: 0, p2: 0, p3: 0, p4: 0 },
+      blocking: ['P0'],
+      blockingCount: 1,
+      findingsCount: 1,
+      summary: 'One P0 remains in R2.',
+    };
+
+    // 1. Seed applied R2 REWORK via event
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 1000,
+        payload: {
+          taskId: 'tsk_bridge_consistency',
+          projectName: 'imcodes',
+          title: 'Bridge Verdict Consistency',
+          verb: 'REWORK',
+          effect: 'verdict',
+          toStatus: 'rework',
+          round: 2,
+          lastAudit: reworkAudit,
+        },
+      },
+    });
+    let row = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_bridge_consistency');
+    expect(row?.lastAudit).toEqual(reworkAudit);
+
+    // 2. Rejected / held PASS event (effect=verdict_held or effect=recorded, or verdictJudgement=inconsistent) MUST NOT overwrite lastAudit or liveSummary
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 2000,
+        payload: {
+          taskId: 'tsk_bridge_consistency',
+          verb: 'PASS',
+          effect: 'verdict_held',
+          verdictJudgement: 'inconsistent',
+          toStatus: 'in_audit',
+          round: 3,
+          noticeText: 'Bogus held PASS text',
+          lastAudit: { ...reworkAudit, verb: 'PASS', round: 3, blockingCount: 0, counts: { p0: 0, p1: 0, p2: 0, p3: 0, p4: 0 } },
+        },
+      },
+    });
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 2100,
+        payload: {
+          taskId: 'tsk_bridge_consistency',
+          verb: 'PASS',
+          effect: 'recorded',
+          toStatus: 'in_audit',
+          round: 3,
+          noticeText: 'Unauthorized PASS marker recorded only',
+        },
+      },
+    });
+    row = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_bridge_consistency');
+    expect(row?.status).toBe('in_audit');
+    expect(row?.lastAudit).toEqual(reworkAudit);
+    expect(row?.liveSummary).toBe('One P0 remains in R2.');
+
+    // 3. Unapplied NEXT_ROUND (effect=recorded) MUST NOT clear lastAudit
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 2200,
+        payload: {
+          taskId: 'tsk_bridge_consistency',
+          verb: 'NEXT_ROUND',
+          effect: 'recorded',
+          toStatus: 'in_audit',
+          round: 3,
+          lastAudit: null,
+        },
+      },
+    });
+    row = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_bridge_consistency');
+    expect(row?.lastAudit).toEqual(reworkAudit);
+
+    // 4. Legacy daemon bare PASS without payload.lastAudit MUST NOT fabricate Passed
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 2300,
+        payload: {
+          taskId: 'tsk_legacy_bare',
+          projectName: 'imcodes',
+          title: 'Legacy Bare Event',
+          verb: 'PASS',
+          effect: 'verdict',
+          toStatus: 'passed',
+          round: 1,
+          noticeText: 'Legacy daemon plain PASS summary.',
+        },
+      },
+    });
+    const legacyRow = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_legacy_bare');
+    expect(legacyRow?.lastAudit).toBeUndefined();
+    expect(legacyRow?.liveSummary).toBe('Legacy daemon plain PASS summary.');
+
+    // 5. Applied PASS event + matching fleet_snapshot update consistently to Passed
+    const passAudit = {
+      verb: 'PASS' as const,
+      round: 3,
+      counts: { p0: 0, p1: 0, p2: 0, p3: 0, p4: 0 },
+      blocking: ['P0'],
+      blockingCount: 0,
+      findingsCount: 0,
+      summary: 'Clean R3 PASS.',
+    };
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 3000,
+        payload: {
+          taskId: 'tsk_bridge_consistency',
+          verb: 'PASS',
+          effect: 'verdict',
+          verdictJudgement: 'consistent',
+          toStatus: 'passed',
+          round: 3,
+          lastAudit: passAudit,
+        },
+      },
+    });
+    row = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_bridge_consistency');
+    expect(row?.status).toBe('passed');
+    expect(row?.lastAudit).toEqual(passAudit);
+
+    // 6. Applied NEXT_ROUND (effect=next_round, lastAudit=null) clears lastAudit, and fleet_snapshot preserves clear
+    await bridge.ingestGlobalTaskFrame(db, {
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        type: 'task_pair.event',
+        sessionId: 'deck_proj_brain',
+        ts: 4000,
+        payload: {
+          taskId: 'tsk_bridge_consistency',
+          verb: 'NEXT_ROUND',
+          effect: 'next_round',
+          toStatus: 'working',
+          round: 3,
+          lastAudit: null,
+        },
+      },
+    });
+    row = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_bridge_consistency');
+    expect(row?.status).toBe('working');
+    expect(row?.lastAudit).toBeUndefined();
+
+    await bridge.ingestGlobalTaskFleetSnapshot(db, {
+      type: GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
+      pairs: [
+        {
+          taskId: 'tsk_bridge_consistency',
+          brain: 'deck_proj_brain',
+          projectName: 'imcodes',
+          title: 'Bridge Verdict Consistency',
+          status: 'rework',
+          flags: [],
+          round: 4,
+          checklist: { total: 1, implemented: 1, audited: 0 },
+          lastAudit: { ...reworkAudit, round: 4, summary: 'R4 rework from fleet.' },
+          createdAt: 1000,
+          updatedAt: 5000,
+        },
+      ],
+    });
+    row = await getGlobalTaskSummaryForServerTask(db, 'srv-a', 'tsk_bridge_consistency');
+    expect(row?.lastAudit?.round).toBe(4);
+    expect(row?.lastAudit?.summary).toBe('R4 rework from fleet.');
+  });
 });

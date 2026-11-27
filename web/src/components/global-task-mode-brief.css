@@ -839,6 +839,25 @@
   overflow-wrap: anywhere;
 }
 
+.global-task-audit-raw-toggle {
+  border-radius: 9px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  background: rgba(15, 23, 42, 0.54);
+  padding: 6px 10px;
+}
+
+.global-task-audit-raw-toggle > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  color: #93c5fd;
+  user-select: none;
+}
+
+.global-task-audit-raw-toggle[open] > summary {
+  margin-bottom: 8px;
+}
+
 .global-task-audit-tab-count {
   margin-inline-start: 4px;
   padding: 0 5px;

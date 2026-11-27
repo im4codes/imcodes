@@ -308,8 +308,25 @@ export function GlobalTaskBriefModal({
   const implPct = total > 0 ? Math.round((implDone / total) * 100) : 0;
   const auditPct = total > 0 ? Math.round((auditDone / total) * 100) : 0;
   const hasBriefOk = Boolean(activeBrief?.ok);
-  const detailAudit: GlobalTaskAuditDetail | undefined = activeBrief?.ok ? activeBrief.lastAudit : undefined;
   const cachedAudit: GlobalTaskAuditSummary | undefined = task.lastAudit;
+  const rawDetailAudit: GlobalTaskAuditDetail | undefined = briefIsFresh && activeBrief?.ok
+    ? activeBrief.lastAudit
+    : undefined;
+  const detailMatchesCard = Boolean(
+    rawDetailAudit
+    && (!cachedAudit || (
+      rawDetailAudit.round === cachedAudit.round
+      && rawDetailAudit.verb === cachedAudit.verb
+      && rawDetailAudit.counts.p0 === cachedAudit.counts.p0
+      && rawDetailAudit.counts.p1 === cachedAudit.counts.p1
+      && rawDetailAudit.counts.p2 === cachedAudit.counts.p2
+      && rawDetailAudit.counts.p3 === cachedAudit.counts.p3
+      && rawDetailAudit.counts.p4 === cachedAudit.counts.p4
+      && rawDetailAudit.blockingCount === cachedAudit.blockingCount
+    ))
+    && !(!cachedAudit && rawDetailAudit.verb === 'PASS' && (task.status === 'working' || task.status === 'queued')),
+  );
+  const detailAudit: GlobalTaskAuditDetail | undefined = detailMatchesCard ? rawDetailAudit : undefined;
   const effectiveAudit = detailAudit ?? cachedAudit;
   const auditTabBadge = effectiveAudit
     ? (effectiveAudit.blockingCount > 0 ? effectiveAudit.blockingCount : effectiveAudit.findingsCount)
@@ -398,60 +415,70 @@ export function GlobalTaskBriefModal({
 
         {detailAudit ? (
           detailAudit.findings.length > 0 ? (
-            <div class="global-task-audit-findings-list" data-testid="global-task-audit-findings-list">
-              {detailAudit.findings.map((finding) => {
-                const sevClass = finding.severity ? ` is-${finding.severity.toLowerCase()}` : '';
-                return (
-                  <div
-                    key={finding.index}
-                    class={`global-task-audit-finding-card${finding.blocking ? ' is-blocking' : ''}`}
-                    data-testid={`global-task-audit-finding-${finding.index}`}
-                  >
-                    <div class="global-task-audit-finding-head">
-                      <span class="global-task-audit-finding-index">{finding.index}</span>
-                      {finding.severity && (
-                        <span class={`global-task-audit-sev-pill${sevClass}`}>[{finding.severity}]</span>
+            <>
+              <div class="global-task-audit-findings-list" data-testid="global-task-audit-findings-list">
+                {detailAudit.findings.map((finding) => {
+                  const sevClass = finding.severity ? ` is-${finding.severity.toLowerCase()}` : '';
+                  return (
+                    <div
+                      key={finding.index}
+                      class={`global-task-audit-finding-card${finding.blocking ? ' is-blocking' : ''}`}
+                      data-testid={`global-task-audit-finding-${finding.index}`}
+                    >
+                      <div class="global-task-audit-finding-head">
+                        <span class="global-task-audit-finding-index">{finding.index}</span>
+                        {finding.severity && (
+                          <span class={`global-task-audit-sev-pill${sevClass}`}>[{finding.severity}]</span>
+                        )}
+                        {finding.blocking && (
+                          <span class="global-task-audit-blocking-tag">
+                            {t('taskMode.audit_blocking_tag', 'Blocking')}
+                          </span>
+                        )}
+                        {finding.location && (
+                          <code class="global-task-audit-finding-location">{finding.location}</code>
+                        )}
+                      </div>
+                      {finding.summary && (
+                        <div class="global-task-audit-finding-desc">{finding.summary}</div>
                       )}
-                      {finding.blocking && (
-                        <span class="global-task-audit-blocking-tag">
-                          {t('taskMode.audit_blocking_tag', 'Blocking')}
-                        </span>
+                      {finding.invariant && (
+                        <div class="global-task-audit-finding-sub">
+                          <span class="global-task-audit-meta-label">{t('taskMode.audit_label_invariant', 'Invariant')}:</span>
+                          <span>{finding.invariant}</span>
+                        </div>
                       )}
-                      {finding.location && (
-                        <code class="global-task-audit-finding-location">{finding.location}</code>
+                      {finding.evidence && (
+                        <div class="global-task-audit-finding-sub">
+                          <span class="global-task-audit-meta-label">{t('taskMode.audit_label_evidence', 'Evidence')}:</span>
+                          <span>{finding.evidence}</span>
+                        </div>
+                      )}
+                      {finding.proposal && (
+                        <div class="global-task-audit-finding-proposal">
+                          <span class="global-task-audit-meta-label">{t('taskMode.audit_label_proposal', 'Fix proposal')}:</span>
+                          <span>{finding.proposal}</span>
+                        </div>
+                      )}
+                      {finding.tradeoffs && (
+                        <div class="global-task-audit-finding-sub">
+                          <span class="global-task-audit-meta-label">{t('taskMode.audit_label_tradeoffs', 'Trade-offs')}:</span>
+                          <span>{finding.tradeoffs}</span>
+                        </div>
                       )}
                     </div>
-                    {finding.summary && (
-                      <div class="global-task-audit-finding-desc">{finding.summary}</div>
-                    )}
-                    {finding.invariant && (
-                      <div class="global-task-audit-finding-sub">
-                        <span class="global-task-audit-meta-label">{t('taskMode.audit_label_invariant', 'Invariant')}:</span>
-                        <span>{finding.invariant}</span>
-                      </div>
-                    )}
-                    {finding.evidence && (
-                      <div class="global-task-audit-finding-sub">
-                        <span class="global-task-audit-meta-label">{t('taskMode.audit_label_evidence', 'Evidence')}:</span>
-                        <span>{finding.evidence}</span>
-                      </div>
-                    )}
-                    {finding.proposal && (
-                      <div class="global-task-audit-finding-proposal">
-                        <span class="global-task-audit-meta-label">{t('taskMode.audit_label_proposal', 'Fix proposal')}:</span>
-                        <span>{finding.proposal}</span>
-                      </div>
-                    )}
-                    {finding.tradeoffs && (
-                      <div class="global-task-audit-finding-sub">
-                        <span class="global-task-audit-meta-label">{t('taskMode.audit_label_tradeoffs', 'Trade-offs')}:</span>
-                        <span>{finding.tradeoffs}</span>
-                      </div>
-                    )}
+                  );
+                })}
+              </div>
+              {detailAudit.noticeText && (
+                <details class="global-task-audit-raw-toggle" data-testid="global-task-audit-raw-toggle">
+                  <summary>{t('taskMode.audit_label_raw_notice', 'Full audit reply')}</summary>
+                  <div class="global-task-audit-raw-notice" data-testid="global-task-audit-raw-notice">
+                    {detailAudit.noticeText}
                   </div>
-                );
-              })}
-            </div>
+                </details>
+              )}
+            </>
           ) : detailAudit.noticeText ? (
             <div class="global-task-audit-raw-notice" data-testid="global-task-audit-raw-notice">
               <div class="global-task-audit-meta-label">{t('taskMode.audit_label_raw_notice', 'Full audit reply')}</div>

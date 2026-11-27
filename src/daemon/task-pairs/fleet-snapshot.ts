@@ -8,7 +8,7 @@ import {
   type GlobalTaskFleetSnapshotPair,
 } from '../../../shared/global-task-mode.js';
 import { buildGlobalTaskAuditSummary } from '../../../shared/task-pair-brief.js';
-import { TASK_PAIR_NO_AUDITOR } from '../../../shared/task-pair.js';
+import { isAppliedVerdict, TASK_PAIR_NO_AUDITOR } from '../../../shared/task-pair.js';
 import { isInternalSessionDisplayValue } from '../../../shared/session-display.js';
 import { taskPairChecklistCounts } from '../../../shared/task-pair-checklist.js';
 import { getSession } from '../../store/session-store.js';
@@ -44,10 +44,13 @@ export function toGlobalTaskFleetSnapshotPair(stored: StoredTaskPair): GlobalTas
   const executorModel = sessionModel(state.executor, state.executorModel);
   const auditorModel = sessionModel(state.auditor, state.auditorModel);
   const lastAudit = buildGlobalTaskAuditSummary(state.lastVerdict, state.blocking);
-  // Keep independent blockedNote; fall back to compact audit summary for legacy clients while avoiding dumping raw noticeText when structured lastAudit is present.
+  const appliedNoticeText = state.lastVerdict && isAppliedVerdict(state.lastVerdict.judgement)
+    ? state.lastVerdict.noticeText?.trim()
+    : undefined;
+  // Keep independent blockedNote; fall back to compact applied audit summary for legacy clients while avoiding dumping unapplied/raw noticeText.
   const liveSummary = state.blockedNote?.trim()
     || lastAudit?.summary
-    || state.lastVerdict?.noticeText?.trim()
+    || appliedNoticeText
     || undefined;
   const startedAt = typeof state.startedAt === 'number' && Number.isFinite(state.startedAt) && state.startedAt > 0
     ? state.startedAt

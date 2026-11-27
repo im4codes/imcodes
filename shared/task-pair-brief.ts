@@ -6,7 +6,7 @@ import {
   type GlobalTaskAuditCounts,
   type GlobalTaskAuditSummary,
 } from './global-task-mode.js';
-import type { TaskPairAuditFinding, TaskPairLastVerdict } from './task-pair.js';
+import { isAppliedVerdict, type TaskPairAuditFinding, type TaskPairLastVerdict } from './task-pair.js';
 
 export const TASK_PAIR_BRIEF_MSG = {
   REQUEST: 'task_pair.brief_request',
@@ -70,23 +70,45 @@ export interface TaskPairBriefResponse {
 
 const AUDIT_TAGGED_FINDING_RE = /^\s*(?:(?:\d+[.)、]\s*)|(?:[-*•]\s*)|(?:#{1,6}\s*)|(?:第[0-9一二三四五六七八九十]+[条项个]?\s*))*(?:\*\*|__)?(?:(?:REWORK|PASS|finding|发现|问题|audit|审计)\s*[:：]\s*)?(?:finding\s*)?\[\s*(P[0-4])\s*\](?:\*\*|__)?\s*[:：\-—]?\s*(.*)$/iu;
 const AUDIT_BARE_FINDING_RE = /^\s*(?:(?:\d+[.)、]\s*)|(?:[-*•]\s*)|(?:#{1,6}\s*))?(?:\*\*|__)?\b(P[0-4])\b(?:\*\*|__)?\s*[:：\-—]\s*(.*)$/iu;
-const AUDIT_NUMBERED_ITEM_RE = /^\s*(?:\*\*|__)?(\d{1,3})[.)、](?:\*\*|__)?\s+(.+)$/u;
+const AUDIT_NUMBERED_ITEM_RE = /^\s*(?:#{1,6}\s*)?(?:\*\*|__)?(\d{1,3})[.)、](?:\*\*|__)?\s+(.+)$/u;
 const AUDIT_BULLET_ITEM_RE = /^\s*[-*•]\s+(.+)$/u;
+const AUDIT_HEADING_OR_RULE_RE = /^\s*(?:#{1,6}\s+\S|[-*_]{3,}\s*$)/u;
 const AUDIT_SUMMARY_LINE_RE = /^\s*(?:[-*•]\s*)?(?:\*\*|__)?(?:summary|audit summary|摘要|审计摘要|总体评价|评估|结论)(?:\*\*|__)?\s*[:：]\s*(.*)$/iu;
 const AUDIT_FIELD_RE = /^\s*(?:[-*•]\s*)?(?:\*\*|__)?(?<label>invariant|violat(?:es|ed|ion)|violation\s+of\s+invariant|invariant\s+violated|违反不变量|不变量|location|位置|file(?:\s*\/\s*function)?|文件(?:路径|位置)?|function|evidence(?:\s*\/\s*repro(?:duction)?)?|证据|repro(?:duction)?|复现|proposal|recommendation|auditor\s+proposal|suggest(?:ed)?\s+(?:solution|fix)|solution|fix|建议(?:方案)?|修复(?:建议|方案)|建议|trade[- ]?offs?|权衡|validation(?:\s+summary)?|验证(?:摘要)?|tests?|suite|next step|next steps|下一步|reason|why|原因|返工原因|未通过原因|主要问题|审计意见|返工意见|审查意见)(?:\*\*|__)?\s*[:：]\s*(?:\*\*|__)?(?<value>.*)$/iu;
 const AUDIT_METADATA_LINE_RE = /^\s*(?:\[IM\.codes task\b|<!--|Audited\s+pair\b|(?:status|round|executor|auditor|verdict|blocking)\s*[:=])/iu;
 const AUDIT_INLINE_SEVERITY_RE = /(?:\[(P[0-4])\]|\((P[0-4])\)|\b(P[0-4])\b)/iu;
 
-function cleanUntruncatedText(value: unknown): string | undefined {
+type AuditFindingFieldKey = keyof Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking' | 'severity'>;
+type AuditDraftFinding = Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'>;
+
+function stripMarkdownBold(value: string): string {
+  // Strip `**bold**` emphasis only; never remove `__` so paths/identifiers like `src/a__b.ts` stay intact.
+  return value.replace(/\*\*([^\n]*?)\*\*/gu, '$1');
+}
+
+function cleanUntruncatedText(value: unknown, preserveNewlines = false): string | undefined {
   if (typeof value !== 'string') return undefined;
-  const cleaned = value.replace(/\*\*/gu, '').replace(/__/gu, '').replace(/[ \t]+/gu, ' ').trim();
+  if (preserveNewlines) {
+    const cleaned = value
+      .replace(/\r\n?/gu, '\n')
+      .split('\n')
+      .map((line) => stripMarkdownBold(line).replace(/[ \t]+/gu, ' ').trimEnd())
+      .join('\n')
+      .trim();
+    return cleaned || undefined;
+  }
+  const cleaned = stripMarkdownBold(value).replace(/[ \t]+/gu, ' ').trim();
   return cleaned || undefined;
 }
 
-function appendDetailText(existing: string | undefined, next: string | undefined): string | undefined {
+function appendDetailText(
+  existing: string | undefined,
+  next: string | undefined,
+  blankLineBefore = false,
+): string | undefined {
   if (!next) return existing;
   if (!existing) return next;
-  return `${existing}\n${next}`;
+  return `${existing}${blankLineBefore ? '\n\n' : '\n'}${next}`;
 }
 
 function isBlockingSeverity(severity: string | undefined, blockingSet: ReadonlySet<string>): boolean {
@@ -95,13 +117,13 @@ function isBlockingSeverity(severity: string | undefined, blockingSet: ReadonlyS
 }
 
 function assignFieldFromLabel(
-  finding: Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'>,
+  finding: AuditDraftFinding,
   label: string,
   value: string,
-): keyof Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking' | 'severity'> | undefined {
+): AuditFindingFieldKey | undefined {
   const key = label.toLowerCase().replace(/[：:]/gu, '').trim();
   const normalized = cleanUntruncatedText(value);
-  let field: keyof Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking' | 'severity'> | undefined;
+  let field: AuditFindingFieldKey | undefined;
   if (key.includes('invariant') || key.includes('violat') || key.includes('不变量')) field = 'invariant';
   else if (key.includes('location') || key === 'file' || key === 'function' || key.includes('位置') || key.includes('文件')) field = 'location';
   else if (key.includes('evidence') || key.includes('repro') || key.includes('证据') || key.includes('复现')) field = 'evidence';
@@ -114,15 +136,19 @@ function assignFieldFromLabel(
 }
 
 function parseUntruncatedTextAudit(rawText: string): {
-  findings: Array<Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'>>;
+  findings: AuditDraftFinding[];
   summary?: string;
   reason?: string;
   nextStep?: string;
 } {
   const lines = rawText.replace(/\r\n?/gu, '\n').split('\n');
-  const taggedFindings: Array<Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'>> = [];
-  let current: Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'> | undefined;
-  let currentField: keyof Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking' | 'severity'> | undefined;
+  const findings: AuditDraftFinding[] = [];
+  let current: AuditDraftFinding | undefined;
+  let currentField: AuditFindingFieldKey | undefined;
+  let pendingBlankLine = false;
+  let sawEmptyHeaderField = false;
+  let inCodeFence = false;
+  let topLevelSection: 'summary' | 'reason' | 'nextStep' | null = null;
   let summary: string | undefined;
   const reasons: string[] = [];
   const nextSteps: string[] = [];
@@ -130,26 +156,57 @@ function parseUntruncatedTextAudit(rawText: string): {
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
-    if (!line) {
-      currentField = undefined;
+    if (line.startsWith('```')) {
+      inCodeFence = !inCodeFence;
+      if (current && currentField) {
+        current[currentField] = appendDetailText(current[currentField], line, pendingBlankLine) ?? line;
+        pendingBlankLine = false;
+      }
       continue;
     }
+
+    if (inCodeFence) {
+      if (current && currentField) {
+        const fenceLine = stripMarkdownBold(rawLine).trimEnd();
+        current[currentField] = appendDetailText(current[currentField], fenceLine, pendingBlankLine) ?? fenceLine;
+      }
+      pendingBlankLine = false;
+      continue;
+    }
+
+    if (!line) {
+      // Preserve paragraph boundaries inside active findings/fields instead of dropping subsequent paragraphs.
+      pendingBlankLine = true;
+      continue;
+    }
+
+    const leadingSpaces = rawLine.match(/^([ \t]*)/u)?.[1].replace(/\t/gu, '  ').length ?? 0;
+
     const taggedMatch = line.match(AUDIT_TAGGED_FINDING_RE) || line.match(AUDIT_BARE_FINDING_RE);
     if (taggedMatch) {
       const severity = taggedMatch[1]?.toUpperCase();
       const body = cleanUntruncatedText(taggedMatch[2]) ?? '';
-      current = { severity, summary: body };
-      taggedFindings.push(current);
+      current = { ...(severity ? { severity } : {}), summary: body };
+      findings.push(current);
       currentField = 'summary';
+      pendingBlankLine = false;
+      sawEmptyHeaderField = !body || body.endsWith(':');
+      topLevelSection = null;
       continue;
     }
+
     const summaryMatch = line.match(AUDIT_SUMMARY_LINE_RE);
     if (summaryMatch) {
       const val = cleanUntruncatedText(summaryMatch[1]);
-      if (val) summary = appendDetailText(summary, val);
+      if (val) summary = appendDetailText(summary, val, pendingBlankLine);
+      current = undefined;
       currentField = undefined;
+      pendingBlankLine = false;
+      sawEmptyHeaderField = false;
+      topLevelSection = 'summary';
       continue;
     }
+
     const labelled = line.match(AUDIT_FIELD_RE);
     if (labelled) {
       const label = labelled.groups?.label ?? '';
@@ -158,85 +215,223 @@ function parseUntruncatedTextAudit(rawText: string): {
         const assigned = assignFieldFromLabel(current, label, value);
         if (assigned) {
           currentField = assigned;
+          const cleanVal = cleanUntruncatedText(value);
+          sawEmptyHeaderField = !cleanVal || cleanVal.endsWith(':');
+          pendingBlankLine = false;
+          topLevelSection = null;
           continue;
         }
       }
       const cleanVal = cleanUntruncatedText(value);
       if (/next step|下一步/iu.test(label)) {
         if (cleanVal) nextSteps.push(cleanVal);
+        current = undefined;
         currentField = undefined;
+        pendingBlankLine = false;
+        sawEmptyHeaderField = false;
+        topLevelSection = 'nextStep';
         continue;
       }
       if (/reason|why|原因|返工原因|未通过原因|主要问题|审计意见|返工意见|审查意见/iu.test(label)) {
         if (cleanVal) reasons.push(cleanVal);
+        current = undefined;
         currentField = undefined;
+        pendingBlankLine = false;
+        sawEmptyHeaderField = false;
+        topLevelSection = 'reason';
         continue;
       }
       if (/validation|验证|tests?|suite/iu.test(label)) {
+        current = undefined;
         currentField = undefined;
+        pendingBlankLine = false;
+        sawEmptyHeaderField = false;
+        topLevelSection = null;
         continue;
       }
     }
-    if (current && currentField) {
-      const cont = cleanUntruncatedText(line);
-      if (cont) {
-        current[currentField] = appendDetailText(current[currentField], cont) ?? cont;
+
+    const numMatch = line.match(AUDIT_NUMBERED_ITEM_RE);
+    if (numMatch) {
+      const isNestedSubStep = Boolean(
+        current
+        && currentField
+        && currentField !== 'summary'
+        && (leadingSpaces >= 2 || (sawEmptyHeaderField && !pendingBlankLine)),
+      );
+      if (!isNestedSubStep) {
+        const body = cleanUntruncatedText(numMatch[2]) ?? '';
+        if (body) {
+          const sevMatch = body.match(AUDIT_INLINE_SEVERITY_RE);
+          const severity = (sevMatch?.[1] ?? sevMatch?.[2] ?? sevMatch?.[3])?.toUpperCase();
+          current = { ...(severity ? { severity } : {}), summary: body };
+          findings.push(current);
+          currentField = 'summary';
+          pendingBlankLine = false;
+          sawEmptyHeaderField = body.endsWith(':');
+          topLevelSection = null;
+          continue;
+        }
       }
+    }
+
+    const bulletMatch = line.match(AUDIT_BULLET_ITEM_RE);
+    if (bulletMatch) {
+      const isNestedBullet = Boolean(
+        current
+        && currentField
+        && (
+          leadingSpaces >= 2
+          || (currentField !== 'summary' && (!pendingBlankLine || sawEmptyHeaderField))
+        ),
+      );
+      if (!isNestedBullet) {
+        const body = cleanUntruncatedText(bulletMatch[1]) ?? '';
+        if (body) {
+          const sevMatch = body.match(AUDIT_INLINE_SEVERITY_RE);
+          const severity = (sevMatch?.[1] ?? sevMatch?.[2] ?? sevMatch?.[3])?.toUpperCase();
+          current = { ...(severity ? { severity } : {}), summary: body };
+          findings.push(current);
+          currentField = 'summary';
+          pendingBlankLine = false;
+          sawEmptyHeaderField = body.endsWith(':');
+          topLevelSection = null;
+          continue;
+        }
+      }
+    }
+
+    if (AUDIT_METADATA_LINE_RE.test(line)) {
+      pendingBlankLine = false;
       continue;
     }
-    if (!AUDIT_METADATA_LINE_RE.test(line) && !line.startsWith('```')) {
-      const cleaned = cleanUntruncatedText(line);
-      if (cleaned) proseLines.push(cleaned);
+
+    if (AUDIT_HEADING_OR_RULE_RE.test(line)) {
+      current = undefined;
+      currentField = undefined;
+      pendingBlankLine = false;
+      sawEmptyHeaderField = false;
+      topLevelSection = null;
+      const cleanedHeading = cleanUntruncatedText(line.replace(/^#+\s*/u, ''));
+      if (cleanedHeading && !/^[-*_]{3,}$/u.test(cleanedHeading)) proseLines.push(cleanedHeading);
+      continue;
     }
+
+    const cleaned = cleanUntruncatedText(line);
+    if (cleaned) {
+      if (current && currentField) {
+        current[currentField] = appendDetailText(current[currentField], cleaned, pendingBlankLine) ?? cleaned;
+      } else if (topLevelSection === 'nextStep') {
+        nextSteps.push(cleaned);
+      } else if (topLevelSection === 'reason') {
+        reasons.push(cleaned);
+      } else if (topLevelSection === 'summary') {
+        summary = appendDetailText(summary, cleaned, pendingBlankLine);
+      } else {
+        proseLines.push(cleaned);
+      }
+    }
+    pendingBlankLine = false;
+    sawEmptyHeaderField = false;
   }
 
-  let findings = taggedFindings.filter((item) => Boolean(item.summary || item.location || item.proposal || item.evidence));
-
-  // Fallback for numbered / bullet lists when auditor did not tag [P0]..[P4] on each line
-  if (findings.length === 0) {
-    const listFindings: Array<Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'>> = [];
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line || AUDIT_METADATA_LINE_RE.test(line) || line.startsWith('```')) continue;
-      if (AUDIT_SUMMARY_LINE_RE.test(line)) continue;
-      const numMatch = line.match(AUDIT_NUMBERED_ITEM_RE);
-      const bulletMatch = !numMatch ? line.match(AUDIT_BULLET_ITEM_RE) : null;
-      const itemBody = numMatch ? cleanUntruncatedText(numMatch[2]) : (bulletMatch ? cleanUntruncatedText(bulletMatch[1]) : undefined);
-      if (!itemBody) continue;
-      const sevMatch = itemBody.match(AUDIT_INLINE_SEVERITY_RE);
-      const severity = (sevMatch?.[1] ?? sevMatch?.[2] ?? sevMatch?.[3])?.toUpperCase();
-      listFindings.push({
-        ...(severity ? { severity } : {}),
-        summary: itemBody,
-      });
-    }
-    if (listFindings.length > 0) {
-      findings = listFindings;
-    }
-  }
-
+  const normalizedFindings = findings.filter((item) => Boolean(item.summary || item.location || item.proposal || item.evidence));
   const effectiveSummary = summary ?? (proseLines.length > 0 ? proseLines[0] : undefined);
   return {
-    findings,
+    findings: normalizedFindings,
     ...(effectiveSummary ? { summary: effectiveSummary } : {}),
     ...(reasons.length > 0 ? { reason: reasons.join('\n') } : {}),
     ...(nextSteps.length > 0 ? { nextStep: nextSteps.join('\n') } : {}),
   };
 }
 
+function mergeSingleAuditField(saved: string | undefined, parsed: string | undefined): string | undefined {
+  if (!saved) return parsed;
+  if (!parsed) return saved;
+  // Prefer saved structured field unless parsed untruncated text strictly expands a truncated prefix.
+  if (parsed.length > saved.length && parsed.startsWith(saved.slice(0, Math.min(40, saved.length)))) {
+    return parsed;
+  }
+  return saved;
+}
+
+function mergeAuditFindings(
+  structuredFull: readonly AuditDraftFinding[],
+  parsedFromText: readonly AuditDraftFinding[],
+  legacyStructured: readonly AuditDraftFinding[],
+): AuditDraftFinding[] {
+  if (structuredFull.length > 0) {
+    return structuredFull.map((item, idx) => {
+      const supplement = parsedFromText[idx];
+      if (!supplement) return item;
+      const severity = item.severity ?? supplement.severity;
+      const location = item.location ?? supplement.location;
+      const evidence = item.evidence ?? supplement.evidence;
+      const proposal = item.proposal ?? supplement.proposal;
+      const invariant = item.invariant ?? supplement.invariant;
+      const tradeoffs = item.tradeoffs ?? supplement.tradeoffs;
+      return {
+        ...(severity ? { severity } : {}),
+        summary: item.summary || supplement.summary,
+        ...(location ? { location } : {}),
+        ...(evidence ? { evidence } : {}),
+        ...(proposal ? { proposal } : {}),
+        ...(invariant ? { invariant } : {}),
+        ...(tradeoffs ? { tradeoffs } : {}),
+      };
+    });
+  }
+
+  if (legacyStructured.length > 0 && parsedFromText.length > 0) {
+    const merged: AuditDraftFinding[] = [];
+    const total = Math.max(legacyStructured.length, parsedFromText.length);
+    for (let i = 0; i < total; i++) {
+      const legacy = legacyStructured[i];
+      const parsed = parsedFromText[i];
+      if (!legacy) {
+        if (parsed) merged.push(parsed);
+        continue;
+      }
+      if (!parsed) {
+        merged.push(legacy);
+        continue;
+      }
+      const severity = legacy.severity ?? parsed.severity;
+      const summary = mergeSingleAuditField(legacy.summary, parsed.summary) ?? '';
+      const location = mergeSingleAuditField(legacy.location, parsed.location);
+      const evidence = mergeSingleAuditField(legacy.evidence, parsed.evidence);
+      const proposal = mergeSingleAuditField(legacy.proposal, parsed.proposal);
+      const invariant = mergeSingleAuditField(legacy.invariant, parsed.invariant);
+      const tradeoffs = mergeSingleAuditField(legacy.tradeoffs, parsed.tradeoffs);
+      merged.push({
+        ...(severity ? { severity } : {}),
+        summary,
+        ...(location ? { location } : {}),
+        ...(evidence ? { evidence } : {}),
+        ...(proposal ? { proposal } : {}),
+        ...(invariant ? { invariant } : {}),
+        ...(tradeoffs ? { tradeoffs } : {}),
+      });
+    }
+    return merged;
+  }
+
+  return parsedFromText.length > 0 ? [...parsedFromText] : [...legacyStructured];
+}
+
 function normalizeStructuredFindings(
   structured: readonly TaskPairAuditFinding[] | undefined,
-): Array<Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'>> {
+): AuditDraftFinding[] {
   if (!Array.isArray(structured) || structured.length === 0) return [];
-  const out: Array<Omit<GlobalTaskAuditFindingItem, 'index' | 'blocking'>> = [];
+  const out: AuditDraftFinding[] = [];
   for (const item of structured) {
     if (!item || typeof item !== 'object') continue;
-    const summary = cleanUntruncatedText(item.summary) ?? cleanUntruncatedText(item.invariant) ?? '';
+    const summary = cleanUntruncatedText(item.summary, true) ?? cleanUntruncatedText(item.invariant, true) ?? '';
     const location = cleanUntruncatedText(item.location);
-    const evidence = cleanUntruncatedText(item.evidence);
-    const proposal = cleanUntruncatedText(item.proposal);
-    const invariant = cleanUntruncatedText(item.invariant);
-    const tradeoffs = cleanUntruncatedText(item.tradeoffs);
+    const evidence = cleanUntruncatedText(item.evidence, true);
+    const proposal = cleanUntruncatedText(item.proposal, true);
+    const invariant = cleanUntruncatedText(item.invariant, true);
+    const tradeoffs = cleanUntruncatedText(item.tradeoffs, true);
     const severity = typeof item.severity === 'string' && item.severity.trim()
       ? item.severity.trim().toUpperCase()
       : undefined;
@@ -267,15 +462,17 @@ function normalizeCounts(
 }
 
 /**
- * Extract full, untruncated numbered audit details from a persisted `TaskPairLastVerdict`.
- * Prefers full structured details (`structuredDetails`) or untruncated reply text (`fullNoticeText`),
- * falling back cleanly to `noticeText` / `auditDetails` for legacy persisted pairs.
+ * Extract full, untruncated numbered audit details from an applied `TaskPairLastVerdict`.
+ * Unapplied verdicts (`judgement` inconsistent / missing_severity) yield `undefined`.
  */
 export function extractAuditFindingsFromVerdict(
   lastVerdict: TaskPairLastVerdict | null | undefined,
   blocking: readonly string[] = ['P0'],
 ): GlobalTaskAuditDetail | undefined {
   if (!lastVerdict || (lastVerdict.verb !== 'PASS' && lastVerdict.verb !== 'REWORK')) {
+    return undefined;
+  }
+  if (!isAppliedVerdict(lastVerdict.judgement)) {
     return undefined;
   }
   const counts = normalizeCounts(lastVerdict.counts);
@@ -292,9 +489,7 @@ export function extractAuditFindingsFromVerdict(
   const structuredFull = normalizeStructuredFindings(lastVerdict.structuredDetails?.findings);
   const legacyStructured = normalizeStructuredFindings(lastVerdict.auditDetails?.findings);
 
-  const rawFindings = structuredFull.length > 0
-    ? structuredFull
-    : (parsedFromText.findings.length > 0 ? parsedFromText.findings : legacyStructured);
+  const rawFindings = mergeAuditFindings(structuredFull, parsedFromText.findings, legacyStructured);
 
   const findings: GlobalTaskAuditFindingItem[] = rawFindings.map((item, idx) => ({
     index: idx + 1,
@@ -314,21 +509,21 @@ export function extractAuditFindingsFromVerdict(
   }, 0);
   const findingsCount = findings.length > 0 ? findings.length : countSum;
 
-  const summary = cleanUntruncatedText(lastVerdict.structuredDetails?.summary)
+  const summary = cleanUntruncatedText(lastVerdict.structuredDetails?.summary, true)
     ?? parsedFromText.summary
-    ?? cleanUntruncatedText(lastVerdict.auditDetails?.summary)
-    ?? cleanUntruncatedText(lastVerdict.reason)
-    ?? cleanUntruncatedText(lastVerdict.auditDetails?.reason)
+    ?? cleanUntruncatedText(lastVerdict.auditDetails?.summary, true)
+    ?? cleanUntruncatedText(lastVerdict.reason, true)
+    ?? cleanUntruncatedText(lastVerdict.auditDetails?.reason, true)
     ?? findings[0]?.summary;
 
-  const reason = cleanUntruncatedText(lastVerdict.structuredDetails?.reason)
+  const reason = cleanUntruncatedText(lastVerdict.structuredDetails?.reason, true)
     ?? parsedFromText.reason
-    ?? cleanUntruncatedText(lastVerdict.reason)
-    ?? cleanUntruncatedText(lastVerdict.auditDetails?.reason);
+    ?? cleanUntruncatedText(lastVerdict.reason, true)
+    ?? cleanUntruncatedText(lastVerdict.auditDetails?.reason, true);
 
-  const nextStep = cleanUntruncatedText(lastVerdict.structuredDetails?.nextStep)
+  const nextStep = cleanUntruncatedText(lastVerdict.structuredDetails?.nextStep, true)
     ?? parsedFromText.nextStep
-    ?? cleanUntruncatedText(lastVerdict.auditDetails?.nextStep);
+    ?? cleanUntruncatedText(lastVerdict.auditDetails?.nextStep, true);
 
   return {
     verb: lastVerdict.verb,

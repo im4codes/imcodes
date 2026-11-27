@@ -1,4 +1,5 @@
 import { SESSION_HISTORY_SUPERVISION_GUIDANCE } from './session-history.js';
+import type { GlobalTaskAuditSummary } from './global-task-mode.js';
 import { isTaskPairSuspended, type TaskPairScheduling } from './task-pair-suspension.js';
 import type { TaskPairTitleAccess, TaskPairTitleWireAccess } from './task-pair-title-access.js';
 /**
@@ -2952,6 +2953,8 @@ export interface TaskPairEventPayload {
   blockedNote?: string;
   /** Structured, display-safe audit context extracted from the notice. */
   auditDetails?: TaskPairAuditDetails;
+  /** Compact, applied audit verdict summary projected by daemon (`null` when cleared by NEXT_ROUND/reopened). */
+  lastAudit?: GlobalTaskAuditSummary | null;
   /** For a pair awaiting Brain's decision: what became of the last daemon notice to Brain (absent on daemons that predate it). */
   brainNotice?: TaskPairBrainNotice;
 }

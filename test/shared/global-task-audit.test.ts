@@ -191,4 +191,139 @@ describe('global task structured audit summary & extraction', () => {
     expect(Buffer.byteLength(bounded, 'utf8')).toBeLessThanOrEqual(GLOBAL_TASK_PG_NOTIFY_MAX_BYTES);
     expect(JSON.parse(bounded).lastAudit).toEqual(normalized);
   });
+
+  it('parses mixed [P0] + unbracketed numbered/bullet findings, multi-paragraph fields, plain numbered fields, preserves __ paths, and keeps saved auditDetails fields', () => {
+    const mixedReply = [
+      'Summary: Mixed format audit.',
+      '',
+      '1. [P0] First tagged finding',
+      '',
+      'Second paragraph describing first finding impact.',
+      'Location: src/a__b.ts:12',
+      'Proposal: Fix first invariant.',
+      '',
+      'Second paragraph of first proposal.',
+      '',
+      '2. Second plain numbered finding (P1)',
+      'Location: src/nested/__init__.py:44',
+      'Proposal: Fix second item cleanly.',
+      '',
+      '- Third plain bullet finding',
+      'Proposal: Fix third item cleanly.',
+    ].join('\n');
+
+    const mixed = extractAuditFindingsFromVerdict({
+      verb: 'REWORK',
+      counts: { P0: 1, P1: 1, P2: 0, P3: 0, P4: 0 },
+      judgement: 'consistent',
+      round: 2,
+      fullNoticeText: mixedReply,
+      noticeText: mixedReply,
+    }, ['P0']);
+
+    expect(mixed?.findings).toHaveLength(3);
+    expect(mixed?.findings[0]).toMatchObject({
+      index: 1,
+      severity: 'P0',
+      blocking: true,
+      location: 'src/a__b.ts:12',
+    });
+    expect(mixed?.findings[0]!.summary).toContain('Second paragraph describing first finding impact.');
+    expect(mixed?.findings[0]!.proposal).toContain('Fix first invariant.');
+    expect(mixed?.findings[0]!.proposal).toContain('Second paragraph of first proposal.');
+    expect(mixed?.findings[0]!.proposal).not.toContain('Fix second item cleanly.');
+    expect(mixed?.findings[1]).toMatchObject({
+      index: 2,
+      severity: 'P1',
+      blocking: false,
+      location: 'src/nested/__init__.py:44',
+      proposal: 'Fix second item cleanly.',
+    });
+    expect(mixed?.findings[2]).toMatchObject({
+      index: 3,
+      blocking: false,
+      summary: 'Third plain bullet finding',
+      proposal: 'Fix third item cleanly.',
+    });
+
+    const plainNumberedReply = [
+      '1. Missing validation guard on upload',
+      '',
+      'Continuation paragraph after blank line.',
+      'Location: server/src/a__handler.ts:90',
+      'Proposal: Validate size before write.',
+      '',
+      '2. Missing timeout cleanup',
+      'Location: src/daemon/b__worker.ts:15',
+      'Proposal: Clear timer on abort.',
+    ].join('\n');
+
+    const plainNumbered = extractAuditFindingsFromVerdict({
+      verb: 'REWORK',
+      counts: { P0: 2, P1: 0, P2: 0, P3: 0, P4: 0 },
+      judgement: 'consistent',
+      round: 3,
+      fullNoticeText: plainNumberedReply,
+      noticeText: plainNumberedReply,
+    }, ['P0']);
+
+    expect(plainNumbered?.findings).toHaveLength(2);
+    expect(plainNumbered?.findings[0]).toMatchObject({
+      index: 1,
+      location: 'server/src/a__handler.ts:90',
+      proposal: 'Validate size before write.',
+    });
+    expect(plainNumbered?.findings[0]!.summary).toContain('Continuation paragraph after blank line.');
+    expect(plainNumbered?.findings[1]).toMatchObject({
+      index: 2,
+      location: 'src/daemon/b__worker.ts:15',
+      proposal: 'Clear timer on abort.',
+    });
+
+    // Existing saved auditDetails (with location + proposal) must not be clobbered by a short 1-line noticeText
+    const preserved = extractAuditFindingsFromVerdict({
+      verb: 'REWORK',
+      counts: { P0: 1, P1: 0, P2: 0, P3: 0, P4: 0 },
+      judgement: 'consistent',
+      round: 1,
+      noticeText: '[P0] Short summary headline only',
+      auditDetails: {
+        findings: [
+          {
+            severity: 'P0',
+            summary: 'Full structured summary headline',
+            location: 'src/saved__path.ts:77',
+            proposal: 'Keep saved proposal intact',
+          },
+        ],
+      },
+    }, ['P0']);
+
+    expect(preserved?.findings).toEqual([
+      {
+        index: 1,
+        severity: 'P0',
+        blocking: true,
+        summary: 'Full structured summary headline',
+        location: 'src/saved__path.ts:77',
+        proposal: 'Keep saved proposal intact',
+      },
+    ]);
+
+    // Unapplied (inconsistent / missing_severity) verdicts must return undefined so held PASS never appears as Passed
+    expect(extractAuditFindingsFromVerdict({
+      verb: 'PASS',
+      counts: { P0: 1, P1: 0, P2: 0, P3: 0, P4: 0 },
+      judgement: 'inconsistent',
+      round: 4,
+      noticeText: '[P0] Still broken PASS attempt',
+    }, ['P0'])).toBeUndefined();
+    expect(buildGlobalTaskAuditSummary({
+      verb: 'REWORK',
+      counts: { P0: 0, P1: 0, P2: 0, P3: 0, P4: 0 },
+      judgement: 'missing_severity',
+      round: 4,
+      noticeText: 'REWORK without severities',
+    }, ['P0'])).toBeUndefined();
+  });
 });

@@ -18,6 +18,7 @@ import {
   TASK_PAIR_NO_AUDITOR,
 } from '../../shared/task-pair.js';
 import { taskPairChecklistCounts } from '../../shared/task-pair-checklist.js';
+import { buildGlobalTaskAuditSummary } from '../../shared/task-pair-brief.js';
 import {
   supervisionConsoleStatusGroup,
   type SupervisionConsoleSessionState,
@@ -122,6 +123,7 @@ export function buildPairConsoleRow(
       ...(pair.executor ? (() => { const p = resolve?.(pair.executor!, pair.updatedAt); return { executorLabel: p?.label, executorModel: p?.model ?? pair.executorModel, executorThinking: p?.thinking ?? pair.executorThinking, executorState: p?.state }; })() : pair.executorModel || pair.executorThinking ? { executorModel: pair.executorModel, executorThinking: pair.executorThinking } : {}),
       ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? (() => { const p = resolve?.(pair.auditor!, pair.updatedAt); return { auditorLabel: p?.label, auditorModel: p?.model ?? pair.auditorModel, auditorThinking: p?.thinking ?? pair.auditorThinking, auditorState: p?.state }; })() : pair.auditor === TASK_PAIR_NO_AUDITOR ? { auditorModel: TASK_PAIR_NO_AUDITOR } : pair.auditorModel || pair.auditorThinking ? { auditorModel: pair.auditorModel, auditorThinking: pair.auditorThinking } : {}),
       ...(pair.lastVerdict ? { severityCounts: { ...pair.lastVerdict.counts }, lastVerdict: pair.lastVerdict.verb } : {}),
+      lastAudit: buildGlobalTaskAuditSummary(pair.lastVerdict, pair.blocking) ?? null,
       ...(pair.flags.includes('waiting_for_capacity') ? { waitingReason: pair.capacityWaitReason ?? null } : {}),
       ...(pair.brief
         ? {

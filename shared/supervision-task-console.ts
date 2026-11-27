@@ -1,4 +1,5 @@
 import { TASK_PAIR_DECISION_MSG, type TaskPairDecisionRecord } from './task-pair-decision.js';
+import type { GlobalTaskAuditSummary } from './global-task-mode.js';
 import type { TaskPairScheduling } from './task-pair-suspension.js';
 import type { TaskPairTitleWireAccess } from './task-pair-title-access.js';
 /**
@@ -494,6 +495,8 @@ export interface SupervisionConsolePairInfo {
   blocking: AuditSeverity[];
   severityCounts?: TaskPairSeverityCounts;
   lastVerdict?: 'PASS' | 'REWORK';
+  /** Compact, applied audit verdict summary projected by daemon (`null` when no applied verdict). */
+  lastAudit?: GlobalTaskAuditSummary | null;
   createdAt?: number;
   /** Pair-engine lifecycle clock, used by compact panels for frozen terminal duration. */
   startedAt?: number;

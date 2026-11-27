@@ -971,6 +971,7 @@ describe('GlobalTaskModeView Brief & Checklist HUD', () => {
             blockingCount: 3,
             findingsCount: 4,
             summary: 'Three blocking P0 items and one P1 note found.',
+            noticeText: 'RAW_AUDIT_REPLY_FULL_TEXT_FOR_TOGGLE',
             findings: [
               { index: 1, severity: 'P0', blocking: true, summary: 'First P0 defect', location: 'src/a.ts:10', proposal: 'Fix A' },
               { index: 2, severity: 'P0', blocking: true, summary: 'Second P0 defect', location: 'src/b.ts:20', proposal: 'Fix B' },
@@ -1082,6 +1083,12 @@ describe('GlobalTaskModeView Brief & Checklist HUD', () => {
     expect(screen.getByTestId('global-task-audit-finding-4').textContent).toContain(longItemTail);
     expect(screen.getByTestId('global-task-audit-finding-4').textContent).toContain('PROPOSAL_END_OK');
 
+    // Collapsible raw reply toggle is also available alongside parsed findings
+    const rawToggle = screen.getByTestId('global-task-audit-raw-toggle') as HTMLDetailsElement;
+    expect(rawToggle).toBeTruthy();
+    expect(rawToggle.open).toBe(false);
+    expect(screen.getByTestId('global-task-audit-raw-notice').textContent).toContain('RAW_AUDIT_REPLY_FULL_TEXT_FOR_TOGGLE');
+
     // Close and test daemon-offline fallback still displays cached audit summary gracefully
     fireEvent.click(screen.getByTestId('global-task-brief-hud-close'));
     fireEvent.click(screen.getByTestId('task-mode-audit-strip-tsk_offline_cached'));
@@ -1089,5 +1096,150 @@ describe('GlobalTaskModeView Brief & Checklist HUD', () => {
       expect(screen.getByTestId('global-task-audit-cached-only')).toBeTruthy();
     });
     expect(screen.getByTestId('global-task-audit-modal-blocking').textContent).toContain('P0 ×1 pending');
+  });
+
+  it('shows current R5 card summary and hides stale R4 findings while refreshing or when daemon goes offline, and clears when new round resets audit', async () => {
+    let callCount = 0;
+    const pending: Array<{ resolve: (res: Response) => void }> = [];
+
+    globalThis.fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/server/srv-1/task-pairs/tsk_r4_to_r5/brief')) {
+        callCount += 1;
+        if (callCount === 1) {
+          return Promise.resolve(new Response(JSON.stringify({
+            ok: true,
+            taskId: 'tsk_r4_to_r5',
+            brief: '- [x][ ] 1. Task',
+            briefRevision: 'rev-r4',
+            checklist: { total: 1, implemented: 1, audited: 0 },
+            lastAudit: {
+              verb: 'REWORK',
+              round: 4,
+              counts: { p0: 2, p1: 0, p2: 0, p3: 0, p4: 0 },
+              blocking: ['P0'],
+              blockingCount: 2,
+              findingsCount: 2,
+              summary: 'OLD_R4_SUMMARY_TEXT',
+              findings: [
+                { index: 1, severity: 'P0', blocking: true, summary: 'OLD_R4_FINDING_TEXT' },
+              ],
+            },
+            updatedAt: 5000,
+          }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+        }
+        return new Promise<Response>((resolve) => {
+          pending.push({ resolve });
+        });
+      }
+      return Promise.resolve(new Response(JSON.stringify({ ok: true }), { status: 200 }));
+    }) as typeof fetch;
+
+    const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+    render(<GlobalTaskModeView onExit={() => {}} onJumpToSession={() => {}} />);
+
+    globalTaskModeStore.setState({
+      loaded: true,
+      tasks: [
+        {
+          serverId: 'srv-1',
+          serverName: 'M3',
+          serverOnline: true,
+          projectName: 'imcodes',
+          brainSession: 'deck_cd_brain',
+          brainLabel: 'Main',
+          taskId: 'tsk_r4_to_r5',
+          title: 'R4 to R5 transition',
+          status: 'rework',
+          flags: [],
+          round: 4,
+          checklist: { total: 1, implemented: 1, audited: 0 },
+          lastAudit: {
+            verb: 'REWORK',
+            round: 4,
+            counts: { p0: 2, p1: 0, p2: 0, p3: 0, p4: 0 },
+            blocking: ['P0'],
+            blockingCount: 2,
+            findingsCount: 2,
+            summary: 'OLD_R4_SUMMARY_TEXT',
+          },
+          createdAt: 1000,
+          updatedAt: 5000,
+          isTerminal: false,
+          needsAttention: false,
+        },
+      ],
+    });
+
+    fireEvent.click(await screen.findByTestId('task-mode-audit-strip-tsk_r4_to_r5'));
+    await waitFor(() => {
+      expect(screen.getByTestId('global-task-audit-finding-1').textContent).toContain('OLD_R4_FINDING_TEXT');
+    });
+    expect(callCount).toBe(1);
+
+    // Push live R5 card update while modal is open -> must drop stale R4 findings and show R5 summary while loading
+    await act(async () => {
+      globalTaskModeStore.setState({
+        tasks: [
+          {
+            ...globalTaskModeStore.getState().tasks[0]!,
+            round: 5,
+            updatedAt: 6000,
+            lastAudit: {
+              verb: 'REWORK',
+              round: 5,
+              counts: { p0: 1, p1: 0, p2: 0, p3: 0, p4: 0 },
+              blocking: ['P0'],
+              blockingCount: 1,
+              findingsCount: 1,
+              summary: 'NEW_R5_SUMMARY_TEXT',
+            },
+          },
+        ],
+      });
+    });
+
+    await waitFor(() => {
+      expect(callCount).toBe(2);
+    });
+    expect(screen.getByTestId('global-task-audit-detail').textContent).toContain('Rework · R5');
+    expect(screen.getByTestId('global-task-audit-detail').textContent).toContain('NEW_R5_SUMMARY_TEXT');
+    expect(screen.queryByTestId('global-task-audit-finding-1')).toBeNull();
+    expect(screen.getByTestId('global-task-audit-detail').textContent).not.toContain('OLD_R4_FINDING_TEXT');
+
+    // Resolve R5 refresh with 503 DAEMON_OFFLINE -> R5 summary + error + cached-only shown, old R4 findings stay gone
+    await act(async () => {
+      pending[0]!.resolve(new Response(JSON.stringify({ ok: false, error: TASK_PAIR_BRIEF_ERROR.DAEMON_OFFLINE }), {
+        status: 503,
+        headers: { 'Content-Type': 'application/json' },
+      }));
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('global-task-brief-error').textContent).toContain('offline');
+    });
+    expect(screen.getByTestId('global-task-audit-cached-only')).toBeTruthy();
+    expect(screen.getByTestId('global-task-audit-modal-blocking').textContent).toContain('P0 ×1 pending');
+    expect(screen.getByTestId('global-task-audit-detail').textContent).toContain('NEW_R5_SUMMARY_TEXT');
+    expect(screen.queryByTestId('global-task-audit-finding-1')).toBeNull();
+    expect(screen.getByTestId('global-task-audit-detail').textContent).not.toContain('OLD_R4_FINDING_TEXT');
+
+    // Push NEXT_ROUND clearing lastAudit -> old verdict & findings must not reappear
+    await act(async () => {
+      globalTaskModeStore.setState({
+        tasks: [
+          {
+            ...globalTaskModeStore.getState().tasks[0]!,
+            status: 'working',
+            updatedAt: 7000,
+            lastAudit: undefined,
+          },
+        ],
+      });
+    });
+    await waitFor(() => {
+      expect(callCount).toBe(3);
+    });
+    expect(screen.queryByTestId('global-task-audit-detail')).toBeNull();
+    expect(document.body.textContent).not.toContain('OLD_R4_FINDING_TEXT');
   });
 });

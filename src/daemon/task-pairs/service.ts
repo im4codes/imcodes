@@ -6,6 +6,7 @@ import {
 } from '../../../shared/task-pair-close.js';
 import {
   TASK_PAIR_BRIEF_ERROR,
+  buildGlobalTaskAuditSummary,
   extractAuditFindingsFromVerdict,
   type TaskPairBriefResponse,
 } from '../../../shared/task-pair-brief.js';
@@ -64,6 +65,7 @@ import {
   taskPairWorkspaceKeptDigestMetaKey,
   TASK_PAIR_TERMINAL_FLUSH_FIELD,
   isComplexSupervisionTaskBrief,
+  isAppliedVerdict,
   applyTaskPairMarker,
   resolveTaskPairBrainWait,
   isTerminalTaskPairStatus,
@@ -3363,6 +3365,16 @@ export function emitTaskPairTimelineEvent(
       ...(pair.auditorThinking ? { auditorThinking: pair.auditorThinking } : {}),
     } : {}),
   };
+  if (base.effect === 'next_round' || base.effect === 'reopened') {
+    payload.lastAudit = null;
+  } else if (
+    pair?.lastVerdict
+    && isAppliedVerdict(pair.lastVerdict.judgement)
+    && !((base.verb === 'PASS' || base.verb === 'REWORK') && base.effect === 'recorded')
+  ) {
+    const projectedAudit = buildGlobalTaskAuditSummary(pair.lastVerdict, pair.blocking);
+    if (projectedAudit) payload.lastAudit = projectedAudit;
+  }
   if (pair?.lastVerdict) {
     if (!payload.severityCounts) payload.severityCounts = pair.lastVerdict.counts;
     if (!payload.verdictJudgement) payload.verdictJudgement = pair.lastVerdict.judgement;
