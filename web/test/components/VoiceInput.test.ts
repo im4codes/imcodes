@@ -14,7 +14,17 @@ const speechApi = vi.hoisted(() => ({
   stop: vi.fn(),
 }));
 
-vi.mock('@capacitor/core', () => ({ registerPlugin: vi.fn() }));
+const streamingApi = vi.hoisted(() => ({
+  available: vi.fn(),
+  checkPermissions: vi.fn(),
+  requestPermissions: vi.fn(),
+  addListener: vi.fn(),
+  start: vi.fn(),
+  stop: vi.fn(),
+  performHaptic: vi.fn(),
+}));
+
+vi.mock('@capacitor/core', () => ({ registerPlugin: vi.fn(() => streamingApi) }));
 
 vi.mock('@capgo/capacitor-speech-recognition', () => ({
   SpeechRecognition: speechApi,
@@ -62,6 +72,17 @@ beforeEach(async () => {
   });
   speechApi.start.mockReset().mockResolvedValue({});
   speechApi.stop.mockReset().mockResolvedValue(undefined);
+  streamingApi.available.mockReset().mockResolvedValue({ available: true });
+  streamingApi.checkPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+  streamingApi.requestPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+  streamingApi.addListener.mockReset().mockImplementation(async (eventName: string, handler: (data: any) => void) => {
+    listeners[eventName] = handler;
+    return { remove: vi.fn(async () => undefined) };
+  });
+  streamingApi.start.mockReset().mockResolvedValue({});
+  streamingApi.stop.mockReset().mockResolvedValue(undefined);
+  streamingApi.performHaptic.mockReset().mockResolvedValue(undefined);
+  localStorage.clear();
   VoiceInput = await import('../../src/components/VoiceInput.js');
 });
 
@@ -2096,6 +2117,57 @@ describe('Web Mobile final drain', () => {
       Object.defineProperty(navigator, 'vibrate', { value: origVibrate, configurable: true });
     }
   });
+
+  it.each(['ios', 'android'] as const)(
+    'routes triggerHapticFeedback to StreamingSpeech even when imcodes_voice_engine=system uses platform SpeechRecognition on %s',
+    async (platform) => {
+      const vibrateSpy = vi.fn(() => true);
+      const origVibrate = navigator.vibrate;
+      Object.defineProperty(navigator, 'vibrate', { value: vibrateSpy, configurable: true });
+      const origCap = (globalThis as any).Capacitor;
+      try {
+        (globalThis as any).Capacitor = {
+          isNativePlatform: () => true,
+          getPlatform: () => platform,
+          isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+        };
+        VoiceInput.setVoiceRecognitionEngine('system');
+
+        // Speech recognition still uses @capgo/capacitor-speech-recognition (speechApi), NOT streamingApi.
+        const started = await VoiceInput.startListening(() => {}, () => {});
+        expect(started).toBe(true);
+        expect(speechApi.start).toHaveBeenCalledTimes(1);
+        expect(streamingApi.start).not.toHaveBeenCalled();
+
+        // Native haptics still route to StreamingSpeech.performHaptic without falling back to navigator.vibrate.
+        await VoiceInput.triggerHapticFeedback(20, 'medium');
+        await VoiceInput.triggerHapticFeedback(12, 'selection');
+        await VoiceInput.triggerHapticFeedback(12, 'light');
+        await VoiceInput.triggerHapticFeedback(18, 'success');
+        await VoiceInput.triggerHapticFeedback(15, 'warning');
+
+        expect(streamingApi.performHaptic.mock.calls).toEqual([
+          [{ style: 'medium' }],
+          [{ style: 'selection' }],
+          [{ style: 'light' }],
+          [{ style: 'success' }],
+          [{ style: 'warning' }],
+        ]);
+        expect(vibrateSpy).not.toHaveBeenCalled();
+
+        // Rejection on StreamingSpeech still degrades cleanly without throwing.
+        streamingApi.performHaptic.mockRejectedValueOnce(new Error('UNIMPLEMENTED'));
+        await expect(VoiceInput.triggerHapticFeedback(15, 'warning')).resolves.toBeUndefined();
+        expect(vibrateSpy).toHaveBeenCalledWith(15);
+
+        await VoiceInput.stopListening({ abort: true });
+      } finally {
+        localStorage.clear();
+        (globalThis as any).Capacitor = origCap;
+        Object.defineProperty(navigator, 'vibrate', { value: origVibrate, configurable: true });
+      }
+    },
+  );
 
   it('skips local primeVoiceGesture when an online primary remote voice provider is configured', async () => {
     speechApi.checkPermissions.mockResolvedValueOnce({ speechRecognition: 'granted' });

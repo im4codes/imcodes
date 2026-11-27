@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render } from '@testing-library/preact';
 
 const nativeListeners: Record<string, (data: any) => void> = {};
+const systemSpeechListeners: Record<string, (data: any) => void> = {};
 const nativeBridge = vi.hoisted(() => ({
   available: vi.fn(),
   checkPermissions: vi.fn(),
@@ -15,9 +16,21 @@ const nativeBridge = vi.hoisted(() => ({
   prewarm: vi.fn(),
   performHaptic: vi.fn(),
 }));
+const systemSpeechBridge = vi.hoisted(() => ({
+  available: vi.fn(),
+  checkPermissions: vi.fn(),
+  requestPermissions: vi.fn(),
+  addListener: vi.fn(),
+  start: vi.fn(),
+  stop: vi.fn(),
+}));
 
 vi.mock('@capacitor/core', () => ({
   registerPlugin: () => nativeBridge,
+}));
+
+vi.mock('@capgo/capacitor-speech-recognition', () => ({
+  SpeechRecognition: systemSpeechBridge,
 }));
 
 vi.mock('react-i18next', () => ({
@@ -954,4 +967,100 @@ describe('Mobile Web Speech real integration (SessionControls + VoiceOverlay + V
       (globalThis as any).Capacitor = origCap;
     }
   });
+
+  it.each(['ios', 'android'] as const)(
+    'routes speech via system SpeechRecognition while still firing StreamingSpeech haptics on %s when imcodes_voice_engine=system',
+    async (platform) => {
+      for (const key of Object.keys(nativeListeners)) delete nativeListeners[key];
+      for (const key of Object.keys(systemSpeechListeners)) delete systemSpeechListeners[key];
+      nativeBridge.available.mockReset().mockResolvedValue({ available: true });
+      nativeBridge.checkPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+      nativeBridge.requestPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+      nativeBridge.start.mockReset().mockResolvedValue(undefined);
+      nativeBridge.stop.mockReset().mockResolvedValue(undefined);
+      nativeBridge.prewarm.mockReset().mockResolvedValue(undefined);
+      nativeBridge.performHaptic.mockReset().mockResolvedValue(undefined);
+      nativeBridge.addListener.mockReset().mockImplementation(async (eventName: string, handler: (data: any) => void) => {
+        nativeListeners[eventName] = handler;
+        return { remove: async () => { if (nativeListeners[eventName] === handler) delete nativeListeners[eventName]; } };
+      });
+
+      systemSpeechBridge.available.mockReset().mockResolvedValue({ available: true });
+      systemSpeechBridge.checkPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+      systemSpeechBridge.requestPermissions.mockReset().mockResolvedValue({ speechRecognition: 'granted' });
+      systemSpeechBridge.start.mockReset().mockResolvedValue(undefined);
+      systemSpeechBridge.stop.mockReset().mockResolvedValue(undefined);
+      systemSpeechBridge.addListener.mockReset().mockImplementation(async (eventName: string, handler: (data: any) => void) => {
+        systemSpeechListeners[eventName] = handler;
+        return { remove: async () => { if (systemSpeechListeners[eventName] === handler) delete systemSpeechListeners[eventName]; } };
+      });
+
+      const vibrateSpy = vi.fn(() => true);
+      const origVibrate = navigator.vibrate;
+      Object.defineProperty(navigator, 'vibrate', { value: vibrateSpy, configurable: true });
+      const origCap = (globalThis as any).Capacitor;
+      (globalThis as any).Capacitor = {
+        isNativePlatform: () => true,
+        getPlatform: () => platform,
+        isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+      };
+      VoiceInput.setVoiceRecognitionEngine('system');
+
+      try {
+        const ws = { connected: true, send: vi.fn(), sendSessionCommand: vi.fn(), onMessage: vi.fn(() => () => {}) } as any;
+        const view = render(
+          <SessionControls
+            ws={ws}
+            activeSession={makeSession()}
+            quickData={makeQuickData()}
+            sessions={[]}
+            subSessions={[]}
+            serverId="srv-1"
+          />,
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        const input = document.querySelector('.controls-input') as HTMLElement;
+
+        // Hold -> slide right (edit) -> slide back center -> release send
+        fireEvent(input, Object.assign(new Event('pointerdown', { bubbles: true, cancelable: true }), {
+          clientX: 180, clientY: 500, pointerId: 41, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+        }));
+        await vi.advanceTimersByTimeAsync(175);
+        await vi.advanceTimersByTimeAsync(0);
+        expect(systemSpeechBridge.start).toHaveBeenCalledTimes(1);
+        expect(nativeBridge.start).not.toHaveBeenCalled();
+
+        systemSpeechListeners.listeningState?.({ status: 'started' });
+        systemSpeechListeners.partialResults?.({ matches: ['system voice haptics'], isFinal: true });
+        await vi.advanceTimersByTimeAsync(0);
+
+        fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true, cancelable: true }), {
+          clientX: 280, clientY: 500, pointerId: 41, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+        }));
+        fireEvent(window, Object.assign(new Event('pointermove', { bubbles: true, cancelable: true }), {
+          clientX: 180, clientY: 500, pointerId: 41, button: 0, buttons: 1, pointerType: 'touch', isPrimary: true,
+        }));
+        fireEvent(window, Object.assign(new Event('pointerup', { bubbles: true, cancelable: true }), {
+          clientX: 180, clientY: 500, pointerId: 41, button: 0, buttons: 0, pointerType: 'touch', isPrimary: true,
+        }));
+        await vi.advanceTimersByTimeAsync(350);
+
+        expect(systemSpeechBridge.stop).toHaveBeenCalled();
+        expect(nativeBridge.stop).not.toHaveBeenCalled();
+        expect(ws.sendSessionCommand).toHaveBeenCalled();
+        expect(nativeBridge.performHaptic.mock.calls).toEqual([
+          [{ style: 'medium' }],
+          [{ style: 'selection' }],
+          [{ style: 'selection' }],
+          [{ style: 'success' }],
+        ]);
+        expect(vibrateSpy).not.toHaveBeenCalled();
+        view.unmount();
+      } finally {
+        localStorage.clear();
+        (globalThis as any).Capacitor = origCap;
+        Object.defineProperty(navigator, 'vibrate', { value: origVibrate, configurable: true });
+      }
+    },
+  );
 });

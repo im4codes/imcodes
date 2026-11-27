@@ -281,4 +281,52 @@ describe('shared native voice bridge', () => {
     expect(formatRemoteVoiceFallbackReason('ws_open_timeout')).toBe('ws_open_timeout');
     expect(formatRemoteVoiceFallbackReason('ready_timeout')).toBe('ready_timeout');
   });
+
+  it.each(['ios', 'android'] as const)(
+    'exposes getNativeHapticFeedback from StreamingSpeech on %s even when system speech engine is selected',
+    async (platform) => {
+      const performHaptic = vi.fn().mockResolvedValue(undefined);
+      Object.assign(bridges.streaming, { performHaptic });
+      try {
+        // When system engine is selected, speech recognizer points to @capgo/legacy while haptics stay on StreamingSpeech.
+        vi.stubGlobal('Capacitor', {
+          getPlatform: () => platform,
+          isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+        });
+        const mod = await import('../src/voice-recognition-backend.js');
+        mod.setVoiceRecognitionEngine('system');
+        expect(mod.getNativeSpeechRecognition()).toBe(bridges.legacy);
+        expect(mod.getNativeHapticFeedback()).toBe(bridges.streaming);
+
+        // Web platform or missing StreamingSpeech plugin disables the bridge.
+        vi.resetModules();
+        vi.stubGlobal('Capacitor', {
+          getPlatform: () => 'web',
+          isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+        });
+        const webMod = await import('../src/voice-recognition-backend.js');
+        expect(webMod.getNativeHapticFeedback()).toBeNull();
+
+        vi.resetModules();
+        vi.stubGlobal('Capacitor', {
+          getPlatform: () => platform,
+          isPluginAvailable: () => false,
+        });
+        const noPluginMod = await import('../src/voice-recognition-backend.js');
+        expect(noPluginMod.getNativeHapticFeedback()).toBeNull();
+
+        // Older shell PluginHeaders omitting performHaptic must return null cleanly.
+        vi.resetModules();
+        vi.stubGlobal('Capacitor', {
+          getPlatform: () => platform,
+          isPluginAvailable: (name: string) => name === 'StreamingSpeech',
+          PluginHeaders: [{ name: 'StreamingSpeech', methods: [{ name: 'start' }, { name: 'stop' }] }],
+        });
+        const oldHeaderMod = await import('../src/voice-recognition-backend.js');
+        expect(oldHeaderMod.getNativeHapticFeedback()).toBeNull();
+      } finally {
+        delete (bridges.streaming as Record<string, unknown>).performHaptic;
+      }
+    },
+  );
 });

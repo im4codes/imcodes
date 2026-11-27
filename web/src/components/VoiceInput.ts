@@ -10,6 +10,7 @@
  */
 import {
   formatActiveVoiceServiceLabel,
+  getNativeHapticFeedback,
   getNativeRawPcmCapture,
   getNativeSpeechRecognition,
   getPlatformFallbackSpeechRecognition,
@@ -2391,10 +2392,18 @@ export async function triggerHapticFeedback(
 ): Promise<void> {
   if (isCapacitorNative()) {
     try {
-      const recognition = getNativeSpeechRecognition();
-      if (typeof recognition.performHaptic === 'function') {
-        await recognition.performHaptic({ style });
+      const hapticBridge = getNativeHapticFeedback();
+      if (hapticBridge) {
+        await hapticBridge.performHaptic({ style });
         return;
+      }
+      // Preserve custom recognizer haptics only on legacy shells lacking StreamingSpeech.
+      if (!isStreamingSpeechAvailable()) {
+        const recognition = getNativeSpeechRecognition();
+        if (typeof recognition.performHaptic === 'function') {
+          await recognition.performHaptic({ style });
+          return;
+        }
       }
     } catch {
       // Fall back to navigator.vibrate below.

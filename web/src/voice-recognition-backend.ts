@@ -161,6 +161,28 @@ export function getNativeSpeechRecognition(): NativeSpeechRecognition {
   return getVoiceRecognitionEngine() === 'system' ? SpeechRecognition : StreamingSpeech;
 }
 
+export interface NativeHapticFeedback {
+  performHaptic: (options?: { style?: HapticFeedbackStyle }) => Promise<void>;
+}
+
+const HAPTIC_FEEDBACK_PLUGIN_METHODS = ['performHaptic'] as const;
+
+/** Native haptic feedback bridge exposed by the StreamingSpeech plugin,
+ * independent of the user's selected speech recognition engine ('builtin' vs 'system'). */
+export function getNativeHapticFeedback(): NativeHapticFeedback | null {
+  if (!isStreamingSpeechAvailable()) return null;
+  const capacitor = (globalThis as { Capacitor?: { getPlatform?: () => string } }).Capacitor;
+  if (capacitor?.getPlatform?.() === 'web') return null;
+  const candidate = StreamingSpeech as unknown as Partial<NativeHapticFeedback> & Record<string, unknown>;
+  if (
+    !hasNativePluginMethods(STREAMING_SPEECH_PLUGIN_NAME, candidate, HAPTIC_FEEDBACK_PLUGIN_METHODS)
+    || typeof candidate.performHaptic !== 'function'
+  ) {
+    return null;
+  }
+  return candidate as NativeHapticFeedback;
+}
+
 /** Platform recognizer used as fallback when builtin StreamingSpeech is unavailable or fails to start. */
 export function getPlatformFallbackSpeechRecognition(): NativeSpeechRecognition | null {
   return SpeechRecognition ?? null;
