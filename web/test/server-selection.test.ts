@@ -272,4 +272,25 @@ describe('mergeServerNavigation', () => {
     expect(result[0].status).toBe('offline');
     expect(result[0].lastHeartbeatAt).toBe(150_000);
   });
+
+  it('does not let older or equal online response revive a server previously marked offline', () => {
+    const previous = [{ id: 'srv-1', name: 'Server One', status: 'offline', lastHeartbeatAt: 200_000 }];
+    const incomingOlder = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 180_000 }];
+    const resultOlder = mergeServerNavigation(incomingOlder, previous, new Set());
+    expect(resultOlder[0].status).toBe('offline');
+    expect(resultOlder[0].lastHeartbeatAt).toBe(200_000);
+
+    const incomingEqual = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 200_000 }];
+    const resultEqual = mergeServerNavigation(incomingEqual, previous, new Set());
+    expect(resultEqual[0].status).toBe('offline');
+    expect(resultEqual[0].lastHeartbeatAt).toBe(200_000);
+  });
+
+  it('allows newer online response with advanced heartbeat to recover an offline server', () => {
+    const previous = [{ id: 'srv-1', name: 'Server One', status: 'offline', lastHeartbeatAt: 200_000 }];
+    const incomingNewer = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 250_000 }];
+    const result = mergeServerNavigation(incomingNewer, previous, new Set());
+    expect(result[0].status).toBe('online');
+    expect(result[0].lastHeartbeatAt).toBe(250_000);
+  });
 });

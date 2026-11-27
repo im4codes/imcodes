@@ -94,6 +94,16 @@ export function mergeServerNavigation<T extends SelectableServerInfo>(
     const prevHb = typeof prevAny.lastHeartbeatAt === 'number' ? prevAny.lastHeartbeatAt : null;
     const currHb = typeof currAny.lastHeartbeatAt === 'number' ? currAny.lastHeartbeatAt : null;
 
+    // If previous was explicitly offline, do not let an incoming response with older or equal heartbeat restore online
+    if (prevAny.status === 'offline') {
+      if (currHb !== null && prevHb !== null && currHb <= prevHb) {
+        return prev;
+      }
+      if (currHb === null && prevHb !== null) {
+        return prev;
+      }
+    }
+
     // Do not regress fresh live heartbeat with older REST timestamp, unless previous was offline
     if (prevAny.status !== 'offline' && prevHb !== null && (currHb === null || prevHb > currHb)) {
       return {

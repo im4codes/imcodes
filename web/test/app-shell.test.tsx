@@ -16055,4 +16055,159 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     expect(localStorage.getItem('rcc_session')).toBe(sharedName);
     expect(window.location.hash).toBe(`#/srv-2/${sharedName}`);
   }, 15_000);
+
+  it('server presence foreground recovery: throttles focus/visibility, skips hidden, and discards out-of-order stale online responses', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const startTime = new Date('2026-05-31T12:00:00Z');
+    vi.setSystemTime(startTime);
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+
+    let serverRequestCount = 0;
+    let readyForRaceTest = false;
+    let deferredOnlineResolve: ((value: any) => void) | null = null;
+    let deferredOfflineResolve: ((value: any) => void) | null = null;
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        serverRequestCount++;
+        if (!readyForRaceTest) {
+          return {
+            servers: [
+              { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 100 },
+              { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 200 },
+            ],
+          };
+        }
+        if (!deferredOnlineResolve) {
+          return new Promise((resolve) => {
+            deferredOnlineResolve = resolve;
+          });
+        }
+        if (!deferredOfflineResolve) {
+          return new Promise((resolve) => {
+            deferredOfflineResolve = resolve;
+          });
+        }
+        return { servers: [] };
+      }
+      if (path.startsWith('/api/server/')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    const { App } = await importApp();
+    render(<App />);
+
+    // Allow initial auth and server requests to resolve
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(150);
+    });
+
+    // Initial load finishes
+    await waitFor(() => {
+      expect(document.body.textContent).toContain('Server One');
+      expect(document.body.textContent).toContain('Server Two');
+    });
+    const initialRequests = serverRequestCount;
+    expect(initialRequests).toBeGreaterThanOrEqual(1);
+    expect(discoverSharedEntriesMock).toHaveBeenCalled();
+    const initialSharedCalls = discoverSharedEntriesMock.mock.calls.length;
+
+    // Both servers initially online
+    const onlineDots = document.querySelectorAll('.server-item-dot-online');
+    expect(onlineDots.length).toBe(2);
+
+    // 1. Hidden document when < 10s cooldown: visibilitychange must NOT trigger refresh
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000); // 2s < 10s
+      fireEvent(document, new Event('visibilitychange'));
+      fireEvent(window, new Event('focus'));
+    });
+    expect(serverRequestCount).toBe(initialRequests);
+    expect(discoverSharedEntriesMock.mock.calls.length).toBe(initialSharedCalls);
+
+    // 2. Visible document but < 10s cooldown: must NOT trigger refresh
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000); // 2s + 3s = 5s < 10s
+      fireEvent(document, new Event('visibilitychange'));
+      fireEvent(window, new Event('focus'));
+    });
+    expect(serverRequestCount).toBe(initialRequests);
+
+    // 3. Hidden document even when >= 10s cooldown: must NOT trigger refresh
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000); // 2s + 3s + 5s = 10s >= 10s
+      fireEvent(document, new Event('visibilitychange'));
+      fireEvent(window, new Event('focus'));
+    });
+    expect(serverRequestCount).toBe(initialRequests);
+
+    // Enable race test responses before next foreground refresh
+    readyForRaceTest = true;
+
+    // 4. Visible document and >= 10s cooldown: triggers refresh (race request 1, online response pending)
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+    await act(async () => {
+      fireEvent(document, new Event('visibilitychange'));
+    });
+    expect(serverRequestCount).toBe(initialRequests + 1);
+
+    // Immediate second focus within 10s: throttled
+    await act(async () => {
+      fireEvent(window, new Event('focus'));
+    });
+    expect(serverRequestCount).toBe(initialRequests + 1);
+
+    // 5. Polling triggers next request (reaches 30s interval from mount) (race request 2, offline response pending)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000);
+    });
+    expect(serverRequestCount).toBe(initialRequests + 2);
+
+    // Focus immediately after polling (e.g. 20ms): throttled because polling updated lastServerRefreshAtRef!
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20);
+      fireEvent(window, new Event('focus'));
+      fireEvent(document, new Event('visibilitychange'));
+    });
+    expect(serverRequestCount).toBe(initialRequests + 2);
+
+    // 6. Out-of-order response resolution: the newer request (returning offline) resolves first
+    await act(async () => {
+      deferredOfflineResolve!({
+        servers: [
+          { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 100 },
+          { id: 'srv-2', name: 'Server Two', status: 'offline', lastHeartbeatAt: Date.now() - 50_000, createdAt: 200 },
+        ],
+      });
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    // Verify srv-2 is now offline
+    await waitFor(() => {
+      expect(document.body.textContent).toContain('Server Two');
+      expect(document.querySelector('.server-item-dot-offline')).toBeTruthy();
+    });
+
+    // Older in-flight response returning online resolves later
+    // Must be discarded by requestSeq and not revive srv-2!
+    await act(async () => {
+      deferredOnlineResolve!({
+        servers: [
+          { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 100 },
+          { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 200 },
+        ],
+      });
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    // Assert srv-2 remains offline!
+    expect(document.querySelector('.server-item-dot-offline')).toBeTruthy();
+    const onlineDotsAfterLateResponse = document.querySelectorAll('.server-item-dot-online');
+    expect(onlineDotsAfterLateResponse.length).toBe(1); // Only Server One is online
+  }, 20_000);
 });

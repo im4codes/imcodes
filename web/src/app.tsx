@@ -2482,14 +2482,24 @@ function InternalMainApp() {
     setServers((previous) => mergeServerNavigation(incoming, previous, sharedNavigationServerIdsRef.current));
   }, []);
 
+  const serverLoadSeqRef = useRef(0);
+  const serverLoadAppliedSeqRef = useRef(0);
+  const lastServerRefreshAtRef = useRef(0);
+
   // Load servers list whenever auth is available
   const loadServers = useCallback(async () => {
     if (!auth) return;
+    const requestSeq = ++serverLoadSeqRef.current;
+    lastServerRefreshAtRef.current = Date.now();
     try {
       const [data, machinesData] = await Promise.all([
         apiFetch<{ servers: ServerInfo[] }>('/api/server'),
         apiFetch<{ machines?: Array<{ serverId?: unknown }> }>('/api/machines').catch(() => null),
       ]);
+      if (requestSeq < serverLoadAppliedSeqRef.current) {
+        return;
+      }
+      serverLoadAppliedSeqRef.current = requestSeq;
       if (Array.isArray(machinesData?.machines)) {
         const machineIds = sanitizePushEnabledServerIds(
           machinesData.machines.map((m) => (typeof m.serverId === 'string' ? m.serverId : '')),
@@ -2503,12 +2513,17 @@ function InternalMainApp() {
       // Preserve the last known list on refresh failures. The request is still
       // considered resolved so the UI can escape the initial connecting gate.
     } finally {
-      setServersLoaded(true);
-      setPresenceTick((t) => (t + 1) % 1_000_000);
+      if (requestSeq >= serverLoadAppliedSeqRef.current) {
+        setServersLoaded(true);
+        setPresenceTick((t) => (t + 1) % 1_000_000);
+      }
     }
   }, [auth, applyServerInventory]);
 
   useEffect(() => {
+    serverLoadSeqRef.current = 0;
+    serverLoadAppliedSeqRef.current = 0;
+    lastServerRefreshAtRef.current = 0;
     setServersLoaded(false);
     setServersSynced(false);
     knownOwnedServerIdsRef.current = null;
@@ -2671,12 +2686,10 @@ function InternalMainApp() {
       void refreshSharedEntries({ silent: true });
     }, 30_000);
 
-    let lastForegroundRefreshAt = Date.now();
     const handleForeground = () => {
       if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
       const now = Date.now();
-      if (now - lastForegroundRefreshAt < 10_000) return;
-      lastForegroundRefreshAt = now;
+      if (now - lastServerRefreshAtRef.current < 10_000) return;
       void loadServers();
       void refreshSharedEntries({ silent: true });
     };
