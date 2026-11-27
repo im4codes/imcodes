@@ -321,3 +321,37 @@ export function mergeRestSessionEntry(
   );
   return merged;
 }
+
+/**
+ * Merge a pre-authoritative REST `/api/server/:id/sessions` response into
+ * existing state (`prev`), preserving cached/live metadata AND retaining any
+ * cached navigable main tabs not yet present in DB (including when REST returns
+ * `[]`) until authoritative WS `session_list` arrives.
+ */
+export function mergeRestSessionList(
+  restRows: readonly SessionInfo[],
+  prev: readonly SessionInfo[],
+  preservedIncognito: readonly SessionInfo[] = [],
+): SessionInfo[] {
+  const prevByName = new Map(prev.map((s) => [s.name, s]));
+  const mergedLoaded = restRows.map((s) => mergeRestSessionEntry(s, prevByName.get(s.name)));
+  const loadedNames = new Set(mergedLoaded.map((s) => s.name));
+
+  const preservedCached: SessionInfo[] = [];
+  for (const s of prev) {
+    if (!loadedNames.has(s.name) && s.incognito !== true && isNavigableMainSession(s)) {
+      loadedNames.add(s.name);
+      preservedCached.push(s);
+    }
+  }
+
+  const incogByName = new Map<string, SessionInfo>();
+  for (const s of preservedIncognito) {
+    if (s.incognito && !loadedNames.has(s.name)) incogByName.set(s.name, s);
+  }
+  for (const s of prev) {
+    if (s.incognito && !loadedNames.has(s.name)) incogByName.set(s.name, s);
+  }
+
+  return [...mergedLoaded, ...preservedCached, ...incogByName.values()];
+}

@@ -25,7 +25,11 @@ import { isWorkingSessionState } from '../../shared/session-activity-types.js';
 import type { SupervisionHeartbeatSnapshot } from '../../shared/supervision-heartbeat.js';
 import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
-import { scheduleBackgroundQuotaRefresh } from './quota-background-refresh.js';
+import {
+  scheduleBackgroundQuotaRefresh,
+  serializeQuotaSnapshot,
+  serializeQwenRuntimeSnapshot,
+} from './quota-background-refresh.js';
 
 export interface SessionListItem extends SessionContextBootstrapState, SessionIncognitoConfig {
   name: string;
@@ -265,17 +269,37 @@ export async function buildSessionList(): Promise<SessionListItem[]> {
   const agyUsageQuota = needsAgySdkHydration ? peekAgyUsageQuotaCached() : null;
   const grokUsageQuota = needsGrokSdkHydration ? peekGrokUsageQuotaCached() : null;
   const museUsageQuota = needsMuseSdkHydration ? peekMuseUsageQuotaCached() : null;
+  if (needsQwenHydration && sessions.some((s) => s.agentType === 'qwen' && !s.ccPreset)) {
+    if (!qwenRuntime?.authLimit || qwenRuntime.authType === QWEN_AUTH_TYPES.UNKNOWN) {
+      scheduleBackgroundQuotaRefresh('qwen-runtime-config', () => getQwenRuntimeConfig({ probe: true }), {
+        beforeSnapshot: serializeQwenRuntimeSnapshot(qwenRuntime),
+        serializeResult: serializeQwenRuntimeSnapshot,
+      });
+    }
+  }
   if (needsClaudeSdkHydration) {
-    scheduleBackgroundQuotaRefresh('claude-usage-quota', () => getClaudeUsageQuota());
+    scheduleBackgroundQuotaRefresh('claude-usage-quota', () => getClaudeUsageQuota(), {
+      beforeSnapshot: serializeQuotaSnapshot(claudeUsageQuota),
+      serializeResult: serializeQuotaSnapshot,
+    });
   }
   if (needsAgySdkHydration) {
-    scheduleBackgroundQuotaRefresh('agy-usage-quota', () => fetchAgyUsageQuota());
+    scheduleBackgroundQuotaRefresh('agy-usage-quota', () => fetchAgyUsageQuota(), {
+      beforeSnapshot: serializeQuotaSnapshot(agyUsageQuota),
+      serializeResult: serializeQuotaSnapshot,
+    });
   }
   if (needsGrokSdkHydration) {
-    scheduleBackgroundQuotaRefresh('grok-usage-quota', () => getGrokUsageQuota());
+    scheduleBackgroundQuotaRefresh('grok-usage-quota', () => getGrokUsageQuota(), {
+      beforeSnapshot: serializeQuotaSnapshot(grokUsageQuota),
+      serializeResult: serializeQuotaSnapshot,
+    });
   }
   if (needsMuseSdkHydration) {
-    scheduleBackgroundQuotaRefresh('muse-usage-quota', () => getMuseUsageQuota());
+    scheduleBackgroundQuotaRefresh('muse-usage-quota', () => getMuseUsageQuota(), {
+      beforeSnapshot: serializeQuotaSnapshot(museUsageQuota),
+      serializeResult: serializeQuotaSnapshot,
+    });
   }
   const codexRuntime = needsCodexHydration ? await getCodexRuntimeConfig({ probe: false }).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig) : null;
   const copilotRuntime = needsCopilotHydration ? await getCopilotRuntimeConfig({ probe: false }).catch(() => null) : null;

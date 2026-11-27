@@ -316,7 +316,7 @@ import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import {
   isNavigableMainSession,
   isSubSessionName,
-  mergeRestSessionEntry,
+  mergeRestSessionList,
   mergeSessionListEntry,
   parseMainSessionName,
   resolveSharedSessionProject,
@@ -998,6 +998,8 @@ function InternalMainApp() {
   const sharedNavigationServerIdsRef = useRef<Set<string>>(new Set());
   const initialHashStateRef = useRef(resolveInitialRouteState());
   const initialSharedTabRestoreRef = useRef(readSharedTabRestoreMarker());
+  const ownedServerEpochRef = useRef(0);
+  const wsAuthoritativeServerEpochRef = useRef<{ serverId: string; epoch: number } | null>(null);
   const sharedOpenGenerationRef = useRef(0);
   const sharedOpenAbortRef = useRef<AbortController | null>(null);
   const sharedOpenIntentRef = useRef<SharedOpenIntent | null>(null);
@@ -1160,6 +1162,8 @@ function InternalMainApp() {
     const releaseCleanupGate = holdAuthCredentialCleanupGate();
     const stopPushPromise = isNative() ? stopAndroidBackgroundPushOnLogout().catch(() => {}) : Promise.resolve();
     authMutationGenerationRef.current += 1;
+    ownedServerEpochRef.current += 1;
+    wsAuthoritativeServerEpochRef.current = null;
     const staleAuthAttempts = [...activeAuthAttemptSettlementsRef.current];
     sharedOpenAbortRef.current?.abort();
     sharedOpenAbortRef.current = null;
@@ -2533,15 +2537,26 @@ function InternalMainApp() {
   useEffect(() => {
     if (!auth || !selectedServerId || selectedShareTarget || sharedHashRestorePending) return;
     const targetServerId = selectedServerId;
+    const requestEpoch = ownedServerEpochRef.current;
     let cancelled = false;
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 5_000); // 5s timeout — don't block UI on slow network
+    const isCurrentPreAuthoritativeRest = () => (
+      !cancelled
+      && !ctrl.signal.aborted
+      && selectedServerIdRef.current === targetServerId
+      && ownedServerEpochRef.current === requestEpoch
+      && !(
+        wsAuthoritativeServerEpochRef.current?.serverId === targetServerId
+        && wsAuthoritativeServerEpochRef.current?.epoch === requestEpoch
+      )
+    );
     apiFetch<{ sessions: Array<{ name: string; project_name: string; role: string; agent_type: string; agent_version?: string; state: string; error?: string | null; project_dir?: string; runtime_type?: 'process' | 'transport'; label?: string | null; description?: string | null }> }>(
       `/api/server/${targetServerId}/sessions`,
       { signal: ctrl.signal },
     ).then((data) => {
       clearTimeout(timer);
-      if (cancelled || ctrl.signal.aborted || selectedServerIdRef.current !== targetServerId) return;
+      if (!isCurrentPreAuthoritativeRest()) return;
       const mapped: SessionInfo[] = data.sessions.map((s) => ({
         name: s.name,
         project: s.project_name,
@@ -2567,37 +2582,24 @@ function InternalMainApp() {
         quotaMeta: undefined,
       }));
       const preservedIncognito = incognitoMainSessionsByServerRef.current.get(targetServerId) ?? [];
+      const mergedForNav = mergeRestSessionList(mapped, sessionsRef.current, preservedIncognito);
       setSessions((prev) => {
-        const mergedLoaded = mapped.map((s) => {
-          const existing = prev.find((p) => p.name === s.name);
-          return mergeRestSessionEntry(s, existing);
-        });
-        const loadedNames = new Set(mergedLoaded.map((s) => s.name));
-        const incogByName = new Map<string, SessionInfo>();
-        for (const s of preservedIncognito) {
-          if (s.incognito && !loadedNames.has(s.name)) incogByName.set(s.name, s);
-        }
-        for (const s of prev) {
-          if (s.incognito && !loadedNames.has(s.name)) incogByName.set(s.name, s);
-        }
-        return incogByName.size > 0 ? [...mergedLoaded, ...incogByName.values()] : mergedLoaded;
+        if (!isCurrentPreAuthoritativeRest()) return prev;
+        return mergeRestSessionList(mapped, prev, preservedIncognito);
       });
-      const loadedNamesSet = new Set(mapped.map((s) => s.name));
-      const allForNav = [
-        ...mapped,
-        ...preservedIncognito.filter((s) => !loadedNamesSet.has(s.name)),
-      ];
-      const navigableMapped = allForNav.filter(isNavigableMainSession);
+      const navigableMapped = mergedForNav.filter(isNavigableMainSession);
       // Only mark loaded if we got data — empty means daemon hasn't synced yet,
       // so wait for WS session_list to avoid flashing "No active sessions"
-      if (allForNav.length > 0) {
+      if (mapped.length > 0 || preservedIncognito.length > 0) {
         setSessionsLoaded(true);
       }
       // Restore the last tab for this server, never the global session value
       // left by another server. A stale/missing snapshot safely falls back
       // to the first navigable tab -- without being recorded as the user's
       // choice, so the memory of what they really had open is kept.
-      restoreLastTabRef.current(targetServerId, navigableMapped.map((session) => session.name));
+      if (isCurrentPreAuthoritativeRest() && navigableMapped.length > 0) {
+        restoreLastTabRef.current(targetServerId, navigableMapped.map((session) => session.name));
+      }
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
     return () => { cancelled = true; clearTimeout(timer); ctrl.abort(); };
   }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
@@ -4441,6 +4443,8 @@ function InternalMainApp() {
       || selectedShareTarget.sessionName === name;
     const nextSharedEntryId = keepsSharedRoute ? selectedSharedEntryId : null;
     if (!keepsSharedRoute) {
+      ownedServerEpochRef.current += 1;
+      wsAuthoritativeServerEpochRef.current = null;
       setSelectedShareTarget(null);
       setSelectedSharedEntryId(null);
       clearSharedTabRestoreMarker();
@@ -5009,6 +5013,8 @@ function InternalMainApp() {
       }
       setSharedActiveDispatchIds(openedDispatchIds);
 
+      ownedServerEpochRef.current += 1;
+      wsAuthoritativeServerEpochRef.current = null;
       setSelectedShareTarget(opened.target);
       setSelectedSharedEntryId(entry.id);
       rememberSharedTab(entry);
@@ -5764,6 +5770,7 @@ function InternalMainApp() {
     if (!auth || !selectedServerId || sharedHashRestorePending) return;
 
     const targetServerId = selectedServerId;
+    const wsOwnedEpoch = ownedServerEpochRef.current;
     selectedServerIdRef.current = targetServerId;
     let effectDisposed = false;
     const isStaleSocket = () => (
@@ -6054,7 +6061,12 @@ function InternalMainApp() {
           const existing = prev.find((p) => p.name === s.name);
           return mergeSessionListEntry(s as IncomingSessionListEntry, existing);
         }));
-        if (!selectedShareTarget && selectedServerIdRef.current === selectedServerId) {
+        if (
+          !selectedShareTarget
+          && selectedServerIdRef.current === selectedServerId
+          && ownedServerEpochRef.current === wsOwnedEpoch
+        ) {
+          wsAuthoritativeServerEpochRef.current = { serverId: selectedServerId, epoch: wsOwnedEpoch };
           writeCachedServerSessions(selectedServerId, mergedSessionList);
         }
         setSessionsLoaded(true);
@@ -7317,6 +7329,8 @@ function InternalMainApp() {
     // User intent to leave is authoritative immediately; a shared-open response
     // that settles while logout I/O is pending must not restore the old route.
     authMutationGenerationRef.current += 1;
+    ownedServerEpochRef.current += 1;
+    wsAuthoritativeServerEpochRef.current = null;
     sharedOpenAbortRef.current?.abort();
     sharedOpenAbortRef.current = null;
     sharedOpenGenerationRef.current += 1;
@@ -7435,6 +7449,8 @@ function InternalMainApp() {
     nextServerId?: string | null,
     options?: { restoreCachedOwnedSessions?: boolean },
   ): SessionInfo[] => {
+    ownedServerEpochRef.current += 1;
+    wsAuthoritativeServerEpochRef.current = null;
     staleSubSessionsSnapshotRef.current = rawSubSessionsRef.current;
     managedSharesGenerationRef.current += 1;
     explicitSelectionServerRef.current = null;
@@ -10013,6 +10029,7 @@ function InternalMainApp() {
     !hasEnteredAppShellRef.current
     && !selectedServerKnownOffline
     && !pendingSharedPayload
+    && visibleMainSessions.length === 0
     && shouldShowInitialConnectingGate(
       Boolean(auth),
       selectedServerId,

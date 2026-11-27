@@ -9,7 +9,7 @@ import {
   SESSION_LIST_CACHE_STORAGE_KEY,
   writeCachedServerSessions,
 } from '../src/session-list-cache.js';
-import { mergeRestSessionEntry } from '../src/session-list-merge.js';
+import { mergeRestSessionEntry, mergeRestSessionList } from '../src/session-list-merge.js';
 import type { SessionInfo } from '../src/types.js';
 
 function makeSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -207,5 +207,95 @@ describe('mergeRestSessionEntry', () => {
     const merged = mergeRestSessionEntry(lateRest, liveWs);
     expect(merged.state).toBe('running');
     expect(merged.modelDisplay).toBe('claude-opus-4-6');
+  });
+
+  it('preserves all 65+ navigable main tabs without arbitrary truncation at 64', () => {
+    const many = Array.from({ length: 65 }, (_, idx) =>
+      makeSession({
+        name: `deck_proj_${idx}_brain`,
+        project: `proj-${idx}`,
+        label: `Tab ${idx}`,
+        modelDisplay: `model-${idx}`,
+      }),
+    );
+
+    writeCachedServerSessions('srv-many', many);
+    const restored = readCachedServerSessions('srv-many');
+    expect(restored).toHaveLength(65);
+    expect(restored[64]).toMatchObject({
+      name: 'deck_proj_64_brain',
+      label: 'Tab 64',
+      modelDisplay: 'model-64',
+      state: 'unknown',
+    });
+  });
+
+  it('sanitizes malformed quotaMeta (e.g. non-array groups) on hydration and fails soft when localStorage getter throws SecurityError', () => {
+    localStorage.setItem(
+      SESSION_LIST_CACHE_STORAGE_KEY,
+      JSON.stringify({
+        'srv-corrupt': {
+          updatedAt: Date.now(),
+          sessions: [
+            {
+              name: 'deck_good_with_bad_quota_brain',
+              project: 'good',
+              role: 'brain',
+              agentType: 'agy-sdk',
+              modelDisplay: 'gemini-3-pro',
+              quotaMeta: { groups: 'bad' },
+            },
+            {
+              name: 'deck_good_with_null_quota_brain',
+              project: 'nullq',
+              role: 'brain',
+              agentType: 'claude-code-sdk',
+              quotaMeta: null,
+            },
+          ],
+        },
+      }),
+    );
+
+    const restored = readCachedServerSessions('srv-corrupt');
+    expect(restored).toHaveLength(2);
+    expect(restored[0]).toMatchObject({
+      name: 'deck_good_with_bad_quota_brain',
+      modelDisplay: 'gemini-3-pro',
+    });
+    expect(restored[0]?.quotaMeta).toBeUndefined();
+    expect(restored[1]?.quotaMeta).toBeNull();
+
+    const desc = Object.getOwnPropertyDescriptor(window, 'localStorage');
+    Object.defineProperty(window, 'localStorage', {
+      configurable: true,
+      get() {
+        throw new DOMException('blocked', 'SecurityError');
+      },
+    });
+    try {
+      expect(readCachedServerSessions('srv-corrupt')).toEqual([]);
+      expect(() => writeCachedServerSessions('srv-corrupt', [makeSession()])).not.toThrow();
+      expect(() => clearCachedServerSessions()).not.toThrow();
+    } finally {
+      if (desc) Object.defineProperty(window, 'localStorage', desc);
+    }
+  });
+
+  it('mergeRestSessionList keeps cached tabs when REST returns empty or partial rows before WS session_list', () => {
+    const cachedA = makeSession({ name: 'deck_a_brain', project: 'a', modelDisplay: 'opus' });
+    const cachedB = makeSession({ name: 'deck_b_brain', project: 'b', modelDisplay: 'sonnet' });
+
+    expect(mergeRestSessionList([], [cachedA, cachedB]).map((s) => s.name)).toEqual([
+      'deck_a_brain',
+      'deck_b_brain',
+    ]);
+
+    const partialRest: SessionInfo[] = [
+      { name: 'deck_a_brain', project: 'a', role: 'brain', agentType: 'claude-code-sdk', state: 'unknown', label: 'A from DB' },
+    ];
+    const mergedPartial = mergeRestSessionList(partialRest, [cachedA, cachedB]);
+    expect(mergedPartial.map((s) => s.name)).toEqual(['deck_a_brain', 'deck_b_brain']);
+    expect(mergedPartial[0]).toMatchObject({ label: 'A from DB', modelDisplay: 'opus' });
   });
 });

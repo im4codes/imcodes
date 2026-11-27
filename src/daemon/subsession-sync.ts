@@ -15,7 +15,10 @@ import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
 import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 import { isClaudeCodeSdkAgentType } from '../../shared/agent-types.js';
-import { scheduleBackgroundQuotaRefresh } from './quota-background-refresh.js';
+import {
+  scheduleBackgroundQuotaRefresh,
+  serializeQuotaSnapshot,
+} from './quota-background-refresh.js';
 import { isIncognitoSession } from '../../shared/session-incognito-types.js';
 import { isIncognitoSessionName } from '../../shared/session-incognito-context.js';
 
@@ -163,12 +166,18 @@ export async function buildSubSessionSyncPayload(
       if (!cache.claudeUsageQuotaChecked) {
         cache.claudeUsageQuotaChecked = true;
         cache.claudeUsageQuota = peekClaudeUsageQuotaCached();
-        scheduleBackgroundQuotaRefresh('claude-usage-quota', () => getClaudeUsageQuota());
+        scheduleBackgroundQuotaRefresh('claude-usage-quota', () => getClaudeUsageQuota(), {
+          beforeSnapshot: serializeQuotaSnapshot(cache.claudeUsageQuota),
+          serializeResult: serializeQuotaSnapshot,
+        });
       }
       usageQuota = cache.claudeUsageQuota ?? null;
     } else {
       usageQuota = peekClaudeUsageQuotaCached();
-      scheduleBackgroundQuotaRefresh('claude-usage-quota', () => getClaudeUsageQuota());
+      scheduleBackgroundQuotaRefresh('claude-usage-quota', () => getClaudeUsageQuota(), {
+        beforeSnapshot: serializeQuotaSnapshot(usageQuota),
+        serializeResult: serializeQuotaSnapshot,
+      });
     }
   }
 
@@ -178,12 +187,18 @@ export async function buildSubSessionSyncPayload(
       if (!cache.agyUsageQuotaChecked) {
         cache.agyUsageQuotaChecked = true;
         cache.agyUsageQuota = peekAgyUsageQuotaCached();
-        scheduleBackgroundQuotaRefresh('agy-usage-quota', () => fetchAgyUsageQuota());
+        scheduleBackgroundQuotaRefresh('agy-usage-quota', () => fetchAgyUsageQuota(), {
+          beforeSnapshot: serializeQuotaSnapshot(cache.agyUsageQuota),
+          serializeResult: serializeQuotaSnapshot,
+        });
       }
       agyUsageQuota = cache.agyUsageQuota ?? null;
     } else {
       agyUsageQuota = peekAgyUsageQuotaCached();
-      scheduleBackgroundQuotaRefresh('agy-usage-quota', () => fetchAgyUsageQuota());
+      scheduleBackgroundQuotaRefresh('agy-usage-quota', () => fetchAgyUsageQuota(), {
+        beforeSnapshot: serializeQuotaSnapshot(agyUsageQuota),
+        serializeResult: serializeQuotaSnapshot,
+      });
     }
   }
 
@@ -193,12 +208,18 @@ export async function buildSubSessionSyncPayload(
       if (!cache.grokUsageQuotaChecked) {
         cache.grokUsageQuotaChecked = true;
         cache.grokUsageQuota = peekGrokUsageQuotaCached();
-        scheduleBackgroundQuotaRefresh('grok-usage-quota', () => getGrokUsageQuota());
+        scheduleBackgroundQuotaRefresh('grok-usage-quota', () => getGrokUsageQuota(), {
+          beforeSnapshot: serializeQuotaSnapshot(cache.grokUsageQuota),
+          serializeResult: serializeQuotaSnapshot,
+        });
       }
       grokUsageQuota = cache.grokUsageQuota ?? null;
     } else {
       grokUsageQuota = peekGrokUsageQuotaCached();
-      scheduleBackgroundQuotaRefresh('grok-usage-quota', () => getGrokUsageQuota());
+      scheduleBackgroundQuotaRefresh('grok-usage-quota', () => getGrokUsageQuota(), {
+        beforeSnapshot: serializeQuotaSnapshot(grokUsageQuota),
+        serializeResult: serializeQuotaSnapshot,
+      });
     }
   }
 
@@ -208,12 +229,18 @@ export async function buildSubSessionSyncPayload(
       if (!cache.museUsageQuotaChecked) {
         cache.museUsageQuotaChecked = true;
         cache.museUsageQuota = peekMuseUsageQuotaCached();
-        scheduleBackgroundQuotaRefresh('muse-usage-quota', () => getMuseUsageQuota());
+        scheduleBackgroundQuotaRefresh('muse-usage-quota', () => getMuseUsageQuota(), {
+          beforeSnapshot: serializeQuotaSnapshot(cache.museUsageQuota),
+          serializeResult: serializeQuotaSnapshot,
+        });
       }
       museUsageQuota = cache.museUsageQuota ?? null;
     } else {
       museUsageQuota = peekMuseUsageQuotaCached();
-      scheduleBackgroundQuotaRefresh('muse-usage-quota', () => getMuseUsageQuota());
+      scheduleBackgroundQuotaRefresh('muse-usage-quota', () => getMuseUsageQuota(), {
+        beforeSnapshot: serializeQuotaSnapshot(museUsageQuota),
+        serializeResult: serializeQuotaSnapshot,
+      });
     }
   }
   let transportQueue: TransportQueueSnapshotPayload | null = null;

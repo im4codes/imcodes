@@ -21,6 +21,7 @@ import {
   TEAM_DISCUSSION_LAYOUT_STORAGE_KEY,
 } from '../src/team-discussion-layout-preference.js';
 import { serverSessionStorageKey } from '../src/server-tab-state.js';
+import { readCachedServerSessions, writeCachedServerSessions } from '../src/session-list-cache.js';
 
 const {
   apiFetchMock,
@@ -13899,5 +13900,149 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     vi.mocked(pushMod.stopAndroidBackgroundPushOnLogout).mockClear();
     authExpiredState.handler?.('token expired');
     await waitFor(() => expect(pushMod.stopAndroidBackgroundPushOnLogout).toHaveBeenCalled());
+  }, 20_000);
+
+  it('keeps cached tabs on early REST [] until authoritative WS session_list, and rejects late REST rollback after WS [A,C] and rapid A->B->A switch', async () => {
+    writeCachedServerSessions('srv-1', [
+      {
+        name: 'deck_a_brain',
+        project: 'a',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        state: 'idle',
+        runtimeType: 'transport',
+        modelDisplay: 'claude-opus-4-6',
+        activeModel: 'claude-opus-4-6',
+        quotaLabel: '5h 10% · 7d 20%',
+      },
+      {
+        name: 'deck_b_brain',
+        project: 'b',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        state: 'idle',
+        runtimeType: 'transport',
+        modelDisplay: 'claude-sonnet-4-6',
+        activeModel: 'claude-sonnet-4-6',
+      },
+    ]);
+    writeCachedServerSessions('srv-2', [
+      {
+        name: 'deck_srv2_brain',
+        project: 'srv2',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        state: 'idle',
+        runtimeType: 'transport',
+        modelDisplay: 'gpt-5.5',
+        activeModel: 'gpt-5.5',
+      },
+    ]);
+
+    const srv1RestResolvers: Array<(data: { sessions: unknown[] }) => void> = [];
+    let resolveSrv2Rest!: (data: { sessions: unknown[] }) => void;
+
+    apiFetchMock.mockImplementation((path: string) => {
+      if (path === '/api/auth/user/me') return Promise.resolve({ id: 'user-1' });
+      if (path === '/api/server') {
+        return Promise.resolve({
+          servers: [
+            { id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: Date.now() },
+            { id: 'srv-2', name: 'Server Two', status: 'online', lastHeartbeatAt: Date.now() },
+          ],
+        });
+      }
+      if (path === '/api/server/srv-1/sessions') {
+        return new Promise((resolve) => {
+          srv1RestResolvers.push(resolve as (data: { sessions: unknown[] }) => void);
+        });
+      }
+      if (path === '/api/server/srv-2/sessions') {
+        return new Promise((resolve) => {
+          resolveSrv2Rest = resolve as (data: { sessions: unknown[] }) => void;
+        });
+      }
+      if (path.startsWith('/api/watch/sessions')) return Promise.resolve({ sessions: [] });
+      return Promise.resolve({});
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_a_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    // Frame 1 from cache before REST or WS settles: both A and B tabs + modelDisplay must appear immediately
+    const initialTabs = await screen.findByTestId('app-shell-session-tabs');
+    expect(within(initialTabs).getByText('tabs-select-deck_a_brain')).toBeTruthy();
+    expect(within(initialTabs).getByText('tabs-select-deck_b_brain')).toBeTruthy();
+    expect(screen.getByTestId('session-pane-deck_a_brain').getAttribute('data-model-display')).toBe('claude-opus-4-6');
+
+    await waitFor(() => expect(srv1RestResolvers.length).toBeGreaterThanOrEqual(1));
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(1));
+
+    // 1. Pre-authoritative REST [] must NOT clear cached [A, B]
+    await act(async () => {
+      srv1RestResolvers[0]!({ sessions: [] });
+    });
+    expect(within(screen.getByTestId('app-shell-session-tabs')).getByText('tabs-select-deck_a_brain')).toBeTruthy();
+    expect(within(screen.getByTestId('app-shell-session-tabs')).getByText('tabs-select-deck_b_brain')).toBeTruthy();
+
+    // 2. Rapid A -> B -> A switch while B and new A REST calls remain pending
+    const srv2Icon = await screen.findByTestId('server-icon-srv-2');
+    fireEvent.click(srv2Icon);
+    expect(within(screen.getByTestId('app-shell-session-tabs')).getByText('tabs-select-deck_srv2_brain')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('server-icon-srv-1'));
+    expect(within(screen.getByTestId('app-shell-session-tabs')).getByText('tabs-select-deck_a_brain')).toBeTruthy();
+    expect(screen.getByTestId('session-pane-deck_a_brain').getAttribute('data-model-display')).toBe('claude-opus-4-6');
+
+    await waitFor(() => expect(wsInstances.length).toBeGreaterThanOrEqual(3));
+    await waitFor(() => expect(srv1RestResolvers.length).toBeGreaterThanOrEqual(2));
+    const srv1WsAfterReturn = wsInstances[wsInstances.length - 1]!;
+
+    // 3. Authoritative WS [A, C] arrives BEFORE late REST [A, B]
+    await act(async () => {
+      srv1WsAfterReturn.emit({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_a_brain', project: 'a', role: 'brain', agentType: 'claude-code-sdk', state: 'running', runtimeType: 'transport', modelDisplay: 'claude-opus-4-6', activeModel: 'claude-opus-4-6' },
+          { name: 'deck_c_brain', project: 'c', role: 'brain', agentType: 'claude-code-sdk', state: 'idle', runtimeType: 'transport', modelDisplay: 'claude-haiku-4-5', activeModel: 'claude-haiku-4-5' },
+        ],
+      });
+    });
+
+    const tabsAfterWs = screen.getByTestId('app-shell-session-tabs');
+    expect(within(tabsAfterWs).getByText('tabs-select-deck_a_brain')).toBeTruthy();
+    expect(within(tabsAfterWs).getByText('tabs-select-deck_c_brain')).toBeTruthy();
+    expect(within(tabsAfterWs).queryByText('tabs-select-deck_b_brain')).toBeNull();
+    expect(readCachedServerSessions('srv-1').map((s) => s.name)).toEqual(['deck_a_brain', 'deck_c_brain']);
+
+    // User switches to C on srv-1
+    fireEvent.click(within(tabsAfterWs).getByText('tabs-select-deck_c_brain'));
+    expect(screen.getByTestId('session-pane-deck_c_brain').getAttribute('data-is-active')).toBe('true');
+
+    // Late srv-2 REST and late srv-1 REST [A, B] arrive AFTER authoritative WS [A, C] — must NOT resurrect B, drop C, leak srv-2, or steal active tab
+    await act(async () => {
+      resolveSrv2Rest?.({
+        sessions: [
+          { name: 'deck_srv2_brain', project_name: 'srv2', role: 'brain', agent_type: 'codex-sdk', runtime_type: 'transport', state: 'idle' },
+        ],
+      });
+      srv1RestResolvers[1]!({
+        sessions: [
+          { name: 'deck_a_brain', project_name: 'a', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+          { name: 'deck_b_brain', project_name: 'b', role: 'brain', agent_type: 'claude-code-sdk', runtime_type: 'transport', state: 'idle' },
+        ],
+      });
+    });
+
+    const finalTabs = screen.getByTestId('app-shell-session-tabs');
+    expect(within(finalTabs).getByText('tabs-select-deck_a_brain')).toBeTruthy();
+    expect(within(finalTabs).getByText('tabs-select-deck_c_brain')).toBeTruthy();
+    expect(within(finalTabs).queryByText('tabs-select-deck_b_brain')).toBeNull();
+    expect(within(finalTabs).queryByText('tabs-select-deck_srv2_brain')).toBeNull();
+    expect(screen.getByTestId('session-pane-deck_c_brain').getAttribute('data-is-active')).toBe('true');
   }, 20_000);
 });

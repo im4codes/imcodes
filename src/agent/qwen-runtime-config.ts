@@ -157,10 +157,17 @@ export async function getQwenRuntimeConfig(options: QwenRuntimeConfigOptions = f
       availableModels,
       ...(cached?.value.authLimit ? { authLimit: cached.value.authLimit } : {}),
     };
-    if (!isKnownAuthType(authType) && now - lastProbeFailureAt >= PROBE_FAILURE_BACKOFF_MS && !inflightProbe) {
-      void getQwenRuntimeConfig({ probe: true }).catch(() => {});
-    }
     return value;
+  }
+
+  if (!force && now - lastProbeFailureAt < PROBE_FAILURE_BACKOFF_MS) {
+    const settings = await readSettings();
+    const authType = detectAuthTypeFromSettings(settings);
+    return {
+      authType,
+      availableModels: getAvailableModelsFromSettings(settings, authType),
+      ...(cached?.value.authLimit ? { authLimit: cached.value.authLimit } : {}),
+    };
   }
 
   if (!force && inflightProbe) return inflightProbe;

@@ -1,10 +1,9 @@
-import type { ProviderQuotaMeta } from '@shared/provider-quota.js';
+import { sanitizeProviderQuotaMeta, type ProviderQuotaMeta } from '@shared/provider-quota.js';
 import type { SessionInfo } from './types.js';
 import { isNavigableMainSession } from './session-list-merge.js';
 
 export const SESSION_LIST_CACHE_STORAGE_KEY = 'imcodes_session_list_cache_v1';
 export const MAX_CACHED_SERVERS = 16;
-const MAX_CACHED_SESSIONS_PER_SERVER = 64;
 
 interface CachedSessionSnapshot {
   name: string;
@@ -43,6 +42,21 @@ interface CachedServerBucket {
 }
 
 type SessionListCachePayload = Record<string, CachedServerBucket>;
+
+function resolveStorage(explicit?: Storage): Storage | null {
+  if (explicit !== undefined) return explicit;
+  try {
+    return typeof localStorage === 'undefined' ? null : localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function sanitizeCachedQuotaMeta(value: unknown): ProviderQuotaMeta | null | undefined {
+  if (value === null) return null;
+  if (value === undefined) return undefined;
+  return sanitizeProviderQuotaMeta(value);
+}
 
 function readCacheStore(storage: Storage): SessionListCachePayload {
   try {
@@ -87,6 +101,7 @@ function writeCacheStore(storage: Storage, payload: SessionListCachePayload): vo
 function toLightweightSnapshot(session: SessionInfo): CachedSessionSnapshot | null {
   if (!isNavigableMainSession(session) || session.incognito === true) return null;
   if (!session.name || !session.project || !session.agentType) return null;
+  const sanitizedQuotaMeta = sanitizeCachedQuotaMeta(session.quotaMeta);
   return {
     name: session.name,
     project: session.project,
@@ -112,7 +127,7 @@ function toLightweightSnapshot(session: SessionInfo): CachedSessionSnapshot | nu
     ...(session.planLabel !== undefined ? { planLabel: session.planLabel } : {}),
     ...(session.quotaLabel !== undefined ? { quotaLabel: session.quotaLabel } : {}),
     ...(session.quotaUsageLabel !== undefined ? { quotaUsageLabel: session.quotaUsageLabel } : {}),
-    ...(session.quotaMeta !== undefined ? { quotaMeta: session.quotaMeta } : {}),
+    ...(sanitizedQuotaMeta !== undefined ? { quotaMeta: sanitizedQuotaMeta } : {}),
     ...(session.codexCreditsBalance !== undefined ? { codexCreditsBalance: session.codexCreditsBalance } : {}),
     ...(session.codexCreditsHasCredits !== undefined ? { codexCreditsHasCredits: session.codexCreditsHasCredits } : {}),
     ...(session.codexCreditsUnlimited !== undefined ? { codexCreditsUnlimited: session.codexCreditsUnlimited } : {}),
@@ -132,6 +147,7 @@ function hydrateCachedSnapshot(raw: unknown): SessionInfo | null {
     return null;
   }
   if (!isNavigableMainSession({ name: s.name, role: s.role })) return null;
+  const sanitizedQuotaMeta = sanitizeCachedQuotaMeta(s.quotaMeta);
   return {
     name: s.name,
     project: s.project,
@@ -159,9 +175,7 @@ function hydrateCachedSnapshot(raw: unknown): SessionInfo | null {
     ...(typeof s.planLabel === 'string' ? { planLabel: s.planLabel } : {}),
     ...(typeof s.quotaLabel === 'string' ? { quotaLabel: s.quotaLabel } : {}),
     ...(typeof s.quotaUsageLabel === 'string' ? { quotaUsageLabel: s.quotaUsageLabel } : {}),
-    ...(s.quotaMeta === null || (s.quotaMeta && typeof s.quotaMeta === 'object' && !Array.isArray(s.quotaMeta))
-      ? { quotaMeta: s.quotaMeta as ProviderQuotaMeta | null }
-      : {}),
+    ...(sanitizedQuotaMeta !== undefined ? { quotaMeta: sanitizedQuotaMeta } : {}),
     ...(typeof s.codexCreditsBalance === 'string' ? { codexCreditsBalance: s.codexCreditsBalance } : {}),
     ...(typeof s.codexCreditsHasCredits === 'boolean' ? { codexCreditsHasCredits: s.codexCreditsHasCredits } : {}),
     ...(typeof s.codexCreditsUnlimited === 'boolean' ? { codexCreditsUnlimited: s.codexCreditsUnlimited } : {}),
@@ -170,11 +184,13 @@ function hydrateCachedSnapshot(raw: unknown): SessionInfo | null {
 
 /**
  * Read lightweight cached main tabs for an owned server.
- * Never throws on missing or corrupt storage; returns `[]` on fallback.
+ * Never throws on missing, restricted, or corrupt storage; returns `[]` on fallback.
  */
-export function readCachedServerSessions(serverId: string | null | undefined, storage: Storage = localStorage): SessionInfo[] {
+export function readCachedServerSessions(serverId: string | null | undefined, storage?: Storage): SessionInfo[] {
   if (!serverId) return [];
-  const store = readCacheStore(storage);
+  const target = resolveStorage(storage);
+  if (!target) return [];
+  const store = readCacheStore(target);
   const bucket = store[serverId];
   if (!bucket || !Array.isArray(bucket.sessions)) return [];
   const hydrated: SessionInfo[] = [];
@@ -186,15 +202,17 @@ export function readCachedServerSessions(serverId: string | null | undefined, st
 }
 
 /**
- * Persist lightweight main tabs for an owned server (excluding incognito sessions),
- * bounded to `MAX_CACHED_SERVERS` servers.
+ * Persist all lightweight navigable main tabs for an owned server (excluding
+ * incognito sessions), bounded to `MAX_CACHED_SERVERS` servers.
  */
 export function writeCachedServerSessions(
   serverId: string | null | undefined,
   sessions: readonly SessionInfo[],
-  storage: Storage = localStorage,
+  storage?: Storage,
 ): void {
   if (!serverId) return;
+  const target = resolveStorage(storage);
+  if (!target) return;
   const snapshots: CachedSessionSnapshot[] = [];
   const seen = new Set<string>();
   for (const session of sessions) {
@@ -202,21 +220,21 @@ export function writeCachedServerSessions(
     if (!snap || seen.has(snap.name)) continue;
     seen.add(snap.name);
     snapshots.push(snap);
-    if (snapshots.length >= MAX_CACHED_SESSIONS_PER_SERVER) break;
   }
-  const store = readCacheStore(storage);
+  const store = readCacheStore(target);
   if (snapshots.length === 0) {
     delete store[serverId];
   } else {
     store[serverId] = { updatedAt: Date.now(), sessions: snapshots };
   }
-  writeCacheStore(storage, store);
+  writeCacheStore(target, store);
 }
 
 /** Clear all cached owned-server session lists (e.g. on logout). */
-export function clearCachedServerSessions(storage: Storage = localStorage): void {
+export function clearCachedServerSessions(storage?: Storage): void {
   try {
-    storage.removeItem(SESSION_LIST_CACHE_STORAGE_KEY);
+    const target = resolveStorage(storage);
+    target?.removeItem(SESSION_LIST_CACHE_STORAGE_KEY);
   } catch {
     // Ignore restricted/unavailable storage.
   }
