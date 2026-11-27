@@ -490,7 +490,7 @@ describe('session-mgmt persistence routes', () => {
         body: JSON.stringify({ agentType }),
       });
       expect(typeRes.status).toBe(403);
-      expect(await typeRes.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+      expect(await typeRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
     }
     expect(mockUpdateSession).not.toHaveBeenCalled();
   });
@@ -2269,5 +2269,122 @@ describe('session-mgmt persistence routes', () => {
     expect(res.status).toBe(403);
     await expect(res.json()).resolves.toEqual({ error: 'forbidden', reason: 'share-direct-surface-denied' });
     expect(sendToDaemonMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects shell/script create, patch, and send for BOTH tab-share and whole-server-share participants while keeping LLM & owner access', async () => {
+    const app = await buildApp();
+    const serverCoverage = {
+      target: { kind: 'server', serverId: 'srv-1' } as const,
+      effectiveRole: 'participant' as const,
+      historyCutoffAt: 0,
+      nextCoverageRecheckAt: null,
+      coveringShareIds: ['server-share-1'],
+      primaryShareId: 'server-share-1',
+      authorizedAt: Date.now(),
+      serverParticipantAuthority: true,
+    };
+
+    // 1. Whole-server participant POST /session/start with shell or script -> 403 participant_shell_forbidden
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
+      shareProvenance: 'server',
+    });
+    for (const agentType of ['shell', 'script']) {
+      const startRes = await app.request('/api/server/srv-1/session/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ project: 'shproj', dir: '/tmp/shproj', agentType }),
+      });
+      expect(startRes.status).toBe(403);
+      expect(await startRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    }
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
+
+    // Whole-server participant POST /session/start with LLM succeeds
+    const llmStartRes = await app.request('/api/server/srv-1/session/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project: 'llmproj', dir: '/tmp/llmproj', agentType: 'claude-code' }),
+    });
+    expect(llmStartRes.status).toBe(200);
+    sendToDaemonMock.mockClear();
+
+    // 2. Whole-server participant PATCH /sessions/:name to shell/script OR on existing shell session -> 403
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
+      shareProvenance: 'server',
+    });
+    for (const agentType of ['shell', 'script']) {
+      const patchRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentType }),
+      });
+      expect(patchRes.status).toBe(403);
+      expect(await patchRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    }
+    mockGetDbSessionByName.mockResolvedValueOnce({
+      name: 'deck_sh_brain',
+      role: 'brain',
+      agent_type: 'shell',
+    });
+    const patchExistingShell = await app.request('/api/server/srv-1/sessions/deck_sh_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label: 'renamed' }),
+    });
+    expect(patchExistingShell.status).toBe(403);
+    expect(await patchExistingShell.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+
+    // 3. Tab-share & whole-server participant POST /session/send targeting shell/script sub-session -> 403
+    mockGetSubSessionById.mockResolvedValue({ id: 'subsh1', server_id: 'srv-1', type: 'shell' });
+    for (const [provenance, coverage] of [
+      ['session', {
+        target: { kind: 'subsession', serverId: 'srv-1', subSessionId: 'subsh1' } as const,
+        effectiveRole: 'participant' as const,
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['tab-share-1'],
+        primaryShareId: 'tab-share-1',
+        authorizedAt: Date.now(),
+      }],
+      ['server', serverCoverage],
+    ] as const) {
+      mockResolveHttpShareAccess.mockResolvedValue({
+        membership: 'none',
+        actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
+        shareProvenance: provenance,
+      });
+      const sendRes = await app.request('/api/server/srv-1/session/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionName: 'deck_sub_subsh1', text: 'id' }),
+      });
+      expect(sendRes.status).toBe(403);
+      expect(await sendRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    }
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
+
+    // 4. Owner still creates and sends to shell sessions normally
+    mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'owner',
+      actor: { kind: 'server-member', effectiveActorRole: 'server-manager' },
+    });
+    const ownerStart = await app.request('/api/server/srv-1/session/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project: 'ownersh', dir: '/tmp/ownersh', agentType: 'shell' }),
+    });
+    expect(ownerStart.status).toBe(200);
+    const ownerSend = await app.request('/api/server/srv-1/session/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionName: 'deck_sub_subsh1', text: 'id' }),
+    });
+    expect(ownerSend.status).toBe(200);
   });
 });

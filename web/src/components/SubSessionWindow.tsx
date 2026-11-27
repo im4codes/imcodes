@@ -1251,19 +1251,30 @@ export function SubSessionWindow({
       {/* Content */}
       <div class="subsession-content">
         <div style={{ display: viewMode === 'terminal' ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}>
-          {visible && <TerminalView
-              sessionName={sub.sessionName}
-              ws={ws}
-              connected={connected}
-              active={(isShell || active) && viewMode === 'terminal'}
-              autoFocus={active && viewMode === 'terminal'}
-              onDiff={(apply) => onDiff(sub.sessionName, apply)}
-              onHistory={(apply) => onHistory(sub.sessionName, apply)}
-              onFitFn={(fn) => { termFitFnRef.current = fn; }}
-              onScrollBottomFn={onTermScrollBottomFn}
-              mobileInput={isShell}
-              onRestart={onRestart}
-            />}
+          {visible && (() => {
+            const isShareScoped = !!sharedState && sharedState.outgoing !== true;
+            const terminalReadOnly = isShareScoped && (isShell || sharedState?.effectiveRole !== 'participant');
+            const terminalReadOnlyHint = isShareScoped && isShell
+              ? t('share.shell_participant_forbidden')
+              : undefined;
+            return (
+              <TerminalView
+                sessionName={sub.sessionName}
+                ws={ws}
+                connected={connected}
+                active={(isShell || active) && viewMode === 'terminal'}
+                autoFocus={active && viewMode === 'terminal'}
+                onDiff={(apply) => onDiff(sub.sessionName, apply)}
+                onHistory={(apply) => onHistory(sub.sessionName, apply)}
+                onFitFn={(fn) => { termFitFnRef.current = fn; }}
+                onScrollBottomFn={onTermScrollBottomFn}
+                mobileInput={isShell && !terminalReadOnly}
+                readOnly={terminalReadOnly}
+                readOnlyHint={terminalReadOnlyHint}
+                onRestart={onRestart}
+              />
+            );
+          })()}
         </div>
         {visible && viewMode === 'chat' && (
           <ChatView

@@ -39,9 +39,11 @@ import {
   CLAUDE_CODE_CLI_SDK_AGENT_TYPE,
   isClaudeCodeSdkAgentType,
   isSessionAgentType,
+  isShellLikeAgentType,
   isSubSessionRecord,
   unsupportedAgentTypeError,
 } from '../../shared/agent-types.js';
+import { PARTICIPANT_SHELL_FORBIDDEN_REASON } from '../../shared/tab-sharing.js';
 import { isServerLinkResyncStatePayload, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
@@ -3313,9 +3315,32 @@ async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
 
 // sanitizeProjectName moved to shared/sanitize-project-name.ts
 
+function isParticipantSharedActor(cmd: Record<string, unknown>): boolean {
+  const sharedActor = cmd.sharedActor;
+  return Boolean(
+    sharedActor
+    && typeof sharedActor === 'object'
+    && (sharedActor as { effectiveActorRole?: unknown }).effectiveActorRole === 'participant',
+  );
+}
+
 async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawProject = cmd.project as string | undefined;
   const agentType = (cmd.agentType as string) || 'claude-code';
+  if (isParticipantSharedActor(cmd)) {
+    const targetProject = rawProject ? sanitizeProjectName(rawProject) : undefined;
+    const targetSession = targetProject ? `deck_${targetProject}_brain` : undefined;
+    const existingTarget = targetSession ? getSession(targetSession) : undefined;
+    if (isShellLikeAgentType(agentType) || isShellLikeAgentType(existingTarget?.agentType)) {
+      logger.warn({ project: targetProject ?? rawProject, agentType }, 'session.start rejected: participant_shell_forbidden');
+      serverLink.send({
+        type: 'session.error',
+        ...(targetProject ? { project: targetProject } : {}),
+        message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+      });
+      return;
+    }
+  }
   const requestedDir = expandTilde((cmd.dir as string) || '~');
   const ccPresetName = cmd.ccPreset as string | undefined;
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
@@ -3533,6 +3558,20 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
   const sessionName = cmd.sessionName as string | undefined;
   if (sessionName) {
     const record = getSession(sessionName);
+    if (
+      isParticipantSharedActor(cmd)
+      && (isShellLikeAgentType(cmd.agentType) || isShellLikeAgentType(record?.agentType))
+    ) {
+      logger.warn({ sessionName, requestedAgentType: cmd.agentType, currentAgentType: record?.agentType }, 'session.restart rejected: participant_shell_forbidden');
+      serverLink.send({
+        type: 'session.error',
+        project: record?.projectName ?? sessionName,
+        session: sessionName,
+        sessionName,
+        message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+      });
+      return;
+    }
     if (!record) {
       logger.warn({ sessionName }, 'session.restart: session not found in store');
       return;
@@ -3585,6 +3624,14 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     logger.warn({ project }, 'session.restart: no brain session found');
     return;
   }
+  if (
+    isParticipantSharedActor(cmd)
+    && (isShellLikeAgentType(cmd.agentType) || isShellLikeAgentType(brain.agentType))
+  ) {
+    logger.warn({ project, brainSession: brain.name, brainAgentType: brain.agentType }, 'session.restart(project) rejected: participant_shell_forbidden');
+    try { serverLink.send({ type: 'session.error', project, message: PARTICIPANT_SHELL_FORBIDDEN_REASON }); } catch { /* ignore */ }
+    return;
+  }
   if (!isSessionAgentType(brain.agentType)) {
     const message = unsupportedAgentTypeError(String(brain.agentType)).message;
     logger.warn({ project, sessionName: brain.name, agentType: brain.agentType }, 'session.restart aborted: unsupported brain agent type');
@@ -3603,6 +3650,10 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     });
   const workerTypes: ProjectConfig['workerTypes'] = [];
   for (const worker of projectWorkers) {
+    if (isParticipantSharedActor(cmd) && isShellLikeAgentType(worker.agentType)) {
+      logger.warn({ project, sessionName: worker.name, agentType: worker.agentType }, 'session.restart: skipping shell/script worker for shared participant');
+      continue;
+    }
     if (!isSessionAgentType(worker.agentType)) {
       logger.warn(
         { project, sessionName: worker.name, role: worker.role, agentType: worker.agentType },
@@ -5055,6 +5106,31 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
 
   if (!sessionName || typeof text !== 'string') {
     logger.warn('session.send: missing sessionName or text');
+    return;
+  }
+
+  const sendTargetRecord = getSession(sessionName);
+  if (
+    sharedActor?.effectiveActorRole === 'participant'
+    && (
+      isShellLikeAgentType(sendTargetRecord?.agentType)
+      || isShellLikeAgentType(cmd.agentType)
+      || isShellLikeAgentType(cmd.sessionType)
+    )
+  ) {
+    logger.warn({ sessionName, commandId: commandId ?? null, agentType: sendTargetRecord?.agentType }, 'session.send rejected: participant_shell_forbidden');
+    const errCommandId = commandId ?? crypto.randomUUID();
+    timelineEmitter.emit(sessionName, 'command.ack', {
+      commandId: errCommandId,
+      status: 'error',
+      error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+    });
+    emitCommandAckReliable(serverLink, {
+      commandId: errCommandId,
+      sessionName,
+      status: 'error',
+      error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+    });
     return;
   }
 
@@ -7285,10 +7361,24 @@ async function handleDeleteTimelineMessage(cmd: Record<string, unknown>, serverL
 async function handleInput(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   if (!sessionName || cmd.data === undefined) return;
+  const inputRecord = getSession(sessionName);
+  if (isParticipantSharedActor(cmd) && isShellLikeAgentType(inputRecord?.agentType)) {
+    logger.warn({ sessionName, agentType: inputRecord?.agentType }, 'session.input rejected: participant_shell_forbidden');
+    try {
+      serverLink.send({
+        type: 'session.error',
+        project: inputRecord?.projectName ?? sessionName,
+        session: sessionName,
+        sessionName,
+        message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+      });
+    } catch { /* ignore */ }
+    return;
+  }
   // Transport sessions have no terminal and never reach the process authority window.
   const binding = getTransportRuntime(sessionName)
     ? undefined
-    : bindProcessSharedMachineCommand(sessionName, getSession(sessionName), cmd);
+    : bindProcessSharedMachineCommand(sessionName, inputRecord, cmd);
   try {
     await handleInputBound(cmd, serverLink);
   } finally {
@@ -8673,6 +8763,19 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const id = cmd.id as string | undefined;
   const type = cmd.sessionType as string | undefined;
   const sessionName = id ? subSessionName(id) : undefined;
+  if (isParticipantSharedActor(cmd) && isShellLikeAgentType(type ?? cmd.agentType)) {
+    logger.warn({ id, sessionName, type: type ?? cmd.agentType }, 'subsession.start rejected: participant_shell_forbidden');
+    serverLink.send({
+      type: 'session.error',
+      message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+      ...(id && sessionName ? { id, session: sessionName, sessionName } : {}),
+      ...(typeof cmd.parentSession === 'string' && cmd.parentSession ? { project: cmd.parentSession } : {}),
+    });
+    if (incognito && id && sessionName) {
+      serverLink.send({ type: 'subsession.closed', id, sessionName, incognito: true });
+    }
+    return;
+  }
   if (incognito && (!type || !supportsSessionIncognito(type) || !serverLink.supportsIncognitoSessions())) {
     serverLink.send({
       type: 'session.error',
@@ -8853,6 +8956,20 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
     return;
   }
   const record = getSession(sName);
+  if (
+    isParticipantSharedActor(cmd)
+    && (isShellLikeAgentType(cmd.agentType ?? cmd.sessionType) || isShellLikeAgentType(record?.agentType))
+  ) {
+    logger.warn({ sessionName: sName, requestedAgentType: cmd.agentType ?? cmd.sessionType, currentAgentType: record?.agentType }, 'subsession.restart rejected: participant_shell_forbidden');
+    serverLink.send({
+      type: 'session.error',
+      project: record?.projectName ?? sName,
+      session: sName,
+      sessionName: sName,
+      message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
+    });
+    return;
+  }
   if (!record) {
     logger.warn({ sessionName: sName }, 'subsession.restart: session not found in store');
     return;

@@ -179,6 +179,7 @@
     "menu": {
       "shareTab": "Compartir"
     },
+    "shell_participant_forbidden": "Los participantes compartidos solo pueden usar sesiones de agentes de IA; shell y script son exclusivos del propietario.",
     "dialogTitle": "Compartir acceso",
     "dialogSubtitle": "Concede acceso limitado a {{target}}.",
     "target": {

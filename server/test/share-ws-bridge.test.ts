@@ -3679,4 +3679,81 @@ describe('WsBridge share-scoped sockets', () => {
     await flushAsync();
     expect(viewer.sentJson.some((m) => m.type === 'subsession.removed' && m.id === 'live_child')).toBe(true);
   });
+
+  it('blocks BOTH tab-share and whole-server-share participants from creating, starting, restarting, or sending input to shell/script sessions over WS', async () => {
+    const now = Date.now();
+    const daemon = new MockWs();
+    const bridge = WsBridge.get(serverId);
+    const subRows: Array<{ id: string; parent_session: string | null }> = [
+      { id: 'sh1', parent_session: 'deck_proj_brain' },
+      { id: 'sc1', parent_session: 'deck_proj_brain' },
+    ];
+    const db = makeDb(null, [], { subSessions: subRows });
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-shell-ws-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+
+    // Sync one LLM main session and two shell/script sub-sessions so targetAgentType is known.
+    daemon.emit('message', JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: 'deck_proj_brain', project: 'proj', role: 'brain', state: 'idle', agentType: 'claude-code', runtimeType: 'process' },
+      ],
+    }));
+    daemon.emit('message', JSON.stringify({
+      type: 'subsession.sync',
+      id: 'sh1',
+      parentSession: 'deck_proj_brain',
+      sessionType: 'shell',
+      runtimeType: 'process',
+      state: 'idle',
+    }));
+    daemon.emit('message', JSON.stringify({
+      type: 'subsession.sync',
+      id: 'sc1',
+      parentSession: 'deck_proj_brain',
+      sessionType: 'script',
+      runtimeType: 'process',
+      state: 'idle',
+    }));
+    await flushAsync();
+
+    const mainTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const serverTarget: ShareTarget = { kind: 'server', serverId };
+
+    for (const [label, target, cov] of [
+      ['tab-share', mainTarget, coverage(mainTarget, 'participant', now)],
+      ['server-share', serverTarget, { ...coverage(serverTarget, 'participant', now), serverParticipantAuthority: true }],
+    ] as const) {
+      bridge.setShareCoverageResolverForTests(async () => cov);
+      const sock = new MockWs();
+      bridge.handleShareBrowserConnection(sock as never, `participant-${label}`, db, {
+        ticketId: `ticket-${label}`,
+        target,
+        snapshot: cov,
+      });
+      daemon.sent.length = 0;
+
+      // Forbidden shell/script commands
+      sock.emit('message', JSON.stringify({ type: 'session.input', sessionName: 'deck_sub_sh1', data: 'whoami\r' }));
+      sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_sub_sc1', text: 'ls', commandId: `send-${label}` }));
+      sock.emit('message', JSON.stringify({ type: 'session.start', project: 'newsh', dir: '/tmp/newsh', agentType: 'shell' }));
+      sock.emit('message', JSON.stringify({ type: 'session.restart', sessionName: 'deck_proj_brain', agentType: 'script' }));
+      sock.emit('message', JSON.stringify({ type: 'subsession.start', id: `newsh_${label}`, sessionType: 'shell', parentSession: 'deck_proj_brain' }));
+      sock.emit('message', JSON.stringify({ type: 'subsession.start', id: `newsc_${label}`, sessionType: 'script', parentSession: 'deck_proj_brain' }));
+      sock.emit('message', JSON.stringify({ type: 'subsession.restart', sessionName: 'deck_sub_sh1' }));
+      await flushAsync();
+
+      expect(daemon.sentJson).toHaveLength(0);
+      expect(sock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === `send-${label}` && m.reason === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN)).toBe(true);
+      expect(sock.sentJson.filter((m) => m.type === 'error' && m.code === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN).length).toBeGreaterThanOrEqual(4);
+
+      // Permitted LLM session commands keep working normally
+      sock.emit('message', JSON.stringify({ type: 'session.input', sessionName: 'deck_proj_brain', data: '\x1b' }));
+      sock.emit('message', JSON.stringify({ type: 'subsession.start', id: `ok_${label}`, sessionType: 'codex-sdk', parentSession: 'deck_proj_brain' }));
+      await flushAsync();
+      expect(daemon.sentJson.some((m) => m.type === 'session.input' && m.sessionName === 'deck_proj_brain')).toBe(true);
+      expect(daemon.sentJson.some((m) => m.type === 'subsession.start' && m.sessionType === 'codex-sdk')).toBe(true);
+    }
+  });
 });

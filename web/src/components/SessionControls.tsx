@@ -3135,8 +3135,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   // participant role belongs to the recipient and must never turn the owner's
   // own composer into a share-scoped, read-only surface.
   const isShareScopedSession = !!sharedState && sharedState.outgoing !== true;
+  const isShellSession = activeSession?.agentType === 'shell' || activeSession?.agentType === 'script';
   const canSharedSessionSend = !isShareScopedSession
-    || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant');
+    || (sharedState?.status === 'active' && sharedState.effectiveRole === 'participant' && !isShellSession);
   const canManageSharedServer = canSharedActorManageServer(sharedState);
   // Session settings mutate the owner session, so shared access is a positive
   // role grant rather than a consequence of the menu being reachable. Active
@@ -9366,7 +9367,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   };
 
   const handleShortcut = (data: string) => {
-    if (!ws || !activeSession) return;
+    if (!ws || !activeSession || inputDisabled) return;
     ws.sendInput(activeSession.name, data);
     onAfterAction?.();
   };

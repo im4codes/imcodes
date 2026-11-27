@@ -53,7 +53,7 @@ import {
 } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
-import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '@shared/agent-types.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, isShellLikeAgentType } from '@shared/agent-types.js';
 import { SESSION_INCOGNITO_CAPABILITY, supportsSessionIncognito } from '@shared/session-incognito-types.js';
 import { IncognitoCreateOption } from './IncognitoCreateOption.js';
 
@@ -83,6 +83,8 @@ interface Props {
   defaultCwd?: string;
   /** Optional consumer-owned filter. The ordinary launcher remains unchanged. */
   allowedAgentTypes?: readonly string[];
+  /** True for shared-session / shared-server participants: hides and blocks shell/script sessions. */
+  forbidShellAgentTypes?: boolean;
   /** Lets a caller place the reused launcher above another modal. */
   overlayClassName?: string;
   isProviderConnected: (id: string) => boolean;
@@ -106,9 +108,12 @@ export function resolveDefaultSubSessionType(allowedAgentTypes?: readonly string
   return selectableAllowed[0] ?? AGY_SDK_PROVIDER_ID;
 }
 
-export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTypes, overlayClassName, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
+export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTypes, forbidShellAgentTypes = false, overlayClassName, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
   const { t } = useTranslation();
-  const initialType = useMemo(() => resolveDefaultSubSessionType(allowedAgentTypes), [allowedAgentTypes]);
+  const initialType = useMemo(() => {
+    const resolved = resolveDefaultSubSessionType(allowedAgentTypes);
+    return forbidShellAgentTypes && isShellLikeAgentType(resolved) ? AGY_SDK_PROVIDER_ID : resolved;
+  }, [allowedAgentTypes, forbidShellAgentTypes]);
   const [type, setType] = useState(initialType);
   const [lastUnlockedType, setLastUnlockedType] = useState(initialType);
   const [customProviderSdk, setCustomProviderSdk] = useState(false);
@@ -183,6 +188,7 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
   };
   const selectType = (nextType: string) => {
     if (!isSessionAgentTypeSelectable(nextType)) return;
+    if (forbidShellAgentTypes && isShellLikeAgentType(nextType)) return;
     if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextType)) return;
     if (incognito && !supportsSessionIncognito(nextType)) return;
     if (nextType !== type) {
@@ -347,7 +353,9 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
     ? Math.min(MAX_SUB_SESSION_LAUNCH_COUNT, Math.max(1, parseInt(countInput, 10) || 1))
     : 1;
 
-  const canStartType = isSessionAgentTypeSelectable(type) && (!allowedAgentTypeSet || allowedAgentTypeSet.has(type));
+  const canStartType = isSessionAgentTypeSelectable(type)
+    && !(forbidShellAgentTypes && isShellLikeAgentType(type))
+    && (!allowedAgentTypeSet || allowedAgentTypeSet.has(type));
   const incognitoBlocked = incognito && (!canIncognito || !supportsSessionIncognito(type));
   const handleStart = () => {
     if (!canStartType || incognitoBlocked) return;
@@ -620,13 +628,15 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
                   <div key={group.id} class="session-agent-group">
                     <div class="session-agent-group-title">{t(SESSION_AGENT_GROUP_LABEL_KEYS[group.id])}</div>
                     <div class="session-agent-grid">
-                      {visibleItems.map((choice) => (
+                      {visibleItems.map((choice) => {
+                        const shellBlocked = forbidShellAgentTypes && isShellLikeAgentType(choice.id);
+                        return (
                         <button
                           key={choice.id}
                           type="button"
                           class={`session-agent-card${type === choice.id ? ' active' : ''}`}
                           data-agent-type={choice.id}
-                          // Hidden choices (e.g. qwen) stay real DOM nodes --
+                          // Hidden choices (e.g. qwen, or shell/script for shared participants) stay real DOM nodes --
                           // just invisible and out of the tab/accessibility
                           // order -- rather than being omitted from
                           // visibleItems, so the underlying data/behavior
@@ -637,15 +647,16 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
                           // legitimately offers qwen as a backend) is a
                           // deliberate exception and renders normally. Unavailable Claude CLI SDK
                           // is never restored by an allow-list.
-                          style={(choice.hidden && (!isSessionAgentTypeSelectable(choice.id) || !allowedAgentTypeSet?.has(choice.id))) ? { display: 'none' } : undefined}
-                          disabled={!isSessionAgentTypeSelectable(choice.id) || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
+                          style={(shellBlocked || (choice.hidden && (!isSessionAgentTypeSelectable(choice.id) || !allowedAgentTypeSet?.has(choice.id)))) ? { display: 'none' } : undefined}
+                          disabled={shellBlocked || !isSessionAgentTypeSelectable(choice.id) || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
                           aria-pressed={type === choice.id}
                           onClick={() => selectType(choice.id)}
                         >
                           <span class="session-agent-card-icon" aria-hidden="true">{choice.icon}</span>
                           <span>{getSessionAgentLabel(t, choice)}</span>
                         </button>
-                      ))}
+                        );
+                      })}
                     </div>
                   </div>
                 );

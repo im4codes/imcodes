@@ -12,7 +12,9 @@ import { P2P_WORKFLOW_MSG } from '../../../shared/p2p-workflow-messages.js';
 import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
 import { isP2pSavedConfig, sanitizeP2pSavedConfig } from '../../../shared/p2p-modes.js';
 import { collectRoutedSessionNames } from '../../../shared/p2p-routing-fields.js';
+import { isShellLikeAgentType } from '../../../shared/agent-types.js';
 import {
+  PARTICIPANT_SHELL_FORBIDDEN_REASON,
   SHARE_BROWSER_COMMANDS,
   isSharedServerParticipant,
   rawSubSessionIdFromDisplayName,
@@ -68,6 +70,7 @@ export type ShareReason = Extract<
   | 'share-cancel-unsupported'
   | 'share-dispatch-changed'
   | 'share-comment-invalid'
+  | typeof PARTICIPANT_SHELL_FORBIDDEN_REASON
 >;
 
 export type ShareScopedSocketState = {
@@ -141,7 +144,17 @@ export const SHARE_REASONS = {
   CANCEL_UNSUPPORTED: 'share-cancel-unsupported',
   DISPATCH_CHANGED: 'share-dispatch-changed',
   COMMENT_INVALID: 'share-comment-invalid',
+  PARTICIPANT_SHELL_FORBIDDEN: PARTICIPANT_SHELL_FORBIDDEN_REASON,
 } as const satisfies Record<string, ShareReason>;
+
+export const SHELL_FORBIDDEN_SHARE_COMMANDS: ReadonlySet<string> = new Set([
+  'session.input',
+  'session.send',
+  'session.start',
+  'session.restart',
+  'subsession.start',
+  'subsession.restart',
+]);
 
 const SHARE_MODEL_CATALOG_AGENT_TYPES = new Set([
   'claude-code-sdk',
@@ -597,6 +610,7 @@ export function evaluateShareCommand(input: {
   state: ShareScopedSocketState;
   now: number;
   runtimeType: 'process' | 'transport' | 'unknown';
+  targetAgentType?: string | null;
   activeDispatchId: string | null;
 }): ShareCommandDecision {
   const type = typeof input.msg.type === 'string' ? input.msg.type : '';
@@ -746,6 +760,17 @@ export function evaluateShareCommand(input: {
 
   if (input.state.snapshot.effectiveRole !== 'participant') {
     return { allowed: false, reason: SHARE_REASONS.ROLE_DENIED };
+  }
+
+  if (SHELL_FORBIDDEN_SHARE_COMMANDS.has(type)) {
+    const requestedAgentType = typeof input.msg.agentType === 'string'
+      ? input.msg.agentType
+      : typeof input.msg.sessionType === 'string'
+        ? input.msg.sessionType
+        : undefined;
+    if (isShellLikeAgentType(requestedAgentType) || isShellLikeAgentType(input.targetAgentType)) {
+      return { allowed: false, reason: SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN };
+    }
   }
 
   if (policy.kind === 'participant-bound-action') {

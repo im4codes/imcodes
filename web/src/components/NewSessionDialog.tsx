@@ -67,7 +67,7 @@ import {
 } from "../../../src/shared/models/options.js";
 import { loadAgyModelPreference, saveAgyModelPreference } from "../agy-model-preference.js";
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from "@shared/git-remote-url.js";
-import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from "@shared/agent-types.js";
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, isShellLikeAgentType, type SessionAgentType } from "@shared/agent-types.js";
 import {
   CODEBUDDY_CHINA_DEFAULT_MODEL,
   CODEBUDDY_CHINA_MODEL_FALLBACK,
@@ -116,6 +116,7 @@ const responsiveDialogStyle = {
 interface Props {
   ws: WsClient | null;
   serverId: string;
+  forbidShellAgentTypes?: boolean;
   onClose: () => void;
   onSessionStarted: (sessionName: string) => void;
   isProviderConnected: (id: string) => boolean;
@@ -147,6 +148,7 @@ function canUseGitRemoteClone(ws: WsClient | null): boolean {
 export function NewSessionDialog({
   ws,
   serverId,
+  forbidShellAgentTypes = false,
   onClose,
   onSessionStarted,
   isProviderConnected: _isProviderConnected,
@@ -214,6 +216,7 @@ export function NewSessionDialog({
     map: AgentAvailabilityMap | null = agentAvailability,
   ): boolean => (
     isSessionAgentTypeSelectable(id)
+    && !(forbidShellAgentTypes && isShellLikeAgentType(id))
     && isAgentInstalled(id, map)
     && (!incognito || supportsSessionIncognito(id))
     && (!customProviderSdk || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(id))
@@ -226,6 +229,7 @@ export function NewSessionDialog({
       for (const choice of group.items) {
         if (choice.hidden) continue;
         if (!isSessionAgentTypeSelectable(choice.id)) continue;
+        if (forbidShellAgentTypes && isShellLikeAgentType(choice.id)) continue;
         if (opts.customOnly && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)) continue;
         if (opts.incognitoOnly && !supportsSessionIncognito(choice.id)) continue;
         if (map ? !isAgentExplicitlyInstalled(choice.id, map) : !isAgentInstalled(choice.id, map)) continue;
@@ -1301,7 +1305,7 @@ export function NewSessionDialog({
                       // choice is unreachable for a real user while the
                       // underlying data/behavior (and any test that still
                       // queries it directly) stays fully intact.
-                      style={choice.hidden ? { display: 'none' } : undefined}
+                      style={choice.hidden || (forbidShellAgentTypes && isShellLikeAgentType(choice.id)) ? { display: 'none' } : undefined}
                       disabled={starting || !isAgentValidForFilters(choice.id)}
                       aria-pressed={agentType === choice.id}
                       title={unavailable ? t("new_session.agent_not_installed_hint") : undefined}

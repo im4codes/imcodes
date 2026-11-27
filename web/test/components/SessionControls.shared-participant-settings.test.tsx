@@ -364,7 +364,7 @@ describe('SessionControls shared participant settings entry points', () => {
     expect(within(viewerMenu).queryByRole('button', { name: 'Settings' })).toBeNull();
     view.unmount();
 
-    render(
+    const shellView = render(
       <SessionControls
         ws={makeWs() as never}
         connected
@@ -386,8 +386,34 @@ describe('SessionControls shared participant settings entry points', () => {
     fireEvent.click(screen.getByTitle('Actions'));
     const shellMenu = document.querySelector('.session-actions-menu') as HTMLElement;
     expect(shellMenu).not.toBeNull();
-    expect(within(shellMenu).getByRole('button', { name: 'Settings' })).toBeDefined();
+    expect(within(shellMenu).queryByRole('button', { name: 'Settings' })).toBeNull();
     expect(within(shellMenu).queryByRole('button', { name: 'Supervision settings' })).toBeNull();
+    shellView.unmount();
+
+    render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={{
+          ...sharedSession('participant'),
+          name: 'deck_sub_proc',
+          role: 'worker',
+          agentType: 'claude-code',
+          runtimeType: 'process',
+        } as SessionInfo}
+        subSessionId="sub-1"
+        hideWorkflowControls
+        onSubStop={vi.fn()}
+        quickData={quickData}
+        onSettings={onSettings}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    const procMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(procMenu).not.toBeNull();
+    expect(within(procMenu).getByRole('button', { name: 'Settings' })).toBeDefined();
+    expect(within(procMenu).queryByRole('button', { name: 'Supervision settings' })).toBeNull();
   });
 
   it('removes both settings entries when an open participant surface is downgraded to viewer', () => {

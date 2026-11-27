@@ -35,6 +35,10 @@ interface Props {
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, allow keyboard input on mobile (for shell/ssh sessions). */
   mobileInput?: boolean;
+  /** When true, block terminal input/paste (used for viewer shares and participant-forbidden shell/script views). */
+  readOnly?: boolean;
+  /** Optional read-only notice banner shown over the top of the terminal. */
+  readOnlyHint?: string;
   /** Action shown when daemon recovery is exhausted instead of leaving a black pane. */
   onRestart?: () => void;
 }
@@ -95,7 +99,7 @@ export function joinWrappedTerminalSelection(selection: string, continuationRows
   return joined;
 }
 
-export function TerminalView({ sessionName, ws, connected, active = true, autoFocus = true, preview = false, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput, onRestart }: Props) {
+export function TerminalView({ sessionName, ws, connected, active = true, autoFocus = true, preview = false, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput, readOnly = false, readOnlyHint, onRestart }: Props) {
   const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -109,6 +113,10 @@ export function TerminalView({ sessionName, ws, connected, active = true, autoFo
   autoFocusRef.current = autoFocus;
   const previewRef = useRef(preview);
   previewRef.current = preview;
+  const readOnlyRef = useRef(readOnly);
+  readOnlyRef.current = readOnly;
+  const mobileInputRef = useRef(mobileInput);
+  mobileInputRef.current = mobileInput;
   const pendingRawChunksRef = useRef<Uint8Array[]>([]);
   const pendingRawBytesRef = useRef(0);
   // xterm's parser is asynchronous. Serialise *all* writes (raw PTY bytes and
@@ -345,8 +353,8 @@ export function TerminalView({ sessionName, ws, connected, active = true, autoFo
       allowTransparency: false,
       cursorBlink: !preview,
       // On mobile: disable xterm stdin unless mobileInput is set (shell sessions
-      // need keyboard for interactive SSH-like input).
-      disableStdin: isMobileRef.current && !mobileInput,
+      // need keyboard for interactive SSH-like input). Never accept stdin in readOnly mode.
+      disableStdin: Boolean(readOnlyRef.current) || (isMobileRef.current && !mobileInput),
     });
 
     // The isolated real-browser shell harness uses the xterm API to select and
@@ -436,12 +444,14 @@ export function TerminalView({ sessionName, ws, connected, active = true, autoFo
     // This prevents keys from going to the terminal in chat mode even if
     // xterm's hidden textarea still has focus.
     term.onData((data) => {
+      if (readOnlyRef.current) return;
       const el = containerRef.current;
       if (el && el.clientWidth === 0 && el.clientHeight === 0) return;
       wsRef.current?.sendInput(sessionName, data);
     });
 
     const handlePaste = (ev: ClipboardEvent) => {
+      if (readOnlyRef.current) return;
       const el = containerRef.current;
       if (!el || (el.clientWidth === 0 && el.clientHeight === 0)) return;
       const text = ev.clipboardData?.getData('text/plain') ?? '';
@@ -818,6 +828,12 @@ export function TerminalView({ sessionName, ws, connected, active = true, autoFo
   }, [applyHistory, onHistory]);
 
   useEffect(() => {
+    if (termRef.current) {
+      termRef.current.options.disableStdin = Boolean(readOnly) || (isMobileRef.current && !mobileInput);
+    }
+  }, [readOnly, mobileInput]);
+
+  useEffect(() => {
     if (active) return;
     if (scrollHideTimerRef.current) {
       clearTimeout(scrollHideTimerRef.current);
@@ -836,19 +852,43 @@ export function TerminalView({ sessionName, ws, connected, active = true, autoFo
 
   return (
     <div class="terminal-wrap" style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+      {readOnly && readOnlyHint && (
+        <div
+          role="status"
+          data-testid="terminal-readonly-hint"
+          style={{
+            position: 'absolute',
+            top: 8,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 4,
+            padding: '4px 10px',
+            borderRadius: 6,
+            background: 'rgba(15, 23, 42, 0.9)',
+            border: '1px solid #334155',
+            color: '#cbd5e1',
+            fontSize: 12,
+            pointerEvents: 'none',
+            maxWidth: 'calc(100% - 24px)',
+            textAlign: 'center',
+          }}
+        >
+          {readOnlyHint}
+        </div>
+      )}
       <div
         ref={containerRef}
         class="terminal-container"
         style={{ width: '100%', height: '100%', overflow: 'hidden' }}
         onClick={isMobile ? undefined : () => {
           fitRef.current?.fit();
-          termRef.current?.focus();
+          if (!readOnly) termRef.current?.focus();
         }}
         onTouchStart={isMobile ? (e) => {
           isTouchingRef.current = true;
           const t = e.touches[0];
           touchStartPosRef.current = { x: t.clientX, y: t.clientY };
-          if (!mobileInput) e.preventDefault(); // block keyboard popup — except for shell sessions
+          if (readOnly || !mobileInput) e.preventDefault(); // block keyboard popup when readOnly or non-shell
         } : undefined}
         onTouchEnd={isMobile ? (e) => {
           isTouchingRef.current = false;
@@ -856,7 +896,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, autoFo
           const startPos = touchStartPosRef.current;
           touchStartPosRef.current = null;
           // For shell sessions: focus xterm textarea to trigger keyboard (tap only, not scroll)
-          if (mobileInput && termRef.current && startPos) {
+          if (!readOnly && mobileInput && termRef.current && startPos) {
             const t = e.changedTouches[0];
             const dx = Math.abs(t.clientX - startPos.x);
             const dy = Math.abs(t.clientY - startPos.y);

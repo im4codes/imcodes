@@ -335,7 +335,7 @@ import {
   type DaemonUpgradeBlockedToastState,
 } from './daemon-upgrade-blocked.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
-import { getSessionRuntimeType } from '@shared/agent-types.js';
+import { getSessionRuntimeType, isShellLikeAgentType } from '@shared/agent-types.js';
 import { canSessionRoleOwnAutomaticSupervision, getSupportedSupervisionBackendOptions } from '@shared/supervision-config.js';
 import type { SupervisionExecutionPoolKind } from '@shared/supervision-execution-pool.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
@@ -8132,6 +8132,12 @@ function InternalMainApp() {
         return;
       }
 
+      const mainSession = sessionsRef.current.find((item) => item.name === session);
+      const targetAgentType = focusedSubId ? focusedSubRecord?.type : mainSession?.agentType;
+      const isShareScopedTarget = selectedShareTargetRef.current !== null
+        || Boolean(mainSession?.sharedState && mainSession.sharedState.outgoing !== true);
+      if (isShareScopedTarget && isShellLikeAgentType(targetAgentType)) return;
+
       let data: string | null = null;
       if (e.key === 'Enter')     { data = '\r'; }
       else if (e.key === 'Backspace') { data = '\x7f'; }
@@ -8183,6 +8189,11 @@ function InternalMainApp() {
         fallbackMainViewMode: viewModesRef.current[session] ?? defaultViewMode,
       });
       if (currentViewMode !== 'terminal') return;
+      const mainSession = sessionsRef.current.find((item) => item.name === session);
+      const targetAgentType = focusedSubId ? focusedSubRecord?.type : mainSession?.agentType;
+      const isShareScopedTarget = selectedShareTargetRef.current !== null
+        || Boolean(mainSession?.sharedState && mainSession.sharedState.outgoing !== true);
+      if (isShareScopedTarget && isShellLikeAgentType(targetAgentType)) return;
       const text = e.clipboardData?.getData('text/plain') ?? '';
       if (!text) return;
       e.preventDefault();
@@ -13223,6 +13234,7 @@ function InternalMainApp() {
         <NewSessionDialog
           ws={wsRef.current}
           serverId={selectedServerId ?? ''}
+          forbidShellAgentTypes={Boolean(selectedShareTarget)}
           onClose={() => setShowNewSession(false)}
           onSessionStarted={(name) => { setActiveSession(name); setShowNewSession(false); }}
           isProviderConnected={isProviderConnected}
@@ -13470,6 +13482,7 @@ function InternalMainApp() {
           serverId={selectedServerId ?? undefined}
           defaultCwd={activeSessionInfo?.projectDir}
           allowedAgentTypes={poolAddTarget ? getSupportedSupervisionBackendOptions() : undefined}
+          forbidShellAgentTypes={Boolean(selectedShareTarget)}
           overlayClassName={poolAddTarget ? 'session-settings-child-overlay' : undefined}
           isProviderConnected={isProviderConnected}
           getRemoteSessions={getRemoteSessions}
@@ -13527,6 +13540,7 @@ function InternalMainApp() {
           cwd={settingsTarget.cwd}
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
+          forbidShellAgentTypes={Boolean(selectedShareTarget)}
           canControlAutomaticSupervision={settingsTarget.canControlAutomaticSupervision}
           transportConfig={settingsTarget.transportConfig}
           supervisionMode={settingsTarget.supervisionMode}

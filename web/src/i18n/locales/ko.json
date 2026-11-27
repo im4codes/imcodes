@@ -179,6 +179,7 @@
     "menu": {
       "shareTab": "공유"
     },
+    "shell_participant_forbidden": "공유 참여자는 AI 에이전트 세션만 사용할 수 있으며 shell / script 세션은 소유자 전용입니다.",
     "dialogTitle": "액세스 공유",
     "dialogSubtitle": "{{target}}에 범위가 제한된 액세스를 부여합니다.",
     "target": {

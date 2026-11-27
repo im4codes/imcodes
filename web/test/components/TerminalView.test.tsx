@@ -884,4 +884,43 @@ describe('TerminalView desktop autoFocus guard', () => {
       unmount();
     }
   });
+
+  it('blocks terminal keystrokes and paste while displaying readOnlyHint when readOnly is true', () => {
+    (TerminalMock as unknown as ReturnType<typeof vi.fn>).mockClear();
+    const sendInput = vi.fn();
+    const ws = {
+      sendInput,
+      sendResize: vi.fn(),
+      sendSnapshotRequest: vi.fn(),
+      onTerminalRaw: vi.fn(() => vi.fn()),
+      onMessage: vi.fn(() => vi.fn()),
+    } as any;
+    const { container, unmount } = render(
+      <TerminalView
+        sessionName="deck_sub_sh1"
+        ws={ws}
+        connected={true}
+        readOnly={true}
+        readOnlyHint="Shared participants cannot use shell sessions."
+      />,
+    );
+    const termInstance = (TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.results.at(-1)?.value;
+    expect((TerminalMock as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0]).toMatchObject({
+      disableStdin: true,
+    });
+    const onDataCb = termInstance.onData.mock.calls[0]?.[0] as ((d: string) => void) | undefined;
+    expect(onDataCb).toBeDefined();
+    onDataCb!('rm -rf /\r');
+    expect(sendInput).not.toHaveBeenCalled();
+
+    const termContainer = container.querySelector('.terminal-container')!;
+    const pasteEv = new Event('paste', { bubbles: true, cancelable: true }) as ClipboardEvent;
+    Object.defineProperty(pasteEv, 'clipboardData', { value: { getData: () => 'ls\n' } });
+    termContainer.dispatchEvent(pasteEv);
+    expect(sendInput).not.toHaveBeenCalled();
+
+    const hint = screen.getByTestId('terminal-readonly-hint');
+    expect(hint.textContent).toBe('Shared participants cannot use shell sessions.');
+    unmount();
+  });
 });

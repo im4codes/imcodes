@@ -18,8 +18,8 @@ import {
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { listActiveSharesForUser } from '../db/tab-sharing.js';
-import { rawSubSessionIdFromDisplayName } from '../../../shared/tab-sharing.js';
-import { getSessionRuntimeType, isSessionAgentType } from '../../../shared/agent-types.js';
+import { PARTICIPANT_SHELL_FORBIDDEN_REASON, rawSubSessionIdFromDisplayName } from '../../../shared/tab-sharing.js';
+import { getSessionRuntimeType, isSessionAgentType, isShellLikeAgentType } from '../../../shared/agent-types.js';
 import { SESSION_INCOGNITO_UNSUPPORTED, supportsSessionIncognito } from '../../../shared/session-incognito-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -192,9 +192,14 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
     const reason = shareReason ?? (member.ok ? 'share-role-denied' : member.reason);
     return c.json({ error: 'forbidden', reason }, 403);
   }
+  const realMembershipForCreate = memberMayCreate
+    ? await resolveServerMembershipRole(c.env.DB, serverId, userId)
+    : 'none';
+  if (isShellLikeAgentType(body.type) && realMembershipForCreate !== 'owner' && realMembershipForCreate !== 'admin') {
+    return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
+  }
   if (body.transport_config !== undefined && body.transport_config !== null) {
-    const realMembership = await resolveServerMembershipRole(c.env.DB, serverId, userId);
-    if (realMembership !== 'owner' && realMembership !== 'admin') {
+    if (realMembershipForCreate !== 'owner' && realMembershipForCreate !== 'admin') {
       return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
     }
   }
@@ -330,12 +335,17 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
   const isWholeServerShare = access?.actor.kind === 'share'
     && (access.shareProvenance === 'server'
       || (access.shareProvenance === undefined && access.actor.coverage?.target?.kind === 'server'));
+  if (isShellLikeAgentType(body.type) || isShellLikeAgentType(existing.type)) {
+    const isShareParticipantActor = access?.actor.kind === 'share'
+      || (memberMayUpdate && (await resolveServerMembershipRole(c.env.DB, serverId, userId)) === 'none');
+    if (isShareParticipantActor) {
+      return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
+    }
+  }
   if (access?.actor.kind === 'share'
     && (Object.prototype.hasOwnProperty.call(body, 'transportConfig')
       || (!isWholeServerShare
-        && (Object.prototype.hasOwnProperty.call(body, 'cwd')
-          || body.type === 'shell'
-          || body.type === 'script')))) {
+        && Object.prototype.hasOwnProperty.call(body, 'cwd')))) {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
 

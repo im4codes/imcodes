@@ -19,6 +19,7 @@ import {
   type ShareDenialReason,
   type ShareTarget,
 } from '../db/tab-sharing.js';
+import { PARTICIPANT_SHELL_FORBIDDEN_REASON } from '../../../shared/tab-sharing.js';
 import {
   resolveHttpShareAccess,
   resolveHttpShareAccessForCoveredSession,
@@ -38,7 +39,7 @@ import {
 } from '../../../shared/worker-session-snapshot.js';
 import { evaluateSharedCommandRateLimit } from '../share/share-rate-limit.js';
 import { getPodIdentity } from '../util/pod-identity.js';
-import { getSessionRuntimeType, isSessionAgentType } from '../../../shared/agent-types.js';
+import { getSessionRuntimeType, isSessionAgentType, isShellLikeAgentType } from '../../../shared/agent-types.js';
 import { isDelegationReplyCapableAgentType } from '../../../shared/agent-delegation.js';
 import {
   PEER_AUDIT_UNKNOWN_IDENTITY,
@@ -690,6 +691,20 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
     return c.json({ error: 'invalid_json' }, 400);
   }
 
+  let existingSession = null as Awaited<ReturnType<typeof getDbSessionByName>> | null;
+  let loadedExistingSession = false;
+  const loadExistingSession = async () => {
+    if (!loadedExistingSession) {
+      loadedExistingSession = true;
+      existingSession = await getDbSessionByName(c.env.DB, serverId, sessionName);
+    }
+    return existingSession;
+  };
+
+  if (access.actor.kind === 'share' && isShellLikeAgentType(body.agentType)) {
+    return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
+  }
+
   // The dedicated supervision route is not the only way an owner can persist
   // transportConfig. Keep the generic settings route from becoming a bypass:
   // concrete-session participants may still edit their authorized presentation
@@ -698,10 +713,19 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   if (access.actor.kind === 'share'
     && !isWholeServerShareAccess(access)
     && (Object.prototype.hasOwnProperty.call(body, 'transportConfig')
-      || Object.prototype.hasOwnProperty.call(body, 'cwd')
-      || body.agentType === 'shell'
-      || body.agentType === 'script')) {
+      || Object.prototype.hasOwnProperty.call(body, 'cwd'))) {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
+  }
+
+  if (access.actor.kind === 'share') {
+    const current = await loadExistingSession();
+    const cachedBridgeAgentType = await WsBridge.get(serverId).resolveSessionAgentType?.(sessionName);
+    if (
+      isShellLikeAgentType(current?.agent_type)
+      || isShellLikeAgentType(cachedBridgeAgentType)
+    ) {
+      return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
+    }
   }
 
   const fields: {
@@ -731,7 +755,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
   }
   const requestedSupervision = extractSessionSupervisionSnapshot(body.transportConfig ?? null);
   if (requestedSupervision && requestedSupervision.mode !== SUPERVISION_MODE.OFF) {
-    const current = await getDbSessionByName(c.env.DB, serverId, sessionName);
+    const current = await loadExistingSession();
     if (!current || !canSessionRoleOwnAutomaticSupervision(current.role)) {
       return c.json({ error: 'forbidden', reason: 'brain_session_required' }, 403);
     }
@@ -870,11 +894,29 @@ sessionMgmtRoutes.post('/:id/session/start', async (c) => {
   }
   const rawProject = typeof body.project === 'string' ? body.project : '';
   const projectDir = typeof body.dir === 'string' ? body.dir : '';
+  const projectName = rawProject ? sanitizeProjectName(rawProject) : '';
+  const targetSessionName = projectName ? `deck_${projectName}_brain` : '';
   if (rawProject) {
-    const projectName = sanitizeProjectName(rawProject);
-    const sessionName = `deck_${projectName}_brain`;
-    if (isKnownTestSessionLike({ name: sessionName, projectName: rawProject, projectDir })) {
+    if (isKnownTestSessionLike({ name: targetSessionName, projectName: rawProject, projectDir })) {
       return c.json({ error: 'test_session_blocked' }, 400);
+    }
+  }
+  const serverShareAccess = await resolveHttpShareAccess(c.env.DB, {
+    serverId,
+    userId,
+    target: { kind: 'server', serverId },
+  });
+  if (serverShareAccess.actor.kind === 'share') {
+    const existingTarget = targetSessionName ? await getDbSessionByName(c.env.DB, serverId, targetSessionName) : null;
+    const bridgeAgentType = targetSessionName
+      ? await WsBridge.get(serverId).resolveSessionAgentType?.(targetSessionName)
+      : null;
+    if (
+      isShellLikeAgentType(body.agentType)
+      || isShellLikeAgentType(existingTarget?.agent_type)
+      || isShellLikeAgentType(bridgeAgentType)
+    ) {
+      return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
     }
   }
   return relayToDaemon(c, 'session.start', body);
@@ -1159,6 +1201,17 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: 'share-role-denied', actionId, now });
         return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
       }
+      const bridge = WsBridge.get(serverId);
+      const trustedAgentType = (await bridge.resolveSessionAgentType?.(targetSessionName!))
+        ?? (await getTrustedAgentType(c.env.DB, serverId, target));
+      if (
+        isShellLikeAgentType(trustedAgentType)
+        || isShellLikeAgentType(body.agentType)
+        || isShellLikeAgentType(body.sessionType)
+      ) {
+        await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON, actionId, now });
+        return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
+      }
       const p2pScopeTarget = await httpP2pScopeTarget(c.env.DB, {
         userId,
         serverId,
@@ -1176,7 +1229,7 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: p2pScopeReason, actionId, now });
         return c.json({ error: 'forbidden', reason: p2pScopeReason }, 403);
       }
-      const rateLimitReason = evaluateHttpShareRateLimit({ bridge: WsBridge.get(serverId), userId, serverId, sessionName: targetSessionName ?? '', commandType: 'session.send', now });
+      const rateLimitReason = evaluateHttpShareRateLimit({ bridge, userId, serverId, sessionName: targetSessionName ?? '', commandType: 'session.send', now });
       if (rateLimitReason) {
         await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: rateLimitReason, actionId, now });
         return c.json({ error: 'forbidden', reason: rateLimitReason }, 429);
@@ -1291,6 +1344,16 @@ async function getTrustedRuntimeType(db: Env['DB'], serverId: string, target: Sh
       [serverId, target.kind === 'main' ? target.sessionName : ''],
     );
   return normalizeTrustedRuntimeType(row?.runtime_type ?? null);
+}
+
+async function getTrustedAgentType(db: Env['DB'], serverId: string, target: ShareTarget): Promise<string | null> {
+  if (target.kind === 'server') return null;
+  if (target.kind === 'subsession') {
+    const sub = await getSubSessionById(db, target.subSessionId, serverId);
+    return typeof sub?.type === 'string' ? sub.type : null;
+  }
+  const session = await getDbSessionByName(db, serverId, target.sessionName);
+  return typeof session?.agent_type === 'string' ? session.agent_type : null;
 }
 
 function normalizeTrustedRuntimeType(value: string | null): TrustedRuntimeType {

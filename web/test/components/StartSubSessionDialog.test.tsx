@@ -1579,3 +1579,64 @@ describe('resolveDefaultSubSessionType', () => {
     expect(resolveDefaultSubSessionType(['gemini', 'gemini-sdk'])).toBe(AGY_SDK_PROVIDER_ID);
   });
 });
+
+describe('StartSubSessionDialog participant shell restriction', () => {
+  afterEach(() => {
+    localStorage.clear();
+    __clearTransportModelCacheForTests();
+    cleanup();
+  });
+
+  it('hides and disables shell and script choices when forbidShellAgentTypes is true while keeping LLM choices selectable', () => {
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        forbidShellAgentTypes={true}
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    for (const id of ['shell', 'script']) {
+      const btn = document.querySelector(`button[data-agent-type="${id}"]`) as HTMLButtonElement | null;
+      expect(btn).not.toBeNull();
+      expect(btn!.disabled).toBe(true);
+      expect(btn!.style.display).toBe('none');
+      fireEvent.click(btn!);
+    }
+    const codexBtn = document.querySelector('button[data-agent-type="codex-sdk"]') as HTMLButtonElement;
+    expect(codexBtn.disabled).toBe(false);
+    expect(codexBtn.style.display).not.toBe('none');
+
+    fireEvent.click(codexBtn);
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, expect.anything());
+  });
+
+  it('keeps shell and script choices enabled and visible for owners', () => {
+    render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        forbidShellAgentTypes={false}
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    for (const id of ['shell', 'script']) {
+      const btn = document.querySelector(`button[data-agent-type="${id}"]`) as HTMLButtonElement | null;
+      expect(btn).not.toBeNull();
+      expect(btn!.disabled).toBe(false);
+      expect(btn!.style.display).not.toBe('none');
+    }
+  });
+});

@@ -174,7 +174,7 @@ describe('command-handler delegation routing behavior', () => {
     beforeEach(() => {
       getSessionMock.mockReturnValue({
         name: 'deck_proj_brain', projectName: 'proj', projectDir: '/repo', role: 'brain',
-        agentType: 'shell', runtimeType: 'process', state: 'idle', ...identity,
+        agentType: 'claude-code', runtimeType: 'process', state: 'idle', ...identity,
       });
     });
     const input = (extra: Record<string, unknown> = {}) => handleWebCommand({

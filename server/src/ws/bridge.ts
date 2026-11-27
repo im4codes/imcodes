@@ -502,6 +502,7 @@ import {
 } from '../../../shared/daemon-auth.js';
 import {
   SHARE_REASONS,
+  SHELL_FORBIDDEN_SHARE_COMMANDS,
   buildSharedActorEnvelope,
   commandSessionName,
   evaluateShareCommand,
@@ -2793,6 +2794,7 @@ export class WsBridge {
   private browserShareStates = new Map<WebSocket, ShareScopedSocketState>();
   private shareCoverageResolver: ShareCoverageResolver = resolveShareCoverageFromDb;
   private sessionRuntimeTypes = new Map<string, 'process' | 'transport' | 'unknown'>();
+  private sessionAgentTypes = new Map<string, { agentType: string | null; cachedAt: number }>();
   private activeDispatchIds = new Map<string, string>();
 
   /** db reference for session ownership checks */
@@ -8410,15 +8412,27 @@ export class WsBridge {
       };
     }
     const sessionName = commandSessionName(msg);
+    const msgType = typeof msg.type === 'string' ? msg.type : '';
     // Only a cancel depends on the runtime type, so a keystroke never waits on it.
     const runtimeType = sessionName && msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL
       ? await this.resolveSessionRuntimeType(sessionName)
       : 'unknown';
+    let targetAgentType: string | null = null;
+    if (SHELL_FORBIDDEN_SHARE_COMMANDS.has(msgType)) {
+      const agentTargetSession = sessionName
+        ?? ((msgType === 'session.start' || msgType === 'session.restart') && typeof msg.project === 'string' && msg.project.trim()
+          ? mainSessionNameForProjectSlug(sanitizeProjectName(msg.project))
+          : null);
+      if (agentTargetSession) {
+        targetAgentType = await this.resolveSessionAgentType(agentTargetSession);
+      }
+    }
     const decision = evaluateShareCommand({
       msg,
       state: current,
       now: shareClockNow(),
       runtimeType,
+      targetAgentType,
       activeDispatchId: sessionName ? this.activeDispatchIds.get(sessionName) ?? null : null,
     });
     if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
@@ -9077,6 +9091,45 @@ export class WsBridge {
     safeSend(ws, JSON.stringify({ type: 'share.teardown', reason }));
     this.cleanupBrowserSocket(ws);
     try { ws.close(1008, reason); } catch { /* ignore */ }
+  }
+
+  private resolveCachedSessionAgentType(sessionName: string): string | null {
+    const cached = this.sessionAgentTypes.get(sessionName);
+    if (cached && shareClockNow() - cached.cachedAt <= SHARE_HOT_PATH_COVERAGE_TTL_MS && cached.agentType) {
+      return cached.agentType;
+    }
+    const activeMain = this.activeMainSessions.get(sessionName);
+    if (activeMain?.agentType) return activeMain.agentType;
+    const activeSub = this.activeSubSessions.get(sessionName);
+    if (activeSub?.agentType) return activeSub.agentType;
+    return null;
+  }
+
+  async resolveSessionAgentType(sessionName: string): Promise<string | null> {
+    const cached = this.sessionAgentTypes.get(sessionName);
+    if (cached && shareClockNow() - cached.cachedAt <= SHARE_HOT_PATH_COVERAGE_TTL_MS) {
+      return cached.agentType;
+    }
+    const liveCached = this.resolveCachedSessionAgentType(sessionName);
+    if (liveCached) return liveCached;
+    if (!this.db) return null;
+    try {
+      const subSessionId = sessionName.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1];
+      const row = subSessionId
+        ? await this.db.queryOne<{ agent_type: string | null }>(
+          'SELECT type AS agent_type FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
+          [this.serverId, subSessionId],
+        )
+        : await this.db.queryOne<{ agent_type: string | null }>(
+          'SELECT agent_type FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
+          [this.serverId, sessionName],
+        );
+      const agentType = typeof row?.agent_type === 'string' && row.agent_type.trim() ? row.agent_type.trim() : null;
+      this.sessionAgentTypes.set(sessionName, { agentType, cachedAt: shareClockNow() });
+      return agentType;
+    } catch {
+      return null;
+    }
   }
 
   private async resolveSessionRuntimeType(sessionName: string): Promise<'process' | 'transport' | 'unknown'> {
@@ -10640,6 +10693,7 @@ export class WsBridge {
     this.recentTextBySession.delete(canonicalName);
     this.activeDispatchIds.delete(canonicalName);
     this.sessionRuntimeTypes.delete(canonicalName);
+    this.sessionAgentTypes.delete(canonicalName);
     for (const [ws, subs] of this.timelineSubscriptions) {
       subs.delete(canonicalName);
       this.clearTimelineLatestValueFingerprints(ws, canonicalName);
@@ -10748,6 +10802,8 @@ export class WsBridge {
       if (!name) continue;
       this.activeMainSessions.set(name, { name, project, projectDir, state, agentType, runtimeType, label });
       this.sessionRuntimeTypes.set(name, this.normalizeRuntimeType(runtimeType));
+      if (agentType) this.sessionAgentTypes.set(name, { agentType, cachedAt: shareClockNow() });
+      else this.sessionAgentTypes.delete(name);
       if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(name);
     }
     this.pruneSessionOwnershipCacheToActive(this.activeMainSessions);
@@ -11834,6 +11890,8 @@ export class WsBridge {
       });
       if (subIdentityProjectKey) this.subIdentityProjectKeys.set(subSessionName, subIdentityProjectKey);
       this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
+      if (agentType) this.sessionAgentTypes.set(subSessionName, { agentType, cachedAt: shareClockNow() });
+      else this.sessionAgentTypes.delete(subSessionName);
       if (typeof msg.state === 'string') this.updateAuthoritativeSessionState(subSessionName, msg.state);
     }
     return true;

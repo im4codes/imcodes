@@ -108,6 +108,8 @@ export interface SharedActorEnvelope {
   daemonAckedAt?: number;
 }
 
+export const PARTICIPANT_SHELL_FORBIDDEN_REASON = 'participant_shell_forbidden' as const;
+
 export const SHARE_DENIAL_REASONS = [
   'share-role-denied',
   'share-direct-surface-denied',
@@ -122,6 +124,7 @@ export const SHARE_DENIAL_REASONS = [
   'share-dispatch-changed',
   'share-audit-duplicate',
   'share-comment-invalid',
+  PARTICIPANT_SHELL_FORBIDDEN_REASON,
 ] as const;
 
 export type ShareDenialReason = (typeof SHARE_DENIAL_REASONS)[number];

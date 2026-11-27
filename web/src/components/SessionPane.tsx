@@ -474,7 +474,14 @@ export function SessionPane({
 
   const terminalVisible = isActive && effectiveViewMode === 'terminal';
   const chatVisible = isActive && effectiveViewMode === 'chat';
-  const isShellTerminal = terminalVisible && (session.agentType === 'shell' || session.agentType === 'script');
+  const isShellLike = session.agentType === 'shell' || session.agentType === 'script';
+  const isShellTerminal = terminalVisible && isShellLike;
+  const isShareScopedSession = isShareScopedState(session.sharedState);
+  const terminalReadOnly = isShareScopedSession
+    && (isShellLike || session.sharedState?.effectiveRole !== 'participant');
+  const terminalReadOnlyHint = isShareScopedSession && isShellLike
+    ? t('share.shell_participant_forbidden')
+    : undefined;
   const legacyCodexModel = loadLegacyCodexModelPreferenceForModelessSession(session, detectedModel, lastUsage?.model);
   const effectiveDetectedModel = detectedModel ?? legacyCodexModel ?? undefined;
 
@@ -504,7 +511,9 @@ export function SessionPane({
             onFocusFn={onFocusFn}
             onFitFn={onFitFn}
             onScrollBottomFn={handleTermScrollFn}
-            mobileInput={session.agentType === 'shell'}
+            mobileInput={session.agentType === 'shell' && !terminalReadOnly}
+            readOnly={terminalReadOnly}
+            readOnlyHint={terminalReadOnlyHint}
             onRestart={onRestart}
           />}
       </div>

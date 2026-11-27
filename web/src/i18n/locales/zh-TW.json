@@ -179,6 +179,7 @@
     "menu": {
       "shareTab": "分享"
     },
+    "shell_participant_forbidden": "共享參與者僅可使用大模型工作階段，不可建立或操作 shell / script 終端機工作階段。",
     "dialogTitle": "分享存取權",
     "dialogSubtitle": "授予 {{target}} 受限存取權。",
     "target": {

@@ -179,6 +179,7 @@
     "menu": {
       "shareTab": "共享"
     },
+    "shell_participant_forbidden": "共享参与者仅可使用大模型会话，不可创建或操作 shell / script 终端会话。",
     "dialogTitle": "共享访问",
     "dialogSubtitle": "向 {{target}} 授予受限访问。",
     "target": {

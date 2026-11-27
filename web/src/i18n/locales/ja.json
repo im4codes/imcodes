@@ -179,6 +179,7 @@
     "menu": {
       "shareTab": "共有"
     },
+    "shell_participant_forbidden": "共有参加者は AI エージェントセッションのみ利用できます。shell / script はオーナー専用です。",
     "dialogTitle": "アクセスを共有",
     "dialogSubtitle": "{{target}} へのスコープ付きアクセスを付与します。",
     "target": {

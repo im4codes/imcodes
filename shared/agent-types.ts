@@ -103,6 +103,10 @@ export function isRawCommandSessionAgentType(value: string): value is typeof RAW
   return (RAW_COMMAND_SESSION_AGENT_TYPES as readonly string[]).includes(value);
 }
 
+export function isShellLikeAgentType(agentType: unknown): agentType is typeof RAW_COMMAND_SESSION_AGENT_TYPES[number] {
+  return typeof agentType === 'string' && isRawCommandSessionAgentType(agentType.trim());
+}
+
 export function getSessionRuntimeType(value: string): 'transport' | 'process' {
   return isTransportSessionAgentType(value) ? 'transport' : 'process';
 }

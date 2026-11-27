@@ -179,6 +179,7 @@
     "menu": {
       "shareTab": "Share"
     },
+    "shell_participant_forbidden": "Shared participants can only use AI agent sessions; shell and script sessions are owner-only.",
     "dialogTitle": "Share access",
     "dialogSubtitle": "Grant scoped access to {{target}}.",
     "target": {
