@@ -45,6 +45,7 @@ constexpr int kTargetSampleRate = 16000;
 constexpr size_t kInitialPartialSamples = 12800;   // 0.8s @ 16kHz
 constexpr size_t kStepPartialSamples = 12800;      // 0.8s stride
 constexpr size_t kMaxSegmentSamples = 216000;      // 13.5s segment cap
+constexpr size_t kMaxFinalReDecodeSamples = 480000;  // 30s full-utterance final re-decode cap
 constexpr size_t kMinPauseSplitSamples = 96000;    // 6.0s before natural pause split
 constexpr size_t kPauseWindowSamples = 6400;       // 400ms trailing silence window
 constexpr size_t kPauseScanStrideSamples = 800;    // 50ms scan stride for pause boundary
@@ -741,8 +742,15 @@ size_t find_pause_split_take_count(
 template <typename DecodeFn, typename EmitFn>
 class SegmentedUtterancePipeline {
  public:
-  SegmentedUtterancePipeline(DecodeFn decode_fn, EmitFn emit_fn)
-      : decode_fn_(std::move(decode_fn)), emit_fn_(std::move(emit_fn)) {}
+  SegmentedUtterancePipeline(
+      DecodeFn decode_fn,
+      EmitFn emit_fn,
+      size_t max_segment_samples = kMaxSegmentSamples,
+      size_t max_final_redecode_samples = kMaxFinalReDecodeSamples)
+      : decode_fn_(std::move(decode_fn)),
+        emit_fn_(std::move(emit_fn)),
+        max_segment_samples_(max_segment_samples),
+        max_final_redecode_samples_(max_final_redecode_samples) {}
 
   void preload(std::vector<float> initial) {
     if (initial.empty()) return;
@@ -792,7 +800,9 @@ class SegmentedUtterancePipeline {
 
   void run_loop() {
     std::vector<float> segment_samples;
-    segment_samples.reserve(kMaxSegmentSamples + 16000);
+    segment_samples.reserve(max_segment_samples_ + 16000);
+    std::vector<float> utterance_samples;
+    bool utterance_exceeded_final_cap = false;
     std::string committed_text;
     std::string active_segment_text;
     std::string last_emitted_text;
@@ -815,8 +825,8 @@ class SegmentedUtterancePipeline {
           is_aborted = true;
         } else {
           const size_t available = pending_samples_.size() - pending_head_;
-          const size_t space = kMaxSegmentSamples > segment_samples.size()
-              ? (kMaxSegmentSamples - segment_samples.size())
+          const size_t space = max_segment_samples_ > segment_samples.size()
+              ? (max_segment_samples_ - segment_samples.size())
               : 0;
           const size_t max_take = std::min(space, available);
           const size_t take = find_pause_split_take_count(
@@ -826,10 +836,17 @@ class SegmentedUtterancePipeline {
               max_take,
               active_segment_text);
           if (take > 0) {
-            segment_samples.insert(
-                segment_samples.end(),
-                pending_samples_.begin() + static_cast<std::ptrdiff_t>(pending_head_),
-                pending_samples_.begin() + static_cast<std::ptrdiff_t>(pending_head_ + take));
+            const auto take_begin = pending_samples_.begin() + static_cast<std::ptrdiff_t>(pending_head_);
+            const auto take_end = take_begin + static_cast<std::ptrdiff_t>(take);
+            segment_samples.insert(segment_samples.end(), take_begin, take_end);
+            if (!utterance_exceeded_final_cap) {
+              if (utterance_samples.size() + take > max_final_redecode_samples_) {
+                utterance_exceeded_final_cap = true;
+                std::vector<float>().swap(utterance_samples);
+              } else {
+                utterance_samples.insert(utterance_samples.end(), take_begin, take_end);
+              }
+            }
             pending_head_ += take;
             if (pending_head_ == pending_samples_.size()) {
               pending_samples_.clear();
@@ -843,19 +860,22 @@ class SegmentedUtterancePipeline {
       }
 
       if (is_aborted) {
+        std::vector<float>().swap(utterance_samples);
         break;
       }
 
-      const bool reached_segment_cap = segment_samples.size() >= kMaxSegmentSamples;
+      const bool reached_segment_cap = segment_samples.size() >= max_segment_samples_;
       const bool reached_pause_split =
           !reached_segment_cap && has_trailing_silence_pause(segment_samples, active_segment_text);
       const bool should_commit_segment = reached_segment_cap || reached_pause_split;
+      const bool skip_trailing_segment_commit =
+          can_finish_now && !utterance_exceeded_final_cap;
       const bool need_decode =
           segment_samples.size() >= kInitialPartialSamples &&
           (segment_samples.size() - last_decoded_len >= kStepPartialSamples ||
-           should_commit_segment);
+           (should_commit_segment && !skip_trailing_segment_commit));
 
-      if (need_decode && !(can_finish_now && !should_commit_segment)) {
+      if (need_decode && !(can_finish_now && (!should_commit_segment || skip_trailing_segment_commit))) {
         last_decoded_len = segment_samples.size();
         const bool segment_has_speech =
             !active_segment_text.empty() || has_utterance_speech_energy(segment_samples);
@@ -869,6 +889,7 @@ class SegmentedUtterancePipeline {
           }
         }
         if (is_aborted) {
+          std::vector<float>().swap(utterance_samples);
           break;
         }
         if (!seg_text.empty()) {
@@ -908,16 +929,53 @@ class SegmentedUtterancePipeline {
     }
 
     if (!final_aborted) {
-      std::string final_seg = active_segment_text;
-      if (segment_samples.size() >= 1600 &&
-          (!active_segment_text.empty() || has_utterance_speech_energy(segment_samples))) {
-        const std::string tail_text = strip_asr_control_tags(decode_fn_(segment_samples));
-        if (!tail_text.empty()) {
-          final_seg = tail_text;
+      std::string final_text;
+      if (!utterance_exceeded_final_cap && utterance_samples.size() >= 1600) {
+        const bool utterance_has_speech =
+            !committed_text.empty() ||
+            !active_segment_text.empty() ||
+            has_utterance_speech_energy(utterance_samples);
+        if (utterance_has_speech) {
+          final_text = strip_asr_control_tags(decode_fn_(utterance_samples));
+          std::vector<float>().swap(utterance_samples);
+          {
+            std::lock_guard<std::mutex> lock(mu_);
+            final_aborted = aborted_;
+          }
+          if (final_aborted) {
+            emit_fn_("{\"type\":\"end\"}");
+            return;
+          }
+          if (final_text.empty()) {
+            final_text = join_transcript_segments(committed_text, active_segment_text);
+          }
+        } else {
+          std::vector<float>().swap(utterance_samples);
+          final_text = join_transcript_segments(committed_text, active_segment_text);
         }
+      } else {
+        std::vector<float>().swap(utterance_samples);
+        std::string final_seg = active_segment_text;
+        if (segment_samples.size() >= 1600 &&
+            (!active_segment_text.empty() || has_utterance_speech_energy(segment_samples))) {
+          const std::string tail_text = strip_asr_control_tags(decode_fn_(segment_samples));
+          {
+            std::lock_guard<std::mutex> lock(mu_);
+            final_aborted = aborted_;
+          }
+          if (final_aborted) {
+            emit_fn_("{\"type\":\"end\"}");
+            return;
+          }
+          if (!tail_text.empty()) {
+            final_seg = tail_text;
+          }
+        }
+        final_text = join_transcript_segments(committed_text, final_seg);
       }
-      const std::string final_text = join_transcript_segments(committed_text, final_seg);
       emit_fn_("{\"type\":\"result\",\"text\":\"" + json_escape(final_text) + "\",\"isFinal\":true}");
+    } else {
+      std::vector<float>().swap(utterance_samples);
     }
     emit_fn_("{\"type\":\"end\"}");
   }
@@ -925,6 +983,8 @@ class SegmentedUtterancePipeline {
  private:
   DecodeFn decode_fn_;
   EmitFn emit_fn_;
+  size_t max_segment_samples_;
+  size_t max_final_redecode_samples_;
   std::mutex mu_;
   std::condition_variable cv_;
   std::vector<float> pending_samples_;
@@ -991,7 +1051,7 @@ class Qwen3OnnxEngine {
       cfg.model_config.qwen3_asr.decoder = decoder_.c_str();
       cfg.model_config.qwen3_asr.tokenizer = tokenizer_.c_str();
       cfg.model_config.qwen3_asr.max_total_len = 1024;
-      cfg.model_config.qwen3_asr.max_new_tokens = 256;
+      cfg.model_config.qwen3_asr.max_new_tokens = 384;
       cfg.model_config.qwen3_asr.temperature = 1e-6f;
       cfg.model_config.qwen3_asr.top_p = 0.8f;
       cfg.model_config.qwen3_asr.seed = 42;

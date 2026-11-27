@@ -3458,6 +3458,10 @@ it.skipIf(!swiftCompiler)('parses macOS ImcodesSpeechMlx main.swift and executes
   // 1. Full-file Swift parse check across main.swift.
   await runNativeOrThrow(swiftCompiler!, ['-parse', '-swift-version', '5', mainSwiftPath], { timeout: 60000 });
 
+  // 1b. Contract pins on macOS 30s full-utterance final re-decode & token budget.
+  expect(mainSwift).toContain('maxFinalReDecodeSamples: Int = 480_000');
+  expect(mainSwift).toContain('maxTokens: samples.count > maxSegmentSamples ? 384 : 192');
+
   // 2. Slice production joinTranscriptSegments, sanitizeAsrRepetitionLoop, and QwenSegmentedDecodeEngine.
   const joinSlice = mainSwift.slice(
     mainSwift.indexOf('func joinTranscriptSegments('),
@@ -3490,18 +3494,20 @@ func markerText(_ samples: [Float]) -> String {
     return first < 0.35 ? "seg-one" : "seg-two"
 }
 
-// 1. >216,000 samples (250,000) prefilled + immediate normal stop -> decodes [216000, 34000] and emits ONE isFinal=true "seg-one seg-two".
+// 1. <=30s multi-segment (250,000 <= 480,000) prefilled + immediate normal stop -> streaming decodes 216,000,
+//    then final pass re-decodes FULL 250,000 utterance with prefixTokens=[] replacing rolled-over text.
 do {
     let emitLock = NSLock()
     var emitted: [[String: Any]] = []
-    var decodeSizes: [Int] = []
+    var decodeCalls: [(size: Int, prefixCount: Int)] = []
     let done = DispatchSemaphore(value: 0)
     let engine = QwenSegmentedDecodeEngine(
         expectLanguageHeader: false,
         decodeFn: { samples, prefix, checkCancel in
             try checkCancel()
-            decodeSizes.append(samples.count)
-            return QwenSegmentedDecodeResult(text: markerText(samples), tokens: prefix + [1])
+            decodeCalls.append((samples.count, prefix.count))
+            let txt = samples.count == 250_000 ? "full-utterance-rewrite" : markerText(samples)
+            return QwenSegmentedDecodeResult(text: txt, tokens: prefix + [1])
         },
         rollbackPrefixFn: { tokens, _, _ in tokens },
         emitJsonFn: { payload in
@@ -3517,21 +3523,26 @@ do {
     DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
     engine.requestStop(abort: false, producerAlsoFinished: true)
     check(done.wait(timeout: .now() + 5) == .success, "case 1 timed out")
-    check(decodeSizes == [216_000, 34_000], "case 1 decodeSizes mismatch: \\(decodeSizes)")
+    check(decodeCalls.map { $0.size } == [216_000, 250_000], "case 1 decodeSizes mismatch: \\(decodeCalls)")
+    check(decodeCalls.last?.prefixCount == 0, "case 1 final pass must use empty prefixTokens: \\(decodeCalls)")
     let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
-    check(finals.count == 1 && (finals[0]["text"] as? String) == "seg-one seg-two", "case 1 final mismatch: \\(finals)")
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "full-utterance-rewrite", "case 1 final mismatch: \\(finals)")
 }
 
-// 2. Trailing samples enqueued AFTER requestStop(abort: false, producerAlsoFinished: false) and BEFORE markProducerFinished() must be decoded.
+// 2. Trailing samples enqueued AFTER requestStop(abort: false, producerAlsoFinished: false) and BEFORE markProducerFinished()
+//    (<=30s total = 220,000) must be included in the full-utterance prefix-free final re-decode.
 do {
     let emitLock = NSLock()
     var emitted: [[String: Any]] = []
+    var decodeCalls: [(size: Int, prefixCount: Int)] = []
     let done = DispatchSemaphore(value: 0)
     let engine = QwenSegmentedDecodeEngine(
         expectLanguageHeader: false,
         decodeFn: { samples, prefix, checkCancel in
             try checkCancel()
-            return QwenSegmentedDecodeResult(text: markerText(samples), tokens: prefix + [1])
+            decodeCalls.append((samples.count, prefix.count))
+            let txt = samples.count == 220_000 ? "whole-220k" : markerText(samples)
+            return QwenSegmentedDecodeResult(text: txt, tokens: prefix + [1])
         },
         rollbackPrefixFn: { tokens, _, _ in tokens },
         emitJsonFn: { payload in
@@ -3548,11 +3559,209 @@ do {
     check(engine.enqueue([Float](repeating: 0.8, count: 4_000)), "trailing enqueue before markProducerFinished rejected")
     engine.markProducerFinished()
     check(done.wait(timeout: .now() + 5) == .success, "case 2 timed out")
+    check(decodeCalls.map { $0.size } == [216_000, 220_000] && decodeCalls.last?.prefixCount == 0, "case 2 decodeCalls: \\(decodeCalls)")
     let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
-    check(finals.count == 1 && (finals[0]["text"] as? String) == "seg-one seg-two", "case 2 final mismatch: \\(finals)")
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "whole-220k", "case 2 final mismatch: \\(finals)")
 }
 
-// 3. Abort rejects new samples and never emits isFinal=true.
+// 3. <=30s single segment keeps streaming confirmedTokens during partials, then on stop with newCount == 0
+//    MUST NOT shortcut; runs final decode with prefixTokens=[] replacing streaming typo/punctuation.
+do {
+    let emitLock = NSLock()
+    var emitted: [[String: Any]] = []
+    var decodePrefixes: [[Int32]] = []
+    let decodeLock = NSLock()
+    var pass = 0
+    let done = DispatchSemaphore(value: 0)
+    let engine = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 4_000,
+        strideSamples: 4_000,
+        expectLanguageHeader: false,
+        decodeFn: { _, prefix, checkCancel in
+            try checkCancel()
+            decodeLock.lock()
+            decodePrefixes.append(prefix)
+            pass += 1
+            let p = pass
+            decodeLock.unlock()
+            return QwenSegmentedDecodeResult(
+                text: p < 3 ? "流式错字。半句" : "完整正确，整句",
+                tokens: [10, 11, 12]
+            )
+        },
+        rollbackPrefixFn: { tokens, _, _ in tokens },
+        emitJsonFn: { payload in
+            emitLock.lock()
+            emitted.append(payload)
+            emitLock.unlock()
+        },
+        onLoopFinishedFn: { done.signal() }
+    )
+    DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
+    check(engine.enqueue([Float](repeating: 0.2, count: 4_000)), "case 3a enqueue failed")
+    for _ in 0..<200 {
+        decodeLock.lock(); let p = pass; decodeLock.unlock()
+        if p >= 1 { break }
+        Thread.sleep(forTimeInterval: 0.005)
+    }
+    check(engine.enqueue([Float](repeating: 0.2, count: 4_000)), "case 3b enqueue failed")
+    for _ in 0..<200 {
+        decodeLock.lock(); let p = pass; decodeLock.unlock()
+        if p >= 2 { break }
+        Thread.sleep(forTimeInterval: 0.005)
+    }
+    // Stop with zero new samples (newCount == 0) while confirmedTokens == [10, 11, 12]!
+    engine.requestStop(abort: false, producerAlsoFinished: true)
+    check(done.wait(timeout: .now() + 5) == .success, "case 3 timed out")
+    check(
+        decodePrefixes.count == 3 && decodePrefixes[0].isEmpty && decodePrefixes[1] == [10, 11, 12] && decodePrefixes[2].isEmpty,
+        "case 3 prefixes: \\(decodePrefixes)"
+    )
+    let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "完整正确，整句", "case 3 final: \\(finals)")
+}
+
+// 4. >30s (>480,000 default cap AND custom cap): drops whole-utterance buffer, keeps committedText,
+//    and decodes only trailing activeSegment with prefixTokens=[] (even when newCount == 0).
+do {
+    let emitLock = NSLock()
+    var emitted: [[String: Any]] = []
+    var decodeCalls: [(size: Int, prefix: [Int32])] = []
+    let decodeLock = NSLock()
+    let done = DispatchSemaphore(value: 0)
+    let engine = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 4_000,
+        strideSamples: 4_000,
+        maxSegmentSamples: 216_000,
+        maxFinalReDecodeSamples: 480_000,
+        expectLanguageHeader: false,
+        decodeFn: { samples, prefix, checkCancel in
+            try checkCancel()
+            decodeLock.lock()
+            decodeCalls.append((samples.count, prefix))
+            decodeLock.unlock()
+            if samples.count == 216_000 {
+                return QwenSegmentedDecodeResult(text: samples.first! < 0.35 ? "seg-a" : "seg-b", tokens: [1, 2])
+            }
+            return QwenSegmentedDecodeResult(text: prefix.isEmpty ? "tail-clean" : "tail-dirty", tokens: [3, 4])
+        },
+        rollbackPrefixFn: { tokens, _, _ in tokens },
+        emitJsonFn: { payload in
+            emitLock.lock()
+            emitted.append(payload)
+            emitLock.unlock()
+        },
+        onLoopFinishedFn: { done.signal() }
+    )
+    var longPcm = [Float](repeating: 0.2, count: 500_000)
+    for i in 216_000..<432_000 { longPcm[i] = 0.5 }
+    for i in 432_000..<500_000 { longPcm[i] = 0.8 }
+    engine.preload(longPcm)
+    DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
+    engine.requestStop(abort: false, producerAlsoFinished: true)
+    check(done.wait(timeout: .now() + 5) == .success, "case 4 timed out")
+    check(decodeCalls.allSatisfy { $0.size <= 216_000 }, "case 4 exceeded maxSegmentSamples: \\(decodeCalls)")
+    check(decodeCalls.last?.size == 68_000 && decodeCalls.last?.prefix.isEmpty == true, "case 4 trailing final mismatch: \\(decodeCalls)")
+    let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "seg-a seg-b tail-clean", "case 4 final mismatch: \\(finals)")
+}
+
+// 5. >cap newCount == 0 trailing activeSegment still gets prefix-free re-decode without duplicating committedText.
+do {
+    let emitLock = NSLock()
+    var emitted: [[String: Any]] = []
+    var calls: [(size: Int, prefix: [Int32])] = []
+    let callLock = NSLock()
+    let done = DispatchSemaphore(value: 0)
+    let engine = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 4,
+        strideSamples: 4,
+        maxSegmentSamples: 8,
+        maxFinalReDecodeSamples: 10,
+        expectLanguageHeader: false,
+        decodeFn: { samples, prefix, checkCancel in
+            try checkCancel()
+            callLock.lock()
+            calls.append((samples.count, prefix))
+            callLock.unlock()
+            if samples.count == 8 { return QwenSegmentedDecodeResult(text: "head", tokens: [7]) }
+            return QwenSegmentedDecodeResult(text: prefix.isEmpty ? "tail-final" : "tail-interim", tokens: [9])
+        },
+        rollbackPrefixFn: { tokens, _, _ in tokens },
+        emitJsonFn: { payload in emitLock.lock(); emitted.append(payload); emitLock.unlock() },
+        onLoopFinishedFn: { done.signal() }
+    )
+    DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
+    check(engine.enqueue([Float](repeating: 0.2, count: 12)), "case 5 enqueue failed")
+    for _ in 0..<200 {
+        callLock.lock(); let c = calls.count; callLock.unlock()
+        if c >= 2 { break }
+        Thread.sleep(forTimeInterval: 0.005)
+    }
+    engine.requestStop(abort: false, producerAlsoFinished: true)
+    check(done.wait(timeout: .now() + 5) == .success, "case 5 timed out")
+    check(calls.count == 3 && calls.last?.size == 4 && calls.last?.prefix.isEmpty == true, "case 5 calls: \\(calls)")
+    let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
+    check(finals.count == 1 && (finals[0]["text"] as? String) == "head tail-final", "case 5 finals: \\(finals)")
+}
+
+// 6. Silence gate and hotword hallucination retraction stay intact on both <=cap and >cap final passes.
+do {
+    // 6a: pure silence <=cap never invokes decodeFn
+    var decodedCount = 0
+    var silenceEmitted: [[String: Any]] = []
+    let doneA = DispatchSemaphore(value: 0)
+    let engineA = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 4,
+        strideSamples: 4,
+        maxSegmentSamples: 8,
+        maxFinalReDecodeSamples: 16,
+        expectLanguageHeader: false,
+        hotwordTerms: ["IM.codes"],
+        decodeFn: { _, _, _ in decodedCount += 1; return QwenSegmentedDecodeResult(text: "IM.codes", tokens: [1]) },
+        rollbackPrefixFn: { t, _, _ in t },
+        emitJsonFn: { silenceEmitted.append($0) },
+        onLoopFinishedFn: { doneA.signal() }
+    )
+    engineA.preload([Float](repeating: 0.001, count: 12))
+    DispatchQueue.global(qos: .userInitiated).async { engineA.runLoop() }
+    engineA.requestStop(abort: false, producerAlsoFinished: true)
+    check(doneA.wait(timeout: .now() + 5) == .success, "case 6a timed out")
+    check(decodedCount == 0 && silenceEmitted.isEmpty, "case 6a decoded silent audio: count=\\(decodedCount), emitted=\\(silenceEmitted)")
+
+    // 6b: provisional single hotword interim ("IM.codes") -> <=cap whole-utterance final returns echo -> retracts cleanly to ""
+    var hwEmitted: [[String: Any]] = []
+    var hwPass = 0
+    let hwLock = NSLock()
+    let doneB = DispatchSemaphore(value: 0)
+    let engineB = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 4,
+        strideSamples: 4,
+        maxSegmentSamples: 100,
+        maxFinalReDecodeSamples: 100,
+        expectLanguageHeader: false,
+        hotwordTerms: ["IM.codes"],
+        decodeFn: { _, _, _ in
+            hwLock.lock(); hwPass += 1; let p = hwPass; hwLock.unlock()
+            return QwenSegmentedDecodeResult(text: p == 1 ? "IM.codes" : "IM.codes，IM.codes。", tokens: [1])
+        },
+        rollbackPrefixFn: { t, _, _ in t },
+        emitJsonFn: { hwEmitted.append($0) },
+        onLoopFinishedFn: { doneB.signal() }
+    )
+    DispatchQueue.global(qos: .userInitiated).async { engineB.runLoop() }
+    check(engineB.enqueue([Float](repeating: 0.1, count: 8)), "case 6b enqueue failed")
+    for _ in 0..<200 {
+        hwLock.lock(); let p = hwPass; hwLock.unlock()
+        if p >= 1 { break }
+        Thread.sleep(forTimeInterval: 0.005)
+    }
+    engineB.requestStop(abort: false, producerAlsoFinished: true)
+    check(doneB.wait(timeout: .now() + 5) == .success, "case 6b timed out")
+    check((hwEmitted.last?["text"] as? String) == "" && (hwEmitted.last?["isFinal"] as? Bool) == true, "case 6b did not retract: \\(hwEmitted)")
+}
+
+// 7. Abort rejects new samples and never emits isFinal=true (even if abort happens during final re-decode).
 do {
     var emitted: [[String: Any]] = []
     let engine = QwenSegmentedDecodeEngine(
@@ -3574,4 +3783,136 @@ print("MAC_SEGMENTED_DECODE:PASS")
 `);
   await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { timeout: 120000 });
   expect((await runNativeOrThrow(binFile, [], { timeout: 60000 })).trim()).toBe('MAC_SEGMENTED_DECODE:PASS');
+
+  // 3. Slice & compile Windows C++ SegmentedUtterancePipeline checks when clang++ is available.
+  const winCppPath = fileURLToPath(new URL('../../apps/pc-app/native/win/imcodes-speech-win.cpp', import.meta.url));
+  const winCpp = await readFile(winCppPath, 'utf8');
+  expect(winCpp).toContain('kMaxFinalReDecodeSamples = 480000');
+  expect(winCpp).toContain('cfg.model_config.qwen3_asr.max_new_tokens = 384;');
+  const clangPp = process.env.CXX || (existsSync('/usr/bin/clang++') ? '/usr/bin/clang++' : undefined);
+  if (clangPp) {
+    const helperStart = winCpp.indexOf('constexpr int kTargetSampleRate');
+    const helperEnd = winCpp.indexOf('std::string wide_to_utf8(');
+    const pipeStart = winCpp.indexOf('template <typename SampleAtFn>');
+    const pipeEnd = winCpp.indexOf('#ifdef IMCODES_HAS_SHERPA_ONNX', pipeStart);
+    expect(helperStart).toBeGreaterThan(-1);
+    expect(helperEnd).toBeGreaterThan(helperStart);
+    expect(pipeStart).toBeGreaterThan(-1);
+    expect(pipeEnd).toBeGreaterThan(pipeStart);
+
+    const cppFile = join(root, 'WinSegmentedPipelineTests.cpp');
+    const cppBin = join(root, 'win-segmented-pipeline-tests');
+    await writeFile(cppFile, `#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <cctype>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+${winCpp.slice(helperStart, helperEnd)}
+${winCpp.slice(pipeStart, pipeEnd)}
+
+int main() {
+  (void)&emit_error;
+  assert(sanitize_asr_repetition_loop("hello").compare("hello") == 0);
+  // A. <= max_final_redecode_samples across segment cap rollover -> final decodes FULL utterance_samples
+  {
+    std::vector<size_t> decode_sizes;
+    std::vector<std::string> emitted;
+    SegmentedUtterancePipeline pipeline(
+        [&](const std::vector<float>& samples) -> std::string {
+          decode_sizes.push_back(samples.size());
+          return samples.size() == 24000 ? "full-win-utterance" : "partial-seg";
+        },
+        [&](const std::string& line) { emitted.push_back(line); },
+        /*max_segment_samples=*/16000,
+        /*max_final_redecode_samples=*/30000);
+    pipeline.preload(std::vector<float>(24000, 0.2f));
+    std::thread worker([&]() { pipeline.run_loop(); });
+    pipeline.request_stop(false, true);
+    worker.join();
+    assert(decode_sizes.size() == 2 && decode_sizes[0] == 16000 && decode_sizes[1] == 24000);
+    assert(emitted.size() >= 2);
+    assert(emitted[emitted.size() - 2] == "{\\"type\\":\\"result\\",\\"text\\":\\"full-win-utterance\\",\\"isFinal\\":true}");
+    assert(emitted.back() == "{\\"type\\":\\"end\\"}");
+  }
+
+  // B. > max_final_redecode_samples -> drops full buffer, preserves committed_text + decodes trailing segment
+  {
+    std::vector<size_t> decode_sizes;
+    std::vector<std::string> emitted;
+    SegmentedUtterancePipeline pipeline(
+        [&](const std::vector<float>& samples) -> std::string {
+          decode_sizes.push_back(samples.size());
+          if (samples.size() == 16000) return "head-seg";
+          return "tail-seg";
+        },
+        [&](const std::string& line) { emitted.push_back(line); },
+        /*max_segment_samples=*/16000,
+        /*max_final_redecode_samples=*/20000);
+    pipeline.preload(std::vector<float>(24000, 0.2f));
+    std::thread worker([&]() { pipeline.run_loop(); });
+    pipeline.request_stop(false, true);
+    worker.join();
+    for (size_t sz : decode_sizes) assert(sz <= 16000);
+    assert(decode_sizes.back() == 8000);
+    assert(emitted[emitted.size() - 2] == "{\\"type\\":\\"result\\",\\"text\\":\\"head-seg tail-seg\\",\\"isFinal\\":true}");
+  }
+
+  // C. Pure silence <= max_final_redecode_samples skips decode_fn_ and emits empty final ""
+  {
+    int decode_calls = 0;
+    std::vector<std::string> emitted;
+    SegmentedUtterancePipeline pipeline(
+        [&](const std::vector<float>&) -> std::string {
+          ++decode_calls;
+          return "IM.codes";
+        },
+        [&](const std::string& line) { emitted.push_back(line); },
+        /*max_segment_samples=*/16000,
+        /*max_final_redecode_samples=*/30000);
+    pipeline.preload(std::vector<float>(18000, 0.001f));
+    std::thread worker([&]() { pipeline.run_loop(); });
+    pipeline.request_stop(false, true);
+    worker.join();
+    assert(decode_calls == 0);
+    assert(emitted.size() == 2 && emitted[0] == "{\\"type\\":\\"result\\",\\"text\\":\\"\\",\\"isFinal\\":true}");
+  }
+
+  // D. Abort never emits isFinal=true
+  {
+    std::vector<std::string> emitted;
+    SegmentedUtterancePipeline pipeline(
+        [&](const std::vector<float>&) -> std::string { return "x"; },
+        [&](const std::string& line) { emitted.push_back(line); },
+        16000,
+        30000);
+    pipeline.preload(std::vector<float>(24000, 0.2f));
+    pipeline.request_stop(true, true);
+    pipeline.run_loop();
+    for (const auto& line : emitted) {
+      assert(line.find("\\"isFinal\\":true") == std::string::npos);
+    }
+  }
+
+  std::cout << "WIN_SEGMENTED_PIPELINE:PASS\\n";
+  return 0;
+}
+`);
+    await runNativeOrThrow(clangPp, ['-std=c++17', '-Wall', '-Wextra', '-Werror', cppFile, '-o', cppBin], { timeout: 60000 });
+    expect((await runNativeOrThrow(cppBin, [], { timeout: 60000 })).trim()).toBe('WIN_SEGMENTED_PIPELINE:PASS');
+  }
 }, 180_000);
