@@ -367,12 +367,39 @@ function mergeSingleAuditField(saved: string | undefined, parsed: string | undef
   return saved;
 }
 
-function sameFindingSummaryIdentity(a: string, b: string): boolean {
-  const normA = a.replace(/\s+/gu, ' ').trim().toLowerCase();
-  const normB = b.replace(/\s+/gu, ' ').trim().toLowerCase();
+function normalizeFullFindingSummary(value: string): string {
+  return value.replace(/\s+/gu, ' ').trim().toLowerCase();
+}
+
+function sameFindingSummaryOrPrefixTruncation(a: string, b: string): boolean {
+  const normA = normalizeFullFindingSummary(a);
+  const normB = normalizeFullFindingSummary(b);
   if (!normA || !normB) return false;
-  const prefix = Math.min(32, normA.length, normB.length);
-  return normA.slice(0, prefix) === normB.slice(0, prefix);
+  if (normA === normB) return true;
+  // Allow only full-string prefix expansion when an older slice truncated the tail of the same summary.
+  return (normA.length >= 24 && normB.startsWith(normA)) || (normB.length >= 24 && normA.startsWith(normB));
+}
+
+function findUniqueParsedMatch(
+  item: AuditDraftFinding,
+  structuredList: readonly AuditDraftFinding[],
+  parsedList: readonly AuditDraftFinding[],
+): AuditDraftFinding | undefined {
+  const targetSummary = normalizeFullFindingSummary(item.summary);
+  if (!targetSummary) return undefined;
+  const compatibleSeverity = (other: AuditDraftFinding): boolean => (
+    !item.severity || !other.severity || item.severity === other.severity
+  );
+  // Refuse cross-matching when multiple structured entries share the same normalized summary.
+  const structuredDupes = structuredList.filter(
+    (s) => normalizeFullFindingSummary(s.summary) === targetSummary && compatibleSeverity(s),
+  );
+  if (structuredDupes.length !== 1) return undefined;
+
+  const exactMatches = parsedList.filter(
+    (p) => normalizeFullFindingSummary(p.summary) === targetSummary && compatibleSeverity(p),
+  );
+  return exactMatches.length === 1 ? exactMatches[0] : undefined;
 }
 
 function mergeAuditFindings(
@@ -381,11 +408,10 @@ function mergeAuditFindings(
   legacyStructured: readonly AuditDraftFinding[],
 ): AuditDraftFinding[] {
   if (structuredFull.length > 0) {
-    const canSupplementByIndex = parsedFromText.length === structuredFull.length;
-    return structuredFull.map((item, idx) => {
-      const supplement = canSupplementByIndex
-        ? parsedFromText[idx]
-        : parsedFromText.find((p) => sameFindingSummaryIdentity(item.summary, p.summary));
+    // Explicit structured findings keep their own order and fields; never index-bind or prefix-guess against independent notice text.
+    // Only fill missing optional fields when a single unambiguous exact-summary + severity match exists.
+    return structuredFull.map((item) => {
+      const supplement = findUniqueParsedMatch(item, structuredFull, parsedFromText);
       if (!supplement) return item;
       const severity = item.severity ?? supplement.severity;
       const location = item.location ?? supplement.location;
@@ -415,7 +441,7 @@ function mergeAuditFindings(
         const l = legacyStructured[idx]!;
         const sevAligned = !p.severity || !l.severity || p.severity === l.severity;
         if (!sevAligned) return false;
-        return sameFindingSummaryIdentity(p.summary, l.summary) || (legacyStructured.length === 1 && !parsedHasAnyField);
+        return sameFindingSummaryOrPrefixTruncation(p.summary, l.summary) || (legacyStructured.length === 1 && !parsedHasAnyField);
       });
     if (!canFillFromLegacy) {
       return [...parsedFromText];
