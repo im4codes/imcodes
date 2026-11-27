@@ -6743,12 +6743,11 @@ async function sendProcessSessionMessage(
       getContextStoreClient().fireAndForget('recordMemoryHits', [memoryContext.hitIds]);
     }
   }
-  return true;
-
   if (agentType === 'opencode') {
     const { scheduleCatchup } = await import('./opencode-watcher.js');
     scheduleCatchup(sessionName);
   }
+  return true;
 }
 
 function scheduleProcessAutomationDrain(sessionName: string): void {
@@ -6800,7 +6799,11 @@ export async function drainProcessAutomationQueue(sessionName: string): Promise<
         next.options.onAborted?.();
         continue;
       }
-      await sendProcessSessionMessage(sessionName, next.text, [], next.options);
+      const delivered = await sendProcessSessionMessage(sessionName, next.text, [], next.options);
+      if (!delivered) {
+        next.options?.onAborted?.();
+        continue;
+      }
       break; // Deliver one queued turn per idle transition.
     }
   } catch (err) {

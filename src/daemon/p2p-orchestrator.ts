@@ -400,6 +400,7 @@ export interface P2pRun {
 // ── In-memory store ───────────────────────────────────────────────────────
 
 const activeRuns = new Map<string, P2pRun>();
+const activeRunServerLinks = new Map<string, ServerLink | null>();
 
 function byteLength(value: string): number {
   return new TextEncoder().encode(value).byteLength;
@@ -1012,15 +1013,22 @@ async function dispatchP2pPromptToSession(args: {
     throw new Error(`missing_transport_runtime:${args.session}`);
   }
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
+  let abortedReason: string | null = null;
   const sendResult = await sendProcessSessionMessageForAutomation(args.session, args.prompt, {
-    beforeTyping: () => !(
-      isParticipantSharedActorEnvelope(args.run.sharedActor)
-      && isShellLikeAgentType(getSession(args.session)?.agentType)
-    ),
-    onAborted: () => {
+    beforeTyping: () => {
       if (isParticipantSharedActorEnvelope(args.run.sharedActor) && isShellLikeAgentType(getSession(args.session)?.agentType)) {
-        failRun(args.run, 'dispatch_failed', PARTICIPANT_SHELL_FORBIDDEN_REASON, null);
+        abortedReason = PARTICIPANT_SHELL_FORBIDDEN_REASON;
+        return false;
       }
+      return true;
+    },
+    onAborted: () => {
+      if (args.run._cancelled || isTerminal(args.run.status)) return;
+      const serverLink = activeRunServerLinks.get(args.run.id) ?? null;
+      const reason = abortedReason ?? (isParticipantSharedActorEnvelope(args.run.sharedActor)
+        ? PARTICIPANT_SHELL_FORBIDDEN_REASON
+        : 'aborted_before_typing');
+      failRun(args.run, 'dispatch_failed', reason, serverLink);
     },
     userMessageMetadata: {
       ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
@@ -1031,10 +1039,11 @@ async function dispatchP2pPromptToSession(args: {
     },
   });
   if (sendResult === 'aborted') {
-    if (isParticipantSharedActorEnvelope(args.run.sharedActor) && isShellLikeAgentType(getSession(args.session)?.agentType)) {
-      throw new Error(PARTICIPANT_SHELL_FORBIDDEN_REASON);
-    }
-    throw new Error('aborted_before_typing');
+    throw new Error(
+      abortedReason ?? (isParticipantSharedActorEnvelope(args.run.sharedActor)
+        ? PARTICIPANT_SHELL_FORBIDDEN_REASON
+        : 'aborted_before_typing'),
+    );
   }
   return { mode: sendResult === 'queued' ? 'queued' : 'tmux' };
 }
@@ -1537,6 +1546,7 @@ export async function startP2pRun(...args:
   };
 
   activeRuns.set(runId, run);
+  activeRunServerLinks.set(runId, serverLink);
   pushState(run, serverLink);
 
   // Start the bookend chain in background
@@ -1596,6 +1606,7 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null,
     run.activePhase = 'queued';
     transition(run, 'cancelled', serverLink);
     activeRuns.delete(runId);
+    activeRunServerLinks.delete(runId);
     logger.info({ runId, source, reason: options.reason }, 'P2P queued run cancelled');
     return true;
   }
@@ -1612,6 +1623,7 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null,
     run.activeTargetSessions = [];
     transition(run, 'cancelled', serverLink);
     activeRuns.delete(runId);
+    activeRunServerLinks.delete(runId);
     logger.info({
       runId,
       source,
@@ -1622,6 +1634,7 @@ export async function cancelP2pRun(runId: string, serverLink: ServerLink | null,
   }
 
   activeRuns.delete(runId);
+  activeRunServerLinks.delete(runId);
   logger.info({ runId, source, reason: options.reason, currentStatus: run.status }, 'P2P terminal run removed after cancel request');
   return true;
 }
@@ -4300,9 +4313,9 @@ async function dispatchHop(
         logger.warn({ runId: run.id, session }, 'P2P: hard deadline reached, force-skipping hop');
         break;
       }
-      if (run._cancelled) {
+      if (run._cancelled || isTerminal(run.status)) {
         idleWaiter.cancel();
-        await finishHop('cancelled');
+        await finishHop(run._cancelled ? 'cancelled' : 'failed', run.error ?? undefined);
         return false;
       }
       await sleep(IDLE_POLL_MS);
@@ -4315,9 +4328,9 @@ async function dispatchHop(
         logger.warn({ runId: run.id, session }, 'P2P: hard deadline reached, force-skipping hop');
         break;
       }
-      if (run._cancelled) {
+      if (run._cancelled || isTerminal(run.status)) {
         idleWaiter.cancel();
-        await finishHop('cancelled');
+        await finishHop(run._cancelled ? 'cancelled' : 'failed', run.error ?? undefined);
         return false;
       }
 
@@ -4671,6 +4684,7 @@ function scheduleP2pRunTerminalCleanup(run: P2pRun): void {
     } catch { /* ignore */ }
     // A3: unified activeRuns delete — covers completed/failed/timed_out/cancelled.
     activeRuns.delete(run.id);
+    activeRunServerLinks.delete(run.id);
     terminalCleanupScheduled.delete(run.id);
   }, 60_000);
 }

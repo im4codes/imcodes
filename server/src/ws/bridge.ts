@@ -8436,9 +8436,6 @@ export class WsBridge {
       ? await evaluateParticipantP2pShellRestriction({
         msg,
         resolveAgentType: (name) => this.resolveSessionAgentType(name),
-        resolveExpandedSessions: sessionName
-          ? () => this.resolveP2pDomainSessionNames(sessionName)
-          : undefined,
       })
       : null;
     const decision = evaluateShareCommand({
@@ -9182,97 +9179,6 @@ export class WsBridge {
     }
     const finalCached = this.resolveCachedSessionAgentType(sessionName);
     return finalCached.hit ? finalCached.agentType : null;
-  }
-
-  async resolveP2pDomainSessionNames(initiatorSession: string): Promise<string[]> {
-    const names = new Set<string>([initiatorSession]);
-    const liveInitSub = this.activeSubSessions.get(initiatorSession);
-    const liveInitMain = this.activeMainSessions.get(initiatorSession);
-
-    let scopeMainSession: string | null = liveInitSub?.parentSession ?? null;
-    let projectName: string | null = liveInitMain?.project ?? null;
-    if (this.db && initiatorSession.startsWith('deck_sub_') && !scopeMainSession) {
-      try {
-        const subId = initiatorSession.match(/^deck_sub_([A-Za-z0-9_-]+)$/)?.[1];
-        if (subId) {
-          const row = await this.db.queryOne<{ parent_session: string | null }>(
-            'SELECT parent_session FROM sub_sessions WHERE server_id = $1 AND id = $2 LIMIT 1',
-            [this.serverId, subId],
-          );
-          scopeMainSession = row?.parent_session ?? null;
-        }
-      } catch { /* best effort */ }
-    } else if (this.db && !initiatorSession.startsWith('deck_sub_') && !projectName) {
-      try {
-        const row = await this.db.queryOne<{ project_name: string | null }>(
-          'SELECT project_name FROM sessions WHERE server_id = $1 AND name = $2 LIMIT 1',
-          [this.serverId, initiatorSession],
-        );
-        projectName = row?.project_name ?? null;
-      } catch { /* best effort */ }
-    }
-
-    if (initiatorSession.startsWith('deck_sub_')) {
-      if (scopeMainSession) {
-        const mainLive = this.activeMainSessions.get(scopeMainSession);
-        if (!mainLive || mainLive.state !== 'stopped') names.add(scopeMainSession);
-        for (const sub of this.activeSubSessions.values()) {
-          if (sub.parentSession === scopeMainSession && sub.state !== 'stopped') names.add(sub.name);
-        }
-      }
-    } else {
-      for (const sub of this.activeSubSessions.values()) {
-        if (sub.parentSession === initiatorSession && sub.state !== 'stopped') names.add(sub.name);
-      }
-      if (projectName) {
-        const projectSlug = sanitizeProjectName(projectName);
-        for (const session of this.activeMainSessions.values()) {
-          if (
-            session.state !== 'stopped'
-            && (session.project === projectName || (session.project ? sanitizeProjectName(session.project) === projectSlug : false))
-          ) {
-            names.add(session.name);
-          }
-        }
-      }
-    }
-
-    if (this.db) {
-      try {
-        if (initiatorSession.startsWith('deck_sub_') && scopeMainSession) {
-          const rows = await this.db.query<{ id: string }>(
-            'SELECT id FROM sub_sessions WHERE server_id = $1 AND parent_session = $2 AND closed_at IS NULL',
-            [this.serverId, scopeMainSession],
-          );
-          for (const row of rows) {
-            const subName = `deck_sub_${row.id}`;
-            if (this.activeSubSessions.get(subName)?.state !== 'stopped') names.add(subName);
-          }
-        } else if (!initiatorSession.startsWith('deck_sub_')) {
-          const subRows = await this.db.query<{ id: string }>(
-            'SELECT id FROM sub_sessions WHERE server_id = $1 AND parent_session = $2 AND closed_at IS NULL',
-            [this.serverId, initiatorSession],
-          );
-          for (const row of subRows) {
-            const subName = `deck_sub_${row.id}`;
-            if (this.activeSubSessions.get(subName)?.state !== 'stopped') names.add(subName);
-          }
-          if (projectName) {
-            const projectSlug = sanitizeProjectName(projectName);
-            const mainRows = await this.db.query<{ name: string; state: string | null }>(
-              "SELECT name, state FROM sessions WHERE server_id = $1 AND (project_name = $2 OR project_name = $3) AND name NOT LIKE 'deck_sub_%'",
-              [this.serverId, projectName, projectSlug],
-            );
-            for (const row of mainRows) {
-              const live = this.activeMainSessions.get(row.name);
-              const effectiveState = live?.state ?? row.state;
-              if (effectiveState !== 'stopped') names.add(row.name);
-            }
-          }
-        }
-      } catch { /* best effort */ }
-    }
-    return [...names];
   }
 
   private async resolveExecutionTargetAgentTypes(

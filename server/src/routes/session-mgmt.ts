@@ -1402,7 +1402,6 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         msg: body,
         resolveAgentType: async (name) => (await bridge.resolveSessionAgentType?.(name))
           ?? (await getTrustedAgentType(c.env.DB, serverId, shareTargetFromSessionName(serverId, name) ?? { kind: 'server', serverId })),
-        resolveExpandedSessions: async () => resolveHttpP2pDomainSessionNames(c.env.DB, serverId, bridge, targetSessionName!),
       });
       if (p2pShellReason) {
         await auditHttpShareCommand(c, { userId, target, coverage: access.actor.coverage, actionType: 'session.send', decision: 'rejected', reason: p2pShellReason, actionId, now });
@@ -1548,57 +1547,6 @@ async function getTrustedAgentType(db: Env['DB'], serverId: string, target: Shar
   }
   const session = await getDbSessionByName(db, serverId, target.sessionName);
   return typeof session?.agent_type === 'string' ? session.agent_type : null;
-}
-
-async function resolveHttpP2pDomainSessionNames(
-  db: Env['DB'],
-  serverId: string,
-  bridge: Pick<WsBridge, 'resolveP2pDomainSessionNames' | 'getLiveSubSessionCloneState'>,
-  initiatorSession: string,
-): Promise<string[]> {
-  const names = new Set<string>([initiatorSession]);
-  if (typeof bridge.resolveP2pDomainSessionNames === 'function') {
-    for (const name of await bridge.resolveP2pDomainSessionNames(initiatorSession)) {
-      names.add(name);
-    }
-  }
-  const dbSessions = await getDbSessionsByServer(db, serverId);
-  const dbSubs = await getSubSessionsByServer(db, serverId);
-  if (initiatorSession.startsWith('deck_sub_')) {
-    const initSubId = initiatorSession.slice('deck_sub_'.length);
-    const initSub = dbSubs.find((sub) => sub.id === initSubId);
-    const scopeMain = initSub?.parent_session ?? null;
-    if (scopeMain) {
-      const mainRow = dbSessions.find((session) => session.name === scopeMain);
-      if (!mainRow || mainRow.state !== 'stopped') names.add(scopeMain);
-      for (const sub of dbSubs) {
-        if (sub.parent_session !== scopeMain || sub.closed_at !== null) continue;
-        const subName = `deck_sub_${sub.id}`;
-        const liveState = bridge.getLiveSubSessionCloneState?.(subName);
-        if (liveState?.known && liveState.state === 'stopped') continue;
-        names.add(subName);
-      }
-    }
-  } else {
-    const initMain = dbSessions.find((session) => session.name === initiatorSession);
-    const projectSlug = initMain?.project_name ? sanitizeProjectName(initMain.project_name) : null;
-    for (const sub of dbSubs) {
-      if (sub.parent_session !== initiatorSession || sub.closed_at !== null) continue;
-      const subName = `deck_sub_${sub.id}`;
-      const liveState = bridge.getLiveSubSessionCloneState?.(subName);
-      if (liveState?.known && liveState.state === 'stopped') continue;
-      names.add(subName);
-    }
-    if (initMain?.project_name) {
-      for (const session of dbSessions) {
-        if (session.name.startsWith('deck_sub_') || session.state === 'stopped') continue;
-        const matchesProject = session.project_name === initMain.project_name
-          || (projectSlug ? sanitizeProjectName(session.project_name) === projectSlug : false);
-        if (matchesProject) names.add(session.name);
-      }
-    }
-  }
-  return [...names];
 }
 
 function normalizeTrustedRuntimeType(value: string | null): TrustedRuntimeType {

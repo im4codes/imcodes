@@ -2515,8 +2515,13 @@ describe('session-mgmt persistence routes', () => {
     expect(renameRes.status).toBe(403);
     expect(await renameRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
 
-    // 3. Unbounded P2P broadcasts (@@all / p2pMode / __all__) rejected on mixed project, allowed on pure-LLM project
-    mockDbQueryOne.mockResolvedValue({ project_name: 'pure', display_name: 'Shared User', username: 'shared' });
+    // 3. Mixed-domain unbounded P2P broadcasts (@@all / p2pMode / __all__) relay for daemon LLM filtering; explicit shell recipients still rejected with 403
+    mockDbQueryOne.mockImplementation(async (sql: string, params: unknown[] = []) => {
+      if (typeof sql === 'string' && sql.includes('FROM sessions')) {
+        return { project_name: params[1] === 'deck_mix_brain' ? 'mix' : 'pure' };
+      }
+      return { display_name: 'Shared User', username: 'shared' };
+    });
     mockDbQuery.mockImplementation(async (sql: string) => {
       if (typeof sql === 'string' && sql.includes('FROM server_shares')) {
         return [{
@@ -2539,7 +2544,7 @@ describe('session-mgmt persistence routes', () => {
     resolveSessionAgentTypeMock.mockImplementation(async (name: string) => {
       if (name === 'deck_mix_brain' || name === 'deck_pure_brain') return 'claude-code';
       if (name === 'deck_sub_mixsh') return 'shell';
-      if (name === 'deck_sub_purellm') return 'codex-sdk';
+      if (name === 'deck_sub_mixllm' || name === 'deck_sub_purellm') return 'codex-sdk';
       return null;
     });
     mockGetDbSessionsByServer.mockResolvedValue([
@@ -2548,33 +2553,42 @@ describe('session-mgmt persistence routes', () => {
     ]);
     mockGetSubSessionsByServer.mockResolvedValue([
       { id: 'mixsh', server_id: 'srv-1', type: 'shell', parent_session: 'deck_mix_brain', closed_at: null },
+      { id: 'mixllm', server_id: 'srv-1', type: 'codex-sdk', parent_session: 'deck_mix_brain', closed_at: null },
       { id: 'purellm', server_id: 'srv-1', type: 'codex-sdk', parent_session: 'deck_pure_brain', closed_at: null },
     ]);
+
+    for (const payload of [
+      { sessionName: 'deck_mix_brain', text: '@@discuss(deck_sub_mixsh, audit)' },
+      { sessionName: 'deck_mix_brain', text: 'check', p2pAtTargets: [{ session: 'deck_sub_mixsh', mode: 'audit' }] },
+      { sessionName: 'deck_mix_brain', text: 'check', p2pSessionConfig: { deck_sub_mixsh: { enabled: true, mode: 'audit' } } },
+    ]) {
+      const explicitShell = await app.request('/api/server/srv-1/session/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      expect(explicitShell.status).toBe(403);
+      expect(await explicitShell.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    }
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
 
     for (const payload of [
       { sessionName: 'deck_mix_brain', text: '@@all(audit)' },
       { sessionName: 'deck_mix_brain', text: 'check', p2pMode: 'audit' },
       { sessionName: 'deck_mix_brain', text: 'check', p2pAtTargets: [{ session: '__all__', mode: 'audit' }] },
+      { sessionName: 'deck_pure_brain', text: 'check', p2pMode: 'audit' },
     ]) {
-      const mixBc = await app.request('/api/server/srv-1/session/send', {
+      const bcRes = await app.request('/api/server/srv-1/session/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      expect(mixBc.status).toBe(403);
-      expect(await mixBc.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(bcRes.status).toBe(200);
     }
-    expect(sendToDaemonMock).not.toHaveBeenCalled();
-
-    const pureBc = await app.request('/api/server/srv-1/session/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionName: 'deck_pure_brain', text: 'check', p2pMode: 'audit' }),
-    });
-    expect(pureBc.status).toBe(200);
+    expect(sendToDaemonMock).toHaveBeenCalledTimes(4);
     expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toMatchObject({
       type: 'session.send',
-      sessionName: 'deck_pure_brain',
+      sessionName: 'deck_mix_brain',
       sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
     });
   });

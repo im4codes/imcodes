@@ -13,6 +13,8 @@ const {
   listSessionsMock,
   timelineEmitMock,
   emitCommandAckReliableMock,
+  startP2pRunMock,
+  scheduleCatchupMock,
 } = vi.hoisted(() => ({
   startProjectMock: vi.fn(),
   teardownProjectMock: vi.fn(),
@@ -26,6 +28,8 @@ const {
   listSessionsMock: vi.fn(() => []),
   timelineEmitMock: vi.fn(),
   emitCommandAckReliableMock: vi.fn(),
+  startP2pRunMock: vi.fn(async () => ({ id: 'p2p-run-1' })),
+  scheduleCatchupMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -64,7 +68,13 @@ vi.mock('../../src/daemon/terminal-streamer.js', () => ({ terminalStreamer: { su
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({ timelineEmitter: { emit: timelineEmitMock, on: vi.fn(() => () => {}), off: vi.fn(), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })) } }));
 vi.mock('../../src/daemon/timeline-store.js', () => ({ timelineStore: { append: vi.fn(), read: vi.fn(() => []), clear: vi.fn() } }));
 vi.mock('../../src/daemon/subsession-manager.js', () => ({ startSubSession: startSubSessionMock, stopSubSession: vi.fn(), rebuildSubSessions: vi.fn(), detectShells: vi.fn().mockResolvedValue([]), readSubSessionResponse: vi.fn(), subSessionName: (id: string) => `deck_sub_${id}` }));
-vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({ startP2pRun: vi.fn(), cancelP2pRun: vi.fn(), getP2pRun: vi.fn(() => undefined), listP2pRuns: vi.fn(() => []), serializeP2pRun: vi.fn() }));
+vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({ startP2pRun: startP2pRunMock, cancelP2pRun: vi.fn(), getP2pRun: vi.fn(() => undefined), listP2pRuns: vi.fn(() => []), serializeP2pRun: vi.fn() }));
+vi.mock('../../src/daemon/opencode-watcher.js', () => ({
+  startWatching: vi.fn(),
+  stopWatching: vi.fn(),
+  isWatching: vi.fn(() => false),
+  scheduleCatchup: scheduleCatchupMock,
+}));
 vi.mock('../../src/daemon/session-list.js', () => ({ buildSessionList: vi.fn(async () => []) }));
 vi.mock('../../src/daemon/repo-handler.js', () => ({ handleRepoCommand: vi.fn() }));
 vi.mock('../../src/daemon/file-transfer-handler.js', () => ({ handleFileUpload: vi.fn(), handleFileUploadFetch: vi.fn(), handleFileDownload: vi.fn(), createProjectFileHandle: vi.fn(), createProjectFileHandleFromValidatedPath: vi.fn(), tryCreateProjectFileHandle: vi.fn(), lookupAttachment: vi.fn(() => undefined) }));
@@ -78,7 +88,13 @@ vi.mock('../../src/daemon/git-remote-clone.js', () => ({
   maybeCloneGitRemoteToDirectory: vi.fn(async ({ targetDir }: { targetDir: string }) => targetDir),
 }));
 
-import { handleWebCommand, sendProcessSessionMessageForAutomation } from '../../src/daemon/command-handler.js';
+import {
+  clearProcessAutomationQueuesForTest,
+  drainProcessAutomationQueue,
+  getProcessAutomationQueueDepth,
+  handleWebCommand,
+  sendProcessSessionMessageForAutomation,
+} from '../../src/daemon/command-handler.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
@@ -122,6 +138,7 @@ describe('command-handler participant shell/script defense-in-depth', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    clearProcessAutomationQueuesForTest();
     getSessionMock.mockImplementation((name: string) => {
       if (name === 'deck_sub_sh1') return { name, projectName: 'proj', role: 'w1', agentType: 'shell', projectDir: '/tmp/proj', state: 'idle' };
       if (name === 'deck_sub_sc1') return { name, projectName: 'proj', role: 'w1', agentType: 'script', projectDir: '/tmp/proj', state: 'idle' };
@@ -394,5 +411,163 @@ describe('command-handler participant shell/script defense-in-depth', () => {
       expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
       expect(sendRawInputMock).toHaveBeenCalledTimes(2);
     });
+  });
+
+  it('delivers mixed-domain P2P broadcasts only to LLM targets while rejecting explicit shell recipients and keeping owner control', async () => {
+    const mixBrain = { name: 'deck_mixbc_brain', projectName: 'mixbc', role: 'brain', agentType: 'claude-code', projectDir: '/tmp/mixbc', state: 'idle' };
+    const mixLlm = { name: 'deck_sub_mixllm', projectName: 'mixbc', role: 'w1', parentSession: 'deck_mixbc_brain', agentType: 'codex-sdk', projectDir: '/tmp/mixbc', state: 'idle' };
+    const mixShell = { name: 'deck_sub_mixsh', projectName: 'mixbc', role: 'w2', parentSession: 'deck_mixbc_brain', agentType: 'shell', projectDir: '/tmp/mixbc', state: 'idle' };
+    listSessionsMock.mockReturnValue([mixBrain, mixLlm, mixShell]);
+    getSessionMock.mockImplementation((name: string) => [mixBrain, mixLlm, mixShell].find((s) => s.name === name));
+
+    // Participant unbounded @@all & p2pMode (with config) deliver only to LLM (shell excluded from expandP2pTargets)
+    handleWebCommand({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: '@@all(audit) review please', commandId: 'mix-all-1', sharedActor: SERVER_PARTICIPANT }, serverLink as any);
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_mixbc_brain',
+      text: 'review',
+      p2pMode: 'audit',
+      p2pSessionConfig: {
+        deck_sub_mixllm: { enabled: true, mode: 'audit' },
+        deck_sub_mixsh: { enabled: false, mode: 'audit' },
+      },
+      commandId: 'mix-mode-1',
+      sharedActor: SERVER_PARTICIPANT,
+    }, serverLink as any);
+    await vi.waitFor(() => {
+      expect(startP2pRunMock).toHaveBeenCalledTimes(2);
+    });
+    for (const call of startP2pRunMock.mock.calls) {
+      expect(call[0].targets).toEqual([{ session: 'deck_sub_mixllm', mode: 'audit' }]);
+      expect(call[0].targets.some((t: { session: string }) => t.session === 'deck_sub_mixsh')).toBe(false);
+    }
+
+    // Explicit participant shell target rejected without startP2pRun
+    startP2pRunMock.mockClear();
+    timelineEmitMock.mockClear();
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_mixbc_brain',
+      text: 'review',
+      commandId: 'mix-explicit-sh',
+      p2pAtTargets: [{ session: 'deck_sub_mixsh', mode: 'audit' }],
+      sharedActor: SERVER_PARTICIPANT,
+    }, serverLink as any);
+    await vi.waitFor(() => {
+      expect(timelineEmitMock).toHaveBeenCalledWith('deck_mixbc_brain', 'command.ack', expect.objectContaining({
+        commandId: 'mix-explicit-sh',
+        status: 'error',
+        error: 'participant_shell_forbidden',
+      }));
+    });
+    expect(startP2pRunMock).not.toHaveBeenCalled();
+
+    // Owner explicit shell target still allowed
+    handleWebCommand({
+      type: 'session.send',
+      sessionName: 'deck_mixbc_brain',
+      text: 'review',
+      commandId: 'mix-owner-sh',
+      p2pAtTargets: [{ session: 'deck_sub_mixsh', mode: 'audit' }],
+    }, serverLink as any);
+    await vi.waitFor(() => {
+      expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+    });
+    expect(startP2pRunMock.mock.calls[0]?.[0].targets).toEqual([{ session: 'deck_sub_mixsh', mode: 'audit' }]);
+  });
+
+  it('invokes onAborted and continues draining queued automation messages when in-lock guard returns false', async () => {
+    let qState: 'running' | 'idle' = 'running';
+    let qAgentType = 'claude-code';
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_qdrain_brain') {
+        return {
+          name,
+          projectName: 'qdrain',
+          role: 'brain',
+          agentType: qAgentType,
+          projectDir: '/tmp/qdrain',
+          state: qState,
+          runtimeType: 'process',
+        };
+      }
+      return undefined;
+    });
+
+    const onAborted1 = vi.fn();
+    const onTyped1 = vi.fn();
+    const onAborted2 = vi.fn();
+    const onTyped2 = vi.fn();
+    let checkCalls = 0;
+
+    const q1 = await sendProcessSessionMessageForAutomation('deck_qdrain_brain', 'first-aborts-in-lock', {
+      deliveryMode: 'queue',
+      verbatim: true,
+      // Passes queue pre-check (call 1), fails inside mutex (call 2)
+      beforeTyping: () => {
+        checkCalls += 1;
+        return checkCalls === 1;
+      },
+      onAborted: onAborted1,
+      onTyped: onTyped1,
+    });
+    const q2 = await sendProcessSessionMessageForAutomation('deck_qdrain_brain', 'second-succeeds', {
+      deliveryMode: 'queue',
+      verbatim: true,
+      beforeTyping: () => qAgentType !== 'shell',
+      onAborted: onAborted2,
+      onTyped: onTyped2,
+    });
+    expect(q1).toBe('queued');
+    expect(q2).toBe('queued');
+    expect(getProcessAutomationQueueDepth('deck_qdrain_brain')).toBe(2);
+
+    qState = 'idle';
+    await drainProcessAutomationQueue('deck_qdrain_brain');
+
+    expect(onAborted1).toHaveBeenCalledTimes(1);
+    expect(onTyped1).not.toHaveBeenCalled();
+    expect(onAborted2).not.toHaveBeenCalled();
+    expect(onTyped2).toHaveBeenCalledTimes(1);
+    expect(sendKeysDelayedEnterMock).toHaveBeenCalledTimes(1);
+    expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith('deck_qdrain_brain', 'second-succeeds', { verbatim: true });
+    expect(getProcessAutomationQueueDepth('deck_qdrain_brain')).toBe(0);
+  });
+
+  it('runs OpenCode scheduleCatchup after successful process sends and skips it when blocked before typing', async () => {
+    let ocAgentType = 'opencode';
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_oc_brain') {
+        return {
+          name,
+          projectName: 'oc',
+          role: 'brain',
+          agentType: ocAgentType,
+          projectDir: '/tmp/oc',
+          state: 'idle',
+          runtimeType: 'process',
+        };
+      }
+      return undefined;
+    });
+
+    const sentRes = await sendProcessSessionMessageForAutomation('deck_oc_brain', 'hello opencode', {
+      verbatim: true,
+      userMessageMetadata: { sharedActor: SERVER_PARTICIPANT },
+    });
+    expect(sentRes).toBe('sent');
+    expect(scheduleCatchupMock).toHaveBeenCalledTimes(1);
+    expect(scheduleCatchupMock).toHaveBeenCalledWith('deck_oc_brain');
+
+    scheduleCatchupMock.mockClear();
+    sendKeysDelayedEnterMock.mockClear();
+    const blockedRes = await sendProcessSessionMessageForAutomation('deck_oc_brain', 'blocked opencode', {
+      verbatim: true,
+      beforeTyping: () => false,
+      userMessageMetadata: { sharedActor: SERVER_PARTICIPANT },
+    });
+    expect(blockedRes).toBe('aborted');
+    expect(scheduleCatchupMock).not.toHaveBeenCalled();
+    expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
   });
 });

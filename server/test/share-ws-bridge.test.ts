@@ -3938,7 +3938,7 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'p2p-llm-ok' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
   });
 
-  it('fences stale in-flight DB reads on newer sync, uses exact project match on session.restart, aligns clone visibility to active running/idle children, and blocks mixed unbounded P2P broadcasts', async () => {
+  it('fences stale in-flight DB reads on newer sync, uses exact project match on session.restart, aligns clone visibility to active running/idle children, and allows mixed-domain P2P broadcasts while blocking explicit shell recipients', async () => {
     const now = Date.now();
     const daemon = new MockWs();
     const bridge = WsBridge.get(serverId);
@@ -3946,6 +3946,7 @@ describe('WsBridge share-scoped sockets', () => {
       { id: 'stoppedsh', parent_session: 'deck_stopshclone_brain', type: 'shell', closed_at: null },
       { id: 'okclone', parent_session: 'deck_stopshclone_brain', type: 'codex-sdk', closed_at: null },
       { id: 'mixbsh', parent_session: 'deck_mixbc_brain', type: 'shell', closed_at: null },
+      { id: 'mixbllm', parent_session: 'deck_mixbc_brain', type: 'codex-sdk', closed_at: null },
       { id: 'purebllm', parent_session: 'deck_purebc_brain', type: 'codex-sdk', closed_at: null },
     ];
     let resolveInflightQuery!: (val: { agent_type: string | null } | null) => void;
@@ -4030,6 +4031,7 @@ describe('WsBridge share-scoped sockets', () => {
     daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'stoppedsh', parentSession: 'deck_stopshclone_brain', sessionType: 'shell', runtimeType: 'process', state: 'stopped' }));
     daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'okclone', parentSession: 'deck_stopshclone_brain', sessionType: 'codex-sdk', runtimeType: 'transport', state: 'idle' }));
     daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'mixbsh', parentSession: 'deck_mixbc_brain', sessionType: 'shell', runtimeType: 'process', state: 'idle' }));
+    daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'mixbllm', parentSession: 'deck_mixbc_brain', sessionType: 'codex-sdk', runtimeType: 'transport', state: 'idle' }));
     daemon.emit('message', JSON.stringify({ type: 'subsession.sync', id: 'purebllm', parentSession: 'deck_purebc_brain', sessionType: 'codex-sdk', runtimeType: 'transport', state: 'idle' }));
     await flushAsync();
 
@@ -4069,9 +4071,13 @@ describe('WsBridge share-scoped sockets', () => {
     // 3) Group clone allows inactive stopped shell child under pure LLM group
     sock.emit('message', JSON.stringify({ type: SESSION_GROUP_CLONE_MSG.START, serverId, sourceMainSessionName: 'deck_stopshclone_brain', idempotencyKey: 'clone-stopped-sh' }));
 
-    // 4) Unbounded P2P broadcasts: mixed blocks BEFORE daemon relay; pure LLM relays with sharedActor
+    // 4) Unbounded P2P broadcasts (@@all / p2pMode / __all__) in mixed domain still relay with sharedActor so daemon excludes shell & delivers to LLM; explicit shell targets still reject
     sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: '@@all(audit)', commandId: 'bc-mix-all' }));
     sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: 'hi', p2pMode: 'audit', commandId: 'bc-mix-mode' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: 'hi', p2pAtTargets: [{ session: '__all__', mode: 'audit' }], commandId: 'bc-mix-star' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: '@@discuss(deck_sub_mixbsh, audit)', commandId: 'bc-mix-named-text' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: 'hi', p2pAtTargets: [{ session: 'deck_sub_mixbsh', mode: 'audit' }], commandId: 'bc-mix-named-at' }));
+    sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: 'hi', p2pSessionConfig: { deck_sub_mixbsh: { enabled: true, mode: 'audit' } }, commandId: 'bc-mix-named-cfg' }));
     sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_purebc_brain', text: 'hi', p2pMode: 'audit', commandId: 'bc-pure-mode' }));
     await flushAsync();
 
@@ -4079,10 +4085,11 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson.some((m) => m.type === 'session.restart' && m.project === 'app_v2')).toBe(false);
     expect(daemon.sentJson.some((m) => m.type === 'session.input' && m.sessionName === 'deck_inflight_brain')).toBe(false);
     expect(daemon.sentJson.some((m) => m.type === SESSION_GROUP_CLONE_MSG.START && m.sourceMainSessionName === 'deck_stopshclone_brain' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
-    expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'bc-mix-all')).toBe(false);
-    expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'bc-mix-mode')).toBe(false);
-    expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'bc-pure-mode' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
-    for (const cmdId of ['bc-mix-all', 'bc-mix-mode']) {
+    for (const cmdId of ['bc-mix-all', 'bc-mix-mode', 'bc-mix-star', 'bc-pure-mode']) {
+      expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === cmdId && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    }
+    for (const cmdId of ['bc-mix-named-text', 'bc-mix-named-at', 'bc-mix-named-cfg']) {
+      expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === cmdId)).toBe(false);
       expect(sock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === cmdId && m.reason === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN)).toBe(true);
     }
   });

@@ -103,21 +103,15 @@ export function evaluateP2pSendTargetScope(params: {
 export async function evaluateParticipantP2pShellRestriction(params: {
   msg: Record<string, unknown>;
   resolveAgentType: (sessionName: string) => Promise<string | null>;
-  resolveExpandedSessions?: () => Promise<string[]>;
 }): Promise<typeof PARTICIPANT_SHELL_FORBIDDEN_REASON | null> {
   const routed = extractAllP2pRoutedSessionNames(params.msg);
   if (!routed.hasP2pRouting) return null;
 
-  const candidates = new Set<string>(routed.sessions);
-  if (routed.hasUnboundedExpansion && params.resolveExpandedSessions) {
-    for (const expanded of await params.resolveExpandedSessions()) {
-      if (typeof expanded === 'string' && expanded.trim()) {
-        candidates.add(expanded.trim());
-      }
-    }
-  }
-
-  for (const sessionName of candidates) {
+  // Reject explicitly named shell/script recipients (including configured
+  // p2pSessionConfig participants). Unbounded expansions (@@all, p2pMode,
+  // __all__) keep the daemon's existing expandP2pTargets eligibility filter,
+  // which excludes shell/script targets rather than rejecting whole mixed domains.
+  for (const sessionName of routed.sessions) {
     const agentType = await params.resolveAgentType(sessionName);
     if (isShellLikeAgentType(agentType)) return PARTICIPANT_SHELL_FORBIDDEN_REASON;
   }

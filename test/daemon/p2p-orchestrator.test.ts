@@ -3613,6 +3613,46 @@ describe('P2P orchestrator — parallel rounds', () => {
     expect(abortedDone.error).toContain('participant_shell_forbidden');
     expect(sendKeysDelayedEnterMock.mock.calls.some(([sess]) => sess === 'deck_proj_w1')).toBe(false);
 
+    // 2c. Queued onAborted fires asynchronously after beforeTyping already flipped to shell ->
+    //     settles run with failRun AND pushes terminal p2p.run_error over active serverLink without re-reading type
+    sendKeysDelayedEnterMock.mockClear();
+    serverLinkMock.send.mockClear();
+    w1AgentType = 'codex';
+    let capturedAbortOpts: { beforeTyping?: () => boolean; onAborted?: () => void } | undefined;
+    processSessionSendMock.mockImplementation(async (session: string, prompt: string, opts?: { beforeTyping?: () => boolean; onAborted?: () => void }) => {
+      if (session === 'deck_proj_w1') {
+        w1AgentType = 'shell';
+        expect(opts?.beforeTyping?.()).toBe(false);
+        // Simulate session type changing back before async onAborted fires (reason must stay captured from abort)
+        w1AgentType = 'codex';
+        capturedAbortOpts = opts;
+        return 'queued';
+      }
+      await sendKeysDelayedEnterMock(session, prompt);
+      return 'sent';
+    });
+    const queuedAbortedRun = await startP2pRun({
+      initiatorSession: 'deck_proj_brain',
+      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      userText: 'queued abort settles terminal projection',
+      fileContents: [],
+      serverLink: serverLinkMock as any,
+      sharedActor: participantActor,
+    });
+    await vi.waitFor(() => {
+      expect(capturedAbortOpts?.onAborted).toBeDefined();
+    });
+    capturedAbortOpts!.onAborted!();
+    const queuedAbortedDone = await waitForStatus(queuedAbortedRun.id, ['failed'], 10_000);
+    expect(queuedAbortedDone.error).toContain('participant_shell_forbidden');
+    expect(serverLinkMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'p2p.run_error',
+      run: expect.objectContaining({
+        id: queuedAbortedRun.id,
+        status: 'failed',
+      }),
+    }));
+
     // 3. Pure-LLM participant run & owner run with shell session succeed cleanly
     processSessionSendMock.mockClear();
     w1AgentType = 'codex';
