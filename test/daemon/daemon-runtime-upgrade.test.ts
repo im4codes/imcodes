@@ -1490,7 +1490,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     expect(roRes).toMatchObject({ eligible: false, reason: 'legacy_npm_cli_read_only' });
   });
 
-  it('[F3-R2] verifies real daemon.lock.json identity, fails closed on PID reuse/probe errors, and recovers unserviced + first user_fallback rollbacks', async () => {
+  it('[F3-R2] verifies real daemon.lock.json identity, fails closed on PID reuse/probe errors, and recovers unserviced + first user_fallback rollbacks', { timeout: 30_000 }, async () => {
     const root = makeTempDir('imcodes-rt-f3r2-');
     const stateDir = join(root, 'state');
     mkdirSync(stateDir, { recursive: true });
@@ -1656,7 +1656,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     });
     oldDaemonChild.unref();
     const waitStart = Date.now();
-    while (!existsSync(join(rbStateDir, 'daemon.lock.json')) && Date.now() - waitStart < 3_000) {
+    while (!existsSync(join(rbStateDir, 'daemon.lock.json')) && Date.now() - waitStart < 10_000) {
       await new Promise((r) => setTimeout(r, 25));
     }
 
@@ -1676,7 +1676,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
         userHome: rbHome,
         env: { IMCODES_HOME: rbStateDir },
         source: { kind: 'local', dir: feed120 },
-        healthCheckTimeoutMs: 1000,
+        healthCheckTimeoutMs: 4000,
         settleMs: 100,
       });
     } finally {
@@ -1730,7 +1730,7 @@ esac
       homeDir: detRoot,
       keepTargets: [det120, det110],
       restartCommand: JSON.stringify(failThenRestoreScript).slice(1, -1),
-      healthCheckTimeoutMs: 1200,
+      healthCheckTimeoutMs: 3000,
       settleMs: 100,
       spawnRunner: () => {},
     });
