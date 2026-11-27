@@ -3813,6 +3813,11 @@ describe('sdk transport session restore', () => {
       }
       expect(codexRunForSession(name, 'start')?.input).toContain('LATEST_SECOND_STALLED_HANDOFF');
       expect(codexRunForSession(name, 'start')?.input).not.toContain('STALE_FIRST_STALLED_HANDOFF');
+
+      // Consumed: second turn after /handoff must not repeat the handoff pack while tokenizer remains stalled.
+      runtime!.send('turn two');
+      await settleCodexRun(name, 'start', 'turn two');
+      expect(codexRunForSession(name, 'start')?.input).toBe('turn two');
     } finally {
       countMock.mockImplementation((...args) => actualMod.countTokensAsync(...args));
     }
