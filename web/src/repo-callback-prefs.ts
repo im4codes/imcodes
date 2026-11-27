@@ -20,13 +20,49 @@ export interface LoadedRepoCallbackPrefs {
   hasSavedConfig: boolean;
 }
 
-function normalizeRepoCallbackProjectDir(raw: string | null | undefined): string {
+export function normalizeRepoCallbackProjectDir(raw: string | null | undefined): string {
   if (!raw) return '';
   const trimmed = raw.trim();
-  if (!trimmed || trimmed === '/') return trimmed;
-  if (/^[A-Za-z]:[\\/]+$/.test(trimmed)) return trimmed.slice(0, 3);
-  if (/^[A-Za-z]:$/.test(trimmed)) return trimmed;
+  if (!trimmed) return '';
+  if (/^\/+$/.test(trimmed)) return '/';
+  if (/^[A-Za-z]:[\\/]*$/.test(trimmed)) {
+    if (/^[A-Za-z]:$/.test(trimmed)) return trimmed;
+    return `${trimmed[0]}:${trimmed[2] === '\\' ? '\\' : '/'}`;
+  }
   return trimmed.replace(/[\\/]+$/, '');
+}
+
+export function findRepoCallbackConfigKey(
+  repos: Record<string, RepoCallbackRepoConfig>,
+  projectDir: string,
+): string | null {
+  if (Object.prototype.hasOwnProperty.call(repos, projectDir)) return projectDir;
+  const normalized = normalizeRepoCallbackProjectDir(projectDir);
+  if (!normalized) return null;
+  for (const key of Object.keys(repos)) {
+    if (normalizeRepoCallbackProjectDir(key) === normalized) return key;
+  }
+  return null;
+}
+
+export function resolveFloatingRepoPanelScope(params: {
+  repoPanelTarget: { sessionId?: string | null; projectDir?: string | null; parentSubId?: string | null } | null;
+  activeSession: string | null | undefined;
+  activeSessionProjectDir: string | null | undefined;
+  isTabShare: boolean;
+  sessionRootPath: string;
+}): { sessionId: string | null; projectDir: string | undefined; parentSubId: string | null } {
+  const parentSubId = params.repoPanelTarget?.parentSubId ?? null;
+  const followActive = !parentSubId;
+  const sessionId = followActive
+    ? (params.activeSession ?? params.repoPanelTarget?.sessionId ?? null)
+    : (params.repoPanelTarget?.sessionId ?? params.activeSession ?? null);
+  const projectDir = params.isTabShare
+    ? params.sessionRootPath
+    : followActive
+      ? (params.activeSessionProjectDir ?? params.repoPanelTarget?.projectDir ?? undefined)
+      : (params.repoPanelTarget?.projectDir ?? params.activeSessionProjectDir ?? undefined);
+  return { sessionId, projectDir, parentSubId };
 }
 
 export async function loadRepoCallbackPrefs(
@@ -39,8 +75,9 @@ export async function loadRepoCallbackPrefs(
   ]);
   const globalPrefs = normalizeRepoCallbackGlobalPrefs(rawGlobal);
   const serverPrefs = normalizeRepoCallbackServerPrefs(rawServer);
-  const hasSavedConfig = Object.prototype.hasOwnProperty.call(serverPrefs.repos, projectDir);
-  const repoConfig = serverPrefs.repos[projectDir] ?? createDefaultRepoCallbackConfig(projectDir);
+  const matchedKey = findRepoCallbackConfigKey(serverPrefs.repos, projectDir);
+  const hasSavedConfig = matchedKey !== null;
+  const repoConfig = matchedKey ? serverPrefs.repos[matchedKey] : createDefaultRepoCallbackConfig(projectDir);
   return { globalPrefs, serverPrefs, repoConfig, hasSavedConfig };
 }
 
@@ -59,9 +96,12 @@ export async function saveRepoCallbackRepoConfig(
   const existingRaw = await getUserPref(repoCallbackServerPrefKey(serverId));
   const current = normalizeRepoCallbackServerPrefs(existingRaw);
   const nowMs = Date.now();
-  const prevConfig = current.repos[config.projectDir];
+  const existingKey = findRepoCallbackConfigKey(current.repos, config.projectDir);
+  const targetKey = existingKey ?? config.projectDir;
+  const prevConfig = existingKey ? current.repos[existingKey] : undefined;
   const nextDraft: RepoCallbackRepoConfig = {
     ...config,
+    projectDir: targetKey,
     lookbackWindow: normalizeRepoCallbackLookbackWindow(config.lookbackWindow),
     updatedAt: nowMs,
   };
@@ -75,7 +115,7 @@ export async function saveRepoCallbackRepoConfig(
     version: 1,
     repos: {
       ...current.repos,
-      [config.projectDir]: nextDraft,
+      [targetKey]: nextDraft,
     },
   });
   await saveUserPref(repoCallbackServerPrefKey(serverId), next);

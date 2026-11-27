@@ -241,7 +241,7 @@ import { ASK_ANSWER_ACK_WAIT_MS } from '@shared/ask-answer.js';
 import type { TrailingAskQuestion } from './find-pending-question.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
-import { buildRepoCallbackTargetOptions } from './repo-callback-prefs.js';
+import { buildRepoCallbackTargetOptions, resolveFloatingRepoPanelScope } from './repo-callback-prefs.js';
 import { ingestSessionRepoContext, clearSessionRepoContexts } from './session-repo-context-store.js';
 import { FloatingPanel } from './components/FloatingPanel.js';
 import { ClientDownloadsModal } from './components/ClientDownloadsModal.js';
@@ -9562,10 +9562,13 @@ function InternalMainApp() {
     });
   }, [activeSession, ensureDesktopWindow, isTabShare, removeDesktopWindow, repoPanelTarget?.parentSubId, resolveRepoProjectDir, runVersionSensitiveAction, selectedServerId, subSessions, trans]);
 
-  const repoPanelSessionId = repoPanelTarget?.sessionId ?? activeSession ?? null;
-  const repoPanelProjectDir = isTabShare
-    ? FS_SESSION_ROOT_PATH
-    : repoPanelTarget?.projectDir ?? activeSessionInfo?.projectDir;
+  const { sessionId: repoPanelSessionId, projectDir: repoPanelProjectDir } = resolveFloatingRepoPanelScope({
+    repoPanelTarget,
+    activeSession,
+    activeSessionProjectDir: activeSessionInfo?.projectDir,
+    isTabShare,
+    sessionRootPath: FS_SESSION_ROOT_PATH,
+  });
 
   // Audit fix (DiscussionsPage spam-fetch loop) — memoize the
   // request-scope object so its identity stays stable across parent

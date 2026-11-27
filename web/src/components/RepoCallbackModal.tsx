@@ -23,6 +23,7 @@ import {
 import type { WsClient } from '../ws-client.js';
 import { isNative } from '../native.js';
 import {
+  findRepoCallbackConfigKey,
   loadRepoCallbackPrefs,
   saveRepoCallbackGlobalTemplates,
   saveRepoCallbackRepoConfig,
@@ -176,15 +177,18 @@ export function RepoCallbackModal({
         if (cancelled) return;
         loadedConfigStateRef.current = { key: configKey, hasSavedConfig: loaded.hasSavedConfig };
         setGlobalTemplates(loaded.globalPrefs.templates);
-        const curSession = currentSessionNameRef.current;
-        const canBindCurrent = !loaded.hasSavedConfig
-          && Boolean(curSession)
-          && callbackTargetsRef.current.some((opt) => opt.sessionName === curSession);
-        setDraft(
-          canBindCurrent && curSession
+        setDraft((prev) => {
+          if (userEditedTargetRef.current) {
+            return { ...loaded.repoConfig, target: prev.target };
+          }
+          const curSession = currentSessionNameRef.current;
+          const canBindCurrent = !loaded.hasSavedConfig
+            && Boolean(curSession)
+            && callbackTargetsRef.current.some((opt) => opt.sessionName === curSession);
+          return canBindCurrent && curSession
             ? { ...loaded.repoConfig, target: curSession }
-            : loaded.repoConfig,
-        );
+            : loaded.repoConfig;
+        });
       })
       .catch((err) => {
         if (cancelled) return;
@@ -208,11 +212,13 @@ export function RepoCallbackModal({
     const loadedState = loadedConfigStateRef.current;
     const configKey = `${serverId ?? ''}\0${projectDir}`;
     if (!loadedState || loadedState.key !== configKey || loadedState.hasSavedConfig) return;
-    if (!currentSessionName || !callbackTargets.some((opt) => opt.sessionName === currentSessionName)) return;
+    const nextTarget = currentSessionName && callbackTargets.some((opt) => opt.sessionName === currentSessionName)
+      ? currentSessionName
+      : REPO_CALLBACK_TARGET_BRAIN;
     setDraft((prev) => (
-      prev.target === REPO_CALLBACK_TARGET_BRAIN && !userEditedTargetRef.current
-        ? { ...prev, target: currentSessionName }
-        : prev
+      prev.target === nextTarget || userEditedTargetRef.current
+        ? prev
+        : { ...prev, target: nextTarget }
     ));
   }, [open, serverId, projectDir, currentSessionName, callbackTargets]);
 
@@ -419,12 +425,7 @@ export function RepoCallbackModal({
         };
         setDraft(nextDraft);
         if (serverId) {
-          const savedServer = await saveRepoCallbackRepoConfig(serverId, nextDraft);
-          const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
-          if (loadedConfigStateRef.current?.key === `${serverId}\0${projectDir}`) {
-            loadedConfigStateRef.current.hasSavedConfig = true;
-          }
-          setDraft(savedRepo);
+          const savedRepo = await persistRepoConfig(serverId, nextDraft);
           ws.repoCallbackSync?.(projectDir);
           onConfigSaved?.(savedRepo, savedGlobal.templates);
         } else {
@@ -450,12 +451,7 @@ export function RepoCallbackModal({
             },
           },
         };
-        const savedServer = await saveRepoCallbackRepoConfig(serverId!, nextDraft);
-        const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
-        if (loadedConfigStateRef.current?.key === `${serverId ?? ''}\0${projectDir}`) {
-          loadedConfigStateRef.current.hasSavedConfig = true;
-        }
-        setDraft(savedRepo);
+        const savedRepo = await persistRepoConfig(serverId!, nextDraft);
         ws.repoCallbackSync?.(projectDir);
         onConfigSaved?.(savedRepo, globalTemplates);
         setFeedback({ kind: 'success', text: t('repo.callback_tpl_saved_repo', { name }) });
@@ -466,6 +462,20 @@ export function RepoCallbackModal({
     } finally {
       setSaving(false);
     }
+  };
+
+  const persistRepoConfig = async (
+    targetServerId: string,
+    configToSave: RepoCallbackRepoConfig,
+  ): Promise<RepoCallbackRepoConfig> => {
+    const savedServer = await saveRepoCallbackRepoConfig(targetServerId, configToSave);
+    const matchedKey = findRepoCallbackConfigKey(savedServer.repos, configToSave.projectDir || projectDir);
+    const savedRepo = (matchedKey ? savedServer.repos[matchedKey] : undefined) ?? configToSave;
+    if (loadedConfigStateRef.current?.key === `${targetServerId}\0${projectDir}`) {
+      loadedConfigStateRef.current.hasSavedConfig = true;
+    }
+    setDraft(savedRepo);
+    return savedRepo;
   };
 
   const handleDeleteSelectedTemplate = async (eventType: RepoCallbackEventType) => {
@@ -500,9 +510,7 @@ export function RepoCallbackModal({
       };
       setDraft(nextDraft);
       if (serverId) {
-        const savedServer = await saveRepoCallbackRepoConfig(serverId, nextDraft);
-        const savedRepo = savedServer.repos[projectDir] ?? nextDraft;
-        setDraft(savedRepo);
+        await persistRepoConfig(serverId, nextDraft);
       }
       ws.repoCallbackSync?.(projectDir);
       setFeedback({ kind: 'success', text: t('repo.callback_tpl_deleted') });
@@ -523,15 +531,10 @@ export function RepoCallbackModal({
       setFeedback(null);
       const nextConfig: RepoCallbackRepoConfig = {
         ...draft,
-        projectDir,
+        projectDir: draft.projectDir || projectDir,
         updatedAt: Date.now(),
       };
-      const savedServer = await saveRepoCallbackRepoConfig(serverId, nextConfig);
-      const savedRepo = savedServer.repos[projectDir] ?? nextConfig;
-      if (loadedConfigStateRef.current?.key === `${serverId}\0${projectDir}`) {
-        loadedConfigStateRef.current.hasSavedConfig = true;
-      }
-      setDraft(savedRepo);
+      const savedRepo = await persistRepoConfig(serverId, nextConfig);
       ws.repoCallbackSync?.(projectDir);
       onConfigSaved?.(savedRepo, globalTemplates);
       setFeedback({ kind: 'success', text: t('repo.callback_saved') });
@@ -690,7 +693,7 @@ export function RepoCallbackModal({
                 <input
                   type="checkbox"
                   checked={draft.enabled}
-                  disabled={readOnly}
+                  disabled={readOnly || loading}
                   onChange={(e) => setDraft((prev) => ({ ...prev, enabled: (e.target as HTMLInputElement).checked }))}
                 />
                 <span>{t('repo.callback_enabled')}</span>
@@ -708,7 +711,7 @@ export function RepoCallbackModal({
                 <span>{t('repo.callback_interval_label')}</span>
                 <select
                   value={String(draft.intervalMs)}
-                  disabled={readOnly}
+                  disabled={readOnly || loading}
                   onChange={(e) => setDraft((prev) => ({ ...prev, intervalMs: Number((e.target as HTMLSelectElement).value) }))}
                   style={{ width: '100%', minWidth: 0, maxWidth: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '6px 8px', fontSize: 12 }}
                 >
@@ -725,7 +728,7 @@ export function RepoCallbackModal({
                 <select
                   aria-label={t('repo.callback_lookback_label')}
                   value={normalizeRepoCallbackLookbackWindow(draft.lookbackWindow ?? REPO_CALLBACK_DEFAULT_LOOKBACK_WINDOW)}
-                  disabled={readOnly}
+                  disabled={readOnly || loading}
                   onChange={(e) => {
                     const lookbackWindow: RepoCallbackLookbackWindow = normalizeRepoCallbackLookbackWindow(
                       (e.target as HTMLSelectElement).value,
@@ -747,7 +750,7 @@ export function RepoCallbackModal({
                 <select
                   aria-label={t('repo.callback_target_label')}
                   value={draft.target}
-                  disabled={readOnly}
+                  disabled={readOnly || loading}
                   onChange={(e) => {
                     userEditedTargetRef.current = true;
                     setDraft((prev) => ({ ...prev, target: (e.target as HTMLSelectElement).value }));
@@ -802,7 +805,7 @@ export function RepoCallbackModal({
                       <input
                         type="checkbox"
                         checked={setting.enabled}
-                        disabled={readOnly}
+                        disabled={readOnly || loading}
                         onChange={(e) => {
                           const checked = (e.target as HTMLInputElement).checked;
                           setDraft((prev) => ({
@@ -848,7 +851,7 @@ export function RepoCallbackModal({
                         <select
                           aria-label={`${eventLabel(eventType)} ${t('repo.callback_template_label')}`}
                           value={tplKey}
-                          disabled={readOnly}
+                          disabled={readOnly || loading}
                           onChange={(e) => handleSelectTemplate(eventType, (e.target as HTMLSelectElement).value)}
                           style={{ flex: 1, minWidth: 'min(160px, 100%)', maxWidth: '100%', boxSizing: 'border-box', background: '#0f172a', color: '#e2e8f0', border: '1px solid #334155', borderRadius: 6, padding: '5px 8px', fontSize: 12 }}
                         >
@@ -868,7 +871,7 @@ export function RepoCallbackModal({
                           <button
                             type="button"
                             class="btn btn-sm"
-                            disabled={saving}
+                            disabled={saving || loading}
                             onClick={() => void handleDeleteSelectedTemplate(eventType)}
                             style={{ fontSize: 11, color: '#fca5a5' }}
                           >
@@ -881,7 +884,7 @@ export function RepoCallbackModal({
                         aria-label={`${eventLabel(eventType)} ${t('repo.callback_prompt_label')}`}
                         rows={4}
                         value={getCurrentPromptText(eventType)}
-                        disabled={readOnly}
+                        disabled={readOnly || loading}
                         placeholder={REPO_CALLBACK_DEFAULT_PROMPTS[eventType]}
                         onInput={(e) => handlePromptChange(eventType, (e.target as HTMLTextAreaElement).value)}
                         style={{
@@ -910,6 +913,7 @@ export function RepoCallbackModal({
                             type="text"
                             aria-label={t('repo.callback_tpl_name_placeholder')}
                             value={templateNameDraft}
+                            disabled={loading}
                             onInput={(e) => setTemplateNameDraft((e.target as HTMLInputElement).value)}
                             placeholder={t('repo.callback_tpl_name_placeholder')}
                             style={{
@@ -928,7 +932,7 @@ export function RepoCallbackModal({
                           <button
                             type="button"
                             class="btn btn-sm"
-                            disabled={saving}
+                            disabled={saving || loading}
                             onClick={() => void handleSaveTemplate(eventType, 'global')}
                             style={{ fontSize: 11 }}
                           >
@@ -937,7 +941,7 @@ export function RepoCallbackModal({
                           <button
                             type="button"
                             class="btn btn-sm"
-                            disabled={saving}
+                            disabled={saving || loading}
                             onClick={() => void handleSaveTemplate(eventType, 'repo')}
                             style={{ fontSize: 11 }}
                           >

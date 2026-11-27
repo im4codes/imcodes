@@ -17,7 +17,13 @@ import type { CallbackTaskRecord } from '@shared/callback-types.js';
 import type { WsClient, ServerMessage } from '../src/ws-client.js';
 import { RepoPage } from '../src/pages/RepoPage.js';
 import { REPO_CALLBACK_PAGE_SIZE } from '../src/components/RepoCallbackModal.js';
-import { buildRepoCallbackTargetOptions, saveRepoCallbackRepoConfig } from '../src/repo-callback-prefs.js';
+import {
+  buildRepoCallbackTargetOptions,
+  findRepoCallbackConfigKey,
+  normalizeRepoCallbackProjectDir,
+  resolveFloatingRepoPanelScope,
+  saveRepoCallbackRepoConfig,
+} from '../src/repo-callback-prefs.js';
 import { getUserPref } from '../src/api.js';
 
 const nativeMockState = vi.hoisted(() => ({
@@ -1208,5 +1214,231 @@ describe('RepoCallbackModal & RepoPage callback integration', () => {
     await waitFor(() => {
       expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('deck_cd_brain');
     });
+  });
+
+  it('tracks active conversation A->B on floating RepoPage and open unsaved modal, keeps sub-session window anchored, unifies trailing-slash/root keys, protects deferred/unsaved edits, and marks delete-template saves as configured', async () => {
+    // 1. Floating RepoPage scope: main window follows activeSession A->B; sub-session window stays anchored; tabShare keeps root path
+    expect(resolveFloatingRepoPanelScope({
+      repoPanelTarget: { sessionId: 'deck_cd_brain', projectDir: '/work/repo-a', parentSubId: null },
+      activeSession: 'deck_cd1_brain',
+      activeSessionProjectDir: '/work/repo-b',
+      isTabShare: false,
+      sessionRootPath: '/__session_root__',
+    })).toEqual({
+      sessionId: 'deck_cd1_brain',
+      projectDir: '/work/repo-b',
+      parentSubId: null,
+    });
+
+    expect(resolveFloatingRepoPanelScope({
+      repoPanelTarget: { sessionId: 'deck_sub_1', projectDir: '/work/sub-wt', parentSubId: 'sub_1' },
+      activeSession: 'deck_cd1_brain',
+      activeSessionProjectDir: '/work/repo-b',
+      isTabShare: false,
+      sessionRootPath: '/__session_root__',
+    })).toEqual({
+      sessionId: 'deck_sub_1',
+      projectDir: '/work/sub-wt',
+      parentSubId: 'sub_1',
+    });
+
+    expect(resolveFloatingRepoPanelScope({
+      repoPanelTarget: { sessionId: 'deck_cd_brain', projectDir: '/__session_root__', parentSubId: null },
+      activeSession: 'deck_cd1_brain',
+      activeSessionProjectDir: '/work/repo-b',
+      isTabShare: true,
+      sessionRootPath: '/__session_root__',
+    })).toEqual({
+      sessionId: 'deck_cd1_brain',
+      projectDir: '/__session_root__',
+      parentSubId: null,
+    });
+
+    // 2. Same-directory multi-Brain open unsaved modal switches A -> B cleanly and saves B
+    const targetsAB = buildRepoCallbackTargetOptions('/work/repo-ab', [
+      { name: 'deck_cd_brain', role: 'brain', project: 'cd', state: 'idle', projectDir: '/work/repo-ab' },
+      { name: 'deck_cd1_brain', role: 'brain', project: 'cd1', state: 'idle', projectDir: '/work/repo-ab' },
+    ]);
+    const wsSwitch = createMockWs();
+    const { rerender: rerenderSwitch } = render(
+      <RepoPage
+        ws={wsSwitch}
+        sessionId="deck_cd_brain"
+        serverId="srv-ab"
+        projectDir="/work/repo-ab"
+        callbackTargets={targetsAB}
+      />,
+    );
+    await openModalAndAwaitPrefs();
+    expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('deck_cd_brain');
+
+    rerenderSwitch(
+      <RepoPage
+        ws={wsSwitch}
+        sessionId="deck_cd1_brain"
+        serverId="srv-ab"
+        projectDir="/work/repo-ab"
+        callbackTargets={targetsAB}
+      />,
+    );
+    await waitFor(() => {
+      expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('deck_cd1_brain');
+    });
+    fireEvent.click(screen.getByText('Save settings'));
+    await waitFor(() => {
+      const serverPrefs = prefStore.get(repoCallbackServerPrefKey('srv-ab')) as {
+        repos: Record<string, { target: string }>;
+      };
+      expect(serverPrefs.repos['/work/repo-ab']?.target).toBe('deck_cd1_brain');
+    });
+    cleanup();
+
+    // 3. Trailing-slash normalization on load/save & '//' -> '/' root normalization prevents duplicate config keys
+    expect(normalizeRepoCallbackProjectDir('/')).toBe('/');
+    expect(normalizeRepoCallbackProjectDir('//')).toBe('/');
+    expect(normalizeRepoCallbackProjectDir('///')).toBe('/');
+    expect(normalizeRepoCallbackProjectDir('C:\\\\')).toBe('C:\\');
+    expect(findRepoCallbackConfigKey({ '/': createDefaultRepoCallbackConfig('/') }, '//')).toBe('/');
+    expect(
+      buildRepoCallbackTargetOptions('//', [{ name: 'root_b', role: 'brain', state: 'idle', projectDir: '/' }]).map((t) => t.sessionName),
+    ).toEqual(['root_b']);
+
+    await saveRepoCallbackRepoConfig('srv-slash', {
+      ...createDefaultRepoCallbackConfig('/work/repo-slash/'),
+      target: 'brain',
+      enabled: true,
+    });
+    const wsSlash = createMockWs();
+    const slashTargets = buildRepoCallbackTargetOptions('/work/repo-slash', [
+      { name: 'deck_cd_brain', role: 'brain', project: 'cd', state: 'idle', projectDir: '/work/repo-slash/' },
+      { name: 'deck_cd1_brain', role: 'brain', project: 'cd1', state: 'idle', projectDir: '/work/repo-slash' },
+    ]);
+    render(
+      <RepoPage
+        ws={wsSlash}
+        sessionId="deck_cd_brain"
+        serverId="srv-slash"
+        projectDir="/work/repo-slash"
+        callbackTargets={slashTargets}
+      />,
+    );
+    await openModalAndAwaitPrefs();
+    const slashSelect = screen.getByLabelText('Callback target session') as HTMLSelectElement;
+    expect(slashSelect.value).toBe('brain');
+
+    changeSelect(slashSelect, 'deck_cd1_brain');
+    await new Promise((r) => setTimeout(r, 0));
+    fireEvent.click(screen.getByText('Save settings'));
+    await waitFor(() => {
+      const serverPrefs = prefStore.get(repoCallbackServerPrefKey('srv-slash')) as {
+        repos: Record<string, { projectDir: string; target: string }>;
+      };
+      expect(Object.keys(serverPrefs.repos)).toEqual(['/work/repo-slash/']);
+      expect(serverPrefs.repos['/work/repo-slash/']?.target).toBe('deck_cd1_brain');
+      expect(serverPrefs.repos['/work/repo-slash/']?.projectDir).toBe('/work/repo-slash/');
+    });
+    cleanup();
+
+    // 4. Deferred prefs loading disables controls AND preserves programmatic manual edits made in-flight
+    let resolveServerPref!: (v: unknown) => void;
+    vi.mocked(getUserPref).mockImplementation(async (key: string) => {
+      if (key === repoCallbackServerPrefKey('srv-deferred')) {
+        return await new Promise((resolve) => {
+          resolveServerPref = resolve;
+        });
+      }
+      return prefStore.get(key) ?? null;
+    });
+    const wsDeferred = createMockWs();
+    render(
+      <RepoPage
+        ws={wsDeferred}
+        sessionId="deck_cd_brain"
+        serverId="srv-deferred"
+        projectDir="/work/repo-deferred"
+        callbackTargets={targetsAB}
+      />,
+    );
+    fireEvent.click(screen.getByText('Monitor & Callback'));
+    const deferredSelect = screen.getByLabelText('Callback target session') as HTMLSelectElement;
+    expect(deferredSelect.disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Save Repo' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Save Global' }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
+
+    // Even if a change event fires while deferred load is pending, resolution preserves the user's choice
+    changeSelect(deferredSelect, 'deck_cd1_brain');
+    resolveServerPref({ version: 1, repos: {} });
+    await waitFor(() => {
+      expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).disabled).toBe(false);
+    });
+    expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('deck_cd1_brain');
+    vi.mocked(getUserPref).mockImplementation(async (key: string) => prefStore.get(key) ?? null);
+    cleanup();
+
+    // 5. Unsaved manual edit BEFORE target hydration protects selection without requiring Save first
+    const wsUnsavedEdit = createMockWs();
+    const { rerender: rerenderUnsavedEdit } = render(
+      <RepoPage
+        ws={wsUnsavedEdit}
+        sessionId="deck_cd_brain"
+        serverId="srv-unsaved-edit"
+        projectDir="/work/repo-unsaved-edit"
+        callbackTargets={targetsAB}
+      />,
+    );
+    await openModalAndAwaitPrefs();
+    const unsavedEditSelect = screen.getByLabelText('Callback target session') as HTMLSelectElement;
+    expect(unsavedEditSelect.value).toBe('deck_cd_brain');
+    changeSelect(unsavedEditSelect, 'brain');
+    await new Promise((r) => setTimeout(r, 0));
+    rerenderUnsavedEdit(
+      <RepoPage
+        ws={wsUnsavedEdit}
+        sessionId="deck_cd1_brain"
+        serverId="srv-unsaved-edit"
+        projectDir="/work/repo-unsaved-edit"
+        callbackTargets={[...targetsAB, { sessionName: 'deck_cd2_brain', label: 'cd2 (deck_cd2_brain)', state: 'idle' }]}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('brain');
+    cleanup();
+
+    // 6. Template deletion persists repo config and sets hasSavedConfig=true so late target updates do not override 'brain'
+    const wsTplDel = createMockWs();
+    const { rerender: rerenderTplDel } = render(
+      <RepoPage
+        ws={wsTplDel}
+        sessionId="deck_cd_brain"
+        serverId="srv-tpl-del"
+        projectDir="/work/repo-tpl-del"
+        callbackTargets={[]}
+      />,
+    );
+    await openModalAndAwaitPrefs();
+    // Save a repo template while target is 'brain', then delete it cleanly
+    const tplInput = screen.getByPlaceholderText('Template name (to save/reuse)') as HTMLInputElement;
+    fireEvent.input(tplInput, { target: { value: 'Temp CI Tpl' } });
+    fireEvent.click(screen.getByText('Save Repo'));
+    await waitFor(() => {
+      expect(screen.getByText('repo.callback_tpl_delete')).toBeTruthy();
+    });
+    fireEvent.click(screen.getByText('repo.callback_tpl_delete'));
+    await waitFor(() => {
+      expect(screen.queryByText('repo.callback_tpl_delete')).toBeNull();
+    });
+    // Now callbackTargets arrives with currentSessionName='deck_cd_brain': saved 'brain' must stay intact
+    rerenderTplDel(
+      <RepoPage
+        ws={wsTplDel}
+        sessionId="deck_cd_brain"
+        serverId="srv-tpl-del"
+        projectDir="/work/repo-tpl-del"
+        callbackTargets={targetsAB}
+      />,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect((screen.getByLabelText('Callback target session') as HTMLSelectElement).value).toBe('brain');
   });
 });
