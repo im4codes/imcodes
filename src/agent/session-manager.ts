@@ -1302,8 +1302,8 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   handoffLaunchGeneration?: number;
   /** Internal: invoked after `postLaunch` and initial context injection finish. */
   onPostLaunchReady?: () => Promise<unknown> | unknown;
-  /** Internal: pre-connected provider passed by connect-time sync to avoid re-entering provider-registry lock. */
-  provider?: TransportProvider;
+  /** Internal: queue-protected pre-connected provider passed by connect-time sync in provider-registry. */
+  connectTimeProvider?: TransportProvider;
 }
 
 export interface SessionRelaunchOverrides {
@@ -3772,7 +3772,14 @@ export async function restoreTransportSessions(
  * callers cannot both observe "no in-flight".
  */
 const transportLaunchInFlight = new Map<string, Promise<void>>();
-const transportLaunchAwaitingProvider = new Map<string, string>();
+interface TransportLaunchState {
+  agentType: AgentType;
+  /** Pre-connected provider handed directly by connect-time sync. */
+  preConnectedProvider?: TransportProvider;
+  /** Wakes an in-flight launch currently awaiting ensureProviderConnected. */
+  resolveProviderHandoff?: (provider: TransportProvider) => void;
+}
+const transportLaunchStates = new WeakMap<Promise<void>, TransportLaunchState>();
 
 /** How long a launch waits on an earlier in-flight launch of the same session before giving up. */
 export const DEFAULT_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS = 45_000;
@@ -3797,15 +3804,14 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   clearTransportRestoreBackoff(name);
   const inFlight = transportLaunchInFlight.get(name);
   if (inFlight) {
-    // Break the indirect registry -> oc-session-sync -> launchTransportSession cycle:
-    // if the in-flight launch for this session is currently awaiting ensureProviderConnected
-    // for the same pre-connected provider, return immediately so sync can finish and the
-    // outer launch can proceed with the now-connected provider.
-    if (!opts.fresh && opts.provider && transportLaunchAwaitingProvider.get(name) === opts.provider.id) {
-      if (opts.bindExistingKey) {
-        registerProviderRoute(opts.bindExistingKey, name);
-      }
-      return;
+    const inFlightState = transportLaunchStates.get(inFlight);
+    // If connect-time sync encounters an in-flight launch for the same provider type,
+    // hand it the queue-protected connected provider directly so neither identity/cleanup
+    // preparation nor ensureProviderConnected deadlocks against the registry op holding sync,
+    // while still awaiting `inFlight` to preserve single-runtime ownership and real errors.
+    if (!opts.fresh && opts.connectTimeProvider && inFlightState && inFlightState.agentType === opts.connectTimeProvider.id) {
+      inFlightState.preConnectedProvider = opts.connectTimeProvider;
+      inFlightState.resolveProviderHandoff?.(opts.connectTimeProvider);
     }
     // A wedged earlier launch must not hold every later launch of this session forever: wait a
     // bounded time, then fail loudly so the caller (and the user) sees why nothing started.
@@ -3819,24 +3825,33 @@ export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
     // A non-fresh caller only needs the session up: if the prior launch
     // registered a runtime, we're done. A fresh caller must proceed (it
     // intentionally tears down + recreates).
-    if (!opts.fresh && transportRuntimes.has(name)) return;
+    if (!opts.fresh && transportRuntimes.has(name)) {
+      if (opts.bindExistingKey) {
+        registerProviderRoute(opts.bindExistingKey, name);
+      }
+      return;
+    }
   }
   const incognito = opts.incognito === true || (!opts.fresh && isIncognitoSession(getSession(name)));
   if (incognito && !supportsSessionIncognito(opts.agentType)) throw new Error(SESSION_INCOGNITO_UNSUPPORTED);
   if (incognito && !opts.fresh && getSession(name)) throw new Error('Incognito session cannot be restored; start a fresh session.');
   opts = { ...opts, ...(incognito ? { incognito: true } : {}) };
   setSessionIncognito(name, incognito);
-  const launch = withSessionPrivacy(name, incognito, () => launchTransportSessionInner(opts));
-  const tracked = launch.then(() => {}, () => {});
+  const launchState: TransportLaunchState = { agentType: opts.agentType };
+  let settleTracked!: () => void;
+  const tracked = new Promise<void>((resolve) => { settleTracked = resolve; });
+  transportLaunchStates.set(tracked, launchState);
   transportLaunchInFlight.set(name, tracked);
+  const launch = withSessionPrivacy(name, incognito, () => launchTransportSessionInner(opts, launchState));
   try {
     await launch;
   } finally {
     if (transportLaunchInFlight.get(name) === tracked) transportLaunchInFlight.delete(name);
+    settleTracked();
   }
 }
 
-async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
+async function launchTransportSessionInner(opts: LaunchOpts, launchState?: TransportLaunchState): Promise<void> {
   const { name, projectName, role, agentType, projectDir, skipStore, label, description, bindExistingKey, skipCreate } = opts;
   const existing = getSession(name);
   // A fresh launch is an explicit replacement. Remove the old runtime before
@@ -3882,18 +3897,25 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   }
 
   let provider: TransportProvider;
-  if (opts.provider) {
-    provider = opts.provider;
+  if (opts.connectTimeProvider) {
+    provider = opts.connectTimeProvider;
+  } else if (launchState?.preConnectedProvider) {
+    provider = launchState.preConnectedProvider;
   } else {
-    transportLaunchAwaitingProvider.set(name, agentType);
+    const controller = new AbortController();
+    const handoffPromise = new Promise<TransportProvider>((resolve) => {
+      if (launchState) launchState.resolveProviderHandoff = resolve;
+    });
+    const ensurePromise = ensureProviderConnected(agentType, {}, { signal: controller.signal });
+    ensurePromise.catch(() => {});
     try {
-      provider = await ensureProviderConnected(agentType, {});
+      provider = await Promise.race([ensurePromise, handoffPromise]);
     } finally {
-      if (transportLaunchAwaitingProvider.get(name) === agentType) {
-        transportLaunchAwaitingProvider.delete(name);
-      }
+      if (launchState) launchState.resolveProviderHandoff = undefined;
+      controller.abort();
     }
   }
+  const providerTrackedInRegistry = !opts.connectTimeProvider && getProvider(agentType) === provider;
 
   const launchRecord = getSession(name);
   const launchRecipient = recipientFromSessionRecord(launchRecord) ?? {
@@ -4201,6 +4223,12 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     ? existing.hookCredential
     : mintHookCredential();
   // Create session on provider
+  if (providerTrackedInRegistry) {
+    const currentProvider = launchState?.preConnectedProvider ?? getProvider(agentType);
+    if (currentProvider !== provider) {
+      throw new Error(`Provider ${agentType} changed before session initialize`);
+    }
+  }
   const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
   await runtime.initialize({
     ...(opts.incognito ? { incognito: true } : {}),
@@ -4252,6 +4280,13 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   if (agentType === AGY_SDK_PROVIDER_ID && !ownsAgyLaunch(getSession(name))) {
     await runtime.kill({ detachProviderSession: true });
     throw Object.assign(new Error('AG launch owner changed'), { code: PROVIDER_ERROR_CODES.CANCELLED, recoverable: false });
+  }
+  if (providerTrackedInRegistry) {
+    const currentProvider = launchState?.preConnectedProvider ?? getProvider(agentType);
+    if (currentProvider !== provider) {
+      await runtime.kill({ detachProviderSession: true }).catch(() => {});
+      throw new Error(`Provider ${agentType} changed during session launch`);
+    }
   }
   const latestSessionInfo = getLatestSessionInfo();
   // Atomic: store runtime + register provider route + persist — rollback all on failure

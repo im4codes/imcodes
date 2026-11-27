@@ -1,67 +1,125 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../src/store/session-store.js';
 
+interface MockOcInstance {
+  index: number;
+  disconnected: boolean;
+  createSessionCalls: number;
+  endSessionCalls: number;
+  sendCalls: Array<{ sessionId: string; message: string }>;
+  listSessionsCalls: number;
+}
+
 const state = vi.hoisted(() => {
   const store = new Map<string, SessionRecord>();
   const broadcastEvents: Array<{ providerId: string; connected: boolean }> = [];
+  const instances: MockOcInstance[] = [];
   let listSessionsResult: Array<{ key: string; displayName?: string }> = [];
-  let onConnectHook: (() => Promise<void>) | null = null;
+  let listSessionsHook: ((instance: MockOcInstance) => Promise<Array<{ key: string; displayName?: string }>> | Array<{ key: string; displayName?: string }>) | null = null;
+  let onConnectHook: ((instance: MockOcInstance) => Promise<void>) | null = null;
+  let identityHook: ((sessionName: string) => Promise<string | undefined>) | null = null;
+  let releaseResourcesHook: (() => Promise<{ ok: number; failed: number }>) | null = null;
   let createSessionCalls = 0;
 
   return {
     store,
     broadcastEvents,
+    instances,
     get listSessionsResult() { return listSessionsResult; },
     set listSessionsResult(v: Array<{ key: string; displayName?: string }>) { listSessionsResult = v; },
+    get listSessionsHook() { return listSessionsHook; },
+    set listSessionsHook(fn: typeof listSessionsHook) { listSessionsHook = fn; },
     get onConnectHook() { return onConnectHook; },
-    set onConnectHook(fn: (() => Promise<void>) | null) { onConnectHook = fn; },
+    set onConnectHook(fn: typeof onConnectHook) { onConnectHook = fn; },
+    get identityHook() { return identityHook; },
+    set identityHook(fn: typeof identityHook) { identityHook = fn; },
+    get releaseResourcesHook() { return releaseResourcesHook; },
+    set releaseResourcesHook(fn: typeof releaseResourcesHook) { releaseResourcesHook = fn; },
     get createSessionCalls() { return createSessionCalls; },
     incCreateSessionCalls() { createSessionCalls += 1; },
     reset() {
       store.clear();
       broadcastEvents.length = 0;
+      instances.length = 0;
       listSessionsResult = [];
+      listSessionsHook = null;
       onConnectHook = null;
+      identityHook = null;
+      releaseResourcesHook = null;
       createSessionCalls = 0;
     },
   };
 });
 
 const mocks = vi.hoisted(() => {
-  const mockConnect = vi.fn(async () => {
-    if (state.onConnectHook) await state.onConnectHook();
-  });
-  const mockDisconnect = vi.fn().mockResolvedValue(undefined);
+  const mockConnect = vi.fn();
+  const mockDisconnect = vi.fn();
   const mockWireProviderToRelay = vi.fn();
   const mockBroadcastProviderStatus = vi.fn((providerId: string, connected: boolean) => {
     state.broadcastEvents.push({ providerId, connected });
   });
 
-  const MockOpenClawProvider = vi.fn().mockImplementation(() => ({
-    id: 'openclaw',
-    connectionMode: 'persistent',
-    sessionOwnership: 'provider',
-    capabilities: {
-      streaming: true,
-      toolCalling: true,
-      approval: true,
-      sessionRestore: true,
-      multiTurn: true,
-      attachments: false,
-    },
-    connect: mockConnect,
-    disconnect: mockDisconnect,
-    send: vi.fn().mockResolvedValue(undefined),
-    onDelta: vi.fn(),
-    onComplete: vi.fn(),
-    onError: vi.fn(),
-    listSessions: vi.fn(async () => state.listSessionsResult),
-    createSession: vi.fn(async (opts: { sessionName?: string }) => {
-      state.incCreateSessionCalls();
-      return opts.sessionName === 'deck_agent___main' ? 'agent___main___main' : `oc-${state.createSessionCalls}`;
-    }),
-    endSession: vi.fn().mockResolvedValue(undefined),
-  }));
+  const MockOpenClawProvider = vi.fn().mockImplementation(() => {
+    const inst: MockOcInstance = {
+      index: state.instances.length + 1,
+      disconnected: false,
+      createSessionCalls: 0,
+      endSessionCalls: 0,
+      sendCalls: [],
+      listSessionsCalls: 0,
+    };
+    state.instances.push(inst);
+    return {
+      id: 'openclaw',
+      connectionMode: 'persistent',
+      sessionOwnership: 'provider',
+      capabilities: {
+        streaming: true,
+        toolCalling: true,
+        approval: true,
+        sessionRestore: true,
+        multiTurn: true,
+        attachments: false,
+      },
+      connect: async () => {
+        inst.disconnected = false;
+        mockConnect(inst.index);
+        if (state.onConnectHook) await state.onConnectHook(inst);
+      },
+      disconnect: async () => {
+        inst.disconnected = true;
+        mockDisconnect(inst.index);
+      },
+      send: vi.fn(async (sessionId: string, message: unknown) => {
+        if (inst.disconnected) throw new Error('WebSocket is not open: readyState 3 (CLOSED)');
+        const text = typeof message === 'string'
+          ? message
+          : (typeof message === 'object' && message !== null && 'assembledMessage' in message
+            ? String((message as { assembledMessage: unknown }).assembledMessage)
+            : String(message));
+        inst.sendCalls.push({ sessionId, message: text });
+      }),
+      onDelta: vi.fn(),
+      onComplete: vi.fn(),
+      onError: vi.fn(),
+      listSessions: vi.fn(async () => {
+        inst.listSessionsCalls += 1;
+        if (state.listSessionsHook) return await state.listSessionsHook(inst);
+        return state.listSessionsResult;
+      }),
+      createSession: vi.fn(async (opts: { sessionName?: string; skipCreate?: boolean; bindExistingKey?: string }) => {
+        inst.createSessionCalls += 1;
+        state.incCreateSessionCalls();
+        if (inst.disconnected && !opts.skipCreate) {
+          throw new Error('WebSocket is not open: readyState 3 (CLOSED)');
+        }
+        return opts.bindExistingKey ?? (opts.sessionName === 'deck_agent___main' ? 'agent___main___main' : `oc-${state.createSessionCalls}`);
+      }),
+      endSession: vi.fn(async () => {
+        inst.endSessionCalls += 1;
+      }),
+    };
+  });
 
   return {
     mockConnect,
@@ -69,6 +127,32 @@ const mocks = vi.hoisted(() => {
     mockWireProviderToRelay,
     mockBroadcastProviderStatus,
     MockOpenClawProvider,
+  };
+});
+
+vi.mock('../../src/daemon/session-identity-resolver.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/daemon/session-identity-resolver.js')>(
+    '../../src/daemon/session-identity-resolver.js',
+  );
+  return {
+    ...actual,
+    resolveEffectiveIdentityPrompt: vi.fn(async (input: Parameters<typeof actual.resolveEffectiveIdentityPrompt>[0]) => {
+      if (state.identityHook) return await state.identityHook(input.name);
+      return await actual.resolveEffectiveIdentityPrompt(input);
+    }),
+  };
+});
+
+vi.mock('../../src/daemon/session-resource-service.js', async () => {
+  const actual = await vi.importActual<typeof import('../../src/daemon/session-resource-service.js')>(
+    '../../src/daemon/session-resource-service.js',
+  );
+  return {
+    ...actual,
+    releaseSessionChildResources: vi.fn(async (record: Parameters<typeof actual.releaseSessionChildResources>[0], opts: Parameters<typeof actual.releaseSessionChildResources>[1]) => {
+      if (state.releaseResourcesHook) return await state.releaseResourcesHook();
+      return await actual.releaseSessionChildResources(record, opts);
+    }),
   };
 });
 
@@ -139,6 +223,7 @@ describe('OpenClaw reconnect syncOcSessions + registry serialization', () => {
   });
 
   afterEach(async () => {
+    delete process.env.IMCODES_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS;
     await stopTransportRuntimeSession('deck_agent___main').catch(() => {});
     unregisterProviderRoute('agent___main___main');
     await disconnectAll();
@@ -217,7 +302,9 @@ describe('OpenClaw reconnect syncOcSessions + registry serialization', () => {
     expect(getTransportRuntime('deck_agent___main')).toBeDefined();
     expect(getProvider('openclaw')).toBeDefined();
     expect(state.createSessionCalls).toBe(1);
-    expect(mocks.mockBroadcastProviderStatus).toHaveBeenCalledWith('openclaw', true);
+    await vi.waitFor(() => {
+      expect(mocks.mockBroadcastProviderStatus).toHaveBeenCalledWith('openclaw', true);
+    });
 
     await disconnectProvider('openclaw');
     expect(getProvider('openclaw')).toBeUndefined();
@@ -251,5 +338,223 @@ describe('OpenClaw reconnect syncOcSessions + registry serialization', () => {
     await connectProvider('openclaw', { url: 'ws://127.0.0.1:18789', token: 'tok' });
     expect(runtimeExistsAtStatusBroadcast).toBe(true);
     expect(getTransportRuntime('deck_agent___main')).toBeDefined();
+  });
+
+  it('completes promptly without timeout when explicit connectProvider sync encounters an in-flight launch suspended on identity prefetch', async () => {
+    process.env.IMCODES_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS = '150';
+    state.store.set('deck_agent___main', {
+      name: 'deck_agent___main',
+      projectName: 'deck_agent___main',
+      role: 'w1',
+      agentType: 'openclaw',
+      projectDir: '/tmp/oc-main',
+      state: 'stopped',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      runtimeType: 'transport',
+      providerId: 'openclaw',
+      providerSessionId: 'agent___main___main',
+    });
+    state.listSessionsResult = [{ key: 'agent___main___main', displayName: 'OpenClaw Main' }];
+
+    let identityEnteredResolve!: () => void;
+    const identityEntered = new Promise<void>((res) => { identityEnteredResolve = res; });
+    let identityGateResolve!: () => void;
+    const identityGate = new Promise<void>((res) => { identityGateResolve = res; });
+    state.identityHook = async () => {
+      identityEnteredResolve();
+      await identityGate;
+      return undefined;
+    };
+
+    const outerLaunch = launchTransportSession({
+      name: 'deck_agent___main',
+      projectName: 'deck_agent___main',
+      role: 'w1',
+      agentType: 'openclaw',
+      projectDir: '/tmp/oc-main',
+      bindExistingKey: 'agent___main___main',
+      skipCreate: true,
+    });
+    await identityEntered;
+
+    // While outerLaunch is suspended at identity prefetch (before ensureProviderConnected),
+    // explicit connectProvider enters syncOcSessions and joins the same-name launch.
+    let syncEnteredResolve!: () => void;
+    const syncEntered = new Promise<void>((res) => { syncEnteredResolve = res; });
+    state.listSessionsHook = async () => {
+      syncEnteredResolve();
+      return state.listSessionsResult;
+    };
+    const explicitConnect = connectProvider('openclaw', { url: 'ws://127.0.0.1:18789', token: 'tok' });
+    await syncEntered;
+    // Allow syncOcSessions to enter launchTransportSession('deck_agent___main') while identityGate is held.
+    await new Promise((res) => setTimeout(res, 20));
+
+    identityGateResolve();
+    await Promise.all([outerLaunch, explicitConnect]);
+
+    expect(getTransportRuntime('deck_agent___main')).toBeDefined();
+    expect(state.createSessionCalls).toBe(1);
+    expect(mocks.mockBroadcastProviderStatus).toHaveBeenCalledWith('openclaw', true);
+  });
+
+  it('does not treat a failed in-flight launch as a successful syncOcSessions recovery', async () => {
+    process.env.IMCODES_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS = '150';
+    state.store.set('deck_agent___main', {
+      name: 'deck_agent___main',
+      projectName: 'deck_agent___main',
+      role: 'w1',
+      agentType: 'openclaw',
+      projectDir: '/tmp/oc-main',
+      state: 'stopped',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      runtimeType: 'transport',
+      providerId: 'openclaw',
+      providerSessionId: 'agent___main___main',
+    });
+    state.listSessionsResult = [{ key: 'agent___main___main', displayName: 'OpenClaw Main' }];
+
+    let identityEnteredResolve!: () => void;
+    const identityEntered = new Promise<void>((res) => { identityEnteredResolve = res; });
+    let identityGateResolve!: () => void;
+    const identityGate = new Promise<void>((res) => { identityGateResolve = res; });
+    state.identityHook = async () => {
+      identityEnteredResolve();
+      await identityGate;
+      return undefined;
+    };
+    // Cleanup consistently fails -> neither launch can build a runtime.
+    state.releaseResourcesHook = async () => ({ ok: 0, failed: 1 });
+
+    const outerLaunch = launchTransportSession({
+      name: 'deck_agent___main',
+      projectName: 'deck_agent___main',
+      role: 'w1',
+      agentType: 'openclaw',
+      projectDir: '/tmp/oc-main',
+      bindExistingKey: 'agent___main___main',
+      skipCreate: true,
+    });
+    await identityEntered;
+
+    const explicitConnect = connectProvider('openclaw', { url: 'ws://127.0.0.1:18789', token: 'tok' });
+    await new Promise((res) => setTimeout(res, 20));
+    identityGateResolve();
+
+    await expect(outerLaunch).rejects.toThrow('session resource cleanup failed');
+    await explicitConnect;
+
+    expect(getTransportRuntime('deck_agent___main')).toBeUndefined();
+    expect(state.store.get('deck_agent___main')?.state).toBe('stopped');
+  });
+
+  it('prevents ordinary provider.list_sessions refresh from binding a runtime onto disconnected provider A when concurrent reconnect installs B', async () => {
+    const serverLink = { send: vi.fn() };
+    await connectProvider('openclaw', { url: 'ws://127.0.0.1:18789', token: 'tok-a' });
+    const instanceA = state.instances[0]!;
+    expect(instanceA.index).toBe(1);
+
+    state.store.set('deck_agent___main', {
+      name: 'deck_agent___main',
+      projectName: 'deck_agent___main',
+      role: 'w1',
+      agentType: 'openclaw',
+      projectDir: '/tmp/oc-main',
+      state: 'stopped',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      runtimeType: 'transport',
+      providerId: 'openclaw',
+      providerSessionId: 'agent___main___main',
+    });
+    state.listSessionsResult = [{ key: 'agent___main___main', displayName: 'OpenClaw Main' }];
+
+    let identityEnteredResolve!: () => void;
+    const identityEntered = new Promise<void>((res) => { identityEnteredResolve = res; });
+    let identityGateResolve!: () => void;
+    const identityGate = new Promise<void>((res) => { identityGateResolve = res; });
+    let gatedOnce = false;
+    state.identityHook = async () => {
+      if (!gatedOnce) {
+        gatedOnce = true;
+        identityEnteredResolve();
+        await identityGate;
+      }
+      return undefined;
+    };
+
+    const { syncOcSessions } = await import('../../src/daemon/oc-session-sync.js');
+    // Ordinary refresh (no connectTimeProvider) lists from A and yields in identity prefetch.
+    const refreshPromise = syncOcSessions(serverLink as any);
+    await identityEntered;
+
+    // Concurrent reconnect disconnects A and connects B.
+    const reconnectPromise = connectProvider('openclaw', { url: 'ws://127.0.0.1:18790', token: 'tok-b' });
+    await vi.waitFor(() => {
+      expect(instanceA.disconnected).toBe(true);
+      expect(state.instances.length).toBe(2);
+    });
+    const instanceB = state.instances[1]!;
+
+    identityGateResolve();
+    await Promise.all([refreshPromise, reconnectPromise]);
+
+    const runtime = getTransportRuntime('deck_agent___main');
+    expect(runtime).toBeDefined();
+    expect(instanceA.createSessionCalls).toBe(0);
+    expect(instanceB.createSessionCalls).toBe(1);
+
+    const sendOutcome = runtime!.send('hello after reconnect');
+    expect(sendOutcome).toBe('sent');
+    await vi.waitFor(() => {
+      expect(instanceB.sendCalls).toHaveLength(1);
+    });
+    expect(instanceA.sendCalls).toHaveLength(0);
+  });
+
+  it('aborts ordinary syncOcSessions when provider disconnects/reconnects during listSessions', async () => {
+    const serverLink = { send: vi.fn() };
+    await connectProvider('openclaw', { url: 'ws://127.0.0.1:18789', token: 'tok-a' });
+    const instanceA = state.instances[0]!;
+
+    let listEnteredResolve!: () => void;
+    const listEntered = new Promise<void>((res) => { listEnteredResolve = res; });
+    let listGateResolve!: () => void;
+    const listGate = new Promise<void>((res) => { listGateResolve = res; });
+
+    state.listSessionsHook = async (inst) => {
+      if (inst === instanceA && inst.listSessionsCalls === 2) {
+        listEnteredResolve();
+        await listGate;
+        return [
+          { key: 'agent___main___deck_sub_orphan' },
+          { key: 'agent___main___main', displayName: 'Stale A Only' },
+        ];
+      }
+      return [];
+    };
+
+    const { syncOcSessions } = await import('../../src/daemon/oc-session-sync.js');
+    const staleRefresh = syncOcSessions(serverLink as any);
+    await listEntered;
+
+    await connectProvider('openclaw', { url: 'ws://127.0.0.1:18790', token: 'tok-b' });
+    expect(instanceA.disconnected).toBe(true);
+
+    listGateResolve();
+    await staleRefresh;
+
+    // Stale A results must neither delete orphans on A nor materialize sessions from A.
+    expect(instanceA.endSessionCalls).toBe(0);
+    expect(instanceA.createSessionCalls).toBe(0);
+    expect(getTransportRuntime('deck_agent___main')).toBeUndefined();
   });
 });

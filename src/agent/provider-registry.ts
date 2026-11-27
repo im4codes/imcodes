@@ -12,7 +12,11 @@ import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
 const providers = new Map<string, TransportProvider>();
 const providerOps = new Map<string, Promise<void>>();
-const pendingEnsureConnects = new Map<string, Promise<TransportProvider>>();
+interface PendingEnsureEntry {
+  promise: Promise<TransportProvider>;
+  waiters: number;
+}
+const pendingEnsureConnects = new Map<string, PendingEnsureEntry>();
 
 function runSerialized<T>(id: string, fn: () => Promise<T>): Promise<T> {
   const prev = providerOps.get(id) ?? Promise.resolve();
@@ -38,27 +42,86 @@ export function getAllProviders(): TransportProvider[] {
   return [...providers.values()];
 }
 
-export async function ensureProviderConnected(id: string, config: ProviderConfig = {}): Promise<TransportProvider> {
+export async function ensureProviderConnected(
+  id: string,
+  config: ProviderConfig = {},
+  options?: { signal?: AbortSignal },
+): Promise<TransportProvider> {
   if (!providerOps.has(id) && providers.has(id)) {
     return providers.get(id)!;
   }
-  const inFlight = pendingEnsureConnects.get(id);
-  if (inFlight) return inFlight;
+  const signal = options?.signal;
+  if (signal?.aborted) {
+    throw new Error(`Provider ensure aborted: ${id}`);
+  }
+  let entry = pendingEnsureConnects.get(id);
+  if (!entry) {
+    const created: PendingEnsureEntry = { promise: null!, waiters: 0 };
+    const pending = runSerialized(id, async () => {
+      if (created.waiters <= 0) {
+        if (pendingEnsureConnects.get(id) === created) {
+          pendingEnsureConnects.delete(id);
+        }
+        throw new Error(`Provider ensure superseded before connect: ${id}`);
+      }
+      const current = providers.get(id);
+      if (current) return current;
+      await connectProviderUnlocked(id, config);
+      const connected = providers.get(id);
+      if (!connected) throw new Error(`Provider failed to connect: ${id}`);
+      return connected;
+    }).finally(() => {
+      if (pendingEnsureConnects.get(id) === created) {
+        pendingEnsureConnects.delete(id);
+      }
+    });
+    created.promise = pending;
+    // Prevent unhandled rejection when all aborted callers leave before queued execution.
+    pending.catch(() => {});
+    pendingEnsureConnects.set(id, created);
+    entry = created;
+  }
 
-  const pending = runSerialized(id, async () => {
-    const current = providers.get(id);
-    if (current) return current;
-    await connectProviderUnlocked(id, config);
-    const connected = providers.get(id);
-    if (!connected) throw new Error(`Provider failed to connect: ${id}`);
-    return connected;
-  }).finally(() => {
-    if (pendingEnsureConnects.get(id) === pending) {
-      pendingEnsureConnects.delete(id);
+  const activeEntry = entry;
+  activeEntry.waiters += 1;
+  if (!signal) {
+    try {
+      return await activeEntry.promise;
+    } finally {
+      activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
     }
+  }
+
+  return await new Promise<TransportProvider>((resolve, reject) => {
+    let settled = false;
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
+      if (activeEntry.waiters === 0 && pendingEnsureConnects.get(id) === activeEntry) {
+        pendingEnsureConnects.delete(id);
+      }
+      reject(new Error(`Provider ensure aborted: ${id}`));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    activeEntry.promise.then(
+      (provider) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
+        resolve(provider);
+      },
+      (err) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        activeEntry.waiters = Math.max(0, activeEntry.waiters - 1);
+        reject(err);
+      },
+    );
   });
-  pendingEnsureConnects.set(id, pending);
-  return pending;
 }
 
 async function connectProviderUnlocked(id: string, config: ProviderConfig): Promise<void> {
@@ -86,7 +149,7 @@ async function connectProviderUnlocked(id: string, config: ProviderConfig): Prom
   if (id === 'openclaw' && _serverLink) {
     try {
       const { syncOcSessions } = await import('../daemon/oc-session-sync.js');
-      await syncOcSessions(_serverLink as any);
+      await syncOcSessions(_serverLink as any, { connectTimeProvider: provider });
     } catch (err) {
       logger.warn({ err }, 'OC session auto-sync failed — continuing without materialization');
     }

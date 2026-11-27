@@ -20,7 +20,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import logger from '../util/logger.js';
 import type { ServerLink } from './server-link.js';
-import type { RemoteSessionInfo } from '../agent/transport-provider.js';
+import type { RemoteSessionInfo, TransportProvider } from '../agent/transport-provider.js';
 import { normalizeOpenClawDisplayName, preferredOpenClawLabel } from '../agent/openclaw-display.js';
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -111,12 +111,28 @@ export function mainSessionProjectDir(agentName: string): string {
 
 // ── Sync pipeline ───────────────────────────────────────────────────────────
 
-export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
-  const provider = getProvider('openclaw');
+export interface SyncOcSessionsOptions {
+  /**
+   * Queue-protected connected provider passed ONLY by `connectProviderUnlocked`
+   * inside `provider-registry.ts`. Ordinary refresh callers MUST omit this so
+   * they resolve the live provider via `ensureProviderConnected` and abort when
+   * a concurrent reconnect supersedes the listed provider snapshot.
+   */
+  connectTimeProvider?: TransportProvider;
+}
+
+export async function syncOcSessions(
+  serverLink: ServerLink,
+  options: SyncOcSessionsOptions = {},
+): Promise<void> {
+  const connectTimeProvider = options.connectTimeProvider;
+  const provider = connectTimeProvider ?? getProvider('openclaw');
   if (!provider || !provider.capabilities.sessionRestore || !provider.listSessions) {
     logger.debug('oc-sync: no openclaw provider or no listSessions capability');
     return;
   }
+  const isSuperseded = (): boolean => getProvider('openclaw') !== provider;
+  const connectLaunchProvider = connectTimeProvider ? { connectTimeProvider } : {};
 
   let sessions: RemoteSessionInfo[];
   try {
@@ -125,13 +141,19 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
     logger.warn({ err }, 'oc-sync: failed to list OC sessions');
     return;
   }
+  if (isSuperseded()) {
+    logger.debug('oc-sync: openclaw provider changed during listSessions — aborting stale sync');
+    return;
+  }
 
   // ── Delete orphan sessions (created with internal names by old key format bug) ──
   let deleted = 0;
   for (const s of sessions) {
+    if (isSuperseded()) return;
     if (isOrphanKey(s.key)) {
       try {
         await provider.endSession(s.key);
+        if (isSuperseded()) return;
         deleted++;
         logger.info({ key: s.key }, 'oc-sync: deleted orphan session from OC gateway');
       } catch (err) {
@@ -145,6 +167,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
   let created = 0;
 
   for (const group of groups) {
+    if (isSuperseded()) return;
     // ── Main session ──
     const mName = mainSessionName(group.agentName);
     const mainExists = !!getSession(mName);
@@ -156,6 +179,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
       const mainLabel = preferredOpenClawLabel(mainRecord?.label, group.mainSession.displayName, group.mainSession.key) || mainSessionLabel(group.agentName);
 
       if (mainExists && needsRuntime) {
+        if (isSuperseded()) return;
         // Session in store but runtime lost (daemon restart / OC reconnect) — recreate runtime
         try {
           await launchTransportSession({
@@ -163,11 +187,13 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
             label: mainLabel,
             projectDir: mainSessionProjectDir(group.agentName),
             bindExistingKey: group.mainSession.key, skipCreate: true, skipStore: true,
-            provider,
+            ...connectLaunchProvider,
           });
+          if (isSuperseded()) return;
           upsertSession({ ...mainRecord!, state: 'idle', label: mainLabel, updatedAt: Date.now() });
           logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: reconnected main session runtime');
         } catch (err) {
+          if (isSuperseded()) return;
           registerProviderRoute(group.mainSession.key, mName);
           logger.warn({ err, session: mName }, 'oc-sync: failed to recreate main runtime, route-only fallback');
         }
@@ -176,6 +202,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
         if (isProviderSessionBound(group.mainSession.key)) {
           logger.debug({ key: group.mainSession.key, mName }, 'oc-sync: main session providerSessionId already bound — skipped');
         } else {
+          if (isSuperseded()) return;
           try {
             const opts: LaunchOpts = {
               name: mName,
@@ -187,12 +214,14 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               description: normalizeOpenClawDisplayName(group.mainSession.displayName),
               bindExistingKey: group.mainSession.key,
               skipCreate: true,
-              provider,
+              ...connectLaunchProvider,
             };
             await launchTransportSession(opts);
+            if (isSuperseded()) return;
             created++;
             logger.info({ session: mName, ocKey: group.mainSession.key }, 'oc-sync: materialized main session');
           } catch (err) {
+            if (isSuperseded()) return;
             logger.warn({ err, session: mName }, 'oc-sync: failed to materialize main session');
           }
         }
@@ -201,6 +230,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
 
     // ── Sub-sessions (channel bindings) ──
     for (const ch of group.channelSessions) {
+      if (isSuperseded()) return;
       // Route exists AND runtime exists → fully alive, skip
       const existingRoute = resolveSessionName(ch.key);
       if (existingRoute && getTransportRuntime(existingRoute)) continue;
@@ -217,8 +247,9 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
-              provider,
+              ...connectLaunchProvider,
             });
+            if (isSuperseded()) return;
             const newLabel = preferredOpenClawLabel(storeEntry.label, ch.displayName, ch.key);
             upsertSession({ ...storeEntry, state: 'idle', parentSession: mName, label: newLabel, updatedAt: Date.now() });
             // Update server DB label (may have been stored with sanitized key before displayName fix)
@@ -233,6 +264,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
             } catch { /* not connected */ }
             logger.info({ session: storeEntry.name, ocKey: ch.key, parent: mName, label: newLabel }, 'oc-sync: rebuilt runtime for existing sub-session');
           } catch (err) {
+            if (isSuperseded()) return;
             logger.warn({ err, session: storeEntry.name }, 'oc-sync: failed to rebuild runtime');
           }
         }
@@ -251,8 +283,9 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
               projectDir: mainSessionProjectDir(group.agentName),
               bindExistingKey: ch.key, skipCreate: true, skipStore: true,
               parentSession: mName,
-              provider,
+              ...connectLaunchProvider,
             });
+            if (isSuperseded()) return;
             // Update store: mark running, set parentSession + label (preserve existing label)
             const reconnLabel = preferredOpenClawLabel(existingInStore.label, ch.displayName, ch.key);
             upsertSession({
@@ -274,6 +307,7 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
             } catch { /* not connected */ }
             logger.info({ session: existingInStore.name, ocKey: ch.key, parent: mName, label: reconnLabel }, 'oc-sync: reconnected sub-session runtime');
           } catch (err) {
+            if (isSuperseded()) return;
             registerProviderRoute(ch.key, existingInStore.name);
             logger.warn({ err, session: existingInStore.name }, 'oc-sync: failed to recreate runtime, route-only fallback');
           }
@@ -299,9 +333,10 @@ export async function syncOcSessions(serverLink: ServerLink): Promise<void> {
           bindExistingKey: ch.key,
           skipCreate: true,
           parentSession: mName,
-          provider,
+          ...connectLaunchProvider,
         };
         await launchTransportSession(opts);
+        if (isSuperseded()) return;
         created++;
 
         // Sync to server DB
