@@ -503,9 +503,9 @@ html.native-ios-mac .chat-dl-btn {
 @keyframes tab-alert { 0%, 100% { background: transparent; box-shadow: none; border-color: transparent; } 50% { background: #3a1c1c; box-shadow: 0 0 12px #ef444480 inset, 0 0 4px #ef444440; border-color: #ef4444; } }
 .tab.alert.active { animation: tab-alert-active 0.5s ease-in-out 6; }
 @keyframes tab-alert-active { 0%, 100% { background: #161b22; border-color: #3b82f6; } 50% { background: #3a1c1c; box-shadow: 0 0 14px #ef444490 inset; border-color: #ef4444; } }
-/* WS dot inline on active tab */
-.tab-ws-dot { margin-left: 6px; font-size: 7px; line-height: 1; vertical-align: middle; flex-shrink: 0; text-shadow: 0 0 8px currentColor; }
-.tab-latency { font-size: 9px; font-family: monospace; margin-left: 2px; vertical-align: middle; }
+/* WS dot + latency overlay in bottom-right corner of active tab */
+.tab-ws-dot { position: absolute; bottom: 1px; right: 2px; margin: 0; display: inline-flex; align-items: center; gap: 2px; font-size: 7px; line-height: 1; white-space: nowrap; z-index: 3; pointer-events: none; text-shadow: 0 0 8px currentColor; }
+.tab-latency { font-size: 8px; line-height: 1; font-family: monospace; margin: 0; }
 .share-state-indicator { display: inline-flex; align-items: center; align-self: center; gap: 5px; min-width: 0; margin-left: 6px; padding: 2px 6px; border: 1px solid rgba(34,211,238,0.38); border-radius: 999px; color: #dffaff; background: rgba(8,145,178,0.24); font-size: 10px; line-height: 1.2; cursor: default; pointer-events: none; white-space: nowrap; box-shadow: 0 0 0 1px rgba(8,145,178,0.10), 0 0 12px rgba(34,211,238,0.12); }
 .share-state-icon { font-size: 12px; line-height: 1; filter: drop-shadow(0 0 5px rgba(34,211,238,0.45)); }
 .share-state-indicator-icon-only { width: 18px; height: 18px; min-width: 18px; margin-left: 4px; padding: 0; justify-content: center; border-color: rgba(34,211,238,0.58); background: rgba(8,145,178,0.36); color: #f0fdff; box-shadow: 0 0 0 1px rgba(34,211,238,0.18), 0 0 12px rgba(34,211,238,0.24); }
@@ -26588,6 +26588,16 @@ html.native-mac-desktop .remote-desktop-window-blocked {
     font-size: 8px;
     bottom: 1px;
     left: 1px;
+  }
+
+  html[data-native-platform="android"] .tab-ws-dot {
+    font-size: 6px;
+    bottom: 1px;
+    right: 2px;
+  }
+
+  html[data-native-platform="android"] .tab-latency {
+    font-size: 7px;
   }
 
   html[data-native-platform="android"] .shortcuts {

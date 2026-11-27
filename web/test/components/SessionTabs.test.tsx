@@ -1139,7 +1139,8 @@ describe('SessionTabs', () => {
   it('renders top-left corner sequence numbers matching visual tab order without increasing tab height or width', async () => {
     const fs = await import('node:fs');
     const path = await import('node:path');
-    const cssText = fs.readFileSync(path.resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    const webRoot = process.cwd().endsWith('/web') ? process.cwd() : path.join(process.cwd(), 'web');
+    const cssText = fs.readFileSync(path.join(webRoot, 'src/styles.css'), 'utf8');
 
     // Inject tab CSS rules directly into the document to assert real box/positioning properties.
     const tabRule = cssText.match(/\.tab\s*\{[^}]+\}/)?.[0] ?? '';
@@ -1196,7 +1197,8 @@ describe('SessionTabs', () => {
   it('positions .tab-pin at bottom-left corner and .tab > .agent-badge at top-right corner out-of-flow without altering SessionTree badge', async () => {
     const fs = await import('node:fs');
     const path = await import('node:path');
-    const cssText = fs.readFileSync(path.resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    const webRoot = process.cwd().endsWith('/web') ? process.cwd() : path.join(process.cwd(), 'web');
+    const cssText = fs.readFileSync(path.join(webRoot, 'src/styles.css'), 'utf8');
 
     // 1. Assert CSS rules for out-of-flow corner positioning
     const pinRule = cssText.match(/(?:^|\n)\.tab-pin\s*\{[^}]+\}/)?.[0] ?? '';
@@ -1274,5 +1276,117 @@ describe('SessionTabs', () => {
     const tab3AgentBadge = renderedTabs[2].querySelector('.agent-badge');
     expect(tab3Pin).toBeNull();
     expect(tab3AgentBadge).toBeNull();
+  });
+
+  it('positions .tab-ws-dot and .tab-latency at bottom-right corner out-of-flow without altering active tab interactions', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const webRoot = process.cwd().endsWith('/web') ? process.cwd() : path.join(process.cwd(), 'web');
+    const cssText = fs.readFileSync(path.join(webRoot, 'src/styles.css'), 'utf8');
+
+    // 1. Assert CSS rules for bottom-right corner overlay
+    const wsDotRule = cssText.match(/(?:^|\n)\.tab-ws-dot\s*\{[^}]+\}/)?.[0] ?? '';
+    const latencyRule = cssText.match(/(?:^|\n)\.tab-latency\s*\{[^}]+\}/)?.[0] ?? '';
+    const androidWsDotRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab-ws-dot\s*\{[^}]+\}/)?.[0] ?? '';
+    const androidLatencyRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab-latency\s*\{[^}]+\}/)?.[0] ?? '';
+
+    // .tab-ws-dot must be bottom-right, absolute, pointer-events: none, margin: 0, non-negative bottom
+    expect(wsDotRule).toContain('position: absolute');
+    expect(wsDotRule).toMatch(/bottom:\s*1px/);
+    expect(wsDotRule).toMatch(/right:\s*2px/);
+    expect(wsDotRule).toContain('pointer-events: none');
+    expect(wsDotRule).toContain('margin: 0');
+    expect(wsDotRule).not.toContain('margin-left');
+    expect(wsDotRule).toContain('white-space: nowrap');
+    expect(wsDotRule).toContain('z-index: 3');
+
+    // .tab-latency must have margin: 0, line-height: 1
+    expect(latencyRule).toContain('margin: 0');
+    expect(latencyRule).toContain('line-height: 1');
+
+    // Android compact rules must exist with non-negative bottom
+    expect(androidWsDotRule).toContain('bottom: 1px');
+    expect(androidWsDotRule).toContain('right: 2px');
+    expect(androidWsDotRule).toContain('font-size: 6px');
+    expect(androidLatencyRule).toContain('font-size: 7px');
+
+    // 2. Render SessionTabs and verify .tab-ws-dot rendering across connected/latency states
+    const sessions = makeSessions([
+      { name: 'sess_active', label: 'Active Tab', state: 'idle' },
+      { name: 'sess_inactive', label: 'Inactive Tab', state: 'idle' },
+    ]);
+
+    // Case A: Active + Connected + latencyMs=12
+    const { rerender } = render(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="sess_active"
+        connected={true}
+        latencyMs={12}
+        latencyColor="#34d399"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+
+    const tabsA = screen.getAllByRole('tab');
+    const activeDotA = tabsA[0].querySelector('.tab-ws-dot');
+    const inactiveDotA = tabsA[1].querySelector('.tab-ws-dot');
+    expect(activeDotA).not.toBeNull();
+    expect(activeDotA?.getAttribute('title')).toBe('12ms');
+    expect(activeDotA?.querySelector('.tab-latency')?.textContent).toBe('12ms');
+    expect(inactiveDotA).toBeNull();
+
+    // Case B: Active + Connected + latencyMs=0 (0ms is valid latency, must not fall back to Connected)
+    rerender(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="sess_active"
+        connected={true}
+        latencyMs={0}
+        latencyColor="#34d399"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    const activeDotB = screen.getAllByRole('tab')[0].querySelector('.tab-ws-dot');
+    expect(activeDotB?.getAttribute('title')).toBe('0ms');
+    expect(activeDotB?.querySelector('.tab-latency')?.textContent).toBe('0ms');
+
+    // Case C: Active + Connected + latencyMs=null
+    rerender(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="sess_active"
+        connected={true}
+        latencyMs={null}
+        latencyColor="#34d399"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    const activeDotC = screen.getAllByRole('tab')[0].querySelector('.tab-ws-dot');
+    expect(activeDotC?.getAttribute('title')).toBe('Connected');
+    expect(activeDotC?.querySelector('.tab-latency')).toBeNull();
+
+    // Case D: Active + Disconnected (connected=false)
+    rerender(
+      <SessionTabs
+        sessions={sessions}
+        activeSession="sess_active"
+        connected={false}
+        latencyMs={null}
+        latencyColor="#34d399"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    const activeDotD = screen.getAllByRole('tab')[0].querySelector('.tab-ws-dot');
+    expect(activeDotD?.getAttribute('title')).toBe('Disconnected');
+    expect(activeDotD?.querySelector('.tab-latency')).toBeNull();
   });
 });
