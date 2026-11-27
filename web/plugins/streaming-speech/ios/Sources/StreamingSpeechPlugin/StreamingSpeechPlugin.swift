@@ -3078,7 +3078,8 @@ final class SpeechDecoder {
             guard let raw, !raw.isEmpty else { return }
             for part in raw.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
                 guard terms.count < 60 else { return }
-                let cleaned = String(part).trimmingCharacters(in: .whitespacesAndNewlines)
+                let stripped = String(part).unicodeScalars.filter { !CharacterSet.controlCharacters.contains($0) }
+                let cleaned = String(String.UnicodeScalarView(stripped)).trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !cleaned.isEmpty else { continue }
                 let bounded = cleaned.count > 64 ? String(cleaned.prefix(64)).trimmingCharacters(in: .whitespacesAndNewlines) : cleaned
                 guard !bounded.isEmpty else { continue }
@@ -3092,9 +3093,12 @@ final class SpeechDecoder {
             }
         }
 
-        appendSource(base)
         appendSource(request)
-        return terms.isEmpty ? nil : terms.joined(separator: ", ")
+        if terms.isEmpty {
+            return base
+        }
+        appendSource(base)
+        return terms.joined(separator: ", ")
     }
 
     init?(recognizer: SpeechRecognizer, language: String? = nil, hotwords: String? = nil) {

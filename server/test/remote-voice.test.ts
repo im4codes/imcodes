@@ -2599,6 +2599,42 @@ describe('RemoteVoiceHub + /api/voice routes + /api/ws/voice-relay', () => {
     });
     await proto.handleRawMessage(providerWs, 'owner-1', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-b' }));
 
+    // Cross-account privacy enforcement: even if client sends hotwords due to stale cache
+    // (assuming isOwnDevice=true) without allowSharedHotwords=true, hub MUST drop hotwords when
+    // resolved provider belongs to another user, and MUST forward when allowSharedHotwords=true.
+    await proto.handleRawMessage(clientBWs, 'user-b', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-b-stale-denied',
+      targetDeviceId: 'mac-shared',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['SecretProj', 'PrivateTerm'],
+    }));
+    expect(providerSent.at(-1)).toEqual({
+      type: 'voice.session.start',
+      sessionId: 'pc-b-stale-denied',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+    });
+    expect(
+      (hub as unknown as { sessions: Map<string, { hotwords?: string[] }> }).sessions.get('pc-b-stale-denied')?.hotwords,
+    ).toBeUndefined();
+    await proto.handleRawMessage(providerWs, 'owner-1', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-b-stale-denied' }));
+
+    await proto.handleRawMessage(clientBWs, 'user-b', JSON.stringify({
+      type: 'voice.session.start',
+      sessionId: 'pc-b-consented',
+      targetDeviceId: 'mac-shared',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['SharedOptIn'],
+      allowSharedHotwords: true,
+    }));
+    expect(providerSent.at(-1)).toEqual({
+      type: 'voice.session.start',
+      sessionId: 'pc-b-consented',
+      sampleRate: REMOTE_VOICE_SAMPLE_RATE,
+      hotwords: ['SharedOptIn'],
+    });
+    await proto.handleRawMessage(providerWs, 'owner-1', JSON.stringify({ type: 'voice.session.end', sessionId: 'pc-b-consented' }));
+
     // Concurrent HTTP ASR: User A sends hotwords -> prompt set; User B omits -> prompt absent
     const pcm = Buffer.alloc(640, 1).toString('base64');
     await proto.handleRawMessage(clientAWs, 'owner-1', JSON.stringify({

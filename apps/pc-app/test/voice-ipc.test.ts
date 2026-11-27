@@ -2727,7 +2727,7 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       mkdirSync(modelDir, { recursive: true });
       writeFileSync(path.join(modelDir, 'config.json'), weights);
       const hotwordsFilePath = path.join(modelDir, 'hotwords.txt');
-      writeFileSync(hotwordsFilePath, '', 'utf8');
+      writeFileSync(hotwordsFilePath, 'StaticOne\nStaticTwo\n', 'utf8');
       writeFileSync(path.join(tempDir, 'speech-model.json'), JSON.stringify({ version: 1, model: 'qwen3-1.7b' }));
 
       const mlxBin = path.join(tempDir, 'imcodes-speech-mlx');
@@ -2816,7 +2816,18 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       expect(rem2Cmd).toEqual({ cmd: 'start_pcm', locale: 'en-US' });
       proc.stdout.emit('data', '{"type":"end"}\n');
 
-      expect(readFileSync(hotwordsFilePath, 'utf8')).toBe('');
+      // 5) Remote session C with different hotwords Y -> sends Y without inheriting A or touching hotwords.txt
+      const rem3 = await handlers.get(PC_APP_VOICE_CHANNELS.startRemoteSession)!(trustedEv, {
+        sessionId: 'rem-hw-3',
+        locale: 'ja-JP',
+        hotwords: ['ProjectY'],
+      });
+      expect(rem3).toEqual({ ok: true });
+      const rem3Cmd = JSON.parse(String(proc.stdin.write.mock.calls.at(-1)?.[0]).trim());
+      expect(rem3Cmd).toEqual({ cmd: 'start_pcm', locale: 'ja-JP', hotwords: 'ProjectY' });
+      proc.stdout.emit('data', '{"type":"end"}\n');
+
+      expect(readFileSync(hotwordsFilePath, 'utf8')).toBe('StaticOne\nStaticTwo\n');
     } finally {
       if (voice) await voice.dispose();
       rmSync(tempDir, { recursive: true, force: true });

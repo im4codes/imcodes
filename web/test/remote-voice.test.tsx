@@ -4085,6 +4085,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     ws1.emitOpen();
     const startFrame1 = JSON.parse(ws1.sent[0]!) as Record<string, unknown>;
     expect(startFrame1.hotwords).toBeUndefined();
+    expect(startFrame1.allowSharedHotwords).toBeUndefined();
     ws1.emitMessage({ type: 'voice.session.ready', sessionId: startFrame1.sessionId });
     await expect(start1).resolves.toBe(true);
     ws1.emitMessage({
@@ -4106,6 +4107,7 @@ describe('Phase 2 Shared Remote Voice Recognition', () => {
     ws2.emitOpen();
     const startFrame2 = JSON.parse(ws2.sent[0]!) as Record<string, unknown>;
     expect(startFrame2.hotwords).toEqual(['IM.codes', 'worktree']);
+    expect(startFrame2.allowSharedHotwords).toBe(true);
     ws2.emitMessage({ type: 'voice.session.ready', sessionId: startFrame2.sessionId });
     await expect(start2).resolves.toBe(true);
     ws2.emitMessage({ type: 'voice.session.end', sessionId: startFrame2.sessionId });

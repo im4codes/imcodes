@@ -74,6 +74,7 @@ import { KeyboardShortcutsSection } from '../components/KeyboardShortcutsSection
 import { SharedVoiceSection } from '../components/SharedVoiceSection.js';
 import { OfflineVoiceModelSection } from '../components/OfflineVoiceModelSection.js';
 import { VoiceHotwordsSection } from '../components/VoiceHotwordsSection.js';
+import type { VoiceHotwordProjectInput } from '../voice-hotwords.js';
 import type { KeyboardShortcutOverrides } from '../keyboard-shortcuts.js';
 import {
   formatGlobalFontDelta,
@@ -150,6 +151,13 @@ interface Props {
   isAdmin?: boolean;
   serverUrl?: string | null;
   activeProjectName?: string | null;
+  activeProjectKey?: VoiceHotwordProjectInput;
+  serverNamesById?: Record<string, string> | null;
+  focusTarget?: {
+    section: 'voice-hotwords';
+    projectKey?: VoiceHotwordProjectInput;
+    token: number;
+  } | null;
   initialTab?: SettingsTab;
   shortcutOverrides?: KeyboardShortcutOverrides;
   onChangeShortcutOverrides?: (
@@ -170,6 +178,9 @@ export function SettingsPage({
   isAdmin = false,
   serverUrl,
   activeProjectName,
+  activeProjectKey,
+  serverNamesById,
+  focusTarget = null,
   initialTab = 'profile',
   shortcutOverrides,
   onChangeShortcutOverrides,
@@ -310,7 +321,10 @@ export function SettingsPage({
     };
   }, [currentLang]);
 
-  const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab);
+  const [activeTab, setActiveTab] = useState<SettingsTab>(
+    focusTarget?.section === 'voice-hotwords' ? 'profile' : initialTab,
+  );
+  const voiceHotwordsRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const [editingName, setEditingName] = useState(false);
@@ -573,6 +587,15 @@ export function SettingsPage({
       scrollRef.current.scrollTop = 0;
     }
   };
+
+  useEffect(() => {
+    if (focusTarget?.section !== 'voice-hotwords') return;
+    setActiveTab('profile');
+    const raf = requestAnimationFrame(() => {
+      voiceHotwordsRef.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [focusTarget?.section, focusTarget?.token]);
 
   const togglePushType = (type: PushNotificationType) => {
     userEditedPushRef.current = true;
@@ -1130,7 +1153,13 @@ export function SettingsPage({
 
               <SharedVoiceSection />
 
-              <VoiceHotwordsSection currentProjectName={activeProjectName} />
+              <VoiceHotwordsSection
+                sectionRef={voiceHotwordsRef}
+                currentProjectName={activeProjectKey !== undefined ? activeProjectKey : activeProjectName}
+                targetProjectKey={focusTarget?.section === 'voice-hotwords' ? focusTarget.projectKey : undefined}
+                targetProjectToken={focusTarget?.section === 'voice-hotwords' ? focusTarget.token : undefined}
+                serverNamesById={serverNamesById}
+              />
 
               <div class="settings-card" data-testid="settings-tts-card">
                 <h2 class="settings-card-heading">

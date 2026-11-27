@@ -37,6 +37,12 @@ import {
 } from '../voice-recognition-backend.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
 import {
+  encodeVoiceHotwordProjectKey,
+  hasVoiceHotwordsSettingsHandler,
+  openVoiceHotwordsSettings,
+  type VoiceHotwordProjectInput,
+} from '../voice-hotwords.js';
+import {
   VoiceStreamingRobot,
   applyVoiceRobotLevel,
   clampVoiceRobotLevel,
@@ -702,13 +708,13 @@ function shouldPrimeVoiceInputOnPointerDown(): boolean {
     || Object.prototype.hasOwnProperty.call(VoiceInput, 'primeWebGesture');
 }
 
-function primeVoiceInputGesture(options?: { deferAudioPause?: boolean }): boolean {
+function primeVoiceInputGesture(options?: { deferAudioPause?: boolean; projectKey?: VoiceHotwordProjectInput }): boolean {
   if (Object.prototype.hasOwnProperty.call(VoiceInput, 'primeVoiceGesture')) {
-    const fn = (VoiceInput as { primeVoiceGesture?: (opts?: { deferAudioPause?: boolean }) => boolean }).primeVoiceGesture;
+    const fn = (VoiceInput as { primeVoiceGesture?: (opts?: { deferAudioPause?: boolean; projectKey?: VoiceHotwordProjectInput }) => boolean }).primeVoiceGesture;
     if (typeof fn === 'function') return fn(options);
   }
   if (!Object.prototype.hasOwnProperty.call(VoiceInput, 'primeWebGesture')) return false;
-  const fn = (VoiceInput as { primeWebGesture?: (opts?: { deferAudioPause?: boolean }) => boolean }).primeWebGesture;
+  const fn = (VoiceInput as { primeWebGesture?: (opts?: { deferAudioPause?: boolean; projectKey?: VoiceHotwordProjectInput }) => boolean }).primeWebGesture;
   return typeof fn === 'function' ? fn(options) : false;
 }
 
@@ -841,6 +847,8 @@ interface Props {
   onRenameSession?: () => void;
   /** Called when Settings is selected in the menu. */
   onSettings?: (intent?: SessionSettingsOpenIntent) => void;
+  /** Called to navigate directly to Voice Hotwords settings for this project/scope. */
+  onOpenVoiceHotwordsSettings?: (projectKey: string | null) => void;
   /** Called when Share is selected in the send-adjacent more menu. */
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
   /** Whether the active session tab is pinned. */
@@ -2373,7 +2381,11 @@ const ComposerTargetBubble = memo(function ComposerTargetBubble({
   );
 });
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, hideWorkflowControls = false, onSend, onRemoveOptimisticMessage, onSendFailed, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, taskQuote, onRemoveTaskQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onSessionSaved, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onOpenVoiceHotwordsSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, hideWorkflowControls = false, onSend, onRemoveOptimisticMessage, onSendFailed, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, taskQuote, onRemoveTaskQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onSessionSaved, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
+  const resolvedVoiceHotwordProjectKey = useMemo(
+    () => (activeSession?.project ? encodeVoiceHotwordProjectKey(activeSession.project, serverId) : null),
+    [activeSession?.project, serverId],
+  );
   const baseOpenNodeGroups = useNodeGroupsNav(onOpenNodeGroups);
   const handleOpenNodeGroupsFromBrowser = useCallback(() => {
     onMobileFileBrowserClose?.();
@@ -6777,12 +6789,12 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const openStandardVoiceOverlay = useCallback(() => {
     if (inputDisabledRef.current) return;
     if (!hasVoiceNotepadDraft && VoiceInput.isAvailable()) {
-      primeVoiceInputGesture({ deferAudioPause: false });
+      primeVoiceInputGesture({ deferAudioPause: false, projectKey: resolvedVoiceHotwordProjectKey });
     }
     setVoiceOverlayInitialText(null);
     setVoiceOverlayAutoStart(true);
     setVoiceOpen(true);
-  }, [hasVoiceNotepadDraft]);
+  }, [hasVoiceNotepadDraft, resolvedVoiceHotwordProjectKey]);
 
   const pulseInlineRecognizing = useCallback(() => {
     setInlineVoiceRecognizing(true);
@@ -6862,7 +6874,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     setInlineVoiceLevel(0);
     setVoiceModelLoading(false);
     setInlineVoicePermissionTarget(null);
-    primeVoiceInputGesture({ deferAudioPause: false });
+    primeVoiceInputGesture({ deferAudioPause: false, projectKey: resolvedVoiceHotwordProjectKey });
 
     setVoiceInputModelLoadingHandler((loading) => {
       if (!mountedRef.current || inlineVoiceTokenRef.current !== token || !inlineVoiceActiveRef.current) return;
@@ -6946,7 +6958,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           showSendWarning(trimmedErr);
         }
       },
-      activeSession?.project ? { projectKey: activeSession.project } : undefined,
+      { projectKey: resolvedVoiceHotwordProjectKey },
     )).then((ok) => {
       if (inlineVoiceTokenRef.current !== token) return;
       if (ok === false && inlineVoiceActiveRef.current) {
@@ -6973,6 +6985,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     publishComposerText,
     pulseInlineRecognizing,
     quickData.data,
+    resolvedVoiceHotwordProjectKey,
     showSendWarning,
     stopInlineVoice,
     syncHistoryEditOrDraft,
@@ -7813,7 +7826,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         (err) => {
           failTransaction(err || 'permission_denied');
         },
-        activeSession?.project ? { projectKey: activeSession.project } : undefined,
+        { projectKey: resolvedVoiceHotwordProjectKey },
       ).then(
         (started) => {
           tx.startSettled = true;
@@ -7919,6 +7932,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     fallbackToComposerClick,
     finalizeVoiceHold,
     pulseVoiceHoldRecognizing,
+    resolvedVoiceHotwordProjectKey,
     updateVoiceHoldZoneFromDx,
   ]);
 
@@ -7993,7 +8007,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     applyComposerVoiceTouchLock(el, false);
     attachComposerVoiceWindowListeners();
     if (voiceHoldTxRef.current === null && shouldPrimeVoiceInputOnPointerDown()) {
-      didPrimeVoiceGestureRef.current = primeVoiceInputGesture({ deferAudioPause: true });
+      didPrimeVoiceGestureRef.current = primeVoiceInputGesture({
+        deferAudioPause: true,
+        projectKey: resolvedVoiceHotwordProjectKey,
+      });
     }
 
     if (voiceHoldTimerRef.current !== null) clearTimeout(voiceHoldTimerRef.current);
@@ -8005,6 +8022,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     voiceOpen,
     activateComposerVoiceHold,
     attachComposerVoiceWindowListeners,
+    resolvedVoiceHotwordProjectKey,
     retireOrphanedVoiceHold,
     setComposerVoicePending,
   ]);
@@ -12319,6 +12337,23 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                   )}
                 </>
               )}
+              {(onOpenVoiceHotwordsSettings || hasVoiceHotwordsSettingsHandler()) && (
+                <button
+                  class="menu-item session-action-menu-item"
+                  data-testid="session-menu-voice-hotwords"
+                  onClick={() => {
+                    setMenuOpen(false);
+                    if (onOpenVoiceHotwordsSettings) {
+                      onOpenVoiceHotwordsSettings(resolvedVoiceHotwordProjectKey);
+                    } else {
+                      openVoiceHotwordsSettings(resolvedVoiceHotwordProjectKey);
+                    }
+                  }}
+                >
+                  <SessionActionMenuIcon kind="settings" />
+                  <span class="session-action-menu-label">{t('settings.voice_hotwords_title')}</span>
+                </button>
+              )}
               {canShowCloneGroupAction && (
                 <button
                   class="menu-item session-action-menu-item"
@@ -12523,7 +12558,16 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       onSendNotepad={handleVoiceNotepadSend}
       draftScope={voiceNotepadDraftScope}
       sessionLabel={composerTargetName}
-      projectKey={activeSession?.project ?? null}
+      projectKey={resolvedVoiceHotwordProjectKey}
+      onOpenHotwordsSettings={(onOpenVoiceHotwordsSettings || hasVoiceHotwordsSettingsHandler())
+        ? () => {
+            if (onOpenVoiceHotwordsSettings) {
+              onOpenVoiceHotwordsSettings(resolvedVoiceHotwordProjectKey);
+            } else {
+              openVoiceHotwordsSettings(resolvedVoiceHotwordProjectKey);
+            }
+          }
+        : undefined}
       autoStartListening={voiceOverlayAutoStart}
       initialText={voiceOverlayInitialText !== null ? voiceOverlayInitialText : (divRef.current ? readComposerElementText(divRef.current) : '')}
     />

@@ -23,6 +23,11 @@ import { getLocalPcAppRemoteDeviceId } from '../remote-voice-provider.js';
 import { holdScreenAwake } from '../screen-awake.js';
 import { getActiveCssZoom, UI_SCALE_EVENT } from '../ui-scale.js';
 import {
+  hasVoiceHotwordsSettingsHandler,
+  openVoiceHotwordsSettings,
+  type VoiceHotwordProjectInput,
+} from '../voice-hotwords.js';
+import {
   NOTEPAD_DRAFT_SAVE_INTERVAL_MS,
   buildNotepadInlineMessage,
   deleteVoiceNotepadDraft,
@@ -48,7 +53,9 @@ interface Props {
    */
   draftScope?: string | null;
   /** Active project key used to resolve project-scoped ASR hotwords and post-processing. */
-  projectKey?: string | null;
+  projectKey?: VoiceHotwordProjectInput;
+  /** Opens the Settings page directly at the Voice Hotwords section for this project/scope. */
+  onOpenHotwordsSettings?: () => void;
   /** Shown in the review step as where the notepad will be sent. */
   sessionLabel?: string;
   /**
@@ -227,6 +234,7 @@ export function VoiceOverlay({
   autoStartListening = true,
   draftScope,
   projectKey = null,
+  onOpenHotwordsSettings,
   sessionLabel,
   onSendNotepad,
 }: Props) {
@@ -755,7 +763,7 @@ export function VoiceOverlay({
         } else if (startingTokenRef.current === token) {
           pendingErrorWhileStarting = true;
         }
-      }, ...(projectKey ? [{ projectKey }] : []));
+      }, { projectKey: projectKey ?? null });
       startCallSettled = true;
       const currentValid = sessionTokenRef.current === token
         && flushingTokenRef.current !== token
@@ -1315,6 +1323,26 @@ export function VoiceOverlay({
                 </option>
               )}
             </select>
+          )}
+          {(onOpenHotwordsSettings || hasVoiceHotwordsSettingsHandler()) && (
+            <button
+              type="button"
+              data-testid="voice-overlay-hotwords-btn"
+              class="voice-notepad-toggle"
+              title={t('settings.voice_hotwords_title')}
+              aria-label={t('settings.voice_hotwords_title')}
+              onClick={() => {
+                void VoiceInput.stopListening({ abort: true }).catch(() => {});
+                onClose();
+                if (onOpenHotwordsSettings) {
+                  onOpenHotwordsSettings();
+                } else {
+                  openVoiceHotwordsSettings(projectKey ?? null);
+                }
+              }}
+            >
+              {t('settings.voice_hotwords_title')}
+            </button>
           )}
           <button
             type="button"

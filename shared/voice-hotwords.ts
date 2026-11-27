@@ -38,12 +38,12 @@ interface CompiledMatcher {
 
 const ASCII_CONTROL_RE = /[\u0000-\u001F\u007F]/g;
 const WHITESPACE_RUN_RE = /\s+/g;
-const ALIAS_LINE_RE = /^(.+?)\s*(?:=>|->)\s*(.+)$/;
 const ASCII_PRINTABLE_RE = /^[\x20-\x7E]+$/;
 const ASCII_WORD_CHAR_RE = /[A-Za-z0-9_/@:-]/;
 const ASCII_RIGHT_BOUNDARY_RE = /[A-Za-z0-9_/@-]/;
 const ASCII_ALNUM_UNDER_RE = /[A-Za-z0-9_]/;
-const URL_SPAN_RE = /https?:\/\/[^\s"'<>()[\]]+/gi;
+const URL_CANDIDATE_RE = /(?:https?|wss?|ftp):\/\/[^\s<>"'`\u3000]+/gi;
+const URL_TRAILING_PUNCT_RE = /^[.,;:!?'"\u3002\uff0c\u3001\uff1b\uff1a\uff01\uff1f\u201d\u2019\u300b\u300d\u300f\u3011]$/;
 const REGEX_META_RE = /[.*+?^${}()|[\]\\]/g;
 
 const matcherCache = new WeakMap<object, CompiledMatcher>();
@@ -102,6 +102,20 @@ type ParsedHotwordEntry =
   | { kind: 'term'; term: string }
   | { kind: 'alias'; from: string; to: string };
 
+function parseAliasParts(line: string): { from: string; to: string } | null {
+  const fatIdx = line.indexOf('=>');
+  const thinIdx = line.indexOf('->');
+  const idx =
+    fatIdx >= 0 && thinIdx >= 0
+      ? Math.min(fatIdx, thinIdx)
+      : Math.max(fatIdx, thinIdx);
+  if (idx <= 0) return null;
+  const from = sanitizeVoiceHotwordText(line.slice(0, idx), VOICE_HOTWORDS_MAX_TERM_CHARS);
+  const to = sanitizeVoiceHotwordText(line.slice(idx + 2), VOICE_HOTWORDS_MAX_TERM_CHARS);
+  if (!from || !to) return null;
+  return { from, to };
+}
+
 function parseVoiceHotwordLines(raw: string | null | undefined): { entries: ParsedHotwordEntry[] } {
   if (typeof raw !== 'string' || !raw) {
     return { entries: [] };
@@ -111,14 +125,10 @@ function parseVoiceHotwordLines(raw: string | null | undefined): { entries: Pars
     const trimmedLine = line.trim();
     if (!trimmedLine) continue;
 
-    const aliasMatch = ALIAS_LINE_RE.exec(trimmedLine);
-    if (aliasMatch) {
-      const from = sanitizeVoiceHotwordText(aliasMatch[1], VOICE_HOTWORDS_MAX_TERM_CHARS);
-      const to = sanitizeVoiceHotwordText(aliasMatch[2], VOICE_HOTWORDS_MAX_TERM_CHARS);
-      if (from && to) {
-        entries.push({ kind: 'alias', from, to });
-        continue;
-      }
+    const alias = parseAliasParts(trimmedLine);
+    if (alias) {
+      entries.push({ kind: 'alias', from: alias.from, to: alias.to });
+      continue;
     }
 
     const term = sanitizeVoiceHotwordText(trimmedLine, VOICE_HOTWORDS_MAX_TERM_CHARS);
@@ -195,6 +205,7 @@ export function mergeVoiceHotwords(input: MergeVoiceHotwordsInput): CompiledVoic
   const seenTerms = new Set<string>();
   const replacements: VoiceHotwordReplacement[] = [];
   const seenAliases = new Set<string>();
+  const projectProtectedKeys = new Set<string>();
   let contextLength = 0;
 
   const pushTerm = (rawTerm: string) => {
@@ -208,13 +219,38 @@ export function mergeVoiceHotwords(input: MergeVoiceHotwordsInput): CompiledVoic
     contextLength += sepLen + rawTerm.length;
   };
 
-  for (const entry of [...projectEntries, ...globalEntries]) {
+  // Pre-collect all project canonical terms and targets so a later project line or global alias
+  // can never overwrite a project canonical spelling via key collision.
+  for (const entry of projectEntries) {
+    if (entry.kind === 'term') {
+      projectProtectedKeys.add(termDedupeKey(entry.term));
+    } else {
+      projectProtectedKeys.add(termDedupeKey(entry.from));
+      projectProtectedKeys.add(termDedupeKey(entry.to));
+    }
+  }
+
+  for (const entry of projectEntries) {
     if (entry.kind === 'term') {
       pushTerm(entry.term);
       continue;
     }
     const aliasKey = termDedupeKey(entry.from);
     if (seenAliases.has(aliasKey)) continue;
+    seenAliases.add(aliasKey);
+    pushTerm(entry.to);
+    if (entry.from !== entry.to && replacements.length < VOICE_HOTWORDS_MAX_ALIASES) {
+      replacements.push({ from: entry.from, to: entry.to });
+    }
+  }
+
+  for (const entry of globalEntries) {
+    if (entry.kind === 'term') {
+      pushTerm(entry.term);
+      continue;
+    }
+    const aliasKey = termDedupeKey(entry.from);
+    if (seenAliases.has(aliasKey) || projectProtectedKeys.has(aliasKey)) continue;
     seenAliases.add(aliasKey);
     pushTerm(entry.to);
     if (entry.from !== entry.to && replacements.length < VOICE_HOTWORDS_MAX_ALIASES) {
@@ -301,22 +337,216 @@ function passesAsciiBoundary(text: string, offset: number, length: number): bool
   return true;
 }
 
-function collectUrlSpans(text: string): Array<[number, number]> | null {
-  if (!text.includes('://')) return null;
-  const spans: Array<[number, number]> = [];
-  URL_SPAN_RE.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = URL_SPAN_RE.exec(text)) !== null) {
-    spans.push([m.index, m.index + m[0].length]);
+function trimMatchedUrlEnd(url: string): number {
+  let end = url.length;
+  while (end > 0) {
+    const ch = url[end - 1]!;
+    if (URL_TRAILING_PUNCT_RE.test(ch)) {
+      end -= 1;
+      continue;
+    }
+    if (ch === ')' || ch === ']') {
+      const openCh = ch === ')' ? '(' : '[';
+      let depth = 0;
+      for (let i = 0; i < end - 1; i += 1) {
+        const c = url[i]!;
+        if (c === openCh) depth += 1;
+        else if (c === ch && depth > 0) depth -= 1;
+      }
+      if (depth === 0) {
+        end -= 1;
+        continue;
+      }
+    }
+    break;
   }
-  return spans.length > 0 ? spans : null;
+  return end;
 }
 
-function isInsideUrlSpan(spans: readonly [number, number][] | null, offset: number, length: number): boolean {
+function collectUrlSpans(text: string, out: Array<[number, number]>): void {
+  if (!text.includes('://')) return;
+  URL_CANDIDATE_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = URL_CANDIDATE_RE.exec(text)) !== null) {
+    const trimmedLen = trimMatchedUrlEnd(m[0]);
+    if (trimmedLen > 0) {
+      out.push([m.index, m.index + trimmedLen]);
+    }
+  }
+}
+
+function isAtLineFenceStart(text: string, pos: number): boolean {
+  let i = pos;
+  let spaces = 0;
+  while (i > 0 && text[i - 1] !== '\n' && text[i - 1] !== '\r') {
+    if (text[i - 1] !== ' ') return false;
+    spaces += 1;
+    if (spaces > 3) return false;
+    i -= 1;
+  }
+  return true;
+}
+
+function isTrailingLineSpaceOnly(text: string, pos: number): boolean {
+  for (let i = pos; i < text.length; i += 1) {
+    const ch = text[i]!;
+    if (ch === '\n' || ch === '\r') return true;
+    if (ch !== ' ' && ch !== '\t') return false;
+  }
+  return true;
+}
+
+function collectTildeFenceSpans(text: string, out: Array<[number, number]>): void {
+  if (!text.includes('~~~')) return;
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '~' && isAtLineFenceStart(text, i)) {
+      let len = 0;
+      while (i + len < text.length && text[i + len] === '~') len += 1;
+      if (len >= 3) {
+        const lineEnd = text.indexOf('\n', i + len);
+        if (lineEnd === -1) {
+          out.push([i, text.length]);
+          break;
+        }
+        let cursor = lineEnd + 1;
+        let closedEnd = text.length;
+        while (cursor < text.length) {
+          const nextNl = text.indexOf('\n', cursor);
+          const rowEnd = nextNl === -1 ? text.length : nextNl;
+          let p = cursor;
+          let sp = 0;
+          while (p < rowEnd && text[p] === ' ' && sp < 3) {
+            p += 1;
+            sp += 1;
+          }
+          let closeLen = 0;
+          while (p + closeLen < rowEnd && text[p + closeLen] === '~') closeLen += 1;
+          if (closeLen >= len && isTrailingLineSpaceOnly(text, p + closeLen)) {
+            closedEnd = rowEnd;
+            break;
+          }
+          if (nextNl === -1) break;
+          cursor = nextNl + 1;
+        }
+        out.push([i, closedEnd]);
+        i = closedEnd;
+        continue;
+      }
+      i += len;
+      continue;
+    }
+    i += 1;
+  }
+}
+
+function collectBacktickSpans(text: string, out: Array<[number, number]>): void {
+  if (!text.includes('`')) return;
+  const runs: Array<{ start: number; len: number; lineStart: boolean }> = [];
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '`') {
+      const start = i;
+      while (i < text.length && text[i] === '`') i += 1;
+      runs.push({ start, len: i - start, lineStart: isAtLineFenceStart(text, start) });
+    } else {
+      i += 1;
+    }
+  }
+  if (runs.length === 0) return;
+
+  // Pre-index run indices by length so inline code matching stays strictly O(N).
+  const indicesByLen = new Map<number, number[]>();
+  for (let idx = 0; idx < runs.length; idx += 1) {
+    const len = runs[idx]!.len;
+    const arr = indicesByLen.get(len);
+    if (arr) arr.push(idx);
+    else indicesByLen.set(len, [idx]);
+  }
+  const cursorByLen = new Map<number, number>();
+
+  let r = 0;
+  while (r < runs.length) {
+    const open = runs[r]!;
+    if (open.len >= 3 && open.lineStart) {
+      let closeIdx = -1;
+      for (let j = r + 1; j < runs.length; j += 1) {
+        const cand = runs[j]!;
+        if (cand.lineStart && cand.len >= open.len && isTrailingLineSpaceOnly(text, cand.start + cand.len)) {
+          closeIdx = j;
+          break;
+        }
+      }
+      if (closeIdx !== -1) {
+        const close = runs[closeIdx]!;
+        out.push([open.start, close.start + close.len]);
+        r = closeIdx + 1;
+        continue;
+      }
+      out.push([open.start, text.length]);
+      break;
+    }
+
+    const list = indicesByLen.get(open.len);
+    let ptr = cursorByLen.get(open.len) ?? 0;
+    while (list && ptr < list.length && list[ptr]! <= r) {
+      ptr += 1;
+    }
+    cursorByLen.set(open.len, ptr);
+    if (list && ptr < list.length) {
+      const closeIdx = list[ptr]!;
+      const close = runs[closeIdx]!;
+      out.push([open.start, close.start + close.len]);
+      cursorByLen.set(open.len, ptr + 1);
+      r = closeIdx + 1;
+      continue;
+    }
+
+    r += 1;
+  }
+}
+
+function collectProtectedSpans(text: string): Array<[number, number]> | null {
+  const hasUrl = text.includes('://');
+  const hasTicks = text.includes('`');
+  const hasTilde = text.includes('~~~');
+  if (!hasUrl && !hasTicks && !hasTilde) return null;
+
+  const raw: Array<[number, number]> = [];
+  if (hasTicks) collectBacktickSpans(text, raw);
+  if (hasTilde) collectTildeFenceSpans(text, raw);
+  if (hasUrl) collectUrlSpans(text, raw);
+  if (raw.length === 0) return null;
+
+  raw.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const merged: Array<[number, number]> = [raw[0]!];
+  for (let i = 1; i < raw.length; i += 1) {
+    const [s, e] = raw[i]!;
+    const last = merged[merged.length - 1]!;
+    if (s <= last[1]) {
+      if (e > last[1]) last[1] = e;
+    } else {
+      merged.push([s, e]);
+    }
+  }
+  return merged;
+}
+
+function isInsideProtectedSpan(spans: readonly [number, number][] | null, offset: number, length: number): boolean {
   if (!spans) return false;
   const end = offset + length;
-  for (const [start, spanEnd] of spans) {
-    if (offset < spanEnd && end > start) return true;
+  let lo = 0;
+  let hi = spans.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const [start, spanEnd] = spans[mid]!;
+    if (end <= start) {
+      hi = mid - 1;
+    } else if (offset >= spanEnd) {
+      lo = mid + 1;
+    } else {
+      return true;
+    }
   }
   return false;
 }
@@ -324,7 +554,7 @@ function isInsideUrlSpan(spans: readonly [number, number][] | null, offset: numb
 /**
  * Deterministic sub-millisecond post-processing using compiled project/global hotwords.
  * Applies explicit aliases and ASCII word-boundary case normalization in a single regex pass
- * without modifying URLs or compound code identifiers.
+ * without modifying fenced/inline code, full URLs, or compound code identifiers.
  */
 export function applyVoiceHotwordPostProcess(
   text: string,
@@ -338,11 +568,11 @@ export function applyVoiceHotwordPostProcess(
   const matcher = buildCompiledMatcher(compiled);
   if (!matcher.regex) return text;
 
-  const urlSpans = collectUrlSpans(text);
+  const protectedSpans = collectProtectedSpans(text);
   matcher.regex.lastIndex = 0;
 
   return text.replace(matcher.regex, (matched, offset: number, fullText: string) => {
-    if (isInsideUrlSpan(urlSpans, offset, matched.length)) {
+    if (isInsideProtectedSpan(protectedSpans, offset, matched.length)) {
       return matched;
     }
     const candidates = matcher.rulesByLower.get(matched.toLowerCase());

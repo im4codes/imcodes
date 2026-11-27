@@ -501,11 +501,6 @@ private func mergeSessionHotwords(base: String?, requestHotwords: Any?) -> Strin
         totalChars += sepLen + bounded.count
     }
 
-    if let base, !base.isEmpty {
-        for part in base.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
-            appendTerm(String(part))
-        }
-    }
     if let rawString = requestHotwords as? String {
         for part in rawString.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
             appendTerm(String(part))
@@ -518,7 +513,18 @@ private func mergeSessionHotwords(base: String?, requestHotwords: Any?) -> Strin
         }
     }
 
-    return terms.isEmpty ? nil : terms.joined(separator: ", ")
+    // Preserve legacy static hotwords.txt verbatim when no valid per-request hotwords are provided.
+    if terms.isEmpty {
+        return base
+    }
+
+    if let base, !base.isEmpty {
+        for part in base.split(whereSeparator: { $0 == "," || $0 == "\n" || $0 == "\r" }) {
+            appendTerm(String(part))
+        }
+    }
+
+    return terms.joined(separator: ", ")
 }
 
 private func checkMlxRuntimeAvailable() -> Bool {

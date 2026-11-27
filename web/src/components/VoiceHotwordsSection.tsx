@@ -6,6 +6,7 @@ import {
   parseVoiceHotwordsInput,
 } from '@shared/voice-hotwords.js';
 import {
+  formatVoiceHotwordProjectLabel,
   getActiveVoiceHotwordProject,
   getGlobalVoiceHotwordsRaw,
   getProjectVoiceHotwordsRaw,
@@ -16,10 +17,15 @@ import {
   setProjectVoiceHotwordsRaw,
   setShareHotwordsWithOthers,
   subscribeVoiceHotwordsChange,
+  type VoiceHotwordProjectInput,
 } from '../voice-hotwords.js';
 
 interface Props {
-  currentProjectName?: string | null;
+  currentProjectName?: VoiceHotwordProjectInput;
+  targetProjectKey?: VoiceHotwordProjectInput;
+  targetProjectToken?: number;
+  serverNamesById?: Record<string, string> | null;
+  sectionRef?: { current: HTMLDivElement | null };
 }
 
 const fieldLabelStyle = { fontSize: '13px', fontWeight: 600, color: '#e2e8f0' } as const;
@@ -39,14 +45,26 @@ const textareaStyle = {
   resize: 'vertical',
 } as const;
 
-export function VoiceHotwordsSection({ currentProjectName }: Props) {
+export function VoiceHotwordsSection({
+  currentProjectName,
+  targetProjectKey,
+  targetProjectToken,
+  serverNamesById,
+  sectionRef,
+}: Props) {
   const { t } = useTranslation();
-  const [selectedProject, setSelectedProject] = useState<string | null>(() => (
-    normalizeVoiceHotwordProjectKey(currentProjectName)
-    ?? getActiveVoiceHotwordProject()
-    ?? listVoiceHotwordProjectKeys()[0]
-    ?? null
-  ));
+  const [storeRevision, setStoreRevision] = useState(0);
+  const [selectedProject, setSelectedProject] = useState<string | null>(() => {
+    if (targetProjectKey !== undefined) {
+      return normalizeVoiceHotwordProjectKey(targetProjectKey);
+    }
+    return (
+      normalizeVoiceHotwordProjectKey(currentProjectName)
+      ?? getActiveVoiceHotwordProject()
+      ?? listVoiceHotwordProjectKeys()[0]
+      ?? null
+    );
+  });
   const [projectRaw, setProjectRaw] = useState<string>(() => (
     selectedProject ? getProjectVoiceHotwordsRaw(selectedProject) : ''
   ));
@@ -54,25 +72,34 @@ export function VoiceHotwordsSection({ currentProjectName }: Props) {
   const [shareWithOthers, setShareWithOthersState] = useState<boolean>(() => getShareHotwordsWithOthers());
 
   const projectOptions = useMemo(() => {
+    void storeRevision;
     const keys = new Set(listVoiceHotwordProjectKeys());
     const explicit = normalizeVoiceHotwordProjectKey(currentProjectName) ?? getActiveVoiceHotwordProject();
     if (explicit) keys.add(explicit);
     if (selectedProject) keys.add(selectedProject);
     return [...keys].sort((a, b) => a.localeCompare(b));
-  }, [currentProjectName, selectedProject, projectRaw]);
+  }, [currentProjectName, selectedProject, projectRaw, storeRevision]);
 
   useEffect(() => {
+    if (targetProjectToken !== undefined) {
+      setSelectedProject(normalizeVoiceHotwordProjectKey(targetProjectKey));
+    }
+  }, [targetProjectKey, targetProjectToken]);
+
+  useEffect(() => {
+    if (targetProjectToken !== undefined) return;
     const nextCurrent = normalizeVoiceHotwordProjectKey(currentProjectName);
     if (nextCurrent) {
       setSelectedProject(nextCurrent);
     }
-  }, [currentProjectName]);
+  }, [currentProjectName, targetProjectToken]);
 
   useEffect(() => {
     setProjectRaw(selectedProject ? getProjectVoiceHotwordsRaw(selectedProject) : '');
     setGlobalRaw(getGlobalVoiceHotwordsRaw());
     setShareWithOthersState(getShareHotwordsWithOthers());
     return subscribeVoiceHotwordsChange(() => {
+      setStoreRevision((n) => n + 1);
       setProjectRaw(selectedProject ? getProjectVoiceHotwordsRaw(selectedProject) : '');
       setGlobalRaw(getGlobalVoiceHotwordsRaw());
       setShareWithOthersState(getShareHotwordsWithOthers());
@@ -86,6 +113,10 @@ export function VoiceHotwordsSection({ currentProjectName }: Props) {
     [selectedProject, projectRaw, globalRaw],
   );
 
+  const selectedProjectLabel = selectedProject
+    ? formatVoiceHotwordProjectLabel(selectedProject, serverNamesById)
+    : null;
+
   const handleProjectSelect = (e: Event) => {
     const el = (e.currentTarget ?? e.target) as HTMLSelectElement;
     const next = el.value || null;
@@ -94,7 +125,7 @@ export function VoiceHotwordsSection({ currentProjectName }: Props) {
   };
 
   return (
-    <div class="settings-card" data-testid="settings-voice-hotwords-card">
+    <div ref={sectionRef} class="settings-card" data-testid="settings-voice-hotwords-card">
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
         <h2 class="settings-card-heading" style={{ marginBottom: 0 }}>
           {t('settings.voice_hotwords_title')}
@@ -112,12 +143,12 @@ export function VoiceHotwordsSection({ currentProjectName }: Props) {
         <div>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 6, flexWrap: 'wrap' }}>
             <div style={fieldLabelStyle}>
-              {selectedProject
-                ? t('settings.voice_hotwords_project_label', { project: selectedProject })
+              {selectedProjectLabel
+                ? t('settings.voice_hotwords_project_label', { project: selectedProjectLabel })
                 : t('settings.voice_hotwords_project_empty_title')}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              {projectOptions.length > 1 && (
+              {(projectOptions.length > 1 || (!selectedProject && projectOptions.length > 0)) && (
                 <select
                   aria-label={t('settings.voice_hotwords_project_select')}
                   data-testid="voice-hotwords-project-select"
@@ -133,8 +164,13 @@ export function VoiceHotwordsSection({ currentProjectName }: Props) {
                     fontSize: '12px',
                   }}
                 >
+                  {!selectedProject && (
+                    <option value="">{t('settings.voice_hotwords_project_empty_title')}</option>
+                  )}
                   {projectOptions.map((key) => (
-                    <option key={key} value={key} selected={selectedProject === key}>{key}</option>
+                    <option key={key} value={key} selected={selectedProject === key}>
+                      {formatVoiceHotwordProjectLabel(key, serverNamesById)}
+                    </option>
                   ))}
                 </select>
               )}

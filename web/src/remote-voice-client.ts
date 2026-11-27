@@ -543,6 +543,7 @@ export interface StartRemoteVoiceSessionOptions {
   targetDeviceId: string;
   locale?: string;
   hotwords?: string[];
+  allowSharedHotwords?: boolean;
   onResult: (text: string, isFinal: boolean) => void;
   onLevel?: (level: number) => void;
   onCaptureStarted?: (handle: ActiveRemoteVoiceSessionHandle) => void;
@@ -1867,6 +1868,7 @@ export async function startRemoteVoiceSession(
           targetDeviceId: opts.targetDeviceId,
           ...(opts.locale ? { locale: opts.locale } : {}),
           ...(opts.hotwords && opts.hotwords.length > 0 ? { hotwords: opts.hotwords } : {}),
+          ...(opts.allowSharedHotwords === true ? { allowSharedHotwords: true } : {}),
           sampleRate: REMOTE_VOICE_SAMPLE_RATE,
         }));
       } catch {

@@ -1,6 +1,12 @@
 import { R2RelayToggle } from './components/R2RelayToggle.js';
 import { isPresetCompatibleCrossSdkSwitch } from './components/quick-sdk-model.js';
-import { setActiveVoiceHotwordProject } from './voice-hotwords.js';
+import {
+  encodeVoiceHotwordProjectKey,
+  registerOpenVoiceHotwordsSettingsHandler,
+  setActiveVoiceHotwordProject,
+  setVoiceHotwordsAuthScope,
+  type VoiceHotwordProjectInput,
+} from './voice-hotwords.js';
 import { setFileRelayUser, setServerR2RelayEnabled } from './r2-relay-preference.js';
 import { suppressHoverPreviewsUntilPointerMove } from './hover-preview-gate.js';
 import { DesktopAuthBridge } from './pages/DesktopAuthBridge.js';
@@ -3573,6 +3579,11 @@ function InternalMainApp() {
   // ── Settings / Admin ────────────────────────────────────────────────────────
   const [showDownloadsModal, setShowDownloadsModal] = useState(false);
   const [showSettingsPage, setShowSettingsPage] = useState(false);
+  const [settingsFocusTarget, setSettingsFocusTarget] = useState<{
+    section: 'voice-hotwords';
+    projectKey?: VoiceHotwordProjectInput;
+    token: number;
+  } | null>(null);
   const [showUsageSummaryPage, setShowUsageSummaryPage] = useState(false);
   const [showCronManager, setShowCronManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
@@ -10563,9 +10574,42 @@ function InternalMainApp() {
     const parentMain = activeSub ? sessions.find((s) => s.name === activeSub.parentSession) : null;
     return activeMain?.project ?? parentMain?.project ?? sessions[0]?.project ?? null;
   }, [activeSession, sessions, subSessionsSlim]);
+  const activeSessionProject = useMemo(() => {
+    if (!activeSession) return null;
+    const activeSub = subSessionsSlim.find((s) => s.sessionName === activeSession);
+    const activeMain = sessions.find((s) => s.name === activeSession);
+    const parentMain = activeSub ? sessions.find((s) => s.name === activeSub.parentSession) : null;
+    return activeMain?.project ?? parentMain?.project ?? null;
+  }, [activeSession, sessions, subSessionsSlim]);
+  const activeVoiceHotwordProjectKey = useMemo(
+    () => (activeSessionProject ? encodeVoiceHotwordProjectKey(activeSessionProject, selectedServerId) : null),
+    [activeSessionProject, selectedServerId],
+  );
+  const voiceHotwordServerNamesById = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const srv of unifiedServers) {
+      if (srv.id && srv.name) {
+        map[srv.id] = srv.name;
+      }
+    }
+    return map;
+  }, [unifiedServers]);
   useEffect(() => {
-    setActiveVoiceHotwordProject(cronProject);
-  }, [cronProject]);
+    setVoiceHotwordsAuthScope(auth ? { userId: auth.userId, baseUrl: auth.baseUrl } : null);
+  }, [auth]);
+  useEffect(() => {
+    setActiveVoiceHotwordProject(activeVoiceHotwordProjectKey);
+  }, [activeVoiceHotwordProjectKey]);
+  useEffect(() => {
+    return registerOpenVoiceHotwordsSettingsHandler((projectKey) => {
+      setSettingsFocusTarget((prev) => ({
+        section: 'voice-hotwords',
+        projectKey: projectKey ?? null,
+        token: (prev?.token ?? 0) + 1,
+      }));
+      setShowSettingsPage(true);
+    });
+  }, []);
   const cronJobCount = useCronJobCount({
     enabled: Boolean(nativeReady && auth && selectedServerId),
     serverId: selectedServerId,
@@ -12411,10 +12455,16 @@ function InternalMainApp() {
             hasPassword={userHasPassword}
             isAdmin={isAdmin}
             serverUrl={auth?.baseUrl ?? nativeServerUrl}
-            activeProjectName={cronProject}
+            activeProjectName={activeSessionProject}
+            activeProjectKey={activeVoiceHotwordProjectKey}
+            serverNamesById={voiceHotwordServerNamesById}
+            focusTarget={settingsFocusTarget}
             shortcutOverrides={shortcutOverrides}
             onChangeShortcutOverrides={setShortcutOverrides}
-            onBack={() => setShowSettingsPage(false)}
+            onBack={() => {
+              setShowSettingsPage(false);
+              setSettingsFocusTarget(null);
+            }}
             onDisplayNameChanged={(name) => setUserDisplayName(name)}
             onUserAuthUpdated={(next) => {
               setUsername(next.username);

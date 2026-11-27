@@ -31,7 +31,12 @@ import {
 } from '../voice-recognition-backend.js';
 import type { RemoteVoiceProviderInfo } from '@shared/remote-voice.js';
 import { applyVoiceHotwordPostProcess, type CompiledVoiceHotwords } from '@shared/voice-hotwords.js';
-import { getCompiledVoiceHotwordsForProject, resolveRemoteVoiceHotwordsForProvider } from '../voice-hotwords.js';
+import {
+  getCompiledVoiceHotwordsForProject,
+  getShareHotwordsWithOthers,
+  resolveRemoteVoiceHotwordsForProvider,
+  type VoiceHotwordProjectInput,
+} from '../voice-hotwords.js';
 import type { PluginListenerHandle } from '@capacitor/core';
 import {
   getPcAppBridge,
@@ -365,6 +370,7 @@ interface NativeSession {
   deferAudioPause: boolean;
   captureStarted: boolean;
   startInvoked: boolean;
+  startedHotwordsKey?: string;
   abortPendingStart?: (() => void) | null;
   handles: PluginListenerHandle[];
 }
@@ -1575,6 +1581,18 @@ export async function ensureNativeMicPermissionForHold(): Promise<{ granted: boo
   }
 }
 
+function serializeHotwordsTerms(terms: readonly string[] | undefined): string {
+  return terms && terms.length > 0 ? terms.join('\u0000') : '';
+}
+
+function canAcceptHotwordsForRecognition(recognition: NativeSpeechRecognition | undefined): boolean {
+  if (!recognition) return false;
+  if (isPcAppNativeSpeech()) return true;
+  return isStreamingSpeechAvailable()
+    && getVoiceRecognitionEngine() !== 'system'
+    && recognition !== getPlatformFallbackSpeechRecognition();
+}
+
 async function startListeningInternal(session: NativeSession): Promise<boolean> {
   const { generation } = session;
   const primaryRecognition = session.recognition;
@@ -1829,10 +1847,8 @@ async function startListeningInternal(session: NativeSession): Promise<boolean> 
 
     session.startInvoked = true;
     const ownerHotwords = session.owner.hotwords?.terms;
-    const canPassHotwords = isPcAppNativeSpeech()
-      || (isStreamingSpeechAvailable()
-        && getVoiceRecognitionEngine() !== 'system'
-        && recognition !== getPlatformFallbackSpeechRecognition());
+    const canPassHotwords = canAcceptHotwordsForRecognition(recognition);
+    session.startedHotwordsKey = serializeHotwordsTerms(canPassHotwords ? ownerHotwords : undefined);
     const initialStartOpts = {
       ...startOpts,
       ...(session.initialPcmBase64 && (isPcAppNativeSpeech() || recognition !== getPlatformFallbackSpeechRecognition())
@@ -2257,7 +2273,7 @@ function startWebListening(
  * activation across async modal opens or hold timers. Caller adopts via
  * `startListening()` or aborts cleanly via `cancelWebGesturePrime()`.
  */
-export function primeWebGesture(options?: { deferAudioPause?: boolean }): boolean {
+export function primeWebGesture(options?: { deferAudioPause?: boolean; projectKey?: VoiceHotwordProjectInput }): boolean {
   if (isNative() || !isAvailable() || !getWebSpeechCtor()) return false;
   if (_pendingStop) return false;
   if (_webSession && !_webSession.retired && !_webSession.ended) {
@@ -2265,7 +2281,10 @@ export function primeWebGesture(options?: { deferAudioPause?: boolean }): boolea
   }
   if (_listening) return false;
   const noop = () => {};
-  const primedOwner = createCaptureOwner(noop, noop, noop);
+  const compiledHotwords = options && 'projectKey' in options
+    ? getCompiledVoiceHotwordsForProject(options.projectKey ?? null)
+    : getCompiledVoiceHotwordsForProject();
+  const primedOwner = createCaptureOwner(noop, noop, noop, compiledHotwords);
   claimActiveOwner(primedOwner);
   return startWebListening(primedOwner, {
     primed: true,
@@ -2294,7 +2313,7 @@ export function cancelWebGesturePrime(): void {
   }
 }
 
-function primeNativeGesture(options?: { deferAudioPause?: boolean }): boolean {
+function primeNativeGesture(options?: { deferAudioPause?: boolean; projectKey?: VoiceHotwordProjectInput }): boolean {
   if (!isNative() || !isAvailable()) return false;
   if (_pendingStop) return false;
   if (_nativeSession && !_nativeSession.retired && !_nativeSession.aborted) {
@@ -2313,7 +2332,10 @@ function primeNativeGesture(options?: { deferAudioPause?: boolean }): boolean {
 
   _primedOutcome = null;
   const noop = () => {};
-  const primedOwner = createCaptureOwner(noop, noop, noop);
+  const compiledHotwords = options && 'projectKey' in options
+    ? getCompiledVoiceHotwordsForProject(options.projectKey ?? null)
+    : getCompiledVoiceHotwordsForProject();
+  const primedOwner = createCaptureOwner(noop, noop, noop, compiledHotwords);
   claimActiveOwner(primedOwner);
   const generation = ++_generation;
   const session: NativeSession = {
@@ -2380,7 +2402,7 @@ export function needsPointerDownGesturePrime(): boolean {
  * so hold-to-talk captures the first syllable immediately with zero timer delay.
  * Caller adopts via `startListening()` or aborts silently via `cancelVoiceGesturePrime()`.
  */
-export function primeVoiceGesture(options?: { deferAudioPause?: boolean }): boolean {
+export function primeVoiceGesture(options?: { deferAudioPause?: boolean; projectKey?: VoiceHotwordProjectInput }): boolean {
   if (!isAvailable()) return false;
   if (hasOnlinePrimaryRemoteProvider()) {
     return primeRemoteVoiceCapture();
@@ -2678,7 +2700,7 @@ function beginPendingRemoteStop(
 }
 
 export interface StartListeningOptions {
-  projectKey?: string | null;
+  projectKey?: VoiceHotwordProjectInput;
 }
 
 export async function startListening(
@@ -2687,7 +2709,9 @@ export async function startListening(
   onError?: (error: string) => void,
   options?: StartListeningOptions,
 ): Promise<boolean> {
-  const compiledHotwords = getCompiledVoiceHotwordsForProject(options?.projectKey);
+  const compiledHotwords = options && 'projectKey' in options
+    ? getCompiledVoiceHotwordsForProject(options.projectKey ?? null)
+    : getCompiledVoiceHotwordsForProject();
   const remotePrimary = getRemoteVoiceState().primaryDeviceId;
   if (!isAvailable() && !remotePrimary) {
     const msg = 'Speech recognition is not available';
@@ -2933,12 +2957,14 @@ export async function startListening(
         ? eager.failedReason
         : null;
       const remoteHotwords = resolveRemoteVoiceHotwordsForProvider(route.provider, compiledHotwords);
+      const allowSharedHotwords = getShareHotwordsWithOthers();
       const res = failedPermissionReason
         ? (cancelRemoteVoiceCapturePrime(), { ok: false as const, cancelled: false, reason: failedPermissionReason })
         : await startRemoteVoiceSession({
           targetDeviceId: route.targetDeviceId,
           locale: getVoiceLanguageMode() === 'auto' ? undefined : pickLocale(),
           ...(remoteHotwords ? { hotwords: remoteHotwords } : {}),
+          ...(allowSharedHotwords ? { allowSharedHotwords: true } : {}),
           signal: abortCtrl.signal,
           ...(route.provider.providerKind === 'http_asr'
             ? { stopDrainMs: REMOTE_VOICE_CLIENT_HTTP_ASR_STOP_DRAIN_MS }
@@ -3171,6 +3197,7 @@ export async function startListening(
         true,
         hadNotifiedListening,
         res.bufferedPcm,
+        compiledHotwords,
       );
     }
 
@@ -3375,6 +3402,48 @@ async function startLocalListening(
   const primedOutcome = consumePrimedOutcome(onResult, onListeningChange, onError, isFallback, hotwords);
   if (primedOutcome.handled) {
     return primedOutcome.started;
+  }
+
+  const preCheckAdoptable =
+    (_pendingStart && _pendingStart.generation === _generation && !_pendingStart.session.retired && !_pendingStart.session.aborted
+      ? _pendingStart.session
+      : null)
+    ?? (_nativeSession && !_nativeSession.retired && !_nativeSession.aborted && _nativeSession.generation === _generation
+      ? _nativeSession
+      : null)
+    ?? (_listening && _nativeSession && !_nativeSession.retired && !_nativeSession.aborted
+      ? _nativeSession
+      : null);
+
+  if (
+    preCheckAdoptable
+    && preCheckAdoptable.startInvoked
+    && preCheckAdoptable.startedHotwordsKey !== undefined
+  ) {
+    const requestedHotwordsKey = serializeHotwordsTerms(
+      canAcceptHotwordsForRecognition(preCheckAdoptable.recognition) ? hotwords?.terms : undefined,
+    );
+    if (preCheckAdoptable.startedHotwordsKey !== requestedHotwordsKey) {
+      // Mismatched native capture (e.g., primed before final project hotwords resolved):
+      // end the mismatched capture cleanly without tearing down prewarm/model caches, then restart below.
+      const mismatchStartPromise = _pendingStart?.session === preCheckAdoptable ? _pendingStart.promise : null;
+      if (_pendingStart?.session === preCheckAdoptable) {
+        _pendingStart = null;
+      }
+      await beginNativeSessionAbort(
+        preCheckAdoptable,
+        mismatchStartPromise,
+        !preCheckAdoptable.stopStarted,
+      );
+      if (startIntent < _lastStopIntent) {
+        if (alreadyNotifiedListening) {
+          _listening = false;
+          syncTtsVoiceSuppression();
+          onListeningChange?.(false);
+        }
+        return false;
+      }
+    }
   }
 
   const owner = createCaptureOwner(onResult, onListeningChange, onError, hotwords);

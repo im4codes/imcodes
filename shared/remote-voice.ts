@@ -151,6 +151,7 @@ export type RemoteVoiceSessionStartFrame = {
   locale?: string;
   sampleRate: number;
   hotwords?: string[];
+  allowSharedHotwords?: boolean;
 };
 
 export type RemoteVoiceSessionAudioFrame = {
@@ -552,6 +553,9 @@ export function parseRemoteVoiceInboundFrame(
       if (!parsedHotwords.ok) {
         return { ok: false, sessionId, code: REMOTE_VOICE_ERROR_CODES.INVALID_FRAME, message: parsedHotwords.message };
       }
+      if (rec.allowSharedHotwords !== undefined && typeof rec.allowSharedHotwords !== 'boolean') {
+        return { ok: false, sessionId, code: REMOTE_VOICE_ERROR_CODES.INVALID_FRAME, message: 'Invalid allowSharedHotwords' };
+      }
       return {
         ok: true,
         frame: {
@@ -561,6 +565,7 @@ export function parseRemoteVoiceInboundFrame(
           ...(locale ? { locale } : {}),
           sampleRate: REMOTE_VOICE_SAMPLE_RATE,
           ...(parsedHotwords.hotwords ? { hotwords: parsedHotwords.hotwords } : {}),
+          ...(rec.allowSharedHotwords === true ? { allowSharedHotwords: true } : {}),
         },
       };
     }

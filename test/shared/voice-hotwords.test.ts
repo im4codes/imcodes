@@ -91,19 +91,41 @@ describe('shared voice hotwords', () => {
     expect(applyVoiceHotwordPostProcess('compile c++ and check foo.bar[0] output', compiled))
       .toBe('compile C++ and check foo.bar[0] output');
 
-    // URLs, dotted domains/files, and snake/slash identifiers are untouched
+    // URLs (including parenthesized paths with CJK), inline/fenced code, and compound identifiers are untouched
     expect(
       applyVoiceHotwordPostProcess(
-        'Visit https://worktree.example.com/imcodes/codex-sdk or open src/worktree_dir/im.codes.ts',
+        'Visit https://worktree.example.com/wiki/Foo_(WorkTree)/爱码 and [doc](https://example.com/imcodes_(CODEX-SDK)/爱码) or check `WorkTree` and ```ts\nconst x = "爱码 WorkTree";\n``` plus src/worktree_dir/im.codes.ts',
         compiled,
       ),
-    ).toBe('Visit https://worktree.example.com/imcodes/codex-sdk or open src/worktree_dir/im.codes.ts');
+    ).toBe(
+      'Visit https://worktree.example.com/wiki/Foo_(WorkTree)/爱码 and [doc](https://example.com/imcodes_(CODEX-SDK)/爱码) or check `WorkTree` and ```ts\nconst x = "爱码 WorkTree";\n``` plus src/worktree_dir/im.codes.ts',
+    );
   });
 
-  it('completes 60 rules across 500+ chars in well under 1ms', () => {
+  it('prevents global aliases from overriding project canonical terms and handles long lines linearly', () => {
+    const compiled = mergeVoiceHotwords({
+      projectRaw: 'IM.codes\nWorkTree',
+      globalRaw: 'im.codes => WrongGlobal\nworktree => BadTree\n爱码 => IM.codes',
+    });
+
+    expect(applyVoiceHotwordPostProcess('Please check im.codes and worktree via 爱码 today.', compiled))
+      .toBe('Please check IM.codes and WorkTree via IM.codes today.');
+
+    // Pathological long line with repeated arrows / unpaired backticks finishes well within budget
+    const pathological = `${'a '.repeat(4000)} ${'`'.repeat(500)} not_an_arrow => x`;
+    const parsed = parseVoiceHotwordsInput(pathological);
+    expect(parsed.terms.length).toBeLessThanOrEqual(1);
+    const t0 = performance.now();
+    const out = applyVoiceHotwordPostProcess(pathological, compiled);
+    expect(performance.now() - t0).toBeLessThan(15);
+    expect(out).toBe(pathological);
+  });
+
+  it('completes 60 rules across >=500 chars in well under 1ms', () => {
     const rules = Array.from({ length: 60 }, (_, i) => `wrongterm${i} => CorrectTerm_${i}`).join('\n');
     const compiled = mergeVoiceHotwords({ projectRaw: rules });
-    const text = '请帮我检查 wrongterm0 和 wrongterm15 以及 wrongterm59 在这个项目里的运行情况，还有其它无关内容重复拼接。'.repeat(6);
+    const text = '请帮我检查 wrongterm0 和 wrongterm15 以及 wrongterm59 在这个项目里的运行情况，还有其它无关内容重复拼接。'.repeat(11);
+    expect(text.length).toBeGreaterThanOrEqual(500);
 
     // Warm regex cache once, then measure execution
     const out = applyVoiceHotwordPostProcess(text, compiled);

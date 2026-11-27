@@ -40,6 +40,7 @@ import {
 } from '../tts.js';
 import { TtsQuickSettingsPopover } from './TtsQuickSettingsPopover.js';
 import { VoiceOverlay } from './VoiceOverlay.js';
+import { encodeVoiceHotwordProjectKey } from '../voice-hotwords.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { formatTaskDuration, type ElapsedDurationUnits } from '../util/tool-duration.js';
 import {
@@ -2324,7 +2325,9 @@ export function GlobalTaskModeView({
           open
           autoStartListening
           initialText={voiceTarget.initialText ?? ''}
-          projectKey={voiceTarget.projectName ?? null}
+          projectKey={voiceTarget.projectName
+            ? encodeVoiceHotwordProjectKey(voiceTarget.projectName, voiceTarget.serverId)
+            : null}
           sessionLabel={voiceTarget.taskTitle
             ? `${voiceTarget.serverName} · ${voiceTarget.label} · ${voiceTarget.taskTitle}`
             : `${voiceTarget.serverName} · ${voiceTarget.label}`}

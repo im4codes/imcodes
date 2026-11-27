@@ -12,18 +12,25 @@ import ko from '../src/i18n/locales/ko.json';
 import es from '../src/i18n/locales/es.json';
 import ru from '../src/i18n/locales/ru.json';
 import {
+  encodeVoiceHotwordProjectKey,
   getCompiledVoiceHotwordsForProject,
   getGlobalVoiceHotwordsRaw,
   getProjectVoiceHotwordsRaw,
   getShareHotwordsWithOthers,
+  registerOpenVoiceHotwordsSettingsHandler,
+  resetVoiceHotwordsScopeForTesting,
   resolveRemoteVoiceHotwordsForProvider,
   setActiveVoiceHotwordProject,
   setGlobalVoiceHotwordsRaw,
   setProjectVoiceHotwordsRaw,
   setShareHotwordsWithOthers,
+  setVoiceHotwordsAuthScope,
   shouldSendRemoteVoiceHotwords,
+  type VoiceHotwordProjectInput,
 } from '../src/voice-hotwords.js';
 import { VoiceHotwordsSection } from '../src/components/VoiceHotwordsSection.js';
+import { VoiceOverlay } from '../src/components/VoiceOverlay.js';
+import { SettingsPage } from '../src/pages/SettingsPage.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -37,14 +44,15 @@ vi.mock('react-i18next', () => ({
 
 describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
   beforeEach(() => {
+    cleanup();
     localStorage.clear();
-    setActiveVoiceHotwordProject(null);
+    resetVoiceHotwordsScopeForTesting();
   });
 
   afterEach(() => {
     cleanup();
     localStorage.clear();
-    setActiveVoiceHotwordProject(null);
+    resetVoiceHotwordsScopeForTesting();
   });
 
   it('isolates hotwords per project, merges with global (project priority), and gates cross-account sharing by default', () => {
@@ -124,6 +132,104 @@ describe('web voice hotwords store, privacy gate, UI, and i18n parity', () => {
         expect(typeof settings[key], `${locale}.settings.${key}`).toBe('string');
         expect(String(settings[key]).trim().length, `${locale}.settings.${key} non-empty`).toBeGreaterThan(0);
       }
+    }
+  });
+
+  it('isolates global/project hotwords and consent across same-origin accounts (A -> B -> A), cross-server same-named projects, and explicit no-project entries', () => {
+    const origin = 'https://app.im.codes';
+    // Account A signs in
+    setVoiceHotwordsAuthScope({ userId: 'user-a', baseUrl: origin });
+    setGlobalVoiceHotwordsRaw('GlobalA');
+    setShareHotwordsWithOthers(true);
+    const srv1Proj = encodeVoiceHotwordProjectKey('codedeck', 'srv-1')!;
+    const srv2Proj = encodeVoiceHotwordProjectKey('codedeck', 'srv-2')!;
+    setProjectVoiceHotwordsRaw(srv1Proj, 'ServerOneTerm');
+    setProjectVoiceHotwordsRaw(srv2Proj, 'ServerTwoTerm');
+    setActiveVoiceHotwordProject(srv1Proj);
+
+    expect(getCompiledVoiceHotwordsForProject(srv1Proj).terms).toEqual(['ServerOneTerm', 'GlobalA']);
+    expect(getCompiledVoiceHotwordsForProject(srv2Proj).terms).toEqual(['ServerTwoTerm', 'GlobalA']);
+    // Explicit no-project (`null`) MUST ignore _activeProjectKey and return only scoped global terms
+    expect(getCompiledVoiceHotwordsForProject(null).terms).toEqual(['GlobalA']);
+
+    // Logout deactivates previous account state immediately
+    setVoiceHotwordsAuthScope(null);
+    expect(getGlobalVoiceHotwordsRaw()).toBe('');
+    expect(getShareHotwordsWithOthers()).toBe(false);
+    expect(getCompiledVoiceHotwordsForProject(srv1Proj).terms).toEqual([]);
+
+    // Switch on same origin to Account B -> zero inheritance from A
+    setVoiceHotwordsAuthScope({ userId: 'user-b', baseUrl: origin });
+    expect(getGlobalVoiceHotwordsRaw()).toBe('');
+    expect(getShareHotwordsWithOthers()).toBe(false);
+    expect(getProjectVoiceHotwordsRaw(srv1Proj)).toBe('');
+    expect(getCompiledVoiceHotwordsForProject(srv1Proj).terms).toEqual([]);
+    setGlobalVoiceHotwordsRaw('GlobalB');
+    expect(getCompiledVoiceHotwordsForProject(null).terms).toEqual(['GlobalB']);
+
+    // Switch back to Account A -> A's global, multi-server project hotwords, and consent are restored
+    setVoiceHotwordsAuthScope({ userId: 'user-a', baseUrl: origin });
+    expect(getGlobalVoiceHotwordsRaw()).toBe('GlobalA');
+    expect(getShareHotwordsWithOthers()).toBe(true);
+    expect(getCompiledVoiceHotwordsForProject(srv1Proj).terms).toEqual(['ServerOneTerm', 'GlobalA']);
+    expect(getCompiledVoiceHotwordsForProject(srv2Proj).terms).toEqual(['ServerTwoTerm', 'GlobalA']);
+  });
+
+  it('opens SettingsPage VoiceHotwordsSection preselected for the current VoiceOverlay project', async () => {
+    setVoiceHotwordsAuthScope({ userId: 'user-nav', baseUrl: 'https://nav.example' });
+    const srv1Proj = encodeVoiceHotwordProjectKey('my-app', 'srv-mac')!;
+    const srv2Proj = encodeVoiceHotwordProjectKey('my-app', 'srv-win')!;
+    setProjectVoiceHotwordsRaw(srv1Proj, 'MacTerm');
+    setProjectVoiceHotwordsRaw(srv2Proj, 'WinTerm');
+
+    let openedTarget: { section: 'voice-hotwords'; projectKey?: VoiceHotwordProjectInput; token: number } | null = null;
+    const unregister = registerOpenVoiceHotwordsSettingsHandler((projectKey) => {
+      openedTarget = { section: 'voice-hotwords', projectKey: projectKey ?? null, token: 1 };
+    });
+
+    try {
+      const onClose = vi.fn();
+      const overlay = render(
+        h(VoiceOverlay, {
+          open: true,
+          autoStartListening: false,
+          projectKey: srv2Proj,
+          onClose,
+          onSend: () => 'accepted',
+        }),
+      );
+
+      const hwBtn = overlay.getByTestId('voice-overlay-hotwords-btn');
+      fireEvent.click(hwBtn);
+      expect(onClose).toHaveBeenCalledTimes(1);
+      expect(openedTarget).toEqual({ section: 'voice-hotwords', projectKey: srv2Proj, token: 1 });
+      overlay.unmount();
+
+      render(
+        h(SettingsPage, {
+          displayName: 'Nav User',
+          username: 'nav',
+          hasPassword: true,
+          initialTab: 'security',
+          focusTarget: openedTarget,
+          serverNamesById: { 'srv-mac': 'Mac Studio', 'srv-win': 'Win Box' },
+          onBack: () => {},
+          onDisplayNameChanged: () => {},
+          onUserAuthUpdated: () => {},
+        }),
+      );
+
+      await waitFor(() => {
+        const input = screen.getByTestId('voice-hotwords-project-input') as HTMLTextAreaElement;
+        expect(input.value).toBe('WinTerm');
+      });
+      const select = screen.getByTestId('voice-hotwords-project-select') as HTMLSelectElement;
+      expect([...select.options].map((o) => o.textContent)).toEqual([
+        'my-app · Mac Studio',
+        'my-app · Win Box',
+      ]);
+    } finally {
+      unregister();
     }
   });
 });

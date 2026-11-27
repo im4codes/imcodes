@@ -2408,4 +2408,61 @@ describe('Web Mobile final drain', () => {
     }
   });
 
+  it('passes project hotwords during warm-cache prime and restarts mismatched native capture cleanly without clearing prewarm', async () => {
+    const origCap = (globalThis as any).Capacitor;
+    (globalThis as any).Capacitor = {
+      isNativePlatform: () => true,
+      isPluginAvailable: () => true,
+      getPlatform: () => 'ios',
+    };
+    const hotwordsMod = await import('../../src/voice-hotwords.js');
+    hotwordsMod.resetVoiceHotwordsScopeForTesting();
+    hotwordsMod.setProjectVoiceHotwordsRaw('proj-a', 'AlphaTerm\nalpha term => AlphaTerm');
+    hotwordsMod.setProjectVoiceHotwordsRaw('proj-b', 'BetaTerm\nbeta term => BetaTerm');
+
+    try {
+      await VoiceInput.prewarm({ requestPermission: false });
+      streamingApi.checkPermissions.mockClear();
+      streamingApi.requestPermissions.mockClear();
+      streamingApi.available.mockClear();
+
+      // 1. Prime with proj-a: StreamingSpeech.start receives proj-a hotwords immediately.
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true, projectKey: 'proj-a' })).toBe(true);
+      await waitFor(() => expect(streamingApi.start).toHaveBeenCalledTimes(1));
+      expect(streamingApi.start.mock.calls[0]?.[0]).toMatchObject({ hotwords: ['AlphaTerm'] });
+
+      // Adopt with matching proj-a: reuses primed session with zero restart, and applies proj-a post-processing.
+      const resA = vi.fn();
+      await expect(VoiceInput.startListening(resA, undefined, undefined, { projectKey: 'proj-a' })).resolves.toBe(true);
+      expect(streamingApi.start).toHaveBeenCalledTimes(1);
+      listeners.partialResults?.({ matches: ['check alpha term now'], isFinal: true });
+      expect(resA).toHaveBeenLastCalledWith('check AlphaTerm now', true);
+      await VoiceInput.stopListening({ abort: true });
+
+      // 2. Prime without project (empty/global) while native start fires, then adopt with proj-b:
+      //    must stop the mismatched primed capture and restart native start with proj-b hotwords
+      //    without clearing prewarm / re-calling requestPermissions or available.
+      streamingApi.start.mockClear();
+      streamingApi.stop.mockClear();
+      expect(VoiceInput.primeVoiceGesture({ deferAudioPause: true, projectKey: null })).toBe(true);
+      await waitFor(() => expect(streamingApi.start).toHaveBeenCalledTimes(1));
+      expect(streamingApi.start.mock.calls[0]?.[0]?.hotwords).toBeUndefined();
+
+      const resB = vi.fn();
+      await expect(VoiceInput.startListening(resB, undefined, undefined, { projectKey: 'proj-b' })).resolves.toBe(true);
+      expect(streamingApi.stop).toHaveBeenCalledTimes(1);
+      expect(streamingApi.start).toHaveBeenCalledTimes(2);
+      expect(streamingApi.start.mock.calls[1]?.[0]).toMatchObject({ hotwords: ['BetaTerm'] });
+      expect(streamingApi.requestPermissions).not.toHaveBeenCalled();
+      expect(streamingApi.available).not.toHaveBeenCalled();
+      listeners.partialResults?.({ matches: ['using beta term here'], isFinal: true });
+      expect(resB).toHaveBeenLastCalledWith('using BetaTerm here', true);
+
+      await VoiceInput.stopListening({ abort: true });
+    } finally {
+      hotwordsMod.resetVoiceHotwordsScopeForTesting();
+      (globalThis as any).Capacitor = origCap;
+    }
+  });
+
 });

@@ -895,7 +895,7 @@ export class RemoteVoiceHub {
   private async startSession(
     clientWs: WebSocket,
     clientUserId: string,
-    frame: { sessionId: string; targetDeviceId: string; locale?: string; sampleRate: number; hotwords?: string[] },
+    frame: { sessionId: string; targetDeviceId: string; locale?: string; sampleRate: number; hotwords?: string[]; allowSharedHotwords?: boolean },
   ): Promise<void> {
     if (this.sessions.has(frame.sessionId)) {
       safeSendWs(clientWs, {
@@ -979,6 +979,12 @@ export class RemoteVoiceHub {
       return;
     }
 
+    const isOwnProvider = provider.userId === clientUserId;
+    const canForwardHotwords = isOwnProvider || frame.allowSharedHotwords === true;
+    const effectiveHotwords = canForwardHotwords && frame.hotwords && frame.hotwords.length > 0
+      ? [...frame.hotwords]
+      : undefined;
+
     const session: ActiveVoiceSession = {
       sessionId: frame.sessionId,
       kind: 'pc_app',
@@ -992,7 +998,7 @@ export class RemoteVoiceHub {
       readyTimer: null,
       idleTimer: null,
       durationTimer: null,
-      ...(frame.hotwords && frame.hotwords.length > 0 ? { hotwords: [...frame.hotwords] } : {}),
+      ...(effectiveHotwords ? { hotwords: effectiveHotwords } : {}),
     };
     provider.activeSessionId = frame.sessionId;
     this.sessions.set(frame.sessionId, session);
@@ -1022,7 +1028,7 @@ export class RemoteVoiceHub {
       sessionId: frame.sessionId,
       ...(frame.locale ? { locale: frame.locale } : {}),
       sampleRate: frame.sampleRate,
-      ...(frame.hotwords && frame.hotwords.length > 0 ? { hotwords: frame.hotwords } : {}),
+      ...(effectiveHotwords ? { hotwords: effectiveHotwords } : {}),
     });
   }
 

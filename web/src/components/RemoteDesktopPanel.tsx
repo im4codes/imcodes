@@ -4806,7 +4806,7 @@ export function RemoteDesktopPanel({
                       event.preventDefault();
                       event.stopPropagation();
                       releaseCapturedInput();
-                      VoiceInput.primeVoiceGesture?.({ deferAudioPause: false });
+                      VoiceInput.primeVoiceGesture?.({ deferAudioPause: false, projectKey: null });
                       setRemoteVoiceOpen(true);
                     }}
                     onKeyDown={(event) => event.stopPropagation()}
@@ -5455,6 +5455,7 @@ export function RemoteDesktopPanel({
               return 'accepted';
             }}
             autoStartListening={true}
+            projectKey={null}
             sessionLabel={machine.displayName}
           />
         )}
