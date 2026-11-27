@@ -15,7 +15,13 @@ export type PortForwardClusterStatus = 'preparing' | 'connecting' | 'active' | '
 
 export type PortForwardRelayHop = 'to_coordinator' | 'to_endpoint';
 
-export type PortForwardRemoteCloseAckOutcome = 'confirmed' | 'timed_out' | 'missing';
+export type PortForwardRemoteCloseAckOutcome = 'confirmed' | 'timed_out' | 'missing' | 'error';
+
+export type PortForwardCoordinatorAdoptResult =
+  | { outcome: 'adopted'; record: PortForwardClusterTunnelRecord }
+  | { outcome: 'already_closed' }
+  | { outcome: 'lost_race'; record: PortForwardClusterTunnelRecord }
+  | { outcome: 'not_found' };
 
 export interface PortForwardEndpointPresence {
   serverId: string;
@@ -133,6 +139,13 @@ export interface PortForwardClusterStore {
     >>,
   ): Promise<void>;
   markTunnelClosed(tunnelId: string, updatedAt?: number): Promise<void>;
+  tryAdoptCoordinator(
+    tunnelId: string,
+    expectedCoordinatorPodId: string,
+    expectedUpdatedAt: number,
+    newCoordinatorPodId: string,
+    now?: number,
+  ): Promise<PortForwardCoordinatorAdoptResult>;
   getTunnel(tunnelId: string): Promise<PortForwardClusterTunnelRecord | null>;
   listActiveTunnels(userId: string, filterServerId?: string): Promise<PortForwardTunnelSummary[]>;
   listOpenTunnelsForUser(userId: string, filterServerId?: string): Promise<PortForwardClusterTunnelRecord[]>;
@@ -301,6 +314,25 @@ export class InMemoryPortForwardClusterStore implements PortForwardClusterStore 
       existing.updatedAt = updatedAt;
     }
     await this.cleanupTunnelMessages(tunnelId);
+  }
+
+  async tryAdoptCoordinator(
+    tunnelId: string,
+    expectedCoordinatorPodId: string,
+    expectedUpdatedAt: number,
+    newCoordinatorPodId: string,
+    now = Date.now(),
+  ): Promise<PortForwardCoordinatorAdoptResult> {
+    const existing = this.tunnels.get(tunnelId);
+    if (!existing) return { outcome: 'not_found' };
+    if (existing.status === 'closed') return { outcome: 'already_closed' };
+    if (existing.coordinatorPodId !== expectedCoordinatorPodId || existing.updatedAt !== expectedUpdatedAt) {
+      return { outcome: 'lost_race', record: { ...existing } };
+    }
+    existing.coordinatorPodId = newCoordinatorPodId;
+    existing.status = 'closing';
+    existing.updatedAt = Math.max(now, expectedUpdatedAt + 1);
+    return { outcome: 'adopted', record: { ...existing } };
   }
 
   async getTunnel(tunnelId: string): Promise<PortForwardClusterTunnelRecord | null> {
@@ -847,6 +879,40 @@ export class PostgresPortForwardClusterStore implements PortForwardClusterStore 
       [updatedAt, tunnelId],
     );
     await this.cleanupTunnelMessages(tunnelId);
+  }
+
+  async tryAdoptCoordinator(
+    tunnelId: string,
+    expectedCoordinatorPodId: string,
+    expectedUpdatedAt: number,
+    newCoordinatorPodId: string,
+    now = Date.now(),
+  ): Promise<PortForwardCoordinatorAdoptResult> {
+    const nextUpdatedAt = Math.max(now, expectedUpdatedAt + 1);
+    return this.db.transaction(async (tx): Promise<PortForwardCoordinatorAdoptResult> => {
+      const updated = await tx.queryOne<PgTunnelRow>(
+        `UPDATE port_forward_tunnels
+            SET coordinator_pod_id = $1,
+                status = 'closing',
+                updated_at = $2
+          WHERE tunnel_id = $3
+            AND coordinator_pod_id = $4
+            AND updated_at = $5
+            AND status <> 'closed'
+          RETURNING *`,
+        [newCoordinatorPodId, nextUpdatedAt, tunnelId, expectedCoordinatorPodId, expectedUpdatedAt],
+      );
+      if (updated) {
+        return { outcome: 'adopted', record: rowToTunnelRecord(updated) };
+      }
+      const current = await tx.queryOne<PgTunnelRow>(
+        `SELECT * FROM port_forward_tunnels WHERE tunnel_id = $1 LIMIT 1`,
+        [tunnelId],
+      );
+      if (!current) return { outcome: 'not_found' };
+      if (current.status === 'closed') return { outcome: 'already_closed' };
+      return { outcome: 'lost_race', record: rowToTunnelRecord(current) };
+    });
   }
 
   async getTunnel(tunnelId: string): Promise<PortForwardClusterTunnelRecord | null> {

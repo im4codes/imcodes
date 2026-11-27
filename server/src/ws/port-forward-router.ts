@@ -249,6 +249,7 @@ export class PortForwardRouter {
   private readonly ingressPressure = new Map<string, IngressSenderPressure>();
   private readonly authorizedRemoteRoutes = new Map<string, PortForwardClusterTunnelRecord>();
   private readonly closedDeliveryTombstones = new Set<string>();
+  private readonly inFlightAdoptions = new Map<string, Promise<{ confirmed: boolean; tunnelId: string }>>();
   private podId: string;
   private clusterStore: PortForwardClusterStore;
   private hasSharedClusterStore: boolean;
@@ -1052,9 +1053,27 @@ export class PortForwardRouter {
             () => sendAck(false, 'timed_out'),
           );
         } else {
+          const adopting = this.inFlightAdoptions.get(msg.tunnelId);
+          if (adopting) {
+            void adopting.then(
+              (res) => sendAck(res.confirmed, res.confirmed ? 'confirmed' : 'timed_out'),
+              () => sendAck(false, 'timed_out'),
+            );
+            return;
+          }
           void (async () => {
-            const record = await this.clusterStore.getTunnel(msg.tunnelId).catch(() => null);
-            if (!record || record.status === 'closed') {
+            let record: PortForwardClusterTunnelRecord | null;
+            try {
+              record = await this.clusterStore.getTunnel(msg.tunnelId);
+            } catch {
+              sendAck(false, 'error');
+              return;
+            }
+            if (!record) {
+              sendAck(false, 'error');
+              return;
+            }
+            if (record.status === 'closed') {
               sendAck(true, 'confirmed');
               return;
             }
@@ -1317,97 +1336,162 @@ export class PortForwardRouter {
       if (ack.ok) {
         return { confirmed: true, tunnelId: record.tunnelId };
       }
-      if (ack.outcome === 'timed_out') {
+      if (ack.outcome !== 'missing') {
         return { confirmed: false, tunnelId: record.tunnelId };
       }
     }
 
-    // Coordinator is absent or dead: adopt recovery ownership ONLY against the persisted bound pods/generations
-    // so an unrelated pod presence overwrite can NEVER confirm close while old sockets are still live.
-    const fresh = await this.clusterStore.getTunnel(record.tunnelId).catch(() => null);
-    if (!fresh) {
-      return { confirmed: false, tunnelId: record.tunnelId };
+    const existingAdoption = this.inFlightAdoptions.get(record.tunnelId);
+    if (existingAdoption) {
+      return existingAdoption;
     }
-    if (fresh.status === 'closed') {
-      return { confirmed: true, tunnelId: record.tunnelId };
-    }
-    if (allowRedirect
-      && fresh.coordinatorPodId
-      && fresh.coordinatorPodId !== record.coordinatorPodId
-      && fresh.coordinatorPodId !== this.podId) {
-      return this.closeTunnelRecordAndAwait(fresh, reason, false);
-    }
-    if (!fresh.listenPodId || !fresh.targetPodId) {
-      // Legacy record missing persisted pod bindings: never fabricate confirmation.
-      await this.clusterStore.updateTunnel(fresh.tunnelId, { status: 'closing' }).catch(() => {});
-      return { confirmed: false, tunnelId: fresh.tunnelId };
-    }
-    const adopted: ActiveServerTunnel = {
-      tunnelId: fresh.tunnelId,
-      userId: fresh.userId,
-      listenNode: fresh.listenNode,
-      listenServerId: fresh.listenServerId,
-      ...(fresh.listenNodeId ? { listenNodeId: fresh.listenNodeId } : {}),
-      listenPodId: fresh.listenPodId,
-      listenGeneration: fresh.listenGeneration,
-      requestedListenPort: fresh.requestedListenPort,
-      boundListenPort: fresh.boundListenPort,
-      targetNode: fresh.targetNode,
-      targetServerId: fresh.targetServerId,
-      ...(fresh.targetNodeId ? { targetNodeId: fresh.targetNodeId } : {}),
-      targetPodId: fresh.targetPodId,
-      targetGeneration: fresh.targetGeneration,
-      targetHost: fresh.targetHost,
-      targetPort: fresh.targetPort,
-      transportPref: fresh.transportPref,
-      transportMode: fresh.transportMode,
-      listenEstablishedMode: fresh.transportMode,
-      targetEstablishedMode: fresh.transportMode,
-      ...(fresh.label ? { label: fresh.label } : {}),
-      status: 'active',
-      listenReady: true,
-      listenCandidates: [],
-      listenPublicKey: null,
-      listenKeyProof: null,
-      listenIdentityPublicKey: null,
-      listenIdentitySignature: null,
-      targetReady: true,
-      targetCandidates: [],
-      targetPublicKey: null,
-      targetKeyProof: null,
-      targetIdentityPublicKey: null,
-      targetIdentitySignature: null,
-      connectDispatchedToListen: true,
-      l2tBackpressured: false,
-      t2lBackpressured: false,
-      l2tOutMemPaused: false,
-      l2tHop1Paused: false,
-      l2tHop2Paused: false,
-      t2lOutMemPaused: false,
-      t2lHop1Paused: false,
-      t2lHop2Paused: false,
-      activeConnections: fresh.activeConnections,
-      bytesSent: fresh.bytesSent,
-      bytesReceived: fresh.bytesReceived,
-      createdAt: fresh.createdAt,
-      expiresAt: fresh.expiresAt,
-      prepareTimer: null,
-      establishTimer: null,
-      ttlTimer: null,
-      closeAckTimer: null,
-      listenCloseState: 'pending',
-      targetCloseState: 'pending',
-      closeSettled: false,
-      closePromise: null,
-      resolveClose: null,
-      resolveOpen: null,
+
+    const runAdoption = async (): Promise<{ confirmed: boolean; tunnelId: string }> => {
+      // Coordinator is absent or dead: atomically adopt ownership via CAS against (coordinatorPodId, updatedAt).
+      // Any read/write failure or lost race NEVER assumes offline or builds a duplicate closing instance!
+      let fresh: PortForwardClusterTunnelRecord | null;
+      try {
+        fresh = await this.clusterStore.getTunnel(record.tunnelId);
+      } catch {
+        return { confirmed: false, tunnelId: record.tunnelId };
+      }
+      if (!fresh) {
+        return { confirmed: false, tunnelId: record.tunnelId };
+      }
+      if (fresh.status === 'closed') {
+        return { confirmed: true, tunnelId: record.tunnelId };
+      }
+      if (fresh.coordinatorPodId !== record.coordinatorPodId && fresh.coordinatorPodId !== this.podId) {
+        return allowRedirect
+          ? this.closeTunnelRecordAndAwait(fresh, reason, false)
+          : { confirmed: false, tunnelId: fresh.tunnelId };
+      }
+      if (!fresh.listenPodId || !fresh.targetPodId) {
+        await this.clusterStore.updateTunnel(fresh.tunnelId, { status: 'closing' }).catch(() => {});
+        return { confirmed: false, tunnelId: fresh.tunnelId };
+      }
+
+      let adoptRes;
+      try {
+        adoptRes = await this.clusterStore.tryAdoptCoordinator(
+          fresh.tunnelId,
+          fresh.coordinatorPodId,
+          fresh.updatedAt,
+          this.podId,
+        );
+      } catch {
+        return { confirmed: false, tunnelId: fresh.tunnelId };
+      }
+
+      if (adoptRes.outcome === 'already_closed') {
+        return { confirmed: true, tunnelId: fresh.tunnelId };
+      }
+      if (adoptRes.outcome === 'not_found') {
+        return { confirmed: false, tunnelId: fresh.tunnelId };
+      }
+      if (adoptRes.outcome === 'lost_race') {
+        const winner = adoptRes.record;
+        if (winner.coordinatorPodId === this.podId) {
+          const localWinner = this.tunnels.get(winner.tunnelId) ?? this.closingTunnels.get(winner.tunnelId);
+          if (localWinner) {
+            const settled = await this.failPendingOrCloseTunnel(
+              localWinner,
+              409,
+              PORT_FORWARD_ERRORS.TUNNEL_NOT_FOUND,
+              reason,
+            );
+            return { confirmed: settled.confirmed, tunnelId: winner.tunnelId };
+          }
+          return { confirmed: false, tunnelId: winner.tunnelId };
+        }
+        return allowRedirect
+          ? this.closeTunnelRecordAndAwait(winner, reason, false)
+          : { confirmed: false, tunnelId: winner.tunnelId };
+      }
+
+      const adoptedRecord = adoptRes.record;
+      const existingLocal = this.tunnels.get(adoptedRecord.tunnelId) ?? this.closingTunnels.get(adoptedRecord.tunnelId);
+      if (existingLocal) {
+        const settled = await this.failPendingOrCloseTunnel(
+          existingLocal,
+          409,
+          PORT_FORWARD_ERRORS.TUNNEL_NOT_FOUND,
+          reason,
+        );
+        return { confirmed: settled.confirmed, tunnelId: adoptedRecord.tunnelId };
+      }
+
+      const adopted: ActiveServerTunnel = {
+        tunnelId: adoptedRecord.tunnelId,
+        userId: adoptedRecord.userId,
+        listenNode: adoptedRecord.listenNode,
+        listenServerId: adoptedRecord.listenServerId,
+        ...(adoptedRecord.listenNodeId ? { listenNodeId: adoptedRecord.listenNodeId } : {}),
+        listenPodId: adoptedRecord.listenPodId,
+        listenGeneration: adoptedRecord.listenGeneration,
+        requestedListenPort: adoptedRecord.requestedListenPort,
+        boundListenPort: adoptedRecord.boundListenPort,
+        targetNode: adoptedRecord.targetNode,
+        targetServerId: adoptedRecord.targetServerId,
+        ...(adoptedRecord.targetNodeId ? { targetNodeId: adoptedRecord.targetNodeId } : {}),
+        targetPodId: adoptedRecord.targetPodId,
+        targetGeneration: adoptedRecord.targetGeneration,
+        targetHost: adoptedRecord.targetHost,
+        targetPort: adoptedRecord.targetPort,
+        transportPref: adoptedRecord.transportPref,
+        transportMode: adoptedRecord.transportMode,
+        listenEstablishedMode: adoptedRecord.transportMode,
+        targetEstablishedMode: adoptedRecord.transportMode,
+        ...(adoptedRecord.label ? { label: adoptedRecord.label } : {}),
+        status: 'active',
+        listenReady: true,
+        listenCandidates: [],
+        listenPublicKey: null,
+        listenKeyProof: null,
+        listenIdentityPublicKey: null,
+        listenIdentitySignature: null,
+        targetReady: true,
+        targetCandidates: [],
+        targetPublicKey: null,
+        targetKeyProof: null,
+        targetIdentityPublicKey: null,
+        targetIdentitySignature: null,
+        connectDispatchedToListen: true,
+        l2tBackpressured: false,
+        t2lBackpressured: false,
+        l2tOutMemPaused: false,
+        l2tHop1Paused: false,
+        l2tHop2Paused: false,
+        t2lOutMemPaused: false,
+        t2lHop1Paused: false,
+        t2lHop2Paused: false,
+        activeConnections: adoptedRecord.activeConnections,
+        bytesSent: adoptedRecord.bytesSent,
+        bytesReceived: adoptedRecord.bytesReceived,
+        createdAt: adoptedRecord.createdAt,
+        expiresAt: adoptedRecord.expiresAt,
+        prepareTimer: null,
+        establishTimer: null,
+        ttlTimer: null,
+        closeAckTimer: null,
+        listenCloseState: 'pending',
+        targetCloseState: 'pending',
+        closeSettled: false,
+        closePromise: null,
+        resolveClose: null,
+        resolveOpen: null,
+      };
+      const settled = await this.closeTunnelInternal(adopted, reason, true, true);
+      return { confirmed: settled.confirmed, tunnelId: adoptedRecord.tunnelId };
     };
-    await this.clusterStore.updateTunnel(fresh.tunnelId, {
-      coordinatorPodId: this.podId,
-      status: 'closing',
-    }).catch(() => {});
-    const settled = await this.closeTunnelInternal(adopted, reason, true, true);
-    return { confirmed: settled.confirmed, tunnelId: fresh.tunnelId };
+
+    const adoptionPromise = runAdoption().finally(() => {
+      if (this.inFlightAdoptions.get(record.tunnelId) === adoptionPromise) {
+        this.inFlightAdoptions.delete(record.tunnelId);
+      }
+    });
+    this.inFlightAdoptions.set(record.tunnelId, adoptionPromise);
+    return adoptionPromise;
   }
 
   async closeTunnelForUser(

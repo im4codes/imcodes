@@ -2515,4 +2515,187 @@ describe('server port-forward router & HTTP control plane', () => {
       expect(rebound.tunnel.listenPort).toBe(fixedPort);
     }
   });
+
+  it('never fakes close on restarted coordinator read failure or adoption write failure, and serializes concurrent cross-pod DELETEs via atomic CAS (R7 P0)', async () => {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const sListen = `r7_l_${suffix}`;
+    const sTarget = `r7_t_${suffix}`;
+    const baseStore = new InMemoryPortForwardClusterStore();
+    const origGetTunnel = baseStore.getTunnel.bind(baseStore);
+    const origTryAdopt = baseStore.tryAdoptCoordinator.bind(baseStore);
+
+    let failCoordinatorGetTunnel = false;
+    let coordinatorRestartedInstance = false;
+    let failAdoptWrite = false;
+    let slowAdoptMs = 0;
+
+    // Wrap clusterStore separately for the restarted coordinator vs adoption pods so we can inject exact storage faults!
+    const makeStoreProxy = (opts: { isRestartedCoord?: boolean } = {}): InMemoryPortForwardClusterStore =>
+      new Proxy(baseStore, {
+        get(target, prop, receiver) {
+          if (prop === 'getTunnel') {
+            return async (id: string) => {
+              if (opts.isRestartedCoord && failCoordinatorGetTunnel) {
+                throw new Error('simulated_db_read_error');
+              }
+              return origGetTunnel(id);
+            };
+          }
+          if (prop === 'tryAdoptCoordinator') {
+            return async (
+              tid: string,
+              expCoord: string,
+              expUpdated: number,
+              newCoord: string,
+              now?: number,
+            ) => {
+              if (failAdoptWrite) {
+                throw new Error('simulated_cas_write_error');
+              }
+              if (slowAdoptMs > 0) {
+                await new Promise((r) => setTimeout(r, slowAdoptMs));
+              }
+              return origTryAdopt(tid, expCoord, expUpdated, newCoord, now);
+            };
+          }
+          const value = Reflect.get(target, prop, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+
+    const bridgesA = new Map<string, PortForwardBridgeEndpoint>();
+    const bridgesT = new Map<string, PortForwardBridgeEndpoint>();
+
+    const podCoordLive = new PortForwardRouter({
+      podId: 'pod_r7_coord',
+      clusterStore: baseStore,
+      closeAckTimeoutMs: 60,
+      prepareTimeoutMs: 2_000,
+      establishTimeoutMs: 4_000,
+    });
+    const podA = new PortForwardRouter({ podId: 'pod_r7_a', clusterStore: baseStore, lookupBridge: (id) => bridgesA.get(id), closeAckTimeoutMs: 60 });
+    const podT = new PortForwardRouter({ podId: 'pod_r7_t', clusterStore: baseStore, lookupBridge: (id) => bridgesT.get(id), closeAckTimeoutMs: 60 });
+    const podFbX = new PortForwardRouter({ podId: 'pod_r7_fbx', clusterStore: makeStoreProxy(), closeAckTimeoutMs: 60 });
+    const podFbY = new PortForwardRouter({ podId: 'pod_r7_fby', clusterStore: makeStoreProxy(), closeAckTimeoutMs: 60 });
+
+    const idL = generateEndpointIdentityKeyPair();
+    const idT = generateEndpointIdentityKeyPair();
+    const trusted = new Map([[sListen, idL.publicKeyB64], [sTarget, idT.publicKeyB64]]);
+
+    const engA = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idL,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podA.handleDaemonMessage(sListen, 1, m)); },
+    });
+    const engT = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idT,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podT.handleDaemonMessage(sTarget, 1, m)); },
+    });
+
+    let podCoordRestarted: PortForwardRouter | undefined;
+    cleanups.push(async () => {
+      failCoordinatorGetTunnel = false;
+      failAdoptWrite = false;
+      slowAdoptMs = 0;
+      engA.closeAll();
+      engT.closeAll();
+      await podA.stopCluster();
+      await podT.stopCluster();
+      await podFbX.stopCluster();
+      await podFbY.stopCluster();
+      await podCoordRestarted?.stopCluster();
+      await podCoordLive.stopCluster();
+    });
+
+    let closeAttemptsToA = 0;
+    bridgesA.set(sListen, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => {
+        if (m.type === PORT_FORWARD_MSG.CLOSE) closeAttemptsToA += 1;
+        void engA.handleMessage(m);
+        return true;
+      },
+    });
+    bridgesT.set(sTarget, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => { void engT.handleMessage(m); return true; },
+    });
+    podA.onDaemonConnected(sListen, 1);
+    podT.onDaemonConnected(sTarget, 1);
+
+    const opened = await podCoordLive.openTunnel({
+      userId: 'user_r7',
+      listenNode: sListen,
+      listenServerId: sListen,
+      listenPort: 0,
+      targetNode: sTarget,
+      targetServerId: sTarget,
+      targetHost: '127.0.0.1',
+      targetPort: 9999,
+      ttlSeconds: 60,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const tid = opened.tunnel.tunnelId;
+    expect(engA.listTunnels()).toHaveLength(1);
+
+    // Replace pod_r7_coord's subscriber with a freshly restarted coordinator instance (same podId, empty memory, DB still active!).
+    podCoordRestarted = new PortForwardRouter({
+      podId: 'pod_r7_coord',
+      clusterStore: makeStoreProxy({ isRestartedCoord: true }),
+      closeAckTimeoutMs: 60,
+    });
+    coordinatorRestartedInstance = true;
+    void coordinatorRestartedInstance;
+
+    // 1. Coordinator DB read error on close_tunnel MUST return unconfirmed 504, persisted state MUST stay active, ZERO endpoints closed!
+    failCoordinatorGetTunnel = true;
+    const readErrClose = await podFbX.closeTunnelForUser('user_r7', tid);
+    expect(readErrClose.ok).toBe(false);
+    if (!readErrClose.ok) {
+      expect(readErrClose.status).toBe(504);
+      expect(readErrClose.unconfirmedTunnelIds).toEqual([tid]);
+    }
+    expect((await origGetTunnel(tid))?.status).toBe('active');
+    expect(engA.listTunnels()).toHaveLength(1);
+    expect(closeAttemptsToA).toBe(0);
+    failCoordinatorGetTunnel = false;
+
+    // 2. CAS takeover write failure MUST abort before constructing closing tunnel or sending CLOSE -> unconfirmed 504!
+    failAdoptWrite = true;
+    const writeErrClose = await podFbX.closeTunnelForUser('user_r7', tid);
+    expect(writeErrClose.ok).toBe(false);
+    if (!writeErrClose.ok) {
+      expect(writeErrClose.status).toBe(504);
+      expect(readErrClose.ok ? [] : writeErrClose.unconfirmedTunnelIds).toEqual([tid]);
+    }
+    expect((await origGetTunnel(tid))?.status).toBe('active');
+    expect(closeAttemptsToA).toBe(0);
+    expect(engA.listTunnels()).toHaveLength(1);
+    failAdoptWrite = false;
+
+    // 3. Concurrent cross-pod DELETEs race for CAS takeover: EXACTLY ONE winner adopts coordinatorPodId,
+    //    both receive clean confirmed close, endpoints receive single coordinated CLOSE & release cleanly!
+    (podCoordRestarted as unknown as { unsubscribeBus?: () => void }).unsubscribeBus?.();
+    slowAdoptMs = 15;
+    const [resX, resY] = await Promise.all([
+      podFbX.closeTunnelForUser('user_r7', tid),
+      podFbY.closeTunnelForUser('user_r7', tid),
+    ]);
+    expect(resX.ok).toBe(true);
+    expect(resY.ok).toBe(true);
+    expect(engA.listTunnels()).toHaveLength(0);
+    expect(engT.listTunnels()).toHaveLength(0);
+    expect((await origGetTunnel(tid))?.status).toBe('closed');
+    // Only ONE winner pod should have dispatched CLOSE to podA (loser followed winner rather than double-adopting).
+    expect(closeAttemptsToA).toBe(1);
+  });
 });
