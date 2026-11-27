@@ -617,4 +617,156 @@ describe('CursorHeadlessProvider', () => {
       else process.env.USERPROFILE = origUserProfile;
     }
   });
+
+  it('never executes unpromoted .new when promotion fails or exits zero without activating, and falls back safely to healthy old version', async () => {
+    const origPlatform = process.platform;
+    const origPath = process.env.PATH;
+    const origPathExt = process.env.PATHEXT;
+    const origLocalAppData = process.env.LOCALAPPDATA;
+    const origUserProfile = process.env.USERPROFILE;
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'cursor-staged-fail-'));
+    tempDirs.push(tmpRoot);
+
+    try {
+      const stagedOnlyDir = join(tmpRoot, 'staged-only');
+      const stagedOnlyVerNew = join(stagedOnlyDir, 'versions', '2026.12.01-f1e2d3c.new');
+      const stagedNewNode = join(stagedOnlyVerNew, 'node.exe');
+      mkdirSync(stagedOnlyVerNew, { recursive: true });
+      writeFileSync(stagedNewNode, 'staged node');
+      writeFileSync(join(stagedOnlyVerNew, 'index.js'), 'ok');
+      writeFileSync(join(stagedOnlyDir, 'versions', 'promote-staged.cmd'), '@echo off\r\nexit /b 1\r\n');
+      const stagedOnlyPs1 = join(stagedOnlyDir, 'cursor-agent.ps1');
+      writeFileSync(stagedOnlyPs1, [
+        '# cursor-agent-promote-staged',
+        '$promoteStaged = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) "versions\\promote-staged.cmd"',
+        'if (Test-Path -LiteralPath $promoteStaged) { & $promoteStaged }',
+        '$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition',
+        'function Parse-VersionString { param([string]$versionString) $p = $versionString.Split("-")[0].Split("."); return [int]($p[0] + $p[1].PadLeft(2,"0") + $p[2].PadLeft(2,"0")) }',
+        '$versionDir = Get-ChildItem -Path "$scriptPath\\versions"',
+        '& "$nodePath" "$scriptPath\\versions\\$versionName\\index.js" $args',
+      ].join('\n'));
+      const stagedOnlyCmd = join(stagedOnlyDir, 'cursor-agent.cmd');
+      writeFileSync(stagedOnlyCmd, [
+        '@echo off',
+        '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0cursor-agent.ps1" %*',
+      ].join('\r\n'));
+
+      const psExe = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+      Object.defineProperty(process, 'platform', { value: 'win32' });
+      process.env.PATH = stagedOnlyDir;
+      process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+      process.env.LOCALAPPDATA = tmpRoot;
+      process.env.USERPROFILE = tmpRoot;
+
+      // Case 1: promoteStep exits non-zero when only `.new` exists -> connect & send both fail without touching `.new/node.exe`
+      const calls1: Array<{ file: string; args: string[] }> = [];
+      cursorHeadlessRuntimeHooks.loadChildProcess = async () => ({
+        execFile: vi.fn((file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+          calls1.push({ file, args });
+          cb(new Error('promote failed (exit 1)'), '', 'promote failed');
+          return { stdin: { end: vi.fn() } } as never;
+        }),
+        spawn: harness.spawn,
+      } as unknown as typeof import('node:child_process'));
+
+      const provider1 = new CursorHeadlessProvider();
+      await expect(provider1.connect({ binaryPath: stagedOnlyCmd })).rejects.toThrow();
+      expect(calls1.some((c) => c.file === stagedNewNode)).toBe(false);
+
+      // Even if promotion exits 0 without activating `.new` into an active non-`.new` directory,
+      // connect(), createSession(), and send() must NEVER run `.new/node.exe`.
+      const calls2: Array<{ file: string; args: string[] }> = [];
+      cursorHeadlessRuntimeHooks.loadChildProcess = async () => ({
+        execFile: vi.fn((file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+          calls2.push({ file, args });
+          if (args.includes('--version')) cb(null, '2026.12.01-f1e2d3c\n', '');
+          else cb(null, 'Logged in\n', '');
+          return { stdin: { end: vi.fn() } } as never;
+        }),
+        spawn: harness.spawn,
+      } as unknown as typeof import('node:child_process'));
+
+      const provider2 = new CursorHeadlessProvider();
+      await expect(provider2.connect({ binaryPath: stagedOnlyCmd })).rejects.toThrow(/staged update did not activate/i);
+      expect(calls2).toEqual([{ file: psExe, args: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', stagedOnlyPs1, '--version'] }]);
+      expect(calls2.some((c) => c.file === stagedNewNode)).toBe(false);
+
+      // Direct send() / createSession() with staged-only failing promote also never runs `.new/node.exe`
+      (provider2 as unknown as { config: Record<string, unknown> }).config = { binaryPath: stagedOnlyCmd };
+      const sidStagedOnly = await provider2.createSession({ sessionKey: 'staged-fail-send', cwd: tmpRoot, resumeId: 'chat-staged' });
+      await expect(provider2.send(sidStagedOnly, 'should not hit .new')).rejects.toThrow(/did not activate/i);
+      expect(calls2.some((c) => c.file === stagedNewNode)).toBe(false);
+      expect(harness.spawn).not.toHaveBeenCalled();
+
+      // Case 2: Old healthy active version + `.new` where promote fails non-zero -> safely falls back to old active version
+      const fallbackDir = join(tmpRoot, 'with-old-active');
+      const oldVerDir = join(fallbackDir, 'versions', '2026.05.05-a1b2c3d');
+      const newVerStagedDir = join(fallbackDir, 'versions', '2026.12.01-f1e2d3c.new');
+      const oldNode = join(oldVerDir, 'node.exe');
+      const oldIndex = join(oldVerDir, 'index.js');
+      const newStagedNode = join(newVerStagedDir, 'node.exe');
+      mkdirSync(oldVerDir, { recursive: true });
+      mkdirSync(newVerStagedDir, { recursive: true });
+      writeFileSync(oldNode, 'old node');
+      writeFileSync(oldIndex, 'ok');
+      writeFileSync(newStagedNode, 'new node');
+      writeFileSync(join(newVerStagedDir, 'index.js'), 'ok');
+      writeFileSync(join(fallbackDir, 'versions', 'promote-staged.cmd'), '@echo off\r\nexit /b 1\r\n');
+      const fallbackPs1 = join(fallbackDir, 'cursor-agent.ps1');
+      writeFileSync(fallbackPs1, [
+        '# cursor-agent-promote-staged',
+        '$promoteStaged = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) "versions\\promote-staged.cmd"',
+        'if (Test-Path -LiteralPath $promoteStaged) { & $promoteStaged }',
+        '$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition',
+        'function Parse-VersionString { param([string]$versionString) $p = $versionString.Split("-")[0].Split("."); return [int]($p[0] + $p[1].PadLeft(2,"0") + $p[2].PadLeft(2,"0")) }',
+        '$versionDir = Get-ChildItem -Path "$scriptPath\\versions"',
+        '& "$nodePath" "$scriptPath\\versions\\$versionName\\index.js" $args',
+      ].join('\n'));
+      const fallbackCmd = join(fallbackDir, 'cursor-agent.cmd');
+      writeFileSync(fallbackCmd, [
+        '@echo off',
+        '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0cursor-agent.ps1" %*',
+      ].join('\r\n'));
+
+      const fallbackCalls: Array<{ file: string; args: string[] }> = [];
+      cursorHeadlessRuntimeHooks.loadChildProcess = async () => ({
+        execFile: vi.fn((file: string, args: string[], _opts: unknown, cb: (err: Error | null, stdout: string, stderr: string) => void) => {
+          fallbackCalls.push({ file, args });
+          if (file === psExe) {
+            cb(new Error('promote failed (exit 1)'), '', 'promote failed');
+          } else if (args.includes('--version')) {
+            cb(null, '2026.05.05-a1b2c3d\n', '');
+          } else if (args.includes('status')) {
+            cb(null, 'Logged in\n', '');
+          } else if (args.includes('create-chat')) {
+            cb(null, 'cursor-chat-fallback\n', '');
+          } else {
+            cb(null, '', '');
+          }
+          return { stdin: { end: vi.fn() } } as never;
+        }),
+        spawn: harness.spawn,
+      } as unknown as typeof import('node:child_process'));
+
+      const providerFallback = new CursorHeadlessProvider();
+      await providerFallback.connect({ binaryPath: fallbackCmd });
+      const sidFallback = await providerFallback.createSession({ sessionKey: 'fallback-old', cwd: tmpRoot });
+      await providerFallback.send(sidFallback, 'fallback to healthy active version');
+
+      expect(fallbackCalls.some((c) => c.file === newStagedNode)).toBe(false);
+      expect(fallbackCalls.some((c) => c.file === oldNode && c.args[0] === oldIndex && c.args.includes('create-chat'))).toBe(true);
+      expect(harness.lastSpawn().file).toBe(oldNode);
+      expect(harness.lastSpawn().args[0]).toBe(oldIndex);
+      expect(harness.lastSpawn().args.slice(-2)).toEqual(['--', 'fallback to healthy active version']);
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform });
+      process.env.PATH = origPath;
+      if (origPathExt === undefined) delete process.env.PATHEXT;
+      else process.env.PATHEXT = origPathExt;
+      if (origLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+      else process.env.LOCALAPPDATA = origLocalAppData;
+      if (origUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = origUserProfile;
+    }
+  });
 });

@@ -18,7 +18,7 @@ import {
   getSupportedCursorWindowsExts,
   getUnixCursorCandidateDirs,
   getWindowsCursorSearchDirs,
-  resolveCursorCmdLauncher,
+  resolveCursorCmdLauncherPlan,
   resolveNodePackageRoot,
 } from './transport-paths.js';
 
@@ -397,7 +397,7 @@ async function probeCursorHeadless(deps: AgentAvailabilityProbeDeps): Promise<Ag
           } catch {
             isRealDiskFile = false;
           }
-          if (isRealDiskFile && !resolveCursorCmdLauncher(diskCandidate)) continue;
+          if (isRealDiskFile && !resolveCursorCmdLauncherPlan(diskCandidate)) continue;
         }
         return { installed: true };
       }

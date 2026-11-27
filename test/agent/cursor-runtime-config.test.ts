@@ -18,14 +18,16 @@ vi.mock('../../src/util/logger.js', () => ({
   },
 }));
 
-// Stabilize the transport-paths resolution so tests don't depend on PATH lookups.
-vi.mock('../../src/agent/transport-paths.js', () => ({
-  resolveCursorPathForSdk: (bin = 'cursor-agent') => bin,
-  resolveCursorLaunchPlan: (bin = 'cursor-agent') => ({ direct: { executable: bin, prependArgs: [] } }),
-  hasPendingCursorStagedUpdate: () => false,
-  resolveCursorExecutableForSpawn: (bin = 'cursor-agent') => ({ executable: bin, prependArgs: [] }),
-  resolveExecutableForSpawn: (bin: string) => ({ executable: bin, prependArgs: [] }),
+const transportPathsMock = vi.hoisted(() => ({
+  resolveCursorPathForSdk: vi.fn((bin = 'cursor-agent') => bin),
+  resolveCursorLaunchPlan: vi.fn((bin = 'cursor-agent') => ({ direct: { executable: bin, prependArgs: [] } })),
+  hasPendingCursorStagedUpdate: vi.fn(() => false),
+  resolveCursorExecutableForSpawn: vi.fn((bin = 'cursor-agent') => ({ executable: bin, prependArgs: [] })),
+  resolveExecutableForSpawn: vi.fn((bin: string) => ({ executable: bin, prependArgs: [] })),
 }));
+
+// Stabilize the transport-paths resolution so tests don't depend on PATH lookups.
+vi.mock('../../src/agent/transport-paths.js', () => transportPathsMock);
 
 import {
   getCursorRuntimeConfig,
@@ -38,6 +40,11 @@ describe('cursor-runtime-config parsers', () => {
   beforeEach(() => {
     __cursorRuntimeConfigInternals.clearCache();
     childProcessMock.execFile.mockReset();
+    transportPathsMock.resolveCursorPathForSdk.mockImplementation((bin = 'cursor-agent') => bin);
+    transportPathsMock.resolveCursorLaunchPlan.mockImplementation((bin = 'cursor-agent') => ({
+      direct: { executable: bin, prependArgs: [] },
+    }));
+    transportPathsMock.hasPendingCursorStagedUpdate.mockImplementation(() => false);
   });
 
   describe('parseListModelsOutput', () => {
@@ -173,6 +180,101 @@ describe('cursor-runtime-config parsers', () => {
       expect(config.loggedInAs).toBeUndefined();
       expect(config.defaultModel).toBeUndefined();
       expect(config.isColdFallback).toBeUndefined();
+    });
+
+    it('returns empty runtime config without probing .new when staged promote fails or does not activate a version', async () => {
+      const promoteStep = {
+        executable: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+        prependArgs: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\cursor\\cursor-agent.ps1'],
+      };
+      transportPathsMock.hasPendingCursorStagedUpdate.mockReturnValue(true);
+      transportPathsMock.resolveCursorLaunchPlan.mockReturnValue({
+        direct: null,
+        promoteStep,
+        stagedVersionsDir: 'C:\\cursor\\versions',
+      });
+
+      const calls: Array<{ file: string; args: string[] }> = [];
+      childProcessMock.execFile.mockImplementation((...args: any[]) => {
+        const file = args[0] as string;
+        const cliArgs = args[1] as string[];
+        const cb = args.at(-1);
+        calls.push({ file, args: cliArgs });
+        cb?.(new Error('promote failed non-zero'), '', 'promote error');
+        return { stdin: { end: vi.fn() } } as never;
+      });
+
+      const failedPromoteConfig = await getCursorRuntimeConfig(true);
+      expect(failedPromoteConfig).toEqual({
+        availableModels: [],
+        isAuthenticated: false,
+      });
+      expect(calls).toEqual([{
+        file: promoteStep.executable,
+        args: [...promoteStep.prependArgs, '--version'],
+      }]);
+
+      // Even if promote exits 0 without creating an active non-.new directory, model/status probes do NOT run.
+      calls.length = 0;
+      childProcessMock.execFile.mockImplementation((...args: any[]) => {
+        const file = args[0] as string;
+        const cliArgs = args[1] as string[];
+        const cb = args.at(-1);
+        calls.push({ file, args: cliArgs });
+        cb?.(null, '2026.12.01-f1e2d3c\n', '');
+        return { stdin: { end: vi.fn() } } as never;
+      });
+
+      const unpromotedConfig = await getCursorRuntimeConfig(true);
+      expect(unpromotedConfig).toEqual({
+        availableModels: [],
+        isAuthenticated: false,
+      });
+      expect(calls).toEqual([{
+        file: promoteStep.executable,
+        args: [...promoteStep.prependArgs, '--version'],
+      }]);
+    });
+
+    it('falls back safely to healthy old active entrypoint when staged promote fails during probe', async () => {
+      const oldDirect = { executable: 'C:\\cursor\\versions\\2026.05.05\\node.exe', prependArgs: ['C:\\cursor\\versions\\2026.05.05\\index.js'] };
+      const promoteStep = {
+        executable: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+        prependArgs: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\\cursor\\cursor-agent.ps1'],
+      };
+      transportPathsMock.hasPendingCursorStagedUpdate.mockReturnValue(true);
+      transportPathsMock.resolveCursorLaunchPlan.mockReturnValue({
+        direct: oldDirect,
+        promoteStep,
+        stagedVersionsDir: 'C:\\cursor\\versions',
+      });
+
+      const calls: Array<{ file: string; args: string[] }> = [];
+      childProcessMock.execFile.mockImplementation((...args: any[]) => {
+        const file = args[0] as string;
+        const cliArgs = args[1] as string[];
+        const cb = args.at(-1);
+        calls.push({ file, args: cliArgs });
+        if (file === promoteStep.executable) {
+          cb?.(new Error('promote timeout'), '', '');
+        } else if (cliArgs.includes('--list-models')) {
+          cb?.(null, 'auto - Auto\ncomposer-2.5  (current, default)\n', '');
+        } else if (cliArgs.includes('status')) {
+          cb?.(null, 'Logged in as fallback@example.com\n', '');
+        }
+        return { stdin: { end: vi.fn() } } as never;
+      });
+
+      const config = await getCursorRuntimeConfig(true);
+      expect(config).toEqual({
+        availableModels: ['auto', 'composer-2.5'],
+        defaultModel: 'composer-2.5',
+        loggedInAs: 'fallback@example.com',
+        isAuthenticated: true,
+      });
+      expect(calls[0]?.file).toBe(promoteStep.executable);
+      expect(calls[1]?.file).toBe(oldDirect.executable);
+      expect(calls[2]?.file).toBe(oldDirect.executable);
     });
   });
 });

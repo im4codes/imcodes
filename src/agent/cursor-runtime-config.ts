@@ -135,12 +135,19 @@ export async function getCursorRuntimeConfig(options: CursorRuntimeConfigOptions
       if (hasPendingCursorStagedUpdate(plan) && plan.promoteStep) {
         try {
           await execFileStdout(plan.promoteStep.executable, [...plan.promoteStep.prependArgs, '--version']);
-          plan = resolveCursorLaunchPlan(resolveCursorPathForSdk(CURSOR_BIN));
         } catch (err) {
           logger.debug({ err }, 'cursor-agent staged promote step failed during runtime config probe');
         }
+        plan = resolveCursorLaunchPlan(resolveCursorPathForSdk(CURSOR_BIN));
       }
       const resolved = plan.direct;
+      if (!resolved) {
+        logger.warn('cursor-agent has no active non-.new executable entrypoint; returning empty runtime config');
+        return {
+          availableModels: [],
+          isAuthenticated: false,
+        };
+      }
       let modelsOut = '';
       try {
         modelsOut = await execFileStdout(resolved.executable, [...resolved.prependArgs, '--list-models']);

@@ -188,8 +188,17 @@ export class CursorHeadlessProvider implements TransportProvider {
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
 
   async connect(config: ProviderConfig): Promise<void> {
-    const plan = resolveCursorLaunchPlan(this.resolveBinaryPath(config));
-    const versionRunner = plan.promoteStep ?? plan.direct;
+    const binaryPath = this.resolveBinaryPath(config);
+    const plan = resolveCursorLaunchPlan(binaryPath);
+    const initialDirect = plan.direct;
+    const versionRunner = plan.promoteStep ?? initialDirect;
+    if (!versionRunner) {
+      throw this.makeError(
+        PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        'Cursor has no active executable entrypoint',
+        false,
+      );
+    }
     let versionOutput = '';
     try {
       const versionProbe = await this.runExecFile(versionRunner.executable, [...versionRunner.prependArgs, '--version'], {
@@ -198,7 +207,20 @@ export class CursorHeadlessProvider implements TransportProvider {
       });
       versionOutput = `${versionProbe.stdout}\n${versionProbe.stderr}`.trim();
     } catch (err) {
-      throw this.normalizeConnectError(err, 'Cursor binary not found or not executable');
+      if (plan.promoteStep && initialDirect) {
+        logger.debug({ err }, 'Cursor staged launcher --version promote failed during connect; retrying with active entrypoint');
+        try {
+          const fallbackProbe = await this.runExecFile(initialDirect.executable, [...initialDirect.prependArgs, '--version'], {
+            windowsHide: true,
+            timeout: CONNECT_PROBE_TIMEOUT_MS,
+          });
+          versionOutput = `${fallbackProbe.stdout}\n${fallbackProbe.stderr}`.trim();
+        } catch (fallbackErr) {
+          throw this.normalizeConnectError(fallbackErr, 'Cursor binary not found or not executable');
+        }
+      } else {
+        throw this.normalizeConnectError(err, 'Cursor binary not found or not executable');
+      }
     }
     const parsedVersion = this.parseCursorVersion(versionOutput);
     if (!parsedVersion) {
@@ -221,8 +243,15 @@ export class CursorHeadlessProvider implements TransportProvider {
       );
     }
     const resolved = plan.promoteStep
-      ? resolveCursorLaunchPlan(this.resolveBinaryPath(config)).direct
-      : plan.direct;
+      ? resolveCursorLaunchPlan(binaryPath).direct
+      : initialDirect;
+    if (!resolved) {
+      throw this.makeError(
+        PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        'Cursor staged update did not activate an executable entrypoint; no active non-.new version is available',
+        false,
+      );
+    }
     try {
       const { stdout, stderr } = await this.runExecFile(resolved.executable, [...resolved.prependArgs, 'status'], {
         windowsHide: true,
@@ -789,7 +818,9 @@ export class CursorHeadlessProvider implements TransportProvider {
   }
 
   private async resolveDirectExecutableWithStagedPromote(): Promise<ResolvedExecutable> {
-    let plan = resolveCursorLaunchPlan(this.resolveBinaryPath(this.config));
+    const binaryPath = this.resolveBinaryPath(this.config);
+    let plan = resolveCursorLaunchPlan(binaryPath);
+    let promoteError: unknown = null;
     if (hasPendingCursorStagedUpdate(plan) && plan.promoteStep) {
       try {
         await this.runExecFile(plan.promoteStep.executable, [...plan.promoteStep.prependArgs, '--version'], {
@@ -800,12 +831,19 @@ export class CursorHeadlessProvider implements TransportProvider {
             ...toProcessEnv(this.config?.env),
           },
         });
-        plan = resolveCursorLaunchPlan(this.resolveBinaryPath(this.config));
       } catch (err) {
-        logger.debug({ err }, 'Cursor staged launcher promote check failed; continuing with active entrypoint');
+        promoteError = err;
+        logger.debug({ err }, 'Cursor staged launcher promote check failed; checking for active entrypoint');
       }
+      plan = resolveCursorLaunchPlan(binaryPath);
     }
-    return plan.direct;
+    if (plan.direct) {
+      return plan.direct;
+    }
+    const message = promoteError
+      ? `Cursor staged update promotion failed and no active executable is available: ${promoteError instanceof Error ? promoteError.message : String(promoteError)}`
+      : 'Cursor staged update did not activate an executable entrypoint; no active non-.new version is available';
+    throw this.makeError(PROVIDER_ERROR_CODES.CONFIG_ERROR, message, false, promoteError ?? undefined);
   }
 
   private resolveDefaultModel(): string | undefined {

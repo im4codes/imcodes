@@ -683,7 +683,24 @@ function extractPs1FixedNodeFlags(ps1Content: string): string[] {
   return splitCmdTokens(match[1]);
 }
 
-function resolveCursorPs1Launcher(ps1Path: string): ResolvedExecutable | null {
+interface CursorPs1Resolution {
+  active: ResolvedExecutable | null;
+}
+
+function resolveCursorVersionDirExecutable(verDir: string, fixedFlags: string[]): ResolvedExecutable | null {
+  const verNode = joinSmart(verDir, 'node.exe');
+  const verIndex = joinSmart(verDir, 'index.js');
+  if (isRegularFileSync(verNode) && isRegularFileSync(verIndex)) {
+    return { executable: verNode, prependArgs: [...fixedFlags, verIndex] };
+  }
+  for (const exeName of ['cursor-agent.exe', 'agent.exe']) {
+    const exePath = joinSmart(verDir, exeName);
+    if (isRegularFileSync(exePath)) return { executable: exePath, prependArgs: [] };
+  }
+  return null;
+}
+
+function resolveCursorPs1LauncherPlan(ps1Path: string): CursorPs1Resolution | null {
   let content: string;
   try {
     content = readFileSync(ps1Path, 'utf8');
@@ -697,11 +714,14 @@ function resolveCursorPs1Launcher(ps1Path: string): ResolvedExecutable | null {
   const flatNode = joinSmart(ps1Dir, 'node.exe');
   const flatIndex = joinSmart(ps1Dir, 'index.js');
   if (isRegularFileSync(flatNode) && isRegularFileSync(flatIndex)) {
-    return { executable: flatNode, prependArgs: [...fixedFlags, flatIndex] };
+    return { active: { executable: flatNode, prependArgs: [...fixedFlags, flatIndex] } };
   }
 
+  const versionsDir = joinSmart(ps1Dir, 'versions');
+  const hasPromoteHook = /promote-staged\.cmd/i.test(content) && isRegularFileSync(joinSmart(versionsDir, 'promote-staged.cmd'));
+
   // Case 2: active.txt version pin (check both scriptPath\active.txt and scriptPath\versions\active.txt)
-  for (const activeFile of [joinSmart(ps1Dir, 'active.txt'), joinSmart(ps1Dir, 'versions', 'active.txt')]) {
+  for (const activeFile of [joinSmart(ps1Dir, 'active.txt'), joinSmart(versionsDir, 'active.txt')]) {
     if (!isRegularFileSync(activeFile)) continue;
     let activeVer = '';
     try {
@@ -710,15 +730,14 @@ function resolveCursorPs1Launcher(ps1Path: string): ResolvedExecutable | null {
       return null;
     }
     if (!activeVer || /[\\/]/.test(activeVer)) return null;
-    const activeDir = joinSmart(ps1Dir, 'versions', activeVer);
-    const activeNode = joinSmart(activeDir, 'node.exe');
-    const activeIndex = joinSmart(activeDir, 'index.js');
-    if (isRegularFileSync(activeNode) && isRegularFileSync(activeIndex)) {
-      return { executable: activeNode, prependArgs: [...fixedFlags, activeIndex] };
+    const activeExec = resolveCursorVersionDirExecutable(joinSmart(versionsDir, activeVer), fixedFlags);
+    if (activeExec) {
+      return { active: activeExec };
     }
-    for (const exeName of ['cursor-agent.exe', 'agent.exe']) {
-      const exePath = joinSmart(activeDir, exeName);
-      if (isRegularFileSync(exePath)) return { executable: exePath, prependArgs: [] };
+    // Never treat an unpromoted `.new` directory as an active direct executable;
+    // when promote-staged hook is armed, allow promotion-only attempt (`active: null`).
+    if (hasPromoteHook && resolveCursorVersionDirExecutable(joinSmart(versionsDir, `${activeVer}.new`), fixedFlags)) {
+      return { active: null };
     }
     // Fail closed if active.txt points to an incomplete/missing directory.
     return null;
@@ -728,7 +747,6 @@ function resolveCursorPs1Launcher(ps1Path: string): ResolvedExecutable | null {
   const hasVersionsLookup = /\$scriptPath[\\/]versions/i.test(content) && (/Parse-VersionString/i.test(content) || /versions/i.test(content));
   if (!hasVersionsLookup) return null;
 
-  const versionsDir = joinSmart(ps1Dir, 'versions');
   try {
     const dirEntries = readdirSync(versionsDir, { withFileTypes: true }).filter((entry) => entry.isDirectory());
     const entries = dirEntries
@@ -736,26 +754,21 @@ function resolveCursorPs1Launcher(ps1Path: string): ResolvedExecutable | null {
       .map((entry) => entry.name)
       .sort(compareCursorVersionDirsDesc);
     for (const ver of entries) {
-      const verDir = joinSmart(versionsDir, ver);
-      const verNode = joinSmart(verDir, 'node.exe');
-      const verIndex = joinSmart(verDir, 'index.js');
-      if (isRegularFileSync(verNode) && isRegularFileSync(verIndex)) {
-        return { executable: verNode, prependArgs: [...fixedFlags, verIndex] };
+      const activeExec = resolveCursorVersionDirExecutable(joinSmart(versionsDir, ver), fixedFlags);
+      if (activeExec) {
+        return { active: activeExec };
       }
     }
-    // Also accept a staged `.new` update directory when the installer's promote-staged hook is armed.
-    const hasPromoteHook = /promote-staged\.cmd/i.test(content) && isRegularFileSync(joinSmart(versionsDir, 'promote-staged.cmd'));
+    // A staged `.new` update directory with promote-staged hook proves promotion may be attempted,
+    // NEVER that `.new` itself can be launched directly when promotion fails or does not activate it.
     if (hasPromoteHook) {
       const stagedEntries = dirEntries
         .filter((entry) => entry.name.endsWith('.new') && CURSOR_PS1_VERSION_RE.test(entry.name.slice(0, -4)))
         .map((entry) => entry.name.slice(0, -4))
         .sort(compareCursorVersionDirsDesc);
       for (const ver of stagedEntries) {
-        const verDir = joinSmart(versionsDir, `${ver}.new`);
-        const verNode = joinSmart(verDir, 'node.exe');
-        const verIndex = joinSmart(verDir, 'index.js');
-        if (isRegularFileSync(verNode) && isRegularFileSync(verIndex)) {
-          return { executable: verNode, prependArgs: [...fixedFlags, verIndex] };
+        if (resolveCursorVersionDirExecutable(joinSmart(versionsDir, `${ver}.new`), fixedFlags)) {
+          return { active: null };
         }
       }
     }
@@ -770,8 +783,9 @@ function isBatchForwardArgsToken(token: string): boolean {
 }
 
 export interface CursorWindowsLaunchPlan {
-  /** Direct Node/binary entrypoint to spawn with user prompts and arbitrary argv (zero PowerShell second hop). */
-  direct: ResolvedExecutable;
+  /** Direct Node/binary entrypoint to spawn with user prompts and arbitrary argv (zero PowerShell second hop).
+   *  Null when only an unpromoted `.new` staged directory + promote hook exists with no active version yet. */
+  direct: ResolvedExecutable | null;
   /** Official wrapper invocation (e.g. `powershell.exe -File cursor-agent.ps1`) used ONLY with
    *  trusted fixed args such as `--version` to execute staged `.new` promotion before re-resolving `direct`. */
   promoteStep?: ResolvedExecutable;
@@ -876,14 +890,14 @@ export function resolveCursorCmdLauncherPlan(cmdPath: string, depth = 0): Cursor
       const ps1Raw = ps1TokenIdx >= 0 ? cmdTokens[ps1TokenIdx] : undefined;
       if (ps1Raw) {
         const ps1Path = normalizeBatchPath(ps1Raw);
-        const direct = isRegularFileSync(ps1Path) ? resolveCursorPs1Launcher(ps1Path) : null;
-        if (direct) {
+        const ps1Plan = isRegularFileSync(ps1Path) ? resolveCursorPs1LauncherPlan(ps1Path) : null;
+        if (ps1Plan) {
           const powershellExe = headRaw.includes('/') || headRaw.includes('\\')
             ? path.win32.normalize(headRaw)
             : headRaw;
           const psArgs = cmdTokens.slice(1).map((tok, i) => (i + 1 === ps1TokenIdx ? ps1Path : tok));
           return {
-            direct,
+            direct: ps1Plan.active,
             promoteStep: { executable: powershellExe, prependArgs: psArgs },
             stagedVersionsDir: joinSmart(dirnameSmart(ps1Path), 'versions'),
           };
@@ -927,7 +941,9 @@ export function resolveCursorCmdLauncherPlan(cmdPath: string, depth = 0): Cursor
         const nested = resolveCursorCmdLauncherPlan(nestedCmd, depth + 1);
         if (nested) {
           return {
-            direct: { executable: nested.direct.executable, prependArgs: [...nested.direct.prependArgs, ...cmdTokens.slice(2)] },
+            direct: nested.direct
+              ? { executable: nested.direct.executable, prependArgs: [...nested.direct.prependArgs, ...cmdTokens.slice(2)] }
+              : null,
             ...(nested.promoteStep ? { promoteStep: nested.promoteStep } : {}),
             ...(nested.stagedVersionsDir ? { stagedVersionsDir: nested.stagedVersionsDir } : {}),
           };
@@ -999,7 +1015,7 @@ export function resolveCursorLaunchPlan(nameOrPath = 'cursor-agent'): CursorWind
 
 /** Resolve Cursor Agent to a directly-launchable `(executable, prependArgs)` spec (always `direct`, never PowerShell). */
 export function resolveCursorExecutableForSpawn(nameOrPath = 'cursor-agent'): ResolvedExecutable {
-  return resolveCursorLaunchPlan(nameOrPath).direct;
+  return resolveCursorLaunchPlan(nameOrPath).direct ?? { executable: nameOrPath.trim() || 'cursor-agent', prependArgs: [] };
 }
 
 /** Resolve a CLI path/entry for Cursor Agent (`cursor-agent` or `agent`).
@@ -1020,7 +1036,7 @@ export function resolveCursorPathForSdk(name = 'cursor-agent'): string {
       for (const dir of uniqueNonEmpty(searchDirs)) {
         for (const candidate of listWindowsCandidateFilesInDir(dir, bin, exts)) {
           if (/\.(exe|com)$/i.test(candidate)) return candidate;
-          if (/\.(cmd|bat)$/i.test(candidate) && resolveCursorCmdLauncher(candidate)) {
+          if (/\.(cmd|bat)$/i.test(candidate) && resolveCursorCmdLauncherPlan(candidate)) {
             return candidate;
           }
         }

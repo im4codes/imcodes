@@ -13,6 +13,7 @@ import {
   resolveCursorPathForSdk,
   resolveCursorExecutableForSpawn,
   resolveCursorCmdLauncher,
+  resolveCursorCmdLauncherPlan,
   resolveCursorLaunchPlan,
   hasPendingCursorStagedUpdate,
 } from '../../src/agent/transport-paths.js';
@@ -287,8 +288,46 @@ describe('resolveCursorPathForSdk (cursor-agent and agent resolution)', () => {
       ].join('\n');
       fs.writeFileSync(agentPs1, ps1WithHook);
       const stagedPlan = resolveCursorLaunchPlan('cursor-agent');
+      expect(stagedPlan.direct).toEqual({ executable: newNode, prependArgs: [newIndex] });
       expect(stagedPlan.promoteStep).toEqual(expectedPsPromote);
       expect(hasPendingCursorStagedUpdate(stagedPlan)).toBe(true);
+
+      // Staged `.new`-only (no active version dir yet): promoteStep + stagedVersionsDir present,
+      // but direct MUST be null so `.new` is never executed if promote-staged fails or does not activate it.
+      const stagedOnlyDir = path.join(tmpDir, 'staged-only-ps');
+      const stagedOnlyVerDir = path.join(stagedOnlyDir, 'versions', '2026.12.01-f1e2d3c.new');
+      fs.mkdirSync(stagedOnlyVerDir, { recursive: true });
+      fs.writeFileSync(path.join(stagedOnlyVerDir, 'node.exe'), 'staged node');
+      fs.writeFileSync(path.join(stagedOnlyVerDir, 'index.js'), 'console.log("staged");\n');
+      fs.writeFileSync(path.join(stagedOnlyDir, 'versions', 'promote-staged.cmd'), '@echo off\r\nexit /b 1\r\n');
+      const stagedOnlyPs1 = path.join(stagedOnlyDir, 'cursor-agent.ps1');
+      fs.writeFileSync(stagedOnlyPs1, [
+        '# cursor-agent-promote-staged',
+        '$promoteStaged = Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Definition) "versions\\promote-staged.cmd"',
+        'if (Test-Path -LiteralPath $promoteStaged) { & $promoteStaged }',
+        '$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition',
+        'function Parse-VersionString { param([string]$versionString) $p = $versionString.Split("-")[0].Split("."); return [int]($p[0] + $p[1].PadLeft(2,"0") + $p[2].PadLeft(2,"0")) }',
+        '$versionDir = Get-ChildItem -Path "$scriptPath\\versions"',
+        '& "$nodePath" "$scriptPath\\versions\\$versionName\\index.js" $args',
+      ].join('\n'));
+      const stagedOnlyCmd = path.join(stagedOnlyDir, 'cursor-agent.cmd');
+      fs.writeFileSync(stagedOnlyCmd, [
+        '@echo off',
+        '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0cursor-agent.ps1" %*',
+      ].join('\r\n'));
+      const stagedOnlyPlan = resolveCursorCmdLauncherPlan(stagedOnlyCmd);
+      expect(stagedOnlyPlan).not.toBeNull();
+      expect(stagedOnlyPlan?.direct).toBeNull();
+      expect(stagedOnlyPlan?.promoteStep).toEqual({
+        executable: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+        prependArgs: ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', stagedOnlyPs1],
+      });
+      expect(hasPendingCursorStagedUpdate(stagedOnlyPlan!)).toBe(true);
+      expect(resolveCursorCmdLauncher(stagedOnlyCmd)).toBeNull();
+      expect(resolveCursorExecutableForSpawn(stagedOnlyCmd)).toEqual({
+        executable: stagedOnlyCmd,
+        prependArgs: [],
+      });
 
       // Even if active.txt points to a missing version, static .ps1 launchability fails closed -> bad wrapper rejected
       const activeTxt = path.join(goodDir, 'versions', 'active.txt');
