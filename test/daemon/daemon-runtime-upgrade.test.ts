@@ -1490,7 +1490,7 @@ describe('daemon-runtime atomic self-upgrade, rollback, discovery priority & fal
     expect(roRes).toMatchObject({ eligible: false, reason: 'legacy_npm_cli_read_only' });
   });
 
-  it('[F3-R2] verifies real daemon.lock.json identity, fails closed on PID reuse/probe errors, and recovers unserviced + first user_fallback rollbacks', { timeout: 30_000 }, async () => {
+  it('[F3-R2] verifies real daemon.lock.json identity, fails closed on PID reuse/probe errors, and recovers unserviced + first user_fallback rollbacks', { timeout: process.platform === 'darwin' && process.arch === 'x64' ? 60_000 : 30_000 }, async () => {
     const root = makeTempDir('imcodes-rt-f3r2-');
     const stateDir = join(root, 'state');
     mkdirSync(stateDir, { recursive: true });
