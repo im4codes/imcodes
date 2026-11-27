@@ -851,17 +851,49 @@ function collapseRunsForPeriod(chars: string[], period: number): { next: string[
   return { next: out, changed: true };
 }
 
+const ASR_CONTROL_TAG_RE = /(?:(?<![A-Za-z0-9_])language[ \t\r\n]+[A-Za-z0-9_-]+[ \t\r\n]*)?<asr_text>|<\|[^|>\r\n]{1,48}\|>/g;
+
+/**
+ * Strip Qwen3-ASR control prefixes/tags (e.g. `language None<asr_text>`,
+ * `language\nChinese<asr_text>`, standalone `<asr_text>`, `<|endoftext|>`)
+ * while leaving ordinary words such as `"the language model"` untouched.
+ */
+export function stripAsrControlTags(text: string): string {
+  if (!text) return '';
+  return text.replace(ASR_CONTROL_TAG_RE, '').trim();
+}
+
+/**
+ * Sanitize an incoming ASR transcript result and preserve the session's last
+ * non-empty sanitized transcript when a terminal `isFinal` frame collapses to
+ * empty (e.g. `language None<asr_text>` or a pure repetition burst from an older helper).
+ */
+export function resolveSessionTranscriptResult(
+  rawText: string,
+  isFinal: boolean,
+  lastNonEmptyText: string,
+): { emit: boolean; text: string; nextLastNonEmptyText: string } {
+  const sanitized = sanitizeAsrRepetitionLoop(rawText);
+  if (sanitized.trim().length > 0) {
+    return { emit: true, text: sanitized, nextLastNonEmptyText: sanitized };
+  }
+  if (!isFinal) {
+    return { emit: false, text: '', nextLastNonEmptyText: lastNonEmptyText };
+  }
+  return { emit: true, text: lastNonEmptyText, nextLastNonEmptyText: lastNonEmptyText };
+}
+
 /**
  * Remove runaway consecutive ASR repetition loops (e.g. Qwen3-ASR greedy loop bursts
  * such as `"想，他".repeat(60)`) in bounded O(n) time while preserving normal repeated
  * speech expressions (`哈哈哈哈`, `对对对`, `10000000`, `yes yes yes`, `...`).
  */
 export function sanitizeAsrRepetitionLoop(text: string): string {
-  if (!text) return '';
-  if (!text.trim()) return '';
-  if (text.length < ASR_SINGLE_CHAR_REPEAT_THRESHOLD) return text;
+  const stripped = stripAsrControlTags(text);
+  if (!stripped) return '';
+  if (stripped.length < ASR_SINGLE_CHAR_REPEAT_THRESHOLD) return stripped;
 
-  let chars = Array.from(text);
+  let chars = Array.from(stripped);
   let removedAny = false;
 
   for (let round = 0; round < 2; round += 1) {
@@ -884,7 +916,7 @@ export function sanitizeAsrRepetitionLoop(text: string): string {
     if (!changedInRound) break;
   }
 
-  if (!removedAny) return text;
+  if (!removedAny) return stripped;
 
   const cleaned = chars.join('').trim();
   if (!cleaned || !ASR_MEANINGFUL_CHAR_RE.test(cleaned)) {

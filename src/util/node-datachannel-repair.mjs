@@ -8,8 +8,24 @@
  * the newly installed daemon starts.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync, rmSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import {
+  accessSync,
+  closeSync,
+  constants,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -38,6 +54,16 @@ function run(command, args, options = {}) {
   });
 }
 
+function resolveCommandOnPath(commandName, env = process.env) {
+  if (!commandName || isAbsolute(commandName)) return commandName;
+  const pathValue = env.PATH ?? env.Path ?? '';
+  for (const dir of pathValue.split(delimiter).filter(Boolean)) {
+    const candidate = join(dir, commandName);
+    if (existsSync(candidate)) return candidate;
+  }
+  return commandName;
+}
+
 export function resolveNpmCliJs(npmCommand, nodeExecPath = process.execPath, env = process.env) {
   const candidates = [];
   if (
@@ -48,7 +74,8 @@ export function resolveNpmCliJs(npmCommand, nodeExecPath = process.execPath, env
     candidates.push(env.npm_execpath);
   }
   const roots = [dirname(nodeExecPath)];
-  if (npmCommand && isAbsolute(npmCommand)) roots.unshift(dirname(npmCommand));
+  const resolvedNpm = resolveCommandOnPath(npmCommand, env);
+  if (resolvedNpm && isAbsolute(resolvedNpm)) roots.unshift(dirname(resolvedNpm));
   for (const root of roots) {
     candidates.push(
       join(root, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
@@ -108,6 +135,43 @@ function readDependencySpec(packageRoot) {
   }
 }
 
+function isDirWritable(dirPath) {
+  try {
+    accessSync(dirPath, constants.W_OK);
+  } catch {
+    return false;
+  }
+  // Probe file creation/removal to catch EROFS or Windows ACL restrictions
+  // without ever leaving stray files behind.
+  const probePath = join(dirPath, `.imcodes-write-probe-${process.pid}-${Date.now()}`);
+  let fd = null;
+  try {
+    fd = openSync(probePath, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY, 0o600);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch { /* ignore */ }
+    }
+    try { unlinkSync(probePath); } catch { /* ignore */ }
+  }
+}
+
+function isTargetWritable(packageRoot, dependencyDir) {
+  const nodeModulesDir = join(packageRoot, 'node_modules');
+  const writeBase = existsSync(nodeModulesDir) ? nodeModulesDir : packageRoot;
+  if (!isDirWritable(writeBase)) return false;
+  if (existsSync(dependencyDir) && !isDirWritable(dependencyDir)) return false;
+  return true;
+}
+
+function restoreBackupIfNeeded(backupDir, dependencyDir) {
+  if (backupDir && existsSync(backupDir) && !existsSync(dependencyDir)) {
+    try { renameSync(backupDir, dependencyDir); } catch { /* best-effort restore */ }
+  }
+}
+
 export function repairNodeDatachannel(options = {}) {
   const packageRoot = resolve(options.packageRoot ?? DEFAULT_PACKAGE_ROOT);
   const npmCommand = options.npmCommand
@@ -118,39 +182,138 @@ export function repairNodeDatachannel(options = {}) {
     process.platform === 'win32' ? resolveNpmCliJs(npmCommand) : ''
   );
   const log = options.log ?? (() => {});
-  const runNpm = (args) => npmCli
-    ? run(process.execPath, [npmCli, ...args], { cwd: packageRoot, timeout: REPAIR_TIMEOUT_MS })
-    : run(npmCommand, args, { cwd: packageRoot, timeout: REPAIR_TIMEOUT_MS });
+  const runNpm = (args, cwd = packageRoot) => npmCli
+    ? run(process.execPath, [npmCli, ...args], { cwd, timeout: REPAIR_TIMEOUT_MS })
+    : run(npmCommand, args, { cwd, timeout: REPAIR_TIMEOUT_MS });
   const dependencySpec = readDependencySpec(packageRoot);
   if (!dependencySpec) return { available: false, attempted: false, repaired: false, reason: 'not_declared' };
   if (verify(packageRoot)) return { available: true, attempted: false, repaired: false };
 
-  const dependencyDir = join(packageRoot, 'node_modules', 'node-datachannel');
+  const nodeModulesDir = join(packageRoot, 'node_modules');
+  const dependencyDir = join(nodeModulesDir, 'node-datachannel');
+  if (!isTargetWritable(packageRoot, dependencyDir)) {
+    log(`node_modules directory is not writable (${nodeModulesDir}) — skipping repair; relay remains enabled`);
+    return { available: false, attempted: false, repaired: false, reason: 'not_writable' };
+  }
+
   let attempted = false;
-  if (existsSync(join(dependencyDir, 'package.json'))) {
-    attempted = true;
-    log('node-datachannel native addon unavailable — rebuilding with lifecycle scripts enabled');
-    const rebuild = runNpm([
-      'rebuild', '--global=false', '--prefix', packageRoot,
-      'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
-    ]);
-    if (rebuild.status !== 0) {
-      log(`node-datachannel rebuild returned non-zero [exit ${rebuild.status} signal ${rebuild.signal ?? 'none'}]; trying clean dependency reinstall`);
+  let rebuildSnapshotDir = '';
+  let canCleanupRebuildSnapshot = false;
+  try {
+    if (existsSync(join(dependencyDir, 'package.json'))) {
+      attempted = true;
+      try {
+        rebuildSnapshotDir = join(nodeModulesDir, `.node-datachannel-rebuild-snapshot-${process.pid}-${Date.now()}`);
+        // Preserve symlink semantics; never run in-place rebuild unless a full restorable snapshot succeeded.
+        cpSync(dependencyDir, rebuildSnapshotDir, { recursive: true, verbatimSymlinks: true });
+      } catch (snapshotErr) {
+        if (rebuildSnapshotDir && existsSync(rebuildSnapshotDir)) {
+          try { rmSync(rebuildSnapshotDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        }
+        rebuildSnapshotDir = '';
+        log(`node-datachannel rebuild snapshot failed (${snapshotErr instanceof Error ? snapshotErr.message : String(snapshotErr)}) — skipping in-place rebuild and trying isolated reinstall`);
+      }
+
+      if (rebuildSnapshotDir) {
+        log('node-datachannel native addon unavailable — rebuilding with lifecycle scripts enabled');
+        const rebuild = runNpm([
+          'rebuild', '--global=false', '--prefix', packageRoot,
+          'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
+        ], packageRoot);
+        if (verify(packageRoot)) {
+          canCleanupRebuildSnapshot = true;
+          log('node-datachannel repair succeeded');
+          return { available: true, attempted, repaired: true };
+        }
+        if (rebuild.status !== 0) {
+          log(`node-datachannel rebuild returned non-zero [exit ${rebuild.status} signal ${rebuild.signal ?? 'none'}]; restoring pre-rebuild snapshot before isolated reinstall`);
+        } else {
+          log('node-datachannel rebuild completed but verification failed; restoring pre-rebuild snapshot before isolated reinstall');
+        }
+        let failedRebuildDir = '';
+        try {
+          if (existsSync(dependencyDir)) {
+            failedRebuildDir = join(nodeModulesDir, `.node-datachannel-failed-rebuild-${process.pid}-${Date.now()}`);
+            renameSync(dependencyDir, failedRebuildDir);
+          }
+          renameSync(rebuildSnapshotDir, dependencyDir);
+          rebuildSnapshotDir = '';
+          canCleanupRebuildSnapshot = true;
+          if (failedRebuildDir && existsSync(failedRebuildDir)) {
+            try { rmSync(failedRebuildDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+          }
+        } catch (restoreErr) {
+          if (failedRebuildDir && existsSync(failedRebuildDir) && !existsSync(dependencyDir)) {
+            try { renameSync(failedRebuildDir, dependencyDir); } catch { /* best-effort */ }
+          }
+          // Preserve rebuildSnapshotDir on disk as the intact backup and abort overwriting via reinstall.
+          log(`node-datachannel rebuild snapshot restore failed (${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}); preserving snapshot at ${rebuildSnapshotDir}`);
+          return { available: false, attempted, repaired: false, reason: 'restore_failed' };
+        }
+      }
+    } else {
+      log('node-datachannel package missing or incomplete — trying isolated dependency reinstall');
     }
-  } else {
-    log('node-datachannel package missing or incomplete — trying clean dependency reinstall');
+  } finally {
+    if (canCleanupRebuildSnapshot && rebuildSnapshotDir && existsSync(rebuildSnapshotDir)) {
+      try { rmSync(rebuildSnapshotDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
   }
 
   if (!verify(packageRoot)) {
     attempted = true;
-    try { rmSync(dependencyDir, { recursive: true, force: true }); } catch { /* npm reports the failure below */ }
-    const reinstall = runNpm([
-      'install', '--global=false', '--prefix', packageRoot,
-      '--no-save', '--ignore-scripts=false', '--foreground-scripts',
-      `node-datachannel@${dependencySpec}`,
-    ]);
-    if (reinstall.status !== 0) {
-      log(`node-datachannel clean reinstall returned non-zero [exit ${reinstall.status} signal ${reinstall.signal ?? 'none'}]`);
+    const stagingRoot = realpathSync(mkdtempSync(join(tmpdir(), 'imcodes-ndc-repair-')));
+    let siblingStagingDir = '';
+    let backupDir = '';
+    try {
+      writeFileSync(
+        join(stagingRoot, 'package.json'),
+        JSON.stringify({ name: 'imcodes-ndc-repair', private: true }),
+      );
+      // Install strictly in an isolated staging dir so npm Arborist never reifies
+      // or mutates sibling packages (e.g. pino) inside the live packageRoot.
+      const reinstall = runNpm([
+        'install', '--global=false', '--prefix', stagingRoot,
+        '--no-save', '--no-audit', '--no-fund', '--ignore-scripts=false', '--foreground-scripts',
+        `node-datachannel@${dependencySpec}`,
+      ], stagingRoot);
+      if (reinstall.status !== 0) {
+        log(`node-datachannel isolated reinstall returned non-zero [exit ${reinstall.status} signal ${reinstall.signal ?? 'none'}]`);
+      } else if (!verify(stagingRoot)) {
+        log('node-datachannel staging verification FAILED — leaving installed node_modules untouched');
+      } else {
+        const stagedDepDir = join(stagingRoot, 'node_modules', 'node-datachannel');
+        mkdirSync(nodeModulesDir, { recursive: true });
+        siblingStagingDir = join(nodeModulesDir, `.node-datachannel-staging-${process.pid}-${Date.now()}`);
+        // Stage on the target filesystem before renaming so cross-device tmpdir() never fails with EXDEV.
+        cpSync(stagedDepDir, siblingStagingDir, { recursive: true, verbatimSymlinks: true });
+        if (existsSync(dependencyDir)) {
+          backupDir = join(nodeModulesDir, `.node-datachannel-backup-${process.pid}-${Date.now()}`);
+          renameSync(dependencyDir, backupDir);
+        }
+        try {
+          renameSync(siblingStagingDir, dependencyDir);
+          siblingStagingDir = '';
+        } catch (swapError) {
+          restoreBackupIfNeeded(backupDir, dependencyDir);
+          throw swapError;
+        }
+        if (backupDir && existsSync(backupDir)) {
+          try { rmSync(backupDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+          backupDir = '';
+        }
+      }
+    } catch (error) {
+      restoreBackupIfNeeded(backupDir, dependencyDir);
+      log(`node-datachannel isolated reinstall error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      if (siblingStagingDir && existsSync(siblingStagingDir)) {
+        try { rmSync(siblingStagingDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+      if (backupDir && existsSync(backupDir) && existsSync(dependencyDir)) {
+        try { rmSync(backupDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+      try { rmSync(stagingRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
     }
   }
 

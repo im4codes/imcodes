@@ -17,6 +17,7 @@ import {
   parseRemoteVoiceInboundFrame,
   parseServerSharedProvidersSetting,
   resolveOpenAiTranscriptionEndpoint,
+  resolveSessionTranscriptResult,
   sanitizeAsrRepetitionLoop,
   sanitizeCrossAccountOwnerLabel,
   sanitizeRemoteVoiceDeviceName,
@@ -188,6 +189,7 @@ interface ActiveVoiceSession {
   sampleRate?: number;
   audioChunks?: Buffer[];
   totalAudioBytes?: number;
+  lastNonEmptyText?: string;
   stopping?: boolean;
   abortController?: AbortController;
 }
@@ -1258,14 +1260,15 @@ export class RemoteVoiceHub {
     const session = this.sessions.get(sessionId);
     if (!session || session.providerUserId !== providerUserId || session.providerWs !== providerWs) return;
     this.resetIdleTimer(session);
-    const sanitized = sanitizeAsrRepetitionLoop(text);
-    if (!isFinal && sanitized.length === 0) {
+    const resolved = resolveSessionTranscriptResult(text, isFinal, session.lastNonEmptyText ?? '');
+    session.lastNonEmptyText = resolved.nextLastNonEmptyText;
+    if (!resolved.emit) {
       return;
     }
     safeSendWs(session.clientWs, {
       type: 'voice.session.result',
       sessionId,
-      text: sanitized,
+      text: resolved.text,
       isFinal,
     });
   }

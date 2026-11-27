@@ -21,6 +21,7 @@ import {
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
+import { buildNpmInvocation, resolveNpmCliJs } from '../../src/util/windows-launch-preflight.mjs';
 
 const PREFLIGHT_SRC = join(process.cwd(), 'src', 'util', 'windows-launch-preflight.mjs');
 const NODE_DATACHANNEL_REPAIR_SRC = join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs');
@@ -75,7 +76,7 @@ function makeSandbox(opts: {
   }
 
   // node_modules: critical deps healthy except those in halfInstalledDeps.
-  const allCritical = ['commander', 'ws', 'cors', 'body-parser', 'hono', '@huggingface/transformers'];
+  const allCritical = ['commander', 'ws', 'cors', 'body-parser', 'hono', 'pino', '@huggingface/transformers'];
   const half = new Set(opts.halfInstalledDeps ?? []);
   for (const dep of allCritical) {
     const depDir = join(pkgRoot, 'node_modules', dep);
@@ -124,24 +125,25 @@ exit ${opts.npmExitCode ?? 0}
   return { root, pkgRoot, preflight, shimDir, homeDir, npmCallLog, repairLog };
 }
 
-function runPreflight(sb: Sandbox): { stderr: string; status: number | null } {
+function runPreflight(sb: Sandbox, envOverride?: (env: NodeJS.ProcessEnv) => NodeJS.ProcessEnv): { stderr: string; status: number | null } {
+  const baseEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: `${sb.shimDir}:${process.env.PATH ?? ''}`,
+    HOME: sb.homeDir,
+    USERPROFILE: sb.homeDir,        // Windows env name; preflight uses homedir() either way
+    IMCODES_HOME: join(sb.homeDir, '.imcodes'),
+    IMCODES_LAUNCH_REPAIR_LOG: sb.repairLog,
+    // Keep npm and module lookup hermetic; the shim never reaches the
+    // registry, and no ambient NODE_PATH/global cache may influence checks.
+    NODE_PATH: '',
+    npm_config_cache: join(sb.root, 'npm-cache'),
+    npm_config_prefix: join(sb.root, 'npm-prefix'),
+    npm_config_userconfig: join(sb.root, 'npmrc'),
+    npm_config_update_notifier: 'false',
+    npm_config_offline: 'true',
+  };
   const r = spawnSync(process.execPath, [sb.preflight], {
-    env: {
-      ...process.env,
-      PATH: `${sb.shimDir}:${process.env.PATH ?? ''}`,
-      HOME: sb.homeDir,
-      USERPROFILE: sb.homeDir,        // Windows env name; preflight uses homedir() either way
-      IMCODES_HOME: join(sb.homeDir, '.imcodes'),
-      IMCODES_LAUNCH_REPAIR_LOG: sb.repairLog,
-      // Keep npm and module lookup hermetic; the shim never reaches the
-      // registry, and no ambient NODE_PATH/global cache may influence checks.
-      NODE_PATH: '',
-      npm_config_cache: join(sb.root, 'npm-cache'),
-      npm_config_prefix: join(sb.root, 'npm-prefix'),
-      npm_config_userconfig: join(sb.root, 'npmrc'),
-      npm_config_update_notifier: 'false',
-      npm_config_offline: 'true',
-    },
+    env: envOverride ? envOverride(baseEnv) : baseEnv,
     encoding: 'utf8',
     timeout: 15_000,
   });
@@ -169,14 +171,178 @@ describe('src/util/windows-launch-preflight.mjs', () => {
     }
   });
 
-  it('first fixed-version launch invokes optional-native repair before returning to watchdog', () => {
+  it('first fixed-version launch invokes isolated optional-native repair before returning to watchdog', () => {
     const sb = makeSandbox({ brokenNodeDatachannel: true });
     try {
       const r = runPreflight(sb);
       expect(r.status).toBe(0);
       const npmLog = readFileSync(sb.npmCallLog, 'utf8');
       expect(npmLog).toContain(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel --ignore-scripts=false --foreground-scripts`);
-      expect(npmLog).toContain(`install --global=false --prefix ${sb.pkgRoot} --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test`);
+      expect(npmLog).toContain('install --global=false --prefix ');
+      expect(npmLog).not.toContain(`install --global=false --prefix ${sb.pkgRoot} --no-save`);
+      expect(npmLog).toContain('--no-save --no-audit --no-fund --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test');
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('half-installed pino: invokes npm install -g --ignore-scripts imcodes@<pinned>', () => {
+    const sb = makeSandbox({ halfInstalledDeps: ['pino'] });
+    try {
+      const r = runPreflight(sb);
+      expect(r.status).toBe(0);
+      const npmLog = readFileSync(sb.npmCallLog, 'utf8');
+      expect(npmLog).toContain('install -g --ignore-scripts --prefer-online imcodes@1.2.3');
+      expect(r.stderr).toMatch(/half-installed/);
+      expect(r.stderr).toMatch(/pino/);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves npm-cli.js for Windows npm.cmd on PATH and avoids direct .cmd spawn under shell:false', () => {
+    const root = mkdtempSync(join(tmpdir(), 'win-npm-cli & space-'));
+    try {
+      const customNpmBinDir = join(root, 'Custom npm & tools');
+      const npmCmd = join(customNpmBinDir, 'npm.cmd');
+      const npmCli = join(customNpmBinDir, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+      const fakeNode = join(root, 'node-bin', 'node.exe');
+      mkdirSync(join(customNpmBinDir, 'node_modules', 'npm', 'bin'), { recursive: true });
+      mkdirSync(join(root, 'node-bin'), { recursive: true });
+      writeFileSync(npmCmd, '@echo off\r\n');
+      writeFileSync(npmCli, '// npm-cli fixture\n');
+      writeFileSync(fakeNode, 'exe');
+
+      expect(resolveNpmCliJs('npm.cmd', fakeNode, { PATH: customNpmBinDir })).toBe(npmCli);
+      const invocation = buildNpmInvocation(
+        ['install', '-g', '--ignore-scripts', '--prefer-online', 'imcodes@1.2.3'],
+        {
+          npmCommand: 'npm.cmd',
+          platform: 'win32',
+          nodeExecPath: fakeNode,
+          env: { PATH: customNpmBinDir },
+        },
+      );
+      expect(invocation).toEqual({
+        command: fakeNode,
+        args: [npmCli, 'install', '-g', '--ignore-scripts', '--prefer-online', 'imcodes@1.2.3'],
+        npmCli,
+      });
+      const preflightSrc = readFileSync(PREFLIGHT_SRC, 'utf8');
+      expect(preflightSrc).toContain('shell: false');
+      expect(preflightSrc).toContain('resolveNpmCliJs');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('injectable npm-cli.js fixture fixes half-installed pino via node, clears same-version marker, and re-runs repair', () => {
+    const sb = makeSandbox({ halfInstalledDeps: ['pino'], brokenNodeDatachannel: true });
+    try {
+      const fixtureCli = join(sb.root, 'npm-cli-fixture.cjs');
+      const fixtureLog = join(sb.root, 'npm-cli-calls.jsonl');
+      writeFileSync(fixtureCli, [
+        "const { appendFileSync, mkdirSync, writeFileSync } = require('node:fs');",
+        "const { join } = require('node:path');",
+        "const args = process.argv.slice(2);",
+        `appendFileSync(${JSON.stringify(fixtureLog)}, JSON.stringify({ execPath: process.execPath, args }) + '\\n');`,
+        "if (args[0] === 'install' && args[1] === '-g') {",
+        // Restore pino cleanly (simulating `npm install -g imcodes@1.2.3`) without repairing node-datachannel yet.
+        `  writeFileSync(${JSON.stringify(join(sb.pkgRoot, 'node_modules', 'pino', 'package.json'))}, JSON.stringify({ name: 'pino', version: '9.0.0' }));`,
+        "  process.exit(0);",
+        "}",
+        "if (args[0] === 'install' && args.includes('--prefix')) {",
+        "  const prefix = args[args.indexOf('--prefix') + 1];",
+        "  const depDir = join(prefix, 'node_modules', 'node-datachannel');",
+        "  mkdirSync(depDir, { recursive: true });",
+        "  writeFileSync(join(depDir, 'package.json'), JSON.stringify({ name: 'node-datachannel', version: '0.0.0-test', type: 'module', main: './index.js' }));",
+        "  writeFileSync(join(depDir, 'index.js'), 'export default { fixed: true };\\n');",
+        "  process.exit(0);",
+        "}",
+        "process.exit(2);",
+      ].join('\n'));
+      const markerPath = join(sb.homeDir, '.imcodes', 'node-datachannel-repair-failed.txt');
+      writeFileSync(markerPath, `1.2.3|${sb.pkgRoot}`);
+
+      const r = runPreflight(sb, (env) => ({
+        ...env,
+        PATH: '',
+        IMCODES_NPM_CLI: fixtureCli,
+      }));
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain('node-datachannel launch repair skipped');
+      expect(r.stderr).toContain('self-repair OK');
+      expect(existsSync(sb.npmCallLog)).toBe(false);
+      expect(existsSync(markerPath)).toBe(false);
+
+      const calls = readFileSync(fixtureLog, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as { execPath: string; args: string[] });
+      expect(calls[0]).toEqual({
+        execPath: process.execPath,
+        args: ['install', '-g', '--ignore-scripts', '--prefer-online', 'imcodes@1.2.3'],
+      });
+      expect(calls.some((c) => c.args[0] === 'rebuild' && c.args.includes(`--prefix`) && c.args.includes(sb.pkgRoot))).toBe(true);
+      expect(calls.some((c) => c.args[0] === 'install' && !c.args.includes('-g') && c.args.includes('node-datachannel@0.0.0-test'))).toBe(true);
+      expect(readFileSync(join(sb.pkgRoot, 'node_modules', 'node-datachannel', 'index.js'), 'utf8')).toContain('fixed: true');
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('still self-repairs half-installed pino via npm-cli.js fixture when node-datachannel-repair.mjs helper is absent', () => {
+    const sb = makeSandbox({ halfInstalledDeps: ['pino'] });
+    try {
+      const fixtureCli = join(sb.root, 'npm-cli-absent-helper.cjs');
+      const fixtureLog = join(sb.root, 'npm-cli-absent-helper.jsonl');
+      writeFileSync(fixtureCli, [
+        "const { appendFileSync } = require('node:fs');",
+        `appendFileSync(${JSON.stringify(fixtureLog)}, JSON.stringify(process.argv.slice(2)) + '\\n');`,
+        "process.exit(0);",
+      ].join('\n'));
+      expect(existsSync(join(sb.pkgRoot, 'dist', 'src', 'util', 'node-datachannel-repair.mjs'))).toBe(false);
+
+      const r = runPreflight(sb, (env) => ({
+        ...env,
+        PATH: '',
+        IMCODES_NPM_CLI: fixtureCli,
+      }));
+      expect(r.status).toBe(0);
+      expect(r.stderr).toContain('self-repair OK');
+      const calls = readFileSync(fixtureLog, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as string[]);
+      expect(calls).toEqual([['install', '-g', '--ignore-scripts', '--prefer-online', 'imcodes@1.2.3']]);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('skips repeated launch-time node-datachannel repair for the same failing version+pkgRoot and retries on version change', () => {
+    const sb = makeSandbox({ brokenNodeDatachannel: true, npmExitCode: 1 });
+    try {
+      const first = runPreflight(sb);
+      expect(first.status).toBe(0);
+      const callsAfterFirst = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n').filter(Boolean);
+      expect(callsAfterFirst.length).toBeGreaterThan(0);
+      const markerPath = join(sb.homeDir, '.imcodes', 'node-datachannel-repair-failed.txt');
+      expect(existsSync(markerPath)).toBe(true);
+      expect(readFileSync(markerPath, 'utf8')).toBe(`1.2.3|${sb.pkgRoot}`);
+
+      const second = runPreflight(sb);
+      expect(second.status).toBe(0);
+      expect(second.stderr).toContain('node-datachannel launch repair skipped');
+      const callsAfterSecond = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n').filter(Boolean);
+      expect(callsAfterSecond).toEqual(callsAfterFirst);
+
+      writeFileSync(
+        join(sb.pkgRoot, 'package.json'),
+        JSON.stringify({ name: 'imcodes', version: '1.2.4', optionalDependencies: { 'node-datachannel': '0.0.0-test' } }),
+      );
+      const third = runPreflight(sb);
+      expect(third.status).toBe(0);
+      const callsAfterThird = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n').filter(Boolean);
+      expect(callsAfterThird.length).toBeGreaterThan(callsAfterSecond.length);
+      expect(readFileSync(markerPath, 'utf8')).toBe(`1.2.4|${sb.pkgRoot}`);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
@@ -214,7 +380,8 @@ describe('src/util/windows-launch-preflight.mjs', () => {
       ))).toBe(true);
       expect(calls.slice(globalInstall + 1).some((call) => (
         call.includes(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel`)
-        || (call.includes(`install --global=false --prefix ${sb.pkgRoot} --no-save`)
+        || (call.includes('install --global=false --prefix ')
+          && !call.includes(`--prefix ${sb.pkgRoot}`)
           && call.includes('node-datachannel@0.0.0-test'))
       ))).toBe(true);
     } finally {

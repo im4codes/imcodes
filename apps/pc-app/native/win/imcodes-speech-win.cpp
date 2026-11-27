@@ -45,6 +45,11 @@ constexpr int kTargetSampleRate = 16000;
 constexpr size_t kInitialPartialSamples = 12800;   // 0.8s @ 16kHz
 constexpr size_t kStepPartialSamples = 12800;      // 0.8s stride
 constexpr size_t kMaxSegmentSamples = 216000;      // 13.5s segment cap
+constexpr size_t kMinPauseSplitSamples = 96000;    // 6.0s before natural pause split
+constexpr size_t kPauseWindowSamples = 6400;       // 400ms trailing silence window
+constexpr size_t kPauseScanStrideSamples = 800;    // 50ms scan stride for pause boundary
+constexpr float kPauseRmsThreshold = 0.012f;
+constexpr float kSpeechPeakThreshold = 0.02f;
 
 std::mutex g_output_mutex;
 
@@ -222,16 +227,98 @@ bool collapse_cp_runs_for_period(std::vector<uint32_t>& cps, size_t period) {
   return true;
 }
 
-std::string sanitize_asr_repetition_loop(const std::string& input) {
+bool is_ascii_ws(char c) {
+  return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+bool is_ascii_alnum(unsigned char c) {
+  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+}
+
+bool is_lang_token_char(unsigned char c) {
+  return is_ascii_alnum(c) || c == '_' || c == '-';
+}
+
+std::string trim_ascii_ws(const std::string& input) {
+  size_t start = 0;
+  while (start < input.size() && is_ascii_ws(input[start])) ++start;
+  size_t end = input.size();
+  while (end > start && is_ascii_ws(input[end - 1])) --end;
+  return input.substr(start, end - start);
+}
+
+/**
+ * Strip Qwen3-ASR control prefixes/tags (e.g. `language None<asr_text>`,
+ * `language Chinese<asr_text>`, `<asr_text>`, `<|endoftext|>`) without touching
+ * normal sentences that merely contain `"language"`.
+ */
+std::string strip_asr_control_tags(const std::string& input) {
   if (input.empty()) return {};
-  bool only_ws = true;
-  for (unsigned char c : input) {
-    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
-      only_ws = false;
-      break;
+  std::string out;
+  out.reserve(input.size());
+  size_t i = 0;
+  const std::string kAsrTag = "<asr_text>";
+  const std::string kLangPrefix = "language";
+  while (i < input.size()) {
+    // Match `[word boundary]language <lang>[ws]*<asr_text>`
+    if (i + kLangPrefix.size() < input.size() &&
+        input.compare(i, kLangPrefix.size(), kLangPrefix) == 0 &&
+        (i == 0 || (!is_ascii_alnum(static_cast<unsigned char>(input[i - 1])) && input[i - 1] != '_'))) {
+      size_t p = i + kLangPrefix.size();
+      if (p < input.size() && is_ascii_ws(input[p])) {
+        while (p < input.size() && is_ascii_ws(input[p])) ++p;
+        const size_t lang_start = p;
+        while (p < input.size() && is_lang_token_char(static_cast<unsigned char>(input[p]))) ++p;
+        if (p > lang_start) {
+          while (p < input.size() && is_ascii_ws(input[p])) ++p;
+          if (p + kAsrTag.size() <= input.size() && input.compare(p, kAsrTag.size(), kAsrTag) == 0) {
+            i = p + kAsrTag.size();
+            continue;
+          }
+        }
+      }
     }
+    if (i + kAsrTag.size() <= input.size() && input.compare(i, kAsrTag.size(), kAsrTag) == 0) {
+      i += kAsrTag.size();
+      continue;
+    }
+    if (i + 2 < input.size() && input[i] == '<' && input[i + 1] == '|') {
+      size_t p = i + 2;
+      while (p < input.size() && (p - (i + 2)) <= 48 &&
+             input[p] != '|' && input[p] != '>' && input[p] != '\r' && input[p] != '\n') {
+        ++p;
+      }
+      const size_t body_len = p - (i + 2);
+      if (body_len >= 1 && body_len <= 48 && p + 1 < input.size() &&
+          input[p] == '|' && input[p + 1] == '>') {
+        i = p + 2;
+        continue;
+      }
+    }
+    out.push_back(input[i]);
+    ++i;
   }
-  if (only_ws) return {};
+  return trim_ascii_ws(out);
+}
+
+/**
+ * Join committed and active transcript segments, inserting a single ASCII space
+ * only between adjacent ASCII alphanumeric characters (matching macOS).
+ */
+std::string join_transcript_segments(const std::string& committed, const std::string& active) {
+  const std::string lhs = trim_ascii_ws(committed);
+  const std::string rhs = trim_ascii_ws(active);
+  if (lhs.empty()) return rhs;
+  if (rhs.empty()) return lhs;
+  const bool needs_space =
+      is_ascii_alnum(static_cast<unsigned char>(lhs.back())) &&
+      is_ascii_alnum(static_cast<unsigned char>(rhs.front()));
+  return needs_space ? (lhs + " " + rhs) : (lhs + rhs);
+}
+
+std::string sanitize_asr_repetition_loop(const std::string& raw_input) {
+  const std::string input = strip_asr_control_tags(raw_input);
+  if (input.empty()) return {};
   std::vector<uint32_t> cps = utf8_to_codepoints(input);
   if (cps.size() < 8) return input;
 
@@ -553,6 +640,72 @@ std::string resolve_target_capture_uid(const std::string& requested_uid) {
   return devices.empty() ? std::string{} : devices.front().uid;
 }
 
+template <typename SampleAtFn>
+float window_rms_indexed(SampleAtFn&& sample_at, size_t start, size_t count) {
+  if (count == 0) return 0.0f;
+  double sum_sq = 0.0;
+  for (size_t i = 0; i < count; ++i) {
+    const double s = static_cast<double>(sample_at(start + i));
+    sum_sq += s * s;
+  }
+  return static_cast<float>(std::sqrt(sum_sq / static_cast<double>(count)));
+}
+
+template <typename SampleAtFn>
+bool has_speech_energy_indexed(SampleAtFn&& sample_at, size_t end) {
+  for (size_t i = 0; i < end; ++i) {
+    if (std::fabs(sample_at(i)) >= kSpeechPeakThreshold) return true;
+  }
+  return false;
+}
+
+bool has_trailing_silence_pause(const std::vector<float>& samples, const std::string& active_segment_text) {
+  if (samples.size() < kMinPauseSplitSamples || samples.size() <= kPauseWindowSamples) {
+    return false;
+  }
+  const auto at = [&](size_t idx) { return samples[idx]; };
+  const size_t win_start = samples.size() - kPauseWindowSamples;
+  if (active_segment_text.empty() && !has_speech_energy_indexed(at, win_start)) {
+    return false;
+  }
+  return window_rms_indexed(at, win_start, kPauseWindowSamples) < kPauseRmsThreshold;
+}
+
+size_t find_pause_split_take_count(
+    const std::vector<float>& segment_samples,
+    const std::vector<float>& pending_samples,
+    size_t pending_head,
+    size_t max_take,
+    const std::string& active_segment_text) {
+  const size_t cur_len = segment_samples.size();
+  const size_t total = cur_len + max_take;
+  if (max_take == 0 || total < kMinPauseSplitSamples || total <= kPauseWindowSamples) {
+    return max_take;
+  }
+  const auto at = [&](size_t idx) {
+    return idx < cur_len ? segment_samples[idx] : pending_samples[pending_head + (idx - cur_len)];
+  };
+  const size_t min_cand = std::max(kMinPauseSplitSamples, cur_len + 1);
+  const size_t first_aligned = ((min_cand + kPauseScanStrideSamples - 1) / kPauseScanStrideSamples) * kPauseScanStrideSamples;
+  auto check_cand = [&](size_t cand_total) -> bool {
+    if (cand_total <= kPauseWindowSamples || cand_total > total) return false;
+    const size_t win_start = cand_total - kPauseWindowSamples;
+    if (window_rms_indexed(at, win_start, kPauseWindowSamples) >= kPauseRmsThreshold) {
+      return false;
+    }
+    return !active_segment_text.empty() || has_speech_energy_indexed(at, win_start);
+  };
+  for (size_t cand = first_aligned; cand <= total; cand += kPauseScanStrideSamples) {
+    if (check_cand(cand)) {
+      return cand - cur_len;
+    }
+  }
+  if (total >= min_cand && check_cand(total)) {
+    return max_take;
+  }
+  return max_take;
+}
+
 template <typename DecodeFn, typename EmitFn>
 class SegmentedUtterancePipeline {
  public:
@@ -609,6 +762,8 @@ class SegmentedUtterancePipeline {
     std::vector<float> segment_samples;
     segment_samples.reserve(kMaxSegmentSamples + 16000);
     std::string committed_text;
+    std::string active_segment_text;
+    std::string last_emitted_text;
     size_t last_decoded_len = 0;
 
     while (true) {
@@ -631,7 +786,13 @@ class SegmentedUtterancePipeline {
           const size_t space = kMaxSegmentSamples > segment_samples.size()
               ? (kMaxSegmentSamples - segment_samples.size())
               : 0;
-          const size_t take = std::min(space, available);
+          const size_t max_take = std::min(space, available);
+          const size_t take = find_pause_split_take_count(
+              segment_samples,
+              pending_samples_,
+              pending_head_,
+              max_take,
+              active_segment_text);
           if (take > 0) {
             segment_samples.insert(
                 segment_samples.end(),
@@ -654,14 +815,17 @@ class SegmentedUtterancePipeline {
       }
 
       const bool reached_segment_cap = segment_samples.size() >= kMaxSegmentSamples;
+      const bool reached_pause_split =
+          !reached_segment_cap && has_trailing_silence_pause(segment_samples, active_segment_text);
+      const bool should_commit_segment = reached_segment_cap || reached_pause_split;
       const bool need_decode =
           segment_samples.size() >= kInitialPartialSamples &&
           (segment_samples.size() - last_decoded_len >= kStepPartialSamples ||
-           reached_segment_cap);
+           should_commit_segment);
 
-      if (need_decode && !(can_finish_now && !reached_segment_cap)) {
+      if (need_decode && !(can_finish_now && !should_commit_segment)) {
         last_decoded_len = segment_samples.size();
-        const std::string seg_text = decode_fn_(segment_samples);
+        const std::string seg_text = strip_asr_control_tags(decode_fn_(segment_samples));
         {
           std::lock_guard<std::mutex> lock(mu_);
           if (aborted_) {
@@ -671,24 +835,27 @@ class SegmentedUtterancePipeline {
         if (is_aborted) {
           break;
         }
-        std::string combined = committed_text;
         if (!seg_text.empty()) {
-          if (!combined.empty()) combined.push_back(' ');
-          combined += seg_text;
+          active_segment_text = seg_text;
         }
-        if (reached_segment_cap) {
-          if (!seg_text.empty()) {
+        const std::string& effective_seg = !seg_text.empty() ? seg_text : active_segment_text;
+        const std::string combined = join_transcript_segments(committed_text, effective_seg);
+        if (should_commit_segment) {
+          if (!effective_seg.empty()) {
             committed_text = combined;
           }
+          active_segment_text.clear();
           segment_samples.clear();
           last_decoded_len = 0;
-          if (!can_finish_now && !combined.empty()) {
+          if (!can_finish_now && !combined.empty() && combined != last_emitted_text) {
+            last_emitted_text = combined;
             emit_fn_("{\"type\":\"result\",\"text\":\"" + json_escape(combined) + "\",\"isFinal\":false}");
           }
           if (has_remaining_pending || (is_stop_requested && !can_finish_now)) {
             continue;
           }
-        } else if (!combined.empty()) {
+        } else if (!seg_text.empty() && !combined.empty() && combined != last_emitted_text) {
+          last_emitted_text = combined;
           emit_fn_("{\"type\":\"result\",\"text\":\"" + json_escape(combined) + "\",\"isFinal\":false}");
         }
       }
@@ -705,14 +872,14 @@ class SegmentedUtterancePipeline {
     }
 
     if (!final_aborted) {
-      std::string final_text = committed_text;
+      std::string final_seg = active_segment_text;
       if (segment_samples.size() >= 1600) {
-        const std::string tail_text = decode_fn_(segment_samples);
+        const std::string tail_text = strip_asr_control_tags(decode_fn_(segment_samples));
         if (!tail_text.empty()) {
-          if (!final_text.empty()) final_text.push_back(' ');
-          final_text += tail_text;
+          final_seg = tail_text;
         }
       }
+      const std::string final_text = join_transcript_segments(committed_text, final_seg);
       emit_fn_("{\"type\":\"result\",\"text\":\"" + json_escape(final_text) + "\",\"isFinal\":true}");
     }
     emit_fn_("{\"type\":\"end\"}");
@@ -786,8 +953,8 @@ class Qwen3OnnxEngine {
       cfg.model_config.qwen3_asr.encoder = encoder_.c_str();
       cfg.model_config.qwen3_asr.decoder = decoder_.c_str();
       cfg.model_config.qwen3_asr.tokenizer = tokenizer_.c_str();
-      cfg.model_config.qwen3_asr.max_total_len = 512;
-      cfg.model_config.qwen3_asr.max_new_tokens = 128;
+      cfg.model_config.qwen3_asr.max_total_len = 1024;
+      cfg.model_config.qwen3_asr.max_new_tokens = 256;
       cfg.model_config.qwen3_asr.temperature = 1e-6f;
       cfg.model_config.qwen3_asr.top_p = 0.8f;
       cfg.model_config.qwen3_asr.seed = 42;
@@ -826,9 +993,7 @@ class Qwen3OnnxEngine {
       SherpaOnnxDestroyOfflineRecognizerResult(res);
     }
     SherpaOnnxDestroyOfflineStream(stream);
-    while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) text.erase(text.begin());
-    while (!text.empty() && (text.back() == ' ' || text.back() == '\t')) text.pop_back();
-    return sanitize_asr_repetition_loop(text);
+    return sanitize_asr_repetition_loop(strip_asr_control_tags(text));
   }
 
   const std::string& active_provider() const { return active_provider_; }
@@ -1410,7 +1575,9 @@ int run_hotkey_command() {
   } state;
 
   std::atomic<bool> quit_flag{false};
+  std::atomic<DWORD> hook_tid{0};
   std::thread hook_thread([&]() {
+    hook_tid.store(GetCurrentThreadId());
     g_keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, GetModuleHandleW(nullptr), 0);
     if (!g_keyboard_hook) {
       emit_error("hook_failed", "", "SetWindowsHookExW(WH_KEYBOARD_LL) failed");
@@ -1554,8 +1721,8 @@ int run_hotkey_command() {
   }
 
   if (hook_thread.joinable()) {
-    DWORD hook_tid = GetThreadId(hook_thread.native_handle());
-    if (hook_tid != 0) PostThreadMessageW(hook_tid, WM_QUIT, 0, 0);
+    const DWORD tid = hook_tid.load();
+    if (tid != 0) PostThreadMessageW(tid, WM_QUIT, 0, 0);
     hook_thread.join();
   }
   return 0;

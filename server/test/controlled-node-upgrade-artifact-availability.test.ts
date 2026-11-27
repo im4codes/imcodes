@@ -193,6 +193,20 @@ async function waitForReal(predicate: () => boolean, timeoutMs = 2_000): Promise
   }
 }
 
+/**
+ * Waits until WsBridge has finished both `isDaemonConnected()` and the entire
+ * async post-auth chain (`authPromise` -> `finishLocalAuth()`), which arms the
+ * post-auth upgrade stagger timer synchronously before resolving.
+ */
+async function waitForPostAuthUpgradeArmed(bridge: WsBridge): Promise<void> {
+  const internal = bridge as unknown as { authPromise: Promise<void> | null };
+  await waitForReal(() => bridge.isDaemonConnected());
+  while (internal.authPromise) {
+    await internal.authPromise;
+  }
+  await Promise.resolve();
+}
+
 describe('controlled-node upgrade artifact availability', () => {
   let restorePublisherSignerResolver: (() => void) | null = null;
 
@@ -335,9 +349,9 @@ describe('controlled-node upgrade artifact availability', () => {
       daemonVersion: '2026.11.6629-dev.6677',
       capabilities: [],
     }));
+    await waitForPostAuthUpgradeArmed(winBridge);
     await waitForReal(() =>
-      winBridge.isDaemonConnected()
-      && winRowState.controlled_upgrade_status === CONTROLLED_NODE_UPGRADE_STATUS.CURRENT,
+      winRowState.controlled_upgrade_status === CONTROLLED_NODE_UPGRADE_STATUS.CURRENT,
     );
     await vi.advanceTimersByTimeAsync(20_000);
 
@@ -390,7 +404,7 @@ describe('controlled-node upgrade artifact availability', () => {
       daemonVersion: '2026.11.6629-dev.6677',
       capabilities: [],
     }));
-    await waitForReal(() => linuxBridge.isDaemonConnected());
+    await waitForPostAuthUpgradeArmed(linuxBridge);
     await vi.advanceTimersByTimeAsync(20_000);
     expect(linuxWs.sentMessages().some((m) => m.type === 'daemon.upgrade')).toBe(true);
 
@@ -416,7 +430,7 @@ describe('controlled-node upgrade artifact availability', () => {
       token,
       daemonVersion: '2026.11.6629-dev.6677',
     }));
-    await waitForReal(() => fullBridge.isDaemonConnected());
+    await waitForPostAuthUpgradeArmed(fullBridge);
     await vi.advanceTimersByTimeAsync(20_000);
     expect(fullWs.sentMessages().some((m) => m.type === 'daemon.upgrade')).toBe(true);
 
@@ -432,8 +446,7 @@ describe('controlled-node upgrade artifact availability', () => {
       daemonVersion: '2026.11.6629-dev.6677',
       capabilities: [],
     }));
-    await waitForReal(() => winBridge.isDaemonConnected());
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await waitForPostAuthUpgradeArmed(winBridge);
     await vi.advanceTimersByTimeAsync(20_000);
     await waitForReal(() => winWs2.sentMessages().some((m) => m.type === 'machine.exec'));
     // Triggers legacy rescue MACHINE_EXEC because this test node has no safe self-upgrade cap.
