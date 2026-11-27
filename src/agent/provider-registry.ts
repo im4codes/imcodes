@@ -12,6 +12,7 @@ import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE } from '../../shared/agent-types.js';
 
 const providers = new Map<string, TransportProvider>();
 const providerOps = new Map<string, Promise<void>>();
+const retiringProviders = new WeakSet<TransportProvider>();
 interface PendingEnsureEntry {
   promise: Promise<TransportProvider>;
   waiters: number;
@@ -36,6 +37,15 @@ export function setProviderRegistryServerLink(link: { send(msg: object): void })
 
 export function getProvider(id: string): TransportProvider | undefined {
   return providers.get(id);
+}
+
+/**
+ * Returns true iff `provider` is still the live, non-retiring instance registered for `id`.
+ * `disconnectProviderUnlocked` marks the active instance retiring synchronously before awaiting
+ * `provider.disconnect()` so concurrent launches and syncs cannot publish against a disconnecting gateway.
+ */
+export function isCurrentProvider(id: string, provider: TransportProvider): boolean {
+  return providers.get(id) === provider && !retiringProviders.has(provider);
 }
 
 export function getAllProviders(): TransportProvider[] {
@@ -137,6 +147,7 @@ async function connectProviderUnlocked(id: string, config: ProviderConfig): Prom
     await provider.disconnect().catch(() => {});
     throw err;
   }
+  retiringProviders.delete(provider);
   providers.set(id, provider);
   // A reconnected provider may now be able to do what it could not before.
   clearTransportRestoreBackoffForProvider(id);
@@ -176,10 +187,13 @@ export function connectProvider(id: string, config: ProviderConfig): Promise<voi
 async function disconnectProviderUnlocked(id: string): Promise<void> {
   const provider = providers.get(id);
   if (!provider) return;
+  retiringProviders.add(provider);
   try {
     await provider.disconnect();
   } finally {
-    providers.delete(id);
+    if (providers.get(id) === provider) {
+      providers.delete(id);
+    }
     broadcastProviderStatus(id, false);
     logger.info({ provider: id }, 'Provider disconnected');
   }

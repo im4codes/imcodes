@@ -17,6 +17,7 @@ const state = vi.hoisted(() => {
   let listSessionsResult: Array<{ key: string; displayName?: string }> = [];
   let listSessionsHook: ((instance: MockOcInstance) => Promise<Array<{ key: string; displayName?: string }>> | Array<{ key: string; displayName?: string }>) | null = null;
   let onConnectHook: ((instance: MockOcInstance) => Promise<void>) | null = null;
+  let onDisconnectHook: ((instance: MockOcInstance) => Promise<void>) | null = null;
   let identityHook: ((sessionName: string) => Promise<string | undefined>) | null = null;
   let releaseResourcesHook: (() => Promise<{ ok: number; failed: number }>) | null = null;
   let createSessionCalls = 0;
@@ -31,6 +32,8 @@ const state = vi.hoisted(() => {
     set listSessionsHook(fn: typeof listSessionsHook) { listSessionsHook = fn; },
     get onConnectHook() { return onConnectHook; },
     set onConnectHook(fn: typeof onConnectHook) { onConnectHook = fn; },
+    get onDisconnectHook() { return onDisconnectHook; },
+    set onDisconnectHook(fn: typeof onDisconnectHook) { onDisconnectHook = fn; },
     get identityHook() { return identityHook; },
     set identityHook(fn: typeof identityHook) { identityHook = fn; },
     get releaseResourcesHook() { return releaseResourcesHook; },
@@ -44,6 +47,7 @@ const state = vi.hoisted(() => {
       listSessionsResult = [];
       listSessionsHook = null;
       onConnectHook = null;
+      onDisconnectHook = null;
       identityHook = null;
       releaseResourcesHook = null;
       createSessionCalls = 0;
@@ -87,6 +91,7 @@ const mocks = vi.hoisted(() => {
         if (state.onConnectHook) await state.onConnectHook(inst);
       },
       disconnect: async () => {
+        if (state.onDisconnectHook) await state.onDisconnectHook(inst);
         inst.disconnected = true;
         mockDisconnect(inst.index);
       },
@@ -203,8 +208,10 @@ import {
   disconnectProvider,
   ensureProviderConnected,
   getProvider,
+  isCurrentProvider,
   setProviderRegistryServerLink,
 } from '../../src/agent/provider-registry.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import {
   getTransportRuntime,
   launchTransportSession,
@@ -667,5 +674,69 @@ describe('OpenClaw reconnect syncOcSessions + registry serialization', () => {
       expect(instance2.sendCalls).toHaveLength(1);
     });
     expect(instance1.sendCalls).toHaveLength(0);
+  });
+
+  it('refuses to publish runtime, store, or route when disconnectProvider starts retiring A after real runtime.initialize completes', async () => {
+    const serverLink = { send: vi.fn() };
+    state.listSessionsResult = [];
+    await connectProvider('openclaw', { url: 'ws://127.0.0.1:18789', token: 'tok-a' });
+    const providerA = getProvider('openclaw')!;
+    expect(isCurrentProvider('openclaw', providerA)).toBe(true);
+
+    // Ordinary refresh will see an unmaterialized A session.
+    state.listSessionsResult = [{ key: 'agent___main___main', displayName: 'Retiring A Main' }];
+
+    let postInitEnteredResolve!: () => void;
+    const postInitEntered = new Promise<void>((res) => { postInitEnteredResolve = res; });
+    let postInitGateResolve!: () => void;
+    const postInitGate = new Promise<void>((res) => { postInitGateResolve = res; });
+    const origInitialize = TransportSessionRuntime.prototype.initialize;
+    const initSpy = vi.spyOn(TransportSessionRuntime.prototype, 'initialize').mockImplementation(async function (this: TransportSessionRuntime, ...args) {
+      await origInitialize.apply(this, args);
+      postInitEnteredResolve();
+      await postInitGate;
+    });
+
+    let disconnectEnteredResolve!: () => void;
+    const disconnectEntered = new Promise<void>((res) => { disconnectEnteredResolve = res; });
+    let disconnectGateResolve!: () => void;
+    const disconnectGate = new Promise<void>((res) => { disconnectGateResolve = res; });
+    state.onDisconnectHook = async () => {
+      disconnectEnteredResolve();
+      await disconnectGate;
+    };
+
+    try {
+      const { syncOcSessions } = await import('../../src/daemon/oc-session-sync.js');
+      const refreshPromise = syncOcSessions(serverLink as any);
+      await postInitEntered;
+
+      // Start disconnecting A while real initialize is paused right before returning.
+      const disconnectPromise = disconnectProvider('openclaw');
+      await disconnectEntered;
+
+      // Even before A.disconnect() resolves (and while getProvider still holds A),
+      // A is synchronously retired for publish.
+      expect(getProvider('openclaw')).toBe(providerA);
+      expect(isCurrentProvider('openclaw', providerA)).toBe(false);
+
+      // Release initialize so launch attempts the synchronous publish check while disconnect is still pending.
+      postInitGateResolve();
+      await refreshPromise;
+
+      expect(getTransportRuntime('deck_agent___main')).toBeUndefined();
+      expect(state.store.get('deck_agent___main')).toBeUndefined();
+      expect(resolveSessionName('agent___main___main')).toBeUndefined();
+
+      disconnectGateResolve();
+      await disconnectPromise;
+
+      expect(getProvider('openclaw')).toBeUndefined();
+      expect(getTransportRuntime('deck_agent___main')).toBeUndefined();
+      expect(state.store.get('deck_agent___main')).toBeUndefined();
+      expect(resolveSessionName('agent___main___main')).toBeUndefined();
+    } finally {
+      initSpy.mockRestore();
+    }
   });
 });

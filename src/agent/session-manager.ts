@@ -27,7 +27,14 @@ import {
 import { RUNTIME_TYPES } from './session-runtime.js';
 import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { canonicalizeTransportCwd, normalizeTransportCwd } from './transport-paths.js';
-import { ensureProviderConnected, getProvider } from './provider-registry.js';
+import * as providerRegistry from './provider-registry.js';
+const { ensureProviderConnected, getProvider } = providerRegistry;
+
+function isRegistryProviderCurrent(id: string, provider: TransportProvider): boolean {
+  return typeof providerRegistry.isCurrentProvider === 'function'
+    ? providerRegistry.isCurrentProvider(id, provider)
+    : getProvider(id) === provider;
+}
 import {
   claimTransportRestoreNotice,
   clearTransportRestoreBackoff,
@@ -3902,14 +3909,14 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
   const cachedPreConnected = launchState?.preConnectedProvider;
   if (opts.connectTimeProvider) {
     provider = opts.connectTimeProvider;
-  } else if (cachedPreConnected && getProvider(agentType) === cachedPreConnected) {
+  } else if (cachedPreConnected && isRegistryProviderCurrent(agentType, cachedPreConnected)) {
     provider = cachedPreConnected;
   } else {
-    if (launchState && cachedPreConnected && getProvider(agentType) !== cachedPreConnected) {
-      // Handoff only unblocks waiting; if reconnect/disconnect already replaced it, never trust stale handle.
+    if (launchState && cachedPreConnected && !isRegistryProviderCurrent(agentType, cachedPreConnected)) {
+      // Handoff only unblocks waiting; if reconnect/disconnect already replaced or retired it, never trust stale handle.
       launchState.preConnectedProvider = undefined;
     }
-    if (opts.expectedProvider && getProvider(agentType) !== opts.expectedProvider) {
+    if (opts.expectedProvider && !isRegistryProviderCurrent(agentType, opts.expectedProvider)) {
       throw new Error(`Provider ${agentType} superseded before session launch`);
     }
     const controller = new AbortController();
@@ -3925,24 +3932,18 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
       controller.abort();
     }
   }
-  const providerTrackedInRegistry = !opts.connectTimeProvider && getProvider(agentType) === provider;
-  const assertLaunchProviderCurrent = async (
-    stage: string,
-    runtimeToKill?: TransportSessionRuntime,
-  ): Promise<void> => {
-    const liveProvider = getProvider(agentType);
+  const providerTrackedInRegistry = !opts.connectTimeProvider && isRegistryProviderCurrent(agentType, provider);
+  const isLaunchProviderStale = (): boolean => {
     const staleSource = Boolean(
-      opts.expectedProvider && (liveProvider !== opts.expectedProvider || provider !== opts.expectedProvider),
+      opts.expectedProvider
+        && (!isRegistryProviderCurrent(agentType, opts.expectedProvider) || provider !== opts.expectedProvider),
     );
-    const staleRegistry = Boolean(providerTrackedInRegistry && liveProvider !== provider);
-    if (staleSource || staleRegistry) {
-      if (runtimeToKill) {
-        await runtimeToKill.kill({ detachProviderSession: true }).catch(() => {});
-      }
-      throw new Error(`Provider ${agentType} changed ${stage}`);
-    }
+    const staleRegistry = Boolean(providerTrackedInRegistry && !isRegistryProviderCurrent(agentType, provider));
+    return staleSource || staleRegistry;
   };
-  await assertLaunchProviderCurrent('before session prepare');
+  if (isLaunchProviderStale()) {
+    throw new Error(`Provider ${agentType} changed before session prepare`);
+  }
 
   const launchRecord = getSession(name);
   const launchRecipient = recipientFromSessionRecord(launchRecord) ?? {
@@ -4250,8 +4251,10 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     ? existing.hookCredential
     : mintHookCredential();
   // Create session on provider
-  await assertLaunchProviderCurrent('before session initialize');
   const launchAuthContext = await resolveLaunchAuthContext(provider.id, transportEnv);
+  if (isLaunchProviderStale()) {
+    throw new Error(`Provider ${agentType} changed before session initialize`);
+  }
   await runtime.initialize({
     ...(opts.incognito ? { incognito: true } : {}),
     sessionKey: effectiveSessionKey,
@@ -4303,7 +4306,10 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     await runtime.kill({ detachProviderSession: true });
     throw Object.assign(new Error('AG launch owner changed'), { code: PROVIDER_ERROR_CODES.CANCELLED, recoverable: false });
   }
-  await assertLaunchProviderCurrent('during session launch', runtime);
+  if (isLaunchProviderStale()) {
+    await runtime.kill({ detachProviderSession: true }).catch(() => {});
+    throw new Error(`Provider ${agentType} changed during session launch`);
+  }
   const latestSessionInfo = getLatestSessionInfo();
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
