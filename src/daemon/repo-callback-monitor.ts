@@ -1186,6 +1186,9 @@ export class RepoCallbackMonitor {
   } {
     const sessions = this.listSessionsFn();
     const projectSessions = sessions.filter((s) => sameProjectDir(s.projectDir, config.projectDir));
+    const baseBrainRecord = projectSessions.find((s) => s.role === 'brain');
+    const inferredProjectName = baseBrainRecord?.projectName
+      ?? projectSessions.map((s) => resolveEffectiveProjectName(s, sessions)).find(Boolean);
 
     const requested = config.target.trim();
     if (!requested || requested === REPO_CALLBACK_TARGET_BRAIN) {
@@ -1212,9 +1215,6 @@ export class RepoCallbackMonitor {
         return { sessionName: brainRecord.name, record: brainRecord };
       }
 
-      const inferredProjectName = projectSessions
-        .map((s) => s.projectName || resolveEffectiveProjectName(s, sessions))
-        .find(Boolean);
       if (inferredProjectName) {
         const fallbackName = projectBrainSession(inferredProjectName);
         const fallbackRecord = sessions.find((s) => s.name === fallbackName);
@@ -1244,26 +1244,11 @@ export class RepoCallbackMonitor {
       return { sessionName: REPO_CALLBACK_TARGET_BRAIN, error: `No session found for ${config.projectDir}` };
     }
 
-    const baseBrainRecord = projectSessions.find((s) => s.role === 'brain');
-    const baseInferredProjectName = baseBrainRecord?.projectName
-      ?? projectSessions.map((s) => resolveEffectiveProjectName(s, sessions)).find(Boolean);
-
-    const projectNames = new Set(
-      projectSessions
-        .map((s) => s.projectName || resolveEffectiveProjectName(s, sessions))
-        .filter((name): name is string => typeof name === 'string' && name.length > 0),
-    );
-    if (baseInferredProjectName) {
-      projectNames.add(baseInferredProjectName);
-    }
-
     const exact = sessions.find((s) => (
       s.name === requested
       && (
         sameProjectDir(s.projectDir, config.projectDir)
-        || (baseInferredProjectName !== undefined && resolveEffectiveProjectName(s, sessions) === baseInferredProjectName)
-        || projectNames.has(s.projectName)
-        || projectNames.has(resolveEffectiveProjectName(s, sessions))
+        || (inferredProjectName !== undefined && resolveEffectiveProjectName(s, sessions) === inferredProjectName)
       )
     ));
     if (!exact) {

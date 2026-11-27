@@ -2233,6 +2233,134 @@ describe('RepoCallbackMonitor background polling & delivery', () => {
       expect(callbacks[0]!.targetSession).toBe('deck_cd1_w1');
       expect(callbacks[0]!.status).toBe('pending');
 
+      // Counterpart check: explicit target deck_cd_w1 (with projectName='cd' in different cwd)
+      // must NOT be matched by the cd1 project scope and must be rejected as unavailable
+      const cdWorker = makeSession({
+        name: 'deck_cd_w1',
+        projectName: 'cd',
+        projectDir: '/tmp/linked-worktree',
+        role: 'w1',
+        state: 'running',
+        updatedAt: 5000,
+      });
+      const prCd: RepoPR = {
+        number: 852,
+        title: 'Cross-cwd Worktree PR 2',
+        author: 'eve',
+        state: 'open',
+        draft: false,
+        head: 'feat/cross-cwd-2',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 3_000,
+        updatedAt: nowMs + 3_000,
+        url: 'https://github.com/acme/widget/pull/852',
+      };
+      const providerCd: RepoProvider = {
+        ...createMockProvider({}),
+        listPRs: vi.fn(async () => ({ items: [prCd], page: 1, hasMore: false, projectDir: '/tmp/repo-shared' })),
+      };
+
+      const configCd = createDefaultRepoCallbackConfig('/tmp/repo-shared');
+      configCd.enabled = true;
+      configCd.target = 'deck_cd_w1';
+      configCd.sinceAtMs = nowMs;
+      configCd.events.pr_new.enabled = true;
+
+      const monitorCd = new RepoCallbackMonitor({
+        store,
+        detect: async () => createOkContext('/tmp/repo-shared'),
+        createProvider: () => providerCd,
+        listSessions: () => [cd1Brain, cdBrain, cd1Worker, cdWorker],
+        sendToSession: async (sessionName, text) => {
+          sent.push({ sessionName, text });
+        },
+        now: () => nowMs + 4_000,
+      });
+      monitorCd.setConfigsForTesting({ repos: { '/tmp/repo-shared': configCd } });
+
+      const resCd = await monitorCd.checkProject('/tmp/repo-shared');
+      expect(resCd).toEqual({ checked: true, dispatched: 0 });
+      const cdCallbacks = store.listCallbacks({ scopeKey: '/tmp/repo-shared' });
+      const failedCd = cdCallbacks.find((c) => c.targetSession === 'deck_cd_w1');
+      expect(failedCd).toBeTruthy();
+      expect(failedCd?.status).toBe('failed');
+      expect(failedCd?.lastError).toContain('unavailable');
+
+      store.close();
+    });
+
+    it('boundary 6: infers parent project scope via resolveEffectiveProjectName when repo has only child sessions', async () => {
+      const store = new CallbackTaskStore(':memory:');
+      const nowMs = 1_700_900_000_000;
+      const sent: Array<{ sessionName: string; text: string }> = [];
+
+      const pr: RepoPR = {
+        number: 86,
+        title: 'Parent Scope PR',
+        author: 'frank',
+        state: 'open',
+        draft: false,
+        head: 'feat/parent-scope',
+        base: 'main',
+        labels: [],
+        createdAt: nowMs + 1_000,
+        updatedAt: nowMs + 1_000,
+        url: 'https://github.com/acme/widget/pull/86',
+      };
+      const provider: RepoProvider = {
+        ...createMockProvider({}),
+        listPRs: vi.fn(async () => ({ items: [pr], page: 1, hasMore: false, projectDir: '/tmp/repo-child' })),
+      };
+
+      const config = createDefaultRepoCallbackConfig('/tmp/repo-child');
+      config.enabled = true;
+      config.target = 'brain';
+      config.sinceAtMs = nowMs;
+      config.events.pr_new.enabled = true;
+
+      // Child worker located in /tmp/repo-child with raw projectName != parent project
+      const childWorker = makeSession({
+        name: 'deck_child_w1',
+        projectName: 'child_raw',
+        projectDir: '/tmp/repo-child',
+        role: 'w1',
+        parentSession: 'deck_parent_proj_brain',
+        state: 'running',
+        updatedAt: 1000,
+      });
+      // Parent brain located elsewhere in /tmp/repo-parent with projectName: 'parent_proj'
+      const parentBrain = makeSession({
+        name: 'deck_parent_proj_brain',
+        projectName: 'parent_proj',
+        projectDir: '/tmp/repo-parent',
+        role: 'brain',
+        state: 'idle',
+        updatedAt: 2000,
+      });
+
+      const monitor = new RepoCallbackMonitor({
+        store,
+        detect: async () => createOkContext('/tmp/repo-child'),
+        createProvider: () => provider,
+        listSessions: () => [childWorker, parentBrain],
+        sendToSession: async (sessionName, text) => {
+          sent.push({ sessionName, text });
+        },
+        now: () => nowMs + 2_000,
+      });
+      monitor.setConfigsForTesting({ repos: { '/tmp/repo-child': config } });
+
+      const res = await monitor.checkProject('/tmp/repo-child');
+      expect(res).toEqual({ checked: true, dispatched: 1 });
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.sessionName).toBe('deck_parent_proj_brain');
+
+      const callbacks = store.listCallbacks({ scopeKey: '/tmp/repo-child' });
+      expect(callbacks).toHaveLength(1);
+      expect(callbacks[0]!.targetSession).toBe('deck_parent_proj_brain');
+      expect(callbacks[0]!.status).toBe('pending');
+
       store.close();
     });
   });
