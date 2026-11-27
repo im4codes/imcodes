@@ -637,7 +637,7 @@ describe('tab sharing APIs', () => {
     expect(subEntry.parentSessionName).toBe(sessionName);
 
     // Closed subsession must report target-unavailable in discovery instead of active
-    await updateSubSession(db, subSessionId, { closedAt: Date.now() });
+    await updateSubSession(db, subSessionId, serverId, { closed_at: Date.now() });
     const discoverAfterClose = await app.request('/api/shares', { headers: authHeaders(recipientId) });
     expect(discoverAfterClose.status).toBe(200);
     const closedBody = await discoverAfterClose.json() as {
