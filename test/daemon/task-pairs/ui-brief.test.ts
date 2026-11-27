@@ -129,4 +129,82 @@ describe('TaskPairService.getPairBriefForUi', () => {
     expect(TASK_PAIR_BRIEF_MSG.REQUEST).toBe('task_pair.brief_request');
     expect(TASK_PAIR_BRIEF_MSG.RESPONSE).toBe('task_pair.brief_response');
   });
+
+  it('persists full marker verdict beyond 4000 chars and returns untruncated numbered findings via getPairBriefForUi', () => {
+    service.applyMarker({
+      project: PROJECT,
+      writer: BRAIN,
+      marker: {
+        verb: 'DISPATCH',
+        knownVerb: 'DISPATCH',
+        taskId: 'tsk_brief_audit',
+        attrs: { executor: EXEC, auditor: AUD, title: 'Long Audit Sentinel Test' },
+        brief: '- [x][ ] 1. Implement feature',
+      },
+      source: 'mcp',
+      eventId: 'ev-dispatch-audit-1',
+      suppressAutomaticBrief: true,
+    });
+
+    service.applyMarker({
+      project: PROJECT,
+      writer: EXEC,
+      marker: {
+        verb: 'READY_FOR_AUDIT',
+        knownVerb: 'READY_FOR_AUDIT',
+        taskId: 'tsk_brief_audit',
+        attrs: { path: '/tmp/dir' },
+      },
+      source: 'timeline',
+      eventId: 'ev-ready-audit-1',
+    });
+
+    const longBody = 'Z'.repeat(4200);
+    const tailSentinel = 'TAIL_SENTINEL_FINDING_2_AFTER_4200';
+    const tailProposal = 'TAIL_SENTINEL_PROPOSAL_FIX_99';
+    const reworkTurn = [
+      'Summary: Rework required after deep review.',
+      `[P0] First item (${longBody})`,
+      'Location: src/first.ts:10',
+      'Proposal: Fix first item',
+      `[P0] Second item at very end ${tailSentinel}`,
+      'Location: src/second.ts:99',
+      `Proposal: Apply full solution ${tailProposal}`,
+      '',
+      '<!-- IMCODES_TASK REWORK tsk_brief_audit blocking=P0 p0=2 p1=0 -->',
+    ].join('\n');
+
+    service.applyMarker({
+      project: PROJECT,
+      writer: AUD,
+      marker: {
+        verb: 'REWORK',
+        knownVerb: 'REWORK',
+        taskId: 'tsk_brief_audit',
+        attrs: { blocking: 'P0', p0: '2', p1: '0' },
+      },
+      source: 'timeline',
+      turnText: reworkTurn,
+      eventId: 'ev-rework-audit-1',
+    });
+
+    const persisted = getTaskPairStore().getPair(PROJECT, 'tsk_brief_audit');
+    expect(persisted?.state.lastVerdict?.noticeText?.length).toBe(4000);
+    expect(persisted?.state.lastVerdict?.fullNoticeText).toContain(tailProposal);
+
+    const briefRes = service.getPairBriefForUi('tsk_brief_audit');
+    expect(briefRes.ok).toBe(true);
+    expect(briefRes.lastAudit).toBeDefined();
+    expect(briefRes.lastAudit!.verb).toBe('REWORK');
+    expect(briefRes.lastAudit!.blockingCount).toBe(2);
+    expect(briefRes.lastAudit!.findings).toHaveLength(2);
+    expect(briefRes.lastAudit!.findings[1]).toMatchObject({
+      index: 2,
+      severity: 'P0',
+      blocking: true,
+      location: 'src/second.ts:99',
+    });
+    expect(briefRes.lastAudit!.findings[1]!.summary).toContain(tailSentinel);
+    expect(briefRes.lastAudit!.findings[1]!.proposal).toContain(tailProposal);
+  });
 });

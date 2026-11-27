@@ -246,4 +246,60 @@ describe('buildGlobalTaskFleetSnapshotPayload', () => {
       removeSession('deck_sub_m_aud');
     }
   });
+
+  it('emits compact lastAudit summary for fleet snapshot cards and keeps blockedNote priority', () => {
+    store.savePair('proj', makePairState({
+      taskId: 'tsk_rework_card',
+      status: 'rework',
+      round: 4,
+      blocking: ['P0'],
+      lastVerdict: {
+        verb: 'REWORK',
+        counts: { P0: 2, P1: 1, P2: 0, P3: 0, P4: 0 },
+        judgement: 'consistent',
+        round: 4,
+        fullNoticeText: [
+          'Summary: Two blocking regressions found.',
+          '- [P0] Missing validation guard on empty payload',
+          '- [P0] Broken retry backoff',
+          '- [P1] Minor label alignment',
+        ].join('\n'),
+        noticeText: 'Summary: Two blocking regressions found.',
+      },
+      updatedAt: 9_000,
+    }));
+
+    store.savePair('proj', makePairState({
+      taskId: 'tsk_blocked_with_audit',
+      status: 'awaiting_brain_decision',
+      flags: ['blocked'],
+      round: 2,
+      blockedNote: 'SSH target unreachable on port 2222',
+      lastVerdict: {
+        verb: 'REWORK',
+        counts: { P0: 1, P1: 0, P2: 0, P3: 0, P4: 0 },
+        judgement: 'consistent',
+        round: 2,
+        noticeText: '- [P0] Previous round defect',
+      },
+      updatedAt: 9_500,
+    }));
+
+    const frame = buildGlobalTaskFleetSnapshotPayload(10_000);
+    const reworkPair = frame.pairs.find((p) => p.taskId === 'tsk_rework_card');
+    expect(reworkPair?.lastAudit).toEqual({
+      verb: 'REWORK',
+      round: 4,
+      counts: { p0: 2, p1: 1, p2: 0, p3: 0, p4: 0 },
+      blocking: ['P0'],
+      blockingCount: 2,
+      findingsCount: 3,
+      summary: 'Two blocking regressions found.',
+    });
+    expect(reworkPair?.liveSummary).toBe('Two blocking regressions found.');
+
+    const blockedPair = frame.pairs.find((p) => p.taskId === 'tsk_blocked_with_audit');
+    expect(blockedPair?.liveSummary).toBe('SSH target unreachable on port 2222');
+    expect(blockedPair?.lastAudit?.blockingCount).toBe(1);
+  });
 });

@@ -5,6 +5,7 @@ export const GLOBAL_TASK_SNAPSHOT_PATH = '/api/global-tasks' as const;
 export const GLOBAL_TASK_TICKET_PATH = '/api/global-tasks/ws-ticket' as const;
 export const GLOBAL_TASK_FLEET_SNAPSHOT_MSG = 'task_pair.fleet_snapshot' as const;
 export const GLOBAL_TASK_BRAIN_TEXT_MAX_CHARS = 1200 as const;
+export const GLOBAL_TASK_AUDIT_SUMMARY_MAX_CHARS = 160 as const;
 export const GLOBAL_TASK_NOTIFY_CHANNEL = 'global_task_pair_updates' as const;
 export const GLOBAL_TASK_WS_TICKET_TYPE = 'global-tasks-ws-ticket' as const;
 export const GLOBAL_TASK_PG_NOTIFY_MAX_BYTES = 4000 as const;
@@ -49,6 +50,24 @@ export interface GlobalTaskChecklistProgress {
   audited: number;
 }
 
+export interface GlobalTaskAuditCounts {
+  p0: number;
+  p1: number;
+  p2: number;
+  p3: number;
+  p4: number;
+}
+
+export interface GlobalTaskAuditSummary {
+  verb: 'PASS' | 'REWORK';
+  round: number;
+  counts: GlobalTaskAuditCounts;
+  blocking: string[];
+  blockingCount: number;
+  findingsCount: number;
+  summary?: string;
+}
+
 export interface GlobalTaskSummaryRow {
   serverId: string;
   serverName: string;
@@ -68,6 +87,7 @@ export interface GlobalTaskSummaryRow {
   auditorModel?: string;
   auditor?: string;
   liveSummary?: string;
+  lastAudit?: GlobalTaskAuditSummary;
   startedAt?: number;
   endedAt?: number;
   createdAt: number;
@@ -138,6 +158,7 @@ export interface GlobalTaskFleetSnapshotPair {
   auditorModel?: string;
   auditor?: string;
   liveSummary?: string;
+  lastAudit?: GlobalTaskAuditSummary;
   startedAt?: number;
   endedAt?: number;
   createdAt: number;
@@ -282,6 +303,52 @@ export function normalizeGlobalChecklist(
   const implemented = Math.max(0, Math.floor(Number(checklist?.implemented ?? 0) || 0));
   const audited = Math.max(0, Math.floor(Number(checklist?.audited ?? 0) || 0));
   return { total, implemented, audited };
+}
+
+const VALID_AUDIT_BLOCKING = new Set(['P0', 'P1', 'P2', 'P3', 'P4']);
+
+export function normalizeGlobalTaskAuditSummary(raw: unknown): GlobalTaskAuditSummary | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const rec = raw as Record<string, unknown>;
+  const verb = rec.verb === 'PASS' || rec.verb === 'REWORK' ? rec.verb : undefined;
+  if (!verb) return undefined;
+  const countsObj = rec.counts && typeof rec.counts === 'object' ? (rec.counts as Record<string, unknown>) : {};
+  const counts: GlobalTaskAuditCounts = {
+    p0: Math.max(0, Math.floor(Number(countsObj.p0 ?? 0) || 0)),
+    p1: Math.max(0, Math.floor(Number(countsObj.p1 ?? 0) || 0)),
+    p2: Math.max(0, Math.floor(Number(countsObj.p2 ?? 0) || 0)),
+    p3: Math.max(0, Math.floor(Number(countsObj.p3 ?? 0) || 0)),
+    p4: Math.max(0, Math.floor(Number(countsObj.p4 ?? 0) || 0)),
+  };
+  const blockingRaw = Array.isArray(rec.blocking)
+    ? rec.blocking
+        .map((item) => (typeof item === 'string' ? item.trim().toUpperCase() : ''))
+        .filter((item) => VALID_AUDIT_BLOCKING.has(item))
+    : [];
+  const blocking = blockingRaw.length > 0 ? [...new Set(blockingRaw)] : ['P0'];
+  const computedBlockingCount = blocking.reduce((sum, lvl) => {
+    const key = lvl.toLowerCase() as keyof GlobalTaskAuditCounts;
+    return sum + (counts[key] ?? 0);
+  }, 0);
+  const countSum = counts.p0 + counts.p1 + counts.p2 + counts.p3 + counts.p4;
+  const rawBlockingCount = typeof rec.blockingCount === 'number' && Number.isFinite(rec.blockingCount) && rec.blockingCount >= 0
+    ? Math.floor(rec.blockingCount)
+    : computedBlockingCount;
+  const rawFindingsCount = typeof rec.findingsCount === 'number' && Number.isFinite(rec.findingsCount) && rec.findingsCount >= 0
+    ? Math.floor(rec.findingsCount)
+    : countSum;
+  const summary = typeof rec.summary === 'string' && rec.summary.trim()
+    ? truncateGlobalBrainText(rec.summary.replace(/\s+/gu, ' ').trim(), GLOBAL_TASK_AUDIT_SUMMARY_MAX_CHARS)
+    : '';
+  return {
+    verb,
+    round: Math.max(0, Math.floor(Number(rec.round ?? 0) || 0)),
+    counts,
+    blocking,
+    blockingCount: rawBlockingCount,
+    findingsCount: Math.max(rawFindingsCount, countSum > 0 && rawFindingsCount === 0 ? countSum : rawFindingsCount),
+    ...(summary ? { summary } : {}),
+  };
 }
 
 /**

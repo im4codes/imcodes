@@ -1968,6 +1968,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     attrs: Record<string, string>;
     idempotencyKey?: string;
     turnText?: string;
+    structuredAuditDetails?: import('../../shared/task-pair.js').TaskPairAuditDetails;
     authorize: (pair: StoredTaskPair) => ToolResult | undefined;
   }): Promise<ToolResult> => {
     const store = getTaskPairStore();
@@ -1986,6 +1987,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       eventId,
       suppressAutomaticBrief: false,
       ...(input.turnText ? { turnText: input.turnText } : {}),
+      ...(input.structuredAuditDetails ? { structuredAuditDetails: input.structuredAuditDetails } : {}),
     });
     if (transition.settled) await transition.settled;
     const after = store.getPair(input.project, input.taskId);
@@ -4282,25 +4284,45 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const reason = stringArg(args, 'reason')?.trim();
       const notice = stringArg(args, 'notice')?.trim();
       const summary = stringArg(args, 'summary')?.trim();
-      let turnText = notice || '';
-      if (!turnText) {
-        const parts: string[] = [];
-        if (summary) parts.push(`Summary: ${summary}`);
-        if (reason) parts.push(`Reason: ${reason}`);
-        if (Array.isArray(args.findings)) {
-          for (const item of args.findings) {
-            if (typeof item === 'string') {
-              parts.push(`- ${item}`);
-            } else if (item && typeof item === 'object') {
-              const rec = item as Record<string, unknown>;
-              const sev = typeof rec.severity === 'string' ? `[${rec.severity}] ` : '';
-              const sum = typeof rec.summary === 'string' ? rec.summary : '';
-              if (sev || sum) parts.push(`- ${sev}${sum}`);
+      const structuredFindings: import('../../shared/task-pair.js').TaskPairAuditFinding[] = [];
+      const turnParts: string[] = [];
+      if (summary) turnParts.push(`Summary: ${summary}`);
+      if (reason) turnParts.push(`Reason: ${reason}`);
+      if (Array.isArray(args.findings)) {
+        for (const item of args.findings) {
+          if (typeof item === 'string') {
+            const trimmed = item.trim();
+            if (!trimmed) continue;
+            structuredFindings.push({ summary: trimmed });
+            turnParts.push(`- ${trimmed}`);
+          } else if (item && typeof item === 'object') {
+            const rec = item as Record<string, unknown>;
+            const finding: import('../../shared/task-pair.js').TaskPairAuditFinding = {};
+            for (const field of ['severity', 'summary', 'invariant', 'location', 'evidence', 'proposal', 'tradeoffs'] as const) {
+              const rawVal = typeof rec[field] === 'string' ? rec[field].trim() : '';
+              if (rawVal) finding[field] = rawVal;
             }
+            if (Object.keys(finding).length > 0) structuredFindings.push(finding);
+            const sev = finding.severity ? `[${finding.severity}] ` : '';
+            const sum = finding.summary ?? '';
+            if (sev || sum) turnParts.push(`- ${sev}${sum}`);
+            if (finding.location) turnParts.push(`  Location: ${finding.location}`);
+            if (finding.invariant) turnParts.push(`  Invariant: ${finding.invariant}`);
+            if (finding.evidence) turnParts.push(`  Evidence: ${finding.evidence}`);
+            if (finding.proposal) turnParts.push(`  Proposal: ${finding.proposal}`);
+            if (finding.tradeoffs) turnParts.push(`  Trade-offs: ${finding.tradeoffs}`);
           }
         }
-        if (parts.length > 0) turnText = parts.join('\n');
       }
+      const turnText = notice || turnParts.join('\n');
+      const structuredAuditDetails: import('../../shared/task-pair.js').TaskPairAuditDetails | undefined =
+        (structuredFindings.length > 0 || summary || reason)
+          ? {
+              ...(structuredFindings.length > 0 ? { findings: structuredFindings } : {}),
+              ...(summary ? { summary } : {}),
+              ...(reason ? { reason } : {}),
+            }
+          : undefined;
       const verdictKey = stringArg(args, 'idempotencyKey')?.trim() || JSON.stringify(Object.entries(attrs).sort());
       const verdictEventId = `mcp:pair-${verdict.toLowerCase()}:${context.project}:${taskId}:${verdictKey}`;
       if ((stored.state.status !== 'in_audit' || !stored.state.material) && !getTaskPairStore().hasEvent(verdictEventId)) {
@@ -4309,6 +4331,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       return applyStructuredPairLifecycle({
         project: context.project, taskId, verb: verdict, attrs, idempotencyKey: stringArg(args, 'idempotencyKey'),
         ...(turnText ? { turnText } : {}),
+        ...(structuredAuditDetails ? { structuredAuditDetails } : {}),
         authorize: (pair) => pair.state.auditor === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_verdict requires the assigned auditor'),
       });
     },

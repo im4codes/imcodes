@@ -82,6 +82,7 @@ interface MemSummaryRow {
   auditor_model?: string | null;
   auditor: string | null;
   live_summary: string | null;
+  last_audit_json?: string | null;
   is_terminal: boolean;
   needs_attention: boolean;
   started_at?: number | null;
@@ -236,6 +237,7 @@ class InMemoryGlobalTaskDb {
             endedAt,
             executorModel,
             auditorModel,
+            lastAuditParam,
           ] = params;
 
           const key = this.summaryKey(String(serverId), String(taskId));
@@ -255,6 +257,8 @@ class InMemoryGlobalTaskDb {
           const sExecModel = String(executorModel ?? '') || null;
           const sAuditModel = (sAuditor === 'none' || sAuditor === '__none__') ? null : (String(auditorModel ?? '') || null);
           const sLive = String(liveSummary ?? '') || null;
+          const rawLastAuditParam = String(lastAuditParam ?? '');
+          const sLastAudit = (rawLastAuditParam === '' || rawLastAuditParam === '__NULL__') ? null : rawLastAuditParam;
           const bTerminal = Boolean(isTerminal);
           const bAttention = Boolean(needsAttention);
           const nCreated = Number(createdAt ?? 0);
@@ -282,6 +286,7 @@ class InMemoryGlobalTaskDb {
               auditor_model: sAuditModel,
               auditor: sAuditor,
               live_summary: sLive,
+              last_audit_json: sLastAudit,
               is_terminal: bTerminal,
               needs_attention: bAttention,
               started_at: nStarted,
@@ -310,6 +315,11 @@ class InMemoryGlobalTaskDb {
               auditor_model: (sAuditor === 'none' || sAuditor === '__none__') ? null : (sAuditModel ?? existing.auditor_model ?? null),
               auditor: sAuditor ?? existing.auditor,
               live_summary: isNewerOrEqual ? (sLive ?? existing.live_summary) : existing.live_summary,
+              last_audit_json: !isNewerOrEqual
+                ? (existing.last_audit_json ?? null)
+                : (rawLastAuditParam === '__NULL__'
+                  ? null
+                  : (rawLastAuditParam !== '' ? rawLastAuditParam : (existing.last_audit_json ?? null))),
               is_terminal: isNewerOrEqual ? bTerminal : existing.is_terminal,
               needs_attention: !isNewerOrEqual
                 ? existing.needs_attention
@@ -1711,5 +1721,63 @@ describe('global-task-mode server engine', () => {
     });
     expect(cleared?.executorModel).toBe('claude-opus-4-6-high');
     expect(cleared?.auditorModel).toBeUndefined();
+  });
+
+  it('persists compact lastAudit via last_audit_json, preserves on partial updates, clears on null, and reloads on PG notify envelope', async () => {
+    const now = Date.now();
+    const audit = {
+      verb: 'REWORK' as const,
+      round: 4,
+      counts: { p0: 3, p1: 1, p2: 0, p3: 0, p4: 0 },
+      blocking: ['P0'],
+      blockingCount: 3,
+      findingsCount: 4,
+      summary: '3 P0 defects need fixes.',
+    };
+
+    const saved = await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_audit_db',
+      projectName: 'imcodes',
+      brainSession: 'deck_proj_brain',
+      title: 'Audit persistence',
+      status: 'rework',
+      round: 4,
+      lastAudit: audit,
+      createdAt: now - 5_000,
+      updatedAt: now - 4_000,
+    });
+    expect(saved?.lastAudit).toEqual(audit);
+
+    // Partial update (e.g. /close or non-verdict event with lastAudit omitted) preserves lastAudit
+    const partial = await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_audit_db',
+      status: 'working',
+      updatedAt: now - 3_000,
+    });
+    expect(partial?.lastAudit).toEqual(audit);
+
+    // Snapshot reload reads persisted lastAudit
+    const snap = await listGlobalTaskSnapshotForUser(db, 'user-a');
+    expect(snap.tasks.find((t) => t.taskId === 'tsk_audit_db')?.lastAudit).toEqual(audit);
+
+    // PG notify envelope carries IDs only and handleNotifyPayload re-fetches full row with lastAudit
+    const testHub = new GlobalTaskHub();
+    await testHub.notifyTaskUpdated(db, 'srv-a', 'tsk_audit_db', saved!);
+    const notifyPayload = memDb.pgNotifies.at(-1)!.payload;
+    expect(Buffer.byteLength(notifyPayload, 'utf8')).toBeLessThan(200);
+    expect(JSON.parse(notifyPayload)).toMatchObject({ kind: 'task', serverId: 'srv-a', taskId: 'tsk_audit_db' });
+    await testHub.stop();
+
+    // Explicit null (e.g. NEXT_ROUND or fleet snapshot without verdict) clears lastAudit
+    const cleared = await upsertGlobalTaskSummary(db, {
+      serverId: 'srv-a',
+      taskId: 'tsk_audit_db',
+      status: 'working',
+      lastAudit: null,
+      updatedAt: now - 1_000,
+    });
+    expect(cleared?.lastAudit).toBeUndefined();
   });
 });

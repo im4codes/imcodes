@@ -6,6 +6,7 @@ import {
 } from '../../../shared/task-pair-close.js';
 import {
   TASK_PAIR_BRIEF_ERROR,
+  extractAuditFindingsFromVerdict,
   type TaskPairBriefResponse,
 } from '../../../shared/task-pair-brief.js';
 import { projectPairScheduling, type TaskPairScheduling } from '../../../shared/task-pair-suspension.js';
@@ -208,6 +209,8 @@ export interface ApplyMarkerInput {
   suppressAutomaticBrief?: boolean;
   /** Runtime assistant-timeline ingestion rejects new Brain pairs unless pair_create was used. */
   requireStructuredPairCreate?: boolean;
+  /** Structured audit details passed directly from MCP pair_verdict without text truncation. */
+  structuredAuditDetails?: import('../../../shared/task-pair.js').TaskPairAuditDetails;
 }
 
 export interface TaskPairBriefDelivery {
@@ -988,6 +991,7 @@ export class TaskPairService {
           now,
           source: input.source,
           turnText: input.turnText,
+          ...(input.structuredAuditDetails ? { structuredAuditDetails: input.structuredAuditDetails } : {}),
           ...(input.requireStructuredPairCreate ? { requireStructuredPairCreate: true } : {}),
           ...(busySessions.size > 0 ? { busySessions } : {}),
         })
@@ -1038,11 +1042,19 @@ export class TaskPairService {
     if (transition.pair) {
       if (!existing && input.initialScheduling) transition.pair.scheduling = input.initialScheduling;
       if (transition.verdict && transition.pair.lastVerdict) {
-        const noticeText = input.turnText ? stripTaskPairMarkersForDisplay(input.turnText).trim().slice(0, 4000) : '';
+        const fullNoticeText = input.turnText ? stripTaskPairMarkersForDisplay(input.turnText).trim() : '';
+        const noticeText = fullNoticeText.slice(0, 4000);
         const auditDetails = noticeText ? parseTaskPairAuditDetails(noticeText) : undefined;
         if (noticeText && !transition.pair.lastVerdict.noticeText) transition.pair.lastVerdict.noticeText = noticeText;
+        if (fullNoticeText && !transition.pair.lastVerdict.fullNoticeText) transition.pair.lastVerdict.fullNoticeText = fullNoticeText;
         if (auditDetails && !transition.pair.lastVerdict.auditDetails) transition.pair.lastVerdict.auditDetails = auditDetails;
+        if (input.structuredAuditDetails && !transition.pair.lastVerdict.structuredDetails) {
+          transition.pair.lastVerdict.structuredDetails = input.structuredAuditDetails;
+        }
         if (auditDetails?.reason && !transition.pair.lastVerdict.reason) transition.pair.lastVerdict.reason = auditDetails.reason;
+        if (input.structuredAuditDetails?.reason && !transition.pair.lastVerdict.reason) {
+          transition.pair.lastVerdict.reason = input.structuredAuditDetails.reason;
+        }
       }
       // Any marker that reopens a terminal pair (STARTED/WORKING/QUEUE,
       // READY_FOR_AUDIT, or a new verdict) must also reopen its retained
@@ -3292,12 +3304,14 @@ export class TaskPairService {
     const briefRevision = brief
       ? createHash('sha1').update(brief).digest('hex').slice(0, 16)
       : undefined;
+    const lastAudit = extractAuditFindingsFromVerdict(stored.state.lastVerdict, stored.state.blocking);
     return {
       ok: true,
       taskId,
       brief,
       ...(briefRevision ? { briefRevision } : {}),
       checklist: taskPairChecklistCounts(brief),
+      ...(lastAudit ? { lastAudit } : {}),
       updatedAt: stored.state.updatedAt,
     };
   }

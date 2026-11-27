@@ -419,7 +419,10 @@ import { TASK_PAIR_BRIEF_MSG } from '../../../shared/task-pair-brief.js';
 import {
   GLOBAL_TASK_FLEET_SNAPSHOT_MSG,
   isGlobalTaskTerminalStatus,
+  normalizeGlobalTaskAuditSummary,
 } from '../../../shared/global-task-mode.js';
+import { buildGlobalTaskAuditSummary } from '../../../shared/task-pair-brief.js';
+import type { TaskPairLastVerdict, TaskPairSeverityCounts } from '../../../shared/task-pair.js';
 import {
   upsertGlobalTaskSummariesBatchChanges,
   upsertGlobalTaskSummaryWithChange,
@@ -16311,6 +16314,7 @@ export class WsBridge {
         auditorModel: typeof item.auditorModel === 'string' ? item.auditorModel : undefined,
         auditor: typeof item.auditor === 'string' ? item.auditor : undefined,
         liveSummary: typeof item.liveSummary === 'string' ? item.liveSummary : undefined,
+        lastAudit: normalizeGlobalTaskAuditSummary(item.lastAudit) ?? null,
         startedAt: typeof item.startedAt === 'number' ? item.startedAt : undefined,
         endedAt: typeof item.endedAt === 'number' ? item.endedAt : undefined,
         createdAt: typeof item.createdAt === 'number' ? item.createdAt : undefined,
@@ -16343,6 +16347,7 @@ export class WsBridge {
     const liveSummary = typeof task.currentAction === 'string' && task.currentAction.trim()
       ? task.currentAction.trim()
       : (typeof pair.blockedNote === 'string' && pair.blockedNote.trim() ? pair.blockedNote.trim() : undefined);
+    const consoleAudit = normalizeGlobalTaskAuditSummary(pair.lastAudit);
     return {
       serverId: this.serverId,
       taskId,
@@ -16363,6 +16368,7 @@ export class WsBridge {
       auditorModel: typeof pair.auditorModel === 'string' ? pair.auditorModel : undefined,
       auditor: typeof pair.auditor === 'string' ? pair.auditor : undefined,
       liveSummary,
+      ...(consoleAudit ? { lastAudit: consoleAudit } : {}),
       startedAt: typeof pair.startedAt === 'number'
         ? pair.startedAt
         : (typeof task.startedAt === 'number' ? task.startedAt : undefined),
@@ -16403,11 +16409,39 @@ export class WsBridge {
         const checklistObj = payload.checklist && typeof payload.checklist === 'object'
           ? (payload.checklist as Record<string, unknown>)
           : null;
+        const verbUpper = typeof payload.verb === 'string' ? payload.verb.trim().toUpperCase() : '';
+        const eventBlocking = Array.isArray(payload.blocking)
+          ? payload.blocking.filter((b): b is string => typeof b === 'string')
+          : undefined;
+        let eventLastAudit = normalizeGlobalTaskAuditSummary(payload.lastAudit);
+        if (!eventLastAudit && (verbUpper === 'PASS' || verbUpper === 'REWORK')) {
+          const countsObj = (payload.severityCounts && typeof payload.severityCounts === 'object')
+            ? payload.severityCounts as Partial<TaskPairSeverityCounts & Record<string, unknown>>
+            : undefined;
+          const syntheticVerdict: TaskPairLastVerdict = {
+            verb: verbUpper,
+            counts: {
+              P0: Number(countsObj?.P0 ?? countsObj?.p0 ?? 0) || 0,
+              P1: Number(countsObj?.P1 ?? countsObj?.p1 ?? 0) || 0,
+              P2: Number(countsObj?.P2 ?? countsObj?.p2 ?? 0) || 0,
+              P3: Number(countsObj?.P3 ?? countsObj?.p3 ?? 0) || 0,
+              P4: Number(countsObj?.P4 ?? countsObj?.p4 ?? 0) || 0,
+            },
+            judgement: 'consistent',
+            round: typeof payload.round === 'number' ? payload.round : 0,
+            ...(typeof payload.noticeText === 'string' ? { noticeText: payload.noticeText } : {}),
+            ...(payload.auditDetails && typeof payload.auditDetails === 'object'
+              ? { auditDetails: payload.auditDetails as TaskPairLastVerdict['auditDetails'] }
+              : {}),
+          };
+          eventLastAudit = buildGlobalTaskAuditSummary(syntheticVerdict, eventBlocking);
+        }
         const liveSummary = typeof payload.blockedNote === 'string' && payload.blockedNote.trim()
           ? payload.blockedNote.trim()
-          : (typeof payload.noticeText === 'string' && payload.noticeText.trim()
-            ? payload.noticeText.trim().slice(0, 240)
-            : undefined);
+          : (eventLastAudit?.summary
+            || (typeof payload.noticeText === 'string' && payload.noticeText.trim()
+              ? payload.noticeText.trim().slice(0, 240)
+              : undefined));
         const { row: saved, changed } = await upsertGlobalTaskSummaryWithChange(db, {
           serverId: this.serverId,
           taskId,
@@ -16430,6 +16464,9 @@ export class WsBridge {
           auditorModel: typeof payload.auditorModel === 'string' ? payload.auditorModel : undefined,
           auditor: typeof payload.auditor === 'string' ? payload.auditor : undefined,
           liveSummary,
+          ...(verbUpper === 'NEXT_ROUND'
+            ? { lastAudit: null }
+            : (eventLastAudit ? { lastAudit: eventLastAudit } : {})),
           startedAt: typeof payload.startedAt === 'number'
             ? payload.startedAt
             : (status === 'working' && payload.fromStatus === 'queued' ? eventTs : undefined),

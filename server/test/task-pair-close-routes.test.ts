@@ -104,15 +104,15 @@ function makeMemDb() {
           serverId, taskId, projectName, brainSession, brainLabel, title,
           status, flagsJson, round, checklistTotal, checklistImplemented, checklistAudited,
           executorLabel, auditorLabel, auditor, liveSummary, isTerminal, needsAttention,
-          createdAt, updatedAt, startedAt, endedAt,
+          createdAt, updatedAt, startedAt, endedAt, _executorModel, _auditorModel, lastAuditParam,
         ] = params as [
           string, string, string, string, string, string,
           string, string, number, number, number, number,
           string, string, string, string, boolean, boolean,
-          number, number, number | null, number | null,
+          number, number, number | null, number | null, string, string, string,
         ];
         const key = `${serverId}\u0000${taskId}`;
-        const prev = summaries.get(key);
+        const prev = summaries.get(key) as (typeof summaries extends Map<string, infer V> ? V & { last_audit_json?: string | null } : never) | undefined;
         summaries.set(key, {
           server_id: serverId,
           task_id: taskId,
@@ -130,6 +130,9 @@ function makeMemDb() {
           auditor_label: auditorLabel || prev?.auditor_label || null,
           auditor: auditor || prev?.auditor || null,
           live_summary: liveSummary || prev?.live_summary || null,
+          last_audit_json: lastAuditParam === '__NULL__'
+            ? null
+            : (lastAuditParam || prev?.last_audit_json || null),
           is_terminal: Boolean(isTerminal),
           needs_attention: Boolean(needsAttention),
           created_at: prev?.created_at || createdAt,

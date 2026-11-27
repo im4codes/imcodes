@@ -950,4 +950,144 @@ describe('GlobalTaskModeView Brief & Checklist HUD', () => {
     expect(screen.getByTestId('global-task-brief-item-1').textContent).toContain('Ahead v2500');
     expect(briefCalls).toBe(2);
   });
+
+  it('renders structured audit feedback strip on card, suppresses duplicated raw liveSummary, and opens numbered 1..4 audit list on click without truncation', async () => {
+    const longItemTail = 'UNTRUNCATED_END_TAIL_TOKEN_987';
+    const longProposal = 'Apply full validation guard and retry loop cleanly without cutting off ' + 'X'.repeat(500) + ' PROPOSAL_END_OK';
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/api/server/srv-1/task-pairs/tsk_rework_4/brief')) {
+        return new Response(JSON.stringify({
+          ok: true,
+          taskId: 'tsk_rework_4',
+          brief: '- [x][ ] 1. Ship feature',
+          briefRevision: 'rev-audit-4',
+          checklist: { total: 1, implemented: 1, audited: 0 },
+          lastAudit: {
+            verb: 'REWORK',
+            round: 4,
+            counts: { p0: 3, p1: 1, p2: 0, p3: 0, p4: 0 },
+            blocking: ['P0'],
+            blockingCount: 3,
+            findingsCount: 4,
+            summary: 'Three blocking P0 items and one P1 note found.',
+            findings: [
+              { index: 1, severity: 'P0', blocking: true, summary: 'First P0 defect', location: 'src/a.ts:10', proposal: 'Fix A' },
+              { index: 2, severity: 'P0', blocking: true, summary: 'Second P0 defect', location: 'src/b.ts:20', proposal: 'Fix B' },
+              { index: 3, severity: 'P1', blocking: false, summary: 'Third non-blocking item', location: 'src/c.ts:30' },
+              { index: 4, severity: 'P0', blocking: true, summary: `Fourth P0 item full details ${longItemTail}`, location: 'src/d.ts:40', proposal: longProposal },
+            ],
+          },
+          updatedAt: 5000,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (url.includes('/api/server/srv-1/task-pairs/tsk_offline_cached/brief')) {
+        return new Response(JSON.stringify({ ok: false, error: TASK_PAIR_BRIEF_ERROR.DAEMON_OFFLINE }), {
+          status: 503,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return new Response(JSON.stringify({ ticket: 't1' }), { status: 200 });
+    }) as typeof fetch;
+
+    const { GlobalTaskModeView } = await import('../../src/components/GlobalTaskModeView.js');
+    render(<GlobalTaskModeView onExit={() => {}} onJumpToSession={() => {}} />);
+    globalTaskModeStore.setState({
+      loading: false,
+      connected: true,
+      connecting: false,
+      servers: [{ id: 'srv-1', name: 'M3', online: true }],
+      brains: [],
+      tasks: [
+        {
+          serverId: 'srv-1',
+          serverName: 'M3',
+          serverOnline: true,
+          projectName: 'imcodes',
+          brainSession: 'deck_cd_brain',
+          brainLabel: 'Main',
+          taskId: 'tsk_rework_4',
+          title: 'Fix audit strip',
+          status: 'rework',
+          flags: [],
+          round: 4,
+          checklist: { total: 1, implemented: 1, audited: 0 },
+          liveSummary: 'RAW_TRUNCATED_NOTICE_SHOULD_NOT_DUPLICATE',
+          lastAudit: {
+            verb: 'REWORK',
+            round: 4,
+            counts: { p0: 3, p1: 1, p2: 0, p3: 0, p4: 0 },
+            blocking: ['P0'],
+            blockingCount: 3,
+            findingsCount: 4,
+            summary: 'Three blocking P0 items and one P1 note found.',
+          },
+          createdAt: 1000,
+          updatedAt: 5000,
+          isTerminal: false,
+          needsAttention: false,
+        },
+        {
+          serverId: 'srv-1',
+          serverName: 'M3',
+          serverOnline: false,
+          projectName: 'imcodes',
+          brainSession: 'deck_cd_brain',
+          brainLabel: 'Main',
+          taskId: 'tsk_offline_cached',
+          title: 'Offline cached audit card',
+          status: 'rework',
+          flags: ['blocked'],
+          round: 2,
+          checklist: { total: 0, implemented: 0, audited: 0 },
+          liveSummary: 'Blocked on external SSH node',
+          lastAudit: {
+            verb: 'REWORK',
+            round: 2,
+            counts: { p0: 1, p1: 0, p2: 0, p3: 0, p4: 0 },
+            blocking: ['P0'],
+            blockingCount: 1,
+            findingsCount: 1,
+            summary: 'One P0 pending.',
+          },
+          createdAt: 1000,
+          updatedAt: 4000,
+          isTerminal: false,
+          needsAttention: true,
+        },
+      ],
+    });
+
+    const strip = await screen.findByTestId('task-mode-audit-strip-tsk_rework_4');
+    expect(strip.textContent).toContain('Rework · R4');
+    expect(screen.getByTestId('task-mode-audit-blocking-tsk_rework_4').textContent).toContain('P0 ×3 pending');
+    expect(strip.textContent).toContain('P1 ×1');
+    expect(strip.textContent).toContain('View 1..4');
+    // Duplicated truncated liveSummary is hidden when structured audit strip is shown without independent block
+    expect(document.body.textContent).not.toContain('RAW_TRUNCATED_NOTICE_SHOULD_NOT_DUPLICATE');
+    // Independent blockedNote IS still shown on blocked card
+    expect(document.body.textContent).toContain('Blocked on external SSH node');
+
+    // Click strip -> opens modal directly onto Audit Feedback tab with full 1..4 list
+    fireEvent.click(strip);
+    const auditTab = await screen.findByTestId('global-task-brief-tab-audit');
+    expect(auditTab.getAttribute('aria-selected')).toBe('true');
+
+    await waitFor(() => {
+      expect(screen.getByTestId('global-task-audit-finding-4')).toBeTruthy();
+    });
+    expect(screen.getByTestId('global-task-audit-finding-1').textContent).toContain('src/a.ts:10');
+    expect(screen.getByTestId('global-task-audit-finding-1').textContent).toContain('Fix A');
+    expect(screen.getByTestId('global-task-audit-finding-3').textContent).toContain('Third non-blocking item');
+    expect(screen.getByTestId('global-task-audit-finding-4').textContent).toContain(longItemTail);
+    expect(screen.getByTestId('global-task-audit-finding-4').textContent).toContain('PROPOSAL_END_OK');
+
+    // Close and test daemon-offline fallback still displays cached audit summary gracefully
+    fireEvent.click(screen.getByTestId('global-task-brief-hud-close'));
+    fireEvent.click(screen.getByTestId('task-mode-audit-strip-tsk_offline_cached'));
+    await waitFor(() => {
+      expect(screen.getByTestId('global-task-audit-cached-only')).toBeTruthy();
+    });
+    expect(screen.getByTestId('global-task-audit-modal-blocking').textContent).toContain('P0 ×1 pending');
+  });
 });

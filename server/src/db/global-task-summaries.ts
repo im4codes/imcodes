@@ -10,6 +10,8 @@ import {
   isGlobalTaskWithinSyncWindow,
   isNoAuditorSentinel,
   normalizeGlobalChecklist,
+  normalizeGlobalTaskAuditSummary,
+  type GlobalTaskAuditSummary,
   type GlobalTaskBrainSummary,
   type GlobalTaskChecklistProgress,
   type GlobalTaskServerSummary,
@@ -43,6 +45,7 @@ export interface GlobalTaskSummaryUpsertInput {
   auditorModel?: string;
   auditor?: string;
   liveSummary?: string;
+  lastAudit?: GlobalTaskAuditSummary | null;
   startedAt?: number;
   endedAt?: number;
   createdAt?: number;
@@ -68,12 +71,22 @@ interface RawSummaryRow {
   auditor_model?: string | null;
   auditor: string | null;
   live_summary: string | null;
+  last_audit_json?: string | null;
   is_terminal: boolean | number;
   needs_attention: boolean | number;
   started_at?: number | string | null;
   ended_at?: number | string | null;
   created_at: number | string;
   updated_at: number | string;
+}
+
+function parseLastAuditJson(raw: string | null | undefined): GlobalTaskAuditSummary | undefined {
+  if (!raw) return undefined;
+  try {
+    return normalizeGlobalTaskAuditSummary(JSON.parse(raw));
+  } catch {
+    return undefined;
+  }
 }
 
 function parseFlagsJson(raw: string | null | undefined): string[] {
@@ -132,6 +145,7 @@ function mapRawSummaryRow(
   const endedAt = typeof row.ended_at === 'number' || (typeof row.ended_at === 'string' && row.ended_at !== '')
     ? (Number(row.ended_at) || 0)
     : 0;
+  const lastAudit = parseLastAuditJson(row.last_audit_json);
   return {
     serverId: String(row.server_id),
     serverName: serverMeta.name,
@@ -155,6 +169,7 @@ function mapRawSummaryRow(
     ...(auditorModel ? { auditorModel } : {}),
     ...(auditor ? { auditor } : {}),
     ...(cleanOptionalStr(row.live_summary) ? { liveSummary: cleanOptionalStr(row.live_summary) } : {}),
+    ...(lastAudit ? { lastAudit } : {}),
     ...(startedAt > 0 ? { startedAt } : {}),
     ...(endedAt > 0 ? { endedAt } : {}),
     createdAt: Number(row.created_at ?? 0) || 0,
@@ -220,6 +235,7 @@ export function hasGlobalTaskSummaryChanged(
     || prev.checklist.total !== next.checklist.total
     || prev.checklist.implemented !== next.checklist.implemented
     || prev.checklist.audited !== next.checklist.audited
+    || JSON.stringify(prev.lastAudit ?? null) !== JSON.stringify(next.lastAudit ?? null)
   ) {
     return true;
   }
@@ -262,6 +278,12 @@ export async function upsertGlobalTaskSummaryWithChange(
   const executorModel = cleanModelOptional(input.executorModel) ?? '';
   const auditorModel = isNoAuditorSentinel(auditor) ? '' : (cleanModelOptional(input.auditorModel) ?? '');
   const liveSummary = cleanOptionalStr(input.liveSummary) ?? '';
+  const normalizedLastAudit = input.lastAudit === undefined
+    ? undefined
+    : (input.lastAudit === null ? null : (normalizeGlobalTaskAuditSummary(input.lastAudit) ?? null));
+  const lastAuditParam = normalizedLastAudit === undefined
+    ? ''
+    : (normalizedLastAudit === null ? '__NULL__' : JSON.stringify(normalizedLastAudit));
   const isTerminal = isGlobalTaskTerminalStatus(status);
   const statusNeedsAttention = isGlobalTaskAttentionNeeded(status, cleanFlags);
   const now = Date.now();
@@ -292,14 +314,15 @@ export async function upsertGlobalTaskSummaryWithChange(
       checklist_total, checklist_implemented, checklist_audited,
       executor_label, auditor_label, auditor, live_summary,
       is_terminal, needs_attention, created_at, updated_at, started_at, ended_at,
-      executor_model, auditor_model
+      executor_model, auditor_model, last_audit_json
     ) VALUES (
       $1, $2, $3, $4, $5, $6,
       $7, CASE WHEN $8 = '' THEN '[]' ELSE $8 END, $9,
       $10, $11, $12,
       NULLIF($13, ''), NULLIF($14, ''), NULLIF($15, ''), NULLIF($16, ''),
       $17, $18, $19, $20, $21, $22,
-      NULLIF($23, ''), NULLIF($24, '')
+      NULLIF($23, ''), NULLIF($24, ''),
+      CASE WHEN $25 = '' OR $25 = '__NULL__' THEN NULL ELSE $25 END
     )
     ON CONFLICT (server_id, task_id) DO UPDATE SET
       project_name = CASE WHEN excluded.project_name <> '' THEN excluded.project_name ELSE global_task_pair_summaries.project_name END,
@@ -321,6 +344,12 @@ export async function upsertGlobalTaskSummaryWithChange(
         ELSE COALESCE(excluded.auditor_model, global_task_pair_summaries.auditor_model)
       END,
       live_summary = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at THEN COALESCE(excluded.live_summary, global_task_pair_summaries.live_summary) ELSE global_task_pair_summaries.live_summary END,
+      last_audit_json = CASE
+        WHEN excluded.updated_at < global_task_pair_summaries.updated_at THEN global_task_pair_summaries.last_audit_json
+        WHEN $25 = '__NULL__' THEN NULL
+        WHEN $25 <> '' THEN $25
+        ELSE global_task_pair_summaries.last_audit_json
+      END,
       is_terminal = CASE WHEN excluded.updated_at >= global_task_pair_summaries.updated_at THEN excluded.is_terminal ELSE global_task_pair_summaries.is_terminal END,
       needs_attention = CASE
         WHEN excluded.updated_at < global_task_pair_summaries.updated_at THEN global_task_pair_summaries.needs_attention
@@ -370,6 +399,7 @@ export async function upsertGlobalTaskSummaryWithChange(
       endedAt > 0 ? endedAt : null,
       executorModel,
       auditorModel,
+      lastAuditParam,
     ],
   );
 

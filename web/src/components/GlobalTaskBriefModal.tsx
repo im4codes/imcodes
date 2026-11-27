@@ -1,16 +1,20 @@
 import { createPortal } from 'preact/compat';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
-import type { GlobalTaskSummaryRow } from '@shared/global-task-mode.js';
+import type { GlobalTaskAuditSummary, GlobalTaskSummaryRow } from '@shared/global-task-mode.js';
 import { parseTaskPairChecklist } from '@shared/task-pair-checklist.js';
-import { TASK_PAIR_BRIEF_ERROR, type TaskPairBriefResponse } from '@shared/task-pair-brief.js';
+import {
+  TASK_PAIR_BRIEF_ERROR,
+  type GlobalTaskAuditDetail,
+  type TaskPairBriefResponse,
+} from '@shared/task-pair-brief.js';
 import { fetchServerTaskPairBrief } from '../api.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import type { GlobalTaskJumpContext } from '../global-task-mode-store.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
 import './global-task-mode-brief.css';
 
-export type GlobalTaskBriefTab = 'checklist' | 'brief';
+export type GlobalTaskBriefTab = 'checklist' | 'audit' | 'brief';
 
 interface CachedBriefEntry {
   response: TaskPairBriefResponse;
@@ -304,9 +308,173 @@ export function GlobalTaskBriefModal({
   const implPct = total > 0 ? Math.round((implDone / total) * 100) : 0;
   const auditPct = total > 0 ? Math.round((auditDone / total) * 100) : 0;
   const hasBriefOk = Boolean(activeBrief?.ok);
+  const detailAudit: GlobalTaskAuditDetail | undefined = activeBrief?.ok ? activeBrief.lastAudit : undefined;
+  const cachedAudit: GlobalTaskAuditSummary | undefined = task.lastAudit;
+  const effectiveAudit = detailAudit ?? cachedAudit;
+  const auditTabBadge = effectiveAudit
+    ? (effectiveAudit.blockingCount > 0 ? effectiveAudit.blockingCount : effectiveAudit.findingsCount)
+    : 0;
   const fetchError = activeErrorCode
     ? formatBriefFetchError(activeErrorCode, (key, defaultValue) => t(key, { defaultValue }))
     : null;
+
+  const renderAuditTabContent = () => {
+    if (!effectiveAudit) {
+      if (loading) {
+        return (
+          <div class="global-task-brief-hud-loading" data-testid="global-task-brief-loading">
+            <span class="global-task-brief-hud-spinner" aria-hidden="true" />
+            <span>{t('taskMode.brief_loading', 'Syncing brief & checklist from daemon…')}</span>
+          </div>
+        );
+      }
+      if (fetchError) return null;
+      return (
+        <div class="global-task-brief-hud-empty" data-testid="global-task-audit-empty">
+          {t('taskMode.audit_empty', 'No audit feedback recorded for this task yet.')}
+        </div>
+      );
+    }
+
+    const isRework = effectiveAudit.verb === 'REWORK';
+    const blockingSet = new Set(effectiveAudit.blocking.map((b) => b.toUpperCase()));
+    const blockingItems = (['P0', 'P1', 'P2', 'P3', 'P4'] as const)
+      .filter((lvl) => blockingSet.has(lvl))
+      .map((lvl) => ({ lvl, count: effectiveAudit.counts[lvl.toLowerCase() as keyof typeof effectiveAudit.counts] ?? 0 }))
+      .filter((entry) => entry.count > 0);
+    const blockingText = blockingItems.length > 0
+      ? blockingItems.map((entry) => `${entry.lvl} ×${entry.count}`).join(' · ')
+      : (effectiveAudit.blockingCount > 0 ? `${effectiveAudit.blocking[0] ?? 'P0'} ×${effectiveAudit.blockingCount}` : '');
+    const verdictLabel = isRework
+      ? (effectiveAudit.round > 0
+        ? t('taskMode.audit_verdict_rework_round', { round: effectiveAudit.round, defaultValue: `Rework · R${effectiveAudit.round}` })
+        : t('taskMode.audit_verdict_rework', 'Rework'))
+      : (effectiveAudit.round > 0
+        ? t('taskMode.audit_verdict_pass_round', { round: effectiveAudit.round, defaultValue: `Passed · R${effectiveAudit.round}` })
+        : t('taskMode.audit_verdict_pass', 'Passed'));
+
+    return (
+      <div class="global-task-audit-detail" data-testid="global-task-audit-detail">
+        <div class={`global-task-audit-summary-panel ${isRework ? 'is-rework' : 'is-pass'}`}>
+          <div class="global-task-audit-summary-badges">
+            <span class={`global-task-audit-verdict-badge ${isRework ? 'is-rework' : 'is-pass'}`}>
+              {verdictLabel}
+            </span>
+            {blockingText && (
+              <span class="global-task-audit-blocking-badge" data-testid="global-task-audit-modal-blocking">
+                {t('taskMode.audit_blocking_pending', { items: blockingText, defaultValue: `${blockingText} pending` })}
+              </span>
+            )}
+            {(['P0', 'P1', 'P2', 'P3', 'P4'] as const).map((lvl) => {
+              const count = effectiveAudit.counts[lvl.toLowerCase() as keyof typeof effectiveAudit.counts] ?? 0;
+              if (count === 0 && lvl !== 'P0') return null;
+              return (
+                <span key={lvl} class={`global-task-audit-sev-pill is-${lvl.toLowerCase()}`}>
+                  {lvl}: {count}
+                </span>
+              );
+            })}
+          </div>
+
+          {effectiveAudit.summary && (
+            <div class="global-task-audit-meta-note" data-testid="global-task-audit-summary-text">
+              <span class="global-task-audit-meta-label">{t('taskMode.audit_label_summary', 'Summary')}:</span>
+              <span>{effectiveAudit.summary}</span>
+            </div>
+          )}
+          {detailAudit?.reason && detailAudit.reason !== effectiveAudit.summary && (
+            <div class="global-task-audit-meta-note">
+              <span class="global-task-audit-meta-label">{t('taskMode.audit_label_reason', 'Reason')}:</span>
+              <span>{detailAudit.reason}</span>
+            </div>
+          )}
+          {detailAudit?.nextStep && (
+            <div class="global-task-audit-meta-note">
+              <span class="global-task-audit-meta-label">{t('taskMode.audit_label_next_step', 'Next step')}:</span>
+              <span>{detailAudit.nextStep}</span>
+            </div>
+          )}
+        </div>
+
+        {detailAudit ? (
+          detailAudit.findings.length > 0 ? (
+            <div class="global-task-audit-findings-list" data-testid="global-task-audit-findings-list">
+              {detailAudit.findings.map((finding) => {
+                const sevClass = finding.severity ? ` is-${finding.severity.toLowerCase()}` : '';
+                return (
+                  <div
+                    key={finding.index}
+                    class={`global-task-audit-finding-card${finding.blocking ? ' is-blocking' : ''}`}
+                    data-testid={`global-task-audit-finding-${finding.index}`}
+                  >
+                    <div class="global-task-audit-finding-head">
+                      <span class="global-task-audit-finding-index">{finding.index}</span>
+                      {finding.severity && (
+                        <span class={`global-task-audit-sev-pill${sevClass}`}>[{finding.severity}]</span>
+                      )}
+                      {finding.blocking && (
+                        <span class="global-task-audit-blocking-tag">
+                          {t('taskMode.audit_blocking_tag', 'Blocking')}
+                        </span>
+                      )}
+                      {finding.location && (
+                        <code class="global-task-audit-finding-location">{finding.location}</code>
+                      )}
+                    </div>
+                    {finding.summary && (
+                      <div class="global-task-audit-finding-desc">{finding.summary}</div>
+                    )}
+                    {finding.invariant && (
+                      <div class="global-task-audit-finding-sub">
+                        <span class="global-task-audit-meta-label">{t('taskMode.audit_label_invariant', 'Invariant')}:</span>
+                        <span>{finding.invariant}</span>
+                      </div>
+                    )}
+                    {finding.evidence && (
+                      <div class="global-task-audit-finding-sub">
+                        <span class="global-task-audit-meta-label">{t('taskMode.audit_label_evidence', 'Evidence')}:</span>
+                        <span>{finding.evidence}</span>
+                      </div>
+                    )}
+                    {finding.proposal && (
+                      <div class="global-task-audit-finding-proposal">
+                        <span class="global-task-audit-meta-label">{t('taskMode.audit_label_proposal', 'Fix proposal')}:</span>
+                        <span>{finding.proposal}</span>
+                      </div>
+                    )}
+                    {finding.tradeoffs && (
+                      <div class="global-task-audit-finding-sub">
+                        <span class="global-task-audit-meta-label">{t('taskMode.audit_label_tradeoffs', 'Trade-offs')}:</span>
+                        <span>{finding.tradeoffs}</span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : detailAudit.noticeText ? (
+            <div class="global-task-audit-raw-notice" data-testid="global-task-audit-raw-notice">
+              <div class="global-task-audit-meta-label">{t('taskMode.audit_label_raw_notice', 'Full audit reply')}</div>
+              <div>{detailAudit.noticeText}</div>
+            </div>
+          ) : (
+            <div class="global-task-brief-hud-empty" data-testid="global-task-audit-empty-findings">
+              {t('taskMode.audit_empty', 'No audit feedback recorded for this task yet.')}
+            </div>
+          )
+        ) : loading ? (
+          <div class="global-task-brief-hud-loading" data-testid="global-task-brief-loading">
+            <span class="global-task-brief-hud-spinner" aria-hidden="true" />
+            <span>{t('taskMode.brief_loading', 'Syncing brief & checklist from daemon…')}</span>
+          </div>
+        ) : (
+          <div class="global-task-brief-hud-empty" data-testid="global-task-audit-cached-only">
+            {t('taskMode.audit_cached_only_notice', 'Showing cached summary from card (detailed findings unavailable).')}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const handleCopy = () => {
     if (!briefText.trim()) return;
@@ -407,6 +575,19 @@ export function GlobalTaskBriefModal({
             <button
               type="button"
               role="tab"
+              aria-selected={activeTab === 'audit'}
+              class={`global-task-brief-hud-tab${activeTab === 'audit' ? ' is-active' : ''}`}
+              data-testid="global-task-brief-tab-audit"
+              onClick={() => setActiveTab('audit')}
+            >
+              {t('taskMode.brief_tab_audit', 'Audit Feedback')}
+              {auditTabBadge > 0 && (
+                <span class="global-task-audit-tab-count">{auditTabBadge}</span>
+              )}
+            </button>
+            <button
+              type="button"
+              role="tab"
               aria-selected={activeTab === 'brief'}
               class={`global-task-brief-hud-tab${activeTab === 'brief' ? ' is-active' : ''}`}
               data-testid="global-task-brief-tab-brief"
@@ -452,7 +633,9 @@ export function GlobalTaskBriefModal({
             </div>
           )}
 
-          {loading && !hasBriefOk ? (
+          {activeTab === 'audit' ? (
+            renderAuditTabContent()
+          ) : loading && !hasBriefOk ? (
             <div class="global-task-brief-hud-loading" data-testid="global-task-brief-loading">
               <span class="global-task-brief-hud-spinner" aria-hidden="true" />
               <span>{t('taskMode.brief_loading', 'Syncing brief & checklist from daemon…')}</span>

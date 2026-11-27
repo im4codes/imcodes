@@ -1529,7 +1529,11 @@ export interface TaskPairLastVerdict {
   judgement: TaskPairVerdictJudgement;
   round: number;
   noticeText?: string;
+  /** Full stripped verdict text without the 4000-char notice slice used by timelines. */
+  fullNoticeText?: string;
   auditDetails?: TaskPairAuditDetails;
+  /** Full structured details submitted via pair_verdict without parser truncation. */
+  structuredDetails?: TaskPairAuditDetails;
   reason?: string;
 }
 
@@ -1869,6 +1873,8 @@ export interface TaskPairApplyContext {
   busySessions?: ReadonlySet<string>;
   /** Full assistant turn, used only for lightweight auditor-proposal enforcement. */
   turnText?: string;
+  /** Full structured audit details (e.g. from pair_verdict MCP tool), preserved without parser truncation. */
+  structuredAuditDetails?: TaskPairAuditDetails;
   /** Runtime timeline ingestion must use pair_create for new Brain work. */
   requireStructuredPairCreate?: boolean;
 }
@@ -2594,13 +2600,16 @@ export function applyTaskPairMarker(
       const verdict = judgeTaskPairVerdict(verb, attrs, pair.blocking);
       if (verdict.blockingMismatch) unusual = true;
       if (terminal && verb === 'PASS') {
-        const noticeText = ctx.turnText ? stripTaskPairMarkersForDisplay(ctx.turnText).trim().slice(0, 4000) : undefined;
+        const strippedText = ctx.turnText ? stripTaskPairMarkersForDisplay(ctx.turnText).trim() : '';
+        const noticeText = strippedText ? strippedText.slice(0, 4000) : undefined;
         pair.lastVerdict = {
           verb,
           counts: verdict.counts,
           judgement: verdict.judgement,
           round: pair.round,
           ...(noticeText ? { noticeText } : {}),
+          ...(strippedText ? { fullNoticeText: strippedText } : {}),
+          ...(ctx.structuredAuditDetails ? { structuredDetails: ctx.structuredAuditDetails } : {}),
         };
         return done('recorded', { verdict });
       }
@@ -2794,13 +2803,16 @@ function applyVerdict(
   intents: TaskPairIntent[],
   ctx?: TaskPairApplyContext,
 ): void {
-  const noticeText = ctx?.turnText ? stripTaskPairMarkersForDisplay(ctx.turnText).trim().slice(0, 4000) : undefined;
+  const strippedText = ctx?.turnText ? stripTaskPairMarkersForDisplay(ctx.turnText).trim() : '';
+  const noticeText = strippedText ? strippedText.slice(0, 4000) : undefined;
   pair.lastVerdict = {
     verb,
     counts: verdict.counts,
     judgement: verdict.judgement,
     round: pair.round,
     ...(noticeText ? { noticeText } : {}),
+    ...(strippedText ? { fullNoticeText: strippedText } : {}),
+    ...(ctx?.structuredAuditDetails ? { structuredDetails: ctx.structuredAuditDetails } : {}),
   };
   if (!isAppliedVerdict(verdict.judgement)) {
     if (spendCap(pair, 'verdict_correction', intents)) {
