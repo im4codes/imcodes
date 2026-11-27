@@ -2340,7 +2340,8 @@ html.native-ios-mac .chat-dl-btn {
 }
 .quick-sdk-item-dot {
   flex-shrink: 0;
-  font-size: 8px;
+  font-size: 7.5px;
+  line-height: 1;
   color: #34d399;
 }
 .menu-dropdown-models .quick-sdk-model-item {
@@ -2410,16 +2411,16 @@ html.native-ios-mac .chat-dl-btn {
     max-height: 100%;
   }
   .quick-sdk-model-sdks {
-    flex: 0 0 clamp(144px, 44%, 184px);
-    width: clamp(144px, 44%, 184px);
+    flex: 0 0 clamp(166px, 46%, 196px);
+    width: clamp(166px, 46%, 196px);
   }
   .quick-sdk-item,
   .menu-dropdown-models .quick-sdk-model-item {
     min-height: 40px;
   }
   .quick-sdk-item {
-    padding: 6px 6px;
-    gap: 5px;
+    padding: 6px 5.5px;
+    gap: 4.5px;
   }
 }
 @media (max-width: 359px) {

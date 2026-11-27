@@ -117,13 +117,13 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
                                   role: 'brain',
                                   state: 'idle',
                                   projectDir: '/work/app',
-                                  agentType: 'claude-code',
+                                  agentType: 'claude-code-sdk',
                                   modelDisplay: 'sonnet',
                                 }}
                                 serverId="srv1"
                                 modelOpen={open}
                                 splitAllowed={true}
-                                currentSdk="claude-code"
+                                currentSdk="claude-code-sdk"
                                 currentModel="sonnet"
                                 sameSdkItems={[
                                   { id: 'opus', label: 'Opus' },
@@ -206,12 +206,19 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
           const models = document.querySelector('.quick-sdk-model-models')!.getBoundingClientRect().toJSON();
           const sdkRow = document.querySelector('.quick-sdk-item')!.getBoundingClientRect().toJSON();
           const modelRow = document.querySelector('.quick-sdk-model-item')!.getBoundingClientRect().toJSON();
-          const sdkLabels = Array.from(document.querySelectorAll('.quick-sdk-item-label')).map((el) => {
-            const htmlEl = el as HTMLElement;
+          const sdkItems = Array.from(document.querySelectorAll('.quick-sdk-item[data-sdk-id]')).map((btn) => {
+            const htmlBtn = btn as HTMLElement;
+            const sdkId = htmlBtn.getAttribute('data-sdk-id') ?? '';
+            const labelEl = htmlBtn.querySelector('.quick-sdk-item-label') as HTMLElement | null;
+            const dotEl = htmlBtn.querySelector('.quick-sdk-item-dot') as HTMLElement | null;
+            const isCurrent = htmlBtn.classList.contains('is-current');
             return {
-              text: htmlEl.textContent?.trim() ?? '',
-              scrollWidth: htmlEl.scrollWidth,
-              clientWidth: htmlEl.clientWidth,
+              sdkId,
+              isCurrent,
+              hasDot: Boolean(dotEl),
+              label: labelEl?.textContent?.trim() ?? '',
+              scrollWidth: labelEl?.scrollWidth ?? 0,
+              clientWidth: labelEl?.clientWidth ?? 0,
             };
           });
           return {
@@ -222,7 +229,7 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
             models,
             sdkRow,
             modelRow,
-            sdkLabels,
+            sdkItems,
           };
         });
 
@@ -287,12 +294,28 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
 
         // Core SDK labels must not be truncated on mobile-390, mobile-430, and desktop-1440
         if (sc.name === 'mobile-390' || sc.name === 'mobile-430' || sc.name === 'desktop-1440') {
-          const coreSdkNames = ['Antigravity', 'Codex SDK', 'Claude Code SDK', 'Qoder SDK', 'Copilot', 'Cursor', 'OpenCode SDK', 'Grok Build'];
-          for (const name of coreSdkNames) {
-            const item = geom.sdkLabels.find((l) => l.text === name);
-            if (item) {
-              expect(item.scrollWidth, `${sc.name} - ${name} should not be truncated`).toBeLessThanOrEqual(item.clientWidth + 2);
+          const coreSdkIds = [
+            'agy-sdk',
+            'codex-sdk',
+            'claude-code-sdk',
+            'qoder-sdk',
+            'copilot-sdk',
+            'cursor-headless',
+            'opencode-sdk',
+            'grok-sdk',
+          ];
+          for (const id of coreSdkIds) {
+            const item = geom.sdkItems.find((it) => it.sdkId === id);
+            expect(item, `${sc.name} - ${id} button must exist in quick switcher`).toBeDefined();
+            expect(item!.label.length, `${sc.name} - ${id} label must not be empty`).toBeGreaterThan(0);
+            if (id === 'claude-code-sdk') {
+              expect(item!.isCurrent, `${sc.name} - claude-code-sdk must be is-current`).toBe(true);
+              expect(item!.hasDot, `${sc.name} - claude-code-sdk must display current status dot`).toBe(true);
             }
+            expect(
+              item!.scrollWidth,
+              `${sc.name} - ${id} label "${item!.label}" should not be truncated (scrollWidth: ${item!.scrollWidth}, clientWidth: ${item!.clientWidth})`
+            ).toBeLessThanOrEqual(item!.clientWidth + 2);
           }
         }
 
