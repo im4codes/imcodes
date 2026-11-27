@@ -534,7 +534,7 @@ function SessionTabsControlled({ sessions, activeSession, connected, latencyMs, 
                 >
                   {idx + 1}
                 </sup>
-                {isPinned && <span class="tab-pin">📌</span>}
+                {isPinned && <span class="tab-pin" aria-hidden="true">📌</span>}
                 {agentBadge(s.agentType)}
                 {getLabel(s)}
                 {s.state === 'error' && (
