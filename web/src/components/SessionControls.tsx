@@ -99,9 +99,10 @@ import {
   readSafeAreaLeftPx,
   readSafeAreaRightPx,
   readSafeAreaTopPx,
+  resolveQuickSdkDropdownOptions,
 } from '../util/model-dropdown-style.js';
 
-export { computeModelDropdownStyle };
+export { computeModelDropdownStyle, resolveQuickSdkDropdownOptions };
 import { isInsufficientCapacityError } from '../upload-error.js';
 import { MobileDpad, DPAD_ARROW_SEQUENCES } from './MobileDpad.js';
 import { P2pConfigPanel, buildP2pWorkflowLaunchEnvelopeFromConfig } from './P2pConfigPanel.js';
@@ -5221,7 +5222,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     const rect = trigger.getBoundingClientRect();
     const viewport = window.visualViewport;
     const effectiveWidth = viewport?.width ? Math.min(window.innerWidth, viewport.width) : window.innerWidth;
-    const isNarrowViewport = effectiveWidth > 0 && effectiveWidth <= 640;
     return computeModelDropdownStyle(rect, {
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
@@ -5233,11 +5233,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       safeAreaBottom: readSafeAreaBottomPx(),
       safeAreaLeft: readSafeAreaLeftPx(),
       safeAreaRight: readSafeAreaRightPx(),
-    }, quickSdkSplitAllowed ? {
-      minWidth: isNarrowViewport ? 280 : 340,
-      preferredWidth: isNarrowViewport ? 374 : 416,
-      ...(isNarrowViewport ? { viewportHeightCapRatio: 0.46, maxHeightPx: 340 } : {}),
-    } : undefined);
+    }, quickSdkSplitAllowed ? resolveQuickSdkDropdownOptions(effectiveWidth) : undefined);
   }, [modelLayoutTick, modelOpen, quickSdkSplitAllowed]);
 
   const renderModelDropdown = useCallback((content: ComponentChildren) => {

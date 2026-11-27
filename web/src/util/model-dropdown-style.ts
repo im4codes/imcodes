@@ -129,6 +129,35 @@ export interface ModelDropdownStyleOptions {
   preferredWidth?: number;
   viewportHeightCapRatio?: number;
   maxHeightPx?: number;
+  preferExactWidth?: boolean;
+  centerHorizontally?: boolean;
+}
+
+/**
+ * Resolve standard options for the two-column Quick SDK / Model switcher menu.
+ *
+ * - Mobile (<= 640px): ~90% viewport width, centered horizontally within safe
+ *   areas, ~52% viewport height (up to 520px).
+ * - Desktop (> 640px): ~540px width, ~52% viewport height (up to 500px).
+ */
+export function resolveQuickSdkDropdownOptions(effectiveWidth: number): ModelDropdownStyleOptions {
+  if (effectiveWidth > 0 && effectiveWidth <= 640) {
+    return {
+      preferredWidth: Math.max(300, Math.round(effectiveWidth * 0.9)),
+      minWidth: Math.min(300, Math.round(effectiveWidth * 0.85)),
+      preferExactWidth: true,
+      centerHorizontally: true,
+      viewportHeightCapRatio: 0.52,
+      maxHeightPx: 520,
+    };
+  }
+  return {
+    preferredWidth: effectiveWidth > 0 ? Math.min(540, Math.round(effectiveWidth * 0.86)) : 540,
+    minWidth: 420,
+    preferExactWidth: true,
+    viewportHeightCapRatio: 0.52,
+    maxHeightPx: 500,
+  };
 }
 
 /**
@@ -244,10 +273,14 @@ export function computeModelDropdownStyle(
 
   const isRightHalf = rect.left + rect.width / 2 > visibleLeft + effectiveWidth / 2;
 
+  const resolvedWidth = options?.preferExactWidth && preferredWidth !== undefined
+    ? `${Math.round(preferredWidth)}px`
+    : 'max-content';
+
   const style: JSX.CSSProperties = {
     position: 'fixed',
     zIndex: 2147483646,
-    width: 'max-content',
+    width: resolvedWidth,
     minWidth: `${Math.round(clampedMinWidth)}px`,
     maxHeight,
     overflowY: 'auto',
@@ -262,7 +295,12 @@ export function computeModelDropdownStyle(
     style.top = 'auto';
   }
 
-  if (isRightHalf) {
+  if (options?.centerHorizontally && preferredWidth !== undefined) {
+    const leftOffset = Math.round(leftSafeBoundary + Math.max(0, horizontalLimit - preferredWidth) / 2);
+    style.left = `${leftOffset}px`;
+    style.right = 'auto';
+    style.maxWidth = `${Math.round(horizontalLimit)}px`;
+  } else if (isRightHalf) {
     const idealRightOffset = Math.max(rightInsetFromLayoutRight, layoutWidth - rect.right);
     const maxShiftRightOffset = preferredWidth !== undefined
       ? Math.max(

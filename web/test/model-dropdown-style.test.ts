@@ -8,6 +8,7 @@ import {
   readSafeAreaLeftPx,
   readSafeAreaRightPx,
   readSafeAreaTopPx,
+  resolveQuickSdkDropdownOptions,
 } from '../src/util/model-dropdown-style.js';
 
 /**
@@ -362,5 +363,110 @@ describe('computeModelDropdownStyle', () => {
     expect(readSafeAreaRightPx(document)).toBe(22);
     document.documentElement.style.removeProperty('--sal');
     document.documentElement.style.removeProperty('--sar');
+  });
+
+  it('enlarges Quick SDK/Model split dropdown across 1440x900, 430x932, 390x844, 320x568, notched and visualViewport', () => {
+    // 1. Desktop 1440x900: widened to 540px and capped around 50% height (up to 500px)
+    const desktopOpts = resolveQuickSdkDropdownOptions(1440);
+    expect(desktopOpts.preferredWidth).toBe(540);
+    expect(desktopOpts.minWidth).toBe(420);
+    expect(desktopOpts.preferExactWidth).toBe(true);
+    expect(desktopOpts.centerHorizontally).toBeUndefined();
+    expect(desktopOpts.viewportHeightCapRatio).toBe(0.52);
+    expect(desktopOpts.maxHeightPx).toBe(500);
+
+    const desktopLeft = computeModelDropdownStyle(
+      { top: 820, bottom: 852, left: 100, right: 180, width: 80 },
+      { innerWidth: 1440, innerHeight: 900, safeAreaTop: 0 },
+      desktopOpts,
+    );
+    expect(desktopLeft.width).toBe('540px');
+    expect(desktopLeft.left).toBe('100px');
+    expect(desktopLeft.right).toBe('auto');
+    expect(desktopLeft.minWidth).toBe('420px');
+    expect(evalCssPx(desktopLeft.maxHeight)).toBe(Math.floor(900 * 0.52));
+
+    const desktopRight = computeModelDropdownStyle(
+      { top: 820, bottom: 852, left: 1340, right: 1420, width: 80 },
+      { innerWidth: 1440, innerHeight: 900, safeAreaTop: 0 },
+      desktopOpts,
+    );
+    expect(desktopRight.width).toBe('540px');
+    expect(desktopRight.right).toBe('20px');
+    expect(desktopRight.left).toBe('auto');
+
+    // 2. Mobile 430x932 (iPhone Pro Max): >= 85% width (387px, 90%), centered horizontally, ~52% height (484px)
+    const mobile430Opts = resolveQuickSdkDropdownOptions(430);
+    expect(mobile430Opts.preferredWidth).toBe(387);
+    expect(mobile430Opts.minWidth).toBe(300);
+    expect(mobile430Opts.preferExactWidth).toBe(true);
+    expect(mobile430Opts.centerHorizontally).toBe(true);
+    expect(mobile430Opts.viewportHeightCapRatio).toBe(0.52);
+    expect(mobile430Opts.maxHeightPx).toBe(520);
+
+    const mobile430 = computeModelDropdownStyle(
+      { top: 840, bottom: 874, left: 320, right: 400, width: 80 },
+      { innerWidth: 430, innerHeight: 932, safeAreaTop: 59, safeAreaBottom: 34 },
+      mobile430Opts,
+    );
+    expect(mobile430.width).toBe('387px');
+    // horizontalLimit = (430 - 8) - 8 = 414. leftOffset = 8 + round((414 - 387) / 2) = 22px
+    expect(mobile430.left).toBe('22px');
+    expect(mobile430.right).toBe('auto');
+    expect(mobile430.maxWidth).toBe('414px');
+    expect(evalCssPx(mobile430.maxHeight, { sat: 59 })).toBe(Math.floor(932 * 0.52));
+
+    // 3. Mobile 390x844: >= 85% width (351px, 90%), centered horizontally, ~52% height (438px)
+    const mobile390Opts = resolveQuickSdkDropdownOptions(390);
+    expect(mobile390Opts.preferredWidth).toBe(351);
+    expect(mobile390Opts.preferExactWidth).toBe(true);
+    expect(mobile390Opts.centerHorizontally).toBe(true);
+
+    const mobile390 = computeModelDropdownStyle(
+      { top: 760, bottom: 794, left: 240, right: 320, width: 80 },
+      { innerWidth: 390, innerHeight: 844, safeAreaTop: 47, safeAreaBottom: 34 },
+      mobile390Opts,
+    );
+    expect(mobile390.width).toBe('351px');
+    // horizontalLimit = 374. leftOffset = 8 + round((374 - 351) / 2) = 20px
+    expect(mobile390.left).toBe('20px');
+    expect(mobile390.right).toBe('auto');
+    expect(mobile390.maxWidth).toBe('374px');
+    expect(evalCssPx(mobile390.maxHeight, { sat: 47 })).toBe(Math.floor(844 * 0.52));
+
+    // 4. Ultra-narrow 320x568: clamps to 300px inside [8, 312], centered at 10px
+    const mobile320Opts = resolveQuickSdkDropdownOptions(320);
+    expect(mobile320Opts.preferredWidth).toBe(300);
+    const mobile320 = computeModelDropdownStyle(
+      { top: 500, bottom: 534, left: 180, right: 260, width: 80 },
+      { innerWidth: 320, innerHeight: 568, safeAreaTop: 0, safeAreaBottom: 0 },
+      mobile320Opts,
+    );
+    expect(mobile320.width).toBe('300px');
+    expect(mobile320.left).toBe('10px');
+    expect(mobile320.maxWidth).toBe('304px');
+    expect(evalCssPx(mobile320.maxHeight)).toBe(Math.floor(568 * 0.52));
+
+    // 5. Notched 390x844 with sal=22, sar=22: clamps to 330px inside safe boundaries
+    const notched = computeModelDropdownStyle(
+      { top: 320, bottom: 352, left: 300, right: 380, width: 80 },
+      {
+        innerWidth: 390,
+        innerHeight: 844,
+        visualViewportWidth: 350,
+        visualViewportHeight: 420,
+        visualViewportOffsetLeft: 20,
+        visualViewportOffsetTop: 24,
+        safeAreaTop: 47,
+        safeAreaBottom: 34,
+        safeAreaLeft: 22,
+        safeAreaRight: 22,
+      },
+      resolveQuickSdkDropdownOptions(350),
+    );
+    // horizontalLimit = 330. preferredWidth (315) fits inside 330.
+    expect(evalCssPx(notched.width)).toBeLessThanOrEqual(330);
+    expect(evalCssPx(notched.left)).toBeGreaterThanOrEqual(30);
+    expect(evalCssPx(notched.left) + evalCssPx(notched.width)).toBeLessThanOrEqual(360);
   });
 });

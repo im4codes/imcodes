@@ -40,6 +40,7 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
             readSafeAreaLeftPx,
             readSafeAreaRightPx,
             readSafeAreaTopPx,
+            resolveQuickSdkDropdownOptions,
           } from './src/util/model-dropdown-style.js';
 
           i18n.use(initReactI18next).init({
@@ -75,7 +76,6 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
               offsetLeft: window.visualViewport?.offsetLeft,
             };
             const effWidth = vv.width ? Math.min(window.innerWidth, vv.width) : window.innerWidth;
-            const isNarrow = effWidth <= 640;
             const style = open ? computeModelDropdownStyle(rect, {
               innerWidth: window.innerWidth,
               innerHeight: window.innerHeight,
@@ -87,11 +87,7 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
               safeAreaBottom: readSafeAreaBottomPx(),
               safeAreaLeft: readSafeAreaLeftPx(),
               safeAreaRight: readSafeAreaRightPx(),
-            }, {
-              minWidth: isNarrow ? 280 : 340,
-              preferredWidth: isNarrow ? 374 : 416,
-              ...(isNarrow ? { viewportHeightCapRatio: 0.46, maxHeightPx: 340 } : {}),
-            }) : undefined;
+            }, resolveQuickSdkDropdownOptions(effWidth)) : undefined;
 
             return (
               <I18nextProvider i18n={i18n}>
@@ -176,6 +172,7 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
     try {
       const scenarios = [
         { name: 'desktop-1440', vw: 1440, vh: 900, align: 'left', sat: 0, sab: 0, sal: 0, sar: 0, expectRowH: 36, vv: null },
+        { name: 'mobile-430', vw: 430, vh: 932, align: 'right', sat: 59, sab: 34, sal: 0, sar: 0, expectRowH: 40, vv: null },
         { name: 'mobile-390', vw: 390, vh: 844, align: 'right', sat: 47, sab: 34, sal: 0, sar: 0, expectRowH: 40, vv: null },
         { name: 'mobile-320', vw: 320, vh: 568, align: 'right', sat: 0, sab: 0, sal: 0, sar: 0, expectRowH: 38, vv: null },
         { name: 'notched-390', vw: 390, vh: 844, align: 'right', sat: 47, sab: 34, sal: 22, sar: 22, expectRowH: 40, vv: null },
@@ -209,6 +206,14 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
           const models = document.querySelector('.quick-sdk-model-models')!.getBoundingClientRect().toJSON();
           const sdkRow = document.querySelector('.quick-sdk-item')!.getBoundingClientRect().toJSON();
           const modelRow = document.querySelector('.quick-sdk-model-item')!.getBoundingClientRect().toJSON();
+          const sdkLabels = Array.from(document.querySelectorAll('.quick-sdk-item-label')).map((el) => {
+            const htmlEl = el as HTMLElement;
+            return {
+              text: htmlEl.textContent?.trim() ?? '',
+              scrollWidth: htmlEl.scrollWidth,
+              clientWidth: htmlEl.clientWidth,
+            };
+          });
           return {
             docScrollWidth: document.documentElement.scrollWidth,
             menu,
@@ -217,6 +222,7 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
             models,
             sdkRow,
             modelRow,
+            sdkLabels,
           };
         });
 
@@ -241,7 +247,12 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
         expect(geom.modelRow.height, sc.name).toBeGreaterThanOrEqual(sc.expectRowH);
 
         if (sc.name === 'mobile-390') {
-          expect(geom.menu.height).toBeLessThanOrEqual(340);
+          // Width fills >= 85% of viewport width (~90% target: 351px)
+          expect(geom.menu.width, sc.name).toBeGreaterThanOrEqual(390 * 0.85);
+          // Height fills ~50% of viewport height (~52% target: 438px)
+          expect(geom.menu.height, sc.name).toBeGreaterThanOrEqual(390);
+          expect(geom.menu.height, sc.name).toBeLessThanOrEqual(460);
+
           // Independent column scroll: wheel-scroll SDK rail, verify model rail & page do not move.
           const sdksCenter = { x: geom.sdks.left + geom.sdks.width / 2, y: geom.sdks.top + geom.sdks.height / 2 };
           await page.mouse.move(sdksCenter.x, sdksCenter.y);
@@ -258,6 +269,31 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
           expect(scrollCheck.sdkScrollTop).toBeGreaterThan(0);
           expect(scrollCheck.modelScrollTop).toBe(0);
           expect(scrollCheck.winScrollY).toBe(0);
+        }
+
+        if (sc.name === 'mobile-430') {
+          // Width fills >= 85% of viewport width (~90% target: 387px)
+          expect(geom.menu.width, sc.name).toBeGreaterThanOrEqual(430 * 0.85);
+          // Height fills ~50% of viewport height (~52% target: 484px)
+          expect(geom.menu.height, sc.name).toBeGreaterThanOrEqual(440);
+          expect(geom.menu.height, sc.name).toBeLessThanOrEqual(500);
+        }
+
+        if (sc.name === 'desktop-1440') {
+          // Width widened to ~540px and comfortably tall
+          expect(geom.menu.width, sc.name).toBeGreaterThanOrEqual(500);
+          expect(geom.menu.height, sc.name).toBeGreaterThanOrEqual(400);
+        }
+
+        // Core SDK labels must not be truncated on mobile-390, mobile-430, and desktop-1440
+        if (sc.name === 'mobile-390' || sc.name === 'mobile-430' || sc.name === 'desktop-1440') {
+          const coreSdkNames = ['Antigravity', 'Codex SDK', 'Claude Code SDK', 'Qoder SDK', 'Copilot', 'Cursor', 'OpenCode SDK', 'Grok Build'];
+          for (const name of coreSdkNames) {
+            const item = geom.sdkLabels.find((l) => l.text === name);
+            if (item) {
+              expect(item.scrollWidth, `${sc.name} - ${name} should not be truncated`).toBeLessThanOrEqual(item.clientWidth + 2);
+            }
+          }
         }
 
         await ctx.close();

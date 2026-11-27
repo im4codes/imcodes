@@ -2193,7 +2193,7 @@ html.native-ios-mac .chat-dl-btn {
   display: flex;
   flex-direction: column;
   box-sizing: border-box;
-  width: min(416px, calc(var(--imcodes-ui-vw, 100vw) - 16px));
+  width: min(540px, calc(var(--imcodes-ui-vw, 100vw) - 16px));
   overflow: hidden !important;
   padding: 0;
   border-radius: 10px;
@@ -2210,16 +2210,16 @@ html.native-ios-mac .chat-dl-btn {
   flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
-  width: min(414px, 100%);
+  width: 100%;
   max-width: 100%;
-  height: min(370px, 50vh);
+  height: min(500px, calc(var(--imcodes-ui-vh, 100vh) * 0.52));
   max-height: 100%;
   overflow: hidden;
   color: #e2e8f0;
 }
 .quick-sdk-model-sdks {
-  flex: 0 0 clamp(118px, 36%, 150px);
-  width: clamp(118px, 36%, 150px);
+  flex: 0 0 clamp(172px, 38%, 212px);
+  width: clamp(172px, 38%, 212px);
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -2298,8 +2298,8 @@ html.native-ios-mac .chat-dl-btn {
   min-height: 36px;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
+  gap: 5px;
+  padding: 6px 7px;
   border: 1px solid transparent;
   border-radius: 7px;
   background: transparent;
@@ -2326,7 +2326,7 @@ html.native-ios-mac .chat-dl-btn {
 }
 .quick-sdk-item-icon {
   flex-shrink: 0;
-  width: 16px;
+  width: 15px;
   text-align: center;
   font-size: 12px;
   line-height: 1;
@@ -2402,32 +2402,39 @@ html.native-ios-mac .chat-dl-btn {
 }
 @media (max-width: 640px) {
   .menu-dropdown-models:has(.quick-sdk-model-split) {
-    width: min(374px, calc(var(--imcodes-ui-vw, 100vw) - 16px));
+    width: min(90vw, calc(var(--imcodes-ui-vw, 100vw) - 16px));
   }
   .quick-sdk-model-split {
-    width: min(372px, 100%);
-    height: min(340px, 46vh);
+    width: 100%;
+    height: min(520px, calc(var(--imcodes-ui-vh, 100vh) * 0.52));
     max-height: 100%;
   }
   .quick-sdk-model-sdks {
-    flex: 0 0 clamp(96px, 34%, 126px);
-    width: clamp(96px, 34%, 126px);
+    flex: 0 0 clamp(144px, 44%, 184px);
+    width: clamp(144px, 44%, 184px);
   }
   .quick-sdk-item,
   .menu-dropdown-models .quick-sdk-model-item {
     min-height: 40px;
   }
+  .quick-sdk-item {
+    padding: 6px 6px;
+    gap: 5px;
+  }
 }
 @media (max-width: 359px) {
   .quick-sdk-model-sdks {
-    flex: 0 0 clamp(88px, 34%, 106px);
-    width: clamp(88px, 34%, 106px);
+    flex: 0 0 clamp(128px, 44%, 144px);
+    width: clamp(128px, 44%, 144px);
   }
   .quick-sdk-item,
   .menu-dropdown-models .quick-sdk-model-item {
     min-height: 38px;
-    padding-left: 7px;
-    padding-right: 7px;
+  }
+  .quick-sdk-item {
+    padding: 6px 5px;
+    gap: 4px;
+    font-size: 11.5px;
   }
   .menu-dropdown-models .quick-sdk-default-item {
     font-size: 11px;
