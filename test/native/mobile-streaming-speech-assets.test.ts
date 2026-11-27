@@ -3520,8 +3520,9 @@ do {
         }
     )
     engine.preload(makeMarkedPcm(250_000, 0.2, 0.8))
-    DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
+    // Request immediate stop BEFORE starting worker so assertions are independent of thread scheduling.
     engine.requestStop(abort: false, producerAlsoFinished: true)
+    DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
     check(done.wait(timeout: .now() + 5) == .success, "case 1 timed out")
     check(decodeCalls.map { $0.size } == [216_000, 250_000], "case 1 decodeSizes mismatch: \\(decodeCalls)")
     check(decodeCalls.last?.prefixCount == 0, "case 1 final pass must use empty prefixTokens: \\(decodeCalls)")
@@ -3535,12 +3536,16 @@ do {
     let emitLock = NSLock()
     var emitted: [[String: Any]] = []
     var decodeCalls: [(size: Int, prefixCount: Int)] = []
+    let firstDecodeEntered = DispatchSemaphore(value: 0)
     let done = DispatchSemaphore(value: 0)
     let engine = QwenSegmentedDecodeEngine(
         expectLanguageHeader: false,
         decodeFn: { samples, prefix, checkCancel in
             try checkCancel()
             decodeCalls.append((samples.count, prefix.count))
+            if samples.count == 216_000 {
+                firstDecodeEntered.signal()
+            }
             let txt = samples.count == 220_000 ? "whole-220k" : markerText(samples)
             return QwenSegmentedDecodeResult(text: txt, tokens: prefix + [1])
         },
@@ -3553,9 +3558,9 @@ do {
         onLoopFinishedFn: { done.signal() }
     )
     engine.preload([Float](repeating: 0.2, count: 216_000))
-    DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
     engine.requestStop(abort: false, producerAlsoFinished: false)
-    Thread.sleep(forTimeInterval: 0.02)
+    DispatchQueue.global(qos: .userInitiated).async { engine.runLoop() }
+    check(firstDecodeEntered.wait(timeout: .now() + 5) == .success, "case 2 first decode timed out")
     check(engine.enqueue([Float](repeating: 0.8, count: 4_000)), "trailing enqueue before markProducerFinished rejected")
     engine.markProducerFinished()
     check(done.wait(timeout: .now() + 5) == .success, "case 2 timed out")
@@ -3759,6 +3764,98 @@ do {
     engineB.requestStop(abort: false, producerAlsoFinished: true)
     check(doneB.wait(timeout: .now() + 5) == .success, "case 6b timed out")
     check((hwEmitted.last?["text"] as? String) == "" && (hwEmitted.last?["isFinal"] as? Bool) == true, "case 6b did not retract: \\(hwEmitted)")
+
+    // 6c & 6d (P0 #1 counterexamples): interim "IM.codes" -> echo "IM.codes，IM.codes。" retracted to ""
+    // -> final decode returning single "IM.codes" MUST stay retracted ("") under BOTH <=cap and >cap
+    // (including both direct trailing final and post-rollover stop)!
+    for (label, maxCap, step3Count) in [("<=cap", 100, 0), (">cap-tail", 10, 4), (">cap-rollover", 10, 8)] {
+        var stepEmitted: [[String: Any]] = []
+        var stepPass = 0
+        let sem1 = DispatchSemaphore(value: 0)
+        let sem2 = DispatchSemaphore(value: 0)
+        let lockStep = NSLock()
+        let doneStep = DispatchSemaphore(value: 0)
+        let stepEngine = QwenSegmentedDecodeEngine(
+            initialStrideSamples: 4,
+            strideSamples: 4,
+            maxSegmentSamples: 8,
+            maxFinalReDecodeSamples: maxCap,
+            expectLanguageHeader: false,
+            hotwordTerms: ["IM.codes"],
+            decodeFn: { _, _, _ in
+                lockStep.lock(); stepPass += 1; let p = stepPass; lockStep.unlock()
+                if p == 1 { return QwenSegmentedDecodeResult(text: "IM.codes", tokens: [1]) }
+                if p == 2 { return QwenSegmentedDecodeResult(text: "IM.codes，IM.codes。", tokens: [1]) }
+                return QwenSegmentedDecodeResult(text: "IM.codes", tokens: [1])
+            },
+            rollbackPrefixFn: { t, _, _ in t },
+            emitJsonFn: { payload in
+                stepEmitted.append(payload)
+                let txt = payload["text"] as? String
+                let isF = (payload["isFinal"] as? Bool) ?? false
+                if !isF && txt == "IM.codes" { sem1.signal() }
+                if !isF && txt == "" { sem2.signal() }
+            },
+            onLoopFinishedFn: { doneStep.signal() }
+        )
+        DispatchQueue.global(qos: .userInitiated).async { stepEngine.runLoop() }
+        check(stepEngine.enqueue([Float](repeating: 0.1, count: 4)), "case 6\\(label) chunk 1")
+        check(sem1.wait(timeout: .now() + 5) == .success, "case 6\\(label) interim IM.codes wait")
+        check(stepEngine.enqueue([Float](repeating: 0.1, count: 4)), "case 6\\(label) chunk 2")
+        check(sem2.wait(timeout: .now() + 5) == .success, "case 6\\(label) retract wait")
+        if step3Count > 0 {
+            check(stepEngine.enqueue([Float](repeating: 0.1, count: step3Count)), "case 6\\(label) chunk 3")
+            if label == ">cap-rollover" {
+                for _ in 0..<200 {
+                    lockStep.lock(); let p = stepPass; lockStep.unlock()
+                    if p >= 3 { break }
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+            }
+        }
+        stepEngine.requestStop(abort: false, producerAlsoFinished: true)
+        check(doneStep.wait(timeout: .now() + 5) == .success, "case 6\\(label) done wait")
+        let finals = stepEmitted.filter { ($0["isFinal"] as? Bool) == true }
+        check(finals.count == 1 && (finals[0]["text"] as? String) == "", "case 6\\(label) resurrected IM.codes: \\(stepEmitted)")
+    }
+
+    // 6e: interim "IM.codes" -> echo retracted -> final returns real sentence "打开 IM.codes" -> accepted!
+    var realEmitted: [[String: Any]] = []
+    var realPass = 0
+    let realSem1 = DispatchSemaphore(value: 0)
+    let realSem2 = DispatchSemaphore(value: 0)
+    let doneReal = DispatchSemaphore(value: 0)
+    let realEngine = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 4,
+        strideSamples: 4,
+        maxSegmentSamples: 100,
+        maxFinalReDecodeSamples: 100,
+        expectLanguageHeader: false,
+        hotwordTerms: ["IM.codes"],
+        decodeFn: { _, _, _ in
+            realPass += 1
+            if realPass == 1 { return QwenSegmentedDecodeResult(text: "IM.codes", tokens: [1]) }
+            if realPass == 2 { return QwenSegmentedDecodeResult(text: "IM.codes，IM.codes。", tokens: [1]) }
+            return QwenSegmentedDecodeResult(text: "打开 IM.codes", tokens: [1])
+        },
+        rollbackPrefixFn: { t, _, _ in t },
+        emitJsonFn: { payload in
+            realEmitted.append(payload)
+            let txt = payload["text"] as? String
+            let isF = (payload["isFinal"] as? Bool) ?? false
+            if !isF && txt == "IM.codes" { realSem1.signal() }
+            if !isF && txt == "" { realSem2.signal() }
+        },
+        onLoopFinishedFn: { doneReal.signal() }
+    )
+    DispatchQueue.global(qos: .userInitiated).async { realEngine.runLoop() }
+    check(realEngine.enqueue([Float](repeating: 0.1, count: 4)), "case 6e chunk 1")
+    check(realSem1.wait(timeout: .now() + 5) == .success, "case 6e sem1")
+    check(realEngine.enqueue([Float](repeating: 0.1, count: 4)), "case 6e chunk 2")
+    check(realSem2.wait(timeout: .now() + 5) == .success, "case 6e sem2")
+    realEngine.requestStop(abort: false, producerAlsoFinished: true)
+    check(doneReal.wait(timeout: .now() + 5) == .success, "case 6e done")
+    check((realEmitted.last?["text"] as? String) == "打开 IM.codes" && (realEmitted.last?["isFinal"] as? Bool) == true, "case 6e failed: \\(realEmitted)")
 }
 
 // 7. Abort rejects new samples and never emits isFinal=true (even if abort happens during final re-decode).
@@ -3784,27 +3881,37 @@ print("MAC_SEGMENTED_DECODE:PASS")
   await runNativeOrThrow(swiftCompiler!, ['-swift-version', '5', swiftFile, '-o', binFile], { timeout: 120000 });
   expect((await runNativeOrThrow(binFile, [], { timeout: 60000 })).trim()).toBe('MAC_SEGMENTED_DECODE:PASS');
 
-  // 3. Slice & compile Windows C++ SegmentedUtterancePipeline checks when clang++ is available.
+  // 3. Compile & execute the full standalone Windows C++ test suite (apps/pc-app/native/win/segmented-pipeline.test.cpp)
+  //    against the portable C++ slices of imcodes-speech-win.cpp when clang++ is available.
   const winCppPath = fileURLToPath(new URL('../../apps/pc-app/native/win/imcodes-speech-win.cpp', import.meta.url));
+  const winTestPath = fileURLToPath(new URL('../../apps/pc-app/native/win/segmented-pipeline.test.cpp', import.meta.url));
   const winCpp = await readFile(winCppPath, 'utf8');
+  const winTestSrc = await readFile(winTestPath, 'utf8');
   expect(winCpp).toContain('kMaxFinalReDecodeSamples = 480000');
   expect(winCpp).toContain('cfg.model_config.qwen3_asr.max_new_tokens = 384;');
   const clangPp = process.env.CXX || (existsSync('/usr/bin/clang++') ? '/usr/bin/clang++' : undefined);
   if (clangPp) {
-    const helperStart = winCpp.indexOf('constexpr int kTargetSampleRate');
+    const helperStart = winCpp.indexOf('constexpr uint64_t kDirectMlMinVramMb');
     const helperEnd = winCpp.indexOf('std::string wide_to_utf8(');
+    const b64Start = winCpp.indexOf('std::optional<std::string> extract_json_string_field(');
+    const b64End = winCpp.indexOf('std::string resolve_target_capture_uid(');
     const pipeStart = winCpp.indexOf('template <typename SampleAtFn>');
     const pipeEnd = winCpp.indexOf('#ifdef IMCODES_HAS_SHERPA_ONNX', pipeStart);
     expect(helperStart).toBeGreaterThan(-1);
     expect(helperEnd).toBeGreaterThan(helperStart);
+    expect(b64Start).toBeGreaterThan(-1);
+    expect(b64End).toBeGreaterThan(b64Start);
     expect(pipeStart).toBeGreaterThan(-1);
     expect(pipeEnd).toBeGreaterThan(pipeStart);
 
-    const cppFile = join(root, 'WinSegmentedPipelineTests.cpp');
-    const cppBin = join(root, 'win-segmented-pipeline-tests');
+    // Strip lines 1-2 (#define IMCODES_SPEECH_WIN_NO_MAIN / #include "imcodes-speech-win.cpp") from standalone suite
+    const testBodyStart = winTestSrc.indexOf('#include <cassert>');
+    expect(testBodyStart).toBeGreaterThan(-1);
+
+    const cppFile = join(root, 'WinSegmentedPipelineFullSuite.cpp');
+    const cppBin = join(root, 'win-segmented-pipeline-full');
     await writeFile(cppFile, `#include <algorithm>
 #include <atomic>
-#include <cassert>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -3815,6 +3922,7 @@ print("MAC_SEGMENTED_DECODE:PASS")
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -3823,96 +3931,12 @@ print("MAC_SEGMENTED_DECODE:PASS")
 #include <vector>
 
 ${winCpp.slice(helperStart, helperEnd)}
+${winCpp.slice(b64Start, b64End)}
 ${winCpp.slice(pipeStart, pipeEnd)}
 
-int main() {
-  (void)&emit_error;
-  assert(sanitize_asr_repetition_loop("hello").compare("hello") == 0);
-  // A. <= max_final_redecode_samples across segment cap rollover -> final decodes FULL utterance_samples
-  {
-    std::vector<size_t> decode_sizes;
-    std::vector<std::string> emitted;
-    SegmentedUtterancePipeline pipeline(
-        [&](const std::vector<float>& samples) -> std::string {
-          decode_sizes.push_back(samples.size());
-          return samples.size() == 24000 ? "full-win-utterance" : "partial-seg";
-        },
-        [&](const std::string& line) { emitted.push_back(line); },
-        /*max_segment_samples=*/16000,
-        /*max_final_redecode_samples=*/30000);
-    pipeline.preload(std::vector<float>(24000, 0.2f));
-    std::thread worker([&]() { pipeline.run_loop(); });
-    pipeline.request_stop(false, true);
-    worker.join();
-    assert(decode_sizes.size() == 2 && decode_sizes[0] == 16000 && decode_sizes[1] == 24000);
-    assert(emitted.size() >= 2);
-    assert(emitted[emitted.size() - 2] == "{\\"type\\":\\"result\\",\\"text\\":\\"full-win-utterance\\",\\"isFinal\\":true}");
-    assert(emitted.back() == "{\\"type\\":\\"end\\"}");
-  }
-
-  // B. > max_final_redecode_samples -> drops full buffer, preserves committed_text + decodes trailing segment
-  {
-    std::vector<size_t> decode_sizes;
-    std::vector<std::string> emitted;
-    SegmentedUtterancePipeline pipeline(
-        [&](const std::vector<float>& samples) -> std::string {
-          decode_sizes.push_back(samples.size());
-          if (samples.size() == 16000) return "head-seg";
-          return "tail-seg";
-        },
-        [&](const std::string& line) { emitted.push_back(line); },
-        /*max_segment_samples=*/16000,
-        /*max_final_redecode_samples=*/20000);
-    pipeline.preload(std::vector<float>(24000, 0.2f));
-    std::thread worker([&]() { pipeline.run_loop(); });
-    pipeline.request_stop(false, true);
-    worker.join();
-    for (size_t sz : decode_sizes) assert(sz <= 16000);
-    assert(decode_sizes.back() == 8000);
-    assert(emitted[emitted.size() - 2] == "{\\"type\\":\\"result\\",\\"text\\":\\"head-seg tail-seg\\",\\"isFinal\\":true}");
-  }
-
-  // C. Pure silence <= max_final_redecode_samples skips decode_fn_ and emits empty final ""
-  {
-    int decode_calls = 0;
-    std::vector<std::string> emitted;
-    SegmentedUtterancePipeline pipeline(
-        [&](const std::vector<float>&) -> std::string {
-          ++decode_calls;
-          return "IM.codes";
-        },
-        [&](const std::string& line) { emitted.push_back(line); },
-        /*max_segment_samples=*/16000,
-        /*max_final_redecode_samples=*/30000);
-    pipeline.preload(std::vector<float>(18000, 0.001f));
-    std::thread worker([&]() { pipeline.run_loop(); });
-    pipeline.request_stop(false, true);
-    worker.join();
-    assert(decode_calls == 0);
-    assert(emitted.size() == 2 && emitted[0] == "{\\"type\\":\\"result\\",\\"text\\":\\"\\",\\"isFinal\\":true}");
-  }
-
-  // D. Abort never emits isFinal=true
-  {
-    std::vector<std::string> emitted;
-    SegmentedUtterancePipeline pipeline(
-        [&](const std::vector<float>&) -> std::string { return "x"; },
-        [&](const std::string& line) { emitted.push_back(line); },
-        16000,
-        30000);
-    pipeline.preload(std::vector<float>(24000, 0.2f));
-    pipeline.request_stop(true, true);
-    pipeline.run_loop();
-    for (const auto& line : emitted) {
-      assert(line.find("\\"isFinal\\":true") == std::string::npos);
-    }
-  }
-
-  std::cout << "WIN_SEGMENTED_PIPELINE:PASS\\n";
-  return 0;
-}
+${winTestSrc.slice(testBodyStart)}
 `);
-    await runNativeOrThrow(clangPp, ['-std=c++17', '-Wall', '-Wextra', '-Werror', cppFile, '-o', cppBin], { timeout: 60000 });
-    expect((await runNativeOrThrow(cppBin, [], { timeout: 60000 })).trim()).toBe('WIN_SEGMENTED_PIPELINE:PASS');
+    await runNativeOrThrow(clangPp, ['-std=c++17', '-Wall', '-Wextra', cppFile, '-o', cppBin], { timeout: 60000 });
+    expect((await runNativeOrThrow(cppBin, [], { timeout: 60000 })).trim()).toBe('segmented-pipeline tests passed');
   }
 }, 180_000);

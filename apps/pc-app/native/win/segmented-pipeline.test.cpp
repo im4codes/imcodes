@@ -61,8 +61,8 @@ std::string decode_by_marker(const std::vector<float>& samples) {
 }  // namespace
 
 int main() {
-  // 1. P0-4 counterexample: >216,000 samples (250,000 samples) prefilled + immediate normal stop(false)
-  // Must decode both segments (216,000 + 34,000) and emit ONE isFinal=true containing both.
+  // 1. <=30s multi-segment (250,000 <= kMaxFinalReDecodeSamples) prefilled + immediate normal stop(false):
+  // streaming commits 216,000, then final re-decodes FULL 250,000 utterance replacing rolled-over text.
   {
     std::vector<std::string> emitted;
     std::mutex emit_mu;
@@ -71,8 +71,9 @@ int main() {
     SegmentedUtterancePipeline<
         std::function<std::string(const std::vector<float>&)>,
         std::function<void(const std::string&)>> pipeline(
-        [&](const std::vector<float>& samples) {
+        [&](const std::vector<float>& samples) -> std::string {
           decode_sizes.push_back(samples.size());
+          if (samples.size() == 250000) return "full-250k-utterance";
           return decode_by_marker(samples);
         },
         [&](const std::string& line) {
@@ -87,7 +88,7 @@ int main() {
 
     assert(decode_sizes.size() == 2);
     assert(decode_sizes[0] == kMaxSegmentSamples);
-    assert(decode_sizes[1] == 250000 - kMaxSegmentSamples);
+    assert(decode_sizes[1] == 250000);
 
     int final_count = 0;
     std::string final_text;
@@ -99,7 +100,55 @@ int main() {
       }
     }
     assert(final_count == 1);
-    assert(final_text == "seg-one seg-two");
+    assert(final_text == "full-250k-utterance");
+    assert(!emitted.empty() && extract_json_string_field(emitted.back(), "type") == "end");
+  }
+
+  // 1b. >30s (500,000 > kMaxFinalReDecodeSamples) releases full buffer, commits 216k chunks,
+  // and final decodes ONLY trailing active segment (68,000).
+  {
+    std::vector<std::string> emitted;
+    std::mutex emit_mu;
+    std::vector<size_t> decode_sizes;
+    std::vector<float> long_pcm(500000, 0.2f);
+    for (size_t i = kMaxSegmentSamples * 2; i < long_pcm.size(); ++i) {
+      long_pcm[i] = 0.8f;
+    }
+
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> pipeline(
+        [&](const std::vector<float>& samples) -> std::string {
+          decode_sizes.push_back(samples.size());
+          return decode_by_marker(samples);
+        },
+        [&](const std::string& line) {
+          std::lock_guard<std::mutex> lock(emit_mu);
+          emitted.push_back(line);
+        });
+
+    pipeline.preload(long_pcm);
+    std::thread worker([&]() { pipeline.run_loop(); });
+    pipeline.request_stop(false, true);
+    worker.join();
+
+    assert(decode_sizes.size() == 3);
+    assert(decode_sizes[0] == kMaxSegmentSamples);
+    assert(decode_sizes[1] == kMaxSegmentSamples);
+    assert(decode_sizes[2] == 500000 - (kMaxSegmentSamples * 2));
+    for (size_t sz : decode_sizes) assert(sz <= kMaxSegmentSamples);
+
+    int final_count = 0;
+    std::string final_text;
+    for (const auto& line : emitted) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        ++final_count;
+        final_text = extract_json_string_field(line, "text").value_or("");
+      }
+    }
+    assert(final_count == 1);
+    assert(final_text == "seg-one seg-one seg-two");
     assert(!emitted.empty() && extract_json_string_field(emitted.back(), "type") == "end");
   }
 
@@ -137,13 +186,16 @@ int main() {
   }
 
   // 3. Producer stays active (WASAPI mode) while prefill decodes, then pushes live tail and stops.
+  // Verify >cap segmented boundary AND <=cap full-utterance inclusion of trailing WASAPI tail.
   {
     std::vector<std::string> emitted;
     SegmentedUtterancePipeline<
         std::function<std::string(const std::vector<float>&)>,
         std::function<void(const std::string&)>> pipeline(
         [](const std::vector<float>& samples) { return decode_by_marker(samples); },
-        [&](const std::string& line) { emitted.push_back(line); });
+        [&](const std::string& line) { emitted.push_back(line); },
+        kMaxSegmentSamples,
+        kMaxSegmentSamples + 1000);
 
     pipeline.preload(std::vector<float>(kMaxSegmentSamples, 0.2f));
     std::thread worker([&]() { pipeline.run_loop(); });
@@ -165,6 +217,35 @@ int main() {
     assert(final_count == 1);
     assert(final_text == "seg-one seg-two");
   }
+  {
+    std::vector<std::string> emitted;
+    std::vector<size_t> decode_sizes;
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> pipeline(
+        [&](const std::vector<float>& samples) {
+          decode_sizes.push_back(samples.size());
+          return samples.size() == kMaxSegmentSamples + 4000 ? "whole-with-tail" : decode_by_marker(samples);
+        },
+        [&](const std::string& line) { emitted.push_back(line); });
+
+    pipeline.preload(std::vector<float>(kMaxSegmentSamples, 0.2f));
+    std::thread worker([&]() { pipeline.run_loop(); });
+    pipeline.push(std::vector<float>(4000, 0.8f));
+    pipeline.request_stop(false, false);
+    pipeline.mark_producer_finished();
+    worker.join();
+
+    assert(!decode_sizes.empty() && decode_sizes.back() == kMaxSegmentSamples + 4000);
+    std::string final_text;
+    for (const auto& line : emitted) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_text = extract_json_string_field(line, "text").value_or("");
+      }
+    }
+    assert(final_text == "whole-with-tail");
+  }
 
   // 4. P0-2 counterexample A: request_stop(false, false) happens before prefill/start finishes;
   // prefill must STILL be accepted and decoded completely once producer finishes.
@@ -178,7 +259,9 @@ int main() {
         [&](const std::string& line) {
           std::lock_guard<std::mutex> lock(emit_mu);
           emitted.push_back(line);
-        });
+        },
+        kMaxSegmentSamples,
+        240000);
 
     pipeline.request_stop(false, false);
     pipeline.preload(make_marked_pcm(250000, 0.2f, 0.8f));
@@ -245,7 +328,9 @@ int main() {
         [&](const std::string& line) {
           std::lock_guard<std::mutex> lock(sync_mu);
           emitted.push_back(line);
-        });
+        },
+        kMaxSegmentSamples,
+        kMaxSegmentSamples + 1000);
 
     pipeline.preload(std::vector<float>(kMaxSegmentSamples, 0.2f));
     std::thread worker([&]() { pipeline.run_loop(); });
@@ -335,7 +420,9 @@ int main() {
             has_first_partial_emit = true;
             sync_cv.notify_all();
           }
-        });
+        },
+        kMaxSegmentSamples,
+        kMaxSegmentSamples + 1000);
 
     std::thread worker([&]() { pipeline.run_loop(); });
     // Push initial partial threshold and wait until "first-part" is emitted into active_segment_text.
@@ -485,7 +572,9 @@ int main() {
           if (first < 0.65f) return "language Chinese<asr_text>第二段。";
           return "language Chinese<asr_text>第三段。";
         },
-        [&](const std::string& line) { emitted.push_back(line); });
+        [&](const std::string& line) { emitted.push_back(line); },
+        kMaxSegmentSamples,
+        210000);
 
     pipeline.preload(pcm);
     std::thread worker([&]() { pipeline.run_loop(); });
@@ -505,6 +594,46 @@ int main() {
       }
     }
     assert(final_text == "第一段。第二段。第三段。");
+  }
+
+  // 10b. <=30s pause split at 6s+400ms still re-decodes FULL utterance (126,400 samples) on final pass
+  // replacing mid-sentence pause-split text with whole-utterance result.
+  {
+    std::vector<std::string> emitted;
+    std::vector<size_t> decode_sizes;
+    std::vector<float> pcm;
+    pcm.insert(pcm.end(), kMinPauseSplitSamples, 0.2f);
+    pcm.insert(pcm.end(), kPauseWindowSamples, 0.0f);
+    pcm.insert(pcm.end(), 24000, 0.5f);
+
+    SegmentedUtterancePipeline<
+        std::function<std::string(const std::vector<float>&)>,
+        std::function<void(const std::string&)>> pipeline(
+        [&](const std::vector<float>& samples) -> std::string {
+          decode_sizes.push_back(samples.size());
+          if (samples.size() == kMinPauseSplitSamples + kPauseWindowSamples + 24000) {
+            return "language Chinese<asr_text>第一段，第二段。";
+          }
+          return "language Chinese<asr_text>第一段。";
+        },
+        [&](const std::string& line) { emitted.push_back(line); });
+
+    pipeline.preload(pcm);
+    std::thread worker([&]() { pipeline.run_loop(); });
+    pipeline.request_stop(false, true);
+    worker.join();
+
+    assert(decode_sizes.size() == 2);
+    assert(decode_sizes[0] == kMinPauseSplitSamples + kPauseWindowSamples);
+    assert(decode_sizes[1] == kMinPauseSplitSamples + kPauseWindowSamples + 24000);
+    std::string final_text;
+    for (const auto& line : emitted) {
+      if (extract_json_string_field(line, "type") == "result" &&
+          extract_json_bool_or_str(line, "isFinal") == "true") {
+        final_text = extract_json_string_field(line, "text").value_or("");
+      }
+    }
+    assert(final_text == "第一段，第二段。");
   }
 
   // 11. Pure silence (>= 6s of 0.0f) emits zero non-empty results and leaves final_text empty.
@@ -633,6 +762,91 @@ int main() {
       }
     }
     assert(final_text == "前文");
+  }
+
+  // 14. ServeCommandLoop non-blocking stop -> abort during gated final decode emits NO isFinal=true.
+  {
+    std::vector<std::string> emitted;
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool in_final_decode = false;
+    bool release_final_decode = false;
+    bool loop_finished = false;
+
+    ServeCommandLoop loop(
+        nullptr,
+        [&]() {
+          return std::make_unique<PcmUtteranceDecoder>(
+              [&](const std::vector<float>&) -> std::string {
+                {
+                  std::lock_guard<std::mutex> lock(gate_mu);
+                  in_final_decode = true;
+                }
+                gate_cv.notify_all();
+                wait_until_or_fail(
+                    gate_mu,
+                    gate_cv,
+                    [&]() { return release_final_decode; },
+                    "scenario 14 final decode gate");
+                return "late-final-should-not-emit";
+              },
+              [&](const std::string& line) {
+                std::lock_guard<std::mutex> lock(gate_mu);
+                emitted.push_back(line);
+                if (extract_json_string_field(line, "type") == "end") {
+                  loop_finished = true;
+                  gate_cv.notify_all();
+                }
+              });
+        });
+
+    auto encode_pcm16_b64 = [](size_t samples_count, int16_t val) {
+      static const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      std::vector<uint8_t> bytes(samples_count * 2);
+      for (size_t i = 0; i < samples_count; ++i) {
+        bytes[i * 2] = static_cast<uint8_t>(val & 0xff);
+        bytes[i * 2 + 1] = static_cast<uint8_t>((val >> 8) & 0xff);
+      }
+      std::string out;
+      for (size_t i = 0; i < bytes.size(); i += 3) {
+        uint32_t v = static_cast<uint32_t>(bytes[i]) << 16;
+        if (i + 1 < bytes.size()) v |= static_cast<uint32_t>(bytes[i + 1]) << 8;
+        if (i + 2 < bytes.size()) v |= static_cast<uint32_t>(bytes[i + 2]);
+        out.push_back(kB64[(v >> 18) & 63]);
+        out.push_back(kB64[(v >> 12) & 63]);
+        out.push_back(i + 1 < bytes.size() ? kB64[(v >> 6) & 63] : '=');
+        out.push_back(i + 2 < bytes.size() ? kB64[v & 63] : '=');
+      }
+      return out;
+    };
+
+    assert(loop.handle_line("{\"cmd\":\"start_pcm\"}"));
+    assert(loop.handle_line("{\"cmd\":\"pcm\",\"data\":\"" + encode_pcm16_b64(3200, 3000) + "\"}"));
+    // Normal stop MUST return immediately without blocking on the gated final decode.
+    const auto t0 = std::chrono::steady_clock::now();
+    assert(loop.handle_line("{\"cmd\":\"stop\"}"));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    assert(elapsed < std::chrono::milliseconds(500));
+
+    wait_until_or_fail(
+        gate_mu, gate_cv, [&]() { return in_final_decode; }, "scenario 14 enter final decode");
+
+    // Abort MUST also be processed immediately while final decode is blocked inside gate!
+    assert(loop.handle_line("{\"cmd\":\"abort\"}"));
+
+    {
+      std::lock_guard<std::mutex> lock(gate_mu);
+      release_final_decode = true;
+    }
+    gate_cv.notify_all();
+    wait_until_or_fail(
+        gate_mu, gate_cv, [&]() { return loop_finished; }, "scenario 14 end event");
+    assert(!loop.handle_line("{\"cmd\":\"shutdown\"}"));
+
+    for (const auto& line : emitted) {
+      assert(extract_json_bool_or_str(line, "isFinal") != "true");
+    }
+    assert(!emitted.empty() && extract_json_string_field(emitted.back(), "type") == "end");
   }
 
   std::printf("segmented-pipeline tests passed\n");

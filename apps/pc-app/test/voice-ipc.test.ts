@@ -948,7 +948,7 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     }
   });
 
-  it('uses 12_000ms stop drain timeout for MLX helpers, 2_200ms for system helpers, and immediate SIGTERM on abort=true', async () => {
+  it('uses 45_000ms stop drain timeout for Qwen helpers (including slow >12s final re-decode), 2_200ms for system helpers, and immediate SIGTERM on abort=true', async () => {
     const weights = Buffer.from('mlx-drain-weights');
     const sha = createHash('sha256').update(weights).digest('hex');
     const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
@@ -1011,7 +1011,7 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       await sysStop;
       expect(children[0].kill).toHaveBeenCalledWith('SIGTERM');
 
-      // 2. Ready MLX helper drains for 12_000ms (does NOT SIGTERM at 2_200ms or 5_000ms)
+      // 2. Ready Qwen MLX helper drains past 12_000ms (receives slow 25_000ms final exit cleanly without SIGTERM)
       vi.useRealTimers();
       await voice.setSpeechModel('qwen3-0.6b');
       await vi.waitFor(async () => {
@@ -1022,19 +1022,17 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
       const mlxStop = voice.stopListening({ abort: false });
       expect(children[1].stdin.write).toHaveBeenCalledWith('stop\n');
-      await vi.advanceTimersByTimeAsync(2_500);
+      await vi.advanceTimersByTimeAsync(25_000);
       expect(children[1].kill).not.toHaveBeenCalled();
-      await vi.advanceTimersByTimeAsync(2_500);
-      expect(children[1].kill).not.toHaveBeenCalled();
-      // Emitting natural final exit at 5.0s resolves without SIGTERM
+      // Emitting natural final exit at 25.0s resolves without SIGTERM
       children[1].emit('exit', 0);
       await mlxStop;
       expect(children[1].kill).not.toHaveBeenCalled();
 
-      // 3. Hung MLX helper is still SIGTERM-killed at 12_000ms
+      // 3. Hung Qwen MLX helper is still bounded and SIGTERM-killed at 45_000ms
       expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
       const mlxHungStop = voice.stopListening({ abort: false });
-      await vi.advanceTimersByTimeAsync(11_900);
+      await vi.advanceTimersByTimeAsync(44_900);
       expect(children[2].kill).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(150);
       await mlxHungStop;
@@ -2831,6 +2829,131 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
     } finally {
       if (voice) await voice.dispose();
       rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it('delivers slow >12s resident Qwen final results for local and remote stop, emits a single end, and isolates win32 worker on abort during stop', async () => {
+    const weights = Buffer.from('slow-finalize-weights');
+    const sha = createHash('sha256').update(weights).digest('hex');
+    const manifests: Record<PcAppSpeechVariant, PcAppSpeechModelManifest> = {
+      '0.6b': {
+        choice: 'qwen3-0.6b',
+        variant: '0.6b',
+        repoId: 'aufklarer/test-slow-0.6b',
+        revision: 'slow06',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+      '1.7b': {
+        choice: 'qwen3-1.7b',
+        variant: '1.7b',
+        repoId: 'aufklarer/test-slow-1.7b',
+        revision: 'slow17',
+        files: [{ filename: 'config.json', expectedSize: weights.length, expectedSha256: sha }],
+      },
+    };
+
+    const procs: Array<ReturnType<typeof createFakeChildProcess>> = [];
+    const sentEvents: PcAppVoiceEvent[] = [];
+    const remoteEvents: PcAppRemoteVoiceEvent[] = [];
+    const voice = createPcAppVoiceController({
+      platform: 'win32',
+      arch: 'x64',
+      userDataDir: tempDir,
+      winSpeechHelperPath: 'C:\\IM.codes\\resources\\imcodes-speech-win.exe',
+      useResidentMlxWorker: true,
+      isMainWebContents: () => true,
+      getCurrentTrustedOrigin: () => 'https://app.im.codes',
+      getActiveOrigin: () => 'https://app.im.codes',
+      getTrustedOrigins: () => new Set(['https://app.im.codes']),
+      getSenderUrl: () => 'https://app.im.codes/session/1',
+      sendToRenderer: (_ch, payload) => sentEvents.push(payload as PcAppVoiceEvent),
+      manifests,
+      mirrorOrigins: ['https://hf-mirror.com'],
+      fetchModel: async () => new Response(new Uint8Array(weights), { status: 200 }),
+      runHelperAsync: async (_bin, args) => {
+        if (args[0] === 'probe') {
+          return JSON.stringify({ ok: true, gpuName: 'CPU', vramMb: 0, provider: 'cpu', localAsrSupported: true });
+        }
+        return JSON.stringify([{ uid: 'mic-1', name: 'Mic', transport: 'usb', isDefault: true, isPhysical: true }]);
+      },
+      spawnHelper: () => {
+        const proc = createFakeChildProcess();
+        proc.kill = vi.fn(() => {
+          queueMicrotask(() => proc.emit('exit', 0));
+          return true;
+        }) as unknown as typeof proc.kill;
+        procs.push(proc);
+        queueMicrotask(() => {
+          proc.stdout.emit('data', '{"type":"ready","variant":"0.6b","provider":"cpu"}\n');
+        });
+        return proc as unknown as ChildProcess;
+      },
+    });
+    const unsubRemote = voice.subscribeRemoteEvents((ev) => remoteEvents.push(ev));
+
+    await voice.setSpeechModel('qwen3-0.6b');
+    await vi.waitFor(() => {
+      expect(procs).toHaveLength(1);
+    });
+    await vi.waitFor(async () => {
+      const status = await voice.getSpeechModelStatus();
+      expect(status.state).toBe('ready');
+    });
+
+    vi.useFakeTimers();
+    try {
+      expect(procs).toHaveLength(1);
+
+      // 1. Local resident stop delivers >12s final result (at 25_000ms) with exactly ONE end event
+      expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+      const localStopP = voice.stopListening({ abort: false });
+      await vi.advanceTimersByTimeAsync(25_000);
+      expect(sentEvents.filter((e) => e.type === 'end')).toHaveLength(0);
+      procs[0]!.stdout.emit('data', '{"type":"result","text":"慢速整句重解","isFinal":true}\n');
+      procs[0]!.stdout.emit('data', '{"type":"end"}\n');
+      await localStopP;
+      expect(sentEvents).toEqual([
+        { type: 'result', text: '慢速整句重解', isFinal: true },
+        { type: 'end' },
+      ]);
+
+      // 2. Remote provider stopRemoteSession also waits past 12_000ms and delivers 25_000ms final + single end
+      sentEvents.length = 0;
+      remoteEvents.length = 0;
+      expect(await voice.startRemoteSession({ sessionId: 'rem-slow-1', locale: 'zh-CN' })).toEqual({ ok: true });
+      const remStopP = voice.stopRemoteSession({ sessionId: 'rem-slow-1', abort: false });
+      await vi.advanceTimersByTimeAsync(25_000);
+      procs[0]!.stdout.emit('data', '{"type":"result","text":"远程慢速整句","isFinal":true}\n');
+      procs[0]!.stdout.emit('data', '{"type":"end"}\n');
+      await remStopP;
+      expect(remoteEvents.filter((e) => e.type === 'voice.session.result')).toEqual([
+        { type: 'voice.session.result', sessionId: 'rem-slow-1', text: '远程慢速整句', isFinal: true },
+      ]);
+      expect(remoteEvents.filter((e) => e.type === 'voice.session.end')).toHaveLength(1);
+
+      // 3. Abort DURING win32 in-flight stop immediately isolates & kills the worker, drops late result, and respawns clean worker
+      sentEvents.length = 0;
+      expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+      const inflightStopP = voice.stopListening({ abort: false });
+      await vi.advanceTimersByTimeAsync(500);
+      await voice.stopListening({ abort: true });
+      await inflightStopP;
+      expect(procs[0]!.kill).toHaveBeenCalledWith('SIGTERM');
+      expect(sentEvents).toEqual([{ type: 'end' }]);
+
+      // Late stdout from terminated worker MUST NOT reach current or next utterance
+      procs[0]!.stdout.emit('data', '{"type":"result","text":"迟到旧结果","isFinal":true}\n');
+      expect(sentEvents).toEqual([{ type: 'end' }]);
+
+      expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(procs).toHaveLength(2);
+      procs[1]!.stdout.emit('data', '{"type":"end"}\n');
+      await voice.stopListening({ abort: true });
+    } finally {
+      unsubRemote();
+      vi.useRealTimers();
+      await voice.dispose();
     }
   });
 });

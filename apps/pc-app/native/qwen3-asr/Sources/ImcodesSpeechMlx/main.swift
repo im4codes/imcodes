@@ -825,6 +825,7 @@ final class QwenSegmentedDecodeEngine {
     private var activeText = ""
     private var activeTrustedRealText = ""
     private var activePendingSingleHotword = false
+    private var retractedSegmentSingleHotword = false
     private var pendingRetractionFinal = false
     private var confirmedTokens: [Int32] = []
     private var lastEmittedText = ""
@@ -973,11 +974,18 @@ final class QwenSegmentedDecodeEngine {
             let isFinalExceededSegment = isFinalPass && exceededFinalCap && currentLen > 0
             let shouldRunFinalDecode = isFinalWholeUtterance || isFinalExceededSegment
 
-            if isFinalPass && !shouldRunFinalDecode && (!lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal) {
-                let finalCombined = !committedText.isEmpty && !activeText.isEmpty
+            if isFinalPass && !shouldRunFinalDecode && (!lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal || retractedSegmentSingleHotword) {
+                let rawFinalCombined = !committedText.isEmpty && !activeText.isEmpty
                     ? joinTranscriptSegments(committedText, activeText)
                     : (!lastEmittedText.isEmpty ? lastEmittedText : committedText)
+                let finalCombined = (!hotwordTerms.isEmpty
+                    && (retractedSegmentSingleHotword || pendingRetractionFinal)
+                    && !committedHasTrustedRealText
+                    && activeTrustedRealText.isEmpty)
+                    ? ""
+                    : rawFinalCombined
                 pendingRetractionFinal = false
+                retractedSegmentSingleHotword = false
                 emitJsonFn([
                     "type": "result",
                     "text": finalCombined,
@@ -1081,8 +1089,21 @@ final class QwenSegmentedDecodeEngine {
                         )
                         let hitHotwordHallucination = !rawText.isEmpty && text.isEmpty && (preHallucination.isEmpty || !afterRepetition.isEmpty)
                         let hitAnyGuard = text != rawText
+                        let hasRealNonHotword = !text.isEmpty && !stripVoiceHotwordHallucination(
+                            text,
+                            hotwordTerms: hotwordTerms,
+                            allowSingle: true
+                        ).isEmpty
+                        let hadRetractedSingleHotword = pendingRetractionFinal || retractedSegmentSingleHotword
+                        let blockedRetractedSingleHotword =
+                            hadRetractedSingleHotword
+                            && !hasRealNonHotword
+                            && activeTrustedRealText.isEmpty
+                            && (!isFinalWholeUtterance || !committedHasTrustedRealText)
 
-                        if hitHotwordHallucination || (text.isEmpty && (activePendingSingleHotword || !activeTrustedRealText.isEmpty || (isFinalWholeUtterance && committedHasTrustedRealText))) {
+                        if hitHotwordHallucination
+                            || blockedRetractedSingleHotword
+                            || (text.isEmpty && (activePendingSingleHotword || !activeTrustedRealText.isEmpty || (isFinalWholeUtterance && committedHasTrustedRealText))) {
                             confirmedTokens = []
                             let trustedCommitted = (!isFinalWholeUtterance || committedHasTrustedRealText) ? committedText : ""
                             if !activeTrustedRealText.isEmpty {
@@ -1091,6 +1112,7 @@ final class QwenSegmentedDecodeEngine {
                                 if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
                                     lastEmittedText = combined
                                     pendingRetractionFinal = false
+                                    retractedSegmentSingleHotword = false
                                     emitJsonFn([
                                         "type": "result",
                                         "text": combined,
@@ -1099,7 +1121,13 @@ final class QwenSegmentedDecodeEngine {
                                 }
                             } else if !trustedCommitted.isEmpty {
                                 activeText = ""
+                                if activePendingSingleHotword {
+                                    retractedSegmentSingleHotword = true
+                                }
                                 activePendingSingleHotword = false
+                                if isFinalPass {
+                                    retractedSegmentSingleHotword = false
+                                }
                                 if trustedCommitted != lastEmittedText || isFinalPass {
                                     lastEmittedText = trustedCommitted
                                     pendingRetractionFinal = false
@@ -1109,10 +1137,16 @@ final class QwenSegmentedDecodeEngine {
                                         "isFinal": isFinalPass,
                                     ])
                                 }
-                            } else if activePendingSingleHotword || (isFinalWholeUtterance && (!lastEmittedText.isEmpty || pendingRetractionFinal)) {
+                            } else if activePendingSingleHotword || blockedRetractedSingleHotword || (isFinalWholeUtterance && (!lastEmittedText.isEmpty || pendingRetractionFinal)) {
                                 activeText = ""
+                                if activePendingSingleHotword {
+                                    retractedSegmentSingleHotword = true
+                                }
                                 activePendingSingleHotword = false
-                                if !lastEmittedText.isEmpty || (isFinalPass && pendingRetractionFinal) {
+                                if isFinalPass {
+                                    retractedSegmentSingleHotword = false
+                                }
+                                if !lastEmittedText.isEmpty || (isFinalPass && (pendingRetractionFinal || blockedRetractedSingleHotword)) {
                                     lastEmittedText = ""
                                     pendingRetractionFinal = !isFinalPass
                                     emitJsonFn([
@@ -1127,14 +1161,10 @@ final class QwenSegmentedDecodeEngine {
                         } else {
                             activeText = text
                             if !text.isEmpty {
-                                let hasRealNonHotword = !stripVoiceHotwordHallucination(
-                                    text,
-                                    hotwordTerms: hotwordTerms,
-                                    allowSingle: true
-                                ).isEmpty
                                 if hasRealNonHotword {
                                     activeTrustedRealText = text
                                     activePendingSingleHotword = false
+                                    retractedSegmentSingleHotword = false
                                 } else if activeTrustedRealText.isEmpty && !isFinalWholeUtterance {
                                     activePendingSingleHotword = true
                                 }
@@ -1156,6 +1186,9 @@ final class QwenSegmentedDecodeEngine {
                             if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
                                 lastEmittedText = combined
                                 pendingRetractionFinal = false
+                                if isFinalPass && hasRealNonHotword {
+                                    retractedSegmentSingleHotword = false
+                                }
                                 emitJsonFn([
                                     "type": "result",
                                     "text": combined,

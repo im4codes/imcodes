@@ -938,14 +938,6 @@ class SegmentedUtterancePipeline {
         if (utterance_has_speech) {
           final_text = strip_asr_control_tags(decode_fn_(utterance_samples));
           std::vector<float>().swap(utterance_samples);
-          {
-            std::lock_guard<std::mutex> lock(mu_);
-            final_aborted = aborted_;
-          }
-          if (final_aborted) {
-            emit_fn_("{\"type\":\"end\"}");
-            return;
-          }
           if (final_text.empty()) {
             final_text = join_transcript_segments(committed_text, active_segment_text);
           }
@@ -959,21 +951,19 @@ class SegmentedUtterancePipeline {
         if (segment_samples.size() >= 1600 &&
             (!active_segment_text.empty() || has_utterance_speech_energy(segment_samples))) {
           const std::string tail_text = strip_asr_control_tags(decode_fn_(segment_samples));
-          {
-            std::lock_guard<std::mutex> lock(mu_);
-            final_aborted = aborted_;
-          }
-          if (final_aborted) {
-            emit_fn_("{\"type\":\"end\"}");
-            return;
-          }
           if (!tail_text.empty()) {
             final_seg = tail_text;
           }
         }
         final_text = join_transcript_segments(committed_text, final_seg);
       }
-      emit_fn_("{\"type\":\"result\",\"text\":\"" + json_escape(final_text) + "\",\"isFinal\":true}");
+      {
+        std::lock_guard<std::mutex> lock(mu_);
+        final_aborted = aborted_;
+        if (!final_aborted) {
+          emit_fn_("{\"type\":\"result\",\"text\":\"" + json_escape(final_text) + "\",\"isFinal\":true}");
+        }
+      }
     } else {
       std::vector<float>().swap(utterance_samples);
     }
@@ -992,6 +982,210 @@ class SegmentedUtterancePipeline {
   bool producer_finished_{false};
   bool stop_requested_{false};
   bool aborted_{false};
+};
+
+std::vector<uint8_t> decode_base64_bytes(const std::string& input) {
+  static constexpr int kInvalid = -1;
+  int table[256];
+  std::fill(std::begin(table), std::end(table), kInvalid);
+  for (int i = 0; i < 26; ++i) {
+    table[static_cast<unsigned char>('A' + i)] = i;
+    table[static_cast<unsigned char>('a' + i)] = 26 + i;
+  }
+  for (int i = 0; i < 10; ++i) {
+    table[static_cast<unsigned char>('0' + i)] = 52 + i;
+  }
+  table[static_cast<unsigned char>('+')] = 62;
+  table[static_cast<unsigned char>('/')] = 63;
+
+  std::vector<uint8_t> out;
+  out.reserve((input.size() * 3) / 4);
+  uint32_t val = 0;
+  int valb = -8;
+  for (unsigned char ch : input) {
+    if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
+    if (ch == '=') break;
+    const int d = table[ch];
+    if (d == kInvalid) return {};
+    val = (val << 6) + static_cast<uint32_t>(d);
+    valb += 6;
+    if (valb >= 0) {
+      out.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+      valb -= 8;
+    }
+  }
+  return out;
+}
+
+std::vector<float> decode_base64_pcm16_samples(const std::string& b64) {
+  const std::vector<uint8_t> bytes = decode_base64_bytes(b64);
+  const size_t sample_count = bytes.size() / 2;
+  std::vector<float> samples;
+  if (sample_count == 0) return samples;
+  samples.reserve(sample_count);
+  for (size_t i = 0; i < sample_count; ++i) {
+    const uint16_t raw = static_cast<uint16_t>(bytes[i * 2]) |
+                         (static_cast<uint16_t>(bytes[i * 2 + 1]) << 8);
+    const int16_t signed_sample = static_cast<int16_t>(raw);
+    samples.push_back(static_cast<float>(signed_sample) / 32768.0f);
+  }
+  return samples;
+}
+
+struct ActiveServeSessionHandle {
+  virtual ~ActiveServeSessionHandle() = default;
+  virtual void start() = 0;
+  virtual void push_pcm_base64(const std::string& b64) {}
+  virtual void request_stop(bool abort_only) = 0;
+  virtual void wait_for_finish() = 0;
+};
+
+class PcmUtteranceDecoder : public ActiveServeSessionHandle {
+ public:
+  using DecodeFn = std::function<std::string(const std::vector<float>&)>;
+  using EmitFn = std::function<void(const std::string&)>;
+
+  PcmUtteranceDecoder(
+      DecodeFn decode_fn,
+      EmitFn emit_fn,
+      size_t max_segment_samples = kMaxSegmentSamples,
+      size_t max_final_redecode_samples = kMaxFinalReDecodeSamples)
+      : emit_fn_(emit_fn),
+        pipeline_(std::move(decode_fn), std::move(emit_fn), max_segment_samples, max_final_redecode_samples) {}
+
+  ~PcmUtteranceDecoder() override {
+    stop(true);
+  }
+
+  void start() override {
+    emit_fn_("{\"type\":\"start\"}");
+    worker_ = std::thread([this]() { pipeline_.run_loop(); });
+  }
+
+  void push_pcm_base64(const std::string& b64) override {
+    const std::vector<float> samples = decode_base64_pcm16_samples(b64);
+    if (samples.empty()) return;
+    pipeline_.push(samples);
+  }
+
+  void request_stop(bool abort_only) override {
+    pipeline_.request_stop(abort_only, true);
+  }
+
+  void wait_for_finish() override {
+    if (worker_.joinable()) {
+      worker_.join();
+    }
+  }
+
+  void stop(bool abort_only) {
+    request_stop(abort_only);
+    wait_for_finish();
+  }
+
+ private:
+  EmitFn emit_fn_;
+  SegmentedUtterancePipeline<DecodeFn, EmitFn> pipeline_;
+  std::thread worker_;
+};
+
+class ServeCommandLoop {
+ public:
+  using MicFactoryFn = std::function<std::unique_ptr<ActiveServeSessionHandle>(const std::string& dev, std::vector<float> initial)>;
+  using PcmFactoryFn = std::function<std::unique_ptr<ActiveServeSessionHandle>()>;
+
+  ServeCommandLoop(MicFactoryFn mic_factory, PcmFactoryFn pcm_factory)
+      : mic_factory_(std::move(mic_factory)), pcm_factory_(std::move(pcm_factory)) {}
+
+  ~ServeCommandLoop() {
+    join_and_reset_active(true);
+  }
+
+  void request_stop_active(bool abort_only) {
+    if (active_session_) {
+      active_session_->request_stop(abort_only);
+    }
+  }
+
+  void join_and_reset_active(bool abort_only) {
+    request_stop_active(abort_only);
+    if (active_session_) {
+      active_session_->wait_for_finish();
+      active_session_.reset();
+    }
+  }
+
+  // Returns false when `shutdown` is received.
+  bool handle_line(const std::string& raw_line) {
+    std::string line = raw_line;
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    if (line.empty()) return true;
+
+    const auto cmd = extract_json_string_field(line, "cmd");
+    if (!cmd.has_value()) return true;
+
+    if (*cmd == "prefill_reset") {
+      prefilled_pcm_.clear();
+    } else if (*cmd == "prefill_pcm") {
+      const auto data = extract_json_string_field(line, "data");
+      if (data.has_value()) {
+        const std::vector<float> samples = decode_base64_pcm16_samples(*data);
+        if (!samples.empty()) {
+          prefilled_pcm_.insert(prefilled_pcm_.end(), samples.begin(), samples.end());
+          if (prefilled_pcm_.size() > kMaxPrefillSamples) {
+            prefilled_pcm_.erase(
+                prefilled_pcm_.begin(),
+                prefilled_pcm_.begin() + static_cast<std::ptrdiff_t>(prefilled_pcm_.size() - kMaxPrefillSamples));
+          }
+        }
+      }
+    } else if (*cmd == "start") {
+      join_and_reset_active(true);
+      if (mic_factory_) {
+        const std::string dev = extract_json_string_field(line, "device").value_or("auto");
+        std::vector<float> initial = std::move(prefilled_pcm_);
+        prefilled_pcm_.clear();
+        active_session_ = mic_factory_(dev, std::move(initial));
+        if (active_session_) {
+          active_session_->start();
+        }
+      }
+    } else if (*cmd == "start_pcm") {
+      prefilled_pcm_.clear();
+      join_and_reset_active(true);
+      if (pcm_factory_) {
+        active_session_ = pcm_factory_();
+        if (active_session_) {
+          active_session_->start();
+        }
+      }
+    } else if (*cmd == "pcm") {
+      if (active_session_) {
+        const auto data = extract_json_string_field(line, "data");
+        if (data.has_value()) {
+          active_session_->push_pcm_base64(*data);
+        }
+      }
+    } else if (*cmd == "stop") {
+      // Non-blocking: signal final re-decode so stdin remains responsive to abort/shutdown.
+      request_stop_active(false);
+    } else if (*cmd == "abort") {
+      prefilled_pcm_.clear();
+      request_stop_active(true);
+    } else if (*cmd == "shutdown") {
+      prefilled_pcm_.clear();
+      join_and_reset_active(true);
+      return false;
+    }
+    return true;
+  }
+
+ private:
+  static constexpr size_t kMaxPrefillSamples = 16000 * 30;
+  MicFactoryFn mic_factory_;
+  PcmFactoryFn pcm_factory_;
+  std::unique_ptr<ActiveServeSessionHandle> active_session_;
+  std::vector<float> prefilled_pcm_;
 };
 
 #ifdef IMCODES_HAS_SHERPA_ONNX
@@ -1130,7 +1324,7 @@ class Qwen3OnnxEngine {
   std::string active_provider_{"cpu"};
 };
 
-class WasapiUtteranceCapture {
+class WasapiUtteranceCapture : public ActiveServeSessionHandle {
  public:
   WasapiUtteranceCapture(
       Qwen3OnnxEngine& engine,
@@ -1143,15 +1337,15 @@ class WasapiUtteranceCapture {
             [this](const std::vector<float>& samples) { return engine_.decode(samples); },
             [](const std::string& line) { emit_json_line(line); }) {}
 
-  ~WasapiUtteranceCapture() {
+  ~WasapiUtteranceCapture() override {
     stop(true);
   }
 
-  void start() {
+  void start() override {
     worker_ = std::thread([this]() { run_loop(); });
   }
 
-  void stop(bool abort_only) {
+  void request_stop(bool abort_only) override {
     if (abort_only) {
       aborted_.store(true);
     }
@@ -1163,9 +1357,17 @@ class WasapiUtteranceCapture {
         SetEvent(stop_event_);
       }
     }
+  }
+
+  void wait_for_finish() override {
     if (worker_.joinable()) {
       worker_.join();
     }
+  }
+
+  void stop(bool abort_only) {
+    request_stop(abort_only);
+    wait_for_finish();
   }
 
  private:
@@ -1417,92 +1619,6 @@ class WasapiUtteranceCapture {
   std::thread worker_;
 };
 
-std::vector<uint8_t> decode_base64_bytes(const std::string& input) {
-  static constexpr int kInvalid = -1;
-  int table[256];
-  std::fill(std::begin(table), std::end(table), kInvalid);
-  for (int i = 0; i < 26; ++i) {
-    table[static_cast<unsigned char>('A' + i)] = i;
-    table[static_cast<unsigned char>('a' + i)] = 26 + i;
-  }
-  for (int i = 0; i < 10; ++i) {
-    table[static_cast<unsigned char>('0' + i)] = 52 + i;
-  }
-  table[static_cast<unsigned char>('+')] = 62;
-  table[static_cast<unsigned char>('/')] = 63;
-
-  std::vector<uint8_t> out;
-  out.reserve((input.size() * 3) / 4);
-  uint32_t val = 0;
-  int valb = -8;
-  for (unsigned char ch : input) {
-    if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
-    if (ch == '=') break;
-    const int d = table[ch];
-    if (d == kInvalid) return {};
-    val = (val << 6) + static_cast<uint32_t>(d);
-    valb += 6;
-    if (valb >= 0) {
-      out.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
-      valb -= 8;
-    }
-  }
-  return out;
-}
-
-std::vector<float> decode_base64_pcm16_samples(const std::string& b64) {
-  const std::vector<uint8_t> bytes = decode_base64_bytes(b64);
-  const size_t sample_count = bytes.size() / 2;
-  std::vector<float> samples;
-  if (sample_count == 0) return samples;
-  samples.reserve(sample_count);
-  for (size_t i = 0; i < sample_count; ++i) {
-    const uint16_t raw = static_cast<uint16_t>(bytes[i * 2]) |
-                         (static_cast<uint16_t>(bytes[i * 2 + 1]) << 8);
-    const int16_t signed_sample = static_cast<int16_t>(raw);
-    samples.push_back(static_cast<float>(signed_sample) / 32768.0f);
-  }
-  return samples;
-}
-
-class PcmUtteranceDecoder {
- public:
-  explicit PcmUtteranceDecoder(Qwen3OnnxEngine& engine)
-      : engine_(engine),
-        pipeline_(
-            [this](const std::vector<float>& samples) { return engine_.decode(samples); },
-            [](const std::string& line) { emit_json_line(line); }) {}
-
-  ~PcmUtteranceDecoder() {
-    stop(true);
-  }
-
-  void start() {
-    emit_json_line("{\"type\":\"start\"}");
-    worker_ = std::thread([this]() { pipeline_.run_loop(); });
-  }
-
-  void push_pcm_base64(const std::string& b64) {
-    const std::vector<float> samples = decode_base64_pcm16_samples(b64);
-    if (samples.empty()) return;
-    pipeline_.push(samples);
-  }
-
-  void stop(bool abort_only) {
-    pipeline_.request_stop(abort_only, true);
-    if (worker_.joinable()) {
-      worker_.join();
-    }
-  }
-
- private:
-  Qwen3OnnxEngine& engine_;
-  SegmentedUtterancePipeline<
-      std::function<std::string(const std::vector<float>&)>,
-      std::function<void(const std::string&)>> pipeline_;
-  std::thread worker_;
-};
-
 int run_serve_command(const std::string& model_dir, const std::string& variant, const std::string& provider) {
   emit_json_line("{\"type\":\"loading\",\"variant\":\"" + json_escape(variant) + "\"}");
   Qwen3OnnxEngine engine;
@@ -1514,75 +1630,22 @@ int run_serve_command(const std::string& model_dir, const std::string& variant, 
   emit_json_line("{\"type\":\"ready\",\"variant\":\"" + json_escape(variant) +
                  "\",\"provider\":\"" + json_escape(engine.active_provider()) + "\"}");
 
-  std::unique_ptr<WasapiUtteranceCapture> active_mic;
-  std::unique_ptr<PcmUtteranceDecoder> active_pcm;
-  std::vector<float> prefilled_pcm;
-  static constexpr size_t kMaxPrefillSamples = 16000 * 30;
-  auto stop_active = [&](bool abort_only) {
-    if (active_mic) {
-      active_mic->stop(abort_only);
-      active_mic.reset();
-    }
-    if (active_pcm) {
-      active_pcm->stop(abort_only);
-      active_pcm.reset();
-    }
-  };
+  ServeCommandLoop loop(
+      [&](const std::string& dev, std::vector<float> initial) {
+        return std::make_unique<WasapiUtteranceCapture>(engine, dev, std::move(initial));
+      },
+      [&]() {
+        return std::make_unique<PcmUtteranceDecoder>(
+            [&engine](const std::vector<float>& samples) { return engine.decode(samples); },
+            [](const std::string& json_line) { emit_json_line(json_line); });
+      });
 
   std::string line;
   while (std::getline(std::cin, line)) {
-    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-    if (line.empty()) continue;
-
-    const auto cmd = extract_json_string_field(line, "cmd");
-    if (!cmd.has_value()) continue;
-
-    if (*cmd == "prefill_reset") {
-      prefilled_pcm.clear();
-    } else if (*cmd == "prefill_pcm") {
-      const auto data = extract_json_string_field(line, "data");
-      if (data.has_value()) {
-        const std::vector<float> samples = decode_base64_pcm16_samples(*data);
-        if (!samples.empty()) {
-          prefilled_pcm.insert(prefilled_pcm.end(), samples.begin(), samples.end());
-          if (prefilled_pcm.size() > kMaxPrefillSamples) {
-            prefilled_pcm.erase(
-                prefilled_pcm.begin(),
-                prefilled_pcm.begin() + static_cast<std::ptrdiff_t>(prefilled_pcm.size() - kMaxPrefillSamples));
-          }
-        }
-      }
-    } else if (*cmd == "start") {
-      stop_active(true);
-      const std::string dev = extract_json_string_field(line, "device").value_or("auto");
-      std::vector<float> initial = std::move(prefilled_pcm);
-      prefilled_pcm.clear();
-      active_mic = std::make_unique<WasapiUtteranceCapture>(engine, dev, std::move(initial));
-      active_mic->start();
-    } else if (*cmd == "start_pcm") {
-      prefilled_pcm.clear();
-      stop_active(true);
-      active_pcm = std::make_unique<PcmUtteranceDecoder>(engine);
-      active_pcm->start();
-    } else if (*cmd == "pcm") {
-      if (active_pcm) {
-        const auto data = extract_json_string_field(line, "data");
-        if (data.has_value()) {
-          active_pcm->push_pcm_base64(*data);
-        }
-      }
-    } else if (*cmd == "stop") {
-      stop_active(false);
-    } else if (*cmd == "abort") {
-      prefilled_pcm.clear();
-      stop_active(true);
-    } else if (*cmd == "shutdown") {
-      prefilled_pcm.clear();
-      stop_active(true);
+    if (!loop.handle_line(line)) {
       break;
     }
   }
-  stop_active(true);
   return 0;
 }
 
@@ -1595,22 +1658,28 @@ int run_listen_command(const std::string& model_dir, const std::string& variant,
     emit_error("model_load_failed", "speech", init_err);
     return 1;
   }
-  WasapiUtteranceCapture capture(engine, device_uid);
-  capture.start();
-  std::string line;
-  bool abort_mode = false;
-  while (std::getline(std::cin, line)) {
-    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-    if (line == "abort") {
-      abort_mode = true;
-      break;
+  auto capture = std::make_shared<WasapiUtteranceCapture>(engine, device_uid);
+  capture->start();
+  std::weak_ptr<WasapiUtteranceCapture> weak_capture = capture;
+  std::thread([weak_capture]() {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+      auto cap = weak_capture.lock();
+      if (!cap) return;
+      if (line == "abort") {
+        cap->request_stop(true);
+        return;
+      }
+      if (line == "stop") {
+        cap->request_stop(false);
+      }
     }
-    if (line == "stop") {
-      abort_mode = false;
-      break;
+    if (auto cap = weak_capture.lock()) {
+      cap->request_stop(false);
     }
-  }
-  capture.stop(abort_mode);
+  }).detach();
+  capture->wait_for_finish();
   return 0;
 }
 

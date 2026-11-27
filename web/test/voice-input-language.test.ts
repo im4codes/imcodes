@@ -600,6 +600,44 @@ describe('voice recognition engine preference & cache switching', () => {
     }
   });
 
+  it('allows up to PC_APP_FINALIZE_DRAIN_MS (46s) for PC App local Qwen stopListening while still bounded', async () => {
+    vi.stubGlobal('Capacitor', undefined);
+    let releasePcStop!: () => void;
+    let pcSub: ((ev: any) => void) | null = null;
+    (globalThis as any).__IMCODES_PC_APP__ = {
+      platform: 'win32',
+      voice: {
+        isNativeSpeechSupported: () => true,
+        getPermissions: vi.fn(async () => ({ mic: 'granted', speech: 'granted' })),
+        requestPermissions: vi.fn(async () => ({ mic: 'granted', speech: 'granted' })),
+        getSpeechModelStatus: vi.fn(async () => ({ selectedModel: 'qwen3-0.6b', activeBackend: 'qwen3-0.6b', state: 'ready' })),
+        startListening: vi.fn(async () => ({ ok: true })),
+        stopListening: vi.fn(() => new Promise<void>((resolve) => { releasePcStop = resolve; })),
+        subscribe: (fn: (ev: any) => void) => { pcSub = fn; return () => { pcSub = null; }; },
+      },
+    };
+    vi.useFakeTimers();
+    try {
+      const onResult = vi.fn();
+      await expect(input.startListening(onResult)).resolves.toBe(true);
+      let stopSettled = false;
+      const stopPromise = input.stopListening().then(() => { stopSettled = true; });
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(stopSettled).toBe(false);
+
+      pcSub?.({ type: 'result', text: 'Windows 慢速完整终解', isFinal: true });
+      pcSub?.({ type: 'end' });
+      releasePcStop();
+      await stopPromise;
+      expect(stopSettled).toBe(true);
+      expect(onResult).toHaveBeenLastCalledWith('Windows 慢速完整终解', true);
+    } finally {
+      vi.useRealTimers();
+      await input.stopListening({ abort: true });
+      delete (globalThis as any).__IMCODES_PC_APP__;
+    }
+  });
+
   it('caches SpeechRecognition fallback while StreamingSpeech is downloading and surfaces fallback errors clearly', async () => {
     // 1. First press probes StreamingSpeech (downloading) -> falls back to platform SpeechRecognition and caches it in _prewarmCache
     bridges.streaming.available.mockResolvedValueOnce({ available: false, downloading: true, progress: 0.25 } as any);

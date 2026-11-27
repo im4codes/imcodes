@@ -412,6 +412,8 @@ export const NATIVE_PERMISSION_TIMEOUT_MS = 15_000;
 export const NATIVE_START_TIMEOUT_MS = 15_000;
 /** Upper bound for normal native `stop()` drain (>15s so legitimate slow drains pass without timing out). */
 export const NATIVE_STOP_DRAIN_MS = 20_000;
+/** Bounded drain timeout for PC App local Qwen3-ASR 30s full-utterance final re-decode (matches PC IPC 45s budget). */
+export const PC_APP_FINALIZE_DRAIN_MS = 46_000;
 /** Short cleanup bound when stopping an unsettled native `start()` that never began capture (`!captureStarted`). */
 export const NATIVE_UNSTARTED_STOP_DRAIN_MS = 2_000;
 /** Upper bound waiting for Web Speech `onstart`/`onaudiostart`/`onresult` after `rec.start()`. */
@@ -949,7 +951,7 @@ async function finalizeBufferedSpeechOnOwner(
         });
       }
       if (!signal.aborted) {
-        await withTimeout(donePromise, NATIVE_STOP_DRAIN_MS, 'PC voice finalize timed out').catch(() => {
+        await withTimeout(donePromise, PC_APP_FINALIZE_DRAIN_MS, 'PC voice finalize timed out').catch(() => {
           void bridge.voice?.stopListening?.({ abort: true }).catch(() => {});
         });
       }
@@ -4153,6 +4155,10 @@ export async function stopListening(options?: StopListeningOptions): Promise<voi
     }
   }
 
+  const drainTimeoutMs = isPcAppNativeSpeech() && getVoiceRecognitionEngine() !== 'system'
+    ? PC_APP_FINALIZE_DRAIN_MS
+    : NATIVE_STOP_DRAIN_MS;
+
   let stopPromise!: Promise<void>;
   stopPromise = (async () => {
     let stopFailure: string | null = null;
@@ -4161,7 +4167,7 @@ export async function stopListening(options?: StopListeningOptions): Promise<voi
         if (session) {
           await withTimeout(
             session.recognition.stop(),
-            NATIVE_STOP_DRAIN_MS,
+            drainTimeoutMs,
             'Speech recognition stop timed out',
           );
         }
@@ -4179,7 +4185,7 @@ export async function stopListening(options?: StopListeningOptions): Promise<voi
         if (startPromise) {
           await withTimeout(
             startPromise,
-            NATIVE_STOP_DRAIN_MS,
+            drainTimeoutMs,
             'Speech start settle during stop timed out',
           );
         }
@@ -4227,7 +4233,7 @@ export async function stopListening(options?: StopListeningOptions): Promise<voi
   })();
 
   _pendingStopMaxWaitMs = hadCaptureStarted
-    ? NATIVE_STOP_DRAIN_MS + 1_000
+    ? drainTimeoutMs + 1_000
     : NATIVE_UNSTARTED_STOP_DRAIN_MS + 500;
   _pendingStop = stopPromise;
   try {

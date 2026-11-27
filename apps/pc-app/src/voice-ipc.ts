@@ -412,6 +412,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     source?: 'in-app' | 'global' | 'remote';
     sessionId?: string;
     remoteEnded?: boolean;
+    stopRequested?: boolean;
     onEvent?: (event: PcAppVoiceEvent) => void;
     loggedFirstLevel: boolean;
     loggedFirstResult: boolean;
@@ -429,6 +430,9 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     killTimer: ReturnType<typeof setTimeout> | null;
   }
 
+  const SYSTEM_SPEECH_STOP_TIMEOUT_MS = 2_200;
+  // Local Qwen3-ASR full-utterance final re-decode runs up to 30s of audio (and CPU ONNX can exceed real-time).
+  const QWEN_LOCAL_FINALIZE_TIMEOUT_MS = 45_000;
   const DEFAULT_REMOTE_SESSION_IDLE_TIMEOUT_MS = 30_000;
   const remoteSessionIdleTimeoutMs =
     typeof deps.remoteSessionIdleTimeoutMs === 'number'
@@ -1706,6 +1710,13 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         } catch {
           shutdownMlxWorker(worker);
         }
+        if (isWin32 && utt.stopRequested) {
+          // Sherpa-ONNX offline decode is synchronous; isolate & terminate the worker immediately on abort during stop.
+          shutdownMlxWorker(worker);
+          try {
+            worker.proc.kill('SIGTERM');
+          } catch { /* ignore */ }
+        }
       }
     }
     resolveUtteranceWaiters(utt);
@@ -1796,9 +1807,15 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           } catch {
             shutdownMlxWorker(worker);
           }
+          if (isWin32 && utt.stopRequested) {
+            shutdownMlxWorker(worker);
+            try {
+              worker.proc.kill('SIGTERM');
+            } catch { /* ignore */ }
+          }
         }
         resolveUtteranceWaiters(utt);
-        notifyVoiceEvent({ type: 'end' });
+        emitWorkerUtteranceEvent(utt, { type: 'end' });
         return;
       }
 
@@ -1806,10 +1823,11 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         activeWorkerUtterance = null;
         if (worker) worker.utterance = null;
         resolveUtteranceWaiters(utt);
-        notifyVoiceEvent({ type: 'end' });
+        emitWorkerUtteranceEvent(utt, { type: 'end' });
         return;
       }
 
+      utt.stopRequested = true;
       try {
         worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'stop' })}\n`);
       } catch {
@@ -1843,11 +1861,17 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
             } catch {
               shutdownMlxWorker(worker);
             }
+            if (isWin32) {
+              shutdownMlxWorker(worker);
+              try {
+                worker.proc.kill('SIGTERM');
+              } catch { /* ignore */ }
+            }
           }
-          notifyVoiceEvent({ type: 'end' });
+          emitWorkerUtteranceEvent(utt, { type: 'end' });
           resolveUtteranceWaiters(utt);
           done();
-        }, 12_000);
+        }, QWEN_LOCAL_FINALIZE_TIMEOUT_MS);
       });
       return;
     }
@@ -1875,7 +1899,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     } catch {
       try { child.kill('SIGTERM'); } catch { /* ignore */ }
     }
-    const stopTimeoutMs = isMlxChild ? 12_000 : 2_200;
+    const stopTimeoutMs = isMlxChild ? QWEN_LOCAL_FINALIZE_TIMEOUT_MS : SYSTEM_SPEECH_STOP_TIMEOUT_MS;
     await new Promise<void>((resolveStop) => {
       let settled = false;
       const done = () => {
@@ -2024,6 +2048,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
                 startPcmCmd.hotwords = hotwordsTerms;
               }
               appendVoiceLog(`mlx serve finalizeOnly variant=${variant} chunks=${prefillChunks.length}`);
+              utterance.stopRequested = true;
               worker.proc.stdin?.write(`${JSON.stringify(startPcmCmd)}\n`);
               for (const chunk of prefillChunks) {
                 worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'pcm', data: chunk })}\n`);
@@ -2616,6 +2641,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         return { ok: true };
       }
 
+      utt.stopRequested = true;
       try {
         worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'stop' })}\n`);
       } catch {
@@ -2642,8 +2668,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
             shutdownIfNotReady: true,
             emitEnd: true,
           });
+          if (isWin32) {
+            shutdownMlxWorker(worker);
+            try {
+              worker.proc.kill('SIGTERM');
+            } catch { /* ignore */ }
+          }
           done();
-        }, 12_000);
+        }, QWEN_LOCAL_FINALIZE_TIMEOUT_MS);
       });
       return { ok: true };
     };
