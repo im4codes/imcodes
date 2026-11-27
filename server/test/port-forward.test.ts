@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { createServer as createHttpServer, request as httpRequest } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
@@ -1518,5 +1518,417 @@ describe('server port-forward router & HTTP control plane', () => {
     expect(await podCoord.listTunnels('user_bp')).toHaveLength(0);
     expect(engL.listTunnels()).toHaveLength(0);
     expect(engT.listTunnels()).toHaveLength(0);
+  });
+
+  it('never reports close confirmed on live WS send rejection or cross-pod DB enqueue throw, succeeding only on ACK or real disconnect (R4 P0 #1)', async () => {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const sListen = `r4c_l_${suffix}`;
+    const sTarget = `r4c_t_${suffix}`;
+    const baseStore = new InMemoryPortForwardClusterStore();
+    const origEnqueue = baseStore.enqueueBusMessage.bind(baseStore);
+    let failRemoteCloseEnqueue = false;
+    baseStore.enqueueBusMessage = async (podId, msg) => {
+      if (failRemoteCloseEnqueue && msg.kind === 'to_endpoint' && msg.frame.type === PORT_FORWARD_MSG.CLOSE) {
+        throw new Error('simulated_db_bus_enqueue_failure');
+      }
+      return origEnqueue(podId, msg);
+    };
+
+    const bridgesListen = new Map<string, PortForwardBridgeEndpoint>();
+    const bridgesTarget = new Map<string, PortForwardBridgeEndpoint>();
+    const podCoord = new PortForwardRouter({
+      podId: 'pod_r4_c',
+      clusterStore: baseStore,
+      closeAckTimeoutMs: 60,
+      prepareTimeoutMs: 2_000,
+      establishTimeoutMs: 4_000,
+      lookupBridge: (id) => bridgesListen.get(id),
+    });
+    const podTarget = new PortForwardRouter({
+      podId: 'pod_r4_t',
+      clusterStore: baseStore,
+      closeAckTimeoutMs: 60,
+      lookupBridge: (id) => bridgesTarget.get(id),
+    });
+
+    const idL = generateEndpointIdentityKeyPair();
+    const idT = generateEndpointIdentityKeyPair();
+    const trusted = new Map([[sListen, idL.publicKeyB64], [sTarget, idT.publicKeyB64]]);
+
+    const engL = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idL,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podCoord.handleDaemonMessage(sListen, 1, m)); },
+    });
+    const engT = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idT,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podTarget.handleDaemonMessage(sTarget, 1, m)); },
+    });
+    cleanups.push(async () => {
+      failRemoteCloseEnqueue = false;
+      engL.closeAll();
+      engT.closeAll();
+      await podTarget.stopCluster();
+      await podCoord.stopCluster();
+    });
+
+    let rejectListenCloseWrite = false;
+    let listenConnected = true;
+    bridgesListen.set(sListen, {
+      isDaemonConnected: () => listenConnected,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => {
+        if (m.type === PORT_FORWARD_MSG.CLOSE && rejectListenCloseWrite) return false;
+        void engL.handleMessage(m);
+        return true;
+      },
+    });
+    bridgesTarget.set(sTarget, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => { void engT.handleMessage(m); return true; },
+    });
+    podCoord.onDaemonConnected(sListen, 1);
+    podTarget.onDaemonConnected(sTarget, 1);
+
+    const openOne = async () => {
+      const opened = await podCoord.openTunnel({
+        userId: 'user_r4_close',
+        listenNode: sListen,
+        listenServerId: sListen,
+        listenPort: 0,
+        targetNode: sTarget,
+        targetServerId: sTarget,
+        targetHost: '127.0.0.1',
+        targetPort: 9999,
+        ttlSeconds: 60,
+        transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+      });
+      expect(opened.ok).toBe(true);
+      if (!opened.ok) throw new Error(opened.error);
+      return opened.tunnel.tunnelId;
+    };
+
+    // Case 1: Live listen bridge rejects CLOSE write (returns false while connected) -> 504 unconfirmed, liveListenerCount === 1!
+    const tid1 = await openOne();
+    rejectListenCloseWrite = true;
+    const liveRejectClose = await podCoord.closeTunnelForUser('user_r4_close', tid1);
+    expect(liveRejectClose.ok).toBe(false);
+    if (!liveRejectClose.ok) {
+      expect(liveRejectClose.status).toBe(504);
+      expect(liveRejectClose.unconfirmedTunnelIds).toEqual([tid1]);
+    }
+    expect(engL.listTunnels()).toHaveLength(1);
+
+    // Case 2: Cross-pod enqueueBusMessage throws on CLOSE -> 504 unconfirmed as well; retry once both recover succeeds cleanly!
+    rejectListenCloseWrite = false;
+    failRemoteCloseEnqueue = true;
+    const tid2 = await openOne();
+    const enqueueErrClose = await podCoord.closeTunnelForUser('user_r4_close', tid2);
+    expect(enqueueErrClose.ok).toBe(false);
+    if (!enqueueErrClose.ok) {
+      expect(enqueueErrClose.status).toBe(504);
+      expect(enqueueErrClose.unconfirmedTunnelIds).toEqual([tid2]);
+    }
+    expect(engL.listTunnels().map((t) => t.tunnelId)).toEqual([tid1]);
+    expect(engT.listTunnels().map((t) => t.tunnelId)).toEqual([tid2]);
+
+    failRemoteCloseEnqueue = false;
+    expect(await podCoord.closeTunnelForUser('user_r4_close', tid1)).toEqual({ ok: true, closedTunnelIds: [tid1] });
+    expect(await podCoord.closeTunnelForUser('user_r4_close', tid2)).toEqual({ ok: true, closedTunnelIds: [tid2] });
+    expect(engL.listTunnels()).toHaveLength(0);
+    expect(engT.listTunnels()).toHaveLength(0);
+
+    // Case 3: Genuine disconnect on listen side (`isDaemonConnected() === false`) is provably offline and settles close cleanly.
+    const tid3 = await openOne();
+    rejectListenCloseWrite = true;
+    listenConnected = false;
+    const offlineClose = await podCoord.closeTunnelForUser('user_r4_close', tid3);
+    expect(offlineClose).toEqual({ ok: true, closedTunnelIds: [tid3] });
+    expect(engT.listTunnels()).toHaveLength(0);
+  });
+
+  it('rejects unauthorized or stale-generation RELAY_FRAME/CLOSE bursts before touching queues, backpressure, or tunnel state (R4 P0 #2)', async () => {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const sListen = `r4a_l_${suffix}`;
+    const sTarget = `r4a_t_${suffix}`;
+    const sRogue = `r4a_rogue_${suffix}`;
+    const echoServer = createHttpServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        res.end(Buffer.concat(chunks));
+      });
+    });
+    await new Promise<void>((r) => echoServer.listen(0, '127.0.0.1', () => r()));
+    const echoPort = (echoServer.address() as { port: number }).port;
+    cleanups.push(() => new Promise<void>((r) => echoServer.close(() => r())));
+
+    const store = new InMemoryPortForwardClusterStore();
+    const bridgesA = new Map<string, PortForwardBridgeEndpoint>();
+    const bridgesB = new Map<string, PortForwardBridgeEndpoint>();
+    const podCoord = new PortForwardRouter({ podId: 'pod_r4a_c', clusterStore: store, prepareTimeoutMs: 2_000, establishTimeoutMs: 4_000 });
+    const podA = new PortForwardRouter({ podId: 'pod_r4a_a', clusterStore: store, lookupBridge: (id) => bridgesA.get(id) });
+    const podB = new PortForwardRouter({ podId: 'pod_r4a_b', clusterStore: store, lookupBridge: (id) => bridgesB.get(id) });
+
+    const idL = generateEndpointIdentityKeyPair();
+    const idT = generateEndpointIdentityKeyPair();
+    const trusted = new Map([[sListen, idL.publicKeyB64], [sTarget, idT.publicKeyB64]]);
+    const engL = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idL,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podA.handleDaemonMessage(sListen, 5, m)); },
+    });
+    const engT = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idT,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podB.handleDaemonMessage(sTarget, 7, m)); },
+    });
+    cleanups.push(async () => {
+      await podCoord.closeAllForUser('user_r4_auth').catch(() => {});
+      engL.closeAll();
+      engT.closeAll();
+      await podA.stopCluster();
+      await podB.stopCluster();
+      await podCoord.stopCluster();
+    });
+
+    const listenCtrlEvents: Array<Record<string, unknown>> = [];
+    bridgesA.set(sListen, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 5,
+      trySendPortForward: (m) => {
+        if (m.type === PORT_FORWARD_MSG.RELAY_BACKPRESSURE || m.type === PORT_FORWARD_MSG.CLOSE) {
+          listenCtrlEvents.push(m);
+        }
+        void engL.handleMessage(m);
+        return true;
+      },
+    });
+    bridgesB.set(sTarget, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 7,
+      trySendPortForward: (m) => { void engT.handleMessage(m); return true; },
+    });
+    podA.onDaemonConnected(sListen, 5);
+    podB.onDaemonConnected(sTarget, 7);
+
+    const opened = await podCoord.openTunnel({
+      userId: 'user_r4_auth',
+      listenNode: sListen,
+      listenServerId: sListen,
+      listenPort: 0,
+      targetNode: sTarget,
+      targetServerId: sTarget,
+      targetHost: '127.0.0.1',
+      targetPort: echoPort,
+      ttlSeconds: 120,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+    const tid = opened.tunnel.tunnelId;
+    listenCtrlEvents.length = 0;
+
+    // Attack 1: Unrelated rogue node floods oversized RELAY_FRAME burst & forged CLOSE on BOTH remote podA and coordinator podCoord.
+    const bigBurst = Buffer.alloc(32 * 1024, 0x71).toString('base64');
+    for (let i = 0; i < 64; i++) {
+      podA.handleDaemonMessage(sRogue, 1, { type: PORT_FORWARD_MSG.RELAY_FRAME, tunnelId: tid, data: bigBurst });
+      podCoord.handleDaemonMessage(sRogue, 1, { type: PORT_FORWARD_MSG.RELAY_FRAME, tunnelId: tid, data: bigBurst });
+    }
+    podA.handleDaemonMessage(sRogue, 1, { type: PORT_FORWARD_MSG.CLOSE, tunnelId: tid, role: 'listen' });
+    podCoord.handleDaemonMessage(sRogue, 1, { type: PORT_FORWARD_MSG.CLOSE, tunnelId: tid, role: 'listen' });
+
+    // Attack 2: Stale generation on listen server (gen=4 != gen=5) floods RELAY_FRAME burst & CLOSE.
+    for (let i = 0; i < 64; i++) {
+      podA.handleDaemonMessage(sListen, 4, { type: PORT_FORWARD_MSG.RELAY_FRAME, tunnelId: tid, data: bigBurst });
+      podCoord.handleDaemonMessage(sListen, 4, { type: PORT_FORWARD_MSG.RELAY_FRAME, tunnelId: tid, data: bigBurst });
+    }
+    podA.handleDaemonMessage(sListen, 4, { type: PORT_FORWARD_MSG.CLOSE, tunnelId: tid, role: 'listen' });
+
+    await new Promise((r) => setTimeout(r, 60));
+    expect(listenCtrlEvents).toEqual([]);
+    expect(await podCoord.listTunnels('user_r4_auth')).toHaveLength(1);
+    expect(engL.listTunnels()).toHaveLength(1);
+
+    // Legitimate traffic still flows intact!
+    const echoed = await new Promise<string>((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port: opened.tunnel.listenPort, path: '/', method: 'POST' }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+      });
+      req.on('error', reject);
+      req.end('auth-guard-intact');
+    });
+    expect(echoed).toBe('auth-guard-intact');
+  });
+
+  it('retries transient hop-1 SQL errors in order and explicitly aborts tunnel on persistent enqueue failure or unconsumed row expiry (R4 P0 #3)', async () => {
+    const echoServer = createHttpServer((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (c: Buffer) => chunks.push(c));
+      req.on('end', () => {
+        res.writeHead(200, { 'content-type': 'application/octet-stream' });
+        res.end(Buffer.concat(chunks));
+      });
+    });
+    await new Promise<void>((r) => echoServer.listen(0, '127.0.0.1', () => r()));
+    const echoPort = (echoServer.address() as { port: number }).port;
+    cleanups.push(() => new Promise<void>((r) => echoServer.close(() => r())));
+
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const s1 = `r4d_l_${suffix}`;
+    const s2 = `r4d_t_${suffix}`;
+    const baseStore = new InMemoryPortForwardClusterStore();
+    const origEnqueue = baseStore.enqueueBusMessage.bind(baseStore);
+    let failCountRemaining = 0;
+    let persistentHop1Fail = false;
+
+    baseStore.enqueueBusMessage = async (podId, msg) => {
+      if (msg.kind === 'to_coordinator' && msg.frame.type === PORT_FORWARD_MSG.RELAY_FRAME) {
+        if (persistentHop1Fail) {
+          throw new Error('persistent_sql_failure');
+        }
+        if (failCountRemaining > 0) {
+          failCountRemaining -= 1;
+          throw new Error('transient_sql_failure');
+        }
+      }
+      return origEnqueue(podId, msg);
+    };
+
+    const bridgesA = new Map<string, PortForwardBridgeEndpoint>();
+    const bridgesB = new Map<string, PortForwardBridgeEndpoint>();
+    const podCoord = new PortForwardRouter({ podId: 'pod_r4d_c', clusterStore: baseStore, prepareTimeoutMs: 2_000, establishTimeoutMs: 4_000 });
+    const podA = new PortForwardRouter({ podId: 'pod_r4d_a', clusterStore: baseStore, lookupBridge: (id) => bridgesA.get(id) });
+    const podB = new PortForwardRouter({ podId: 'pod_r4d_b', clusterStore: baseStore, lookupBridge: (id) => bridgesB.get(id) });
+
+    const idL = generateEndpointIdentityKeyPair();
+    const idT = generateEndpointIdentityKeyPair();
+    const trusted = new Map([[s1, idL.publicKeyB64], [s2, idT.publicKeyB64]]);
+    const engL = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idL,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podA.handleDaemonMessage(s1, 1, m)); },
+    });
+    const engT = new PortForwardEngine({
+      disableDirectTcp: true,
+      disableDirectUdp: true,
+      identityKeyPair: idT,
+      resolveTrustedPeerPublicKey: (id) => trusted.get(id) ?? null,
+      sendWs: (m) => { queueMicrotask(() => podB.handleDaemonMessage(s2, 1, m)); },
+    });
+    cleanups.push(async () => {
+      persistentHop1Fail = false;
+      failCountRemaining = 0;
+      await podCoord.closeAllForUser('user_r4_data').catch(() => {});
+      engL.closeAll();
+      engT.closeAll();
+      await podA.stopCluster();
+      await podB.stopCluster();
+      await podCoord.stopCluster();
+    });
+
+    bridgesA.set(s1, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => { void engL.handleMessage(m); return true; },
+    });
+    bridgesB.set(s2, {
+      isDaemonConnected: () => true,
+      daemonConnectionGeneration: () => 1,
+      trySendPortForward: (m) => { void engT.handleMessage(m); return true; },
+    });
+    podA.onDaemonConnected(s1, 1);
+    podB.onDaemonConnected(s2, 1);
+
+    const opened = await podCoord.openTunnel({
+      userId: 'user_r4_data',
+      listenNode: s1,
+      listenServerId: s1,
+      listenPort: 0,
+      targetNode: s2,
+      targetServerId: s2,
+      targetHost: '127.0.0.1',
+      targetPort: echoPort,
+      ttlSeconds: 1800,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened.ok).toBe(true);
+    if (!opened.ok) return;
+
+    // 1. Transient hop-1 failure (2 errors before succeeding) MUST retry cleanly & deliver complete payload in exact byte order!
+    failCountRemaining = 2;
+    const payload = randomBytes(192 * 1024);
+    const postPayload = (port: number) => new Promise<Buffer>((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port, path: '/', method: 'POST' }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      });
+      req.on('error', reject);
+      req.end(payload);
+    });
+    const echoed = await postPayload(opened.tunnel.listenPort);
+    expect(echoed.equals(payload)).toBe(true);
+
+    // 2. Persistent hop-1 SQL failure MUST explicitly abort/close the tunnel instead of silently dropping frames until 30m TTL!
+    persistentHop1Fail = true;
+    await expect(postPayload(opened.tunnel.listenPort)).rejects.toThrow();
+    await new Promise((r) => setTimeout(r, 150));
+    expect(engL.listTunnels()).toHaveLength(0);
+    expect(engT.listTunnels()).toHaveLength(0);
+    expect(await podCoord.listTunnels('user_r4_data')).toHaveLength(0);
+    persistentHop1Fail = false;
+
+    // 3. Expired unconsumed relay data row during reclaimStaleMessages MUST notify coordinator to close active tunnel!
+    const opened2 = await podCoord.openTunnel({
+      userId: 'user_r4_data',
+      listenNode: s1,
+      listenServerId: s1,
+      listenPort: 0,
+      targetNode: s2,
+      targetServerId: s2,
+      targetHost: '127.0.0.1',
+      targetPort: echoPort,
+      ttlSeconds: 1800,
+      transport: PORT_FORWARD_TRANSPORT_PREF.RELAY,
+    });
+    expect(opened2.ok).toBe(true);
+    if (!opened2.ok) return;
+    await baseStore.setPodDrainPausedForTests('pod_r4d_c', true);
+    await origEnqueue('pod_r4d_c', {
+      kind: 'to_coordinator',
+      tunnelId: opened2.tunnel.tunnelId,
+      fromServerId: s1,
+      fromGeneration: 1,
+      direction: 'l2t',
+      frame: {
+        type: PORT_FORWARD_MSG.RELAY_FRAME,
+        tunnelId: opened2.tunnel.tunnelId,
+        data: Buffer.from('will-expire').toString('base64'),
+      },
+    });
+    // Advance clock past CLUSTER_RELAY_MSG_TTL_MS when reclaiming -> expires queued relay frame & triggers close!
+    const reclaimed = await baseStore.reclaimStaleMessages(Date.now() + PORT_FORWARD_LIMITS.CLUSTER_RELAY_MSG_TTL_MS + 10);
+    expect(reclaimed).toBeGreaterThanOrEqual(1);
+    await baseStore.setPodDrainPausedForTests('pod_r4d_c', false);
+    await new Promise((r) => setTimeout(r, 80));
+    expect(engL.listTunnels()).toHaveLength(0);
+    expect(engT.listTunnels()).toHaveLength(0);
+    expect(await podCoord.listTunnels('user_r4_data')).toHaveLength(0);
   });
 });
