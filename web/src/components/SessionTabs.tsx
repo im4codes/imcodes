@@ -526,15 +526,16 @@ function SessionTabsControlled({ sessions, activeSession, idleAlerts, p2pSession
                 onMouseLeave={(e) => onTabMouseEnd(e as MouseEvent)}
                 title={`${s.agentType}${s.agentVersion ? ` ${s.agentVersion}` : ''} — ${s.state}${isPinned ? ' (pinned)' : ''}`}
               >
-                <sup
-                  class="session-tab-seq"
-                  data-testid={`session-tab-seq-${s.name}`}
-                  aria-hidden="true"
-                >
-                  {idx + 1}
-                </sup>
+                <span class="tab-top-left-badges" aria-hidden="true">
+                  <sup
+                    class="session-tab-seq"
+                    data-testid={`session-tab-seq-${s.name}`}
+                  >
+                    {idx + 1}
+                  </sup>
+                  {agentBadge(s.agentType)}
+                </span>
                 {isPinned && <span class="tab-pin" aria-hidden="true">📌</span>}
-                {agentBadge(s.agentType)}
                 {getLabel(s)}
                 {s.state === 'error' && (
                   <span

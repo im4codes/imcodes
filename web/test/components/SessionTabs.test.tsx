@@ -1195,16 +1195,22 @@ describe('SessionTabs', () => {
 
     // Inject tab CSS rules directly into the document to assert real box/positioning properties.
     const tabRule = cssText.match(/\.tab\s*\{[^}]+\}/)?.[0] ?? '';
+    const topLeftRule = cssText.match(/\.tab-top-left-badges\s*\{[^}]+\}/)?.[0] ?? '';
     const seqRule = cssText.match(/\.session-tab-seq\s*\{[^}]+\}/)?.[0] ?? '';
     const barRule = cssText.match(/\.tab-bar\s*\{[^}]+\}/)?.[0] ?? '';
     const androidSubSeqRule = cssText.match(/html\[data-native-platform="android"\]\s*\.subsession-card-seq\s*\{[^}]+\}/)?.[0] ?? '';
     const androidTabSeqRule = cssText.match(/html\[data-native-platform="android"\]\s*\.session-tab-seq\s*\{[^}]+\}/)?.[0] ?? '';
     expect(tabRule).toContain('overflow: visible');
     expect(tabRule).toContain('position: relative');
-    expect(seqRule).toContain('position: absolute');
-    expect(seqRule).toContain('top: -3px');
-    expect(seqRule).toContain('left: 0');
-    expect(seqRule).toContain('pointer-events: none');
+    expect(topLeftRule).toContain('position: absolute');
+    expect(topLeftRule).toContain('top: -3px');
+    expect(topLeftRule).toContain('left: 0');
+    expect(topLeftRule).toContain('display: inline-flex');
+    expect(topLeftRule).toContain('pointer-events: none');
+    expect(topLeftRule).toContain('z-index: 3');
+    expect(seqRule).toContain('font-size: 9px');
+    expect(seqRule).toContain('font-weight: 700');
+    expect(seqRule).not.toContain('position: absolute');
     // Android keeps legacy .subsession-card-seq padding untouched while sizing .session-tab-seq cleanly
     expect(androidSubSeqRule).not.toContain('padding');
     expect(androidTabSeqRule).toContain('font-size: 8px');
@@ -1245,15 +1251,16 @@ describe('SessionTabs', () => {
     expect(screen.getByTestId('session-tab-seq-sess_a').textContent).toBe('3');
   });
 
-  it('positions .tab-pin at bottom-left corner and .tab > .agent-badge at top-right corner out-of-flow without altering SessionTree badge', () => {
+  it('positions .tab-pin at bottom-left corner and .tab-top-left-badges at top-left corner out-of-flow without altering SessionTree badge', () => {
     const cssText = readTabStyles();
 
     // 1. Assert CSS rules for out-of-flow corner positioning
     const pinRule = cssText.match(/(?:^|\n)\.tab-pin\s*\{[^}]+\}/)?.[0] ?? '';
-    const tabAgentBadgeRule = cssText.match(/\.tab\s*>\s*\.agent-badge\s*\{[^}]+\}/)?.[0] ?? '';
+    const topLeftBadgesRule = cssText.match(/\.tab-top-left-badges\s*\{[^}]+\}/)?.[0] ?? '';
+    const tabAgentBadgeRule = cssText.match(/\.tab-top-left-badges\s+\.agent-badge\s*\{[^}]+\}/)?.[0] ?? '';
     const baseAgentBadgeRule = cssText.match(/(?:^|\n)\.agent-badge\s*\{[^}]+\}/)?.[0] ?? '';
     const androidPinRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab-pin\s*\{[^}]+\}/)?.[0] ?? '';
-    const androidTabAgentBadgeRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab\s*>\s*\.agent-badge\s*\{[^}]+\}/)?.[0] ?? '';
+    const androidTabAgentBadgeRule = cssText.match(/html\[data-native-platform="android"\]\s*\.tab-top-left-badges\s+\.agent-badge\s*\{[^}]+\}/)?.[0] ?? '';
 
     // .tab-pin must be bottom-left, absolute, pointer-events: none, margin: 0
     expect(pinRule).toContain('position: absolute');
@@ -1263,12 +1270,18 @@ describe('SessionTabs', () => {
     expect(pinRule).toContain('margin: 0');
     expect(pinRule).not.toContain('margin-right');
 
-    // .tab > .agent-badge must be top-right, absolute, pointer-events: none, margin: 0
-    expect(tabAgentBadgeRule).toContain('position: absolute');
-    expect(tabAgentBadgeRule).toContain('top: -3px');
-    expect(tabAgentBadgeRule).toContain('right: 0');
-    expect(tabAgentBadgeRule).toContain('pointer-events: none');
-    expect(tabAgentBadgeRule).toContain('margin: 0');
+    // .tab-top-left-badges must be top-left, absolute, inline-flex, pointer-events: none
+    expect(topLeftBadgesRule).toContain('position: absolute');
+    expect(topLeftBadgesRule).toContain('top: -3px');
+    expect(topLeftBadgesRule).toContain('left: 0');
+    expect(topLeftBadgesRule).toContain('display: inline-flex');
+    expect(topLeftBadgesRule).toContain('gap: 2px');
+    expect(topLeftBadgesRule).toContain('pointer-events: none');
+
+    // .tab-top-left-badges .agent-badge must have badge font/padding and no top-right absolute positioning
+    expect(tabAgentBadgeRule).toContain('font-size: 8.5px');
+    expect(tabAgentBadgeRule).toContain('padding: 1px 4px');
+    expect(tabAgentBadgeRule).not.toContain('right: 0');
 
     // Base .agent-badge (used in SessionTree) must remain inline and NOT have position: absolute
     expect(baseAgentBadgeRule).toContain('display: inline-flex');
@@ -1277,8 +1290,8 @@ describe('SessionTabs', () => {
     // Android compact rules must be present
     expect(androidPinRule).toContain('bottom: 1px');
     expect(androidPinRule).toContain('left: 1px');
-    expect(androidTabAgentBadgeRule).toContain('top: -3px');
-    expect(androidTabAgentBadgeRule).toContain('right: 0');
+    expect(androidTabAgentBadgeRule).toContain('font-size: 8px');
+    expect(androidTabAgentBadgeRule).toContain('padding: 0 3px');
 
     // 2. Render SessionTabs with pinned tabs and agent types
     const sessions = makeSessions([
@@ -1301,29 +1314,66 @@ describe('SessionTabs', () => {
     const renderedTabs = screen.getAllByRole('tab');
     expect(renderedTabs).toHaveLength(3);
 
-    // Tab 1 (pinned, agent badge): has .tab-pin and .agent-badge and .session-tab-seq
+    // Tab 1 (pinned, agent badge): has .tab-pin and .tab-top-left-badges containing .session-tab-seq and .agent-badge
     const tab1Pin = renderedTabs[0].querySelector('.tab-pin');
-    const tab1AgentBadge = renderedTabs[0].querySelector('.agent-badge');
-    const tab1Seq = renderedTabs[0].querySelector('.session-tab-seq');
+    const tab1TopLeft = renderedTabs[0].querySelector('.tab-top-left-badges');
+    const tab1AgentBadge = tab1TopLeft?.querySelector('.agent-badge');
+    const tab1Seq = tab1TopLeft?.querySelector('.session-tab-seq');
     expect(tab1Pin).not.toBeNull();
     expect(tab1Pin?.textContent).toBe('📌');
     expect(tab1Pin?.getAttribute('aria-hidden')).toBe('true');
+    expect(tab1TopLeft).not.toBeNull();
+    expect(tab1Seq?.textContent).toBe('1');
     expect(tab1AgentBadge).not.toBeNull();
     expect(tab1AgentBadge?.textContent).toBe('cc');
-    expect(tab1Seq?.textContent).toBe('1');
+    expect(tab1Seq?.nextElementSibling).toBe(tab1AgentBadge);
 
-    // Tab 2 (unpinned, agent badge): no .tab-pin, has .agent-badge and .session-tab-seq
+    // Tab 2 (unpinned, agent badge): no .tab-pin, has .tab-top-left-badges with seq and badge
     const tab2Pin = renderedTabs[1].querySelector('.tab-pin');
-    const tab2AgentBadge = renderedTabs[1].querySelector('.agent-badge');
+    const tab2TopLeft = renderedTabs[1].querySelector('.tab-top-left-badges');
+    const tab2Seq = tab2TopLeft?.querySelector('.session-tab-seq');
+    const tab2AgentBadge = tab2TopLeft?.querySelector('.agent-badge');
     expect(tab2Pin).toBeNull();
+    expect(tab2TopLeft).not.toBeNull();
+    expect(tab2Seq?.textContent).toBe('2');
     expect(tab2AgentBadge).not.toBeNull();
     expect(tab2AgentBadge?.textContent).toBe('cx');
+    expect(tab2Seq?.nextElementSibling).toBe(tab2AgentBadge);
 
-    // Tab 3 (unpinned, no agent badge): no .tab-pin, no .agent-badge
+    // Tab 3 (unpinned, no agent badge): no .tab-pin, has .tab-top-left-badges with seq only
     const tab3Pin = renderedTabs[2].querySelector('.tab-pin');
-    const tab3AgentBadge = renderedTabs[2].querySelector('.agent-badge');
+    const tab3TopLeft = renderedTabs[2].querySelector('.tab-top-left-badges');
+    const tab3Seq = tab3TopLeft?.querySelector('.session-tab-seq');
+    const tab3AgentBadge = tab3TopLeft?.querySelector('.agent-badge');
     expect(tab3Pin).toBeNull();
+    expect(tab3TopLeft).not.toBeNull();
+    expect(tab3Seq?.textContent).toBe('3');
     expect(tab3AgentBadge).toBeNull();
+
+    // 3. Render 10+ tabs to verify 2-digit sequence numbers work cleanly alongside agent badge
+    const tenSessions = makeSessions(
+      Array.from({ length: 10 }, (_, i) => ({
+        name: `sess_${i + 1}`,
+        label: `Tab ${i + 1}`,
+        agentType: i === 9 ? 'claude-code' : undefined,
+      })),
+    );
+    const { container: tenContainer } = render(
+      <SessionTabs
+        sessions={tenSessions}
+        activeSession="sess_10"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+    const tab10 = tenContainer.querySelectorAll('.tab')[9];
+    const tab10TopLeft = tab10.querySelector('.tab-top-left-badges');
+    const tab10Seq = tab10TopLeft?.querySelector('.session-tab-seq');
+    const tab10Badge = tab10TopLeft?.querySelector('.agent-badge');
+    expect(tab10Seq?.textContent).toBe('10');
+    expect(tab10Badge?.textContent).toBe('cc');
+    expect(tab10Seq?.nextElementSibling).toBe(tab10Badge);
   });
 
   it('ensures .tab-ws-dot, .tab-latency, and idle green dots are completely removed from tabs and styles', () => {
