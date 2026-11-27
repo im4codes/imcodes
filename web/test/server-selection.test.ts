@@ -292,4 +292,27 @@ describe('mergeServerNavigation', () => {
     expect(result[0].status).toBe('online');
     expect(result[0].lastHeartbeatAt).toBe(150_000);
   });
+
+  it('preserves statusObservedAt across intermediate offline REST responses and rejects in-flight online while accepting fresh online', () => {
+    // 1. Initial state: locally disconnected at t = 170_000
+    const state0 = [{ id: 'srv-1', name: 'Server One', status: 'offline', lastHeartbeatAt: 170_000, statusObservedAt: 170_000 }];
+
+    // 2. An older REST response (started at t = 160_000) returns offline without statusObservedAt
+    const incomingOffline = [{ id: 'srv-1', name: 'Server One', status: 'offline', lastHeartbeatAt: 155_000 }];
+    const state1 = mergeServerNavigation(incomingOffline, state0, new Set(), { requestStartedAt: 160_000 });
+    expect(state1[0].status).toBe('offline');
+    expect(state1[0].statusObservedAt).toBe(170_000); // Must preserve the local statusObservedAt!
+
+    // 3. Another in-flight REST response (started at t = 165_000 < 170_000) arrives returning online
+    const incomingInFlightOnline = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 164_000 }];
+    const state2 = mergeServerNavigation(incomingInFlightOnline, state1, new Set(), { requestStartedAt: 165_000 });
+    expect(state2[0].status).toBe('offline'); // Must NOT resurrect to online!
+    expect(state2[0].statusObservedAt).toBe(170_000);
+
+    // 4. A fresh REST response (started at t = 180_000 >= 170_000) arrives returning online
+    const incomingFreshOnline = [{ id: 'srv-1', name: 'Server One', status: 'online', lastHeartbeatAt: 175_000 }];
+    const state3 = mergeServerNavigation(incomingFreshOnline, state2, new Set(), { requestStartedAt: 180_000 });
+    expect(state3[0].status).toBe('online');
+    expect(state3[0].lastHeartbeatAt).toBe(175_000);
+  });
 });

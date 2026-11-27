@@ -381,7 +381,7 @@ import {
 } from './onboarding.js';
 // useSwipeBack now handled inside FloatingPanel for discussion/repo pages
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
-import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, SharedOpenTimeoutError, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
+import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, SharedOpenTimeoutError, listManagedSharesForServer, type SharedEntrySummary, getApiBaseUrl } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
 import { recordPerfRender } from './perf-render-debug.js';
 import { isExpandedMobileViewport, isMobileDevice, subscribeDeviceLayoutChange } from './mobile-device.js';
@@ -2485,12 +2485,14 @@ function InternalMainApp() {
   const serverLoadSeqRef = useRef(0);
   const serverLoadAppliedSeqRef = useRef(0);
   const lastServerRefreshAtRef = useRef(0);
-  const authEpochRef = useRef(0);
 
   // Load servers list whenever auth is available
   const loadServers = useCallback(async () => {
-    if (!auth) return;
-    const requestEpoch = authEpochRef.current;
+    if (!auth || !authRef.current || authRef.current.userId !== auth.userId) {
+      return;
+    }
+    const requestUserId = auth.userId;
+    const requestEndpoint = getApiBaseUrl();
     const requestStartedAt = Date.now();
     const requestSeq = ++serverLoadSeqRef.current;
     lastServerRefreshAtRef.current = requestStartedAt;
@@ -2499,7 +2501,13 @@ function InternalMainApp() {
         apiFetch<{ servers: ServerInfo[] }>('/api/server'),
         apiFetch<{ machines?: Array<{ serverId?: unknown }> }>('/api/machines').catch(() => null),
       ]);
-      if (authEpochRef.current !== requestEpoch || requestSeq < serverLoadAppliedSeqRef.current) {
+      const currentAuth = authRef.current;
+      const isAuthValid = Boolean(
+        currentAuth &&
+        currentAuth.userId === requestUserId &&
+        getApiBaseUrl() === requestEndpoint
+      );
+      if (!isAuthValid || requestSeq < serverLoadAppliedSeqRef.current) {
         return;
       }
       serverLoadAppliedSeqRef.current = requestSeq;
@@ -2516,7 +2524,13 @@ function InternalMainApp() {
       // Preserve the last known list on refresh failures. The request is still
       // considered resolved so the UI can escape the initial connecting gate.
     } finally {
-      if (authEpochRef.current === requestEpoch && requestSeq >= serverLoadAppliedSeqRef.current) {
+      const currentAuth = authRef.current;
+      const isAuthValid = Boolean(
+        currentAuth &&
+        currentAuth.userId === requestUserId &&
+        getApiBaseUrl() === requestEndpoint
+      );
+      if (isAuthValid && requestSeq >= serverLoadAppliedSeqRef.current) {
         setServersLoaded(true);
         setPresenceTick((t) => (t + 1) % 1_000_000);
       }
@@ -2524,7 +2538,6 @@ function InternalMainApp() {
   }, [auth, applyServerInventory]);
 
   useEffect(() => {
-    authEpochRef.current += 1;
     lastServerRefreshAtRef.current = 0;
     setServersLoaded(false);
     setServersSynced(false);

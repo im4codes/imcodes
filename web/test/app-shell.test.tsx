@@ -50,7 +50,11 @@ const {
   loginAttemptState,
   loginState,
   syncedPrefs,
+  apiConfigState,
 } = vi.hoisted(() => ({
+  apiConfigState: {
+    baseUrl: 'http://localhost',
+  },
   syncedPrefs: { enabled: false, get: vi.fn(), save: vi.fn() },
   apiFetchMock: vi.fn(),
   autoRegisterChatScrollState: {
@@ -179,12 +183,14 @@ vi.mock('../src/api.js', () => {
     DEFAULT_SHARED_ENTRY_OPEN_TIMEOUT_MS: 15_000,
     apiFetch: (...args: unknown[]) => apiFetchMock(...args),
     clearApiKey: (...args: unknown[]) => clearApiKeyMock(...args),
-    configure: vi.fn(),
+    configure: vi.fn((baseUrl: string) => {
+      apiConfigState.baseUrl = (baseUrl || 'http://localhost').replace(/\/$/, '');
+    }),
     configureExpectedUserId: vi.fn(),
     configureApiKey: (...args: unknown[]) => configureApiKeyMock(...args),
     discoverSharedEntries: (...args: unknown[]) => discoverSharedEntriesMock(...args),
     fetchMe: (...args: unknown[]) => fetchMeMock(...args),
-    getApiBaseUrl: vi.fn(() => 'http://localhost'),
+    getApiBaseUrl: vi.fn(() => apiConfigState.baseUrl),
     getApiKey: vi.fn(() => 'api-key-1'),
     sendSessionViaHttp: vi.fn(async () => ({ ok: true })),
     listManagedSharesForServer: (...args: unknown[]) => listManagedSharesForServerMock(...args),
@@ -1465,6 +1471,7 @@ beforeEach(() => {
   loginAttemptState.webReloads = 0;
   loginState.userId = 'user-1';
   loginState.baseUrl = 'http://localhost';
+  apiConfigState.baseUrl = 'http://localhost';
   nativeState.value = false;
   autoRegisterChatScrollState.enabled = false;
   autoRegisterChatScrollState.mainCalls = [];
@@ -16215,7 +16222,7 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     expect(onlineDotsAfterLateResponse.length).toBe(1); // Only Server One is online
   }, 20_000);
 
-  it('discards late in-flight server list response from previous auth context after account switch', async () => {
+  it('discards late in-flight server list response from previous auth context after logout and account switch', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     let deferredUser1Resolve: ((value: any) => void) | null = null;
     let currentUser = 'user-1';
@@ -16253,20 +16260,13 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
     });
     expect(deferredUser1Resolve).toBeTruthy();
 
-    // User 1 logs out
+    // User 1 logs out: authRef.current is cleared to null synchronously
     currentUser = 'user-2';
     fireEvent.click(screen.getByRole('button', { name: 'Log Out' }));
     await waitFor(() => expect(screen.getByRole('button', { name: 'login-page' })).toBeTruthy());
 
-    // User 2 logs in via login-page
-    fireEvent.click(screen.getByRole('button', { name: 'login-page' }));
-
-    // Wait for User 2 servers to be loaded and rendered
-    await waitFor(() => {
-      expect(document.body.textContent).toContain('Server Two User 2');
-    });
-
-    // Now delayed User 1 server response arrives
+    // Delayed User 1 server response arrives while logged out (authRef.current is null)
+    // Must be discarded immediately and not populate servers or crash
     await act(async () => {
       deferredUser1Resolve!({
         servers: [
@@ -16276,8 +16276,102 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       await vi.advanceTimersByTimeAsync(100);
     });
 
+    // Ensure User 1 server was NOT rendered/leaked
+    expect(document.body.textContent).not.toContain('Server One User 1');
+
+    // User 2 logs in via login-page
+    fireEvent.click(screen.getByRole('button', { name: 'login-page' }));
+
+    // Wait for User 2 servers to be loaded and rendered
+    await waitFor(() => {
+      expect(document.body.textContent).toContain('Server Two User 2');
+    });
+
     // Ensure User 1 server did NOT overwrite User 2 server
     expect(document.body.textContent).toContain('Server Two User 2');
     expect(document.body.textContent).not.toContain('Server One User 1');
+  }, 20_000);
+
+  it('discards late in-flight server list response from previous port when switching endpoints on same host for same user', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let deferredPort4100Resolve: ((value: any) => void) | null = null;
+    let deferredPort4200Resolve: ((value: any) => void) | null = null;
+    let currentEndpoint = 'http://localhost:4100';
+
+    loginState.userId = 'user-1';
+    loginState.baseUrl = 'http://localhost:4200';
+    loginAttemptState.mode = 'native';
+
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') {
+        if (currentEndpoint === 'http://localhost:4100') {
+          return new Promise((resolve) => {
+            deferredPort4100Resolve = resolve;
+          });
+        }
+        return new Promise((resolve) => {
+          deferredPort4200Resolve = resolve;
+        });
+      }
+      if (path === '/api/auth/logout') return {};
+      if (path.startsWith('/api/server/')) return { sessions: [] };
+      return {};
+    });
+
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost:4100' }));
+    apiConfigState.baseUrl = 'http://localhost:4100';
+    const { App } = await importApp();
+    render(<App />);
+
+    // Allow port 4100 mount to start loadServers
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(deferredPort4100Resolve).toBeTruthy();
+
+    // User switches to port 4200 on same host with same userId
+    currentEndpoint = 'http://localhost:4200';
+    fireEvent.click(screen.getByRole('button', { name: 'Log Out' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'login-page' })).toBeTruthy());
+
+    // Login to port 4200 as same user-1
+    fireEvent.click(screen.getByRole('button', { name: 'login-page' }));
+
+    // Wait for port 4200 loadServers to be initiated and held in-flight
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(100);
+    });
+    expect(deferredPort4200Resolve).toBeTruthy();
+
+    // Now release delayed port 4100 server response while 4200 is still pending
+    // sequence number (seq 1 >= applied 0) does not block it; only the endpoint guard blocks it!
+    await act(async () => {
+      deferredPort4100Resolve!({
+        servers: [
+          { id: 'srv-port-4100', name: 'Server Port 4100', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 100 },
+        ],
+      });
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    // Ensure port 4100 server was NOT rendered/applied because endpoint guard rejected it
+    expect(document.body.textContent).not.toContain('Server Port 4100');
+
+    // Finally, release port 4200 response
+    await act(async () => {
+      deferredPort4200Resolve!({
+        servers: [
+          { id: 'srv-port-4200', name: 'Server Port 4200', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 200 },
+        ],
+      });
+      await vi.advanceTimersByTimeAsync(100);
+    });
+
+    // Verify port 4200 server loaded and rendered cleanly, while port 4100 server is absent
+    await waitFor(() => {
+      expect(document.body.textContent).toContain('Server Port 4200');
+    });
+    expect(document.body.textContent).not.toContain('Server Port 4100');
   }, 20_000);
 });

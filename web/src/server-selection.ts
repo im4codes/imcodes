@@ -87,8 +87,17 @@ export function mergeServerNavigation<T extends SelectableServerInfo>(
     const prevAny = prev as Record<string, unknown>;
     const currAny = server as Record<string, unknown>;
 
-    // Explicit offline on incoming takes effect immediately
+    // Explicit offline on incoming takes effect immediately.
+    // If previous was explicitly offline with a local observed timestamp (e.g. from local disconnect),
+    // retain statusObservedAt so subsequent in-flight responses sent before that disconnect cannot resurrect it.
     if (currAny.status === 'offline') {
+      const prevObservedAt = typeof prevAny.statusObservedAt === 'number' ? prevAny.statusObservedAt : null;
+      if (prevAny.status === 'offline' && prevObservedAt !== null && typeof currAny.statusObservedAt !== 'number') {
+        return {
+          ...server,
+          statusObservedAt: prevObservedAt,
+        };
+      }
       return server;
     }
 
