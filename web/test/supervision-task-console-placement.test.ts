@@ -111,9 +111,11 @@ describe('toolbar placement & retired supervision task console toggle', () => {
     expect(app).toMatch(
       /const mainSharedAccessRole = selectedShareTarget\?\.kind === 'subsession'\s*\?\s*'viewer'\s*:\s*sharedAccessRole;/,
     );
-    expect(app).toMatch(
-      /supervisionTaskConsoleVisibility = \{[\s\S]*?sharedAccessRole:\s*mainSharedAccessRole,?[\s\S]*?\};/,
+    const consoleVisibilityBlock = boundedBlock(
+      'const supervisionTaskConsoleVisibility = {',
+      '};',
     );
+    expect(consoleVisibilityBlock).toMatch(/^\s*sharedAccessRole:\s*mainSharedAccessRole,?$/m);
     expect(workspace.match(/showSupervisionTaskConsole && canViewTaskConsole && activeSessionInfo/g)).toHaveLength(1);
     expect(workspace).not.toMatch(/role === 'brain'/);
     expect(workspace).toContain("readOnly={mainSharedAccessRole === 'viewer'}");
