@@ -104,6 +104,8 @@ let deferredMaintenanceTimer: NodeJS.Timeout | undefined;
 let deferredMaintenanceAttempts = 0;
 let deferredMaintenanceRunning = false;
 let activeMaintenanceWorker: NodeWorker | null = null;
+let activeMaintenanceWorkerExitPromise: Promise<number | null> | null = null;
+let maintenanceWorkerFactory: ((code: string, options: Record<string, unknown>) => NodeWorker) | null = null;
 let largeWalCheckpointPromise: Promise<{ busy: boolean; error?: string }> | null = null;
 let lastMaintenanceErrorLogAt = 0;
 
@@ -114,6 +116,9 @@ function sessionFilePath(sessionId: string): string {
 
 function ensureDb(): DatabaseSyncInstance {
   if (db) return db;
+  if (retentionStopped) {
+    throw new Error('Timeline projection worker is stopped');
+  }
   mkdirSync(dirname(dbPath), { recursive: true });
   const instance = new DatabaseSync(dbPath);
   const initialPageCount = Number(
@@ -578,45 +583,76 @@ function getNodeWorkerConstructor(): (new (filename: string | URL, options?: Rec
   }
 }
 
+export function setMaintenanceWorkerFactoryForTests(
+  factory?: ((code: string, options: Record<string, unknown>) => NodeWorker) | null,
+): void {
+  maintenanceWorkerFactory = factory ?? null;
+}
+
 function defaultRunLargeWalCheckpoint(): Promise<LargeWalCheckpointResult> {
   if (retentionStopped) return Promise.resolve({ busy: false });
-  const NodeWorkerCtor = getNodeWorkerConstructor();
-  if (typeof NodeWorkerCtor !== 'function') {
-    return Promise.resolve({ busy: true, error: 'worker_threads.Worker unavailable' });
+  if (activeMaintenanceWorkerExitPromise) {
+    return activeMaintenanceWorkerExitPromise.then(() => ({ busy: false }));
   }
-  return new Promise<LargeWalCheckpointResult>((resolve) => {
-    let settled = false;
-    const finish = (res: LargeWalCheckpointResult): void => {
-      if (settled) return;
-      settled = true;
-      activeMaintenanceWorker = null;
-      resolve(res);
-    };
-    let worker: NodeWorker;
-    try {
+  let worker: NodeWorker;
+  try {
+    if (maintenanceWorkerFactory) {
+      worker = maintenanceWorkerFactory(MAINTENANCE_CHECKPOINT_WORKER_CODE, {
+        eval: true,
+        workerData: { dbPath, busyTimeoutMs: INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS },
+        execArgv: ['--disable-warning=ExperimentalWarning'],
+      });
+    } else {
+      const NodeWorkerCtor = getNodeWorkerConstructor();
+      if (typeof NodeWorkerCtor !== 'function') {
+        return Promise.resolve({ busy: true, error: 'worker_threads.Worker unavailable' });
+      }
       worker = new NodeWorkerCtor(MAINTENANCE_CHECKPOINT_WORKER_CODE, {
         eval: true,
         workerData: { dbPath, busyTimeoutMs: INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS },
         execArgv: ['--disable-warning=ExperimentalWarning'],
       });
-    } catch (err) {
-      finish({ busy: true, error: err instanceof Error ? err.message : String(err) });
-      return;
     }
+  } catch (err) {
+    return Promise.resolve({ busy: true, error: err instanceof Error ? err.message : String(err) });
+  }
+
+  return new Promise<LargeWalCheckpointResult>((resolve) => {
+    let savedResult: LargeWalCheckpointResult | null = null;
+    let settled = false;
+    const finish = (res: LargeWalCheckpointResult): void => {
+      if (settled) return;
+      settled = true;
+      resolve(res);
+    };
+
     activeMaintenanceWorker = worker;
+    activeMaintenanceWorkerExitPromise = new Promise<number | null>((resolveExit) => {
+      worker.once('exit', (code) => {
+        if (activeMaintenanceWorker === worker) {
+          activeMaintenanceWorker = null;
+          activeMaintenanceWorkerExitPromise = null;
+        }
+        resolveExit(code);
+        if (!savedResult) {
+          savedResult = code === 0 ? { busy: false } : { busy: true, error: `maintenance worker exited with code ${code}` };
+        }
+        finish(savedResult);
+      });
+    });
+
     worker.unref();
     worker.once('message', (msg: { ok?: boolean; busy?: boolean; error?: string }) => {
       if (msg?.ok) {
-        finish({ busy: Boolean(msg.busy) });
+        savedResult = { busy: Boolean(msg.busy) };
       } else {
-        finish({ busy: true, error: msg?.error ?? 'maintenance checkpoint failed' });
+        savedResult = { busy: true, error: msg?.error ?? 'maintenance checkpoint failed' };
       }
     });
     worker.once('error', (err) => {
-      finish({ busy: true, error: err instanceof Error ? err.message : String(err) });
-    });
-    worker.once('exit', (code) => {
-      finish(code === 0 ? { busy: false } : { busy: true, error: `maintenance worker exited with code ${code}` });
+      if (!savedResult) {
+        savedResult = { busy: true, error: err instanceof Error ? err.message : String(err) };
+      }
     });
   });
 }
@@ -644,6 +680,9 @@ function runLargeWalCheckpoint(): Promise<LargeWalCheckpointResult> {
   return promise;
 }
 
+let activeDeferredMaintenancePromise: Promise<void> | null = null;
+let activeRetentionPromise: Promise<Record<string, unknown>> | null = null;
+
 function nextMaintenanceBackoffMs(attempt: number): number {
   return Math.min(DEFERRED_MAINTENANCE_MAX_MS, DEFERRED_MAINTENANCE_INITIAL_MS * 2 ** Math.min(attempt + 1, 10));
 }
@@ -653,7 +692,9 @@ function scheduleDeferredMaintenanceTimer(delayMs: number): void {
   const clampedDelay = Math.max(20, Math.min(DEFERRED_MAINTENANCE_LOW_FREQ_MS, Math.trunc(delayMs)));
   deferredMaintenanceTimer = setTimeout(() => {
     deferredMaintenanceTimer = undefined;
-    void runDeferredMaintenance().catch((err) => {
+    const p = runDeferredMaintenance();
+    activeDeferredMaintenancePromise = p;
+    void p.catch((err) => {
       logDeferredMaintenanceError(err);
     });
   }, clampedDelay);
@@ -684,6 +725,7 @@ export async function runDeferredMaintenance(): Promise<void> {
     const pendingFrames = estimateWalFrames(database);
     if (pendingFrames > SMALL_WAL_CHECKPOINT_MAX_FRAMES) {
       const ckpt = await runLargeWalCheckpoint();
+      if (retentionStopped) return;
       if (ckpt.error) {
         hadError = true;
         needsRetry = true;
@@ -733,11 +775,13 @@ export async function runDeferredMaintenance(): Promise<void> {
       }
     }
   } catch (err) {
+    if (retentionStopped) return;
     hadError = true;
     needsRetry = true;
     logDeferredMaintenanceError(err);
   } finally {
     deferredMaintenanceRunning = false;
+    activeDeferredMaintenancePromise = null;
     if (!retentionStopped && (hadError || needsRetry)) {
       if (!hadError && madeProgress) {
         deferredMaintenanceAttempts = 0;
@@ -1055,17 +1099,22 @@ function readRetentionConfig(): { days: number; enabledAt: number } | null {
 
 /** Retention never holds up the writer for the normal 5s lock timeout. */
 function retentionWrite<T>(work: () => T): T {
+  if (retentionStopped) {
+    throw new Error('Timeline projection worker is stopped');
+  }
   const database = ensureDb();
   database.exec(`PRAGMA busy_timeout = ${INCREMENTAL_VACUUM_BUSY_TIMEOUT_MS}`);
   try { return work(); } finally { database.exec(`PRAGMA busy_timeout = ${WORKER_BUSY_TIMEOUT_MS}`); }
 }
 
 function retentionState(): Record<string, unknown> {
-  return ensureDb().prepare('SELECT * FROM timeline_retention WHERE id = 1').get() as Record<string, unknown>;
+  if (retentionStopped) return {};
+  return (ensureDb().prepare('SELECT * FROM timeline_retention WHERE id = 1').get() as Record<string, unknown> | undefined) ?? {};
 }
 
 function prepareRetentionSchedule(enabledAt: number): Record<string, unknown> {
   const state = retentionState();
+  if (retentionStopped) return state;
   if (state.enabled_at !== enabledAt || state.next_run === null) {
     retentionWrite(() => ensureDb().prepare('UPDATE timeline_retention SET enabled_at = ?, next_run = ?, retry_after = 0 WHERE id = 1')
       .run(enabledAt, nextHistoryCleanupAt(enabledAt)));
@@ -1077,14 +1126,30 @@ async function runRetention(now = Date.now()): Promise<Record<string, unknown>> 
   if (!retention || retentionRunning || retentionStopped) return { skipped: true };
   if (!Number.isSafeInteger(now) || now < 0 || now > 8.64e15 - retention.dayMs) throw new Error('Invalid retention clock');
   retentionRunning = true;
+  const currentPromise = runRetentionWork(now);
+  activeRetentionPromise = currentPromise;
+  try {
+    return await currentPromise;
+  } finally {
+    if (activeRetentionPromise === currentPromise) {
+      activeRetentionPromise = null;
+    }
+  }
+}
+
+async function runRetentionWork(now: number): Promise<Record<string, unknown>> {
+  const activeRetention = retention;
+  if (!activeRetention) return { skipped: true };
+  let lastKnownState: Record<string, unknown> = {};
   try {
     const config = readRetentionConfig();
     if (!config) return { skipped: true };
     const { days, enabledAt } = config;
     const database = ensureDb();
     const state = prepareRetentionSchedule(enabledAt);
+    lastKnownState = state;
     if (now < Number(state.next_run) || now < Math.max(Number(state.retry_after), retentionRetryAfter)) return { ...state, skipped: true };
-    const cutoff = Math.max(retentionCutoff ?? 0, now - days * retention.dayMs);
+    const cutoff = Math.max(retentionCutoff ?? 0, now - days * activeRetention.dayMs);
     // Fence imports before deletion, including a partially completed run. The
     // tombstone is monotonic: increasing days/off cannot resurrect purged ranges.
     retentionWrite(() => database.prepare('UPDATE timeline_retention SET cutoff = ? WHERE id = 1').run(cutoff));
@@ -1101,7 +1166,7 @@ async function runRetention(now = Date.now()): Promise<Record<string, unknown>> 
       if (!session) break;
       let changed: number;
       do {
-        if (!stillCurrent()) return { ...retentionState(), interrupted: true };
+        if (!stillCurrent()) return { ...lastKnownState, interrupted: true };
         changed = 0;
         // Short synchronous transactions finish before yielding to queued
         // appends/reads/rebuilds. The existing session+ts index bounds each batch.
@@ -1114,14 +1179,14 @@ async function runRetention(now = Date.now()): Promise<Record<string, unknown>> 
               AND ts >= 0 AND ts < ? AND ts <= 8640000000000000
               AND typeof(ts) IN ('integer', 'real') AND ts = CAST(ts AS INTEGER)
             ORDER BY ts LIMIT ?
-          )`).run(session.session_id, cutoff, retention.batchSize).changes);
+          )`).run(session.session_id, cutoff, activeRetention.batchSize).changes);
           database.prepare('UPDATE timeline_retention SET batches = batches + 1, deleted = deleted + ? WHERE id = 1').run(changed);
         }));
         await new Promise<void>((resolve) => setImmediate(resolve));
-      } while (changed === retention.batchSize);
+      } while (changed === activeRetention.batchSize);
       afterSession = session.session_id;
     }
-    if (!stillCurrent()) return { ...retentionState(), interrupted: true };
+    if (!stillCurrent()) return { ...lastKnownState, interrupted: true };
     // Downtime catches up ONCE; next run returns to the next local 03:00.
     retentionWrite(() => database.prepare(`UPDATE timeline_retention SET last_success = ?, next_run = ?, retry_after = 0,
       runs = runs + 1, last_error = NULL WHERE id = 1`).run(now, nextHistoryCleanupAt(now)));
@@ -1144,10 +1209,15 @@ async function runRetention(now = Date.now()): Promise<Record<string, unknown>> 
     }
     return retentionState();
   } catch (err) {
-    retentionRetryAfter = now + retention.retryMs;
+    if (retentionStopped) {
+      return { ...lastKnownState, interrupted: true };
+    }
+    retentionRetryAfter = now + activeRetention.retryMs;
     try {
-      retentionWrite(() => ensureDb().prepare('UPDATE timeline_retention SET retry_after = ?, last_error = ? WHERE id = 1')
-        .run(now + retention.retryMs, err instanceof Error ? err.message : String(err)));
+      if (!retentionStopped && db) {
+        retentionWrite(() => ensureDb().prepare('UPDATE timeline_retention SET retry_after = ?, last_error = ? WHERE id = 1')
+          .run(now + activeRetention.retryMs, err instanceof Error ? err.message : String(err)));
+      }
     } catch { /* a locked/unavailable database may prevent even the progress write */ }
     throw err;
   } finally {
@@ -1169,6 +1239,7 @@ function scheduleRetention(): void {
     retentionTimer = setTimeout(() => {
       void runRetention().then(scheduleRetention, (err) => {
         console.warn('SQLite history retention failed; will retry:', err instanceof Error ? err.message : String(err));
+        if (retentionStopped) return;
         clearTimeout(retentionTimer);
         retentionTimer = setTimeout(scheduleRetention, retention.retryMs);
         retentionTimer.unref();
@@ -1177,6 +1248,7 @@ function scheduleRetention(): void {
     retentionTimer.unref();
   } catch (err) {
     console.warn('SQLite history retention schedule failed; will retry:', err instanceof Error ? err.message : String(err));
+    if (retentionStopped) return;
     retentionTimer = setTimeout(scheduleRetention, retention.retryMs);
     retentionTimer.unref();
   }
@@ -1184,19 +1256,65 @@ function scheduleRetention(): void {
 
 async function handleShutdown(): Promise<true> {
   retentionStopped = true;
-  if (retentionTimer) clearTimeout(retentionTimer);
+  if (retentionTimer) {
+    clearTimeout(retentionTimer);
+    retentionTimer = undefined;
+  }
   if (deferredMaintenanceTimer) {
     clearTimeout(deferredMaintenanceTimer);
     deferredMaintenanceTimer = undefined;
   }
   deferredMaintenanceAttempts = 0;
-  const maintenanceWorker = activeMaintenanceWorker;
-  activeMaintenanceWorker = null;
-  if (maintenanceWorker) {
-    void maintenanceWorker.terminate();
-  }
   retentionWatchHandle?.stop();
   retentionWatchHandle = undefined;
+
+  // 1. 保留大 WAL 子 worker 句柄直到 exit，先发终止或等待明确 exit
+  const maintenanceWorker = activeMaintenanceWorker;
+  const exitPromise = activeMaintenanceWorkerExitPromise;
+  if (maintenanceWorker) {
+    try {
+      await maintenanceWorker.terminate();
+    } catch {
+      // ignore
+    }
+  }
+  if (exitPromise) {
+    try {
+      await exitPromise;
+    } catch {
+      // ignore
+    }
+  }
+  activeMaintenanceWorker = null;
+  activeMaintenanceWorkerExitPromise = null;
+
+  // 2. 再等待运行中的维护收尾与 retention 收尾
+  const inFlightMaintenance = activeDeferredMaintenancePromise;
+  if (inFlightMaintenance) {
+    try {
+      await inFlightMaintenance;
+    } catch {
+      // ignore
+    }
+  }
+  const inFlightRetention = activeRetentionPromise;
+  if (inFlightRetention) {
+    try {
+      await inFlightRetention;
+    } catch {
+      // ignore
+    }
+  }
+
+  // 3. 最后关闭 SQLite 和端口
+  if (db) {
+    try {
+      db.close();
+    } catch {
+      // ignore
+    }
+    db = null;
+  }
   parentPort?.close();
   return true;
 }

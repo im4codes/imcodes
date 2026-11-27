@@ -9,9 +9,31 @@ vi.mock('../../src/agent/session-manager.js', () => ({
   getTransportRuntime: vi.fn(() => undefined),
 }));
 
+const { testQuotaMeta } = vi.hoisted(() => ({
+  testQuotaMeta: {
+    groups: [
+      {
+        id: 'gemini',
+        label: 'Gemini',
+        primary: { usedPercent: 15, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+        secondary: { usedPercent: 5, windowDurationMins: 10_080, resetsAt: 1_800_500_000 },
+      },
+      {
+        id: 'claude-gpt',
+        label: 'Claude/GPT',
+        primary: { usedPercent: 60, windowDurationMins: 300, resetsAt: 1_800_010_000 },
+        secondary: { usedPercent: 30, windowDurationMins: 10_080, resetsAt: 1_800_600_000 },
+      },
+    ],
+  },
+}));
+
 vi.mock('../../src/agent/agy-usage-quota.js', () => ({
   fetchAgyUsageQuota: vi.fn(async () => null),
-  peekAgyUsageQuotaCached: vi.fn(() => null),
+  peekAgyUsageQuotaCached: vi.fn(() => ({
+    quotaLabel: 'Gemini 5h 15% 1h · 7d 5% 5d | Claude/GPT 5h 60% 2h · 7d 30% 6d',
+    quotaMeta: testQuotaMeta,
+  })),
   recordAgyQuotaActivity: vi.fn(),
 }));
 
@@ -39,23 +61,6 @@ describe('session-store and session-list quota groups round-trip', () => {
   beforeEach(() => {
     for (const s of listSessions()) removeSession(s.name);
   });
-
-  const testQuotaMeta: ProviderQuotaMeta = {
-    groups: [
-      {
-        id: PROVIDER_QUOTA_GROUP_ID.GEMINI,
-        label: PROVIDER_QUOTA_GROUP_LABEL.GEMINI,
-        primary: { usedPercent: 15, windowDurationMins: 300, resetsAt: 1_800_000_000 },
-        secondary: { usedPercent: 5, windowDurationMins: 10_080, resetsAt: 1_800_500_000 },
-      },
-      {
-        id: PROVIDER_QUOTA_GROUP_ID.CLAUDE_GPT,
-        label: PROVIDER_QUOTA_GROUP_LABEL.CLAUDE_GPT,
-        primary: { usedPercent: 60, windowDurationMins: 300, resetsAt: 1_800_010_000 },
-        secondary: { usedPercent: 30, windowDurationMins: 10_080, resetsAt: 1_800_600_000 },
-      },
-    ],
-  };
 
   it('preserves quotaMeta groups across session-store upsert and retrieval', () => {
     const record: SessionRecord = {

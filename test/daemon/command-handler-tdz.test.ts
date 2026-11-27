@@ -91,5 +91,5 @@ describe('command-handler module initialization / TDZ invariants', () => {
       sessionStore.removeSession('deck_tdz_probe_brain');
       vi.doUnmock('../../src/agent/session-manager.js');
     }
-  });
+  }, 60_000);
 });

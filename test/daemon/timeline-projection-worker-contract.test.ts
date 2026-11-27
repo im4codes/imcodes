@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -34,20 +35,37 @@ function makeEvent(
 describe('timeline projection worker contract', () => {
   let tempHome: string | null = null;
   const loadedWorkers: Array<() => Promise<void>> = [];
+  const tempHomes: string[] = [];
 
   afterEach(async () => {
+    let firstError: unknown = null;
     try {
       for (const shutdownWorker of loadedWorkers.splice(0)) {
-        await shutdownWorker();
+        try {
+          await shutdownWorker();
+        } catch (err) {
+          if (!firstError) firstError = err;
+        }
       }
+    } catch (err) {
+      if (!firstError) firstError = err;
     } finally {
       vi.useRealTimers();
       vi.restoreAllMocks();
       vi.resetModules();
       vi.unmock('node:os');
       vi.unmock('node:worker_threads');
-      if (tempHome) rmSync(tempHome, { recursive: true, force: true });
+      for (const dir of tempHomes.splice(0)) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch (err) {
+          if (!firstError) firstError = err;
+        }
+      }
       tempHome = null;
+      if (firstError) {
+        throw firstError;
+      }
     }
   });
 
@@ -56,9 +74,17 @@ describe('timeline projection worker contract', () => {
     retention?: { configPath: string; dayMs: number; maxDays: number; retryMs: number; batchSize: number };
   }) {
     tempHome = mkdtempSync(join(tmpdir(), 'imcodes-projection-worker-'));
+    tempHomes.push(tempHome);
     const dbPath = join(tempHome, 'projection.sqlite');
     options?.prepareDb?.(dbPath);
-    const postMessage = vi.fn();
+    const pendingResponses = new Map<string, (resp: { id: string; ok: boolean; result?: unknown; error?: string }) => void>();
+    const postMessage = vi.fn((resp: { id: string; ok: boolean; result?: unknown; error?: string }) => {
+      const cb = pendingResponses.get(resp.id);
+      if (cb) {
+        pendingResponses.delete(resp.id);
+        cb(resp);
+      }
+    });
     const close = vi.fn();
     let handler: WorkerHandler | null = null;
     let isShutDown = false;
@@ -90,22 +116,28 @@ describe('timeline projection worker contract', () => {
     loadedWorkers.push(async () => {
       if (isShutDown) return;
       isShutDown = true;
-      await handler!({ id: 'after-each-shutdown', type: 'shutdown', payload: {} });
+      if (handler) {
+        const p = new Promise<{ id: string; ok: boolean; result?: unknown; error?: string }>((resolve) => {
+          pendingResponses.set('after-each-shutdown', resolve);
+        });
+        void handler({ id: 'after-each-shutdown', type: 'shutdown', payload: {} });
+        const resp = await p;
+        if (!resp || resp.ok !== true) {
+          throw new Error(`Worker shutdown failed in afterEach cleanup: ${resp?.error ?? 'no response'}`);
+        }
+      }
     });
 
     async function request(message: Record<string, unknown>) {
-      postMessage.mockClear();
-      await handler!(message);
+      const id = String(message.id);
       if (message.type === 'shutdown') {
         isShutDown = true;
       }
-      expect(postMessage).toHaveBeenCalledTimes(1);
-      return postMessage.mock.calls[0]?.[0] as {
-        id: string;
-        ok: boolean;
-        result?: unknown;
-        error?: string;
-      };
+      const p = new Promise<{ id: string; ok: boolean; result?: unknown; error?: string }>((resolve) => {
+        pendingResponses.set(id, resolve);
+      });
+      void handler!(message);
+      return await p;
     }
 
     return { request, close, dbPath, workerMod };
@@ -714,6 +746,190 @@ describe('timeline projection worker contract', () => {
     } finally {
       workerMod.setLargeWalCheckpointRunnerForTests(undefined);
       process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('does not reopen SQLite or leak timers when shutdown is issued concurrently during yielding retention batches', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const configPath = join(tmpdir(), `imcodes-ret-conc-sd-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+    const dayMs = HISTORY_RETENTION.dayMs;
+    const enabledAt = Date.now() - 2 * dayMs;
+    writeFileSync(configPath, JSON.stringify({ keepDays: 1, enabledAt }));
+    try {
+      const { request, dbPath } = await loadWorker({
+        retention: { configPath, dayMs, maxDays: HISTORY_RETENTION.maxDays, retryMs: 60_000, batchSize: 50 },
+      });
+      expect((await request({ id: 'init', type: 'queryHistory', payload: { sessionId: 'none', limit: 1 } })).ok).toBe(true);
+
+      const bigText = 'retention-conc-'.repeat(20);
+      const nowMs = Date.now();
+      const oldTs = enabledAt - 10 * dayMs;
+      const seeder = new DatabaseSync(dbPath);
+      seeder.exec('PRAGMA wal_autocheckpoint = 0;');
+      const insert = seeder.prepare(`INSERT INTO timeline_projection_events
+        (session_id, append_ordinal, event_id, ts, seq, epoch, type, source, confidence, text, payload_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 1, 'assistant.text', 'daemon', 'high', ?, ?, ?, ?)`);
+      seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_conc', 300, 0, 0, 1, 'ready', NULL)`).run();
+      seeder.exec('BEGIN');
+      for (let i = 1; i <= 300; i += 1) {
+        insert.run('s_conc', i, `conc-${i}`, oldTs + i, i, bigText, JSON.stringify({ text: bigText }), oldTs + i, oldTs + i);
+      }
+      seeder.exec('COMMIT');
+      seeder.close();
+
+      // Dispatch retentionTick across multiple batches (batchSize 50, 300 rows = 6 batches)
+      // and issue shutdown concurrently while it yields.
+      const tickPromise = request({ id: 'tick-conc', type: 'retentionTick', payload: { now: nowMs + dayMs } });
+      const shutdownPromise = request({ id: 'sd-conc', type: 'shutdown', payload: {} });
+
+      const [tickRes, shutRes] = await Promise.all([tickPromise, shutdownPromise]);
+      expect(shutRes.ok).toBe(true);
+      expect(shutRes.result).toBe(true);
+      expect(tickRes.ok).toBe(true);
+      expect(tickRes.result).toMatchObject({ interrupted: true });
+      expect(vi.getTimerCount()).toBe(0);
+
+      // Verify SQLite was closed and not reopened: rmSync of the database file and directory succeeds cleanly
+      expect(() => rmSync(dbPath, { force: true })).not.toThrow();
+    } finally {
+      try { rmSync(configPath, { force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  it('keeps shutdown pending while initial yielding retentionTick completes, rejecting second skipped tick', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const configPath = join(tmpdir(), `imcodes-ret-yield-sd-${Date.now()}-${Math.random().toString(16).slice(2)}.json`);
+    const dayMs = HISTORY_RETENTION.dayMs;
+    const enabledAt = Date.now() - 2 * dayMs;
+    writeFileSync(configPath, JSON.stringify({ keepDays: 1, enabledAt }));
+    try {
+      const { request, dbPath } = await loadWorker({
+        retention: { configPath, dayMs, maxDays: HISTORY_RETENTION.maxDays, retryMs: 60_000, batchSize: 50 },
+      });
+      expect((await request({ id: 'init', type: 'queryHistory', payload: { sessionId: 'none', limit: 1 } })).ok).toBe(true);
+
+      const bigText = 'retention-yield-'.repeat(20);
+      const nowMs = Date.now();
+      const oldTs = enabledAt - 10 * dayMs;
+      const seeder = new DatabaseSync(dbPath);
+      seeder.exec('PRAGMA wal_autocheckpoint = 0;');
+      const insert = seeder.prepare(`INSERT INTO timeline_projection_events
+        (session_id, append_ordinal, event_id, ts, seq, epoch, type, source, confidence, text, payload_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 1, 'assistant.text', 'daemon', 'high', ?, ?, ?, ?)`);
+      seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_yield', 300, 0, 0, 1, 'ready', NULL)`).run();
+      seeder.exec('BEGIN');
+      for (let i = 1; i <= 300; i += 1) {
+        insert.run('s_yield', i, `y-${i}`, oldTs + i, i, bigText, JSON.stringify({ text: bigText }), oldTs + i, oldTs + i);
+      }
+      seeder.exec('COMMIT');
+      seeder.close();
+
+      // Dispatch tick 1 which yields after batch 1
+      const tick1Promise = request({ id: 'tick-1', type: 'retentionTick', payload: { now: nowMs + dayMs } });
+
+      // While tick 1 is running, dispatch a second tick -> must return { skipped: true } without overwriting activeRetentionPromise
+      const tick2Res = await request({ id: 'tick-2', type: 'retentionTick', payload: { now: nowMs + dayMs } });
+      expect(tick2Res.ok).toBe(true);
+      expect(tick2Res.result).toMatchObject({ skipped: true });
+
+      // Dispatch shutdown: shutdown must remain pending and NOT settle before tick 1 completes
+      let shutdownSettled = false;
+      const shutdownPromise = request({ id: 'sd-yield', type: 'shutdown', payload: {} });
+      shutdownPromise.then(() => { shutdownSettled = true; });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(shutdownSettled).toBe(false);
+
+      // Now tick 1 resolves
+      const [tick1Res, shutRes] = await Promise.all([tick1Promise, shutdownPromise]);
+      expect(shutdownSettled).toBe(true);
+      expect(shutRes.ok).toBe(true);
+      expect(shutRes.result).toBe(true);
+      expect(tick1Res.ok).toBe(true);
+      expect(tick1Res.result).toMatchObject({ interrupted: true });
+      expect(vi.getTimerCount()).toBe(0);
+
+      expect(() => rmSync(dbPath, { force: true })).not.toThrow();
+    } finally {
+      try { rmSync(configPath, { force: true }); } catch { /* ignore */ }
+    }
+  });
+
+  it('does not prematurely confirm shutdown when checkpoint worker posts message before exit', async () => {
+    const { request, dbPath, workerMod } = await loadWorker();
+    expect((await request({ id: 'init-cw', type: 'queryHistory', payload: { sessionId: 'none', limit: 1 } })).ok).toBe(true);
+
+    const bigText = 'big-wal-'.repeat(200);
+    const reader = new DatabaseSync(dbPath, { readOnly: true });
+    reader.exec('BEGIN; SELECT count(*) FROM timeline_projection_sessions;');
+    const seeder = new DatabaseSync(dbPath);
+    seeder.exec('PRAGMA wal_autocheckpoint = 0;');
+    const insert = seeder.prepare(`INSERT INTO timeline_projection_events
+      (session_id, append_ordinal, event_id, ts, seq, epoch, type, source, confidence, text, payload_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 1, 'assistant.text', 'daemon', 'high', ?, ?, ?, ?)`);
+    seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_wal', 1200, 0, 0, 1, 'ready', NULL)`).run();
+    seeder.exec('BEGIN');
+    for (let i = 1; i <= 1200; i += 1) {
+      insert.run('s_wal', i, `w-${i}`, i, i, bigText, JSON.stringify({ text: bigText }), i, i);
+    }
+    seeder.exec('COMMIT');
+    seeder.close();
+    reader.exec('COMMIT;');
+    reader.close();
+
+    class FakeMaintenanceWorker extends EventEmitter {
+      unref = vi.fn();
+      terminate = vi.fn(async () => {
+        // Controlled: terminate does not immediately exit until we simulate it
+      });
+    }
+
+    let fakeWorker: FakeMaintenanceWorker | null = null;
+    let factoryCalls = 0;
+    workerMod.setMaintenanceWorkerFactoryForTests(() => {
+      factoryCalls += 1;
+      fakeWorker = new FakeMaintenanceWorker();
+      return fakeWorker as unknown as import('node:worker_threads').Worker;
+    });
+
+    try {
+      // Start deferred maintenance checkpoint
+      const checkpointPromise = workerMod.runDeferredMaintenance();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(fakeWorker).not.toBeNull();
+      expect(factoryCalls).toBe(1);
+
+      // Sub-worker posts message first, BEFORE exiting
+      fakeWorker!.emit('message', { ok: true, busy: false });
+      await Promise.resolve();
+
+      // Advancing next maintenance after message but before exit must NOT create a second worker
+      const secondMaintenancePromise = workerMod.runDeferredMaintenance();
+      await Promise.resolve();
+      expect(factoryCalls).toBe(1);
+
+      // Dispatch shutdown: shutdown must wait for worker exit and NOT settle prematurely
+      let shutdownSettled = false;
+      const shutdownPromise = request({ id: 'sd-subworker', type: 'shutdown', payload: {} });
+      shutdownPromise.then(() => { shutdownSettled = true; });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(shutdownSettled).toBe(false);
+
+      // Now worker exits
+      fakeWorker!.emit('exit', 0);
+      const shutRes = await shutdownPromise;
+      await checkpointPromise;
+      await secondMaintenancePromise;
+      expect(shutdownSettled).toBe(true);
+      expect(shutRes.ok).toBe(true);
+      expect(shutRes.result).toBe(true);
+      expect(factoryCalls).toBe(1);
+    } finally {
+      workerMod.setMaintenanceWorkerFactoryForTests(null);
     }
   });
 });
