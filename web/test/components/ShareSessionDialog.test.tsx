@@ -156,4 +156,21 @@ describe('ShareSessionDialog security warnings', () => {
     expect(warning).toBeTruthy();
     expect(warning.textContent).toContain("Security notice: Sharing a session lets collaborators interact with this device's environment");
   });
+
+  it('structures header, warning, panel, and actions with proper layout classes to support fixed actions', () => {
+    const { container } = render(
+      <ShareSessionDialog
+        variant="session"
+        target={defaultTarget}
+        onClose={vi.fn()}
+      />
+    );
+
+    const dialog = container.querySelector('.share-dialog');
+    expect(dialog).toBeTruthy();
+    expect(dialog?.querySelector('.share-dialog-header')).toBeTruthy();
+    expect(dialog?.querySelector('.share-security-warning')).toBeTruthy();
+    expect(dialog?.querySelector('.share-dialog-panel')).toBeTruthy();
+    expect(dialog?.querySelector('.ask-actions')).toBeTruthy();
+  });
 });

@@ -178,7 +178,7 @@ export function ShareSessionDialog({
   return (
     <div class="ask-dialog-overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
       <div class="ask-dialog share-dialog" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label={t(variant === 'machine' ? 'controlled_nodes.share.title' : 'share.dialogTitle')}>
-        <div>
+        <div class="share-dialog-header">
           <div class="share-dialog-title">{t(variant === 'machine' ? 'controlled_nodes.share.title' : 'share.dialogTitle')}</div>
           <div class="share-dialog-subtitle">{t(variant === 'machine' ? 'controlled_nodes.share.subtitle' : 'share.dialogSubtitle', { target: targetLabel })}</div>
         </div>

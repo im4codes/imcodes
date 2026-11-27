@@ -687,17 +687,19 @@ html.native-ios-mac .chat-dl-btn {
 }
 .tab-context-menu { position: fixed; background: #1c2128; border: 1px solid #30363d; border-radius: 6px; min-width: 150px; box-shadow: 0 8px 24px #00000080; z-index: 100; overflow: hidden; }
 .menu-divider { height: 1px; background: #21262d; margin: 2px 0; }
-.share-dialog { max-width: 520px; }
+.share-dialog { max-width: 520px; overflow-y: hidden; }
+.share-dialog-header { flex-shrink: 0; }
 .share-dialog-title { font-size: 18px; font-weight: 800; color: #f8fafc; }
 .share-dialog-subtitle { margin-top: 4px; font-size: 12px; line-height: 1.4; color: #94a3b8; }
-.share-security-warning { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid rgba(245,158,11,0.38); border-radius: 8px; background: rgba(120,53,15,0.26); color: #fed7aa; font-size: 12px; line-height: 1.45; overflow-wrap: break-word; }
-.share-dialog-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 4px; border: 1px solid rgba(125,211,252,0.16); border-radius: 9px; background: rgba(8,15,28,0.62); }
+.share-security-warning { display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border: 1px solid rgba(245,158,11,0.38); border-radius: 8px; background: rgba(120,53,15,0.26); color: #fed7aa; font-size: 12px; line-height: 1.45; overflow-wrap: break-word; flex-shrink: 0; }
+.share-dialog-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; padding: 4px; border: 1px solid rgba(125,211,252,0.16); border-radius: 9px; background: rgba(8,15,28,0.62); flex-shrink: 0; }
 .share-dialog-tab { min-height: 36px; padding: 7px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: #94a3b8; font: inherit; font-size: 12px; font-weight: 750; cursor: pointer; }
 .share-dialog-tab:hover { color: #e0f2fe; background: rgba(14,116,144,0.12); }
 .share-dialog-tab.is-active { border-color: rgba(34,211,238,0.34); background: rgba(8,145,178,0.2); color: #cffafe; box-shadow: inset 0 0 14px rgba(34,211,238,0.06); }
 .share-dialog-tab:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: 2px; }
-.share-dialog-panel { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.share-dialog-panel { display: flex; flex-direction: column; gap: 16px; min-width: 0; flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; padding-right: 2px; }
 .share-dialog-remote-desktop .remote-desktop-access { max-height: none; padding: 0; background: transparent; overflow: visible; }
+.share-dialog .ask-actions { flex-shrink: 0; padding-top: 4px; }
 .share-field { display: flex; flex-direction: column; gap: 8px; }
 .share-field-label { font-size: 12px; font-weight: 700; color: #cbd5e1; }
 .share-choice-row { display: flex; flex-wrap: wrap; gap: 8px; }
