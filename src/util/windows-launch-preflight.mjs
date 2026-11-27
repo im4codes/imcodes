@@ -26,7 +26,7 @@
  * Idempotent: healthy install costs one stat per dep + the dist check
  * (~ms) and exits 0 with no side effects.
  */
-import { existsSync, readFileSync, mkdirSync, appendFileSync, statSync, rmSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, mkdirSync, appendFileSync, statSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -46,6 +46,7 @@ const CRITICAL_DEPS = [
   'cors',
   'body-parser',
   'hono',
+  'pino',
   '@huggingface/transformers',
 ];
 
@@ -148,8 +149,22 @@ if (!existsSync(entryPath)) {
 // new repair logic into the upgrade runner that installs the first fixed build.
 const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 const nodeDatachannelRepair = join(PKG_ROOT, 'dist', 'src', 'util', 'node-datachannel-repair.mjs');
+const NDC_REPAIR_FAIL_MARKER = join(IMCODES_HOME, 'node-datachannel-repair-failed.txt');
+function clearNodeDatachannelFailureMarker() {
+  try { unlinkSync(NDC_REPAIR_FAIL_MARKER); } catch { /* ignore */ }
+}
 function repairNodeDatachannel() {
   if (!existsSync(nodeDatachannelRepair)) return;
+  const pinnedVersion = readPinnedVersion();
+  const markerKey = pinnedVersion ? `${pinnedVersion}|${PKG_ROOT}` : '';
+  if (markerKey) {
+    try {
+      if (existsSync(NDC_REPAIR_FAIL_MARKER) && readFileSync(NDC_REPAIR_FAIL_MARKER, 'utf8').trim() === markerKey) {
+        log(`node-datachannel launch repair skipped (previously failed for imcodes@${pinnedVersion}) — relay remains enabled`);
+        return;
+      }
+    } catch { /* proceed with repair attempt */ }
+  }
   const repair = spawnSync(process.execPath, [nodeDatachannelRepair, PKG_ROOT], {
     env: { ...process.env, IMCODES_NPM_BIN: npmCmd },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -160,7 +175,17 @@ function repairNodeDatachannel() {
   if (repair.stderr) {
     try { appendFileSync(REPAIR_LOG, repair.stderr); } catch { /* ignore */ }
   }
-  if (repair.status !== 0) log('node-datachannel launch repair unavailable — relay remains enabled');
+  if (repair.status === 0) {
+    clearNodeDatachannelFailureMarker();
+  } else {
+    log('node-datachannel launch repair unavailable — relay remains enabled');
+    if (markerKey) {
+      try {
+        mkdirSync(IMCODES_HOME, { recursive: true });
+        writeFileSync(NDC_REPAIR_FAIL_MARKER, markerKey);
+      } catch { /* best-effort */ }
+    }
+  }
 }
 repairNodeDatachannel();
 
@@ -201,6 +226,7 @@ if (r.stderr) {
 
 if (r.status === 0) {
   log('self-repair OK');
+  clearNodeDatachannelFailureMarker();
   // The global reinstall deliberately suppresses lifecycle scripts and can
   // replace a native addon repaired above. Verify/repair the freshly installed
   // tree again before handing control back to the watchdog.

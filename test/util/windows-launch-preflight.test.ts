@@ -75,7 +75,7 @@ function makeSandbox(opts: {
   }
 
   // node_modules: critical deps healthy except those in halfInstalledDeps.
-  const allCritical = ['commander', 'ws', 'cors', 'body-parser', 'hono', '@huggingface/transformers'];
+  const allCritical = ['commander', 'ws', 'cors', 'body-parser', 'hono', 'pino', '@huggingface/transformers'];
   const half = new Set(opts.halfInstalledDeps ?? []);
   for (const dep of allCritical) {
     const depDir = join(pkgRoot, 'node_modules', dep);
@@ -169,14 +169,61 @@ describe('src/util/windows-launch-preflight.mjs', () => {
     }
   });
 
-  it('first fixed-version launch invokes optional-native repair before returning to watchdog', () => {
+  it('first fixed-version launch invokes isolated optional-native repair before returning to watchdog', () => {
     const sb = makeSandbox({ brokenNodeDatachannel: true });
     try {
       const r = runPreflight(sb);
       expect(r.status).toBe(0);
       const npmLog = readFileSync(sb.npmCallLog, 'utf8');
       expect(npmLog).toContain(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel --ignore-scripts=false --foreground-scripts`);
-      expect(npmLog).toContain(`install --global=false --prefix ${sb.pkgRoot} --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test`);
+      expect(npmLog).toContain('install --global=false --prefix ');
+      expect(npmLog).not.toContain(`install --global=false --prefix ${sb.pkgRoot} --no-save`);
+      expect(npmLog).toContain('--no-save --no-audit --no-fund --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test');
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('half-installed pino: invokes npm install -g --ignore-scripts imcodes@<pinned>', () => {
+    const sb = makeSandbox({ halfInstalledDeps: ['pino'] });
+    try {
+      const r = runPreflight(sb);
+      expect(r.status).toBe(0);
+      const npmLog = readFileSync(sb.npmCallLog, 'utf8');
+      expect(npmLog).toContain('install -g --ignore-scripts --prefer-online imcodes@1.2.3');
+      expect(r.stderr).toMatch(/half-installed/);
+      expect(r.stderr).toMatch(/pino/);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('skips repeated launch-time node-datachannel repair for the same failing version+pkgRoot and retries on version change', () => {
+    const sb = makeSandbox({ brokenNodeDatachannel: true, npmExitCode: 1 });
+    try {
+      const first = runPreflight(sb);
+      expect(first.status).toBe(0);
+      const callsAfterFirst = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n').filter(Boolean);
+      expect(callsAfterFirst.length).toBeGreaterThan(0);
+      const markerPath = join(sb.homeDir, '.imcodes', 'node-datachannel-repair-failed.txt');
+      expect(existsSync(markerPath)).toBe(true);
+      expect(readFileSync(markerPath, 'utf8')).toBe(`1.2.3|${sb.pkgRoot}`);
+
+      const second = runPreflight(sb);
+      expect(second.status).toBe(0);
+      expect(second.stderr).toContain('node-datachannel launch repair skipped');
+      const callsAfterSecond = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n').filter(Boolean);
+      expect(callsAfterSecond).toEqual(callsAfterFirst);
+
+      writeFileSync(
+        join(sb.pkgRoot, 'package.json'),
+        JSON.stringify({ name: 'imcodes', version: '1.2.4', optionalDependencies: { 'node-datachannel': '0.0.0-test' } }),
+      );
+      const third = runPreflight(sb);
+      expect(third.status).toBe(0);
+      const callsAfterThird = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n').filter(Boolean);
+      expect(callsAfterThird.length).toBeGreaterThan(callsAfterSecond.length);
+      expect(readFileSync(markerPath, 'utf8')).toBe(`1.2.4|${sb.pkgRoot}`);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
@@ -214,7 +261,8 @@ describe('src/util/windows-launch-preflight.mjs', () => {
       ))).toBe(true);
       expect(calls.slice(globalInstall + 1).some((call) => (
         call.includes(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel`)
-        || (call.includes(`install --global=false --prefix ${sb.pkgRoot} --no-save`)
+        || (call.includes('install --global=false --prefix ')
+          && !call.includes(`--prefix ${sb.pkgRoot}`)
           && call.includes('node-datachannel@0.0.0-test'))
       ))).toBe(true);
     } finally {

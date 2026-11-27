@@ -63,7 +63,13 @@ log() {
 #
 # Keep this list short and stable — over-eager checks cost startup
 # latency on every healthy boot.
-CRITICAL_DEPS=(commander ws cors body-parser hono "@huggingface/transformers")
+CRITICAL_DEPS=(commander ws cors body-parser hono pino "@huggingface/transformers")
+
+read_pinned_version() {
+  if [ -n "$NODE" ] && [ -f "$PKG_ROOT/package.json" ]; then
+    "$NODE" -e "console.log(require(process.argv[1]).version || '')" "$PKG_ROOT/package.json" 2>/dev/null || true
+  fi
+}
 
 # Returns 0 if a dep dir exists but lacks package.json (the half-install
 # signature); 1 otherwise. A missing dep dir entirely is also fine —
@@ -146,7 +152,7 @@ if [ "$needs_repair" = "1" ]; then
   elif [ ! -f "$PKG_ROOT/package.json" ]; then
     log "node_modules half-installed but $PKG_ROOT/package.json missing — cannot read pinned version"
   else
-    pinned="$("$NODE" -e "console.log(require('$PKG_ROOT/package.json').version)" 2>/dev/null || true)"
+    pinned="$(read_pinned_version)"
     if [ -z "$pinned" ]; then
       log "node_modules half-installed but pinned version unreadable — proceeding without repair"
     else
@@ -168,6 +174,7 @@ if [ "$needs_repair" = "1" ]; then
       rm -rf "$GLOBAL_LIB"/.imcodes-* "$STATE_DIR/upgrade.lock.d" >>"$REPAIR_LOG" 2>&1 || true
       if "$NPM" install -g --ignore-scripts --prefer-online "imcodes@$pinned" >>"$REPAIR_LOG" 2>&1; then
         log "self-repair OK"
+        rm -f "$STATE_DIR/node-datachannel-repair-failed.txt" 2>/dev/null || true
       else
         log "self-repair FAILED — see $REPAIR_LOG"
         # Fall through and let exec fail; systemd will keep retrying
@@ -182,11 +189,29 @@ fi
 # Run the newly installed package's built-in repair before the daemon starts.
 # This launch-time pass is essential for the first upgrade from an older daemon:
 # that old daemon's generated upgrade script cannot contain newer repair logic.
+# Persist a version+pkgRoot failure marker so repeated daemon restarts of the
+# same version do not thrash failing repair attempts on every boot.
+NDC_REPAIR_FAIL_MARKER="$STATE_DIR/node-datachannel-repair-failed.txt"
 NODE_DATACHANNEL_REPAIR="$PKG_ROOT/dist/src/util/node-datachannel-repair.mjs"
 if [ -f "$NODE_DATACHANNEL_REPAIR" ] && [ -n "$NPM" ]; then
-  mkdir -p "$(dirname "$REPAIR_LOG")"
-  if ! IMCODES_NPM_BIN="$NPM" "$NODE" "$NODE_DATACHANNEL_REPAIR" "$PKG_ROOT" >>"$REPAIR_LOG" 2>&1; then
-    log "node-datachannel launch repair unavailable — relay remains enabled; see $REPAIR_LOG"
+  ndc_pinned="$(read_pinned_version)"
+  ndc_marker_key=""
+  if [ -n "$ndc_pinned" ]; then
+    ndc_marker_key="${ndc_pinned}|${PKG_ROOT}"
+  fi
+  if [ -n "$ndc_marker_key" ] && [ -f "$NDC_REPAIR_FAIL_MARKER" ] && [ "$(cat "$NDC_REPAIR_FAIL_MARKER" 2>/dev/null || true)" = "$ndc_marker_key" ]; then
+    log "node-datachannel launch repair skipped (previously failed for imcodes@$ndc_pinned) — relay remains enabled"
+  else
+    mkdir -p "$(dirname "$REPAIR_LOG")"
+    if IMCODES_NPM_BIN="$NPM" "$NODE" "$NODE_DATACHANNEL_REPAIR" "$PKG_ROOT" >>"$REPAIR_LOG" 2>&1; then
+      rm -f "$NDC_REPAIR_FAIL_MARKER" 2>/dev/null || true
+    else
+      log "node-datachannel launch repair unavailable — relay remains enabled; see $REPAIR_LOG"
+      if [ -n "$ndc_marker_key" ]; then
+        mkdir -p "$STATE_DIR" 2>/dev/null || true
+        printf '%s' "$ndc_marker_key" >"$NDC_REPAIR_FAIL_MARKER" 2>/dev/null || true
+      fi
+    fi
   fi
 fi
 

@@ -111,7 +111,7 @@ function makeSandbox(opts: {
 
   // node_modules: by default ALL CRITICAL_DEPS are healthy; opts.halfInstalledDeps
   // marks specific ones as empty placeholders (the real failure mode).
-  const allCritical = ['commander', 'ws', 'cors', 'body-parser', 'hono', '@huggingface/transformers'];
+  const allCritical = ['commander', 'ws', 'cors', 'body-parser', 'hono', 'pino', '@huggingface/transformers'];
   const half = new Set(opts.halfInstalledDeps ?? []);
   for (const dep of allCritical) {
     const depDir = join(pkgRoot, 'node_modules', dep);
@@ -202,16 +202,81 @@ describeUnix('bin/imcodes-launch.sh', () => {
     }
   });
 
-  it('first fixed-version launch repairs script-suppressed node-datachannel before daemon handoff', () => {
+  it('first fixed-version launch repairs script-suppressed node-datachannel via isolated staging before daemon handoff', () => {
     const sb = makeSandbox({ brokenNodeDatachannel: true });
     try {
       const r = runLauncher(sb);
       expect(r.status).toBe(0);
       const npmLog = readFileSync(sb.npmCallLog, 'utf8');
       expect(npmLog).toContain(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel --ignore-scripts=false --foreground-scripts`);
-      expect(npmLog).toContain(`install --global=false --prefix ${sb.pkgRoot} --no-save --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test`);
+      expect(npmLog).toContain('install --global=false --prefix ');
+      expect(npmLog).not.toContain(`install --global=false --prefix ${sb.pkgRoot} --no-save`);
+      expect(npmLog).toContain('--no-save --no-audit --no-fund --ignore-scripts=false --foreground-scripts node-datachannel@0.0.0-test');
       const nodeLog = readFileSync(join(sb.root, 'node-calls.log'), 'utf8');
       expect(nodeLog).toContain('start');
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('half-installed pino: triggers npm install -g imcodes@<pinned>', () => {
+    const sb = makeSandbox({ halfInstalledDeps: ['pino'] });
+    try {
+      const r = runLauncher(sb);
+      expect(r.status).toBe(0);
+      const npmLog = readFileSync(sb.npmCallLog, 'utf8');
+      expect(npmLog).toContain('install -g --ignore-scripts --prefer-online imcodes@1.2.3');
+      expect(r.stderr).toMatch(/half-installed/);
+      expect(r.stderr).toMatch(/pino/);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('skips repeated launch-time node-datachannel repair for the same failing version+pkgRoot and retries on version change', () => {
+    const sb = makeSandbox({ brokenNodeDatachannel: true, npmExitCode: 1 });
+    try {
+      const first = runLauncher(sb);
+      expect(first.status).toBe(0);
+      const callsAfterFirst = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n').filter(Boolean);
+      expect(callsAfterFirst.length).toBeGreaterThan(0);
+      const markerPath = join(sb.homeDir, '.imcodes', 'node-datachannel-repair-failed.txt');
+      expect(existsSync(markerPath)).toBe(true);
+      expect(readFileSync(markerPath, 'utf8')).toBe(`1.2.3|${sb.pkgRoot}`);
+
+      // Second launch on identical version skips spawning npm for node-datachannel repair.
+      const second = runLauncher(sb);
+      expect(second.status).toBe(0);
+      expect(second.stderr).toContain('node-datachannel launch repair skipped');
+      const callsAfterSecond = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n').filter(Boolean);
+      expect(callsAfterSecond).toEqual(callsAfterFirst);
+
+      // Upgrading version invalidates the failure marker and attempts repair again.
+      writeFileSync(
+        join(sb.pkgRoot, 'package.json'),
+        JSON.stringify({ name: 'imcodes', version: '1.2.4', optionalDependencies: { 'node-datachannel': '0.0.0-test' } }),
+      );
+      const third = runLauncher(sb);
+      expect(third.status).toBe(0);
+      const callsAfterThird = readFileSync(sb.npmCallLog, 'utf8').trim().split('\n').filter(Boolean);
+      expect(callsAfterThird.length).toBeGreaterThan(callsAfterSecond.length);
+      expect(readFileSync(markerPath, 'utf8')).toBe(`1.2.4|${sb.pkgRoot}`);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  it('clears the launch failure marker after a successful half-install self-repair so node-datachannel repair runs fresh', () => {
+    const sb = makeSandbox({ halfInstalledDeps: ['commander'], brokenNodeDatachannel: true });
+    try {
+      const markerPath = join(sb.homeDir, '.imcodes', 'node-datachannel-repair-failed.txt');
+      writeFileSync(markerPath, `1.2.3|${sb.pkgRoot}`);
+      const r = runLauncher(sb);
+      expect(r.status).toBe(0);
+      const npmLog = readFileSync(sb.npmCallLog, 'utf8');
+      expect(npmLog).toContain('install -g --ignore-scripts --prefer-online imcodes@1.2.3');
+      expect(npmLog).toContain(`rebuild --global=false --prefix ${sb.pkgRoot} node-datachannel`);
+      expect(r.stderr).not.toContain('node-datachannel launch repair skipped');
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }

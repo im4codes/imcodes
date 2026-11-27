@@ -1,11 +1,11 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
-  chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { isDirectInvocation, resolveNpmCliJs } from '../../src/util/node-datachannel-repair.mjs';
+import { isDirectInvocation, repairNodeDatachannel, resolveNpmCliJs } from '../../src/util/node-datachannel-repair.mjs';
 import { buildBashNodeDatachannelRepair } from '../../src/util/node-datachannel-repair-script.js';
 
 const cleanup: string[] = [];
@@ -21,12 +21,13 @@ describe('buildBashNodeDatachannelRepair', () => {
     expect(block).toContain('"$NODE" "$NODE_DATACHANNEL_REPAIR" "$IMCODES_PACKAGE_DIR"');
   });
 
-  it('runs only the dependency lifecycle with scripts explicitly enabled', () => {
+  it('runs only the dependency lifecycle with scripts explicitly enabled and never installs into packageRoot', () => {
     const implementation = readFileSync(join(process.cwd(), 'src', 'util', 'node-datachannel-repair.mjs'), 'utf8');
     expect(implementation).toContain("'rebuild', '--global=false', '--prefix', packageRoot");
     expect(implementation).toContain("'node-datachannel', '--ignore-scripts=false', '--foreground-scripts'");
-    expect(implementation).toContain("'install', '--global=false', '--prefix', packageRoot");
-    expect(implementation).toContain("'--no-save', '--ignore-scripts=false', '--foreground-scripts'");
+    expect(implementation).toContain("'install', '--global=false', '--prefix', stagingRoot");
+    expect(implementation).toContain("'--no-save', '--no-audit', '--no-fund', '--ignore-scripts=false', '--foreground-scripts'");
+    expect(implementation).not.toContain("'install', '--global=false', '--prefix', packageRoot");
     expect(block).not.toContain('install -g');
   });
 
@@ -300,7 +301,7 @@ describe('node-datachannel optional dependency decoupling', () => {
 
   const bashBin = resolveBashBin();
 
-  it.skipIf(!bashBin)('repairs missing node-datachannel on attempt 1 targeting explicit project dir and stops retrying', () => {
+  it.skipIf(!bashBin)('repairs missing node-datachannel on attempt 1 via isolated staging without targeting projectDir and stops retrying', () => {
     const { parentDir, projectDir, result, calls } = setupIsolatedCiProject({
       declareOptionalDep: true,
       ciInstallsDep: false,
@@ -313,9 +314,182 @@ describe('node-datachannel optional dependency decoupling', () => {
     expect(calls.map((c) => c.subcmd)).toEqual(['ci', 'install']);
     const installCall = calls[1];
     expect(installCall.args).toContain('node-datachannel@^0.32.3');
-    expect(installCall.args[installCall.args.indexOf('--prefix') + 1]).toBe(resolve(projectDir));
+    const installPrefix = installCall.args[installCall.args.indexOf('--prefix') + 1];
+    expect(installPrefix).not.toBe(resolve(projectDir));
+    expect(installCall.cwd).toBe(installPrefix);
     expect(existsSync(join(projectDir, 'node_modules', 'node-datachannel', 'package.json'))).toBe(true);
     expect(existsSync(join(parentDir, 'node_modules'))).toBe(false);
+  });
+
+  it('counterexample: failed isolated reinstall preserves sibling pino and existing node-datachannel without passing --prefix packageRoot', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes ndc fail & pino-'));
+    cleanup.push(root);
+    const pkgRoot = join(root, 'pkg');
+    const pinoDir = join(pkgRoot, 'node_modules', 'pino');
+    const depDir = join(pkgRoot, 'node_modules', 'node-datachannel');
+    const npmLogPath = join(root, 'npm-calls.jsonl');
+    const fakeNpmJs = join(root, 'fake-npm.cjs');
+    const fakeNpmWrapper = join(root, process.platform === 'win32' ? 'npm.cmd' : 'npm');
+
+    mkdirSync(pinoDir, { recursive: true });
+    mkdirSync(depDir, { recursive: true });
+    writeFileSync(join(pkgRoot, 'package.json'), JSON.stringify({
+      name: 'imcodes',
+      private: true,
+      optionalDependencies: { 'node-datachannel': '^0.32.3' },
+    }));
+    writeFileSync(join(pinoDir, 'package.json'), JSON.stringify({ name: 'pino', version: '9.0.0' }));
+    writeFileSync(join(pinoDir, 'pino.js'), 'export default function pino() {}\n');
+    writeFileSync(join(depDir, 'package.json'), JSON.stringify({
+      name: 'node-datachannel', version: '0.32.3', type: 'module', main: './index.js',
+    }));
+    writeFileSync(join(depDir, 'index.js'), "throw new Error('preexisting broken addon');\n");
+    writeFileSync(fakeNpmJs, [
+      "const { appendFileSync } = require('node:fs');",
+      "const args = process.argv.slice(2);",
+      `appendFileSync(${JSON.stringify(npmLogPath)}, JSON.stringify({ subcmd: args[0], args, cwd: process.cwd() }) + '\\n');`,
+      "process.exit(args[0] === 'install' ? 217 : 2);",
+    ].join('\n'));
+    if (process.platform === 'win32') {
+      writeFileSync(fakeNpmWrapper, `@echo off\r\n"${process.execPath}" "${fakeNpmJs}" %*\r\n`);
+    } else {
+      writeFileSync(fakeNpmWrapper, `#!/usr/bin/env sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeNpmJs)} "$@"\n`, { mode: 0o755 });
+    }
+
+    const result = repairNodeDatachannel({
+      packageRoot: pkgRoot,
+      npmCommand: fakeNpmWrapper,
+      npmCli: fakeNpmJs,
+    });
+
+    expect(result).toEqual({ available: false, attempted: true, repaired: false, reason: 'verification_failed' });
+    const calls = readFileSync(npmLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { subcmd: string; args: string[]; cwd: string });
+    const installCall = calls.find((c) => c.subcmd === 'install');
+    expect(installCall).toBeDefined();
+    expect(installCall!.args[installCall!.args.indexOf('--prefix') + 1]).not.toBe(resolve(pkgRoot));
+    expect(installCall!.cwd).not.toBe(resolve(pkgRoot));
+    // Sibling pino and pre-existing node-datachannel must be completely untouched.
+    expect(JSON.parse(readFileSync(join(pinoDir, 'package.json'), 'utf8'))).toEqual({ name: 'pino', version: '9.0.0' });
+    expect(readFileSync(join(pinoDir, 'pino.js'), 'utf8')).toBe('export default function pino() {}\n');
+    expect(readFileSync(join(depDir, 'index.js'), 'utf8')).toBe("throw new Error('preexisting broken addon');\n");
+    expect(readdirSync(join(pkgRoot, 'node_modules')).filter((name) => name.startsWith('.node-datachannel-'))).toEqual([]);
+  });
+
+  it('installs in staging, rejects parent-level decoy unless staging itself works, then swaps only node-datachannel cleanly', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes ndc swap & decoy-'));
+    cleanup.push(root);
+    // Parent node_modules decoy must NOT pass verification for either staging or pkgRoot.
+    const decoyDir = join(root, 'node_modules', 'node-datachannel');
+    mkdirSync(decoyDir, { recursive: true });
+    writeFileSync(join(decoyDir, 'package.json'), JSON.stringify({
+      name: 'node-datachannel', version: 'decoy', type: 'module', main: './index.js',
+    }));
+    writeFileSync(join(decoyDir, 'index.js'), 'export default { decoy: true };\n');
+
+    const pkgRoot = join(root, 'imcodes & spaces');
+    const pinoDir = join(pkgRoot, 'node_modules', 'pino');
+    const npmLogPath = join(root, 'npm-calls.jsonl');
+    const fakeNpmJs = join(root, 'fake-npm.cjs');
+    const fakeNpmWrapper = join(root, process.platform === 'win32' ? 'npm.cmd' : 'npm');
+
+    mkdirSync(pinoDir, { recursive: true });
+    writeFileSync(join(pkgRoot, 'package.json'), JSON.stringify({
+      name: 'imcodes',
+      private: true,
+      optionalDependencies: { 'node-datachannel': '^0.32.3' },
+    }));
+    writeFileSync(join(pinoDir, 'package.json'), JSON.stringify({ name: 'pino', version: '9.0.0' }));
+
+    // Step 1: npm install exits 0 without creating node-datachannel in staging -> decoy must NOT fool verify(stagingRoot).
+    writeFileSync(fakeNpmJs, [
+      "const { appendFileSync, mkdirSync, writeFileSync } = require('node:fs');",
+      "const { join } = require('node:path');",
+      "const args = process.argv.slice(2);",
+      `appendFileSync(${JSON.stringify(npmLogPath)}, JSON.stringify({ subcmd: args[0], args, cwd: process.cwd() }) + '\\n');`,
+      "if (args[0] === 'install' && process.env.TEST_WRITE_STAGED === '1') {",
+      "  const prefix = args[args.indexOf('--prefix') + 1];",
+      "  const depDir = join(prefix, 'node_modules', 'node-datachannel');",
+      "  mkdirSync(depDir, { recursive: true });",
+      "  writeFileSync(join(depDir, 'package.json'), JSON.stringify({ name: 'node-datachannel', version: '0.32.3', type: 'module', main: './index.js' }));",
+      "  writeFileSync(join(depDir, 'index.js'), 'export default { staged: true };\\n');",
+      "}",
+      "process.exit(0);",
+    ].join('\n'));
+    if (process.platform === 'win32') {
+      writeFileSync(fakeNpmWrapper, `@echo off\r\n"${process.execPath}" "${fakeNpmJs}" %*\r\n`);
+    } else {
+      writeFileSync(fakeNpmWrapper, `#!/usr/bin/env sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeNpmJs)} "$@"\n`, { mode: 0o755 });
+    }
+
+    process.env.TEST_WRITE_STAGED = '0';
+    try {
+      const decoyOnly = repairNodeDatachannel({
+        packageRoot: pkgRoot,
+        npmCommand: fakeNpmWrapper,
+        npmCli: fakeNpmJs,
+      });
+      expect(decoyOnly).toEqual({ available: false, attempted: true, repaired: false, reason: 'verification_failed' });
+      expect(existsSync(join(pkgRoot, 'node_modules', 'node-datachannel'))).toBe(false);
+
+      process.env.TEST_WRITE_STAGED = '1';
+      const repaired = repairNodeDatachannel({
+        packageRoot: pkgRoot,
+        npmCommand: fakeNpmWrapper,
+        npmCli: fakeNpmJs,
+      });
+      expect(repaired).toEqual({ available: true, attempted: true, repaired: true });
+      expect(readFileSync(join(pkgRoot, 'node_modules', 'node-datachannel', 'index.js'), 'utf8')).toContain('staged: true');
+      expect(JSON.parse(readFileSync(join(pinoDir, 'package.json'), 'utf8'))).toEqual({ name: 'pino', version: '9.0.0' });
+      expect(readdirSync(join(pkgRoot, 'node_modules')).filter((name) => name.startsWith('.node-datachannel-'))).toEqual([]);
+      const calls = readFileSync(npmLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { subcmd: string; args: string[]; cwd: string });
+      for (const installCall of calls.filter((c) => c.subcmd === 'install')) {
+        const stagedRoot = installCall.args[installCall.args.indexOf('--prefix') + 1];
+        expect(existsSync(stagedRoot)).toBe(false);
+      }
+    } finally {
+      delete process.env.TEST_WRITE_STAGED;
+    }
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('skips repair fast without spawning npm when node_modules is not writable', () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes ndc readonly-'));
+    cleanup.push(root);
+    const pkgRoot = join(root, 'pkg');
+    const nodeModulesDir = join(pkgRoot, 'node_modules');
+    const depDir = join(nodeModulesDir, 'node-datachannel');
+    const npmLogPath = join(root, 'npm-calls.jsonl');
+    const fakeNpmJs = join(root, 'fake-npm.cjs');
+    const fakeNpmWrapper = join(root, 'npm');
+
+    mkdirSync(depDir, { recursive: true });
+    writeFileSync(join(pkgRoot, 'package.json'), JSON.stringify({
+      name: 'imcodes',
+      private: true,
+      optionalDependencies: { 'node-datachannel': '^0.32.3' },
+    }));
+    writeFileSync(join(depDir, 'package.json'), JSON.stringify({
+      name: 'node-datachannel', version: '0.32.3', type: 'module', main: './index.js',
+    }));
+    writeFileSync(join(depDir, 'index.js'), "throw new Error('broken');\n");
+    writeFileSync(fakeNpmJs, `require('node:fs').appendFileSync(${JSON.stringify(npmLogPath)}, 'called\\n');\n`);
+    writeFileSync(fakeNpmWrapper, `#!/usr/bin/env sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(fakeNpmJs)} "$@"\n`, { mode: 0o755 });
+
+    chmodSync(nodeModulesDir, 0o555);
+    try {
+      const logs: string[] = [];
+      const result = repairNodeDatachannel({
+        packageRoot: pkgRoot,
+        npmCommand: fakeNpmWrapper,
+        npmCli: fakeNpmJs,
+        log: (line) => logs.push(line),
+      });
+      expect(result).toEqual({ available: false, attempted: false, repaired: false, reason: 'not_writable' });
+      expect(existsSync(npmLogPath)).toBe(false);
+      expect(logs.some((line) => line.includes('not writable'))).toBe(true);
+      expect(readdirSync(nodeModulesDir).filter((name) => name.startsWith('.imcodes-write-probe'))).toEqual([]);
+    } finally {
+      chmodSync(nodeModulesDir, 0o755);
+    }
   });
 
   it.skipIf(!bashBin)('retries once on first repair failure and succeeds on attempt 2', () => {
