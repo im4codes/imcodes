@@ -1246,7 +1246,9 @@
     "verification_reference": "承認済み検証端末「{{alias}}」（verificationMachineId: {{id}}、対象: {{target}}）で実機テストを行ってください。",
     "verification_add": "既存の参照から承認",
     "verification_authorize_alias": "エイリアス: {{name}}",
-    "verification_authorize_node": "管理対象ノード: {{name}}"
+    "verification_authorize_node": "管理対象ノード: {{name}}",
+    "search_history_placeholder": "履歴を絞り込み…",
+    "no_history_matches": "一致する履歴はありません"
   },
   "file_browser": {
     "title_dir": "ディレクトリを選択",

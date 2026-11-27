@@ -1246,7 +1246,9 @@
     "verification_reference": "Используйте разрешённую машину проверки «{{alias}}» (verificationMachineId: {{id}}, цель: {{target}}) для тестирования на реальном устройстве.",
     "verification_add": "Авторизовать из существующего источника",
     "verification_authorize_alias": "Псевдоним: {{name}}",
-    "verification_authorize_node": "Управляемый узел: {{name}}"
+    "verification_authorize_node": "Управляемый узел: {{name}}",
+    "search_history_placeholder": "Фильтр истории…",
+    "no_history_matches": "Нет подходящей истории"
   },
   "file_browser": {
     "title_dir": "Выбрать директорию",

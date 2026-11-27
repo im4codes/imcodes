@@ -1246,7 +1246,9 @@
     "verification_reference": "使用已授权验证设备“{{alias}}”（verificationMachineId：{{id}}，目标：{{target}}）进行真机测试。",
     "verification_add": "从已有来源授权",
     "verification_authorize_alias": "别名：{{name}}",
-    "verification_authorize_node": "受控节点：{{name}}"
+    "verification_authorize_node": "受控节点：{{name}}",
+    "search_history_placeholder": "筛选历史记录…",
+    "no_history_matches": "无匹配历史记录"
   },
   "file_browser": {
     "title_dir": "选择目录",

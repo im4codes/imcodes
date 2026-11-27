@@ -81,4 +81,93 @@ describe('quick-data routes', () => {
       phrases: ['updated phrase'],
     });
   });
+
+  it('accepts up to 200 global and per-session history entries and rejects 201', async () => {
+    const entries200 = Array.from({ length: 200 }, (_, i) => `cmd-${i}`);
+    const okRes = await app.request('/api/quick-data', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        data: {
+          history: entries200,
+          sessionHistory: { deck_a: entries200 },
+          commands: [],
+          phrases: [],
+        },
+      }),
+    });
+    expect(okRes.status).toBe(200);
+
+    const overGlobalRes = await app.request('/api/quick-data', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        data: {
+          history: [...entries200, 'cmd-200'],
+          sessionHistory: {},
+          commands: [],
+          phrases: [],
+        },
+      }),
+    });
+    expect(overGlobalRes.status).toBe(400);
+
+    const overSessionRes = await app.request('/api/quick-data', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        data: {
+          history: [],
+          sessionHistory: { deck_a: [...entries200, 'cmd-200'] },
+          commands: [],
+          phrases: [],
+        },
+      }),
+    });
+    expect(overSessionRes.status).toBe(400);
+  });
+
+  it('persists valid last-sent timestamps, prunes stale timestamp keys, and rejects invalid timestamps', async () => {
+    const res = await app.request('/api/quick-data', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        data: {
+          history: ['deploy'],
+          sessionHistory: { deck_a: ['deploy'] },
+          historyTimestamps: { deploy: 1700000001000, evicted: 1700000000000 },
+          sessionHistoryTimestamps: {
+            deck_a: { deploy: 1700000002000, stale: 1699999999000 },
+            deck_removed: { gone: 1699999999000 },
+          },
+          commands: [],
+          phrases: [],
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    expect(upsertQuickDataMock).toHaveBeenCalledWith({}, 'test-user', {
+      history: ['deploy'],
+      sessionHistory: { deck_a: ['deploy'] },
+      historyTimestamps: { deploy: 1700000001000 },
+      sessionHistoryTimestamps: { deck_a: { deploy: 1700000002000 } },
+      commands: [],
+      phrases: [],
+    });
+
+    const badTs = await app.request('/api/quick-data', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        data: {
+          history: ['deploy'],
+          sessionHistory: {},
+          historyTimestamps: { deploy: -5 },
+          commands: [],
+          phrases: [],
+        },
+      }),
+    });
+    expect(badTs.status).toBe(400);
+  });
 });

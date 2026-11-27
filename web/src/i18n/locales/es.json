@@ -1246,7 +1246,9 @@
     "verification_reference": "Usa la máquina de verificación autorizada «{{alias}}» (verificationMachineId: {{id}}, destino: {{target}}) para pruebas reales.",
     "verification_add": "Autorizar desde una fuente existente",
     "verification_authorize_alias": "Alias: {{name}}",
-    "verification_authorize_node": "Nodo: {{name}}"
+    "verification_authorize_node": "Nodo: {{name}}",
+    "search_history_placeholder": "Filtrar historial…",
+    "no_history_matches": "No hay historial coincidente"
   },
   "file_browser": {
     "title_dir": "Seleccionar directorio",

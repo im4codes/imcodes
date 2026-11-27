@@ -31,8 +31,10 @@ import {
 import { listVerificationMachines, setVerificationMachine } from '../api/verification-machines.js';
 
 export interface QuickData {
-  history: string[];                        // cross-session
-  sessionHistory: Record<string, string[]>; // per-session, keyed by session name
+  history: string[];                                                 // cross-session
+  sessionHistory: Record<string, string[]>;                          // per-session, keyed by session name
+  historyTimestamps?: Record<string, number>;                        // epoch ms per history text
+  sessionHistoryTimestamps?: Record<string, Record<string, number>>; // epoch ms per session + text
   commands: string[];
   phrases: string[];
 }
@@ -41,8 +43,8 @@ export const EMPTY_QUICK_DATA: QuickData = { history: [], sessionHistory: {}, co
 
 // ── Built-in defaults (not stored in D1, cannot be deleted) ───────────────
 
-const SESSION_HISTORY_MAX = 50;
-const GLOBAL_HISTORY_MAX = 50;
+export const SESSION_HISTORY_MAX = 200;
+export const GLOBAL_HISTORY_MAX = 200;
 
 // ── Data helpers ──────────────────────────────────────────────────────────
 
@@ -50,27 +52,139 @@ function dedupPrepend(list: string[], text: string, max: number): string[] {
   return [text, ...list.filter((h) => h !== text)].slice(0, max);
 }
 
-export function recordHistoryEntry(data: QuickData, text: string, sessionName?: string): QuickData {
+function validTimestamp(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined;
+}
+
+function pruneTimestampMap(entries: readonly string[], rawMap: unknown): Record<string, number> | undefined {
+  if (!rawMap || typeof rawMap !== 'object') return undefined;
+  const allowed = new Set(entries);
+  const pruned: Record<string, number> = {};
+  for (const [key, rawVal] of Object.entries(rawMap as Record<string, unknown>)) {
+    if (!allowed.has(key)) continue;
+    const ts = validTimestamp(rawVal);
+    if (ts !== undefined) pruned[key] = ts;
+  }
+  return Object.keys(pruned).length > 0 ? pruned : undefined;
+}
+
+function pruneSessionTimestampMaps(
+  sessionHistory: Record<string, string[]>,
+  rawMaps: unknown,
+): Record<string, Record<string, number>> | undefined {
+  if (!rawMaps || typeof rawMaps !== 'object') return undefined;
+  const pruned: Record<string, Record<string, number>> = {};
+  for (const [session, rawMap] of Object.entries(rawMaps as Record<string, unknown>)) {
+    const entries = sessionHistory[session];
+    if (!entries || entries.length === 0) continue;
+    const cleaned = pruneTimestampMap(entries, rawMap);
+    if (cleaned) pruned[session] = cleaned;
+  }
+  return Object.keys(pruned).length > 0 ? pruned : undefined;
+}
+
+function buildQuickDataWithPrunedTimestamps(
+  nextHistory: string[],
+  nextSessionHistory: Record<string, string[]>,
+  nextHistoryTs: unknown,
+  nextSessionTs: unknown,
+  commands: string[],
+  phrases: string[],
+): QuickData {
+  const historyTimestamps = pruneTimestampMap(nextHistory, nextHistoryTs);
+  const sessionHistoryTimestamps = pruneSessionTimestampMaps(nextSessionHistory, nextSessionTs);
+  return {
+    history: nextHistory,
+    sessionHistory: nextSessionHistory,
+    ...(historyTimestamps ? { historyTimestamps } : {}),
+    ...(sessionHistoryTimestamps ? { sessionHistoryTimestamps } : {}),
+    commands,
+    phrases,
+  };
+}
+
+export function recordHistoryEntry(data: QuickData, text: string, sessionName?: string, now = Date.now()): QuickData {
   const trimmed = text.trim();
   if (!trimmed) return data;
-  const next: QuickData = {
-    ...data,
-    history: dedupPrepend(data.history, trimmed, GLOBAL_HISTORY_MAX),
-  };
+  const ts = validTimestamp(now) ?? Math.trunc(Date.now());
+  const nextHistory = dedupPrepend(data.history, trimmed, GLOBAL_HISTORY_MAX);
+  const nextHistoryTs = { ...data.historyTimestamps, [trimmed]: ts };
+  let nextSessionHistory = data.sessionHistory;
+  let nextSessionTs = data.sessionHistoryTimestamps;
   if (sessionName) {
     const prev = data.sessionHistory[sessionName] ?? [];
-    next.sessionHistory = {
+    nextSessionHistory = {
       ...data.sessionHistory,
       [sessionName]: dedupPrepend(prev, trimmed, SESSION_HISTORY_MAX),
     };
+    nextSessionTs = {
+      ...data.sessionHistoryTimestamps,
+      [sessionName]: {
+        ...(data.sessionHistoryTimestamps?.[sessionName] ?? {}),
+        [trimmed]: ts,
+      },
+    };
   }
-  return next;
+  return buildQuickDataWithPrunedTimestamps(
+    nextHistory,
+    nextSessionHistory,
+    nextHistoryTs,
+    nextSessionTs,
+    data.commands,
+    data.phrases,
+  );
 }
 
 export function getNavigableHistory(data: QuickData, sessionName?: string): string[] {
   if (!sessionName) return data.history;
   const sessionHist = data.sessionHistory[sessionName] ?? [];
   return sessionHist.length > 0 ? sessionHist : data.history;
+}
+
+export function getHistoryTimestamp(
+  data: QuickData,
+  text: string,
+  scope: HistoryScope,
+  sessionName?: string,
+): number | undefined {
+  if (scope === 'session') {
+    return sessionName ? validTimestamp(data.sessionHistoryTimestamps?.[sessionName]?.[text]) : undefined;
+  }
+  let latest = validTimestamp(data.historyTimestamps?.[text]);
+  if (data.sessionHistoryTimestamps) {
+    for (const sessionMap of Object.values(data.sessionHistoryTimestamps)) {
+      const candidate = validTimestamp(sessionMap?.[text]);
+      if (candidate !== undefined && (latest === undefined || candidate > latest)) {
+        latest = candidate;
+      }
+    }
+  }
+  return latest;
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, '0');
+}
+
+export function formatHistoryTimestamp(
+  ts: number | undefined,
+  now = Date.now(),
+): { short: string; full: string } | null {
+  if (typeof ts !== 'number' || !Number.isFinite(ts) || ts <= 0) return null;
+  const date = new Date(ts);
+  if (Number.isNaN(date.getTime())) return null;
+  const ref = new Date(now);
+  const yyyy = date.getFullYear();
+  const mm = pad2(date.getMonth() + 1);
+  const dd = pad2(date.getDate());
+  const hh = pad2(date.getHours());
+  const mi = pad2(date.getMinutes());
+  const ss = pad2(date.getSeconds());
+  const datePart = yyyy === ref.getFullYear() ? `${mm}-${dd}` : `${yyyy}-${mm}-${dd}`;
+  return {
+    short: `${datePart} ${hh}:${mi}`,
+    full: `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`,
+  };
 }
 
 export function getAccountHistory(data: QuickData): string[] {
@@ -86,7 +200,14 @@ export function getAccountHistory(data: QuickData): string[] {
   };
   append(data.history);
   for (const items of Object.values(data.sessionHistory)) append(items);
-  return merged;
+  // Sort timestamped entries newest-first while preserving insertion order for
+  // legacy untimestamped entries so multi-session Global history surfaces recent sends first.
+  const hasAnyTimestamp = merged.some((item) => getHistoryTimestamp(data, item, 'global') !== undefined);
+  if (!hasAnyTimestamp) return merged;
+  return merged
+    .map((item, idx) => ({ item, idx, ts: getHistoryTimestamp(data, item, 'global') ?? -1 }))
+    .sort((a, b) => (b.ts !== a.ts ? b.ts - a.ts : a.idx - b.idx))
+    .map((entry) => entry.item);
 }
 
 // ── Hook ──────────────────────────────────────────────────────────────────
@@ -133,12 +254,14 @@ export function normalizeQuickData(raw: unknown): QuickData {
       sessionHistory[session] = normalizeStringList(entries).slice(0, SESSION_HISTORY_MAX);
     }
   }
-  return {
-    history: normalizeStringList(data.history).slice(0, GLOBAL_HISTORY_MAX),
+  return buildQuickDataWithPrunedTimestamps(
+    normalizeStringList(data.history).slice(0, GLOBAL_HISTORY_MAX),
     sessionHistory,
-    commands: normalizeStringList(data.commands),
-    phrases: normalizeStringList(data.phrases),
-  };
+    data.historyTimestamps,
+    data.sessionHistoryTimestamps,
+    normalizeStringList(data.commands),
+    normalizeStringList(data.phrases),
+  );
 }
 
 function mergeLocalFirst(local: string[], server: string[], max: number): string[] {
@@ -151,6 +274,23 @@ function mergeLocalFirst(local: string[], server: string[], max: number): string
     if (merged.length >= max) break;
   }
   return merged;
+}
+
+function mergeTimestampRecords(
+  a?: Record<string, number>,
+  b?: Record<string, number>,
+): Record<string, number> | undefined {
+  if (!a && !b) return undefined;
+  const merged: Record<string, number> = {};
+  for (const src of [a, b]) {
+    if (!src) continue;
+    for (const [key, raw] of Object.entries(src)) {
+      const ts = validTimestamp(raw);
+      if (ts === undefined) continue;
+      merged[key] = merged[key] === undefined ? ts : Math.max(merged[key], ts);
+    }
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
 function unionServerLocal(server: string[], local: string[]): string[] {
@@ -166,15 +306,23 @@ function unionServerLocal(server: string[], local: string[]): string[] {
 
 function mergeQuickDataForHydration(server: QuickData, local: QuickData): QuickData {
   const sessionHistory: Record<string, string[]> = { ...server.sessionHistory };
+  const sessionTs: Record<string, Record<string, number>> = {};
   for (const session of new Set([...Object.keys(server.sessionHistory), ...Object.keys(local.sessionHistory)])) {
     sessionHistory[session] = mergeLocalFirst(local.sessionHistory[session] ?? [], server.sessionHistory[session] ?? [], SESSION_HISTORY_MAX);
+    const mergedMap = mergeTimestampRecords(
+      server.sessionHistoryTimestamps?.[session],
+      local.sessionHistoryTimestamps?.[session],
+    );
+    if (mergedMap) sessionTs[session] = mergedMap;
   }
-  return {
-    history: mergeLocalFirst(local.history, server.history, GLOBAL_HISTORY_MAX),
+  return buildQuickDataWithPrunedTimestamps(
+    mergeLocalFirst(local.history, server.history, GLOBAL_HISTORY_MAX),
     sessionHistory,
-    commands: unionServerLocal(server.commands, local.commands),
-    phrases: unionServerLocal(server.phrases, local.phrases),
-  };
+    mergeTimestampRecords(server.historyTimestamps, local.historyTimestamps),
+    sessionTs,
+    unionServerLocal(server.commands, local.commands),
+    unionServerLocal(server.phrases, local.phrases),
+  );
 }
 
 /**
@@ -353,20 +501,48 @@ const removePhrase = (phrase: string) => {
   updateQuickData((prev) => prev.phrases.includes(phrase) ? { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) } : prev);
 };
 const removeHistory = (text: string) => {
-  updateQuickData((prev) => prev.history.includes(text) ? { ...prev, history: prev.history.filter((h) => h !== text) } : prev);
+  updateQuickData((prev) => {
+    if (!prev.history.includes(text)) return prev;
+    return buildQuickDataWithPrunedTimestamps(
+      prev.history.filter((h) => h !== text),
+      prev.sessionHistory,
+      prev.historyTimestamps,
+      prev.sessionHistoryTimestamps,
+      prev.commands,
+      prev.phrases,
+    );
+  });
 };
 const removeSessionHistory = (sessionName: string, text: string) => {
   updateQuickData((prev) => {
     const sh = prev.sessionHistory[sessionName] ?? [];
     if (!sh.includes(text)) return prev;
-    return { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) } };
+    return buildQuickDataWithPrunedTimestamps(
+      prev.history,
+      { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) },
+      prev.historyTimestamps,
+      prev.sessionHistoryTimestamps,
+      prev.commands,
+      prev.phrases,
+    );
   });
 };
 const clearHistory = () => {
-  updateQuickData((prev) => prev.history.length === 0 ? prev : { ...prev, history: [] });
+  updateQuickData((prev) => prev.history.length === 0
+    ? prev
+    : buildQuickDataWithPrunedTimestamps([], prev.sessionHistory, undefined, prev.sessionHistoryTimestamps, prev.commands, prev.phrases));
 };
 const clearSessionHistory = (sessionName: string) => {
-  updateQuickData((prev) => (prev.sessionHistory[sessionName] ?? []).length === 0 ? prev : { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: [] } });
+  updateQuickData((prev) => (prev.sessionHistory[sessionName] ?? []).length === 0
+    ? prev
+    : buildQuickDataWithPrunedTimestamps(
+        prev.history,
+        { ...prev.sessionHistory, [sessionName]: [] },
+        prev.historyTimestamps,
+        prev.sessionHistoryTimestamps,
+        prev.commands,
+        prev.phrases,
+      ));
 };
 
 
@@ -481,6 +657,7 @@ export function QuickInputPanel({
   const editInputRef = useRef<HTMLInputElement>(null);
   const [historyPage, setHistoryPage] = useState(0);
   const [historyScope, setHistoryScope] = useState<HistoryScope>('session');
+  const [historySearch, setHistorySearch] = useState('');
   const [activeTab, setActiveTab] = useState<QpTab>('quick');
   const [rememberedMachineGroup, setMachineGroup] = useRememberedMachineGroup(open && activeTab === 'machines');
   const machineGroup = resolveMachineGroup(rememberedMachineGroup, machines);
@@ -519,8 +696,8 @@ export function QuickInputPanel({
   const [aliasSaving, setAliasSaving] = useState(false);
   const aliasNameInputRef = useRef<HTMLInputElement>(null);
 
-  // Reset page when scope or session changes
-  useEffect(() => { setHistoryPage(0); }, [historyScope, sessionName]);
+  // Reset page when scope, session, or history search filter changes
+  useEffect(() => { setHistoryPage(0); }, [historyScope, sessionName, historySearch]);
 
   // Refetch server aliases whenever the alias tab becomes visible (or the panel
   // opens on it), so aliases created elsewhere — e.g. by an agent via the
@@ -708,8 +885,13 @@ export function QuickInputPanel({
   const activeHistory = historyScope === 'session'
     ? (data.sessionHistory[sessionName] ?? [])
     : getAccountHistory(data);
-  const totalHistoryPages = Math.ceil(activeHistory.length / HISTORY_PAGE_SIZE);
-  const historySlice = activeHistory.slice(historyPage * HISTORY_PAGE_SIZE, (historyPage + 1) * HISTORY_PAGE_SIZE);
+  const normalizedHistoryQuery = historySearch.trim().toLowerCase();
+  const filteredHistory = normalizedHistoryQuery
+    ? activeHistory.filter((item) => item.toLowerCase().includes(normalizedHistoryQuery))
+    : activeHistory;
+  const totalHistoryPages = Math.ceil(filteredHistory.length / HISTORY_PAGE_SIZE);
+  const safeHistoryPage = totalHistoryPages > 0 ? Math.min(historyPage, totalHistoryPages - 1) : 0;
+  const historySlice = filteredHistory.slice(safeHistoryPage * HISTORY_PAGE_SIZE, (safeHistoryPage + 1) * HISTORY_PAGE_SIZE);
 
   const handleSelect = (text: string) => { onSelect(text); onClose(); };
   const handleSend = (text: string) => { onSend(text); onClose(); };
@@ -1062,13 +1244,22 @@ export function QuickInputPanel({
         {/* Alias tab — browse + create/edit/delete user aliases. Selecting one
             inserts its `;;(name)` marker (never the value). */}
         {activeTab === 'alias' && <>
-          <div class="qp-add-row">
+          <div class="qp-add-row qp-alias-search-row">
             <input
               class="qp-add-input"
               value={aliasSearch}
               onInput={(e) => setAliasSearch((e.target as HTMLInputElement).value)}
               placeholder={t('alias.search_placeholder')}
             />
+            {aliasSearch && (
+              <button
+                type="button"
+                class="qp-add-cancel qp-search-clear"
+                title={t('alias.cancel')}
+                onClick={() => setAliasSearch('')}
+              >✕</button>
+            )}
+            <span class="qp-alias-count">{filteredAliases.length}</span>
             <button class="qp-add-confirm" title={t('alias.add')} onClick={openAliasCreate}>＋</button>
           </div>
 
@@ -1104,7 +1295,7 @@ export function QuickInputPanel({
               />
               {aliasErrorText && <div class="qp-alias-error" role="alert">{aliasErrorText}</div>}
               <div class="qp-alias-form-actions">
-                <button class="qp-toolbar-btn" disabled={aliasSaving} onClick={() => { void commitAlias(); }}>{t('alias.save')}</button>
+                <button class="qp-toolbar-btn qp-toolbar-btn-primary" disabled={aliasSaving} onClick={() => { void commitAlias(); }}>{t('alias.save')}</button>
                 <button class="qp-toolbar-btn" onClick={closeAliasForm}>{t('alias.cancel')}</button>
               </div>
             </div>
@@ -1119,20 +1310,22 @@ export function QuickInputPanel({
               <div class="qp-alias-items">
                 {filteredAliases.map((a) => (
                   <span key={a.name} class="qp-pill qp-pill-custom qp-alias-item" title={a.description || a.name}>
-                    <span class="qp-pill-text" onClick={() => { onInsertAlias?.(a.name); onClose(); }}>{a.name}</span>
-                    {/* Desktop list view: truncated value + description + tags.
-                        Hidden on mobile (CSS), where the row collapses to a pill. */}
-                    <span class="qp-alias-item-meta">
-                      <span class="qp-alias-item-value">{a.value}</span>
-                      {a.description ? <span class="qp-alias-item-desc">{a.description}</span> : null}
-                      {a.tags && a.tags.length > 0 ? (
-                        <span class="qp-alias-item-tags">
-                          {a.tags.map((tg) => <span key={tg} class="qp-alias-tag">{tg}</span>)}
-                        </span>
-                      ) : null}
+                    <span class="qp-alias-item-row">
+                      <span class="qp-pill-text" onClick={() => { onInsertAlias?.(a.name); onClose(); }}>{a.name}</span>
+                      <span class="qp-alias-item-meta">
+                        <span class="qp-alias-item-value">{a.value}</span>
+                        {a.description ? <span class="qp-alias-item-desc">{a.description}</span> : null}
+                        {a.tags && a.tags.length > 0 ? (
+                          <span class="qp-alias-item-tags">
+                            {a.tags.map((tg) => <span key={tg} class="qp-alias-tag">{tg}</span>)}
+                          </span>
+                        ) : null}
+                      </span>
+                      <span class="qp-alias-item-actions">
+                        <button class="qp-pill-edit" title={t('alias.edit')} onClick={() => openAliasEdit(a.name)}>✎</button>
+                        <button class="qp-pill-del" title={t('alias.delete')} onClick={() => { void deleteAliasEntry(a.name); }}>✕</button>
+                      </span>
                     </span>
-                    <button class="qp-pill-edit" title={t('alias.edit')} onClick={() => openAliasEdit(a.name)}>✎</button>
-                    <button class="qp-pill-del" title={t('alias.delete')} onClick={() => { void deleteAliasEntry(a.name); }}>✕</button>
                   </span>
                 ))}
               </div>
@@ -1173,7 +1366,10 @@ export function QuickInputPanel({
           {/* Commands — pill wrap */}
           {loaded && (
             <>
-              <div class="qp-section-header">{t('quick_input.commands')}</div>
+              <div class="qp-section-header">
+                <span>{t('quick_input.commands')}</span>
+                <span class="qp-section-count">{defaultCmds.length + data.commands.length}</span>
+              </div>
               <div class="qp-pills">
                 {defaultCmds.map((cmd) => (
                   <button key={cmd} class="qp-pill qp-pill-default" onClick={() => handleSend(cmd)}>{cmd}</button>
@@ -1205,7 +1401,10 @@ export function QuickInputPanel({
           {/* Phrases — pill wrap */}
           {loaded && (
             <>
-              <div class="qp-section-header">{t('quick_input.phrases')}</div>
+              <div class="qp-section-header">
+                <span>{t('quick_input.phrases')}</span>
+                <span class="qp-section-count">{DEFAULT_QUICK_PHRASES.length + data.phrases.length}</span>
+              </div>
               <div class="qp-pills">
                 {DEFAULT_QUICK_PHRASES.map((phrase) => (
                   <button key={phrase} class="qp-pill qp-pill-default" onClick={() => handleSend(phrase)}>{phrase}</button>
@@ -1234,11 +1433,20 @@ export function QuickInputPanel({
             </>
           )}
 
-          {/* History — scope toggle + rows */}
+          {/* History — scope toggle + search + rows with last-sent timestamp */}
           {loaded && (
             <>
               <div class="qp-section-header qp-history-header">
-                <span>{t('quick_input.history')}</span>
+                <span class="qp-history-title-wrap">
+                  <span>{t('quick_input.history')}</span>
+                  <span class="qp-section-count">
+                    {normalizedHistoryQuery
+                      ? `${filteredHistory.length}/${activeHistory.length}`
+                      : historyScope === 'session'
+                        ? `${activeHistory.length}/${SESSION_HISTORY_MAX}`
+                        : `${activeHistory.length}`}
+                  </span>
+                </span>
                 <div class="qp-scope-toggle">
                   <button
                     class={`qp-scope-btn${historyScope === 'session' ? ' active' : ''}`}
@@ -1250,14 +1458,59 @@ export function QuickInputPanel({
                   >{t('quick_input.all')}</button>
                 </div>
               </div>
-              {historySlice.length > 0 ? historySlice.map((text, i) => (
-                <div key={historyPage * HISTORY_PAGE_SIZE + i} class="qp-item qp-item-history" onClick={() => handleSelect(text)} title={text.length > 60 ? text : undefined}>
-                  <span class="qp-item-text">{formatPreviewText(text, 60)}</span>
-                  <button class="qp-item-del" onClick={(e) => { e.stopPropagation(); handleRemoveItem(text); }}>✕</button>
+              {activeHistory.length > 0 && (
+                <div class="qp-history-search-row">
+                  <input
+                    class="qp-add-input qp-history-search-input"
+                    value={historySearch}
+                    onInput={(e) => setHistorySearch((e.target as HTMLInputElement).value)}
+                    placeholder={t('quick_input.search_history_placeholder')}
+                  />
+                  {historySearch && (
+                    <button
+                      type="button"
+                      class="qp-add-cancel qp-search-clear"
+                      onClick={() => setHistorySearch('')}
+                    >✕</button>
+                  )}
                 </div>
-              )) : (
+              )}
+              {historySlice.length > 0 ? historySlice.map((text, i) => {
+                const rawTs = getHistoryTimestamp(data, text, historyScope, sessionName);
+                const formattedTs = formatHistoryTimestamp(rawTs);
+                return (
+                  <div
+                    key={`${safeHistoryPage * HISTORY_PAGE_SIZE + i}:${text}`}
+                    class="qp-item qp-item-history"
+                    onClick={() => handleSelect(text)}
+                    title={text.length > 80 ? text : undefined}
+                  >
+                    <span class="qp-item-text">{formatPreviewText(text, 80)}</span>
+                    <span class="qp-item-meta">
+                      {formattedTs && (
+                        <time
+                          class="qp-item-time"
+                          dateTime={new Date(rawTs!).toISOString()}
+                          title={formattedTs.full}
+                        >
+                          {formattedTs.short}
+                        </time>
+                      )}
+                      <button
+                        type="button"
+                        class="qp-item-del"
+                        onClick={(e) => { e.stopPropagation(); handleRemoveItem(text); }}
+                      >✕</button>
+                    </span>
+                  </div>
+                );
+              }) : (
                 <div class="qp-history-empty">
-                  {historyScope === 'session' ? t('quick_input.no_history_session') : t('quick_input.no_history')}
+                  {normalizedHistoryQuery
+                    ? t('quick_input.no_history_matches')
+                    : historyScope === 'session'
+                      ? t('quick_input.no_history_session')
+                      : t('quick_input.no_history')}
                 </div>
               )}
             </>
@@ -1267,9 +1520,9 @@ export function QuickInputPanel({
         {/* Pagination */}
         {loaded && totalHistoryPages > 1 && (
           <div class="qp-pagination">
-            <button class="qp-page-btn" disabled={historyPage === 0} onClick={() => setHistoryPage((p) => p - 1)}>{t('quick_input.newer')}</button>
-            <span class="qp-page-info">{historyPage + 1} / {totalHistoryPages}</span>
-            <button class="qp-page-btn" disabled={historyPage >= totalHistoryPages - 1} onClick={() => setHistoryPage((p) => p + 1)}>{t('quick_input.older')}</button>
+            <button class="qp-page-btn" disabled={safeHistoryPage === 0} onClick={() => setHistoryPage((p) => Math.max(0, p - 1))}>{t('quick_input.newer')}</button>
+            <span class="qp-page-info">{safeHistoryPage + 1} / {totalHistoryPages}</span>
+            <button class="qp-page-btn" disabled={safeHistoryPage >= totalHistoryPages - 1} onClick={() => setHistoryPage((p) => Math.min(totalHistoryPages - 1, p + 1))}>{t('quick_input.older')}</button>
           </div>
         )}
         </>}

@@ -121,6 +121,8 @@ export interface DbSession {
 export interface QuickData {
   history: string[];
   sessionHistory?: Record<string, string[]>;
+  historyTimestamps?: Record<string, number>;
+  sessionHistoryTimestamps?: Record<string, Record<string, number>>;
   commands: string[];
   phrases: string[];
 }

@@ -1246,7 +1246,9 @@
     "verification_reference": "승인된 검증 장치 \"{{alias}}\"(verificationMachineId: {{id}}, 대상: {{target}})로 실기기 테스트를 수행하세요.",
     "verification_add": "기존 소스에서 승인",
     "verification_authorize_alias": "별칭: {{name}}",
-    "verification_authorize_node": "제어 노드: {{name}}"
+    "verification_authorize_node": "제어 노드: {{name}}",
+    "search_history_placeholder": "기록 필터…",
+    "no_history_matches": "일치하는 기록이 없습니다"
   },
   "file_browser": {
     "title_dir": "디렉토리 선택",

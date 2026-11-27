@@ -216,4 +216,24 @@ describe('QuickInputPanel — 别名 tab', () => {
     // Focus must remain on the value field — not stolen back to the name input.
     expect(document.activeElement).toBe(valueInput);
   });
+
+  it('renders upgraded alias search counter, clear control, and structured item actions container', async () => {
+    store = [
+      { name: 'alpha', value: 'ssh 1.2.3.4', description: 'box 1', tags: ['ops'], createdAt: '', updatedAt: '', source: 'web' },
+      { name: 'beta', value: 'ssh 5.6.7.8', description: 'box 2', tags: [], createdAt: '', updatedAt: '', source: 'web' },
+    ];
+    render(<QuickInputPanel {...baseProps()} />);
+    fireEvent.click(aliasTabButton());
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('2'));
+    expect(root().querySelectorAll('.qp-alias-item-row')).toHaveLength(2);
+    expect(root().querySelectorAll('.qp-alias-item-actions')).toHaveLength(2);
+
+    const search = root().querySelector('.qp-alias-search-row input') as HTMLInputElement;
+    fireEvent.input(search, { target: { value: 'alpha' } });
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('1'));
+    const clearBtn = root().querySelector('.qp-alias-search-row .qp-search-clear') as HTMLButtonElement;
+    expect(clearBtn).not.toBeNull();
+    fireEvent.click(clearBtn);
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('2'));
+  });
 });

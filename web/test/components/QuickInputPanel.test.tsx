@@ -25,6 +25,8 @@ vi.mock('react-i18next', () => ({
         'quick_input.all': 'All',
         'quick_input.no_history_session': 'No session history',
         'quick_input.no_history': 'No history',
+        'quick_input.no_history_matches': 'No matching history',
+        'quick_input.search_history_placeholder': 'Filter history…',
         'quick_input.newer': 'Newer',
         'quick_input.older': 'Older',
         'quick_input.confirm_delete': 'Delete?',
@@ -48,7 +50,17 @@ vi.mock('../../src/api.js', () => ({
   apiFetch: (...args: unknown[]) => apiFetchMock(...args),
 }));
 
-import { QuickInputPanel, useQuickData, __resetQuickDataForTests, type QuickData } from '../../src/components/QuickInputPanel.js';
+import {
+  QuickInputPanel,
+  useQuickData,
+  __resetQuickDataForTests,
+  recordHistoryEntry,
+  formatHistoryTimestamp,
+  getHistoryTimestamp,
+  SESSION_HISTORY_MAX,
+  GLOBAL_HISTORY_MAX,
+  type QuickData,
+} from '../../src/components/QuickInputPanel.js';
 import { AGY_SDK_PROVIDER_ID } from '../../../shared/agy-agent.js';
 
 describe('QuickInputPanel history scope', () => {
@@ -687,6 +699,131 @@ describe('QuickInputPanel history scope', () => {
     expect(commands).not.toContain('/compact');
     expect(commands).not.toContain('/thinking');
   });
+
+  it('caps global and per-session history at 200 entries and prunes evicted timestamps', () => {
+    expect(SESSION_HISTORY_MAX).toBe(200);
+    expect(GLOBAL_HISTORY_MAX).toBe(200);
+    let data: QuickData = { history: [], sessionHistory: {}, commands: [], phrases: [] };
+    for (let i = 0; i < 205; i++) {
+      data = recordHistoryEntry(data, `entry-${i}`, 'sess-a', 1_700_000_000_000 + i * 1000);
+    }
+    expect(data.history).toHaveLength(200);
+    expect(data.history[0]).toBe('entry-204');
+    expect(data.history[199]).toBe('entry-5');
+    expect(data.sessionHistory['sess-a']).toHaveLength(200);
+    expect(Object.keys(data.historyTimestamps ?? {})).toHaveLength(200);
+    expect(data.historyTimestamps?.['entry-0']).toBeUndefined();
+    expect(data.historyTimestamps?.['entry-204']).toBe(1_700_000_204_000);
+    expect(Object.keys(data.sessionHistoryTimestamps?.['sess-a'] ?? {})).toHaveLength(200);
+    expect(data.sessionHistoryTimestamps?.['sess-a']?.['entry-4']).toBeUndefined();
+
+    // Re-sending an older entry moves it to front and updates its timestamp.
+    data = recordHistoryEntry(data, 'entry-10', 'sess-a', 1_700_000_999_000);
+    expect(data.history[0]).toBe('entry-10');
+    expect(data.historyTimestamps?.['entry-10']).toBe(1_700_000_999_000);
+    expect(data.sessionHistoryTimestamps?.['sess-a']?.['entry-10']).toBe(1_700_000_999_000);
+  });
+
+  it('formats same-year vs cross-year timestamps and renders last-sent date & time per scope without crashing on legacy items', () => {
+    const now = new Date(2026, 10, 28, 12, 0, 0).getTime();
+    const sameYearTs = new Date(2026, 10, 28, 4, 9, 5).getTime();
+    const prevYearTs = new Date(2025, 11, 31, 23, 59, 12).getTime();
+
+    expect(formatHistoryTimestamp(sameYearTs, now)).toEqual({ short: '11-28 04:09', full: '2026-11-28 04:09:05' });
+    expect(formatHistoryTimestamp(prevYearTs, now)).toEqual({ short: '2025-12-31 23:59', full: '2025-12-31 23:59:12' });
+    expect(formatHistoryTimestamp(undefined, now)).toBeNull();
+    expect(formatHistoryTimestamp(0, now)).toBeNull();
+    expect(formatHistoryTimestamp(Number.NaN, now)).toBeNull();
+
+    const tsA = new Date(new Date().getFullYear(), 0, 15, 9, 30, 0).getTime();
+    const tsB = new Date(new Date().getFullYear(), 0, 16, 18, 45, 0).getTime();
+    const expectedA = formatHistoryTimestamp(tsA)!.short;
+    const expectedB = formatHistoryTimestamp(tsB)!.short;
+
+    const data: QuickData = {
+      history: ['shared', 'legacy-no-ts'],
+      sessionHistory: {
+        'session-a': ['shared', 'legacy-no-ts'],
+        'session-b': ['shared'],
+      },
+      historyTimestamps: { shared: tsB },
+      sessionHistoryTimestamps: {
+        'session-a': { shared: tsA },
+        'session-b': { shared: tsB },
+      },
+      commands: [],
+      phrases: [],
+    };
+
+    expect(getHistoryTimestamp(data, 'shared', 'session', 'session-a')).toBe(tsA);
+    expect(getHistoryTimestamp(data, 'shared', 'global', 'session-a')).toBe(tsB);
+
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="codex-sdk"
+        sessionName="session-a"
+        data={data}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    const rowsSession = Array.from(document.querySelectorAll('.qp-item-history'));
+    expect(rowsSession).toHaveLength(2);
+    expect(rowsSession[0].querySelector('.qp-item-time')?.textContent).toBe(expectedA);
+    expect(rowsSession[1].querySelector('.qp-item-time')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'All' }));
+    const rowsGlobal = Array.from(document.querySelectorAll('.qp-item-history'));
+    expect(rowsGlobal[0].querySelector('.qp-item-time')?.textContent).toBe(expectedB);
+  });
+
+  it('filters history with search input and paginates beyond 50 items up to 200', () => {
+    const items = Array.from({ length: 120 }, (_, i) => (i === 115 ? 'needle target command' : `hist item ${i + 1}`));
+    render(
+      <QuickInputPanel
+        open
+        onClose={vi.fn()}
+        onSelect={vi.fn()}
+        onSend={vi.fn()}
+        agentType="codex-sdk"
+        sessionName="session-a"
+        data={{ history: items, sessionHistory: { 'session-a': items }, commands: [], phrases: [] }}
+        loaded
+        onAddCommand={vi.fn()}
+        onAddPhrase={vi.fn()}
+        onRemoveCommand={vi.fn()}
+        onRemovePhrase={vi.fn()}
+        onRemoveHistory={vi.fn()}
+        onRemoveSessionHistory={vi.fn()}
+        onClearHistory={vi.fn()}
+        onClearSessionHistory={vi.fn()}
+      />,
+    );
+
+    expect(document.querySelector('.qp-page-info')?.textContent).toBe('1 / 12');
+    expect(document.querySelector('.qp-history-header .qp-section-count')?.textContent).toBe('120/200');
+
+    const filterInput = document.querySelector('.qp-history-search-input') as HTMLInputElement;
+    fireEvent.input(filterInput, { target: { value: 'needle' } });
+    expect(screen.getByText('needle target command')).toBeDefined();
+    expect(document.querySelector('.qp-page-info')).toBeNull();
+    expect(document.querySelector('.qp-history-header .qp-section-count')?.textContent).toBe('1/120');
+
+    fireEvent.input(filterInput, { target: { value: 'no-such-match-xyz' } });
+    expect(screen.getByText('No matching history')).toBeDefined();
+  });
 });
 
 describe('useQuickData persistence guard', () => {
@@ -992,5 +1129,65 @@ describe('useQuickData persistence guard', () => {
     vi.advanceTimersByTime(2000);
     await Promise.resolve();
     expect(apiFetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('merges historyTimestamps by newest epoch on hydration and prunes timestamps on remove/clear', async () => {
+    let resolveGet!: (value: unknown) => void;
+    apiFetchMock.mockReturnValueOnce(new Promise((resolve) => { resolveGet = resolve; }));
+    apiFetchMock.mockResolvedValue({ ok: true });
+
+    let latest!: ReturnType<typeof useQuickData>;
+    function TsHarness() {
+      latest = useQuickData();
+      return <div data-testid="loaded">{String(latest.loaded)}</div>;
+    }
+
+    render(<TsHarness />);
+    vi.setSystemTime(new Date(2026, 10, 28, 4, 30, 0));
+    act(() => {
+      latest.recordHistory('shared cmd', 'deck_proj_brain');
+    });
+    const localTs = new Date(2026, 10, 28, 4, 30, 0).getTime();
+
+    await act(async () => {
+      resolveGet({
+        data: {
+          history: ['shared cmd', 'older cmd'],
+          sessionHistory: { deck_proj_brain: ['shared cmd', 'older cmd'] },
+          historyTimestamps: { 'shared cmd': 1_700_000_000_000, 'older cmd': 1_699_999_000_000 },
+          sessionHistoryTimestamps: { deck_proj_brain: { 'shared cmd': 1_700_000_000_000, 'older cmd': 1_699_999_000_000 } },
+          commands: [],
+          phrases: [],
+        },
+      });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(screen.getByTestId('loaded').textContent).toBe('true'));
+    expect(latest.data.historyTimestamps).toEqual({
+      'shared cmd': localTs,
+      'older cmd': 1_699_999_000_000,
+    });
+    expect(latest.data.sessionHistoryTimestamps?.deck_proj_brain).toEqual({
+      'shared cmd': localTs,
+      'older cmd': 1_699_999_000_000,
+    });
+
+    act(() => {
+      latest.removeSessionHistory('deck_proj_brain', 'older cmd');
+    });
+    expect(latest.data.sessionHistoryTimestamps?.deck_proj_brain).toEqual({ 'shared cmd': localTs });
+
+    act(() => {
+      latest.removeHistory('shared cmd');
+    });
+    expect(latest.data.historyTimestamps).toEqual({ 'older cmd': 1_699_999_000_000 });
+
+    act(() => {
+      latest.clearSessionHistory('deck_proj_brain');
+      latest.clearHistory();
+    });
+    expect(latest.data.historyTimestamps).toBeUndefined();
+    expect(latest.data.sessionHistoryTimestamps).toBeUndefined();
   });
 });
