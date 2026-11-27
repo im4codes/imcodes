@@ -857,7 +857,7 @@ function Write-Note($m) { Write-Host "    $m" }
 ${addPathMatch![0]}
 
 function Run-OcScenario([string]$CaseDir, [string]$Mode) {
-  $origPath = $env:Path
+  $origPath = $env:PATH
   $origProfile = $env:USERPROFILE
   $origSkip = $env:IMCODES_SKIP_OPENCODE
   try {
@@ -869,11 +869,12 @@ function Run-OcScenario([string]$CaseDir, [string]$Mode) {
     $script:LastPrefix = ''
     $npmExe = Join-Path $CaseDir 'fake-npm.ps1'
     if ($Mode -eq 'fail-npm') {
-      Set-Content $npmExe 'param([Parameter(ValueFromRemainingArguments=$true)]$a) "npm $($a -join \" \")" | Add-Content "' + $npmLog + '"; $global:LASTEXITCODE = 2'
+      Set-Content -Path $npmExe -Value ("param([Parameter(ValueFromRemainingArguments=\`$true)]\`$a) Add-Content -Path '$npmLog' -Value (\`"npm \`" + (\`$a -join ' ')); \`$global:LASTEXITCODE = 2")
     } elseif ($Mode -eq 'fake-ok') {
-      Set-Content $npmExe 'param([Parameter(ValueFromRemainingArguments=$true)]$a) if ($a[0] -eq "prefix") { Write-Output "' + (Join-Path $CaseDir 'empty-pref') + '" }; $global:LASTEXITCODE = 0'
+      $emptyPref = Join-Path $CaseDir 'empty-pref'
+      Set-Content -Path $npmExe -Value ("param([Parameter(ValueFromRemainingArguments=\`$true)]\`$a) if (\`$a[0] -eq 'prefix') { Write-Output '$emptyPref' }; \`$global:LASTEXITCODE = 0")
     } else {
-      Set-Content $npmExe 'param([Parameter(ValueFromRemainingArguments=$true)]$a) "npm $($a -join \" \")" | Add-Content "' + $npmLog + '"; $global:LASTEXITCODE = 0'
+      Set-Content -Path $npmExe -Value ("param([Parameter(ValueFromRemainingArguments=\`$true)]\`$a) Add-Content -Path '$npmLog' -Value (\`"npm \`" + (\`$a -join ' ')); \`$global:LASTEXITCODE = 0")
     }
     if ($Mode -eq 'path-bad-ver') {
       $ocName = if ($IsWindows -or -not $PSVersionTable.Platform -or $PSVersionTable.Platform -eq 'Win32NT') { 'opencode.cmd' } else { 'opencode' }
@@ -886,12 +887,15 @@ function Run-OcScenario([string]$CaseDir, [string]$Mode) {
       }
     }
     $sep = [System.IO.Path]::PathSeparator
-    $env:Path = @($binDir, '/usr/bin', '/bin') -join $sep
+    $newPath = @($binDir, '/usr/bin', '/bin') -join $sep
+    $env:PATH = $newPath
+    $env:Path = $newPath
     $npmRegistry = 'https://registry.npmjs.org/'
     $skipOpenCodeEffective = $false
     ${ocBlockMatch![0]}
     Write-Output "MODE=$Mode STATUS=$openCodeStatus RESOLVED=$($(Get-Command opencode -ErrorAction SilentlyContinue | ForEach-Object Source) -join '')"
   } finally {
+    $env:PATH = $origPath
     $env:Path = $origPath
     $env:USERPROFILE = $origProfile
     $env:IMCODES_SKIP_OPENCODE = $origSkip

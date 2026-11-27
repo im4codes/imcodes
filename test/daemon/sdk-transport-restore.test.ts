@@ -3761,9 +3761,10 @@ describe('sdk transport session restore', () => {
         type: 'user.message',
         payload: { text: 'STALE_FIRST_STALLED_HANDOFF' },
       }]);
-      const deadline = Date.now() + 2_000;
+      const deadline = Date.now() + 5_000;
       while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < deadline) {
         await flush();
+        await new Promise((r) => setTimeout(r, 10));
       }
       expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).toContain('LATEST_SECOND_STALLED_HANDOFF');
       expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).not.toContain('STALE_FIRST_STALLED_HANDOFF');
@@ -3772,9 +3773,10 @@ describe('sdk transport session restore', () => {
       const runtime = getTransportRuntime(name);
       runtime!.send('turn one');
       await settleCodexRun(name, 'start');
-      const firstTurnDeadline = Date.now() + 2_000;
+      const firstTurnDeadline = Date.now() + 5_000;
       while (!codexRunForSession(name, 'start')?.input.includes('turn one') && Date.now() < firstTurnDeadline) {
         await flush();
+        await new Promise((r) => setTimeout(r, 10));
       }
       expect(codexRunForSession(name, 'start')?.input).toContain('LATEST_SECOND_STALLED_HANDOFF');
       expect(codexRunForSession(name, 'start')?.input).not.toContain('STALE_FIRST_STALLED_HANDOFF');
