@@ -832,9 +832,11 @@ export class DeepseekHarnessProvider implements TransportProvider {
         state.compacting = event.active;
         if (event.active) {
           this.emitStatus(sessionId, state, { status: 'compacting', label: 'Compacting conversation...' });
+        } else if (event.committed) {
+          this.refreshSessionSystemText(sessionId);
+          this.emitStatus(sessionId, state, { status: null, label: null, compactionOutcome: 'committed' });
         } else {
-          if (event.committed) this.refreshSessionSystemText(sessionId);
-          this.clearStatus(sessionId, state);
+          this.emitStatus(sessionId, state, { status: null, label: null, compactionOutcome: 'failed' });
         }
         return;
       case DSH_BRIDGE_EVENT.TURN_END:
@@ -967,7 +969,11 @@ export class DeepseekHarnessProvider implements TransportProvider {
     state: DeepseekHarnessSessionState,
     status: ProviderStatusUpdate,
   ): void {
-    const signature = JSON.stringify({ status: status.status, label: status.label ?? null });
+    const signature = JSON.stringify({
+      status: status.status,
+      label: status.label ?? null,
+      compactionOutcome: status.compactionOutcome ?? null,
+    });
     if (state.lastStatusSignature === signature) return;
     state.lastStatusSignature = signature;
     for (const cb of this.statusCallbacks) cb(sessionId, status);

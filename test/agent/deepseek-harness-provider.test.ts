@@ -478,13 +478,13 @@ describe('DeepseekHarnessProvider', () => {
     expect(statuses).toEqual([
       { status: 'working', label: null },
       { status: 'compacting', label: 'Compacting conversation...' },
-      { status: null, label: null },
+      { status: null, label: null, compactionOutcome: 'failed' },
       { status: 'compacting', label: 'Compacting conversation...' },
       { status: null, label: null },
     ]);
   });
 
-  it('prevents aborted compaction from leaking across TransportSessionRuntime turns while reinjecting after normal compaction', async () => {
+  it('distinguishes failed summary vs committed compaction across TransportSessionRuntime completion, error, and cancel', async () => {
     const runtime = new TransportSessionRuntime(provider, 'deck_dsh_runtime_compaction');
     const refreshSpy = vi.spyOn(provider, 'refreshSessionSystemText');
     try {
@@ -494,31 +494,63 @@ describe('DeepseekHarnessProvider', () => {
         identityPrompt: 'CONTRACT_SURVIVES',
       });
 
-      // Turn 1: starts compacting, then fails with error (uncommitted compaction).
+      // Turn 1: initial turn establishes baseline injected identity.
       runtime.send('turn 1', 'm1');
-      await vi.waitFor(() => expect(child.commands().some((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toBe(true), { timeout: 2_000 });
-      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
-      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false });
-      child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.ERROR, message: 'turn failed' });
+      await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(1), { timeout: 2_000 });
+      expect((child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT).at(-1) as { text?: string })?.text).toContain('CONTRACT_SURVIVES');
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'ok-1' });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
       await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
 
-      // Turn 2: ordinary completion must NOT inherit Turn 1's compacting observation.
+      // Turn 2: compaction starts, summary fails (committed omitted), then normal reply completes -> MUST NOT refresh!
       runtime.send('turn 2', 'm2');
       await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(2), { timeout: 2_000 });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false });
       child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'ok-2' });
       child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
       await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
       expect(refreshSpy).not.toHaveBeenCalled();
 
-      // Turn 3: normal compaction commits and completes -> reinjectAfterCompaction calls refreshSessionSystemText.
+      // Turn 3: confirms Turn 2 did NOT invalidate runtime/provider caches (no redundant re-injection),
+      // then commits compaction cleanly and completes normally -> reinjectAfterCompaction fires.
       runtime.send('turn 3', 'm3');
       await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(3), { timeout: 2_000 });
+      expect((child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT).at(-1) as { text?: string })?.text).not.toContain('CONTRACT_SURVIVES');
       child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
       child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false, committed: true });
       child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'ok-3' });
       child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
       await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
       expect(refreshSpy).toHaveBeenCalledTimes(2);
+
+      // Turn 4: receives full re-injection, then compaction commits and the turn FAILS -> runtime caches still invalidate!
+      refreshSpy.mockClear();
+      runtime.send('turn 4', 'm4');
+      await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(4), { timeout: 2_000 });
+      expect((child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT).at(-1) as { text?: string })?.text).toContain('CONTRACT_SURVIVES');
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false, committed: true });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.ERROR, message: 'turn failed' });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
+      // Called once on committed compaction end + once by runtime.reinjectAfterCompaction in clearActiveDispatchOwner.
+      expect(refreshSpy).toHaveBeenCalledTimes(2);
+
+      // Turn 5: receives full re-injection after Turn 4 failure, then commits compaction and gets CANCELLED -> still invalidates!
+      refreshSpy.mockClear();
+      runtime.send('turn 5', 'm5');
+      await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(5), { timeout: 2_000 });
+      expect((child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT).at(-1) as { text?: string })?.text).toContain('CONTRACT_SURVIVES');
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false, committed: true });
+      await flush();
+      await runtime.cancel();
+      expect(refreshSpy).toHaveBeenCalledTimes(2);
+
+      // Turn 6: receives full re-injection again after Turn 5 cancel.
+      runtime.send('turn 6', 'm6');
+      await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(6), { timeout: 2_000 });
+      expect((child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT).at(-1) as { text?: string })?.text).toContain('CONTRACT_SURVIVES');
     } finally {
       await runtime.kill();
     }

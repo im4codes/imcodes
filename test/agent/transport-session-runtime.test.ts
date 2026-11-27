@@ -298,6 +298,24 @@ describe('TransportSessionRuntime memory provenance', () => {
         complete(turnDone('turn-d', 10_000));
         await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
         expect(provider.refreshSessionSystemText).not.toHaveBeenCalled();
+
+        // Turn E observes explicit compactionOutcome: 'failed', then completes normally -> must NOT refresh.
+        runtime.send('turn E', 'work-e');
+        await vi.waitFor(() => expect(provider.send).toHaveBeenCalledTimes(5), { timeout: 2_000 });
+        const statusFn = (provider as unknown as { __status?: (sid: string, update: ProviderStatusUpdate) => void }).__status;
+        statusFn?.('provider-session-1', { status: 'compacting' });
+        statusFn?.('provider-session-1', { status: null, label: null, compactionOutcome: 'failed' });
+        complete(turnDone('turn-e', 10_000));
+        await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
+        expect(provider.refreshSessionSystemText).not.toHaveBeenCalled();
+
+        // Turn F observes explicit compactionOutcome: 'committed', then errors -> runtime caches STILL invalidate.
+        runtime.send('turn F', 'work-f');
+        await vi.waitFor(() => expect(provider.send).toHaveBeenCalledTimes(6), { timeout: 2_000 });
+        statusFn?.('provider-session-1', { status: 'compacting' });
+        statusFn?.('provider-session-1', { status: null, label: null, compactionOutcome: 'committed' });
+        fail({ code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'post-compact failure', recoverable: true });
+        expect(provider.refreshSessionSystemText).toHaveBeenCalledTimes(1);
       } finally {
         await runtime.kill();
       }

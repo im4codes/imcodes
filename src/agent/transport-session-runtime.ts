@@ -790,8 +790,12 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _recoverableDispatchRetries = 0;
   /** When this runtime last compacted on its own (see maybeAutoCompact). */
   private _lastAutoCompactAt = 0;
-  /** The provider reported compacting during the active foreground dispatch/generation. */
-  private _compactionObservedDispatch: { dispatchId: number | null; generation: number } | null = null;
+  /** The provider reported compacting or a compaction outcome during the active foreground dispatch/generation. */
+  private _compactionObservedDispatch: {
+    dispatchId: number | null;
+    generation: number;
+    outcome: 'inferred' | 'committed';
+  } | null = null;
   // Pending backoff timer for the next auto-retry drain. While set, the session
   // counts as having active turn work (so new sends queue in order behind the
   // message being retried) and presents an in-progress status, not idle.
@@ -948,7 +952,6 @@ export class TransportSessionRuntime implements SessionRuntime {
             providerAccepted: true,
             reason: 'provider_complete_after_cancel',
           });
-          this.consumeCompactionObservedForActiveDispatch();
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
           this._activeTurn = null;
@@ -959,6 +962,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           if (this._activeDispatchId !== null) {
             this.clearDispatchCancellationState(this._activeDispatchId);
           }
+          // Settles any committed compaction before clearing dispatch ownership and draining queued turns.
           this.clearActiveDispatchOwner();
           this._activeDispatchStaleRecoveryStarted = false;
           if (!this._drainPending()) {
@@ -1234,12 +1238,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
         const activity = this.getActivitySnapshot();
-        // Providers also compact on their own mid-turn (Claude's
-        // compact_boundary, Codex's inline auto-compaction, including
-        // provider-initiated foreground turns such as retained task wakes).
-        // Bind observation to the active dispatch/generation when live
-        // foreground work exists, so idle late frames or cancelled/failed turns
-        // cannot leak into the next turn.
+        // Providers either report an explicit compactionOutcome (`committed` vs
+        // `failed`) or only emit `status: 'compacting'` (legacy inference,
+        // including provider-initiated foreground turns such as retained task
+        // wakes). Bind the state to the active dispatch/generation while live
+        // foreground work exists so cancel, error, idle late frames, or a
+        // failed summary cannot misclassify an unrelated turn.
         const hasProviderForegroundWork = activity.blockingWorkCount > 0
           && !!activity.providerSnapshot
           && !this.hasLocallyCancelledActivityGeneration(activity.providerSnapshot);
@@ -1250,11 +1254,28 @@ export class TransportSessionRuntime implements SessionRuntime {
           && !this._stopQueueBarrier
           && this._recoverableRetryTimer === null
           && this._capacityRetryTimer === null;
-        if (status?.status === 'compacting' && hasLiveForegroundTurn) {
-          this._compactionObservedDispatch = {
-            dispatchId: this._activeDispatchId,
-            generation: this._activityGeneration,
-          };
+        if (hasLiveForegroundTurn) {
+          const sameActive = this._compactionObservedDispatch?.dispatchId === this._activeDispatchId
+            && this._compactionObservedDispatch?.generation === this._activityGeneration;
+          if (status?.compactionOutcome === 'committed') {
+            this._compactionObservedDispatch = {
+              dispatchId: this._activeDispatchId,
+              generation: this._activityGeneration,
+              outcome: 'committed',
+            };
+          } else if (status?.compactionOutcome === 'failed') {
+            if (!sameActive || this._compactionObservedDispatch?.outcome !== 'committed') {
+              this._compactionObservedDispatch = null;
+            }
+          } else if (status?.status === 'compacting') {
+            if (!sameActive || this._compactionObservedDispatch?.outcome !== 'committed') {
+              this._compactionObservedDispatch = {
+                dispatchId: this._activeDispatchId,
+                generation: this._activityGeneration,
+                outcome: 'inferred',
+              };
+            }
+          }
         }
         const canKeepActive = this.hasActiveTurnWork() || activity.backgroundKeepsSessionRunning;
         if (!this._activeDispatchCancelled && status?.status && canKeepActive) {
@@ -6126,7 +6147,9 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   private clearInferredCompactionObservation(): void {
-    this._compactionObservedDispatch = null;
+    if (this._compactionObservedDispatch?.outcome !== 'committed') {
+      this._compactionObservedDispatch = null;
+    }
   }
 
   private consumeCompactionObservedForActiveDispatch(): boolean {
@@ -6143,7 +6166,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.retireExternalCompletionGrace(dispatchId);
     const targetDispatchId = dispatchId ?? this._activeDispatchId;
     if (this._compactionObservedDispatch?.dispatchId === targetDispatchId) {
+      const committedBeforeSettle = this._compactionObservedDispatch.outcome === 'committed'
+        && this._compactionObservedDispatch.generation === this._activityGeneration;
       this._compactionObservedDispatch = null;
+      if (committedBeforeSettle) {
+        this.reinjectAfterCompaction();
+      }
     }
     if (dispatchId === null || this._activeDispatchId === dispatchId) {
       this._activeDispatchId = null;

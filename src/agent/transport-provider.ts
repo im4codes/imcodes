@@ -522,6 +522,12 @@ export interface ProviderStatusUpdate {
   status: string | null;
   /** Human-readable label shown in the footer/status line. Null clears the label. */
   label?: string | null;
+  /**
+   * Explicit outcome of a provider-reported compaction bracket when the SDK
+   * exposes it (`committed` invalidates runtime injection caches even if the
+   * turn later fails/cancels; `failed` clears optimistic compacting state).
+   */
+  compactionOutcome?: 'committed' | 'failed';
 }
 
 /** Evidence passed from a transport runtime to a provider rollout backstop. */
