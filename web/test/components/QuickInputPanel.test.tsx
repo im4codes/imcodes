@@ -54,9 +54,12 @@ import {
   QuickInputPanel,
   useQuickData,
   __resetQuickDataForTests,
+  __simulateReloadForTests,
   recordHistoryEntry,
   formatHistoryTimestamp,
   getHistoryTimestamp,
+  getAccountHistory,
+  mergeQuickDataForHydration,
   SESSION_HISTORY_MAX,
   GLOBAL_HISTORY_MAX,
   type QuickData,
@@ -1189,5 +1192,195 @@ describe('useQuickData persistence guard', () => {
     });
     expect(latest.data.historyTimestamps).toBeUndefined();
     expect(latest.data.sessionHistoryTimestamps).toBeUndefined();
+  });
+
+  it('keeps "All" capped at 200 items across two sessions and aligns "All" vs "This Session" delete/clear scopes', async () => {
+    const items200 = Array.from({ length: 200 }, (_, i) => `global-${i}`);
+    const data201: QuickData = {
+      history: items200,
+      sessionHistory: { 'sess-b': ['from-sess-b'] },
+      historyTimestamps: Object.fromEntries(items200.map((k, i) => [k, 1_700_000_000_000 + (200 - i) * 1000])),
+      sessionHistoryTimestamps: { 'sess-b': { 'from-sess-b': 1_700_000_000_000 } },
+      commands: [],
+      phrases: [],
+    };
+    const accountList = getAccountHistory(data201);
+    expect(accountList).toHaveLength(200);
+
+    // Interactive end-to-end delete/clear check through real useQuickData + QuickInputPanel:
+    const tsA = 1_700_001_000_000;
+    const tsB = 1_700_002_000_000;
+    apiFetchMock.mockImplementation(async (url: string) => {
+      if (url === '/api/quick-data') {
+        return {
+          data: {
+            history: ['global-only'],
+            sessionHistory: {
+              'sess-a': ['a-only'],
+              'sess-b': ['b-only'],
+            },
+            historyTimestamps: { 'global-only': 1_700_000_500_000 },
+            sessionHistoryTimestamps: {
+              'sess-a': { 'a-only': tsA },
+              'sess-b': { 'b-only': tsB },
+            },
+            commands: [],
+            phrases: [],
+          },
+        };
+      }
+      if (url === '/api/aliases') return { aliases: [] };
+      return { ok: true };
+    });
+
+    function ScopedHarness({ sessionName }: { sessionName: string }) {
+      const quick = useQuickData();
+      return (
+        <QuickInputPanel
+          open
+          onClose={vi.fn()}
+          onSelect={vi.fn()}
+          onSend={vi.fn()}
+          agentType="codex-sdk"
+          sessionName={sessionName}
+          data={quick.data}
+          loaded={quick.loaded}
+          onAddCommand={quick.addCommand}
+          onAddPhrase={quick.addPhrase}
+          onRemoveCommand={quick.removeCommand}
+          onRemovePhrase={quick.removePhrase}
+          onRemoveHistory={quick.removeHistory}
+          onRemoveSessionHistory={quick.removeSessionHistory}
+          onClearHistory={quick.clearHistory}
+          onClearSessionHistory={quick.clearSessionHistory}
+        />
+      );
+    }
+
+    render(<ScopedHarness sessionName="sess-a" />);
+    await waitFor(() => expect(screen.getByText('a-only')).toBeDefined());
+
+    // Clear "This Session" (sess-a) -> removes ONLY a-only, keeps b-only and global-only in "All".
+    fireEvent.click(screen.getByRole('button', { name: 'Clear history' }));
+    expect(screen.getByText('No session history')).toBeDefined();
+
+    fireEvent.click(screen.getByRole('button', { name: 'All' }));
+    expect(screen.getByText('b-only')).toBeDefined();
+    expect(screen.getByText('global-only')).toBeDefined();
+
+    // Deleting 'b-only' in "All" removes it from sessionHistory['sess-b'] too (not stuck visible).
+    const rowB = screen.getByText('b-only').closest('.qp-item-history')!;
+    fireEvent.click(rowB.querySelector('.qp-item-del')!);
+    expect(screen.queryByText('b-only')).toBeNull();
+    expect(screen.getByText('global-only')).toBeDefined();
+
+    // Clearing in "All" removes every remaining item across both global and session histories.
+    fireEvent.click(screen.getByRole('button', { name: 'Clear history' }));
+    expect(screen.getByText('No history')).toBeDefined();
+  });
+
+  it('preserves timestamps for prototype-key history strings (__proto__, constructor, toString) across record, hydrate merge, and delete', () => {
+    let data = recordHistoryEntry(
+      { history: [], sessionHistory: {}, commands: [], phrases: [] },
+      '__proto__',
+      'audit',
+      1234,
+    );
+    expect(Object.hasOwn(data.historyTimestamps!, '__proto__')).toBe(true);
+    expect(getHistoryTimestamp(data, '__proto__', 'global')).toBe(1234);
+    expect(getHistoryTimestamp(data, '__proto__', 'session', 'audit')).toBe(1234);
+    expect(getHistoryTimestamp(data, 'constructor', 'global')).toBeUndefined();
+    expect(getHistoryTimestamp(data, 'toString', 'session', 'audit')).toBeUndefined();
+
+    data = recordHistoryEntry(data, 'constructor', 'audit', 2000);
+    const serverSnapshot: QuickData = {
+      history: ['__proto__', 'constructor'],
+      sessionHistory: { audit: ['__proto__', 'constructor'] },
+      historyTimestamps: Object.fromEntries([['__proto__', 5000], ['constructor', 1000]]),
+      sessionHistoryTimestamps: {
+        audit: Object.fromEntries([['__proto__', 900], ['constructor', 3000]]),
+      },
+      commands: [],
+      phrases: [],
+    };
+    const merged = mergeQuickDataForHydration(serverSnapshot, data);
+    expect(readOwnRecordValueSafe(merged.historyTimestamps, 'constructor')).toBe(2000);
+    expect(getHistoryTimestamp(merged, '__proto__', 'global')).toBe(5000);
+    expect(getHistoryTimestamp(merged, 'constructor', 'global')).toBe(3000);
+    expect(getHistoryTimestamp(merged, '__proto__', 'session', 'audit')).toBe(1234);
+    expect(getHistoryTimestamp(merged, 'constructor', 'session', 'audit')).toBe(3000);
+  });
+
+  function readOwnRecordValueSafe<V>(record: Record<string, V> | undefined, key: string): V | undefined {
+    return record && Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+  }
+
+  it('persists a >64KB 200-entry snapshot across pagehide without keepalive failure and replays it to server on reload scoped by account', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'https://im.test' }));
+    const initial200 = Array.from({ length: 200 }, (_, i) => `long-item-${i}-${'x'.repeat(240)}`);
+    const serverData: QuickData = {
+      history: initial200,
+      sessionHistory: { deck_big: initial200 },
+      historyTimestamps: Object.fromEntries(initial200.map((k, i) => [k, 1_700_000_000_000 + i])),
+      sessionHistoryTimestamps: { deck_big: Object.fromEntries(initial200.map((k, i) => [k, 1_700_000_000_000 + i])) },
+      commands: [],
+      phrases: [],
+    };
+
+    // First load hydrates 200-item snapshot (~100KB+ JSON).
+    apiFetchMock.mockResolvedValueOnce({ data: serverData });
+    // PUT during pagehide fails/aborts (e.g. unload mid-flight).
+    apiFetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+
+    let quick!: ReturnType<typeof useQuickData>;
+    function BigHarness() {
+      quick = useQuickData();
+      return <div data-testid="top-hist">{quick.data.history[0] ?? ''}</div>;
+    }
+
+    const view = render(<BigHarness />);
+    await waitFor(() => expect(screen.getByTestId('top-hist').textContent).toBe(initial200[0]));
+
+    // Send 201st entry immediately before unload; >60KB payload skips keepalive and retains pending backup.
+    const sentTs = new Date(2026, 10, 28, 5, 12, 0).getTime();
+    vi.setSystemTime(sentTs);
+    act(() => {
+      quick.recordHistory('fresh-201st-before-pagehide', 'deck_big');
+    });
+    expect(quick.data.history[0]).toBe('fresh-201st-before-pagehide');
+
+    window.dispatchEvent(new Event('pagehide'));
+    await Promise.resolve();
+    expect(apiFetchMock).toHaveBeenCalledTimes(2);
+    expect((apiFetchMock.mock.calls[1][1] as RequestInit).keepalive).toBeUndefined();
+
+    // Account isolation: user-2 does NOT see user-1's unconfirmed backup.
+    view.unmount();
+    __simulateReloadForTests();
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-2', baseUrl: 'https://im.test' }));
+    apiFetchMock.mockResolvedValueOnce({ data: { history: [], sessionHistory: {}, commands: [], phrases: [] } });
+    const viewUser2 = render(<BigHarness />);
+    await waitFor(() => expect(quick.loaded).toBe(true));
+    expect(quick.data.history).toEqual([]);
+    viewUser2.unmount();
+
+    // Switch back to user-1 and reload: server still returns old snapshot, but backup restores + replays PUT 200 and clears local backup.
+    __simulateReloadForTests();
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'https://im.test' }));
+    apiFetchMock.mockResolvedValueOnce({ data: serverData });
+    apiFetchMock.mockResolvedValueOnce({ ok: true });
+
+    render(<BigHarness />);
+    await waitFor(() => expect(screen.getByTestId('top-hist').textContent).toBe('fresh-201st-before-pagehide'));
+    expect(quick.data.history).toHaveLength(200);
+    expect(quick.data.historyTimestamps?.['fresh-201st-before-pagehide']).toBe(sentTs);
+
+    // Server confirmation PUT fires automatically on reload and deletes the pending localStorage key.
+    await waitFor(() => expect(apiFetchMock).toHaveBeenCalledTimes(5));
+    expect(apiFetchMock.mock.calls[4][0]).toBe('/api/quick-data');
+    expect((apiFetchMock.mock.calls[4][1] as RequestInit).method).toBe('PUT');
+    await waitFor(() => {
+      expect(localStorage.getItem('imcodes.quick_data.pending:https://im.test:user-1')).toBeNull();
+    });
   });
 });

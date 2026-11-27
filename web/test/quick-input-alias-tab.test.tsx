@@ -236,4 +236,38 @@ describe('QuickInputPanel — 别名 tab', () => {
     fireEvent.click(clearBtn);
     await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('2'));
   });
+
+  it('uses dedicated scrollable fields container + pinned Save/Cancel actions when editing and wraps 30+ long-tag items', async () => {
+    store = Array.from({ length: 32 }, (_, i) => ({
+      name: `box-${i}`,
+      value: `ssh root@host-${i}`,
+      description: `host note ${i}`,
+      tags: ['very-long-production-tag-01', 'very-long-production-tag-02', 'very-long-production-tag-03'],
+      createdAt: '',
+      updatedAt: '',
+      source: 'web' as const,
+    }));
+    render(<QuickInputPanel {...baseProps()} />);
+    fireEvent.click(aliasTabButton());
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('32'));
+    expect(root().querySelectorAll('.qp-alias-tag').length).toBe(96);
+
+    const panel = root().querySelector('.qp-alias-panel')!;
+    expect(panel.classList.contains('is-editing')).toBe(false);
+
+    const editBtn = Array.from(root().querySelectorAll('button')).find((b) => b.getAttribute('title') === 'alias.edit')!;
+    fireEvent.click(editBtn);
+
+    expect(panel.classList.contains('is-editing')).toBe(true);
+    const fields = root().querySelector('.qp-alias-form .qp-alias-form-fields');
+    const actions = root().querySelector('.qp-alias-form .qp-alias-form-actions');
+    expect(fields).not.toBeNull();
+    expect(actions).not.toBeNull();
+    expect(fields!.querySelector('input[placeholder="alias.name_placeholder"]')).not.toBeNull();
+    expect(fields!.querySelector('textarea[placeholder="alias.value_placeholder"]')).not.toBeNull();
+    expect(Array.from(actions!.querySelectorAll('button')).map((b) => b.textContent)).toEqual([
+      'alias.save',
+      'alias.cancel',
+    ]);
+  });
 });

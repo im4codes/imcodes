@@ -170,4 +170,41 @@ describe('quick-data routes', () => {
     });
     expect(badTs.status).toBe(400);
   });
+
+  it('preserves prototype-sensitive history keys (__proto__, constructor, toString) on PUT and GET roundtrip', async () => {
+    const rawBody = JSON.stringify({
+      data: {
+        history: ['__proto__', 'constructor', 'toString'],
+        sessionHistory: { audit: ['__proto__', 'constructor'] },
+        historyTimestamps: JSON.parse('{"__proto__":1234,"constructor":5678,"toString":9012}'),
+        sessionHistoryTimestamps: {
+          audit: JSON.parse('{"__proto__":2345,"constructor":6789}'),
+        },
+        commands: [],
+        phrases: [],
+      },
+    });
+    expect(rawBody).toContain('"__proto__":1234');
+
+    const putRes = await app.request('/api/quick-data', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: rawBody,
+    });
+    expect(putRes.status).toBe(200);
+    const saved = upsertQuickDataMock.mock.calls[0][2] as Record<string, any>;
+    expect(Object.hasOwn(saved.historyTimestamps, '__proto__')).toBe(true);
+    expect(saved.historyTimestamps['__proto__']).toBe(1234);
+    expect(saved.historyTimestamps['constructor']).toBe(5678);
+    expect(saved.historyTimestamps['toString']).toBe(9012);
+    expect(Object.hasOwn(saved.sessionHistoryTimestamps.audit, '__proto__')).toBe(true);
+    expect(saved.sessionHistoryTimestamps.audit['__proto__']).toBe(2345);
+
+    getQuickDataMock.mockResolvedValueOnce(saved);
+    const getRes = await app.request('/api/quick-data');
+    expect(getRes.status).toBe(200);
+    const getJsonText = await getRes.text();
+    expect(getJsonText).toContain('"__proto__":1234');
+    expect(getJsonText).toContain('"__proto__":2345');
+  });
 });

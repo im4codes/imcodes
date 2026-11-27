@@ -56,31 +56,42 @@ function validTimestamp(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.trunc(value) : undefined;
 }
 
+function readOwnRecordValue<V>(record: Record<string, V> | undefined, key: string): V | undefined {
+  if (!record || typeof record !== 'object') return undefined;
+  return Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+}
+
+function mapWithEntry<V>(record: Record<string, V> | undefined, key: string, value: V): Record<string, V> {
+  const entries = new Map<string, V>(record && typeof record === 'object' ? Object.entries(record) : []);
+  entries.set(key, value);
+  return Object.fromEntries(entries);
+}
+
 function pruneTimestampMap(entries: readonly string[], rawMap: unknown): Record<string, number> | undefined {
-  if (!rawMap || typeof rawMap !== 'object') return undefined;
+  if (!rawMap || typeof rawMap !== 'object' || Array.isArray(rawMap)) return undefined;
   const allowed = new Set(entries);
-  const pruned: Record<string, number> = {};
+  const pruned = new Map<string, number>();
   for (const [key, rawVal] of Object.entries(rawMap as Record<string, unknown>)) {
     if (!allowed.has(key)) continue;
     const ts = validTimestamp(rawVal);
-    if (ts !== undefined) pruned[key] = ts;
+    if (ts !== undefined) pruned.set(key, ts);
   }
-  return Object.keys(pruned).length > 0 ? pruned : undefined;
+  return pruned.size > 0 ? Object.fromEntries(pruned) : undefined;
 }
 
 function pruneSessionTimestampMaps(
   sessionHistory: Record<string, string[]>,
   rawMaps: unknown,
 ): Record<string, Record<string, number>> | undefined {
-  if (!rawMaps || typeof rawMaps !== 'object') return undefined;
-  const pruned: Record<string, Record<string, number>> = {};
+  if (!rawMaps || typeof rawMaps !== 'object' || Array.isArray(rawMaps)) return undefined;
+  const pruned = new Map<string, Record<string, number>>();
   for (const [session, rawMap] of Object.entries(rawMaps as Record<string, unknown>)) {
-    const entries = sessionHistory[session];
+    const entries = readOwnRecordValue(sessionHistory, session);
     if (!entries || entries.length === 0) continue;
     const cleaned = pruneTimestampMap(entries, rawMap);
-    if (cleaned) pruned[session] = cleaned;
+    if (cleaned) pruned.set(session, cleaned);
   }
-  return Object.keys(pruned).length > 0 ? pruned : undefined;
+  return pruned.size > 0 ? Object.fromEntries(pruned) : undefined;
 }
 
 function buildQuickDataWithPrunedTimestamps(
@@ -108,22 +119,21 @@ export function recordHistoryEntry(data: QuickData, text: string, sessionName?: 
   if (!trimmed) return data;
   const ts = validTimestamp(now) ?? Math.trunc(Date.now());
   const nextHistory = dedupPrepend(data.history, trimmed, GLOBAL_HISTORY_MAX);
-  const nextHistoryTs = { ...data.historyTimestamps, [trimmed]: ts };
+  const nextHistoryTs = mapWithEntry(data.historyTimestamps, trimmed, ts);
   let nextSessionHistory = data.sessionHistory;
   let nextSessionTs = data.sessionHistoryTimestamps;
   if (sessionName) {
-    const prev = data.sessionHistory[sessionName] ?? [];
-    nextSessionHistory = {
-      ...data.sessionHistory,
-      [sessionName]: dedupPrepend(prev, trimmed, SESSION_HISTORY_MAX),
-    };
-    nextSessionTs = {
-      ...data.sessionHistoryTimestamps,
-      [sessionName]: {
-        ...(data.sessionHistoryTimestamps?.[sessionName] ?? {}),
-        [trimmed]: ts,
-      },
-    };
+    const prev = readOwnRecordValue(data.sessionHistory, sessionName) ?? [];
+    nextSessionHistory = mapWithEntry(
+      data.sessionHistory,
+      sessionName,
+      dedupPrepend(prev, trimmed, SESSION_HISTORY_MAX),
+    );
+    nextSessionTs = mapWithEntry(
+      data.sessionHistoryTimestamps,
+      sessionName,
+      mapWithEntry(readOwnRecordValue(data.sessionHistoryTimestamps, sessionName), trimmed, ts),
+    );
   }
   return buildQuickDataWithPrunedTimestamps(
     nextHistory,
@@ -137,7 +147,7 @@ export function recordHistoryEntry(data: QuickData, text: string, sessionName?: 
 
 export function getNavigableHistory(data: QuickData, sessionName?: string): string[] {
   if (!sessionName) return data.history;
-  const sessionHist = data.sessionHistory[sessionName] ?? [];
+  const sessionHist = readOwnRecordValue(data.sessionHistory, sessionName) ?? [];
   return sessionHist.length > 0 ? sessionHist : data.history;
 }
 
@@ -148,12 +158,14 @@ export function getHistoryTimestamp(
   sessionName?: string,
 ): number | undefined {
   if (scope === 'session') {
-    return sessionName ? validTimestamp(data.sessionHistoryTimestamps?.[sessionName]?.[text]) : undefined;
+    if (!sessionName) return undefined;
+    const sessionMap = readOwnRecordValue(data.sessionHistoryTimestamps, sessionName);
+    return validTimestamp(readOwnRecordValue(sessionMap, text));
   }
-  let latest = validTimestamp(data.historyTimestamps?.[text]);
+  let latest = validTimestamp(readOwnRecordValue(data.historyTimestamps, text));
   if (data.sessionHistoryTimestamps) {
     for (const sessionMap of Object.values(data.sessionHistoryTimestamps)) {
-      const candidate = validTimestamp(sessionMap?.[text]);
+      const candidate = validTimestamp(readOwnRecordValue(sessionMap, text));
       if (candidate !== undefined && (latest === undefined || candidate > latest)) {
         latest = candidate;
       }
@@ -201,13 +213,16 @@ export function getAccountHistory(data: QuickData): string[] {
   append(data.history);
   for (const items of Object.values(data.sessionHistory)) append(items);
   // Sort timestamped entries newest-first while preserving insertion order for
-  // legacy untimestamped entries so multi-session Global history surfaces recent sends first.
+  // legacy untimestamped entries, then enforce the global 200-item ceiling so
+  // the "All" view never exceeds GLOBAL_HISTORY_MAX.
   const hasAnyTimestamp = merged.some((item) => getHistoryTimestamp(data, item, 'global') !== undefined);
-  if (!hasAnyTimestamp) return merged;
-  return merged
-    .map((item, idx) => ({ item, idx, ts: getHistoryTimestamp(data, item, 'global') ?? -1 }))
-    .sort((a, b) => (b.ts !== a.ts ? b.ts - a.ts : a.idx - b.idx))
-    .map((entry) => entry.item);
+  const ordered = hasAnyTimestamp
+    ? merged
+        .map((item, idx) => ({ item, idx, ts: getHistoryTimestamp(data, item, 'global') ?? -1 }))
+        .sort((a, b) => (b.ts !== a.ts ? b.ts - a.ts : a.idx - b.idx))
+        .map((entry) => entry.item)
+    : merged;
+  return ordered.slice(0, GLOBAL_HISTORY_MAX);
 }
 
 // ── Hook ──────────────────────────────────────────────────────────────────
@@ -218,6 +233,66 @@ let _mutatedBeforeHydration = false;
 let _visibilityInstalled = false;
 let _visibilityHandler: (() => void) | null = null;
 let _pageHideHandler: (() => void) | null = null;
+let _saveRevision = 0;
+let _inFlightSaves = 0;
+
+const QUICK_DATA_PENDING_KEY_PREFIX = 'imcodes.quick_data.pending:';
+const KEEPALIVE_SAFE_BODY_BYTES = 60_000;
+
+function getQuickDataPendingStorageKey(): string | null {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const rawAuth = localStorage.getItem('rcc_auth');
+    if (rawAuth) {
+      const parsed = JSON.parse(rawAuth) as { userId?: unknown; baseUrl?: unknown } | null;
+      const userId = typeof parsed?.userId === 'string' ? parsed.userId.trim() : '';
+      const baseUrl = typeof parsed?.baseUrl === 'string' ? parsed.baseUrl.trim() : '';
+      if (userId) return `${QUICK_DATA_PENDING_KEY_PREFIX}${baseUrl}:${userId}`;
+    }
+  } catch { /* ignore */ }
+  const origin = typeof window !== 'undefined' && window.location?.origin ? window.location.origin : 'default';
+  return `${QUICK_DATA_PENDING_KEY_PREFIX}${origin}:anon`;
+}
+
+function writePendingSnapshot(data: QuickData): void {
+  const key = getQuickDataPendingStorageKey();
+  if (!key) return;
+  try {
+    localStorage.setItem(key, JSON.stringify(data));
+  } catch { /* ignore quota/private mode errors */ }
+}
+
+function readPendingSnapshot(): QuickData | null {
+  const key = getQuickDataPendingStorageKey();
+  if (!key) return null;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return null;
+    return normalizeQuickData(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
+function clearPendingSnapshot(): void {
+  const key = getQuickDataPendingStorageKey();
+  if (!key) return;
+  try {
+    localStorage.removeItem(key);
+  } catch { /* ignore */ }
+}
+
+function clearAllPendingSnapshotsForTests(): void {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(QUICK_DATA_PENDING_KEY_PREFIX)) keys.push(k);
+    }
+    for (const k of keys) localStorage.removeItem(k);
+  } catch { /* ignore */ }
+}
 
 // ── Pending-add tracking ─────────────────────────────────────────────────
 // User-added custom phrases/commands are persisted via a 2-second debounced
@@ -248,15 +323,15 @@ function normalizeStringList(value: unknown): string[] {
 
 export function normalizeQuickData(raw: unknown): QuickData {
   const data = raw && typeof raw === 'object' ? raw as Partial<QuickData> : {};
-  const sessionHistory: Record<string, string[]> = {};
-  if (data.sessionHistory && typeof data.sessionHistory === 'object') {
+  const sessionHistoryMap = new Map<string, string[]>();
+  if (data.sessionHistory && typeof data.sessionHistory === 'object' && !Array.isArray(data.sessionHistory)) {
     for (const [session, entries] of Object.entries(data.sessionHistory)) {
-      sessionHistory[session] = normalizeStringList(entries).slice(0, SESSION_HISTORY_MAX);
+      sessionHistoryMap.set(session, normalizeStringList(entries).slice(0, SESSION_HISTORY_MAX));
     }
   }
   return buildQuickDataWithPrunedTimestamps(
     normalizeStringList(data.history).slice(0, GLOBAL_HISTORY_MAX),
-    sessionHistory,
+    Object.fromEntries(sessionHistoryMap),
     data.historyTimestamps,
     data.sessionHistoryTimestamps,
     normalizeStringList(data.commands),
@@ -281,16 +356,17 @@ function mergeTimestampRecords(
   b?: Record<string, number>,
 ): Record<string, number> | undefined {
   if (!a && !b) return undefined;
-  const merged: Record<string, number> = {};
+  const merged = new Map<string, number>();
   for (const src of [a, b]) {
     if (!src) continue;
     for (const [key, raw] of Object.entries(src)) {
       const ts = validTimestamp(raw);
       if (ts === undefined) continue;
-      merged[key] = merged[key] === undefined ? ts : Math.max(merged[key], ts);
+      const existing = merged.get(key);
+      merged.set(key, existing === undefined ? ts : Math.max(existing, ts));
     }
   }
-  return Object.keys(merged).length > 0 ? merged : undefined;
+  return merged.size > 0 ? Object.fromEntries(merged) : undefined;
 }
 
 function unionServerLocal(server: string[], local: string[]): string[] {
@@ -304,22 +380,29 @@ function unionServerLocal(server: string[], local: string[]): string[] {
   return merged;
 }
 
-function mergeQuickDataForHydration(server: QuickData, local: QuickData): QuickData {
-  const sessionHistory: Record<string, string[]> = { ...server.sessionHistory };
-  const sessionTs: Record<string, Record<string, number>> = {};
+export function mergeQuickDataForHydration(server: QuickData, local: QuickData): QuickData {
+  const sessionHistoryMap = new Map<string, string[]>(Object.entries(server.sessionHistory));
+  const sessionTsMap = new Map<string, Record<string, number>>();
   for (const session of new Set([...Object.keys(server.sessionHistory), ...Object.keys(local.sessionHistory)])) {
-    sessionHistory[session] = mergeLocalFirst(local.sessionHistory[session] ?? [], server.sessionHistory[session] ?? [], SESSION_HISTORY_MAX);
-    const mergedMap = mergeTimestampRecords(
-      server.sessionHistoryTimestamps?.[session],
-      local.sessionHistoryTimestamps?.[session],
+    sessionHistoryMap.set(
+      session,
+      mergeLocalFirst(
+        readOwnRecordValue(local.sessionHistory, session) ?? [],
+        readOwnRecordValue(server.sessionHistory, session) ?? [],
+        SESSION_HISTORY_MAX,
+      ),
     );
-    if (mergedMap) sessionTs[session] = mergedMap;
+    const mergedMap = mergeTimestampRecords(
+      readOwnRecordValue(server.sessionHistoryTimestamps, session),
+      readOwnRecordValue(local.sessionHistoryTimestamps, session),
+    );
+    if (mergedMap) sessionTsMap.set(session, mergedMap);
   }
   return buildQuickDataWithPrunedTimestamps(
     mergeLocalFirst(local.history, server.history, GLOBAL_HISTORY_MAX),
-    sessionHistory,
+    Object.fromEntries(sessionHistoryMap),
     mergeTimestampRecords(server.historyTimestamps, local.historyTimestamps),
-    sessionTs,
+    Object.fromEntries(sessionTsMap),
     unionServerLocal(server.commands, local.commands),
     unionServerLocal(server.phrases, local.phrases),
   );
@@ -341,12 +424,19 @@ function applyPendingAdds(server: QuickData): QuickData {
   return { ...server, phrases, commands };
 }
 
+function utf8ByteLength(str: string): number {
+  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(str).byteLength;
+  return str.length * 3;
+}
+
 function scheduleSave(data: QuickData, canPersist: boolean): void {
   if (!canPersist) return;
+  const rev = ++_saveRevision;
+  writePendingSnapshot(data);
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = setTimeout(() => {
     _debounceTimer = null;
-    runSave(data);
+    runSave(data, { revision: rev });
   }, 2000);
 }
 
@@ -356,11 +446,13 @@ function scheduleSave(data: QuickData, canPersist: boolean): void {
  * persisted, while concurrent mutations during the in-flight PUT are
  * preserved for the next save cycle.
  */
-function runSave(data: QuickData, opts?: { keepalive?: boolean }): void {
+function runSave(data: QuickData, opts?: { keepalive?: boolean; revision?: number }): void {
+  const rev = opts?.revision ?? _saveRevision;
   const snapPhraseAdds = new Set(_pendingPhraseAdds);
   const snapCommandAdds = new Set(_pendingCommandAdds);
   const init: RequestInit = { method: 'PUT', body: JSON.stringify({ data }) };
   if (opts?.keepalive) init.keepalive = true;
+  _inFlightSaves += 1;
   apiFetch('/api/quick-data', init)
     .then(() => {
       // Persisted — remove just the items that were in the in-flight
@@ -368,25 +460,38 @@ function runSave(data: QuickData, opts?: { keepalive?: boolean }): void {
       // will be flushed by the next debounced save.
       for (const p of snapPhraseAdds) _pendingPhraseAdds.delete(p);
       for (const c of snapCommandAdds) _pendingCommandAdds.delete(c);
+      if (_saveRevision === rev) clearPendingSnapshot();
     })
     .catch((err) => {
       console.error('[quick-data] save failed:', err);
-      // Pending sets keep the in-flight items so the next scheduleSave
-      // (or unload flush) will retry them.
+      // Pending sets + localStorage snapshot keep the in-flight items so
+      // the next scheduleSave, unload flush, or next-load hydration retries them.
+    })
+    .finally(() => {
+      _inFlightSaves = Math.max(0, _inFlightSaves - 1);
     });
 }
 
 /**
- * Synchronously flush a pending debounced save during page hide / unload.
- * Uses fetch `keepalive` so the request survives the tab closing. No-op
- * when there is nothing to flush.
+ * Flush a pending debounced save during page hide / unload.
+ * Stores an account-scoped pending snapshot before attempting network delivery;
+ * uses `fetch(..., { keepalive: true })` when under Chromium's 64 KiB cap, and
+ * falls back to a standard PUT + persisted local retry when a 200-entry
+ * snapshot exceeds the keepalive body limit.
  */
 function flushPendingSave(): void {
   if (!_debounceTimer || !_hasHydratedFromServer) return;
   clearTimeout(_debounceTimer);
   _debounceTimer = null;
+  const rev = _saveRevision;
   const data = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
-  runSave(data, { keepalive: true });
+  writePendingSnapshot(data);
+  const body = JSON.stringify({ data });
+  if (utf8ByteLength(body) <= KEEPALIVE_SAFE_BODY_BYTES) {
+    runSave(data, { keepalive: true, revision: rev });
+  } else {
+    runSave(data, { revision: rev });
+  }
 }
 
 // Explicit annotation: the fetcher closure references `quickDataResource`
@@ -398,10 +503,18 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
       const res = await apiFetch<{ data: QuickData }>('/api/quick-data');
       const server = normalizeQuickData(res.data);
       _hasHydratedFromServer = true;
-      if (_mutatedBeforeHydration) {
+      const shouldReplayPending = _debounceTimer === null && _inFlightSaves === 0;
+      const pendingLocal = shouldReplayPending ? readPendingSnapshot() : null;
+      if (_mutatedBeforeHydration || pendingLocal) {
         _mutatedBeforeHydration = false;
-        const merged = mergeQuickDataForHydration(server, normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA));
+        const inMemory = normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
+        const withPending = pendingLocal ? mergeQuickDataForHydration(server, pendingLocal) : server;
+        const merged = mergeQuickDataForHydration(withPending, inMemory);
         quickDataResource.mutate(merged);
+        if (pendingLocal) {
+          const rev = ++_saveRevision;
+          runSave(merged, { revision: rev });
+        }
         return applyPendingAdds(merged);
       }
       // Re-fetch path: ensure optimistic phrase/command additions that
@@ -411,10 +524,11 @@ let quickDataResource: SharedResource<QuickData> = createSharedResource<QuickDat
       return applyPendingAdds(server);
     } catch {
       // Don't wipe the in-memory value on transient fetch errors — keep
-      // whatever is currently in the resource (or EMPTY on first load).
-      return _hasHydratedFromServer
-        ? normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA)
-        : EMPTY_QUICK_DATA;
+      // whatever is currently in the resource (or local pending snapshot / EMPTY).
+      if (_hasHydratedFromServer) {
+        return normalizeQuickData(quickDataResource.peek().value ?? EMPTY_QUICK_DATA);
+      }
+      return readPendingSnapshot() ?? EMPTY_QUICK_DATA;
     }
   },
 });
@@ -502,10 +616,21 @@ const removePhrase = (phrase: string) => {
 };
 const removeHistory = (text: string) => {
   updateQuickData((prev) => {
-    if (!prev.history.includes(text)) return prev;
+    const inGlobal = prev.history.includes(text);
+    let inAnySession = false;
+    const nextSessionHistoryMap = new Map<string, string[]>();
+    for (const [session, list] of Object.entries(prev.sessionHistory)) {
+      if (list.includes(text)) {
+        inAnySession = true;
+        nextSessionHistoryMap.set(session, list.filter((h) => h !== text));
+      } else {
+        nextSessionHistoryMap.set(session, list);
+      }
+    }
+    if (!inGlobal && !inAnySession) return prev;
     return buildQuickDataWithPrunedTimestamps(
-      prev.history.filter((h) => h !== text),
-      prev.sessionHistory,
+      inGlobal ? prev.history.filter((h) => h !== text) : prev.history,
+      Object.fromEntries(nextSessionHistoryMap),
       prev.historyTimestamps,
       prev.sessionHistoryTimestamps,
       prev.commands,
@@ -515,11 +640,11 @@ const removeHistory = (text: string) => {
 };
 const removeSessionHistory = (sessionName: string, text: string) => {
   updateQuickData((prev) => {
-    const sh = prev.sessionHistory[sessionName] ?? [];
+    const sh = readOwnRecordValue(prev.sessionHistory, sessionName) ?? [];
     if (!sh.includes(text)) return prev;
     return buildQuickDataWithPrunedTimestamps(
       prev.history,
-      { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) },
+      mapWithEntry(prev.sessionHistory, sessionName, sh.filter((h) => h !== text)),
       prev.historyTimestamps,
       prev.sessionHistoryTimestamps,
       prev.commands,
@@ -528,16 +653,20 @@ const removeSessionHistory = (sessionName: string, text: string) => {
   });
 };
 const clearHistory = () => {
-  updateQuickData((prev) => prev.history.length === 0
-    ? prev
-    : buildQuickDataWithPrunedTimestamps([], prev.sessionHistory, undefined, prev.sessionHistoryTimestamps, prev.commands, prev.phrases));
+  updateQuickData((prev) => {
+    const hasSessionItems = Object.values(prev.sessionHistory).some((items) => items.length > 0);
+    if (prev.history.length === 0 && !hasSessionItems && !prev.historyTimestamps && !prev.sessionHistoryTimestamps) {
+      return prev;
+    }
+    return buildQuickDataWithPrunedTimestamps([], {}, undefined, undefined, prev.commands, prev.phrases);
+  });
 };
 const clearSessionHistory = (sessionName: string) => {
-  updateQuickData((prev) => (prev.sessionHistory[sessionName] ?? []).length === 0
+  updateQuickData((prev) => (readOwnRecordValue(prev.sessionHistory, sessionName) ?? []).length === 0
     ? prev
     : buildQuickDataWithPrunedTimestamps(
         prev.history,
-        { ...prev.sessionHistory, [sessionName]: [] },
+        mapWithEntry(prev.sessionHistory, sessionName, []),
         prev.historyTimestamps,
         prev.sessionHistoryTimestamps,
         prev.commands,
@@ -555,11 +684,13 @@ export function useQuickData(): UseQuickDataResult {
   return useMemo(() => ({ data, loaded: snapshot.loaded, ...QUICK_DATA_ACTIONS }), [data, snapshot.loaded]);
 }
 
-export function __resetQuickDataForTests(): void {
+export function __simulateReloadForTests(): void {
   if (_debounceTimer) clearTimeout(_debounceTimer);
   _debounceTimer = null;
   _hasHydratedFromServer = false;
   _mutatedBeforeHydration = false;
+  _saveRevision = 0;
+  _inFlightSaves = 0;
   _pendingPhraseAdds.clear();
   _pendingCommandAdds.clear();
   if (_visibilityHandler && typeof document !== 'undefined') {
@@ -572,6 +703,11 @@ export function __resetQuickDataForTests(): void {
   _pageHideHandler = null;
   _visibilityInstalled = false;
   quickDataResource.disposeForTests();
+}
+
+export function __resetQuickDataForTests(): void {
+  clearAllPendingSnapshotsForTests();
+  __simulateReloadForTests();
 }
 
 // ── Panel component ───────────────────────────────────────────────────────
@@ -883,7 +1019,7 @@ export function QuickInputPanel({
 
   const defaultCmds = getDefaultQuickCommands(agentType);
   const activeHistory = historyScope === 'session'
-    ? (data.sessionHistory[sessionName] ?? [])
+    ? (readOwnRecordValue(data.sessionHistory, sessionName) ?? [])
     : getAccountHistory(data);
   const normalizedHistoryQuery = historySearch.trim().toLowerCase();
   const filteredHistory = normalizedHistoryQuery
@@ -1243,7 +1379,7 @@ export function QuickInputPanel({
 
         {/* Alias tab — browse + create/edit/delete user aliases. Selecting one
             inserts its `;;(name)` marker (never the value). */}
-        {activeTab === 'alias' && <>
+        {activeTab === 'alias' && <div class={`qp-alias-panel${aliasForm ? ' is-editing' : ''}`}>
           <div class="qp-add-row qp-alias-search-row">
             <input
               class="qp-add-input"
@@ -1267,33 +1403,35 @@ export function QuickInputPanel({
 
           {aliasForm && (
             <div class="qp-alias-form">
-              <input
-                ref={aliasNameInputRef}
-                class="qp-add-input"
-                value={aliasForm.name}
-                onInput={(e) => setAliasForm((f) => f ? { ...f, name: (e.target as HTMLInputElement).value } : f)}
-                placeholder={t('alias.name_placeholder')}
-              />
-              <textarea
-                class="qp-add-input qp-alias-value"
-                value={aliasForm.value}
-                onInput={(e) => setAliasForm((f) => f ? { ...f, value: (e.target as HTMLTextAreaElement).value } : f)}
-                placeholder={t('alias.value_placeholder')}
-                rows={3}
-              />
-              <input
-                class="qp-add-input"
-                value={aliasForm.description}
-                onInput={(e) => setAliasForm((f) => f ? { ...f, description: (e.target as HTMLInputElement).value } : f)}
-                placeholder={t('alias.description_placeholder')}
-              />
-              <input
-                class="qp-add-input"
-                value={aliasForm.tags}
-                onInput={(e) => setAliasForm((f) => f ? { ...f, tags: (e.target as HTMLInputElement).value } : f)}
-                placeholder={t('alias.tags_placeholder')}
-              />
-              {aliasErrorText && <div class="qp-alias-error" role="alert">{aliasErrorText}</div>}
+              <div class="qp-alias-form-fields">
+                <input
+                  ref={aliasNameInputRef}
+                  class="qp-add-input"
+                  value={aliasForm.name}
+                  onInput={(e) => setAliasForm((f) => f ? { ...f, name: (e.target as HTMLInputElement).value } : f)}
+                  placeholder={t('alias.name_placeholder')}
+                />
+                <textarea
+                  class="qp-add-input qp-alias-value"
+                  value={aliasForm.value}
+                  onInput={(e) => setAliasForm((f) => f ? { ...f, value: (e.target as HTMLTextAreaElement).value } : f)}
+                  placeholder={t('alias.value_placeholder')}
+                  rows={3}
+                />
+                <input
+                  class="qp-add-input"
+                  value={aliasForm.description}
+                  onInput={(e) => setAliasForm((f) => f ? { ...f, description: (e.target as HTMLInputElement).value } : f)}
+                  placeholder={t('alias.description_placeholder')}
+                />
+                <input
+                  class="qp-add-input"
+                  value={aliasForm.tags}
+                  onInput={(e) => setAliasForm((f) => f ? { ...f, tags: (e.target as HTMLInputElement).value } : f)}
+                  placeholder={t('alias.tags_placeholder')}
+                />
+                {aliasErrorText && <div class="qp-alias-error" role="alert">{aliasErrorText}</div>}
+              </div>
               <div class="qp-alias-form-actions">
                 <button class="qp-toolbar-btn qp-toolbar-btn-primary" disabled={aliasSaving} onClick={() => { void commitAlias(); }}>{t('alias.save')}</button>
                 <button class="qp-toolbar-btn" onClick={closeAliasForm}>{t('alias.cancel')}</button>
@@ -1331,7 +1469,7 @@ export function QuickInputPanel({
               </div>
             )}
           </div>
-        </>}
+        </div>}
 
         {/* Quick tab content */}
         {activeTab === 'quick' && <>
