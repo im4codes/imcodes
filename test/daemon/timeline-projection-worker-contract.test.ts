@@ -35,6 +35,7 @@ describe('timeline projection worker contract', () => {
   let tempHome: string | null = null;
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.resetModules();
     vi.unmock('node:os');
@@ -54,11 +55,13 @@ describe('timeline projection worker contract', () => {
     const close = vi.fn();
     let handler: WorkerHandler | null = null;
 
+    const actualWorkerThreads = await vi.importActual<typeof import('node:worker_threads')>('node:worker_threads');
     vi.doMock('node:os', async () => {
       const actual = await vi.importActual<typeof import('node:os')>('node:os');
       return { ...actual, homedir: () => tempHome! };
     });
     vi.doMock('node:worker_threads', () => ({
+      Worker: actualWorkerThreads.Worker,
       workerData: {
         dbPath,
         stateDir: join(tempHome!, '.imcodes'),
@@ -444,5 +447,256 @@ describe('timeline projection worker contract', () => {
     const checkDb = new DatabaseSync(dbPath, { readOnly: true });
     expect(Number((checkDb.prepare('PRAGMA auto_vacuum').get() as { auto_vacuum: number | bigint }).auto_vacuum)).toBe(0);
     checkDb.close();
+  });
+
+  it('isolates large-WAL checkpoint behind an independent worker so queryHistory answers while checkpoint pauses at a barrier', async () => {
+    const { request, dbPath, workerMod } = await loadWorker();
+    expect((await request({ id: 'init', type: 'queryHistory', payload: { sessionId: 'none', limit: 1 } })).ok).toBe(true);
+
+    const bigText = 'barrier-'.repeat(180);
+    const timelineDir = join(tempHome!, '.imcodes', 'timeline');
+    mkdirSync(timelineDir, { recursive: true });
+    const readJsonlPath = join(timelineDir, 's_read.jsonl');
+    writeFileSync(readJsonlPath, 'placeholder\n');
+    const readStat = statSync(readJsonlPath);
+    const seeder = new DatabaseSync(dbPath);
+    seeder.exec('PRAGMA wal_autocheckpoint = 0;');
+    const insert = seeder.prepare(`INSERT INTO timeline_projection_events
+      (session_id, append_ordinal, event_id, ts, seq, epoch, type, source, confidence, text, payload_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 1, 'assistant.text', 'daemon', 'high', ?, ?, ?, ?)`);
+    seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_del', 1500, 0, 0, 1, 'ready', NULL)`).run();
+    seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_read', 300, ?, ?, 1, 'ready', NULL)`)
+      .run(readStat.size, Math.trunc(readStat.mtimeMs));
+    seeder.exec('BEGIN');
+    for (let i = 1; i <= 1500; i += 1) {
+      insert.run('s_del', i, `del-${i}`, 10_000 + i, i, bigText, JSON.stringify({ text: bigText }), 10_000 + i, 10_000 + i);
+    }
+    for (let i = 1; i <= 300; i += 1) {
+      insert.run('s_read', i, `read-${i}`, 20_000 + i, i, bigText, JSON.stringify({ text: bigText }), 20_000 + i, 20_000 + i);
+    }
+    seeder.exec('COMMIT');
+    seeder.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+    const dbSizeBaseline = statSync(dbPath).size;
+
+    // Grow WAL >1,500 frames with additional s_del2 rows that will also be deleted, leaving only s_read (300 rows).
+    seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_del2', 1500, 0, 0, 1, 'ready', NULL)`).run();
+    seeder.exec('BEGIN');
+    for (let i = 1; i <= 1500; i += 1) {
+      insert.run('s_del2', i, `del2-${i}`, 30_000 + i, i, bigText, JSON.stringify({ text: bigText }), 30_000 + i, 30_000 + i);
+    }
+    seeder.exec('COMMIT');
+    seeder.close();
+
+    let enteredResolve!: () => void;
+    const barrierEntered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+    let releaseBarrier!: () => void;
+    const barrierHold = new Promise<void>((resolve) => { releaseBarrier = resolve; });
+    let runnerCalls = 0;
+
+    workerMod.setLargeWalCheckpointRunnerForTests(async (defaultRunner) => {
+      runnerCalls += 1;
+      enteredResolve();
+      await barrierHold;
+      return defaultRunner();
+    });
+
+    try {
+      expect((await request({ id: 'del-barrier', type: 'deleteSession', payload: { sessionId: 's_del' } })).ok).toBe(true);
+      expect((await request({ id: 'del2-barrier', type: 'deleteSession', payload: { sessionId: 's_del2' } })).ok).toBe(true);
+      await barrierEntered;
+
+      // While isolated checkpoint is stuck on the barrier, queryHistory on the projection worker responds immediately.
+      const t0 = Date.now();
+      const queryRes = await request({ id: 'q-during-barrier', type: 'queryHistory', payload: { sessionId: 's_read', limit: 5 } });
+      expect(queryRes.ok).toBe(true);
+      expect((queryRes.result as { events: TimelineEvent[] }).events).toHaveLength(5);
+      expect(Date.now() - t0).toBeLessThan(500);
+
+      // Re-invoking runDeferredMaintenance while already running coalesces cleanly to the single in-flight task.
+      await workerMod.runDeferredMaintenance();
+      expect(runnerCalls).toBe(1);
+
+      releaseBarrier();
+      const walPath = `${dbPath}-wal`;
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && (statSync(walPath).size > 0 || statSync(dbPath).size >= dbSizeBaseline)) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+      }
+      expect(statSync(walPath).size).toBe(0);
+      expect(statSync(dbPath).size).toBeLessThan(dbSizeBaseline);
+    } finally {
+      workerMod.setLargeWalCheckpointRunnerForTests(undefined);
+    }
+  });
+
+  it('uses unified single-timer exponential backoff under persistent locks, low-freq cooldown, recovers after unlock, and stops on shutdown', async () => {
+    vi.useFakeTimers();
+    const recordedDelays: number[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((fn: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      recordedDelays.push(Number(delay ?? 0));
+      return realSetTimeout(fn, delay, ...args);
+    }) as typeof setTimeout);
+
+    const { request, dbPath, workerMod } = await loadWorker();
+    expect((await request({ id: 'init-ft', type: 'queryHistory', payload: { sessionId: 'none', limit: 1 } })).ok).toBe(true);
+
+    const bigText = 'lock-'.repeat(300);
+    const seeder = new DatabaseSync(dbPath);
+    seeder.exec('PRAGMA wal_autocheckpoint = 0;');
+    const insert = seeder.prepare(`INSERT INTO timeline_projection_events
+      (session_id, append_ordinal, event_id, ts, seq, epoch, type, source, confidence, text, payload_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 1, 'assistant.text', 'daemon', 'high', ?, ?, ?, ?)`);
+    seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_lock', 900, 0, 0, 1, 'ready', NULL)`).run();
+    seeder.exec('BEGIN');
+    for (let i = 1; i <= 900; i += 1) {
+      insert.run('s_lock', i, `lk-${i}`, 1_000 + i, i, bigText, JSON.stringify({ text: bigText }), 1_000 + i, 1_000 + i);
+    }
+    seeder.exec('COMMIT');
+    seeder.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+    const dbSizeBaseline = statSync(dbPath).size;
+
+    // Delete 150 rows externally (~125 pages) so maybeIncrementalVacuum can be tested directly for zero side-effect timers.
+    seeder.exec("DELETE FROM timeline_projection_events WHERE session_id = 's_lock' AND append_ordinal <= 150;");
+    const vacDirect = workerMod.maybeIncrementalVacuum(seeder, 64, 1);
+    expect(vacDirect.needsMaintenance).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    seeder.close();
+
+    // Hold persistent write lock across 14 scheduled maintenance attempts.
+    const blocker = new DatabaseSync(dbPath);
+    try {
+      setTimeoutSpy.mockClear();
+      recordedDelays.length = 0;
+      expect((await request({ id: 'del-ft', type: 'deleteSession', payload: { sessionId: 's_lock' } })).ok).toBe(true);
+      expect(vi.getTimerCount()).toBe(1);
+
+      blocker.exec('BEGIN IMMEDIATE');
+      for (let attempt = 0; attempt < 14; attempt += 1) {
+        await vi.advanceTimersToNextTimerAsync();
+        expect(vi.getTimerCount()).toBe(1);
+      }
+
+      // First call is 100ms, retries strictly back off exponentially (200, 400, ... -> 30000),
+      // and attempts >= 12 drop to 300_000ms low-frequency cooldown (never 100ms hot looping).
+      expect(recordedDelays[0]).toBe(100);
+      expect(recordedDelays[1]).toBe(200);
+      expect(recordedDelays[2]).toBe(400);
+      expect(recordedDelays.slice(0, 13).some((d) => d === 30_000)).toBe(true);
+      expect(recordedDelays[13]).toBe(300_000);
+      expect(recordedDelays[14]).toBe(300_000);
+
+      // Release persistent lock and advance to next tick -> maintenance finishes and clears timers.
+      blocker.exec('ROLLBACK');
+      await vi.advanceTimersToNextTimerAsync();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(statSync(`${dbPath}-wal`).size).toBe(0);
+      expect(statSync(dbPath).size).toBeLessThan(dbSizeBaseline);
+
+      // Seed >576 pages so deleteSession leaves freelist>=64 and arms 1 timer, then verify shutdown cancels it.
+      const resched = new DatabaseSync(dbPath);
+      resched.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_lock2', 900, 0, 0, 1, 'ready', NULL)`).run();
+      resched.exec('BEGIN');
+      for (let i = 1; i <= 900; i += 1) {
+        resched.prepare(`INSERT INTO timeline_projection_events
+          (session_id, append_ordinal, event_id, ts, seq, epoch, type, source, confidence, text, payload_json, created_at, updated_at)
+          VALUES ('s_lock2', ?, ?, ?, ?, 1, 'assistant.text', 'daemon', 'high', ?, ?, ?, ?)`)
+          .run(i, `l2-${i}`, i, i, bigText, JSON.stringify({ text: bigText }), i, i);
+      }
+      resched.exec('COMMIT');
+      resched.close();
+      expect((await request({ id: 'del-sd', type: 'deleteSession', payload: { sessionId: 's_lock2' } })).ok).toBe(true);
+      expect(vi.getTimerCount()).toBe(1);
+      expect((await request({ id: 'sd', type: 'shutdown', payload: {} })).ok).toBe(true);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      try { blocker.close(); } catch { /* ignore */ }
+    }
+  });
+
+  it('catches non-busy disk-full maintenance errors without unhandled rejections, keeps queryHistory responsive, and converges cleanly', async () => {
+    vi.useFakeTimers();
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { request, dbPath, workerMod } = await loadWorker();
+    expect((await request({ id: 'init-err', type: 'queryHistory', payload: { sessionId: 'none', limit: 1 } })).ok).toBe(true);
+
+    const bigText = 'diskfull-'.repeat(180);
+    const seeder = new DatabaseSync(dbPath);
+    seeder.exec('PRAGMA wal_autocheckpoint = 0;');
+    const insert = seeder.prepare(`INSERT INTO timeline_projection_events
+      (session_id, append_ordinal, event_id, ts, seq, epoch, type, source, confidence, text, payload_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 1, 'assistant.text', 'daemon', 'high', ?, ?, ?, ?)`);
+    const timelineDir = join(tempHome!, '.imcodes', 'timeline');
+    mkdirSync(timelineDir, { recursive: true });
+    const errQJsonlPath = join(timelineDir, 's_err_q.jsonl');
+    writeFileSync(errQJsonlPath, 'placeholder\n');
+    const errQStat = statSync(errQJsonlPath);
+    seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_err_del', 1500, 0, 0, 1, 'ready', NULL)`).run();
+    seeder.prepare(`INSERT INTO timeline_projection_sessions VALUES ('s_err_q', 300, ?, ?, 1, 'ready', NULL)`)
+      .run(errQStat.size, Math.trunc(errQStat.mtimeMs));
+    seeder.exec('BEGIN');
+    for (let i = 1; i <= 1500; i += 1) {
+      insert.run('s_err_del', i, `ed-${i}`, i, i, bigText, JSON.stringify({ text: bigText }), i, i);
+    }
+    for (let i = 1; i <= 300; i += 1) {
+      insert.run('s_err_q', i, `eq-${i}`, i, i, bigText, JSON.stringify({ text: bigText }), i, i);
+    }
+    seeder.exec('COMMIT');
+    seeder.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+    const dbSizeBaseline = statSync(dbPath).size;
+    // Grow WAL >1,500 frames by adding more s_err_del rows that will also be deleted.
+    seeder.exec('BEGIN');
+    for (let i = 1501; i <= 3000; i += 1) {
+      insert.run('s_err_del', i, `ed-${i}`, i, i, bigText, JSON.stringify({ text: bigText }), i, i);
+    }
+    seeder.exec('COMMIT');
+    seeder.close();
+
+    let failCount = 0;
+    let recoveryCkptPromise: Promise<unknown> | null = null;
+    workerMod.setLargeWalCheckpointRunnerForTests(async (defaultRunner) => {
+      failCount += 1;
+      if (failCount <= 2) {
+        throw new Error('SQLITE_FULL: database or disk is full');
+      }
+      recoveryCkptPromise = defaultRunner();
+      return recoveryCkptPromise;
+    });
+
+    try {
+      expect((await request({ id: 'del-full', type: 'deleteSession', payload: { sessionId: 's_err_del' } })).ok).toBe(true);
+
+      // Run two failing deferred maintenance ticks -> no unhandledRejection, warning rate-limited once, queryHistory works.
+      await vi.advanceTimersToNextTimerAsync();
+      await vi.advanceTimersToNextTimerAsync();
+      expect(failCount).toBe(2);
+      expect(unhandled).toHaveLength(0);
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+
+      const qRes = await request({ id: 'q-after-err', type: 'queryHistory', payload: { sessionId: 's_err_q', limit: 5 } });
+      expect(qRes.ok).toBe(true);
+      expect((qRes.result as { events: TimelineEvent[] }).events).toHaveLength(5);
+
+      // Third tick recovers and completes large-WAL checkpoint + shrinkage cleanly.
+      await vi.advanceTimersToNextTimerAsync();
+      vi.useRealTimers();
+      if (recoveryCkptPromise) await recoveryCkptPromise;
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && (statSync(`${dbPath}-wal`).size > 0 || statSync(dbPath).size >= dbSizeBaseline)) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(failCount).toBe(3);
+      expect(statSync(`${dbPath}-wal`).size).toBe(0);
+      expect(statSync(dbPath).size).toBeLessThan(dbSizeBaseline);
+      expect((await request({ id: 'sd-err', type: 'shutdown', payload: {} })).ok).toBe(true);
+    } finally {
+      workerMod.setLargeWalCheckpointRunnerForTests(undefined);
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 });
