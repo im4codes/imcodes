@@ -25,7 +25,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -54,6 +54,16 @@ function run(command, args, options = {}) {
   });
 }
 
+function resolveCommandOnPath(commandName, env = process.env) {
+  if (!commandName || isAbsolute(commandName)) return commandName;
+  const pathValue = env.PATH ?? env.Path ?? '';
+  for (const dir of pathValue.split(delimiter).filter(Boolean)) {
+    const candidate = join(dir, commandName);
+    if (existsSync(candidate)) return candidate;
+  }
+  return commandName;
+}
+
 export function resolveNpmCliJs(npmCommand, nodeExecPath = process.execPath, env = process.env) {
   const candidates = [];
   if (
@@ -64,7 +74,8 @@ export function resolveNpmCliJs(npmCommand, nodeExecPath = process.execPath, env
     candidates.push(env.npm_execpath);
   }
   const roots = [dirname(nodeExecPath)];
-  if (npmCommand && isAbsolute(npmCommand)) roots.unshift(dirname(npmCommand));
+  const resolvedNpm = resolveCommandOnPath(npmCommand, env);
+  if (resolvedNpm && isAbsolute(resolvedNpm)) roots.unshift(dirname(resolvedNpm));
   for (const root of roots) {
     candidates.push(
       join(root, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
@@ -186,18 +197,62 @@ export function repairNodeDatachannel(options = {}) {
   }
 
   let attempted = false;
-  if (existsSync(join(dependencyDir, 'package.json'))) {
-    attempted = true;
-    log('node-datachannel native addon unavailable — rebuilding with lifecycle scripts enabled');
-    const rebuild = runNpm([
-      'rebuild', '--global=false', '--prefix', packageRoot,
-      'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
-    ], packageRoot);
-    if (rebuild.status !== 0) {
-      log(`node-datachannel rebuild returned non-zero [exit ${rebuild.status} signal ${rebuild.signal ?? 'none'}]; trying isolated dependency reinstall`);
+  let rebuildSnapshotDir = '';
+  try {
+    if (existsSync(join(dependencyDir, 'package.json'))) {
+      attempted = true;
+      log('node-datachannel native addon unavailable — rebuilding with lifecycle scripts enabled');
+      try {
+        rebuildSnapshotDir = join(nodeModulesDir, `.node-datachannel-rebuild-snapshot-${process.pid}-${Date.now()}`);
+        cpSync(dependencyDir, rebuildSnapshotDir, { recursive: true, dereference: true });
+      } catch (snapshotErr) {
+        if (rebuildSnapshotDir && existsSync(rebuildSnapshotDir)) {
+          try { rmSync(rebuildSnapshotDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        }
+        rebuildSnapshotDir = '';
+        log(`node-datachannel rebuild snapshot failed: ${snapshotErr instanceof Error ? snapshotErr.message : String(snapshotErr)}`);
+      }
+      const rebuild = runNpm([
+        'rebuild', '--global=false', '--prefix', packageRoot,
+        'node-datachannel', '--ignore-scripts=false', '--foreground-scripts',
+      ], packageRoot);
+      if (verify(packageRoot)) {
+        log('node-datachannel repair succeeded');
+        return { available: true, attempted, repaired: true };
+      }
+      if (rebuild.status !== 0) {
+        log(`node-datachannel rebuild returned non-zero [exit ${rebuild.status} signal ${rebuild.signal ?? 'none'}]; trying isolated dependency reinstall`);
+      } else {
+        log('node-datachannel rebuild completed but verification failed; trying isolated dependency reinstall');
+      }
+      // Restore the pre-rebuild snapshot before isolated reinstall so any in-place
+      // lifecycle script writes never remain if isolated reinstall fails.
+      if (rebuildSnapshotDir && existsSync(rebuildSnapshotDir)) {
+        let failedRebuildDir = '';
+        try {
+          if (existsSync(dependencyDir)) {
+            failedRebuildDir = join(nodeModulesDir, `.node-datachannel-failed-rebuild-${process.pid}-${Date.now()}`);
+            renameSync(dependencyDir, failedRebuildDir);
+          }
+          renameSync(rebuildSnapshotDir, dependencyDir);
+          rebuildSnapshotDir = '';
+          if (failedRebuildDir && existsSync(failedRebuildDir)) {
+            try { rmSync(failedRebuildDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+          }
+        } catch (restoreErr) {
+          if (failedRebuildDir && existsSync(failedRebuildDir) && !existsSync(dependencyDir)) {
+            try { renameSync(failedRebuildDir, dependencyDir); } catch { /* best-effort */ }
+          }
+          log(`node-datachannel rebuild snapshot restore failed: ${restoreErr instanceof Error ? restoreErr.message : String(restoreErr)}`);
+        }
+      }
+    } else {
+      log('node-datachannel package missing or incomplete — trying isolated dependency reinstall');
     }
-  } else {
-    log('node-datachannel package missing or incomplete — trying isolated dependency reinstall');
+  } finally {
+    if (rebuildSnapshotDir && existsSync(rebuildSnapshotDir)) {
+      try { rmSync(rebuildSnapshotDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
   }
 
   if (!verify(packageRoot)) {

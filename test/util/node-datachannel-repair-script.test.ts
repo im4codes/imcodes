@@ -345,10 +345,29 @@ describe('node-datachannel optional dependency decoupling', () => {
     }));
     writeFileSync(join(depDir, 'index.js'), "throw new Error('preexisting broken addon');\n");
     writeFileSync(fakeNpmJs, [
-      "const { appendFileSync } = require('node:fs');",
+      "const { appendFileSync, mkdirSync, writeFileSync } = require('node:fs');",
+      "const { join } = require('node:path');",
       "const args = process.argv.slice(2);",
       `appendFileSync(${JSON.stringify(npmLogPath)}, JSON.stringify({ subcmd: args[0], args, cwd: process.cwd() }) + '\\n');`,
-      "process.exit(args[0] === 'install' ? 217 : 2);",
+      "if (args[0] === 'rebuild') {",
+      "  const depRoot = join(process.cwd(), 'node_modules', 'node-datachannel');",
+      "  mkdirSync(join(depRoot, 'build'), { recursive: true });",
+      "  writeFileSync(join(depRoot, 'index.js'), \"throw new Error('corrupted by failed rebuild');\\n\");",
+      "  writeFileSync(join(depRoot, 'build', 'partial.o'), 'dirty');",
+      "  process.exit(2);",
+      "}",
+      "if (args[0] === 'install') {",
+      "  if (process.env.TEST_BROKEN_STAGING === '1') {",
+      "    const prefix = args[args.indexOf('--prefix') + 1];",
+      "    const staged = join(prefix, 'node_modules', 'node-datachannel');",
+      "    mkdirSync(staged, { recursive: true });",
+      "    writeFileSync(join(staged, 'package.json'), JSON.stringify({ name: 'node-datachannel', version: '0.32.3', type: 'module', main: './index.js' }));",
+      "    writeFileSync(join(staged, 'index.js'), \"throw new Error('broken staging install');\\n\");",
+      "    process.exit(0);",
+      "  }",
+      "  process.exit(217);",
+      "}",
+      "process.exit(0);",
     ].join('\n'));
     if (process.platform === 'win32') {
       writeFileSync(fakeNpmWrapper, `@echo off\r\n"${process.execPath}" "${fakeNpmJs}" %*\r\n`);
@@ -364,15 +383,34 @@ describe('node-datachannel optional dependency decoupling', () => {
 
     expect(result).toEqual({ available: false, attempted: true, repaired: false, reason: 'verification_failed' });
     const calls = readFileSync(npmLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { subcmd: string; args: string[]; cwd: string });
+    expect(calls.map((c) => c.subcmd)).toEqual(['rebuild', 'install']);
     const installCall = calls.find((c) => c.subcmd === 'install');
     expect(installCall).toBeDefined();
     expect(installCall!.args[installCall!.args.indexOf('--prefix') + 1]).not.toBe(resolve(pkgRoot));
     expect(installCall!.cwd).not.toBe(resolve(pkgRoot));
-    // Sibling pino and pre-existing node-datachannel must be completely untouched.
+    // Sibling pino and pre-existing node-datachannel (restored after destructive rebuild) must be intact.
     expect(JSON.parse(readFileSync(join(pinoDir, 'package.json'), 'utf8'))).toEqual({ name: 'pino', version: '9.0.0' });
     expect(readFileSync(join(pinoDir, 'pino.js'), 'utf8')).toBe('export default function pino() {}\n');
     expect(readFileSync(join(depDir, 'index.js'), 'utf8')).toBe("throw new Error('preexisting broken addon');\n");
+    expect(existsSync(join(depDir, 'build', 'partial.o'))).toBe(false);
     expect(readdirSync(join(pkgRoot, 'node_modules')).filter((name) => name.startsWith('.node-datachannel-'))).toEqual([]);
+
+    // Same guarantee when isolated install exits 0 but fails staging verification.
+    process.env.TEST_BROKEN_STAGING = '1';
+    try {
+      const stagingFailed = repairNodeDatachannel({
+        packageRoot: pkgRoot,
+        npmCommand: fakeNpmWrapper,
+        npmCli: fakeNpmJs,
+      });
+      expect(stagingFailed).toEqual({ available: false, attempted: true, repaired: false, reason: 'verification_failed' });
+      expect(readFileSync(join(depDir, 'index.js'), 'utf8')).toBe("throw new Error('preexisting broken addon');\n");
+      expect(existsSync(join(depDir, 'build', 'partial.o'))).toBe(false);
+      expect(readFileSync(join(pinoDir, 'pino.js'), 'utf8')).toBe('export default function pino() {}\n');
+      expect(readdirSync(join(pkgRoot, 'node_modules')).filter((name) => name.startsWith('.node-datachannel-'))).toEqual([]);
+    } finally {
+      delete process.env.TEST_BROKEN_STAGING;
+    }
   });
 
   it('installs in staging, rejects parent-level decoy unless staging itself works, then swaps only node-datachannel cleanly', () => {
