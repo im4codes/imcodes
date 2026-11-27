@@ -11,6 +11,9 @@ const BASH_RC_FILENAME = 'bash-rc.sh';
 const ZDOTDIR_NAME = 'zdotdir';
 const FISH_DATA_DIR_NAME = 'fish-data';
 const IMCODES_ZSH_WRAPPER_DIR_ENV = 'IMCODES_ZSH_WRAPPER_DIR' as const;
+const IMCODES_FISH_DATA_DIR_ENV = 'IMCODES_FISH_DATA_DIR' as const;
+const IMCODES_ORIG_XDG_DATA_SET_ENV = 'IMCODES_ORIG_XDG_DATA_SET' as const;
+const IMCODES_ORIG_XDG_DATA_HOME_ENV = 'IMCODES_ORIG_XDG_DATA_HOME' as const;
 
 const SAFE_SESSION_NAME_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const FISH_SAFE_SESSION_NAME_RE = /^[A-Za-z0-9_]{1,72}$/;
@@ -240,10 +243,25 @@ function shellArgQuote(value: string): string {
   return shellSingleQuote(value);
 }
 
+function buildFishInitCommand(fishHistoryName: string): string {
+  return [
+    `set -g fish_history ${fishHistoryName}`,
+    `if test "$XDG_DATA_HOME" = "$${IMCODES_FISH_DATA_DIR_ENV}"`,
+    `if test "$${IMCODES_ORIG_XDG_DATA_SET_ENV}" = 1`,
+    `set -gx XDG_DATA_HOME "$${IMCODES_ORIG_XDG_DATA_HOME_ENV}"`,
+    'else',
+    'set -e XDG_DATA_HOME',
+    'end',
+    'end',
+    `set -e ${IMCODES_FISH_DATA_DIR_ENV} ${IMCODES_ORIG_XDG_DATA_SET_ENV} ${IMCODES_ORIG_XDG_DATA_HOME_ENV}`,
+  ].join('; ');
+}
+
 /**
  * Extra launch arguments for interactive shells whose history isolation requires startup flags:
  * - POSIX / Windows Git Bash: `--rcfile` wrapper enforcing per-session `HISTFILE`
- * - Fish: `-C 'set -g fish_history <per-session>'` applied after user `config.fish`
+ * - Fish: `-C '...'` enforcing per-session `fish_history` and restoring original `XDG_DATA_HOME`
+ *   before user commands run so child processes keep their normal XDG data path
  * Returns `''` for native Windows shells (`cmd`, `powershell`, `pwsh`) and other POSIX shells.
  */
 export function buildShellHistoryLaunchArgs(shellBin?: string | null, sessionName?: string): string {
@@ -255,7 +273,7 @@ export function buildShellHistoryLaunchArgs(shellBin?: string | null, sessionNam
   if (base === 'fish' && sessionName) {
     const fishHistoryName = resolveFishHistoryName(sessionName);
     if (!fishHistoryName) return '';
-    return ` -C ${shellArgQuote(`set -g fish_history ${fishHistoryName}`)}`;
+    return ` -C ${shellArgQuote(buildFishInitCommand(fishHistoryName))}`;
   }
   return '';
 }
@@ -276,7 +294,16 @@ export function shellHistoryEnv(
     if (!fishHistPath) return {};
     const fishDataDir = ensureFishDataDir();
     assertNotRealImcodesPathInTests(fishHistPath, 'fish shell history file');
-    return { XDG_DATA_HOME: fishDataDir };
+    const origXdgDataHome = process.env.XDG_DATA_HOME;
+    const fishEnv: Record<string, string> = {
+      XDG_DATA_HOME: fishDataDir,
+      [IMCODES_FISH_DATA_DIR_ENV]: fishDataDir,
+      [IMCODES_ORIG_XDG_DATA_SET_ENV]: origXdgDataHome !== undefined ? '1' : '0',
+    };
+    if (origXdgDataHome !== undefined) {
+      fishEnv[IMCODES_ORIG_XDG_DATA_HOME_ENV] = origXdgDataHome;
+    }
+    return fishEnv;
   }
 
   const filePath = resolveShellHistoryFilePath(sessionName);

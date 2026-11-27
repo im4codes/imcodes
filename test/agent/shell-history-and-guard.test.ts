@@ -165,20 +165,40 @@ describe('shell history isolation & prompt-injection guard', () => {
     expect(env1.XDG_DATA_HOME).toBeUndefined();
     expect(existsSync(join(dir, 'zdotdir', '.zshrc'))).toBe(true);
 
-    // Fish gets scoped XDG_DATA_HOME + valid non-default fish_history launch args, without touching other shells
+    // Fish gets scoped XDG_DATA_HOME + original-XDG snapshot + valid non-default fish_history launch args
+    vi.stubEnv('XDG_DATA_HOME', '/tmp/custom-xdg-data');
     const fishEnv = shellHistoryEnv('deck-sub-fish-1', 'shell', '/usr/bin/fish');
     const fishName = resolveFishHistoryName('deck-sub-fish-1');
     const fishNameUnderscore = resolveFishHistoryName('deck_sub_fish_1');
     expect(fishName).toMatch(/^[A-Za-z_][A-Za-z0-9_]*$/);
     expect(fishName).not.toBe('fish');
     expect(fishName).not.toBe(fishNameUnderscore);
-    expect(fishEnv).toEqual({ XDG_DATA_HOME: resolveFishDataDir() });
+    expect(fishEnv).toEqual({
+      XDG_DATA_HOME: resolveFishDataDir(),
+      IMCODES_FISH_DATA_DIR: resolveFishDataDir(),
+      IMCODES_ORIG_XDG_DATA_SET: '1',
+      IMCODES_ORIG_XDG_DATA_HOME: '/tmp/custom-xdg-data',
+    });
+    vi.unstubAllEnvs();
+    vi.stubEnv('IMCODES_HOME', stateDir);
+    const origXdg = process.env.XDG_DATA_HOME;
+    delete process.env.XDG_DATA_HOME;
+    try {
+      expect(shellHistoryEnv('deck-sub-fish-unset', 'shell', '/usr/bin/fish')).toEqual({
+        XDG_DATA_HOME: resolveFishDataDir(),
+        IMCODES_FISH_DATA_DIR: resolveFishDataDir(),
+        IMCODES_ORIG_XDG_DATA_SET: '0',
+      });
+    } finally {
+      if (origXdg !== undefined) process.env.XDG_DATA_HOME = origXdg;
+    }
     expect(resolveFishHistoryFilePath('deck-sub-fish-1')).toBe(
       join(resolveFishDataDir(), 'fish', `${fishName}_history`),
     );
-    expect(buildShellHistoryLaunchArgs('/usr/bin/fish', 'deck-sub-fish-1')).toBe(
-      ` -C 'set -g fish_history ${fishName}'`,
-    );
+    const fishArgs = buildShellHistoryLaunchArgs('/usr/bin/fish', 'deck-sub-fish-1');
+    expect(fishArgs).toContain(`set -g fish_history ${fishName}`);
+    expect(fishArgs).toContain('set -gx XDG_DATA_HOME "$IMCODES_ORIG_XDG_DATA_HOME"');
+    expect(fishArgs).toContain('set -e XDG_DATA_HOME');
 
     // Shared resolveShellBin on Windows picks process.env.SHELL POSIX shells too + emits Git Bash --rcfile
     const origPlatform = process.platform;
@@ -576,8 +596,13 @@ describe('shell history isolation & prompt-injection guard', () => {
     const fakeHome = join(stateDir, 'fish-home');
     const fakeCfg = join(fakeHome, '.config', 'fish');
     const fakeSharedData = join(fakeHome, '.local', 'share', 'fish');
+    const fakeUserXdgData = join(fakeHome, 'custom-xdg-data');
     mkdirSync(fakeCfg, { recursive: true });
     mkdirSync(fakeSharedData, { recursive: true });
+    mkdirSync(join(fakeUserXdgData, 'myapp'), { recursive: true });
+    mkdirSync(join(fakeHome, '.local', 'share', 'myapp'), { recursive: true });
+    writeFileSync(join(fakeUserXdgData, 'myapp', 'token.txt'), 'ORIG_XDG_READ_OK', 'utf8');
+    writeFileSync(join(fakeHome, '.local', 'share', 'myapp', 'token.txt'), 'DEFAULT_LOCAL_READ_OK', 'utf8');
 
     const sharedFishHist = join(fakeSharedData, 'fish_history');
     writeFileSync(sharedFishHist, '- cmd: echo SHARED_FISH_UNTOUCHED\n  when: 1700000000\n', 'utf8');
@@ -591,12 +616,26 @@ describe('shell history isolation & prompt-injection guard', () => {
     const driver = new ShellDriver();
     const s1 = 'deck_sub_fish_real1';
     const s2 = 'deck-sub-fish-real2';
+    const sUnset = 'deck_sub_fish_unset';
     const cmd1 = driver.buildLaunchCommand(s1, { shellBin: fishBin });
     const cmd2 = driver.buildLaunchCommand(s2, { shellBin: fishBin });
+    const cmdUnset = driver.buildLaunchCommand(sUnset, { shellBin: fishBin });
+
+    vi.stubEnv('XDG_DATA_HOME', fakeUserXdgData);
     const env1 = shellHistoryEnv(s1, 'shell', fishBin);
     const env2 = shellHistoryEnv(s2, 'shell', fishBin);
+    const origXdg = process.env.XDG_DATA_HOME;
+    delete process.env.XDG_DATA_HOME;
+    let envUnset: Record<string, string>;
+    try {
+      envUnset = shellHistoryEnv(sUnset, 'shell', fishBin);
+    } finally {
+      if (origXdg !== undefined) process.env.XDG_DATA_HOME = origXdg;
+    }
+
     const hist1 = resolveFishHistoryFilePath(s1)!;
     const hist2 = resolveFishHistoryFilePath(s2)!;
+    const histUnset = resolveFishHistoryFilePath(sUnset)!;
 
     const runInteractiveFish = (launchCmd: string, extraEnv: Record<string, string>, commands: string[]) => {
       const py = [
@@ -644,21 +683,36 @@ describe('shell history isolation & prompt-injection guard', () => {
       return res.stdout;
     };
 
-    const out1 = runInteractiveFish(cmd1, env1, ['echo CFG=$FISH_CFG_MARKER HIST=$fish_history', 'echo ONLY_IN_FISH_1']);
+    const childReadCmd =
+      'python3 -c "import os; print(\'SET=\' + str(\'XDG_DATA_HOME\' in os.environ) + \':\' + open(os.path.join(os.environ.get(\'XDG_DATA_HOME\', os.path.expanduser(\'~/.local/share\')), \'myapp\', \'token.txt\')).read())"';
+
+    const out1 = runInteractiveFish(cmd1, env1, [
+      'echo CFG=$FISH_CFG_MARKER HIST=$fish_history',
+      childReadCmd,
+      'echo ONLY_IN_FISH_1',
+    ]);
     const out2 = runInteractiveFish(cmd2, env2, ['history', 'echo ONLY_IN_FISH_2']);
     const out1Restart = runInteractiveFish(cmd1, env1, ['history']);
+    const outUnset1 = runInteractiveFish(cmdUnset, envUnset, [childReadCmd, 'echo ONLY_IN_FISH_UNSET']);
+    const outUnsetRestart = runInteractiveFish(cmdUnset, envUnset, ['history']);
 
     expect(out1).toContain(`CFG=yes HIST=${resolveFishHistoryName(s1)}`);
+    expect(out1).toContain('SET=True:ORIG_XDG_READ_OK');
+    expect(outUnset1).toContain('SET=False:DEFAULT_LOCAL_READ_OK');
+    expect(outUnsetRestart).toContain('ONLY_IN_FISH_UNSET');
     expect(out2).not.toContain('SHARED_FISH_UNTOUCHED');
     expect(out2).not.toContain('ONLY_IN_FISH_1');
     expect(out1Restart).toContain('ONLY_IN_FISH_1');
     expect(out1Restart).not.toContain('SHARED_FISH_UNTOUCHED');
     expect(out1Restart).not.toContain('ONLY_IN_FISH_2');
     expect(readFileSync(sharedFishHist, 'utf8')).toBe('- cmd: echo SHARED_FISH_UNTOUCHED\n  when: 1700000000\n');
+    expect(existsSync(join(fakeUserXdgData, 'fish', `${resolveFishHistoryName(s1)}_history`))).toBe(false);
+    expect(existsSync(join(fakeSharedData, `${resolveFishHistoryName(sUnset)}_history`))).toBe(false);
     expect(readFileSync(hist1, 'utf8')).toContain('ONLY_IN_FISH_1');
     expect(readFileSync(hist1, 'utf8')).not.toContain('ONLY_IN_FISH_2');
     expect(readFileSync(hist2, 'utf8')).toContain('ONLY_IN_FISH_2');
     expect(readFileSync(hist2, 'utf8')).not.toContain('ONLY_IN_FISH_1');
+    expect(readFileSync(histUnset, 'utf8')).toContain('ONLY_IN_FISH_UNSET');
 
     // Closing s1 deletes only s1's Fish history file, preserving s2's file.
     cleanupShellHistoryFile(s1);
