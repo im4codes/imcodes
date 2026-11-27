@@ -579,6 +579,168 @@ describe('ChatView — switch bottom-pin guarantees', () => {
     }
   });
 
+  it('reconciles downward smooth locate when an image below an intermediate viewport row grows +300px mid-scroll and preserves cancel on End', async () => {
+    const events = [
+      userEvent('r-top', 'top history prompt', 1000),
+      assistantEvent('r-img', 'mid image:\n\n![mid](https://example.test/mid.png)', 2000),
+      userEvent('r-target', 'located lower prompt', 3000),
+      assistantEvent('r-tail', 'latest reply', 4000),
+    ];
+    const chat = await mountSwitchHarness({
+      serverId: 'srv-1',
+      sessionId: 'deck_locate_downward_mid_img',
+      visible: true,
+      events,
+      initialScrollHeight: 2000,
+      initialClientHeight: 200,
+      messagePinsEnabled: true,
+    });
+    expect(chat.scrollTop).toBe(1800);
+
+    const topEl = chat.container.querySelector('[data-event-id="r-top"]') as HTMLElement | null;
+    const imgEl = chat.container.querySelector('img[alt="mid"]') as HTMLImageElement | null;
+    const targetEl = chat.container.querySelector('[data-event-id="r-target"]') as HTMLElement | null;
+    expect(topEl).not.toBeNull();
+    expect(imgEl).not.toBeNull();
+    expect(targetEl).not.toBeNull();
+
+    let midImgGrowth = 0;
+    let currentTop = 1800;
+    let currentHeight = 2000;
+    let fromSmoothStep = false;
+    let smoothCancelledByDirectWrite = false;
+    let activeSmooth: { dest: number; timer: number | null } | null = null;
+    let resolveMidReached: (() => void) | null = null;
+    const midReached = new Promise<void>((resolve) => {
+      resolveMidReached = resolve;
+    });
+    const clamp = (v: number) => Math.max(0, Math.min(v, Math.max(0, currentHeight - 200)));
+
+    Object.defineProperty(chat.scrollEl, 'scrollHeight', { configurable: true, get: () => currentHeight });
+    Object.defineProperty(chat.scrollEl, 'clientHeight', { configurable: true, get: () => 200 });
+    Object.defineProperty(chat.scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => currentTop,
+      set: (v: number) => {
+        if (activeSmooth && !fromSmoothStep) {
+          smoothCancelledByDirectWrite = true;
+          if (activeSmooth.timer !== null) window.clearTimeout(activeSmooth.timer);
+          activeSmooth = null;
+        }
+        currentTop = clamp(v);
+      },
+    });
+    const completeSmooth = () => {
+      if (!activeSmooth) return;
+      const { dest, timer } = activeSmooth;
+      if (timer !== null) window.clearTimeout(timer);
+      activeSmooth = null;
+      fromSmoothStep = true;
+      currentTop = clamp(dest);
+      fromSmoothStep = false;
+      fireEvent.scroll(chat.scrollEl);
+      chat.scrollEl.dispatchEvent(new Event('scrollend'));
+    };
+    const scrollToImpl = vi.fn((opts?: ScrollToOptions) => {
+      const dest = typeof opts?.top === 'number' ? opts.top : 0;
+      if (opts?.behavior !== 'smooth') {
+        if (activeSmooth) {
+          if (activeSmooth.timer !== null) window.clearTimeout(activeSmooth.timer);
+          activeSmooth = null;
+        }
+        fromSmoothStep = true;
+        currentTop = clamp(dest);
+        fromSmoothStep = false;
+        fireEvent.scroll(chat.scrollEl);
+        return;
+      }
+      if (activeSmooth?.timer != null) window.clearTimeout(activeSmooth.timer);
+      const midTimer = window.setTimeout(() => {
+        if (!activeSmooth) return;
+        activeSmooth.timer = null;
+        fromSmoothStep = true;
+        // Step through an intermediate scrollTop inside `r-top` (`0..260`) while `r-img` sits below `r-top`.
+        currentTop = clamp(200);
+        fromSmoothStep = false;
+        fireEvent.scroll(chat.scrollEl);
+        resolveMidReached?.();
+        resolveMidReached = null;
+      }, 10);
+      activeSmooth = { dest, timer: midTimer };
+    });
+    Object.defineProperty(chat.scrollEl, 'scrollTo', { configurable: true, writable: true, value: scrollToImpl });
+
+    const rootRectSpy = vi.spyOn(chat.scrollEl, 'getBoundingClientRect').mockReturnValue({
+      x: 0, y: 0, top: 0, left: 0, right: 320, bottom: 200, width: 320, height: 200, toJSON: () => ({}),
+    } as DOMRect);
+    const topRectSpy = vi.spyOn(topEl!, 'getBoundingClientRect').mockImplementation(() => {
+      const top = 0 - currentTop;
+      return {
+        x: 0, y: top, top, left: 0, right: 320, bottom: top + 260, width: 320, height: 260, toJSON: () => ({}),
+      } as DOMRect;
+    });
+    const targetRectSpy = vi.spyOn(targetEl!, 'getBoundingClientRect').mockImplementation(() => {
+      const contentTop = 1130 + midImgGrowth;
+      const top = contentTop - currentTop;
+      return {
+        x: 0, y: top, top, left: 0, right: 320, bottom: top + 40, width: 320, height: 40, toJSON: () => ({}),
+      } as DOMRect;
+    });
+
+    try {
+      // Scroll up to old history (`scrollTop = 0`) and disengage follow cleanly.
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      fireEvent.wheel(chat.scrollEl, { deltaY: -120 });
+      currentTop = 0;
+      fireEvent.scroll(chat.scrollEl);
+      expect(chat.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+
+      // Locate `r-target` downward (initial desired top = 1130 - 80 = 1050).
+      act(() => {
+        requestMessagePinNavigation({
+          id: 'pin-downward-mid-img',
+          serverId: 'srv-1',
+          sessionName: 'deck_locate_downward_mid_img',
+          eventId: 'r-target',
+          eventTs: 3000,
+          eventType: 'user.message',
+          text: 'located lower prompt',
+          createdAt: 1,
+          updatedAt: 1,
+        });
+      });
+
+      // Mid-smooth (`scrollTop = 200`, inside `r-top` whose delta stays 0): grow `r-img` below `r-top` and above `r-target` by +300px.
+      await midReached;
+      expect(currentTop).toBe(200);
+      midImgGrowth = 300;
+      currentHeight = 2300;
+      fireEvent(imgEl!, new Event('load', { bubbles: false }));
+      completeSmooth();
+
+      // Natural smooth finish reconciles to `1350` (not stranded at `1050` where target y=380 would be off-screen).
+      await waitFor(() => expect(currentTop).toBe(1350));
+      await chat.drainFrames();
+      expect(smoothCancelledByDirectWrite).toBe(false);
+      expect(currentTop).toBe(1350);
+      const visibleTargetRect = targetEl!.getBoundingClientRect();
+      expect(visibleTargetRect.top).toBe(80);
+      expect(visibleTargetRect.bottom).toBe(120);
+      expect(chat.container.querySelector('.chat-scroll-btn')).not.toBeNull();
+
+      // Explicit `End` releases locate ownership and jumps to bottom (`2100`).
+      fireEvent.keyDown(chat.scrollEl, { key: 'End' });
+      await chat.drainFrames();
+      expect(currentTop).toBe(2100);
+      expect(chat.container.querySelector('.chat-scroll-btn')).toBeNull();
+    } finally {
+      if (activeSmooth?.timer != null) window.clearTimeout(activeSmooth.timer);
+      rootRectSpy.mockRestore();
+      topRectSpy.mockRestore();
+      targetRectSpy.mockRestore();
+    }
+  });
+
   it('keeps virtualized >24-row chats pinned through A -> B -> C -> A switches, ResizeObserver row measurement, delayed catch-up, and img load', async () => {
     const eventsA = [userEvent('a-1', 'server A', 500)];
     const eventsB = [userEvent('b-1', 'server B', 600)];

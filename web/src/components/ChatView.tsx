@@ -1968,15 +1968,23 @@ function findEventElement(root: ParentNode, eventId: string): HTMLElement | null
 /** Center a message inside the chat's own scroll viewport. `scrollIntoView`
  * also scrolls every eligible ancestor, which can move a floating chat window
  * and push its titlebar (including the pin control) out of view. */
-function scrollEventWithinChat(container: HTMLElement, target: HTMLElement, behavior: ScrollBehavior): void {
+function computeLocateTargetTop(
+  container: HTMLElement,
+  target: HTMLElement,
+): { desiredTop: number; targetTopInContent: number; targetHeight: number } {
   const rectScale = getDomRectToLayoutScale(container);
   const containerRect = container.getBoundingClientRect();
   const targetRect = target.getBoundingClientRect();
-  const targetTop = container.scrollTop + (targetRect.top - containerRect.top) / rectScale;
+  const targetTopInContent = container.scrollTop + (targetRect.top - containerRect.top) / rectScale;
   const targetHeight = targetRect.height / rectScale;
   const centerOffset = Math.max(0, (container.clientHeight - targetHeight) / 2);
   const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
-  const top = Math.min(maxTop, Math.max(0, targetTop - centerOffset));
+  const desiredTop = Math.min(maxTop, Math.max(0, targetTopInContent - centerOffset));
+  return { desiredTop, targetTopInContent, targetHeight };
+}
+
+function scrollEventWithinChat(container: HTMLElement, target: HTMLElement, behavior: ScrollBehavior): void {
+  const { desiredTop: top } = computeLocateTargetTop(container, target);
   if (typeof container.scrollTo === 'function') {
     container.scrollTo({ top, behavior });
   } else {
@@ -4447,7 +4455,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const activeLocateSmoothRef = useRef<{
     eventId: string | null;
     destTop: number;
-    needsReconcile: boolean;
     until: number;
     cleanup?: () => void;
   } | null>(null);
@@ -4504,13 +4511,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     if (!current) return;
     activeLocateSmoothRef.current = null;
     current.cleanup?.();
-    if (!autoScrollRef.current && current.needsReconcile && current.eventId) {
+    if (!autoScrollRef.current && current.eventId) {
       const target = findEventElement(root, current.eventId);
       if (target) {
-        scrollEventWithinChat(root, target, 'auto');
-        lastScrollTopRef.current = root.scrollTop;
-        lastScrollHeightRef.current = root.scrollHeight;
-        lastClientHeightRef.current = root.clientHeight;
+        const { desiredTop, targetHeight } = computeLocateTargetTop(root, target);
+        if (targetHeight > 0 && Math.abs(root.scrollTop - desiredTop) > 1) {
+          markProgrammaticScroll();
+          scrollEventWithinChat(root, target, 'auto');
+          lastScrollTopRef.current = root.scrollTop;
+          lastScrollHeightRef.current = root.scrollHeight;
+          lastClientHeightRef.current = root.clientHeight;
+        }
       }
     }
     if (!autoScrollRef.current) {
@@ -4654,8 +4665,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   const restoreReaderAnchor = () => {
     const activeLocate = activeLocateSmoothRef.current;
     const root = scrollRef.current;
+    if (!root) return;
+    if (activeLocate) {
+      // Never write scrollTop mid-smooth-scroll (browsers abort native smooth
+      // animations on programmatic scrollTop assignment); finishActiveLocateSmooth
+      // reconciles directly around the located target by eventId once settled.
+      if (Date.now() < activeLocate.until) return;
+      finishActiveLocateSmooth(root);
+      return;
+    }
     const anchor = readerAnchorRef.current;
-    if (!root || !anchor) return;
+    if (!anchor) return;
     // Attribute lookup by iteration: ids are opaque strings, and this avoids
     // building a selector from them (no escaping rules to get wrong).
     let node: HTMLElement | null = null;
@@ -4664,7 +4684,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     }
     // The anchor row left the DOM (virtualized out): pick the row now in view.
     if (!node) {
-      if (activeLocate && Date.now() < activeLocate.until) return;
       captureReaderAnchor();
       return;
     }
@@ -4672,13 +4691,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const contentTop = ((node.getBoundingClientRect().top - root.getBoundingClientRect().top) / rectScale) + root.scrollTop;
     const delta = computeReaderAnchorDelta(anchor.contentTop, contentTop);
     if (delta === 0) return;
-    if (activeLocate && Date.now() < activeLocate.until) {
-      // Never write scrollTop mid-smooth-scroll (browsers abort native smooth
-      // animations on programmatic scrollTop assignment); defer and reconcile
-      // around the located target once smooth finishes.
-      activeLocate.needsReconcile = true;
-      return;
-    }
     const remainder = absorbTopShiftRef.current ? absorbTopShiftRef.current(delta) : delta;
     if (remainder === 0) return; // absorbed: the row is back where it was, nothing was written
     if (isTouchInteracting()) return;
@@ -5293,6 +5305,9 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   // re-anchor around the locate target rather than the pre-jump bottom row.
   const commitExplicitLocateScroll = (root: HTMLElement, target: HTMLElement) => {
     clearActiveLocateSmooth();
+    userScrollUpUntilRef.current = 0;
+    userPointerOrKeyScrollUntilRef.current = 0;
+    pointerScrollActiveRef.current = false;
     pendingVisibleScrollToBottomRef.current = false;
     pendingEngageFollowRef.current = false;
     pendingGrowthRepinRef.current = false;
@@ -5307,14 +5322,8 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       && typeof window.matchMedia === 'function'
       && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     const behavior: ScrollBehavior = reducedMotion ? 'auto' : 'smooth';
-    const rectScale = getDomRectToLayoutScale(root);
-    const rootRect = root.getBoundingClientRect();
-    const targetRect = target.getBoundingClientRect();
-    const targetTopInContent = root.scrollTop + (targetRect.top - rootRect.top) / rectScale;
-    const targetHeight = targetRect.height / rectScale;
-    const centerOffset = Math.max(0, (root.clientHeight - targetHeight) / 2);
+    const { desiredTop, targetTopInContent } = computeLocateTargetTop(root, target);
     const maxTop = Math.max(0, root.scrollHeight - root.clientHeight);
-    const desiredTop = Math.min(maxTop, Math.max(0, targetTopInContent - centerOffset));
     if (desiredTop < root.scrollTop && maxTop - desiredTop > 1) {
       lastScrollTopRef.current = root.scrollTop;
       lastScrollHeightRef.current = root.scrollHeight;
@@ -5340,7 +5349,6 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
       activeLocateSmoothRef.current = {
         eventId: targetEventId,
         destTop: desiredTop,
-        needsReconcile: false,
         until: Date.now() + 900,
         cleanup: () => {
           root.removeEventListener('scrollend', onScrollEnd);
@@ -5632,7 +5640,9 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     setShowScrollBtn(!autoScrollRef.current);
     if (!autoScrollRef.current) {
       lastScrollActivityRef.current = Date.now();
-      captureReaderAnchor();
+      if (!hasActiveLocateSmooth()) {
+        captureReaderAnchor();
+      }
     }
     lastScrollTopRef.current = scrollTop;
     lastScrollHeightRef.current = scrollHeight;
@@ -6623,7 +6633,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             canPassivePin={() => !isTouchInteracting() && !hasActiveUserScrollIntent() && !hasActiveScrollAnchorLock()}
             onProgrammaticScroll={markProgrammaticScroll}
             onRowsRendered={() => { syncPinnedTargetRef.current?.(); }}
-            onTopOffsetReconciled={() => { if (!autoScrollRef.current) captureReaderAnchor(); }}
+            onTopOffsetReconciled={() => { if (!autoScrollRef.current && !hasActiveLocateSmooth()) captureReaderAnchor(); }}
             renderItem={(item) => {
             if (item.type === 'history-gap') {
               return (
