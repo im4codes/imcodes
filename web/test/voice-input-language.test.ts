@@ -657,21 +657,6 @@ describe('voice recognition engine preference & cache switching', () => {
       await input.stopListening({ abort: true });
       await inflightStop;
       expect(stopCalls).toEqual([{ abort: false }, { abort: true }]);
-
-      // 3) When PC backend is actually 'system', short 20s upper bound is restored (not 46s)
-      (globalThis as any).__IMCODES_PC_APP__.voice.getSpeechModelStatus.mockResolvedValueOnce({
-        selectedModel: 'system',
-        activeBackend: 'system',
-        state: 'ready',
-      });
-      expect(await input.startListening(vi.fn())).toBe(true);
-      await Promise.resolve();
-      let sysSettled = false;
-      const sysStopP = input.stopListening().then(() => { sysSettled = true; });
-      await vi.advanceTimersByTimeAsync(20_500);
-      expect(sysSettled).toBe(true);
-      resolveStopFalse?.();
-      await sysStopP;
     } finally {
       vi.useRealTimers();
       delete (globalThis as any).__IMCODES_PC_APP__;
@@ -770,9 +755,12 @@ describe('active voice service tracking & formatting', () => {
     }
   });
 
-  it('tracks PC App local speech models (1.7B, 0.6B, system) and blocks stale async status overwrites', async () => {
+  it('tracks PC App local speech models (1.7B, 0.6B, system), blocks stale system status overwrite, and preserves 25s final drain', async () => {
     vi.stubGlobal('Capacitor', undefined);
     let resolveFirstStatus!: (status: any) => void;
+    let releaseSlowStop!: () => void;
+    let deferStop = true;
+    let pcSub: ((ev: any) => void) | null = null;
     const getSpeechModelStatus = vi.fn()
       .mockImplementationOnce(() => new Promise((resolve) => { resolveFirstStatus = resolve; }))
       .mockImplementationOnce(async () => ({ selectedModel: 'qwen3-0.6b', activeBackend: 'qwen3-0.6b', state: 'ready' }))
@@ -786,33 +774,54 @@ describe('active voice service tracking & formatting', () => {
         getPermissions: vi.fn(async () => ({ mic: 'granted', speech: 'granted' })),
         requestPermissions: vi.fn(async () => ({ mic: 'granted', speech: 'granted' })),
         startListening: vi.fn(async () => ({ ok: true })),
-        stopListening: vi.fn(async () => {}),
+        stopListening: vi.fn(() => (deferStop
+          ? new Promise<void>((resolve) => { releaseSlowStop = resolve; })
+          : Promise.resolve())),
         getSpeechModelStatus,
-        subscribe: () => () => {},
+        subscribe: (fn: (ev: any) => void) => { pcSub = fn; return () => { pcSub = null; }; },
       },
     };
 
     try {
-      // Session 1 starts while status is slow; stop and immediately start Session 2 with 0.6B
+      // Session 1 starts while system status is slow; stop and immediately start Session 2 with 0.6B
       await input.startListening(vi.fn());
       await input.stopListening({ abort: true });
-      await input.startListening(vi.fn());
+      const onSession2Result = vi.fn();
+      await input.startListening(onSession2Result);
       await vi.waitFor(() => {
         expect(input.getActiveVoiceService()).toEqual({ kind: 'local_pc_model', label: 'Qwen3-ASR 0.6B' });
       });
 
-      // Stale status response from Session 1 (1.7B) must NOT overwrite Session 2 (0.6B)
-      resolveFirstStatus({ selectedModel: 'qwen3-1.7b', activeBackend: 'qwen3-1.7b', state: 'ready' });
+      // Stale status response from Session 1 ('system') arrives LATE:
+      // must NOT overwrite Session 2 label OR shrink Session 2 drain below 25s!
+      resolveFirstStatus({ selectedModel: 'system', activeBackend: 'system', state: 'ready' });
       await Promise.resolve();
       await Promise.resolve();
       expect(input.getActiveVoiceService()).toEqual({ kind: 'local_pc_model', label: 'Qwen3-ASR 0.6B' });
 
-      await input.stopListening();
+      vi.useFakeTimers();
+      try {
+        let settled = false;
+        const stopP = input.stopListening().then(() => { settled = true; });
+        await vi.advanceTimersByTimeAsync(25_000);
+        expect(settled).toBe(false);
+        pcSub?.({ type: 'result', text: '乱序后25秒终解成功', isFinal: true });
+        pcSub?.({ type: 'end' });
+        releaseSlowStop();
+        await stopP;
+        expect(settled).toBe(true);
+        expect(onSession2Result).toHaveBeenLastCalledWith('乱序后25秒终解成功', true);
+      } finally {
+        vi.useRealTimers();
+      }
+
+      deferStop = false;
       await input.startListening(vi.fn());
       await vi.waitFor(() => {
         expect(input.getActiveVoiceService()).toEqual({ kind: 'local_pc_model' });
       });
       expect(input.formatActiveVoiceServiceLabel(input.getActiveVoiceService(), (k) => k, true)).toBe('voice.engine_system');
+      await input.stopListening();
     } finally {
       await input.stopListening({ abort: true });
       delete (globalThis as any).__IMCODES_PC_APP__;

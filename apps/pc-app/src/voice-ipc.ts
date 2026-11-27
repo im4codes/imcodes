@@ -413,7 +413,6 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     sessionId?: string;
     remoteEnded?: boolean;
     stopRequested?: boolean;
-    sawActivity?: boolean;
     onEvent?: (event: PcAppVoiceEvent) => void;
     loggedFirstLevel: boolean;
     loggedFirstResult: boolean;
@@ -429,12 +428,19 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     stderrBuffer: string;
     utterance: ActiveWorkerUtterance | null;
     awaitingAbortedEnd?: boolean;
+    abortedEndWait: {
+      promise: Promise<boolean>;
+      resolve: (drained: boolean) => void;
+      timer: ReturnType<typeof setTimeout>;
+    } | null;
     killTimer: ReturnType<typeof setTimeout> | null;
   }
 
   const SYSTEM_SPEECH_STOP_TIMEOUT_MS = 2_200;
   // Local Qwen3-ASR full-utterance final re-decode runs up to 30s of audio (and CPU ONNX can exceed real-time).
   const QWEN_LOCAL_FINALIZE_TIMEOUT_MS = 45_000;
+  // Bounded wait for an aborted resident worker to emit its terminating `end` before isolating it cleanly.
+  const ABORT_END_DRAIN_TIMEOUT_MS = 250;
   const DEFAULT_REMOTE_SESSION_IDLE_TIMEOUT_MS = 30_000;
   const remoteSessionIdleTimeoutMs =
     typeof deps.remoteSessionIdleTimeoutMs === 'number'
@@ -450,6 +456,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     source?: 'in-app' | 'global';
     finalizeOnly: boolean;
     aborted: boolean;
+    wakeOnCancel?: () => void;
   } | null = null;
   let activeRemoteSession: { sessionId: string; utt: ActiveWorkerUtterance } | null = null;
   let remoteStopTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1398,6 +1405,14 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     deps.sendToRenderer(PC_APP_VOICE_CHANNELS.event, payload);
   };
 
+  const resolveAbortedEndWait = (worker: ResidentMlxWorker, drained: boolean): void => {
+    const wait = worker.abortedEndWait;
+    if (!wait) return;
+    worker.abortedEndWait = null;
+    clearTimeout(wait.timer);
+    wait.resolve(drained);
+  };
+
   const shutdownMlxWorker = (target?: ResidentMlxWorker | null): void => {
     const worker = target ?? mlxWorker;
     if (!worker) return;
@@ -1407,6 +1422,8 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     if (workerSpawnInFlight && !target) {
       workerSpawnInFlight = null;
     }
+    worker.awaitingAbortedEnd = false;
+    resolveAbortedEndWait(worker, false);
     if (worker.state === 'stopping') return;
     worker.state = 'stopping';
 
@@ -1500,6 +1517,7 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         stdoutBuffer: '',
         stderrBuffer: '',
         utterance: null,
+        abortedEndWait: null,
         killTimer: null,
       };
       mlxWorker = worker;
@@ -1558,6 +1576,25 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
             continue;
           }
 
+          if (worker.awaitingAbortedEnd) {
+            if (parsed.type === 'end') {
+              worker.awaitingAbortedEnd = false;
+              resolveAbortedEndWait(worker, true);
+              continue;
+            }
+            if (parsed.type === 'error') {
+              if (
+                (parsed.code === 'unknown_command' && worker.state !== 'ready')
+                || parsed.code === 'sherpa_onnx_unavailable'
+              ) {
+                markBackendUnavailable(parsed.code);
+              }
+              appendVoiceLog(`mlx serve aborted background error code=${parsed.code} message=${parsed.message ?? '-'}`);
+            }
+            // Drop every queued pre-abort utterance frame (partial, result, level, start) until `end` confirms boundary.
+            continue;
+          }
+
           if (parsed.type === 'error') {
             if (
               (parsed.code === 'unknown_command' && worker.state !== 'ready')
@@ -1574,11 +1611,6 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
           }
 
           if (parsed.type === 'end') {
-            if (worker.awaitingAbortedEnd && !worker.utterance?.sawActivity) {
-              worker.awaitingAbortedEnd = false;
-              continue;
-            }
-            worker.awaitingAbortedEnd = false;
             const utt = worker.utterance;
             if (utt) {
               worker.utterance = null;
@@ -1589,13 +1621,6 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
               resolveUtteranceWaiters(utt);
             }
             continue;
-          }
-
-          if (parsed.type === 'start' || parsed.type === 'result') {
-            worker.awaitingAbortedEnd = false;
-            if (worker.utterance) {
-              worker.utterance.sawActivity = true;
-            }
           }
 
           if (
@@ -1620,6 +1645,8 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         }
         const wasStopping = worker.state === 'stopping';
         worker.state = 'stopping';
+        worker.awaitingAbortedEnd = false;
+        resolveAbortedEndWait(worker, false);
         const utt = worker.utterance;
         if (utt) {
           worker.utterance = null;
@@ -1650,6 +1677,8 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         }
         const wasStopping = worker.state === 'stopping';
         worker.state = 'stopping';
+        worker.awaitingAbortedEnd = false;
+        resolveAbortedEndWait(worker, false);
         const utt = worker.utterance;
         if (utt) {
           worker.utterance = null;
@@ -1715,13 +1744,63 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
     }
     if (options?.writeAbort !== false) {
       worker.awaitingAbortedEnd = true;
+      if (!worker.abortedEndWait) {
+        let resolveWait!: (drained: boolean) => void;
+        const promise = new Promise<boolean>((resolve) => {
+          resolveWait = resolve;
+        });
+        const timer = setTimeout(() => {
+          resolveAbortedEndWait(worker, false);
+        }, ABORT_END_DRAIN_TIMEOUT_MS);
+        if (typeof timer.unref === 'function') {
+          timer.unref();
+        }
+        worker.abortedEndWait = { promise, resolve: resolveWait, timer };
+      }
       try {
         worker.proc.stdin?.write(`${JSON.stringify({ cmd: 'abort' })}\n`);
       } catch {
         worker.awaitingAbortedEnd = false;
+        resolveAbortedEndWait(worker, false);
         shutdownMlxWorker(worker);
       }
     }
+  };
+
+  const waitForCleanResidentWorker = async (
+    initialWorker: ResidentMlxWorker | null,
+    variant: PcAppSpeechVariant,
+    isCancelled: () => boolean,
+    registerCancelWakeup?: (wake: () => void) => void,
+  ): Promise<ResidentMlxWorker | null> => {
+    let worker = initialWorker;
+    if (!worker || worker.state === 'stopping' || serveUnsupported) return worker;
+    if (worker.awaitingAbortedEnd && worker.abortedEndWait) {
+      const drained = await new Promise<boolean>((resolve) => {
+        let settled = false;
+        const finish = (ok: boolean) => {
+          if (settled) return;
+          settled = true;
+          resolve(ok);
+        };
+        registerCancelWakeup?.(() => finish(false));
+        void worker!.abortedEndWait!.promise.then(finish);
+      });
+      if (isCancelled()) return null;
+      if (!drained || worker.awaitingAbortedEnd || worker.state === 'stopping') {
+        worker.awaitingAbortedEnd = false;
+        resolveAbortedEndWait(worker, false);
+        shutdownMlxWorker(worker);
+        if (isWin32) {
+          try {
+            worker.proc.kill('SIGTERM');
+          } catch { /* ignore */ }
+        }
+        worker = await ensureResidentMlxWorker(variant, { skipVerify: true });
+        if (isCancelled()) return null;
+      }
+    }
+    return worker;
   };
 
   const cleanupRemoteSession = (
@@ -1811,6 +1890,8 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
       && (options?.abort || !pendingStartRequest.finalizeOnly)
     ) {
       pendingStartRequest.aborted = true;
+      pendingStartRequest.wakeOnCancel?.();
+      pendingStartRequest.wakeOnCancel = undefined;
       if (pendingStartRequest.source !== 'global') {
         notifyVoiceEvent({ type: 'end' });
       }
@@ -2013,17 +2094,28 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
             notifyVoiceEvent({ type: 'loading', variant });
           }
         }
-        const worker = await ensureResidentMlxWorker(variant, { skipVerify: alreadyReady });
+        let worker = await ensureResidentMlxWorker(variant, { skipVerify: alreadyReady });
         if (isCancelledBeforeDispatch()) {
           clearPendingStartIfCurrent();
           return { ok: false, error: 'cancelled' };
         }
         if (worker && worker.state !== 'stopping' && !serveUnsupported) {
           await stopListening({ abort: true, exceptStartSeq: myStartReq.seq });
+          worker = await waitForCleanResidentWorker(
+            worker,
+            variant,
+            isCancelledBeforeDispatch,
+            (wake) => {
+              myStartReq.wakeOnCancel = wake;
+            },
+          );
+          myStartReq.wakeOnCancel = undefined;
           if (isCancelledBeforeDispatch()) {
             clearPendingStartIfCurrent();
             return { ok: false, error: 'cancelled' };
           }
+        }
+        if (worker && worker.state !== 'stopping' && !serveUnsupported) {
           if (worker.state !== 'ready') {
             if (isGlobalSource) {
               options?.onEvent?.({ type: 'loading', variant });
@@ -2476,7 +2568,15 @@ export function createPcAppVoiceController(deps: PcAppVoiceControllerDeps) {
         return { ok: false, error: 'not_ready' };
       }
       const alreadyReady = Boolean(mlxWorker && mlxWorker.variant === variant && mlxWorker.state === 'ready');
-      const worker = await ensureResidentMlxWorker(variant, { skipVerify: alreadyReady });
+      const initialWorker = await ensureResidentMlxWorker(variant, { skipVerify: alreadyReady });
+      const worker = await waitForCleanResidentWorker(
+        initialWorker,
+        variant,
+        () =>
+          controllerDisposed
+          || activeRemoteSession !== null
+          || Boolean(activeChild || (activeWorkerUtterance && activeWorkerUtterance.source !== 'remote')),
+      );
       const postWorkerLocalActive = Boolean(
         activeChild
         || (activeWorkerUtterance && activeWorkerUtterance.source !== 'remote'),

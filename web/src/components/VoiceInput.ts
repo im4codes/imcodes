@@ -637,17 +637,18 @@ function refreshPcAppSpeechModelForSession(
   if (!readPromise) return;
   void Promise.resolve(readPromise)
     .then((choice) => {
-      if (choice === 'system' || choice === 'qwen3-0.6b' || choice === 'qwen3-1.7b') {
-        syncPcModelCacheBridge();
-        _cachedPcModelChoice = choice;
-      }
       if (
         querySeq !== _pcModelQuerySeq
         || generation !== _generation
         || !isOwnerCurrent(owner)
-        || _activeService === null
-        || _activeService.kind !== 'local_pc_model'
       ) {
+        return;
+      }
+      if (choice === 'system' || choice === 'qwen3-0.6b' || choice === 'qwen3-1.7b') {
+        syncPcModelCacheBridge();
+        _cachedPcModelChoice = choice;
+      }
+      if (_activeService === null || _activeService.kind !== 'local_pc_model') {
         return;
       }
       const label = resolvePcModelDisplayLabel(_cachedPcModelChoice);
@@ -2794,11 +2795,12 @@ function dispatchNativeAbortStop(session: NativeSession): Promise<void> {
 }
 
 function getNativeStopDrainTimeoutMs(session: NativeSession | null): number {
-  if (!(session?.isPcApp ?? isPcAppNativeSpeech())) {
-    return NATIVE_STOP_DRAIN_MS;
-  }
-  syncPcModelCacheBridge();
-  return _cachedPcModelChoice === 'system' ? NATIVE_STOP_DRAIN_MS : PC_APP_FINALIZE_DRAIN_MS;
+  // PC App main process enforces its own exact stop timeout (2.2s system / 45s Qwen);
+  // keep Web's PC bridge ceiling at 46s so stale/cross-session system status cannot cut off a 25s+ Qwen finalize,
+  // while Capacitor mobile continues using NATIVE_STOP_DRAIN_MS (20s).
+  return (session?.isPcApp ?? isPcAppNativeSpeech())
+    ? PC_APP_FINALIZE_DRAIN_MS
+    : NATIVE_STOP_DRAIN_MS;
 }
 
 function beginNativeSessionAbort(

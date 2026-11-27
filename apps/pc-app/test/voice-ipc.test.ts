@@ -1688,6 +1688,16 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       runHelperAsync: async () => JSON.stringify({ mic: 'granted', speech: 'granted', speechAvailable: true }),
       spawnHelper: () => {
         const proc = createFakeChildProcess();
+        const origWrite = proc.stdin.write;
+        proc.stdin.write = vi.fn((chunk: unknown) => {
+          const text = typeof chunk === 'string' ? chunk : String(chunk);
+          if (text.includes('"cmd":"abort"')) {
+            queueMicrotask(() => {
+              proc.stdout.emit('data', '{"type":"end"}\n');
+            });
+          }
+          return origWrite(chunk);
+        }) as unknown as typeof proc.stdin.write;
         spawned.push(proc);
         return proc as unknown as ChildProcess;
       },
@@ -1812,6 +1822,16 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       runHelperAsync: async () => JSON.stringify({ mic: 'granted', speech: 'granted', speechAvailable: true }),
       spawnHelper: () => {
         const proc = createFakeChildProcess();
+        const origWrite = proc.stdin.write;
+        proc.stdin.write = vi.fn((chunk: unknown) => {
+          const text = typeof chunk === 'string' ? chunk : String(chunk);
+          if (text.includes('"cmd":"abort"')) {
+            queueMicrotask(() => {
+              proc.stdout.emit('data', '{"type":"end"}\n');
+            });
+          }
+          return origWrite(chunk);
+        }) as unknown as typeof proc.stdin.write;
         spawned.push(proc);
         return proc as unknown as ChildProcess;
       },
@@ -1933,6 +1953,16 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       runHelperAsync: async () => JSON.stringify({ mic: 'granted', speech: 'granted', speechAvailable: true }),
       spawnHelper: () => {
         const proc = createFakeChildProcess();
+        const origWrite = proc.stdin.write;
+        proc.stdin.write = vi.fn((chunk: unknown) => {
+          const text = typeof chunk === 'string' ? chunk : String(chunk);
+          if (text.includes('"cmd":"abort"')) {
+            queueMicrotask(() => {
+              proc.stdout.emit('data', '{"type":"end"}\n');
+            });
+          }
+          return origWrite(chunk);
+        }) as unknown as typeof proc.stdin.write;
         spawned.push(proc);
         return proc as unknown as ChildProcess;
       },
@@ -3016,16 +3046,23 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       expect((await voice.getSpeechModelStatus()).state).toBe('ready');
     });
 
-    // A: start -> abort before stop (reuses w0) -> immediate start -> delayed old end arrives BEFORE new start -> new utterance keeps receiving final!
+    // A: start -> abort before stop (waits for old `end` BEFORE dispatching new start) -> old partial + end arrive -> reuses clean w0!
     expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
     await voice.stopListening({ abort: true });
     expect(procs[0]!.kill).not.toHaveBeenCalled();
 
     sentEvents.length = 0;
-    expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+    procs[0]!.stdin.write.mockClear();
+    const restartP = voice.startListening({ locale: 'zh-CN' });
+    await Promise.resolve();
+    await Promise.resolve();
+    // New start MUST wait for old `end` before writing `cmd:start`!
+    expect(procs[0]!.stdin.write).not.toHaveBeenCalledWith(expect.stringContaining('"cmd":"start"'));
+    // Queued pre-abort partial AND terminating old `end` arrive together in one stdout chunk:
+    procs[0]!.stdout.emit('data', '{"type":"result","text":"旧取消残留","isFinal":false}\n{"type":"end"}\n');
+    expect(await restartP).toEqual({ ok: true });
     expect(procs).toHaveLength(1);
-    // Old aborted session end arrives asynchronously before new session emits start:
-    procs[0]!.stdout.emit('data', '{"type":"end"}\n');
+    expect(procs[0]!.stdin.write).toHaveBeenCalledWith('{"cmd":"start","locale":"zh-CN"}\n');
     // New session starts, decodes final, and ends:
     procs[0]!.stdout.emit('data', '{"type":"start"}\n{"type":"result","text":"新会话终解","isFinal":true}\n{"type":"end"}\n');
     expect(sentEvents).toEqual([
@@ -3034,19 +3071,50 @@ describe('PC App voice permissions, Settings deep-link, and Swift helper IPC', (
       { type: 'end' },
     ]);
 
-    // B: start -> normal stop (in-flight final) -> abort -> immediate start -> spawns fresh worker w1 & ignores late w0 events
+    // B: rapid double abort while waiting on unconfirmed aborted `end` -> cancels immediately without sending start!
+    // C: no old `end` recovery -> bounded timeout isolates unresponsive w0 & spawns fresh w1!
+    vi.useFakeTimers();
+    try {
+      expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
+      await voice.stopListening({ abort: true });
+      sentEvents.length = 0;
+      procs[0]!.stdin.write.mockClear();
+      const pendingRestartP = voice.startListening({ locale: 'zh-CN' });
+      await vi.advanceTimersByTimeAsync(10);
+      await voice.stopListening({ abort: true });
+      expect(await pendingRestartP).toEqual({ ok: false, error: 'cancelled' });
+      expect(procs[0]!.stdin.write).not.toHaveBeenCalledWith(expect.stringContaining('"cmd":"start"'));
+
+      sentEvents.length = 0;
+      const recoverP = voice.startListening({ locale: 'zh-CN' });
+      await vi.advanceTimersByTimeAsync(300);
+      expect(await recoverP).toEqual({ ok: true });
+      expect(procs).toHaveLength(2);
+      expect(procs[0]!.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
+      procs[0]!.stdout.emit('data', '{"type":"result","text":"超时旧worker残留","isFinal":true}\n{"type":"end"}\n');
+      procs[1]!.stdout.emit('data', '{"type":"start"}\n{"type":"result","text":"隔离恢复终解","isFinal":true}\n{"type":"end"}\n');
+      expect(sentEvents.filter((e) => e.type !== 'loading')).toEqual([
+        { type: 'start' },
+        { type: 'result', text: '隔离恢复终解', isFinal: true },
+        { type: 'end' },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // D: start -> normal stop (in-flight final) -> abort -> immediate start -> spawns fresh worker w2 & ignores late w1 events
     sentEvents.length = 0;
     expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
     const pendingStopP = voice.stopListening({ abort: false });
     await voice.stopListening({ abort: true });
     await pendingStopP;
-    expect(procs[0]!.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
+    expect(procs[1]!.stdin.write).toHaveBeenCalledWith('{"cmd":"shutdown"}\n');
 
     sentEvents.length = 0;
     expect(await voice.startListening({ locale: 'zh-CN' })).toEqual({ ok: true });
-    expect(procs).toHaveLength(2);
-    procs[0]!.stdout.emit('data', '{"type":"result","text":"老worker延迟终解","isFinal":true}\n{"type":"end"}\n');
-    procs[1]!.stdout.emit('data', '{"type":"start"}\n{"type":"result","text":"全新worker终解","isFinal":true}\n{"type":"end"}\n');
+    expect(procs).toHaveLength(3);
+    procs[1]!.stdout.emit('data', '{"type":"result","text":"老worker延迟终解","isFinal":true}\n{"type":"end"}\n');
+    procs[2]!.stdout.emit('data', '{"type":"start"}\n{"type":"result","text":"全新worker终解","isFinal":true}\n{"type":"end"}\n');
     expect(sentEvents).toEqual([
       { type: 'start' },
       { type: 'result', text: '全新worker终解', isFinal: true },
