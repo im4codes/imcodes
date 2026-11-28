@@ -905,9 +905,10 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
           {supportsModelSelection && (
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.supervision.model')}</div>
-              {((type === 'qwen' || type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) || (Boolean(selectedCcPreset) && CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) && modelSuggestions.length > 0 ? (
+              {modelSuggestions.length > 0 ? (
                 <select
                   class="input"
+                  id={`sub-session-model-${type}`}
                   value={requestedModel}
                   onInput={(e) => {
                     const val = (e.target as HTMLSelectElement).value;
@@ -926,6 +927,9 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
                   }}
                   style={{ width: '100%' }}
                 >
+                  {!requestedModel && (
+                    <option value="">{t('new_session.default_model')}</option>
+                  )}
                   {requestedModel.trim() && !modelSuggestions.includes(requestedModel.trim()) && (
                     <option value={requestedModel.trim()}>{requestedModel.trim()}</option>
                   )}

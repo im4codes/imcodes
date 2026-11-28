@@ -1532,7 +1532,8 @@
     "refresh_agents": "刷新",
     "refresh_agents_hint": "重新检测本机已安装的 Agent SDK 和 CLI",
     "agent_not_installed": "所选 Agent SDK/CLI 未在本机安装。",
-    "agent_not_installed_hint": "本机未安装"
+    "agent_not_installed_hint": "本机未安装",
+    "default_model": "默认模型"
   },
   "api_key": {
     "copy": "复制",

@@ -1532,7 +1532,8 @@
     "refresh_agents": "Обновить",
     "refresh_agents_hint": "Повторно проверить установленные Agent SDK и CLI на этом хосте",
     "agent_not_installed": "Выбранный Agent SDK/CLI не установлен на этом хосте.",
-    "agent_not_installed_hint": "Не установлен на этом хосте"
+    "agent_not_installed_hint": "Не установлен на этом хосте",
+    "default_model": "Модель по умолчанию"
   },
   "api_key": {
     "copy": "Копировать",

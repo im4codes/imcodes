@@ -1532,7 +1532,8 @@
     "refresh_agents": "Refresh",
     "refresh_agents_hint": "Re-scan installed agent SDKs and CLIs on this host",
     "agent_not_installed": "The selected agent SDK/CLI is not installed on this host.",
-    "agent_not_installed_hint": "Not installed on this host"
+    "agent_not_installed_hint": "Not installed on this host",
+    "default_model": "Default model"
   },
   "api_key": {
     "copy": "Copy",

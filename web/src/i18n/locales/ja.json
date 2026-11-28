@@ -1532,7 +1532,8 @@
     "refresh_agents": "更新",
     "refresh_agents_hint": "このホストにインストール済みの Agent SDK と CLI を再スキャンします",
     "agent_not_installed": "選択した Agent SDK/CLI はこのホストにインストールされていません。",
-    "agent_not_installed_hint": "このホストに未インストール"
+    "agent_not_installed_hint": "このホストに未インストール",
+    "default_model": "デフォルトモデル"
   },
   "api_key": {
     "copy": "コピー",

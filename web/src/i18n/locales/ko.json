@@ -1532,7 +1532,8 @@
     "refresh_agents": "새로고침",
     "refresh_agents_hint": "이 호스트에 설치된 Agent SDK 및 CLI 다시 검색",
     "agent_not_installed": "선택한 Agent SDK/CLI가 이 호스트에 설치되어 있지 않습니다.",
-    "agent_not_installed_hint": "이 호스트에 설치되지 않음"
+    "agent_not_installed_hint": "이 호스트에 설치되지 않음",
+    "default_model": "기본 모델"
   },
   "api_key": {
     "copy": "복사",

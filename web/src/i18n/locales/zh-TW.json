@@ -1532,7 +1532,8 @@
     "refresh_agents": "重新整理",
     "refresh_agents_hint": "重新偵測此主機上已安裝的 Agent SDK 與 CLI",
     "agent_not_installed": "所選的 Agent SDK/CLI 尚未在此主機上安裝。",
-    "agent_not_installed_hint": "此主機未安裝"
+    "agent_not_installed_hint": "此主機未安裝",
+    "default_model": "預設模型"
   },
   "api_key": {
     "copy": "複製",

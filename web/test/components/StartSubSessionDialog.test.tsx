@@ -261,7 +261,8 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
-    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.5' } });
+    const modelSelect = document.getElementById('sub-session-model-codex-sdk') as HTMLSelectElement;
+    fireEvent.input(modelSelect, { target: { value: 'gpt-5.5' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
@@ -286,8 +287,8 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
-    const modelInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
-    await waitFor(() => expect(modelInput.value).toBe(expectedFallback));
+    const modelSelect = document.getElementById('sub-session-model-codex-sdk') as HTMLSelectElement;
+    await waitFor(() => expect(modelSelect.value).toBe(expectedFallback));
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
@@ -999,7 +1000,8 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /copilot_sdk/i }));
-    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gpt-5.4-mini' } });
+    const modelSelect = document.getElementById('sub-session-model-copilot-sdk') as HTMLSelectElement;
+    fireEvent.input(modelSelect, { target: { value: 'gpt-5.4-mini' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('copilot-sdk', undefined, '/tmp', undefined, {
@@ -1135,7 +1137,7 @@ describe('StartSubSessionDialog', () => {
       });
     });
 
-    await waitFor(() => expect(ocInput.value).toBe('qwen2.5-coder:32b'));
+    await waitFor(() => expect((document.getElementById('sub-session-model-opencode-sdk') as HTMLSelectElement)?.value).toBe('qwen2.5-coder:32b'));
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
     expect(onStart).toHaveBeenLastCalledWith('opencode-sdk', undefined, '/tmp', undefined, expect.objectContaining({
       requestedModel: 'qwen2.5-coder:32b',
@@ -1279,10 +1281,9 @@ describe('StartSubSessionDialog', () => {
   it('shows Antigravity sub-session options while disconnected', async () => {
     render(<StartSubSessionDialog ws={Object.assign(makeWs(), { connected: false }) as any} defaultCwd="/tmp" isProviderConnected={() => false} getRemoteSessions={() => []} refreshSessions={vi.fn()} onStart={vi.fn()} onClose={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
-    const input = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
-    act(() => input.focus());
+    const select = document.getElementById('sub-session-model-agy-sdk') as HTMLSelectElement;
     await waitFor(() => expect(screen.getByRole('option', { name: 'gemini-4-hydrogen-high' })).toBeDefined());
-    expect(input.value).toBe('gemini-4-hydrogen-high');
+    expect(select.value).toBe('gemini-4-hydrogen-high');
   });
 
   it('replaces Antigravity sub-session fallback options with the refreshed catalog', async () => {
@@ -1293,7 +1294,7 @@ describe('StartSubSessionDialog', () => {
     const request = ws.send.mock.calls.find(([msg]) => msg.type === 'transport.list_models' && msg.agentType === AGY_SDK_PROVIDER_ID)?.[0];
     expect(request).toBeDefined();
     act(() => handlers.forEach(cb => cb({ type: 'transport.models_response', agentType: AGY_SDK_PROVIDER_ID, requestId: request.requestId, models: [{ id: 'gemini-3.8-flash-high' }, { id: 'new-live-model' }], defaultModel: 'gemini-3.8-flash-high' })));
-    act(() => (screen.getByPlaceholderText('selectModel') as HTMLInputElement).focus());
+    const select = document.getElementById('sub-session-model-agy-sdk') as HTMLSelectElement;
     await waitFor(() => expect(screen.getByRole('option', { name: 'new-live-model' })).toBeDefined());
     expect(screen.queryByRole('option', { name: 'gemini-4-argon-medium' })).toBeNull();
   });
@@ -1313,11 +1314,12 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
-    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'gemini-2.5-pro' } });
+    const select = document.getElementById('sub-session-model-agy-sdk') as HTMLSelectElement;
+    fireEvent.input(select, { target: { value: 'gemini-4-carbon-medium' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith(AGY_SDK_PROVIDER_ID, undefined, '/tmp', undefined, {
-      requestedModel: 'gemini-2.5-pro',
+      requestedModel: 'gemini-4-carbon-medium',
     });
   });
 
@@ -1336,7 +1338,8 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /cursor_headless/i }));
-    fireEvent.input(screen.getByPlaceholderText('selectModel'), { target: { value: 'composer-2.5-fast' } });
+    const select = document.getElementById('sub-session-model-cursor-headless') as HTMLSelectElement;
+    fireEvent.input(select, { target: { value: 'composer-2.5-fast' } });
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
 
     expect(onStart).toHaveBeenCalledWith('cursor-headless', undefined, '/tmp', undefined, {
@@ -1382,7 +1385,7 @@ describe('StartSubSessionDialog', () => {
       isAuthenticated: true,
     })));
 
-    const input1 = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    const input1 = document.getElementById('sub-session-model-agy-sdk') as HTMLSelectElement;
     await waitFor(() => expect(input1.value).toBe(AGY_DEFAULT_MODEL_ID));
 
     fireEvent.input(input1, { target: { value: 'claude-opus-5-5-high' } });
@@ -1407,7 +1410,7 @@ describe('StartSubSessionDialog', () => {
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
-    const input2 = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    const input2 = document.getElementById('sub-session-model-agy-sdk') as HTMLSelectElement;
     await waitFor(() => expect(input2.value).toBe('claude-opus-5-5-high'));
   });
 
@@ -1539,8 +1542,8 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
-    const modelInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
-    await waitFor(() => expect(modelInput.value).toBe('gpt-6.2-sol'));
+    const modelSelect = document.getElementById('sub-session-model-codex-sdk') as HTMLSelectElement;
+    await waitFor(() => expect(modelSelect.value).toBe('gpt-6.2-sol'));
 
     const req = ws.send.mock.calls.find(([msg]) => msg.type === 'transport.list_models' && msg.agentType === 'codex-sdk')?.[0];
     act(() => handlers.forEach((cb) => cb({
@@ -1551,7 +1554,7 @@ describe('StartSubSessionDialog', () => {
       ...(defaultModel ? { defaultModel } : {}),
     })));
 
-    await waitFor(() => expect(modelInput.value).toBe(expected));
+    await waitFor(() => expect(modelSelect.value).toBe(expected));
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
     if (expected) {
       expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
@@ -1599,10 +1602,10 @@ describe('StartSubSessionDialog', () => {
     );
 
     fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
-    const modelInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
-    await waitFor(() => expect(modelInput.value).toBe('gpt-6.2-sol'));
+    const modelSelect = document.getElementById('sub-session-model-codex-sdk') as HTMLSelectElement;
+    await waitFor(() => expect(modelSelect.value).toBe('gpt-6.2-sol'));
 
-    fireEvent.input(modelInput, { target: { value: 'gpt-5.6' } });
+    fireEvent.input(modelSelect, { target: { value: 'gpt-5.6' } });
     const req = ws.send.mock.calls.find(([msg]) => msg.type === 'transport.list_models' && msg.agentType === 'codex-sdk')?.[0];
     act(() => handlers.forEach((cb) => cb({
       type: 'transport.models_response',
@@ -1611,7 +1614,7 @@ describe('StartSubSessionDialog', () => {
       models: [{ id: 'gpt-6.4-sol' }, { id: 'gpt-6-sol' }],
     })));
 
-    expect(modelInput.value).toBe('gpt-5.6');
+    expect(modelSelect.value).toBe('gpt-5.6');
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
     expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, {
       requestedModel: 'gpt-5.6',
@@ -1699,8 +1702,8 @@ describe('StartSubSessionDialog', () => {
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
-    const modelInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
-    await waitFor(() => expect(modelInput.value).toBe('gpt-6.2-sol'));
+    const modelSelect = document.getElementById('sub-session-model-codex-sdk') as HTMLSelectElement;
+    await waitFor(() => expect(modelSelect.value).toBe('gpt-6.2-sol'));
 
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
     expect(onStart2).toHaveBeenLastCalledWith('codex-sdk', undefined, '/tmp', undefined, {
@@ -1715,7 +1718,156 @@ describe('StartSubSessionDialog', () => {
       requestId: req2?.requestId,
       models: [{ id: 'gpt-6.5-sol' }, { id: 'gpt-6-sol' }],
     })));
-    await waitFor(() => expect(modelInput.value).toBe('gpt-6.5-sol'));
+    await waitFor(() => expect(modelSelect.value).toBe('gpt-6.5-sol'));
+  });
+
+  describe('model dropdown mobile UX regression tests', () => {
+    it('renders a native <select> dropdown (no text input) for codex-sdk when suggestions exist', () => {
+      const onStart = vi.fn();
+      render(
+        <StartSubSessionDialog
+          ws={makeWs() as any}
+          defaultCwd="/tmp"
+          isProviderConnected={() => false}
+          getRemoteSessions={() => []}
+          refreshSessions={vi.fn()}
+          onStart={onStart}
+          onClose={vi.fn()}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
+      const modelSelect = document.getElementById('sub-session-model-codex-sdk') as HTMLSelectElement;
+      expect(modelSelect).not.toBeNull();
+      expect(modelSelect.tagName).toBe('SELECT');
+      expect(screen.queryByPlaceholderText('selectModel')).toBeNull();
+
+      // Verify suggested options are present
+      const optionValues = Array.from(modelSelect.options).map((o) => o.value);
+      expect(optionValues).toContain('gpt-6.2-sol');
+
+      // Change selection cleanly
+      fireEvent.input(modelSelect, { target: { value: 'gpt-5.5' } });
+      fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+      expect(onStart).toHaveBeenCalledWith('codex-sdk', undefined, '/tmp', undefined, expect.objectContaining({
+        requestedModel: 'gpt-5.5',
+      }));
+    });
+
+    it('renders a native <select> dropdown for agy-sdk when suggestions exist', () => {
+      render(
+        <StartSubSessionDialog
+          ws={Object.assign(makeWs(), { connected: false }) as any}
+          defaultCwd="/tmp"
+          isProviderConnected={() => false}
+          getRemoteSessions={() => []}
+          refreshSessions={vi.fn()}
+          onStart={vi.fn()}
+          onClose={vi.fn()}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
+      const select = document.getElementById('sub-session-model-agy-sdk') as HTMLSelectElement;
+      expect(select).not.toBeNull();
+      expect(select.tagName).toBe('SELECT');
+      expect(screen.queryByPlaceholderText('selectModel')).toBeNull();
+      expect(select.value).toBe(AGY_DEFAULT_MODEL_ID);
+    });
+
+    it('falls back to ModelCombobox text input when modelSuggestions is empty', () => {
+      const onStart = vi.fn();
+      render(
+        <StartSubSessionDialog
+          ws={makeWs() as any}
+          defaultCwd="/tmp"
+          isProviderConnected={() => false}
+          getRemoteSessions={() => []}
+          refreshSessions={vi.fn()}
+          onStart={onStart}
+          onClose={vi.fn()}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /deepseek_harness/i }));
+      // deepseek-harness has empty model suggestions, so it renders ModelCombobox input
+      const comboboxInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+      expect(comboboxInput).not.toBeNull();
+      expect(comboboxInput.tagName).toBe('INPUT');
+      expect(document.querySelector('select#sub-session-model-deepseek-harness')).toBeNull();
+
+      fireEvent.input(comboboxInput, { target: { value: 'deepseek-reasoner' } });
+      fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+      expect(onStart).toHaveBeenCalledWith('deepseek-harness', undefined, '/tmp', undefined, expect.objectContaining({
+        requestedModel: 'deepseek-reasoner',
+      }));
+    });
+
+    it('renders default model option when requestedModel is empty and preserves custom out-of-list model', async () => {
+      const handlers = new Set<(message: unknown) => void>();
+      const ws = {
+        ...makeWs(),
+        connected: true,
+        onMessage: (cb: (message: unknown) => void) => {
+          handlers.add(cb);
+          return () => handlers.delete(cb);
+        },
+      };
+      render(
+        <StartSubSessionDialog
+          ws={ws as any}
+          defaultCwd="/tmp"
+          isProviderConnected={() => false}
+          getRemoteSessions={() => []}
+          refreshSessions={vi.fn()}
+          onStart={vi.fn()}
+          onClose={vi.fn()}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /codex_sdk/i }));
+      const req = ws.send.mock.calls.find(([msg]) => msg.type === 'transport.list_models' && msg.agentType === 'codex-sdk')?.[0];
+      // Deliver catalog without Sol models so requestedModel resolves to ''
+      act(() => handlers.forEach((cb) => cb({
+        type: 'transport.models_response',
+        agentType: 'codex-sdk',
+        requestId: req?.requestId,
+        models: [{ id: 'gpt-6-luna' }, { id: 'gpt-5.6' }],
+        defaultModel: undefined,
+      })));
+
+      const select = document.getElementById('sub-session-model-codex-sdk') as HTMLSelectElement;
+      expect(select.value).toBe('');
+      const defaultOption = Array.from(select.options).find((o) => o.value === '');
+      expect(defaultOption).toBeDefined();
+
+      // CC preset with an unlisted custom model renders as an option in select
+      const subListReq = ws.send.mock.calls.find(([msg]) => msg?.type === 'cc.presets.list')?.[0];
+      act(() => {
+        handlers.forEach((cb) => cb({
+          type: 'cc.presets.list_response',
+          requestId: subListReq?.requestId,
+          presets: [{
+            name: 'CustomPreset',
+            env: { ANTHROPIC_MODEL: 'custom-unlisted-model' },
+            availableModels: [],
+          }],
+        }));
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: /claude_code_sdk/i }));
+      const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+        .find((s) => Array.from(s.options).some((o) => o.value === 'CustomPreset'));
+      expect(presetSelect).toBeDefined();
+      fireEvent.input(presetSelect!, { target: { value: 'CustomPreset' } });
+
+      await waitFor(() => {
+        const ccSelect = document.getElementById('sub-session-model-claude-code-sdk') as HTMLSelectElement;
+        expect(ccSelect?.value).toBe('custom-unlisted-model');
+        const customOption = Array.from(ccSelect.options).find((o) => o.value === 'custom-unlisted-model');
+        expect(customOption).toBeDefined();
+      });
+    });
   });
 });
 
