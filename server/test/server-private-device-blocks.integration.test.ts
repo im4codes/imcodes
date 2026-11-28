@@ -342,20 +342,13 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
     const vmDirectId = await mkVmProfile('vm-direct-only', directOnlyC.nodeId);
     const vmOverlapId = await mkVmProfile('vm-overlap-g2', overlapGroupNode.nodeId);
 
-    // Live turn tokens on Host A (and Host H2)
+    // Live turn tokens on Host A (Owner turn first; Participant turn is minted when handoff happens in section 5
+    // because Stage 2 revokes prior turn grants on the same session tree upon sender switch) and Host H2
     const ownerTurnA = await issueOwnerMachineAuthorityForSession(db, {
       actorUserId: owner.id,
       sourceServerId: hostA.serverId,
       sessionName: 'deck_main_brain',
       actionId: `act-o-${hex(4)}`,
-      signingKey: JWT_KEY,
-    });
-    const partTurnA = await issueSharedMachineAuthorityForSession(db, {
-      actorUserId: participant.id,
-      sourceServerId: hostA.serverId,
-      sessionName: 'deck_main_brain',
-      shareTarget: { kind: 'main', serverId: hostA.serverId, sessionName: 'deck_main_brain' },
-      actionId: `act-p-${hex(4)}`,
       signingKey: JWT_KEY,
     });
     const ownerTurnH2 = await issueOwnerMachineAuthorityForSession(db, {
@@ -482,6 +475,14 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
     expect(hostDMachines).toContain(unsharedB.serverId);
 
     // 5. Dual-identity symmetry: Participant's unshared device STILL works until Participant enables toggle on Host A
+    const partTurnA = await issueSharedMachineAuthorityForSession(db, {
+      actorUserId: participant.id,
+      sourceServerId: hostA.serverId,
+      sessionName: 'deck_main_brain',
+      shareTarget: { kind: 'main', serverId: hostA.serverId, sessionName: 'deck_main_brain' },
+      actionId: `act-p-${hex(4)}`,
+      signingKey: JWT_KEY,
+    });
     expect((await app.request(`/api/machine/computer-use?serverId=${pUnshared.serverId}`, {
       method: 'POST',
       headers: daemonAuth(hostA.serverId, hostA.token, partTurnA!),
