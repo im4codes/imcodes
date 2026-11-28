@@ -2206,7 +2206,7 @@ exec "$@"
       join(fakeBin, 'id'),
       `#!/bin/sh
 if [ "$1" = "-u" ] && [ "$#" -eq 1 ]; then echo "0"; exit 0; fi
-if [ "$1" = "-u" ] && [ "$#" -eq 2 ]; then echo "1000"; exit 0; fi
+if [ "$1" = "-u" ] && [ "$#" -eq 2 ]; then echo "59999"; exit 0; fi
 exec /usr/bin/id "$@"
 `,
       { mode: 0o755 },
