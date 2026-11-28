@@ -1,8 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import {
+  CUSTOM_PROVIDER_SDK_AGENT_TYPES,
+  getCcPresetEffectiveModel,
+  normalizeCcPresetName,
+  type CcPreset,
+} from '@shared/cc-presets.js';
 import { patchSession, patchSubSession } from '../api.js';
 import { saveAgyModelPreference } from '../agy-model-preference.js';
+import { useAgentAvailability } from '../hooks/useAgentAvailability.js';
+import { useCcPresets } from '../hooks/useCcPresets.js';
+import { isShareScopedState } from '../tab-sharing-ui.js';
+import type { AgentAvailabilityMap } from '@shared/agent-availability.js';
 import {
   buildTransportModelCatalogIdentity,
   supportsDynamicTransportModels,
@@ -10,6 +20,13 @@ import {
 } from '../hooks/useTransportModels.js';
 import type { SessionInfo } from '../types.js';
 import type { WsClient } from '../ws-client.js';
+import type { AppliedSessionRestartState } from '@shared/session-restart-contract.js';
+import {
+  captureSessionSwitchBaseline,
+  isSessionSwitchSupersededBySync,
+  type SessionSwitchBaseline,
+  type SessionSwitchComparable,
+} from '../session-state-updates.js';
 import { getSessionAgentLabel } from './session-agent-options.js';
 import {
   findQuickSdkChoice,
@@ -21,8 +38,8 @@ import {
 export interface QuickSdkSavedFields {
   type: string;
   requestedModel: string | null;
-  activeModel: null;
-  modelDisplay: null;
+  activeModel: string | null;
+  modelDisplay: string | null;
   ccPreset?: string | null;
 }
 
@@ -32,12 +49,21 @@ export interface SameSdkModelItem {
   title?: string;
 }
 
+export function isQuickSdkUnavailable(
+  sdkId: string,
+  currentSdk: string,
+  availability: AgentAvailabilityMap | null | undefined,
+): boolean {
+  return sdkId !== currentSdk && availability?.[sdkId]?.installed === false;
+}
+
 interface CrossSdkPreviewCatalogProps {
   ws: WsClient | null;
   sessionName: string | undefined;
   targetScope: string | undefined;
   previewSdk: string;
   effectivePreset: string | null;
+  effectivePresetEntry?: CcPreset | null;
   switching: boolean;
   onSelectCrossModel: (modelId: string | null) => void;
 }
@@ -53,6 +79,7 @@ function CrossSdkPreviewCatalog({
   targetScope,
   previewSdk,
   effectivePreset,
+  effectivePresetEntry,
   switching,
   onSelectCrossModel,
 }: CrossSdkPreviewCatalogProps) {
@@ -70,10 +97,11 @@ function CrossSdkPreviewCatalog({
       sdk: previewSdk,
       sessionName,
       ccPreset: effectivePreset,
+      presetEntry: effectivePresetEntry,
       targetScope,
       dynamicState: dynamicModels,
     }),
-    [previewSdk, sessionName, effectivePreset, targetScope, dynamicModels],
+    [previewSdk, sessionName, effectivePreset, effectivePresetEntry, targetScope, dynamicModels],
   );
 
   return (
@@ -140,7 +168,14 @@ interface QuickSdkModelMenuProps {
   onClose: () => void;
   onAfterAction?: () => void;
   onSessionSaved?: (fields: QuickSdkSavedFields) => void;
+  getLiveSession?: () => SessionSwitchComparable | null | undefined;
+  onSessionSwitchCommit?: (
+    sessionName: string,
+    baseline: SessionSwitchBaseline | null,
+    applied: AppliedSessionRestartState | null,
+  ) => void;
   onSwitchError?: (message: string) => void;
+  onOpenCcPresetManager?: () => void;
 }
 
 export function QuickSdkModelMenu({
@@ -160,16 +195,25 @@ export function QuickSdkModelMenu({
   onClose,
   onAfterAction,
   onSessionSaved,
+  getLiveSession,
+  onSessionSwitchCommit,
   onSwitchError,
+  onOpenCcPresetManager,
 }: QuickSdkModelMenuProps) {
   const { t } = useTranslation();
+  const currentPreset = activeSession?.ccPreset?.trim() ?? '';
   const [previewSdk, setPreviewSdk] = useState<string>(currentSdk);
+  const [previewPreset, setPreviewPreset] = useState<string>(currentPreset);
   const [internalSwitching, setInternalSwitching] = useState(false);
   const switching = switchingProp ?? internalSwitching;
   const actionDisabled = Boolean(disabled || switching);
   const switchingRef = useRef(false);
   switchingRef.current = switching;
   const mountedRef = useRef(true);
+  const prevOpenRef = useRef(false);
+
+  const { availability: agentAvailability } = useAgentAvailability(ws, { enabled: splitAllowed && modelOpen });
+  const { presets: ccPresets } = useCcPresets(ws, { enabled: splitAllowed && modelOpen });
 
   const updateSwitching = (next: boolean) => {
     switchingRef.current = next;
@@ -186,12 +230,43 @@ export function QuickSdkModelMenu({
     };
   }, []);
 
-  // Default preview column to the session's current SDK every time the menu opens.
+  // Default preview column & preset to the session's current SDK/preset every time the menu opens or currentSdk changes.
+  useEffect(() => {
+    const justOpened = modelOpen && !prevOpenRef.current;
+    prevOpenRef.current = modelOpen;
+    if (justOpened || (modelOpen && prevOpenRef.current)) {
+      if (justOpened) {
+        setPreviewSdk(currentSdk);
+        setPreviewPreset(currentPreset);
+      }
+    }
+  }, [modelOpen, currentSdk, currentPreset]);
+
   useEffect(() => {
     if (modelOpen) {
       setPreviewSdk(currentSdk);
+      setPreviewPreset(currentPreset);
     }
-  }, [modelOpen, currentSdk]);
+  }, [currentSdk, currentPreset, modelOpen]);
+
+  // If availability probe completes while user already clicked an uninstalled preview SDK,
+  // snap the preview column cleanly back to the active SDK so the right rail cannot PATCH it.
+  useEffect(() => {
+    if (modelOpen && isQuickSdkUnavailable(previewSdk, currentSdk, agentAvailability)) {
+      setPreviewSdk(currentSdk);
+      setPreviewPreset(currentPreset);
+    }
+  }, [modelOpen, previewSdk, currentSdk, currentPreset, agentAvailability]);
+
+  const handleSelectPreviewSdk = (nextSdk: string) => {
+    if (isQuickSdkUnavailable(nextSdk, currentSdk, agentAvailability)) return;
+    setPreviewSdk(nextSdk);
+    if (nextSdk === currentSdk) {
+      setPreviewPreset(currentPreset);
+    } else {
+      setPreviewPreset(resolveEffectiveCrossSdkPreset(currentSdk, nextSdk, currentPreset) ?? '');
+    }
+  };
 
   const sdkGroups = useMemo(
     () => getQuickSwitchableSdkGroups(currentSdk, subSessionId ? 'sub-session' : 'new-session'),
@@ -206,11 +281,17 @@ export function QuickSdkModelMenu({
     [serverId, ws],
   );
 
-  const isCrossSdkPreview = splitAllowed && previewSdk !== currentSdk;
-  const effectivePreviewPreset = useMemo(
-    () => resolveEffectiveCrossSdkPreset(currentSdk, previewSdk, activeSession?.ccPreset),
-    [currentSdk, previewSdk, activeSession?.ccPreset],
+  const previewSupportsPreset = CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(previewSdk);
+  const effectivePreviewPreset = previewSupportsPreset ? (previewPreset.trim() || null) : null;
+  const matchedPreviewPreset = useMemo(
+    () => (effectivePreviewPreset
+      ? ccPresets.find((p) => normalizeCcPresetName(p.name) === normalizeCcPresetName(effectivePreviewPreset))
+      : undefined),
+    [ccPresets, effectivePreviewPreset],
   );
+  const isCrossSdkPreview = splitAllowed && previewSdk !== currentSdk;
+  const isPresetSwitch = splitAllowed && previewSupportsPreset && (effectivePreviewPreset ?? '') !== currentPreset;
+  const isRelaunchSwitch = isCrossSdkPreview || isPresetSwitch;
 
   const previewIdentityKey = useMemo(
     () => buildTransportModelCatalogIdentity({
@@ -235,38 +316,56 @@ export function QuickSdkModelMenu({
     onSelectSameSdkModel(modelId);
   };
 
-  const handleCrossSdkSwitch = async (nextSdk: string, nextModel: string | null) => {
+  const handleCrossSdkSwitch = async (nextSdk: string, nextModel: string | null, nextPreset: string | null) => {
     if (disabled || switchingRef.current || !activeSession || !serverId?.trim()) return;
-    const nextEffectivePreset = resolveEffectiveCrossSdkPreset(
-      currentSdk,
-      nextSdk,
-      activeSession.ccPreset,
-    );
+    if (isQuickSdkUnavailable(nextSdk, currentSdk, agentAvailability)) return;
+    const baseline = captureSessionSwitchBaseline(activeSession);
+    const nextEffectivePreset = CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextSdk)
+      ? (nextPreset?.trim() || null)
+      : null;
     updateSwitching(true);
     onClose();
     try {
-      if (subSessionId) {
-        await patchSubSession(serverId, subSessionId, {
-          type: nextSdk,
-          requestedModel: nextModel,
-          activeModel: null,
-        });
-      } else {
-        await patchSession(serverId, activeSession.name, {
-          agentType: nextSdk,
-          requestedModel: nextModel,
-          activeModel: null,
-        });
+      const response = subSessionId
+        ? await patchSubSession(serverId, subSessionId, {
+            type: nextSdk,
+            requestedModel: nextModel,
+            activeModel: null,
+            ccPresetId: nextEffectivePreset,
+          })
+        : await patchSession(serverId, activeSession.name, {
+            agentType: nextSdk,
+            requestedModel: nextModel,
+            activeModel: null,
+            ccPreset: nextEffectivePreset,
+          });
+      if (response?.pending) {
+        onSwitchError?.(t('session.quickSwitch.switchPending'));
+        return;
       }
-      if (nextSdk === AGY_SDK_PROVIDER_ID && nextModel) {
-        saveAgyModelPreference(nextModel, activeSession.name);
+      if (response?.superseded || response?.ok === false) {
+        return;
+      }
+      const applied = response?.applied;
+      const latestSession = getLiveSession?.();
+      if (isSessionSwitchSupersededBySync(latestSession, baseline, applied)) {
+        return;
+      }
+      const savedType = applied ? applied.agentType : nextSdk;
+      const savedModel = applied ? applied.requestedModel : nextModel;
+      const savedActiveModel = applied ? applied.activeModel : null;
+      const savedModelDisplay = applied ? (applied.modelDisplay ?? applied.activeModel) : null;
+      const savedPreset = applied ? applied.ccPreset : nextEffectivePreset;
+      onSessionSwitchCommit?.(activeSession.name, baseline, applied ?? null);
+      if (savedType === AGY_SDK_PROVIDER_ID && savedModel) {
+        saveAgyModelPreference(savedModel, activeSession.name);
       }
       onSessionSaved?.({
-        type: nextSdk,
-        requestedModel: nextModel,
-        activeModel: null,
-        modelDisplay: null,
-        ccPreset: nextEffectivePreset,
+        type: savedType,
+        requestedModel: savedModel,
+        activeModel: savedActiveModel,
+        modelDisplay: savedModelDisplay,
+        ccPreset: savedPreset,
       });
       onAfterAction?.();
     } catch (err) {
@@ -296,11 +395,15 @@ export function QuickSdkModelMenu({
     );
   }
 
+  const hasSelectedPresetInList = !previewPreset
+    || ccPresets.some((p) => normalizeCcPresetName(p.name) === normalizeCcPresetName(previewPreset));
+
   return (
     <div
       class="quick-sdk-model-split"
       data-testid="quick-sdk-model-split"
       data-preview-sdk={previewSdk}
+      data-preview-preset={effectivePreviewPreset ?? ''}
       data-switching={switching ? 'true' : 'false'}
     >
       <div
@@ -318,16 +421,24 @@ export function QuickSdkModelMenu({
                 const isCurrent = choice.id === currentSdk;
                 const isPreview = choice.id === previewSdk;
                 const label = getSessionAgentLabel(t, choice);
+                const availability = agentAvailability?.[choice.id];
+                const isUnavailable = isQuickSdkUnavailable(choice.id, currentSdk, agentAvailability);
+                const unavailableReason = availability?.reason?.trim();
+                const tooltip = isUnavailable
+                  ? `${label} — ${t('new_session.agent_not_installed_hint')}${unavailableReason ? `: ${unavailableReason}` : ''}`
+                  : label;
                 return (
                   <button
                     key={choice.id}
                     type="button"
                     aria-pressed={isPreview}
+                    aria-disabled={isUnavailable ? 'true' : undefined}
                     data-sdk-id={choice.id}
-                    class={`quick-sdk-item${isPreview ? ' is-preview' : ''}${isCurrent ? ' is-current' : ''}`}
-                    disabled={actionDisabled}
-                    onClick={() => setPreviewSdk(choice.id)}
-                    title={label}
+                    data-installed={availability ? String(availability.installed) : undefined}
+                    class={`quick-sdk-item${isPreview ? ' is-preview' : ''}${isCurrent ? ' is-current' : ''}${isUnavailable ? ' is-unavailable' : ''}`}
+                    disabled={actionDisabled || isUnavailable}
+                    onClick={() => { if (!isUnavailable) handleSelectPreviewSdk(choice.id); }}
+                    title={tooltip}
                   >
                     <span class="quick-sdk-item-icon" aria-hidden="true">{choice.icon}</span>
                     <span class="quick-sdk-item-label">{label}</span>
@@ -348,14 +459,62 @@ export function QuickSdkModelMenu({
       >
         <div class="quick-sdk-col-header quick-sdk-col-header-models">
           <span class="quick-sdk-col-title">{previewSdkLabel}</span>
-          {isCrossSdkPreview && (
-            <span class="quick-sdk-handoff-badge" title={t('session.quickSwitch.handoffHint')}>
-              {t('session.quickSwitch.handoffHint')}
+          {isRelaunchSwitch && (
+            <span
+              class="quick-sdk-handoff-badge"
+              title={isCrossSdkPreview ? t('session.quickSwitch.handoffHint') : t('session.quickSwitch.presetRelaunchHint')}
+            >
+              {isCrossSdkPreview ? t('session.quickSwitch.handoffHint') : t('session.quickSwitch.presetRelaunchHint')}
             </span>
           )}
         </div>
+
+        {previewSupportsPreset && (
+          <div class="quick-sdk-preset-bar" data-testid="quick-sdk-preset-bar">
+            <span class="quick-sdk-preset-label">{t('session.quickSwitch.presetLabel')}</span>
+            <select
+              data-testid="quick-sdk-preset-select"
+              aria-label={t('session.quickSwitch.presetLabel')}
+              class="quick-sdk-preset-select"
+              value={previewPreset}
+              disabled={actionDisabled}
+              onInput={(e) => setPreviewPreset((e.target as HTMLSelectElement).value)}
+              onChange={(e) => setPreviewPreset((e.target as HTMLSelectElement).value)}
+            >
+              <option value="">{t('session.quickSwitch.presetDefault')}</option>
+              {!hasSelectedPresetInList && previewPreset && (
+                <option value={previewPreset}>{previewPreset}</option>
+              )}
+              {ccPresets.map((p) => {
+                const effModel = getCcPresetEffectiveModel(p);
+                return (
+                  <option key={p.name} value={p.name}>
+                    {effModel ? `${p.name} (${effModel})` : p.name}
+                  </option>
+                );
+              })}
+            </select>
+            {onOpenCcPresetManager && !isShareScopedState(activeSession?.sharedState) && (
+              <button
+                type="button"
+                class="quick-sdk-preset-manage-btn"
+                data-testid="quick-sdk-manage-presets"
+                disabled={actionDisabled}
+                onClick={() => {
+                  onClose();
+                  onOpenCcPresetManager();
+                }}
+                title={t('session.quickSwitch.managePresets')}
+                aria-label={t('session.quickSwitch.managePresets')}
+              >
+                ⚙
+              </button>
+            )}
+          </div>
+        )}
+
         <div class="quick-sdk-col-scroll">
-          {!isCrossSdkPreview ? (
+          {!isRelaunchSwitch ? (
             sameSdkItems.length > 0 ? (
               sameSdkItems.map((item) => (
                 <button
@@ -384,8 +543,9 @@ export function QuickSdkModelMenu({
                 targetScope={effectiveTargetScope}
                 previewSdk={previewSdk}
                 effectivePreset={effectivePreviewPreset}
+                effectivePresetEntry={matchedPreviewPreset}
                 switching={actionDisabled}
-                onSelectCrossModel={(modelId) => void handleCrossSdkSwitch(previewSdk, modelId)}
+                onSelectCrossModel={(modelId) => void handleCrossSdkSwitch(previewSdk, modelId, effectivePreviewPreset)}
               />
             )
           )}

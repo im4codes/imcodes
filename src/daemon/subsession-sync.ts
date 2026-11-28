@@ -102,6 +102,8 @@ export async function buildSubSessionSyncPayload(
 ): Promise<Record<string, unknown> | null> {
   const sessionName = `deck_sub_${id}`;
   const record = getSession(sessionName);
+  const initialRuntimeEpoch = record?.runtimeEpoch ?? null;
+  const initialSessionInstanceId = record?.sessionInstanceId ?? null;
   const r = { ...record, ...overrides };
   if (isIncognitoSessionName(sessionName) || isIncognitoSession(r)) {
     return null;
@@ -255,6 +257,24 @@ export async function buildSubSessionSyncPayload(
   const isClone = isExecutionClone(cloneMetadata);
   const identity = (field: (typeof CLONE_PAYLOAD_IDENTITY_FIELDS)[number]): string | null =>
     isClone ? null : ((r[field] as string | undefined) ?? null);
+
+  if (record) {
+    const latest = getSession(sessionName);
+    if (!latest) {
+      logger.debug({ id, sessionName }, 'Skipping subsession.sync: session removed during async payload build');
+      return null;
+    }
+    if (
+      (latest.runtimeEpoch ?? null) !== initialRuntimeEpoch
+      || (latest.sessionInstanceId ?? null) !== initialSessionInstanceId
+    ) {
+      logger.debug(
+        { id, sessionName, initialRuntimeEpoch, latestRuntimeEpoch: latest.runtimeEpoch ?? null },
+        'Skipping subsession.sync: runtimeEpoch or sessionInstanceId rotated during async payload build',
+      );
+      return null;
+    }
+  }
 
   return {
     type: 'subsession.sync',

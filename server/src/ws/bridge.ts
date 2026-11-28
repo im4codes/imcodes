@@ -357,6 +357,11 @@ import {
   SUBSESSION_SYNC_BATCH_MSG,
 } from '../../../shared/scale-limits.js';
 import {
+  DEFAULT_SESSION_RESTART_TIMEOUT_MS,
+  type AppliedSessionRestartState,
+  type SessionRestartRelayResult,
+} from '../../../shared/session-restart-contract.js';
+import {
   activateCapabilityVersion,
   advanceCapabilityOperation,
   updateCapabilityOperation,
@@ -2758,6 +2763,19 @@ export class WsBridge {
   private upgradeBlockedSyncRequiredGeneration: number | null = null;
   /** Connection generation whose persisted blocker replay has completed. */
   private upgradeBlockedSyncCompleteGeneration: number | null = null;
+  private daemonSupportsRestartResponse = false;
+  private sessionDbMutationChains = new Map<string, Promise<void>>();
+  private sessionRestartEpochs = new Map<string, number>();
+  private committedSessionRestartEpochs = new Map<string, number>();
+  private lastObservedSubSessionRuntimeEpoch = new Map<string, string>();
+  private supersededSubSessionRuntimeEpochs = new Map<string, Set<string>>();
+  private pendingRestartEntries = new Map<string, {
+    sessionName: string;
+    epoch: number;
+    timedOut: boolean;
+    persistApplied?: (applied: AppliedSessionRestartState) => Promise<void>;
+    cleanupTimer: ReturnType<typeof setTimeout>;
+  }>();
   private seenUpgradeBlockedFailures = new Map<string, number>();
   private browserRateLimiter = new MemoryRateLimiter();
   /** Per share socket, per lane: the tail of the ordered command chain and how many wait in it. */
@@ -6271,6 +6289,7 @@ export class WsBridge {
     this.credentialPromise = null;
     this.upgradeBlockedSyncRequiredGeneration = null;
     this.upgradeBlockedSyncCompleteGeneration = null;
+    this.daemonSupportsRestartResponse = false;
     this.supportedSharedContextRuntimeBackends = null;
 
     // Auth timeout
@@ -6505,6 +6524,8 @@ export class WsBridge {
         this.upgradeBlockedSyncCompleteGeneration = supportsUpgradeBlockedSync
           ? null
           : connectionGeneration;
+        this.daemonSupportsRestartResponse = this.daemonNodeRole === NODE_ROLE.FULL
+          && msg.supportsSessionRestartResponse === true;
         const controlledCapabilities = this.daemonNodeRole === NODE_ROLE.CONTROLLED
           ? parseAdvertisedControlledNodeCapabilities(msg.capabilities)
           : { ok: true as const, value: [] };
@@ -10129,6 +10150,32 @@ export class WsBridge {
       return;
     }
 
+    if (type === 'session.restart_response' || type === 'subsession.restart_response') {
+      const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+      if (requestId) {
+        const pending = this.pendingRestartEntries.get(requestId);
+        const resolvedSyncWaiter = this.machineConfigRequests.resolve(requestId, msg);
+        if (!resolvedSyncWaiter && pending?.timedOut) {
+          clearTimeout(pending.cleanupTimer);
+          this.pendingRestartEntries.delete(requestId);
+          const applied = this.parseAppliedRestartState(msg.applied);
+          const previousRuntimeEpoch = typeof msg.previousRuntimeEpoch === 'string' && msg.previousRuntimeEpoch
+            ? msg.previousRuntimeEpoch
+            : null;
+          if (msg.ok === true && applied) {
+            void this.commitAuthoritativeRestart(
+              pending.sessionName,
+              pending.epoch,
+              applied,
+              pending.persistApplied,
+              previousRuntimeEpoch,
+            ).catch((err) => logger.warn({ err, sessionName: pending.sessionName }, 'Failed to commit late restart response'));
+          }
+        }
+      }
+      return;
+    }
+
     // ── Terminal diff: session-scoped ─────────────────────────────────────────
     if (type === 'terminal_update') {
       const sessionName = (msg.diff as Record<string, unknown> | undefined)?.sessionName as string | undefined;
@@ -10328,66 +10375,111 @@ export class WsBridge {
     // ── Sub-session sync: daemon creates sub-sessions → persist to DB ────────
     if ((type === 'subsession.sync' || type === SUBSESSION_SYNC_BATCH_MSG) && this.db) {
       const db = this.db;
-      const rawItems = type === SUBSESSION_SYNC_BATCH_MSG
+      const isBatch = type === SUBSESSION_SYNC_BATCH_MSG;
+      const rawItems = isBatch
         ? (Array.isArray(msg.items) ? msg.items.filter((x): x is Record<string, unknown> => !!x && typeof x === 'object') : [])
         : [msg];
-      const acceptedItems: Record<string, unknown>[] = [];
-      for (const item of rawItems) {
-        if (isIncognitoSession(item) || (typeof item.id === 'string' && this.incognitoSessions.has(`deck_sub_${item.id}`))) {
-          this.registerInMemoryIncognitoSubSession(item);
-          continue;
+      const eligibleItems = rawItems.flatMap((item) => {
+        const id = typeof item.id === 'string' ? item.id.trim() : '';
+        if (!id) return [];
+        const sessionName = `deck_sub_${id}`;
+        if (isKnownTestSessionLike({
+          name: sessionName,
+          cwd: typeof item.cwd === 'string' ? item.cwd : undefined,
+          parentSession: typeof item.parentSession === 'string' ? item.parentSession : undefined,
+        })) {
+          return [];
         }
-        if (this.registerActiveSubSessionFromSync(item)) acceptedItems.push(item);
-      }
-      if (acceptedItems.length === 0) return;
+        return [{ item, sessionName }];
+      });
+      if (eligibleItems.length === 0) return;
 
-      if (type === 'subsession.sync') {
-        const single = acceptedItems[0];
-        void (async () => {
-          const resolved = await this.resolveSubSessionSyncItem(db, single);
-          if (!resolved) {
-            logger.warn({ id: single.id }, 'Skipping sub-session DB sync without sessionType');
+      void this.runSerializedMultiSessionDbMutation(
+        eligibleItems.map((entry) => entry.sessionName),
+        async () => {
+          const acceptedItems: Array<{ item: Record<string, unknown>; sessionName: string }> = [];
+          for (const { item, sessionName } of eligibleItems) {
+            if (this.isSupersededSubSessionSync(sessionName, item)) {
+              logger.debug({ id: item.id, runtimeEpoch: item.runtimeEpoch }, 'Ignoring superseded subsession sync after restart commit');
+              continue;
+            }
+            if (isIncognitoSession(item) || this.incognitoSessions.has(sessionName)) {
+              this.registerInMemoryIncognitoSubSession(item);
+              if (typeof item.runtimeEpoch === 'string' && item.runtimeEpoch) {
+                this.lastObservedSubSessionRuntimeEpoch.set(sessionName, item.runtimeEpoch);
+              }
+              continue;
+            }
+            acceptedItems.push({ item, sessionName });
+          }
+          if (acceptedItems.length === 0) return;
+
+          if (!isBatch) {
+            const single = acceptedItems[0]!;
+            const resolved = await this.resolveSubSessionSyncItem(db, single.item);
+            if (!resolved) {
+              logger.warn({ id: single.item.id }, 'Skipping sub-session DB sync without sessionType');
+              return;
+            }
+            this.registerActiveSubSessionFromSync(single.item);
+            await createSubSession(
+              db,
+              resolved.row.id,
+              this.serverId,
+              resolved.row.type,
+              resolved.row.shellBin,
+              resolved.row.cwd,
+              resolved.row.label,
+              resolved.row.ccSessionId,
+              resolved.row.geminiSessionId ?? null,
+              resolved.row.parentSession ?? null,
+              resolved.row.runtimeType ?? null,
+              resolved.row.providerId ?? null,
+              resolved.row.providerSessionId ?? null,
+              resolved.row.description ?? null,
+              resolved.row.ccPresetId ?? null,
+              resolved.row.requestedModel ?? null,
+              resolved.row.activeModel ?? null,
+              resolved.row.effort ?? null,
+              resolved.row.transportConfig ?? null,
+              resolved.row.executionCloneMetadata ?? null,
+            );
+            if (Object.keys(resolved.explicitClearFields).length > 0) {
+              await updateSubSession(db, resolved.row.id, this.serverId, resolved.explicitClearFields);
+            }
+            if (typeof single.item.runtimeEpoch === 'string' && single.item.runtimeEpoch) {
+              this.lastObservedSubSessionRuntimeEpoch.set(single.sessionName, single.item.runtimeEpoch);
+            }
+            this.setCachedSessionAgentType(single.sessionName, resolved.row.type);
+            await this.refreshAllNonServerShareCoveredSessions();
+            this.broadcastToBrowsers(JSON.stringify(resolved.frame));
             return;
           }
-          await createSubSession(
-            db,
-            resolved.row.id,
-            this.serverId,
-            resolved.row.type,
-            resolved.row.shellBin,
-            resolved.row.cwd,
-            resolved.row.label,
-            resolved.row.ccSessionId,
-            resolved.row.geminiSessionId ?? null,
-            resolved.row.parentSession ?? null,
-            resolved.row.runtimeType ?? null,
-            resolved.row.providerId ?? null,
-            resolved.row.providerSessionId ?? null,
-            resolved.row.description ?? null,
-            resolved.row.ccPresetId ?? null,
-            resolved.row.requestedModel ?? null,
-            resolved.row.activeModel ?? null,
-            resolved.row.effort ?? null,
-            resolved.row.transportConfig ?? null,
-            resolved.row.executionCloneMetadata ?? null,
-          );
-          this.setCachedSessionAgentType(`deck_sub_${resolved.row.id}`, resolved.row.type);
-          await this.refreshAllNonServerShareCoveredSessions();
-          this.broadcastToBrowsers(JSON.stringify(resolved.frame));
-        })().catch((e) => logger.error({ err: e, id: single.id }, 'Failed to sync sub-session to DB'));
-        return;
-      }
 
-      void (async () => {
-        const resolved = (await Promise.all(acceptedItems.map((item) => this.resolveSubSessionSyncItem(db, item))))
-          .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
-        for (let i = 0; i < resolved.length; i += SUBSESSION_SYNC_BATCH_MAX_ITEMS) {
-          const chunk = resolved.slice(i, i + SUBSESSION_SYNC_BATCH_MAX_ITEMS);
-          await createSubSessionsBatch(db, chunk.map((entry) => entry.row));
-          await this.refreshAllNonServerShareCoveredSessions();
-          this.broadcastSubsessionCreatedBatch(chunk.map((entry) => entry.frame));
-        }
-      })().catch((e) => logger.error({ err: e, count: acceptedItems.length }, 'Failed to batch sync sub-sessions to DB'));
+          const resolvedPairs = (await Promise.all(
+            acceptedItems.map(async ({ item, sessionName }) => {
+              const resolved = await this.resolveSubSessionSyncItem(db, item);
+              return resolved ? { item, sessionName, resolved } : null;
+            }),
+          )).filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+          for (let i = 0; i < resolvedPairs.length; i += SUBSESSION_SYNC_BATCH_MAX_ITEMS) {
+            const chunk = resolvedPairs.slice(i, i + SUBSESSION_SYNC_BATCH_MAX_ITEMS);
+            await createSubSessionsBatch(db, chunk.map((entry) => entry.resolved.row));
+            for (const entry of chunk) {
+              this.registerActiveSubSessionFromSync(entry.item);
+              if (Object.keys(entry.resolved.explicitClearFields).length > 0) {
+                await updateSubSession(db, entry.resolved.row.id, this.serverId, entry.resolved.explicitClearFields);
+              }
+              if (typeof entry.item.runtimeEpoch === 'string' && entry.item.runtimeEpoch) {
+                this.lastObservedSubSessionRuntimeEpoch.set(entry.sessionName, entry.item.runtimeEpoch);
+              }
+              this.setCachedSessionAgentType(entry.sessionName, entry.resolved.row.type);
+            }
+            await this.refreshAllNonServerShareCoveredSessions();
+            this.broadcastSubsessionCreatedBatch(chunk.map((entry) => entry.resolved.frame));
+          }
+        },
+      ).catch((e) => logger.error({ err: e, count: eligibleItems.length, type }, 'Failed to sync sub-sessions to DB'));
       return;
     }
     if (type === 'subsession.update_gemini_id' && this.db) {
@@ -12069,7 +12161,11 @@ export class WsBridge {
   private async resolveSubSessionSyncItem(
     db: Database,
     msg: Record<string, unknown>,
-  ): Promise<{ row: import('../db/queries.js').SubSessionBatchUpsertInput; frame: Record<string, unknown> } | null> {
+  ): Promise<{
+    row: import('../db/queries.js').SubSessionBatchUpsertInput;
+    frame: Record<string, unknown>;
+    explicitClearFields: { cc_preset_id?: null; requested_model?: null; active_model?: null };
+  } | null> {
     if (typeof msg.id !== 'string' || !msg.id) return null;
     const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
       ? msg.sessionType.trim()
@@ -12096,7 +12192,12 @@ export class WsBridge {
         }
       : {};
     const activeModel = ((msg.activeModel as string) || (msg.modelDisplay as string)) || null;
+    const explicitClearFields: { cc_preset_id?: null; requested_model?: null; active_model?: null } = {};
+    if ('ccPresetId' in msg && msg.ccPresetId == null) explicitClearFields.cc_preset_id = null;
+    if ('requestedModel' in msg && msg.requestedModel == null) explicitClearFields.requested_model = null;
+    if ('activeModel' in msg && activeModel == null) explicitClearFields.active_model = null;
     return {
+      explicitClearFields,
       row: {
         id: msg.id,
         serverId: this.serverId,
@@ -14776,6 +14877,207 @@ export class WsBridge {
     });
   }
 
+  private runSerializedSessionDbMutation<T>(sessionName: string, fn: () => Promise<T>): Promise<T> {
+    const key = sessionName || '__global__';
+    const prev = this.sessionDbMutationChains.get(key) ?? Promise.resolve();
+    const run = prev.catch(() => undefined).then(fn);
+    const tail = run.then(() => undefined, () => undefined);
+    this.sessionDbMutationChains.set(key, tail);
+    void tail.finally(() => {
+      if (this.sessionDbMutationChains.get(key) === tail) {
+        this.sessionDbMutationChains.delete(key);
+      }
+    });
+    return run;
+  }
+
+  private runSerializedMultiSessionDbMutation<T>(sessionNames: string[], fn: () => Promise<T>): Promise<T> {
+    const uniqueSorted = [...new Set(sessionNames.filter(Boolean))].sort();
+    if (uniqueSorted.length === 0) return fn();
+    const prevs = uniqueSorted.map((key) => this.sessionDbMutationChains.get(key) ?? Promise.resolve());
+    const run = Promise.all(prevs.map((prev) => prev.catch(() => undefined))).then(() => fn());
+    const tail = run.then(() => undefined, () => undefined);
+    for (const key of uniqueSorted) {
+      this.sessionDbMutationChains.set(key, tail);
+    }
+    void tail.finally(() => {
+      for (const key of uniqueSorted) {
+        if (this.sessionDbMutationChains.get(key) === tail) {
+          this.sessionDbMutationChains.delete(key);
+        }
+      }
+    });
+    return run;
+  }
+
+  private isSupersededSubSessionSync(sessionName: string, msg: Record<string, unknown>): boolean {
+    const runtimeEpoch = typeof msg.runtimeEpoch === 'string' ? msg.runtimeEpoch : '';
+    if (!runtimeEpoch) {
+      // If a modern restart already committed on this session with a known runtimeEpoch,
+      // reject any subsequent sync that lacks runtimeEpoch (pre-epoch / deferred snapshot).
+      return (this.committedSessionRestartEpochs.get(sessionName) ?? 0) > 0
+        && this.lastObservedSubSessionRuntimeEpoch.has(sessionName);
+    }
+    return this.supersededSubSessionRuntimeEpochs.get(sessionName)?.has(runtimeEpoch) === true;
+  }
+
+  private parseAppliedRestartState(raw: unknown): AppliedSessionRestartState | null {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const obj = raw as Record<string, unknown>;
+    if (typeof obj.agentType !== 'string' || !obj.agentType.trim()) return null;
+    const strOrNull = (val: unknown): string | null =>
+      (typeof val === 'string' && val.length > 0 ? val : null);
+    const recOrNull = (val: unknown): Record<string, unknown> | null =>
+      (val && typeof val === 'object' && !Array.isArray(val) ? (val as Record<string, unknown>) : null);
+    return {
+      agentType: obj.agentType.trim(),
+      ccPreset: strOrNull(obj.ccPreset),
+      requestedModel: strOrNull(obj.requestedModel),
+      activeModel: strOrNull(obj.activeModel),
+      modelDisplay: strOrNull(obj.modelDisplay),
+      runtimeType: strOrNull(obj.runtimeType),
+      providerId: strOrNull(obj.providerId),
+      cwd: strOrNull(obj.cwd),
+      label: strOrNull(obj.label),
+      description: strOrNull(obj.description),
+      effort: strOrNull(obj.effort),
+      transportConfig: recOrNull(obj.transportConfig),
+      runtimeEpoch: strOrNull(obj.runtimeEpoch),
+    };
+  }
+
+  private markRuntimeEpochSuperseded(sessionName: string, epoch: string | null | undefined, currentEpoch: string | null | undefined): void {
+    if (!epoch || epoch === currentEpoch) return;
+    let set = this.supersededSubSessionRuntimeEpochs.get(sessionName);
+    if (!set) {
+      set = new Set<string>();
+      this.supersededSubSessionRuntimeEpochs.set(sessionName, set);
+    }
+    set.add(epoch);
+    if (set.size > 20) {
+      const oldest = set.values().next().value;
+      if (oldest !== undefined) set.delete(oldest);
+    }
+  }
+
+  private async commitAuthoritativeRestart(
+    sessionName: string,
+    restartEpoch: number,
+    applied: AppliedSessionRestartState | null,
+    persistApplied?: (applied: AppliedSessionRestartState) => Promise<void>,
+    previousRuntimeEpoch?: string | null,
+  ): Promise<'committed' | 'superseded'> {
+    return this.runSerializedSessionDbMutation(sessionName, async () => {
+      const lastCommittedEpoch = sessionName
+        ? (this.committedSessionRestartEpochs.get(sessionName) ?? 0)
+        : 0;
+      if (sessionName && restartEpoch <= lastCommittedEpoch) {
+        return 'superseded';
+      }
+      if (applied && persistApplied) {
+        await persistApplied(applied);
+      }
+      if (sessionName) {
+        this.committedSessionRestartEpochs.set(sessionName, restartEpoch);
+        const currentEpoch = applied?.runtimeEpoch ?? null;
+        if (previousRuntimeEpoch) {
+          this.markRuntimeEpochSuperseded(sessionName, previousRuntimeEpoch, currentEpoch);
+        }
+        if (currentEpoch) {
+          const prevEpoch = this.lastObservedSubSessionRuntimeEpoch.get(sessionName);
+          this.markRuntimeEpochSuperseded(sessionName, prevEpoch, currentEpoch);
+          this.lastObservedSubSessionRuntimeEpoch.set(sessionName, currentEpoch);
+        }
+        if (applied) {
+          this.setCachedSessionAgentType(sessionName, applied.agentType);
+        }
+      }
+      return 'committed';
+    });
+  }
+
+  /**
+   * Relay `session.restart` or `subsession.restart` and await daemon confirmation
+   * when the connected daemon advertises `supportsSessionRestartResponse`.
+   * Falls back to fire-and-forget `sendToDaemon` for older daemons (version skew).
+   */
+  async sendSessionRestartCommand(
+    frame: Record<string, unknown>,
+    options?: {
+      timeoutMs?: number;
+      persistApplied?: (applied: AppliedSessionRestartState) => Promise<void>;
+    },
+  ): Promise<SessionRestartRelayResult> {
+    if (!this.daemonSupportsRestartResponse) {
+      this.sendToDaemon(JSON.stringify(frame));
+      return { status: 'legacy_sent' };
+    }
+    const sessionName = typeof frame.sessionName === 'string' ? frame.sessionName : '';
+    const timeoutMs = options?.timeoutMs ?? DEFAULT_SESSION_RESTART_TIMEOUT_MS;
+    const requestId = randomUUID();
+    const restartEpoch = (this.sessionRestartEpochs.get(sessionName) ?? 0) + 1;
+    if (sessionName) this.sessionRestartEpochs.set(sessionName, restartEpoch);
+    const deadlineAt = Date.now() + timeoutMs;
+    const cleanupTimer = setTimeout(() => {
+      this.pendingRestartEntries.delete(requestId);
+    }, Math.max(timeoutMs + 120_000, 120_000));
+    cleanupTimer.unref?.();
+    this.pendingRestartEntries.set(requestId, {
+      sessionName,
+      epoch: restartEpoch,
+      timedOut: false,
+      persistApplied: options?.persistApplied,
+      cleanupTimer,
+    });
+
+    let reply: Record<string, unknown>;
+    try {
+      reply = await this.sendMachineConfigRequest(
+        { ...frame, requestId, deadlineAt, restartEpoch },
+        timeoutMs,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const pending = this.pendingRestartEntries.get(requestId);
+      if (message === 'timeout' && pending && this.isDaemonConnected()) {
+        pending.timedOut = true;
+        return { status: 'pending', requestId, restartEpoch };
+      }
+      if (pending) {
+        clearTimeout(pending.cleanupTimer);
+        this.pendingRestartEntries.delete(requestId);
+      }
+      throw err;
+    }
+
+    const pending = this.pendingRestartEntries.get(requestId);
+    if (pending) {
+      clearTimeout(pending.cleanupTimer);
+      this.pendingRestartEntries.delete(requestId);
+    }
+    if (reply.ok !== true) {
+      const error = typeof reply.error === 'string' && reply.error.trim()
+        ? reply.error.trim()
+        : 'relaunch_rejected';
+      return { status: 'rejected', error };
+    }
+    const applied = this.parseAppliedRestartState(reply.applied);
+    const previousRuntimeEpoch = typeof reply.previousRuntimeEpoch === 'string' && reply.previousRuntimeEpoch
+      ? reply.previousRuntimeEpoch
+      : null;
+    const outcome = await this.commitAuthoritativeRestart(
+      sessionName,
+      restartEpoch,
+      applied,
+      options?.persistApplied,
+      previousRuntimeEpoch,
+    );
+    if (outcome === 'superseded') {
+      return { status: 'superseded' };
+    }
+    return { status: 'committed', applied };
+  }
+
   /**
    * Try to resolve a pending memory.get_sources request.
    * Returns true if a matching pending request was found and resolved.
@@ -14791,6 +15093,10 @@ export class WsBridge {
     this.memorySourcesRequests.rejectAll(reason);
     this.machineConfigRequests.rejectAll(reason);
     this.sessionIdentityRequests.rejectAll(reason);
+    for (const [, pending] of this.pendingRestartEntries) {
+      clearTimeout(pending.cleanupTimer);
+    }
+    this.pendingRestartEntries.clear();
   }
 
   // ── PROJECT/SESSION identity: daemon is the sole content owner ─────────

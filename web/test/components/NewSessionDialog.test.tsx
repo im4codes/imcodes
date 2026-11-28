@@ -812,13 +812,15 @@ describe('NewSessionDialog', () => {
   it('saves qwen presets with the new default env template', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    const listReq1 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
+    act(() => ws.emit({ type: 'cc.presets.list_response', requestId: listReq1.requestId, presets: [] }));
 
     selectAgent('qwen');
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByText('api_provider_add_edit'));
-    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
-    fireEvent.click(screen.getByRole('button', { name: /save preset/i }));
+    fireEvent.input(screen.getByPlaceholderText('namePlaceholder'), { target: { value: 'MiniMax' } });
+    fireEvent.click(screen.getByRole('button', { name: 'savePresetButton' }));
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'cc.presets.save',
@@ -844,19 +846,21 @@ describe('NewSessionDialog', () => {
   it('saves OpenAI compatible preset when selected in preset editor', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    const listReq2 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
+    act(() => ws.emit({ type: 'cc.presets.list_response', requestId: listReq2.requestId, presets: [] }));
 
     selectAgent('qwen');
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
 
     fireEvent.click(screen.getByText('api_provider_add_edit'));
-    const openaiRadio = screen.getByLabelText(/OpenAI Compatible/i);
+    const openaiRadio = screen.getByLabelText(/protocolOpenAi/i);
     fireEvent.click(openaiRadio);
 
     expect((screen.getByDisplayValue('https://api.minimax.chat/v1') as HTMLInputElement)).toBeDefined();
     expect((screen.getByDisplayValue('MiniMax-Text-01') as HTMLInputElement)).toBeDefined();
 
-    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax-OpenAI' } });
-    fireEvent.click(screen.getByRole('button', { name: /save preset/i }));
+    fireEvent.input(screen.getByPlaceholderText('namePlaceholder'), { target: { value: 'MiniMax-OpenAI' } });
+    fireEvent.click(screen.getByRole('button', { name: 'savePresetButton' }));
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'cc.presets.save',
@@ -879,12 +883,22 @@ describe('NewSessionDialog', () => {
   it('keeps the preset env model authoritative for qwen after discovery', async () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    const listReq3 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
+    act(() => ws.emit({ type: 'cc.presets.list_response', requestId: listReq3.requestId, presets: [] }));
 
     selectAgent('qwen');
     fireEvent.click(screen.getByText('api_provider_add_edit'));
-    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'MiniMax' } });
-    fireEvent.input(screen.getByPlaceholderText('your-api-key'), { target: { value: 'secret' } });
-    fireEvent.click(screen.getByRole('button', { name: /discover models/i }));
+    fireEvent.input(screen.getByPlaceholderText('namePlaceholder'), { target: { value: 'MiniMax' } });
+    fireEvent.input(screen.getByPlaceholderText('apiKeyPlaceholder'), { target: { value: 'secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'discoverModels' }));
+
+    const discoverSaveCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    act(() => ws.emit({ type: 'cc.presets.save_response', requestId: discoverSaveCall.requestId, ok: true }));
+
+    await waitFor(() => {
+      expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'cc.presets.discover_models', presetName: 'MiniMax' }));
+    });
+
     act(() => ws.emit({
       type: 'cc.presets.discover_models_response',
       ok: true,
@@ -903,6 +917,10 @@ describe('NewSessionDialog', () => {
 
     fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
     fireEvent.input(screen.getByPlaceholderText('~/.imcodes/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    await waitFor(() => {
+      const startBtn = screen.getByRole('button', { name: /start/i });
+      expect((startBtn as HTMLButtonElement).disabled).toBe(false);
+    });
     fireEvent.click(screen.getByRole('button', { name: /start/i }));
 
     await waitFor(() => {
@@ -910,6 +928,246 @@ describe('NewSessionDialog', () => {
         agentType: 'qwen',
         ccPreset: 'MiniMax',
         requestedModel: 'MiniMax-M2.7',
+      }));
+    });
+  });
+
+  it('does not replay prior discovery into newly opened NewSessionDialog or overwrite switched preset when stale discovery resolves', async () => {
+    const ws = makeWs();
+    const { CcPresetManagerDialog } = await import('../../src/components/CcPresetManager.js');
+
+    const mgr = render(<CcPresetManagerDialog ws={ws as any} onClose={vi.fn()} />);
+    const mgrListReq = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
+    act(() => ws.emit({
+      type: 'cc.presets.list_response',
+      requestId: mgrListReq.requestId,
+      presets: [
+        { name: 'PresetA', env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a1' }, defaultModel: 'a1' },
+        { name: 'PresetB', env: { ANTHROPIC_BASE_URL: 'https://b.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'b1' }, defaultModel: 'b1' },
+      ],
+    }));
+    fireEvent.click(screen.getAllByRole('button', { name: 'editButton' })[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'discoverModels' }));
+    const mgrSaveCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    act(() => ws.emit({ type: 'cc.presets.save_response', requestId: mgrSaveCall.requestId, ok: true }));
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call: any[]) => call[0]?.type === 'cc.presets.discover_models')).toBe(true);
+    });
+    const mgrDiscover = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').at(-1)![0];
+    act(() => ws.emit({
+      type: 'cc.presets.discover_models_response',
+      requestId: mgrDiscover.requestId,
+      ok: true,
+      presetName: 'PresetA',
+      preset: {
+        name: 'PresetA',
+        env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a1' },
+        defaultModel: 'a1',
+        availableModels: [{ id: 'a1' }, { id: 'a2' }],
+      },
+    }));
+    mgr.unmount();
+
+    // Open NewSessionDialog AFTER CcPresetManagerDialog discovered PresetA:
+    // default selection for qwen must stay empty (Default), never replaying PresetA or model 'a1'.
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    const dlgListReq = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
+    act(() => ws.emit({
+      type: 'cc.presets.list_response',
+      requestId: dlgListReq.requestId,
+      presets: [
+        { name: 'PresetA', env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a1' }, defaultModel: 'a1', availableModels: [{ id: 'a1' }, { id: 'a2' }] },
+        { name: 'PresetB', env: { ANTHROPIC_BASE_URL: 'https://b.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'b1' }, defaultModel: 'b1', availableModels: [{ id: 'b1' }] },
+      ],
+    }));
+
+    selectAgent('claude-code-sdk');
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((s) => Array.from(s.options).some((o) => o.value === 'PresetA'))!;
+    expect(presetSelect.value).toBe('');
+
+    // Start in-flight discovery on PresetA in NewSessionDialog, then switch selection to PresetB before response arrives.
+    fireEvent.click(screen.getByText('api_provider_add_edit'));
+    fireEvent.click(screen.getAllByRole('button', { name: 'editButton' })[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'discoverModels' }));
+    const dlgSaveCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    act(() => ws.emit({ type: 'cc.presets.save_response', requestId: dlgSaveCall.requestId, ok: true }));
+    await waitFor(() => {
+      expect(ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').length).toBe(2);
+    });
+    const dlgDiscover = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').at(-1)![0];
+
+    fireEvent.input(presetSelect, { target: { value: 'PresetB' } });
+    expect(presetSelect.value).toBe('PresetB');
+
+    act(() => ws.emit({
+      type: 'cc.presets.discover_models_response',
+      requestId: dlgDiscover.requestId,
+      ok: true,
+      presetName: 'PresetA',
+      preset: {
+        name: 'PresetA',
+        env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a2' },
+        defaultModel: 'a2',
+        availableModels: [{ id: 'a1' }, { id: 'a2' }],
+      },
+    }));
+
+    // Confirm async resolution of PresetA's discovery response keeps PresetB & b1 (and child editor NEVER calls onSelectPresetName('PresetA')).
+    fireEvent.click(presetSelect);
+    const editRowA = document.querySelector('[data-cc-preset-row="PresetA"] button') as HTMLButtonElement;
+    expect(editRowA).not.toBeNull();
+    fireEvent.click(editRowA);
+    fireEvent.input(presetSelect, { target: { value: 'PresetB' } });
+    expect(presetSelect.value).toBe('PresetB');
+
+    fireEvent.click(screen.getByRole('button', { name: 'discoverModels' }));
+    const dlgSaveCall2 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    act(() => ws.emit({ type: 'cc.presets.save_response', requestId: dlgSaveCall2.requestId, ok: true }));
+    await waitFor(() => {
+      expect(ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').length).toBe(3);
+    });
+    const dlgDiscover2 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').at(-1)![0];
+    act(() => ws.emit({
+      type: 'cc.presets.discover_models_response',
+      requestId: dlgDiscover2.requestId,
+      ok: true,
+      presetName: 'PresetA',
+      preset: {
+        name: 'PresetA',
+        env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a2' },
+        defaultModel: 'a2',
+        availableModels: [{ id: 'a1' }, { id: 'a2' }, { id: 'a3' }],
+      },
+    }));
+
+    // Wait an extra microtask tick to confirm neither parent nor child overwrote PresetB
+    await waitFor(() => {
+      expect(presetSelect.value).toBe('PresetB');
+    });
+
+    // Also test Default ('') kept when user switches from PresetA back to Default before response settles
+    fireEvent.input(presetSelect, { target: { value: 'PresetA' } });
+    fireEvent.click(screen.getByRole('button', { name: 'discoverModels' }));
+    const dlgSaveCall3 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    act(() => ws.emit({ type: 'cc.presets.save_response', requestId: dlgSaveCall3.requestId, ok: true }));
+    await waitFor(() => {
+      expect(ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').length).toBe(4);
+    });
+    const dlgDiscover3 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').at(-1)![0];
+    fireEvent.input(presetSelect, { target: { value: '' } });
+    act(() => ws.emit({
+      type: 'cc.presets.discover_models_response',
+      requestId: dlgDiscover3.requestId,
+      ok: true,
+      presetName: 'PresetA',
+      preset: {
+        name: 'PresetA',
+        env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a3' },
+        defaultModel: 'a3',
+        availableModels: [{ id: 'a1' }, { id: 'a2' }, { id: 'a3' }],
+      },
+    }));
+    await waitFor(() => {
+      expect(presetSelect.value).toBe('');
+    });
+
+    // Must keep Default (''), or PresetB before. Switch to PresetB and verify Start payload
+    fireEvent.input(presetSelect, { target: { value: 'PresetB' } });
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'switch-safe' } });
+    fireEvent.input(screen.getByPlaceholderText('~/.imcodes/projects/my-project'), { target: { value: '/tmp/switch-safe' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    await waitFor(() => {
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+        ccPreset: 'PresetB',
+      }));
+    });
+  });
+
+  it('preserves switched PresetB across async Save/Delete of PresetA and preserves manual model choice during PresetA discovery', async () => {
+    const ws = makeWs();
+    const onSelectSpy = vi.fn();
+    void onSelectSpy;
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    const listReq = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
+    act(() => ws.emit({
+      type: 'cc.presets.list_response',
+      requestId: listReq.requestId,
+      version: 'v1',
+      presets: [
+        { name: 'PresetA', env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a1' }, defaultModel: 'a1', availableModels: [{ id: 'a1' }, { id: 'a2' }] },
+        { name: 'PresetB', env: { ANTHROPIC_BASE_URL: 'https://b.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'b1' }, defaultModel: 'b1', availableModels: [{ id: 'b1' }] },
+      ],
+    }));
+
+    selectAgent('claude-code-sdk');
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((s) => Array.from(s.options).some((o) => o.value === 'PresetB'))!;
+
+    // 1) Save PresetA -> user immediately selects PresetB while SAVE_RESPONSE is in-flight -> PresetB must stay active
+    fireEvent.click(screen.getByText('api_provider_add_edit'));
+    fireEvent.input(screen.getByPlaceholderText('namePlaceholder'), { target: { value: 'PresetNew' } });
+    fireEvent.input(screen.getByPlaceholderText('apiKeyPlaceholder'), { target: { value: 'k' } });
+    fireEvent.click(screen.getByRole('button', { name: 'savePresetButton' }));
+    const saveCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+
+    fireEvent.input(presetSelect, { target: { value: 'PresetB' } });
+    expect(presetSelect.value).toBe('PresetB');
+
+    await act(async () => {
+      ws.emit({ type: 'cc.presets.save_response', requestId: saveCall.requestId, ok: true, version: 'v2', presets: saveCall.presets });
+    });
+    expect(presetSelect.value).toBe('PresetB');
+
+    // 2) Delete PresetNew after switching to PresetB while delete SAVE_RESPONSE is in-flight -> PresetB must not be cleared
+    const newRowButtons = document.querySelectorAll('[data-cc-preset-row="PresetNew"] button');
+    fireEvent.click(newRowButtons[newRowButtons.length - 1]);
+    const deleteCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    await act(async () => {
+      ws.emit({ type: 'cc.presets.save_response', requestId: deleteCall.requestId, ok: true, version: 'v3', presets: deleteCall.presets });
+    });
+    expect(presetSelect.value).toBe('PresetB');
+
+    // 3) Select PresetA -> click Discover -> user explicitly picks model a2 -> DISCOVER_MODELS_RESPONSE resolves -> a2 preserved
+    fireEvent.input(presetSelect, { target: { value: 'PresetA' } });
+    const editBtnA = document.querySelector('[data-cc-preset-row="PresetA"] button') as HTMLButtonElement;
+    fireEvent.click(editBtnA);
+    fireEvent.click(screen.getByRole('button', { name: 'discoverModels' }));
+    const discSaveCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    act(() => ws.emit({ type: 'cc.presets.save_response', requestId: discSaveCall.requestId, ok: true, version: 'v4', presets: discSaveCall.presets }));
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call: any[]) => call[0]?.type === 'cc.presets.discover_models')).toBe(true);
+    });
+    const discCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').at(-1)![0];
+
+    const modelSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((s) => Array.from(s.options).some((o) => o.value === 'a2'))!;
+    fireEvent.input(modelSelect, { target: { value: 'a2' } });
+    expect(modelSelect.value).toBe('a2');
+
+    await act(async () => {
+      ws.emit({
+        type: 'cc.presets.discover_models_response',
+        requestId: discCall.requestId,
+        ok: true,
+        presetName: 'PresetA',
+        preset: {
+          name: 'PresetA',
+          env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a1' },
+          defaultModel: 'a1',
+          availableModels: [{ id: 'a1' }, { id: 'a2' }, { id: 'a3' }],
+        },
+        version: 'v5',
+      });
+    });
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'race-safe' } });
+    fireEvent.input(screen.getByPlaceholderText('~/.imcodes/projects/my-project'), { target: { value: '/tmp/race-safe' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    await waitFor(() => {
+      expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+        ccPreset: 'PresetA',
+        requestedModel: 'a2',
       }));
     });
   });
@@ -2307,9 +2565,11 @@ describe('NewSessionDialog', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
+    const listReqOc = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
     act(() => {
       ws.emit({
         type: 'cc.presets.list_response',
+        requestId: listReqOc.requestId,
         presets: [
           {
             name: 'MiniMax',
@@ -2355,9 +2615,11 @@ describe('NewSessionDialog', () => {
     const ws = makeWs();
     render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
+    const listReqOc = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
     act(() => {
       ws.emit({
         type: 'cc.presets.list_response',
+        requestId: listReqOc.requestId,
         presets: [
           {
             name: 'MiniMax',

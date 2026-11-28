@@ -33,6 +33,8 @@ import { useSharedGitChangesCount } from '../git-status-store.js';
 import type { WsClient } from '../ws-client.js';
 import { dispatchSessionSend } from '../session-send-transport.js';
 import type { TerminalDiff, SessionInfo } from '../types.js';
+import type { AppliedSessionRestartState } from '@shared/session-restart-contract.js';
+import type { SessionSwitchBaseline, SessionSwitchComparable } from '../session-state-updates.js';
 import { isShareScopedState, type SharedStateSummary } from '../tab-sharing-ui.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { extractLatestUsage } from '../usage-data.js';
@@ -115,6 +117,14 @@ interface Props {
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   onSessionSaved?: (fields: { type?: string; requestedModel?: string | null; activeModel?: string | null; modelDisplay?: string | null; ccPreset?: string | null }) => void;
+  getLatestSession?: () => SessionSwitchComparable | null | undefined;
+  onSessionSwitchCommit?: (
+    sessionName: string,
+    baseline: SessionSwitchBaseline | null,
+    applied: AppliedSessionRestartState | null,
+  ) => void;
+  /** Open the standalone CC Preset manager dialog (undefined for restricted shared actors). */
+  onOpenCcPresetManager?: () => void;
   onLiveSessionStateChange?: (state: SubSession['state']) => void;
   /** Open a file preview in the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
@@ -317,7 +327,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, onAskAnswer, onViewModeChange, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onSessionSaved, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick, zIndex, onFocus, onChatScrollFn, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, pendingTaskQuote, onPendingTaskQuoteConsumed, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true, accountScope,
+  sub, ws, connected, active, visible = true, taskPairPanelVisitKey, showTaskPairPanel = true, pairTaskTitle = null, pairRole = null, onPendingQuestion, onAskAnswer, onViewModeChange, idleFlashToken, onDiff, onHistory, onMinimize, onClosePairSplit, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onSessionSaved, getLatestSession, onSessionSwitchCommit, onOpenCcPresetManager, onLiveSessionStateChange, onPreviewFile, onOpenLocalWebPreview, onCloudDocClick, onRemoteDesktopClick, zIndex, onFocus, onChatScrollFn, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onInputRef, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, pendingTaskQuote, onPendingTaskQuoteConsumed, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true, canManageFileShares = true, accountScope,
 }: Props) {
   recordPerfRender(visible ? 'SubSessionWindow:visible' : 'SubSessionWindow:hidden');
   const effectiveCanManageFileShares = canManageFileShares && !isShareScopedState(sharedState);
@@ -1409,6 +1419,9 @@ export function SubSessionWindow({
         canManageFileShares={effectiveCanManageFileShares}
         onTransportConfigSaved={onTransportConfigSaved}
         onSessionSaved={onSessionSaved}
+        getLatestSession={getLatestSession}
+        onSessionSwitchCommit={onSessionSwitchCommit}
+        onOpenCcPresetManager={onOpenCcPresetManager}
         sessionDisplayName={sub.label ? formatLabel(sub.label) : agentTag}
         activeThinking={!!activeThinkingTs}
         activeTransportTurn={activeTimelineTurn}

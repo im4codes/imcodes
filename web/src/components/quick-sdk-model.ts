@@ -4,7 +4,12 @@ import {
   isCodexFamily,
 } from '@shared/agent-types.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
-import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
+import {
+  CUSTOM_PROVIDER_SDK_AGENT_TYPES,
+  getCcPresetAvailableModelIds,
+  getCcPresetEffectiveModel,
+  type CcPreset,
+} from '@shared/cc-presets.js';
 import {
   CODEBUDDY_CHINA_MODEL_FALLBACK,
   CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
@@ -179,11 +184,12 @@ export function resolveCrossSdkModels(options: {
   sdk: string;
   sessionName?: string | null;
   ccPreset?: string | null;
+  presetEntry?: Pick<CcPreset, 'availableModels' | 'defaultModel' | 'env' | 'authType'> | null;
   targetScope?: string | null;
   dynamicState?: Pick<TransportModelState, 'models' | 'defaultModel' | 'loading'> | null;
   cachedCatalog?: CachedTransportModelCatalog | null;
 }): ResolvedCrossSdkModels {
-  const { sdk, sessionName, ccPreset, targetScope, dynamicState } = options;
+  const { sdk, sessionName, ccPreset, presetEntry, targetScope, dynamicState } = options;
   const normalizedPreset = ccPreset?.trim() || null;
   const catalogIdentity = buildTransportModelCatalogIdentity({
     agentType: sdk,
@@ -198,6 +204,12 @@ export function resolveCrossSdkModels(options: {
   const dynamicIds = (dynamicState?.models ?? []).map((m) => m.id).filter(Boolean);
   const cachedIds = (cachedCatalog?.models ?? []).map((m) => m.id).filter(Boolean);
   const staticFallback = normalizedPreset ? null : getStaticFallbackModels(sdk);
+  const presetModelIds = normalizedPreset && presetEntry
+    ? getCcPresetAvailableModelIds(presetEntry)
+    : [];
+  const presetDefaultModel = normalizedPreset && presetEntry
+    ? (getCcPresetEffectiveModel(presetEntry) ?? presetModelIds[0] ?? null)
+    : null;
 
   let staticList: readonly string[] = [];
   if (!normalizedPreset) {
@@ -225,7 +237,12 @@ export function resolveCrossSdkModels(options: {
   }
 
   let models: string[];
-  if (sdk === 'muse-code-sdk') {
+  if (normalizedPreset) {
+    const remoteModels = dynamicIds.length > 0 ? dynamicIds : cachedIds;
+    models = presetModelIds.length > 0
+      ? mergeModelSuggestions(presetModelIds, remoteModels)
+      : remoteModels;
+  } else if (sdk === 'muse-code-sdk') {
     models = mergeModelSuggestions(staticList, dynamicIds.length > 0 ? dynamicIds : cachedIds);
   } else if (dynamicIds.length > 0) {
     models = dynamicIds;
@@ -238,6 +255,7 @@ export function resolveCrossSdkModels(options: {
   const resolvedDefault =
     dynamicState?.defaultModel?.trim()
     || (!normalizedPreset ? cachedCatalog?.defaultModel?.trim() : undefined)
+    || presetDefaultModel
     || (normalizedPreset ? cachedCatalog?.defaultModel?.trim() : undefined)
     || (sdk === AGY_SDK_PROVIDER_ID ? AGY_DEFAULT_MODEL_ID : null)
     || staticFallback?.defaultModel?.trim()

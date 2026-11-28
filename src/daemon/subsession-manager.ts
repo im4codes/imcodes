@@ -330,6 +330,8 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   const resourceRuntimeEpoch = createRuntimeEpoch();
   // The pane launched below is always a new process, so it gets a new hook credential.
   const hookCredential = mintHookCredential();
+  const explicitSubProcessModel = sub.codexModel?.trim() || sub.requestedModel?.trim() || undefined;
+  let resolvedSubPresetModel = explicitSubProcessModel;
   const launchEnv: Record<string, string> = {
     IMCODES_SESSION: sessionName,
     ...resourceOwnerEnv({ sessionName, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
@@ -337,12 +339,30 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
   };
   let presetInitMessage: string | undefined;
   if (sub.ccPreset && (agentType === 'claude-code' || agentType === 'codex')) {
-    const { resolvePresetEnv, getPreset, getPresetInitMessage } = await import('./cc-presets.js');
-    const presetEnv = await resolvePresetEnv(sub.ccPreset, sub.ccSessionId ?? undefined);
-    Object.assign(launchEnv, presetEnv);
+    const { resolvePresetEnv, getPreset, getPresetInitMessage, selectPresetModel, syncSessionContextWindow } = await import('./cc-presets.js');
     const preset = await getPreset(sub.ccPreset);
+    resolvedSubPresetModel = preset ? selectPresetModel(preset, explicitSubProcessModel) : explicitSubProcessModel;
+    const presetEnv = resolvedSubPresetModel
+      ? await resolvePresetEnv(sub.ccPreset, sub.ccSessionId ?? undefined, resolvedSubPresetModel)
+      : await resolvePresetEnv(sub.ccPreset, sub.ccSessionId ?? undefined);
+    Object.assign(launchEnv, presetEnv);
+    syncSessionContextWindow(sub.ccSessionId ?? undefined, preset?.contextWindow);
     if (preset) presetInitMessage = getPresetInitMessage(preset);
+  } else if (sub.ccSessionId) {
+    const { syncSessionContextWindow } = await import('./cc-presets.js');
+    syncSessionContextWindow(sub.ccSessionId, undefined);
   }
+  const effectiveLaunchOpts = {
+    ...launchOpts,
+    ...(agentType === 'codex' && resolvedSubPresetModel ? { codexModel: resolvedSubPresetModel } : {}),
+    ...(agentType === 'claude-code' && resolvedSubPresetModel ? { requestedModel: resolvedSubPresetModel } : {}),
+  };
+  const resolvedLaunchCmd = useResume
+    ? (driver.buildResumeCommand(sessionName, effectiveLaunchOpts) ?? driver.buildLaunchCommand(sessionName, effectiveLaunchOpts))
+    : driver.buildLaunchCommand(sessionName, effectiveLaunchOpts);
+  const winLaunch = useResume
+    ? (driver.buildWinResumeSpec?.(sessionName, effectiveLaunchOpts) ?? driver.buildWinLaunchSpec?.(sessionName, effectiveLaunchOpts))
+    : driver.buildWinLaunchSpec?.(sessionName, effectiveLaunchOpts);
   Object.assign(launchEnv, {
     IMCODES_SESSION: sessionName,
     ...resourceOwnerEnv({ sessionName, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
@@ -356,7 +376,11 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     : undefined;
   let recoveryHandedOff = false;
   try {
-    await newSession(sessionName, launchCmd, { cwd: sub.cwd ?? undefined, env: launchEnv });
+    await newSession(sessionName, resolvedLaunchCmd, {
+      cwd: sub.cwd ?? undefined,
+      env: launchEnv,
+      ...(winLaunch ? { winLaunch } : {}),
+    });
     const paneId = await getPaneId(sessionName);
 
     if (agentType === 'opencode' && !sub.opencodeSessionId && sub.cwd) {
@@ -438,6 +462,11 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
       opencodeSessionId: sub.opencodeSessionId ?? undefined,
       parentSession: sub.parentSession ?? undefined,
       ccPreset: sub.ccPreset ?? undefined,
+      ...((agentType === 'claude-code' || agentType === 'codex') && resolvedSubPresetModel ? {
+        requestedModel: resolvedSubPresetModel,
+        activeModel: resolvedSubPresetModel,
+        modelDisplay: resolvedSubPresetModel,
+      } : {}),
       description: sub.description ?? undefined,
       ...(sub.identityPrompt && !isShellLike ? { appliedIdentityHash: identityPromptHash(sub.identityPrompt) } : {}),
       provisionedIdentityHash: sub.provisionedIdentityHash ?? undefined,

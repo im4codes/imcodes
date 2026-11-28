@@ -544,4 +544,43 @@ describe('process session /clear handling', () => {
       expect.objectContaining({ source: 'daemon' }),
     );
   });
+
+  it('forwards ccPreset (including explicit null) on session.restart and subsession.restart to relaunchSessionWithSettings', async () => {
+    getSessionMock.mockImplementation((name: string) => (
+      name === 'deck_sub_sub1'
+        ? {
+            name: 'deck_sub_sub1',
+            projectName: 'proj',
+            role: 'w1',
+            agentType: 'claude-code-sdk',
+            runtimeType: 'transport',
+            state: 'idle',
+            projectDir: '/proj',
+          }
+        : {
+            name: 'deck_proj_brain',
+            projectName: 'proj',
+            role: 'brain',
+            agentType: 'claude-code-sdk',
+            runtimeType: 'transport',
+            state: 'idle',
+            projectDir: '/proj',
+          }
+    ));
+
+    handleWebCommand({ type: 'session.restart', sessionName: 'deck_proj_brain', ccPreset: 'MiniMax' }, serverLink as any);
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_proj_brain' }),
+      expect.objectContaining({ ccPreset: 'MiniMax' }),
+    );
+
+    relaunchSessionWithSettingsMock.mockClear();
+    handleWebCommand({ type: 'subsession.restart', sessionName: 'deck_sub_sub1', ccPreset: null }, serverLink as any);
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ name: 'deck_sub_sub1' }),
+      expect.objectContaining({ ccPreset: null }),
+    );
+  });
 });

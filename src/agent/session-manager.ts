@@ -443,6 +443,8 @@ export interface ProjectConfig {
   effort?: TransportEffortLevel;
   /** Session-scoped Agent identity available before the first provider turn. */
   identityPrompt?: string;
+  /** Optional initial requested model passed from main-session startup. */
+  requestedModel?: string;
 }
 
 export function getDriver(type: AgentType): AgentDriver {
@@ -463,9 +465,9 @@ export function sessionName(project: string, role: 'brain' | `w${number}`): stri
 
 /** Start all sessions for a project (brain + workers). */
 export async function startProject(config: ProjectConfig): Promise<void> {
-  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label, effort, identityPrompt } = config;
+  const { name, dir, brainType, workerTypes, fresh, extraEnv, ccPreset, label, effort, identityPrompt, requestedModel } = config;
 
-  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, label, effort, identityPrompt });
+  await launchSession({ name: sessionName(name, 'brain'), projectName: name, role: 'brain', agentType: brainType, projectDir: dir, fresh, extraEnv, ccPreset, requestedModel, label, effort, identityPrompt });
 
   for (let i = 0; i < workerTypes.length; i++) {
     const role = `w${i + 1}` as `w${number}`;
@@ -1141,30 +1143,36 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     role: record.role,
     parentSession: record.parentSession,
   });
+  const launchPresetState = await resolveProcessPresetLaunchState({
+    agentType: effectiveRecord.agentType,
+    ccPreset: effectiveRecord.ccPreset,
+    requestedModel: effectiveRecord.requestedModel,
+    ccSessionId,
+  });
   const launchOpts = {
     cwd: projectDir,
     ...(effectiveRecord.shellBin ? { shellBin: effectiveRecord.shellBin } : {}),
     ccSessionId,
     codexSessionId: effectiveRecord.codexSessionId,
     opencodeSessionId: effectiveRecord.opencodeSessionId,
+    ...(effectiveRecord.agentType === 'codex' && launchPresetState.resolvedModel
+      ? { codexModel: launchPresetState.resolvedModel }
+      : {}),
+    ...(effectiveRecord.agentType === 'claude-code' && launchPresetState.resolvedModel
+      ? { requestedModel: launchPresetState.resolvedModel }
+      : {}),
     nativeAgentsFenced,
   };
   const cmd = driver.buildResumeCommand(record.name, launchOpts) ?? driver.buildLaunchCommand(record.name, launchOpts);
+  const winLaunch = driver.buildWinResumeSpec?.(record.name, launchOpts)
+    ?? driver.buildWinLaunchSpec?.(record.name, launchOpts);
 
-  const resourceSessionInstanceId = record.sessionInstanceId?.trim() || randomUUID();
-  const resourceRuntimeEpoch = randomUUID();
-  // A process pane respawn: the old CLI process (and anything it hosted) is gone.
-  const oldResources = await releaseSessionChildResources(record, { providerThreadContinues: false });
-  if (oldResources.failed > 0) {
-    throw new Error(`session resource cleanup failed for ${oldResources.failed} resource(s)`);
-  }
-
-  // Env injection: on ConPTY (Windows), pass env directly to the PTY spawn so cmd.exe
-  // doesn't need to parse POSIX `export` syntax.  On tmux/wezterm, prepend `export` to cmd.
-  // A respawn always starts a new process, so it gets a new hook credential (the old process's copy stops working).
   const hookCredential = mintHookCredential();
   const isShellLike = isShellLikeAgentType(effectiveRecord.agentType);
+  const resourceSessionInstanceId = record.sessionInstanceId?.trim() || randomUUID();
+  const resourceRuntimeEpoch = randomUUID();
   const mergedEnv: Record<string, string> = {
+    ...launchPresetState.env,
     ...imcodesStateDirEnv(),
     IMCODES_SESSION: record.name,
     ...resourceOwnerEnv({
@@ -1175,9 +1183,17 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     ...hookCredentialEnv(hookCredential),
     ...shellHistoryEnv(record.name, effectiveRecord.agentType, effectiveRecord.shellBin),
   };
-  if (record.ccPreset && record.agentType === 'claude-code') {
-    const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
-    Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset, ccSessionId));
+
+  let preparedWinTargets: import('./win-launch.js').ResolvedWinTargetPlan | undefined;
+  if (BACKEND === 'conpty' && winLaunch) {
+    const { preflightConptyWinLaunch } = await import('./conpty.js');
+    preparedWinTargets = preflightConptyWinLaunch(winLaunch, mergedEnv);
+  }
+
+  // A process pane respawn: the old CLI process (and anything it hosted) is gone.
+  const oldResources = await releaseSessionChildResources(record, { providerThreadContinues: false });
+  if (oldResources.failed > 0) {
+    throw new Error(`session resource cleanup failed for ${oldResources.failed} resource(s)`);
   }
   const releaseRecovery = !isShellLike
     ? claimProcessRestartContinuationRecovery(record.name, resourceRuntimeEpoch)
@@ -1186,7 +1202,11 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   try {
     try {
       if (BACKEND === 'conpty') {
-        await respawnPane(record.name, cmd, { env: mergedEnv });
+        await respawnPane(record.name, cmd, {
+          env: mergedEnv,
+          ...(winLaunch ? { winLaunch } : {}),
+          ...(preparedWinTargets ? { preparedWinTargets } : {}),
+        });
       } else {
         const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
         const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
@@ -1244,7 +1264,8 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
         if (record.ccPreset && record.agentType === 'claude-code') {
           const { getPreset, getPresetInitMessage } = await import('../daemon/cc-presets.js');
           const preset = await getPreset(record.ccPreset);
-          if (preset) initParts.push(getPresetInitMessage(preset));
+          const initMsg = preset ? getPresetInitMessage(preset) : undefined;
+          if (initMsg) initParts.push(initMsg);
         }
         if (initParts.length > 0) {
           const initMsg = `[Context — absorb silently, do not respond to this message]\n${initParts.join('\n\n')}`;
@@ -1293,7 +1314,7 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   /** Qwen model ID for `qwen --model <ID>`. */
   qwenModel?: string;
   /** Unified requested transport model for launch/restore. */
-  requestedModel?: string;
+  requestedModel?: string | null;
   /** Human-readable label for UI display. */
   label?: string;
   /** Reasoning/thinking effort for supported transport providers. */
@@ -1304,7 +1325,7 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   description?: string;
   /** Effective synchronized user/project/session identity contract. */
   identityPrompt?: string;
-  /** CC env preset name — resolved to env vars at launch, persisted for respawn (`null` clears). */
+  /** CC env preset name (or explicit null to clear) — resolved to env vars at launch, persisted for respawn. */
   ccPreset?: string | null;
   /** Bind to an existing remote session key instead of creating a new one. */
   bindExistingKey?: string;
@@ -1324,6 +1345,145 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   connectTimeProvider?: TransportProvider;
   /** Internal: source provider whose remote listing authorized this launch; aborts if replaced/disconnected. */
   expectedProvider?: TransportProvider;
+  /** Internal: preflight-validated preset snapshot & resolved ConPTY target reused by relaunch without re-reading mutable config post-teardown. */
+  preparedProcessLaunch?: PreparedProcessPresetLaunch;
+}
+
+export class RestartBeforeStartTimeoutError extends Error {
+  constructor(message = 'restart_timeout_before_start') {
+    super(message);
+    this.name = 'RestartBeforeStartTimeoutError';
+  }
+}
+
+function assertBeforeRestartDeadline(deadlineAt?: number): void {
+  if (typeof deadlineAt === 'number' && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt) {
+    throw new RestartBeforeStartTimeoutError();
+  }
+}
+
+export interface PreparedProcessPresetLaunch {
+  ccPreset: string | null;
+  requestedModel: string | null;
+  env: Record<string, string>;
+  resolvedModel?: string;
+  contextWindow?: number;
+  availableCodexModels?: string[];
+  preparedWinTargets?: import('./win-launch.js').ResolvedWinTargetPlan;
+}
+
+async function resolveProcessPresetLaunchState(opts: {
+  agentType: string;
+  ccPreset?: string | null;
+  requestedModel?: string | null;
+  ccSessionId?: string;
+  previousCcSessionId?: string;
+  syncContextWindow?: boolean;
+}): Promise<{
+  env: Record<string, string>;
+  resolvedModel?: string;
+  contextWindow?: number;
+  availableCodexModels?: string[];
+}> {
+  const ccPresets = await import('../daemon/cc-presets.js');
+  const shouldSyncContextWindow = opts.syncContextWindow !== false;
+  if (shouldSyncContextWindow && opts.previousCcSessionId && opts.previousCcSessionId !== opts.ccSessionId) {
+    ccPresets.syncSessionContextWindow?.(opts.previousCcSessionId, undefined);
+  }
+  const explicitModel = opts.requestedModel?.trim() || undefined;
+  if (opts.ccPreset && (opts.agentType === 'claude-code' || opts.agentType === 'codex')) {
+    const preset = await ccPresets.getPreset(opts.ccPreset);
+    const resolvedModel = preset
+      ? (typeof ccPresets.selectPresetModel === 'function'
+          ? ccPresets.selectPresetModel(preset, explicitModel)
+          : (explicitModel ?? ccPresets.getPresetEffectiveModel?.(preset)))
+      : explicitModel;
+    const env = resolvedModel
+      ? await ccPresets.resolvePresetEnv(opts.ccPreset, opts.ccSessionId, resolvedModel, { syncContextWindow: shouldSyncContextWindow })
+      : await ccPresets.resolvePresetEnv(opts.ccPreset, opts.ccSessionId, undefined, { syncContextWindow: shouldSyncContextWindow });
+    const availableCodexModels = (opts.agentType === 'codex' && preset && typeof ccPresets.getPresetAvailableModelIds === 'function')
+      ? ccPresets.getPresetAvailableModelIds(preset)
+      : undefined;
+    if (shouldSyncContextWindow) {
+      ccPresets.syncSessionContextWindow?.(opts.ccSessionId, preset?.contextWindow);
+    }
+    return {
+      env,
+      resolvedModel,
+      contextWindow: preset?.contextWindow,
+      ...(availableCodexModels?.length ? { availableCodexModels } : {}),
+    };
+  }
+  if (shouldSyncContextWindow) {
+    ccPresets.syncSessionContextWindow?.(opts.ccSessionId, undefined);
+  }
+  return {
+    env: {},
+    resolvedModel: (opts.agentType === 'claude-code' || opts.agentType === 'codex') ? explicitModel : undefined,
+  };
+}
+
+async function prepareProcessLaunchBeforeTeardown(params: {
+  name: string;
+  role: string;
+  parentSession?: string;
+  agentType: AgentType;
+  projectDir: string;
+  shellBin?: string;
+  ccPreset?: string | null;
+  requestedModel?: string | null;
+  fresh?: boolean;
+  ccSessionId?: string;
+  codexSessionId?: string;
+  opencodeSessionId?: string;
+}): Promise<PreparedProcessPresetLaunch | undefined> {
+  if (isTransportAgent(params.agentType)) return undefined;
+  const launchPresetState = await resolveProcessPresetLaunchState({
+    agentType: params.agentType,
+    ccPreset: params.ccPreset,
+    requestedModel: params.requestedModel,
+    syncContextWindow: false,
+  });
+  let preparedWinTargets: import('./win-launch.js').ResolvedWinTargetPlan | undefined;
+  if (BACKEND === 'conpty') {
+    const driver = getDriver(params.agentType);
+    if (driver.buildWinLaunchSpec) {
+      const nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({
+        sessionName: params.name,
+        role: params.role,
+        parentSession: params.parentSession,
+      });
+      const launchOpts = {
+        cwd: params.projectDir,
+        fresh: params.fresh,
+        ...(params.shellBin ? { shellBin: params.shellBin } : {}),
+        ccSessionId: params.ccSessionId ?? 'preflight-cc-id',
+        codexSessionId: params.codexSessionId,
+        opencodeSessionId: params.opencodeSessionId,
+        ...(params.agentType === 'codex' && launchPresetState.resolvedModel ? { codexModel: launchPresetState.resolvedModel } : {}),
+        ...(params.agentType === 'claude-code' && launchPresetState.resolvedModel ? { requestedModel: launchPresetState.resolvedModel } : {}),
+        nativeAgentsFenced,
+      };
+      const winLaunch = driver.buildWinLaunchSpec(params.name, launchOpts);
+      if (winLaunch) {
+        const { preflightConptyWinLaunch } = await import('./conpty.js');
+        preparedWinTargets = preflightConptyWinLaunch(winLaunch, {
+          ...launchPresetState.env,
+          ...imcodesStateDirEnv(),
+          IMCODES_SESSION: params.name,
+        });
+      }
+    }
+  }
+  return {
+    ccPreset: params.ccPreset ?? null,
+    requestedModel: params.requestedModel ?? null,
+    env: launchPresetState.env,
+    resolvedModel: launchPresetState.resolvedModel,
+    contextWindow: launchPresetState.contextWindow,
+    ...(launchPresetState.availableCodexModels?.length ? { availableCodexModels: launchPresetState.availableCodexModels } : {}),
+    ...(preparedWinTargets ? { preparedWinTargets } : {}),
+  };
 }
 
 export interface SessionRelaunchOverrides {
@@ -1433,7 +1593,9 @@ function isPresetCompatibleAgentSwitch(sourceAgentType: string, targetAgentType:
 export async function relaunchSessionWithSettings(
   record: SessionRecord,
   overrides: SessionRelaunchOverrides = {},
+  options?: { deadlineAt?: number },
 ): Promise<void> {
+  assertBeforeRestartDeadline(options?.deadlineAt);
   const launchGeneration = advanceCrossVendorHandoffLaunchGeneration(record.name);
   const existedAtStart = Boolean(getSession(record.name));
   const isGenerationCurrent = (): boolean => crossVendorHandoffLaunchGenerations.get(record.name) === launchGeneration;
@@ -1458,15 +1620,17 @@ export async function relaunchSessionWithSettings(
   const targetProjectDir = overrides.projectDir ?? record.projectDir;
   const targetLabel = overrides.label !== undefined ? overrides.label : (record.label ?? null);
   const targetDescription = overrides.description !== undefined ? overrides.description : (record.description ?? null);
+  const targetCcPreset = overrides.ccPreset !== undefined
+    ? (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType) ? (overrides.ccPreset?.trim() || null) : null)
+    : (isPresetCompatibleAgentSwitch(record.agentType, targetAgentType) ? (record.ccPreset ?? null) : null);
+  const presetChanged = targetCcPreset !== (record.ccPreset ?? null);
   // A model id is provider-scoped. An AG switch without an explicit choice
   // must use AG's default, not the previous provider's (possibly invalid) id.
+  // Switching CC Preset without an explicit model likewise drops the old
+  // preset's model so the new preset's default applies.
   const enteringAgy = targetAgentType === AGY_SDK_PROVIDER_ID && record.agentType !== AGY_SDK_PROVIDER_ID;
-  const targetCcPreset = overrides.ccPreset !== undefined
-    ? (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(targetAgentType) ? (overrides.ccPreset ?? null) : null)
-    : (isPresetCompatibleAgentSwitch(record.agentType, targetAgentType) ? (record.ccPreset ?? null) : null);
-  const clearingCcPreset = overrides.ccPreset === null && Boolean(record.ccPreset);
   const rawRequestedModel = overrides.requestedModel !== undefined ? overrides.requestedModel
-    : (enteringAgy || clearingCcPreset) ? null : (record.requestedModel ?? null);
+    : (enteringAgy || presetChanged) ? null : (record.requestedModel ?? null);
   const targetRequestedModel = targetAgentType === AGY_SDK_PROVIDER_ID
     ? (sanitizeAgyStartupModel(rawRequestedModel) ?? null)
     : rawRequestedModel;
@@ -1474,6 +1638,20 @@ export async function relaunchSessionWithSettings(
   const targetTransportConfig = overrides.transportConfig !== undefined ? overrides.transportConfig : (record.transportConfig ?? null);
   const compatibleIds = targetFresh ? {} : getCompatibleSessionIds(record, targetAgentType);
   const targetRuntimeType = getSessionRuntimeType(targetAgentType);
+  const preparedProcessLaunch = await prepareProcessLaunchBeforeTeardown({
+    name: record.name,
+    role: record.role,
+    ...(record.parentSession ? { parentSession: record.parentSession } : {}),
+    agentType: targetAgentType,
+    projectDir: targetProjectDir,
+    ...(record.shellBin ? { shellBin: record.shellBin } : {}),
+    ccPreset: targetCcPreset,
+    requestedModel: targetRequestedModel,
+    fresh: targetFresh,
+    ...compatibleIds,
+  });
+  assertSessionOwnership();
+  assertBeforeRestartDeadline(options?.deadlineAt);
   const forceHandoff = overrides.handoff === true;
   const handoffConfig = normalizeCrossVendorHandoffConfig(record.crossVendorHandoff?.config);
   const effectiveHandoffConfig = forceHandoff ? { ...handoffConfig, enabled: true } : handoffConfig;
@@ -1526,6 +1704,7 @@ export async function relaunchSessionWithSettings(
   }
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
+    && !presetChanged
     && (!targetFresh || targetAgentType === 'openclaw')
     // Qwen uses providerSessionId as its real resume key, so explicit restart must
     // preserve it (unless fresh conversation requested). Claude/Codex SDKs keep their provider continuity in ccSessionId /
@@ -1538,6 +1717,7 @@ export async function relaunchSessionWithSettings(
     && typeof record.providerSessionId === 'string'
     && record.providerSessionId.length > 0;
 
+  assertBeforeRestartDeadline(options?.deadlineAt);
   await teardownSessionRuntime(record);
   assertSessionOwnership();
 
@@ -1551,10 +1731,11 @@ export async function relaunchSessionWithSettings(
       label: targetLabel ?? undefined,
       description: targetDescription ?? undefined,
       identityPrompt: targetIdentityPrompt ?? undefined,
-      requestedModel: targetRequestedModel ?? undefined,
+      requestedModel: targetRequestedModel,
       effort: targetEffort ?? undefined,
       transportConfig: targetTransportConfig ?? undefined,
       ccPreset: targetCcPreset,
+      ...(preparedProcessLaunch ? { preparedProcessLaunch } : {}),
       ...(preserveTransportBinding ? {
         bindExistingKey: record.providerSessionId,
         ...(!targetFresh ? { skipCreate: true } : {}),
@@ -4063,7 +4244,9 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
   const storedProviderResumeId = (!opts.fresh && (existing?.providerId ?? existing?.agentType) === agentType)
     ? existing?.providerResumeId
     : undefined;
-  let requestedTransportModel = opts.requestedModel ?? storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined);
+  let requestedTransportModel = opts.requestedModel !== undefined
+    ? (opts.requestedModel ?? undefined)
+    : (storedRequestedModel ?? (agentType === 'qwen' ? (opts.qwenModel ?? existing?.qwenModel) : undefined));
   if (agentType === 'codex-sdk') {
     requestedTransportModel = sanitizeCodexSdkStartupModel(requestedTransportModel);
   } else if (isClaudeCodeSdkAgentType(agentType) && requestedTransportModel) {
@@ -4084,9 +4267,9 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
   // and causes Qwen to revert from the preset model (MiniMax-M2 / GLM / Kimi …)
   // back to the OAuth `coder-model` placeholder. `opts.fresh` (from /clear or
   // explicit reset) still wins — same rule applied to transportConfig above.
-  const effectiveCcPreset: string | undefined = opts.ccPreset === null
-    ? undefined
-    : (opts.ccPreset ?? (!opts.fresh && existing?.ccPreset && isPresetCompatibleAgentSwitch(existing.agentType, agentType) ? existing.ccPreset : undefined));
+  const effectiveCcPreset: string | undefined = opts.ccPreset !== undefined
+    ? (opts.ccPreset?.trim() || undefined)
+    : (!opts.fresh && existing?.ccPreset && isPresetCompatibleAgentSwitch(existing.agentType, agentType) ? existing.ccPreset : undefined);
   const effectiveUserCreated: boolean | undefined =
     opts.userCreated ?? (!opts.fresh ? existing?.userCreated : undefined);
   const effectiveParentSession: string | undefined =
@@ -4727,14 +4910,6 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   // Inject both the display identity and the exact logical/runtime owner tuple.
   // Only a pane this call creates receives the new environment; an adopted live pane keeps the process (and credential, if any) it has.
   const hookCredential = exists ? storedBeforeLaunch?.hookCredential : mintHookCredential();
-  const mergedEnv: Record<string, string> = {
-    ...extraEnv,
-    ...imcodesStateDirEnv(),
-    IMCODES_SESSION: name,
-    ...resourceOwnerEnv({ sessionName: name, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
-    ...hookCredentialEnv(hookCredential),
-    ...shellHistoryEnv(name, agentType, opts.shellBin),
-  };
   // A missing tmux pane can be a non-fresh crash restart of the same logical
   // conversation. Only explicit fresh launches or genuinely new records reset
   // the conversation-lifetime summary ledger.
@@ -4746,12 +4921,6 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     if (stored) {
       ccSessionId = stored;
     }
-  }
-
-  // Cache context window for preset so watcher can use it in usage.update
-  if (opts.ccPreset && (agentType === 'claude-code' || agentType === 'codex')) {
-    const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
-    await resolvePresetEnv(opts.ccPreset, ccSessionId);
   }
 
   // No seed file creation for CC — CC ≥2.1.88 crashes on --resume with our seed format.
@@ -4769,6 +4938,38 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     ccSessionId,
     codexSessionId,
   }));
+
+  let launchPresetState: {
+    env: Record<string, string>;
+    resolvedModel?: string;
+    contextWindow?: number;
+    availableCodexModels?: string[];
+  };
+  if (opts.preparedProcessLaunch) {
+    const ccPresets = await import('../daemon/cc-presets.js');
+    if (storedBeforeLaunch?.ccSessionId && storedBeforeLaunch.ccSessionId !== ccSessionId) {
+      ccPresets.syncSessionContextWindow?.(storedBeforeLaunch.ccSessionId, undefined);
+    }
+    ccPresets.syncSessionContextWindow?.(ccSessionId, opts.preparedProcessLaunch.contextWindow);
+    launchPresetState = opts.preparedProcessLaunch;
+  } else {
+    launchPresetState = await resolveProcessPresetLaunchState({
+      agentType,
+      ccPreset: opts.ccPreset,
+      requestedModel: opts.requestedModel,
+      ccSessionId,
+      previousCcSessionId: storedBeforeLaunch?.ccSessionId,
+    });
+  }
+  const mergedEnv: Record<string, string> = {
+    ...extraEnv,
+    ...launchPresetState.env,
+    ...imcodesStateDirEnv(),
+    IMCODES_SESSION: name,
+    ...resourceOwnerEnv({ sessionName: name, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
+    ...hookCredentialEnv(hookCredential),
+    ...shellHistoryEnv(name, agentType, opts.shellBin),
+  };
 
   const releaseRecovery = (!fresh && !exists && opts.onPostLaunchReady && agentType !== 'shell' && agentType !== 'script')
     ? claimProcessRestartContinuationRecovery(name, resourceRuntimeEpoch)
@@ -4794,17 +4995,26 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     }
     const launchStart = Date.now();
     nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({ sessionName: name, role, parentSession: opts.parentSession });
-    const launchCmd = driver.buildLaunchCommand(name, {
+    const launchOpts = {
       cwd: projectDir,
       fresh,
       ...(opts.shellBin ? { shellBin: opts.shellBin } : {}),
       ccSessionId,
       codexSessionId,
+      ...(agentType === 'codex' && launchPresetState.resolvedModel ? { codexModel: launchPresetState.resolvedModel } : {}),
+      ...(agentType === 'claude-code' && launchPresetState.resolvedModel ? { requestedModel: launchPresetState.resolvedModel } : {}),
       opencodeSessionId,
       nativeAgentsFenced,
-    });
+    };
+    const launchCmd = driver.buildLaunchCommand(name, launchOpts);
+    const winLaunch = driver.buildWinLaunchSpec?.(name, launchOpts);
     try {
-      await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
+      await newSession(name, launchCmd, {
+        cwd: projectDir,
+        env: mergedEnv,
+        ...(winLaunch ? { winLaunch } : {}),
+        ...(opts.preparedProcessLaunch?.preparedWinTargets ? { preparedWinTargets: opts.preparedProcessLaunch.preparedWinTargets } : {}),
+      });
     } catch (error) {
       const existing = getSession(name);
       if (existing) throw markLaunchFailure(existing, error);
@@ -4842,8 +5052,8 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
 
   let familyDisplay: Partial<SessionRecord> | undefined;
   if (agentType === 'codex') {
-    let availableCodexModels: string[] | undefined;
-    if (opts.ccPreset) {
+    let availableCodexModels: string[] | undefined = launchPresetState.availableCodexModels;
+    if (!opts.preparedProcessLaunch && !availableCodexModels && opts.ccPreset) {
       const { getPreset, getPresetAvailableModelIds } = await import('../daemon/cc-presets.js');
       const preset = await getPreset(opts.ccPreset);
       if (preset) {
@@ -4851,9 +5061,17 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         if (models.length > 0) availableCodexModels = models;
       }
     }
+    const existingCodexSession = getSession(name);
+    const existingForMerge = existingCodexSession
+      ? {
+          ...existingCodexSession,
+          ccPreset: opts.ccPreset ?? null,
+          ...(!opts.ccPreset && existingCodexSession.ccPreset ? { codexAvailableModels: undefined } : {}),
+        }
+      : undefined;
     const rawDisplay = mergeCodexDisplayMetadata(
       await getCodexRuntimeConfig({ probe: false }).catch(() => ({})),
-      getSession(name),
+      existingForMerge,
     );
     familyDisplay = {
       ...rawDisplay,
@@ -4866,6 +5084,9 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   if (!skipStore) {
     const existing = getSession(name);
     const summarySyncFingerprints = getSummarySyncFingerprints(name);
+    const storedProcessModel = (agentType === 'claude-code' || agentType === 'codex')
+      ? ((opts.ccPreset || opts.requestedModel) ? (launchPresetState.resolvedModel ?? opts.requestedModel ?? null) : null)
+      : (opts.requestedModel ?? null);
     const record: SessionRecord = {
       name,
       sessionInstanceId: resourceSessionInstanceId,
@@ -4886,10 +5107,10 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
       ...(codexSessionId ? { codexSessionId } : {}),
       ...(opencodeSessionId ? { opencodeSessionId } : {}),
       ...(opts.ccPreset ? { ccPreset: opts.ccPreset } : {}),
-      ...(opts.requestedModel ? {
-        requestedModel: opts.requestedModel,
-        activeModel: opts.requestedModel,
-        modelDisplay: opts.requestedModel,
+      ...(storedProcessModel ? {
+        requestedModel: storedProcessModel,
+        activeModel: storedProcessModel,
+        modelDisplay: storedProcessModel,
       } : {}),
       ...(label ? { label } : {}),
       ...(opts.description ? { description: opts.description } : {}),

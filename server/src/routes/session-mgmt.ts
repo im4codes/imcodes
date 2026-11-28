@@ -22,6 +22,7 @@ import {
   type ShareTarget,
 } from '../db/tab-sharing.js';
 import { PARTICIPANT_SHELL_FORBIDDEN_REASON } from '../../../shared/tab-sharing.js';
+import type { AppliedSessionRestartState, SessionRestartRelayResult } from '../../../shared/session-restart-contract.js';
 import {
   resolveHttpShareAccess,
   resolveHttpShareAccessForCoveredSession,
@@ -740,6 +741,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
     description?: string | null;
     cwd?: string | null;
     agentType?: string | null;
+    ccPreset?: string | null;
     requestedModel?: string | null;
     activeModel?: string | null;
     effort?: string | null;
@@ -805,6 +807,18 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
       return c.json({ error: 'invalid_agent_type' }, 400);
     }
   }
+  let hasCcPreset = false;
+  let normalizedCcPreset: string | null | undefined;
+  if (Object.prototype.hasOwnProperty.call(body, 'ccPreset') && body.ccPreset !== undefined) {
+    hasCcPreset = true;
+    if (body.ccPreset === null) {
+      normalizedCcPreset = null;
+    } else if (typeof body.ccPreset === 'string') {
+      normalizedCcPreset = body.ccPreset.trim() || null;
+    } else {
+      return c.json({ error: 'invalid_cc_preset' }, 400);
+    }
+  }
   if ('label' in body) fields.label = body.label ?? null;
   if ('description' in body) fields.description = body.description ?? null;
   if ('cwd' in body) fields.project_dir = body.cwd ?? null;
@@ -824,11 +838,6 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
     }
   }
 
-  await updateSession(c.env.DB, serverId, sessionName, fields);
-  if ('agentType' in body && body.agentType != null) {
-    WsBridge.get(serverId).invalidateSessionAgentTypeCache?.(sessionName);
-  }
-
   const sharedActorNow = Date.now();
   const sharedActor = access.actor.kind === 'share'
     ? await buildHttpSharedActor(c.env.DB, {
@@ -840,29 +849,84 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
       })
     : null;
 
-  if (typeof body.agentType === 'string') {
-    try {
-      WsBridge.get(serverId).sendToDaemon(JSON.stringify({
-        type: 'session.restart',
-        sessionName,
-        agentType: body.agentType,
-        ...(body.label !== undefined ? { label: body.label } : {}),
-        ...(body.description !== undefined ? { description: body.description } : {}),
-        ...(body.cwd !== undefined ? { cwd: body.cwd } : {}),
-        ...(body.requestedModel !== undefined ? { requestedModel: body.requestedModel } : {}),
-        ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
-        ...(body.effort !== undefined ? { effort: body.effort } : {}),
-        ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
-        ...(sharedActor ? { sharedActor } : {}),
-      }));
-    } catch (err) {
-      logger.error({ serverId, sessionName, err }, 'WsBridge session settings relay failed');
-      return c.json({ error: 'relay_failed' }, 502);
+  const bridge = WsBridge.get(serverId);
+  const shouldRestartSession = typeof body.agentType === 'string' || hasCcPreset;
+  if (shouldRestartSession) {
+    const restartFrame = {
+      type: 'session.restart',
+      sessionName,
+      ...(typeof body.agentType === 'string' ? { agentType: body.agentType } : {}),
+      ...(hasCcPreset ? { ccPreset: normalizedCcPreset ?? null } : {}),
+      ...(body.label !== undefined ? { label: body.label } : {}),
+      ...(body.description !== undefined ? { description: body.description } : {}),
+      ...(body.cwd !== undefined ? { cwd: body.cwd } : {}),
+      ...(body.requestedModel !== undefined ? { requestedModel: body.requestedModel } : {}),
+      ...(body.activeModel !== undefined ? { activeModel: body.activeModel } : {}),
+      ...(body.effort !== undefined ? { effort: body.effort } : {}),
+      ...(body.transportConfig !== undefined ? { transportConfig: body.transportConfig } : {}),
+      ...(sharedActor ? { sharedActor } : {}),
+    };
+    if (hasCcPreset && typeof bridge.sendSessionRestartCommand === 'function') {
+      const persistApplied = async (applied: AppliedSessionRestartState) => {
+        await updateSession(c.env.DB, serverId, sessionName, {
+          ...fields,
+          requested_model: applied.requestedModel,
+          active_model: applied.activeModel,
+          ...('label' in body ? { label: applied.label } : {}),
+          ...('description' in body ? { description: applied.description } : {}),
+          ...('cwd' in body ? { project_dir: applied.cwd } : {}),
+          ...('effort' in body ? { effort: applied.effort } : {}),
+          ...('transportConfig' in body ? { transport_config: applied.transportConfig } : {}),
+        });
+        if (applied.agentType !== undefined) {
+          bridge.invalidateSessionAgentTypeCache?.(sessionName);
+        }
+      };
+      let restartResult: SessionRestartRelayResult | { status?: undefined; ok?: boolean; error?: string };
+      try {
+        restartResult = await bridge.sendSessionRestartCommand(restartFrame, { persistApplied }) as SessionRestartRelayResult | { status?: undefined; ok?: boolean; error?: string };
+      } catch (err) {
+        logger.error({ serverId, sessionName, err }, 'WsBridge session settings relay failed');
+        return c.json({ error: 'relay_failed' }, 502);
+      }
+      if (restartResult.status === 'pending') {
+        return c.json({ ok: false, pending: true, requestId: restartResult.requestId }, 202);
+      }
+      if (restartResult.status === 'superseded') {
+        return c.json({ ok: false, superseded: true }, 200);
+      }
+      if (restartResult.status === 'rejected' || (restartResult.status === undefined && restartResult.ok === false)) {
+        return c.json({ error: restartResult.error || 'relaunch_rejected' }, 422);
+      }
+      if (restartResult.status === 'committed') {
+        return c.json({ ok: true, ...(restartResult.applied ? { applied: restartResult.applied } : {}) });
+      }
+      // legacy_sent or minimal test mock returning { ok: true }
+      await updateSession(c.env.DB, serverId, sessionName, fields);
+      if ('agentType' in body && body.agentType != null) {
+        bridge.invalidateSessionAgentTypeCache?.(sessionName);
+      }
+    } else {
+      await updateSession(c.env.DB, serverId, sessionName, fields);
+      if ('agentType' in body && body.agentType != null) {
+        bridge.invalidateSessionAgentTypeCache?.(sessionName);
+      }
+      try {
+        bridge.sendToDaemon(JSON.stringify(restartFrame));
+      } catch (err) {
+        logger.error({ serverId, sessionName, err }, 'WsBridge session settings relay failed');
+        return c.json({ error: 'relay_failed' }, 502);
+      }
+    }
+  } else {
+    await updateSession(c.env.DB, serverId, sessionName, fields);
+    if ('agentType' in body && body.agentType != null) {
+      bridge.invalidateSessionAgentTypeCache?.(sessionName);
     }
   }
-  if (body.agentType == null && body.label !== undefined) {
+  if (!shouldRestartSession && body.label !== undefined) {
     try {
-      WsBridge.get(serverId).sendToDaemon(JSON.stringify({
+      bridge.sendToDaemon(JSON.stringify({
         type: 'session.relabel',
         sessionName,
         label: body.label ?? null,
@@ -873,7 +937,7 @@ sessionMgmtRoutes.patch('/:id/sessions/:name', async (c) => {
       return c.json({ error: 'relay_failed' }, 502);
     }
   }
-  if (body.agentType == null && body.transportConfig !== undefined) {
+  if (!shouldRestartSession && body.transportConfig !== undefined) {
     try {
       WsBridge.get(serverId).sendToDaemon(JSON.stringify({
         type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,

@@ -1,4 +1,5 @@
 import type { AgentStatus, AgentType } from '../detect.js';
+import type { WinLaunchSpec } from '../win-launch.js';
 
 export type DeleteBufferFn = () => Promise<void>;
 
@@ -14,6 +15,8 @@ export interface LaunchOptions {
   codexSessionId?: string;
   /** Codex model override — passed as `-m MODEL` flag on launch. */
   codexModel?: string;
+  /** Requested model override for Claude CLI `--model <MODEL>`. */
+  requestedModel?: string;
   /** OpenCode session ID for `opencode -s <ID>`. */
   opencodeSessionId?: string;
   /** Optional OpenCode CLI resolution overrides (used cleanly in tests). */
@@ -50,6 +53,12 @@ export interface AgentDriver {
    * Returns null if this agent does not support resume.
    */
   buildResumeCommand(sessionName: string, opts?: LaunchOptions): string | null;
+
+  /** Build direct argv launch spec for ConPTY on Windows (avoids `cmd.exe /c` model parsing). */
+  buildWinLaunchSpec?(sessionName: string, opts?: LaunchOptions): WinLaunchSpec;
+
+  /** Build direct argv resume spec for ConPTY on Windows (avoids `cmd.exe /c` model parsing). */
+  buildWinResumeSpec?(sessionName: string, opts?: LaunchOptions): WinLaunchSpec;
 
   /**
    * Detect the current status from captured pane lines.

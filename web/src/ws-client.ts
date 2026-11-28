@@ -298,9 +298,9 @@ export type ServerMessage =
   | { type: typeof P2P_WORKFLOW_MSG.STATUS_RESPONSE; requestId: string; runId?: string; run?: any; runs?: any[]; error?: string }
   | { type: typeof P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE; requestId: string; discussions: Array<{ id: string; fileName: string; path?: string; preview: string; mtime: number }> }
   | { type: typeof P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE; id?: string; requestId: string; content?: string; error?: string }
-  | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; presets: CcPreset[] }
-  | { type: typeof CC_PRESET_MSG.SAVE_RESPONSE; requestId?: string; ok: boolean; error?: string }
-  | { type: typeof CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE; requestId?: string; presetName: string; ok: boolean; preset?: CcPreset; models?: CcPresetModelInfo[]; endpoint?: string; error?: string }
+  | { type: typeof CC_PRESET_MSG.LIST_RESPONSE; requestId?: string; presets: CcPreset[]; version?: string }
+  | { type: typeof CC_PRESET_MSG.SAVE_RESPONSE; requestId?: string; ok: boolean; version?: string; presets?: CcPreset[]; conflict?: boolean; error?: string }
+  | { type: typeof CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE; requestId?: string; presetName: string; ok: boolean; preset?: CcPreset; presets?: CcPreset[]; version?: string; models?: CcPresetModelInfo[]; endpoint?: string; error?: string }
   | { type: typeof CODEX_RESET_CREDITS_MSG.LIST_RESPONSE; requestId?: string; ok: boolean; credits?: CodexResetCredit[]; availableCount?: number; error?: string }
   | { type: typeof CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE; requestId?: string; ok: boolean; outcome?: CodexConsumeOutcome; error?: string }
   | { type: typeof CODEX_CREDIT_HISTORY_MSG.RESPONSE; requestId?: string; ok: boolean; snapshots?: CodexCreditSnapshot[]; error?: string }

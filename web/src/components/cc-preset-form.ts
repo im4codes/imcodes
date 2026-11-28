@@ -2,6 +2,7 @@ import {
   DEFAULT_CC_PRESET_CONTEXT_WINDOW as DEFAULT_CC_PRESET_CONTEXT_WINDOW_VALUE,
   getCcPresetEffectiveModel,
   normalizeCcPresetContextWindow,
+  normalizeCcPresetInitMessage,
 } from '@shared/cc-presets.js';
 import type { CcPreset, CcPresetAuthType, CcPresetModelInfo } from '@shared/cc-presets.js';
 
@@ -24,8 +25,6 @@ export const DEFAULT_CC_PRESET_MODEL = 'MiniMax-M2.7';
 export const DEFAULT_OPENAI_PRESET_BASE_URL = 'https://api.minimax.chat/v1';
 export const DEFAULT_OPENAI_PRESET_MODEL = 'MiniMax-Text-01';
 export const DEFAULT_CC_PRESET_CONTEXT_WINDOW = String(DEFAULT_CC_PRESET_CONTEXT_WINDOW_VALUE);
-export const DEFAULT_CC_PRESET_INIT_MSG =
-  'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
 
 const DEFAULT_CC_PRESET_CUSTOM_ENV_TEMPLATE = Object.freeze([
   { key: 'API_TIMEOUT_MS', value: '3000000' },
@@ -57,7 +56,7 @@ export function createDefaultCcPresetDraft(authType: CcPresetAuthType = 'anthrop
     model: isOpenAi ? DEFAULT_OPENAI_PRESET_MODEL : DEFAULT_CC_PRESET_MODEL,
     contextWindow: DEFAULT_CC_PRESET_CONTEXT_WINDOW,
     customEnv: cloneCustomEnv(DEFAULT_CC_PRESET_CUSTOM_ENV_TEMPLATE),
-    initMessage: DEFAULT_CC_PRESET_INIT_MSG,
+    initMessage: '',
     availableModels: [],
   };
 }
@@ -87,7 +86,7 @@ export function createCcPresetDraftFromPreset(preset: CcPresetEntry): CcPresetDr
     customEnv: Object.entries(preset.env)
       .filter(([key]) => !INLINE_ENV_KEYS.has(key))
       .map(([key, value]) => ({ key, value })),
-    initMessage: preset.initMessage ?? DEFAULT_CC_PRESET_INIT_MSG,
+    initMessage: normalizeCcPresetInitMessage(preset.initMessage) ?? '',
     availableModels: preset.availableModels ?? [],
   };
 }
@@ -119,7 +118,8 @@ export function buildCcPresetFromDraft(draft: CcPresetDraft): CcPresetEntry {
   };
   const contextWindow = parseInt(draft.contextWindow, 10);
   if (contextWindow) preset.contextWindow = contextWindow;
-  if (draft.initMessage.trim()) preset.initMessage = draft.initMessage.trim();
+  const initMessage = normalizeCcPresetInitMessage(draft.initMessage);
+  if (initMessage) preset.initMessage = initMessage;
   if (draft.availableModels.length > 0) preset.availableModels = draft.availableModels;
   if (model) preset.defaultModel = model;
   return preset;

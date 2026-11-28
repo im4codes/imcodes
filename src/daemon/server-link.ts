@@ -668,6 +668,7 @@ export class ServerLink {
         DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
       [SHARED_CONTEXT_RUNTIME_CAPABILITY_PROTOCOL.AUTH_BACKENDS_FIELD]:
         SHARED_CONTEXT_RUNTIME_BACKENDS,
+      supportsSessionRestartResponse: true,
     });
     const ws = useCoreLaneWorker
       ? new CoreLaneSocket(wsUrl, {

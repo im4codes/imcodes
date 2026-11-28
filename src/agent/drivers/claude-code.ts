@@ -1,9 +1,11 @@
 import type { AgentDriver, LaunchOptions, DeleteBufferFn } from './base.js';
 import { cwdPrefix } from './base.js';
 import { claudeNativeAgentFenceFlag } from '../native-agent-fence.js';
+import type { WinLaunchSpec } from '../win-launch.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../../shared/cron-types.js';
+import { quoteShellArg } from '../../util/shell-quote.js';
 
 const OVERLAY_PATTERNS = [
   /Allow|Deny/,
@@ -66,28 +68,64 @@ const STARTUP_PROMPTS: Array<{
   { pattern: /\[Y\/n\]/i, keys: ['Enter'], label: 'confirm' },
 ];
 
+function buildCommonClaudeArgs(opts?: LaunchOptions): string[] {
+  const args = [
+    '--dangerously-skip-permissions',
+    '--append-system-prompt',
+    CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE,
+  ];
+  if (opts?.requestedModel) {
+    args.push('--model', opts.requestedModel);
+  }
+  return args;
+}
+
 export class ClaudeCodeDriver implements AgentDriver {
   readonly type = 'claude-code' as const;
   readonly promptChar = '❯';
   readonly spinnerChars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+  buildWinLaunchSpec(_sessionName: string, opts?: LaunchOptions): WinLaunchSpec {
+    const common = buildCommonClaudeArgs(opts);
+    if (opts?.ccSessionId) {
+      return { primary: { program: 'claude', args: [...common, '--session-id', opts.ccSessionId] } };
+    }
+    if (opts?.fresh) {
+      return { primary: { program: 'claude', args: common } };
+    }
+    return {
+      primary: { program: 'claude', args: [...common, '-c'] },
+      fallback: { program: 'claude', args: common },
+    };
+  }
+
+  buildWinResumeSpec(sessionName: string, opts?: LaunchOptions): WinLaunchSpec {
+    if (opts?.ccSessionId) {
+      const common = buildCommonClaudeArgs(opts);
+      return { primary: { program: 'claude', args: [...common, '--resume', opts.ccSessionId] } };
+    }
+    return this.buildWinLaunchSpec(sessionName, opts);
+  }
+
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
     const fence = opts?.nativeAgentsFenced ? claudeNativeAgentFenceFlag() : '';
+    const modelFlag = opts?.requestedModel ? ` --model ${quoteShellArg(opts.requestedModel, opts?.platform)}` : '';
     if (opts?.ccSessionId) {
-      return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG} --session-id ${opts.ccSessionId}`;
+      return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG}${modelFlag} --session-id ${opts.ccSessionId}`;
     }
     if (opts?.fresh) {
-      return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG}`;
+      return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG}${modelFlag}`;
     }
-    return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG} -c || claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG}`;
+    return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG}${modelFlag} -c || claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG}${modelFlag}`;
   }
 
   buildResumeCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
     const fence = opts?.nativeAgentsFenced ? claudeNativeAgentFenceFlag() : '';
+    const modelFlag = opts?.requestedModel ? ` --model ${quoteShellArg(opts.requestedModel, opts?.platform)}` : '';
     if (opts?.ccSessionId) {
-      return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG} --resume ${opts.ccSessionId}`;
+      return `${cwd}claude --dangerously-skip-permissions${fence}${CRON_TRUST_SYSTEM_PROMPT_FLAG}${modelFlag} --resume ${opts.ccSessionId}`;
     }
     return this.buildLaunchCommand(_sessionName, opts);
   }

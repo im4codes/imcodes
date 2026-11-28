@@ -90,4 +90,32 @@ describe('CC preset form', () => {
       ANTHROPIC_MODEL: 'MiniMax-M2.7',
     });
   });
+
+  it('omits retired DuckDuckGo default initMessage from new and legacy drafts while keeping custom text', async () => {
+    const { RETIRED_DEFAULT_CC_PRESET_INIT_MESSAGE } = await import('../../shared/cc-presets.js');
+    const { buildCcPresetFromDraft, createDefaultCcPresetDraft } = await import('../src/components/cc-preset-form.js');
+
+    expect(createDefaultCcPresetDraft().initMessage).toBe('');
+    expect(
+      createCcPresetDraftFromPreset({
+        name: 'legacy',
+        env: { ANTHROPIC_MODEL: 'm1' },
+        initMessage: RETIRED_DEFAULT_CC_PRESET_INIT_MESSAGE,
+      }).initMessage,
+    ).toBe('');
+    expect(
+      buildCcPresetFromDraft({
+        ...createDefaultCcPresetDraft(),
+        name: 'clean',
+        initMessage: RETIRED_DEFAULT_CC_PRESET_INIT_MESSAGE,
+      }).initMessage,
+    ).toBeUndefined();
+    expect(
+      buildCcPresetFromDraft({
+        ...createDefaultCcPresetDraft(),
+        name: 'custom',
+        initMessage: 'Custom boot instruction',
+      }).initMessage,
+    ).toBe('Custom boot instruction');
+  });
 });

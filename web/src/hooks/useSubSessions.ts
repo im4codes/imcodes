@@ -2,7 +2,12 @@
  * useSubSessions — loads sub-session list from PG, handles create/close,
  * and triggers daemon rebuild on connect.
  */
-import { replaceAtIfChanged } from '../session-state-updates.js';
+import {
+  isSessionSwitchSupersededBySync,
+  replaceAtIfChanged,
+  type SessionSwitchBaseline,
+} from '../session-state-updates.js';
+import type { AppliedSessionRestartState } from '@shared/session-restart-contract.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
   listSubSessions,
@@ -199,6 +204,7 @@ export function useSubSessions(
     setSubSessionsRaw((prev) => {
       const next = typeof updater === 'function' ? updater(prev) : updater;
       if (targetServerId && serverIdRef.current === targetServerId) {
+        rawSubSessionsSnapshotRef.current = next;
         if (disableHttpLoadRef.current) {
           if (hydratedSharedRef.current?.serverId === targetServerId) {
             hydratedSharedRef.current = { serverId: targetServerId, items: next };
@@ -486,6 +492,13 @@ export function useSubSessions(
                   ...existing,
                   ...(isIncog || existing.incognito ? { incognito: true, serverId: currentServerId ?? existing.serverId } : {}),
                   ...(m.activityGeneration !== undefined && { activityGeneration: m.activityGeneration as ActivityGenerationLike }),
+                  ...(m.sessionType ? { type: m.sessionType } : {}),
+                  ...(m.runtimeType != null
+                    ? { runtimeType: m.runtimeType }
+                    : m.sessionType
+                      ? { runtimeType: getSessionRuntimeType(m.sessionType) }
+                      : {}),
+                  ...(m.providerId !== undefined && { providerId: m.providerId }),
                   ...(m.state != null && { state: m.state as SubSession['state'] }),
                   ...(m.sessionInstanceId !== undefined && { sessionInstanceId: m.sessionInstanceId }),
                   ...(m.runtimeEpoch !== undefined && { runtimeEpoch: m.runtimeEpoch }),
@@ -1030,14 +1043,21 @@ export function useSubSessions(
   }, [serverId, subSessions, ws]);
 
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
-  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession,
-    'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'state' | 'authoritativeIdleAt' | 'transportConfig'
-    | 'ccPresetId' | 'requestedModel' | 'activeModel' | 'modelDisplay'
-  >>) => {
+  const updateLocal = useCallback((
+    id: string,
+    fields: Partial<Pick<SubSession,
+      'type' | 'runtimeType' | 'runtimeEpoch' | 'label' | 'description' | 'cwd' | 'state' | 'authoritativeIdleAt' | 'transportConfig'
+      | 'ccPresetId' | 'requestedModel' | 'activeModel' | 'modelDisplay'
+    >>,
+    switchGuard?: { baseline?: SessionSwitchBaseline | null; applied?: AppliedSessionRestartState | null } | null,
+  ) => {
     setSubSessions((prev) => {
       const idx = prev.findIndex((s) => s.id === id);
       if (idx === -1) return prev;
       const existing = prev[idx];
+      if (switchGuard && isSessionSwitchSupersededBySync(existing, switchGuard.baseline, switchGuard.applied)) {
+        return prev;
+      }
       let changed = false;
       for (const key of Object.keys(fields) as Array<keyof typeof fields>) {
         if (existing[key] !== fields[key]) {
@@ -1086,5 +1106,10 @@ export function useSubSessions(
     });
   }, [subSessions, activeSession]);
 
-  return { subSessions, visibleSubSessions, loadedServerId, create, close, restart, rename, updateLocal, hydrateShared };
+  const getSnapshotById = useCallback(
+    (id: string) => rawSubSessionsSnapshotRef.current.find((s) => s.id === id),
+    [],
+  );
+
+  return { subSessions, visibleSubSessions, loadedServerId, create, close, restart, rename, updateLocal, hydrateShared, getSnapshotById };
 }

@@ -50,6 +50,9 @@ export interface CcPresetSaveResponse {
   type: typeof CC_PRESET_MSG.SAVE_RESPONSE;
   requestId?: string;
   ok: boolean;
+  version?: string;
+  presets?: CcPreset[];
+  conflict?: boolean;
   error?: string;
 }
 
@@ -96,6 +99,15 @@ export function normalizeCcPresetContextWindow(
     return DEFAULT_CC_PRESET_CONTEXT_WINDOW;
   }
   return contextWindow;
+}
+
+export const RETIRED_DEFAULT_CC_PRESET_INIT_MESSAGE =
+  'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
+
+export function normalizeCcPresetInitMessage(value: string | undefined | null): string | undefined {
+  const trimmed = typeof value === 'string' ? value.trim() : '';
+  if (!trimmed || trimmed === RETIRED_DEFAULT_CC_PRESET_INIT_MESSAGE) return undefined;
+  return trimmed;
 }
 
 export function normalizeCcPresetName(name: string): string {

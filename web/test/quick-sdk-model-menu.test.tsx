@@ -3,7 +3,9 @@
  */
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { AGENT_AVAILABILITY_MSG } from '@shared/agent-availability.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+import { CC_PRESET_MSG } from '@shared/cc-presets.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { UseQuickDataResult } from '../src/components/QuickInputPanel.js';
 
@@ -71,6 +73,7 @@ function makeWs() {
     sendSessionCommand: vi.fn(),
     sendSessionCommandUrgent: vi.fn(),
     subSessionSetModel: vi.fn(),
+    detectAgents: vi.fn(),
     send: vi.fn(),
     sendInput: vi.fn(),
     onMessage: vi.fn((cb: (msg: unknown) => void) => {
@@ -314,6 +317,7 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
         agentType: 'codex-sdk',
         requestedModel: chosenModel,
         activeModel: null,
+        ccPreset: null,
       });
     });
 
@@ -464,6 +468,7 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
         type: AGY_SDK_PROVIDER_ID,
         requestedModel: AGY_DEFAULT_MODEL_ID,
         activeModel: null,
+        ccPresetId: null,
       });
     });
     expect(mockApi.saveAgyModelPreference).toHaveBeenCalledWith(AGY_DEFAULT_MODEL_ID, 'deck_sub_worker1');
@@ -489,6 +494,7 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
         agentType: 'qoder-sdk',
         requestedModel: null,
         activeModel: null,
+        ccPreset: null,
       });
     });
     cleanup();
@@ -560,6 +566,7 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
         agentType: 'claude-code-sdk',
         requestedModel: null,
         activeModel: null,
+        ccPreset: 'glm',
       });
     });
     expect(onSessionSaved).toHaveBeenCalledWith(expect.objectContaining({
@@ -603,7 +610,511 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
         agentType: 'claude-code-sdk',
         requestedModel: 'glm-4.5-air',
         activeModel: null,
+        ccPreset: 'glm',
       });
     });
+  });
+
+  it('grays out and disables uninstalled non-current SDKs while keeping currentSdk and installed SDKs active', async () => {
+    const { container, ws } = renderSessionControls({ agentType: 'claude-code' });
+    fireEvent.click(container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+
+    // Before availability arrives, SDKs optimistically remain interactive (no false graying).
+    const codexBefore = document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement;
+    expect(codexBefore.disabled).toBe(false);
+    expect(codexBefore.classList.contains('is-unavailable')).toBe(false);
+    expect(ws.detectAgents).toHaveBeenCalledWith(false);
+
+    ws.emitMessage({
+      type: AGENT_AVAILABILITY_MSG.RESULT,
+      checkedAt: Date.now(),
+      agents: {
+        'claude-code': { installed: false, reason: 'binary missing' },
+        'codex-sdk': { installed: false, reason: 'codex CLI not found' },
+        'opencode-sdk': { installed: true },
+      },
+    });
+
+    await waitFor(() => {
+      const codexBtn = document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement;
+      expect(codexBtn.disabled).toBe(true);
+      expect(codexBtn.getAttribute('aria-disabled')).toBe('true');
+      expect(codexBtn.classList.contains('is-unavailable')).toBe(true);
+      expect(codexBtn.title).toContain('new_session.agent_not_installed_hint');
+      expect(codexBtn.title).toContain('codex CLI not found');
+    });
+
+    // Clicking disabled uninstalled SDK must not change preview.
+    const codexBtn = document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement;
+    fireEvent.click(codexBtn);
+    expect(document.body.querySelector('[data-testid="quick-sdk-model-split"]')?.getAttribute('data-preview-sdk')).toBe('claude-code');
+
+    // currentSdk remains enabled even if availability reported false.
+    const currentBtn = document.body.querySelector('[data-sdk-id="claude-code"]') as HTMLButtonElement;
+    expect(currentBtn.disabled).toBe(false);
+    expect(currentBtn.classList.contains('is-unavailable')).toBe(false);
+
+    // Installed SDK switches preview normally.
+    const opencodeBtn = document.body.querySelector('[data-sdk-id="opencode-sdk"]') as HTMLButtonElement;
+    expect(opencodeBtn.disabled).toBe(false);
+    expect(opencodeBtn.classList.contains('is-unavailable')).toBe(false);
+    fireEvent.click(opencodeBtn);
+    expect(document.body.querySelector('[data-testid="quick-sdk-model-split"]')?.getAttribute('data-preview-sdk')).toBe('opencode-sdk');
+  });
+
+  it('supports CC Preset selection, clearing back to Default, preset-defined models, and manage trigger inside QuickSdkModelMenu', async () => {
+    const onOpenCcPresetManager = vi.fn();
+    const { container, ws, onSessionSaved } = renderSessionControls(
+      { agentType: 'claude-code-sdk', ccPreset: 'MiniMax', requestedModel: 'MiniMax-M2.7' },
+      { onOpenCcPresetManager },
+    );
+
+    const trigger = container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement;
+    fireEvent.click(trigger);
+
+    const listReq = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === CC_PRESET_MSG.LIST).at(-1)![0];
+    // Untagged stale list response must be ignored while listReq is active
+    ws.emitMessage({
+      type: CC_PRESET_MSG.LIST_RESPONSE,
+      presets: [{ name: 'StaleWrong', env: {} }],
+    });
+    expect(document.body.querySelector('[data-testid="quick-sdk-preset-select"] option[value="StaleWrong"]')).toBeNull();
+
+    ws.emitMessage({
+      type: CC_PRESET_MSG.LIST_RESPONSE,
+      requestId: listReq.requestId,
+      presets: [
+        {
+          name: 'MiniMax',
+          authType: 'anthropic',
+          env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic', ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+          availableModels: [{ id: 'MiniMax-M2.7' }, { id: 'MiniMax-Text-01' }],
+          defaultModel: 'MiniMax-M2.7',
+        },
+        {
+          name: 'OpenAI-Custom',
+          authType: 'openai',
+          env: { OPENAI_BASE_URL: 'https://api.example.com/v1', OPENAI_MODEL: 'gpt-custom-1' },
+          availableModels: [{ id: 'gpt-custom-1' }, { id: 'gpt-custom-2' }],
+          defaultModel: 'gpt-custom-1',
+        },
+      ],
+    });
+
+    await waitFor(() => {
+      const select = document.body.querySelector('[data-testid="quick-sdk-preset-select"]') as HTMLSelectElement;
+      expect(select).not.toBeNull();
+      expect(select.value).toBe('MiniMax');
+    });
+
+    // Non-preset SDK hides preset selector bar.
+    fireEvent.click(document.body.querySelector('[data-sdk-id="opencode-sdk"]') as HTMLButtonElement);
+    expect(document.body.querySelector('[data-testid="quick-sdk-preset-bar"]')).toBeNull();
+
+    // Switching back to preset-capable codex-sdk shows preset selector and picking OpenAI-Custom exposes preset models immediately.
+    fireEvent.click(document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement);
+    const presetSelect = document.body.querySelector('[data-testid="quick-sdk-preset-select"]') as HTMLSelectElement;
+    expect(presetSelect).not.toBeNull();
+    fireEvent.change(presetSelect, { target: { value: 'OpenAI-Custom' } });
+
+    await waitFor(() => {
+      expect(document.body.querySelector('[data-cross-model-id="gpt-custom-2"]')).not.toBeNull();
+    });
+
+    // Switch back to current SDK (claude-code-sdk) and clear preset back to Default (""), then click default model switch.
+    fireEvent.click(document.body.querySelector('[data-sdk-id="claude-code-sdk"]') as HTMLButtonElement);
+    const sameSdkPresetSelect = document.body.querySelector('[data-testid="quick-sdk-preset-select"]') as HTMLSelectElement;
+    expect(sameSdkPresetSelect.value).toBe('MiniMax');
+    fireEvent.change(sameSdkPresetSelect, { target: { value: '' } });
+
+    const defaultBtn = document.body.querySelector('[data-testid="quick-sdk-default-switch"]') as HTMLButtonElement;
+    expect(defaultBtn).not.toBeNull();
+    fireEvent.click(defaultBtn);
+
+    await waitFor(() => {
+      expect(mockApi.patchSession).toHaveBeenCalledWith('srv1', 'deck_app_brain', expect.objectContaining({
+        agentType: 'claude-code-sdk',
+        activeModel: null,
+        ccPreset: null,
+      }));
+    });
+    expect(onSessionSaved).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'claude-code-sdk',
+      ccPreset: null,
+    }));
+
+    // Reopen and verify manage button closes menu & triggers onOpenCcPresetManager.
+    fireEvent.click(trigger);
+    const manageBtn = document.body.querySelector('[data-testid="quick-sdk-manage-presets"]') as HTMLButtonElement;
+    expect(manageBtn).not.toBeNull();
+    fireEvent.click(manageBtn);
+    expect(onOpenCcPresetManager).toHaveBeenCalledTimes(1);
+    expect(document.body.querySelector('[data-testid="quick-sdk-model-split"]')).toBeNull();
+  });
+
+  it('hides CC Preset manage button for shared actors or when onOpenCcPresetManager is omitted', () => {
+    const view1 = renderSessionControls({ agentType: 'claude-code-sdk' });
+    fireEvent.click(view1.container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    expect(document.body.querySelector('[data-testid="quick-sdk-preset-bar"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-testid="quick-sdk-manage-presets"]')).toBeNull();
+    cleanup();
+
+    const view2 = renderSessionControls(
+      {
+        agentType: 'claude-code-sdk',
+        sharedState: { targetKind: 'main', effectiveRole: 'participant', status: 'active' },
+      },
+      { onOpenCcPresetManager: vi.fn() },
+    );
+    fireEvent.click(view2.container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    expect(document.body.querySelector('[data-testid="quick-sdk-preset-bar"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-testid="quick-sdk-manage-presets"]')).toBeNull();
+    cleanup();
+
+    // Owner sharing out their own session (outgoing: true) MUST retain preset management access.
+    const viewOwnerSharedOut = renderSessionControls(
+      {
+        agentType: 'claude-code-sdk',
+        sharedState: { effectiveRole: 'participant', outgoing: true, status: 'active', users: [] },
+      },
+      { onOpenCcPresetManager: vi.fn() },
+    );
+    fireEvent.click(viewOwnerSharedOut.container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    expect(document.body.querySelector('[data-testid="quick-sdk-manage-presets"]')).not.toBeNull();
+  });
+
+  it('snaps preview back to currentSdk and blocks PATCH when delayed availability reports previewed SDK unavailable', async () => {
+    const { container, ws } = renderSessionControls({ agentType: 'claude-code' });
+    fireEvent.click(container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+
+    // Before availability RESULT arrives, codex-sdk is optimistically selectable for preview.
+    const codexBtn = document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement;
+    expect(codexBtn.disabled).toBe(false);
+    fireEvent.click(codexBtn);
+    expect(document.body.querySelector('[data-testid="quick-sdk-model-split"]')?.getAttribute('data-preview-sdk')).toBe('codex-sdk');
+
+    // Probe arrives reporting codex-sdk is NOT installed.
+    ws.emitMessage({
+      type: AGENT_AVAILABILITY_MSG.RESULT,
+      checkedAt: Date.now(),
+      agents: {
+        'claude-code': { installed: true },
+        'codex-sdk': { installed: false, reason: 'codex CLI not found' },
+      },
+    });
+
+    await waitFor(() => {
+      expect(document.body.querySelector('[data-testid="quick-sdk-model-split"]')?.getAttribute('data-preview-sdk')).toBe('claude-code');
+    });
+    expect(codexBtn.disabled).toBe(true);
+    expect(codexBtn.classList.contains('is-unavailable')).toBe(true);
+
+    // Clicking the right column now executes same-SDK model selection on claude-code, NEVER cross-SDK PATCH to codex-sdk.
+    const rightItems = Array.from(document.body.querySelectorAll('.quick-sdk-model-item')) as HTMLButtonElement[];
+    expect(rightItems.length).toBeGreaterThan(0);
+    fireEvent.click(rightItems[0]);
+    expect(mockApi.patchSession).not.toHaveBeenCalled();
+    expect(mockApi.patchSubSession).not.toHaveBeenCalled();
+  });
+
+  it('keeps previous session state and surfaces warning without calling onSessionSaved when PATCH returns 422', async () => {
+    mockApi.patchSubSession.mockRejectedValueOnce(new Error('API 422: Cannot safely forward model "m %TEMP%"'));
+
+    const { container, onSessionSaved, onAfterAction } = renderSessionControls(
+      {
+        name: 'deck_sub_sub-win-1',
+        project: 'proj',
+        role: 'w1',
+        agentType: 'claude-code',
+        state: 'idle',
+      },
+      { subSessionId: 'sub-win-1' },
+    );
+
+    fireEvent.click(container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    const codexBtn = document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement;
+    expect(codexBtn).not.toBeNull();
+    fireEvent.click(codexBtn);
+
+    const crossModelBtn = await waitFor(() => {
+      const btn = document.body.querySelector('[data-cross-model-id]') as HTMLButtonElement | null;
+      expect(btn).not.toBeNull();
+      return btn!;
+    });
+    fireEvent.click(crossModelBtn);
+
+    await waitFor(() => {
+      expect(mockApi.patchSubSession).toHaveBeenCalledTimes(1);
+      expect(container.textContent).toContain('Cannot safely forward model');
+    });
+    expect(onSessionSaved).not.toHaveBeenCalled();
+    expect(onAfterAction).not.toHaveBeenCalled();
+  });
+
+  it('commits daemon-applied fallback model (m1) over clicked request (m2) and treats 202 pending as non-optimistic', async () => {
+    // 1) Daemon applied m1 despite clicking m2 -> UI must save applied m1 + activeModel m1 (never m2 / null)
+    mockApi.patchSubSession.mockResolvedValueOnce({
+      ok: true,
+      applied: {
+        agentType: 'codex-sdk',
+        ccPreset: null,
+        requestedModel: 'm1-fallback',
+        activeModel: 'm1-fallback',
+        modelDisplay: 'm1-fallback',
+        runtimeType: 'transport',
+        providerId: 'codex',
+        cwd: '/work/proj',
+        label: null,
+        description: null,
+        effort: null,
+        transportConfig: null,
+        runtimeEpoch: 'epoch-ui-1',
+      },
+    });
+    const view1 = renderSessionControls(
+      {
+        name: 'deck_sub_sub-ui-1',
+        project: 'proj',
+        role: 'w1',
+        agentType: 'claude-code',
+        state: 'idle',
+      },
+      { subSessionId: 'sub-ui-1' },
+    );
+    fireEvent.click(view1.container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    fireEvent.click(document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement);
+    const crossModelBtn1 = await waitFor(() => {
+      const btn = document.body.querySelector('[data-cross-model-id]') as HTMLButtonElement | null;
+      expect(btn).not.toBeNull();
+      return btn!;
+    });
+    expect(crossModelBtn1.getAttribute('data-cross-model-id')).not.toBe('m1-fallback');
+    fireEvent.click(crossModelBtn1);
+
+    await waitFor(() => {
+      expect(view1.onSessionSaved).toHaveBeenCalledWith({
+        type: 'codex-sdk',
+        requestedModel: 'm1-fallback',
+        activeModel: 'm1-fallback',
+        modelDisplay: 'm1-fallback',
+        ccPreset: null,
+      });
+    });
+    cleanup();
+
+    // 2) HTTP 202 pending response -> must NOT call onSessionSaved optimistically and surfaces pending warning
+    mockApi.patchSubSession.mockResolvedValueOnce({
+      ok: false,
+      pending: true,
+      requestId: 'req-ui-pending',
+    });
+    const view2 = renderSessionControls(
+      {
+        name: 'deck_sub_sub-ui-2',
+        project: 'proj',
+        role: 'w1',
+        agentType: 'claude-code',
+        state: 'idle',
+      },
+      { subSessionId: 'sub-ui-2' },
+    );
+    fireEvent.click(view2.container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    fireEvent.click(document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement);
+    const crossModelBtn2 = await waitFor(() => {
+      const btn = document.body.querySelector('[data-cross-model-id]') as HTMLButtonElement | null;
+      expect(btn).not.toBeNull();
+      return btn!;
+    });
+    fireEvent.click(crossModelBtn2);
+
+    await waitFor(() => {
+      expect(mockApi.patchSubSession).toHaveBeenCalledTimes(2);
+      expect(view2.container.textContent).toContain('session.quickSwitch.switchPending');
+    });
+    expect(view2.onSessionSaved).not.toHaveBeenCalled();
+    expect(view2.onAfterAction).not.toHaveBeenCalled();
+    cleanup();
+
+    // 3) Superseded HTTP response ({ ok: false, superseded: true }) -> ignored cleanly without calling onSessionSaved or warning
+    mockApi.patchSession.mockResolvedValueOnce({
+      ok: false,
+      superseded: true,
+    });
+    const view3 = renderSessionControls({
+      name: 'deck_ui3_brain',
+      project: 'ui3',
+      role: 'brain',
+      agentType: 'claude-code',
+      state: 'idle',
+    });
+    fireEvent.click(view3.container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    fireEvent.click(document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement);
+    const crossModelBtn3 = await waitFor(() => {
+      const btn = document.body.querySelector('[data-cross-model-id]') as HTMLButtonElement | null;
+      expect(btn).not.toBeNull();
+      return btn!;
+    });
+    fireEvent.click(crossModelBtn3);
+
+    await waitFor(() => {
+      expect(mockApi.patchSession).toHaveBeenCalledTimes(1);
+    });
+    expect(view3.onSessionSaved).not.toHaveBeenCalled();
+    expect(view3.onAfterAction).not.toHaveBeenCalled();
+    expect(view3.container.textContent).not.toContain('session.quickSwitch.switchFailed');
+    expect(view3.container.textContent).not.toContain('session.quickSwitch.switchPending');
+    cleanup();
+
+    // 4) HTTP Promise A remains in-flight while WS sync delivers newer state B (runtimeEpoch: 'ep-B') ->
+    // resolving HTTP A with ok=true & applied A (runtimeEpoch: 'ep-A') MUST NOT revert B.
+    let resolveDeferredA!: (val: unknown) => void;
+    mockApi.patchSubSession.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveDeferredA = resolve; }),
+    );
+    const view4 = renderSessionControls(
+      {
+        name: 'deck_sub_sub-ui-race',
+        project: 'proj',
+        role: 'w1',
+        agentType: 'claude-code',
+        runtimeEpoch: 'ep-0',
+        state: 'idle',
+      },
+      { subSessionId: 'sub-ui-race' },
+    );
+    fireEvent.click(view4.container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    fireEvent.click(document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement);
+    const crossModelBtn4 = await waitFor(() => {
+      const btn = document.body.querySelector('[data-cross-model-id]') as HTMLButtonElement | null;
+      expect(btn).not.toBeNull();
+      return btn!;
+    });
+    fireEvent.click(crossModelBtn4);
+
+    // Simulate WS sync arriving with newer runtimeEpoch B from another device while A is still in-flight
+    view4.rerender(
+      <SessionControls
+        {...view4.makeProps({
+          name: 'deck_sub_sub-ui-race',
+          project: 'proj',
+          role: 'w1',
+          agentType: 'qwen',
+          ccPreset: 'PresetB',
+          requestedModel: 'qwen-b',
+          activeModel: 'qwen-b',
+          modelDisplay: 'qwen-b',
+          runtimeEpoch: 'ep-B',
+          state: 'idle',
+        })}
+      />,
+    );
+
+    resolveDeferredA({
+      ok: true,
+      applied: {
+        agentType: 'codex-sdk',
+        ccPreset: null,
+        requestedModel: 'gpt-a',
+        activeModel: 'gpt-a',
+        modelDisplay: 'gpt-a',
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        cwd: '/work/proj',
+        label: null,
+        description: null,
+        effort: null,
+        transportConfig: null,
+        runtimeEpoch: 'ep-A',
+      },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(view4.onSessionSaved).not.toHaveBeenCalled();
+    expect(view4.onAfterAction).not.toHaveBeenCalled();
+    cleanup();
+
+    // 5) Same-runtimeEpoch hot-switch counterexample: A commits (ep-E, agy-sdk, m1), user hot-switches inside SAME ep-E to m2,
+    // then delayed HTTP A arrives with ep-E / m1 -> helper & component BOTH reject A and NEVER revert local AGY preference to m1.
+    const { captureSessionSwitchBaseline, isSessionSwitchSupersededBySync } = await import('../src/session-state-updates.js');
+    const baseSameEpoch = captureSessionSwitchBaseline({
+      name: 'deck_same_epoch',
+      agentType: 'claude-code',
+      runtimeEpoch: 'ep-0',
+      requestedModel: null,
+      activeModel: null,
+      modelDisplay: null,
+    });
+    const syncedHotM2 = {
+      name: 'deck_same_epoch',
+      agentType: AGY_SDK_PROVIDER_ID,
+      runtimeEpoch: 'ep-E',
+      requestedModel: 'm2',
+      activeModel: 'm2',
+      modelDisplay: 'm2',
+    };
+    const delayedHttpM1 = {
+      agentType: AGY_SDK_PROVIDER_ID,
+      ccPreset: null,
+      requestedModel: 'm1',
+      activeModel: 'm1',
+      modelDisplay: 'm1',
+      runtimeEpoch: 'ep-E',
+    };
+    expect(isSessionSwitchSupersededBySync(syncedHotM2, baseSameEpoch, delayedHttpM1)).toBe(true);
+
+    mockApi.saveAgyModelPreference.mockClear();
+    let resolveDeferredSameEpoch!: (val: unknown) => void;
+    mockApi.patchSession.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveDeferredSameEpoch = resolve; }),
+    );
+    const view5 = renderSessionControls({
+      name: 'deck_main_same_epoch',
+      project: 'main',
+      role: 'brain',
+      agentType: 'claude-code',
+      runtimeEpoch: 'ep-0',
+      state: 'idle',
+    });
+    fireEvent.click(view5.container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    fireEvent.click(document.body.querySelector('[data-sdk-id="agy-sdk"]') as HTMLButtonElement);
+    const agyCrossBtn = await waitFor(() => {
+      const btn = document.body.querySelector('[data-cross-model-id]') as HTMLButtonElement | null;
+      expect(btn).not.toBeNull();
+      return btn!;
+    });
+    fireEvent.click(agyCrossBtn);
+
+    // Hot-switch inside SAME ep-E to m2 arrives before HTTP A resolves
+    view5.rerender(
+      <SessionControls
+        {...view5.makeProps({
+          name: 'deck_main_same_epoch',
+          project: 'main',
+          role: 'brain',
+          agentType: AGY_SDK_PROVIDER_ID,
+          requestedModel: 'm2',
+          activeModel: 'm2',
+          modelDisplay: 'm2',
+          runtimeEpoch: 'ep-E',
+          state: 'idle',
+        })}
+      />,
+    );
+
+    resolveDeferredSameEpoch({
+      ok: true,
+      applied: {
+        ...delayedHttpM1,
+        runtimeType: 'transport',
+        providerId: AGY_SDK_PROVIDER_ID,
+        cwd: '/work/main',
+        label: null,
+        description: null,
+        effort: null,
+        transportConfig: null,
+      },
+    });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(view5.onSessionSaved).not.toHaveBeenCalled();
+    expect(mockApi.saveAgyModelPreference).not.toHaveBeenCalled();
   });
 });

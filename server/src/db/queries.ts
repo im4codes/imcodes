@@ -1838,6 +1838,7 @@ export async function updateSubSession(
   id: string,
   serverId: string,
   fields: {
+    type?: string;
     label?: string | null;
     closed_at?: number | null;
     gemini_session_id?: string | null;
@@ -1854,6 +1855,7 @@ export async function updateSubSession(
   const parts: string[] = [];
   const vals: unknown[] = [];
   let idx = 1;
+  if ('type' in fields && typeof fields.type === 'string' && fields.type.trim()) { parts.push(`type = $${idx++}`); vals.push(fields.type.trim()); }
   if ('label' in fields) { parts.push(`label = $${idx++}`); vals.push(fields.label ?? null); }
   if ('closed_at' in fields) { parts.push(`closed_at = $${idx++}`); vals.push(fields.closed_at ?? null); }
   if ('gemini_session_id' in fields) { parts.push(`gemini_session_id = $${idx++}`); vals.push(fields.gemini_session_id ?? null); }

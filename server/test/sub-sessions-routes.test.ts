@@ -553,4 +553,199 @@ describe('sub-session routes', () => {
       invalidateSpy.mockRestore();
     }
   });
+
+  it('PATCH /sub-sessions/:subId updates cc_preset_id and relays subsession.restart on ccPresetId set/clear', async () => {
+    const { getSubSessionById, updateSubSession } = await import('../src/db/queries.js');
+    const { WsBridge } = await import('../src/ws/bridge.js');
+    const bridge = WsBridge.get('srv-1');
+    const sendSpy = vi.spyOn(bridge, 'sendToDaemon').mockImplementation(() => {});
+    try {
+      vi.mocked(getSubSessionById).mockResolvedValue({
+        id: 'sub-cc-1',
+        server_id: 'srv-1',
+        type: 'claude-code-sdk',
+      } as never);
+      const app = await buildApp();
+
+      // 1. Set ccPresetId -> updates DB and relays subsession.restart with ccPreset
+      const setRes = await app.request('/api/server/srv-1/sub-sessions/sub-cc-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ccPresetId: ' MiniMax ', requestedModel: 'MiniMax-M2.7', activeModel: null }),
+      });
+      expect(setRes.status).toBe(200);
+      expect(updateSubSession).toHaveBeenCalledWith(expect.anything(), 'sub-cc-1', 'srv-1', {
+        cc_preset_id: 'MiniMax',
+        requested_model: 'MiniMax-M2.7',
+        active_model: null,
+      });
+      expect(JSON.parse(String(sendSpy.mock.calls[0]?.[0]))).toEqual({
+        type: 'subsession.restart',
+        sessionName: 'deck_sub_sub-cc-1',
+        ccPreset: 'MiniMax',
+        requestedModel: 'MiniMax-M2.7',
+        activeModel: null,
+      });
+      sendSpy.mockClear();
+
+      // 2. Clear ccPresetId -> sets null in DB and relays subsession.restart with ccPreset: null
+      const clearRes = await app.request('/api/server/srv-1/sub-sessions/sub-cc-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'claude-code-sdk', ccPresetId: null, requestedModel: null, activeModel: null }),
+      });
+      expect(clearRes.status).toBe(200);
+      expect(updateSubSession).toHaveBeenLastCalledWith(expect.anything(), 'sub-cc-1', 'srv-1', {
+        cc_preset_id: null,
+        requested_model: null,
+        active_model: null,
+      });
+      expect(JSON.parse(String(sendSpy.mock.calls[0]?.[0]))).toEqual({
+        type: 'subsession.restart',
+        sessionName: 'deck_sub_sub-cc-1',
+        agentType: 'claude-code-sdk',
+        ccPreset: null,
+        requestedModel: null,
+        activeModel: null,
+      });
+      sendSpy.mockClear();
+
+      // 3. Invalid ccPresetId returns 400
+      const badRes = await app.request('/api/server/srv-1/sub-sessions/sub-cc-1', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ccPresetId: 42 }),
+      });
+      expect(badRes.status).toBe(400);
+      expect(await badRes.json()).toEqual({ error: 'invalid_cc_preset' });
+      expect(sendSpy).not.toHaveBeenCalled();
+
+      // 4. Daemon restart rejection returns 422 BEFORE updating sub_sessions DB
+      vi.mocked(updateSubSession).mockClear();
+      const restartCmdSpy = vi.spyOn(bridge, 'sendSessionRestartCommand').mockResolvedValue({
+        status: 'rejected',
+        error: 'Cannot safely forward model "m %TEMP%" through unparsed Windows batch file',
+      });
+      try {
+        const rejectRes = await app.request('/api/server/srv-1/sub-sessions/sub-cc-1', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'claude-code',
+            ccPresetId: 'MiniMax',
+            requestedModel: 'm %TEMP%',
+            activeModel: null,
+          }),
+        });
+        expect(rejectRes.status).toBe(422);
+        expect(await rejectRes.json()).toEqual({
+          error: 'Cannot safely forward model "m %TEMP%" through unparsed Windows batch file',
+        });
+        expect(restartCmdSpy).toHaveBeenCalledTimes(1);
+        expect(updateSubSession).not.toHaveBeenCalled();
+
+        // 5. Daemon fallback commit persists actual m1 / activeModel=m1 (never raw m2 / null) and explicit null clear
+        const appliedFallback = {
+          agentType: 'qwen',
+          ccPreset: null,
+          requestedModel: 'm1',
+          activeModel: 'm1',
+          modelDisplay: 'm1',
+          runtimeType: 'transport',
+          providerId: 'qwen',
+          cwd: '/cc',
+          label: null,
+          description: null,
+          effort: null,
+          transportConfig: null,
+          runtimeEpoch: 'epoch-sub-1',
+        };
+        restartCmdSpy.mockImplementationOnce(async (_frame, opts) => {
+          await opts?.persistApplied?.(appliedFallback);
+          return { status: 'committed', applied: appliedFallback };
+        });
+        const appliedRes = await app.request('/api/server/srv-1/sub-sessions/sub-cc-1', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'qwen',
+            ccPresetId: null,
+            requestedModel: 'm2',
+            activeModel: null,
+          }),
+        });
+        expect(appliedRes.status).toBe(200);
+        expect(await appliedRes.json()).toEqual({ ok: true, applied: appliedFallback });
+        expect(updateSubSession).toHaveBeenCalledWith(expect.anything(), 'sub-cc-1', 'srv-1', expect.objectContaining({
+          type: 'qwen',
+          cc_preset_id: null,
+          requested_model: 'm1',
+          active_model: 'm1',
+        }));
+
+        // 6. Pending timeout returns 202 without overwriting DB prematurely
+        vi.mocked(updateSubSession).mockClear();
+        restartCmdSpy.mockResolvedValueOnce({
+          status: 'pending',
+          requestId: 'req-sub-pending',
+          restartEpoch: 3,
+        });
+        const pendingRes = await app.request('/api/server/srv-1/sub-sessions/sub-cc-1', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'claude-code',
+            ccPresetId: null,
+            requestedModel: null,
+          }),
+        });
+        expect(pendingRes.status).toBe(202);
+        expect(await pendingRes.json()).toEqual({ ok: false, pending: true, requestId: 'req-sub-pending' });
+        expect(updateSubSession).not.toHaveBeenCalled();
+
+        // 7. Superseded -> 200 { ok: false, superseded: true } without calling updateSubSession
+        vi.mocked(updateSubSession).mockClear();
+        restartCmdSpy.mockResolvedValueOnce({ status: 'superseded' });
+        const supRes = await app.request('/api/server/srv-1/sub-sessions/sub-cc-1', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'qwen',
+            ccPresetId: 'MiniMax',
+            requestedModel: 'stale-m',
+          }),
+        });
+        expect(supRes.status).toBe(200);
+        expect(await supRes.json()).toEqual({ ok: false, superseded: true });
+        expect(updateSubSession).not.toHaveBeenCalled();
+
+        // 8. Plain type switch WITHOUT ccPresetId bypasses sendSessionRestartCommand and relays via sendToDaemon
+        vi.mocked(updateSubSession).mockClear();
+        restartCmdSpy.mockClear();
+        sendSpy.mockClear();
+        const plainRes = await app.request('/api/server/srv-1/sub-sessions/sub-cc-1', {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            type: 'codex-sdk',
+            requestedModel: 'gpt-5',
+          }),
+        });
+        expect(plainRes.status).toBe(200);
+        expect(await plainRes.json()).toEqual({ ok: true });
+        expect(restartCmdSpy).not.toHaveBeenCalled();
+        expect(updateSubSession).toHaveBeenCalledTimes(1);
+        expect(JSON.parse(String(sendSpy.mock.calls[0]?.[0]))).toEqual({
+          type: 'subsession.restart',
+          sessionName: 'deck_sub_sub-cc-1',
+          agentType: 'codex-sdk',
+          requestedModel: 'gpt-5',
+        });
+      } finally {
+        restartCmdSpy.mockRestore();
+      }
+    } finally {
+      sendSpy.mockRestore();
+    }
+  });
 });

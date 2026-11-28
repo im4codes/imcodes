@@ -1818,8 +1818,14 @@ export async function patchSubSession(
     effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
     transportConfig?: Record<string, unknown> | null;
   },
-): Promise<void> {
-  await apiFetch(`/api/server/${serverId}/sub-sessions/${subId}`, {
+): Promise<{
+  ok?: boolean;
+  pending?: boolean;
+  superseded?: boolean;
+  requestId?: string;
+  applied?: import('../../shared/session-restart-contract.js').AppliedSessionRestartState | null;
+}> {
+  return apiFetch(`/api/server/${serverId}/sub-sessions/${subId}`, {
     method: 'PATCH',
     body: JSON.stringify(body),
   });
@@ -1833,13 +1839,20 @@ export async function patchSession(
     description?: string | null;
     cwd?: string | null;
     agentType?: string | null;
+    ccPreset?: string | null;
     requestedModel?: string | null;
     activeModel?: string | null;
     effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
     transportConfig?: Record<string, unknown> | null;
   },
-): Promise<void> {
-  await apiFetch(`/api/server/${serverId}/sessions/${sessionName}`, {
+): Promise<{
+  ok?: boolean;
+  pending?: boolean;
+  superseded?: boolean;
+  requestId?: string;
+  applied?: import('../../shared/session-restart-contract.js').AppliedSessionRestartState | null;
+}> {
+  return apiFetch(`/api/server/${serverId}/sessions/${sessionName}`, {
     method: 'PATCH',
     body: JSON.stringify(body),
   });

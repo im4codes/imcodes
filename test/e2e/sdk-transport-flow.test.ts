@@ -177,6 +177,10 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
   getPresetEffectiveModel: vi.fn((preset: { defaultModel?: string; env?: Record<string, string> }) => (
     preset.env?.ANTHROPIC_MODEL ?? preset.defaultModel ?? preset.env?.OPENAI_MODEL
   )),
+  selectPresetModel: vi.fn((preset: { defaultModel?: string; env?: Record<string, string>; availableModels?: Array<{ id: string }> }, requested?: string) => (
+    requested?.trim() || preset.env?.ANTHROPIC_MODEL || preset.defaultModel || preset.env?.OPENAI_MODEL || preset.availableModels?.[0]?.id
+  )),
+  syncSessionContextWindow: vi.fn(),
   invalidateCache: vi.fn(),
 }));
 
@@ -854,6 +858,66 @@ describe('sdk transport flow e2e', () => {
       readPreferred.mockRestore();
       readCompletedTextTail.mockRestore();
     }
+  });
+
+  it('applies and explicitly clears ccPreset to null on same-SDK session.restart without retaining stale preset or model', async () => {
+    mocks.store.set('deck_preset_switch_brain', {
+      name: 'deck_preset_switch_brain',
+      projectName: 'preset_switch',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      providerId: 'claude-code-sdk',
+      runtimeType: 'transport',
+      projectDir: '/tmp/preset-switch',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+      updatedAt: 1,
+      ccSessionId: 'cc-preset-switch',
+    });
+
+    const serverLink = { send: vi.fn() } as any;
+    handleWebCommand({
+      type: 'session.restart',
+      sessionName: 'deck_preset_switch_brain',
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => mocks.store.get('deck_preset_switch_brain')?.ccPreset === 'MiniMax');
+
+    const withPreset = mocks.store.get('deck_preset_switch_brain');
+    expect(withPreset?.ccPreset).toBe('MiniMax');
+    expect(withPreset?.requestedModel).toBe('MiniMax-M2.7');
+
+    serverLink.send.mockClear();
+    mocks.claudeCalls.length = 0;
+
+    // Clear ccPreset back to Default (ccPreset: null, requestedModel: null)
+    handleWebCommand({
+      type: 'session.restart',
+      sessionName: 'deck_preset_switch_brain',
+      agentType: 'claude-code-sdk',
+      ccPreset: null,
+      requestedModel: null,
+    }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => serverLink.send.mock.calls.some((call: any[]) => call[0]?.type === 'session_list'));
+
+    const cleared = mocks.store.get('deck_preset_switch_brain');
+    expect(cleared?.agentType).toBe('claude-code-sdk');
+    expect(cleared?.ccPreset).toBeUndefined();
+    expect(cleared?.requestedModel).toBeUndefined();
+
+    handleWebCommand({ type: 'session.send', session: 'deck_preset_switch_brain', text: 'after-clear', commandId: `cmd-preset-clear-${Date.now()}` }, serverLink);
+    await flushAsync();
+    await waitForCondition(() => mocks.claudeCalls.length > 0, 5000);
+
+    const clearedCall = mocks.claudeCalls.at(-1);
+    expect(clearedCall?.options.env?.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(clearedCall?.options.env?.ANTHROPIC_MODEL).toBeUndefined();
   });
 
   it('pushes a corrective session_list when settings restart fails', async () => {

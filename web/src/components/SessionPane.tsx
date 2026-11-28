@@ -33,6 +33,8 @@ import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { loadLegacyCodexModelPreferenceForModelessSession } from '../codex-model-preference.js';
 import type { FileBrowserPreviewRequest } from './file-browser-lazy.js';
+import type { AppliedSessionRestartState } from '@shared/session-restart-contract.js';
+import type { SessionSwitchBaseline, SessionSwitchComparable } from '../session-state-updates.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
 import { isShareScopedState } from '../tab-sharing-ui.js';
 import { focusComposerElement } from '../keyboard-shortcuts.js';
@@ -120,6 +122,14 @@ export interface SessionPaneProps {
   onViewRepo?: () => void;
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   onSessionSaved?: (fields: { type?: string; requestedModel?: string | null; activeModel?: string | null; modelDisplay?: string | null; ccPreset?: string | null }) => void;
+  getLatestSession?: () => SessionSwitchComparable | null | undefined;
+  onSessionSwitchCommit?: (
+    sessionName: string,
+    baseline: SessionSwitchBaseline | null,
+    applied: AppliedSessionRestartState | null,
+  ) => void;
+  /** Open the standalone CC Preset manager dialog (undefined for restricted shared actors). */
+  onOpenCcPresetManager?: () => void;
   /** Called after shortcut/action button clicks — use to restore xterm focus. */
   onAfterAction?: () => void;
   /** Open a file preview in the shared floating preview host. */
@@ -186,6 +196,9 @@ export function SessionPane({
   onViewRepo,
   onTransportConfigSaved,
   onSessionSaved,
+  getLatestSession,
+  onSessionSwitchCommit,
+  onOpenCcPresetManager,
   onAfterAction,
   onPreviewFile,
   onOpenLocalWebPreview,
@@ -646,6 +659,9 @@ export function SessionPane({
           onToggleSessionPin={onToggleSessionPin}
           onTransportConfigSaved={onTransportConfigSaved}
           onSessionSaved={onSessionSaved}
+          getLatestSession={getLatestSession}
+          onSessionSwitchCommit={onSessionSwitchCommit}
+          onOpenCcPresetManager={onOpenCcPresetManager}
           sessionDisplayName={session.label ? formatLabel(session.label) : (session.project ?? null)}
           quickData={quickData}
           detectedModel={effectiveDetectedModel}

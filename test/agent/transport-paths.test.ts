@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   normalizeTransportCwd,
   resolveBinaryOnWindows,
+  getWindowsClaudeInstallCandidates,
   parseNpmCmdShim,
   resolveExecutableForSpawn,
   resolveClaudeCodePathForSdk,
@@ -861,6 +862,48 @@ describe('resolveKimiPathForSdk (v2 + legacy fallback)', () => {
       expect(resolveKimiPathForSdk('kimi', { HOME: tmpDir, PATH: '/usr/bin' })).toBe(v2Bin);
       fs.rmSync(v2Bin);
       expect(resolveKimiPathForSdk('kimi', { HOME: tmpDir, PATH: '/usr/bin' })).toBe(legacyBin);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('resolves Windows Path, Pathext, AppData, UserProfile, LocalAppData, and ProgramFiles case-insensitively', () => {
+    const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'win-env-case-'));
+    try {
+      const binDir = path.join(tmpDir, 'custom-bin');
+      const appDataDir = path.join(tmpDir, 'AppData');
+      const appDataNpmDir = path.join(appDataDir, 'npm');
+      const userProfileDir = path.join(tmpDir, 'UserProfile');
+      const userNpmDir = path.join(userProfileDir, 'AppData', 'Roaming', 'npm');
+      const localAppData = path.join(tmpDir, 'LocalAppData');
+      const progFiles = path.join(tmpDir, 'ProgramFiles');
+      const progFilesX86 = path.join(tmpDir, 'ProgramFilesX86');
+      for (const dir of [binDir, appDataNpmDir, userNpmDir]) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const binCmd = path.join(binDir, 'claude.cmd');
+      const appDataCodex = path.join(appDataNpmDir, 'codex.cmd');
+      const userTool = path.join(userNpmDir, 'tool.bat');
+      fs.writeFileSync(binCmd, '@echo off\r\n');
+      fs.writeFileSync(appDataCodex, '@echo off\r\n');
+      fs.writeFileSync(userTool, '@echo off\r\n');
+
+      expect(resolveBinaryOnWindows('claude', { Path: binDir, Pathext: '.cmd' }, 'win32')).toBe(binCmd);
+      expect(resolveBinaryOnWindows('codex', { Path: '', AppData: appDataDir, Pathext: '.cmd' }, 'win32')).toBe(appDataCodex);
+      expect(resolveBinaryOnWindows('tool', { Path: '', UserProfile: userProfileDir, Pathext: '.bat' }, 'win32')).toBe(userTool);
+
+      const candidates = getWindowsClaudeInstallCandidates('claude', {
+        AppData: appDataDir,
+        UserProfile: userProfileDir,
+        LocalAppData: localAppData,
+        programfiles: progFiles,
+        'programfiles(x86)': progFilesX86,
+      });
+      expect(candidates).toContain(path.join(appDataNpmDir, 'claude.exe'));
+      expect(candidates).toContain(path.join(userNpmDir, 'claude.exe'));
+      expect(candidates).toContain(path.join(localAppData, 'Programs', 'Claude', 'claude.exe'));
+      expect(candidates).toContain(path.join(progFiles, 'Claude', 'claude.exe'));
+      expect(candidates).toContain(path.join(progFilesX86, 'Claude', 'claude.exe'));
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

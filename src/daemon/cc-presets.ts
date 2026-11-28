@@ -8,6 +8,7 @@ import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
  * ANTHROPIC_MODEL value is auto-copied to the 4 model override env vars.
  */
 
+import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
 import {
@@ -15,6 +16,7 @@ import {
   getCcPresetEffectiveModel,
   inferCcPresetAuthType,
   normalizeCcPresetContextWindow,
+  normalizeCcPresetInitMessage,
   normalizeCcPresetName,
   normalizeCodexBaseUrl,
   normalizeCodexProviderId,
@@ -22,6 +24,7 @@ import {
   type CcPresetAuthType,
   type CcPresetModelInfo,
   type KimiLlmConfig,
+  type CcPresetTransportMode,
 } from '../../shared/cc-presets.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
@@ -30,6 +33,62 @@ import logger from '../util/logger.js';
 function presetsPath(): string { return join(resolveImcodesHome(), 'cc-presets.json'); }
 
 let cachedPresets: CcPreset[] | null = null;
+let saveMutex: Promise<void> = Promise.resolve();
+
+export class CcPresetConflictError extends Error {
+  constructor(
+    public readonly currentPresets: CcPreset[],
+    public readonly currentVersion: string,
+  ) {
+    super('CC preset snapshot conflict');
+    this.name = 'CcPresetConflictError';
+  }
+}
+
+export class CcPresetDiscoveryStaleError extends Error {
+  constructor(
+    public readonly currentPresets: CcPreset[],
+    public readonly currentVersion: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'CcPresetDiscoveryStaleError';
+  }
+}
+
+function runUnderPresetSaveMutex<T>(fn: () => Promise<T>): Promise<T> {
+  const run = saveMutex.then(fn);
+  saveMutex = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+function getDiscoveryConnectionFields(preset: CcPreset): {
+  transportMode: CcPresetTransportMode;
+  authType: CcPresetAuthType;
+  baseUrl: string;
+  apiKey: string;
+} {
+  const env = preset.env ?? {};
+  const transportMode: CcPresetTransportMode = preset.transportMode ?? 'qwen-compatible-api';
+  const authType: CcPresetAuthType = preset.authType ?? (
+    env['OPENAI_BASE_URL'] && !env['ANTHROPIC_BASE_URL'] ? 'openai' : 'anthropic'
+  );
+  const baseUrl = authType === 'openai'
+    ? (env['OPENAI_BASE_URL']?.trim() || env['ANTHROPIC_BASE_URL']?.trim() || '')
+    : (env['ANTHROPIC_BASE_URL']?.trim() || env['OPENAI_BASE_URL']?.trim() || '');
+  const apiKey = authType === 'openai'
+    ? (env['OPENAI_API_KEY']?.trim() || env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || '')
+    : (env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || env['OPENAI_API_KEY']?.trim() || '');
+  return { transportMode, authType, baseUrl, apiKey };
+}
+
+function presetSourceFingerprint(preset: CcPreset): string {
+  return JSON.stringify(getDiscoveryConnectionFields(preset));
+}
+
+export function computePresetsVersion(presets: readonly CcPreset[]): string {
+  return createHash('sha256').update(JSON.stringify(presets)).digest('hex').slice(0, 16);
+}
 
 /** ccSessionId → contextWindow (set when preset env is resolved for a session). */
 const sessionContextWindows = new Map<string, number>();
@@ -84,11 +143,14 @@ function normalizePreset(raw: unknown): CcPreset | null {
     || envRecord['OPENAI_MODEL']?.trim()
     || undefined;
   const contextWindow = normalizeCcPresetContextWindow(configuredContextWindow, effectiveModel);
+  const initMessage = normalizeCcPresetInitMessage(
+    typeof record.initMessage === 'string' ? record.initMessage : undefined,
+  );
   return {
     name,
     env: envRecord,
     ...(contextWindow ? { contextWindow } : {}),
-    ...(typeof record.initMessage === 'string' ? { initMessage: record.initMessage } : {}),
+    ...(initMessage ? { initMessage } : {}),
     ...(record.transportMode === 'qwen-compatible-api' || record.transportMode === 'claude-cli-preset'
       ? { transportMode: record.transportMode }
       : {}),
@@ -129,13 +191,43 @@ export async function loadPresets(): Promise<CcPreset[]> {
   }
 }
 
-export async function savePresets(presets: CcPreset[]): Promise<void> {
+export async function loadPresetsWithVersion(): Promise<{ presets: CcPreset[]; version: string }> {
+  const presets = await loadPresets();
+  return { presets, version: computePresetsVersion(presets) };
+}
+
+async function performSavePresets(
+  presets: CcPreset[],
+  expectedVersion?: string,
+): Promise<{ presets: CcPreset[]; version: string }> {
+  if (expectedVersion !== undefined) {
+    // Re-read authoritative snapshot before comparing versions so concurrent
+    // external writes or invalidated caches never bypass conflict checks.
+    invalidateCache();
+    const current = await loadPresets();
+    const currentVersion = computePresetsVersion(current);
+    if (expectedVersion !== currentVersion) {
+      throw new CcPresetConflictError(current, currentVersion);
+    }
+  }
   const normalized = normalizePresets(presets);
   await fs.mkdir(dirname(presetsPath()), { recursive: true });
   const tempPath = `${presetsPath()}.${process.pid}.${Date.now()}.tmp`;
   await fs.writeFile(tempPath, JSON.stringify(normalized, null, 2), 'utf8');
   await fs.rename(tempPath, presetsPath());
   cachedPresets = normalized;
+  return { presets: normalized, version: computePresetsVersion(normalized) };
+}
+
+export async function savePresets(presets: CcPreset[]): Promise<void> {
+  await savePresetsVersioned(presets);
+}
+
+export async function savePresetsVersioned(
+  presets: CcPreset[],
+  expectedVersion?: string,
+): Promise<{ presets: CcPreset[]; version: string }> {
+  return runUnderPresetSaveMutex(() => performSavePresets(presets, expectedVersion));
 }
 
 export async function getPreset(name: string): Promise<CcPreset | undefined> {
@@ -210,6 +302,7 @@ export async function resolvePresetEnv(
   presetName: string,
   ccSessionId?: string,
   modelOverride?: string,
+  options?: { syncContextWindow?: boolean },
 ): Promise<Record<string, string>> {
   const preset = await getPreset(presetName);
   if (!preset) return {};
@@ -247,8 +340,10 @@ export async function resolvePresetEnv(
   // Set context window hint as env var so daemon can report it in usage events
   if (preset.contextWindow) {
     env['IMCODES_CONTEXT_WINDOW'] = String(preset.contextWindow);
-    // Also cache for watcher lookup
-    if (ccSessionId) sessionContextWindows.set(ccSessionId, preset.contextWindow);
+  }
+  // Keep watcher cache aligned (and evict stale entry if the preset has no window).
+  if (options?.syncContextWindow !== false) {
+    syncSessionContextWindow(ccSessionId, preset.contextWindow);
   }
   logger.debug({ preset: presetName, keys: Object.keys(env) }, 'Resolved CC preset env');
   return env;
@@ -683,14 +778,7 @@ export async function discoverPresetModels(preset: CcPreset): Promise<{
   defaultModel?: string;
   endpoint: string;
 }> {
-  const env = { ...preset.env };
-  const authType: CcPresetAuthType = resolvePresetAuthType(preset);
-  const baseUrl = authType === 'openai'
-    ? (env['OPENAI_BASE_URL']?.trim() || env['ANTHROPIC_BASE_URL']?.trim() || '')
-    : (env['ANTHROPIC_BASE_URL']?.trim() || env['OPENAI_BASE_URL']?.trim() || '');
-  const apiKey = authType === 'openai'
-    ? (env['OPENAI_API_KEY']?.trim() || env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || '')
-    : (env['ANTHROPIC_API_KEY']?.trim() || env['ANTHROPIC_AUTH_TOKEN']?.trim() || env['OPENAI_API_KEY']?.trim() || '');
+  const { authType, baseUrl, apiKey } = getDiscoveryConnectionFields(preset);
 
   if (!baseUrl) {
     throw new Error(authType === 'openai' ? 'Preset is missing OPENAI_BASE_URL' : 'Preset is missing ANTHROPIC_BASE_URL');
@@ -794,6 +882,8 @@ export interface CcPresetModelCatalog {
   models: CcPresetModelInfo[];
   defaultModel?: string;
   endpoint?: string;
+  presets?: CcPreset[];
+  version?: string;
 }
 
 function getStoredPresetModelCatalog(preset: CcPreset): CcPresetModelCatalog {
@@ -821,40 +911,75 @@ export async function refreshPresetModels(presetName: string): Promise<CcPresetM
   const preset = await getPreset(presetName);
   if (!preset) throw new Error(`Preset "${presetName}" not found`);
   const normalizedName = normalizeCcPresetName(preset.name);
+  const sourceFingerprint = presetSourceFingerprint(preset);
   try {
     const discovered = await discoverPresetModels(preset);
-    const latestPresets = await loadPresets();
-    const latestPreset = latestPresets.find(
-      (item) => normalizeCcPresetName(item.name) === normalizedName,
-    ) ?? preset;
-    const effectiveAuthType: CcPresetAuthType = latestPreset.authType
-      ?? (latestPreset.env['OPENAI_BASE_URL'] && !latestPreset.env['ANTHROPIC_BASE_URL'] ? 'openai' : 'anthropic');
-    const updatedPreset: CcPreset = {
-      ...latestPreset,
-      transportMode: latestPreset.transportMode ?? 'qwen-compatible-api',
-      authType: effectiveAuthType,
-      availableModels: discovered.availableModels,
-      lastDiscoveredAt: Date.now(),
-      modelDiscoveryError: undefined,
-    };
-    await savePresets(latestPresets.map((item) => (
-      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
-    )));
-    const catalog = getStoredPresetModelCatalog(updatedPreset);
-    return { ...catalog, endpoint: discovered.endpoint };
+    return await runUnderPresetSaveMutex(async () => {
+      invalidateCache();
+      const { presets: latestPresets, version: currentVersion } = await loadPresetsWithVersion();
+      const latestPreset = latestPresets.find(
+        (item) => normalizeCcPresetName(item.name) === normalizedName,
+      );
+      if (!latestPreset) {
+        throw new CcPresetDiscoveryStaleError(
+          latestPresets,
+          currentVersion,
+          `Preset "${preset.name}" was deleted during model discovery`,
+        );
+      }
+      if (presetSourceFingerprint(latestPreset) !== sourceFingerprint) {
+        throw new CcPresetDiscoveryStaleError(
+          latestPresets,
+          currentVersion,
+          `Preset "${preset.name}" configuration changed during model discovery`,
+        );
+      }
+      const effectiveAuthType: CcPresetAuthType = latestPreset.authType
+        ?? (latestPreset.env['OPENAI_BASE_URL'] && !latestPreset.env['ANTHROPIC_BASE_URL'] ? 'openai' : 'anthropic');
+      const updatedPreset: CcPreset = {
+        ...latestPreset,
+        transportMode: latestPreset.transportMode ?? 'qwen-compatible-api',
+        authType: effectiveAuthType,
+        availableModels: discovered.availableModels,
+        lastDiscoveredAt: Date.now(),
+        modelDiscoveryError: undefined,
+      };
+      const saved = await performSavePresets(latestPresets.map((item) => (
+        normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
+      )));
+      const savedTarget = saved.presets.find(
+        (item) => normalizeCcPresetName(item.name) === normalizedName,
+      ) ?? updatedPreset;
+      const catalog = getStoredPresetModelCatalog(savedTarget);
+      return {
+        ...catalog,
+        endpoint: discovered.endpoint,
+        presets: saved.presets,
+        version: saved.version,
+      };
+    });
   } catch (error) {
+    if (error instanceof CcPresetDiscoveryStaleError) {
+      throw error;
+    }
     const message = error instanceof Error ? error.message : String(error);
-    const latestPresets = await loadPresets();
-    const latestPreset = latestPresets.find(
-      (item) => normalizeCcPresetName(item.name) === normalizedName,
-    ) ?? preset;
-    const updatedPreset: CcPreset = {
-      ...latestPreset,
-      modelDiscoveryError: message,
-    };
-    await savePresets(latestPresets.map((item) => (
-      normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
-    )));
+    await runUnderPresetSaveMutex(async () => {
+      invalidateCache();
+      const latestPresets = await loadPresets();
+      const latestPreset = latestPresets.find(
+        (item) => normalizeCcPresetName(item.name) === normalizedName,
+      );
+      if (!latestPreset || presetSourceFingerprint(latestPreset) !== sourceFingerprint) {
+        return;
+      }
+      const updatedPreset: CcPreset = {
+        ...latestPreset,
+        modelDiscoveryError: message,
+      };
+      await performSavePresets(latestPresets.map((item) => (
+        normalizeCcPresetName(item.name) === normalizedName ? updatedPreset : item
+      )));
+    });
     throw error;
   }
 }
@@ -871,12 +996,20 @@ export async function getPresetModelCatalog(
   return getStoredPresetModelCatalog(preset);
 }
 
-/** Default init message for non-Anthropic providers (no native web search). */
-const DEFAULT_INIT_MESSAGE = 'For web searches, use: curl -s "https://html.duckduckgo.com/html/?q=QUERY" | head -200. Replace QUERY with URL-encoded search terms.';
+/** Get the init message for a preset (returns undefined when absent or retired default). */
+export function getPresetInitMessage(preset: CcPreset): string | undefined {
+  return normalizeCcPresetInitMessage(preset.initMessage);
+}
 
-/** Get the init message for a preset (uses default if not specified). */
-export function getPresetInitMessage(preset: CcPreset): string {
-  return preset.initMessage ?? DEFAULT_INIT_MESSAGE;
+/** Update or evict the cached preset context window for a Claude session UUID. */
+export function syncSessionContextWindow(ccSessionId: string | undefined, contextWindow: number | undefined): void {
+  const id = ccSessionId?.trim();
+  if (!id) return;
+  if (typeof contextWindow === 'number' && Number.isFinite(contextWindow) && contextWindow > 0) {
+    sessionContextWindows.set(id, contextWindow);
+  } else {
+    sessionContextWindows.delete(id);
+  }
 }
 
 export function invalidateCache(): void {

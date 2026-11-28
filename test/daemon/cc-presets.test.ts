@@ -751,4 +751,297 @@ describe('cc presets', () => {
     expect(pi.env).not.toHaveProperty('ANTHROPIC_API_KEY');
   });
 
+  it('omits retired DuckDuckGo default initMessage, strips legacy persisted copies, and keeps custom messages', async () => {
+    const { RETIRED_DEFAULT_CC_PRESET_INIT_MESSAGE } = await import('../../shared/cc-presets.js');
+    const { savePresets, getPreset, getPresetInitMessage, invalidateCache } = await import('../../src/daemon/cc-presets.js');
+
+    await savePresets([
+      {
+        name: 'NoInit',
+        env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_MODEL: 'm1' },
+      },
+      {
+        name: 'LegacyDuckDuckGo',
+        env: { ANTHROPIC_BASE_URL: 'https://b.test', ANTHROPIC_MODEL: 'm1' },
+        initMessage: RETIRED_DEFAULT_CC_PRESET_INIT_MESSAGE,
+      },
+      {
+        name: 'CustomInit',
+        env: { ANTHROPIC_BASE_URL: 'https://c.test', ANTHROPIC_MODEL: 'm1' },
+        initMessage: 'Use internal docs endpoint first.',
+      },
+    ]);
+
+    invalidateCache();
+
+    const noInit = await getPreset('NoInit');
+    const legacy = await getPreset('LegacyDuckDuckGo');
+    const custom = await getPreset('CustomInit');
+
+    expect(noInit?.initMessage).toBeUndefined();
+    expect(legacy?.initMessage).toBeUndefined();
+    expect(custom?.initMessage).toBe('Use internal docs endpoint first.');
+
+    expect(getPresetInitMessage(noInit!)).toBeUndefined();
+    expect(getPresetInitMessage(legacy!)).toBeUndefined();
+    expect(getPresetInitMessage({ ...legacy!, initMessage: RETIRED_DEFAULT_CC_PRESET_INIT_MESSAGE })).toBeUndefined();
+    expect(getPresetInitMessage(custom!)).toBe('Use internal docs endpoint first.');
+  });
+
+  it('syncs and clears cached session contextWindow when switching or clearing presets', async () => {
+    const { resolvePresetEnv, getSessionContextWindow, syncSessionContextWindow } = await import('../../src/daemon/cc-presets.js');
+
+    await resolvePresetEnv('MiniMax', 'cc-uuid-1');
+    expect(getSessionContextWindow('cc-uuid-1')).toBe(200_000);
+
+    syncSessionContextWindow('cc-uuid-1', undefined);
+    expect(getSessionContextWindow('cc-uuid-1')).toBeUndefined();
+  });
+
+  it('keeps explicit modelOverride authoritative in resolvePresetEnv even when discovered catalog is stale', async () => {
+    const { savePresets, resolvePresetEnv, getPresetTransportOverrides } = await import('../../src/daemon/cc-presets.js');
+    await savePresets([
+      {
+        name: 'StaleCatalog',
+        env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_MODEL: 'm1' },
+        defaultModel: 'm1',
+        availableModels: [{ id: 'm1' }],
+      },
+    ]);
+
+    const env = await resolvePresetEnv('StaleCatalog', undefined, 'm2');
+    const overrides = await getPresetTransportOverrides('StaleCatalog', 'm2');
+    expect(env.ANTHROPIC_MODEL).toBe('m2');
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('m2');
+    expect(overrides.model).toBe('m2');
+  });
+
+  it('rejects stale expectedVersion writes via CcPresetConflictError and keeps newer concurrent presets', async () => {
+    const {
+      savePresetsVersioned,
+      loadPresetsWithVersion,
+      CcPresetConflictError,
+    } = await import('../../src/daemon/cc-presets.js');
+
+    const initial = await loadPresetsWithVersion();
+    const afterB = await savePresetsVersioned(
+      [...initial.presets, { name: 'PresetB', env: { ANTHROPIC_MODEL: 'b1' } }],
+      initial.version,
+    );
+    expect(afterB.presets.map((p) => p.name)).toContain('PresetB');
+
+    await expect(
+      savePresetsVersioned(
+        [...initial.presets, { name: 'PresetC', env: { ANTHROPIC_MODEL: 'c1' } }],
+        initial.version,
+      ),
+    ).rejects.toBeInstanceOf(CcPresetConflictError);
+
+    const latest = await loadPresetsWithVersion();
+    expect(latest.presets.map((p) => p.name)).toEqual(['minimax', 'PresetB']);
+  });
+
+  it('merges refreshPresetModels atomically under saveMutex without overwriting concurrent PresetB saves', async () => {
+    const {
+      savePresetsVersioned,
+      loadPresetsWithVersion,
+      refreshPresetModels,
+      getPreset,
+    } = await import('../../src/daemon/cc-presets.js');
+
+    let resolveFetch!: (res: Response) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    })));
+
+    try {
+      const initial = await loadPresetsWithVersion();
+      const discoverPromise = refreshPresetModels('MiniMax');
+
+      // Wait for fetch to be initiated so discovery is in flight
+      await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+
+      // Concurrently save PresetB while MiniMax model discovery is awaiting network
+      const afterB = await savePresetsVersioned(
+        [...initial.presets, { name: 'PresetB', env: { ANTHROPIC_MODEL: 'b1' }, defaultModel: 'b1' }],
+        initial.version,
+      );
+
+      // Complete discovery fetch
+      resolveFetch(new Response(JSON.stringify({ data: [{ id: 'MiniMax-M3' }, { id: 'MiniMax-M2.7' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+
+      const catalog = await discoverPromise;
+      expect(catalog.version).toBeDefined();
+      expect(catalog.version).not.toBe(afterB.version);
+      expect(catalog.presets?.map((p) => p.name)).toEqual(['minimax', 'PresetB']);
+
+      // Both PresetB and MiniMax's updated catalog persist cleanly on disk
+      const disk = await loadPresetsWithVersion();
+      expect(disk.version).toBe(catalog.version);
+      expect(disk.presets.map((p) => p.name)).toEqual(['minimax', 'PresetB']);
+      const minimax = await getPreset('MiniMax');
+      expect(minimax?.availableModels?.map((m) => m.id)).toEqual(['MiniMax-M3', 'MiniMax-M2.7']);
+
+      // Immediate follow-up save using returned catalog.version succeeds without conflict
+      const afterC = await savePresetsVersioned(
+        [...disk.presets, { name: 'PresetC', env: { ANTHROPIC_MODEL: 'c1' }, defaultModel: 'c1' }],
+        catalog.version,
+      );
+      expect(afterC.presets.map((p) => p.name)).toEqual(['minimax', 'PresetB', 'PresetC']);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('aborts refreshPresetModels merge if target preset was deleted or its endpoint changed while discovery ran', async () => {
+    const {
+      savePresetsVersioned,
+      loadPresetsWithVersion,
+      refreshPresetModels,
+      CcPresetDiscoveryStaleError,
+    } = await import('../../src/daemon/cc-presets.js');
+
+    let resolveFetch!: (res: Response) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve) => {
+      resolveFetch = resolve;
+    })));
+
+    try {
+      // 1) Deleted concurrently -> never resurrect
+      const s1 = await loadPresetsWithVersion();
+      const discoverDeleted = refreshPresetModels('MiniMax');
+      await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+      await savePresetsVersioned([
+        {
+          name: 'Other',
+          env: { ANTHROPIC_BASE_URL: 'https://other.test/v1', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'o1' },
+        },
+      ], s1.version);
+      resolveFetch(new Response(JSON.stringify({ data: [{ id: 'MiniMax-M3' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+      await expect(discoverDeleted).rejects.toBeInstanceOf(CcPresetDiscoveryStaleError);
+      expect((await loadPresetsWithVersion()).presets.map((p) => p.name)).toEqual(['Other']);
+
+      // 2) Provider endpoint edited concurrently -> never attach old catalog onto new provider URL
+      const s2 = await loadPresetsWithVersion();
+      resolveFetch = undefined as any;
+      const discoverChanged = refreshPresetModels('Other');
+      await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+      await savePresetsVersioned([
+        {
+          name: 'Other',
+          env: { ANTHROPIC_BASE_URL: 'https://new-endpoint.example/v1', ANTHROPIC_MODEL: 'new-1' },
+        },
+      ], s2.version);
+      resolveFetch(new Response(JSON.stringify({ data: [{ id: 'stale-old-model' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+      await expect(discoverChanged).rejects.toBeInstanceOf(CcPresetDiscoveryStaleError);
+      const after = await loadPresetsWithVersion();
+      expect(after.presets[0].env.ANTHROPIC_BASE_URL).toBe('https://new-endpoint.example/v1');
+      expect(after.presets[0].availableModels).toBeUndefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('aborts refreshPresetModels when active credential rotates in a dual-credential preset during deferred discovery', async () => {
+    const {
+      savePresetsVersioned,
+      loadPresetsWithVersion,
+      refreshPresetModels,
+      CcPresetDiscoveryStaleError,
+    } = await import('../../src/daemon/cc-presets.js');
+
+    let resolveFetch!: (res: Response) => void;
+    let rejectFetch!: (err: Error) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>((resolve, reject) => {
+      resolveFetch = resolve;
+      rejectFetch = reject;
+    })));
+
+    try {
+      // Case 1: OpenAI preset with both ANTHROPIC_API_KEY and OPENAI_API_KEY — rotate OPENAI_API_KEY during fetch success
+      await savePresetsVersioned([
+        {
+          name: 'DualOpenAI',
+          authType: 'openai',
+          env: {
+            OPENAI_BASE_URL: 'https://dual.test/v1',
+            OPENAI_API_KEY: 'o-old',
+            ANTHROPIC_API_KEY: 'a-unchanged',
+            OPENAI_MODEL: 'm1',
+          },
+        },
+        {
+          name: 'DualAnthropic',
+          authType: 'anthropic',
+          env: {
+            ANTHROPIC_BASE_URL: 'https://anth.test',
+            ANTHROPIC_AUTH_TOKEN: 'tok-old',
+            OPENAI_API_KEY: 'o-unchanged',
+            ANTHROPIC_MODEL: 'c1',
+          },
+        },
+      ]);
+
+      const snap1 = await loadPresetsWithVersion();
+      const discoverOpenAi = refreshPresetModels('DualOpenAI');
+      await vi.waitFor(() => expect(resolveFetch).toBeDefined());
+
+      // Concurrently rotate OPENAI_API_KEY + add PresetOther while ANTHROPIC_API_KEY stays identical
+      await savePresetsVersioned([
+        {
+          ...snap1.presets[0],
+          env: { ...snap1.presets[0].env, OPENAI_API_KEY: 'o-new' },
+        },
+        snap1.presets[1],
+        { name: 'PresetOther', env: { ANTHROPIC_MODEL: 'x1' } },
+      ], snap1.version);
+
+      resolveFetch(new Response(JSON.stringify({ data: [{ id: 'stale-old-key-model' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }));
+      await expect(discoverOpenAi).rejects.toBeInstanceOf(CcPresetDiscoveryStaleError);
+
+      const after1 = await loadPresetsWithVersion();
+      const dualOai = after1.presets.find((p) => p.name === 'DualOpenAI')!;
+      expect(dualOai.env.OPENAI_API_KEY).toBe('o-new');
+      expect(dualOai.availableModels).toBeUndefined();
+      expect(dualOai.modelDiscoveryError).toBeUndefined();
+      expect(after1.presets.map((p) => p.name)).toContain('PresetOther');
+
+      // Case 2: Anthropic preset using ANTHROPIC_AUTH_TOKEN + OPENAI_API_KEY — rotate ANTHROPIC_AUTH_TOKEN during fetch failure
+      resolveFetch = undefined as any;
+      rejectFetch = undefined as any;
+      const discoverAnthropic = refreshPresetModels('DualAnthropic');
+      await vi.waitFor(() => expect(rejectFetch).toBeDefined());
+
+      await savePresetsVersioned([
+        after1.presets[0],
+        {
+          ...after1.presets[1],
+          env: { ...after1.presets[1].env, ANTHROPIC_AUTH_TOKEN: 'tok-new' },
+        },
+        after1.presets[2],
+      ], after1.version);
+
+      rejectFetch(new Error('old token unauthorized'));
+      await expect(discoverAnthropic).rejects.toThrow('old token unauthorized');
+
+      const after2 = await loadPresetsWithVersion();
+      const dualAnth = after2.presets.find((p) => p.name === 'DualAnthropic')!;
+      expect(dualAnth.env.ANTHROPIC_AUTH_TOKEN).toBe('tok-new');
+      expect(dualAnth.modelDiscoveryError).toBeUndefined();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

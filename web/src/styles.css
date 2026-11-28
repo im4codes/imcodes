@@ -2311,6 +2311,70 @@ html.native-ios-mac .chat-dl-btn {
   border: 1px solid rgba(52, 211, 153, 0.32);
   white-space: nowrap;
 }
+.quick-sdk-preset-bar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--chrome-line-soft);
+  background: rgba(15, 23, 42, 0.52);
+}
+.quick-sdk-preset-label {
+  flex-shrink: 0;
+  font-size: 10px;
+  font-weight: 600;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+.quick-sdk-preset-select {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: 5px;
+  border: 1px solid rgba(71, 85, 105, 0.72);
+  background: rgba(15, 23, 42, 0.92);
+  color: #e2e8f0;
+  font-size: 11px;
+  font-family: inherit;
+  outline: none;
+  cursor: pointer;
+}
+.quick-sdk-preset-select:focus-visible {
+  border-color: rgba(56, 189, 248, 0.72);
+}
+.quick-sdk-preset-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.quick-sdk-preset-manage-btn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  border: 1px solid rgba(71, 85, 105, 0.72);
+  background: rgba(30, 41, 59, 0.76);
+  color: #cbd5e1;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.quick-sdk-preset-manage-btn:hover:not(:disabled) {
+  background: rgba(51, 65, 85, 0.9);
+  border-color: rgba(125, 211, 252, 0.45);
+  color: #f8fafc;
+}
+.quick-sdk-preset-manage-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
 .quick-sdk-col-scroll {
   flex: 1 1 auto;
   min-height: 0;
@@ -2342,9 +2406,20 @@ html.native-ios-mac .chat-dl-btn {
   cursor: pointer;
   transition: background 0.12s, color 0.12s, border-color 0.12s, box-shadow 0.12s;
 }
-.quick-sdk-item:hover {
+.quick-sdk-item:hover:not(:disabled) {
   background: rgba(30, 41, 59, 0.72);
   color: #e2e8f0;
+}
+.quick-sdk-item.is-unavailable,
+.quick-sdk-item.is-unavailable:hover {
+  background: transparent;
+  border-color: transparent;
+  color: #475569;
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.quick-sdk-item.is-unavailable .quick-sdk-item-icon {
+  filter: grayscale(1);
 }
 .quick-sdk-item.is-preview {
   background: linear-gradient(135deg, rgba(34, 211, 238, 0.16), rgba(16, 185, 129, 0.08));
@@ -2476,6 +2551,21 @@ html.native-ios-mac .chat-dl-btn {
     max-width: 88px;
     font-size: 9.5px;
     padding: 1px 4px;
+  }
+  .quick-sdk-preset-bar {
+    padding: 4px 6px;
+    gap: 4px;
+  }
+  .quick-sdk-preset-label {
+    display: none;
+  }
+  .quick-sdk-preset-select {
+    font-size: 10.5px;
+    height: 22px;
+  }
+  .quick-sdk-preset-manage-btn {
+    width: 22px;
+    height: 22px;
   }
 }
 .menu-dropdown-openspec { width: max-content; min-width: min(380px, calc(var(--imcodes-ui-vw, 100vw) - 24px)); max-width: calc(var(--imcodes-ui-vw, 100vw) - 24px); overscroll-behavior: contain; display: flex; flex-direction: column; z-index: 2147483646; }

@@ -109,6 +109,101 @@ describe('ClaudeCodeDriver', () => {
     expect(sendKey).toHaveBeenCalledWith('Enter');
   });
 
+  it('shell-quotes requestedModel literally on launch and resume so spaces, quotes, and expansions are never interpreted', () => {
+    const trickyModel = `m'2 "$HOME" \`id\` $(whoami) v1`;
+    const launchCmd = driver.buildLaunchCommand('deck_proj_brain', {
+      ccSessionId: 'cc-1',
+      requestedModel: trickyModel,
+      platform: 'linux',
+    });
+    const resumeCmd = driver.buildResumeCommand('deck_proj_brain', {
+      ccSessionId: 'cc-1',
+      requestedModel: trickyModel,
+      platform: 'linux',
+    });
+    const expectedFlag = ` --model 'm'\\''2 "$HOME" \`id\` $(whoami) v1' `;
+    expect(launchCmd).toContain(expectedFlag);
+    expect(resumeCmd).toContain(expectedFlag);
+  });
+
+  it('passes literal tricky requestedModel argv through real sh -c and Windows ConPTY .cmd shim resolution without %VAR% expansion', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { execFileSync } = await import('node:child_process');
+    const { resolveWindowsExecutableForConpty } = await import('../../../src/agent/win-launch.js');
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'imcodes-driver-argv-'));
+    try {
+      const trickyModel = `m'2 "quoted" %TEMP% $HOME \`id\` & v1`;
+      // 1) Real POSIX sh -c execution probe with executable binary capturing process.argv
+      const binDir = path.join(tmpDir, 'bin');
+      fs.mkdirSync(binDir, { recursive: true });
+      const probeJs = path.join(tmpDir, 'argv-probe.mjs');
+      fs.writeFileSync(probeJs, '#!/usr/bin/env node\nconsole.log(JSON.stringify(process.argv.slice(2)));\n', 'utf8');
+      const claudeBin = path.join(binDir, 'claude');
+      fs.writeFileSync(claudeBin, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(probeJs)} "$@"\n`, 'utf8');
+      fs.chmodSync(claudeBin, 0o755);
+
+      const posixLaunch = driver.buildLaunchCommand('deck_proj_brain', {
+        ccSessionId: 'cc-1',
+        requestedModel: trickyModel,
+        platform: 'linux',
+      });
+      const posixResume = driver.buildResumeCommand('deck_proj_brain', {
+        ccSessionId: 'cc-1',
+        requestedModel: trickyModel,
+        platform: 'linux',
+      });
+      for (const cmd of [posixLaunch, posixResume]) {
+        const stdout = execFileSync('sh', ['-c', cmd], {
+          env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}`, TEMP: '/SHOULD_NOT_EXPAND' },
+          encoding: 'utf8',
+        });
+        const argv = JSON.parse(stdout.trim()) as string[];
+        const idx = argv.indexOf('--model');
+        expect(idx).toBeGreaterThanOrEqual(0);
+        expect(argv[idx + 1]).toBe(trickyModel);
+      }
+
+      // 2) Windows npm .cmd shim resolution bypasses cmd.exe and preserves literal %TEMP%, quotes, spaces & ampersand
+      const npmDir = path.join(tmpDir, 'npm');
+      const pkgBinDir = path.join(npmDir, 'node_modules', '@anthropic-ai', 'claude-code');
+      fs.mkdirSync(pkgBinDir, { recursive: true });
+      const shimTarget = path.join(pkgBinDir, 'cli.js');
+      fs.writeFileSync(shimTarget, 'console.log(JSON.stringify(process.argv.slice(2)));\n', 'utf8');
+      fs.writeFileSync(
+        path.join(npmDir, 'claude.cmd'),
+        `@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\@anthropic-ai\\claude-code\\cli.js" %*\r\n`,
+        'utf8',
+      );
+
+      for (const spec of [
+        driver.buildWinLaunchSpec('deck_proj_brain', { ccSessionId: 'cc-1', requestedModel: trickyModel }),
+        driver.buildWinResumeSpec('deck_proj_brain', { ccSessionId: 'cc-1', requestedModel: trickyModel }),
+      ]) {
+        const resolved = resolveWindowsExecutableForConpty(
+          spec.primary,
+          { PATH: npmDir, PATHEXT: '.COM;.EXE;.BAT;.CMD', TEMP: '/SHOULD_NOT_EXPAND' },
+          'win32',
+        );
+        expect(resolved.kind).toBe('direct');
+        if (resolved.kind === 'direct') {
+          const out = execFileSync(resolved.file, resolved.args, {
+            env: { ...process.env, TEMP: '/SHOULD_NOT_EXPAND' },
+            encoding: 'utf8',
+          });
+          const argv = JSON.parse(out.trim()) as string[];
+          const idx = argv.indexOf('--model');
+          expect(idx).toBeGreaterThanOrEqual(0);
+          expect(argv[idx + 1]).toBe(trickyModel);
+        }
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('postLaunch selects Yes in the arrow trust-folder menu', async () => {
     vi.useFakeTimers();
     const capturePane = vi.fn()
@@ -257,6 +352,106 @@ describe('CodexDriver', () => {
       if (origPath === undefined) delete process.env.PATH; else process.env.PATH = origPath;
       if (origPathext === undefined) delete process.env.PATHEXT; else process.env.PATHEXT = origPathext;
       rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('shell-quotes codexModel literally on launch and resume across POSIX and win32', () => {
+    const trickyModel = `codex 'm' "$PATH" \`uname\` 1`;
+    const launchCmd = driver.buildLaunchCommand('deck_proj_w1', {
+      fresh: true,
+      codexModel: trickyModel,
+      platform: 'linux',
+    });
+    const resumeCmd = driver.buildResumeCommand('deck_proj_w1', {
+      codexSessionId: 'codex-1',
+      codexModel: trickyModel,
+      platform: 'linux',
+    });
+    const expectedFlag = ` -m 'codex '\\''m'\\'' "$PATH" \`uname\` 1' `;
+    expect(launchCmd).toContain(expectedFlag);
+    expect(resumeCmd).toContain(expectedFlag);
+
+    const winCmd = driver.buildLaunchCommand('deck_proj_w1', {
+      fresh: true,
+      codexModel: 'gpt "5" %TEMP%',
+      platform: 'win32',
+    });
+    expect(winCmd).toContain(' -m "gpt \\"5\\" %%TEMP%%" ');
+  });
+
+  it('passes literal tricky codexModel argv through real sh -c and Windows ConPTY .cmd shim resolution', async () => {
+    const fs = await import('node:fs');
+    const os = await import('node:os');
+    const path = await import('node:path');
+    const { execFileSync } = await import('node:child_process');
+    const { resolveWindowsExecutableForConpty } = await import('../../../src/agent/win-launch.js');
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'imcodes-codex-argv-'));
+    try {
+      const trickyModel = `codex 'm' "q" %TEMP% $PATH & 1`;
+      const binDir = path.join(tmpDir, 'bin');
+      fs.mkdirSync(binDir, { recursive: true });
+      const probeJs = path.join(tmpDir, 'argv-probe.mjs');
+      fs.writeFileSync(probeJs, 'console.log(JSON.stringify(process.argv.slice(2)));\n', 'utf8');
+      const codexBin = path.join(binDir, 'codex');
+      fs.writeFileSync(codexBin, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(probeJs)} "$@"\n`, 'utf8');
+      fs.chmodSync(codexBin, 0o755);
+
+      const posixLaunch = driver.buildLaunchCommand('deck_proj_w1', {
+        fresh: true,
+        codexModel: trickyModel,
+        platform: 'linux',
+      });
+      const posixResume = driver.buildResumeCommand('deck_proj_w1', {
+        codexSessionId: 'codex-1',
+        codexModel: trickyModel,
+        platform: 'linux',
+      });
+      for (const cmd of [posixLaunch, posixResume]) {
+        const stdout = execFileSync('sh', ['-c', cmd], {
+          env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}`, TEMP: '/SHOULD_NOT_EXPAND' },
+          encoding: 'utf8',
+        });
+        const argv = JSON.parse(stdout.trim()) as string[];
+        const idx = argv.indexOf('-m');
+        expect(idx).toBeGreaterThanOrEqual(0);
+        expect(argv[idx + 1]).toBe(trickyModel);
+      }
+
+      // Windows npm .cmd shim resolution for codex passes trickyModel untouched without cmd.exe
+      const npmDir = path.join(tmpDir, 'npm');
+      const pkgBinDir = path.join(npmDir, 'node_modules', '@openai', 'codex', 'bin');
+      fs.mkdirSync(pkgBinDir, { recursive: true });
+      fs.writeFileSync(path.join(pkgBinDir, 'codex.js'), 'console.log(JSON.stringify(process.argv.slice(2)));\n', 'utf8');
+      fs.writeFileSync(
+        path.join(npmDir, 'codex.cmd'),
+        `@ECHO off\r\n"%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n`,
+        'utf8',
+      );
+
+      for (const spec of [
+        driver.buildWinLaunchSpec('deck_proj_w1', { fresh: true, codexModel: trickyModel }),
+        driver.buildWinResumeSpec('deck_proj_w1', { codexSessionId: 'codex-1', codexModel: trickyModel }),
+      ]) {
+        const resolved = resolveWindowsExecutableForConpty(
+          spec.primary,
+          { PATH: npmDir, PATHEXT: '.COM;.EXE;.BAT;.CMD', TEMP: '/SHOULD_NOT_EXPAND' },
+          'win32',
+        );
+        expect(resolved.kind).toBe('direct');
+        if (resolved.kind === 'direct') {
+          const out = execFileSync(resolved.file, resolved.args, {
+            env: { ...process.env, TEMP: '/SHOULD_NOT_EXPAND' },
+            encoding: 'utf8',
+          });
+          const argv = JSON.parse(out.trim()) as string[];
+          const idx = argv.indexOf('-m');
+          expect(idx).toBeGreaterThanOrEqual(0);
+          expect(argv[idx + 1]).toBe(trickyModel);
+        }
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
 

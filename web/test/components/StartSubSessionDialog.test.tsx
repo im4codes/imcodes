@@ -698,19 +698,21 @@ describe('StartSubSessionDialog', () => {
         onClose={vi.fn()}
       />,
     );
+    const subListReq1 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
+    ws.emit({ type: 'cc.presets.list_response', requestId: subListReq1.requestId, presets: [] });
 
     fireEvent.click(document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement);
     await waitFor(() => expect(screen.getByText('compatible_api_via_qwen')).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
 
-    const openaiRadio = screen.getByLabelText(/OpenAI Compatible/i);
+    const openaiRadio = screen.getByLabelText(/protocolOpenAi/i);
     fireEvent.click(openaiRadio);
 
     expect((screen.getByDisplayValue('https://api.minimax.chat/v1') as HTMLInputElement)).toBeDefined();
     expect((screen.getByDisplayValue('MiniMax-Text-01') as HTMLInputElement)).toBeDefined();
 
-    fireEvent.input(screen.getByPlaceholderText('e.g. MiniMax'), { target: { value: 'OpenAI-Sub' } });
-    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    fireEvent.input(screen.getByPlaceholderText('namePlaceholder'), { target: { value: 'OpenAI-Sub' } });
+    fireEvent.click(screen.getByRole('button', { name: 'saveButton' }));
 
     expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'cc.presets.save',
@@ -726,6 +728,159 @@ describe('StartSubSessionDialog', () => {
           }),
         }),
       ],
+    }));
+  });
+
+  it('keeps selected PresetB or Default when PresetA discovery completes asynchronously in sub-session dialog', async () => {
+    const ws = makeWs();
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+    const subListReq2 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
+    ws.emit({
+      type: 'cc.presets.list_response',
+      requestId: subListReq2.requestId,
+      version: 'v1',
+      presets: [
+        { name: 'PresetA', env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a1' }, defaultModel: 'a1', availableModels: [{ id: 'a1' }] },
+        { name: 'PresetB', env: { ANTHROPIC_BASE_URL: 'https://b.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'b1' }, defaultModel: 'b1', availableModels: [{ id: 'b1' }] },
+      ],
+    });
+
+    fireEvent.click(document.querySelector('[data-agent-type="claude-code-sdk"]') as HTMLButtonElement);
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((s) => Array.from(s.options).some((o) => o.value === 'PresetB'))!;
+    fireEvent.input(presetSelect, { target: { value: 'PresetB' } });
+
+    fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
+    const editBtnA = document.querySelector('[data-cc-preset-row="PresetA"] button') as HTMLButtonElement;
+    fireEvent.click(editBtnA);
+    fireEvent.click(screen.getByRole('button', { name: 'discoverModels' }));
+
+    const saveCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    ws.emit({ type: 'cc.presets.save_response', requestId: saveCall.requestId, ok: true, version: 'v2', presets: saveCall.presets });
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call: any[]) => call[0]?.type === 'cc.presets.discover_models')).toBe(true);
+    });
+    const discoverCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').at(-1)![0];
+    ws.emit({
+      type: 'cc.presets.discover_models_response',
+      requestId: discoverCall.requestId,
+      ok: true,
+      presetName: 'PresetA',
+      preset: {
+        name: 'PresetA',
+        env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a2' },
+        defaultModel: 'a2',
+        availableModels: [{ id: 'a1' }, { id: 'a2' }],
+      },
+    });
+
+    await waitFor(() => {
+      expect(presetSelect.value).toBe('PresetB');
+    });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.objectContaining({
+      ccPreset: 'PresetB',
+      requestedModel: 'b1',
+    }));
+  });
+
+  it('preserves switched PresetB across async Save/Delete and explicit model choice during Discovery in sub-session dialog', async () => {
+    const ws = makeWs();
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+    const listReq = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
+    ws.emit({
+      type: 'cc.presets.list_response',
+      requestId: listReq.requestId,
+      version: 'v1',
+      presets: [
+        { name: 'PresetA', env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a1' }, defaultModel: 'a1', availableModels: [{ id: 'a1' }, { id: 'a2' }] },
+        { name: 'PresetB', env: { ANTHROPIC_BASE_URL: 'https://b.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'b1' }, defaultModel: 'b1', availableModels: [{ id: 'b1' }] },
+      ],
+    });
+
+    fireEvent.click(document.querySelector('[data-agent-type="claude-code-sdk"]') as HTMLButtonElement);
+    const presetSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .find((s) => Array.from(s.options).some((o) => o.value === 'PresetB'))!;
+
+    fireEvent.click(screen.getByRole('button', { name: /api_provider_add_edit/i }));
+    fireEvent.input(screen.getByPlaceholderText('namePlaceholder'), { target: { value: 'PresetNew' } });
+    fireEvent.input(screen.getByPlaceholderText('apiKeyPlaceholder'), { target: { value: 'k' } });
+    fireEvent.click(screen.getByRole('button', { name: 'saveButton' }));
+    const saveCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+
+    fireEvent.input(presetSelect, { target: { value: 'PresetB' } });
+    await act(async () => {
+      ws.emit({ type: 'cc.presets.save_response', requestId: saveCall.requestId, ok: true, version: 'v2', presets: saveCall.presets });
+    });
+    expect(presetSelect.value).toBe('PresetB');
+
+    const newRowButtons = document.querySelectorAll('[data-cc-preset-row="PresetNew"] button');
+    fireEvent.click(newRowButtons[newRowButtons.length - 1]);
+    const deleteCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    await act(async () => {
+      ws.emit({ type: 'cc.presets.save_response', requestId: deleteCall.requestId, ok: true, version: 'v3', presets: deleteCall.presets });
+    });
+    expect(presetSelect.value).toBe('PresetB');
+
+    // Explicit model choice during PresetA discovery must not be overwritten by response
+    fireEvent.input(presetSelect, { target: { value: 'PresetA' } });
+    const editBtnA = document.querySelector('[data-cc-preset-row="PresetA"] button') as HTMLButtonElement;
+    fireEvent.click(editBtnA);
+    fireEvent.click(screen.getByRole('button', { name: 'discoverModels' }));
+    const discSaveCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.save').at(-1)![0];
+    ws.emit({ type: 'cc.presets.save_response', requestId: discSaveCall.requestId, ok: true, version: 'v4', presets: discSaveCall.presets });
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call: any[]) => call[0]?.type === 'cc.presets.discover_models')).toBe(true);
+    });
+    const discCall = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.discover_models').at(-1)![0];
+    const modelSelect = (screen.getAllByRole('combobox') as HTMLSelectElement[])
+      .filter((s) => Array.from(s.options).some((o) => o.value === 'a2'))
+      .at(-1)!;
+    fireEvent.input(modelSelect, { target: { value: 'a2' } });
+    expect(modelSelect.value).toBe('a2');
+
+    await act(async () => {
+      ws.emit({
+        type: 'cc.presets.discover_models_response',
+        requestId: discCall.requestId,
+        ok: true,
+        presetName: 'PresetA',
+        preset: {
+          name: 'PresetA',
+          env: { ANTHROPIC_BASE_URL: 'https://a.test', ANTHROPIC_API_KEY: 'k', ANTHROPIC_MODEL: 'a1' },
+          defaultModel: 'a1',
+          availableModels: [{ id: 'a1' }, { id: 'a2' }, { id: 'a3' }],
+        },
+        version: 'v5',
+      });
+    });
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenCalledWith('claude-code-sdk', undefined, '/tmp', undefined, expect.objectContaining({
+      ccPreset: 'PresetA',
+      requestedModel: 'a2',
     }));
   });
 
@@ -1001,9 +1156,11 @@ describe('StartSubSessionDialog', () => {
       />,
     );
 
+    const subListReq3 = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === 'cc.presets.list').at(-1)![0];
     act(() => {
       ws.emit({
         type: 'cc.presets.list_response',
+        requestId: subListReq3.requestId,
         presets: [{
           name: 'MiniMax',
           env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },

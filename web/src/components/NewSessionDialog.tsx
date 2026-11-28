@@ -33,28 +33,16 @@ import {
   useTransportModels,
   supportsDynamicTransportModels,
 } from "../hooks/useTransportModels.js";
+import { useCcPresets } from "../hooks/useCcPresets.js";
+import { CcPresetEditorPanel } from "./CcPresetManager.js";
 import { ModelCombobox } from "./ModelCombobox.js";
 import { usePresetModelSelection } from "../hooks/usePresetModelSelection.js";
 import { QwenCodingPlanHint } from "./QwenCodingPlanHint.js";
-import {
-  buildCcPresetFromDraft,
-  createCcPresetDraftFromPreset,
-  createDefaultCcPresetDraft,
-  DEFAULT_CC_PRESET_BASE_URL,
-  DEFAULT_CC_PRESET_MODEL,
-  DEFAULT_OPENAI_PRESET_BASE_URL,
-  DEFAULT_OPENAI_PRESET_MODEL,
-  type CcPresetDraft,
-  type CcPresetEntry,
-} from "./cc-preset-form.js";
-import { CC_PRESET_MSG } from "@shared/cc-presets.js";
 import {
   CUSTOM_PROVIDER_SDK_AGENT_TYPES,
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
   normalizeCcPresetName,
-  type CcPreset,
-  type CcPresetAuthType,
 } from "@shared/cc-presets.js";
 import {
   AGY_MODEL_IDS,
@@ -240,66 +228,82 @@ export function NewSessionDialog({
   };
 
   // CC env presets
-  const [ccPresets, setCcPresets] = useState<CcPresetEntry[]>([]);
+  const {
+    presets: ccPresets,
+    loaded: ccPresetsLoaded,
+    loading: ccPresetsLoading,
+    refreshing: ccPresetsRefreshing,
+    saving: savingPreset,
+    discovering: discoveringPreset,
+    error: presetError,
+    setError: setPresetError,
+    savePreset: saveCcPreset,
+    deletePreset: deleteCcPreset,
+    discoverModels: discoverCcPresetModels,
+  } = useCcPresets(ws, { enabled: true });
   const [ccPreset, setCcPreset] = useState<string>("");
   const [ccInitPrompt, setCcInitPrompt] = useState<string>("");
   const [showPresetEditor, setShowPresetEditor] = useState(false);
-  // New preset form
-  const defaultPresetDraft = createDefaultCcPresetDraft();
-  const [newPresetName, setNewPresetName] = useState("");
-  const [newPresetAuthType, setNewPresetAuthType] = useState<CcPresetAuthType>(defaultPresetDraft.authType);
-  const [newPresetBaseUrl, setNewPresetBaseUrl] = useState(defaultPresetDraft.baseUrl);
-  const [newPresetToken, setNewPresetToken] = useState("");
-  const [newPresetModel, setNewPresetModel] = useState(defaultPresetDraft.model);
-  const [newPresetCtx, setNewPresetCtx] = useState(defaultPresetDraft.contextWindow);
-  const [newPresetCustomEnv, setNewPresetCustomEnv] = useState<
-    Array<{ key: string; value: string }>
-  >(defaultPresetDraft.customEnv);
-  const [newPresetInit, setNewPresetInit] = useState(defaultPresetDraft.initMessage);
-  const [newPresetAvailableModels, setNewPresetAvailableModels] = useState(
-    defaultPresetDraft.availableModels,
-  );
-  const [presetError, setPresetError] = useState("");
-  const [discoveringPreset, setDiscoveringPreset] = useState(false);
-  const fmtCtx = (v: string) => {
-    const n = parseInt(v, 10);
-    if (!n) return "";
-    if (n >= 1000000)
-      return `${(n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1)}M`;
-    if (n >= 1000) return `${(n / 1000).toFixed(0)}K`;
-    return String(n);
+  const ccPresetRef = useRef(ccPreset);
+  ccPresetRef.current = ccPreset;
+  const ccPresetEpochRef = useRef(0);
+  const requestedModelEpochRef = useRef(0);
+  const selectCcPreset = (nextPreset: string) => {
+    ccPresetEpochRef.current += 1;
+    requestedModelEpochRef.current += 1;
+    ccPresetRef.current = nextPreset;
+    setCcPreset(nextPreset);
   };
-  const applyPresetDraft = (draft: CcPresetDraft) => {
-    setNewPresetName(draft.name);
-    setNewPresetAuthType(draft.authType);
-    setNewPresetBaseUrl(draft.baseUrl);
-    setNewPresetToken(draft.token);
-    setNewPresetModel(draft.model);
-    setNewPresetCtx(draft.contextWindow);
-    setNewPresetCustomEnv(draft.customEnv);
-    setNewPresetInit(draft.initMessage);
-    setNewPresetAvailableModels(draft.availableModels);
+  const suppressEditorAutoSelectRef = useRef(false);
+  const handleEditorSavePreset = async (preset: Parameters<typeof saveCcPreset>[0]) => {
+    const epochAtStart = ccPresetEpochRef.current;
+    const result = await saveCcPreset(preset);
+    suppressEditorAutoSelectRef.current = Boolean(result.ok && ccPresetEpochRef.current !== epochAtStart);
+    if (suppressEditorAutoSelectRef.current) {
+      queueMicrotask(() => { suppressEditorAutoSelectRef.current = false; });
+    }
+    return result;
   };
-  const buildCurrentPresetDraft = (): CcPresetDraft => ({
-    name: newPresetName,
-    authType: newPresetAuthType,
-    baseUrl: newPresetBaseUrl,
-    token: newPresetToken,
-    model: newPresetModel,
-    contextWindow: newPresetCtx,
-    customEnv: newPresetCustomEnv,
-    initMessage: newPresetInit,
-    availableModels: newPresetAvailableModels,
-  });
-  const persistPresetDraft = (): CcPresetEntry => {
-    const preset = buildCcPresetFromDraft(buildCurrentPresetDraft());
-    const presetKey = normalizeCcPresetName(preset.name);
-    const updated = [...ccPresets.filter((p) => normalizeCcPresetName(p.name) !== presetKey), preset];
-    setCcPresets(updated);
-    try {
-      ws?.send({ type: CC_PRESET_MSG.SAVE, requestId: `cc-preset-save-${Date.now()}`, presets: updated });
-    } catch {}
-    return preset;
+  const handleEditorDeletePreset = async (presetName: string) => {
+    const epochAtStart = ccPresetEpochRef.current;
+    const result = await deleteCcPreset(presetName);
+    suppressEditorAutoSelectRef.current = Boolean(
+      result.ok
+      && (ccPresetEpochRef.current !== epochAtStart
+        || (ccPresetRef.current && normalizeCcPresetName(ccPresetRef.current) !== normalizeCcPresetName(presetName))),
+    );
+    if (suppressEditorAutoSelectRef.current) {
+      queueMicrotask(() => { suppressEditorAutoSelectRef.current = false; });
+    }
+    return result;
+  };
+  const handleEditorSelectPresetName = (nextName: string) => {
+    if (suppressEditorAutoSelectRef.current) {
+      suppressEditorAutoSelectRef.current = false;
+      return;
+    }
+    selectCcPreset(nextName);
+  };
+  const handleDiscoverPresetModels = async (preset: Parameters<typeof discoverCcPresetModels>[0]) => {
+    const selectionAtStart = ccPresetRef.current;
+    const epochAtStart = ccPresetEpochRef.current;
+    const modelEpochAtStart = requestedModelEpochRef.current;
+    const result = await discoverCcPresetModels(preset);
+    if (!result.ok || !result.preset) return result;
+    const currentSelection = ccPresetRef.current;
+    if (
+      ccPresetEpochRef.current === epochAtStart
+      && (currentSelection === result.preset.name || (!currentSelection && selectionAtStart === ""))
+    ) {
+      const shouldAutoSelectModel = requestedModelEpochRef.current === modelEpochAtStart;
+      if (!currentSelection) selectCcPreset(result.preset.name);
+      if (shouldAutoSelectModel) {
+        const nextModel = getCcPresetEffectiveModel(result.preset)
+          ?? getCcPresetAvailableModelIds(result.preset)[0];
+        if (nextModel) setRequestedModel(nextModel);
+      }
+    }
+    return result;
   };
   const resolveCustomProviderAgent = (map: AgentAvailabilityMap | null = agentAvailability): AgentType | null => {
     const defaultCompatible = isSessionAgentTypeSelectable("claude-code-sdk")
@@ -321,7 +325,7 @@ export function NewSessionDialog({
     setError("");
     setPresetError("");
     if (enabled) {
-      if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
+      if (!ccPreset && ccPresets.length > 0) selectCcPreset(ccPresets[0].name);
       if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) || !isAgentInstalled(agentType) || (incognito && !supportsSessionIncognito(agentType))) {
         const nextCustom = resolveCustomProviderAgent();
         if (nextCustom) {
@@ -346,31 +350,6 @@ export function NewSessionDialog({
     () => selectedCcPreset ? getCcPresetAvailableModelIds(selectedCcPreset) : [],
     [selectedCcPreset],
   );
-  const importPresetFromClipboard = async () => {
-    try {
-      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
-      const parsed = JSON.parse(await navigator.clipboard.readText()) as CcPresetEntry;
-      if (!parsed || typeof parsed.name !== 'string' || !parsed.env || typeof parsed.env !== 'object') {
-        throw new Error('Invalid preset JSON');
-      }
-      applyPresetDraft(createCcPresetDraftFromPreset(parsed));
-      setCcPreset(parsed.name);
-      setShowPresetEditor(true);
-      setPresetError('');
-    } catch {
-      setPresetError(t('new_session.api_provider_import_error'));
-    }
-  };
-  const exportPresetToClipboard = async (preset: CcPresetEntry) => {
-    try {
-      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
-      await navigator.clipboard.writeText(JSON.stringify(preset, null, 2));
-      setPresetError('');
-      onToast?.(t('new_session.api_provider_export_success'));
-    } catch {
-      setPresetError(t('new_session.api_provider_export_error'));
-    }
-  };
 
   // OpenClaw-specific state
   const [ocMode, setOcMode] = useState<OpenClawMode>("new");
@@ -410,28 +389,6 @@ export function NewSessionDialog({
             setAgentAvailability(nextMap);
             setDetectingAgents(false);
           }
-          // Listen for CC presets response
-          if (msg.type === CC_PRESET_MSG.LIST_RESPONSE) {
-            setCcPresets((msg as any).presets ?? []);
-          }
-          if (msg.type === CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE) {
-            setDiscoveringPreset(false);
-            if (msg.preset) {
-              const presetKey = normalizeCcPresetName(msg.preset.name);
-              setCcPresets((current) => [
-                ...current.filter((preset) => normalizeCcPresetName(preset.name) !== presetKey),
-                msg.preset,
-              ].filter((preset): preset is CcPreset => preset !== undefined));
-              if (newPresetName.trim().toLowerCase() === msg.preset.name.trim().toLowerCase()) {
-                applyPresetDraft(createCcPresetDraftFromPreset(msg.preset));
-              }
-              if (ccPreset === msg.preset.name || !ccPreset) setCcPreset(msg.preset.name);
-              const nextModel = getCcPresetEffectiveModel(msg.preset)
-                ?? getCcPresetAvailableModelIds(msg.preset)[0];
-              if (nextModel) setRequestedModel(nextModel);
-            }
-            setPresetError(msg.ok ? "" : (msg.error ?? "Failed to discover models"));
-          }
           // Listen for openclaw remote session list response
           const raw = msg as unknown as Record<string, unknown>;
           if (raw["type"] === "openclaw.sessions_response") {
@@ -449,11 +406,6 @@ export function NewSessionDialog({
       } catch {
         setDetectingAgents(false);
       }
-    }
-    try {
-      ws.send({ type: CC_PRESET_MSG.LIST });
-    } catch {
-      /* ws may not support send in test */
     }
     return () => {
       unsub?.();
@@ -1454,6 +1406,7 @@ export function NewSessionDialog({
                   if (agentType === "opencode-sdk" && !selectedCcPreset) {
                     openCodeModelManuallySelectedRef.current = val.trim().length > 0;
                   }
+                  requestedModelEpochRef.current += 1;
                   setRequestedModel(val);
                 }}
                 style={{
@@ -1497,6 +1450,7 @@ export function NewSessionDialog({
                   if (agentType === "opencode-sdk" && !selectedCcPreset) {
                     openCodeModelManuallySelectedRef.current = val.trim().length > 0;
                   }
+                  requestedModelEpochRef.current += 1;
                   setRequestedModel(val);
                 }}
                 className="input"
@@ -1555,7 +1509,7 @@ export function NewSessionDialog({
                   value={ccPreset}
                   disabled={starting}
                   onInput={(e) =>
-                    setCcPreset((e.target as HTMLSelectElement).value)
+                    selectCcPreset((e.target as HTMLSelectElement).value)
                   }
                   style={{
                     width: "100%",
@@ -1591,517 +1545,25 @@ export function NewSessionDialog({
 
             {/* Inline preset editor */}
             {showPresetEditor && (
-              <div
-                style={{
-                  background: "#0f172a",
-                  border: "1px solid #334155",
-                  borderRadius: 6,
-                  padding: 12,
-                  marginBottom: 12,
-                  fontSize: 12,
-                }}
-              >
-                <div
-                  style={{ marginBottom: 4, fontWeight: 600, color: "#94a3b8" }}
-                >
-                  Add / Edit Preset
-                </div>
-                <div
-                  style={{ fontSize: 10, color: "#475569", marginBottom: 8 }}
-                >
-                  Stored locally on daemon (~/.imcodes/cc-presets.json)
-                </div>
-                <div style={{ marginBottom: 8 }}>
-                  <div style={{ fontSize: 10, color: "#64748b", marginBottom: 2 }}>
-                    API Protocol
-                  </div>
-                  <div style={{ display: "flex", gap: 12 }}>
-                    <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11, color: "#e2e8f0" }}>
-                      <input
-                        type="radio"
-                        name="new-session-preset-auth-type"
-                        value="anthropic"
-                        checked={newPresetAuthType === "anthropic"}
-                        onChange={() => {
-                          setNewPresetAuthType("anthropic");
-                          if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_OPENAI_PRESET_BASE_URL) {
-                            setNewPresetBaseUrl(DEFAULT_CC_PRESET_BASE_URL);
-                          }
-                          if (!newPresetModel || newPresetModel === DEFAULT_OPENAI_PRESET_MODEL) {
-                            setNewPresetModel(DEFAULT_CC_PRESET_MODEL);
-                          }
-                        }}
-                      />
-                      Anthropic Compatible
-                    </label>
-                    <label style={{ display: "flex", alignItems: "center", gap: 4, cursor: "pointer", fontSize: 11, color: "#e2e8f0" }}>
-                      <input
-                        type="radio"
-                        name="new-session-preset-auth-type"
-                        value="openai"
-                        checked={newPresetAuthType === "openai"}
-                        onChange={() => {
-                          setNewPresetAuthType("openai");
-                          if (!newPresetBaseUrl || newPresetBaseUrl === DEFAULT_CC_PRESET_BASE_URL) {
-                            setNewPresetBaseUrl(DEFAULT_OPENAI_PRESET_BASE_URL);
-                          }
-                          if (!newPresetModel || newPresetModel === DEFAULT_CC_PRESET_MODEL) {
-                            setNewPresetModel(DEFAULT_OPENAI_PRESET_MODEL);
-                          }
-                        }}
-                      />
-                      OpenAI Compatible
-                    </label>
-                  </div>
-                </div>
-                {[
-                  {
-                    label: "Preset Name",
-                    envKey: "",
-                    ph: "e.g. MiniMax",
-                    val: newPresetName,
-                    set: setNewPresetName,
-                  },
-                  {
-                    label: "API Base URL",
-                    envKey: newPresetAuthType === "openai" ? "OPENAI_BASE_URL" : "ANTHROPIC_BASE_URL",
-                    ph: newPresetAuthType === "openai" ? DEFAULT_OPENAI_PRESET_BASE_URL : DEFAULT_CC_PRESET_BASE_URL,
-                    val: newPresetBaseUrl,
-                    set: setNewPresetBaseUrl,
-                  },
-                  {
-                    label: "API Key",
-                    envKey: newPresetAuthType === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY",
-                    ph: "your-api-key",
-                    val: newPresetToken,
-                    set: setNewPresetToken,
-                    type: "password" as const,
-                  },
-                  {
-                    label: "Model",
-                    envKey: newPresetAuthType === "openai" ? "OPENAI_MODEL" : "ANTHROPIC_MODEL",
-                    ph: newPresetAuthType === "openai" ? `e.g. ${DEFAULT_OPENAI_PRESET_MODEL}` : `e.g. ${DEFAULT_CC_PRESET_MODEL}`,
-                    val: newPresetModel,
-                    set: setNewPresetModel,
-                  },
-                ].map(({ label, envKey, ph, val, set, type }) => (
-                  <div key={label} style={{ marginBottom: 5 }}>
-                    <div
-                      style={{
-                        fontSize: 10,
-                        color: "#64748b",
-                        marginBottom: 2,
-                      }}
-                    >
-                      {label}
-                      {envKey && (
-                        <span style={{ color: "#334155", marginLeft: 4 }}>
-                          {envKey}
-                        </span>
-                      )}
-                    </div>
-                    <input
-                      type={type ?? "text"}
-                      placeholder={ph}
-                      value={val}
-                      onInput={(e) => set((e.target as HTMLInputElement).value)}
-                      style={{
-                        width: "100%",
-                        background: "#1e293b",
-                        border: "1px solid #334155",
-                        color: "#e2e8f0",
-                        padding: "5px 8px",
-                        borderRadius: 4,
-                        fontSize: 12,
-                        boxSizing: "border-box",
-                      }}
-                    />
-                  </div>
-                ))}
-                {newPresetAvailableModels.length > 0 && (
-                  <div style={{ marginBottom: 5 }}>
-                    <div
-                      style={{ fontSize: 10, color: "#64748b", marginBottom: 2 }}
-                    >
-                      Discovered Models
-                    </div>
-                    <select
-                      value={newPresetModel}
-                      onInput={(e) =>
-                        setNewPresetModel((e.target as HTMLSelectElement).value)
-                      }
-                      style={{
-                        width: "100%",
-                        background: "#1e293b",
-                        border: "1px solid #334155",
-                        color: "#e2e8f0",
-                        padding: "5px 8px",
-                        borderRadius: 4,
-                        fontSize: 12,
-                        boxSizing: "border-box",
-                      }}
-                    >
-                      {newPresetAvailableModels.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.name ? `${item.name} (${item.id})` : item.id}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                )}
-                <div style={{ marginBottom: 5 }}>
-                  <div
-                    style={{ fontSize: 10, color: "#64748b", marginBottom: 2 }}
-                  >
-                    Context Window
-                    {newPresetCtx && (
-                      <span style={{ color: "#3b82f6", marginLeft: 6 }}>
-                        {fmtCtx(newPresetCtx)}
-                      </span>
-                    )}
-                  </div>
-                  <input
-                    type="text"
-                    placeholder="1000000"
-                    value={newPresetCtx}
-                    onInput={(e) =>
-                      setNewPresetCtx((e.target as HTMLInputElement).value)
-                    }
-                    style={{
-                      width: "100%",
-                      background: "#1e293b",
-                      border: "1px solid #334155",
-                      color: "#e2e8f0",
-                      padding: "5px 8px",
-                      borderRadius: 4,
-                      fontSize: 12,
-                      boxSizing: "border-box",
-                    }}
-                  />
-                </div>
-                {/* Custom env vars */}
-                <div style={{ marginBottom: 5 }}>
-                  <div
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      alignItems: "center",
-                      marginBottom: 2,
-                    }}
-                  >
-                    <span style={{ fontSize: 10, color: "#64748b" }}>
-                      Custom ENV Vars
-                    </span>
-                    <button
-                      type="button"
-                      style={{
-                        background: "none",
-                        border: "none",
-                        color: "#3b82f6",
-                        cursor: "pointer",
-                        fontSize: 10,
-                        padding: 0,
-                      }}
-                      onClick={() =>
-                        setNewPresetCustomEnv([
-                          ...newPresetCustomEnv,
-                          { key: "", value: "" },
-                        ])
-                      }
-                    >
-                      + Add
-                    </button>
-                  </div>
-                  {newPresetCustomEnv.map((item, i) => (
-                    <div
-                      key={i}
-                      style={{ display: "flex", gap: 4, marginBottom: 3 }}
-                    >
-                      <input
-                        type="text"
-                        placeholder="ENV_KEY"
-                        value={item.key}
-                        onInput={(e) => {
-                          const u = [...newPresetCustomEnv];
-                          u[i] = {
-                            ...u[i],
-                            key: (e.target as HTMLInputElement).value,
-                          };
-                          setNewPresetCustomEnv(u);
-                        }}
-                        style={{
-                          flex: 1,
-                          background: "#1e293b",
-                          border: "1px solid #334155",
-                          color: "#e2e8f0",
-                          padding: "4px 6px",
-                          borderRadius: 4,
-                          fontSize: 11,
-                          fontFamily: "monospace",
-                          boxSizing: "border-box",
-                        }}
-                      />
-                      <input
-                        type="text"
-                        placeholder="value"
-                        value={item.value}
-                        onInput={(e) => {
-                          const u = [...newPresetCustomEnv];
-                          u[i] = {
-                            ...u[i],
-                            value: (e.target as HTMLInputElement).value,
-                          };
-                          setNewPresetCustomEnv(u);
-                        }}
-                        style={{
-                          flex: 2,
-                          background: "#1e293b",
-                          border: "1px solid #334155",
-                          color: "#e2e8f0",
-                          padding: "4px 6px",
-                          borderRadius: 4,
-                          fontSize: 11,
-                          boxSizing: "border-box",
-                        }}
-                      />
-                      <button
-                        type="button"
-                        style={{
-                          background: "none",
-                          border: "none",
-                          color: "#ef4444",
-                          cursor: "pointer",
-                          fontSize: 12,
-                          padding: "0 4px",
-                        }}
-                        onClick={() =>
-                          setNewPresetCustomEnv(
-                            newPresetCustomEnv.filter((_, j) => j !== i),
-                          )
-                        }
-                      >
-                        ×
-                      </button>
-                    </div>
-                  ))}
-                </div>
-                <div style={{ marginBottom: 6 }}>
-                  <div
-                    style={{ fontSize: 10, color: "#64748b", marginBottom: 2 }}
-                  >
-                    Init Message (sent after session starts)
-                  </div>
-                  <textarea
-                    value={newPresetInit}
-                    rows={2}
-                    onInput={(e) =>
-                      setNewPresetInit((e.target as HTMLTextAreaElement).value)
-                    }
-                    style={{
-                      width: "100%",
-                      background: "#1e293b",
-                      border: "1px solid #334155",
-                      color: "#e2e8f0",
-                      padding: "5px 8px",
-                      borderRadius: 4,
-                      fontSize: 11,
-                      resize: "vertical",
-                      boxSizing: "border-box",
-                    }}
-                  />
-                </div>
-                {presetError && (
-                  <div style={{ color: "#ef4444", fontSize: 11, marginBottom: 6 }}>
-                    {presetError}
-                  </div>
-                )}
-                <button
-                  type="button"
-                  disabled={!newPresetName.trim() || !newPresetBaseUrl.trim()}
-                  style={{
-                    background: "#1d4ed8",
-                    border: "none",
-                    color: "#fff",
-                    padding: "4px 12px",
-                    borderRadius: 4,
-                    cursor: "pointer",
-                    fontSize: 12,
-                    opacity:
-                      !newPresetName.trim() || !newPresetBaseUrl.trim()
-                        ? 0.5
-                        : 1,
-                  }}
-                  onClick={() => {
-                    const preset = persistPresetDraft();
-                    applyPresetDraft(createDefaultCcPresetDraft());
-                    setCcPreset(preset.name);
-                    setPresetError("");
-                  }}
-                >
-                  Save Preset
-                </button>
-                <button
-                  type="button"
-                  style={{
-                    background: "#334155",
-                    border: "none",
-                    color: "#fff",
-                    padding: "4px 12px",
-                    borderRadius: 4,
-                    cursor: "pointer",
-                    fontSize: 12,
-                    marginLeft: 8,
-                  }}
-                  onClick={() => { void importPresetFromClipboard(); }}
-                >
-                  {t('new_session.api_provider_import_json')}
-                </button>
-                <button
-                  type="button"
-                  disabled={
-                    discoveringPreset
-                    || !newPresetName.trim()
-                    || !newPresetBaseUrl.trim()
-                    || !newPresetToken.trim()
-                  }
-                  style={{
-                    background: "#0f766e",
-                    border: "none",
-                    color: "#fff",
-                    padding: "4px 12px",
-                    borderRadius: 4,
-                    cursor: "pointer",
-                    fontSize: 12,
-                    marginLeft: 8,
-                    opacity:
-                      discoveringPreset
-                      || !newPresetName.trim()
-                      || !newPresetBaseUrl.trim()
-                      || !newPresetToken.trim()
-                        ? 0.5
-                        : 1,
-                  }}
-                  onClick={() => {
-                    if (!ws?.connected) {
-                      setPresetError("Daemon offline");
-                      return;
-                    }
-                    const preset = persistPresetDraft();
-                    setCcPreset(preset.name);
-                    setDiscoveringPreset(true);
-                    setPresetError("");
-                    try {
-                      ws.send({
-                        type: CC_PRESET_MSG.DISCOVER_MODELS,
-                        requestId: `cc-preset-discover-${Date.now()}`,
-                        presetName: preset.name,
-                      });
-                    } catch {
-                      setDiscoveringPreset(false);
-                      setPresetError("Failed to send discover request");
-                    }
-                  }}
-                >
-                  {discoveringPreset ? "Discovering..." : "Discover Models"}
-                </button>
-
-                {/* Existing presets — edit/delete */}
-                {ccPresets.length > 0 && (
-                  <div
-                    style={{
-                      marginTop: 10,
-                      borderTop: "1px solid #334155",
-                      paddingTop: 8,
-                    }}
-                  >
-                    <div
-                      style={{
-                        color: "#64748b",
-                        fontSize: 11,
-                        marginBottom: 4,
-                      }}
-                    >
-                      Saved presets:
-                    </div>
-                    {ccPresets.map((p) => (
-                      <div
-                        key={p.name}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          padding: "3px 0",
-                          fontSize: 12,
-                        }}
-                      >
-                        <span style={{ color: "#e2e8f0" }}>
-	                          {p.name}{" "}
-	                          <span style={{ color: "#475569" }}>
-	                            {getCcPresetEffectiveModel(p) ?? ""}
-	                          </span>
-                        </span>
-                        <div style={{ display: "flex", gap: 4 }}>
-                          <button
-                            type="button"
-                            style={{
-                              background: "none",
-                              border: "none",
-                              color: "#3b82f6",
-                              cursor: "pointer",
-                              fontSize: 11,
-                            }}
-                            onClick={() => {
-                              applyPresetDraft(createCcPresetDraftFromPreset(p));
-                              setPresetError(p.modelDiscoveryError ?? "");
-                            }}
-                          >
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            style={{
-                              background: "none",
-                              border: "none",
-                              color: "#ef4444",
-                              cursor: "pointer",
-                              fontSize: 11,
-                            }}
-	                            onClick={() => {
-	                              const updated = ccPresets.filter(
-	                                (x) => normalizeCcPresetName(x.name) !== normalizeCcPresetName(p.name),
-	                              );
-                              setCcPresets(updated);
-                              try {
-	                                ws?.send({
-	                                  type: CC_PRESET_MSG.SAVE,
-	                                  requestId: `cc-preset-save-${Date.now()}`,
-	                                  presets: updated,
-	                                });
-                              } catch {}
-                              if (ccPreset === p.name) setCcPreset("");
-                            }}
-	                          >
-	                            Delete
-	                          </button>
-                          <button
-                            type="button"
-                            style={{
-                              background: "none",
-                              border: "none",
-                              color: "#22c55e",
-                              cursor: "pointer",
-                              fontSize: 11,
-                            }}
-                            onClick={() => { void exportPresetToClipboard(p); }}
-                          >
-                            {t('new_session.api_provider_export_json')}
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+              <CcPresetEditorPanel
+                ws={ws}
+                presets={ccPresets}
+                loaded={ccPresetsLoaded}
+                loading={ccPresetsLoading}
+                refreshing={ccPresetsRefreshing}
+                saving={savingPreset}
+                discovering={discoveringPreset}
+                error={presetError}
+                onClearError={() => setPresetError("")}
+                onError={setPresetError}
+                onSavePreset={handleEditorSavePreset}
+                onDeletePreset={handleEditorDeletePreset}
+                onDiscoverModels={handleDiscoverPresetModels}
+                selectedPresetName={ccPreset}
+                onSelectPresetName={handleEditorSelectPresetName}
+                onToast={onToast}
+                radioName="new-session-preset-auth-type"
+              />
             )}
 
             {/* Extra init prompt for this launch */}

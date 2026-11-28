@@ -81,6 +81,7 @@ import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { MobileServerMenu } from './components/MobileServerMenu.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
+import { CcPresetManagerDialog } from './components/CcPresetManager.js';
 import { VoiceLanguageSwitcher } from './components/VoiceLanguageSwitcher.js';
 import { remoteVoiceProvider } from './remote-voice-provider.js';
 import { installRemoteVoiceAutoRefresh, resetRemoteVoiceClientForTesting } from './remote-voice-client.js';
@@ -492,7 +493,14 @@ import {
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
   REMOTE_DESKTOP_LOCAL_WEB_ACTION,
 } from '@shared/remote-desktop-local-management.js';
-import { looselyEqual, markSessionRunningIfNeeded, updateSessionIfChanged } from './session-state-updates.js';
+import {
+  isSessionSwitchSupersededBySync,
+  looselyEqual,
+  markSessionRunningIfNeeded,
+  updateSessionIfChanged,
+  type SessionSwitchBaseline,
+} from './session-state-updates.js';
+import type { AppliedSessionRestartState } from '@shared/session-restart-contract.js';
 import { createMapUpdateBatcher, type MapUpdateBatcher } from './map-update-batcher.js';
 import { useStructuralIdentity } from './hooks/useStructuralIdentity.js';
 import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
@@ -3745,7 +3753,9 @@ function InternalMainApp() {
   } | null>(null);
   const [showUsageSummaryPage, setShowUsageSummaryPage] = useState(false);
   const [showCronManager, setShowCronManager] = useState(false);
+  const [showCcPresetManager, setShowCcPresetManager] = useState(false);
   const [showAdminPage, setShowAdminPage] = useState(false);
+  const openCcPresetManager = useCallback(() => setShowCcPresetManager(true), []);
   const [showSharedContextManagement, setShowSharedContextManagement] = useState(false);
   const [showControlledNodes, setShowControlledNodes] = useState(Boolean(aideskManagementNodeId));
   const [remoteDesktopWorkspace, setRemoteDesktopWorkspace] = useState(
@@ -5199,6 +5209,10 @@ function InternalMainApp() {
     : undefined;
   const staleSubSessionsSnapshotRef = useRef<readonly SubSession[] | null>(null);
   const rawSubSessionsRef = useRef<readonly SubSession[]>([]);
+  const pendingQuickSwitchCommitsRef = useRef<Map<string, {
+    baseline: SessionSwitchBaseline | null;
+    applied: AppliedSessionRestartState | null;
+  }>>(new Map());
   const {
     subSessions: rawSubSessions,
     visibleSubSessions: rawVisibleSubSessions,
@@ -5209,6 +5223,7 @@ function InternalMainApp() {
     rename: renameSubSession,
     updateLocal: updateSubLocal,
     hydrateShared: hydrateSharedSubSessions,
+    getSnapshotById: getSubSessionSnapshotById,
   } = useSubSessions(
     (nativeReady && auth) ? selectedServerId : null,
     wsRef.current,
@@ -5447,6 +5462,7 @@ function InternalMainApp() {
     setRepoPanelTarget(null);
     setRepoFocusLatestAction(null);
     setShowCronManager(false);
+    setShowCcPresetManager(false);
     setShowDiscussionsPage(false);
     setDiscussionInitialId(null);
     setDiscussionInitialTab('team');
@@ -8861,6 +8877,7 @@ function InternalMainApp() {
     setShowDiscussionsPage(false);
     setShowRepoPage(false);
     setShowCronManager(false);
+    setShowCcPresetManager(false);
     setShowMobileFileBrowser(false);
     setShowSharedContextManagement(false);
     setShowSharedContextDiagnostics(false);
@@ -9701,6 +9718,7 @@ function InternalMainApp() {
     || showSettingsPage
     || showUsageSummaryPage
     || showCronManager
+    || showCcPresetManager
     || showAdminPage
     || showSharedContextManagement
     || showControlledNodes
@@ -9751,6 +9769,7 @@ function InternalMainApp() {
     || showSettingsPage
     || showUsageSummaryPage
     || showCronManager
+    || showCcPresetManager
     || showAdminPage
     || showSharedContextManagement
     || showControlledNodes
@@ -9973,6 +9992,7 @@ function InternalMainApp() {
     setShowRepoPage(false);
     setPreviewFileRequest(null);
     setShowCronManager(false);
+    setShowCcPresetManager(false);
     setShowSharedContextManagement(false);
     setShowControlledNodes(false);
     setShowCloudDocs(false);
@@ -10003,6 +10023,7 @@ function InternalMainApp() {
     setShowSettingsPage(false);
     setShowUsageSummaryPage(false);
     setShowCronManager(false);
+    setShowCcPresetManager(false);
     setShowAdminPage(false);
     setShowSharedContextManagement(false);
     setShowControlledNodes(false);
@@ -11502,6 +11523,18 @@ function InternalMainApp() {
               >
                 {trans('sharedContext.management.title')}
               </button>
+              {!selectedShareTarget && matchingWs && (
+                <button
+                  type="button"
+                  class="btn desktop-cc-presets-btn"
+                  data-testid="desktop-cc-presets-btn"
+                  style={{ background: '#334155', color: '#e2e8f0', fontSize: 12 }}
+                  onClick={openCcPresetManager}
+                  title={trans('ccPreset.managerTitle')}
+                >
+                  {trans('ccPreset.toolbarButton')}
+                </button>
+              )}
               <div class="controlled-nodes-shortcut-group">
                 <button
                   class="btn controlled-nodes-shortcut-main"
@@ -12180,14 +12213,26 @@ function InternalMainApp() {
                     session.name === s.name ? { ...session, transportConfig } : session
                   )));
                 }}
+                getLatestSession={() => sessionsRef.current.find((session) => session.name === s.name) ?? s}
+                onSessionSwitchCommit={(sessionName, baseline, applied) => {
+                  pendingQuickSwitchCommitsRef.current.set(sessionName, { baseline, applied });
+                }}
                 onSessionSaved={(fields) => {
+                  const switchGuard = pendingQuickSwitchCommitsRef.current.get(s.name) ?? null;
+                  if (switchGuard) pendingQuickSwitchCommitsRef.current.delete(s.name);
                   setSessions((prev) => prev.map((session) => {
                     if (session.name !== s.name) return session;
+                    if (switchGuard && isSessionSwitchSupersededBySync(session, switchGuard.baseline, switchGuard.applied)) {
+                      return session;
+                    }
                     const updated = { ...session };
                     if (fields.type !== undefined) {
                       updated.agentType = fields.type;
                       updated.runtimeType = getSessionRuntimeType(fields.type);
                       if (fields.type !== session.agentType) delete updated.qwenModel;
+                    }
+                    if (switchGuard?.applied?.runtimeEpoch !== undefined) {
+                      updated.runtimeEpoch = switchGuard.applied.runtimeEpoch ?? undefined;
                     }
                     if (fields.ccPreset === null) delete updated.ccPreset;
                     else if (fields.ccPreset !== undefined) updated.ccPreset = fields.ccPreset;
@@ -12200,6 +12245,7 @@ function InternalMainApp() {
                     return updated;
                   }));
                 }}
+                onOpenCcPresetManager={!selectedShareTarget && matchingWs ? openCcPresetManager : undefined}
                 onPreviewFile={(request) => handlePreviewFileRequest({ ...request, sourcePreviewLive: false })}
                 onOpenLocalWebPreview={openLocalWebPreviewFromChat}
                 onCloudDocClick={openCloudDocPreview}
@@ -12521,6 +12567,19 @@ function InternalMainApp() {
                     }}
                     title={trans('sharedContext.management.title')}
                   >CTX</button>
+                )}
+                {selectedServerId && !selectedShareTarget && matchingWs && (
+                  <button
+                    type="button"
+                    class="mobile-sidebar-hdr-btn"
+                    data-testid="mobile-cc-presets-btn"
+                    onClick={() => {
+                      openCcPresetManager();
+                      closeSidebar();
+                    }}
+                    title={trans('ccPreset.managerTitle')}
+                    aria-label={trans('ccPreset.managerTitle')}
+                  >API</button>
                 )}
                 {(unifiedServers.length > 0 || sharedEntriesLoading || sharedEntriesError !== null || restrictedSharedEntries.length > 0) && (
                   <button
@@ -12918,6 +12977,7 @@ function InternalMainApp() {
               readOnly={mainSharedAccessRole === 'viewer'}
               onNavigateSession={(sessionName, quote) => {
                 setShowCronManager(false);
+    setShowCcPresetManager(false);
                 window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));
               }}
               onBack={() => setShowCronManager(false)}
@@ -13323,14 +13383,28 @@ function InternalMainApp() {
               onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               onViewRepo={() => openRepoPage({ sessionId: sub.sessionName, projectDir: sub.cwd, initialTab: 'branches', parentSubId: sub.id })}
               onTransportConfigSaved={(transportConfig) => updateSubLocal(sub.id, { transportConfig })}
-              onSessionSaved={(fields) => updateSubLocal(sub.id, {
-                type: fields.type !== undefined ? fields.type : undefined,
-                runtimeType: fields.type !== undefined ? getSessionRuntimeType(fields.type) : undefined,
-                ccPresetId: fields.ccPreset !== undefined ? fields.ccPreset : undefined,
-                requestedModel: fields.requestedModel,
-                activeModel: fields.activeModel,
-                modelDisplay: fields.modelDisplay,
-              })}
+              getLatestSession={() => getSubSessionSnapshotById(sub.id) ?? sub}
+              onSessionSwitchCommit={(sessionName, baseline, applied) => {
+                pendingQuickSwitchCommitsRef.current.set(sessionName, { baseline, applied });
+              }}
+              onSessionSaved={(fields) => {
+                const switchGuard = pendingQuickSwitchCommitsRef.current.get(sub.sessionName) ?? null;
+                if (switchGuard) pendingQuickSwitchCommitsRef.current.delete(sub.sessionName);
+                updateSubLocal(
+                  sub.id,
+                  {
+                    type: fields.type !== undefined ? fields.type : undefined,
+                    runtimeType: fields.type !== undefined ? getSessionRuntimeType(fields.type) : undefined,
+                    ...(switchGuard?.applied?.runtimeEpoch !== undefined ? { runtimeEpoch: switchGuard.applied.runtimeEpoch } : {}),
+                    ccPresetId: fields.ccPreset !== undefined ? fields.ccPreset : undefined,
+                    requestedModel: fields.requestedModel,
+                    activeModel: fields.activeModel,
+                    modelDisplay: fields.modelDisplay,
+                  },
+                  switchGuard,
+                );
+              }}
+              onOpenCcPresetManager={!selectedShareTarget && matchingWs ? openCcPresetManager : undefined}
               onLiveSessionStateChange={(liveState) => updateSubLocal(sub.id, {
                 state: liveState,
                 ...(liveState === 'idle'
@@ -13479,6 +13553,14 @@ function InternalMainApp() {
           serverName={deleteTarget.name}
           onConfirm={() => handleDeleteServer(deleteTarget)}
           onCancel={() => setDeleteTarget(null)}
+        />
+      )}
+
+      {showCcPresetManager && selectedServerId && !selectedShareTarget && matchingWs && (
+        <CcPresetManagerDialog
+          ws={matchingWs}
+          onClose={() => setShowCcPresetManager(false)}
+          onToast={showSuccessToast}
         />
       )}
 

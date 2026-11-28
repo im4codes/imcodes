@@ -31,6 +31,7 @@ import {
   registerPane,
 } from './wezterm.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
+import type { ResolvedWinTargetPlan, WinLaunchSpec } from './win-launch.js';
 import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { shellQuote } from '../util/shell-quote.js';
 import { execFileOffMain as execFile, execFileOffMainIdempotent as execFileRead } from '../util/exec-helper.js';
@@ -597,6 +598,8 @@ export async function sendKey(session: string, key: string): Promise<void> {
 export interface NewSessionOptions {
   cwd?: string;
   env?: Record<string, string>;
+  winLaunch?: WinLaunchSpec;
+  preparedWinTargets?: ResolvedWinTargetPlan;
 }
 
 /** Create a new detached session. Throws if it already exists. */
@@ -800,7 +803,11 @@ export async function paneExists(paneTarget: string): Promise<boolean> {
 }
 
 /** Respawn a dead pane (remain-on-exit) with a new command. */
-export async function respawnPane(name: string, command: string, opts?: { env?: Record<string, string> }): Promise<void> {
+export async function respawnPane(
+  name: string,
+  command: string,
+  opts?: { env?: Record<string, string>; winLaunch?: WinLaunchSpec; preparedWinTargets?: ResolvedWinTargetPlan },
+): Promise<void> {
   if (BACKEND === 'conpty') {
     const c = await conpty();
     await c.conptyRespawnPane(name, command, opts);

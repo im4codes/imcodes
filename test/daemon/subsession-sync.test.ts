@@ -161,4 +161,42 @@ describe('subsession-sync transport queue projection', () => {
     });
     expect(legacyFrames.some((f) => f.type === SUBSESSION_SYNC_BATCH_MSG)).toBe(false);
   });
+
+  it('drops stale subsession sync payloads whose runtimeEpoch rotated while building', async () => {
+    upsertSession({
+      name: 'deck_sub_rotate',
+      projectName: 'demo',
+      role: 'w1',
+      agentType: 'qwen',
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      providerSessionId: 'prov-old',
+      sessionInstanceId: 'inst-1',
+      runtimeEpoch: 'ep-old',
+      parentSession: 'deck_demo_brain',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+
+    const slowSharedCache = {
+      presetModels: new Map<string, Promise<string[] | undefined>>(),
+      claudeRuntimeConfig: new Promise<Record<string, unknown>>((resolve) => {
+        setTimeout(() => resolve({}), 25);
+      }),
+    };
+    const buildPromise = buildSubSessionSyncPayload('rotate', { agentType: 'claude-code-sdk' }, { sharedCache: slowSharedCache as never });
+
+    // Rotate runtimeEpoch mid-build
+    const current = getSession('deck_sub_rotate')!;
+    upsertSession({
+      ...current,
+      agentType: 'claude-code',
+      runtimeEpoch: 'ep-new',
+    });
+
+    await expect(buildPromise).resolves.toBeNull();
+  });
 });

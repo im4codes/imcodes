@@ -11,7 +11,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const webRoot = resolve(here, '..');
 
 describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', () => {
-  it('fits cleanly on 1440x900, 390x844, 320x568, notched horizontal safe areas, keyboard VisualViewport, and scrolls columns independently', { timeout: 30000 }, async () => {
+  it('fits cleanly on 1440, 640, 430, 390, 359, 320, notched safe areas, keyboard VisualViewport, wide preset bar + manage button, and scrolls columns independently', { timeout: 30000 }, async () => {
     const require = createRequire(import.meta.url);
     const { chromium } = require('playwright') as typeof import('playwright');
     const executablePath = existsSync(chromium.executablePath())
@@ -33,6 +33,7 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
           import { I18nextProvider, initReactI18next } from 'react-i18next';
           import enLocale from './src/i18n/locales/en.json';
           import zhCNLocale from './src/i18n/locales/zh-CN.json';
+          import { CC_PRESET_MSG } from '@shared/cc-presets.js';
           import { QuickSdkModelMenu } from './src/components/QuickSdkModelMenu.js';
           import {
             computeModelDropdownStyle,
@@ -50,10 +51,44 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
             interpolation: { escapeValue: false },
           });
 
+          function createMockWs() {
+            const listeners = new Set();
+            return {
+              connected: true,
+              detectAgents: () => {},
+              getDaemonCapabilitySnapshot: () => ({ daemonId: 'd-test' }),
+              onMessage: (cb) => {
+                listeners.add(cb);
+                return () => listeners.delete(cb);
+              },
+              send: (msg) => {
+                if (msg?.type === CC_PRESET_MSG.LIST) {
+                  setTimeout(() => {
+                    for (const cb of listeners) {
+                      cb({
+                        type: CC_PRESET_MSG.LIST_RESPONSE,
+                        requestId: msg.requestId,
+                        presets: [
+                          {
+                            name: 'Ultra-Long-Enterprise-Custom-Provider-Preset-2026-Production',
+                            env: { ANTHROPIC_MODEL: 'MiniMax-M2.7-Ultra-Long-Model-Name' },
+                            defaultModel: 'MiniMax-M2.7-Ultra-Long-Model-Name',
+                            availableModels: [{ id: 'MiniMax-M2.7-Ultra-Long-Model-Name' }, { id: 'MiniMax-Text-01' }],
+                          },
+                        ],
+                      });
+                    }
+                  }, 0);
+                }
+              },
+            };
+          }
+
           function Harness({ triggerAlign = 'left', overrideVv = null }) {
             const [open, setOpen] = useState(true);
             const [tick, setTick] = useState(0);
             const btnRef = useRef(null);
+            const [ws] = useState(() => createMockWs());
 
             useEffect(() => {
               setTick((x) => x + 1);
@@ -110,7 +145,7 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
                           {open && (
                             <div class="menu-dropdown menu-dropdown-models" style={style}>
                               <QuickSdkModelMenu
-                                ws={null}
+                                ws={ws}
                                 activeSession={{
                                   name: 'deck_app_brain',
                                   project: 'app',
@@ -118,6 +153,7 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
                                   state: 'idle',
                                   projectDir: '/work/app',
                                   agentType: 'claude-code-sdk',
+                                  ccPreset: 'Ultra-Long-Enterprise-Custom-Provider-Preset-2026-Production',
                                   modelDisplay: 'sonnet',
                                 }}
                                 serverId="srv1"
@@ -132,6 +168,7 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
                                 ]}
                                 onSelectSameSdkModel={() => {}}
                                 onClose={() => setOpen(false)}
+                                onOpenCcPresetManager={() => {}}
                               />
                             </div>
                           )}
@@ -172,8 +209,10 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
     try {
       const scenarios = [
         { name: 'desktop-1440', vw: 1440, vh: 900, align: 'left', sat: 0, sab: 0, sal: 0, sar: 0, expectRowH: 36, vv: null },
+        { name: 'tablet-640', vw: 640, vh: 800, align: 'right', sat: 0, sab: 0, sal: 0, sar: 0, expectRowH: 40, vv: null },
         { name: 'mobile-430', vw: 430, vh: 932, align: 'right', sat: 59, sab: 34, sal: 0, sar: 0, expectRowH: 40, vv: null },
         { name: 'mobile-390', vw: 390, vh: 844, align: 'right', sat: 47, sab: 34, sal: 0, sar: 0, expectRowH: 40, vv: null },
+        { name: 'mobile-359', vw: 359, vh: 740, align: 'right', sat: 0, sab: 0, sal: 0, sar: 0, expectRowH: 38, vv: null },
         { name: 'mobile-320', vw: 320, vh: 568, align: 'right', sat: 0, sab: 0, sal: 0, sar: 0, expectRowH: 38, vv: null },
         { name: 'notched-390', vw: 390, vh: 844, align: 'right', sat: 47, sab: 34, sal: 22, sar: 22, expectRowH: 40, vv: null },
         {
@@ -197,6 +236,8 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
         await page.addScriptTag({ content: bundleJs });
         await page.evaluate((opts) => (window as any).__mountHarness(opts), { align: sc.align, overrideVv: sc.vv });
         await page.waitForSelector('[data-testid="quick-sdk-model-split"]');
+        await page.waitForSelector('[data-testid="quick-sdk-preset-bar"]');
+        await page.waitForSelector('[data-testid="quick-sdk-manage-presets"]');
         await page.click('[data-sdk-id="codex-sdk"]');
 
         const geom = await page.evaluate(() => {
@@ -204,6 +245,9 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
           const split = document.querySelector('.quick-sdk-model-split')!.getBoundingClientRect().toJSON();
           const sdks = document.querySelector('.quick-sdk-model-sdks')!.getBoundingClientRect().toJSON();
           const models = document.querySelector('.quick-sdk-model-models')!.getBoundingClientRect().toJSON();
+          const presetBar = document.querySelector('[data-testid="quick-sdk-preset-bar"]')!.getBoundingClientRect().toJSON();
+          const presetSelect = document.querySelector('[data-testid="quick-sdk-preset-select"]')!.getBoundingClientRect().toJSON();
+          const manageBtn = document.querySelector('[data-testid="quick-sdk-manage-presets"]')!.getBoundingClientRect().toJSON();
           const sdkRow = document.querySelector('.quick-sdk-item')!.getBoundingClientRect().toJSON();
           const modelRow = document.querySelector('.quick-sdk-model-item')!.getBoundingClientRect().toJSON();
           const sdkItems = Array.from(document.querySelectorAll('.quick-sdk-item[data-sdk-id]')).map((btn) => {
@@ -227,6 +271,9 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
             split,
             sdks,
             models,
+            presetBar,
+            presetSelect,
+            manageBtn,
             sdkRow,
             modelRow,
             sdkItems,
@@ -253,14 +300,18 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
         expect(geom.sdkRow.height, sc.name).toBeGreaterThanOrEqual(sc.expectRowH);
         expect(geom.modelRow.height, sc.name).toBeGreaterThanOrEqual(sc.expectRowH);
 
+        // CC Preset bar + wide-preset <select> + manage button must fit cleanly inside right column without clipping or overlapping.
+        expect(geom.presetBar.right, sc.name).toBeLessThanOrEqual(geom.models.right + 0.5);
+        expect(geom.presetSelect.right, sc.name).toBeLessThanOrEqual(geom.manageBtn.left + 0.5);
+        expect(geom.manageBtn.right, sc.name).toBeLessThanOrEqual(geom.presetBar.right + 0.5);
+        expect(geom.manageBtn.width, sc.name).toBeGreaterThanOrEqual(20);
+        expect(geom.manageBtn.height, sc.name).toBeGreaterThanOrEqual(20);
+
         if (sc.name === 'mobile-390') {
-          // Width fills >= 85% of viewport width (~90% target: 351px)
           expect(geom.menu.width, sc.name).toBeGreaterThanOrEqual(390 * 0.85);
-          // Height fills ~50% of viewport height (~52% target: 438px)
           expect(geom.menu.height, sc.name).toBeGreaterThanOrEqual(390);
           expect(geom.menu.height, sc.name).toBeLessThanOrEqual(460);
 
-          // Independent column scroll: wheel-scroll SDK rail, verify model rail & page do not move.
           const sdksCenter = { x: geom.sdks.left + geom.sdks.width / 2, y: geom.sdks.top + geom.sdks.height / 2 };
           await page.mouse.move(sdksCenter.x, sdksCenter.y);
           await page.mouse.wheel(0, 120);
@@ -279,20 +330,16 @@ describe('QuickSdkModelMenu real-browser layout, safe-area & scroll isolation', 
         }
 
         if (sc.name === 'mobile-430') {
-          // Width fills >= 85% of viewport width (~90% target: 387px)
           expect(geom.menu.width, sc.name).toBeGreaterThanOrEqual(430 * 0.85);
-          // Height fills ~50% of viewport height (~52% target: 484px)
           expect(geom.menu.height, sc.name).toBeGreaterThanOrEqual(440);
           expect(geom.menu.height, sc.name).toBeLessThanOrEqual(500);
         }
 
         if (sc.name === 'desktop-1440') {
-          // Width widened to ~540px and comfortably tall
           expect(geom.menu.width, sc.name).toBeGreaterThanOrEqual(500);
           expect(geom.menu.height, sc.name).toBeGreaterThanOrEqual(400);
         }
 
-        // Core SDK labels must not be truncated on mobile-390, mobile-430, and desktop-1440
         if (sc.name === 'mobile-390' || sc.name === 'mobile-430' || sc.name === 'desktop-1440') {
           const coreSdkIds = [
             'agy-sdk',

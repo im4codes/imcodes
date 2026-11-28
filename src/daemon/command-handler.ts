@@ -32,7 +32,19 @@ import {
   type SessionModelSwitchResult,
   type SessionThinkingSwitchResult,
 } from '../../shared/session-model-control.js';
-import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
+import {
+  startProject,
+  stopProject,
+  teardownProject,
+  getTransportRuntime,
+  launchTransportSession,
+  isProviderSessionBound,
+  persistSessionRecord,
+  relaunchSessionWithSettings,
+  stopTransportRuntimeSession,
+  type ProjectConfig,
+} from '../agent/session-manager.js';
+import type { AppliedSessionRestartState } from '../../shared/session-restart-contract.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
 import {
@@ -3391,7 +3403,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     let extraEnv: Record<string, string> | undefined;
     if (ccPresetName && (agentType === 'claude-code' || agentType === 'claude-code-sdk' || isClaudeCodeSdkAgentType(agentType) || agentType === 'codex' || agentType === 'codex-sdk')) {
       const { resolvePresetEnv } = await import('./cc-presets.js');
-      extraEnv = await resolvePresetEnv(ccPresetName);
+      extraEnv = await resolvePresetEnv(ccPresetName, undefined, requestedModel);
     }
 
     // Reject duplicate main-session starts for an existing project/session namespace.
@@ -3437,6 +3449,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       fresh: isClaudeCodeSdkAgentType(agentType) || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === AGY_SDK_PROVIDER_ID || agentType === 'muse-code-sdk' || isCodeBuddyProviderId(agentType),
       extraEnv,
       ccPreset: ccPresetName,
+      requestedModel,
       effort,
       identityPrompt,
     };
@@ -3535,7 +3548,8 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       if (ccPresetName) {
         const { getPreset, getPresetInitMessage } = await import('./cc-presets.js');
         const preset = await getPreset(ccPresetName);
-        if (preset) parts.push(getPresetInitMessage(preset));
+        const initMsg = preset ? getPresetInitMessage(preset) : undefined;
+        if (initMsg) parts.push(initMsg);
       }
       if (ccInitPrompt) parts.push(ccInitPrompt);
       if (parts.length > 0) {
@@ -3553,9 +3567,65 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   }
 }
 
+function sendRestartResponse(
+  serverLink: ServerLink,
+  responseType: 'session.restart_response' | 'subsession.restart_response',
+  requestId: unknown,
+  result:
+    | { ok: true; applied?: AppliedSessionRestartState; restartEpoch?: number; previousRuntimeEpoch?: string | null }
+    | { ok: false; rejected?: boolean; error: string; restartEpoch?: number },
+): void {
+  if (typeof requestId !== 'string' || !requestId) return;
+  try {
+    const previousRuntimeEpoch = result.ok
+      && result.previousRuntimeEpoch
+      && result.previousRuntimeEpoch !== result.applied?.runtimeEpoch
+      ? result.previousRuntimeEpoch
+      : undefined;
+    serverLink.send({
+      type: responseType,
+      requestId,
+      ok: result.ok,
+      ...(typeof result.restartEpoch === 'number' ? { restartEpoch: result.restartEpoch } : {}),
+      ...(result.ok
+        ? {
+            ...(previousRuntimeEpoch ? { previousRuntimeEpoch } : {}),
+            ...(result.applied ? { applied: result.applied } : {}),
+          }
+        : { ...(result.rejected ? { rejected: true } : {}), error: result.error }),
+    });
+  } catch {
+    // Link not connected; server late-ack / sync tracker handles disconnect.
+  }
+}
+
+function buildAppliedRestartState(record: SessionRecord): AppliedSessionRestartState {
+  return {
+    agentType: record.agentType,
+    ccPreset: record.ccPreset ?? null,
+    requestedModel: record.requestedModel ?? null,
+    activeModel: record.activeModel ?? record.modelDisplay ?? null,
+    modelDisplay: record.modelDisplay ?? null,
+    runtimeType: record.runtimeType ?? null,
+    providerId: record.providerId ?? null,
+    cwd: record.projectDir ?? null,
+    label: record.label ?? null,
+    description: record.description ?? null,
+    effort: record.effort ?? null,
+    transportConfig: record.transportConfig ?? null,
+    runtimeEpoch: record.runtimeEpoch ?? null,
+  };
+}
+
+function isRestartDeadlineExpired(deadlineAt: unknown): boolean {
+  return typeof deadlineAt === 'number' && Number.isFinite(deadlineAt) && Date.now() >= deadlineAt;
+}
+
 async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   if (sessionName) {
+    const restartEpoch = typeof cmd.restartEpoch === 'number' ? cmd.restartEpoch : undefined;
+    const deadlineAt = typeof cmd.deadlineAt === 'number' && Number.isFinite(cmd.deadlineAt) ? cmd.deadlineAt : undefined;
     const record = getSession(sessionName);
     if (
       isParticipantSharedActor(cmd)
@@ -3573,16 +3643,28 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
         sessionName,
         message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
       });
+      sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: PARTICIPANT_SHELL_FORBIDDEN_REASON, restartEpoch });
       return;
     }
     if (!record) {
       logger.warn({ sessionName }, 'session.restart: session not found in store');
+      sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: 'session_not_found', restartEpoch });
+      return;
+    }
+    if (isRestartDeadlineExpired(deadlineAt)) {
+      logger.warn({ sessionName, deadlineAt }, 'session.restart aborted before queue lock: deadline expired');
+      sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: 'restart_timeout_before_start', restartEpoch });
       return;
     }
     try {
       await runExclusiveSessionRelaunch(sessionName, async () => {
         try {
+          if (isRestartDeadlineExpired(deadlineAt)) {
+            sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: 'restart_timeout_before_start', restartEpoch });
+            return;
+          }
           const liveRecord = getSession(sessionName) ?? record;
+          const previousRuntimeEpoch = liveRecord.runtimeEpoch ?? null;
           if (isParticipantSharedActor(cmd) && isShellLikeAgentType(liveRecord.agentType)) {
             logger.warn({ sessionName, currentAgentType: liveRecord.agentType }, 'session.restart rejected inside lock: participant_shell_forbidden');
             serverLink.send({
@@ -3592,6 +3674,7 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
               sessionName,
               message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
             });
+            sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: PARTICIPANT_SHELL_FORBIDDEN_REASON, restartEpoch });
             return;
           }
           await relaunchSessionWithSettings(liveRecord, {
@@ -3602,15 +3685,38 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
             requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
             effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
             transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
-            ...('ccPreset' in cmd ? { ccPreset: (cmd.ccPreset as string | null) } : {}),
+            ...('ccPreset' in cmd && cmd.ccPreset !== undefined
+              ? { ccPreset: typeof cmd.ccPreset === 'string' && cmd.ccPreset.trim() ? cmd.ccPreset.trim() : null }
+              : {}),
+          }, ...(deadlineAt !== undefined ? [{ deadlineAt }] : []));
+          const liveAfter = getSession(sessionName) ?? liveRecord;
+          sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, {
+            ok: true,
+            applied: buildAppliedRestartState(liveAfter),
+            restartEpoch,
+            previousRuntimeEpoch,
           });
           await handleGetSessions(serverLink);
           logger.info({ sessionName, agentType: cmd.agentType ?? record.agentType }, 'Session relaunched via settings');
         } catch (err) {
+          if (err instanceof Error && err.name === 'RestartBeforeStartTimeoutError') {
+            logger.warn({ sessionName, deadlineAt }, 'session.restart aborted before destructive teardown: deadline expired');
+            sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: err.message, restartEpoch });
+            return;
+          }
           logger.error({ sessionName, err }, 'session.restart(sessionName) failed');
           const message = describeTransportSendError(err);
           emitSessionInlineError(sessionName, message);
-          try { serverLink.send({ type: 'session.error', project: record.projectName, message }); } catch { /* ignore */ }
+          try {
+            serverLink.send({
+              type: 'session.error',
+              project: record.projectName,
+              session: sessionName,
+              sessionName,
+              message,
+            });
+          } catch { /* ignore */ }
+          sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: message, restartEpoch });
           await handleGetSessions(serverLink);
           throw err;
         }
@@ -9104,6 +9210,8 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
     return;
   }
   const record = getSession(sName);
+  const restartEpoch = typeof cmd.restartEpoch === 'number' ? cmd.restartEpoch : undefined;
+  const deadlineAt = typeof cmd.deadlineAt === 'number' && Number.isFinite(cmd.deadlineAt) ? cmd.deadlineAt : undefined;
   if (
     isParticipantSharedActor(cmd)
     && (
@@ -9120,26 +9228,41 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
       sessionName: sName,
       message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
     });
+    sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: PARTICIPANT_SHELL_FORBIDDEN_REASON, restartEpoch });
     return;
   }
   if (!record) {
     logger.warn({ sessionName: sName }, 'subsession.restart: session not found in store');
+    sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: 'session_not_found', restartEpoch });
     return;
   }
   if ((isIncognitoSession(record) || isIncognitoSessionName(sName))
     && (record.state === 'error' || record.state === 'stopped' || !getTransportRuntime(sName))) {
     logger.warn({ sessionName: sName }, 'subsession.restart: refusing to restart dead incognito sub-session');
+    const message = 'Incognito session cannot be restored; start a new session.';
     serverLink.send({
       type: 'session.error',
       project: record.projectName,
-      message: 'Incognito session cannot be restored; start a new session.',
+      session: sName,
+      sessionName: sName,
+      message,
     });
+    sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: message, restartEpoch });
+    return;
+  }
+  if (isRestartDeadlineExpired(deadlineAt)) {
+    logger.warn({ sessionName: sName, deadlineAt }, 'subsession.restart aborted before queue lock: deadline expired');
+    sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: 'restart_timeout_before_start', restartEpoch });
     return;
   }
   const id = sName.replace(/^deck_sub_/, '');
   try {
     await runExclusiveSessionRelaunch(sName, async () => {
       try {
+        if (isRestartDeadlineExpired(deadlineAt)) {
+          sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: 'restart_timeout_before_start', restartEpoch });
+          return;
+        }
         const liveRecord = getSession(sName) ?? record;
         if (isParticipantSharedActor(cmd) && isShellLikeAgentType(liveRecord.agentType)) {
           logger.warn({ sessionName: sName, currentAgentType: liveRecord.agentType }, 'subsession.restart rejected inside lock: participant_shell_forbidden');
@@ -9150,9 +9273,11 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
             sessionName: sName,
             message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
           });
+          sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: PARTICIPANT_SHELL_FORBIDDEN_REASON, restartEpoch });
           return;
         }
         const effectiveRecord = (await recoverOpenCodeSessionRecord(liveRecord)) ?? liveRecord;
+        const previousRuntimeEpoch = effectiveRecord.runtimeEpoch ?? liveRecord.runtimeEpoch ?? null;
         await relaunchSessionWithSettings(effectiveRecord, {
           agentType: (cmd.agentType as any) ?? undefined,
           projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
@@ -9161,19 +9286,63 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
           requestedModel: ('requestedModel' in cmd ? (cmd.requestedModel as string | null) : undefined),
           effort: ('effort' in cmd ? (cmd.effort as any) : undefined),
           transportConfig: ('transportConfig' in cmd ? (cmd.transportConfig as Record<string, unknown> | null) : undefined),
-          ...('ccPreset' in cmd ? { ccPreset: (cmd.ccPreset as string | null) } : {}),
+          ...('ccPreset' in cmd && cmd.ccPreset !== undefined
+            ? { ccPreset: typeof cmd.ccPreset === 'string' && cmd.ccPreset.trim() ? cmd.ccPreset.trim() : null }
+            : {}),
+        }, ...(deadlineAt !== undefined ? [{ deadlineAt }] : []));
+        const liveAfter = getSession(sName) ?? liveRecord;
+        sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, {
+          ok: true,
+          applied: buildAppliedRestartState(liveAfter),
+          restartEpoch,
+          previousRuntimeEpoch,
         });
         try {
           await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sName));
         } catch { /* not connected */ }
       } catch (e: unknown) {
+        if (e instanceof Error && e.name === 'RestartBeforeStartTimeoutError') {
+          logger.warn({ sessionName: sName, deadlineAt }, 'subsession.restart aborted before destructive teardown: deadline expired');
+          sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: e.message, restartEpoch });
+          return;
+        }
         logger.error({ err: e, sessionName: sName }, 'subsession.restart failed');
+        const message = describeTransportSendError(e);
+        emitSessionInlineError(sName, message);
+        const liveAfter = getSession(sName) ?? record;
+        try {
+          serverLink.send({
+            type: 'session.error',
+            project: liveAfter.projectName,
+            session: sName,
+            sessionName: sName,
+            message,
+          });
+        } catch { /* ignore */ }
+        sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: message, restartEpoch });
+        try {
+          await sendSubSessionSync(serverLink, id, undefined, getSubSessionSyncOptions(sName));
+        } catch { /* not connected */ }
         throw e;
       }
     });
   } catch {
-    // Failure already logged; keep command handler alive for future sends.
+    // Failure already surfaced via session.error + corrective subsession.sync.
   }
+}
+
+function isSubSessionSyncPayloadCurrent(payload: Record<string, unknown>): boolean {
+  const id = typeof payload.id === 'string' ? payload.id : '';
+  if (!id) return false;
+  const live = getSession(`deck_sub_${id}`);
+  if (!live) return false;
+  if ('runtimeEpoch' in payload && (payload.runtimeEpoch ?? null) !== (live.runtimeEpoch ?? null)) {
+    return false;
+  }
+  if ('sessionInstanceId' in payload && (payload.sessionInstanceId ?? null) !== (live.sessionInstanceId ?? null)) {
+    return false;
+  }
+  return true;
 }
 
 async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -9200,10 +9369,13 @@ async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLi
   };
   await Promise.all(Array.from({ length: workerCount }, worker));
 
-  const validPayloads = payloads.filter((p): p is Record<string, unknown> => p !== null);
+  const validPayloads = payloads.filter(
+    (p): p is Record<string, unknown> => p !== null && isSubSessionSyncPayloadCurrent(p),
+  );
   if (cmd.supportsSyncBatch === true) {
     for (let i = 0; i < validPayloads.length; i += SUBSESSION_SYNC_BATCH_MAX_ITEMS) {
-      const items = validPayloads.slice(i, i + SUBSESSION_SYNC_BATCH_MAX_ITEMS);
+      const items = validPayloads.slice(i, i + SUBSESSION_SYNC_BATCH_MAX_ITEMS).filter(isSubSessionSyncPayloadCurrent);
+      if (items.length === 0) continue;
       try {
         serverLink.send({ type: SUBSESSION_SYNC_BATCH_MSG, items });
       } catch (e) {
@@ -9215,6 +9387,7 @@ async function handleSubSessionRebuildAll(cmd: Record<string, unknown>, serverLi
 
   // Backward-compatible fallback for older servers that only speak individual `subsession.sync`.
   for (const payload of validPayloads) {
+    if (!isSubSessionSyncPayloadCurrent(payload)) continue;
     try {
       serverLink.send(payload);
     } catch (e) {
@@ -14234,8 +14407,8 @@ export async function listProviderSessions(providerId: string): Promise<Array<{ 
 // ── CC env presets ────────────────────────────────────────────────────────
 
 async function handleCcPresetsList(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const { loadPresets } = await import('./cc-presets.js');
-  const presets = await loadPresets();
+  const { loadPresetsWithVersion } = await import('./cc-presets.js');
+  const { presets, version } = await loadPresetsWithVersion();
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId.trim() : '';
   const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : '';
   serverLink.send({
@@ -14243,12 +14416,14 @@ async function handleCcPresetsList(cmd: Record<string, unknown>, serverLink: Ser
     ...(requestId ? { requestId } : {}),
     ...(sessionName ? { sessionName } : {}),
     presets,
+    version,
   });
 }
 
 async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const presets = Array.isArray(cmd.presets) ? cmd.presets as CcPreset[] : undefined;
+  const expectedVersion = typeof cmd.expectedVersion === 'string' ? cmd.expectedVersion : undefined;
   if (!presets) {
     serverLink.send({
       type: CC_PRESET_MSG.SAVE_RESPONSE,
@@ -14258,11 +14433,29 @@ async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: Ser
     });
     return;
   }
-  const { savePresets } = await import('./cc-presets.js');
+  const { CcPresetConflictError, savePresetsVersioned } = await import('./cc-presets.js');
   try {
-    await savePresets(presets);
-    serverLink.send({ type: CC_PRESET_MSG.SAVE_RESPONSE, ...(requestId ? { requestId } : {}), ok: true });
+    const saved = await savePresetsVersioned(presets, expectedVersion);
+    serverLink.send({
+      type: CC_PRESET_MSG.SAVE_RESPONSE,
+      ...(requestId ? { requestId } : {}),
+      ok: true,
+      version: saved.version,
+      presets: saved.presets,
+    });
   } catch (err) {
+    if (err instanceof CcPresetConflictError) {
+      serverLink.send({
+        type: CC_PRESET_MSG.SAVE_RESPONSE,
+        ...(requestId ? { requestId } : {}),
+        ok: false,
+        conflict: true,
+        version: err.currentVersion,
+        presets: err.currentPresets,
+        error: err.message,
+      });
+      return;
+    }
     logger.error({ err }, 'Failed to save CC presets');
     serverLink.send({
       type: CC_PRESET_MSG.SAVE_RESPONSE,
@@ -14310,20 +14503,26 @@ async function handleCcPresetsDiscoverModels(cmd: Record<string, unknown>, serve
       preset: catalog.preset,
       models: catalog.models,
       endpoint: catalog.endpoint,
+      ...(catalog.presets ? { presets: catalog.presets } : {}),
+      ...(catalog.version ? { version: catalog.version } : {}),
     });
   } catch (error) {
+    const { CcPresetDiscoveryStaleError, loadPresetsWithVersion } = await import('./cc-presets.js');
     const message = error instanceof Error ? error.message : String(error);
-    const updatedPreset = await getPreset(preset.name) ?? {
-      ...preset,
-      modelDiscoveryError: message,
-    };
+    const latest = error instanceof CcPresetDiscoveryStaleError
+      ? { presets: error.currentPresets, version: error.currentVersion }
+      : await loadPresetsWithVersion();
+    const normalizedName = normalizeCcPresetName(preset.name);
+    const updatedPreset = latest.presets.find((item) => normalizeCcPresetName(item.name) === normalizedName);
     serverLink.send({
       type: CC_PRESET_MSG.DISCOVER_MODELS_RESPONSE,
       ...(requestId ? { requestId } : {}),
-      presetName: updatedPreset.name,
+      presetName: updatedPreset?.name ?? preset.name,
       ok: false,
       error: message,
-      preset: updatedPreset,
+      ...(updatedPreset ? { preset: updatedPreset } : {}),
+      presets: latest.presets,
+      version: latest.version,
     });
   }
 }

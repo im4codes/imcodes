@@ -36,6 +36,7 @@ const resolveSessionIdentityProjectKeyMock = vi.fn<(sessionName: string) => stri
 const isDaemonConnectedMock = vi.fn(() => true);
 const resolveSessionAgentTypeMock = vi.fn<(name: string) => Promise<string | null>>(async () => null);
 const invalidateSessionAgentTypeCacheMock = vi.fn();
+let sendSessionRestartCommandMock: ((frame: Record<string, unknown>) => Promise<{ ok: boolean; error?: string }>) | undefined;
 const sendSessionIdentityLocalRequestMock = vi.fn(async (
   _requestId: string,
   payload: { op: 'get' | 'set' | 'delete'; scope: string; scopeKey: string; content?: string },
@@ -89,6 +90,7 @@ vi.mock('../src/ws/bridge.js', () => ({
       sendSessionIdentityLocalRequest: sendSessionIdentityLocalRequestMock,
       resolveSessionAgentType: resolveSessionAgentTypeMock,
       invalidateSessionAgentTypeCache: invalidateSessionAgentTypeCacheMock,
+      ...(sendSessionRestartCommandMock ? { sendSessionRestartCommand: sendSessionRestartCommandMock } : {}),
     }),
   },
 }));
@@ -568,6 +570,142 @@ describe('session-mgmt persistence routes', () => {
       cwd: '/tmp/next',
       description: 'next persona',
     });
+  });
+
+  it('PATCH /sessions/:name rejects without updating DB when daemon restart preflight fails', async () => {
+    const sendSessionRestartCommand = vi.fn().mockResolvedValue({
+      ok: false,
+      error: 'Cannot safely forward model "bad" through unparsed Windows batch file',
+    });
+    sendSessionRestartCommandMock = sendSessionRestartCommand;
+    try {
+      const app = await buildApp();
+      const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentType: 'claude-code',
+          requestedModel: 'm %TEMP%',
+          ccPreset: 'CustomPreset',
+        }),
+      });
+
+      expect(res.status).toBe(422);
+      expect(await res.json()).toEqual({
+        error: 'Cannot safely forward model "bad" through unparsed Windows batch file',
+      });
+      expect(sendSessionRestartCommand).toHaveBeenCalledTimes(1);
+      expect(mockUpdateSession).not.toHaveBeenCalled();
+    } finally {
+      sendSessionRestartCommandMock = undefined;
+    }
+  });
+
+  it('PATCH /sessions/:name commits daemon-applied fallback model (m1 instead of m2) and returns 202 when restart response is pending', async () => {
+    const applied = {
+      agentType: 'qwen',
+      ccPreset: 'PresetA',
+      requestedModel: 'm1',
+      activeModel: 'm1',
+      modelDisplay: 'm1',
+      runtimeType: 'transport',
+      providerId: 'qwen',
+      cwd: '/tmp/proj',
+      label: null,
+      description: null,
+      effort: null,
+      transportConfig: null,
+      runtimeEpoch: 'epoch-1',
+    };
+    sendSessionRestartCommandMock = vi.fn(async (_frame, opts?: { persistApplied?: (a: typeof applied) => Promise<void> }) => {
+      await opts?.persistApplied?.(applied);
+      return { status: 'committed' as const, applied };
+    });
+    try {
+      const app = await buildApp();
+      const res = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentType: 'qwen',
+          ccPreset: 'PresetA',
+          requestedModel: 'm2',
+          activeModel: null,
+        }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true, applied });
+      expect(mockUpdateSession).toHaveBeenCalledWith(
+        mockDb,
+        'srv-1',
+        'deck_proj_brain',
+        expect.objectContaining({
+          requested_model: 'm1',
+          active_model: 'm1',
+        }),
+      );
+
+      // Timeout/pending -> 202 (never 502) and does NOT overwrite DB with stale raw m2
+      mockUpdateSession.mockClear();
+      sendSessionRestartCommandMock = vi.fn(async () => ({
+        status: 'pending' as const,
+        requestId: 'req-pending-1',
+        restartEpoch: 2,
+      }));
+      const pendingRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentType: 'qwen',
+          ccPreset: 'PresetA',
+          requestedModel: 'm2',
+        }),
+      });
+      expect(pendingRes.status).toBe(202);
+      expect(await pendingRes.json()).toEqual({ ok: false, pending: true, requestId: 'req-pending-1' });
+      expect(mockUpdateSession).not.toHaveBeenCalled();
+
+      // Superseded -> 200 { ok: false, superseded: true } without secondary persistApplied or raw updateSession fallback
+      mockUpdateSession.mockClear();
+      sendSessionRestartCommandMock = vi.fn(async () => ({ status: 'superseded' as const }));
+      const supersededRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentType: 'qwen',
+          ccPreset: null,
+          requestedModel: 'stale-m',
+        }),
+      });
+      expect(supersededRes.status).toBe(200);
+      expect(await supersededRes.json()).toEqual({ ok: false, superseded: true });
+      expect(mockUpdateSession).not.toHaveBeenCalled();
+
+      // Plain agentType switch WITHOUT ccPreset bypasses confirmation protocol on modern daemon
+      mockUpdateSession.mockClear();
+      const plainSpy = vi.fn(async () => ({ status: 'committed' as const, applied }));
+      sendSessionRestartCommandMock = plainSpy;
+      const plainRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentType: 'codex-sdk',
+          requestedModel: 'gpt-5',
+        }),
+      });
+      expect(plainRes.status).toBe(200);
+      expect(await plainRes.json()).toEqual({ ok: true });
+      expect(plainSpy).not.toHaveBeenCalled();
+      expect(mockUpdateSession).toHaveBeenCalledTimes(1);
+      expect(sendToDaemonMock).toHaveBeenCalledWith(JSON.stringify({
+        type: 'session.restart',
+        sessionName: 'deck_proj_brain',
+        agentType: 'codex-sdk',
+        requestedModel: 'gpt-5',
+      }));
+    } finally {
+      sendSessionRestartCommandMock = undefined;
+    }
   });
 
   it('PATCH /sessions/:name relays transport-config updates to the daemon without a restart', async () => {
@@ -2446,6 +2584,56 @@ describe('session-mgmt persistence routes', () => {
       body: JSON.stringify({ sessionName: 'deck_sub_subsh1', text: 'id' }),
     });
     expect(ownerSend.status).toBe(200);
+  });
+
+  it('PATCH /sessions/:name relays session.restart when ccPreset changes (set or explicitly cleared to null) and validates type', async () => {
+    const app = await buildApp();
+
+    // 1. Applying a ccPreset on the same SDK relays session.restart without agentType or session.relabel
+    const setRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ccPreset: '  MiniMax  ', requestedModel: 'MiniMax-M2.7', activeModel: null }),
+    });
+    expect(setRes.status).toBe(200);
+    expect(sendToDaemonMock).toHaveBeenCalledTimes(1);
+    const setPayload = JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]));
+    expect(setPayload).toEqual({
+      type: 'session.restart',
+      sessionName: 'deck_proj_brain',
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
+      activeModel: null,
+    });
+    sendToDaemonMock.mockClear();
+
+    // 2. Explicitly clearing ccPreset to null relays session.restart with ccPreset: null
+    const clearRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentType: 'claude-code-sdk', ccPreset: null, requestedModel: null, activeModel: null }),
+    });
+    expect(clearRes.status).toBe(200);
+    expect(sendToDaemonMock).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toEqual({
+      type: 'session.restart',
+      sessionName: 'deck_proj_brain',
+      agentType: 'claude-code-sdk',
+      ccPreset: null,
+      requestedModel: null,
+      activeModel: null,
+    });
+    sendToDaemonMock.mockClear();
+
+    // 3. Invalid non-string non-null ccPreset returns 400
+    const badRes = await app.request('/api/server/srv-1/sessions/deck_proj_brain', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ccPreset: 123 }),
+    });
+    expect(badRes.status).toBe(400);
+    expect(await badRes.json()).toEqual({ error: 'invalid_cc_preset' });
+    expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
   it('rejects PUT /sessions/:name, shell relabel/rename, and mixed unbounded P2P broadcasts for whole-server participants while keeping pure-LLM & owner paths', async () => {

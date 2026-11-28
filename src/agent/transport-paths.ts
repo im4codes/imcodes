@@ -40,32 +40,91 @@ export function canonicalizeTransportCwd(cwd?: string): string | undefined {
  *  This helper walks PATH manually and tries PATHEXT extensions FIRST so we
  *  prefer `codex.cmd` over the extensionless `codex` shim.  Returns the
  *  absolute path if found, or the original name if not. */
-export function resolveBinaryOnWindows(name: string): string {
-  if (process.platform !== 'win32') return name;
-  // Already absolute and exists? Use as-is.
-  if (path.isAbsolute(name) && existsSync(name)) return name;
+const SUPPORTED_WIN_BINARY_EXTS = new Set(['.com', '.exe', '.bat', '.cmd']);
+
+/** Case-insensitive Windows env lookup (prefers exact casing when both exist). */
+export function getWindowsEnvValue(env: NodeJS.ProcessEnv, key: string): string | undefined {
+  const exact = env[key];
+  if (typeof exact === 'string') return exact;
+  const target = key.toLowerCase();
+  for (const [k, v] of Object.entries(env)) {
+    if (k.toLowerCase() === target && typeof v === 'string') return v;
+  }
+  return undefined;
+}
+
+/** Shallow-copy env omitting keys matched case-insensitively. */
+export function omitWindowsEnvKeys(env: NodeJS.ProcessEnv, ...keys: string[]): NodeJS.ProcessEnv {
+  const blocked = new Set(keys.map((k) => k.toLowerCase()));
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (!blocked.has(k.toLowerCase())) out[k] = v;
+  }
+  return out;
+}
+
+/** Merge Windows env maps case-insensitively while preserving override key casing. */
+export function mergeWindowsEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  extraEnv?: Record<string, string>,
+): Record<string, string> {
+  const merged: Record<string, string> = {};
+  const keyMap = new Map<string, string>();
+  for (const [k, v] of Object.entries(baseEnv)) {
+    if (typeof v !== 'string') continue;
+    const lower = k.toLowerCase();
+    const prev = keyMap.get(lower);
+    if (prev && prev !== k) delete merged[prev];
+    merged[k] = v;
+    keyMap.set(lower, k);
+  }
+  if (extraEnv) {
+    for (const [k, v] of Object.entries(extraEnv)) {
+      const lower = k.toLowerCase();
+      const prev = keyMap.get(lower);
+      if (prev && prev !== k) delete merged[prev];
+      merged[k] = v;
+      keyMap.set(lower, k);
+    }
+  }
+  return merged;
+}
+
+export function resolveBinaryOnWindows(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform !== 'win32') return name;
+  // Already absolute and exists as a regular file? Use as-is.
+  if (path.isAbsolute(name) && isRegularFileSync(name)) return name;
   // Windows path/ext delimiter is always ';'.  Hard-code it instead of
   // importing `delimiter` from node:path because that constant is the host
   // OS delimiter (':' on Linux), which breaks tests that fake
   // `process.platform = 'win32'` on a posix CI runner.
   const WIN_DELIMITER = ';';
   const pathDirs = uniqueNonEmpty([
-    ...(process.env.PATH ?? '').split(WIN_DELIMITER),
-    ...getWindowsGlobalCliDirs(),
+    ...(getWindowsEnvValue(env, 'PATH') ?? '').split(WIN_DELIMITER),
+    ...getWindowsGlobalCliDirs(env),
   ]);
-  const pathExtRaw = process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
-  const exts = uniqueNonEmpty(pathExtRaw.split(WIN_DELIMITER).flatMap((e) => [e.toLowerCase(), e]));
-  const hasExt = exts.some((e) => name.toLowerCase().endsWith(e.toLowerCase()));
-  // If the user already gave a known extension, try it directly.  Otherwise
-  // try every PATHEXT (so we hit `.cmd` before the extensionless Unix shim),
-  // then fall back to the bare name as a last resort.
-  const extsToTry = hasExt ? [''] : [...exts, ''];
+  const pathExtRaw = getWindowsEnvValue(env, 'PATHEXT') ?? '.COM;.EXE;.BAT;.CMD';
+  const exts = uniqueNonEmpty(
+    pathExtRaw
+      .split(WIN_DELIMITER)
+      .filter((e) => SUPPORTED_WIN_BINARY_EXTS.has(e.toLowerCase()))
+      .flatMap((e) => [e.toLowerCase(), e]),
+  );
+  const effectiveExts = exts.length > 0 ? exts : ['.com', '.exe', '.bat', '.cmd'];
+  const hasExt = SUPPORTED_WIN_BINARY_EXTS.has(path.extname(name).toLowerCase());
+  // Only match Windows launchable binary extensions (.com/.exe/.bat/.cmd);
+  // never pick up an extensionless npm Unix shell script on Windows.
+  const extsToTry = hasExt ? [''] : effectiveExts;
   for (const dir of pathDirs) {
     for (const ext of extsToTry) {
       // Use path.join (native) — works on both Windows runtime and tests
       // that fake `process.platform = 'win32'` on a posix host.
       const candidate = path.join(dir, name + ext);
-      if (existsSync(candidate)) return candidate;
+      if (isRegularFileSync(candidate)) return candidate;
     }
   }
   return name;
@@ -75,36 +134,47 @@ function uniqueNonEmpty(values: Array<string | undefined>): string[] {
   return [...new Set(values.filter((value): value is string => typeof value === 'string' && value.trim().length > 0))];
 }
 
-function getWindowsGlobalCliDirs(): string[] {
+function getWindowsGlobalCliDirs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const appData = getWindowsEnvValue(env, 'APPDATA');
+  const userProfile = getWindowsEnvValue(env, 'USERPROFILE');
   return uniqueNonEmpty([
-    process.env.APPDATA ? path.join(process.env.APPDATA, 'npm') : undefined,
-    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, 'AppData', 'Roaming', 'npm') : undefined,
+    appData ? path.join(appData, 'npm') : undefined,
+    userProfile ? path.join(userProfile, 'AppData', 'Roaming', 'npm') : undefined,
   ]);
 }
 
-function getWindowsClaudeInstallCandidates(name: string): string[] {
+export function getWindowsClaudeInstallCandidates(name: string, env: NodeJS.ProcessEnv = process.env): string[] {
   const basename = path.basename(name);
-  const hasExt = /\.[^\\/]+$/.test(basename);
-  const fileNames = hasExt ? [basename] : [basename, `${basename}.exe`, `${basename}.cmd`, `${basename}.bat`];
+  const hasExt = /\.(?:com|exe|cmd|bat)$/i.test(basename);
+  const fileNames = hasExt ? [basename] : [`${basename}.exe`, `${basename}.com`, `${basename}.cmd`, `${basename}.bat`];
+  const userProfile = getWindowsEnvValue(env, 'USERPROFILE');
+  const localAppData = getWindowsEnvValue(env, 'LOCALAPPDATA');
+  const programFiles = getWindowsEnvValue(env, 'ProgramFiles');
+  const programFilesX86 = getWindowsEnvValue(env, 'ProgramFiles(x86)');
   const dirs = uniqueNonEmpty([
-    ...getWindowsGlobalCliDirs(),
-    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, '.local', 'bin') : undefined,
-    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Claude') : undefined,
-    process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'Programs', 'Claude Code') : undefined,
-    process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Claude') : undefined,
-    process.env.ProgramFiles ? path.join(process.env.ProgramFiles, 'Claude Code') : undefined,
-    process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'Claude') : undefined,
-    process.env['ProgramFiles(x86)'] ? path.join(process.env['ProgramFiles(x86)'], 'Claude Code') : undefined,
+    ...getWindowsGlobalCliDirs(env),
+    userProfile ? path.join(userProfile, '.local', 'bin') : undefined,
+    localAppData ? path.join(localAppData, 'Programs', 'Claude') : undefined,
+    localAppData ? path.join(localAppData, 'Programs', 'Claude Code') : undefined,
+    programFiles ? path.join(programFiles, 'Claude') : undefined,
+    programFiles ? path.join(programFiles, 'Claude Code') : undefined,
+    programFilesX86 ? path.join(programFilesX86, 'Claude') : undefined,
+    programFilesX86 ? path.join(programFilesX86, 'Claude Code') : undefined,
   ]);
   return dirs.flatMap((dir) => fileNames.map((fileName) => path.join(dir, fileName)));
 }
 
-export function resolveBinaryWithWindowsFallbacks(name: string, windowsCandidates: string[] = []): string {
-  if (process.platform !== 'win32') return name;
+export function resolveBinaryWithWindowsFallbacks(
+  name: string,
+  windowsCandidates: string[] = [],
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  if (platform !== 'win32') return name;
   for (const candidate of windowsCandidates) {
-    if (candidate && existsSync(candidate)) return candidate;
+    if (candidate && isRegularFileSync(candidate)) return candidate;
   }
-  return resolveBinaryOnWindows(name);
+  return resolveBinaryOnWindows(name, env, platform);
 }
 
 /** Common per-user `claude` install locations on macOS/Linux, checked when the

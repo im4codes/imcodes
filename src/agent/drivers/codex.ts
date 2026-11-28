@@ -1,11 +1,13 @@
 import type { AgentDriver, LaunchOptions } from './base.js';
 import { cwdPrefix } from './base.js';
 import { codexNativeAgentFenceFlags } from '../native-agent-fence.js';
+import type { WinLaunchSpec } from '../win-launch.js';
 import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../../shared/cron-types.js';
 import { quoteShellBinary } from '../opencode-cli-path.js';
 import { resolveCodexPathForPty } from '../transport-paths.js';
+import { quoteShellArg } from '../../util/shell-quote.js';
 
 // Startup prompts to auto-dismiss after launch
 const STARTUP_PROMPTS: Array<{
@@ -17,15 +19,47 @@ const STARTUP_PROMPTS: Array<{
   { pattern: /update available.*->|skip until next version/i, keys: ['Down', 'Down', 'Enter'], label: 'update' },
 ];
 
+function buildCommonCodexArgs(opts?: LaunchOptions): string[] {
+  const args: string[] = [];
+  if (opts?.codexModel) {
+    args.push('-m', opts.codexModel);
+  }
+  args.push(
+    '-c',
+    `developer_instructions=${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`,
+    '-s',
+    'danger-full-access',
+  );
+  return args;
+}
+
 export class CodexDriver implements AgentDriver {
   readonly type = 'codex' as const;
   readonly promptChar = '›';
   readonly spinnerChars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧'];
 
+  buildWinLaunchSpec(_sessionName: string, opts?: LaunchOptions): WinLaunchSpec {
+    const common = buildCommonCodexArgs(opts);
+    if (opts?.codexSessionId) {
+      return { primary: { program: 'codex', args: [...common, 'resume', opts.codexSessionId] } };
+    }
+    if (opts?.fresh) {
+      return { primary: { program: 'codex', args: common } };
+    }
+    return {
+      primary: { program: 'codex', args: [...common, 'resume', '--last'] },
+      fallback: { program: 'codex', args: common },
+    };
+  }
+
+  buildWinResumeSpec(sessionName: string, opts?: LaunchOptions): WinLaunchSpec {
+    return this.buildWinLaunchSpec(sessionName, opts);
+  }
+
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
     const bin = quoteShellBinary(resolveCodexPathForPty('codex'));
-    const modelFlag = opts?.codexModel ? ` -m ${JSON.stringify(opts.codexModel)}` : '';
+    const modelFlag = opts?.codexModel ? ` -m ${quoteShellArg(opts.codexModel, opts?.platform)}` : '';
     const cronTrust = ` -c ${JSON.stringify(`developer_instructions=${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`)}`;
     // Global flags, so they precede `resume`. They fence only threads this
     // process CREATES; a resumed thread keeps its own creation-time state.

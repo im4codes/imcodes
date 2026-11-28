@@ -212,6 +212,8 @@ import { shortModelLabel } from '../model-label.js';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
 import { QuickSdkModelMenu, type QuickSdkSavedFields } from './QuickSdkModelMenu.js';
+import type { AppliedSessionRestartState } from '@shared/session-restart-contract.js';
+import type { SessionSwitchBaseline, SessionSwitchComparable } from '../session-state-updates.js';
 import { isQuickSdkSwitchAllowed, supportsQuickModelTrigger } from './quick-sdk-model.js';
 import { findQuickSdkChoice, getQuickSwitchableSdkGroups } from './quick-sdk-model.js';
 import { getSessionAgentLabel } from './session-agent-options.js';
@@ -985,6 +987,14 @@ interface Props {
   onTransportConfigSaved?: (transportConfig: Record<string, unknown> | null) => void;
   /** Optional local optimistic update when quick SDK+model switcher changes provider/model. */
   onSessionSaved?: (fields: QuickSdkSavedFields) => void;
+  getLatestSession?: () => SessionSwitchComparable | null | undefined;
+  onSessionSwitchCommit?: (
+    sessionName: string,
+    baseline: SessionSwitchBaseline | null,
+    applied: AppliedSessionRestartState | null,
+  ) => void;
+  /** Open the standalone CC Preset manager dialog (undefined for restricted shared actors). */
+  onOpenCcPresetManager?: () => void;
   /** Gate version-sensitive panels when the loaded frontend is stale. */
   onVersionSensitiveAction?: (featureLabel: string, action: () => void) => void;
   /** Reports the current composer text to parent surfaces (e.g. footer actions). */
@@ -2388,7 +2398,13 @@ const ComposerTargetBubble = memo(function ComposerTargetBubble({
   );
 });
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onOpenVoiceHotwordsSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, hideWorkflowControls = false, onSend, onRemoveOptimisticMessage, onSendFailed, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, taskQuote, onRemoveTaskQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onSessionSaved, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onOpenVoiceHotwordsSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, hideWorkflowControls = false, onSend, onRemoveOptimisticMessage, onSendFailed, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, onOpenNodeGroups, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, taskQuote, onRemoveTaskQuote, pendingPrefillText, onPendingPrefillApplied, pendingSharedUpload, onPendingSharedUploadConsumed, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onSessionSaved, getLatestSession, onSessionSwitchCommit, onOpenCcPresetManager, onVersionSensitiveAction, onComposerTextChange, canManageFileShares = true }: Props) {
+  const latestActiveSessionRef = useRef<SessionInfo | null | undefined>(activeSession);
+  latestActiveSessionRef.current = activeSession;
+  const resolveLiveSession = useCallback(
+    () => getLatestSession?.() ?? latestActiveSessionRef.current,
+    [getLatestSession],
+  );
   const resolvedVoiceHotwordProjectKey = useMemo(
     () => (activeSession?.project ? encodeVoiceHotwordProjectKey(activeSession.project, serverId) : null),
     [activeSession?.project, serverId],
@@ -10391,6 +10407,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 onClose={() => setModelOpen(false)}
                 onAfterAction={onAfterAction}
                 onSessionSaved={onSessionSaved}
+                getLiveSession={resolveLiveSession}
+                onSessionSwitchCommit={onSessionSwitchCommit}
+                onOpenCcPresetManager={onOpenCcPresetManager}
                 onSwitchError={showSendWarning}
               />
             )}
@@ -10431,6 +10450,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 onClose={() => setModelOpen(false)}
                 onAfterAction={onAfterAction}
                 onSessionSaved={onSessionSaved}
+                getLiveSession={resolveLiveSession}
+                onSessionSwitchCommit={onSessionSwitchCommit}
+                onOpenCcPresetManager={onOpenCcPresetManager}
                 onSwitchError={showSendWarning}
               />
             )}
@@ -10488,6 +10510,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 onClose={() => setModelOpen(false)}
                 onAfterAction={onAfterAction}
                 onSessionSaved={onSessionSaved}
+                getLiveSession={resolveLiveSession}
+                onSessionSwitchCommit={onSessionSwitchCommit}
+                onOpenCcPresetManager={onOpenCcPresetManager}
                 onSwitchError={showSendWarning}
               />
             )}
@@ -10526,6 +10551,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 onClose={() => setModelOpen(false)}
                 onAfterAction={onAfterAction}
                 onSessionSaved={onSessionSaved}
+                getLiveSession={resolveLiveSession}
+                onSessionSwitchCommit={onSessionSwitchCommit}
+                onOpenCcPresetManager={onOpenCcPresetManager}
                 onSwitchError={showSendWarning}
               />
             )}
@@ -10571,6 +10599,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                 onClose={() => setModelOpen(false)}
                 onAfterAction={onAfterAction}
                 onSessionSaved={onSessionSaved}
+                getLiveSession={resolveLiveSession}
+                onSessionSwitchCommit={onSessionSwitchCommit}
+                onOpenCcPresetManager={onOpenCcPresetManager}
                 onSwitchError={showSendWarning}
               />
             )}
