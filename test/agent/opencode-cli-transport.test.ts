@@ -673,6 +673,9 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     `, 'utf8');
     const wrapper = makeFakeExecutable(join(root, 'bin'), 'opencode', `#!/bin/sh\nexec "${process.execPath}" "${hangScript}" "$@"\n`);
 
+    // Pre-warm dynamic import so cold Vite ESM transform doesn't eat into the 1.5s startup timeout budget under parallel test runs
+    await import('@opencode/client/promise');
+
     // 1. Timeout covers hung server.info() AFTER listening URL is printed
     await expect(startOpenCodeV2CliHost({
       binaryPath: wrapper,
