@@ -26,6 +26,7 @@ import { AGENT_DELEGATION_NOTIFICATION_RESULTS } from '../../shared/agent-delega
 import { OPENCODE_SDK_EFFORT_LEVELS } from '../../shared/effort-levels.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import { DEFAULT_OPENCODE_MODEL_ID } from '../../src/shared/models/options.js';
+import logger from '../../src/util/logger.js';
 
 vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -5695,9 +5696,9 @@ describe('OpenCodeSdkProvider', () => {
     expect(MCP_STARTUP_TIMEOUT_MS).toBe(20_000);
   });
 
-  it('preserves healthy bound MCP servers across partial timeout/failure, drains stderr, and recovers on retry', async () => {
+  it('preserves healthy bound MCP servers across partial failure, drains stderr past backpressure, and recovers on retry', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'imcodes-mcp-coord-'));
-    const coordinator = new SharedOpenCodeHostMcpCoordinator(1_500);
+    const coordinator = new SharedOpenCodeHostMcpCoordinator();
     const sdkUrl = JSON.stringify(
       pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.js')).href,
     );
@@ -5709,31 +5710,58 @@ describe('OpenCodeSdkProvider', () => {
     );
 
     const healthyCountFile = join(dir, 'healthy-spawns.txt');
+    const healthyPidFile = join(dir, 'healthy.pid');
+    const healthyDrainedFile = join(dir, 'healthy-drained.txt');
     const flakyCountFile = join(dir, 'flaky-spawns.txt');
+    const flakyPidFile = join(dir, 'flaky.pid');
     const healthyScript = join(dir, 'healthy-mcp.mjs');
     const flakyScript = join(dir, 'flaky-mcp.mjs');
 
-    const makeMcpServerSource = (toolName: string, countFile: string, options: { hangFirst?: boolean; noisyStderr?: boolean }) => [
-      `import { appendFileSync, readFileSync } from 'node:fs';`,
+    const makeMcpServerSource = (
+      toolName: string,
+      countFile: string,
+      pidFile: string,
+      options: { failFirstListTools?: boolean; noisyStderrDrainedFile?: string },
+    ) => [
+      `import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';`,
+      `import { once } from 'node:events';`,
       `import { Server } from ${sdkUrl};`,
       `import { StdioServerTransport } from ${stdioUrl};`,
       `import { CallToolRequestSchema, ListToolsRequestSchema } from ${typesUrl};`,
+      `appendFileSync(${JSON.stringify(pidFile)}, process.pid + '\\n');`,
       `appendFileSync(${JSON.stringify(countFile)}, '1\\n');`,
       `const spawnNum = readFileSync(${JSON.stringify(countFile)}, 'utf8').trim().split('\\n').length;`,
-      ...(options.noisyStderr ? [`for (let i = 0; i < 400; i += 1) process.stderr.write('noise-stderr-' + 'x'.repeat(256) + '\\n');`] : []),
-      ...(options.hangFirst ? [`if (spawnNum === 1) { await new Promise(() => {}); }`] : []),
+      ...(options.noisyStderrDrainedFile
+        ? [
+            `const chunk = 'noise-stderr-' + 'x'.repeat(8192) + '\\n';`,
+            `let bytesWritten = 0;`,
+            `for (let i = 0; i < 80; i += 1) {`,
+            `  const ok = process.stderr.write(chunk);`,
+            `  bytesWritten += Buffer.byteLength(chunk);`,
+            `  if (!ok) await once(process.stderr, 'drain');`,
+            `}`,
+            `writeFileSync(${JSON.stringify(options.noisyStderrDrainedFile)}, JSON.stringify({ bytesWritten }));`,
+          ]
+        : []),
       `const server = new Server({ name: ${JSON.stringify(toolName)}, version: '1.0.0' }, { capabilities: { tools: {} } });`,
-      `server.setRequestHandler(ListToolsRequestSchema, async () => ({`,
-      `  tools: [{ name: ${JSON.stringify(toolName)}, description: 'test tool', inputSchema: { type: 'object', properties: {} } }],`,
-      `}));`,
+      `server.setRequestHandler(ListToolsRequestSchema, async () => {`,
+      ...(options.failFirstListTools
+        ? [`  if (spawnNum === 1) throw new Error('transient listTools failure on first spawn');`]
+        : []),
+      `  return { tools: [{ name: ${JSON.stringify(toolName)}, description: 'test tool', inputSchema: { type: 'object', properties: {} } }] };`,
+      `});`,
       `server.setRequestHandler(CallToolRequestSchema, async () => ({`,
       `  content: [{ type: 'text', text: JSON.stringify({ ok: true, tool: ${JSON.stringify(toolName)} }) }],`,
       `}));`,
       `await server.connect(new StdioServerTransport());`,
     ].join('\n');
 
-    writeFileSync(healthyScript, makeMcpServerSource('ping', healthyCountFile, { noisyStderr: true }), 'utf8');
-    writeFileSync(flakyScript, makeMcpServerSource('pong', flakyCountFile, { hangFirst: true }), 'utf8');
+    writeFileSync(
+      healthyScript,
+      makeMcpServerSource('ping', healthyCountFile, healthyPidFile, { noisyStderrDrainedFile: healthyDrainedFile }),
+      'utf8',
+    );
+    writeFileSync(flakyScript, makeMcpServerSource('pong', flakyCountFile, flakyPidFile, { failFirstListTools: true }), 'utf8');
 
     const addedTools = new Map<string, { execute: (input: unknown, ctx: { sessionID: string }) => Promise<unknown> }>();
     const transforms: Array<(editor: { add: (tool: Record<string, unknown>) => void }) => void> = [];
@@ -5761,6 +5789,15 @@ describe('OpenCodeSdkProvider', () => {
       },
     });
 
+    const isPidAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err: any) {
+        return err?.code !== 'ESRCH';
+      }
+    };
+
     try {
       // Empty & all-disabled configs return true without preventing signature cache.
       await expect(coordinator.bindSession('sess-empty', dir, {})).resolves.toBe(true);
@@ -5773,14 +5810,17 @@ describe('OpenCodeSdkProvider', () => {
         flaky: { type: 'local' as const, command: [process.execPath, flakyScript], environment: {}, disabled: false },
       };
 
-      // Initial bind: `healthy` binds cleanly despite large stderr output; `flaky` times out -> returns false.
+      // Initial bind: `healthy` drains >640 KiB of stderr past OS pipe backpressure and binds cleanly; `flaky` fails listTools -> returns false.
       await expect(coordinator.bindSession('sess-partial', dir, specs)).resolves.toBe(false);
       expect(addedTools.has('healthy_ping')).toBe(true);
       expect(addedTools.has('flaky_pong')).toBe(false);
 
+      const { readFileSync } = await import('node:fs');
+      const drained = JSON.parse(readFileSync(healthyDrainedFile, 'utf8')) as { bytesWritten: number };
+      expect(drained.bytesWritten).toBeGreaterThanOrEqual(512 * 1024);
+
       // Retry: `healthy` stays reused (spawn count remains 1), `flaky` spawns #2 and succeeds -> returns true!
       await expect(coordinator.bindSession('sess-partial', dir, specs)).resolves.toBe(true);
-      const { readFileSync } = await import('node:fs');
       expect(readFileSync(healthyCountFile, 'utf8').trim().split('\n')).toHaveLength(1);
       expect(readFileSync(flakyCountFile, 'utf8').trim().split('\n')).toHaveLength(2);
       expect(addedTools.has('healthy_ping')).toBe(true);
@@ -5789,6 +5829,236 @@ describe('OpenCodeSdkProvider', () => {
       const toolsMap: Record<string, unknown> = { healthy_ping: {}, flaky_pong: {} };
       await hookFn?.({ sessionID: 'sess-partial', tools: toolsMap });
       expect(Object.keys(toolsMap)).toEqual(['healthy_ping', 'flaky_pong']);
+    } finally {
+      await coordinator.closeAll();
+      teardown();
+      const { readFileSync } = await import('node:fs');
+      const pids = [healthyPidFile, flakyPidFile]
+        .filter((f) => existsSync(f))
+        .flatMap((f) => readFileSync(f, 'utf8').trim().split('\n').filter(Boolean).map((n) => Number(n)));
+      await vi.waitFor(() => {
+        for (const pid of pids) expect(isPidAlive(pid)).toBe(false);
+      }, { timeout: 3_000 });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('logs OpenCodeRequestTimeoutError and kills hanging MCP child PID on startup timeout', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-mcp-timeout-'));
+    const coordinator = new SharedOpenCodeHostMcpCoordinator(400);
+    const pidFile = join(dir, 'hanging.pid');
+    const hangScript = join(dir, 'hang-mcp.mjs');
+    writeFileSync(
+      hangScript,
+      [
+        `import { writeFileSync } from 'node:fs';`,
+        `writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));`,
+        `// Keep active libuv handle so Node stays alive until killed by coordinator timeout.`,
+        `setInterval(() => {}, 60_000);`,
+      ].join('\n'),
+      'utf8',
+    );
+
+    const warnSpy = vi.mocked(logger.warn);
+    warnSpy.mockClear();
+
+    const isPidAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err: any) {
+        return err?.code !== 'ESRCH';
+      }
+    };
+
+    try {
+      await expect(coordinator.bindSession('sess-timeout', dir, {
+        hanging: { type: 'local', command: [process.execPath, hangScript], environment: {}, disabled: false },
+      })).resolves.toBe(false);
+
+      const timeoutLog = warnSpy.mock.calls.find(([arg, msg]) => (
+        msg === 'OpenCode session MCP startup failed'
+        && (arg as { serverName?: string })?.serverName === 'hanging'
+      ));
+      expect(timeoutLog).toBeDefined();
+      expect((timeoutLog?.[0] as { error?: Error })?.error).toMatchObject({
+        name: 'OpenCodeRequestTimeoutError',
+        message: expect.stringMatching(/MCP (?:connect|listTools) \(hanging\) timed out after 400ms/),
+      });
+
+      const { readFileSync } = await import('node:fs');
+      const pid = Number(readFileSync(pidFile, 'utf8').trim());
+      expect(Number.isInteger(pid) && pid > 0).toBe(true);
+      await vi.waitFor(() => {
+        expect(isPidAlive(pid)).toBe(false);
+      }, { timeout: 3_000 });
+    } finally {
+      await coordinator.closeAll();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it('prevents in-flight retry bindSession from re-registering or leaking child PID after unbindSession or closeAll', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-mcp-race-'));
+    const sdkUrl = JSON.stringify(
+      pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.js')).href,
+    );
+    const stdioUrl = JSON.stringify(
+      pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js')).href,
+    );
+    const typesUrl = JSON.stringify(
+      pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/types.js')).href,
+    );
+
+    const countFile = join(dir, 'gated-spawns.txt');
+    const startedFile = join(dir, 'gated-started.txt');
+    const releaseFile = join(dir, 'gated-release.txt');
+    const pidFile = join(dir, 'gated.pid');
+    const gatedScript = join(dir, 'gated-mcp.mjs');
+    const otherScript = join(dir, 'other-mcp.mjs');
+
+    writeFileSync(
+      gatedScript,
+      [
+        `import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';`,
+        `import { Server } from ${sdkUrl};`,
+        `import { StdioServerTransport } from ${stdioUrl};`,
+        `import { CallToolRequestSchema, ListToolsRequestSchema } from ${typesUrl};`,
+        `appendFileSync(${JSON.stringify(pidFile)}, process.pid + '\\n');`,
+        `appendFileSync(${JSON.stringify(countFile)}, '1\\n');`,
+        `const spawnNum = readFileSync(${JSON.stringify(countFile)}, 'utf8').trim().split('\\n').length;`,
+        `if (spawnNum >= 2) {`,
+        `  writeFileSync(${JSON.stringify(startedFile)}, String(process.pid));`,
+        `  await new Promise((resolve) => {`,
+        `    const timer = setInterval(() => {`,
+        `      if (existsSync(${JSON.stringify(releaseFile)})) { clearInterval(timer); resolve(); }`,
+        `    }, 20);`,
+        `  });`,
+        `}`,
+        `const server = new Server({ name: 'gated', version: '1.0.0' }, { capabilities: { tools: {} } });`,
+        `server.setRequestHandler(ListToolsRequestSchema, async () => {`,
+        `  if (spawnNum === 1) throw new Error('initial failure');`,
+        `  return { tools: [{ name: 'gated_tool', description: 'test tool', inputSchema: { type: 'object', properties: {} } }] };`,
+        `});`,
+        `server.setRequestHandler(CallToolRequestSchema, async () => ({ content: [{ type: 'text', text: 'ok' }] }));`,
+        `await server.connect(new StdioServerTransport());`,
+      ].join('\n'),
+      'utf8',
+    );
+
+    writeFileSync(
+      otherScript,
+      [
+        `import { Server } from ${sdkUrl};`,
+        `import { StdioServerTransport } from ${stdioUrl};`,
+        `import { CallToolRequestSchema, ListToolsRequestSchema } from ${typesUrl};`,
+        `const server = new Server({ name: 'other', version: '1.0.0' }, { capabilities: { tools: {} } });`,
+        `server.setRequestHandler(ListToolsRequestSchema, async () => ({`,
+        `  tools: [{ name: 'keep', description: 'other tool', inputSchema: { type: 'object', properties: {} } }],`,
+        `}));`,
+        `server.setRequestHandler(CallToolRequestSchema, async () => ({ content: [{ type: 'text', text: 'ok' }] }));`,
+        `await server.connect(new StdioServerTransport());`,
+      ].join('\n'),
+      'utf8',
+    );
+
+    const isPidAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err: any) {
+        return err?.code !== 'ESRCH';
+      }
+    };
+
+    const coordinator = new SharedOpenCodeHostMcpCoordinator();
+    const addedTools = new Set<string>();
+    const transforms: Array<(editor: { add: (tool: Record<string, unknown>) => void }) => void> = [];
+    let hookFn: ((request: { sessionID: string; tools: Record<string, unknown> }) => void | Promise<void>) | undefined;
+    const teardown = await coordinator.plugin.setup({
+      location: { directory: dir },
+      tool: {
+        transform: (fn) => { transforms.push(fn); },
+        reload: async () => {
+          addedTools.clear();
+          for (const t of transforms) {
+            t({
+              add: (tool) => {
+                const ns = (tool.options as { namespace?: string } | undefined)?.namespace ?? 'mcp';
+                addedTools.add(`${ns}_${String(tool.name)}`);
+              },
+            });
+          }
+        },
+      },
+      session: {
+        hook: (_event, fn) => { hookFn = fn; },
+      },
+    });
+
+    try {
+      // Unrelated session stays bound and intact when another session unbinds mid-retry.
+      await expect(coordinator.bindSession('sess-other', dir, {
+        other: { type: 'local', command: [process.execPath, otherScript], environment: {}, disabled: false },
+      })).resolves.toBe(true);
+      expect(addedTools.has('other_keep')).toBe(true);
+
+      // Spawn #1 fails initial bind; session has no binding yet.
+      await expect(coordinator.bindSession('sess-race', dir, {
+        gated: { type: 'local', command: [process.execPath, gatedScript], environment: {}, disabled: false },
+      })).resolves.toBe(false);
+      expect(addedTools.has('gated_gated_tool')).toBe(false);
+
+      // Retry (spawn #2) blocks before MCP init completes, then unbindSession races ahead.
+      const retryPromise = coordinator.bindSession('sess-race', dir, {
+        gated: { type: 'local', command: [process.execPath, gatedScript], environment: {}, disabled: false },
+      });
+      await vi.waitFor(() => {
+        expect(existsSync(startedFile)).toBe(true);
+      }, { timeout: 5_000 });
+      const { readFileSync } = await import('node:fs');
+      const retryPid = Number(readFileSync(startedFile, 'utf8').trim());
+
+      await coordinator.unbindSession('sess-race');
+      await vi.waitFor(() => {
+        expect(isPidAlive(retryPid)).toBe(false);
+      }, { timeout: 3_000 });
+
+      writeFileSync(releaseFile, 'go', 'utf8');
+      await expect(retryPromise).resolves.toBe(false);
+      expect(addedTools.has('gated_gated_tool')).toBe(false);
+      expect(addedTools.has('other_keep')).toBe(true);
+
+      const otherTools: Record<string, unknown> = { other_keep: {} };
+      await hookFn?.({ sessionID: 'sess-other', tools: otherTools });
+      expect(Object.keys(otherTools)).toEqual(['other_keep']);
+
+      // Now test closeAll racing with another gated bindSession (spawn #3).
+      rmSync(startedFile, { force: true });
+      rmSync(releaseFile, { force: true });
+      const race2Promise = coordinator.bindSession('sess-race-2', dir, {
+        gated: { type: 'local', command: [process.execPath, gatedScript], environment: {}, disabled: false },
+      });
+      await vi.waitFor(() => {
+        expect(existsSync(startedFile)).toBe(true);
+      }, { timeout: 5_000 });
+      const race2Pid = Number(readFileSync(startedFile, 'utf8').trim());
+
+      await coordinator.closeAll();
+      await vi.waitFor(() => {
+        expect(isPidAlive(race2Pid)).toBe(false);
+      }, { timeout: 3_000 });
+
+      writeFileSync(releaseFile, 'go', 'utf8');
+      await expect(race2Promise).resolves.toBe(false);
+      expect(addedTools.has('gated_gated_tool')).toBe(false);
+      expect(addedTools.has('other_keep')).toBe(false);
+      // After closeAll, further bindSession calls fail cleanly without spawning.
+      const countBefore = readFileSync(countFile, 'utf8').trim().split('\n').length;
+      await expect(coordinator.bindSession('sess-race-after-close', dir, {
+        gated: { type: 'local', command: [process.execPath, gatedScript], environment: {}, disabled: false },
+      })).resolves.toBe(false);
+      expect(readFileSync(countFile, 'utf8').trim().split('\n').length).toBe(countBefore);
     } finally {
       await coordinator.closeAll();
       teardown();

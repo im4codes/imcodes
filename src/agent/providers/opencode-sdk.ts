@@ -380,7 +380,14 @@ export class SharedOpenCodeHostMcpCoordinator {
     directory: string;
     servers: Map<string, BoundSessionMcpServer>;
   }>();
+  private readonly sessionGenerations = new Map<string, number>();
+  private readonly inFlightSessions = new Map<string, Set<{
+    generation: number;
+    cancelled: boolean;
+    cancel: () => Promise<void>;
+  }>>();
   private readonly directoryReloaders = new Map<string, Set<() => Promise<void>>>();
+  private closedAll = false;
 
   constructor(private readonly startupTimeoutMs = MCP_STARTUP_TIMEOUT_MS) {}
 
@@ -497,103 +504,209 @@ export class SharedOpenCodeHostMcpCoordinator {
     directory: string,
     mcpServers: Record<string, OpenCodeMcpServerSpec>,
   ): Promise<boolean> {
-    const dirKey = resolve(directory);
-    const existing = this.sessionBindings.get(providerSessionId);
-    const nextServers = new Map<string, BoundSessionMcpServer>();
-    const toClose: BoundSessionMcpServer[] = [];
+    if (this.closedAll) return false;
 
-    if (existing) {
-      for (const [serverName, bound] of existing.servers.entries()) {
-        const nextSpec = mcpServers[serverName];
-        if (!nextSpec || nextSpec.disabled || JSON.stringify(nextSpec) !== bound.signature) {
-          toClose.push(bound);
-        } else {
-          nextServers.set(serverName, bound);
+    const dirKey = resolve(directory);
+    const generation = (this.sessionGenerations.get(providerSessionId) ?? 0) + 1;
+    this.sessionGenerations.set(providerSessionId, generation);
+
+    const existingAttempts = [...(this.inFlightSessions.get(providerSessionId) ?? [])];
+    for (const prev of existingAttempts) {
+      await prev.cancel().catch(() => {});
+    }
+    if (this.closedAll || this.sessionGenerations.get(providerSessionId) !== generation) {
+      return false;
+    }
+
+    const newlyCreatedServers: BoundSessionMcpServer[] = [];
+    let activeClient: BoundSessionMcpServer['client'] | null = null;
+    let activeTransport: BoundSessionMcpServer['transport'] | null = null;
+
+    const closeCreatedServers = async () => {
+      const pendingClient = activeClient;
+      const pendingTransport = activeTransport;
+      activeClient = null;
+      activeTransport = null;
+      if (pendingClient) await Promise.resolve(pendingClient.close()).catch(() => {});
+      if (pendingTransport) await Promise.resolve(pendingTransport.close()).catch(() => {});
+      const created = newlyCreatedServers.splice(0, newlyCreatedServers.length);
+      for (const bound of created) {
+        await Promise.resolve(bound.client.close()).catch(() => {});
+        await Promise.resolve(bound.transport.close()).catch(() => {});
+      }
+    };
+
+    const attempt = {
+      generation,
+      cancelled: false,
+      cancel: async () => {
+        attempt.cancelled = true;
+        await closeCreatedServers();
+      },
+    };
+    const isStale = () => (
+      attempt.cancelled
+      || this.closedAll
+      || this.sessionGenerations.get(providerSessionId) !== generation
+    );
+
+    let sessionAttempts = this.inFlightSessions.get(providerSessionId);
+    if (!sessionAttempts) {
+      sessionAttempts = new Set();
+      this.inFlightSessions.set(providerSessionId, sessionAttempts);
+    }
+    sessionAttempts.add(attempt);
+
+    try {
+      const existing = this.sessionBindings.get(providerSessionId);
+      const nextServers = new Map<string, BoundSessionMcpServer>();
+      const toClose: BoundSessionMcpServer[] = [];
+
+      if (existing) {
+        for (const [serverName, bound] of existing.servers.entries()) {
+          const nextSpec = mcpServers[serverName];
+          if (!nextSpec || nextSpec.disabled || JSON.stringify(nextSpec) !== bound.signature) {
+            toClose.push(bound);
+          } else {
+            nextServers.set(serverName, bound);
+          }
         }
       }
-    }
 
-    const [{ Client }, { StdioClientTransport }] = await Promise.all([
-      import('@modelcontextprotocol/sdk/client/index.js'),
-      import('@modelcontextprotocol/sdk/client/stdio.js'),
-    ]);
+      const [{ Client }, { StdioClientTransport }] = await Promise.all([
+        import('@modelcontextprotocol/sdk/client/index.js'),
+        import('@modelcontextprotocol/sdk/client/stdio.js'),
+      ]);
+      if (isStale()) {
+        await closeCreatedServers();
+        return false;
+      }
 
-    let allBound = true;
-    for (const [serverName, spec] of Object.entries(mcpServers)) {
-      if (spec.disabled || nextServers.has(serverName) || !Array.isArray(spec.command) || spec.command.length === 0) {
-        continue;
-      }
-      const signature = JSON.stringify(spec);
-      const [command, ...args] = spec.command;
-      const env: Record<string, string> = {};
-      for (const [k, v] of Object.entries(process.env)) {
-        if (typeof v === 'string') env[k] = v;
-      }
-      for (const [k, v] of Object.entries(spec.environment ?? {})) {
-        if (typeof v === 'string') env[k] = v;
-      }
-      const transport = new StdioClientTransport({
-        command,
-        args,
-        env,
-        cwd: dirKey,
-        stderr: 'pipe',
-      });
-      // Drain child stderr immediately so chatty stdio MCP servers cannot stall on pipe backpressure.
-      (transport.stderr as { resume?: () => void } | null)?.resume?.();
-      const client = new Client({ name: 'imcodes-opencode-mcp', version: '1.0.0' });
-      try {
-        await withOpenCodeRequestTimeout(
-          client.connect(transport),
-          `MCP connect (${serverName})`,
-          undefined,
-          this.startupTimeoutMs,
-        );
-        const listed = await withOpenCodeRequestTimeout(
-          client.listTools(),
-          `MCP listTools (${serverName})`,
-          undefined,
-          this.startupTimeoutMs,
-        );
-        const tools: McpToolDescriptor[] = (Array.isArray(listed?.tools) ? listed.tools : []).map((tool) => ({
-          serverName,
-          toolName: String(tool.name),
-          ...(typeof tool.description === 'string' ? { description: tool.description } : {}),
-          inputSchema: sanitizeMcpInputSchema(tool.inputSchema),
-        }));
-        nextServers.set(serverName, {
-          serverName,
-          signature,
-          client: client as unknown as BoundSessionMcpServer['client'],
-          transport,
-          tools,
+      let allBound = true;
+      for (const [serverName, spec] of Object.entries(mcpServers)) {
+        if (isStale()) {
+          await closeCreatedServers();
+          return false;
+        }
+        if (spec.disabled || nextServers.has(serverName) || !Array.isArray(spec.command) || spec.command.length === 0) {
+          continue;
+        }
+        const signature = JSON.stringify(spec);
+        const [command, ...args] = spec.command;
+        const env: Record<string, string> = {};
+        for (const [k, v] of Object.entries(process.env)) {
+          if (typeof v === 'string') env[k] = v;
+        }
+        for (const [k, v] of Object.entries(spec.environment ?? {})) {
+          if (typeof v === 'string') env[k] = v;
+        }
+        const transport = new StdioClientTransport({
+          command,
+          args,
+          env,
+          cwd: dirKey,
+          stderr: 'pipe',
         });
-      } catch (error) {
-        allBound = false;
-        await Promise.resolve(client.close()).catch(() => {});
-        await Promise.resolve(transport.close()).catch(() => {});
-        logger.warn({ provider: 'opencode-sdk', providerSessionId, serverName, directory: dirKey, error }, 'OpenCode session MCP startup failed');
+        // Drain child stderr immediately so chatty stdio MCP servers cannot stall on pipe backpressure.
+        (transport.stderr as { resume?: () => void } | null)?.resume?.();
+        const client = new Client({ name: 'imcodes-opencode-mcp', version: '1.0.0' });
+        activeClient = client as unknown as BoundSessionMcpServer['client'];
+        activeTransport = transport;
+        try {
+          await withOpenCodeRequestTimeout(
+            client.connect(transport),
+            `MCP connect (${serverName})`,
+            undefined,
+            this.startupTimeoutMs,
+          );
+          if (isStale()) {
+            await closeCreatedServers();
+            return false;
+          }
+          const listed = await withOpenCodeRequestTimeout(
+            client.listTools(),
+            `MCP listTools (${serverName})`,
+            undefined,
+            this.startupTimeoutMs,
+          );
+          if (isStale()) {
+            await closeCreatedServers();
+            return false;
+          }
+          const tools: McpToolDescriptor[] = (Array.isArray(listed?.tools) ? listed.tools : []).map((tool) => ({
+            serverName,
+            toolName: String(tool.name),
+            ...(typeof tool.description === 'string' ? { description: tool.description } : {}),
+            inputSchema: sanitizeMcpInputSchema(tool.inputSchema),
+          }));
+          const boundServer: BoundSessionMcpServer = {
+            serverName,
+            signature,
+            client: client as unknown as BoundSessionMcpServer['client'],
+            transport,
+            tools,
+          };
+          activeClient = null;
+          activeTransport = null;
+          newlyCreatedServers.push(boundServer);
+          nextServers.set(serverName, boundServer);
+        } catch (error) {
+          activeClient = null;
+          activeTransport = null;
+          await Promise.resolve(client.close()).catch(() => {});
+          await Promise.resolve(transport.close()).catch(() => {});
+          if (isStale()) {
+            await closeCreatedServers();
+            return false;
+          }
+          allBound = false;
+          logger.warn({ provider: 'opencode-sdk', providerSessionId, serverName, directory: dirKey, error }, 'OpenCode session MCP startup failed');
+        }
+      }
+
+      if (isStale()) {
+        await closeCreatedServers();
+        return false;
+      }
+
+      for (const old of toClose) {
+        await Promise.resolve(old.client.close()).catch(() => {});
+        await Promise.resolve(old.transport.close()).catch(() => {});
+      }
+
+      if (isStale()) {
+        await closeCreatedServers();
+        return false;
+      }
+
+      if (nextServers.size === 0) {
+        this.sessionBindings.delete(providerSessionId);
+      } else {
+        this.sessionBindings.set(providerSessionId, { directory: dirKey, servers: nextServers });
+      }
+      await this.reloadDirectory(dirKey);
+      return allBound;
+    } finally {
+      const current = this.inFlightSessions.get(providerSessionId);
+      current?.delete(attempt);
+      if (current && current.size === 0) {
+        this.inFlightSessions.delete(providerSessionId);
       }
     }
-
-    for (const old of toClose) {
-      await Promise.resolve(old.client.close()).catch(() => {});
-      await Promise.resolve(old.transport.close()).catch(() => {});
-    }
-
-    if (nextServers.size === 0) {
-      this.sessionBindings.delete(providerSessionId);
-    } else {
-      this.sessionBindings.set(providerSessionId, { directory: dirKey, servers: nextServers });
-    }
-    await this.reloadDirectory(dirKey);
-    return allBound;
   }
 
   async unbindSession(providerSessionId: string): Promise<void> {
+    this.sessionGenerations.set(
+      providerSessionId,
+      (this.sessionGenerations.get(providerSessionId) ?? 0) + 1,
+    );
+    const inFlight = [...(this.inFlightSessions.get(providerSessionId) ?? [])];
     const existing = this.sessionBindings.get(providerSessionId);
+    if (existing) this.sessionBindings.delete(providerSessionId);
+    for (const attempt of inFlight) {
+      await attempt.cancel().catch(() => {});
+    }
     if (!existing) return;
-    this.sessionBindings.delete(providerSessionId);
     for (const bound of existing.servers.values()) {
       await Promise.resolve(bound.client.close()).catch(() => {});
       await Promise.resolve(bound.transport.close()).catch(() => {});
@@ -602,8 +715,12 @@ export class SharedOpenCodeHostMcpCoordinator {
   }
 
   async closeAll(): Promise<void> {
-    const ids = [...this.sessionBindings.keys()];
-    await Promise.all(ids.map((id) => this.unbindSession(id)));
+    this.closedAll = true;
+    const ids = new Set<string>([
+      ...this.sessionBindings.keys(),
+      ...this.inFlightSessions.keys(),
+    ]);
+    await Promise.all([...ids].map((id) => this.unbindSession(id)));
   }
 }
 
@@ -3689,6 +3806,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   private async syncSessionMcp(state: OpenCodeSessionState): Promise<void> {
+    if (state.abort.signal.aborted) return;
     const mcpServers = getDefaultMcpServers(state.runtimeConfig);
     const mcpServersConfig: Record<string, OpenCodeMcpServerSpec> = Object.fromEntries(
       Object.entries(mcpServers).map(([name, server]) => [name, {
@@ -3703,6 +3821,13 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const synced = state.bindSessionMcp
       ? await state.bindSessionMcp(state.providerSessionId, state.cwd, mcpServersConfig)
       : await applyOpenCodeDirectoryMcpServers(state.client, state.cwd, mcpServersConfig);
+    if (state.abort.signal.aborted) {
+      state.syncedMcpSignature = null;
+      if (synced !== false && state.unbindSessionMcp) {
+        await state.unbindSessionMcp(state.providerSessionId).catch(() => {});
+      }
+      return;
+    }
     state.syncedMcpSignature = synced === false ? null : signature;
   }
 
@@ -4698,11 +4823,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     for (const timer of state.pendingPermissions.values()) clearTimeout(timer);
     state.pendingPermissions.clear();
     state.surfacedQuestionCallIds.clear();
+    state.abort.abort();
     if (unbindMcp && state.unbindSessionMcp) {
       await state.unbindSessionMcp(state.providerSessionId).catch(() => {});
     }
     await state.releaseEvents().catch(() => {});
-    state.abort.abort();
     if (swallowCloseError) {
       await Promise.resolve(state.server.close()).catch(() => {});
     } else {
