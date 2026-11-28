@@ -537,8 +537,13 @@ html.native-ios-mac .chat-dl-btn {
 .share-state-indicator-shared-in { border-color: rgba(168,85,247,0.65); background: rgba(147,51,234,0.28); color: #f3e8ff; box-shadow: 0 0 0 1px rgba(168,85,247,0.18), 0 0 12px rgba(168,85,247,0.24); }
 .share-state-indicator-icon-only.share-state-indicator-shared-in { border-color: rgba(192,132,252,0.70); background: rgba(147,51,234,0.38); color: #faf5ff; }
 .share-state-icon-return { display: inline-block; vertical-align: middle; flex-shrink: 0; filter: drop-shadow(0 0 5px rgba(192,132,252,0.55)); }
-.tab > .share-state-indicator-icon-only { width: auto; height: auto; min-width: 0; margin-left: 5px; padding: 0; border: none; background: transparent; color: #a5f3fc; box-shadow: none; }
-.tab > .share-state-indicator-icon-only .share-state-icon { font-size: 12px; filter: drop-shadow(0 0 5px rgba(34,211,238,0.55)); }
+.tab-top-left-badges .share-state-indicator-icon-only,
+.tab > .share-state-indicator-icon-only { width: auto; height: auto; min-width: 0; margin: 0; padding: 0; border: none; background: transparent; color: #a5f3fc; box-shadow: none; line-height: 1; }
+.tab-top-left-badges .share-state-indicator-icon-only .share-state-icon,
+.tab > .share-state-indicator-icon-only .share-state-icon { font-size: 9px; line-height: 1; filter: drop-shadow(0 0 4px rgba(34,211,238,0.55)); }
+.tab-top-left-badges .share-state-indicator-icon-only .share-state-icon-return,
+.tab > .share-state-indicator-icon-only .share-state-icon-return { width: 9px; height: 9px; }
+.tab-top-left-badges .share-state-indicator-icon-only.share-state-indicator-shared-in { color: #e9d5ff; }
 .share-state-dot { width: 5px; height: 5px; border-radius: 999px; background: #34d399; box-shadow: 0 0 8px rgba(52,211,153,0.65); flex-shrink: 0; }
 .share-state-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 .tab-tool { margin-left: 5px; font-size: 9px; color: var(--chrome-accent); opacity: 0.9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 60px; vertical-align: middle; }
@@ -26798,6 +26803,15 @@ html.native-mac-desktop .remote-desktop-window-blocked {
   html[data-native-platform="android"] .tab-top-left-badges .agent-badge {
     font-size: 8px;
     padding: 0 3px;
+  }
+
+  html[data-native-platform="android"] .tab-top-left-badges .share-state-indicator-icon-only .share-state-icon {
+    font-size: 8px;
+  }
+
+  html[data-native-platform="android"] .tab-top-left-badges .share-state-indicator-icon-only .share-state-icon-return {
+    width: 8px;
+    height: 8px;
   }
 
   html[data-native-platform="android"] .tab-pin {

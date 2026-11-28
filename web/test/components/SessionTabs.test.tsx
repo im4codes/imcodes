@@ -1377,6 +1377,116 @@ describe('SessionTabs', () => {
     expect(tab10Seq?.nextElementSibling).toBe(tab10Badge);
   });
 
+  it('renders SharedStateIndicator inside .tab-top-left-badges immediately after agent badge in compact out-of-flow layout', () => {
+    const cssText = readTabStyles();
+
+    // 1. Assert CSS contracts for .tab-top-left-badges .share-state-indicator-icon-only
+    const shareIndicatorRule = cssText.match(/\.tab-top-left-badges\s+\.share-state-indicator-icon-only[^{]*\{[^}]+\}/)?.[0] ?? '';
+    const shareIconRule = cssText.match(/\.tab-top-left-badges\s+\.share-state-indicator-icon-only\s+\.share-state-icon[^{]*\{[^}]+\}/)?.[0] ?? '';
+    const shareReturnIconRule = cssText.match(/\.tab-top-left-badges\s+\.share-state-indicator-icon-only\s+\.share-state-icon-return[^{]*\{[^}]+\}/)?.[0] ?? '';
+    const androidShareIconRule = cssText.match(/html\[data-native-platform="android"\]\s+\.tab-top-left-badges\s+\.share-state-indicator-icon-only\s+\.share-state-icon[^{]*\{[^}]+\}/)?.[0] ?? '';
+    const androidShareReturnIconRule = cssText.match(/html\[data-native-platform="android"\]\s+\.tab-top-left-badges\s+\.share-state-indicator-icon-only\s+\.share-state-icon-return[^{]*\{[^}]+\}/)?.[0] ?? '';
+
+    expect(shareIndicatorRule).toContain('width: auto');
+    expect(shareIndicatorRule).toContain('height: auto');
+    expect(shareIndicatorRule).toContain('min-width: 0');
+    expect(shareIndicatorRule).toContain('margin: 0');
+    expect(shareIndicatorRule).toContain('padding: 0');
+    expect(shareIndicatorRule).toContain('border: none');
+    expect(shareIndicatorRule).toContain('background: transparent');
+    expect(shareIndicatorRule).toContain('box-shadow: none');
+    expect(shareIndicatorRule).toContain('line-height: 1');
+
+    expect(shareIconRule).toContain('font-size: 9px');
+    expect(shareReturnIconRule).toContain('width: 9px');
+    expect(shareReturnIconRule).toContain('height: 9px');
+
+    expect(androidShareIconRule).toContain('font-size: 8px');
+    expect(androidShareReturnIconRule).toContain('width: 8px');
+    expect(androidShareReturnIconRule).toContain('height: 8px');
+
+    // 2. Render SessionTabs with:
+    // Tab 1: agent badge + sharedState -> order: seq -> agent-badge -> share-state-indicator
+    // Tab 2: no agent badge + sharedState -> order: seq -> share-state-indicator
+    // Tab 3: agent badge + no sharedState -> order: seq -> agent-badge (no share indicator)
+    // Tab 4: shared-in return variant
+    const testSessions = makeSessions([
+      {
+        name: 'sess_shared_ag',
+        label: 'Shared Agent',
+        agentType: 'claude-code',
+        sharedState: { effectiveRole: 'viewer', status: 'active' },
+      },
+      {
+        name: 'sess_shared_no_ag',
+        label: 'Shared Plain',
+        agentType: 'worker',
+        sharedState: { effectiveRole: 'participant', status: 'active' },
+      },
+      {
+        name: 'sess_unshared_ag',
+        label: 'Unshared Agent',
+        agentType: 'codex-sdk',
+      },
+      {
+        name: 'sess_shared_in',
+        label: 'Shared In',
+        agentType: 'claude-code',
+        sharedState: { effectiveRole: 'viewer', status: 'active', outgoing: false },
+      },
+    ]);
+
+    const { container } = render(
+      <SessionTabs
+        sessions={testSessions}
+        activeSession="sess_shared_ag"
+        onSelect={vi.fn()}
+        sessionsLoaded={true}
+        {...defaultProps}
+      />,
+    );
+
+    const tabs = container.querySelectorAll('.tab');
+    expect(tabs).toHaveLength(4);
+
+    // Tab 1: seq -> agent-badge -> share-state-indicator
+    const tab1TopLeft = tabs[0].querySelector('.tab-top-left-badges');
+    expect(tab1TopLeft).not.toBeNull();
+    expect(tab1TopLeft?.getAttribute('aria-hidden')).toBeNull();
+    const tab1Seq = tab1TopLeft?.querySelector('.session-tab-seq');
+    const tab1Badge = tab1TopLeft?.querySelector('.agent-badge');
+    const tab1Share = tab1TopLeft?.querySelector('.share-state-indicator');
+    expect(tab1Seq?.getAttribute('aria-hidden')).toBe('true');
+    expect(tab1Badge?.getAttribute('aria-hidden')).toBe('true');
+    expect(tab1Share).not.toBeNull();
+    expect(tab1Share?.getAttribute('aria-label')).toBe('indicatorCompact');
+    expect(tab1Seq?.nextElementSibling).toBe(tab1Badge);
+    expect(tab1Badge?.nextElementSibling).toBe(tab1Share);
+
+    // Confirm share-state-indicator is NOT outside .tab-top-left-badges
+    const tab1DirectShareChildren = Array.from(tabs[0].children).filter(c => c.classList.contains('share-state-indicator'));
+    expect(tab1DirectShareChildren).toHaveLength(0);
+
+    // Tab 2: seq -> share-state-indicator (no agent-badge)
+    const tab2TopLeft = tabs[1].querySelector('.tab-top-left-badges');
+    const tab2Seq = tab2TopLeft?.querySelector('.session-tab-seq');
+    const tab2Badge = tab2TopLeft?.querySelector('.agent-badge');
+    const tab2Share = tab2TopLeft?.querySelector('.share-state-indicator');
+    expect(tab2Badge).toBeNull();
+    expect(tab2Share).not.toBeNull();
+    expect(tab2Seq?.nextElementSibling).toBe(tab2Share);
+
+    // Tab 3: seq -> agent-badge (no share indicator)
+    const tab3TopLeft = tabs[2].querySelector('.tab-top-left-badges');
+    const tab3Share = tab3TopLeft?.querySelector('.share-state-indicator');
+    expect(tab3Share).toBeNull();
+
+    // Tab 4: shared-in with return icon
+    const tab4TopLeft = tabs[3].querySelector('.tab-top-left-badges');
+    const tab4Share = tab4TopLeft?.querySelector('.share-state-indicator');
+    expect(tab4Share).not.toBeNull();
+  });
+
   it('ensures .tab-ws-dot, .tab-latency, and idle green dots are completely removed from tabs and styles', () => {
     const cssText = readTabStyles();
 

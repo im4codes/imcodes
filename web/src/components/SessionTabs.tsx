@@ -245,7 +245,7 @@ function SessionTabsControlled({ sessions, activeSession, idleAlerts, p2pSession
   const agentBadge = (agentType: string) => {
     const badge = getAgentBadgeConfig(agentType);
     if (!badge) return null;
-    return <span class="agent-badge" style={{ background: badge.color }}>{badge.label}</span>;
+    return <span class="agent-badge" aria-hidden="true" style={{ background: badge.color }}>{badge.label}</span>;
   };
 
   const openCtxAt = useCallback((x: number, y: number, session: SessionInfo) => {
@@ -527,14 +527,16 @@ function SessionTabsControlled({ sessions, activeSession, idleAlerts, p2pSession
                 onMouseLeave={(e) => onTabMouseEnd(e as MouseEvent)}
                 title={`${s.agentType}${s.agentVersion ? ` ${s.agentVersion}` : ''} — ${s.state}${isPinned ? ' (pinned)' : ''}`}
               >
-                <span class="tab-top-left-badges" aria-hidden="true">
+                <span class="tab-top-left-badges">
                   <sup
                     class="session-tab-seq"
                     data-testid={`session-tab-seq-${s.name}`}
+                    aria-hidden="true"
                   >
                     {idx + 1}
                   </sup>
                   {agentBadge(s.agentType)}
+                  <SharedStateIndicator state={s.sharedState} compact iconOnly />
                 </span>
                 {isPinned && <span class="tab-pin" aria-hidden="true">📌</span>}
                 {getLabel(s)}
@@ -549,7 +551,6 @@ function SessionTabsControlled({ sessions, activeSession, idleAlerts, p2pSession
                   </span>
                 )}
                 {p2pSessionLabels?.has(s.name) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
-                <SharedStateIndicator state={s.sharedState} compact iconOnly />
                 {/* tool call indicator removed — too flashy */}
               </button>
             )}
