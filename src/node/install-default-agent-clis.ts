@@ -32,6 +32,7 @@ import {
   filterCandidatesForIsolation,
   findCommandInEnvPath,
   getPathModule,
+  isProcessExclusiveLockAvailable,
   normalizeRegistryUrl,
   parseBooleanEnv,
   readEnvCaseInsensitive,
@@ -491,6 +492,15 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
     return { status: 'unsupported', reason: `unsupported_platform:${platform}/${arch}` };
   }
 
+  if (!(await isProcessExclusiveLockAvailable())) {
+    opts.logger?.warn?.('node:sqlite unavailable; skipping Codex CLI install safely without publishing');
+    return {
+      status: 'skipped',
+      packageName: `@openai/codex-${suffix}`,
+      reason: 'codex_publish_lock_unavailable',
+    };
+  }
+
   const registries = resolveCandidateNpmRegistries({
     registry: opts.registry,
     registries: opts.registries,
@@ -703,6 +713,15 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
         return publishOutcome;
       } catch (err) {
         lastReason = err instanceof Error ? err.message : String(err);
+        if (lastReason === 'codex_publish_lock_unavailable') {
+          opts.logger?.warn?.('node:sqlite unavailable; skipping Codex CLI install safely without publishing');
+          return {
+            status: 'skipped',
+            packageName: `@openai/codex-${suffix}`,
+            registry,
+            reason: lastReason,
+          };
+        }
         opts.logger?.warn?.(`codex install attempt from ${registry} failed (${lastReason})`);
       } finally {
         rmSync(tmpTgz, { force: true });

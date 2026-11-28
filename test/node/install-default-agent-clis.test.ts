@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import {
   chmodSync,
@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -1438,19 +1439,30 @@ describe('install-default-agent-clis', () => {
     }
   });
 
-  it('serializes multi-process Codex publish via kernel lock, never double-rolls-back after lock release, and never steals held aged locks', async () => {
+  it('serializes multi-process Codex publish via unified SQLite lock, rejects --no-experimental-sqlite without touching targets, and never double-rolls-back after lock release', async () => {
     const execFileAsync = promisify(execFile);
     const root = makeTempDir();
     const rt = await transpileStrippedRuntime(join(root, 'stripped-lock'));
 
+    const ocTgz = buildTarGz([{ name: 'package/bin/opencode', content: 'oc-bin', mode: 0o755 }]);
     const codexTgz = buildTarGz([
       { name: 'package/vendor/x86_64-unknown-linux-musl/bin/codex', content: 'codex-bin', mode: 0o755 },
       { name: 'package/vendor/x86_64-unknown-linux-musl/bin/codex-code-mode-host', content: 'host-bin', mode: 0o755 },
       { name: 'package/vendor/x86_64-unknown-linux-musl/codex-path/rg', content: 'rg', mode: 0o755 },
       { name: 'package/vendor/x86_64-unknown-linux-musl/codex-resources/asset.txt', content: 'asset', mode: 0o644 },
     ]);
+    const claudeTgz = buildTarGz([{ name: 'package/claude', content: 'claude-bin', mode: 0o755 }]);
+    const agyBin = Buffer.from('agy-bin');
+
+    const ocPkg = resolveOpenCodePlatformPackage('linux', 'x64', false)!;
     const srv = await startMockServer((req, res) => {
       res.setHeader('connection', 'close');
+      if (req.url === `/${encodeURIComponent(ocPkg)}/latest`) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '2.4.2', dist: { tarball: `${srv.url}/oc.tgz`, integrity: sriSha512(ocTgz) } }));
+        return;
+      }
+      if (req.url === '/oc.tgz') { res.end(ocTgz); return; }
       if (req.url === '/@openai%2Fcodex/latest') {
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ version: '0.172.0', optionalDependencies: { '@openai/codex-linux-x64': 'npm:@openai/codex@0.172.0-linux-x64' } }));
@@ -1462,127 +1474,361 @@ describe('install-default-agent-clis', () => {
         return;
       }
       if (req.url === '/codex.tgz') { res.end(codexTgz); return; }
+      if (req.url === '/@anthropic-ai%2Fclaude-code-linux-x64/latest') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '2.1.332', dist: { tarball: `${srv.url}/claude.tgz`, integrity: sriSha512(claudeTgz) } }));
+        return;
+      }
+      if (req.url === '/claude.tgz') { res.end(claudeTgz); return; }
+      if (req.url === '/manifests/linux_amd64.json') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '0.9.0', url: `${srv.url}/agy`, sha512: hexSha512(agyBin) }));
+        return;
+      }
+      if (req.url === '/agy') { res.end(agyBin); return; }
       res.statusCode = 404;
       res.end();
     });
 
+    const spawnIpcNode = (nodeArgs: string[], extraEnv: Record<string, string> = {}) => {
+      const child = spawn(process.execPath, nodeArgs, {
+        cwd: root,
+        env: { PATH: '', ...extraEnv },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout?.on('data', (chunk) => { stdout += String(chunk); });
+      child.stderr?.on('data', (chunk) => { stderr += String(chunk); });
+      const events: Array<Record<string, unknown>> = [];
+      const waiters = new Set<(msg: Record<string, unknown>) => void>();
+      child.on('message', (msg) => {
+        if (msg && typeof msg === 'object') {
+          const rec = msg as Record<string, unknown>;
+          events.push(rec);
+          for (const w of waiters) w(rec);
+        }
+      });
+      const done = new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('exit', (code, signal) => {
+          if (code === 0) resolve({ stdout, stderr });
+          else reject(new Error(`child exited code=${code} signal=${signal} stderr=${stderr}`));
+        });
+      });
+      const hasEvent = (eventName: string) => events.some((e) => e.event === eventName);
+      const waitForEvent = (eventName: string) => new Promise<Record<string, unknown>>((resolve, reject) => {
+        const existing = events.find((e) => e.event === eventName);
+        if (existing) {
+          resolve(existing);
+          return;
+        }
+        const onMsg = (rec: Record<string, unknown>) => {
+          if (rec.event === eventName) {
+            waiters.delete(onMsg);
+            resolve(rec);
+          }
+        };
+        waiters.add(onMsg);
+        done.catch((err) => {
+          waiters.delete(onMsg);
+          reject(err);
+        });
+      });
+      return {
+        child,
+        done,
+        hasEvent,
+        waitForEvent,
+        sendCmd: (cmd: string) => { child.send({ cmd }); },
+      };
+    };
+
     try {
-      // 1. Two independent OS processes succeeding concurrently: winner installs, loser sees existing
-      const sharedHome = join(root, 'home-two-proc');
-      const runInstallProc = (extraScript: string) => execFileAsync(
+      // Prepare temp wrapped stripped runtime for causal IPC lock-boundary barriers
+      // (test-only wrapper around real withProcessExclusiveLock; product src/ stays untouched).
+      const rtWrapDir = join(root, 'stripped-wrap');
+      const rtWrap = await transpileStrippedRuntime(rtWrapDir);
+      const wrapHelpersPath = join(rtWrapDir, 'src', 'node', 'cli-install-helpers.js');
+      const realHelpersPath = join(rtWrapDir, 'src', 'node', 'cli-install-helpers.real.js');
+      renameSync(wrapHelpersPath, realHelpersPath);
+      writeFileSync(
+        wrapHelpersPath,
+        `export * from './cli-install-helpers.real.js';
+import { withProcessExclusiveLock as realWithLock } from './cli-install-helpers.real.js';
+const waitIpcCmd = (cmdName) => new Promise((resolve) => {
+  const onMsg = (m) => {
+    if (m?.cmd === cmdName) {
+      process.off('message', onMsg);
+      resolve();
+    }
+  };
+  process.on('message', onMsg);
+});
+export async function withProcessExclusiveLock(lockDbPath, opts, fn) {
+  const mode = process.env.TEST_LOCK_MODE || 'pause-before-outer-catch';
+  if (mode === 'hold-before-fn' || mode === 'notify-acquire') {
+    process.send?.({ event: 'trying-lock' });
+    return await realWithLock(lockDbPath, opts, async () => {
+      process.send?.({ event: 'entered-lock' });
+      if (mode === 'hold-before-fn') {
+        await waitIpcCmd('proceed-fn');
+      }
+      return await fn();
+    });
+  }
+  try {
+    return await realWithLock(lockDbPath, opts, fn);
+  } catch (err) {
+    if (process.send) {
+      process.send({ event: 'lock-released' });
+      await waitIpcCmd('continue-outer-catch');
+    }
+    throw err;
+  }
+}
+`,
+      );
+
+      // 1. Concurrent winners serialized by causal IPC barrier (no timing assumptions):
+      //    Process A acquires SQLite lock and pauses BEFORE creating bin/codex.
+      //    Process B starts, sees no bin/codex yet, stages, and blocks trying to acquire lock.
+      //    Parent confirms Process B cannot enter lock until Process A releases, then unblocks A.
+      //    A installs cleanly ('installed'); B wakes up inside lock and sees existing ('existing').
+      const ipcRaceHome = join(root, 'home-ipc-race');
+      const holderA = spawnIpcNode(
+        [
+          '--input-type=module', '-e',
+          `const { installCodexCli } = await import(${JSON.stringify(rtWrap.defaultModUrl)});
+           const r = await installCodexCli({
+             homeDir: ${JSON.stringify(ipcRaceHome)},
+             platform: 'linux',
+             arch: 'x64',
+             env: { PATH: '' },
+             registry: ${JSON.stringify(srv.url)},
+             noFallback: true,
+             verifyVersion: () => '0.172.0',
+           });
+           console.log(JSON.stringify(r));`,
+        ],
+        { TEST_LOCK_MODE: 'hold-before-fn' },
+      );
+      await holderA.waitForEvent('entered-lock');
+
+      const waiterB = spawnIpcNode(
+        [
+          '--input-type=module', '-e',
+          `const { installCodexCli } = await import(${JSON.stringify(rtWrap.defaultModUrl)});
+           const r = await installCodexCli({
+             homeDir: ${JSON.stringify(ipcRaceHome)},
+             platform: 'linux',
+             arch: 'x64',
+             env: { PATH: '' },
+             registry: ${JSON.stringify(srv.url)},
+             noFallback: true,
+             verifyVersion: () => '0.172.0',
+           });
+           console.log(JSON.stringify(r));`,
+        ],
+        { TEST_LOCK_MODE: 'notify-acquire' },
+      );
+      await waiterB.waitForEvent('trying-lock');
+      // Yield briefly on macrotask queue to confirm waiterB remains blocked on SQLite lock
+      await new Promise((r) => setTimeout(r, 80));
+      expect(waiterB.hasEvent('entered-lock')).toBe(false);
+
+      holderA.sendCmd('proceed-fn');
+      const [outA, outB] = await Promise.all([holderA.done, waiterB.done]);
+      expect(JSON.parse(outA.stdout.trim()).status).toBe('installed');
+      expect(JSON.parse(outB.stdout.trim()).status).toBe('existing');
+      expect(waiterB.hasEvent('entered-lock')).toBe(true);
+      expect(existsSync(join(ipcRaceHome, '.codex', 'bin', 'codex'))).toBe(true);
+      expect(existsSync(join(ipcRaceHome, '.codex', 'bin', 'codex-code-mode-host'))).toBe(true);
+      expect(existsSync(join(ipcRaceHome, '.codex', 'codex-path', 'rg'))).toBe(true);
+      expect(existsSync(join(ipcRaceHome, '.codex', 'codex-resources', 'asset.txt'))).toBe(true);
+
+      // 2. Deterministic IPC gate: Process A holds unified SQLite lock while Process B runs WITH --no-experimental-sqlite.
+      //    Process B MUST NOT acquire a separate .pid lock or touch any target file in .codex,
+      //    and MUST cleanly degrade Codex to 'skipped' while still installing opencode, claude, and agy.
+      const mixedHome = join(root, 'home-sqlite-vs-nosqlite');
+      mkdirSync(join(mixedHome, '.codex', 'bin'), { recursive: true });
+      const lockHolder = spawnIpcNode([
+        '--input-type=module', '-e',
+        `import fs from 'node:fs';
+         import { join } from 'node:path';
+         const { withProcessExclusiveLock } = await import(${JSON.stringify(rt.helpersModUrl)});
+         const lockPath = join(${JSON.stringify(mixedHome)}, '.codex', '.codex-publish.lock.db');
+         await withProcessExclusiveLock(lockPath, { timeoutMs: 10000 }, async () => {
+           fs.writeFileSync(join(${JSON.stringify(mixedHome)}, '.codex', 'bin', 'codex-code-mode-host'), 'holder-sibling');
+           process.send({ event: 'in-lock' });
+           await new Promise((resolve) => {
+             const onMsg = (m) => { if (m?.cmd === 'release') { process.off('message', onMsg); resolve(); } };
+             process.on('message', onMsg);
+           });
+         });`,
+      ]);
+      await lockHolder.waitForEvent('in-lock');
+      expect(existsSync(join(mixedHome, '.codex', '.codex-publish.lock.db'))).toBe(true);
+
+      // Spawn Process B with --no-experimental-sqlite targeting the SAME mixedHome while holder keeps the SQLite lock
+      const noSqliteProc = await execFileAsync(
+        process.execPath,
+        [
+          '--no-experimental-sqlite',
+          '--input-type=module', '-e',
+          `const { installDefaultAgentClis } = await import(${JSON.stringify(rt.defaultModUrl)});
+           const res = await installDefaultAgentClis({
+             homeDir: ${JSON.stringify(mixedHome)},
+             platform: 'linux',
+             arch: 'x64',
+             isMusl: false,
+             env: { PATH: '' },
+             registry: ${JSON.stringify(srv.url)},
+             agyManifestBaseUrl: ${JSON.stringify(srv.url)},
+             noFallback: true,
+             verifyVersion: () => '1.0.0',
+           });
+           console.log(JSON.stringify(res));`,
+        ],
+        { cwd: root, env: { PATH: '' } },
+      );
+      const noSqliteParsed = JSON.parse(noSqliteProc.stdout.trim()) as { results: Record<string, { status: string; reason?: string }> };
+      expect(noSqliteParsed.results.codex?.status).toBe('skipped');
+      expect(noSqliteParsed.results.codex?.reason).toBe('codex_publish_lock_unavailable');
+      expect(noSqliteParsed.results.opencode?.status).toBe('installed');
+      expect(noSqliteParsed.results.claude?.status).toBe('installed');
+      expect(noSqliteParsed.results.agy?.status).toBe('installed');
+      expect(existsSync(join(mixedHome, '.codex', '.codex-publish.lock.db.pid'))).toBe(false);
+      expect(readFileSync(join(mixedHome, '.codex', 'bin', 'codex-code-mode-host'), 'utf8')).toBe('holder-sibling');
+      expect(existsSync(join(mixedHome, '.codex', 'bin', 'codex'))).toBe(false);
+
+      lockHolder.sendCmd('release');
+      await lockHolder.done;
+
+      // Also verify --no-experimental-sqlite in a completely clean home skips Codex cleanly without creating .codex
+      const cleanNoSqliteHome = join(root, 'home-nosqlite-clean');
+      const cleanNoSqlite = await execFileAsync(
+        process.execPath,
+        [
+          '--no-experimental-sqlite',
+          '--input-type=module', '-e',
+          `const { installDefaultAgentClis } = await import(${JSON.stringify(rt.defaultModUrl)});
+           const res = await installDefaultAgentClis({
+             homeDir: ${JSON.stringify(cleanNoSqliteHome)},
+             platform: 'linux',
+             arch: 'x64',
+             isMusl: false,
+             env: { PATH: '' },
+             registry: ${JSON.stringify(srv.url)},
+             agyManifestBaseUrl: ${JSON.stringify(srv.url)},
+             noFallback: true,
+             verifyVersion: () => '1.0.0',
+           });
+           console.log(JSON.stringify(res));`,
+        ],
+        { cwd: root, env: { PATH: '' } },
+      );
+      const cleanNoSqliteParsed = JSON.parse(cleanNoSqlite.stdout.trim()) as { results: Record<string, { status: string; reason?: string }> };
+      expect(cleanNoSqliteParsed.results.codex?.status).toBe('skipped');
+      expect(cleanNoSqliteParsed.results.codex?.reason).toBe('codex_publish_lock_unavailable');
+      expect(cleanNoSqliteParsed.results.opencode?.status).toBe('installed');
+      expect(cleanNoSqliteParsed.results.claude?.status).toBe('installed');
+      expect(cleanNoSqliteParsed.results.agy?.status).toBe('installed');
+      expect(existsSync(join(cleanNoSqliteHome, '.codex'))).toBe(false);
+
+      // 3. Exact post-lock / pre-outer-catch IPC pause counterexample across TWO OS PROCESSES:
+      //    Process A runs stripped-wrap (mode=pause-before-outer-catch), pauses strictly AFTER
+      //    withProcessExclusiveLock releases the SQLite lock and strictly BEFORE installCodexCli enters outer catch.
+      //    Process B then acquires the lock and installs all Codex binaries/siblings.
+      //    When Process A resumes into outer catch, it MUST NOT delete Process B's files.
+      const postLockHome = join(root, 'home-postlock-outercatch-race');
+      const failProcA = spawnIpcNode([
+        '--input-type=module', '-e',
+        `import fs from 'node:fs';
+         const { installCodexCli } = await import(${JSON.stringify(rtWrap.defaultModUrl)});
+         const r = await installCodexCli({
+           homeDir: ${JSON.stringify(postLockHome)},
+           platform: 'linux',
+           arch: 'x64',
+           env: { PATH: '' },
+           registry: ${JSON.stringify(srv.url)},
+           noFallback: true,
+           verifyVersion: () => '0.172.0',
+           linkFile: (src, dst) => {
+             if (dst.endsWith('asset.txt')) throw new Error('sim_a_fail');
+             fs.linkSync(src, dst);
+           },
+         });
+         console.log(JSON.stringify(r));`,
+      ]);
+      await failProcA.waitForEvent('lock-released');
+
+      // Now Process A has released the SQLite lock and is paused strictly BEFORE outer catch runs!
+      const installProcB = await execFileAsync(
         process.execPath,
         [
           '--input-type=module', '-e',
           `const { installCodexCli } = await import(${JSON.stringify(rt.defaultModUrl)});
-           ${extraScript}`,
+           const r = await installCodexCli({
+             homeDir: ${JSON.stringify(postLockHome)},
+             platform: 'linux',
+             arch: 'x64',
+             env: { PATH: '' },
+             registry: ${JSON.stringify(srv.url)},
+             noFallback: true,
+             verifyVersion: () => '0.172.0',
+           });
+           console.log(JSON.stringify(r));`,
         ],
         { cwd: root, env: { PATH: '' } },
       );
+      expect(JSON.parse(installProcB.stdout.trim()).status).toBe('installed');
 
-      const [okA, okB] = await Promise.all([
-        runInstallProc(`const r = await installCodexCli({ homeDir: ${JSON.stringify(sharedHome)}, platform: 'linux', arch: 'x64', env: { PATH: '' }, registry: ${JSON.stringify(srv.url)}, noFallback: true, verifyVersion: () => '0.172.0' }); console.log(JSON.stringify(r));`),
-        runInstallProc(`const r = await installCodexCli({ homeDir: ${JSON.stringify(sharedHome)}, platform: 'linux', arch: 'x64', env: { PATH: '' }, registry: ${JSON.stringify(srv.url)}, noFallback: true, verifyVersion: () => '0.172.0' }); console.log(JSON.stringify(r));`),
+      // Resume Process A directly into outer catch and confirm zero post-lock deletion of Process B's files
+      failProcA.sendCmd('continue-outer-catch');
+      const outFailA = await failProcA.done;
+      expect(JSON.parse(outFailA.stdout.trim()).status).toBe('failed');
+      expect(existsSync(join(postLockHome, '.codex', 'bin', 'codex'))).toBe(true);
+      expect(existsSync(join(postLockHome, '.codex', 'bin', 'codex-code-mode-host'))).toBe(true);
+      expect(existsSync(join(postLockHome, '.codex', 'codex-path', 'rg'))).toBe(true);
+      expect(existsSync(join(postLockHome, '.codex', 'codex-resources', 'asset.txt'))).toBe(true);
+
+      // 4. Aged SQLite lock held by a live process MUST NOT be preempted/stolen (IPC-synchronized)
+      const lockDir = join(root, 'lock-sqlite-aged');
+      mkdirSync(lockDir, { recursive: true });
+      const lockDb = join(lockDir, '.codex-publish.lock.db');
+      const agedHolder = spawnIpcNode([
+        '--input-type=module', '-e',
+        `const { withProcessExclusiveLock } = await import(${JSON.stringify(rt.helpersModUrl)});
+         await withProcessExclusiveLock(${JSON.stringify(lockDb)}, { timeoutMs: 10000 }, async () => {
+           process.send({ event: 'locked' });
+           await new Promise((resolve) => {
+             const onMsg = (m) => { if (m?.cmd === 'release') { process.off('message', onMsg); resolve(); } };
+             process.on('message', onMsg);
+           });
+         });`,
       ]);
-      const statuses = [JSON.parse(okA.stdout.trim()).status, JSON.parse(okB.stdout.trim()).status].sort();
-      expect(statuses).toEqual(['existing', 'installed']);
-      expect(existsSync(join(sharedHome, '.codex', 'bin', 'codex'))).toBe(true);
-      expect(existsSync(join(sharedHome, '.codex', 'bin', 'codex-code-mode-host'))).toBe(true);
-      expect(existsSync(join(sharedHome, '.codex', 'codex-path', 'rg'))).toBe(true);
-      expect(existsSync(join(sharedHome, '.codex', 'codex-resources', 'asset.txt'))).toBe(true);
+      await agedHolder.waitForEvent('locked');
+      const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+      utimesSync(lockDb, twoHoursAgo, twoHoursAgo);
 
-      // 2. Interleaved failure/success across TWO OS PROCESSES:
-      //    Process A fails in sibling publish, rolls back ONCE inside lock, releases lock, then PAUSES
-      //    inside outer catch's logger.warn while Process B enters lock and installs everything cleanly!
-      //    When A resumes/exits outer catch, it MUST NOT delete B's published siblings.
-      const raceHome = join(root, 'home-two-proc-postlock-delay');
-      const releasedMarker = join(root, 'a-released.flag');
-      const procA = runInstallProc(`
-        import fs from 'node:fs';
-        const r = await installCodexCli({
-          homeDir: ${JSON.stringify(raceHome)},
-          platform: 'linux',
-          arch: 'x64',
-          env: { PATH: '' },
-          registry: ${JSON.stringify(srv.url)},
-          noFallback: true,
-          verifyVersion: () => '0.172.0',
-          linkFile: (src, dst) => {
-            if (dst.endsWith('asset.txt')) throw new Error('sim_a_fail');
-            fs.linkSync(src, dst);
-          },
-          logger: {
-            warn: () => {
-              // Runs AFTER lock is released in outer catch; signal B to acquire lock & install,
-              // then stay alive past B's completion before A unwinds catch.
-              fs.writeFileSync(${JSON.stringify(releasedMarker)}, '1');
-              const until = Date.now() + 350;
-              while (Date.now() < until) {}
-            },
-          },
-        });
-        console.log(JSON.stringify(r));
-      `);
-      // Wait for A to have rolled back and exited the lock, then immediately run independent Process B
-      await new Promise<void>((resolve) => {
-        const poll = () => (existsSync(releasedMarker) ? resolve() : setTimeout(poll, 10));
-        poll();
-      });
-      const procB = runInstallProc(`const r = await installCodexCli({ homeDir: ${JSON.stringify(raceHome)}, platform: 'linux', arch: 'x64', env: { PATH: '' }, registry: ${JSON.stringify(srv.url)}, noFallback: true, verifyVersion: () => '0.172.0' }); console.log(JSON.stringify(r));`);
-      const [outRaceA, outRaceB] = await Promise.all([procA, procB]);
-      expect(JSON.parse(outRaceA.stdout.trim()).status).toBe('failed');
-      expect(JSON.parse(outRaceB.stdout.trim()).status).toBe('installed');
-      expect(existsSync(join(raceHome, '.codex', 'bin', 'codex'))).toBe(true);
-      expect(existsSync(join(raceHome, '.codex', 'bin', 'codex-code-mode-host'))).toBe(true);
-      expect(existsSync(join(raceHome, '.codex', 'codex-path', 'rg'))).toBe(true);
-      expect(existsSync(join(raceHome, '.codex', 'codex-resources', 'asset.txt'))).toBe(true);
-
-      // 3. Aged lock held by a LIVE process MUST NOT be preempted/stolen (both node:sqlite AND legacy PID fallback)
-      for (const forceLegacyPidFile of [false, true]) {
-        const lockDir = join(root, forceLegacyPidFile ? 'lock-legacy' : 'lock-sqlite');
-        mkdirSync(lockDir, { recursive: true });
-        const lockDb = join(lockDir, '.codex-publish.lock.db');
-        const heldFlag = join(lockDir, 'held.flag');
-
-        const holderProc = execFileAsync(
-          process.execPath,
-          [
-            '--input-type=module', '-e',
-            `import fs from 'node:fs';
-             const { withProcessExclusiveLock } = await import(${JSON.stringify(rt.helpersModUrl)});
-             await withProcessExclusiveLock(${JSON.stringify(lockDb)}, { timeoutMs: 2000, forceLegacyPidFile: ${forceLegacyPidFile} }, async () => {
-               fs.writeFileSync(${JSON.stringify(heldFlag)}, 'held');
-               await new Promise((r) => setTimeout(r, 450));
-             });`,
-          ],
-          { cwd: root, env: { PATH: '' } },
-        );
-        await new Promise<void>((resolve) => {
-          const poll = () => (existsSync(heldFlag) ? resolve() : setTimeout(poll, 10));
-          poll();
-        });
-        // Backdate lock file mtime by 2 hours while holder process is still alive
-        const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
-        const targetLockFile = forceLegacyPidFile ? `${lockDb}.pid` : lockDb;
-        if (existsSync(targetLockFile)) {
-          utimesSync(targetLockFile, twoHoursAgo, twoHoursAgo);
-        }
-        const waiterRes = await execFileAsync(
-          process.execPath,
-          [
-            '--input-type=module', '-e',
-            `const { withProcessExclusiveLock } = await import(${JSON.stringify(rt.helpersModUrl)});
-             try {
-               await withProcessExclusiveLock(${JSON.stringify(lockDb)}, { timeoutMs: 120, forceLegacyPidFile: ${forceLegacyPidFile} }, async () => {});
-               console.log('STOLE');
-             } catch (err) {
-               console.log(err instanceof Error ? err.message : String(err));
-             }`,
-          ],
-          { cwd: root, env: { PATH: '' } },
-        );
-        expect(waiterRes.stdout.trim()).toBe('codex_publish_lock_timeout');
-        await holderProc;
-      }
+      const waiterRes = await execFileAsync(
+        process.execPath,
+        [
+          '--input-type=module', '-e',
+          `const { withProcessExclusiveLock } = await import(${JSON.stringify(rt.helpersModUrl)});
+           try {
+             await withProcessExclusiveLock(${JSON.stringify(lockDb)}, { timeoutMs: 120 }, async () => {});
+             console.log('STOLE');
+           } catch (err) {
+             console.log(err instanceof Error ? err.message : String(err));
+           }`,
+        ],
+        { cwd: root, env: { PATH: '' } },
+      );
+      expect(waiterRes.stdout.trim()).toBe('codex_publish_lock_timeout');
+      agedHolder.sendCmd('release');
+      await agedHolder.done;
     } finally {
       await srv.close();
     }
