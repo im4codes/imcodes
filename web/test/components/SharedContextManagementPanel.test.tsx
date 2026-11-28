@@ -2318,6 +2318,14 @@ describe('SharedContextManagementPanel', () => {
     ));
     expect(updateSharedContextRuntimeConfigMock).not.toHaveBeenCalled();
 
+    // Hero refresh on Memory tab must also preserve the uncommitted Manual gpt-5.4/gpt-5.6 draft!
+    const runtimeCallsBeforeRefresh = fetchSharedContextRuntimeConfigMock.mock.calls.length;
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.refresh')[0]);
+    });
+    await flush();
+    await waitFor(() => expect(fetchSharedContextRuntimeConfigMock.mock.calls.length).toBeGreaterThan(runtimeCallsBeforeRefresh));
+
     // Returning to Processing tab still shows the uncommitted Manual gpt-5.4/gpt-5.6 draft, and saving it sends Manual + gpt-5.4/gpt-5.6!
     await act(async () => {
       fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));

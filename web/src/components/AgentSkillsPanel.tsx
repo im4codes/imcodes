@@ -1,5 +1,5 @@
 import { Fragment } from 'preact';
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import {
   AGENT_SKILLS_ACTION,
@@ -23,6 +23,8 @@ import { MachineSelect, MachineTargets } from './MachinePicker.js';
 interface Props {
   /** The machine the panel opens on. */
   serverId?: string;
+  /** Incremented by parent to reload skills for the currently selected machine without remounting. */
+  refreshSignal?: number;
 }
 
 interface MachineResult extends AgentSkillsRunResult {
@@ -45,11 +47,12 @@ const AUDITOR_NAMES: Record<string, string> = { ath: 'Gen ATH', socket: 'Socket'
  * searches the skills.sh directory with its security audits, and runs the
  * `skills` CLI: install on any set of machines at once, update, remove.
  */
-export function AgentSkillsPanel({ serverId }: Props) {
+export function AgentSkillsPanel({ serverId, refreshSignal }: Props) {
   const { t } = useTranslation();
   const { machines, onlineMachines, machineName } = useDaemonMachines();
   const { targets, toggle: toggleTarget } = useMachineTargets(serverId);
   const [machineId, setMachineId] = useState<string | undefined>(serverId);
+  const lastRefreshSignalRef = useRef(refreshSignal ?? 0);
   const [skills, setSkills] = useState<AgentSkillEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState(false);
@@ -87,6 +90,12 @@ export function AgentSkillsPanel({ serverId }: Props) {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (refreshSignal === undefined || refreshSignal === lastRefreshSignalRef.current) return;
+    lastRefreshSignalRef.current = refreshSignal;
+    if (machineId) void load();
+  }, [load, machineId, refreshSignal]);
 
 
   const errorText = (error?: string) => t(

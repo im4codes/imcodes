@@ -180,13 +180,19 @@ vi.mock('../../src/api/agent-mcp.js', () => ({
   searchAgentMcpRegistry: vi.fn(async () => []),
 }));
 
+const agentSkillsApiMock = vi.hoisted(() => ({
+  listAgentSkills: vi.fn(async (_serverId: string) => [{ name: 'wecomcli-doc', description: 'WeCom docs' }]),
+}));
 vi.mock('../../src/api/agent-skills.js', () => ({
-  listAgentSkills: vi.fn(async () => [{ name: 'wecomcli-doc', description: 'WeCom docs' }]),
+  listAgentSkills: (serverId: string) => agentSkillsApiMock.listAgentSkills(serverId),
   runAgentSkills: vi.fn(async () => ({ ok: true })),
 }));
 
+const apiFetchMock = vi.hoisted(() => vi.fn(async () => ({
+  servers: [] as Array<{ id: string; name: string; status: string; lastHeartbeatAt: number }>,
+})));
 vi.mock('../../src/api.js', () => ({
-  apiFetch: vi.fn(async () => ({ servers: [] })),
+  apiFetch: (...args: unknown[]) => apiFetchMock(...args),
   ApiError: class ApiError extends Error {
     code: string | null;
     constructor(public status: number, public body: string) {
@@ -235,6 +241,8 @@ describe('SharedContextManagementPanel MCP tab', () => {
   let consoleError: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    apiFetchMock.mockResolvedValue({ servers: [] });
+    agentSkillsApiMock.listAgentSkills.mockResolvedValue([{ name: 'wecomcli-doc', description: 'WeCom docs' }]);
     apiMock.listTeams.mockResolvedValue([]);
     apiMock.getPersonalCloudMemory.mockResolvedValue({ stats: {}, records: [], pendingRecords: [], projects: [] });
     apiMock.getEnterpriseSharedMemory.mockResolvedValue({ stats: {}, records: [], pendingRecords: [], projects: [] });
@@ -348,6 +356,58 @@ describe('SharedContextManagementPanel MCP tab', () => {
     expect(await screen.findByText('wecomcli-doc')).toBeDefined();
     expect(screen.getByText('WeCom docs')).toBeDefined();
     expect(screen.queryByText('Docs MCP')).toBeNull();
+  });
+
+  it('reloads the currently selected machine skills from the hero refresh button without losing selection or query, and skips requests without a machine', async () => {
+    const now = Date.now();
+    apiFetchMock.mockResolvedValue({
+      servers: [
+        { id: 'mac', name: 'mini-2', status: 'online', lastHeartbeatAt: now },
+        { id: 'linux', name: 'vm-124', status: 'online', lastHeartbeatAt: now },
+      ],
+    });
+
+    render(<SharedContextManagementPanel serverId="mac" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Skills'));
+    });
+    await waitFor(() => expect(agentSkillsApiMock.listAgentSkills).toHaveBeenCalledWith('mac'));
+
+    const machineSelect = await screen.findByLabelText('sharedContext.management.agentSkills.machineLabel') as HTMLSelectElement;
+    await screen.findByRole('option', { name: 'vm-124' });
+    await act(async () => {
+      machineSelect.value = 'linux';
+      fireEvent(machineSelect, new Event('change', { bubbles: true }));
+    });
+    await waitFor(() => expect(agentSkillsApiMock.listAgentSkills).toHaveBeenCalledWith('linux'));
+
+    const searchInput = screen.getByLabelText('sharedContext.management.agentSkills.searchLabel') as HTMLInputElement;
+    await act(async () => {
+      fireEvent.input(searchInput, { target: { value: 'pdf' } });
+    });
+
+    agentSkillsApiMock.listAgentSkills.mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('Refresh')[0]);
+    });
+    await waitFor(() => expect(agentSkillsApiMock.listAgentSkills).toHaveBeenCalledTimes(1));
+    expect(agentSkillsApiMock.listAgentSkills).toHaveBeenCalledWith('linux');
+    expect(machineSelect.value).toBe('linux');
+    expect(searchInput.value).toBe('pdf');
+
+    cleanup();
+    agentSkillsApiMock.listAgentSkills.mockClear();
+    render(<SharedContextManagementPanel />);
+    await flush();
+    await act(async () => {
+      fireEvent.click(screen.getByText('Skills'));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('Refresh')[0]);
+    });
+    expect(agentSkillsApiMock.listAgentSkills).not.toHaveBeenCalled();
   });
 
   it('keeps MCP locale keys resolvable in every supported locale', () => {

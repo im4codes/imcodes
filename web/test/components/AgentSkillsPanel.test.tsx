@@ -152,4 +152,33 @@ describe('AgentSkillsPanel', () => {
     fireEvent.click(screen.getByText('sharedContext.management.agentSkills.install'));
     await waitFor(() => expect(runAgentSkills).toHaveBeenCalledWith('mac', { action: 'add', source: 'owner/repo' }));
   });
+
+  it('reloads skills for the active machine on refreshSignal without resetting machine or search state, and skips request when no machine is selected', async () => {
+    const view = render(h(AgentSkillsPanel, { serverId: 'mac', refreshSignal: 0 }));
+    await screen.findByText('wecomcli-doc');
+    expect(listAgentSkills).toHaveBeenCalledTimes(1);
+    expect(listAgentSkills).toHaveBeenLastCalledWith('mac');
+
+    const machineSelect = await screen.findByLabelText('sharedContext.management.agentSkills.machineLabel') as HTMLSelectElement;
+    await screen.findByRole('option', { name: 'vm-124' });
+    machineSelect.value = 'linux';
+    fireEvent(machineSelect, new Event('change', { bubbles: true }));
+    await waitFor(() => expect(listAgentSkills).toHaveBeenCalledWith('linux'));
+
+    const searchInput = screen.getByLabelText('sharedContext.management.agentSkills.searchLabel') as HTMLInputElement;
+    fireEvent.input(searchInput, { target: { value: 'pdf' } });
+
+    listAgentSkills.mockClear();
+    view.rerender(h(AgentSkillsPanel, { serverId: 'mac', refreshSignal: 1 }));
+    await waitFor(() => expect(listAgentSkills).toHaveBeenCalledTimes(1));
+    expect(listAgentSkills).toHaveBeenCalledWith('linux');
+    expect(machineSelect.value).toBe('linux');
+    expect(searchInput.value).toBe('pdf');
+
+    view.unmount();
+    listAgentSkills.mockClear();
+    const emptyView = render(h(AgentSkillsPanel, { refreshSignal: 0 }));
+    emptyView.rerender(h(AgentSkillsPanel, { refreshSignal: 1 }));
+    await waitFor(() => expect(listAgentSkills).not.toHaveBeenCalled());
+  });
 });

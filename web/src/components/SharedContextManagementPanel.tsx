@@ -1271,6 +1271,7 @@ export function SharedContextManagementPanel({ serverId, ws, memoryProjectCandid
   const [loadErrors, setLoadErrors] = useState<Partial<Record<PanelLoadSection, unknown>>>({});
   const [notice, setNotice] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<ManagementTab>('memory');
+  const [skillsRefreshSignal, setSkillsRefreshSignal] = useState(0);
   const [processingLoading, setProcessingLoading] = useState(false);
   const [processingSaving, setProcessingSaving] = useState(false);
   const [processingSnapshot, setProcessingSnapshot] = useState<SharedContextRuntimeConfigSnapshot | null>(null);
@@ -2966,7 +2967,7 @@ export function SharedContextManagementPanel({ serverId, ws, memoryProjectCandid
     if (activeTab === 'memory') {
       void loadMemoryViews();
       loadMemoryAdminViews();
-      if (serverId) void reloadProcessingConfig();
+      if (serverId) void reloadProcessingConfig({ preserveDirtyModelDraft: true });
       return;
     }
     if (activeTab === 'processing') {
@@ -2976,6 +2977,10 @@ export function SharedContextManagementPanel({ serverId, ws, memoryProjectCandid
     if (activeTab === 'mcp') {
       loadMemoryAdminViews();
       loadMcpStatus();
+      return;
+    }
+    if (activeTab === 'skills') {
+      setSkillsRefreshSignal((current) => current + 1);
     }
   }, [activeTab, loadMcpStatus, loadMemoryAdminViews, loadMemoryViews, reloadProcessingConfig, serverId]);
 
@@ -3336,7 +3341,7 @@ export function SharedContextManagementPanel({ serverId, ws, memoryProjectCandid
       )}
 
       {activeTab === 'skills' && (
-        <AgentSkillsPanel serverId={serverId} />
+        <AgentSkillsPanel serverId={serverId} refreshSignal={skillsRefreshSignal} />
       )}
 
       {activeTab === 'memory' && (
