@@ -34,6 +34,7 @@ const SYNC_ALLOWLIST: Readonly<Record<string, string>> = {
   'src/daemon/command-handler.ts': '`launchctl unload` / `systemctl disable` once when the owner deletes this server\'s daemon (uninstall); the process exits right after.',
   'src/daemon/supervision-integration-bundle.ts': 'Retired legacy integration path, git calls need stdin and binary stdout the helper cannot carry. Reachable only from an explicit action (an agent\'s MCP call or a legacy task being integrated), never from a periodic pass: the tick loops and dispatchReadyRework/Integration skip pairs and inert projects (isLegacyDispatchInertProject, send-tool.ts). Every exported entry is wrapped in a named watchdog phase, so a stall here names itself.',
   'src/agent/agy-incognito-isolation.ts': 'Process exit hook (`process.on(\'exit\')`) and constructor error rollback cannot await async child cleanup; runtime reclaim callers use `reclaimOrphanedAgyIncognitoHomes` and `{ skipReclaim: true }`.',
+  'src/agent/opencode-cli-path.ts': 'Windows-only, process-lifetime-cached one-shot elevation probe used by synchronous OpenCode binary fallback when `opencode` is absent from PATH (never periodic), while the async path uses `execFileOffMain`.',
 };
 
 /** Direct `execFile` / `exec` imports that are allowed to stay. */

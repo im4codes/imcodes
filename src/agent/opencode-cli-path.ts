@@ -1,11 +1,9 @@
-import { execFile as execFileCb, execFileSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { promisify } from 'node:util';
-
-const execFileAsync = promisify(execFileCb);
+import { execFileOffMain } from '../util/exec-helper.js';
 
 const DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD';
 export const OPENCODE_PRIVILEGE_PROBE_TIMEOUT_MS = 2_000;
@@ -130,11 +128,11 @@ export async function isOpenCodeCallerElevatedAsync(
     if (useCache && cachedWin32Elevated !== null) return cachedWin32Elevated;
     const psExe = getTrustedWindowsPowerShellPath(opts.env);
     const runAsync = opts.runPrivilegeProbeAsync ?? (async (file, args, timeoutMs) => {
-      const { stdout } = await execFileAsync(file, [...args], {
+      const { stdout } = await execFileOffMain(file, [...args], {
         encoding: 'utf8',
         timeout: timeoutMs,
       });
-      return stdout;
+      return String(stdout);
     });
     try {
       const parsed = parseExplicitElevationOutput(await runAsync(psExe, WIN_ADMIN_CHECK, OPENCODE_PRIVILEGE_PROBE_TIMEOUT_MS));
