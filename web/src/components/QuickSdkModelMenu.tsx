@@ -206,6 +206,7 @@ export function QuickSdkModelMenu({
   const currentPreset = activeSession?.ccPreset?.trim() ?? '';
   const [previewSdk, setPreviewSdk] = useState<string>(currentSdk);
   const [previewPreset, setPreviewPreset] = useState<string>(currentPreset);
+  const [presetTouched, setPresetTouched] = useState(false);
   const [byokOnly, setByokOnly] = useState(false);
   const [internalSwitching, setInternalSwitching] = useState(false);
   const switching = switchingProp ?? internalSwitching;
@@ -226,6 +227,13 @@ export function QuickSdkModelMenu({
   const visibleSdkGroups = useMemo(() => {
     return byokOnly ? filterQuickSdkGroupsByok(sdkGroups) : sdkGroups;
   }, [sdkGroups, byokOnly]);
+
+  const shouldPreservePreviewPreset = presetTouched || (byokOnly && Boolean(previewPreset.trim()));
+
+  const handleSelectPreviewPreset = (nextPreset: string) => {
+    setPresetTouched(true);
+    setPreviewPreset(nextPreset);
+  };
 
   const updateSwitching = (next: boolean) => {
     switchingRef.current = next;
@@ -250,6 +258,7 @@ export function QuickSdkModelMenu({
       if (justOpened) {
         setPreviewSdk(currentSdk);
         setPreviewPreset(currentPreset);
+        setPresetTouched(false);
         setByokOnly(false);
       }
     }
@@ -259,6 +268,7 @@ export function QuickSdkModelMenu({
     if (modelOpen) {
       setPreviewSdk(currentSdk);
       setPreviewPreset(currentPreset);
+      setPresetTouched(false);
     }
   }, [currentSdk, currentPreset, modelOpen]);
 
@@ -274,14 +284,18 @@ export function QuickSdkModelMenu({
         const fallbackSdk = pickFirstSelectableQuickSdk(visibleSdkGroups, currentSdk, agentAvailability);
         if (fallbackSdk) {
           setPreviewSdk(fallbackSdk);
-          setPreviewPreset(fallbackSdk === currentSdk ? currentPreset : (resolveEffectiveCrossSdkPreset(currentSdk, fallbackSdk, currentPreset) ?? ''));
+          if (!shouldPreservePreviewPreset) {
+            setPreviewPreset(fallbackSdk === currentSdk ? currentPreset : (resolveEffectiveCrossSdkPreset(currentSdk, fallbackSdk, currentPreset) ?? ''));
+          }
           return;
         }
       }
       setPreviewSdk(currentSdk);
-      setPreviewPreset(currentPreset);
+      if (!shouldPreservePreviewPreset) {
+        setPreviewPreset(currentPreset);
+      }
     }
-  }, [modelOpen, previewSdk, currentSdk, currentPreset, agentAvailability, byokOnly, visibleSdkGroups]);
+  }, [modelOpen, previewSdk, currentSdk, currentPreset, agentAvailability, byokOnly, visibleSdkGroups, shouldPreservePreviewPreset]);
 
   const handleByokToggle = (e: Event) => {
     const checked = (e.target as HTMLInputElement).checked;
@@ -294,7 +308,9 @@ export function QuickSdkModelMenu({
         const nextSdk = pickFirstSelectableQuickSdk(byokGroups, currentSdk, agentAvailability);
         if (nextSdk) {
           setPreviewSdk(nextSdk);
-          setPreviewPreset(nextSdk === currentSdk ? currentPreset : (resolveEffectiveCrossSdkPreset(currentSdk, nextSdk, currentPreset) ?? ''));
+          if (!shouldPreservePreviewPreset) {
+            setPreviewPreset(nextSdk === currentSdk ? currentPreset : (resolveEffectiveCrossSdkPreset(currentSdk, nextSdk, currentPreset) ?? ''));
+          }
         }
       }
     }
@@ -304,10 +320,12 @@ export function QuickSdkModelMenu({
     if (byokOnly && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextSdk)) return;
     if (isQuickSdkUnavailable(nextSdk, currentSdk, agentAvailability)) return;
     setPreviewSdk(nextSdk);
-    if (nextSdk === currentSdk) {
-      setPreviewPreset(currentPreset);
-    } else {
-      setPreviewPreset(resolveEffectiveCrossSdkPreset(currentSdk, nextSdk, currentPreset) ?? '');
+    if (!shouldPreservePreviewPreset) {
+      if (nextSdk === currentSdk) {
+        setPreviewPreset(currentPreset);
+      } else {
+        setPreviewPreset(resolveEffectiveCrossSdkPreset(currentSdk, nextSdk, currentPreset) ?? '');
+      }
     }
   };
 
@@ -535,8 +553,8 @@ export function QuickSdkModelMenu({
               class="quick-sdk-preset-select"
               value={previewPreset}
               disabled={actionDisabled}
-              onInput={(e) => setPreviewPreset((e.target as HTMLSelectElement).value)}
-              onChange={(e) => setPreviewPreset((e.target as HTMLSelectElement).value)}
+              onInput={(e) => handleSelectPreviewPreset((e.target as HTMLSelectElement).value)}
+              onChange={(e) => handleSelectPreviewPreset((e.target as HTMLSelectElement).value)}
             >
               <option value="">{t('session.quickSwitch.presetDefault')}</option>
               {!hasSelectedPresetInList && previewPreset && (

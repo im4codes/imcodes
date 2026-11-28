@@ -765,10 +765,10 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
       expect(document.body.querySelector('[data-cross-model-id="gpt-custom-2"]')).not.toBeNull();
     });
 
-    // Switch back to current SDK (claude-code-sdk) and clear preset back to Default (""), then click default model switch.
+    // Switch back to current SDK (claude-code-sdk); the manually chosen OpenAI-Custom preset is preserved until explicitly cleared back to Default ("").
     fireEvent.click(document.body.querySelector('[data-sdk-id="claude-code-sdk"]') as HTMLButtonElement);
     const sameSdkPresetSelect = document.body.querySelector('[data-testid="quick-sdk-preset-select"]') as HTMLSelectElement;
-    expect(sameSdkPresetSelect.value).toBe('MiniMax');
+    expect(sameSdkPresetSelect.value).toBe('OpenAI-Custom');
     fireEvent.change(sameSdkPresetSelect, { target: { value: '' } });
 
     const defaultBtn = document.body.querySelector('[data-testid="quick-sdk-default-switch"]') as HTMLButtonElement;
@@ -1243,5 +1243,174 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
       return cb!;
     });
     expect(reopenedCheckbox.checked).toBe(false);
+  });
+
+  it('preserves user-selected BYOK preset across SDK switches, filters LIST_MODELS, and submits ccPreset on switch', async () => {
+    const { container, ws } = renderSessionControls({
+      name: 'deck_agy_brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      modelDisplay: 'gemini-2.5-pro',
+    });
+
+    fireEvent.click(container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    fireEvent.click(document.body.querySelector('[data-testid="quick-sdk-byok-toggle"]') as HTMLInputElement);
+
+    const listReq = ws.send.mock.calls.filter((c: any[]) => c[0]?.type === CC_PRESET_MSG.LIST).at(-1)![0];
+    ws.emitMessage({
+      type: CC_PRESET_MSG.LIST_RESPONSE,
+      requestId: listReq.requestId,
+      presets: [
+        {
+          name: 'glm5.3',
+          authType: 'anthropic',
+          env: { ANTHROPIC_MODEL: 'glm-5.3[1m]' },
+          availableModels: [{ id: 'glm-5.3[1m]' }],
+          defaultModel: 'glm-5.3[1m]',
+        },
+      ],
+    });
+
+    // Switch preview to claude-code-sdk and select BYOK preset glm5.3
+    fireEvent.click(document.body.querySelector('[data-sdk-id="claude-code-sdk"]') as HTMLButtonElement);
+    const presetSelect = await waitFor(() => {
+      const sel = document.body.querySelector('[data-testid="quick-sdk-preset-select"]') as HTMLSelectElement | null;
+      expect(sel).not.toBeNull();
+      return sel!;
+    });
+    fireEvent.change(presetSelect, { target: { value: 'glm5.3' } });
+    expect(document.body.querySelector('[data-testid="quick-sdk-model-split"]')?.getAttribute('data-preview-preset')).toBe('glm5.3');
+
+    // Switch to codex-sdk: preset stays glm5.3, LIST_MODELS includes ccPreset, and model click submits ccPreset: 'glm5.3'
+    fireEvent.click(document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement);
+    const split = document.body.querySelector('[data-testid="quick-sdk-model-split"]') as HTMLElement;
+    expect(split.getAttribute('data-preview-sdk')).toBe('codex-sdk');
+    expect(split.getAttribute('data-preview-preset')).toBe('glm5.3');
+    expect((document.body.querySelector('[data-testid="quick-sdk-preset-select"]') as HTMLSelectElement).value).toBe('glm5.3');
+
+    await waitFor(() => {
+      const codexListCalls = ws.send.mock.calls
+        .map((c: any[]) => c[0] as Record<string, unknown>)
+        .filter((m) => m?.type === TRANSPORT_MSG.LIST_MODELS && m?.agentType === 'codex-sdk' && m?.ccPreset === 'glm5.3');
+      expect(codexListCalls.length).toBeGreaterThanOrEqual(1);
+    });
+
+    const codexModelBtn = document.body.querySelector('[data-cross-model-id]') as HTMLButtonElement;
+    expect(codexModelBtn).not.toBeNull();
+    fireEvent.click(codexModelBtn);
+
+    await waitFor(() => {
+      expect(mockApi.patchSession).toHaveBeenCalledWith('srv1', 'deck_agy_brain', expect.objectContaining({
+        agentType: 'codex-sdk',
+        requestedModel: codexModelBtn.getAttribute('data-cross-model-id'),
+        activeModel: null,
+        ccPreset: 'glm5.3',
+      }));
+    });
+  });
+
+  it('preserves session current ccPreset across BYOK SDK switches when BYOK mode is checked', async () => {
+    const { container, ws } = renderSessionControls({
+      agentType: 'claude-code-sdk',
+      ccPreset: 'glm5.3',
+      requestedModel: 'glm-5.3[1m]',
+    });
+
+    fireEvent.click(container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement);
+    const listReq = ws.send.mock.calls.filter((c: any[]) => c[0]?.type === CC_PRESET_MSG.LIST).at(-1)![0];
+    ws.emitMessage({
+      type: CC_PRESET_MSG.LIST_RESPONSE,
+      requestId: listReq.requestId,
+      presets: [{ name: 'glm5.3', env: { ANTHROPIC_MODEL: 'glm-5.3[1m]' }, availableModels: [{ id: 'glm-5.3[1m]' }] }],
+    });
+
+    fireEvent.click(document.body.querySelector('[data-testid="quick-sdk-byok-toggle"]') as HTMLInputElement);
+    fireEvent.click(document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement);
+
+    const split = document.body.querySelector('[data-testid="quick-sdk-model-split"]') as HTMLElement;
+    expect(split.getAttribute('data-preview-sdk')).toBe('codex-sdk');
+    expect(split.getAttribute('data-preview-preset')).toBe('glm5.3');
+    expect((document.body.querySelector('[data-testid="quick-sdk-preset-select"]') as HTMLSelectElement).value).toBe('glm5.3');
+  });
+
+  it('keeps manual preset across non-BYOK detour without leaking, keeps explicit Default (""), preserves preset across availability snap, and resets on reopen', async () => {
+    const { container, ws } = renderSessionControls({
+      agentType: 'claude-code-sdk',
+      ccPreset: 'MiniMax',
+      requestedModel: 'MiniMax-M2.7',
+    });
+
+    const trigger = container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement;
+    fireEvent.click(trigger);
+
+    const listReq = ws.send.mock.calls.filter((c: any[]) => c[0]?.type === CC_PRESET_MSG.LIST).at(-1)![0];
+    ws.emitMessage({
+      type: CC_PRESET_MSG.LIST_RESPONSE,
+      requestId: listReq.requestId,
+      presets: [
+        { name: 'MiniMax', env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' }, availableModels: [{ id: 'MiniMax-M2.7' }] },
+        { name: 'glm5.3', env: { ANTHROPIC_MODEL: 'glm-5.3[1m]' }, availableModels: [{ id: 'glm-5.3[1m]' }] },
+      ],
+    });
+
+    // Manually select glm5.3 without BYOK checkbox checked
+    const presetSelect = await waitFor(() => {
+      const sel = document.body.querySelector('[data-testid="quick-sdk-preset-select"]') as HTMLSelectElement | null;
+      expect(sel).not.toBeNull();
+      return sel!;
+    });
+    fireEvent.change(presetSelect, { target: { value: 'glm5.3' } });
+
+    // Switch to codex-sdk -> preserved
+    fireEvent.click(document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement);
+    const split = document.body.querySelector('[data-testid="quick-sdk-model-split"]') as HTMLElement;
+    expect(split.getAttribute('data-preview-preset')).toBe('glm5.3');
+
+    // Temporarily preview non-BYOK agy-sdk -> effectivePreviewPreset is null ("") and LIST_MODELS has no ccPreset
+    fireEvent.click(document.body.querySelector('[data-sdk-id="agy-sdk"]') as HTMLButtonElement);
+    expect(split.getAttribute('data-preview-preset')).toBe('');
+    expect(document.body.querySelector('[data-testid="quick-sdk-preset-bar"]')).toBeNull();
+    await waitFor(() => {
+      const agyCalls = ws.send.mock.calls
+        .map((c: any[]) => c[0] as Record<string, unknown>)
+        .filter((m) => m?.type === TRANSPORT_MSG.LIST_MODELS && m?.agentType === 'agy-sdk');
+      expect(agyCalls.length).toBeGreaterThanOrEqual(1);
+      expect(agyCalls.at(-1)?.ccPreset).toBeUndefined();
+    });
+
+    // Switch back to currentSdk (claude-code-sdk): chosen glm5.3 returns and enters preset relaunch state
+    fireEvent.click(document.body.querySelector('[data-sdk-id="claude-code-sdk"]') as HTMLButtonElement);
+    expect(split.getAttribute('data-preview-preset')).toBe('glm5.3');
+    expect(document.body.querySelector('.quick-sdk-handoff-badge')).not.toBeNull();
+
+    // Check BYOK, switch to codex-sdk, then emit async availability marking codex-sdk uninstalled & kimi-sdk installed -> kimi-sdk keeps glm5.3
+    fireEvent.click(document.body.querySelector('[data-testid="quick-sdk-byok-toggle"]') as HTMLInputElement);
+    fireEvent.click(document.body.querySelector('[data-sdk-id="codex-sdk"]') as HTMLButtonElement);
+    ws.emitMessage({
+      type: AGENT_AVAILABILITY_MSG.RESULT,
+      checkedAt: Date.now(),
+      agents: {
+        'claude-code-sdk': { installed: false, reason: 'missing' },
+        'codex-sdk': { installed: false, reason: 'missing' },
+        'kimi-sdk': { installed: true },
+      },
+    });
+    await waitFor(() => {
+      expect(split.getAttribute('data-preview-sdk')).toBe('kimi-sdk');
+    });
+    expect(split.getAttribute('data-preview-preset')).toBe('glm5.3');
+
+    // Explicitly select "" (Default), switch back to currentSdk -> stays "" instead of snapping back to MiniMax
+    fireEvent.change(document.body.querySelector('[data-testid="quick-sdk-preset-select"]') as HTMLSelectElement, { target: { value: '' } });
+    fireEvent.click(document.body.querySelector('[data-sdk-id="claude-code-sdk"]') as HTMLButtonElement);
+    expect(split.getAttribute('data-preview-preset')).toBe('');
+
+    // Close and reopen menu -> resets presetTouched and restores session's currentPreset ('MiniMax')
+    fireEvent.click(trigger);
+    await waitFor(() => expect(document.body.querySelector('[data-testid="quick-sdk-model-split"]')).toBeNull());
+    fireEvent.click(trigger);
+    await waitFor(() => {
+      const reopenedSplit = document.body.querySelector('[data-testid="quick-sdk-model-split"]');
+      expect(reopenedSplit?.getAttribute('data-preview-preset')).toBe('MiniMax');
+    });
   });
 });
