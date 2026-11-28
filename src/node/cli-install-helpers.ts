@@ -16,6 +16,7 @@ import {
 import { access, stat } from 'node:fs/promises';
 import http from 'node:http';
 import https from 'node:https';
+import { isIP } from 'node:net';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -665,9 +666,12 @@ async function fetchViaNodeHttpProxy(urlStr: string, proxyStr: string, init: Req
         if (head && head.length > 0) {
           socket.unshift(head);
         }
+        const isIpTarget = isIP(targetHost) !== 0;
         const tlsSocket = tls.connect({
           socket,
-          servername: targetHost,
+          ...(isIpTarget
+            ? { checkServerIdentity: (_host, cert) => tls.checkServerIdentity(targetHost, cert) }
+            : { servername: targetHost }),
         });
         registerDestroy(() => tlsSocket.destroy());
         tlsSocket.on('error', onError);

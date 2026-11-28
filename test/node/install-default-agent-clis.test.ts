@@ -137,7 +137,7 @@ async function startMockServer(
   };
 }
 
-function createSelfSignedLoopbackCert(): { keyPem: string; certPem: string } {
+function createSelfSignedLoopbackCert(ipBytes: number[] = [127, 0, 0, 1]): { keyPem: string; certPem: string } {
   const derLen = (n: number): Buffer => {
     if (n < 0x80) return Buffer.from([n]);
     const bytes: number[] = [];
@@ -161,9 +161,9 @@ function createSelfSignedLoopbackCert(): { keyPem: string; certPem: string } {
   const spki = publicKey.export({ type: 'spki', format: 'der' });
 
   const algId = tlv(0x30, oidSha256Rsa, Buffer.from([0x05, 0x00]));
-  const name = tlv(0x30, tlv(0x31, tlv(0x30, oidCn, tlv(0x0c, Buffer.from('127.0.0.1')))));
+  const name = tlv(0x30, tlv(0x31, tlv(0x30, oidCn, tlv(0x0c, Buffer.from(ipBytes.join('.'))))));
   const validity = tlv(0x30, tlv(0x17, Buffer.from('250101000000Z')), tlv(0x17, Buffer.from('350101000000Z')));
-  const sanExt = tlv(0x30, oidSan, tlv(0x04, tlv(0x30, Buffer.from([0x87, 4, 127, 0, 0, 1]))));
+  const sanExt = tlv(0x30, oidSan, tlv(0x04, tlv(0x30, Buffer.from([0x87, ipBytes.length, ...ipBytes]))));
   const basicExt = tlv(0x30, oidBasic, Buffer.from([0x01, 0x01, 0xff]), tlv(0x04, tlv(0x30, Buffer.from([0x01, 0x01, 0xff]))));
   const tbs = tlv(0x30, tlv(0xa0, derInt(Buffer.from([2]))), derInt(Buffer.from([1])), algId, name, validity, name, spki, tlv(0xa3, tlv(0x30, sanExt, basicExt)));
   const sig = sign('sha256', tbs, privateKey);
@@ -1256,6 +1256,42 @@ describe('install-default-agent-clis', () => {
       expect(parsedDead.status).toBe('failed');
       expect(parsedDead.reason).toContain('proxy_');
       expect(httpsHits).toBe(hitsBeforeDead);
+
+      // 1d. Mismatched IP SAN certificate over CONNECT proxy fails closed (ERR_TLS_CERT_ALTNAME_INVALID)
+      const mismatchedCert = createSelfSignedLoopbackCert([127, 0, 0, 2]);
+      const mismatchedCertPath = join(root, 'srv-mismatched-cert.pem');
+      writeFileSync(mismatchedCertPath, mismatchedCert.certPem);
+      let mismatchedHits = 0;
+      const mismatchedSrv = https.createServer(
+        { key: mismatchedCert.keyPem, cert: mismatchedCert.certPem },
+        (_req, res) => {
+          mismatchedHits += 1;
+          res.statusCode = 200;
+          res.end();
+        },
+      );
+      await new Promise<void>((resolve) => mismatchedSrv.listen(0, '127.0.0.1', () => resolve()));
+      const mismatchedOrigin = `https://127.0.0.1:${(mismatchedSrv.address() as net.AddressInfo).port}`;
+      try {
+        const homeMismatched = join(root, 'home-mismatched');
+        const rMismatched = await execFileAsync(
+          process.execPath,
+          [
+            '--input-type=module', '-e',
+            `const { installClaudeCli } = await import(${JSON.stringify(rt.defaultModUrl)});
+             const res = await installClaudeCli({ homeDir: ${JSON.stringify(homeMismatched)}, platform: 'linux', arch: 'x64', isMusl: false, env: { PATH: '', HTTPS_PROXY: ${JSON.stringify(connectProxy.url)} }, registry: ${JSON.stringify(mismatchedOrigin)}, noFallback: true, verifyVersion: () => '2.1.332' });
+             console.log(JSON.stringify(res));`,
+          ],
+          { cwd: strippedDir, env: { PATH: '', NODE_EXTRA_CA_CERTS: mismatchedCertPath } },
+        );
+        const parsedMismatched = JSON.parse(rMismatched.stdout.trim()) as { status: string; reason?: string };
+        expect(parsedMismatched.status).toBe('failed');
+        expect(parsedMismatched.reason).toMatch(/proxy_error.*(ALTNAME_INVALID|altname|does not match)/i);
+        expect(mismatchedHits).toBe(0);
+      } finally {
+        mismatchedSrv.closeAllConnections?.();
+        await new Promise<void>((resolve) => mismatchedSrv.close(() => resolve()));
+      }
 
       // 2. NODE_USE_ENV_PROXY=1 must NOT leak isolatedTest loopback traffic across compiled helpers or OpenCode
       const connectsBeforeIso = connectCount;
