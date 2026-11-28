@@ -26,6 +26,7 @@ import {
 import { hydrateStandaloneAuthFromStorage } from './standalone-auth.js';
 import { ensureRemoteDesktopAppManifestLink, installPwaInstallCapture } from './pwa-install.js';
 import './styles.css';
+import './components/global-task-mode-brief.css';
 import './i18n/index.js';
 // Bundled programmer webfonts (OFL 1.1). JetBrains Mono is the default;
 // Cascadia Mono is available in the chat font picker even when it is not

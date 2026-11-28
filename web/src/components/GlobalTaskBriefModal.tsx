@@ -12,7 +12,6 @@ import { fetchServerTaskPairBrief } from '../api.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import type { GlobalTaskJumpContext } from '../global-task-mode-store.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
-import './global-task-mode-brief.css';
 
 export type GlobalTaskBriefTab = 'checklist' | 'audit' | 'brief';
 
