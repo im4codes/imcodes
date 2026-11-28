@@ -146,6 +146,8 @@ interface PiSessionState {
   cwd: string;
   env?: Record<string, string>;
   requestedModel?: string;
+  pendingModelSelection?: { rawModel: string };
+  pendingModelSwitch?: Promise<void> | null;
   model?: string;
   provider?: string;
   effort?: TransportEffortLevel;
@@ -492,8 +494,11 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
 
     return withSessionPrivacy(state.sessionName ?? state.routeId, state.incognito === true, async () => {
       this.emitStatus(sessionId, state, { status: 'working', label: null });
-      state.turnGeneration++;
+      const generation = ++state.turnGeneration;
       await this.ensureChild(state);
+      await this.flushPendingModelSelection(state);
+      await this.ensureChild(state);
+      const capturedChild = state.child;
       this.resetTurn(state);
       state.currentMessageId = `${state.routeId}:${randomUUID()}`;
       state.turnActive = true;
@@ -506,13 +511,15 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
           ...(images.length > 0 ? { images } : {}),
         });
         const data = asRecord(response.data);
-        if (data?.disposition === 'handled') {
+        if (data?.disposition === 'handled' && state.child === capturedChild && state.turnGeneration === generation) {
           this.finishTurn(state);
         }
       } catch (error) {
-        state.turnActive = false;
-        this.clearStatus(sessionId, state);
-        this.resetTurn(state);
+        if (state.child === capturedChild && state.turnGeneration === generation) {
+          state.turnActive = false;
+          this.clearStatus(sessionId, state);
+          this.resetTurn(state);
+        }
         throw this.makeError(
           PROVIDER_ERROR_CODES.PROVIDER_ERROR,
           error instanceof Error ? error.message : String(error),
@@ -529,35 +536,42 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     }
     return withSessionPrivacy(state.sessionName ?? sessionId, state.incognito === true, async () => {
       this.emitStatus(sessionId, state, { status: 'working', label: 'Compacting...' });
-      state.turnGeneration++;
+      const generation = ++state.turnGeneration;
       try {
         await this.ensureChild(state);
+        await this.flushPendingModelSelection(state);
+        await this.ensureChild(state);
       } catch (error) {
-        this.clearStatus(sessionId, state);
+        if (state.turnGeneration === generation) this.clearStatus(sessionId, state);
         throw error;
       }
       const stdin = state.child?.stdin;
       if (!stdin || stdin.destroyed) {
-        this.clearStatus(sessionId, state);
+        if (state.turnGeneration === generation) this.clearStatus(sessionId, state);
         throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Pi RPC process is unavailable', true);
       }
       const capturedChild = state.child;
-      const generation = state.turnGeneration;
       this.resetTurn(state);
       state.turnActive = true;
       state.compacting = true;
       state.cancelled = false;
+      const ownsCompactTurn = (): boolean =>
+        !state.disposed
+        && this.sessions.get(sessionId) === state
+        && Boolean(capturedChild)
+        && state.child === capturedChild
+        && state.turnGeneration === generation
+        && state.turnActive
+        && Boolean(state.compacting);
       void this.request(state, { type: PI_RPC_COMMAND.COMPACT }, COMPACT_RPC_TIMEOUT_MS).then(
         (response) => withSessionPrivacy(state.sessionName ?? sessionId, state.incognito === true, () => {
+          if (!ownsCompactTurn()) return;
           const wasCancelled = state.cancelled;
-          const isCurrentTurn = Boolean(capturedChild && state.child === capturedChild && state.turnGeneration === generation);
-          if (wasCancelled && isCurrentTurn) this.stopConfirmations.complete(capturedChild!);
-          if (state.turnGeneration === generation) {
-            state.turnActive = false;
-            state.compacting = false;
-            this.clearStatus(sessionId, state);
-            this.resetTurn(state);
-          }
+          if (wasCancelled) this.stopConfirmations.complete(capturedChild!);
+          state.turnActive = false;
+          state.compacting = false;
+          this.clearStatus(sessionId, state);
+          this.resetTurn(state);
           if (wasCancelled) {
             state.cancelled = false;
             this.emitError(sessionId, {
@@ -589,16 +603,14 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
           for (const cb of this.completeCallbacks) cb(sessionId, completion);
         }),
         (error) => withSessionPrivacy(state.sessionName ?? sessionId, state.incognito === true, () => {
+          if (!ownsCompactTurn()) return;
           const wasCancelled = state.cancelled;
           const isChildRpcTerminal = error instanceof PiRpcResponseError;
-          const isCurrentTurn = Boolean(capturedChild && state.child === capturedChild && state.turnGeneration === generation);
-          if (state.turnGeneration === generation) {
-            state.turnActive = false;
-            state.compacting = false;
-            this.clearStatus(sessionId, state);
-            this.resetTurn(state);
-          }
-          if (wasCancelled && isChildRpcTerminal && isCurrentTurn) {
+          state.turnActive = false;
+          state.compacting = false;
+          this.clearStatus(sessionId, state);
+          this.resetTurn(state);
+          if (wasCancelled && isChildRpcTerminal) {
             this.stopConfirmations.complete(capturedChild!);
             state.cancelled = false;
             this.emitError(sessionId, {
@@ -671,48 +683,80 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     if (!state || !model || state.requestedModel === model) return;
     state.requestedModel = model;
     const child = state.child;
-    if (child && !state.turnActive) {
-      const activeProvider = state.llmConfig?.provider ?? state.provider;
-      let provider: string | undefined;
-      let modelId: string;
-      if (activeProvider && model.startsWith(`${activeProvider}/`)) {
-        provider = activeProvider;
-        modelId = model.slice(activeProvider.length + 1);
-      } else if (state.llmConfig?.provider && state.llmConfig.availableModels?.includes(model)) {
-        provider = state.llmConfig.provider;
-        modelId = model;
-      } else {
-        const slash = model.indexOf('/');
-        provider = slash > 0 ? model.slice(0, slash) : activeProvider;
-        modelId = slash > 0 ? model.slice(slash + 1) : model;
-      }
-      if (provider && modelId) {
-        void this.request(state, { type: PI_RPC_COMMAND.SET_MODEL, provider, modelId })
-          .then((response) => {
-            const switched = modelInfo(response.data);
-            state.model = switched.id ?? modelId;
-            state.provider = switched.provider ?? provider;
-            this.setSessionModelContextWindow(state, state.provider, state.model, switched.contextWindow);
-            this.emitInfo(sessionId, { model: state.model });
-            void this.syncAvailableThinkingLevels(state);
-          })
-          .catch(() => {
-            if (!state.incognito && state.child === child && !state.disposed) {
-              state.modelContextWindow = undefined;
-              state.catalogContextWindows = undefined;
-              this.detachChild(state);
-              void this.stopChild(state, child);
-            }
-          });
-        return;
-      }
+    if (!child) {
+      state.pendingModelSelection = undefined;
+      return;
     }
-    if (state.incognito) return;
-    if (child) {
-      state.modelContextWindow = undefined;
-      state.catalogContextWindows = undefined;
-      this.detachChild(state);
-      void this.stopChild(state, child);
+    if (state.turnActive || !state.hasStartedChild) {
+      state.pendingModelSelection = { rawModel: model };
+      return;
+    }
+    state.pendingModelSelection = undefined;
+    void this.applyPiModelSelection(state, child, model);
+  }
+
+  private resolvePiModelTarget(state: PiSessionState, model: string): { provider?: string; modelId: string } {
+    const activeProvider = state.llmConfig?.provider ?? state.provider;
+    if (activeProvider && model.startsWith(`${activeProvider}/`)) {
+      return { provider: activeProvider, modelId: model.slice(activeProvider.length + 1) };
+    }
+    if (state.llmConfig?.provider && state.llmConfig.availableModels?.includes(model)) {
+      return { provider: state.llmConfig.provider, modelId: model };
+    }
+    const slash = model.indexOf('/');
+    return {
+      provider: slash > 0 ? model.slice(0, slash) : activeProvider,
+      modelId: slash > 0 ? model.slice(slash + 1) : model,
+    };
+  }
+
+  private applyPiModelSelection(state: PiSessionState, child: ChildProcess, rawModel: string): Promise<void> {
+    const { provider, modelId } = this.resolvePiModelTarget(state, rawModel);
+    if (!provider || !modelId) {
+      if (!state.incognito && !state.turnActive && state.child === child && !state.disposed) {
+        state.modelContextWindow = undefined;
+        state.catalogContextWindows = undefined;
+        this.detachChild(state);
+        return this.stopChild(state, child);
+      }
+      return Promise.resolve();
+    }
+    const op = this.request(state, { type: PI_RPC_COMMAND.SET_MODEL, provider, modelId })
+      .then((response) => {
+        if (state.child !== child || state.disposed) return;
+        const switched = modelInfo(response.data);
+        state.model = switched.id ?? modelId;
+        state.provider = switched.provider ?? provider;
+        this.setSessionModelContextWindow(state, state.provider, state.model, switched.contextWindow);
+        this.emitInfo(state.routeId, { model: state.model });
+        void this.syncAvailableThinkingLevels(state);
+      })
+      .catch(() => {
+        if (!state.incognito && !state.turnActive && state.child === child && !state.disposed) {
+          state.modelContextWindow = undefined;
+          state.catalogContextWindows = undefined;
+          this.detachChild(state);
+          void this.stopChild(state, child);
+        }
+      })
+      .finally(() => {
+        if (state.pendingModelSwitch === op) state.pendingModelSwitch = null;
+      });
+    state.pendingModelSwitch = op;
+    return op;
+  }
+
+  private async flushPendingModelSelection(state: PiSessionState): Promise<void> {
+    while (state.pendingModelSwitch || (state.pendingModelSelection && state.child)) {
+      if (state.pendingModelSwitch) {
+        await state.pendingModelSwitch;
+        continue;
+      }
+      const pending = state.pendingModelSelection!;
+      state.pendingModelSelection = undefined;
+      if (state.child) {
+        await this.applyPiModelSelection(state, state.child, pending.rawModel);
+      }
     }
   }
 
@@ -828,6 +872,8 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
       await state.startPromise;
       return;
     }
+    state.pendingModelSelection = undefined;
+    state.pendingModelSwitch = null;
     const privacyKey = state.sessionName ?? state.routeId;
     const isPrivate = state.incognito === true;
     const executable = resolveExecutableForSpawn(resolvePiBinary());
@@ -922,6 +968,8 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     this.releasePendingQuestions(state, true);
     state.child = null;
     state.startPromise = null;
+    state.pendingModelSelection = undefined;
+    state.pendingModelSwitch = null;
     const error = new Error('Pi RPC process disconnected');
     for (const pending of state.pending.values()) {
       clearTimeout(pending.timer);

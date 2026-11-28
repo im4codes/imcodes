@@ -731,13 +731,16 @@ describe('DeepseekHarnessProvider', () => {
     await flush();
     const stale = child;
 
-    // Detach and swap in a live replacement, as a model switch does.
+    // Force child error so stale is detached and replaced cleanly on the next send.
+    stale.emit('error', new Error('stale child dropped'));
+    await flush();
+    errors.length = 0;
+
     const replacement = new FakeChild();
     spawnMock.mockImplementation(() => {
       setImmediate(() => replacement.emitEvent(readyFrame()));
       return replacement;
     });
-    provider.setSessionAgentId(sessionId, 'other-model');
     await provider.send(sessionId, 'after switch');
     await flush();
     errors.length = 0;
@@ -1063,7 +1066,7 @@ describe('DeepseekHarnessProvider /compact and preset models', () => {
     }
   });
 
-  it('switches model in-process via SET_MODEL on idle live child and keeps respawn fallback for active turns', async () => {
+  it('switches model in-process via SET_MODEL when idle and defers busy switch until after active turn on the same child', async () => {
     const sessionId = await provider.createSession({
       sessionKey: 'dsh-switch-route',
       cwd: '/tmp/project',
@@ -1090,25 +1093,37 @@ describe('DeepseekHarnessProvider /compact and preset models', () => {
     child.emitEvent({ type: DSH_BRIDGE_EVENT.MODEL_SELECTED, provider: 'glm5.3', model: 'glm-5.3-flashx' });
     await flush();
     expect(sessionInfos.at(-1)?.info).toMatchObject({ model: 'glm-5.3-flashx' });
-    await provider.send(sessionId, 'next on same child');
-    expect(spawnMock).toHaveBeenCalledTimes(1);
 
-    // Active turn: still falls back to detach + respawn with updated DSH_BRIDGE_MODEL_ENV.
-    const replacement = new FakeChild();
-    spawnMock.mockImplementation(() => {
-      setImmediate(() => replacement.emitEvent({
-        type: DSH_BRIDGE_EVENT.READY,
-        sessionId: 'dsh-compact-1',
-        provider: 'glm5.3',
-        model: 'glm-5.3-flash',
-        resumed: true,
-      }));
-      return replacement;
-    });
+    // Busy active turn: switching mid-turn must NOT interrupt the turn or kill/respawn child.
+    await provider.send(sessionId, 'busy turn on flashx');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const cmdsBeforeBusySwitch = child.commands().length;
     provider.setSessionAgentId(sessionId, 'glm5.3/glm-5.3-flash');
-    await provider.send(sessionId, 'next after active respawn');
-    expect(spawnMock).toHaveBeenCalledTimes(2);
-    const spawnEnv = spawnMock.mock.calls.at(-1)?.[2]?.env as Record<string, string> | undefined;
-    expect(spawnEnv?.[DSH_BRIDGE_MODEL_ENV]).toBe('glm-5.3-flash');
+    expect(child.killed).toBe(false);
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(child.commands()).toHaveLength(cmdsBeforeBusySwitch);
+
+    // Current active turn finishes cleanly on existing model without terminal errors.
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.DELTA, text: 'busy-done' });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'busy-done' });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
+    await flush();
+    expect(errors).toHaveLength(0);
+    expect(completions.at(-1)?.message.content).toBe('busy-done');
+
+    // Next turn flushes deferred SET_MODEL before PROMPT on the SAME child and preserves resumeId.
+    await provider.send(sessionId, 'next turn after busy switch');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const tail = child.commands().slice(cmdsBeforeBusySwitch);
+    expect(tail).toEqual([
+      { type: DSH_BRIDGE_COMMAND.SET_MODEL, provider: 'glm5.3', model: 'glm-5.3-flash' },
+      expect.objectContaining({ type: DSH_BRIDGE_COMMAND.PROMPT }),
+    ]);
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.MODEL_SELECTED, provider: 'glm5.3', model: 'glm-5.3-flash' });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.USAGE, inputTokens: 10, outputTokens: 5, model: 'glm-5.3-flash', finalized: true });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'on-flash' });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
+    await flush();
+    expect(completions.at(-1)?.message.metadata?.model).toBe('glm-5.3-flash');
   });
 });

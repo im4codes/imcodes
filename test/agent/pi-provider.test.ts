@@ -1285,4 +1285,131 @@ describe('PiProvider', () => {
       firstKeptEntryId: 'entry-slow',
     });
   });
+
+  it('defers busy model switches until after the active turn finishes and awaits SET_MODEL before next PROMPT', async () => {
+    const customChild = new FakePiChild();
+    spawnMock.mockReturnValue(customChild);
+    const errors: Array<{ error: ProviderError }> = [];
+    provider.onError((_id, error) => errors.push({ error }));
+    customChild.onCommand = (cmd) => {
+      if (cmd.type === PI_RPC_COMMAND.GET_STATE) {
+        return {
+          success: true,
+          data: {
+            sessionId: 'pi-busy-switch',
+            model: { id: 'glm-5.3-flash', provider: 'glm5.3', contextWindow: 1_000_000 },
+            thinkingLevel: 'medium',
+          },
+        };
+      }
+      if (cmd.type === PI_RPC_COMMAND.SET_MODEL) {
+        return {
+          success: true,
+          data: { id: cmd.modelId, provider: cmd.provider, contextWindow: 128_000 },
+        };
+      }
+      return undefined;
+    };
+
+    await provider.connect({});
+    const sid = await provider.createSession({
+      sessionKey: 'route-busy-switch',
+      sessionName: 'deck_busy_switch',
+      cwd: '/tmp',
+      agentId: 'glm5.3/glm-5.3-flash',
+      piLlm: {
+        provider: 'glm5.3',
+        model: 'glm-5.3-flash',
+        availableModels: ['glm-5.3-flash', 'glm-4.5-air'],
+      },
+    });
+
+    await provider.send(sid, 'turn 1 active');
+    const writtenBeforeSwitch = customChild.written.length;
+
+    // Model switch during active turn must NOT kill/detach child or send SET_MODEL mid-turn.
+    provider.setSessionAgentId(sid, 'glm5.3/glm-4.5-air');
+    await flush();
+    expect(killProcessTreeMock).not.toHaveBeenCalled();
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(customChild.written.slice(writtenBeforeSwitch)).toEqual([]);
+
+    // Active turn completes normally on original model.
+    customChild.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: {
+        role: 'assistant',
+        model: 'glm-5.3-flash',
+        content: [{ type: 'text', text: 'turn-1-ok' }],
+      },
+    });
+    customChild.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await flush();
+    expect(errors).toHaveLength(0);
+    expect(completions.at(-1)?.content).toBe('turn-1-ok');
+
+    // Next turn sends and awaits SET_MODEL ACK before PROMPT on the exact same child.
+    await provider.send(sid, 'turn 2 switched');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(killProcessTreeMock).not.toHaveBeenCalled();
+    const tail = customChild.written.slice(writtenBeforeSwitch);
+    expect(tail.map((c) => c.type)).toEqual([
+      PI_RPC_COMMAND.SET_MODEL,
+      PI_RPC_COMMAND.GET_AVAILABLE_THINKING_LEVELS,
+      PI_RPC_COMMAND.PROMPT,
+    ]);
+    expect(tail[0]).toMatchObject({ provider: 'glm5.3', modelId: 'glm-4.5-air' });
+  });
+
+  it('emits one terminal error when Pi exits mid-compact and suppresses stale continuations across recovery', async () => {
+    const firstChild = new FakePiChild();
+    const secondChild = new FakePiChild();
+    let spawnCount = 0;
+    spawnMock.mockImplementation(() => {
+      spawnCount += 1;
+      return spawnCount === 1 ? firstChild : secondChild;
+    });
+    const errors: Array<{ error: ProviderError }> = [];
+    const statuses: ProviderStatusUpdate[] = [];
+    provider.onError((_id, error) => errors.push({ error }));
+    provider.onStatus((_id, st) => statuses.push(st));
+
+    await provider.connect({});
+    const sid = await provider.createSession({
+      sessionKey: 'route-compact-exit',
+      sessionName: 'deck_compact_exit',
+      cwd: '/tmp',
+      agentId: 'minimax/MiniMax-M2.7',
+    });
+
+    const origWrite = firstChild.stdin.write;
+    firstChild.stdin.write = (chunk: string) => {
+      const command = JSON.parse(chunk.trim()) as Record<string, unknown>;
+      if (command.type === PI_RPC_COMMAND.COMPACT) {
+        firstChild.written.push(command);
+        return true;
+      }
+      return origWrite(chunk);
+    };
+
+    await provider.send(sid, '/compact');
+    expect(firstChild.written.some((c) => c.type === PI_RPC_COMMAND.COMPACT)).toBe(true);
+
+    // Unexpected child exit mid-compact must emit ONLY CONNECTION_LOST (never duplicate PROVIDER_ERROR).
+    firstChild.emit('exit', 1, null);
+    await flush();
+    expect(errors.map((e) => e.error.code)).toEqual(['CONNECTION_LOST']);
+    expect(statuses.at(-1)).toEqual({ status: null, label: null });
+
+    // Recover cleanly on replacement child without stale continuation interference.
+    await provider.send(sid, 'after recovery');
+    secondChild.emitFrame({
+      type: PI_RPC_FRAME.MESSAGE_END,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'recovered-ok' }] },
+    });
+    secondChild.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await flush();
+    expect(errors).toHaveLength(1);
+    expect(completions.at(-1)?.content).toBe('recovered-ok');
+  });
 });

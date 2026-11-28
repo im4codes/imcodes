@@ -121,6 +121,8 @@ interface DeepseekHarnessSessionState {
   model?: string;
   /** Model IM.codes asked for; pinned across respawns until the user changes it. */
   requestedModel?: string;
+  /** Deferred model switch recorded while a turn or startup is active, flushed before next prompt/compact. */
+  pendingModelSelection?: { provider?: string; model: string };
   provider?: string;
   /**
    * LLM config materialized from a ccPreset. Public route metadata is written
@@ -354,19 +356,37 @@ export class DeepseekHarnessProvider implements TransportProvider {
     if (!state || !model || state.requestedModel === model) return;
     state.requestedModel = model;
     const child = state.child;
-    if (child && state.readySettled && !state.turnActive) {
-      if (this.write(state, {
-        type: DSH_BRIDGE_COMMAND.SET_MODEL,
-        ...(provider ? { provider } : {}),
-        model,
-      })) {
-        return;
-      }
+    if (!child) {
+      state.pendingModelSelection = undefined;
+      return;
     }
-    // When a turn is active, startup is still in flight, or stdin cannot take
-    // SET_MODEL, detach BEFORE async teardown so a queued send() respawns cleanly.
+    if (!state.readySettled || state.turnActive) {
+      state.pendingModelSelection = { ...(provider ? { provider } : {}), model };
+      return;
+    }
+    state.pendingModelSelection = undefined;
+    if (this.write(state, {
+      type: DSH_BRIDGE_COMMAND.SET_MODEL,
+      ...(provider ? { provider } : {}),
+      model,
+    })) {
+      return;
+    }
+    // Stdin unavailable on an idle child: detach and tear down so the next send respawns cleanly.
     this.detachChild(state);
     void this.stopChild(state, child);
+  }
+
+  private flushPendingModelSelection(state: DeepseekHarnessSessionState): boolean {
+    const pending = state.pendingModelSelection;
+    if (!pending) return true;
+    if (!state.child || !state.readySettled) return false;
+    state.pendingModelSelection = undefined;
+    return this.write(state, {
+      type: DSH_BRIDGE_COMMAND.SET_MODEL,
+      ...(pending.provider ? { provider: pending.provider } : {}),
+      model: pending.model,
+    });
   }
 
   // ── Sending ────────────────────────────────────────────────────────────────
@@ -401,6 +421,10 @@ export class DeepseekHarnessProvider implements TransportProvider {
     this.emitStatus(sessionId, state, { status: 'working', label: null });
     state.turnGeneration++;
     await this.ensureChild(state);
+    if (!this.flushPendingModelSelection(state)) {
+      this.clearStatus(sessionId, state);
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'dsh bridge stdin is unavailable', true);
+    }
     state.currentText = '';
     state.committedSegments = [];
     state.currentMessageId = `${state.routeId}:${randomUUID()}`;
@@ -432,6 +456,10 @@ export class DeepseekHarnessProvider implements TransportProvider {
     } catch (error) {
       this.clearStatus(sessionId, state);
       throw error;
+    }
+    if (!this.flushPendingModelSelection(state)) {
+      this.clearStatus(sessionId, state);
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'dsh bridge stdin is unavailable', true);
     }
     this.resetTurn(state);
     state.turnActive = true;
@@ -563,11 +591,12 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // be cached: `dsh` missing from PATH emits 'error'+'close' and never 'exit',
     // so without this the first ENOENT would be replayed by every later send()
     // for the life of the session, even after the user installs it.
-    if (state.child && state.readyPromise && state.readySettled) {
+    if (state.child && state.readyPromise) {
       await state.readyPromise;
       return;
     }
     if (state.child) this.detachChild(state);
+    state.pendingModelSelection = undefined;
 
     // Decided on the spawn path before the overlay is written; recorded as
     // pending so an admission check during the write sees this spawn's fence.
@@ -720,6 +749,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
   private detachChild(state: DeepseekHarnessSessionState): void {
     state.child = null;
     state.childNativeAgentFence = undefined;
+    state.pendingModelSelection = undefined;
     state.reader?.close();
     state.reader = null;
     state.readyPromise = null;
