@@ -25,6 +25,8 @@ vi.mock('pg', () => ({
 
 import { buildApp, setupWebSocketUpgrade } from '../src/index.js';
 import { WsBridge } from '../src/ws/bridge.js';
+import { healthCheckCron } from '../src/cron/health-check.js';
+import { globalTaskHub } from '../src/services/global-task-hub.js';
 import {
   DAEMON_REBALANCE_NOTIFY_CHANNEL,
   DAEMON_REBALANCE_WS_CLOSE_CODE,
@@ -162,8 +164,7 @@ function makeStatefulServersDb(options: {
     last_heartbeat_at: number | null;
     connected_providers: Record<string, boolean>;
   };
-  onOfflineExecute?: () => Promise<void>;
-  onClearProvidersExecute?: () => Promise<void>;
+  onHeartbeatQuery?: () => Promise<void>;
 }) {
   const tokenHash = sha256Hex(options.secret);
   const row = options.sharedRow ?? {
@@ -179,55 +180,42 @@ function makeStatefulServersDb(options: {
     connected_providers: {} as Record<string, boolean>,
   };
 
-  function matchesHeartbeatCondition(sql: string, paramValue?: number): boolean {
-    if (sql.includes('last_heartbeat_at IS NULL OR last_heartbeat_at <=')) {
-      return row.last_heartbeat_at === null || row.last_heartbeat_at <= Number(paramValue);
-    }
-    if (sql.includes('last_heartbeat_at IS NULL')) {
-      return row.last_heartbeat_at === null;
-    }
-    return true;
-  }
-
   const db = {
     row,
     queryOne: async (sql: string) => {
       if (sql.includes('token_hash')) {
         return { ...row };
       }
-      if (sql.includes('SELECT last_heartbeat_at FROM servers')) {
-        return { last_heartbeat_at: row.last_heartbeat_at };
-      }
       return null;
     },
-    query: async () => [],
+    query: async (sql: string, params: unknown[] = []) => {
+      if (sql.includes("FROM servers WHERE status = 'online'")) {
+        const cutoff = Number(params[0]);
+        if (row.status === 'online' && (row.last_heartbeat_at === null || row.last_heartbeat_at < cutoff)) {
+          return [{ id: row.id, name: row.name, user_id: row.user_id, last_heartbeat_at: row.last_heartbeat_at }];
+        }
+        return [];
+      }
+      return [];
+    },
     execute: async (sql: string, params: unknown[] = []) => {
-      if (sql.includes('UPDATE servers') && sql.includes('last_heartbeat_at = GREATEST')) {
-        const requested = Number(params[0]);
-        const nextHb = Math.max(row.last_heartbeat_at !== null ? row.last_heartbeat_at + 1 : 0, requested);
-        row.last_heartbeat_at = nextHb;
+      if (sql.includes('UPDATE servers SET last_heartbeat_at')) {
+        if (options.onHeartbeatQuery) {
+          await options.onHeartbeatQuery();
+        }
+        row.last_heartbeat_at = Number(params[0]);
         row.status = String(params[1]);
         return { changes: 1 };
       }
-      if (sql.includes('UPDATE servers') && sql.includes('SET status = $1')) {
-        if (options.onOfflineExecute) {
-          await options.onOfflineExecute();
-        }
-        const maxHb = params.length >= 3 ? Number(params[2]) : undefined;
-        if (!matchesHeartbeatCondition(sql, maxHb)) {
-          return { changes: 0 };
-        }
+      if (sql.includes('UPDATE servers SET status = $1 WHERE id = $2')) {
         row.status = String(params[0]);
         return { changes: 1 };
       }
+      if (sql.includes("UPDATE servers SET status = 'offline' WHERE id = $1")) {
+        row.status = 'offline';
+        return { changes: 1 };
+      }
       if (sql.includes('UPDATE servers SET connected_providers') && sql.includes("'{}'::jsonb WHERE")) {
-        if (options.onClearProvidersExecute) {
-          await options.onClearProvidersExecute();
-        }
-        const maxHb = params.length >= 2 ? Number(params[1]) : undefined;
-        if (!matchesHeartbeatCondition(sql, maxHb)) {
-          return { changes: 0 };
-        }
         row.connected_providers = {};
         return { changes: 1 };
       }
@@ -791,30 +779,30 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
     }
   });
 
-  it('prevents delayed Pod A 1012 close DB cleanup from overwriting newer Pod B online and provider status, while still marking un-reconnected servers offline', async () => {
+  it('keeps shared online/provider state intact on 1012 rebalance close under heartbeat interleaving, preserves normal close offline marking, and expires un-reconnected servers via healthCheckCron', async () => {
     const serverId = 'srv-handoff-race';
-    const offlineGate = createDeferred<void>();
-    const clearGate = createDeferred<void>();
-    let gatePodAWrites = false;
+    const hbGateA = createDeferred<void>();
+    let gateHbA = true;
 
     const dbA = makeStatefulServersDb({
       serverId,
       secret: 'secret',
-      onOfflineExecute: async () => {
-        if (gatePodAWrites) await offlineGate.promise;
-      },
-      onClearProvidersExecute: async () => {
-        if (gatePodAWrites) await clearGate.promise;
+      onHeartbeatQuery: async () => {
+        if (gateHbA) {
+          gateHbA = false;
+          await hbGateA.promise;
+        }
       },
     });
-    // Separate pool/connection handle on Pod B mutating the SAME underlying server row without Pod A's close-write gate.
     const dbB = makeStatefulServersDb({
       serverId,
       secret: 'secret',
       sharedRow: dbA.row,
     });
 
-    // Simulate Pod A auth at t=1000 and Pod B auth ALSO observing t=1000 (worst-case same-ms clock).
+    const notifySpy = vi.spyOn(globalTaskHub, 'notifyServerState').mockResolvedValue();
+
+    // 1. Pod A authenticates while its DB heartbeat write is still in-flight, and receives provider status.
     let nowMs = 1_000;
     vi.spyOn(Date, 'now').mockImplementation(() => nowMs);
 
@@ -823,21 +811,19 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
     bridgeA.handleDaemonConnection(wsA as never, dbA, { JWT_SIGNING_KEY: signingKey } as Env);
     wsA.emit('message', Buffer.from(JSON.stringify({ type: 'auth', serverId, token: 'secret' })));
     await flushAsync();
-    expect(dbA.row.status).toBe('online');
-    const hbA = dbA.row.last_heartbeat_at!;
+    expect(bridgeA.isDaemonConnected()).toBe(true);
 
-    // Advance age past 5s and trigger 1012 rebalance on Pod A while delaying A's DB close writes.
+    // 2. Advance past minConnectionAgeMs (5s) and close Pod A via 1012 rebalance.
     nowMs = 7_000;
-    gatePodAWrites = true;
     expect(bridgeA.rebalanceDaemonConnection(5_000, 'pod-b', nowMs)).toBe(true);
     expect(wsA.closeCode).toBe(DAEMON_REBALANCE_WS_CLOSE_CODE);
     expect(bridgeA.isDaemonConnected()).toBe(false);
 
-    // Clear Pod A's in-memory singleton map so bridgeB models a distinct Pod B process instance.
+    // Move WsBridge singleton to model separate Pod B process.
     WsBridge.getAll().delete(serverId);
 
-    // Pod B authenticates the reconnected daemon (even if Pod B's clock read hbA = 1000) & sets provider status.
-    nowMs = hbA;
+    // 3. Pod B authenticates and sets provider status BEFORE Pod A's delayed heartbeat promise settles.
+    nowMs = 7_050;
     const bridgeB = WsBridge.get(serverId);
     const wsB = new MockWs();
     bridgeB.handleDaemonConnection(wsB as never, dbB, { JWT_SIGNING_KEY: signingKey } as Env);
@@ -849,26 +835,45 @@ describe('DaemonPodRebalancer & cross-pod WS rebalance', () => {
       connected: true,
     })));
     await flushAsync();
-    expect(dbA.row.status).toBe('online');
-    expect(dbA.row.last_heartbeat_at).toBeGreaterThan(hbA);
-    expect(dbA.row.connected_providers).toEqual({ 'claude-code': true });
 
-    // Release Pod A's delayed offline / provider-clear DB writes; DB row must stay online with providers intact.
-    gatePodAWrites = false;
-    clearGate.resolve();
-    offlineGate.resolve();
+    // Release Pod A's stalled heartbeat task and flush everything.
+    hbGateA.resolve();
     await flushAsync();
 
+    // Pod A's 1012 rebalance close must NOT emit offline status, provider clear, or globalTaskHub offline notify.
     expect(dbA.row.status).toBe('online');
     expect(dbA.row.connected_providers).toEqual({ 'claude-code': true });
+    expect(notifySpy.mock.calls.some(([, sid, online]) => sid === serverId && online === false)).toBe(false);
 
-    // Un-reconnected close (no Pod C takes over): closing wsB cleanly marks DB offline & clears providers.
-    const prevHbB = dbA.row.last_heartbeat_at!;
-    nowMs = prevHbB + 10_000;
+    // 4. Un-reconnected 1012 close: if a server closed via 1012 never reconnects anywhere,
+    // healthCheckCron marks it offline once its heartbeat expires (> 10 minutes).
+    nowMs += 10_000;
     expect(bridgeB.rebalanceDaemonConnection(5_000, 'pod-c', nowMs)).toBe(true);
     await flushAsync();
+    expect(dbA.row.status).toBe('online'); // not prematurely marked offline by rebalance close
 
+    nowMs += 10 * 60 * 1000 + 1; // past HEARTBEAT_TIMEOUT_MS (10 minutes)
+    await healthCheckCron({ DB: dbB } as unknown as Env);
+    expect(dbA.row.status).toBe('offline');
+
+    // 5. Normal non-rebalance socket close still marks status offline, clears providers, and emits global offline notify immediately.
+    WsBridge.getAll().delete(serverId);
+    const { bridge: bridgeC, daemonWs: wsC } = await connectAuthenticatedDaemon(serverId, 'secret', dbB);
+    wsC.emit('message', Buffer.from(JSON.stringify({
+      type: TRANSPORT_MSG.PROVIDER_STATUS,
+      providerId: 'codex',
+      connected: true,
+    })));
+    await flushAsync();
+    expect(dbA.row.status).toBe('online');
+    expect(dbA.row.connected_providers['codex']).toBe(true);
+
+    notifySpy.mockClear();
+    wsC.close(1006, 'network drop');
+    await flushAsync();
+    expect(bridgeC.isDaemonConnected()).toBe(false);
     expect(dbA.row.status).toBe('offline');
     expect(dbA.row.connected_providers).toEqual({});
+    expect(notifySpy.mock.calls.some(([, sid, online]) => sid === serverId && online === false)).toBe(true);
   });
 });

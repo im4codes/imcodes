@@ -2414,15 +2414,10 @@ export class WsBridge {
           normalizedVersion,
           options?.controlledCapabilities,
           options?.runtimeArch,
-          now,
         )
-      : updateServerHeartbeat(db, this.serverId, normalizedVersion, undefined, undefined, now);
+      : updateServerHeartbeat(db, this.serverId, normalizedVersion);
 
-    writePromise.then((storedHeartbeatAt) => {
-      if (this.daemonGeneration === connectionGeneration && this.lastHeartbeatDbWriteAt > 0) {
-        this.lastHeartbeatDbWriteAt = Math.max(this.lastHeartbeatDbWriteAt, storedHeartbeatAt);
-      }
-    }).catch((err) => {
+    writePromise.catch((err) => {
       if (this.daemonGeneration === connectionGeneration && this.lastHeartbeatDbWriteAt === now) {
         this.lastHeartbeatDbWriteAt = prevWriteAt;
         this.lastHeartbeatDbVersion = prevVersion;
@@ -7298,14 +7293,8 @@ export class WsBridge {
         this.remoteDesktopNodeContextCache = null;
         this.remoteDesktopNodeContextLastUnavailableGeneration = null;
         this.remoteDesktopNodeContextInFlight = null;
-        const lastRecordedHeartbeatAt = this.lastHeartbeatDbWriteAt;
         const isRebalanceClose = this.rebalanceClosedWs.delete(ws);
-        const presenceCondition = lastRecordedHeartbeatAt > 0
-          ? { maxLastHeartbeatAt: lastRecordedHeartbeatAt }
-          : isRebalanceClose
-            ? { maxLastHeartbeatAt: null }
-            : undefined;
-        this.resetHeartbeatDbPersistenceState('offline');
+        this.resetHeartbeatDbPersistenceState(isRebalanceClose ? null : 'offline');
         if (disconnectedOwnerUserId) {
           this.failDisconnectedCapabilityOperations(db, disconnectedOwnerUserId);
         }
@@ -7318,17 +7307,21 @@ export class WsBridge {
         this.remoteDesktopRouter.suspendDaemonGeneration(connectionGeneration);
         this.openspecAutoDeliverProjectionCache.clearActive();
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.DISCONNECTED }));
-        void clearProviderStatus(db, this.serverId, presenceCondition).catch(() => {});
-        void updateServerStatus(db, this.serverId, 'offline', presenceCondition)
-          .then((applied) => {
-            if (applied && !wasControlled) {
-              return globalTaskHub.notifyServerState(db, this.serverId, false).catch((err) =>
-                logger.warn({ err, serverId: this.serverId }, 'Global task server offline notify failed'),
-              );
-            }
-            return undefined;
-          })
-          .catch((err) => logger.error({ err }, 'Failed to mark server offline'));
+        // Rebalance closes clean only Pod A's local socket state: never emit
+        // shared offline/provider-clear writes or global offline notifications
+        // that could race ahead of/behind the target pod's reconnect. If the
+        // daemon never reconnects anywhere, health-check marks it offline.
+        if (!isRebalanceClose) {
+          void clearProviderStatus(db, this.serverId).catch(() => {});
+          updateServerStatus(db, this.serverId, 'offline').catch((err) =>
+            logger.error({ err }, 'Failed to mark server offline'),
+          );
+          if (!wasControlled) {
+            void globalTaskHub.notifyServerState(db, this.serverId, false).catch((err) =>
+              logger.warn({ err, serverId: this.serverId }, 'Global task server offline notify failed'),
+            );
+          }
+        }
 
         // ── Ack reliability: start grace window, don't yet announce offline ──
         // If daemon reconnects within RECONNECT_GRACE_MS, we replay inflight
