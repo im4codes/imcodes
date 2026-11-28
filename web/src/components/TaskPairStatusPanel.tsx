@@ -14,6 +14,17 @@ import { useNowTicker } from '../hooks/useNowTicker.js';
 import { formatTaskDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
+import { TaskAuditVerdictStrip } from './TaskAuditVerdictStrip.js';
+import { GlobalTaskBriefModal } from './GlobalTaskBriefModal.js';
+import {
+  isNoAuditorSentinel,
+  normalizeGlobalChecklist,
+  normalizeGlobalTaskAuditSummary,
+  type GlobalTaskSummaryRow,
+} from '@shared/global-task-mode.js';
+import { isInternalSessionDisplayValue } from '@shared/session-display.js';
+import { formatLabel } from '../format-label.js';
+import { formatModelPresentation } from '../model-label.js';
 import { closeServerTaskPair } from '../api.js';
 import type { TaskPairCloseAction } from '@shared/task-pair-close.js';
 import {
@@ -120,11 +131,13 @@ function resolveSessionModel(
   sessions: readonly SessionLabelEntry[] | undefined,
   projectionSessions: readonly { sessionName: string; title: string; activeModel?: string | null; requestedModel?: string | null }[],
 ): string | undefined {
-  if (typeof payloadModel === 'string' && payloadModel.trim()) return payloadModel.trim();
+  if (typeof payloadModel === 'string' && payloadModel.trim() && !isNoAuditorSentinel(payloadModel)) return payloadModel.trim();
   const session = sessions?.find((entry) => entry.name === id);
-  if (session?.activeModel?.trim() || session?.requestedModel?.trim()) return session.activeModel?.trim() || session.requestedModel?.trim() || undefined;
+  const sessionModel = session?.activeModel?.trim() || session?.requestedModel?.trim();
+  if (sessionModel && !isNoAuditorSentinel(sessionModel)) return sessionModel;
   const projected = projectionSessions.find((entry) => entry.sessionName === id);
-  return projected?.activeModel?.trim() || projected?.requestedModel?.trim() || undefined;
+  const projectedModel = projected?.activeModel?.trim() || projected?.requestedModel?.trim();
+  return projectedModel && !isNoAuditorSentinel(projectedModel) ? projectedModel : undefined;
 }
 
 function hasPairActivity(events: readonly TimelineEvent[], serverId?: string | null): boolean {
@@ -240,11 +253,22 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   const [closeConfirmTarget, setCloseConfirmTarget] = useState<TaskPairCloseConfirmTarget | null>(null);
   const [closeSending, setCloseSending] = useState(false);
   const [closeError, setCloseError] = useState<string | null>(null);
+  const [auditModalTarget, setAuditModalTarget] = useState<{
+    serverId: string;
+    taskId: string;
+    fallback: {
+      task: GlobalTaskSummaryRow;
+      statusLabel: string;
+      executorDisplay: string;
+      auditorDisplay: string;
+    };
+  } | null>(null);
   useEffect(() => {
     setOptimisticClosedRows(new Map());
     setRowContextMenu(null);
     setCloseConfirmTarget(null);
     setCloseError(null);
+    setAuditModalTarget(null);
   }, [serverId]);
   useEffect(() => {
     const handler = (e: Event) => {
@@ -303,6 +327,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   const {
     reworkCounts,
     taskTitles,
+    allRows,
     groups,
     scopedDefaultTaskId,
     counts,
@@ -381,6 +406,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     return {
       reworkCounts: nextReworkCounts,
       taskTitles: nextTaskTitles,
+      allRows: grouped.allRows,
       groups: grouped.groups,
       scopedDefaultTaskId: nextScopedDefaultTaskId,
       counts: nextCounts,
@@ -493,25 +519,147 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     toggle();
   };
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
+  const resolveCompactModel = (rawModel: unknown) => {
+    const trimmed = typeof rawModel === 'string' && rawModel.trim() && !isNoAuditorSentinel(rawModel)
+      ? rawModel.trim()
+      : '';
+    return trimmed ? formatModelPresentation(trimmed) : null;
+  };
+  const buildAuditModalContext = (row: TaskPairPanelRow) => {
+    if (!serverId) return null;
+    const payload = row.payload;
+    const taskIdStr = String(payload.taskId);
+    const taskStatus = String(payload.toStatus);
+    const title = taskPairDisplayTitle(payload.title, taskIdStr, payload.brief) ?? t('taskPair.panel_untitled');
+    const auditRound = Math.max(0, Math.floor(Number(payload.round ?? 0) || 0));
+    const flags = Array.isArray(payload.flags)
+      ? payload.flags.filter((f): f is string => typeof f === 'string')
+      : [];
+    const execId = typeof payload.executor === 'string' && payload.executor && !isNoAuditorSentinel(payload.executor)
+      ? payload.executor
+      : undefined;
+    const audRawId = typeof payload.auditor === 'string' ? payload.auditor : undefined;
+    const audId = audRawId && !isNoAuditorSentinel(audRawId) ? audRawId : undefined;
+    const execLabel = execId
+      ? (taskPairResolveDisplaySessionLabel(
+          execId,
+          payload.executorLabel,
+          sessions?.find((entry) => entry.name === execId),
+          projectionSessions.find((entry) => entry.sessionName === execId)?.title,
+        ) || t('taskPair.panel_executor'))
+      : undefined;
+    const audLabel = audId
+      ? (taskPairResolveDisplaySessionLabel(
+          audId,
+          payload.auditorLabel,
+          sessions?.find((entry) => entry.name === audId),
+          projectionSessions.find((entry) => entry.sessionName === audId)?.title,
+        ) || t('taskPair.panel_auditor'))
+      : undefined;
+    const executorDisplay = execLabel ? formatLabel(execLabel) : t('taskPair.card_unassigned');
+    let auditorDisplay: string;
+    if (isNoAuditorSentinel(audRawId)) {
+      auditorDisplay = t('taskMode.auditor_none', 'None');
+    } else if (audLabel) {
+      auditorDisplay = formatLabel(audLabel);
+    } else if (audId && !isInternalSessionDisplayValue(audId)) {
+      auditorDisplay = formatLabel(audId);
+    } else {
+      auditorDisplay = audId ? t('taskPair.panel_auditor') : t('taskPair.card_unassigned');
+    }
+    const rawExecModel = execId
+      ? resolveSessionModel(execId, payload.executorModel, sessions, projectionSessions)
+      : (typeof payload.executorModel === 'string' && payload.executorModel.trim() && !isNoAuditorSentinel(payload.executorModel)
+        ? payload.executorModel.trim()
+        : undefined);
+    const rawPayloadAudModel = typeof payload.auditorModel === 'string' && payload.auditorModel.trim()
+      ? payload.auditorModel.trim()
+      : undefined;
+    const rawAudModel = isNoAuditorSentinel(audRawId) || isNoAuditorSentinel(rawPayloadAudModel)
+      ? undefined
+      : (audId
+        ? resolveSessionModel(audId, rawPayloadAudModel, sessions, projectionSessions)
+        : rawPayloadAudModel);
+    const execCompact = rawExecModel ? formatModelPresentation(rawExecModel).label?.trim() || rawExecModel : undefined;
+    const audCompact = rawAudModel ? formatModelPresentation(rawAudModel).label?.trim() || rawAudModel : undefined;
+    const waitKind = getTaskPairWaitKind(payload);
+    const statusLabel = waitKind
+      ? t(`taskPair.status.${waitKind}`)
+      : flags.includes('blocked')
+        ? t('taskPair.flag.blocked')
+        : flags.includes('needs_input')
+          ? t('taskPair.flag.needs_input')
+          : taskStatus === 'rework' && auditRound > 0
+            ? t('taskPair.status.rework_round', { round: auditRound })
+            : t(`taskPair.status.${taskStatus}`, { defaultValue: taskStatus });
+    const brainSession = typeof payload.brain === 'string' && payload.brain.trim()
+      ? payload.brain.trim()
+      : (scopeSessionId || execId || '');
+    const createdAt = Number.isFinite(Number(payload.createdAt))
+      ? Number(payload.createdAt)
+      : (Number.isFinite(row.startedAt) ? row.startedAt : row.updatedAt);
+    const updatedAt = Number.isFinite(row.updatedAt) ? row.updatedAt : 0;
+    const lastAudit = normalizeGlobalTaskAuditSummary(payload.lastAudit);
+    const projectName = typeof payload.projectName === 'string' && payload.projectName.trim()
+      ? payload.projectName.trim()
+      : '';
+    const taskRow: GlobalTaskSummaryRow = {
+      serverId,
+      serverName: serverId,
+      serverOnline: true,
+      projectName,
+      brainSession,
+      brainLabel: '',
+      taskId: taskIdStr,
+      title,
+      status: taskStatus,
+      flags,
+      round: auditRound,
+      checklist: normalizeGlobalChecklist(payload.checklist as { total?: number; implemented?: number; audited?: number } | undefined),
+      ...(execLabel ? { executorLabel: execLabel } : {}),
+      ...(audLabel ? { auditorLabel: audLabel } : {}),
+      ...(execCompact ? { executorModel: execCompact } : {}),
+      ...(audCompact ? { auditorModel: audCompact } : {}),
+      ...(audRawId ? { auditor: audRawId } : {}),
+      ...(lastAudit ? { lastAudit } : {}),
+      ...(Number.isFinite(row.startedAt) ? { startedAt: row.startedAt } : {}),
+      ...(Number.isFinite(Number(payload.endedAt)) ? { endedAt: Number(payload.endedAt) } : {}),
+      createdAt,
+      updatedAt,
+      isTerminal: TASK_PAIR_TERMINAL_STATUSES.includes(taskStatus as TaskPairStatus),
+      needsAttention: flags.includes('blocked') || flags.includes('needs_input') || taskStatus === 'awaiting_brain_decision',
+    };
+    return {
+      task: taskRow,
+      statusLabel,
+      executorDisplay,
+      auditorDisplay,
+    };
+  };
   const session = (id: unknown, label: unknown, model: unknown, _thinking: unknown, role: 'executor' | 'auditor') => {
     // 'none' is a real, deliberate value (auditor=none): there is no session
     // to open, so it must not render as a dangling clickable placeholder.
     if (typeof id !== 'string' || !id || id === 'none') return null;
     const text = taskPairResolveDisplaySessionLabel(id, label, sessions?.find((entry) => entry.name === id), projectionSessions.find((entry) => entry.sessionName === id)?.title) || t(`taskPair.panel_${role}`);
     const resolvedModel = resolveSessionModel(id, model, sessions, projectionSessions);
+    const compactModel = resolveCompactModel(resolvedModel);
     return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => {
       if (isFullscreen) persistCollapsed(true);
       window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
     }}>
       <span class="task-pair-status-session-main">
         <span class="task-pair-status-session-label">{text}</span>
-        {resolvedModel && <small class="task-pair-status-session-model">{resolvedModel}</small>}
+        {compactModel?.label?.trim() && (
+          <small class="task-pair-status-session-model" title={compactModel.title}>
+            {compactModel.label}
+          </small>
+        )}
       </span>
     </button>;
   };
   const unassigned = (model: unknown, _thinking: unknown) => {
-    const modelText = typeof model === 'string' && model.trim() ? model.trim() : '';
-    return <small class="task-pair-role-unassigned">{t('taskPair.panel_unassigned')}{modelText ? `${t('taskPair.panel_model_separator')}${modelText}` : ''}</small>;
+    const compactModel = resolveCompactModel(model);
+    return <small class="task-pair-role-unassigned" title={compactModel?.title}>{t('taskPair.panel_unassigned')}{compactModel?.label?.trim() ? `${t('taskPair.panel_model_separator')}${compactModel.label}` : ''}</small>;
   };
   const durationUnits = {
     hour: t('taskPair.panel_duration_hour'),
@@ -573,6 +721,27 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
             status: payload.toStatus, flags: payload.flags ?? [], round: payload.round ?? 0,
           } as SupervisionConsolePairInfo} taskTitles={taskTitles} />
           <TaskPairBrief key={JSON.stringify([serverId, scopeSessionId, String(payload.taskId)])} brief={typeof payload.brief === 'string' ? payload.brief : undefined} briefRevision={typeof payload.briefRevision === 'string' ? payload.briefRevision : undefined} checklist={payload.checklist as { total: number; implemented: number; audited: number } | undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
+          {(() => {
+            const auditSummary = normalizeGlobalTaskAuditSummary(payload.lastAudit);
+            if (!auditSummary) return null;
+            return (
+              <TaskAuditVerdictStrip
+                audit={auditSummary}
+                taskId={taskIdStr}
+                testIdPrefix="task-pair-panel"
+                interactive={Boolean(serverId)}
+                onOpenDetails={serverId ? () => {
+                  const ctx = buildAuditModalContext(row);
+                  if (!ctx) return;
+                  setAuditModalTarget({
+                    serverId,
+                    taskId: taskIdStr,
+                    fallback: ctx,
+                  });
+                } : undefined}
+              />
+            );
+          })()}
           {duration !== undefined && <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{Number.isFinite(row.startedAt) && <>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · </>}{queued ? t('taskPair.panel_queued', { duration }) : t('taskPair.panel_elapsed', { duration })}</small>}
           <div class="task-pair-status-row-roles">
             <span class="task-pair-role-chip" role="group" aria-label={t('taskPair.panel_executor')}><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, payload.executorThinking, 'executor') ?? unassigned(payload.executorModel, payload.executorThinking)}</span>
@@ -736,6 +905,27 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       }}
       onConfirm={() => void handleConfirmCloseTask()}
     />
+    {auditModalTarget && auditModalTarget.serverId === serverId && (() => {
+      const liveRow = allRows.find((r) => String(r.payload.taskId) === auditModalTarget.taskId);
+      const ctx = (liveRow ? buildAuditModalContext(liveRow) : null) ?? auditModalTarget.fallback;
+      return (
+        <GlobalTaskBriefModal
+          task={ctx.task}
+          initialTab="audit"
+          statusLabel={ctx.statusLabel}
+          executorDisplay={ctx.executorDisplay}
+          auditorDisplay={ctx.auditorDisplay}
+          onClose={() => setAuditModalTarget(null)}
+          onJumpToSession={(_srvId, targetSession) => {
+            setAuditModalTarget(null);
+            if (isFullscreen) persistCollapsed(true);
+            if (targetSession) {
+              window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: targetSession } }));
+            }
+          }}
+        />
+      );
+    })()}
   </>;
 }
 

@@ -54,6 +54,7 @@ import {
 } from './TaskPairActionMenus.js';
 import type { TaskPairCloseAction } from '@shared/task-pair-close.js';
 import { GlobalTaskBriefModal, type GlobalTaskBriefTab } from './GlobalTaskBriefModal.js';
+import { TaskAuditVerdictStrip } from './TaskAuditVerdictStrip.js';
 
 export type GlobalTaskStatusFilter = 'all' | 'attention' | 'working' | 'audit' | 'done';
 
@@ -1584,69 +1585,14 @@ export function GlobalTaskModeView({
               <div class="global-task-timing-row">{timingEl}</div>
             )}
 
-            {(() => {
-              const audit = task.lastAudit;
-              if (!audit) return null;
-              const isRework = audit.verb === 'REWORK';
-              const blockingSet = new Set(audit.blocking.map((b) => b.toUpperCase()));
-              const blockingItems = (['P0', 'P1', 'P2', 'P3', 'P4'] as const)
-                .filter((lvl) => blockingSet.has(lvl))
-                .map((lvl) => ({ lvl, count: audit.counts[lvl.toLowerCase() as keyof typeof audit.counts] ?? 0 }))
-                .filter((entry) => entry.count > 0);
-              const blockingText = blockingItems.length > 0
-                ? blockingItems.map((entry) => `${entry.lvl} ×${entry.count}`).join(' · ')
-                : (audit.blockingCount > 0 ? `${audit.blocking[0] ?? 'P0'} ×${audit.blockingCount}` : '');
-              const otherChips = (['P0', 'P1', 'P2', 'P3', 'P4'] as const)
-                .filter((lvl) => !blockingSet.has(lvl))
-                .map((lvl) => ({ lvl, count: audit.counts[lvl.toLowerCase() as keyof typeof audit.counts] ?? 0 }))
-                .filter((entry) => entry.count > 0);
-              const verdictLabel = isRework
-                ? (audit.round > 0
-                  ? t('taskMode.audit_verdict_rework_round', { round: audit.round, defaultValue: `Rework · R${audit.round}` })
-                  : t('taskMode.audit_verdict_rework', 'Rework'))
-                : (audit.round > 0
-                  ? t('taskMode.audit_verdict_pass_round', { round: audit.round, defaultValue: `Passed · R${audit.round}` })
-                  : t('taskMode.audit_verdict_pass', 'Passed'));
-              const ctaLabel = audit.findingsCount > 0
-                ? t('taskMode.audit_open_details_count', { count: audit.findingsCount, defaultValue: `View 1..${audit.findingsCount}` })
-                : t('taskMode.audit_open_details', 'Details');
-              return (
-                <button
-                  type="button"
-                  class={`global-task-audit-strip ${isRework ? 'is-rework' : 'is-pass'}`}
-                  data-testid={`task-mode-audit-strip-${task.taskId}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    openBriefModal(task, 'audit');
-                  }}
-                >
-                  <div class="global-task-audit-strip-header">
-                    <span class="global-task-audit-strip-verdict">{verdictLabel}</span>
-                    {blockingText ? (
-                      <span
-                        class="global-task-audit-strip-blocking"
-                        data-testid={`task-mode-audit-blocking-${task.taskId}`}
-                      >
-                        {t('taskMode.audit_blocking_pending', { items: blockingText, defaultValue: `${blockingText} pending` })}
-                      </span>
-                    ) : (
-                      !isRework && (
-                        <span class="global-task-audit-strip-chip is-zero">P0 0</span>
-                      )
-                    )}
-                    {otherChips.map((chip) => (
-                      <span key={chip.lvl} class={`global-task-audit-strip-chip is-${chip.lvl.toLowerCase()}`}>
-                        {chip.lvl} ×{chip.count}
-                      </span>
-                    ))}
-                    <span class="global-task-audit-strip-cta">{ctaLabel} ›</span>
-                  </div>
-                  {audit.summary && (
-                    <div class="global-task-audit-strip-summary" title={audit.summary}>{audit.summary}</div>
-                  )}
-                </button>
-              );
-            })()}
+            {task.lastAudit && (
+              <TaskAuditVerdictStrip
+                audit={task.lastAudit}
+                taskId={task.taskId}
+                testIdPrefix="task-mode"
+                onOpenDetails={() => openBriefModal(task, 'audit')}
+              />
+            )}
 
             {task.liveSummary && (!task.lastAudit || (
               (task.flags.includes('blocked') || task.flags.includes('needs_input') || task.status === 'awaiting_brain_decision')

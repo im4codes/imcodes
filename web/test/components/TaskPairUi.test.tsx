@@ -1208,8 +1208,10 @@ describe('TaskPairStatusPanel', () => {
       payload: { taskId: 'Q-none', title: 'Queued no audit', toStatus: 'queued', auditor: 'none', executorModel: 'gpt-6-luna' },
     }] as never} />);
     expect(screen.getAllByText(/taskPair\.panel_unassigned/).length).toBe(3);
-    expect(screen.getAllByText(/gpt-6-luna/).length).toBe(2);
-    expect(screen.getByText(/gpt-6-sol/)).toBeTruthy();
+    expect(screen.getAllByText(/6-luna/).length).toBe(2);
+    expect(screen.getByText(/6-sol/)).toBeTruthy();
+    expect(screen.getAllByTitle('gpt-6-luna').length).toBe(2);
+    expect(screen.getByTitle('gpt-6-sol')).toBeTruthy();
     expect(screen.getByText('taskPair.panel_no_audit')).toBeTruthy();
   });
 
@@ -1333,9 +1335,11 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.getByText('Cx1')).toBeTruthy();
     expect(screen.queryByText('deck_sub_exec')).toBeNull();
     expect(document.querySelector('[data-session-name="deck_sub_exec"]')).toBeTruthy();
-    expect(screen.getByText('gpt-6-sol')).toBeTruthy();
-    expect(screen.getByText('gpt-6-astra')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: /Cx1.*gpt-6-sol/ }));
+    expect(screen.getByText('6-sol')).toBeTruthy();
+    expect(screen.getByText('6-astra')).toBeTruthy();
+    expect(screen.getByTitle('gpt-6-sol')).toBeTruthy();
+    expect(screen.getByTitle('gpt-6-astra')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /Cx1.*6-sol/ }));
     expect(navigate).toHaveBeenCalledWith('deck_sub_exec');
     window.removeEventListener('deck:navigate', listener);
   });

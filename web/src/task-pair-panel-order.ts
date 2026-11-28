@@ -244,11 +244,21 @@ export function mergeTaskPairTimelinePayload(
   oldPayload: Record<string, unknown> | undefined,
   nextPayload: Record<string, unknown>,
 ): Record<string, unknown> {
-  if (isValidTaskPairStatus(nextPayload.toStatus)) return nextPayload;
-  if (oldPayload && isValidTaskPairStatus(oldPayload.toStatus)) {
-    return { ...nextPayload, toStatus: oldPayload.toStatus };
+  const hasNextAudit = Object.prototype.hasOwnProperty.call(nextPayload, 'lastAudit');
+  const preservedAudit = !hasNextAudit && oldPayload && oldPayload.lastAudit != null
+    ? { lastAudit: oldPayload.lastAudit }
+    : {};
+  if (isValidTaskPairStatus(nextPayload.toStatus)) {
+    return Object.keys(preservedAudit).length > 0
+      ? { ...preservedAudit, ...nextPayload }
+      : nextPayload;
   }
-  return nextPayload;
+  if (oldPayload && isValidTaskPairStatus(oldPayload.toStatus)) {
+    return { ...preservedAudit, ...nextPayload, toStatus: oldPayload.toStatus };
+  }
+  return Object.keys(preservedAudit).length > 0
+    ? { ...preservedAudit, ...nextPayload }
+    : nextPayload;
 }
 
 export function resolveOrderedTaskPairRows({

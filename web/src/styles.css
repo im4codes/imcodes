@@ -20966,6 +20966,21 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-row-meta { display: flex; align-items: center; gap: 4px; opacity: .62; }
 .task-pair-status-row-meta-icon { font-size: 9px; opacity: .85; }
 .task-pair-status-row-roles { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.task-pair-status-row .global-task-audit-strip { min-width: 0; margin-top: 2px; }
+.task-pair-status-row .global-task-audit-strip.is-readonly { cursor: default; }
+.task-pair-status-row .global-task-audit-strip.is-readonly:hover,
+.task-pair-status-row .global-task-audit-strip.is-readonly:focus-visible {
+  border-color: rgba(148, 163, 184, 0.22);
+  box-shadow: none;
+}
+.task-pair-status-row .global-task-audit-strip.is-rework.is-readonly:hover,
+.task-pair-status-row .global-task-audit-strip.is-rework.is-readonly:focus-visible {
+  border-color: rgba(248, 113, 113, 0.42);
+}
+.task-pair-status-row .global-task-audit-strip.is-pass.is-readonly:hover,
+.task-pair-status-row .global-task-audit-strip.is-pass.is-readonly:focus-visible {
+  border-color: rgba(52, 211, 153, 0.36);
+}
 .task-pair-brief { min-width: 0; margin-top: 2px; }
 .task-pair-brief-actions { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; min-width: 0; }
 .task-pair-brief-actions button { border: 0; background: transparent; color: var(--chrome-accent, #67e8f9); padding: 1px 3px; font: inherit; font-size: 10px; cursor: pointer; }
