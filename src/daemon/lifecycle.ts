@@ -15,7 +15,7 @@ import { createSupervisionSessionPresentationResolver } from './supervision-sess
 import { createSupervisionPairRefreshScheduler } from './supervision-pair-refresh.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
 import { markDaemonProcess } from './process-role.js';
-import { stopProject, restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setSessionInfoModelSyncCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
+import { stopProject, restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setSessionInfoModelSyncCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, scrubTransportRuntimeTurnAuthorities, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import { beginUpgradeReadinessTracking, markGracefulShutdownStarted, markStartupPhaseDone } from './upgrade-readiness.js';
 import {
   captureRestartContinuationsBeforeShutdownDetailed,
@@ -41,6 +41,7 @@ import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import {
+  clearAllDaemonTurnAuthoritiesOnDisconnect,
   markTreeSessionIdle,
   registerTreeSessionActivityProbe,
   releaseProcessSharedMachineAuthority,
@@ -94,7 +95,7 @@ import { backfillProjectionEmbeddings } from '../context/projection-embedding-ma
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { setArchiveBackfillSchedulingEnabled } from '../store/archive-backfill-scheduling.js';
 import { isMemoryDaemonEnabled, isMemoryDisabledError } from '../store/memory-daemon-switch.js';
-import { getResendCount } from './transport-resend-queue.js';
+import { getResendCount, scrubResendQueueTurnAuthorities } from './transport-resend-queue.js';
 import {
   getTransportQueueStore,
   classifyQueueSweepCandidate,
@@ -1043,6 +1044,17 @@ export async function startup(): Promise<DaemonContext> {
     });
     setServerLinkDisconnectSecurityHandler(() => {
       disconnectSecurityCleanup();
+      clearAllDaemonTurnAuthoritiesOnDisconnect({
+        scrubTransportRuntimes: scrubTransportRuntimeTurnAuthorities,
+        scrubResendQueues: scrubResendQueueTurnAuthorities,
+        clearTaskPairAuthorities: () => {
+          try {
+            getTaskPairStore().clearInMemoryPrivateAuthorities();
+          } catch {
+            // Task-pair store may not be open in minimal lifecycle harnesses.
+          }
+        },
+      });
       closeDaemonPortForwards('server_link_disconnected');
     });
     const capabilitySyncServiceForOwner = (ownerId: string): CapabilitySyncService => {
@@ -1330,7 +1342,8 @@ export async function startup(): Promise<DaemonContext> {
 
   registerTreeSessionActivityProbe((sessionName) => {
     const rt = getTransportRuntime(sessionName);
-    if (rt && (rt.getStatus() !== 'idle' || rt.sending || rt.pendingCount > 0)) return true;
+    const rtStatus = rt?.getStatus();
+    if (rt && ((rtStatus !== undefined && rtStatus !== 'idle' && rtStatus !== 'error') || rt.sending || rt.pendingCount > 0)) return true;
     if (getResendCount(sessionName) > 0) return true;
     if (hasInFlightTaskPairMessageForSession(sessionName)) return true;
     return false;

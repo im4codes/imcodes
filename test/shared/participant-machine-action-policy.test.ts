@@ -20,8 +20,14 @@ describe.each(subjects)('%s real access', (_name, subject, mayView, mayExecute) 
     if (!expected && (subject.accessRole === 'owner' || subject.accessRole === 'participant')) {
       expect(participantTurnDecision).toEqual({ allowed: false, reason: D.EXECUTE_NOT_GRANTED });
     }
+    const nonParticipantTurnExpected =
+      action === MACHINE_ACTION.FILE_LIST
+      && subject.accessRole === 'participant'
+      && subject.accessSource === S.GROUP
+        ? true
+        : expected;
     const ownerTurn = evaluateMachineAction({ ...subject, participantTurn: false }, action);
-    expect(ownerTurn.allowed).toBe(expected);
+    expect(ownerTurn.allowed).toBe(nonParticipantTurnExpected);
     const switchedOff = evaluateMachineAction({ ...subject, execEnabled: false }, action);
     expect(switchedOff.allowed).toBe(action === MACHINE_ACTION.LIST && mayView);
   });

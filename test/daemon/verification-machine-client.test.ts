@@ -21,7 +21,7 @@ describe('verification machine online client', () => {
     await expect(listVerificationMachineProfiles('repo-1', { endpoint, fetchImpl }))
       .resolves.toMatchObject({ status: 'ok', profiles: [{ id: profile.id }] });
     expect(fetchImpl).toHaveBeenCalledWith(
-      'https://im.example.test/api/verification-machines?projectKey=repo-1',
+      'https://im.example.test/api/verification-machines?projectKey=repo-1&serverId=srv-1',
       expect.objectContaining({ headers: { Authorization: 'Bearer secret-token', 'X-Server-Id': 'srv-1' } }),
     );
   });

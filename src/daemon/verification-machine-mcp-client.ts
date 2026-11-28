@@ -77,8 +77,10 @@ async function request(options: Options, path: string, init: RequestInit) {
         return failure(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'shared machine authority unavailable');
       }
     }
+    const sep = path.includes('?') ? '&' : '?';
+    const stickyPath = `${VERIFICATION_MACHINE_API_PATH}${path}${sep}serverId=${encodeURIComponent(endpoint.serverId)}`;
     const response = await (options.fetchImpl ?? fetch)(
-      daemonApiUrl(endpoint.workerUrl, (init.method ?? 'GET') as DaemonHttpMethod, `${VERIFICATION_MACHINE_API_PATH}${path}`),
+      daemonApiUrl(endpoint.workerUrl, (init.method ?? 'GET') as DaemonHttpMethod, stickyPath),
       {
         ...init,
         headers: {

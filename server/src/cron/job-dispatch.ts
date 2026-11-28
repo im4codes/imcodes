@@ -17,7 +17,11 @@ import {
 } from '../db/tab-sharing.js';
 import { resolveServerMemberAccessOrShareDeny, resolveHttpShareAccessForCoveredSession } from '../routes/share-http-auth.js';
 import { isWholeServerShareUser } from '../security/server-share-boundary.js';
-import { issueOwnerMachineAuthorityForSession, issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import {
+  issueOwnerMachineAuthorityForSession,
+  issueSharedMachineAuthorityForSession,
+  revokeTurnAuthorityGrantByToken,
+} from '../share/shared-machine-authority.js';
 import type { Database } from '../db/client.js';
 import {
   CRON_EXACT_SEND_CAPABILITY_V1,
@@ -31,7 +35,11 @@ import {
   type CronAction,
   type CronDispatchMessage,
 } from '../../../shared/cron-types.js';
-import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
+import {
+  OWNER_MACHINE_AUTHORITY_FIELD,
+  SHARED_MACHINE_AUTHORITY_FIELD,
+  TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
+} from '../../../shared/shared-machine-authority.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../../shared/imcodes-send.js';
 import type { SharedActorEnvelope } from '../../../shared/tab-sharing.js';
 import logger from '../util/logger.js';
@@ -453,6 +461,7 @@ async function issueCronDispatchAuthority(
   executionId: string,
   prov: CronProvenanceRow | null,
   auth: Extract<SharedCronDispatchAuth, { authorized: true }>,
+  bridge: ReturnType<typeof WsBridge.get>,
 ): Promise<CronDispatchAuthorityFields> {
   const targetSessionName = job.target_session_name?.trim()
     || (job.project_name ? `deck_${job.project_name}_${job.target_role ?? 'brain'}` : '');
@@ -470,17 +479,28 @@ async function issueCronDispatchAuthority(
     return {};
   }
   if (!targetSessionName) return {};
+  const canMintTurnAuthority = typeof (bridge as { hasDaemonCapability?: unknown }).hasDaemonCapability === 'function'
+    && (bridge as { hasDaemonCapability: (cap: string) => boolean }).hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1);
+  const expectedGen = typeof (bridge as { daemonConnectionGeneration?: unknown }).daemonConnectionGeneration === 'function'
+    ? (bridge as { daemonConnectionGeneration: () => number }).daemonConnectionGeneration()
+    : undefined;
 
   if (auth.participantActorUserId && auth.participantSnapshot) {
     const shareTarget = auth.participantSnapshot.target;
-    const token = await issueSharedMachineAuthorityForSession(env.DB, {
-      actorUserId: auth.participantActorUserId,
-      sourceServerId: job.server_id,
-      sessionName: targetSessionName,
-      shareTarget,
-      actionId,
-      signingKey: env.JWT_SIGNING_KEY,
-    });
+    let token: string | null = canMintTurnAuthority
+      ? await issueSharedMachineAuthorityForSession(env.DB, {
+          actorUserId: auth.participantActorUserId,
+          sourceServerId: job.server_id,
+          sessionName: targetSessionName,
+          shareTarget,
+          actionId,
+          signingKey: env.JWT_SIGNING_KEY,
+        })
+      : null;
+    if (token && (!bridge.isDaemonConnected() || (expectedGen !== undefined && bridge.daemonConnectionGeneration?.() !== expectedGen))) {
+      revokeTurnAuthorityGrantByToken(job.server_id, token);
+      token = null;
+    }
     const sharedActor: SharedActorEnvelope = {
       actorUserId: auth.participantActorUserId,
       actorDisplayName: auth.participantActorUserId,
@@ -498,13 +518,18 @@ async function issueCronDispatchAuthority(
   }
 
   if (prov?.shared && prov.creator_user_id !== job.user_id) return {};
-  const token = await issueOwnerMachineAuthorityForSession(env.DB, {
+  if (!canMintTurnAuthority) return {};
+  let token = await issueOwnerMachineAuthorityForSession(env.DB, {
     actorUserId: job.user_id,
     sourceServerId: job.server_id,
     sessionName: targetSessionName,
     actionId,
     signingKey: env.JWT_SIGNING_KEY,
   });
+  if (token && (!bridge.isDaemonConnected() || (expectedGen !== undefined && bridge.daemonConnectionGeneration?.() !== expectedGen))) {
+    revokeTurnAuthorityGrantByToken(job.server_id, token);
+    token = null;
+  }
   return token ? { [OWNER_MACHINE_AUTHORITY_FIELD]: token } : {};
 }
 
@@ -564,7 +589,7 @@ export async function dispatchJobNow(
     logger.warn({ jobId: job.id }, 'Cron manual trigger: target_role is NULL, defaulting to brain');
   }
   const executionId = randomHex(12);
-  const authorityFields = await issueCronDispatchAuthority(env, job, executionId, provenance.row, auth);
+  const authorityFields = await issueCronDispatchAuthority(env, job, executionId, provenance.row, auth, bridge);
   const msg: CronDispatchMessage = {
     type: CRON_MSG.DISPATCH,
     jobId: job.id,
@@ -833,7 +858,7 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       // the claim, so the payload always describes the durable occurrence.
       const nextRun = job.next_run_at ?? calculateNextRun(job.cron_expr, now, job.timezone);
       const executionId = job.execution_id ?? randomHex(12);
-      const authorityFields = await issueCronDispatchAuthority(env, job, executionId, provenance.row, auth);
+      const authorityFields = await issueCronDispatchAuthority(env, job, executionId, provenance.row, auth, bridge);
       const msg: CronDispatchMessage = {
         type: CRON_MSG.DISPATCH,
         jobId: job.id,

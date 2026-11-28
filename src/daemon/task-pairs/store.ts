@@ -1147,6 +1147,10 @@ export class TaskPairStore {
     this.#inMemoryPrivateAuthorities.set(key, { kind: 'owner', authority, updatedAt: now });
   }
 
+  clearInMemoryPrivateAuthorities(): void {
+    this.#inMemoryPrivateAuthorities.clear();
+  }
+
   getPrivateAuthority(project: string, taskId: string): TaskPairPrivateAuthority | undefined {
     const key = pairKey(project, taskId);
     const row = this.#db.prepare('SELECT kind, actor_user_id, updated_at FROM task_pair_private_authority WHERE project = ? AND task_id = ?')

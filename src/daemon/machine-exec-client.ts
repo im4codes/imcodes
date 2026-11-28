@@ -295,7 +295,7 @@ export async function listMachines(opts: {
   const base = opts.serverUrl.replace(/\/+$/, '');
   let res: Response;
   try {
-    res = await doFetch(`${base}/api/machines`, {
+    res = await doFetch(`${base}/api/machines?serverId=${encodeURIComponent(opts.sourceServerId)}`, {
       headers: authHeaders(opts.sourceServerId, opts.sourceToken, opts.sharedMachineAuthority),
     });
   } catch (err) {

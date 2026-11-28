@@ -15,8 +15,10 @@ import { shareCancelDispatchDenial } from '../../shared/tab-sharing.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
   SHARED_MACHINE_AUTHORITY_FIELD,
+  TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
   TURN_AUTHORITY_TOKEN_PREFIX,
 } from '../../shared/shared-machine-authority.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { resolveSharedMachineAuthority } from '../src/share/shared-machine-authority.js';
 
 class MockWs extends EventEmitter {
@@ -78,6 +80,14 @@ async function connect(serverId: string, db: never, opts: { userId?: string; rol
   const daemon = new MockWs();
   bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-hot-path-key' } as never);
   daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+  await flush();
+  daemon.emit('message', JSON.stringify({
+    type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+    daemonId: serverId,
+    helloEpoch: 1,
+    sentAt: Date.now(),
+    capabilities: [TURN_AUTHORITY_REVOKE_CAPABILITY_V1],
+  }));
   await flush();
   daemon.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'deck_proj_brain', runtimeType: 'transport' }] }));
   await flush();

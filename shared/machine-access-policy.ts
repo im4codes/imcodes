@@ -103,6 +103,13 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
   if (!machineActionRequiresExecute(action)) return { allowed: true };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };
   if (subject.accessRole === 'participant') {
+    if (
+      action === MACHINE_ACTION.FILE_LIST
+      && !subject.participantTurn
+      && subject.accessSource === MACHINE_ACCESS_SOURCE.GROUP
+    ) {
+      return { allowed: true };
+    }
     return subject.execGranted === true
       ? { allowed: true }
       : { allowed: false, reason: MACHINE_DENIAL_REASON.EXECUTE_NOT_GRANTED };

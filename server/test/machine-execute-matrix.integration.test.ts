@@ -139,10 +139,10 @@ async function admits(name: string, action: MachineAction, token?: string): Prom
   return admission.ok;
 }
 
-/** Who may EXECUTE (exec, shell, GUI input, file send / fetch / list): the owner and participants with an explicit exec_granted=true share grant. */
+/** Who may EXECUTE (exec, shell, GUI input, file send / fetch / delegated list): the owner and participants with an explicit exec_granted=true share grant. */
 const MAY_EXECUTE = ['owner', 'pYes', 'groupAndGrant'];
-/** Directory listing is execute-class too unless exec_granted=true. */
-const MAY_LIST = ['owner', 'pYes', 'groupAndGrant'];
+/** Non-delegated browser/picker directory listing allows group participants in addition to execute-granted actors. */
+const MAY_LIST = ['owner', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
 /** Who may merely operate (view-class): every access that is not a viewer / nothing. */
 const MAY_VIEW = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
 
@@ -305,7 +305,7 @@ describe('exec_remote uses the participant grant on participant-origin turns', (
       token: headers[SHARED_MACHINE_AUTHORITY_HEADER], signingKey: KEY, authenticatedSourceServerId: owner.serverId,
       sourceOwnerUserId: owner.userId, targetServerId: nodeId, action: MACHINE_ACTION.FILE_LIST, now: Date.now(),
     });
-    expect(listAdmission.ok, MACHINE_ACTION.FILE_LIST).toBe(MAY_LIST.includes(name));
+    expect(listAdmission.ok, MACHINE_ACTION.FILE_LIST).toBe(mayExecute);
   });
 
   it.each(['pNo', 'pYes', 'gMember'])('%s: daemon list keeps the raw switch for non-EXEC consumers without owner-grant substitution', async (name) => {

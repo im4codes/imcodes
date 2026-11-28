@@ -624,7 +624,9 @@ describe('cron API authentication (real auth middleware)', () => {
       const bridge = WsBridge.get(VICTIM_SERVER);
       const origConnected = bridge.isDaemonConnected.bind(bridge);
       const origSend = bridge.sendToDaemon.bind(bridge);
+      const origCap = bridge.hasDaemonCapability.bind(bridge);
       bridge.isDaemonConnected = () => true;
+      bridge.hasDaemonCapability = () => true;
       bridge.sendToDaemon = (raw: string) => { sentPayloads.push(raw); };
       try {
         // Reload-based scheduled dispatch preserves restricted authority for both send and selfManaged command
@@ -655,6 +657,7 @@ describe('cron API authentication (real auth middleware)', () => {
         await expect(dispatchJobNow(env(state.db), tamperedJob as never)).rejects.toThrow('share_revoked');
       } finally {
         bridge.isDaemonConnected = origConnected;
+        bridge.hasDaemonCapability = origCap;
         bridge.sendToDaemon = origSend;
       }
       expect(sentPayloads).toHaveLength(4);

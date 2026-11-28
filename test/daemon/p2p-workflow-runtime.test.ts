@@ -19,6 +19,7 @@ import {
 } from '../../shared/transport/file-transfer.js';
 import { CRON_EXACT_SEND_CAPABILITY_V1 } from '../../shared/cron-types.js';
 import { R2_RELAY_CAPABILITY } from '../../shared/r2-relay.js';
+import { TURN_AUTHORITY_REVOKE_CAPABILITY_V1 } from '../../shared/shared-machine-authority.js';
 import type {
   P2pBindRuntimeContext,
   P2pCompiledWorkflow,
@@ -212,6 +213,7 @@ describe('ServerLink P2P workflow hello', () => {
       FILE_TRANSFER_SHARED_ACTOR_CAPABILITY,
       ASK_ANSWER_ACK_CAPABILITY_V1,
       CRON_EXACT_SEND_CAPABILITY_V1,
+      TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
     ]);
 
     link.updateP2pWorkflowCapabilities([
@@ -239,6 +241,7 @@ describe('ServerLink P2P workflow hello', () => {
       FILE_TRANSFER_SHARED_ACTOR_CAPABILITY,
       ASK_ANSWER_ACK_CAPABILITY_V1,
       CRON_EXACT_SEND_CAPABILITY_V1,
+      TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
     ]));
   });
 
@@ -310,6 +313,7 @@ describe('ServerLink P2P workflow hello', () => {
         FILE_TRANSFER_SHARED_ACTOR_CAPABILITY,
         ASK_ANSWER_ACK_CAPABILITY_V1,
         CRON_EXACT_SEND_CAPABILITY_V1,
+        TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
       ],
       timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
       timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
@@ -391,6 +395,7 @@ describe('ServerLink P2P workflow hello', () => {
         FILE_TRANSFER_SHARED_ACTOR_CAPABILITY,
         ASK_ANSWER_ACK_CAPABILITY_V1,
         CRON_EXACT_SEND_CAPABILITY_V1,
+        TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
       ]),
       timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
       timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,

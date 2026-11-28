@@ -7,12 +7,16 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import {
   bindProcessSharedMachineActivity,
+  bindTreeTurnAuthority,
+  clearAllDaemonTurnAuthoritiesOnDisconnect,
   clearProcessSharedMachineAuthoritiesForTests,
   markTreeSessionActive,
   markTreeSessionIdle,
+  markTreeSessionIdleIfInactive,
   readActiveTreeAuthorityForSession,
   registerTreeSessionActivityProbe,
   releaseProcessSharedMachineAuthority,
+  resolveCanonicalTurnAuthority,
   resolveDaemonRootSessionName,
   resolveSessionEffectiveSharedMachineAuthority,
 } from '../../src/daemon/shared-machine-authority-context.js';
@@ -22,6 +26,10 @@ import {
   readSenderParticipantTurn,
 } from '../../src/daemon/sender-participant-turn.js';
 import { setActiveServerLink } from '../../src/daemon/active-server-link.js';
+import { listMachines as listMachinesHttp } from '../../src/daemon/machine-exec-client.js';
+import { aliasMcpList } from '../../src/daemon/alias-mcp-client.js';
+import { listVerificationMachineProfiles } from '../../src/daemon/verification-machine-mcp-client.js';
+import { enqueueResend, getResendEntries, clearResend, scrubResendQueueTurnAuthorities } from '../../src/daemon/transport-resend-queue.js';
 import { upsertSession, removeSession, listSessions, type SessionRecord } from '../../src/store/session-store.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
@@ -212,6 +220,16 @@ describe('daemon unified main-tree turn authority', () => {
     expect(readSenderParticipantTurn(p2Brain.name)).toEqual({ actorUserId: 'user-p1', authority: tokP1 });
     expect(readSenderParticipantTurn(p3Brain.name)).toEqual({ actorUserId: 'user-p2', authority: tokP2 });
 
+    // Finish Tree 1's owner turn before P1 starts a serial turn on Tree 1 (O -> P1), while Trees 2 & 3 stay isolated.
+    t += 5_000;
+    releaseProcessSharedMachineAuthority(p1Brain.name, t);
+    await flushMicrotasks();
+    expect(sentFrames.pop()).toEqual({
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName: p1Brain.name,
+      tokenHash: sha256(tokO),
+    });
+
     // Participant P1 sends a message into Tree 1's sub-session (O -> P1): Tree 1 switches to P1 while Trees 2 & 3 stay untouched.
     const tokP1Tree1 = 'trg_part1_switch_tree1_abcdef12';
     t += 5_000;
@@ -224,7 +242,17 @@ describe('daemon unified main-tree turn authority', () => {
     expect(readSenderOwnerMachineAuthority(p1Brain.name)).toBeNull();
     expect(readSenderParticipantTurn(p3Brain.name)).toEqual({ actorUserId: 'user-p2', authority: tokP2 });
 
-    // Participant P2 sends into Tree 1 main session (P1 -> P2): Tree 1 immediately switches to P2!
+    // Finish Tree 1's P1 sub-session turn before P2 starts on Tree 1 (P1 -> P2).
+    t += 5_000;
+    releaseProcessSharedMachineAuthority(p1Sub.name, t);
+    await flushMicrotasks();
+    expect(sentFrames.pop()).toEqual({
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName: p1Brain.name,
+      tokenHash: sha256(tokP1Tree1),
+    });
+
+    // Participant P2 sends into Tree 1 main session (P1 -> P2): Tree 1 cleanly binds P2!
     const tokP2Tree1 = 'trg_part2_switch_tree1_abcdef12';
     t += 5_000;
     bindProcessSharedMachineActivity(p1Brain.name, idOf(p1Brain), {
@@ -393,5 +421,218 @@ describe('daemon unified main-tree turn authority', () => {
       await mcp.close();
       await new Promise<void>((resolve, reject) => hook.close((err) => err ? reject(err) : resolve()));
     }
+  });
+
+  it('P0 #1: poisons tree fail-closed when main (P2) and sub (P1) are simultaneously active, and rejects local/tree/generation mismatch across all canonical readers', async () => {
+    const main = seed({ name: 'deck_mix_main', projectName: 'mix', role: 'brain', state: 'running' });
+    const sub = seed({ name: 'deck_sub_mix', projectName: 'mix', role: 'w1', parentSession: main.name, state: 'running' });
+    const tokP2 = 'trg_p2_concurrent_11111111111111';
+    const tokP1 = 'trg_p1_concurrent_22222222222222';
+    const t = Date.now();
+
+    const genMain = bindTreeTurnAuthority(main.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p2',
+      authority: tokP2,
+    }, { now: t });
+    // Simultaneously (before main goes idle), child admits a DIFFERENT actor P1 in the same tree!
+    const genSub = bindTreeTurnAuthority(sub.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokP1,
+    }, { now: t + 50 });
+
+    expect(genSub).toBeGreaterThan(genMain);
+    // Prior token revoked immediately and tree poisoned to mixed
+    expect(sentFrames).toContainEqual({
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName: main.name,
+      tokenHash: sha256(tokP2),
+    });
+    expect(readActiveTreeAuthorityForSession(main.name)).toMatchObject({ kind: 'mixed', authority: null });
+
+    // Local runtime claiming P1 with an old/mismatched treeGeneration MUST NOT borrow any token
+    const p1Runtime = {
+      sending: true,
+      activeDispatchEntries: [{ sharedActor: { effectiveActorRole: 'participant', actorUserId: 'user-p1' }, sharedMachineAuthority: tokP1 }],
+      requiresSharedMachineAuthority: () => true,
+      getActiveSharedMachineAuthority: () => tokP1,
+      getActiveOwnerMachineAuthority: () => null,
+      activeTurnParticipantUserIds: () => ['user-p1'],
+      getActiveTreeGeneration: () => genMain,
+    };
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: sub.name,
+      identity: idOf(sub),
+      sessionRunning: true,
+      now: t + 100,
+      runtime: p1Runtime,
+    })).toEqual({ required: true, authority: null });
+
+    // Even if a test tree holds P2 directly, a runtime claiming local P1 cannot combine P1 actorUserId with P2 authority!
+    clearProcessSharedMachineAuthoritiesForTests();
+    const genTreeP2 = bindTreeTurnAuthority(main.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p2',
+      authority: tokP2,
+    }, { now: t + 200 });
+    expect(resolveCanonicalTurnAuthority({
+      sessionName: sub.name,
+      identity: idOf(sub),
+      sessionRunning: true,
+      now: t + 201,
+      runtime: { ...p1Runtime, getActiveTreeGeneration: () => genTreeP2 },
+    })).toMatchObject({ required: true, isParticipantScoped: true, actorUserId: AMBIGUOUS_PARTICIPANT_ACTOR, authority: null });
+
+    // Local owner turn when tree holds participant ALSO fails closed (never borrows participant or leaks owner)
+    expect(resolveCanonicalTurnAuthority({
+      sessionName: sub.name,
+      identity: idOf(sub),
+      sessionRunning: true,
+      now: t + 202,
+      runtime: {
+        sending: true,
+        activeDispatchEntries: [{}],
+        requiresSharedMachineAuthority: () => false,
+        getActiveSharedMachineAuthority: () => null,
+        getActiveOwnerMachineAuthority: () => null,
+      },
+    })).toMatchObject({ required: true, isParticipantScoped: true, authority: null });
+  });
+
+  it('P0 #2: revokes fast (<1500ms) turns via idle guard timer, failed task-pair inactive cleanup, error probe, and link disconnect + generation fence', async () => {
+    vi.useFakeTimers();
+    try {
+      const fastSess = seed({ name: 'deck_fast_brain', projectName: 'fast', role: 'brain', state: 'running' });
+      const tokFast = 'trg_fast_short_turn_111111111111';
+      let linkGen = 1;
+      let linkOpen = true;
+      setActiveServerLink({
+        send: (msg) => { sentFrames.push(msg as Record<string, unknown>); },
+        trySend: (msg) => {
+          if (!linkOpen) return false;
+          sentFrames.push(msg as Record<string, unknown>);
+          return true;
+        },
+        isConnected: () => linkOpen,
+        getConnectionGeneration: () => linkGen,
+      });
+
+      const t0 = Date.now();
+      bindProcessSharedMachineActivity(fastSess.name, idOf(fastSess), {
+        kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+        authority: tokFast,
+      }, { now: t0 }).typed(t0);
+
+      // Turn finishes in 300ms (< 1500ms idle guard) and session becomes idle
+      vi.advanceTimersByTime(300);
+      upsertSession({ ...fastSess, state: 'idle' });
+      releaseProcessSharedMachineAuthority(fastSess.name, Date.now());
+      await flushMicrotasks();
+      expect(sentFrames).toEqual([]);
+
+      // Advancing past 1500ms guard fires automatic recheck & revoke!
+      vi.advanceTimersByTime(1_300);
+      await flushMicrotasks();
+      expect(sentFrames).toEqual([{
+        type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+        rootSessionName: fastSess.name,
+        tokenHash: sha256(tokFast),
+      }]);
+
+      // Errored runtime + failed task-pair dispatch (`markTreeSessionIdleIfInactive`) both revoke cleanly
+      sentFrames.length = 0;
+      const errTok = 'trg_error_turn_22222222222222222';
+      const errSub = seed({ name: 'deck_sub_err', projectName: 'fast', role: 'w1', parentSession: fastSess.name });
+      let probeBusy = false;
+      unregisterProbe = registerTreeSessionActivityProbe((name) => name === errSub.name && probeBusy);
+      bindTreeTurnAuthority(fastSess.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: errTok }, { now: Date.now() });
+      markTreeSessionActive(errSub.name);
+      markTreeSessionIdleIfInactive(errSub.name);
+      markTreeSessionIdle(fastSess.name);
+      await flushMicrotasks();
+      expect(sentFrames).toEqual([{
+        type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+        rootSessionName: fastSess.name,
+        tokenHash: sha256(errTok),
+      }]);
+
+      // Disconnect scrubs treeAuthorities, windows, and resend RAM tokens + fences old link generation
+      sentFrames.length = 0;
+      const partSess = seed({ name: 'deck_dc_part', projectName: 'dc', role: 'brain', state: 'running' });
+      const tokDcPart = 'trg_dc_participant_333333333333';
+      bindProcessSharedMachineActivity(partSess.name, idOf(partSess), {
+        kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+        actorUserId: 'user-p1',
+        authority: tokDcPart,
+      }, { now: Date.now(), sessionRunning: true }).typed(Date.now());
+      clearResend(partSess.name);
+      enqueueResend(partSess.name, {
+        commandId: 'cmd-dc-1',
+        text: 'hello',
+        queuedAt: Date.now(),
+        sharedActor: { actorUserId: 'user-p1', actorDisplayName: 'P1', effectiveActorRole: 'participant', actionId: 'a1', origin: 'shared-tab', authorizedAt: 1, primaryShareId: null, snapshot: { target: { kind: 'main', serverId: 's1', sessionName: partSess.name }, effectiveRole: 'participant', historyCutoffAt: 0, coveringShareIds: [], authorizedAt: 1, nextCoverageRecheckAt: null } },
+        sharedMachineAuthority: tokDcPart,
+      }, true);
+
+      linkOpen = false;
+      clearAllDaemonTurnAuthoritiesOnDisconnect({ scrubResendQueues: scrubResendQueueTurnAuthorities });
+
+      // Active participant remains fail-closed (required: true, authority: null) with zero RAM tokens anywhere!
+      expect(readSenderParticipantTurn(partSess.name)).toEqual({ actorUserId: 'user-p1', authority: null });
+      expect(getResendEntries(partSess.name)[0]?.sharedMachineAuthority).toBeUndefined();
+      expect(getResendEntries(partSess.name)[0]?.sharedActor?.actorUserId).toBe('user-p1');
+      clearResend(partSess.name);
+
+      // Reconnecting at generation 2 must ignore late idle revoke from generation 1 tree entry
+      linkGen = 2;
+      linkOpen = true;
+      const gen1Tok = 'trg_gen1_old_44444444444444444444';
+      const genSess = seed({ name: 'deck_gen_fence', projectName: 'gf', role: 'brain' });
+      linkGen = 1;
+      bindTreeTurnAuthority(genSess.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: gen1Tok }, { now: Date.now() });
+      linkGen = 2;
+      markTreeSessionIdle(genSess.name);
+      await flushMicrotasks();
+      expect(sentFrames).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('P0 #4: source daemon HTTP clients always include ?serverId= for ingress sticky pod routing', async () => {
+    const urls: string[] = [];
+    const fetchStub = vi.fn(async (input: RequestInfo | URL) => {
+      urls.push(String(input));
+      if (String(input).includes('/api/machines')) {
+        return new Response(JSON.stringify({ machines: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (String(input).includes('/api/verification-machines')) {
+        return new Response(JSON.stringify({ profiles: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify({ aliases: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    });
+
+    await listMachinesHttp({
+      serverUrl: 'https://im.example.test',
+      sourceServerId: 'srv-src-sticky',
+      sourceToken: 'secret',
+      fetchImpl: fetchStub as unknown as typeof fetch,
+    });
+    await listVerificationMachineProfiles('proj-1', {
+      endpoint: { workerUrl: 'https://im.example.test', serverId: 'srv-src-sticky', token: 'secret' },
+      fetchImpl: fetchStub as unknown as typeof fetch,
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetchStub as unknown as typeof fetch;
+    try {
+      await aliasMcpList({ endpoint: { workerUrl: 'https://im.example.test', serverId: 'srv-src-sticky', token: 'secret' } });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(urls[0]).toBe('https://im.example.test/api/machines?serverId=srv-src-sticky');
+    expect(urls[1]).toBe('https://im.example.test/api/verification-machines?projectKey=proj-1&serverId=srv-src-sticky');
+    expect(urls[2]).toContain('https://im.example.test/api/aliases?');
+    expect(urls[2]).toContain('serverId=srv-src-sticky');
   });
 });

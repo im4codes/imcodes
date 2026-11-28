@@ -14,9 +14,9 @@ describe('process shared machine authority: wiring', () => {
     expect(idleBranch.slice(resyncGuard, release)).toContain("state === 'idle'");
   });
 
-  it('the hook answers from the live process window using the session running state', async () => {
+  it('the hook answers from the live tree/process authority using the session running state', async () => {
     const hook = await readSourceAsync(new URL('src/daemon/hook-server.ts', root));
-    expect(hook).toMatch(/readProcessSharedMachineAuthority\(session\.name,[\s\S]{0,200}session\.state === 'running'/);
+    expect(hook).toMatch(/resolveSessionEffectiveSharedMachineAuthority\(\{[\s\S]{0,200}sessionName:\s*session\.name,[\s\S]{0,200}sessionRunning:\s*session\.state === 'running'/);
   });
 
   it('all process input and send paths bind through the same function', async () => {

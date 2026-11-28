@@ -42,6 +42,17 @@ import { SESSION_GROUP_CLONE_CAPABILITY_V1, SESSION_GROUP_CLONE_MSG } from '../.
 import { SESSION_INCOGNITO_CAPABILITY } from '../../shared/session-incognito-types.js';
 import { encodeSessionIdentityDirectHandle } from '../../shared/session-identity.js';
 import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
+import { TURN_AUTHORITY_REVOKE_CAPABILITY_V1 } from '../../shared/shared-machine-authority.js';
+
+function emitTurnAuthorityHello(daemon: MockWs, serverId: string, sentAt = Date.now(), extraCaps: string[] = []): void {
+  daemon.emit('message', JSON.stringify({
+    type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+    daemonId: serverId,
+    helloEpoch: 1,
+    sentAt,
+    capabilities: [TURN_AUTHORITY_REVOKE_CAPABILITY_V1, ...extraCaps],
+  }));
+}
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -1009,6 +1020,8 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
+    emitTurnAuthorityHello(daemon, serverId, now);
+    await flushAsync();
     daemon.sent.length = 0;
 
     const shared = new MockWs();
@@ -1893,6 +1906,8 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
+    emitTurnAuthorityHello(daemon, serverId, now);
+    await flushAsync();
     daemon.sent.length = 0;
 
     const shared = new MockWs();
@@ -2127,6 +2142,8 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
+    emitTurnAuthorityHello(daemon, serverId, now);
+    await flushAsync();
     daemon.sent.length = 0;
 
     const shared = new MockWs();
@@ -2240,6 +2257,8 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
+    emitTurnAuthorityHello(daemon, serverId, now);
+    await flushAsync();
     daemon.sent.length = 0;
 
     const tabShare = new MockWs();
@@ -2348,6 +2367,8 @@ describe('WsBridge share-scoped sockets', () => {
     const daemon = new MockWs();
     bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    emitTurnAuthorityHello(daemon, serverId, now);
     await flushAsync();
     daemon.sent.length = 0;
 
@@ -2643,6 +2664,8 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
+    emitTurnAuthorityHello(daemon, serverId, now);
+    await flushAsync();
     daemon.sent.length = 0;
 
     const shared = new MockWs();
@@ -2768,6 +2791,7 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
+    emitTurnAuthorityHello(daemon, serverId, now);
     daemon.emit('message', JSON.stringify({
       type: 'session_list',
       sessions: [{ name: 'deck_proj_brain', runtimeType: 'transport' }],
@@ -3693,6 +3717,7 @@ describe('WsBridge share-scoped sockets', () => {
     bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-shell-ws-key' } as never);
     daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
     await flushAsync();
+    emitTurnAuthorityHello(daemon, serverId, now);
 
     // Sync one LLM main session and two shell/script sub-sessions so targetAgentType is known.
     daemon.emit('message', JSON.stringify({
@@ -4109,7 +4134,7 @@ describe('WsBridge share-scoped sockets', () => {
     daemon.emit('message', JSON.stringify({
       type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
       daemonId: serverId,
-      capabilities: [SESSION_GROUP_CLONE_CAPABILITY_V1],
+      capabilities: [SESSION_GROUP_CLONE_CAPABILITY_V1, TURN_AUTHORITY_REVOKE_CAPABILITY_V1],
       helloEpoch: 1,
       sentAt: now,
     }));
@@ -4254,7 +4279,7 @@ describe('WsBridge share-scoped sockets', () => {
     daemon.emit('message', JSON.stringify({
       type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
       daemonId: serverId,
-      capabilities: [SESSION_GROUP_CLONE_CAPABILITY_V1],
+      capabilities: [SESSION_GROUP_CLONE_CAPABILITY_V1, TURN_AUTHORITY_REVOKE_CAPABILITY_V1],
       helloEpoch: 1,
       sentAt: now,
     }));

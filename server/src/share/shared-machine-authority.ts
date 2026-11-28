@@ -16,6 +16,11 @@ import {
   type MachineDenialReason,
 } from '../../../shared/machine-access-policy.js';
 import {
+  defaultTurnAuthorityCluster,
+  type RemoteTurnAuthorityGrantMeta,
+  type TurnAuthorityClusterVerifier,
+} from './turn-authority-cluster.js';
+import {
   canOperateControlledMachine,
   listAccessibleControlledMachines,
   resolveControlledMachineOperatorAccess,
@@ -111,6 +116,112 @@ export function revokeTurnAuthorityGrantByHash(
   const grant = grantsByHash.get(normalized);
   if (!grant || grant.serverId !== serverId || grant.rootSessionName !== rootSessionName) return false;
   return deleteGrantByHash(normalized);
+}
+
+/** Revoke a live turn grant by raw opaque token for a specific source serverId (any tree). */
+export function revokeTurnAuthorityGrantByToken(serverId: string, token: string): boolean {
+  if (!token) return false;
+  const tokenHash = sha256Hex(token);
+  const grant = grantsByHash.get(tokenHash);
+  if (!grant || grant.serverId !== serverId) return false;
+  return deleteGrantByHash(tokenHash);
+}
+
+let customClusterVerifier: TurnAuthorityClusterVerifier | null | undefined;
+let daemonConnectedChecker: ((serverId: string) => boolean) | null = null;
+
+/**
+ * Bind this pod's live RAM grant store to the cross-pod PG LISTEN/NOTIFY verifier.
+ * Never persists grants or raw tokens; exposes only hashed lookups and atomic confirm-and-slide.
+ */
+export function bindDefaultTurnAuthorityCluster(isDaemonConnectedForServer: (serverId: string) => boolean): void {
+  daemonConnectedChecker = isDaemonConnectedForServer;
+  defaultTurnAuthorityCluster.bindLocalHandlers({
+    lookupLocalGrant(tokenHash, serverId, now) {
+      const grant = grantsByHash.get(tokenHash);
+      if (grant && grant.serverId === serverId && grant.expiresAt > now) {
+        return {
+          found: true,
+          grant: {
+            tokenHash: grant.tokenHash,
+            serverId: grant.serverId,
+            rootSessionName: grant.rootSessionName,
+            sessionName: grant.sessionName,
+            projectName: grant.projectName,
+            actorUserId: grant.actorUserId,
+            ownerUserId: grant.ownerUserId,
+            kind: grant.kind,
+            ...(grant.shareTarget ? { shareTarget: grant.shareTarget } : {}),
+            actionId: grant.actionId,
+            createdAt: grant.createdAt,
+          },
+        };
+      }
+      return {
+        found: false,
+        ownsConnectedDaemon: daemonConnectedChecker ? daemonConnectedChecker(serverId) : false,
+      };
+    },
+    confirmAndSlideLocalGrant(tokenHash, serverId, expectedCreatedAt, now) {
+      const grant = grantsByHash.get(tokenHash);
+      if (!grant || grant.serverId !== serverId || grant.createdAt !== expectedCreatedAt) return false;
+      if (grant.expiresAt <= now) {
+        deleteGrantByHash(tokenHash);
+        return false;
+      }
+      grant.lastUsedAt = now;
+      grant.expiresAt = Math.max(grant.expiresAt, now + TURN_AUTHORITY_TTL_MS);
+      return true;
+    },
+  });
+}
+
+export function setTurnAuthorityClusterVerifierForTests(verifier: TurnAuthorityClusterVerifier | null): void {
+  customClusterVerifier = verifier;
+}
+
+function getActiveClusterVerifier(): TurnAuthorityClusterVerifier {
+  return customClusterVerifier ?? defaultTurnAuthorityCluster;
+}
+
+function confirmAndSlideLocalGrantRecord(
+  tokenHash: string,
+  expectedGrant: TurnAuthorityGrantRecord,
+  now: number,
+): boolean {
+  const live = grantsByHash.get(tokenHash);
+  if (live !== expectedGrant || live.expiresAt <= now) {
+    if (live && live.expiresAt <= now) deleteGrantByHash(tokenHash);
+    return false;
+  }
+  live.lastUsedAt = now;
+  live.expiresAt = Math.max(live.expiresAt, now + TURN_AUTHORITY_TTL_MS);
+  return true;
+}
+
+async function reconfirmTurnAuthorityGrantLiveness(input: {
+  tokenHash: string;
+  serverId: string;
+  expectedCreatedAt: number;
+  remoteOwnerPodId?: string;
+  now: number;
+}): Promise<boolean> {
+  if (input.remoteOwnerPodId) {
+    return getActiveClusterVerifier().confirmAndSlideGrant(
+      input.remoteOwnerPodId,
+      input.tokenHash,
+      input.serverId,
+      input.expectedCreatedAt,
+      input.now,
+    );
+  }
+  const live = grantsByHash.get(input.tokenHash);
+  if (!live || live.serverId !== input.serverId || live.createdAt !== input.expectedCreatedAt) return false;
+  if (live.expiresAt <= input.now) {
+    deleteGrantByHash(input.tokenHash);
+    return false;
+  }
+  return true;
 }
 
 /** Delete every active turn grant associated with a disconnected/replaced daemon server WS. */
@@ -434,6 +545,8 @@ export type SharedMachineAuthorityDecision =
       rootSessionName: string;
       projectName: string;
       tokenHash: string;
+      grantCreatedAt: number;
+      remoteOwnerPodId?: string;
     }
   | {
       kind: 'participant';
@@ -444,11 +557,14 @@ export type SharedMachineAuthorityDecision =
       shareTarget?: ShareTarget;
       actionId: string;
       tokenHash: string;
+      grantCreatedAt: number;
+      remoteOwnerPodId?: string;
     };
 
 /**
- * Verify the server-stateful in-memory opaque turn grant and re-read the live share grant
- * or owner identity from DB. Never accepts stateless tokens or falls back to source-owner authority.
+ * Verify the server-stateful in-memory opaque turn grant (local RAM or cross-pod cluster RPC)
+ * and re-read the live share grant or owner identity from DB. Reconfirms live grant presence
+ * after every DB await before sliding TTL so concurrent revocation rejects in-flight admissions.
  */
 export async function resolveSharedMachineAuthority(
   db: Database,
@@ -462,15 +578,31 @@ export async function resolveSharedMachineAuthority(
 ): Promise<SharedMachineAuthorityDecision> {
   if (!input.token) return { kind: 'absent' };
   const tokenHash = sha256Hex(input.token);
-  const grant = grantsByHash.get(tokenHash);
+  const now = input.now;
+  const localGrant = grantsByHash.get(tokenHash);
+  let grant: TurnAuthorityGrantRecord | RemoteTurnAuthorityGrantMeta | undefined = localGrant;
+  let remoteOwnerPodId: string | undefined;
+
+  if (!grant) {
+    const remote = await getActiveClusterVerifier().lookupGrant(
+      tokenHash,
+      input.authenticatedSourceServerId,
+      now,
+    );
+    if (remote && remote.found && remote.grant.tokenHash === tokenHash) {
+      grant = remote.grant;
+      remoteOwnerPodId = remote.ownerPodId;
+    }
+  }
+
   if (!grant || grant.serverId !== input.authenticatedSourceServerId) {
     return { kind: 'invalid' };
   }
-  const now = input.now;
-  if (grant.expiresAt <= now) {
+  if (!remoteOwnerPodId && (grant as TurnAuthorityGrantRecord).expiresAt <= now) {
     deleteGrantByHash(tokenHash);
     return { kind: 'invalid' };
   }
+
   if (grant.kind === 'owner') {
     if (input.sourceOwnerUserId && grant.actorUserId !== input.sourceOwnerUserId) {
       return { kind: 'invalid' };
@@ -484,8 +616,16 @@ export async function resolveSharedMachineAuthority(
         return { kind: 'invalid' };
       }
     }
-    grant.lastUsedAt = now;
-    grant.expiresAt = Math.max(grant.expiresAt, now + TURN_AUTHORITY_TTL_MS);
+    const confirmed = remoteOwnerPodId
+      ? await getActiveClusterVerifier().confirmAndSlideGrant(
+          remoteOwnerPodId,
+          tokenHash,
+          input.authenticatedSourceServerId,
+          grant.createdAt,
+          now,
+        )
+      : confirmAndSlideLocalGrantRecord(tokenHash, localGrant!, now);
+    if (!confirmed) return { kind: 'invalid' };
     return {
       kind: 'owner',
       actorUserId: grant.actorUserId,
@@ -493,8 +633,11 @@ export async function resolveSharedMachineAuthority(
       rootSessionName: grant.rootSessionName,
       projectName: grant.projectName,
       tokenHash: grant.tokenHash,
+      grantCreatedAt: grant.createdAt,
+      ...(remoteOwnerPodId ? { remoteOwnerPodId } : {}),
     };
   }
+
   const shareTarget = grant.shareTarget;
   if (!shareTarget || shareTarget.serverId !== input.authenticatedSourceServerId) {
     return { kind: 'invalid' };
@@ -514,11 +657,19 @@ export async function resolveSharedMachineAuthority(
     now,
   });
   if (!coverage || coverage.effectiveRole !== 'participant') {
-    deleteGrantByHash(tokenHash);
+    if (!remoteOwnerPodId) deleteGrantByHash(tokenHash);
     return { kind: 'invalid' };
   }
-  grant.lastUsedAt = now;
-  grant.expiresAt = Math.max(grant.expiresAt, now + TURN_AUTHORITY_TTL_MS);
+  const confirmed = remoteOwnerPodId
+    ? await getActiveClusterVerifier().confirmAndSlideGrant(
+        remoteOwnerPodId,
+        tokenHash,
+        input.authenticatedSourceServerId,
+        grant.createdAt,
+        now,
+      )
+    : confirmAndSlideLocalGrantRecord(tokenHash, localGrant!, now);
+  if (!confirmed) return { kind: 'invalid' };
   return {
     kind: 'participant',
     actorUserId: grant.actorUserId,
@@ -528,7 +679,52 @@ export async function resolveSharedMachineAuthority(
     shareTarget,
     actionId: grant.actionId,
     tokenHash: grant.tokenHash,
+    grantCreatedAt: grant.createdAt,
+    ...(remoteOwnerPodId ? { remoteOwnerPodId } : {}),
   };
+}
+
+interface DetailedOperationalUser {
+  userId: string;
+  delegatedActorUserId?: string;
+  authorityKind: 'absent' | 'owner' | 'participant';
+  tokenHash?: string;
+  grantCreatedAt?: number;
+  remoteOwnerPodId?: string;
+}
+
+async function resolveMachineOperationalUserDetailed(
+  db: Database,
+  input: {
+    token: string | undefined;
+    signingKey: string;
+    authenticatedSourceServerId: string;
+    sourceOwnerUserId: string;
+    now: number;
+  },
+): Promise<DetailedOperationalUser | null> {
+  const delegated = await resolveSharedMachineAuthority(db, input);
+  if (delegated.kind === 'invalid') return null;
+  if (delegated.kind === 'participant') {
+    return {
+      userId: input.sourceOwnerUserId,
+      delegatedActorUserId: delegated.actorUserId,
+      authorityKind: 'participant',
+      tokenHash: delegated.tokenHash,
+      grantCreatedAt: delegated.grantCreatedAt,
+      ...(delegated.remoteOwnerPodId ? { remoteOwnerPodId: delegated.remoteOwnerPodId } : {}),
+    };
+  }
+  if (delegated.kind === 'owner') {
+    return {
+      userId: input.sourceOwnerUserId,
+      authorityKind: 'owner',
+      tokenHash: delegated.tokenHash,
+      grantCreatedAt: delegated.grantCreatedAt,
+      ...(delegated.remoteOwnerPodId ? { remoteOwnerPodId: delegated.remoteOwnerPodId } : {}),
+    };
+  }
+  return { userId: input.sourceOwnerUserId, authorityKind: 'absent' };
 }
 
 export async function resolveMachineOperationalUser(
@@ -541,15 +737,13 @@ export async function resolveMachineOperationalUser(
     now: number;
   },
 ): Promise<{ userId: string; delegatedActorUserId?: string; authorityKind: 'absent' | 'owner' | 'participant' } | null> {
-  const delegated = await resolveSharedMachineAuthority(db, input);
-  if (delegated.kind === 'invalid') return null;
-  if (delegated.kind === 'participant') {
-    return { userId: input.sourceOwnerUserId, delegatedActorUserId: delegated.actorUserId, authorityKind: 'participant' };
-  }
-  if (delegated.kind === 'owner') {
-    return { userId: input.sourceOwnerUserId, authorityKind: 'owner' };
-  }
-  return { userId: input.sourceOwnerUserId, authorityKind: 'absent' };
+  const detailed = await resolveMachineOperationalUserDetailed(db, input);
+  if (!detailed) return null;
+  return {
+    userId: detailed.userId,
+    ...(detailed.delegatedActorUserId ? { delegatedActorUserId: detailed.delegatedActorUserId } : {}),
+    authorityKind: detailed.authorityKind,
+  };
 }
 
 /**
@@ -612,7 +806,7 @@ export async function admitMachineAction(
   db: Database,
   input: MachineActionAdmissionInput,
 ): Promise<MachineActionAdmission> {
-  const operational = await resolveMachineOperationalUser(db, input);
+  const operational = await resolveMachineOperationalUserDetailed(db, input);
   // An invalid / expired / foreign turn authority never falls back to the owner.
   if (!operational) return { ok: false, reason: MACHINE_DENIAL_REASON.NO_ACCESS, accessSource: null };
   const delegatedActorUserId = operational.delegatedActorUserId;
@@ -642,6 +836,16 @@ export async function admitMachineAction(
     participantTurn: Boolean(delegatedActorUserId),
   }, input.action);
   if (!decision.allowed) return deny(decision.reason, target.access_source);
+  if (operational.authorityKind !== 'absent' && operational.tokenHash && operational.grantCreatedAt !== undefined) {
+    const stillLive = await reconfirmTurnAuthorityGrantLiveness({
+      tokenHash: operational.tokenHash,
+      serverId: input.authenticatedSourceServerId,
+      expectedCreatedAt: operational.grantCreatedAt,
+      remoteOwnerPodId: operational.remoteOwnerPodId,
+      now: input.now,
+    });
+    if (!stillLive) return deny(MACHINE_DENIAL_REASON.NO_ACCESS, null);
+  }
   return { ok: true, target, ...(delegatedActorUserId ? { delegatedActorUserId } : {}) };
 }
 

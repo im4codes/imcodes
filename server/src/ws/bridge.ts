@@ -55,11 +55,13 @@ import {
   issueSharedMachineAuthorityForSession,
   revokeAllTurnAuthorityGrantsForServer,
   revokeTurnAuthorityGrantByHash,
+  revokeTurnAuthorityGrantByToken,
 } from '../share/shared-machine-authority.js';
 import {
   OWNER_MACHINE_AUTHORITY_FIELD,
   SHARED_MACHINE_AUTHORITY_FIELD,
   SHARE_PROCESS_INPUT_COMMANDS,
+  TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
   isTurnAuthorityRevokeMessage,
 } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
@@ -2841,6 +2843,11 @@ export class WsBridge {
   private providerStatus = new Map<string, boolean>();
   /** Cached advanced P2P capabilities for the current authenticated daemon socket. */
   private daemonP2pWorkflowCapabilities: DaemonP2pWorkflowCapabilities | null = null;
+  private pendingPreAuthDaemonHello: {
+    ws: WebSocket;
+    generation: number;
+    msg: Record<string, unknown>;
+  } | null = null;
   /** Strict auth-advertised capability versions for a CONTROLLED node socket. */
   private controlledNodeCapabilities = new Set<ControlledNodeCapability>();
   /** Latest sanitized OpenSpec Auto Deliver projections; protocol routing waits for shared message constants. */
@@ -6274,6 +6281,7 @@ export class WsBridge {
     // process's lower hello epoch look stale forever, leaving browsers on the
     // pre-upgrade capability snapshot even though the new daemon is healthy.
     this.daemonP2pWorkflowCapabilities = null;
+    this.pendingPreAuthDaemonHello = null;
     this.remoteDesktopAuthorityReadyGeneration = null;
     this.directFileTransferRouter.setDaemonGeneration(connectionGeneration);
     this.remoteDesktopRouter.setDaemonGeneration(connectionGeneration);
@@ -6357,6 +6365,14 @@ export class WsBridge {
           this.acknowledgeControlledNodeHeartbeat(msg, ws, db, connectionGeneration);
           return;
         }
+      }
+      if (
+        msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO
+        && this.authPromise
+        && !this.authenticated
+      ) {
+        this.pendingPreAuthDaemonHello = { ws, generation: connectionGeneration, msg };
+        return;
       }
       if (this.authPromise) {
         const pendingAuth = this.authPromise;
@@ -6816,6 +6832,21 @@ export class WsBridge {
           this.graceTimer = null;
         }
         this.daemonOfflineAnnounced = false;
+        if (
+          this.pendingPreAuthDaemonHello
+          && this.pendingPreAuthDaemonHello.ws === ws
+          && this.pendingPreAuthDaemonHello.generation === connectionGeneration
+          && this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+        ) {
+          const helloMsg = this.pendingPreAuthDaemonHello.msg;
+          this.pendingPreAuthDaemonHello = null;
+          this.handleDaemonP2pWorkflowHello(helloMsg);
+          try {
+            ws.send(JSON.stringify({ type: SESSION_INCOGNITO_SERVER_READY }));
+          } catch { /* ignore */ }
+        } else {
+          this.pendingPreAuthDaemonHello = null;
+        }
         await this.replayInflightToDaemon(ws, connectionGeneration);
         if (!isCurrentAuthConnection()) {
           finishLocalAuth();
@@ -7321,6 +7352,7 @@ export class WsBridge {
         }
         this.providerStatus.clear();
         this.daemonP2pWorkflowCapabilities = null;
+    this.pendingPreAuthDaemonHello = null;
         this.controlledNodeCapabilities.clear();
         this.daemonControlledOs = null;
         this.daemonControlledArch = null;
@@ -8164,9 +8196,25 @@ export class WsBridge {
         const capturedMsg = msg;
         const capturedRaw = raw;
         await this.enqueueOwnerCommand(ws, async () => {
+          const isSessionSend = capturedMsg.type === 'session.send'
+            && typeof capturedMsg.commandId === 'string'
+            && targetSession.length > 0;
+          if (isSessionSend && this.inflightCommands.has(capturedMsg.commandId as string)) {
+            return;
+          }
+          if (isSessionSend && !this.isDaemonConnected()) {
+            this.handleOutboundSessionSend(ws, capturedMsg.commandId as string, targetSession, capturedRaw);
+            return;
+          }
+          if (!isSessionSend && !this.isDaemonConnected()) {
+            this.sendToDaemon(capturedRaw);
+            return;
+          }
           let stampedMsg = capturedMsg;
           let stampedRaw = capturedRaw;
-          if (targetSession && this.db && this.directFileTransferTicketSigningKey && userId) {
+          const expectedGen = this.daemonConnectionGeneration();
+          const canMintTurnAuthority = this.isDaemonConnected() && this.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1);
+          if (canMintTurnAuthority && targetSession && this.db && this.directFileTransferTicketSigningKey && userId) {
             const token = browserMessageType === 'session.send'
               ? await issueOwnerMachineAuthorityForSession(this.db, {
                   actorUserId: userId,
@@ -8180,12 +8228,16 @@ export class WsBridge {
                 })
               : await this.ownerInputMachineAuthority(ws, userId, targetSession);
             if (token) {
-              stampedMsg = { ...capturedMsg, [OWNER_MACHINE_AUTHORITY_FIELD]: token };
-              stampedRaw = JSON.stringify(stampedMsg);
+              if (!this.isDaemonConnected() || this.daemonConnectionGeneration() !== expectedGen) {
+                revokeTurnAuthorityGrantByToken(this.serverId, token);
+              } else {
+                stampedMsg = { ...capturedMsg, [OWNER_MACHINE_AUTHORITY_FIELD]: token };
+                stampedRaw = JSON.stringify(stampedMsg);
+              }
             }
           }
-          if (stampedMsg.type === 'session.send' && typeof stampedMsg.commandId === 'string' && targetSession) {
-            this.handleOutboundSessionSend(ws, stampedMsg.commandId, targetSession, stampedRaw);
+          if (isSessionSend) {
+            this.handleOutboundSessionSend(ws, stampedMsg.commandId as string, targetSession, stampedRaw);
             return;
           }
           this.sendToDaemon(stampedRaw);
@@ -8531,18 +8583,32 @@ export class WsBridge {
         ? commandSessionName(decision.stampedMessage)
         : null
     ) ?? sessionName;
-    if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
-      const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
-      const token = actor ? await this.issueShareMachineAuthority(actor, sessionName) : null;
-      if (!token) {
-        const denied: ShareCommandDecision = { allowed: false, reason: SHARE_REASONS.TARGET_UNAVAILABLE };
-        this.queueShareCommandAudit(current, msg, denied);
-        return denied;
+    if (decision.allowed && effectiveSessionName) {
+      const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, effectiveSessionName, shareClockNow());
+      if (rateLimitReason) {
+        const rateLimitedDecision: ShareCommandDecision = { allowed: false, reason: rateLimitReason };
+        this.queueShareCommandAudit(current, msg, rateLimitedDecision);
+        return rateLimitedDecision;
       }
-      decision.stampedMessage = {
-        ...decision.stampedMessage,
-        [SHARED_MACHINE_AUTHORITY_FIELD]: token,
-      };
+    }
+    const isDuplicateInflight = msg.type === 'session.send'
+      && typeof msg.commandId === 'string'
+      && this.inflightCommands.has(msg.commandId);
+    if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage && !isDuplicateInflight) {
+      const daemonGraceOrHandshake = !this.isDaemonConnected() && Boolean(this.graceTimer || this.daemonWs);
+      if (!daemonGraceOrHandshake) {
+        const actor = decision.stampedMessage.sharedActor as SharedActorEnvelope | undefined;
+        const token = actor ? await this.issueShareMachineAuthority(actor, sessionName) : null;
+        if (!token) {
+          const denied: ShareCommandDecision = { allowed: false, reason: SHARE_REASONS.TARGET_UNAVAILABLE };
+          this.queueShareCommandAudit(current, msg, denied);
+          return denied;
+        }
+        decision.stampedMessage = {
+          ...decision.stampedMessage,
+          [SHARED_MACHINE_AUTHORITY_FIELD]: token,
+        };
+      }
     } else if (decision.allowed && sessionName && typeof msg.type === 'string'
       && SHARE_PROCESS_INPUT_COMMANDS.has(msg.type) && decision.stampedMessage) {
       // Keystrokes are never refused for want of a token (ESC/Ctrl-C must keep
@@ -8554,14 +8620,6 @@ export class WsBridge {
         decision.stampedMessage = { ...decision.stampedMessage, [SHARED_MACHINE_AUTHORITY_FIELD]: token };
       }
     }
-    if (decision.allowed && effectiveSessionName) {
-      const rateLimitReason = this.evaluateShareScopedRateLimit(current, msg, effectiveSessionName, shareClockNow());
-      if (rateLimitReason) {
-        const rateLimitedDecision: ShareCommandDecision = { allowed: false, reason: rateLimitReason };
-        this.queueShareCommandAudit(current, msg, rateLimitedDecision);
-        return rateLimitedDecision;
-      }
-    }
     this.queueShareCommandAudit(current, msg, decision);
     return decision;
   }
@@ -8569,7 +8627,9 @@ export class WsBridge {
   private async issueShareMachineAuthority(actor: SharedActorEnvelope, sessionName: string): Promise<string | null> {
     const signingKey = this.directFileTransferTicketSigningKey;
     if (!signingKey || !this.db) return null;
-    return issueSharedMachineAuthorityForSession(this.db, {
+    if (!this.isDaemonConnected() || !this.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1)) return null;
+    const expectedGen = this.daemonConnectionGeneration();
+    const token = await issueSharedMachineAuthorityForSession(this.db, {
       actorUserId: actor.actorUserId,
       sourceServerId: this.serverId,
       sessionName,
@@ -8577,6 +8637,11 @@ export class WsBridge {
       actionId: actor.actionId,
       signingKey,
     });
+    if (token && (!this.isDaemonConnected() || this.daemonConnectionGeneration() !== expectedGen)) {
+      revokeTurnAuthorityGrantByToken(this.serverId, token);
+      return null;
+    }
+    return token;
   }
 
   /** Per socket+session token for a participant's keystrokes; see SHARE_INPUT_AUTHORITY_REUSE_MS. */
@@ -8585,6 +8650,7 @@ export class WsBridge {
     actor: SharedActorEnvelope,
     sessionName: string,
   ): Promise<string | null> {
+    if (!this.isDaemonConnected() || !this.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1)) return null;
     let perSession = this.shareInputAuthorityTokens.get(ws);
     if (!perSession) {
       perSession = new Map();
@@ -8636,6 +8702,7 @@ export class WsBridge {
     sessionName: string,
   ): Promise<string | null> {
     if (!this.db || !this.directFileTransferTicketSigningKey) return null;
+    if (!this.isDaemonConnected() || !this.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1)) return null;
     let perSession = this.ownerInputAuthorityTokens.get(ws);
     if (!perSession) {
       perSession = new Map();
@@ -8653,6 +8720,7 @@ export class WsBridge {
     if (inFlight) return inFlight;
     const db = this.db;
     const signingKey = this.directFileTransferTicketSigningKey;
+    const expectedGen = this.daemonConnectionGeneration();
     const run = issueOwnerMachineAuthorityForSession(db, {
       actorUserId: userId,
       sourceServerId: this.serverId,
@@ -8663,6 +8731,10 @@ export class WsBridge {
     })
       .catch(() => null)
       .then((token) => {
+        if (token && (!this.isDaemonConnected() || this.daemonConnectionGeneration() !== expectedGen)) {
+          revokeTurnAuthorityGrantByToken(this.serverId, token);
+          return null;
+        }
         perSession.set(sessionName, { token, at: shareClockNow() });
         return token;
       })
@@ -12517,9 +12589,77 @@ export class WsBridge {
         || this.daemonGeneration !== expectedConnection.generation
       )
     ) return;
+    let effectiveRawPayload = entry.rawPayload;
+    if (this.rawPayloadType(effectiveRawPayload) === 'session.send') {
+      try {
+        const parsed = JSON.parse(effectiveRawPayload) as Record<string, unknown>;
+        if (entry.share) {
+          const actor = parsed.sharedActor as SharedActorEnvelope | undefined;
+          const existingToken = typeof parsed[SHARED_MACHINE_AUTHORITY_FIELD] === 'string'
+            ? String(parsed[SHARED_MACHINE_AUTHORITY_FIELD])
+            : null;
+          if (!existingToken || !isTurnAuthorityGrantActive(existingToken, shareClockNow())) {
+            const minted = actor ? await this.issueShareMachineAuthority(actor, entry.sessionName) : null;
+            if (
+              expectedConnection
+              && (
+                this.daemonWs !== expectedConnection.ws
+                || this.daemonGeneration !== expectedConnection.generation
+              )
+            ) {
+              if (minted) revokeTurnAuthorityGrantByToken(this.serverId, minted);
+              return;
+            }
+            if (!minted) {
+              this.emitInflightFailure(entry, SHARE_REASONS.TARGET_UNAVAILABLE);
+              this.removeInflight(entry.commandId);
+              return;
+            }
+            effectiveRawPayload = JSON.stringify({ ...parsed, [SHARED_MACHINE_AUTHORITY_FIELD]: minted });
+            entry.rawPayload = effectiveRawPayload;
+          }
+        } else if (
+          this.isDaemonConnected()
+          && this.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1)
+          && this.db
+          && this.directFileTransferTicketSigningKey
+        ) {
+          const existingOwnerToken = typeof parsed[OWNER_MACHINE_AUTHORITY_FIELD] === 'string'
+            ? String(parsed[OWNER_MACHINE_AUTHORITY_FIELD])
+            : null;
+          const ownerUserId = this.daemonOwnerUserId;
+          if ((!existingOwnerToken || !isTurnAuthorityGrantActive(existingOwnerToken, shareClockNow())) && ownerUserId) {
+            const mintedOwner = await issueOwnerMachineAuthorityForSession(this.db, {
+              actorUserId: ownerUserId,
+              sourceServerId: this.serverId,
+              sessionName: entry.sessionName,
+              projectName: this.activeMainSessions.get(entry.sessionName)?.project,
+              actionId: entry.commandId,
+              signingKey: this.directFileTransferTicketSigningKey,
+            });
+            if (
+              expectedConnection
+              && (
+                this.daemonWs !== expectedConnection.ws
+                || this.daemonGeneration !== expectedConnection.generation
+              )
+            ) {
+              if (mintedOwner) revokeTurnAuthorityGrantByToken(this.serverId, mintedOwner);
+              return;
+            }
+            if (mintedOwner) {
+              effectiveRawPayload = JSON.stringify({ ...parsed, [OWNER_MACHINE_AUTHORITY_FIELD]: mintedOwner });
+              entry.rawPayload = effectiveRawPayload;
+            }
+          }
+        }
+      } catch {
+        // Non-JSON payload fallback
+      }
+    }
     const rawPayload = markBridgeRetry
-      ? this.withBridgeRetryMarker(entry.rawPayload, entry.dispatchAttempts + 1)
-      : entry.rawPayload;
+      ? this.withBridgeRetryMarker(effectiveRawPayload, entry.dispatchAttempts + 1)
+      : effectiveRawPayload;
     this.sendToDaemon(rawPayload);
     if (this.rawPayloadType(entry.rawPayload) === 'session.send') {
       this.activeDispatchIds.set(entry.sessionName, entry.commandId);
@@ -13902,6 +14042,7 @@ export class WsBridge {
       this.upgradeBlockedSyncRequiredGeneration = null;
       this.upgradeBlockedSyncCompleteGeneration = null;
       this.daemonP2pWorkflowCapabilities = null;
+    this.pendingPreAuthDaemonHello = null;
       this.supportedSharedContextRuntimeBackends = null;
       this.controlledNodeCapabilities.clear();
       this.daemonControlledOs = null;

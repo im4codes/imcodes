@@ -17,9 +17,19 @@ import { EventEmitter } from 'node:events';
 import { Hono } from 'hono';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { PORT_FORWARD_API_PATH, PORT_FORWARD_ERRORS, PORT_FORWARD_TRANSPORT_PREF } from '../../shared/port-forward.js';
-import { SHARED_MACHINE_AUTHORITY_HEADER, TURN_AUTHORITY_TOKEN_PREFIX } from '../../shared/shared-machine-authority.js';
+import {
+  SHARED_MACHINE_AUTHORITY_HEADER,
+  TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
+  TURN_AUTHORITY_TOKEN_PREFIX,
+} from '../../shared/shared-machine-authority.js';
+import { MACHINE_ACTION } from '../../shared/machine-access-policy.js';
+import {
+  PgNotifyTurnAuthorityCluster,
+  type RemoteTurnAuthorityGrantMeta,
+} from '../src/share/turn-authority-cluster.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 import { buildApp } from '../src/index.js';
 import { createDatabase, type Database } from '../src/db/client.js';
@@ -30,10 +40,13 @@ import { generateControlledNodeId } from '../src/services/controlled-node-identi
 import { randomHex, signJwt, verifyJwt } from '../src/security/crypto.js';
 import {
   TURN_AUTHORITY_TTL_MS,
+  admitMachineAction,
   clearTurnAuthorityGrantsForTests,
   issueOwnerMachineAuthorityForSession,
   issueSharedMachineAuthorityForSession,
   resolveSharedMachineAuthority,
+  revokeTurnAuthorityGrantsForTree,
+  setTurnAuthorityClusterVerifierForTests,
 } from '../src/share/shared-machine-authority.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import { createPortForwardRoutes } from '../src/routes/port-forward.js';
@@ -624,5 +637,391 @@ describe('pure in-memory server-stateful opaque tree turn grants', () => {
     // Browser/mobile UI remains untouched
     expect((await app.request('/api/aliases', { headers: userBearer(OWNER_O) })).status).toBe(200);
     expect((await pfApp.request('/api/machines', { headers: userBearer(PART_P1) })).status).toBe(200);
+  });
+
+  it('P0 #2 capability gate: refuses delegated/shared turn grants when daemon lacks turn_authority_revoke_v1 while keeping unshared personal FULL hosts working', async () => {
+    const legacySrv = `srv-leg-${tag}`;
+    const legacyTok = `tok-leg-${tag}`;
+    await createServer(db, legacySrv, OWNER_O, 'LegacyHost', sha256(legacyTok));
+    await db.execute(`UPDATE servers SET status = 'online' WHERE id = $1`, [legacySrv]);
+    await upsertDbSession(db, `sleg-${tag}`, legacySrv, 'deck_leg_brain', `leg_${tag}`, 'brain', 'claude-code-sdk', '/leg', 'idle', 'Leg');
+    await createOrUpdateShare(db, {
+      id: `sh-leg-${tag}`,
+      target: { kind: 'main', serverId: legacySrv, sessionName: 'deck_leg_brain' },
+      targetUserId: PART_P1,
+      role: 'participant',
+      createdBy: OWNER_O,
+      now: Date.now(),
+    });
+
+    const ws = await connectFakeBridgeDaemon(legacySrv, legacyTok);
+    try {
+      // Do NOT send DAEMON_HELLO with TURN_AUTHORITY_REVOKE_CAPABILITY_V1 -> legacy daemon!
+      // 1) Shared HTTP session/send fails closed (403)
+      const httpShared = await app.request(`/api/server/${legacySrv}/session/send`, {
+        method: 'POST',
+        headers: userBearer(PART_P1),
+        body: JSON.stringify({ sessionName: 'deck_leg_brain', commandId: 'cmd-leg-http', text: 'hi' }),
+      });
+      expect(httpShared.status).toBe(403);
+
+      // 2) Shared WS session.send fails closed (`share-target-unavailable`)
+      const bridge = WsBridge.get(legacySrv);
+      const partWs = new FakeWs();
+      bridge.handleShareBrowserConnection(partWs as never, PART_P1, db, {
+        ticketId: `tkt-leg-${tag}`,
+        target: { kind: 'main', serverId: legacySrv, sessionName: 'deck_leg_brain' },
+        snapshot: {
+          target: { kind: 'main', serverId: legacySrv, sessionName: 'deck_leg_brain' },
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          coveringShareIds: [`sh-leg-${tag}`],
+          authorizedAt: Date.now(),
+          nextCoverageRecheckAt: null,
+        },
+      });
+      partWs.emit('message', JSON.stringify({
+        type: 'session.send',
+        sessionName: 'deck_leg_brain',
+        commandId: 'cmd-leg-ws',
+        text: 'hello',
+      }));
+      await new Promise((r) => setTimeout(r, 40));
+      expect(partWs.sent.some((s) => s.includes('share-target-unavailable'))).toBe(true);
+
+      // 3) Shared host HTTP call with no header (owner omitted capability) STILL fails closed on shared host!
+      expect((await app.request('/api/aliases', { headers: daemonHeaders(legacySrv, legacyTok) })).status).toBe(403);
+
+      // 4) Unshared personal FULL host (no token / absent) keeps working!
+      expect((await app.request('/api/aliases', { headers: daemonHeaders(M_PRIV_HOST, TOK_PRIV_HOST) })).status).toBe(200);
+
+      // 5) Once daemon declares TURN_AUTHORITY_REVOKE_CAPABILITY_V1, shared session/send mints trg_ and works!
+      ws.emit('message', Buffer.from(JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: legacySrv,
+        helloEpoch: 1,
+        sentAt: Date.now(),
+        capabilities: [TURN_AUTHORITY_REVOKE_CAPABILITY_V1],
+      })), false);
+      await new Promise((r) => setTimeout(r, 30));
+      const upgradedRes = await app.request(`/api/server/${legacySrv}/session/send`, {
+        method: 'POST',
+        headers: userBearer(PART_P1),
+        body: JSON.stringify({ sessionName: 'deck_leg_brain', commandId: 'cmd-upg-http', text: 'hi' }),
+      });
+      expect(upgradedRes.status).toBe(200);
+    } finally {
+      ws.close();
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  });
+
+  it('P0 #3: rejects concurrent revoke during DB await (TOCTOU) and preserves active grant on rate-limited or duplicate retry sends', async () => {
+    // 1) Controlled DB delay during resolveSharedMachineAuthority & admitMachineAction
+    const tok = (await issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: OWNER_O,
+      sourceServerId: M_SHARED,
+      sessionName: PROJ1_MAIN,
+      actionId: 'toctou-1',
+    }))!;
+
+    let releaseQuery!: () => void;
+    const delayedDb: Database = {
+      ...db,
+      async queryOne(sql: string, params?: unknown[]) {
+        if (sql.includes('FROM servers s')) {
+          await new Promise<void>((res) => { releaseQuery = res; });
+        }
+        return db.queryOne(sql, params);
+      },
+    } as Database;
+
+    const pendingResolve = resolveSharedMachineAuthority(delayedDb, {
+      token: tok,
+      authenticatedSourceServerId: M_SHARED,
+      sourceOwnerUserId: OWNER_O,
+      now: Date.now(),
+    });
+    // Wait until delayedDb entered the await inside isVerifiedRealServerOwner
+    while (!releaseQuery) await new Promise((r) => setTimeout(r, 5));
+    // Concurrently revoke while DB check is still awaiting!
+    revokeTurnAuthorityGrantsForTree(M_SHARED, PROJ1_MAIN);
+    releaseQuery();
+    await expect(pendingResolve).resolves.toEqual({ kind: 'invalid' });
+
+    // Also test TOCTOU inside admitMachineAction after resolveSharedMachineAuthority succeeded:
+    const tok2 = (await issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: OWNER_O,
+      sourceServerId: M_SHARED,
+      sessionName: PROJ1_MAIN,
+      actionId: 'toctou-2',
+    }))!;
+    let releaseTargetQuery!: () => void;
+    const delayedAdmitDb: Database = {
+      ...db,
+      async queryOne(sql: string, params?: unknown[]) {
+        if (sql.includes('FROM server_shares') || sql.includes('controlled')) {
+          await new Promise<void>((res) => { releaseTargetQuery = res; });
+        }
+        return db.queryOne(sql, params);
+      },
+    } as Database;
+    const pendingAdmit = admitMachineAction(delayedAdmitDb, {
+      token: tok2,
+      signingKey: JWT_KEY,
+      authenticatedSourceServerId: M_SHARED,
+      sourceOwnerUserId: OWNER_O,
+      targetServerId: CTL_O.id,
+      action: MACHINE_ACTION.EXEC,
+      now: Date.now(),
+    });
+    const deadline = Date.now() + 2_000;
+    while (!releaseTargetQuery && Date.now() < deadline) await new Promise((r) => setTimeout(r, 5));
+    revokeTurnAuthorityGrantsForTree(M_SHARED, PROJ1_MAIN);
+    releaseTargetQuery?.();
+    await expect(pendingAdmit).resolves.toMatchObject({ ok: false });
+
+    // 2) Duplicate owner commandId & rate-limited participant burst MUST NOT revoke the executing turn grant!
+    const ws = await connectFakeBridgeDaemon(M_SHARED, TOK_SHARED);
+    try {
+      ws.emit('message', Buffer.from(JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: M_SHARED,
+        helloEpoch: 1,
+        sentAt: Date.now(),
+        capabilities: [TURN_AUTHORITY_REVOKE_CAPABILITY_V1],
+      })), false);
+      await new Promise((r) => setTimeout(r, 30));
+
+      const bridge = WsBridge.get(M_SHARED);
+      const ownerWs = new FakeWs();
+      bridge.handleBrowserConnection(ownerWs as never, OWNER_O, db);
+      ownerWs.emit('message', JSON.stringify({
+        type: 'session.send',
+        sessionName: PROJ1_MAIN,
+        commandId: 'cmd-owner-dup',
+        text: 'first',
+      }));
+      await new Promise((r) => setTimeout(r, 40));
+      const firstOwnerSend = ws.sent.map((s) => JSON.parse(s) as Record<string, unknown>).find((m) => m.commandId === 'cmd-owner-dup');
+      const liveOwnerTok = String(firstOwnerSend?.ownerMachineAuthority ?? '');
+      expect(liveOwnerTok.startsWith(TURN_AUTHORITY_TOKEN_PREFIX)).toBe(true);
+
+      // Browser retries exact same commandId while inflight -> MUST NOT mint/revoke active token!
+      ownerWs.emit('message', JSON.stringify({
+        type: 'session.send',
+        sessionName: PROJ1_MAIN,
+        commandId: 'cmd-owner-dup',
+        text: 'first',
+      }));
+      await new Promise((r) => setTimeout(r, 30));
+      await expect(resolveSharedMachineAuthority(db, {
+        token: liveOwnerTok,
+        authenticatedSourceServerId: M_SHARED,
+        sourceOwnerUserId: OWNER_O,
+        now: Date.now(),
+      })).resolves.toMatchObject({ kind: 'owner', actorUserId: OWNER_O });
+
+      // Share rate limit burst (> 10 pending sends) MUST NOT revoke the executing participant's grant!
+      const partWs = new FakeWs();
+      bridge.handleShareBrowserConnection(partWs as never, PART_P1, db, {
+        ticketId: `tkt-rl-${tag}`,
+        target: SHARE_P1_PROJ2,
+        snapshot: {
+          target: SHARE_P1_PROJ2,
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          coveringShareIds: [`sh-p1-proj2-${tag}`],
+          authorizedAt: Date.now(),
+          nextCoverageRecheckAt: null,
+        },
+      });
+      for (let i = 0; i < 11; i += 1) {
+        partWs.emit('message', JSON.stringify({
+          type: 'session.send',
+          sessionName: PROJ2_MAIN,
+          commandId: `cmd-rl-${i}`,
+          text: `msg-${i}`,
+        }));
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      await new Promise((r) => setTimeout(r, 40));
+      expect(partWs.sent.some((s) => s.includes('share-rate-limited'))).toBe(true);
+      const lastAdmittedPart = [...ws.sent].reverse().map((s) => JSON.parse(s) as Record<string, unknown>)
+        .find((m) => m.type === 'session.send' && m.sessionName === PROJ2_MAIN);
+      const livePartTok = String(lastAdmittedPart?.sharedMachineAuthority ?? '');
+      expect(livePartTok.startsWith(TURN_AUTHORITY_TOKEN_PREFIX)).toBe(true);
+      await expect(resolveSharedMachineAuthority(db, {
+        token: livePartTok,
+        authenticatedSourceServerId: M_SHARED,
+        sourceOwnerUserId: OWNER_O,
+        now: Date.now(),
+      })).resolves.toMatchObject({ kind: 'participant', actorUserId: PART_P1 });
+    } finally {
+      ws.close();
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  });
+
+  it('P0 #4 cross-pod verification: Target Pod B validates Source Pod A pure-RAM grant via zero-persistence hash RPC without raw tokens or DB writes', async () => {
+    const podABusListeners = new Set<(channel: string, payload: string) => void>();
+    const wirePayloads: string[] = [];
+    const makePodCluster = (podId: string) => new PgNotifyTurnAuthorityCluster({
+      podId: () => podId,
+      rpcTimeoutMs: 250,
+      pgClientFactory: () => {
+        let onNotification: ((msg: { channel?: string; payload?: string }) => void) | null = null;
+        const listener = (channel: string, payload: string) => onNotification?.({ channel, payload });
+        return {
+          async connect() { podABusListeners.add(listener); },
+          async query() { return {}; },
+          on(ev: string, fn: (...args: any[]) => void) { if (ev === 'notification') onNotification = fn; },
+          async end() { podABusListeners.delete(listener); },
+        };
+      },
+    });
+    const fakeNotifyDb = {
+      async query(_sql: string, params?: unknown[]) {
+        const ch = String(params?.[0] ?? '');
+        const payload = String(params?.[1] ?? '');
+        wirePayloads.push(payload);
+        for (const fn of podABusListeners) fn(ch, payload);
+        return [];
+      },
+    };
+
+    const podAStore = new Map<string, RemoteTurnAuthorityGrantMeta & { expiresAt: number }>();
+    const podA = makePodCluster('pod-a');
+    podA.bindLocalHandlers({
+      lookupLocalGrant(tokenHash, serverId, now) {
+        const g = podAStore.get(tokenHash);
+        if (g && g.serverId === serverId && g.expiresAt > now) {
+          return { found: true, grant: g };
+        }
+        return { found: false, ownsConnectedDaemon: true };
+      },
+      confirmAndSlideLocalGrant(tokenHash, serverId, expectedCreatedAt, now) {
+        const g = podAStore.get(tokenHash);
+        if (!g || g.serverId !== serverId || g.createdAt !== expectedCreatedAt || g.expiresAt <= now) return false;
+        g.expiresAt = Math.max(g.expiresAt, now + TURN_AUTHORITY_TTL_MS);
+        return true;
+      },
+    });
+    const podB = makePodCluster('pod-b');
+    await Promise.all([
+      podA.start('postgres://localhost/ignored', fakeNotifyDb as never),
+      podB.start('postgres://localhost/ignored', fakeNotifyDb as never),
+    ]);
+    setTurnAuthorityClusterVerifierForTests(podB);
+    try {
+      // Simulate Pod A holding a participant P1 grant (`grantsByHash` on Pod B has NO record of `rawToken`!)
+      const rawToken = `${TURN_AUTHORITY_TOKEN_PREFIX}remote_pod_a_1234567890abcd`;
+      const t0 = Date.now();
+      podAStore.set(sha256(rawToken), {
+        tokenHash: sha256(rawToken),
+        serverId: M_SHARED,
+        rootSessionName: PROJ1_MAIN,
+        sessionName: PROJ1_CHILD,
+        projectName: `p1_${tag}`,
+        actorUserId: PART_P1,
+        ownerUserId: OWNER_O,
+        kind: 'participant',
+        shareTarget: SHARE_P1_PROJ1,
+        actionId: 'cross-pod-exec',
+        createdAt: t0,
+        expiresAt: t0 + TURN_AUTHORITY_TTL_MS,
+      });
+
+      const p1CrossPodHdrs = daemonHeaders(M_SHARED, TOK_SHARED, rawToken);
+      // Pod B admits P1's owned CTL_P1_OWN and denies O's private CTL_O
+      expect((await pfApp.request(`/api/machine/exec?serverId=${CTL_P1_OWN.id}`, {
+        method: 'POST',
+        headers: { ...p1CrossPodHdrs, 'content-type': 'application/json' },
+        body: JSON.stringify({ command: 'pwd' }),
+      })).status).toBe(200);
+      expect((await pfApp.request(`/api/machine/computer-use?serverId=${CTL_P1_OWN.id}`, {
+        method: 'POST',
+        headers: { ...p1CrossPodHdrs, 'content-type': 'application/json' },
+        body: JSON.stringify({ tool: 'list_apps' }),
+      })).status).toBe(200);
+      expect((await pfApp.request(`/api/machine/exec?serverId=${CTL_O.id}`, {
+        method: 'POST',
+        headers: { ...p1CrossPodHdrs, 'content-type': 'application/json' },
+        body: JSON.stringify({ command: 'pwd' }),
+      })).status).toBe(403);
+
+      // Cluster RPC payloads NEVER carry the raw trg_ token!
+      expect(wirePayloads.length).toBeGreaterThan(0);
+      expect(wirePayloads.some((p) => p.includes(rawToken))).toBe(false);
+
+      // Cross-pod TOCTOU: if Pod A revokes between lookup and confirmAndSlide, Pod B MUST reject!
+      let releaseConfirmAwait!: () => void;
+      const origConfirm = podB.confirmAndSlideGrant.bind(podB);
+      setTurnAuthorityClusterVerifierForTests({
+        lookupGrant: podB.lookupGrant.bind(podB),
+        async confirmAndSlideGrant(ownerPodId, th, srvId, createdAt, n) {
+          podAStore.delete(th);
+          await new Promise<void>((res) => { releaseConfirmAwait = res; setTimeout(res, 1); });
+          return origConfirm(ownerPodId, th, srvId, createdAt, n);
+        },
+      });
+      await expect(resolveSharedMachineAuthority(db, {
+        token: rawToken,
+        authenticatedSourceServerId: M_SHARED,
+        sourceOwnerUserId: OWNER_O,
+        now: Date.now(),
+      })).resolves.toEqual({ kind: 'invalid' });
+      void releaseConfirmAwait;
+      setTurnAuthorityClusterVerifierForTests(podB);
+
+      // Once Pod A revokes/deletes the grant from its RAM, Pod B rejects immediately!
+      podAStore.delete(sha256(rawToken));
+      expect((await pfApp.request(`/api/machine/exec?serverId=${CTL_P1_OWN.id}`, {
+        method: 'POST',
+        headers: { ...p1CrossPodHdrs, 'content-type': 'application/json' },
+        body: JSON.stringify({ command: 'pwd' }),
+      })).status).toBe(403);
+    } finally {
+      setTurnAuthorityClusterVerifierForTests(null);
+      await Promise.all([podA.stop(), podB.stop()]);
+    }
+  });
+
+  it('P0 #5 FILE_LIST policy: denies group participant during delegated participantTurn without exec_granted while allowing browser UI', async () => {
+    const grpId = `grp-fl-${tag}`;
+    const grpControlledId = `ctl-grp-${tag}`;
+    await seedControlled(grpControlledId, OWNER_O, 'Group-CTL');
+    await db.execute('INSERT INTO teams (id, name, owner_id, created_at) VALUES ($1,$2,$3,$4)', [grpId, 'Group FileList Test', OWNER_O, Date.now()]);
+    await db.execute('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)', [grpId, PART_P1, 'member', Date.now()]);
+    await db.execute('INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3)', [grpControlledId, grpId, Date.now()]);
+
+    // Group membership alone grants accessSource='group', execGranted=false:
+    // Browser interactive FILE_LIST is allowed, whereas delegated participantTurn FILE_LIST MUST be denied!
+    await expect(admitMachineAction(db, {
+      token: undefined,
+      signingKey: JWT_KEY,
+      authenticatedSourceServerId: '',
+      sourceOwnerUserId: PART_P1,
+      targetServerId: grpControlledId,
+      action: MACHINE_ACTION.FILE_LIST,
+      now: Date.now(),
+    })).resolves.toMatchObject({ ok: true });
+
+    const tokPart = (await issueSharedMachineAuthorityForSession(db, {
+      actorUserId: PART_P1,
+      sourceServerId: M_SHARED,
+      sessionName: PROJ1_MAIN,
+      shareTarget: SHARE_P1_PROJ1,
+      actionId: 'grp-fl-delegated',
+    }))!;
+    await expect(admitMachineAction(db, {
+      token: tokPart,
+      signingKey: JWT_KEY,
+      authenticatedSourceServerId: M_SHARED,
+      sourceOwnerUserId: OWNER_O,
+      targetServerId: grpControlledId,
+      action: MACHINE_ACTION.FILE_LIST,
+      now: Date.now(),
+    })).resolves.toMatchObject({ ok: false });
   });
 });

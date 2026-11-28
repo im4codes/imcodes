@@ -92,7 +92,9 @@ async function getEndpoint(options: AliasMcpClientOptions): Promise<AliasServerE
 }
 
 function aliasUrl(endpoint: AliasServerEndpoint, method: DaemonHttpMethod, query = ''): string {
-  return daemonApiUrl(cleanBaseUrl(endpoint.workerUrl), method, `${ALIAS_API_PATH}${query}`);
+  const sep = query.includes('?') ? '&' : '?';
+  const sticky = `${query}${sep}serverId=${encodeURIComponent(endpoint.serverId)}`;
+  return daemonApiUrl(cleanBaseUrl(endpoint.workerUrl), method, `${ALIAS_API_PATH}${sticky}`);
 }
 
 async function parseJsonResponse(res: Response): Promise<unknown> {

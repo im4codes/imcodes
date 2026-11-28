@@ -720,6 +720,11 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _deferredContextBootstrapBase = 0;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
+  private _onTurnAdmitted?: (
+    origins: ReadonlyArray<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority'>>,
+    dispatchId: number | null,
+  ) => number | null;
+  private _activeTreeGeneration: number | null = null;
 
   /** Current turn completion signal — resolved by onComplete, rejected by onError. */
   private _activeTurn: {
@@ -1401,6 +1406,16 @@ export class TransportSessionRuntime implements SessionRuntime {
   /** Register a callback for status changes (idle/streaming/thinking/error). */
   set onStatusChange(cb: (status: AgentStatus) => void) { this._onStatusChange = cb; }
 
+  /** Register a callback fired only when a new turn or appended turn origin is admitted. */
+  set onTurnAdmitted(
+    cb: (
+      origins: ReadonlyArray<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority'>>,
+      dispatchId: number | null,
+    ) => number | null,
+  ) {
+    this._onTurnAdmitted = cb;
+  }
+
   /** Register a callback for when pending messages are drained into a new turn. */
   set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void) { this._onDrain = cb; }
   set pendingDrainAdmission(cb: (message: PendingTransportMessage) => boolean | TransportQueueAdmissionDecision) { this._pendingDrainAdmission = cb; }
@@ -1685,6 +1700,42 @@ export class TransportSessionRuntime implements SessionRuntime {
       .filter((entry) => entry.sharedActor?.effectiveActorRole === 'participant')
       .map((entry) => entry.sharedActor!.actorUserId)
       .filter((id) => typeof id === 'string' && id))];
+  }
+
+  getActiveTreeGeneration(): number | null {
+    return this._activeDispatchEntries.length > 0 ? this._activeTreeGeneration : null;
+  }
+
+  scrubTurnAuthorities(): void {
+    for (const entry of this._activeDispatchEntries) {
+      delete entry.sharedMachineAuthority;
+      delete entry.ownerMachineAuthority;
+    }
+    for (const entry of this._pendingMessages) {
+      delete entry.sharedMachineAuthority;
+      delete entry.ownerMachineAuthority;
+    }
+    for (const item of this._unacknowledgedActiveAppends) {
+      delete item.entry.sharedMachineAuthority;
+      delete item.entry.ownerMachineAuthority;
+    }
+    if (this._appendedTurnOrigins) {
+      for (const entry of this._appendedTurnOrigins.entries) {
+        delete entry.sharedMachineAuthority;
+        delete entry.ownerMachineAuthority;
+      }
+    }
+    this._activeTreeGeneration = null;
+  }
+
+  private notifyTurnAdmitted(): void {
+    if (!this._onTurnAdmitted) return;
+    try {
+      const generation = this._onTurnAdmitted(this.turnOriginEntries(), this._activeDispatchId);
+      this._activeTreeGeneration = typeof generation === 'number' ? generation : null;
+    } catch {
+      this._activeTreeGeneration = null;
+    }
   }
 
   getProviderOutputSilenceMs(nowMs: number = Date.now()): number | null {
@@ -3815,6 +3866,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           })),
         ],
       };
+      this.notifyTurnAdmitted();
     }
 
     if (
@@ -5172,6 +5224,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const isCommandDispatch = this._activeDispatchEntries.length > 0
       && this._activeDispatchEntries.every((entry) => entry.commandMode === true);
     this.bindSdkTurnLostReplacementDispatch(dispatchId, this._activeDispatchEntries);
+    this.notifyTurnAdmitted();
 
     // Alias expansion (A′): the provider (and runtime history) receive the
     // agent-bound `providerText` while `message` — the ORIGINAL marker text —

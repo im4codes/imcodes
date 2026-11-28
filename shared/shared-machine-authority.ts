@@ -4,6 +4,8 @@ import type { ShareTarget } from './tab-sharing.js';
 
 /** Prefix for pure in-memory, server-stateful opaque turn grants (non-JWT, zero persistence). */
 export const TURN_AUTHORITY_TOKEN_PREFIX = 'trg_' as const;
+/** Capability negotiated in daemon.hello before the server mints pure-RAM turn grants for that link. */
+export const TURN_AUTHORITY_REVOKE_CAPABILITY_V1 = 'turn_authority_revoke_v1' as const;
 /** Server-minted delegated authority for device calls originating in a shared turn. */
 export const SHARED_MACHINE_AUTHORITY_TYPE = 'shared-session-machine-authority' as const;
 /** Server-minted authority for machine/account calls originating in a verified host owner turn. */

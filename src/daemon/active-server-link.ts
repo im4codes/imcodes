@@ -11,6 +11,8 @@ export interface ActiveServerLink {
   /** Present on the real ServerLink: false when the message was dropped (socket not open). */
   trySend?(msg: unknown): boolean;
   isConnected?(): boolean;
+  /** Monotonic per-connection generation on ServerLink; fenced so stale links never send late revokes. */
+  getConnectionGeneration?(): number;
 }
 
 export interface SubSessionClosedNotice {

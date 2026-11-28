@@ -5,6 +5,8 @@ import { MachineGroupInvalidationRuntime } from './services/machine-group-invali
 import { applyMachineGroupInvalidation, failClosedMachineGroupConnections } from './ws/machine-group-revalidation.js';
 import { globalTaskHub } from './services/global-task-hub.js';
 import { daemonPodRebalancer } from './ws/daemon-pod-rebalance.js';
+import { defaultTurnAuthorityCluster } from './share/turn-authority-cluster.js';
+import { bindDefaultTurnAuthorityCluster } from './share/shared-machine-authority.js';
 import { pushStreamHub } from './services/push-stream-hub.js';
 import { globalTasksRoutes } from './routes/global-tasks.js';
 import { remoteVoiceHub } from './services/remote-voice-hub.js';
@@ -1574,6 +1576,8 @@ async function main() {
   // Listener setup runs asynchronously with bounded connect/LISTEN timeouts so
   // startup HTTP readiness is never delayed if the dedicated LISTEN socket stalls.
   void daemonPodRebalancer.start(envConfig.DATABASE_URL, db);
+  bindDefaultTurnAuthorityCluster((serverId) => Boolean(WsBridge.find(serverId)?.isDaemonConnected()));
+  void defaultTurnAuthorityCluster.start(envConfig.DATABASE_URL, db);
   await Promise.all([
     remoteVoiceHub.refreshServerSharedProviders(db),
     remoteVoiceHub.refreshServerAsrServices(db, env),
@@ -1665,6 +1669,7 @@ async function main() {
     await defaultPortForwardRouter.stopCluster();
     await globalTaskHub.stop();
     await daemonPodRebalancer.stop();
+    await defaultTurnAuthorityCluster.stop();
     pushStreamHub.stop();
     remoteVoiceHub.stop();
     await machineGroupInvalidation.stop();

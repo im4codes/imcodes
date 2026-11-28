@@ -87,6 +87,8 @@ vi.mock('../src/ws/bridge.js', () => ({
       getActiveDispatchIdForSession: getActiveDispatchIdForSessionMock,
       resolveSessionIdentityProjectKey: resolveSessionIdentityProjectKeyMock,
       isDaemonConnected: isDaemonConnectedMock,
+      hasDaemonCapability: () => true,
+      daemonConnectionGeneration: () => 1,
       sendSessionIdentityLocalRequest: sendSessionIdentityLocalRequestMock,
       resolveSessionAgentType: resolveSessionAgentTypeMock,
       invalidateSessionAgentTypeCache: invalidateSessionAgentTypeCacheMock,

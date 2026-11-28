@@ -38,6 +38,7 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
+import { TURN_AUTHORITY_REVOKE_CAPABILITY_V1 } from '../../shared/shared-machine-authority.js';
 import { ASK_ANSWER_ACK_CAPABILITY_V1 } from '../../shared/ask-answer.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
@@ -340,6 +341,7 @@ const DAEMON_STATIC_CAPABILITIES = [
   FILE_TRANSFER_SHARED_ACTOR_CAPABILITY,
   ASK_ANSWER_ACK_CAPABILITY_V1,
   CRON_EXACT_SEND_CAPABILITY_V1,
+  TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
 ] as const;
 
 export function directFileTransferDaemonCapabilities(available: boolean): readonly string[] {
@@ -600,6 +602,11 @@ export class ServerLink {
     P2P_WORKFLOW_IMPLEMENTATION_CAPABILITY_V1,
   ];
   private lastRuntimeLinkStatusWriteAt = 0;
+  private connectionGeneration = 0;
+
+  getConnectionGeneration(): number {
+    return this.connectionGeneration;
+  }
 
   constructor(opts: ServerLinkOpts) {
     this.workerUrl = opts.workerUrl;
@@ -623,6 +630,7 @@ export class ServerLink {
 
   connect(): void {
     this.incognitoServerReady = false;
+    this.connectionGeneration += 1;
     // A new authentication attempt replaces all authority learned over the
     // prior socket, even if that socket never delivers a close event.
     clearServerLinkSecurity('connect_replacement');

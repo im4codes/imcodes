@@ -35,7 +35,9 @@ import {
 import {
   SHARED_MACHINE_AUTHORITY_HEADER,
   SHARED_MACHINE_AUTHORITY_TYPE,
+  TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
 } from '../../shared/shared-machine-authority.js';
+import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
 import { computerUseCall as daemonComputerUse } from '../../src/daemon/computer-use-client.js';
@@ -517,6 +519,14 @@ describe('controlled-node shared action admission', () => {
       type: 'auth', serverId: source.serverId, token: source.token,
     })), false);
     await waitFor(() => sourceBridge.isDaemonConnected());
+    sourceSocket.emit('message', Buffer.from(JSON.stringify({
+      type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+      daemonId: source.serverId,
+      helloEpoch: 1,
+      sentAt: Date.now(),
+      capabilities: [TURN_AUTHORITY_REVOKE_CAPABILITY_V1],
+    })), false);
+    await waitFor(() => sourceBridge.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1));
     const admission = await app.request(`/api/server/${source.serverId}/session/send`, {
       method: 'POST',
       headers: webAuth(participantId),

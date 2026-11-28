@@ -2596,6 +2596,42 @@ function wireTransportCallbacks(
     upsertSession(next);
     emitSessionPersist(next, sessionName);
   };
+  runtime.onTurnAdmitted = (origins) => {
+    if (origins.length === 0) return null;
+    const hasParticipant = origins.some((entry) => entry.sharedActor?.effectiveActorRole === 'participant');
+    if (hasParticipant) {
+      const actors = [...new Set(
+        origins
+          .filter((entry) => entry.sharedActor?.effectiveActorRole === 'participant')
+          .map((entry) => entry.sharedActor?.actorUserId ?? '')
+          .filter(Boolean),
+      )];
+      const hasOwner = origins.some((entry) => entry.sharedActor?.effectiveActorRole !== 'participant');
+      const tokens = [...new Set(
+        origins
+          .map((entry) => entry.sharedMachineAuthority)
+          .filter((token): token is string => typeof token === 'string' && token.trim().length > 0),
+      )];
+      const allHaveToken = origins.every((entry) => typeof entry.sharedMachineAuthority === 'string' && entry.sharedMachineAuthority.trim().length > 0);
+      const cleanAuthority = !hasOwner && actors.length === 1 && allHaveToken && tokens.length === 1 ? tokens[0]! : undefined;
+      return bindTreeTurnAuthority(sessionName, {
+        kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+        actorUserId: actors.length === 1 ? actors[0]! : '',
+        ...(cleanAuthority ? { authority: cleanAuthority } : {}),
+      }, { markActive: true });
+    }
+    const ownerTokens = [...new Set(
+      origins
+        .map((entry) => entry.ownerMachineAuthority)
+        .filter((token): token is string => typeof token === 'string' && token.trim().length > 0),
+    )];
+    const allHaveOwnerToken = origins.every((entry) => typeof entry.ownerMachineAuthority === 'string' && entry.ownerMachineAuthority.trim().length > 0);
+    const cleanOwnerAuthority = allHaveOwnerToken && ownerTokens.length === 1 ? ownerTokens[0]! : undefined;
+    return bindTreeTurnAuthority(sessionName, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+      ...(cleanOwnerAuthority ? { authority: cleanOwnerAuthority } : {}),
+    }, { markActive: true });
+  };
   runtime.onStatusChange = (status) => {
     // Emit assistant.thinking for chat typing indicator (matches tmux watcher behavior)
     if (status === 'thinking') {
@@ -2607,25 +2643,7 @@ function wireTransportCallbacks(
       queueReason: 'transport_status_idle',
     });
     if (built.effectiveState === 'running') {
-      if (runtime.requiresSharedMachineAuthority()) {
-        const actors = runtime.activeTurnParticipantUserIds();
-        const sharedAuth = runtime.getActiveSharedMachineAuthority();
-        bindTreeTurnAuthority(sessionName, {
-          kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
-          actorUserId: actors.length === 1 ? actors[0]! : '',
-          ...(sharedAuth ? { authority: sharedAuth } : {}),
-        }, { markActive: true });
-      } else {
-        const ownerAuth = runtime.getActiveOwnerMachineAuthority();
-        if (ownerAuth) {
-          bindTreeTurnAuthority(sessionName, {
-            kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
-            authority: ownerAuth,
-          }, { markActive: true });
-        } else {
-          markTreeSessionActive(sessionName);
-        }
-      }
+      markTreeSessionActive(sessionName);
     } else if (built.effectiveState === 'idle' || built.effectiveState === 'error') {
       markTreeSessionIdle(sessionName);
     }
@@ -3198,6 +3216,13 @@ export function rebuildProviderRoutes(): void {
 /** Get the transport runtime for a session (if it is a transport session). */
 export function getTransportRuntime(name: string): TransportSessionRuntime | undefined {
   return transportRuntimes.get(name);
+}
+
+/** Scrub ephemeral in-memory turn grants from all active/queued transport runtimes on link drop. */
+export function scrubTransportRuntimeTurnAuthorities(): void {
+  for (const runtime of transportRuntimes.values()) {
+    runtime.scrubTurnAuthorities();
+  }
 }
 
 /** Persist and apply one fully-resolved identity contract without replacing history. */

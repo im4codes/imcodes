@@ -67,8 +67,16 @@ import {
 } from '../../../shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { shareCancelDispatchDenial } from '../../../shared/tab-sharing.js';
-import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
-import { issueOwnerMachineAuthorityForSession, issueSharedMachineAuthorityForSession } from '../share/shared-machine-authority.js';
+import {
+  OWNER_MACHINE_AUTHORITY_FIELD,
+  SHARED_MACHINE_AUTHORITY_FIELD,
+  TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
+} from '../../../shared/shared-machine-authority.js';
+import {
+  issueOwnerMachineAuthorityForSession,
+  issueSharedMachineAuthorityForSession,
+  revokeTurnAuthorityGrantByToken,
+} from '../share/shared-machine-authority.js';
 import {
   buildTransportConfigWithSupervision,
   canSessionRoleOwnAutomaticSupervision,
@@ -1393,6 +1401,16 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         now,
         origin: isWholeServerShareAccess(access) ? 'shared-server' : 'shared-tab',
       });
+      const isConnected = typeof bridge?.isDaemonConnected === 'function' ? bridge.isDaemonConnected() : false;
+      const supportsTurnAuthority = typeof bridge?.hasDaemonCapability === 'function'
+        ? bridge.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1)
+        : false;
+      const expectedGen = typeof bridge?.daemonConnectionGeneration === 'function'
+        ? bridge.daemonConnectionGeneration()
+        : undefined;
+      if (!isConnected || !supportsTurnAuthority) {
+        return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+      }
       const sharedMachineAuthority = await issueSharedMachineAuthorityForSession(c.env.DB, {
         actorUserId: userId,
         sourceServerId: serverId,
@@ -1402,6 +1420,13 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         signingKey: c.env.JWT_SIGNING_KEY,
       });
       if (!sharedMachineAuthority) return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+      const currentGen = typeof bridge?.daemonConnectionGeneration === 'function'
+        ? bridge.daemonConnectionGeneration()
+        : undefined;
+      if (!bridge.isDaemonConnected() || currentGen !== expectedGen) {
+        revokeTurnAuthorityGrantByToken(serverId, sharedMachineAuthority);
+        return c.json({ error: 'forbidden', reason: 'share-target-unavailable' }, 403);
+      }
       return relayToDaemon(c, 'session.send', {
         ...rest,
         sharedActor,
@@ -1416,7 +1441,16 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
     if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
   }
   const safeBody = stripBrowserShareFields(body);
-  const ownerMachineAuthority = targetSessionName
+  const ownerBridge = WsBridge.get(serverId);
+  const isConnected = typeof ownerBridge?.isDaemonConnected === 'function' ? ownerBridge.isDaemonConnected() : false;
+  const expectedGen = typeof ownerBridge?.daemonConnectionGeneration === 'function'
+    ? ownerBridge.daemonConnectionGeneration()
+    : undefined;
+  const supportsTurnAuthority = typeof ownerBridge?.hasDaemonCapability === 'function'
+    ? ownerBridge.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1)
+    : false;
+  const canMintOwnerTurn = isConnected && supportsTurnAuthority;
+  let ownerMachineAuthority = (canMintOwnerTurn && targetSessionName)
     ? await issueOwnerMachineAuthorityForSession(c.env.DB, {
         actorUserId: userId,
         sourceServerId: serverId,
@@ -1425,6 +1459,13 @@ sessionMgmtRoutes.post('/:id/session/send', async (c) => {
         signingKey: c.env.JWT_SIGNING_KEY,
       })
     : null;
+  const currentGen = typeof ownerBridge?.daemonConnectionGeneration === 'function'
+    ? ownerBridge.daemonConnectionGeneration()
+    : undefined;
+  if (ownerMachineAuthority && (!ownerBridge.isDaemonConnected() || currentGen !== expectedGen)) {
+    revokeTurnAuthorityGrantByToken(serverId, ownerMachineAuthority);
+    ownerMachineAuthority = null;
+  }
   return relayToDaemon(
     c,
     'session.send',

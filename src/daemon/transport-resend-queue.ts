@@ -454,6 +454,19 @@ export function getResendCount(sessionName: string): number {
   return queues.get(sessionName)?.length ?? 0;
 }
 
+/**
+ * Scrub all in-memory turn authority tokens from resend queues (e.g. on ServerLink disconnect),
+ * preserving `sharedActor` so participant-origin queued messages still fail closed when drained.
+ */
+export function scrubResendQueueTurnAuthorities(): void {
+  for (const list of queues.values()) {
+    for (const entry of list) {
+      delete entry.sharedMachineAuthority;
+      delete entry.ownerMachineAuthority;
+    }
+  }
+}
+
 /** Expire stale resend entries before projecting queue state without dispatching. */
 export function expireResendEntries(sessionName: string, nowMs: number = Date.now()): QueueSnapshot | undefined {
   const list = queues.get(sessionName);

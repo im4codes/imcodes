@@ -23,6 +23,7 @@ import { globalTaskHub } from '../src/services/global-task-hub.js';
 import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
+import { TURN_AUTHORITY_REVOKE_CAPABILITY_V1 } from '../../shared/shared-machine-authority.js';
 import { P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
 import {
   P2P_BRIDGE_ERROR_CODES,
@@ -2648,6 +2649,13 @@ describe('WsBridge', () => {
         daemonVersion: '2026.7.3157-dev.3556',
       }));
       daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        helloEpoch: 1,
+        sentAt: Date.now(),
+        capabilities: [TURN_AUTHORITY_REVOKE_CAPABILITY_V1],
+      }));
+      daemonWs.emit('message', JSON.stringify({
         type: DAEMON_MSG.UPGRADE_BLOCKED,
         reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
         failureId: 'failure-during-slow-auth',
@@ -3163,21 +3171,28 @@ describe('WsBridge', () => {
       }>((resolve) => {
         resolveReplacementAuth = resolve;
       });
+      const baseReplacementDb = makeDb('valid-hash');
       const replacementDb = {
-        queryOne: () => replacementQuery,
-        query: async () => [],
-        execute: async () => ({ changes: 1 }),
-        exec: async () => {},
-        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) =>
-          fn(replacementDb as unknown as import('../src/db/client.js').Database),
-        close: () => {},
+        ...baseReplacementDb,
+        queryOne: (sql: string, params?: unknown[]) => (
+          sql.includes('FROM servers') ? replacementQuery : baseReplacementDb.queryOne(sql, params)
+        ),
       } as unknown as import('../src/db/client.js').Database;
       const replacementWs = new MockWs();
-      bridge.handleDaemonConnection(replacementWs as never, replacementDb, {} as never);
+      bridge.handleDaemonConnection(replacementWs as never, replacementDb, {
+        JWT_SIGNING_KEY: 'bridge-test-signing-key',
+      } as never);
       replacementWs.emit('message', JSON.stringify({
         type: 'auth',
         serverId,
         token: 'my-token',
+      }));
+      replacementWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        helloEpoch: 1,
+        sentAt: Date.now(),
+        capabilities: [TURN_AUTHORITY_REVOKE_CAPABILITY_V1],
       }));
       await flushAsync();
 
