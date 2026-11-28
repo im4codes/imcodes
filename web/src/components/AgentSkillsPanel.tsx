@@ -65,6 +65,8 @@ export function AgentSkillsPanel({ serverId, refreshSignal }: Props) {
   const [found, setFound] = useState<AgentSkillSearchResult[] | null>(null);
   const [selected, setSelected] = useState<AgentSkillSearchResult | null>(null);
   const [audit, setAudit] = useState<AuditState | null>(null);
+  const currentMachineIdRef = useRef(machineId);
+  currentMachineIdRef.current = machineId;
   const loadGenerationRef = useRef(0);
 
   useEffect(() => () => {
@@ -75,9 +77,16 @@ export function AgentSkillsPanel({ serverId, refreshSignal }: Props) {
     setMachineId(serverId);
   }, [serverId]);
 
-  const load = useCallback(async () => {
+  const commitLoadedSkills = useCallback((targetMachineId: string | undefined, nextSkills: AgentSkillEntry[]) => {
+    if (!targetMachineId || currentMachineIdRef.current !== targetMachineId) return;
+    loadGenerationRef.current += 1;
+    setSkills(nextSkills);
+    setLoadError(false);
+    setLoading(false);
+  }, []);
+
+  const loadForMachine = useCallback(async (targetMachineId: string | undefined) => {
     const generation = ++loadGenerationRef.current;
-    const targetMachineId = machineId;
     if (!targetMachineId) {
       setSkills([]);
       setLoadError(false);
@@ -88,10 +97,10 @@ export function AgentSkillsPanel({ serverId, refreshSignal }: Props) {
     setLoadError(false);
     try {
       const nextSkills = await listAgentSkills(targetMachineId);
-      if (loadGenerationRef.current !== generation) return;
+      if (loadGenerationRef.current !== generation || currentMachineIdRef.current !== targetMachineId) return;
       setSkills(nextSkills);
     } catch {
-      if (loadGenerationRef.current !== generation) return;
+      if (loadGenerationRef.current !== generation || currentMachineIdRef.current !== targetMachineId) return;
       setSkills([]);
       setLoadError(true);
     } finally {
@@ -99,7 +108,9 @@ export function AgentSkillsPanel({ serverId, refreshSignal }: Props) {
         setLoading(false);
       }
     }
-  }, [machineId]);
+  }, []);
+
+  const load = useCallback(() => loadForMachine(machineId), [loadForMachine, machineId]);
 
   useEffect(() => {
     void load();
@@ -124,15 +135,17 @@ export function AgentSkillsPanel({ serverId, refreshSignal }: Props) {
   ) => {
     setBusy(label);
     setResults([]);
+    const operatedOn = new Set(ids);
     try {
       const settled = await Promise.all(ids.map(async (id) => ({ serverId: id, ...(await runAgentSkills(id, request)) })));
       setResults(settled);
-      const current = settled.find((result) => result.serverId === machineId);
+      const activeMachineId = currentMachineIdRef.current;
+      if (!activeMachineId || !operatedOn.has(activeMachineId)) return;
+      const current = settled.find((result) => result.serverId === activeMachineId);
       if (current?.skills) {
-        loadGenerationRef.current += 1;
-        setSkills(current.skills);
+        commitLoadedSkills(activeMachineId, current.skills);
       } else {
-        await load();
+        await loadForMachine(activeMachineId);
       }
     } finally {
       setBusy(null);

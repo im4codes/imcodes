@@ -236,4 +236,66 @@ describe('AgentSkillsPanel', () => {
     expect(screen.getByText('linux-skill')).toBeDefined();
     expect(screen.queryByText('sharedContext.management.agentSkills.loadFailed')).toBeNull();
   });
+
+  it('settles loading and updated skills when Update All completes ahead of an overlapping refresh, and does not clobber another machine switched mid-run', async () => {
+    const view = render(h(AgentSkillsPanel, { serverId: 'mac', refreshSignal: 0 }));
+    await screen.findByText('wecomcli-doc');
+
+    let resolveUpdate!: (res: Awaited<ReturnType<typeof runAgentSkills>>) => void;
+    const pendingUpdate = new Promise<Awaited<ReturnType<typeof runAgentSkills>>>((res) => {
+      resolveUpdate = res;
+    });
+    let resolveRefresh!: (rows: Awaited<ReturnType<typeof listAgentSkills>>) => void;
+    const pendingRefresh = new Promise<Awaited<ReturnType<typeof listAgentSkills>>>((res) => {
+      resolveRefresh = res;
+    });
+
+    runAgentSkills.mockReturnValueOnce(pendingUpdate);
+    listAgentSkills.mockReturnValueOnce(pendingRefresh);
+
+    // Overlap Update All with a concurrent hero refresh on the same machine.
+    fireEvent.click(screen.getByText('sharedContext.management.agentSkills.updateAll'));
+    view.rerender(h(AgentSkillsPanel, { serverId: 'mac', refreshSignal: 1 }));
+    expect(screen.getByText('common.loading')).toBeDefined();
+
+    // Update All completes first with fresh skills; loading must settle immediately and stale refresh must not overwrite.
+    resolveUpdate({
+      ok: true,
+      output: 'Updated',
+      skills: [{ name: 'updated-skill', description: 'From update' }],
+    });
+    expect(await screen.findByText('updated-skill')).toBeDefined();
+    expect(screen.queryByText('common.loading')).toBeNull();
+
+    resolveRefresh([{ name: 'stale-refresh-skill', description: 'Stale' }]);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(screen.getByText('updated-skill')).toBeDefined();
+    expect(screen.queryByText('stale-refresh-skill')).toBeNull();
+    expect(screen.queryByText('common.loading')).toBeNull();
+
+    // Now start an action on mac (including empty-skills result), switch to linux while pending -> mac result must not clobber linux.
+    let resolveMacAction!: (res: Awaited<ReturnType<typeof runAgentSkills>>) => void;
+    const pendingMacAction = new Promise<Awaited<ReturnType<typeof runAgentSkills>>>((res) => {
+      resolveMacAction = res;
+    });
+    runAgentSkills.mockReturnValueOnce(pendingMacAction);
+    listAgentSkills.mockResolvedValueOnce([{ name: 'linux-active-skill', description: 'Linux list' }]);
+
+    fireEvent.click(screen.getByText('sharedContext.management.agentSkills.updateAll'));
+    const machineSelect = await screen.findByLabelText('sharedContext.management.agentSkills.machineLabel') as HTMLSelectElement;
+    await screen.findByRole('option', { name: 'vm-124' });
+    machineSelect.value = 'linux';
+    fireEvent(machineSelect, new Event('change', { bubbles: true }));
+    expect(await screen.findByText('linux-active-skill')).toBeDefined();
+
+    const linuxCallsAfterSwitch = listAgentSkills.mock.calls.length;
+    resolveMacAction({ ok: true, output: 'Done on mac' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.getByText('linux-active-skill')).toBeDefined();
+    expect(listAgentSkills.mock.calls.length).toBe(linuxCallsAfterSwitch);
+    expect(screen.queryByText('common.loading')).toBeNull();
+  });
 });
