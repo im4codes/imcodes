@@ -42,6 +42,8 @@ import { buildSessionList, resolveAuthoritativeSessionListState } from './sessio
 import { timelineEmitter } from './timeline-emitter.js';
 import {
   clearAllDaemonTurnAuthoritiesOnDisconnect,
+  readProcessSharedMachineActivityEpoch,
+  readTimelineEventActivityEpoch,
   registerTreeSessionActivityProbe,
   releaseProcessSharedMachineAuthority,
 } from './shared-machine-authority-context.js';
@@ -1361,12 +1363,24 @@ export async function startup(): Promise<DaemonContext> {
     if (e.type === 'session.state') {
       const state = (e.payload as Record<string, unknown>).state;
       if (state === 'idle') {
-        notifySessionIdle(e.sessionId);
-        // The turn is over: a participant's machine-authority window on a process session ends here.
-        const activityEpoch = (e.payload as { activityEpoch?: unknown })?.activityEpoch;
-        if (typeof activityEpoch === 'number') {
-          releaseProcessSharedMachineAuthority(e.sessionId, { expectedActivityEpoch: activityEpoch });
+        const trackedEpoch = readTimelineEventActivityEpoch(e);
+        const payloadObj = e.payload as { activityEpoch?: unknown } | undefined;
+        const hasPayloadEpoch = payloadObj !== undefined
+          && Object.prototype.hasOwnProperty.call(payloadObj, 'activityEpoch')
+          && (typeof payloadObj.activityEpoch === 'number' || payloadObj.activityEpoch === null);
+        const hasExplicitEpoch = trackedEpoch !== undefined || hasPayloadEpoch;
+        if (hasExplicitEpoch) {
+          const expectedEpoch = trackedEpoch !== undefined
+            ? trackedEpoch
+            : (payloadObj?.activityEpoch as number | null);
+          if (readProcessSharedMachineActivityEpoch(e.sessionId) !== expectedEpoch) {
+            return;
+          }
+          notifySessionIdle(e.sessionId);
+          releaseProcessSharedMachineAuthority(e.sessionId, { expectedActivityEpoch: expectedEpoch });
         } else {
+          notifySessionIdle(e.sessionId);
+          // The turn is over: a participant's machine-authority window on a process session ends here.
           releaseProcessSharedMachineAuthority(e.sessionId);
         }
         void drainQueue(e.sessionId);

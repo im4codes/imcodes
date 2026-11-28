@@ -7,6 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import {
   bindProcessSharedMachineActivity,
+  bindSdkTurnOriginsAuthority,
   bindTreeTurnAuthority,
   clearAllDaemonTurnAuthoritiesOnDisconnect,
   clearProcessSharedMachineAuthoritiesForTests,
@@ -20,7 +21,10 @@ import {
   resolveCanonicalTurnAuthority,
   resolveDaemonRootSessionName,
   resolveSessionEffectiveSharedMachineAuthority,
+  summarizeSdkTurnOrigins,
 } from '../../src/daemon/shared-machine-authority-context.js';
+import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import {
   AMBIGUOUS_PARTICIPANT_ACTOR,
   readSenderOwnerMachineAuthority,
@@ -754,5 +758,317 @@ describe('daemon unified main-tree turn authority', () => {
     expect(urls[1]).toBe('https://im.example.test/api/verification-machines?projectKey=proj-1&serverId=srv-src-sticky');
     expect(urls[2]).toContain('https://im.example.test/api/aliases?');
     expect(urls[2]).toContain('serverId=srv-src-sticky');
+  });
+
+  it('Round 3 P0 #1: SDK queue-coalesce and active-turn append keep same-sender tokens non-mixed and advance to latest grant while failing closed on P1/P2 or O/P1 mix', async () => {
+    const p1Actor = (userId: string, sessionName: string) => ({
+      actorUserId: userId,
+      actorDisplayName: userId,
+      effectiveActorRole: 'participant' as const,
+      actionId: `act-${userId}`,
+      origin: 'shared-tab' as const,
+      authorizedAt: Date.now(),
+      primaryShareId: null,
+      snapshot: {
+        target: { kind: 'main' as const, serverId: 'srv-1', sessionName },
+        effectiveRole: 'participant' as const,
+        historyCutoffAt: 0,
+        coveringShareIds: [],
+        authorizedAt: Date.now(),
+        nextCoverageRecheckAt: null,
+      },
+    });
+
+    const makeSdkHarness = (sess: SessionRecord) => {
+      let sendGateResolve: (() => void) | null = null;
+      let completeHandler: ((sid: string, msg: any) => void) | undefined;
+      let statusHandler: ((sid: string, status: any) => void) | undefined;
+      let appendHandler: ((sid: string, payload: any) => Promise<'delivered' | 'stale' | 'unsupported'>) | undefined;
+      const provider: TransportProvider = {
+        id: 'codex-sdk',
+        connectionMode: 'persistent',
+        sessionOwnership: 'provider',
+        capabilities: {
+          streaming: true,
+          toolCalling: false,
+          approval: false,
+          sessionRestore: false,
+          multiTurn: true,
+          attachments: false,
+          contextSupport: 'full-normalized-context-injection',
+          activeDelegationNotification: 'native',
+        },
+        connect: vi.fn().mockResolvedValue(undefined),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+        createSession: vi.fn().mockResolvedValue(`prov-${sess.name}`),
+        endSession: vi.fn().mockResolvedValue(undefined),
+        send: vi.fn().mockImplementation(
+          () => new Promise<void>((resolve) => {
+            sendGateResolve = resolve;
+          }),
+        ),
+        notifyActiveDelegation: vi.fn().mockImplementation(async (sid, payload) => {
+          if (appendHandler) return appendHandler(sid, payload);
+          return 'delivered';
+        }),
+        cancel: vi.fn().mockResolvedValue(undefined),
+        onDelta: () => () => undefined,
+        onComplete: (cb) => { completeHandler = cb; return () => undefined; },
+        onError: () => () => undefined,
+        onApprovalRequest: () => undefined,
+        onStatus: (cb) => { statusHandler = cb; return () => undefined; },
+        onUsage: () => () => undefined,
+        onToolCall: () => () => undefined,
+        respondApproval: vi.fn().mockResolvedValue(undefined),
+      };
+      const runtime = new TransportSessionRuntime(provider, sess.name);
+      runtime.onTurnAdmitted = (origins) => bindSdkTurnOriginsAuthority(sess.name, origins);
+      return {
+        provider,
+        runtime,
+        setAppendHandler: (fn: typeof appendHandler) => { appendHandler = fn; },
+        finishSend: () => {
+          const resolve = sendGateResolve;
+          sendGateResolve = null;
+          resolve?.();
+          completeHandler?.(`prov-${sess.name}`, { id: 'm1', role: 'assistant', content: 'ok', status: 'complete', timestamp: Date.now() });
+          statusHandler?.(`prov-${sess.name}`, 'idle');
+        },
+      };
+    };
+
+    // 1. Queue-coalesce (`_drainPending`) merges two admitted messages from SAME P1 with distinct tokens
+    const sessMain = seed({ name: 'deck_sdk_r3_brain', projectName: 'sdk-r3', role: 'brain', runtimeType: 'transport', agentType: 'codex-sdk', state: 'running' });
+    const h = makeSdkHarness(sessMain);
+    await h.runtime.initialize({ sessionName: sessMain.name, projectName: sessMain.projectName, cwd: sessMain.projectDir });
+
+    const tokP1_1 = 'trg_sdk_p1_coalesce_111111111111';
+    const tokP1_2 = 'trg_sdk_p1_coalesce_222222222222';
+    const tokP1_3 = 'trg_sdk_p1_append_33333333333333';
+
+    // Enqueue both via `send()` while runtime is busy so `_drainPending` coalesces both into one dispatched turn
+    (h.runtime as any)._sending = true;
+    expect(h.runtime.send('msg 1 from P1', 'cm-1', undefined, undefined, {
+      sharedActor: p1Actor('user-p1', sessMain.name),
+      sharedMachineAuthority: tokP1_1,
+    })).toBe('queued');
+    expect(h.runtime.send('msg 2 from P1', 'cm-2', undefined, undefined, {
+      sharedActor: p1Actor('user-p1', sessMain.name),
+      sharedMachineAuthority: tokP1_2,
+    })).toBe('queued');
+    (h.runtime as any)._sending = false;
+    expect((h.runtime as any)._drainPending()).toBe(true);
+
+    // Coalesced origins `[tokP1_1, tokP1_2]` from same P1 MUST resolve to latest `tokP1_2` (NOT mixed!)
+    expect(h.runtime.getActiveSharedMachineAuthority()).toBe(tokP1_2);
+    expect(readActiveTreeAuthorityForSession(sessMain.name)?.authority).toBe(tokP1_2);
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: sessMain.name,
+      identity: idOf(sessMain),
+      sessionRunning: true,
+      now: Date.now(),
+      runtime: h.runtime,
+    })).toEqual({
+      required: true,
+      actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.PARTICIPANT,
+      authority: tokP1_2,
+    });
+
+    // Late bind with superseded `tokP1_1` must NOT regress `tokP1_2`
+    bindTreeTurnAuthority(sessMain.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokP1_1,
+    });
+    expect(readActiveTreeAuthorityForSession(sessMain.name)?.authority).toBe(tokP1_2);
+
+    // 2. Active-turn append from SAME P1 with `tokP1_3` advances both runtime & tree to `tokP1_3` without mixed
+    expect(h.runtime.send('msg 3 append from P1', 'cm-3', undefined, undefined, {
+      sharedActor: p1Actor('user-p1', sessMain.name),
+      sharedMachineAuthority: tokP1_3,
+    })).toBe('queued');
+    const appendRes = await h.runtime.appendPendingMessagesToActiveTurn(['cm-3'], 'notif-3');
+    expect(appendRes.status).toBe('delivered');
+    expect(h.runtime.getActiveSharedMachineAuthority()).toBe(tokP1_3);
+    expect(readActiveTreeAuthorityForSession(sessMain.name)?.authority).toBe(tokP1_3);
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: sessMain.name,
+      identity: idOf(sessMain),
+      sessionRunning: true,
+      now: Date.now(),
+      runtime: h.runtime,
+    })).toEqual({
+      required: true,
+      actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.PARTICIPANT,
+      authority: tokP1_3,
+    });
+
+    // 3. Contrast: P2 appends into P1's active SDK turn -> immediately mixed fail-closed AND revokes BOTH P1 (`tokP1_3`) AND P2 (`tokP2_conf`)
+    sentFrames.length = 0;
+    const tokP2_conf = 'trg_sdk_p2_conflict_444444444444';
+    expect(h.runtime.send('msg 4 conflict from P2', 'cm-4', undefined, undefined, {
+      sharedActor: p1Actor('user-p2', sessMain.name),
+      sharedMachineAuthority: tokP2_conf,
+    })).toBe('queued');
+    const appendP2 = await h.runtime.appendPendingMessagesToActiveTurn(['cm-4'], 'notif-4');
+    expect(appendP2.status).toBe('delivered');
+    expect(h.runtime.getActiveSharedMachineAuthority()).toBeNull();
+    expect(h.runtime.requiresSharedMachineAuthority()).toBe(true);
+    expect(readActiveTreeAuthorityForSession(sessMain.name)).toMatchObject({ kind: 'mixed', authority: null });
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: sessMain.name,
+      identity: idOf(sessMain),
+      sessionRunning: true,
+      now: Date.now(),
+      runtime: h.runtime,
+    })).toEqual({ required: true, authority: null });
+    expect(sentFrames).toEqual(expect.arrayContaining([
+      { type: DAEMON_MSG.TURN_AUTHORITY_REVOKE, rootSessionName: sessMain.name, tokenHash: sha256(tokP1_3) },
+      { type: DAEMON_MSG.TURN_AUTHORITY_REVOKE, rootSessionName: sessMain.name, tokenHash: sha256(tokP2_conf) },
+    ]));
+
+    h.finishSend();
+    await h.runtime.kill();
+    await flushMicrotasks();
+
+    // 4. Same Owner O coalesced tokens advance cleanly; O + P1 conflict fails closed and revokes BOTH tokens
+    sentFrames.length = 0;
+    const ownerSummary = summarizeSdkTurnOrigins([
+      { ownerMachineAuthority: 'trg_o_1' },
+      { ownerMachineAuthority: 'trg_o_2' },
+    ]);
+    expect(ownerSummary).toEqual({
+      state: 'owner',
+      actorUserId: null,
+      authority: 'trg_o_2',
+      revokeTokenHashes: [sha256('trg_o_1')],
+    });
+    const mixedSummary = summarizeSdkTurnOrigins([
+      { ownerMachineAuthority: 'trg_o_conflict' },
+      { sharedActor: p1Actor('user-p1', sessMain.name), sharedMachineAuthority: 'trg_p1_conflict' },
+    ]);
+    expect(mixedSummary).toEqual({
+      state: 'mixed',
+      actorUserId: 'user-p1',
+      authority: null,
+      revokeTokenHashes: [sha256('trg_o_conflict'), sha256('trg_p1_conflict')],
+    });
+  });
+
+  it('Round 3 P0 #2: process conflict (`P1->P2`, `O->P1`, `P1->O`) revokes both old and newly minted hashes, preserves offline retry, and fences linkGeneration', async () => {
+    let linkGen = 10;
+    let trySendOk = true;
+    setActiveServerLink({
+      send: (msg) => { sentFrames.push(msg as Record<string, unknown>); },
+      trySend: (msg) => {
+        if (!trySendOk) return false;
+        sentFrames.push(msg as Record<string, unknown>);
+        return true;
+      },
+      isConnected: () => true,
+      getConnectionGeneration: () => linkGen,
+    });
+
+    // Case A: P1(tok1) -> P2(tok2) in SAME active process window -> revokes BOTH tok1 AND tok2 immediately
+    const procA = seed({ name: 'deck_proc_c1_brain', projectName: 'proc-c1', role: 'brain', state: 'running' });
+    const tokP1 = 'trg_proc_p1_old_1111111111111111';
+    const tokP2 = 'trg_proc_p2_new_2222222222222222';
+    const b1 = bindProcessSharedMachineActivity(procA.name, idOf(procA), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokP1,
+    }, { now: Date.now(), sessionRunning: true });
+    b1.typed(Date.now());
+    sentFrames.length = 0;
+
+    const b2 = bindProcessSharedMachineActivity(procA.name, idOf(procA), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p2',
+      authority: tokP2,
+    }, { now: Date.now() + 10, sessionRunning: true });
+    b2.typed(Date.now() + 10);
+
+    expect(readActiveTreeAuthorityForSession(procA.name)).toMatchObject({ kind: 'mixed', authority: null });
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: procA.name,
+      identity: idOf(procA),
+      sessionRunning: true,
+      now: Date.now() + 20,
+    })).toEqual({ required: true, authority: null });
+    expect(sentFrames).toEqual(expect.arrayContaining([
+      { type: DAEMON_MSG.TURN_AUTHORITY_REVOKE, rootSessionName: procA.name, tokenHash: sha256(tokP1) },
+      { type: DAEMON_MSG.TURN_AUTHORITY_REVOKE, rootSessionName: procA.name, tokenHash: sha256(tokP2) },
+    ]));
+
+    // Case B: O(tokO) -> P1(tokP1b) -> revokes BOTH tokO and tokP1b immediately
+    const procB = seed({ name: 'deck_proc_c2_brain', projectName: 'proc-c2', role: 'brain', state: 'running' });
+    const tokO = 'trg_proc_o_old_33333333333333333';
+    const tokP1b = 'trg_proc_p1_new_4444444444444444';
+    bindProcessSharedMachineActivity(procB.name, idOf(procB), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+      authority: tokO,
+    }, { now: Date.now(), sessionRunning: true }).typed(Date.now());
+    sentFrames.length = 0;
+    bindProcessSharedMachineActivity(procB.name, idOf(procB), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokP1b,
+    }, { now: Date.now() + 10, sessionRunning: true }).typed(Date.now() + 10);
+    expect(readActiveTreeAuthorityForSession(procB.name)).toMatchObject({ kind: 'mixed', authority: null });
+    expect(sentFrames).toEqual(expect.arrayContaining([
+      { type: DAEMON_MSG.TURN_AUTHORITY_REVOKE, rootSessionName: procB.name, tokenHash: sha256(tokO) },
+      { type: DAEMON_MSG.TURN_AUTHORITY_REVOKE, rootSessionName: procB.name, tokenHash: sha256(tokP1b) },
+    ]));
+
+    // Case C: Failed revoke send (`trySendOk = false`) keeps hashes in `pendingRevokeHashes` and retries at final idle on SAME linkGen
+    const procC = seed({ name: 'deck_proc_c3_brain', projectName: 'proc-c3', role: 'brain', state: 'running' });
+    const tokC1 = 'trg_retry_c1_5555555555555555555';
+    const tokC2 = 'trg_retry_c2_6666666666666666666';
+    bindProcessSharedMachineActivity(procC.name, idOf(procC), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokC1,
+    }, { now: Date.now(), sessionRunning: true }).typed(Date.now());
+    trySendOk = false;
+    sentFrames.length = 0;
+    bindProcessSharedMachineActivity(procC.name, idOf(procC), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p2',
+      authority: tokC2,
+    }, { now: Date.now() + 10, sessionRunning: true }).typed(Date.now() + 10);
+    expect(sentFrames).toEqual([]);
+
+    trySendOk = true;
+    upsertSession({ ...procC, state: 'idle' });
+    releaseProcessSharedMachineAuthority(procC.name, { forceSettle: true });
+    await flushMicrotasks();
+    expect(sentFrames).toEqual(expect.arrayContaining([
+      { type: DAEMON_MSG.TURN_AUTHORITY_REVOKE, rootSessionName: procC.name, tokenHash: sha256(tokC1) },
+      { type: DAEMON_MSG.TURN_AUTHORITY_REVOKE, rootSessionName: procC.name, tokenHash: sha256(tokC2) },
+    ]));
+
+    // Case D: If linkGeneration changed before final idle, stale linkGen revoke hashes are fenced cleanly
+    const procD = seed({ name: 'deck_proc_c4_brain', projectName: 'proc-c4', role: 'brain', state: 'running' });
+    const tokD1 = 'trg_fence_d1_7777777777777777777';
+    const tokD2 = 'trg_fence_d2_8888888888888888888';
+    linkGen = 20;
+    trySendOk = false;
+    bindProcessSharedMachineActivity(procD.name, idOf(procD), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokD1,
+    }, { now: Date.now(), sessionRunning: true }).typed(Date.now());
+    bindProcessSharedMachineActivity(procD.name, idOf(procD), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p2',
+      authority: tokD2,
+    }, { now: Date.now() + 10, sessionRunning: true }).typed(Date.now() + 10);
+    sentFrames.length = 0;
+    linkGen = 21;
+    trySendOk = true;
+    upsertSession({ ...procD, state: 'idle' });
+    releaseProcessSharedMachineAuthority(procD.name, { forceSettle: true });
+    await flushMicrotasks();
+    expect(sentFrames).toEqual([]);
   });
 });

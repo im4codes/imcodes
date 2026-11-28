@@ -1,6 +1,7 @@
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
 import { queuedPairWakeAllowed } from '../daemon/task-pairs/wake-authority.js';
+import { summarizeSdkTurnOrigins, type SdkTurnOriginSummary } from '../daemon/shared-machine-authority-context.js';
 import { withMemoryMcpSessionEnv } from './providers/getDefaultMcpServers.js';
 import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
 import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
@@ -1667,24 +1668,25 @@ export class TransportSessionRuntime implements SessionRuntime {
     return stillSameTurn ? [...this._activeDispatchEntries, ...appended.entries] : this._activeDispatchEntries;
   }
 
+  getTurnOriginSummary(): SdkTurnOriginSummary {
+    return summarizeSdkTurnOrigins(this.turnOriginEntries());
+  }
+
   /** Opaque authority for the active turn only; ambiguity fails closed. */
   getActiveSharedMachineAuthority(): string | null {
-    const origins = this.turnOriginEntries();
-    if (origins.length === 0 || origins.some((entry) => !entry.sharedMachineAuthority)) return null;
-    const tokens = new Set(origins.map((entry) => entry.sharedMachineAuthority!));
-    return tokens.size === 1 ? [...tokens][0]! : null;
+    const summary = this.getTurnOriginSummary();
+    return summary.state === 'participant' ? summary.authority : null;
   }
 
   /** Opaque owner-turn authority for non-participant turns only; any participant or unstamped origin fails closed. */
   getActiveOwnerMachineAuthority(): string | null {
-    if (this.requiresSharedMachineAuthority()) return null;
-    const origins = this.turnOriginEntries();
-    if (origins.length === 0 || origins.some((entry) => !entry.ownerMachineAuthority)) return null;
-    return origins[origins.length - 1]!.ownerMachineAuthority!;
+    const summary = this.getTurnOriginSummary();
+    return summary.state === 'owner' ? summary.authority : null;
   }
 
   requiresSharedMachineAuthority(): boolean {
-    return this.turnOriginEntries().some((entry) => entry.sharedActor?.effectiveActorRole === 'participant');
+    const summary = this.getTurnOriginSummary();
+    return summary.state === 'participant' || summary.state === 'mixed';
   }
 
   getParticipantToolBinding(): { providerSessionId: string | null; dispatchId: number | null } {

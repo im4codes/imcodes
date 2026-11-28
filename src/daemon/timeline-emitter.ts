@@ -28,6 +28,7 @@ import {
 import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
 import { recordAssistantFileReadGrants } from './session-file-read-grants.js';
+import { recordTimelineEventActivityEpoch } from './shared-machine-authority-context.js';
 
 /** Pattern matching temp file instruction: "Read and execute all instructions in @<path>" */
 const TEMP_FILE_RE = /^Read and execute all instructions in @(.+\.imcodes-prompt-[0-9a-f]+\.md)$/;
@@ -123,7 +124,7 @@ export class TimelineEmitter {
     sessionId: string,
     type: TimelineEventType,
     payload: Record<string, unknown>,
-    opts?: { source?: TimelineSource; confidence?: TimelineConfidence; eventId?: string; ts?: number; hidden?: boolean },
+    opts?: { source?: TimelineSource; confidence?: TimelineConfidence; eventId?: string; ts?: number; hidden?: boolean; activityEpoch?: number | null },
   ): TimelineEvent | null {
     const session = getSession(sessionId);
     const incognito = inIncognitoContext() || isIncognitoSessionName(sessionId) || isIncognitoSession(session) || isIncognitoSession(payload);
@@ -178,7 +179,11 @@ export class TimelineEmitter {
       if (!terminalState && !hasStructuredQueueMutation && !hasErrorMutation) {
         if (this.lastSignalPayload.get(key) === fingerprint) {
           finishTrace('synthetic');
-          return { eventId: '', sessionId, ts: Date.now(), seq: 0, epoch: this.epoch, source: opts?.source ?? 'daemon', confidence: opts?.confidence ?? 'high', type, payload } as TimelineEvent;
+          const synthetic = { eventId: '', sessionId, ts: Date.now(), seq: 0, epoch: this.epoch, source: opts?.source ?? 'daemon', confidence: opts?.confidence ?? 'high', type, payload } as TimelineEvent;
+          if (opts && Object.prototype.hasOwnProperty.call(opts, 'activityEpoch')) {
+            recordTimelineEventActivityEpoch(synthetic, opts.activityEpoch ?? null);
+          }
+          return synthetic;
         }
       }
       this.lastSignalPayload.set(key, fingerprint);
@@ -331,6 +336,9 @@ export class TimelineEmitter {
       payload,
       ...(opts?.hidden ? { hidden: true } : {}),
     };
+    if (opts && Object.prototype.hasOwnProperty.call(opts, 'activityEpoch')) {
+      recordTimelineEventActivityEpoch(event, opts.activityEpoch ?? null);
+    }
 
     // Ring buffer — stable eventId events replace in-place (streaming delta updates).
     //

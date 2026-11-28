@@ -155,7 +155,6 @@ function resolveTaskPairDeliveryAuthority(
       resolved && (
         resolved.kind === 'owner'
         || (resolved.actorUserId && liveTree.actorUserId && resolved.actorUserId !== liveTree.actorUserId)
-        || (resolved.authority && liveTree.authority && resolved.authority !== liveTree.authority)
       )
     ) {
       return {

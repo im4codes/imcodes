@@ -1364,17 +1364,17 @@ export class TerminalStreamer {
     const idleActivityEpoch = readProcessSharedMachineActivityEpoch(sessionName);
     const timer = setTimeout(() => {
       this.idleTimers.delete(sessionName);
-      const currentlyIdle = this.idleState.get(sessionName) ?? false;
       const sess = getSession(sessionName);
       if (sess?.agentType === 'codex' && isCodexWatching(sessionName)) {
         return; // Codex has stronger structured idle signals via JSONL/hook
       }
+      if (readProcessSharedMachineActivityEpoch(sessionName) !== idleActivityEpoch) {
+        return;
+      }
+      const currentlyIdle = this.idleState.get(sessionName) ?? false;
       if (!currentlyIdle) {
         this.idleState.set(sessionName, true);
-        timelineEmitter.emit(sessionName, 'session.state', {
-          state: 'idle',
-          ...(idleActivityEpoch !== null ? { activityEpoch: idleActivityEpoch } : {}),
-        });
+        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' }, { activityEpoch: idleActivityEpoch });
         if (sess) upsertSession({ ...sess, state: 'idle', updatedAt: Date.now() });
       }
     }, IDLE_THRESHOLD_MS);

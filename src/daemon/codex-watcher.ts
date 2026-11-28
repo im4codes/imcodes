@@ -200,24 +200,41 @@ function flushFinalAnswer(sessionName: string): void {
   timelineEmitter.emit(sessionName, 'assistant.text', { text: buf.text, streaming: false }, { source: 'daemon', confidence: 'high' });
 }
 
-function emitSessionState(sessionName: string, state: 'running' | 'idle'): void {
+function emitSessionState(
+  sessionName: string,
+  state: 'running' | 'idle',
+  capturedIdleEpoch?: number | null,
+): void {
   const prev = sessionStates.get(sessionName);
   if (prev === state) return;
-  sessionStates.set(sessionName, state);
-  if (state === 'running' && prev !== 'running') {
+  if (state === 'idle') {
+    const expectedEpoch = capturedIdleEpoch !== undefined
+      ? capturedIdleEpoch
+      : readProcessSharedMachineActivityEpoch(sessionName);
+    if (readProcessSharedMachineActivityEpoch(sessionName) !== expectedEpoch) {
+      return;
+    }
+    sessionStates.set(sessionName, 'idle');
+    timelineEmitter.emit(sessionName, 'session.state', {
+      state: 'idle',
+      ...(historyReplaySessions.has(sessionName) ? { [TIMELINE_SUPPRESS_PUSH_FIELD]: true } : {}),
+    }, { source: 'daemon', confidence: 'high', activityEpoch: expectedEpoch });
+    updateSessionState(sessionName, 'idle');
+    return;
+  }
+  sessionStates.set(sessionName, 'running');
+  if (prev !== 'running') {
     const watcher = watchers.get(sessionName);
     if (watcher) {
       watcher.turnHadAssistantText = false;
       watcher.noTextRetrackAttempted = false;
     }
   }
-  const idleActivityEpoch = state === 'idle' ? readProcessSharedMachineActivityEpoch(sessionName) : null;
   timelineEmitter.emit(sessionName, 'session.state', {
-    state,
-    ...(idleActivityEpoch !== null ? { activityEpoch: idleActivityEpoch } : {}),
+    state: 'running',
     ...(historyReplaySessions.has(sessionName) ? { [TIMELINE_SUPPRESS_PUSH_FIELD]: true } : {}),
   }, { source: 'daemon', confidence: 'high' });
-  updateSessionState(sessionName, state);
+  updateSessionState(sessionName, 'running');
 }
 
 export function resetParseStateForTests(): void {
@@ -343,13 +360,14 @@ export function parseLine(sessionName: string, line: string, model?: string): vo
     emitSessionState(sessionName, 'running');
   } else if (pl.type === 'task_complete') {
     const watcher = watchers.get(sessionName);
+    const completionEpoch = readProcessSharedMachineActivityEpoch(sessionName);
     if (watcher && !watcher.turnHadAssistantText && !watcher.noTextRetrackAttempted) {
       watcher.noTextRetrackAttempted = true;
-      void finalizeIdleAfterRefresh(sessionName);
+      void finalizeIdleAfterRefresh(sessionName, completionEpoch);
       return;
     }
     flushFinalAnswer(sessionName);
-    emitSessionState(sessionName, 'idle');
+    emitSessionState(sessionName, 'idle', completionEpoch);
   } else if (pl.type === 'user_message') {
     flushFinalAnswer(sessionName);
     if (pl.message?.trim()) timelineEmitter.emit(sessionName, 'user.message', { text: pl.message }, { source: 'daemon', confidence: 'high', ...(ts ? { ts } : {}) });
@@ -843,21 +861,23 @@ async function retrackLatestRolloutInner(sessionName: string, state: WatcherStat
   return true;
 }
 
-async function finalizeIdleAfterRefresh(sessionName: string): Promise<void> {
+async function finalizeIdleAfterRefresh(sessionName: string, capturedEpoch: number | null): Promise<void> {
   let refreshed = false;
   let retracked = false;
   try {
     refreshed = await refreshTrackedSession(sessionName).catch(() => false);
-    if (sessionStates.get(sessionName) !== 'running') {
+    if (sessionStates.get(sessionName) !== 'running' && readProcessSharedMachineActivityEpoch(sessionName) === capturedEpoch) {
       retracked = await retrackLatestRollout(sessionName).catch(() => false);
-      if (retracked && sessionStates.get(sessionName) !== 'running') {
+      if (retracked && sessionStates.get(sessionName) !== 'running' && readProcessSharedMachineActivityEpoch(sessionName) === capturedEpoch) {
         refreshed = (await refreshTrackedSession(sessionName).catch(() => false)) || refreshed;
       }
     }
   } finally {
     flushFinalAnswer(sessionName);
+    if (watchers.get(sessionName)?.stopped) return;
     if ((refreshed || retracked) && sessionStates.get(sessionName) === 'running') return;
-    emitSessionState(sessionName, 'idle');
+    if (readProcessSharedMachineActivityEpoch(sessionName) !== capturedEpoch) return;
+    emitSessionState(sessionName, 'idle', capturedEpoch);
   }
 }
 

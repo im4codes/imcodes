@@ -95,15 +95,15 @@ function sendTurnAuthorityRevoke(
   rootSessionName: string,
   tokenHash: string,
   expectedLinkGeneration?: number,
-): void {
+): boolean {
   const link = getActiveServerLink();
-  if (!link || (link.isConnected && !link.isConnected())) return;
+  if (!link || (link.isConnected && !link.isConnected())) return false;
   if (
     expectedLinkGeneration !== undefined
     && link.getConnectionGeneration
     && link.getConnectionGeneration() !== expectedLinkGeneration
   ) {
-    return;
+    return false;
   }
   try {
     const frame = {
@@ -111,10 +111,12 @@ function sendTurnAuthorityRevoke(
       rootSessionName,
       tokenHash,
     };
-    if (link.trySend) link.trySend(frame);
-    else link.send(frame);
+    if (link.trySend) return link.trySend(frame) !== false;
+    link.send(frame);
+    return true;
   } catch {
     // Socket unavailable: server WS disconnect handler sweeps all grants for this serverId.
+    return false;
   }
 }
 
@@ -171,6 +173,139 @@ function maybeRevokeIdleTreeAuthority(
   }
 }
 
+export interface SdkTurnOriginInput {
+  sharedActor?: { effectiveActorRole?: string; actorUserId?: string };
+  sharedMachineAuthority?: string;
+  ownerMachineAuthority?: string;
+}
+
+export interface SdkTurnOriginSummary {
+  state: 'none' | 'owner' | 'participant' | 'mixed';
+  actorUserId: string | null;
+  authority: string | null;
+  /**
+   * Non-callable SHA-256 hashes of every valid token in `origins` that is not the active authority:
+   * - when `state === 'mixed'`: all valid tokens across conflicting/unstamped entries so every one is revoked;
+   * - when single-sender multiple-turn merge: earlier superseded tokens replaced by the latest token.
+   */
+  revokeTokenHashes: string[];
+}
+
+/**
+ * Shared origin summarizer used by both `onTurnAdmitted` (session-manager) and canonical
+ * local runtime reading (`transport-session-runtime` / `readLocalTurnAuthorityView`).
+ */
+export function summarizeSdkTurnOrigins(origins: ReadonlyArray<SdkTurnOriginInput>): SdkTurnOriginSummary {
+  if (origins.length === 0) {
+    return { state: 'none', actorUserId: null, authority: null, revokeTokenHashes: [] };
+  }
+
+  const allTokenHashes: string[] = [];
+  const seenHashes = new Set<string>();
+  const addTokenHash = (token: string | undefined | null) => {
+    const trimmed = typeof token === 'string' ? token.trim() : '';
+    if (!trimmed) return;
+    const hash = sha256Hex(trimmed);
+    if (!seenHashes.has(hash)) {
+      seenHashes.add(hash);
+      allTokenHashes.push(hash);
+    }
+  };
+  for (const entry of origins) {
+    addTokenHash(entry.sharedMachineAuthority);
+    addTokenHash(entry.ownerMachineAuthority);
+  }
+
+  const hasParticipant = origins.some((entry) => entry.sharedActor?.effectiveActorRole === 'participant');
+  if (hasParticipant) {
+    const actors = [...new Set(
+      origins
+        .filter((entry) => entry.sharedActor?.effectiveActorRole === 'participant')
+        .map((entry) => entry.sharedActor?.actorUserId?.trim() ?? '')
+        .filter(Boolean),
+    )];
+    const hasOwnerEntry = origins.some((entry) => entry.sharedActor?.effectiveActorRole !== 'participant');
+    const allEntriesValidParticipant = origins.every(
+      (entry) => entry.sharedActor?.effectiveActorRole === 'participant'
+        && Boolean(entry.sharedActor.actorUserId?.trim())
+        && Boolean(entry.sharedMachineAuthority?.trim()),
+    );
+    if (!hasOwnerEntry && actors.length === 1 && allEntriesValidParticipant) {
+      const authority = origins[origins.length - 1]!.sharedMachineAuthority!.trim();
+      const liveHash = sha256Hex(authority);
+      return {
+        state: 'participant',
+        actorUserId: actors[0]!,
+        authority,
+        revokeTokenHashes: allTokenHashes.filter((hash) => hash !== liveHash),
+      };
+    }
+    return {
+      state: 'mixed',
+      actorUserId: actors.length === 1 ? actors[0]! : AMBIGUOUS_TREE_PARTICIPANT_ACTOR,
+      authority: null,
+      revokeTokenHashes: allTokenHashes,
+    };
+  }
+
+  const allHaveOwnerToken = origins.every(
+    (entry) => typeof entry.ownerMachineAuthority === 'string' && entry.ownerMachineAuthority.trim().length > 0,
+  );
+  const authority = allHaveOwnerToken
+    ? origins[origins.length - 1]!.ownerMachineAuthority!.trim()
+    : null;
+  const liveHash = authority ? sha256Hex(authority) : null;
+  return {
+    state: 'owner',
+    actorUserId: null,
+    authority,
+    revokeTokenHashes: allTokenHashes.filter((hash) => hash !== liveHash),
+  };
+}
+
+/**
+ * Production `onTurnAdmitted` handler binding summarized SDK turn origins into
+ * `treeAuthorities`, advancing same-sender tokens and revoking all conflicting hashes.
+ */
+export function bindSdkTurnOriginsAuthority(
+  sessionName: string,
+  origins: ReadonlyArray<SdkTurnOriginInput>,
+  opts: { now?: number } = {},
+): number | null {
+  const summary = summarizeSdkTurnOrigins(origins);
+  if (summary.state === 'none') return null;
+  if (summary.state === 'mixed') {
+    return bindTreeTurnAuthority(sessionName, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: summary.actorUserId === AMBIGUOUS_TREE_PARTICIPANT_ACTOR ? '' : (summary.actorUserId ?? ''),
+    }, {
+      ...opts,
+      markActive: true,
+      conflict: true,
+      conflictRevokeHashes: summary.revokeTokenHashes,
+    });
+  }
+  if (summary.state === 'participant') {
+    return bindTreeTurnAuthority(sessionName, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: summary.actorUserId ?? '',
+      ...(summary.authority ? { authority: summary.authority } : {}),
+    }, {
+      ...opts,
+      markActive: true,
+      ...(summary.revokeTokenHashes.length > 0 ? { supersededHashes: summary.revokeTokenHashes } : {}),
+    });
+  }
+  return bindTreeTurnAuthority(sessionName, {
+    kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+    ...(summary.authority ? { authority: summary.authority } : {}),
+  }, {
+    ...opts,
+    markActive: true,
+    ...(summary.revokeTokenHashes.length > 0 ? { supersededHashes: summary.revokeTokenHashes } : {}),
+  });
+}
+
 function sameStableSender(
   a: { kind: 'owner' | 'participant' | 'mixed'; actorUserId: string | null },
   b: { kind: 'owner' | 'participant' | 'mixed'; actorUserId: string | null },
@@ -210,17 +345,29 @@ function hasOtherActiveConflictingSession(
 
 function flushConflictRevokeHashes(
   rootSessionName: string,
-  entry: TreeAuthorityState,
-  extraHash: string | null,
-  extraLinkGen: number | undefined,
+  supersededTokenHashes: Set<string>,
+  pendingRevokeHashes: Map<string, number | undefined>,
+  currentLinkGeneration: number | undefined,
+  extraHashes: ReadonlyArray<[string | null | undefined, number | undefined]>,
 ): void {
-  const toRevoke: Array<[string, number | undefined]> = [];
-  if (entry.tokenHash) toRevoke.push([entry.tokenHash, entry.linkGeneration]);
-  if (extraHash && extraHash !== entry.tokenHash) toRevoke.push([extraHash, extraLinkGen]);
-  for (const [hash, linkGen] of toRevoke) {
-    recordSupersededHash(entry.supersededTokenHashes, hash);
-    entry.pendingRevokeHashes.set(hash, linkGen);
-    sendTurnAuthorityRevoke(rootSessionName, hash, linkGen);
+  for (const [hash, linkGen] of extraHashes) {
+    if (!hash) continue;
+    recordSupersededHash(supersededTokenHashes, hash);
+    pendingRevokeHashes.set(hash, linkGen);
+  }
+  for (const [hash, linkGen] of [...pendingRevokeHashes.entries()]) {
+    if (
+      linkGen !== undefined
+      && currentLinkGeneration !== undefined
+      && linkGen !== currentLinkGeneration
+    ) {
+      // Previous WS connection generation already disconnected and wiped all grants on the server.
+      pendingRevokeHashes.delete(hash);
+      continue;
+    }
+    if (sendTurnAuthorityRevoke(rootSessionName, hash, linkGen)) {
+      pendingRevokeHashes.delete(hash);
+    }
   }
 }
 
@@ -233,7 +380,13 @@ function flushConflictRevokeHashes(
 export function bindTreeTurnAuthority(
   sessionName: string,
   activity: SharedMachineActivity,
-  opts: { now?: number; markActive?: boolean } = {},
+  opts: {
+    now?: number;
+    markActive?: boolean;
+    conflict?: boolean;
+    conflictRevokeHashes?: ReadonlyArray<string>;
+    supersededHashes?: ReadonlyArray<string>;
+  } = {},
 ): number {
   const now = opts.now ?? Date.now();
   const rootSessionName = resolveDaemonRootSessionName(sessionName);
@@ -260,11 +413,21 @@ export function bindTreeTurnAuthority(
   const incomingHash = normalizedIncoming.authority ? sha256Hex(normalizedIncoming.authority) : null;
   const incomingInvalidParticipant = normalizedIncoming.kind === 'participant'
     && (!normalizedIncoming.actorUserId || !normalizedIncoming.authority);
+  const explicitConflict = opts.conflict === true;
+  const conflictHashesFromOpts = (opts.conflictRevokeHashes ?? [])
+    .map((hash) => [hash, currentLinkGeneration] as [string, number | undefined]);
 
   if (existing) {
     pruneInactiveOtherSessions(existing, sessionName);
+    if (opts.supersededHashes?.length) {
+      for (const hash of opts.supersededHashes) {
+        recordSupersededHash(existing.supersededTokenHashes, hash);
+      }
+    }
     const otherActiveExists = [...existing.activeSessions].some((name) => name !== sessionName);
-    const sameSenderAsTree = existing.kind !== 'mixed' && sameStableSender(existing, normalizedIncoming);
+    const sameSenderAsTree = !explicitConflict
+      && existing.kind !== 'mixed'
+      && sameStableSender(existing, normalizedIncoming);
     const currentActorOnSameSession = existing.activeSessions.has(sessionName)
       ? existing.sessionActors.get(sessionName)
       : undefined;
@@ -275,13 +438,26 @@ export function bindTreeTurnAuthority(
     const existingMixedSticky = existing.kind === 'mixed' && (otherActiveExists || existing.activeSessions.has(sessionName));
     const conflictsWithOther = otherActiveExists && hasOtherActiveConflictingSession(existing, sessionName, normalizedIncoming);
 
-    if (incomingInvalidParticipant || existingMixedSticky || conflictsWithOther || sameSessionConflict) {
+    if (explicitConflict || incomingInvalidParticipant || existingMixedSticky || conflictsWithOther || sameSessionConflict) {
       const generation = ++globalTreeGeneration;
       const activeSessions = existing.activeSessions;
       if (markActive) activeSessions.add(sessionName);
       const sessionActors = existing.sessionActors;
-      sessionActors.set(sessionName, normalizedIncoming);
-      flushConflictRevokeHashes(rootSessionName, existing, incomingHash, currentLinkGeneration);
+      sessionActors.set(sessionName, {
+        ...normalizedIncoming,
+        ...(explicitConflict ? { authority: null } : {}),
+      });
+      flushConflictRevokeHashes(
+        rootSessionName,
+        existing.supersededTokenHashes,
+        existing.pendingRevokeHashes,
+        currentLinkGeneration,
+        [
+          [existing.tokenHash, existing.linkGeneration],
+          [incomingHash, currentLinkGeneration],
+          ...conflictHashesFromOpts,
+        ],
+      );
       treeAuthorities.set(rootSessionName, {
         rootSessionName,
         generation,
@@ -320,27 +496,58 @@ export function bindTreeTurnAuthority(
         existing.tokenHash = incomingHash;
         existing.linkGeneration = currentLinkGeneration;
       }
+      if (existing.pendingRevokeHashes.size > 0) {
+        flushConflictRevokeHashes(
+          rootSessionName,
+          existing.supersededTokenHashes,
+          existing.pendingRevokeHashes,
+          currentLinkGeneration,
+          [],
+        );
+      }
       existing.updatedAt = now;
       return existing.generation;
     }
   }
 
-  if (existing && existing.pendingRevokeHashes.size > 0) {
-    for (const [hash, linkGen] of existing.pendingRevokeHashes) {
-      sendTurnAuthorityRevoke(rootSessionName, hash, linkGen);
-    }
-    existing.pendingRevokeHashes.clear();
-  }
   const activeSessions = existing?.activeSessions ?? new Set<string>();
   const sessionActors = existing?.sessionActors ?? new Map<string, TreeSessionActorBinding>();
   const supersededTokenHashes = existing?.supersededTokenHashes ?? new Set<string>();
   const pendingRevokeHashes = existing?.pendingRevokeHashes ?? new Map<string, number | undefined>();
+  if (opts.supersededHashes?.length) {
+    for (const hash of opts.supersededHashes) {
+      recordSupersededHash(supersededTokenHashes, hash);
+    }
+  }
   if (existing?.tokenHash) recordSupersededHash(supersededTokenHashes, existing.tokenHash);
+  if (existing && pendingRevokeHashes.size > 0) {
+    flushConflictRevokeHashes(
+      rootSessionName,
+      supersededTokenHashes,
+      pendingRevokeHashes,
+      currentLinkGeneration,
+      [],
+    );
+  }
   if (markActive) activeSessions.add(sessionName);
-  sessionActors.set(sessionName, normalizedIncoming);
+  sessionActors.set(sessionName, {
+    ...normalizedIncoming,
+    ...(explicitConflict ? { authority: null } : {}),
+  });
 
-  if (incomingInvalidParticipant || (incomingHash && supersededTokenHashes.has(incomingHash))) {
+  if (explicitConflict || incomingInvalidParticipant || (incomingHash && supersededTokenHashes.has(incomingHash))) {
     const generation = ++globalTreeGeneration;
+    flushConflictRevokeHashes(
+      rootSessionName,
+      supersededTokenHashes,
+      pendingRevokeHashes,
+      currentLinkGeneration,
+      [
+        [existing?.tokenHash, existing?.linkGeneration],
+        [incomingHash, currentLinkGeneration],
+        ...conflictHashesFromOpts,
+      ],
+    );
     treeAuthorities.set(rootSessionName, {
       rootSessionName,
       generation,
@@ -523,6 +730,9 @@ export function bindProcessSharedMachineActivity(
     window.turns += 1;
     window.undelivered += 1;
   }
+  const priorWindowAuthorityHash = window.authority ? sha256Hex(window.authority) : null;
+  const priorWindowOwnerAuthorityHash = window.ownerAuthority ? sha256Hex(window.ownerAuthority) : null;
+  const incomingAuthorityHash = activity.authority ? sha256Hex(activity.authority) : null;
   if (!identity) window.identity = null;
   if (activity.kind === SHARED_MACHINE_ACTIVITY_KIND.OWNER) {
     window.owner = true;
@@ -533,11 +743,18 @@ export function bindProcessSharedMachineActivity(
     if (activity.authority) window.authority = activity.authority;
   }
   const hasConflictInWindow = window.participants.size > 0 && (window.owner || window.participants.size > 1 || !window.authority);
+  const conflictRevokeHashes = hasConflictInWindow
+    ? [...new Set([priorWindowAuthorityHash, priorWindowOwnerAuthorityHash, incomingAuthorityHash].filter((hash): hash is string => Boolean(hash)))]
+    : undefined;
   if (startsTurn || activity.authority || hasConflictInWindow) {
     const treeActivity: SharedMachineActivity = hasConflictInWindow
       ? { kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT, actorUserId: '' }
       : activity;
-    window.treeGeneration = bindTreeTurnAuthority(sessionName, treeActivity, { now, markActive: startsTurn || hasConflictInWindow });
+    window.treeGeneration = bindTreeTurnAuthority(sessionName, treeActivity, {
+      now,
+      markActive: startsTurn || hasConflictInWindow,
+      ...(hasConflictInWindow ? { conflict: true, conflictRevokeHashes } : {}),
+    });
   }
   if (!startsTurn) return NO_BINDING;
   const bound = window;
@@ -609,14 +826,24 @@ export const PROCESS_SHARED_MACHINE_IDLE_GUARD_MS = 1_500;
 
 export interface ReleaseProcessSharedMachineAuthorityOptions {
   now?: number;
-  /** Completion epoch observed when idle was detected; matching completes immediately (0ms), mismatched is stale and ignored. */
-  expectedActivityEpoch?: number;
+  /** Completion epoch snapshot captured at timer/completion start (`null` = no active window at start). */
+  expectedActivityEpoch?: number | null;
   /** Terminate/error settlement: immediately clear local process window and tree active marker. */
   forceSettle?: boolean;
 }
 
 export function readProcessSharedMachineActivityEpoch(sessionName: string): number | null {
   return windows.get(sessionName)?.activityEpoch ?? null;
+}
+
+const timelineEventActivityEpochs = new WeakMap<object, number | null>();
+
+export function recordTimelineEventActivityEpoch(event: object, activityEpoch: number | null): void {
+  timelineEventActivityEpochs.set(event, activityEpoch);
+}
+
+export function readTimelineEventActivityEpoch(event: object): number | null | undefined {
+  return timelineEventActivityEpochs.get(event);
 }
 
 export function releaseProcessSharedMachineAuthority(
@@ -638,8 +865,8 @@ export function releaseProcessSharedMachineAuthority(
 
   if (window) {
     if (opts.expectedActivityEpoch !== undefined) {
-      if (window.activityEpoch !== opts.expectedActivityEpoch) {
-        return; // Stale idle edge from an earlier activity epoch must never affect a newer turn.
+      if (opts.expectedActivityEpoch === null || window.activityEpoch !== opts.expectedActivityEpoch) {
+        return; // Stale idle edge from an empty pre-window timer or earlier activity epoch must never affect a newer turn.
       }
     } else {
       const elapsed = now - window.lastActivityAt;
@@ -717,6 +944,7 @@ export function clearAllDaemonTurnAuthoritiesOnDisconnect(hooks?: {
 export interface CanonicalRuntimeAuthorityAdapter {
   sending?: boolean;
   activeDispatchEntries?: ReadonlyArray<{ sharedActor?: { effectiveActorRole?: string; actorUserId?: string } }>;
+  getTurnOriginSummary?: () => SdkTurnOriginSummary;
   requiresSharedMachineAuthority?: () => boolean;
   getActiveSharedMachineAuthority?: () => string | null;
   getActiveOwnerMachineAuthority?: () => string | null;
@@ -758,11 +986,52 @@ function readLocalTurnAuthorityView(input: {
 }): LocalTurnAuthorityView {
   if (input.runtime) {
     const rt = input.runtime;
+    const localTreeGen = rt.getActiveTreeGeneration?.() ?? null;
+    const hasDispatchEntries = (rt.activeDispatchEntries?.length ?? 0) > 0;
+    if (rt.getTurnOriginSummary) {
+      const summary = rt.getTurnOriginSummary();
+      if (summary.state === 'mixed') {
+        return {
+          state: 'mixed',
+          actorUserId: summary.actorUserId ?? AMBIGUOUS_TREE_PARTICIPANT_ACTOR,
+        };
+      }
+      if (summary.state === 'participant') {
+        if (!summary.authority || !summary.actorUserId) {
+          return {
+            state: 'mixed',
+            actorUserId: summary.actorUserId ?? AMBIGUOUS_TREE_PARTICIPANT_ACTOR,
+          };
+        }
+        return {
+          state: 'participant',
+          actorUserId: summary.actorUserId,
+          authority: summary.authority,
+          treeGeneration: localTreeGen,
+        };
+      }
+      if (summary.state === 'owner') {
+        if (summary.authority || hasDispatchEntries || rt.sending) {
+          return {
+            state: 'owner',
+            authority: summary.authority,
+            treeGeneration: localTreeGen,
+          };
+        }
+      }
+      if (rt.sending || hasDispatchEntries) {
+        return {
+          state: 'owner',
+          authority: null,
+          treeGeneration: localTreeGen,
+        };
+      }
+      return { state: 'none' };
+    }
+
     const localRequired = rt.requiresSharedMachineAuthority?.() === true;
     const localSharedAuth = rt.getActiveSharedMachineAuthority?.() ?? null;
     const localOwnerAuth = rt.getActiveOwnerMachineAuthority?.() ?? null;
-    const localTreeGen = rt.getActiveTreeGeneration?.() ?? null;
-    const hasDispatchEntries = (rt.activeDispatchEntries?.length ?? 0) > 0;
     const actors = rt.activeTurnParticipantUserIds?.()
       ?? (rt.activeDispatchEntries ?? [])
         .filter((entry) => entry.sharedActor?.effectiveActorRole === 'participant')

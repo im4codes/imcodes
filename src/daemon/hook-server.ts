@@ -2134,11 +2134,14 @@ export async function startHookServer(
               res.end(JSON.stringify({ ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR }));
               return;
             }
+            if (readProcessSharedMachineActivityEpoch(session) !== idleActivityEpoch) {
+              logger.debug({ session, event }, 'Hook: ignored idle after async refresh — window activity epoch changed');
+              res.writeHead(200);
+              res.end('ignored');
+              return;
+            }
             onHook({ event: 'idle', session, agentType });
-            timelineEmitter.emit(session, 'session.state', {
-              state: 'idle',
-              ...(idleActivityEpoch !== null ? { activityEpoch: idleActivityEpoch } : {}),
-            }, { source: 'hook' });
+            timelineEmitter.emit(session, 'session.state', { state: 'idle' }, { source: 'hook', activityEpoch: idleActivityEpoch });
             upsertSession({ ...latestRecord, state: 'idle', updatedAt: Date.now() });
             // Drain queued messages when session becomes idle
             void drainQueue(session);
