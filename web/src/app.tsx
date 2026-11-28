@@ -1116,8 +1116,13 @@ function InternalMainApp() {
   const sharedDiscoveryRetryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sharedDiscoveryRetryCountRef = useRef(0);
   const [sharedDiscoveryRetryPending, setSharedDiscoveryRetryPending] = useState(false);
+  const [sharedEntriesSuccessSeq, setSharedEntriesSuccessSeq] = useState(0);
   const sharedDiscoveryGenerationRef = useRef(0);
-  const downgradedFallbackShareRef = useRef<{ entryId: string; serverId: string } | null>(null);
+  const downgradedFallbackShareRef = useRef<{
+    entryId: string;
+    serverId: string;
+    lastAttemptedDiscoverySeq: number;
+  } | null>(null);
   useEffect(() => {
     return () => {
       sharedDiscoveryAbortRef.current?.abort();
@@ -2639,11 +2644,23 @@ function InternalMainApp() {
       return inFlight.promise;
     }
 
+    if (
+      options?.coalesceInFlight &&
+      !options?.isRetry &&
+      currentUserId &&
+      lastSharedAuthUserIdRef.current === currentUserId &&
+      sharedDiscoveryRetryTimerRef.current !== null
+    ) {
+      return;
+    }
+
     if (!options?.isRetry && sharedDiscoveryRetryTimerRef.current) {
       clearTimeout(sharedDiscoveryRetryTimerRef.current);
       sharedDiscoveryRetryTimerRef.current = null;
-      sharedDiscoveryRetryCountRef.current = 0;
-      setSharedDiscoveryRetryPending(false);
+      if (!options?.silent) {
+        sharedDiscoveryRetryCountRef.current = 0;
+        setSharedDiscoveryRetryPending(false);
+      }
     }
 
     // Abort any prior in-flight discovery
@@ -2662,6 +2679,8 @@ function InternalMainApp() {
       }
       sharedDiscoveryRetryCountRef.current = 0;
       setSharedDiscoveryRetryPending(false);
+      setSharedEntriesSuccessSeq(0);
+      downgradedFallbackShareRef.current = null;
       lastSharedAuthUserIdRef.current = null;
       lastSharedEntryIdByServerRef.current.clear();
       visitedSharedSessionsByServerRef.current.clear();
@@ -2682,6 +2701,8 @@ function InternalMainApp() {
       lastSharedAuthUserIdRef.current = currentUserId;
       sharedDiscoveryRetryCountRef.current = 0;
       setSharedDiscoveryRetryPending(false);
+      setSharedEntriesSuccessSeq(0);
+      downgradedFallbackShareRef.current = null;
       lastSharedEntryIdByServerRef.current.clear();
       visitedSharedSessionsByServerRef.current.clear();
       visitedSharedSubSessionsByServerRef.current.clear();
@@ -2731,6 +2752,7 @@ function InternalMainApp() {
           sharedDiscoveryRetryTimerRef.current = null;
         }
         setSharedDiscoveryRetryPending(false);
+        setSharedEntriesSuccessSeq((seq) => seq + 1);
 
         const activeIds = new Set(entries.filter((entry) => entry.status === 'active').map((entry) => entry.serverId));
         sharedNavigationServerIdsRef.current = activeIds;
@@ -5636,6 +5658,7 @@ function InternalMainApp() {
     setConnecting(false);
     setLatencyMs(null);
     setActiveSession(null, { remember: false, keepSubWindows: true });
+    downgradedFallbackShareRef.current = null;
     writeHashState(null, null, null);
   }, [resetServerScopedOverlaysAndTargets, setActiveSession, sharedReturnServer]);
 
@@ -5652,7 +5675,7 @@ function InternalMainApp() {
       source?: 'ui' | 'external' | 'startup';
     },
   ): Promise<SharedOpenResultStatus> => {
-    if (!options?.isDowngradedFallback) {
+    if (options?.source === 'ui' || (downgradedFallbackShareRef.current && entry.serverId !== downgradedFallbackShareRef.current.serverId)) {
       downgradedFallbackShareRef.current = null;
     }
     const preferredSession = options?.preferredSessionName
@@ -5895,6 +5918,9 @@ function InternalMainApp() {
       initialHashStateRef.current = nextRoute;
       sharedHashRestoreStartedRef.current = true;
       setSharedHashRestorePending(false);
+      if (opened.target.kind === 'server' || !options?.isDowngradedFallback) {
+        downgradedFallbackShareRef.current = null;
+      }
       writeHashState(nextRoute.serverId, nextRoute.sessionName, nextRoute.sharedEntryId);
 
       return 'opened';
@@ -5905,6 +5931,8 @@ function InternalMainApp() {
       }
       setSharedEntriesError(formatSharedAccessError(err, trans));
       if (!isDefinitiveShareDenial(err)) {
+        sharedOpenIntentRef.current = null;
+        sharedOpenAbortRef.current = null;
         return 'denied';
       }
       const nextDenied = new Set(deniedSharedEntryIdsRef.current);
@@ -6045,7 +6073,11 @@ function InternalMainApp() {
 
     const isDowngradedFallback = !discoveredEntry && entry.target.kind !== 'server';
     if (isDowngradedFallback) {
-      downgradedFallbackShareRef.current = { entryId: entry.id, serverId: entry.serverId };
+      downgradedFallbackShareRef.current = {
+        entryId: entry.id,
+        serverId: entry.serverId,
+        lastAttemptedDiscoverySeq: 0,
+      };
     }
 
     void handleOpenSharedEntry(entry, {
@@ -6075,28 +6107,55 @@ function InternalMainApp() {
   useEffect(() => {
     const downgraded = downgradedFallbackShareRef.current;
     if (!downgraded) return;
-    if (!selectedShareTarget) return;
-    if (selectedShareTarget.kind !== 'main' || selectedServerId !== downgraded.serverId) {
+    if (sharedEntriesSuccessSeq <= downgraded.lastAttemptedDiscoverySeq) return;
+    if (selectedServerId !== downgraded.serverId) {
       downgradedFallbackShareRef.current = null;
       return;
     }
-    const upgraded = sharedEntries.find((candidate) => (
-      candidate.status === 'active'
-      && candidate.serverId === downgraded.serverId
-      && candidate.target.kind === 'server'
-      && candidate.id === downgraded.entryId
-      && !deniedSharedEntryIds.has(candidate.id)
-    )) ?? sharedEntries.find((candidate) => (
-      candidate.status === 'active'
-      && candidate.serverId === downgraded.serverId
-      && candidate.target.kind === 'server'
-      && !deniedSharedEntryIds.has(candidate.id)
-    )) ?? null;
+    if (selectedShareTarget?.kind === 'server') {
+      downgradedFallbackShareRef.current = null;
+      return;
+    }
+    const upgraded = selectedShareTarget?.kind === 'main'
+      ? (
+          sharedEntries.find((candidate) => (
+            candidate.status === 'active'
+            && candidate.serverId === downgraded.serverId
+            && candidate.target.kind === 'server'
+            && candidate.id === downgraded.entryId
+            && !deniedSharedEntryIds.has(candidate.id)
+          )) ?? sharedEntries.find((candidate) => (
+            candidate.status === 'active'
+            && candidate.serverId === downgraded.serverId
+            && candidate.target.kind === 'server'
+            && !deniedSharedEntryIds.has(candidate.id)
+          )) ?? null
+        )
+      : (
+          sharedEntries.find((candidate) => (
+            candidate.status === 'active'
+            && candidate.serverId === downgraded.serverId
+            && candidate.target.kind === 'server'
+            && candidate.id === downgraded.entryId
+            && !deniedSharedEntryIds.has(candidate.id)
+          )) ?? sharedEntries.find((candidate) => (
+            candidate.status === 'active'
+            && candidate.serverId === downgraded.serverId
+            && candidate.target.kind === 'server'
+            && !deniedSharedEntryIds.has(candidate.id)
+          )) ?? sharedEntries.find((candidate) => (
+            candidate.status === 'active'
+            && candidate.serverId === downgraded.serverId
+            && candidate.id === downgraded.entryId
+            && !deniedSharedEntryIds.has(candidate.id)
+          )) ?? null
+        );
     if (!upgraded) return;
-    downgradedFallbackShareRef.current = null;
+    downgraded.lastAttemptedDiscoverySeq = sharedEntriesSuccessSeq;
     void handleOpenSharedEntry(upgraded, {
       restoreFromHash: true,
       preferredSessionName: activeSessionRef.current ?? initialHashStateRef.current.sessionName,
+      isDowngradedFallback: upgraded.target.kind !== 'server',
       source: 'startup',
     });
   }, [
@@ -6105,6 +6164,7 @@ function InternalMainApp() {
     selectedServerId,
     selectedShareTarget,
     sharedEntries,
+    sharedEntriesSuccessSeq,
   ]);
 
   const closeSubSessionAndClearMaximized = useCallback((id: string) => {
@@ -8952,7 +9012,11 @@ function InternalMainApp() {
 
       const isDowngradedFallback = !discovered && entry.target.kind !== 'server';
       if (isDowngradedFallback) {
-        downgradedFallbackShareRef.current = { entryId: entry.id, serverId: entry.serverId };
+        downgradedFallbackShareRef.current = {
+          entryId: entry.id,
+          serverId: entry.serverId,
+          lastAttemptedDiscoverySeq: 0,
+        };
       }
 
       void handleOpenSharedEntry(entry, { preferredSessionName: route.sessionName, isDowngradedFallback, source: 'external' })
