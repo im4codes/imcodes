@@ -445,18 +445,8 @@ export function createPortForwardRoutes(
     if (!tunnelId) {
       return c.json({ ok: false, reason: PORT_FORWARD_ERRORS.INVALID_REQUEST, error: 'tunnelId is required' }, 400);
     }
-<<<<<<< HEAD
     const actingUserId = effectiveActorUserId;
-    const record = typeof (router as { getTunnel?: unknown }).getTunnel === 'function'
-      ? await router.getTunnel(tunnelId)
-      : (await router.listTunnels(effectiveActorUserId)).find((t) => t.tunnelId === tunnelId) ?? null;
-    const recordStatus = (record as { status?: string } | null)?.status;
-    const recordUserId = (record as { userId?: string } | null)?.userId ?? effectiveActorUserId;
-    if (record && recordStatus !== 'closed' && recordUserId === effectiveActorUserId) {
-=======
-    const actingUserId = caller.operational.delegatedActorUserId ?? caller.userId;
-    const res = await router.closeTunnelForUser(caller.userId, tunnelId, 'closed_by_user', async (record) => {
->>>>>>> c8506c563 (fix(security): enforce single-snapshot port-forward close and stale-account toggle guard)
+    const res = await router.closeTunnelForUser(effectiveActorUserId, tunnelId, 'closed_by_user', async (record) => {
       const blockedIds = await findBlockedPrivateDeviceServerIds(c.env.DB, {
         sourceServerId: caller.sourceServerId,
         actingUserId,
@@ -470,13 +460,8 @@ export function createPortForwardRoutes(
           error: MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST,
         };
       }
-<<<<<<< HEAD
-    }
-    const res = await router.closeTunnelForUser(effectiveActorUserId, tunnelId);
-=======
       return { ok: true as const };
     });
->>>>>>> c8506c563 (fix(security): enforce single-snapshot port-forward close and stale-account toggle guard)
     if (!res.ok) {
       return c.json({
         ok: false,
