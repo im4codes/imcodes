@@ -1115,12 +1115,11 @@ describe('a shared-session participant reaches only the machines shared with the
       expect((await computerUse(t.app,t.delegated,node)).status).toBe(403);
       expect(await listed(t.app,t.delegated)).not.toContain(node);
       expect((await client.callTool({name:MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,arguments:{machine:nodeId,tool:'list_apps'}})).isError).toBe(true);
-      // Same DB user without exec_granted: interactive browser fileHandle works, delegated participant turn fails closed;
-      // adding exec_granted allows delegated fileHandle until share revocation.
+      // Same DB user with direct participant share (default exec_granted=false): both interactive browser and delegated participant turn work until share revocation.
       await createMachineGrant({ownerId:peer,recipientId:t.participantId,serverId:node,role:'participant',exec:false});
       expect((await computerUse(t.app,t.delegated,node)).status).toBe(200);
       expect((await fileHandle(t.app,webAuth(t.participantId),node)).status).toBe(503);
-      expect((await fileHandle(t.app,t.delegated,node)).status).toBe(403);
+      expect((await fileHandle(t.app,t.delegated,node)).status).toBe(503);
       await db.execute('UPDATE server_shares SET exec_granted=true WHERE server_id=$1 AND target_user_id=$2',[node,t.participantId]);
       expect((await fileHandle(t.app,t.delegated,node)).status).toBe(503);
       await db.execute('UPDATE server_shares SET revoked_at=$3 WHERE server_id=$1 AND target_user_id=$2',[node,t.participantId,Date.now()]);

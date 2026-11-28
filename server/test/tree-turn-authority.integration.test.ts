@@ -1087,10 +1087,11 @@ describe('pure in-memory server-stateful opaque tree turn grants', () => {
         method: 'POST', headers: p1WebAuth, body: fd,
       })).status).toBe(503);
 
-      // Same real DB user on delegated participantTurn without extra exec_granted: retains participant execute access (503 = passed policy gate, target offline).
+      // Same real DB user on delegated participantTurn without extra exec_granted:
+      // browser-only machine-file-list stays 403 for daemon tokens, while daemon-allowed machine-file-handle and upload pass policy gate (503 = target offline).
       expect((await app.request(`/api/server/${targetId}/machine-file-list`, {
         method: 'POST', headers: { ...p1DelegatedHdrs, 'content-type': 'application/json' }, body: JSON.stringify({ path: ':drives:' }),
-      })).status).toBe(503);
+      })).status).toBe(403);
       expect((await app.request(`/api/server/${targetId}/machine-file-handle`, {
         method: 'POST', headers: { ...p1DelegatedHdrs, 'content-type': 'application/json' }, body: JSON.stringify({ path: '/tmp/a.txt' }),
       })).status).toBe(503);
