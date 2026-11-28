@@ -17203,4 +17203,156 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
 
     expect(await screen.findByTestId('session-pane-deck_alt_brain')).toBeTruthy();
   }, 20_000);
+
+  it('preserves the requested tab when an undiscovered same-server external route is opened after an older failed upgrade, and upgrades only on a newer matching discovery', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-old-srv');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+
+    const oldServerGrant = {
+      id: 'share-old-srv',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Server Old',
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+    const altServerGrant = {
+      id: 'share-alt-new',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Server Alt',
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+
+    let discoveryCalls = 0;
+    discoverSharedEntriesMock.mockImplementation(async () => {
+      discoveryCalls += 1;
+      if (discoveryCalls === 1) return [];
+      if (discoveryCalls === 2) return [oldServerGrant];
+      // Discovery #3 includes the newly granted server share matching share-alt-new
+      return [oldServerGrant, altServerGrant];
+    });
+
+    let serverOpenCount = 0;
+    let resolveAltFallback!: (val: unknown) => void;
+    const altFallbackDeferred = new Promise((resolve) => {
+      resolveAltFallback = resolve;
+    });
+    let altFallbackSignal: AbortSignal | undefined;
+
+    openSharedEntryMock.mockImplementation(async (target: { kind: string; serverId: string; sessionName?: string }) => {
+      if (target.kind === 'main' && target.sessionName === 'deck_beta_brain') {
+        return {
+          server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+          target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+          coverage: {
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['share-old-srv'],
+            primaryShareId: 'share-old-srv',
+            authorizedAt: Date.now(),
+          },
+          sessions: [
+            { sessionName: 'deck_beta_brain', title: 'Beta', state: 'running', agentType: 'codex-sdk' },
+          ],
+          subSessions: [],
+        };
+      }
+      if (target.kind === 'main' && target.sessionName === 'deck_alt_brain') {
+        const lastCall = openSharedEntryOptionsMock.mock.calls.at(-1);
+        altFallbackSignal = (lastCall?.[1] as { signal?: AbortSignal } | undefined)?.signal;
+        return altFallbackDeferred;
+      }
+      serverOpenCount += 1;
+      if (serverOpenCount === 1) {
+        throw new Error('transient 503 old upgrade');
+      }
+      return {
+        server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+        target: altServerGrant.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-alt-new'],
+          primaryShareId: 'share-alt-new',
+          authorizedAt: Date.now(),
+        },
+        sessions: [
+          { sessionName: 'deck_beta_brain', title: 'Beta', state: 'running', agentType: 'codex-sdk' },
+          { sessionName: 'deck_alt_brain', title: 'Alt', state: 'running', agentType: 'claude-code-sdk' },
+          { sessionName: 'deck_gamma_brain', title: 'Control Center', state: 'idle', agentType: 'codex-sdk' },
+        ],
+        subSessions: [],
+      };
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+
+    const realDateNow = Date.now;
+    let fakeNow = realDateNow() + 20_000;
+    Date.now = () => fakeNow;
+    try {
+      // Discovery #2 sees oldServerGrant; old upgrade fails transiently (seq=2)
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+      await waitFor(() => expect(serverOpenCount).toBe(1));
+
+      // Navigate to an undiscovered same-server external route (not in discovery #2's snapshot)
+      // Do NOT trigger a new discovery yet!
+      await act(async () => {
+        window.location.hash = '#/srv-shared/deck_alt_brain?shared=share-alt-new';
+        window.dispatchEvent(new Event('hashchange'));
+      });
+      await waitFor(() => expect(altFallbackSignal).toBeDefined());
+      // Stale snapshot from discovery #2 must NOT trigger an upgrade or abort altFallbackSignal
+      expect(altFallbackSignal?.aborted).toBe(false);
+      expect(serverOpenCount).toBe(1);
+
+      await act(async () => {
+        resolveAltFallback({
+          server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+          target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_alt_brain' },
+          coverage: {
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['share-alt-new'],
+            primaryShareId: 'share-alt-new',
+            authorizedAt: Date.now(),
+          },
+          sessions: [
+            { sessionName: 'deck_alt_brain', title: 'Alt', state: 'running', agentType: 'claude-code-sdk' },
+          ],
+          subSessions: [],
+        });
+      });
+
+      expect(await screen.findByTestId('session-pane-deck_alt_brain')).toBeTruthy();
+      expect(window.location.hash).toBe('#/srv-shared/deck_alt_brain?shared=share-alt-new');
+      expect(altFallbackSignal?.aborted).toBe(false);
+      expect(serverOpenCount).toBe(1);
+
+      // Subsequent discovery #3 resolves matching share-alt-new server grant -> upgrades keeping deck_alt_brain
+      fakeNow += 20_000;
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+      await waitFor(() => expect(serverOpenCount).toBe(2));
+    } finally {
+      Date.now = realDateNow;
+    }
+
+    expect(await screen.findByTestId('session-pane-deck_alt_brain')).toBeTruthy();
+    expect(screen.getByTestId('session-pane-deck_alt_brain').getAttribute('data-is-active')).toBe('true');
+    expect(screen.getByText('tabs-select-deck_gamma_brain')).toBeTruthy();
+  }, 20_000);
 });
