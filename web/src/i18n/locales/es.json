@@ -373,7 +373,7 @@
       "compact_failed": "⚠️ No se pudo compactar la conversación.",
       "session_inline_error": "⚠️ La sesión informó de un error.",
       "turn_stopped_for_queue": "⚠️ Se detuvo el turno anterior: enviando los mensajes en cola",
-      "welcome_opencode_free_model": "Usando el modelo inicial gratuito ({{model}}, servicio de terceros; las entradas pueden usarse para mejorar los modelos) — evita compartir código sensible o cambia abajo a tu propio SDK/modelo cuando quieras."
+      "welcome_opencode_free_model": "Usando el modelo inicial gratuito ({{model}}, servicio de terceros; las entradas pueden usarse para mejorar los modelos) — evita compartir código sensible; compra créditos/plan de OpenCode en https://opencode.ai o cambia abajo a tu propio SDK/modelo cuando quieras."
     },
     "execution_status": {
       "waiting": "En espera",

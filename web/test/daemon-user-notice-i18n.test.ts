@@ -107,7 +107,9 @@ describe('daemon user notice web localization', () => {
     )) as { chat?: { daemon_notice?: Record<string, string> } } & Record<string, unknown>;
     const rawTemplate = resource.chat?.daemon_notice?.welcome_opencode_free_model;
     expect(typeof rawTemplate).toBe('string');
-    expect(rawTemplate).not.toMatch(/OpenCode|Anomaly|BYOK/i);
+    expect(rawTemplate).toContain('OpenCode');
+    expect(rawTemplate).toContain('https://opencode.ai');
+    expect(rawTemplate).not.toMatch(/Anomaly|BYOK/i);
 
     const localized = localizeDaemonUserNoticeEvent(
       noticeEvent(DAEMON_USER_NOTICE_CODE.WELCOME_OPENCODE_FREE_MODEL, { model: 'opencode/big-pickle' }),

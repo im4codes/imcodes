@@ -280,7 +280,7 @@ export function formatDaemonUserNoticeEnglish(
     case DAEMON_USER_NOTICE_CODE.TURN_STOPPED_FOR_QUEUE:
       return 'Stopped previous turn — sending queued message(s).';
     case DAEMON_USER_NOTICE_CODE.WELCOME_OPENCODE_FREE_MODEL:
-      return `Using free starter model (${stringParam(params, 'model')}, third-party service; inputs may be used to improve models) — avoid sensitive code, or switch to your own SDK/model below anytime.`;
+      return `Using free starter model (${stringParam(params, 'model')}, third-party service; inputs may be used to improve models) — avoid sensitive code; purchase OpenCode credits/plan at https://opencode.ai or switch to your own SDK/model below anytime.`;
   }
 }
 

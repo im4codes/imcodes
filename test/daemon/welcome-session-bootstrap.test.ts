@@ -287,7 +287,9 @@ describe('welcome-session-bootstrap', () => {
       expect(typeof msg).toBe('string');
       expect(msg).toContain('{{model}}');
       expect(msg).not.toMatch(/[\r\n]/);
-      expect(msg).not.toMatch(/OpenCode|Anomaly|BYOK/i);
+      expect(msg).toContain('OpenCode');
+      expect(msg).toContain('https://opencode.ai');
+      expect(msg).not.toMatch(/Anomaly|BYOK/i);
     }
   });
 
@@ -477,7 +479,7 @@ describe('welcome-session-bootstrap', () => {
         memoryExcluded: true,
         noticeCode: DAEMON_USER_NOTICE_CODE.WELCOME_OPENCODE_FREE_MODEL,
         noticeParams: { model: 'opencode/big-pickle' },
-        text: 'Using free starter model (opencode/big-pickle, third-party service; inputs may be used to improve models) — avoid sensitive code, or switch to your own SDK/model below anytime.',
+        text: 'Using free starter model (opencode/big-pickle, third-party service; inputs may be used to improve models) — avoid sensitive code; purchase OpenCode credits/plan at https://opencode.ai or switch to your own SDK/model below anytime.',
       }),
     );
     expect(onSessionCreated).toHaveBeenCalledTimes(1);

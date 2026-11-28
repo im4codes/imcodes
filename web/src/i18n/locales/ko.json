@@ -373,7 +373,7 @@
       "compact_failed": "⚠️ 대화 압축에 실패했습니다.",
       "session_inline_error": "⚠️ 세션에서 오류를 보고했습니다.",
       "turn_stopped_for_queue": "⚠️ 이전 턴을 중지했습니다 — 대기열 메시지 전송 중",
-      "welcome_opencode_free_model": "무료 체험 모델({{model}}, 서드파티 제공, 입력이 모델 개선에 활용될 수 있음)을 사용 중입니다. 민감한 코드는 입력하지 마세요. 하단에서 본인 SDK/모델로 언제든 전환할 수 있습니다."
+      "welcome_opencode_free_model": "무료 체험 모델({{model}}, 서드파티 제공, 입력이 모델 개선에 활용될 수 있음)을 사용 중입니다. 민감한 코드는 입력하지 마세요. 지속 사용 시 OpenCode(https://opencode.ai)에서 크레딧/플랜을 구매하거나 하단에서 본인 SDK/모델로 언제든 전환할 수 있습니다."
     },
     "execution_status": {
       "waiting": "대기 중",
