@@ -494,6 +494,11 @@ describe('install-opencode-cli', () => {
     const tgz = buildTarGz([{ name: 'package/bin/opencode', content: 'ok', typeflag: '0' }]);
     const integrity = `sha512-${createHash('sha512').update(tgz).digest('base64')}`;
 
+    const hostPosixPlatform: NodeJS.Platform | null = process.platform === 'darwin' || process.platform === 'linux' ? process.platform : null;
+    const hostValidPkg = hostPosixPlatform
+      ? resolveOpenCodePlatformPackage({ platform: hostPosixPlatform, arch: 'x64', isMusl: false })
+      : null;
+
     let externalHits = 0;
     const externalSrv = await startMockServer((_req, res) => {
       externalHits += 1;
@@ -519,7 +524,7 @@ describe('install-opencode-cli', () => {
         res.end();
         return;
       }
-      if (req.url === '/valid/opencode-linux-x64/latest') {
+      if (req.url === '/valid/opencode-linux-x64/latest' || (hostValidPkg && req.url === `/valid/${hostValidPkg}/latest`)) {
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify({ version: '2.4.2', dist: { tarball: `${regUrl}/valid.tgz`, integrity } }));
         return;
@@ -577,24 +582,26 @@ describe('install-opencode-cli', () => {
       expect(externalHits).toBe(0);
 
       // 4. Symlinked .opencode/bin escaping homeDir is rejected before writing
-      const homeSymlink = makeTempDir();
-      const outsideDir = makeTempDir('outside-target-');
-      mkdirSync(join(homeSymlink, '.opencode'), { recursive: true });
-      symlinkSync(outsideDir, join(homeSymlink, '.opencode', 'bin'));
-      const symRes = await installOpenCodeCli({
-        homeDir: homeSymlink,
-        platform: 'linux',
-        arch: 'x64',
-        isMusl: false,
-        env: { PATH: '' },
-        registry: `${isolatedSrv.url}/valid`,
-        noFallback: true,
-        isolatedTest: true,
-        verifyVersion: () => 'opencode 2.4.2',
-      });
-      expect(symRes.status).toBe('failed');
-      expect(symRes.reason).toContain('unsafe_symlink_target');
-      expect(readdirSync(outsideDir)).toEqual([]);
+      if (hostPosixPlatform && hostValidPkg) {
+        const homeSymlink = makeTempDir();
+        const outsideDir = makeTempDir('outside-target-');
+        mkdirSync(join(homeSymlink, '.opencode'), { recursive: true });
+        symlinkSync(outsideDir, join(homeSymlink, '.opencode', 'bin'));
+        const symRes = await installOpenCodeCli({
+          homeDir: homeSymlink,
+          platform: hostPosixPlatform,
+          arch: 'x64',
+          isMusl: false,
+          env: { PATH: '' },
+          registry: `${isolatedSrv.url}/valid`,
+          noFallback: true,
+          isolatedTest: true,
+          verifyVersion: () => 'opencode 2.4.2',
+        });
+        expect(symRes.status).toBe('failed');
+        expect(symRes.reason).toContain('unsafe_symlink_target');
+        expect(readdirSync(outsideDir)).toEqual([]);
+      }
     } finally {
       await externalSrv.close();
       await isolatedSrv.close();

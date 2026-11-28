@@ -234,7 +234,7 @@ export async function isOpenCodeAlreadyInstalled(opts: {
     if (homeDir) {
       const binDir = p.join(homeDir, '.opencode', 'bin');
       const homeBin = p.join(binDir, 'opencode.exe');
-      if (process.platform === 'win32') {
+      if (platform === process.platform) {
         ensureSafeOpenCodePaths(homeDir, binDir, homeBin, platform, false);
       }
       if (await isExec(homeBin)) return homeBin;
@@ -249,7 +249,7 @@ export async function isOpenCodeAlreadyInstalled(opts: {
   if (homeDir) {
     const binDir = p.join(homeDir, '.opencode', 'bin');
     const homeBin = p.join(binDir, 'opencode');
-    if (process.platform !== 'win32') {
+    if (platform === process.platform) {
       ensureSafeOpenCodePaths(homeDir, binDir, homeBin, platform, false);
     }
     if (await isExec(homeBin)) return homeBin;
@@ -689,7 +689,7 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
       verifyBufferIntegrity(tgzBuffer, dist!);
       const binaryBuf = extractBinaryFromTarGz(tgzBuffer, entryCandidates);
 
-      if ((platform === 'win32') === (process.platform === 'win32')) {
+      if (platform === process.platform) {
         ensureSafeOpenCodePaths(homeDir, binDir, destPath, platform, true);
       } else {
         mkdirSync(binDir, { recursive: true });
