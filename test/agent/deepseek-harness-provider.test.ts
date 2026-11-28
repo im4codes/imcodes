@@ -1126,4 +1126,34 @@ describe('DeepseekHarnessProvider /compact and preset models', () => {
     await flush();
     expect(completions.at(-1)?.message.metadata?.model).toBe('glm-5.3-flash');
   });
+
+  it('captures setSessionAgentId updates made during suspended writeDshOverlay for the first spawn and prompt', async () => {
+    let releaseOverlay!: (path: string) => void;
+    writeDshOverlayMock.mockImplementationOnce(
+      () => new Promise<string>((resolve) => { releaseOverlay = resolve; }),
+    );
+    const sessionId = await provider.createSession({
+      sessionKey: 'dsh-overlay-race',
+      cwd: '/tmp/project',
+      agentId: 'glm5.3/glm-5.3-flash',
+      llm: {
+        provider: 'glm5.3',
+        model: 'glm-5.3-flash',
+        availableModels: ['glm-5.3-flash', 'glm-4.5-air'],
+      },
+    });
+
+    const firstSend = provider.send(sessionId, 'first prompt during overlay boot');
+    await vi.waitFor(() => expect(writeDshOverlayMock).toHaveBeenCalledTimes(1), { timeout: 2_000 });
+
+    // User switches model while child is null and writeDshOverlay is still suspended.
+    provider.setSessionAgentId(sessionId, 'glm5.3/glm-4.5-air');
+    releaseOverlay('/tmp/overlay-race.patch.json');
+    await firstSend;
+
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    const spawnEnv = spawnMock.mock.calls[0]?.[2]?.env as Record<string, string> | undefined;
+    expect(spawnEnv?.[DSH_BRIDGE_MODEL_ENV]).toBe('glm-4.5-air');
+    expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(1);
+  });
 });

@@ -146,8 +146,9 @@ interface PiSessionState {
   cwd: string;
   env?: Record<string, string>;
   requestedModel?: string;
-  pendingModelSelection?: { rawModel: string };
+  pendingModelSelection?: { rawModel: string; selectionVersion: number };
   pendingModelSwitch?: Promise<void> | null;
+  modelSelectionVersion?: number;
   model?: string;
   provider?: string;
   effort?: TransportEffortLevel;
@@ -682,17 +683,19 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     const model = agentId.trim();
     if (!state || !model || state.requestedModel === model) return;
     state.requestedModel = model;
+    const selectionVersion = (state.modelSelectionVersion ?? 0) + 1;
+    state.modelSelectionVersion = selectionVersion;
     const child = state.child;
     if (!child) {
       state.pendingModelSelection = undefined;
       return;
     }
-    if (state.turnActive || !state.hasStartedChild) {
-      state.pendingModelSelection = { rawModel: model };
+    if (state.turnActive || !state.hasStartedChild || state.pendingModelSwitch) {
+      state.pendingModelSelection = { rawModel: model, selectionVersion };
       return;
     }
     state.pendingModelSelection = undefined;
-    void this.applyPiModelSelection(state, child, model);
+    void this.applyPiModelSelection(state, child, model, selectionVersion);
   }
 
   private resolvePiModelTarget(state: PiSessionState, model: string): { provider?: string; modelId: string } {
@@ -710,10 +713,19 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     };
   }
 
-  private applyPiModelSelection(state: PiSessionState, child: ChildProcess, rawModel: string): Promise<void> {
+  private applyPiModelSelection(
+    state: PiSessionState,
+    child: ChildProcess,
+    rawModel: string,
+    selectionVersion: number,
+  ): Promise<void> {
     const { provider, modelId } = this.resolvePiModelTarget(state, rawModel);
+    const isLatestIntent = (): boolean =>
+      state.child === child
+      && !state.disposed
+      && (state.modelSelectionVersion ?? 0) === selectionVersion;
     if (!provider || !modelId) {
-      if (!state.incognito && !state.turnActive && state.child === child && !state.disposed) {
+      if (!state.incognito && !state.turnActive && isLatestIntent()) {
         state.modelContextWindow = undefined;
         state.catalogContextWindows = undefined;
         this.detachChild(state);
@@ -723,7 +735,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     }
     const op = this.request(state, { type: PI_RPC_COMMAND.SET_MODEL, provider, modelId })
       .then((response) => {
-        if (state.child !== child || state.disposed) return;
+        if (!isLatestIntent()) return;
         const switched = modelInfo(response.data);
         state.model = switched.id ?? modelId;
         state.provider = switched.provider ?? provider;
@@ -732,7 +744,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
         void this.syncAvailableThinkingLevels(state);
       })
       .catch(() => {
-        if (!state.incognito && !state.turnActive && state.child === child && !state.disposed) {
+        if (!state.incognito && !state.turnActive && isLatestIntent()) {
           state.modelContextWindow = undefined;
           state.catalogContextWindows = undefined;
           this.detachChild(state);
@@ -740,7 +752,19 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
         }
       })
       .finally(() => {
-        if (state.pendingModelSwitch === op) state.pendingModelSwitch = null;
+        if (state.pendingModelSwitch !== op) return;
+        state.pendingModelSwitch = null;
+        if (
+          !state.turnActive
+          && state.hasStartedChild
+          && state.child === child
+          && !state.disposed
+          && state.pendingModelSelection
+        ) {
+          const next = state.pendingModelSelection;
+          state.pendingModelSelection = undefined;
+          void this.applyPiModelSelection(state, child, next.rawModel, next.selectionVersion);
+        }
       });
     state.pendingModelSwitch = op;
     return op;
@@ -755,7 +779,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
       const pending = state.pendingModelSelection!;
       state.pendingModelSelection = undefined;
       if (state.child) {
-        await this.applyPiModelSelection(state, state.child, pending.rawModel);
+        await this.applyPiModelSelection(state, state.child, pending.rawModel, pending.selectionVersion);
       }
     }
   }

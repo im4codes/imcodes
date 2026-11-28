@@ -596,29 +596,13 @@ export class DeepseekHarnessProvider implements TransportProvider {
       return;
     }
     if (state.child) this.detachChild(state);
-    state.pendingModelSelection = undefined;
 
     // Decided on the spawn path before the overlay is written; recorded as
     // pending so an admission check during the write sees this spawn's fence.
     const nativeAgentsFenced = this.nativeAgentFence.required(state.routeId, state.sessionName);
     state.pendingChildNativeAgentFence = fenceOf(nativeAgentsFenced);
     const resumeId = state.harnessSessionId;
-    // Compute the exact child env once so `sandbox-policy` in the overlay matches
-    // the effective `DSH_PERMISSION_MODE` seen by the spawned child process.
-    const childEnv: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...(state.env ?? {}),
-      [DSH_BRIDGE_CWD_ENV]: state.cwd,
-      ...(resumeId ? { [DSH_BRIDGE_RESUME_ENV]: resumeId } : {}),
-      // The harness picks the model when it creates the agent, so IM.codes
-      // pins it here too. A ccPreset's route metadata rides the overlay while
-      // its credential stays out of that file and enters only this child.
-      ...(state.requestedModel ? { [DSH_BRIDGE_MODEL_ENV]: state.requestedModel } : {}),
-      ...(state.llmConfig?.apiKey
-        ? { [DSH_PROVIDER_API_KEY_ENV]: state.llmConfig.apiKey }
-        : {}),
-    };
-    const permissionMode = childEnv.DSH_PERMISSION_MODE?.trim() || 'workspace-write';
+    const permissionMode = (state.env?.DSH_PERMISSION_MODE ?? process.env.DSH_PERMISSION_MODE)?.trim() || 'workspace-write';
     let overlayPath: string;
     try {
       overlayPath = await writeDshOverlay({
@@ -632,6 +616,24 @@ export class DeepseekHarnessProvider implements TransportProvider {
       state.pendingChildNativeAgentFence = undefined;
       throw error;
     }
+    // Capture the latest requested model AFTER overlay I/O and right before
+    // spawn so setSessionAgentId updates made during overlay writes apply to
+    // the initial child env instead of being dropped.
+    const spawnedModel = state.requestedModel;
+    state.pendingModelSelection = undefined;
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...(state.env ?? {}),
+      [DSH_BRIDGE_CWD_ENV]: state.cwd,
+      ...(resumeId ? { [DSH_BRIDGE_RESUME_ENV]: resumeId } : {}),
+      // The harness picks the model when it creates the agent, so IM.codes
+      // pins it here too. A ccPreset's route metadata rides the overlay while
+      // its credential stays out of that file and enters only this child.
+      ...(spawnedModel ? { [DSH_BRIDGE_MODEL_ENV]: spawnedModel } : {}),
+      ...(state.llmConfig?.apiKey
+        ? { [DSH_PROVIDER_API_KEY_ENV]: state.llmConfig.apiKey }
+        : {}),
+    };
     // On Windows `dsh` is an npm .cmd shim, which bare spawn() cannot execute;
     // this resolves it to `node <script>` the same way every other local-SDK
     // provider does.

@@ -1412,4 +1412,92 @@ describe('PiProvider', () => {
     expect(errors).toHaveLength(1);
     expect(completions.at(-1)?.content).toBe('recovered-ok');
   });
+
+  it('retains the latest Pi model across rapid concurrent setSessionAgentId switches and applies it before next prompt', async () => {
+    const customChild = new FakePiChild();
+    spawnMock.mockReturnValue(customChild);
+    const infos: SessionInfoUpdate[] = [];
+    provider.onSessionInfo((_id, info) => infos.push(info));
+
+    const pendingA: Array<{ command: Record<string, unknown> }> = [];
+    const origWrite = customChild.stdin.write;
+    customChild.stdin.write = (chunk: string) => {
+      const command = JSON.parse(chunk.trim()) as Record<string, unknown>;
+      if (command.type === PI_RPC_COMMAND.SET_MODEL && command.modelId === 'model-a') {
+        // Hold SET_MODEL(model-a) unanswered until explicitly released to force an A->B race.
+        customChild.written.push(command);
+        pendingA.push({ command });
+        return true;
+      }
+      return origWrite(chunk);
+    };
+    customChild.onCommand = (cmd) => {
+      if (cmd.type === PI_RPC_COMMAND.GET_STATE) {
+        return {
+          success: true,
+          data: {
+            sessionId: 'pi-rapid-switch',
+            model: { id: 'model-init', provider: 'glm5.3', contextWindow: 1_000_000 },
+            thinkingLevel: 'medium',
+          },
+        };
+      }
+      if (cmd.type === PI_RPC_COMMAND.SET_MODEL) {
+        return {
+          success: true,
+          data: { id: cmd.modelId, provider: cmd.provider, contextWindow: 1_000_000 },
+        };
+      }
+      return undefined;
+    };
+
+    await provider.connect({});
+    const sid = await provider.createSession({
+      sessionKey: 'route-rapid-switch',
+      sessionName: 'deck_rapid_switch',
+      cwd: '/tmp',
+      agentId: 'glm5.3/model-init',
+      piLlm: {
+        provider: 'glm5.3',
+        model: 'model-init',
+        availableModels: ['model-init', 'model-a', 'model-b', 'model-c'],
+      },
+    });
+    // Boot child first so idle hot-switch path is active.
+    await provider.send(sid, 'warmup');
+    customChild.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await flush();
+    infos.length = 0;
+
+    // Rapid switches A -> B while SET_MODEL(A) is still in flight; B must NOT be sent concurrently
+    // and A's delayed response must NEVER overwrite sessionInfo to model-a.
+    provider.setSessionAgentId(sid, 'glm5.3/model-a');
+    provider.setSessionAgentId(sid, 'glm5.3/model-b');
+    await flush();
+
+    expect(pendingA).toHaveLength(1);
+    expect(customChild.written.filter((c) => c.type === PI_RPC_COMMAND.SET_MODEL).map((c) => c.modelId)).toEqual(['model-a']);
+
+    // Queue next prompt while model-a ACK is still pending; PROMPT must wait for A then B ACK.
+    const sendPromise = provider.send(sid, 'next turn');
+    await flush();
+    expect(customChild.written.filter((c) => c.type === PI_RPC_COMMAND.PROMPT)).toHaveLength(1);
+
+    // Late ACK for A arrives: stale A must not emit model-a, and B is dispatched cleanly next.
+    customChild.emitFrame({
+      type: PI_RPC_FRAME.RESPONSE,
+      id: pendingA[0]!.command.id,
+      command: PI_RPC_COMMAND.SET_MODEL,
+      success: true,
+      data: { id: 'model-a', provider: 'glm5.3', contextWindow: 1_000_000 },
+    });
+    await sendPromise;
+
+    const sentModels = customChild.written
+      .filter((c) => c.type === PI_RPC_COMMAND.SET_MODEL)
+      .map((c) => c.modelId);
+    expect(sentModels).toEqual(['model-a', 'model-b']);
+    expect(infos.map((i) => i.model).filter(Boolean)).toEqual(['model-b']);
+    expect(customChild.written.at(-1)).toMatchObject({ type: PI_RPC_COMMAND.PROMPT });
+  });
 });
