@@ -29,6 +29,10 @@ const { dispatchSessionMessage } = await import('../../src/daemon/session-dispat
 const { CHAT_MESSAGE_ORIGINS } = await import('../../shared/chat-message-origin.js');
 const { clearAllResend } = await import('../../src/daemon/transport-resend-queue.js');
 const { resetTransportQueueStoreForTests } = await import('../../src/daemon/transport-queue-store.js');
+const {
+  clearAllDaemonTurnAuthoritiesOnDisconnect,
+  clearProcessSharedMachineAuthoritiesForTests,
+} = await import('../../src/daemon/shared-machine-authority-context.js');
 
 const transport = (patch: Partial<SessionRecord> = {}): SessionRecord => ({
   name: 'deck_sub_emgrx', projectName: 'proj', projectDir: '/repo', role: 'w1', agentType: 'claude-code-sdk',
@@ -256,6 +260,67 @@ describe('session dispatch emergency mode', () => {
       expect(cancelSessionMock).not.toHaveBeenCalled();
       expect(mocks.stopSessionNow).not.toHaveBeenCalled();
       expect(mocks.processSend).toHaveBeenCalled();
+    });
+
+    it('Round 7 P0: strips stale tokens and authorityIssueSeq on append fallback after disconnect across suspended cancelSession await', async () => {
+      clearProcessSharedMachineAuthoritiesForTests();
+      mocks.appendExternal.mockResolvedValue('unsupported');
+      mocks.runtimeSend.mockReturnValue('sent');
+
+      const sharedActor = {
+        actorUserId: 'user-p1',
+        actorDisplayName: 'P1',
+        effectiveActorRole: 'participant' as const,
+        actionId: 'act-r7',
+        origin: 'shared-tab' as const,
+        authorizedAt: 1,
+        primaryShareId: null,
+        snapshot: {
+          target: { kind: 'main' as const, serverId: 's1', sessionName: 'deck_sub_emgrx' },
+          effectiveRole: 'participant' as const,
+          historyCutoffAt: 0,
+          coveringShareIds: [],
+          authorizedAt: 1,
+          nextCoverageRecheckAt: null,
+        },
+      };
+
+      const target = transport({ state: 'running' });
+      const cancelSessionMock = vi.fn().mockImplementation(async () => {
+        clearAllDaemonTurnAuthoritiesOnDisconnect();
+        return true;
+      });
+
+      await dispatchSessionMessage(target, 'fallback participant redirect', {
+        messageId: 'send_r7_part_dc',
+        ...AGENT,
+        sharedActor,
+        sharedMachineAuthority: 'trg_r7_part_stale_111111111111',
+        cancelSession: cancelSessionMock,
+      } as never);
+
+      const partCallMeta = mocks.runtimeSend.mock.calls.at(-1)?.[4] as Record<string, unknown>;
+      expect(partCallMeta.deliveryMode).toBe('append');
+      expect(partCallMeta.emergency).toBe(true);
+      expect(partCallMeta.queuePlacement).toBe('front');
+      expect(partCallMeta.sharedActor).toEqual(sharedActor);
+      expect(partCallMeta.sharedMachineAuthority).toBeUndefined();
+      expect(partCallMeta.ownerMachineAuthority).toBeUndefined();
+      expect(partCallMeta.authorityIssueSeq).toBeUndefined();
+
+      mocks.runtimeSend.mockClear();
+      await dispatchSessionMessage(target, 'fallback owner redirect', {
+        messageId: 'send_r7_owner_dc',
+        ...AGENT,
+        ownerMachineAuthority: 'trg_r7_owner_stale_22222222222',
+        cancelSession: cancelSessionMock,
+      } as never);
+
+      const ownerCallMeta = mocks.runtimeSend.mock.calls.at(-1)?.[4] as Record<string, unknown>;
+      expect(ownerCallMeta.deliveryMode).toBe('append');
+      expect(ownerCallMeta.ownerMachineAuthority).toBeUndefined();
+      expect(ownerCallMeta.authorityIssueSeq).toBeUndefined();
+      clearProcessSharedMachineAuthoritiesForTests();
     });
   });
 });

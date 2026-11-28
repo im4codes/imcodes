@@ -3,11 +3,11 @@ import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../share
 import { queuedPairWakeAllowed } from '../daemon/task-pairs/wake-authority.js';
 import {
   allocateTurnAuthorityIssueSeq,
-  getTurnAuthorityDisconnectGeneration,
+  captureTurnAuthorityFence,
   summarizeSdkTurnOrigins,
   type SdkTurnOriginSummary,
+  type TurnAuthorityFence,
 } from '../daemon/shared-machine-authority-context.js';
-import { getActiveServerLink } from '../daemon/active-server-link.js';
 import { withMemoryMcpSessionEnv } from './providers/getDefaultMcpServers.js';
 import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
 import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
@@ -1724,15 +1724,9 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   private didTurnAuthorityScrubAcross(
     preAppendScrubGen: number,
-    preAppendDisconnectGen: number,
-    preAppendLinkGen: number | undefined,
+    preAppendFence: TurnAuthorityFence,
   ): boolean {
-    const currentLink = getActiveServerLink();
-    const currentLinkGen = currentLink?.getConnectionGeneration?.();
-    return this._turnAuthorityScrubGeneration !== preAppendScrubGen
-      || getTurnAuthorityDisconnectGeneration() !== preAppendDisconnectGen
-      || (preAppendLinkGen !== undefined && currentLinkGen !== undefined && currentLinkGen !== preAppendLinkGen)
-      || (currentLink?.isConnected !== undefined && !currentLink.isConnected());
+    return this._turnAuthorityScrubGeneration !== preAppendScrubGen || !preAppendFence.isCurrent();
   }
 
   private scrubEntryTurnAuthorities(
@@ -3865,8 +3859,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const preAdmissionProviderSessionId = this._providerSessionId;
     const preAdmissionDispatchId = this._activeDispatchId;
     const preAppendScrubGen = this._turnAuthorityScrubGeneration;
-    const preAppendDisconnectGen = getTurnAuthorityDisconnectGeneration();
-    const preAppendLinkGen = getActiveServerLink()?.getConnectionGeneration?.();
+    const preAppendFence = captureTurnAuthorityFence();
     const inFlightAppendId = ++this._nextInFlightActiveAppendId;
     this._inFlightActiveAppends.set(inFlightAppendId, selected);
     let admission: AgentDelegationNotificationResult;
@@ -3882,14 +3875,14 @@ export class TransportSessionRuntime implements SessionRuntime {
       });
     } catch (error) {
       this._inFlightActiveAppends.delete(inFlightAppendId);
-      if (this.didTurnAuthorityScrubAcross(preAppendScrubGen, preAppendDisconnectGen, preAppendLinkGen)) {
+      if (this.didTurnAuthorityScrubAcross(preAppendScrubGen, preAppendFence)) {
         for (const entry of selected) this.scrubEntryTurnAuthorities(entry);
       }
       restoreReservation();
       throw error;
     }
     this._inFlightActiveAppends.delete(inFlightAppendId);
-    if (this.didTurnAuthorityScrubAcross(preAppendScrubGen, preAppendDisconnectGen, preAppendLinkGen)) {
+    if (this.didTurnAuthorityScrubAcross(preAppendScrubGen, preAppendFence)) {
       for (const entry of selected) this.scrubEntryTurnAuthorities(entry);
     }
     if (admission !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {

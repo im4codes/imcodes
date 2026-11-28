@@ -36,7 +36,13 @@ import { setActiveServerLink } from '../../src/daemon/active-server-link.js';
 import { listMachines as listMachinesHttp } from '../../src/daemon/machine-exec-client.js';
 import { aliasMcpList } from '../../src/daemon/alias-mcp-client.js';
 import { listVerificationMachineProfiles } from '../../src/daemon/verification-machine-mcp-client.js';
-import { enqueueResend, getResendEntries, clearResend, scrubResendQueueTurnAuthorities } from '../../src/daemon/transport-resend-queue.js';
+import {
+  clearResend,
+  drainResend,
+  enqueueResend,
+  getResendEntries,
+  scrubResendQueueTurnAuthorities,
+} from '../../src/daemon/transport-resend-queue.js';
 import { deliverTransportResendEntry } from '../../src/agent/transport-resend-delivery.js';
 import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 import { upsertSession, removeSession, listSessions, type SessionRecord } from '../../src/store/session-store.js';
@@ -1615,5 +1621,149 @@ describe('daemon unified main-tree turn authority', () => {
 
     h.finishSend();
     await h.runtime.kill();
+  });
+
+  it('Round 7 P0: drainResend scrubs already-dequeued in-flight batch entries and retryEntries on synchronous forceReconnect or mid-drain disconnect', async () => {
+    let linkGen = 70;
+    let connected = true;
+    const hCleanup = { scrub: () => {} };
+    setActiveServerLink({
+      send: (msg) => { sentFrames.push(msg as Record<string, unknown>); },
+      trySend: () => false,
+      isConnected: () => connected,
+      getConnectionGeneration: () => linkGen,
+      forceReconnect: () => {
+        connected = false;
+        hCleanup.scrub();
+        linkGen += 1;
+      },
+    });
+
+    // Part A: Synchronous ServerLink.forceReconnect during entry #1 scrubs entry #2 and any RETRY entries cleanly.
+    const sessA = seed({ name: 'deck_r7_drain_sync', projectName: 'r7-da', role: 'brain', runtimeType: 'transport', agentType: 'codex-sdk', state: 'running' });
+    const recA = idOf(sessA);
+    const actorA = p1Actor('user-p1', sessA.name);
+    const tokA1 = 'trg_r7_sync_1_11111111111111111';
+    const tokA2 = 'trg_r7_sync_2_22222222222222222';
+    clearResend(sessA.name);
+    hCleanup.scrub = () => {
+      clearAllDaemonTurnAuthoritiesOnDisconnect({ scrubResendQueues: scrubResendQueueTurnAuthorities });
+    };
+
+    expect(enqueueResend(sessA.name, {
+      recipient: recA,
+      text: 'msg-1',
+      commandId: 'cmd-r7-a1',
+      clientMessageId: 'cmd-r7-a1',
+      sharedActor: actorA,
+      sharedMachineAuthority: tokA1,
+      authorityIssueSeq: allocateTurnAuthorityIssueSeq(),
+      queuedAt: Date.now(),
+    }).accepted).toBe(true);
+    expect(enqueueResend(sessA.name, {
+      recipient: recA,
+      text: 'msg-2',
+      commandId: 'cmd-r7-a2',
+      clientMessageId: 'cmd-r7-a2',
+      sharedActor: actorA,
+      sharedMachineAuthority: tokA2,
+      authorityIssueSeq: allocateTurnAuthorityIssueSeq(),
+      queuedAt: Date.now(),
+    }).accepted).toBe(true);
+
+    const seenInDispatch: Array<{
+      id: string;
+      sharedMachineAuthority?: string;
+      authorityIssueSeq?: number;
+      actorUserId?: string;
+    }> = [];
+    await drainResend(
+      sessA.name,
+      async (entry) => {
+        if (entry.clientMessageId === 'cmd-r7-a1') {
+          // Simulate conflict + revoke send failure inside batch entry #1 -> synchronous forceReconnect -> disconnect scrub.
+          bindTreeTurnAuthority(sessA.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT, actorUserId: 'user-p1', authority: tokA1 });
+          bindTreeTurnAuthority(sessA.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT, actorUserId: 'user-p2', authority: 'trg_r7_conf_p2_333333' });
+        }
+        seenInDispatch.push({
+          id: entry.clientMessageId!,
+          sharedMachineAuthority: entry.sharedMachineAuthority,
+          authorityIssueSeq: entry.authorityIssueSeq,
+          actorUserId: entry.sharedActor?.actorUserId,
+        });
+        return 'retry';
+      },
+      undefined,
+      undefined,
+      undefined,
+      recA,
+    );
+
+    expect(seenInDispatch[0]?.id).toBe('cmd-r7-a1');
+    expect(seenInDispatch[1]).toEqual({
+      id: 'cmd-r7-a2',
+      sharedMachineAuthority: undefined,
+      authorityIssueSeq: undefined,
+      actorUserId: 'user-p1',
+    });
+    const retriedA = getResendEntries(sessA.name);
+    expect(retriedA.map((e) => e.clientMessageId)).toEqual(['cmd-r7-a1', 'cmd-r7-a2']);
+    expect(JSON.stringify(retriedA)).not.toContain('trg_');
+    expect(retriedA.every((e) => e.authorityIssueSeq === undefined)).toBe(true);
+    expect(retriedA.every((e) => e.sharedActor?.actorUserId === 'user-p1')).toBe(true);
+    clearResend(sessA.name);
+
+    // Part B: Entry #1 returns RETRY BEFORE disconnect; disconnect fires during await dispatch(entry #2) -> retryEntries re-queued scrubbed.
+    connected = true;
+    const sessB = seed({ name: 'deck_r7_drain_async', projectName: 'r7-db', role: 'brain', runtimeType: 'transport', agentType: 'codex-sdk', state: 'running' });
+    const recB = idOf(sessB);
+    const actorB = p1Actor('user-p1', sessB.name);
+    clearResend(sessB.name);
+
+    enqueueResend(sessB.name, {
+      recipient: recB,
+      text: 'retry-before-dc-1',
+      commandId: 'cmd-r7-b1',
+      clientMessageId: 'cmd-r7-b1',
+      sharedActor: actorB,
+      sharedMachineAuthority: 'trg_r7_async_1_444444444444444',
+      authorityIssueSeq: allocateTurnAuthorityIssueSeq(),
+      queuedAt: Date.now(),
+    });
+    enqueueResend(sessB.name, {
+      recipient: recB,
+      text: 'retry-during-dc-2',
+      commandId: 'cmd-r7-b2',
+      clientMessageId: 'cmd-r7-b2',
+      sharedActor: actorB,
+      sharedMachineAuthority: 'trg_r7_async_2_555555555555555',
+      authorityIssueSeq: allocateTurnAuthorityIssueSeq(),
+      queuedAt: Date.now(),
+    });
+
+    await drainResend(
+      sessB.name,
+      async (entry) => {
+        if (entry.clientMessageId === 'cmd-r7-b2') {
+          await Promise.resolve();
+          connected = false;
+          clearAllDaemonTurnAuthoritiesOnDisconnect({ scrubResendQueues: scrubResendQueueTurnAuthorities });
+          linkGen += 1;
+          connected = true;
+        }
+        return 'retry';
+      },
+      undefined,
+      undefined,
+      undefined,
+      recB,
+    );
+
+    const retriedB = getResendEntries(sessB.name);
+    expect(retriedB.map((e) => e.clientMessageId)).toEqual(['cmd-r7-b1', 'cmd-r7-b2']);
+    expect(JSON.stringify(retriedB)).not.toContain('trg_');
+    expect(retriedB.every((e) => e.authorityIssueSeq === undefined)).toBe(true);
+    expect(retriedB.every((e) => e.sharedActor?.actorUserId === 'user-p1')).toBe(true);
+    clearResend(sessB.name);
   });
 });

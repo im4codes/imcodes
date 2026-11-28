@@ -69,8 +69,13 @@ import { terminalInputNeedsSessionMutex } from './terminal-input.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { registerProcessQueueDrainer } from './hook-server.js';
-import { allocateTurnAuthorityIssueSeq, bindProcessSharedMachineCommand, type ProcessSharedMachineBinding } from './shared-machine-authority-context.js';
-import { OWNER_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
+import {
+  allocateTurnAuthorityIssueSeq,
+  bindProcessSharedMachineCommand,
+  captureTurnAuthorityFence,
+  type ProcessSharedMachineBinding,
+} from './shared-machine-authority-context.js';
+import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
 import {
   emitTransportUserMessage as emitTransportUserMessageEvent,
   persistTransportUserMessage,
@@ -5259,6 +5264,21 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   const authorityIssueSeq = (sharedMachineAuthority || ownerMachineAuthority)
     ? allocateTurnAuthorityIssueSeq()
     : undefined;
+  const authorityFence = captureTurnAuthorityFence();
+  const liveCommandAuthorities = () => authorityFence.isCurrent()
+    ? {
+        ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
+        ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
+        ...(authorityIssueSeq !== undefined ? { authorityIssueSeq } : {}),
+      }
+    : {};
+  const liveAuthorityCmd = () => authorityFence.isCurrent()
+    ? cmd
+    : {
+        ...cmd,
+        [SHARED_MACHINE_AUTHORITY_FIELD]: undefined,
+        [OWNER_MACHINE_AUTHORITY_FIELD]: undefined,
+      };
   const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
     ? cmd.shareScope as SharedP2pRunScope
     : undefined;
@@ -5933,7 +5953,13 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   const record = (await import('../store/session-store.js')).getSession(sessionName);
   // Records who fed the session. A participant's turn is never cleared by a
   // later owner message: the window ends only when the session goes idle.
-  authorityBinding.current = bindProcessSharedMachineCommand(sessionName, record, cmd, undefined, authorityIssueSeq);
+  authorityBinding.current = bindProcessSharedMachineCommand(
+    sessionName,
+    record,
+    liveAuthorityCmd(),
+    undefined,
+    authorityFence.isCurrent() ? authorityIssueSeq : undefined,
+  );
 
   // F4 fix (audit f395d49c-78c) — fail closed when the session record is missing.
   //
@@ -6174,9 +6200,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       ...(aliasAudit ? { aliasAudit } : {}),
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
-      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
-      ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
-      ...(authorityIssueSeq !== undefined ? { authorityIssueSeq } : {}),
+      ...liveCommandAuthorities(),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
@@ -6273,9 +6297,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       ...(aliasAudit ? { aliasAudit } : {}),
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
-      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
-      ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
-      ...(authorityIssueSeq !== undefined ? { authorityIssueSeq } : {}),
+      ...liveCommandAuthorities(),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
       ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
@@ -6457,9 +6479,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       const sendMetadata = (sharedActor || sharedMachineAuthority || ownerMachineAuthority || aliasProviderText || aliasAudit || requestedDeliveryMode)
         ? {
             ...(sharedActor ? { sharedActor } : {}),
-            ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
-            ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
-            ...(authorityIssueSeq !== undefined ? { authorityIssueSeq } : {}),
+            ...liveCommandAuthorities(),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
             ...(aliasAudit ? { aliasAudit } : {}),
             ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),

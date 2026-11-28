@@ -92,6 +92,30 @@ export function getTurnAuthorityDisconnectGeneration(): number {
   return globalTurnAuthorityDisconnectGeneration;
 }
 
+export interface TurnAuthorityFence {
+  isCurrent(): boolean;
+}
+
+export function captureTurnAuthorityFence(): TurnAuthorityFence {
+  const capturedDisconnectGen = globalTurnAuthorityDisconnectGeneration;
+  const capturedLink = getActiveServerLink();
+  const capturedLinkGen = capturedLink?.getConnectionGeneration?.();
+  const hadConnectedLink = Boolean(capturedLink && (!capturedLink.isConnected || capturedLink.isConnected()));
+  return {
+    isCurrent(): boolean {
+      if (globalTurnAuthorityDisconnectGeneration !== capturedDisconnectGen) return false;
+      const link = getActiveServerLink();
+      const currentLinkGen = link?.getConnectionGeneration?.();
+      if (capturedLinkGen !== undefined && currentLinkGen !== undefined && currentLinkGen !== capturedLinkGen) {
+        return false;
+      }
+      if (hadConnectedLink && !link) return false;
+      if (link?.isConnected !== undefined && !link.isConnected()) return false;
+      return true;
+    },
+  };
+}
+
 function recordIdleRevokeFallback(
   rootSessionName: string,
   hash: string | null | undefined,

@@ -35,6 +35,7 @@ import {
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from './transport-queue-store.js';
 import type { QueueRecipientIdentity } from './transport-queue-store.js';
 import type { ProviderActiveTurnDeliveryKind } from '../agent/transport-provider.js';
+import { captureTurnAuthorityFence } from './shared-machine-authority-context.js';
 
 /** Queued entry age limit. Matches hook-server.ts QUEUE_EXPIRY_MS (5 minutes). */
 export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
@@ -110,6 +111,14 @@ export interface ResendEntry {
 }
 
 const queues = new Map<string, ResendEntry[]>();
+let resendScrubGeneration = 0;
+const inFlightDrainedBatches = new Set<ResendEntry[]>();
+
+function scrubResendEntryTurnAuthorities(entry: ResendEntry): void {
+  delete entry.sharedMachineAuthority;
+  delete entry.ownerMachineAuthority;
+  delete entry.authorityIssueSeq;
+}
 
 function supervisionReferencesMatch(
   durable: QueueSupervisionReference | undefined,
@@ -468,12 +477,12 @@ export function getResendCount(sessionName: string): number {
  * preserving `sharedActor` so participant-origin queued messages still fail closed when drained.
  */
 export function scrubResendQueueTurnAuthorities(): void {
+  resendScrubGeneration += 1;
   for (const list of queues.values()) {
-    for (const entry of list) {
-      delete entry.sharedMachineAuthority;
-      delete entry.ownerMachineAuthority;
-      delete entry.authorityIssueSeq;
-    }
+    for (const entry of list) scrubResendEntryTurnAuthorities(entry);
+  }
+  for (const batch of inFlightDrainedBatches) {
+    for (const entry of batch) scrubResendEntryTurnAuthorities(entry);
   }
 }
 
@@ -698,112 +707,125 @@ export async function drainResend(
   }
   queues.delete(sessionName);
   bumpTransportQueueRevision(sessionName);
+  const fence = captureTurnAuthorityFence();
+  const capturedResendScrubGen = resendScrubGeneration;
+  const wasScrubbed = () => resendScrubGeneration !== capturedResendScrubGen || !fence.isCurrent();
   let dispatched = 0;
   let expiredCount = 0;
   let failedCount = 0;
   const retryEntries: ResendEntry[] = [];
-  for (const entry of list) {
-    if (now - entry.queuedAt > RESEND_EXPIRY_MS) {
-      if (!entry.clientMessageId) {
-        logger.warn({ sessionName, commandId: entry.commandId }, 'transport queue mark expired skipped for resend entry without clientMessageId');
-        continue;
-      }
-      expiredCount += 1;
-      try {
-        getTransportQueueStore().markFailed(sessionName, entry.clientMessageId, 'expired', now);
-      } catch (err) {
-        logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark expired failed for resend entry');
-      }
-      logger.info(
-        { sessionName, commandId: entry.commandId, ageMs: now - entry.queuedAt },
-        'transport resend entry expired — dropping without redelivery',
-      );
-      continue;
-    }
-    try {
-      const clientMessageId = entry.clientMessageId;
-      if (!clientMessageId) {
-        failedCount += 1;
-        logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend dispatch finalized as failed: missing clientMessageId');
-        continue;
-      }
-      const handoffId = handoffs.get(clientMessageId);
-      if (!handoffId) {
-        failedCount += 1;
-        logger.warn({ sessionName, commandId: entry.commandId, clientMessageId }, 'transport resend dispatch missing committed handoff ownership');
-        continue;
-      }
-      // This is the only ownership transfer edge.  The durable row stays
-      // handoff_inflight while the callback either delivers it directly or
-      // stages it in the runtime under this exact capability.  Making the row
-      // queued before dispatch lets restore/reconnect rehydrate it a second
-      // time; forcing the runtime to acquire another lease parks APPEND rows.
-      const dispatchResult = await dispatch(entry, { clientMessageId, handoffId });
-      if (dispatchResult === RESEND_DISPATCH_CONTROL.RETRY) {
-        getTransportQueueStore().releaseHandoff(sessionName, handoffId, [clientMessageId]);
-        handoffs.delete(clientMessageId);
-        retryEntries.push(entry);
-        continue;
-      }
-      if (dispatchResult === RESEND_DISPATCH_CONTROL.STALE) {
-        // Stale lifecycle authority is not delivery. Delete the live row and
-        // private material without creating a delivery tombstone/evidence.
-        getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared', now, recipient ?? null);
-        handoffs.delete(clientMessageId);
-        continue;
-      }
-      if (dispatchResult !== 'queued' && dispatchResult !== 'appended') {
-        try {
-          const result = getTransportQueueStore().finalizeSentBatch(
-            sessionName,
-            [clientMessageId],
-            undefined,
-            undefined,
-            recipient ?? null,
-          );
-          if (result.deliveryFacts.length > 0) onDelivered?.({ deliveryFacts: result.deliveryFacts });
-        } catch (err) {
-          logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite finalizeSent failed for resend entry');
+  inFlightDrainedBatches.add(list);
+  try {
+    for (const entry of list) {
+      if (now - entry.queuedAt > RESEND_EXPIRY_MS) {
+        if (!entry.clientMessageId) {
+          logger.warn({ sessionName, commandId: entry.commandId }, 'transport queue mark expired skipped for resend entry without clientMessageId');
+          continue;
         }
-      }
-      // queued/appended means the runtime now owns this exact lease; sent was
-      // finalized above.  In either case the resend holder must never release
-      // or rehydrate the row again.
-      handoffs.delete(clientMessageId);
-      dispatched++;
-      logger.info(
-        { sessionName, commandId: entry.commandId, dispatchResult },
-        dispatchResult === 'queued'
-          ? 'transport resend accepted into runtime queue after reconnect'
-          : 'transport resend delivered after reconnect',
-      );
-    } catch (err) {
-      failedCount += 1;
-      const clientMessageId = entry.clientMessageId;
-      if (!clientMessageId) {
-        logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark failed skipped for resend entry without clientMessageId');
+        expiredCount += 1;
+        try {
+          getTransportQueueStore().markFailed(sessionName, entry.clientMessageId, 'expired', now);
+        } catch (err) {
+          logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark expired failed for resend entry');
+        }
+        logger.info(
+          { sessionName, commandId: entry.commandId, ageMs: now - entry.queuedAt },
+          'transport resend entry expired — dropping without redelivery',
+        );
         continue;
       }
       try {
-        getTransportQueueStore().markFailed(sessionName, clientMessageId, 'dispatch_failed', now);
+        const clientMessageId = entry.clientMessageId;
+        if (!clientMessageId) {
+          failedCount += 1;
+          logger.warn({ sessionName, commandId: entry.commandId }, 'transport resend dispatch finalized as failed: missing clientMessageId');
+          continue;
+        }
+        const handoffId = handoffs.get(clientMessageId);
+        if (!handoffId) {
+          failedCount += 1;
+          logger.warn({ sessionName, commandId: entry.commandId, clientMessageId }, 'transport resend dispatch missing committed handoff ownership');
+          continue;
+        }
+        if (wasScrubbed()) scrubResendEntryTurnAuthorities(entry);
+        // This is the only ownership transfer edge.  The durable row stays
+        // handoff_inflight while the callback either delivers it directly or
+        // stages it in the runtime under this exact capability.  Making the row
+        // queued before dispatch lets restore/reconnect rehydrate it a second
+        // time; forcing the runtime to acquire another lease parks APPEND rows.
+        const dispatchResult = await dispatch(entry, { clientMessageId, handoffId });
+        if (dispatchResult === RESEND_DISPATCH_CONTROL.RETRY) {
+          getTransportQueueStore().releaseHandoff(sessionName, handoffId, [clientMessageId]);
+          handoffs.delete(clientMessageId);
+          if (wasScrubbed()) scrubResendEntryTurnAuthorities(entry);
+          retryEntries.push(entry);
+          continue;
+        }
+        if (dispatchResult === RESEND_DISPATCH_CONTROL.STALE) {
+          // Stale lifecycle authority is not delivery. Delete the live row and
+          // private material without creating a delivery tombstone/evidence.
+          getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared', now, recipient ?? null);
+          handoffs.delete(clientMessageId);
+          continue;
+        }
+        if (dispatchResult !== 'queued' && dispatchResult !== 'appended') {
+          try {
+            const result = getTransportQueueStore().finalizeSentBatch(
+              sessionName,
+              [clientMessageId],
+              undefined,
+              undefined,
+              recipient ?? null,
+            );
+            if (result.deliveryFacts.length > 0) onDelivered?.({ deliveryFacts: result.deliveryFacts });
+          } catch (err) {
+            logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite finalizeSent failed for resend entry');
+          }
+        }
+        // queued/appended means the runtime now owns this exact lease; sent was
+        // finalized above.  In either case the resend holder must never release
+        // or rehydrate the row again.
         handoffs.delete(clientMessageId);
-      } catch (storeErr) {
-        logger.warn({ err: storeErr, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark failed failed for resend entry');
+        dispatched++;
+        logger.info(
+          { sessionName, commandId: entry.commandId, dispatchResult },
+          dispatchResult === 'queued'
+            ? 'transport resend accepted into runtime queue after reconnect'
+            : 'transport resend delivered after reconnect',
+        );
+      } catch (err) {
+        failedCount += 1;
+        const clientMessageId = entry.clientMessageId;
+        if (!clientMessageId) {
+          logger.warn({ err, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark failed skipped for resend entry without clientMessageId');
+          continue;
+        }
+        try {
+          getTransportQueueStore().markFailed(sessionName, clientMessageId, 'dispatch_failed', now);
+          handoffs.delete(clientMessageId);
+        } catch (storeErr) {
+          logger.warn({ err: storeErr, sessionName, commandId: entry.commandId }, 'transport queue sqlite mark failed failed for resend entry');
+        }
+        logger.warn(
+          { err, sessionName, commandId: entry.commandId },
+          'transport resend dispatch failed — dropping entry to avoid loops',
+        );
       }
-      logger.warn(
-        { err, sessionName, commandId: entry.commandId },
-        'transport resend dispatch failed — dropping entry to avoid loops',
-      );
     }
-  }
-  if (retryEntries.length > 0) {
-    const concurrent = queues.get(sessionName) ?? [];
-    const retriedIds = new Set(retryEntries.map((entry) => entry.clientMessageId));
-    queues.set(sessionName, [
-      ...retryEntries,
-      ...concurrent.filter((entry) => !retriedIds.has(entry.clientMessageId)),
-    ]);
-    bumpTransportQueueRevision(sessionName);
+    if (retryEntries.length > 0) {
+      if (wasScrubbed()) {
+        for (const entry of retryEntries) scrubResendEntryTurnAuthorities(entry);
+      }
+      const concurrent = queues.get(sessionName) ?? [];
+      const retriedIds = new Set(retryEntries.map((entry) => entry.clientMessageId));
+      queues.set(sessionName, [
+        ...retryEntries,
+        ...concurrent.filter((entry) => !retriedIds.has(entry.clientMessageId)),
+      ]);
+      bumpTransportQueueRevision(sessionName);
+    }
+  } finally {
+    inFlightDrainedBatches.delete(list);
   }
   if (expiredCount > 0 && onExpired) {
     try {
