@@ -2985,25 +2985,99 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     return false;
   }
 
-  private messageDigestForMigrationCheck(msg: Record<string, unknown>): string {
+  private canonicalizeJsonValue(value: unknown): unknown {
+    if (value === null || typeof value !== 'object') return value;
+    if (Array.isArray(value)) return value.map((item) => this.canonicalizeJsonValue(item));
+    const out: Record<string, unknown> = {};
+    const rec = value as Record<string, unknown>;
+    for (const key of Object.keys(rec).sort()) {
+      const child = rec[key];
+      if (child === undefined) continue;
+      out[key] = this.canonicalizeJsonValue(child);
+    }
+    return out;
+  }
+
+  private canonicalizeMigrationMessage(msg: Record<string, unknown>): unknown {
     const type = safeString(msg.type) ?? '';
-    if (type === 'user' || type === 'synthetic') {
-      return (safeString(msg.text) ?? '').trim();
+    if (type === 'user') {
+      const files = (Array.isArray(msg.files) ? msg.files : []).map((f) => {
+        if (!f || typeof f !== 'object') return this.canonicalizeJsonValue(f);
+        const rec = f as Record<string, unknown>;
+        return this.canonicalizeJsonValue({
+          mime: safeString(rec.mime) ?? '',
+          name: safeString(rec.name) ?? null,
+          description: safeString(rec.description) ?? null,
+          data: safeString(rec.data) ?? null,
+          uri: safeString(rec.uri) ?? null,
+          source: rec.source !== undefined ? this.canonicalizeJsonValue(rec.source) : null,
+          mention: rec.mention !== undefined ? this.canonicalizeJsonValue(rec.mention) : null,
+        });
+      });
+      const agents = (Array.isArray(msg.agents) ? msg.agents : []).map((a) => this.canonicalizeJsonValue(a));
+      const skills = (Array.isArray(msg.skills) ? msg.skills : []).map((s) => this.canonicalizeJsonValue(s));
+      return {
+        type: 'user',
+        text: typeof msg.text === 'string' ? msg.text : '',
+        files,
+        agents,
+        skills,
+      };
     }
-    if (type === 'assistant' && Array.isArray(msg.content)) {
-      return msg.content
-        .map((part) => {
-          if (!part || typeof part !== 'object') return '';
-          const rec = part as Record<string, unknown>;
-          const pType = safeString(rec.type) ?? '';
-          if (pType === 'text' || pType === 'reasoning') return `${pType}:${String(rec.text ?? '').trim()}`;
-          if (pType === 'tool') return `tool:${safeString(rec.id) ?? safeString(rec.name) ?? ''}`;
-          return pType;
-        })
-        .filter(Boolean)
-        .join('|');
+    if (type === 'synthetic') {
+      return {
+        type: 'synthetic',
+        text: typeof msg.text === 'string' ? msg.text : '',
+      };
     }
-    return '';
+    if (type === 'compaction') {
+      return {
+        type: 'compaction',
+        status: safeString(msg.status) ?? '',
+        reason: safeString(msg.reason) ?? '',
+        summary: typeof msg.summary === 'string' ? msg.summary : '',
+      };
+    }
+    if (type === 'assistant') {
+      const parts = Array.isArray(msg.content) ? msg.content : [];
+      const canonicalParts = parts.map((part) => {
+        if (!part || typeof part !== 'object') return this.canonicalizeJsonValue(part);
+        const rec = part as Record<string, unknown>;
+        const pType = safeString(rec.type) ?? '';
+        if (pType === 'text' || pType === 'reasoning') {
+          return this.canonicalizeJsonValue({
+            type: pType,
+            text: typeof rec.text === 'string' ? rec.text : '',
+            ...(rec.native !== undefined ? { native: rec.native } : {}),
+          });
+        }
+        if (pType === 'tool') {
+          const st = (rec.state && typeof rec.state === 'object' ? rec.state : {}) as Record<string, unknown>;
+          return this.canonicalizeJsonValue({
+            type: 'tool',
+            id: safeString(rec.id) ?? '',
+            name: safeString(rec.name) ?? '',
+            ...(rec.native !== undefined ? { native: rec.native } : {}),
+            state: {
+              status: safeString(st.status) ?? '',
+              ...(st.input !== undefined ? { input: st.input } : {}),
+              ...(st.content !== undefined ? { content: st.content } : {}),
+              ...(st.error !== undefined ? { error: st.error } : {}),
+              ...(st.metadata !== undefined ? { metadata: st.metadata } : {}),
+            },
+          });
+        }
+        return this.canonicalizeJsonValue(rec);
+      });
+      return this.canonicalizeJsonValue({
+        type: 'assistant',
+        content: canonicalParts,
+        error: msg.error !== undefined ? msg.error : null,
+        finish: safeString(msg.finish) ?? null,
+      });
+    }
+    const { time: _storageTime, metadata: _storageMeta, ...semantic } = msg;
+    return this.canonicalizeJsonValue(semantic);
   }
 
   private checkTargetMatchesConfirmedV1Source(
@@ -3047,10 +3121,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       if (srcType !== tgtType) {
         return { matches: false, reason: `message[${i}] type "${tgtType ?? 'missing'}" differs from v1 source "${srcType ?? 'missing'}"` };
       }
-      const srcDigest = this.messageDigestForMigrationCheck(src);
-      const tgtDigest = this.messageDigestForMigrationCheck(tgt);
-      if (srcDigest && tgtDigest && srcDigest !== tgtDigest) {
-        return { matches: false, reason: `message[${i}] content diverges from v1 source` };
+      const srcCanonical = JSON.stringify(this.canonicalizeMigrationMessage(src));
+      const tgtCanonical = JSON.stringify(this.canonicalizeMigrationMessage(tgt));
+      if (srcCanonical !== tgtCanonical) {
+        return { matches: false, reason: `message[${i}] payload diverges from v1 source` };
       }
     }
     return { matches: true };
@@ -3830,8 +3904,20 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
   private readonly stopConfirmations = new ProviderStopConfirmation();
   private readonly cancelTerminalConfirmations = new ProviderStopConfirmation();
+  private readonly cancelTerminalObservers = new WeakMap<
+    OpenCodeSessionState,
+    { providerSessionId: string; generation: number; observed: boolean }
+  >();
 
   private completeStopConfirmations(state: OpenCodeSessionState): void {
+    const observer = this.cancelTerminalObservers.get(state);
+    if (
+      observer
+      && observer.providerSessionId === state.providerSessionId
+      && observer.generation === state.generation
+    ) {
+      observer.observed = true;
+    }
     this.stopConfirmations.complete(state);
     this.cancelTerminalConfirmations.complete(state);
   }
@@ -3883,17 +3969,31 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     const wasCompacting = state.compacting;
     const prevCancelled = state.cancelled;
     const prevActiveTurnParams = state.activeTurnParams;
+    const capturedProviderSessionId = state.providerSessionId;
     const cancelledGeneration = state.generation + 1;
+    const observer = {
+      providerSessionId: capturedProviderSessionId,
+      generation: cancelledGeneration,
+      observed: false,
+    };
+    this.cancelTerminalObservers.set(state, observer);
     state.cancelled = true;
     state.compacting = false;
     state.compactRequest = null;
     state.authHealInFlight = false;
     state.activeTurnParams = null;
     state.generation = cancelledGeneration;
+    const isCancelledRouteStillCurrent = () => this.sessions.get(sessionId) === state
+      && state.providerSessionId === capturedProviderSessionId
+      && state.generation === cancelledGeneration;
     let confirmedStopped = false;
     try {
       const interruptResult = await this.interruptRouteWithDeadline(state, 'session cancel');
       if (interruptResult.ok) {
+        confirmedStopped = true;
+        return;
+      }
+      if (observer.observed && isCancelledRouteStillCurrent()) {
         confirmedStopped = true;
         return;
       }
@@ -3906,10 +4006,12 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       );
       await this.cancelTerminalConfirmations.confirm(
         state,
-        async () => {},
-        () => this.sessions.get(sessionId) === state
-          && state.providerSessionId === state.providerSessionId
-          && state.generation === cancelledGeneration,
+        async () => {
+          if (observer.observed && isCancelledRouteStillCurrent()) {
+            this.cancelTerminalConfirmations.complete(state);
+          }
+        },
+        isCancelledRouteStillCurrent,
       );
       confirmedStopped = true;
     } catch (error) {
@@ -3919,6 +4021,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       }
       throw error;
     } finally {
+      if (this.cancelTerminalObservers.get(state) === observer) {
+        this.cancelTerminalObservers.delete(state);
+      }
       if (confirmedStopped) {
         this.failOnce(state, providerError(
           PROVIDER_ERROR_CODES.CANCELLED,

@@ -1264,8 +1264,25 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     expect(hungRetry).toBe('v1-retry-ok');
     await pHungAbort.send(hungRetry, 'after retry');
 
-    // B5: Direct cancel() with hung `session.abort` does NOT fake local `failOnce(..., CANCELLED)` at 150ms;
-    // it waits for ProviderStopConfirmation until terminal `session.idle` arrives on the live stream!
+    // B5a: Early `session.idle` arriving BEFORE 150ms interrupt deadline is captured by pre-armed observer
+    // and settles cleanly without hitting ProviderStopConfirmation timeout, once, allowing immediate next send!
+    const errCountBeforeEarly = hungErrors.length;
+    setTimeout(() => {
+      hungQueues.get(6)!.push({
+        type: 'session.idle',
+        properties: { sessionID: 'shared-hung-abort-ses' },
+      });
+    }, 20);
+    const earlyCancelT0 = Date.now();
+    await pHungAbort.cancel(hungRetry);
+    expect(Date.now() - earlyCancelT0).toBeLessThan(300);
+    expect(hungErrors.slice(errCountBeforeEarly)).toEqual([
+      expect.objectContaining({ sid: hungRetry, code: PROVIDER_ERROR_CODES.CANCELLED }),
+    ]);
+    await pHungAbort.send(hungRetry, 'after early cancel');
+
+    // B5b: Late `session.idle` arriving AFTER 150ms interrupt deadline waits on ProviderStopConfirmation,
+    // never fakes local failOnce prematurely, settles once on idle, and allows next turn send!
     let directCancelSettled = false;
     const errCountBeforeCancel = hungErrors.length;
     const cancelPending = pHungAbort.cancel(hungRetry).then(() => { directCancelSettled = true; });
@@ -1281,9 +1298,30 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     expect(hungErrors.slice(errCountBeforeCancel)).toEqual([
       expect.objectContaining({ sid: hungRetry, code: PROVIDER_ERROR_CODES.CANCELLED }),
     ]);
+    await pHungAbort.send(hungRetry, 'after late cancel');
+
+    // B5c: When NO terminal event arrives, cancel() rejects with terminal confirmation timeout and ZERO fake CANCELLED;
+    // once late idle arrives afterward (with assistant reply), busy clears and next turn works cleanly!
+    const errCountBeforeTimeout = hungErrors.length;
+    await expect(pHungAbort.cancel(hungRetry)).rejects.toThrow('Provider stop terminal confirmation timed out');
+    expect(hungErrors.slice(errCountBeforeTimeout)).toEqual([]);
+    hungQueues.get(6)!.push({
+      type: 'message.updated',
+      properties: { info: { id: 'msg-b5c', sessionID: 'shared-hung-abort-ses', role: 'assistant' } },
+    });
+    hungQueues.get(6)!.push({
+      type: 'message.part.updated',
+      properties: { part: { id: 'prt-b5c', sessionID: 'shared-hung-abort-ses', messageID: 'msg-b5c', type: 'text', text: 'late response' } },
+    });
+    hungQueues.get(6)!.push({
+      type: 'session.idle',
+      properties: { sessionID: 'shared-hung-abort-ses' },
+    });
+    await vi.waitFor(async () => {
+      await pHungAbort.send(hungRetry, 'busy before end');
+    });
 
     // B3: `endSession` on busy route with hung `session.abort` finishes promptly AND still runs child close!
-    await pHungAbort.send(hungRetry, 'busy before end');
     const endT0 = Date.now();
     await pHungAbort.endSession(hungRetry);
     expect(Date.now() - endT0).toBeLessThan(300);
@@ -1371,7 +1409,7 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     expect(v2Deltas.some((d) => d.delta.includes('FROM_STALE_HOST_A'))).toBe(false);
     expect(v2Deltas.some((d) => d.sid === v2B && d.delta.includes('FROM_LIVE_HOST_B'))).toBe(true);
     await pV2Iso.disconnect();
-  });
+  }, 20_000);
 
   it('F6: preserves default embedded opencode-sdk.db session restore across upgrade to v1 CLI or v2 store', async () => {
     const root = mkTemp();
@@ -1741,6 +1779,24 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     v1SourceDb.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run(pinnedV1Id, root, 'v1-pinned-idempotent', 1500, 2500);
     v1SourceDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run('msg_pin_1', pinnedV1Id, 1600, 1600, JSON.stringify({ role: 'user', agent: 'build', model: { providerID: 'opencode', modelID: 'big-pickle' } }));
     v1SourceDb.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run('prt_pin_1', 'msg_pin_1', pinnedV1Id, 1600, 1600, JSON.stringify({ type: 'text', text: 'pinned hello v1' }));
+    v1SourceDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run('msg_pin_2', pinnedV1Id, 1700, 1800, JSON.stringify({ role: 'assistant', agent: 'build', finish: 'stop', model: { providerID: 'opencode', modelID: 'big-pickle' }, time: { completed: 1800 } }));
+    v1SourceDb.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run('prt_pin_2', 'msg_pin_2', pinnedV1Id, 1700, 1800, JSON.stringify({
+      type: 'tool',
+      callID: 'call_bash_1',
+      tool: 'bash',
+      state: { status: 'completed', input: { command: 'pwd' }, output: 'ORIGINAL_TOOL_OUTPUT', time: { start: 1700, end: 1800 } },
+    }));
+    const toolDiffV1Id = 'ses_v1_tool_diff';
+    v1SourceDb.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run(toolDiffV1Id, root, 'v1-tool-diff', 1500, 2500);
+    v1SourceDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run('msg_td_1', toolDiffV1Id, 1600, 1600, JSON.stringify({ role: 'user', agent: 'build', model: { providerID: 'opencode', modelID: 'big-pickle' } }));
+    v1SourceDb.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run('prt_td_1', 'msg_td_1', toolDiffV1Id, 1600, 1600, JSON.stringify({ type: 'text', text: 'run pwd' }));
+    v1SourceDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run('msg_td_2', toolDiffV1Id, 1700, 1800, JSON.stringify({ role: 'assistant', agent: 'build', finish: 'stop', model: { providerID: 'opencode', modelID: 'big-pickle' }, time: { completed: 1800 } }));
+    v1SourceDb.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run('prt_td_2', 'msg_td_2', toolDiffV1Id, 1700, 1800, JSON.stringify({
+      type: 'tool',
+      callID: 'call_bash_diff',
+      tool: 'bash',
+      state: { status: 'completed', input: { command: 'pwd' }, output: 'ORIGINAL_TOOL_OUTPUT', time: { start: 1700, end: 1800 } },
+    }));
     v1SourceDb.close();
 
     const ownersBeforeConflict = v2UpgradeOwners.length;
@@ -1783,7 +1839,25 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     });
     expect(pinnedFirstRoute).toBe('emb-pinned-first');
     expect(embOnlyOwners.at(-1)?.owner).toBe('embedded');
+    const toolDiffFirstRoute = await pEmbOnly.createSession({
+      sessionKey: 'emb-tooldiff-first',
+      cwd: root,
+      skipCreate: true,
+      resumeId: toolDiffV1Id,
+      openCodeStorageOwner: 'v1-cli',
+    });
+    expect(toolDiffFirstRoute).toBe('emb-tooldiff-first');
     await pEmbOnly.disconnect();
+
+    // Simulate v1 compaction replacing `call_bash_diff` output while keeping same session ID, message ID, callID, type, directory!
+    const v1CompactDb = new DatabaseSync(join(v1DataDir, 'opencode.db'));
+    v1CompactDb.prepare('UPDATE part SET data = ? WHERE id = ?').run(JSON.stringify({
+      type: 'tool',
+      callID: 'call_bash_diff',
+      tool: 'bash',
+      state: { status: 'completed', input: { command: 'pwd' }, output: 'ORIGINAL_TOOL_OUTPUT', time: { start: 1700, end: 1800, compacted: 1900 } },
+    }), 'prt_td_2');
+    v1CompactDb.close();
 
     const pEmbRetry = new OpenCodeSdkProvider();
     const embRetryOwners: Array<{ sid: string; owner: string | undefined }> = [];
@@ -1800,6 +1874,17 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     });
     expect(pinnedRetryRoute).toBe('emb-pinned-retry');
     expect(embRetryOwners.at(-1)?.owner).toBe('embedded');
+
+    // Same ID/type/directory/callID with DIFFERENT tool result (compacted in v1 vs original in embedded) MUST reject CONFIG_ERROR!
+    const ownersBeforeToolDiff = embRetryOwners.length;
+    await expect(pEmbRetry.createSession({
+      sessionKey: 'emb-rejects-tool-diff',
+      cwd: root,
+      skipCreate: true,
+      resumeId: toolDiffV1Id,
+      openCodeStorageOwner: 'v1-cli',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    expect(embRetryOwners.length).toBe(ownersBeforeToolDiff);
 
     // Divergent history (`oldSessionId` in embedded != `oldSessionId` in v1) fails & preserves both DBs!
     const ownersBeforeDivergentEmb = embRetryOwners.length;

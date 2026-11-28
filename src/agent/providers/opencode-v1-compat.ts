@@ -1575,8 +1575,20 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
 
   private readonly stopConfirmations = new ProviderStopConfirmation();
   private readonly cancelTerminalConfirmations = new ProviderStopConfirmation();
+  private readonly cancelTerminalObservers = new WeakMap<
+    OpenCodeSessionState,
+    { providerSessionId: string; generation: number; observed: boolean }
+  >();
 
   private completeStopConfirmations(state: OpenCodeSessionState): void {
+    const observer = this.cancelTerminalObservers.get(state);
+    if (
+      observer
+      && observer.providerSessionId === state.providerSessionId
+      && observer.generation === state.generation
+    ) {
+      observer.observed = true;
+    }
     this.stopConfirmations.complete(state);
     this.cancelTerminalConfirmations.complete(state);
   }
@@ -1620,14 +1632,28 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     if (!state.busy) return;
     const wasCompacting = state.compacting;
     const prevCancelled = state.cancelled;
+    const capturedProviderSessionId = state.providerSessionId;
     const cancelledGeneration = state.generation + 1;
+    const observer = {
+      providerSessionId: capturedProviderSessionId,
+      generation: cancelledGeneration,
+      observed: false,
+    };
+    this.cancelTerminalObservers.set(state, observer);
     state.cancelled = true;
     state.compacting = false;
     state.generation = cancelledGeneration;
+    const isCancelledRouteStillCurrent = () => this.sessions.get(sessionId) === state
+      && state.providerSessionId === capturedProviderSessionId
+      && state.generation === cancelledGeneration;
     let confirmedStopped = false;
     try {
       const interruptResult = await this.interruptRouteWithDeadline(state, 'session cancel');
       if (interruptResult.ok) {
+        confirmedStopped = true;
+        return;
+      }
+      if (observer.observed && isCancelledRouteStillCurrent()) {
         confirmedStopped = true;
         return;
       }
@@ -1640,10 +1666,12 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       );
       await this.cancelTerminalConfirmations.confirm(
         state,
-        async () => {},
-        () => this.sessions.get(sessionId) === state
-          && state.providerSessionId === state.providerSessionId
-          && state.generation === cancelledGeneration,
+        async () => {
+          if (observer.observed && isCancelledRouteStillCurrent()) {
+            this.cancelTerminalConfirmations.complete(state);
+          }
+        },
+        isCancelledRouteStillCurrent,
       );
       confirmedStopped = true;
     } catch (error) {
@@ -1652,6 +1680,9 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       }
       throw error;
     } finally {
+      if (this.cancelTerminalObservers.get(state) === observer) {
+        this.cancelTerminalObservers.delete(state);
+      }
       if (confirmedStopped) {
         this.failOnce(state, providerError(
           PROVIDER_ERROR_CODES.CANCELLED,
