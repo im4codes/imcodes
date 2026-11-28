@@ -191,13 +191,36 @@ export function pickFirstSelectableQuickSdk(
   currentSdk: string,
   availability?: AgentAvailabilityMap | null,
 ): string | undefined {
+  let firstUnknown: string | undefined;
+
   for (const group of groups) {
     for (const choice of group.items) {
-      if (choice.id === currentSdk || availability?.[choice.id]?.installed !== false) {
+      const isCurrent = choice.id === currentSdk;
+      const status = availability?.[choice.id]?.installed;
+
+      // 1. Current SDK is always selectable unless confirmed uninstalled
+      if (isCurrent && status !== false) {
         return choice.id;
+      }
+
+      // 2. Confirmed installed SDK (installed: true) has top priority
+      if (status === true) {
+        return choice.id;
+      }
+
+      // 3. Remember the first unknown (not reported in availability probe)
+      if (status === undefined && firstUnknown === undefined) {
+        firstUnknown = choice.id;
       }
     }
   }
+
+  // 4. Fall back to first unknown item when no confirmed installed SDK exists
+  if (firstUnknown !== undefined) {
+    return firstUnknown;
+  }
+
+  // 5. Fall back to first item when all candidates are uninstalled
   return groups[0]?.items[0]?.id;
 }
 

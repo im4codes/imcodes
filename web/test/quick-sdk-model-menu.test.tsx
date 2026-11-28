@@ -239,16 +239,31 @@ describe('quick-sdk-model helpers', () => {
     expect(byokIds).not.toContain('copilot-sdk');
     expect(byokIds).not.toContain('cursor-headless');
 
-    // pickFirstSelectableQuickSdk skips unavailable SDKs
-    const firstInstalled = pickFirstSelectableQuickSdk(byokGroups, 'agy-sdk', {
+    // pickFirstSelectableQuickSdk prioritizes confirmed installed (installed: true) over unknown (undefined)
+    // and unknown over uninstalled (installed: false)
+    // Leading candidate: false, next candidate: undefined (unknown), later candidate: true
+    const prioritized = pickFirstSelectableQuickSdk(byokGroups, 'agy-sdk', {
       [byokIds[0]]: { installed: false },
+      // byokIds[1] omitted -> unknown
+      [byokIds[2]]: { installed: true },
     } as any);
-    expect(firstInstalled).toBe(byokIds[1]);
+    expect(prioritized).toBe(byokIds[2]);
+
+    // When no confirmed installed item exists, falls back to first unknown
+    const fallbackUnknown = pickFirstSelectableQuickSdk(byokGroups, 'agy-sdk', {
+      [byokIds[0]]: { installed: false },
+      // byokIds[1] is unknown
+      [byokIds[2]]: { installed: false },
+    } as any);
+    expect(fallbackUnknown).toBe(byokIds[1]);
 
     // Falls back to first item when all marked uninstalled
     const allUninstalledMap = Object.fromEntries(byokIds.map((id) => [id, { installed: false }]));
     const fallbackAllUninstalled = pickFirstSelectableQuickSdk(byokGroups, 'agy-sdk', allUninstalledMap as any);
     expect(fallbackAllUninstalled).toBe(byokIds[0]);
+
+    // With no probe at all, falls back to first item
+    expect(pickFirstSelectableQuickSdk(byokGroups, 'agy-sdk', null)).toBe(byokIds[0]);
   });
 });
 
@@ -1189,18 +1204,22 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
     // Preset bar is now visible for the previewed BYOK SDK
     expect(document.body.querySelector('[data-testid="quick-sdk-preset-bar"]')).not.toBeNull();
 
-    // When async availability marks the auto-selected previewSdk uninstalled, snap to another available BYOK SDK
+    // When async availability marks the auto-selected previewSdk uninstalled,
+    // leaves next candidate (claude-code-sdk) unknown, and marks a later candidate (kimi-sdk) true,
+    // preview snaps precisely to the later confirmed installed candidate.
     ws.emitMessage({
       type: AGENT_AVAILABILITY_MSG.RESULT,
       checkedAt: Date.now(),
       agents: {
         [newPreviewSdk!]: { installed: false, reason: 'cli missing' },
-        'claude-code-sdk': { installed: true },
+        // claude-code-sdk is omitted (unknown)
+        'kimi-sdk': { installed: true },
       },
     });
 
     await waitFor(() => {
       const updatedPreview = split.getAttribute('data-preview-sdk');
+      expect(updatedPreview).toBe('kimi-sdk');
       expect(updatedPreview).not.toBe(newPreviewSdk);
       expect(updatedPreview).not.toBe(AGY_SDK_PROVIDER_ID);
       expect(CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(updatedPreview!)).toBe(true);
