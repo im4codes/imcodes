@@ -279,7 +279,7 @@ describe('iOS localized Action extension and shared Inbox handoff', () => {
       expect(rule).toContain(uti);
     }
     expect(plist('../ios/App/ShareActionExtension/ShareActionExtension.entitlements')['com.apple.security.application-groups']).toEqual(['group.com.im.codes']);
-    const app = plist('../ios/App/App/Info.plist'); expect(app.CFBundleDocumentTypes[0].CFBundleTypeRole).toBe('Viewer'); expect(app.CFBundleLocalizations).toEqual(Object.keys(localizations)); expect(app.UIBackgroundModes).toContain('remote-notification'); expect(app.UIBackgroundModes).toContain('audio');
+    const app = plist('../ios/App/App/Info.plist'); expect(app.CFBundleDocumentTypes[0].CFBundleTypeRole).toBe('Viewer'); expect(app.CFBundleLocalizations).toEqual(Object.keys(localizations)); expect(app.UIBackgroundModes).toContain('remote-notification'); expect(app.UIBackgroundModes).not.toContain('audio');
   });
   it.each(Object.entries(localizations))('packages %s display name and truthful notification + completion strings', (locale, label) => {
     const strings = read('../ios/App/ShareActionExtension/' + locale + '.lproj/InfoPlist.strings');
