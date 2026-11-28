@@ -671,20 +671,21 @@ describe('detectInstalledAgents()', () => {
     });
     expect(detected.opencode?.installed).toBe(true);
 
-    // Windows home fallback requires confirmed non-elevation (fails closed when unconfirmed)
+    // Windows home fallback denies elevated callers (isElevated: true) and allows confirmed non-elevated callers (isElevated: false)
     const winHome = 'C:\\Users\\alice';
     const winHomeBin = 'C:\\Users\\alice\\.opencode\\bin\\opencode.exe';
-    const winUnconfirmed = await detectInstalledAgents({
+    const winElevated = await detectInstalledAgents({
       deps: {
         platform: 'win32',
         homeDir: winHome,
         imcodesHomeDir: 'C:\\Users\\alice\\.imcodes',
         env: { PATH: 'C:\\Windows\\System32' },
+        isElevated: true,
         isExecutableFile: async (p) => p.toLowerCase() === winHomeBin.toLowerCase(),
         isProviderConnected: () => false,
       },
     });
-    expect(winUnconfirmed.opencode?.installed).toBe(false);
+    expect(winElevated.opencode?.installed).toBe(false);
 
     const winNonElevated = await detectInstalledAgents({
       deps: {
