@@ -6065,4 +6065,152 @@ describe('OpenCodeSdkProvider', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it('keeps published healthy MCP child alive and callable when a second bindSession runs during gated reload', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-mcp-reload-race-'));
+    const sdkUrl = JSON.stringify(
+      pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.js')).href,
+    );
+    const stdioUrl = JSON.stringify(
+      pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js')).href,
+    );
+    const typesUrl = JSON.stringify(
+      pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/types.js')).href,
+    );
+
+    const healthyPidFile = join(dir, 'healthy.pid');
+    const extraPidFile = join(dir, 'extra.pid');
+    const healthyScript = join(dir, 'healthy-mcp.mjs');
+    const extraScript = join(dir, 'extra-mcp.mjs');
+
+    const writeServer = (scriptPath: string, toolName: string, pidFile: string) => {
+      writeFileSync(
+        scriptPath,
+        [
+          `import { appendFileSync } from 'node:fs';`,
+          `import { Server } from ${sdkUrl};`,
+          `import { StdioServerTransport } from ${stdioUrl};`,
+          `import { CallToolRequestSchema, ListToolsRequestSchema } from ${typesUrl};`,
+          `appendFileSync(${JSON.stringify(pidFile)}, process.pid + '\\n');`,
+          `const server = new Server({ name: ${JSON.stringify(toolName)}, version: '1.0.0' }, { capabilities: { tools: {} } });`,
+          `server.setRequestHandler(ListToolsRequestSchema, async () => ({`,
+          `  tools: [{ name: ${JSON.stringify(toolName)}, description: 'test tool', inputSchema: { type: 'object', properties: {} } }],`,
+          `}));`,
+          `server.setRequestHandler(CallToolRequestSchema, async () => ({`,
+          `  content: [{ type: 'text', text: JSON.stringify({ ok: true, tool: ${JSON.stringify(toolName)}, pid: process.pid }) }],`,
+          `}));`,
+          `await server.connect(new StdioServerTransport());`,
+        ].join('\n'),
+        'utf8',
+      );
+    };
+
+    writeServer(healthyScript, 'ping', healthyPidFile);
+    writeServer(extraScript, 'alt', extraPidFile);
+
+    const isPidAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err: any) {
+        return err?.code !== 'ESRCH';
+      }
+    };
+
+    const coordinator = new SharedOpenCodeHostMcpCoordinator();
+    const addedTools = new Map<string, { execute: (input: unknown, ctx: { sessionID: string }) => Promise<unknown> }>();
+    const transforms: Array<(editor: { add: (tool: Record<string, unknown>) => void }) => void> = [];
+    const reloadEntered = deferred<void>();
+    const reloadRelease = deferred<void>();
+    let gateFirstReload = true;
+
+    const runTransforms = () => {
+      addedTools.clear();
+      for (const t of transforms) {
+        t({
+          add: (tool) => {
+            const ns = (tool.options as { namespace?: string } | undefined)?.namespace ?? 'mcp';
+            addedTools.set(`${ns}_${String(tool.name)}`, tool as any);
+          },
+        });
+      }
+    };
+
+    const teardown = await coordinator.plugin.setup({
+      location: { directory: dir },
+      tool: {
+        transform: (fn) => { transforms.push(fn); },
+        reload: async () => {
+          runTransforms();
+          if (gateFirstReload) {
+            gateFirstReload = false;
+            reloadEntered.resolve();
+            await reloadRelease.promise;
+          }
+        },
+      },
+      session: {
+        hook: () => {},
+      },
+    });
+
+    try {
+      const initialSpecs = {
+        healthy: { type: 'local' as const, command: [process.execPath, healthyScript], environment: {}, disabled: false },
+        replaceable: { type: 'local' as const, command: [process.execPath, extraScript], environment: { REV: '1' }, disabled: false },
+      };
+      const firstBind = coordinator.bindSession('sess-reload', dir, initialSpecs);
+      await reloadEntered.promise;
+
+      // Second bind with identical specs arrives while first reloadDirectory is still suspended.
+      await expect(coordinator.bindSession('sess-reload', dir, initialSpecs)).resolves.toBe(true);
+
+      const { readFileSync } = await import('node:fs');
+      const healthyPids = readFileSync(healthyPidFile, 'utf8').trim().split('\n').filter(Boolean).map(Number);
+      const extraPids = readFileSync(extraPidFile, 'utf8').trim().split('\n').filter(Boolean).map(Number);
+      expect(healthyPids).toHaveLength(1);
+      expect(extraPids).toHaveLength(1);
+      expect(isPidAlive(healthyPids[0]!)).toBe(true);
+      expect(isPidAlive(extraPids[0]!)).toBe(true);
+
+      const pingResult = await addedTools.get('healthy_ping')!.execute({}, { sessionID: 'sess-reload' });
+      expect(pingResult).toMatchObject({ output: { ok: true, tool: 'ping', pid: healthyPids[0] } });
+
+      reloadRelease.resolve();
+      await expect(firstBind).resolves.toBe(true);
+      expect(isPidAlive(healthyPids[0]!)).toBe(true);
+
+      // Config change replaces only `replaceable`; `healthy` stays on the same live PID and remains callable.
+      await expect(coordinator.bindSession('sess-reload', dir, {
+        healthy: initialSpecs.healthy,
+        replaceable: { type: 'local' as const, command: [process.execPath, extraScript], environment: { REV: '2' }, disabled: false },
+      })).resolves.toBe(true);
+      const extraPidsAfterUpdate = readFileSync(extraPidFile, 'utf8').trim().split('\n').filter(Boolean).map(Number);
+      expect(readFileSync(healthyPidFile, 'utf8').trim().split('\n').filter(Boolean).map(Number)).toEqual(healthyPids);
+      expect(extraPidsAfterUpdate).toHaveLength(2);
+      await vi.waitFor(() => {
+        expect(isPidAlive(extraPids[0]!)).toBe(false);
+      }, { timeout: 3_000 });
+      expect(isPidAlive(healthyPids[0]!)).toBe(true);
+      expect(isPidAlive(extraPidsAfterUpdate[1]!)).toBe(true);
+      expect(await addedTools.get('healthy_ping')!.execute({}, { sessionID: 'sess-reload' })).toMatchObject({
+        output: { ok: true, tool: 'ping', pid: healthyPids[0] },
+      });
+      expect(await addedTools.get('replaceable_alt')!.execute({}, { sessionID: 'sess-reload' })).toMatchObject({
+        output: { ok: true, tool: 'alt', pid: extraPidsAfterUpdate[1] },
+      });
+
+      // Unbind kills all remaining live child PIDs cleanly.
+      await coordinator.unbindSession('sess-reload');
+      await vi.waitFor(() => {
+        expect(isPidAlive(healthyPids[0]!)).toBe(false);
+        expect(isPidAlive(extraPidsAfterUpdate[1]!)).toBe(false);
+      }, { timeout: 3_000 });
+    } finally {
+      reloadRelease.resolve();
+      await coordinator.closeAll();
+      teardown();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });

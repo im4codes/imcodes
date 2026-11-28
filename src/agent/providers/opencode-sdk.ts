@@ -381,6 +381,7 @@ export class SharedOpenCodeHostMcpCoordinator {
     servers: Map<string, BoundSessionMcpServer>;
   }>();
   private readonly sessionGenerations = new Map<string, number>();
+  private readonly unbindGenerations = new Map<string, number>();
   private readonly inFlightSessions = new Map<string, Set<{
     generation: number;
     cancelled: boolean;
@@ -509,6 +510,7 @@ export class SharedOpenCodeHostMcpCoordinator {
     const dirKey = resolve(directory);
     const generation = (this.sessionGenerations.get(providerSessionId) ?? 0) + 1;
     this.sessionGenerations.set(providerSessionId, generation);
+    const unbindGen = this.unbindGenerations.get(providerSessionId) ?? 0;
 
     const existingAttempts = [...(this.inFlightSessions.get(providerSessionId) ?? [])];
     for (const prev of existingAttempts) {
@@ -556,6 +558,13 @@ export class SharedOpenCodeHostMcpCoordinator {
       this.inFlightSessions.set(providerSessionId, sessionAttempts);
     }
     sessionAttempts.add(attempt);
+    const detachAttempt = () => {
+      const current = this.inFlightSessions.get(providerSessionId);
+      current?.delete(attempt);
+      if (current && current.size === 0) {
+        this.inFlightSessions.delete(providerSessionId);
+      }
+    };
 
     try {
       const existing = this.sessionBindings.get(providerSessionId);
@@ -669,29 +678,28 @@ export class SharedOpenCodeHostMcpCoordinator {
         return false;
       }
 
-      for (const old of toClose) {
-        await Promise.resolve(old.client.close()).catch(() => {});
-        await Promise.resolve(old.transport.close()).catch(() => {});
-      }
-
-      if (isStale()) {
-        await closeCreatedServers();
-        return false;
-      }
-
+      // Commit the new binding and transfer ownership synchronously before any post-commit awaits,
+      // so neither `toClose` servers can be reused nor published servers cancelled during `reloadDirectory`.
       if (nextServers.size === 0) {
         this.sessionBindings.delete(providerSessionId);
       } else {
         this.sessionBindings.set(providerSessionId, { directory: dirKey, servers: nextServers });
       }
+      newlyCreatedServers.length = 0;
+      detachAttempt();
+
+      for (const old of toClose) {
+        await Promise.resolve(old.client.close()).catch(() => {});
+        await Promise.resolve(old.transport.close()).catch(() => {});
+      }
+
       await this.reloadDirectory(dirKey);
+      if (this.closedAll || (this.unbindGenerations.get(providerSessionId) ?? 0) !== unbindGen) {
+        return false;
+      }
       return allBound;
     } finally {
-      const current = this.inFlightSessions.get(providerSessionId);
-      current?.delete(attempt);
-      if (current && current.size === 0) {
-        this.inFlightSessions.delete(providerSessionId);
-      }
+      detachAttempt();
     }
   }
 
@@ -699,6 +707,10 @@ export class SharedOpenCodeHostMcpCoordinator {
     this.sessionGenerations.set(
       providerSessionId,
       (this.sessionGenerations.get(providerSessionId) ?? 0) + 1,
+    );
+    this.unbindGenerations.set(
+      providerSessionId,
+      (this.unbindGenerations.get(providerSessionId) ?? 0) + 1,
     );
     const inFlight = [...(this.inFlightSessions.get(providerSessionId) ?? [])];
     const existing = this.sessionBindings.get(providerSessionId);
