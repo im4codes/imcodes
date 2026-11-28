@@ -5,7 +5,7 @@ import { CONTROLLED_NODE_ABI_MODERN, CONTROLLED_NODE_RUNTIME_ABI_PROFILE, normal
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
-import { lstat, open, realpath } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, realpath, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { EnrollmentBlob, EnrollmentTrailerRange } from '../../shared/remote-exec.js';
 import {
@@ -16,6 +16,7 @@ import {
   defaultStagedExecutablePath,
   generateInstallIdentity,
   hashEnrollmentToken,
+  inspectExecutableReceipt,
   loadCredential,
   loadInstallIdentity,
   loadPendingReenrollment,
@@ -33,6 +34,7 @@ import {
   type StagedExecutableReceipt,
   type VerifiedEnrollmentSource,
 } from './enrollment.js';
+import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 import {
   controlledNodeEndpointsPath,
   resetEndpointStateForCredential,
@@ -128,6 +130,10 @@ export interface ControlledNodeBootstrapDeps {
   loadPendingReenrollment?: () => Promise<PendingReenrollmentRecord | null>;
   persistPendingReenrollment?: (record: PendingReenrollmentRecord) => Promise<void>;
   removePendingReenrollment?: () => Promise<void>;
+  /** Cross-process exclusive lock wrapping credential/journal state transitions (released before startService). */
+  withProcessLock?: <T>(fn: () => Promise<T>, credentialPath?: string) => Promise<T>;
+  /** Inspect an already-staged executable receipt from disk during crash recovery. */
+  inspectStagedReceipt?: (stagedPath: string) => Promise<StagedExecutableReceipt>;
   /** Isolate/reset server-endpoints cache when rotating credential or target server. */
   resetEndpointState?: (
     next: Pick<ControlledNodeCredential, 'serverId' | 'serverUrl'>,
@@ -221,6 +227,8 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     loadPendingReenrollment: () => loadPendingReenrollment(pendingReenrollmentPath),
     persistPendingReenrollment: (record) => persistPendingReenrollment(record, pendingReenrollmentPath),
     removePendingReenrollment: () => removePendingReenrollment(pendingReenrollmentPath),
+    withProcessLock: (fn, lockCredentialPath = credentialPath) => withBootstrapProcessLock(lockCredentialPath, fn),
+    inspectStagedReceipt: (stagedPath) => inspectExecutableReceipt(stagedPath, sourceExecutablePath),
     resetEndpointState: (next, previous) => resetEndpointStateForCredential(
       controlledNodeEndpointsPath(journalPath),
       previous,
@@ -834,6 +842,249 @@ function ensureBootstrapPortForwardTrust(
   }
 }
 
+interface BootstrapLockedOutcome {
+  result: BootstrapResult;
+  deferredStartReceipt?: ServiceReceipt;
+}
+
+const BOOTSTRAP_LOCK_TIMEOUT_MS = 30_000;
+
+function isSqliteBusyError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: unknown } | null)?.code;
+  return (code === 'ERR_SQLITE_ERROR' && /database is locked|SQLITE_BUSY/i.test(msg))
+    || /database is locked|SQLITE_BUSY/i.test(msg);
+}
+
+async function runSqliteLockSqlBounded(
+  db: { exec: (sql: string) => void },
+  sql: string,
+  deadline: number,
+  timeoutMessage: string,
+): Promise<void> {
+  while (true) {
+    if (Date.now() >= deadline) {
+      throw new Error(timeoutMessage);
+    }
+    try {
+      db.exec(sql);
+      return;
+    } catch (err) {
+      if (!isSqliteBusyError(err)) throw err;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(timeoutMessage);
+      }
+      const jitter = 5 + Math.floor(Math.random() * 11);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(jitter, remaining)));
+    }
+  }
+}
+
+async function assertLockPathSafe(lockPath: string): Promise<void> {
+  try {
+    const st = await lstat(lockPath);
+    if (st.isSymbolicLink() || !st.isFile()) {
+      throw new Error(`controlled node bootstrap lock path is unsafe: ${lockPath}`);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return;
+    throw error;
+  }
+}
+
+function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code !== 'ESRCH';
+  }
+}
+
+async function withExclusivePidLockFile<T>(
+  lockFilePath: string,
+  deadline: number,
+  fn: () => Promise<T>,
+): Promise<T> {
+  while (true) {
+    await assertLockPathSafe(lockFilePath);
+    try {
+      const handle = await open(lockFilePath, fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY, 0o600);
+      try {
+        await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+      } finally {
+        await handle.close();
+      }
+      try {
+        return await fn();
+      } finally {
+        await unlink(lockFilePath).catch(() => {});
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== 'EEXIST') throw err;
+      try {
+        const raw = await readFile(lockFilePath, 'utf8');
+        const parsed = JSON.parse(raw) as { pid?: unknown };
+        if (typeof parsed.pid === 'number' && !isPidAlive(parsed.pid)) {
+          await unlink(lockFilePath).catch(() => {});
+          continue;
+        }
+      } catch {
+        // Concurrent creator/unlinker; wait until deadline.
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(`Timed out acquiring controlled node bootstrap lock: ${lockFilePath}`);
+      }
+      const jitter = 5 + Math.floor(Math.random() * 11);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(jitter, remaining)));
+    }
+  }
+}
+
+/**
+ * Acquire an OS-kernel exclusive cross-process lock via SQLite `BEGIN IMMEDIATE`
+ * on `<stateDir>/install-bootstrap.lock.db` (automatically released by the kernel
+ * on crash/SIGKILL), falling back cleanly to `O_CREAT | O_EXCL` only on legacy
+ * runtimes lacking `node:sqlite`.
+ */
+export async function withBootstrapProcessLock<T>(
+  credentialPath: string,
+  fn: () => Promise<T>,
+  options: { lockTimeoutMs?: number } = {},
+): Promise<T> {
+  const dir = dirname(credentialPath);
+  const dirMode = process.platform === 'linux' && dir === '/var/lib/imcodes-node' ? 0o755 : 0o700;
+  await mkdir(dir, { recursive: true, mode: dirMode });
+  const lockDbPath = join(dir, 'install-bootstrap.lock.db');
+  await assertLockPathSafe(lockDbPath);
+
+  const timeoutMs = Math.max(1, Math.floor(options.lockTimeoutMs ?? BOOTSTRAP_LOCK_TIMEOUT_MS));
+  const deadline = Date.now() + timeoutMs;
+
+  let DatabaseSyncCtor: typeof import('node:sqlite')['DatabaseSync'] | null = null;
+  try {
+    suppressSqliteExperimentalWarning();
+    ({ DatabaseSync: DatabaseSyncCtor } = await import('node:sqlite'));
+  } catch {
+    DatabaseSyncCtor = null;
+  }
+
+  if (!DatabaseSyncCtor) {
+    return withExclusivePidLockFile(`${lockDbPath}.pid`, deadline, fn);
+  }
+
+  const db = new DatabaseSyncCtor(lockDbPath);
+  let inTx = false;
+  try {
+    db.exec('PRAGMA busy_timeout = 0;');
+    await runSqliteLockSqlBounded(
+      db,
+      'BEGIN IMMEDIATE;',
+      deadline,
+      `Timed out acquiring controlled node bootstrap lock: ${lockDbPath}`,
+    );
+    inTx = true;
+    const result = await fn();
+    await runSqliteLockSqlBounded(
+      db,
+      'COMMIT;',
+      deadline,
+      `Timed out committing controlled node bootstrap lock: ${lockDbPath}`,
+    );
+    inTx = false;
+    return result;
+  } catch (err) {
+    if (inTx) {
+      try {
+        db.exec('ROLLBACK;');
+      } catch { /* ignore rollback error */ }
+    }
+    throw err;
+  } finally {
+    try {
+      db.close();
+    } catch { /* ignore close error */ }
+  }
+}
+
+async function computeCandidateStagedDigest(
+  source: VerifiedEnrollmentSource,
+  stagedExecutablePath: string,
+  trailerStart: number,
+): Promise<PendingReenrollmentRecord['candidateStaged'] | undefined> {
+  if (trailerStart <= 0) return undefined;
+  const hash = createHash('sha256');
+  const chunkSize = 64 * 1024;
+  let offset = 0;
+  while (offset < trailerStart) {
+    const len = Math.min(chunkSize, trailerStart - offset);
+    const chunk = await source.readExactly(offset, len);
+    if (chunk.length !== len) return undefined;
+    hash.update(chunk);
+    offset += len;
+  }
+  return {
+    path: stagedExecutablePath,
+    sha256: hash.digest('hex'),
+    size: trailerStart,
+  };
+}
+
+async function isRunningFromStagedExecutablePath(deps: ControlledNodeBootstrapDeps): Promise<boolean> {
+  if (deps.sourceExecutablePath === deps.stagedExecutablePath) return true;
+  try {
+    const [srcReal, stagedReal] = await Promise.all([
+      realpath(deps.sourceExecutablePath),
+      realpath(deps.stagedExecutablePath),
+    ]);
+    return srcReal === stagedReal;
+  } catch {
+    return false;
+  }
+}
+
+async function inspectRecoveredStagedReceipt(
+  deps: ControlledNodeBootstrapDeps,
+  journal: InstallJournal,
+  record: PendingReenrollmentRecord,
+): Promise<StagedExecutableReceipt | undefined> {
+  const inspectFn = deps.inspectStagedReceipt
+    ?? ((p: string) => inspectExecutableReceipt(p, deps.sourceExecutablePath));
+  try {
+    const inspected = await inspectFn(deps.stagedExecutablePath);
+    if (record.stagedReceipt || record.candidateStaged) {
+      const matchesCandidate = Boolean(
+        record.candidateStaged
+        && inspected.sha256 === record.candidateStaged.sha256
+        && inspected.size === record.candidateStaged.size,
+      );
+      const matchesPendingReceipt = Boolean(
+        record.stagedReceipt
+        && inspected.sha256 === record.stagedReceipt.sha256
+        && inspected.size === record.stagedReceipt.size,
+      );
+      const matchesJournal = Boolean(
+        journal.stagedReceipt
+        && inspected.sha256 === journal.stagedReceipt.sha256
+        && inspected.size === journal.stagedReceipt.size,
+      );
+      if (!matchesCandidate && !matchesPendingReceipt && !matchesJournal) {
+        throw new Error('controlled node staged executable does not match pending reenrollment or journal receipt');
+      }
+    }
+    return inspected;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return record.stagedReceipt;
+    }
+    throw err;
+  }
+}
+
 async function commitPendingReenrollment(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
@@ -843,24 +1094,47 @@ async function commitPendingReenrollment(
   resolved: ResolvedEnrollmentSource | null,
   source: VerifiedEnrollmentSource | null,
   publisherTrustError: string | undefined,
-): Promise<BootstrapResult> {
-  let sourceArtifact: SourceArtifactIdentity | undefined;
+  options: { startService?: boolean; disposition?: 'handoff_complete' | 'run_runtime' } = {},
+): Promise<BootstrapLockedOutcome> {
+  let sourceArtifact: SourceArtifactIdentity | undefined = record.sourceArtifact;
   let stagedReceipt: StagedExecutableReceipt | undefined;
+  let updatedRecord = record;
   if (resolved && source) {
-    sourceArtifact = await deps.inspectSourceArtifact(deps.sourceExecutablePath);
+    sourceArtifact = sourceArtifact ?? await deps.inspectSourceArtifact(deps.sourceExecutablePath);
+    const candidateStaged = !resolved.windowsAuthenticode
+      ? await computeCandidateStagedDigest(source, deps.stagedExecutablePath, resolved.trailerStart)
+      : undefined;
+    updatedRecord = {
+      ...updatedRecord,
+      ...(sourceArtifact ? { sourceArtifact } : {}),
+      ...(candidateStaged ? { candidateStaged } : {}),
+    };
+    await deps.persistPendingReenrollment?.(updatedRecord);
     stagedReceipt = await source.stageTrailerFreeExecutable(
       deps.stagedExecutablePath,
       resolved.trailerStart,
       resolved.windowsAuthenticode,
     );
+    updatedRecord = {
+      ...updatedRecord,
+      stagedReceipt,
+      candidateStaged: {
+        path: stagedReceipt.path,
+        sha256: stagedReceipt.sha256,
+        size: stagedReceipt.size,
+      },
+    };
+    await deps.persistPendingReenrollment?.(updatedRecord);
+  } else {
+    stagedReceipt = await inspectRecoveredStagedReceipt(deps, journal, updatedRecord);
   }
   const previousEndpointTarget = {
-    serverId: record.previousServerId ?? existing.serverId,
-    serverUrl: record.previousServerUrl ?? existing.serverUrl,
+    serverId: updatedRecord.previousServerId ?? existing.serverId,
+    serverUrl: updatedRecord.previousServerUrl ?? existing.serverUrl,
   };
   await deps.resetEndpointState?.(newCredential, previousEndpointTarget);
   await deps.prepareCredentialDir();
-  await deps.persistInstallIdentity(record.identity);
+  await deps.persistInstallIdentity(updatedRecord.identity);
   await deps.persistCredential(newCredential);
 
   const cleanupStatus = journal.cleanupStatus && journal.cleanupStatus !== 'pending'
@@ -869,25 +1143,34 @@ async function commitPendingReenrollment(
   journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
     now: Math.max(deps.now, journal.updatedAt),
     previous: journal,
-    installId: record.identity.installId,
-    nodeTokenHash: record.identity.nodeTokenHash,
+    installId: updatedRecord.identity.installId,
+    nodeTokenHash: updatedRecord.identity.nodeTokenHash,
     serverId: newCredential.serverId,
     stagedExePath: journal.stagedExePath ?? deps.stagedExecutablePath,
     ...(stagedReceipt ? { stagedReceipt } : {}),
-    sourceExePath: record.identity.sourceExePath,
+    sourceExePath: updatedRecord.identity.sourceExePath,
     ...(sourceArtifact ? { sourceArtifact } : {}),
     cleanupStatus,
     allowIdentityRotation: true,
   });
   await deps.removePendingReenrollment?.();
   const pfTrust = ensureBootstrapPortForwardTrust(deps);
-  journal = await ensureServiceStartRequested(deps, journal, { startService: true });
+  const serviceStep = await prepareServiceStartRequested(deps, journal, {
+    startService: options.startService,
+  });
+  journal = serviceStep.journal;
+  if (options.startService === false && options.disposition === 'run_runtime') {
+    journal = await reconcileStableServicePersistence(deps, journal);
+  }
   return {
-    credential: newCredential,
-    disposition: 'handoff_complete',
-    journal,
-    publisherTrustError,
-    ...pfTrust,
+    result: {
+      credential: newCredential,
+      disposition: options.disposition ?? 'handoff_complete',
+      journal,
+      publisherTrustError,
+      ...pfTrust,
+    },
+    ...(serviceStep.deferredStartReceipt ? { deferredStartReceipt: serviceStep.deferredStartReceipt } : {}),
   };
 }
 
@@ -900,12 +1183,12 @@ async function reenrollExistingInstallation(
   abiProfile: ControlledNodeAbiProfile,
   existingPending: PendingReenrollmentRecord | null,
   publisherTrustError: string | undefined,
-): Promise<BootstrapResult> {
+): Promise<BootstrapLockedOutcome> {
   assertProductionServerUrl(resolved.blob.serverUrl);
   // Read-only source inspection BEFORE redeem; never overwrite the formal
   // staged executable until redeemEnrollmentV2 succeeds so a failed redeem
   // keeps isCurrentExecutableStable === true for the healthy existing service.
-  await deps.inspectSourceArtifact(deps.sourceExecutablePath);
+  const sourceArtifact = await deps.inspectSourceArtifact(deps.sourceExecutablePath);
   await deps.prepareCredentialDir();
 
   const targetOrigin = normalizeServerOriginForCompare(resolved.blob.serverUrl);
@@ -918,7 +1201,7 @@ async function reenrollExistingInstallation(
     && normalizeControlledNodeAbiProfile(existingPending.abiProfile) === abiProfile,
   );
   let record: PendingReenrollmentRecord = reusePending && existingPending
-    ? existingPending
+    ? { ...existingPending, ...(existingPending.sourceArtifact ? {} : { sourceArtifact }) }
     : {
       version: 1,
       targetOrigin,
@@ -930,14 +1213,15 @@ async function reenrollExistingInstallation(
       },
       previousServerId: existing.serverId,
       previousServerUrl: existing.serverUrl,
+      sourceArtifact,
       createdAt: Math.max(deps.now, journal.updatedAt),
     };
-  if (!reusePending) {
+  if (!reusePending || !existingPending?.sourceArtifact) {
     await deps.persistPendingReenrollment?.(record);
   }
 
   const newCredential = await deps.redeemEnrollmentV2(resolved.blob, record.identity);
-  record = { ...record, redeemedCredential: newCredential };
+  record = { ...record, redeemedCredential: newCredential, sourceArtifact };
   await deps.persistPendingReenrollment?.(record);
 
   return commitPendingReenrollment(
@@ -949,14 +1233,15 @@ async function reenrollExistingInstallation(
     resolved,
     source,
     publisherTrustError,
+    { startService: true, disposition: 'handoff_complete' },
   );
 }
 
-async function ensureServiceStartRequested(
+async function prepareServiceStartRequested(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
   options: { startService?: boolean } = {},
-): Promise<InstallJournal> {
+): Promise<{ journal: InstallJournal; deferredStartReceipt?: ServiceReceipt }> {
   journal = await ensureServiceRegistered(deps, journal);
   const receipt = receiptFromJournal(journal);
   if (phaseIndex(journal.phase) < phaseIndex('service_start_requested')) {
@@ -968,8 +1253,10 @@ async function ensureServiceStartRequested(
       serviceReceipt: receipt,
     });
   }
-  if (options.startService !== false) await deps.startService(receipt);
-  return journal;
+  return {
+    journal,
+    ...(options.startService !== false ? { deferredStartReceipt: receipt } : {}),
+  };
 }
 
 /**
@@ -1009,10 +1296,18 @@ async function withBootstrapSerialLock<T>(lockKey: string, fn: () => Promise<T>)
 
 export async function bootstrapControlledNodeWithDisposition(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
   const lockKey = `${deps.credentialPath}\0${deps.journalPath}`;
-  return withBootstrapSerialLock(lockKey, () => bootstrapControlledNodeWithDispositionLocked(deps));
+  const runLocked = () => bootstrapControlledNodeWithDispositionLocked(deps);
+  const { result, deferredStartReceipt } = await withBootstrapSerialLock(
+    lockKey,
+    () => (deps.withProcessLock ? deps.withProcessLock(runLocked, deps.credentialPath) : runLocked()),
+  );
+  if (deferredStartReceipt) {
+    await deps.startService(deferredStartReceipt);
+  }
+  return result;
 }
 
-async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
+async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNodeBootstrapDeps): Promise<BootstrapLockedOutcome> {
   const abiProfile = deps.abiProfile ?? CONTROLLED_NODE_RUNTIME_ABI_PROFILE;
   let existing: ControlledNodeCredential | null;
   let preloadedJournal: InstallJournal | null = null;
@@ -1050,7 +1345,7 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
       deps.warn(`controlled node interrupted upgrade recovery: ${recovery.outcome}`);
     }
     if (recovery.handoff) {
-      return { credential: existing, disposition: 'handoff_complete', journal };
+      return { result: { credential: existing, disposition: 'handoff_complete', journal } };
     }
   }
   const stableRuntime = await deps.isStableRuntime(journal);
@@ -1063,14 +1358,16 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
       deps,
       'Windows release publisher trust maintenance failed; continuing stable runtime and retrying later',
     );
-    journal = await ensureServiceStartRequested(deps, journal, { startService: false });
+    journal = (await prepareServiceStartRequested(deps, journal, { startService: false })).journal;
     journal = await reconcileStableServicePersistence(deps, journal);
     return {
-      credential: existing,
-      disposition: 'run_runtime',
-      journal,
-      publisherTrustError,
-      ...ensureBootstrapPortForwardTrust(deps),
+      result: {
+        credential: existing,
+        disposition: 'run_runtime',
+        journal,
+        publisherTrustError,
+        ...ensureBootstrapPortForwardTrust(deps),
+      },
     };
   }
 
@@ -1096,50 +1393,114 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
           serverId: existing.serverId,
         });
       }
-      journal = await ensureServiceStartRequested(deps, journal, { startService: false });
+      journal = (await prepareServiceStartRequested(deps, journal, { startService: false })).journal;
       return {
-        credential: existing,
-        disposition: 'run_runtime',
-        journal,
-        publisherTrustError,
-        ...ensureBootstrapPortForwardTrust(deps),
+        result: {
+          credential: existing,
+          disposition: 'run_runtime',
+          journal,
+          publisherTrustError,
+          ...ensureBootstrapPortForwardTrust(deps),
+        },
       };
     }
 
     let source: VerifiedEnrollmentSource | null = null;
     try {
-      const pendingReenrollment = (await deps.loadPendingReenrollment?.()) ?? null;
+      let activePending = (await deps.loadPendingReenrollment?.()) ?? null;
       source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
       const resolved = await resolveEnrollmentSource(deps, source);
+      const runningFromStagedPath = await isRunningFromStagedExecutablePath(deps);
       const targetOrigin = resolved ? normalizeServerOriginForCompare(resolved.blob.serverUrl) : null;
       const enrollTokenHash = resolved ? hashEnrollmentToken(resolved.blob.enrollToken) : null;
       const pendingCommittedMatchesExisting = Boolean(
-        pendingReenrollment?.redeemedCredential
-        && existing.serverId === pendingReenrollment.redeemedCredential.serverId
-        && existing.token === pendingReenrollment.redeemedCredential.token,
+        activePending?.redeemedCredential
+        && existing.serverId === activePending.redeemedCredential.serverId
+        && existing.token === activePending.redeemedCredential.token,
+      );
+      const pendingMatchesPrevious = Boolean(
+        activePending?.redeemedCredential
+        && activePending.previousServerId !== undefined
+        && existing.serverId === activePending.previousServerId
+        && (
+          activePending.previousServerUrl === undefined
+          || normalizeServerOriginForCompare(activePending.previousServerUrl)
+            === normalizeServerOriginForCompare(existing.serverUrl)
+        ),
       );
       const pendingMatchesResolved = Boolean(
-        pendingReenrollment
+        activePending
         && resolved
-        && pendingReenrollment.targetOrigin === targetOrigin
-        && pendingReenrollment.enrollTokenHash === enrollTokenHash
-        && normalizeControlledNodeAbiProfile(pendingReenrollment.abiProfile) === abiProfile,
+        && activePending.targetOrigin === targetOrigin
+        && activePending.enrollTokenHash === enrollTokenHash
+        && normalizeControlledNodeAbiProfile(activePending.abiProfile) === abiProfile,
       );
-      if (pendingReenrollment?.redeemedCredential && (pendingCommittedMatchesExisting || pendingMatchesResolved)) {
-        return await commitPendingReenrollment(
+      if (activePending?.redeemedCredential && (pendingCommittedMatchesExisting || pendingMatchesPrevious || pendingMatchesResolved)) {
+        if (!resolved) {
+          return await commitPendingReenrollment(
+            deps,
+            journal,
+            existing,
+            activePending,
+            activePending.redeemedCredential,
+            null,
+            null,
+            publisherTrustError,
+            runningFromStagedPath
+              ? { startService: false, disposition: 'run_runtime' }
+              : { startService: true, disposition: 'handoff_complete' },
+          );
+        }
+        if (targetOrigin === activePending.targetOrigin) {
+          return await commitPendingReenrollment(
+            deps,
+            journal,
+            existing,
+            activePending,
+            activePending.redeemedCredential,
+            resolved,
+            source,
+            publisherTrustError,
+            { startService: true, disposition: 'handoff_complete' },
+          );
+        }
+        const finalized = await commitPendingReenrollment(
           deps,
           journal,
           existing,
-          pendingReenrollment,
-          pendingReenrollment.redeemedCredential,
-          resolved,
-          source,
+          activePending,
+          activePending.redeemedCredential,
+          null,
+          null,
           publisherTrustError,
+          { startService: false, disposition: 'handoff_complete' },
         );
+        existing = finalized.result.credential!;
+        journal = finalized.result.journal;
+        activePending = null;
+      }
+      if (!resolved && runningFromStagedPath) {
+        if (journal.phase === 'files_staged') {
+          journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
+            now: deps.now,
+            previous: journal,
+            serverId: existing.serverId,
+          });
+        }
+        journal = (await prepareServiceStartRequested(deps, journal, { startService: false })).journal;
+        return {
+          result: {
+            credential: existing,
+            disposition: 'run_runtime',
+            journal,
+            publisherTrustError,
+            ...ensureBootstrapPortForwardTrust(deps),
+          },
+        };
       }
       if (resolved) {
         const serverUrlChanged = normalizeServerOriginForCompare(existing.serverUrl) !== targetOrigin;
-        let shouldReenroll = serverUrlChanged || (pendingMatchesResolved && !pendingReenrollment?.redeemedCredential);
+        let shouldReenroll = serverUrlChanged || (pendingMatchesResolved && !activePending?.redeemedCredential);
         if (serverUrlChanged) {
           deps.warn('controlled node enrollment serverUrl differs from existing credential; re-enrolling with fresh install identity');
         } else if (shouldReenroll) {
@@ -1159,7 +1520,7 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
             resolved,
             source,
             abiProfile,
-            pendingReenrollment,
+            activePending,
             publisherTrustError,
           );
         }
@@ -1174,13 +1535,17 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
       if (resolved) {
         journal = await restageWithResolvedSource(deps, journal, resolved, source);
       }
-      journal = await ensureServiceStartRequested(deps, journal, { startService: true });
+      const serviceStep = await prepareServiceStartRequested(deps, journal, { startService: true });
+      journal = serviceStep.journal;
       return {
-        credential: existing,
-        disposition: 'handoff_complete',
-        journal,
-        publisherTrustError,
-        ...ensureBootstrapPortForwardTrust(deps),
+        result: {
+          credential: existing,
+          disposition: 'handoff_complete',
+          journal,
+          publisherTrustError,
+          ...ensureBootstrapPortForwardTrust(deps),
+        },
+        ...(serviceStep.deferredStartReceipt ? { deferredStartReceipt: serviceStep.deferredStartReceipt } : {}),
       };
     } finally {
       if (source) await source.close().catch(() => {});
@@ -1196,9 +1561,11 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
         throw new Error('controlled node is enrolled but enrollment blob is unavailable; manual recovery required');
       }
       return {
-        credential: null,
-        disposition: 'pending_setup',
-        journal,
+        result: {
+          credential: null,
+          disposition: 'pending_setup',
+          journal,
+        },
       };
     }
 
@@ -1213,9 +1580,13 @@ async function bootstrapControlledNodeWithDispositionLocked(deps: ControlledNode
     const credential = enrolled.credential;
     const pfTrust = ensureBootstrapPortForwardTrust(deps);
 
-    journal = await ensureServiceStartRequested(deps, journal);
+    const serviceStep = await prepareServiceStartRequested(deps, journal, { startService: true });
+    journal = serviceStep.journal;
 
-    return { credential, disposition: 'handoff_complete', journal, publisherTrustError, ...pfTrust };
+    return {
+      result: { credential, disposition: 'handoff_complete', journal, publisherTrustError, ...pfTrust },
+      ...(serviceStep.deferredStartReceipt ? { deferredStartReceipt: serviceStep.deferredStartReceipt } : {}),
+    };
   } finally {
     if (source) await source.close().catch(() => {});
   }

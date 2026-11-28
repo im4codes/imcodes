@@ -27,6 +27,7 @@ import {
 import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
 import { isControlledNodeArch } from '../../shared/controlled-node-artifacts.js';
 import { normalizeControlledNodeEndpointOrigin } from '../../shared/controlled-node-endpoints.js';
+import type { SourceArtifactIdentity } from './install-journal.js';
 import {
   inspectWindowsAuthenticodeEnrollmentContainer,
   WINDOWS_AUTHENTICODE_ENROLLMENT_OVERHEAD_MAX,
@@ -550,6 +551,12 @@ export function defaultPendingReenrollmentPath(credentialPath = defaultCredentia
   return join(dirname(credentialPath), 'pending-reenrollment.json');
 }
 
+export interface PendingReenrollmentStagedCandidate {
+  path: string;
+  sha256: string;
+  size: number;
+}
+
 export interface PendingReenrollmentRecord {
   version: 1;
   targetOrigin: string;
@@ -559,6 +566,9 @@ export interface PendingReenrollmentRecord {
   previousServerId?: string;
   previousServerUrl?: string;
   redeemedCredential?: ControlledNodeCredential;
+  candidateStaged?: PendingReenrollmentStagedCandidate;
+  stagedReceipt?: StagedExecutableReceipt;
+  sourceArtifact?: SourceArtifactIdentity;
   createdAt: number;
 }
 
@@ -717,6 +727,37 @@ function isValidControlledNodeCredentialValue(value: unknown): value is Controll
   return true;
 }
 
+function isValidDigestPair(value: unknown): value is SourceArtifactIdentity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.sha256 === 'string'
+    && isEnrollmentNodeTokenHash(v.sha256)
+    && typeof v.size === 'number'
+    && Number.isFinite(v.size)
+    && v.size >= 0;
+}
+
+function isValidFileIdentityValue(value: unknown): value is FileIdentity {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const v = value as Record<string, unknown>;
+  return typeof v.size === 'number'
+    && Number.isFinite(v.size)
+    && v.size >= 0
+    && typeof v.mtimeMs === 'number'
+    && Number.isFinite(v.mtimeMs)
+    && typeof v.ctimeMs === 'number'
+    && Number.isFinite(v.ctimeMs);
+}
+
+function isValidStagedReceiptValue(value: unknown): value is StagedExecutableReceipt {
+  if (!isValidDigestPair(value)) return false;
+  const v = value as unknown as Record<string, unknown>;
+  return typeof v.path === 'string'
+    && v.path.length > 0
+    && isValidFileIdentityValue(v.sourceIdentity)
+    && isValidFileIdentityValue(v.stagedIdentity);
+}
+
 function isValidPendingReenrollmentRecord(value: unknown): value is PendingReenrollmentRecord {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const r = value as Partial<PendingReenrollmentRecord>;
@@ -731,6 +772,12 @@ function isValidPendingReenrollmentRecord(value: unknown): value is PendingReenr
     if (!isValidControlledNodeCredentialValue(r.redeemedCredential)) return false;
     if (r.redeemedCredential.token !== r.identity.nodeToken) return false;
   }
+  if (r.candidateStaged !== undefined) {
+    const cs = r.candidateStaged as unknown as Record<string, unknown>;
+    if (!isValidDigestPair(r.candidateStaged) || typeof cs.path !== 'string' || !cs.path) return false;
+  }
+  if (r.stagedReceipt !== undefined && !isValidStagedReceiptValue(r.stagedReceipt)) return false;
+  if (r.sourceArtifact !== undefined && !isValidDigestPair(r.sourceArtifact)) return false;
   if (typeof r.createdAt !== 'number' || !Number.isFinite(r.createdAt) || r.createdAt < 0) return false;
   return true;
 }
