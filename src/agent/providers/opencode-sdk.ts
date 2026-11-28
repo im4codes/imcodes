@@ -43,6 +43,15 @@ import { composeProviderSystemText } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
 import logger from '../../util/logger.js';
 import { imcodesStatePath } from '../../util/imcodes-state-dir.js';
+import {
+  OPENCODE_TRANSPORT_MODES,
+  isLoopbackHostname,
+  redactSecretText,
+  resolveOpenCodeTransport,
+  startOpenCodeV2CliHost,
+  type OpenCodeTransportResolution,
+} from './opencode-cli.js';
+import { OpenCodeV1CliProvider } from './opencode-v1-compat.js';
 import { NativeAgentFenceSlot, OPENCODE_NATIVE_AGENT_TOOLS, fenceOf } from '../native-agent-fence.js';
 import {
   NATIVE_AGENT_ADMISSION_MODES,
@@ -886,6 +895,8 @@ export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
     };
   },
 };
+
+const defaultOpenCodeSdkStart = openCodeSdkRuntimeHooks.start;
 
 interface NormalizedOpenCodePermission {
   id: string;
@@ -2152,6 +2163,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   private lifecycleAbort: AbortController | null = null;
   private databasePath: string | undefined;
   private catalogDirectory = process.cwd();
+  private transportResolution: OpenCodeTransportResolution | null = null;
+  private v1Delegate: OpenCodeV1CliProvider | null = null;
+  private v1WiringDisposers: Array<() => void> = [];
+  private nativeAgentFenceResolver?: NativeAgentFenceResolver;
+  private connectConfig: ProviderConfig = {};
   private sessions = new Map<string, OpenCodeSessionState>();
   private readonly legacyImportInFlight = new Map<string, Promise<OpenCodeSessionInfoLike | null>>();
   private readonly pendingQuestions = new Map<string, PendingOpenCodeForm>();
@@ -2173,8 +2189,74 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
   private usageCallbacks: Array<(sessionId: string, usage: ProviderUsageUpdate) => void> = [];
 
+  private async startConfiguredRuntime(options: OpenCodeSdkStartOptions): Promise<OpenCodeSdkRuntimeStartResult> {
+    if (this.transportResolution?.mode === OPENCODE_TRANSPORT_MODES.V2_CLI) {
+      return await startOpenCodeV2CliHost({
+        ...options,
+        binaryPath: this.transportResolution.cli.binaryPath,
+      });
+    }
+    return await openCodeSdkRuntimeHooks.start(options);
+  }
+
+  private wireV1Delegate(v1: OpenCodeV1CliProvider): void {
+    const disposers: Array<() => void> = [];
+    disposers.push(v1.onDelta((sessionId, delta) => {
+      for (const cb of this.deltaCallbacks) cb(sessionId, delta);
+    }));
+    disposers.push(v1.onComplete((sessionId, msg) => {
+      for (const cb of this.completeCallbacks) cb(sessionId, msg);
+    }));
+    disposers.push(v1.onError((sessionId, err) => {
+      for (const cb of this.errorCallbacks) cb(sessionId, err);
+    }));
+    v1.onToolCall((sessionId, tool) => {
+      for (const cb of this.toolCallbacks) cb(sessionId, tool);
+    });
+    v1.onApprovalRequest((sessionId, req) => {
+      for (const cb of this.approvalCallbacks) cb(sessionId, req);
+    });
+    disposers.push(v1.onSessionInfo((sessionId, info) => {
+      for (const cb of this.sessionInfoCallbacks) cb(sessionId, info);
+    }));
+    disposers.push(v1.onStatus((sessionId, status) => {
+      for (const cb of this.statusCallbacks) cb(sessionId, status);
+    }));
+    disposers.push(v1.onUsage((sessionId, usage) => {
+      for (const cb of this.usageCallbacks) cb(sessionId, usage);
+    }));
+    if (this.toolExecutionGuard) v1.setToolExecutionGuard(this.toolExecutionGuard);
+    if (this.participantTurnResolver) v1.setParticipantTurnResolver(this.participantTurnResolver);
+    if (this.nativeAgentFenceResolver) v1.setNativeAgentFenceResolver(this.nativeAgentFenceResolver);
+    this.v1WiringDisposers = disposers;
+  }
+
   async connect(config: ProviderConfig): Promise<void> {
-    if (this.client && this.server) return;
+    if (this.v1Delegate || (this.client && this.server)) return;
+    const resolution = await resolveOpenCodeTransport({
+      hookOverridden: openCodeSdkRuntimeHooks.start !== defaultOpenCodeSdkStart,
+      config,
+    });
+    this.transportResolution = resolution;
+    this.connectConfig = { ...config };
+
+    if (resolution.mode === OPENCODE_TRANSPORT_MODES.V1_CLI) {
+      const v1 = new OpenCodeV1CliProvider({ binaryPath: resolution.cli.binaryPath });
+      this.wireV1Delegate(v1);
+      try {
+        await v1.connect(config);
+        this.v1Delegate = v1;
+        return;
+      } catch (error) {
+        for (const dispose of this.v1WiringDisposers) dispose();
+        this.v1WiringDisposers = [];
+        await v1.disconnect().catch(() => {});
+        this.transportResolution = null;
+        this.connectConfig = {};
+        throw error;
+      }
+    }
+
     const abort = new AbortController();
     const port = positiveNumber(config.port) || 0;
     const timeout = positiveNumber(config.startupTimeoutMs) || 10_000;
@@ -2183,7 +2265,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     this.databasePath = databasePath;
     this.catalogDirectory = catalogDirectory;
     try {
-      const started = await openCodeSdkRuntimeHooks.start({
+      const started = await this.startConfiguredRuntime({
         hostname: LOOPBACK_HOST,
         port,
         timeout,
@@ -2194,7 +2276,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         ...(databasePath ? { databasePath } : {}),
       });
       const url = new URL(started.server.url);
-      if (url.hostname !== LOOPBACK_HOST && url.hostname !== 'localhost' && url.hostname !== '::1') {
+      if (!isLoopbackHostname(url.hostname)) {
         await Promise.resolve(started.server.close()).catch(() => {});
         throw providerError(PROVIDER_ERROR_CODES.CONFIG_ERROR, 'OpenCode SDK server did not bind to loopback', false);
       }
@@ -2202,18 +2284,31 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       this.server = started.server;
       this.lifecycleAbort = abort;
       this.approvalTimeoutMs = positiveNumber(config.approvalTimeoutMs) || DEFAULT_APPROVAL_TIMEOUT_MS;
-      logger.info({ provider: this.id, server: url.origin }, 'OpenCode SDK provider connected');
+      logger.info({ provider: this.id, server: url.origin, mode: resolution.mode }, 'OpenCode SDK provider connected');
     } catch (error) {
       abort.abort();
       await Promise.resolve(this.server?.close()).catch(() => {});
       this.server = null;
       this.client = null;
       this.lifecycleAbort = null;
-      throw this.normalizeError(error, 'connect');
+      const normalized = this.normalizeError(error, 'connect');
+      this.transportResolution = null;
+      this.connectConfig = {};
+      throw normalized;
     }
   }
 
   async disconnect(): Promise<void> {
+    if (this.v1Delegate) {
+      const delegate = this.v1Delegate;
+      this.v1Delegate = null;
+      for (const dispose of this.v1WiringDisposers) dispose();
+      this.v1WiringDisposers = [];
+      this.transportResolution = null;
+      this.connectConfig = {};
+      await delegate.disconnect();
+      return;
+    }
     const states = [...this.sessions.values()];
     this.sessions.clear();
     this.providerToRoute.clear();
@@ -2234,6 +2329,8 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     await Promise.resolve(this.server?.close()).catch(() => {});
     this.server = null;
     this.client = null;
+    this.transportResolution = null;
+    this.connectConfig = {};
     this.modelCache = null;
     this.modelContextWindows.clear();
     this.modelReasoningMeta.clear();
@@ -2242,6 +2339,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
+    if (this.v1Delegate) return this.v1Delegate.getMemoryMcpStatus();
     return {
       providerId: this.id,
       status: this.client ? MEMORY_MCP_STATUS.READY : MEMORY_MCP_STATUS.UNKNOWN,
@@ -2251,6 +2349,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   async createSession(config: SessionConfig): Promise<string> {
+    if (this.v1Delegate) return this.v1Delegate.createSession(config);
     this.assertConnected();
     if (!this.modelCache) await this.listModels(false);
     const routeId = config.bindExistingKey ?? config.sessionKey;
@@ -2467,10 +2566,12 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   async endSession(sessionId: string): Promise<void> {
+    if (this.v1Delegate) return this.v1Delegate.endSession(sessionId);
     await this.closeOrDetachRoute(sessionId, true);
   }
 
   async detachSession(sessionId: string): Promise<void> {
+    if (this.v1Delegate) return this.v1Delegate.detachSession(sessionId);
     await this.closeOrDetachRoute(sessionId, false);
   }
 
@@ -2525,6 +2626,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
+    if (this.v1Delegate) return this.v1Delegate.restoreSession(sessionId);
     const client = this.assertConnected();
     try {
       const session = await this.ensureSessionPresentOrImportLegacy(client, sessionId, this.catalogDirectory);
@@ -2538,6 +2640,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   async listSessions(options: RemoteSessionListOptions = {}): Promise<RemoteSessionInfo[]> {
+    if (this.v1Delegate) return this.v1Delegate.listSessions(options);
     const client = this.assertConnected();
     const directory = safeString(options.directory);
     const result = await client.session.list(directory ? { directory } : undefined);
@@ -2556,6 +2659,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   async listModels(force = false): Promise<ProviderModelList> {
+    if (this.v1Delegate) return this.v1Delegate.listModels(force);
     if (!force && this.modelCache && Date.now() - this.modelCache.at < MODEL_CACHE_TTL_MS) {
       return this.modelCache.value;
     }
@@ -2637,6 +2741,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   setSessionAgentId(sessionId: string, agentId: string): void {
+    if (this.v1Delegate) {
+      this.v1Delegate.setSessionAgentId(sessionId, agentId);
+      return;
+    }
     const state = this.sessions.get(sessionId);
     if (!state || !agentId.trim()) return;
     state.model = agentId.trim();
@@ -2645,6 +2753,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   setSessionEffort(sessionId: string, effort: TransportEffortLevel): void {
+    if (this.v1Delegate) {
+      this.v1Delegate.setSessionEffort(sessionId, effort);
+      return;
+    }
     const state = this.sessions.get(sessionId);
     if (!state) return;
     state.effort = effort;
@@ -2763,6 +2875,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     attachments?: TransportAttachment[],
     extraSystemPrompt?: string,
   ): Promise<void> {
+    if (this.v1Delegate) return this.v1Delegate.send(sessionId, payloadOrMessage, attachments, extraSystemPrompt);
     const state = this.sessions.get(sessionId);
     if (!state) throw providerError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown OpenCode SDK session: ${sessionId}`, false);
     this.assertRouteOwner(state);
@@ -3019,6 +3132,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     sessionId: string,
     notification: ProviderDelegationNotification,
   ): Promise<AgentDelegationNotificationResult> {
+    if (this.v1Delegate) return this.v1Delegate.notifyActiveDelegation(sessionId, notification);
     const state = this.sessions.get(sessionId);
     if (!state?.busy || state.cancelled) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
     await state.client.sessions.prompt({
@@ -3037,6 +3151,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   private readonly stopConfirmations = new ProviderStopConfirmation();
 
   cancelAndWait(sessionId: string): Promise<void> {
+    if (this.v1Delegate) return this.v1Delegate.cancelAndWait(sessionId);
     const state = this.sessions.get(sessionId);
     if (!state) return Promise.reject(new Error('OpenCode session unavailable for Stop'));
     const providerSessionId = state.providerSessionId;
@@ -3048,6 +3163,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   answerPendingQuestion(sessionName: string, answer: string): boolean {
+    if (this.v1Delegate) return this.v1Delegate.answerPendingQuestion(sessionName, answer);
     for (const [routeId, state] of this.sessions) {
       if ((state.runtimeConfig.sessionName ?? routeId) !== sessionName) continue;
       const pending = this.pendingQuestions.get(routeId);
@@ -3069,6 +3185,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   async cancel(sessionId: string, options?: ProviderCancelOptions): Promise<void> {
+    if (this.v1Delegate) return this.v1Delegate.cancel(sessionId, options);
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.clearPendingQuestion(state, true);
@@ -3117,10 +3234,12 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
 
   setToolExecutionGuard(guard: ToolExecutionGuard): void {
     this.toolExecutionGuard = guard;
+    this.v1Delegate?.setToolExecutionGuard(guard);
   }
 
   setParticipantTurnResolver(resolver: (sessionId: string) => boolean): void {
     this.participantTurnResolver = resolver;
+    this.v1Delegate?.setParticipantTurnResolver(resolver);
   }
 
   onToolCall(cb: (sessionId: string, tool: ToolCallEvent) => void): void {
@@ -3147,6 +3266,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   async respondApproval(sessionId: string, requestId: string, approved: boolean): Promise<void> {
+    if (this.v1Delegate) return this.v1Delegate.respondApproval(sessionId, requestId, approved);
     const state = this.sessions.get(sessionId);
     if (!state) throw providerError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown OpenCode SDK session: ${sessionId}`, false);
     const timer = state.pendingPermissions.get(requestId);
@@ -3268,7 +3388,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   setNativeAgentFenceResolver(resolver: NativeAgentFenceResolver): void {
+    this.nativeAgentFenceResolver = resolver;
     this.nativeAgentFence.install(resolver);
+    this.v1Delegate?.setNativeAgentFenceResolver(resolver);
   }
 
   /**
@@ -3276,6 +3398,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
    * started. A relaunch starts a new runtime and decides again.
    */
   async getNativeAgentFence(providerSessionId: string): Promise<NativeAgentFence> {
+    if (this.v1Delegate) return this.v1Delegate.getNativeAgentFence(providerSessionId);
     return this.sessions.get(providerSessionId)?.nativeAgentFence ?? NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
   }
 
@@ -3458,7 +3581,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     );
     let releaseEvents: (() => Promise<void>) | null = null;
     try {
-      started = await openCodeSdkRuntimeHooks.start({
+      started = await this.startConfiguredRuntime({
         hostname: LOOPBACK_HOST,
         port: 0,
         timeout: 10_000,
@@ -3474,7 +3597,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         },
       });
       const url = new URL(started.server.url);
-      if (url.hostname !== LOOPBACK_HOST && url.hostname !== 'localhost' && url.hostname !== '::1') {
+      if (!isLoopbackHostname(url.hostname)) {
         throw providerError(PROVIDER_ERROR_CODES.CONFIG_ERROR, 'OpenCode SDK session server did not bind to loopback', false);
       }
       const clientRef = started.client;
@@ -4107,7 +4230,14 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         }
         this.forwardPermissionApproval(state, permission);
       }).catch(() => {
-        if (this.participantTurnResolver?.(state.routeId) === true) {
+        let isParticipantTurn = false;
+        try {
+          isParticipantTurn = this.participantTurnResolver?.(state.routeId) === true;
+        } catch {
+          // Fail-closed when participant turn resolver itself throws.
+          isParticipantTurn = true;
+        }
+        if (isParticipantTurn) {
           void this.replyPermission(state, id, false).catch((error) => {
             this.emitError(state.routeId, this.normalizeError(error, 'permission rejection'));
           });
@@ -4936,7 +5066,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       return error as ProviderError;
     }
     const status = errorHttpStatus(error);
-    const message = errorMessage(error);
+    const message = redactSecretText(errorMessage(error), []);
     const lower = message.toLowerCase();
     const errorType = error && typeof error === 'object' ? safeString((error as { type?: unknown }).type)?.toLowerCase() ?? '' : '';
     const errorName = error && typeof error === 'object' ? safeString((error as { name?: unknown }).name)?.toLowerCase() ?? '' : '';
@@ -4977,7 +5107,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       || (lower.includes('rate') && lower.includes('limit'))
       || status === 429
     ) {
-      return providerError(PROVIDER_ERROR_CODES.RATE_LIMITED, `OpenCode ${operation} failed: ${message}`, true);
+      const isFreeLimit = errorType.includes('free-limit') || lower.includes('free usage limit');
+      const hint = isFreeLimit && this.transportResolution?.mode === OPENCODE_TRANSPORT_MODES.EMBEDDED
+        ? ' Install the official OpenCode CLI (`opencode`) or configure a provider API key to avoid embedded free-tier limits.'
+        : '';
+      return providerError(PROVIDER_ERROR_CODES.RATE_LIMITED, `OpenCode ${operation} failed: ${message}${hint}`, true);
     }
     if (lower.includes('abort') || lower.includes('cancel')) {
       return providerError(PROVIDER_ERROR_CODES.CANCELLED, `OpenCode ${operation} cancelled`, true);

@@ -70,6 +70,7 @@
     "@microsoft/copilot-sdk": "^2.0.4",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@muse-code/sdk": "^1.4.25",
+    "@opencode-ai/sdk": "^1.19.6",
     "@opencode/sdk": "^2.4.2",
     "add-mcp": "2.4.1",
     "commander": "^12.1.0",
