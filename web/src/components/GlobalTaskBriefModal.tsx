@@ -737,21 +737,23 @@ export function GlobalTaskBriefModal({
           >
             {t('common.close', 'Close')}
           </button>
-          <button
-            type="button"
-            class="global-task-brief-hud-btn-primary"
-            data-testid="global-task-brief-open-session"
-            onClick={() => {
-              onClose();
-              onJumpToSession(task.serverId, task.brainSession, {
-                taskId: task.taskId,
-                title: task.title,
-                status: task.status,
-              });
-            }}
-          >
-            {t('taskMode.enter_session', 'Open session')}
-          </button>
+          {task.brainSession.trim() && (
+            <button
+              type="button"
+              class="global-task-brief-hud-btn-primary"
+              data-testid="global-task-brief-open-session"
+              onClick={() => {
+                onClose();
+                onJumpToSession(task.serverId, task.brainSession, {
+                  taskId: task.taskId,
+                  title: task.title,
+                  status: task.status,
+                });
+              }}
+            >
+              {t('taskMode.enter_session', 'Open session')}
+            </button>
+          )}
         </footer>
       </section>
     </div>

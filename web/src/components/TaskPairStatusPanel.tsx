@@ -25,6 +25,7 @@ import {
 import { isInternalSessionDisplayValue } from '@shared/session-display.js';
 import { formatLabel } from '../format-label.js';
 import { formatModelPresentation } from '../model-label.js';
+import { globalTaskModeStore } from '../global-task-mode-store.js';
 import { closeServerTaskPair } from '../api.js';
 import type { TaskPairCloseAction } from '@shared/task-pair-close.js';
 import {
@@ -52,6 +53,7 @@ import {
   mergeSnapshotRows,
   mergeTaskPairTimelinePayload,
   normalizeTaskPairSnapshot,
+  resolveTimelinePayloadBrain,
   type TaskPairConsoleSnapshotDetail,
   type TaskPairPanelRow,
 } from '../task-pair-panel-order.js';
@@ -271,6 +273,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     setAuditModalTarget(null);
   }, [serverId]);
   useEffect(() => {
+    setAuditModalTarget(null);
+    setRowContextMenu(null);
+  }, [serverId, scopeSessionId, collapsedVisitKey]);
+  useEffect(() => {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent).detail;
       setActiveSplitTaskId(detail?.activeTaskId ?? null);
@@ -327,6 +333,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   const {
     reworkCounts,
     taskTitles,
+    taskBrains,
     allRows,
     groups,
     scopedDefaultTaskId,
@@ -337,12 +344,15 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     const latest = new Map<string, TaskPairPanelRow>();
     const nextReworkCounts = new Map<string, number>();
     const nextTaskTitles = new Map<string, string>();
+    const nextTaskBrains = new Map<string, string>();
     for (const event of events) {
       if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
       const eventPayload = event.payload as Record<string, unknown>;
       if (typeof eventPayload.taskId === 'string') {
         const eventTitle = taskPairDisplayTitle(eventPayload.title, eventPayload.taskId, eventPayload.brief);
         if (eventTitle) nextTaskTitles.set(eventPayload.taskId, eventTitle);
+        const eventBrain = resolveTimelinePayloadBrain(eventPayload);
+        if (eventBrain) nextTaskBrains.set(eventPayload.taskId, eventBrain);
         if (eventPayload.verb === 'REWORK') {
           nextReworkCounts.set(eventPayload.taskId, (nextReworkCounts.get(eventPayload.taskId) ?? 0) + 1);
         }
@@ -386,6 +396,8 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       const effectiveRow = latest.get(id) ?? row;
       const resolved = taskPairDisplayTitle(effectiveRow.payload.title, id, effectiveRow.payload.brief);
       if (resolved) nextTaskTitles.set(id, resolved);
+      const resolvedBrain = resolveTimelinePayloadBrain(effectiveRow.payload);
+      if (resolvedBrain) nextTaskBrains.set(id, resolvedBrain);
     }
     const grouped = groupAndOrderTaskPairRows(latest.values(), scopeSessionId);
     const nextScopedDefaultTaskId = scopeSessionId
@@ -406,6 +418,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     return {
       reworkCounts: nextReworkCounts,
       taskTitles: nextTaskTitles,
+      taskBrains: nextTaskBrains,
       allRows: grouped.allRows,
       groups: grouped.groups,
       scopedDefaultTaskId: nextScopedDefaultTaskId,
@@ -423,6 +436,12 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     ? (narrowVisitChoice !== undefined ? narrowVisitChoice : true)
     : resolveTaskPairPanelCollapsed({ choice, mobile: isMobile, phone, scopeSessionId, collapsedVisitKey });
   const collapsed = baseCollapsed || (usesInlineMobileFit && cramped);
+  useEffect(() => {
+    if ((!visible || collapsed || !hasRows) && (auditModalTarget || rowContextMenu)) {
+      setAuditModalTarget(null);
+      setRowContextMenu(null);
+    }
+  }, [visible, collapsed, hasRows, auditModalTarget, rowContextMenu]);
   const now = useNowTicker(visible && !collapsed && hasRows && hasActiveDurationRow);
   const isExpandedDocked = isMobile && isExpandedMobile && !scopeSessionId && !collapsed;
   const isFullscreen = isMobile && !isExpandedMobile && !scopeSessionId && !collapsed;
@@ -592,9 +611,30 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           : taskStatus === 'rework' && auditRound > 0
             ? t('taskPair.status.rework_round', { round: auditRound })
             : t(`taskPair.status.${taskStatus}`, { defaultValue: taskStatus });
-    const brainSession = typeof payload.brain === 'string' && payload.brain.trim()
-      ? payload.brain.trim()
-      : (scopeSessionId || execId || '');
+    const globalState = globalTaskModeStore.getState();
+    const matchedGlobalTask = globalState.tasks.find(
+      (item) => item.serverId === serverId && item.taskId === taskIdStr,
+    );
+    const matchedGlobalServer = globalState.servers.find((item) => item.id === serverId);
+    const rawGlobalSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: TaskPairConsoleSnapshotDetail }).__imcodesTaskPairSnapshot;
+    const acceptedRawSnapshot = isAcceptedPanelSnapshot(rawGlobalSnapshot, serverId) && Array.isArray(rawGlobalSnapshot?.tasks)
+      ? rawGlobalSnapshot
+      : null;
+    const matchedRawTask = acceptedRawSnapshot?.tasks?.find((item) => String(item.taskId) === taskIdStr);
+    const matchedRawPair = (matchedRawTask?.pair && typeof matchedRawTask.pair === 'object'
+      ? matchedRawTask.pair
+      : undefined) as Record<string, unknown> | undefined;
+    const snapshotBrain = resolveTimelinePayloadBrain(matchedRawPair) ?? resolveTimelinePayloadBrain(matchedRawTask);
+    const rawBrainCandidate = resolveTimelinePayloadBrain(payload)
+      ?? taskBrains.get(taskIdStr)
+      ?? snapshotBrain
+      ?? matchedGlobalTask?.brainSession;
+    const brainSession = rawBrainCandidate
+      && rawBrainCandidate.trim()
+      && rawBrainCandidate.trim() !== execId
+      && rawBrainCandidate.trim() !== audId
+      ? rawBrainCandidate.trim()
+      : '';
     const createdAt = Number.isFinite(Number(payload.createdAt))
       ? Number(payload.createdAt)
       : (Number.isFinite(row.startedAt) ? row.startedAt : row.updatedAt);
@@ -602,14 +642,14 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     const lastAudit = normalizeGlobalTaskAuditSummary(payload.lastAudit);
     const projectName = typeof payload.projectName === 'string' && payload.projectName.trim()
       ? payload.projectName.trim()
-      : '';
+      : (matchedGlobalTask?.projectName ?? '');
     const taskRow: GlobalTaskSummaryRow = {
       serverId,
-      serverName: serverId,
-      serverOnline: true,
+      serverName: matchedGlobalTask?.serverName || matchedGlobalServer?.name || serverId,
+      serverOnline: matchedGlobalTask?.serverOnline ?? matchedGlobalServer?.online ?? true,
       projectName,
       brainSession,
-      brainLabel: '',
+      brainLabel: matchedGlobalTask?.brainLabel ?? '',
       taskId: taskIdStr,
       title,
       status: taskStatus,
@@ -905,7 +945,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       }}
       onConfirm={() => void handleConfirmCloseTask()}
     />
-    {auditModalTarget && auditModalTarget.serverId === serverId && (() => {
+    {visible && !collapsed && hasRows && auditModalTarget && auditModalTarget.serverId === serverId && (() => {
       const liveRow = allRows.find((r) => String(r.payload.taskId) === auditModalTarget.taskId);
       const ctx = (liveRow ? buildAuditModalContext(liveRow) : null) ?? auditModalTarget.fallback;
       return (
@@ -916,12 +956,16 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           executorDisplay={ctx.executorDisplay}
           auditorDisplay={ctx.auditorDisplay}
           onClose={() => setAuditModalTarget(null)}
-          onJumpToSession={(_srvId, targetSession) => {
+          onJumpToSession={(srvId, targetSession) => {
             setAuditModalTarget(null);
+            if (!targetSession.trim()) return;
             if (isFullscreen) persistCollapsed(true);
-            if (targetSession) {
-              window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: targetSession } }));
-            }
+            window.dispatchEvent(new CustomEvent('deck:navigate', {
+              detail: {
+                ...(srvId ? { serverId: srvId } : {}),
+                session: targetSession,
+              },
+            }));
           }}
         />
       );

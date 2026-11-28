@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { TaskPairStatusPanel } from '../../src/components/TaskPairStatusPanel.js';
 import { clearGlobalTaskBriefCache } from '../../src/components/GlobalTaskBriefModal.js';
+import { globalTaskModeStore } from '../../src/global-task-mode-store.js';
 import { mergeTaskPairTimelinePayload } from '../../src/task-pair-panel-order.js';
 
 vi.mock('react-i18next', () => ({
@@ -45,6 +46,7 @@ function ensureExpanded(container: HTMLElement) {
 
 beforeEach(() => {
   clearGlobalTaskBriefCache();
+  globalTaskModeStore.setState({ tasks: [], servers: [], brains: [], latestBrainTexts: {} });
   window.localStorage.clear();
   delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
 });
@@ -52,6 +54,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearGlobalTaskBriefCache();
+  globalTaskModeStore.setState({ tasks: [], servers: [], brains: [], latestBrainTexts: {} });
   window.localStorage.clear();
   delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
   globalThis.fetch = originalFetch;
@@ -293,7 +296,7 @@ describe('TaskPairStatusPanel audit strip & compact model display', () => {
     };
 
     const navigate = vi.fn();
-    const onNavigate = (e: Event) => navigate((e as CustomEvent).detail.session);
+    const onNavigate = (e: Event) => navigate((e as CustomEvent).detail);
     window.addEventListener('deck:navigate', onNavigate);
     try {
       const view = render(<TaskPairStatusPanel events={[]} serverId="srv-1" />);
@@ -309,9 +312,9 @@ describe('TaskPairStatusPanel audit strip & compact model display', () => {
       expect(screen.getByTestId('global-task-audit-finding-1').textContent).toContain('Missing modal test');
       expect(fetchMock).toHaveBeenCalledTimes(1);
 
-      // Open session closes modal and dispatches deck:navigate to brainSession
+      // Open session closes modal and dispatches deck:navigate with serverId + brainSession
       fireEvent.click(screen.getByTestId('global-task-brief-open-session'));
-      expect(navigate).toHaveBeenCalledWith('deck_proj_brain');
+      expect(navigate).toHaveBeenCalledWith({ serverId: 'srv-1', session: 'deck_proj_brain' });
       expect(screen.queryByTestId('global-task-brief-hud')).toBeNull();
 
       // Re-open and switch serverId -> modal closes cleanly
@@ -431,6 +434,252 @@ describe('TaskPairStatusPanel audit strip & compact model display', () => {
     expect(edgeUnassigned).toHaveLength(2);
     for (const el of edgeUnassigned) {
       expect(el.textContent).toBe('taskPair.panel_unassigned');
+    }
+  });
+
+  it('closes audit modal, aborts in-flight brief fetch, and keeps modal closed on collapse, hide (visible=false), and scope changes', async () => {
+    const signals: AbortSignal[] = [];
+    globalThis.fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal) signals.push(init.signal);
+      return new Promise<Response>(() => {
+        // intentionally pending so abort can be verified directly
+      });
+    }) as typeof fetch;
+
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      serverId: 'srv-1',
+      tasks: [
+        {
+          taskId: 'tsk_lifecycle_modal',
+          title: 'Modal lifecycle check',
+          updatedAt: 5000,
+          pair: {
+            status: 'rework',
+            round: 2,
+            brain: 'deck_proj_brain',
+            executor: 'deck_sub_exec',
+            auditor: 'deck_sub_aud',
+            lastAudit: {
+              verb: 'REWORK',
+              round: 2,
+              counts: { p0: 1, p1: 0, p2: 0, p3: 0, p4: 0 },
+              blocking: ['P0'],
+              blockingCount: 1,
+              findingsCount: 1,
+              summary: 'Lifecycle P0.',
+            },
+          },
+        },
+      ],
+    };
+
+    const view = render(<TaskPairStatusPanel events={[]} serverId="srv-1" visible scopeSessionId="deck_sub_exec" />);
+    ensureExpanded(view.container);
+
+    // 1. Open -> collapse -> modal removed immediately, fetch aborted -> re-expand -> modal remains closed
+    fireEvent.click(screen.getByTestId('task-pair-panel-audit-strip-tsk_lifecycle_modal'));
+    await screen.findByTestId('global-task-brief-hud');
+    expect(signals).toHaveLength(1);
+    expect(signals[0]!.aborted).toBe(false);
+
+    fireEvent.click(view.container.querySelector<HTMLButtonElement>('.task-pair-status-toggle')!);
+    expect(view.container.querySelector<HTMLButtonElement>('.task-pair-status-toggle')!.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByTestId('global-task-brief-hud')).toBeNull();
+    expect(signals[0]!.aborted).toBe(true);
+
+    // Re-expand -> modal stays closed
+    fireEvent.click(view.container.querySelector('.task-pair-status-toggle')!);
+    expect(screen.queryByTestId('global-task-brief-hud')).toBeNull();
+
+    // 2. Open -> visible=false -> modal removed immediately, fetch aborted -> visible=true -> modal stays closed
+    fireEvent.click(screen.getByTestId('task-pair-panel-audit-strip-tsk_lifecycle_modal'));
+    await screen.findByTestId('global-task-brief-hud');
+    expect(signals).toHaveLength(2);
+    expect(signals[1]!.aborted).toBe(false);
+
+    await act(async () => {
+      view.rerender(<TaskPairStatusPanel events={[]} serverId="srv-1" visible={false} scopeSessionId="deck_sub_exec" />);
+    });
+    expect(screen.queryByTestId('global-task-brief-hud')).toBeNull();
+    expect(signals[1]!.aborted).toBe(true);
+
+    await act(async () => {
+      view.rerender(<TaskPairStatusPanel events={[]} serverId="srv-1" visible scopeSessionId="deck_sub_exec" />);
+    });
+    expect(screen.queryByTestId('global-task-brief-hud')).toBeNull();
+
+    // 3. Open -> scopeSessionId changes -> modal closes cleanly
+    fireEvent.click(screen.getByTestId('task-pair-panel-audit-strip-tsk_lifecycle_modal'));
+    await screen.findByTestId('global-task-brief-hud');
+    await act(async () => {
+      view.rerender(<TaskPairStatusPanel events={[]} serverId="srv-1" visible scopeSessionId="deck_sub_aud" />);
+    });
+    expect(screen.queryByTestId('global-task-brief-hud')).toBeNull();
+  });
+
+  it('never falls back to executor or scopeSessionId on daemon timeline-only REWORK events; hides Open session when Brain is unknown and resolves trusted Brain when available', async () => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const taskId = url.includes('tsk_no_brain') ? 'tsk_no_brain' : 'tsk_with_brain_event';
+      return new Response(JSON.stringify({
+        ok: true,
+        taskId,
+        brief: '- [x][ ] 1. Verify timeline brain target',
+        briefRevision: 'rev-tl',
+        checklist: { total: 1, implemented: 1, audited: 0 },
+        lastAudit: {
+          verb: 'REWORK',
+          round: 1,
+          counts: { p0: 1, p1: 0, p2: 0, p3: 0, p4: 0 },
+          blocking: ['P0'],
+          blockingCount: 1,
+          findingsCount: 1,
+          summary: 'Timeline-only audit summary.',
+          findings: [
+            { index: 1, severity: 'P0', blocking: true, summary: 'Real timeline defect' },
+          ],
+        },
+        updatedAt: 5000,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as typeof fetch;
+
+    const navigate = vi.fn();
+    const onNavigate = (e: Event) => navigate((e as CustomEvent).detail);
+    window.addEventListener('deck:navigate', onNavigate);
+    try {
+      // Case A: Real daemon timeline-only auditor REWORK event (no brain field, no brain writer, no snapshot/global task)
+      // Rendered inside scoped auditor view (`scopeSessionId="deck_sub_aud"`) -> must NOT jump to deck_sub_exec or deck_sub_aud!
+      const auditorOnlyEvents = [
+        {
+          eventId: 'ev-aud-rework',
+          type: 'task_pair.event',
+          ts: 2000,
+          payload: {
+            taskId: 'tsk_no_brain',
+            title: 'Timeline only rework',
+            verb: 'REWORK',
+            writer: 'deck_sub_aud',
+            role: 'auditor',
+            source: 'marker',
+            effect: 'rework',
+            toStatus: 'rework',
+            round: 1,
+            executor: 'deck_sub_exec',
+            auditor: 'deck_sub_aud',
+            lastAudit: {
+              verb: 'REWORK',
+              round: 1,
+              counts: { p0: 1, p1: 0, p2: 0, p3: 0, p4: 0 },
+              blocking: ['P0'],
+              blockingCount: 1,
+              findingsCount: 1,
+              summary: 'Timeline-only audit summary.',
+            },
+          },
+        },
+      ] as never;
+
+      const view = render(<TaskPairStatusPanel events={auditorOnlyEvents} serverId="srv-1" scopeSessionId="deck_sub_aud" />);
+      ensureExpanded(view.container);
+
+      fireEvent.click(screen.getByTestId('task-pair-panel-audit-strip-tsk_no_brain'));
+      await waitFor(() => {
+        expect(screen.getByTestId('global-task-audit-finding-1')).toBeTruthy();
+      });
+      // Details remain readable, while Open session button is hidden rather than targeting executor/auditor
+      expect(screen.queryByTestId('global-task-brief-open-session')).toBeNull();
+      expect(navigate).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByTestId('global-task-brief-hud-close'));
+      expect(screen.queryByTestId('global-task-brief-hud')).toBeNull();
+
+      // Case B: Matching globalTaskModeStore entry provides trusted Brain even on single auditor REWORK event
+      globalTaskModeStore.setState({
+        servers: [{ id: 'srv-1', name: 'M3-Node', online: true }],
+        tasks: [
+          {
+            serverId: 'srv-1',
+            serverName: 'M3-Node',
+            serverOnline: true,
+            projectName: 'imcodes',
+            brainSession: 'deck_store_brain',
+            brainLabel: 'Main',
+            taskId: 'tsk_no_brain',
+            title: 'Timeline only rework',
+            status: 'rework',
+            flags: [],
+            round: 1,
+            checklist: { total: 1, implemented: 1, audited: 0 },
+            createdAt: 1000,
+            updatedAt: 2000,
+            isTerminal: false,
+            needsAttention: false,
+          },
+        ],
+      });
+
+      fireEvent.click(screen.getByTestId('task-pair-panel-audit-strip-tsk_no_brain'));
+      const jumpFromStore = await screen.findByTestId('global-task-brief-open-session');
+      fireEvent.click(jumpFromStore);
+      expect(navigate).toHaveBeenLastCalledWith({ serverId: 'srv-1', session: 'deck_store_brain' });
+
+      // Case C: Timeline history includes an earlier role='brain' event (no globalTaskModeStore, no snapshot)
+      globalTaskModeStore.setState({ tasks: [], servers: [] });
+      const timelineWithBrainWriter = [
+        {
+          eventId: 'ev-brain-dispatch',
+          type: 'task_pair.event',
+          ts: 1000,
+          payload: {
+            taskId: 'tsk_with_brain_event',
+            title: 'Timeline with brain event',
+            verb: 'DISPATCH',
+            writer: 'deck_timeline_brain',
+            role: 'brain',
+            source: 'mcp',
+            effect: 'dispatched',
+            toStatus: 'working',
+            executor: 'deck_sub_exec',
+            auditor: 'deck_sub_aud',
+          },
+        },
+        {
+          eventId: 'ev-aud-rework-2',
+          type: 'task_pair.event',
+          ts: 2000,
+          payload: {
+            taskId: 'tsk_with_brain_event',
+            title: 'Timeline with brain event',
+            verb: 'REWORK',
+            writer: 'deck_sub_aud',
+            role: 'auditor',
+            source: 'marker',
+            effect: 'rework',
+            toStatus: 'rework',
+            round: 1,
+            executor: 'deck_sub_exec',
+            auditor: 'deck_sub_aud',
+            lastAudit: {
+              verb: 'REWORK',
+              round: 1,
+              counts: { p0: 1, p1: 0, p2: 0, p3: 0, p4: 0 },
+              blocking: ['P0'],
+              blockingCount: 1,
+              findingsCount: 1,
+              summary: 'Timeline-only audit summary.',
+            },
+          },
+        },
+      ] as never;
+
+      view.rerender(<TaskPairStatusPanel events={timelineWithBrainWriter} serverId="srv-1" scopeSessionId="deck_sub_aud" />);
+      ensureExpanded(view.container);
+      fireEvent.click(screen.getByTestId('task-pair-panel-audit-strip-tsk_with_brain_event'));
+      const jumpFromTimeline = await screen.findByTestId('global-task-brief-open-session');
+      fireEvent.click(jumpFromTimeline);
+      expect(navigate).toHaveBeenLastCalledWith({ serverId: 'srv-1', session: 'deck_timeline_brain' });
+    } finally {
+      window.removeEventListener('deck:navigate', onNavigate);
     }
   });
 });

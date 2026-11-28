@@ -240,6 +240,37 @@ export function isTaskPairSplittable(payload: Record<string, unknown>): boolean 
     && payload.auditor !== 'none';
 }
 
+const NON_SESSION_BRAIN_WRITERS = new Set(['daemon', 'system', 'unknown', 'none', '__none__']);
+
+function isTrustedBrainSessionCandidate(
+  value: unknown,
+  excluded?: readonly unknown[],
+): value is string {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  if (!trimmed || NON_SESSION_BRAIN_WRITERS.has(trimmed.toLowerCase())) return false;
+  if (excluded) {
+    for (const entry of excluded) {
+      if (typeof entry === 'string' && entry.trim() === trimmed) return false;
+    }
+  }
+  return true;
+}
+
+export function resolveTimelinePayloadBrain(
+  payload: Record<string, unknown> | undefined,
+): string | undefined {
+  if (!payload) return undefined;
+  const excluded = [payload.executor, payload.auditor];
+  if (isTrustedBrainSessionCandidate(payload.brain, excluded)) {
+    return payload.brain.trim();
+  }
+  if (payload.role === 'brain' && isTrustedBrainSessionCandidate(payload.writer, excluded)) {
+    return payload.writer.trim();
+  }
+  return undefined;
+}
+
 export function mergeTaskPairTimelinePayload(
   oldPayload: Record<string, unknown> | undefined,
   nextPayload: Record<string, unknown>,
@@ -248,16 +279,20 @@ export function mergeTaskPairTimelinePayload(
   const preservedAudit = !hasNextAudit && oldPayload && oldPayload.lastAudit != null
     ? { lastAudit: oldPayload.lastAudit }
     : {};
+  const resolvedBrain = resolveTimelinePayloadBrain(nextPayload) ?? resolveTimelinePayloadBrain(oldPayload);
+  const preservedBrain = resolvedBrain && !isTrustedBrainSessionCandidate(nextPayload.brain, [nextPayload.executor, nextPayload.auditor])
+    ? { brain: resolvedBrain }
+    : {};
   if (isValidTaskPairStatus(nextPayload.toStatus)) {
-    return Object.keys(preservedAudit).length > 0
-      ? { ...preservedAudit, ...nextPayload }
+    return Object.keys(preservedAudit).length > 0 || Object.keys(preservedBrain).length > 0
+      ? { ...preservedAudit, ...nextPayload, ...preservedBrain }
       : nextPayload;
   }
   if (oldPayload && isValidTaskPairStatus(oldPayload.toStatus)) {
-    return { ...preservedAudit, ...nextPayload, toStatus: oldPayload.toStatus };
+    return { ...preservedAudit, ...nextPayload, ...preservedBrain, toStatus: oldPayload.toStatus };
   }
-  return Object.keys(preservedAudit).length > 0
-    ? { ...preservedAudit, ...nextPayload }
+  return Object.keys(preservedAudit).length > 0 || Object.keys(preservedBrain).length > 0
+    ? { ...preservedAudit, ...nextPayload, ...preservedBrain }
     : nextPayload;
 }
 
