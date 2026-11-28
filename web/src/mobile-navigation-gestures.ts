@@ -900,16 +900,15 @@ export class TwoFingerSwipeTracker {
         this.enterStopPhase('locked_out', event);
         return;
       }
-      if (isSwipeBackEdgeTouch(first.target ?? event.target, first.clientX)) {
-        this.enterStopPhase('locked_out', event);
-        return;
-      }
       this.pendingTouchId = first.identifier;
       this.pendingStartPoint = { x: first.clientX, y: first.clientY };
       this.pendingLastPoint = { x: first.clientX, y: first.clientY };
       this.longPressAnchor = null;
       this.pendingTarget = first.target ?? event.target ?? null;
-      this.pendingDirectHorizontalEligible = canStartDirectHorizontalChatSwipe(this.pendingTarget);
+      this.pendingDirectHorizontalEligible = (
+        canStartDirectHorizontalChatSwipe(this.pendingTarget)
+        && !isSwipeBackEdgeTouch(this.pendingTarget, first.clientX)
+      );
       this.phase = 'long_press_pending';
       this.longPressTimer = this.setTimer(() => {
         this.longPressTimer = null;

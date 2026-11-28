@@ -26,7 +26,10 @@ vi.mock('../src/screen-awake.js', () => ({
 }));
 
 import { useSwipeBack } from '../src/hooks/useSwipeBack.js';
-import { attachMobileNavigationGestures } from '../src/mobile-navigation-gestures.js';
+import {
+  attachMobileNavigationGestures,
+  MOBILE_LONG_PRESS_MS,
+} from '../src/mobile-navigation-gestures.js';
 
 function TestSwipeBackSurface({ onBack, withChatChild = false }: { onBack?: (() => void) | null; withChatChild?: boolean }) {
   const ref = useSwipeBack(onBack);
@@ -195,7 +198,7 @@ describe('useSwipeBack haptics and edge lifecycle', () => {
     const detach = attachMobileNavigationGestures({
       isMobile: true,
       viewportWidth: 390,
-      getAvailableSteps: () => 1,
+      getAvailableSteps: () => 2,
       onAction,
     });
 
@@ -216,20 +219,50 @@ describe('useSwipeBack haptics and edge lifecycle', () => {
         [{ style: 'success' }],
       ]);
 
-      // 2) Same nested chat bubble starting outside left edge (x=100 -> 240): global direct horizontal swipe handles tabPrev
+      // 2) Left-edge long-press + vertical drag (x=12, y=300 -> hold -> x=12, y=220) triggers ONLY global serverPrev
+      streamingApi.performHaptic.mockClear();
+      dispatchTouch(bubble, 'touchstart', [{ identifier: 13, clientX: 12, clientY: 300 }]);
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      dispatchTouch(bubble, 'touchmove', [{ identifier: 13, clientX: 12, clientY: 220 }]);
+      dispatchTouch(bubble, 'touchend', [], [{ identifier: 13, clientX: 12, clientY: 220 }]);
+      expect(onBack).toHaveBeenCalledTimes(1);
+      expect(onAction).toHaveBeenCalledTimes(1);
+      expect(onAction).toHaveBeenLastCalledWith('serverPrev', 1);
+      expect(streamingApi.performHaptic.mock.calls).toEqual([
+        [{ style: 'medium' }],
+        [{ style: 'success' }],
+      ]);
+
+      // 3) Left-edge long-press + horizontal right drag (x=12, y=300 -> hold -> x=142, y=300) has ONLY global HUD owner (tabNext, not back)
+      streamingApi.performHaptic.mockClear();
+      dispatchTouch(bubble, 'touchstart', [{ identifier: 14, clientX: 12, clientY: 300 }]);
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      dispatchTouch(bubble, 'touchmove', [{ identifier: 14, clientX: 80, clientY: 300 }]); // step 1 -> medium
+      dispatchTouch(bubble, 'touchmove', [{ identifier: 14, clientX: 142, clientY: 300 }]); // step 2 -> selection
+      dispatchTouch(bubble, 'touchend', [], [{ identifier: 14, clientX: 142, clientY: 300 }]);
+      expect(onBack).toHaveBeenCalledTimes(1);
+      expect(onAction).toHaveBeenCalledTimes(2);
+      expect(onAction).toHaveBeenLastCalledWith('tabNext', 2);
+      expect(streamingApi.performHaptic.mock.calls).toEqual([
+        [{ style: 'medium' }],
+        [{ style: 'selection' }],
+        [{ style: 'success' }],
+      ]);
+
+      // 4) Same nested chat bubble starting outside left edge (x=100 -> 240): global direct horizontal swipe handles tabPrev
       streamingApi.performHaptic.mockClear();
       dispatchTouch(bubble, 'touchstart', [{ identifier: 11, clientX: 100, clientY: 200 }]);
       dispatchTouch(bubble, 'touchmove', [{ identifier: 11, clientX: 240, clientY: 200 }]);
       dispatchTouch(bubble, 'touchend', [], [{ identifier: 11, clientX: 240, clientY: 200 }]);
       expect(onBack).toHaveBeenCalledTimes(1);
-      expect(onAction).toHaveBeenCalledTimes(1);
+      expect(onAction).toHaveBeenCalledTimes(3);
       expect(onAction).toHaveBeenLastCalledWith('tabPrev', 1);
       expect(streamingApi.performHaptic.mock.calls).toEqual([
         [{ style: 'medium' }],
         [{ style: 'success' }],
       ]);
 
-      // 3) Non-native Web surface (Capacitor.isNativePlatform() === false): no data-swipe-back-surface attribute, left-edge x=12 -> 142 triggers tabPrev
+      // 5) Non-native Web surface (Capacitor.isNativePlatform() === false): no data-swipe-back-surface attribute, left-edge x=12 -> 142 triggers tabPrev
       streamingApi.performHaptic.mockClear();
       const vibrate = vi.fn(() => true);
       Object.defineProperty(navigator, 'vibrate', { configurable: true, value: vibrate });
@@ -246,7 +279,7 @@ describe('useSwipeBack haptics and edge lifecycle', () => {
       dispatchTouch(webBubble, 'touchmove', [{ identifier: 12, clientX: 142, clientY: 200 }]);
       dispatchTouch(webBubble, 'touchend', [], [{ identifier: 12, clientX: 142, clientY: 200 }]);
       expect(onBack).toHaveBeenCalledTimes(1);
-      expect(onAction).toHaveBeenCalledTimes(2);
+      expect(onAction).toHaveBeenCalledTimes(4);
       expect(onAction).toHaveBeenLastCalledWith('tabPrev', 1);
       expect(vibrate.mock.calls).toEqual([[16], [18]]);
     } finally {

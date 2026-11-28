@@ -5,6 +5,7 @@
 import { useEffect, useRef } from 'preact/hooks';
 import type { RefObject } from 'preact';
 import {
+  isMobileNavigationGestureActive,
   SWIPE_BACK_EDGE_THRESHOLD_PX,
   SWIPE_BACK_SURFACE_ATTR,
 } from '../mobile-navigation-gestures.js';
@@ -154,6 +155,10 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
     }
 
     const onTouchStart = (e: TouchEvent) => {
+      if (e.defaultPrevented || isMobileNavigationGestureActive(el.ownerDocument)) {
+        cancelTracking();
+        return;
+      }
       if (e.touches.length !== 1) {
         cancelTracking();
         return;
@@ -173,6 +178,10 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
 
     const onTouchMove = (e: TouchEvent) => {
       if (!tracking) return;
+      if (e.defaultPrevented || isMobileNavigationGestureActive(el.ownerDocument)) {
+        cancelTracking();
+        return;
+      }
       if (e.touches.length !== 1) {
         cancelTracking();
         return;
@@ -193,6 +202,10 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
 
     const onTouchEnd = (e: TouchEvent) => {
       if (!tracking) return;
+      if (e.defaultPrevented || isMobileNavigationGestureActive(el.ownerDocument)) {
+        cancelTracking();
+        return;
+      }
       if (e.touches.length > 0) {
         cancelTracking();
         return;
