@@ -3502,7 +3502,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         agentType: agentType as AgentType,
         projectDir: dir,
         fresh: true,
-        ...((agentType === 'deepseek-harness' || agentType === 'pi') && ccPresetName ? { ccPreset: ccPresetName } : {}),
+        ...((agentType === 'deepseek-harness' || agentType === 'pi' || agentType === 'kimi-sdk') && ccPresetName ? { ccPreset: ccPresetName } : {}),
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
@@ -3777,6 +3777,12 @@ async function resolveValidatedModelList(record: SessionRecord): Promise<{ model
       const agyModels = await getProvider(AGY_SDK_PROVIDER_ID)?.listModels?.().catch(() => ({ models: [] }));
       return { models: agyModels?.models.map((model) => model.id) ?? [] };
     }
+    case 'kimi-sdk': {
+      if (!record.ccPreset) return null;
+      const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
+      const preset = await getPreset(record.ccPreset);
+      return { models: preset ? getPresetAvailableModelIds(preset) : [] };
+    }
     default:
       return null;
   }
@@ -3963,12 +3969,12 @@ async function applyTransportModelSwitch(
     }
     contextWindow = resolveContextWindow(undefined, requestedModel);
   } else if (isGenericModelSwitchAgent(agentType)) {
-    if (agentType === 'grok-sdk') {
+    if (agentType === 'grok-sdk' || (agentType === 'kimi-sdk' && Boolean(record.ccPreset))) {
       const availableModels = validated?.models ?? [];
       if (!availableModels.includes(requestedModel)) {
         return refuse(
           SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
-          `Unknown Grok model: ${requestedModel}`,
+          agentType === 'grok-sdk' ? `Unknown Grok model: ${requestedModel}` : `Unknown Kimi preset model: ${requestedModel}`,
           DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
           availableModels,
         );
@@ -3982,7 +3988,7 @@ async function applyTransportModelSwitch(
       modelDisplay: requestedModel,
       updatedAt: Date.now(),
     };
-    contextWindow = resolveContextWindow(undefined, requestedModel);
+    contextWindow = resolveContextWindow(agentType === 'kimi-sdk' ? record.presetContextWindow : undefined, requestedModel);
   } else {
     return {
       ok: false,

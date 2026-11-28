@@ -2149,6 +2149,24 @@ describe('handleWebCommand transport queue behavior', () => {
     })));
   });
 
+  it('forwards ccPreset when starting a kimi-sdk main session', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'transport',
+      dir: sessionWorkingTempDir!,
+      agentType: 'kimi-sdk',
+      ccPreset: 'glm5.3',
+      requestedModel: 'glm-5.3-flash',
+    }, serverLink as any);
+    await vi.waitFor(() => expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'kimi-sdk',
+      ccPreset: 'glm5.3',
+      requestedModel: 'glm-5.3-flash',
+      fresh: true,
+    })));
+  });
+
   it('starts a fresh grok-sdk main session with the requested model', async () => {
     handleWebCommand({
       type: 'session.start',
@@ -6954,6 +6972,48 @@ describe('handleWebCommand transport queue behavior', () => {
       requestedModel: 'moonshot-v1-auto,thinking',
       activeModel: 'moonshot-v1-auto,thinking',
       modelDisplay: 'moonshot-v1-auto,thinking',
+    }));
+  });
+
+  it('validates /model against preset catalog for kimi-sdk preset sessions', async () => {
+    const setAgentId = vi.fn();
+    getPresetMock.mockResolvedValue({
+      name: 'glm5.3',
+      env: {},
+      contextWindow: 1_000_000,
+      availableModels: [{ id: 'glm-5.3-flash' }, { id: 'glm-5.3' }],
+      defaultModel: 'glm-5.3[1m]',
+    });
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'kimi-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      ccPreset: 'glm5.3',
+      presetContextWindow: 1_000_000,
+      requestedModel: 'glm-5.3-flash',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'provider-route-1',
+      setAgentId,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: '/model glm-5.3',
+      commandId: 'cmd-model-kimi-preset',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(getPresetMock).toHaveBeenCalledWith('glm5.3');
+    expect(setAgentId).toHaveBeenCalledWith('glm-5.3');
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      requestedModel: 'glm-5.3',
+      activeModel: 'glm-5.3',
+      modelDisplay: 'glm-5.3',
     }));
   });
 

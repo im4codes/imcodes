@@ -25,6 +25,7 @@ import type { LocalAuthContext } from './local-auth-context.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
+import type { KimiLlmConfig } from '../../shared/cc-presets.js';
 import type {
   AgentDelegationActiveNotificationMode,
   AgentDelegationNotificationResult,
@@ -378,6 +379,8 @@ export interface SessionConfig extends SessionIncognitoConfig {
   llm?: DshLlmConfig;
   /** Pi coding-agent custom provider route, supplied only to the child process. */
   piLlm?: PiLlmConfig;
+  /** Kimi CLI ACP custom provider route, materialized into an isolated 0600 share config. */
+  kimiLlm?: KimiLlmConfig;
   /** Parent session key for sub-sessions. */
   parentSessionKey?: string;
   /** If binding to an already-existing remote session, use this key directly. */

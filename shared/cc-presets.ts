@@ -25,9 +25,26 @@ export const CUSTOM_PROVIDER_SDK_AGENT_TYPES: ReadonlySet<string> = new Set([
   'qwen',
   'deepseek-harness',
   'pi',
+  'kimi-sdk',
   'codex-sdk',
   'codex',
 ]);
+
+export interface KimiLlmModelConfig {
+  id: string;
+  name?: string;
+  contextWindow?: number;
+}
+
+export interface KimiLlmConfig {
+  provider: string;
+  providerType: 'anthropic' | 'openai_legacy';
+  model: string;
+  baseUrl: string;
+  apiKey?: string;
+  contextWindow?: number;
+  models: KimiLlmModelConfig[];
+}
 
 export interface CcPresetSaveResponse {
   type: typeof CC_PRESET_MSG.SAVE_RESPONSE;

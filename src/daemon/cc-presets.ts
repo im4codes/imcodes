@@ -21,6 +21,7 @@ import {
   type CcPreset,
   type CcPresetAuthType,
   type CcPresetModelInfo,
+  type KimiLlmConfig,
 } from '../../shared/cc-presets.js';
 import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
@@ -549,6 +550,75 @@ export async function getPiPresetTransportConfig(presetName: string, requestedMo
   return {
     ...rest,
     ...(piLlm ? { piLlm } : {}),
+  };
+}
+
+export async function getKimiPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
+  env: Record<string, string>;
+  kimiLlm?: KimiLlmConfig;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+}> {
+  const preset = await getPreset(presetName);
+  if (!preset) return { env: {} };
+
+  const availableModels = getPresetAvailableModelIds(preset);
+  const model = selectPresetModel(preset, requestedModel);
+  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
+  const isOpenAi = preset.authType === 'openai'
+    || Boolean(resolvedEnv['OPENAI_BASE_URL']?.trim() && !resolvedEnv['ANTHROPIC_BASE_URL']?.trim());
+  const baseUrl = isOpenAi
+    ? (resolvedEnv['OPENAI_BASE_URL']?.trim() || undefined)
+    : (resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || resolvedEnv['OPENAI_BASE_URL']?.trim() || undefined);
+  const apiKey = isOpenAi
+    ? (
+        resolvedEnv['OPENAI_API_KEY']?.trim()
+        || resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+        || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+        || undefined
+      )
+    : (
+        resolvedEnv['ANTHROPIC_API_KEY']?.trim()
+        || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
+        || resolvedEnv['OPENAI_API_KEY']?.trim()
+        || undefined
+      );
+
+  const modelIds = [...new Set([...(model ? [model] : []), ...availableModels])];
+  const kimiLlm: KimiLlmConfig | undefined = (model && baseUrl)
+    ? {
+        provider: normalizeCcPresetName(preset.name),
+        providerType: isOpenAi ? 'openai_legacy' : 'anthropic',
+        model,
+        baseUrl,
+        ...(apiKey ? { apiKey } : {}),
+        ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+        models: modelIds.map((id) => ({
+          id,
+          name: preset.availableModels?.find((item) => item.id === id)?.name?.trim() || id,
+          ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+        })),
+      }
+    : undefined;
+
+  const runtimeFacts = (model || baseUrl) ? [
+    `Authoritative runtime fact: this Kimi session is routed through the "${preset.name}" API provider preset.`,
+    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
+    model ? `Authoritative runtime model: ${model}.` : undefined,
+    model ? `If the user asks which model you are using, answer exactly with "${model}".` : undefined,
+    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
+    'These runtime facts override any generic default model or provider identity.',
+  ].filter(Boolean).join(' ') : undefined;
+
+  return {
+    env: model ? (isOpenAi ? { OPENAI_MODEL: model } : { ANTHROPIC_MODEL: model }) : {},
+    ...(kimiLlm ? { kimiLlm } : {}),
+    ...(model ? { model } : {}),
+    ...(availableModels.length ? { availableModels } : {}),
+    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
+    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
   };
 }
 

@@ -281,6 +281,66 @@ describe('cc presets', () => {
     expect(result.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
   });
 
+  it('builds Kimi preset transport config for Anthropic and OpenAI presets without leaking secrets in env', async () => {
+    const { savePresets, getKimiPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    const anthropicRes = await getKimiPresetTransportConfig('MiniMax', 'MiniMax-M2.7');
+    expect(anthropicRes).toMatchObject({
+      env: { ANTHROPIC_MODEL: 'MiniMax-M2.7' },
+      model: 'MiniMax-M2.7',
+      contextWindow: 200_000,
+      kimiLlm: {
+        provider: 'minimax',
+        providerType: 'anthropic',
+        model: 'MiniMax-M2.7',
+        baseUrl: 'https://api.minimax.io/anthropic',
+        apiKey: 'test-token',
+        contextWindow: 200_000,
+      },
+    });
+    expect(anthropicRes?.kimiLlm.models).toEqual([
+      expect.objectContaining({ id: 'MiniMax-M2.7', contextWindow: 200_000 }),
+    ]);
+    expect(anthropicRes?.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(anthropicRes?.env).not.toHaveProperty('ANTHROPIC_AUTH_TOKEN');
+    expect(anthropicRes?.env).not.toHaveProperty('KIMI_API_KEY');
+
+    await savePresets([
+      {
+        name: 'GLM-OpenAI',
+        env: {
+          OPENAI_BASE_URL: 'https://open.bigmodel.cn/api/paas/v4',
+          OPENAI_API_KEY: 'oa-secret-123',
+          OPENAI_MODEL: 'glm-5.3',
+        },
+        authType: 'openai',
+        defaultModel: 'glm-5.3',
+        contextWindow: 1_000_000,
+        availableModels: [
+          { id: 'glm-5.3-flash', label: 'GLM-5.3-Flash' },
+          { id: 'glm-5.3', label: 'GLM-5.3' },
+        ],
+      },
+    ]);
+
+    const openaiRes = await getKimiPresetTransportConfig('GLM-OpenAI', 'glm-5.3-flash');
+    expect(openaiRes).toMatchObject({
+      model: 'glm-5.3-flash',
+      contextWindow: 1_000_000,
+      kimiLlm: {
+        provider: 'glm-openai',
+        providerType: 'openai_legacy',
+        model: 'glm-5.3-flash',
+        baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+        apiKey: 'oa-secret-123',
+        contextWindow: 1_000_000,
+      },
+    });
+    expect(openaiRes?.kimiLlm.models.map((m) => m.id)).toEqual(['glm-5.3-flash', 'glm-5.3']);
+    expect(openaiRes?.env).not.toHaveProperty('OPENAI_API_KEY');
+    expect(openaiRes?.env).not.toHaveProperty('KIMI_API_KEY');
+  });
+
   it('clamps a previous provider model to the newly selected preset catalogue', async () => {
     const { selectPresetModel } = await import('../../src/daemon/cc-presets.js');
     const nextPreset = {

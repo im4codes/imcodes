@@ -127,7 +127,7 @@ export function buildTransportResumeLaunchOpts(record: SessionRecord): LaunchOpt
     requestedModel: record.requestedModel,
     effort: record.effort,
     transportConfig: record.transportConfig,
-    ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi') ? record.ccPreset : undefined,
+    ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'kimi-sdk') ? record.ccPreset : undefined,
     // Thread resume ids back so the provider reuses the same conversation.
     ...(isClaudeCodeSdkAgentType(record.agentType) && record.ccSessionId ? { ccSessionId: record.ccSessionId } : {}),
     ...(record.agentType === 'codex-sdk' && record.codexSessionId ? { codexSessionId: record.codexSessionId } : {}),

@@ -1873,4 +1873,128 @@ describe('KimiV2Provider', () => {
       rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('isolates CC Preset credentials in 0o700/0o600 KIMI_SHARE_DIR, preserves non-preset spawns, recycles on preset change, and cleans up on disconnect', async () => {
+    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-preset-')));
+    let capturedShareDir: string | undefined;
+    let capturedToml = '';
+    try {
+      const provider = new KimiV2Provider();
+
+      // 1) Non-preset default spawn leaves KIMI_SHARE_DIR unset when inherited env lacks it
+      const origShareEnv = process.env.KIMI_SHARE_DIR;
+      delete process.env.KIMI_SHARE_DIR;
+      try {
+        await provider.connect({});
+        await provider.createSession({ sessionKey: 'sess-default', cwd: tmpDir });
+        const defaultCall = mockSpawn.mock.calls[0]!;
+        const defaultArgs = defaultCall[1] as string[];
+        const defaultOpts = defaultCall[2] as { env: NodeJS.ProcessEnv };
+        expect(defaultArgs).toEqual(['acp']);
+        expect(defaultOpts.env.KIMI_SHARE_DIR).toBeUndefined();
+
+        // 2) Switching to an Anthropic preset recycles child process with 0o700 KIMI_SHARE_DIR + 0o600 config.toml
+        state.conn = makeMockConn({
+          newSession: vi.fn(async () => ({
+            sessionId: 'kimi-sess-1',
+            models: {
+              availableModels: [
+                { modelId: 'glm-5.3-flash', name: 'GLM-5.3-Flash' },
+                { modelId: 'glm-5.3', name: 'GLM-5.3' },
+              ],
+              currentModelId: 'glm-5.3-flash',
+            },
+          })),
+        });
+        await provider.createSession({
+          sessionKey: 'sess-preset-anth',
+          cwd: tmpDir,
+          agentId: 'glm-5.3-flash',
+          kimiLlm: {
+            provider: 'glm5.3',
+            providerType: 'anthropic',
+            baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+            apiKey: 'secret-preset-key-anth',
+            model: 'glm-5.3-flash',
+            contextWindow: 1_000_000,
+            models: [
+              { id: 'glm-5.3-flash', label: 'GLM-5.3-Flash', contextWindow: 1_000_000 },
+              { id: 'glm-5.3', label: 'GLM-5.3', contextWindow: 200_000 },
+            ],
+          },
+        });
+        expect(mockSpawn).toHaveBeenCalledTimes(2);
+        const anthCall = mockSpawn.mock.calls[1]!;
+        const anthArgs = anthCall[1] as string[];
+        const anthEnv = (anthCall[2] as { env: NodeJS.ProcessEnv }).env;
+        expect(anthArgs).toEqual(['acp']);
+        expect(JSON.stringify(anthArgs)).not.toContain('secret-preset-key-anth');
+        expect(anthEnv.KIMI_API_KEY).toBeUndefined();
+
+        capturedShareDir = anthEnv.KIMI_SHARE_DIR;
+        expect(capturedShareDir).toBeTruthy();
+        const { statSync } = await import('node:fs');
+        expect(statSync(capturedShareDir!).mode & 0o777).toBe(0o700);
+        const cfgPath = path.join(capturedShareDir!, 'config.toml');
+        expect(statSync(cfgPath).mode & 0o777).toBe(0o600);
+        capturedToml = readFileSync(cfgPath, 'utf8');
+        expect(capturedToml).toContain('type = "anthropic"');
+        expect(capturedToml).toContain('base_url = "https://open.bigmodel.cn/api/anthropic"');
+        expect(capturedToml).toContain('api_key = "secret-preset-key-anth"');
+        expect(capturedToml).toContain('telemetry = false');
+        expect(capturedToml).toContain('max_context_size = 1000000');
+
+        // usage_update without explicit contextWindow uses preset model contextWindow
+        const usages: Array<{ model?: string; usage?: { input_tokens?: number; model_context_window?: number } }> = [];
+        provider.onUsage((_, u) => usages.push(u));
+        await state.handlers!.sessionUpdate({
+          sessionId: 'kimi-sess-1',
+          update: { sessionUpdate: 'usage_update', used: 1200 } as never,
+        });
+        expect(usages.at(-1)).toMatchObject({
+          model: 'glm-5.3-flash',
+          usage: { input_tokens: 1200, model_context_window: 1_000_000 },
+        });
+
+        // listModels merges/returns preset model catalog cleanly
+        const listed = await provider.listModels(true);
+        expect(listed.models.map((m) => m.id)).toEqual(expect.arrayContaining(['glm-5.3-flash', 'glm-5.3']));
+
+        // Switching to OpenAI preset recycles again cleanly, cleans prior share dir, and writes type = "openai_legacy"
+        const prevShareDir = capturedShareDir!;
+        state.conn = makeMockConn();
+        await provider.createSession({
+          sessionKey: 'sess-preset-openai',
+          cwd: tmpDir,
+          agentId: 'gpt-compat',
+          kimiLlm: {
+            provider: 'openai-compat',
+            providerType: 'openai_legacy',
+            baseUrl: 'https://example.invalid/v1',
+            apiKey: 'secret-openai-key',
+            model: 'gpt-compat',
+            contextWindow: 128_000,
+            models: [{ id: 'gpt-compat', contextWindow: 128_000 }],
+          },
+        });
+        expect(mockSpawn).toHaveBeenCalledTimes(3);
+        const { existsSync } = await import('node:fs');
+        expect(existsSync(prevShareDir)).toBe(false);
+        const openaiEnv = (mockSpawn.mock.calls[2]![2] as { env: NodeJS.ProcessEnv }).env;
+        capturedShareDir = openaiEnv.KIMI_SHARE_DIR;
+        const openaiToml = readFileSync(path.join(capturedShareDir!, 'config.toml'), 'utf8');
+        expect(openaiToml).toContain('type = "openai_legacy"');
+        expect(openaiToml).toContain('api_key = "secret-openai-key"');
+        expect(openaiToml).toContain('max_context_size = 128000');
+
+        await provider.disconnect();
+        expect(existsSync(capturedShareDir!)).toBe(false);
+      } finally {
+        if (origShareEnv !== undefined) process.env.KIMI_SHARE_DIR = origShareEnv;
+      }
+    } finally {
+      if (capturedShareDir) rmSync(capturedShareDir, { recursive: true, force: true });
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

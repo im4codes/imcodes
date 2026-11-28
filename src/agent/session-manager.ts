@@ -103,7 +103,7 @@ import {
   isSubSessionRecord,
   unsupportedAgentTypeError,
 } from '../../shared/agent-types.js';
-import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '../../shared/cc-presets.js';
+import { CUSTOM_PROVIDER_SDK_AGENT_TYPES, type KimiLlmConfig } from '../../shared/cc-presets.js';
 import { detectLocalAuthContext, hasLocalAuthCandidate, isExplicitlyUnsupportedLocalAuthProvider, localAuthContextEnv, type LocalAuthContext } from './local-auth-context.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
@@ -1932,7 +1932,7 @@ async function recoverTransportRuntimeAfterError(
       requestedModel: record.requestedModel,
       effort: record.effort,
       transportConfig: record.transportConfig,
-      ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
+      ccPreset: (isClaudeCodeSdkAgentType(record.agentType) || record.agentType === 'qwen' || record.agentType === 'deepseek-harness' || record.agentType === 'pi' || record.agentType === 'kimi-sdk' || record.agentType === 'codex-sdk') ? record.ccPreset : undefined,
       // Qwen-compatible API providers can reject a resumed conversation when
       // their persisted tool-call chain is invalid (e.g. "tool call result
       // does not follow tool call"). Auto-recovery must rotate the provider
@@ -3456,6 +3456,7 @@ export async function restoreTransportSessions(
       let availableCodexModels: string[] | undefined;
       let dshLlmConfig: DshLlmConfig | undefined;
       let piLlmConfig: PiLlmConfig | undefined;
+      let kimiLlmConfig: KimiLlmConfig | undefined;
       const boundServerId = await loadBoundServerIdForManagedMcp();
       const capabilityOwnerId = boundServerId ? getAuthenticatedCapabilityOwner(boundServerId) : undefined;
       const resolveRuntimeContextBootstrap = (onNamespaceResolved?: (stage: TransportContextNamespaceStage) => void) => resolveTransportContextBootstrap({
@@ -3534,6 +3535,14 @@ export async function restoreTransportSessions(
         if (presetConfig.model) effectiveRequestedModel = presetConfig.model;
         restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
         if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
+      } else if (s.providerId === 'kimi-sdk' && s.ccPreset) {
+        const { getKimiPresetTransportConfig } = await import('../daemon/cc-presets.js');
+        const presetConfig = await getKimiPresetTransportConfig(s.ccPreset, effectiveRequestedModel);
+        extraEnv = { ...(extraEnv ?? {}), ...presetConfig.env };
+        kimiLlmConfig = presetConfig.kimiLlm;
+        if (presetConfig.model) effectiveRequestedModel = presetConfig.model;
+        restoredPresetContextWindow = presetConfig.contextWindow ?? restoredPresetContextWindow;
+        if (presetConfig.systemPrompt) systemPrompt = presetConfig.systemPrompt;
       }
       if (s.providerId === 'qwen'
         && !s.ccPreset
@@ -3601,6 +3610,7 @@ export async function restoreTransportSessions(
         agentId: effectiveRequestedModel,
         ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
         ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
+        ...(kimiLlmConfig ? { kimiLlm: kimiLlmConfig } : {}),
         resumeId,
         ...(!freshOnRestore && typeof s.transportConfig?.openCodeStorageOwner === 'string'
           ? { openCodeStorageOwner: s.transportConfig.openCodeStorageOwner as 'v1-cli' | 'v2-cli' | 'embedded' }
@@ -4033,6 +4043,7 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
   let transportSettings: string | Record<string, unknown> | undefined;
   let dshLlmConfig: DshLlmConfig | undefined;
   let piLlmConfig: PiLlmConfig | undefined;
+  let kimiLlmConfig: KimiLlmConfig | undefined;
   if (agentType === AGY_SDK_PROVIDER_ID && existing?.agentType === AGY_SDK_PROVIDER_ID
     && !opts.fresh && !opts.providerResumeId && !existing.providerResumeId
     && existing.agyNativeSessionState !== AGY_NATIVE_SESSION_STATE.UNSTARTED) {
@@ -4252,6 +4263,20 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     effectiveBindExistingKey = undefined;
     transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
     effectiveSkipCreate = !!transportResumeId;
+  } else if (agentType === 'kimi-sdk') {
+    if (effectiveCcPreset) {
+      const { getKimiPresetTransportConfig } = await import('../daemon/cc-presets.js');
+      const presetConfig = await getKimiPresetTransportConfig(effectiveCcPreset, requestedTransportModel);
+      transportEnv = { ...(transportEnv ?? {}), ...presetConfig.env };
+      kimiLlmConfig = presetConfig.kimiLlm;
+      if (presetConfig.model) requestedTransportModel = presetConfig.model;
+      presetContextWindow = presetConfig.contextWindow ?? presetContextWindow;
+      if (presetConfig.systemPrompt) transportSystemPrompt = presetConfig.systemPrompt;
+    }
+    effectiveSessionKey = randomUUID();
+    effectiveBindExistingKey = undefined;
+    transportResumeId = opts.incognito ? undefined : (opts.providerResumeId ?? storedProviderResumeId);
+    effectiveSkipCreate = !!transportResumeId;
   } else if (usesProviderResumeId(agentType)) {
     effectiveSessionKey = randomUUID();
     effectiveBindExistingKey = undefined;
@@ -4334,6 +4359,7 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     ...(transportSettings ? { settings: transportSettings } : {}),
     ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
     ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
+    ...(kimiLlmConfig ? { kimiLlm: kimiLlmConfig } : {}),
     contextNamespace: contextBootstrap.namespace,
     contextNamespaceDiagnostics: contextBootstrap.diagnostics,
     contextRemoteProcessedFreshness: contextBootstrap.remoteProcessedFreshness,

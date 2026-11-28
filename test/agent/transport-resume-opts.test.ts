@@ -64,8 +64,8 @@ describe('buildTransportResumeLaunchOpts', () => {
     }
   });
 
-  it('preserves third-party preset routing for DSH and Pi resumes', () => {
-    for (const agentType of ['deepseek-harness', 'pi'] as const) {
+  it('preserves third-party preset routing for DSH, Pi, and Kimi resumes', () => {
+    for (const agentType of ['deepseek-harness', 'pi', 'kimi-sdk'] as const) {
       expect(buildTransportResumeLaunchOpts(rec({ agentType, ccPreset: 'MiniMax' })))
         .toMatchObject({ ccPreset: 'MiniMax' });
     }
