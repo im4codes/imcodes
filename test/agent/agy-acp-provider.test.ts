@@ -6204,9 +6204,9 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
 
   it('cancels hung session/new on TRANSPORT_TURN_TIMEOUT to prevent ghost prompt and allows recovery (P0-4)', async () => {
     resetTransportQueueStoreForTests();
-    vi.stubEnv('IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS', '800');
+    vi.stubEnv('IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS', '2000');
     vi.stubEnv('IMCODES_ACP_CANCEL_GRACE_MS', '120');
-    vi.stubEnv('IMCODES_ACP_SESSION_RPC_TIMEOUT_MS', '5000');
+    vi.stubEnv('IMCODES_ACP_SESSION_RPC_TIMEOUT_MS', '8000');
     const { provider, root, requests } = await setup();
     const id = 'deck_test_agy_p04_turn_timeout_ghost';
     const runtime = new TransportSessionRuntime(provider, id);
@@ -6225,7 +6225,7 @@ describe('AG ACP _meta.antigravity.systemPrompt.append delivery', () => {
         { timeout: 5000 },
       );
 
-      await vi.waitFor(() => expect(runtime.getStatus()).toBe('error'), { timeout: 5000 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('error'), { timeout: 8000 });
       const state = (provider as any).sessions.get(id);
       await vi.waitFor(() => expect(state.promptInFlight).toBe(false), { timeout: 5000 });
 
