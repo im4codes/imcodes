@@ -1511,7 +1511,7 @@
     "qwen_provider_hint": "Если нужен сторонний Coding Plan, выберите Claude Code SDK.",
     "qwen_provider_selected_hint": "Выбранный SDK может использовать сторонние провайдеры Coding Plan с Anthropic-совместимым API через пресеты API Provider ниже.",
     "custom_provider_sdk": "SDK пользовательского провайдера",
-    "custom_provider_sdk_help": "Использует транспорт Claude Code SDK как слой совместимости; ниже выберите пресет API Provider.",
+    "custom_provider_sdk_help": "Использует транспорт Codex SDK как слой совместимости; ниже выберите пресет API Provider.",
     "custom_provider_preset": "Пресет пользовательского провайдера",
     "custom_provider_preset_required": "Выберите или добавьте пресет API Provider для SDK пользовательского провайдера.",
     "compatible_api_via_qwen": "Совместимый API (через Qwen)",

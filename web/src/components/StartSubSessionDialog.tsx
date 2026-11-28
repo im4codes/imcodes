@@ -8,7 +8,7 @@ import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { parseString, usePref } from '../hooks/usePref.js';
 import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
 import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, MUSE_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
-import { getSessionAgentGroups, getSessionAgentLabel, isSessionAgentTypeSelectable, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
+import { DEFAULT_CUSTOM_PROVIDER_SDK, getSessionAgentGroups, getSessionAgentLabel, isCustomProviderTransportSdk, isSessionAgentTypeSelectable, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { SdkModeRecommendation } from './SdkModeRecommendation.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
@@ -199,9 +199,32 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
     }
     return result;
   };
+  const agentGroups = getSessionAgentGroups('sub-session');
+  const allowedAgentTypeSet = useMemo(
+    () => allowedAgentTypes ? new Set(allowedAgentTypes.filter(isSessionAgentTypeSelectable)) : null,
+    [allowedAgentTypes],
+  );
+  const isTypeValidForCustomProvider = (candidate: string): boolean => (
+    isSessionAgentTypeSelectable(candidate)
+    && isCustomProviderTransportSdk(candidate)
+    && (!allowedAgentTypeSet || allowedAgentTypeSet.has(candidate))
+    && (!incognito || supportsSessionIncognito(candidate))
+  );
+  const resolveCustomProviderType = (): string | null => {
+    if (isTypeValidForCustomProvider(DEFAULT_CUSTOM_PROVIDER_SDK)) {
+      return DEFAULT_CUSTOM_PROVIDER_SDK;
+    }
+    for (const group of agentGroups) {
+      for (const choice of group.items) {
+        if (choice.hidden) continue;
+        if (isTypeValidForCustomProvider(choice.id)) return choice.id;
+      }
+    }
+    return null;
+  };
   const selectType = (nextType: string) => {
     if (!isSessionAgentTypeSelectable(nextType)) return;
-    if (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextType)) return;
+    if (customProviderSdk && !isCustomProviderTransportSdk(nextType)) return;
     if (incognito && !supportsSessionIncognito(nextType)) return;
     if (nextType !== type) {
       if (nextType === AGY_SDK_PROVIDER_ID) {
@@ -219,10 +242,13 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
     setPresetError('');
     if (enabled) {
       if (!ccPreset && ccPresets.length > 0) selectCcPreset(ccPresets[0].name);
-      if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type)) {
-        setLastUnlockedType(type);
-        setRequestedModel('');
-        setType('claude-code-sdk');
+      if (!isTypeValidForCustomProvider(type)) {
+        const nextCustom = resolveCustomProviderType();
+        if (nextCustom) {
+          setLastUnlockedType(type);
+          setRequestedModel('');
+          setType(nextCustom);
+        }
       }
       return;
     }
@@ -246,12 +272,6 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
 
   // Remote sessions come from the provider status hook (pushed on connect, cached in DB)
   const ocRemoteSessions = getRemoteSessions('openclaw');
-
-  const agentGroups = getSessionAgentGroups('sub-session');
-  const allowedAgentTypeSet = useMemo(
-    () => allowedAgentTypes ? new Set(allowedAgentTypes.filter(isSessionAgentTypeSelectable)) : null,
-    [allowedAgentTypes],
-  );
 
   useEffect(() => {
     if (!allowedAgentTypeSet || allowedAgentTypeSet.has(type)) return;
@@ -306,9 +326,16 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type)) setType('claude-code-sdk');
+    if (!isTypeValidForCustomProvider(type)) {
+      const nextCustom = resolveCustomProviderType();
+      if (nextCustom && nextCustom !== type) {
+        setRequestedModel('');
+        setType(nextCustom);
+      }
+    }
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
-  }, [ccPreset, ccPresets, customProviderSdk, type]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allowedAgentTypeSet, ccPreset, ccPresets, customProviderSdk, incognito, type]);
 
   // A bind-mode OpenClaw launch connects to one specific EXISTING external
   // session, so repeating it does not mean "N sessions" -- it always launches
@@ -319,7 +346,8 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
     : 1;
 
   const canStartType = isSessionAgentTypeSelectable(type)
-    && (!allowedAgentTypeSet || allowedAgentTypeSet.has(type));
+    && (!allowedAgentTypeSet || allowedAgentTypeSet.has(type))
+    && (!customProviderSdk || isCustomProviderTransportSdk(type));
   const incognitoBlocked = incognito && (!canIncognito || !supportsSessionIncognito(type));
   const handleStart = () => {
     if (!canStartType || incognitoBlocked) return;
@@ -585,7 +613,7 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
                   ? group.items.filter((choice) => allowedAgentTypeSet.has(choice.id))
                   : group.items;
                 const visibleItems = customProviderSdk
-                  ? allowedItems.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                  ? allowedItems.filter((choice) => isCustomProviderTransportSdk(choice.id))
                   : allowedItems;
                 if (visibleItems.length === 0) return null;
                 return (
@@ -611,7 +639,7 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
                           // deliberate exception and renders normally. Unavailable Claude CLI SDK
                           // is never restored by an allow-list.
                           style={(choice.hidden && (!isSessionAgentTypeSelectable(choice.id) || !allowedAgentTypeSet?.has(choice.id))) ? { display: 'none' } : undefined}
-                          disabled={!isSessionAgentTypeSelectable(choice.id) || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))}
+                          disabled={!isSessionAgentTypeSelectable(choice.id) || (incognito && !supportsSessionIncognito(choice.id)) || (customProviderSdk && !isCustomProviderTransportSdk(choice.id))}
                           aria-pressed={type === choice.id}
                           onClick={() => selectType(choice.id)}
                         >

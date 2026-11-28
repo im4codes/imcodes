@@ -10,7 +10,9 @@ import { sanitizeProjectName, DEFAULT_PROJECTS_DIR_PREFIX } from "@shared/saniti
 import { buildReadableProjectDir } from "../util/project-dir-slug.js";
 import { AGENT_AVAILABILITY_MSG, type AgentAvailabilityMap } from "@shared/agent-availability.js";
 import {
+  DEFAULT_CUSTOM_PROVIDER_SDK,
   getSessionAgentGroups,
+  isCustomProviderTransportSdk,
   isSessionAgentTypeSelectable,
   getSessionAgentLabel,
   SESSION_AGENT_GROUP_LABEL_KEYS,
@@ -204,7 +206,7 @@ export function NewSessionDialog({
     isSessionAgentTypeSelectable(id)
     && isAgentInstalled(id, map)
     && (!incognito || supportsSessionIncognito(id))
-    && (!customProviderSdk || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(id))
+    && (!customProviderSdk || isCustomProviderTransportSdk(id))
   );
   const findFirstAvailableAgent = (
     opts: { customOnly?: boolean; incognitoOnly?: boolean; map?: AgentAvailabilityMap | null } = {},
@@ -214,7 +216,7 @@ export function NewSessionDialog({
       for (const choice of group.items) {
         if (choice.hidden) continue;
         if (!isSessionAgentTypeSelectable(choice.id)) continue;
-        if (opts.customOnly && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)) continue;
+        if (opts.customOnly && !isCustomProviderTransportSdk(choice.id)) continue;
         if (opts.incognitoOnly && !supportsSessionIncognito(choice.id)) continue;
         if (map ? !isAgentExplicitlyInstalled(choice.id, map) : !isAgentInstalled(choice.id, map)) continue;
         return choice.id;
@@ -302,10 +304,14 @@ export function NewSessionDialog({
     return result;
   };
   const resolveCustomProviderAgent = (map: AgentAvailabilityMap | null = agentAvailability): AgentType | null => {
-    const defaultCompatible = isSessionAgentTypeSelectable("claude-code-sdk")
-      && (!incognito || supportsSessionIncognito("claude-code-sdk"));
-    if (defaultCompatible && (map ? isAgentExplicitlyInstalled("claude-code-sdk", map) : isAgentInstalled("claude-code-sdk", map))) {
-      return "claude-code-sdk";
+    const defaultCompatible = isSessionAgentTypeSelectable(DEFAULT_CUSTOM_PROVIDER_SDK)
+      && isCustomProviderTransportSdk(DEFAULT_CUSTOM_PROVIDER_SDK)
+      && (!incognito || supportsSessionIncognito(DEFAULT_CUSTOM_PROVIDER_SDK));
+    if (
+      defaultCompatible
+      && (map ? isAgentExplicitlyInstalled(DEFAULT_CUSTOM_PROVIDER_SDK, map) : isAgentInstalled(DEFAULT_CUSTOM_PROVIDER_SDK, map))
+    ) {
+      return DEFAULT_CUSTOM_PROVIDER_SDK;
     }
     return findFirstAvailableAgent({ customOnly: true, incognitoOnly: incognito, map });
   };
@@ -322,7 +328,7 @@ export function NewSessionDialog({
     setPresetError("");
     if (enabled) {
       if (!ccPreset && ccPresets.length > 0) selectCcPreset(ccPresets[0].name);
-      if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) || !isAgentInstalled(agentType) || (incognito && !supportsSessionIncognito(agentType))) {
+      if (!isCustomProviderTransportSdk(agentType) || !isAgentInstalled(agentType) || (incognito && !supportsSessionIncognito(agentType))) {
         const nextCustom = resolveCustomProviderAgent();
         if (nextCustom) {
           setLastUnlockedAgentType(agentType);
@@ -653,13 +659,12 @@ export function NewSessionDialog({
 
   useEffect(() => {
     if (!customProviderSdk) return;
-    // Snap only when the current type cannot act as a custom-provider layer.
-    // Forcing `claude-code-sdk` unconditionally here re-locked the dropdown:
+    // Snap only when the current type cannot act as a custom-provider transport layer.
+    // Forcing `codex-sdk` unconditionally here re-locked the selector:
     // picking another supported type set the state and then this effect, which
-    // re-runs on every `agentType` change, immediately reverted it — so the
-    // session still started as `claude-code-sdk` while the UI had briefly shown
-    // otherwise. Mirrors the same guard in StartSubSessionDialog.
-    if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType)) {
+    // re-runs on every `agentType` change, immediately reverted it.
+    // Mirrors the same guard in StartSubSessionDialog.
+    if (!isCustomProviderTransportSdk(agentType) || (incognito && !supportsSessionIncognito(agentType))) {
       const nextCustom = resolveCustomProviderAgent();
       if (nextCustom) {
         setRequestedModel("");
@@ -1232,7 +1237,7 @@ export function NewSessionDialog({
           <div class="session-agent-groups">
             {agentGroups.map((group) => {
               const visibleItems = customProviderSdk
-                ? group.items.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                ? group.items.filter((choice) => isCustomProviderTransportSdk(choice.id))
                 : group.items;
               if (visibleItems.length === 0) return null;
               return (

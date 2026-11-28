@@ -624,16 +624,22 @@ describe('NewSessionDialog', () => {
 
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
-    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
-    expect(getAgentButton('claude-code-sdk').disabled).toBe(false);
+    await waitFor(() => expect(getAgentButton('codex-sdk').getAttribute('aria-pressed')).toBe('true'));
+    expect(getAgentButton('codex-sdk').disabled).toBe(false);
     expect(screen.getByText('custom_provider_preset')).toBeDefined();
+    // CLI process runners are hidden when custom provider SDK is enabled
+    expect(document.querySelector('[data-agent-type="claude-code"]')).toBeNull();
+    expect(document.querySelector('[data-agent-type="codex"]')).toBeNull();
+    // Hidden transport choice (qwen) stays rendered with display:none
+    const hiddenQwenBtn = document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement | null;
+    expect(hiddenQwenBtn).not.toBeNull();
+    expect(hiddenQwenBtn!.style.display).toBe('none');
 
-    // DSH and Pi are selectable compatibility layers; unsupported transports
-    // DSH, Pi, and Codex are selectable compatibility layers; unsupported transports
+    // DSH, Pi, and Claude Code SDK are selectable compatibility layers; unsupported transports
     // (such as gemini-sdk) are removed from the expanded card selector.
     expect(getAgentButton('deepseek-harness')).toBeDefined();
     expect(getAgentButton('pi')).toBeDefined();
-    expect(getAgentButton('codex-sdk')).toBeDefined();
+    expect(getAgentButton('claude-code-sdk')).toBeDefined();
     expect(document.querySelector('[data-agent-type="gemini-sdk"]')).toBeNull();
 
     selectAgent('deepseek-harness');
@@ -679,7 +685,7 @@ describe('NewSessionDialog', () => {
     fireEvent.click(toggle);
 
     await waitFor(() => {
-      expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
+      expect(getAgentButton('codex-sdk').getAttribute('aria-pressed')).toBe('true');
       expect(screen.getByText('custom_provider_preset')).toBeDefined();
       expect((screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement).checked).toBe(true);
     });
@@ -707,7 +713,7 @@ describe('NewSessionDialog', () => {
 
     const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
     fireEvent.click(toggle);
-    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+    await waitFor(() => expect(getAgentButton('codex-sdk').getAttribute('aria-pressed')).toBe('true'));
 
     fireEvent.click(toggle);
     await waitFor(() => expect(getAgentButton(AGY_SDK_PROVIDER_ID).getAttribute('aria-pressed')).toBe('true'));
@@ -2723,5 +2729,70 @@ describe('NewSessionDialog', () => {
       expect(onSessionStarted).toHaveBeenCalledWith('deck_test_identity_project_brain');
       expect(onClose).toHaveBeenCalledOnce();
     });
+  });
+
+  it('hides CLI options, defaults to codex-sdk from CLI selections, allows switching other transport SDKs, and restores CLI on uncheck', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    // Both CLI choices are initially rendered
+    expect(getAgentButton('claude-code')).toBeDefined();
+    expect(getAgentButton('codex')).toBeDefined();
+
+    // Start from claude-code CLI, enable custom provider SDK -> snaps to codex-sdk and hides process group
+    selectAgent('claude-code');
+    expect(getAgentButton('claude-code').getAttribute('aria-pressed')).toBe('true');
+    const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(getAgentButton('codex-sdk').getAttribute('aria-pressed')).toBe('true');
+    });
+    expect(document.querySelector('[data-agent-type="claude-code"]')).toBeNull();
+    expect(document.querySelector('[data-agent-type="codex"]')).toBeNull();
+    expect(document.querySelector('[data-agent-type="opencode"]')).toBeNull();
+
+    // Switching to another transport BYOK SDK stays selected without snapping back to codex-sdk
+    selectAgent('claude-code-sdk');
+    await waitFor(() => expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true'));
+    selectAgent('kimi-sdk');
+    await waitFor(() => expect(getAgentButton('kimi-sdk').getAttribute('aria-pressed')).toBe('true'));
+
+    // Unchecking restores CLI options and prior unlocked CLI agent
+    fireEvent.click(toggle);
+    await waitFor(() => expect(getAgentButton('claude-code').getAttribute('aria-pressed')).toBe('true'));
+    expect(getAgentButton('codex')).toBeDefined();
+
+    // Also snaps codex CLI -> codex-sdk when re-enabled
+    selectAgent('codex');
+    fireEvent.click(toggle);
+    await waitFor(() => expect(getAgentButton('codex-sdk').getAttribute('aria-pressed')).toBe('true'));
+    expect(document.querySelector('[data-agent-type="codex"]')).toBeNull();
+  });
+
+  it('falls back to installed transport BYOK SDK (never CLI) when codex-sdk is uninstalled', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    act(() => ws.emit({
+      type: AGENT_AVAILABILITY_MSG.RESULT,
+      checkedAt: 5_000,
+      agents: {
+        [AGY_SDK_PROVIDER_ID]: { installed: true },
+        'codex-sdk': { installed: false },
+        'claude-code-sdk': { installed: true },
+        'claude-code': { installed: true },
+        codex: { installed: true },
+      },
+    }));
+
+    const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
+    fireEvent.click(toggle);
+
+    await waitFor(() => {
+      expect(getAgentButton('claude-code-sdk').getAttribute('aria-pressed')).toBe('true');
+    });
+    expect(document.querySelector('[data-agent-type="claude-code"]')).toBeNull();
+    expect(document.querySelector('[data-agent-type="codex"]')).toBeNull();
   });
 });

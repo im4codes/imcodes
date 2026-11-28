@@ -1,7 +1,10 @@
 import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, type SessionAgentType } from '@shared/agent-types.js';
+import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
+
+export const DEFAULT_CUSTOM_PROVIDER_SDK = 'codex-sdk' as const;
 
 export type SessionAgentGroupId = 'transport' | 'process';
 export type SessionAgentSurface = 'new-session' | 'sub-session';
@@ -240,6 +243,17 @@ export function getSessionAgentLabel(
 /** Frontend selection policy only; historical types and backend parsing stay intact. */
 export function isSessionAgentTypeSelectable(agentType: string): boolean {
   return agentType !== CLAUDE_CODE_CLI_SDK_AGENT_TYPE && agentType !== 'gemini' && agentType !== 'gemini-sdk';
+}
+
+/**
+ * True when `agentType` supports custom API provider presets and belongs to the
+ * `transport` SDK group (excluding CLI `process` runners such as `claude-code`
+ * and `codex`).
+ */
+export function isCustomProviderTransportSdk(agentType: string): boolean {
+  if (!CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType)) return false;
+  const choice = SESSION_AGENT_CHOICES.find((item) => item.id === agentType);
+  return choice?.group === 'transport';
 }
 
 /**

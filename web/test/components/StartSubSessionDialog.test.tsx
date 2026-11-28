@@ -533,10 +533,12 @@ describe('StartSubSessionDialog', () => {
 
     fireEvent.click(screen.getByLabelText(/custom_provider_sdk/i));
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /claude_code_sdk/i }).className).toContain('active'));
-    // Non-supported types (e.g., gemini-sdk) are filtered out and no longer rendered.
+    await waitFor(() => expect(screen.getByRole('button', { name: /codex_sdk/i }).className).toContain('active'));
+    // Non-supported and CLI process types (e.g., gemini-sdk, claude-code, codex) are filtered out.
     expect(screen.queryByRole('button', { name: /gemini_sdk/i })).toBeNull();
-    expect(screen.getByRole('button', { name: /codex_sdk/i })).toBeDefined();
+    expect(document.querySelector('[data-agent-type="claude-code"]')).toBeNull();
+    expect(document.querySelector('[data-agent-type="codex"]')).toBeNull();
+    expect(screen.getByRole('button', { name: /claude_code_sdk/i })).toBeDefined();
     // dsh (deepseek-harness) is now a visible, selectable button when custom provider SDK is on.
     const dshBtn = screen.getByRole('button', { name: /deepseek_harness/i }) as HTMLButtonElement;
     expect(dshBtn.disabled).toBe(false);
@@ -1451,7 +1453,7 @@ describe('StartSubSessionDialog', () => {
     expect(activeBtn?.getAttribute('data-agent-type')).toBe('codex-sdk');
   });
 
-  it('toggles customProviderSdk on (switches to claude-code-sdk) and off (restores agy-sdk)', () => {
+  it('toggles customProviderSdk on (switches to codex-sdk) and off (restores agy-sdk)', () => {
     const { container } = render(
       <StartSubSessionDialog
         ws={makeWs() as any}
@@ -1473,7 +1475,7 @@ describe('StartSubSessionDialog', () => {
     fireEvent.click(toggle);
     expect(toggle.checked).toBe(true);
     const activeBtn2 = container.querySelector('.session-agent-card.active') as HTMLButtonElement | null;
-    expect(activeBtn2?.getAttribute('data-agent-type')).toBe('claude-code-sdk');
+    expect(activeBtn2?.getAttribute('data-agent-type')).toBe('codex-sdk');
 
     fireEvent.click(toggle);
     expect(toggle.checked).toBe(false);
@@ -1768,5 +1770,66 @@ describe('StartSubSessionDialog shell and script choices', () => {
     fireEvent.click(shellBtn);
     fireEvent.click(screen.getByRole('button', { name: /launch/i }));
     expect(onStart).toHaveBeenCalledWith('shell', '/bin/bash', '/tmp', undefined, undefined);
+  });
+
+  it('hides CLI options, defaults to codex-sdk from CLI selections, allows other transport SDKs, respects allowedAgentTypes, and restores CLI on uncheck', () => {
+    const { container } = render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const claudeCliBtn = document.querySelector('button[data-agent-type="claude-code"]') as HTMLButtonElement;
+    expect(claudeCliBtn).not.toBeNull();
+    fireEvent.click(claudeCliBtn);
+    expect(claudeCliBtn.className).toContain('active');
+
+    const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
+    fireEvent.click(toggle);
+
+    expect(container.querySelector('.session-agent-card.active')?.getAttribute('data-agent-type')).toBe('codex-sdk');
+    expect(document.querySelector('[data-agent-type="claude-code"]')).toBeNull();
+    expect(document.querySelector('[data-agent-type="codex"]')).toBeNull();
+    const hiddenQwenBtn = document.querySelector('[data-agent-type="qwen"]') as HTMLButtonElement | null;
+    expect(hiddenQwenBtn).not.toBeNull();
+    expect(hiddenQwenBtn!.style.display).toBe('none');
+
+    // Switching to another transport BYOK SDK stays selected without snapping back
+    fireEvent.click(screen.getByRole('button', { name: /claude_code_sdk/i }));
+    expect(container.querySelector('.session-agent-card.active')?.getAttribute('data-agent-type')).toBe('claude-code-sdk');
+    fireEvent.click(screen.getByRole('button', { name: /kimi_sdk/i }));
+    expect(container.querySelector('.session-agent-card.active')?.getAttribute('data-agent-type')).toBe('kimi-sdk');
+
+    // Unchecking restores CLI options and prior CLI type
+    fireEvent.click(toggle);
+    expect(container.querySelector('.session-agent-card.active')?.getAttribute('data-agent-type')).toBe('claude-code');
+    expect(document.querySelector('button[data-agent-type="codex"]')).not.toBeNull();
+  });
+
+  it('falls back to allowed transport BYOK SDK (never CLI) when allowedAgentTypes excludes codex-sdk', () => {
+    const { container } = render(
+      <StartSubSessionDialog
+        ws={makeWs() as any}
+        defaultCwd="/tmp"
+        allowedAgentTypes={['claude-code', 'codex', 'claude-code-sdk']}
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const toggle = screen.getByLabelText(/custom_provider_sdk/i) as HTMLInputElement;
+    fireEvent.click(toggle);
+    expect(container.querySelector('.session-agent-card.active')?.getAttribute('data-agent-type')).toBe('claude-code-sdk');
+    expect(document.querySelector('[data-agent-type="claude-code"]')).toBeNull();
+    expect(document.querySelector('[data-agent-type="codex"]')).toBeNull();
   });
 });

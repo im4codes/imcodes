@@ -1511,7 +1511,7 @@
     "qwen_provider_hint": "Si necesitas un Coding Plan de terceros, elige Claude Code SDK.",
     "qwen_provider_selected_hint": "El SDK seleccionado puede usar proveedores externos de Coding Plan compatibles con Anthropic mediante los presets de API Provider de abajo.",
     "custom_provider_sdk": "SDK de proveedor personalizado",
-    "custom_provider_sdk_help": "Usa el transporte Claude Code SDK como capa de compatibilidad y elige abajo un preset de API Provider.",
+    "custom_provider_sdk_help": "Usa el transporte Codex SDK como capa de compatibilidad y elige abajo un preset de API Provider.",
     "custom_provider_preset": "Preset de proveedor personalizado",
     "custom_provider_preset_required": "Elige o agrega un preset de API Provider para el SDK de proveedor personalizado.",
     "compatible_api_via_qwen": "API compatible (vía Qwen)",
