@@ -26,6 +26,7 @@ import { buildQueueProjectionEntry } from '../../shared/transport-queue-privacy.
 import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
 import { resolveTransportConversationKey } from '../agent/transport-resume-opts.js';
 import { getSession } from '../store/session-store.js';
+import { finalizeSqliteLegacyScrub } from '../store/sqlite-secure-scrub.js';
 import { suppressSqliteExperimentalWarning } from '../util/suppress-sqlite-warning.js';
 import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
@@ -460,6 +461,33 @@ export class TransportQueueStore {
     return `${sessionName}\u0000${clientMessageId}\u0000${recipient?.sessionInstanceId ?? ''}\u0000${recipient?.runtimeEpoch ?? ''}`;
   }
 
+  private applyAdoptedPrivateMemoryActions(
+    sessionName: string,
+    recipient: QueueRecipientIdentity,
+    actions: {
+      deletedLegacyPrivateIds: ReadonlySet<string>;
+      migratedLegacyPrivateIds: ReadonlySet<string>;
+      rotatedSameInstancePrivateIds: ReadonlySet<string>;
+    },
+  ): void {
+    for (const clientMessageId of actions.deletedLegacyPrivateIds) {
+      // Clear ONLY the deleted legacy (null/null) authority entry; same-instance rotated rows retain theirs.
+      this.memoryAuthorities.delete(this.authorityKey(sessionName, clientMessageId, null));
+    }
+    if (actions.migratedLegacyPrivateIds.size > 0) {
+      this.migrateMemoryAuthorities(sessionName, recipient, {
+        clientMessageIds: actions.migratedLegacyPrivateIds,
+        matchLegacy: true,
+      });
+    }
+    if (actions.rotatedSameInstancePrivateIds.size > 0) {
+      this.migrateMemoryAuthorities(sessionName, recipient, {
+        clientMessageIds: actions.rotatedSameInstancePrivateIds,
+        matchSameInstanceDifferentEpoch: true,
+      });
+    }
+  }
+
   private clearMemoryAuthorities(sessionName: string, clientMessageId?: string): void {
     const prefix = clientMessageId
       ? `${sessionName}\u0000${clientMessageId}\u0000`
@@ -534,7 +562,7 @@ export class TransportQueueStore {
 
   private scrubPersistedAuthorities(): void {
     const scrubKey = 'authority_ram_only_scrub_v1';
-    const done = this.db.prepare('SELECT 1 FROM queue_security_migrations WHERE name = ?').get(scrubKey);
+    const done = Boolean(this.db.prepare('SELECT 1 FROM queue_security_migrations WHERE name = ?').get(scrubKey));
     const rows = this.db.prepare(`
       SELECT session_name AS sessionName, client_message_id AS clientMessageId, material_json AS materialJson
       FROM queue_private_material
@@ -555,15 +583,20 @@ export class TransportQueueStore {
         scrubbedCount += Number(res.changes ?? 0);
       }
     }
-    if (!done || scrubbedCount > 0) {
-      if (this.isFileBackedDb()) {
-        this.db.exec('VACUUM;');
-        this.db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-      }
-      this.db.prepare(`
-        INSERT OR REPLACE INTO queue_security_migrations (name, completed_at) VALUES (?, ?)
-      `).run(scrubKey, Date.now());
-    }
+    finalizeSqliteLegacyScrub({
+      db: this.db,
+      isFileBacked: this.isFileBackedDb(),
+      scrubbedRows: scrubbedCount,
+      alreadyCompleted: done,
+      markCompleted: () => {
+        this.db.prepare(`
+          INSERT OR REPLACE INTO queue_security_migrations (name, completed_at) VALUES (?, ?)
+        `).run(scrubKey, Date.now());
+      },
+      clearCompleted: () => {
+        this.db.prepare('DELETE FROM queue_security_migrations WHERE name = ?').run(scrubKey);
+      },
+    });
   }
 
   /** Atomically accept one server cron occurrence; retries are no-ops. */
@@ -2179,12 +2212,11 @@ export class TransportQueueStore {
 
       let migrated = 0;
       let purged = 0;
-      const staleIds: string[] = [];
-      const migratedIds = new Set<string>();
+      const deletedLegacyPrivateIds = new Set<string>();
+      const migratedLegacyPrivateIds = new Set<string>();
+      const rotatedSameInstancePrivateIds = new Set<string>();
       for (const message of recoverableMessages) {
         const stale = Number(message.oldestAt) < sessionCreatedAt;
-        if (stale) staleIds.push(message.clientMessageId);
-        else migratedIds.add(message.clientMessageId);
         for (const table of tables) {
           const legacyResult = stale
             ? this.db.prepare(`
@@ -2213,9 +2245,19 @@ export class TransportQueueStore {
             recipient.sessionInstanceId,
             recipient.runtimeEpoch,
           );
-          if (stale) purged += Number(legacyResult.changes ?? 0);
-          else migrated += Number(legacyResult.changes ?? 0);
-          migrated += Number(rotated.changes ?? 0);
+          const legacyChanges = Number(legacyResult.changes ?? 0);
+          const rotatedChanges = Number(rotated.changes ?? 0);
+          if (stale) purged += legacyChanges;
+          else migrated += legacyChanges;
+          migrated += rotatedChanges;
+
+          if (table.name === 'queue_private_material') {
+            if (stale && legacyChanges > 0) deletedLegacyPrivateIds.add(message.clientMessageId);
+            else if (!stale && legacyChanges > 0) migratedLegacyPrivateIds.add(message.clientMessageId);
+            if (rotatedChanges > 0) rotatedSameInstancePrivateIds.add(message.clientMessageId);
+          } else if (table.name === 'queue_entries' && stale && legacyChanges > 0) {
+            deletedLegacyPrivateIds.add(message.clientMessageId);
+          }
         }
       }
 
@@ -2236,14 +2278,11 @@ export class TransportQueueStore {
           `).run(Date.now(), sessionName);
         }
         this.db.exec('COMMIT');
-        for (const staleId of staleIds) this.clearMemoryAuthorities(sessionName, staleId);
-        if (migratedIds.size > 0) {
-          this.migrateMemoryAuthorities(sessionName, recipient, {
-            clientMessageIds: migratedIds,
-            matchLegacy: true,
-            matchSameInstanceDifferentEpoch: true,
-          });
-        }
+        this.applyAdoptedPrivateMemoryActions(sessionName, recipient, {
+          deletedLegacyPrivateIds,
+          migratedLegacyPrivateIds,
+          rotatedSameInstancePrivateIds,
+        });
         return { status: 'pending', migrated, ...(purged > 0 ? { purged } : {}) };
       }
 
@@ -2262,14 +2301,11 @@ export class TransportQueueStore {
         `).run(Date.now(), sessionName);
       }
       this.db.exec('COMMIT');
-      for (const staleId of staleIds) this.clearMemoryAuthorities(sessionName, staleId);
-      if (migratedIds.size > 0) {
-        this.migrateMemoryAuthorities(sessionName, recipient, {
-          clientMessageIds: migratedIds,
-          matchLegacy: true,
-          matchSameInstanceDifferentEpoch: true,
-        });
-      }
+      this.applyAdoptedPrivateMemoryActions(sessionName, recipient, {
+        deletedLegacyPrivateIds,
+        migratedLegacyPrivateIds,
+        rotatedSameInstancePrivateIds,
+      });
       return {
         status: !metaIsCaller || migrated > 0 || purged > 0 ? 'adopted' : 'already_bound',
         migrated,

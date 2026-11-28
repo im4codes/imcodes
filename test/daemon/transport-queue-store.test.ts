@@ -1972,4 +1972,110 @@ describe('dropTaskPairEntries', () => {
       reopened.close();
     }
   });
+
+  it('adoptLegacyRecipientIdentity preserves and migrates RAM authorities for early same-instance rows while clearing only purged legacy rows in mixed-identity batches', () => {
+    const name = 'adopt-mixed-ram';
+    const instOld = { sessionInstanceId: 'inst-mix', runtimeEpoch: 'epoch-old' };
+    const instNew = { sessionInstanceId: 'inst-mix', runtimeEpoch: 'epoch-new' };
+    const sessionCreatedAt = 1_000;
+
+    // 1. Stale legacy (null/null, before sessionCreatedAt) -> purged from SQLite + RAM cleared.
+    store.enqueue({
+      sessionName: name,
+      clientMessageId: 'msg-stale-legacy',
+      text: 'stale legacy',
+      recipient: null,
+      now: 100,
+      privateMaterialJson: JSON.stringify({
+        text: 'stale legacy',
+        ownerMachineAuthority: 'jwt-stale-legacy-owner',
+      }),
+    });
+
+    // 2. Same-instance old-epoch owner message whose updated_at/created_at < sessionCreatedAt -> MUST rotate & keep RAM owner token!
+    store.enqueue({
+      sessionName: name,
+      clientMessageId: 'msg-early-inst-owner',
+      text: 'early verified instance owner',
+      recipient: instOld,
+      now: 200,
+      privateMaterialJson: JSON.stringify({
+        text: 'early verified instance owner',
+        ownerMachineAuthority: 'jwt-early-inst-owner',
+      }),
+    });
+
+    // 3. Same-instance old-epoch participant message whose updated_at/created_at < sessionCreatedAt -> MUST rotate & keep RAM shared token!
+    store.enqueue({
+      sessionName: name,
+      clientMessageId: 'msg-early-inst-shared',
+      text: 'early verified instance shared',
+      recipient: instOld,
+      now: 250,
+      sharedActor: { actorUserId: 'part-early', effectiveActorRole: 'participant' } as never,
+      privateMaterialJson: JSON.stringify({
+        text: 'early verified instance shared',
+        sharedActorEnvelope: { actorUserId: 'part-early', effectiveActorRole: 'participant' },
+        sharedMachineAuthority: 'jwt-early-inst-shared',
+      }),
+    });
+
+    // 4. Mixed-identity rows for a single clientMessageId: early same-instance queue_private_material + early null/null delivery tombstone.
+    store.enqueue({
+      sessionName: name,
+      clientMessageId: 'msg-mixed-tombstone-early',
+      text: 'mixed tombstone + private',
+      recipient: instOld,
+      now: 300,
+      privateMaterialJson: JSON.stringify({
+        text: 'mixed tombstone + private',
+        ownerMachineAuthority: 'jwt-mixed-survives',
+      }),
+    });
+    const rawDb = (store as unknown as { db: InstanceType<typeof DatabaseSync> }).db;
+    rawDb.prepare(`
+      INSERT INTO queue_delivery_tombstones (session_name, queue_epoch, client_message_id, delivery_frame_id, created_at, recipient_session_instance_id, recipient_runtime_epoch)
+      VALUES (?, 'legacy-q-epoch', ?, 'frame-1', ?, NULL, NULL)
+    `).run(name, 'msg-mixed-tombstone-early', 80);
+
+    // 5. Fresh legacy (null/null, after sessionCreatedAt) -> bound to instNew + RAM migrated.
+    store.enqueue({
+      sessionName: name,
+      clientMessageId: 'msg-fresh-legacy',
+      text: 'fresh legacy',
+      recipient: null,
+      now: 1_500,
+      sharedActor: { actorUserId: 'part-fresh', effectiveActorRole: 'participant' } as never,
+      privateMaterialJson: JSON.stringify({
+        text: 'fresh legacy',
+        sharedActorEnvelope: { actorUserId: 'part-fresh', effectiveActorRole: 'participant' },
+        sharedMachineAuthority: 'jwt-fresh-legacy-shared',
+      }),
+    });
+
+    const adopted = store.adoptLegacyRecipientIdentity(name, instNew, { sessionCreatedAt });
+    expect(adopted.status).toBe('adopted');
+
+    // Purged stale legacy entry is completely gone from SQLite + RAM.
+    expect(store.readPrivateDispatchMaterial(name, 'msg-stale-legacy', null)).toBeUndefined();
+    expect(store.readPrivateDispatchMaterial(name, 'msg-stale-legacy', instNew)).toBeUndefined();
+
+    // Early verified same-instance entries (both owner AND shared, plus mixed-tombstone case) MUST retain RAM tokens on instNew and deny instOld.
+    expect(store.readPrivateDispatchMaterial(name, 'msg-early-inst-owner', instOld)).toBeUndefined();
+    expect(JSON.parse(store.readPrivateDispatchMaterial(name, 'msg-early-inst-owner', instNew)!).ownerMachineAuthority)
+      .toBe('jwt-early-inst-owner');
+
+    expect(store.readPrivateDispatchMaterial(name, 'msg-early-inst-shared', instOld)).toBeUndefined();
+    expect(JSON.parse(store.readPrivateDispatchMaterial(name, 'msg-early-inst-shared', instNew)!).sharedMachineAuthority)
+      .toBe('jwt-early-inst-shared');
+
+    expect(store.readPrivateDispatchMaterial(name, 'msg-mixed-tombstone-early', instOld)).toBeUndefined();
+    expect(JSON.parse(store.readPrivateDispatchMaterial(name, 'msg-mixed-tombstone-early', instNew)!).ownerMachineAuthority)
+      .toBe('jwt-mixed-survives');
+
+    // Fresh legacy bound to instNew retains RAM token.
+    expect(store.readPrivateDispatchMaterial(name, 'msg-fresh-legacy', null)).toBeUndefined();
+    expect(JSON.parse(store.readPrivateDispatchMaterial(name, 'msg-fresh-legacy', instNew)!).sharedMachineAuthority)
+      .toBe('jwt-fresh-legacy-shared');
+  });
 });

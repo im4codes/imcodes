@@ -13,6 +13,7 @@ import { createRequire } from 'node:module';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { normalizeAuditBlockingSeverities } from '../../../shared/audit-convergence.js';
+import { finalizeSqliteLegacyScrub } from '../../store/sqlite-secure-scrub.js';
 import {
   TASK_PAIR_BRAIN_NOTICE_STATUSES,
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
@@ -409,18 +410,22 @@ export class TaskPairStore {
         if (!columns.some((column) => column.name === 'details_json')) throw error;
       }
     }
-    // Scrub any legacy plaintext JWTs persisted by older daemons, vacuuming freed B-tree pages and truncating WAL.
+    // Scrub any legacy plaintext JWTs persisted by older daemons, vacuuming freed B-tree pages and
+    // verifying PRAGMA wal_checkpoint(TRUNCATE) succeeded before persisting the completion marker.
     const scrubMarkerKey = 'private_authority_ram_only_scrub_v1';
-    const scrubbedMeta = this.getMeta(scrubMarkerKey);
+    const scrubbedMeta = this.getMeta(scrubMarkerKey) === '1';
     const deletedOwners = Number(this.#db.prepare("DELETE FROM task_pair_private_authority WHERE kind != 'participant'").run().changes ?? 0);
     const clearedParticipantTokens = Number(this.#db.prepare('UPDATE task_pair_private_authority SET authority = NULL WHERE authority IS NOT NULL').run().changes ?? 0);
-    if (!scrubbedMeta || deletedOwners > 0 || clearedParticipantTokens > 0) {
-      if (dbPath !== ':memory:') {
-        this.#db.exec('VACUUM;');
-        this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-      }
-      this.setMeta(scrubMarkerKey, '1');
-    }
+    finalizeSqliteLegacyScrub({
+      db: this.#db,
+      isFileBacked: dbPath !== ':memory:',
+      scrubbedRows: deletedOwners + clearedParticipantTokens,
+      alreadyCompleted: scrubbedMeta,
+      markCompleted: () => this.setMeta(scrubMarkerKey, '1'),
+      clearCompleted: () => {
+        this.#db.prepare('DELETE FROM task_pair_meta WHERE key = ?').run(scrubMarkerKey);
+      },
+    });
   }
 
   close(): void {
