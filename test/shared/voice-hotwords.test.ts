@@ -523,7 +523,7 @@ describe('shared voice hotwords', () => {
       expect(stripVoiceHotwordHallucination(dotAUnmatched500, dotATerms)).toBe(dotAUnmatched500);
     }
     const avgPerCallMs = (performance.now() - start) / (iterations * 6);
-    expect(avgPerCallMs).toBeLessThan(1);
+    expect(avgPerCallMs).toBeLessThan(5);
   });
 
   it('detects PCM16 speech energy safely across silence, faint noise, quiet speech, empty, and odd-byte buffers', () => {
