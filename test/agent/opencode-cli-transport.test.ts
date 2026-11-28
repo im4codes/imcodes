@@ -1282,10 +1282,14 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     await pHungAbort.send(hungRetry, 'after early cancel');
 
     // B5b: Late `session.idle` arriving AFTER 150ms interrupt deadline waits on ProviderStopConfirmation,
-    // never fakes local failOnce prematurely, settles once on idle, and allows next turn send!
+    // never fakes local failOnce prematurely, ignores unkeyed `session.compacted`, settles once on idle, and allows next turn send!
     let directCancelSettled = false;
     const errCountBeforeCancel = hungErrors.length;
     const cancelPending = pHungAbort.cancel(hungRetry).then(() => { directCancelSettled = true; });
+    hungQueues.get(6)!.push({
+      type: 'session.compacted',
+      properties: { sessionID: 'shared-hung-abort-ses' },
+    });
     await new Promise((res) => setTimeout(res, 220));
     expect(directCancelSettled).toBe(false);
     expect(hungErrors.slice(errCountBeforeCancel)).toEqual([]);

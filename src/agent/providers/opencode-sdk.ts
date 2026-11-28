@@ -3908,6 +3908,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     OpenCodeSessionState,
     { providerSessionId: string; generation: number; observed: boolean }
   >();
+  private readonly cancelledCompactRequests = new WeakMap<
+    OpenCodeSessionState,
+    { generation: number; compactRequest: OpenCodeCompactRequestState }
+  >();
 
   private completeStopConfirmations(state: OpenCodeSessionState): void {
     const observer = this.cancelTerminalObservers.get(state);
@@ -3920,6 +3924,27 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     }
     this.stopConfirmations.complete(state);
     this.cancelTerminalConfirmations.complete(state);
+  }
+
+  private isMatchingManualCompactionEvent(
+    state: OpenCodeSessionState,
+    data: Record<string, any> | undefined,
+    kind: 'ended' | 'failed' | 'legacy_compacted',
+  ): boolean {
+    const cancelledCompact = this.cancelledCompactRequests.get(state);
+    const ctx = (!state.cancelled && state.compacting && state.compactRequest)
+      ? state.compactRequest
+      : (state.cancelled && cancelledCompact && cancelledCompact.generation === state.generation)
+        ? cancelledCompact.compactRequest
+        : null;
+    if (!ctx) return false;
+    if (kind === 'legacy_compacted') {
+      return !ctx.sawV2Compaction;
+    }
+    if (data?.reason !== 'manual') return false;
+    const eventInputId = safeString(data?.inputID);
+    if (eventInputId) return eventInputId === ctx.inputId;
+    return ctx.manualStarted && ctx.startedInputId === ctx.inputId;
   }
 
   cancelAndWait(sessionId: string): Promise<void> {
@@ -3967,6 +3992,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state.pendingAdmissionAbort?.abort();
     if (!state.busy) return;
     const wasCompacting = state.compacting;
+    const prevCompactRequest = state.compactRequest;
     const prevCancelled = state.cancelled;
     const prevActiveTurnParams = state.activeTurnParams;
     const capturedProviderSessionId = state.providerSessionId;
@@ -3977,6 +4003,14 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       observed: false,
     };
     this.cancelTerminalObservers.set(state, observer);
+    if (wasCompacting && prevCompactRequest) {
+      this.cancelledCompactRequests.set(state, {
+        generation: cancelledGeneration,
+        compactRequest: prevCompactRequest,
+      });
+    } else {
+      this.cancelledCompactRequests.delete(state);
+    }
     state.cancelled = true;
     state.compacting = false;
     state.compactRequest = null;
@@ -4017,7 +4051,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     } catch (error) {
       if (!confirmedStopped) {
         state.cancelled = prevCancelled;
+        state.compacting = wasCompacting;
+        state.compactRequest = prevCompactRequest;
         state.activeTurnParams = prevActiveTurnParams;
+        this.cancelledCompactRequests.delete(state);
       }
       throw error;
     } finally {
@@ -4876,7 +4913,9 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.compaction.ended': {
-        this.completeStopConfirmations(state);
+        if (this.isMatchingManualCompactionEvent(state, data, 'ended')) {
+          this.completeStopConfirmations(state);
+        }
         if (!state.compacting || !state.compactRequest || state.cancelled) return;
         state.compactRequest.sawV2Compaction = true;
         if (data?.reason !== 'manual') return;
@@ -4894,13 +4933,17 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       }
       case 'session.compacted':
         // Standalone legacy v1 compaction compatibility event (never overrides an active v2 compaction flow).
-        this.completeStopConfirmations(state);
+        if (this.isMatchingManualCompactionEvent(state, data, 'legacy_compacted')) {
+          this.completeStopConfirmations(state);
+        }
         if (state.compacting && !state.cancelled && !state.compactRequest?.sawV2Compaction) {
           this.completeCompactOnce(state, event.type);
         }
         return;
       case 'session.compaction.failed': {
-        this.completeStopConfirmations(state);
+        if (this.isMatchingManualCompactionEvent(state, data, 'failed')) {
+          this.completeStopConfirmations(state);
+        }
         if (!state.compacting || !state.compactRequest || state.cancelled) return;
         state.compactRequest.sawV2Compaction = true;
         if (data?.reason !== 'manual') return;

@@ -312,6 +312,56 @@ describe('OpenCodeSdkProvider', () => {
     await provider.disconnect();
   });
 
+  it('does not use early automatic compaction or uncorrelated compaction to confirm stop on an ordinary prompt', async () => {
+    const harness = createHarness();
+    let releaseInterrupt!: () => void;
+    let hangInterrupt = true;
+    harness.client.session.interrupt.mockImplementation(async () => {
+      if (hangInterrupt) {
+        await new Promise<void>((resolve) => { releaseInterrupt = resolve; });
+      }
+      return { interrupted: true };
+    });
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', harness.queue.close, { once: true });
+      return { client: harness.client as any, server: harness.server };
+    });
+    const provider = new OpenCodeSdkProvider();
+    const errors: Array<{ sessionId: string; code: string }> = [];
+    provider.onError((sid, err) => errors.push({ sessionId: sid, code: err.code }));
+    await provider.connect({});
+    const route = await provider.createSession({ sessionKey: 'route-auto-compact-stop', cwd: '/tmp/project' });
+
+    await provider.send(route, 'ordinary foreground prompt');
+    let settled = false;
+    const cancelling = provider.cancel(route).then(() => { settled = true; });
+    await vi.waitFor(() => expect(harness.client.session.interrupt).toHaveBeenCalledOnce());
+
+    // Early auto compaction (and unkeyed legacy session.compacted) inside the 150ms interrupt window MUST NOT confirm stop!
+    harness.queue.push({
+      type: 'session.compaction.ended',
+      data: { sessionID: 'oc-session-1', reason: 'auto' },
+    });
+    harness.queue.push({
+      type: 'session.compacted',
+      data: { sessionID: 'oc-session-1' },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 220));
+    expect(settled).toBe(false);
+    expect(errors).toEqual([]);
+
+    // Real session.idle settles CANCELLED once, clears busy, and enables next turn!
+    harness.queue.push({ type: 'session.idle', data: { sessionID: 'oc-session-1' } });
+    await cancelling;
+    expect(settled).toBe(true);
+    expect(errors).toEqual([expect.objectContaining({ sessionId: route, code: PROVIDER_ERROR_CODES.CANCELLED })]);
+    hangInterrupt = false;
+    await provider.send(route, 'next foreground prompt');
+    harness.queue.push({ type: 'session.idle', data: { sessionID: 'oc-session-1' } });
+    releaseInterrupt?.();
+    await provider.disconnect();
+  });
+
   it('steers a correlated delegation completion through client.sessions.prompt', async () => {
     const harness = createHarness();
     openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {

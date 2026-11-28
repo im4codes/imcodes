@@ -2120,8 +2120,8 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
         return;
       }
       case 'session.compacted':
-        this.completeStopConfirmations(state);
         if (state.compacting && !state.cancelled) {
+          this.completeStopConfirmations(state);
           this.completeCompactOnce(state, 'session.compacted');
         }
         return;
