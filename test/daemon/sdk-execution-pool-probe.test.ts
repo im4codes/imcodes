@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   loadModelTierKnowledge,
   upsertModelTierKnowledge,
+  upsertModelTierKnowledgeSync,
 } from '../../src/daemon/model-tier-knowledge.js';
 import { probeExecutionPoolSdks } from '../../src/daemon/sdk-execution-pool-probe.js';
 import { AGY_NATIVE_SESSION_STATE } from '../../shared/agy-agent.js';
@@ -783,5 +784,101 @@ describe('probeExecutionPoolSdks', () => {
     ]);
 
     expect(loadModelTierKnowledge(knowledgeFile).map((r) => r.model).sort()).toEqual(['claude-recovery-c', 'gpt-recovery-d']);
+  });
+
+  it('enforces a single strict deadline across async and sync COMMIT BUSY retries under cross-process SHARED locks', async () => {
+    const dir = makeTmpDir();
+    const knowledgeFile = join(dir, 'model-tier-knowledge.json');
+    const lockDbPath = `${knowledgeFile}.lock.db`;
+    const require = createRequire(import.meta.url);
+    const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
+
+    // Initialize the SQLite header/table so other processes take a real OS SHARED read lock.
+    const initDb = new DatabaseSync(lockDbPath);
+    initDb.exec('CREATE TABLE IF NOT EXISTS _k (id INTEGER PRIMARY KEY);');
+    initDb.close();
+
+    const spawnSharedReader = (holdMs: number) => {
+      const readerScript = [
+        `import { createRequire } from 'node:module';`,
+        `const require = createRequire(import.meta.url);`,
+        `const { DatabaseSync } = require('node:sqlite');`,
+        `const db = new DatabaseSync(${JSON.stringify(lockDbPath)});`,
+        `db.exec('BEGIN DEFERRED; SELECT count(*) FROM _k;');`,
+        `process.stdout.write('SHARED_LOCKED\\n');`,
+        `await new Promise((r) => setTimeout(r, ${holdMs}));`,
+        `db.exec('COMMIT;');`,
+        `db.close();`,
+      ].join('\n');
+      const child = spawn(process.execPath, ['--input-type=module', '-e', readerScript], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      const exitPromise = new Promise<void>((resolveExit, rejectExit) => {
+        child.on('exit', (code) => (code === 0 ? resolveExit() : rejectExit(new Error(`shared reader exited ${code}`))));
+      });
+      const readyPromise = new Promise<void>((resolveReady, rejectReady) => {
+        child.stdout.on('data', (chunk) => {
+          if (String(chunk).includes('SHARED_LOCKED')) resolveReady();
+        });
+        child.on('error', rejectReady);
+      });
+      return { readyPromise, exitPromise };
+    };
+
+    // 1. Async COMMIT timeout boundary: SHARED lock outlives lockTimeoutMs=5 (released at 20ms) -> MUST fail commit within deadline, never sleep past and succeed.
+    const asyncTimeoutReader = spawnSharedReader(20);
+    await asyncTimeoutReader.readyPromise;
+    await expect(upsertModelTierKnowledge(
+      [{ provider: 'codex-sdk', model: 'gpt-commit-timeout-async', tier: 'secondary' }],
+      knowledgeFile,
+      1_000,
+      { lockTimeoutMs: 5 },
+    )).rejects.toThrow(/Timed out committing model-tier-knowledge lock/);
+    await asyncTimeoutReader.exitPromise;
+
+    // Next async write after reader releases succeeds cleanly.
+    await upsertModelTierKnowledge(
+      [{ provider: 'codex-sdk', model: 'gpt-after-async-commit-timeout', tier: 'secondary' }],
+      knowledgeFile,
+      2_000,
+    );
+
+    // 2. Async COMMIT before-deadline recovery: SHARED lock releases before lockTimeoutMs=500 -> retries and resolves cleanly.
+    const asyncSuccessReader = spawnSharedReader(25);
+    await asyncSuccessReader.readyPromise;
+    await upsertModelTierKnowledge(
+      [{ provider: 'claude-code-sdk', model: 'claude-commit-recovered-async', tier: 'flagship' }],
+      knowledgeFile,
+      3_000,
+      { lockTimeoutMs: 500 },
+    );
+    await asyncSuccessReader.exitPromise;
+
+    // 3. Sync COMMIT timeout boundary & before-deadline recovery.
+    const syncTimeoutReader = spawnSharedReader(20);
+    await syncTimeoutReader.readyPromise;
+    expect(() => upsertModelTierKnowledgeSync(
+      [{ provider: 'codex-sdk', model: 'gpt-commit-timeout-sync', tier: 'secondary' }],
+      knowledgeFile,
+      4_000,
+      { lockTimeoutMs: 5 },
+    )).toThrow(/Timed out committing model-tier-knowledge lock/);
+    await syncTimeoutReader.exitPromise;
+
+    const syncSuccessReader = spawnSharedReader(25);
+    await syncSuccessReader.readyPromise;
+    upsertModelTierKnowledgeSync(
+      [{ provider: 'codex-sdk', model: 'gpt-commit-recovered-sync', tier: 'secondary' }],
+      knowledgeFile,
+      5_000,
+      { lockTimeoutMs: 500 },
+    );
+    await syncSuccessReader.exitPromise;
+
+    const savedModels = loadModelTierKnowledge(knowledgeFile).map((r) => r.model);
+    expect(savedModels).toContain('gpt-after-async-commit-timeout');
+    expect(savedModels).toContain('claude-commit-recovered-async');
+    expect(savedModels).toContain('gpt-commit-recovered-sync');
   });
 });

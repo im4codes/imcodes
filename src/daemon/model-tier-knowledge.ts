@@ -134,6 +134,65 @@ function sleepSyncMs(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function runBusyBoundedSync(
+  db: InstanceType<typeof DatabaseSync>,
+  sql: string,
+  deadline: number,
+  timeoutErrorMessage: string,
+): void {
+  let attempts = 0;
+  while (true) {
+    if (attempts > 0 && Date.now() >= deadline) {
+      throw new Error(timeoutErrorMessage);
+    }
+    attempts += 1;
+    try {
+      db.exec(sql);
+      return;
+    } catch (err) {
+      if (!isSqliteBusyError(err)) throw err;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(timeoutErrorMessage);
+      }
+      sleepSyncMs(Math.min(5, remaining));
+      if (Date.now() >= deadline) {
+        throw new Error(timeoutErrorMessage);
+      }
+    }
+  }
+}
+
+async function runBusyBoundedAsync(
+  db: InstanceType<typeof DatabaseSync>,
+  sql: string,
+  deadline: number,
+  timeoutErrorMessage: string,
+): Promise<void> {
+  let attempts = 0;
+  while (true) {
+    if (attempts > 0 && Date.now() >= deadline) {
+      throw new Error(timeoutErrorMessage);
+    }
+    attempts += 1;
+    try {
+      db.exec(sql);
+      return;
+    } catch (err) {
+      if (!isSqliteBusyError(err)) throw err;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        throw new Error(timeoutErrorMessage);
+      }
+      const jitter = 5 + Math.floor(Math.random() * 11);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(jitter, remaining)));
+      if (Date.now() >= deadline) {
+        throw new Error(timeoutErrorMessage);
+      }
+    }
+  }
+}
+
 /**
  * Acquire an OS-kernel transactional lock via SQLite `BEGIN IMMEDIATE` on a
  * companion `.lock.db` file so concurrent processes serialize strictly without
@@ -148,35 +207,26 @@ function withSqliteKnowledgeLockSync<T>(
   mkdirSync(dirname(filePath), { recursive: true });
   const lockDbPath = `${filePath}.lock.db`;
   const timeoutMs = Math.max(1, Math.floor(options.lockTimeoutMs ?? KNOWLEDGE_LOCK_TIMEOUT_MS));
+  const deadline = Date.now() + timeoutMs;
   const db = new DatabaseSync(lockDbPath);
   let inTx = false;
   try {
-    db.exec(`PRAGMA busy_timeout = ${timeoutMs};`);
-    try {
-      db.exec('BEGIN IMMEDIATE;');
-      inTx = true;
-    } catch (err) {
-      if (isSqliteBusyError(err)) {
-        throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDbPath}`);
-      }
-      throw err;
-    }
+    db.exec('PRAGMA busy_timeout = 0;');
+    runBusyBoundedSync(
+      db,
+      'BEGIN IMMEDIATE;',
+      deadline,
+      `Timed out acquiring model-tier-knowledge lock: ${lockDbPath}`,
+    );
+    inTx = true;
     const result = fn();
-    const commitDeadline = Date.now() + timeoutMs;
-    while (true) {
-      try {
-        db.exec('COMMIT;');
-        inTx = false;
-        break;
-      } catch (err) {
-        if (!isSqliteBusyError(err)) throw err;
-        const remaining = commitDeadline - Date.now();
-        if (remaining <= 0) {
-          throw new Error(`Timed out committing model-tier-knowledge lock: ${lockDbPath}`);
-        }
-        sleepSyncMs(Math.min(10, Math.max(1, remaining)));
-      }
-    }
+    runBusyBoundedSync(
+      db,
+      'COMMIT;',
+      deadline,
+      `Timed out committing model-tier-knowledge lock: ${lockDbPath}`,
+    );
+    inTx = false;
     return result;
   } catch (err) {
     if (inTx) {
@@ -202,49 +252,32 @@ async function withSqliteKnowledgeLockAsync<T>(
   const timeoutMs = Math.max(1, Math.floor(options.lockTimeoutMs ?? KNOWLEDGE_LOCK_TIMEOUT_MS));
   const deadline = Date.now() + timeoutMs;
   const db = new DatabaseSync(lockDbPath);
+  let inTx = false;
   try {
     db.exec('PRAGMA busy_timeout = 0;');
-    let inTx = false;
-    while (true) {
+    await runBusyBoundedAsync(
+      db,
+      'BEGIN IMMEDIATE;',
+      deadline,
+      `Timed out acquiring model-tier-knowledge lock: ${lockDbPath}`,
+    );
+    inTx = true;
+    const result = fn();
+    await runBusyBoundedAsync(
+      db,
+      'COMMIT;',
+      deadline,
+      `Timed out committing model-tier-knowledge lock: ${lockDbPath}`,
+    );
+    inTx = false;
+    return result;
+  } catch (err) {
+    if (inTx) {
       try {
-        db.exec('BEGIN IMMEDIATE;');
-        inTx = true;
-        break;
-      } catch (err) {
-        if (!isSqliteBusyError(err)) throw err;
-        if (Date.now() >= deadline) {
-          throw new Error(`Timed out acquiring model-tier-knowledge lock: ${lockDbPath}`);
-        }
-        const jitter = 5 + Math.floor(Math.random() * 11);
-        await new Promise((resolve) => setTimeout(resolve, jitter));
-      }
+        db.exec('ROLLBACK;');
+      } catch { /* ignore rollback error */ }
     }
-    try {
-      const result = fn();
-      const commitDeadline = Date.now() + timeoutMs;
-      while (true) {
-        try {
-          db.exec('COMMIT;');
-          inTx = false;
-          break;
-        } catch (err) {
-          if (!isSqliteBusyError(err)) throw err;
-          if (Date.now() >= commitDeadline) {
-            throw new Error(`Timed out committing model-tier-knowledge lock: ${lockDbPath}`);
-          }
-          const jitter = 5 + Math.floor(Math.random() * 11);
-          await new Promise((resolve) => setTimeout(resolve, jitter));
-        }
-      }
-      return result;
-    } catch (err) {
-      if (inTx) {
-        try {
-          db.exec('ROLLBACK;');
-        } catch { /* ignore rollback error */ }
-      }
-      throw err;
-    }
+    throw err;
   } finally {
     try {
       db.close();
