@@ -2553,4 +2553,53 @@ describe('QuickInputPanel structured layout, manage toggle, and copy actions', (
 
     setTimeoutSpy.mockRestore();
   });
+
+  it('still expires first copy feedback after 1500ms if a subsequent copy fails or stays pending', async () => {
+    vi.useFakeTimers();
+    let resolvePending!: () => void;
+    const writeText = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('clipboard unavailable'))
+      .mockResolvedValueOnce(undefined)
+      .mockImplementationOnce(() => new Promise<void>((r) => { resolvePending = r; }));
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+
+    renderPanel({
+      data: { history: [], sessionHistory: {}, commands: [], phrases: ['first', 'second'] },
+    });
+
+    const copyBtns = Array.from(document.querySelectorAll('[data-qp-section="phrase"] .qp-card-copy-btn')) as HTMLButtonElement[];
+
+    // Case 1: First copy succeeds -> second copy fails -> first ✓ still expires at 1500ms
+    fireEvent.click(copyBtns[0]!);
+    await act(async () => { await Promise.resolve(); });
+    expect(copyBtns[0]!.classList.contains('is-copied')).toBe(true);
+
+    fireEvent.click(copyBtns[1]!);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(copyBtns[1]!.classList.contains('is-copied')).toBe(false);
+
+    act(() => { vi.advanceTimersByTime(1500); });
+    expect(copyBtns[0]!.classList.contains('is-copied')).toBe(false);
+
+    // Case 2: First copy succeeds -> second copy stays pending past 1500ms -> first ✓ still expires at 1500ms, and second eventually sets ✓
+    fireEvent.click(copyBtns[0]!);
+    await act(async () => { await Promise.resolve(); });
+    expect(copyBtns[0]!.classList.contains('is-copied')).toBe(true);
+
+    fireEvent.click(copyBtns[1]!);
+    act(() => { vi.advanceTimersByTime(1500); });
+    expect(copyBtns[0]!.classList.contains('is-copied')).toBe(false);
+    expect(copyBtns[1]!.classList.contains('is-copied')).toBe(false);
+
+    resolvePending();
+    await act(async () => { await Promise.resolve(); });
+    expect(copyBtns[1]!.classList.contains('is-copied')).toBe(true);
+  });
 });

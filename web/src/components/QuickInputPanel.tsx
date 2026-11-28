@@ -1940,11 +1940,12 @@ export function QuickInputPanel({
         if (copyRequestSeqRef.current !== requestSeq) return;
         if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
         setCopiedKey(itemKey);
-        copiedTimerRef.current = setTimeout(() => {
-          if (copyRequestSeqRef.current !== requestSeq) return;
+        const timer = setTimeout(() => {
+          if (copiedTimerRef.current !== timer) return;
           copiedTimerRef.current = null;
           setCopiedKey((prev) => (prev === itemKey ? null : prev));
         }, 1500);
+        copiedTimerRef.current = timer;
       },
     );
   };
