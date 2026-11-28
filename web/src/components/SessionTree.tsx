@@ -471,7 +471,7 @@ function SessionTreeInner({
             {directSubs.length > 0 && (
               <div class="session-tree-direct-shared" role="group" data-testid="session-tree-direct-shared">
                 <div class="session-tree-direct-shared-header">
-                  {t('share.sharedWithMe.directSubSessions', 'Shared sub-sessions')}
+                  {t('share.sharedWithMe.directSubSessions', 'Collaborative sub-sessions')}
                 </div>
                 {directSubs.map((sub) => renderSubNode(sub))}
               </div>

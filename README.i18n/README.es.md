@@ -2,7 +2,7 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**Workbench de AI Force autoalojado, de código disponible y sin vendor lock-in: Task Pairs y Execution Pool multi-proveedor, Nodos Controlados y Computer Use detrás de NAT, Escritorio Remoto 4K integrado, Cloud Docs + ONLYOFFICE y compartición en equipo.**
+**Workbench de AI Force autoalojado, de código disponible y sin vendor lock-in: Task Pairs y Execution Pool multi-proveedor, Nodos Controlados y Computer Use detrás de NAT, Escritorio Remoto 4K integrado, Cloud Docs + ONLYOFFICE y colaboración en equipo en tiempo real.**
 
 > Deja de chatear con una sola IA. Dirige una AI Force.<br>
 > Un solo workbench: cada modelo y cada máquina bajo tu mando.<br>
@@ -20,7 +20,7 @@ IM.codes unifica tus agentes de IA, máquinas remotas y documentación del equip
 | **Nodos Controlados y AI Computer Use (`OCU`)** | Convierte máquinas Linux, Windows y macOS detrás de NAT en nodos operados por IA sin IP pública, VPN ni puertos abiertos. Ejecución `exec_remote` acotada, transferencia directa/relé y automatización GUI/CDP mediante `computer_use_call` (`^^(nodeId)`). |
 | **Escritorio Remoto 4K integrado** | Integrado directamente en IM.codes sin cuotas adicionales de escritorio remoto bajo tu licencia de IM.codes. Abre escritorios 4K de Windows, macOS y Linux desde navegador o móvil, supervisa hasta 4 equipos en el Muro Desktop y mantén siempre el control humano final. |
 | **Cloud Docs y edición colaborativa (`ONLYOFFICE`)** | Cloud Docs + ONLYOFFICE + DocBuilder integrados. Guarda especificaciones, runbooks y AI Skills, inyecta cualquier documento con `&` en el chat y crea, convierte y edita DOCX/XLSX/PPTX/Markdown en equipo. |
-| **Compartición en equipo y control de acceso** | Comparte Nodos Controlados, sesiones/sub-sesiones y Cloud Docs por usuario o grupo (`viewer` o `participant`) con revocación en un clic; grupos privados aíslan tus equipos personales y familiares. |
+| **Colaboración en tiempo real y control de acceso** | Colabora en tiempo real en ordenadores de desarrollo del equipo, Nodos Controlados, sesiones/sub-sesiones y Cloud Docs por usuario o grupo (`viewer` o `participant`) con revocación en un clic; grupos privados aíslan tus equipos personales y familiares. |
 | **Sincronización de 3 pantallas e iPhone Duo** | Continuidad fluida entre escritorio, tablet, **iPhone Duo / Plegable**, móvil y Apple Watch con pestañas y paneles sincronizados. |
 
 ## Capturas
@@ -99,9 +99,9 @@ Cloud Docs integrado con ONLYOFFICE y DocBuilder para mantener especificaciones,
 
 - **Inyección instantánea con `&`.** Escribe `&` en el composer o usa la herramienta MCP `cloud_docs` para listar, leer, editar, convertir y compartir documentos DOCX/XLSX/PPTX/Markdown.
 
-## Compartición en equipo y espacios colaborativos
+## Colaboración en equipo en tiempo real (equipos, servidores y escritorios)
 
-Comparte Nodos Controlados, sesiones vivas, sub-sesiones y Cloud Docs por usuario o grupo con roles `viewer` (solo lectura) o `participant` (envío de prompts y operación), revocación en un clic y grupos privados para máquinas personales.
+Trabaja en equipo en tiempo real sobre ordenadores de desarrollo dedicados, Nodos Controlados, sesiones vivas, sub-sesiones y Cloud Docs — igual que un escritorio remoto y pair programming sobre el mismo proyecto — con roles `viewer` (observación de solo lectura) o `participant` (pair programming, envío de prompts y operación en nodos autorizados), revocación en un clic y grupos privados para máquinas personales.
 
 ## Descarga
 
@@ -132,7 +132,7 @@ Para cambios basados en OpenSpec, Auto Deliver convierte un change folder en una
 
 ## Programación colaborativa
 
-Comparte una pestaña, sub-sesión o source server completo con otro usuario. Usa `viewer` para review de solo lectura o `participant` cuando un teammate deba enviar prompts a las sesiones cubiertas. Los mensajes compartidos llevan actor label y el acceso puede degradarse o revocarse desde la UI.
+Colabora en tiempo real en una pestaña, sub-sesión o equipo de desarrollo del equipo con otro compañero. Usa `viewer` para review de solo lectura o `participant` cuando un teammate deba hacer pair programming y enviar prompts a las sesiones cubiertas. Los mensajes colaborativos llevan actor label y el acceso puede degradarse o revocarse desde la UI.
 
 ## Shared Agent Context y memoria
 
@@ -205,7 +205,7 @@ Soporte completo para móvil, autenticación biométrica, notificaciones push, e
 Ejecuta un cambio guiado por spec mediante un pipeline estructurado: auditoría proposal/spec, prompts de implementación, sugerencias de validación basadas en manifests, auditoría/retrabajo Team, scoring automático de spec/tasks/implementation/tests/risk y handoff fail-closed visible.
 
 ### Programación colaborativa
-Comparte una sesión viva para pair programming, o invita a más personas a un workspace de servidor con alcance mediante roles viewer/participant.
+Colabora en una sesión viva para pair programming, o invita a compañeros a un workspace de servidor de desarrollo con alcance mediante roles viewer/participant.
 
 ### Auditoría cross-modelo y discusiones Team
 La salida de un solo modelo no debería confiarse ciegamente. Las discusiones Team permiten que múltiples agentes — de distintos proveedores y estilos de pensamiento — colaboren en el análisis del mismo código antes de escribir una sola línea. Cada ronda sigue un pipeline multifase personalizable, donde cada agente lee todas las contribuciones anteriores. Diferentes modelos detectan diferentes tipos de problemas. Esta revisión cruzada entre proveedores encuentra problemas que un solo modelo suele pasar por alto antes de la implementación, reduciendo el retrabajo.

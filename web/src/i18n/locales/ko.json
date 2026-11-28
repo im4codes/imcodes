@@ -167,21 +167,21 @@
         "daemon_offline": "이 세션이 실행 중인 머신이 오프라인이라 중지를 전달하지 못했습니다.",
         "ack_timeout": "머신이 제때 중지를 확인하지 않았습니다. 바쁜 상태일 수 있으니 다시 시도하세요.",
         "daemon_error": "중지 중 머신에서 오류가 보고되었습니다. 다시 시도하세요.",
-        "outside_share": "이 세션은 공유받은 범위 밖이라 중지할 수 없습니다.",
+        "outside_share": "이 세션은 협업 범위 밖이라 중지할 수 없습니다.",
         "rate_limited": "이 세션에 대한 중지 요청이 너무 많습니다. 1분 후 다시 시도하세요.",
         "dispatch_changed": "마지막으로 확인한 이후 실행 중인 턴이 바뀌었습니다. 현재 턴을 중지하려면 중지를 다시 누르세요.",
         "unsupported": "참가자는 이 유형의 세션을 중지할 수 없습니다.",
-        "role_denied": "이 공유에서 내 역할로는 중지할 수 없습니다.",
+        "role_denied": "이 협업에서 내 역할로는 중지할 수 없습니다.",
         "access_ended": "이 세션에 대한 접근이 종료되었습니다.",
         "generic": "중지를 적용하지 못했습니다. 다시 시도하세요."
       }
     },
     "menu": {
-      "shareTab": "공유"
+      "shareTab": "협업"
     },
     "shell_participant_forbidden": "공유 참여자는 AI 에이전트 세션만 사용할 수 있으며 shell / script 세션은 소유자 전용입니다.",
-    "dialogTitle": "액세스 공유",
-    "dialogSubtitle": "{{target}}에 범위가 제한된 액세스를 부여합니다.",
+    "dialogTitle": "실시간 협업",
+    "dialogSubtitle": "{{target}}에서 함께 작업할 협업자를 초대합니다.",
     "target": {
       "label": "대상",
       "currentTab": "현재 탭",
@@ -206,45 +206,45 @@
       "body": "에이전트는 샌드박스 처리되지 않습니다. UI/API 제한은 직접 제어를 줄이지만, 참가자 프롬프트는 접근 가능한 환경에서 동작하는 에이전트에 영향을 줄 수 있습니다."
     },
     "recipient": {
-      "label": "받는 사람",
+      "label": "협업자",
       "placeholder": "사용자 ID 또는 이메일"
     },
     "list": {
-      "label": "공유 사용자",
-      "title": "공유 사용자",
-      "empty": "아직 공유 사용자가 없습니다"
+      "label": "협업자",
+      "title": "협업자",
+      "empty": "아직 협업자가 없습니다"
     },
     "manage": {
       "roleFor": "{{user}}의 역할",
       "revoke": "철회",
-      "revokeConfirm": "{{user}}의 액세스를 철회할까요?"
+      "revokeConfirm": "{{user}}의 협업 권한을 해제할까요?"
     },
     "sharedWithMe": {
-      "title": "나에게 공유됨",
-      "empty": "공유된 탭 또는 서버가 없습니다",
-      "refresh": "공유 액세스 새로고침",
-      "collapse": "공유 목록 접기",
-      "expand": "공유 목록 펼치기",
-      "count": "공유 항목 {{count}}개",
+      "title": "초대된 협업",
+      "empty": "협업 중인 탭 또는 서버가 없습니다",
+      "refresh": "협업 목록 새로고침",
+      "collapse": "협업 목록 접기",
+      "expand": "협업 목록 펼치기",
+      "count": "협업 항목 {{count}}개",
       "guideReturn": "{{server}}로 돌아가기",
       "guideDismiss": "확인",
-      "openTimeout": "공유 접근 열기 시간이 초과되었습니다. 다시 시도해 주세요.",
-      "openFailed": "공유 접근을 열지 못했습니다. 다시 시도해 주세요.",
+      "openTimeout": "협업 워크스페이스 열기 시간이 초과되었습니다. 다시 시도해 주세요.",
+      "openFailed": "협업 워크스페이스를 열지 못했습니다. 다시 시도해 주세요.",
       "kind": {
         "server": "서버",
         "tab": "탭",
         "subsession": "하위 세션"
       }
     },
-    "create": "공유 만들기",
-    "creating": "만드는 중...",
+    "create": "협업자 추가",
+    "creating": "추가 중...",
     "scope": {
-      "current": "공유 범위"
+      "current": "협업 범위"
     },
-    "indicator": "{{scope}}이(가) {{role}}로 공유됨 · {{status}}",
-    "indicatorCompact": "{{role}}로 공유됨 · {{status}}",
-    "indicatorSharedOut": "다른 사용자와 공유됨",
-    "indicatorSharedIn": "나에게 공유됨",
+    "indicator": "{{scope}} · {{role}} 역할로 협업 중 · {{status}}",
+    "indicatorCompact": "{{role}} 역할로 협업 중 · {{status}}",
+    "indicatorSharedOut": "팀과 협업 중",
+    "indicatorSharedIn": "초대된 협업",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "활성",
@@ -254,14 +254,14 @@
     },
     "reason": {
       "share-role-denied": "이 역할은 해당 작업을 사용할 수 없습니다.",
-      "share-direct-surface-denied": "이 화면은 공유 액세스에서 사용할 수 없습니다.",
-      "share-rate-limited": "공유 작업이 너무 많습니다. 잠시 후 다시 시도하세요.",
-      "share-revoked": "이 공유는 철회되었습니다.",
-      "share-expired": "이 공유는 만료되었습니다.",
-      "share-target-unavailable": "공유 대상을 사용할 수 없습니다.",
-      "share-role-changed": "공유 역할이 변경되었습니다.",
-      "share-ticket-invalid": "공유 액세스 티켓이 유효하지 않습니다.",
-      "share-cancel-unsupported": "이 공유 탭에서는 취소가 지원되지 않습니다.",
+      "share-direct-surface-denied": "이 화면은 협업 모드에서 사용할 수 없습니다.",
+      "share-rate-limited": "협업 작업이 너무 많습니다. 잠시 후 다시 시도하세요.",
+      "share-revoked": "이 협업 액세스는 철회되었습니다.",
+      "share-expired": "이 협업 액세스는 만료되었습니다.",
+      "share-target-unavailable": "협업 대상을 사용할 수 없습니다.",
+      "share-role-changed": "협업 역할이 변경되었습니다.",
+      "share-ticket-invalid": "협업 액세스 티켓이 유효하지 않습니다.",
+      "share-cancel-unsupported": "이 협업 탭에서는 취소가 지원되지 않습니다.",
       "share-audit-duplicate": "이 작업은 이미 기록되었습니다.",
       "share-comment-invalid": "댓글을 게시할 수 없습니다."
     },
@@ -5705,9 +5705,9 @@
       },
       "controlledNodes": {
         "pill": "제어 노드",
-        "title": "제어 노드 및 공유 그룹",
-        "tagline": "원격 실행, 파일 전송 및 문서 권한용 그룹을 함께 관리합니다.",
-        "summary": "다른 머신을 제어 노드(`^` / `^^(이름)`)로 등록해 원격 명령과 파일 전송을 수행하고, 「제어 노드 → 그룹」에서 멤버와 서버를 묶어 문서 공유 권한에도 바로 재사용할 수 있습니다.",
+        "title": "제어 노드 및 협업 그룹",
+        "tagline": "원격 실행, 파일 전송 및 팀 협업·문서 권한용 그룹을 함께 관리합니다.",
+        "summary": "다른 머신을 제어 노드(`^` / `^^(이름)`)로 등록해 원격 명령과 파일 전송을 수행하고, 「제어 노드 → 그룹」에서 멤버와 서버를 묶어 실시간 머신 협업과 문서 권한에도 바로 재사용할 수 있습니다.",
         "tip_1": "「제어 노드 → 그룹」에서 그룹을 만들고 서버와 멤버를 추가하세요.",
         "tip_2": "`^` 멘션이나 원격 MCP 도구(`exec_remote`, 파일 전송)로 노드를 제어하세요.",
         "tip_3": "설정 화면에서 개별 노드 토큰을 즉시 비활성화하거나 폐기할 수 있습니다."
@@ -5773,7 +5773,7 @@
     "logout": "로그아웃",
     "tabs": {
       "label": "대시보드 섹션",
-      "devices": "기기 및 공유",
+      "devices": "기기 및 협업",
       "api_keys": "API 키",
       "account": "보안 및 계정"
     }

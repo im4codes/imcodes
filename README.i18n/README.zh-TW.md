@@ -2,7 +2,7 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**自託管、源碼可用、零廠商綁定的 AI Force 工作台：跨廠商 Task Pairs 與執行池、內網穿透受控節點與 Computer Use、內建 4K 遠端桌面、雲端文件 + ONLYOFFICE，以及團隊共享。**
+**自託管、源碼可用、零廠商綁定的 AI Force 工作台：跨廠商 Task Pairs 與執行池、內網穿透受控節點與 Computer Use、內建 4K 遠端桌面、雲端文件 + ONLYOFFICE，以及電腦/桌面即時團隊協作。**
 
 > 別再只和一個 AI 對話，指揮一整支 AI Force。<br>
 > 一座工作台，調遣所有模型與機器。<br>
@@ -20,7 +20,7 @@ IM.codes 將 AI Agent、遠端電腦與團隊文件統一至同一座即時工�
 | **受控節點與 AI Computer Use（OCU）** | 無需公網 IP、VPN 或連接埠轉發，將內網 Linux、Windows、macOS 機器接入為 AI 可操作節點；支援有作用域的 `exec_remote`、直連/中繼檔案傳輸及 `computer_use_call` 型別化 GUI/CDP 瀏覽器自動化（`^^(nodeId)`）。 |
 | **內建 4K 遠端桌面（遠桌）** | 直接內建於 IM.codes，在授權範圍內使用無需額外購買第三方遠端桌面服務。瀏覽器或手機隨時連線 Windows、macOS、Linux 桌面，支援四分屏多機桌面牆，人類始終擁有最終控制權。 |
 | **雲端文件與協作編輯（ONLYOFFICE）** | 內建雲端文件 + ONLYOFFICE + DocBuilder。統一存放規範、Runbook 與 AI Skills，以 `&` 選擇器直接注入對話，協作建立、轉換、編輯與分享 DOCX/XLSX/PPTX/Markdown。 |
-| **團隊共享與精細權限控制** | 依個人或群組分享受控節點、即時會話/子會話與雲端文件（`viewer` 或 `participant`），支援一鍵撤銷；私有群組可將個人與家庭設備徹底隔離。 |
+| **電腦/桌面即時協作** | 依個人或群組在團隊開發機、受控節點、即時會話/子會話與雲端文件上即時協作（`viewer` 或 `participant`），支援一鍵撤銷；私有群組可將個人與家庭設備徹底隔離。 |
 | **三螢幕協同與 iPhone Duo** | 桌面、平板、**iPhone Duo / 摺疊螢幕雙螢幕**、手機與 Apple Watch 無縫銜接，標籤與面板跨端同步。 |
 
 ## 截圖展示
@@ -100,12 +100,12 @@ IM.codes 將 AI Agent、遠端電腦與團隊文件統一至同一座即時工�
 - **`&` 選擇器一鍵注入對話。** 在輸入框輸入 `&` 即可選擇並注入任何雲端文件，SDK Agent 也能透過託管 `cloud_docs` MCP 工具列表、讀取、編輯、轉換與分享文件。
 - **ONLYOFFICE + DocBuilder。** 線上協作編輯 DOCX、XLSX、PPTX 與 Markdown，支援格式轉換與團隊權限共享。
 
-## 團隊共享與協作空間
+## 電腦、伺服器與桌面即時團隊協作
 
-依個人或群組精細分享受控節點、即時會話、子會話與雲端文件，同時守住基礎設施控制權。
+依個人或群組在團隊開發電腦、受控節點、即時會話、子會話與雲端文件上展開即時協作——如同在同一個專案上使用遠端桌面與結對程式設計——同時守住基礎設施控制權。
 
-- **分級角色。** `viewer` 適合唯讀旁觀與審閱；`participant` 可向覆蓋會話送出 prompt 或操作授權節點，訊息自動標註真人 actor。
-- **一鍵撤銷與私有群組。** 隨時降級或撤銷權限，並透過私有群組將個人與家庭電腦與團隊工作空間徹底隔離。
+- **分級角色。** `viewer` 適合唯讀旁觀與審閱；`participant` 可在授權團隊開發機上即時結對協作、向覆蓋會話送出 prompt 或操作節點，協作訊息自動標註真人 actor。
+- **一鍵撤銷與私有群組。** 隨時降級或撤銷協作權限，並透過私有群組將個人與家庭電腦與團隊協作工作空間徹底隔離。
 
 ## 下载
 
@@ -136,7 +136,7 @@ IM.codes 將 AI Agent、遠端電腦與團隊文件統一至同一座即時工�
 
 ## 協作編程
 
-把目前標籤頁、子 session 或整台 source server 分享給其他使用者。`viewer` 適合唯讀 review；`participant` 可以向覆蓋範圍內的 session 送出 prompt。Shared message 會標註真人 actor，權限可在 UI 中降級或撤銷。
+邀請協作者加入目前標籤頁、子 session 或團隊開發伺服器展開即時協作。`viewer` 適合唯讀 review；`participant` 可以在覆蓋範圍內的 session 中即時結對協作並送出 prompt。協作訊息會標註真人 actor，權限可在 UI 中降級或撤銷。
 
 ## 共享代理上下文與記憶
 
@@ -215,7 +215,7 @@ IM.codes 可用你自己的 supervisor 提示詞對支援的 agent session 做�
 
 ### 協作編程
 
-把即時 session 分享給另一個人做 pair programming，或邀請多人進入有作用域的 server 工作區，並用 viewer/participant 區分權限。
+在即時 session 中與隊友一起進行 pair programming 即時協作，或邀請多人進入有作用域的開發機/server 工作區，並用 viewer/participant 區分權限。
 
 ### 跨模型稽核與團隊討論
 

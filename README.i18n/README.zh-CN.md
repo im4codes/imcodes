@@ -2,7 +2,7 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**自托管、源码可用、零厂商绑定的 AI Force 工作台：跨厂商 Task Pairs 与执行池、内网穿透受控节点与 Computer Use、内置 4K 远程桌面、云文档 + ONLYOFFICE，以及团队共享。**
+**自托管、源码可用、零厂商绑定的 AI Force 工作台：跨厂商 Task Pairs 与执行池、内网穿透受控节点与 Computer Use、内置 4K 远程桌面、云文档 + ONLYOFFICE，以及电脑/桌面实时团队协作。**
 
 > 别再只和一个 AI 对话，指挥一整支 AI Force。<br>
 > 一座工作台，调遣所有模型与机器。<br>
@@ -20,7 +20,7 @@ IM.codes 把 AI Agent、远程电脑与团队文档统一到同一座实时工�
 | **受控节点与 AI Computer Use（OCU）** | 无需公网 IP、VPN 或端口映射，把内网 Linux、Windows、macOS 机器接入为 AI 可操作节点；支持有作用域的 `exec_remote`、直连/中继文件传输及 `computer_use_call` 类型化 GUI/CDP 浏览器自动化（`^^(nodeId)`）。 |
 | **内置 4K 远程桌面（远桌）** | 直接内置于 IM.codes，在许可范围内使用无需额外购买第三方远程桌面服务。浏览器或手机随时连接 Windows、macOS、Linux 桌面，支持 4 分屏多机桌面墙，人类始终拥有最终控制权。 |
 | **云文档与协同编辑（ONLYOFFICE）** | 内置云文档 + ONLYOFFICE + DocBuilder。统一存放规范、Runbook 与 AI Skills，用 `&` 选择器直接注入对话，协同创建、转换、编辑与分享 DOCX/XLSX/PPTX/Markdown。 |
-| **团队共享与精细权限控制** | 按人或分组共享受控节点、实时会话/子会话与云文档（`viewer` 或 `participant`），支持一键撤销；私有分组可将个人与家庭设备彻底隔离。 |
+| **电脑/桌面实时协作** | 按人或分组在团队开发机、受控节点、实时会话/子会话与云文档上实时协作（`viewer` 或 `participant`），支持一键撤销；私有分组可将个人与家庭设备彻底隔离。 |
 | **三屏协同与 iPhone Duo** | 桌面、平板、**iPhone Duo / 折叠屏双屏**、手机与 Apple Watch 无缝衔接，标签与面板跨端同步。 |
 
 ## 截图展示
@@ -100,12 +100,12 @@ IM.codes 把 AI Agent、远程电脑与团队文档统一到同一座实时工�
 - **`&` 选择器一键注入对话。** 在输入框输入 `&` 即可选择并注入任何云文档，SDK Agent 也能通过托管 `cloud_docs` MCP 工具列表、读取、编辑、转换与分享文档。
 - **ONLYOFFICE + DocBuilder。** 在线协同编辑 DOCX、XLSX、PPTX 与 Markdown，支持格式转换与团队权限共享。
 
-## 团队共享与协作空间
+## 电脑、服务器与桌面实时团队协作
 
-按人或分组精细分享受控节点、实时会话、子会话与云文档，同时守住基础设施控制权。
+按人或分组在团队开发电脑、受控节点、实时会话、子会话与云文档上开展实时协作——如同在同一个项目上使用远程桌面和结对编程——同时守住基础设施控制权。
 
-- **分级角色。** `viewer` 适合只读旁观与审阅；`participant` 可向覆盖会话发送 prompt 或操作授权节点，消息自动标注真人 actor。
-- **一键撤销与私有分组。** 随时降级或撤销权限，并通过私有分组将个人与家庭电脑与团队工作空间彻底隔离。
+- **分级角色。** `viewer` 适合只读旁观与审阅；`participant` 可在授权团队开发机上实时结对协作、向覆盖会话发送 prompt 或操作节点，协作消息自动标注真人 actor。
+- **一键撤销与私有分组。** 随时降级或撤销协作权限，并通过私有分组将个人与家庭电脑与团队协作工作空间彻底隔离。
 
 ## 下载
 
@@ -136,7 +136,7 @@ IM.codes 把 AI Agent、远程电脑与团队文档统一到同一座实时工�
 
 ## 协作编程
 
-把当前标签页、子会话或整台 source server 分享给其他用户。`viewer` 适合只读 review；`participant` 可以向覆盖范围内的会话发送 prompt。Shared message 会标注真人 actor，权限可在 UI 中降级或撤销。
+邀请协作者加入当前标签页、子会话或团队开发服务器开展实时协作。`viewer` 适合只读 review；`participant` 可以在覆盖范围内的会话中实时结对协作并发送 prompt。协作消息会标注真人 actor，权限可在 UI 中降级或撤销。
 
 ## 共享代理上下文与记忆
 
@@ -215,7 +215,7 @@ IM.codes 可用你自己的 supervisor 提示词对支持的 agent session 做�
 
 ### 协作编程
 
-把实时 session 分享给另一个人做 pair programming，或邀请多人进入有作用域的 server 工作区，并用 viewer/participant 区分权限。
+在实时 session 中与队友一起进行 pair programming 实时协作，或邀请多人进入有作用域的开发机/server 工作区，并用 viewer/participant 区分权限。
 
 ### 跨模型审计与团队讨论
 

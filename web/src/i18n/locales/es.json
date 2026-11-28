@@ -167,21 +167,21 @@
         "daemon_offline": "La máquina donde se ejecuta esta sesión está sin conexión, así que no se pudo entregar la detención.",
         "ack_timeout": "La máquina no confirmó la detención a tiempo. Puede estar ocupada; inténtalo de nuevo.",
         "daemon_error": "La máquina informó de un error al detener. Inténtalo de nuevo.",
-        "outside_share": "Esta sesión está fuera de lo que se compartió contigo, así que no puedes detenerla.",
+        "outside_share": "Esta sesión está fuera de tu ámbito de colaboración, así que no puedes detenerla.",
         "rate_limited": "Demasiadas solicitudes de detención para esta sesión. Espera un minuto e inténtalo de nuevo.",
         "dispatch_changed": "El turno en curso cambió desde la última vez que lo viste. Pulsa Detener otra vez para detener el actual.",
         "unsupported": "Los participantes no pueden detener este tipo de sesión.",
-        "role_denied": "Tu rol en este acceso compartido no permite detener.",
+        "role_denied": "Tu rol en esta colaboración no permite detener.",
         "access_ended": "Tu acceso a esta sesión ha terminado.",
         "generic": "No se pudo aplicar la detención. Inténtalo de nuevo."
       }
     },
     "menu": {
-      "shareTab": "Compartir"
+      "shareTab": "Colaborar"
     },
     "shell_participant_forbidden": "Los participantes compartidos solo pueden usar sesiones de agentes de IA; shell y script son exclusivos del propietario.",
-    "dialogTitle": "Compartir acceso",
-    "dialogSubtitle": "Concede acceso limitado a {{target}}.",
+    "dialogTitle": "Colaboración en tiempo real",
+    "dialogSubtitle": "Invita a colaboradores a trabajar juntos en {{target}}.",
     "target": {
       "label": "Destino",
       "currentTab": "Pestaña actual",
@@ -206,45 +206,45 @@
       "body": "Los agentes no están en una zona aislada. Los límites de UI/API reducen controles directos, pero una indicación de participante puede influir en un agente que actúa en su entorno accesible."
     },
     "recipient": {
-      "label": "Destinatario",
+      "label": "Colaborador",
       "placeholder": "ID de usuario o correo"
     },
     "list": {
-      "label": "Usuarios compartidos",
-      "title": "Usuarios compartidos",
-      "empty": "Aún no hay usuarios compartidos"
+      "label": "Colaboradores",
+      "title": "Colaboradores",
+      "empty": "Aún no hay colaboradores"
     },
     "manage": {
       "roleFor": "Rol para {{user}}",
       "revoke": "Revocar",
-      "revokeConfirm": "¿Revocar el acceso de {{user}}?"
+      "revokeConfirm": "¿Quitar a {{user}} de la colaboración?"
     },
     "sharedWithMe": {
-      "title": "Compartido conmigo",
-      "empty": "No hay pestañas ni servidores compartidos",
-      "refresh": "Actualizar acceso compartido",
-      "collapse": "Contraer elementos compartidos",
-      "expand": "Expandir elementos compartidos",
-      "count": "{{count}} elementos compartidos",
+      "title": "Colaboraciones",
+      "empty": "No hay pestañas ni servidores en colaboración",
+      "refresh": "Actualizar colaboraciones",
+      "collapse": "Contraer colaboraciones",
+      "expand": "Expandir colaboraciones",
+      "count": "{{count}} colaboraciones",
       "guideReturn": "Volver a {{server}}",
       "guideDismiss": "Entendido",
-      "openTimeout": "Se agotó el tiempo para abrir el acceso compartido. Inténtalo de nuevo.",
-      "openFailed": "No se pudo abrir el acceso compartido. Inténtalo de nuevo.",
+      "openTimeout": "Se agotó el tiempo para abrir la colaboración. Inténtalo de nuevo.",
+      "openFailed": "No se pudo abrir la colaboración. Inténtalo de nuevo.",
       "kind": {
         "server": "Servidor",
         "tab": "Pestaña",
         "subsession": "Subsesión"
       }
     },
-    "create": "Crear recurso compartido",
-    "creating": "Creando...",
+    "create": "Añadir colaborador",
+    "creating": "Añadiendo...",
     "scope": {
-      "current": "Alcance compartido"
+      "current": "Ámbito de colaboración"
     },
-    "indicator": "{{scope}} compartido como {{role}} · {{status}}",
-    "indicatorCompact": "Compartido como {{role}} · {{status}}",
-    "indicatorSharedOut": "Compartido con otros",
-    "indicatorSharedIn": "Compartido conmigo",
+    "indicator": "{{scope}} · colaborando como {{role}} · {{status}}",
+    "indicatorCompact": "Colaborando como {{role}} · {{status}}",
+    "indicatorSharedOut": "Colaborando con el equipo",
+    "indicatorSharedIn": "En colaboración",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "Activo",
@@ -254,14 +254,14 @@
     },
     "reason": {
       "share-role-denied": "Este rol no puede usar esa acción.",
-      "share-direct-surface-denied": "Esta superficie no está disponible con acceso compartido.",
-      "share-rate-limited": "Demasiadas acciones compartidas. Inténtalo de nuevo pronto.",
-      "share-revoked": "Este recurso compartido fue revocado.",
-      "share-expired": "Este recurso compartido caducó.",
-      "share-target-unavailable": "El destino compartido no está disponible.",
-      "share-role-changed": "El rol compartido cambió.",
-      "share-ticket-invalid": "El ticket de acceso compartido no es válido.",
-      "share-cancel-unsupported": "Cancelar no es compatible con esta pestaña compartida.",
+      "share-direct-surface-denied": "Esta superficie no está disponible en modo colaboración.",
+      "share-rate-limited": "Demasiadas acciones de colaboración. Inténtalo de nuevo pronto.",
+      "share-revoked": "Se revocó este acceso de colaboración.",
+      "share-expired": "Este acceso de colaboración caducó.",
+      "share-target-unavailable": "El destino de colaboración no está disponible.",
+      "share-role-changed": "Tu rol de colaboración cambió.",
+      "share-ticket-invalid": "El ticket de acceso de colaboración no es válido.",
+      "share-cancel-unsupported": "Cancelar no es compatible con esta pestaña colaborativa.",
       "share-audit-duplicate": "Esta acción ya fue registrada.",
       "share-comment-invalid": "No se pudo publicar el comentario."
     },
@@ -5706,8 +5706,8 @@
       "controlledNodes": {
         "pill": "Nodos",
         "title": "Nodos controlados y grupos",
-        "tagline": "Ejecución remota, transferencia de archivos y grupos globales.",
-        "summary": "Registra máquinas como nodos controlados (`^` / `^^(nombre)`) para ejecutar comandos o mover archivos, y organiza máquinas y miembros en Nodos controlados → Grupos para reutilizarlos en permisos de documentos.",
+        "tagline": "Ejecución remota, transferencia de archivos y grupos de colaboración.",
+        "summary": "Registra máquinas como nodos controlados (`^` / `^^(nombre)`) para ejecutar comandos o mover archivos, y organiza máquinas y colaboradores en Nodos controlados → Grupos para colaboración en equipo y permisos de documentos.",
         "tip_1": "Crea grupos y arrastra servidores desde Nodos controlados → Grupos.",
         "tip_2": "Dirígete a un nodo usando `^` o las herramientas MCP remotas.",
         "tip_3": "Desactiva o revoca tokens de nodos al instante desde Ajustes."
@@ -5773,7 +5773,7 @@
     "logout": "Cerrar sesión",
     "tabs": {
       "label": "Secciones del panel",
-      "devices": "Dispositivos y compartidos",
+      "devices": "Dispositivos y colaboración",
       "api_keys": "Claves API",
       "account": "Seguridad y cuenta"
     }

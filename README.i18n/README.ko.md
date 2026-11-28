@@ -2,7 +2,7 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**셀프 호스팅 · 소스 공개 · 벤더 종속 없는 AI Force 워크벤치: 크로스 벤더 Task Pairs & Execution Pool, NAT 뒤 제어 노드 & Computer Use, 내장 4K 원격 데스크톱, Cloud Docs + ONLYOFFICE, 팀 공유.**
+**셀프 호스팅 · 소스 공개 · 벤더 종속 없는 AI Force 워크벤치: 크로스 벤더 Task Pairs & Execution Pool, NAT 뒤 제어 노드 & Computer Use, 내장 4K 원격 데스크톱, Cloud Docs + ONLYOFFICE, 실시간 팀 협업.**
 
 > 단 하나의 AI와 대화하지 마세요. AI Force를 지휘하세요.<br>
 > 하나의 워크벤치에서 모든 모델과 머신을 지휘합니다.<br>
@@ -20,7 +20,7 @@ IM.codes는 AI 에이전트, 원격 머신, 팀 문서를 하나의 실시간 �
 | **제어 노드 & AI Computer Use (`OCU`)** | 공인 IP, VPN, 포트 포워딩 없이 NAT 뒤 Linux / Windows / macOS 머신을 AI 조작 노드로 연결합니다. 범위 지정 `exec_remote`, 직접/릴레이 파일 전송, `computer_use_call` 기반 GUI·CDP 브라우저 자동화(`^^(nodeId)`)를 지원합니다. |
 | **내장 4K 원격 데스크톱** | 별도 원격 데스크톱 추가 요금 없이 기본 내장됩니다. 브라우저나 휴대폰에서 Windows / macOS / Linux 데스크톱을 4K로 제어하고, 4타일 Desktop Wall로 여러 호스트를 동시에 모니터링하며 최종 제어권은 항상 사람이 유지합니다. |
 | **Cloud Docs & 협업 편집 (`ONLYOFFICE`)** | ONLYOFFICE와 DocBuilder를 통합한 Cloud Docs를 내장합니다. 사양서, 런북, AI Skills를 보관하고 `&` 피커로 채팅에 즉시 주입하며 DOCX/XLSX/PPTX/Markdown을 공동 편집·변환·공유합니다. |
-| **팀 공유 & 접근 제어** | 제어 노드, 라이브 세션/서브 세션, Cloud Docs를 사용자·그룹 단위로 공유(`viewer` 또는 `participant`)하고 원클릭으로 회수합니다. 프라이빗 그룹으로 개인·가정용 머신을 깔끔하게 격리합니다. |
+| **실시간 팀 협업 및 접근 제어** | 팀 개발 PC, 제어 노드, 라이브 세션/서브 세션, Cloud Docs에서 사용자·그룹 단위로 실시간 협업(`viewer` 또는 `participant`)하고 원클릭으로 회수합니다. 프라이빗 그룹으로 개인·가정용 머신을 깔끔하게 격리합니다. |
 | **3화면 연동 & iPhone Duo** | 데스크톱, 태블릿, **iPhone Duo / 폴더블 듀얼 스크린**, 모바일, Apple Watch 간 탭과 패널이 매끄럽게 동기화됩니다. |
 
 ## 스크린샷
@@ -100,9 +100,9 @@ ONLYOFFICE와 DocBuilder가 내장된 Cloud Docs로 사양서, 런북, 아키텍
 - **`&` 피커로 채팅 즉시 주입.** `&`를 입력해 문서를 첨부하거나 `cloud_docs` MCP 도구로 조회·생성·편집·변환·공유를 수행합니다.
 - **ONLYOFFICE + DocBuilder.** DOCX / XLSX / PPTX / Markdown의 공동 편집과 포맷 변환을 지원합니다.
 
-## 팀 공유 & 접근 제어
+## 실시간 팀 협업 (PC · 서버 · 데스크톱)
 
-제어 노드, 라이브 세션, 서브 세션, Cloud Docs를 사용자 또는 그룹별로 공유하고 원클릭으로 권한을 낮추거나 철회할 수 있으며, 프라이빗 그룹으로 개인·가정용 머신을 안전하게 분리합니다.
+원격 데스크톱이나 페어 프로그래밍처럼 팀 개발 PC, 제어 노드, 라이브 세션, 서브 세션, Cloud Docs에서 사용자 또는 그룹 단위로 실시간 협업하고, `viewer` / `participant` 역할로 권한을 제어하며 원클릭으로 철회할 수 있습니다. 프라이빗 그룹으로 개인·가정용 머신을 안전하게 분리합니다.
 
 ## 다운로드
 
@@ -133,7 +133,7 @@ OpenSpec 기반 변경에서 Auto Deliver는 change folder를 end-to-end 감독�
 
 ## 협업 코딩
 
-현재 탭, sub-session, 또는 전체 source server를 다른 사용자에게 공유할 수 있습니다. `viewer`는 read-only review에, `participant`는 covered session에 prompt를 보낼 때 사용합니다. Shared message에는 actor label이 붙고 access는 UI에서 낮추거나 회수할 수 있습니다.
+현재 탭, sub-session, 또는 팀 개발 서버에서 다른 팀원과 실시간으로 협업할 수 있습니다. `viewer`는 read-only review에, `participant`는 허용된 covered session에서 페어 프로그래밍과 prompt 전송에 사용합니다. 협업 메시지에는 actor label이 붙고 access는 UI에서 낮추거나 회수할 수 있습니다.
 
 ## Shared Agent Context와 메모리
 
@@ -206,7 +206,7 @@ SSH, VPN, 포트 포워딩 없이 브라우저에서 agent session의 터미널�
 Spec-driven change를 구조화된 pipeline으로 진행합니다: proposal/spec audit, implementation prompts, manifest-aware validation hints, Team audit/rework, spec/tasks/implementation/tests/risk 자동 채점, fail-closed handoff.
 
 ### 협업 코딩
-Live session을 다른 사람에게 공유해 pair programming을 하거나, viewer/participant roles로 scoped server workspace에 여러 사람을 초대할 수 있습니다.
+Live session에서 팀원과 함께 pair programming을 하거나, viewer/participant roles로 scoped dev server workspace에 여러 사람을 초대할 수 있습니다.
 
 ### 크로스 모델 감사와 Team 토론
 단일 모델의 출력을 맹목적으로 신뢰해서는 안 됩니다. Team 토론은 서로 다른 프로바이더와 사고 방식을 가진 여러 agent가 코드 작성 전에 동일한 코드베이스에서 협력 분석을 수행합니다. 각 라운드는 커스터마이징 가능한 멀티 페이즈 파이프라인을 따르며, 각 agent는 이전 기여를 모두 읽은 후 출력합니다. 서로 다른 모델이 서로 다른 유형의 문제를 발견합니다. 이 크로스 프로바이더 교차 검토로 구현 전에 단일 모델이 자주 놓치는 문제를 찾아내어 재작업을 줄일 수 있습니다.

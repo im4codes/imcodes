@@ -167,21 +167,21 @@
         "daemon_offline": "このセッションが動いているマシンがオフラインのため、停止を届けられませんでした。",
         "ack_timeout": "マシンが時間内に停止を確認しませんでした。混み合っている可能性があります。もう一度お試しください。",
         "daemon_error": "停止中にマシンがエラーを報告しました。もう一度お試しください。",
-        "outside_share": "このセッションは共有された範囲外のため、停止できません。",
+        "outside_share": "このセッションはあなたの共同作業範囲外のため、停止できません。",
         "rate_limited": "このセッションへの停止リクエストが多すぎます。1分ほど待ってからもう一度お試しください。",
         "dispatch_changed": "最後に確認したときから実行中のターンが変わりました。もう一度「停止」を押すと現在のターンを停止します。",
         "unsupported": "参加者はこの種類のセッションを停止できません。",
-        "role_denied": "この共有でのあなたの役割では停止できません。",
+        "role_denied": "この共同作業でのあなたの役割では停止できません。",
         "access_ended": "このセッションへのアクセスは終了しました。",
         "generic": "停止を適用できませんでした。もう一度お試しください。"
       }
     },
     "menu": {
-      "shareTab": "共有"
+      "shareTab": "共同作業"
     },
     "shell_participant_forbidden": "共有参加者は AI エージェントセッションのみ利用できます。shell / script はオーナー専用です。",
-    "dialogTitle": "アクセスを共有",
-    "dialogSubtitle": "{{target}} へのスコープ付きアクセスを付与します。",
+    "dialogTitle": "リアルタイム共同作業",
+    "dialogSubtitle": "{{target}} で一緒に作業するメンバーを招待します。",
     "target": {
       "label": "対象",
       "currentTab": "現在のタブ",
@@ -206,45 +206,45 @@
       "body": "エージェントはサンドボックス化されていません。UI/API の制限は直接操作を減らしますが、参加者のプロンプトは、アクセス可能な環境で動作するエージェントに影響する可能性があります。"
     },
     "recipient": {
-      "label": "受信者",
+      "label": "共同作業者",
       "placeholder": "ユーザー ID またはメール"
     },
     "list": {
-      "label": "共有ユーザー",
-      "title": "共有ユーザー",
-      "empty": "共有ユーザーはまだいません"
+      "label": "共同作業者",
+      "title": "共同作業者",
+      "empty": "共同作業者はまだいません"
     },
     "manage": {
       "roleFor": "{{user}} のロール",
       "revoke": "取り消し",
-      "revokeConfirm": "{{user}} のアクセスを取り消しますか？"
+      "revokeConfirm": "{{user}} の共同作業アクセスを解除しますか？"
     },
     "sharedWithMe": {
-      "title": "自分に共有",
-      "empty": "共有されたタブまたはサーバーはありません",
-      "refresh": "共有アクセスを更新",
-      "collapse": "共有リストを折りたたむ",
-      "expand": "共有リストを展開",
-      "count": "共有 {{count}} 件",
+      "title": "招待された共同作業",
+      "empty": "共同作業中のタブまたはサーバーはありません",
+      "refresh": "共同作業リストを更新",
+      "collapse": "共同作業リストを折りたたむ",
+      "expand": "共同作業リストを展開",
+      "count": "共同作業 {{count}} 件",
       "guideReturn": "{{server}} に戻る",
       "guideDismiss": "了解",
-      "openTimeout": "共有アクセスの開始がタイムアウトしました。もう一度お試しください。",
-      "openFailed": "共有アクセスを開けませんでした。もう一度お試しください。",
+      "openTimeout": "共同作業ワークスペースの開始がタイムアウトしました。もう一度お試しください。",
+      "openFailed": "共同作業ワークスペースを開けませんでした。もう一度お試しください。",
       "kind": {
         "server": "サーバー",
         "tab": "タブ",
         "subsession": "サブセッション"
       }
     },
-    "create": "共有を作成",
-    "creating": "作成中...",
+    "create": "共同作業者を追加",
+    "creating": "追加中...",
     "scope": {
-      "current": "共有スコープ"
+      "current": "共同作業範囲"
     },
-    "indicator": "{{scope}} は {{role}} として共有中 · {{status}}",
-    "indicatorCompact": "{{role}} として共有中 · {{status}}",
-    "indicatorSharedOut": "他のユーザーと共有中",
-    "indicatorSharedIn": "共有されたサーバー",
+    "indicator": "{{scope}} · {{role}} として共同作業中 · {{status}}",
+    "indicatorCompact": "{{role}} として共同作業中 · {{status}}",
+    "indicatorSharedOut": "チームと共同作業中",
+    "indicatorSharedIn": "招待された共同作業",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "有効",
@@ -254,14 +254,14 @@
     },
     "reason": {
       "share-role-denied": "このロールではその操作を使用できません。",
-      "share-direct-surface-denied": "この画面は共有アクセスでは利用できません。",
-      "share-rate-limited": "共有操作が多すぎます。しばらくしてから再試行してください。",
-      "share-revoked": "この共有は取り消されました。",
-      "share-expired": "この共有は期限切れです。",
-      "share-target-unavailable": "共有対象を利用できません。",
-      "share-role-changed": "共有ロールが変更されました。",
-      "share-ticket-invalid": "共有アクセスチケットが無効です。",
-      "share-cancel-unsupported": "この共有タブではキャンセルはサポートされていません。",
+      "share-direct-surface-denied": "この画面は共同作業中は利用できません。",
+      "share-rate-limited": "共同作業の操作が多すぎます。しばらくしてから再試行してください。",
+      "share-revoked": "この共同作業アクセスは取り消されました。",
+      "share-expired": "この共同作業アクセスは期限切れです。",
+      "share-target-unavailable": "共同作業対象を利用できません。",
+      "share-role-changed": "共同作業ロールが変更されました。",
+      "share-ticket-invalid": "共同作業アクセスチケットが無効です。",
+      "share-cancel-unsupported": "この共同作業タブではキャンセルはサポートされていません。",
       "share-audit-duplicate": "この操作はすでに記録されています。",
       "share-comment-invalid": "コメントを投稿できませんでした。"
     },
@@ -5705,9 +5705,9 @@
       },
       "controlledNodes": {
         "pill": "管理ノード",
-        "title": "管理ノードと共有グループ",
-        "tagline": "リモート実行・ファイル転送・ドキュメント権限のグループ共通化。",
-        "summary": "他マシンを管理ノード（`^` / `^^(名前)`）として登録しコマンド実行やファイル転送を行えます。「管理ノード → グループ」でメンバーとサーバーを管理すると、ドキュメント共有権限にもそのまま再利用できます。",
+        "title": "管理ノードと共同作業グループ",
+        "tagline": "リモート実行・ファイル転送・共同作業およびドキュメント権限グループ。",
+        "summary": "他マシンを管理ノード（`^` / `^^(名前)`）として登録しコマンド実行やファイル転送を行えます。「管理ノード → グループ」でメンバーとサーバーを管理すると、PC・デスクトップ共同作業やドキュメント権限にもそのまま再利用できます。",
         "tip_1": "「管理ノード → グループ」でグループを作成しサーバーを追加します。",
         "tip_2": "`^` や MCP ツール（`exec_remote` / ファイル転送）で対象マシンを指定します。",
         "tip_3": "設定画面からノードごとのトークンをいつでも無効化・失効できます。"
@@ -5773,7 +5773,7 @@
     "logout": "ログアウト",
     "tabs": {
       "label": "ダッシュボードセクション",
-      "devices": "デバイスと共有",
+      "devices": "デバイスと共同作業",
       "api_keys": "APIキー",
       "account": "セキュリティとアカウント"
     }

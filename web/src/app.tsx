@@ -816,7 +816,7 @@ function formatSharedAccessError(
   t?: (key: string, options?: any) => string,
 ): string {
   if (error instanceof SharedOpenTimeoutError || (error instanceof Error && error.name === 'SharedOpenTimeoutError')) {
-    return t ? t('share.sharedWithMe.openTimeout') : 'Opening shared access timed out. Please try again.';
+    return t ? t('share.sharedWithMe.openTimeout') : 'Opening collaborative workspace timed out. Please try again.';
   }
   if (error instanceof ApiError) {
     try {

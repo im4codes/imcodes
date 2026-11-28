@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.i18n/README.zh-CN.md) | [繁體中文](README.i18n/README.zh-TW.md) | [Español](README.i18n/README.es.md) | [Русский](README.i18n/README.ru.md) | [日本語](README.i18n/README.ja.md) | [한국어](README.i18n/README.ko.md)
 
-**Self-hosted, source-available, zero-lock-in AI Force workbench: cross-vendor Task Pairs & Execution Pool, behind-NAT Controlled Nodes & Computer Use, built-in 4K Remote Desktop, Cloud Docs + ONLYOFFICE, and Team Sharing.**
+**Self-hosted, source-available, zero-lock-in AI Force workbench: cross-vendor Task Pairs & Execution Pool, behind-NAT Controlled Nodes & Computer Use, built-in 4K Remote Desktop, Cloud Docs + ONLYOFFICE, and Real-Time Team Collaboration.**
 
 > Stop chatting with one AI. Command an AI Force.<br>
 > One workbench — every model, every machine, under your command.<br>
@@ -20,7 +20,7 @@ IM.codes unifies your AI agents, computers, and team documents in one real-time 
 | **Controlled Nodes & AI Computer Use (`OCU`)** | Turn behind-NAT Linux, Windows, and macOS machines into AI-operated nodes — no public IP, VPN, or port forwarding. Scoped `exec_remote`, direct/relay file transfers, and typed GUI/CDP browser automation via `computer_use_call` (`^^(nodeId)`). |
 | **Built-in 4K Remote Desktop** | Built directly into IM.codes with no separate remote-desktop add-on fees under your IM.codes license. Open live 4K desktops across Windows, macOS, and Linux from any browser or phone, monitor up to 4 hosts on the Desktop Wall, and stay in ultimate human control anytime. |
 | **Cloud Docs & Collaborative Editing** | Built-in Cloud Docs + ONLYOFFICE + DocBuilder. Store specs, runbooks, and AI Skills, inject any doc straight into chat with `&`, and collaboratively create, convert, and edit DOCX/XLSX/PPTX/Markdown. |
-| **Team Sharing & Access Control** | Share Controlled Nodes, live sessions/sub-sessions, and Cloud Docs per user or group (`viewer` or `participant`) with one-click revoke; private groups keep personal and family machines isolated. |
+| **Real-Time Team Collaboration** | Collaborate in real time on team dev computers, Controlled Nodes, live sessions/sub-sessions, and Cloud Docs per user or group (`viewer` or `participant`) with one-click revoke; private groups keep personal and family machines isolated. |
 | **3-Screen & iPhone Duo Sync** | Seamless desktop, tablet, **iPhone Duo / Foldable** dual-screen span, mobile, and Apple Watch continuity with synced tabs, panels, and push notifications. |
 
 ## Screenshots
@@ -100,12 +100,12 @@ Keep specifications, runbooks, architecture notes, and AI Skills alongside your 
 - **Instant chat injection via `&` picker.** Type `&` in the composer to reference any Cloud Doc, or let SDK agents read, create, edit, convert, and share documents via the managed `cloud_docs` MCP tool.
 - **ONLYOFFICE + DocBuilder.** Collaboratively edit DOCX, XLSX, PPTX, and Markdown directly in the workbench, convert formats, and share read/edit access across your team.
 
-## Team Sharing & Collaborative Workspaces
+## Real-Time Team Collaboration (Computers, Servers & Desktops)
 
-Share Controlled Nodes, live coding tabs, sub-sessions, and Cloud Docs per user or group without giving up control of your infrastructure.
+Work together in real time on dedicated team dev computers, Controlled Nodes, live coding tabs, sub-sessions, and Cloud Docs — like Remote Desktop and pair programming on the same project — without giving up control of your infrastructure.
 
-- **Granular roles.** Grant `viewer` for read-only observation/review or `participant` when teammates should send prompts or operate covered nodes. Shared messages carry clear actor labels.
-- **One-click revoke & private groups.** Downgrade or revoke access anytime, and use private groups to keep personal or family machines strictly isolated from shared team workspaces.
+- **Granular roles.** Grant `viewer` for read-only observation/review or `participant` when teammates should pair-program, send prompts, or operate authorized team dev machines. Collaborative messages carry clear actor labels.
+- **One-click revoke & private groups.** Downgrade or revoke collaboration access anytime, and use private groups to keep personal or family machines strictly isolated from team collaboration workspaces.
 
 ## Download
 
@@ -137,7 +137,7 @@ For OpenSpec-based changes, Auto Deliver turns a change folder into an end-to-en
 
 ## Collaborative Coding
 
-Share a tab, sub-session, or whole source server with another user. Use `viewer` for read-only review or `participant` when a teammate should send prompts into the covered sessions. Shared messages carry actor labels, and access can be downgraded or revoked from the UI.
+Collaborate in real time on a tab, sub-session, or dedicated team dev computer/server with teammates. Use `viewer` for read-only review or `participant` when a teammate should pair-program and send prompts into the authorized sessions. Collaborative messages carry clear actor labels, and access can be downgraded or revoked from the UI.
 
 ## Shared Agent Context & Memory
 
@@ -218,7 +218,7 @@ Run a spec-driven change through a structured delivery pipeline: proposal/spec a
 
 ### Collaborative Coding
 
-Share a live session for pair programming, or invite more people into a scoped server workspace with viewer/participant roles.
+Collaborate on a live session for pair programming, or invite teammates into a scoped dev computer/server workspace with viewer/participant roles.
 
 ### Supervised Task Automation
 

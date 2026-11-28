@@ -167,21 +167,21 @@
         "daemon_offline": "此工作階段所在的機器已離線，停止指令未能送達。",
         "ack_timeout": "機器未在規定時間內確認停止，可能正忙，請重試。",
         "daemon_error": "機器在停止時回報了錯誤，請重試。",
-        "outside_share": "此工作階段不在分享給你的範圍內，無法停止。",
+        "outside_share": "此工作階段不在你的協作範圍內，無法停止。",
         "rate_limited": "此工作階段的停止請求過於頻繁，請等待一分鐘後再試。",
         "dispatch_changed": "目前執行的輪次已變更，請再點一次停止以停止最新的輪次。",
         "unsupported": "參與者無法停止這類工作階段。",
-        "role_denied": "你在此分享中的角色不允許停止。",
+        "role_denied": "你在此協作中的角色不允許停止。",
         "access_ended": "你對該工作階段的存取已結束。",
         "generic": "停止未能生效，請重試。"
       }
     },
     "menu": {
-      "shareTab": "分享"
+      "shareTab": "協作"
     },
     "shell_participant_forbidden": "共享參與者僅可使用大模型工作階段，不可建立或操作 shell / script 終端機工作階段。",
-    "dialogTitle": "分享存取權",
-    "dialogSubtitle": "授予 {{target}} 受限存取權。",
+    "dialogTitle": "即時協作",
+    "dialogSubtitle": "邀請協作者加入 {{target}} 一起協作。",
     "target": {
       "label": "目標",
       "currentTab": "目前標籤",
@@ -206,45 +206,45 @@
       "body": "代理未被沙箱隔離。UI/API 限制會減少直接控制面，但參與者提示仍可能影響代理在其可存取環境中的行為。"
     },
     "recipient": {
-      "label": "接收者",
+      "label": "協作者",
       "placeholder": "使用者 ID 或電子郵件"
     },
     "list": {
-      "label": "分享使用者",
-      "title": "分享使用者",
-      "empty": "尚無分享使用者"
+      "label": "協作者",
+      "title": "協作者",
+      "empty": "尚無協作者"
     },
     "manage": {
       "roleFor": "{{user}} 的角色",
       "revoke": "撤銷",
-      "revokeConfirm": "撤銷 {{user}} 的存取？"
+      "revokeConfirm": "移除 {{user}} 的協作權限？"
     },
     "sharedWithMe": {
-      "title": "別人分享給我",
-      "empty": "沒有分享的標籤或伺服器",
-      "refresh": "重新整理分享存取",
-      "collapse": "收合分享清單",
-      "expand": "展開分享清單",
-      "count": "{{count}} 個分享項目",
+      "title": "受邀協作",
+      "empty": "沒有受邀協作的標籤或伺服器",
+      "refresh": "重新整理協作清單",
+      "collapse": "收合協作清單",
+      "expand": "展開協作清單",
+      "count": "{{count}} 個協作項目",
       "guideReturn": "返回 {{server}}",
       "guideDismiss": "知道了",
-      "openTimeout": "開啟分享存取逾時，請重試。",
-      "openFailed": "開啟分享存取失敗，請重試。",
+      "openTimeout": "開啟協作工作區逾時，請重試。",
+      "openFailed": "開啟協作工作區失敗，請重試。",
       "kind": {
         "server": "伺服器",
         "tab": "標籤",
         "subsession": "子工作階段"
       }
     },
-    "create": "建立分享",
-    "creating": "正在建立...",
+    "create": "新增協作者",
+    "creating": "正在新增...",
     "scope": {
-      "current": "分享範圍"
+      "current": "協作範圍"
     },
-    "indicator": "{{scope}} 以 {{role}} 分享 · {{status}}",
-    "indicatorCompact": "以 {{role}} 分享 · {{status}}",
-    "indicatorSharedOut": "已分享給別人",
-    "indicatorSharedIn": "分享給我",
+    "indicator": "{{scope}} · 以 {{role}} 協作 · {{status}}",
+    "indicatorCompact": "以 {{role}} 協作 · {{status}}",
+    "indicatorSharedOut": "已開啟即時協作",
+    "indicatorSharedIn": "受邀協作",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "有效",
@@ -254,14 +254,14 @@
     },
     "reason": {
       "share-role-denied": "此角色不能使用該操作。",
-      "share-direct-surface-denied": "分享存取中不可使用此介面。",
-      "share-rate-limited": "分享操作過多，請稍後再試。",
-      "share-revoked": "此分享已撤銷。",
-      "share-expired": "此分享已過期。",
-      "share-target-unavailable": "分享目標不可用。",
-      "share-role-changed": "分享角色已變更。",
-      "share-ticket-invalid": "分享存取票證無效。",
-      "share-cancel-unsupported": "此分享標籤不支援取消。",
+      "share-direct-surface-denied": "協作模式中不可使用此介面。",
+      "share-rate-limited": "協作操作過於頻繁，請稍後再試。",
+      "share-revoked": "此協作權限已撤銷。",
+      "share-expired": "此協作權限已過期。",
+      "share-target-unavailable": "協作目標不可用。",
+      "share-role-changed": "你的協作角色已變更。",
+      "share-ticket-invalid": "協作存取票證無效。",
+      "share-cancel-unsupported": "此協作標籤不支援取消。",
       "share-audit-duplicate": "此操作已記錄。",
       "share-comment-invalid": "無法發布留言。"
     },
@@ -5706,8 +5706,8 @@
       "controlledNodes": {
         "pill": "受控節點",
         "title": "受控節點與全域分組",
-        "tagline": "跨機器執行、檔案傳輸與文件共享複用分組。",
-        "summary": "將其他機器註冊為受控節點（`^` / `^^(名稱)`）即可遠端執行指令與傳檔；於「受控節點 → 分組」管理成員並拖入伺服器，即可直接用於裝置共享與文件權限配置。",
+        "tagline": "跨機器執行、檔案傳輸以及團隊協作與文件權限複用分組。",
+        "summary": "將其他機器註冊為受控節點（`^` / `^^(名稱)`）即可遠端執行指令與傳檔；於「受控節點 → 分組」管理成員並拖入伺服器，即可直接用於電腦/桌面即時協作與文件權限配置。",
         "tip_1": "在「受控節點 → 分組」建立分組並管理成員與所屬機器。",
         "tip_2": "透過 `^` 或 `exec_remote` / 傳檔工具調度指定節點。",
         "tip_3": "可隨時於設定中停用或撤銷單一節點憑證。"
@@ -5773,7 +5773,7 @@
     "logout": "登出",
     "tabs": {
       "label": "主控台分頁",
-      "devices": "裝置與共用",
+      "devices": "裝置與協作",
       "api_keys": "API Key",
       "account": "安全與帳號"
     }

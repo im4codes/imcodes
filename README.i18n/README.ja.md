@@ -2,7 +2,7 @@
 
 [English](../README.md) | [简体中文](README.zh-CN.md) | [繁體中文](README.zh-TW.md) | [Español](README.es.md) | [Русский](README.ru.md) | [日本語](README.ja.md) | [한국어](README.ko.md)
 
-**セルフホスト・ソース公開・ベンダーロックインなしの AI Force ワークベンチ：クロスベンダー Task Pairs & Execution Pool、NAT 越え制御対象ノード & Computer Use、内蔵 4K リモートデスクトップ、Cloud Docs + ONLYOFFICE、チーム共有。**
+**セルフホスト・ソース公開・ベンダーロックインなしの AI Force ワークベンチ：クロスベンダー Task Pairs & Execution Pool、NAT 越え制御対象ノード & Computer Use、内蔵 4K リモートデスクトップ、Cloud Docs + ONLYOFFICE、リアルタイムチーム共同作業。**
 
 > 1つの AI と話すのは終わり。AI Force を指揮せよ。<br>
 > ひとつのワークベンチから、あらゆるモデルとマシンを意のままに。<br>
@@ -20,7 +20,7 @@ IM.codes は AI エージェント、リモートマシン、チームドキュ�
 | **制御対象ノード & AI Computer Use（OCU）** | パブリック IP・VPN・ポート開放なしで、NAT 配下の Linux / Windows / macOS マシンを AI 操作ノード化。スコープ付き `exec_remote`、直接/リレーファイル転送、`computer_use_call` による GUI・CDP ブラウザ自動化（`^^(nodeId)`）。 |
 | **内蔵 4K リモートデスクトップ** | 別途リモートデスクトップ課金なしで標準内蔵。ブラウザやスマートフォンから Windows / macOS / Linux デスクトップを 4K 表示・操作でき、4 タイル Desktop Wall で同時監視し、最終制御権は常に人間が保持します。 |
 | **Cloud Docs & 共同編集（ONLYOFFICE）** | Cloud Docs + ONLYOFFICE + DocBuilder を内蔵。仕様書・手順書・AI Skills を管理し、`&` ピッカーでチャットへ直接注入し、DOCX/XLSX/PPTX/Markdown を共同編集・変換・共有します。 |
-| **チーム共有 & アクセス制御** | 制御対象ノード、ライブセッション/サブセッション、Cloud Docs をユーザーやグループ単位で共有（`viewer` / `participant`）、ワンクリックで取り消し可能。プライベートグループで個人・自宅マシンを分離します。 |
+| **リアルタイムチーム共同作業** | チーム専用の開発PC、制御対象ノード、ライブセッション/サブセッション、Cloud Docs 上でユーザーやグループ単位にリアルタイム共同作業（`viewer` / `participant`）、ワンクリックで取り消し可能。プライベートグループで個人・自宅マシンを分離します。 |
 | **3画面連携 & iPhone Duo** | デスクトップ、タブレット、**iPhone Duo / 折りたたみデュアル画面**、モバイル、Apple Watch 間でタブやパネルをシームレスに同期します。 |
 
 ## スクリーンショット
@@ -100,12 +100,12 @@ ONLYOFFICE と DocBuilder を統合した Cloud Docs により、仕様書、Run
 - **`&` ピッカーでチャットへ直接注入。** `&` を入力してドキュメントを選択、または `cloud_docs` MCP ツールから読み取り・作成・編集・変換・共有を実行。
 - **ONLYOFFICE + DocBuilder。** DOCX / XLSX / PPTX / Markdown の共同編集と変換に対応します。
 
-## チーム共有 & アクセス制御
+## リアルタイムチーム共同作業（PC・サーバー・デスクトップ）
 
-制御対象ノード、ライブセッション、サブセッション、Cloud Docs をユーザーまたはグループ単位で共有します。
+リモートデスクトップやペアプログラミングのように、チーム専用の開発PC、制御対象ノード、ライブセッション、サブセッション、Cloud Docs 上でユーザーまたはグループ単位にリアルタイムで協働できます。
 
-- **ロール制御と即時取り消し。** 閲覧専用の `viewer` と指示送信・ノード操作可能な `participant` を切り替え、ワンクリックで取り消せます。
-- **プライベートグループ。** 個人や自宅のマシンをチームワークスペースから完全に分離できます。
+- **ロール制御と即時取り消し。** 閲覧専用の `viewer` と許可された開発マシン上でペア作業・指示送信・ノード操作が可能な `participant` を切り替え、協働メッセージにアクターを明示し、ワンクリックで取り消せます。
+- **プライベートグループ。** 個人や自宅のマシンをチーム共同作業ワークスペースから完全に分離できます。
 
 ## ダウンロード
 
@@ -136,7 +136,7 @@ OpenSpec ベースの変更では、Auto Deliver が change folder を end-to-en
 
 ## 協調プログラミング
 
-現在のタブ、サブセッション、または source server 全体を他のユーザーに共有できます。`viewer` は read-only review、`participant` は対象 session への prompt 送信に使います。Shared message には actor label が付き、access は UI で降格または取り消しできます。
+現在のタブ、サブセッション、またはチームの開発サーバー全体で他のメンバーとリアルタイムに共同作業できます。`viewer` は read-only review、`participant` は対象 session でのペア作業や prompt 送信に使います。協働メッセージには actor label が付き、access は UI で降格または取り消しできます。
 
 ## Shared Agent Context とメモリ
 
@@ -209,7 +209,7 @@ SSH、VPN、ポート開放なしで、任意のブラウザから agent session
 spec-driven change を structured pipeline で進めます: proposal/spec audit、implementation prompts、manifest-aware validation hints、Team audit/rework、spec/tasks/implementation/tests/risk の自動採点、fail-closed handoff。
 
 ### 協調プログラミング
-live session を他の人に共有して pair programming したり、viewer/participant roles で scoped server workspace に複数人を招待できます。
+live session で他のメンバーと pair programming したり、viewer/participant roles で scoped dev server workspace に複数人を招待できます。
 
 ### クロスモデル監査と Team ディスカッション
 単一モデルの出力を盲信すべきではありません。Team ディスカッションでは、異なるプロバイダーや思考スタイルを持つ複数の agent が、コードを書く前に同じコードベースで協調分析を行います。各ラウンドはカスタマイズ可能なマルチフェーズパイプラインに従い、各 agent は前の貢献をすべて読んだ上で出力します。異なるモデルは異なる種類の問題を発見します。このクロスプロバイダー相互審査により、実装前に単一モデルが見落としがちな問題を発見し、手戻りを減らせます。

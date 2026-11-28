@@ -167,21 +167,21 @@
         "daemon_offline": "此会话所在的机器已离线，停止指令未能送达。",
         "ack_timeout": "机器未在规定时间内确认停止，可能正忙，请重试。",
         "daemon_error": "机器在停止时报告了错误，请重试。",
-        "outside_share": "此会话不在分享给你的范围内，无法停止。",
+        "outside_share": "此会话不在你的协作范围内，无法停止。",
         "rate_limited": "此会话的停止请求过于频繁，请等待一分钟后再试。",
         "dispatch_changed": "当前运行的轮次已变化，请再点一次停止以停止最新的轮次。",
         "unsupported": "参与者无法停止这类会话。",
-        "role_denied": "你在此分享中的角色不允许停止。",
+        "role_denied": "你在此协作中的角色不允许停止。",
         "access_ended": "你对该会话的访问已结束。",
         "generic": "停止未能生效，请重试。"
       }
     },
     "menu": {
-      "shareTab": "共享"
+      "shareTab": "协作"
     },
     "shell_participant_forbidden": "共享参与者仅可使用大模型会话，不可创建或操作 shell / script 终端会话。",
-    "dialogTitle": "共享访问",
-    "dialogSubtitle": "向 {{target}} 授予受限访问。",
+    "dialogTitle": "实时协作",
+    "dialogSubtitle": "邀请协作者加入 {{target}} 一起协作。",
     "target": {
       "label": "目标",
       "currentTab": "当前标签",
@@ -206,45 +206,45 @@
       "body": "代理未被沙箱隔离。UI/API 限制会减少直接控制面，但参与者提示仍可能影响代理在其可访问环境中的行为。"
     },
     "recipient": {
-      "label": "接收者",
+      "label": "协作者",
       "placeholder": "用户 ID 或邮箱"
     },
     "list": {
-      "label": "共享用户",
-      "title": "共享用户",
-      "empty": "还没有共享用户"
+      "label": "协作者",
+      "title": "协作者",
+      "empty": "暂无协作者"
     },
     "manage": {
       "roleFor": "{{user}} 的角色",
       "revoke": "撤销",
-      "revokeConfirm": "撤销 {{user}} 的访问？"
+      "revokeConfirm": "移除 {{user}} 的协作权限？"
     },
     "sharedWithMe": {
-      "title": "别人共享给我",
-      "empty": "没有共享的标签或服务器",
-      "refresh": "刷新共享访问",
-      "collapse": "折叠共享列表",
-      "expand": "展开共享列表",
-      "count": "{{count}} 项共享",
+      "title": "受邀协作",
+      "empty": "没有受邀协作的标签或服务器",
+      "refresh": "刷新协作列表",
+      "collapse": "折叠协作列表",
+      "expand": "展开协作列表",
+      "count": "{{count}} 项协作",
       "guideReturn": "返回 {{server}}",
       "guideDismiss": "知道了",
-      "openTimeout": "打开共享访问超时，请重试。",
-      "openFailed": "打开共享访问失败，请重试。",
+      "openTimeout": "打开协作工作区超时，请重试。",
+      "openFailed": "打开协作工作区失败，请重试。",
       "kind": {
         "server": "服务器",
         "tab": "标签",
         "subsession": "子会话"
       }
     },
-    "create": "创建共享",
-    "creating": "正在创建...",
+    "create": "添加协作者",
+    "creating": "正在添加...",
     "scope": {
-      "current": "共享范围"
+      "current": "协作范围"
     },
-    "indicator": "{{scope}} 以 {{role}} 共享 · {{status}}",
-    "indicatorCompact": "以 {{role}} 共享 · {{status}}",
-    "indicatorSharedOut": "已共享给别人",
-    "indicatorSharedIn": "共享给我",
+    "indicator": "{{scope}} · 以 {{role}} 协作 · {{status}}",
+    "indicatorCompact": "以 {{role}} 协作 · {{status}}",
+    "indicatorSharedOut": "已开启实时协作",
+    "indicatorSharedIn": "受邀协作",
     "actorLabel": "{{name}} · {{role}}",
     "status": {
       "active": "有效",
@@ -254,14 +254,14 @@
     },
     "reason": {
       "share-role-denied": "此角色不能使用该操作。",
-      "share-direct-surface-denied": "共享访问中不可使用此界面。",
-      "share-rate-limited": "共享操作过多，请稍后再试。",
-      "share-revoked": "此共享已撤销。",
-      "share-expired": "此共享已过期。",
-      "share-target-unavailable": "共享目标不可用。",
-      "share-role-changed": "共享角色已变更。",
-      "share-ticket-invalid": "共享访问票据无效。",
-      "share-cancel-unsupported": "此共享标签不支持取消。",
+      "share-direct-surface-denied": "协作模式中不可使用此界面。",
+      "share-rate-limited": "协作操作过于频繁，请稍后再试。",
+      "share-revoked": "此协作权限已撤销。",
+      "share-expired": "此协作权限已过期。",
+      "share-target-unavailable": "协作目标不可用。",
+      "share-role-changed": "你的协作角色已变更。",
+      "share-ticket-invalid": "协作访问票据无效。",
+      "share-cancel-unsupported": "此协作标签不支持取消。",
       "share-audit-duplicate": "此操作已记录。",
       "share-comment-invalid": "无法发布评论。"
     },
@@ -5706,8 +5706,8 @@
       "controlledNodes": {
         "pill": "受控节点",
         "title": "受控节点与全局分组",
-        "tagline": "跨机器执行、文件传输以及文档共享复用分组。",
-        "summary": "把其他机器注册为受控节点（`^` / `^^(名称)`）即可远程执行命令与传文件；在「受控节点 → 分组」中管理成员并拖入服务器，即可直接用于设备共享与文档权限配置。",
+        "tagline": "跨机器执行、文件传输以及团队协作与文档权限复用分组。",
+        "summary": "把其他机器注册为受控节点（`^` / `^^(名称)`）即可远程执行命令与传文件；在「受控节点 → 分组」中管理成员并拖入服务器，即可直接用于电脑/桌面实时协作与文档权限配置。",
         "tip_1": "在「受控节点 → 分组」创建分组并管理成员与所属机器。",
         "tip_2": "通过 `^` 或 `exec_remote` / 文件传输工具精准调度指定节点。",
         "tip_3": "可随时在设置中停用或吊销单个受控节点凭证。"
@@ -5773,7 +5773,7 @@
     "logout": "退出登录",
     "tabs": {
       "label": "控制台分组",
-      "devices": "设备与共享",
+      "devices": "设备与协作",
       "api_keys": "API Key",
       "account": "安全与账号"
     }
