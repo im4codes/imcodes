@@ -1834,6 +1834,93 @@ describe('bootstrapControlledNodeWithDisposition via stdin enrollment', () => {
       await rm(dir, { recursive: true, force: true });
     }
   });
+
+  it('clears unknown pending and enrolls with new ticket only after prior ticket replay returns authoritative 401/410 rejection (P0-1)', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-stdin-unused-old-ticket-'));
+    try {
+      const sourcePath = join(dir, 'downloaded-imcodes-node');
+      const stagedPath = join(dir, 'staged', 'imcodes-node');
+      const bytes = Buffer.from('BINARY_BYTES');
+      await writeFile(sourcePath, bytes, { mode: 0o700 });
+
+      const { journalPath, journal: initialJournal } = await seedHealthyInstallation(dir, sourcePath, stagedPath, bytes);
+      let currentJournal = initialJournal;
+      const pendingPath = join(dir, 'pending-reenrollment.json');
+
+      const existingCred: ControlledNodeCredential = {
+        serverId: 'srv-old',
+        token: 'old-revoked-tok',
+        serverUrl: 'https://relay.example.com',
+        nodeRole: 'controlled',
+      };
+      let genCount = 0;
+      const calls: Array<{ enrollToken: string; installId: string }> = [];
+      let failAttempt1 = true;
+
+      const { deps, state } = createBootstrapFixture(dir, sourcePath, stagedPath, bytes, {
+        now: 1_700_000_005_000,
+        enrollmentBlob: { serverUrl: 'https://relay.example.com', enrollToken: 'ticket-1-never-committed' },
+        journalPath,
+        loadCredential: vi.fn(async () => state.credential),
+        loadInstallIdentity: vi.fn(async () => state.identity),
+        loadPendingReenrollment: () => loadPendingReenrollment(pendingPath),
+        persistPendingReenrollment: (rec) => persistPendingReenrollment(rec, pendingPath),
+        removePendingReenrollment: () => removePendingReenrollment(pendingPath),
+        probeExistingCredential: vi.fn(async () => 'revoked' as const),
+        generateInstallIdentity: vi.fn(() => {
+          genCount += 1;
+          return {
+            installId: `inst-unused-${genCount}`,
+            nodeToken: `tok-unused-${genCount}`,
+            nodeTokenHash: createHash('sha256').update(`tok-unused-${genCount}`, 'utf8').digest('hex'),
+            sourceExePath: sourcePath,
+          };
+        }),
+        redeemEnrollmentV2: vi.fn(async (blob, id) => {
+          calls.push({ enrollToken: blob.enrollToken, installId: id.installId });
+          if (blob.enrollToken === 'ticket-1-never-committed') {
+            if (failAttempt1) {
+              failAttempt1 = false;
+              throw new Error('network_timeout_before_server_commit');
+            }
+            // Authoritative server response when Ticket 1 expired/revoked with NO active registration.
+            throw new Error('enrollment_redeem_failed:401');
+          }
+          return {
+            serverId: 'srv-from-ticket-2',
+            nodeId: '1122334456',
+            token: id.nodeToken,
+            serverUrl: blob.serverUrl,
+            nodeRole: 'controlled' as const,
+          };
+        }),
+        loadInstallJournal: vi.fn(async () => currentJournal),
+        writeInstallPhase: vi.fn(async (p, phase, opts) => {
+          currentJournal = await writeInstallPhase(p, phase, opts);
+          state.journal = currentJournal;
+          return currentJournal;
+        }),
+      });
+      state.credential = existingCred;
+      state.journal = initialJournal;
+
+      await expect(bootstrapControlledNodeWithDisposition(deps)).rejects.toThrow(/network_timeout_before_server_commit/);
+      const res2 = await bootstrapControlledNodeWithDisposition({
+        ...deps,
+        enrollmentBlob: { serverUrl: 'https://relay.example.com', enrollToken: 'ticket-2-fresh' },
+      });
+      expect(res2.disposition).toBe('handoff_complete');
+      expect(res2.credential?.serverId).toBe('srv-from-ticket-2');
+      expect(calls).toEqual([
+        { enrollToken: 'ticket-1-never-committed', installId: 'inst-unused-1' },
+        { enrollToken: 'ticket-1-never-committed', installId: 'inst-unused-1' },
+        { enrollToken: 'ticket-2-fresh', installId: 'inst-unused-2' },
+      ]);
+      expect(await loadPendingReenrollment(pendingPath)).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('probeControlledNodeCredentialStatus', () => {

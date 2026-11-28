@@ -2444,23 +2444,6 @@ enrollRoutes.post('/v2/redeem', async (c) => {
       );
       // A ticket stands for its owner: a disabled (or pending) owner's tickets redeem nothing, whatever their expiry.
       if (!row) return { kind: 'denied' as const };
-      if (row.revoked_at != null) return { kind: 'denied' as const };
-      // A ticket with no group is the normal case: a machine belongs to whoever
-      // installs it, and groups are a later, separate decision. Denying here
-      // rejected every freshly minted link with a 401 -- the mint stopped
-      // requiring a group, and this gate was left behind.
-      if (!row.reusable && (row.expires_at == null || Number(row.expires_at) <= now)) {
-        return { kind: 'denied' as const };
-      }
-      if (!isControlledNodeArtifactCompatibleWithRuntime(row.os, row.arch, os, arch)) {
-        return { kind: 'mismatch' as const, ticketId: row.id };
-      }
-
-      if (normalizeControlledNodeAbiProfile(row.abi_profile) !== abiProfile && !enrollmentAbiDigest({
-        os: row.os, arch: row.arch, abiProfile: row.abi_profile, sha256: row.artifact_sha256,
-        variants: row.abi_variants, allowVariants: row.delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
-          || row.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
-      }, abiProfile)) return { kind: 'mismatch' as const, ticketId: row.id };
       const existing = await tx.queryOne<{
         node_token_hash: string;
         redeemed_server_id: string;
@@ -2468,18 +2451,32 @@ enrollRoutes.post('/v2/redeem', async (c) => {
         ref_name: string | null;
         display_name: string | null;
         abi_profile?: unknown;
+        server_revoked_at: number | null;
       }>(
         `SELECT install.node_token_hash, install.redeemed_server_id,
-                server.node_id, server.ref_name, server.display_name, server.abi_profile
+                server.node_id, server.ref_name, server.display_name, server.abi_profile,
+                server.revoked_at AS server_revoked_at
            FROM controlled_node_enrollment_installs AS install
            JOIN servers AS server ON server.id = install.redeemed_server_id
           WHERE install.enrollment_id = $1 AND install.install_id = $2`,
         [row.id, installId],
       );
-      if (existing) {
-        if (existing.node_token_hash !== nodeTokenHash || normalizeControlledNodeAbiProfile(existing.abi_profile) !== abiProfile) {
-          return { kind: 'mismatch' as const, ticketId: row.id };
-        }
+      const runtimeMatchesTicket = isControlledNodeArtifactCompatibleWithRuntime(row.os, row.arch, os, arch)
+        && (normalizeControlledNodeAbiProfile(row.abi_profile) === abiProfile || enrollmentAbiDigest({
+          os: row.os, arch: row.arch, abiProfile: row.abi_profile, sha256: row.artifact_sha256,
+          variants: row.abi_variants, allowVariants: row.delivery === CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND
+            || row.delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+        }, abiProfile));
+      if (
+        existing
+        && existing.server_revoked_at == null
+        && runtimeMatchesTicket
+        && existing.node_token_hash === nodeTokenHash
+        && normalizeControlledNodeAbiProfile(existing.abi_profile) === abiProfile
+      ) {
+        // Exact idempotent replay of an active node created by this enrollment +
+        // install identity (allowed even if the ticket was later revoked or
+        // expired; owner account + node revocation status are both enforced).
         const existingNodeId = parseControlledNodeId(existing.node_id);
         if (!existingNodeId) throw new Error('controlled_node_redeem_stored_node_id_invalid');
         const legacyTarget = existing.ref_name == null
@@ -2497,6 +2494,24 @@ enrollRoutes.post('/v2/redeem', async (c) => {
           ...(legacyTarget ? { refName: legacyTarget.value } : {}),
           displayName: existing.display_name ?? '',
         };
+      }
+
+      if (row.revoked_at != null) return { kind: 'denied' as const };
+      // A ticket with no group is the normal case: a machine belongs to whoever
+      // installs it, and groups are a later, separate decision. Denying here
+      // rejected every freshly minted link with a 401 -- the mint stopped
+      // requiring a group, and this gate was left behind.
+      if (!row.reusable && (row.expires_at == null || Number(row.expires_at) <= now)) {
+        return { kind: 'denied' as const };
+      }
+      if (!runtimeMatchesTicket) {
+        return { kind: 'mismatch' as const, ticketId: row.id };
+      }
+      if (existing) {
+        if (existing.server_revoked_at != null) {
+          return { kind: 'denied' as const };
+        }
+        return { kind: 'mismatch' as const, ticketId: row.id };
       }
 
       // A legacy package remains single-use. Migration 059 backfills its

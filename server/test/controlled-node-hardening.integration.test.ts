@@ -7,6 +7,9 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { Hono } from 'hono';
 import { randomBytes, createHash } from 'node:crypto';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser, createServer } from '../src/db/queries.js';
@@ -15,7 +18,25 @@ import { machinesRoutes } from '../src/routes/machines.js';
 import { serverRoutes } from '../src/routes/server.js';
 import { bindRoutes } from '../src/routes/bind.js';
 import { WsBridge } from '../src/ws/bridge.js';
-import { MACHINE_LIST_MAX_ITEMS, NODE_ROLE, NODE_ROLE_REFUSAL } from '../../shared/remote-exec.js';
+import { enrollmentOsFromNodePlatform, MACHINE_LIST_MAX_ITEMS, NODE_ROLE, NODE_ROLE_REFUSAL } from '../../shared/remote-exec.js';
+import { bootstrapControlledNodeWithDisposition } from '../../src/node/bootstrap.js';
+import {
+  generateInstallIdentity,
+  inspectExecutableReceipt,
+  loadCredential,
+  loadInstallIdentity,
+  loadPendingReenrollment,
+  openVerifiedEnrollmentSource,
+  persistCredential,
+  persistInstallIdentity,
+  persistPendingReenrollment,
+  probeControlledNodeCredentialStatus,
+  redeemEnrollmentV2,
+  removePendingReenrollment,
+  type ControlledNodeCredential,
+  type PendingInstallIdentity,
+} from '../../src/node/enrollment.js';
+import { INSTALL_JOURNAL_VERSION, writeInstallPhase, type InstallJournal } from '../../src/node/install-journal.js';
 import { MACHINE_REASONS } from '../../shared/machine-reference.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_ERROR } from '../../shared/controlled-node-auto-unlock.js';
@@ -894,5 +915,244 @@ describe('POST /api/bind/verify enforces role and revocation', () => {
     }
     // One indistinguishable answer: any variation is an existence oracle.
     expect(seen.size).toBe(1);
+  });
+});
+
+describe('controlled-node lost-response recovery across ticket revocation/expiry vs unused ticket', () => {
+  function makeAppFetch(
+    app: ReturnType<typeof buildApp>,
+    options: { dropAfterRedeemCommit?: () => boolean } = {},
+  ): typeof fetch {
+    return (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+      const appRes = await app.request(new Request(url, init));
+      const bodyBuf = await appRes.arrayBuffer();
+      if (url.endsWith('/api/enroll/v2/redeem') && appRes.ok && options.dropAfterRedeemCommit?.()) {
+        throw new Error('network_timeout_after_server_commit');
+      }
+      const wrapped = new Response(bodyBuf, {
+        status: appRes.status,
+        statusText: appRes.statusText,
+        headers: appRes.headers,
+      });
+      Object.defineProperty(wrapped, 'url', { value: url, configurable: true });
+      return wrapped;
+    }) as typeof fetch;
+  }
+
+  async function seedRuntimeTicket(code: string, userId: string, opts: { reusable?: boolean } = {}): Promise<string> {
+    const now = Date.now();
+    const deskTeamId = await seedDesk(userId);
+    const osName = enrollmentOsFromNodePlatform(process.platform) ?? 'linux';
+    const row = await db.queryOne<{ id: string }>(
+      `INSERT INTO controlled_node_enrollments_v2
+         (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
+          encrypted_code, ticket_expires_at, expires_at, reusable, created_at, desk_team_id)
+       VALUES ($1, $2, $3, $4, $5, $6, 'test-only', $7, $7, $8, $9, $10)
+       RETURNING id`,
+      [
+        sha256(hex(16)),
+        sha256(code),
+        userId,
+        osName,
+        process.arch,
+        sha256(hex(32)),
+        now + 60_000,
+        opts.reusable ?? true,
+        now,
+        deskTeamId,
+      ],
+    );
+    return row!.id;
+  }
+
+  async function runLostResponseFlow(mode: 'ticket_expired_legacy' | 'ticket_revoked' | 'ticket_never_succeeded_before_revoke') {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+
+    const oldServerId = hex(8);
+    const oldToken = hex(16);
+    await createServer(db, oldServerId, userId, 'old-node', sha256(oldToken));
+    await db.execute(
+      'UPDATE servers SET node_role = $2, revoked_at = $3 WHERE id = $1',
+      [oldServerId, NODE_ROLE.CONTROLLED, Date.now()],
+    );
+
+    const ticket1 = `t1_${hex(8)}`;
+    const ticket2 = `t2_${hex(8)}`;
+    const ticket1Id = await seedRuntimeTicket(ticket1, userId, {
+      reusable: mode !== 'ticket_expired_legacy',
+    });
+    const ticket2Id = await seedRuntimeTicket(ticket2, userId, { reusable: true });
+
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-pg-lost-http-'));
+    try {
+      const sourcePath = join(dir, 'downloaded-imcodes-node');
+      const stagedPath = join(dir, 'staged', 'imcodes-node');
+      const credPath = join(dir, 'cred.json');
+      const identityPath = join(dir, 'install-identity.json');
+      const pendingPath = join(dir, 'pending-reenrollment.json');
+      const journalPath = join(dir, 'install.json');
+      const bytes = Buffer.from('#!/bin/sh\necho pg-e2e-binary\n');
+      await writeFile(sourcePath, bytes, { mode: 0o700 });
+      const opened = await openVerifiedEnrollmentSource(sourcePath);
+      const initialReceipt = await opened.stageTrailerFreeExecutable(stagedPath, bytes.length);
+      await opened.close();
+
+      let journal: InstallJournal = await writeInstallPhase(journalPath, 'elevated', { now: 1_000 });
+      journal = await writeInstallPhase(journalPath, 'credential_prepared', {
+        now: 1_001,
+        previous: journal,
+        installId: 'inst-old',
+        nodeTokenHash: sha256(oldToken),
+        sourceExePath: sourcePath,
+      });
+      journal = await writeInstallPhase(journalPath, 'files_staged', {
+        now: 1_002,
+        previous: journal,
+        stagedExePath: stagedPath,
+        stagedReceipt: initialReceipt,
+      });
+      journal = await writeInstallPhase(journalPath, 'enrolled', {
+        now: 1_003,
+        previous: journal,
+        serverId: oldServerId,
+        cleanupStatus: 'skipped',
+      });
+      journal = await writeInstallPhase(journalPath, 'service_registered', {
+        now: 1_004,
+        previous: journal,
+        serviceName: 'imcodes-node',
+        serviceReceipt: { name: 'imcodes-node', platform: process.platform, action: stagedPath },
+      });
+
+      const oldCred: ControlledNodeCredential = {
+        serverId: oldServerId,
+        token: oldToken,
+        serverUrl: 'https://relay.example.com',
+        nodeRole: NODE_ROLE.CONTROLLED,
+      };
+      await persistCredential(oldCred, credPath);
+
+      let dropResponse = true;
+      let forceFailBeforeHttp = mode === 'ticket_never_succeeded_before_revoke';
+      const redeemedTickets: string[] = [];
+      const appFetch = makeAppFetch(app, {
+        dropAfterRedeemCommit: () => {
+          if (dropResponse) {
+            dropResponse = false;
+            return true;
+          }
+          return false;
+        },
+      });
+
+      const makeDeps = (enrollToken: string) => ({
+        enrollmentBlob: { serverUrl: 'https://relay.example.com', enrollToken },
+        loadCredential: () => loadCredential(credPath, { skipPermissionCheck: true }),
+        openVerifiedEnrollmentSource: (p = sourcePath) => openVerifiedEnrollmentSource(p),
+        loadInstallIdentity: () => loadInstallIdentity(identityPath, { skipPermissionCheck: true }),
+        persistInstallIdentity: (id: PendingInstallIdentity) => persistInstallIdentity(id, identityPath),
+        generateInstallIdentity: () => ({ ...generateInstallIdentity(), sourceExePath: sourcePath }),
+        redeemEnrollmentV2: async (blob: { serverUrl: string; enrollToken: string }, id: PendingInstallIdentity) => {
+          redeemedTickets.push(blob.enrollToken);
+          if (forceFailBeforeHttp) {
+            forceFailBeforeHttp = false;
+            throw new Error('network_timeout_before_server_commit');
+          }
+          return redeemEnrollmentV2(blob, id, appFetch);
+        },
+        persistCredential: (cred: ControlledNodeCredential) => persistCredential(cred, credPath),
+        probeExistingCredential: (cred: ControlledNodeCredential) => probeControlledNodeCredentialStatus(cred, appFetch),
+        loadPendingReenrollment: () => loadPendingReenrollment(pendingPath, { skipPermissionCheck: true }),
+        persistPendingReenrollment: (rec: Parameters<typeof persistPendingReenrollment>[0]) => persistPendingReenrollment(rec, pendingPath),
+        removePendingReenrollment: () => removePendingReenrollment(pendingPath),
+        installDefinition: async () => ({ name: 'imcodes-node', platform: process.platform, action: stagedPath }),
+        inspectDefinition: async (r: NonNullable<InstallJournal['serviceReceipt']>) => r,
+        inspectServiceState: async () => ({
+          installed: true, action: stagedPath, effectiveAction: stagedPath, loadedActionMatches: true,
+          loaded: true, bootEnabled: true, principal: 'root', restartPolicy: 'on-failure' as const,
+          observedDefinitionSha256: null, definitionMatches: true, runState: 'running' as const, errors: [], raw: 'ok',
+        }),
+        startService: vi.fn(async () => {}),
+        verifyStagedExecutable: async () => {},
+        isStableRuntime: async () => false,
+        assertElevated: () => {},
+        ensureReleasePublisherTrust: async () => {},
+        inspectSourceArtifact: async (p: string) => {
+          const receipt = await inspectExecutableReceipt(p);
+          return { sha256: receipt.sha256, size: receipt.size };
+        },
+        prepareCredentialDir: async () => {},
+        loadInstallJournal: async () => journal,
+        writeInstallPhase: async (p: string, phase: InstallJournal['phase'], opts: Parameters<typeof writeInstallPhase>[2]) => {
+          journal = await writeInstallPhase(p, phase, opts);
+          return journal;
+        },
+        journalPath,
+        credentialPath: credPath,
+        stagedExecutablePath: stagedPath,
+        sourceExecutablePath: sourcePath,
+        now: Date.now(),
+        warn: () => {},
+      });
+
+      // Attempt 1 with Ticket 1: fails on network timeout (committed for legacy/revoked modes; uncommitted for control mode).
+      await expect(bootstrapControlledNodeWithDisposition(makeDeps(ticket1))).rejects.toThrow(/network_timeout/);
+
+      // Expire or revoke Ticket 1 BEFORE Attempt 2 arrives with Ticket 2.
+      if (mode === 'ticket_expired_legacy') {
+        await db.execute(
+          'UPDATE controlled_node_enrollments_v2 SET expires_at = $2 WHERE id = $1',
+          [ticket1Id, Date.now() - 1_000],
+        );
+      } else {
+        await db.execute(
+          'UPDATE controlled_node_enrollments_v2 SET revoked_at = $2 WHERE id = $1',
+          [ticket1Id, Date.now()],
+        );
+      }
+
+      const res2 = await bootstrapControlledNodeWithDisposition(makeDeps(ticket2));
+      expect(res2.disposition).toBe('handoff_complete');
+
+      const activeNodes = await db.query<{ id: string }>(
+        'SELECT id FROM servers WHERE user_id = $1 AND revoked_at IS NULL',
+        [userId],
+      );
+      expect(activeNodes.rows).toHaveLength(1);
+      expect(res2.credential?.serverId).toBe(activeNodes.rows[0]!.id);
+
+      const t2Installs = await db.query<{ redeemed_server_id: string }>(
+        'SELECT redeemed_server_id FROM controlled_node_enrollment_installs WHERE enrollment_id = $1',
+        [ticket2Id],
+      );
+      if (mode === 'ticket_never_succeeded_before_revoke') {
+        // Control: Ticket 1 replay got authoritative 401 -> cleared pending -> Ticket 2 created the single active node.
+        expect(redeemedTickets).toEqual([ticket1, ticket1, ticket2]);
+        expect(t2Installs.rows).toHaveLength(1);
+      } else {
+        // Regression: Ticket 1 had already committed in DB -> Ticket 1 idempotent replay recovered Node A
+        // despite later revocation/expiry; Ticket 2 was NEVER redeemed.
+        expect(redeemedTickets).toEqual([ticket1, ticket1]);
+        expect(t2Installs.rows).toHaveLength(0);
+      }
+      expect(await loadPendingReenrollment(pendingPath, { skipPermissionCheck: true })).toBeNull();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('recovers already-committed node after lost HTTP response even when legacy single-use ticket subsequently expires', async () => {
+    await runLostResponseFlow('ticket_expired_legacy');
+  });
+
+  it('recovers already-committed node after lost HTTP response even when ticket is subsequently revoked', async () => {
+    await runLostResponseFlow('ticket_revoked');
+  });
+
+  it('proceeds cleanly with new ticket when prior ticket replay authoritatively rejects (401) because no active node exists', async () => {
+    await runLostResponseFlow('ticket_never_succeeded_before_revoke');
   });
 });
