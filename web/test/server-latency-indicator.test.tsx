@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest';
-import { render } from '@testing-library/preact';
+import { describe, it, expect, vi } from 'vitest';
+import { fireEvent, render } from '@testing-library/preact';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ServerLatencyIndicator } from '../src/components/ServerLatencyIndicator.js';
@@ -182,5 +182,73 @@ describe('ServerLatencyIndicator & Layout Integration', () => {
     const chevronIdx = children.indexOf(chevronEl);
     expect(nameIdx).toBeLessThan(latencyIdx);
     expect(latencyIdx).toBeLessThan(chevronIdx);
+  });
+
+  it('enforces touch-safe button CSS, pointer-events: none on all .mobile-server-btn descendants, and delivers clicks across latency/chevron children', () => {
+    const mobileServerBtnRule = css.match(/(?:^|\n)\.mobile-server-btn\s*\{[^}]+\}/)?.[0] ?? '';
+    expect(mobileServerBtnRule).toContain('touch-action: manipulation');
+    expect(mobileServerBtnRule).toContain('user-select: none');
+    expect(mobileServerBtnRule).toContain('-webkit-user-select: none');
+    expect(mobileServerBtnRule).toContain('-webkit-touch-callout: none');
+    expect(css).toMatch(/\.mobile-server-btn\s+\*\s*\{[^}]*pointer-events:\s*none/);
+
+    // Desktop latency indicator remains interactive/hoverable (not stripped of title or pointer-events)
+    expect(css).not.toMatch(/\.desktop-server-latency[^{]*\{[^}]*pointer-events:\s*none/);
+
+    const onToggleMenu = vi.fn();
+    const { container, rerender } = render(
+      <button type="button" class="mobile-server-btn" title="Alpha Server" onClick={onToggleMenu}>
+        <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
+        <span class="mobile-server-btn-name">Alpha Server</span>
+        <span class="share-state-indicator" title="Shared">👥</span>
+        <ServerLatencyIndicator connected={true} latencyMs={null} className="mobile-server-latency" />
+        <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
+      </button>
+    );
+
+    const clickChild = (selector: string) => {
+      const el = container.querySelector(selector) as HTMLElement;
+      expect(el, `missing ${selector}`).not.toBeNull();
+      fireEvent.click(el);
+    };
+
+    // Initial connected (null latency)
+    let expectedClicks = 0;
+    clickChild('.mobile-server-latency');
+    expectedClicks += 1;
+    expect(onToggleMenu).toHaveBeenCalledTimes(expectedClicks);
+
+    // Live latency transitions (32ms -> 450ms -> disconnected) keep button activation intact
+    for (const props of [
+      { connected: true, latencyMs: 32 },
+      { connected: true, latencyMs: 450 },
+      { connected: false, latencyMs: null },
+    ]) {
+      rerender(
+        <button type="button" class="mobile-server-btn" title="Alpha Server" onClick={onToggleMenu}>
+          <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
+          <span class="mobile-server-btn-name">Alpha Server</span>
+          <span class="share-state-indicator" title="Shared">👥</span>
+          <ServerLatencyIndicator {...props} className="mobile-server-latency" />
+          <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
+        </button>
+      );
+      clickChild('.mobile-server-latency');
+      expectedClicks += 1;
+      expect(onToggleMenu).toHaveBeenCalledTimes(expectedClicks);
+      if (props.latencyMs != null) {
+        clickChild('.mobile-server-latency-val');
+      } else {
+        clickChild('.mobile-server-btn-chevron');
+      }
+      expectedClicks += 1;
+      expect(onToggleMenu).toHaveBeenCalledTimes(expectedClicks);
+    }
+
+    clickChild('.share-state-indicator');
+    clickChild('.mobile-server-btn-icon');
+    clickChild('.mobile-server-btn-chevron');
+    expectedClicks += 3;
+    expect(onToggleMenu).toHaveBeenCalledTimes(expectedClicks);
   });
 });

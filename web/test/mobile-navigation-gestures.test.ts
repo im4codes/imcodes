@@ -598,6 +598,21 @@ describe('mobile-navigation-gestures', () => {
     const input = document.createElement('textarea');
     document.body.appendChild(input);
     expect(canHandleMobileNavigationGesture(input, { isMobile: true, document })).toBe(false);
+    input.remove();
+
+    const serverBar = document.createElement('div');
+    serverBar.className = 'mobile-server-bar';
+    const serverBtn = document.createElement('button');
+    serverBtn.className = 'mobile-server-btn';
+    const latency = document.createElement('span');
+    latency.className = 'mobile-server-latency';
+    serverBtn.appendChild(latency);
+    serverBar.appendChild(serverBtn);
+    document.body.appendChild(serverBar);
+    expect(canHandleMobileNavigationGesture(latency, { isMobile: true, document })).toBe(false);
+    expect(canHandleMobileNavigationGesture(serverBtn, { isMobile: true, document })).toBe(false);
+    expect(canHandleMobileNavigationGesture(mainTarget, { isMobile: true, document })).toBe(true);
+    serverBar.remove();
   });
 
   it('attaches capture listeners only when isMobile is true and stays resilient to child stopPropagation', () => {

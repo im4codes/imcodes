@@ -1962,7 +1962,7 @@ Gtk.main()
             <span class="mobile-server-btn-icon" aria-hidden="true">☁</span>
             <span class="mobile-server-btn-name">Very Long Production Node Identifier Alpha</span>
             <span class="share-state-indicator" aria-label="Shared">👥</span>
-            <span class="mobile-server-latency"><span class="badge-dot badge-dot-online">●</span>32ms</span>
+            <span class="mobile-server-latency" title="32ms">●<span class="mobile-server-latency-val"> 32ms</span></span>
             <span class="mobile-server-btn-chevron" aria-hidden="true">▾</span>
           </button>
         </div>
@@ -2006,7 +2006,9 @@ Gtk.main()
           const bar = document.querySelector('.mobile-server-bar') as HTMLElement;
           const toggle = document.querySelector('.mobile-sidebar-toggle') as HTMLElement;
           const btn = document.querySelector('.mobile-server-btn') as HTMLElement;
+          const icon = document.querySelector('.mobile-server-btn-icon') as HTMLElement;
           const name = document.querySelector('.mobile-server-btn-name') as HTMLElement;
+          const share = document.querySelector('.share-state-indicator') as HTMLElement;
           const latency = document.querySelector('.mobile-server-latency') as HTMLElement;
           const chevron = document.querySelector('.mobile-server-btn-chevron') as HTMLElement;
           const actions = document.querySelector('.mobile-server-actions') as HTMLElement;
@@ -2016,11 +2018,37 @@ Gtk.main()
           const bBar = bar.getBoundingClientRect();
           const bToggle = toggle.getBoundingClientRect();
           const bBtn = btn.getBoundingClientRect();
+          const bIcon = icon.getBoundingClientRect();
           const bName = name.getBoundingClientRect();
+          const bShare = share.getBoundingClientRect();
           const bLatency = latency.getBoundingClientRect();
           const bChevron = chevron.getBoundingClientRect();
           const bActions = actions.getBoundingClientRect();
           const bLastBtn = lastActionBtn.getBoundingClientRect();
+
+          const yCenter = bBtn.top + bBtn.height / 2;
+          const hitPoints = [
+            { label: 'icon', x: bIcon.left + bIcon.width / 2, y: yCenter },
+            { label: 'name', x: bName.left + bName.width / 2, y: yCenter },
+            { label: 'share', x: bShare.left + bShare.width / 2, y: yCenter },
+            { label: 'latency', x: bLatency.left + bLatency.width / 2, y: yCenter },
+            { label: 'chevron', x: bChevron.left + bChevron.width / 2, y: yCenter },
+            { label: 'rightEdge', x: bBtn.right - 2, y: yCenter },
+          ];
+          const hitResults = hitPoints.map((pt) => {
+            const hit = document.elementFromPoint(pt.x, pt.y);
+            return {
+              ...pt,
+              isBtn: hit === btn,
+              hitTag: hit ? `${hit.tagName}.${hit.className}` : 'null',
+            };
+          });
+
+          (window as unknown as { __mobileBtnClicks?: number }).__mobileBtnClicks = 0;
+          btn.addEventListener('click', () => {
+            const w = window as unknown as { __mobileBtnClicks?: number };
+            w.__mobileBtnClicks = (w.__mobileBtnClicks ?? 0) + 1;
+          });
 
           return {
             barWidth: bBar.width,
@@ -2041,6 +2069,7 @@ Gtk.main()
             actionsWidth: bActions.width,
             lastBtnRight: bLastBtn.right,
             vpWidth,
+            hitResults,
           };
         }, tc.width);
 
@@ -2062,6 +2091,18 @@ Gtk.main()
 
         // 5. All action buttons stay within the viewport (last action button right <= viewport width)
         expect(metrics.lastBtnRight, `${tc.platform} ${tc.width} last btn in viewport`).toBeLessThanOrEqual(tc.width + 0.5);
+
+        // 6. Entire width of .mobile-server-btn (including latency badge, chevron, and right edge) resolves
+        // to .mobile-server-btn via elementFromPoint and activates the button on real mouse click.
+        for (const hr of metrics.hitResults) {
+          expect(hr.isBtn, `${tc.platform} ${tc.width} elementFromPoint(${hr.label}) hit ${hr.hitTag}`).toBe(true);
+        }
+        for (const label of ['latency', 'chevron', 'rightEdge']) {
+          const pt = metrics.hitResults.find((hr) => hr.label === label)!;
+          await page.mouse.click(pt.x, pt.y);
+        }
+        const totalClicks = await page.evaluate(() => (window as unknown as { __mobileBtnClicks?: number }).__mobileBtnClicks ?? 0);
+        expect(totalClicks, `${tc.platform} ${tc.width} right-side real clicks`).toBe(3);
 
         await page.close();
       }

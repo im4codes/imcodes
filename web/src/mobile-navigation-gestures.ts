@@ -216,6 +216,7 @@ const MOBILE_GESTURE_BOTTOM_CONTROL_SELECTOR = [
 const MOBILE_GESTURE_BLOCKING_TARGET_SELECTOR = [
   MOBILE_GESTURE_BLOCKING_DOM_SELECTOR,
   MOBILE_GESTURE_BOTTOM_CONTROL_SELECTOR,
+  '.mobile-server-bar',
   '.remote-desktop-panel',
   '.remote-desktop-workspace',
   '.remote-desktop-wall',

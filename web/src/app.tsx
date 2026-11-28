@@ -11790,7 +11790,10 @@ function InternalMainApp() {
               <button class="mobile-sidebar-toggle" aria-expanded={mobileSidebarOpen} onClick={toggleMobileSidebar}>≡</button>
               <div class="mobile-server-switcher-wrap">
                 <button
+                  type="button"
                   class="mobile-server-btn"
+                  aria-expanded={showMobileServerMenu}
+                  aria-haspopup="menu"
                   onClick={() => {
                     setShowMobileServerMenu((o) => {
                       const next = !o;
