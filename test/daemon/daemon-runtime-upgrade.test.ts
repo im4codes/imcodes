@@ -2271,7 +2271,7 @@ esac
         `
           const { spawn } = require('node:child_process');
           // Naive in-group child (simulating direct child / cgroup-bound runner without OS host isolation):
-          spawn(process.execPath, ['-e', 'require("node:fs").writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => { require("node:fs").writeFileSync(process.argv[2], "done"); }, 4000);', process.argv[1], process.argv[2]], { stdio: 'ignore' });
+          spawn(process.execPath, ['-e', 'const fs = require("node:fs"); const tmp = process.argv[1] + ".tmp"; fs.writeFileSync(tmp, String(process.pid)); fs.renameSync(tmp, process.argv[1]); setTimeout(() => { require("node:fs").writeFileSync(process.argv[2], "done"); }, 4000);', process.argv[1], process.argv[2]], { stdio: 'ignore' });
           setInterval(() => {}, 1000);
         `,
         ceRunnerKilled,
@@ -2282,6 +2282,7 @@ esac
     ceOldDaemon.unref();
     await waitUntil(() => existsSync(ceRunnerKilled));
     const ceRunnerPid = Number(readFileSync(ceRunnerKilled, 'utf8').trim());
+    expect(ceRunnerPid).toBeGreaterThan(0);
     // Sweep old daemon's entire kill domain (pgroup)
     try { process.kill(-ceOldDaemon.pid!, 'SIGKILL'); } catch {}
     await new Promise((r) => setTimeout(r, 250));
@@ -2309,15 +2310,26 @@ esac
       const killDomainSweptMarker = join(root, 'kill-domain-swept.txt');
       const restartWrapper = join(root, 'causal-restart.mjs');
       const oldPidFile = join(root, 'old-daemon.pid');
+      const launchedOutFile = join(root, 'launched-result.json');
       writeFileSync(
         restartWrapper,
         `
-          import { appendFileSync, readFileSync, realpathSync } from 'node:fs';
+          import { appendFileSync, existsSync, readFileSync, realpathSync } from 'node:fs';
           import { spawn } from 'node:child_process';
           import { join } from 'node:path';
           const runtimeRoot = ${JSON.stringify(runtimeRoot)};
           const stateDir = ${JSON.stringify(stateDir)};
           const oldPid = Number(readFileSync(${JSON.stringify(oldPidFile)}, 'utf8').trim());
+          const launchedOutFile = ${JSON.stringify(launchedOutFile)};
+          const deadline = Date.now() + 5000;
+          while (!existsSync(launchedOutFile) && Date.now() < deadline) {
+            try {
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+            } catch {
+              const end = Date.now() + 20;
+              while (Date.now() < end) {}
+            }
+          }
           // Sweep old daemon's entire process group (kill domain)!
           try { process.kill(-oldPid, 'SIGKILL'); } catch {}
           appendFileSync(${JSON.stringify(killDomainSweptMarker)}, 'swept\\n');
@@ -2348,11 +2360,10 @@ esac
       const restartCmdScript = join(root, 'causal-restart.sh');
       writeFileSync(restartCmdScript, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(restartWrapper)}\n`, { mode: 0o755 });
 
-      const launchedOutFile = join(root, 'launched-result.json');
       const daemonModuleUrl = new URL('../../src/daemon/daemon-runtime-upgrade.ts', import.meta.url).href;
 
       const oldDaemonScript = `
-        import { writeFileSync } from 'node:fs';
+        import { writeFileSync, renameSync } from 'node:fs';
         import { join } from 'node:path';
         import { spawn } from 'node:child_process';
         import { probeProcessStartToken } from ${JSON.stringify(LOCK_IDENTITY_MODULE_URL)};
@@ -2393,7 +2404,9 @@ esac
             },
           } : {}),
         });
-        writeFileSync(${JSON.stringify(launchedOutFile)}, JSON.stringify(launched));
+        const launchedTmp = ${JSON.stringify(launchedOutFile)} + '.tmp';
+        writeFileSync(launchedTmp, JSON.stringify(launched));
+        renameSync(launchedTmp, ${JSON.stringify(launchedOutFile)});
         await new Promise(() => {});
       `;
 
