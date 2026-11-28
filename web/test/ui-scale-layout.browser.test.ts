@@ -1806,8 +1806,17 @@ Gtk.main()
         expect(edgeCheck.tab2BorderOk).toBe(true);
         expect(edgeCheck.tab10BorderOk).toBe(true);
 
-        // 3. Causality test: verify alert pulse CSS animation preserves base borders at 0/500ms and pulses red at 250ms
-        if (!vp.mobile) {
+        // 3. Causality test: verify alert pulse CSS animation preserves base borders, active surface gradients,
+        //    and top cyan/violet neon crowns at 0/250/500ms on both desktop and mobile (.layout-mobile), while pulsing red at 250ms.
+        {
+          const toggleMobileLayout = async (enable: boolean) => {
+            await page.evaluate((on) => {
+              const rootEl = document.getElementById('root');
+              rootEl?.classList.toggle('layout-mobile', on);
+            }, enable);
+          };
+
+          await toggleMobileLayout(vp.mobile);
           await page.evaluate(() => {
             (window as unknown as { __mountTabs: (active: string, alerts: string[]) => void }).__mountTabs('sess_1', ['sess_1', 'sess_2', 'sess_3', 'sess_4']);
           });
@@ -1819,7 +1828,7 @@ Gtk.main()
               const anim = el.getAnimations().find((a) => (a as CSSAnimation).animationName?.includes('alert'));
               if (!anim) return null;
               anim.pause();
-              const times: Record<number, { color: string; style: string; width: string; isTransparent: boolean }> = {};
+              const times: Record<number, { color: string; style: string; width: string; bgImage: string; boxShadow: string; isTransparent: boolean }> = {};
               for (const ms of [0, 250, 500]) {
                 anim.currentTime = ms;
                 const s = window.getComputedStyle(el);
@@ -1827,6 +1836,8 @@ Gtk.main()
                   color: s.borderTopColor,
                   style: s.borderTopStyle,
                   width: s.borderTopWidth,
+                  bgImage: s.backgroundImage,
+                  boxShadow: s.boxShadow,
                   isTransparent: s.borderTopColor === 'transparent' || s.borderTopColor.includes('rgba(0, 0, 0, 0)'),
                 };
               }
@@ -1852,9 +1863,14 @@ Gtk.main()
           expect(alertChecks1.brainIncognitoInactive![0].style).toBe('dashed');
           expect(alertChecks1.brainIncognitoInactive![250].style).toBe('dashed');
           expect(alertChecks1.brainIncognitoInactive![500].style).toBe('dashed');
-          // Brain active tab retains purple border at 0 and 500ms, not blue (#3b82f6)
+          // Brain active tab retains purple border at 0 and 500ms, plus active gradient + violet neon crown + red pulse at 250ms
           expect(alertChecks1.brainActive![0].color).not.toBe('rgb(59, 130, 246)');
           expect(alertChecks1.brainActive![500].color).not.toBe('rgb(59, 130, 246)');
+          for (const ms of [0, 250, 500] as const) {
+            expect(alertChecks1.brainActive![ms].bgImage).toContain('linear-gradient');
+            expect(alertChecks1.brainActive![ms].boxShadow).toContain('221, 214, 254');
+          }
+          expect(alertChecks1.brainActive![250].boxShadow).toContain('239, 68, 68');
 
           // Check active regular tab and active brain incognito tab alerts
           await page.evaluate(() => {
@@ -1868,7 +1884,7 @@ Gtk.main()
               const anim = el.getAnimations().find((a) => (a as CSSAnimation).animationName?.includes('alert'));
               if (!anim) return null;
               anim.pause();
-              const times: Record<number, { color: string; style: string; width: string; isTransparent: boolean }> = {};
+              const times: Record<number, { color: string; style: string; width: string; bgImage: string; boxShadow: string; isTransparent: boolean }> = {};
               for (const ms of [0, 250, 500]) {
                 anim.currentTime = ms;
                 const s = window.getComputedStyle(el);
@@ -1876,6 +1892,8 @@ Gtk.main()
                   color: s.borderTopColor,
                   style: s.borderTopStyle,
                   width: s.borderTopWidth,
+                  bgImage: s.backgroundImage,
+                  boxShadow: s.boxShadow,
                   isTransparent: s.borderTopColor === 'transparent' || s.borderTopColor.includes('rgba(0, 0, 0, 0)'),
                 };
               }
@@ -1897,6 +1915,11 @@ Gtk.main()
           expect(alertChecks2.brainIncognitoActive![500].isTransparent).toBe(false);
           expect(alertChecks2.brainIncognitoActive![500].style).toBe('dashed');
           expect(alertChecks2.brainIncognitoActive![500].color).not.toBe('rgb(59, 130, 246)');
+          for (const ms of [0, 250, 500] as const) {
+            expect(alertChecks2.brainIncognitoActive![ms].bgImage).toContain('linear-gradient');
+            expect(alertChecks2.brainIncognitoActive![ms].boxShadow).toContain('221, 214, 254');
+          }
+          expect(alertChecks2.brainIncognitoActive![250].boxShadow).toContain('239, 68, 68');
 
           await page.evaluate(() => {
             (window as unknown as { __mountTabs: (active: string, alerts: string[]) => void }).__mountTabs('sess_3', ['sess_3']);
@@ -1908,7 +1931,7 @@ Gtk.main()
             const anim = el.getAnimations().find((a) => (a as CSSAnimation).animationName?.includes('alert'));
             if (!anim) return null;
             anim.pause();
-            const times: Record<number, { color: string; style: string; width: string; isTransparent: boolean }> = {};
+            const times: Record<number, { color: string; style: string; width: string; bgImage: string; boxShadow: string; isTransparent: boolean }> = {};
             for (const ms of [0, 250, 500]) {
               anim.currentTime = ms;
               const s = window.getComputedStyle(el);
@@ -1916,6 +1939,8 @@ Gtk.main()
                 color: s.borderTopColor,
                 style: s.borderTopStyle,
                 width: s.borderTopWidth,
+                bgImage: s.backgroundImage,
+                boxShadow: s.boxShadow,
                 isTransparent: s.borderTopColor === 'transparent' || s.borderTopColor.includes('rgba(0, 0, 0, 0)'),
               };
             }
@@ -1926,6 +1951,12 @@ Gtk.main()
           expect(regActiveAlert![0].isTransparent).toBe(false);
           expect(regActiveAlert![250].color).toBe('rgb(239, 68, 68)');
           expect(regActiveAlert![500].isTransparent).toBe(false);
+          for (const ms of [0, 250, 500] as const) {
+            expect(regActiveAlert![ms].bgImage).toContain('linear-gradient');
+            expect(regActiveAlert![ms].boxShadow).toContain('103, 232, 249');
+          }
+          expect(regActiveAlert![250].boxShadow).toContain('239, 68, 68');
+          await toggleMobileLayout(false);
         }
 
         await page.close();

@@ -715,6 +715,8 @@ describe('styles.css regression contracts', () => {
     expect(tabAlertActiveRule).not.toBeNull();
     expect(tabAlertActiveRule![0]).not.toMatch(/0%[^}]*border-color:\s*#3b82f6/);
     expect(tabAlertActiveRule![0]).not.toMatch(/100%[^}]*border-color:\s*#3b82f6/);
+    expect(tabAlertActiveRule![0]).not.toMatch(/\bbackground\s*:/);
+    expect(tabAlertActiveRule![0]).toMatch(/50%\s*\{[^}]*var\(--tab-active-crown\)/);
     expect(tabAlertActiveRule![0]).toMatch(/50%\s*\{[^}]*border-color:\s*#ef4444/);
   });
 
