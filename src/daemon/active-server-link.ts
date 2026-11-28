@@ -13,6 +13,8 @@ export interface ActiveServerLink {
   isConnected?(): boolean;
   /** Monotonic per-connection generation on ServerLink; fenced so stale links never send late revokes. */
   getConnectionGeneration?(): number;
+  /** Close the current authenticated WS connection and schedule reconnect (triggers server-side WS sweep). */
+  forceReconnect?(reason?: string): void;
 }
 
 export interface SubSessionClosedNotice {

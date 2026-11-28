@@ -990,7 +990,11 @@ export class ServerLink {
           logger.warn({ err }, 'ServerLink: core-lane queue rejected control send');
         }
       }
-      clearServerLinkSecurity('send_without_open_socket');
+      if (messageTypeOf(msg) === DAEMON_MSG.TURN_AUTHORITY_REVOKE && this.ws) {
+        this.forceReconnect('turn_authority_revoke_send_failed');
+      } else {
+        clearServerLinkSecurity('send_without_open_socket');
+      }
       // Best-effort: silently drop messages when the link isn't up. Throwing
       // here would become an unhandled rejection in any fire-and-forget
       // caller (handleP2pConfigSave, repo-handler, command-handler, etc.)
@@ -1089,7 +1093,13 @@ export class ServerLink {
           }
         }
       }
-      clearServerLinkSecurity('socket_send_error');
+      if (messageTypeOf(msg) === DAEMON_MSG.TURN_AUTHORITY_REVOKE) {
+        // Revoke failed while socket looked OPEN (e.g. CoreLaneSocket queue full): force-close
+        // so server WS disconnect sweep immediately deletes all grants for this serverId.
+        this.forceReconnect('turn_authority_revoke_send_failed');
+      } else {
+        clearServerLinkSecurity('socket_send_error');
+      }
       recordServerSend({
         msgType: typeof (msg as { type?: unknown })?.type === 'string' ? (msg as { type: string }).type : undefined,
         commandId: typeof (msg as { commandId?: unknown })?.commandId === 'string' ? (msg as { commandId: string }).commandId : undefined,
@@ -1905,25 +1915,33 @@ export class ServerLink {
     this.forceReconnect(reason);
   }
 
+  private inForceReconnect = false;
+
   /** Kill current connection and force immediate reconnect */
-  private forceReconnect(reason = 'watchdog_forced_reconnect'): void {
-    clearServerLinkSecurity(reason);
-    cleanupPreviewRelaysForLink(this);
-    this.stopHeartbeat();
-    this.stopWatchdog();
-    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = undefined; }
-    this.reconnecting = false;
-    // Force-close existing socket (will trigger close event, but we handle reconnect ourselves)
-    try { this.ws?.close(); } catch { /* ignore */ }
-    this.ws = null;
-    this.recordRuntimeLinkStatus({
-      state: 'disconnected',
-      lastDisconnectedAt: Date.now(),
-      lastError: reason,
-    });
-    // Reset backoff for forced reconnects — we want to come back fast
-    this.backoffMs = INITIAL_BACKOFF_MS;
-    this.scheduleReconnect();
+  forceReconnect(reason = 'watchdog_forced_reconnect'): void {
+    if (this.inForceReconnect) return;
+    this.inForceReconnect = true;
+    try {
+      clearServerLinkSecurity(reason);
+      cleanupPreviewRelaysForLink(this);
+      this.stopHeartbeat();
+      this.stopWatchdog();
+      if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = undefined; }
+      this.reconnecting = false;
+      // Force-close existing socket (will trigger close event, but we handle reconnect ourselves)
+      try { this.ws?.close(); } catch { /* ignore */ }
+      this.ws = null;
+      this.recordRuntimeLinkStatus({
+        state: 'disconnected',
+        lastDisconnectedAt: Date.now(),
+        lastError: reason,
+      });
+      // Reset backoff for forced reconnects — we want to come back fast
+      this.backoffMs = INITIAL_BACKOFF_MS;
+      this.scheduleReconnect();
+    } finally {
+      this.inForceReconnect = false;
+    }
   }
 
   private scheduleReconnect(): void {

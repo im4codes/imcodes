@@ -10,7 +10,7 @@ import {
 import { createHash } from 'node:crypto';
 import { sendCommandText } from '../../shared/send-command-mode.js';
 import { readSenderOwnerMachineAuthority, readSenderParticipantTurn } from './sender-participant-turn.js';
-import { bindProcessSharedMachineActivity } from './shared-machine-authority-context.js';
+import { allocateTurnAuthorityIssueSeq, bindProcessSharedMachineActivity } from './shared-machine-authority-context.js';
 import { SHARED_MACHINE_ACTIVITY_KIND } from '../../shared/shared-machine-authority.js';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -342,6 +342,9 @@ export async function dispatchSessionMessage(
   message: string,
   options: SessionDispatchMessageOptions,
 ): Promise<SessionDispatchMessageResult> {
+  const authorityIssueSeq = (options.sharedMachineAuthority || options.ownerMachineAuthority)
+    ? allocateTurnAuthorityIssueSeq()
+    : undefined;
   // Urgent control: /stop stops the target immediately and never rides any send queue.
   if (isSessionControlCommandText(message.trim(), 'stop')) {
     const { stopSessionNow } = await import('./command-handler.js');
@@ -471,6 +474,7 @@ export async function dispatchSessionMessage(
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
         ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+        ...(authorityIssueSeq !== undefined ? { authorityIssueSeq } : {}),
       };
       const commandPrivateMetadata = Object.keys(privateMetadata).length > 0 ? privateMetadata : undefined;
       const result = typeof appendExternal === 'function'
@@ -501,6 +505,7 @@ export async function dispatchSessionMessage(
           ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
           ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
           ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+          ...(authorityIssueSeq !== undefined ? { authorityIssueSeq } : {}),
           ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
           ...(options.queueSupervisionReference
             ? { supervisionReference: options.queueSupervisionReference }
@@ -545,6 +550,7 @@ export async function dispatchSessionMessage(
           ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
         ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+        ...(authorityIssueSeq !== undefined ? { authorityIssueSeq } : {}),
           timelineCommitted: true,
           ...originMetadata(options),
         })
@@ -553,6 +559,7 @@ export async function dispatchSessionMessage(
           ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
           ...(options.sharedMachineAuthority ? { sharedMachineAuthority: options.sharedMachineAuthority } : {}),
           ...(options.ownerMachineAuthority ? { ownerMachineAuthority: options.ownerMachineAuthority } : {}),
+          ...(authorityIssueSeq !== undefined ? { authorityIssueSeq } : {}),
           ...originMetadata(options),
         })
       : options.messageOrigin || options.command
@@ -596,14 +603,14 @@ export async function dispatchSessionMessage(
           target.name,
           { sessionInstanceId: target.sessionInstanceId, runtimeEpoch: target.runtimeEpoch },
           { kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT, actorUserId: options.sharedActor.actorUserId, authority: options.sharedMachineAuthority },
-          { sessionRunning: target.state === 'running' },
+          { sessionRunning: target.state === 'running', ...(authorityIssueSeq !== undefined ? { issueSeq: authorityIssueSeq } : {}) },
         )
       : options.ownerMachineAuthority
         ? bindProcessSharedMachineActivity(
             target.name,
             { sessionInstanceId: target.sessionInstanceId, runtimeEpoch: target.runtimeEpoch },
             { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: options.ownerMachineAuthority },
-            { sessionRunning: target.state === 'running' },
+            { sessionRunning: target.state === 'running', ...(authorityIssueSeq !== undefined ? { issueSeq: authorityIssueSeq } : {}) },
           )
         : null
     : null;

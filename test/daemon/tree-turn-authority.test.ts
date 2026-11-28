@@ -941,6 +941,7 @@ describe('daemon unified main-tree turn authority', () => {
       state: 'owner',
       actorUserId: null,
       authority: 'trg_o_2',
+      authorityIssueSeq: null,
       revokeTokenHashes: [sha256('trg_o_1')],
     });
     const mixedSummary = summarizeSdkTurnOrigins([
@@ -951,6 +952,7 @@ describe('daemon unified main-tree turn authority', () => {
       state: 'mixed',
       actorUserId: 'user-p1',
       authority: null,
+      authorityIssueSeq: null,
       revokeTokenHashes: [sha256('trg_o_conflict'), sha256('trg_p1_conflict')],
     });
   });
@@ -1070,5 +1072,255 @@ describe('daemon unified main-tree turn authority', () => {
     releaseProcessSharedMachineAuthority(procD.name, { forceSettle: true });
     await flushMicrotasks();
     expect(sentFrames).toEqual([]);
+  });
+
+  it('Round 5 P0 #1: suspended older SDK active-turn append completing AFTER sub-session newer token never regresses tree authority', async () => {
+    const p1Actor = (userId: string, sessionName: string) => ({
+      actorUserId: userId,
+      actorDisplayName: userId,
+      effectiveActorRole: 'participant' as const,
+      actionId: `act-${userId}`,
+      origin: 'shared-tab' as const,
+      authorizedAt: Date.now(),
+      primaryShareId: null,
+      snapshot: {
+        target: { kind: 'main' as const, serverId: 'srv-1', sessionName },
+        effectiveRole: 'participant' as const,
+        historyCutoffAt: 0,
+        coveringShareIds: [],
+        authorizedAt: Date.now(),
+        nextCoverageRecheckAt: null,
+      },
+    });
+
+    const makeSdkHarness = (sess: SessionRecord) => {
+      let sendGateResolve: (() => void) | null = null;
+      let appendHandler: ((sid: string, payload: any) => Promise<'delivered' | 'stale' | 'unsupported'>) | undefined;
+      const provider: TransportProvider = {
+        id: 'codex-sdk',
+        connectionMode: 'persistent',
+        sessionOwnership: 'provider',
+        capabilities: {
+          streaming: true,
+          toolCalling: false,
+          approval: false,
+          sessionRestore: false,
+          multiTurn: true,
+          attachments: false,
+          contextSupport: 'full-normalized-context-injection',
+          activeDelegationNotification: 'native',
+        },
+        connect: vi.fn().mockResolvedValue(undefined),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+        createSession: vi.fn().mockResolvedValue(`prov-${sess.name}`),
+        endSession: vi.fn().mockResolvedValue(undefined),
+        send: vi.fn().mockImplementation(
+          () => new Promise<void>((resolve) => {
+            sendGateResolve = resolve;
+          }),
+        ),
+        notifyActiveDelegation: vi.fn().mockImplementation(async (sid, payload) => {
+          if (appendHandler) return appendHandler(sid, payload);
+          return 'delivered';
+        }),
+        cancel: vi.fn().mockResolvedValue(undefined),
+        onDelta: () => () => undefined,
+        onComplete: () => () => undefined,
+        onError: () => () => undefined,
+        onApprovalRequest: () => undefined,
+        onStatus: () => () => undefined,
+        onUsage: () => () => undefined,
+        onToolCall: () => () => undefined,
+        respondApproval: vi.fn().mockResolvedValue(undefined),
+      };
+      const runtime = new TransportSessionRuntime(provider, sess.name);
+      runtime.onTurnAdmitted = (origins) => bindSdkTurnOriginsAuthority(sess.name, origins);
+      return {
+        runtime,
+        setAppendHandler: (fn: typeof appendHandler) => { appendHandler = fn; },
+        releaseSend: () => { sendGateResolve?.(); sendGateResolve = null; },
+      };
+    };
+
+    const mainSess = seed({ name: 'deck_r5_p1_brain', projectName: 'r5-p1', role: 'brain', runtimeType: 'transport', agentType: 'codex-sdk', state: 'running' });
+    const subSess = seed({ name: 'deck_sub_r5_w1', projectName: 'r5-p1', role: 'w1', parentSession: mainSess.name, runtimeType: 'transport', agentType: 'codex-sdk', state: 'running' });
+    const hMain = makeSdkHarness(mainSess);
+    const hSub = makeSdkHarness(subSess);
+    await hMain.runtime.initialize({ sessionName: mainSess.name, projectName: mainSess.projectName, cwd: mainSess.projectDir });
+    await hSub.runtime.initialize({ sessionName: subSess.name, projectName: subSess.projectName, cwd: subSess.projectDir });
+
+    const tokInit = 'trg_r5_init_11111111111111111111';
+    const tokOldAppend = 'trg_r5_old_append_2222222222222';
+    const tokNewSub = 'trg_r5_new_sub_3333333333333333';
+
+    // 1. Main starts turn with tokInit
+    expect(hMain.runtime.send('initial main msg', 'cm-init', undefined, undefined, {
+      sharedActor: p1Actor('user-p1', mainSess.name),
+      sharedMachineAuthority: tokInit,
+    })).toBe('sent');
+    expect(readActiveTreeAuthorityForSession(mainSess.name)?.authority).toBe(tokInit);
+
+    // 2. Older append message from SAME P1 enters main and suspends inside provider's notifyActiveDelegation
+    let resolveSuspendedAppend!: (res: 'delivered') => void;
+    hMain.setAppendHandler(
+      () => new Promise<'delivered'>((resolve) => {
+        resolveSuspendedAppend = resolve;
+      }),
+    );
+    expect(hMain.runtime.send('older append msg', 'cm-old-append', undefined, undefined, {
+      sharedActor: p1Actor('user-p1', mainSess.name),
+      sharedMachineAuthority: tokOldAppend,
+    })).toBe('queued');
+    const pendingAppendPromise = hMain.runtime.appendPendingMessagesToActiveTurn(['cm-old-append'], 'notif-old-append');
+    await flushMicrotasks();
+
+    // Note: treeAuthorities has NEVER seen `tokOldAppend` yet (`supersededTokenHashes` does NOT have `sha256(tokOldAppend)`).
+    // 3. Before `cm-old-append` settles, sub-session receives newer `tokNewSub` from SAME P1.
+    expect(hSub.runtime.send('newer sub msg', 'cm-new-sub', undefined, undefined, {
+      sharedActor: p1Actor('user-p1', subSess.name),
+      sharedMachineAuthority: tokNewSub,
+    })).toBe('sent');
+    expect(readActiveTreeAuthorityForSession(mainSess.name)?.authority).toBe(tokNewSub);
+
+    // 4. Now the suspended older append completes on main -> notifyTurnAdmitted fires late!
+    resolveSuspendedAppend('delivered');
+    const appendOutcome = await pendingAppendPromise;
+    expect(appendOutcome.status).toBe('delivered');
+
+    // BOTH main and sub MUST still hold the newest live token `tokNewSub` (never regressed to `tokOldAppend`)!
+    expect(readActiveTreeAuthorityForSession(mainSess.name)?.authority).toBe(tokNewSub);
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: mainSess.name,
+      identity: idOf(mainSess),
+      sessionRunning: true,
+      now: Date.now(),
+      runtime: hMain.runtime,
+    })).toEqual({
+      required: true,
+      actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.PARTICIPANT,
+      authority: tokNewSub,
+    });
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: subSess.name,
+      identity: idOf(subSess),
+      sessionRunning: true,
+      now: Date.now(),
+      runtime: hSub.runtime,
+    })).toEqual({
+      required: true,
+      actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.PARTICIPANT,
+      authority: tokNewSub,
+    });
+
+    hMain.releaseSend();
+    hSub.releaseSend();
+    await hMain.runtime.kill();
+    await hSub.runtime.kill();
+  });
+
+  it('Round 5 P0 #2: final-idle and conflict revoke failures close active ServerLink or preserve gen-scoped RAM retry without leaking to new connection', async () => {
+    // Part A: Failed final-idle revoke on an OPEN link triggers forceReconnect so server WS sweep invalidates old token;
+    // when linkGeneration increments on the reconnect, new connection NEVER receives stale gen-1 revoke frames.
+    let linkGen = 30;
+    let isConnectedFlag = true;
+    let trySendOk = false;
+    let forceReconnectReasons: string[] = [];
+    setActiveServerLink({
+      send: (msg) => { sentFrames.push(msg as Record<string, unknown>); },
+      trySend: (msg) => {
+        if (!trySendOk) return false;
+        sentFrames.push(msg as Record<string, unknown>);
+        return true;
+      },
+      isConnected: () => isConnectedFlag,
+      getConnectionGeneration: () => linkGen,
+      forceReconnect: (reason = 'test') => {
+        forceReconnectReasons.push(reason);
+        isConnectedFlag = false;
+        clearAllDaemonTurnAuthoritiesOnDisconnect();
+      },
+    });
+
+    const idleFailSess = seed({ name: 'deck_r5_idle_fail', projectName: 'r5-if', role: 'brain', state: 'running' });
+    const tokIdleFail = 'trg_r5_idle_fail_111111111111111';
+    bindTreeTurnAuthority(idleFailSess.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokIdleFail,
+    });
+
+    // Keep trySend failing through final idle on OPEN link
+    sentFrames.length = 0;
+    upsertSession({ ...idleFailSess, state: 'idle' });
+    markTreeSessionIdle(idleFailSess.name);
+    await flushMicrotasks();
+
+    expect(forceReconnectReasons).toEqual(['turn_authority_revoke_send_failed']);
+    expect(sentFrames).toEqual([]);
+
+    // Now simulate reconnection on NEW linkGeneration = 31 with trySendOk = true:
+    // server already swept gen-30 grants on close, and gen-31 MUST NOT emit stale gen-30 revoke frames!
+    linkGen = 31;
+    isConnectedFlag = true;
+    trySendOk = true;
+    const tokFresh = 'trg_r5_fresh_gen31_222222222222';
+    upsertSession({ ...idleFailSess, state: 'running' });
+    bindTreeTurnAuthority(idleFailSess.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+      authority: tokFresh,
+    });
+    expect(sentFrames).toEqual([]);
+
+    // Part B: Same OPEN-link failure during mixed conflict triggers immediate forceReconnect as well
+    forceReconnectReasons = [];
+    sentFrames.length = 0;
+    trySendOk = false;
+    const mixSess = seed({ name: 'deck_r5_mix_fail', projectName: 'r5-mf', role: 'brain', state: 'running' });
+    bindProcessSharedMachineActivity(mixSess.name, idOf(mixSess), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: 'trg_r5_mix1_33333333333333333333',
+    }, { now: Date.now(), sessionRunning: true }).typed(Date.now());
+    bindProcessSharedMachineActivity(mixSess.name, idOf(mixSess), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p2',
+      authority: 'trg_r5_mix2_44444444444444444444',
+    }, { now: Date.now() + 5, sessionRunning: true }).typed(Date.now() + 5);
+    expect(forceReconnectReasons).toEqual(['turn_authority_revoke_send_failed']);
+
+    // Part C: If a link WITHOUT forceReconnect stays on the same generation after disconnect scrub,
+    // pendingIdleRevokeHashes survives `clearAllDaemonTurnAuthoritiesOnDisconnect` and retries when transport recovers on SAME generation.
+    sentFrames.length = 0;
+    let sameGen = 40;
+    let sameGenConnected = false;
+    let sameGenTrySendOk = false;
+    setActiveServerLink({
+      send: (msg) => { sentFrames.push(msg as Record<string, unknown>); },
+      trySend: (msg) => {
+        if (!sameGenTrySendOk) return false;
+        sentFrames.push(msg as Record<string, unknown>);
+        return true;
+      },
+      isConnected: () => sameGenConnected,
+      getConnectionGeneration: () => sameGen,
+    });
+    const retrySess = seed({ name: 'deck_r5_samegen', projectName: 'r5-sg', role: 'brain', state: 'running' });
+    const tokSameGen = 'trg_r5_samegen_5555555555555555';
+    bindTreeTurnAuthority(retrySess.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: tokSameGen });
+    upsertSession({ ...retrySess, state: 'idle' });
+    markTreeSessionIdle(retrySess.name);
+    await flushMicrotasks();
+    clearAllDaemonTurnAuthoritiesOnDisconnect();
+    expect(sentFrames).toEqual([]);
+
+    sameGenConnected = true;
+    sameGenTrySendOk = true;
+    const otherSess = seed({ name: 'deck_r5_samegen_next', projectName: 'r5-sg2', role: 'brain', state: 'running' });
+    bindTreeTurnAuthority(otherSess.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: 'trg_r5_other_6666666666666666666' });
+    expect(sentFrames).toEqual([{
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName: retrySess.name,
+      tokenHash: sha256(tokSameGen),
+    }]);
   });
 });

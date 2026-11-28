@@ -1,7 +1,11 @@
 import { SESSION_MODEL_APPLIED } from '../../shared/session-model-control.js';
 import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../shared/agy-agent.js';
 import { queuedPairWakeAllowed } from '../daemon/task-pairs/wake-authority.js';
-import { summarizeSdkTurnOrigins, type SdkTurnOriginSummary } from '../daemon/shared-machine-authority-context.js';
+import {
+  allocateTurnAuthorityIssueSeq,
+  summarizeSdkTurnOrigins,
+  type SdkTurnOriginSummary,
+} from '../daemon/shared-machine-authority-context.js';
 import { withMemoryMcpSessionEnv } from './providers/getDefaultMcpServers.js';
 import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
 import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
@@ -185,6 +189,8 @@ export interface PendingTransportMessage {
   sharedMachineAuthority?: string;
   /** @internal: opaque server-signed owner-turn device authority; never exposed in public projections/prompts. */
   ownerMachineAuthority?: string;
+  /** @internal: daemon-local monotonic turn-authority admission sequence for out-of-order append resolution. */
+  authorityIssueSeq?: number;
   /** @internal: this logical user event has already been written to the timeline. */
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
@@ -297,6 +303,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   delete publicEntry.messagePreamble;
   delete publicEntry.sharedMachineAuthority;
   delete publicEntry.ownerMachineAuthority;
+  delete publicEntry.authorityIssueSeq;
   // `aliasAudit` deliberately survives: it holds only referenced names and a
   // hash, and the onDrain consumer needs it to anchor the final user.message.
   delete publicEntry.peerAudit;
@@ -315,6 +322,8 @@ export interface TransportSendMetadata {
   sharedMachineAuthority?: string;
   /** @internal: opaque server-signed owner-turn device authority for this exact owner turn. */
   ownerMachineAuthority?: string;
+  /** @internal: daemon-local monotonic turn-authority admission sequence captured when the command entered daemon. */
+  authorityIssueSeq?: number;
   /**
    * Agent-bound text after alias expansion (A′). When present the provider (and
    * runtime history) receive this text while the timeline keeps the ORIGINAL
@@ -759,7 +768,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _appendedTurnOrigins: {
     dispatchId: number | null;
     turn: unknown;
-    entries: Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority'>>;
+    entries: Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority' | 'authorityIssueSeq'>>;
   } | null = null;
   /** Last single-message turn that reached provider completion. Consumed by
    * the authoritative idle projection; never inferred from timeline order. */
@@ -1658,7 +1667,7 @@ export class TransportSessionRuntime implements SessionRuntime {
    * Every message that fed the CURRENT turn: the dispatched entries and whatever was appended into the running turn since. The turn's
    * origin class is the weakest of them (a participant anywhere makes it participant-origin).
    */
-  private turnOriginEntries(): Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority'>> {
+  private turnOriginEntries(): Array<Pick<PendingTransportMessage, 'sharedActor' | 'sharedMachineAuthority' | 'ownerMachineAuthority' | 'authorityIssueSeq'>> {
     const appended = this._appendedTurnOrigins;
     const stillSameTurn = appended !== null && (
       appended.dispatchId !== null
@@ -1712,19 +1721,23 @@ export class TransportSessionRuntime implements SessionRuntime {
     for (const entry of this._activeDispatchEntries) {
       delete entry.sharedMachineAuthority;
       delete entry.ownerMachineAuthority;
+      delete entry.authorityIssueSeq;
     }
     for (const entry of this._pendingMessages) {
       delete entry.sharedMachineAuthority;
       delete entry.ownerMachineAuthority;
+      delete entry.authorityIssueSeq;
     }
     for (const item of this._unacknowledgedActiveAppends) {
       delete item.entry.sharedMachineAuthority;
       delete item.entry.ownerMachineAuthority;
+      delete item.entry.authorityIssueSeq;
     }
     if (this._appendedTurnOrigins) {
       for (const entry of this._appendedTurnOrigins.entries) {
         delete entry.sharedMachineAuthority;
         delete entry.ownerMachineAuthority;
+        delete entry.authorityIssueSeq;
       }
     }
     this._activeTreeGeneration = null;
@@ -3280,6 +3293,11 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
       ...(metadata?.sharedMachineAuthority ? { sharedMachineAuthority: metadata.sharedMachineAuthority } : {}),
       ...(metadata?.ownerMachineAuthority ? { ownerMachineAuthority: metadata.ownerMachineAuthority } : {}),
+      ...(typeof metadata?.authorityIssueSeq === 'number'
+        ? { authorityIssueSeq: metadata.authorityIssueSeq }
+        : (metadata?.sharedMachineAuthority || metadata?.ownerMachineAuthority)
+          ? { authorityIssueSeq: allocateTurnAuthorityIssueSeq() }
+          : {}),
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
       ...(nativeAppendRequested ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
@@ -3865,6 +3883,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
             ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
             ...(entry.ownerMachineAuthority ? { ownerMachineAuthority: entry.ownerMachineAuthority } : {}),
+            ...(typeof entry.authorityIssueSeq === 'number' ? { authorityIssueSeq: entry.authorityIssueSeq } : {}),
           })),
         ],
       };

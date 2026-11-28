@@ -69,7 +69,7 @@ import { terminalInputNeedsSessionMutex } from './terminal-input.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { registerProcessQueueDrainer } from './hook-server.js';
-import { bindProcessSharedMachineCommand, type ProcessSharedMachineBinding } from './shared-machine-authority-context.js';
+import { allocateTurnAuthorityIssueSeq, bindProcessSharedMachineCommand, type ProcessSharedMachineBinding } from './shared-machine-authority-context.js';
 import { OWNER_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
 import {
   emitTransportUserMessage as emitTransportUserMessageEvent,
@@ -5256,6 +5256,9 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     && rawOwnerMachineAuthority.trim()
     ? rawOwnerMachineAuthority.trim()
     : undefined;
+  const authorityIssueSeq = (sharedMachineAuthority || ownerMachineAuthority)
+    ? allocateTurnAuthorityIssueSeq()
+    : undefined;
   const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
     ? cmd.shareScope as SharedP2pRunScope
     : undefined;
@@ -5898,7 +5901,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
       (isTransportSessionFast && supportsTransportClear(fastRecord.agentType))
       || (fastRecord.runtimeType !== 'transport' && supportsProcessClear(fastRecord.agentType))
     ) {
-      authorityBinding.current = bindProcessSharedMachineCommand(sessionName, fastRecord, cmd);
+      authorityBinding.current = bindProcessSharedMachineCommand(sessionName, fastRecord, cmd, undefined, authorityIssueSeq);
       emitTransportUserMessage(text);
       receiptAcked = true;
       await executeDaemonResetCommand({
@@ -5930,7 +5933,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   const record = (await import('../store/session-store.js')).getSession(sessionName);
   // Records who fed the session. A participant's turn is never cleared by a
   // later owner message: the window ends only when the session goes idle.
-  authorityBinding.current = bindProcessSharedMachineCommand(sessionName, record, cmd);
+  authorityBinding.current = bindProcessSharedMachineCommand(sessionName, record, cmd, undefined, authorityIssueSeq);
 
   // F4 fix (audit f395d49c-78c) — fail closed when the session record is missing.
   //
@@ -6454,6 +6457,7 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
             ...(sharedActor ? { sharedActor } : {}),
             ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
             ...(ownerMachineAuthority ? { ownerMachineAuthority } : {}),
+            ...(authorityIssueSeq !== undefined ? { authorityIssueSeq } : {}),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
             ...(aliasAudit ? { aliasAudit } : {}),
             ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),

@@ -1020,4 +1020,30 @@ describe('ServerLink', () => {
     vi.advanceTimersByTime(2_000);
     expect(link.__backoffMsForTests()).toBe(INITIAL * 2); // doubled for next attempt
   });
+
+  it('closes the open socket via forceReconnect when TURN_AUTHORITY_REVOKE fails to send (e.g. socket throws/queue full)', () => {
+    vi.useFakeTimers();
+    link.connect();
+    const openHandler = mockWsInstance.addEventListener.mock.calls.find(([type]) => type === 'open')?.[1] as
+      | (() => void)
+      | undefined;
+    openHandler?.();
+    const initialGen = link.getConnectionGeneration();
+    mockWsInstance.send.mockImplementationOnce(() => {
+      throw new Error('core lane priority queue is full');
+    });
+
+    const ok = link.trySend({
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName: 'deck_rev_brain',
+      tokenHash: 'hash-123',
+    });
+
+    expect(ok).toBe(false);
+    expect(mockWsInstance.close).toHaveBeenCalledTimes(1);
+    expect(link.isConnected()).toBe(false);
+
+    vi.advanceTimersByTime(2_000);
+    expect(link.getConnectionGeneration()).toBeGreaterThan(initialGen);
+  });
 });

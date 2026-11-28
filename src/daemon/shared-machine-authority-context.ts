@@ -61,6 +61,7 @@ export interface TreeAuthorityState {
   actorUserId: string | null;
   authority: string | null;
   tokenHash: string | null;
+  tokenIssueSeq: number;
   linkGeneration?: number;
   activeSessions: Set<string>;
   sessionActors: Map<string, TreeSessionActorBinding>;
@@ -71,10 +72,58 @@ export interface TreeAuthorityState {
 
 let globalTreeGeneration = 0;
 let globalActivityEpoch = 0;
+let globalTurnAuthorityIssueSeq = 0;
 const treeAuthorities = new Map<string, TreeAuthorityState>();
+/**
+ * Pure-RAM connection-generation-scoped revoke outbox that survives `treeAuthorities.delete`
+ * and local disconnect security scrubs while the failed link generation remains active.
+ */
+const pendingIdleRevokeHashes = new Map<string, { rootSessionName: string; linkGeneration: number | undefined }>();
 export type TreeSessionActivityProbe = (sessionName: string) => boolean;
 const treeActivityProbes = new Set<TreeSessionActivityProbe>();
 const idleGuardTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+export function allocateTurnAuthorityIssueSeq(): number {
+  return ++globalTurnAuthorityIssueSeq;
+}
+
+function recordIdleRevokeFallback(
+  rootSessionName: string,
+  hash: string | null | undefined,
+  linkGeneration: number | undefined,
+): void {
+  if (!hash) return;
+  pendingIdleRevokeHashes.set(hash, { rootSessionName, linkGeneration });
+}
+
+function flushRetainedIdleRevokes(): void {
+  if (pendingIdleRevokeHashes.size === 0) return;
+  const link = getActiveServerLink();
+  const currentLinkGeneration = link?.getConnectionGeneration?.();
+  let needsForceReconnect = false;
+  for (const [hash, item] of [...pendingIdleRevokeHashes.entries()]) {
+    if (
+      item.linkGeneration !== undefined
+      && currentLinkGeneration !== undefined
+      && item.linkGeneration !== currentLinkGeneration
+    ) {
+      pendingIdleRevokeHashes.delete(hash);
+      continue;
+    }
+    if (sendTurnAuthorityRevoke(item.rootSessionName, hash, item.linkGeneration)) {
+      pendingIdleRevokeHashes.delete(hash);
+    } else if (link && (!link.isConnected || link.isConnected())) {
+      needsForceReconnect = true;
+    }
+  }
+  if (needsForceReconnect && link?.forceReconnect) {
+    try {
+      link.forceReconnect('turn_authority_revoke_send_failed');
+    } catch {
+      // Retain hashes in pure RAM until send succeeds or link generation advances.
+    }
+  }
+}
 
 export function registerTreeSessionActivityProbe(probe: TreeSessionActivityProbe): () => void {
   treeActivityProbes.add(probe);
@@ -161,28 +210,31 @@ function maybeRevokeIdleTreeAuthority(
   if (entry.tokenHash !== expectedTokenHash) return;
   if (isAnyTreeSessionStillActive(rootSessionName, entry)) return;
   treeAuthorities.delete(rootSessionName);
-  const flushed = new Set<string>();
+  const queued = new Set<string>();
   if (expectedTokenHash) {
-    flushed.add(expectedTokenHash);
-    sendTurnAuthorityRevoke(rootSessionName, expectedTokenHash, entry.linkGeneration);
+    queued.add(expectedTokenHash);
+    recordIdleRevokeFallback(rootSessionName, expectedTokenHash, entry.linkGeneration);
   }
   for (const [hash, linkGen] of entry.pendingRevokeHashes) {
-    if (flushed.has(hash)) continue;
-    flushed.add(hash);
-    sendTurnAuthorityRevoke(rootSessionName, hash, linkGen);
+    if (queued.has(hash)) continue;
+    queued.add(hash);
+    recordIdleRevokeFallback(rootSessionName, hash, linkGen);
   }
+  flushRetainedIdleRevokes();
 }
 
 export interface SdkTurnOriginInput {
   sharedActor?: { effectiveActorRole?: string; actorUserId?: string };
   sharedMachineAuthority?: string;
   ownerMachineAuthority?: string;
+  authorityIssueSeq?: number;
 }
 
 export interface SdkTurnOriginSummary {
   state: 'none' | 'owner' | 'participant' | 'mixed';
   actorUserId: string | null;
   authority: string | null;
+  authorityIssueSeq: number | null;
   /**
    * Non-callable SHA-256 hashes of every valid token in `origins` that is not the active authority:
    * - when `state === 'mixed'`: all valid tokens across conflicting/unstamped entries so every one is revoked;
@@ -191,13 +243,39 @@ export interface SdkTurnOriginSummary {
   revokeTokenHashes: string[];
 }
 
+function selectLatestIssuedOrigin(
+  origins: ReadonlyArray<SdkTurnOriginInput>,
+  readToken: (entry: SdkTurnOriginInput) => string | undefined,
+): { authority: string | null; authorityIssueSeq: number | null } {
+  let bestToken: string | null = null;
+  let bestSeq: number | undefined;
+  for (const entry of origins) {
+    const raw = readToken(entry);
+    const trimmed = typeof raw === 'string' && raw.trim() ? raw.trim() : null;
+    if (!trimmed) continue;
+    const seq = typeof entry.authorityIssueSeq === 'number' ? entry.authorityIssueSeq : undefined;
+    const shouldReplace = bestToken === null
+      || (seq !== undefined && bestSeq !== undefined && seq >= bestSeq)
+      || (seq !== undefined && bestSeq === undefined)
+      || (seq === undefined && bestSeq === undefined);
+    if (shouldReplace) {
+      bestToken = trimmed;
+      if (seq !== undefined) bestSeq = seq;
+    }
+  }
+  return {
+    authority: bestToken,
+    authorityIssueSeq: bestSeq ?? null,
+  };
+}
+
 /**
  * Shared origin summarizer used by both `onTurnAdmitted` (session-manager) and canonical
  * local runtime reading (`transport-session-runtime` / `readLocalTurnAuthorityView`).
  */
 export function summarizeSdkTurnOrigins(origins: ReadonlyArray<SdkTurnOriginInput>): SdkTurnOriginSummary {
   if (origins.length === 0) {
-    return { state: 'none', actorUserId: null, authority: null, revokeTokenHashes: [] };
+    return { state: 'none', actorUserId: null, authority: null, authorityIssueSeq: null, revokeTokenHashes: [] };
   }
 
   const allTokenHashes: string[] = [];
@@ -231,12 +309,13 @@ export function summarizeSdkTurnOrigins(origins: ReadonlyArray<SdkTurnOriginInpu
         && Boolean(entry.sharedMachineAuthority?.trim()),
     );
     if (!hasOwnerEntry && actors.length === 1 && allEntriesValidParticipant) {
-      const authority = origins[origins.length - 1]!.sharedMachineAuthority!.trim();
-      const liveHash = sha256Hex(authority);
+      const selected = selectLatestIssuedOrigin(origins, (entry) => entry.sharedMachineAuthority);
+      const liveHash = selected.authority ? sha256Hex(selected.authority) : null;
       return {
         state: 'participant',
         actorUserId: actors[0]!,
-        authority,
+        authority: selected.authority,
+        authorityIssueSeq: selected.authorityIssueSeq,
         revokeTokenHashes: allTokenHashes.filter((hash) => hash !== liveHash),
       };
     }
@@ -244,6 +323,7 @@ export function summarizeSdkTurnOrigins(origins: ReadonlyArray<SdkTurnOriginInpu
       state: 'mixed',
       actorUserId: actors.length === 1 ? actors[0]! : AMBIGUOUS_TREE_PARTICIPANT_ACTOR,
       authority: null,
+      authorityIssueSeq: null,
       revokeTokenHashes: allTokenHashes,
     };
   }
@@ -251,14 +331,15 @@ export function summarizeSdkTurnOrigins(origins: ReadonlyArray<SdkTurnOriginInpu
   const allHaveOwnerToken = origins.every(
     (entry) => typeof entry.ownerMachineAuthority === 'string' && entry.ownerMachineAuthority.trim().length > 0,
   );
-  const authority = allHaveOwnerToken
-    ? origins[origins.length - 1]!.ownerMachineAuthority!.trim()
-    : null;
-  const liveHash = authority ? sha256Hex(authority) : null;
+  const selectedOwner = allHaveOwnerToken
+    ? selectLatestIssuedOrigin(origins, (entry) => entry.ownerMachineAuthority)
+    : { authority: null, authorityIssueSeq: null };
+  const liveHash = selectedOwner.authority ? sha256Hex(selectedOwner.authority) : null;
   return {
     state: 'owner',
     actorUserId: null,
-    authority,
+    authority: selectedOwner.authority,
+    authorityIssueSeq: selectedOwner.authorityIssueSeq,
     revokeTokenHashes: allTokenHashes.filter((hash) => hash !== liveHash),
   };
 }
@@ -293,6 +374,7 @@ export function bindSdkTurnOriginsAuthority(
     }, {
       ...opts,
       markActive: true,
+      ...(summary.authorityIssueSeq !== null ? { issueSeq: summary.authorityIssueSeq } : {}),
       ...(summary.revokeTokenHashes.length > 0 ? { supersededHashes: summary.revokeTokenHashes } : {}),
     });
   }
@@ -302,6 +384,7 @@ export function bindSdkTurnOriginsAuthority(
   }, {
     ...opts,
     markActive: true,
+    ...(summary.authorityIssueSeq !== null ? { issueSeq: summary.authorityIssueSeq } : {}),
     ...(summary.revokeTokenHashes.length > 0 ? { supersededHashes: summary.revokeTokenHashes } : {}),
   });
 }
@@ -350,11 +433,13 @@ function flushConflictRevokeHashes(
   currentLinkGeneration: number | undefined,
   extraHashes: ReadonlyArray<[string | null | undefined, number | undefined]>,
 ): void {
+  const link = getActiveServerLink();
   for (const [hash, linkGen] of extraHashes) {
     if (!hash) continue;
     recordSupersededHash(supersededTokenHashes, hash);
     pendingRevokeHashes.set(hash, linkGen);
   }
+  let needsForceReconnect = false;
   for (const [hash, linkGen] of [...pendingRevokeHashes.entries()]) {
     if (
       linkGen !== undefined
@@ -367,6 +452,15 @@ function flushConflictRevokeHashes(
     }
     if (sendTurnAuthorityRevoke(rootSessionName, hash, linkGen)) {
       pendingRevokeHashes.delete(hash);
+    } else if (link && (!link.isConnected || link.isConnected())) {
+      needsForceReconnect = true;
+    }
+  }
+  if (needsForceReconnect && link?.forceReconnect) {
+    try {
+      link.forceReconnect('turn_authority_revoke_send_failed');
+    } catch {
+      // Pending hashes stay in RAM for retry on the same link generation.
     }
   }
 }
@@ -386,13 +480,18 @@ export function bindTreeTurnAuthority(
     conflict?: boolean;
     conflictRevokeHashes?: ReadonlyArray<string>;
     supersededHashes?: ReadonlyArray<string>;
+    issueSeq?: number;
   } = {},
 ): number {
   const now = opts.now ?? Date.now();
   const rootSessionName = resolveDaemonRootSessionName(sessionName);
+  flushRetainedIdleRevokes();
   const existing = treeAuthorities.get(rootSessionName);
   const markActive = opts.markActive !== false;
   const currentLinkGeneration = getActiveServerLink()?.getConnectionGeneration?.();
+  const incomingIssueSeq = typeof opts.issueSeq === 'number'
+    ? opts.issueSeq
+    : allocateTurnAuthorityIssueSeq();
 
   const normalizedIncoming: TreeSessionActorBinding = activity.kind === SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT
     ? {
@@ -465,6 +564,7 @@ export function bindTreeTurnAuthority(
         actorUserId: normalizedIncoming.kind === 'participant' ? normalizedIncoming.actorUserId : existing.actorUserId,
         authority: null,
         tokenHash: null,
+        tokenIssueSeq: Math.max(existing.tokenIssueSeq, incomingIssueSeq),
         linkGeneration: currentLinkGeneration,
         activeSessions,
         sessionActors,
@@ -484,18 +584,32 @@ export function bindTreeTurnAuthority(
 
     if (sameSenderAsTree) {
       if (markActive) existing.activeSessions.add(sessionName);
-      existing.sessionActors.set(sessionName, normalizedIncoming);
       if (incomingHash && incomingHash !== existing.tokenHash) {
+        if (existing.tokenHash && incomingIssueSeq < existing.tokenIssueSeq) {
+          // Out-of-order delayed admission (e.g. an older SDK active-turn append completing AFTER
+          // another sub-session already advanced the tree to a newer token) must NEVER regress the tree.
+          recordSupersededHash(existing.supersededTokenHashes, incomingHash);
+          existing.sessionActors.set(sessionName, {
+            kind: existing.kind === 'participant' ? 'participant' : 'owner',
+            actorUserId: existing.actorUserId,
+            authority: existing.authority,
+          });
+          existing.updatedAt = now;
+          return existing.generation;
+        }
         recordSupersededHash(existing.supersededTokenHashes, existing.tokenHash);
         existing.generation = ++globalTreeGeneration;
         existing.authority = normalizedIncoming.authority;
         existing.tokenHash = incomingHash;
+        existing.tokenIssueSeq = incomingIssueSeq;
         existing.linkGeneration = currentLinkGeneration;
       } else if (normalizedIncoming.authority && !existing.authority) {
         existing.authority = normalizedIncoming.authority;
         existing.tokenHash = incomingHash;
+        existing.tokenIssueSeq = incomingIssueSeq;
         existing.linkGeneration = currentLinkGeneration;
       }
+      existing.sessionActors.set(sessionName, normalizedIncoming);
       if (existing.pendingRevokeHashes.size > 0) {
         flushConflictRevokeHashes(
           rootSessionName,
@@ -555,6 +669,7 @@ export function bindTreeTurnAuthority(
       actorUserId: normalizedIncoming.actorUserId,
       authority: null,
       tokenHash: null,
+      tokenIssueSeq: Math.max(existing?.tokenIssueSeq ?? 0, incomingIssueSeq),
       linkGeneration: currentLinkGeneration,
       activeSessions,
       sessionActors,
@@ -574,6 +689,7 @@ export function bindTreeTurnAuthority(
       actorUserId: normalizedIncoming.actorUserId,
       authority: normalizedIncoming.authority,
       tokenHash: sha256Hex(normalizedIncoming.authority!),
+      tokenIssueSeq: incomingIssueSeq,
       linkGeneration: currentLinkGeneration,
       activeSessions,
       sessionActors,
@@ -592,6 +708,7 @@ export function bindTreeTurnAuthority(
     actorUserId: null,
     authority: normalizedIncoming.authority,
     tokenHash: normalizedIncoming.authority ? sha256Hex(normalizedIncoming.authority) : null,
+    tokenIssueSeq: incomingIssueSeq,
     linkGeneration: currentLinkGeneration,
     activeSessions,
     sessionActors,
@@ -701,6 +818,7 @@ export function bindProcessSharedMachineActivity(
     now?: number;
     sessionRunning?: boolean;
     startsTurn?: boolean;
+    issueSeq?: number;
   } = {},
 ): ProcessSharedMachineBinding {
   const now = opts.now ?? Date.now();
@@ -753,6 +871,7 @@ export function bindProcessSharedMachineActivity(
     window.treeGeneration = bindTreeTurnAuthority(sessionName, treeActivity, {
       now,
       markActive: startsTurn || hasConflictInWindow,
+      ...(opts.issueSeq !== undefined ? { issueSeq: opts.issueSeq } : {}),
       ...(hasConflictInWindow ? { conflict: true, conflictRevokeHashes } : {}),
     });
   }
@@ -789,6 +908,7 @@ export function bindProcessSharedMachineCommand(
   record: { sessionInstanceId?: string; runtimeEpoch?: string; state?: string } | undefined,
   cmd: Record<string, unknown>,
   now?: number,
+  issueSeq?: number,
 ): ProcessSharedMachineBinding {
   const identity = record?.sessionInstanceId && record.runtimeEpoch
     ? { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch }
@@ -819,6 +939,7 @@ export function bindProcessSharedMachineCommand(
     startsTurn,
     sessionRunning: record?.state === 'running',
     ...(now === undefined ? {} : { now }),
+    ...(issueSeq === undefined ? {} : { issueSeq }),
   });
 }
 
@@ -925,7 +1046,27 @@ export function clearAllDaemonTurnAuthoritiesOnDisconnect(hooks?: {
     }
   }
 
+  const currentLinkGeneration = getActiveServerLink()?.getConnectionGeneration?.();
+  for (const [hash, item] of [...pendingIdleRevokeHashes.entries()]) {
+    if (
+      item.linkGeneration !== undefined
+      && currentLinkGeneration !== undefined
+      && item.linkGeneration !== currentLinkGeneration
+    ) {
+      pendingIdleRevokeHashes.delete(hash);
+    }
+  }
+
   for (const [rootSessionName, entry] of [...treeAuthorities.entries()]) {
+    for (const [hash, linkGen] of entry.pendingRevokeHashes) {
+      if (
+        linkGen === undefined
+        || currentLinkGeneration === undefined
+        || linkGen === currentLinkGeneration
+      ) {
+        recordIdleRevokeFallback(rootSessionName, hash, linkGen);
+      }
+    }
     entry.pendingRevokeHashes.clear();
     if (entry.kind === 'owner' || !isAnyTreeSessionStillActive(rootSessionName, entry)) {
       treeAuthorities.delete(rootSessionName);
@@ -1282,4 +1423,5 @@ export function clearProcessSharedMachineAuthoritiesForTests(): void {
   idleGuardTimers.clear();
   windows.clear();
   treeAuthorities.clear();
+  pendingIdleRevokeHashes.clear();
 }
