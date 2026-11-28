@@ -634,6 +634,118 @@ async function withSharedV2CliLock<T>(key: string, fn: () => Promise<T>): Promis
   }
 }
 
+/**
+ * Terminate a CLI child tree and wait for physical child termination ('exit' / 'close'
+ * or non-null exitCode/signalCode) within `timeoutMs`, instead of treating killProcessTree's
+ * SIGKILL dispatch return as termination proof.
+ */
+export async function stopChildProcessAndWait(
+  child: ChildProcess,
+  processResource: AgentProcessResource,
+  timeoutMs = 2_000,
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    await processResource.release().catch(() => {});
+    return;
+  }
+  await new Promise<void>((resolveStop, rejectStop) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.removeListener('exit', onExit);
+      child.removeListener('close', onExit);
+    };
+    const onExit = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolveStop();
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      rejectStop(new Error(`Timed out waiting for OpenCode CLI child process exit after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref?.();
+    child.once('exit', onExit);
+    child.once('close', onExit);
+    if (child.exitCode !== null || child.signalCode !== null) {
+      onExit();
+      return;
+    }
+    void killProcessTree(child).catch((err) => {
+      if (settled) return;
+      if (child.exitCode !== null || child.signalCode !== null) {
+        onExit();
+        return;
+      }
+      settled = true;
+      cleanup();
+      rejectStop(err instanceof Error ? err : new Error(String(err)));
+    });
+  });
+  await processResource.release().catch(() => {});
+}
+
+export async function stopOpenCodeServerAndWait(
+  server: {
+    close(): Promise<void> | void;
+    stopAndWait?(timeoutMs?: number): Promise<void> | void;
+    child?: {
+      exitCode?: number | null;
+      signalCode?: string | null;
+      once?: (ev: string, cb: () => void) => void;
+      removeListener?: (ev: string, cb: () => void) => void;
+    };
+  },
+  timeoutMs: number,
+): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const raceTimeout = <T>(promise: Promise<T>, label: string): Promise<T> =>
+    new Promise<T>((resolveOp, rejectOp) => {
+      timer = setTimeout(() => {
+        rejectOp(new Error(`Timed out waiting for ${label} after ${timeoutMs}ms`));
+      }, timeoutMs);
+      timer.unref?.();
+      promise.then(
+        (v) => {
+          if (timer) clearTimeout(timer);
+          resolveOp(v);
+        },
+        (e) => {
+          if (timer) clearTimeout(timer);
+          rejectOp(e);
+        },
+      );
+    });
+
+  if (typeof server.stopAndWait === 'function') {
+    await raceTimeout(Promise.resolve(server.stopAndWait(timeoutMs)), 'OpenCode exclusive child stop');
+    return;
+  }
+  const child = server.child;
+  const childOnce = child?.once?.bind(child);
+  if (child && childOnce) {
+    const waitChild = new Promise<void>((resolveChild) => {
+      if (child.exitCode != null || child.signalCode != null) {
+        resolveChild();
+        return;
+      }
+      const onExit = () => {
+        child.removeListener?.('exit', onExit);
+        child.removeListener?.('close', onExit);
+        resolveChild();
+      };
+      childOnce('exit', onExit);
+      childOnce('close', onExit);
+    });
+    await raceTimeout(Promise.all([Promise.resolve(server.close()), waitChild]).then(() => undefined), 'OpenCode exclusive child exit');
+    return;
+  }
+  await raceTimeout(Promise.resolve(server.close()), 'OpenCode exclusive server close');
+}
+
 async function terminateCliChild(child: ChildProcess, processResource: AgentProcessResource): Promise<void> {
   await killProcessTree(child).catch(() => {});
   await processResource.release().catch(() => {});
@@ -1120,6 +1232,56 @@ export async function startOpenCodeV2CliHost(
     return releasePromise;
   };
 
+  let stopAndWaitPromise: Promise<void> | null = null;
+  const stopAndWait = (stopTimeoutMs = 2_000): Promise<void> => {
+    if (stopAndWaitPromise) return stopAndWaitPromise;
+    const task = withSharedV2CliLock(hostKey, async () => {
+      if (releasePromise) {
+        if (entry.closePromise) {
+          await entry.closePromise;
+        }
+        if (entry.refCount > 0 && !entry.closed) {
+          throw new Error('Cannot stop shared OpenCode v2 CLI host while other routes hold active references');
+        }
+        if (entry.child.exitCode === null && entry.child.signalCode === null) {
+          await stopChildProcessAndWait(entry.child, entry.processResource, stopTimeoutMs);
+        }
+        return;
+      }
+      if (entry.closed) {
+        if (entry.closePromise) {
+          await entry.closePromise;
+        }
+        if (entry.child.exitCode === null && entry.child.signalCode === null) {
+          await stopChildProcessAndWait(entry.child, entry.processResource, stopTimeoutMs);
+        }
+        return;
+      }
+      if (entry.refCount > 1) {
+        throw new Error('Cannot stop shared OpenCode v2 CLI host while other routes hold active references');
+      }
+      entry.refCount = 0;
+      entry.closed = true;
+      const stopping = (async () => {
+        entry.eventConsumers.clear();
+        entry.sessionMcpBindings.clear();
+        await stopHostEvents();
+        await stopChildProcessAndWait(entry.child, entry.processResource, stopTimeoutMs);
+      })().finally(() => {
+        if (sharedV2CliHosts.get(hostKey) === entry) {
+          sharedV2CliHosts.delete(hostKey);
+        }
+      });
+      entry.closePromise = stopping;
+      await stopping;
+    }).catch((err) => {
+      if (stopAndWaitPromise === task) stopAndWaitPromise = null;
+      throw err;
+    });
+    stopAndWaitPromise = task;
+    return task;
+  };
+
   if (options.signal.aborted) {
     await close();
     const abortErr = new Error('OpenCode startup aborted');
@@ -1168,7 +1330,7 @@ export async function startOpenCodeV2CliHost(
 
   return {
     client: entry.client,
-    server: { url: entry.url, close },
+    server: { url: entry.url, close, stopAndWait },
     subscribeEvents,
     ensureEvents: ensureHostEventLoop,
     bindSessionMcp,

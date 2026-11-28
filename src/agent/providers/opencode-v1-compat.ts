@@ -78,6 +78,8 @@ import {
   isLoopbackHostname,
   redactSecretText,
   resolveOpenCodeCliLaunchPlan,
+  stopChildProcessAndWait,
+  stopOpenCodeServerAndWait,
   type OpenCodeCliLaunchPlan,
 } from './opencode-cli.js';
 
@@ -146,6 +148,7 @@ interface OpenCodeV1ClientLike {
 interface OpenCodeV1ServerLike {
   url: string;
   close(): Promise<void> | void;
+  stopAndWait?(timeoutMs?: number): Promise<void> | void;
 }
 
 export interface OpenCodeV1RuntimeStartOptions {
@@ -172,6 +175,7 @@ async function spawnV1OpencodeServer(options: OpenCodeV1RuntimeStartOptions): Pr
   child: ChildProcess;
   processResource: AgentProcessResource;
   close: () => Promise<void>;
+  stopAndWait: (timeoutMs?: number) => Promise<void>;
 }> {
   if (!isLoopbackHostname(options.hostname)) {
     throw new Error(`OpenCode CLI v1 serve refused non-loopback hostname: ${options.hostname}`);
@@ -222,6 +226,16 @@ async function spawnV1OpencodeServer(options: OpenCodeV1RuntimeStartOptions): Pr
       await processResource.release().catch(() => {});
     })();
     return closePromise;
+  };
+  let stopAndWaitPromise: Promise<void> | null = null;
+  const stopAndWait = (stopTimeoutMs = CHILD_CLOSE_TIMEOUT_MS): Promise<void> => {
+    if (stopAndWaitPromise) return stopAndWaitPromise;
+    const task = stopChildProcessAndWait(child, processResource, stopTimeoutMs).catch((err) => {
+      if (stopAndWaitPromise === task) stopAndWaitPromise = null;
+      throw err;
+    });
+    stopAndWaitPromise = task;
+    return task;
   };
 
   const url = await new Promise<string>((resolveUrl, rejectUrl) => {
@@ -297,7 +311,7 @@ async function spawnV1OpencodeServer(options: OpenCodeV1RuntimeStartOptions): Pr
     child.once('exit', onExit);
   });
 
-  return { url, password, child, processResource, close };
+  return { url, password, child, processResource, close, stopAndWait };
 }
 
 export const openCodeV1RuntimeHooks: OpenCodeV1RuntimeHooks = {
@@ -347,7 +361,7 @@ export const openCodeV1RuntimeHooks: OpenCodeV1RuntimeHooks = {
     });
     return {
       client: client as unknown as OpenCodeV1ClientLike,
-      server: { url: started.url, close: started.close },
+      server: { url: started.url, close: started.close, stopAndWait: started.stopAndWait },
     };
   },
 };
@@ -1104,24 +1118,18 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     if (!this.isExclusiveRuntimeChild(previousOwner, incomingServer, incomingClient)) {
       return false;
     }
-    const prevCancelled = previousOwner.cancelled;
-    previousOwner.cancelled = true;
-    previousOwner.generation += 1;
     try {
-      await withOpenCodeRequestTimeout(
-        this.closeSessionState(previousOwner, false),
-        'exclusive route close',
-        undefined,
-        CHILD_CLOSE_TIMEOUT_MS,
-      );
+      await stopOpenCodeServerAndWait(previousOwner.server, CHILD_CLOSE_TIMEOUT_MS);
     } catch (error) {
-      previousOwner.cancelled = prevCancelled;
       logger.warn(
         { provider: this.id, routeId: previousOwner.routeId, providerSessionId: previousOwner.providerSessionId, error },
-        'Failed to stop exclusive OpenCode v1 child after interrupt timeout',
+        'Failed to confirm exclusive OpenCode v1 child termination after interrupt timeout; keeping existing owner intact',
       );
       return false;
     }
+    previousOwner.cancelled = true;
+    previousOwner.generation += 1;
+    await this.closeSessionState(previousOwner);
     if (this.sessions.get(previousOwner.routeId) === previousOwner) {
       this.sessions.delete(previousOwner.routeId);
     }
@@ -1132,6 +1140,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     if (this.providerToRoute.get(previousOwner.providerSessionId) === previousOwner.routeId) {
       this.providerToRoute.delete(previousOwner.providerSessionId);
     }
+    this.completeStopConfirmations(previousOwner);
     this.failOnce(
       previousOwner,
       providerError(
@@ -1565,6 +1574,12 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
   }
 
   private readonly stopConfirmations = new ProviderStopConfirmation();
+  private readonly cancelTerminalConfirmations = new ProviderStopConfirmation();
+
+  private completeStopConfirmations(state: OpenCodeSessionState): void {
+    this.stopConfirmations.complete(state);
+    this.cancelTerminalConfirmations.complete(state);
+  }
 
   cancelAndWait(sessionId: string): Promise<void> {
     const state = this.sessions.get(sessionId);
@@ -1604,32 +1619,51 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     state.pendingAdmissionAbort?.abort();
     if (!state.busy) return;
     const wasCompacting = state.compacting;
+    const prevCancelled = state.cancelled;
+    const cancelledGeneration = state.generation + 1;
     state.cancelled = true;
     state.compacting = false;
-    state.generation += 1;
+    state.generation = cancelledGeneration;
+    let confirmedStopped = false;
     try {
       const interruptResult = await this.interruptRouteWithDeadline(state, 'session cancel');
-      if (!interruptResult.ok) {
-        if (interruptResult.timedOut) {
-          logger.warn(
-            { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId, error: interruptResult.error },
-            'OpenCode v1 session abort timed out during cancel',
-          );
-        } else {
-          throw interruptResult.error;
-        }
+      if (interruptResult.ok) {
+        confirmedStopped = true;
+        return;
       }
+      if (!interruptResult.timedOut) {
+        throw interruptResult.error;
+      }
+      logger.warn(
+        { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId, error: interruptResult.error },
+        'OpenCode v1 session abort timed out during cancel; awaiting terminal stop confirmation',
+      );
+      await this.cancelTerminalConfirmations.confirm(
+        state,
+        async () => {},
+        () => this.sessions.get(sessionId) === state
+          && state.providerSessionId === state.providerSessionId
+          && state.generation === cancelledGeneration,
+      );
+      confirmedStopped = true;
+    } catch (error) {
+      if (!confirmedStopped) {
+        state.cancelled = prevCancelled;
+      }
+      throw error;
     } finally {
-      this.failOnce(state, providerError(
-        PROVIDER_ERROR_CODES.CANCELLED,
-        options?.origin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG
-          ? 'OpenCode was unresponsive and was automatically recovered.'
-          : wasCompacting
-            ? 'OpenCode compact cancelled'
-            : 'OpenCode turn cancelled',
-        true,
-        options ? { cancelOrigin: options.origin, reason: options.reason } : undefined,
-      ));
+      if (confirmedStopped) {
+        this.failOnce(state, providerError(
+          PROVIDER_ERROR_CODES.CANCELLED,
+          options?.origin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG
+            ? 'OpenCode was unresponsive and was automatically recovered.'
+            : wasCompacting
+              ? 'OpenCode compact cancelled'
+              : 'OpenCode turn cancelled',
+          true,
+          options ? { cancelOrigin: options.origin, reason: options.reason } : undefined,
+        ));
+      }
     }
   }
 
@@ -2041,11 +2075,11 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       case 'session.status': {
         const status = event.properties?.status;
         if (state.compacting) {
-          if (status?.type === 'idle') this.stopConfirmations.complete(state);
+          if (status?.type === 'idle') this.completeStopConfirmations(state);
           return;
         }
         if (status?.type === 'idle') {
-          this.stopConfirmations.complete(state);
+          this.completeStopConfirmations(state);
           this.completeOnce(state, 'session.status');
           return;
         }
@@ -2055,17 +2089,18 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
         return;
       }
       case 'session.compacted':
-        this.stopConfirmations.complete(state);
+        this.completeStopConfirmations(state);
         if (state.compacting && !state.cancelled) {
           this.completeCompactOnce(state, 'session.compacted');
         }
         return;
       case 'session.idle':
-        this.stopConfirmations.complete(state);
+        this.completeStopConfirmations(state);
         if (state.compacting) return;
         this.completeOnce(state, 'session.idle');
         return;
       case 'session.error': {
+        this.completeStopConfirmations(state);
         const sessionProviderId = state.activeStepProviderId
           ?? parseModelIdentity(state.model)?.providerID
           ?? parseModelIdentity(this.modelCache?.value.defaultModel)?.providerID;

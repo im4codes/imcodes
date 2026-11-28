@@ -52,6 +52,7 @@ import {
   redactSecretText,
   resolveOpenCodeTransport,
   startOpenCodeV2CliHost,
+  stopOpenCodeServerAndWait,
   type OpenCodeTransportResolution,
 } from './opencode-cli.js';
 import { OpenCodeV1CliProvider } from './opencode-v1-compat.js';
@@ -227,6 +228,10 @@ export interface OpenCodeClientLike {
       };
       wait?(input: { sessionID: string }): Promise<void>;
       import?(input: Record<string, unknown>): Promise<OpenCodeSessionInfoLike>;
+      export?(input: { sessionID: string; sanitize?: boolean }): Promise<{
+        info?: OpenCodeSessionInfoLike;
+        messages?: Array<Record<string, unknown>>;
+      }>;
     };
     mcp?: {
       add?(input: {
@@ -253,6 +258,7 @@ export interface OpenCodeClientLike {
 interface OpenCodeServerLike {
   url: string;
   close(): Promise<void> | void;
+  stopAndWait?(timeoutMs?: number): Promise<void> | void;
 }
 
 export interface OpenCodeMcpServerSpec {
@@ -2932,24 +2938,18 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     if (!this.isExclusiveRuntimeChild(previousOwner, incomingServer, incomingClient)) {
       return false;
     }
-    const prevCancelled = previousOwner.cancelled;
-    previousOwner.cancelled = true;
-    previousOwner.generation += 1;
     try {
-      await withOpenCodeRequestTimeout(
-        this.closeSessionState(previousOwner, false, false),
-        'exclusive route close',
-        undefined,
-        CHILD_CLOSE_TIMEOUT_MS,
-      );
+      await stopOpenCodeServerAndWait(previousOwner.server, CHILD_CLOSE_TIMEOUT_MS);
     } catch (error) {
-      previousOwner.cancelled = prevCancelled;
       logger.warn(
         { provider: this.id, routeId: previousOwner.routeId, providerSessionId: previousOwner.providerSessionId, error },
-        'Failed to stop exclusive OpenCode child after interrupt timeout',
+        'Failed to confirm exclusive OpenCode child termination after interrupt timeout; keeping existing owner intact',
       );
       return false;
     }
+    previousOwner.cancelled = true;
+    previousOwner.generation += 1;
+    await this.closeSessionState(previousOwner, false);
     if (this.sessions.get(previousOwner.routeId) === previousOwner) {
       this.sessions.delete(previousOwner.routeId);
     }
@@ -2960,6 +2960,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     if (this.providerToRoute.get(previousOwner.providerSessionId) === previousOwner.routeId) {
       this.providerToRoute.delete(previousOwner.providerSessionId);
     }
+    this.completeStopConfirmations(previousOwner);
     this.failOnce(
       previousOwner,
       providerError(
@@ -2971,11 +2972,164 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     return true;
   }
 
+  private isImportConflictError(error: unknown): boolean {
+    if (errorHttpStatus(error) === 409) return true;
+    const msg = errorMessage(error).toLowerCase();
+    if (msg.includes('importconflicterror') || msg.includes('already projected') || msg.includes('409')) return true;
+    if (error && typeof error === 'object') {
+      const rec = error as Record<string, unknown>;
+      const tag = safeString(rec._tag) ?? safeString(rec.name) ?? '';
+      if (tag.includes('ImportConflictError')) return true;
+      if (rec.cause && this.isImportConflictError(rec.cause)) return true;
+    }
+    return false;
+  }
+
+  private messageDigestForMigrationCheck(msg: Record<string, unknown>): string {
+    const type = safeString(msg.type) ?? '';
+    if (type === 'user' || type === 'synthetic') {
+      return (safeString(msg.text) ?? '').trim();
+    }
+    if (type === 'assistant' && Array.isArray(msg.content)) {
+      return msg.content
+        .map((part) => {
+          if (!part || typeof part !== 'object') return '';
+          const rec = part as Record<string, unknown>;
+          const pType = safeString(rec.type) ?? '';
+          if (pType === 'text' || pType === 'reasoning') return `${pType}:${String(rec.text ?? '').trim()}`;
+          if (pType === 'tool') return `tool:${safeString(rec.id) ?? safeString(rec.name) ?? ''}`;
+          return pType;
+        })
+        .filter(Boolean)
+        .join('|');
+    }
+    return '';
+  }
+
+  private checkTargetMatchesConfirmedV1Source(
+    legacyPayload: Record<string, unknown>,
+    targetInfo: OpenCodeSessionInfoLike | undefined,
+    targetMessages: Array<Record<string, unknown>>,
+  ): { matches: true } | { matches: false; reason: string } {
+    const legacyInfo = (legacyPayload.info ?? {}) as Record<string, any>;
+    const legacyDir = safeString(legacyInfo.location?.directory ?? (legacyPayload.location as any)?.directory);
+    const targetDir = safeString(targetInfo?.location?.directory);
+    if (legacyDir && targetDir && resolve(legacyDir) !== resolve(targetDir)) {
+      return { matches: false, reason: `target directory "${targetDir}" differs from v1 source directory "${legacyDir}"` };
+    }
+    const sourceMessages = Array.isArray(legacyPayload.messages)
+      ? (legacyPayload.messages as Array<Record<string, unknown>>)
+      : [];
+    const legacyCreated = positiveNumber(legacyInfo.time?.created);
+    const targetCreated = positiveNumber(targetInfo?.time?.created);
+    if (sourceMessages.length === 0) {
+      if (legacyCreated !== undefined && targetCreated !== undefined && Math.abs(legacyCreated - targetCreated) > 1_000) {
+        return { matches: false, reason: 'creation timestamp mismatch for empty v1 session' };
+      }
+      if (targetMessages.length > 0 && (legacyCreated === undefined || targetCreated === undefined)) {
+        return { matches: false, reason: 'target has messages while empty v1 source cannot confirm provenance' };
+      }
+      return { matches: true };
+    }
+    if (targetMessages.length < sourceMessages.length) {
+      return { matches: false, reason: `target has ${targetMessages.length} message(s), fewer than v1 source ${sourceMessages.length}` };
+    }
+    for (let i = 0; i < sourceMessages.length; i++) {
+      const src = sourceMessages[i]!;
+      const tgt = targetMessages[i]!;
+      const srcId = safeString(src.id);
+      const tgtId = safeString(tgt.id);
+      if (srcId !== tgtId) {
+        return { matches: false, reason: `message[${i}] id "${tgtId ?? 'missing'}" differs from v1 source "${srcId ?? 'missing'}"` };
+      }
+      const srcType = safeString(src.type);
+      const tgtType = safeString(tgt.type);
+      if (srcType !== tgtType) {
+        return { matches: false, reason: `message[${i}] type "${tgtType ?? 'missing'}" differs from v1 source "${srcType ?? 'missing'}"` };
+      }
+      const srcDigest = this.messageDigestForMigrationCheck(src);
+      const tgtDigest = this.messageDigestForMigrationCheck(tgt);
+      if (srcDigest && tgtDigest && srcDigest !== tgtDigest) {
+        return { matches: false, reason: `message[${i}] content diverges from v1 source` };
+      }
+    }
+    return { matches: true };
+  }
+
+  private async inspectTargetSessionForMigration(
+    client: OpenCodeClientLike,
+    sessionId: string,
+    expectedMinMessages: number,
+  ): Promise<{ exists: false } | { exists: true; info: OpenCodeSessionInfoLike; messages: Array<Record<string, unknown>> }> {
+    if (typeof client.experimental?.session?.export === 'function') {
+      try {
+        const exported = await client.experimental.session.export({ sessionID: sessionId });
+        if (exported?.info && safeString(exported.info.id) === sessionId) {
+          return {
+            exists: true,
+            info: exported.info,
+            messages: Array.isArray(exported.messages) ? exported.messages : [],
+          };
+        }
+      } catch (err) {
+        if (isNotFoundError(err)) return { exists: false };
+      }
+    }
+    let info: OpenCodeSessionInfoLike;
+    try {
+      info = await client.sessions.get({ sessionID: sessionId });
+    } catch (err) {
+      if (isNotFoundError(err)) return { exists: false };
+      throw err;
+    }
+    const msgRes = await client.message.list({
+      sessionID: sessionId,
+      order: 'asc',
+      limit: Math.max(expectedMinMessages + 50, 200),
+    });
+    return {
+      exists: true,
+      info,
+      messages: Array.isArray(msgRes?.data) ? msgRes.data : [],
+    };
+  }
+
   private async importConfirmedV1SessionIntoRuntime(
     client: OpenCodeClientLike,
     sessionId: string,
     legacy: { payload: Record<string, unknown>; sourceDbPath: string },
   ): Promise<OpenCodeSessionInfoLike> {
+    const sourceMessages = Array.isArray(legacy.payload.messages) ? legacy.payload.messages : [];
+    const reconcileExistingTarget = async (): Promise<OpenCodeSessionInfoLike | null> => {
+      const target = await this.inspectTargetSessionForMigration(client, sessionId, sourceMessages.length);
+      if (!target.exists) return null;
+      const check = this.checkTargetMatchesConfirmedV1Source(legacy.payload, target.info, target.messages);
+      if (check.matches) {
+        logger.info(
+          { provider: this.id, sessionId, sourceDbPath: legacy.sourceDbPath },
+          'Detected already-imported v1-cli OpenCode session matching v1 source history; reusing target session',
+        );
+        return target.info;
+      }
+      throw providerError(
+        PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        `OpenCode session "${sessionId}" belongs to v1 CLI storage (${legacy.sourceDbPath}), but target storage already contains a conflicting session with different history (${check.reason}). Preserving both records without overwriting; install or restore OpenCode v1 CLI (or export via \`opencode export ${sessionId}\`) to resolve manually.`,
+        false,
+      );
+    };
+
+    try {
+      const existingMatch = await reconcileExistingTarget();
+      if (existingMatch) return existingMatch;
+    } catch (err) {
+      if (err && typeof err === 'object' && 'code' in err) throw err;
+      throw providerError(
+        PROVIDER_ERROR_CODES.CONFIG_ERROR,
+        `Failed to inspect target storage while preparing migration of v1-cli session "${sessionId}": ${errorMessage(err)}. Install or restore OpenCode v1 CLI (or configure \`OPENCODE_BIN\` / \`binaryPath\`) to resume this session.`,
+        false,
+      );
+    }
+
     if (typeof client.experimental?.session?.import !== 'function') {
       throw providerError(
         PROVIDER_ERROR_CODES.CONFIG_ERROR,
@@ -2992,6 +3146,14 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       if (safeString(imported?.id) === sessionId) return imported;
       return await client.sessions.get({ sessionID: sessionId });
     } catch (importErr) {
+      if (this.isImportConflictError(importErr)) {
+        try {
+          const raceMatch = await reconcileExistingTarget();
+          if (raceMatch) return raceMatch;
+        } catch (reconcileErr) {
+          if (reconcileErr && typeof reconcileErr === 'object' && 'code' in reconcileErr) throw reconcileErr;
+        }
+      }
       throw providerError(
         PROVIDER_ERROR_CODES.CONFIG_ERROR,
         `Failed to migrate v1-cli OpenCode session "${sessionId}" from ${legacy.sourceDbPath}: ${errorMessage(importErr)}. Install or restore OpenCode v1 CLI (or configure \`OPENCODE_BIN\` / \`binaryPath\`, or export via \`opencode export ${sessionId}\`) without modifying target storage.`,
@@ -3667,6 +3829,12 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
   }
 
   private readonly stopConfirmations = new ProviderStopConfirmation();
+  private readonly cancelTerminalConfirmations = new ProviderStopConfirmation();
+
+  private completeStopConfirmations(state: OpenCodeSessionState): void {
+    this.stopConfirmations.complete(state);
+    this.cancelTerminalConfirmations.complete(state);
+  }
 
   cancelAndWait(sessionId: string): Promise<void> {
     const delegate = this.delegateForSession(sessionId);
@@ -3713,35 +3881,56 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     state.pendingAdmissionAbort?.abort();
     if (!state.busy) return;
     const wasCompacting = state.compacting;
+    const prevCancelled = state.cancelled;
+    const prevActiveTurnParams = state.activeTurnParams;
+    const cancelledGeneration = state.generation + 1;
     state.cancelled = true;
     state.compacting = false;
     state.compactRequest = null;
     state.authHealInFlight = false;
     state.activeTurnParams = null;
-    state.generation += 1;
+    state.generation = cancelledGeneration;
+    let confirmedStopped = false;
     try {
       const interruptResult = await this.interruptRouteWithDeadline(state, 'session cancel');
-      if (!interruptResult.ok) {
-        if (interruptResult.timedOut) {
-          logger.warn(
-            { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId, error: interruptResult.error },
-            'OpenCode session interrupt timed out during cancel',
-          );
-        } else {
-          throw interruptResult.error;
-        }
+      if (interruptResult.ok) {
+        confirmedStopped = true;
+        return;
       }
+      if (!interruptResult.timedOut) {
+        throw interruptResult.error;
+      }
+      logger.warn(
+        { provider: this.id, sessionId: state.routeId, providerSessionId: state.providerSessionId, error: interruptResult.error },
+        'OpenCode session interrupt timed out during cancel; awaiting terminal stop confirmation',
+      );
+      await this.cancelTerminalConfirmations.confirm(
+        state,
+        async () => {},
+        () => this.sessions.get(sessionId) === state
+          && state.providerSessionId === state.providerSessionId
+          && state.generation === cancelledGeneration,
+      );
+      confirmedStopped = true;
+    } catch (error) {
+      if (!confirmedStopped) {
+        state.cancelled = prevCancelled;
+        state.activeTurnParams = prevActiveTurnParams;
+      }
+      throw error;
     } finally {
-      this.failOnce(state, providerError(
-        PROVIDER_ERROR_CODES.CANCELLED,
-        options?.origin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG
-          ? 'OpenCode was unresponsive and was automatically recovered.'
-          : wasCompacting
-            ? 'OpenCode compact cancelled'
-            : 'OpenCode turn cancelled',
-        true,
-        options ? { cancelOrigin: options.origin, reason: options.reason } : undefined,
-      ));
+      if (confirmedStopped) {
+        this.failOnce(state, providerError(
+          PROVIDER_ERROR_CODES.CANCELLED,
+          options?.origin === PROVIDER_CANCEL_ORIGINS.STALE_WATCHDOG
+            ? 'OpenCode was unresponsive and was automatically recovered.'
+            : wasCompacting
+              ? 'OpenCode compact cancelled'
+              : 'OpenCode turn cancelled',
+          true,
+          options ? { cancelOrigin: options.origin, reason: options.reason } : undefined,
+        ));
+      }
     }
   }
 
@@ -4471,7 +4660,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.execution.succeeded': {
-        this.stopConfirmations.complete(state);
+        this.completeStopConfirmations(state);
         // Late prompt completion frames must never settle an active manual /compact or auth-heal attempt.
         if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (inRetryLifecycle()) {
@@ -4486,7 +4675,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.execution.failed': {
-        this.stopConfirmations.complete(state);
+        this.completeStopConfirmations(state);
         if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (inRetryLifecycle()) {
           if (isCorrelatedRetryEvent()) {
@@ -4500,7 +4689,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.execution.interrupted': {
-        this.stopConfirmations.complete(state);
+        this.completeStopConfirmations(state);
         if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (inRetryLifecycle() && !isCorrelatedRetryEvent()) {
           this.scheduleRetryTerminalReconcile(state, state.generation, event.type);
@@ -4544,11 +4733,11 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       case 'session.status': {
         const status = data?.status;
         if (state.compacting) {
-          if (status?.type === 'idle') this.stopConfirmations.complete(state);
+          if (status?.type === 'idle') this.completeStopConfirmations(state);
           return;
         }
         if (status?.type === 'idle') {
-          this.stopConfirmations.complete(state);
+          this.completeStopConfirmations(state);
           if (state.authHealInFlight || state.authHealPhase === 'preparing') return;
           if (inRetryLifecycle()) {
             if (isCorrelatedRetryEvent()) {
@@ -4582,7 +4771,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.compaction.ended': {
-        this.stopConfirmations.complete(state);
+        this.completeStopConfirmations(state);
         if (!state.compacting || !state.compactRequest || state.cancelled) return;
         state.compactRequest.sawV2Compaction = true;
         if (data?.reason !== 'manual') return;
@@ -4600,13 +4789,13 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
       }
       case 'session.compacted':
         // Standalone legacy v1 compaction compatibility event (never overrides an active v2 compaction flow).
-        this.stopConfirmations.complete(state);
+        this.completeStopConfirmations(state);
         if (state.compacting && !state.cancelled && !state.compactRequest?.sawV2Compaction) {
           this.completeCompactOnce(state, event.type);
         }
         return;
       case 'session.compaction.failed': {
-        this.stopConfirmations.complete(state);
+        this.completeStopConfirmations(state);
         if (!state.compacting || !state.compactRequest || state.cancelled) return;
         state.compactRequest.sawV2Compaction = true;
         if (data?.reason !== 'manual') return;
@@ -4621,7 +4810,7 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
         return;
       }
       case 'session.idle':
-        this.stopConfirmations.complete(state);
+        this.completeStopConfirmations(state);
         if (state.compacting || state.authHealInFlight || state.authHealPhase === 'preparing') return;
         if (inRetryLifecycle()) {
           if (isCorrelatedRetryEvent()) {

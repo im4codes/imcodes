@@ -1124,17 +1124,29 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     await pInflight.disconnect();
 
     // Counterexample B2/B3/B4: hung `session.abort` HTTP promise never deadlocks handoff or endSession,
-    // aborts its real request AbortSignal, reclaims exclusive child, and rejects safely when child cannot stop
+    // requires physical child exit proof (server.close returning early without child exit rejects),
+    // keeps old route stream intact on close failure so retry succeeds, and direct cancel timeout
+    // waits on ProviderStopConfirmation instead of locally faking failOnce.
+    const { EventEmitter } = await import('node:events');
     const hungAbortSignals: AbortSignal[] = [];
     const closedServers: string[] = [];
     const hungPromptCalls: string[] = [];
+    const hungQueues = new Map<number, ReturnType<typeof createAsyncQueue<Record<string, any>>>>();
+    const hungChildren = new Map<number, InstanceType<typeof EventEmitter> & { exitCode: number | null; signalCode: string | null }>();
     let hangAbortMode = true;
-    let closeRejectMode = false;
+    let closeRejectForIdx: number | null = null;
+    let omitChildExitForIdx: number | null = null;
     let hungSeq = 0;
     openCodeV1RuntimeHooks.start = vi.fn(async (opts) => {
       const idx = ++hungSeq;
       const tag = `hung-${idx}`;
       const q = createAsyncQueue<Record<string, any>>();
+      hungQueues.set(idx, q);
+      const fakeChild = Object.assign(new EventEmitter(), {
+        exitCode: null as number | null,
+        signalCode: null as string | null,
+      });
+      hungChildren.set(idx, fakeChild);
       opts.signal.addEventListener('abort', q.close, { once: true });
       return {
         client: {
@@ -1163,17 +1175,28 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
         } as any,
         server: {
           url: `http://127.0.0.1:${42100 + idx}`,
+          child: fakeChild,
           close: vi.fn(async () => {
             closedServers.push(tag);
-            if (closeRejectMode && idx === 3) {
+            if (closeRejectForIdx === idx) {
               throw new Error('child close failed');
             }
+            if (omitChildExitForIdx === idx) {
+              // Simulate killProcessTree returning before kernel child exit arrives
+              return;
+            }
+            fakeChild.exitCode = 0;
+            fakeChild.emit('exit', 0, null);
             q.close();
           }),
-        },
+        } as any,
       };
     });
     const pHungAbort = new OpenCodeSdkProvider();
+    const hungDeltas: Array<{ sid: string; text: string }> = [];
+    const hungErrors: Array<{ sid: string; code: string }> = [];
+    pHungAbort.onDelta((sid, d) => hungDeltas.push({ sid, text: d.delta }));
+    pHungAbort.onError((sid, e) => hungErrors.push({ sid, code: e.code }));
     await pHungAbort.connect({ binaryPath: v1Bin } as any);
     const hungA = await pHungAbort.createSession({ sessionKey: 'v1-hung-a', cwd: root });
     await pHungAbort.send(hungA, 'busy turn A');
@@ -1188,34 +1211,83 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     expect(hungB).toBe('v1-hung-b');
     expect(hungAbortSignals.length).toBeGreaterThanOrEqual(1);
     expect(hungAbortSignals[0]!.aborted).toBe(true);
-    // Exclusive old route `hung-2` was stopped, closed, and reclaimed before publishing `hungB`
+    // Exclusive old route `hung-2` exited, closed, and was reclaimed before publishing `hungB`
     expect(closedServers).toContain('hung-2');
     await expect(pHungAbort.send(hungA, 'after reclaim')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND });
     await pHungAbort.send(hungB, 'turn B succeeds');
     expect(hungPromptCalls).toEqual(['hung-2', 'hung-3']);
 
-    // B4: When abort times out AND old child cannot be confirmed stopped, takeover returns retryable error,
-    // closes newly started child (`hung-4`), and keeps clear ownership on `hungB` (`hung-3`)!
-    closeRejectMode = true;
+    // B4a: When close() fails, incoming runtime (`hung-4`) is closed, retryable error is thrown,
+    // AND `hungB` keeps its live SSE subscription & clear busy ownership (not half-torn-down!)
+    closeRejectForIdx = 3;
     await expect(pHungAbort.createSession({
-      sessionKey: 'v1-unsafe-c',
+      sessionKey: 'v1-unsafe-close-err',
       cwd: root,
       skipCreate: true,
       resumeId: 'shared-hung-abort-ses',
     })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONNECTION_LOST, recoverable: true });
     expect(closedServers).toContain('hung-4');
-    // `hungB` remains unambiguous busy owner (`already busy`), NOT lost!
+    hungQueues.get(3)!.push({
+      type: 'message.updated',
+      properties: { info: { id: 'msg-b-live', sessionID: 'shared-hung-abort-ses', role: 'assistant' } },
+    });
+    hungQueues.get(3)!.push({
+      type: 'message.part.updated',
+      properties: { part: { id: 'part-b-live', sessionID: 'shared-hung-abort-ses', messageID: 'msg-b-live', type: 'text', text: 'STILL_ALIVE_B' } },
+    });
+    await vi.waitFor(() => expect(hungDeltas.some((d) => d.sid === hungB && d.text.includes('STILL_ALIVE_B'))).toBe(true));
     await expect(pHungAbort.send(hungB, 'still busy owner')).rejects.toMatchObject({
       code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
       message: expect.stringContaining('already busy'),
     });
 
+    // B4b: Retry after close failure where server.close() returns IMMEDIATELY without child 'exit' arriving:
+    // MUST wait for child exit proof & time out without publishing `v1-no-exit`, keeping `hungB` intact!
+    closeRejectForIdx = null;
+    omitChildExitForIdx = 3;
+    await expect(pHungAbort.createSession({
+      sessionKey: 'v1-no-exit',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'shared-hung-abort-ses',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONNECTION_LOST, recoverable: true });
+    expect(closedServers).toContain('hung-5');
+
+    // B4c: Once child exit CAN complete (`omitChildExitForIdx = null`), retrying takeover SUCCEEDS cleanly!
+    omitChildExitForIdx = null;
+    const hungRetry = await pHungAbort.createSession({
+      sessionKey: 'v1-retry-ok',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'shared-hung-abort-ses',
+    });
+    expect(hungRetry).toBe('v1-retry-ok');
+    await pHungAbort.send(hungRetry, 'after retry');
+
+    // B5: Direct cancel() with hung `session.abort` does NOT fake local `failOnce(..., CANCELLED)` at 150ms;
+    // it waits for ProviderStopConfirmation until terminal `session.idle` arrives on the live stream!
+    let directCancelSettled = false;
+    const errCountBeforeCancel = hungErrors.length;
+    const cancelPending = pHungAbort.cancel(hungRetry).then(() => { directCancelSettled = true; });
+    await new Promise((res) => setTimeout(res, 220));
+    expect(directCancelSettled).toBe(false);
+    expect(hungErrors.slice(errCountBeforeCancel)).toEqual([]);
+    hungQueues.get(6)!.push({
+      type: 'session.idle',
+      properties: { sessionID: 'shared-hung-abort-ses' },
+    });
+    await cancelPending;
+    expect(directCancelSettled).toBe(true);
+    expect(hungErrors.slice(errCountBeforeCancel)).toEqual([
+      expect.objectContaining({ sid: hungRetry, code: PROVIDER_ERROR_CODES.CANCELLED }),
+    ]);
+
     // B3: `endSession` on busy route with hung `session.abort` finishes promptly AND still runs child close!
-    closeRejectMode = false;
+    await pHungAbort.send(hungRetry, 'busy before end');
     const endT0 = Date.now();
-    await pHungAbort.endSession(hungB);
+    await pHungAbort.endSession(hungRetry);
     expect(Date.now() - endT0).toBeLessThan(300);
-    expect(closedServers.filter((s) => s === 'hung-3').length).toBeGreaterThanOrEqual(2);
+    expect(closedServers.filter((s) => s === 'hung-6').length).toBeGreaterThanOrEqual(1);
     hangAbortMode = false;
     await pHungAbort.disconnect();
 
@@ -1539,6 +1611,22 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
           }
           if (pathname.startsWith('/api/session/') && req.method === 'GET') {
             res.statusCode = 404;
+            res.setHeader('content-type', 'application/json');
+            res.end(JSON.stringify({ message: 'Not Found' }));
+            return;
+          }
+          if (pathname.startsWith('/api/experimental/session/') && pathname.endsWith('/export') && req.method === 'GET') {
+            res.setHeader('content-type', 'application/json');
+            if (pathname === ${JSON.stringify('/api/experimental/session/' + oldSessionId + '/export')}) {
+              res.end(JSON.stringify({
+                data: {
+                  info: { id: ${JSON.stringify(oldSessionId)}, time: { created: 1000, updated: 9999999999999 } },
+                  messages: [{ id: 'stale-v2-msg-1', type: 'user', time: { created: 1000 } }],
+                },
+              }));
+              return;
+            }
+            res.statusCode = 404;
             res.end(JSON.stringify({ message: 'Not Found' }));
             return;
           }
@@ -1631,58 +1719,122 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     expect(readFileSync(v2F6Log, 'utf8')).toBe('');
     expect(v2UpgradeOwners.length).toBe(ownerCountBeforeG);
 
-    // (f) v1-cli owner + V2_CLI mode + confirmed v1 DB source migrates via import (even with colliding v2 GET) and THEN sets owner='v2-cli'
+    // (f) v1-cli owner + V2_CLI mode:
+    //     - divergent v2 copy with same ID (`oldSessionId` has `stale-v2-msg-1`) MUST reject conflict & keep both!
+    //     - clean v1 session (`ses_v1_mig_only`) imports via POST /api/experimental/session/import and updates owner='v2-cli'
     const v1DataDir = join(xdgData, 'opencode');
     mkdirSync(v1DataDir, { recursive: true });
+    const v1OnlyMigId = 'ses_v1_mig_only';
     const v1SourceDb = new DatabaseSync(join(v1DataDir, 'opencode.db'));
     v1SourceDb.exec(`
       CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER);
       CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
       CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT);
     `);
-    v1SourceDb.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run(oldSessionId, root, 'v1-owned', 1000, 2000);
-    v1SourceDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run('v1-m1', oldSessionId, 1100, 1100, JSON.stringify({ role: 'user', agent: 'build' }));
-    v1SourceDb.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run('v1-p1', 'v1-m1', oldSessionId, 1100, 1100, JSON.stringify({ type: 'text', text: 'from v1' }));
+    v1SourceDb.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run(oldSessionId, root, 'v1-divergent', 1000, 2000);
+    v1SourceDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run('msg_v1_1', oldSessionId, 1100, 1100, JSON.stringify({ role: 'user', agent: 'build' }));
+    v1SourceDb.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run('prt_v1_1', 'msg_v1_1', oldSessionId, 1100, 1100, JSON.stringify({ type: 'text', text: 'from v1' }));
+    v1SourceDb.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run(v1OnlyMigId, root, 'v1-clean-mig', 1000, 2000);
+    v1SourceDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run('msg_v1_only_1', v1OnlyMigId, 1100, 1100, JSON.stringify({ role: 'user', agent: 'build' }));
+    v1SourceDb.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run('prt_v1_only_1', 'msg_v1_only_1', v1OnlyMigId, 1100, 1100, JSON.stringify({ type: 'text', text: 'clean migrate' }));
+    const pinnedV1Id = 'ses_v1_pinned_mig';
+    v1SourceDb.prepare('INSERT INTO session (id, directory, title, time_created, time_updated) VALUES (?, ?, ?, ?, ?)').run(pinnedV1Id, root, 'v1-pinned-idempotent', 1500, 2500);
+    v1SourceDb.prepare('INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?)').run('msg_pin_1', pinnedV1Id, 1600, 1600, JSON.stringify({ role: 'user', agent: 'build', model: { providerID: 'opencode', modelID: 'big-pickle' } }));
+    v1SourceDb.prepare('INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?)').run('prt_pin_1', 'msg_pin_1', pinnedV1Id, 1600, 1600, JSON.stringify({ type: 'text', text: 'pinned hello v1' }));
     v1SourceDb.close();
-    const migRoute = await pV2Upgrade.createSession({
-      sessionKey: 'v2-confirmed-v1-mig',
+
+    const ownersBeforeConflict = v2UpgradeOwners.length;
+    await expect(pV2Upgrade.createSession({
+      sessionKey: 'v2-divergent-v1',
       cwd: root,
       skipCreate: true,
       resumeId: oldSessionId,
       openCodeStorageOwner: 'v1-cli',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    expect(v2UpgradeOwners.length).toBe(ownersBeforeConflict);
+
+    const migRoute = await pV2Upgrade.createSession({
+      sessionKey: 'v2-confirmed-v1-mig',
+      cwd: root,
+      skipCreate: true,
+      resumeId: v1OnlyMigId,
+      openCodeStorageOwner: 'v1-cli',
     });
     expect(migRoute).toBe('v2-confirmed-v1-mig');
-    expect(readFileSync(v2F6Log, 'utf8')).toContain(`"op":"import","id":"${oldSessionId}"`);
+    expect(readFileSync(v2F6Log, 'utf8')).toContain(`"op":"import","id":"${v1OnlyMigId}"`);
     expect(v2UpgradeOwners.at(-1)?.owner).toBe('v2-cli');
 
-    // (g) v2-cli owner + EMBEDDED mode + colliding embedded copy MUST reject without DB write or owner overwrite,
-    //     and unavailable v1-cli owner + EMBEDDED mode also rejects; new session fallback still works!
+    // (g) Real pinned @opencode/sdk@2.4.2 EMBEDDED runtime:
+    //     1) First migration with v1-cli owner imports `pinnedV1Id` cleanly into `embeddedDbFile` & emits 'embedded'.
+    //     2) Simulated daemon interruption before persisting new owner: reconnect & retry with stale `openCodeStorageOwner: 'v1-cli'`
+    //        MUST detect identical already-imported history (NO ImportConflictError!) & reuse target cleanly!
+    //     3) Divergent history (`oldSessionId` in embedded DB != `oldSessionId` in `v1SourceDb`) MUST fail CONFIG_ERROR without modifying either DB.
+    const pEmbOnly = new OpenCodeSdkProvider();
+    const embOnlyOwners: Array<{ sid: string; owner: string | undefined }> = [];
+    pEmbOnly.onSessionInfo((sid, info) => embOnlyOwners.push({ sid, owner: info.openCodeStorageOwner }));
+    await pEmbOnly.connect({ embedded: true, databasePath: embeddedDbFile, cwd: root } as any);
+
+    const pinnedFirstRoute = await pEmbOnly.createSession({
+      sessionKey: 'emb-pinned-first',
+      cwd: root,
+      skipCreate: true,
+      resumeId: pinnedV1Id,
+      openCodeStorageOwner: 'v1-cli',
+    });
+    expect(pinnedFirstRoute).toBe('emb-pinned-first');
+    expect(embOnlyOwners.at(-1)?.owner).toBe('embedded');
+    await pEmbOnly.disconnect();
+
+    const pEmbRetry = new OpenCodeSdkProvider();
+    const embRetryOwners: Array<{ sid: string; owner: string | undefined }> = [];
+    pEmbRetry.onSessionInfo((sid, info) => embRetryOwners.push({ sid, owner: info.openCodeStorageOwner }));
+    await pEmbRetry.connect({ embedded: true, databasePath: embeddedDbFile, cwd: root } as any);
+
+    // Retry with stale `openCodeStorageOwner: 'v1-cli'` succeeds (no 409 ImportConflictError!)
+    const pinnedRetryRoute = await pEmbRetry.createSession({
+      sessionKey: 'emb-pinned-retry',
+      cwd: root,
+      skipCreate: true,
+      resumeId: pinnedV1Id,
+      openCodeStorageOwner: 'v1-cli',
+    });
+    expect(pinnedRetryRoute).toBe('emb-pinned-retry');
+    expect(embRetryOwners.at(-1)?.owner).toBe('embedded');
+
+    // Divergent history (`oldSessionId` in embedded != `oldSessionId` in v1) fails & preserves both DBs!
+    const ownersBeforeDivergentEmb = embRetryOwners.length;
+    await expect(pEmbRetry.createSession({
+      sessionKey: 'emb-rejects-divergent-v1',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+      openCodeStorageOwner: 'v1-cli',
+    })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
+    expect(embRetryOwners.length).toBe(ownersBeforeDivergentEmb);
+
+    // (h) v2-cli owner + EMBEDDED mode + colliding embedded copy rejects without DB write or owner overwrite;
+    //     unavailable v1-cli owner + EMBEDDED mode also rejects; new session fallback still works!
     rmSync(join(v1DataDir, 'opencode.db'), { force: true });
     const embSnapDb = new DatabaseSync(embeddedDbFile);
     const snapBefore = embSnapDb.prepare('SELECT time_updated FROM session_v2 WHERE id = ?').get(oldSessionId) as { time_updated: number };
     const cntBefore = Number((embSnapDb.prepare('SELECT COUNT(*) AS cnt FROM session_message WHERE session_id = ?').get(oldSessionId) as any).cnt);
     embSnapDb.close();
 
-    const pEmbOnly = new OpenCodeSdkProvider();
-    const embOnlyOwners: Array<{ sid: string; owner: string | undefined }> = [];
-    pEmbOnly.onSessionInfo((sid, info) => embOnlyOwners.push({ sid, owner: info.openCodeStorageOwner }));
-    await pEmbOnly.connect({ embedded: true, databasePath: embeddedDbFile, cwd: root } as any);
-
-    await expect(pEmbOnly.createSession({
+    await expect(pEmbRetry.createSession({
       sessionKey: 'emb-rejects-v2',
       cwd: root,
       skipCreate: true,
       resumeId: oldSessionId,
       openCodeStorageOwner: 'v2-cli',
     })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
-    await expect(pEmbOnly.createSession({
+    await expect(pEmbRetry.createSession({
       sessionKey: 'emb-rejects-missing-v1',
       cwd: root,
       skipCreate: true,
       resumeId: oldSessionId,
       openCodeStorageOwner: 'v1-cli',
     })).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.CONFIG_ERROR });
-    expect(embOnlyOwners).toEqual([]);
+    expect(embRetryOwners.length).toBe(ownersBeforeDivergentEmb);
 
     const embAfterDb = new DatabaseSync(embeddedDbFile);
     const snapAfter = embAfterDb.prepare('SELECT time_updated FROM session_v2 WHERE id = ?').get(oldSessionId) as { time_updated: number };
@@ -1691,10 +1843,10 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     expect(snapAfter.time_updated).toBe(snapBefore.time_updated);
     expect(cntAfter).toBe(cntBefore);
 
-    const embFreshRoute = await pEmbOnly.createSession({ sessionKey: 'emb-fresh-ok', cwd: root });
+    const embFreshRoute = await pEmbRetry.createSession({ sessionKey: 'emb-fresh-ok', cwd: root });
     expect(embFreshRoute).toBe('emb-fresh-ok');
-    expect(embOnlyOwners.find((x) => x.sid === 'emb-fresh-ok')?.owner).toBe('embedded');
-    await pEmbOnly.disconnect();
+    expect(embRetryOwners.find((x) => x.sid === 'emb-fresh-ok')?.owner).toBe('embedded');
+    await pEmbRetry.disconnect();
 
     delete process.env.V2_F6_LOG;
     await pV2Upgrade.disconnect();
