@@ -445,6 +445,7 @@ export function createPortForwardRoutes(
     if (!tunnelId) {
       return c.json({ ok: false, reason: PORT_FORWARD_ERRORS.INVALID_REQUEST, error: 'tunnelId is required' }, 400);
     }
+<<<<<<< HEAD
     const actingUserId = effectiveActorUserId;
     const record = typeof (router as { getTunnel?: unknown }).getTunnel === 'function'
       ? await router.getTunnel(tunnelId)
@@ -452,20 +453,30 @@ export function createPortForwardRoutes(
     const recordStatus = (record as { status?: string } | null)?.status;
     const recordUserId = (record as { userId?: string } | null)?.userId ?? effectiveActorUserId;
     if (record && recordStatus !== 'closed' && recordUserId === effectiveActorUserId) {
+=======
+    const actingUserId = caller.operational.delegatedActorUserId ?? caller.userId;
+    const res = await router.closeTunnelForUser(caller.userId, tunnelId, 'closed_by_user', async (record) => {
+>>>>>>> c8506c563 (fix(security): enforce single-snapshot port-forward close and stale-account toggle guard)
       const blockedIds = await findBlockedPrivateDeviceServerIds(c.env.DB, {
         sourceServerId: caller.sourceServerId,
         actingUserId,
         targetServerIds: [record.listenServerId, record.targetServerId],
       });
       if (blockedIds.size > 0) {
-        return c.json({
-          ok: false,
+        return {
+          ok: false as const,
+          status: 403,
           reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
           error: MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST,
-        }, 403);
+        };
       }
+<<<<<<< HEAD
     }
     const res = await router.closeTunnelForUser(effectiveActorUserId, tunnelId);
+=======
+      return { ok: true as const };
+    });
+>>>>>>> c8506c563 (fix(security): enforce single-snapshot port-forward close and stale-account toggle guard)
     if (!res.ok) {
       return c.json({
         ok: false,
@@ -513,25 +524,31 @@ export function createPortForwardRoutes(
         }, 403);
       }
     }
-    const selectedTunnels = typeof (router as { listOpenTunnels?: unknown }).listOpenTunnels === 'function'
-      ? await router.listOpenTunnels(effectiveActorUserId, filterServerId)
-      : await router.listTunnels(effectiveActorUserId, filterServerId);
-    if (selectedTunnels.length > 0) {
-      const endpointIds = [...new Set(selectedTunnels.flatMap((t) => [t.listenServerId, t.targetServerId]))];
+    const closeResult = await router.closeAllForUser(effectiveActorUserId, filterServerId, 'closed_by_user', async (openTunnels) => {
+      if (openTunnels.length === 0) return { ok: true as const };
+      const endpointIds = [...new Set(openTunnels.flatMap((t) => [t.listenServerId, t.targetServerId]))];
       const blockedIds = await findBlockedPrivateDeviceServerIds(c.env.DB, {
         sourceServerId: caller.sourceServerId,
         actingUserId,
         targetServerIds: endpointIds,
       });
       if (blockedIds.size > 0) {
-        return c.json({
-          ok: false,
+        return {
+          ok: false as const,
+          status: 403,
           reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
           error: MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST,
-        }, 403);
+        };
       }
+      return { ok: true as const };
+    });
+    if (closeResult.denied) {
+      return c.json({
+        ok: false,
+        reason: closeResult.denied.reason,
+        error: closeResult.denied.error,
+      }, closeResult.denied.status as 403);
     }
-    const closeResult = await router.closeAllForUser(effectiveActorUserId, filterServerId);
     if (!closeResult.confirmed) {
       return c.json({
         ok: false,

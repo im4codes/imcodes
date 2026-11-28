@@ -2860,7 +2860,21 @@ function InternalMainApp() {
   refreshSharedEntriesRef.current = refreshSharedEntries;
 
   const handleToggleSharedPrivateDeviceBlock = useCallback(async (serverId: string, blockPrivateDevices: boolean) => {
+    const requestAuthGen = authMutationGenerationRef.current;
+    const requestUserId = authRef.current?.userId ?? null;
+    const requestBaseUrl = authRef.current?.baseUrl ?? null;
     const res = await updateMyServerPrivateDevicePolicy(serverId, blockPrivateDevices);
+    const currentAuth = authRef.current;
+    if (
+      !requestUserId
+      || requestBaseUrl === null
+      || authMutationGenerationRef.current !== requestAuthGen
+      || !currentAuth
+      || currentAuth.userId !== requestUserId
+      || currentAuth.baseUrl !== requestBaseUrl
+    ) {
+      return;
+    }
     setSharedEntries((prev) => prev.map((entry) => (
       entry.serverId === serverId
         ? { ...entry, blockMyPrivateDevices: res.blockPrivateDevices }

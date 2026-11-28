@@ -1517,6 +1517,9 @@ export class PortForwardRouter {
     userId: string,
     tunnelId: string,
     reason = 'closed_by_user',
+    authorizeRecord?: (
+      record: PortForwardClusterTunnelRecord,
+    ) => Promise<{ ok: true } | { ok: false; status: number; reason: PortForwardErrorCode; error: string }>,
   ): Promise<
     | { ok: true; closedTunnelIds: string[] }
     | {
@@ -1545,6 +1548,17 @@ export class PortForwardRouter {
         error: `tunnel "${tunnelId}" is not owned by caller`,
       };
     }
+    if (authorizeRecord) {
+      const authRes = await authorizeRecord(record);
+      if (!authRes.ok) {
+        return {
+          ok: false,
+          status: authRes.status,
+          reason: authRes.reason,
+          error: authRes.error,
+        };
+      }
+    }
     const res = await this.closeTunnelRecordAndAwait(record, reason);
     if (!res.confirmed) {
       return {
@@ -1563,8 +1577,31 @@ export class PortForwardRouter {
     userId: string,
     nodeServerId?: string,
     reason = 'closed_by_user',
-  ): Promise<{ confirmed: boolean; closedTunnelIds: string[]; unconfirmedTunnelIds: string[] }> {
+    authorizeBatch?: (
+      records: PortForwardClusterTunnelRecord[],
+    ) => Promise<{ ok: true } | { ok: false; status: number; reason: PortForwardErrorCode; error: string }>,
+  ): Promise<{
+    confirmed: boolean;
+    closedTunnelIds: string[];
+    unconfirmedTunnelIds: string[];
+    denied?: { status: number; reason: PortForwardErrorCode; error: string };
+  }> {
     const openTunnels = await this.clusterStore.listOpenTunnelsForUser(userId, nodeServerId);
+    if (authorizeBatch && openTunnels.length > 0) {
+      const authRes = await authorizeBatch(openTunnels);
+      if (!authRes.ok) {
+        return {
+          confirmed: false,
+          closedTunnelIds: [],
+          unconfirmedTunnelIds: [],
+          denied: {
+            status: authRes.status,
+            reason: authRes.reason,
+            error: authRes.error,
+          },
+        };
+      }
+    }
     const results = await Promise.all(openTunnels.map((record) => this.closeTunnelRecordAndAwait(record, reason)));
     const closedTunnelIds = results.filter((r) => r.confirmed).map((r) => r.tunnelId);
     const unconfirmedTunnelIds = results.filter((r) => !r.confirmed).map((r) => r.tunnelId);

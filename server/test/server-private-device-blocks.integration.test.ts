@@ -22,8 +22,12 @@ import { signJwt } from '../src/security/crypto.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import { MACHINE_DENIAL_REASON } from '../../shared/machine-access-policy.js';
-import type { PortForwardRouter } from '../src/ws/port-forward-router.js';
-import type { PortForwardTunnelSummary } from '../../shared/port-forward.js';
+import { PortForwardRouter } from '../src/ws/port-forward-router.js';
+import {
+  InMemoryPortForwardClusterStore,
+  type PortForwardClusterStatus,
+  type PortForwardClusterTunnelRecord,
+} from '../src/ws/port-forward-cluster.js';
 
 const JWT_KEY = 'private-device-block-test-key';
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
@@ -112,7 +116,17 @@ async function removeServerFromGroup(serverId: string, teamId: string) {
   await db.execute('DELETE FROM machine_groups WHERE server_id = $1 AND team_id = $2', [serverId, teamId]);
 }
 
-function createApp(initialTunnels: Array<PortForwardTunnelSummary & { userId: string; status: string }> = []) {
+async function createApp(
+  initialTunnels: Array<Partial<PortForwardClusterTunnelRecord> & {
+    tunnelId: string;
+    userId: string;
+    listenServerId: string;
+    listenNode: string;
+    targetServerId: string;
+    targetNode: string;
+    status: PortForwardClusterStatus;
+  }> = [],
+) {
   const app = new Hono();
   app.use('*', async (c, next) => {
     (c as unknown as { env: { DB: Database; JWT_SIGNING_KEY: string } }).env = {
@@ -122,62 +136,65 @@ function createApp(initialTunnels: Array<PortForwardTunnelSummary & { userId: st
     await next();
   });
 
-  const tunnels = [...initialTunnels];
-  const closeTunnelSpy = vi.fn(async (_userId: string, tunnelId: string) => {
-    const idx = tunnels.findIndex((t) => t.tunnelId === tunnelId && t.status !== 'closed');
-    if (idx === -1) return { ok: false as const, status: 404, reason: 'tunnel_not_found' as const, error: 'not found' };
-    tunnels[idx] = { ...tunnels[idx]!, status: 'closed' };
-    return { ok: true as const, closedTunnelIds: [tunnelId] };
-  });
-  const closeAllSpy = vi.fn(async (userId: string, nodeServerId?: string) => {
-    const closedIds: string[] = [];
-    for (let i = 0; i < tunnels.length; i += 1) {
-      const t = tunnels[i]!;
-      if (t.userId !== userId || t.status === 'closed') continue;
-      if (nodeServerId && t.listenServerId !== nodeServerId && t.targetServerId !== nodeServerId) continue;
-      tunnels[i] = { ...t, status: 'closed' };
-      closedIds.push(t.tunnelId);
-    }
-    return { confirmed: true, closedTunnelIds: closedIds, unconfirmedTunnelIds: [] };
-  });
+  const clusterStore = new InMemoryPortForwardClusterStore();
+  const now = Date.now();
+  for (const t of initialTunnels) {
+    await clusterStore.tryCreateTunnel({
+      coordinatorPodId: 'pod-test',
+      listenPodId: 'pod-test',
+      listenGeneration: 1,
+      requestedListenPort: t.listenPort ?? 9100,
+      boundListenPort: t.listenPort ?? 9100,
+      targetPodId: 'pod-test',
+      targetGeneration: 1,
+      targetHost: '127.0.0.1',
+      targetPort: 80,
+      transportPref: 'auto',
+      transportMode: 'relay',
+      activeConnections: 0,
+      bytesSent: 0,
+      bytesReceived: 0,
+      createdAt: now,
+      expiresAt: now + 60_000,
+      updatedAt: now,
+      ...t,
+    } as PortForwardClusterTunnelRecord);
+  }
 
-  const mockPortForwardRouter = {
-    configure: () => {},
-    openTunnel: async (req: Record<string, unknown>) => ({
-      ok: true,
-      tunnel: {
-        tunnelId: 'tun-mock-1',
-        listenNode: req.listenNode,
-        listenServerId: req.listenServerId,
-        listenHost: '127.0.0.1',
-        listenPort: req.listenPort ?? 8080,
-        localEndpoint: `127.0.0.1:${req.listenPort ?? 8080}`,
-        targetNode: req.targetNode,
-        targetServerId: req.targetServerId,
-        targetHost: req.targetHost,
-        targetPort: req.targetPort,
-        transportMode: 'relay',
-        activeConnections: 0,
-        bytesSent: 0,
-        bytesReceived: 0,
-        createdAt: Date.now(),
-        expiresAt: Date.now() + 60_000,
-      },
-    }),
-    listTunnels: async (userId: string, nodeServerId?: string) => tunnels.filter((t) => (
-      t.userId === userId
-      && t.status === 'active'
-      && (!nodeServerId || t.listenServerId === nodeServerId || t.targetServerId === nodeServerId)
-    )),
-    listOpenTunnels: async (userId: string, nodeServerId?: string) => tunnels.filter((t) => (
-      t.userId === userId
-      && t.status !== 'closed'
-      && (!nodeServerId || t.listenServerId === nodeServerId || t.targetServerId === nodeServerId)
-    )),
-    getTunnel: async (tunnelId: string) => tunnels.find((t) => t.tunnelId === tunnelId) ?? null,
-    closeTunnelForUser: closeTunnelSpy,
-    closeAllForUser: closeAllSpy,
-  } as unknown as PortForwardRouter;
+  const router = new PortForwardRouter({
+    podId: 'pod-test',
+    clusterStore,
+    closeAckTimeoutMs: 50,
+  });
+  const closedByRouter: string[] = [];
+  router.openTunnel = async (req) => ({
+    ok: true,
+    tunnel: {
+      tunnelId: 'tun-mock-1',
+      listenNode: req.listenNode,
+      listenServerId: req.listenServerId,
+      listenHost: '127.0.0.1',
+      listenPort: req.listenPort ?? 8080,
+      localEndpoint: `127.0.0.1:${req.listenPort ?? 8080}`,
+      targetNode: req.targetNode,
+      targetServerId: req.targetServerId,
+      targetHost: req.targetHost,
+      targetPort: req.targetPort,
+      transportMode: 'relay',
+      activeConnections: 0,
+      bytesSent: 0,
+      bytesReceived: 0,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + 60_000,
+    },
+  });
+  (router as unknown as {
+    closeTunnelRecordAndAwait: (r: { tunnelId: string }, reason: string) => Promise<{ confirmed: boolean; tunnelId: string }>;
+  }).closeTunnelRecordAndAwait = async (rec, _reason) => {
+    closedByRouter.push(rec.tunnelId);
+    await clusterStore.markTunnelClosed(rec.tunnelId);
+    return { confirmed: true, tunnelId: rec.tunnelId };
+  };
 
   app.route('/api/server', serverRoutes);
   app.route('/api', tabSharingRoutes);
@@ -191,9 +208,9 @@ function createApp(initialTunnels: Array<PortForwardTunnelSummary & { userId: st
     result: { ok: true, content: [{ type: 'text', text: 'apps' }] },
   })));
   app.route('/api/server', fileTransferRoutes);
-  app.route('/api/port-forwards', createPortForwardRoutes(mockPortForwardRouter));
+  app.route('/api/port-forwards', createPortForwardRoutes(router));
   app.route('/api/verification-machines', verificationMachineRoutes);
-  return { app, mockPortForwardRouter, tunnels, closeTunnelSpy, closeAllSpy };
+  return { app, router, clusterStore, closedByRouter };
 }
 
 describe('Symmetric per-user per-host private device blocks ("各自保护自己")', () => {
@@ -284,7 +301,7 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
       now: Date.now(),
     });
 
-    const { app } = createApp();
+    const { app } = await createApp();
 
     // 1. Daemon token and stranger rejected on self-only policy endpoints
     expect((await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
@@ -509,27 +526,17 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
     await addServerToGroup(hostA.serverId, g1);
     await addServerToGroup(allowedShared.serverId, g1);
 
-    const now = Date.now();
-    const { app, tunnels, closeTunnelSpy, closeAllSpy } = createApp([
+    const { app, clusterStore, closedByRouter } = await createApp([
       {
         tunnelId: 't-allowed',
         userId: owner.id,
         status: 'active',
         listenNode: 'self',
         listenServerId: hostA.serverId,
-        listenHost: '127.0.0.1',
-        listenPort: 9101,
-        localEndpoint: '127.0.0.1:9101',
+        requestedListenPort: 9101,
+        boundListenPort: 9101,
         targetNode: allowedShared.nodeId,
         targetServerId: allowedShared.serverId,
-        targetHost: '127.0.0.1',
-        targetPort: 80,
-        transportMode: 'relay',
-        activeConnections: 0,
-        bytesSent: 0,
-        bytesReceived: 0,
-        createdAt: now,
-        expiresAt: now + 60_000,
       },
       {
         tunnelId: 't-blocked-target',
@@ -537,39 +544,21 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
         status: 'active',
         listenNode: allowedShared.nodeId,
         listenServerId: allowedShared.serverId,
-        listenHost: '127.0.0.1',
-        listenPort: 9102,
-        localEndpoint: '127.0.0.1:9102',
+        requestedListenPort: 9102,
+        boundListenPort: 9102,
         targetNode: blockedPriv.nodeId,
         targetServerId: blockedPriv.serverId,
-        targetHost: '127.0.0.1',
-        targetPort: 80,
-        transportMode: 'relay',
-        activeConnections: 0,
-        bytesSent: 0,
-        bytesReceived: 0,
-        createdAt: now,
-        expiresAt: now + 60_000,
       },
       {
         tunnelId: 't-blocked-listen',
         userId: owner.id,
-        status: 'opening',
+        status: 'preparing',
         listenNode: blockedFull.serverId,
         listenServerId: blockedFull.serverId,
-        listenHost: '127.0.0.1',
-        listenPort: 9103,
-        localEndpoint: '127.0.0.1:9103',
+        requestedListenPort: 9103,
+        boundListenPort: 9103,
         targetNode: allowedShared.nodeId,
         targetServerId: allowedShared.serverId,
-        targetHost: '127.0.0.1',
-        targetPort: 80,
-        transportMode: 'relay',
-        activeConnections: 0,
-        bytesSent: 0,
-        bytesReceived: 0,
-        createdAt: now,
-        expiresAt: now + 60_000,
       },
     ]);
 
@@ -594,7 +583,7 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
     expect(listRes.status).toBe(200);
     expect(((await listRes.json()) as { tunnels: Array<{ tunnelId: string }> }).tunnels.map((t) => t.tunnelId)).toEqual(['t-allowed']);
 
-    // DELETE /:tunnelId blocks on either blocked targetServerId or blocked listenServerId, never calling router close
+    // DELETE /:tunnelId blocks on either blocked targetServerId or blocked listenServerId, closing ZERO tunnels
     for (const id of ['t-blocked-target', 't-blocked-listen']) {
       const delOne = await app.request(`/api/port-forwards/${id}`, {
         method: 'DELETE',
@@ -603,7 +592,7 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
       expect(delOne.status).toBe(403);
       expect(((await delOne.json()) as { error: string }).error).toBe(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST);
     }
-    expect(closeTunnelSpy).not.toHaveBeenCalled();
+    expect(closedByRouter).toEqual([]);
 
     // Batch DELETE / without ?node= blocks with 403 and performs ZERO partial closes!
     const delAll = await app.request('/api/port-forwards', {
@@ -612,8 +601,12 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
     });
     expect(delAll.status).toBe(403);
     expect(((await delAll.json()) as { error: string }).error).toBe(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST);
-    expect(closeAllSpy).not.toHaveBeenCalled();
-    expect(tunnels.every((t) => t.status !== 'closed')).toBe(true);
+    expect(closedByRouter).toEqual([]);
+    expect((await clusterStore.listOpenTunnelsForUser(owner.id)).map((t) => t.tunnelId).sort()).toEqual([
+      't-allowed',
+      't-blocked-listen',
+      't-blocked-target',
+    ]);
 
     // Batch DELETE /?node=allowedShared also fails atomically because t-blocked-target/listen bridge allowedShared <-> blocked!
     const delFiltered = await app.request(`/api/port-forwards?node=${allowedShared.nodeId}`, {
@@ -621,8 +614,8 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
       headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
     });
     expect(delFiltered.status).toBe(403);
-    expect(closeAllSpy).not.toHaveBeenCalled();
-    expect(tunnels.every((t) => t.status !== 'closed')).toBe(true);
+    expect(closedByRouter).toEqual([]);
+    expect(await clusterStore.listOpenTunnelsForUser(owner.id)).toHaveLength(3);
 
     // When toggle is turned OFF, normal DELETE /:tunnelId and DELETE / work!
     await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
@@ -640,7 +633,8 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
       headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
     });
     expect(delAllOk.status).toBe(200);
-    expect(tunnels.every((t) => t.status === 'closed')).toBe(true);
+    expect(await clusterStore.listOpenTunnelsForUser(owner.id)).toHaveLength(0);
+    expect(closedByRouter.sort()).toEqual(['t-allowed', 't-blocked-listen', 't-blocked-target']);
   });
 
   it('filters private controlled nodes BEFORE LIMIT cap (>200 machines) in both /api/machines and /api/verification-machines', async () => {
@@ -659,7 +653,7 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
     await addServerToGroup(lastShared.serverId, g1);
     const lastPrivate = await seedControlledNode(owner.id, 'zzz-priv-204');
 
-    const { app } = createApp();
+    const { app } = await createApp();
     // Register verification profiles for the >200 nodes (priv #202, shared #203, priv #204) via browser
     for (const [alias, nodeId] of [
       ['p-priv-001', privateNodes[0]!.nodeId],
@@ -721,5 +715,134 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
     });
     expect(putBlockedRes.status).toBe(403);
     expect(((await putBlockedRes.json()) as { error: string }).error).toBe(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST);
+  });
+
+  it('uses a single cluster-store snapshot for batch DELETE /api/port-forwards so newly opened private tunnels cannot slip into execution', async () => {
+    const owner = await createUser(db, `snap-o-${hex(4)}`, 'Snap Owner', 'snapo@test.local');
+    const colleague = await createUser(db, `snap-c-${hex(4)}`, 'Snap Colleague', 'snapc@test.local');
+    const g1 = await createTeamWithMembers('Snap Team', owner.id, [colleague.id]);
+    const hostA = await seedFullHost(owner.id, 'Snap Host A');
+    const allowedShared = await seedControlledNode(owner.id, 'Snap Allowed C');
+    const blockedPriv = await seedControlledNode(owner.id, 'Snap Blocked B');
+    await addServerToGroup(hostA.serverId, g1);
+    await addServerToGroup(allowedShared.serverId, g1);
+
+    await appRequestPatchBlock(owner.id, hostA.serverId, true);
+
+    async function appRequestPatchBlock(uid: string, sid: string, val: boolean) {
+      await db.execute(
+        `INSERT INTO server_private_device_blocks (server_id, user_id, block_private_devices, updated_at)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (server_id, user_id) DO UPDATE SET block_private_devices = excluded.block_private_devices`,
+        [sid, uid, val, Date.now()],
+      );
+    }
+
+    const now = Date.now();
+    const clusterStore = new InMemoryPortForwardClusterStore();
+    const checkedTunnel = {
+      tunnelId: 'checked-tunnel',
+      userId: owner.id,
+      coordinatorPodId: 'pod-test',
+      listenNode: 'self',
+      listenServerId: hostA.serverId,
+      listenPodId: 'pod-test',
+      listenGeneration: 1,
+      requestedListenPort: 9201,
+      boundListenPort: 9201,
+      targetNode: allowedShared.nodeId,
+      targetServerId: allowedShared.serverId,
+      targetPodId: 'pod-test',
+      targetGeneration: 1,
+      targetHost: '127.0.0.1',
+      targetPort: 80,
+      transportPref: 'auto' as const,
+      transportMode: 'relay' as const,
+      status: 'active' as const,
+      activeConnections: 0,
+      bytesSent: 0,
+      bytesReceived: 0,
+      createdAt: now,
+      expiresAt: now + 60_000,
+      updatedAt: now,
+    };
+    const newUncheckedTunnel = {
+      ...checkedTunnel,
+      tunnelId: 'new-unchecked-tunnel',
+      targetNode: blockedPriv.nodeId,
+      targetServerId: blockedPriv.serverId,
+      requestedListenPort: 9202,
+      boundListenPort: 9202,
+    };
+    await clusterStore.tryCreateTunnel(checkedTunnel);
+
+    let listOpenCalls = 0;
+    const origListOpen = clusterStore.listOpenTunnelsForUser.bind(clusterStore);
+    clusterStore.listOpenTunnelsForUser = async (userId: string, nodeServerId?: string) => {
+      listOpenCalls += 1;
+      if (listOpenCalls === 1) {
+        return origListOpen(userId, nodeServerId);
+      }
+      // If a buggy 2nd read occurred, this newly opened blocked tunnel would appear and get closed!
+      return [checkedTunnel, newUncheckedTunnel];
+    };
+
+    const closedByRouter: string[] = [];
+    const realRouter = new PortForwardRouter({
+      podId: 'pod-test',
+      clusterStore,
+      closeAckTimeoutMs: 50,
+    });
+    const origCloseRecord = (realRouter as unknown as {
+      closeTunnelRecordAndAwait: (r: { tunnelId: string }, reason: string) => Promise<{ confirmed: boolean; tunnelId: string }>;
+    }).closeTunnelRecordAndAwait.bind(realRouter);
+    (realRouter as unknown as {
+      closeTunnelRecordAndAwait: (r: { tunnelId: string }, reason: string) => Promise<{ confirmed: boolean; tunnelId: string }>;
+    }).closeTunnelRecordAndAwait = async (rec, _reason) => {
+      closedByRouter.push(rec.tunnelId);
+      void origCloseRecord;
+      return { confirmed: true, tunnelId: rec.tunnelId };
+    };
+
+    const routeApp = new Hono();
+    routeApp.use('*', async (c, next) => {
+      (c as unknown as { env: { DB: Database; JWT_SIGNING_KEY: string } }).env = {
+        DB: db,
+        JWT_SIGNING_KEY: JWT_KEY,
+      };
+      await next();
+    });
+    routeApp.route('/api/port-forwards', createPortForwardRoutes(realRouter));
+
+    const turnToken = await issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: owner.id,
+      sourceServerId: hostA.serverId,
+      sessionName: 'deck_snap',
+      actionId: `act-snap-${hex(4)}`,
+      signingKey: JWT_KEY,
+    });
+
+    // 1. Clean 1st snapshot [checked-tunnel]: clusterStore.listOpenTunnelsForUser called ONLY ONCE; new-unchecked-tunnel NEVER closed!
+    const okRes = await routeApp.request('/api/port-forwards', {
+      method: 'DELETE',
+      headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
+    });
+    expect(okRes.status).toBe(200);
+    expect(await okRes.json()).toEqual({ ok: true, closedCount: 1, closedTunnelIds: ['checked-tunnel'] });
+    expect(listOpenCalls).toBe(1);
+    expect(closedByRouter).toEqual(['checked-tunnel']);
+
+    // 2. When the single snapshot includes newUncheckedTunnel, authorizeBatch rejects 403 and closes ZERO tunnels!
+    closedByRouter.length = 0;
+    listOpenCalls = 0;
+    await clusterStore.tryCreateTunnel(newUncheckedTunnel);
+    clusterStore.listOpenTunnelsForUser = origListOpen;
+    const blockedRes = await routeApp.request('/api/port-forwards', {
+      method: 'DELETE',
+      headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
+    });
+    expect(blockedRes.status).toBe(403);
+    expect(((await blockedRes.json()) as { error: string }).error).toBe(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST);
+    expect(closedByRouter).toEqual([]);
   });
 });
