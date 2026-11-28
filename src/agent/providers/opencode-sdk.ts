@@ -102,6 +102,7 @@ const CONTEXT_WINDOW_REFRESH_MIN_INTERVAL_MS = 3_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 const PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS = [0, 100, 250, 500, 1_000] as const;
 const MISSING_FINAL_RECOVERY_TIMEOUT_MS = 15_000;
+export const MCP_STARTUP_TIMEOUT_MS = 20_000;
 const INTERRUPT_RPC_TIMEOUT_MS = 150;
 const CHILD_CLOSE_TIMEOUT_MS = 2_000;
 const MISSING_FINAL_RECOVERY_RECHECK_DELAYS_MS = [250, 1_000] as const;
@@ -296,7 +297,7 @@ export interface OpenCodeSdkRuntimeStartResult {
     providerSessionId: string,
     directory: string,
     mcpServers: Record<string, OpenCodeMcpServerSpec>,
-  ) => Promise<void>;
+  ) => Promise<boolean | void>;
   unbindSessionMcp?: (providerSessionId: string) => Promise<void>;
 }
 
@@ -374,12 +375,14 @@ function formatMcpToolResult(result: Awaited<ReturnType<BoundSessionMcpServer['c
   };
 }
 
-class SharedOpenCodeHostMcpCoordinator {
+export class SharedOpenCodeHostMcpCoordinator {
   private readonly sessionBindings = new Map<string, {
     directory: string;
     servers: Map<string, BoundSessionMcpServer>;
   }>();
   private readonly directoryReloaders = new Map<string, Set<() => Promise<void>>>();
+
+  constructor(private readonly startupTimeoutMs = MCP_STARTUP_TIMEOUT_MS) {}
 
   readonly plugin = {
     id: 'imcodes-session-mcp',
@@ -493,7 +496,7 @@ class SharedOpenCodeHostMcpCoordinator {
     providerSessionId: string,
     directory: string,
     mcpServers: Record<string, OpenCodeMcpServerSpec>,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const dirKey = resolve(directory);
     const existing = this.sessionBindings.get(providerSessionId);
     const nextServers = new Map<string, BoundSessionMcpServer>();
@@ -515,6 +518,7 @@ class SharedOpenCodeHostMcpCoordinator {
       import('@modelcontextprotocol/sdk/client/stdio.js'),
     ]);
 
+    let allBound = true;
     for (const [serverName, spec] of Object.entries(mcpServers)) {
       if (spec.disabled || nextServers.has(serverName) || !Array.isArray(spec.command) || spec.command.length === 0) {
         continue;
@@ -535,10 +539,22 @@ class SharedOpenCodeHostMcpCoordinator {
         cwd: dirKey,
         stderr: 'pipe',
       });
+      // Drain child stderr immediately so chatty stdio MCP servers cannot stall on pipe backpressure.
+      (transport.stderr as { resume?: () => void } | null)?.resume?.();
       const client = new Client({ name: 'imcodes-opencode-mcp', version: '1.0.0' });
       try {
-        await withOpenCodeRequestTimeout(client.connect(transport), `MCP connect (${serverName})`);
-        const listed = await withOpenCodeRequestTimeout(client.listTools(), `MCP listTools (${serverName})`);
+        await withOpenCodeRequestTimeout(
+          client.connect(transport),
+          `MCP connect (${serverName})`,
+          undefined,
+          this.startupTimeoutMs,
+        );
+        const listed = await withOpenCodeRequestTimeout(
+          client.listTools(),
+          `MCP listTools (${serverName})`,
+          undefined,
+          this.startupTimeoutMs,
+        );
         const tools: McpToolDescriptor[] = (Array.isArray(listed?.tools) ? listed.tools : []).map((tool) => ({
           serverName,
           toolName: String(tool.name),
@@ -553,6 +569,7 @@ class SharedOpenCodeHostMcpCoordinator {
           tools,
         });
       } catch (error) {
+        allBound = false;
         await Promise.resolve(client.close()).catch(() => {});
         await Promise.resolve(transport.close()).catch(() => {});
         logger.warn({ provider: 'opencode-sdk', providerSessionId, serverName, directory: dirKey, error }, 'OpenCode session MCP startup failed');
@@ -570,6 +587,7 @@ class SharedOpenCodeHostMcpCoordinator {
       this.sessionBindings.set(providerSessionId, { directory: dirKey, servers: nextServers });
     }
     await this.reloadDirectory(dirKey);
+    return allBound;
   }
 
   async unbindSession(providerSessionId: string): Promise<void> {
@@ -643,16 +661,19 @@ export async function applyOpenCodeDirectoryMcpServers(
   client: OpenCodeClientLike,
   directory: string | undefined,
   mcpServers: Record<string, OpenCodeMcpServerSpec | Record<string, unknown>> | undefined,
-): Promise<void> {
+): Promise<boolean> {
   const add = client.experimental?.mcp?.add;
-  if (!add || !directory || !mcpServers) return;
+  if (!add || !directory || !mcpServers) return true;
+  let allAdded = true;
   for (const [server, serverConfig] of Object.entries(mcpServers)) {
     try {
       await add({ server, location: { directory }, config: { ...serverConfig } });
     } catch (error) {
+      allAdded = false;
       logger.warn({ provider: 'opencode-sdk', server, directory, error }, 'OpenCode experimental.mcp.add failed');
     }
   }
+  return allAdded;
 }
 
 export const openCodeSdkRuntimeHooks: OpenCodeSdkRuntimeHooks = {
@@ -3679,12 +3700,10 @@ export class OpenCodeSdkProvider implements TransportProvider, InteractiveQuesti
     );
     const signature = JSON.stringify(mcpServersConfig);
     if (state.syncedMcpSignature === signature) return;
-    if (state.bindSessionMcp) {
-      await state.bindSessionMcp(state.providerSessionId, state.cwd, mcpServersConfig);
-    } else {
-      await applyOpenCodeDirectoryMcpServers(state.client, state.cwd, mcpServersConfig);
-    }
-    state.syncedMcpSignature = signature;
+    const synced = state.bindSessionMcp
+      ? await state.bindSessionMcp(state.providerSessionId, state.cwd, mcpServersConfig)
+      : await applyOpenCodeDirectoryMcpServers(state.client, state.cwd, mcpServersConfig);
+    state.syncedMcpSignature = synced === false ? null : signature;
   }
 
   private async applySystemInstruction(state: OpenCodeSessionState, system: string | undefined): Promise<void> {

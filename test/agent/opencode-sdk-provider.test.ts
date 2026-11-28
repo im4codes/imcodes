@@ -7,7 +7,10 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { OpenCode } from '@opencode/sdk';
 import {
+  MCP_STARTUP_TIMEOUT_MS,
   OpenCodeSdkProvider,
+  SharedOpenCodeHostMcpCoordinator,
+  applyOpenCodeDirectoryMcpServers,
   openCodeSdkRuntimeHooks,
 } from '../../src/agent/providers/opencode-sdk.js';
 import { OPENCODE_NATIVE_AGENT_TOOLS } from '../../src/agent/native-agent-fence.js';
@@ -3879,7 +3882,7 @@ describe('OpenCodeSdkProvider', () => {
                 const patched = Object.fromEntries(
                   Object.entries(servers).map(([name, spec]) => [name, {
                     ...spec,
-                    command: ['node', mcpScript],
+                    command: [process.execPath, mcpScript],
                   }]),
                 );
                 return origBind(psid, dir, patched);
@@ -3946,7 +3949,7 @@ describe('OpenCodeSdkProvider', () => {
       srv.closeAllConnections?.();
       srv.close();
     }
-  }, 35_000);
+  }, 60_000);
 
   it('ignores late session.execution.failed and session.execution.interrupted during manual /compact', async () => {
     const harness = createHarness();
@@ -4120,7 +4123,7 @@ describe('OpenCodeSdkProvider', () => {
           ? {
             bindSessionMcp: (psid, dir, servers) => {
               const patched = Object.fromEntries(
-                Object.entries(servers).map(([name, spec]) => [name, { ...spec, command: ['node', mcpScript] }]),
+                Object.entries(servers).map(([name, spec]) => [name, { ...spec, command: [process.execPath, mcpScript] }]),
               );
               return origBind(psid, dir, patched);
             },
@@ -4177,7 +4180,7 @@ describe('OpenCodeSdkProvider', () => {
       srv.closeAllConnections?.();
       srv.close();
     }
-  }, 35_000);
+  }, 60_000);
 
   it('rejects non-expired 401/403, conflicting providers, mid-turn credential switches, and unattributable OPENCODE_API_KEY deletion', async () => {
     // 1. Generic 401 invalid_api_key / Invalid credential & 403 must NOT delete credentials
@@ -4555,7 +4558,7 @@ describe('OpenCodeSdkProvider', () => {
           ? {
             bindSessionMcp: (psid, dir, servers) => {
               const patched = Object.fromEntries(
-                Object.entries(servers).map(([name, spec]) => [name, { ...spec, command: ['node', mcpScript] }]),
+                Object.entries(servers).map(([name, spec]) => [name, { ...spec, command: [process.execPath, mcpScript] }]),
               );
               return origBind(psid, dir, patched);
             },
@@ -4623,7 +4626,7 @@ describe('OpenCodeSdkProvider', () => {
       srv.closeAllConnections?.();
       srv.close();
     }
-  }, 35_000);
+  }, 60_000);
 
   it('preserves a credential activated while credential.list() is pending under real v2.4.2 list shapes and refuses DB deletion when OPENCODE_API_KEY is active', async () => {
     // 1. Real v2.4.2 list shape (NO timestamps: id/integrationID/label/active/value only) + credential activated mid-read
@@ -5586,4 +5589,211 @@ describe('OpenCodeSdkProvider', () => {
     expect(approvals[0]!.id).toBe('perm-owner');
     await provider.disconnect();
   });
+
+  it('does not cache syncedMcpSignature when bindSessionMcp or applyOpenCodeDirectoryMcpServers fails, and retries cleanly on send()', async () => {
+    expect(MCP_STARTUP_TIMEOUT_MS).toBe(20_000);
+
+    const completeTurn = async (
+      provider: OpenCodeSdkProvider,
+      harness: ReturnType<typeof createHarness>,
+      completes: Array<unknown>,
+      expectedCount: number,
+      msgId: string,
+    ) => {
+      harness.queue.push({ type: 'session.text.delta', data: { sessionID: 'oc-session-1', assistantMessageID: msgId, ordinal: 0, delta: 'ok' } });
+      harness.queue.push({ type: 'session.step.ended', data: { sessionID: 'oc-session-1', assistantMessageID: msgId, finish: 'stop' } });
+      await vi.waitFor(() => expect(completes).toHaveLength(expectedCount));
+      // Clear any trailing microtask state before next send()
+      expect((provider as any).sessions.size).toBeGreaterThan(0);
+    };
+
+    // 1. bindSessionMcp returns false during createSession -> send() #1 retries & returns true -> send() #2 hits cache.
+    const h1 = createHarness();
+    let bindCalls1 = 0;
+    const bindResults: boolean[] = [false, true];
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', h1.queue.close, { once: true });
+      return {
+        client: h1.client as any,
+        server: h1.server,
+        bindSessionMcp: vi.fn(async () => {
+          bindCalls1 += 1;
+          return bindResults[bindCalls1 - 1] ?? true;
+        }),
+      };
+    });
+    const p1 = new OpenCodeSdkProvider();
+    const completes1: unknown[] = [];
+    p1.onComplete((_sid, msg) => completes1.push(msg));
+    await p1.connect({});
+    const route1 = await p1.createSession({ sessionKey: 'mcp-retry-route', cwd: '/tmp/proj-retry' });
+    expect(bindCalls1).toBe(1);
+    const state1 = (p1 as any).sessions.get(route1);
+    expect(state1.syncedMcpSignature).toBeNull();
+
+    await p1.send(route1, 'retry after failed createSession bind');
+    expect(bindCalls1).toBe(2);
+    expect(state1.syncedMcpSignature).toEqual(expect.any(String));
+    await completeTurn(p1, h1, completes1, 1, 'msg-r1-a');
+
+    await p1.send(route1, 'cached after recovery');
+    expect(bindCalls1).toBe(2);
+    await completeTurn(p1, h1, completes1, 2, 'msg-r1-b');
+    await p1.disconnect();
+
+    // 2. Backwards-compatible bindSessionMcp returning Promise<void> (undefined) still caches signature on createSession.
+    const h2 = createHarness();
+    let bindCallsVoid = 0;
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', h2.queue.close, { once: true });
+      return {
+        client: h2.client as any,
+        server: h2.server,
+        bindSessionMcp: vi.fn(async () => {
+          bindCallsVoid += 1;
+        }),
+      };
+    });
+    const p2 = new OpenCodeSdkProvider();
+    await p2.connect({});
+    const routeVoid = await p2.createSession({ sessionKey: 'mcp-void-route', cwd: '/tmp/proj-void' });
+    expect(bindCallsVoid).toBe(1);
+    expect((p2 as any).sessions.get(routeVoid).syncedMcpSignature).toEqual(expect.any(String));
+    await p2.send(routeVoid, 'should hit cache');
+    expect(bindCallsVoid).toBe(1);
+    await p2.disconnect();
+
+    // 3. Fallback applyOpenCodeDirectoryMcpServers: returns false when experimental.mcp.add fails -> retries on send().
+    const h3 = createHarness();
+    let failFirstAdd = true;
+    const mcpAdd = vi.fn(async () => {
+      if (failFirstAdd) {
+        failFirstAdd = false;
+        throw new Error('mcp_add_transient_fail');
+      }
+    });
+    (h3.client.experimental as any).mcp = { add: mcpAdd };
+    openCodeSdkRuntimeHooks.start = vi.fn(async (options) => {
+      options.signal.addEventListener('abort', h3.queue.close, { once: true });
+      return { client: h3.client as any, server: h3.server };
+    });
+    const p3 = new OpenCodeSdkProvider();
+    const completes3: unknown[] = [];
+    p3.onComplete((_sid, msg) => completes3.push(msg));
+    await p3.connect({});
+    const routeAdd = await p3.createSession({ sessionKey: 'mcp-dir-add-retry', cwd: '/tmp/proj-add' });
+    expect(mcpAdd).toHaveBeenCalledTimes(1);
+    expect((p3 as any).sessions.get(routeAdd).syncedMcpSignature).toBeNull();
+    await p3.send(routeAdd, 'retry directory add');
+    expect(mcpAdd).toHaveBeenCalledTimes(2);
+    expect((p3 as any).sessions.get(routeAdd).syncedMcpSignature).toEqual(expect.any(String));
+    await completeTurn(p3, h3, completes3, 1, 'msg-r3-a');
+    await p3.send(routeAdd, 'cached directory add');
+    expect(mcpAdd).toHaveBeenCalledTimes(2);
+    await completeTurn(p3, h3, completes3, 2, 'msg-r3-b');
+    await p3.disconnect();
+
+    await expect(applyOpenCodeDirectoryMcpServers(h3.client as any, '/tmp/proj', {})).resolves.toBe(true);
+  });
+
+  it('preserves healthy bound MCP servers across partial timeout/failure, drains stderr, and recovers on retry', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'imcodes-mcp-coord-'));
+    const coordinator = new SharedOpenCodeHostMcpCoordinator(1_500);
+    const sdkUrl = JSON.stringify(
+      pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/server/index.js')).href,
+    );
+    const stdioUrl = JSON.stringify(
+      pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/server/stdio.js')).href,
+    );
+    const typesUrl = JSON.stringify(
+      pathToFileURL(join(process.cwd(), 'node_modules/@modelcontextprotocol/sdk/dist/esm/types.js')).href,
+    );
+
+    const healthyCountFile = join(dir, 'healthy-spawns.txt');
+    const flakyCountFile = join(dir, 'flaky-spawns.txt');
+    const healthyScript = join(dir, 'healthy-mcp.mjs');
+    const flakyScript = join(dir, 'flaky-mcp.mjs');
+
+    const makeMcpServerSource = (toolName: string, countFile: string, options: { hangFirst?: boolean; noisyStderr?: boolean }) => [
+      `import { appendFileSync, readFileSync } from 'node:fs';`,
+      `import { Server } from ${sdkUrl};`,
+      `import { StdioServerTransport } from ${stdioUrl};`,
+      `import { CallToolRequestSchema, ListToolsRequestSchema } from ${typesUrl};`,
+      `appendFileSync(${JSON.stringify(countFile)}, '1\\n');`,
+      `const spawnNum = readFileSync(${JSON.stringify(countFile)}, 'utf8').trim().split('\\n').length;`,
+      ...(options.noisyStderr ? [`for (let i = 0; i < 400; i += 1) process.stderr.write('noise-stderr-' + 'x'.repeat(256) + '\\n');`] : []),
+      ...(options.hangFirst ? [`if (spawnNum === 1) { await new Promise(() => {}); }`] : []),
+      `const server = new Server({ name: ${JSON.stringify(toolName)}, version: '1.0.0' }, { capabilities: { tools: {} } });`,
+      `server.setRequestHandler(ListToolsRequestSchema, async () => ({`,
+      `  tools: [{ name: ${JSON.stringify(toolName)}, description: 'test tool', inputSchema: { type: 'object', properties: {} } }],`,
+      `}));`,
+      `server.setRequestHandler(CallToolRequestSchema, async () => ({`,
+      `  content: [{ type: 'text', text: JSON.stringify({ ok: true, tool: ${JSON.stringify(toolName)} }) }],`,
+      `}));`,
+      `await server.connect(new StdioServerTransport());`,
+    ].join('\n');
+
+    writeFileSync(healthyScript, makeMcpServerSource('ping', healthyCountFile, { noisyStderr: true }), 'utf8');
+    writeFileSync(flakyScript, makeMcpServerSource('pong', flakyCountFile, { hangFirst: true }), 'utf8');
+
+    const addedTools = new Map<string, { execute: (input: unknown, ctx: { sessionID: string }) => Promise<unknown> }>();
+    const transforms: Array<(editor: { add: (tool: Record<string, unknown>) => void }) => void> = [];
+    let hookFn: ((request: { sessionID: string; tools: Record<string, unknown> }) => void | Promise<void>) | undefined;
+    const runTransforms = () => {
+      addedTools.clear();
+      for (const t of transforms) {
+        t({
+          add: (tool) => {
+            const opts = tool.options as { namespace?: string } | undefined;
+            const ns = opts?.namespace ?? 'mcp';
+            addedTools.set(`${ns}_${String(tool.name)}`, tool as any);
+          },
+        });
+      }
+    };
+    const teardown = await coordinator.plugin.setup({
+      location: { directory: dir },
+      tool: {
+        transform: (fn) => { transforms.push(fn); },
+        reload: async () => { runTransforms(); },
+      },
+      session: {
+        hook: (_event, fn) => { hookFn = fn; },
+      },
+    });
+
+    try {
+      // Empty & all-disabled configs return true without preventing signature cache.
+      await expect(coordinator.bindSession('sess-empty', dir, {})).resolves.toBe(true);
+      await expect(coordinator.bindSession('sess-disabled', dir, {
+        disabled_srv: { type: 'local', command: [process.execPath, healthyScript], environment: {}, disabled: true },
+      })).resolves.toBe(true);
+
+      const specs = {
+        healthy: { type: 'local' as const, command: [process.execPath, healthyScript], environment: {}, disabled: false },
+        flaky: { type: 'local' as const, command: [process.execPath, flakyScript], environment: {}, disabled: false },
+      };
+
+      // Initial bind: `healthy` binds cleanly despite large stderr output; `flaky` times out -> returns false.
+      await expect(coordinator.bindSession('sess-partial', dir, specs)).resolves.toBe(false);
+      expect(addedTools.has('healthy_ping')).toBe(true);
+      expect(addedTools.has('flaky_pong')).toBe(false);
+
+      // Retry: `healthy` stays reused (spawn count remains 1), `flaky` spawns #2 and succeeds -> returns true!
+      await expect(coordinator.bindSession('sess-partial', dir, specs)).resolves.toBe(true);
+      const { readFileSync } = await import('node:fs');
+      expect(readFileSync(healthyCountFile, 'utf8').trim().split('\n')).toHaveLength(1);
+      expect(readFileSync(flakyCountFile, 'utf8').trim().split('\n')).toHaveLength(2);
+      expect(addedTools.has('healthy_ping')).toBe(true);
+      expect(addedTools.has('flaky_pong')).toBe(true);
+
+      const toolsMap: Record<string, unknown> = { healthy_ping: {}, flaky_pong: {} };
+      await hookFn?.({ sessionID: 'sess-partial', tools: toolsMap });
+      expect(Object.keys(toolsMap)).toEqual(['healthy_ping', 'flaky_pong']);
+    } finally {
+      await coordinator.closeAll();
+      teardown();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
