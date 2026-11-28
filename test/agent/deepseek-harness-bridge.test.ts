@@ -13,13 +13,14 @@ import {
   DSH_BRIDGE_COMMAND,
   DSH_BRIDGE_EVENT,
   DSH_BRIDGE_CWD_ENV,
+  DSH_BRIDGE_MODEL_ENV,
   DSH_BRIDGE_RESUME_ENV,
   DSH_BRIDGE_TOOL_STATUS,
   DSH_BRIDGE_TURN_REASON,
   DSH_SESSION_EVENT,
   type DshBridgeEvent,
 } from '../../shared/deepseek-harness.js';
-import { apply, dispatchDshBridgeCommand, inject, name } from '../../src/agent/providers/deepseek-harness/bridge.js';
+import { apply, dispatchDshBridgeCommand, executeManualDshCompact, inject, name } from '../../src/agent/providers/deepseek-harness/bridge.js';
 
 type SessionEventListener = (session: { id: string }, event: { type: string; surfaceOp?: string; data?: Record<string, unknown> }) => void;
 type AssistantStreamListener = (payload: { agent?: { session?: { id: string } }; frame?: { type?: string; chunk?: unknown } }) => void;
@@ -27,16 +28,24 @@ type AssistantStreamListener = (payload: { agent?: { session?: { id: string } };
 const OWN_SESSION = { id: 'session-own' };
 const OTHER_SESSION = { id: 'session-other' };
 
-function makeAgent(sessionOverrides: { requestContext?: () => Record<string, unknown> | undefined } = {}) {
+function makeAgent(
+  sessionOverrides: { requestContext?: () => Record<string, unknown> | undefined } = {},
+  options: { withModel?: boolean } = {},
+) {
   const followups: unknown[] = [];
   const steers: unknown[] = [];
   const cancelCauses: Array<{ kind: string } | undefined> = [];
+  const modelSelections: Array<{ provider: string; model: string }> = [];
+  let currentModel: { provider: string; model: string } | undefined = options.withModel
+    ? { provider: 'deepseek-official', model: 'deepseek-v4-flash' }
+    : undefined;
   let cancelled = 0;
   const session = { ...OWN_SESSION, ...sessionOverrides };
   return {
     followups,
     steers,
     cancelCauses,
+    modelSelections,
     cancelCount: () => cancelled,
     agent: {
       session,
@@ -44,6 +53,17 @@ function makeAgent(sessionOverrides: { requestContext?: () => Record<string, unk
       followup: (message: unknown) => { followups.push(message); },
       steer: (message: unknown) => { steers.push(message); },
       cancel: (cause?: { kind: string }) => { cancelled += 1; cancelCauses.push(cause); },
+      ...(options.withModel
+        ? {
+            model: {
+              current: () => currentModel,
+              select: (selection: { provider: string; model: string }) => {
+                currentModel = selection;
+                modelSelections.push(selection);
+              },
+            },
+          }
+        : {}),
     },
   };
 }
@@ -474,6 +494,79 @@ describe('deepseek-harness bridge', () => {
     expect(frames).toEqual([]);
   });
 
+  it('runs agents.resume setup() to apply requested model override when resuming', async () => {
+    vi.stubEnv(DSH_BRIDGE_RESUME_ENV, 'session-previous');
+    vi.stubEnv(DSH_BRIDGE_MODEL_ENV, 'glm5.3/glm-4.5-air');
+    const agentBits = makeAgent({}, { withModel: true });
+    const resumed: Array<Record<string, unknown>> = [];
+    const harness = makeCtx(agentBits.agent, {
+      agentDefaultModel: { currentSelection: () => ({ provider: 'glm5.3', model: 'glm-5.3-flash' }) },
+      agents: {
+        create: vi.fn(async () => ({ agent: agentBits.agent })),
+        resume: vi.fn(async (options: Record<string, unknown>) => {
+          resumed.push(options);
+          const setup = options.setup as ((ctx: unknown, agent: typeof agentBits.agent) => void) | undefined;
+          setup?.({}, agentBits.agent);
+          return { agent: agentBits.agent };
+        }),
+      },
+    });
+    apply(harness.ctx as never);
+    for (let i = 0; i < 10; i += 1) await new Promise((resolve) => setImmediate(resolve));
+
+    expect(resumed).toHaveLength(1);
+    expect(agentBits.modelSelections).toEqual([{ provider: 'glm5.3', model: 'glm-4.5-air' }]);
+    expect(frames[0]).toMatchObject({
+      type: DSH_BRIDGE_EVENT.READY,
+      resumed: true,
+      provider: 'glm5.3',
+      model: 'glm-4.5-air',
+    });
+  });
+
+  it('reports manual compaction commit, empty history, and abort outcomes cleanly', async () => {
+    const agentBits = makeAgent();
+    const sessions = { flush: vi.fn().mockResolvedValue(undefined) };
+    const compactNow = vi.fn()
+      .mockResolvedValueOnce({ shadowedSeqs: [1, 2, 3], shadowedTokenCount: 950 })
+      .mockResolvedValueOnce(null)
+      .mockImplementationOnce((_agent: unknown, signal?: AbortSignal) => new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(new Error('Compaction aborted')), { once: true });
+      }));
+    const harness = makeCtx(agentBits.agent, {
+      sessions,
+      compaction: { compactNow },
+    });
+
+    await executeManualDshCompact(harness.ctx as never, agentBits.agent as never, sessions as never, new AbortController());
+    expect(sessions.flush).toHaveBeenCalledWith(agentBits.agent.session);
+    expect(frames.at(-1)).toEqual({
+      type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+      ok: true,
+      committed: true,
+      shadowedCount: 3,
+      shadowedTokenCount: 950,
+    });
+
+    await executeManualDshCompact(harness.ctx as never, agentBits.agent as never, sessions as never, new AbortController());
+    expect(frames.at(-1)).toEqual({
+      type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+      ok: false,
+      message: 'No compactable history yet.',
+    });
+
+    const abort = new AbortController();
+    const pending = executeManualDshCompact(harness.ctx as never, agentBits.agent as never, sessions as never, abort);
+    abort.abort();
+    await pending;
+    expect(frames.at(-1)).toEqual({
+      type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+      ok: false,
+      cancelled: true,
+      message: 'Compaction aborted',
+    });
+  });
+
   it('reports missing core services instead of throwing', async () => {
     const agentBits = makeAgent();
     const harness = makeCtx(agentBits.agent, { agents: undefined });
@@ -502,7 +595,52 @@ describe('deepseek-harness bridge', () => {
 describe('deepseek-harness bridge command handling', () => {
   it('models the command vocabulary the daemon writes', () => {
     // The daemon writes these verbatim; a rename on either side breaks the child.
-    expect(Object.values(DSH_BRIDGE_COMMAND)).toEqual(['prompt', 'steer', 'cancel', 'shutdown']);
+    expect(Object.values(DSH_BRIDGE_COMMAND)).toEqual(['prompt', 'steer', 'setModel', 'compact', 'cancel', 'shutdown']);
+  });
+
+  it('switches model in-process via SET_MODEL and emits MODEL_SELECTED', () => {
+    const frames: DshBridgeEvent[] = [];
+    const writeSpy = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: string) => {
+      for (const line of String(chunk).split('\n')) {
+        if (line.trim()) frames.push(JSON.parse(line) as DshBridgeEvent);
+      }
+      return true;
+    }) as never);
+    try {
+      const harness = makeAgent({}, { withModel: true });
+      const requestExit = vi.fn();
+
+      dispatchDshBridgeCommand(harness.agent, {
+        type: DSH_BRIDGE_COMMAND.SET_MODEL,
+        provider: 'glm5.3',
+        model: 'glm5.3/glm-4.5-air',
+      }, requestExit, undefined, undefined, 'glm5.3');
+
+      expect(harness.modelSelections).toEqual([{ provider: 'glm5.3', model: 'glm-4.5-air' }]);
+      expect(frames).toEqual([{
+        type: DSH_BRIDGE_EVENT.MODEL_SELECTED,
+        provider: 'glm5.3',
+        model: 'glm-4.5-air',
+      }]);
+      expect(requestExit).not.toHaveBeenCalled();
+    } finally {
+      writeSpy.mockRestore();
+    }
+  });
+
+  it('routes COMPACT through onCompact and aborts active compact on CANCEL', () => {
+    const harness = makeAgent();
+    const requestExit = vi.fn();
+    const onCompact = vi.fn();
+    const onCancel = vi.fn();
+
+    dispatchDshBridgeCommand(harness.agent, { type: DSH_BRIDGE_COMMAND.COMPACT }, requestExit, onCompact, onCancel);
+    expect(onCompact).toHaveBeenCalledTimes(1);
+    expect(onCancel).not.toHaveBeenCalled();
+
+    dispatchDshBridgeCommand(harness.agent, { type: DSH_BRIDGE_COMMAND.CANCEL }, requestExit, onCompact, onCancel);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+    expect(harness.cancelCauses).toEqual([{ kind: 'user' }]);
   });
 
   it('dispatches active-turn append through steer without followup, cancel, or shutdown', () => {

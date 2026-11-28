@@ -166,9 +166,8 @@ interface DeepseekHarnessSessionState {
   lastStatusSignature: string | null;
   /** True while the harness is executing an async context compaction bracket. */
   compacting: boolean;
-  /** Settlement callbacks for an explicit `/compact` command. */
-  compactResolve?: () => void;
-  compactReject?: (err: Error) => void;
+  /** True while awaiting asynchronous `COMPACT_RESULT` for an admitted `/compact` turn. */
+  manualCompacting?: boolean;
   disposed: boolean;
   /** The native-agent fence the live `child` was spawned with. */
   childNativeAgentFence?: NativeAgentFence;
@@ -345,19 +344,27 @@ export class DeepseekHarnessProvider implements TransportProvider {
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
     const rawModel = agentId.trim();
-    const provider = state?.llmConfig?.provider ?? state?.provider;
+    const configuredProvider = state?.llmConfig?.provider;
+    const explicitSlash = rawModel.indexOf('/');
+    const provider = configuredProvider ?? (explicitSlash > 0 ? rawModel.slice(0, explicitSlash) : state?.provider);
     const providerPrefix = provider ? `${provider}/` : '';
     const model = providerPrefix && rawModel.startsWith(providerPrefix)
       ? rawModel.slice(providerPrefix.length)
       : rawModel;
     if (!state || !model || state.requestedModel === model) return;
     state.requestedModel = model;
-    // The model is chosen when the agent is created, so it only takes effect on
-    // the next spawn. Detach the child refs BEFORE the async teardown: leaving
-    // them set lets a send() arriving inside the shutdown grace take
-    // ensureChild's fast path and write the prompt into a dying stdin, which
-    // silently loses the message. Clearing them first makes that send respawn.
     const child = state.child;
+    if (child && state.readySettled && !state.turnActive) {
+      if (this.write(state, {
+        type: DSH_BRIDGE_COMMAND.SET_MODEL,
+        ...(provider ? { provider } : {}),
+        model,
+      })) {
+        return;
+      }
+    }
+    // When a turn is active, startup is still in flight, or stdin cannot take
+    // SET_MODEL, detach BEFORE async teardown so a queued send() respawns cleanly.
     this.detachChild(state);
     void this.stopChild(state, child);
   }
@@ -420,25 +427,25 @@ export class DeepseekHarnessProvider implements TransportProvider {
     }
     this.emitStatus(sessionId, state, { status: 'compacting', label: 'Compacting conversation...' });
     state.turnGeneration++;
-    await this.ensureChild(state);
+    try {
+      await this.ensureChild(state);
+    } catch (error) {
+      this.clearStatus(sessionId, state);
+      throw error;
+    }
     this.resetTurn(state);
     state.turnActive = true;
     state.compacting = true;
+    state.manualCompacting = true;
     state.cancelled = false;
-    const compactPromise = new Promise<void>((resolve, reject) => {
-      state.compactResolve = resolve;
-      state.compactReject = reject;
-    });
     if (!this.write(state, { type: DSH_BRIDGE_COMMAND.COMPACT })) {
-      state.compactResolve = undefined;
-      state.compactReject = undefined;
       state.turnActive = false;
       state.compacting = false;
+      state.manualCompacting = false;
       this.clearStatus(sessionId, state);
       this.resetTurn(state);
       throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'dsh bridge stdin is unavailable', true);
     }
-    await compactPromise;
   }
 
   async notifyActiveDelegation(
@@ -543,6 +550,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
       model: state.model,
       harnessSessionId: state.harnessSessionId,
       childRunning: !!state.child,
+      ...(state.child?.pid ? { childPid: state.child.pid } : {}),
       turnActive: state.turnActive,
       memoryMcpMounted: !!state.memoryMcp,
     };
@@ -710,18 +718,13 @@ export class DeepseekHarnessProvider implements TransportProvider {
 
   /** Drop this session's references to its child without terminating it. */
   private detachChild(state: DeepseekHarnessSessionState): void {
-    const rejectCompact = state.compactReject;
-    state.compactResolve = undefined;
-    state.compactReject = undefined;
     state.child = null;
     state.childNativeAgentFence = undefined;
     state.reader?.close();
     state.reader = null;
     state.readyPromise = null;
     state.readySettled = false;
-    if (rejectCompact) {
-      rejectCompact(new Error('dsh bridge disconnected during compaction'));
-    }
+    state.manualCompacting = false;
   }
 
   /**
@@ -900,6 +903,13 @@ export class DeepseekHarnessProvider implements TransportProvider {
         }
         return;
       }
+      case DSH_BRIDGE_EVENT.MODEL_SELECTED:
+        if (event.provider) state.provider = event.provider;
+        if (event.model && event.model !== state.model) {
+          state.model = event.model;
+          this.emitSessionInfo(sessionId, { model: event.model });
+        }
+        return;
       case DSH_BRIDGE_EVENT.COMPACTING:
         state.compacting = event.active;
         if (event.active) {
@@ -912,13 +922,11 @@ export class DeepseekHarnessProvider implements TransportProvider {
         }
         return;
       case DSH_BRIDGE_EVENT.COMPACT_RESULT: {
-        const resolveCompact = state.compactResolve;
-        const rejectCompact = state.compactReject;
-        state.compactResolve = undefined;
-        state.compactReject = undefined;
+        if (!state.manualCompacting) return;
         if (state.child) this.stopConfirmations.complete(state.child);
         state.turnActive = false;
         state.compacting = false;
+        state.manualCompacting = false;
         this.clearStatus(sessionId, state);
         if (event.ok) {
           this.refreshSessionSystemText(sessionId);
@@ -941,20 +949,21 @@ export class DeepseekHarnessProvider implements TransportProvider {
           };
           this.resetTurn(state);
           for (const cb of this.completeCallbacks) cb(sessionId, completion);
-          resolveCompact?.();
           return;
         }
         if (event.cancelled || state.cancelled) {
           state.cancelled = false;
           this.resetTurn(state);
-          resolveCompact?.();
+          this.emitError(sessionId, {
+            code: PROVIDER_ERROR_CODES.CANCELLED,
+            message: 'Turn cancelled',
+            recoverable: true,
+          });
           return;
         }
         this.resetTurn(state);
         const message = `dsh compact failed: ${event.message || 'Unknown error'}`;
-        const providerError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, true);
-        this.emitError(sessionId, providerError);
-        rejectCompact?.(Object.assign(new Error(message), providerError));
+        this.emitError(sessionId, this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, true));
         return;
       }
       case DSH_BRIDGE_EVENT.TURN_END:
@@ -1052,6 +1061,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
     state.pendingSessionSystemText = undefined;
     state.lastUsageModel = undefined;
     state.compacting = false;
+    state.manualCompacting = false;
   }
 
   private clearStatus(sessionId: string, state: DeepseekHarnessSessionState): void {
@@ -1059,9 +1069,6 @@ export class DeepseekHarnessProvider implements TransportProvider {
   }
 
   private failSession(state: DeepseekHarnessSessionState, message: string): void {
-    const rejectCompact = state.compactReject;
-    state.compactResolve = undefined;
-    state.compactReject = undefined;
     state.rejectReady?.(new Error(message));
     state.rejectReady = null;
     state.resolveReady = null;
@@ -1073,7 +1080,6 @@ export class DeepseekHarnessProvider implements TransportProvider {
       message,
       recoverable: true,
     });
-    rejectCompact?.(new Error(message));
   }
 
   // ── Emit helpers ───────────────────────────────────────────────────────────

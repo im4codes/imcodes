@@ -22,6 +22,8 @@ vi.mock('../../src/util/kill-process-tree.js', () => ({
 }));
 
 import { PiProvider } from '../../src/agent/providers/pi.js';
+import { onConfirmedProviderStop } from '../../src/agent/provider-stop-confirmation.js';
+import { dispatchSharedContextSend } from '../../src/agent/transport-runtime-assembly.js';
 import {
   PI_SUPPORTED_PACKAGE,
   buildPiRpcArgs,
@@ -1174,5 +1176,113 @@ describe('PiProvider', () => {
     const compactPromise = provider.send(sid, '/compact');
     await flush();
     await expect(Promise.all([provider.cancelAndWait(sid), compactPromise])).resolves.toBeDefined();
+  });
+
+  it('does not confirm Stop on local compact RPC timeout during hung compact cancel (only real response or exit confirms)', async () => {
+    const customChild = new FakePiChild();
+    spawnMock.mockReturnValue(customChild);
+    const errors: Array<{ error: ProviderError }> = [];
+    provider.onError((_id, error) => errors.push({ error }));
+    await provider.connect({});
+    const sid = await provider.createSession({
+      sessionKey: 'route-compact-hang',
+      sessionName: 'deck_compact_hang',
+      cwd: '/tmp',
+      agentId: 'minimax/MiniMax-M2.7',
+    });
+
+    await provider.send(sid, 'hello');
+    customChild.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await flush();
+
+    // Hold both COMPACT and ABORT unanswered so Pi's local COMPACT_RPC_TIMEOUT_MS (180s) fires.
+    const origWrite = customChild.stdin.write;
+    customChild.stdin.write = (chunk: string) => {
+      const command = JSON.parse(chunk.trim()) as Record<string, unknown>;
+      if (command.type === PI_RPC_COMMAND.COMPACT || command.type === PI_RPC_COMMAND.ABORT) {
+        customChild.written.push(command);
+        return true;
+      }
+      return origWrite(chunk);
+    };
+
+    vi.useFakeTimers();
+    try {
+      await provider.send(sid, '/compact');
+      await vi.advanceTimersByTimeAsync(20);
+
+      let stopTimedOut = false;
+      const stopPromise = provider.cancelAndWait(sid);
+      const stopCaught = stopPromise.catch(() => { stopTimedOut = true; });
+      const confirmed = vi.fn();
+      onConfirmedProviderStop(stopPromise, confirmed);
+
+      // Advance to t=29s (past TRANSPORT_STOP_QUEUE_TIMEOUT_MS, before Pi's compact RPC timeout).
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(stopTimedOut).toBe(true);
+      expect(confirmed).not.toHaveBeenCalled();
+
+      // Advance past Pi's 180s compact RPC timeout: emits PROVIDER_ERROR without confirming Stop.
+      await vi.advanceTimersByTimeAsync(152_000);
+      await stopCaught;
+      expect(errors.at(-1)?.error).toMatchObject({
+        code: 'PROVIDER_ERROR',
+        message: expect.stringContaining('timed out'),
+      });
+      expect(confirmed).not.toHaveBeenCalled();
+
+      // Real captured child exit later DOES confirm Stop.
+      customChild.emit('exit', 1, null);
+      expect(confirmed).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not trip sendProviderWithTimeout when Pi /compact completes after the admission window', async () => {
+    const customChild = new FakePiChild();
+    spawnMock.mockReturnValue(customChild);
+    let capturedCompactCmd: Record<string, unknown> | undefined;
+    const origWrite = customChild.stdin.write;
+    customChild.stdin.write = (chunk: string) => {
+      const command = JSON.parse(chunk.trim()) as Record<string, unknown>;
+      if (command.type === PI_RPC_COMMAND.COMPACT) {
+        capturedCompactCmd = command;
+        customChild.written.push(command);
+        return true;
+      }
+      return origWrite(chunk);
+    };
+    const errors: Array<{ error: ProviderError }> = [];
+    provider.onError((_id, error) => errors.push({ error }));
+    await provider.connect({});
+    const sid = await provider.createSession({
+      sessionKey: 'route-compact-slow',
+      sessionName: 'deck_compact_slow',
+      cwd: '/tmp',
+      agentId: 'minimax/MiniMax-M2.7',
+    });
+
+    const dispatched = await dispatchSharedContextSend(provider, sid, {
+      userMessage: '/compact',
+      namespace: { scope: 'personal', projectId: 'p1' },
+    }, { sendTimeoutMs: 40 });
+    expect(dispatched.disposition).toBe('sent');
+    await new Promise((resolve) => setTimeout(resolve, 90));
+    expect(errors).toHaveLength(0);
+
+    expect(capturedCompactCmd).toBeDefined();
+    customChild.emitFrame({
+      type: PI_RPC_FRAME.RESPONSE,
+      id: capturedCompactCmd!.id,
+      command: PI_RPC_COMMAND.COMPACT,
+      success: true,
+      data: { summary: 'slow summary', firstKeptEntryId: 'entry-slow' },
+    });
+    await flush();
+    expect(completions.at(-1)?.metadata).toMatchObject({
+      [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+      firstKeptEntryId: 'entry-slow',
+    });
   });
 });

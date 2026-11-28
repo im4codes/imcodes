@@ -26,6 +26,8 @@ export const DSH_BRIDGE_COMMAND = {
   PROMPT: 'prompt',
   /** Insert user text at the next safe boundary of the active agent turn. */
   STEER: 'steer',
+  /** Switch the live agent's active provider/model selection without restarting the child. */
+  SET_MODEL: 'setModel',
   /** Manually compact conversation history through the harness compaction service. */
   COMPACT: 'compact',
   /** Cancel the in-flight turn without tearing the agent down. */
@@ -38,6 +40,8 @@ export const DSH_BRIDGE_COMMAND = {
 export const DSH_BRIDGE_EVENT = {
   /** Agent created or resumed; carries the durable session id used for resume. */
   READY: 'ready',
+  /** Live agent accepted a `setModel` selection. */
+  MODEL_SELECTED: 'modelSelected',
   /** Incremental assistant text (`agent/assistant-stream` or `assistant/chunk` → `text-delta`). */
   DELTA: 'delta',
   /** Model is reasoning (`agent/assistant-stream` or `assistant/chunk` → `reasoning-delta`); carries no content. */
@@ -86,6 +90,12 @@ export interface DshBridgeSteerCommand {
   text: string;
 }
 
+export interface DshBridgeSetModelCommand {
+  type: typeof DSH_BRIDGE_COMMAND.SET_MODEL;
+  provider?: string;
+  model: string;
+}
+
 export interface DshBridgeCompactCommand {
   type: typeof DSH_BRIDGE_COMMAND.COMPACT;
 }
@@ -101,6 +111,7 @@ export interface DshBridgeShutdownCommand {
 export type DshBridgeCommand =
   | DshBridgePromptCommand
   | DshBridgeSteerCommand
+  | DshBridgeSetModelCommand
   | DshBridgeCompactCommand
   | DshBridgeCancelCommand
   | DshBridgeShutdownCommand;
@@ -112,6 +123,12 @@ export interface DshBridgeReadyEvent {
   model?: string;
   /** True when the agent was restored from a persisted session rather than created. */
   resumed: boolean;
+}
+
+export interface DshBridgeModelSelectedEvent {
+  type: typeof DSH_BRIDGE_EVENT.MODEL_SELECTED;
+  provider?: string;
+  model: string;
 }
 
 export interface DshBridgeDeltaEvent {
@@ -182,6 +199,7 @@ export interface DshBridgeErrorEvent {
 
 export type DshBridgeEvent =
   | DshBridgeReadyEvent
+  | DshBridgeModelSelectedEvent
   | DshBridgeDeltaEvent
   | DshBridgeReasoningEvent
   | DshBridgeMessageEvent

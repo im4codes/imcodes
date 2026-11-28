@@ -94,6 +94,7 @@ import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaborati
 import { setSessionIncognito, withSessionPrivacy } from '../../../shared/session-incognito-context.js';
 
 const RPC_TIMEOUT_MS = 30_000;
+const COMPACT_RPC_TIMEOUT_MS = 180_000;
 const SHUTDOWN_GRACE_MS = 3_000;
 const MODEL_CACHE_TTL_MS = 30_000;
 const DEFAULT_EXTENSION_UI_TIMEOUT_MS = 5 * 60 * 1_000;
@@ -133,6 +134,9 @@ interface PendingRpc {
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
+
+/** Error returned by the child Pi RPC process itself (`success: false`). */
+class PiRpcResponseError extends Error {}
 
 interface PiSessionState {
   routeId: string;
@@ -520,62 +524,98 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
 
   private async compactSession(state: PiSessionState): Promise<void> {
     const sessionId = state.routeId;
+    if (state.turnActive) {
+      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'Pi compact failed: session has an active turn', true);
+    }
     return withSessionPrivacy(state.sessionName ?? sessionId, state.incognito === true, async () => {
       this.emitStatus(sessionId, state, { status: 'working', label: 'Compacting...' });
       state.turnGeneration++;
-      await this.ensureChild(state);
+      try {
+        await this.ensureChild(state);
+      } catch (error) {
+        this.clearStatus(sessionId, state);
+        throw error;
+      }
+      const stdin = state.child?.stdin;
+      if (!stdin || stdin.destroyed) {
+        this.clearStatus(sessionId, state);
+        throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'Pi RPC process is unavailable', true);
+      }
+      const capturedChild = state.child;
+      const generation = state.turnGeneration;
       this.resetTurn(state);
       state.turnActive = true;
       state.compacting = true;
       state.cancelled = false;
-      try {
-        const response = await this.request(state, { type: PI_RPC_COMMAND.COMPACT });
-        const wasCancelled = state.cancelled;
-        if (state.child && wasCancelled) this.stopConfirmations.complete(state.child);
-        state.turnActive = false;
-        state.compacting = false;
-        this.clearStatus(sessionId, state);
-        if (wasCancelled) {
-          this.resetTurn(state);
-          return;
-        }
-        this.refreshSessionSystemText(sessionId);
-        const data = asRecord(response.data);
-        const completion: AgentMessage = {
-          id: `${state.routeId}:context-compaction:${Date.now()}`,
-          sessionId,
-          kind: 'system',
-          role: 'system',
-          content: 'Pi context compacted.',
-          timestamp: Date.now(),
-          status: 'complete',
-          metadata: {
-            provider: this.id,
-            event: PI_RPC_FRAME.COMPACTION_END,
-            [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
-            ...(!state.incognito && state.piSessionId ? { resumeId: state.piSessionId } : {}),
-            ...(typeof data?.summary === 'string' ? { summary: data.summary } : {}),
-            ...(typeof data?.firstKeptEntryId === 'string' ? { firstKeptEntryId: data.firstKeptEntryId } : {}),
-          },
-        };
-        this.resetTurn(state);
-        for (const cb of this.completeCallbacks) cb(sessionId, completion);
-      } catch (error) {
-        const wasCancelled = state.cancelled;
-        if (state.child && wasCancelled) this.stopConfirmations.complete(state.child);
-        state.turnActive = false;
-        state.compacting = false;
-        this.clearStatus(sessionId, state);
-        this.resetTurn(state);
-        if (wasCancelled) return;
-        const providerError = this.makeError(
-          PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-          `Pi compact failed: ${error instanceof Error ? error.message : String(error)}`,
-          true,
-        );
-        this.emitError(sessionId, providerError);
-        throw providerError;
-      }
+      void this.request(state, { type: PI_RPC_COMMAND.COMPACT }, COMPACT_RPC_TIMEOUT_MS).then(
+        (response) => withSessionPrivacy(state.sessionName ?? sessionId, state.incognito === true, () => {
+          const wasCancelled = state.cancelled;
+          const isCurrentTurn = Boolean(capturedChild && state.child === capturedChild && state.turnGeneration === generation);
+          if (wasCancelled && isCurrentTurn) this.stopConfirmations.complete(capturedChild!);
+          if (state.turnGeneration === generation) {
+            state.turnActive = false;
+            state.compacting = false;
+            this.clearStatus(sessionId, state);
+            this.resetTurn(state);
+          }
+          if (wasCancelled) {
+            state.cancelled = false;
+            this.emitError(sessionId, {
+              code: PROVIDER_ERROR_CODES.CANCELLED,
+              message: 'Turn cancelled',
+              recoverable: true,
+            });
+            return;
+          }
+          this.refreshSessionSystemText(sessionId);
+          const data = asRecord(response.data);
+          const completion: AgentMessage = {
+            id: `${state.routeId}:context-compaction:${Date.now()}`,
+            sessionId,
+            kind: 'system',
+            role: 'system',
+            content: 'Pi context compacted.',
+            timestamp: Date.now(),
+            status: 'complete',
+            metadata: {
+              provider: this.id,
+              event: PI_RPC_FRAME.COMPACTION_END,
+              [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+              ...(!state.incognito && state.piSessionId ? { resumeId: state.piSessionId } : {}),
+              ...(typeof data?.summary === 'string' ? { summary: data.summary } : {}),
+              ...(typeof data?.firstKeptEntryId === 'string' ? { firstKeptEntryId: data.firstKeptEntryId } : {}),
+            },
+          };
+          for (const cb of this.completeCallbacks) cb(sessionId, completion);
+        }),
+        (error) => withSessionPrivacy(state.sessionName ?? sessionId, state.incognito === true, () => {
+          const wasCancelled = state.cancelled;
+          const isChildRpcTerminal = error instanceof PiRpcResponseError;
+          const isCurrentTurn = Boolean(capturedChild && state.child === capturedChild && state.turnGeneration === generation);
+          if (state.turnGeneration === generation) {
+            state.turnActive = false;
+            state.compacting = false;
+            this.clearStatus(sessionId, state);
+            this.resetTurn(state);
+          }
+          if (wasCancelled && isChildRpcTerminal && isCurrentTurn) {
+            this.stopConfirmations.complete(capturedChild!);
+            state.cancelled = false;
+            this.emitError(sessionId, {
+              code: PROVIDER_ERROR_CODES.CANCELLED,
+              message: 'Turn cancelled',
+              recoverable: true,
+            });
+            return;
+          }
+          const providerError = this.makeError(
+            PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+            `Pi compact failed: ${error instanceof Error ? error.message : String(error)}`,
+            true,
+          );
+          this.emitError(sessionId, providerError);
+        }),
+      );
     });
   }
 
@@ -1056,15 +1096,15 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     });
   }
 
-  private request(state: PiSessionState, command: PiRpcCommand): Promise<PiRpcResponse> {
+  private request(state: PiSessionState, command: PiRpcCommand, timeoutMs = RPC_TIMEOUT_MS): Promise<PiRpcResponse> {
     const stdin = state.child?.stdin;
     if (!stdin || stdin.destroyed) return Promise.reject(new Error('Pi RPC process is unavailable'));
     const id = command.id ?? randomUUID();
     return new Promise<PiRpcResponse>((resolve, reject) => {
       const timer = setTimeout(() => {
         state.pending.delete(id);
-        reject(new Error(`Pi RPC ${command.type} timed out after ${RPC_TIMEOUT_MS}ms`));
-      }, RPC_TIMEOUT_MS);
+        reject(new Error(`Pi RPC ${command.type} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
       timer.unref?.();
       state.pending.set(id, { resolve, reject, timer });
       try {
@@ -1103,7 +1143,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
       clearTimeout(pending.timer);
       state.pending.delete(frame.id!);
       if (frame.success) pending.resolve(frame);
-      else pending.reject(new Error(frame.error || `Pi RPC ${frame.command} failed`));
+      else pending.reject(new PiRpcResponseError(frame.error || `Pi RPC ${frame.command} failed`));
       return;
     }
     const event = asRecord(frame);

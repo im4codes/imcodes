@@ -218,6 +218,7 @@ export function dispatchDshBridgeCommand(
   requestExit: (code: number) => void,
   onCompact?: () => void,
   onCancel?: () => void,
+  defaultProvider?: string,
 ): void {
   switch (command.type) {
     case DSH_BRIDGE_COMMAND.PROMPT:
@@ -230,6 +231,26 @@ export function dispatchDshBridgeCommand(
         agent.steer(buildUserMessage(command.text));
       }
       return;
+    case DSH_BRIDGE_COMMAND.SET_MODEL: {
+      const targetProvider = readString(command.provider)
+        ?? readString(agent.model?.current?.()?.provider)
+        ?? defaultProvider;
+      const rawModel = readString(command.model);
+      const prefix = targetProvider ? `${targetProvider}/` : '';
+      const targetModel = rawModel && prefix && rawModel.startsWith(prefix)
+        ? rawModel.slice(prefix.length)
+        : rawModel;
+      if (targetProvider && targetModel) {
+        agent.model?.select?.({ provider: targetProvider, model: targetModel });
+        const applied = agent.model?.current?.();
+        emit({
+          type: DSH_BRIDGE_EVENT.MODEL_SELECTED,
+          provider: readString(applied?.provider) ?? targetProvider,
+          model: readString(applied?.model) ?? targetModel,
+        });
+      }
+      return;
+    }
     case DSH_BRIDGE_COMMAND.COMPACT:
       onCompact?.();
       return;
@@ -421,6 +442,50 @@ function subscribe(ctx: DshPluginContext, agent: DshAgent): void {
   });
 }
 
+/** Execute a single manual compaction request and report commit, empty, or abort outcome. */
+export async function executeManualDshCompact(
+  ctx: DshPluginContext,
+  agent: DshAgent,
+  sessions: DshSessionStore,
+  abort: AbortController,
+): Promise<void> {
+  const compaction = ctx.get('compaction') as DshCompactionService | undefined;
+  if (!compaction?.compactNow) {
+    emit({
+      type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+      ok: false,
+      message: 'Compaction service unavailable.',
+    });
+    return;
+  }
+  try {
+    const result = await compaction.compactNow(agent, abort.signal);
+    if (result === null) {
+      emit({
+        type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+        ok: false,
+        message: 'No compactable history yet.',
+      });
+      return;
+    }
+    await sessions.flush(agent.session).catch(() => {});
+    emit({
+      type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+      ok: true,
+      committed: true,
+      ...(Array.isArray(result.shadowedSeqs) ? { shadowedCount: result.shadowedSeqs.length } : {}),
+      ...(typeof result.shadowedTokenCount === 'number' ? { shadowedTokenCount: result.shadowedTokenCount } : {}),
+    });
+  } catch (err) {
+    emit({
+      type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+      ok: false,
+      ...(abort.signal.aborted ? { cancelled: true } : {}),
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
 async function start(ctx: DshPluginContext): Promise<void> {
   const loader = ctx.get('loader') as { await?: () => Promise<void> } | undefined;
   await loader?.await?.();
@@ -507,42 +572,10 @@ async function start(ctx: DshPluginContext): Promise<void> {
       });
       return;
     }
-    const compaction = ctx.get('compaction') as DshCompactionService | undefined;
-    if (!compaction?.compactNow) {
-      emit({
-        type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
-        ok: false,
-        message: 'Compaction service unavailable.',
-      });
-      return;
-    }
     const abort = new AbortController();
     activeCompactAbort = abort;
     try {
-      const result = await compaction.compactNow(agent, abort.signal);
-      if (result === null) {
-        emit({
-          type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
-          ok: false,
-          message: 'No compactable history yet.',
-        });
-        return;
-      }
-      await sessions.flush(agent.session).catch(() => {});
-      emit({
-        type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
-        ok: true,
-        committed: true,
-        ...(Array.isArray(result.shadowedSeqs) ? { shadowedCount: result.shadowedSeqs.length } : {}),
-        ...(typeof result.shadowedTokenCount === 'number' ? { shadowedTokenCount: result.shadowedTokenCount } : {}),
-      });
-    } catch (err) {
-      emit({
-        type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
-        ok: false,
-        ...(abort.signal.aborted ? { cancelled: true } : {}),
-        message: err instanceof Error ? err.message : String(err),
-      });
+      await executeManualDshCompact(ctx, agent, sessions, abort);
     } finally {
       if (activeCompactAbort === abort) activeCompactAbort = null;
     }
@@ -587,6 +620,7 @@ async function start(ctx: DshPluginContext): Promise<void> {
       requestExit,
       () => { void runManualCompact(); },
       () => { activeCompactAbort?.abort(); },
+      selection.provider,
     );
   });
   // The daemon closing stdin is a terminal signal: flush and leave rather than

@@ -27,6 +27,7 @@ vi.mock('../../src/agent/providers/deepseek-harness/runtime.js', async (importOr
 
 import { DeepseekHarnessProvider } from '../../src/agent/providers/deepseek-harness.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
+import { dispatchSharedContextSend } from '../../src/agent/transport-runtime-assembly.js';
 import {
   DSH_AGENT_DEFAULT_MODEL_ROW_ID,
   DSH_BRIDGE_COMMAND,
@@ -913,6 +914,7 @@ describe('DeepseekHarnessProvider /compact and preset models', () => {
   let child: FakeChild;
   let completions: Array<{ sessionId: string; message: AgentMessage }>;
   let errors: Array<{ sessionId: string; error: { code: string; message: string; recoverable: boolean } }>;
+  let sessionInfos: Array<{ sessionId: string; info: Record<string, unknown> }>;
 
   beforeEach(async () => {
     spawnMock.mockReset();
@@ -931,8 +933,10 @@ describe('DeepseekHarnessProvider /compact and preset models', () => {
     provider = new DeepseekHarnessProvider();
     completions = [];
     errors = [];
+    sessionInfos = [];
     provider.onComplete((sessionId, message) => completions.push({ sessionId, message }));
     provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+    provider.onSessionInfo((sessionId, info) => sessionInfos.push({ sessionId, info: info as Record<string, unknown> }));
     await provider.connect({});
   });
 
@@ -940,7 +944,7 @@ describe('DeepseekHarnessProvider /compact and preset models', () => {
     await provider.disconnect();
   });
 
-  it('intercepts /compact as DSH_BRIDGE_COMMAND.COMPACT and settles commit, failure, and cancel cleanly', async () => {
+  it('resolves /compact immediately on stdin write and settles commit, failure, and cancel asynchronously via events', async () => {
     expect(provider.capabilities.compact).toMatchObject({
       execution: 'sdk-rpc',
       verified: true,
@@ -964,13 +968,15 @@ describe('DeepseekHarnessProvider /compact and preset models', () => {
       isAuthenticated: true,
     });
 
-    const compactDone = provider.send(sessionId, '/compact');
-    await vi.waitFor(() => expect(child.commands().some((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toBe(true), { timeout: 2_000 });
+    await provider.send(sessionId, '/compact');
+    expect(child.commands().some((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toBe(true);
     expect(child.commands().some((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toBe(false);
+    expect(completions).toHaveLength(0);
+
     child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
     child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false, committed: true });
     child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACT_RESULT, ok: true, committed: true, shadowedCount: 4, shadowedTokenCount: 1200 });
-    await compactDone;
+    await flush();
     expect(completions.at(-1)?.message).toMatchObject({
       kind: 'system',
       role: 'system',
@@ -981,26 +987,83 @@ describe('DeepseekHarnessProvider /compact and preset models', () => {
       }),
     });
 
-    const compactFail = provider.send(sessionId, '/compact');
-    await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toHaveLength(2), { timeout: 2_000 });
+    await provider.send(sessionId, '/compact');
+    expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toHaveLength(2);
     child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACT_RESULT, ok: false, message: 'No compactable history yet.' });
-    await expect(compactFail).rejects.toThrow('No compactable history yet.');
+    await flush();
     expect(errors.at(-1)?.error).toMatchObject({
       code: 'PROVIDER_ERROR',
       message: 'dsh compact failed: No compactable history yet.',
       recoverable: true,
     });
 
-    const errCountBeforeCancel = errors.length;
-    const compactCancel = provider.send(sessionId, '/compact');
-    await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toHaveLength(3), { timeout: 2_000 });
+    await provider.send(sessionId, '/compact');
+    expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toHaveLength(3);
     const stopPromise = provider.cancelAndWait(sessionId);
     child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACT_RESULT, ok: false, cancelled: true, message: 'aborted' });
-    await expect(Promise.all([stopPromise, compactCancel])).resolves.toBeDefined();
-    expect(errors).toHaveLength(errCountBeforeCancel);
+    await expect(stopPromise).resolves.toBeUndefined();
+    expect(errors.at(-1)?.error).toMatchObject({
+      code: 'CANCELLED',
+      message: 'Turn cancelled',
+      recoverable: true,
+    });
   });
 
-  it('strips matching provider prefix when setSessionAgentId updates DSH_BRIDGE_MODEL_ENV', async () => {
+  it('does not trip sendProviderWithTimeout when slow /compact settles after the admission window', async () => {
+    const sid = await provider.createSession({
+      sessionKey: 'dsh-direct-compact-timeout',
+      sessionName: 'deck_dsh_direct_compact',
+      cwd: '/tmp/project',
+      agentId: 'glm-5.3-flash',
+    });
+    const dispatched = await dispatchSharedContextSend(provider, sid, {
+      userMessage: '/compact',
+      namespace: { scope: 'personal', projectId: 'p1' },
+    }, { sendTimeoutMs: 40 });
+    expect(dispatched.disposition).toBe('sent');
+    await new Promise((resolve) => setTimeout(resolve, 90));
+    expect(errors).toHaveLength(0);
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACT_RESULT, ok: true, committed: true });
+    await flush();
+    expect(completions.at(-1)?.message.metadata?.[SESSION_CONTROL_METADATA_COMMAND_FIELD]).toBe('compact');
+
+    const runtime = new TransportSessionRuntime(provider, 'deck_dsh_slow_compact');
+    try {
+      await runtime.initialize({
+        sessionKey: 'dsh-slow-compact-route',
+        sessionName: 'deck_dsh_slow_compact',
+        identityPrompt: 'IDENTITY_AFTER_COMPACT',
+      });
+
+      runtime.send('turn 1', 'm1');
+      await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(1), { timeout: 2_000 });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.MESSAGE, text: 'ready' });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
+
+      runtime.send('/compact', 'm-compact');
+      await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toHaveLength(2), { timeout: 2_000 });
+      await new Promise((resolve) => setTimeout(resolve, 90));
+
+      expect(runtime.getStatus()).toBe('thinking');
+      expect(errors).toHaveLength(0);
+
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false, committed: true });
+      child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACT_RESULT, ok: true, committed: true, shadowedCount: 2, shadowedTokenCount: 400 });
+      await vi.waitFor(() => expect(runtime.getStatus()).toBe('idle'), { timeout: 2_000 });
+      expect(completions.at(-1)?.message.metadata?.[SESSION_CONTROL_METADATA_COMMAND_FIELD]).toBe('compact');
+
+      runtime.send('turn 2', 'm2');
+      await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toHaveLength(2), { timeout: 2_000 });
+      const secondPrompt = child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT).at(-1) as { text?: string } | undefined;
+      expect(secondPrompt?.text).toContain('IDENTITY_AFTER_COMPACT');
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('switches model in-process via SET_MODEL on idle live child and keeps respawn fallback for active turns', async () => {
     const sessionId = await provider.createSession({
       sessionKey: 'dsh-switch-route',
       cwd: '/tmp/project',
@@ -1015,20 +1078,37 @@ describe('DeepseekHarnessProvider /compact and preset models', () => {
     child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
     await flush();
 
+    // Idle live child: sends SET_MODEL in-process on the exact same child without respawn.
+    provider.setSessionAgentId(sessionId, 'glm5.3/glm-5.3-flashx');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+    expect(child.killed).toBe(false);
+    expect(child.commands().at(-1)).toEqual({
+      type: DSH_BRIDGE_COMMAND.SET_MODEL,
+      provider: 'glm5.3',
+      model: 'glm-5.3-flashx',
+    });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.MODEL_SELECTED, provider: 'glm5.3', model: 'glm-5.3-flashx' });
+    await flush();
+    expect(sessionInfos.at(-1)?.info).toMatchObject({ model: 'glm-5.3-flashx' });
+    await provider.send(sessionId, 'next on same child');
+    expect(spawnMock).toHaveBeenCalledTimes(1);
+
+    // Active turn: still falls back to detach + respawn with updated DSH_BRIDGE_MODEL_ENV.
     const replacement = new FakeChild();
     spawnMock.mockImplementation(() => {
       setImmediate(() => replacement.emitEvent({
         type: DSH_BRIDGE_EVENT.READY,
         sessionId: 'dsh-compact-1',
         provider: 'glm5.3',
-        model: 'glm-5.3-flashx',
+        model: 'glm-5.3-flash',
         resumed: true,
       }));
       return replacement;
     });
-    provider.setSessionAgentId(sessionId, 'glm5.3/glm-5.3-flashx');
-    await provider.send(sessionId, 'next');
+    provider.setSessionAgentId(sessionId, 'glm5.3/glm-5.3-flash');
+    await provider.send(sessionId, 'next after active respawn');
+    expect(spawnMock).toHaveBeenCalledTimes(2);
     const spawnEnv = spawnMock.mock.calls.at(-1)?.[2]?.env as Record<string, string> | undefined;
-    expect(spawnEnv?.[DSH_BRIDGE_MODEL_ENV]).toBe('glm-5.3-flashx');
+    expect(spawnEnv?.[DSH_BRIDGE_MODEL_ENV]).toBe('glm-5.3-flash');
   });
 });
