@@ -4,9 +4,12 @@
  */
 import { useEffect, useRef } from 'preact/hooks';
 import type { RefObject } from 'preact';
+import {
+  SWIPE_BACK_EDGE_THRESHOLD_PX,
+  SWIPE_BACK_SURFACE_ATTR,
+} from '../mobile-navigation-gestures.js';
 import { triggerHaptic } from '../util/haptics.js';
 
-const EDGE_THRESHOLD = 30;
 const SWIPE_MIN_DISTANCE = 80;
 
 function findTouch(list: TouchList, id: number | null): Touch | null {
@@ -157,7 +160,7 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
       }
       const touch = e.touches[0];
       if (!touch) return;
-      if (touch.clientX <= EDGE_THRESHOLD) {
+      if (touch.clientX <= SWIPE_BACK_EDGE_THRESHOLD_PX) {
         cancelTracking();
         startX = touch.clientX;
         startY = touch.clientY;
@@ -216,6 +219,7 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
       cancelTracking();
     };
 
+    el.setAttribute(SWIPE_BACK_SURFACE_ATTR, 'true');
     el.addEventListener('touchstart', onTouchStart, { passive: true });
     el.addEventListener('touchmove', onTouchMove, { passive: true });
     el.addEventListener('touchend', onTouchEnd, { passive: true });
@@ -224,6 +228,7 @@ export function useSwipeBack(onBack: (() => void) | null | undefined): RefObject
       tracking = false;
       armed = false;
       activeTouchId = null;
+      el.removeAttribute(SWIPE_BACK_SURFACE_ATTR);
       el.removeEventListener('touchstart', onTouchStart);
       el.removeEventListener('touchmove', onTouchMove);
       el.removeEventListener('touchend', onTouchEnd);

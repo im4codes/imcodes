@@ -220,6 +220,7 @@ describe('mobile-navigation-gestures', () => {
       tracker.onTouchCancel(); // cancel -> no 18
       expect(vibrate.mock.calls).toEqual([[20]]);
 
+      // F1: Explicit unavailable direction (maxSteps=0) stays completely silent on HUD entry and when jumping from armed -> unavailable
       vibrate.mockClear();
       const lockedTracker = new TwoFingerSwipeTracker({
         viewportHeight: 844,
@@ -227,11 +228,29 @@ describe('mobile-navigation-gestures', () => {
       });
       lockedTracker.onTouchStart({ touches: [{ identifier: 5, clientX: 160, clientY: 300 }] });
       vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
-      lockedTracker.onTouchMove({ touches: [{ identifier: 5, clientX: 180, clientY: 300 }] }); // tracking start (20)
-      lockedTracker.onTouchMove({ touches: [{ identifier: 5, clientX: 250, clientY: 300 }] }); // maxSteps=0 -> no arm haptic
-      lockedTracker.onTouchMove({ touches: [{ identifier: 5, clientX: 160, clientY: 210 }] }); // maxSteps=0 -> no dir/arm haptic
+      lockedTracker.onTouchMove({ touches: [{ identifier: 5, clientX: 180, clientY: 300 }] }); // right maxSteps=0 -> silent
+      lockedTracker.onTouchMove({ touches: [{ identifier: 5, clientX: 250, clientY: 300 }] }); // maxSteps=0 -> silent
+      lockedTracker.onTouchMove({ touches: [{ identifier: 5, clientX: 160, clientY: 210 }] }); // up maxSteps=0 -> silent
       expect(lockedTracker.evaluateTouchEnd({ touches: [] })).toBeNull();
-      expect(vibrate.mock.calls).toEqual([[20]]);
+      expect(vibrate).not.toHaveBeenCalled();
+
+      // Armed HUD jumping to an unavailable axis/direction stays silent, then resumes accurate feedback on return to an available direction
+      vibrate.mockClear();
+      const partialHudTracker = new TwoFingerSwipeTracker({
+        viewportHeight: 844,
+        getAvailableSteps: (dir) => (dir === 'right' ? 2 : 0),
+      });
+      partialHudTracker.onTouchStart({ touches: [{ identifier: 6, clientX: 160, clientY: 300 }] });
+      vi.advanceTimersByTime(MOBILE_LONG_PRESS_MS);
+      partialHudTracker.onTouchMove({ touches: [{ identifier: 6, clientX: 180, clientY: 300 }] }); // tracking start right (20)
+      partialHudTracker.onTouchMove({ touches: [{ identifier: 6, clientX: 230, clientY: 300 }] }); // arm right step=1 (16)
+      partialHudTracker.onTouchMove({ touches: [{ identifier: 6, clientX: 160, clientY: 220 }] }); // jump to up (maxSteps=0) -> silent!
+      expect(vibrate.mock.calls).toEqual([[20], [16]]);
+      partialHudTracker.onTouchMove({ touches: [{ identifier: 6, clientX: 180, clientY: 300 }] }); // return to right step=0 -> light (10)
+      partialHudTracker.onTouchMove({ touches: [{ identifier: 6, clientX: 230, clientY: 300 }] }); // re-arm right step=1 -> medium (16)
+      partialHudTracker.onTouchMove({ touches: [{ identifier: 6, clientX: 160, clientY: 300 }] }); // center deadzone -> disarm light (10)
+      expect(partialHudTracker.evaluateTouchEnd({ touches: [] })).toBeNull();
+      expect(vibrate.mock.calls).toEqual([[20], [16], [10], [16], [10]]);
 
       // 4) Direct horizontal swipe inside .chat-view: engage -> arm -> disarm -> flip -> arm -> commit; vertical scroll & maxSteps=0 silent
       const chatPane = document.createElement('div');
@@ -261,7 +280,73 @@ describe('mobile-navigation-gestures', () => {
       blockedDirect.evaluateTouchEnd({ touches: [], changedTouches: [{ identifier: 11, clientX: 120, clientY: 300, target: chatPane }] });
       expect(vibrate).not.toHaveBeenCalled();
 
+      // Armed direct_horizontal jumping to unavailable opposite direction stays silent; center deadzone still disarms
+      vibrate.mockClear();
+      const oneWayDirect = new TwoFingerSwipeTracker({
+        viewportWidth: 390,
+        directSwipeThresholdPx: 110,
+        getAvailableSteps: (dir) => (dir === 'right' ? 1 : 0), // only swipe left -> tabNext available
+      });
+      oneWayDirect.onTouchStart({ touches: [{ identifier: 16, clientX: 200, clientY: 300, target: chatPane }] });
+      oneWayDirect.onTouchMove({ touches: [{ identifier: 16, clientX: 170, clientY: 300, target: chatPane }] }); // engage tabNext (10)
+      oneWayDirect.onTouchMove({ touches: [{ identifier: 16, clientX: 80, clientY: 300, target: chatPane }] }); // arm tabNext (16)
+      oneWayDirect.onTouchMove({ touches: [{ identifier: 16, clientX: 280, clientY: 300, target: chatPane }] }); // unavailable tabPrev -> silent!
+      expect(vibrate.mock.calls).toEqual([[10], [16]]);
+      oneWayDirect.onTouchMove({ touches: [{ identifier: 16, clientX: 80, clientY: 300, target: chatPane }] }); // re-arm tabNext (16)
+      oneWayDirect.onTouchMove({ touches: [{ identifier: 16, clientX: 200, clientY: 300, target: chatPane }] }); // center deadzone -> disarm light (10)
+      expect(oneWayDirect.evaluateTouchEnd({ touches: [] })).toBeNull();
+      expect(vibrate.mock.calls).toEqual([[10], [16], [16], [10]]);
+
+      // F2: Direct horizontal 8px hysteresis prevents oscillation at threshold=110 (111->109->111->109->111), disarms once <102, drops hysteresis on flip
+      vibrate.mockClear();
+      const hystProgress: Array<MobileNavigationGestureProgress | null> = [];
+      const hystDirect = new TwoFingerSwipeTracker({
+        viewportWidth: 390,
+        directSwipeThresholdPx: 110,
+        getAvailableSteps: () => 1,
+        onProgress: (p) => hystProgress.push(p),
+      });
+      hystDirect.onTouchStart({ touches: [{ identifier: 17, clientX: 300, clientY: 300, target: chatPane }] });
+      hystDirect.onTouchMove({ touches: [{ identifier: 17, clientX: 189, clientY: 300, target: chatPane }] }); // dx=-111 -> armed (16)
+      hystDirect.onTouchMove({ touches: [{ identifier: 17, clientX: 191, clientY: 300, target: chatPane }] }); // dx=-109 (>=102) -> stays armed, silent
+      hystDirect.onTouchMove({ touches: [{ identifier: 17, clientX: 189, clientY: 300, target: chatPane }] }); // dx=-111 -> stays armed, silent
+      hystDirect.onTouchMove({ touches: [{ identifier: 17, clientX: 191, clientY: 300, target: chatPane }] }); // dx=-109 -> stays armed, silent
+      hystDirect.onTouchMove({ touches: [{ identifier: 17, clientX: 189, clientY: 300, target: chatPane }] }); // dx=-111 -> stays armed, silent
+      expect(hystProgress.at(-1)?.armed).toBe(true);
+      expect(vibrate.mock.calls).toEqual([[16]]);
+
+      // Pull below exit threshold (110 - 8 = 102) -> disarms once (light 10); micro-jitter back to 105 stays unarmed (needs 110)
+      hystDirect.onTouchMove({ touches: [{ identifier: 17, clientX: 199, clientY: 300, target: chatPane }] }); // dx=-101 -> disarm (10)
+      hystDirect.onTouchMove({ touches: [{ identifier: 17, clientX: 195, clientY: 300, target: chatPane }] }); // dx=-105 -> stays unarmed
+      expect(hystProgress.at(-1)?.armed).toBe(false);
+      expect(vibrate.mock.calls).toEqual([[16], [10]]);
+
+      // Re-arm at 111 -> medium (16), then release inside hysteresis band at 105 -> commits tabNext + success (18)
+      hystDirect.onTouchMove({ touches: [{ identifier: 17, clientX: 189, clientY: 300, target: chatPane }] }); // dx=-111 -> arm (16)
+      hystDirect.onTouchMove({ touches: [{ identifier: 17, clientX: 195, clientY: 300, target: chatPane }] }); // dx=-105 -> still armed
+      expect(hystProgress.at(-1)?.armed).toBe(true);
+      expect(hystDirect.evaluateTouchEnd({
+        touches: [],
+        changedTouches: [{ identifier: 17, clientX: 195, clientY: 300, target: chatPane }],
+      })).toEqual({ action: 'tabNext', step: 1 });
+      expect(vibrate.mock.calls).toEqual([[16], [10], [16], [18]]);
+
+      // Direction flip from armed left (-115) to right (+105 < 110) immediately drops hysteresis (unarmed), only arms at >=110 (+111)
+      vibrate.mockClear();
+      hystDirect.onTouchStart({ touches: [{ identifier: 18, clientX: 200, clientY: 300, target: chatPane }] });
+      hystDirect.onTouchMove({ touches: [{ identifier: 18, clientX: 85, clientY: 300, target: chatPane }] }); // dx=-115 -> armed tabNext (16)
+      hystDirect.onTouchMove({ touches: [{ identifier: 18, clientX: 305, clientY: 300, target: chatPane }] }); // dx=+105 -> flipped from armed to unarmed tabPrev -> light disarm (10)
+      expect(hystProgress.at(-1)).toMatchObject({ swipeAction: 'tabPrev', armed: false, step: 0 });
+      hystDirect.onTouchMove({ touches: [{ identifier: 18, clientX: 311, clientY: 300, target: chatPane }] }); // dx=+111 -> armed tabPrev (16)
+      expect(hystProgress.at(-1)).toMatchObject({ swipeAction: 'tabPrev', armed: true, step: 1 });
+      expect(hystDirect.evaluateTouchEnd({
+        touches: [],
+        changedTouches: [{ identifier: 18, clientX: 311, clientY: 300, target: chatPane }],
+      })).toEqual({ action: 'tabPrev', step: 1 });
+      expect(vibrate.mock.calls).toEqual([[16], [10], [16], [18]]);
+
       // Full direct horizontal lifecycle: engage (10) -> arm (16) -> disarm (10) -> flip unarmed (12) -> arm (16) -> commit (18)
+      vibrate.mockClear();
       directTracker.onTouchStart({ touches: [{ identifier: 12, clientX: 200, clientY: 300, target: chatPane }] });
       directTracker.onTouchMove({ touches: [{ identifier: 12, clientX: 170, clientY: 300, target: chatPane }] }); // dx=-30 -> engage light (10)
       directTracker.onTouchMove({ touches: [{ identifier: 12, clientX: 80, clientY: 300, target: chatPane }] }); // dx=-120 -> arm medium (16)

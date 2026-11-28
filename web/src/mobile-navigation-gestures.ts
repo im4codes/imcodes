@@ -70,7 +70,9 @@ const MOBILE_DIRECT_SWIPE_TRACKING_DOMINANCE_RATIO = 1.35;
 export const MOBILE_NAV_GESTURE_ACTIVE_CLASS = 'mobile-nav-gesture-active';
 export const MOBILE_NAV_GESTURE_ACTIVE_EVENT = 'imcodes:mobile-nav-gesture-active';
 const MOBILE_SWIPE_DIRECTION_DEADZONE_PX = 4;
-const MOBILE_GESTURE_RECENT_WINDOW_MS = 350;
+export const MOBILE_GESTURE_RECENT_WINDOW_MS = 350;
+export const SWIPE_BACK_EDGE_THRESHOLD_PX = 30;
+export const SWIPE_BACK_SURFACE_ATTR = 'data-swipe-back-surface';
 
 export function resolveMobileDirectSwipeThresholdPx(viewportWidth?: number, overridePx?: number): number {
   if (overridePx !== undefined && Number.isFinite(overridePx) && overridePx > 0) {
@@ -317,6 +319,17 @@ export function canStartDirectHorizontalChatSwipe(target: EventTarget | null | u
   return true;
 }
 
+export function isSwipeBackEdgeTouch(
+  target: EventTarget | null | undefined,
+  clientX: number,
+  edgeThresholdPx = SWIPE_BACK_EDGE_THRESHOLD_PX,
+): boolean {
+  if (!Number.isFinite(clientX) || clientX > edgeThresholdPx) return false;
+  const el = resolveElementTarget(target);
+  if (!el || typeof el.closest !== 'function') return false;
+  return Boolean(el.closest(`[${SWIPE_BACK_SURFACE_ATTR}="true"]`));
+}
+
 export function canHandleMobileNavigationGesture(
   target: EventTarget | null | undefined,
   options: MobileNavigationGestureGuardOptions,
@@ -522,6 +535,12 @@ export class TwoFingerSwipeTracker {
 
   private emitStateTransitionHaptic(progress: MobileNavigationGestureProgress | null): void {
     if (!progress) return;
+    if (progress.direction !== null && progress.maxSteps <= 0) {
+      // Explicit unavailable target directions must remain silent even from an armed state;
+      // update snapshot so subsequent movement to an available direction transitions accurately.
+      this.recordFeedbackSnapshot(progress);
+      return;
+    }
     const mode = progress.mode ?? 'long_press';
 
     if (mode === 'direct_horizontal') {
@@ -780,7 +799,19 @@ export class TwoFingerSwipeTracker {
     }
 
     const distance = direction ? absDx : 0;
-    const armed = Boolean(swipeAction && maxSteps > 0 && distance >= threshold);
+    let armed = false;
+    if (!direction || !swipeAction || maxSteps <= 0) {
+      this.lastCommittedDirection = direction;
+      this.lastCommittedStep = 0;
+    } else {
+      const wasArmedSameDirection = this.lastCommittedDirection === direction && this.lastCommittedStep > 0;
+      const effectiveThreshold = wasArmedSameDirection
+        ? Math.max(0, threshold - MOBILE_SWIPE_STEP_HYSTERESIS_PX)
+        : threshold;
+      armed = distance >= effectiveThreshold;
+      this.lastCommittedDirection = direction;
+      this.lastCommittedStep = armed ? 1 : 0;
+    }
     const step = armed ? 1 : 0;
     const committedAction = armed ? swipeAction : null;
     const progress = armed
@@ -866,6 +897,10 @@ export class TwoFingerSwipeTracker {
       const first = event.touches[0];
       if (first) clearTouchHapticTriggered(this.doc, first.identifier);
       if (!first || !this.canTrackEvent(event)) {
+        this.enterStopPhase('locked_out', event);
+        return;
+      }
+      if (isSwipeBackEdgeTouch(first.target ?? event.target, first.clientX)) {
         this.enterStopPhase('locked_out', event);
         return;
       }
@@ -991,13 +1026,15 @@ export class TwoFingerSwipeTracker {
       this.lastPoints.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
       this.phase = 'tracking';
       this.setActive(true);
-      if (!hasTouchHapticTriggered(this.doc, touch.identifier)) {
+      const evaluation = this.evaluateTrackedState();
+      const progress = evaluation.progress;
+      const isExplicitUnavailableDirection = Boolean(progress?.direction && progress.maxSteps <= 0);
+      if (!isExplicitUnavailableDirection && !hasTouchHapticTriggered(this.doc, touch.identifier)) {
         markTouchHapticTriggered(this.doc, touch.identifier);
         triggerHaptic('medium', 20);
       }
-      const evaluation = this.evaluateTrackedState();
-      this.recordFeedbackSnapshot(evaluation.progress);
-      this.emitProgress(evaluation.progress);
+      this.recordFeedbackSnapshot(progress);
+      this.emitProgress(progress);
       return null;
     }
 
