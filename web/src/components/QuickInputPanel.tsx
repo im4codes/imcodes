@@ -1654,6 +1654,7 @@ export function QuickInputPanel({
   const [aliasForm, setAliasForm] = useState<{ original: string | null; name: string; value: string; description: string; tags: string } | null>(null);
   const [aliasError, setAliasError] = useState<AliasReason | 'generic' | null>(null);
   const [aliasSaving, setAliasSaving] = useState(false);
+  const [aliasManaging, setAliasManaging] = useState(false);
   const aliasNameInputRef = useRef<HTMLInputElement>(null);
 
   // Reset page when scope, session, or history search filter changes
@@ -1794,10 +1795,14 @@ export function QuickInputPanel({
     if (data.phrases.length === 0 && managePhrases) setManagePhrases(false);
   }, [data.phrases.length, managePhrases]);
   useEffect(() => {
+    if (allAliases.length === 0 && aliasManaging) setAliasManaging(false);
+  }, [allAliases.length, aliasManaging]);
+  useEffect(() => {
     if (!open) {
       copyRequestSeqRef.current += 1;
       setManageCommands(false);
       setManagePhrases(false);
+      setAliasManaging(false);
       setEditingItem(null);
       setEditValue('');
       setCopiedKey(null);
@@ -2454,6 +2459,16 @@ export function QuickInputPanel({
               >✕</button>
             )}
             <span class="qp-alias-count">{filteredAliases.length}</span>
+            {allAliases.length > 0 && (
+              <button
+                type="button"
+                class={`qp-manage-btn${aliasManaging ? ' is-active' : ''}`}
+                aria-pressed={aliasManaging}
+                onClick={() => setAliasManaging((m) => !m)}
+              >
+                {aliasManaging ? t('quick_input.manage_done', t('quick_input.done')) : t('quick_input.manage')}
+              </button>
+            )}
             <button class="qp-add-confirm" title={t('alias.add')} onClick={openAliasCreate}>＋</button>
           </div>
 
@@ -2503,7 +2518,7 @@ export function QuickInputPanel({
                 {aliasSearch ? t('alias.no_results') : t('alias.empty')}
               </div>
             ) : (
-              <div class="qp-alias-items">
+              <div class={`qp-alias-items${aliasManaging ? ' is-managing' : ''}`}>
                 {filteredAliases.map((a) => {
                   const metaParts = [a.value, a.description];
                   if (a.tags && a.tags.length > 0) metaParts.push(a.tags.map((t) => `#${t}`).join(' '));
@@ -2511,10 +2526,12 @@ export function QuickInputPanel({
                   return (
                     <span key={a.name} class="qp-pill qp-pill-custom qp-alias-item" title={hoverTitle}>
                       <span class="qp-pill-text" onClick={() => { onInsertAlias?.(a.name); onClose(); }}>{a.name}</span>
-                      <span class="qp-alias-item-actions">
-                        <button type="button" class="qp-pill-edit" title={t('alias.edit')} onClick={() => openAliasEdit(a.name)}>✎</button>
-                        <button type="button" class="qp-pill-del" title={t('alias.delete')} onClick={() => { void deleteAliasEntry(a.name); }}>✕</button>
-                      </span>
+                      {aliasManaging && (
+                        <span class="qp-alias-item-actions">
+                          <button type="button" class="qp-pill-edit" title={t('alias.edit')} onClick={() => openAliasEdit(a.name)}>✎</button>
+                          <button type="button" class="qp-pill-del" title={t('alias.delete')} onClick={() => { void deleteAliasEntry(a.name); }}>✕</button>
+                        </span>
+                      )}
                     </span>
                   );
                 })}

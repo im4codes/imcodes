@@ -46,6 +46,7 @@ vi.mock('react-i18next', () => ({
         'quick_input.placeholder_phrase': 'phrase',
         'quick_input.manage': 'Manage',
         'quick_input.done': 'Done',
+        'quick_input.manage_done': 'Done',
         'quick_input.my_phrases': 'My Phrases',
         'quick_input.builtin_phrases': 'Built-in',
         'quick_input.my_commands': 'My Commands',

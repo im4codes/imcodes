@@ -1304,6 +1304,7 @@
     "no_history_matches": "일치하는 기록이 없습니다",
     "manage": "관리",
     "done": "완료",
+    "manage_done": "완료",
     "my_phrases": "내 문구",
     "builtin_phrases": "기본 제공",
     "my_commands": "내 명령",

@@ -4942,6 +4942,7 @@ html.native-ios-mac .chat-dl-btn {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  min-height: 32px;
   border-radius: 8px;
   border: 1px solid rgba(125,211,252,0.18);
   background: rgba(15,23,42,0.72);
@@ -5021,30 +5022,8 @@ html.native-ios-mac .chat-dl-btn {
     gap: 6px;
     padding: 6px 8px 8px;
   }
-  .qp-pill.qp-alias-item {
-    flex-direction: column;
-    align-items: stretch;
-    justify-content: space-between;
-    min-height: 56px;
-  }
-  .qp-pill.qp-alias-item .qp-pill-text {
-    flex: 1 1 auto;
-    width: 100%;
-    max-width: none;
-    white-space: normal;
-    word-break: break-word;
-    overflow-wrap: anywhere;
-    line-height: 1.3;
-    padding: 7px 7px 5px;
-    display: flex;
-    align-items: center;
-  }
-  .qp-pill.qp-alias-item .qp-alias-item-actions {
-    width: 100%;
-    justify-content: flex-end;
-    border-left: none;
-    border-top: 1px solid rgba(148,163,184,0.14);
-    padding: 2px 4px;
+  .qp-alias-items.is-managing {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 .qp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(100,116,139,0.5) transparent; }

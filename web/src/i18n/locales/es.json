@@ -1304,6 +1304,7 @@
     "no_history_matches": "No hay historial coincidente",
     "manage": "Gestionar",
     "done": "Listo",
+    "manage_done": "Listo",
     "my_phrases": "Mis frases",
     "builtin_phrases": "Integrados",
     "my_commands": "Mis comandos",

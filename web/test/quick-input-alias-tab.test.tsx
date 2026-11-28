@@ -230,6 +230,10 @@ describe('QuickInputPanel — 别名 tab', () => {
     fireEvent.click(aliasTabButton());
     await waitFor(() => expect(root().textContent).toContain('deploy'));
 
+    const manageBtn = root().querySelector('.qp-manage-btn') as HTMLButtonElement;
+    expect(manageBtn).not.toBeNull();
+    fireEvent.click(manageBtn);
+
     const delBtn = Array.from(root().querySelectorAll('button')).find((b) => b.textContent === '✕' && b.getAttribute('title') === 'alias.delete');
     fireEvent.click(delBtn!);
 
@@ -244,6 +248,11 @@ describe('QuickInputPanel — 别名 tab', () => {
     render(<QuickInputPanel {...baseProps()} />);
     fireEvent.click(aliasTabButton());
     await waitFor(() => expect(root().textContent).toContain('deploy'));
+
+    const manageBtn = root().querySelector('.qp-manage-btn') as HTMLButtonElement;
+    expect(manageBtn).not.toBeNull();
+    fireEvent.click(manageBtn);
+
     const editBtn = Array.from(root().querySelectorAll('button')).find((b) => b.getAttribute('title') === 'alias.edit');
     fireEvent.click(editBtn!);
     // Let the initial "focus name on open" timer fire.
@@ -266,6 +275,11 @@ describe('QuickInputPanel — 别名 tab', () => {
     fireEvent.click(aliasTabButton());
     await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('2'));
     expect(root().querySelectorAll('.qp-alias-item')).toHaveLength(2);
+    expect(root().querySelectorAll('.qp-alias-item-actions')).toHaveLength(0);
+
+    const manageBtn = root().querySelector('.qp-manage-btn') as HTMLButtonElement;
+    expect(manageBtn).not.toBeNull();
+    fireEvent.click(manageBtn);
     expect(root().querySelectorAll('.qp-alias-item-actions')).toHaveLength(2);
 
     const search = root().querySelector('.qp-alias-search-row input') as HTMLInputElement;
@@ -297,6 +311,10 @@ describe('QuickInputPanel — 别名 tab', () => {
     const panel = root().querySelector('.qp-alias-panel')!;
     expect(panel.classList.contains('is-editing')).toBe(false);
 
+    const manageBtn = root().querySelector('.qp-manage-btn') as HTMLButtonElement;
+    expect(manageBtn).not.toBeNull();
+    fireEvent.click(manageBtn);
+
     const editBtn = Array.from(root().querySelectorAll('button')).find((b) => b.getAttribute('title') === 'alias.edit')!;
     fireEvent.click(editBtn);
 
@@ -313,7 +331,7 @@ describe('QuickInputPanel — 别名 tab', () => {
     ]);
   });
 
-  it('satisfies CSS contract: .qp-alias-items uses 5-column CSS grid on desktop and 3-column on mobile, no ;; prefix, and adaptive mobile cell height', () => {
+  it('satisfies CSS contract: .qp-alias-items uses 5-column CSS grid on desktop and 3-column (2-column when managing) on mobile, strictly single-row', () => {
     const cssPath = resolve(__dirname, '../src/styles.css');
     const cssContent = readFileSync(cssPath, 'utf-8');
 
@@ -321,19 +339,28 @@ describe('QuickInputPanel — 别名 tab', () => {
     expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*display:\s*grid/);
     expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*grid-template-columns:\s*repeat\(5,\s*minmax\(0,\s*1fr\)\)/);
 
-    // Mobile media query must use 3 equal-width columns and adaptive taller cells
+    // Mobile media query must use 3 equal-width columns in browse mode and 2 equal-width columns when managing
     expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-alias-items\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/);
-    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s*\{[^}]*flex-direction:\s*column/);
-    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s*\{[^}]*min-height:\s*56px/);
-    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s+\.qp-pill-text\s*\{[^}]*white-space:\s*normal/);
+    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-alias-items\.is-managing\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/);
+
+    // Single-row mobile invariant: NO flex-direction: column and NO min-height: 56px inside mobile alias styles!
+    expect(cssContent).not.toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s*\{[^}]*flex-direction:\s*column/);
+    expect(cssContent).not.toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s*\{[^}]*min-height:\s*56px/);
+    expect(cssContent).not.toMatch(/\.qp-alias-item[^}]*min-height:\s*56px/);
 
     // .qp-pill.qp-alias-item compound selector (0,2,0) overrides .qp-pill-custom (0,1,0)
     // fills each grid cell with 100% width, min-width: 0, 8px radius, cyan border, and translucent background
     expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*width:\s*100%/);
     expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*min-width:\s*0/);
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*min-height:\s*32px/);
     expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*border-radius:\s*8px/);
     expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*border:\s*1px solid rgba\(125,211,252,0\.18\)/);
     expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*background:\s*rgba\(15,23,42,0\.72\)/);
+
+    // Single-line ellipsis truncation on .qp-pill-text
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s+\.qp-pill-text\s*\{[^}]*white-space:\s*nowrap/);
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s+\.qp-pill-text\s*\{[^}]*text-overflow:\s*ellipsis/);
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s+\.qp-pill-text\s*\{[^}]*overflow:\s*hidden/);
 
     // No redundant ';;' prefix pseudo-element on buttons
     expect(cssContent).not.toContain('.qp-pill.qp-alias-item .qp-pill-text::before');
@@ -359,9 +386,48 @@ describe('QuickInputPanel — 别名 tab', () => {
     const textSpan = pill.querySelector('.qp-pill-text') as HTMLElement;
     expect(textSpan.textContent).toBe(longName);
 
+    expect(pill.querySelector('.qp-alias-item-actions')).toBeNull();
+
+    const manageBtn = root().querySelector('.qp-manage-btn') as HTMLButtonElement;
+    expect(manageBtn).not.toBeNull();
+    fireEvent.click(manageBtn);
+
     const actions = pill.querySelector('.qp-alias-item-actions') as HTMLElement;
     expect(actions).not.toBeNull();
     expect(actions.querySelector('.qp-pill-edit')).not.toBeNull();
     expect(actions.querySelector('.qp-pill-del')).not.toBeNull();
+  });
+
+  it('toggles Manage mode on and off in alias tab with .qp-manage-btn and .is-managing class', async () => {
+    store = [
+      { name: 'alias-1', value: 'v1', description: 'd1', tags: [], createdAt: '', updatedAt: '', source: 'web' },
+      { name: 'alias-2', value: 'v2', description: 'd2', tags: [], createdAt: '', updatedAt: '', source: 'web' },
+    ];
+    render(<QuickInputPanel {...baseProps()} />);
+    fireEvent.click(aliasTabButton());
+    await waitFor(() => expect(root().querySelector('.qp-alias-count')?.textContent).toBe('2'));
+
+    const itemsContainer = root().querySelector('.qp-alias-items')!;
+    expect(itemsContainer.classList.contains('is-managing')).toBe(false);
+    expect(root().querySelectorAll('.qp-alias-item-actions')).toHaveLength(0);
+
+    const manageBtn = root().querySelector('.qp-manage-btn') as HTMLButtonElement;
+    expect(manageBtn).not.toBeNull();
+    expect(manageBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(manageBtn.classList.contains('is-active')).toBe(false);
+
+    // Click Manage
+    fireEvent.click(manageBtn);
+    expect(manageBtn.getAttribute('aria-pressed')).toBe('true');
+    expect(manageBtn.classList.contains('is-active')).toBe(true);
+    expect(itemsContainer.classList.contains('is-managing')).toBe(true);
+    expect(root().querySelectorAll('.qp-alias-item-actions')).toHaveLength(2);
+
+    // Click Done
+    fireEvent.click(manageBtn);
+    expect(manageBtn.getAttribute('aria-pressed')).toBe('false');
+    expect(manageBtn.classList.contains('is-active')).toBe(false);
+    expect(itemsContainer.classList.contains('is-managing')).toBe(false);
+    expect(root().querySelectorAll('.qp-alias-item-actions')).toHaveLength(0);
   });
 });
