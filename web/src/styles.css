@@ -30045,6 +30045,28 @@ html.native-ios-mac .global-task-mode-entry-btn {
     grid-template-columns: 1fr;
     gap: 6px;
   }
+  .cc-preset-env-list {
+    gap: 8px;
+  }
+  .cc-preset-env-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 5px 6px;
+  }
+  .cc-preset-env-row:not(:last-child) {
+    padding-bottom: 7px;
+    border-bottom: 1px solid rgba(125, 211, 252, 0.10);
+  }
+  .cc-preset-env-key-input {
+    grid-column: 1 / -1;
+    width: 100%;
+    min-width: 0;
+  }
+  .cc-preset-env-val-input {
+    width: 100%;
+    min-width: 0;
+  }
   .cc-preset-row {
     flex-direction: column;
     align-items: stretch;

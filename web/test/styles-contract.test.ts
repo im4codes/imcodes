@@ -2369,4 +2369,23 @@ describe('styles.css regression contracts', () => {
     expect(cssWithoutComments).toMatch(/\.qp-pill\.qp-alias-item\s*\{/);
     expect(cssWithoutComments).toMatch(/\.qp-pill-custom\s*\{[^}]*border-radius:\s*999px/);
   });
+
+  it('gives .cc-preset-env-key-input full row width under <=640px while preserving proportional flex min-width: 0 on desktop', () => {
+    const envRowDesktop = cssWithoutComments.match(/(?:^|\n)\.cc-preset-env-row\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(envRowDesktop).toMatch(/display:\s*flex/);
+    expect(envRowDesktop).toMatch(/min-width:\s*0/);
+
+    const envKeyDesktop = cssWithoutComments.match(/(?:^|\n)\.cc-preset-env-key-input\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(envKeyDesktop).toMatch(/flex:\s*1\.35\s+1\s+0/);
+    expect(envKeyDesktop).toMatch(/min-width:\s*0/);
+
+    const envValDesktop = cssWithoutComments.match(/(?:^|\n)\.cc-preset-env-val-input\s*\{[^}]*\}/)?.[0] ?? '';
+    expect(envValDesktop).toMatch(/flex:\s*1\.65\s+1\s+0/);
+    expect(envValDesktop).toMatch(/min-width:\s*0/);
+
+    const mobileBlocks = extractBalancedAtRuleBlocks(cssWithoutComments, /@media\s*\(max-width:\s*640px\)/).join('\n');
+    expect(mobileBlocks).toMatch(/\.cc-preset-env-row\s*\{[^}]*display:\s*grid[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/);
+    expect(mobileBlocks).toMatch(/\.cc-preset-env-key-input\s*\{[^}]*grid-column:\s*1\s*\/\s*-1[^}]*width:\s*100%[^}]*min-width:\s*0/);
+    expect(mobileBlocks).toMatch(/\.cc-preset-env-val-input\s*\{[^}]*width:\s*100%[^}]*min-width:\s*0/);
+  });
 });
