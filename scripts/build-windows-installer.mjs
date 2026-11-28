@@ -59,7 +59,9 @@ export function renderWindowsPhaseAInstallerPs1({ version, cliWrapperContent, mi
   [switch]$ForceTakeover,
   [switch]$AllowSystemRoot,
   [switch]$ApplyServices,
-  [switch]$SkipOpenCode
+  [switch]$SkipOpenCode,
+  [switch]$DeferUserDaemon,
+  [switch]$ActivateUserDaemon
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1067,7 +1069,7 @@ function Stop-ControlledNodeAndSidecarsForInstall {
   throw "controlled_node_binary_locked: managed process or file lock did not clear under $NodeRoot"
 }
 
-function Save-RollbackSnapshot($Plan, $ServiceSnapshot) {
+function Save-RollbackSnapshot($Plan, $ServiceSnapshot, [bool]$StoppedDaemon = $false) {
   $manifestPath = Join-Path $SnapshotDir 'snapshot.json'
   $filesDir = Join-Path $SnapshotDir 'files'
   $svcDir = Join-Path $SnapshotDir 'services'
@@ -1147,6 +1149,7 @@ function Save-RollbackSnapshot($Plan, $ServiceSnapshot) {
     preservedDatabases = $preservedDatabases
     services = [ordered]@{
       applyRecorded = [bool]$ApplyServices
+      activateUserDaemon = [bool]((-not $Plan.preserveUserDaemonAutostart) -or $StoppedDaemon)
       userDaemonWasRunning = [bool]($ServiceSnapshot -and $ServiceSnapshot.userDaemonWasRunning)
       tasks = $savedTasks
     }
@@ -1407,8 +1410,10 @@ Write-HealthLog 'restart_requested'
       [void](Invoke-Schtasks @('/Run', '/TN', 'imcodes-node'))
     }
   }
-  if ((-not $Plan.preserveUserDaemonAutostart) -or $RestartDaemon) {
-    Sync-OpenCodeProcessPath
+  if (-not $DeferUserDaemon -and ((-not $Plan.preserveUserDaemonAutostart) -or $RestartDaemon)) {
+    if (-not (Test-IsElevatedOrSystemProcess)) {
+      Sync-OpenCodeProcessPath
+    }
     $handledDaemon = Invoke-ServiceAction 'ActivateUserDaemon' @{ autostartPath = $AutostartPath; currentDir = $CurrentDir }
     if (-not $handledDaemon -and (Test-Path -LiteralPath $AutostartPath -PathType Leaf)) {
       Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c call "' + $AutostartPath + '"') -WindowStyle Hidden | Out-Null
@@ -1743,7 +1748,9 @@ function Install-OpenCodeCliBestEffort {
         try { Add-UserPathEntry $ocBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $ocBinDir to User PATH: " + $_.Exception.Message) }
       }
     }
-    Sync-OpenCodeProcessPath
+    if (-not (Test-IsElevatedOrSystemProcess)) {
+      Sync-OpenCodeProcessPath
+    }
   } catch {
     Write-InstallerLog ("WARNING: OpenCode CLI install failed (non-blocking): " + $_.Exception.Message)
   }
@@ -1753,6 +1760,50 @@ if ($Mode -eq 'InstallOpenCode') {
   try {
     Write-InstallerLog "Starting InstallOpenCode version=$Version homeDir=$HomeDir"
     Install-OpenCodeCliBestEffort
+    if ($ActivateUserDaemon) {
+      $isElevatedCtx = Test-IsElevatedOrSystemProcess
+      $shouldActivate = $false
+      $snapManifestPath = Join-Path $SnapshotDir 'snapshot.json'
+      if (Test-Path -LiteralPath $snapManifestPath -PathType Leaf) {
+        try {
+          $snapObj = Get-Content -LiteralPath $snapManifestPath -Raw | ConvertFrom-Json
+          if ($snapObj.PSObject.Properties['scenario'] -and [string]$snapObj.scenario -eq 'clean') {
+            $shouldActivate = $true
+          }
+          if ($snapObj.services -and $snapObj.services.PSObject.Properties['activateUserDaemon'] -and [bool]$snapObj.services.activateUserDaemon) {
+            $shouldActivate = $true
+          }
+        } catch {}
+      } elseif (-not (Test-Path -LiteralPath $AutostartPath -PathType Leaf)) {
+        $shouldActivate = $true
+      }
+      if ($shouldActivate) {
+        if (-not $isElevatedCtx) {
+          $ocBaseDir = Join-Path $HomeDir '.opencode'
+          $ocBinDir = Join-Path $ocBaseDir 'bin'
+          $ocExePath = Join-Path $ocBinDir 'opencode.exe'
+          $ocSafe = $true
+          foreach ($ocCheckPath in @($ocBaseDir, $ocBinDir, $ocExePath)) {
+            if (Test-PathHasReparsePoint $ocCheckPath) { $ocSafe = $false; break }
+          }
+          if ($ocSafe) {
+            Sync-OpenCodeProcessPath
+          }
+          if (-not (Test-Path -LiteralPath $AutostartPath -PathType Leaf)) {
+            $nodeExe = Join-Path $CurrentDir 'node.exe'
+            $entryJs = Join-Path $CurrentDir 'package\\dist\\src\\index.js'
+            if ((Test-Path -LiteralPath $nodeExe -PathType Leaf) -and (Test-Path -LiteralPath $entryJs -PathType Leaf)) {
+              $startupCmd = "@echo off\`r\`nstart \`"\`" /min \`"$nodeExe\`" \`"$entryJs\`" start --foreground\`r\`n"
+              Write-TextAtomic $AutostartPath $startupCmd ([System.Text.Encoding]::ASCII)
+            }
+          }
+        }
+        $handledDaemon = Invoke-ServiceAction 'ActivateUserDaemon' @{ autostartPath = $AutostartPath; currentDir = $CurrentDir }
+        if (-not $handledDaemon -and (Test-Path -LiteralPath $AutostartPath -PathType Leaf)) {
+          Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c call "' + $AutostartPath + '"') -WindowStyle Hidden | Out-Null
+        }
+      }
+    }
     Write-InstallerLog 'Completed InstallOpenCode'
     exit 0
   } catch {
@@ -1768,7 +1819,7 @@ $preServiceSnap = Get-WindowsServicesSnapshot
 $stoppedDaemon = Assert-SingleInstanceLockAndStop $plan
 $snapManifestPath = Join-Path $SnapshotDir 'snapshot.json'
 if (-not (Test-Path -LiteralPath $snapManifestPath -PathType Leaf)) {
-  Save-RollbackSnapshot $plan $preServiceSnap
+  Save-RollbackSnapshot $plan $preServiceSnap $stoppedDaemon
 } elseif ($ApplyServices) {
   try {
     $existingSnap = Get-Content -LiteralPath $snapManifestPath -Raw | ConvertFrom-Json
@@ -2065,8 +2116,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ${filesEntries.join('\n')}
 
 [Run]
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode InstallOpenCode -AllowSystemRoot -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"""; Flags: runhidden waituntilterminated runasoriginaluser
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode PostInstall -AllowSystemRoot -SkipOpenCode -ApplyServices -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"" -NodeRoot ""{commonappdata}\\imcodes-node"" -CliWrapperPath ""{localappdata}\\imcodes\\bin\\imcodes.cmd"" -StagedCliWrapper ""{app}\\imcodes.cmd.staged"" -LogPath ""{commonappdata}\\imcodes-node\\installer-postinstall.log"""; Flags: runhidden waituntilterminated
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode PostInstall -AllowSystemRoot -SkipOpenCode -ApplyServices -DeferUserDaemon -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"" -NodeRoot ""{commonappdata}\\imcodes-node"" -CliWrapperPath ""{localappdata}\\imcodes\\bin\\imcodes.cmd"" -StagedCliWrapper ""{app}\\imcodes.cmd.staged"" -LogPath ""{commonappdata}\\imcodes-node\\installer-postinstall.log"""; Flags: runhidden waituntilterminated
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode InstallOpenCode -AllowSystemRoot -ActivateUserDaemon -Version ""${version}"" -RuntimeRoot ""{commonpf}\\IM.codes\\daemon-runtime"" -NodeRoot ""{commonappdata}\\imcodes-node"""; Flags: runhidden waituntilterminated runasoriginaluser
 
 [UninstallRun]
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\\imcodes-windows-installer.ps1"" -Mode Rollback -AllowSystemRoot -ApplyServices -SnapshotDir ""{commonappdata}\\imcodes-node\\installer-rollback-${version}"" -LogPath ""{commonappdata}\\imcodes-node\\installer-rollback.log"""; Flags: runhidden waituntilterminated; RunOnceId: "IMCodesDesktopRollback"

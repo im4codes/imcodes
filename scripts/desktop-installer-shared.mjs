@@ -1925,6 +1925,9 @@ if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then
 </plist>
 EOF
   else
+    sd_oc_bin="$(printf '%s' "$EFF_HOME/.opencode/bin" | sed -e 's/%/%%/g' -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g')"
+    sd_node_bin="$(printf '%s' "$CURRENT_LINK/bin/node" | sed -e 's/%/%%/g' -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g')"
+    sd_entry_js="$(printf '%s' "$CURRENT_LINK/package/dist/src/index.js" | sed -e 's/%/%%/g' -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g')"
     cat > "$auto_tmp" <<EOF
 [Unit]
 Description=IM.codes Coding Daemon
@@ -1932,7 +1935,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$CURRENT_LINK/bin/node $CURRENT_LINK/package/dist/src/index.js start --foreground
+ExecStart=/bin/sh -c 'case ":\\$PATH:" in *":\\$1:"*) ;; *) [ -n "\\$PATH" ] && PATH="\\$PATH:\\$1" || PATH="\\$1";; esac; export PATH; exec "\\$2" "\\$3" start --foreground' _ "$sd_oc_bin" "$sd_node_bin" "$sd_entry_js"
 Restart=always
 RestartSec=5
 
@@ -2032,23 +2035,6 @@ EOF
   fi
 fi
 
-sync_linux_systemd_opencode_path() {
-  oc_bin="$EFF_HOME/.opencode/bin"
-  [ -x "$oc_bin/opencode" ] || return 0
-  env_d_dir="$EFF_HOME/.config/environment.d"
-  mkdir_for_target_user "$env_d_dir"
-  env_d_file="$env_d_dir/99-imcodes-opencode.conf"
-  printf 'PATH=\${PATH:+$PATH:}%s\n' "$oc_bin" > "$env_d_file"
-  chown_target_entry "$env_d_file"
-  cur_mgr_path="$(run_systemctl_user show-environment 2>/dev/null | sed -n 's/^PATH=//p' | head -n1 || true)"
-  if [ -n "$cur_mgr_path" ]; then
-    case ":$cur_mgr_path:" in
-      *":$oc_bin:"*) ;;
-      *) run_systemctl_user set-environment "PATH=$cur_mgr_path:$oc_bin" >/dev/null 2>&1 || true ;;
-    esac
-  fi
-}
-
 refresh_node_staged_receipt
 if [ "$APPLY_SERVICES" -eq 1 ]; then
   mark_services_applied_posix
@@ -2087,7 +2073,6 @@ if [ "$APPLY_SERVICES" -eq 1 ]; then
           echo "WARNING: tmux not found in PATH; install tmux (e.g. sudo apt-get install -y tmux) so imcodes.service can start." >&2
         fi
       fi
-      sync_linux_systemd_opencode_path
       run_systemctl_user daemon-reload >/dev/null 2>&1 || true
       run_systemctl_user enable imcodes.service >/dev/null 2>&1 || true
       run_systemctl_user restart imcodes.service >/dev/null 2>&1 || run_systemctl_user start imcodes.service >/dev/null 2>&1 || true
