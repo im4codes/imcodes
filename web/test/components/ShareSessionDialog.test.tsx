@@ -23,6 +23,7 @@ vi.mock('react-i18next', () => ({
       }
       if (key === 'share.target.server') return 'Whole server';
       if (key === 'share.target.currentTab') return 'Current session tab';
+      if (key === 'share.role.viewer') return 'Viewer';
       if (key === 'share.role.participant') return 'Participant';
       if (!vars) return key;
       const suffix = Object.entries(vars)
@@ -158,7 +159,7 @@ describe('ShareSessionDialog security warnings', () => {
     expect(warning.textContent).toContain('High-risk collaboration notice: Real-time collaboration lets participants run Shell commands');
   });
 
-  it('escalates warning styling and renders trust disclosure when Participant role is selected', () => {
+  it('escalates warning styling, renders trust disclosure, and switches roleHelp by selected target scope when Participant role is selected', () => {
     const { container } = render(
       <ShareSessionDialog
         variant="session"
@@ -170,6 +171,7 @@ describe('ShareSessionDialog security warnings', () => {
     const warning = screen.getByTestId('share-security-warning');
     expect(warning.classList.contains('is-participant')).toBe(false);
     expect(container.querySelector('.share-trust-disclosure')).toBeNull();
+    expect(container.querySelector('.share-help')?.textContent).toBe('share.roleHelp.viewer');
 
     fireEvent.click(screen.getByRole('radio', { name: 'Participant' }));
     expect(warning.classList.contains('is-participant')).toBe(true);
@@ -177,6 +179,42 @@ describe('ShareSessionDialog security warnings', () => {
     expect(disclosure).toBeTruthy();
     expect(disclosure?.textContent).toContain('share.trust.title');
     expect(disclosure?.textContent).toContain('share.trust.body');
+    expect(container.querySelector('.share-help')?.textContent).toBe('share.roleHelp.participant');
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Whole server' }));
+    expect(container.querySelector('.share-help')?.textContent).toBe('share.roleHelp.serverParticipant');
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Viewer' }));
+    expect(container.querySelector('.share-help')?.textContent).toBe('share.roleHelp.viewer');
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Participant' }));
+    fireEvent.click(screen.getByRole('radio', { name: 'Current session tab' }));
+    expect(container.querySelector('.share-help')?.textContent).toBe('share.roleHelp.participant');
+  });
+
+  it('uses whole-server participant roleHelp when fixedTarget is a server and preserves machine role_help on machine variant', () => {
+    const serverSessionView = render(
+      <ShareSessionDialog
+        variant="session"
+        fixedTarget={{ kind: 'server', serverId: 'srv-1' }}
+        target={defaultTarget}
+        onClose={vi.fn()}
+      />
+    );
+    fireEvent.click(screen.getByRole('radio', { name: 'Participant' }));
+    expect(serverSessionView.container.querySelector('.share-help')?.textContent).toBe('share.roleHelp.serverParticipant');
+    serverSessionView.unmount();
+
+    const machineView = render(
+      <ShareSessionDialog
+        variant="machine"
+        fixedTarget={{ kind: 'server', serverId: 'srv-1' }}
+        target={defaultTarget}
+        onClose={vi.fn()}
+      />
+    );
+    fireEvent.click(screen.getByRole('radio', { name: 'Participant' }));
+    expect(machineView.container.querySelector('.share-help')?.textContent).toBe('controlled_nodes.share.role_help.participant');
   });
 
   it('structures header, warning, panel, and actions with proper layout classes to support fixed actions', () => {

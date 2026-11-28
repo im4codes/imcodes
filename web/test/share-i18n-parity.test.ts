@@ -68,7 +68,7 @@ describe('share i18n parity', () => {
         share?: {
           shell_participant_forbidden?: unknown;
           trust?: { title?: unknown; body?: unknown };
-          roleHelp?: { viewer?: unknown; participant?: unknown };
+          roleHelp?: { viewer?: unknown; participant?: unknown; serverParticipant?: unknown };
         };
       };
       expect(messages.share?.shell_participant_forbidden, locale).toBeUndefined();
@@ -76,6 +76,9 @@ describe('share i18n parity', () => {
       expect(String(messages.share?.trust?.body ?? '').trim(), locale).not.toBe('');
       expect(String(messages.share?.roleHelp?.viewer ?? '').trim(), locale).not.toBe('');
       expect(String(messages.share?.roleHelp?.participant ?? '').trim(), locale).not.toBe('');
+      const serverParticipantHelp = String(messages.share?.roleHelp?.serverParticipant ?? '').trim();
+      expect(serverParticipantHelp, locale).not.toBe('');
+      expect(serverParticipantHelp, locale).not.toMatch(/cannot stop|不可关闭|不可關閉|終了はできません|종료는 불가|no puede cerrar|не закрывать/i);
     }
   });
 });

@@ -3834,7 +3834,7 @@ describe('WsBridge share-scoped sockets', () => {
     const now = Date.now();
     const daemon = new MockWs();
     const bridge = WsBridge.get(serverId);
-    const subRows: Array<{ id: string; parent_session: string | null }> = [
+    const subRows: Array<{ id: string; parent_session: string | null; closed_at?: number | null; execution_clone_metadata?: unknown }> = [
       { id: 'owned_db_sh', parent_session: 'deck_proj_alpha_brain' },
       { id: 'other_db_sh', parent_session: 'deck_other_brain' },
       { id: 'orphan_sub', parent_session: null },
@@ -3843,6 +3843,12 @@ describe('WsBridge share-scoped sockets', () => {
     const baseDb = makeDb(null, [], { subSessions: subRows });
     const db = {
       ...baseDb,
+      query: async (sql: string, params: unknown[] = []) => {
+        if (sql.includes('FROM sub_sessions WHERE server_id = $1 AND closed_at IS NULL')) {
+          return subRows.filter((r) => !r.closed_at && !r.execution_clone_metadata);
+        }
+        return (baseDb as { query: (s: string, p?: unknown[]) => Promise<unknown[]> }).query(sql, params);
+      },
       queryOne: async (sql: string, params: unknown[] = []) => {
         if (sql.includes('FROM sub_sessions WHERE id = $1 AND server_id = $2')) {
           if (throwSubSessionLookup) throw new Error('db_lookup_error');
@@ -3979,6 +3985,27 @@ describe('WsBridge share-scoped sockets', () => {
       expect.objectContaining({ type: 'subsession.restart', sessionName: 'deck_sub_owned_db_sh', sharedActor: expect.objectContaining({ origin: 'shared-tab' }) }),
     ]));
     expect(bridge.isIncognitoSessionName('deck_sub_tab_incog_child')).toBe(true);
+
+    // 2b) Fresh 5s coverage cache window + immediate POST /sub-sessions persistence:
+    // Both Shell and Agent subsession.start MUST refresh live coverage and succeed under covered parent,
+    // while execution clones persisted under the same parent remain filtered and rejected.
+    subRows.push(
+      { id: 'post_created_sh', parent_session: 'deck_proj_alpha_brain' },
+      { id: 'post_created_llm', parent_session: 'deck_proj_alpha_brain' },
+      { id: 'post_created_clone', parent_session: 'deck_proj_alpha_brain', execution_clone_metadata: { parentRunId: 'run-1' } },
+    );
+    tabSock.sent.length = 0;
+    daemon.sent.length = 0;
+    tabSock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'post_created_sh', sessionType: 'shell', parentSession: 'deck_proj_alpha_brain' }));
+    tabSock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'post_created_llm', sessionType: 'claude-code-sdk', parentSession: 'deck_proj_alpha_brain' }));
+    tabSock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'post_created_clone', sessionType: 'claude-code-sdk', parentSession: 'deck_proj_alpha_brain' }));
+    await flushAsync();
+
+    expect(daemon.sentJson).toEqual([
+      expect.objectContaining({ type: 'subsession.start', id: 'post_created_sh', sessionType: 'shell', parentSession: 'deck_proj_alpha_brain', sharedActor: expect.objectContaining({ origin: 'shared-tab', effectiveActorRole: 'participant' }) }),
+      expect.objectContaining({ type: 'subsession.start', id: 'post_created_llm', sessionType: 'claude-code-sdk', parentSession: 'deck_proj_alpha_brain', sharedActor: expect.objectContaining({ origin: 'shared-tab', effectiveActorRole: 'participant' }) }),
+    ]);
+    expect(tabSock.sentJson.some((m) => m.type === 'error' && m.code === SHARE_REASONS.DIRECT_SURFACE_DENIED)).toBe(true);
 
     // 3) Whole-server participant allows project-level session.restart, yet still rejects mismatched targets & orphan sub-session
     const serverTarget: ShareTarget = { kind: 'server', serverId };

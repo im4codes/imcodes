@@ -198,7 +198,8 @@
     },
     "roleHelp": {
       "viewer": "Solo lectura: Puede ver el estado del ámbito y unirse al debate sin operar la máquina ni dirigir herramientas.",
-      "participant": "Colaborador en tiempo real: Puede operar terminales Shell/script, archivos, herramientas del espacio de trabajo, OpenSpec y nuevas subsesiones dentro del ámbito (no puede cerrar sesiones existentes)."
+      "participant": "Colaborador en tiempo real: Puede operar terminales Shell/script, archivos, herramientas del espacio de trabajo, OpenSpec y nuevas subsesiones dentro del ámbito (no puede cerrar sesiones existentes).",
+      "serverParticipant": "Colaborador en tiempo real: Puede operar terminales Shell/script, archivos, herramientas del espacio de trabajo, OpenSpec e iniciar o detener sesiones en todo este servidor compartido."
     },
     "trust": {
       "title": "Alto riesgo: Equivale al control de escritorio remoto y del equipo",

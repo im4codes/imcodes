@@ -198,7 +198,8 @@
     },
     "roleHelp": {
       "viewer": "Read-only: Can view scoped state and join scoped discussion without operating this machine or driving tools.",
-      "participant": "Real-time collaborator: Can operate Shell/script terminals, files, workspace tools, OpenSpec, and sub-sessions within the shared machine scope (cannot stop/close existing sessions)."
+      "participant": "Real-time collaborator: Can operate Shell/script terminals, files, workspace tools, OpenSpec, and sub-sessions within the shared machine scope (cannot stop/close existing sessions).",
+      "serverParticipant": "Real-time collaborator: Can operate Shell/script terminals, files, workspace tools, OpenSpec, and start or stop sessions across this shared server."
     },
     "trust": {
       "title": "High risk: Equivalent to Remote Desktop & full host control",

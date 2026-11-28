@@ -91,7 +91,11 @@ export function ShareSessionDialog({
     ? (target.serverLabel?.trim() || t('share.target.serverFallback'))
     : target.tabLabel;
   const isDeviceShare = variant === 'machine' || targetChoice === 'server' || fixedTarget?.kind === 'server';
-  const roleHelpPrefix = variant === 'machine' ? 'controlled_nodes.share.role_help' : 'share.roleHelp';
+  const roleHelpKey = variant === 'machine'
+    ? `controlled_nodes.share.role_help.${role}`
+    : (selectedTarget.kind === 'server' && role === 'participant'
+      ? 'share.roleHelp.serverParticipant'
+      : `share.roleHelp.${role}`);
 
   const loadShares = useCallback(async () => {
     setSharesLoading(true);
@@ -266,7 +270,7 @@ export function ShareSessionDialog({
                   <span>{t('share.role.participant')}</span>
                 </label>
               </div>
-              <div class="share-help">{t(`${roleHelpPrefix}.${role}`)}</div>
+              <div class="share-help">{t(roleHelpKey)}</div>
             </div>
 
             {isParticipantRole(role) && (

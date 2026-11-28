@@ -8439,7 +8439,7 @@ export class WsBridge {
     // DB for each one: the socket's coverage serves them until it is older than
     // the TTL or a grant changed (epoch). Anything not fresh is re-resolved
     // from the DB (single flight), and a failed re-resolution denies.
-    const current = this.shareCoverageIsFresh(state)
+    let current = this.shareCoverageIsFresh(state)
       ? state
       : await this.refreshShareCoverage(ws, state);
     if (!current) {
@@ -8464,6 +8464,38 @@ export class WsBridge {
     const lifecycleContext = SHARE_LIFECYCLE_ACTOR_COMMANDS.has(msgType)
       ? await this.resolveShareLifecycleTargetContext(msg)
       : undefined;
+    // If HTTP POST /sub-sessions persisted a child under a covered parent within the 5s coverage TTL,
+    // refresh authoritative live coverage once so valid `subsession.start` / `subsession.restart` sees it
+    // while still filtering execution clones, closed rows, and revoked grants via resolveCoveredSessionNames.
+    if (
+      (msgType === 'subsession.start' || msgType === 'subsession.restart')
+      && lifecycleContext?.subSessionRecord?.exists
+      && !lifecycleContext.subSessionRecord.lookupFailed
+      && !lifecycleContext.subSessionRecord.incognito
+      && lifecycleContext.subSessionRecord.parentSession
+      && shareStateCoversSession(current, lifecycleContext.subSessionRecord.parentSession)
+    ) {
+      const targetSubSession = msgType === 'subsession.start'
+        ? (typeof msg.id === 'string' && msg.id.trim() && !msg.id.trim().startsWith('deck_sub_')
+          ? `deck_sub_${msg.id.trim()}`
+          : null)
+        : (typeof msg.sessionName === 'string' && msg.sessionName.trim().startsWith('deck_sub_')
+          ? msg.sessionName.trim()
+          : null);
+      if (targetSubSession && !shareStateCoversSession(current, targetSubSession)) {
+        const refreshed = await this.refreshShareCoverage(ws, current);
+        if (!refreshed) {
+          const decision: ShareCommandDecision = {
+            allowed: false,
+            reason: this.shareStateLooksExpired(current) ? SHARE_REASONS.EXPIRED : SHARE_REASONS.REVOKED,
+            closeSocket: true,
+          };
+          this.queueShareCommandAudit(current, msg, decision);
+          return decision;
+        }
+        current = refreshed;
+      }
+    }
     const decision = evaluateShareCommand({
       msg,
       state: current,
