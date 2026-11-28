@@ -313,7 +313,7 @@ describe('QuickInputPanel — 别名 tab', () => {
     ]);
   });
 
-  it('satisfies CSS contract: .qp-alias-items uses flex-wrap: wrap row flow and .qp-alias-item is auto-width pill', () => {
+  it('satisfies CSS contract: .qp-alias-items uses flex-wrap: wrap row flow, .qp-pill.qp-alias-item overrides .qp-pill-custom, and mobile uses min(180px, calc(100vw - 110px))', () => {
     const cssPath = resolve(__dirname, '../src/styles.css');
     const cssContent = readFileSync(cssPath, 'utf-8');
 
@@ -322,13 +322,41 @@ describe('QuickInputPanel — 别名 tab', () => {
     expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*flex-direction:\s*row/);
     expect(cssContent).toMatch(/\.qp-alias-items\s*\{[^}]*flex-wrap:\s*wrap/);
 
-    // .qp-alias-item must be inline auto-width pill, NOT full-width card (width: 100%)
-    expect(cssContent).toMatch(/\.qp-alias-item\s*\{[^}]*width:\s*auto/);
-    expect(cssContent).toMatch(/\.qp-alias-item\s*\{[^}]*display:\s*inline-flex/);
-    expect(cssContent).not.toMatch(/\.qp-alias-item\s*\{[^}]*(?<![a-z-])width:\s*100%/);
+    // .qp-pill.qp-alias-item compound selector (0,2,0) must override .qp-pill-custom (0,1,0)
+    // with 8px radius, cyan border, and translucent background
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*width:\s*auto/);
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*display:\s*inline-flex/);
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*border-radius:\s*8px/);
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*border:\s*1px solid rgba\(125,211,252,0\.18\)/);
+    expect(cssContent).toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*background:\s*rgba\(15,23,42,0\.72\)/);
+    expect(cssContent).not.toMatch(/\.qp-pill\.qp-alias-item\s*\{[^}]*(?<![a-z-])width:\s*100%/);
+
+    // Mobile media query must cap text width at min(180px, calc(100vw - 110px)) to prevent 390px expansion
+    expect(cssContent).toMatch(/@media\s*\(max-width:\s*640px\)[\s\S]*?\.qp-pill\.qp-alias-item\s+\.qp-pill-text\s*\{[^}]*max-width:\s*min\(180px,\s*calc\(100vw\s*-\s*110px\)\)/);
+
+    // Quick tab .qp-pill-custom preserves default 999px pill border-radius
+    expect(cssContent).toMatch(/\.qp-pill-custom\s*\{[^}]*border-radius:\s*999px/);
 
     // Obsolete full-width card meta/tag selectors must be removed
     expect(cssContent).not.toContain('.qp-alias-item-meta');
     expect(cssContent).not.toContain('.qp-alias-tag');
+  });
+
+  it('renders a 20-character maximum-length alias name with compact structure and actions intact', async () => {
+    const longName = 'abcdefghijklmnopqrst'; // exactly 20 chars (max length allowed by ALIAS_NAME_PATTERN)
+    store = [{ name: longName, value: 'val', description: 'desc', tags: [], createdAt: '', updatedAt: '', source: 'web' }];
+    render(<QuickInputPanel {...baseProps()} />);
+    fireEvent.click(aliasTabButton());
+    await waitFor(() => expect(root().textContent).toContain(longName));
+
+    const pill = root().querySelector('.qp-pill.qp-alias-item') as HTMLElement;
+    expect(pill).not.toBeNull();
+    const textSpan = pill.querySelector('.qp-pill-text') as HTMLElement;
+    expect(textSpan.textContent).toBe(longName);
+
+    const actions = pill.querySelector('.qp-alias-item-actions') as HTMLElement;
+    expect(actions).not.toBeNull();
+    expect(actions.querySelector('.qp-pill-edit')).not.toBeNull();
+    expect(actions.querySelector('.qp-pill-del')).not.toBeNull();
   });
 });

@@ -4845,7 +4845,7 @@ html.native-ios-mac .chat-dl-btn {
   gap: 6px;
   padding: 8px 10px 10px;
 }
-.qp-alias-item {
+.qp-pill.qp-alias-item {
   width: auto;
   max-width: 100%;
   box-sizing: border-box;
@@ -4860,12 +4860,12 @@ html.native-ios-mac .chat-dl-btn {
   line-height: 1.2;
   transition: border-color 0.14s, background 0.14s, box-shadow 0.14s;
 }
-.qp-alias-item:hover {
+.qp-pill.qp-alias-item:hover {
   border-color: rgba(56,189,248,0.48);
   background: rgba(23,36,58,0.88);
   box-shadow: 0 2px 10px rgba(0,0,0,0.28), 0 0 10px rgba(34,211,238,0.12);
 }
-.qp-alias-item .qp-pill-text {
+.qp-pill.qp-alias-item .qp-pill-text {
   flex: 0 1 auto;
   min-width: 0;
   max-width: 180px;
@@ -4882,18 +4882,18 @@ html.native-ios-mac .chat-dl-btn {
   cursor: pointer;
   transition: color 0.12s, background 0.12s;
 }
-.qp-alias-item .qp-pill-text::before {
+.qp-pill.qp-alias-item .qp-pill-text::before {
   content: ';;';
   color: #38bdf8;
   opacity: 0.78;
   margin-right: 2px;
   font-weight: 500;
 }
-.qp-alias-item .qp-pill-text:hover {
+.qp-pill.qp-alias-item .qp-pill-text:hover {
   color: #38bdf8;
   background: rgba(56,189,248,0.12);
 }
-.qp-alias-item-actions {
+.qp-pill.qp-alias-item .qp-alias-item-actions {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
@@ -4901,8 +4901,8 @@ html.native-ios-mac .chat-dl-btn {
   border-left: 1px solid rgba(148,163,184,0.14);
   padding: 1px 3px 1px 2px;
 }
-.qp-alias-item .qp-pill-edit,
-.qp-alias-item .qp-pill-del {
+.qp-pill.qp-alias-item .qp-pill-edit,
+.qp-pill.qp-alias-item .qp-pill-del {
   padding: 3px 5px;
   border: none;
   background: none;
@@ -4913,11 +4913,11 @@ html.native-ios-mac .chat-dl-btn {
   cursor: pointer;
   transition: color 0.12s, background 0.12s;
 }
-.qp-alias-item .qp-pill-edit:hover {
+.qp-pill.qp-alias-item .qp-pill-edit:hover {
   background: rgba(59,130,246,0.18);
   color: #93c5fd;
 }
-.qp-alias-item .qp-pill-del:hover {
+.qp-pill.qp-alias-item .qp-pill-del:hover {
   background: rgba(239,68,68,0.18);
   color: #fca5a5;
 }
@@ -4932,8 +4932,8 @@ html.native-ios-mac .chat-dl-btn {
     padding: 6px 8px 8px;
     gap: 5px;
   }
-  .qp-alias-item .qp-pill-text {
-    max-width: calc(100vw - 110px);
+  .qp-pill.qp-alias-item .qp-pill-text {
+    max-width: min(180px, calc(100vw - 110px));
   }
 }
 .qp-list { flex: 1 1 auto; min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: rgba(100,116,139,0.5) transparent; }
