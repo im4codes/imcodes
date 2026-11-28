@@ -1,5 +1,5 @@
 import { join, resolve } from 'node:path';
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -335,7 +335,7 @@ describe('computer use runner open-computer-use CLI', () => {
         moduleFilePath: join(root, 'missing', 'computer-use-runner.js'),
         entryFilePath: join(root, 'missing', 'imcodes'),
         cwd: root,
-        fileExists: async () => true,
+        fileExists: async (candidate: string) => candidate.startsWith(root) && existsSync(candidate),
       };
 
       // Direct Contents/Helpers/* overrides are rejected on both Darwin 21 and Darwin 23
