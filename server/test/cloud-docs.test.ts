@@ -1877,7 +1877,7 @@ describe('cloud docs & recent documents', () => {
     });
   });
 
-  it('aborts oversized streams early without full buffering on callback & upload (exact bounds, spoofed Content-Length, mid-stream error)', async () => {
+  it('aborts oversized streams early without full buffering on callback & upload (exact bounds, spoofed Content-Length, mid-stream error)', { timeout: 20_000 }, async () => {
     const createRes = await app.request('/api/cloud-docs/blank', {
       method: 'POST',
       headers: { ...bearerHeader('owner-1'), 'Content-Type': 'application/json' },

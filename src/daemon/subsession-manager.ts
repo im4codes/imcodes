@@ -321,9 +321,6 @@ export async function startSubSession(sub: SubSessionRecord): Promise<void> {
     knownOpenCodeSessionIds = (await listOpenCodeSessions(sub.cwd, 50)).map((session) => session.id);
   }
   const launchStart = Date.now();
-  const launchCmd = useResume
-    ? (driver.buildResumeCommand(sessionName, launchOpts) ?? driver.buildLaunchCommand(sessionName, launchOpts))
-    : driver.buildLaunchCommand(sessionName, launchOpts);
 
   // Resolve CC env preset if specified
   const resourceSessionInstanceId = storedBeforeLaunch?.sessionInstanceId ?? randomUUID();

@@ -1088,9 +1088,8 @@ export class HermesAcpProvider extends KimiSdkProvider {
     if ((connection as unknown as Record<symbol, unknown>)[HERMES_WRAPPED_CONNECTION]) {
       return connection;
     }
-    const provider = this;
     return new Proxy(connection, {
-      get(target, prop) {
+      get: (target, prop) => {
         if (prop === HERMES_WRAPPED_CONNECTION) return true;
         const value = Reflect.get(target, prop, target);
         if ((prop === 'newSession' || prop === 'loadSession' || prop === 'resumeSession') && typeof value === 'function') {
@@ -1103,11 +1102,11 @@ export class HermesAcpProvider extends KimiSdkProvider {
                 ? result.sessionId
                 : (typeof params?.sessionId === 'string' ? params.sessionId : undefined);
               if (acpSid) {
-                provider.startupModelFailures.delete(acpSid);
-                if (typeof target.unstable_setSessionModel !== 'function' && provider.isPresetAcpSession(acpSid)) {
+                this.startupModelFailures.delete(acpSid);
+                if (typeof target.unstable_setSessionModel !== 'function' && this.isPresetAcpSession(acpSid)) {
                   const modelsObj = result?.models as { currentModelId?: unknown } | null | undefined;
                   if (typeof modelsObj?.currentModelId === 'string' && modelsObj.currentModelId) {
-                    provider.emitConfirmedModelInfo(acpSid, modelsObj.currentModelId);
+                    this.emitConfirmedModelInfo(acpSid, modelsObj.currentModelId);
                   }
                 }
               }
@@ -1119,19 +1118,19 @@ export class HermesAcpProvider extends KimiSdkProvider {
           return async (params: Parameters<AcpClientConnection['prompt']>[0]) => {
             const acpSid = params?.sessionId;
             let effectiveParams = params;
-            if (acpSid && provider.isPresetAcpSession(acpSid)) {
-              const inFlight = provider.pendingModelSwitches.get(acpSid);
+            if (acpSid && this.isPresetAcpSession(acpSid)) {
+              const inFlight = this.pendingModelSwitches.get(acpSid);
               if (inFlight) {
                 await inFlight.catch(() => {});
               }
-              const failure = provider.startupModelFailures.get(acpSid);
-              const targetModel = provider.getSessionModelForAcpSession(acpSid);
+              const failure = this.startupModelFailures.get(acpSid);
+              const targetModel = this.getSessionModelForAcpSession(acpSid);
               if (failure && (!targetModel || targetModel === failure.modelId)) {
                 throw failure.error;
               }
-              const routeId = provider.findRouteIdForAcpSession(acpSid);
-              const awaiter = routeId ? provider.routeConfirmAwaiters.get(routeId) : undefined;
-              const turnPayload = routeId ? provider.activeTurnPayloads.get(routeId) : undefined;
+              const routeId = this.findRouteIdForAcpSession(acpSid);
+              const awaiter = routeId ? this.routeConfirmAwaiters.get(routeId) : undefined;
+              const turnPayload = routeId ? this.activeTurnPayloads.get(routeId) : undefined;
               if (awaiter) {
                 const committedSystemPrompt = await awaiter();
                 const rebuilder = turnPayload ? getTurnPayloadSystemPromptRebuilder(turnPayload) : undefined;
@@ -1155,7 +1154,7 @@ export class HermesAcpProvider extends KimiSdkProvider {
               }
             }
             const result = await Promise.resolve((value as AcpClientConnection['prompt']).call(target, effectiveParams));
-            provider.capturePromptResponseUsage(acpSid, result);
+            this.capturePromptResponseUsage(acpSid, result);
             return result;
           };
         }
@@ -1167,37 +1166,37 @@ export class HermesAcpProvider extends KimiSdkProvider {
             const acpSid = params?.sessionId;
             const modelId = params?.modelId;
             if (!acpSid) return rawPromise;
-            const isPreset = provider.isPresetAcpSession(acpSid);
+            const isPreset = this.isPresetAcpSession(acpSid);
             if (!isPreset) {
               // Default Hermes uses best-effort setSessionAgentId: never block or fail sends.
               return rawPromise;
             }
-            const isExplicitLiveSwitch = (provider.liveSwitchAcpCounts.get(acpSid) ?? 0) > 0;
+            const isExplicitLiveSwitch = (this.liveSwitchAcpCounts.get(acpSid) ?? 0) > 0;
             const tracked = rawPromise.then(
               async () => {
-                provider.startupModelFailures.delete(acpSid);
+                this.startupModelFailures.delete(acpSid);
                 if (!isExplicitLiveSwitch && typeof modelId === 'string' && modelId) {
-                  provider.emitConfirmedModelInfo(acpSid, modelId);
-                  const routeId = provider.findRouteIdForAcpSession(acpSid);
-                  const awaiter = routeId ? provider.routeConfirmAwaiters.get(routeId) : undefined;
+                  this.emitConfirmedModelInfo(acpSid, modelId);
+                  const routeId = this.findRouteIdForAcpSession(acpSid);
+                  const awaiter = routeId ? this.routeConfirmAwaiters.get(routeId) : undefined;
                   if (awaiter) await awaiter();
                 }
               },
               (err: unknown) => {
                 if (!isExplicitLiveSwitch && typeof modelId === 'string' && modelId) {
-                  provider.startupModelFailures.set(acpSid, {
+                  this.startupModelFailures.set(acpSid, {
                     modelId,
-                    error: provider.toModelProviderError(err),
+                    error: this.toModelProviderError(err),
                   });
                 }
                 throw err;
               },
             ).finally(() => {
-              if (provider.pendingModelSwitches.get(acpSid) === tracked) {
-                provider.pendingModelSwitches.delete(acpSid);
+              if (this.pendingModelSwitches.get(acpSid) === tracked) {
+                this.pendingModelSwitches.delete(acpSid);
               }
             });
-            provider.pendingModelSwitches.set(acpSid, tracked);
+            this.pendingModelSwitches.set(acpSid, tracked);
             return tracked;
           };
         }

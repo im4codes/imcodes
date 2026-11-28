@@ -3469,16 +3469,25 @@ chmod 755 "$home_arg/.codex/bin/codex" "$home_arg/.local/bin/claude"
     expect(traceText).not.toContain('--skip-agy');
     expect(traceText).not.toContain('--skip-opencode');
 
-    // 2. Hook mode runs slow OpenCode hook concurrently with fast default-CLIs hook (default finishes BEFORE slow opencode sleeps out)
+    // 2. Hook mode runs slow OpenCode hook concurrently with fast default-CLIs hook (gate ensures deterministic ordering without fragile sleep race)
     const isoConc = join(root, 'iso-conc');
     const homeConc = join(root, 'home-conc');
     mkdirSync(join(isoConc, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
     execFileSync('cp', ['-R', `${rtDir}/.`, join(isoConc, 'daemon-runtime', 'releases', '0.9.5')]);
     const orderFile = join(root, 'hook-order.log');
+    const defaultReadyFlag = join(root, 'default-done.flag');
     const slowOcHook = join(root, 'slow-oc-hook.sh');
     const fastDefaultHook = join(root, 'fast-default-hook.sh');
-    writeFileSync(slowOcHook, `#!/bin/sh\nsleep 0.4\necho "OC_DONE" >> "${orderFile}"\n`, { mode: 0o755 });
-    writeFileSync(fastDefaultHook, `#!/bin/sh\necho "DEFAULT_DONE" >> "${orderFile}"\n`, { mode: 0o755 });
+    writeFileSync(
+      slowOcHook,
+      `#!/bin/sh\ni=0\nwhile [ ! -f "${defaultReadyFlag}" ] && [ "$i" -lt 100 ]; do\n  sleep 0.05\n  i=$((i + 1))\ndone\necho "OC_DONE" >> "${orderFile}"\n`,
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      fastDefaultHook,
+      `#!/bin/sh\necho "DEFAULT_DONE" >> "${orderFile}"\ntouch "${defaultReadyFlag}"\n`,
+      { mode: 0o755 },
+    );
 
     const resConc = execFileSync(
       runnerPath,

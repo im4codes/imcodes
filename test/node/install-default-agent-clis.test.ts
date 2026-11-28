@@ -1454,7 +1454,7 @@ describe('install-default-agent-clis', () => {
     const claudeTgz = buildTarGz([{ name: 'package/claude', content: 'claude-bin', mode: 0o755 }]);
     const agyBin = Buffer.from('agy-bin');
 
-    const ocPkg = resolveOpenCodePlatformPackage('linux', 'x64', false)!;
+    const ocPkg = resolveOpenCodePlatformPackage({ platform: 'linux', arch: 'x64', isMusl: false })!;
     const srv = await startMockServer((req, res) => {
       res.setHeader('connection', 'close');
       if (req.url === `/${encodeURIComponent(ocPkg)}/latest`) {
