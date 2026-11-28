@@ -2323,6 +2323,146 @@ describe('KimiV2Provider', () => {
     }
   });
 
+  it('retains pending teardown when strictResume fails during an active concurrent query and cleans up after query finishes, while preserving already-bound routes', async () => {
+    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-conc-query-')));
+    const baseShareDir = path.join(tmpDir, 'base-share');
+    mkdirSync(baseShareDir, { recursive: true });
+    const origShareEnv = process.env.KIMI_SHARE_DIR;
+    process.env.KIMI_SHARE_DIR = baseShareDir;
+
+    const llm: KimiLlmConfig = {
+      provider: 'glm5.3',
+      providerType: 'anthropic',
+      baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+      apiKey: 'secret-concurrent-query-key',
+      model: 'glm-5.3-flash',
+      contextWindow: 1_000_000,
+      models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+    };
+
+    try {
+      const { existsSync } = await import('node:fs');
+
+      // Case 1: hanging listSessions on preset route + strictResume failure -> second transient listSessions -> queries finish cleanly -> teardown runs
+      let resolvePendingList!: (val: { sessions: Array<{ sessionId: string; cwd: string; title: string }> }) => void;
+      const pendingListPromise = new Promise<{ sessions: Array<{ sessionId: string; cwd: string; title: string }> }>((resolve) => {
+        resolvePendingList = resolve;
+      });
+      const conn1 = makeMockConn({
+        listSessions: vi.fn()
+          .mockImplementationOnce(() => pendingListPromise)
+          .mockImplementationOnce(async () => ({
+            sessions: [{ sessionId: 'remote-2', cwd: tmpDir, title: 'Second query' }],
+          })),
+        resumeSession: vi.fn(async () => {
+          throw new RequestError(-32002, 'Session not found');
+        }),
+        loadSession: vi.fn(async () => {
+          throw new RequestError(-32002, 'Session not found');
+        }),
+        newSession: vi.fn(async () => ({ sessionId: 'should-not-create' })),
+      });
+      // Control connection (route has an already-bound live session + hanging listSessions + strictResume fail)
+      let resolveControlList!: (val: { sessions: Array<{ sessionId: string; cwd: string }> }) => void;
+      const controlListPromise = new Promise<{ sessions: Array<{ sessionId: string; cwd: string }> }>((resolve) => {
+        resolveControlList = resolve;
+      });
+      const conn2 = makeMockConn({
+        newSession: vi.fn(async () => ({ sessionId: 'bound-alive-id' })),
+        listSessions: vi.fn(() => controlListPromise),
+        resumeSession: vi.fn(async () => {
+          throw new RequestError(-32002, 'Session not found');
+        }),
+        loadSession: vi.fn(async () => {
+          throw new RequestError(-32002, 'Session not found');
+        }),
+      });
+      state.connQueue.push(conn1, conn2);
+
+      const provider1 = new KimiV2Provider();
+      await provider1.connect({ kimiLlm: llm });
+
+      const listPromise1 = provider1.listSessions({ directory: tmpDir });
+      await vi.waitFor(() => expect(conn1.listSessions).toHaveBeenCalledTimes(1));
+
+      const spawnEnv1 = (mockSpawn.mock.calls.at(-1)![2] as { env: NodeJS.ProcessEnv }).env;
+      const presetShareDir1 = spawnEnv1.KIMI_SHARE_DIR!;
+      expect(presetShareDir1).not.toBe(baseShareDir);
+      expect(existsSync(path.join(presetShareDir1, 'config.toml'))).toBe(true);
+
+      // strictResume fails while listSessions is concurrently holding inFlightOps on the same preset route
+      await expect(provider1.createSession({
+        sessionKey: 'sess-fail-concurrent',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        resumeId: 'missing-concurrent-1',
+        strictResume: true,
+        kimiLlm: llm,
+      })).rejects.toThrow();
+
+      // Pending query must NOT be aborted mid-flight; private share dir stays until query releases
+      expect(mockKillProcessTree).not.toHaveBeenCalled();
+      expect(existsSync(presetShareDir1)).toBe(true);
+
+      // A second transient query acquiring the route must NOT wipe out pending teardown
+      const secondListResult = await provider1.listSessions({ directory: tmpDir });
+      expect(secondListResult).toEqual([{ key: 'remote-2', displayName: 'Second query', directory: tmpDir }]);
+      expect(mockKillProcessTree).not.toHaveBeenCalled();
+      expect(existsSync(presetShareDir1)).toBe(true);
+
+      // Resolving the hanging query completes normally and triggers idle teardown of child & secret share dir
+      resolvePendingList({
+        sessions: [{ sessionId: 'remote-1', cwd: tmpDir, title: 'Hanging query' }],
+      });
+      const firstListResult = await listPromise1;
+      expect(firstListResult).toEqual([{ key: 'remote-1', displayName: 'Hanging query', directory: tmpDir }]);
+      expect(mockKillProcessTree).toHaveBeenCalledTimes(1);
+      expect(existsSync(presetShareDir1)).toBe(false);
+      expect(provider1.getSessionDiagnostics('sess-fail-concurrent')).toBeNull();
+
+      // Case 2 (control): already-bound live session + hanging listSessions + strictResume failure -> session & share dir stay intact
+      mockKillProcessTree.mockClear();
+      const provider2 = new KimiV2Provider();
+      await provider2.connect({ kimiLlm: llm });
+      await provider2.createSession({
+        sessionKey: 'sess-bound-control',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: llm,
+      });
+      const controlShareDir = (mockSpawn.mock.calls.at(-1)![2] as { env: NodeJS.ProcessEnv }).env.KIMI_SHARE_DIR!;
+      const controlList = provider2.listSessions({ directory: tmpDir });
+      await vi.waitFor(() => expect(conn2.listSessions).toHaveBeenCalledTimes(1));
+
+      await expect(provider2.createSession({
+        sessionKey: 'sess-fail-control',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        resumeId: 'missing-concurrent-2',
+        strictResume: true,
+        kimiLlm: llm,
+      })).rejects.toThrow();
+
+      resolveControlList({ sessions: [{ sessionId: 'bound-alive-id', cwd: tmpDir }] });
+      expect(await controlList).toEqual([{ key: 'bound-alive-id', directory: tmpDir }]);
+      expect(mockKillProcessTree).not.toHaveBeenCalled();
+      expect(existsSync(controlShareDir)).toBe(true);
+      expect(provider2.getSessionDiagnostics('sess-bound-control')?.connected).toBe(true);
+      expect(provider2.getSessionDiagnostics('sess-fail-control')).toBeNull();
+
+      await provider1.disconnect();
+      await provider2.disconnect();
+      expect(existsSync(controlShareDir)).toBe(false);
+    } finally {
+      if (origShareEnv !== undefined) {
+        process.env.KIMI_SHARE_DIR = origShareEnv;
+      } else {
+        delete process.env.KIMI_SHARE_DIR;
+      }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps base kimi.json read-only, uses isolated metadata view for default resume, and fails closed on corrupt metadata', async () => {
     const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-wd-view-')));
     const projCwd = path.join(tmpDir, 'never-seen-cwd');

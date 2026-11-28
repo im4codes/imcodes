@@ -854,11 +854,19 @@ export class KimiV2Provider implements TransportProvider {
 
   private acquireConnectionUse(entry: KimiConnectionEntry): void {
     entry.inFlightOps++;
-    entry.teardownWhenIdle = false;
   }
 
-  private async releaseConnectionUse(entry: KimiConnectionEntry): Promise<void> {
-    entry.inFlightOps = Math.max(0, entry.inFlightOps - 1);
+  private scheduleTeardownIfUnbound(entry: KimiConnectionEntry): void {
+    if (
+      this.connections.get(entry.routeKey) === entry
+      && this.countSessionsOnEntry(entry.routeKey) === 0
+      && !this.hasActiveTurnsOnEntry(entry.routeKey, entry.generation)
+    ) {
+      entry.teardownWhenIdle = true;
+    }
+  }
+
+  private async flushIdleTeardownIfReady(entry: KimiConnectionEntry): Promise<void> {
     if (
       entry.inFlightOps === 0
       && entry.teardownWhenIdle
@@ -870,6 +878,11 @@ export class KimiV2Provider implements TransportProvider {
       entry.teardownWhenIdle = false;
       await this.teardownConnectionEntry(entry);
     }
+  }
+
+  private async releaseConnectionUse(entry: KimiConnectionEntry): Promise<void> {
+    entry.inFlightOps = Math.max(0, entry.inFlightOps - 1);
+    await this.flushIdleTeardownIfReady(entry);
   }
 
   async disconnect(): Promise<void> {
@@ -1371,6 +1384,9 @@ export class KimiV2Provider implements TransportProvider {
     } finally {
       if (entry.connectingPromise === connectPromise) {
         entry.connectingPromise = null;
+        if (entry.teardownWhenIdle) {
+          await this.flushIdleTeardownIfReady(entry);
+        }
       }
     }
   }
@@ -1709,6 +1725,7 @@ export class KimiV2Provider implements TransportProvider {
       assertOwned();
       state.boundEnvKey = entry.routeKey;
       state.boundConnectionGeneration = targetConnGen;
+      entry.teardownWhenIdle = false;
       if (state.compactionTrackerGeneration !== targetConnGen) {
         this.resetSessionCompactionTracking(state, targetConnGen);
       }
@@ -1747,6 +1764,9 @@ export class KimiV2Provider implements TransportProvider {
       } catch (err) {
         throw this.normalizeProviderException(err, entry);
       }
+    }
+    if (state.boundEnvKey === entry.routeKey && state.boundConnectionGeneration === targetConnGen) {
+      entry.teardownWhenIdle = false;
     }
   }
 
@@ -1847,12 +1867,9 @@ export class KimiV2Provider implements TransportProvider {
     this.acquireConnectionUse(entry);
     try {
       await this.ensureSessionReady(state, entry, connection, { allowFresh: !config.strictResume });
-      if (previousEntry && previousEntry !== entry && this.countSessionsOnEntry(previousEntry.routeKey) === 0 && previousEntry.activePresetShareDir) {
-        if (previousEntry.inFlightOps === 0) {
-          await this.teardownConnectionEntry(previousEntry);
-        } else {
-          previousEntry.teardownWhenIdle = true;
-        }
+      if (previousEntry && previousEntry !== entry && previousEntry.activePresetShareDir) {
+        this.scheduleTeardownIfUnbound(previousEntry);
+        await this.flushIdleTeardownIfReady(previousEntry);
       }
     } catch (err) {
       if (!prior) {
@@ -1869,13 +1886,8 @@ export class KimiV2Provider implements TransportProvider {
           this.acpToRoute.set(previousBoundAcpId, routeId);
         }
       }
-      if (
-        (entry.activePresetShareDir !== null || Boolean(config.strictResume))
-        && this.countSessionsOnEntry(entry.routeKey) === 0
-        && entry.inFlightOps <= 1
-        && !this.hasActiveTurnsOnEntry(entry.routeKey, entry.generation)
-      ) {
-        entry.teardownWhenIdle = true;
+      if (entry.activePresetShareDir !== null || Boolean(config.strictResume)) {
+        this.scheduleTeardownIfUnbound(entry);
       }
       throw err;
     } finally {
@@ -1902,6 +1914,11 @@ export class KimiV2Provider implements TransportProvider {
       try {
         await this.ensureSessionReady(state, entry, connection, { allowFresh: false });
         return true;
+      } catch (innerErr) {
+        if (entry.activePresetShareDir !== null) {
+          this.scheduleTeardownIfUnbound(entry);
+        }
+        throw innerErr;
       } finally {
         await this.releaseConnectionUse(entry);
       }
@@ -1990,12 +2007,9 @@ export class KimiV2Provider implements TransportProvider {
     }
     this.resetSessionCompactionTracking(state);
     this.clearStatus(state.sessionKey, state);
-    if (entry && entry.activePresetShareDir && this.countSessionsOnEntry(entry.routeKey) === 0) {
-      if (entry.inFlightOps === 0) {
-        await this.teardownConnectionEntry(entry);
-      } else {
-        entry.teardownWhenIdle = true;
-      }
+    if (entry && entry.activePresetShareDir) {
+      this.scheduleTeardownIfUnbound(entry);
+      await this.flushIdleTeardownIfReady(entry);
     }
   }
 
@@ -2020,12 +2034,9 @@ export class KimiV2Provider implements TransportProvider {
       ).catch(() => {});
     }
 
-    if (entry && this.countSessionsOnEntry(entry.routeKey) === 0) {
-      if (entry.inFlightOps === 0) {
-        await this.teardownConnectionEntry(entry);
-      } else {
-        entry.teardownWhenIdle = true;
-      }
+    if (entry) {
+      this.scheduleTeardownIfUnbound(entry);
+      await this.flushIdleTeardownIfReady(entry);
     }
   }
 
@@ -2108,8 +2119,8 @@ export class KimiV2Provider implements TransportProvider {
         modelCatalogSource: 'live',
       };
     } catch (err) {
-      if (entry && this.countSessionsOnEntry(entry.routeKey) === 0 && (!acquired || entry.inFlightOps <= 1)) {
-        entry.teardownWhenIdle = true;
+      if (entry) {
+        this.scheduleTeardownIfUnbound(entry);
       }
       const normalized = this.normalizeProviderException(err, entry);
       return {
@@ -2120,8 +2131,8 @@ export class KimiV2Provider implements TransportProvider {
     } finally {
       if (entry && acquired) {
         await this.releaseConnectionUse(entry);
-      } else if (entry && entry.teardownWhenIdle && entry.inFlightOps === 0 && this.countSessionsOnEntry(entry.routeKey) === 0) {
-        await this.teardownConnectionEntry(entry);
+      } else if (entry) {
+        await this.flushIdleTeardownIfReady(entry);
       }
     }
   }
