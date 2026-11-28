@@ -790,6 +790,8 @@ describe('probeExecutionPoolSdks', () => {
     const dir = makeTmpDir();
     const knowledgeFile = join(dir, 'model-tier-knowledge.json');
     const lockDbPath = `${knowledgeFile}.lock.db`;
+    const moduleUrl = pathToFileURL(resolve(process.cwd(), 'src/daemon/model-tier-knowledge.ts')).href;
+    const tsxLoader = pathToFileURL(resolve(process.cwd(), 'node_modules/tsx/dist/loader.mjs')).href;
     const require = createRequire(import.meta.url);
     const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
@@ -798,24 +800,33 @@ describe('probeExecutionPoolSdks', () => {
     initDb.exec('CREATE TABLE IF NOT EXISTS _k (id INTEGER PRIMARY KEY);');
     initDb.close();
 
-    const spawnSharedReader = (holdMs: number) => {
+    // Parent-controlled SHARED read-lock holder: holds until stdin receives RELEASE\n (no fixed ms window).
+    const spawnSharedReader = () => {
       const readerScript = [
         `import { createRequire } from 'node:module';`,
+        `import { createInterface } from 'node:readline';`,
         `const require = createRequire(import.meta.url);`,
         `const { DatabaseSync } = require('node:sqlite');`,
         `const db = new DatabaseSync(${JSON.stringify(lockDbPath)});`,
         `db.exec('BEGIN DEFERRED; SELECT count(*) FROM _k;');`,
         `process.stdout.write('SHARED_LOCKED\\n');`,
-        `await new Promise((r) => setTimeout(r, ${holdMs}));`,
+        `const rl = createInterface({ input: process.stdin });`,
+        `await new Promise((resolve) => {`,
+        `  rl.on('line', (line) => { if (line.trim() === 'RELEASE') resolve(); });`,
+        `  rl.on('close', resolve);`,
+        `});`,
+        `rl.close();`,
         `db.exec('COMMIT;');`,
         `db.close();`,
       ].join('\n');
       const child = spawn(process.execPath, ['--input-type=module', '-e', readerScript], {
         cwd: process.cwd(),
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
+      let stderr = '';
+      child.stderr.on('data', (c) => { stderr += String(c); });
       const exitPromise = new Promise<void>((resolveExit, rejectExit) => {
-        child.on('exit', (code) => (code === 0 ? resolveExit() : rejectExit(new Error(`shared reader exited ${code}`))));
+        child.on('exit', (code) => (code === 0 ? resolveExit() : rejectExit(new Error(`shared reader exited ${code}: ${stderr}`))));
       });
       const readyPromise = new Promise<void>((resolveReady, rejectReady) => {
         child.stdout.on('data', (chunk) => {
@@ -823,62 +834,178 @@ describe('probeExecutionPoolSdks', () => {
         });
         child.on('error', rejectReady);
       });
-      return { readyPromise, exitPromise };
+      const release = async () => {
+        if (!child.killed && child.exitCode === null) {
+          child.stdin.write('RELEASE\n');
+          child.stdin.end();
+        }
+        await exitPromise;
+      };
+      return { readyPromise, release };
     };
 
-    // 1. Async COMMIT timeout boundary: SHARED lock outlives lockTimeoutMs=5 (released at 20ms) -> MUST fail commit within deadline, never sleep past and succeed.
-    const asyncTimeoutReader = spawnSharedReader(20);
-    await asyncTimeoutReader.readyPromise;
-    await expect(upsertModelTierKnowledge(
-      [{ provider: 'codex-sdk', model: 'gpt-commit-timeout-async', tier: 'secondary' }],
-      knowledgeFile,
-      1_000,
-      { lockTimeoutMs: 5 },
-    )).rejects.toThrow(/Timed out committing model-tier-knowledge lock/);
-    await asyncTimeoutReader.exitPromise;
+    // 1. Async & sync first-COMMIT deadline check when callback work overruns the shared lock deadline:
+    // COMMIT must not execute past deadline, ROLLBACK + close must run, and subsequent writes recover.
+    for (const mode of ['async', 'sync'] as const) {
+      const origExec = DatabaseSync.prototype.exec;
+      let afterBegin = false;
+      const executedSql: string[] = [];
+      const execSpy = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+        executedSql.push(sql);
+        const res = origExec.call(this, sql);
+        if (sql === 'BEGIN IMMEDIATE;') afterBegin = true;
+        return res;
+      });
+      const baseNow = 1_000_000;
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => (afterBegin ? baseNow + 30 : baseNow));
+      try {
+        if (mode === 'async') {
+          await expect(upsertModelTierKnowledge(
+            [{ provider: 'codex-sdk', model: 'gpt-first-commit-expired-async', tier: 'secondary' }],
+            knowledgeFile,
+            1_000,
+            { lockTimeoutMs: 5 },
+          )).rejects.toThrow(/Timed out committing model-tier-knowledge lock/);
+        } else {
+          expect(() => upsertModelTierKnowledgeSync(
+            [{ provider: 'codex-sdk', model: 'gpt-first-commit-expired-sync', tier: 'secondary' }],
+            knowledgeFile,
+            1_000,
+            { lockTimeoutMs: 5 },
+          )).toThrow(/Timed out committing model-tier-knowledge lock/);
+        }
+        expect(executedSql.filter((s) => s === 'BEGIN IMMEDIATE;')).toHaveLength(1);
+        expect(executedSql).not.toContain('COMMIT;');
+        expect(executedSql).toContain('ROLLBACK;');
+      } finally {
+        nowSpy.mockRestore();
+        execSpy.mockRestore();
+      }
+    }
 
-    // Next async write after reader releases succeeds cleanly.
+    // 2. Async COMMIT timeout under parent-controlled SHARED lock (released only in finally after rejection).
+    const asyncTimeoutReader = spawnSharedReader();
+    await asyncTimeoutReader.readyPromise;
+    try {
+      await expect(upsertModelTierKnowledge(
+        [{ provider: 'codex-sdk', model: 'gpt-commit-timeout-async', tier: 'secondary' }],
+        knowledgeFile,
+        2_000,
+        { lockTimeoutMs: 15 },
+      )).rejects.toThrow(/Timed out committing model-tier-knowledge lock/);
+    } finally {
+      await asyncTimeoutReader.release();
+    }
+
     await upsertModelTierKnowledge(
       [{ provider: 'codex-sdk', model: 'gpt-after-async-commit-timeout', tier: 'secondary' }],
       knowledgeFile,
-      2_000,
+      2_500,
     );
 
-    // 2. Async COMMIT before-deadline recovery: SHARED lock releases before lockTimeoutMs=500 -> retries and resolves cleanly.
-    const asyncSuccessReader = spawnSharedReader(25);
+    // 3. Async COMMIT recovery: hold SHARED until writer confirms real COMMIT SQLITE_BUSY, then release.
+    const asyncSuccessReader = spawnSharedReader();
     await asyncSuccessReader.readyPromise;
-    await upsertModelTierKnowledge(
-      [{ provider: 'claude-code-sdk', model: 'claude-commit-recovered-async', tier: 'flagship' }],
-      knowledgeFile,
-      3_000,
-      { lockTimeoutMs: 500 },
-    );
-    await asyncSuccessReader.exitPromise;
+    {
+      const origExec = DatabaseSync.prototype.exec;
+      let resolveCommitBusy!: () => void;
+      const commitBusyObserved = new Promise<void>((r) => { resolveCommitBusy = r; });
+      let beginCount = 0;
+      let commitAttempts = 0;
+      const execSpy = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+        if (sql === 'BEGIN IMMEDIATE;') beginCount += 1;
+        if (sql === 'COMMIT;') {
+          commitAttempts += 1;
+          try {
+            return origExec.call(this, sql);
+          } catch (err) {
+            resolveCommitBusy();
+            throw err;
+          }
+        }
+        return origExec.call(this, sql);
+      });
+      try {
+        const writePromise = upsertModelTierKnowledge(
+          [{ provider: 'claude-code-sdk', model: 'claude-commit-recovered-async', tier: 'flagship' }],
+          knowledgeFile,
+          3_000,
+          { lockTimeoutMs: 5_000 },
+        );
+        await commitBusyObserved;
+        await asyncSuccessReader.release();
+        await writePromise;
+        expect(beginCount).toBe(1);
+        expect(commitAttempts).toBeGreaterThanOrEqual(2);
+      } finally {
+        execSpy.mockRestore();
+        await asyncSuccessReader.release();
+      }
+    }
 
-    // 3. Sync COMMIT timeout boundary & before-deadline recovery.
-    const syncTimeoutReader = spawnSharedReader(20);
+    // 4. Sync COMMIT timeout under parent-controlled SHARED lock (released only in finally after throw).
+    const syncTimeoutReader = spawnSharedReader();
     await syncTimeoutReader.readyPromise;
-    expect(() => upsertModelTierKnowledgeSync(
-      [{ provider: 'codex-sdk', model: 'gpt-commit-timeout-sync', tier: 'secondary' }],
-      knowledgeFile,
-      4_000,
-      { lockTimeoutMs: 5 },
-    )).toThrow(/Timed out committing model-tier-knowledge lock/);
-    await syncTimeoutReader.exitPromise;
+    try {
+      expect(() => upsertModelTierKnowledgeSync(
+        [{ provider: 'codex-sdk', model: 'gpt-commit-timeout-sync', tier: 'secondary' }],
+        knowledgeFile,
+        4_000,
+        { lockTimeoutMs: 15 },
+      )).toThrow(/Timed out committing model-tier-knowledge lock/);
+    } finally {
+      await syncTimeoutReader.release();
+    }
 
-    const syncSuccessReader = spawnSharedReader(25);
+    // 5. Sync COMMIT recovery: run sync writer in child process so parent observes COMMIT_BUSY and then releases SHARED lock.
+    const syncSuccessReader = spawnSharedReader();
     await syncSuccessReader.readyPromise;
-    upsertModelTierKnowledgeSync(
-      [{ provider: 'codex-sdk', model: 'gpt-commit-recovered-sync', tier: 'secondary' }],
-      knowledgeFile,
-      5_000,
-      { lockTimeoutMs: 500 },
-    );
-    await syncSuccessReader.exitPromise;
+    try {
+      const syncChildScript = [
+        `import { createRequire } from 'node:module';`,
+        `import { upsertModelTierKnowledgeSync } from ${JSON.stringify(moduleUrl)};`,
+        `const require = createRequire(import.meta.url);`,
+        `const { DatabaseSync } = require('node:sqlite');`,
+        `const origExec = DatabaseSync.prototype.exec;`,
+        `let notified = false;`,
+        `DatabaseSync.prototype.exec = function (sql) {`,
+        `  try {`,
+        `    return origExec.call(this, sql);`,
+        `  } catch (err) {`,
+        `    if (sql === 'COMMIT;' && !notified) {`,
+        `      notified = true;`,
+        `      process.stdout.write('COMMIT_BUSY\\n');`,
+        `    }`,
+        `    throw err;`,
+        `  }`,
+        `};`,
+        `upsertModelTierKnowledgeSync([{ provider: 'codex-sdk', model: 'gpt-commit-recovered-sync', tier: 'secondary' }], ${JSON.stringify(knowledgeFile)}, 5_000, { lockTimeoutMs: 5_000 });`,
+      ].join('\n');
+      const syncChild = spawn(process.execPath, ['--import', tsxLoader, '--input-type=module', '-e', syncChildScript], {
+        cwd: process.cwd(),
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let syncStderr = '';
+      syncChild.stderr.on('data', (c) => { syncStderr += String(c); });
+      const commitBusyPromise = new Promise<void>((resolveBusy, rejectBusy) => {
+        syncChild.stdout.on('data', (chunk) => {
+          if (String(chunk).includes('COMMIT_BUSY')) resolveBusy();
+        });
+        syncChild.on('error', rejectBusy);
+      });
+      const syncExitPromise = new Promise<void>((resolveExit, rejectExit) => {
+        syncChild.on('exit', (code) => (code === 0 ? resolveExit() : rejectExit(new Error(`sync recovery child exited ${code}: ${syncStderr}`))));
+      });
+      await commitBusyPromise;
+      await syncSuccessReader.release();
+      await syncExitPromise;
+    } finally {
+      await syncSuccessReader.release();
+    }
 
     const savedModels = loadModelTierKnowledge(knowledgeFile).map((r) => r.model);
     expect(savedModels).toContain('gpt-after-async-commit-timeout');
     expect(savedModels).toContain('claude-commit-recovered-async');
     expect(savedModels).toContain('gpt-commit-recovered-sync');
-  });
+  }, 30_000);
 });

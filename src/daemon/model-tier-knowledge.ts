@@ -140,12 +140,10 @@ function runBusyBoundedSync(
   deadline: number,
   timeoutErrorMessage: string,
 ): void {
-  let attempts = 0;
   while (true) {
-    if (attempts > 0 && Date.now() >= deadline) {
+    if (Date.now() >= deadline) {
       throw new Error(timeoutErrorMessage);
     }
-    attempts += 1;
     try {
       db.exec(sql);
       return;
@@ -156,9 +154,6 @@ function runBusyBoundedSync(
         throw new Error(timeoutErrorMessage);
       }
       sleepSyncMs(Math.min(5, remaining));
-      if (Date.now() >= deadline) {
-        throw new Error(timeoutErrorMessage);
-      }
     }
   }
 }
@@ -169,12 +164,10 @@ async function runBusyBoundedAsync(
   deadline: number,
   timeoutErrorMessage: string,
 ): Promise<void> {
-  let attempts = 0;
   while (true) {
-    if (attempts > 0 && Date.now() >= deadline) {
+    if (Date.now() >= deadline) {
       throw new Error(timeoutErrorMessage);
     }
-    attempts += 1;
     try {
       db.exec(sql);
       return;
@@ -186,9 +179,6 @@ async function runBusyBoundedAsync(
       }
       const jitter = 5 + Math.floor(Math.random() * 11);
       await new Promise((resolve) => setTimeout(resolve, Math.min(jitter, remaining)));
-      if (Date.now() >= deadline) {
-        throw new Error(timeoutErrorMessage);
-      }
     }
   }
 }
