@@ -12,7 +12,7 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
-import { CcPresetManagerDialog } from '../../src/components/CcPresetManager.js';
+import { CcPresetEditorPanel, CcPresetManagerDialog } from '../../src/components/CcPresetManager.js';
 import { CC_PRESET_REQUEST_TIMEOUT_MS, useCcPresets } from '../../src/hooks/useCcPresets.js';
 
 function makeWs(initialConnected = true) {
@@ -379,5 +379,118 @@ describe('CcPresetManagerDialog', () => {
     const immediateSave = ws.send.mock.calls.filter((call: any[]) => call[0]?.type === CC_PRESET_MSG.SAVE).at(-1)![0];
     expect(immediateSave.expectedVersion).toBe('v3');
     expect(immediateSave.presets.map((p: CcPreset) => p.name)).toEqual(['PresetA', 'PresetB', 'PresetC']);
+  });
+
+  it('renders Sci-Fi Tech UI classes, protocol pills, env chips, custom env rows, context badge, and row editing state in standalone mode', async () => {
+    const ws = makeWs(true);
+    const savedPreset: CcPreset = {
+      name: 'DeepSeek-Gateway',
+      authType: 'openai',
+      env: {
+        OPENAI_BASE_URL: 'https://api.deepseek.com/v1',
+        OPENAI_API_KEY: 'sk-ds-1234',
+        OPENAI_MODEL: 'deepseek-chat',
+      },
+      customEnv: [{ key: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', value: '1' }],
+      contextWindow: 200000,
+    };
+
+    const { container } = render(<CcPresetManagerDialog ws={ws} onClose={() => {}} />);
+    const listCall = ws.send.mock.calls.find((call: any[]) => call[0]?.type === CC_PRESET_MSG.LIST)![0];
+
+    act(() => {
+      ws.emit({
+        type: CC_PRESET_MSG.LIST_RESPONSE,
+        requestId: listCall.requestId,
+        presets: [savedPreset],
+        version: 'v1',
+      });
+    });
+
+    await waitFor(() => expect(container.querySelector('[data-cc-preset-row="DeepSeek-Gateway"]')).not.toBeNull());
+
+    expect(container.querySelector('.cc-preset-manager-overlay')).not.toBeNull();
+    expect(container.querySelector('.cc-preset-manager-dialog')).not.toBeNull();
+    expect(container.querySelector('.cc-preset-editor.cc-preset-editor-standalone')).not.toBeNull();
+    expect(container.querySelector('.cc-preset-field-row-2col')).not.toBeNull();
+
+    // Default Anthropic protocol pill is active and shows ANTHROPIC_* env key chips
+    const pills = Array.from(container.querySelectorAll('.cc-preset-protocol-pill'));
+    expect(pills).toHaveLength(2);
+    expect(pills[0].classList.contains('is-active')).toBe(true);
+    expect(pills[1].classList.contains('is-active')).toBe(false);
+    expect(Array.from(container.querySelectorAll('.cc-preset-env-key')).map((el) => el.textContent)).toEqual([
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_MODEL',
+    ]);
+
+    // Switching to OpenAI updates active pill and env key chips
+    fireEvent.click(screen.getByLabelText('ccPreset.protocolOpenAi'));
+    expect(pills[0].classList.contains('is-active')).toBe(false);
+    expect(pills[1].classList.contains('is-active')).toBe(true);
+    expect(Array.from(container.querySelectorAll('.cc-preset-env-key')).map((el) => el.textContent)).toEqual([
+      'OPENAI_BASE_URL',
+      'OPENAI_API_KEY',
+      'OPENAI_MODEL',
+    ]);
+
+    // Context window badge renders formatted size (e.g. 200K)
+    fireEvent.input(screen.getByPlaceholderText('1000000'), { target: { value: '200000' } });
+    expect(container.querySelector('.cc-preset-context-badge')?.textContent).toBe('200K');
+
+    // Add custom env row appends a row with dedicated key/value inputs and remove button
+    const initialEnvRows = container.querySelectorAll('.cc-preset-env-row').length;
+    fireEvent.click(screen.getByRole('button', { name: 'ccPreset.addEnvVar' }));
+    expect(container.querySelectorAll('.cc-preset-env-row')).toHaveLength(initialEnvRows + 1);
+    expect(container.querySelector('.cc-preset-env-key-input')).not.toBeNull();
+    expect(container.querySelector('.cc-preset-env-val-input')).not.toBeNull();
+    expect(container.querySelector('.cc-preset-env-remove-btn')).not.toBeNull();
+
+    // Saved preset row keeps [Edit, Delete, Export] button order and marks row .is-editing when Edit is clicked
+    const row = container.querySelector('[data-cc-preset-row="DeepSeek-Gateway"]')!;
+    expect(row.querySelector('.cc-preset-row-name')?.textContent).toBe('DeepSeek-Gateway');
+    expect(row.querySelector('.cc-preset-row-proto')?.textContent).toBe('OpenAI');
+    expect(row.querySelector('.cc-preset-row-model')?.textContent).toBe('deepseek-chat');
+    const rowButtons = Array.from(row.querySelectorAll('button'));
+    expect(rowButtons.map((b) => b.textContent)).toEqual([
+      'ccPreset.editButton',
+      'ccPreset.deleteButton',
+      'new_session.api_provider_export_json',
+    ]);
+    expect(row.classList.contains('is-editing')).toBe(false);
+    fireEvent.click(rowButtons[0]);
+    expect(row.classList.contains('is-editing')).toBe(true);
+  });
+
+  it('renders embedded compact mode with .is-compact and omits standalone empty box when presets are empty', () => {
+    const { container } = render(
+      <CcPresetEditorPanel
+        compact
+        presets={[]}
+        loaded
+        loading={false}
+        refreshing={false}
+        saving={false}
+        discovering={false}
+        error={null}
+        onClearError={() => {}}
+        onError={() => {}}
+        onSave={async () => true}
+        onDiscoverModels={async () => null}
+      />,
+    );
+
+    const editor = container.querySelector('.cc-preset-editor');
+    expect(editor).not.toBeNull();
+    expect(editor!.classList.contains('is-compact')).toBe(true);
+    expect(editor!.classList.contains('cc-preset-editor-standalone')).toBe(false);
+    expect(container.querySelector('.cc-preset-field-row-2col')).not.toBeNull();
+    expect(container.querySelector('[data-testid="cc-preset-empty"]')).toBeNull();
+    expect(Array.from(container.querySelectorAll('.cc-preset-env-key')).map((el) => el.textContent)).toEqual([
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_MODEL',
+    ]);
   });
 });

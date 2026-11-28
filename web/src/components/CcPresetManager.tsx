@@ -229,57 +229,66 @@ export function CcPresetEditorPanel({
 
   const displayError = formatPresetError(t, error);
   const isOpenAi = draft.authType === 'openai';
-  const inputStyle = compact
-    ? { width: '100%', fontSize: 11 }
-    : {
-        width: '100%',
-        background: '#1e293b',
-        border: '1px solid #334155',
-        color: '#e2e8f0',
-        padding: '5px 8px',
-        borderRadius: 4,
-        fontSize: 12,
-        boxSizing: 'border-box' as const,
-      };
-  const labelStyle = compact
-    ? { fontSize: 9, color: '#64748b', marginBottom: 1 }
-    : { fontSize: 10, color: '#64748b', marginBottom: 2 };
+  const normalizedDraftName = draft.name.trim() ? normalizeCcPresetName(draft.name) : '';
+
+  const textFields = [
+    {
+      key: 'name' as const,
+      label: t('ccPreset.nameLabel'),
+      envKey: '',
+      ph: t('ccPreset.namePlaceholder'),
+      val: draft.name,
+      type: 'text' as const,
+    },
+    {
+      key: 'baseUrl' as const,
+      label: t('ccPreset.baseUrlLabel'),
+      envKey: isOpenAi ? 'OPENAI_BASE_URL' : 'ANTHROPIC_BASE_URL',
+      ph: isOpenAi ? DEFAULT_OPENAI_PRESET_BASE_URL : DEFAULT_CC_PRESET_BASE_URL,
+      val: draft.baseUrl,
+      type: 'text' as const,
+    },
+    {
+      key: 'token' as const,
+      label: t('ccPreset.apiKeyLabel'),
+      envKey: isOpenAi ? 'OPENAI_API_KEY' : (compact ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY'),
+      ph: t('ccPreset.apiKeyPlaceholder'),
+      val: draft.token,
+      type: 'password' as const,
+    },
+  ];
+
+  const editorClasses = [
+    'cc-preset-editor',
+    standalone ? 'cc-preset-editor-standalone' : '',
+    compact ? 'is-compact' : '',
+  ].filter(Boolean).join(' ');
 
   return (
-    <div
-      class={standalone ? 'cc-preset-editor cc-preset-editor-standalone' : 'cc-preset-editor'}
-      style={{
-        background: '#0f172a',
-        border: '1px solid #334155',
-        borderRadius: 6,
-        padding: compact ? 10 : 12,
-        marginBottom: standalone || compact ? 0 : 12,
-        fontSize: compact ? 11 : 12,
-      }}
-    >
+    <div class={editorClasses}>
       {!compact && !standalone && (
-        <div style={{ marginBottom: 4, fontWeight: 600, color: '#94a3b8' }}>
+        <div class="cc-preset-editor-title">
           {t('ccPreset.editorTitle')}
         </div>
       )}
-      <div style={{ fontSize: 10, color: compact ? '#64748b' : '#475569', marginBottom: compact ? 4 : 8 }}>
+      <div class="cc-preset-storage-hint">
         {t('ccPreset.storageHint')}
       </div>
       {(!loaded || refreshing) && (
-        <div data-testid="cc-preset-loading" style={{ color: '#94a3b8', fontSize: 11, marginBottom: 6 }}>
+        <div data-testid="cc-preset-loading" class="cc-preset-status-banner">
           {loading || refreshing ? t('ccPreset.loadingList') : t('ccPreset.notLoadedError')}
         </div>
       )}
       {compact && displayError && (
-        <div role="alert" style={{ color: '#ef4444', fontSize: 11, marginBottom: 4 }}>{displayError}</div>
+        <div role="alert" class="cc-preset-alert">{displayError}</div>
       )}
 
-      <div style={{ marginBottom: compact ? 6 : 8 }}>
-        <div style={{ fontSize: compact ? 9 : 10, color: '#64748b', marginBottom: 2 }}>
+      <div class="cc-preset-field">
+        <div class="cc-preset-field-label">
           {t('ccPreset.protocolLabel')}
         </div>
-        <div style={{ display: 'flex', gap: 12 }}>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: compact ? 10 : 11, color: '#e2e8f0' }}>
+        <div class="cc-preset-protocol-group">
+          <label class={`cc-preset-protocol-pill${draft.authType === 'anthropic' ? ' is-active' : ''}`}>
             <input
               type="radio"
               name={radioName}
@@ -289,7 +298,7 @@ export function CcPresetEditorPanel({
             />
             {t('ccPreset.protocolAnthropic')}
           </label>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: compact ? 10 : 11, color: '#e2e8f0' }}>
+          <label class={`cc-preset-protocol-pill${draft.authType === 'openai' ? ' is-active' : ''}`}>
             <input
               type="radio"
               name={radioName}
@@ -302,64 +311,29 @@ export function CcPresetEditorPanel({
         </div>
       </div>
 
-      {[
-        {
-          label: t('ccPreset.nameLabel'),
-          envKey: '',
-          ph: t('ccPreset.namePlaceholder'),
-          val: draft.name,
-          onChange: (val: string) => setField('name', val),
-          type: 'text' as const,
-        },
-        {
-          label: t('ccPreset.baseUrlLabel'),
-          envKey: isOpenAi ? 'OPENAI_BASE_URL' : 'ANTHROPIC_BASE_URL',
-          ph: isOpenAi ? DEFAULT_OPENAI_PRESET_BASE_URL : DEFAULT_CC_PRESET_BASE_URL,
-          val: draft.baseUrl,
-          onChange: (val: string) => setField('baseUrl', val),
-          type: 'text' as const,
-        },
-        {
-          label: t('ccPreset.apiKeyLabel'),
-          envKey: isOpenAi ? 'OPENAI_API_KEY' : (compact ? 'ANTHROPIC_AUTH_TOKEN' : 'ANTHROPIC_API_KEY'),
-          ph: t('ccPreset.apiKeyPlaceholder'),
-          val: draft.token,
-          onChange: (val: string) => setField('token', val),
-          type: 'password' as const,
-        },
-        {
-          label: t('ccPreset.modelLabel'),
-          envKey: isOpenAi ? 'OPENAI_MODEL' : 'ANTHROPIC_MODEL',
-          ph: isOpenAi ? DEFAULT_OPENAI_PRESET_MODEL : DEFAULT_CC_PRESET_MODEL,
-          val: draft.model,
-          onChange: (val: string) => setField('model', val),
-          type: 'text' as const,
-        },
-      ].map(({ label, envKey, ph, val, onChange, type }) => (
-        <div key={label} style={{ marginBottom: compact ? 4 : 5 }}>
-          <div style={labelStyle}>
-            {label}
-            {envKey && <span style={{ color: '#334155', marginLeft: 4 }}>{envKey}</span>}
+      {textFields.map(({ key, label, envKey, ph, val, type }) => (
+        <div key={key} class="cc-preset-field">
+          <div class="cc-preset-field-label">
+            <span>{label}</span>
+            {envKey && <span class="cc-preset-env-key">{envKey}</span>}
           </div>
           <input
-            class={compact ? 'input' : undefined}
+            class="cc-preset-input"
             type={type}
             placeholder={ph}
             value={val}
-            onInput={(e) => onChange((e.target as HTMLInputElement).value)}
-            style={inputStyle}
+            onInput={(e) => setField(key, (e.target as HTMLInputElement).value)}
           />
         </div>
       ))}
 
       {draft.availableModels.length > 0 && (
-        <div style={{ marginBottom: compact ? 4 : 5 }}>
-          <div style={labelStyle}>{t('ccPreset.discoveredModelsLabel')}</div>
+        <div class="cc-preset-field">
+          <div class="cc-preset-field-label">{t('ccPreset.discoveredModelsLabel')}</div>
           <select
-            class={compact ? 'input' : undefined}
+            class="cc-preset-select"
             value={draft.model}
             onInput={(e) => setField('model', (e.target as HTMLSelectElement).value)}
-            style={inputStyle}
           >
             {draft.availableModels.map((item) => (
               <option key={item.id} value={item.id}>
@@ -370,115 +344,114 @@ export function CcPresetEditorPanel({
         </div>
       )}
 
-      <div style={{ marginBottom: compact ? 4 : 5 }}>
-        <div style={labelStyle}>
-          {t('ccPreset.contextWindowLabel')}
-          {draft.contextWindow && (
-            <span style={{ color: '#3b82f6', marginLeft: compact ? 4 : 6 }}>
-              {formatContextWindowBadge(draft.contextWindow)}
-            </span>
-          )}
+      <div class="cc-preset-field-row-2col">
+        <div class="cc-preset-field">
+          <div class="cc-preset-field-label">
+            <span>{t('ccPreset.modelLabel')}</span>
+            <span class="cc-preset-env-key">{isOpenAi ? 'OPENAI_MODEL' : 'ANTHROPIC_MODEL'}</span>
+          </div>
+          <input
+            class="cc-preset-input"
+            type="text"
+            placeholder={isOpenAi ? DEFAULT_OPENAI_PRESET_MODEL : DEFAULT_CC_PRESET_MODEL}
+            value={draft.model}
+            onInput={(e) => setField('model', (e.target as HTMLInputElement).value)}
+          />
         </div>
-        <input
-          class={compact ? 'input' : undefined}
-          type="text"
-          placeholder="1000000"
-          value={draft.contextWindow}
-          onInput={(e) => setField('contextWindow', (e.target as HTMLInputElement).value)}
-          style={inputStyle}
-        />
+
+        <div class="cc-preset-field">
+          <div class="cc-preset-field-label">
+            <span>{t('ccPreset.contextWindowLabel')}</span>
+            {draft.contextWindow && (
+              <span class="cc-preset-context-badge">
+                {formatContextWindowBadge(draft.contextWindow)}
+              </span>
+            )}
+          </div>
+          <input
+            class="cc-preset-input"
+            type="text"
+            placeholder="1000000"
+            value={draft.contextWindow}
+            onInput={(e) => setField('contextWindow', (e.target as HTMLInputElement).value)}
+          />
+        </div>
       </div>
 
-      <div style={{ marginBottom: compact ? 4 : 5 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: compact ? 1 : 2 }}>
-          <span style={{ fontSize: compact ? 9 : 10, color: '#64748b' }}>
+      <div class="cc-preset-env-section">
+        <div class="cc-preset-env-header">
+          <span class="cc-preset-field-label">
             {t('ccPreset.customEnvLabel')}
           </span>
           <button
             type="button"
-            style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: compact ? 9 : 10, padding: 0 }}
+            class="cc-preset-add-env-btn"
             onClick={() => setField('customEnv', [...draft.customEnv, { key: '', value: '' }])}
           >
             {t('ccPreset.addEnvVar')}
           </button>
         </div>
-        {draft.customEnv.map((item, idx) => (
-          <div key={idx} style={{ display: 'flex', gap: compact ? 3 : 4, marginBottom: compact ? 2 : 3 }}>
-            <input
-              class={compact ? 'input' : undefined}
-              type="text"
-              placeholder="ENV_KEY"
-              value={item.key}
-              onInput={(e) => {
-                const updated = [...draft.customEnv];
-                updated[idx] = { ...updated[idx], key: (e.target as HTMLInputElement).value };
-                setField('customEnv', updated);
-              }}
-              style={compact
-                ? { flex: 1, fontSize: 10, fontFamily: 'monospace' }
-                : { flex: 1, background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '4px 6px', borderRadius: 4, fontSize: 11, fontFamily: 'monospace', boxSizing: 'border-box' as const }}
-            />
-            <input
-              class={compact ? 'input' : undefined}
-              type="text"
-              placeholder={t('ccPreset.envValuePlaceholder')}
-              value={item.value}
-              onInput={(e) => {
-                const updated = [...draft.customEnv];
-                updated[idx] = { ...updated[idx], value: (e.target as HTMLInputElement).value };
-                setField('customEnv', updated);
-              }}
-              style={compact
-                ? { flex: 2, fontSize: 10 }
-                : { flex: 2, background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '4px 6px', borderRadius: 4, fontSize: 11, boxSizing: 'border-box' as const }}
-            />
-            <button
-              type="button"
-              style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: compact ? 11 : 12, padding: compact ? '0 3px' : '0 4px' }}
-              onClick={() => setField('customEnv', draft.customEnv.filter((_, j) => j !== idx))}
-            >
-              ×
-            </button>
+        {draft.customEnv.length > 0 && (
+          <div class="cc-preset-env-list">
+            {draft.customEnv.map((item, idx) => (
+              <div key={idx} class="cc-preset-env-row">
+                <input
+                  class="cc-preset-input cc-preset-env-key-input"
+                  type="text"
+                  placeholder="ENV_KEY"
+                  value={item.key}
+                  onInput={(e) => {
+                    const updated = [...draft.customEnv];
+                    updated[idx] = { ...updated[idx], key: (e.target as HTMLInputElement).value };
+                    setField('customEnv', updated);
+                  }}
+                />
+                <input
+                  class="cc-preset-input cc-preset-env-val-input"
+                  type="text"
+                  placeholder={t('ccPreset.envValuePlaceholder')}
+                  value={item.value}
+                  onInput={(e) => {
+                    const updated = [...draft.customEnv];
+                    updated[idx] = { ...updated[idx], value: (e.target as HTMLInputElement).value };
+                    setField('customEnv', updated);
+                  }}
+                />
+                <button
+                  type="button"
+                  class="cc-preset-env-remove-btn"
+                  aria-label="Remove env var"
+                  onClick={() => setField('customEnv', draft.customEnv.filter((_, j) => j !== idx))}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
           </div>
-        ))}
+        )}
       </div>
 
-      <div style={{ marginBottom: compact ? 4 : 6 }}>
-        <div style={labelStyle}>
+      <div class="cc-preset-field">
+        <div class="cc-preset-field-label">
           {compact ? t('ccPreset.initMessageCompactLabel') : t('ccPreset.initMessageLabel')}
         </div>
         <textarea
-          class={compact ? 'input' : undefined}
+          class="cc-preset-textarea"
           value={draft.initMessage}
           rows={2}
           onInput={(e) => setField('initMessage', (e.target as HTMLTextAreaElement).value)}
-          style={compact
-            ? { width: '100%', fontSize: 10, resize: 'vertical' }
-            : { width: '100%', background: '#1e293b', border: '1px solid #334155', color: '#e2e8f0', padding: '5px 8px', borderRadius: 4, fontSize: 11, resize: 'vertical', boxSizing: 'border-box' as const }}
         />
       </div>
 
       {!compact && displayError && (
-        <div role="alert" style={{ color: '#ef4444', fontSize: 11, marginBottom: 6 }}>{displayError}</div>
+        <div role="alert" class="cc-preset-alert">{displayError}</div>
       )}
 
       <div class="cc-preset-editor-actions">
         <button
           type="button"
-          class={compact ? 'btn btn-primary' : undefined}
+          class="cc-preset-btn cc-preset-btn-primary"
           disabled={saving || !draft.name.trim() || !draft.baseUrl.trim()}
-          style={compact
-            ? { fontSize: 11, padding: '3px 10px' }
-            : {
-                background: '#1d4ed8',
-                border: 'none',
-                color: '#fff',
-                padding: '4px 12px',
-                borderRadius: 4,
-                cursor: 'pointer',
-                fontSize: 12,
-                opacity: saving || !draft.name.trim() || !draft.baseUrl.trim() ? 0.5 : 1,
-              }}
           onClick={() => { void handleSave(); }}
         >
           {saving
@@ -487,40 +460,15 @@ export function CcPresetEditorPanel({
         </button>
         <button
           type="button"
-          class={compact ? 'btn btn-secondary' : undefined}
-          style={compact
-            ? { fontSize: 11, padding: '3px 10px', marginLeft: 8 }
-            : {
-                background: '#334155',
-                border: 'none',
-                color: '#fff',
-                padding: '4px 12px',
-                borderRadius: 4,
-                cursor: 'pointer',
-                fontSize: 12,
-                marginLeft: 8,
-              }}
+          class="cc-preset-btn cc-preset-btn-secondary"
           onClick={() => { void handleImport(); }}
         >
           {t('new_session.api_provider_import_json')}
         </button>
         <button
           type="button"
-          class={compact ? 'btn btn-secondary' : undefined}
+          class="cc-preset-btn cc-preset-btn-discover"
           disabled={saving || discovering || !draft.name.trim() || !draft.baseUrl.trim() || !draft.token.trim()}
-          style={compact
-            ? { fontSize: 11, padding: '3px 10px', marginLeft: 8 }
-            : {
-                background: '#0f766e',
-                border: 'none',
-                color: '#fff',
-                padding: '4px 12px',
-                borderRadius: 4,
-                cursor: 'pointer',
-                fontSize: 12,
-                marginLeft: 8,
-                opacity: saving || discovering || !draft.name.trim() || !draft.baseUrl.trim() || !draft.token.trim() ? 0.5 : 1,
-              }}
           onClick={() => { void handleDiscover(); }}
         >
           {discovering ? t('ccPreset.discoveringModels') : t('ccPreset.discoverModels')}
@@ -528,8 +476,7 @@ export function CcPresetEditorPanel({
         {standalone && draft.name && (
           <button
             type="button"
-            class="btn btn-secondary"
-            style={{ fontSize: 12, padding: '4px 10px', marginLeft: 8 }}
+            class="cc-preset-btn cc-preset-btn-ghost"
             onClick={() => {
               updateDraft(createDefaultCcPresetDraft());
               onClearError();
@@ -541,85 +488,70 @@ export function CcPresetEditorPanel({
       </div>
 
       {presets.length > 0 ? (
-        <div
-          style={{
-            marginTop: compact ? 8 : 10,
-            borderTop: '1px solid #334155',
-            paddingTop: compact ? 6 : 8,
-          }}
-        >
+        <div class="cc-preset-saved-section">
           {!compact && (
-            <div style={{ color: '#64748b', fontSize: 11, marginBottom: 4 }}>
-              {t('ccPreset.savedListLabel')}
+            <div class="cc-preset-saved-header">
+              <span>{t('ccPreset.savedListLabel')}</span>
+              <span class="cc-preset-saved-count">{presets.length}</span>
             </div>
           )}
-          {presets.map((preset) => {
-            const effectiveModel = getCcPresetEffectiveModel(preset);
-            return (
-              <div
-                key={preset.name}
-                data-cc-preset-row={preset.name}
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  padding: compact ? '2px 0' : '3px 0',
-                  fontSize: compact ? 11 : 12,
-                  gap: 8,
-                }}
-              >
-                <span style={{ color: '#e2e8f0', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {preset.name}{' '}
-                  {effectiveModel && (
-                    <span style={{ color: '#475569' }}>{effectiveModel}</span>
-                  )}
-                </span>
-                <div style={{ display: 'flex', gap: 4, flexShrink: 0 }}>
-                  <button
-                    type="button"
-                    style={{ background: 'none', border: 'none', color: '#3b82f6', cursor: 'pointer', fontSize: compact ? 10 : 11 }}
-                    onClick={() => {
-                      updateDraft(createCcPresetDraftFromPreset(preset));
-                      if (preset.modelDiscoveryError) {
-                        onError(preset.modelDiscoveryError);
-                      } else {
-                        onClearError();
-                      }
-                    }}
-                  >
-                    {t('ccPreset.editButton')}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={saving}
-                    style={{ background: 'none', border: 'none', color: '#ef4444', cursor: 'pointer', fontSize: compact ? 10 : 11 }}
-                    onClick={() => { void handleDelete(preset.name); }}
-                  >
-                    {compact ? t('ccPreset.deleteCompactButton') : t('ccPreset.deleteButton')}
-                  </button>
-                  <button
-                    type="button"
-                    style={{ background: 'none', border: 'none', color: '#22c55e', cursor: 'pointer', fontSize: compact ? 10 : 11 }}
-                    onClick={() => { void handleExport(preset); }}
-                  >
-                    {t('new_session.api_provider_export_json')}
-                  </button>
+          <div class="cc-preset-saved-list">
+            {presets.map((preset) => {
+              const effectiveModel = getCcPresetEffectiveModel(preset);
+              const isEditingRow = normalizedDraftName !== '' && normalizedDraftName === normalizeCcPresetName(preset.name);
+              return (
+                <div
+                  key={preset.name}
+                  data-cc-preset-row={preset.name}
+                  class={`cc-preset-row${isEditingRow ? ' is-editing' : ''}`}
+                >
+                  <div class="cc-preset-row-main">
+                    <span class="cc-preset-row-name">{preset.name}</span>
+                    <span class="cc-preset-row-proto">
+                      {preset.authType === 'openai' ? 'OpenAI' : 'Anthropic'}
+                    </span>
+                    {effectiveModel && (
+                      <span class="cc-preset-row-model">{effectiveModel}</span>
+                    )}
+                  </div>
+                  <div class="cc-preset-row-actions">
+                    <button
+                      type="button"
+                      class="cc-preset-row-btn cc-preset-row-btn-edit"
+                      onClick={() => {
+                        updateDraft(createCcPresetDraftFromPreset(preset));
+                        if (preset.modelDiscoveryError) {
+                          onError(preset.modelDiscoveryError);
+                        } else {
+                          onClearError();
+                        }
+                      }}
+                    >
+                      {t('ccPreset.editButton')}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={saving}
+                      class="cc-preset-row-btn cc-preset-row-btn-delete"
+                      onClick={() => { void handleDelete(preset.name); }}
+                    >
+                      {compact ? t('ccPreset.deleteCompactButton') : t('ccPreset.deleteButton')}
+                    </button>
+                    <button
+                      type="button"
+                      class="cc-preset-row-btn cc-preset-row-btn-export"
+                      onClick={() => { void handleExport(preset); }}
+                    >
+                      {t('new_session.api_provider_export_json')}
+                    </button>
+                  </div>
                 </div>
-              </div>
-            );
-          })}
+              );
+            })}
+          </div>
         </div>
       ) : standalone ? (
-        <div
-          data-testid="cc-preset-empty"
-          style={{
-            marginTop: 10,
-            borderTop: '1px solid #334155',
-            paddingTop: 8,
-            color: '#64748b',
-            fontSize: 12,
-          }}
-        >
+        <div data-testid="cc-preset-empty" class="cc-preset-empty">
           {t('ccPreset.emptyList')}
         </div>
       ) : null}
@@ -665,7 +597,7 @@ export function CcPresetManagerDialog({
 
   return (
     <div
-      class="dialog-overlay"
+      class="dialog-overlay cc-preset-manager-overlay"
       data-testid="cc-preset-manager-dialog"
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
@@ -676,14 +608,13 @@ export function CcPresetManagerDialog({
         role="dialog"
         aria-modal="true"
         aria-label={t('ccPreset.managerTitle')}
-        style={{ width: 'min(520px, calc(100vw - 24px))', maxHeight: '88vh', display: 'flex', flexDirection: 'column' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <div class="dialog-header">
-          <span>{t('ccPreset.managerTitle')}</span>
+        <div class="dialog-header cc-preset-manager-header">
+          <span class="cc-preset-manager-title">{t('ccPreset.managerTitle')}</span>
           <button
             type="button"
-            class="dialog-close"
+            class="dialog-close cc-preset-manager-close"
             onClick={onClose}
             aria-label={t('common.close')}
           >
@@ -691,8 +622,8 @@ export function CcPresetManagerDialog({
           </button>
         </div>
 
-        <div class="dialog-body" style={{ display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto' }}>
-          <div style={{ fontSize: 12, color: '#94a3b8' }}>
+        <div class="dialog-body cc-preset-manager-body">
+          <div class="cc-preset-manager-subtitle">
             {t('ccPreset.managerSubtitle')}
           </div>
           <CcPresetEditorPanel
@@ -715,8 +646,8 @@ export function CcPresetManagerDialog({
           />
         </div>
 
-        <div class="dialog-footer" style={{ display: 'flex', justifyContent: 'flex-end', padding: '10px 16px', borderTop: '1px solid #1e293b' }}>
-          <button type="button" class="btn btn-secondary" onClick={onClose}>
+        <div class="dialog-footer cc-preset-manager-footer">
+          <button type="button" class="btn cc-preset-btn cc-preset-btn-ghost" onClick={onClose}>
             {t('common.close')}
           </button>
         </div>
