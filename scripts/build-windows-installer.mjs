@@ -53,6 +53,7 @@ export function renderWindowsPhaseAInstallerPs1({ version, cliWrapperContent, mi
   [string]$ServiceHookScript = '',
   [string]$SchtasksExe = '',
   [string]$ProcessProbeScript = '',
+  [string]$OpenCodeInstallHook = '',
   [string]$LogPath = '',
   [int]$TempMaxAgeHours = 24,
   [switch]$ForceTakeover,
@@ -1634,14 +1635,69 @@ if (Test-Path -LiteralPath $installedNodeExe -PathType Leaf) {
   Sync-WindowsAideskShortcut $StartMenuShortcutPath $installedNodeExe '--open-local-panel' $shortcutIconLocation $isCleanInstall
   Sync-WindowsAideskShortcut $DesktopShortcutPath $installedNodeExe '--open-local-panel' $shortcutIconLocation $isCleanInstall
 }
-if ($AllowSystemRoot -and [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
-  $cliBinDir = Split-Path -Parent $CliWrapperPath
+function Add-UserPathEntry([string]$DirPath) {
+  if ([string]::IsNullOrWhiteSpace($DirPath)) { return }
   $curPath = [Environment]::GetEnvironmentVariable('Path', 'User')
   if ([string]::IsNullOrWhiteSpace($curPath)) {
-    [Environment]::SetEnvironmentVariable('Path', $cliBinDir, 'User')
-  } elseif (($curPath.Split(';') | Where-Object { $_ -and ($_.TrimEnd('\\').ToLowerInvariant() -eq $cliBinDir.TrimEnd('\\').ToLowerInvariant()) }).Count -eq 0) {
-    [Environment]::SetEnvironmentVariable('Path', "$curPath;$cliBinDir", 'User')
+    [Environment]::SetEnvironmentVariable('Path', $DirPath, 'User')
+  } elseif (($curPath.Split(';') | Where-Object { $_ -and ($_.TrimEnd('\\').ToLowerInvariant() -eq $DirPath.TrimEnd('\\').ToLowerInvariant()) }).Count -eq 0) {
+    [Environment]::SetEnvironmentVariable('Path', "$curPath;$DirPath", 'User')
   }
+}
+
+function Install-OpenCodeCliBestEffort {
+  try {
+    $skipRaw = [string]$env:IMCODES_SKIP_OPENCODE
+    if ($skipRaw -and ($skipRaw.Trim() -imatch '^(1|true|yes)$')) {
+      Write-InstallerLog 'Skipping OpenCode CLI install (IMCODES_SKIP_OPENCODE)'
+      return
+    }
+    $hookPath = if (-not [string]::IsNullOrWhiteSpace($OpenCodeInstallHook)) { $OpenCodeInstallHook } else { [string]$env:IMCODES_OPENCODE_INSTALL_HOOK }
+    if (-not [string]::IsNullOrWhiteSpace($IsolatedRoot) -and [string]::IsNullOrWhiteSpace($hookPath) -and [string]::IsNullOrWhiteSpace($env:IMCODES_OPENCODE_REGISTRY)) {
+      Write-InstallerLog 'Skipping OpenCode CLI install in isolated test mode'
+      return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($hookPath) -and (Test-Path -LiteralPath $hookPath -PathType Leaf)) {
+      $prevEap = $ErrorActionPreference
+      $ErrorActionPreference = 'Continue'
+      try {
+        & $hookPath -HomeDir $HomeDir 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+          Write-InstallerLog ("WARNING: OpenCode CLI install hook exited $LASTEXITCODE (non-blocking)")
+        }
+      } finally {
+        $ErrorActionPreference = $prevEap
+      }
+    } else {
+      $nodeExe = Join-Path $CurrentDir 'node.exe'
+      $ocInstallerJs = Join-Path $CurrentDir 'package\\dist\\src\\node\\install-opencode-cli.js'
+      if ((Test-Path -LiteralPath $nodeExe -PathType Leaf) -and (Test-Path -LiteralPath $ocInstallerJs -PathType Leaf)) {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+          & $nodeExe $ocInstallerJs --home $HomeDir 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-InstallerLog ("WARNING: OpenCode CLI install exited $LASTEXITCODE (non-blocking)")
+          }
+        } finally {
+          $ErrorActionPreference = $prevEap
+        }
+      }
+    }
+    if ($AllowSystemRoot -and [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+      $ocBinDir = Join-Path (Join-Path $HomeDir '.opencode') 'bin'
+      $ocExePath = Join-Path $ocBinDir 'opencode.exe'
+      if (Test-Path -LiteralPath $ocExePath -PathType Leaf) {
+        try { Add-UserPathEntry $ocBinDir } catch { Write-InstallerLog ("WARNING: Failed to add $ocBinDir to User PATH: " + $_.Exception.Message) }
+      }
+    }
+  } catch {
+    Write-InstallerLog ("WARNING: OpenCode CLI install failed (non-blocking): " + $_.Exception.Message)
+  }
+}
+
+if ($AllowSystemRoot -and [string]::IsNullOrWhiteSpace($IsolatedRoot)) {
+  Add-UserPathEntry (Split-Path -Parent $CliWrapperPath)
 }
 function Ensure-WindowsReleasePublisherTrust([string]$TargetPath, [string]$ExpectedSha256) {
   if ([string]::IsNullOrWhiteSpace($TargetPath) -or -not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) { return }
@@ -1789,6 +1845,7 @@ function Test-RemoteDesktopWorkerManifestIntegrity {
 
 Install-RemoteDesktopVirtualDisplay
 Test-RemoteDesktopWorkerManifestIntegrity
+Install-OpenCodeCliBestEffort
 Remove-Item -LiteralPath (Join-Path $NodeRoot 'upgrade-in-progress.json') -Force -ErrorAction SilentlyContinue
 if ($ApplyServices) {
   Register-WindowsServices $plan $stoppedDaemon

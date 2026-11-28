@@ -817,6 +817,30 @@ hash_file_sha256() {
   fi
 }
 
+install_opencode_cli_best_effort() {
+  case "\${IMCODES_SKIP_OPENCODE:-}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])
+      return 0
+      ;;
+  esac
+  if [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_OPENCODE_REGISTRY:-}" ]; then
+    return 0
+  fi
+  if [ -n "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ]; then
+    "$IMCODES_OPENCODE_INSTALL_HOOK" --home "$EFF_HOME" || echo "WARNING: OpenCode CLI install hook failed (non-blocking)" >&2
+  elif [ -x "$CURRENT_LINK/bin/node" ] && [ -f "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" ]; then
+    "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" --home "$EFF_HOME" || echo "WARNING: OpenCode CLI install failed (non-blocking)" >&2
+  fi
+  if [ -d "$EFF_HOME/.opencode" ]; then
+    for oc_path in "$EFF_HOME/.opencode" "$EFF_HOME/.opencode/bin" "$EFF_HOME/.opencode/bin/opencode"; do
+      if is_root_owned_path "$oc_path"; then
+        chown_target_entry "$oc_path"
+      fi
+    done
+  fi
+  return 0
+}
+
 refresh_node_staged_receipt() {
   j_path="$NODE_ROOT/install-journal.json"
   n_exe="$NODE_ROOT/imcodes-node"
@@ -1959,6 +1983,7 @@ EOF
   fi
 fi
 
+install_opencode_cli_best_effort
 refresh_node_staged_receipt
 
 if [ "$APPLY_SERVICES" -eq 1 ]; then

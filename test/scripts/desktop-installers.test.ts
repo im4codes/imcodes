@@ -2605,4 +2605,212 @@ if (-not ($script:schtasksCalls -contains '/End /TN imcodes-node')) { throw 'mis
       }
     },
   );
+
+  it('installs OpenCode CLI idempotently and non-blockingly in POSIX (linux + darwin) postinstall before service start', async () => {
+    for (const os of ['linux', 'darwin'] as const) {
+      const root = makeTempDir(`imcodes-oc-${os}-`);
+      const rtDir = createFakeRuntimeDir(root, os, '0.9.5');
+      mkdirSync(join(rtDir, 'package', 'dist', 'src', 'node'), { recursive: true });
+      writeFileSync(join(rtDir, 'package', 'dist', 'src', 'node', 'install-opencode-cli.js'), '// stub\n', 'utf8');
+
+      const runnerPath = join(root, `phase-a-${os}.sh`);
+      const scriptText = renderPosixPhaseARunnerScript({
+        platform: os,
+        version: '0.9.5',
+        cliWrapperContent: '#!/bin/sh\necho ok\n',
+      });
+      writeFileSync(runnerPath, scriptText, { mode: 0o755 });
+
+      expect(scriptText).toContain('install_opencode_cli_best_effort');
+      expect(scriptText).toContain('install-opencode-cli.js" --home "$EFF_HOME"');
+      expect(scriptText).toContain('chown_target_entry "$oc_path"');
+      expect(scriptText.lastIndexOf('install_opencode_cli_best_effort\nrefresh_node_staged_receipt')).toBeLessThan(
+        scriptText.lastIndexOf('if [ "$APPLY_SERVICES" -eq 1 ]; then'),
+      );
+
+      // Build fake staged release dir + hook logging invocation order
+      const traceFile = join(root, 'trace.log');
+      const fakeHook = join(root, 'oc-hook.sh');
+      writeFileSync(
+        fakeHook,
+        `#!/bin/sh
+echo "OC_HOOK args=$*" >> "${traceFile}"
+home_arg=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --home) home_arg="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$home_arg/.opencode/bin"
+printf '#!/bin/sh\necho 2.4.2\n' > "$home_arg/.opencode/bin/opencode"
+chmod 755 "$home_arg/.opencode/bin/opencode"
+`,
+        { mode: 0o755 },
+      );
+
+      const failHook = join(root, 'oc-fail-hook.sh');
+      writeFileSync(
+        failHook,
+        `#!/bin/sh
+echo "OC_FAIL_HOOK" >> "${traceFile}"
+exit 42
+`,
+        { mode: 0o755 },
+      );
+
+      const fakeSvcBin = join(root, os === 'linux' ? 'fake-systemctl.sh' : 'fake-launchctl.sh');
+      writeFileSync(
+        fakeSvcBin,
+        `#!/bin/sh
+echo "SVC args=$*" >> "${traceFile}"
+exit 0
+`,
+        { mode: 0o755 },
+      );
+
+      // Case 1: isolated mode with no hook/registry does NOT invoke node installer or create .opencode
+      const isoDefault = join(root, 'iso-default');
+      const homeDefault = join(root, 'home-default');
+      mkdirSync(join(isoDefault, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoDefault, 'daemon-runtime', 'releases', '0.9.5')]);
+      const outDefault = execFileSync(
+        runnerPath,
+        ['--isolated-root', isoDefault, '--home', homeDefault, '--confirm-fda-switch', '--no-service-control'],
+        { env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: '', IMCODES_OPENCODE_REGISTRY: '' }, encoding: 'utf8' },
+      );
+      expect(outDefault).toContain('INSTALL_OK');
+      expect(existsSync(join(homeDefault, '.opencode'))).toBe(false);
+
+      // Case 2: hook runs BEFORE service start/restart and installs ~/.opencode/bin/opencode
+      const isoHook = join(root, 'iso-hook');
+      const homeHook = join(root, 'home-hook');
+      mkdirSync(join(isoHook, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoHook, 'daemon-runtime', 'releases', '0.9.5')]);
+      const outHook = execFileSync(
+        runnerPath,
+        ['--isolated-root', isoHook, '--home', homeHook, '--confirm-fda-switch', '--apply-services'],
+        {
+          env: {
+            ...process.env,
+            IMCODES_OPENCODE_INSTALL_HOOK: fakeHook,
+            ...(os === 'linux' ? { IMCODES_SYSTEMCTL_BIN: fakeSvcBin } : { IMCODES_LAUNCHCTL_BIN: fakeSvcBin }),
+          },
+          encoding: 'utf8',
+        },
+      );
+      expect(outHook).toContain('INSTALL_OK');
+      expect(existsSync(join(homeHook, '.opencode', 'bin', 'opencode'))).toBe(true);
+      const traceLines = readFileSync(traceFile, 'utf8').trim().split('\n');
+      const ocIdx = traceLines.findIndex((l) => l.startsWith('OC_HOOK'));
+      const svcStartIdx = traceLines.findIndex(
+        (l) => l.startsWith('SVC') && (l.includes('restart') || l.includes('start') || l.includes('bootstrap') || l.includes('kickstart')),
+      );
+      expect(ocIdx).toBeGreaterThanOrEqual(0);
+      expect(svcStartIdx).toBeGreaterThan(ocIdx);
+
+      // Case 3: IMCODES_SKIP_OPENCODE=1 skips hook cleanly
+      const isoSkip = join(root, 'iso-skip');
+      const homeSkip = join(root, 'home-skip');
+      mkdirSync(join(isoSkip, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSkip, 'daemon-runtime', 'releases', '0.9.5')]);
+      execFileSync(
+        runnerPath,
+        ['--isolated-root', isoSkip, '--home', homeSkip, '--confirm-fda-switch', '--no-service-control'],
+        { env: { ...process.env, IMCODES_SKIP_OPENCODE: '1', IMCODES_OPENCODE_INSTALL_HOOK: fakeHook }, encoding: 'utf8' },
+      );
+      expect(existsSync(join(homeSkip, '.opencode'))).toBe(false);
+
+      // Case 4: failing OpenCode install stays strictly non-blocking
+      const isoFail = join(root, 'iso-fail');
+      const homeFail = join(root, 'home-fail');
+      mkdirSync(join(isoFail, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoFail, 'daemon-runtime', 'releases', '0.9.5')]);
+      const outFail = execFileSync(
+        runnerPath,
+        ['--isolated-root', isoFail, '--home', homeFail, '--confirm-fda-switch', '--no-service-control'],
+        { env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: failHook }, encoding: 'utf8' },
+      );
+      expect(outFail).toContain('INSTALL_OK');
+
+      // Case 5: default node invocation wires --home "$EFF_HOME" when IMCODES_OPENCODE_REGISTRY is set
+      const isoNode = join(root, 'iso-node');
+      const homeNode = join(root, 'home-node');
+      mkdirSync(join(isoNode, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+      execFileSync('cp', ['-R', `${rtDir}/.`, join(isoNode, 'daemon-runtime', 'releases', '0.9.5')]);
+      const outNode = execFileSync(
+        runnerPath,
+        ['--isolated-root', isoNode, '--home', homeNode, '--confirm-fda-switch', '--no-service-control'],
+        { env: { ...process.env, IMCODES_OPENCODE_INSTALL_HOOK: '', IMCODES_OPENCODE_REGISTRY: 'http://127.0.0.1:9' }, encoding: 'utf8' },
+      );
+      expect(outNode).toContain('IMCODES_CLI_EXEC');
+      expect(outNode).toContain('install-opencode-cli.js');
+      expect(outNode).toContain('INSTALL_OK');
+    }
+  });
+
+  it('wires OpenCode CLI auto-install cleanly into Windows installer ps1 before service registration', () => {
+    const ps1 = renderWindowsPhaseAInstallerPs1({ version: '2026.11.7132-dev.7022', cliWrapperContent: '@echo off\r\n' });
+    expect(ps1).toContain('function Install-OpenCodeCliBestEffort');
+    expect(ps1).toContain('install-opencode-cli.js');
+    expect(ps1).toContain('IMCODES_SKIP_OPENCODE');
+    expect(ps1).toContain('Add-UserPathEntry');
+    expect(ps1.indexOf('Install-OpenCodeCliBestEffort\nRemove-Item')).toBeLessThan(
+      ps1.indexOf('Register-WindowsServices $plan $stoppedDaemon'),
+    );
+  });
+
+  it.skipIf(process.platform !== 'win32')(
+    'runs Windows PostInstall OpenCode hook before Register-WindowsServices and handles opt-out & non-blocking failure',
+    () => {
+      const root = makeTempDir('imcodes-win-oc-');
+      const ps1Path = join(root, 'imcodes-windows-installer.ps1');
+      writeFileSync(
+        ps1Path,
+        renderWindowsPhaseAInstallerPs1({ version: '2026.11.7132-dev.7022', cliWrapperContent: '@echo off\r\n' }),
+        'utf8',
+      );
+      const isoRoot = join(root, 'iso');
+      const nodeRoot = join(isoRoot, 'ProgramData', 'imcodes-node');
+      const runtimeRoot = join(isoRoot, 'ProgramFiles', 'IM.codes', 'daemon-runtime');
+      mkdirSync(nodeRoot, { recursive: true });
+      mkdirSync(join(runtimeRoot, 'releases', '2026.11.7132-dev.7022'), { recursive: true });
+
+      const tracePath = join(root, 'win-trace.txt');
+      const ocHook = join(root, 'oc-hook.ps1');
+      writeFileSync(
+        ocHook,
+        `param([string]$HomeDir)\nAdd-Content -LiteralPath '${tracePath.replace(/'/g, "''")}' -Value "OC:$HomeDir"\n`,
+        'utf8',
+      );
+      const ocFailHook = join(root, 'oc-fail.ps1');
+      writeFileSync(
+        ocFailHook,
+        `param([string]$HomeDir)\nAdd-Content -LiteralPath '${tracePath.replace(/'/g, "''")}' -Value "OC_FAIL:$HomeDir"\nexit 5\n`,
+        'utf8',
+      );
+
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path,
+          '-Mode', 'PostInstall', '-IsolatedRoot', isoRoot, '-Version', '2026.11.7132-dev.7022',
+          '-RuntimeRoot', runtimeRoot, '-NodeRoot', nodeRoot, '-OpenCodeInstallHook', ocHook,
+        ],
+        { encoding: 'utf8' },
+      );
+      expect(readFileSync(tracePath, 'utf8')).toContain('OC:');
+
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path,
+          '-Mode', 'PostInstall', '-IsolatedRoot', isoRoot, '-Version', '2026.11.7132-dev.7022',
+          '-RuntimeRoot', runtimeRoot, '-NodeRoot', nodeRoot, '-OpenCodeInstallHook', ocFailHook,
+        ],
+        { encoding: 'utf8' },
+      );
+      expect(readFileSync(tracePath, 'utf8')).toContain('OC_FAIL:');
+    },
+  );
 });
