@@ -40,6 +40,7 @@
 namespace {
 
 using imcodes::speech::ActiveServeSessionHandle;
+using imcodes::speech::drain_prefill_or_end;
 using imcodes::speech::emit_error;
 using imcodes::speech::emit_json_line;
 using imcodes::speech::emit_transcript_update;
@@ -456,7 +457,7 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
     auto fail_or_early_stop = [&](const char* err_code, const std::string& err_msg) {
       cleanup();
       if (aborted_.load() || stop_requested_.load()) {
-        drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
+        imcodes::speech::drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
         return;
       }
       std::vector<float>().swap(initial_samples_);
@@ -466,7 +467,7 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
 
     if (aborted_.load() || stop_requested_.load()) {
       cleanup();
-      drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
+      imcodes::speech::drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
       return;
     }
 
@@ -529,7 +530,7 @@ class WasapiUtteranceCapture : public ActiveServeSessionHandle {
 
     if (aborted_.load() || stop_requested_.load()) {
       cleanup();
-      drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
+      imcodes::speech::drain_prefill_or_end(aborted_.load(), initial_samples_, pipeline_);
       return;
     }
 
