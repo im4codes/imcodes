@@ -29,6 +29,7 @@
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { mergeCcPresetModelIds, piAiApiForCcPresetAuthType } from '../../../../shared/cc-presets.js';
 import {
   DSH_AGENT_DEFAULT_MODEL_ROW_ID,
   DSH_BRIDGE_PLUGIN_ID,
@@ -191,13 +192,17 @@ export function buildDshOverlay(
   insert.push({ id: DSH_BRIDGE_PLUGIN_ID, name: resolveBridgeEntry() });
   rows.push({ insert });
   if (options.llm) {
-    const modelConfig: Record<string, unknown> = { id: options.llm.model };
-    if (options.llm.contextWindow) modelConfig.contextWindow = options.llm.contextWindow;
+    const modelIds = mergeCcPresetModelIds(options.llm.model, options.llm.availableModels);
+    const models = modelIds.map((id) => {
+      const entry: Record<string, unknown> = { id };
+      if (options.llm?.contextWindow) entry.contextWindow = options.llm.contextWindow;
+      return entry;
+    });
     const providerConfig: Record<string, unknown> = {
-      api: 'anthropic-messages',
+      api: piAiApiForCcPresetAuthType(options.llm.authType),
       ...(options.llm.baseUrl ? { baseURL: options.llm.baseUrl } : {}),
       ...(options.llm.apiKey ? { apiKeyEnv: DSH_PROVIDER_API_KEY_ENV } : {}),
-      models: [modelConfig],
+      models,
     };
     rows.push({
       id: DSH_LLM_PI_AI_ROW_ID,

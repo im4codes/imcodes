@@ -48,6 +48,7 @@ import {
   DSH_SANDBOX_POLICY_ROW_ID,
 } from '../../src/agent/providers/deepseek-harness/runtime.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
 
 /** Fake `dsh` child: stdout is the bridge's event stream, stdin captures commands. */
@@ -874,5 +875,160 @@ describe('buildDshOverlay', () => {
       model: 'MiniMax-M.27',
     });
     expect(JSON.stringify(rows)).not.toContain('sk-test-key');
+  });
+
+  it('registers all deduped preset availableModels and openai-completions protocol for openai authType', () => {
+    const rows = buildDshOverlay({
+      llm: {
+        provider: 'glm5.3',
+        model: 'glm-5.3-flash',
+        authType: 'openai',
+        availableModels: ['glm-5.3-flash', 'glm-5.3-flashx', 'glm-5.3', 'glm-5.3-flash'],
+        baseUrl: 'https://open.example.com/v1',
+        apiKey: 'sk-openai-secret',
+        contextWindow: 1_000_000,
+      },
+    });
+    const adapterRow = rows.find((row) => row.id === DSH_LLM_PI_AI_ROW_ID);
+    expect(adapterRow?.config).toEqual({
+      providers: {
+        'glm5.3': {
+          api: 'openai-completions',
+          baseURL: 'https://open.example.com/v1',
+          apiKeyEnv: DSH_PROVIDER_API_KEY_ENV,
+          models: [
+            { id: 'glm-5.3-flash', contextWindow: 1_000_000 },
+            { id: 'glm-5.3-flashx', contextWindow: 1_000_000 },
+            { id: 'glm-5.3', contextWindow: 1_000_000 },
+          ],
+        },
+      },
+    });
+    expect(JSON.stringify(rows)).not.toContain('sk-openai-secret');
+  });
+});
+
+describe('DeepseekHarnessProvider /compact and preset models', () => {
+  let provider: DeepseekHarnessProvider;
+  let child: FakeChild;
+  let completions: Array<{ sessionId: string; message: AgentMessage }>;
+  let errors: Array<{ sessionId: string; error: { code: string; message: string; recoverable: boolean } }>;
+
+  beforeEach(async () => {
+    spawnMock.mockReset();
+    writeDshOverlayMock.mockClear();
+    child = new FakeChild();
+    spawnMock.mockImplementation(() => {
+      setImmediate(() => child.emitEvent({
+        type: DSH_BRIDGE_EVENT.READY,
+        sessionId: 'dsh-compact-1',
+        provider: 'glm5.3',
+        model: 'glm-5.3-flash',
+        resumed: false,
+      }));
+      return child;
+    });
+    provider = new DeepseekHarnessProvider();
+    completions = [];
+    errors = [];
+    provider.onComplete((sessionId, message) => completions.push({ sessionId, message }));
+    provider.onError((sessionId, error) => errors.push({ sessionId, error }));
+    await provider.connect({});
+  });
+
+  afterEach(async () => {
+    await provider.disconnect();
+  });
+
+  it('intercepts /compact as DSH_BRIDGE_COMMAND.COMPACT and settles commit, failure, and cancel cleanly', async () => {
+    expect(provider.capabilities.compact).toMatchObject({
+      execution: 'sdk-rpc',
+      verified: true,
+      reassertsSessionSystemText: true,
+    });
+    const sessionId = await provider.createSession({
+      sessionKey: 'dsh-compact-route',
+      cwd: '/tmp/project',
+      agentId: 'glm-5.3-flash',
+      llm: {
+        provider: 'glm5.3',
+        model: 'glm-5.3-flash',
+        availableModels: ['glm-5.3-flash', 'glm-5.3-flashx'],
+      },
+    });
+    expect(await provider.listModels()).toEqual({
+      models: [
+        { id: 'glm5.3/glm-5.3-flash', name: 'glm5.3 · glm-5.3-flash' },
+        { id: 'glm5.3/glm-5.3-flashx', name: 'glm5.3 · glm-5.3-flashx' },
+      ],
+      isAuthenticated: true,
+    });
+
+    const compactDone = provider.send(sessionId, '/compact');
+    await vi.waitFor(() => expect(child.commands().some((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toBe(true), { timeout: 2_000 });
+    expect(child.commands().some((c) => c.type === DSH_BRIDGE_COMMAND.PROMPT)).toBe(false);
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: true });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACTING, active: false, committed: true });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACT_RESULT, ok: true, committed: true, shadowedCount: 4, shadowedTokenCount: 1200 });
+    await compactDone;
+    expect(completions.at(-1)?.message).toMatchObject({
+      kind: 'system',
+      role: 'system',
+      metadata: expect.objectContaining({
+        [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+        shadowedCount: 4,
+        shadowedTokenCount: 1200,
+      }),
+    });
+
+    const compactFail = provider.send(sessionId, '/compact');
+    await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toHaveLength(2), { timeout: 2_000 });
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACT_RESULT, ok: false, message: 'No compactable history yet.' });
+    await expect(compactFail).rejects.toThrow('No compactable history yet.');
+    expect(errors.at(-1)?.error).toMatchObject({
+      code: 'PROVIDER_ERROR',
+      message: 'dsh compact failed: No compactable history yet.',
+      recoverable: true,
+    });
+
+    const errCountBeforeCancel = errors.length;
+    const compactCancel = provider.send(sessionId, '/compact');
+    await vi.waitFor(() => expect(child.commands().filter((c) => c.type === DSH_BRIDGE_COMMAND.COMPACT)).toHaveLength(3), { timeout: 2_000 });
+    const stopPromise = provider.cancelAndWait(sessionId);
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.COMPACT_RESULT, ok: false, cancelled: true, message: 'aborted' });
+    await expect(Promise.all([stopPromise, compactCancel])).resolves.toBeDefined();
+    expect(errors).toHaveLength(errCountBeforeCancel);
+  });
+
+  it('strips matching provider prefix when setSessionAgentId updates DSH_BRIDGE_MODEL_ENV', async () => {
+    const sessionId = await provider.createSession({
+      sessionKey: 'dsh-switch-route',
+      cwd: '/tmp/project',
+      agentId: 'glm-5.3-flash',
+      llm: {
+        provider: 'glm5.3',
+        model: 'glm-5.3-flash',
+        availableModels: ['glm-5.3-flash', 'glm-5.3-flashx'],
+      },
+    });
+    await provider.send(sessionId, 'hi');
+    child.emitEvent({ type: DSH_BRIDGE_EVENT.TURN_END, reason: DSH_BRIDGE_TURN_REASON.COMPLETED });
+    await flush();
+
+    const replacement = new FakeChild();
+    spawnMock.mockImplementation(() => {
+      setImmediate(() => replacement.emitEvent({
+        type: DSH_BRIDGE_EVENT.READY,
+        sessionId: 'dsh-compact-1',
+        provider: 'glm5.3',
+        model: 'glm-5.3-flashx',
+        resumed: true,
+      }));
+      return replacement;
+    });
+    provider.setSessionAgentId(sessionId, 'glm5.3/glm-5.3-flashx');
+    await provider.send(sessionId, 'next');
+    const spawnEnv = spawnMock.mock.calls.at(-1)?.[2]?.env as Record<string, string> | undefined;
+    expect(spawnEnv?.[DSH_BRIDGE_MODEL_ENV]).toBe('glm-5.3-flashx');
   });
 });

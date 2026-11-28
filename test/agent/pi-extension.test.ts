@@ -122,6 +122,40 @@ describe('Pi IM.codes extension', () => {
     expect(JSON.stringify(providers)).not.toContain('child-only-key');
   });
 
+  it('registers all deduped preset availableModels and openai-completions protocol for openai authType', async () => {
+    vi.stubEnv(PI_PROVIDER_CONFIG_ENV, JSON.stringify({
+      provider: 'glm5.3',
+      model: 'glm-5.3-flash',
+      baseUrl: 'https://open.example.com/v1',
+      authType: 'openai',
+      availableModels: ['glm-5.3-flash', 'glm-5.3-flashx', 'glm-5.3', 'glm-5.3-flash'],
+      contextWindow: 1_000_000,
+    }));
+    const providers: Array<[string, Record<string, unknown>]> = [];
+    await imcodesPiExtension({
+      registerProvider: (name, config) => providers.push([name, config]),
+      registerTool: () => {},
+      getActiveTools: () => [],
+      setActiveTools: () => {},
+      on: () => {},
+    });
+
+    expect(providers).toEqual([[
+      'glm5.3',
+      expect.objectContaining({
+        baseUrl: 'https://open.example.com/v1',
+        apiKey: `$${PI_PROVIDER_API_KEY_ENV}`,
+        api: 'openai-completions',
+        models: [
+          expect.objectContaining({ id: 'glm-5.3-flash', contextWindow: 1_000_000 }),
+          expect.objectContaining({ id: 'glm-5.3-flashx', contextWindow: 1_000_000 }),
+          expect.objectContaining({ id: 'glm-5.3', contextWindow: 1_000_000 }),
+        ],
+      }),
+    ]]);
+    expect(JSON.stringify(providers)).not.toContain('child-only-key');
+  });
+
   it('mounts MCP tools on session start, proxies execution, and closes on shutdown', async () => {
     const pi = createPiApi();
     await imcodesPiExtension(pi.api);

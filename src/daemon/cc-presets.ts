@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path';
 import {
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
+  inferCcPresetAuthType,
   normalizeCcPresetContextWindow,
   normalizeCcPresetName,
   normalizeCodexBaseUrl,
@@ -456,9 +457,13 @@ export async function getCodexPresetTransportConfig(presetName: string, requeste
   };
 }
 
-export async function getDshPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
+async function resolvePiAiPresetBase(
+  presetName: string,
+  requestedModel: string | undefined,
+  sessionNoun: string,
+): Promise<{
   env: Record<string, string>;
-  llm?: DshLlmConfig;
+  route?: DshLlmConfig & PiLlmConfig;
   model?: string;
   availableModels?: string[];
   systemPrompt?: string;
@@ -470,29 +475,35 @@ export async function getDshPresetTransportConfig(presetName: string, requestedM
   const availableModels = getPresetAvailableModelIds(preset);
   const model = selectPresetModel(preset, requestedModel);
   const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
-  const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
-  const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
-    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
-    || undefined;
+  const authType = inferCcPresetAuthType(preset);
+  const baseUrl = authType === 'openai'
+    ? (resolvedEnv['OPENAI_BASE_URL']?.trim() || resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined)
+    : (resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || resolvedEnv['OPENAI_BASE_URL']?.trim() || undefined);
+  const apiKey = authType === 'openai'
+    ? (resolvedEnv['OPENAI_API_KEY']?.trim() || resolvedEnv['ANTHROPIC_API_KEY']?.trim() || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim() || undefined)
+    : (resolvedEnv['ANTHROPIC_API_KEY']?.trim() || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim() || resolvedEnv['OPENAI_API_KEY']?.trim() || undefined);
 
-  // dsh registers third-party presets through its generic pi-ai adapter. The
-  // API key stays in memory and is passed to the child through a private env
-  // reference; it is never serialized into the generated overlay.
   const env: Record<string, string> = {};
-  if (model) env['ANTHROPIC_MODEL'] = model;
+  if (model) {
+    env['ANTHROPIC_MODEL'] = model;
+    if (authType === 'openai') env['OPENAI_MODEL'] = model;
+  }
 
-  const llm = (model || baseUrl)
+  const routeModel = model ?? availableModels[0];
+  const route = (routeModel || baseUrl)
     ? {
         provider: normalizeCcPresetName(preset.name),
-        model: model ?? availableModels[0],
+        model: routeModel,
+        authType,
+        ...(availableModels.length ? { availableModels } : {}),
         ...(baseUrl ? { baseUrl } : {}),
         ...(apiKey ? { apiKey } : {}),
         ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
       }
     : undefined;
 
-  const runtimeFacts = (model || baseUrl) ? [
-    `Authoritative runtime fact: this session is routed through the "${preset.name}" API provider preset.`,
+  const runtimeFacts = (routeModel || baseUrl) ? [
+    `Authoritative runtime fact: this ${sessionNoun} is routed through the "${preset.name}" API provider preset.`,
     baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
     model ? `Authoritative runtime model: ${model}.` : undefined,
     model ? `If the user asks which model you are using, answer exactly with "${model}".` : undefined,
@@ -502,11 +513,26 @@ export async function getDshPresetTransportConfig(presetName: string, requestedM
 
   return {
     env,
-    ...(llm ? { llm } : {}),
+    ...(route ? { route } : {}),
     ...(model ? { model } : {}),
     ...(availableModels.length ? { availableModels } : {}),
     ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
     ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
+  };
+}
+
+export async function getDshPresetTransportConfig(presetName: string, requestedModel?: string): Promise<{
+  env: Record<string, string>;
+  llm?: DshLlmConfig;
+  model?: string;
+  availableModels?: string[];
+  systemPrompt?: string;
+  contextWindow?: number;
+}> {
+  const { route, ...rest } = await resolvePiAiPresetBase(presetName, requestedModel, 'session');
+  return {
+    ...rest,
+    ...(route ? { llm: route } : {}),
   };
 }
 
@@ -518,41 +544,11 @@ export async function getPiPresetTransportConfig(presetName: string, requestedMo
   systemPrompt?: string;
   contextWindow?: number;
 }> {
-  const preset = await getPreset(presetName);
-  if (!preset) return { env: {} };
-
-  const availableModels = getPresetAvailableModelIds(preset);
-  const model = selectPresetModel(preset, requestedModel);
-  const resolvedEnv = await resolvePresetEnv(presetName, undefined, model);
-  const baseUrl = resolvedEnv['ANTHROPIC_BASE_URL']?.trim() || undefined;
-  const apiKey = resolvedEnv['ANTHROPIC_API_KEY']?.trim()
-    || resolvedEnv['ANTHROPIC_AUTH_TOKEN']?.trim()
-    || undefined;
-  const piLlm = model
-    ? {
-        provider: normalizeCcPresetName(preset.name),
-        model,
-        ...(baseUrl ? { baseUrl } : {}),
-        ...(apiKey ? { apiKey } : {}),
-        ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
-      }
-    : undefined;
-  const runtimeFacts = model ? [
-    `Authoritative runtime fact: this Pi session is routed through the "${preset.name}" API provider preset.`,
-    baseUrl ? `Authoritative provider endpoint: ${baseUrl}.` : undefined,
-    model ? `Authoritative runtime model: ${model}.` : undefined,
-    model ? `If the user asks which model you are using, answer exactly with "${model}".` : undefined,
-    baseUrl ? `If the user asks which provider or endpoint you are using, mention "${baseUrl}".` : undefined,
-    'These runtime facts override any generic default model or provider.',
-  ].filter(Boolean).join(' ') : undefined;
-
+  const { route, ...rest } = await resolvePiAiPresetBase(presetName, requestedModel, 'Pi session');
+  const piLlm = rest.model ? route : undefined;
   return {
-    env: model ? { ANTHROPIC_MODEL: model } : {},
+    ...rest,
     ...(piLlm ? { piLlm } : {}),
-    ...(model ? { model } : {}),
-    ...(availableModels.length ? { availableModels } : {}),
-    ...(runtimeFacts ? { systemPrompt: runtimeFacts } : {}),
-    ...(preset.contextWindow ? { contextWindow: preset.contextWindow } : {}),
   };
 }
 

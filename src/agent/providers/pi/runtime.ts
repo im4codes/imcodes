@@ -46,7 +46,11 @@ export function buildPiRpcArgs(options: {
   args.push('--extension', resolvePiExtensionEntry());
   if (!options.incognito && options.sessionName) args.push('--name', options.sessionName);
   if (options.llm?.provider) args.push('--provider', options.llm.provider);
-  const model = options.requestedModel?.trim() || options.llm?.model;
+  const rawModel = options.requestedModel?.trim() || options.llm?.model;
+  const providerPrefix = options.llm?.provider ? `${options.llm.provider}/` : '';
+  const model = providerPrefix && rawModel?.startsWith(providerPrefix)
+    ? rawModel.slice(providerPrefix.length)
+    : rawModel;
   if (model) args.push('--model', model);
   if (options.effort) args.push('--thinking', options.effort);
   return args;

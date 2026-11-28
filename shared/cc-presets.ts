@@ -90,6 +90,23 @@ function addUniqueModel(target: string[], value: string | undefined): void {
   if (trimmed && !target.includes(trimmed)) target.push(trimmed);
 }
 
+export function inferCcPresetAuthType(
+  preset: Pick<CcPreset, 'env'> & Partial<Pick<CcPreset, 'authType'>>,
+): CcPresetAuthType {
+  return preset.authType ?? (preset.env['OPENAI_BASE_URL'] && !preset.env['ANTHROPIC_BASE_URL'] ? 'openai' : 'anthropic');
+}
+
+export function piAiApiForCcPresetAuthType(authType?: CcPresetAuthType): 'anthropic-messages' | 'openai-completions' {
+  return authType === 'openai' ? 'openai-completions' : 'anthropic-messages';
+}
+
+export function mergeCcPresetModelIds(primaryModel?: string, availableModels?: readonly string[]): string[] {
+  const merged: string[] = [];
+  addUniqueModel(merged, primaryModel);
+  for (const id of availableModels ?? []) addUniqueModel(merged, id);
+  return merged;
+}
+
 /**
  * Runtime-authoritative model for a preset.
  *
@@ -100,8 +117,7 @@ function addUniqueModel(target: string[], value: string | undefined): void {
 export function getCcPresetEffectiveModel(
   preset: Pick<CcPreset, 'defaultModel' | 'env'> & Partial<Pick<CcPreset, 'authType'>>,
 ): string | undefined {
-  const isOpenAi = preset.authType === 'openai'
-    || Boolean(preset.env['OPENAI_BASE_URL'] && !preset.env['ANTHROPIC_BASE_URL']);
+  const isOpenAi = inferCcPresetAuthType(preset) === 'openai';
   const model = isOpenAi
     ? (preset.env['OPENAI_MODEL']?.trim() || preset.defaultModel?.trim() || preset.env['ANTHROPIC_MODEL']?.trim() || '')
     : (preset.env['ANTHROPIC_MODEL']?.trim() || preset.defaultModel?.trim() || preset.env['OPENAI_MODEL']?.trim() || '');

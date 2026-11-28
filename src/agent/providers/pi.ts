@@ -467,7 +467,7 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     const state = this.sessions.get(sessionId);
     if (!state) throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown session ${sessionId}`, false);
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
-    if (isSessionControlCommandText(payload.userMessage, 'compact')) {
+    if (typeof payload.userMessage === 'string' && isSessionControlCommandText(payload.userMessage, 'compact')) {
       if (state.incognito && state.hasStartedChild && !state.child) {
         throw new Error('Incognito conversation ended; start a new session instead of resuming history.');
       }
@@ -530,10 +530,12 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
       state.cancelled = false;
       try {
         const response = await this.request(state, { type: PI_RPC_COMMAND.COMPACT });
+        const wasCancelled = state.cancelled;
+        if (state.child && wasCancelled) this.stopConfirmations.complete(state.child);
         state.turnActive = false;
         state.compacting = false;
         this.clearStatus(sessionId, state);
-        if (state.cancelled) {
+        if (wasCancelled) {
           this.resetTurn(state);
           return;
         }
@@ -559,10 +561,11 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
         this.resetTurn(state);
         for (const cb of this.completeCallbacks) cb(sessionId, completion);
       } catch (error) {
+        const wasCancelled = state.cancelled;
+        if (state.child && wasCancelled) this.stopConfirmations.complete(state.child);
         state.turnActive = false;
         state.compacting = false;
         this.clearStatus(sessionId, state);
-        const wasCancelled = state.cancelled;
         this.resetTurn(state);
         if (wasCancelled) return;
         const providerError = this.makeError(
@@ -629,9 +632,20 @@ export class PiProvider implements TransportProvider, InteractiveQuestionAnswere
     state.requestedModel = model;
     const child = state.child;
     if (child && !state.turnActive) {
-      const slash = model.indexOf('/');
-      const provider = slash > 0 ? model.slice(0, slash) : (state.provider ?? state.llmConfig?.provider);
-      const modelId = slash > 0 ? model.slice(slash + 1) : model;
+      const activeProvider = state.llmConfig?.provider ?? state.provider;
+      let provider: string | undefined;
+      let modelId: string;
+      if (activeProvider && model.startsWith(`${activeProvider}/`)) {
+        provider = activeProvider;
+        modelId = model.slice(activeProvider.length + 1);
+      } else if (state.llmConfig?.provider && state.llmConfig.availableModels?.includes(model)) {
+        provider = state.llmConfig.provider;
+        modelId = model;
+      } else {
+        const slash = model.indexOf('/');
+        provider = slash > 0 ? model.slice(0, slash) : activeProvider;
+        modelId = slash > 0 ? model.slice(slash + 1) : model;
+      }
       if (provider && modelId) {
         void this.request(state, { type: PI_RPC_COMMAND.SET_MODEL, provider, modelId })
           .then((response) => {

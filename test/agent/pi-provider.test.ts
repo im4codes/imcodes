@@ -1083,4 +1083,96 @@ describe('PiProvider', () => {
     expect(sessionBUsingACatalog).toEqual({ input_tokens: 500, output_tokens: 50 });
     expect(sessionBUsingACatalog).not.toHaveProperty('model_context_window');
   });
+
+  it('resolves provider-prefixed and slash-containing preset model switches cleanly and completes Stop during compact cancel', async () => {
+    const customChild = new FakePiChild();
+    spawnMock.mockReturnValue(customChild);
+    customChild.onCommand = (cmd) => {
+      if (cmd.type === PI_RPC_COMMAND.GET_STATE) {
+        return {
+          success: true,
+          data: {
+            sessionId: 'pi-or-1',
+            model: { id: 'openai/gpt-4o', provider: 'openrouter', contextWindow: 128_000 },
+            thinkingLevel: 'medium',
+          },
+        };
+      }
+      if (cmd.type === PI_RPC_COMMAND.SET_MODEL) {
+        return {
+          success: true,
+          data: { id: cmd.modelId, provider: cmd.provider, contextWindow: 200_000 },
+        };
+      }
+      if (cmd.type === PI_RPC_COMMAND.COMPACT) {
+        return { success: false, error: 'Compaction cancelled' };
+      }
+      return undefined;
+    };
+
+    await provider.connect({});
+    const sid = await provider.createSession({
+      sessionKey: 'route-or',
+      sessionName: 'deck_or',
+      cwd: '/tmp',
+      agentId: 'openrouter/openai/gpt-4o',
+      piLlm: {
+        provider: 'openrouter',
+        model: 'openai/gpt-4o',
+        availableModels: ['openai/gpt-4o', 'anthropic/claude-3.5-sonnet'],
+      },
+    });
+    expect(buildPiRpcArgs({
+      sessionId: 'pi-or-1',
+      requestedModel: 'openrouter/openai/gpt-4o',
+      llm: { provider: 'openrouter', model: 'openai/gpt-4o' },
+    })).toEqual(expect.arrayContaining(['--provider', 'openrouter', '--model', 'openai/gpt-4o']));
+
+    await provider.send(sid, 'hello');
+    customChild.emitFrame({ type: PI_RPC_FRAME.AGENT_SETTLED });
+    await flush();
+
+    // Slash-bearing preset model stays on openrouter provider instead of splitting on anthropic/
+    provider.setSessionAgentId(sid, 'anthropic/claude-3.5-sonnet');
+    await flush();
+    // Provider-prefixed preset model strips only matching provider prefix
+    provider.setSessionAgentId(sid, 'openrouter/openai/gpt-4o');
+    await flush();
+
+    const setModels = customChild.written.filter((c) => c.type === PI_RPC_COMMAND.SET_MODEL);
+    expect(setModels.map((c) => ({ provider: c.provider, modelId: c.modelId }))).toEqual([
+      { provider: 'openrouter', modelId: 'anthropic/claude-3.5-sonnet' },
+      { provider: 'openrouter', modelId: 'openai/gpt-4o' },
+    ]);
+
+    // Stopping an in-flight /compact resolves cancelAndWait cleanly when Pi aborts compact
+    const origWrite = customChild.stdin.write;
+    customChild.stdin.write = (chunk: string) => {
+      const command = JSON.parse(chunk.trim()) as Record<string, unknown>;
+      if (command.type === PI_RPC_COMMAND.COMPACT) {
+        customChild.written.push(command);
+        return true;
+      }
+      return origWrite(chunk);
+    };
+    customChild.onCommand = (cmd) => {
+      if (cmd.type === PI_RPC_COMMAND.ABORT) {
+        const pendingCompact = customChild.written.findLast((w) => w.type === PI_RPC_COMMAND.COMPACT);
+        if (pendingCompact) {
+          customChild.emitFrame({
+            type: PI_RPC_FRAME.RESPONSE,
+            id: pendingCompact.id,
+            command: PI_RPC_COMMAND.COMPACT,
+            success: false,
+            error: 'Compaction cancelled',
+          });
+        }
+        return { success: true };
+      }
+      return undefined;
+    };
+    const compactPromise = provider.send(sid, '/compact');
+    await flush();
+    await expect(Promise.all([provider.cancelAndWait(sid), compactPromise])).resolves.toBeDefined();
+  });
 });

@@ -1,3 +1,5 @@
+import type { CcPresetAuthType } from './cc-presets.js';
+
 /** Shared vocabulary for the Pi coding-agent RPC adapter. */
 
 export const PI_RPC_COMMAND = {
@@ -59,6 +61,8 @@ export interface PiLlmConfig {
   model: string;
   baseUrl?: string;
   apiKey?: string;
+  authType?: CcPresetAuthType;
+  availableModels?: string[];
   contextWindow?: number;
   maxTokens?: number;
 }

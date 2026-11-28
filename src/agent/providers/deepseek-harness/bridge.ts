@@ -44,12 +44,26 @@ interface DshSession {
   requestContext?(): { provider?: string; model?: string; contextWindow?: number } | undefined;
 }
 
+interface DshAgentModel {
+  select?(selection: { provider: string; model: string }): void;
+  current?(): DshModelSelection | undefined;
+}
+
 interface DshAgent {
   session: DshSession;
+  model?: DshAgentModel;
   whenIdle(): Promise<void>;
   followup(message: unknown): void;
   steer(message: unknown): void;
   cancel?(cause?: { kind: string }): void;
+}
+
+interface DshCompactionService {
+  compactNow?(
+    agent: DshAgent,
+    signal: AbortSignal,
+    sourceCommandId?: string,
+  ): Promise<{ shadowedSeqs?: unknown[]; shadowedTokenCount?: number } | null>;
 }
 
 interface DshAgentHandle {
@@ -202,6 +216,8 @@ export function dispatchDshBridgeCommand(
   agent: DshAgent,
   command: DshBridgeCommand,
   requestExit: (code: number) => void,
+  onCompact?: () => void,
+  onCancel?: () => void,
 ): void {
   switch (command.type) {
     case DSH_BRIDGE_COMMAND.PROMPT:
@@ -214,7 +230,11 @@ export function dispatchDshBridgeCommand(
         agent.steer(buildUserMessage(command.text));
       }
       return;
+    case DSH_BRIDGE_COMMAND.COMPACT:
+      onCompact?.();
+      return;
     case DSH_BRIDGE_COMMAND.CANCEL:
+      onCancel?.();
       // dsh 0.2.x `ReactLoopAgent.cancel(cause)` reads `cause.kind`.
       agent.cancel?.({ kind: 'user' });
       return;
@@ -418,10 +438,13 @@ async function start(ctx: DshPluginContext): Promise<void> {
   const selection = defaultModel.currentSelection();
   const resumeSessionId = process.env[DSH_BRIDGE_RESUME_ENV]?.trim();
   const cwd = process.env[DSH_BRIDGE_CWD_ENV]?.trim() || process.cwd();
-  // The route always comes from the user's own `~/.dsh` selection; only the
-  // model is overridable by IM.codes, which is why it can be applied on the
-  // very first boot without needing to know the route.
-  const requestedModel = process.env[DSH_BRIDGE_MODEL_ENV]?.trim();
+  // The route always comes from the user's own `~/.dsh` or preset selection;
+  // only the model is overridable by IM.codes on spawn/resume.
+  const rawRequestedModel = process.env[DSH_BRIDGE_MODEL_ENV]?.trim();
+  const providerPrefix = selection.provider ? `${selection.provider}/` : '';
+  const requestedModel = providerPrefix && rawRequestedModel?.startsWith(providerPrefix)
+    ? rawRequestedModel.slice(providerPrefix.length)
+    : rawRequestedModel;
   const effectiveModel = requestedModel || selection.model;
   const agentOptions = {
     ...(selection.provider ? { provider: selection.provider } : {}),
@@ -433,7 +456,20 @@ async function start(ctx: DshPluginContext): Promise<void> {
   if (resumeSessionId) {
     try {
       // dsh 0.2.x expects `resumeSessionId`; `sessionId` is retained for 0.1.x compatibility.
-      handle = await agents.resume({ resumeSessionId, sessionId: resumeSessionId, agentOptions });
+      // Explicitly apply requestedModel in setup() because `AgentModel.current()` keeps the
+      // previously recorded `lastUsed` selection unless a new `model/selection` is written.
+      handle = await agents.resume({
+        resumeSessionId,
+        sessionId: resumeSessionId,
+        agentOptions,
+        ...(requestedModel && selection.provider
+          ? {
+              setup: (_agentCtx: unknown, resumedAgent: DshAgent) => {
+                resumedAgent.model?.select?.({ provider: selection.provider!, model: requestedModel });
+              },
+            }
+          : {}),
+      });
       resumed = true;
     } catch (err) {
       // A resume target can be missing after a session-store prune. Falling
@@ -450,7 +486,8 @@ async function start(ctx: DshPluginContext): Promise<void> {
   subscribe(ctx, agent);
   await agent.whenIdle();
 
-  const readyModel = (resumed ? readString(agent.session.requestContext?.()?.model) : undefined) ?? effectiveModel;
+  const liveModel = readString(agent.model?.current?.()?.model);
+  const readyModel = liveModel ?? (resumed ? readString(agent.session.requestContext?.()?.model) : undefined) ?? effectiveModel;
   emit({
     type: DSH_BRIDGE_EVENT.READY,
     sessionId: agent.session.id,
@@ -460,6 +497,56 @@ async function start(ctx: DshPluginContext): Promise<void> {
   });
 
   const rl = createInterface({ input: process.stdin });
+  let activeCompactAbort: AbortController | null = null;
+  const runManualCompact = async (): Promise<void> => {
+    if (activeCompactAbort) {
+      emit({
+        type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+        ok: false,
+        message: 'Compaction already in progress.',
+      });
+      return;
+    }
+    const compaction = ctx.get('compaction') as DshCompactionService | undefined;
+    if (!compaction?.compactNow) {
+      emit({
+        type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+        ok: false,
+        message: 'Compaction service unavailable.',
+      });
+      return;
+    }
+    const abort = new AbortController();
+    activeCompactAbort = abort;
+    try {
+      const result = await compaction.compactNow(agent, abort.signal);
+      if (result === null) {
+        emit({
+          type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+          ok: false,
+          message: 'No compactable history yet.',
+        });
+        return;
+      }
+      await sessions.flush(agent.session).catch(() => {});
+      emit({
+        type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+        ok: true,
+        committed: true,
+        ...(Array.isArray(result.shadowedSeqs) ? { shadowedCount: result.shadowedSeqs.length } : {}),
+        ...(typeof result.shadowedTokenCount === 'number' ? { shadowedTokenCount: result.shadowedTokenCount } : {}),
+      });
+    } catch (err) {
+      emit({
+        type: DSH_BRIDGE_EVENT.COMPACT_RESULT,
+        ok: false,
+        ...(abort.signal.aborted ? { cancelled: true } : {}),
+        message: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      if (activeCompactAbort === abort) activeCompactAbort = null;
+    }
+  };
 
   // Two paths request termination — an explicit `shutdown` command and the
   // daemon closing stdin — and they can race. Windows makes that race fatal:
@@ -471,6 +558,7 @@ async function start(ctx: DshPluginContext): Promise<void> {
   const requestExit = (code: number): void => {
     if (exiting) return;
     exiting = true;
+    activeCompactAbort?.abort();
     rl.close();
     void sessions.flush(agent.session).catch(() => {}).then(() => {
       const appExit = ctx.get('appExit');
@@ -493,7 +581,13 @@ async function start(ctx: DshPluginContext): Promise<void> {
       warn('ignored malformed command line');
       return;
     }
-    dispatchDshBridgeCommand(agent, command, requestExit);
+    dispatchDshBridgeCommand(
+      agent,
+      command,
+      requestExit,
+      () => { void runManualCompact(); },
+      () => { activeCompactAbort?.abort(); },
+    );
   });
   // The daemon closing stdin is a terminal signal: flush and leave rather than
   // lingering as an orphan holding the session lock.

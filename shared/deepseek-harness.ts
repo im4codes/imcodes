@@ -1,3 +1,5 @@
+import type { CcPresetAuthType } from './cc-presets.js';
+
 /**
  * Wire protocol between the IM.codes daemon and the DeepSeek Harness bridge
  * plugin.
@@ -24,6 +26,8 @@ export const DSH_BRIDGE_COMMAND = {
   PROMPT: 'prompt',
   /** Insert user text at the next safe boundary of the active agent turn. */
   STEER: 'steer',
+  /** Manually compact conversation history through the harness compaction service. */
+  COMPACT: 'compact',
   /** Cancel the in-flight turn without tearing the agent down. */
   CANCEL: 'cancel',
   /** Tear the agent down and exit the process. */
@@ -46,6 +50,8 @@ export const DSH_BRIDGE_EVENT = {
   USAGE: 'usage',
   /** Context compaction lifecycle (`compaction/start` → true, `compaction/end` → false). */
   COMPACTING: 'compacting',
+  /** Outcome of an explicit `compact` command. */
+  COMPACT_RESULT: 'compactResult',
   /** The agent returned to idle; `reason` mirrors the harness turn outcome. */
   TURN_END: 'turnEnd',
   /** A failure the bridge could not attribute to a turn. */
@@ -80,6 +86,10 @@ export interface DshBridgeSteerCommand {
   text: string;
 }
 
+export interface DshBridgeCompactCommand {
+  type: typeof DSH_BRIDGE_COMMAND.COMPACT;
+}
+
 export interface DshBridgeCancelCommand {
   type: typeof DSH_BRIDGE_COMMAND.CANCEL;
 }
@@ -91,6 +101,7 @@ export interface DshBridgeShutdownCommand {
 export type DshBridgeCommand =
   | DshBridgePromptCommand
   | DshBridgeSteerCommand
+  | DshBridgeCompactCommand
   | DshBridgeCancelCommand
   | DshBridgeShutdownCommand;
 
@@ -145,6 +156,16 @@ export interface DshBridgeCompactingEvent {
   committed?: boolean;
 }
 
+export interface DshBridgeCompactResultEvent {
+  type: typeof DSH_BRIDGE_EVENT.COMPACT_RESULT;
+  ok: boolean;
+  committed?: boolean;
+  cancelled?: boolean;
+  message?: string;
+  shadowedCount?: number;
+  shadowedTokenCount?: number;
+}
+
 export interface DshBridgeTurnEndEvent {
   type: typeof DSH_BRIDGE_EVENT.TURN_END;
   reason: DshBridgeTurnReason;
@@ -167,6 +188,7 @@ export type DshBridgeEvent =
   | DshBridgeToolEvent
   | DshBridgeUsageEvent
   | DshBridgeCompactingEvent
+  | DshBridgeCompactResultEvent
   | DshBridgeTurnEndEvent
   | DshBridgeErrorEvent;
 
@@ -228,6 +250,10 @@ export interface DshLlmConfig {
   baseUrl?: string;
   /** API key / auth token for the provider. */
   apiKey?: string;
+  /** Wire protocol family of the preset endpoint ('anthropic' | 'openai'). */
+  authType?: CcPresetAuthType;
+  /** Full preset model catalogue registered under `provider` for runtime switching. */
+  availableModels?: string[];
   /** Context capacity advertised for the selected model. */
   contextWindow?: number;
 }

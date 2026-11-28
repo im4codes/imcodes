@@ -10,6 +10,7 @@
  */
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { mergeCcPresetModelIds, piAiApiForCcPresetAuthType } from '../../../../shared/cc-presets.js';
 import {
   PI_MCP_CONFIG_ENV,
   PI_PROVIDER_API_KEY_ENV,
@@ -150,20 +151,21 @@ function registerPublishedTools(
 export default async function imcodesPiExtension(pi: PiExtensionApi): Promise<void> {
   const provider = parseEnvJson<PiLlmConfig>(PI_PROVIDER_CONFIG_ENV);
   if (provider?.provider && provider.model) {
+    const modelIds = mergeCcPresetModelIds(provider.model, provider.availableModels);
     pi.registerProvider(provider.provider, {
       name: provider.provider,
       ...(provider.baseUrl ? { baseUrl: provider.baseUrl } : {}),
       apiKey: `$${PI_PROVIDER_API_KEY_ENV}`,
-      api: 'anthropic-messages',
-      models: [{
-        id: provider.model,
-        name: provider.model,
+      api: piAiApiForCcPresetAuthType(provider.authType),
+      models: modelIds.map((id) => ({
+        id,
+        name: id,
         reasoning: true,
         input: ['text', 'image'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: provider.contextWindow ?? 200_000,
         maxTokens: provider.maxTokens ?? 32_768,
-      }],
+      })),
     });
   }
 

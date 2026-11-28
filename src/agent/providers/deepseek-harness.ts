@@ -33,6 +33,7 @@ import type {
   ProviderConfig,
   ProviderCapabilities,
   ProviderError,
+  ProviderModelInfo,
   ProviderModelList,
   ProviderStatusUpdate,
   ProviderUsageUpdate,
@@ -55,6 +56,11 @@ import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '..
 import type { ProviderContextPayload } from '../../../shared/context-types.js';
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../../shared/agent-message.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
+import { mergeCcPresetModelIds } from '../../../shared/cc-presets.js';
+import {
+  SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  isSessionControlCommandText,
+} from '../../../shared/session-control-commands.js';
 import {
   DSH_BRIDGE_COMMAND,
   DSH_BRIDGE_CWD_ENV,
@@ -63,6 +69,7 @@ import {
   DSH_BRIDGE_RESUME_ENV,
   DSH_BRIDGE_TURN_REASON,
   DSH_PROVIDER_API_KEY_ENV,
+  DSH_SESSION_EVENT,
   parseDshBridgeEvent,
   type DshBridgeCommand,
   type DshBridgeEvent,
@@ -159,6 +166,9 @@ interface DeepseekHarnessSessionState {
   lastStatusSignature: string | null;
   /** True while the harness is executing an async context compaction bracket. */
   compacting: boolean;
+  /** Settlement callbacks for an explicit `/compact` command. */
+  compactResolve?: () => void;
+  compactReject?: (err: Error) => void;
   disposed: boolean;
   /** The native-agent fence the live `child` was spawned with. */
   childNativeAgentFence?: NativeAgentFence;
@@ -191,6 +201,13 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // A managed session's dsh child is spawned with the sub-agent, workflow
     // and Ralph rows disabled in its overlay.
     nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
+    compact: {
+      execution: 'sdk-rpc',
+      verified: true,
+      completion: 'provider-event',
+      cancellation: 'provider-cancel',
+      reassertsSessionSystemText: true,
+    },
   };
 
   private config: ProviderConfig | null = null;
@@ -327,7 +344,12 @@ export class DeepseekHarnessProvider implements TransportProvider {
 
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.sessions.get(sessionId);
-    const model = agentId.trim();
+    const rawModel = agentId.trim();
+    const provider = state?.llmConfig?.provider ?? state?.provider;
+    const providerPrefix = provider ? `${provider}/` : '';
+    const model = providerPrefix && rawModel.startsWith(providerPrefix)
+      ? rawModel.slice(providerPrefix.length)
+      : rawModel;
     if (!state || !model || state.requestedModel === model) return;
     state.requestedModel = model;
     // The model is chosen when the agent is created, so it only takes effect on
@@ -353,6 +375,10 @@ export class DeepseekHarnessProvider implements TransportProvider {
       throw this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, `Unknown session ${sessionId}`, false);
     }
     const payload = normalizeProviderPayload(payloadOrMessage, attachments, extraSystemPrompt);
+    if (typeof payload.userMessage === 'string' && isSessionControlCommandText(payload.userMessage, 'compact')) {
+      await this.compactSession(state);
+      return;
+    }
     const systemParts = getProviderSystemTextParts(payload);
     const sessionSystemText = systemParts.sessionSystemText;
     // Stable session instructions are re-sent only when they change; the harness
@@ -385,6 +411,34 @@ export class DeepseekHarnessProvider implements TransportProvider {
     // is a silent no-op on a closed stdin, and committing here would leave a
     // retried turn permanently stripped of its session instructions.
     state.pendingSessionSystemText = includeSessionSystemText ? sessionSystemText : undefined;
+  }
+
+  private async compactSession(state: DeepseekHarnessSessionState): Promise<void> {
+    const sessionId = state.routeId;
+    if (state.turnActive) {
+      throw this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, 'dsh compact failed: session has an active turn', true);
+    }
+    this.emitStatus(sessionId, state, { status: 'compacting', label: 'Compacting conversation...' });
+    state.turnGeneration++;
+    await this.ensureChild(state);
+    this.resetTurn(state);
+    state.turnActive = true;
+    state.compacting = true;
+    state.cancelled = false;
+    const compactPromise = new Promise<void>((resolve, reject) => {
+      state.compactResolve = resolve;
+      state.compactReject = reject;
+    });
+    if (!this.write(state, { type: DSH_BRIDGE_COMMAND.COMPACT })) {
+      state.compactResolve = undefined;
+      state.compactReject = undefined;
+      state.turnActive = false;
+      state.compacting = false;
+      this.clearStatus(sessionId, state);
+      this.resetTurn(state);
+      throw this.makeError(PROVIDER_ERROR_CODES.CONNECTION_LOST, 'dsh bridge stdin is unavailable', true);
+    }
+    await compactPromise;
   }
 
   async notifyActiveDelegation(
@@ -448,14 +502,26 @@ export class DeepseekHarnessProvider implements TransportProvider {
   }
 
   /**
-   * The harness resolves provider routes and model catalogues from its own
-   * `~/.dsh` configuration, so IM.codes advertises none. This must still be
-   * implemented: once the provider is connected the daemon stops consulting the
-   * passive list and would otherwise report `Unsupported agentType` in the
-   * model picker.
+   * Advertise preset-registered models when a ccPreset session is active;
+   * non-preset sessions resolve models from the user's `~/.dsh` config.
    */
   async listModels(): Promise<ProviderModelList> {
-    return { models: [] };
+    const models: ProviderModelInfo[] = [];
+    const seen = new Set<string>();
+    for (const state of this.sessions.values()) {
+      if (state.disposed || !state.llmConfig) continue;
+      const provider = state.llmConfig.provider;
+      for (const rawId of mergeCcPresetModelIds(state.llmConfig.model, state.llmConfig.availableModels)) {
+        const id = provider && !rawId.includes('/') ? `${provider}/${rawId}` : rawId;
+        if (seen.has(id)) continue;
+        seen.add(id);
+        models.push({
+          id,
+          name: provider ? `${provider} · ${rawId}` : rawId,
+        });
+      }
+    }
+    return models.length > 0 ? { models, isAuthenticated: true } : { models: [] };
   }
 
   getMemoryMcpStatus(): MemoryMcpProviderStatusView {
@@ -644,12 +710,18 @@ export class DeepseekHarnessProvider implements TransportProvider {
 
   /** Drop this session's references to its child without terminating it. */
   private detachChild(state: DeepseekHarnessSessionState): void {
+    const rejectCompact = state.compactReject;
+    state.compactResolve = undefined;
+    state.compactReject = undefined;
     state.child = null;
     state.childNativeAgentFence = undefined;
     state.reader?.close();
     state.reader = null;
     state.readyPromise = null;
     state.readySettled = false;
+    if (rejectCompact) {
+      rejectCompact(new Error('dsh bridge disconnected during compaction'));
+    }
   }
 
   /**
@@ -839,6 +911,52 @@ export class DeepseekHarnessProvider implements TransportProvider {
           this.emitStatus(sessionId, state, { status: null, label: null, compactionOutcome: 'failed' });
         }
         return;
+      case DSH_BRIDGE_EVENT.COMPACT_RESULT: {
+        const resolveCompact = state.compactResolve;
+        const rejectCompact = state.compactReject;
+        state.compactResolve = undefined;
+        state.compactReject = undefined;
+        if (state.child) this.stopConfirmations.complete(state.child);
+        state.turnActive = false;
+        state.compacting = false;
+        this.clearStatus(sessionId, state);
+        if (event.ok) {
+          this.refreshSessionSystemText(sessionId);
+          const completion: AgentMessage = {
+            id: `${state.routeId}:context-compaction:${Date.now()}`,
+            sessionId,
+            kind: 'system',
+            role: 'system',
+            content: 'DeepSeek Harness context compacted.',
+            timestamp: Date.now(),
+            status: 'complete',
+            metadata: {
+              provider: this.id,
+              event: DSH_SESSION_EVENT.COMPACTION_END,
+              [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact',
+              ...(state.harnessSessionId ? { resumeId: state.harnessSessionId } : {}),
+              ...(event.shadowedCount !== undefined ? { shadowedCount: event.shadowedCount } : {}),
+              ...(event.shadowedTokenCount !== undefined ? { shadowedTokenCount: event.shadowedTokenCount } : {}),
+            },
+          };
+          this.resetTurn(state);
+          for (const cb of this.completeCallbacks) cb(sessionId, completion);
+          resolveCompact?.();
+          return;
+        }
+        if (event.cancelled || state.cancelled) {
+          state.cancelled = false;
+          this.resetTurn(state);
+          resolveCompact?.();
+          return;
+        }
+        this.resetTurn(state);
+        const message = `dsh compact failed: ${event.message || 'Unknown error'}`;
+        const providerError = this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, true);
+        this.emitError(sessionId, providerError);
+        rejectCompact?.(Object.assign(new Error(message), providerError));
+        return;
+      }
       case DSH_BRIDGE_EVENT.TURN_END:
         if (state.child) this.stopConfirmations.complete(state.child);
         this.finishTurn(state, event.reason, event.message, event.code);
@@ -941,6 +1059,9 @@ export class DeepseekHarnessProvider implements TransportProvider {
   }
 
   private failSession(state: DeepseekHarnessSessionState, message: string): void {
+    const rejectCompact = state.compactReject;
+    state.compactResolve = undefined;
+    state.compactReject = undefined;
     state.rejectReady?.(new Error(message));
     state.rejectReady = null;
     state.resolveReady = null;
@@ -952,6 +1073,7 @@ export class DeepseekHarnessProvider implements TransportProvider {
       message,
       recoverable: true,
     });
+    rejectCompact?.(new Error(message));
   }
 
   // ── Emit helpers ───────────────────────────────────────────────────────────

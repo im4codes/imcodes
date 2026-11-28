@@ -600,4 +600,57 @@ describe('cc presets', () => {
     });
   });
 
+  it('passes availableModels and openai authType to both DSH and Pi preset transport configs without leaking keys in env', async () => {
+    const { savePresets, getDshPresetTransportConfig, getPiPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+    await savePresets([
+      {
+        name: 'openai-compat',
+        authType: 'openai',
+        env: {
+          OPENAI_BASE_URL: 'https://open.example.com/v1',
+          OPENAI_API_KEY: 'sk-openai-only-secret',
+          OPENAI_MODEL: 'model-a',
+        },
+        availableModels: [{ id: 'model-a' }, { id: 'model-b' }],
+        contextWindow: 128_000,
+      },
+    ]);
+
+    const dsh = await getDshPresetTransportConfig('openai-compat', 'model-b');
+    expect(dsh).toMatchObject({
+      env: { ANTHROPIC_MODEL: 'model-b', OPENAI_MODEL: 'model-b' },
+      model: 'model-b',
+      availableModels: ['model-a', 'model-b'],
+      llm: {
+        provider: 'openai-compat',
+        model: 'model-b',
+        authType: 'openai',
+        availableModels: ['model-a', 'model-b'],
+        baseUrl: 'https://open.example.com/v1',
+        apiKey: 'sk-openai-only-secret',
+        contextWindow: 128_000,
+      },
+    });
+    expect(dsh.env).not.toHaveProperty('OPENAI_API_KEY');
+    expect(dsh.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+
+    const pi = await getPiPresetTransportConfig('openai-compat', 'model-b');
+    expect(pi).toMatchObject({
+      env: { ANTHROPIC_MODEL: 'model-b', OPENAI_MODEL: 'model-b' },
+      model: 'model-b',
+      availableModels: ['model-a', 'model-b'],
+      piLlm: {
+        provider: 'openai-compat',
+        model: 'model-b',
+        authType: 'openai',
+        availableModels: ['model-a', 'model-b'],
+        baseUrl: 'https://open.example.com/v1',
+        apiKey: 'sk-openai-only-secret',
+        contextWindow: 128_000,
+      },
+    });
+    expect(pi.env).not.toHaveProperty('OPENAI_API_KEY');
+    expect(pi.env).not.toHaveProperty('ANTHROPIC_API_KEY');
+  });
+
 });
