@@ -19,7 +19,11 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AIDESK_ICONSET_ENTRIES } from './aidesk-icon.mjs';
-import { assertUniversalBinaryCompat } from './build-macos-legacy-open-computer-use.mjs';
+import {
+  assertUniversalBinaryCompat,
+  compareMacosVersions,
+  loadUpstreamLock,
+} from './build-macos-legacy-open-computer-use.mjs';
 import { readMacosRemoteDesktopCodeIdentity } from './macos-remote-desktop-build.mjs';
 import product from '../shared/aidesk-product.json' with { type: 'json' };
 import fsDelegate from '../shared/macos-fs-delegate.json' with { type: 'json' };
@@ -201,12 +205,20 @@ export function copyComputerUseLicense(outPath) {
 }
 
 /**
- * The macOS release the bundle -- its Info.plist and its code -- must run on:
- * the remote-desktop components' declared floor, so one bundle cannot claim
- * support the helpers inside it lack, nor lack support they have.
+ * The macOS release the bundle -- its Info.plist and its dispatcher -- must
+ * run on: the lowest floor among its bundled helpers (macOS 12.0 when carrying
+ * the legacy OpenComputerUse helper, even while RD components keep 12.3).
  */
 export async function resolveAideskMinimumSystemVersion(requested) {
-  const version = requested ?? (await readMacosRemoteDesktopCodeIdentity()).minimumMacosVersion;
+  if (requested !== undefined) {
+    if (!/^\d+(\.\d+)*$/u.test(String(requested ?? ''))) {
+      throw new Error('aiDesk requires a numeric minimum system version');
+    }
+    return String(requested);
+  }
+  const rdFloor = (await readMacosRemoteDesktopCodeIdentity()).minimumMacosVersion;
+  const legacyFloor = loadUpstreamLock().minMacosVersion;
+  const version = compareMacosVersions(legacyFloor, rdFloor) < 0 ? legacyFloor : rdFloor;
   if (!/^\d+(\.\d+)*$/u.test(String(version ?? ''))) {
     throw new Error('aiDesk requires a numeric minimum system version');
   }

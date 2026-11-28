@@ -55,6 +55,10 @@ interface MacosComputerUseRuntimeOptions {
   extractAppArchive?: (archivePath: string, destinationRoot: string) => Promise<void>;
 }
 
+function requiresLegacyMacosComputerUseHelper(darwinRelease?: string): boolean {
+  return selectMacosOpenComputerUseExecutable(darwinRelease) === MACOS_COMPUTER_USE_LEGACY_EXECUTABLE;
+}
+
 export function parseDarwinMajorVersion(darwinRelease: string = release()): number | null {
   const match = /^(\d+)(?:\.|$)/.exec(darwinRelease.trim());
   if (!match) return null;
@@ -135,27 +139,25 @@ export async function verifyMacosComputerUseAppBundle(path: string): Promise<voi
 export function macosComputerUseAppBundleForExecutable(executablePath: string): string | null {
   const appPath = dirname(dirname(dirname(resolve(executablePath))));
   const appName = basename(appPath);
-  const resolved = resolve(executablePath);
-  if (appName === MACOS_AIDESK_APP_NAME) {
-    if (resolved === join(appPath, 'Contents', 'MacOS', MACOS_AIDESK_EXECUTABLE)
-      || resolved === join(appPath, 'Contents', 'Helpers', MACOS_COMPUTER_USE_EXECUTABLE)
-      || resolved === join(appPath, 'Contents', 'Helpers', MACOS_COMPUTER_USE_LEGACY_EXECUTABLE)) {
-      return appPath;
-    }
-    return null;
-  }
-  if (appName === MACOS_COMPUTER_USE_APP_NAME) {
-    return resolved === join(appPath, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE)
-      ? appPath
+  const executable = appName === MACOS_AIDESK_APP_NAME
+    ? MACOS_AIDESK_EXECUTABLE
+    : appName === MACOS_COMPUTER_USE_APP_NAME
+      ? MACOS_COMPUTER_USE_EXECUTABLE
       : null;
-  }
-  return null;
+  if (!executable) return null;
+  return resolve(executablePath) === join(appPath, 'Contents', 'MacOS', executable)
+    ? appPath
+    : null;
 }
 
 async function assertLegacyHelperAvailableForBundle(appPath: string, darwinRelease?: string): Promise<void> {
-  if (selectMacosOpenComputerUseExecutable(darwinRelease) !== MACOS_COMPUTER_USE_LEGACY_EXECUTABLE) {
+  if (!requiresLegacyMacosComputerUseHelper(darwinRelease)) {
     return;
   }
+  await assertLegacyHelperPresent(appPath);
+}
+
+async function assertLegacyHelperPresent(appPath: string): Promise<void> {
   if (basename(appPath) !== MACOS_AIDESK_APP_NAME) {
     throw new Error('macos_legacy_open_computer_use_helper_unavailable');
   }
@@ -245,7 +247,9 @@ async function readSourceDigest(path: string): Promise<string | null> {
 async function publishAppBundle(
   sourceArchive: string,
   runtimeRoot: string,
-  options: Required<Pick<MacosComputerUseRuntimeOptions, 'verifyAppBundle' | 'extractAppArchive'>> & Pick<MacosComputerUseRuntimeOptions, 'darwinRelease'>,
+  options: Required<Pick<MacosComputerUseRuntimeOptions, 'verifyAppBundle' | 'extractAppArchive'>> & {
+    requireLegacyHelper?: boolean;
+  },
 ): Promise<string> {
   if (!await isRegularFile(sourceArchive)) throw new Error('computer_use_helper_not_installed');
   const sourceDigest = await sha256File(sourceArchive);
@@ -259,7 +263,9 @@ async function publishAppBundle(
       if (!await isRegularFile(join(existing, 'Contents', 'MacOS', executable))) continue;
       try {
         await options.verifyAppBundle(existing);
-        await assertLegacyHelperAvailableForBundle(existing, options.darwinRelease);
+        if (options.requireLegacyHelper) {
+          await assertLegacyHelperPresent(existing);
+        }
         return existing;
       } catch {
         // A matching archive digest never authorizes an invalid or legacy-incomplete app.
@@ -292,7 +298,9 @@ async function publishAppBundle(
       throw new Error('computer_use_helper_not_installed');
     }
     await options.verifyAppBundle(extractedApp);
-    await assertLegacyHelperAvailableForBundle(extractedApp, options.darwinRelease);
+    if (options.requireLegacyHelper) {
+      await assertLegacyHelperPresent(extractedApp);
+    }
 
     let movedExisting = false;
     let publishedNew = false;
@@ -391,7 +399,7 @@ export async function prepareMacosComputerUseRuntime(
     appPath = await publishAppBundle(sourceOpenComputerUseArchive, runtimeRoot, {
       verifyAppBundle,
       extractAppArchive,
-      darwinRelease: options.darwinRelease,
+      requireLegacyHelper: requiresLegacyMacosComputerUseHelper(options.darwinRelease),
     });
     await publishFile(
       sourceOpenComputerUseArchive,

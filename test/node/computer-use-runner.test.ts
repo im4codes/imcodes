@@ -3,6 +3,9 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync
 import { tmpdir } from 'node:os';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  verifyMacosComputerUseExecutable,
+} from '../../src/node/macos-computer-use.js';
+import {
   browserExecutableCandidatesForTest,
   browserAutomationEndpointForTest,
   browserAttachEndpointForTest,
@@ -300,6 +303,79 @@ describe('computer use runner open-computer-use CLI', () => {
     await expect(verifyOpenComputerUseBinaryForLaunchForTest(binary, 'darwin', verify))
       .rejects.toThrow('signature changed');
     expect(verify).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects IMCODES_COMPUTER_USE_EXE direct Contents/Helpers bypasses and wrong-OS overrides while keeping aidesk-agent and Darwin >= 23 standalone app', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imcodes-ocu-runner-override-'));
+    try {
+      const aiDeskApp = join(root, 'aiDesk.to by IM.codes.app');
+      const aiDeskAgent = join(aiDeskApp, 'Contents', 'MacOS', 'aidesk-agent');
+      const helperOfficial = join(aiDeskApp, 'Contents', 'Helpers', 'OpenComputerUse');
+      const helperLegacy = join(aiDeskApp, 'Contents', 'Helpers', 'OpenComputerUseLegacy');
+      const standaloneApp = join(root, 'Open Computer Use.app');
+      const standaloneBin = join(standaloneApp, 'Contents', 'MacOS', 'OpenComputerUse');
+      for (const dir of [join(aiDeskApp, 'Contents', 'MacOS'), join(aiDeskApp, 'Contents', 'Helpers'), join(standaloneApp, 'Contents', 'MacOS')]) {
+        mkdirSync(dir, { recursive: true });
+      }
+      for (const file of [aiDeskAgent, helperOfficial, helperLegacy, standaloneBin]) {
+        writeFileSync(file, 'bin');
+      }
+
+      const verifyForRelease = (darwinRelease: string) => async (candidate: string) => {
+        try {
+          await verifyMacosComputerUseExecutable(candidate, async () => {}, darwinRelease);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      const common = {
+        platform: 'darwin' as const,
+        arch: 'arm64',
+        moduleFilePath: join(root, 'missing', 'computer-use-runner.js'),
+        entryFilePath: join(root, 'missing', 'imcodes'),
+        cwd: root,
+        fileExists: async () => true,
+      };
+
+      // Direct Contents/Helpers/* overrides are rejected on both Darwin 21 and Darwin 23
+      await expect(resolveOpenComputerUseBinaryForTest({
+        ...common,
+        env: { IMCODES_COMPUTER_USE_EXE: helperOfficial, PATH: '/usr/bin' },
+        verifyTrustedArtifact: verifyForRelease('21.6.0'),
+      })).rejects.toThrow('signed_macos_open_computer_use_helper_unavailable');
+      await expect(resolveOpenComputerUseBinaryForTest({
+        ...common,
+        env: { IMCODES_COMPUTER_USE_EXE: helperLegacy, PATH: '/usr/bin' },
+        verifyTrustedArtifact: verifyForRelease('23.0.0'),
+      })).rejects.toThrow('signed_macos_open_computer_use_helper_unavailable');
+
+      // Standalone Open Computer Use.app is rejected on Darwin 21 but accepted on Darwin >= 23
+      await expect(resolveOpenComputerUseBinaryForTest({
+        ...common,
+        env: { IMCODES_COMPUTER_USE_EXE: standaloneBin, PATH: '/usr/bin' },
+        verifyTrustedArtifact: verifyForRelease('21.6.0'),
+      })).rejects.toThrow('signed_macos_open_computer_use_helper_unavailable');
+      await expect(resolveOpenComputerUseBinaryForTest({
+        ...common,
+        env: { IMCODES_COMPUTER_USE_EXE: standaloneBin, PATH: '/usr/bin' },
+        verifyTrustedArtifact: verifyForRelease('23.0.0'),
+      })).resolves.toBe(standaloneBin);
+
+      // Canonical aidesk-agent dispatcher succeeds on both Darwin 21 and Darwin 23
+      await expect(resolveOpenComputerUseBinaryForTest({
+        ...common,
+        env: { IMCODES_COMPUTER_USE_EXE: aiDeskAgent, PATH: '/usr/bin' },
+        verifyTrustedArtifact: verifyForRelease('21.6.0'),
+      })).resolves.toBe(aiDeskAgent);
+      await expect(resolveOpenComputerUseBinaryForTest({
+        ...common,
+        env: { IMCODES_COMPUTER_USE_EXE: aiDeskAgent, PATH: '/usr/bin' },
+        verifyTrustedArtifact: verifyForRelease('23.0.0'),
+      })).resolves.toBe(aiDeskAgent);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('production Windows selection rejects PATH and unsigned helpers before choosing the anchored candidate', async () => {

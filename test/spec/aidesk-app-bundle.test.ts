@@ -23,6 +23,7 @@ import {
   machoMinimumSystemVersion,
   resolveAideskMinimumSystemVersion,
 } from '../../scripts/build-aidesk-app.mjs';
+import { compareMacosVersions, loadUpstreamLock } from '../../scripts/build-macos-legacy-open-computer-use.mjs';
 import { macosArtifactSupportsStapling } from '../../scripts/macos-release-signing.mjs';
 import {
   MACOS_FS_DELEGATE_APP_OPS,
@@ -141,11 +142,18 @@ describe('aiDesk application bundle', () => {
     expect([...AIDESK_ARCHITECTURES]).toEqual(['arm64', 'x86_64']);
   });
 
-  it('takes its macOS floor from the remote-desktop components', async () => {
+  it('takes its macOS floor from the lowest bundled helper requirement (12.0 for legacy OCU while RD keeps 12.3)', async () => {
     const identity = JSON.parse(
       readSource('native/macos-remote-desktop/code-identity.json'),
     ) as { minimumMacosVersion: string };
-    await expect(resolveAideskMinimumSystemVersion()).resolves.toBe(identity.minimumMacosVersion);
+    const legacyLock = loadUpstreamLock();
+    const resolvedFloor = await resolveAideskMinimumSystemVersion();
+    expect(identity.minimumMacosVersion).toBe('12.3');
+    expect(legacyLock.minMacosVersion).toBe('12.0');
+    expect(resolvedFloor).toBe(legacyLock.minMacosVersion);
+    expect(compareMacosVersions(resolvedFloor, identity.minimumMacosVersion)).toBeLessThanOrEqual(0);
+    expect(buildAideskInfoPlist({ version: '2026.9.1', minimumSystemVersion: resolvedFloor }))
+      .toContain('<key>LSMinimumSystemVersion</key>\n  <string>12.0</string>');
     await expect(resolveAideskMinimumSystemVersion('13.0')).resolves.toBe('13.0');
     await expect(resolveAideskMinimumSystemVersion('latest')).rejects.toThrow();
   });

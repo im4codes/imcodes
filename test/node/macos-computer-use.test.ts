@@ -372,17 +372,33 @@ describe('macOS Computer Use runtime boundary', () => {
     const dir = await tempDir();
     await writeExtractedAiDesk(dir, 'aidesk-v1', { includeLegacyHelper: true });
     const app = join(dir, MACOS_AIDESK_APP_NAME);
+    const dispatcher = join(app, 'Contents', 'MacOS', 'aidesk-agent');
     const officialHelper = join(app, 'Contents', 'Helpers', 'OpenComputerUse');
     const legacyHelper = join(app, 'Contents', 'Helpers', 'OpenComputerUseLegacy');
     expect(resolveMacosAideskHelperExecutable(app, '21.6.0')).toBe(legacyHelper);
     expect(resolveMacosAideskHelperExecutable(app, '23.0.0')).toBe(officialHelper);
-    expect(macosComputerUseAppBundleForExecutable(officialHelper)).toBe(app);
-    expect(macosComputerUseAppBundleForExecutable(legacyHelper)).toBe(app);
+
+    // Direct Contents/Helpers/* overrides must be rejected so single-app TCC & native Darwin routing are never bypassed
+    expect(macosComputerUseAppBundleForExecutable(officialHelper)).toBeNull();
+    expect(macosComputerUseAppBundleForExecutable(legacyHelper)).toBeNull();
+    expect(macosComputerUseAppBundleForExecutable(dispatcher)).toBe(app);
 
     const verify = vi.fn(async () => {});
-    await expect(verifyMacosComputerUseExecutable(join(app, 'Contents', 'MacOS', 'aidesk-agent'), verify, '21.6.0')).resolves.toBeUndefined();
-    await expect(verifyMacosComputerUseExecutable(legacyHelper, verify, '21.6.0')).resolves.toBeUndefined();
+    await expect(verifyMacosComputerUseExecutable(dispatcher, verify, '21.6.0')).resolves.toBeUndefined();
+    await expect(verifyMacosComputerUseExecutable(dispatcher, verify, '23.0.0')).resolves.toBeUndefined();
+    await expect(verifyMacosComputerUseExecutable(officialHelper, verify, '23.0.0'))
+      .rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
+    await expect(verifyMacosComputerUseExecutable(legacyHelper, verify, '21.6.0'))
+      .rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
     expect(verify).toHaveBeenCalledWith(app);
+
+    // Standalone Open Computer Use.app succeeds on Darwin >= 23 and fails on Darwin 21-22
+    const standaloneDir = await tempDir();
+    await writeExtractedApp(standaloneDir, 'ocu-standalone');
+    const standaloneExe = join(standaloneDir, 'Open Computer Use.app', 'Contents', 'MacOS', 'OpenComputerUse');
+    await expect(verifyMacosComputerUseExecutable(standaloneExe, async () => {}, '23.0.0')).resolves.toBeUndefined();
+    await expect(verifyMacosComputerUseExecutable(standaloneExe, async () => {}, '21.6.0'))
+      .rejects.toThrow('macos_legacy_open_computer_use_helper_unavailable');
 
     // Reject bundles missing OpenComputerUseLegacy on macOS 12-13, while allowing them on macOS 14+
     const incompleteDir = await tempDir();
@@ -417,5 +433,40 @@ describe('macOS Computer Use runtime boundary', () => {
     expect(okRuntime.openComputerUseExecutable).toBe(
       join(dir, 'rt-ok', MACOS_AIDESK_APP_NAME, 'Contents', 'MacOS', 'aidesk-agent'),
     );
+  });
+
+  it('keeps generic installMacosAideskAppFromArchive working on Darwin 21 without OpenComputerUseLegacy while rejecting OCU prep on the same sidecar', async () => {
+    const dir = await tempDir();
+    const installRoot = join(dir, 'shared-aidesk');
+    const sourceNode = join(dir, 'node');
+    const legacyFreeArchive = join(dir, 'aidesk-legacy-free.zip');
+    await writeFile(sourceNode, 'node-v1', { mode: 0o755 });
+    await writeFile(legacyFreeArchive, 'aidesk-archive-without-legacy', { mode: 0o644 });
+
+    const extractAppArchive = vi.fn(async (_archive: string, destination: string) => {
+      await writeExtractedAiDesk(destination, 'aidesk-rd-only', { includeLegacyHelper: false });
+    });
+    const verifyAppBundle = vi.fn(async () => {});
+
+    // Remote Desktop sidecar install & digest reuse succeed even on Darwin 21 when OpenComputerUseLegacy is absent
+    const installed = await installMacosAideskAppFromArchive(legacyFreeArchive, installRoot, {
+      extractAppArchive,
+      verifyAppBundle,
+    });
+    expect(installed).toBe(join(installRoot, MACOS_AIDESK_APP_NAME));
+    await expect(installMacosAideskAppFromArchive(legacyFreeArchive, installRoot, {
+      extractAppArchive,
+      verifyAppBundle,
+    })).resolves.toBe(installed);
+    expect(extractAppArchive).toHaveBeenCalledTimes(1);
+
+    // Computer Use preparation on Darwin 21 using that same legacy-free archive / cached install must still fail closed
+    await expect(prepareMacosComputerUseRuntime(sourceNode, legacyFreeArchive, {
+      runtimeRoot: installRoot,
+      darwinRelease: '21.6.0',
+      extractAppArchive,
+      verifyCodeSignature: async () => {},
+      verifyAppBundle,
+    })).rejects.toThrow('macos_legacy_open_computer_use_helper_unavailable');
   });
 });
