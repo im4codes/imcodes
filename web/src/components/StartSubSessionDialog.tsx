@@ -905,39 +905,42 @@ export function StartSubSessionDialog({ ws, serverId, defaultCwd, allowedAgentTy
           {supportsModelSelection && (
             <div>
               <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.supervision.model')}</div>
-              {modelSuggestions.length > 0 ? (
-                <select
-                  class="input"
-                  id={`sub-session-model-${type}`}
-                  value={requestedModel}
-                  onInput={(e) => {
-                    const val = (e.target as HTMLSelectElement).value;
-                    if (type === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
-                    if (type === 'codex-sdk' && !selectedCcPreset) {
-                      codexModelManuallySelectedRef.current = val.trim().length > 0;
-                    }
-                    if ((type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) && !selectedCcPreset) {
-                      claudeCodeModelManuallySelectedRef.current = val.trim().length > 0;
-                    }
-                    if (type === 'opencode-sdk' && !selectedCcPreset) {
-                      openCodeModelManuallySelectedRef.current = val.trim().length > 0;
-                    }
-                    requestedModelEpochRef.current += 1;
-                    setRequestedModel(val);
-                  }}
-                  style={{ width: '100%' }}
-                >
-                  {!requestedModel && (
-                    <option value="">{t('new_session.default_model')}</option>
-                  )}
-                  {requestedModel.trim() && !modelSuggestions.includes(requestedModel.trim()) && (
-                    <option value={requestedModel.trim()}>{requestedModel.trim()}</option>
-                  )}
-                  {modelSuggestions.map((model) => (
-                    <option key={model} value={model}>{model}</option>
-                  ))}
-                </select>
-              ) : (
+              {modelSuggestions.length > 0 ? (() => {
+                const selectedModel = requestedModel.trim();
+                return (
+                  <select
+                    class="input"
+                    id={`sub-session-model-${type}`}
+                    value={selectedModel}
+                    onInput={(e) => {
+                      const val = (e.target as HTMLSelectElement).value;
+                      if (type === AGY_SDK_PROVIDER_ID) agyModelManuallySelectedRef.current = true;
+                      if (type === 'codex-sdk' && !selectedCcPreset) {
+                        codexModelManuallySelectedRef.current = val.trim().length > 0;
+                      }
+                      if ((type === 'claude-code-sdk' || type === CLAUDE_CODE_CLI_SDK_AGENT_TYPE) && !selectedCcPreset) {
+                        claudeCodeModelManuallySelectedRef.current = val.trim().length > 0;
+                      }
+                      if (type === 'opencode-sdk' && !selectedCcPreset) {
+                        openCodeModelManuallySelectedRef.current = val.trim().length > 0;
+                      }
+                      requestedModelEpochRef.current += 1;
+                      setRequestedModel(val);
+                    }}
+                    style={{ width: '100%' }}
+                  >
+                    {!selectedModel && (
+                      <option value="">{t('new_session.default_model')}</option>
+                    )}
+                    {selectedModel && !modelSuggestions.includes(selectedModel) && (
+                      <option value={selectedModel}>{selectedModel}</option>
+                    )}
+                    {modelSuggestions.map((model) => (
+                      <option key={model} value={model}>{model}</option>
+                    ))}
+                  </select>
+                );
+              })() : (
                 <ModelCombobox
                   className="input"
                   id={`sub-session-model-${type}`}

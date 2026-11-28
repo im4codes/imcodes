@@ -1278,6 +1278,64 @@ describe('StartSubSessionDialog', () => {
     });
   });
 
+  it('preserves whitespace-padded custom model and selects default on whitespace-only input when late live catalog arrives (grok-sdk regression)', async () => {
+    const handlers = new Set<(message: unknown) => void>();
+    const ws = {
+      ...makeWs(),
+      connected: true,
+      onMessage: (cb: (message: unknown) => void) => {
+        handlers.add(cb);
+        return () => handlers.delete(cb);
+      },
+    };
+    const onStart = vi.fn();
+    render(
+      <StartSubSessionDialog
+        ws={ws as any}
+        defaultCwd="/tmp"
+        isProviderConnected={() => false}
+        getRemoteSessions={() => []}
+        refreshSessions={vi.fn()}
+        onStart={onStart}
+        onClose={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /grok_sdk/i }));
+    // Before catalog loads, grok-sdk renders text input ModelCombobox
+    const comboboxInput = screen.getByPlaceholderText('selectModel') as HTMLInputElement;
+    expect(comboboxInput).not.toBeNull();
+    fireEvent.input(comboboxInput, { target: { value: '  custom-grok  ' } });
+
+    // Late live catalog arrives
+    const req = ws.send.mock.calls.find(([msg]) => msg.type === 'transport.list_models' && msg.agentType === 'grok-sdk')?.[0];
+    act(() => handlers.forEach((cb) => cb({
+      type: 'transport.models_response',
+      agentType: 'grok-sdk',
+      requestId: req?.requestId,
+      models: [{ id: 'grok-default' }, { id: 'grok-second' }],
+      defaultModel: 'grok-default',
+    })));
+
+    // Dialog transitions to native <select>, matching trimmed custom option without blank display
+    const select = document.getElementById('sub-session-model-grok-sdk') as HTMLSelectElement;
+    expect(select).not.toBeNull();
+    expect(select.tagName).toBe('SELECT');
+    expect(select.value).toBe('custom-grok');
+    expect(select.selectedIndex).toBeGreaterThanOrEqual(0);
+
+    fireEvent.click(screen.getByRole('button', { name: /launch/i }));
+    expect(onStart).toHaveBeenCalledWith('grok-sdk', undefined, '/tmp', undefined, expect.objectContaining({
+      requestedModel: 'custom-grok',
+    }));
+
+    // Counterexample: whitespace-only input selects default model option
+    fireEvent.input(select, { target: { value: '' } });
+    expect(select.value).toBe('');
+    const defaultOption = Array.from(select.options).find((o) => o.value === '');
+    expect(defaultOption).toBeDefined();
+  });
+
   it('shows Antigravity sub-session options while disconnected', async () => {
     render(<StartSubSessionDialog ws={Object.assign(makeWs(), { connected: false }) as any} defaultCwd="/tmp" isProviderConnected={() => false} getRemoteSessions={() => []} refreshSessions={vi.fn()} onStart={vi.fn()} onClose={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /agy_sdk/i }));
