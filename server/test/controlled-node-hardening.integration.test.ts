@@ -1036,7 +1036,7 @@ describe('controlled-node lost-response recovery across ticket revocation/expiry
       };
       await persistCredential(oldCred, credPath);
 
-      let dropResponse = true;
+      let dropResponse = mode !== 'ticket_never_succeeded_before_revoke';
       let forceFailBeforeHttp = mode === 'ticket_never_succeeded_before_revoke';
       const redeemedTickets: string[] = [];
       const appFetch = makeAppFetch(app, {
@@ -1122,8 +1122,8 @@ describe('controlled-node lost-response recovery across ticket revocation/expiry
         'SELECT id FROM servers WHERE user_id = $1 AND revoked_at IS NULL',
         [userId],
       );
-      expect(activeNodes.rows).toHaveLength(1);
-      expect(res2.credential?.serverId).toBe(activeNodes.rows[0]!.id);
+      expect(activeNodes).toHaveLength(1);
+      expect(res2.credential?.serverId).toBe(activeNodes[0]!.id);
 
       const t2Installs = await db.query<{ redeemed_server_id: string }>(
         'SELECT redeemed_server_id FROM controlled_node_enrollment_installs WHERE enrollment_id = $1',
@@ -1132,12 +1132,12 @@ describe('controlled-node lost-response recovery across ticket revocation/expiry
       if (mode === 'ticket_never_succeeded_before_revoke') {
         // Control: Ticket 1 replay got authoritative 401 -> cleared pending -> Ticket 2 created the single active node.
         expect(redeemedTickets).toEqual([ticket1, ticket1, ticket2]);
-        expect(t2Installs.rows).toHaveLength(1);
+        expect(t2Installs).toHaveLength(1);
       } else {
         // Regression: Ticket 1 had already committed in DB -> Ticket 1 idempotent replay recovered Node A
         // despite later revocation/expiry; Ticket 2 was NEVER redeemed.
         expect(redeemedTickets).toEqual([ticket1, ticket1]);
-        expect(t2Installs.rows).toHaveLength(0);
+        expect(t2Installs).toHaveLength(0);
       }
       expect(await loadPendingReenrollment(pendingPath, { skipPermissionCheck: true })).toBeNull();
     } finally {
