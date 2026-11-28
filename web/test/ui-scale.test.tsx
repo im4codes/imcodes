@@ -309,15 +309,29 @@ describe('whole-page UI scale (%) setting & onboarding', () => {
       navigator: { platform: 'iPad', userAgent: 'Mozilla/5.0 (iPad; CPU OS 17_0 like Mac OS X)', maxTouchPoints: 5 },
       innerWidth: 1024,
     };
+    const ipadCapacitorNarrowDesktopMode: NativePlatformEnvironment = {
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+      nativeHost: { isMacDesktop: false },
+      navigator: { platform: 'MacIntel', userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)', maxTouchPoints: 5 },
+      innerWidth: 500,
+    };
     const androidTablet: NativePlatformEnvironment = {
       capacitor: { isNativePlatform: () => true, getPlatform: () => 'android' },
       navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14)', maxTouchPoints: 5 },
       innerWidth: 900,
     };
+    const androidTabletBothTokens: NativePlatformEnvironment = {
+      navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 Mobile Safari/537.36', maxTouchPoints: 5 },
+      innerWidth: 900,
+    };
     expect(getDefaultUiScale(desktopBrowserNarrow)).toBe(100);
     expect(getDefaultUiScale(pcAppNarrow)).toBe(100);
     expect(getDefaultUiScale(ipad)).toBe(100);
+    expect(getDefaultUiScale(ipadCapacitorNarrowDesktopMode)).toBe(100);
+    expect(readUiScale(ipadCapacitorNarrowDesktopMode)).toBe(100);
     expect(getDefaultUiScale(androidTablet)).toBe(100);
+    expect(getDefaultUiScale(androidTabletBothTokens)).toBe(100);
+    expect(readUiScale(androidTabletBothTokens)).toBe(100);
   });
 
   it('strictly falls back to platform default on corrupt, out-of-range, or blocked localStorage', () => {

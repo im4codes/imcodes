@@ -330,20 +330,26 @@ export function isMobilePhone(env: NativePlatformEnvironment = readNativePlatfor
     return true;
   }
 
+  // iPadOS desktop mode: exposes Macintosh / MacIntel with multi-touch (> 1) without iPhone/iPod tokens.
+  const maxTouchPoints = navigatorLike?.maxTouchPoints ?? 0;
+  if (maxTouchPoints > 1 && (/Macintosh|Mac OS X/i.test(ua) || /MacIntel|Mac/i.test(platform))) {
+    return false;
+  }
+
+  // Explicit Tablet token in UA or platform (must take precedence before Mobile or width fallbacks).
+  if (/\bTablet\b/i.test(ua) || /\bTablet\b/i.test(platform)) {
+    return false;
+  }
+
   const nativePlatform = getNativePlatform(env);
 
   // Android phone handling (both native Capacitor and mobile browsers):
   if (nativePlatform === 'android' || /\bAndroid\b/i.test(ua)) {
     if (/\bMobile\b/i.test(ua)) return true;
-    if (!/\bTablet\b/i.test(ua)) {
-      if (typeof env.innerWidth === 'number' && env.innerWidth > 0) {
-        return env.innerWidth < 768;
-      }
-      if (nativePlatform === 'android') {
-        return true;
-      }
+    if (typeof env.innerWidth === 'number' && env.innerWidth > 0) {
+      return env.innerWidth < 768;
     }
-    return false;
+    return nativePlatform === 'android';
   }
 
   // Capacitor iOS fallback when UA lacks explicit iPhone/iPad tokens (e.g. synthetic test env):
@@ -355,7 +361,7 @@ export function isMobilePhone(env: NativePlatformEnvironment = readNativePlatfor
   }
 
   // Other mobile phone web browsers (e.g. Windows Phone, etc.)
-  return /\bMobile\b/i.test(ua) && !/\bTablet\b/i.test(ua);
+  return /\bMobile\b/i.test(ua);
 }
 
 /**

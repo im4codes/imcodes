@@ -470,6 +470,14 @@ describe('native platform detection and uniform UI scaling', () => {
       innerWidth: 834,
     })).toBe(false);
 
+    // Capacitor desktop mode iPad in 500px narrow window must remain false (tablet, not phone)
+    expect(isMobilePhone({
+      capacitor: { isNativePlatform: () => true, getPlatform: () => 'ios' },
+      nativeHost: { isMacDesktop: false },
+      navigator: { platform: 'MacIntel', userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0)', maxTouchPoints: 5 },
+      innerWidth: 500,
+    })).toBe(false);
+
     // Android tablet
     expect(isMobilePhone({
       capacitor: { isNativePlatform: () => true, getPlatform: () => 'android' },
@@ -484,6 +492,12 @@ describe('native platform detection and uniform UI scaling', () => {
 
     expect(isMobilePhone({
       navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36', maxTouchPoints: 5 },
+    })).toBe(false);
+
+    // Android UA carrying both Tablet and Mobile tokens on 900px tablet must remain false
+    expect(isMobilePhone({
+      navigator: { platform: 'Linux armv8l', userAgent: 'Mozilla/5.0 (Linux; Android 14; Tablet) AppleWebKit/537.36 Mobile Safari/537.36', maxTouchPoints: 5 },
+      innerWidth: 900,
     })).toBe(false);
 
     // Synthetic Capacitor fallback without explicit UA tokens
