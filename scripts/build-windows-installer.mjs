@@ -310,7 +310,7 @@ if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
   Assert-SafeTargetPath $defaultLog $RealProfile -EntryMode
   $script:InstallerLogFile = $defaultLog
 } elseif ($Mode -eq 'InstallOpenCode') {
-  $defaultLog = Join-Path (Join-Path $HomeDir '.imcodes') 'installer-opencode.log'
+  $defaultLog = Join-Path $UserStateDir 'installer-opencode.log'
   Assert-SafeTargetPath $defaultLog $RealProfile -EntryMode
   $script:InstallerLogFile = $defaultLog
 }

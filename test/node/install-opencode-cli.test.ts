@@ -370,6 +370,30 @@ describe('install-opencode-cli', () => {
     expect(isoList).toEqual(['http://127.0.0.1:45555']);
   });
 
+  it('honors IMCODES_HOME when homeDir is omitted and uses explicit homeDir when provided', () => {
+    // 1. Scoped IMCODES_HOME (when homeDir is default/omitted, resolves to IMCODES_HOME)
+    const scopedHome = makeTempDir('scoped-imcodes-home-');
+    writeFileSync(join(scopedHome, 'install.json'), JSON.stringify({ registry: 'https://scoped-env.example/npm/' }));
+
+    const scopedList = resolveCandidateRegistries({
+      env: { IMCODES_HOME: scopedHome },
+      noFallback: true,
+    });
+    expect(scopedList).toEqual(['https://scoped-env.example/npm']);
+
+    // 2. Explicit custom homeDir preserves <customHome>/.imcodes even when IMCODES_HOME is set
+    const explicitHome = makeTempDir('explicit-custom-home-');
+    mkdirSync(join(explicitHome, '.imcodes'), { recursive: true });
+    writeFileSync(join(explicitHome, '.imcodes', 'install.json'), JSON.stringify({ registry: 'https://explicit-custom.example/npm/' }));
+
+    const explicitList = resolveCandidateRegistries({
+      homeDir: explicitHome,
+      env: { IMCODES_HOME: scopedHome },
+      noFallback: true,
+    });
+    expect(explicitList).toEqual(['https://explicit-custom.example/npm']);
+  });
+
   it('verifies staged temp binary BEFORE atomic no-clobber publish and cleans up temp files', async () => {
     const payload = Buffer.from('#!/bin/sh\necho "opencode 2.4.2"\n', 'utf8');
     const tgz = buildTarGz([{ name: 'package/bin/opencode', content: payload, typeflag: '0', mode: 0o755 }]);

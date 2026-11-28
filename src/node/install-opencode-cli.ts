@@ -19,6 +19,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 export const OPENCODE_OFFICIAL_REGISTRY = 'https://registry.npmjs.org';
 export const OPENCODE_MIRROR_REGISTRY = 'https://registry.npmmirror.com';
@@ -233,7 +234,7 @@ export async function isOpenCodeAlreadyInstalled(opts: {
     if (homeDir) {
       const binDir = p.join(homeDir, '.opencode', 'bin');
       const homeBin = p.join(binDir, 'opencode.exe');
-      if (platform === process.platform) {
+      if (process.platform === 'win32') {
         ensureSafeOpenCodePaths(homeDir, binDir, homeBin, platform, false);
       }
       if (await isExec(homeBin)) return homeBin;
@@ -248,7 +249,7 @@ export async function isOpenCodeAlreadyInstalled(opts: {
   if (homeDir) {
     const binDir = p.join(homeDir, '.opencode', 'bin');
     const homeBin = p.join(binDir, 'opencode');
-    if (platform === process.platform) {
+    if (process.platform !== 'win32') {
       ensureSafeOpenCodePaths(homeDir, binDir, homeBin, platform, false);
     }
     if (await isExec(homeBin)) return homeBin;
@@ -295,7 +296,7 @@ export function resolveCandidateRegistries(opts: {
   }
 
   if (homeDir && !isolatedTest) {
-    const installJsonPath = path.join(homeDir, '.imcodes', 'install.json');
+    const installJsonPath = path.join(imcodesStateDirForHome(homeDir, env), 'install.json');
     try {
       if (existsSync(installJsonPath)) {
         const parsed = JSON.parse(readFileSync(installJsonPath, 'utf8')) as { registry?: unknown };
@@ -688,7 +689,7 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
       verifyBufferIntegrity(tgzBuffer, dist!);
       const binaryBuf = extractBinaryFromTarGz(tgzBuffer, entryCandidates);
 
-      if (platform === process.platform) {
+      if ((platform === 'win32') === (process.platform === 'win32')) {
         ensureSafeOpenCodePaths(homeDir, binDir, destPath, platform, true);
       } else {
         mkdirSync(binDir, { recursive: true });

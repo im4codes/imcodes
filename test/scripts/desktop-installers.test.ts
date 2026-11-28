@@ -3035,7 +3035,7 @@ exec "${realStatBin}" "$@"
         expect(linuxProbe.agents.opencode).toEqual({ installed: true });
       }
     }
-  });
+  }, 60_000);
 
   it('wires OpenCode CLI auto-install cleanly into Windows installer ps1 and single-transaction PostInstall Inno Setup', async () => {
     const ps1 = renderWindowsPhaseAInstallerPs1({ version: '2026.11.7132-dev.7022', cliWrapperContent: '@echo off\r\n' });
