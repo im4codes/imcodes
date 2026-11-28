@@ -653,8 +653,16 @@ export async function listActorOperableMachineAccess(
   delegatedActorUserId: string,
   now: number,
   limit: number,
+  sourceServerId?: string,
 ) {
-  const rows = await listAccessibleControlledMachines(db, delegatedActorUserId, now, limit, true);
+  const rows = await listAccessibleControlledMachines(
+    db,
+    delegatedActorUserId,
+    now,
+    limit,
+    true,
+    sourceServerId ? { excludePrivateOnSourceServerId: sourceServerId } : undefined,
+  );
   return new Map(rows.filter((row) => canOperateControlledMachine(row.access_role)).map((row) => [row.id, row]));
 }
 

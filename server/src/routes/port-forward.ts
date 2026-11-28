@@ -7,7 +7,7 @@ import { describeActionPayload, gateMachineAction } from '../security/machine-ac
 import { recordMachineActionAuthorized } from '../security/machine-exec-audit.js';
 import logger from '../util/logger.js';
 import {
-  getServerPrivateDeviceBlock,
+  findBlockedPrivateDeviceServerIds,
   isPrivateDeviceBlockedForActorOnSource,
   isSharedOrContributedServer,
   isWholeServerShareUser,
@@ -73,7 +73,14 @@ async function resolveEndpointServer(
     const classified = classifyMachineTarget(rawRef);
     if (classified?.kind === 'legacy_ref_name') {
       const actorId = auth.operational.delegatedActorUserId ?? auth.operational.userId;
-      const accessible = await listAccessibleControlledMachines(db, actorId, auth.now, MACHINE_LIST_MAX_ITEMS + 1);
+      const accessible = await listAccessibleControlledMachines(
+        db,
+        actorId,
+        auth.now,
+        MACHINE_LIST_MAX_ITEMS + 1,
+        false,
+        { excludePrivateOnSourceServerId: auth.sourceServerId },
+      );
       const matches = accessible.filter((row) => row.ref_name === classified.value);
       if (matches.length > 1) {
         return {
@@ -412,35 +419,16 @@ export function createPortForwardRoutes(
       }
     }
     let tunnels = await router.listTunnels(effectiveActorUserId, filterServerId);
-    if (tunnels.length > 0 && await getServerPrivateDeviceBlock(c.env.DB, caller.sourceServerId, actingUserId)) {
-      const checks = new Map<string, boolean>();
-      const visible: typeof tunnels = [];
-      for (const t of tunnels) {
-        let listenBlocked = checks.get(t.listenServerId);
-        if (listenBlocked === undefined) {
-          listenBlocked = await isPrivateDeviceBlockedForActorOnSource(c.env.DB, {
-            sourceServerId: caller.sourceServerId,
-            actingUserId,
-            targetServerId: t.listenServerId,
-            now: caller.now,
-          });
-          checks.set(t.listenServerId, listenBlocked);
-        }
-        let targetBlocked = checks.get(t.targetServerId);
-        if (targetBlocked === undefined) {
-          targetBlocked = await isPrivateDeviceBlockedForActorOnSource(c.env.DB, {
-            sourceServerId: caller.sourceServerId,
-            actingUserId,
-            targetServerId: t.targetServerId,
-            now: caller.now,
-          });
-          checks.set(t.targetServerId, targetBlocked);
-        }
-        if (!listenBlocked && !targetBlocked) {
-          visible.push(t);
-        }
+    if (tunnels.length > 0) {
+      const endpointIds = [...new Set(tunnels.flatMap((t) => [t.listenServerId, t.targetServerId]))];
+      const blockedIds = await findBlockedPrivateDeviceServerIds(c.env.DB, {
+        sourceServerId: caller.sourceServerId,
+        actingUserId,
+        targetServerIds: endpointIds,
+      });
+      if (blockedIds.size > 0) {
+        tunnels = tunnels.filter((t) => !blockedIds.has(t.listenServerId) && !blockedIds.has(t.targetServerId));
       }
-      tunnels = visible;
     }
     return c.json({ ok: true, tunnels });
   });
@@ -456,6 +444,26 @@ export function createPortForwardRoutes(
     const tunnelId = c.req.param('tunnelId');
     if (!tunnelId) {
       return c.json({ ok: false, reason: PORT_FORWARD_ERRORS.INVALID_REQUEST, error: 'tunnelId is required' }, 400);
+    }
+    const actingUserId = effectiveActorUserId;
+    const record = typeof (router as { getTunnel?: unknown }).getTunnel === 'function'
+      ? await router.getTunnel(tunnelId)
+      : (await router.listTunnels(effectiveActorUserId)).find((t) => t.tunnelId === tunnelId) ?? null;
+    const recordStatus = (record as { status?: string } | null)?.status;
+    const recordUserId = (record as { userId?: string } | null)?.userId ?? effectiveActorUserId;
+    if (record && recordStatus !== 'closed' && recordUserId === effectiveActorUserId) {
+      const blockedIds = await findBlockedPrivateDeviceServerIds(c.env.DB, {
+        sourceServerId: caller.sourceServerId,
+        actingUserId,
+        targetServerIds: [record.listenServerId, record.targetServerId],
+      });
+      if (blockedIds.size > 0) {
+        return c.json({
+          ok: false,
+          reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
+          error: MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST,
+        }, 403);
+      }
     }
     const res = await router.closeTunnelForUser(effectiveActorUserId, tunnelId);
     if (!res.ok) {
@@ -479,6 +487,7 @@ export function createPortForwardRoutes(
     }
     const effectiveActorUserId = caller.operational.delegatedActorUserId ?? caller.userId;
     const rawNode = c.req.query('node');
+    const actingUserId = caller.operational.delegatedActorUserId ?? caller.userId;
     let filterServerId: string | undefined;
     if (rawNode) {
       const ref = validatePortForwardNodeRef(rawNode);
@@ -488,6 +497,39 @@ export function createPortForwardRoutes(
       filterServerId = isPortForwardSelfAlias(ref)
         ? caller.sourceServerId
         : ((await resolveMachineTargetServerId(c.env.DB, ref)) ?? ref);
+      if (
+        filterServerId
+        && await isPrivateDeviceBlockedForActorOnSource(c.env.DB, {
+          sourceServerId: caller.sourceServerId,
+          actingUserId,
+          targetServerId: filterServerId,
+          now: caller.now,
+        })
+      ) {
+        return c.json({
+          ok: false,
+          reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
+          error: MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST,
+        }, 403);
+      }
+    }
+    const selectedTunnels = typeof (router as { listOpenTunnels?: unknown }).listOpenTunnels === 'function'
+      ? await router.listOpenTunnels(effectiveActorUserId, filterServerId)
+      : await router.listTunnels(effectiveActorUserId, filterServerId);
+    if (selectedTunnels.length > 0) {
+      const endpointIds = [...new Set(selectedTunnels.flatMap((t) => [t.listenServerId, t.targetServerId]))];
+      const blockedIds = await findBlockedPrivateDeviceServerIds(c.env.DB, {
+        sourceServerId: caller.sourceServerId,
+        actingUserId,
+        targetServerIds: endpointIds,
+      });
+      if (blockedIds.size > 0) {
+        return c.json({
+          ok: false,
+          reason: PORT_FORWARD_ERRORS.TARGET_FORBIDDEN,
+          error: MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST,
+        }, 403);
+      }
     }
     const closeResult = await router.closeAllForUser(effectiveActorUserId, filterServerId);
     if (!closeResult.confirmed) {

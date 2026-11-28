@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'preact/hooks';
+import { useState, useEffect, useMemo, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { ApiKeyManager } from '../components/ApiKeyManager.js';
 import { ServerList } from '../components/ServerList.js';
@@ -8,7 +8,7 @@ import { VoiceLanguageSwitcher } from '../components/VoiceLanguageSwitcher.js';
 import { PasskeyManager } from '../components/PasskeyManager.js';
 import { DeleteAccount } from '../components/DeleteAccount.js';
 import { SharedEntriesPanel } from '../components/SharedEntriesPanel.js';
-import { apiFetch, type SharedEntrySummary } from '../api.js';
+import { apiFetch, updateMyServerPrivateDevicePolicy, type SharedEntrySummary } from '../api.js';
 
 type DashboardTab = 'devices' | 'keys' | 'account';
 
@@ -37,6 +37,8 @@ interface ServerInfo {
   daemonVersion?: string | null;
   latestDaemonVersion?: string | null;
   createdAt: number;
+  isOwner?: boolean;
+  blockMyPrivateDevices?: boolean;
 }
 
 interface KeyInfo {
@@ -108,9 +110,21 @@ export function DashboardPage({
     loadData();
   }, []);
 
+  const groupServers = useMemo(() => servers.filter((s) => s.isOwner === false), [servers]);
+  const handleTogglePrivateDeviceBlock = async (serverId: string, blockPrivateDevices: boolean) => {
+    if (onTogglePrivateDeviceBlock) {
+      await onTogglePrivateDeviceBlock(serverId, blockPrivateDevices);
+    } else {
+      const res = await updateMyServerPrivateDevicePolicy(serverId, blockPrivateDevices);
+      setServers((prev) => prev.map((srv) => (
+        srv.id === serverId ? { ...srv, blockMyPrivateDevices: res.blockPrivateDevices } : srv
+      )));
+    }
+  };
   const showSharedInventory = sharedEntriesLoading
     || sharedEntriesError !== null
-    || sharedEntries.length > 0;
+    || sharedEntries.length > 0
+    || groupServers.length > 0;
   const showGettingStarted = servers.length === 0
     && sharedEntriesLoaded
     && !sharedEntriesLoading
@@ -205,12 +219,13 @@ export function DashboardPage({
                 {showSharedInventory && (
                   <SharedEntriesPanel
                     entries={sharedEntries}
+                    groupServers={groupServers}
                     loading={sharedEntriesLoading}
                     error={sharedEntriesError}
                     openingEntryId={openingSharedEntryId}
                     onOpen={onOpenSharedEntry}
                     onRefresh={onRefreshSharedEntries}
-                    onTogglePrivateDeviceBlock={onTogglePrivateDeviceBlock}
+                    onTogglePrivateDeviceBlock={handleTogglePrivateDeviceBlock}
                   />
                 )}
                 {showGettingStarted && (

@@ -239,9 +239,9 @@
     "create": "Add collaborator",
     "creating": "Adding...",
     "privateDeviceBlock": {
-      "label": "Block access to my private unshared devices",
-      "help": "When enabled, even your own messages on this machine will not authorize access to your own unshared personal devices (affects only your account).",
-      "shortHelp": "Applies only to your own unshared devices on {{server}}"
+      "label": "Block access to my private devices (unshared or other groups)",
+      "help": "When enabled, even your own messages on this machine will not authorize access to your own devices that are unshared or not in a common shared group with this machine (affects only your account).",
+      "shortHelp": "Protects only your unshared or cross-group devices on {{server}}"
     },
     "scope": {
       "current": "Collaborative scope"

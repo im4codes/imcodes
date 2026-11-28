@@ -1,6 +1,10 @@
 import type { Database } from '../db/client.js';
 import { activeUserExistsSql } from '../security/user-status.js';
 import {
+  getServerPrivateDeviceBlock,
+  sharesCommonMachineGroupWithSourceSql,
+} from '../security/server-share-boundary.js';
+import {
   NODE_ROLE,
   type MachineAccessRole,
 } from '../../../shared/remote-exec.js';
@@ -334,7 +338,13 @@ export async function listAccessibleControlledMachines(
   now: number,
   limit: number,
   operableOnly = false,
+  options?: { excludePrivateOnSourceServerId?: string },
 ): Promise<ControlledMachineAccessRow[]> {
+  const sourceId = options?.excludePrivateOnSourceServerId?.trim();
+  const excludePrivateSourceId = sourceId
+    && await getServerPrivateDeviceBlock(db, sourceId, userId)
+    ? sourceId
+    : null;
   return db.query<ControlledMachineAccessRow>(
     `${CONTROLLED_MACHINE_ACCESS_SELECT}
       WHERE s.node_role = $3
@@ -342,9 +352,15 @@ export async function listAccessibleControlledMachines(
         AND ${ACTIVE_ACCOUNTS_ACCESS_PREDICATE}
         AND (s.user_id = $1 OR effective_access.role IS NOT NULL)
         AND (NOT $5::boolean OR s.user_id = $1 OR effective_access.role = 'participant')
+        AND (
+          $6::text IS NULL
+          OR s.user_id <> $1
+          OR s.id = $6::text
+          OR ${sharesCommonMachineGroupWithSourceSql('s.id', '$6::text', '$1')}
+        )
       ORDER BY s.display_name NULLS LAST, s.id
       LIMIT $4`,
-    [userId, now, NODE_ROLE.CONTROLLED, limit, operableOnly],
+    [userId, now, NODE_ROLE.CONTROLLED, limit, operableOnly, excludePrivateSourceId],
   );
 }
 

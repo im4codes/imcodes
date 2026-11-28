@@ -480,6 +480,7 @@ serverRoutes.get('/', requireAuth(), async (c) => {
       daemonVersion: s.daemon_version,
       latestDaemonVersion: process.env.APP_VERSION ?? null,
       createdAt: s.created_at,
+      isOwner: s.user_id === userId,
       blockMyPrivateDevices: blockedServerIds.has(s.id),
     };
   });

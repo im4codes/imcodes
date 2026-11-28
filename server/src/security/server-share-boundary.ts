@@ -245,45 +245,75 @@ export async function setServerPrivateDeviceBlock(
   );
 }
 
-/** Batch lookup of active shared/group-contributed server IDs among `serverIds`. */
-export async function findSharedOrContributedServerIds(
+/**
+ * Shared SQL predicate: true when `targetServerExpr` (`servers.id`) shares at least one
+ * common machine group (`machine_groups.team_id`) with `sourceServerExpr` (including BOTH
+ * `sourceServerExpr` itself AND any non-revoked controlled node linked via `host_server_id`),
+ * AND that overlapping team contains at least one member other than `actingUserExpr`
+ * (solo groups containing only `actingUserExpr` never qualify).
+ *
+ * All three arguments must be compile-time SQL expressions (column names or bind params).
+ */
+export function sharesCommonMachineGroupWithSourceSql(
+  targetServerExpr: string,
+  sourceServerExpr: string,
+  actingUserExpr: string,
+): string {
+  return `EXISTS (
+    SELECT 1
+      FROM machine_groups mg_tgt
+      JOIN machine_groups mg_src ON mg_src.team_id = mg_tgt.team_id
+      JOIN team_members tm ON tm.team_id = mg_tgt.team_id
+     WHERE mg_tgt.server_id = ${targetServerExpr}
+       AND tm.user_id <> ${actingUserExpr}
+       AND (
+         mg_src.server_id = ${sourceServerExpr}
+         OR EXISTS (
+           SELECT 1
+             FROM servers link_src
+            WHERE link_src.id = mg_src.server_id
+              AND link_src.host_server_id = ${sourceServerExpr}
+              AND link_src.revoked_at IS NULL
+         )
+       )
+  )`;
+}
+
+/**
+ * Batch lookup of `targetServerIds` that are blocked for `actingUserId` on `sourceServerId`:
+ * when `(sourceServerId, actingUserId)` has `block_private_devices = true`, returns every
+ * target server in `targetServerIds` owned by `actingUserId` (`<> sourceServerId`) that does
+ * NOT share a common non-solo machine group with `sourceServerId` (direct or via active `host_server_id`).
+ */
+export async function findBlockedPrivateDeviceServerIds(
   db: Database,
-  serverIds: readonly string[],
-  now = Date.now(),
+  input: {
+    sourceServerId?: string | null;
+    actingUserId: string;
+    targetServerIds: readonly string[];
+  },
 ): Promise<Set<string>> {
-  const unique = [...new Set(serverIds.filter((id) => typeof id === 'string' && id.length > 0))];
-  if (unique.length === 0 || typeof (db as { query?: unknown })?.query !== 'function') {
+  const sourceServerId = input.sourceServerId?.trim();
+  if (!sourceServerId || !input.actingUserId || typeof (db as { query?: unknown })?.query !== 'function') {
+    return new Set();
+  }
+  const uniqueTargets = [...new Set(
+    input.targetServerIds.filter((id) => typeof id === 'string' && id.length > 0 && id !== sourceServerId),
+  )];
+  if (uniqueTargets.length === 0) {
+    return new Set();
+  }
+  if (!await getServerPrivateDeviceBlock(db, sourceServerId, input.actingUserId)) {
     return new Set();
   }
   const rows = await db.query<{ id: string }>(
     `SELECT s.id
        FROM servers s
       WHERE s.id = ANY($1::text[])
-        AND (
-          EXISTS (
-            SELECT 1 FROM server_shares ss
-             WHERE ss.server_id = s.id AND ss.revoked_at IS NULL
-               AND (ss.expires_at IS NULL OR ss.expires_at > $2)
-          )
-          OR EXISTS (
-            SELECT 1 FROM session_shares sh
-             WHERE sh.server_id = s.id AND sh.revoked_at IS NULL
-               AND (sh.expires_at IS NULL OR sh.expires_at > $2)
-          )
-          OR EXISTS (
-            SELECT 1 FROM sub_session_shares sb
-             WHERE sb.server_id = s.id AND sb.revoked_at IS NULL
-               AND (sb.expires_at IS NULL OR sb.expires_at > $2)
-          )
-          OR EXISTS (
-            SELECT 1
-              FROM machine_groups mg
-              JOIN team_members tm ON tm.team_id = mg.team_id
-             WHERE mg.server_id = s.id
-               AND tm.user_id <> s.user_id
-          )
-        )`,
-    [unique, now],
+        AND s.user_id = $2
+        AND s.id <> $3
+        AND NOT (${sharesCommonMachineGroupWithSourceSql('s.id', '$3', '$2')})`,
+    [uniqueTargets, input.actingUserId, sourceServerId],
   );
   const rowList = Array.isArray(rows) ? rows : ((rows as { rows?: Array<{ id: string }> })?.rows ?? []);
   return new Set(rowList.map((r) => r.id));
@@ -292,9 +322,10 @@ export async function findSharedOrContributedServerIds(
 /**
  * Symmetric daemon-originated self-protection guard ("各自保护自己"):
  * When `(sourceServerId, actingUserId)` has `block_private_devices = true`, `sourceServerId`'s
- * daemon may NEVER enumerate or control `actingUserId`'s own unshared private devices — even on turns
- * initiated by `actingUserId` themselves. Shared devices, other users on `sourceServerId`, browser/mobile UI,
- * and other hosts with the toggle off remain completely unaffected.
+ * daemon may NEVER enumerate or control `actingUserId`'s own unshared or non-common-group devices
+ * — even on turns initiated by `actingUserId` themselves. Devices sharing a non-solo machine group
+ * with `sourceServerId`, other users on `sourceServerId`, browser/mobile UI, and other hosts with
+ * the toggle off remain completely unaffected.
  */
 export async function isPrivateDeviceBlockedForActorOnSource(
   db: Database,
@@ -310,17 +341,13 @@ export async function isPrivateDeviceBlockedForActorOnSource(
   if (!sourceServerId || !input.actingUserId || !input.targetServerId || input.targetServerId === sourceServerId) {
     return false;
   }
-  if (!await getServerPrivateDeviceBlock(db, sourceServerId, input.actingUserId)) {
+  if (input.targetOwnerUserId && input.targetOwnerUserId !== input.actingUserId) {
     return false;
   }
-  let targetOwnerUserId = input.targetOwnerUserId ?? null;
-  if (!targetOwnerUserId && typeof (db as { queryOne?: unknown })?.queryOne === 'function') {
-    const row = await db.queryOne<{ user_id: string }>('SELECT user_id FROM servers WHERE id = $1 LIMIT 1', [input.targetServerId]);
-    targetOwnerUserId = row?.user_id ?? null;
-  }
-  if (targetOwnerUserId !== input.actingUserId) {
-    return false;
-  }
-  const now = input.now ?? Date.now();
-  return !(await isSharedOrContributedServer(db, input.targetServerId, now));
+  const blocked = await findBlockedPrivateDeviceServerIds(db, {
+    sourceServerId,
+    actingUserId: input.actingUserId,
+    targetServerIds: [input.targetServerId],
+  });
+  return blocked.has(input.targetServerId);
 }

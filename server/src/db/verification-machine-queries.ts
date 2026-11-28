@@ -1,4 +1,5 @@
 import type { Database } from './client.js';
+import { sharesCommonMachineGroupWithSourceSql } from '../security/server-share-boundary.js';
 import type {
   VerificationMachineKind,
   VerificationMachineProfile,
@@ -62,6 +63,25 @@ const LIST_COLUMNS = `id, scope, scope_key,
   kind, target, enabled, revision, created_at, updated_at,
   last_verified_at, last_verification_status, source`;
 
+const EXCLUDE_PRIVATE_CONTROLLED_TARGETS_SQL = (sourceParam: string) => `
+  (
+    ${sourceParam}::text IS NULL
+    OR kind <> 'controlled_node'
+    OR NOT EXISTS (
+      SELECT 1
+        FROM servers s
+       WHERE s.revoked_at IS NULL
+         AND (
+           s.id = verification_machine_profiles.target
+           OR (s.node_role = 'controlled' AND s.node_id = verification_machine_profiles.target)
+         )
+         AND s.user_id = $1
+         AND s.id <> ${sourceParam}::text
+         AND NOT (${sharesCommonMachineGroupWithSourceSql('s.id', `${sourceParam}::text`, '$1')})
+    )
+  )
+`;
+
 export async function listVerificationMachinesPage(
   db: Database,
   userId: string,
@@ -69,7 +89,7 @@ export async function listVerificationMachinesPage(
     projectKey?: string;
     limit?: number;
     cursor?: VerificationMachineCursor | null;
-    excludedControlledTargets?: readonly string[];
+    excludePrivateControlledOnSourceServerId?: string | null;
   },
 ): Promise<{ profiles: VerificationMachineProfile[]; nextCursor: VerificationMachineCursor | null }> {
   const limit = Math.max(
@@ -77,9 +97,7 @@ export async function listVerificationMachinesPage(
     Math.min(VERIFICATION_MACHINE_LIMITS.MAX_ITEMS, Math.trunc(options?.limit ?? VERIFICATION_MACHINE_LIMITS.MAX_ITEMS)),
   );
   const cursor = options?.cursor ?? null;
-  const excludedTargets = options?.excludedControlledTargets?.length
-    ? [...new Set(options.excludedControlledTargets)]
-    : null;
+  const sourceServerId = options?.excludePrivateControlledOnSourceServerId?.trim() || null;
   const rows = await db.query<VerificationMachineRow>(
     `WITH listed AS (
        SELECT ${LIST_COLUMNS},
@@ -90,7 +108,7 @@ export async function listVerificationMachinesPage(
               END AS sort_bucket
          FROM verification_machine_profiles
         WHERE user_id = $1
-          AND ($8::text[] IS NULL OR kind <> 'controlled_node' OR target <> ALL($8::text[]))
+          AND ${EXCLUDE_PRIVATE_CONTROLLED_TARGETS_SQL('$8')}
      )
      SELECT id, scope, scope_key, alias, kind, target, enabled, revision,
             created_at, updated_at, last_verified_at, last_verification_status, source,
@@ -107,7 +125,7 @@ export async function listVerificationMachinesPage(
       cursor?.scopeKey ?? '',
       cursor?.alias ?? '',
       cursor?.id ?? '',
-      excludedTargets,
+      sourceServerId,
     ],
   );
   const hasMore = rows.length > limit;
@@ -128,7 +146,7 @@ export async function listVerificationMachines(
   db: Database,
   userId: string,
   projectKey?: string,
-  options?: { includeAllProjects?: boolean; excludedControlledTargets?: readonly string[] },
+  options?: { includeAllProjects?: boolean; excludePrivateControlledOnSourceServerId?: string | null },
 ): Promise<VerificationMachineProfile[]> {
   if (options?.includeAllProjects === true) {
     const all: VerificationMachineProfile[] = [];
@@ -137,7 +155,7 @@ export async function listVerificationMachines(
       const page = await listVerificationMachinesPage(db, userId, {
         projectKey,
         cursor,
-        excludedControlledTargets: options.excludedControlledTargets,
+        excludePrivateControlledOnSourceServerId: options.excludePrivateControlledOnSourceServerId,
       });
       all.push(...page.profiles);
       if (!page.nextCursor) break;
@@ -145,18 +163,16 @@ export async function listVerificationMachines(
     }
     return all;
   }
-  const excludedTargets = options?.excludedControlledTargets?.length
-    ? [...new Set(options.excludedControlledTargets)]
-    : null;
+  const sourceServerId = options?.excludePrivateControlledOnSourceServerId?.trim() || null;
   const rows = await db.query<VerificationMachineRow>(
     `SELECT ${LIST_COLUMNS}
        FROM verification_machine_profiles
       WHERE user_id = $1
         AND (scope = 'user' OR ($2::text IS NOT NULL AND scope = 'project' AND scope_key = $2))
-        AND ($4::text[] IS NULL OR kind <> 'controlled_node' OR target <> ALL($4::text[]))
+        AND ${EXCLUDE_PRIVATE_CONTROLLED_TARGETS_SQL('$4')}
       ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END, alias ASC, id ASC
       LIMIT $3`,
-    [userId, projectKey ?? null, VERIFICATION_MACHINE_LIMITS.MAX_ITEMS + 1, excludedTargets],
+    [userId, projectKey ?? null, VERIFICATION_MACHINE_LIMITS.MAX_ITEMS + 1, sourceServerId],
   );
   return rows.map(mapRow);
 }

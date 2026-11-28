@@ -1,8 +1,9 @@
 import type { SharedEntrySummary } from '../api.js';
-import { SharedEntriesPanel } from './SharedEntriesPanel.js';
+import { SharedEntriesPanel, type GroupParticipantServerSummary } from './SharedEntriesPanel.js';
 
 interface Props {
   entries: SharedEntrySummary[];
+  groupServers?: GroupParticipantServerSummary[];
   loading?: boolean;
   error?: string | null;
   openingEntryId?: string | null;
@@ -13,6 +14,7 @@ interface Props {
 
 export function MobileSharedEntriesMenu({
   entries,
+  groupServers,
   loading = false,
   error = null,
   openingEntryId = null,
@@ -24,6 +26,7 @@ export function MobileSharedEntriesMenu({
     <div class="mobile-server-menu-shared">
       <SharedEntriesPanel
         entries={entries}
+        groupServers={groupServers}
         loading={loading}
         error={error}
         openingEntryId={openingEntryId}

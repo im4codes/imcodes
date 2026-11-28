@@ -12,14 +12,14 @@ import {
   upsertVerificationMachine,
   type VerificationMachineCursor,
 } from '../db/verification-machine-queries.js';
-import { listControlledMachines } from './machines.js';
-import { listAccessibleControlledMachines, resolveMachineTargetServerId } from '../share/machine-access.js';
 import {
-  findSharedOrContributedServerIds,
+  resolveControlledMachineAccess,
+  resolveMachineTargetServerId,
+} from '../share/machine-access.js';
+import {
   getServerPrivateDeviceBlock,
   isPrivateDeviceBlockedForActorOnSource,
 } from '../security/server-share-boundary.js';
-import { MACHINE_LIST_MAX_ITEMS } from '../../../shared/remote-exec.js';
 import { aliasExistsById } from '../db/alias-queries.js';
 import {
   VERIFICATION_MACHINE_KINDS,
@@ -101,38 +101,15 @@ function decodeCursor(raw: string): VerificationMachineCursor | null {
   }
 }
 
-async function resolveBlockedControlledTargets(
-  db: Env['DB'],
-  sourceServerId: string | undefined,
-  userId: string,
-  now: number,
-): Promise<string[]> {
-  if (!sourceServerId || !await getServerPrivateDeviceBlock(db, sourceServerId, userId)) {
-    return [];
-  }
-  const rows = await listAccessibleControlledMachines(db, userId, now, MACHINE_LIST_MAX_ITEMS + 1);
-  const ownedOtherIds = rows
-    .filter((row) => row.user_id === userId && row.id !== sourceServerId)
-    .map((row) => row.id);
-  if (ownedOtherIds.length === 0) return [];
-  const sharedIds = await findSharedOrContributedServerIds(db, ownedOtherIds, now);
-  const blocked: string[] = [];
-  for (const row of rows) {
-    if (row.user_id === userId && row.id !== sourceServerId && !sharedIds.has(row.id)) {
-      if (row.node_id) blocked.push(row.node_id);
-      blocked.push(row.id);
-    }
-  }
-  return blocked;
-}
-
 verificationMachineRoutes.get('/', async (c) => {
   const projectKey = c.req.query('projectKey')?.trim() || undefined;
   const includeAllProjects = c.req.query('includeAllProjects') === '1'
     || c.req.query('includeAllProjects') === 'true';
   const userId = c.get('effectiveActorUserId') ?? (c.get('userId' as never) as string);
   const authServerId = c.get('authServerId' as never) as string | undefined;
-  const excludedControlledTargets = await resolveBlockedControlledTargets(c.env.DB, authServerId, userId, Date.now());
+  const excludePrivateControlledOnSourceServerId = (
+    authServerId && await getServerPrivateDeviceBlock(c.env.DB, authServerId, userId)
+  ) ? authServerId : undefined;
   if (includeAllProjects) {
     const rawCursor = c.req.query('cursor');
     const cursor = rawCursor === undefined ? null : decodeCursor(rawCursor);
@@ -155,14 +132,16 @@ verificationMachineRoutes.get('/', async (c) => {
       projectKey,
       limit,
       cursor,
-      excludedControlledTargets,
+      excludePrivateControlledOnSourceServerId,
     });
     return c.json({
       profiles: page.profiles,
       ...(page.nextCursor ? { nextCursor: encodeCursor(page.nextCursor) } : {}),
     });
   }
-  const profiles = await listVerificationMachines(c.env.DB, userId, projectKey, { excludedControlledTargets });
+  const profiles = await listVerificationMachines(c.env.DB, userId, projectKey, {
+    excludePrivateControlledOnSourceServerId,
+  });
   if (profiles.length > VERIFICATION_MACHINE_LIMITS.MAX_ITEMS) {
     return c.json({ error: 'verification_machine_list_over_limit' }, 413);
   }
@@ -193,18 +172,20 @@ verificationMachineRoutes.put('/', async (c) => {
   if (kind === VERIFICATION_MACHINE_KINDS.CONTROLLED_NODE) {
     const target = normalizeVerificationMachineTarget(String(body.target));
     const now = Date.now();
-    const { machines } = await listControlledMachines(c.env.DB, userId, now);
-    if (!machines.some((machine) => machine.nodeId === target)) {
+    const targetServerId = await resolveMachineTargetServerId(c.env.DB, target);
+    const access = targetServerId
+      ? await resolveControlledMachineAccess(c.env.DB, userId, targetServerId, now)
+      : null;
+    if (!targetServerId || !access || access.node_id !== target) {
       return c.json({ error: 'verification_machine_target_unauthorized' }, 403);
     }
-    const targetServerId = await resolveMachineTargetServerId(c.env.DB, target);
     if (
       authServerId
-      && targetServerId
       && await isPrivateDeviceBlockedForActorOnSource(c.env.DB, {
         sourceServerId: authServerId,
         actingUserId: userId,
         targetServerId,
+        targetOwnerUserId: access.user_id,
         now,
       })
     ) {

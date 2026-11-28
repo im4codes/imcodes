@@ -30,6 +30,7 @@ describe('ShareSessionDialog mobile 375x667 & desktop layout in Chromium', () =>
     const css = readFileSync(resolve(webDir, 'src/styles.css'), 'utf8');
     const ruJson = JSON.parse(readFileSync(resolve(webDir, 'src/i18n/locales/ru.json'), 'utf8'));
     const dialogPath = resolve(webDir, 'src/components/ShareSessionDialog.tsx');
+    const sharedMenuPath = resolve(webDir, 'src/components/MobileSharedEntriesMenu.tsx');
 
     const compiled = await build({
       stdin: {
@@ -37,6 +38,7 @@ describe('ShareSessionDialog mobile 375x667 & desktop layout in Chromium', () =>
           import { h, render } from 'preact';
           import { useState } from 'preact/hooks';
           import { ShareSessionDialog } from ${JSON.stringify(dialogPath)};
+          import { MobileSharedEntriesMenu } from ${JSON.stringify(sharedMenuPath)};
 
           window.__mountShareDialog = (props = {}) => {
             const root = document.getElementById('root');
@@ -54,6 +56,29 @@ describe('ShareSessionDialog mobile 375x667 & desktop layout in Chromium', () =>
                 onClose: () => setOpen(false),
                 ...props,
               });
+            };
+            render(h(App), root);
+          };
+
+          window.__mountGroupParticipantMenu = (initialBlocked = false) => {
+            const root = document.getElementById('root');
+            const App = () => {
+              const [blocked, setBlocked] = useState(initialBlocked);
+              window.__pushServerPolicyRefresh = (nextVal) => setBlocked(nextVal);
+              return h('div', { class: 'mobile-server-menu', style: { position: 'static', display: 'block', width: '100%', maxHeight: '600px' } },
+                h('div', { class: 'mobile-server-menu-body', style: { display: 'block' } },
+                  h(MobileSharedEntriesMenu, {
+                    entries: [],
+                    groupServers: [{ id: 'srv-grp', name: 'Team Host A', isOwner: false, blockMyPrivateDevices: blocked }],
+                    onOpen: () => {},
+                    onRefresh: () => {},
+                    onTogglePrivateDeviceBlock: async (_id, next) => {
+                      window.__participantCalls = (window.__participantCalls || 0) + 1;
+                      setBlocked(next);
+                    },
+                  })
+                )
+              );
             };
             render(h(App), root);
           };
@@ -216,6 +241,41 @@ describe('ShareSessionDialog mobile 375x667 & desktop layout in Chromium', () =>
       expect(desktopSubmit.bottom).toBeLessThanOrEqual(800);
       const dialogWidth = await page.locator('.share-dialog').evaluate((el) => el.getBoundingClientRect().width);
       expect(dialogWidth).toBeLessThanOrEqual(520);
+
+      // 6. Test 360x640 mobile viewport for BOTH Owner toggle AND group-only Participant toggle + refresh state
+      await page.setViewportSize({ width: 360, height: 640 });
+      const ownerToggle = page.locator('[data-testid="share-private-device-toggle"]');
+      await ownerToggle.scrollIntoViewIfNeeded();
+      await expect.poll(() => ownerToggle.isVisible()).toBe(true);
+      const ownerToggleBox = await ownerToggle.boundingBox();
+      expect(ownerToggleBox).not.toBeNull();
+      expect(ownerToggleBox!.x).toBeGreaterThanOrEqual(0);
+      expect(ownerToggleBox!.x + ownerToggleBox!.width).toBeLessThanOrEqual(360);
+      expect((await ownerToggle.textContent()) ?? '').toMatch(/необщим|групп/i);
+      const ownerCheckbox = ownerToggle.locator('input[type="checkbox"]');
+      expect(await ownerCheckbox.isChecked()).toBe(false);
+      await ownerCheckbox.check();
+      expect(await ownerCheckbox.isChecked()).toBe(true);
+
+      // Mount group-only Participant mobile menu at 360x640
+      await page.evaluate(() => (window as unknown as { __mountGroupParticipantMenu: () => void }).__mountGroupParticipantMenu(false));
+      const partToggle = page.locator('[data-testid="shared-private-policy-srv-grp"]');
+      await expect.poll(() => partToggle.isVisible()).toBe(true);
+      const partBox = await partToggle.boundingBox();
+      expect(partBox).not.toBeNull();
+      expect(partBox!.x).toBeGreaterThanOrEqual(0);
+      expect(partBox!.x + partBox!.width).toBeLessThanOrEqual(360);
+      const noHorizontalOverflow = await page.locator('.mobile-server-menu-body').evaluate(
+        (el) => el.scrollWidth <= el.clientWidth + 1,
+      );
+      expect(noHorizontalOverflow).toBe(true);
+      const partCheckbox = partToggle.locator('input[type="checkbox"]');
+      expect(await partCheckbox.isChecked()).toBe(false);
+      await partCheckbox.check();
+      expect(await partCheckbox.isChecked()).toBe(true);
+      // Simulate external refresh setting back to false -> UI reflects refreshed server value
+      await page.evaluate(() => (window as unknown as { __pushServerPolicyRefresh: (v: boolean) => void }).__pushServerPolicyRefresh(false));
+      expect(await partCheckbox.isChecked()).toBe(false);
     } finally {
       await browser.close();
     }

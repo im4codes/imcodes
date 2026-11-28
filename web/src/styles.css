@@ -736,6 +736,7 @@ html.native-ios-mac .chat-dl-btn {
 .share-private-device-toggle-title { font-size: 12px; font-weight: 700; color: #f1f5f9; line-height: 1.35; overflow-wrap: break-word; }
 .share-private-device-toggle-help { font-size: 11px; color: #94a3b8; line-height: 1.4; overflow-wrap: break-word; }
 .shared-private-policy-list { display: flex; flex-direction: column; gap: 5px; margin-top: 7px; padding-top: 7px; border-top: 1px solid rgba(125,211,252,0.12); }
+.shared-private-policy-list.is-standalone { margin-top: 6px; padding-top: 0; border-top: 0; }
 .shared-private-policy-row { display: flex; align-items: flex-start; gap: 7px; padding: 5px 6px; border-radius: 6px; background: rgba(15,23,42,0.45); color: #cbd5e1; font-size: 11px; line-height: 1.35; cursor: pointer; min-width: 0; }
 .shared-private-policy-row input { margin: 2px 0 0; flex-shrink: 0; accent-color: var(--chrome-accent); }
 .shared-private-policy-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; }

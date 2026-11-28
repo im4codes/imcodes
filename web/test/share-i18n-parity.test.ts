@@ -81,4 +81,25 @@ describe('share i18n parity', () => {
       expect(serverParticipantHelp, locale).not.toMatch(/cannot stop|不可关闭|不可關閉|終了はできません|종료는 불가|no puede cerrar|не закрывать/i);
     }
   });
+
+  it('defines non-empty cross-group privateDeviceBlock copy across all seven locales', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(
+        readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8'),
+      ) as {
+        share?: {
+          privateDeviceBlock?: { label?: unknown; help?: unknown; shortHelp?: unknown };
+        };
+      };
+      const block = messages.share?.privateDeviceBlock;
+      expect(block, locale).toBeDefined();
+      const label = String(block?.label ?? '').trim();
+      const help = String(block?.help ?? '').trim();
+      const shortHelp = String(block?.shortHelp ?? '').trim();
+      expect(label, `${locale}:label`).not.toBe('');
+      expect(help, `${locale}:help`).not.toBe('');
+      expect(shortHelp, `${locale}:shortHelp`).not.toBe('');
+      expect(help, `${locale}:group-wording`).toMatch(/shared group|共享分组|共用群組|共有グループ|공유 그룹|grupo compartido|общую группу/i);
+    }
+  });
 });

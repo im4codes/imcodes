@@ -1288,6 +1288,14 @@ export class PortForwardRouter {
     return this.clusterStore.listActiveTunnels(userId, nodeServerId);
   }
 
+  async getTunnel(tunnelId: string): Promise<PortForwardClusterTunnelRecord | null> {
+    return this.clusterStore.getTunnel(tunnelId);
+  }
+
+  async listOpenTunnels(userId: string, nodeServerId?: string): Promise<PortForwardClusterTunnelRecord[]> {
+    return this.clusterStore.listOpenTunnelsForUser(userId, nodeServerId);
+  }
+
   private async sendRemoteCloseAndAwaitAck(
     record: PortForwardClusterTunnelRecord,
     reason: string,

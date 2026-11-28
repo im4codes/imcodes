@@ -779,6 +779,8 @@ interface ServerInfo {
   daemonVersion?: string | null;
   latestDaemonVersion?: string | null;
   createdAt: number;
+  isOwner?: boolean;
+  blockMyPrivateDevices?: boolean;
 }
 
 interface SharedReturnServer {
@@ -2864,6 +2866,11 @@ function InternalMainApp() {
         ? { ...entry, blockMyPrivateDevices: res.blockPrivateDevices }
         : entry
     )));
+    setServers((prev) => prev.map((srv) => (
+      srv.id === serverId
+        ? { ...srv, blockMyPrivateDevices: res.blockPrivateDevices }
+        : srv
+    )));
   }, []);
 
   useEffect(() => {
@@ -3562,6 +3569,10 @@ function InternalMainApp() {
   const restrictedSharedEntries = useMemo(
     () => filterRestrictedSharedEntries(sharedEntries),
     [sharedEntries],
+  );
+  const groupParticipantServers = useMemo(
+    () => servers.filter((srv) => srv.isOwner === false),
+    [servers],
   );
   useEffect(() => {
     if (!serversSynced || !serversLoaded || !serverOrderHydrated || !serverPinnedHydrated || servers.length === 0) return;
@@ -11883,6 +11894,7 @@ function InternalMainApp() {
             </div>
             <SharedEntriesPanel
               entries={restrictedSharedEntries}
+              groupServers={groupParticipantServers}
               loading={sharedEntriesLoading}
               error={sharedEntriesError}
               openingEntryId={openingSharedEntryId}
@@ -12205,9 +12217,10 @@ function InternalMainApp() {
                             </button>
                           );
                         })}
-                        {(restrictedSharedEntries.length > 0 || sharedEntriesError !== null) && (
+                        {(restrictedSharedEntries.length > 0 || groupParticipantServers.length > 0 || sharedEntriesError !== null) && (
                           <MobileSharedEntriesMenu
                             entries={restrictedSharedEntries}
+                            groupServers={groupParticipantServers}
                             loading={sharedEntriesLoading}
                             error={sharedEntriesError}
                             openingEntryId={openingSharedEntryId}
@@ -12941,6 +12954,7 @@ function InternalMainApp() {
                   })}
                   <SharedEntriesPanel
                     entries={restrictedSharedEntries}
+                    groupServers={groupParticipantServers}
                     loading={sharedEntriesLoading}
                     error={sharedEntriesError}
                     openingEntryId={openingSharedEntryId}

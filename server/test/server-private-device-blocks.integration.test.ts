@@ -1,10 +1,10 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { createHash, randomBytes } from 'node:crypto';
 import { Hono } from 'hono';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createServer, createUser } from '../src/db/queries.js';
-import { createOrUpdateShare, revokeShare, setServerShareExecGrant } from '../src/db/tab-sharing.js';
+import { createOrUpdateShare, setServerShareExecGrant } from '../src/db/tab-sharing.js';
 import {
   issueOwnerMachineAuthorityForSession,
   issueSharedMachineAuthorityForSession,
@@ -23,6 +23,7 @@ import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 import { MACHINE_DENIAL_REASON } from '../../shared/machine-access-policy.js';
 import type { PortForwardRouter } from '../src/ws/port-forward-router.js';
+import type { PortForwardTunnelSummary } from '../../shared/port-forward.js';
 
 const JWT_KEY = 'private-device-block-test-key';
 const hex = (bytes: number) => randomBytes(bytes).toString('hex');
@@ -63,20 +64,55 @@ async function seedFullHost(userId: string, name = 'full-host') {
   return { serverId, token };
 }
 
-async function seedControlledNode(userId: string, name = 'ctrl-node') {
+async function seedControlledNode(
+  userId: string,
+  name = 'ctrl-node',
+  options?: { hostServerId?: string | null },
+) {
   const serverId = `ctl-${hex(6)}`;
   const nodeId = generateControlledNodeId();
   await db.execute(
     `INSERT INTO servers
        (id, user_id, name, token_hash, status, last_heartbeat_at, created_at, node_role,
-        exec_enabled, ref_name, display_name, os, node_id)
-     VALUES ($1,$2,$3,$4,'online',$5,$5,$6,true,$7,$3,'linux',$8)`,
-    [serverId, userId, name, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, `ref-${hex(4)}`, nodeId],
+        exec_enabled, ref_name, display_name, os, node_id, host_server_id)
+     VALUES ($1,$2,$3,$4,'online',$5,$5,$6,true,$7,$3,'linux',$8,$9)`,
+    [serverId, userId, name, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, `ref-${hex(4)}`, nodeId, options?.hostServerId ?? null],
   );
   return { serverId, nodeId };
 }
 
-function createApp() {
+async function createTeamWithMembers(name: string, ownerId: string, extraMemberIds: string[] = []) {
+  const teamId = `team-${hex(6)}`;
+  const now = Date.now();
+  await db.execute(
+    `INSERT INTO teams (id, name, owner_id, plan, created_at) VALUES ($1, $2, $3, 'free', $4)`,
+    [teamId, name, ownerId, now],
+  );
+  await db.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'owner', $3)`,
+    [teamId, ownerId, now],
+  );
+  for (const memberId of extraMemberIds) {
+    await db.execute(
+      `INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1, $2, 'member', $3)`,
+      [teamId, memberId, now],
+    );
+  }
+  return teamId;
+}
+
+async function addServerToGroup(serverId: string, teamId: string) {
+  await db.execute(
+    'INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
+    [serverId, teamId, Date.now()],
+  );
+}
+
+async function removeServerFromGroup(serverId: string, teamId: string) {
+  await db.execute('DELETE FROM machine_groups WHERE server_id = $1 AND team_id = $2', [serverId, teamId]);
+}
+
+function createApp(initialTunnels: Array<PortForwardTunnelSummary & { userId: string; status: string }> = []) {
   const app = new Hono();
   app.use('*', async (c, next) => {
     (c as unknown as { env: { DB: Database; JWT_SIGNING_KEY: string } }).env = {
@@ -86,9 +122,28 @@ function createApp() {
     await next();
   });
 
-  const mockPortForwardRouter: PortForwardRouter = {
+  const tunnels = [...initialTunnels];
+  const closeTunnelSpy = vi.fn(async (_userId: string, tunnelId: string) => {
+    const idx = tunnels.findIndex((t) => t.tunnelId === tunnelId && t.status !== 'closed');
+    if (idx === -1) return { ok: false as const, status: 404, reason: 'tunnel_not_found' as const, error: 'not found' };
+    tunnels[idx] = { ...tunnels[idx]!, status: 'closed' };
+    return { ok: true as const, closedTunnelIds: [tunnelId] };
+  });
+  const closeAllSpy = vi.fn(async (userId: string, nodeServerId?: string) => {
+    const closedIds: string[] = [];
+    for (let i = 0; i < tunnels.length; i += 1) {
+      const t = tunnels[i]!;
+      if (t.userId !== userId || t.status === 'closed') continue;
+      if (nodeServerId && t.listenServerId !== nodeServerId && t.targetServerId !== nodeServerId) continue;
+      tunnels[i] = { ...t, status: 'closed' };
+      closedIds.push(t.tunnelId);
+    }
+    return { confirmed: true, closedTunnelIds: closedIds, unconfirmedTunnelIds: [] };
+  });
+
+  const mockPortForwardRouter = {
     configure: () => {},
-    openTunnel: async (req) => ({
+    openTunnel: async (req: Record<string, unknown>) => ({
       ok: true,
       tunnel: {
         tunnelId: 'tun-mock-1',
@@ -109,9 +164,19 @@ function createApp() {
         expiresAt: Date.now() + 60_000,
       },
     }),
-    listTunnels: async () => [],
-    closeTunnelForUser: async () => ({ ok: true, closedTunnelIds: [] }),
-    closeAllForUser: async () => ({ confirmed: true, closedTunnelIds: [], unconfirmedTunnelIds: [] }),
+    listTunnels: async (userId: string, nodeServerId?: string) => tunnels.filter((t) => (
+      t.userId === userId
+      && t.status === 'active'
+      && (!nodeServerId || t.listenServerId === nodeServerId || t.targetServerId === nodeServerId)
+    )),
+    listOpenTunnels: async (userId: string, nodeServerId?: string) => tunnels.filter((t) => (
+      t.userId === userId
+      && t.status !== 'closed'
+      && (!nodeServerId || t.listenServerId === nodeServerId || t.targetServerId === nodeServerId)
+    )),
+    getTunnel: async (tunnelId: string) => tunnels.find((t) => t.tunnelId === tunnelId) ?? null,
+    closeTunnelForUser: closeTunnelSpy,
+    closeAllForUser: closeAllSpy,
   } as unknown as PortForwardRouter;
 
   app.route('/api/server', serverRoutes);
@@ -128,27 +193,83 @@ function createApp() {
   app.route('/api/server', fileTransferRoutes);
   app.route('/api/port-forwards', createPortForwardRoutes(mockPortForwardRouter));
   app.route('/api/verification-machines', verificationMachineRoutes);
-  return { app, mockPortForwardRouter };
+  return { app, mockPortForwardRouter, tunnels, closeTunnelSpy, closeAllSpy };
 }
 
 describe('Symmetric per-user per-host private device blocks ("各自保护自己")', () => {
-  it('enforces self-only policy management and symmetric cross-device isolation across all daemon routes', async () => {
+  it('enforces common-shared-group boundary, multi-group overlap, host_server_id union, and dual-identity symmetry across all daemon routes', async () => {
     const owner = await createUser(db, `owner-${hex(4)}`, 'Owner', 'owner@test.local');
     const participant = await createUser(db, `part-${hex(4)}`, 'Participant', 'part@test.local');
     const stranger = await createUser(db, `stranger-${hex(4)}`, 'Stranger', 'stranger@test.local');
 
-    // Owner's shared Host A, other unshared Host D, private Machine B, private Full Machine F, shared Machine C
+    // Groups:
+    // G1, G2: shared between Owner & Participant (Host A is in {G1, G2})
+    // G3, G4: shared between Owner & Stranger ONLY (disjoint from Host A's groups!)
+    // G_solo: solo group with ONLY Owner (must NOT qualify as a shared group)
+    const g1 = await createTeamWithMembers('Team G1', owner.id, [participant.id]);
+    const g2 = await createTeamWithMembers('Team G2', owner.id, [participant.id]);
+    const g3 = await createTeamWithMembers('Team G3', owner.id, [stranger.id]);
+    const g4 = await createTeamWithMembers('Team G4', owner.id, [stranger.id]);
+    const gSolo = await createTeamWithMembers('Solo Group', owner.id);
+
+    // Owner hosts: Host A (in G1 & G2) and unblocked Host D
     const hostA = await seedFullHost(owner.id, 'Host A');
     const hostD = await seedFullHost(owner.id, 'Host D');
-    const machineB = await seedControlledNode(owner.id, 'Private Machine B');
+    await addServerToGroup(hostA.serverId, g1);
+    await addServerToGroup(hostA.serverId, g2);
+    await addServerToGroup(hostA.serverId, gSolo);
+
+    // Owner targets:
+    // 1. Completely unshared private controlled node & private FULL node
+    const unsharedB = await seedControlledNode(owner.id, 'Unshared B');
     const fullF = await seedFullHost(owner.id, 'Private Full F');
-    const machineC = await seedControlledNode(owner.id, 'Shared Team Machine C');
+    // 2. Direct share ONLY with Participant (NO common group with Host A) -> MUST BE BLOCKED!
+    const directOnlyC = await seedControlledNode(owner.id, 'Direct Share Only C');
+    await createOrUpdateShare(db, {
+      id: `share-${hex(6)}`,
+      target: { kind: 'server', serverId: directOnlyC.serverId },
+      targetUserId: participant.id,
+      role: 'participant',
+      createdBy: owner.id,
+      now: Date.now(),
+    });
+    await setServerShareExecGrant(db, {
+      serverId: directOnlyC.serverId,
+      targetUserId: participant.id,
+      execGranted: true,
+      now: Date.now(),
+    });
+    // 3. Solo group only (both Host A and soloNode are in gSolo, but ONLY owner is a member) -> MUST BE BLOCKED!
+    const soloGroupNode = await seedControlledNode(owner.id, 'Solo Group Node');
+    await addServerToGroup(soloGroupNode.serverId, gSolo);
+    // 4. Disjoint multi-group ({G3, G4} vs Host A {G1, G2}) -> MUST BE BLOCKED!
+    const disjointGroupNode = await seedControlledNode(owner.id, 'Disjoint Group Node');
+    await addServerToGroup(disjointGroupNode.serverId, g3);
+    await addServerToGroup(disjointGroupNode.serverId, g4);
+    // 5. Overlapping multi-group ({G2, G3} overlaps Host A {G1, G2} at G2) -> MUST BE ALLOWED!
+    const overlapGroupNode = await seedControlledNode(owner.id, 'Overlap Group Node');
+    await addServerToGroup(overlapGroupNode.serverId, g2);
+    await addServerToGroup(overlapGroupNode.serverId, g3);
 
-    // Participant's private Machine E and Participant's own Host E2
-    const machineE = await seedControlledNode(participant.id, 'Participant Private E');
-    const hostE2 = await seedFullHost(participant.id, 'Participant Host E2');
+    // Companion host_server_id test on Host H2 (no direct machine_groups on H2; companion node is in gLink)
+    const gLink = await createTeamWithMembers('Team Link', owner.id, [participant.id]);
+    const hostH2 = await seedFullHost(owner.id, 'Host H2 Companion');
+    const companionOnH2 = await seedControlledNode(owner.id, 'Companion Node', { hostServerId: hostH2.serverId });
+    await addServerToGroup(companionOnH2.serverId, gLink);
+    const linkTarget = await seedControlledNode(owner.id, 'Target In Link Group');
+    await addServerToGroup(linkTarget.serverId, gLink);
 
-    // Seed session on Host A and grant Participant P session + controlled Machine C shares
+    // Group-only Host G (FULL server in g1 only, NO direct shares) for checking group-only GET /api/server + policy access
+    const groupOnlyMemberResSeed = await seedFullHost(owner.id, 'Group Only Host');
+    await addServerToGroup(groupOnlyMemberResSeed.serverId, g1);
+
+    // Participant targets & own host P2
+    const pUnshared = await seedControlledNode(participant.id, 'Participant Unshared E');
+    const pInG1 = await seedControlledNode(participant.id, 'Participant G1 Shared');
+    await addServerToGroup(pInG1.serverId, g1);
+    const hostP2 = await seedFullHost(participant.id, 'Participant Own Host P2');
+
+    // Direct session share on Host A for Participant's shared-session live turn
     await db.execute(
       `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, project_dir, state, created_at, updated_at)
        VALUES ($1, $2, 'deck_main_brain', 'proj', 'brain', 'claude-code', '/tmp', 'idle', $3, $3)`,
@@ -162,25 +283,10 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
       createdBy: owner.id,
       now: Date.now(),
     });
-    const shareC = await createOrUpdateShare(db, {
-      id: `share-${hex(6)}`,
-      target: { kind: 'server', serverId: machineC.serverId },
-      targetUserId: participant.id,
-      role: 'participant',
-      createdBy: owner.id,
-      now: Date.now(),
-    });
-    await setServerShareExecGrant(db, {
-      shareId: shareC.id,
-      serverId: machineC.serverId,
-      targetUserId: participant.id,
-      execGranted: true,
-      now: Date.now(),
-    });
 
-    const { app, mockPortForwardRouter } = createApp();
+    const { app } = createApp();
 
-    // 1. Daemon credential and stranger cannot read or toggle my-private-device-policy
+    // 1. Daemon token and stranger rejected on self-only policy endpoints
     expect((await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
       method: 'GET',
       headers: daemonAuth(hostA.serverId, hostA.token),
@@ -196,36 +302,30 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
       body: JSON.stringify({ blockPrivateDevices: true }),
     })).status).toBe(403);
 
-    // 2. Seed verification machine profiles for Owner's Machine B (private) and Machine C (shared)
-    const vmPrivateRes = await app.request('/api/verification-machines', {
-      method: 'PUT',
-      headers: webAuth(owner.id),
-      body: JSON.stringify({
-        scope: 'user',
-        scopeKey: '',
-        alias: 'vm-private-b',
-        kind: 'controlled_node',
-        target: machineB.nodeId,
-      }),
-    });
-    expect(vmPrivateRes.status).toBe(200);
-    const vmPrivateId = ((await vmPrivateRes.json()) as { profile: { id: string } }).profile.id;
+    // Group-only member Participant CAN read/toggle policy on Group Only Host (even without direct shares!)
+    const partServersRes = await app.request('/api/server', { headers: webAuth(participant.id) });
+    expect(partServersRes.status).toBe(200);
+    const partServers = (await partServersRes.json() as {
+      servers: Array<{ id: string; isOwner?: boolean; blockMyPrivateDevices?: boolean }>;
+    }).servers;
+    const groupOnlyEntry = partServers.find((s) => s.id === groupOnlyMemberResSeed.serverId);
+    expect(groupOnlyEntry).toMatchObject({ isOwner: false, blockMyPrivateDevices: false });
 
-    const vmSharedRes = await app.request('/api/verification-machines', {
-      method: 'PUT',
-      headers: webAuth(owner.id),
-      body: JSON.stringify({
-        scope: 'user',
-        scopeKey: '',
-        alias: 'vm-shared-c',
-        kind: 'controlled_node',
-        target: machineC.nodeId,
-      }),
-    });
-    expect(vmSharedRes.status).toBe(200);
-    const vmSharedId = ((await vmSharedRes.json()) as { profile: { id: string } }).profile.id;
+    // Seed verification machine profiles for unsharedB, directOnlyC, and overlapGroupNode
+    const mkVmProfile = async (alias: string, nodeId: string) => {
+      const res = await app.request('/api/verification-machines', {
+        method: 'PUT',
+        headers: webAuth(owner.id),
+        body: JSON.stringify({ scope: 'user', scopeKey: '', alias, kind: 'controlled_node', target: nodeId }),
+      });
+      expect(res.status).toBe(200);
+      return ((await res.json()) as { profile: { id: string } }).profile.id;
+    };
+    const vmUnsharedId = await mkVmProfile('vm-unshared', unsharedB.nodeId);
+    const vmDirectId = await mkVmProfile('vm-direct-only', directOnlyC.nodeId);
+    const vmOverlapId = await mkVmProfile('vm-overlap-g2', overlapGroupNode.nodeId);
 
-    // Mint turn tokens for Owner and Participant on Host A
+    // Live turn tokens on Host A (and Host H2)
     const ownerTurnA = await issueOwnerMachineAuthorityForSession(db, {
       actorUserId: owner.id,
       sourceServerId: hostA.serverId,
@@ -241,177 +341,385 @@ describe('Symmetric per-user per-host private device blocks ("各自保护自己
       actionId: `act-p-${hex(4)}`,
       signingKey: JWT_KEY,
     });
-    expect(ownerTurnA).toBeTruthy();
-    expect(partTurnA).toBeTruthy();
+    const ownerTurnH2 = await issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: owner.id,
+      sourceServerId: hostH2.serverId,
+      sessionName: 'deck_h2',
+      actionId: `act-h2-${hex(4)}`,
+      signingKey: JWT_KEY,
+    });
 
-    // 3. ONLY Owner O enables blockPrivateDevices on Host A (Participant P keeps false)
+    // 2. Owner enables blockPrivateDevices on Host A (Participant stays false on Host A)
     const patchOwnerRes = await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
       method: 'PATCH',
       headers: webAuth(owner.id),
       body: JSON.stringify({ blockPrivateDevices: true }),
     });
     expect(patchOwnerRes.status).toBe(200);
-    expect(await patchOwnerRes.json()).toEqual({ ok: true, serverId: hostA.serverId, blockPrivateDevices: true });
 
-    // P's own policy on Host A remains false; O's GET /api/server and P's GET /api/shares reflect separation
-    const pPolicyRes = await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
-      method: 'GET',
-      headers: webAuth(participant.id),
-    });
-    expect(pPolicyRes.status).toBe(200);
-    expect(await pPolicyRes.json()).toEqual({ ok: true, serverId: hostA.serverId, blockPrivateDevices: false });
+    // Owner's GET /api/machines on Host A hides: unsharedB, directOnlyC, soloGroupNode, disjointGroupNode!
+    // Allows: overlapGroupNode (shares G2 with Host A) AND participant's pInG1 (non-owner device shared via G1)!
+    const ownerListedIds = (
+      (await (await app.request('/api/machines', { headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!) })).json()) as {
+        machines: Array<{ serverId: string }>;
+      }
+    ).machines.map((m) => m.serverId);
+    expect(ownerListedIds).not.toContain(unsharedB.serverId);
+    expect(ownerListedIds).not.toContain(directOnlyC.serverId);
+    expect(ownerListedIds).not.toContain(soloGroupNode.serverId);
+    expect(ownerListedIds).not.toContain(disjointGroupNode.serverId);
+    expect(ownerListedIds).toContain(overlapGroupNode.serverId);
+    expect(ownerListedIds).toContain(pInG1.serverId);
 
-    const ownerServers = await (await app.request('/api/server', { headers: webAuth(owner.id) })).json() as {
-      servers: Array<{ id: string; blockMyPrivateDevices?: boolean }>;
-    };
-    expect(ownerServers.servers.find((s) => s.id === hostA.serverId)?.blockMyPrivateDevices).toBe(true);
-    expect(ownerServers.servers.find((s) => s.id === hostD.serverId)?.blockMyPrivateDevices).toBe(false);
-
-    const partShares = await (await app.request('/api/shares', { headers: webAuth(participant.id) })).json() as {
-      shares: Array<{ serverId: string; blockMyPrivateDevices?: boolean }>;
-    };
-    expect(partShares.shares.find((s) => s.serverId === hostA.serverId)?.blockMyPrivateDevices).toBe(false);
-
-    // Owner's live turn on Host A:
-    // - GET /api/machines hides Machine B, still includes shared Machine C
-    const ownerListRes = await app.request('/api/machines', {
-      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
-    });
-    expect(ownerListRes.status).toBe(200);
-    const ownerListedIds = ((await ownerListRes.json()) as { machines: Array<{ serverId: string }> }).machines.map((m) => m.serverId);
-    expect(ownerListedIds).not.toContain(machineB.serverId);
-    expect(ownerListedIds).toContain(machineC.serverId);
-
-    // - exec, computer_use, file-transfer, port_forward (controlled AND full), verification-machines all block Machine B / Full F
-    expect((await app.request(`/api/machine/exec?serverId=${machineB.serverId}`, {
+    // Action routes block unshared, direct-only, solo-group, disjoint-group (403) while allowing overlapping group G2 (200)
+    for (const blockedTarget of [unsharedB.serverId, directOnlyC.serverId, soloGroupNode.serverId, disjointGroupNode.serverId]) {
+      expect((await app.request(`/api/machine/exec?serverId=${blockedTarget}`, {
+        method: 'POST',
+        headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
+        body: JSON.stringify({ command: 'echo blocked' }),
+      })).status).toBe(403);
+      expect((await app.request(`/api/machine/computer-use?serverId=${blockedTarget}`, {
+        method: 'POST',
+        headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
+        body: JSON.stringify({ tool: 'list_apps', arguments: {} }),
+      })).status).toBe(403);
+      expect((await app.request(`/api/server/${blockedTarget}/machine-file-handle`, {
+        method: 'POST',
+        headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
+        body: JSON.stringify({ path: '/tmp/secret.txt' }),
+      })).status).toBe(403);
+    }
+    expect((await app.request(`/api/machine/exec?serverId=${overlapGroupNode.serverId}`, {
       method: 'POST',
       headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
-      body: JSON.stringify({ command: 'echo blocked' }),
+      body: JSON.stringify({ command: 'echo ok' }),
+    })).status).toBe(200);
+
+    // port-forward creation checks BOTH controlled and FULL endpoints against common group boundary
+    expect((await app.request('/api/port-forwards', {
+      method: 'POST',
+      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
+      body: JSON.stringify({ listenNode: 'self', listenPort: 9001, targetNode: directOnlyC.nodeId, targetPort: 80 }),
     })).status).toBe(403);
-
-    expect((await app.request(`/api/machine/computer-use?serverId=${machineB.serverId}`, {
+    expect((await app.request('/api/port-forwards', {
       method: 'POST',
       headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
-      body: JSON.stringify({ tool: 'list_apps', arguments: {} }),
+      body: JSON.stringify({ listenNode: fullF.serverId, listenPort: 9002, targetNode: overlapGroupNode.nodeId, targetPort: 80 }),
     })).status).toBe(403);
-
-    expect((await app.request(`/api/server/${machineB.serverId}/machine-file-handle`, {
+    expect((await app.request('/api/port-forwards', {
       method: 'POST',
       headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
-      body: JSON.stringify({ path: '/tmp/secret.txt' }),
+      body: JSON.stringify({ listenNode: 'self', listenPort: 9003, targetNode: overlapGroupNode.nodeId, targetPort: 80 }),
+    })).status).toBe(200);
+
+    // verification-machines hides unshared & directOnly, keeps overlapGroupNode
+    const vmList = (await (await app.request('/api/verification-machines?includeAllProjects=1', {
+      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
+    })).json() as { profiles: Array<{ id: string }> }).profiles.map((p) => p.id);
+    expect(vmList).toEqual([vmOverlapId]);
+    expect((await app.request(`/api/verification-machines/${vmUnsharedId}/verification`, {
+      method: 'POST',
+      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
+      body: JSON.stringify({ status: 'verified' }),
     })).status).toBe(403);
-
-    // port-forward blocks BOTH controlled Machine B and FULL Machine F on listen or target end
-    const pfCtrlRes = await app.request('/api/port-forwards', {
-      method: 'POST',
-      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
-      body: JSON.stringify({ listenNode: 'self', listenPort: 9001, targetNode: machineB.nodeId, targetPort: 80 }),
-    });
-    expect(pfCtrlRes.status).toBe(403);
-    expect(((await pfCtrlRes.json()) as { error: string }).error).toBe(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST);
-
-    const pfFullRes = await app.request('/api/port-forwards', {
-      method: 'POST',
-      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
-      body: JSON.stringify({ listenNode: fullF.serverId, listenPort: 9002, targetNode: machineC.nodeId, targetPort: 80 }),
-    });
-    expect(pfFullRes.status).toBe(403);
-    expect(((await pfFullRes.json()) as { error: string }).error).toBe(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST);
-
-    // verification-machines on Host A hides vm-private-b, keeps vm-shared-c, and denies POST verification for vm-private-b
-    const vmDaemonList = await (await app.request('/api/verification-machines?includeAllProjects=1', {
-      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
-    })).json() as { profiles: Array<{ id: string }> };
-    expect(vmDaemonList.profiles.map((p) => p.id)).toEqual([vmSharedId]);
-
-    expect((await app.request(`/api/verification-machines/${vmPrivateId}/verification`, {
+    expect((await app.request(`/api/verification-machines/${vmDirectId}/verification`, {
       method: 'POST',
       headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
       body: JSON.stringify({ status: 'verified' }),
     })).status).toBe(403);
 
-    // Shared Machine C remains accessible for Owner O on Host A
-    expect((await app.request(`/api/machine/exec?serverId=${machineC.serverId}`, {
+    // Dynamic overlap removal: removing overlapGroupNode from unique overlapping G2 immediately blocks it!
+    await removeServerFromGroup(overlapGroupNode.serverId, g2);
+    expect((await app.request(`/api/machine/exec?serverId=${overlapGroupNode.serverId}`, {
       method: 'POST',
       headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
-      body: JSON.stringify({ command: 'echo shared-ok' }),
+      body: JSON.stringify({ command: 'echo now-blocked' }),
+    })).status).toBe(403);
+
+    // 3. Companion host_server_id union & revocation test on Host H2
+    await app.request(`/api/server/${hostH2.serverId}/my-private-device-policy`, {
+      method: 'PATCH',
+      headers: webAuth(owner.id),
+      body: JSON.stringify({ blockPrivateDevices: true }),
+    });
+    expect((await app.request(`/api/machine/exec?serverId=${linkTarget.serverId}`, {
+      method: 'POST',
+      headers: daemonAuth(hostH2.serverId, hostH2.token, ownerTurnH2!),
+      body: JSON.stringify({ command: 'echo via-companion' }),
     })).status).toBe(200);
+    await db.execute('UPDATE servers SET revoked_at = $2 WHERE id = $1', [companionOnH2.serverId, Date.now()]);
+    expect((await app.request(`/api/machine/exec?serverId=${linkTarget.serverId}`, {
+      method: 'POST',
+      headers: daemonAuth(hostH2.serverId, hostH2.token, ownerTurnH2!),
+      body: JSON.stringify({ command: 'echo companion-revoked' }),
+    })).status).toBe(403);
 
-    // Interactive browser UI (no daemon authServerId) AND unblocked Host D still see/access Machine B
-    const uiMachines = await (await app.request('/api/machines', { headers: webAuth(owner.id) })).json() as {
+    // 4. Browser UI & unblocked Host D unaffected for Owner
+    const uiMachines = (await (await app.request('/api/machines', { headers: webAuth(owner.id) })).json() as {
       machines: Array<{ serverId: string }>;
-    };
-    expect(uiMachines.machines.map((m) => m.serverId)).toContain(machineB.serverId);
-
-    const hostDList = await (await app.request('/api/machines', {
+    }).machines.map((m) => m.serverId);
+    expect(uiMachines).toEqual(expect.arrayContaining([unsharedB.serverId, directOnlyC.serverId, soloGroupNode.serverId, disjointGroupNode.serverId]));
+    const hostDMachines = (await (await app.request('/api/machines', {
       headers: daemonAuth(hostD.serverId, hostD.token),
-    })).json() as { machines: Array<{ serverId: string }> };
-    expect(hostDList.machines.map((m) => m.serverId)).toContain(machineB.serverId);
+    })).json() as { machines: Array<{ serverId: string }> }).machines.map((m) => m.serverId);
+    expect(hostDMachines).toContain(unsharedB.serverId);
 
-    // Crucially: Participant P on Host A STILL accesses Participant P's own unshared Machine E!
-    const partListBefore = await (await app.request('/api/machines', {
-      headers: daemonAuth(hostA.serverId, hostA.token, partTurnA!),
-    })).json() as { machines: Array<{ serverId: string }> };
-    expect(partListBefore.machines.map((m) => m.serverId)).toContain(machineE.serverId);
-    expect((await app.request(`/api/machine/computer-use?serverId=${machineE.serverId}`, {
+    // 5. Dual-identity symmetry: Participant's unshared device STILL works until Participant enables toggle on Host A
+    expect((await app.request(`/api/machine/computer-use?serverId=${pUnshared.serverId}`, {
       method: 'POST',
       headers: daemonAuth(hostA.serverId, hostA.token, partTurnA!),
       body: JSON.stringify({ tool: 'list_apps', arguments: {} }),
     })).status).toBe(200);
 
-    // 4. Participant P enables self-protection on Host A ("参与者也可以关") -> P's Machine E blocked on Host A, O unchanged!
-    expect((await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
+    await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
       method: 'PATCH',
       headers: webAuth(participant.id),
       body: JSON.stringify({ blockPrivateDevices: true }),
-    })).status).toBe(200);
-
-    const partListAfter = await (await app.request('/api/machines', {
+    });
+    const partIdsAfter = (await (await app.request('/api/machines', {
       headers: daemonAuth(hostA.serverId, hostA.token, partTurnA!),
-    })).json() as { machines: Array<{ serverId: string }> };
-    expect(partListAfter.machines.map((m) => m.serverId)).not.toContain(machineE.serverId);
-    expect(partListAfter.machines.map((m) => m.serverId)).toContain(machineC.serverId);
-    expect((await app.request(`/api/machine/computer-use?serverId=${machineE.serverId}`, {
+    })).json() as { machines: Array<{ serverId: string }> }).machines.map((m) => m.serverId);
+    expect(partIdsAfter).not.toContain(pUnshared.serverId);
+    expect(partIdsAfter).toContain(pInG1.serverId);
+    expect((await app.request(`/api/machine/computer-use?serverId=${pUnshared.serverId}`, {
       method: 'POST',
       headers: daemonAuth(hostA.serverId, hostA.token, partTurnA!),
       body: JSON.stringify({ tool: 'list_apps', arguments: {} }),
     })).status).toBe(403);
-    // P's own Host E2 STILL sees Machine E
-    const pHostE2List = await (await app.request('/api/machines', {
-      headers: daemonAuth(hostE2.serverId, hostE2.token),
-    })).json() as { machines: Array<{ serverId: string }> };
-    expect(pHostE2List.machines.map((m) => m.serverId)).toContain(machineE.serverId);
+    expect((await app.request(`/api/machine/computer-use?serverId=${pInG1.serverId}`, {
+      method: 'POST',
+      headers: daemonAuth(hostA.serverId, hostA.token, partTurnA!),
+      body: JSON.stringify({ tool: 'list_apps', arguments: {} }),
+    })).status).toBe(200);
+    // Unblocked Participant Host P2 still sees pUnshared
+    const hostP2Ids = (await (await app.request('/api/machines', {
+      headers: daemonAuth(hostP2.serverId, hostP2.token),
+    })).json() as { machines: Array<{ serverId: string }> }).machines.map((m) => m.serverId);
+    expect(hostP2Ids).toContain(pUnshared.serverId);
+  });
 
-    // 5. Dynamic re-classification: revoking share on Machine C makes Machine C private & blocked for Owner O on Host A!
-    await revokeShare(db, { shareId: shareC.id, serverId: machineC.serverId, now: Date.now() });
-    const ownerAfterRevoke = await (await app.request('/api/machines', {
-      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
-    })).json() as { machines: Array<{ serverId: string }> };
-    expect(ownerAfterRevoke.machines.map((m) => m.serverId)).not.toContain(machineC.serverId);
+  it('blocks DELETE /:tunnelId and atomic batch DELETE / (with and without ?node=) on either blocked endpoint, while allowing when toggle is off', async () => {
+    const owner = await createUser(db, `pf-o-${hex(4)}`, 'PF Owner', 'pfo@test.local');
+    const colleague = await createUser(db, `pf-c-${hex(4)}`, 'PF Colleague', 'pfc@test.local');
+    const g1 = await createTeamWithMembers('PF Team', owner.id, [colleague.id]);
+    const hostA = await seedFullHost(owner.id, 'PF Host A');
+    const allowedShared = await seedControlledNode(owner.id, 'PF Allowed C');
+    const blockedPriv = await seedControlledNode(owner.id, 'PF Blocked B');
+    const blockedFull = await seedFullHost(owner.id, 'PF Blocked Full F');
+    await addServerToGroup(hostA.serverId, g1);
+    await addServerToGroup(allowedShared.serverId, g1);
 
-    // Silence unused variable warnings cleanly via tunnel list filter assertion
-    mockPortForwardRouter.listTunnels = async () => [{
-      tunnelId: 't-1',
-      listenNode: 'self',
-      listenServerId: hostA.serverId,
-      listenHost: '127.0.0.1',
-      listenPort: 9000,
-      localEndpoint: '127.0.0.1:9000',
-      targetNode: machineB.nodeId,
-      targetServerId: machineB.serverId,
-      targetHost: '127.0.0.1',
-      targetPort: 80,
-      transportMode: 'relay',
-      activeConnections: 0,
-      bytesSent: 0,
-      bytesReceived: 0,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + 60_000,
-    }];
-    const pfListRes = await app.request('/api/port-forwards', {
-      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnA!),
+    const now = Date.now();
+    const { app, tunnels, closeTunnelSpy, closeAllSpy } = createApp([
+      {
+        tunnelId: 't-allowed',
+        userId: owner.id,
+        status: 'active',
+        listenNode: 'self',
+        listenServerId: hostA.serverId,
+        listenHost: '127.0.0.1',
+        listenPort: 9101,
+        localEndpoint: '127.0.0.1:9101',
+        targetNode: allowedShared.nodeId,
+        targetServerId: allowedShared.serverId,
+        targetHost: '127.0.0.1',
+        targetPort: 80,
+        transportMode: 'relay',
+        activeConnections: 0,
+        bytesSent: 0,
+        bytesReceived: 0,
+        createdAt: now,
+        expiresAt: now + 60_000,
+      },
+      {
+        tunnelId: 't-blocked-target',
+        userId: owner.id,
+        status: 'active',
+        listenNode: allowedShared.nodeId,
+        listenServerId: allowedShared.serverId,
+        listenHost: '127.0.0.1',
+        listenPort: 9102,
+        localEndpoint: '127.0.0.1:9102',
+        targetNode: blockedPriv.nodeId,
+        targetServerId: blockedPriv.serverId,
+        targetHost: '127.0.0.1',
+        targetPort: 80,
+        transportMode: 'relay',
+        activeConnections: 0,
+        bytesSent: 0,
+        bytesReceived: 0,
+        createdAt: now,
+        expiresAt: now + 60_000,
+      },
+      {
+        tunnelId: 't-blocked-listen',
+        userId: owner.id,
+        status: 'opening',
+        listenNode: blockedFull.serverId,
+        listenServerId: blockedFull.serverId,
+        listenHost: '127.0.0.1',
+        listenPort: 9103,
+        localEndpoint: '127.0.0.1:9103',
+        targetNode: allowedShared.nodeId,
+        targetServerId: allowedShared.serverId,
+        targetHost: '127.0.0.1',
+        targetPort: 80,
+        transportMode: 'relay',
+        activeConnections: 0,
+        bytesSent: 0,
+        bytesReceived: 0,
+        createdAt: now,
+        expiresAt: now + 60_000,
+      },
+    ]);
+
+    const turnToken = await issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: owner.id,
+      sourceServerId: hostA.serverId,
+      sessionName: 'deck_pf',
+      actionId: `act-pf-${hex(4)}`,
+      signingKey: JWT_KEY,
     });
-    expect(pfListRes.status).toBe(200);
-    expect(((await pfListRes.json()) as { tunnels: unknown[] }).tunnels).toEqual([]);
+
+    await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
+      method: 'PATCH',
+      headers: webAuth(owner.id),
+      body: JSON.stringify({ blockPrivateDevices: true }),
+    });
+
+    // GET list returns only t-allowed
+    const listRes = await app.request('/api/port-forwards', {
+      headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
+    });
+    expect(listRes.status).toBe(200);
+    expect(((await listRes.json()) as { tunnels: Array<{ tunnelId: string }> }).tunnels.map((t) => t.tunnelId)).toEqual(['t-allowed']);
+
+    // DELETE /:tunnelId blocks on either blocked targetServerId or blocked listenServerId, never calling router close
+    for (const id of ['t-blocked-target', 't-blocked-listen']) {
+      const delOne = await app.request(`/api/port-forwards/${id}`, {
+        method: 'DELETE',
+        headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
+      });
+      expect(delOne.status).toBe(403);
+      expect(((await delOne.json()) as { error: string }).error).toBe(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST);
+    }
+    expect(closeTunnelSpy).not.toHaveBeenCalled();
+
+    // Batch DELETE / without ?node= blocks with 403 and performs ZERO partial closes!
+    const delAll = await app.request('/api/port-forwards', {
+      method: 'DELETE',
+      headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
+    });
+    expect(delAll.status).toBe(403);
+    expect(((await delAll.json()) as { error: string }).error).toBe(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST);
+    expect(closeAllSpy).not.toHaveBeenCalled();
+    expect(tunnels.every((t) => t.status !== 'closed')).toBe(true);
+
+    // Batch DELETE /?node=allowedShared also fails atomically because t-blocked-target/listen bridge allowedShared <-> blocked!
+    const delFiltered = await app.request(`/api/port-forwards?node=${allowedShared.nodeId}`, {
+      method: 'DELETE',
+      headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
+    });
+    expect(delFiltered.status).toBe(403);
+    expect(closeAllSpy).not.toHaveBeenCalled();
+    expect(tunnels.every((t) => t.status !== 'closed')).toBe(true);
+
+    // When toggle is turned OFF, normal DELETE /:tunnelId and DELETE / work!
+    await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
+      method: 'PATCH',
+      headers: webAuth(owner.id),
+      body: JSON.stringify({ blockPrivateDevices: false }),
+    });
+    const delOneOk = await app.request('/api/port-forwards/t-blocked-listen', {
+      method: 'DELETE',
+      headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
+    });
+    expect(delOneOk.status).toBe(200);
+    const delAllOk = await app.request('/api/port-forwards', {
+      method: 'DELETE',
+      headers: daemonAuth(hostA.serverId, hostA.token, turnToken!),
+    });
+    expect(delAllOk.status).toBe(200);
+    expect(tunnels.every((t) => t.status === 'closed')).toBe(true);
+  });
+
+  it('filters private controlled nodes BEFORE LIMIT cap (>200 machines) in both /api/machines and /api/verification-machines', async () => {
+    const owner = await createUser(db, `cap-o-${hex(4)}`, 'Cap Owner', 'capo@test.local');
+    const teammate = await createUser(db, `cap-t-${hex(4)}`, 'Cap Teammate', 'capt@test.local');
+    const g1 = await createTeamWithMembers('Cap Team', owner.id, [teammate.id]);
+    const hostA = await seedFullHost(owner.id, 'Cap Host A');
+    await addServerToGroup(hostA.serverId, g1);
+
+    // Seed 202 alphabetically-earlier private nodes + 1 alphabetically-last shared-group node #203 + 1 alphabetically-last private node #204
+    const privateNodes: Array<{ serverId: string; nodeId: string }> = [];
+    for (let i = 1; i <= 202; i += 1) {
+      privateNodes.push(await seedControlledNode(owner.id, `aaa-priv-${String(i).padStart(3, '0')}`));
+    }
+    const lastShared = await seedControlledNode(owner.id, 'zzz-shared-203');
+    await addServerToGroup(lastShared.serverId, g1);
+    const lastPrivate = await seedControlledNode(owner.id, 'zzz-priv-204');
+
+    const { app } = createApp();
+    // Register verification profiles for the >200 nodes (priv #202, shared #203, priv #204) via browser
+    for (const [alias, nodeId] of [
+      ['p-priv-001', privateNodes[0]!.nodeId],
+      ['p-priv-204', lastPrivate.nodeId],
+      ['p-shared-203', lastShared.nodeId],
+    ] as const) {
+      const putRes = await app.request('/api/verification-machines', {
+        method: 'PUT',
+        headers: webAuth(owner.id),
+        body: JSON.stringify({ scope: 'user', scopeKey: '', alias, kind: 'controlled_node', target: nodeId }),
+      });
+      expect(putRes.status).toBe(200);
+    }
+
+    const ownerTurnCap = await issueOwnerMachineAuthorityForSession(db, {
+      actorUserId: owner.id,
+      sourceServerId: hostA.serverId,
+      sessionName: 'deck_cap',
+      actionId: `act-cap-${hex(4)}`,
+      signingKey: JWT_KEY,
+    });
+
+    // With toggle OFF: GET /api/machines hits 200-cap -> 413
+    const offList = await app.request('/api/machines', { headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnCap!) });
+    expect(offList.status).toBe(413);
+
+    // Enable blockPrivateDevices on Host A
+    await app.request(`/api/server/${hostA.serverId}/my-private-device-policy`, {
+      method: 'PATCH',
+      headers: webAuth(owner.id),
+      body: JSON.stringify({ blockPrivateDevices: true }),
+    });
+
+    // GET /api/machines returns 200 with ONLY [lastShared] (no false 413, no hiding past 201!)
+    const onList = await app.request('/api/machines', { headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnCap!) });
+    expect(onList.status).toBe(200);
+    const listedIds = ((await onList.json()) as { machines: Array<{ serverId: string }> }).machines.map((m) => m.serverId);
+    expect(listedIds).toEqual([lastShared.serverId]);
+
+    // GET /api/verification-machines hides BOTH p-priv-001 AND p-priv-204 (item >200!), keeps ONLY p-shared-203!
+    const vmRes = await app.request('/api/verification-machines?includeAllProjects=1', {
+      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnCap!),
+    });
+    expect(vmRes.status).toBe(200);
+    const vmAliases = ((await vmRes.json()) as { profiles: Array<{ alias: string }> }).profiles.map((p) => p.alias);
+    expect(vmAliases).toEqual(['p-shared-203']);
+
+    // PUT /api/verification-machines past 200-cap: allowed shared node #203 -> 200, blocked private node #204 -> 403 private_device_blocked_for_host
+    const putAllowedRes = await app.request('/api/verification-machines', {
+      method: 'PUT',
+      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnCap!),
+      body: JSON.stringify({ scope: 'user', scopeKey: '', alias: 'daemon-shared-203', kind: 'controlled_node', target: lastShared.nodeId }),
+    });
+    expect(putAllowedRes.status).toBe(200);
+    const putBlockedRes = await app.request('/api/verification-machines', {
+      method: 'PUT',
+      headers: daemonAuth(hostA.serverId, hostA.token, ownerTurnCap!),
+      body: JSON.stringify({ scope: 'user', scopeKey: '', alias: 'daemon-priv-204', kind: 'controlled_node', target: lastPrivate.nodeId }),
+    });
+    expect(putBlockedRes.status).toBe(403);
+    expect(((await putBlockedRes.json()) as { error: string }).error).toBe(MACHINE_DENIAL_REASON.PRIVATE_DEVICE_BLOCKED_FOR_HOST);
   });
 });

@@ -62,7 +62,6 @@ import { isControlledNodeId } from '../../../shared/controlled-node-identity.js'
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { listActorOperableMachineAccess, resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
 import { isSharedOrContributedServer } from '../security/daemon-scope.js';
-import { findSharedOrContributedServerIds, getServerPrivateDeviceBlock } from '../security/server-share-boundary.js';
 import {
   CONTROLLED_NODE_UPGRADE_STATUS,
   DAEMON_UPGRADE_DELIVERY_STATUS,
@@ -148,19 +147,10 @@ export async function listControlledMachines(
   // the whole machine list as malformed.
   hostServerId?: string;
 })[]; overLimit: boolean }> {
-  const actingUserId = delegatedActorUserId ?? userId;
-  let rows: ControlledRow[] = delegatedActorUserId
-    ? [...(await listActorOperableMachineAccess(db, delegatedActorUserId, nowMs, MACHINE_LIST_MAX_ITEMS + 1)).values()]
-    : await listAccessibleControlledMachines(db, userId, nowMs, MACHINE_LIST_MAX_ITEMS + 1);
-  if (options?.sourceServerId && await getServerPrivateDeviceBlock(db, options.sourceServerId, actingUserId)) {
-    const ownedTargetIds = rows
-      .filter((r) => r.user_id === actingUserId && r.id !== options.sourceServerId)
-      .map((r) => r.id);
-    if (ownedTargetIds.length > 0) {
-      const sharedIds = await findSharedOrContributedServerIds(db, ownedTargetIds, nowMs);
-      rows = rows.filter((r) => r.user_id !== actingUserId || r.id === options.sourceServerId || sharedIds.has(r.id));
-    }
-  }
+  const sourceFilter = options?.sourceServerId ? { excludePrivateOnSourceServerId: options.sourceServerId } : undefined;
+  const rows: ControlledRow[] = delegatedActorUserId
+    ? [...(await listActorOperableMachineAccess(db, delegatedActorUserId, nowMs, MACHINE_LIST_MAX_ITEMS + 1, options?.sourceServerId)).values()]
+    : await listAccessibleControlledMachines(db, userId, nowMs, MACHINE_LIST_MAX_ITEMS + 1, false, sourceFilter);
   // The bound is on the authenticated actual actor's fleet, not the source owner's.
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
   const page = rows.slice(0, MACHINE_LIST_MAX_ITEMS);

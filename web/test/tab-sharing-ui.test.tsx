@@ -6,6 +6,7 @@ import { h } from 'preact';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { useState } from 'preact/hooks';
 import { SessionTabs } from '../src/components/SessionTabs.js';
 import { ShareSessionDialog } from '../src/components/ShareSessionDialog.js';
 import { SharedEntriesPanel } from '../src/components/SharedEntriesPanel.js';
@@ -873,47 +874,105 @@ describe('collaborative tab sharing UI', () => {
     expect(source).toContain('onShareSession(activeSession, subSessionId ?? null)');
   });
 
-  it('renders deduplicated Participant self-protection toggle per shared host and updates private device policy', async () => {
-    const onTogglePrivateDeviceBlock = vi.fn().mockResolvedValue(undefined);
-    render(
-      <SharedEntriesPanel
-        entries={[
-          {
-            id: 'share-1',
-            serverId: 'srv-1',
-            serverName: 'Team Workstation',
-            role: 'participant',
-            status: 'active',
-            blockMyPrivateDevices: false,
-            targetLabel: 'Tab A',
-            target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_a_brain' },
-          },
-          {
-            id: 'share-2',
-            serverId: 'srv-1',
-            serverName: 'Team Workstation',
-            role: 'participant',
-            status: 'active',
-            blockMyPrivateDevices: false,
-            targetLabel: 'Tab B',
-            target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_b_brain' },
-          },
-        ]}
-        onOpen={() => {}}
-        onRefresh={() => {}}
-        onTogglePrivateDeviceBlock={onTogglePrivateDeviceBlock}
-      />,
+  it('renders deduplicated Participant self-protection toggles for direct shares AND group-only servers, and lets external refreshes override settled state', async () => {
+    let resolvePatch!: () => void;
+    const onTogglePrivateDeviceBlock = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { resolvePatch = resolve; }),
     );
+    const Harness = ({ serverBlocked }: { serverBlocked: boolean }) => {
+      const [localServerVal, setLocalServerVal] = useState<boolean | null>(null);
+      const effectiveBlocked = localServerVal ?? serverBlocked;
+      return (
+        <SharedEntriesPanel
+          entries={[
+            {
+              id: 'share-1',
+              serverId: 'srv-1',
+              serverName: 'Team Workstation',
+              role: 'participant',
+              status: 'active',
+              blockMyPrivateDevices: effectiveBlocked,
+              targetLabel: 'Tab A',
+              target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_a_brain' },
+            },
+            {
+              id: 'share-2',
+              serverId: 'srv-1',
+              serverName: 'Team Workstation',
+              role: 'participant',
+              status: 'active',
+              blockMyPrivateDevices: effectiveBlocked,
+              targetLabel: 'Tab B',
+              target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_b_brain' },
+            },
+          ]}
+          groupServers={[
+            { id: 'srv-grp', name: 'Group Only Host', isOwner: false, blockMyPrivateDevices: false },
+            { id: 'srv-own', name: 'Own Host', isOwner: true, blockMyPrivateDevices: false },
+          ]}
+          onOpen={() => {}}
+          onRefresh={() => {}}
+          onTogglePrivateDeviceBlock={async (serverId, next) => {
+            await onTogglePrivateDeviceBlock(serverId, next);
+            setLocalServerVal(next);
+          }}
+        />
+      );
+    };
 
-    const rows = document.querySelectorAll('[data-testid="shared-private-policy-srv-1"]');
-    expect(rows).toHaveLength(1);
-    const checkbox = rows[0]!.querySelector('input[type="checkbox"]') as HTMLInputElement;
+    const view = render(<Harness serverBlocked={false} />);
+
+    // Direct entries deduplicated + group-only server included + owned server excluded
+    expect(document.querySelectorAll('[data-testid="shared-private-policy-srv-1"]')).toHaveLength(1);
+    expect(document.querySelectorAll('[data-testid="shared-private-policy-srv-grp"]')).toHaveLength(1);
+    expect(document.querySelectorAll('[data-testid="shared-private-policy-srv-own"]')).toHaveLength(0);
+
+    const checkbox = document.querySelector('[data-testid="shared-private-policy-srv-1"] input[type="checkbox"]') as HTMLInputElement;
     expect(checkbox.checked).toBe(false);
 
+    // While PATCH is in-flight, optimistic override shows checked=true
     fireEvent.click(checkbox);
     await waitFor(() => {
       expect(onTogglePrivateDeviceBlock).toHaveBeenCalledWith('srv-1', true);
     });
     expect(checkbox.checked).toBe(true);
+
+    // Finish PATCH -> settled value becomes srv prop; external refresh resetting server value to false MUST become visible!
+    resolvePatch();
+    await waitFor(() => {
+      expect(checkbox.disabled).toBe(false);
+    });
+    view.rerender(
+      <SharedEntriesPanel
+        entries={[{
+          id: 'share-1',
+          serverId: 'srv-1',
+          serverName: 'Team Workstation',
+          role: 'participant',
+          status: 'active',
+          blockMyPrivateDevices: false,
+          targetLabel: 'Tab A',
+          target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_a_brain' },
+        }]}
+        groupServers={[{ id: 'srv-grp', name: 'Group Only Host', isOwner: false, blockMyPrivateDevices: true }]}
+        onOpen={() => {}}
+        onRefresh={() => {}}
+        onTogglePrivateDeviceBlock={onTogglePrivateDeviceBlock}
+      />,
+    );
+    expect((document.querySelector('[data-testid="shared-private-policy-srv-1"] input') as HTMLInputElement).checked).toBe(false);
+    expect((document.querySelector('[data-testid="shared-private-policy-srv-grp"] input') as HTMLInputElement).checked).toBe(true);
+
+    // Group-only member with zero direct shares still renders the self-service toggle!
+    view.rerender(
+      <SharedEntriesPanel
+        entries={[]}
+        groupServers={[{ id: 'srv-grp', name: 'Group Only Host', isOwner: false, blockMyPrivateDevices: false }]}
+        onOpen={() => {}}
+        onRefresh={() => {}}
+        onTogglePrivateDeviceBlock={onTogglePrivateDeviceBlock}
+      />,
+    );
+    expect(document.querySelectorAll('[data-testid="shared-private-policy-srv-grp"]')).toHaveLength(1);
   });
 });
