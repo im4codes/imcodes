@@ -2286,6 +2286,47 @@ html.native-ios-mac .chat-dl-btn {
   border-bottom: 1px solid var(--chrome-line-soft);
   background: rgba(13, 20, 34, 0.72);
 }
+.quick-sdk-byok-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: none;
+  letter-spacing: 0.02em;
+  color: #94a3b8;
+  user-select: none;
+  line-height: 1;
+  transition: color 0.14s ease;
+}
+.quick-sdk-byok-toggle:hover {
+  color: #e2e8f0;
+}
+.quick-sdk-byok-toggle.is-active {
+  color: #38bdf8;
+}
+.quick-sdk-byok-toggle input[type="checkbox"] {
+  width: auto;
+  height: auto;
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+  accent-color: #0284c7;
+  flex: 0 0 auto;
+}
+.quick-sdk-byok-toggle input[type="checkbox"]:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.quick-sdk-empty-hint {
+  padding: 16px 12px;
+  font-size: 11px;
+  color: #94a3b8;
+  text-align: center;
+  line-height: 1.4;
+}
 .quick-sdk-col-header-models {
   color: #cbd5e1;
   text-transform: none;

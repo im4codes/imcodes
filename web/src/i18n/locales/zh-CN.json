@@ -1143,7 +1143,10 @@
       "switchPending": "等待 daemon 确认超时，正在等待运行态同步结果。",
       "presetLabel": "预设",
       "presetDefault": "默认",
-      "managePresets": "管理 CC Preset"
+      "managePresets": "管理 CC Preset",
+      "byokFilter": "BYOK",
+      "byokFilterHint": "仅显示支持 BYOK / 自定义 API 预设的 SDK",
+      "noByokSdks": "暂无支持 BYOK 的 SDK"
     },
     "capacity_retrying": "模型容量已满，正在自动重试（间隔不超过 15 秒）",
     "state_error": "会话错误",

@@ -1143,7 +1143,10 @@
       "switchPending": "Switch timed out waiting for daemon confirmation — waiting for runtime sync.",
       "presetLabel": "Preset",
       "presetDefault": "Default",
-      "managePresets": "Manage CC Presets"
+      "managePresets": "Manage CC Presets",
+      "byokFilter": "BYOK",
+      "byokFilterHint": "Only show SDKs that support BYOK / custom API presets",
+      "noByokSdks": "No BYOK SDKs available"
     },
     "capacity_retrying": "Model at capacity — retrying automatically (every ≤15 s)",
     "state_error": "Session error",

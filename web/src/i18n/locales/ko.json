@@ -1143,7 +1143,10 @@
       "switchPending": "데몬 응답 시간이 초과되어 런타임 동기화를 기다리는 중입니다.",
       "presetLabel": "프리셋",
       "presetDefault": "기본값",
-      "managePresets": "CC Preset 관리"
+      "managePresets": "CC Preset 관리",
+      "byokFilter": "BYOK",
+      "byokFilterHint": "BYOK / 사용자 지정 API 프리셋 지원 SDK만 표시",
+      "noByokSdks": "사용 가능한 BYOK 지원 SDK 없음"
     },
     "capacity_retrying": "모델 용량이 가득 찼습니다. 자동으로 재시도 중 (15초 이내 간격)",
     "state_error": "세션 오류",

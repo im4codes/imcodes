@@ -29,8 +29,10 @@ import {
 } from '../session-state-updates.js';
 import { getSessionAgentLabel } from './session-agent-options.js';
 import {
+  filterQuickSdkGroupsByok,
   findQuickSdkChoice,
   getQuickSwitchableSdkGroups,
+  pickFirstSelectableQuickSdk,
   resolveCrossSdkModels,
   resolveEffectiveCrossSdkPreset,
 } from './quick-sdk-model.js';
@@ -204,6 +206,7 @@ export function QuickSdkModelMenu({
   const currentPreset = activeSession?.ccPreset?.trim() ?? '';
   const [previewSdk, setPreviewSdk] = useState<string>(currentSdk);
   const [previewPreset, setPreviewPreset] = useState<string>(currentPreset);
+  const [byokOnly, setByokOnly] = useState(false);
   const [internalSwitching, setInternalSwitching] = useState(false);
   const switching = switchingProp ?? internalSwitching;
   const actionDisabled = Boolean(disabled || switching);
@@ -214,6 +217,15 @@ export function QuickSdkModelMenu({
 
   const { availability: agentAvailability } = useAgentAvailability(ws, { enabled: splitAllowed && modelOpen });
   const { presets: ccPresets } = useCcPresets(ws, { enabled: splitAllowed && modelOpen });
+
+  const sdkGroups = useMemo(
+    () => getQuickSwitchableSdkGroups(currentSdk, subSessionId ? 'sub-session' : 'new-session'),
+    [currentSdk, subSessionId],
+  );
+
+  const visibleSdkGroups = useMemo(() => {
+    return byokOnly ? filterQuickSdkGroupsByok(sdkGroups) : sdkGroups;
+  }, [sdkGroups, byokOnly]);
 
   const updateSwitching = (next: boolean) => {
     switchingRef.current = next;
@@ -238,6 +250,7 @@ export function QuickSdkModelMenu({
       if (justOpened) {
         setPreviewSdk(currentSdk);
         setPreviewPreset(currentPreset);
+        setByokOnly(false);
       }
     }
   }, [modelOpen, currentSdk, currentPreset]);
@@ -250,15 +263,45 @@ export function QuickSdkModelMenu({
   }, [currentSdk, currentPreset, modelOpen]);
 
   // If availability probe completes while user already clicked an uninstalled preview SDK,
-  // snap the preview column cleanly back to the active SDK so the right rail cannot PATCH it.
+  // snap the preview column cleanly back to the active SDK (or first selectable BYOK SDK when byokOnly is active)
+  // so the right rail cannot PATCH it.
   useEffect(() => {
-    if (modelOpen && isQuickSdkUnavailable(previewSdk, currentSdk, agentAvailability)) {
+    if (!modelOpen) return;
+    const isUnavailable = isQuickSdkUnavailable(previewSdk, currentSdk, agentAvailability);
+    const isNonByok = byokOnly && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(previewSdk);
+    if (isUnavailable || isNonByok) {
+      if (byokOnly) {
+        const fallbackSdk = pickFirstSelectableQuickSdk(visibleSdkGroups, currentSdk, agentAvailability);
+        if (fallbackSdk) {
+          setPreviewSdk(fallbackSdk);
+          setPreviewPreset(fallbackSdk === currentSdk ? currentPreset : (resolveEffectiveCrossSdkPreset(currentSdk, fallbackSdk, currentPreset) ?? ''));
+          return;
+        }
+      }
       setPreviewSdk(currentSdk);
       setPreviewPreset(currentPreset);
     }
-  }, [modelOpen, previewSdk, currentSdk, currentPreset, agentAvailability]);
+  }, [modelOpen, previewSdk, currentSdk, currentPreset, agentAvailability, byokOnly, visibleSdkGroups]);
+
+  const handleByokToggle = (e: Event) => {
+    const checked = (e.target as HTMLInputElement).checked;
+    setByokOnly(checked);
+    if (checked) {
+      const byokGroups = filterQuickSdkGroupsByok(sdkGroups);
+      const isCurrentPreviewValid = CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(previewSdk)
+        && !isQuickSdkUnavailable(previewSdk, currentSdk, agentAvailability);
+      if (!isCurrentPreviewValid) {
+        const nextSdk = pickFirstSelectableQuickSdk(byokGroups, currentSdk, agentAvailability);
+        if (nextSdk) {
+          setPreviewSdk(nextSdk);
+          setPreviewPreset(nextSdk === currentSdk ? currentPreset : (resolveEffectiveCrossSdkPreset(currentSdk, nextSdk, currentPreset) ?? ''));
+        }
+      }
+    }
+  };
 
   const handleSelectPreviewSdk = (nextSdk: string) => {
+    if (byokOnly && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextSdk)) return;
     if (isQuickSdkUnavailable(nextSdk, currentSdk, agentAvailability)) return;
     setPreviewSdk(nextSdk);
     if (nextSdk === currentSdk) {
@@ -267,11 +310,6 @@ export function QuickSdkModelMenu({
       setPreviewPreset(resolveEffectiveCrossSdkPreset(currentSdk, nextSdk, currentPreset) ?? '');
     }
   };
-
-  const sdkGroups = useMemo(
-    () => getQuickSwitchableSdkGroups(currentSdk, subSessionId ? 'sub-session' : 'new-session'),
-    [currentSdk, subSessionId],
-  );
 
   const effectiveTargetScope = useMemo(
     () => serverId?.trim()
@@ -318,6 +356,7 @@ export function QuickSdkModelMenu({
 
   const handleCrossSdkSwitch = async (nextSdk: string, nextModel: string | null, nextPreset: string | null) => {
     if (disabled || switchingRef.current || !activeSession || !serverId?.trim()) return;
+    if (byokOnly && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextSdk)) return;
     if (isQuickSdkUnavailable(nextSdk, currentSdk, agentAvailability)) return;
     const baseline = captureSessionSwitchBaseline(activeSession);
     const nextEffectivePreset = CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(nextSdk)
@@ -412,12 +451,29 @@ export function QuickSdkModelMenu({
       >
         <div class="quick-sdk-col-header">
           <span>{t('session.quickSwitch.sdkTitle')}</span>
+          <label
+            class={`quick-sdk-byok-toggle${byokOnly ? ' is-active' : ''}`}
+            title={t('session.quickSwitch.byokFilterHint')}
+          >
+            <input
+              type="checkbox"
+              data-testid="quick-sdk-byok-toggle"
+              checked={byokOnly}
+              disabled={actionDisabled}
+              onChange={handleByokToggle}
+              style={{ flex: '0 0 auto', width: 'auto', margin: 0 }}
+            />
+            <span>{t('session.quickSwitch.byokFilter')}</span>
+          </label>
         </div>
         <div class="quick-sdk-col-scroll">
-          {sdkGroups.map((group, groupIdx) => (
-            <div key={group.id} class="quick-sdk-group">
-              {groupIdx > 0 && <div class="quick-sdk-group-divider" />}
-              {group.items.map((choice) => {
+          {visibleSdkGroups.length === 0 ? (
+            <div class="quick-sdk-empty-hint">{t('session.quickSwitch.noByokSdks')}</div>
+          ) : (
+            visibleSdkGroups.map((group, groupIdx) => (
+              <div key={group.id} class="quick-sdk-group">
+                {groupIdx > 0 && <div class="quick-sdk-group-divider" />}
+                {group.items.map((choice) => {
                 const isCurrent = choice.id === currentSdk;
                 const isPreview = choice.id === previewSdk;
                 const label = getSessionAgentLabel(t, choice);
@@ -449,8 +505,9 @@ export function QuickSdkModelMenu({
                 );
               })}
             </div>
-          ))}
-        </div>
+          ))
+        )}
+      </div>
       </div>
 
       <div

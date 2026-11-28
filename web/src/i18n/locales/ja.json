@@ -1143,7 +1143,10 @@
       "switchPending": "デーモン応答がタイムアウトしました。ランタイム同期を待機中です。",
       "presetLabel": "プリセット",
       "presetDefault": "デフォルト",
-      "managePresets": "CC Preset を管理"
+      "managePresets": "CC Preset を管理",
+      "byokFilter": "BYOK",
+      "byokFilterHint": "BYOK / カスタム API プリセット対応の SDK のみ表示",
+      "noByokSdks": "利用可能な BYOK 対応 SDK がありません"
     },
     "capacity_retrying": "モデルが混雑しています。自動で再試行中（15 秒以内の間隔）",
     "state_error": "セッションエラー",

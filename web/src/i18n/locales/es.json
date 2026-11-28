@@ -1143,7 +1143,10 @@
       "switchPending": "El cambio tardó demasiado esperando al daemon; esperando sincronización.",
       "presetLabel": "Preset",
       "presetDefault": "Predeterminado",
-      "managePresets": "Gestionar CC Presets"
+      "managePresets": "Gestionar CC Presets",
+      "byokFilter": "BYOK",
+      "byokFilterHint": "Mostrar solo SDK compatibles con BYOK / ajustes de API personalizados",
+      "noByokSdks": "No hay SDK compatibles con BYOK disponibles"
     },
     "capacity_retrying": "Modelo al límite de capacidad: reintentando automáticamente (cada ≤15 s)",
     "state_error": "Error de sesión",

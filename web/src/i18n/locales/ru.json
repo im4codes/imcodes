@@ -1143,7 +1143,10 @@
       "switchPending": "Превышено время ожидания ответа демона — ожидание синхронизации состояния.",
       "presetLabel": "Пресет",
       "presetDefault": "По умолчанию",
-      "managePresets": "Управление CC Preset"
+      "managePresets": "Управление CC Preset",
+      "byokFilter": "BYOK",
+      "byokFilterHint": "Показывать только SDK с поддержкой BYOK / пользовательских пресетов API",
+      "noByokSdks": "Нет доступных SDK с поддержкой BYOK"
     },
     "capacity_retrying": "Модель перегружена — автоматический повтор (каждые ≤15 с)",
     "state_error": "Ошибка сеанса",

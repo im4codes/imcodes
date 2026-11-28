@@ -5,7 +5,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AGENT_AVAILABILITY_MSG } from '@shared/agent-availability.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
-import { CC_PRESET_MSG } from '@shared/cc-presets.js';
+import { CC_PRESET_MSG, CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import type { UseQuickDataResult } from '../src/components/QuickInputPanel.js';
 
@@ -41,8 +41,10 @@ vi.mock('../src/agy-model-preference.js', async (importOriginal) => {
 
 import { SessionControls } from '../src/components/SessionControls.js';
 import {
+  filterQuickSdkGroupsByok,
   getQuickSwitchableSdkGroups,
   isQuickSdkSwitchAllowed,
+  pickFirstSelectableQuickSdk,
   resolveCrossSdkModels,
   resolveEffectiveCrossSdkPreset,
   supportsQuickModelTrigger,
@@ -220,6 +222,33 @@ describe('quick-sdk-model helpers', () => {
     const opencodeCatalog = resolveCrossSdkModels({ sdk: 'opencode-sdk', sessionName: 'deck_app_brain', cachedCatalog: null });
     expect(opencodeCatalog.models).toEqual([]);
     expect(opencodeCatalog.defaultModel).toBeNull();
+  });
+
+  it('filters SDK groups strictly to BYOK-capable SDKs and picks first selectable SDK', () => {
+    const allGroups = getQuickSwitchableSdkGroups('agy-sdk');
+    const byokGroups = filterQuickSdkGroupsByok(allGroups);
+    const byokIds = byokGroups.flatMap((g) => g.items.map((i) => i.id));
+
+    // Every item in byokGroups must belong to CUSTOM_PROVIDER_SDK_AGENT_TYPES
+    for (const id of byokIds) {
+      expect(CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(id)).toBe(true);
+    }
+    expect(byokIds).toContain('claude-code-sdk');
+    expect(byokIds).toContain('codex-sdk');
+    expect(byokIds).not.toContain('agy-sdk');
+    expect(byokIds).not.toContain('copilot-sdk');
+    expect(byokIds).not.toContain('cursor-headless');
+
+    // pickFirstSelectableQuickSdk skips unavailable SDKs
+    const firstInstalled = pickFirstSelectableQuickSdk(byokGroups, 'agy-sdk', {
+      [byokIds[0]]: { installed: false },
+    } as any);
+    expect(firstInstalled).toBe(byokIds[1]);
+
+    // Falls back to first item when all marked uninstalled
+    const allUninstalledMap = Object.fromEntries(byokIds.map((id) => [id, { installed: false }]));
+    const fallbackAllUninstalled = pickFirstSelectableQuickSdk(byokGroups, 'agy-sdk', allUninstalledMap as any);
+    expect(fallbackAllUninstalled).toBe(byokIds[0]);
   });
 });
 
@@ -1116,5 +1145,84 @@ describe('QuickSdkModelMenu inside SessionControls', () => {
     await new Promise((r) => setTimeout(r, 0));
     expect(view5.onSessionSaved).not.toHaveBeenCalled();
     expect(mockApi.saveAgyModelPreference).not.toHaveBeenCalled();
+  });
+
+  it('supports BYOK filter checkbox in SDK header, filters selectable SDKs, moves preview from non-BYOK, and resets on close', async () => {
+    const { container, ws } = renderSessionControls({
+      name: 'deck_agy_brain',
+      agentType: AGY_SDK_PROVIDER_ID,
+      modelDisplay: 'gemini-2.5-pro',
+    });
+
+    const trigger = container.querySelector('[data-testid="session-model-trigger"]') as HTMLButtonElement;
+    fireEvent.click(trigger);
+
+    const split = document.body.querySelector('[data-testid="quick-sdk-model-split"]') as HTMLElement;
+    expect(split).not.toBeNull();
+    // Initially previews current non-BYOK SDK (agy-sdk)
+    expect(split.getAttribute('data-preview-sdk')).toBe(AGY_SDK_PROVIDER_ID);
+
+    // BYOK toggle is rendered and unchecked by default
+    const byokCheckbox = document.body.querySelector('[data-testid="quick-sdk-byok-toggle"]') as HTMLInputElement;
+    expect(byokCheckbox).not.toBeNull();
+    expect(byokCheckbox.checked).toBe(false);
+
+    // Non-BYOK SDKs (e.g. agy-sdk, copilot-sdk) are currently visible
+    expect(document.body.querySelector('[data-sdk-id="agy-sdk"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-sdk-id="copilot-sdk"]')).not.toBeNull();
+
+    // Check BYOK
+    fireEvent.click(byokCheckbox);
+    expect(byokCheckbox.checked).toBe(true);
+
+    // Non-BYOK SDKs are hidden
+    expect(document.body.querySelector('[data-sdk-id="agy-sdk"]')).toBeNull();
+    expect(document.body.querySelector('[data-sdk-id="copilot-sdk"]')).toBeNull();
+
+    // BYOK SDKs remain visible
+    expect(document.body.querySelector('[data-sdk-id="claude-code-sdk"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-sdk-id="codex-sdk"]')).not.toBeNull();
+
+    // Preview immediately snaps from non-BYOK agy-sdk to the first available BYOK SDK
+    const newPreviewSdk = split.getAttribute('data-preview-sdk');
+    expect(CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(newPreviewSdk!)).toBe(true);
+    // Preset bar is now visible for the previewed BYOK SDK
+    expect(document.body.querySelector('[data-testid="quick-sdk-preset-bar"]')).not.toBeNull();
+
+    // When async availability marks the auto-selected previewSdk uninstalled, snap to another available BYOK SDK
+    ws.emitMessage({
+      type: AGENT_AVAILABILITY_MSG.RESULT,
+      checkedAt: Date.now(),
+      agents: {
+        [newPreviewSdk!]: { installed: false, reason: 'cli missing' },
+        'claude-code-sdk': { installed: true },
+      },
+    });
+
+    await waitFor(() => {
+      const updatedPreview = split.getAttribute('data-preview-sdk');
+      expect(updatedPreview).not.toBe(newPreviewSdk);
+      expect(updatedPreview).not.toBe(AGY_SDK_PROVIDER_ID);
+      expect(CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(updatedPreview!)).toBe(true);
+    });
+
+    // Uncheck BYOK restores non-BYOK SDKs
+    fireEvent.click(byokCheckbox);
+    expect(byokCheckbox.checked).toBe(false);
+    expect(document.body.querySelector('[data-sdk-id="agy-sdk"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-sdk-id="copilot-sdk"]')).not.toBeNull();
+
+    // Check BYOK again, close menu, and reopen: resets to unchecked
+    fireEvent.click(byokCheckbox);
+    expect(byokCheckbox.checked).toBe(true);
+    fireEvent.click(trigger); // close
+    await waitFor(() => expect(document.body.querySelector('[data-testid="quick-sdk-model-split"]')).toBeNull());
+    fireEvent.click(trigger); // reopen
+    const reopenedCheckbox = await waitFor(() => {
+      const cb = document.body.querySelector('[data-testid="quick-sdk-byok-toggle"]') as HTMLInputElement | null;
+      expect(cb).not.toBeNull();
+      return cb!;
+    });
+    expect(reopenedCheckbox.checked).toBe(false);
   });
 });

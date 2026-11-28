@@ -3,6 +3,7 @@ import {
   isClaudeCodeFamily,
   isCodexFamily,
 } from '@shared/agent-types.js';
+import type { AgentAvailabilityMap } from '@shared/agent-availability.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID } from '@shared/agy-agent.js';
 import {
   CUSTOM_PROVIDER_SDK_AGENT_TYPES,
@@ -172,6 +173,32 @@ export function findQuickSdkChoice(
     if (match) return match;
   }
   return undefined;
+}
+
+export function filterQuickSdkGroupsByok(
+  groups: readonly QuickSdkGroup[],
+): QuickSdkGroup[] {
+  return groups
+    .map((group) => ({
+      id: group.id,
+      items: group.items.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)),
+    }))
+    .filter((group) => group.items.length > 0);
+}
+
+export function pickFirstSelectableQuickSdk(
+  groups: readonly QuickSdkGroup[],
+  currentSdk: string,
+  availability?: AgentAvailabilityMap | null,
+): string | undefined {
+  for (const group of groups) {
+    for (const choice of group.items) {
+      if (choice.id === currentSdk || availability?.[choice.id]?.installed !== false) {
+        return choice.id;
+      }
+    }
+  }
+  return groups[0]?.items[0]?.id;
 }
 
 export interface ResolvedCrossSdkModels {
