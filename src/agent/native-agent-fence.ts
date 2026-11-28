@@ -42,8 +42,11 @@ export const QWEN_NATIVE_AGENT_TOOLS = ['agent', 'task'] as const;
 /** Qoder native sub-agent tool. */
 export const QODER_NATIVE_AGENT_TOOLS = ['Agent'] as const;
 
-/** OpenCode native sub-agent tool. */
+/** OpenCode v2 native sub-agent tool. */
 export const OPENCODE_NATIVE_AGENT_TOOLS = ['subagent'] as const;
+
+/** OpenCode v1.x native sub-agent tools (`task` in stock v1.18.4, `subagent` in compat/v2). */
+export const OPENCODE_V1_NATIVE_AGENT_TOOLS = ['task', 'subagent'] as const;
 
 export const fenceOf = (fenced: boolean): NativeAgentFence => (
   fenced ? NATIVE_AGENT_FENCES.DISABLED : NATIVE_AGENT_FENCES.PROVIDER_DEFAULT
