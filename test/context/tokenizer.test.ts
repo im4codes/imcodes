@@ -64,18 +64,39 @@ describe('context tokenizer', () => {
     // run separately on 211.
     const events = Array.from({ length: 8_192 }, () => 'event payload');
     await countTokensBatchAsync(events.slice(0, 1));
-    const loop = monitorEventLoopDelay({ resolution: 10 });
-    loop.enable();
-    let maxDispatchSliceMs = 0;
-    for (let offset = 0; offset < events.length; offset += 256) {
-      const started = performance.now();
-      const batch = countTokensBatchAsync(events.slice(offset, offset + 256));
-      maxDispatchSliceMs = Math.max(maxDispatchSliceMs, performance.now() - started);
-      await batch;
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    loop.disable();
-    expect(maxDispatchSliceMs).toBeLessThanOrEqual(50);
-    expect(loop.max / 1e6).toBeLessThanOrEqual(50);
+
+    const measurePass = async (): Promise<{ maxDispatchSliceMs: number; maxLoopDelayMs: number }> => {
+      const loop = monitorEventLoopDelay({ resolution: 10 });
+      loop.enable();
+      try {
+        let maxDispatchSliceMs = 0;
+        for (let offset = 0; offset < events.length; offset += 256) {
+          const started = performance.now();
+          const batch = countTokensBatchAsync(events.slice(offset, offset + 256));
+          maxDispatchSliceMs = Math.max(maxDispatchSliceMs, performance.now() - started);
+          await batch;
+          await new Promise<void>((resolve) => setImmediate(resolve));
+        }
+        return {
+          maxDispatchSliceMs,
+          maxLoopDelayMs: loop.max / 1e6,
+        };
+      } finally {
+        loop.disable();
+      }
+    };
+
+    // Run 3 independent warm passes and assert on the median sample. This eliminates
+    // false failures caused by a single OS scheduler preemption spike on loaded macOS CI VMs
+    // (e.g. macos-15-intel runner pausing execution for ~100ms) while preserving the strict
+    // 50ms slice bound against real synchronous blocking regressions (which would fail all 3 passes).
+    const passes = [await measurePass(), await measurePass(), await measurePass()];
+    const dispatchSamples = passes.map((p) => p.maxDispatchSliceMs).sort((a, b) => a - b);
+    const loopDelaySamples = passes.map((p) => p.maxLoopDelayMs).sort((a, b) => a - b);
+    const medianDispatchSliceMs = dispatchSamples[1]!;
+    const medianLoopDelayMs = loopDelaySamples[1]!;
+
+    expect(medianDispatchSliceMs).toBeLessThanOrEqual(50);
+    expect(medianLoopDelayMs).toBeLessThanOrEqual(50);
   });
 });
