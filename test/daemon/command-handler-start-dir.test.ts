@@ -73,8 +73,6 @@ vi.mock('../../src/daemon/git-remote-clone.js', () => ({
 
 import { handleWebCommand } from '../../src/daemon/command-handler.js';
 
-const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 20));
-
 describe('command-handler session.start directory creation & session.detect_agents', () => {
   let tempRoot: string;
 
@@ -103,14 +101,15 @@ describe('command-handler session.start directory creation & session.detect_agen
       dir: targetDir,
       agentType: 'claude-code',
     }, serverLink as any);
-    await flushAsync();
 
-    const dirInfo = await stat(targetDir);
-    expect(dirInfo.isDirectory()).toBe(true);
-    expect(startProjectMock).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'my_app',
-      dir: targetDir,
-    }));
+    await vi.waitFor(async () => {
+      const dirInfo = await stat(targetDir);
+      expect(dirInfo.isDirectory()).toBe(true);
+      expect(startProjectMock).toHaveBeenCalledWith(expect.objectContaining({
+        name: 'my_app',
+        dir: targetDir,
+      }));
+    }, { timeout: 3_000, interval: 10 });
   });
 
   it('does not pre-create targetDir when gitRemoteUrl is present', async () => {
@@ -123,12 +122,14 @@ describe('command-handler session.start directory creation & session.detect_agen
       agentType: 'claude-code',
       gitRemoteUrl: 'https://github.com/acme/cloned-app.git',
     }, serverLink as any);
-    await flushAsync();
+
+    await vi.waitFor(() => {
+      expect(startProjectMock).toHaveBeenCalledWith(expect.objectContaining({
+        dir: targetDir,
+      }));
+    }, { timeout: 3_000, interval: 10 });
 
     await expect(stat(targetDir)).rejects.toThrow();
-    expect(startProjectMock).toHaveBeenCalledWith(expect.objectContaining({
-      dir: targetDir,
-    }));
   });
 
   it('emits session.error cleanly when requested working directory points to a regular file', async () => {
@@ -141,14 +142,16 @@ describe('command-handler session.start directory creation & session.detect_agen
       dir: filePath,
       agentType: 'claude-code',
     }, serverLink as any);
-    await flushAsync();
+
+    await vi.waitFor(() => {
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'session.error',
+        project: 'file_proj',
+      }));
+    }, { timeout: 3_000, interval: 10 });
 
     expect(startProjectMock).not.toHaveBeenCalled();
     expect(launchTransportSessionMock).not.toHaveBeenCalled();
-    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: 'session.error',
-      project: 'file_proj',
-    }));
   });
 
   it('handles session.detect_agents and emits session.agents_availability', async () => {
@@ -156,13 +159,15 @@ describe('command-handler session.start directory creation & session.detect_agen
       type: AGENT_AVAILABILITY_MSG.DETECT,
       forceRefresh: true,
     }, serverLink as any);
-    await flushAsync();
+
+    await vi.waitFor(() => {
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: AGENT_AVAILABILITY_MSG.RESULT,
+        agents: { 'agy-sdk': { installed: true }, codex: { installed: false } },
+        checkedAt: expect.any(Number),
+      }));
+    }, { timeout: 3_000, interval: 10 });
 
     expect(detectInstalledAgentsMock).toHaveBeenCalledWith({ forceRefresh: true });
-    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-      type: AGENT_AVAILABILITY_MSG.RESULT,
-      agents: { 'agy-sdk': { installed: true }, codex: { installed: false } },
-      checkedAt: expect.any(Number),
-    }));
   });
 });

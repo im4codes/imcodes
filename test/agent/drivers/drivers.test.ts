@@ -271,49 +271,94 @@ describe('OpenCodeDriver', () => {
     const tempHome = mkdtempSync(path.join(tmpdir(), 'imcodes oc home '));
     const pathBinDir = mkdtempSync(path.join(tmpdir(), 'imcodes-oc-path-'));
     try {
-      const homeBinDir = path.join(tempHome, '.opencode', 'bin');
-      mkdirSync(homeBinDir, { recursive: true });
-      const homeBin = path.join(homeBinDir, 'opencode');
-      writeFileSync(homeBin, '#!/bin/sh\necho "HOME_OC:$*"\n', 'utf8');
-      chmodSync(homeBin, 0o755);
+      if (process.platform === 'win32') {
+        const homeBinDir = path.join(tempHome, '.opencode', 'bin');
+        mkdirSync(homeBinDir, { recursive: true });
+        const homeBin = path.join(homeBinDir, 'opencode.exe');
+        writeFileSync(homeBin, '@rem mock opencode exe\r\n', 'utf8');
 
-      const sparseEnv = { PATH: '/usr/bin' };
-      const launchCmd = driver.buildLaunchCommand('deck_proj_w1', { env: sparseEnv, homeDir: tempHome, isElevated: false });
-      const resumeIdCmd = driver.buildResumeCommand('deck_proj_w1', {
-        opencodeSessionId: 'oc-123',
-        env: sparseEnv,
-        homeDir: tempHome,
-        isElevated: false,
-      });
-      const resumeFallbackCmd = driver.buildResumeCommand('deck_proj_w1', {
-        env: sparseEnv,
-        homeDir: tempHome,
-        isElevated: false,
-      });
+        const systemRoot = process.env.SystemRoot || process.env.WINDIR || 'C:\\Windows';
+        const sparseEnv: NodeJS.ProcessEnv = {
+          PATH: path.join(systemRoot, 'System32'),
+          PATHEXT: '.EXE;.CMD;.BAT',
+          SystemRoot: systemRoot,
+        };
+        const launchCmd = driver.buildLaunchCommand('deck_proj_w1', { env: sparseEnv, homeDir: tempHome, isElevated: false });
+        const resumeIdCmd = driver.buildResumeCommand('deck_proj_w1', {
+          opencodeSessionId: 'oc-123',
+          env: sparseEnv,
+          homeDir: tempHome,
+          isElevated: false,
+        });
+        const resumeFallbackCmd = driver.buildResumeCommand('deck_proj_w1', {
+          env: sparseEnv,
+          homeDir: tempHome,
+          isElevated: false,
+        });
 
-      const r1 = spawnSync('/bin/sh', ['-c', launchCmd], { env: sparseEnv, encoding: 'utf8' });
-      const r2 = spawnSync('/bin/sh', ['-c', resumeIdCmd], { env: sparseEnv, encoding: 'utf8' });
-      const r3 = spawnSync('/bin/sh', ['-c', resumeFallbackCmd], { env: sparseEnv, encoding: 'utf8' });
-      expect(r1.status).toBe(0);
-      expect(r1.stdout.trim()).toBe('HOME_OC:');
-      expect(r2.status).toBe(0);
-      expect(r2.stdout.trim()).toBe('HOME_OC:-s oc-123');
-      expect(r3.status).toBe(0);
-      expect(r3.stdout.trim()).toBe('HOME_OC:-c');
+        expect(launchCmd).toBe(`"${homeBin}"`);
+        expect(resumeIdCmd).toBe(`"${homeBin}" -s "oc-123"`);
+        expect(resumeFallbackCmd).toBe(`"${homeBin}" -c || "${homeBin}"`);
 
-      // PATH-installed opencode takes precedence over ~/.opencode/bin
-      const pathBin = path.join(pathBinDir, 'opencode');
-      writeFileSync(pathBin, '#!/bin/sh\necho "PATH_OC:$*"\n', 'utf8');
-      chmodSync(pathBin, 0o755);
-      const pathEnv = { PATH: `${pathBinDir}:/usr/bin` };
-      const launchOnPath = driver.buildLaunchCommand('deck_proj_w1', { env: pathEnv, homeDir: tempHome, isElevated: false });
-      expect(launchOnPath).toBe('opencode');
-      const rPath = spawnSync('/bin/sh', ['-c', launchOnPath], { env: pathEnv, encoding: 'utf8' });
-      expect(rPath.status).toBe(0);
-      expect(rPath.stdout.trim()).toBe('PATH_OC:');
+        // PATH-installed opencode takes precedence over ~/.opencode/bin
+        const pathBin = path.join(pathBinDir, 'opencode.cmd');
+        writeFileSync(pathBin, '@echo off\r\necho PATH_OC:%*\r\n', 'utf8');
+        const pathEnv: NodeJS.ProcessEnv = {
+          ...sparseEnv,
+          PATH: `${pathBinDir};${sparseEnv.PATH}`,
+        };
+        const launchOnPath = driver.buildLaunchCommand('deck_proj_w1', { env: pathEnv, homeDir: tempHome, isElevated: false });
+        expect(launchOnPath).toBe('opencode');
+        const comSpec = process.env.ComSpec || 'cmd.exe';
+        const rPath = spawnSync(comSpec, ['/d', '/s', '/c', launchOnPath], { env: pathEnv, encoding: 'utf8' });
+        expect(rPath.status).toBe(0);
+        expect(rPath.stdout.trim()).toBe('PATH_OC:');
+      } else {
+        const homeBinDir = path.join(tempHome, '.opencode', 'bin');
+        mkdirSync(homeBinDir, { recursive: true });
+        const homeBin = path.join(homeBinDir, 'opencode');
+        writeFileSync(homeBin, '#!/bin/sh\necho "HOME_OC:$*"\n', 'utf8');
+        chmodSync(homeBin, 0o755);
+
+        const sparseEnv = { PATH: '/usr/bin' };
+        const launchCmd = driver.buildLaunchCommand('deck_proj_w1', { env: sparseEnv, homeDir: tempHome, isElevated: false });
+        const resumeIdCmd = driver.buildResumeCommand('deck_proj_w1', {
+          opencodeSessionId: 'oc-123',
+          env: sparseEnv,
+          homeDir: tempHome,
+          isElevated: false,
+        });
+        const resumeFallbackCmd = driver.buildResumeCommand('deck_proj_w1', {
+          env: sparseEnv,
+          homeDir: tempHome,
+          isElevated: false,
+        });
+
+        const r1 = spawnSync('/bin/sh', ['-c', launchCmd], { env: sparseEnv, encoding: 'utf8' });
+        const r2 = spawnSync('/bin/sh', ['-c', resumeIdCmd], { env: sparseEnv, encoding: 'utf8' });
+        const r3 = spawnSync('/bin/sh', ['-c', resumeFallbackCmd], { env: sparseEnv, encoding: 'utf8' });
+        expect(r1.status).toBe(0);
+        expect(r1.stdout.trim()).toBe('HOME_OC:');
+        expect(r2.status).toBe(0);
+        expect(r2.stdout.trim()).toBe('HOME_OC:-s oc-123');
+        expect(r3.status).toBe(0);
+        expect(r3.stdout.trim()).toBe('HOME_OC:-c');
+
+        // PATH-installed opencode takes precedence over ~/.opencode/bin
+        const pathBin = path.join(pathBinDir, 'opencode');
+        writeFileSync(pathBin, '#!/bin/sh\necho "PATH_OC:$*"\n', 'utf8');
+        chmodSync(pathBin, 0o755);
+        const pathEnv = { PATH: `${pathBinDir}:/usr/bin` };
+        const launchOnPath = driver.buildLaunchCommand('deck_proj_w1', { env: pathEnv, homeDir: tempHome, isElevated: false });
+        expect(launchOnPath).toBe('opencode');
+        const rPath = spawnSync('/bin/sh', ['-c', launchOnPath], { env: pathEnv, encoding: 'utf8' });
+        expect(rPath.status).toBe(0);
+        expect(rPath.stdout.trim()).toBe('PATH_OC:');
+      }
 
       // Elevated caller (Windows admin/SYSTEM or POSIX root with non-/root home) refuses user-writable home fallback
-      expect(resolveOpenCodeCliSync({ env: sparseEnv, homeDir: tempHome, platform: 'linux', isElevated: true }).source).toBe('missing');
+      expect(resolveOpenCodeCliSync({ env: { PATH: '/usr/bin' }, homeDir: tempHome, platform: 'linux', isElevated: true }).source).toBe('missing');
+      expect(resolveOpenCodeCliSync({ env: { PATH: 'C:\\Windows\\System32' }, homeDir: 'C:\\Users\\Alice Smith', platform: 'win32', isElevated: true }).source).toBe('missing');
       const winResolved = await resolveOpenCodeCliAsync({
         platform: 'win32',
         env: { PATH: 'C:\\Windows\\System32' },
