@@ -226,6 +226,7 @@ interface KimiConnectionEntry {
   child: ChildProcess | null;
   connection: AcpClientConnection | null;
   connectingPromise: Promise<AcpClientConnection> | null;
+  connectingWaiters: number;
   inFlightOps: number;
   teardownWhenIdle: boolean;
   caps: ConnectionCapabilities;
@@ -825,6 +826,7 @@ export class KimiV2Provider implements TransportProvider {
       child: null,
       connection: null,
       connectingPromise: null,
+      connectingWaiters: 0,
       inFlightOps: 0,
       teardownWhenIdle: false,
       caps: defaultConnectionCapabilities(),
@@ -869,6 +871,7 @@ export class KimiV2Provider implements TransportProvider {
   private async flushIdleTeardownIfReady(entry: KimiConnectionEntry): Promise<void> {
     if (
       entry.inFlightOps === 0
+      && entry.connectingWaiters === 0
       && entry.teardownWhenIdle
       && this.connections.get(entry.routeKey) === entry
       && !entry.connectingPromise
@@ -1167,6 +1170,7 @@ export class KimiV2Provider implements TransportProvider {
       && !entry.connection
       && !entry.connectingPromise
       && entry.inFlightOps === 0
+      && entry.connectingWaiters === 0
       && this.countSessionsOnEntry(entry.routeKey) === 0
     ) {
       this.connections.delete(entry.routeKey);
@@ -1186,206 +1190,235 @@ export class KimiV2Provider implements TransportProvider {
     const { env, bin, fingerprint, kimiLlm, presetKey, envKey, routeKey, baseShareDir, defaultResumeViewCwd } = this.computeConnectionDescriptor(sessionConfig);
     const entry = this.getOrCreateConnectionEntry(routeKey, envKey, presetKey, baseShareDir);
 
-    // Coalesce concurrent connect attempts for the SAME connection route; wait before recycling if config/binary changed.
-    while (entry.connectingPromise) {
-      const inflight = entry.connectingPromise;
-      if (entry.envKey === envKey && (!entry.fingerprint || entry.fingerprint === fingerprint)) {
-        const connection = await inflight;
-        return { entry, connection };
-      }
-      await inflight.catch(() => {});
-    }
-
-    if (
-      entry.connection
-      && this.isEntryChildAlive(entry)
-      && entry.envKey === envKey
-      && (!entry.fingerprint || entry.fingerprint === fingerprint)
-    ) {
-      return { entry, connection: entry.connection };
-    }
-
-    const epoch = this.lifecycleEpoch;
-    const generation = ++this.connectionGenerationCounter;
-    entry.generation = generation;
-    entry.envKey = envKey;
-    entry.presetKey = presetKey;
-    entry.baseShareDir = baseShareDir;
-    entry.fingerprint = fingerprint;
-    entry.teardownWhenIdle = false;
-    let spawnedChild: ChildProcess | null = null;
-    let createdPresetShareDir: string | null = null;
-    const isActiveConnect = () => this.lifecycleEpoch === epoch
-      && this.connections.get(routeKey) === entry
-      && entry.generation === generation;
-
-    // Publish the in-flight connection transaction synchronously BEFORE awaiting teardown,
-    // so concurrent callers for this SAME route share one initialize pass without touching other routes.
-    const connectPromise = (async (): Promise<AcpClientConnection> => {
-      if (entry.child && entry.inFlightOps === 0 && !this.hasActiveTurnsOnEntry(routeKey, entry.generation)) {
-        await this.teardownConnectionEntry(entry);
-      }
-
-      if (!isActiveConnect()) {
-        throw new Error('Provider disconnected or connection superseded before spawn');
-      }
-
-      const cwd = normalizeTransportCwd(canonicalizeTransportCwd(sessionConfig?.cwd)) || process.cwd();
-      const spawnEnv: NodeJS.ProcessEnv = { ...env };
-      if (kimiLlm) {
-        const knownCwds = [cwd, ...Array.from(this.sessions.values()).filter((s) => s.boundEnvKey === routeKey || computeKimiLlmKey(s.kimiLlm) === presetKey).map((s) => s.cwd)];
-        createdPresetShareDir = this.preparePresetShareDir(entry, kimiLlm, spawnEnv, knownCwds);
-        spawnEnv.KIMI_SHARE_DIR = createdPresetShareDir;
-      } else if (defaultResumeViewCwd) {
-        createdPresetShareDir = this.prepareDefaultResumeMetadataView(entry, baseShareDir, defaultResumeViewCwd);
-        spawnEnv.KIMI_SHARE_DIR = createdPresetShareDir;
-      }
-
-      entry.stderrTail = [];
-      entry.caps = defaultConnectionCapabilities();
-
-      const child = spawn(bin.executable, [...bin.prependArgs, 'acp'], {
-        cwd,
-        env: spawnEnv,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        detached: process.platform !== 'win32',
-        windowsHide: true,
-      });
-      spawnedChild = child;
-      entry.child = child;
-
-      const spawnErrorPromise = new Promise<never>((_, reject) => {
-        child.once('error', (err) => reject(err));
-      });
-
-      child.stderr?.on('data', (chunk: Buffer | string) => {
-        if (entry.child !== child || !isActiveConnect()) return;
-        const text = chunk.toString('utf8');
-        for (const line of text.split(/\r?\n/)) {
-          if (!line.trim()) continue;
-          entry.stderrTail.push(line);
-          if (entry.stderrTail.length > STDERR_TAIL_LIMIT) entry.stderrTail.shift();
-        }
-      });
-
-      child.once('exit', (code, signal) => {
-        for (const state of this.sessions.values()) {
-          if (state.pendingTurn && state.boundEnvKey === routeKey && state.boundConnectionGeneration === generation) {
-            state.pendingTurn.resolvePhysicalTerminal();
-          }
-          if (state.lastStopTurn && state.boundEnvKey === routeKey && state.boundConnectionGeneration === generation) {
-            state.lastStopTurn.resolvePhysicalTerminal();
-          }
-        }
-        if (entry.child !== child || !isActiveConnect()) {
-          this.cleanupPresetShareDir(createdPresetShareDir);
-          return;
-        }
-        const shareDirToClean = entry.activePresetShareDir ?? createdPresetShareDir;
-        entry.child = null;
-        entry.connection = null;
-        entry.fingerprint = null;
-        entry.teardownWhenIdle = false;
-        entry.caps = defaultConnectionCapabilities();
-        entry.activePresetShareDir = null;
-        entry.activePresetWorkDirs.clear();
-        this.cleanupPresetShareDir(shareDirToClean);
-        const exitMsg = `kimi acp exited unexpectedly (code=${code ?? 'null'}, signal=${signal ?? 'null'})`;
-        for (const state of this.sessions.values()) {
-          if (state.boundEnvKey !== routeKey || state.boundConnectionGeneration !== generation) continue;
-          this.rejectPendingApprovals(state, new Error(exitMsg));
-          if (state.pendingTurn) {
-            this.failTurn(state, state.pendingTurn, new Error(exitMsg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true, entry);
-          } else {
-            this.clearStatus(state.sessionKey, state);
-          }
-          this.resetSessionCompactionTracking(state);
-        }
-      });
-
-      if (!child.stdout || !child.stdin) {
-        await this.teardownConnectionEntry(entry, child, generation);
-        throw new Error('Failed to open stdio pipes for kimi acp');
-      }
-
-      const filteredStdout = filterAcpJsonLines(gateChildStream(child.stdout), (line, count) => {
-        if (count <= 5 || count % 50 === 0) {
-          logger.debug({ provider: this.id, count, line: line.slice(0, 200) }, 'kimi-v2 dropped non-JSON ACP line');
-        }
-      });
-
-      const readable = Readable.toWeb(filteredStdout) as ReadableStream<Uint8Array>;
-      const writable = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
-      const stream = ndJsonStream(writable, readable);
-
-      const isCurrentGeneration = () => isActiveConnect() && entry.child === child;
-      const candidateConnection = createAcpClientConnection(
-        {
-          sessionUpdate: async (notification: SessionNotification) => {
-            if (!isCurrentGeneration()) return;
-            await this.enqueueWireOrder(entry, () => {
-              if (!isCurrentGeneration()) return;
-              this.handleSessionUpdate(entry, notification);
-            });
-          },
-          requestPermission: async (params: RequestPermissionRequest) => {
-            if (!isCurrentGeneration()) return { outcome: { outcome: 'cancelled' } };
-            return this.handleRequestPermission(params);
-          },
-          readTextFile: async (params: ReadTextFileRequest) => this.handleReadTextFile(params),
-          writeTextFile: async (params: WriteTextFileRequest) => this.handleWriteTextFile(params),
-        },
-        stream,
-      );
-
-      const initRace = Promise.race([
-        candidateConnection.initialize({
-          protocolVersion: 1,
-          clientCapabilities: {
-            fs: {
-              readTextFile: true,
-              writeTextFile: true,
-            },
-            session: {
-              compaction: {},
-            },
-          },
-          clientInfo: { name: 'imcodes', version: '1.0.0' },
-        }),
-        spawnErrorPromise,
-      ]);
-
-      const initOutcome = await withTimeoutOutcome(initRace, this.initTimeoutMs);
-      if (initOutcome.timedOut) {
-        await this.teardownConnectionEntry(entry, child, generation);
-        throw new Error(`kimi acp initialize timed out after ${this.initTimeoutMs}ms`);
-      }
-
-      if (!isCurrentGeneration()) {
-        await killProcessTree(child, { ownsProcessGroup: true });
-        throw new Error('kimi acp connection superseded before initialization completed');
-      }
-
-      this.applyInitializeResult(entry, initOutcome.value);
-      entry.connection = candidateConnection;
-      return candidateConnection;
-    })();
-
-    entry.connectingPromise = connectPromise;
+    // Track pending connection callers synchronously BEFORE any await so concurrent endSession
+    // cannot reclaim an in-flight/just-initialized connection before the caller acquires usage.
+    entry.connectingWaiters++;
+    let handoffToCaller = false;
     try {
-      const connection = await connectPromise;
-      return { entry, connection };
-    } catch (err) {
-      if (spawnedChild) {
-        await this.teardownConnectionEntry(entry, spawnedChild, generation);
+      // Coalesce concurrent connect attempts for the SAME connection route; wait before recycling if config/binary changed.
+      while (entry.connectingPromise) {
+        const inflight = entry.connectingPromise;
+        if (entry.envKey === envKey && (!entry.fingerprint || entry.fingerprint === fingerprint)) {
+          const connection = await inflight;
+          if (!entry.child || entry.connection !== connection || !this.isEntryChildAlive(entry)) {
+            continue;
+          }
+          this.acquireConnectionUse(entry);
+          handoffToCaller = true;
+          return { entry, connection };
+        }
+        await inflight.catch(() => {});
       }
-      this.cleanupPresetShareDir(createdPresetShareDir, entry);
-      throw this.normalizeProviderException(err, entry);
+
+      if (
+        entry.connection
+        && this.isEntryChildAlive(entry)
+        && entry.envKey === envKey
+        && (!entry.fingerprint || entry.fingerprint === fingerprint)
+      ) {
+        this.acquireConnectionUse(entry);
+        handoffToCaller = true;
+        return { entry, connection: entry.connection };
+      }
+
+      const epoch = this.lifecycleEpoch;
+      const generation = ++this.connectionGenerationCounter;
+      entry.generation = generation;
+      entry.envKey = envKey;
+      entry.presetKey = presetKey;
+      entry.baseShareDir = baseShareDir;
+      entry.fingerprint = fingerprint;
+      entry.teardownWhenIdle = false;
+      let spawnedChild: ChildProcess | null = null;
+      let createdPresetShareDir: string | null = null;
+      const isActiveConnect = () => this.lifecycleEpoch === epoch
+        && this.connections.get(routeKey) === entry
+        && entry.generation === generation;
+
+      // Publish the in-flight connection transaction synchronously BEFORE awaiting teardown,
+      // so concurrent callers for this SAME route share one initialize pass without touching other routes.
+      const connectPromise = (async (): Promise<AcpClientConnection> => {
+        if (entry.child && entry.inFlightOps === 0 && !this.hasActiveTurnsOnEntry(routeKey, entry.generation)) {
+          await this.teardownConnectionEntry(entry);
+        }
+
+        if (!isActiveConnect()) {
+          throw new Error('Provider disconnected or connection superseded before spawn');
+        }
+
+        const cwd = normalizeTransportCwd(canonicalizeTransportCwd(sessionConfig?.cwd)) || process.cwd();
+        const spawnEnv: NodeJS.ProcessEnv = { ...env };
+        if (kimiLlm) {
+          const knownCwds = [cwd, ...Array.from(this.sessions.values()).filter((s) => s.boundEnvKey === routeKey || computeKimiLlmKey(s.kimiLlm) === presetKey).map((s) => s.cwd)];
+          createdPresetShareDir = this.preparePresetShareDir(entry, kimiLlm, spawnEnv, knownCwds);
+          spawnEnv.KIMI_SHARE_DIR = createdPresetShareDir;
+        } else if (defaultResumeViewCwd) {
+          createdPresetShareDir = this.prepareDefaultResumeMetadataView(entry, baseShareDir, defaultResumeViewCwd);
+          spawnEnv.KIMI_SHARE_DIR = createdPresetShareDir;
+        }
+
+        entry.stderrTail = [];
+        entry.caps = defaultConnectionCapabilities();
+
+        const child = spawn(bin.executable, [...bin.prependArgs, 'acp'], {
+          cwd,
+          env: spawnEnv,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          detached: process.platform !== 'win32',
+          windowsHide: true,
+        });
+        spawnedChild = child;
+        entry.child = child;
+
+        const spawnErrorPromise = new Promise<never>((_, reject) => {
+          child.once('error', (err) => reject(err));
+        });
+
+        child.stderr?.on('data', (chunk: Buffer | string) => {
+          if (entry.child !== child || !isActiveConnect()) return;
+          const text = chunk.toString('utf8');
+          for (const line of text.split(/\r?\n/)) {
+            if (!line.trim()) continue;
+            entry.stderrTail.push(line);
+            if (entry.stderrTail.length > STDERR_TAIL_LIMIT) entry.stderrTail.shift();
+          }
+        });
+
+        child.once('exit', (code, signal) => {
+          for (const state of this.sessions.values()) {
+            if (state.pendingTurn && state.boundEnvKey === routeKey && state.boundConnectionGeneration === generation) {
+              state.pendingTurn.resolvePhysicalTerminal();
+            }
+            if (state.lastStopTurn && state.boundEnvKey === routeKey && state.boundConnectionGeneration === generation) {
+              state.lastStopTurn.resolvePhysicalTerminal();
+            }
+          }
+          if (entry.child !== child || !isActiveConnect()) {
+            this.cleanupPresetShareDir(createdPresetShareDir);
+            return;
+          }
+          const shareDirToClean = entry.activePresetShareDir ?? createdPresetShareDir;
+          entry.child = null;
+          entry.connection = null;
+          entry.fingerprint = null;
+          entry.teardownWhenIdle = false;
+          entry.caps = defaultConnectionCapabilities();
+          entry.activePresetShareDir = null;
+          entry.activePresetWorkDirs.clear();
+          this.cleanupPresetShareDir(shareDirToClean);
+          const exitMsg = `kimi acp exited unexpectedly (code=${code ?? 'null'}, signal=${signal ?? 'null'})`;
+          for (const state of this.sessions.values()) {
+            if (state.boundEnvKey !== routeKey || state.boundConnectionGeneration !== generation) continue;
+            this.rejectPendingApprovals(state, new Error(exitMsg));
+            if (state.pendingTurn) {
+              this.failTurn(state, state.pendingTurn, new Error(exitMsg), PROVIDER_ERROR_CODES.CONNECTION_LOST, true, entry);
+            } else {
+              this.clearStatus(state.sessionKey, state);
+            }
+            this.resetSessionCompactionTracking(state);
+          }
+        });
+
+        if (!child.stdout || !child.stdin) {
+          await this.teardownConnectionEntry(entry, child, generation);
+          throw new Error('Failed to open stdio pipes for kimi acp');
+        }
+
+        const filteredStdout = filterAcpJsonLines(gateChildStream(child.stdout), (line, count) => {
+          if (count <= 5 || count % 50 === 0) {
+            logger.debug({ provider: this.id, count, line: line.slice(0, 200) }, 'kimi-v2 dropped non-JSON ACP line');
+          }
+        });
+
+        const readable = Readable.toWeb(filteredStdout) as ReadableStream<Uint8Array>;
+        const writable = Writable.toWeb(child.stdin) as WritableStream<Uint8Array>;
+        const stream = ndJsonStream(writable, readable);
+
+        const isCurrentGeneration = () => isActiveConnect() && entry.child === child;
+        const candidateConnection = createAcpClientConnection(
+          {
+            sessionUpdate: async (notification: SessionNotification) => {
+              if (!isCurrentGeneration()) return;
+              await this.enqueueWireOrder(entry, () => {
+                if (!isCurrentGeneration()) return;
+                this.handleSessionUpdate(entry, notification);
+              });
+            },
+            requestPermission: async (params: RequestPermissionRequest) => {
+              if (!isCurrentGeneration()) return { outcome: { outcome: 'cancelled' } };
+              return this.handleRequestPermission(params);
+            },
+            readTextFile: async (params: ReadTextFileRequest) => this.handleReadTextFile(params),
+            writeTextFile: async (params: WriteTextFileRequest) => this.handleWriteTextFile(params),
+          },
+          stream,
+        );
+
+        const initRace = Promise.race([
+          candidateConnection.initialize({
+            protocolVersion: 1,
+            clientCapabilities: {
+              fs: {
+                readTextFile: true,
+                writeTextFile: true,
+              },
+              session: {
+                compaction: {},
+              },
+            },
+            clientInfo: { name: 'imcodes', version: '1.0.0' },
+          }),
+          spawnErrorPromise,
+        ]);
+
+        const initOutcome = await withTimeoutOutcome(initRace, this.initTimeoutMs);
+        if (initOutcome.timedOut) {
+          await this.teardownConnectionEntry(entry, child, generation);
+          throw new Error(`kimi acp initialize timed out after ${this.initTimeoutMs}ms`);
+        }
+
+        if (!isCurrentGeneration()) {
+          await killProcessTree(child, { ownsProcessGroup: true });
+          throw new Error('kimi acp connection superseded before initialization completed');
+        }
+
+        this.applyInitializeResult(entry, initOutcome.value);
+        entry.connection = candidateConnection;
+        return candidateConnection;
+      })();
+
+      entry.connectingPromise = connectPromise;
+      try {
+        const connection = await connectPromise;
+        this.acquireConnectionUse(entry);
+        handoffToCaller = true;
+        return { entry, connection };
+      } catch (err) {
+        if (spawnedChild) {
+          await this.teardownConnectionEntry(entry, spawnedChild, generation);
+        }
+        this.cleanupPresetShareDir(createdPresetShareDir, entry);
+        throw this.normalizeProviderException(err, entry);
+      } finally {
+        if (entry.connectingPromise === connectPromise) {
+          entry.connectingPromise = null;
+        }
+      }
     } finally {
-      if (entry.connectingPromise === connectPromise) {
-        entry.connectingPromise = null;
+      entry.connectingWaiters = Math.max(0, entry.connectingWaiters - 1);
+      if (!handoffToCaller) {
         if (entry.teardownWhenIdle) {
           await this.flushIdleTeardownIfReady(entry);
+        } else if (
+          this.connections.get(entry.routeKey) === entry
+          && !entry.child
+          && !entry.connection
+          && !entry.connectingPromise
+          && entry.inFlightOps === 0
+          && entry.connectingWaiters === 0
+          && this.countSessionsOnEntry(entry.routeKey) === 0
+        ) {
+          this.connections.delete(entry.routeKey);
         }
       }
     }
@@ -1786,115 +1819,116 @@ export class KimiV2Provider implements TransportProvider {
     }
 
     const { entry, connection } = await this.ensureConnected(config);
-    if (this.lifecycleEpoch !== epoch) {
-      throw new Error('Provider disconnected during session initialization');
-    }
-    const cwd = normalizeTransportCwd(canonicalizeTransportCwd(config.cwd)) || process.cwd();
-    const mcpServers = getDefaultAcpMcpServers(config);
-    const systemParts = getProviderSystemTextParts({
-      userMessage: '',
-      assembledMessage: '',
-      sessionSystemText: config.identityPrompt ?? config.systemPrompt,
-      systemText: config.systemPrompt ?? config.description,
-      context: {
+    try {
+      if (this.lifecycleEpoch !== epoch) {
+        throw new Error('Provider disconnected during session initialization');
+      }
+      const cwd = normalizeTransportCwd(canonicalizeTransportCwd(config.cwd)) || process.cwd();
+      const mcpServers = getDefaultAcpMcpServers(config);
+      const systemParts = getProviderSystemTextParts({
+        userMessage: '',
+        assembledMessage: '',
         sessionSystemText: config.identityPrompt ?? config.systemPrompt,
         systemText: config.systemPrompt ?? config.description,
-        requiredAuthoredContext: [],
-        advisoryAuthoredContext: [],
-        appliedDocumentVersionIds: [],
+        context: {
+          sessionSystemText: config.identityPrompt ?? config.systemPrompt,
+          systemText: config.systemPrompt ?? config.description,
+          requiredAuthoredContext: [],
+          advisoryAuthoredContext: [],
+          appliedDocumentVersionIds: [],
+          diagnostics: [],
+        },
+        authority: {
+          namespace: config.contextNamespace ?? { scope: 'personal', projectId: 'default' },
+          authoritySource: 'none',
+          freshness: 'missing',
+          fallbackAllowed: true,
+          retryScheduled: false,
+          providerPolicyOutcome: 'allowed',
+          diagnostics: [],
+        },
+        supportClass: 'full-normalized-context-injection',
         diagnostics: [],
-      },
-      authority: {
-        namespace: config.contextNamespace ?? { scope: 'personal', projectId: 'default' },
-        authoritySource: 'none',
-        freshness: 'missing',
-        fallbackAllowed: true,
-        retryScheduled: false,
-        providerPolicyOutcome: 'allowed',
-        diagnostics: [],
-      },
-      supportClass: 'full-normalized-context-injection',
-      diagnostics: [],
-    });
+      });
 
-    // Keep local route key (bindExistingKey) strictly separate from remote ACP session id (resumeId).
-    const initialResumeId = config.fresh
-      ? undefined
-      : (isNonEmptyString(config.resumeId) ? config.resumeId.trim() : existing?.providerSessionId || undefined);
+      // Keep local route key (bindExistingKey) strictly separate from remote ACP session id (resumeId).
+      const initialResumeId = config.fresh
+        ? undefined
+        : (isNonEmptyString(config.resumeId) ? config.resumeId.trim() : existing?.providerSessionId || undefined);
 
-    const requestedModel = isNonEmptyString(config.model)
-      ? config.model.trim()
-      : isNonEmptyString(config.agentId)
-        ? config.agentId.trim()
-        : existing?.model;
+      const requestedModel = isNonEmptyString(config.model)
+        ? config.model.trim()
+        : isNonEmptyString(config.agentId)
+          ? config.agentId.trim()
+          : existing?.model;
 
-    const state: KimiSessionState = {
-      sessionKey: routeId,
-      providerSessionId: initialResumeId ?? '',
-      reportedResumeId: undefined,
-      boundConnectionGeneration: 0,
-      cwd,
-      model: undefined,
-      pendingModel: requestedModel,
-      mode: 'default',
-      lastContextWindow: undefined,
-      sessionUsesConfigOptions: false,
-      modelConfigId: null,
-      systemText: systemParts.sessionSystemText,
-      systemTextInjected: Boolean(config.startupMemoryAlreadyInjected ?? existing?.systemTextInjected),
-      lastInjectedSessionSystemKey: config.startupMemoryAlreadyInjected
-        ? sessionSystemContractKey(systemParts.sessionSystemText)
-        : existing?.lastInjectedSessionSystemKey,
-      replaying: false,
-      promptInFlight: false,
-      turnGeneration: existing?.turnGeneration ?? 0,
-      pendingTurn: null,
-      lastStopTurn: null,
-      lastStatusSignature: null,
-      compactionTrackerGeneration: 0,
-      activeCompactionIds: new Set(),
-      terminalCompactionIds: new Set(),
-      activeTools: new Map(),
-      pendingApprovals: new Map(),
-      mcpServers,
-      env: config.env ?? existing?.env,
-      kimiLlm: config.kimiLlm ?? existing?.kimiLlm,
-    };
-    this.sessions.set(routeId, state);
+      const state: KimiSessionState = {
+        sessionKey: routeId,
+        providerSessionId: initialResumeId ?? '',
+        reportedResumeId: undefined,
+        boundConnectionGeneration: 0,
+        cwd,
+        model: undefined,
+        pendingModel: requestedModel,
+        mode: 'default',
+        lastContextWindow: undefined,
+        sessionUsesConfigOptions: false,
+        modelConfigId: null,
+        systemText: systemParts.sessionSystemText,
+        systemTextInjected: Boolean(config.startupMemoryAlreadyInjected ?? existing?.systemTextInjected),
+        lastInjectedSessionSystemKey: config.startupMemoryAlreadyInjected
+          ? sessionSystemContractKey(systemParts.sessionSystemText)
+          : existing?.lastInjectedSessionSystemKey,
+        replaying: false,
+        promptInFlight: false,
+        turnGeneration: existing?.turnGeneration ?? 0,
+        pendingTurn: null,
+        lastStopTurn: null,
+        lastStatusSignature: null,
+        compactionTrackerGeneration: 0,
+        activeCompactionIds: new Set(),
+        terminalCompactionIds: new Set(),
+        activeTools: new Map(),
+        pendingApprovals: new Map(),
+        mcpServers,
+        env: config.env ?? existing?.env,
+        kimiLlm: config.kimiLlm ?? existing?.kimiLlm,
+      };
+      this.sessions.set(routeId, state);
 
-    const previousEntry = existing ? this.getSessionConnectionEntry(existing) : undefined;
-    const previousBoundAcpId = prior?.providerSessionId;
-    this.acquireConnectionUse(entry);
-    try {
-      await this.ensureSessionReady(state, entry, connection, { allowFresh: !config.strictResume });
-      if (previousEntry && previousEntry !== entry && previousEntry.activePresetShareDir) {
-        this.scheduleTeardownIfUnbound(previousEntry);
-        await this.flushIdleTeardownIfReady(previousEntry);
-      }
-    } catch (err) {
-      if (!prior) {
-        this.unbindSession(routeId);
-        if (state.providerSessionId && this.acpToRoute.get(state.providerSessionId) === routeId) {
-          this.acpToRoute.delete(state.providerSessionId);
+      const previousEntry = existing ? this.getSessionConnectionEntry(existing) : undefined;
+      const previousBoundAcpId = prior?.providerSessionId;
+      try {
+        await this.ensureSessionReady(state, entry, connection, { allowFresh: !config.strictResume });
+        if (previousEntry && previousEntry !== entry && previousEntry.activePresetShareDir) {
+          this.scheduleTeardownIfUnbound(previousEntry);
+          await this.flushIdleTeardownIfReady(previousEntry);
         }
-      } else {
-        if (state.providerSessionId && state.providerSessionId !== previousBoundAcpId && this.acpToRoute.get(state.providerSessionId) === routeId) {
-          this.acpToRoute.delete(state.providerSessionId);
+      } catch (err) {
+        if (!prior) {
+          this.unbindSession(routeId);
+          if (state.providerSessionId && this.acpToRoute.get(state.providerSessionId) === routeId) {
+            this.acpToRoute.delete(state.providerSessionId);
+          }
+        } else {
+          if (state.providerSessionId && state.providerSessionId !== previousBoundAcpId && this.acpToRoute.get(state.providerSessionId) === routeId) {
+            this.acpToRoute.delete(state.providerSessionId);
+          }
+          this.sessions.set(routeId, prior);
+          if (previousBoundAcpId) {
+            this.acpToRoute.set(previousBoundAcpId, routeId);
+          }
         }
-        this.sessions.set(routeId, prior);
-        if (previousBoundAcpId) {
-          this.acpToRoute.set(previousBoundAcpId, routeId);
+        if (entry.activePresetShareDir !== null || Boolean(config.strictResume)) {
+          this.scheduleTeardownIfUnbound(entry);
         }
+        throw err;
       }
-      if (entry.activePresetShareDir !== null || Boolean(config.strictResume)) {
-        this.scheduleTeardownIfUnbound(entry);
-      }
-      throw err;
+
+      return routeId;
     } finally {
       await this.releaseConnectionUse(entry);
     }
-
-    return routeId;
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
@@ -1910,7 +1944,6 @@ export class KimiV2Provider implements TransportProvider {
         resumeId: state.providerSessionId || undefined,
       });
       connectedEntry = entry;
-      this.acquireConnectionUse(entry);
       try {
         await this.ensureSessionReady(state, entry, connection, { allowFresh: false });
         return true;
@@ -1943,7 +1976,6 @@ export class KimiV2Provider implements TransportProvider {
     } catch {
       return [];
     }
-    this.acquireConnectionUse(entry);
     try {
       const directoryRequested = options.directory !== undefined;
       const queryDirectory = normalizeTransportCwd(options.directory);
@@ -2095,9 +2127,8 @@ export class KimiV2Provider implements TransportProvider {
     try {
       const connected = await this.ensureConnected(defaultConfig);
       entry = connected.entry;
-      const connection = connected.connection;
-      this.acquireConnectionUse(entry);
       acquired = true;
+      const connection = connected.connection;
       const probe = await withTimeoutOutcome(
         connection.newSession({ cwd: process.cwd(), mcpServers: [] }),
         this.sessionTimeoutMs,
@@ -2198,7 +2229,6 @@ export class KimiV2Provider implements TransportProvider {
         resumeId: state.providerSessionId || undefined,
       });
       boundEntry = entry;
-      this.acquireConnectionUse(entry);
       try {
         if (turn.cancelled || state.turnGeneration !== generation || this.sessions.get(state.sessionKey) !== state) {
           throw Object.assign(new Error('Turn cancelled before prompt submission'), { code: PROVIDER_ERROR_CODES.CANCELLED });

@@ -2463,6 +2463,134 @@ describe('KimiV2Provider', () => {
     }
   });
 
+  it('preserves a reconnecting preset connection during gated initialize when the last old session closes, completes send on the new session, and tears down only after the new session closes', async () => {
+    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-gated-init-')));
+    const baseShareDir = path.join(tmpDir, 'base-share');
+    mkdirSync(baseShareDir, { recursive: true });
+    const origShareEnv = process.env.KIMI_SHARE_DIR;
+    process.env.KIMI_SHARE_DIR = baseShareDir;
+
+    const llm: KimiLlmConfig = {
+      provider: 'glm5.3',
+      providerType: 'anthropic',
+      baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+      apiKey: 'secret-gated-init-key',
+      model: 'glm-5.3-flash',
+      contextWindow: 1_000_000,
+      models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+    };
+
+    try {
+      const { existsSync } = await import('node:fs');
+
+      const connOld = makeMockConn({
+        newSession: vi.fn(async () => ({ sessionId: 'old-acp-1' })),
+      });
+
+      let resolveInitGate!: (val: unknown) => void;
+      const initGate = new Promise((resolve) => {
+        resolveInitGate = resolve;
+      });
+      const defaultInitResult = {
+        protocolVersion: 1,
+        agentInfo: { name: 'Kimi Code CLI', version: '2.8.1' },
+        agentCapabilities: {
+          loadSession: true,
+          promptCapabilities: { image: true, audio: false, embeddedContext: true },
+          sessionCapabilities: { list: {}, resume: {}, close: {} },
+        },
+      };
+      let promptHandler: ((params: { sessionId: string }) => Promise<{ stopReason: string }>) | null = null;
+      const connNew = makeMockConn({
+        initialize: vi.fn(async () => {
+          await initGate;
+          return defaultInitResult;
+        }),
+        newSession: vi.fn(async () => ({ sessionId: 'new-acp-2' })),
+        prompt: vi.fn(async (params: { sessionId: string }) => {
+          return promptHandler ? promptHandler(params) : { stopReason: 'end_turn' };
+        }),
+      });
+      state.connQueue.push(connOld, connNew);
+
+      const provider = new KimiV2Provider({ kimiLlm: llm });
+      const completes: Array<{ sessionId: string; content: string }> = [];
+      provider.onComplete((sid, msg) => completes.push({ sessionId: sid, content: msg.content }));
+      await provider.connect({ kimiLlm: llm });
+
+      // Start and bind the old session
+      await provider.createSession({
+        sessionKey: 'sess-old',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: llm,
+      });
+      const oldChild = state.children[0];
+      expect(provider.getSessionDiagnostics('sess-old')?.connected).toBe(true);
+
+      // Simulate old child exiting while sess-old is still registered
+      oldChild.exitCode = 0;
+      oldChild.emit('exit', 0, null);
+      expect(provider.getSessionDiagnostics('sess-old')?.connected).toBe(false);
+
+      // Start new session creation on the same preset route; blocks inside initialize()
+      const createNewPromise = provider.createSession({
+        sessionKey: 'sess-new',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: llm,
+      });
+      await vi.waitFor(() => expect(connNew.initialize).toHaveBeenCalledTimes(1));
+
+      const newChild = state.children[1];
+      const newShareDir = (mockSpawn.mock.calls.at(-1)![2] as { env: NodeJS.ProcessEnv }).env.KIMI_SHARE_DIR!;
+      expect(existsSync(path.join(newShareDir, 'config.toml'))).toBe(true);
+
+      // Close the last old session WHILE initialize() for sess-new is in-flight
+      mockKillProcessTree.mockClear();
+      await provider.endSession('sess-old');
+      expect(mockKillProcessTree).not.toHaveBeenCalled();
+      expect(existsSync(newShareDir)).toBe(true);
+
+      // Release initialize(): ensureConnected must hand off an intact, still-owned connection to sess-new
+      resolveInitGate(defaultInitResult);
+      await expect(createNewPromise).resolves.toBe('sess-new');
+      expect(connNew.newSession).toHaveBeenCalledTimes(1);
+      expect(mockKillProcessTree).not.toHaveBeenCalled();
+      expect(existsSync(newShareDir)).toBe(true);
+      expect(provider.getSessionDiagnostics('sess-new')?.connected).toBe(true);
+
+      // New session must be able to send a prompt cleanly on that connection
+      promptHandler = async ({ sessionId }) => {
+        await state.handlers!.sessionUpdate({
+          sessionId,
+          update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'GATED_INIT_SEND_OK' } } as never,
+        });
+        return { stopReason: 'end_turn' };
+      };
+      await provider.send('sess-new', 'hello after old session closed');
+      await vi.waitFor(() => expect(completes).toEqual([
+        { sessionId: 'sess-new', content: 'GATED_INIT_SEND_OK' },
+      ]));
+      expect(mockKillProcessTree).not.toHaveBeenCalled();
+      expect(existsSync(newShareDir)).toBe(true);
+
+      // Closing the new (last) session finally tears down the new child & private share dir
+      await provider.endSession('sess-new');
+      expect(mockKillProcessTree).toHaveBeenCalledWith(newChild, { ownsProcessGroup: true });
+      expect(existsSync(newShareDir)).toBe(false);
+
+      await provider.disconnect();
+    } finally {
+      if (origShareEnv !== undefined) {
+        process.env.KIMI_SHARE_DIR = origShareEnv;
+      } else {
+        delete process.env.KIMI_SHARE_DIR;
+      }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('keeps base kimi.json read-only, uses isolated metadata view for default resume, and fails closed on corrupt metadata', async () => {
     const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-wd-view-')));
     const projCwd = path.join(tmpDir, 'never-seen-cwd');
