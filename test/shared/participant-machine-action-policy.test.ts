@@ -21,9 +21,9 @@ describe.each(subjects)('%s real access', (_name, subject, mayView, mayExecute) 
       expect(participantTurnDecision).toEqual({ allowed: false, reason: D.EXECUTE_NOT_GRANTED });
     }
     const nonParticipantTurnExpected =
-      action === MACHINE_ACTION.FILE_LIST
-      && subject.accessRole === 'participant'
-      && subject.accessSource === S.GROUP
+      subject.accessRole === 'participant'
+      && action !== MACHINE_ACTION.LIST
+      && action !== MACHINE_ACTION.VIEW
         ? true
         : expected;
     const ownerTurn = evaluateMachineAction({ ...subject, participantTurn: false }, action);

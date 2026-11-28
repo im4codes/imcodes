@@ -31,6 +31,7 @@ import {
 import http from 'http';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { readProcessSharedMachineActivityEpoch } from './shared-machine-authority-context.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
 import { DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR } from './memory-mcp-error-codes.js';
 import type { SessionRecord } from '../store/session-store.js';
@@ -2113,6 +2114,7 @@ export async function startHookServer(
             const agentType = (msg['agentType'] as string | undefined) ?? 'unknown';
             const initialInstanceId = record.sessionInstanceId;
             const initialRuntimeEpoch = record.runtimeEpoch;
+            const idleActivityEpoch = readProcessSharedMachineActivityEpoch(session);
             logger.info({ session, agentType }, 'Hook: session idle');
             await refreshSessionWatcher(session);
             // Re-verify session identity and active participant window synchronously after async await
@@ -2133,7 +2135,10 @@ export async function startHookServer(
               return;
             }
             onHook({ event: 'idle', session, agentType });
-            timelineEmitter.emit(session, 'session.state', { state: 'idle' }, { source: 'hook' });
+            timelineEmitter.emit(session, 'session.state', {
+              state: 'idle',
+              ...(idleActivityEpoch !== null ? { activityEpoch: idleActivityEpoch } : {}),
+            }, { source: 'hook' });
             upsertSession({ ...latestRecord, state: 'idle', updatedAt: Date.now() });
             // Drain queued messages when session becomes idle
             void drainQueue(session);

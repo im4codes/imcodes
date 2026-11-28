@@ -42,7 +42,6 @@ import { buildSessionList, resolveAuthoritativeSessionListState } from './sessio
 import { timelineEmitter } from './timeline-emitter.js';
 import {
   clearAllDaemonTurnAuthoritiesOnDisconnect,
-  markTreeSessionIdle,
   registerTreeSessionActivityProbe,
   releaseProcessSharedMachineAuthority,
 } from './shared-machine-authority-context.js';
@@ -1364,10 +1363,15 @@ export async function startup(): Promise<DaemonContext> {
       if (state === 'idle') {
         notifySessionIdle(e.sessionId);
         // The turn is over: a participant's machine-authority window on a process session ends here.
-        releaseProcessSharedMachineAuthority(e.sessionId);
+        const activityEpoch = (e.payload as { activityEpoch?: unknown })?.activityEpoch;
+        if (typeof activityEpoch === 'number') {
+          releaseProcessSharedMachineAuthority(e.sessionId, { expectedActivityEpoch: activityEpoch });
+        } else {
+          releaseProcessSharedMachineAuthority(e.sessionId);
+        }
         void drainQueue(e.sessionId);
       } else if (state === 'error' || state === 'stopped') {
-        markTreeSessionIdle(e.sessionId);
+        releaseProcessSharedMachineAuthority(e.sessionId, { forceSettle: true });
       }
     }
   });

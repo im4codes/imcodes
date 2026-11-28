@@ -41,6 +41,19 @@ export interface TreeSessionActorBinding {
   authority: string | null;
 }
 
+const MAX_SUPERSEDED_HASHES_PER_TREE = 64;
+
+function recordSupersededHash(set: Set<string>, tokenHash: string | null | undefined): void {
+  if (!tokenHash) return;
+  if (set.has(tokenHash)) {
+    set.delete(tokenHash);
+  } else if (set.size >= MAX_SUPERSEDED_HASHES_PER_TREE) {
+    const oldest = set.values().next().value;
+    if (oldest !== undefined) set.delete(oldest);
+  }
+  set.add(tokenHash);
+}
+
 export interface TreeAuthorityState {
   rootSessionName: string;
   generation: number;
@@ -51,10 +64,13 @@ export interface TreeAuthorityState {
   linkGeneration?: number;
   activeSessions: Set<string>;
   sessionActors: Map<string, TreeSessionActorBinding>;
+  supersededTokenHashes: Set<string>;
+  pendingRevokeHashes: Map<string, number | undefined>;
   updatedAt: number;
 }
 
 let globalTreeGeneration = 0;
+let globalActivityEpoch = 0;
 const treeAuthorities = new Map<string, TreeAuthorityState>();
 export type TreeSessionActivityProbe = (sessionName: string) => boolean;
 const treeActivityProbes = new Set<TreeSessionActivityProbe>();
@@ -143,15 +159,26 @@ function maybeRevokeIdleTreeAuthority(
   if (entry.tokenHash !== expectedTokenHash) return;
   if (isAnyTreeSessionStillActive(rootSessionName, entry)) return;
   treeAuthorities.delete(rootSessionName);
+  const flushed = new Set<string>();
   if (expectedTokenHash) {
+    flushed.add(expectedTokenHash);
     sendTurnAuthorityRevoke(rootSessionName, expectedTokenHash, entry.linkGeneration);
+  }
+  for (const [hash, linkGen] of entry.pendingRevokeHashes) {
+    if (flushed.has(hash)) continue;
+    flushed.add(hash);
+    sendTurnAuthorityRevoke(rootSessionName, hash, linkGen);
   }
 }
 
-function sameSessionActor(a: TreeSessionActorBinding, b: TreeSessionActorBinding): boolean {
+function sameStableSender(
+  a: { kind: 'owner' | 'participant' | 'mixed'; actorUserId: string | null },
+  b: { kind: 'owner' | 'participant' | 'mixed'; actorUserId: string | null },
+): boolean {
+  if (a.kind === 'mixed' || b.kind === 'mixed') return false;
   if (a.kind !== b.kind) return false;
   if (a.kind === 'participant') {
-    return a.actorUserId === b.actorUserId && a.authority === b.authority && !!a.actorUserId && !!a.authority;
+    return a.actorUserId === b.actorUserId && !!a.actorUserId;
   }
   return true;
 }
@@ -162,11 +189,6 @@ function pruneInactiveOtherSessions(entry: TreeAuthorityState, currentSessionNam
     if (!entry.activeSessions.has(sName) && !isSessionItselfActive(sName)) {
       entry.sessionActors.delete(sName);
     }
-  }
-  for (const sName of [...entry.activeSessions]) {
-    if (sName === currentSessionName) continue;
-    // Keep explicitly marked activeSessions unless neither sessionActors nor probes indicate anything is possible;
-    // explicit `markTreeSessionIdle` deletes them on completion/failure/error.
   }
 }
 
@@ -180,16 +202,33 @@ function hasOtherActiveConflictingSession(
     const otherActor = entry.sessionActors.get(otherName) ?? {
       kind: entry.kind === 'mixed' ? 'participant' : entry.kind,
       actorUserId: entry.actorUserId,
-      authority: entry.authority,
     };
-    if (!sameSessionActor(otherActor, incoming)) return true;
+    if (!sameStableSender(otherActor, incoming)) return true;
   }
   return false;
 }
 
+function flushConflictRevokeHashes(
+  rootSessionName: string,
+  entry: TreeAuthorityState,
+  extraHash: string | null,
+  extraLinkGen: number | undefined,
+): void {
+  const toRevoke: Array<[string, number | undefined]> = [];
+  if (entry.tokenHash) toRevoke.push([entry.tokenHash, entry.linkGeneration]);
+  if (extraHash && extraHash !== entry.tokenHash) toRevoke.push([extraHash, extraLinkGen]);
+  for (const [hash, linkGen] of toRevoke) {
+    recordSupersededHash(entry.supersededTokenHashes, hash);
+    entry.pendingRevokeHashes.set(hash, linkGen);
+    sendTurnAuthorityRevoke(rootSessionName, hash, linkGen);
+  }
+}
+
 /**
  * Update or establish the unified in-memory grant for a session's root tree.
- * Returns the bound monotonic `generation` so the caller's turn can detect superseded or mixed trees.
+ * Separating stable sender identity from replaceable turn tokens lets the same
+ * sender (`O` or `P1`) start follow-up turns across active sessions in one tree
+ * while immediately replacing the tree token and fencing stale callbacks.
  */
 export function bindTreeTurnAuthority(
   sessionName: string,
@@ -218,30 +257,31 @@ export function bindTreeTurnAuthority(
           : null,
       };
 
+  const incomingHash = normalizedIncoming.authority ? sha256Hex(normalizedIncoming.authority) : null;
   const incomingInvalidParticipant = normalizedIncoming.kind === 'participant'
     && (!normalizedIncoming.actorUserId || !normalizedIncoming.authority);
 
   if (existing) {
     pruneInactiveOtherSessions(existing, sessionName);
     const otherActiveExists = [...existing.activeSessions].some((name) => name !== sessionName);
-    const sameTurnActor = !incomingInvalidParticipant
-      && existing.kind === normalizedIncoming.kind
-      && (normalizedIncoming.kind === 'owner'
-        ? (!normalizedIncoming.authority || existing.authority === normalizedIncoming.authority)
-        : (existing.actorUserId === normalizedIncoming.actorUserId && existing.authority === normalizedIncoming.authority));
-
-    // Sticky mixed while other sessions (or current unfinished session in an already-mixed tree) remain active.
+    const sameSenderAsTree = existing.kind !== 'mixed' && sameStableSender(existing, normalizedIncoming);
+    const currentActorOnSameSession = existing.activeSessions.has(sessionName)
+      ? existing.sessionActors.get(sessionName)
+      : undefined;
+    const sameSessionConflict = Boolean(
+      currentActorOnSameSession
+      && !sameStableSender(currentActorOnSameSession, normalizedIncoming),
+    );
     const existingMixedSticky = existing.kind === 'mixed' && (otherActiveExists || existing.activeSessions.has(sessionName));
     const conflictsWithOther = otherActiveExists && hasOtherActiveConflictingSession(existing, sessionName, normalizedIncoming);
 
-    if (incomingInvalidParticipant || existingMixedSticky || conflictsWithOther) {
-      const priorTokenHash = existing.tokenHash;
-      const priorLinkGen = existing.linkGeneration;
+    if (incomingInvalidParticipant || existingMixedSticky || conflictsWithOther || sameSessionConflict) {
       const generation = ++globalTreeGeneration;
       const activeSessions = existing.activeSessions;
       if (markActive) activeSessions.add(sessionName);
       const sessionActors = existing.sessionActors;
       sessionActors.set(sessionName, normalizedIncoming);
+      flushConflictRevokeHashes(rootSessionName, existing, incomingHash, currentLinkGeneration);
       treeAuthorities.set(rootSessionName, {
         rootSessionName,
         generation,
@@ -252,20 +292,32 @@ export function bindTreeTurnAuthority(
         linkGeneration: currentLinkGeneration,
         activeSessions,
         sessionActors,
+        supersededTokenHashes: existing.supersededTokenHashes,
+        pendingRevokeHashes: existing.pendingRevokeHashes,
         updatedAt: now,
       });
-      if (priorTokenHash) {
-        sendTurnAuthorityRevoke(rootSessionName, priorTokenHash, priorLinkGen);
-      }
       return generation;
     }
 
-    if (sameTurnActor) {
+    if (incomingHash && existing.supersededTokenHashes.has(incomingHash)) {
+      if (sameSenderAsTree && markActive) {
+        existing.activeSessions.add(sessionName);
+      }
+      return existing.generation;
+    }
+
+    if (sameSenderAsTree) {
       if (markActive) existing.activeSessions.add(sessionName);
       existing.sessionActors.set(sessionName, normalizedIncoming);
-      if (normalizedIncoming.authority && !existing.authority) {
+      if (incomingHash && incomingHash !== existing.tokenHash) {
+        recordSupersededHash(existing.supersededTokenHashes, existing.tokenHash);
+        existing.generation = ++globalTreeGeneration;
         existing.authority = normalizedIncoming.authority;
-        existing.tokenHash = sha256Hex(normalizedIncoming.authority);
+        existing.tokenHash = incomingHash;
+        existing.linkGeneration = currentLinkGeneration;
+      } else if (normalizedIncoming.authority && !existing.authority) {
+        existing.authority = normalizedIncoming.authority;
+        existing.tokenHash = incomingHash;
         existing.linkGeneration = currentLinkGeneration;
       }
       existing.updatedAt = now;
@@ -273,12 +325,21 @@ export function bindTreeTurnAuthority(
     }
   }
 
+  if (existing && existing.pendingRevokeHashes.size > 0) {
+    for (const [hash, linkGen] of existing.pendingRevokeHashes) {
+      sendTurnAuthorityRevoke(rootSessionName, hash, linkGen);
+    }
+    existing.pendingRevokeHashes.clear();
+  }
   const activeSessions = existing?.activeSessions ?? new Set<string>();
   const sessionActors = existing?.sessionActors ?? new Map<string, TreeSessionActorBinding>();
+  const supersededTokenHashes = existing?.supersededTokenHashes ?? new Set<string>();
+  const pendingRevokeHashes = existing?.pendingRevokeHashes ?? new Map<string, number | undefined>();
+  if (existing?.tokenHash) recordSupersededHash(supersededTokenHashes, existing.tokenHash);
   if (markActive) activeSessions.add(sessionName);
   sessionActors.set(sessionName, normalizedIncoming);
 
-  if (incomingInvalidParticipant) {
+  if (incomingInvalidParticipant || (incomingHash && supersededTokenHashes.has(incomingHash))) {
     const generation = ++globalTreeGeneration;
     treeAuthorities.set(rootSessionName, {
       rootSessionName,
@@ -290,6 +351,8 @@ export function bindTreeTurnAuthority(
       linkGeneration: currentLinkGeneration,
       activeSessions,
       sessionActors,
+      supersededTokenHashes,
+      pendingRevokeHashes,
       updatedAt: now,
     });
     return generation;
@@ -307,6 +370,8 @@ export function bindTreeTurnAuthority(
       linkGeneration: currentLinkGeneration,
       activeSessions,
       sessionActors,
+      supersededTokenHashes,
+      pendingRevokeHashes,
       updatedAt: now,
     });
     return generation;
@@ -323,6 +388,8 @@ export function bindTreeTurnAuthority(
     linkGeneration: currentLinkGeneration,
     activeSessions,
     sessionActors,
+    supersededTokenHashes,
+    pendingRevokeHashes,
     updatedAt: now,
   });
   return generation;
@@ -442,7 +509,7 @@ export function bindProcessSharedMachineActivity(
       authority: null,
       ownerAuthority: null,
       treeGeneration: null,
-      activityEpoch: 0,
+      activityEpoch: ++globalActivityEpoch,
       lastActivityAt: now,
       turns: opts.sessionRunning ? 1 : 0,
       undelivered: 0,
@@ -450,7 +517,7 @@ export function bindProcessSharedMachineActivity(
     windows.set(sessionName, window);
   }
   window.lastActivityAt = now;
-  window.activityEpoch += 1;
+  window.activityEpoch = ++globalActivityEpoch;
   const startsTurn = opts.startsTurn ?? true;
   if (startsTurn) {
     window.turns += 1;
@@ -482,7 +549,7 @@ export function bindProcessSharedMachineActivity(
       if (windows.get(sessionName) !== bound || bound.undelivered <= 0) return;
       bound.undelivered -= 1;
       bound.lastActivityAt = at;
-      bound.activityEpoch += 1;
+      bound.activityEpoch = ++globalActivityEpoch;
       clearIdleGuardTimer(sessionName);
     },
     settle() {
@@ -540,24 +607,57 @@ export function bindProcessSharedMachineCommand(
 
 export const PROCESS_SHARED_MACHINE_IDLE_GUARD_MS = 1_500;
 
-export function releaseProcessSharedMachineAuthority(sessionName: string, now = Date.now()): void {
+export interface ReleaseProcessSharedMachineAuthorityOptions {
+  now?: number;
+  /** Completion epoch observed when idle was detected; matching completes immediately (0ms), mismatched is stale and ignored. */
+  expectedActivityEpoch?: number;
+  /** Terminate/error settlement: immediately clear local process window and tree active marker. */
+  forceSettle?: boolean;
+}
+
+export function readProcessSharedMachineActivityEpoch(sessionName: string): number | null {
+  return windows.get(sessionName)?.activityEpoch ?? null;
+}
+
+export function releaseProcessSharedMachineAuthority(
+  sessionName: string,
+  nowOrOptions: number | ReleaseProcessSharedMachineAuthorityOptions = Date.now(),
+): void {
+  const opts: ReleaseProcessSharedMachineAuthorityOptions = typeof nowOrOptions === 'number'
+    ? { now: nowOrOptions }
+    : nowOrOptions;
+  const now = opts.now ?? Date.now();
   const window = windows.get(sessionName);
+
+  if (opts.forceSettle) {
+    clearIdleGuardTimer(sessionName);
+    windows.delete(sessionName);
+    markTreeSessionIdle(sessionName, now);
+    return;
+  }
+
   if (window) {
-    const elapsed = now - window.lastActivityAt;
-    if (elapsed < PROCESS_SHARED_MACHINE_IDLE_GUARD_MS) {
-      clearIdleGuardTimer(sessionName);
-      const expectedEpoch = window.activityEpoch;
-      const delayMs = Math.max(1, PROCESS_SHARED_MACHINE_IDLE_GUARD_MS - elapsed + 5);
-      const timer = setTimeout(() => {
-        idleGuardTimers.delete(sessionName);
-        const live = windows.get(sessionName);
-        if (!live || live !== window || live.activityEpoch !== expectedEpoch) return;
-        if (getSession(sessionName)?.state === 'running') return;
-        releaseProcessSharedMachineAuthority(sessionName, Date.now());
-      }, delayMs);
-      timer.unref?.();
-      idleGuardTimers.set(sessionName, timer);
-      return;
+    if (opts.expectedActivityEpoch !== undefined) {
+      if (window.activityEpoch !== opts.expectedActivityEpoch) {
+        return; // Stale idle edge from an earlier activity epoch must never affect a newer turn.
+      }
+    } else {
+      const elapsed = now - window.lastActivityAt;
+      if (elapsed < PROCESS_SHARED_MACHINE_IDLE_GUARD_MS) {
+        clearIdleGuardTimer(sessionName);
+        const expectedEpoch = window.activityEpoch;
+        const delayMs = Math.max(1, PROCESS_SHARED_MACHINE_IDLE_GUARD_MS - elapsed + 5);
+        const timer = setTimeout(() => {
+          idleGuardTimers.delete(sessionName);
+          const live = windows.get(sessionName);
+          if (!live || live !== window || live.activityEpoch !== expectedEpoch) return;
+          if (getSession(sessionName)?.state === 'running') return;
+          releaseProcessSharedMachineAuthority(sessionName, { now: Date.now(), expectedActivityEpoch: expectedEpoch });
+        }, delayMs);
+        timer.unref?.();
+        idleGuardTimers.set(sessionName, timer);
+        return;
+      }
     }
     if (window.undelivered > 0 && window.turns - window.undelivered <= 0) return;
     if (window.turns > 1) {
@@ -565,7 +665,7 @@ export function releaseProcessSharedMachineAuthority(sessionName: string, now = 
       window.owner = false;
       if (window.participants.size > 0) window.ownerAuthority = null;
       window.lastActivityAt = now;
-      window.activityEpoch += 1;
+      window.activityEpoch = ++globalActivityEpoch;
       clearIdleGuardTimer(sessionName);
       return;
     }
@@ -599,6 +699,7 @@ export function clearAllDaemonTurnAuthoritiesOnDisconnect(hooks?: {
   }
 
   for (const [rootSessionName, entry] of [...treeAuthorities.entries()]) {
+    entry.pendingRevokeHashes.clear();
     if (entry.kind === 'owner' || !isAnyTreeSessionStillActive(rootSessionName, entry)) {
       treeAuthorities.delete(rootSessionName);
     } else {
@@ -787,22 +888,8 @@ export function resolveCanonicalTurnAuthority(input: {
           authority: null,
         };
       }
-      if (local.authority && tree.authority && local.authority !== tree.authority) {
-        return {
-          required: true,
-          isParticipantScoped: true,
-          actorUserId: AMBIGUOUS_TREE_PARTICIPANT_ACTOR,
-          authority: null,
-        };
-      }
-      if (local.treeGeneration !== null && local.treeGeneration !== tree.generation) {
-        return {
-          required: true,
-          isParticipantScoped: true,
-          actorUserId: AMBIGUOUS_TREE_PARTICIPANT_ACTOR,
-          authority: null,
-        };
-      }
+      // Same verified participant in the same tree inherits the live tree authority
+      // even when the same sender started a newer turn on another session in the tree.
       return {
         required: true,
         isParticipantScoped: true,
@@ -821,22 +908,7 @@ export function resolveCanonicalTurnAuthority(input: {
           authority: null,
         };
       }
-      if (local.treeGeneration !== null && local.treeGeneration !== tree.generation) {
-        return {
-          required: false,
-          isParticipantScoped: false,
-          actorUserId: null,
-          authority: null,
-        };
-      }
-      if (local.authority && tree.authority && local.authority !== tree.authority) {
-        return {
-          required: false,
-          isParticipantScoped: false,
-          actorUserId: null,
-          authority: null,
-        };
-      }
+      // Same verified owner in the same tree inherits the live tree authority across turns.
       return tree.authority
         ? {
             required: false,

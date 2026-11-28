@@ -14,6 +14,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import { existsSync, readFileSync } from 'node:fs';
 import { Hono } from 'hono';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
@@ -21,15 +22,13 @@ import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import { PORT_FORWARD_API_PATH, PORT_FORWARD_ERRORS, PORT_FORWARD_TRANSPORT_PREF } from '../../shared/port-forward.js';
 import {
+  OWNER_MACHINE_AUTHORITY_FIELD,
+  SHARED_MACHINE_AUTHORITY_FIELD,
   SHARED_MACHINE_AUTHORITY_HEADER,
   TURN_AUTHORITY_REVOKE_CAPABILITY_V1,
   TURN_AUTHORITY_TOKEN_PREFIX,
 } from '../../shared/shared-machine-authority.js';
 import { MACHINE_ACTION } from '../../shared/machine-access-policy.js';
-import {
-  PgNotifyTurnAuthorityCluster,
-  type RemoteTurnAuthorityGrantMeta,
-} from '../src/share/turn-authority-cluster.js';
 import { redactSensitiveText } from '../../shared/redact-secrets.js';
 import { buildApp } from '../src/index.js';
 import { createDatabase, type Database } from '../src/db/client.js';
@@ -46,7 +45,6 @@ import {
   issueSharedMachineAuthorityForSession,
   resolveSharedMachineAuthority,
   revokeTurnAuthorityGrantsForTree,
-  setTurnAuthorityClusterVerifierForTests,
 } from '../src/share/shared-machine-authority.js';
 import { WsBridge } from '../src/ws/bridge.js';
 import { createPortForwardRoutes } from '../src/routes/port-forward.js';
@@ -863,165 +861,244 @@ describe('pure in-memory server-stateful opaque tree turn grants', () => {
     }
   });
 
-  it('P0 #4 cross-pod verification: Target Pod B validates Source Pod A pure-RAM grant via zero-persistence hash RPC without raw tokens or DB writes', async () => {
-    const podABusListeners = new Set<(channel: string, payload: string) => void>();
-    const wirePayloads: string[] = [];
-    const makePodCluster = (podId: string) => new PgNotifyTurnAuthorityCluster({
-      podId: () => podId,
-      rpcTimeoutMs: 250,
-      pgClientFactory: () => {
-        let onNotification: ((msg: { channel?: string; payload?: string }) => void) | null = null;
-        const listener = (channel: string, payload: string) => onNotification?.({ channel, payload });
-        return {
-          async connect() { podABusListeners.add(listener); },
-          async query() { return {}; },
-          on(ev: string, fn: (...args: any[]) => void) { if (ev === 'notification') onNotification = fn; },
-          async end() { podABusListeners.delete(listener); },
-        };
+  it('single-process pure RAM & ACK retry hardening: foreign/unseen tokens fail closed (403), zero pg_notify, and ACK timeout retry never mints or replaces newer grant', async () => {
+    // 1. Verify turn-authority-cluster.ts is removed and shared-machine-authority.ts has zero pg_notify/cluster DB calls.
+    expect(existsSync(new URL('../src/share/turn-authority-cluster.ts', import.meta.url))).toBe(false);
+    const authoritySrc = readFileSync(new URL('../src/share/shared-machine-authority.ts', import.meta.url), 'utf8');
+    expect(authoritySrc).not.toMatch(/pg_notify|LISTEN\s/i);
+
+    // 2. Unseen / foreign-process trg_ token fails closed immediately with 403 across all routes.
+    const unseenToken = `${TURN_AUTHORITY_TOKEN_PREFIX}unseen_foreign_pod_token_12345`;
+    const unseenHdrs = daemonHeaders(M_SHARED, TOK_SHARED, unseenToken);
+    expect((await pfApp.request(`/api/machine/exec?serverId=${CTL_O.id}`, {
+      method: 'POST',
+      headers: { ...unseenHdrs, 'content-type': 'application/json' },
+      body: JSON.stringify({ command: 'pwd' }),
+    })).status).toBe(403);
+    expect((await pfApp.request('/api/aliases', { headers: unseenHdrs })).status).toBe(403);
+
+    // 3. ACK timeout retry must NEVER re-mint or replace a newer turn's tree grant!
+    const daemonWs = await connectFakeBridgeDaemon(M_SHARED, TOK_SHARED);
+    daemonWs.emit('message', Buffer.from(JSON.stringify({
+      type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+      daemonId: M_SHARED,
+      helloEpoch: 1,
+      sentAt: Date.now(),
+      capabilities: [TURN_AUTHORITY_REVOKE_CAPABILITY_V1],
+    })), false);
+    await new Promise((r) => setTimeout(r, 30));
+    const bridge = WsBridge.get(M_SHARED);
+    const p1Ws = new FakeWs();
+    bridge.handleShareBrowserConnection(p1Ws as never, PART_P1, db, {
+      ticketId: `tkt-ack-p1-${tag}`,
+      target: SHARE_P1_PROJ1,
+      snapshot: {
+        target: SHARE_P1_PROJ1,
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        coveringShareIds: [`sh-ack-p1-${tag}`],
+        authorizedAt: Date.now(),
+        nextCoverageRecheckAt: null,
       },
     });
-    const fakeNotifyDb = {
-      async query(_sql: string, params?: unknown[]) {
-        const ch = String(params?.[0] ?? '');
-        const payload = String(params?.[1] ?? '');
-        wirePayloads.push(payload);
-        for (const fn of podABusListeners) fn(ch, payload);
-        return [];
+    const p2Ws = new FakeWs();
+    bridge.handleShareBrowserConnection(p2Ws as never, PART_P2, db, {
+      ticketId: `tkt-ack-p2-${tag}`,
+      target: SHARE_P2_PROJ1,
+      snapshot: {
+        target: SHARE_P2_PROJ1,
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        coveringShareIds: [`sh-p2-proj1-${tag}`],
+        authorizedAt: Date.now(),
+        nextCoverageRecheckAt: null,
       },
+    });
+    const p2Proj3Ws = new FakeWs();
+    bridge.handleShareBrowserConnection(p2Proj3Ws as never, PART_P2, db, {
+      ticketId: `tkt-ack-p2-proj3-${tag}`,
+      target: SHARE_P2_PROJ3,
+      snapshot: {
+        target: SHARE_P2_PROJ3,
+        effectiveRole: 'participant',
+        historyCutoffAt: 0,
+        coveringShareIds: [`sh-p2-proj3-${tag}`],
+        authorizedAt: Date.now(),
+        nextCoverageRecheckAt: null,
+      },
+    });
+
+    const waitForSentCommand = async (
+      predicate: (m: Record<string, unknown>) => boolean,
+      debugSockets: FakeWs[] = [],
+    ): Promise<Record<string, unknown>> => {
+      const deadline = Date.now() + 2_000;
+      while (Date.now() < deadline) {
+        const hit = daemonWs.sent
+          .map((s) => JSON.parse(s) as Record<string, unknown>)
+          .find(predicate);
+        if (hit) return hit;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      throw new Error(`Timed out waiting for daemonWs command. browserMsgs=${JSON.stringify(debugSockets.flatMap((w) => w.sent))}`);
     };
 
-    const podAStore = new Map<string, RemoteTurnAuthorityGrantMeta & { expiresAt: number }>();
-    const podA = makePodCluster('pod-a');
-    podA.bindLocalHandlers({
-      lookupLocalGrant(tokenHash, serverId, now) {
-        const g = podAStore.get(tokenHash);
-        if (g && g.serverId === serverId && g.expiresAt > now) {
-          return { found: true, grant: g };
-        }
-        return { found: false, ownsConnectedDaemon: true };
-      },
-      confirmAndSlideLocalGrant(tokenHash, serverId, expectedCreatedAt, now) {
-        const g = podAStore.get(tokenHash);
-        if (!g || g.serverId !== serverId || g.createdAt !== expectedCreatedAt || g.expiresAt <= now) return false;
-        g.expiresAt = Math.max(g.expiresAt, now + TURN_AUTHORITY_TTL_MS);
-        return true;
-      },
-    });
-    const podB = makePodCluster('pod-b');
-    await Promise.all([
-      podA.start('postgres://localhost/ignored', fakeNotifyDb as never),
-      podB.start('postgres://localhost/ignored', fakeNotifyDb as never),
-    ]);
-    setTurnAuthorityClusterVerifierForTests(podB);
     try {
-      // Simulate Pod A holding a participant P1 grant (`grantsByHash` on Pod B has NO record of `rawToken`!)
-      const rawToken = `${TURN_AUTHORITY_TOKEN_PREFIX}remote_pod_a_1234567890abcd`;
-      const t0 = Date.now();
-      podAStore.set(sha256(rawToken), {
-        tokenHash: sha256(rawToken),
-        serverId: M_SHARED,
-        rootSessionName: PROJ1_MAIN,
-        sessionName: PROJ1_CHILD,
-        projectName: `p1_${tag}`,
-        actorUserId: PART_P1,
-        ownerUserId: OWNER_O,
-        kind: 'participant',
-        shareTarget: SHARE_P1_PROJ1,
-        actionId: 'cross-pod-exec',
-        createdAt: t0,
-        expiresAt: t0 + TURN_AUTHORITY_TTL_MS,
-      });
+      // Turn A (P1) dispatched without ACK arriving yet -> mints tokA
+      p1Ws.emit('message', JSON.stringify({
+        type: 'session.send',
+        sessionName: PROJ1_MAIN,
+        commandId: 'cmd-ack-A',
+        text: 'from P1',
+      }));
+      const frameA1 = await waitForSentCommand((m) => m.commandId === 'cmd-ack-A', [p1Ws]);
+      const tokA = String(frameA1[SHARED_MACHINE_AUTHORITY_FIELD] ?? '');
+      expect(tokA.startsWith(TURN_AUTHORITY_TOKEN_PREFIX)).toBe(true);
 
-      const p1CrossPodHdrs = daemonHeaders(M_SHARED, TOK_SHARED, rawToken);
-      // Pod B admits P1's owned CTL_P1_OWN and denies O's private CTL_O
-      expect((await pfApp.request(`/api/machine/exec?serverId=${CTL_P1_OWN.id}`, {
-        method: 'POST',
-        headers: { ...p1CrossPodHdrs, 'content-type': 'application/json' },
-        body: JSON.stringify({ command: 'pwd' }),
-      })).status).toBe(200);
-      expect((await pfApp.request(`/api/machine/computer-use?serverId=${CTL_P1_OWN.id}`, {
-        method: 'POST',
-        headers: { ...p1CrossPodHdrs, 'content-type': 'application/json' },
-        body: JSON.stringify({ tool: 'list_apps' }),
-      })).status).toBe(200);
-      expect((await pfApp.request(`/api/machine/exec?serverId=${CTL_O.id}`, {
-        method: 'POST',
-        headers: { ...p1CrossPodHdrs, 'content-type': 'application/json' },
-        body: JSON.stringify({ command: 'pwd' }),
-      })).status).toBe(403);
+      // Turn B (P2) admitted on SAME tree -> invalidates tokA, mints tokB
+      p2Ws.emit('message', JSON.stringify({
+        type: 'session.send',
+        sessionName: PROJ1_MAIN,
+        commandId: 'cmd-ack-B',
+        text: 'from P2',
+      }));
+      const frameB1 = await waitForSentCommand((m) => m.commandId === 'cmd-ack-B', [p2Ws]);
+      const tokB = String(frameB1[SHARED_MACHINE_AUTHORITY_FIELD] ?? '');
+      expect(tokB.startsWith(TURN_AUTHORITY_TOKEN_PREFIX)).toBe(true);
+      expect(tokB).not.toBe(tokA);
 
-      // Cluster RPC payloads NEVER carry the raw trg_ token!
-      expect(wirePayloads.length).toBeGreaterThan(0);
-      expect(wirePayloads.some((p) => p.includes(rawToken))).toBe(false);
-
-      // Cross-pod TOCTOU: if Pod A revokes between lookup and confirmAndSlide, Pod B MUST reject!
-      let releaseConfirmAwait!: () => void;
-      const origConfirm = podB.confirmAndSlideGrant.bind(podB);
-      setTurnAuthorityClusterVerifierForTests({
-        lookupGrant: podB.lookupGrant.bind(podB),
-        async confirmAndSlideGrant(ownerPodId, th, srvId, createdAt, n) {
-          podAStore.delete(th);
-          await new Promise<void>((res) => { releaseConfirmAwait = res; setTimeout(res, 1); });
-          return origConfirm(ownerPodId, th, srvId, createdAt, n);
-        },
-      });
+      // Sanity before retry: tokA is already 403, tokB is active (PART_P2 -> 200 on CTL_P2_OWN)
       await expect(resolveSharedMachineAuthority(db, {
-        token: rawToken,
+        token: tokA,
         authenticatedSourceServerId: M_SHARED,
         sourceOwnerUserId: OWNER_O,
         now: Date.now(),
       })).resolves.toEqual({ kind: 'invalid' });
-      void releaseConfirmAwait;
-      setTurnAuthorityClusterVerifierForTests(podB);
-
-      // Once Pod A revokes/deletes the grant from its RAM, Pod B rejects immediately!
-      podAStore.delete(sha256(rawToken));
-      expect((await pfApp.request(`/api/machine/exec?serverId=${CTL_P1_OWN.id}`, {
+      expect((await pfApp.request(`/api/machine/exec?serverId=${CTL_P2_OWN.id}`, {
         method: 'POST',
-        headers: { ...p1CrossPodHdrs, 'content-type': 'application/json' },
+        headers: { ...daemonHeaders(M_SHARED, TOK_SHARED, tokB), 'content-type': 'application/json' },
         body: JSON.stringify({ command: 'pwd' }),
-      })).status).toBe(403);
+      })).status).toBe(200);
+
+      // Simulate ACK timeout on cmd-A triggering automatic bridge retry!
+      daemonWs.sent.length = 0;
+      (bridge as unknown as { onAckTimeout(commandId: string): void }).onAckTimeout('cmd-ack-A');
+      const retryA = await waitForSentCommand((m) => m.commandId === 'cmd-ack-A' && m.__bridgeRetry === true);
+      expect(retryA[SHARED_MACHINE_AUTHORITY_FIELD]).toBeUndefined();
+      expect(retryA[OWNER_MACHINE_AUTHORITY_FIELD]).toBeUndefined();
+
+      // After cmd-A retry: tokA stays 403 AND tokB MUST STILL BE VALID (never replaced/revoked by cmd-A retry)!
+      await expect(resolveSharedMachineAuthority(db, {
+        token: tokA,
+        authenticatedSourceServerId: M_SHARED,
+        sourceOwnerUserId: OWNER_O,
+        now: Date.now(),
+      })).resolves.toEqual({ kind: 'invalid' });
+      expect((await pfApp.request(`/api/machine/exec?serverId=${CTL_P2_OWN.id}`, {
+        method: 'POST',
+        headers: { ...daemonHeaders(M_SHARED, TOK_SHARED, tokB), 'content-type': 'application/json' },
+        body: JSON.stringify({ command: 'pwd' }),
+      })).status).toBe(200);
+
+      // Same ACK-retry guarantee for owner -> newer turn transition:
+      const ownerWs = new FakeWs();
+      bridge.handleBrowserConnection(ownerWs as never, OWNER_O, db);
+      ownerWs.emit('message', JSON.stringify({
+        type: 'session.send',
+        sessionName: PROJ3_MAIN,
+        commandId: 'cmd-ack-owner-A',
+        text: 'owner A',
+      }));
+      const ownerA = await waitForSentCommand((m) => m.commandId === 'cmd-ack-owner-A', [ownerWs]);
+      const ownerTokA = String(ownerA[OWNER_MACHINE_AUTHORITY_FIELD] ?? '');
+      expect(ownerTokA.startsWith(TURN_AUTHORITY_TOKEN_PREFIX)).toBe(true);
+
+      p2Proj3Ws.emit('message', JSON.stringify({
+        type: 'session.send',
+        sessionName: PROJ3_MAIN,
+        commandId: 'cmd-ack-part-B',
+        text: 'part B',
+      }));
+      const partB = await waitForSentCommand((m) => m.commandId === 'cmd-ack-part-B', [p2Proj3Ws]);
+      const partTokB = String(partB[SHARED_MACHINE_AUTHORITY_FIELD] ?? '');
+      expect(partTokB.startsWith(TURN_AUTHORITY_TOKEN_PREFIX)).toBe(true);
+
+      daemonWs.sent.length = 0;
+      (bridge as unknown as { onAckTimeout(commandId: string): void }).onAckTimeout('cmd-ack-owner-A');
+      const ownerRetryA = await waitForSentCommand((m) => m.commandId === 'cmd-ack-owner-A' && m.__bridgeRetry === true);
+      expect(ownerRetryA[OWNER_MACHINE_AUTHORITY_FIELD]).toBeUndefined();
+      await expect(resolveSharedMachineAuthority(db, {
+        token: partTokB,
+        authenticatedSourceServerId: M_SHARED,
+        sourceOwnerUserId: OWNER_O,
+        now: Date.now(),
+      })).resolves.toMatchObject({ kind: 'participant', actorUserId: PART_P2 });
+      ownerWs.close();
+      p1Ws.close();
+      p2Ws.close();
+      p2Proj3Ws.close();
     } finally {
-      setTurnAuthorityClusterVerifierForTests(null);
-      await Promise.all([podA.stop(), podB.stop()]);
+      daemonWs.close();
+      await new Promise((r) => setTimeout(r, 20));
     }
   });
 
-  it('P0 #5 FILE_LIST policy: denies group participant during delegated participantTurn without exec_granted while allowing browser UI', async () => {
+  it('P0 #5 same real DB user interactive vs delegated policy across group and non-granted direct share (file-handle & upload)', async () => {
+    const app = buildApp({ DB: db, JWT_SIGNING_KEY: JWT_KEY, BOT_ENCRYPTION_KEY: BOT_KEY, SERVER_URL: 'http://127.0.0.1:0' } as Env);
     const grpId = `grp-fl-${tag}`;
     const grpControlledId = `ctl-grp-${tag}`;
+    const directNoExecId = `ctl-dir-${tag}`;
     await seedControlled(grpControlledId, OWNER_O, 'Group-CTL');
-    await db.execute('INSERT INTO teams (id, name, owner_id, created_at) VALUES ($1,$2,$3,$4)', [grpId, 'Group FileList Test', OWNER_O, Date.now()]);
+    await seedControlled(directNoExecId, OWNER_O, 'Direct-NoExec-CTL');
+    await db.execute('INSERT INTO teams (id, name, owner_id, created_at) VALUES ($1,$2,$3,$4)', [grpId, 'Group File Test', OWNER_O, Date.now()]);
     await db.execute('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES ($1,$2,$3,$4)', [grpId, PART_P1, 'member', Date.now()]);
     await db.execute('INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1,$2,$3)', [grpControlledId, grpId, Date.now()]);
-
-    // Group membership alone grants accessSource='group', execGranted=false:
-    // Browser interactive FILE_LIST is allowed, whereas delegated participantTurn FILE_LIST MUST be denied!
-    await expect(admitMachineAction(db, {
-      token: undefined,
-      signingKey: JWT_KEY,
-      authenticatedSourceServerId: '',
-      sourceOwnerUserId: PART_P1,
-      targetServerId: grpControlledId,
-      action: MACHINE_ACTION.FILE_LIST,
+    await createOrUpdateShare(db, {
+      id: `sh-dir-noexec-${tag}`,
+      target: { kind: 'server', serverId: directNoExecId },
+      targetUserId: PART_P1,
+      role: 'participant',
+      createdBy: OWNER_O,
+      execGranted: false,
       now: Date.now(),
-    })).resolves.toMatchObject({ ok: true });
+    });
 
+    const p1WebAuth = { authorization: `Bearer ${signJwt({ sub: PART_P1, role: 'member' }, JWT_KEY, 3600)}` };
     const tokPart = (await issueSharedMachineAuthorityForSession(db, {
       actorUserId: PART_P1,
       sourceServerId: M_SHARED,
       sessionName: PROJ1_MAIN,
       shareTarget: SHARE_P1_PROJ1,
-      actionId: 'grp-fl-delegated',
+      actionId: 'grp-dir-interactive-vs-delegated',
     }))!;
-    await expect(admitMachineAction(db, {
-      token: tokPart,
-      signingKey: JWT_KEY,
-      authenticatedSourceServerId: M_SHARED,
-      sourceOwnerUserId: OWNER_O,
-      targetServerId: grpControlledId,
-      action: MACHINE_ACTION.FILE_LIST,
-      now: Date.now(),
-    })).resolves.toMatchObject({ ok: false });
+    const p1DelegatedHdrs = daemonHeaders(M_SHARED, TOK_SHARED, tokPart);
+
+    for (const targetId of [grpControlledId, directNoExecId]) {
+      // Interactive browser user (participantTurn=false): retains baseline FILE_LIST, machine-file-handle, and upload access (503 = passed policy gate, target offline).
+      expect((await app.request(`/api/server/${targetId}/machine-file-list`, {
+        method: 'POST', headers: { ...p1WebAuth, 'content-type': 'application/json' }, body: JSON.stringify({ path: ':drives:' }),
+      })).status).toBe(503);
+      expect((await app.request(`/api/server/${targetId}/machine-file-handle`, {
+        method: 'POST', headers: { ...p1WebAuth, 'content-type': 'application/json' }, body: JSON.stringify({ path: '/tmp/a.txt' }),
+      })).status).toBe(503);
+      const fd = new FormData();
+      fd.append('file', new File(['hi'], 'a.txt', { type: 'text/plain' }));
+      expect((await app.request(`/api/server/${targetId}/upload`, {
+        method: 'POST', headers: p1WebAuth, body: fd,
+      })).status).toBe(503);
+
+      // Same real DB user on delegated participantTurn without exec_granted=true: 403 across FILE_LIST, file-handle, upload, and exec!
+      expect((await app.request(`/api/server/${targetId}/machine-file-list`, {
+        method: 'POST', headers: { ...p1DelegatedHdrs, 'content-type': 'application/json' }, body: JSON.stringify({ path: ':drives:' }),
+      })).status).toBe(403);
+      expect((await app.request(`/api/server/${targetId}/machine-file-handle`, {
+        method: 'POST', headers: { ...p1DelegatedHdrs, 'content-type': 'application/json' }, body: JSON.stringify({ path: '/tmp/a.txt' }),
+      })).status).toBe(403);
+      const fdDelegated = new FormData();
+      fdDelegated.append('file', new File(['hi'], 'a.txt', { type: 'text/plain' }));
+      expect((await app.request(`/api/server/${targetId}/upload`, {
+        method: 'POST', headers: p1DelegatedHdrs, body: fdDelegated,
+      })).status).toBe(403);
+    }
   });
 });

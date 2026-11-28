@@ -14,6 +14,7 @@ import {
   markTreeSessionIdle,
   markTreeSessionIdleIfInactive,
   readActiveTreeAuthorityForSession,
+  readProcessSharedMachineActivityEpoch,
   registerTreeSessionActivityProbe,
   releaseProcessSharedMachineAuthority,
   resolveCanonicalTurnAuthority,
@@ -443,11 +444,16 @@ describe('daemon unified main-tree turn authority', () => {
     }, { now: t + 50 });
 
     expect(genSub).toBeGreaterThan(genMain);
-    // Prior token revoked immediately and tree poisoned to mixed
+    // Both prior P2 token and new conflicting P1 token are revoked immediately, and tree stays mixed fail-closed
     expect(sentFrames).toContainEqual({
       type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
       rootSessionName: main.name,
       tokenHash: sha256(tokP2),
+    });
+    expect(sentFrames).toContainEqual({
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName: main.name,
+      tokenHash: sha256(tokP1),
     });
     expect(readActiveTreeAuthorityForSession(main.name)).toMatchObject({ kind: 'mixed', authority: null });
 
@@ -500,104 +506,218 @@ describe('daemon unified main-tree turn authority', () => {
     })).toMatchObject({ required: true, isParticipantScoped: true, authority: null });
   });
 
-  it('P0 #2: revokes fast (<1500ms) turns via idle guard timer, failed task-pair inactive cleanup, error probe, and link disconnect + generation fence', async () => {
-    vi.useFakeTimers();
-    try {
-      const fastSess = seed({ name: 'deck_fast_brain', projectName: 'fast', role: 'brain', state: 'running' });
-      const tokFast = 'trg_fast_short_turn_111111111111';
-      let linkGen = 1;
-      let linkOpen = true;
-      setActiveServerLink({
-        send: (msg) => { sentFrames.push(msg as Record<string, unknown>); },
-        trySend: (msg) => {
-          if (!linkOpen) return false;
-          sentFrames.push(msg as Record<string, unknown>);
-          return true;
-        },
-        isConnected: () => linkOpen,
-        getConnectionGeneration: () => linkGen,
-      });
+  it('P0 #2: allows same sender (O or P1) follow-up turns across active tree sessions without mixed conflict and blocks stale token regression', async () => {
+    const main = seed({ name: 'deck_same_main', projectName: 'same', role: 'brain', state: 'running' });
+    const sub = seed({ name: 'deck_sub_same', projectName: 'same', role: 'w1', parentSession: main.name, state: 'running' });
+    const t = Date.now();
 
-      const t0 = Date.now();
-      bindProcessSharedMachineActivity(fastSess.name, idOf(fastSess), {
-        kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
-        authority: tokFast,
-      }, { now: t0 }).typed(t0);
+    // 1. Participant P1 active on main (`tokP1A`), then SAME P1 starts a follow-up turn on child (`tokP1B`).
+    const tokP1A = 'trg_same_p1_turn_aaaaaaaaaaaa1111';
+    const tokP1B = 'trg_same_p1_turn_bbbbbbbbbbbb2222';
+    const genA = bindTreeTurnAuthority(main.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokP1A,
+    }, { now: t });
+    const genB = bindTreeTurnAuthority(sub.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokP1B,
+    }, { now: t + 50 });
 
-      // Turn finishes in 300ms (< 1500ms idle guard) and session becomes idle
-      vi.advanceTimersByTime(300);
-      upsertSession({ ...fastSess, state: 'idle' });
-      releaseProcessSharedMachineAuthority(fastSess.name, Date.now());
-      await flushMicrotasks();
-      expect(sentFrames).toEqual([]);
+    expect(genB).toBeGreaterThan(genA);
+    expect(readActiveTreeAuthorityForSession(main.name)).toMatchObject({
+      kind: 'participant',
+      actorUserId: 'user-p1',
+      authority: tokP1B,
+    });
+    // Earlier-started main (`genA`, `tokP1A`) & child (`genB`, `tokP1B`) BOTH inherit live `tokP1B`!
+    const p1OldRuntime = {
+      sending: true,
+      activeDispatchEntries: [{ sharedActor: { effectiveActorRole: 'participant', actorUserId: 'user-p1' }, sharedMachineAuthority: tokP1A }],
+      requiresSharedMachineAuthority: () => true,
+      getActiveSharedMachineAuthority: () => tokP1A,
+      getActiveOwnerMachineAuthority: () => null,
+      activeTurnParticipantUserIds: () => ['user-p1'],
+      getActiveTreeGeneration: () => genA,
+    };
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: main.name,
+      identity: idOf(main),
+      sessionRunning: true,
+      now: t + 60,
+      runtime: p1OldRuntime,
+    })).toEqual({
+      required: true,
+      actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.PARTICIPANT,
+      authority: tokP1B,
+    });
+    expect(readSenderParticipantTurn(sub.name)).toEqual({ actorUserId: 'user-p1', authority: tokP1B });
 
-      // Advancing past 1500ms guard fires automatic recheck & revoke!
-      vi.advanceTimersByTime(1_300);
-      await flushMicrotasks();
-      expect(sentFrames).toEqual([{
-        type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
-        rootSessionName: fastSess.name,
-        tokenHash: sha256(tokFast),
-      }]);
+    // Stale callback attempting to re-bind superseded `tokP1A` CANNOT regress `tokP1B`!
+    const genStale = bindTreeTurnAuthority(main.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokP1A,
+    }, { now: t + 70 });
+    expect(genStale).toBe(genB);
+    expect(readActiveTreeAuthorityForSession(main.name)?.authority).toBe(tokP1B);
 
-      // Errored runtime + failed task-pair dispatch (`markTreeSessionIdleIfInactive`) both revoke cleanly
-      sentFrames.length = 0;
-      const errTok = 'trg_error_turn_22222222222222222';
-      const errSub = seed({ name: 'deck_sub_err', projectName: 'fast', role: 'w1', parentSession: fastSess.name });
-      let probeBusy = false;
-      unregisterProbe = registerTreeSessionActivityProbe((name) => name === errSub.name && probeBusy);
-      bindTreeTurnAuthority(fastSess.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: errTok }, { now: Date.now() });
-      markTreeSessionActive(errSub.name);
-      markTreeSessionIdleIfInactive(errSub.name);
-      markTreeSessionIdle(fastSess.name);
-      await flushMicrotasks();
-      expect(sentFrames).toEqual([{
-        type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
-        rootSessionName: fastSess.name,
-        tokenHash: sha256(errTok),
-      }]);
+    // Clear tree and test Owner O: child running on `tokO1`, SAME O starts new turn on main with `tokO2`.
+    markTreeSessionIdle(main.name, t + 80);
+    markTreeSessionIdle(sub.name, t + 80);
+    await flushMicrotasks();
+    sentFrames.length = 0;
 
-      // Disconnect scrubs treeAuthorities, windows, and resend RAM tokens + fences old link generation
-      sentFrames.length = 0;
-      const partSess = seed({ name: 'deck_dc_part', projectName: 'dc', role: 'brain', state: 'running' });
-      const tokDcPart = 'trg_dc_participant_333333333333';
-      bindProcessSharedMachineActivity(partSess.name, idOf(partSess), {
-        kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
-        actorUserId: 'user-p1',
-        authority: tokDcPart,
-      }, { now: Date.now(), sessionRunning: true }).typed(Date.now());
-      clearResend(partSess.name);
-      enqueueResend(partSess.name, {
-        commandId: 'cmd-dc-1',
-        text: 'hello',
-        queuedAt: Date.now(),
-        sharedActor: { actorUserId: 'user-p1', actorDisplayName: 'P1', effectiveActorRole: 'participant', actionId: 'a1', origin: 'shared-tab', authorizedAt: 1, primaryShareId: null, snapshot: { target: { kind: 'main', serverId: 's1', sessionName: partSess.name }, effectiveRole: 'participant', historyCutoffAt: 0, coveringShareIds: [], authorizedAt: 1, nextCoverageRecheckAt: null } },
-        sharedMachineAuthority: tokDcPart,
-      }, true);
+    const tokO1 = 'trg_same_owner_11111111111111111';
+    const tokO2 = 'trg_same_owner_22222222222222222';
+    const genO1 = bindTreeTurnAuthority(sub.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+      authority: tokO1,
+    }, { now: t + 100 });
+    const genO2 = bindTreeTurnAuthority(main.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+      authority: tokO2,
+    }, { now: t + 150 });
+    expect(genO2).toBeGreaterThan(genO1);
 
-      linkOpen = false;
-      clearAllDaemonTurnAuthoritiesOnDisconnect({ scrubResendQueues: scrubResendQueueTurnAuthorities });
+    const ownerOldChildRuntime = {
+      sending: true,
+      activeDispatchEntries: [{}],
+      requiresSharedMachineAuthority: () => false,
+      getActiveSharedMachineAuthority: () => null,
+      getActiveOwnerMachineAuthority: () => tokO1,
+      getActiveTreeGeneration: () => genO1,
+    };
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: sub.name,
+      identity: idOf(sub),
+      sessionRunning: true,
+      now: t + 160,
+      runtime: ownerOldChildRuntime,
+    })).toEqual({
+      required: false,
+      actorKind: SHARED_MACHINE_AUTHORITY_ACTOR_KIND.OWNER,
+      authority: tokO2,
+    });
+  });
 
-      // Active participant remains fail-closed (required: true, authority: null) with zero RAM tokens anywhere!
-      expect(readSenderParticipantTurn(partSess.name)).toEqual({ actorUserId: 'user-p1', authority: null });
-      expect(getResendEntries(partSess.name)[0]?.sharedMachineAuthority).toBeUndefined();
-      expect(getResendEntries(partSess.name)[0]?.sharedActor?.actorUserId).toBe('user-p1');
-      clearResend(partSess.name);
+  it('P0 #3: revokes fast turns immediately via matching activityEpoch, drops stale idle epochs, and settles stop/error windows', async () => {
+    const fastSess = seed({ name: 'deck_fast_brain', projectName: 'fast', role: 'brain', state: 'running' });
+    const tokFast = 'trg_fast_short_turn_111111111111';
+    let linkGen = 1;
+    let linkOpen = true;
+    setActiveServerLink({
+      send: (msg) => { sentFrames.push(msg as Record<string, unknown>); },
+      trySend: (msg) => {
+        if (!linkOpen) return false;
+        sentFrames.push(msg as Record<string, unknown>);
+        return true;
+      },
+      isConnected: () => linkOpen,
+      getConnectionGeneration: () => linkGen,
+    });
 
-      // Reconnecting at generation 2 must ignore late idle revoke from generation 1 tree entry
-      linkGen = 2;
-      linkOpen = true;
-      const gen1Tok = 'trg_gen1_old_44444444444444444444';
-      const genSess = seed({ name: 'deck_gen_fence', projectName: 'gf', role: 'brain' });
-      linkGen = 1;
-      bindTreeTurnAuthority(genSess.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: gen1Tok }, { now: Date.now() });
-      linkGen = 2;
-      markTreeSessionIdle(genSess.name);
-      await flushMicrotasks();
-      expect(sentFrames).toEqual([]);
-    } finally {
-      vi.useRealTimers();
-    }
+    const t0 = Date.now();
+    bindProcessSharedMachineActivity(fastSess.name, idOf(fastSess), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+      authority: tokFast,
+    }, { now: t0 }).typed(t0);
+    const epoch1 = readProcessSharedMachineActivityEpoch(fastSess.name)!;
+    expect(typeof epoch1).toBe('number');
+
+    // Turn finishes in 300ms (< 1500ms) with matching activityEpoch -> revokes IMMEDIATELY (0ms wait)!
+    upsertSession({ ...fastSess, state: 'idle' });
+    releaseProcessSharedMachineAuthority(fastSess.name, { now: t0 + 300, expectedActivityEpoch: epoch1 });
+    await flushMicrotasks();
+    expect(sentFrames).toEqual([{
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName: fastSess.name,
+      tokenHash: sha256(tokFast),
+    }]);
+
+    // Stale idle carrying old epoch1 after turn 2 bound (epoch2) MUST NOT revoke turn 2!
+    sentFrames.length = 0;
+    const tokTurn2 = 'trg_turn2_keep_alive_2222222222';
+    upsertSession({ ...fastSess, state: 'running' });
+    bindProcessSharedMachineActivity(fastSess.name, idOf(fastSess), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER,
+      authority: tokTurn2,
+    }, { now: t0 + 400 }).typed(t0 + 400);
+    const epoch2 = readProcessSharedMachineActivityEpoch(fastSess.name)!;
+    expect(epoch2).toBeGreaterThan(epoch1);
+
+    releaseProcessSharedMachineAuthority(fastSess.name, { now: t0 + 450, expectedActivityEpoch: epoch1 });
+    await flushMicrotasks();
+    expect(sentFrames).toEqual([]);
+    expect(readActiveTreeAuthorityForSession(fastSess.name)?.authority).toBe(tokTurn2);
+
+    // Stop / error path uses `forceSettle: true`: clears window (`turns > 0`) AND revokes tree authority immediately!
+    upsertSession({ ...fastSess, state: 'stopped' });
+    releaseProcessSharedMachineAuthority(fastSess.name, { forceSettle: true });
+    await flushMicrotasks();
+    expect(sentFrames).toEqual([{
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName: fastSess.name,
+      tokenHash: sha256(tokTurn2),
+    }]);
+    expect(readActiveTreeAuthorityForSession(fastSess.name)).toBeNull();
+
+    // Errored runtime + failed task-pair dispatch (`markTreeSessionIdleIfInactive`) both revoke cleanly
+    sentFrames.length = 0;
+    const errTok = 'trg_error_turn_22222222222222222';
+    const errSub = seed({ name: 'deck_sub_err', projectName: 'fast', role: 'w1', parentSession: fastSess.name });
+    let probeBusy = false;
+    unregisterProbe = registerTreeSessionActivityProbe((name) => name === errSub.name && probeBusy);
+    bindTreeTurnAuthority(fastSess.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: errTok }, { now: Date.now() });
+    markTreeSessionActive(errSub.name);
+    markTreeSessionIdleIfInactive(errSub.name);
+    markTreeSessionIdle(fastSess.name);
+    await flushMicrotasks();
+    expect(sentFrames).toEqual([{
+      type: DAEMON_MSG.TURN_AUTHORITY_REVOKE,
+      rootSessionName: fastSess.name,
+      tokenHash: sha256(errTok),
+    }]);
+
+    // Disconnect scrubs treeAuthorities, windows, and resend RAM tokens + fences old link generation
+    sentFrames.length = 0;
+    const partSess = seed({ name: 'deck_dc_part', projectName: 'dc', role: 'brain', state: 'running' });
+    const tokDcPart = 'trg_dc_participant_333333333333';
+    bindProcessSharedMachineActivity(partSess.name, idOf(partSess), {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokDcPart,
+    }, { now: Date.now(), sessionRunning: true }).typed(Date.now());
+    clearResend(partSess.name);
+    enqueueResend(partSess.name, {
+      commandId: 'cmd-dc-1',
+      text: 'hello',
+      queuedAt: Date.now(),
+      sharedActor: { actorUserId: 'user-p1', actorDisplayName: 'P1', effectiveActorRole: 'participant', actionId: 'a1', origin: 'shared-tab', authorizedAt: 1, primaryShareId: null, snapshot: { target: { kind: 'main', serverId: 's1', sessionName: partSess.name }, effectiveRole: 'participant', historyCutoffAt: 0, coveringShareIds: [], authorizedAt: 1, nextCoverageRecheckAt: null } },
+      sharedMachineAuthority: tokDcPart,
+    }, true);
+
+    linkOpen = false;
+    clearAllDaemonTurnAuthoritiesOnDisconnect({ scrubResendQueues: scrubResendQueueTurnAuthorities });
+
+    // Active participant remains fail-closed (required: true, authority: null) with zero RAM tokens anywhere!
+    expect(readSenderParticipantTurn(partSess.name)).toEqual({ actorUserId: 'user-p1', authority: null });
+    expect(getResendEntries(partSess.name)[0]?.sharedMachineAuthority).toBeUndefined();
+    expect(getResendEntries(partSess.name)[0]?.sharedActor?.actorUserId).toBe('user-p1');
+    clearResend(partSess.name);
+
+    // Reconnecting at generation 2 must ignore late idle revoke from generation 1 tree entry
+    linkGen = 2;
+    linkOpen = true;
+    const gen1Tok = 'trg_gen1_old_44444444444444444444';
+    const genSess = seed({ name: 'deck_gen_fence', projectName: 'gf', role: 'brain' });
+    linkGen = 1;
+    bindTreeTurnAuthority(genSess.name, { kind: SHARED_MACHINE_ACTIVITY_KIND.OWNER, authority: gen1Tok }, { now: Date.now() });
+    linkGen = 2;
+    markTreeSessionIdle(genSess.name);
+    await flushMicrotasks();
+    expect(sentFrames).toEqual([]);
   });
 
   it('P0 #4: source daemon HTTP clients always include ?serverId= for ingress sticky pod routing', async () => {

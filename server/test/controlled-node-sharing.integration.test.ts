@@ -285,7 +285,7 @@ describe('controlled-node sharing reuses grants without becoming a shared Tab', 
     expect(promote.status).toBe(200);
     const participantList = await app.request('/api/machines', { headers: webAuth(recipientId) });
     expect(await participantList.json()).toEqual({
-      machines: [expect.objectContaining({ serverId, accessRole: 'participant', execEnabled: false, execGranted: false })],
+      machines: [expect.objectContaining({ serverId, accessRole: 'participant', execEnabled: true, execGranted: false })],
     });
 
     const nonOwnerManage = await app.request(`/api/server/${serverId}/shares`, {
@@ -1070,11 +1070,12 @@ describe('a shared-session participant reaches only the machines shared with the
     expect(await listed(t.app, t.delegated)).toContain(node);
     expect((await computerUse(t.app, t.ownerTurn, node)).status).toBe(403);
     expect((await computerUse(t.app, t.delegated, node)).status).toBe(200);
-    // Group membership alone grants operate/view + FILE_LIST, not execute without an explicit exec_granted share.
+    // Delegated participant turns require explicit exec_granted; interactive same-user file handle retains baseline access.
     expect((await exec(t.app, t.delegated, node)).status).toBe(403);
     expect((await fileHandle(t.app, t.delegated, node)).status).toBe(403);
+    expect((await fileHandle(t.app, webAuth(t.participantId), node)).status).toBe(503);
     const browser = await (await t.app.request('/api/machines', { headers: webAuth(t.participantId) })).json();
-    expect(browser.machines.find((m: {serverId: string}) => m.serverId === node)).toMatchObject({ accessRole: 'participant', canExecute: false, execEnabled: false, execGranted: false, accessSource: 'group' });
+    expect(browser.machines.find((m: {serverId: string}) => m.serverId === node)).toMatchObject({ accessRole: 'participant', canExecute: true, execEnabled: true, execGranted: false, accessSource: 'group' });
     expect(browser.machines.find((m: {serverId: string}) => m.serverId === node).canRename === true).toBe(role !== 'member');
     expect((await t.app.request(`/api/machines/${node}/display-name`, { method:'POST',headers:webAuth(t.participantId),body:JSON.stringify({displayName:'Group label'}) })).status).toBe(role === 'member' ? 404 : 200);
     for (const action of ['exec-enabled', 'upgrade', 'remote-desktop-worker', 'revoke']) {
@@ -1114,10 +1115,14 @@ describe('a shared-session participant reaches only the machines shared with the
       expect((await computerUse(t.app,t.delegated,node)).status).toBe(403);
       expect(await listed(t.app,t.delegated)).not.toContain(node);
       expect((await client.callTool({name:MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL,arguments:{machine:nodeId,tool:'list_apps'}})).isError).toBe(true);
-      // An actor's explicit grant works without source-owner target authority, and ends live.
-      await createMachineGrant({ownerId:peer,recipientId:t.participantId,serverId:node,role:'participant'});
+      // Same DB user without exec_granted: interactive browser fileHandle works, delegated participant turn fails closed;
+      // adding exec_granted allows delegated fileHandle until share revocation.
+      await createMachineGrant({ownerId:peer,recipientId:t.participantId,serverId:node,role:'participant',exec:false});
       expect((await computerUse(t.app,t.delegated,node)).status).toBe(200);
-      expect((await fileHandle(t.app,t.delegated,node)).status).toBe(503); // admitted, offline target, not an owner-fleet denial
+      expect((await fileHandle(t.app,webAuth(t.participantId),node)).status).toBe(503);
+      expect((await fileHandle(t.app,t.delegated,node)).status).toBe(403);
+      await db.execute('UPDATE server_shares SET exec_granted=true WHERE server_id=$1 AND target_user_id=$2',[node,t.participantId]);
+      expect((await fileHandle(t.app,t.delegated,node)).status).toBe(503);
       await db.execute('UPDATE server_shares SET revoked_at=$3 WHERE server_id=$1 AND target_user_id=$2',[node,t.participantId,Date.now()]);
       expect((await fileHandle(t.app,t.delegated,node)).status).toBe(403);
     } finally { await client.close(); await mcp.close(); }

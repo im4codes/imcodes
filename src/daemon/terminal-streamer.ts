@@ -25,6 +25,7 @@ import { isWatching as isCodexWatching } from './codex-watcher.js';
 import logger from '../util/logger.js';
 import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { readProcessSharedMachineActivityEpoch } from './shared-machine-authority-context.js';
 import { emitSessionInlineError } from './session-error.js';
 import type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 import { TERMINAL_MAX_COLS, TERMINAL_MAX_ROWS } from '../shared/transport/terminal.js';
@@ -1360,6 +1361,7 @@ export class TerminalStreamer {
 
   private resetIdleTimer(sessionName: string): void {
     this.clearIdleTimer(sessionName);
+    const idleActivityEpoch = readProcessSharedMachineActivityEpoch(sessionName);
     const timer = setTimeout(() => {
       this.idleTimers.delete(sessionName);
       const currentlyIdle = this.idleState.get(sessionName) ?? false;
@@ -1369,7 +1371,10 @@ export class TerminalStreamer {
       }
       if (!currentlyIdle) {
         this.idleState.set(sessionName, true);
-        timelineEmitter.emit(sessionName, 'session.state', { state: 'idle' });
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: 'idle',
+          ...(idleActivityEpoch !== null ? { activityEpoch: idleActivityEpoch } : {}),
+        });
         if (sess) upsertSession({ ...sess, state: 'idle', updatedAt: Date.now() });
       }
     }, IDLE_THRESHOLD_MS);

@@ -7,6 +7,7 @@ import { join, basename } from 'path';
 import { homedir } from 'os';
 import { execFileOffMain } from '../util/exec-helper.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { readProcessSharedMachineActivityEpoch } from './shared-machine-authority-context.js';
 import { buildSessionBootstrapContextWithItems, buildCodexMemoryEntry } from './memory-inject.js';
 import { recentSummaryFingerprintsFromItems } from '../context/summary-sync.js';
 import { recordSyncedSummaryFingerprints } from '../context/summary-sync-history.js';
@@ -210,8 +211,10 @@ function emitSessionState(sessionName: string, state: 'running' | 'idle'): void 
       watcher.noTextRetrackAttempted = false;
     }
   }
+  const idleActivityEpoch = state === 'idle' ? readProcessSharedMachineActivityEpoch(sessionName) : null;
   timelineEmitter.emit(sessionName, 'session.state', {
     state,
+    ...(idleActivityEpoch !== null ? { activityEpoch: idleActivityEpoch } : {}),
     ...(historyReplaySessions.has(sessionName) ? { [TIMELINE_SUPPRESS_PUSH_FIELD]: true } : {}),
   }, { source: 'daemon', confidence: 'high' });
   updateSessionState(sessionName, state);

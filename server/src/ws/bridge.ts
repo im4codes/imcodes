@@ -12590,6 +12590,7 @@ export class WsBridge {
       )
     ) return;
     let effectiveRawPayload = entry.rawPayload;
+    const isRetryDispatch = markBridgeRetry || entry.dispatchAttempts > 0;
     if (this.rawPayloadType(effectiveRawPayload) === 'session.send') {
       try {
         const parsed = JSON.parse(effectiveRawPayload) as Record<string, unknown>;
@@ -12598,7 +12599,15 @@ export class WsBridge {
           const existingToken = typeof parsed[SHARED_MACHINE_AUTHORITY_FIELD] === 'string'
             ? String(parsed[SHARED_MACHINE_AUTHORITY_FIELD])
             : null;
-          if (!existingToken || !isTurnAuthorityGrantActive(existingToken, shareClockNow())) {
+          if (isRetryDispatch) {
+            // An ACK-timeout retry or post-dispatch replay must NEVER mint or replace
+            // the tree's newer turn grant: reuse a still-live grant or strip stale tokens.
+            if (existingToken && !isTurnAuthorityGrantActive(existingToken, shareClockNow())) {
+              const { [SHARED_MACHINE_AUTHORITY_FIELD]: _stale, ...withoutToken } = parsed;
+              effectiveRawPayload = JSON.stringify(withoutToken);
+              entry.rawPayload = effectiveRawPayload;
+            }
+          } else if (!existingToken || !isTurnAuthorityGrantActive(existingToken, shareClockNow())) {
             const minted = actor ? await this.issueShareMachineAuthority(actor, entry.sessionName) : null;
             if (
               expectedConnection
@@ -12618,38 +12627,46 @@ export class WsBridge {
             effectiveRawPayload = JSON.stringify({ ...parsed, [SHARED_MACHINE_AUTHORITY_FIELD]: minted });
             entry.rawPayload = effectiveRawPayload;
           }
-        } else if (
-          this.isDaemonConnected()
-          && this.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1)
-          && this.db
-          && this.directFileTransferTicketSigningKey
-        ) {
+        } else {
           const existingOwnerToken = typeof parsed[OWNER_MACHINE_AUTHORITY_FIELD] === 'string'
             ? String(parsed[OWNER_MACHINE_AUTHORITY_FIELD])
             : null;
-          const ownerUserId = this.daemonOwnerUserId;
-          if ((!existingOwnerToken || !isTurnAuthorityGrantActive(existingOwnerToken, shareClockNow())) && ownerUserId) {
-            const mintedOwner = await issueOwnerMachineAuthorityForSession(this.db, {
-              actorUserId: ownerUserId,
-              sourceServerId: this.serverId,
-              sessionName: entry.sessionName,
-              projectName: this.activeMainSessions.get(entry.sessionName)?.project,
-              actionId: entry.commandId,
-              signingKey: this.directFileTransferTicketSigningKey,
-            });
-            if (
-              expectedConnection
-              && (
-                this.daemonWs !== expectedConnection.ws
-                || this.daemonGeneration !== expectedConnection.generation
-              )
-            ) {
-              if (mintedOwner) revokeTurnAuthorityGrantByToken(this.serverId, mintedOwner);
-              return;
-            }
-            if (mintedOwner) {
-              effectiveRawPayload = JSON.stringify({ ...parsed, [OWNER_MACHINE_AUTHORITY_FIELD]: mintedOwner });
+          if (isRetryDispatch) {
+            if (existingOwnerToken && !isTurnAuthorityGrantActive(existingOwnerToken, shareClockNow())) {
+              const { [OWNER_MACHINE_AUTHORITY_FIELD]: _staleOwner, ...withoutOwnerToken } = parsed;
+              effectiveRawPayload = JSON.stringify(withoutOwnerToken);
               entry.rawPayload = effectiveRawPayload;
+            }
+          } else if (
+            this.isDaemonConnected()
+            && this.hasDaemonCapability(TURN_AUTHORITY_REVOKE_CAPABILITY_V1)
+            && this.db
+            && this.directFileTransferTicketSigningKey
+          ) {
+            const ownerUserId = this.daemonOwnerUserId;
+            if ((!existingOwnerToken || !isTurnAuthorityGrantActive(existingOwnerToken, shareClockNow())) && ownerUserId) {
+              const mintedOwner = await issueOwnerMachineAuthorityForSession(this.db, {
+                actorUserId: ownerUserId,
+                sourceServerId: this.serverId,
+                sessionName: entry.sessionName,
+                projectName: this.activeMainSessions.get(entry.sessionName)?.project,
+                actionId: entry.commandId,
+                signingKey: this.directFileTransferTicketSigningKey,
+              });
+              if (
+                expectedConnection
+                && (
+                  this.daemonWs !== expectedConnection.ws
+                  || this.daemonGeneration !== expectedConnection.generation
+                )
+              ) {
+                if (mintedOwner) revokeTurnAuthorityGrantByToken(this.serverId, mintedOwner);
+                return;
+              }
+              if (mintedOwner) {
+                effectiveRawPayload = JSON.stringify({ ...parsed, [OWNER_MACHINE_AUTHORITY_FIELD]: mintedOwner });
+                entry.rawPayload = effectiveRawPayload;
+              }
             }
           }
         }
@@ -12661,7 +12678,7 @@ export class WsBridge {
       ? this.withBridgeRetryMarker(effectiveRawPayload, entry.dispatchAttempts + 1)
       : effectiveRawPayload;
     this.sendToDaemon(rawPayload);
-    if (this.rawPayloadType(entry.rawPayload) === 'session.send') {
+    if (!isRetryDispatch && this.rawPayloadType(entry.rawPayload) === 'session.send') {
       this.activeDispatchIds.set(entry.sessionName, entry.commandId);
     }
     entry.dispatchAttempts += 1;
