@@ -400,6 +400,61 @@ describe('SharedContextManagementPanel', () => {
     expect(sent.filter((m) => m.type === MEMORY_WS.MCP_STATUS_QUERY).length).toBeGreaterThan(mcpQueriesBefore);
   });
 
+  it('ignores stale concurrent runtime-config responses/errors when hero refresh or reload races', async () => {
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await flush();
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    await flush();
+
+    const first = deferred<Awaited<ReturnType<typeof fetchSharedContextRuntimeConfigMock>>>();
+    const second = deferred<Awaited<ReturnType<typeof fetchSharedContextRuntimeConfigMock>>>();
+    fetchSharedContextRuntimeConfigMock
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByText('sharedContext.refresh')[0]);
+      fireEvent.click(screen.getAllByText('sharedContext.refresh')[0]);
+    });
+
+    await act(async () => {
+      second.resolve({
+        snapshot: {
+          persisted: {
+            primaryContextBackend: 'claude-code-sdk',
+            primaryContextModel: 'opus',
+            backupContextBackend: 'codex-sdk',
+            backupContextModel: 'gpt-6-luna',
+            enablePersonalMemorySync: false,
+          },
+          effective: {
+            primaryContextBackend: 'claude-code-sdk',
+            primaryContextModel: 'opus',
+            backupContextBackend: 'codex-sdk',
+            backupContextModel: 'gpt-6-luna',
+            enablePersonalMemorySync: false,
+          },
+          envPrimaryOverrideActive: false,
+          envBackupOverrideActive: false,
+          defaultPrimaryContextBackend: 'codex-sdk',
+          defaultPrimaryContextModel: 'gpt-6-luna',
+        },
+      });
+      await second.promise;
+    });
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('opus');
+
+    await act(async () => {
+      first.reject(new ApiError(500, 'stale_error'));
+      await first.promise.catch(() => undefined);
+    });
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('opus');
+    expect(document.querySelector('[data-load-error="runtimeConfig"]')).toBeNull();
+  });
+
   it('loads and saves server-backed processing config', async () => {
     render(<SharedContextManagementPanel serverId="srv-1" />);
     await flush();

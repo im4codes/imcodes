@@ -181,4 +181,59 @@ describe('AgentSkillsPanel', () => {
     emptyView.rerender(h(AgentSkillsPanel, { refreshSignal: 1 }));
     await waitFor(() => expect(listAgentSkills).not.toHaveBeenCalled());
   });
+
+  it('ignores stale concurrent refresh and machine-switch rejections/responses after a newer load settles', async () => {
+    const view = render(h(AgentSkillsPanel, { serverId: 'mac', refreshSignal: 0 }));
+    await screen.findByText('wecomcli-doc');
+
+    let rejectFirst!: (err: Error) => void;
+    const firstPending = new Promise<Awaited<ReturnType<typeof listAgentSkills>>>((_res, rej) => {
+      rejectFirst = rej;
+    });
+    let resolveSecond!: (rows: Awaited<ReturnType<typeof listAgentSkills>>) => void;
+    const secondPending = new Promise<Awaited<ReturnType<typeof listAgentSkills>>>((res) => {
+      resolveSecond = res;
+    });
+
+    listAgentSkills
+      .mockReturnValueOnce(firstPending)
+      .mockReturnValueOnce(secondPending);
+
+    view.rerender(h(AgentSkillsPanel, { serverId: 'mac', refreshSignal: 1 }));
+    view.rerender(h(AgentSkillsPanel, { serverId: 'mac', refreshSignal: 2 }));
+
+    resolveSecond([{ name: 'fresh-skill', description: 'Latest skills list' }]);
+    expect(await screen.findByText('fresh-skill')).toBeDefined();
+
+    rejectFirst(new Error('500'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.getByText('fresh-skill')).toBeDefined();
+    expect(screen.queryByText('sharedContext.management.agentSkills.loadFailed')).toBeNull();
+
+    // Also verify a pending machine-A load cannot overwrite a newer machine-B result.
+    let rejectOldMachine!: (err: Error) => void;
+    const oldMachinePending = new Promise<Awaited<ReturnType<typeof listAgentSkills>>>((_res, rej) => {
+      rejectOldMachine = rej;
+    });
+    listAgentSkills
+      .mockReturnValueOnce(oldMachinePending)
+      .mockResolvedValueOnce([{ name: 'linux-skill', description: 'On linux' }]);
+
+    view.rerender(h(AgentSkillsPanel, { serverId: 'mac', refreshSignal: 3 }));
+    const machineSelect = await screen.findByLabelText('sharedContext.management.agentSkills.machineLabel') as HTMLSelectElement;
+    await screen.findByRole('option', { name: 'vm-124' });
+    machineSelect.value = 'linux';
+    fireEvent(machineSelect, new Event('change', { bubbles: true }));
+
+    expect(await screen.findByText('linux-skill')).toBeDefined();
+
+    rejectOldMachine(new Error('stale machine failed'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(screen.getByText('linux-skill')).toBeDefined();
+    expect(screen.queryByText('sharedContext.management.agentSkills.loadFailed')).toBeNull();
+  });
 });

@@ -65,25 +65,39 @@ export function AgentSkillsPanel({ serverId, refreshSignal }: Props) {
   const [found, setFound] = useState<AgentSkillSearchResult[] | null>(null);
   const [selected, setSelected] = useState<AgentSkillSearchResult | null>(null);
   const [audit, setAudit] = useState<AuditState | null>(null);
+  const loadGenerationRef = useRef(0);
+
+  useEffect(() => () => {
+    loadGenerationRef.current += 1;
+  }, []);
 
   useEffect(() => {
     setMachineId(serverId);
   }, [serverId]);
 
   const load = useCallback(async () => {
-    if (!machineId) {
+    const generation = ++loadGenerationRef.current;
+    const targetMachineId = machineId;
+    if (!targetMachineId) {
       setSkills([]);
+      setLoadError(false);
+      setLoading(false);
       return;
     }
     setLoading(true);
     setLoadError(false);
     try {
-      setSkills(await listAgentSkills(machineId));
+      const nextSkills = await listAgentSkills(targetMachineId);
+      if (loadGenerationRef.current !== generation) return;
+      setSkills(nextSkills);
     } catch {
+      if (loadGenerationRef.current !== generation) return;
       setSkills([]);
       setLoadError(true);
     } finally {
-      setLoading(false);
+      if (loadGenerationRef.current === generation) {
+        setLoading(false);
+      }
     }
   }, [machineId]);
 
@@ -114,8 +128,12 @@ export function AgentSkillsPanel({ serverId, refreshSignal }: Props) {
       const settled = await Promise.all(ids.map(async (id) => ({ serverId: id, ...(await runAgentSkills(id, request)) })));
       setResults(settled);
       const current = settled.find((result) => result.serverId === machineId);
-      if (current?.skills) setSkills(current.skills);
-      else await load();
+      if (current?.skills) {
+        loadGenerationRef.current += 1;
+        setSkills(current.skills);
+      } else {
+        await load();
+      }
     } finally {
       setBusy(null);
     }

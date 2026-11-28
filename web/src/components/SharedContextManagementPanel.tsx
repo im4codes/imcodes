@@ -1240,6 +1240,7 @@ export function SharedContextManagementPanel({ serverId, ws, memoryProjectCandid
   const { t } = useTranslation();
   const personalMemoryRequestIdRef = useRef<string | null>(null);
   const memoryViewGenerationRef = useRef(0);
+  const processingConfigGenerationRef = useRef(0);
   const personalMemoryStatusTimerRef = useRef<TimeoutHandle | null>(null);
   const memoryFeaturesStatusTimerRef = useRef<TimeoutHandle | null>(null);
   const mcpStatusTimerRef = useRef<TimeoutHandle | null>(null);
@@ -2022,9 +2023,11 @@ export function SharedContextManagementPanel({ serverId, ws, memoryProjectCandid
   }, [applyProcessingSnapshot]);
 
   const reloadProcessingConfig = useCallback(async (options?: { preserveDirtyModelDraft?: boolean }) => {
+    const generation = ++processingConfigGenerationRef.current;
     if (!serverId) {
       loadedProcessingServerIdRef.current = undefined;
       clearLoadError(PANEL_LOAD_SECTIONS.RUNTIME_CONFIG);
+      setProcessingLoading(false);
       setProcessingSnapshot(null);
       setProcessingModelSelectionMode('auto');
       setProcessingPrimaryBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
@@ -2046,6 +2049,7 @@ export function SharedContextManagementPanel({ serverId, ws, memoryProjectCandid
     }
     try {
       const view = await fetchSharedContextRuntimeConfig(serverId);
+      if (processingConfigGenerationRef.current !== generation) return;
       const shouldPreserveDraft = options?.preserveDirtyModelDraft === true
         && loadedProcessingServerIdRef.current === serverId
         && isProcessingModelDraftDirtyRef.current;
@@ -2056,11 +2060,14 @@ export function SharedContextManagementPanel({ serverId, ws, memoryProjectCandid
         applyProcessingSnapshot(view);
       }
     } catch (err) {
+      if (processingConfigGenerationRef.current !== generation) return;
       // 404 here is the server not being the account's own (or being unknown): the
       // processing defaults stay on screen and the line below says why.
       reportLoadError(PANEL_LOAD_SECTIONS.RUNTIME_CONFIG, err);
     } finally {
-      setProcessingLoading(false);
+      if (processingConfigGenerationRef.current === generation) {
+        setProcessingLoading(false);
+      }
     }
   }, [applyMemorySettingsSnapshot, applyProcessingSnapshot, clearLoadError, reportLoadError, serverId]);
 
