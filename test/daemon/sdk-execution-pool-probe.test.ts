@@ -883,19 +883,62 @@ describe('probeExecutionPoolSdks', () => {
       }
     }
 
-    // 2. Async COMMIT timeout under parent-controlled SHARED lock (released only in finally after rejection).
-    const asyncTimeoutReader = spawnSharedReader();
-    await asyncTimeoutReader.readyPromise;
-    try {
-      await expect(upsertModelTierKnowledge(
-        [{ provider: 'codex-sdk', model: 'gpt-commit-timeout-async', tier: 'secondary' }],
-        knowledgeFile,
-        2_000,
-        { lockTimeoutMs: 15 },
-      )).rejects.toThrow(/Timed out committing model-tier-knowledge lock/);
-    } finally {
-      await asyncTimeoutReader.release();
-    }
+    // Shared helper for deterministic COMMIT-timeout verification under parent-controlled SHARED lock:
+    // keeps Date.now() fixed until the first real COMMIT SQLITE_BUSY is caught, so even a pre-BEGIN
+    // scheduling/PRAGMA stall never causes a false acquiring timeout before reaching COMMIT.
+    const runCommitTimeoutCase = async (
+      mode: 'async' | 'sync',
+      model: string,
+      recordNow: number,
+      preBeginStallMs = 0,
+    ) => {
+      const reader = spawnSharedReader();
+      await reader.readyPromise;
+      const origExec = DatabaseSync.prototype.exec;
+      let commitBusySeen = false;
+      const executedSql: string[] = [];
+      const execSpy = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: InstanceType<typeof DatabaseSync>, sql: string) {
+        executedSql.push(sql);
+        if (sql === 'PRAGMA busy_timeout = 0;' && preBeginStallMs > 0) {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, preBeginStallMs);
+        }
+        try {
+          return origExec.call(this, sql);
+        } catch (err) {
+          if (sql === 'COMMIT;') commitBusySeen = true;
+          throw err;
+        }
+      });
+      const baseNow = 2_000_000;
+      const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => (commitBusySeen ? baseNow + 30 : baseNow));
+      try {
+        if (mode === 'async') {
+          await expect(upsertModelTierKnowledge(
+            [{ provider: 'codex-sdk', model, tier: 'secondary' }],
+            knowledgeFile,
+            recordNow,
+            { lockTimeoutMs: 15 },
+          )).rejects.toThrow(/Timed out committing model-tier-knowledge lock/);
+        } else {
+          expect(() => upsertModelTierKnowledgeSync(
+            [{ provider: 'codex-sdk', model, tier: 'secondary' }],
+            knowledgeFile,
+            recordNow,
+            { lockTimeoutMs: 15 },
+          )).toThrow(/Timed out committing model-tier-knowledge lock/);
+        }
+        expect(executedSql).toContain('COMMIT;');
+        expect(executedSql).toContain('ROLLBACK;');
+      } finally {
+        nowSpy.mockRestore();
+        execSpy.mockRestore();
+        await reader.release();
+      }
+    };
+
+    // 2. Async COMMIT timeout (normal + 25ms pre-BEGIN PRAGMA stall counterexample) under parent-controlled SHARED lock.
+    await runCommitTimeoutCase('async', 'gpt-commit-timeout-async', 2_000, 0);
+    await runCommitTimeoutCase('async', 'gpt-commit-timeout-async-prebegin-stall', 2_200, 25);
 
     await upsertModelTierKnowledge(
       [{ provider: 'codex-sdk', model: 'gpt-after-async-commit-timeout', tier: 'secondary' }],
@@ -943,19 +986,9 @@ describe('probeExecutionPoolSdks', () => {
       }
     }
 
-    // 4. Sync COMMIT timeout under parent-controlled SHARED lock (released only in finally after throw).
-    const syncTimeoutReader = spawnSharedReader();
-    await syncTimeoutReader.readyPromise;
-    try {
-      expect(() => upsertModelTierKnowledgeSync(
-        [{ provider: 'codex-sdk', model: 'gpt-commit-timeout-sync', tier: 'secondary' }],
-        knowledgeFile,
-        4_000,
-        { lockTimeoutMs: 15 },
-      )).toThrow(/Timed out committing model-tier-knowledge lock/);
-    } finally {
-      await syncTimeoutReader.release();
-    }
+    // 4. Sync COMMIT timeout (normal + 25ms pre-BEGIN PRAGMA stall counterexample) under parent-controlled SHARED lock.
+    await runCommitTimeoutCase('sync', 'gpt-commit-timeout-sync', 4_000, 0);
+    await runCommitTimeoutCase('sync', 'gpt-commit-timeout-sync-prebegin-stall', 4_200, 25);
 
     // 5. Sync COMMIT recovery: run sync writer in child process so parent observes COMMIT_BUSY and then releases SHARED lock.
     const syncSuccessReader = spawnSharedReader();
