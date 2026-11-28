@@ -31,7 +31,7 @@ export interface RebalanceBridgeTarget {
 }
 
 export interface PgListenerClient {
-  connect(): Promise<void>;
+  connect(): Promise<unknown>;
   query: (sql: string) => Promise<unknown>;
   on: (event: string, listener: (...args: any[]) => void) => void;
   end: () => Promise<unknown>;
@@ -313,7 +313,7 @@ export class DaemonPodRebalancer {
       return this.pgClientFactory(connectionString);
     }
     const pgModule = await import('pg');
-    const driver = (pgModule as {
+    const driver = (pgModule as unknown as {
       default?: { Client: new (opts: { connectionString: string }) => PgListenerClient };
       Client?: new (opts: { connectionString: string }) => PgListenerClient;
     }).default ?? (pgModule as unknown as {
@@ -331,7 +331,7 @@ export class DaemonPodRebalancer {
     if (this.retiredClients.has(client)) return Promise.resolve();
     this.retiredClients.add(client);
     try {
-      return Promise.resolve(client.end()).catch(() => {});
+      return Promise.resolve(client.end()).then(() => undefined, () => undefined);
     } catch {
       return Promise.resolve();
     }
