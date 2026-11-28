@@ -849,44 +849,87 @@ run_as_target_unix_user() {
   return 2
 }
 
-install_default_agent_clis_best_effort() {
-  case "\${IMCODES_SKIP_AGENT_CLIS:-}" in
-    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])
-      return 0
-      ;;
-  esac
-  if [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_DEFAULT_CLIS_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_NPM_REGISTRY:-}" ] && [ -z "\${IMCODES_CODEX_REGISTRY:-}" ] && [ -z "\${IMCODES_CLAUDE_REGISTRY:-}" ] && [ -z "\${IMCODES_AGY_MANIFEST_BASE_URL:-}" ] && [ -z "\${IMCODES_OPENCODE_REGISTRY:-}" ]; then
-    return 0
-  fi
-  if [ -L "$EFF_HOME/.codex" ] || [ -L "$EFF_HOME/.codex/bin" ] || [ -L "$EFF_HOME/.codex/bin/codex" ] \
-    || [ -L "$EFF_HOME/.local" ] || [ -L "$EFF_HOME/.local/bin" ] || [ -L "$EFF_HOME/.local/bin/claude" ] || [ -L "$EFF_HOME/.local/bin/agy" ]; then
-    echo "WARNING: refusing symlinked agent CLI target path in $EFF_HOME; skipping default agent CLI install (non-blocking)" >&2
-    return 0
-  fi
+check_cli_paths_safe_posix() {
+  cli_label="$1"
+  shift
+  for chk_p in "$@"; do
+    if [ -L "$chk_p" ]; then
+      if [ "$cli_label" = "OpenCode" ]; then
+        echo "WARNING: refusing symlinked OpenCode target path ($chk_p) in $EFF_HOME; skipping OpenCode CLI install (non-blocking)" >&2
+      else
+        echo "WARNING: refusing symlinked agent CLI target path ($cli_label: $chk_p) in $EFF_HOME; skipping $cli_label install (non-blocking)" >&2
+      fi
+      return 1
+    fi
+  done
   if [ -n "$ISOLATED_ROOT" ]; then
-    if ! (
-      assert_safe_isolated_target "$EFF_HOME/.codex" entry
-      assert_safe_isolated_target "$EFF_HOME/.codex/bin" entry
-      assert_safe_isolated_target "$EFF_HOME/.codex/bin/codex" entry
-      assert_safe_isolated_target "$EFF_HOME/.local" entry
-      assert_safe_isolated_target "$EFF_HOME/.local/bin" entry
-      assert_safe_isolated_target "$EFF_HOME/.local/bin/claude" entry
-      assert_safe_isolated_target "$EFF_HOME/.local/bin/agy" entry
-    ); then
-      echo "WARNING: unsafe agent CLI target path in isolated mode; skipping default agent CLI install (non-blocking)" >&2
+    for chk_p in "$@"; do
+      if ! ( assert_safe_isolated_target "$chk_p" entry ) >/dev/null 2>&1; then
+        echo "WARNING: unsafe $cli_label target path ($chk_p) in isolated mode; skipping $cli_label install (non-blocking)" >&2
+        return 1
+      fi
+    done
+  fi
+  return 0
+}
+
+is_env_truthy_posix() {
+  case "\${1:-}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+install_default_agent_clis_best_effort() {
+  if is_env_truthy_posix "\${IMCODES_SKIP_AGENT_CLIS:-}"; then
+    return 0
+  fi
+  codex_flag=""
+  claude_flag=""
+  agy_flag=""
+  unsafe_any=0
+  if is_env_truthy_posix "\${IMCODES_SKIP_CODEX:-}"; then
+    codex_flag="--skip-codex"
+  elif ! check_cli_paths_safe_posix codex "$EFF_HOME/.codex" "$EFF_HOME/.codex/bin" "$EFF_HOME/.codex/bin/codex"; then
+    codex_flag="--skip-codex"
+    unsafe_any=1
+  elif [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_DEFAULT_CLIS_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_NPM_REGISTRY:-}" ] && [ -z "\${IMCODES_CODEX_REGISTRY:-}" ]; then
+    codex_flag="--skip-codex"
+  fi
+  if is_env_truthy_posix "\${IMCODES_SKIP_CLAUDE:-}"; then
+    claude_flag="--skip-claude"
+  elif ! check_cli_paths_safe_posix claude "$EFF_HOME/.local" "$EFF_HOME/.local/bin" "$EFF_HOME/.local/bin/claude"; then
+    claude_flag="--skip-claude"
+    unsafe_any=1
+  elif [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_DEFAULT_CLIS_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_NPM_REGISTRY:-}" ] && [ -z "\${IMCODES_CLAUDE_REGISTRY:-}" ]; then
+    claude_flag="--skip-claude"
+  fi
+  if is_env_truthy_posix "\${IMCODES_SKIP_AGY:-}"; then
+    agy_flag="--skip-agy"
+  elif ! check_cli_paths_safe_posix agy "$EFF_HOME/.local" "$EFF_HOME/.local/bin" "$EFF_HOME/.local/bin/agy"; then
+    agy_flag="--skip-agy"
+    unsafe_any=1
+  elif [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_DEFAULT_CLIS_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_AGY_MANIFEST_BASE_URL:-}" ]; then
+    agy_flag="--skip-agy"
+  fi
+
+  if [ -n "\${IMCODES_DEFAULT_CLIS_INSTALL_HOOK:-}" ]; then
+    if [ "$unsafe_any" -eq 1 ]; then
       return 0
     fi
-  fi
-  if [ -n "\${IMCODES_DEFAULT_CLIS_INSTALL_HOOK:-}" ]; then
-    if ! run_as_target_unix_user "$IMCODES_DEFAULT_CLIS_INSTALL_HOOK" --home "$EFF_HOME" --skip-opencode; then
+    if ! run_as_target_unix_user "$IMCODES_DEFAULT_CLIS_INSTALL_HOOK" --home "$EFF_HOME" --skip-opencode $codex_flag $claude_flag $agy_flag; then
       echo "WARNING: default agent CLI install hook failed (non-blocking)" >&2
     fi
+  elif [ -n "$codex_flag" ] && [ -n "$claude_flag" ] && [ -n "$agy_flag" ]; then
+    return 0
   elif [ -x "$CURRENT_LINK/bin/node" ] && [ -f "$CURRENT_LINK/package/dist/src/node/install-default-agent-clis.js" ]; then
     set -- "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-default-agent-clis.js" --home "$EFF_HOME" --skip-opencode
+    [ -n "$codex_flag" ] && set -- "$@" "$codex_flag"
+    [ -n "$claude_flag" ] && set -- "$@" "$claude_flag"
+    [ -n "$agy_flag" ] && set -- "$@" "$agy_flag"
     if [ -n "$ISOLATED_ROOT" ]; then
-      iso_reg="\${IMCODES_NPM_REGISTRY:-\${IMCODES_CODEX_REGISTRY:-\${IMCODES_CLAUDE_REGISTRY:-\${IMCODES_OPENCODE_REGISTRY:-}}}}"
-      if [ -n "$iso_reg" ]; then
-        set -- "$@" --registry "$iso_reg"
+      if [ -n "\${IMCODES_NPM_REGISTRY:-}" ]; then
+        set -- "$@" --registry "\${IMCODES_NPM_REGISTRY}"
       fi
       if [ -n "\${IMCODES_AGY_MANIFEST_BASE_URL:-}" ]; then
         set -- "$@" --agy-manifest-base-url "\${IMCODES_AGY_MANIFEST_BASE_URL}"
@@ -901,54 +944,90 @@ install_default_agent_clis_best_effort() {
 }
 
 install_opencode_cli_best_effort() {
-  case "\${IMCODES_SKIP_AGENT_CLIS:-}" in
-    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])
+  if is_env_truthy_posix "\${IMCODES_SKIP_AGENT_CLIS:-}"; then
+    return 0
+  fi
+
+  oc_flag=""
+  if is_env_truthy_posix "\${IMCODES_SKIP_OPENCODE:-}" || ! check_cli_paths_safe_posix OpenCode "$EFF_HOME/.opencode" "$EFF_HOME/.opencode/bin" "$EFF_HOME/.opencode/bin/opencode"; then
+    oc_flag="--skip-opencode"
+  elif [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_OPENCODE_REGISTRY:-}" ] && [ -z "\${IMCODES_NPM_REGISTRY:-}" ]; then
+    oc_flag="--skip-opencode"
+  fi
+
+  # Concurrent unified path: when no explicit hook is configured and the unified JS installer exists,
+  # execute all 4 CLI installers in parallel inside one Node process with per-CLI safety/skip flags.
+  if [ -z "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_DEFAULT_CLIS_INSTALL_HOOK:-}" ] \
+    && [ -x "$CURRENT_LINK/bin/node" ] && [ -f "$CURRENT_LINK/package/dist/src/node/install-default-agent-clis.js" ]; then
+    codex_flag=""
+    claude_flag=""
+    agy_flag=""
+    if is_env_truthy_posix "\${IMCODES_SKIP_CODEX:-}" || ! check_cli_paths_safe_posix codex "$EFF_HOME/.codex" "$EFF_HOME/.codex/bin" "$EFF_HOME/.codex/bin/codex"; then
+      codex_flag="--skip-codex"
+    elif [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_NPM_REGISTRY:-}" ] && [ -z "\${IMCODES_CODEX_REGISTRY:-}" ]; then
+      codex_flag="--skip-codex"
+    fi
+    if is_env_truthy_posix "\${IMCODES_SKIP_CLAUDE:-}" || ! check_cli_paths_safe_posix claude "$EFF_HOME/.local" "$EFF_HOME/.local/bin" "$EFF_HOME/.local/bin/claude"; then
+      claude_flag="--skip-claude"
+    elif [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_NPM_REGISTRY:-}" ] && [ -z "\${IMCODES_CLAUDE_REGISTRY:-}" ]; then
+      claude_flag="--skip-claude"
+    fi
+    if is_env_truthy_posix "\${IMCODES_SKIP_AGY:-}" || ! check_cli_paths_safe_posix agy "$EFF_HOME/.local" "$EFF_HOME/.local/bin" "$EFF_HOME/.local/bin/agy"; then
+      agy_flag="--skip-agy"
+    elif [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_AGY_MANIFEST_BASE_URL:-}" ]; then
+      agy_flag="--skip-agy"
+    fi
+    if [ -n "$oc_flag" ] && [ -n "$codex_flag" ] && [ -n "$claude_flag" ] && [ -n "$agy_flag" ]; then
       return 0
-      ;;
-  esac
-  oc_skip=0
-  case "\${IMCODES_SKIP_OPENCODE:-}" in
-    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])
-      oc_skip=1
-      ;;
-  esac
-  if [ "$oc_skip" -eq 0 ]; then
-    if [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_OPENCODE_REGISTRY:-}" ]; then
-      oc_skip=1
     fi
-  fi
-  if [ "$oc_skip" -eq 0 ]; then
-    if [ -L "$EFF_HOME/.opencode" ] || [ -L "$EFF_HOME/.opencode/bin" ] || [ -L "$EFF_HOME/.opencode/bin/opencode" ]; then
-      echo "WARNING: refusing symlinked OpenCode target path in $EFF_HOME; skipping OpenCode CLI install (non-blocking)" >&2
-      oc_skip=1
+    set -- "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-default-agent-clis.js" --home "$EFF_HOME"
+    [ -n "$oc_flag" ] && set -- "$@" "$oc_flag"
+    [ -n "$codex_flag" ] && set -- "$@" "$codex_flag"
+    [ -n "$claude_flag" ] && set -- "$@" "$claude_flag"
+    [ -n "$agy_flag" ] && set -- "$@" "$agy_flag"
+    if [ -n "$ISOLATED_ROOT" ]; then
+      if [ -n "\${IMCODES_NPM_REGISTRY:-}" ]; then
+        set -- "$@" --registry "\${IMCODES_NPM_REGISTRY}"
+      fi
+      if [ -n "\${IMCODES_AGY_MANIFEST_BASE_URL:-}" ]; then
+        set -- "$@" --agy-manifest-base-url "\${IMCODES_AGY_MANIFEST_BASE_URL}"
+      fi
+      set -- "$@" --no-fallback --isolated-test
     fi
-  fi
-  if [ "$oc_skip" -eq 0 ] && [ -n "$ISOLATED_ROOT" ]; then
-    if ! (
-      assert_safe_isolated_target "$EFF_HOME/.opencode" entry
-      assert_safe_isolated_target "$EFF_HOME/.opencode/bin" entry
-      assert_safe_isolated_target "$EFF_HOME/.opencode/bin/opencode" entry
-    ); then
-      echo "WARNING: unsafe OpenCode target path in isolated mode; skipping OpenCode CLI install (non-blocking)" >&2
-      oc_skip=1
+    if ! run_as_target_unix_user "$@"; then
+      echo "WARNING: default agent CLI install failed (non-blocking)" >&2
     fi
+    return 0
   fi
-  if [ "$oc_skip" -eq 0 ]; then
+
+  # Fallback / explicit hook path: run OpenCode concurrently with default agent CLIs so a slow
+  # OpenCode install or hook never blocks Codex/Claude/Agy, then wait before finishing.
+  oc_bg_pid=""
+  if [ -z "$oc_flag" ]; then
     if [ -n "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ]; then
-      if ! run_as_target_unix_user "$IMCODES_OPENCODE_INSTALL_HOOK" --home "$EFF_HOME"; then
-        echo "WARNING: OpenCode CLI install hook failed (non-blocking)" >&2
-      fi
+      (
+        if ! run_as_target_unix_user "$IMCODES_OPENCODE_INSTALL_HOOK" --home "$EFF_HOME"; then
+          echo "WARNING: OpenCode CLI install hook failed (non-blocking)" >&2
+        fi
+      ) &
+      oc_bg_pid="$!"
     elif [ -x "$CURRENT_LINK/bin/node" ] && [ -f "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" ]; then
-      set -- "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" --home "$EFF_HOME" --strict
-      if [ -n "$ISOLATED_ROOT" ]; then
-        set -- "$@" --registry "\${IMCODES_OPENCODE_REGISTRY:-}" --no-fallback --isolated-test
-      fi
-      if ! run_as_target_unix_user "$@"; then
-        echo "WARNING: OpenCode CLI install failed (non-blocking)" >&2
-      fi
+      (
+        set -- "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" --home "$EFF_HOME" --strict
+        if [ -n "$ISOLATED_ROOT" ]; then
+          set -- "$@" --registry "\${IMCODES_OPENCODE_REGISTRY:-\${IMCODES_NPM_REGISTRY:-}}" --no-fallback --isolated-test
+        fi
+        if ! run_as_target_unix_user "$@"; then
+          echo "WARNING: OpenCode CLI install failed (non-blocking)" >&2
+        fi
+      ) &
+      oc_bg_pid="$!"
     fi
   fi
   install_default_agent_clis_best_effort
+  if [ -n "$oc_bg_pid" ]; then
+    wait "$oc_bg_pid" 2>/dev/null || true
+  fi
   return 0
 }
 

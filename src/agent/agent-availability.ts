@@ -12,7 +12,7 @@ import { resolveCopilotExplicitBinaryPath, resolveCopilotRuntimePlatform } from 
 import { getProvider } from './provider-registry.js';
 import { DSH_BINARY_ENV, DSH_DEFAULT_BINARY } from './providers/deepseek-harness/runtime.js';
 import { GROK_CLI_BINARY, GROK_CLI_PATH_ENV } from './providers/grok-sdk.js';
-import { resolveOpenCodeCliAsync } from './opencode-cli-path.js';
+import { canUseOpenCodeHomeFallbackAsync, resolveOpenCodeCliAsync } from './opencode-cli-path.js';
 import { PI_BINARY_ENV, PI_DEFAULT_BINARY } from './providers/pi/runtime.js';
 import {
   getBundledClaudeBinaryCandidates,
@@ -549,6 +549,22 @@ function getKimiPreferredDirs(deps: AgentAvailabilityProbeDeps): string[] {
   ]);
 }
 
+async function probeCodex(deps: AgentAvailabilityProbeDeps, includeWindowsGlobalNpmDirs: boolean): Promise<AgentAvailabilityEntry> {
+  const allowHomeFallback = await canUseOpenCodeHomeFallbackAsync(deps.platform, deps.homeDir, {
+    env: deps.env,
+    isElevated: deps.isElevated,
+  });
+  return probeBinary(
+    deps,
+    'codex',
+    {
+      trailingDirs: allowHomeFallback && deps.homeDir ? [pathModuleFor(deps.platform).join(deps.homeDir, '.codex', 'bin')] : [],
+      includeWindowsGlobalNpmDirs,
+    },
+    'codex CLI not found',
+  );
+}
+
 async function probeAgentType(agentType: SessionAgentType, deps: AgentAvailabilityProbeDeps): Promise<AgentAvailabilityEntry> {
   switch (agentType) {
     case AGY_SDK_PROVIDER_ID:
@@ -559,25 +575,9 @@ async function probeAgentType(agentType: SessionAgentType, deps: AgentAvailabili
     case 'claude-code':
       return probeClaudeCli(deps);
     case 'codex-sdk':
-      return probeBinary(
-        deps,
-        'codex',
-        {
-          trailingDirs: deps.homeDir ? [pathModuleFor(deps.platform).join(deps.homeDir, '.codex', 'bin')] : [],
-          includeWindowsGlobalNpmDirs: true,
-        },
-        'codex CLI not found',
-      );
+      return probeCodex(deps, true);
     case 'codex':
-      return probeBinary(
-        deps,
-        'codex',
-        {
-          trailingDirs: deps.homeDir ? [pathModuleFor(deps.platform).join(deps.homeDir, '.codex', 'bin')] : [],
-          includeWindowsGlobalNpmDirs: false,
-        },
-        'codex CLI not found',
-      );
+      return probeCodex(deps, false);
     case 'qoder-sdk':
       return probeQoderSdk(deps);
     case 'copilot-sdk':

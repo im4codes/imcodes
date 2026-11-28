@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -14,6 +15,7 @@ import { tmpdir } from 'node:os';
 import path, { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 import { afterEach, describe, expect, it } from 'vitest';
+import { downloadResponseToFileWithIntegrity, validateDownloadUrl } from '../../src/node/cli-install-helpers.js';
 import {
   installAgyCli,
   installClaudeCli,
@@ -630,6 +632,298 @@ describe('install-default-agent-clis', () => {
       await mirrorSrv.close();
       await downOfficial.close();
       await blockedAgy.close();
+    }
+  });
+
+  it('rolls back partial Codex siblings before publishing binary and preserves existing sibling files on retry', async () => {
+    const root = makeTempDir();
+    const home = join(root, 'home');
+    const codexSuffix = resolveCodexPlatformSuffix()!;
+    const codexSubVer = `0.172.0-${codexSuffix}`;
+    const targetTriple = codexSuffix === 'darwin-arm64'
+      ? 'aarch64-apple-darwin'
+      : codexSuffix === 'darwin-x64'
+        ? 'x86_64-apple-darwin'
+        : 'x86_64-unknown-linux-musl';
+    const codexTgz = buildTarGz([
+      { name: `package/vendor/${targetTriple}/bin/codex`, content: '#!/bin/sh\necho "0.172.0"\n', mode: 0o755 },
+      { name: `package/vendor/${targetTriple}/bin/codex-code-mode-host`, content: '#!/bin/sh\necho host\n', mode: 0o755 },
+      { name: `package/vendor/${targetTriple}/codex-path/rg`, content: 'rg-bin', mode: 0o755 },
+      { name: `package/vendor/${targetTriple}/codex-resources/custom.txt`, content: 'upstream-default', mode: 0o644 },
+      { name: `package/vendor/${targetTriple}/codex-resources/new-asset.txt`, content: 'new-asset', mode: 0o644 },
+    ]);
+    const srv = await startMockServer((req, res) => {
+      if (req.url === '/@openai%2Fcodex/latest') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '0.172.0', optionalDependencies: { [`@openai/codex-${codexSuffix}`]: `npm:@openai/codex@${codexSubVer}` } }));
+        return;
+      }
+      if (req.url === `/@openai%2Fcodex/${encodeURIComponent(codexSubVer)}`) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: codexSubVer, dist: { tarball: `${srv.url}/codex.tgz`, integrity: sriSha512(codexTgz) } }));
+        return;
+      }
+      if (req.url === '/codex.tgz') { res.end(codexTgz); return; }
+      res.statusCode = 404;
+      res.end();
+    });
+
+    try {
+      // Pre-create an existing sibling file that must never be overwritten or deleted during rollback
+      mkdirSync(join(home, '.codex', 'codex-resources'), { recursive: true });
+      writeFileSync(join(home, '.codex', 'codex-resources', 'custom.txt'), 'user-custom-data');
+
+      // Counterexample: simulate failure when linking `new-asset.txt` after `codex-code-mode-host` & `rg` were written
+      let linkCalls = 0;
+      const failingLink = (src: string, dst: string) => {
+        linkCalls += 1;
+        if (dst.endsWith('new-asset.txt')) {
+          throw new Error('simulated_sibling_disk_full');
+        }
+        const fsMod = require('node:fs') as typeof import('node:fs');
+        fsMod.linkSync(src, dst);
+      };
+      const failRes = await installCodexCli({
+        homeDir: home,
+        env: { PATH: '' },
+        registry: srv.url,
+        noFallback: true,
+        linkFile: failingLink,
+        verifyVersion: () => 'codex-cli 0.172.0',
+      });
+      expect(failRes.status).toBe('failed');
+      expect(linkCalls).toBeGreaterThan(0);
+      // Main binary must NEVER be published, newly created siblings/dirs must be rolled back, pre-existing file preserved!
+      expect(existsSync(join(home, '.codex', 'bin', 'codex'))).toBe(false);
+      expect(existsSync(join(home, '.codex', 'bin', 'codex-code-mode-host'))).toBe(false);
+      expect(existsSync(join(home, '.codex', 'codex-path', 'rg'))).toBe(false);
+      expect(existsSync(join(home, '.codex', 'codex-path'))).toBe(false);
+      expect(readFileSync(join(home, '.codex', 'codex-resources', 'custom.txt'), 'utf8')).toBe('user-custom-data');
+
+      // Immediate retry succeeds cleanly and preserves pre-existing sibling without overwriting
+      const retryRes = await installCodexCli({
+        homeDir: home,
+        env: { PATH: '' },
+        registry: srv.url,
+        noFallback: true,
+        verifyVersion: () => 'codex-cli 0.172.0',
+      });
+      expect(retryRes.status).toBe('installed');
+      expect(existsSync(join(home, '.codex', 'bin', 'codex'))).toBe(true);
+      expect(existsSync(join(home, '.codex', 'bin', 'codex-code-mode-host'))).toBe(true);
+      expect(existsSync(join(home, '.codex', 'codex-path', 'rg'))).toBe(true);
+      expect(readFileSync(join(home, '.codex', 'codex-resources', 'new-asset.txt'), 'utf8')).toBe('new-asset');
+      expect(readFileSync(join(home, '.codex', 'codex-resources', 'custom.txt'), 'utf8')).toBe('user-custom-data');
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('routes HTTP/HTTPS via built-in Node proxy with zero undici dependency and fails closed when proxy breaks', async () => {
+    // Static zero-dep guard: runtime installers never depend on undici
+    const helperSrc = readFileSync(join(process.cwd(), 'src', 'node', 'cli-install-helpers.ts'), 'utf8');
+    expect(helperSrc).not.toMatch(/['"]undici['"]/);
+
+    const root = makeTempDir();
+    const home = join(root, 'home');
+    const claudePkg = resolveClaudePlatformPackage({ isMusl: false })!;
+    const claudeTgz = buildTarGz([{ name: 'package/claude', content: '#!/bin/sh\necho "2.1.332"\n', mode: 0o755 }]);
+
+    let directHits = 0;
+    const originSrv = await startMockServer((req, res) => {
+      directHits += 1;
+      if (req.url === `/${claudePkg.startsWith('@') ? `@${encodeURIComponent(claudePkg.slice(1))}` : encodeURIComponent(claudePkg)}/latest`) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '2.1.332', dist: { tarball: `${originSrv.url}/claude.tgz`, integrity: sriSha512(claudeTgz) } }));
+        return;
+      }
+      if (req.url === '/claude.tgz') { res.end(claudeTgz); return; }
+      res.statusCode = 404;
+      res.end();
+    });
+
+    const proxyHits: string[] = [];
+    const proxyAuthHeaders: string[] = [];
+    const httpMod = await import('node:http');
+    const proxySrv = await startMockServer((req, res) => {
+      proxyHits.push(req.url ?? '');
+      if (req.headers['proxy-authorization']) {
+        proxyAuthHeaders.push(String(req.headers['proxy-authorization']));
+      }
+      const targetUrl = new URL(req.url!);
+      const fwd = httpMod.request(targetUrl, { headers: req.headers }, (up) => {
+        res.writeHead(up.statusCode ?? 502, up.headers);
+        up.pipe(res);
+      });
+      fwd.on('error', (err) => {
+        res.statusCode = 502;
+        res.end(String(err));
+      });
+      req.pipe(fwd);
+    });
+
+    try {
+      const proxyRes = await installClaudeCli({
+        homeDir: home,
+        isMusl: false,
+        env: { PATH: '', HTTP_PROXY: proxySrv.url.replace('http://', 'http://u:p@') },
+        registry: originSrv.url,
+        noFallback: true,
+        verifyVersion: () => '2.1.332',
+      });
+      expect(proxyRes.status).toBe('installed');
+      expect(proxyHits.length).toBeGreaterThanOrEqual(2);
+      expect(proxyAuthHeaders.length).toBeGreaterThanOrEqual(2);
+      expect(directHits).toBe(proxyHits.length);
+
+      // Fail-closed: broken proxy must NEVER silently fall back to direct fetch
+      const directBeforeBroken = directHits;
+      const brokenHome = join(root, 'home-broken');
+      const brokenRes = await installClaudeCli({
+        homeDir: brokenHome,
+        isMusl: false,
+        env: { PATH: '', HTTP_PROXY: 'http://127.0.0.1:9' },
+        registry: originSrv.url,
+        noFallback: true,
+        verifyVersion: () => '2.1.332',
+      });
+      expect(brokenRes.status).toBe('failed');
+      expect(brokenRes.reason).toContain('proxy_');
+      expect(directHits).toBe(directBeforeBroken);
+
+      // Unsupported proxy scheme also fails closed without touching target
+      const socksRes = await installClaudeCli({
+        homeDir: join(root, 'home-socks'),
+        isMusl: false,
+        env: { PATH: '', HTTP_PROXY: 'socks5://127.0.0.1:1080' },
+        registry: originSrv.url,
+        noFallback: true,
+        verifyVersion: () => '2.1.332',
+      });
+      expect(socksRes.status).toBe('failed');
+      expect(socksRes.reason).toContain('proxy_unsupported_protocol');
+      expect(directHits).toBe(directBeforeBroken);
+
+      // Strict isolatedTest ignores HTTP_PROXY completely and rejects non-loopback URLs before fetch
+      expect(() => validateDownloadUrl('https://registry.npmjs.org/a.tgz', 'https:', 'https://registry.npmjs.org', true))
+        .toThrow('disallowed_non_loopback_isolated_origin');
+      const nonLoopbackRes = await installClaudeCli({
+        homeDir: join(root, 'home-iso-pub'),
+        isMusl: false,
+        env: { PATH: '', HTTP_PROXY: 'http://127.0.0.1:9' },
+        registry: 'https://registry.npmjs.org',
+        isolatedTest: true,
+        noFallback: true,
+      });
+      expect(nonLoopbackRes.status).toBe('failed');
+      expect(nonLoopbackRes.reason).toContain('disallowed_non_loopback_isolated_origin');
+
+      const isoIgnoreProxyHitsBefore = proxyHits.length;
+      const isoLoopbackRes = await installClaudeCli({
+        homeDir: join(root, 'home-iso-ok'),
+        isMusl: false,
+        env: { PATH: '', HTTP_PROXY: 'http://127.0.0.1:9' },
+        registry: originSrv.url,
+        isolatedTest: true,
+        noFallback: true,
+        verifyVersion: () => '2.1.332',
+      });
+      expect(isoLoopbackRes.status).toBe('installed');
+      expect(proxyHits.length).toBe(isoIgnoreProxyHitsBefore);
+    } finally {
+      await proxySrv.close();
+      await originSrv.close();
+    }
+  });
+
+  it('handles mid-stream WriteStream errors cleanly without unhandled crash and isolates failing CLIs from siblings', async () => {
+    const root = makeTempDir();
+    // 1. Delayed 2-chunk Web stream targeting nonexistent parent directory must reject cleanly without uncaughtException
+    const payload = Buffer.from('hello-delayed-stream-payload');
+    const sha512 = createHash('sha512').update(payload).digest('hex');
+    const delayedStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(payload.subarray(0, 10));
+        setTimeout(() => {
+          controller.enqueue(payload.subarray(10));
+          controller.close();
+        }, 30);
+      },
+    });
+    const fakeRes = new Response(delayedStream, { status: 200 });
+    const unwritableTarget = join(root, 'missing-parent-dir', 'payload.bin');
+    await expect(
+      downloadResponseToFileWithIntegrity(fakeRes, unwritableTarget, {
+        maxBytes: 1024 * 1024,
+        expectedSha512Hex: sha512,
+      }),
+    ).rejects.toThrow();
+
+    // 2. Concurrent execution inside installDefaultAgentClis: symlinked .local/bin/claude fails claude ONLY
+    //    while codex & agy still install concurrently without crashing or aborting
+    const home = join(root, 'home');
+    const decoyTarget = join(root, 'outside-decoy');
+    mkdirSync(join(home, '.local', 'bin'), { recursive: true });
+    symlinkSync(decoyTarget, join(home, '.local', 'bin', 'claude'));
+
+    const codexSuffix = resolveCodexPlatformSuffix()!;
+    const codexSubVer = `0.172.0-${codexSuffix}`;
+    const ocPkg = resolveOpenCodePlatformPackage({ isMusl: false })!;
+    const agyPlatform = resolveAgyManifestPlatform({ isMusl: false })!;
+    const ocTgz = buildTarGz([{ name: 'package/bin/opencode', content: '#!/bin/sh\necho "2.4.2"\n', mode: 0o755 }]);
+    const codexTgz = buildTarGz([{ name: 'package/vendor/x86_64-unknown-linux-musl/bin/codex', content: '#!/bin/sh\necho "0.172.0"\n', mode: 0o755 }]);
+    const agyBin = Buffer.from('#!/bin/sh\necho "0.9.0"\n');
+    const agySha512 = createHash('sha512').update(agyBin).digest('hex');
+
+    const slowOcResponses: ServerResponse[] = [];
+    const srv = await startMockServer((req, res) => {
+      if (req.url === `/${encodeURIComponent(ocPkg)}/latest`) {
+        slowOcResponses.push(res);
+        return;
+      }
+      if (req.url === '/@openai%2Fcodex/latest') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '0.172.0', optionalDependencies: { [`@openai/codex-${codexSuffix}`]: `npm:@openai/codex@${codexSubVer}` } }));
+        return;
+      }
+      if (req.url === `/@openai%2Fcodex/${encodeURIComponent(codexSubVer)}`) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: codexSubVer, dist: { tarball: `${srv.url}/codex.tgz`, integrity: sriSha512(codexTgz) } }));
+        return;
+      }
+      if (req.url === '/codex.tgz') { res.end(codexTgz); return; }
+      if (req.url === `/manifests/${agyPlatform}.json`) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '0.9.0', url: `${srv.url}/agy-bin`, sha512: agySha512 }));
+        return;
+      }
+      if (req.url === '/agy-bin') { res.end(agyBin); return; }
+      res.statusCode = 404;
+      res.end();
+    });
+
+    try {
+      const { results } = await installDefaultAgentClis({
+        homeDir: home,
+        isMusl: false,
+        env: { PATH: '' },
+        registry: srv.url,
+        agyManifestBaseUrl: srv.url,
+        noFallback: true,
+        metadataTimeoutMs: 120,
+        verifyVersion: () => '1.0.0',
+      });
+      expect(results.opencode?.status).toBe('failed');
+      expect(results.claude?.status).toBe('failed');
+      expect(results.claude?.reason).toContain('unsafe_symlink_target');
+      expect(results.codex?.status).toBe('installed');
+      expect(results.agy?.status).toBe('installed');
+      expect(existsSync(decoyTarget)).toBe(false);
+    } finally {
+      for (const r of slowOcResponses) {
+        try { r.destroy(); } catch { /* ignore */ }
+      }
+      await srv.close();
     }
   });
 });

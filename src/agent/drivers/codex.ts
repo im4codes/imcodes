@@ -5,7 +5,7 @@ import type { AgentStatus } from '../detect.js';
 import { detectStatus } from '../detect.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../../shared/cron-types.js';
 import { quoteShellBinary } from '../opencode-cli-path.js';
-import { resolveCodexPathForSdk } from '../transport-paths.js';
+import { resolveCodexPathForPty } from '../transport-paths.js';
 
 // Startup prompts to auto-dismiss after launch
 const STARTUP_PROMPTS: Array<{
@@ -24,7 +24,7 @@ export class CodexDriver implements AgentDriver {
 
   buildLaunchCommand(_sessionName: string, opts?: LaunchOptions): string {
     const cwd = cwdPrefix(opts?.cwd);
-    const bin = quoteShellBinary(resolveCodexPathForSdk('codex'));
+    const bin = quoteShellBinary(resolveCodexPathForPty('codex'));
     const modelFlag = opts?.codexModel ? ` -m ${JSON.stringify(opts.codexModel)}` : '';
     const cronTrust = ` -c ${JSON.stringify(`developer_instructions=${JSON.stringify(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE)}`)}`;
     // Global flags, so they precede `resume`. They fence only threads this

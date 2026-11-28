@@ -14,10 +14,13 @@ import {
   rmSync,
 } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
+import http from 'node:http';
+import https from 'node:https';
 import { homedir } from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import { Readable } from 'node:stream';
+import tls from 'node:tls';
 import { createGunzip } from 'node:zlib';
 import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
@@ -211,6 +214,37 @@ export function normalizeRegistryUrl(raw: unknown): string | null {
   }
 }
 
+export function isLoopbackHostname(hostname: string): boolean {
+  const norm = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  return norm === '127.0.0.1' || norm === '::1' || norm === 'localhost' || norm === '0:0:0:0:0:0:0:1';
+}
+
+export function filterCandidatesForIsolation(candidates: readonly string[], isolatedTest: boolean): string[] {
+  if (!isolatedTest) return [...candidates];
+  return candidates.filter((candidate) => {
+    try {
+      return isLoopbackHostname(new URL(candidate).hostname);
+    } catch {
+      return false;
+    }
+  });
+}
+
+export function collectConfiguredNonLoopbackUrls(urls: Array<string | undefined>): string[] {
+  const rejected: string[] = [];
+  for (const raw of urls) {
+    const normalized = normalizeRegistryUrl(raw);
+    if (!normalized) continue;
+    try {
+      const parsed = new URL(normalized);
+      if (!isLoopbackHostname(parsed.hostname)) rejected.push(parsed.origin);
+    } catch {
+      // ignore unparseable
+    }
+  }
+  return [...new Set(rejected)];
+}
+
 export function resolveCandidateNpmRegistries(opts: {
   registry?: string;
   registries?: string[];
@@ -222,12 +256,15 @@ export function resolveCandidateNpmRegistries(opts: {
 } = {}): string[] {
   const env = opts.env ?? process.env;
   const homeDir = opts.homeDir ?? homedir();
-  const isolatedTest = opts.isolatedTest || parseBooleanEnv(env.IMCODES_OPENCODE_ISOLATED_TEST);
+  const isolatedTest = Boolean(opts.isolatedTest || parseBooleanEnv(env.IMCODES_OPENCODE_ISOLATED_TEST));
   const candidates: Array<string | null> = [];
 
   if (Array.isArray(opts.registries) && opts.registries.length > 0) {
     for (const r of opts.registries) candidates.push(normalizeRegistryUrl(r));
-    return [...new Set(candidates.filter((v): v is string => Boolean(v)))];
+    return filterCandidatesForIsolation(
+      [...new Set(candidates.filter((v): v is string => Boolean(v)))],
+      isolatedTest,
+    );
   }
 
   candidates.push(normalizeRegistryUrl(opts.registry));
@@ -256,7 +293,10 @@ export function resolveCandidateNpmRegistries(opts: {
     candidates.push(NPM_MIRROR_REGISTRY);
   }
 
-  return [...new Set(candidates.filter((v): v is string => Boolean(v)))];
+  return filterCandidatesForIsolation(
+    [...new Set(candidates.filter((v): v is string => Boolean(v)))],
+    isolatedTest,
+  );
 }
 
 export function findCommandInEnvPath(
@@ -301,10 +341,18 @@ export function buildAbortSignal(timeoutMs: number): AbortSignal | undefined {
   return undefined;
 }
 
-export function validateDownloadUrl(rawUrl: string, allowedProto: string, strictOrigin?: string): string {
+export function validateDownloadUrl(
+  rawUrl: string,
+  allowedProto: string,
+  strictOrigin?: string,
+  isolatedTest = false,
+): string {
   const parsed = new URL(rawUrl);
   if (parsed.protocol !== 'https:' && !(allowedProto === 'http:' && parsed.protocol === 'http:')) {
     throw new Error(`unsafe_tarball_protocol:${parsed.protocol}`);
+  }
+  if (isolatedTest && !isLoopbackHostname(parsed.hostname)) {
+    throw new Error(`disallowed_non_loopback_isolated_origin:${parsed.origin}`);
   }
   if (strictOrigin && parsed.origin !== strictOrigin) {
     throw new Error(`disallowed_external_origin:${parsed.origin}`);
@@ -312,7 +360,13 @@ export function validateDownloadUrl(rawUrl: string, allowedProto: string, strict
   return parsed.toString();
 }
 
-function hasProxyEnv(env: NodeJS.ProcessEnv): { httpProxy?: string; httpsProxy?: string; noProxy?: string } | null {
+interface ProxyConfig {
+  httpProxy?: string;
+  httpsProxy?: string;
+  noProxy?: string;
+}
+
+function readProxyConfig(env: NodeJS.ProcessEnv): ProxyConfig | null {
   const httpsProxy = readEnvCaseInsensitive(env, 'HTTPS_PROXY')?.trim();
   const httpProxy = readEnvCaseInsensitive(env, 'HTTP_PROXY')?.trim();
   const allProxy = readEnvCaseInsensitive(env, 'ALL_PROXY')?.trim();
@@ -327,36 +381,260 @@ function hasProxyEnv(env: NodeJS.ProcessEnv): { httpProxy?: string; httpsProxy?:
   };
 }
 
-export async function createProxyDispatcherIfNeeded(
+function shouldBypassProxy(targetUrl: URL, noProxy?: string): boolean {
+  if (!noProxy) return false;
+  const targetHost = targetUrl.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  const targetPort = targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80');
+  for (const rawEntry of noProxy.split(',')) {
+    const entry = rawEntry.trim().toLowerCase();
+    if (!entry) continue;
+    if (entry === '*') return true;
+    let hostPattern = entry;
+    let portPattern: string | null = null;
+    if (entry.startsWith('[')) {
+      const closeIdx = entry.indexOf(']');
+      if (closeIdx !== -1) {
+        hostPattern = entry.slice(1, closeIdx);
+        if (entry[closeIdx + 1] === ':') {
+          portPattern = entry.slice(closeIdx + 2);
+        }
+      }
+    } else {
+      const colonIdx = entry.lastIndexOf(':');
+      if (colonIdx > 0 && entry.indexOf(':') === colonIdx) {
+        hostPattern = entry.slice(0, colonIdx);
+        portPattern = entry.slice(colonIdx + 1);
+      }
+    }
+    if (portPattern && portPattern !== targetPort) continue;
+    const stripped = hostPattern.replace(/^\./, '');
+    if (!stripped) continue;
+    if (targetHost === stripped || (hostPattern.startsWith('.') ? targetHost.endsWith(`.${stripped}`) : targetHost.endsWith(`.${stripped}`))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildHeadersObject(rawHeaders: RequestInit['headers']): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!rawHeaders) return out;
+  if (rawHeaders instanceof Headers) {
+    rawHeaders.forEach((v, k) => {
+      out[k] = v;
+    });
+  } else if (Array.isArray(rawHeaders)) {
+    for (const [k, v] of rawHeaders) {
+      out[k] = v;
+    }
+  } else {
+    for (const [k, v] of Object.entries(rawHeaders)) {
+      if (typeof v === 'string') out[k] = v;
+    }
+  }
+  return out;
+}
+
+function incomingMessageToWebResponse(res: http.IncomingMessage): Response {
+  const status = res.statusCode ?? 502;
+  const headers = new Headers();
+  for (const [k, v] of Object.entries(res.headers)) {
+    if (Array.isArray(v)) {
+      for (const item of v) headers.append(k, item);
+    } else if (typeof v === 'string') {
+      headers.set(k, v);
+    }
+  }
+  const isNullBody = status === 204 || status === 205 || status === 304;
+  if (isNullBody) {
+    res.resume();
+    return new Response(null, { status, statusText: res.statusMessage, headers });
+  }
+  return new Response(Readable.toWeb(res) as ReadableStream<Uint8Array>, {
+    status,
+    statusText: res.statusMessage,
+    headers,
+  });
+}
+
+async function fetchViaNodeHttpProxy(urlStr: string, proxyStr: string, init: RequestInit): Promise<Response> {
+  let proxyUrl: URL;
+  try {
+    proxyUrl = new URL(proxyStr);
+  } catch {
+    throw new Error(`proxy_invalid_url:${proxyStr}`);
+  }
+  if (proxyUrl.protocol !== 'http:' && proxyUrl.protocol !== 'https:') {
+    throw new Error(`proxy_unsupported_protocol:${proxyUrl.protocol}`);
+  }
+  const targetUrl = new URL(urlStr);
+  const proxyIsHttps = proxyUrl.protocol === 'https:';
+  const proxyPort = Number.parseInt(proxyUrl.port || (proxyIsHttps ? '443' : '80'), 10);
+  const targetPort = Number.parseInt(targetUrl.port || (targetUrl.protocol === 'https:' ? '443' : '80'), 10);
+  const proxyAuth = (proxyUrl.username || proxyUrl.password)
+    ? `Basic ${Buffer.from(`${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`).toString('base64')}`
+    : undefined;
+  const reqHeaders = buildHeadersObject(init.headers);
+  const signal = init.signal ?? undefined;
+
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error ? signal.reason : new Error('aborted');
+  }
+
+  return await new Promise<Response>((resolve, reject) => {
+    let settled = false;
+    const cleanups: Array<() => void> = [];
+    const finishErr = (err: unknown) => {
+      if (settled) return;
+      settled = true;
+      for (const fn of cleanups) {
+        try { fn(); } catch { /* ignore */ }
+      }
+      if (err instanceof Error && err.message.startsWith('proxy_')) {
+        reject(err);
+      } else {
+        const msg = err instanceof Error ? err.message : String(err);
+        reject(new Error(`proxy_error:${msg}`));
+      }
+    };
+    const finishOk = (res: http.IncomingMessage) => {
+      if (settled) return;
+      settled = true;
+      for (const fn of cleanups) {
+        try { fn(); } catch { /* ignore */ }
+      }
+      resolve(incomingMessageToWebResponse(res));
+    };
+
+    const proxyTransport = proxyIsHttps ? https : http;
+
+    if (targetUrl.protocol === 'http:') {
+      const proxyHeaders: Record<string, string> = {
+        ...reqHeaders,
+        host: targetUrl.host,
+        ...(proxyAuth ? { 'proxy-authorization': proxyAuth } : {}),
+      };
+      const req = proxyTransport.request(
+        {
+          hostname: proxyUrl.hostname.replace(/^\[|\]$/g, ''),
+          port: proxyPort,
+          method: init.method ?? 'GET',
+          path: targetUrl.toString(),
+          headers: proxyHeaders,
+          agent: false,
+        },
+        (res) => finishOk(res),
+      );
+      if (signal) {
+        const onAbort = () => {
+          req.destroy();
+          finishErr(signal.reason instanceof Error ? signal.reason : new Error('proxy_aborted'));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        cleanups.push(() => signal.removeEventListener('abort', onAbort));
+      }
+      req.on('error', finishErr);
+      req.end();
+      return;
+    }
+
+    const authority = `${targetUrl.hostname.includes(':') && !targetUrl.hostname.startsWith('[') ? `[${targetUrl.hostname}]` : targetUrl.hostname}:${targetPort}`;
+    const connectReq = proxyTransport.request({
+      hostname: proxyUrl.hostname.replace(/^\[|\]$/g, ''),
+      port: proxyPort,
+      method: 'CONNECT',
+      path: authority,
+      headers: {
+        host: authority,
+        ...(proxyAuth ? { 'proxy-authorization': proxyAuth } : {}),
+      },
+      agent: false,
+    });
+    if (signal) {
+      const onAbort = () => {
+        connectReq.destroy();
+        finishErr(signal.reason instanceof Error ? signal.reason : new Error('proxy_aborted'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      cleanups.push(() => signal.removeEventListener('abort', onAbort));
+    }
+    connectReq.on('error', finishErr);
+    connectReq.once('connect', (connectRes, socket) => {
+      socket.on('error', finishErr);
+      if ((connectRes.statusCode ?? 0) < 200 || (connectRes.statusCode ?? 0) >= 300) {
+        socket.destroy();
+        finishErr(new Error(`proxy_connect_failed:${connectRes.statusCode ?? 0}`));
+        return;
+      }
+      const tlsSocket = tls.connect({
+        socket,
+        servername: targetUrl.hostname.replace(/^\[|\]$/g, ''),
+        rejectUnauthorized: true,
+      });
+      tlsSocket.on('error', finishErr);
+      tlsSocket.once('secureConnect', () => {
+        const req = http.request(
+          {
+            hostname: targetUrl.hostname.replace(/^\[|\]$/g, ''),
+            port: targetPort,
+            method: init.method ?? 'GET',
+            path: `${targetUrl.pathname}${targetUrl.search}`,
+            headers: {
+              ...reqHeaders,
+              host: targetUrl.host,
+            },
+            agent: false,
+            createConnection: () => tlsSocket,
+          },
+          (res) => finishOk(res),
+        );
+        if (signal) {
+          const onAbort = () => {
+            req.destroy();
+            tlsSocket.destroy();
+            finishErr(signal.reason instanceof Error ? signal.reason : new Error('proxy_aborted'));
+          };
+          signal.addEventListener('abort', onAbort, { once: true });
+          cleanups.push(() => signal.removeEventListener('abort', onAbort));
+        }
+        req.on('error', finishErr);
+        req.end();
+      });
+    });
+    connectReq.end();
+  });
+}
+
+export async function createProxyAwareFetch(
   fetchFn: typeof fetch,
   env: NodeJS.ProcessEnv,
-): Promise<{ dispatcher?: unknown; close: () => Promise<void> }> {
-  if (fetchFn !== fetch) {
-    return { close: async () => {} };
+  opts: { isolatedTest?: boolean } = {},
+): Promise<{ fetchFn: typeof fetch; close: () => Promise<void> }> {
+  const isolatedTest = Boolean(opts.isolatedTest || parseBooleanEnv(env.IMCODES_OPENCODE_ISOLATED_TEST));
+  if (isolatedTest || fetchFn !== fetch) {
+    return { fetchFn, close: async () => {} };
   }
-  const proxyCfg = hasProxyEnv(env);
+  const proxyCfg = readProxyConfig(env);
   if (!proxyCfg) {
-    return { close: async () => {} };
+    return { fetchFn, close: async () => {} };
   }
-  try {
-    const undiciMod = await import('undici') as {
-      EnvHttpProxyAgent?: new (opts?: { httpProxy?: string; httpsProxy?: string; noProxy?: string }) => {
-        close?: () => Promise<void>;
-      };
-    };
-    if (typeof undiciMod?.EnvHttpProxyAgent === 'function') {
-      const agent = new undiciMod.EnvHttpProxyAgent(proxyCfg);
-      return {
-        dispatcher: agent,
-        close: async () => {
-          await agent.close?.().catch(() => {});
-        },
-      };
+  const wrappedFetch: typeof fetch = async (input, init) => {
+    const urlStr = typeof input === 'string'
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : input.url;
+    const targetUrl = new URL(urlStr);
+    if (shouldBypassProxy(targetUrl, proxyCfg.noProxy)) {
+      return await fetchFn(input, init);
     }
-  } catch {
-    // Fall back to direct fetch if undici package is unavailable in stripped runtime
-  }
-  return { close: async () => {} };
+    const proxyUrl = targetUrl.protocol === 'https:' ? proxyCfg.httpsProxy : proxyCfg.httpProxy;
+    if (!proxyUrl) {
+      return await fetchFn(input, init);
+    }
+    return await fetchViaNodeHttpProxy(urlStr, proxyUrl, init ?? {});
+  };
+  return { fetchFn: wrappedFetch, close: async () => {} };
 }
 
 export async function fetchWithSafeRedirects(
@@ -367,15 +645,14 @@ export async function fetchWithSafeRedirects(
     headers?: Record<string, string>;
     allowedProto: string;
     strictOrigin?: string;
-    dispatcher?: unknown;
+    isolatedTest?: boolean;
   },
 ): Promise<Response> {
-  let currentUrl = validateDownloadUrl(initialUrl, opts.allowedProto, opts.strictOrigin);
+  let currentUrl = validateDownloadUrl(initialUrl, opts.allowedProto, opts.strictOrigin, opts.isolatedTest);
   for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop += 1) {
-    const init: RequestInit & { dispatcher?: unknown } = {
+    const init: RequestInit = {
       ...(opts.headers ? { headers: opts.headers } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
-      ...(opts.dispatcher !== undefined ? { dispatcher: opts.dispatcher } : {}),
       redirect: 'manual',
     };
     const res = await fetchFn(currentUrl, init);
@@ -390,7 +667,12 @@ export async function fetchWithSafeRedirects(
       if (hop === MAX_REDIRECT_HOPS) {
         throw new Error('too_many_redirects');
       }
-      currentUrl = validateDownloadUrl(new URL(location, currentUrl).toString(), opts.allowedProto, opts.strictOrigin);
+      currentUrl = validateDownloadUrl(
+        new URL(location, currentUrl).toString(),
+        opts.allowedProto,
+        opts.strictOrigin,
+        opts.isolatedTest,
+      );
       continue;
     }
     return res;
@@ -440,6 +722,98 @@ function selectExpectedDigestCheck(dist: NpmDistMetadata): ExpectedDigestCheck {
   throw new Error('missing_integrity_metadata');
 }
 
+class ManagedWriteStream {
+  readonly stream: import('node:fs').WriteStream;
+  private streamErr: Error | null = null;
+  private waiterReject: ((err: Error) => void) | null = null;
+
+  constructor(filePath: string, opts: Parameters<typeof createWriteStream>[1]) {
+    this.stream = createWriteStream(filePath, opts);
+    this.stream.on('error', (err: Error) => {
+      if (!this.streamErr) this.streamErr = err;
+      if (this.waiterReject) {
+        const reject = this.waiterReject;
+        this.waiterReject = null;
+        reject(err);
+      }
+    });
+  }
+
+  async write(chunk: Buffer): Promise<void> {
+    if (chunk.length === 0) return;
+    if (this.streamErr) throw this.streamErr;
+    const ok = this.stream.write(chunk);
+    if (this.streamErr) throw this.streamErr;
+    if (!ok) {
+      await new Promise<void>((resolve, reject) => {
+        if (this.streamErr) {
+          reject(this.streamErr);
+          return;
+        }
+        const cleanup = () => {
+          this.stream.off('drain', onDrain);
+          this.stream.off('close', onClose);
+          if (this.waiterReject === reject) this.waiterReject = null;
+        };
+        const onDrain = () => {
+          cleanup();
+          resolve();
+        };
+        const onClose = () => {
+          cleanup();
+          reject(this.streamErr ?? new Error('write_stream_closed_unexpectedly'));
+        };
+        this.waiterReject = (err: Error) => {
+          cleanup();
+          reject(err);
+        };
+        this.stream.once('drain', onDrain);
+        this.stream.once('close', onClose);
+      });
+    }
+  }
+
+  async end(): Promise<void> {
+    if (this.streamErr) throw this.streamErr;
+    await new Promise<void>((resolve, reject) => {
+      if (this.streamErr) {
+        reject(this.streamErr);
+        return;
+      }
+      const cleanup = () => {
+        this.stream.off('finish', onFinish);
+        this.stream.off('close', onClose);
+        if (this.waiterReject === reject) this.waiterReject = null;
+      };
+      const onFinish = () => {
+        cleanup();
+        if (this.streamErr) reject(this.streamErr);
+        else resolve();
+      };
+      const onClose = () => {
+        cleanup();
+        if (this.streamErr) reject(this.streamErr);
+        else resolve();
+      };
+      this.waiterReject = (err: Error) => {
+        cleanup();
+        reject(err);
+      };
+      this.stream.once('finish', onFinish);
+      this.stream.once('close', onClose);
+      this.stream.end();
+    });
+  }
+
+  destroy(): void {
+    try {
+      this.stream.destroy();
+    } catch {
+      // ignore destroy errors
+    }
+  }
+}
+
 export async function downloadResponseToFileWithIntegrity(
   res: Response,
   destFilePath: string,
@@ -464,7 +838,7 @@ export async function downloadResponseToFileWithIntegrity(
   const hash = createHash(check.alg);
   let byteLength = 0;
 
-  const outStream = createWriteStream(destFilePath, { flags: 'wx' });
+  const outStream = new ManagedWriteStream(destFilePath, { flags: 'wx' });
   const writeChunk = async (chunk: Buffer): Promise<void> => {
     if (chunk.length === 0) return;
     byteLength += chunk.length;
@@ -472,20 +846,7 @@ export async function downloadResponseToFileWithIntegrity(
       throw new Error(`invalid_download_size:${byteLength}`);
     }
     hash.update(chunk);
-    if (!outStream.write(chunk)) {
-      await new Promise<void>((resolve, reject) => {
-        const onDrain = () => {
-          outStream.off('error', onErr);
-          resolve();
-        };
-        const onErr = (err: Error) => {
-          outStream.off('drain', onDrain);
-          reject(err);
-        };
-        outStream.once('drain', onDrain);
-        outStream.once('error', onErr);
-      });
-    }
+    await outStream.write(chunk);
   };
 
   try {
@@ -504,10 +865,7 @@ export async function downloadResponseToFileWithIntegrity(
       throw new Error(`invalid_download_size:0`);
     }
 
-    await new Promise<void>((resolve, reject) => {
-      outStream.once('error', reject);
-      outStream.end(() => resolve());
-    });
+    await outStream.end();
 
     const actualBuf = hash.digest();
     if (actualBuf.length !== check.expectedBuf.length || !timingSafeEqual(actualBuf, check.expectedBuf)) {
@@ -516,9 +874,7 @@ export async function downloadResponseToFileWithIntegrity(
 
     return { byteLength };
   } catch (err) {
-    try {
-      outStream.destroy();
-    } catch { /* ignore */ }
+    outStream.destroy();
     rmSync(destFilePath, { force: true });
     throw err;
   }
@@ -729,24 +1085,6 @@ class TarByteCursor {
   }
 }
 
-async function writeChunkToStream(stream: import('node:fs').WriteStream, chunk: Buffer): Promise<void> {
-  if (chunk.length === 0) return;
-  if (!stream.write(chunk)) {
-    await new Promise<void>((resolve, reject) => {
-      const onDrain = () => {
-        stream.off('error', onErr);
-        resolve();
-      };
-      const onErr = (err: Error) => {
-        stream.off('drain', onDrain);
-        reject(err);
-      };
-      stream.once('drain', onDrain);
-      stream.once('error', onErr);
-    });
-  }
-}
-
 export async function extractSingleBinaryFromTarGzFile(
   tgzPath: string,
   targetEntryPaths: readonly string[],
@@ -760,6 +1098,7 @@ export async function extractSingleBinaryFromTarGzFile(
   const gzipRead = createReadStream(tgzPath);
   const gunzip = createGunzip();
   gzipRead.on('error', (err) => gunzip.destroy(err));
+  gunzip.on('error', () => { /* captured by consumer or shutdown */ });
   gzipRead.pipe(gunzip);
 
   const cursor = new TarByteCursor(gunzip as unknown as AsyncIterable<Buffer>, maxUncompressed);
@@ -767,7 +1106,7 @@ export async function extractSingleBinaryFromTarGzFile(
   let nextGnuLongName: string | null = null;
   let globalPax: Record<string, string> = {};
   let matchedEntry: string | null = null;
-  let activeOutStream: import('node:fs').WriteStream | null = null;
+  let activeOutStream: ManagedWriteStream | null = null;
 
   try {
     while (await cursor.ensureAtLeast(512)) {
@@ -822,15 +1161,12 @@ export async function extractSingleBinaryFromTarGzFile(
       if (typeflag === '0' && normalized && wanted.has(normalized) && !matchedEntry) {
         if (size === 0) throw new Error('empty_binary_in_tarball');
         const mode = readTarMode(header);
-        activeOutStream = createWriteStream(destFilePath, {
+        activeOutStream = new ManagedWriteStream(destFilePath, {
           flags: 'wx',
           ...((opts.platform ?? process.platform) !== 'win32' ? { mode: mode | 0o755 } : {}),
         });
-        await cursor.streamExact(size, (chunk) => writeChunkToStream(activeOutStream!, chunk));
-        await new Promise<void>((resolve, reject) => {
-          activeOutStream!.once('error', reject);
-          activeOutStream!.end(() => resolve());
-        });
+        await cursor.streamExact(size, (chunk) => activeOutStream!.write(chunk));
+        await activeOutStream.end();
         activeOutStream = null;
         matchedEntry = normalized;
         if (padLen > 0) await cursor.skipExact(padLen);
@@ -843,9 +1179,7 @@ export async function extractSingleBinaryFromTarGzFile(
     }
   } catch (err) {
     if (activeOutStream) {
-      try {
-        activeOutStream.destroy();
-      } catch { /* ignore */ }
+      activeOutStream.destroy();
     }
     rmSync(destFilePath, { force: true });
     if (err instanceof Error && (err.message.includes('tar') || err.message.includes('unsafe') || err.message.includes('invalid') || err.message.includes('truncated') || err.message.includes('empty'))) {
@@ -879,6 +1213,7 @@ export async function extractVendorSubtreeFromTarGzFile(
   const gzipRead = createReadStream(tgzPath);
   const gunzip = createGunzip();
   gzipRead.on('error', (err) => gunzip.destroy(err));
+  gunzip.on('error', () => { /* captured by consumer or shutdown */ });
   gzipRead.pipe(gunzip);
 
   const cursor = new TarByteCursor(gunzip as unknown as AsyncIterable<Buffer>, maxUncompressed);
@@ -887,7 +1222,7 @@ export async function extractVendorSubtreeFromTarGzFile(
   let globalPax: Record<string, string> = {};
   let capturedGroup: string | undefined;
   const extractedFiles: string[] = [];
-  let activeOutStream: import('node:fs').WriteStream | null = null;
+  let activeOutStream: ManagedWriteStream | null = null;
 
   mkdirSync(destRootDir, { recursive: true });
   const canonicalDestRoot = realpathSync(destRootDir);
@@ -968,15 +1303,12 @@ export async function extractVendorSubtreeFromTarGzFile(
                 throw new Error(`unsafe_target_escape:${relValidated}`);
               }
               const mode = readTarMode(header);
-              activeOutStream = createWriteStream(targetPath, {
+              activeOutStream = new ManagedWriteStream(targetPath, {
                 flags: 'wx',
                 ...(platform !== 'win32' ? { mode } : {}),
               });
-              await cursor.streamExact(size, (chunk) => writeChunkToStream(activeOutStream!, chunk));
-              await new Promise<void>((resolve, reject) => {
-                activeOutStream!.once('error', reject);
-                activeOutStream!.end(() => resolve());
-              });
+              await cursor.streamExact(size, (chunk) => activeOutStream!.write(chunk));
+              await activeOutStream.end();
               activeOutStream = null;
               if (platform !== 'win32') {
                 chmodSync(targetPath, mode);
@@ -995,9 +1327,7 @@ export async function extractVendorSubtreeFromTarGzFile(
     }
   } catch (err) {
     if (activeOutStream) {
-      try {
-        activeOutStream.destroy();
-      } catch { /* ignore */ }
+      activeOutStream.destroy();
     }
     if (err instanceof Error && (err.message.includes('tar') || err.message.includes('unsafe') || err.message.includes('invalid') || err.message.includes('truncated'))) {
       throw err;

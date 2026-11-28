@@ -9135,4 +9135,31 @@ describe('CodexSdkProvider normalChannel startup serialization', () => {
     expect((provider as unknown as { config: unknown }).config).not.toBeNull();
     expect((provider as unknown as { idleThreadSweepTimer: unknown }).idleThreadSweepTimer).not.toBeNull();
   });
+
+  it('spawns ~/.codex/bin/codex when PATH is sparse on non-elevated connect()', async () => {
+    const tmpHome = await mkdtemp(join(tmpdir(), 'codex-sdk-home-bin-'));
+    const origHome = process.env.HOME;
+    const origPath = process.env.PATH;
+    const provider = createCodexProvider();
+    try {
+      const homeBinDir = join(tmpHome, '.codex', 'bin');
+      const homeBin = join(homeBinDir, 'codex');
+      await mkdir(homeBinDir, { recursive: true });
+      await writeFile(homeBin, '#!/bin/sh\necho 0.172.0\n', { mode: 0o755 });
+
+      process.env.HOME = tmpHome;
+      process.env.PATH = '/nonexistent-sparse-dir';
+
+      await provider.connect({
+        binaryPath: 'codex',
+        env: { CODEX_HOME: '/tmp/codex-home-fallback-test' },
+      });
+      expect(childProcessMock.spawn.mock.lastCall?.[0]).toBe(homeBin);
+      await provider.disconnect();
+    } finally {
+      if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
+      if (origPath === undefined) delete process.env.PATH; else process.env.PATH = origPath;
+      await rm(tmpHome, { recursive: true, force: true });
+    }
+  });
 });

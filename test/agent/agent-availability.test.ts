@@ -710,11 +710,13 @@ describe('detectInstalledAgents()', () => {
     await chmod(codexBin, 0o755);
 
     const unixDetected = await detectInstalledAgents({
+      forceRefresh: true,
       deps: {
         platform: 'linux',
         homeDir: tempRoot,
         imcodesHomeDir: path.join(tempRoot, '.imcodes'),
-        env: { PATH: '/usr/bin' },
+        env: { PATH: '/nonexistent-sparse-dir' },
+        isElevated: false,
         isProviderConnected: () => false,
       },
     });
@@ -729,11 +731,13 @@ describe('detectInstalledAgents()', () => {
       'c:\\users\\alice\\appdata\\local\\agy\\bin\\agy.exe',
     ]);
     const winDetected = await detectInstalledAgents({
+      forceRefresh: true,
       deps: {
         platform: 'win32',
         homeDir: winHome,
         imcodesHomeDir: 'C:\\Users\\alice\\.imcodes',
         env: { PATH: 'C:\\Windows\\System32', LOCALAPPDATA: winLocal },
+        isElevated: false,
         isExecutableFile: async (p) => winExes.has(p.toLowerCase()),
         isProviderConnected: () => false,
       },
@@ -742,5 +746,35 @@ describe('detectInstalledAgents()', () => {
     expect(winDetected.codex?.installed).toBe(true);
     expect(winDetected['claude-code-sdk']?.installed).toBe(true);
     expect(winDetected[AGY_SDK_PROVIDER_ID]?.installed).toBe(true);
+
+    // Elevation boundary: elevated callers must NOT fall back to user home ~/.codex/bin/codex[.exe]
+    const winElevated = await detectInstalledAgents({
+      forceRefresh: true,
+      deps: {
+        platform: 'win32',
+        homeDir: winHome,
+        imcodesHomeDir: 'C:\\Users\\alice\\.imcodes',
+        env: { PATH: 'C:\\Windows\\System32' },
+        isElevated: true,
+        isExecutableFile: async (p) => p.toLowerCase() === 'c:\\users\\alice\\.codex\\bin\\codex.exe',
+        isProviderConnected: () => false,
+      },
+    });
+    expect(winElevated['codex-sdk']?.installed).toBe(false);
+    expect(winElevated.codex?.installed).toBe(false);
+
+    const unixElevated = await detectInstalledAgents({
+      forceRefresh: true,
+      deps: {
+        platform: 'linux',
+        homeDir: tempRoot,
+        imcodesHomeDir: path.join(tempRoot, '.imcodes'),
+        env: { PATH: '/nonexistent-sparse-dir' },
+        isElevated: true,
+        isProviderConnected: () => false,
+      },
+    });
+    expect(unixElevated['codex-sdk']?.installed).toBe(false);
+    expect(unixElevated.codex?.installed).toBe(false);
   });
 });

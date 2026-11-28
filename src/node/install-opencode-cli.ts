@@ -20,6 +20,12 @@ import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
+import {
+  collectConfiguredNonLoopbackUrls,
+  createProxyAwareFetch,
+  filterCandidatesForIsolation,
+  isLoopbackHostname,
+} from './cli-install-helpers.js';
 
 export const OPENCODE_OFFICIAL_REGISTRY = 'https://registry.npmjs.org';
 export const OPENCODE_MIRROR_REGISTRY = 'https://registry.npmmirror.com';
@@ -286,7 +292,10 @@ export function resolveCandidateRegistries(opts: {
 
   if (Array.isArray(opts.registries) && opts.registries.length > 0) {
     for (const r of opts.registries) candidates.push(normalizeRegistryUrl(r));
-    return [...new Set(candidates.filter((v): v is string => Boolean(v)))];
+    return filterCandidatesForIsolation(
+      [...new Set(candidates.filter((v): v is string => Boolean(v)))],
+      isolatedTest,
+    );
   }
 
   candidates.push(normalizeRegistryUrl(opts.registry));
@@ -313,7 +322,10 @@ export function resolveCandidateRegistries(opts: {
     candidates.push(OPENCODE_MIRROR_REGISTRY);
   }
 
-  return [...new Set(candidates.filter((v): v is string => Boolean(v)))];
+  return filterCandidatesForIsolation(
+    [...new Set(candidates.filter((v): v is string => Boolean(v)))],
+    isolatedTest,
+  );
 }
 
 export function verifyBufferIntegrity(buffer: Buffer, dist: OpenCodeDistMetadata): void {
@@ -541,10 +553,18 @@ function buildAbortSignal(timeoutMs: number): AbortSignal | undefined {
 
 const MAX_REDIRECT_HOPS = 5;
 
-function validateDownloadUrl(rawUrl: string, allowedProto: string, strictOrigin?: string): string {
+function validateDownloadUrl(
+  rawUrl: string,
+  allowedProto: string,
+  strictOrigin?: string,
+  isolatedTest = false,
+): string {
   const parsed = new URL(rawUrl);
   if (parsed.protocol !== 'https:' && !(allowedProto === 'http:' && parsed.protocol === 'http:')) {
     throw new Error(`unsafe_tarball_protocol:${parsed.protocol}`);
+  }
+  if (isolatedTest && !isLoopbackHostname(parsed.hostname)) {
+    throw new Error(`disallowed_non_loopback_isolated_origin:${parsed.origin}`);
   }
   if (strictOrigin && parsed.origin !== strictOrigin) {
     throw new Error(`disallowed_external_origin:${parsed.origin}`);
@@ -560,9 +580,10 @@ async function fetchWithSafeRedirects(
     headers?: Record<string, string>;
     allowedProto: string;
     strictOrigin?: string;
+    isolatedTest?: boolean;
   },
 ): Promise<Response> {
-  let currentUrl = validateDownloadUrl(initialUrl, opts.allowedProto, opts.strictOrigin);
+  let currentUrl = validateDownloadUrl(initialUrl, opts.allowedProto, opts.strictOrigin, opts.isolatedTest);
   for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop += 1) {
     const res = await fetchFn(currentUrl, {
       ...(opts.headers ? { headers: opts.headers } : {}),
@@ -580,7 +601,12 @@ async function fetchWithSafeRedirects(
       if (hop === MAX_REDIRECT_HOPS) {
         throw new Error('too_many_redirects');
       }
-      currentUrl = validateDownloadUrl(new URL(location, currentUrl).toString(), opts.allowedProto, opts.strictOrigin);
+      currentUrl = validateDownloadUrl(
+        new URL(location, currentUrl).toString(),
+        opts.allowedProto,
+        opts.strictOrigin,
+        opts.isolatedTest,
+      );
       continue;
     }
     return res;
@@ -641,46 +667,61 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
   });
 
   if (registries.length === 0) {
-    return { status: 'failed', packageName, reason: 'no_valid_registry' };
+    const rejected = isolatedTest
+      ? collectConfiguredNonLoopbackUrls([
+          ...(opts.registries ?? []),
+          opts.registry,
+          env.IMCODES_OPENCODE_REGISTRY,
+        ])
+      : [];
+    return {
+      status: 'failed',
+      packageName,
+      reason: rejected.length > 0 ? `disallowed_non_loopback_isolated_origin:${rejected[0]}` : 'no_valid_registry',
+    };
   }
 
   const binaryName = platform === 'win32' ? 'opencode.exe' : 'opencode';
   const entryCandidates = [`package/bin/${binaryName}`];
   const binDir = pathMod.join(homeDir, '.opencode', 'bin');
   const destPath = pathMod.join(binDir, binaryName);
+  const proxy = await createProxyAwareFetch(fetchFn, env, { isolatedTest });
 
   let lastReason = 'unknown_error';
 
-  for (const registry of registries) {
-    try {
-      const regUrl = new URL(registry);
-      const regProto = regUrl.protocol;
-      const strictOrigin = isolatedTest ? regUrl.origin : undefined;
+  try {
+    for (const registry of registries) {
+      try {
+        const regUrl = new URL(registry);
+        const regProto = regUrl.protocol;
+        const strictOrigin = isolatedTest ? regUrl.origin : undefined;
 
-      const metaUrl = `${registry}/${encodeURIComponent(packageName)}/latest`;
-      const metaRes = await fetchWithSafeRedirects(fetchFn, metaUrl, {
-        headers: { accept: 'application/json' },
-        signal: buildAbortSignal(metadataTimeoutMs),
-        allowedProto: regProto,
-        strictOrigin,
-      });
-      if (!metaRes.ok) {
-        throw new Error(`metadata_http_${metaRes.status}`);
-      }
-      const meta = await metaRes.json() as { version?: unknown; dist?: OpenCodeDistMetadata };
-      const dist = meta?.dist;
-      const tarballUrl = typeof dist?.tarball === 'string' ? dist.tarball.trim() : '';
-      if (!tarballUrl) throw new Error('missing_tarball_url');
-      validateDownloadUrl(tarballUrl, regProto, strictOrigin);
+        const metaUrl = `${registry}/${encodeURIComponent(packageName)}/latest`;
+        const metaRes = await fetchWithSafeRedirects(proxy.fetchFn, metaUrl, {
+          headers: { accept: 'application/json' },
+          signal: buildAbortSignal(metadataTimeoutMs),
+          allowedProto: regProto,
+          strictOrigin,
+          isolatedTest,
+        });
+        if (!metaRes.ok) {
+          throw new Error(`metadata_http_${metaRes.status}`);
+        }
+        const meta = await metaRes.json() as { version?: unknown; dist?: OpenCodeDistMetadata };
+        const dist = meta?.dist;
+        const tarballUrl = typeof dist?.tarball === 'string' ? dist.tarball.trim() : '';
+        if (!tarballUrl) throw new Error('missing_tarball_url');
+        validateDownloadUrl(tarballUrl, regProto, strictOrigin, isolatedTest);
 
-      const tarRes = await fetchWithSafeRedirects(fetchFn, tarballUrl, {
-        signal: buildAbortSignal(tarballTimeoutMs),
-        allowedProto: regProto,
-        strictOrigin,
-      });
-      if (!tarRes.ok) {
-        throw new Error(`tarball_http_${tarRes.status}`);
-      }
+        const tarRes = await fetchWithSafeRedirects(proxy.fetchFn, tarballUrl, {
+          signal: buildAbortSignal(tarballTimeoutMs),
+          allowedProto: regProto,
+          strictOrigin,
+          isolatedTest,
+        });
+        if (!tarRes.ok) {
+          throw new Error(`tarball_http_${tarRes.status}`);
+        }
       const tgzBuffer = Buffer.from(await tarRes.arrayBuffer());
       if (tgzBuffer.length === 0 || tgzBuffer.length > MAX_TARBALL_BYTES) {
         throw new Error(`invalid_tarball_size:${tgzBuffer.length}`);
@@ -772,6 +813,9 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
       lastReason = err instanceof Error ? err.message : String(err);
       opts.logger?.warn?.(`attempt from ${registry} failed (${lastReason})`);
     }
+  }
+  } finally {
+    await proxy.close();
   }
 
   return {

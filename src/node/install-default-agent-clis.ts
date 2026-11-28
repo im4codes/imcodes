@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  constants as fsConstants,
   copyFileSync,
   linkSync,
   lstatSync,
@@ -7,6 +8,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  rmdirSync,
   rmSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
@@ -16,7 +18,8 @@ import { fileURLToPath } from 'node:url';
 import {
   buildAbortSignal,
   clearMacosQuarantineBestEffort,
-  createProxyDispatcherIfNeeded,
+  collectConfiguredNonLoopbackUrls,
+  createProxyAwareFetch,
   defaultCheckFileExecutable,
   defaultIsLinuxMusl,
   defaultVerifyVersion,
@@ -26,6 +29,7 @@ import {
   ensureSafePathWithinHome,
   extractSingleBinaryFromTarGzFile,
   extractVendorSubtreeFromTarGzFile,
+  filterCandidatesForIsolation,
   findCommandInEnvPath,
   getPathModule,
   normalizeRegistryUrl,
@@ -306,6 +310,44 @@ function makeUniqueSuffix(): string {
   return `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function rollbackCreatedArtifacts(createdFiles: readonly string[], createdDirs: readonly string[]): void {
+  for (let i = createdFiles.length - 1; i >= 0; i -= 1) {
+    try {
+      rmSync(createdFiles[i]!, { force: true });
+    } catch {
+      // ignore rollback cleanup failure
+    }
+  }
+  for (let i = createdDirs.length - 1; i >= 0; i -= 1) {
+    try {
+      rmdirSync(createdDirs[i]!);
+    } catch {
+      // ignore non-empty or already removed directory
+    }
+  }
+}
+
+function trackMissingDirsBeforeCreate(
+  baseDir: string,
+  relSegments: readonly string[],
+  platform: NodeJS.Platform,
+  createdDirs: string[],
+): void {
+  const pathMod = getPathModule(platform, baseDir);
+  let cur = baseDir;
+  for (const seg of relSegments) {
+    cur = pathMod.join(cur, seg);
+    if (createdDirs.includes(cur)) continue;
+    try {
+      lstatSync(cur);
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') {
+        createdDirs.push(cur);
+      }
+    }
+  }
+}
+
 function publishStagedDirectorySiblings(
   stagedRoot: string,
   targetRoot: string,
@@ -313,6 +355,8 @@ function publishStagedDirectorySiblings(
   homeDir: string,
   platform: NodeJS.Platform,
   linkFn: (existingPath: string, newPath: string) => void,
+  createdFiles: string[],
+  createdDirs: string[],
 ): void {
   const pathMod = getPathModule(platform, homeDir);
   const walk = (relParts: string[]): void => {
@@ -323,6 +367,7 @@ function publishStagedDirectorySiblings(
       if (relPosix === skipRelPath) continue;
       const srcPath = pathMod.join(stagedRoot, ...nextParts);
       if (entry.isDirectory()) {
+        trackMissingDirsBeforeCreate(homeDir, ['.codex', ...nextParts], platform, createdDirs);
         if (platform === process.platform) {
           ensureSafePathWithinHome(homeDir, ['.codex', ...nextParts], undefined, platform, true);
         } else {
@@ -331,6 +376,7 @@ function publishStagedDirectorySiblings(
         walk(nextParts);
       } else if (entry.isFile()) {
         const parentRel = ['.codex', ...relParts];
+        trackMissingDirsBeforeCreate(homeDir, parentRel, platform, createdDirs);
         if (platform === process.platform) {
           ensureSafePathWithinHome(homeDir, parentRel, entry.name, platform, true);
         } else {
@@ -338,12 +384,31 @@ function publishStagedDirectorySiblings(
         }
         const destFile = pathMod.join(targetRoot, ...nextParts);
         try {
+          const existingStat = lstatSync(destFile);
+          if (existingStat.isSymbolicLink()) {
+            throw new Error(`unsafe_symlink_target:${entry.name}`);
+          }
+          // Preserve pre-existing sibling files untouched without overwriting or tracking them for rollback.
+          continue;
+        } catch (statErr: unknown) {
+          if ((statErr as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') {
+            throw statErr;
+          }
+        }
+        try {
           linkFn(srcPath, destFile);
+          createdFiles.push(destFile);
         } catch (err: unknown) {
           const code = (err as NodeJS.ErrnoException | undefined)?.code;
           if (code === 'EEXIST') continue;
           if (code === 'EXDEV' || code === 'EPERM') {
-            copyFileSync(srcPath, destFile);
+            try {
+              copyFileSync(srcPath, destFile, fsConstants.COPYFILE_EXCL);
+            } catch (copyErr: unknown) {
+              if ((copyErr as NodeJS.ErrnoException | undefined)?.code === 'EEXIST') continue;
+              throw copyErr;
+            }
+            createdFiles.push(destFile);
             if (platform !== 'win32') {
               chmodSync(destFile, lstatSync(srcPath).mode & 0o777);
             }
@@ -434,14 +499,25 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
     isolatedTest,
   });
   if (registries.length === 0) {
-    return { status: 'failed', packageName: '@openai/codex', reason: 'no_valid_registry' };
+    const rejected = isolatedTest
+      ? collectConfiguredNonLoopbackUrls([
+          ...(opts.registries ?? []),
+          opts.registry,
+          env.IMCODES_CODEX_REGISTRY,
+        ])
+      : [];
+    return {
+      status: 'failed',
+      packageName: '@openai/codex',
+      reason: rejected.length > 0 ? `disallowed_non_loopback_isolated_origin:${rejected[0]}` : 'no_valid_registry',
+    };
   }
 
   const binaryName = platform === 'win32' ? 'codex.exe' : 'codex';
   const codexBaseDir = pathMod.join(homeDir, '.codex');
   const binDir = pathMod.join(codexBaseDir, 'bin');
   const destPath = pathMod.join(binDir, binaryName);
-  const proxy = await createProxyDispatcherIfNeeded(fetchFn, env);
+  const proxy = await createProxyAwareFetch(fetchFn, env, { isolatedTest });
 
   let lastReason = 'unknown_error';
   try {
@@ -449,6 +525,8 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
       const suffixTag = makeUniqueSuffix();
       const tmpTgz = pathMod.join(codexBaseDir, `.tmp-codex-${suffixTag}.tgz`);
       const stageDir = pathMod.join(codexBaseDir, `.tmp-codex-stage-${suffixTag}`);
+      const createdFiles: string[] = [];
+      const createdDirs: string[] = [];
 
       try {
         const regUrl = new URL(registry);
@@ -457,12 +535,12 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
 
         const encodedPkg = encodeNpmPackageName('@openai/codex');
         const rootMetaUrl = `${registry}/${encodedPkg}/latest`;
-        const rootMetaRes = await fetchWithSafeRedirects(fetchFn, rootMetaUrl, {
+        const rootMetaRes = await fetchWithSafeRedirects(proxy.fetchFn, rootMetaUrl, {
           headers: { accept: 'application/json' },
           signal: buildAbortSignal(metadataTimeoutMs),
           allowedProto: regProto,
           strictOrigin,
-          dispatcher: proxy.dispatcher,
+          isolatedTest,
         });
         if (!rootMetaRes.ok) {
           throw new Error(`metadata_http_${rootMetaRes.status}`);
@@ -474,12 +552,12 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
         }
 
         const subMetaUrl = `${registry}/${encodedPkg}/${encodeURIComponent(subVersion)}`;
-        const subMetaRes = await fetchWithSafeRedirects(fetchFn, subMetaUrl, {
+        const subMetaRes = await fetchWithSafeRedirects(proxy.fetchFn, subMetaUrl, {
           headers: { accept: 'application/json' },
           signal: buildAbortSignal(metadataTimeoutMs),
           allowedProto: regProto,
           strictOrigin,
-          dispatcher: proxy.dispatcher,
+          isolatedTest,
         });
         if (!subMetaRes.ok) {
           throw new Error(`metadata_http_${subMetaRes.status}`);
@@ -488,7 +566,7 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
         const dist = subMeta?.dist;
         const tarballUrl = typeof dist?.tarball === 'string' ? dist.tarball.trim() : '';
         if (!tarballUrl) throw new Error('missing_tarball_url');
-        validateDownloadUrl(tarballUrl, regProto, strictOrigin);
+        validateDownloadUrl(tarballUrl, regProto, strictOrigin, isolatedTest);
 
         if (platform === process.platform) {
           ensureSafePathWithinHome(homeDir, ['.codex', 'bin'], binaryName, platform, true);
@@ -496,11 +574,11 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
           mkdirSync(binDir, { recursive: true });
         }
 
-        const tarRes = await fetchWithSafeRedirects(fetchFn, tarballUrl, {
+        const tarRes = await fetchWithSafeRedirects(proxy.fetchFn, tarballUrl, {
           signal: buildAbortSignal(tarballTimeoutMs),
           allowedProto: regProto,
           strictOrigin,
-          dispatcher: proxy.dispatcher,
+          isolatedTest,
         });
         if (!tarRes.ok) {
           throw new Error(`tarball_http_${tarRes.status}`);
@@ -539,6 +617,39 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
           };
         }
 
+        // Check concurrent destination binary BEFORE publishing siblings.
+        try {
+          const existingStat = lstatSync(destPath);
+          if (existingStat.isSymbolicLink()) {
+            throw new Error(`unsafe_symlink_target:${binaryName}`);
+          }
+          opts.logger?.info?.(`found concurrent codex CLI at ${destPath} — keeping existing install`);
+          return {
+            status: 'existing',
+            path: destPath,
+            version: detectedVersion || metaVersion,
+            packageName: `@openai/codex@${subVersion}`,
+            registry,
+          };
+        } catch (destStatErr: unknown) {
+          if ((destStatErr as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') {
+            throw destStatErr;
+          }
+        }
+
+        // Publish required siblings BEFORE making the main codex binary visible; rollback any
+        // newly created siblings/directories on failure or concurrent binary publish race.
+        publishStagedDirectorySiblings(
+          stageDir,
+          codexBaseDir,
+          `bin/${binaryName}`,
+          homeDir,
+          platform,
+          linkFn,
+          createdFiles,
+          createdDirs,
+        );
+
         let publishedAsExisting = false;
         try {
           linkFn(stagedBin, destPath);
@@ -552,6 +663,7 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
         }
 
         if (publishedAsExisting) {
+          rollbackCreatedArtifacts(createdFiles, createdDirs);
           opts.logger?.info?.(`found concurrent codex CLI at ${destPath} — keeping existing install`);
           return {
             status: 'existing',
@@ -562,7 +674,6 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
           };
         }
 
-        publishStagedDirectorySiblings(stageDir, codexBaseDir, `bin/${binaryName}`, homeDir, platform, linkFn);
         ensureExecutablePermission(destPath, platform);
 
         const finalVersion = detectedVersion || metaVersion;
@@ -575,6 +686,7 @@ export async function installCodexCli(opts: InstallSingleCliOptions = {}): Promi
           registry,
         };
       } catch (err) {
+        rollbackCreatedArtifacts(createdFiles, createdDirs);
         lastReason = err instanceof Error ? err.message : String(err);
         opts.logger?.warn?.(`codex install attempt from ${registry} failed (${lastReason})`);
       } finally {
@@ -646,14 +758,25 @@ export async function installClaudeCli(opts: InstallSingleCliOptions = {}): Prom
     isolatedTest,
   });
   if (registries.length === 0) {
-    return { status: 'failed', packageName, reason: 'no_valid_registry' };
+    const rejected = isolatedTest
+      ? collectConfiguredNonLoopbackUrls([
+          ...(opts.registries ?? []),
+          opts.registry,
+          env.IMCODES_CLAUDE_REGISTRY,
+        ])
+      : [];
+    return {
+      status: 'failed',
+      packageName,
+      reason: rejected.length > 0 ? `disallowed_non_loopback_isolated_origin:${rejected[0]}` : 'no_valid_registry',
+    };
   }
 
   const binaryName = platform === 'win32' ? 'claude.exe' : 'claude';
   const entryCandidates = [`package/${binaryName}`];
   const binDir = pathMod.join(homeDir, '.local', 'bin');
   const destPath = pathMod.join(binDir, binaryName);
-  const proxy = await createProxyDispatcherIfNeeded(fetchFn, env);
+  const proxy = await createProxyAwareFetch(fetchFn, env, { isolatedTest });
 
   let lastReason = 'unknown_error';
   try {
@@ -668,12 +791,12 @@ export async function installClaudeCli(opts: InstallSingleCliOptions = {}): Prom
         const strictOrigin = isolatedTest ? regUrl.origin : undefined;
 
         const metaUrl = `${registry}/${encodeNpmPackageName(packageName)}/latest`;
-        const metaRes = await fetchWithSafeRedirects(fetchFn, metaUrl, {
+        const metaRes = await fetchWithSafeRedirects(proxy.fetchFn, metaUrl, {
           headers: { accept: 'application/json' },
           signal: buildAbortSignal(metadataTimeoutMs),
           allowedProto: regProto,
           strictOrigin,
-          dispatcher: proxy.dispatcher,
+          isolatedTest,
         });
         if (!metaRes.ok) {
           throw new Error(`metadata_http_${metaRes.status}`);
@@ -682,7 +805,7 @@ export async function installClaudeCli(opts: InstallSingleCliOptions = {}): Prom
         const dist = meta?.dist;
         const tarballUrl = typeof dist?.tarball === 'string' ? dist.tarball.trim() : '';
         if (!tarballUrl) throw new Error('missing_tarball_url');
-        validateDownloadUrl(tarballUrl, regProto, strictOrigin);
+        validateDownloadUrl(tarballUrl, regProto, strictOrigin, isolatedTest);
 
         if (platform === process.platform) {
           ensureSafePathWithinHome(homeDir, ['.local', 'bin'], binaryName, platform, true);
@@ -690,11 +813,11 @@ export async function installClaudeCli(opts: InstallSingleCliOptions = {}): Prom
           mkdirSync(binDir, { recursive: true });
         }
 
-        const tarRes = await fetchWithSafeRedirects(fetchFn, tarballUrl, {
+        const tarRes = await fetchWithSafeRedirects(proxy.fetchFn, tarballUrl, {
           signal: buildAbortSignal(tarballTimeoutMs),
           allowedProto: regProto,
           strictOrigin,
-          dispatcher: proxy.dispatcher,
+          isolatedTest,
         });
         if (!tarRes.ok) {
           throw new Error(`tarball_http_${tarRes.status}`);
@@ -792,7 +915,10 @@ export function resolveCandidateAgyManifestBases(opts: {
   const noFallback = opts.noFallback || parseBooleanEnv(env.IMCODES_OPENCODE_NO_FALLBACK);
 
   if (Array.isArray(opts.agyManifestBaseUrls) && opts.agyManifestBaseUrls.length > 0) {
-    return [...new Set(opts.agyManifestBaseUrls.map((u) => normalizeRegistryUrl(u)).filter((v): v is string => Boolean(v)))];
+    return filterCandidatesForIsolation(
+      [...new Set(opts.agyManifestBaseUrls.map((u) => normalizeRegistryUrl(u)).filter((v): v is string => Boolean(v)))],
+      Boolean(isolatedTest),
+    );
   }
 
   const candidates: Array<string | null> = [
@@ -802,7 +928,10 @@ export function resolveCandidateAgyManifestBases(opts: {
   if (!isolatedTest && !noFallback) {
     candidates.push(AGY_OFFICIAL_MANIFEST_BASE_URL);
   }
-  return [...new Set(candidates.filter((v): v is string => Boolean(v)))];
+  return filterCandidatesForIsolation(
+    [...new Set(candidates.filter((v): v is string => Boolean(v)))],
+    Boolean(isolatedTest),
+  );
 }
 
 function isGzipArchiveFile(filePath: string, urlStr: string): boolean {
@@ -866,7 +995,18 @@ export async function installAgyCli(opts: InstallSingleCliOptions = {}): Promise
     isolatedTest,
   });
   if (bases.length === 0) {
-    return { status: 'failed', packageName: `agy:${manifestPlatform}`, reason: 'no_valid_manifest_base' };
+    const rejected = isolatedTest
+      ? collectConfiguredNonLoopbackUrls([
+          ...(opts.agyManifestBaseUrls ?? []),
+          opts.agyManifestBaseUrl,
+          env.IMCODES_AGY_MANIFEST_BASE_URL,
+        ])
+      : [];
+    return {
+      status: 'failed',
+      packageName: `agy:${manifestPlatform}`,
+      reason: rejected.length > 0 ? `disallowed_non_loopback_isolated_origin:${rejected[0]}` : 'no_valid_manifest_base',
+    };
   }
 
   const binaryName = platform === 'win32' ? 'agy.exe' : 'agy';
@@ -875,7 +1015,7 @@ export async function installAgyCli(opts: InstallSingleCliOptions = {}): Promise
     : ['antigravity', 'agy', 'bin/agy', 'bin/antigravity'];
   const binDir = pathMod.join(homeDir, '.local', 'bin');
   const destPath = pathMod.join(binDir, binaryName);
-  const proxy = await createProxyDispatcherIfNeeded(fetchFn, env);
+  const proxy = await createProxyAwareFetch(fetchFn, env, { isolatedTest });
 
   let lastReason = 'unknown_error';
   try {
@@ -890,12 +1030,12 @@ export async function installAgyCli(opts: InstallSingleCliOptions = {}): Promise
         const strictOrigin = isolatedTest ? parsedBase.origin : undefined;
 
         const manifestUrl = `${baseUrl}/manifests/${manifestPlatform}.json`;
-        const manifestRes = await fetchWithSafeRedirects(fetchFn, manifestUrl, {
+        const manifestRes = await fetchWithSafeRedirects(proxy.fetchFn, manifestUrl, {
           headers: { accept: 'application/json' },
           signal: buildAbortSignal(metadataTimeoutMs),
           allowedProto: baseProto,
           strictOrigin,
-          dispatcher: proxy.dispatcher,
+          isolatedTest,
         });
         if (!manifestRes.ok) {
           throw new Error(`manifest_http_${manifestRes.status}`);
@@ -905,7 +1045,7 @@ export async function installAgyCli(opts: InstallSingleCliOptions = {}): Promise
         const sha512 = typeof manifest?.sha512 === 'string' ? manifest.sha512.trim() : '';
         if (!downloadUrl) throw new Error('missing_manifest_download_url');
         if (!sha512) throw new Error('missing_manifest_sha512');
-        validateDownloadUrl(downloadUrl, baseProto, strictOrigin);
+        validateDownloadUrl(downloadUrl, baseProto, strictOrigin, isolatedTest);
 
         if (platform === process.platform) {
           ensureSafePathWithinHome(homeDir, ['.local', 'bin'], binaryName, platform, true);
@@ -913,11 +1053,11 @@ export async function installAgyCli(opts: InstallSingleCliOptions = {}): Promise
           mkdirSync(binDir, { recursive: true });
         }
 
-        const payloadRes = await fetchWithSafeRedirects(fetchFn, downloadUrl, {
+        const payloadRes = await fetchWithSafeRedirects(proxy.fetchFn, downloadUrl, {
           signal: buildAbortSignal(downloadTimeoutMs),
           allowedProto: baseProto,
           strictOrigin,
-          dispatcher: proxy.dispatcher,
+          isolatedTest,
         });
         if (!payloadRes.ok) {
           throw new Error(`download_http_${payloadRes.status}`);

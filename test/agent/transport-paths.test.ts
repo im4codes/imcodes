@@ -8,6 +8,7 @@ import {
   parseNpmCmdShim,
   resolveExecutableForSpawn,
   resolveClaudeCodePathForSdk,
+  resolveCodexPathForPty,
   resolveCodexPathForSdk,
   resolveAgyPathForSdk,
   resolveGrokPathForSdk,
@@ -721,6 +722,69 @@ describe('resolveCodexPathForSdk', () => {
       fs.writeFileSync(pathCodex, '#!/bin/sh\necho 0.172.0\n', { mode: 0o755 });
       process.env.PATH = pathBin;
       expect(resolveCodexPathForSdk('codex')).toBe('codex');
+
+      // Elevation guard skips ~/.codex/bin fallback for elevated callers while preserving PATH & explicit paths
+      expect(resolveCodexPathForSdk('codex', { homeDir: tmpDir, env: { PATH: '/nonexistent-sparse-dir' }, isElevated: true })).toBe('codex');
+      expect(resolveCodexPathForPty('codex', { homeDir: tmpDir, env: { PATH: '/nonexistent-sparse-dir' }, isElevated: true })).toBe('codex');
+      expect(resolveCodexPathForPty('codex', { homeDir: tmpDir, env: { PATH: '/nonexistent-sparse-dir' }, isElevated: false })).toBe(homeCodex);
+
+      // Root running for /root is allowed, root with non-/root home is refused
+      expect(resolveCodexPathForSdk('codex', { homeDir: '/tmp/non-root-home', env: { PATH: '/nonexistent-sparse-dir' }, isElevated: true })).toBe('codex');
+
+      // Windows npm .cmd shim: SDK unwraps to .js for direct node spawn, PTY keeps shim command (never .js)
+      const winFake = fs.mkdtempSync(path.join(require('os').tmpdir(), 'codex-win-shim-'));
+      try {
+        const npmBin = path.join(winFake, 'npm-bin');
+        const pkgDir = path.join(npmBin, 'node_modules', '@openai', 'codex', 'bin');
+        fs.mkdirSync(pkgDir, { recursive: true });
+        const scriptJs = path.join(pkgDir, 'codex.js');
+        const cmdShim = path.join(npmBin, 'codex.cmd');
+        fs.writeFileSync(scriptJs, 'console.log("ok");\n');
+        fs.writeFileSync(cmdShim, `@ECHO off\r\n"%dp0%\\node.exe" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n`);
+
+        expect(resolveCodexPathForSdk('codex', {
+          platform: 'win32',
+          env: { PATH: npmBin, PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+          isElevated: false,
+        })).toBe(scriptJs);
+
+        expect(resolveCodexPathForPty('codex', {
+          platform: 'win32',
+          env: { PATH: npmBin, PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+          isElevated: false,
+        })).toBe('codex');
+
+        // Global npm dir outside PATH still unwraps for SDK and keeps .cmd for PTY
+        expect(resolveCodexPathForSdk('codex', {
+          platform: 'win32',
+          env: { PATH: 'C:\\Windows\\System32', APPDATA: winFake, PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+          homeDir: path.join(winFake, 'no-home'),
+          isElevated: false,
+        })).toBe('codex');
+
+        const appNpm = path.join(winFake, 'npm');
+        const appPkgDir = path.join(appNpm, 'node_modules', '@openai', 'codex', 'bin');
+        fs.mkdirSync(appPkgDir, { recursive: true });
+        const appJs = path.join(appPkgDir, 'codex.js');
+        const appCmd = path.join(appNpm, 'codex.cmd');
+        fs.writeFileSync(appJs, 'console.log("ok");\n');
+        fs.writeFileSync(appCmd, `@ECHO off\r\n"%dp0%\\node.exe" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n`);
+
+        expect(resolveCodexPathForSdk('codex', {
+          platform: 'win32',
+          env: { PATH: 'C:\\Windows\\System32', APPDATA: winFake, PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+          homeDir: path.join(winFake, 'no-home'),
+          isElevated: false,
+        })).toBe(appJs);
+        expect(resolveCodexPathForPty('codex', {
+          platform: 'win32',
+          env: { PATH: 'C:\\Windows\\System32', APPDATA: winFake, PATHEXT: '.COM;.EXE;.BAT;.CMD' },
+          homeDir: path.join(winFake, 'no-home'),
+          isElevated: false,
+        })).toBe(appCmd);
+      } finally {
+        fs.rmSync(winFake, { recursive: true, force: true });
+      }
 
       // Explicit custom paths are preserved verbatim
       expect(resolveCodexPathForSdk('/custom/bin/codex')).toBe('/custom/bin/codex');

@@ -4,6 +4,7 @@ import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import type { ChildProcess } from 'node:child_process';
+import { canUseOpenCodeHomeFallbackSync, type ResolveOpenCodeCliOptions } from './opencode-cli-path.js';
 
 export function normalizeTransportCwd(cwd?: string): string | undefined {
   if (typeof cwd !== 'string' || !cwd.trim()) return undefined;
@@ -422,41 +423,74 @@ export function resolveAgyPathForSdk(name = 'agy'): string {
   return name;
 }
 
-export function resolveCodexPathForSdk(name = 'codex'): string {
+export type ResolveCodexPathOptions = Pick<ResolveOpenCodeCliOptions, 'env' | 'platform' | 'homeDir' | 'isElevated'>;
+
+function findCodexOnWindowsDirs(dirs: readonly string[], env: NodeJS.ProcessEnv): string | null {
+  const pathExtRaw = env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
+  const exts = uniqueNonEmpty(pathExtRaw.split(';').flatMap((e) => [e.toLowerCase(), e]));
+  const extsToTry = [...exts, ''];
+  for (const dir of dirs) {
+    for (const ext of extsToTry) {
+      const candidate = path.join(dir, `codex${ext}`);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
+  return null;
+}
+
+function resolveCodexPath(name: string, mode: 'sdk' | 'pty', opts: ResolveCodexPathOptions = {}): string {
   const trimmed = name.trim();
   if (!trimmed || trimmed !== 'codex') {
     return name;
   }
-  if (process.platform === 'win32') {
-    const resolvedOnPath = resolveBinaryOnWindows(trimmed);
-    if (resolvedOnPath !== trimmed) {
-      if (/\.(cmd|bat)$/i.test(resolvedOnPath)) {
-        return parseNpmCmdShim(resolvedOnPath) ?? resolvedOnPath;
-      }
-      return resolvedOnPath;
+  const platform = opts.platform ?? process.platform;
+  const env = opts.env ?? process.env;
+  if (platform === 'win32') {
+    const pathDirs = uniqueNonEmpty((env.PATH ?? '').split(';'));
+    const onPath = findCodexOnWindowsDirs(pathDirs, env);
+    if (onPath) {
+      if (mode === 'pty') return trimmed;
+      return /\.(cmd|bat)$/i.test(onPath) ? (parseNpmCmdShim(onPath) ?? onPath) : onPath;
     }
-    const home = process.env.USERPROFILE || process.env.HOME || homedir();
-    if (home) {
+    const globalDirs = uniqueNonEmpty([
+      env.APPDATA ? path.join(env.APPDATA, 'npm') : undefined,
+      env.USERPROFILE ? path.join(env.USERPROFILE, 'AppData', 'Roaming', 'npm') : undefined,
+    ]);
+    const inGlobal = findCodexOnWindowsDirs(globalDirs, env);
+    if (inGlobal) {
+      if (mode === 'pty') return inGlobal;
+      return /\.(cmd|bat)$/i.test(inGlobal) ? (parseNpmCmdShim(inGlobal) ?? inGlobal) : inGlobal;
+    }
+    const home = opts.homeDir ?? (env.USERPROFILE || env.HOME || homedir());
+    if (home && canUseOpenCodeHomeFallbackSync('win32', home, { env, isElevated: opts.isElevated })) {
       const homeBin = path.win32.join(home, '.codex', 'bin', 'codex.exe');
       if (isBundledClaudeBinaryFileSync(homeBin, 'win32')) return homeBin;
     }
     return trimmed;
   }
-  const pathDirs = (process.env.PATH ?? '').split(':').map((d) => d.trim()).filter(Boolean);
+  const pathDirs = (env.PATH ?? '').split(':').map((d) => d.trim()).filter(Boolean);
   for (const dir of pathDirs) {
     const candidate = path.join(dir, 'codex');
-    if (isBundledClaudeBinaryFileSync(candidate, process.platform)) {
+    if (isBundledClaudeBinaryFileSync(candidate, platform)) {
       return trimmed;
     }
   }
-  const home = process.env.HOME || homedir();
-  if (home) {
+  const home = opts.homeDir ?? (env.HOME || homedir());
+  if (home && canUseOpenCodeHomeFallbackSync(platform, home, { env, isElevated: opts.isElevated })) {
     const homeBin = path.join(home, '.codex', 'bin', 'codex');
-    if (isBundledClaudeBinaryFileSync(homeBin, process.platform)) {
+    if (isBundledClaudeBinaryFileSync(homeBin, platform)) {
       return homeBin;
     }
   }
   return trimmed;
+}
+
+export function resolveCodexPathForSdk(name = 'codex', opts: ResolveCodexPathOptions = {}): string {
+  return resolveCodexPath(name, 'sdk', opts);
+}
+
+export function resolveCodexPathForPty(name = 'codex', opts: ResolveCodexPathOptions = {}): string {
+  return resolveCodexPath(name, 'pty', opts);
 }
 
 function getUnixMuseCodeInstallCandidates(): string[] {

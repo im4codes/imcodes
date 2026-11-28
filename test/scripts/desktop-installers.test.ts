@@ -3405,5 +3405,95 @@ chmod 755 "$home_arg/.codex/bin/codex" "$home_arg/.local/bin/claude"
     expect(ps1).toContain('IMCODES_SKIP_AGENT_CLIS');
     expect(ps1).toContain("$codexBinDir = Join-Path $codexBaseDir 'bin'");
     expect(ps1).toContain("$localBinDir = Join-Path $localBaseDir 'bin'");
+    expect(ps1).toContain('function Test-WindowsCliPathsSafe');
+    expect(ps1).toContain('[System.Management.Automation.PowerShell]::Create()');
+  });
+
+  it('runs POSIX default agent CLIs concurrently when unified JS is present and isolates single-CLI symlinks without blocking siblings', () => {
+    const root = makeTempDir('imcodes-posix-conc-');
+    const runnerPath = join(root, 'phase-a-linux.sh');
+    writeFileSync(
+      runnerPath,
+      renderPosixPhaseARunnerScript({
+        platform: 'linux',
+        version: '0.9.5',
+        cliWrapperContent: '#!/bin/sh\necho ok\n',
+      }),
+      { mode: 0o755 },
+    );
+
+    const rtDir = join(root, 'stage-rt');
+    mkdirSync(join(rtDir, 'bin'), { recursive: true });
+    mkdirSync(join(rtDir, 'package', 'dist', 'src', 'node'), { recursive: true });
+    writeFileSync(join(rtDir, 'package', 'package.json'), JSON.stringify({ name: 'imcodes', version: '0.9.5' }));
+    writeFileSync(join(rtDir, 'package', 'dist', 'src', 'index.js'), 'console.log("ok");\n');
+    writeFileSync(join(rtDir, 'package', 'dist', 'src', 'node', 'install-opencode-cli.js'), '// oc\n');
+    writeFileSync(join(rtDir, 'package', 'dist', 'src', 'node', 'install-default-agent-clis.js'), '// default\n');
+    const traceFile = join(root, 'unified-node.log');
+    writeFileSync(
+      join(rtDir, 'bin', 'node'),
+      `#!/bin/sh\necho "NODE_CALL args=$*" >> "${traceFile}"\nexit 0\n`,
+      { mode: 0o755 },
+    );
+
+    // 1. Symlinked .local/bin/claude only sets --skip-claude; codex, opencode, and agy are still passed to install-default-agent-clis.js!
+    const isoSym = join(root, 'iso-single-sym');
+    const homeSym = join(root, 'home-single-sym');
+    const decoy = join(root, 'decoy');
+    mkdirSync(join(isoSym, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoSym, 'daemon-runtime', 'releases', '0.9.5')]);
+    mkdirSync(join(homeSym, '.local', 'bin'), { recursive: true });
+    mkdirSync(decoy, { recursive: true });
+    symlinkSync(decoy, join(homeSym, '.local', 'bin', 'claude'));
+
+    const resSym = spawnSync(
+      runnerPath,
+      ['--isolated-root', isoSym, '--home', homeSym, '--confirm-fda-switch', '--no-service-control'],
+      {
+        env: {
+          ...process.env,
+          IMCODES_OPENCODE_INSTALL_HOOK: '',
+          IMCODES_DEFAULT_CLIS_INSTALL_HOOK: '',
+          IMCODES_NPM_REGISTRY: 'http://127.0.0.1:9',
+          IMCODES_AGY_MANIFEST_BASE_URL: 'http://127.0.0.1:9',
+        },
+        encoding: 'utf8',
+      },
+    );
+    expect(resSym.status).toBe(0);
+    expect(resSym.stderr).toContain('refusing symlinked agent CLI target path (claude:');
+    const traceText = readFileSync(traceFile, 'utf8');
+    expect(traceText).toContain('install-default-agent-clis.js');
+    expect(traceText).toContain('--skip-claude');
+    expect(traceText).not.toContain('--skip-codex');
+    expect(traceText).not.toContain('--skip-agy');
+    expect(traceText).not.toContain('--skip-opencode');
+
+    // 2. Hook mode runs slow OpenCode hook concurrently with fast default-CLIs hook (default finishes BEFORE slow opencode sleeps out)
+    const isoConc = join(root, 'iso-conc');
+    const homeConc = join(root, 'home-conc');
+    mkdirSync(join(isoConc, 'daemon-runtime', 'releases', '0.9.5'), { recursive: true });
+    execFileSync('cp', ['-R', `${rtDir}/.`, join(isoConc, 'daemon-runtime', 'releases', '0.9.5')]);
+    const orderFile = join(root, 'hook-order.log');
+    const slowOcHook = join(root, 'slow-oc-hook.sh');
+    const fastDefaultHook = join(root, 'fast-default-hook.sh');
+    writeFileSync(slowOcHook, `#!/bin/sh\nsleep 0.4\necho "OC_DONE" >> "${orderFile}"\n`, { mode: 0o755 });
+    writeFileSync(fastDefaultHook, `#!/bin/sh\necho "DEFAULT_DONE" >> "${orderFile}"\n`, { mode: 0o755 });
+
+    const resConc = execFileSync(
+      runnerPath,
+      ['--isolated-root', isoConc, '--home', homeConc, '--confirm-fda-switch', '--no-service-control'],
+      {
+        env: {
+          ...process.env,
+          IMCODES_OPENCODE_INSTALL_HOOK: slowOcHook,
+          IMCODES_DEFAULT_CLIS_INSTALL_HOOK: fastDefaultHook,
+        },
+        encoding: 'utf8',
+      },
+    );
+    expect(resConc).toContain('INSTALL_OK');
+    const orderLines = readFileSync(orderFile, 'utf8').trim().split('\n');
+    expect(orderLines).toEqual(['DEFAULT_DONE', 'OC_DONE']);
   });
 });

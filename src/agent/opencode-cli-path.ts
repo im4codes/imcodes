@@ -154,7 +154,7 @@ function canUseHomeWithElevationResult(platform: NodeJS.Platform, homeDir: strin
   return platform !== 'win32' && homeDir === '/root';
 }
 
-function canUseOpenCodeHomeFallbackSync(platform: NodeJS.Platform, homeDir: string, opts: ResolveOpenCodeCliOptions): boolean {
+export function canUseOpenCodeHomeFallbackSync(platform: NodeJS.Platform, homeDir: string, opts: ResolveOpenCodeCliOptions = {}): boolean {
   if (!homeDir || !homeDir.trim()) return false;
   const elevated = typeof opts.isElevated === 'function'
     ? opts.isElevated()
@@ -164,7 +164,7 @@ function canUseOpenCodeHomeFallbackSync(platform: NodeJS.Platform, homeDir: stri
   return canUseHomeWithElevationResult(platform, homeDir, elevated);
 }
 
-async function canUseOpenCodeHomeFallbackAsync(platform: NodeJS.Platform, homeDir: string, opts: ResolveOpenCodeCliOptions): Promise<boolean> {
+export async function canUseOpenCodeHomeFallbackAsync(platform: NodeJS.Platform, homeDir: string, opts: ResolveOpenCodeCliOptions = {}): Promise<boolean> {
   if (!homeDir || !homeDir.trim()) return false;
   const elevated = typeof opts.isElevated === 'function'
     ? opts.isElevated()
@@ -244,7 +244,7 @@ export function resolveOpenCodeCliSync(opts: ResolveOpenCodeCliOptions = {}): Re
 }
 
 export function quoteShellBinary(bin: string, platform: NodeJS.Platform = process.platform): string {
-  if (bin === 'opencode') return 'opencode';
+  if (bin === 'opencode' || bin === 'codex') return bin;
   if (platform === 'win32') return `"${bin}"`;
   return `'${bin.replace(/'/gu, `'\\''`)}'`;
 }

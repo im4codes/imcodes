@@ -229,6 +229,37 @@ describe('CodexDriver', () => {
     expect(driver.buildResumeCommand('deck_proj_w1', { codexSessionId: 'codex-1' })).toContain(`-c ${expected}`);
   });
 
+  it('never unwraps Windows .cmd shims to .js in PTY launch/resume commands', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'codex-drv-win-'));
+    const origPlatform = process.platform;
+    const origPath = process.env.PATH;
+    const origPathext = process.env.PATHEXT;
+    try {
+      const npmBin = path.join(tmpDir, 'npm-bin');
+      const pkgDir = path.join(npmBin, 'node_modules', '@openai', 'codex', 'bin');
+      mkdirSync(pkgDir, { recursive: true });
+      writeFileSync(path.join(pkgDir, 'codex.js'), 'console.log("ok");\n');
+      writeFileSync(
+        path.join(npmBin, 'codex.cmd'),
+        `@ECHO off\r\n"%dp0%\\node.exe" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n`,
+      );
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      process.env.PATH = npmBin;
+      process.env.PATHEXT = '.COM;.EXE;.BAT;.CMD';
+
+      const launchCmd = driver.buildLaunchCommand('deck_proj_w1', { fresh: true });
+      const resumeCmd = driver.buildResumeCommand('deck_proj_w1', { codexSessionId: 'codex-1' });
+      expect(launchCmd).toMatch(/^codex -m |^codex -c /);
+      expect(launchCmd).not.toContain('codex.js');
+      expect(resumeCmd).not.toContain('codex.js');
+    } finally {
+      Object.defineProperty(process, 'platform', { value: origPlatform, configurable: true });
+      if (origPath === undefined) delete process.env.PATH; else process.env.PATH = origPath;
+      if (origPathext === undefined) delete process.env.PATHEXT; else process.env.PATHEXT = origPathext;
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   it('captureLastResponse uses capture-pane (no /copy)', async () => {
     const capturePane = vi.fn().mockResolvedValue(['response line']);
     const sendKeys = vi.fn().mockResolvedValue(undefined);
