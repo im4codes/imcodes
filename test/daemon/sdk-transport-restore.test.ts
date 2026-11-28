@@ -4224,6 +4224,7 @@ describe('sdk transport session restore', () => {
       expect(clearedInit).toMatchObject({
         sessionName: name,
         resumeId: 'kimi-resume-1',
+        strictResume: true,
       });
       expect(clearedInit?.kimiLlm).toBeUndefined();
       expect(clearedInit?.agentId).toBeUndefined();

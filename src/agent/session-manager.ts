@@ -1310,6 +1310,8 @@ export interface LaunchOpts extends SessionIncognitoConfig {
   bindExistingKey?: string;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
   skipCreate?: boolean;
+  /** When true, fail explicitly instead of silently creating a fresh conversation if resume fails. */
+  strictResume?: boolean;
   /** Parent session name for sub-sessions (used to group in UI). */
   parentSession?: string;
   /** Mark as user-created (not auto-synced from provider). Protected from sync/health cleanup. */
@@ -1558,7 +1560,7 @@ export async function relaunchSessionWithSettings(
         ...(!targetFresh ? { skipCreate: true } : {}),
       } : {}),
       ...(!targetFresh && record.agentType === targetAgentType && usesProviderResumeId(targetAgentType) && record.providerResumeId
-        ? { providerResumeId: record.providerResumeId }
+        ? { providerResumeId: record.providerResumeId, strictResume: true }
         : {}),
       ...compatibleIds,
       ...(record.shellBin && isShellLikeTarget ? { shellBin: record.shellBin } : {}),
@@ -4372,6 +4374,7 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     agentId: requestedTransportModel,
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
+    ...(opts.strictResume ? { strictResume: true } : {}),
     resumeId: transportResumeId,
     ...(effectiveSkipCreate && typeof effectiveTransportConfig?.openCodeStorageOwner === 'string'
       ? { openCodeStorageOwner: effectiveTransportConfig.openCodeStorageOwner as 'v1-cli' | 'v2-cli' | 'embedded' }

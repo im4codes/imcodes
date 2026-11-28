@@ -1912,7 +1912,6 @@ describe('KimiV2Provider', () => {
               },
             })),
           }),
-          makeMockConn(), // default route probe for listModels() under testBaseShareDir
           makeMockConn(), // OpenAI preset route
         );
         await provider.createSession({
@@ -1984,11 +1983,11 @@ describe('KimiV2Provider', () => {
             models: [{ id: 'gpt-compat', contextWindow: 128_000 }],
           },
         });
-        expect(mockSpawn).toHaveBeenCalledTimes(4);
+        expect(mockSpawn).toHaveBeenCalledTimes(3);
         const { existsSync } = await import('node:fs');
         // Anthropic preset session is still open on its own route, so both preset share dirs stay isolated until ended/disconnected.
         expect(existsSync(capturedShareDir!)).toBe(true);
-        const openaiEnv = (mockSpawn.mock.calls[3]![2] as { env: NodeJS.ProcessEnv }).env;
+        const openaiEnv = (mockSpawn.mock.calls[2]![2] as { env: NodeJS.ProcessEnv }).env;
         const openaiShareDir = openaiEnv.KIMI_SHARE_DIR!;
         const openaiToml = readFileSync(path.join(openaiShareDir, 'config.toml'), 'utf8');
         expect(openaiToml).toContain('type = "openai_legacy"');
@@ -2112,6 +2111,216 @@ describe('KimiV2Provider', () => {
       await vi.waitFor(() => expect(errorsA).toContainEqual({ code: 'CANCELLED' }));
 
       await provider.disconnect();
+    } finally {
+      if (origShareEnv !== undefined) {
+        process.env.KIMI_SHARE_DIR = origShareEnv;
+      } else {
+        delete process.env.KIMI_SHARE_DIR;
+      }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not kill route A while A is mid-newSession when route B launches, and preserves new-generation shareDir across same-route delayed teardown', async () => {
+    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-bindrace-')));
+    const origShareEnv = process.env.KIMI_SHARE_DIR;
+    const baseShareDir = path.join(tmpDir, 'base-share');
+    mkdirSync(baseShareDir, { recursive: true });
+    process.env.KIMI_SHARE_DIR = baseShareDir;
+
+    try {
+      let resolveNewSessionA!: (v: unknown) => void;
+      const connA = makeMockConn({
+        newSession: vi.fn(() => new Promise((r) => { resolveNewSessionA = r; })),
+      });
+      const connB = makeMockConn({
+        newSession: vi.fn(async () => ({ sessionId: 'acp-b-1' })),
+      });
+      state.connQueue.push(connA, connB);
+
+      const provider = new KimiV2Provider();
+      await provider.connect({});
+
+      // Start A; initialize finishes, newSession hangs (so connectingPromise cleared & boundEnvKey not yet set).
+      const createA = provider.createSession({ sessionKey: 'sess-a', cwd: tmpDir });
+      await vi.waitFor(() => expect(resolveNewSessionA).toBeTypeOf('function'));
+
+      // Concurrently start B on a different preset route -> MUST NOT kill A!
+      await provider.createSession({
+        sessionKey: 'sess-b',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: {
+          provider: 'glm5.3',
+          providerType: 'anthropic',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          apiKey: 'bind-key-b',
+          model: 'glm-5.3-flash',
+          contextWindow: 1_000_000,
+          models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+        },
+      });
+      expect(mockKillProcessTree).not.toHaveBeenCalled();
+
+      // Release A's newSession -> both sessions bind & send cleanly; closing each cleans only itself
+      resolveNewSessionA({ sessionId: 'acp-a-1' });
+      await createA;
+      await provider.send('sess-a', 'hello A');
+      await provider.send('sess-b', 'hello B');
+      expect(connA.prompt).toHaveBeenCalledTimes(1);
+      expect(connB.prompt).toHaveBeenCalledTimes(1);
+
+      const shareDirB = (mockSpawn.mock.calls[1]![2] as { env: NodeJS.ProcessEnv }).env.KIMI_SHARE_DIR!;
+      const { existsSync } = await import('node:fs');
+      await provider.endSession('sess-a');
+      expect(existsSync(shareDirB)).toBe(true);
+      await provider.endSession('sess-b');
+      expect(existsSync(shareDirB)).toBe(false);
+
+      // Same-route delayed teardown: capture old shareDir BEFORE awaiting killProcessTree so reconnect cannot delete new shareDir
+      const connC1 = makeMockConn({ newSession: vi.fn(async () => ({ sessionId: 'acp-c-1' })) });
+      const connC2 = makeMockConn({ newSession: vi.fn(async () => ({ sessionId: 'acp-c-2' })) });
+      state.connQueue.push(connC1, connC2);
+      await provider.createSession({
+        sessionKey: 'sess-c',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: {
+          provider: 'glm5.3',
+          providerType: 'anthropic',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          apiKey: 'key-c',
+          model: 'glm-5.3-flash',
+          contextWindow: 1_000_000,
+          models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+        },
+      });
+      const shareDirC1 = (mockSpawn.mock.calls[2]![2] as { env: NodeJS.ProcessEnv }).env.KIMI_SHARE_DIR!;
+      expect(existsSync(shareDirC1)).toBe(true);
+
+      let resolveKillC1!: () => void;
+      mockKillProcessTree.mockImplementationOnce(async () => {
+        await new Promise<void>((r) => { resolveKillC1 = r; });
+      });
+      const endingC1 = provider.endSession('sess-c');
+      await vi.waitFor(() => expect(resolveKillC1).toBeTypeOf('function'));
+      // Re-create same preset session while C1 teardown kill is still awaiting
+      const recreateC2 = provider.createSession({
+        sessionKey: 'sess-c2',
+        cwd: tmpDir,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: {
+          provider: 'glm5.3',
+          providerType: 'anthropic',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          apiKey: 'key-c',
+          model: 'glm-5.3-flash',
+          contextWindow: 1_000_000,
+          models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+        },
+      });
+      resolveKillC1();
+      await Promise.all([endingC1, recreateC2]);
+      const shareDirC2 = (mockSpawn.mock.calls[3]![2] as { env: NodeJS.ProcessEnv }).env.KIMI_SHARE_DIR!;
+      expect(shareDirC2).not.toBe(shareDirC1);
+      expect(existsSync(shareDirC1)).toBe(false);
+      expect(existsSync(shareDirC2)).toBe(true);
+
+      await provider.disconnect();
+      expect(existsSync(shareDirC2)).toBe(false);
+    } finally {
+      if (origShareEnv !== undefined) {
+        process.env.KIMI_SHARE_DIR = origShareEnv;
+      } else {
+        delete process.env.KIMI_SHARE_DIR;
+      }
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('registers cwd in base kimi.json preserving metadata/no credentials and fails closed on strictResume when resume fails', async () => {
+    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-wd-sync-')));
+    const projCwd = path.join(tmpDir, 'never-seen-cwd');
+    mkdirSync(projCwd, { recursive: true });
+    const baseShareDir = path.join(tmpDir, 'base-share');
+    mkdirSync(baseShareDir, { recursive: true });
+    writeFileSync(
+      path.join(baseShareDir, 'kimi.json'),
+      JSON.stringify({
+        extraOwnerField: 'keep-me',
+        work_dirs: [{ path: '/existing/other', kaos: 'local', last_session_id: 'other-sess-9' }],
+      }),
+      { mode: 0o600 },
+    );
+
+    const origShareEnv = process.env.KIMI_SHARE_DIR;
+    process.env.KIMI_SHARE_DIR = baseShareDir;
+    try {
+      const connPreset = makeMockConn({ newSession: vi.fn(async () => ({ sessionId: 'kimi-shared-1' })) });
+      const connDefaultOk = makeMockConn({ resumeSession: vi.fn(async () => ({ configOptions: [] })) });
+      const connDefaultFail = makeMockConn({
+        resumeSession: vi.fn(async () => { throw new RequestError(-32002, 'Session not found'); }),
+        newSession: vi.fn(async () => ({ sessionId: 'should-never-be-created' })),
+      });
+      state.connQueue.push(connPreset, connDefaultOk, connDefaultFail);
+
+      const provider = new KimiV2Provider();
+      await provider.connect({});
+      await provider.createSession({
+        sessionKey: 'sess-preset',
+        cwd: projCwd,
+        agentId: 'glm-5.3-flash',
+        kimiLlm: {
+          provider: 'glm5.3',
+          providerType: 'anthropic',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          apiKey: 'never-write-to-base-kimi',
+          model: 'glm-5.3-flash',
+          contextWindow: 1_000_000,
+          models: [{ id: 'glm-5.3-flash', contextWindow: 1_000_000 }],
+        },
+      });
+
+      const baseMeta = JSON.parse(readFileSync(path.join(baseShareDir, 'kimi.json'), 'utf8')) as {
+        extraOwnerField?: string;
+        work_dirs?: Array<{ path: string; kaos: string; last_session_id: string | null }>;
+      };
+      expect(baseMeta.extraOwnerField).toBe('keep-me');
+      expect(baseMeta.work_dirs).toEqual([
+        { path: '/existing/other', kaos: 'local', last_session_id: 'other-sess-9' },
+        { path: projCwd, kaos: 'local', last_session_id: null },
+      ]);
+      const { existsSync } = await import('node:fs');
+      expect(existsSync(path.join(baseShareDir, 'config.toml'))).toBe(false);
+      expect(readFileSync(path.join(baseShareDir, 'kimi.json'), 'utf8')).not.toContain('never-write-to-base-kimi');
+
+      // Clearing back to default with strictResume succeeds on the same native id
+      await provider.endSession('sess-preset');
+      await provider.createSession({
+        sessionKey: 'sess-default-restored',
+        cwd: projCwd,
+        resumeId: 'kimi-shared-1',
+        strictResume: true,
+      });
+      expect(connDefaultOk.resumeSession).toHaveBeenCalledWith({
+        sessionId: 'kimi-shared-1',
+        cwd: projCwd,
+        mcpServers: expect.any(Array),
+      });
+
+      // Strict resume MUST fail loudly and NEVER fall back to newSession when session is missing
+      const providerFail = new KimiV2Provider();
+      await providerFail.connect({});
+      await expect(providerFail.createSession({
+        sessionKey: 'sess-strict-fail',
+        cwd: projCwd,
+        resumeId: 'missing-id',
+        strictResume: true,
+      })).rejects.toThrow();
+      expect(connDefaultFail.newSession).not.toHaveBeenCalled();
+
+      await provider.disconnect();
+      await providerFail.disconnect();
     } finally {
       if (origShareEnv !== undefined) {
         process.env.KIMI_SHARE_DIR = origShareEnv;

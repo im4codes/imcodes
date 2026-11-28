@@ -393,6 +393,8 @@ export interface SessionConfig extends SessionIncognitoConfig {
   effort?: TransportEffortLevel;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
   skipCreate?: boolean;
+  /** When true, fail explicitly instead of silently starting a fresh conversation if resume fails. */
+  strictResume?: boolean;
   /** When true, the runtime must NOT re-inject startup memory on the next turn
    *  (session is being restored or restarted without /clear; the provider
    *  already received startup memory in a prior run). The runtime still emits
