@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import {
+  allocateTurnAuthorityIssueSeq,
   bindProcessSharedMachineActivity,
   bindSdkTurnOriginsAuthority,
   bindTreeTurnAuthority,
@@ -16,6 +17,7 @@ import {
   markTreeSessionIdleIfInactive,
   readActiveTreeAuthorityForSession,
   readProcessSharedMachineActivityEpoch,
+  readTreeSessionActorsForTests,
   registerTreeSessionActivityProbe,
   releaseProcessSharedMachineAuthority,
   resolveCanonicalTurnAuthority,
@@ -35,6 +37,8 @@ import { listMachines as listMachinesHttp } from '../../src/daemon/machine-exec-
 import { aliasMcpList } from '../../src/daemon/alias-mcp-client.js';
 import { listVerificationMachineProfiles } from '../../src/daemon/verification-machine-mcp-client.js';
 import { enqueueResend, getResendEntries, clearResend, scrubResendQueueTurnAuthorities } from '../../src/daemon/transport-resend-queue.js';
+import { deliverTransportResendEntry } from '../../src/agent/transport-resend-delivery.js';
+import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 import { upsertSession, removeSession, listSessions, type SessionRecord } from '../../src/store/session-store.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
@@ -82,6 +86,82 @@ const idOf = (s: SessionRecord) => ({ sessionInstanceId: s.sessionInstanceId!, r
 const flushMicrotasks = async () => {
   await Promise.resolve();
   await Promise.resolve();
+};
+
+const p1Actor = (userId: string, sessionName: string) => ({
+  actorUserId: userId,
+  actorDisplayName: userId,
+  effectiveActorRole: 'participant' as const,
+  actionId: `act-${userId}`,
+  origin: 'shared-tab' as const,
+  authorizedAt: Date.now(),
+  primaryShareId: null,
+  snapshot: {
+    target: { kind: 'main' as const, serverId: 'srv-1', sessionName },
+    effectiveRole: 'participant' as const,
+    historyCutoffAt: 0,
+    coveringShareIds: [],
+    authorizedAt: Date.now(),
+    nextCoverageRecheckAt: null,
+  },
+});
+
+const makeSdkHarness = (sess: SessionRecord, recipientIdentity?: { sessionInstanceId: string; runtimeEpoch: string }) => {
+  let sendGateResolve: (() => void) | null = null;
+  let completeHandler: ((sid: string, msg: any) => void) | undefined;
+  let statusHandler: ((sid: string, status: any) => void) | undefined;
+  let appendHandler: ((sid: string, payload: any) => Promise<'delivered' | 'stale' | 'unsupported'>) | undefined;
+  const provider: TransportProvider = {
+    id: 'codex-sdk',
+    connectionMode: 'persistent',
+    sessionOwnership: 'provider',
+    capabilities: {
+      streaming: true,
+      toolCalling: false,
+      approval: false,
+      sessionRestore: false,
+      multiTurn: true,
+      attachments: false,
+      contextSupport: 'full-normalized-context-injection',
+      activeDelegationNotification: 'native',
+    },
+    connect: vi.fn().mockResolvedValue(undefined),
+    disconnect: vi.fn().mockResolvedValue(undefined),
+    createSession: vi.fn().mockResolvedValue(`prov-${sess.name}`),
+    endSession: vi.fn().mockResolvedValue(undefined),
+    send: vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => {
+        sendGateResolve = resolve;
+      }),
+    ),
+    notifyActiveDelegation: vi.fn().mockImplementation(async (sid, payload) => {
+      if (appendHandler) return appendHandler(sid, payload);
+      return 'delivered';
+    }),
+    cancel: vi.fn().mockResolvedValue(undefined),
+    onDelta: () => () => undefined,
+    onComplete: (cb) => { completeHandler = cb; return () => undefined; },
+    onError: () => () => undefined,
+    onApprovalRequest: () => undefined,
+    onStatus: (cb) => { statusHandler = cb; return () => undefined; },
+    onUsage: () => () => undefined,
+    onToolCall: () => () => undefined,
+    respondApproval: vi.fn().mockResolvedValue(undefined),
+  };
+  const runtime = new TransportSessionRuntime(provider, sess.name, recipientIdentity);
+  runtime.onTurnAdmitted = (origins) => bindSdkTurnOriginsAuthority(sess.name, origins);
+  return {
+    provider,
+    runtime,
+    setAppendHandler: (fn: typeof appendHandler) => { appendHandler = fn; },
+    finishSend: () => {
+      const resolve = sendGateResolve;
+      sendGateResolve = null;
+      resolve?.();
+      completeHandler?.(`prov-${sess.name}`, { id: 'm1', role: 'assistant', content: 'ok', status: 'complete', timestamp: Date.now() });
+      statusHandler?.(`prov-${sess.name}`, 'idle');
+    },
+  };
 };
 
 describe('daemon unified main-tree turn authority', () => {
@@ -761,82 +841,6 @@ describe('daemon unified main-tree turn authority', () => {
   });
 
   it('Round 3 P0 #1: SDK queue-coalesce and active-turn append keep same-sender tokens non-mixed and advance to latest grant while failing closed on P1/P2 or O/P1 mix', async () => {
-    const p1Actor = (userId: string, sessionName: string) => ({
-      actorUserId: userId,
-      actorDisplayName: userId,
-      effectiveActorRole: 'participant' as const,
-      actionId: `act-${userId}`,
-      origin: 'shared-tab' as const,
-      authorizedAt: Date.now(),
-      primaryShareId: null,
-      snapshot: {
-        target: { kind: 'main' as const, serverId: 'srv-1', sessionName },
-        effectiveRole: 'participant' as const,
-        historyCutoffAt: 0,
-        coveringShareIds: [],
-        authorizedAt: Date.now(),
-        nextCoverageRecheckAt: null,
-      },
-    });
-
-    const makeSdkHarness = (sess: SessionRecord) => {
-      let sendGateResolve: (() => void) | null = null;
-      let completeHandler: ((sid: string, msg: any) => void) | undefined;
-      let statusHandler: ((sid: string, status: any) => void) | undefined;
-      let appendHandler: ((sid: string, payload: any) => Promise<'delivered' | 'stale' | 'unsupported'>) | undefined;
-      const provider: TransportProvider = {
-        id: 'codex-sdk',
-        connectionMode: 'persistent',
-        sessionOwnership: 'provider',
-        capabilities: {
-          streaming: true,
-          toolCalling: false,
-          approval: false,
-          sessionRestore: false,
-          multiTurn: true,
-          attachments: false,
-          contextSupport: 'full-normalized-context-injection',
-          activeDelegationNotification: 'native',
-        },
-        connect: vi.fn().mockResolvedValue(undefined),
-        disconnect: vi.fn().mockResolvedValue(undefined),
-        createSession: vi.fn().mockResolvedValue(`prov-${sess.name}`),
-        endSession: vi.fn().mockResolvedValue(undefined),
-        send: vi.fn().mockImplementation(
-          () => new Promise<void>((resolve) => {
-            sendGateResolve = resolve;
-          }),
-        ),
-        notifyActiveDelegation: vi.fn().mockImplementation(async (sid, payload) => {
-          if (appendHandler) return appendHandler(sid, payload);
-          return 'delivered';
-        }),
-        cancel: vi.fn().mockResolvedValue(undefined),
-        onDelta: () => () => undefined,
-        onComplete: (cb) => { completeHandler = cb; return () => undefined; },
-        onError: () => () => undefined,
-        onApprovalRequest: () => undefined,
-        onStatus: (cb) => { statusHandler = cb; return () => undefined; },
-        onUsage: () => () => undefined,
-        onToolCall: () => () => undefined,
-        respondApproval: vi.fn().mockResolvedValue(undefined),
-      };
-      const runtime = new TransportSessionRuntime(provider, sess.name);
-      runtime.onTurnAdmitted = (origins) => bindSdkTurnOriginsAuthority(sess.name, origins);
-      return {
-        provider,
-        runtime,
-        setAppendHandler: (fn: typeof appendHandler) => { appendHandler = fn; },
-        finishSend: () => {
-          const resolve = sendGateResolve;
-          sendGateResolve = null;
-          resolve?.();
-          completeHandler?.(`prov-${sess.name}`, { id: 'm1', role: 'assistant', content: 'ok', status: 'complete', timestamp: Date.now() });
-          statusHandler?.(`prov-${sess.name}`, 'idle');
-        },
-      };
-    };
-
     // 1. Queue-coalesce (`_drainPending`) merges two admitted messages from SAME P1 with distinct tokens
     const sessMain = seed({ name: 'deck_sdk_r3_brain', projectName: 'sdk-r3', role: 'brain', runtimeType: 'transport', agentType: 'codex-sdk', state: 'running' });
     const h = makeSdkHarness(sessMain);
@@ -1322,5 +1326,294 @@ describe('daemon unified main-tree turn authority', () => {
       rootSessionName: retrySess.name,
       tokenHash: sha256(tokSameGen),
     }]);
+  });
+
+  it('Round 6 P0 #1: resend queue, RAM store, and rehydrate preserve ingress authorityIssueSeq without minting new seq or accepting unprovenaged tokens', async () => {
+    setActiveServerLink({
+      send: (msg) => { sentFrames.push(msg as Record<string, unknown>); },
+      trySend: (msg) => {
+        sentFrames.push(msg as Record<string, unknown>);
+        return true;
+      },
+      isConnected: () => true,
+      getConnectionGeneration: () => 50,
+    });
+
+    const main = seed({ name: 'deck_r6_seq_brain', projectName: 'r6-seq', role: 'brain', state: 'running' });
+    const sub = seed({ name: 'deck_r6_seq_w1', projectName: 'r6-seq', parentSession: main.name, role: 'w1', state: 'running' });
+    const store = getTransportQueueStore();
+    const recipient = idOf(main);
+
+    const tokOld = 'trg_r6_old_queued_111111111111111';
+    const seqOld = allocateTurnAuthorityIssueSeq();
+    const actorP1 = p1Actor('user-p1', main.name);
+    clearResend(main.name);
+
+    const enq1 = enqueueResend(main.name, {
+      recipient,
+      text: 'queued older participant turn',
+      commandId: 'cmd-r6-old-1',
+      clientMessageId: 'cmd-r6-old-1',
+      sharedActor: actorP1,
+      sharedMachineAuthority: tokOld,
+      authorityIssueSeq: seqOld,
+      queuedAt: Date.now(),
+    });
+    expect(enq1.accepted).toBe(true);
+    expect(getResendEntries(main.name)[0]?.authorityIssueSeq).toBe(seqOld);
+
+    // Idempotent retry carrying a newer caller-allocated seq must preserve original seqOld without idempotency conflict.
+    const enqRetry = enqueueResend(main.name, {
+      recipient,
+      text: 'queued older participant turn',
+      commandId: 'cmd-r6-old-1',
+      clientMessageId: 'cmd-r6-old-1',
+      sharedActor: actorP1,
+      sharedMachineAuthority: tokOld,
+      authorityIssueSeq: allocateTurnAuthorityIssueSeq(),
+      queuedAt: Date.now() + 5,
+    });
+    expect(enqRetry.accepted).toBe(true);
+    expect(getResendEntries(main.name)[0]?.authorityIssueSeq).toBe(seqOld);
+
+    // RAM-only private material restores seqOld cleanly in memory without leaking seq into durable projection entries.
+    const privateMat = JSON.parse(store.readPrivateDispatchMaterial(main.name, 'cmd-r6-old-1', recipient)!) as Record<string, unknown>;
+    expect(privateMat.authorityIssueSeq).toBe(seqOld);
+    expect(privateMat.sharedMachineAuthority).toBe(tokOld);
+    const publicSnap = store.readSnapshotForRecipient(main.name, recipient);
+    expect(JSON.stringify(publicSnap)).not.toContain(tokOld);
+    expect(JSON.stringify(publicSnap)).not.toContain('authorityIssueSeq');
+
+    // Rotate >64 newer tokens on sibling sub-session so tokOld's hash falls out of the 64-entry supersededTokenHashes LRU.
+    let tokLatest = '';
+    for (let i = 1; i <= 70; i += 1) {
+      tokLatest = `trg_r6_newer_sub_${String(i).padStart(2, '0')}_2222222222`;
+      bindTreeTurnAuthority(sub.name, {
+        kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+        actorUserId: 'user-p1',
+        authority: tokLatest,
+      });
+    }
+    expect(readActiveTreeAuthorityForSession(main.name)?.authority).toBe(tokLatest);
+
+    // Replay older queued entry via real deliverTransportResendEntry -> preserves seqOld and CANNOT regress tokLatest!
+    const h = makeSdkHarness(main, recipient);
+    await h.runtime.initialize({ sessionName: main.name, projectName: main.projectName, cwd: main.projectDir });
+    const leased = store.markHandoffInFlight(main.name, ['cmd-r6-old-1'], 60_000, Date.now(), recipient);
+    expect(leased).toHaveLength(1);
+    const resendEntry = getResendEntries(main.name)[0]!;
+    const delivery = await deliverTransportResendEntry(h.runtime, resendEntry, {
+      clientMessageId: resendEntry.clientMessageId!,
+      handoffId: leased[0]!.handoffId,
+    });
+    expect(delivery).toBe('sent');
+    expect(readActiveTreeAuthorityForSession(main.name)?.authority).toBe(tokLatest);
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: main.name,
+      identity: idOf(main),
+      sessionRunning: true,
+      now: Date.now(),
+      runtime: h.runtime,
+    })).toEqual({ required: true, actorKind: 'participant', authority: tokLatest });
+    h.finishSend();
+    await h.runtime.kill();
+    clearResend(main.name);
+
+    // Rehydrate path preserves RAM authorityIssueSeq cleanly too and never overtakes tokLatest.
+    const tokRehydOld = 'trg_r6_rehyd_old_22222222222222';
+    const seqRehydOld = seqOld + 1;
+    store.enqueueWithCapacityEviction({
+      sessionName: main.name,
+      recipient,
+      text: 'rehydrated older participant msg',
+      clientMessageId: 'cmd-r6-rehyd-1',
+      commandId: 'cmd-r6-rehyd-1',
+      authorityIssueSeq: seqRehydOld,
+      privateMaterialJson: JSON.stringify({
+        text: 'rehydrated older participant msg',
+        sharedActorEnvelope: p1Actor('user-p1', main.name),
+        sharedMachineAuthority: tokRehydOld,
+      }),
+    });
+    const hRehyd = makeSdkHarness(main, recipient);
+    await hRehyd.runtime.initialize({ sessionName: main.name, projectName: main.projectName, cwd: main.projectDir });
+    expect(hRehyd.runtime.rehydratePendingFromStore('startup')).toBe(1);
+    expect(hRehyd.runtime.pendingEntriesForResend[0]?.authorityIssueSeq).toBe(seqRehydOld);
+    expect((hRehyd.runtime as any)._drainPending()).toBe(true);
+    expect(readActiveTreeAuthorityForSession(main.name)?.authority).toBe(tokLatest);
+    hRehyd.finishSend();
+    await hRehyd.runtime.kill();
+
+    // Unprovenaged handoff replay (no authorityIssueSeq) must NEVER allocate a new seq or accept stale authority tokens.
+    const tokUnprovenaged = 'trg_r6_unprovenaged_333333333333';
+    const seqBeforeUnprovenaged = allocateTurnAuthorityIssueSeq();
+    enqueueResend(main.name, {
+      recipient,
+      text: 'unprovenaged queued replay',
+      commandId: 'cmd-r6-unprov-1',
+      clientMessageId: 'cmd-r6-unprov-1',
+      sharedActor: p1Actor('user-p1', main.name),
+      sharedMachineAuthority: tokUnprovenaged,
+      queuedAt: Date.now(),
+    });
+    const hUnprov = makeSdkHarness(main, recipient);
+    await hUnprov.runtime.initialize({ sessionName: main.name, projectName: main.projectName, cwd: main.projectDir });
+    const leasedUnprov = store.markHandoffInFlight(main.name, ['cmd-r6-unprov-1'], 60_000, Date.now(), recipient);
+    const deliveryUnprov = await deliverTransportResendEntry(hUnprov.runtime, getResendEntries(main.name)[0]!, {
+      clientMessageId: 'cmd-r6-unprov-1',
+      handoffId: leasedUnprov[0]!.handoffId,
+    });
+    expect(deliveryUnprov).toBe('sent');
+    const seqAfterUnprovenaged = allocateTurnAuthorityIssueSeq();
+    expect(seqAfterUnprovenaged).toBe(seqBeforeUnprovenaged + 1);
+    expect(hUnprov.runtime.getActiveSharedMachineAuthority()).toBeNull();
+    expect(hUnprov.runtime.requiresSharedMachineAuthority()).toBe(true);
+    expect(readActiveTreeAuthorityForSession(main.name)?.authority).not.toBe(tokUnprovenaged);
+    expect(readActiveTreeAuthorityForSession(main.name)?.authority).toBeNull();
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: main.name,
+      identity: idOf(main),
+      sessionRunning: true,
+      now: Date.now(),
+      runtime: hUnprov.runtime,
+    })).toEqual({ required: true, authority: null });
+    hUnprov.finishSend();
+    await hUnprov.runtime.kill();
+    clearResend(main.name);
+  });
+
+  it('Round 6 P0 #2: zero raw tokens survive in sessionActors, RAM queue store, or suspended appendPendingMessagesToActiveTurn across disconnect+reconnect', async () => {
+    let linkGen = 60;
+    let connected = true;
+    setActiveServerLink({
+      send: (msg) => { sentFrames.push(msg as Record<string, unknown>); },
+      trySend: (msg) => {
+        sentFrames.push(msg as Record<string, unknown>);
+        return true;
+      },
+      isConnected: () => connected,
+      getConnectionGeneration: () => linkGen,
+    });
+
+    const sess = seed({ name: 'deck_r6_append_dc_brain', projectName: 'r6-dc', role: 'brain', runtimeType: 'transport', agentType: 'codex-sdk', state: 'running' });
+    const tokOwner = 'trg_r6_owner_init_1111111111111';
+    const tokAppend = 'trg_r6_part_append_222222222222';
+    const tokAppendRetry = 'trg_r6_part_stale_333333333333';
+
+    const actor = p1Actor('user-p1', sess.name);
+    // sessionActors must store only sender identity (zero raw authority strings even before disconnect).
+    bindTreeTurnAuthority(sess.name, {
+      kind: SHARED_MACHINE_ACTIVITY_KIND.PARTICIPANT,
+      actorUserId: 'user-p1',
+      authority: tokAppend,
+    });
+    const sessionActorValues = readTreeSessionActorsForTests(sess.name);
+    expect(sessionActorValues).toHaveLength(1);
+    expect(sessionActorValues[0]).toEqual({ kind: 'participant', actorUserId: 'user-p1' });
+    expect('authority' in (sessionActorValues[0] as unknown as Record<string, unknown>)).toBe(false);
+    expect(JSON.stringify(sessionActorValues)).not.toContain('trg_');
+    clearAllDaemonTurnAuthoritiesOnDisconnect();
+
+    // Case A: appendPendingMessagesToActiveTurn suspends mid-await across disconnect + reconnect, then resolves 'delivered'.
+    let resolveAppendA!: (res: 'delivered' | 'stale' | 'unsupported') => void;
+    const h = makeSdkHarness(sess, idOf(sess));
+    h.setAppendHandler(() => new Promise((resolve) => {
+      resolveAppendA = resolve;
+    }));
+    await h.runtime.initialize({ sessionName: sess.name, projectName: sess.projectName, cwd: sess.projectDir });
+
+    expect(h.runtime.send('owner step', 'msg-r6-owner', undefined, undefined, {
+      ownerMachineAuthority: tokOwner,
+    })).toBe('sent');
+    expect(h.runtime.send('participant append', 'msg-r6-part-a', undefined, undefined, {
+      deliveryMode: 'append',
+      sharedActor: actor,
+      sharedMachineAuthority: tokAppend,
+    })).toBe('queued');
+
+    const store = getTransportQueueStore();
+    expect(store.readPrivateDispatchMaterial(sess.name, 'msg-r6-part-a', idOf(sess))).toContain(tokAppend);
+
+    const appendPromise = h.runtime.appendPendingMessagesToActiveTurn(['msg-r6-part-a'], 'notif-r6-a');
+    await flushMicrotasks();
+
+    // Real disconnect cleanup + WS reconnect on next generation while append promise is suspended.
+    connected = false;
+    clearAllDaemonTurnAuthoritiesOnDisconnect({
+      scrubTransportRuntimes: () => h.runtime.scrubTurnAuthorities(),
+      scrubResendQueues: scrubResendQueueTurnAuthorities,
+    });
+    expect(store.readPrivateDispatchMaterial(sess.name, 'msg-r6-part-a', idOf(sess))).not.toContain('trg_');
+    linkGen = 61;
+    connected = true;
+
+    resolveAppendA('delivered');
+    const appendResult = await appendPromise;
+    expect(appendResult.status).toBe('delivered');
+
+    // ZERO raw tokens anywhere in RAM after await resolves on new connection.
+    expect(JSON.stringify(appendResult)).not.toContain('trg_');
+    expect(JSON.stringify((h.runtime as unknown as { _appendedTurnOrigins: unknown })._appendedTurnOrigins)).not.toContain('trg_');
+    expect(JSON.stringify((h.runtime as unknown as { _unacknowledgedActiveAppends: unknown })._unacknowledgedActiveAppends)).not.toContain('trg_');
+    expect(JSON.stringify(h.runtime.activeDispatchEntriesForResend)).not.toContain('trg_');
+    expect(JSON.stringify(h.runtime.pendingEntriesForResend)).not.toContain('trg_');
+    expect(JSON.stringify(readActiveTreeAuthorityForSession(sess.name))).not.toContain('trg_');
+
+    // Participant restriction remains fail-closed (`required: true, authority: null`).
+    expect(h.runtime.requiresSharedMachineAuthority()).toBe(true);
+    expect(h.runtime.getActiveSharedMachineAuthority()).toBeNull();
+    expect(h.runtime.getActiveOwnerMachineAuthority()).toBeNull();
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: sess.name,
+      identity: idOf(sess),
+      sessionRunning: true,
+      now: Date.now(),
+      runtime: h.runtime,
+    })).toEqual({ required: true, authority: null });
+
+    // Finish active turn -> idle -> start fresh turn on new linkGen=61 and confirm clean recovery.
+    h.finishSend();
+    await flushMicrotasks();
+    upsertSession({ ...sess, state: 'idle' });
+    markTreeSessionIdle(sess.name);
+    await flushMicrotasks();
+
+    const tokFreshAfterReconnect = 'trg_r6_fresh_gen61_444444444444';
+    upsertSession({ ...sess, state: 'running' });
+    expect(h.runtime.send('new post-reconnect turn', 'msg-r6-fresh', undefined, undefined, {
+      sharedActor: actor,
+      sharedMachineAuthority: tokFreshAfterReconnect,
+    })).toBe('sent');
+    expect(resolveSessionEffectiveSharedMachineAuthority({
+      sessionName: sess.name,
+      identity: idOf(sess),
+      sessionRunning: true,
+      now: Date.now(),
+      runtime: h.runtime,
+    })).toEqual({ required: true, actorKind: 'participant', authority: tokFreshAfterReconnect });
+
+    // Case B: Non-delivered ('stale') append that triggers restoreReservation() after disconnect also scrubs restored entry.
+    expect(h.runtime.send('second participant append', 'msg-r6-part-b', undefined, undefined, {
+      deliveryMode: 'append',
+      sharedActor: actor,
+      sharedMachineAuthority: tokAppendRetry,
+    })).toBe('queued');
+    const appendPromiseB = h.runtime.appendPendingMessagesToActiveTurn(['msg-r6-part-b'], 'notif-r6-b');
+    await flushMicrotasks();
+    connected = false;
+    clearAllDaemonTurnAuthoritiesOnDisconnect({
+      scrubTransportRuntimes: () => h.runtime.scrubTurnAuthorities(),
+      scrubResendQueues: scrubResendQueueTurnAuthorities,
+    });
+    linkGen = 62;
+    connected = true;
+    resolveAppendA('stale');
+    const appendResultB = await appendPromiseB;
+    expect(appendResultB.status).toBe('stale');
+    expect(JSON.stringify(h.runtime.pendingEntriesForResend)).not.toContain('trg_');
+    expect(h.runtime.pendingEntries[0]?.sharedActor?.actorUserId).toBe('user-p1');
+
+    h.finishSend();
+    await h.runtime.kill();
   });
 });

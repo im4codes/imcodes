@@ -91,6 +91,8 @@ export interface ResendEntry {
   sharedMachineAuthority?: string;
   /** Opaque server-signed owner-turn device authority; private queue material only. */
   ownerMachineAuthority?: string;
+  /** Daemon-local RAM-only admission sequence for monotonic tree-authority ordering; never persisted. */
+  authorityIssueSeq?: number;
   /** Preserve the trusted MCP delivery policy across runtime restore windows. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
   /** @internal: this logical user event has already been written to the timeline. */
@@ -135,6 +137,8 @@ function privateMaterialMatchesReplay(
   try {
     const durable = JSON.parse(durableJson) as Record<string, unknown>;
     const replay = JSON.parse(replayJson) as Record<string, unknown>;
+    delete durable.authorityIssueSeq;
+    delete replay.authorityIssueSeq;
     if (durableReference && durable.supervisionReference === undefined) {
       durable.supervisionReference = durableReference;
     }
@@ -252,8 +256,10 @@ function enqueueResendInternal(
       const local = retainInMemory
         ? list.find((candidate) => candidate.clientMessageId === clientMessageId)
         : undefined;
-      const localMatches = !local || JSON.stringify({ ...local, queuedAt: normalizedEntry.queuedAt })
-        === JSON.stringify(normalizedEntry);
+      const localMatches = !local || (() => {
+        const canonical = ({ queuedAt: _q, authorityIssueSeq: _seq, ...rest }: ResendEntry) => rest;
+        return isDeepStrictEqual(canonical(local), canonical(normalizedEntry));
+      })();
       const durableReference = existing.supervisionReference;
       const referenceMatches = supervisionReferencesMatch(
         durableReference,
@@ -318,6 +324,9 @@ function enqueueResendInternal(
       text: normalizedEntry.text,
       now: normalizedEntry.queuedAt,
       privateMaterialJson,
+      ...(typeof normalizedEntry.authorityIssueSeq === 'number'
+        ? { authorityIssueSeq: normalizedEntry.authorityIssueSeq }
+        : {}),
       ...(normalizedEntry.supervisionReference ? { supervisionReference: normalizedEntry.supervisionReference } : {}),
     }, evicted?.clientMessageId);
     queueSnapshot = result.queueSnapshot;
@@ -463,6 +472,7 @@ export function scrubResendQueueTurnAuthorities(): void {
     for (const entry of list) {
       delete entry.sharedMachineAuthority;
       delete entry.ownerMachineAuthority;
+      delete entry.authorityIssueSeq;
     }
   }
 }

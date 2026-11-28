@@ -24,6 +24,7 @@ import {
 import { transportQueueStaleThresholdMs } from '../../shared/transport-queue-types.js';
 import { buildQueueProjectionEntry } from '../../shared/transport-queue-privacy.js';
 import { OWNER_MACHINE_AUTHORITY_FIELD, SHARED_MACHINE_AUTHORITY_FIELD } from '../../shared/shared-machine-authority.js';
+const AUTHORITY_ISSUE_SEQ_FIELD = 'authorityIssueSeq' as const;
 import { resolveTransportConversationKey } from '../agent/transport-resume-opts.js';
 import { getSession } from '../store/session-store.js';
 import { finalizeSqliteLegacyScrub } from '../store/sqlite-secure-scrub.js';
@@ -115,6 +116,7 @@ export interface EnqueueTransportQueueEntryInput {
   activityGeneration?: number | string;
   replacesClientMessageId?: string;
   privateMaterialJson?: string;
+  authorityIssueSeq?: number;
   supervisionReference?: QueueSupervisionReference;
 }
 
@@ -289,6 +291,7 @@ function parseStoredEntry(row: Record<string, unknown>): QueueStoredEntry {
 interface RamQueueAuthorities {
   ownerMachineAuthority?: string;
   sharedMachineAuthority?: string;
+  authorityIssueSeq?: number;
 }
 
 export class TransportQueueStore {
@@ -488,6 +491,10 @@ export class TransportQueueStore {
     }
   }
 
+  scrubAllMemoryAuthorities(): void {
+    this.memoryAuthorities.clear();
+  }
+
   private clearMemoryAuthorities(sessionName: string, clientMessageId?: string): void {
     const prefix = clientMessageId
       ? `${sessionName}\u0000${clientMessageId}\u0000`
@@ -535,11 +542,17 @@ export class TransportQueueStore {
     }
   }
 
-  private extractAuthoritiesForRam(materialJson: string): { sanitizedJson: string; authorities?: RamQueueAuthorities } {
+  private extractAuthoritiesForRam(
+    materialJson: string,
+    extraAuthorityIssueSeq?: number,
+  ): { sanitizedJson: string; authorities?: RamQueueAuthorities } {
     try {
       const parsed = JSON.parse(materialJson) as Record<string, unknown>;
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-        && (OWNER_MACHINE_AUTHORITY_FIELD in parsed || SHARED_MACHINE_AUTHORITY_FIELD in parsed)) {
+        && (OWNER_MACHINE_AUTHORITY_FIELD in parsed
+          || SHARED_MACHINE_AUTHORITY_FIELD in parsed
+          || AUTHORITY_ISSUE_SEQ_FIELD in parsed
+          || (typeof extraAuthorityIssueSeq === 'number' && Number.isFinite(extraAuthorityIssueSeq)))) {
         const authorities: RamQueueAuthorities = {};
         const rawOwner = parsed[OWNER_MACHINE_AUTHORITY_FIELD];
         if (typeof rawOwner === 'string' && rawOwner.trim()) {
@@ -549,10 +562,19 @@ export class TransportQueueStore {
         if (typeof rawShared === 'string' && rawShared.trim()) {
           authorities.sharedMachineAuthority = rawShared.trim();
         }
+        const rawSeq = typeof extraAuthorityIssueSeq === 'number' && Number.isFinite(extraAuthorityIssueSeq)
+          ? extraAuthorityIssueSeq
+          : (typeof parsed[AUTHORITY_ISSUE_SEQ_FIELD] === 'number' && Number.isFinite(parsed[AUTHORITY_ISSUE_SEQ_FIELD])
+              ? parsed[AUTHORITY_ISSUE_SEQ_FIELD]
+              : undefined);
+        const hasToken = Boolean(authorities.ownerMachineAuthority || authorities.sharedMachineAuthority);
+        if (hasToken && rawSeq !== undefined) {
+          authorities.authorityIssueSeq = rawSeq;
+        }
         delete parsed[OWNER_MACHINE_AUTHORITY_FIELD];
         delete parsed[SHARED_MACHINE_AUTHORITY_FIELD];
-        const hasAny = Boolean(authorities.ownerMachineAuthority || authorities.sharedMachineAuthority);
-        return { sanitizedJson: JSON.stringify(parsed), ...(hasAny ? { authorities } : {}) };
+        delete parsed[AUTHORITY_ISSUE_SEQ_FIELD];
+        return { sanitizedJson: JSON.stringify(parsed), ...(hasToken ? { authorities } : {}) };
       }
     } catch {
       // Leave unparseable payloads untouched.
@@ -946,7 +968,7 @@ export class TransportQueueStore {
       );
       let extractedAuthorities: RamQueueAuthorities | undefined;
       if (input.privateMaterialJson !== undefined) {
-        const extracted = this.extractAuthoritiesForRam(input.privateMaterialJson);
+        const extracted = this.extractAuthoritiesForRam(input.privateMaterialJson, input.authorityIssueSeq);
         extractedAuthorities = extracted.authorities;
         this.db.prepare(`
           INSERT OR REPLACE INTO queue_private_material (
@@ -1186,6 +1208,7 @@ export class TransportQueueStore {
     delete parsed.aliasAudit;
     delete parsed[OWNER_MACHINE_AUTHORITY_FIELD];
     delete parsed[SHARED_MACHINE_AUTHORITY_FIELD];
+    delete parsed[AUTHORITY_ISSUE_SEQ_FIELD];
     parsed.text = text;
     if (replacement?.providerText != null) parsed.providerText = replacement.providerText;
     if (replacement?.aliasAudit) parsed.aliasAudit = replacement.aliasAudit;
@@ -1320,6 +1343,9 @@ export class TransportQueueStore {
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
         if (ramAuthorities.ownerMachineAuthority) parsed[OWNER_MACHINE_AUTHORITY_FIELD] = ramAuthorities.ownerMachineAuthority;
         if (ramAuthorities.sharedMachineAuthority) parsed[SHARED_MACHINE_AUTHORITY_FIELD] = ramAuthorities.sharedMachineAuthority;
+        if (typeof ramAuthorities.authorityIssueSeq === 'number') {
+          parsed[AUTHORITY_ISSUE_SEQ_FIELD] = ramAuthorities.authorityIssueSeq;
+        }
         return JSON.stringify(parsed);
       }
     } catch {
@@ -1342,6 +1368,7 @@ export class TransportQueueStore {
         parsed.appendFallbackReason = reason;
         delete parsed[OWNER_MACHINE_AUTHORITY_FIELD];
         delete parsed[SHARED_MACHINE_AUTHORITY_FIELD];
+        delete parsed[AUTHORITY_ISSUE_SEQ_FIELD];
         this.db.prepare(`UPDATE queue_private_material SET material_json = ? WHERE session_name = ? AND client_message_id = ? AND ${gate.sql}`)
           .run(JSON.stringify(parsed), sessionName, clientMessageId, ...gate.params);
         this.bumpVersion(sessionName);
@@ -2906,6 +2933,11 @@ export function getTransportQueueStore(): TransportQueueStore {
     },
   });
   return routedStore;
+}
+
+export function scrubLoadedTransportQueueMemoryAuthorities(): void {
+  singleton?.scrubAllMemoryAuthorities();
+  privateStore?.scrubAllMemoryAuthorities();
 }
 
 export function resetTransportQueueStoreForTests(): void {

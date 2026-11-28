@@ -3,9 +3,11 @@ import { AGY_SDK_PROVIDER_ID, AGY_NATIVE_START_NOT_ATTEMPTED } from '../../share
 import { queuedPairWakeAllowed } from '../daemon/task-pairs/wake-authority.js';
 import {
   allocateTurnAuthorityIssueSeq,
+  getTurnAuthorityDisconnectGeneration,
   summarizeSdkTurnOrigins,
   type SdkTurnOriginSummary,
 } from '../daemon/shared-machine-authority-context.js';
+import { getActiveServerLink } from '../daemon/active-server-link.js';
 import { withMemoryMcpSessionEnv } from './providers/getDefaultMcpServers.js';
 import { onConfirmedProviderStop } from './provider-stop-confirmation.js';
 import { transportQueueSnapshotToPayload } from '../../shared/transport-queue-wire.js';
@@ -795,6 +797,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     string,
     ActiveDelegationNotificationAdmission
   >();
+  private _turnAuthorityScrubGeneration = 0;
+  private readonly _inFlightActiveAppends = new Map<number, PendingTransportMessage[]>();
+  private _nextInFlightActiveAppendId = 0;
   private _activeDispatchId: number | null = null;
   /** Summary delivery ownership for the active provider turn. A provider
    * accepting send() is not proof that the model consumed the context: the
@@ -1717,28 +1722,37 @@ export class TransportSessionRuntime implements SessionRuntime {
     return this._activeDispatchEntries.length > 0 ? this._activeTreeGeneration : null;
   }
 
+  private didTurnAuthorityScrubAcross(
+    preAppendScrubGen: number,
+    preAppendDisconnectGen: number,
+    preAppendLinkGen: number | undefined,
+  ): boolean {
+    const currentLink = getActiveServerLink();
+    const currentLinkGen = currentLink?.getConnectionGeneration?.();
+    return this._turnAuthorityScrubGeneration !== preAppendScrubGen
+      || getTurnAuthorityDisconnectGeneration() !== preAppendDisconnectGen
+      || (preAppendLinkGen !== undefined && currentLinkGen !== undefined && currentLinkGen !== preAppendLinkGen)
+      || (currentLink?.isConnected !== undefined && !currentLink.isConnected());
+  }
+
+  private scrubEntryTurnAuthorities(
+    entry: Pick<PendingTransportMessage, 'sharedMachineAuthority' | 'ownerMachineAuthority' | 'authorityIssueSeq'>,
+  ): void {
+    delete entry.sharedMachineAuthority;
+    delete entry.ownerMachineAuthority;
+    delete entry.authorityIssueSeq;
+  }
+
   scrubTurnAuthorities(): void {
-    for (const entry of this._activeDispatchEntries) {
-      delete entry.sharedMachineAuthority;
-      delete entry.ownerMachineAuthority;
-      delete entry.authorityIssueSeq;
-    }
-    for (const entry of this._pendingMessages) {
-      delete entry.sharedMachineAuthority;
-      delete entry.ownerMachineAuthority;
-      delete entry.authorityIssueSeq;
-    }
-    for (const item of this._unacknowledgedActiveAppends) {
-      delete item.entry.sharedMachineAuthority;
-      delete item.entry.ownerMachineAuthority;
-      delete item.entry.authorityIssueSeq;
+    this._turnAuthorityScrubGeneration += 1;
+    for (const entry of this._activeDispatchEntries) this.scrubEntryTurnAuthorities(entry);
+    for (const entry of this._pendingMessages) this.scrubEntryTurnAuthorities(entry);
+    for (const item of this._unacknowledgedActiveAppends) this.scrubEntryTurnAuthorities(item.entry);
+    for (const batch of this._inFlightActiveAppends.values()) {
+      for (const entry of batch) this.scrubEntryTurnAuthorities(entry);
     }
     if (this._appendedTurnOrigins) {
-      for (const entry of this._appendedTurnOrigins.entries) {
-        delete entry.sharedMachineAuthority;
-        delete entry.ownerMachineAuthority;
-        delete entry.authorityIssueSeq;
-      }
+      for (const entry of this._appendedTurnOrigins.entries) this.scrubEntryTurnAuthorities(entry);
     }
     this._activeTreeGeneration = null;
   }
@@ -2145,6 +2159,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             sharedActorEnvelope?: unknown;
             sharedMachineAuthority?: unknown;
             ownerMachineAuthority?: unknown;
+            authorityIssueSeq?: unknown;
             timelineCommitted?: unknown;
             historyCommitted?: unknown;
             deliveryMode?: unknown;
@@ -2156,6 +2171,10 @@ export class TransportSessionRuntime implements SessionRuntime {
             registeredSystemContract?: unknown;
           };
           if (typeof material.text === 'string') {
+            const rehydratedIssueSeq = typeof material.authorityIssueSeq === 'number'
+              && Number.isFinite(material.authorityIssueSeq)
+              ? material.authorityIssueSeq
+              : undefined;
             entry = {
               clientMessageId,
               text: material.text,
@@ -2167,12 +2186,13 @@ export class TransportSessionRuntime implements SessionRuntime {
               ...(typeof material.messagePreamble === 'string' && material.messagePreamble ? { messagePreamble: material.messagePreamble } : {}),
               ...(Array.isArray(material.attachmentRefs) && material.attachmentRefs.length ? { attachments: material.attachmentRefs as TransportAttachment[] } : {}),
               ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
-              ...(typeof material.sharedMachineAuthority === 'string' && material.sharedMachineAuthority
+              ...(rehydratedIssueSeq !== undefined && typeof material.sharedMachineAuthority === 'string' && material.sharedMachineAuthority
                 ? { sharedMachineAuthority: material.sharedMachineAuthority }
                 : {}),
-              ...(typeof material.ownerMachineAuthority === 'string' && material.ownerMachineAuthority
+              ...(rehydratedIssueSeq !== undefined && typeof material.ownerMachineAuthority === 'string' && material.ownerMachineAuthority
                 ? { ownerMachineAuthority: material.ownerMachineAuthority }
                 : {}),
+              ...(rehydratedIssueSeq !== undefined ? { authorityIssueSeq: rehydratedIssueSeq } : {}),
               ...(material.timelineCommitted === true ? { timelineCommitted: true } : {}),
               ...(material.historyCommitted === true ? { historyCommitted: true } : {}),
               ...readQueueDeliveryPolicy(material),
@@ -3291,13 +3311,27 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
-      ...(metadata?.sharedMachineAuthority ? { sharedMachineAuthority: metadata.sharedMachineAuthority } : {}),
-      ...(metadata?.ownerMachineAuthority ? { ownerMachineAuthority: metadata.ownerMachineAuthority } : {}),
-      ...(typeof metadata?.authorityIssueSeq === 'number'
-        ? { authorityIssueSeq: metadata.authorityIssueSeq }
-        : (metadata?.sharedMachineAuthority || metadata?.ownerMachineAuthority)
-          ? { authorityIssueSeq: allocateTurnAuthorityIssueSeq() }
-          : {}),
+      ...(() => {
+        const hasExplicitIssueSeq = typeof metadata?.authorityIssueSeq === 'number'
+          && Number.isFinite(metadata.authorityIssueSeq);
+        const isHandoffReplay = Boolean(queueHandoff);
+        // Queued/resend replays must carry their original ingress authorityIssueSeq.
+        // Never synthesize a brand-new seq (or accept an unprovenaged token) during handoff replay.
+        const acceptMetadataAuthorities = !isHandoffReplay || hasExplicitIssueSeq;
+        return {
+          ...(acceptMetadataAuthorities && metadata?.sharedMachineAuthority
+            ? { sharedMachineAuthority: metadata.sharedMachineAuthority }
+            : {}),
+          ...(acceptMetadataAuthorities && metadata?.ownerMachineAuthority
+            ? { ownerMachineAuthority: metadata.ownerMachineAuthority }
+            : {}),
+          ...(hasExplicitIssueSeq
+            ? { authorityIssueSeq: metadata!.authorityIssueSeq }
+            : (!isHandoffReplay && (metadata?.sharedMachineAuthority || metadata?.ownerMachineAuthority))
+              ? { authorityIssueSeq: allocateTurnAuthorityIssueSeq() }
+              : {}),
+        };
+      })(),
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
       ...(nativeAppendRequested ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
@@ -3830,6 +3864,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     const preAdmissionOutputSeq = this._providerOutputSeq;
     const preAdmissionProviderSessionId = this._providerSessionId;
     const preAdmissionDispatchId = this._activeDispatchId;
+    const preAppendScrubGen = this._turnAuthorityScrubGeneration;
+    const preAppendDisconnectGen = getTurnAuthorityDisconnectGeneration();
+    const preAppendLinkGen = getActiveServerLink()?.getConnectionGeneration?.();
+    const inFlightAppendId = ++this._nextInFlightActiveAppendId;
+    this._inFlightActiveAppends.set(inFlightAppendId, selected);
     let admission: AgentDelegationNotificationResult;
     try {
       admission = await this.provider.notifyActiveDelegation(this._providerSessionId, {
@@ -3842,8 +3881,16 @@ export class TransportSessionRuntime implements SessionRuntime {
         deliveryKind,
       });
     } catch (error) {
+      this._inFlightActiveAppends.delete(inFlightAppendId);
+      if (this.didTurnAuthorityScrubAcross(preAppendScrubGen, preAppendDisconnectGen, preAppendLinkGen)) {
+        for (const entry of selected) this.scrubEntryTurnAuthorities(entry);
+      }
       restoreReservation();
       throw error;
+    }
+    this._inFlightActiveAppends.delete(inFlightAppendId);
+    if (this.didTurnAuthorityScrubAcross(preAppendScrubGen, preAppendDisconnectGen, preAppendLinkGen)) {
+      for (const entry of selected) this.scrubEntryTurnAuthorities(entry);
     }
     if (admission !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
       restoreReservation();
@@ -4896,6 +4943,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         ...(entry.supervisionReference ? { supervisionReference: entry.supervisionReference } : {}),
         ...(entry.registeredSystemContract ? { registeredSystemContract: entry.registeredSystemContract } : {}),
       }),
+      ...(typeof entry.authorityIssueSeq === 'number' ? { authorityIssueSeq: entry.authorityIssueSeq } : {}),
       ...(entry.supervisionReference
         ? { supervisionReference: entry.supervisionReference }
         : {}),

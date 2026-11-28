@@ -105,6 +105,7 @@ function preserveEntries(
       ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
       ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
       ...(entry.ownerMachineAuthority ? { ownerMachineAuthority: entry.ownerMachineAuthority } : {}),
+      ...(typeof entry.authorityIssueSeq === 'number' ? { authorityIssueSeq: entry.authorityIssueSeq } : {}),
       ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(entry.historyCommitted ? { historyCommitted: true } : {}),
       ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),
