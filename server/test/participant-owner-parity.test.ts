@@ -96,7 +96,7 @@ describe('participant owner-parity vs share-invite denial', () => {
     mockSendOutbound.mockResolvedValue(undefined);
   });
 
-  it('ownedDaemonServerId strictly denies whole-server participants and allows real owners only', async () => {
+  it('ownedDaemonServerId grants whole-server participants owner parity while strictly denying viewers and non-members', async () => {
     const { ownedDaemonServerId } = await import('../src/routes/owned-daemon-request.js');
     const app = new Hono();
     app.get('/test', async (c) => {
@@ -111,16 +111,22 @@ describe('participant owner-parity vs share-invite denial', () => {
       return c.json(resolved);
     });
 
-    // Whole-server participant: resolveServerRole === 'owner' but resolveServerMembershipRole === 'none' -> 403
+    // Whole-server participant: resolveServerRole === 'owner' even when resolveServerMembershipRole === 'none' -> 200
+    const allowedParticipant = await app.request('/test?serverId=srv-shared');
+    expect(allowedParticipant.status).toBe(200);
+    expect(await allowedParticipant.json()).toEqual({ serverId: 'srv-shared' });
+
+    // Real owner: resolveServerRole === 'owner' -> 200
+    mockResolveServerRole.mockResolvedValueOnce('owner');
+    const allowedOwner = await app.request('/test?serverId=srv-shared');
+    expect(allowedOwner.status).toBe(200);
+    expect(await allowedOwner.json()).toEqual({ serverId: 'srv-shared' });
+
+    // Viewer / non-member / session-only share: resolveServerRole === 'none' -> 403
+    mockResolveServerRole.mockResolvedValueOnce('none');
     const denied = await app.request('/test?serverId=srv-shared');
     expect(denied.status).toBe(403);
     expect(await denied.json()).toEqual({ error: 'forbidden' });
-
-    // Real owner: resolveServerMembershipRole === 'owner' -> 200
-    mockResolveServerMembershipRole.mockResolvedValueOnce('owner');
-    const allowed = await app.request('/test?serverId=srv-shared');
-    expect(allowed.status).toBe(200);
-    expect(await allowed.json()).toEqual({ serverId: 'srv-shared' });
   });
 
   it('serverRoutes blocks whole-server participant rename/delete and blocks participant_daemon on daemon config/binding routes while keeping runtime-config read', async () => {

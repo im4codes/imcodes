@@ -14,21 +14,17 @@ const caller: McpRuntimeCaller = {
   projectName: 'project', serverId: 'server-1', providerId: 'codex-sdk', transport: 'in_process',
 };
 
-const DENIED_PARTICIPANT_TOOLS = [
-  'capability_install',
-  'capability_manage',
-] as const;
+const DENIED_PARTICIPANT_TOOLS: readonly string[] = [];
 
-it('participant turns deny capability persistence tools while leaving cross-device, alias, and other tools governed by their own server/actor checks', () => {
+it('participant turns allow capability install/manage and leave cross-device, alias, and other tools governed by their own server/actor checks', () => {
   const server = createMemoryMcpServer(caller, { capabilityService: {} as CapabilityService });
   const registered = Object.keys((server as unknown as { _registeredTools: Record<string, unknown> })._registeredTools);
   expect(registered.length).toBeGreaterThan(60);
   expect(Object.keys(PARTICIPANT_TURN_TOOL_POLICY).sort()).toEqual([...DENIED_PARTICIPANT_TOOLS].sort());
-  for (const name of DENIED_PARTICIPANT_TOOLS) {
-    expect(isToolAllowedInParticipantTurn(name), name).toBe(false);
-  }
   for (const name of [
-    ...registered.filter((n) => !(DENIED_PARTICIPANT_TOOLS as readonly string[]).includes(n)),
+    ...registered,
+    'capability_install',
+    'capability_manage',
     'capability_list',
     'capability_status',
     'future_registered_tool',
@@ -41,14 +37,14 @@ it('participant turns deny capability persistence tools while leaving cross-devi
 });
 
 const origins = [
-  ['participant', async () => true, true],
+  ['participant', async () => true, false],
   ['owner', async () => false, false],
-  ['unreachable authority', async () => { throw new Error('daemon unreachable'); }, true],
+  ['unreachable authority', async () => { throw new Error('daemon unreachable'); }, false],
   ['missing turn hook', undefined, false],
 ] as const;
 
 describe.each(origins)('%s origin', (_label, participantTurnRequired, denied) => {
-  it.each([false, true])('blocks capability_install/manage while allowing cross-device & alias tools to reach server admission (fallback=%s)', async (fallback) => {
+  it.each([false, true])('allows capability_install/manage while leaving cross-device & alias tools governed by server admission (fallback=%s)', async (fallback) => {
     const resolveAlias = vi.fn(async () => ({ status: 'ok', found: false }));
     const capabilityList = vi.fn(async () => ({ status: 'ok', items: [] }));
     const runAgentMcp = vi.fn(async () => ({ ok: true as const, results: [{ agent: 'codex', ok: true }] }));
@@ -151,7 +147,7 @@ describe.each(origins)('%s origin', (_label, participantTurnRequired, denied) =>
   });
 });
 
-it('capability_install rechecks every call as owner and participant turns alternate', async () => {
+it('capability_install allows both owner and participant turns as turns alternate', async () => {
   let participant = true;
   const runAgentMcp = vi.fn(async () => ({ ok: true as const, results: [] }));
   const server = createMemoryMcpServer(caller, {
@@ -170,14 +166,9 @@ it('capability_install rechecks every call as owner and participant turns altern
         name: 'capability_install',
         arguments: { kind: 'mcp', source: { kind: 'url', value: 'https://mcp.example.com' } },
       });
-      if (origin) {
-        expect(result.isError).toBe(true);
-        expect(mcpToolPayload(result).reason).toBe(PARTICIPANT_TURN_TOOL_REFUSAL);
-      } else {
-        expect(result.isError).not.toBe(true);
-      }
+      expect(result.isError).not.toBe(true);
     }
-    expect(runAgentMcp).toHaveBeenCalledTimes(2);
+    expect(runAgentMcp).toHaveBeenCalledTimes(4);
   } finally { await client.close(); await server.close(); }
 });
 

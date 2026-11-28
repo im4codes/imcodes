@@ -46,7 +46,7 @@ import type { ContextNamespace } from '../../shared/context-types.js';
 export interface CapabilityMcpToolDeps {
   capabilityService?: CapabilityService;
   nodeRole?: NodeRole;
-  /** Returns true (or throws to fail closed) when running inside a shared participant turn. */
+  /** Structural compatibility with MemoryMcpToolDeps; capability tools do not deny participant turns. */
   participantTurnRequired?: () => Promise<boolean>;
   /** Resolve caller context for binding-scoped Skill activation only. */
   resolveCapabilityIdentity?: (caller: McpRuntimeCaller) => Promise<CapabilityRuntimeIdentity | null>;
@@ -146,15 +146,6 @@ export function canRegisterCapabilityMcpTools(_caller: McpRuntimeCaller, deps: C
 
 function error(reason: CapabilityErrorResult['reason'], message: string, retryable = false): CapabilityErrorResult {
   return { status: 'error', reason, error: message, ...(retryable ? { retryable: true } : {}) };
-}
-
-async function isParticipantTurnDenied(deps: CapabilityMcpToolDeps): Promise<boolean> {
-  if (!deps.participantTurnRequired) return false;
-  try {
-    return (await deps.participantTurnRequired()) === true;
-  } catch {
-    return true;
-  }
 }
 
 /**
@@ -612,9 +603,6 @@ export function registerCapabilityMcpTools(
           case CAPABILITY_MCP_TOOL.LIST:
             return await listCapabilitiesWithAgentMcp((raw ?? {}) as CapabilityListRequest, service, deps);
           case CAPABILITY_MCP_TOOL.INSTALL: {
-            if (await isParticipantTurnDenied(deps)) {
-              return toolResult(error(CAPABILITY_ERROR.FORBIDDEN, 'capability_install is not permitted during a participant turn'));
-            }
             const rawInput = raw as Partial<CapabilityInstallRequest>;
             if (rawInput?.kind === CAPABILITY_KIND.SKILL) {
               return await installAgentSkill(rawInput as CapabilityInstallRequest, deps.runAgentSkills ?? runAgentSkillsOnThisMachine);
@@ -633,9 +621,6 @@ export function registerCapabilityMcpTools(
           case CAPABILITY_MCP_TOOL.STATUS:
             return toolResult(await service.status(raw as CapabilityStatusRequest));
           case CAPABILITY_MCP_TOOL.MANAGE: {
-            if (await isParticipantTurnDenied(deps)) {
-              return toolResult(error(CAPABILITY_ERROR.FORBIDDEN, 'capability_manage is not permitted during a participant turn'));
-            }
             const input = raw as CapabilityManageRequest;
             if ((input.action === CAPABILITY_MANAGE_ACTION.UNINSTALL
               || input.action === CAPABILITY_MANAGE_ACTION.DELETE_CREDENTIALS) && !input.userIntent?.trim()) {

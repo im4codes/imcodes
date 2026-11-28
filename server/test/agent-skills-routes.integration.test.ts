@@ -10,6 +10,7 @@ import { runMigrations } from '../src/db/migrate.js';
 import { buildApp } from '../src/index.js';
 import { hashPassword, randomHex, sha256Hex, signJwt } from '../src/security/crypto.js';
 import { WsBridge } from '../src/ws/bridge.js';
+import { createOrUpdateShare } from '../src/db/tab-sharing.js';
 import type { Env } from '../src/env.js';
 import { COOKIE_CSRF, COOKIE_SESSION, HEADER_CSRF } from '../../shared/cookie-names.js';
 import {
@@ -244,28 +245,53 @@ describe('/api/agent-skills', () => {
     expect(daemon.received).toEqual([]);
   });
 
-  it('denies whole-server share participants and daemon credentials on /api/agent-skills* and /api/agent-mcp*', async () => {
+  it('grants whole-server share participants parity on /api/agent-skills* and /api/agent-mcp* while keeping viewers, session shares, and daemon credentials at 403', async () => {
     const wholeParticipant = await createUser('whole_participant');
+    const wholeViewer = await createUser('whole_viewer');
+    const sessionParticipant = await createUser('session_participant');
+    const now = Date.now();
     await db.execute(
       `INSERT INTO server_shares (id, server_id, target_user_id, role, created_by, created_at, updated_at, exec_granted)
        VALUES ($1, $2, $3, 'participant', $4, $5, $5, true)`,
-      [randomHex(8), machine, wholeParticipant, owner, Date.now()],
+      [randomHex(8), machine, wholeParticipant, owner, now],
     );
+    await db.execute(
+      `INSERT INTO server_shares (id, server_id, target_user_id, role, created_by, created_at, updated_at, exec_granted)
+       VALUES ($1, $2, $3, 'viewer', $4, $5, $5, false)`,
+      [randomHex(8), machine, wholeViewer, owner, now],
+    );
+    await db.execute(
+      `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, state, created_at, updated_at)
+       VALUES ($1, $2, 'deck_proj_brain', 'proj', 'brain', 'codex', 'idle', $3, $3)`,
+      [randomHex(8), machine, now],
+    );
+    await createOrUpdateShare(db, {
+      id: randomHex(8),
+      target: { kind: 'main', serverId: machine, sessionName: 'deck_proj_brain' },
+      targetUserId: sessionParticipant,
+      role: 'participant',
+      createdBy: owner,
+      now,
+    });
     const daemon = await connectDaemon(machine, 'daemon-token');
     const app = buildApp(env());
 
-    for (const [method, path, body] of [
+    const routes = [
       ['GET', `/api/agent-skills?serverId=${machine}`, undefined],
       ['POST', `/api/agent-skills/run?serverId=${machine}`, { action: 'add', source: 'WeComTeam/wecom-cli' }],
       ['GET', `/api/agent-mcp?serverId=${machine}`, undefined],
-      ['POST', `/api/agent-mcp/run?serverId=${machine}`, { action: 'add', server: { name: 'evil', transport: 'http', url: 'https://evil.example.com/mcp' } }],
-    ] as const) {
-      const partRes = await app.request(path, {
-        method,
-        headers: headers(wholeParticipant, Boolean(body)),
-        ...(body ? { body: JSON.stringify(body) } : {}),
-      });
-      expect(partRes.status, `participant ${method} ${path}`).toBe(403);
+      ['POST', `/api/agent-mcp/run?serverId=${machine}`, { action: 'add', server: { name: 'github', transport: 'http', url: 'https://mcp.example.com/mcp' } }],
+    ] as const;
+
+    for (const [method, path, body] of routes) {
+      for (const [label, user] of [['viewer', wholeViewer], ['session_participant', sessionParticipant], ['stranger', stranger]] as const) {
+        const deniedRes = await app.request(path, {
+          method,
+          headers: headers(user, Boolean(body)),
+          ...(body ? { body: JSON.stringify(body) } : {}),
+        });
+        expect(deniedRes.status, `${label} ${method} ${path}`).toBe(403);
+      }
 
       const daemonRes = await app.request(path, {
         method,
@@ -279,6 +305,16 @@ describe('/api/agent-skills', () => {
       expect(daemonRes.status, `daemon ${method} ${path}`).toBe(403);
     }
     expect(daemon.received).toEqual([]);
+
+    for (const [method, path, body] of routes) {
+      const partRes = await app.request(path, {
+        method,
+        headers: headers(wholeParticipant, Boolean(body)),
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+      expect(partRes.status, `whole participant ${method} ${path}`).toBe(200);
+    }
+    expect(daemon.received).toHaveLength(4);
   });
 });
 

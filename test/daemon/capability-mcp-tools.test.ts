@@ -664,10 +664,11 @@ describe('capability MCP tools', () => {
     expect(unitDeps.searchAgentMcpRegistry).toBeUndefined();
   });
 
-  it('fails closed inside capability_install and capability_manage during a participant turn or failing turn check', async () => {
-    const runAgentMcp = vi.fn(async () => ({ ok: true as const, results: [] }));
+  it('allows capability_install and capability_manage during a participant turn or failing turn check', async () => {
+    const runAgentMcp = vi.fn(async () => ({ ok: true as const, results: [{ agent: 'codex', ok: true }] }));
     const runAgentSkills = vi.fn(async () => ({ ok: true as const, output: 'ok', skills: [] }));
-    const manage = vi.fn(async () => ({ status: 'ok' as const, item: {} as never }));
+    const listAgentMcp = vi.fn(async () => ({ servers: [{ name: 'github' }] }));
+    const manage = vi.fn(async () => ({ status: 'error' as const, reason: 'not_found' as const, error: 'not found' }));
     const install = vi.fn(async () => ({ status: 'ok' as const, operationId: 'op-1' }));
 
     for (const check of [
@@ -680,6 +681,7 @@ describe('capability MCP tools', () => {
       registerCapabilityMcpTools(server, caller(), {
         capabilityService: { ...service(), install, manage } as unknown as CapabilityService,
         participantTurnRequired: check,
+        listAgentMcp: listAgentMcp as never,
         runAgentMcp: runAgentMcp as never,
         runAgentSkills: runAgentSkills as never,
       });
@@ -691,30 +693,25 @@ describe('capability MCP tools', () => {
           name: 'capability_install',
           arguments: { kind: 'mcp', source: { kind: 'url', value: 'https://mcp.example.com' } },
         });
-        expect(resMcp.isError).toBe(true);
-        expect(resMcp.structuredContent).toMatchObject({ status: 'error', reason: 'forbidden' });
+        expect(resMcp.isError).not.toBe(true);
 
         const resSkill = await client.callTool({
           name: 'capability_install',
           arguments: { kind: 'skill', source: { kind: 'url', value: 'https://skills.sh/acme/skill' } },
         });
-        expect(resSkill.isError).toBe(true);
-        expect(resSkill.structuredContent).toMatchObject({ status: 'error', reason: 'forbidden' });
+        expect(resSkill.isError).not.toBe(true);
 
         const resManage = await client.callTool({
           name: 'capability_manage',
           arguments: { action: 'uninstall', kind: 'mcp', name: 'github', userIntent: 'remove github' },
         });
-        expect(resManage.isError).toBe(true);
-        expect(resManage.structuredContent).toMatchObject({ status: 'error', reason: 'forbidden' });
+        expect(resManage.isError).not.toBe(true);
       } finally {
         await client.close();
         await server.close();
       }
     }
-    expect(runAgentMcp).not.toHaveBeenCalled();
-    expect(runAgentSkills).not.toHaveBeenCalled();
-    expect(install).not.toHaveBeenCalled();
-    expect(manage).not.toHaveBeenCalled();
+    expect(runAgentMcp).toHaveBeenCalledTimes(4);
+    expect(runAgentSkills).toHaveBeenCalledTimes(2);
   });
 });

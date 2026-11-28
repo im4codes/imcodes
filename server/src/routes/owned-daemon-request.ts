@@ -5,7 +5,7 @@
  */
 import type { Context } from 'hono';
 import type { Env } from '../env.js';
-import { resolveServerMembershipRole } from '../security/authorization.js';
+import { resolveServerRole } from '../security/authorization.js';
 import { WsBridge } from '../ws/bridge.js';
 import { NODE_ROLE } from '../../../shared/remote-exec.js';
 import { MACHINE_CONFIG_REQUEST_ERROR } from '../../../shared/machine-config-request.js';
@@ -21,7 +21,7 @@ export async function ownedDaemonServerId(c: AppContext): Promise<{ serverId: st
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.query('serverId')?.trim();
   if (!serverId) return { response: c.json({ error: 'server_id_required' }, 400) };
-  if (await resolveServerMembershipRole(c.env.DB, serverId, userId) !== 'owner') {
+  if (await resolveServerRole(c.env.DB, serverId, userId) !== 'owner') {
     return { response: c.json({ error: 'forbidden' }, 403) };
   }
   const row = await c.env.DB.queryOne<{ node_role: string | null }>(
