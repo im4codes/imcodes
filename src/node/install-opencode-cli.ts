@@ -5,10 +5,11 @@ import {
   chmodSync,
   constants as fsConstants,
   existsSync,
+  linkSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
-  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -45,6 +46,7 @@ export interface InstallOpenCodeOptions {
   registry?: string;
   registries?: string[];
   noFallback?: boolean;
+  isolatedTest?: boolean;
   metadataTimeoutMs?: number;
   tarballTimeoutMs?: number;
   versionTimeoutMs?: number;
@@ -129,6 +131,76 @@ async function defaultCheckFileExecutable(filePath: string, platform: NodeJS.Pla
   }
 }
 
+function isWithinRealRoot(targetReal: string, rootReal: string, platform: NodeJS.Platform): boolean {
+  const p = getPathModule(platform);
+  const normTarget = platform === 'win32' ? targetReal.toLowerCase() : targetReal;
+  const normRoot = platform === 'win32' ? rootReal.toLowerCase() : rootReal;
+  const rel = p.relative(normRoot, normTarget);
+  return rel === '' || (!rel.startsWith('..') && !p.isAbsolute(rel));
+}
+
+function assertExistingDirSafeWithinHome(dirPath: string, canonicalHome: string, label: string, platform: NodeJS.Platform): boolean {
+  let st;
+  try {
+    st = lstatSync(dirPath);
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException | undefined)?.code === 'ENOENT') return false;
+    throw err;
+  }
+  if (st.isSymbolicLink()) {
+    throw new Error(`unsafe_symlink_target:${label}`);
+  }
+  if (!st.isDirectory()) {
+    throw new Error(`unsafe_non_directory_target:${label}`);
+  }
+  const realDir = realpathSync(dirPath);
+  if (!isWithinRealRoot(realDir, canonicalHome, platform)) {
+    throw new Error(`unsafe_target_escape:${label}`);
+  }
+  return true;
+}
+
+function ensureSafeOpenCodePaths(homeDir: string, binDir: string, destPath: string, platform: NodeJS.Platform, createDirs: boolean): void {
+  const p = getPathModule(platform);
+  const opencodeDir = p.join(homeDir, '.opencode');
+
+  if (!existsSync(homeDir)) {
+    if (!createDirs) return;
+    mkdirSync(homeDir, { recursive: true });
+  }
+  if (lstatSync(homeDir).isSymbolicLink()) {
+    throw new Error('unsafe_symlink_target:homeDir');
+  }
+  const canonicalHome = realpathSync(homeDir);
+
+  if (!assertExistingDirSafeWithinHome(opencodeDir, canonicalHome, '.opencode', platform)) {
+    if (!createDirs) return;
+    mkdirSync(opencodeDir);
+    assertExistingDirSafeWithinHome(opencodeDir, canonicalHome, '.opencode', platform);
+  }
+
+  if (!assertExistingDirSafeWithinHome(binDir, canonicalHome, '.opencode/bin', platform)) {
+    if (!createDirs) return;
+    mkdirSync(binDir);
+    assertExistingDirSafeWithinHome(binDir, canonicalHome, '.opencode/bin', platform);
+  }
+
+  try {
+    const destStat = lstatSync(destPath);
+    if (destStat.isSymbolicLink()) {
+      throw new Error('unsafe_symlink_target:opencode');
+    }
+    const realParent = realpathSync(p.dirname(destPath));
+    if (!isWithinRealRoot(realParent, canonicalHome, platform)) {
+      throw new Error('unsafe_target_escape:opencode');
+    }
+  } catch (err: unknown) {
+    if ((err as NodeJS.ErrnoException | undefined)?.code !== 'ENOENT') {
+      throw err;
+    }
+  }
+}
+
 export async function isOpenCodeAlreadyInstalled(opts: {
   homeDir?: string;
   platform?: NodeJS.Platform;
@@ -158,7 +230,11 @@ export async function isOpenCodeAlreadyInstalled(opts: {
       }
     }
     if (homeDir) {
-      const homeBin = p.join(homeDir, '.opencode', 'bin', 'opencode.exe');
+      const binDir = p.join(homeDir, '.opencode', 'bin');
+      const homeBin = p.join(binDir, 'opencode.exe');
+      if (platform === process.platform) {
+        ensureSafeOpenCodePaths(homeDir, binDir, homeBin, platform, false);
+      }
       if (await isExec(homeBin)) return homeBin;
     }
     return null;
@@ -169,7 +245,11 @@ export async function isOpenCodeAlreadyInstalled(opts: {
     if (await isExec(candidate)) return candidate;
   }
   if (homeDir) {
-    const homeBin = p.join(homeDir, '.opencode', 'bin', 'opencode');
+    const binDir = p.join(homeDir, '.opencode', 'bin');
+    const homeBin = p.join(binDir, 'opencode');
+    if (platform === process.platform) {
+      ensureSafeOpenCodePaths(homeDir, binDir, homeBin, platform, false);
+    }
     if (await isExec(homeBin)) return homeBin;
   }
   return null;
@@ -195,9 +275,11 @@ export function resolveCandidateRegistries(opts: {
   env?: NodeJS.ProcessEnv;
   homeDir?: string;
   noFallback?: boolean;
+  isolatedTest?: boolean;
 } = {}): string[] {
   const env = opts.env ?? process.env;
   const homeDir = opts.homeDir ?? homedir();
+  const isolatedTest = opts.isolatedTest || /^(1|true|yes)$/i.test((env.IMCODES_OPENCODE_ISOLATED_TEST ?? '').trim());
   const candidates: Array<string | null> = [];
 
   if (Array.isArray(opts.registries) && opts.registries.length > 0) {
@@ -207,9 +289,11 @@ export function resolveCandidateRegistries(opts: {
 
   candidates.push(normalizeRegistryUrl(opts.registry));
   candidates.push(normalizeRegistryUrl(env.IMCODES_OPENCODE_REGISTRY));
-  candidates.push(normalizeRegistryUrl(env.IMCODES_NPM_REGISTRY));
+  if (!isolatedTest) {
+    candidates.push(normalizeRegistryUrl(env.IMCODES_NPM_REGISTRY));
+  }
 
-  if (homeDir) {
+  if (homeDir && !isolatedTest) {
     const installJsonPath = path.join(homeDir, '.imcodes', 'install.json');
     try {
       if (existsSync(installJsonPath)) {
@@ -222,8 +306,7 @@ export function resolveCandidateRegistries(opts: {
   }
 
   const noFallback = opts.noFallback || /^(1|true|yes)$/i.test((env.IMCODES_OPENCODE_NO_FALLBACK ?? '').trim());
-  const hasExplicit = candidates.some(Boolean);
-  if (!(noFallback && hasExplicit)) {
+  if (!isolatedTest && !noFallback) {
     candidates.push(OPENCODE_OFFICIAL_REGISTRY);
     candidates.push(OPENCODE_MIRROR_REGISTRY);
   }
@@ -323,14 +406,32 @@ function parsePaxRecords(buf: Buffer): Record<string, string> {
   return out;
 }
 
-function normalizeTarEntryPath(rawPath: string): string | null {
-  if (!rawPath || rawPath.includes('\0')) return null;
-  if (rawPath.startsWith('/')) return null;
+function validateTarEntryPath(rawPath: string, typeflag: string): string | null {
+  if (!rawPath || rawPath.includes('\0')) {
+    throw new Error(`unsafe_tar_entry_path:${rawPath}`);
+  }
+  if (rawPath.startsWith('/') || rawPath.startsWith('\\') || /^[a-zA-Z]:/.test(rawPath)) {
+    throw new Error(`unsafe_tar_entry_path:${rawPath}`);
+  }
   let cleaned = rawPath.replace(/\\/g, '/');
   while (cleaned.startsWith('./')) cleaned = cleaned.slice(2);
-  const parts = cleaned.split('/').filter((seg) => seg.length > 0 && seg !== '.');
-  if (parts.length === 0 || parts.some((seg) => seg === '..')) return null;
-  return parts.join('/');
+  const rawSegments = cleaned.split('/').filter((seg) => seg.length > 0 && seg !== '.');
+  if (rawSegments.some((seg) => seg === '..')) {
+    throw new Error(`unsafe_tar_entry_path:${rawPath}`);
+  }
+  if (rawSegments.length === 0) {
+    if (typeflag === '5') return null;
+    throw new Error(`unsafe_tar_entry_path:${rawPath}`);
+  }
+  return rawSegments.join('/');
+}
+
+function normalizeTarEntryPath(rawPath: string): string | null {
+  try {
+    return validateTarEntryPath(rawPath, '0');
+  } catch {
+    return null;
+  }
 }
 
 export function extractBinaryFromTarGz(tgzBuffer: Buffer, targetEntryPaths: string[]): Buffer {
@@ -348,6 +449,7 @@ export function extractBinaryFromTarGz(tgzBuffer: Buffer, targetEntryPaths: stri
   let nextPax: Record<string, string> = {};
   let nextGnuLongName: string | null = null;
   let globalPax: Record<string, string> = {};
+  let matchedBinary: Buffer | null = null;
 
   while (offset + 512 <= tar.length) {
     const header = tar.subarray(offset, offset + 512);
@@ -394,30 +496,28 @@ export function extractBinaryFromTarGz(tgzBuffer: Buffer, targetEntryPaths: stri
 
     const headerCombinedName = rawPrefix ? `${rawPrefix}/${rawName}` : rawName;
     const effectiveRawName = nextPax.path ?? nextGnuLongName ?? globalPax.path ?? headerCombinedName;
+    const effectiveLinkName = nextPax.linkpath ?? readTarString(header, 157, 100);
     nextPax = {};
     nextGnuLongName = null;
 
-    if (typeflag !== '0') {
-      // Never accept symlinks ('2'), hardlinks ('1'), directories ('5'), etc.
-      continue;
+    if (typeflag !== '0' && typeflag !== '5') {
+      throw new Error(`unsafe_tar_entry_type:${typeflag}:${effectiveRawName || effectiveLinkName}`);
     }
 
-    const normalized = normalizeTarEntryPath(effectiveRawName);
-    if (!normalized) {
-      // Reject suspicious traversal entries outright
-      if (effectiveRawName.includes('..') || effectiveRawName.startsWith('/')) {
-        throw new Error(`unsafe_tar_entry_path: ${effectiveRawName}`);
-      }
-      continue;
-    }
+    const normalized = validateTarEntryPath(effectiveRawName, typeflag);
 
-    if (wanted.has(normalized)) {
+    if (typeflag === '0' && normalized && wanted.has(normalized)) {
       if (size === 0) throw new Error('empty_binary_in_tarball');
-      return Buffer.from(tar.subarray(dataStart, dataEnd));
+      if (!matchedBinary) {
+        matchedBinary = Buffer.from(tar.subarray(dataStart, dataEnd));
+      }
     }
   }
 
-  throw new Error('binary_not_found_in_tarball');
+  if (!matchedBinary) {
+    throw new Error('binary_not_found_in_tarball');
+  }
+  return matchedBinary;
 }
 
 function defaultVerifyVersion(binPath: string, timeoutMs: number): string | undefined {
@@ -437,6 +537,55 @@ function buildAbortSignal(timeoutMs: number): AbortSignal | undefined {
   return undefined;
 }
 
+const MAX_REDIRECT_HOPS = 5;
+
+function validateDownloadUrl(rawUrl: string, allowedProto: string, strictOrigin?: string): string {
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== 'https:' && !(allowedProto === 'http:' && parsed.protocol === 'http:')) {
+    throw new Error(`unsafe_tarball_protocol:${parsed.protocol}`);
+  }
+  if (strictOrigin && parsed.origin !== strictOrigin) {
+    throw new Error(`disallowed_external_origin:${parsed.origin}`);
+  }
+  return parsed.toString();
+}
+
+async function fetchWithSafeRedirects(
+  fetchFn: typeof fetch,
+  initialUrl: string,
+  opts: {
+    signal?: AbortSignal;
+    headers?: Record<string, string>;
+    allowedProto: string;
+    strictOrigin?: string;
+  },
+): Promise<Response> {
+  let currentUrl = validateDownloadUrl(initialUrl, opts.allowedProto, opts.strictOrigin);
+  for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop += 1) {
+    const res = await fetchFn(currentUrl, {
+      ...(opts.headers ? { headers: opts.headers } : {}),
+      ...(opts.signal ? { signal: opts.signal } : {}),
+      redirect: 'manual',
+    });
+    if ((res as { type?: string }).type === 'opaqueredirect') {
+      throw new Error('unexpected_opaque_redirect');
+    }
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers?.get?.('location');
+      if (!location) {
+        throw new Error(`redirect_missing_location:${res.status}`);
+      }
+      if (hop === MAX_REDIRECT_HOPS) {
+        throw new Error('too_many_redirects');
+      }
+      currentUrl = validateDownloadUrl(new URL(location, currentUrl).toString(), opts.allowedProto, opts.strictOrigin);
+      continue;
+    }
+    return res;
+  }
+  throw new Error('too_many_redirects');
+}
+
 export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Promise<InstallOpenCodeResult> {
   const env = opts.env ?? process.env;
   const platform = opts.platform ?? process.platform;
@@ -448,18 +597,26 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
   const metadataTimeoutMs = opts.metadataTimeoutMs ?? DEFAULT_METADATA_TIMEOUT_MS;
   const tarballTimeoutMs = opts.tarballTimeoutMs ?? DEFAULT_TARBALL_TIMEOUT_MS;
   const versionTimeoutMs = opts.versionTimeoutMs ?? DEFAULT_VERSION_TIMEOUT_MS;
+  const isolatedTest = Boolean(opts.isolatedTest || /^(1|true|yes)$/i.test((env.IMCODES_OPENCODE_ISOLATED_TEST ?? '').trim()));
 
   if (isOpenCodeOptedOut({ skip: opts.skip, env })) {
     opts.logger?.info?.('skipping OpenCode CLI install (IMCODES_SKIP_OPENCODE / --skip)');
     return { status: 'skipped' };
   }
 
-  const existing = await isOpenCodeAlreadyInstalled({
-    homeDir,
-    platform,
-    env,
-    checkFileExecutable: opts.checkFileExecutable,
-  });
+  let existing: string | null;
+  try {
+    existing = await isOpenCodeAlreadyInstalled({
+      homeDir,
+      platform,
+      env,
+      checkFileExecutable: opts.checkFileExecutable,
+    });
+  } catch (pathErr) {
+    const reason = pathErr instanceof Error ? pathErr.message : String(pathErr);
+    opts.logger?.warn?.(`unsafe OpenCode target path: ${reason}`);
+    return { status: 'failed', reason };
+  }
   if (existing) {
     opts.logger?.info?.(`found existing opencode CLI at ${existing} — keeping existing install`);
     return { status: 'existing', path: existing };
@@ -477,6 +634,7 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
     env,
     homeDir,
     noFallback: opts.noFallback,
+    isolatedTest,
   });
 
   if (registries.length === 0) {
@@ -492,10 +650,16 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
 
   for (const registry of registries) {
     try {
+      const regUrl = new URL(registry);
+      const regProto = regUrl.protocol;
+      const strictOrigin = isolatedTest ? regUrl.origin : undefined;
+
       const metaUrl = `${registry}/${encodeURIComponent(packageName)}/latest`;
-      const metaRes = await fetchFn(metaUrl, {
+      const metaRes = await fetchWithSafeRedirects(fetchFn, metaUrl, {
         headers: { accept: 'application/json' },
         signal: buildAbortSignal(metadataTimeoutMs),
+        allowedProto: regProto,
+        strictOrigin,
       });
       if (!metaRes.ok) {
         throw new Error(`metadata_http_${metaRes.status}`);
@@ -504,14 +668,12 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
       const dist = meta?.dist;
       const tarballUrl = typeof dist?.tarball === 'string' ? dist.tarball.trim() : '';
       if (!tarballUrl) throw new Error('missing_tarball_url');
-      const parsedTarball = new URL(tarballUrl);
-      const regProto = new URL(registry).protocol;
-      if (parsedTarball.protocol !== 'https:' && !(regProto === 'http:' && parsedTarball.protocol === 'http:')) {
-        throw new Error(`unsafe_tarball_protocol:${parsedTarball.protocol}`);
-      }
+      validateDownloadUrl(tarballUrl, regProto, strictOrigin);
 
-      const tarRes = await fetchFn(tarballUrl, {
+      const tarRes = await fetchWithSafeRedirects(fetchFn, tarballUrl, {
         signal: buildAbortSignal(tarballTimeoutMs),
+        allowedProto: regProto,
+        strictOrigin,
       });
       if (!tarRes.ok) {
         throw new Error(`tarball_http_${tarRes.status}`);
@@ -524,36 +686,82 @@ export async function installOpenCodeCli(opts: InstallOpenCodeOptions = {}): Pro
       verifyBufferIntegrity(tgzBuffer, dist!);
       const binaryBuf = extractBinaryFromTarGz(tgzBuffer, entryCandidates);
 
-      mkdirSync(binDir, { recursive: true });
-      const tmpPath = pathMod.join(binDir, `.${binaryName}.tmp-${process.pid}-${Date.now()}`);
+      if (platform === process.platform) {
+        ensureSafeOpenCodePaths(homeDir, binDir, destPath, platform, true);
+      } else {
+        mkdirSync(binDir, { recursive: true });
+      }
+
+      const uniqueSuffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const tmpPath = pathMod.join(binDir, `.tmp-${uniqueSuffix}-${binaryName}`);
+      const metaVersion = typeof meta.version === 'string' ? meta.version.trim() : undefined;
+      let detectedVersion: string | undefined;
+
       try {
-        writeFileSync(tmpPath, binaryBuf);
+        writeFileSync(tmpPath, binaryBuf, {
+          flag: 'wx',
+          ...(platform !== 'win32' ? { mode: 0o755 } : {}),
+        });
         if (platform !== 'win32') {
           chmodSync(tmpPath, 0o755);
         }
-        renameSync(tmpPath, destPath);
-      } catch (writeErr) {
+
+        try {
+          detectedVersion = verifyVer(tmpPath, versionTimeoutMs);
+        } catch (verErr) {
+          const msg = verErr instanceof Error ? verErr.message : String(verErr);
+          opts.logger?.warn?.(`staged OpenCode CLI version probe failed: ${msg}`);
+          return {
+            status: 'unverified',
+            version: metaVersion,
+            packageName,
+            registry,
+            reason: msg,
+          };
+        }
+
+        let publishedAsExisting = false;
+        try {
+          linkSync(tmpPath, destPath);
+        } catch (linkErr: unknown) {
+          const code = (linkErr as NodeJS.ErrnoException | undefined)?.code;
+          if (code === 'EEXIST') {
+            publishedAsExisting = true;
+          } else if (code === 'EXDEV' || code === 'EPERM' || code === 'ENOTSUP' || code === 'EACCES') {
+            try {
+              writeFileSync(destPath, binaryBuf, {
+                flag: 'wx',
+                ...(platform !== 'win32' ? { mode: 0o755 } : {}),
+              });
+              if (platform !== 'win32') {
+                chmodSync(destPath, 0o755);
+              }
+            } catch (wxErr: unknown) {
+              if ((wxErr as NodeJS.ErrnoException | undefined)?.code === 'EEXIST') {
+                publishedAsExisting = true;
+              } else {
+                throw wxErr;
+              }
+            }
+          } else {
+            throw linkErr;
+          }
+        }
+
+        if (publishedAsExisting) {
+          opts.logger?.info?.(`found concurrent opencode CLI at ${destPath} — keeping existing install`);
+          return {
+            status: 'existing',
+            path: destPath,
+            version: detectedVersion || metaVersion,
+            packageName,
+            registry,
+          };
+        }
+      } finally {
         try {
           rmSync(tmpPath, { force: true });
         } catch { /* ignore cleanup error */ }
-        throw writeErr;
-      }
-
-      const metaVersion = typeof meta.version === 'string' ? meta.version.trim() : undefined;
-      let detectedVersion: string | undefined;
-      try {
-        detectedVersion = verifyVer(destPath, versionTimeoutMs);
-      } catch (verErr) {
-        const msg = verErr instanceof Error ? verErr.message : String(verErr);
-        opts.logger?.warn?.(`installed ${destPath}, but version probe failed: ${msg}`);
-        return {
-          status: 'unverified',
-          path: destPath,
-          version: metaVersion,
-          packageName,
-          registry,
-          reason: msg,
-        };
       }
 
       if (platform !== 'win32') {
@@ -591,6 +799,7 @@ function parseCliArgs(argv: string[]): {
   skip: boolean;
   registry?: string;
   noFallback: boolean;
+  isolatedTest: boolean;
   strict: boolean;
   quiet: boolean;
   timeoutMs?: number;
@@ -598,6 +807,7 @@ function parseCliArgs(argv: string[]): {
   const out: ReturnType<typeof parseCliArgs> = {
     skip: false,
     noFallback: false,
+    isolatedTest: false,
     strict: false,
     quiet: false,
   };
@@ -613,6 +823,9 @@ function parseCliArgs(argv: string[]): {
     } else if (arg === '--skip') {
       out.skip = true;
     } else if (arg === '--no-fallback') {
+      out.noFallback = true;
+    } else if (arg === '--isolated-test') {
+      out.isolatedTest = true;
       out.noFallback = true;
     } else if (arg === '--strict') {
       out.strict = true;
@@ -637,6 +850,7 @@ export async function runInstallOpenCodeCli(argv: string[] = process.argv.slice(
       ...(args.registry ? { registry: args.registry } : {}),
       ...(args.skip ? { skip: true } : {}),
       ...(args.noFallback ? { noFallback: true } : {}),
+      ...(args.isolatedTest ? { isolatedTest: true } : {}),
       ...(args.timeoutMs ? { metadataTimeoutMs: args.timeoutMs, tarballTimeoutMs: args.timeoutMs } : {}),
       logger,
     });

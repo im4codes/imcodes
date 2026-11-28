@@ -817,6 +817,38 @@ hash_file_sha256() {
   fi
 }
 
+run_as_target_unix_user() {
+  if [ "$(id -u)" -ne 0 ]; then
+    HOME="$EFF_HOME" "$@"
+    return $?
+  fi
+  t_user="$(resolve_target_unix_user 2>/dev/null || true)"
+  if [ "$EFF_HOME" = "/root" ]; then
+    if [ -z "$t_user" ] || [ "$t_user" = "root" ]; then
+      HOME="$EFF_HOME" "$@"
+      return $?
+    fi
+  fi
+  if [ -z "$t_user" ] || [ "$t_user" = "root" ]; then
+    echo "WARNING: unable to resolve non-root target user for $EFF_HOME; skipping OpenCode CLI install" >&2
+    return 2
+  fi
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$t_user" -- env HOME="$EFF_HOME" PATH="$PATH" "$@"
+    return $?
+  elif command -v su >/dev/null 2>&1; then
+    export IMCODES_SU_HOME="$EFF_HOME"
+    if [ "$PLATFORM" = "darwin" ]; then
+      su "$t_user" -c 'HOME="$IMCODES_SU_HOME" exec "$0" "$@"' "$@"
+    else
+      su -s /bin/sh "$t_user" -c 'HOME="$IMCODES_SU_HOME" exec "$0" "$@"' "$@"
+    fi
+    return $?
+  fi
+  echo "WARNING: neither runuser nor su is available to drop root privileges; skipping OpenCode CLI install" >&2
+  return 2
+}
+
 install_opencode_cli_best_effort() {
   case "\${IMCODES_SKIP_OPENCODE:-}" in
     1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss])
@@ -826,17 +858,28 @@ install_opencode_cli_best_effort() {
   if [ -n "$ISOLATED_ROOT" ] && [ -z "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ] && [ -z "\${IMCODES_OPENCODE_REGISTRY:-}" ]; then
     return 0
   fi
-  if [ -n "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ]; then
-    "$IMCODES_OPENCODE_INSTALL_HOOK" --home "$EFF_HOME" || echo "WARNING: OpenCode CLI install hook failed (non-blocking)" >&2
-  elif [ -x "$CURRENT_LINK/bin/node" ] && [ -f "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" ]; then
-    "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" --home "$EFF_HOME" || echo "WARNING: OpenCode CLI install failed (non-blocking)" >&2
+  if [ -n "$ISOLATED_ROOT" ]; then
+    if ! (
+      assert_safe_isolated_target "$EFF_HOME/.opencode" entry
+      assert_safe_isolated_target "$EFF_HOME/.opencode/bin" entry
+      assert_safe_isolated_target "$EFF_HOME/.opencode/bin/opencode" entry
+    ); then
+      echo "WARNING: unsafe OpenCode target path in isolated mode; skipping OpenCode CLI install (non-blocking)" >&2
+      return 0
+    fi
   fi
-  if [ -d "$EFF_HOME/.opencode" ]; then
-    for oc_path in "$EFF_HOME/.opencode" "$EFF_HOME/.opencode/bin" "$EFF_HOME/.opencode/bin/opencode"; do
-      if is_root_owned_path "$oc_path"; then
-        chown_target_entry "$oc_path"
-      fi
-    done
+  if [ -n "\${IMCODES_OPENCODE_INSTALL_HOOK:-}" ]; then
+    if ! run_as_target_unix_user "$IMCODES_OPENCODE_INSTALL_HOOK" --home "$EFF_HOME"; then
+      echo "WARNING: OpenCode CLI install hook failed (non-blocking)" >&2
+    fi
+  elif [ -x "$CURRENT_LINK/bin/node" ] && [ -f "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" ]; then
+    set -- "$CURRENT_LINK/bin/node" "$CURRENT_LINK/package/dist/src/node/install-opencode-cli.js" --home "$EFF_HOME" --strict
+    if [ -n "$ISOLATED_ROOT" ]; then
+      set -- "$@" --registry "\${IMCODES_OPENCODE_REGISTRY:-}" --no-fallback --isolated-test
+    fi
+    if ! run_as_target_unix_user "$@"; then
+      echo "WARNING: OpenCode CLI install failed (non-blocking)" >&2
+    fi
   fi
   return 0
 }
@@ -1812,6 +1855,8 @@ if [ -d "$RELEASE_DIR" ]; then
   ln -s "$RELEASE_DIR" "$CURRENT_LINK"
 fi
 
+install_opencode_cli_best_effort
+
 if [ "$CLEAN_EXPIRED_TMP" -eq 1 ]; then
   for scan_dir in "$USER_STATE_DIR" "$NODE_ROOT" "$RUNTIME_ROOT"; do
     [ -d "$scan_dir" ] || continue
@@ -1853,7 +1898,7 @@ if [ "$PRESERVE_AUTOSTART" -eq 0 ]; then
     <key>HOME</key>
     <string>$xml_eff_home</string>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$xml_eff_home/.opencode/bin</string>
   </dict>
   <key>ProgramArguments</key>
   <array>
@@ -1883,6 +1928,7 @@ After=network-online.target
 
 [Service]
 Type=simple
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$EFF_HOME/.local/bin:$EFF_HOME/.opencode/bin"
 ExecStart=$CURRENT_LINK/bin/node $CURRENT_LINK/package/dist/src/index.js start --foreground
 Restart=always
 RestartSec=5
@@ -1983,7 +2029,6 @@ EOF
   fi
 fi
 
-install_opencode_cli_best_effort
 refresh_node_staged_receipt
 
 if [ "$APPLY_SERVICES" -eq 1 ]; then

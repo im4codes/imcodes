@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -191,11 +191,29 @@ describe('install-opencode-cli', () => {
     expect(() => verifyBufferIntegrity(payload, {})).toThrow(/missing_integrity_metadata/);
   });
 
-  it('rejects traversal entries and non-regular binary entries in tarballs', () => {
+  it('rejects traversal entries and non-regular entries anywhere in tarball (before or after binary)', () => {
     const symlinkTar = buildTarGz([
       { name: 'package/bin/opencode', content: '', typeflag: '2' },
     ]);
-    expect(() => extractBinaryFromTarGz(symlinkTar, ['package/bin/opencode'])).toThrow(/binary_not_found_in_tarball/);
+    expect(() => extractBinaryFromTarGz(symlinkTar, ['package/bin/opencode'])).toThrow(/unsafe_tar_entry_type/);
+
+    const illegalBeforeValid = buildTarGz([
+      { name: 'package/bin/helper', content: 'package/bin/opencode', typeflag: '2' },
+      { name: 'package/bin/opencode', content: 'valid-bin', typeflag: '0' },
+    ]);
+    expect(() => extractBinaryFromTarGz(illegalBeforeValid, ['package/bin/opencode'])).toThrow(/unsafe_tar_entry_type/);
+
+    const illegalAfterValid = buildTarGz([
+      { name: 'package/bin/opencode', content: 'valid-bin', typeflag: '0' },
+      { name: 'package/bin/link', content: '../outside', typeflag: '1' },
+    ]);
+    expect(() => extractBinaryFromTarGz(illegalAfterValid, ['package/bin/opencode'])).toThrow(/unsafe_tar_entry_type/);
+
+    const traversalAfterValid = buildTarGz([
+      { name: 'package/bin/opencode', content: 'valid-bin', typeflag: '0' },
+      { name: 'package/../../evil', content: 'bad', typeflag: '0' },
+    ]);
+    expect(() => extractBinaryFromTarGz(traversalAfterValid, ['package/bin/opencode'])).toThrow(/unsafe_tar_entry_path/);
 
     const traversalTar = buildTarGz([
       { name: '../evil/opencode', content: 'bad' },
@@ -342,5 +360,200 @@ describe('install-opencode-cli', () => {
       'https://registry.npmjs.org',
       'https://registry.npmmirror.com',
     ]);
+
+    const isoList = resolveCandidateRegistries({
+      registry: 'http://127.0.0.1:45555/',
+      env: { IMCODES_NPM_REGISTRY: 'https://env.example/npm/' },
+      homeDir,
+      isolatedTest: true,
+    });
+    expect(isoList).toEqual(['http://127.0.0.1:45555']);
+  });
+
+  it('verifies staged temp binary BEFORE atomic no-clobber publish and cleans up temp files', async () => {
+    const payload = Buffer.from('#!/bin/sh\necho "opencode 2.4.2"\n', 'utf8');
+    const tgz = buildTarGz([{ name: 'package/bin/opencode', content: payload, typeflag: '0', mode: 0o755 }]);
+    const integrity = `sha512-${createHash('sha512').update(tgz).digest('base64')}`;
+
+    let regUrl = '';
+    const srv = await startMockServer((req, res) => {
+      if (req.url?.endsWith('/latest')) {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '2.4.2', dist: { tarball: `${regUrl}/pkg.tgz`, integrity } }));
+        return;
+      }
+      res.end(tgz);
+    });
+    regUrl = srv.url;
+
+    try {
+      // Counterexample A: failed --version probe leaves destination absent, temp removed, and retry succeeds
+      const homeA = makeTempDir();
+      const destA = join(homeA, '.opencode', 'bin', 'opencode');
+      const binDirA = join(homeA, '.opencode', 'bin');
+      const failedRes = await installOpenCodeCli({
+        homeDir: homeA,
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        env: { PATH: '' },
+        registries: [srv.url],
+        verifyVersion: (stagedPath) => {
+          expect(stagedPath).not.toBe(destA);
+          expect(existsSync(destA)).toBe(false);
+          throw new Error('corrupt_binary_probe');
+        },
+      });
+      expect(failedRes.status).toBe('unverified');
+      expect(existsSync(destA)).toBe(false);
+      expect(readdirSync(binDirA)).toEqual([]);
+
+      const retryRes = await installOpenCodeCli({
+        homeDir: homeA,
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        env: { PATH: '' },
+        registries: [srv.url],
+        verifyVersion: () => 'opencode 2.4.2',
+      });
+      expect(retryRes.status).toBe('installed');
+      expect(existsSync(destA)).toBe(true);
+      expect(readdirSync(binDirA)).toEqual(['opencode']);
+
+      // Counterexample B: concurrent install writing destPath during verifyVersion is NEVER clobbered
+      const homeB = makeTempDir();
+      const destB = join(homeB, '.opencode', 'bin', 'opencode');
+      const binDirB = join(homeB, '.opencode', 'bin');
+      const raceRes = await installOpenCodeCli({
+        homeDir: homeB,
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        env: { PATH: '' },
+        registries: [srv.url],
+        verifyVersion: (stagedPath) => {
+          expect(stagedPath).not.toBe(destB);
+          writeFileSync(destB, 'existing-v1', { mode: 0o755 });
+          return 'opencode 2.4.2';
+        },
+      });
+      expect(raceRes).toMatchObject({ status: 'existing', path: destB });
+      expect(readFileSync(destB, 'utf8')).toBe('existing-v1');
+      expect(readdirSync(binDirB)).toEqual(['opencode']);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  it('enforces isolated origin, manual redirects, no install.json fallback, and canonical symlink confinement', async () => {
+    const tgz = buildTarGz([{ name: 'package/bin/opencode', content: 'ok', typeflag: '0' }]);
+    const integrity = `sha512-${createHash('sha512').update(tgz).digest('base64')}`;
+
+    let externalHits = 0;
+    const externalSrv = await startMockServer((_req, res) => {
+      externalHits += 1;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ version: '2.4.2', dist: { tarball: `${externalSrv.url}/pkg.tgz`, integrity } }));
+    });
+
+    let regUrl = '';
+    const isolatedSrv = await startMockServer((req, res) => {
+      if (req.url === '/opencode-linux-x64/latest') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '2.4.2', dist: { tarball: `${externalSrv.url}/off-origin.tgz`, integrity } }));
+        return;
+      }
+      if (req.url === '/redirect-meta/opencode-linux-x64/latest') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '2.4.2', dist: { tarball: `${regUrl}/redirect-hop.tgz`, integrity } }));
+        return;
+      }
+      if (req.url === '/redirect-hop.tgz') {
+        res.statusCode = 302;
+        res.setHeader('location', `${externalSrv.url}/evil.tgz`);
+        res.end();
+        return;
+      }
+      if (req.url === '/valid/opencode-linux-x64/latest') {
+        res.setHeader('content-type', 'application/json');
+        res.end(JSON.stringify({ version: '2.4.2', dist: { tarball: `${regUrl}/valid.tgz`, integrity } }));
+        return;
+      }
+      res.end(tgz);
+    });
+    regUrl = isolatedSrv.url;
+
+    try {
+      // 1. Failing isolated loopback never falls back to install.json or IMCODES_NPM_REGISTRY
+      const homeOffline = makeTempDir();
+      mkdirSync(join(homeOffline, '.imcodes'), { recursive: true });
+      writeFileSync(join(homeOffline, '.imcodes', 'install.json'), JSON.stringify({ registry: externalSrv.url }));
+      const offlineRes = await installOpenCodeCli({
+        homeDir: homeOffline,
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        env: { PATH: '', IMCODES_NPM_REGISTRY: externalSrv.url },
+        registry: 'http://127.0.0.1:9',
+        noFallback: true,
+        isolatedTest: true,
+      });
+      expect(offlineRes.status).toBe('failed');
+      expect(externalHits).toBe(0);
+
+      // 2. External tarball origin in isolatedTest mode rejected before any fetch
+      const offOriginRes = await installOpenCodeCli({
+        homeDir: makeTempDir(),
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        env: { PATH: '' },
+        registry: isolatedSrv.url,
+        noFallback: true,
+        isolatedTest: true,
+      });
+      expect(offOriginRes.status).toBe('failed');
+      expect(offOriginRes.reason).toContain('disallowed_external_origin');
+      expect(externalHits).toBe(0);
+
+      // 3. External redirect on tarball fetch rejected without contacting external host
+      const redirectRes = await installOpenCodeCli({
+        homeDir: makeTempDir(),
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        env: { PATH: '' },
+        registry: `${isolatedSrv.url}/redirect-meta`,
+        noFallback: true,
+        isolatedTest: true,
+      });
+      expect(redirectRes.status).toBe('failed');
+      expect(redirectRes.reason).toContain('disallowed_external_origin');
+      expect(externalHits).toBe(0);
+
+      // 4. Symlinked .opencode/bin escaping homeDir is rejected before writing
+      const homeSymlink = makeTempDir();
+      const outsideDir = makeTempDir('outside-target-');
+      mkdirSync(join(homeSymlink, '.opencode'), { recursive: true });
+      symlinkSync(outsideDir, join(homeSymlink, '.opencode', 'bin'));
+      const symRes = await installOpenCodeCli({
+        homeDir: homeSymlink,
+        platform: 'linux',
+        arch: 'x64',
+        isMusl: false,
+        env: { PATH: '' },
+        registry: `${isolatedSrv.url}/valid`,
+        noFallback: true,
+        isolatedTest: true,
+        verifyVersion: () => 'opencode 2.4.2',
+      });
+      expect(symRes.status).toBe('failed');
+      expect(symRes.reason).toContain('unsafe_symlink_target');
+      expect(readdirSync(outsideDir)).toEqual([]);
+    } finally {
+      await externalSrv.close();
+      await isolatedSrv.close();
+    }
   });
 });
