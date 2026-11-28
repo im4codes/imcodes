@@ -5591,8 +5591,6 @@ describe('OpenCodeSdkProvider', () => {
   });
 
   it('does not cache syncedMcpSignature when bindSessionMcp or applyOpenCodeDirectoryMcpServers fails, and retries cleanly on send()', async () => {
-    expect(MCP_STARTUP_TIMEOUT_MS).toBe(20_000);
-
     const completeTurn = async (
       provider: OpenCodeSdkProvider,
       harness: ReturnType<typeof createHarness>,
@@ -5694,6 +5692,7 @@ describe('OpenCodeSdkProvider', () => {
     await p3.disconnect();
 
     await expect(applyOpenCodeDirectoryMcpServers(h3.client as any, '/tmp/proj', {})).resolves.toBe(true);
+    expect(MCP_STARTUP_TIMEOUT_MS).toBe(20_000);
   });
 
   it('preserves healthy bound MCP servers across partial timeout/failure, drains stderr, and recovers on retry', async () => {
