@@ -129,4 +129,53 @@ describe('shared-session machine authority', () => {
       })).resolves.toBeNull();
     }
   });
+
+  it('rejects already-issued legacy long-TTL (24h) JWTs once older than the 300s cap', async () => {
+    const { signJwt } = await import('../src/security/crypto.js');
+    const nowSec = Math.floor(Date.now() / 1000);
+    const staleLegacyOwner = signJwt({
+      type: OWNER_MACHINE_AUTHORITY_TYPE,
+      sub: 'owner-1',
+      sourceServerId: 'source-1',
+      sessionName: 'deck_a',
+      projectName: 'project-a',
+      actionId: 'legacy-24h',
+      iat: nowSec - 301,
+      exp: nowSec + 86_000,
+    }, KEY, 86_400);
+    const staleLegacyParticipant = signJwt({
+      type: SHARED_MACHINE_AUTHORITY_TYPE,
+      sub: 'participant-1',
+      sourceServerId: 'source-1',
+      sessionName: 'deck_a',
+      projectName: 'project-a',
+      shareTarget: { kind: 'main', serverId: 'source-1', sessionName: 'deck_a' },
+      actionId: 'legacy-part-24h',
+      iat: nowSec - 301,
+      exp: nowSec + 86_000,
+    }, KEY, 86_400);
+
+    const ownerDb: Database = {
+      queryOne: async (sql: string) => {
+        if (sql.includes('FROM servers')) return { user_id: 'owner-1', user_status: 'active' };
+        if (sql.includes('FROM users')) return { status: 'active' };
+        if (sql.includes('FROM sessions')) return { project_name: 'project-a' };
+        return null;
+      },
+      query: async (sql: string) => {
+        if (sql.includes('FROM server_shares')) return [{ shared: false }];
+        return [];
+      },
+    } as unknown as Database;
+
+    await expect(resolveMachineOperationalUser(ownerDb, {
+      token: staleLegacyOwner, signingKey: KEY, authenticatedSourceServerId: 'source-1',
+      sourceOwnerUserId: 'owner-1', now: Date.now(),
+    })).resolves.toBeNull();
+
+    await expect(resolveMachineOperationalUser(fakeDb(), {
+      token: staleLegacyParticipant, signingKey: KEY, authenticatedSourceServerId: 'source-1',
+      sourceOwnerUserId: 'owner-1', now: Date.now(),
+    })).resolves.toBeNull();
+  });
 });

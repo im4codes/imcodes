@@ -279,10 +279,12 @@ export class TaskPairStore {
   #activeIndex: ActivePairIndex | undefined;
   readonly #livenessDbWriteAt = new Map<string, number>();
   /**
-   * Owner machine authority JWTs stay strictly in daemon RAM (never persisted to SQLite).
-   * After daemon restart they are absent and fail closed on shared hosts.
+   * Both owner and participant machine authority JWTs stay strictly in daemon RAM
+   * (never persisted to SQLite). Participant provenance (`kind = 'participant'`,
+   * `actor_user_id`) remains persisted with `authority = NULL` so restarts fail
+   * closed without ever upgrading a participant pair to owner authority.
    */
-  readonly #ownerPrivateAuthorities = new Map<string, { authority: string; updatedAt: number }>();
+  readonly #inMemoryPrivateAuthorities = new Map<string, TaskPairPrivateAuthority>();
   /**
    * Activity stamps not yet written: the newest liveness of each pair whose
    * last stamp was deferred. Every read overlays it, so a reader (or a state
@@ -307,6 +309,7 @@ export class TaskPairStore {
     this.#db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 5000;
+      PRAGMA secure_delete = ON;
       CREATE TABLE IF NOT EXISTS task_pairs (
         project TEXT NOT NULL,
         task_id TEXT NOT NULL,
@@ -406,8 +409,18 @@ export class TaskPairStore {
         if (!columns.some((column) => column.name === 'details_json')) throw error;
       }
     }
-    // Scrub any legacy plaintext owner machine authority JWT rows persisted by older daemons.
-    this.#db.exec("DELETE FROM task_pair_private_authority WHERE kind != 'participant'");
+    // Scrub any legacy plaintext JWTs persisted by older daemons, vacuuming freed B-tree pages and truncating WAL.
+    const scrubMarkerKey = 'private_authority_ram_only_scrub_v1';
+    const scrubbedMeta = this.getMeta(scrubMarkerKey);
+    const deletedOwners = Number(this.#db.prepare("DELETE FROM task_pair_private_authority WHERE kind != 'participant'").run().changes ?? 0);
+    const clearedParticipantTokens = Number(this.#db.prepare('UPDATE task_pair_private_authority SET authority = NULL WHERE authority IS NOT NULL').run().changes ?? 0);
+    if (!scrubbedMeta || deletedOwners > 0 || clearedParticipantTokens > 0) {
+      if (dbPath !== ':memory:') {
+        this.#db.exec('VACUUM;');
+        this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      }
+      this.setMeta(scrubMarkerKey, '1');
+    }
   }
 
   close(): void {
@@ -417,7 +430,7 @@ export class TaskPairStore {
     this.#activeIndex = undefined;
     this.#livenessDbWriteAt.clear();
     this.#pendingLiveness.clear();
-    this.#ownerPrivateAuthorities.clear();
+    this.#inMemoryPrivateAuthorities.clear();
     this.#db.close();
   }
 
@@ -1077,20 +1090,20 @@ export class TaskPairStore {
     this.#db.prepare(
       'DELETE FROM task_pair_private_authority WHERE NOT EXISTS (SELECT 1 FROM task_pairs WHERE task_pairs.project = task_pair_private_authority.project AND task_pairs.task_id = task_pair_private_authority.task_id)',
     ).run();
-    for (const key of this.#ownerPrivateAuthorities.keys()) {
+    for (const key of this.#inMemoryPrivateAuthorities.keys()) {
       const sep = key.indexOf('\u0000');
       const project = sep >= 0 ? key.slice(0, sep) : '';
       const taskId = sep >= 0 ? key.slice(sep + 1) : '';
       const exists = this.#db.prepare('SELECT 1 FROM task_pairs WHERE project = ? AND task_id = ?').get(project, taskId);
-      if (!exists) this.#ownerPrivateAuthorities.delete(key);
+      if (!exists) this.#inMemoryPrivateAuthorities.delete(key);
     }
     this.#activeIndex = undefined;
   }
 
   /**
-   * Persist per-pair machine authority in a private table never projected into TaskPairState,
-   * timeline events, WS console snapshots, or MCP projections.
-   * Participant-bound pairs fail closed and can never be upgraded to owner authority.
+   * Persist per-pair participant provenance (`kind='participant'`, `authority=NULL`) while keeping
+   * ALL machine authority JWTs (both owner and participant) strictly in daemon RAM.
+   * Participant-bound pairs fail closed after restart and can never upgrade to owner authority.
    */
   recordPrivateAuthority(
     project: string,
@@ -1100,47 +1113,54 @@ export class TaskPairStore {
       | { kind: 'participant'; actorUserId: string; authority: string | null; updatedAt?: number },
   ): void {
     const now = entry.updatedAt ?? Date.now();
+    const key = pairKey(project, taskId);
     if (entry.kind === 'participant') {
-      this.#ownerPrivateAuthorities.delete(pairKey(project, taskId));
       const actorUserId = entry.actorUserId.trim() || 'participant';
       const authority = typeof entry.authority === 'string' && entry.authority.trim() ? entry.authority.trim() : null;
       this.#db.prepare(`
         INSERT INTO task_pair_private_authority (project, task_id, kind, actor_user_id, authority, updated_at)
-        VALUES (?, ?, 'participant', ?, ?, ?)
+        VALUES (?, ?, 'participant', ?, NULL, ?)
         ON CONFLICT (project, task_id) DO UPDATE SET
           kind = 'participant',
           actor_user_id = excluded.actor_user_id,
-          authority = excluded.authority,
+          authority = NULL,
           updated_at = excluded.updated_at
-      `).run(project, taskId, actorUserId, authority, now);
+      `).run(project, taskId, actorUserId, now);
+      this.#inMemoryPrivateAuthorities.set(key, {
+        kind: 'participant',
+        actorUserId,
+        authority,
+        updatedAt: now,
+      });
       return;
     }
     const authority = entry.authority.trim();
     if (!authority) return;
     const existing = this.#db.prepare('SELECT kind FROM task_pair_private_authority WHERE project = ? AND task_id = ?')
       .get(project, taskId) as { kind?: string } | undefined;
-    if (existing?.kind === 'participant') return;
-    this.#ownerPrivateAuthorities.set(pairKey(project, taskId), { authority, updatedAt: now });
+    if (existing?.kind === 'participant' || this.#inMemoryPrivateAuthorities.get(key)?.kind === 'participant') return;
+    this.#inMemoryPrivateAuthorities.set(key, { kind: 'owner', authority, updatedAt: now });
   }
 
   getPrivateAuthority(project: string, taskId: string): TaskPairPrivateAuthority | undefined {
-    const row = this.#db.prepare('SELECT kind, actor_user_id, authority, updated_at FROM task_pair_private_authority WHERE project = ? AND task_id = ?')
-      .get(project, taskId) as { kind: string; actor_user_id: string | null; authority: string | null; updated_at: number } | undefined;
+    const key = pairKey(project, taskId);
+    const row = this.#db.prepare('SELECT kind, actor_user_id, updated_at FROM task_pair_private_authority WHERE project = ? AND task_id = ?')
+      .get(project, taskId) as { kind: string; actor_user_id: string | null; updated_at: number } | undefined;
+    const mem = this.#inMemoryPrivateAuthorities.get(key);
     if (row?.kind === 'participant') {
       const updatedAt = Number(row.updated_at ?? 0);
       return {
         kind: 'participant',
         actorUserId: typeof row.actor_user_id === 'string' && row.actor_user_id.trim() ? row.actor_user_id.trim() : 'participant',
-        authority: typeof row.authority === 'string' && row.authority.trim() ? row.authority.trim() : null,
+        authority: mem?.kind === 'participant' ? mem.authority : null,
         updatedAt,
       };
     }
-    const inMemoryOwner = this.#ownerPrivateAuthorities.get(pairKey(project, taskId));
-    if (inMemoryOwner) {
+    if (mem?.kind === 'owner') {
       return {
         kind: 'owner',
-        authority: inMemoryOwner.authority,
-        updatedAt: inMemoryOwner.updatedAt,
+        authority: mem.authority,
+        updatedAt: mem.updatedAt,
       };
     }
     return undefined;

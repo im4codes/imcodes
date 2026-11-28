@@ -139,10 +139,10 @@ async function admits(name: string, action: MachineAction, token?: string): Prom
   return admission.ok;
 }
 
-/** Who may EXECUTE (exec, shell, GUI input, file send / fetch): the owner and participants with an explicit exec_granted=true share grant. */
+/** Who may EXECUTE (exec, shell, GUI input, file send / fetch / list): the owner and participants with an explicit exec_granted=true share grant. */
 const MAY_EXECUTE = ['owner', 'pYes', 'groupAndGrant'];
-/** Directory listing is a bounded shared-picker capability for group participants, not file read/fetch authority. */
-const MAY_LIST = ['owner', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
+/** Directory listing is execute-class too unless exec_granted=true. */
+const MAY_LIST = ['owner', 'pYes', 'groupAndGrant'];
 /** Who may merely operate (view-class): every access that is not a viewer / nothing. */
 const MAY_VIEW = ['owner', 'pNo', 'pYes', 'gMember', 'gAdmin', 'viewerAndGroup', 'groupAndGrant'];
 

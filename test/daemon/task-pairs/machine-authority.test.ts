@@ -259,24 +259,78 @@ describe('task-pairs machine authority capture, private persistence, and deliver
       expect(msg.metadata.sharedActor).toBeUndefined();
     }
 
-    // Verify SQLite on disk stores ZERO owner authority rows or JWT strings.
+    // Verify SQLite on disk stores ZERO JWTs (both owner AND participant rows keep authority=NULL).
     const inspectDb = new DatabaseSync(dbPath);
     const ownerRowsBeforeRestart = inspectDb.prepare('SELECT kind, authority FROM task_pair_private_authority').all() as Array<{ kind: string; authority: string | null }>;
     expect(ownerRowsBeforeRestart.filter((r) => r.kind === 'owner')).toEqual([]);
     expect(JSON.stringify(ownerRowsBeforeRestart)).not.toContain(ownerJwt);
-    // Simulate legacy plaintext owner row on disk and verify reopening scrubs it.
-    inspectDb.prepare('INSERT OR REPLACE INTO task_pair_private_authority (project, task_id, kind, actor_user_id, authority, updated_at) VALUES (?, ?, ?, NULL, ?, ?)')
-      .run(PROJECT, 'tsk_legacy_owner', 'owner', 'legacy-disk-owner-jwt', 1);
     inspectDb.close();
+
+    // Verify participant authority JWT is also RAM-only while participant provenance survives restart and fails closed.
+    const { readFileSync } = await import('node:fs');
+    const partSentinel = 'SENTINEL_PAIR_PARTICIPANT_JWT_DO_NOT_PERSIST';
+    const ownerSentinel = 'SENTINEL_PAIR_OWNER_JWT_DO_NOT_PERSIST';
+    const partStore = getTaskPairStore();
+    partStore.recordPrivateAuthority(PROJECT, 'tsk_part_ram_only', {
+      kind: 'participant',
+      actorUserId: 'part-ram-1',
+      authority: partSentinel,
+    });
+    expect(partStore.getPrivateAuthority(PROJECT, 'tsk_part_ram_only')).toMatchObject({
+      kind: 'participant',
+      actorUserId: 'part-ram-1',
+      authority: partSentinel,
+    });
+    // Force a legacy pre-patch SQLite DB + WAL with both owner & participant sentinel JWTs (including freed page/WAL bytes).
+    partStore.close();
+    const legacyWriter = new DatabaseSync(dbPath);
+    legacyWriter.exec('PRAGMA journal_mode = WAL; PRAGMA secure_delete = OFF;');
+    legacyWriter.prepare('DELETE FROM task_pair_meta WHERE key = ?').run('private_authority_ram_only_scrub_v1');
+    legacyWriter.prepare('INSERT OR REPLACE INTO task_pair_private_authority (project, task_id, kind, actor_user_id, authority, updated_at) VALUES (?, ?, ?, NULL, ?, ?)')
+      .run(PROJECT, 'tsk_legacy_owner', 'owner', ownerSentinel, 1);
+    legacyWriter.prepare('INSERT OR REPLACE INTO task_pair_private_authority (project, task_id, kind, actor_user_id, authority, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(PROJECT, 'tsk_legacy_part', 'participant', 'legacy-actor', 'SENTINEL_LEGACY_PART_ON_DISK', 1);
+    legacyWriter.close();
 
     // Simulate daemon restart: reopen TaskPairStore from disk.
     const reloaded = new TaskPairStore(dbPath);
     setTaskPairStoreForTests(reloaded);
     expect(reloaded.getPrivateAuthority(PROJECT, 'tsk_owner_1')).toBeUndefined();
+    // Participant pair retains actorUserId & kind='participant', drops JWT (authority=null), and cannot upgrade to owner.
+    expect(reloaded.getPrivateAuthority(PROJECT, 'tsk_part_ram_only')).toMatchObject({
+      kind: 'participant',
+      actorUserId: 'part-ram-1',
+      authority: null,
+    });
+    expect(reloaded.getPrivateAuthority(PROJECT, 'tsk_legacy_part')).toMatchObject({
+      kind: 'participant',
+      actorUserId: 'legacy-actor',
+      authority: null,
+    });
+    reloaded.recordPrivateAuthority(PROJECT, 'tsk_part_ram_only', { kind: 'owner', authority: 'upgrade-denied' });
+    expect(reloaded.getPrivateAuthority(PROJECT, 'tsk_part_ram_only')?.kind).toBe('participant');
+
     const checkScrubbed = new DatabaseSync(dbPath);
     const remainingOwnerRows = checkScrubbed.prepare("SELECT * FROM task_pair_private_authority WHERE kind != 'participant'").all();
+    const nonNullAuthorities = checkScrubbed.prepare('SELECT * FROM task_pair_private_authority WHERE authority IS NOT NULL').all();
     checkScrubbed.close();
     expect(remainingOwnerRows).toEqual([]);
+    expect(nonNullAuthorities).toEqual([]);
+
+    // Verify raw main SQLite file AND -wal file contain ZERO plaintext JWT bytes after VACUUM + checkpoint.
+    const mainBytes = readFileSync(dbPath, 'utf8');
+    expect(mainBytes).not.toContain(partSentinel);
+    expect(mainBytes).not.toContain(ownerSentinel);
+    expect(mainBytes).not.toContain('SENTINEL_LEGACY_PART_ON_DISK');
+    const walPath = `${dbPath}-wal`;
+    try {
+      const walBytes = readFileSync(walPath, 'utf8');
+      expect(walBytes).not.toContain(partSentinel);
+      expect(walBytes).not.toContain(ownerSentinel);
+      expect(walBytes).not.toContain('SENTINEL_LEGACY_PART_ON_DISK');
+    } catch {
+      // Truncated/absent WAL file is equally clean.
+    }
 
     // Zero JWT leakage across store state, events, MCP projections, and timeline payloads.
     const pairGet = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_GET]!({ taskId: 'tsk_owner_1' });

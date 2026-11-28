@@ -100,11 +100,6 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
   // list_machines does not need the exec switch (a device can be listed while its exec is off).
   if (action === MACHINE_ACTION.LIST) return { allowed: true };
   if (!subject.execEnabled) return { allowed: false, reason: MACHINE_DENIAL_REASON.EXEC_DISABLED };
-  if (action === MACHINE_ACTION.FILE_LIST
-    && subject.accessRole === 'participant'
-    && subject.accessSource === MACHINE_ACCESS_SOURCE.GROUP) {
-    return { allowed: true };
-  }
   if (!machineActionRequiresExecute(action)) return { allowed: true };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };
   if (subject.accessRole === 'participant') {

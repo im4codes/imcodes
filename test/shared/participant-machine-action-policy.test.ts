@@ -14,9 +14,7 @@ describe.each(subjects)('%s real access', (_name, subject, mayView, mayExecute) 
   it.each(Object.values(MACHINE_ACTION))('participant vs owner turn for %s', (action) => {
     const expected = action === MACHINE_ACTION.LIST || action === MACHINE_ACTION.VIEW
       ? mayView
-      : action === MACHINE_ACTION.FILE_LIST && subject.accessSource === S.GROUP && subject.accessRole === 'participant'
-        ? true
-        : mayExecute;
+      : mayExecute;
     const participantTurnDecision = evaluateMachineAction(subject, action);
     expect(participantTurnDecision.allowed).toBe(expected);
     if (!expected && (subject.accessRole === 'owner' || subject.accessRole === 'participant')) {

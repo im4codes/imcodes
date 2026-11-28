@@ -184,7 +184,10 @@ export async function resolveSharedMachineAuthority(
 ): Promise<SharedMachineAuthorityDecision> {
   if (!input.token) return { kind: 'absent' };
   const raw = verifyJwt(input.token, input.signingKey);
-  if (!raw || typeof raw.sub !== 'string' || !raw.sub
+  const nowSeconds = Math.floor(Math.max(Date.now(), input.now) / 1000);
+  const iat = raw && typeof raw.iat === 'number' && Number.isFinite(raw.iat) ? raw.iat : null;
+  if (!raw || iat === null || nowSeconds - iat > AUTHORITY_TTL_SECONDS
+    || typeof raw.sub !== 'string' || !raw.sub
     || typeof raw.sourceServerId !== 'string'
     || raw.sourceServerId !== input.authenticatedSourceServerId
     || typeof raw.sessionName !== 'string' || !raw.sessionName

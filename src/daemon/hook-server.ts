@@ -2097,9 +2097,10 @@ export async function startHookServer(
             return;
           }
 
-          const participantTurnActive = readProcessSharedMachineParticipants(session).length > 0
+          const hasParticipantAuth = () =>
+            readProcessSharedMachineParticipants(session).length > 0
             || readSenderParticipantTurn(session) !== null;
-          if (participantTurnActive && !hookCredentialMatches(session, req.headers)) {
+          if (hasParticipantAuth() && !hookCredentialMatches(session, req.headers)) {
             logger.warn({ session, event }, 'Hook: rejected /notify during active participant turn — missing or mismatched hook session credential');
             res.writeHead(403, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR }));
@@ -2108,12 +2109,30 @@ export async function startHookServer(
 
           if (event === 'idle') {
             const agentType = (msg['agentType'] as string | undefined) ?? 'unknown';
+            const initialInstanceId = record.sessionInstanceId;
+            const initialRuntimeEpoch = record.runtimeEpoch;
             logger.info({ session, agentType }, 'Hook: session idle');
             await refreshSessionWatcher(session);
+            // Re-verify session identity and active participant window synchronously after async await
+            // with zero awaits before emitting session.state=idle so a new participant turn cannot be erased.
+            const latestRecord = getSession(session);
+            if (!latestRecord || latestRecord.agentType !== 'claude-code'
+              || (initialInstanceId && latestRecord.sessionInstanceId !== initialInstanceId)
+              || (initialRuntimeEpoch && latestRecord.runtimeEpoch !== initialRuntimeEpoch)) {
+              logger.debug({ session, event }, 'Hook: ignored idle after async refresh — session rotated or no longer managed claude-code');
+              res.writeHead(200);
+              res.end('ignored');
+              return;
+            }
+            if (hasParticipantAuth() && !hookCredentialMatches(session, req.headers)) {
+              logger.warn({ session, event }, 'Hook: rejected /notify post-refresh — participant turn started without valid hook session credential');
+              res.writeHead(403, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: false, error: HOOK_SESSION_CREDENTIAL_ERROR }));
+              return;
+            }
             onHook({ event: 'idle', session, agentType });
             timelineEmitter.emit(session, 'session.state', { state: 'idle' }, { source: 'hook' });
-            const sess = getSession(session);
-            if (sess) upsertSession({ ...sess, state: 'idle', updatedAt: Date.now() });
+            upsertSession({ ...latestRecord, state: 'idle', updatedAt: Date.now() });
             // Drain queued messages when session becomes idle
             void drainQueue(session);
           } else if (event === 'notification') {

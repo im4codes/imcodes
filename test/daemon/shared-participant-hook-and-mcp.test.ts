@@ -745,6 +745,94 @@ describe('hook-server shared participant isolation', () => {
     expect(onHook).toHaveBeenCalledWith(expect.objectContaining({ event: 'idle', session: sessionName }));
     clearProcessSharedMachineAuthoritiesForTests();
   });
+
+  it('re-validates participant window and runtime identity synchronously after async refreshSessionWatcher', async () => {
+    const { refreshSessionWatcher } = await import('../../src/daemon/watcher-controls.js');
+    const {
+      bindProcessSharedMachineActivity,
+      clearProcessSharedMachineAuthoritiesForTests,
+      readProcessSharedMachineAuthority,
+    } = await import('../../src/daemon/shared-machine-authority-context.js');
+    clearProcessSharedMachineAuthoritiesForTests();
+    const sessionName = 'deck_async_toctou_cc';
+    sessionsMap.set(sessionName, {
+      name: sessionName,
+      projectName: 'proj-shared',
+      agentType: 'claude-code',
+      state: 'running',
+      sessionInstanceId: 'inst-toctou',
+      runtimeEpoch: 'epoch-1',
+      hookCredential: 'cred-toctou',
+    } as never);
+
+    let resolveRefresh!: (v: boolean) => void;
+    vi.mocked(refreshSessionWatcher).mockImplementationOnce(() => new Promise<boolean>((resolve) => {
+      resolveRefresh = resolve;
+    }));
+
+    const postIdle = () =>
+      new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const payload = JSON.stringify({ event: 'idle', session: sessionName });
+        const req = http.request({
+          hostname: '127.0.0.1',
+          port,
+          path: '/notify',
+          method: 'POST',
+          agent: false,
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        }, (res) => {
+          let raw = '';
+          res.on('data', (c) => { raw += c; });
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, body: raw }));
+        });
+        req.on('error', reject);
+        req.end(payload);
+      });
+
+    // Request enters BEFORE participant turn starts; waits at await refreshSessionWatcher.
+    const inFlight = postIdle();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(refreshSessionWatcher).toHaveBeenCalledTimes(1);
+
+    // Participant turn starts while refreshSessionWatcher is still awaiting.
+    bindProcessSharedMachineActivity(
+      sessionName,
+      { sessionInstanceId: 'inst-toctou', runtimeEpoch: 'epoch-1' },
+      { kind: 'participant', actorUserId: 'part-toctou', authority: 'sma.jwt.toctou' },
+    );
+    resolveRefresh(true);
+
+    const res = await inFlight;
+    expect(res.status).toBe(403);
+    expect(onHook).not.toHaveBeenCalled();
+    expect(readProcessSharedMachineAuthority(sessionName, { sessionInstanceId: 'inst-toctou', runtimeEpoch: 'epoch-1' })).toEqual({
+      required: true,
+      authority: 'sma.jwt.toctou',
+    });
+
+    // Runtime epoch rotation mid-await also drops stale idle safely.
+    clearProcessSharedMachineAuthoritiesForTests();
+    let resolveRotate!: (v: boolean) => void;
+    vi.mocked(refreshSessionWatcher).mockImplementationOnce(() => new Promise<boolean>((resolve) => {
+      resolveRotate = resolve;
+    }));
+    const rotating = postIdle();
+    await new Promise((r) => setTimeout(r, 20));
+    sessionsMap.set(sessionName, {
+      name: sessionName,
+      projectName: 'proj-shared',
+      agentType: 'claude-code',
+      state: 'running',
+      sessionInstanceId: 'inst-toctou',
+      runtimeEpoch: 'epoch-2',
+      hookCredential: 'cred-toctou',
+    } as never);
+    resolveRotate(true);
+    const rotateRes = await rotating;
+    expect(rotateRes).toEqual({ status: 200, body: 'ignored' });
+    expect(onHook).not.toHaveBeenCalled();
+    clearProcessSharedMachineAuthoritiesForTests();
+  });
 });
 
 describe('daemon MCP HTTP clients propagate shared-machine authority and fail closed on loader failure', () => {

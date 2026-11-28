@@ -707,8 +707,20 @@ describe('file-transfer upload route', () => {
     );
   });
 
-  it('allows a group participant to browse a controlled-node directory without file-fetch authority', async () => {
+  it('denies a group participant from browsing a controlled-node directory without exec_granted', async () => {
     queryOneMock.mockResolvedValue({ user_id: 'owner-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'participant', access_source: 'group', exec_granted: false });
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-list', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: ':drives:' }),
+    });
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'target_forbidden' });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
+  });
+
+  it('allows an exec-granted group participant to browse a controlled-node directory', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'owner-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'participant', access_source: 'group', exec_granted: true });
     sendFileTransferRequestMock.mockResolvedValueOnce({
       type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
       requestId: 'a'.repeat(32),

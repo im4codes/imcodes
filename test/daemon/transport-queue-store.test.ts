@@ -1852,51 +1852,122 @@ describe('dropTaskPairEntries', () => {
     }
   });
 
-  it('keeps ownerMachineAuthority strictly in RAM, never persists it to SQLite, and scrubs legacy rows on open', () => {
-    const dbPath = join(dir, 'owner-authority-ram-only.sqlite');
-    const recipient = { sessionInstanceId: 'inst-1', runtimeEpoch: 'epoch-1' };
-    const ownerJwt = 'eyJ.owner.machine.authority.never.on.disk';
+  it('keeps ownerMachineAuthority and sharedMachineAuthority strictly in RAM, preserves participant actor provenance, migrates RAM tokens across fresh-launch and epoch rebinds, and scrubs legacy SQLite + WAL bytes on open', async () => {
+    const { readFileSync } = await import('node:fs');
+    const dbPath = join(dir, 'authorities-ram-and-migration.sqlite');
+    const recipient1 = { sessionInstanceId: 'inst-1', runtimeEpoch: 'epoch-1' };
+    const recipient2 = { sessionInstanceId: 'inst-1', runtimeEpoch: 'epoch-2' };
+    const foreignInst = { sessionInstanceId: 'inst-other', runtimeEpoch: 'epoch-1' };
+    const ownerSentinel = 'SENTINEL_QUEUE_OWNER_JWT_DO_NOT_WRITE';
+    const sharedSentinel = 'SENTINEL_QUEUE_SHARED_JWT_DO_NOT_WRITE';
+
     const ramStore = new TransportQueueStore({ dbPath });
+    // 1. Enqueue during fresh-launch gap (recipient = null) for owner AND participant.
     ramStore.enqueue({
-      sessionName: 'ram-target',
-      clientMessageId: 'msg-owner-1',
-      text: 'owner task',
-      recipient,
+      sessionName: 'launch-owner',
+      clientMessageId: 'msg-launch-owner',
+      text: 'owner before launch bind',
+      recipient: null,
       privateMaterialJson: JSON.stringify({
-        clientMessageId: 'msg-owner-1',
-        text: 'owner task',
-        ownerMachineAuthority: ownerJwt,
+        clientMessageId: 'msg-launch-owner',
+        text: 'owner before launch bind',
+        ownerMachineAuthority: ownerSentinel,
         deliveryMode: 'append',
       }),
     });
+    ramStore.enqueue({
+      sessionName: 'launch-part',
+      clientMessageId: 'msg-launch-part',
+      text: 'participant before launch bind',
+      recipient: null,
+      sharedActor: { actorUserId: 'part-user-1', effectiveActorRole: 'participant' } as never,
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: 'msg-launch-part',
+        text: 'participant before launch bind',
+        sharedActorEnvelope: { actorUserId: 'part-user-1', effectiveActorRole: 'participant' },
+        sharedMachineAuthority: sharedSentinel,
+      }),
+    });
 
-    // Available in RAM during the same daemon lifetime:
-    const inRam = ramStore.readPrivateDispatchMaterial('ram-target', 'msg-owner-1', recipient);
-    expect(JSON.parse(inRam!).ownerMachineAuthority).toBe(ownerJwt);
-
-    // Trigger markAppendFallback and verify SQLite still stores zero ownerMachineAuthority:
-    ramStore.markAppendFallback('ram-target', 'msg-owner-1', 'unsupported', recipient);
+    // Neither token may appear anywhere on SQLite disk or WAL.
     const rawDb = (ramStore as unknown as { db: InstanceType<typeof DatabaseSync> }).db;
-    const rawRows = rawDb.prepare('SELECT material_json FROM queue_private_material WHERE session_name = ?').all('ram-target') as Array<{ material_json: string }>;
-    expect(rawRows).toHaveLength(1);
-    expect(rawRows[0]!.material_json).not.toContain(ownerJwt);
-    expect(rawRows[0]!.material_json).not.toContain('ownerMachineAuthority');
+    const rawRows = rawDb.prepare('SELECT session_name, material_json FROM queue_private_material').all() as Array<{ session_name: string; material_json: string }>;
+    expect(rawRows).toHaveLength(2);
+    expect(JSON.stringify(rawRows)).not.toContain(ownerSentinel);
+    expect(JSON.stringify(rawRows)).not.toContain(sharedSentinel);
+    expect(JSON.stringify(rawRows)).not.toContain('ownerMachineAuthority');
+    expect(JSON.stringify(rawRows)).not.toContain('sharedMachineAuthority');
+    expect(JSON.stringify(rawRows)).toContain('part-user-1');
+
+    // Failed bindFreshLaunchRecipient (wrong expected id) must NOT move RAM token away from null.
+    expect(ramStore.bindFreshLaunchRecipient('launch-owner', recipient1, ['wrong-id'])).toBe(false);
+    expect(JSON.parse(ramStore.readPrivateDispatchMaterial('launch-owner', 'msg-launch-owner', null)!).ownerMachineAuthority).toBe(ownerSentinel);
+    expect(ramStore.readPrivateDispatchMaterial('launch-owner', 'msg-launch-owner', recipient1)).toBeUndefined();
+
+    // Successful bindFreshLaunchRecipient moves RAM token atomically to recipient1; legacy null no longer matches.
+    expect(ramStore.bindFreshLaunchRecipient('launch-owner', recipient1, ['msg-launch-owner'])).toBe(true);
+    expect(ramStore.bindFreshLaunchRecipient('launch-part', recipient1, ['msg-launch-part'])).toBe(true);
+    expect(ramStore.readPrivateDispatchMaterial('launch-owner', 'msg-launch-owner', null)).toBeUndefined();
+    expect(JSON.parse(ramStore.readPrivateDispatchMaterial('launch-owner', 'msg-launch-owner', recipient1)!).ownerMachineAuthority).toBe(ownerSentinel);
+    expect(JSON.parse(ramStore.readPrivateDispatchMaterial('launch-part', 'msg-launch-part', recipient1)!).sharedMachineAuthority).toBe(sharedSentinel);
+
+    // Failed rebind (different instance) leaves RAM token on recipient1.
+    expect(ramStore.rebindRecipientRuntimeEpoch('launch-owner', recipient1, foreignInst)).toBe(false);
+    expect(JSON.parse(ramStore.readPrivateDispatchMaterial('launch-owner', 'msg-launch-owner', recipient1)!).ownerMachineAuthority).toBe(ownerSentinel);
+
+    // Same-instance epoch rotation (recipient1 -> recipient2) transfers both RAM tokens cleanly; old epoch & foreign instance stay denied.
+    expect(ramStore.rebindRecipientRuntimeEpoch('launch-owner', recipient1, recipient2)).toBe(true);
+    expect(ramStore.rebindRecipientRuntimeEpoch('launch-part', recipient1, recipient2)).toBe(true);
+    expect(ramStore.readPrivateDispatchMaterial('launch-owner', 'msg-launch-owner', recipient1)).toBeUndefined();
+    expect(ramStore.readPrivateDispatchMaterial('launch-owner', 'msg-launch-owner', foreignInst)).toBeUndefined();
+    expect(JSON.parse(ramStore.readPrivateDispatchMaterial('launch-owner', 'msg-launch-owner', recipient2)!).ownerMachineAuthority).toBe(ownerSentinel);
+    expect(JSON.parse(ramStore.readPrivateDispatchMaterial('launch-part', 'msg-launch-part', recipient2)!).sharedMachineAuthority).toBe(sharedSentinel);
+
+    // markAppendFallback keeps SQLite scrubbed.
+    ramStore.markAppendFallback('launch-owner', 'msg-launch-owner', 'unsupported', recipient2);
+    const afterFallback = rawDb.prepare('SELECT material_json FROM queue_private_material WHERE session_name = ?').get('launch-owner') as { material_json: string };
+    expect(afterFallback.material_json).not.toContain('ownerMachineAuthority');
     ramStore.close();
 
-    // Seed a legacy SQLite row containing ownerMachineAuthority and verify reopening scrubs it:
+    // Seed legacy SQLite + WAL rows containing plaintext tokens (with secure_delete=OFF) and deleted freelist pages.
     const legacyWriter = new DatabaseSync(dbPath);
+    legacyWriter.exec('PRAGMA journal_mode = WAL; PRAGMA secure_delete = OFF;');
+    legacyWriter.prepare('DELETE FROM queue_security_migrations WHERE name = ?').run('authority_ram_only_scrub_v1');
     legacyWriter.prepare(
       'INSERT OR REPLACE INTO queue_private_material (session_name, client_message_id, material_json, updated_at, recipient_session_instance_id, recipient_runtime_epoch) VALUES (?, ?, ?, ?, ?, ?)',
-    ).run('ram-target', 'msg-legacy', JSON.stringify({ text: 'old', ownerMachineAuthority: 'legacy-disk-jwt' }), 1, 'inst-1', 'epoch-1');
+    ).run('launch-owner', 'msg-legacy-owner', JSON.stringify({ text: 'old-o', ownerMachineAuthority: 'SENTINEL_LEGACY_DISK_OWNER' }), 1, 'inst-1', 'epoch-2');
+    legacyWriter.prepare(
+      'INSERT OR REPLACE INTO queue_private_material (session_name, client_message_id, material_json, updated_at, recipient_session_instance_id, recipient_runtime_epoch) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run('launch-part', 'msg-legacy-part', JSON.stringify({
+      text: 'old-p',
+      sharedActorEnvelope: { actorUserId: 'part-user-legacy', effectiveActorRole: 'participant' },
+      sharedMachineAuthority: 'SENTINEL_LEGACY_DISK_SHARED',
+    }), 1, 'inst-1', 'epoch-2');
     legacyWriter.close();
 
+    // After simulated daemon restart: both tokens are gone from RAM & scrubbed from SQLite + WAL, while sharedActor provenance survives.
     const reopened = new TransportQueueStore({ dbPath });
     try {
-      expect(reopened.readPrivateDispatchMaterial('ram-target', 'msg-owner-1', recipient)).not.toContain('ownerMachineAuthority');
-      const scrubbed = reopened.readPrivateDispatchMaterial('ram-target', 'msg-legacy', recipient);
-      expect(scrubbed).toBeDefined();
-      expect(scrubbed).not.toContain('legacy-disk-jwt');
-      expect(scrubbed).not.toContain('ownerMachineAuthority');
+      expect(reopened.readPrivateDispatchMaterial('launch-owner', 'msg-launch-owner', recipient2)).not.toContain('ownerMachineAuthority');
+      const partAfterRestart = JSON.parse(reopened.readPrivateDispatchMaterial('launch-part', 'msg-launch-part', recipient2)!) as Record<string, unknown>;
+      expect(partAfterRestart.sharedMachineAuthority).toBeUndefined();
+      expect(partAfterRestart.sharedActorEnvelope).toEqual({ actorUserId: 'part-user-1', effectiveActorRole: 'participant' });
+
+      const legacyPartAfter = JSON.parse(reopened.readPrivateDispatchMaterial('launch-part', 'msg-legacy-part', recipient2)!) as Record<string, unknown>;
+      expect(legacyPartAfter.sharedMachineAuthority).toBeUndefined();
+      expect(legacyPartAfter.sharedActorEnvelope).toEqual({ actorUserId: 'part-user-legacy', effectiveActorRole: 'participant' });
+      expect(reopened.readPrivateDispatchMaterial('launch-owner', 'msg-legacy-owner', recipient2)).not.toContain('SENTINEL_LEGACY_DISK_OWNER');
+
+      // Inspect raw main DB file & -wal file for zero residual sentinel bytes.
+      const mainBytes = readFileSync(dbPath, 'utf8');
+      for (const s of [ownerSentinel, sharedSentinel, 'SENTINEL_LEGACY_DISK_OWNER', 'SENTINEL_LEGACY_DISK_SHARED']) {
+        expect(mainBytes).not.toContain(s);
+        try {
+          expect(readFileSync(`${dbPath}-wal`, 'utf8')).not.toContain(s);
+        } catch {
+          // WAL truncated/absent is clean.
+        }
+      }
     } finally {
       reopened.close();
     }
