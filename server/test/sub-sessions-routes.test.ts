@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Hono } from 'hono';
 
 const mockResolveServerRole = vi.fn<() => Promise<string>>().mockResolvedValue('owner');
@@ -34,6 +34,12 @@ vi.mock('../src/db/queries.js', () => ({
 }));
 
 describe('sub-session routes', () => {
+  let subSessionRoutes: (typeof import('../src/routes/sub-sessions.js'))['subSessionRoutes'];
+
+  beforeAll(async () => {
+    ({ subSessionRoutes } = await import('../src/routes/sub-sessions.js'));
+  }, 30_000);
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockResolveServerRole.mockResolvedValue('owner');
@@ -51,7 +57,6 @@ describe('sub-session routes', () => {
   });
 
   async function buildApp() {
-    const { subSessionRoutes } = await import('../src/routes/sub-sessions.js');
     const app = new Hono();
     app.use('*', async (c, next) => {
       (c as unknown as { env: { DB: object } }).env = { DB: {} };
