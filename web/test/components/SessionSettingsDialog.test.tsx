@@ -2350,7 +2350,7 @@ describe('SessionSettingsDialog supervision', () => {
     }));
   });
 
-  it('hides and disables shell/script agent options when forbidShellAgentTypes is true', () => {
+  it('keeps shell and script agent options visible and selectable without share restriction', () => {
     render(
       <SessionSettingsDialog
         serverId="srv-1"
@@ -2362,7 +2362,6 @@ describe('SessionSettingsDialog supervision', () => {
         activeModel="gpt-6-sol"
         requestedModel="gpt-6-sol"
         transportConfig={null}
-        forbidShellAgentTypes={true}
         surface="session"
         onClose={vi.fn()}
         onSaved={vi.fn()}
@@ -2371,8 +2370,10 @@ describe('SessionSettingsDialog supervision', () => {
     const select = screen.getByTestId('session-agent-type') as HTMLSelectElement;
     const shellOption = select.querySelector('option[value="shell"]') as HTMLOptionElement | null;
     const scriptOption = select.querySelector('option[value="script"]') as HTMLOptionElement | null;
-    expect(shellOption).toBeNull();
-    expect(scriptOption).toBeNull();
+    expect(shellOption).not.toBeNull();
+    expect(scriptOption).not.toBeNull();
+    expect(shellOption!.disabled).toBe(false);
+    expect(scriptOption!.disabled).toBe(false);
     expect(select.querySelector('option[value="claude-code"]')).not.toBeNull();
   });
 });

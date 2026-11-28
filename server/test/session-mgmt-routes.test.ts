@@ -496,10 +496,9 @@ describe('session-mgmt persistence routes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agentType }),
       });
-      expect(typeRes.status).toBe(403);
-      expect(await typeRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(typeRes.status).toBe(200);
     }
-    expect(mockUpdateSession).not.toHaveBeenCalled();
+    expect(mockUpdateSession).toHaveBeenCalledTimes(2);
   });
 
   it('PATCH /sessions/:name gives a whole-server participant the owner settings path with stamped provenance', async () => {
@@ -2427,7 +2426,7 @@ describe('session-mgmt persistence routes', () => {
       serverParticipantAuthority: true,
     };
 
-    // 1. Whole-server participant POST /session/start with shell or script -> 403 participant_shell_forbidden
+    // 1. Whole-server participant POST /session/start with shell or script -> 200 with stamped sharedActor; viewer -> 403 share-role-denied
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
     mockResolveHttpShareAccess.mockResolvedValue({
       membership: 'none',
@@ -2435,14 +2434,34 @@ describe('session-mgmt persistence routes', () => {
       shareProvenance: 'server',
     });
     for (const agentType of ['shell', 'script']) {
+      sendToDaemonMock.mockClear();
       const startRes = await app.request('/api/server/srv-1/session/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ project: 'shproj', dir: '/tmp/shproj', agentType }),
+        body: JSON.stringify({ project: `shproj_${agentType}`, dir: `/tmp/shproj_${agentType}`, agentType, sharedActor: { effectiveActorRole: 'owner' } }),
       });
-      expect(startRes.status).toBe(403);
-      expect(await startRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(startRes.status).toBe(200);
+      expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toMatchObject({
+        type: 'session.start',
+        agentType,
+        sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
+      });
     }
+    sendToDaemonMock.mockClear();
+
+    // Whole-server viewer remains denied even for shell/script start
+    mockResolveHttpShareAccess.mockResolvedValueOnce({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'viewer', coverage: { ...serverCoverage, effectiveRole: 'viewer' } },
+      shareProvenance: 'server',
+    });
+    const viewerStartRes = await app.request('/api/server/srv-1/session/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project: 'vwsh', dir: '/tmp/vwsh', agentType: 'shell' }),
+    });
+    expect(viewerStartRes.status).toBe(403);
+    expect(await viewerStartRes.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
     expect(sendToDaemonMock).not.toHaveBeenCalled();
 
     // Whole-server participant POST /session/start with LLM succeeds and stamps server-owned sharedActor
@@ -2465,7 +2484,7 @@ describe('session-mgmt persistence routes', () => {
     });
     sendToDaemonMock.mockClear();
 
-    // Live bridge type mismatch ('shell') rejects PATCH /sessions/:name even if DB still says 'claude-code'
+    // Live bridge type 'shell' still permits PATCH /sessions/:name for authorized participant
     mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
       membership: 'none',
       actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
@@ -2476,12 +2495,34 @@ describe('session-mgmt persistence routes', () => {
     const liveMismatchPatch = await app.request('/api/server/srv-1/sessions/deck_live_sh', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: 'nope' }),
+      body: JSON.stringify({ label: 'renamed-shell' }),
     });
-    expect(liveMismatchPatch.status).toBe(403);
-    expect(await liveMismatchPatch.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    expect(liveMismatchPatch.status).toBe(200);
 
-    // Whole-server participant POST /session/send to LLM brain with P2P target pointing to shell sub-session -> 403
+    // Whole-server participant POST /session/send to LLM brain with P2P target pointing to shell sub-session -> 200 with stamped sharedActor
+    mockDbQueryOne.mockImplementation(async (sql: string) => {
+      if (typeof sql === 'string' && sql.includes('FROM sessions')) return { project_name: 'proj' };
+      return { display_name: 'Shared User', username: 'shared' };
+    });
+    mockDbQuery.mockImplementation(async (sql: string) => {
+      if (typeof sql === 'string' && sql.includes('FROM server_shares')) {
+        return [{
+          target_kind: 'server',
+          id: 'server-share-1',
+          server_id: 'srv-1',
+          session_name: null,
+          sub_session_id: null,
+          target_user_id: 'user-1',
+          role: 'participant',
+          created_by: 'owner-user',
+          created_at: 1000,
+          updated_at: 1000,
+          expires_at: null,
+          revoked_at: null,
+        }];
+      }
+      return [];
+    });
     mockResolveHttpShareAccess.mockResolvedValue({
       membership: 'none',
       actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
@@ -2499,17 +2540,21 @@ describe('session-mgmt persistence routes', () => {
       { sessionName: 'deck_proj_brain', text: 'check', p2pAtTargets: [{ session: 'deck_sub_subsh1', mode: 'audit' }] },
       { sessionName: 'deck_proj_brain', text: 'check', p2pSessionConfig: { deck_sub_subsh1: { enabled: true, mode: 'audit' } } },
     ]) {
+      sendToDaemonMock.mockClear();
       const p2pRes = await app.request('/api/server/srv-1/session/send', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(p2pPayload),
       });
-      expect(p2pRes.status).toBe(403);
-      expect(await p2pRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(p2pRes.status).toBe(200);
+      expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toMatchObject({
+        type: 'session.send',
+        sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
+      });
     }
-    expect(sendToDaemonMock).not.toHaveBeenCalled();
+    sendToDaemonMock.mockClear();
 
-    // 2. Whole-server participant PATCH /sessions/:name to shell/script OR on existing shell session -> 403
+    // 2. Whole-server participant PATCH /sessions/:name to shell/script OR on existing shell session -> 200
     mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
       membership: 'none',
       actor: { kind: 'share', effectiveActorRole: 'participant', coverage: serverCoverage },
@@ -2521,8 +2566,7 @@ describe('session-mgmt persistence routes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agentType }),
       });
-      expect(patchRes.status).toBe(403);
-      expect(await patchRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(patchRes.status).toBe(200);
     }
     mockGetDbSessionByName.mockResolvedValueOnce({
       name: 'deck_sh_brain',
@@ -2534,13 +2578,12 @@ describe('session-mgmt persistence routes', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'renamed' }),
     });
-    expect(patchExistingShell.status).toBe(403);
-    expect(await patchExistingShell.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    expect(patchExistingShell.status).toBe(200);
 
-    // 3. Tab-share & whole-server participant POST /session/send targeting shell/script sub-session -> 403
+    // 3. Tab-share & whole-server participant POST /session/send targeting covered shell/script sub-session -> 200 with stamped sharedActor; viewer -> 403 share-role-denied
     mockGetSubSessionById.mockResolvedValue({ id: 'subsh1', server_id: 'srv-1', type: 'shell' });
-    for (const [provenance, coverage] of [
-      ['session', {
+    for (const [provenance, expectedOrigin, coverage] of [
+      ['session', 'shared-tab', {
         target: { kind: 'subsession', serverId: 'srv-1', subSessionId: 'subsh1' } as const,
         effectiveRole: 'participant' as const,
         historyCutoffAt: 0,
@@ -2549,8 +2592,9 @@ describe('session-mgmt persistence routes', () => {
         primaryShareId: 'tab-share-1',
         authorizedAt: Date.now(),
       }],
-      ['server', serverCoverage],
+      ['server', 'shared-server', serverCoverage],
     ] as const) {
+      sendToDaemonMock.mockClear();
       mockResolveHttpShareAccess.mockResolvedValue({
         membership: 'none',
         actor: { kind: 'share', effectiveActorRole: 'participant', coverage },
@@ -2561,9 +2605,26 @@ describe('session-mgmt persistence routes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionName: 'deck_sub_subsh1', text: 'id' }),
       });
-      expect(sendRes.status).toBe(403);
-      expect(await sendRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(sendRes.status).toBe(200);
+      expect(JSON.parse(String(sendToDaemonMock.mock.calls[0]?.[0]))).toMatchObject({
+        type: 'session.send',
+        sessionName: 'deck_sub_subsh1',
+        sharedActor: { effectiveActorRole: 'participant', origin: expectedOrigin },
+      });
     }
+    sendToDaemonMock.mockClear();
+    mockResolveHttpShareAccess.mockResolvedValueOnce({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'viewer', coverage: { ...serverCoverage, effectiveRole: 'viewer' } },
+      shareProvenance: 'server',
+    });
+    const viewerSendRes = await app.request('/api/server/srv-1/session/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionName: 'deck_sub_subsh1', text: 'id' }),
+    });
+    expect(viewerSendRes.status).toBe(403);
+    expect(await viewerSendRes.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
     expect(sendToDaemonMock).not.toHaveBeenCalled();
 
     // 4. Owner still creates and sends to shell sessions normally
@@ -2636,7 +2697,7 @@ describe('session-mgmt persistence routes', () => {
     expect(sendToDaemonMock).not.toHaveBeenCalled();
   });
 
-  it('rejects PUT /sessions/:name, shell relabel/rename, and mixed unbounded P2P broadcasts for whole-server participants while keeping pure-LLM & owner paths', async () => {
+  it('rejects PUT /sessions/:name without daemon token while allowing shell relabel/rename and P2P targets for whole-server participants', async () => {
     const app = await buildApp();
     const serverCoverage = {
       target: { kind: 'server', serverId: 'srv-1' } as const,
@@ -2676,34 +2737,43 @@ describe('session-mgmt persistence routes', () => {
       expect(putRes.status).toBe(403);
       expect(await putRes.json()).toEqual({
         error: 'forbidden',
-        reason: agentType === 'shell' || agentType === 'script'
-          ? 'participant_shell_forbidden'
-          : 'share-direct-surface-denied',
+        reason: 'share-direct-surface-denied',
       });
     }
     const delRes = await app.request('/api/server/srv-1/sessions/deck_spoof_brain', { method: 'DELETE' });
     expect(delRes.status).toBe(403);
     expect(mockUpsertDbSession).not.toHaveBeenCalled();
 
-    // 2. PATCH /sessions/:name/label and /rename blocked for share participants on shell sessions
+    // 2. PATCH /sessions/:name/label and /rename allowed for share participants on shell sessions (viewer still denied)
     resolveSessionAgentTypeMock.mockResolvedValue('shell');
     const labelRes = await app.request('/api/server/srv-1/sessions/deck_sh_brain/label', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ label: 'nope' }),
+      body: JSON.stringify({ label: 'shared-shell' }),
     });
-    expect(labelRes.status).toBe(403);
-    expect(await labelRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    expect(labelRes.status).toBe(200);
 
     const renameRes = await app.request('/api/server/srv-1/sessions/deck_sh_brain/rename', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: 'shared-shell-project' }),
+    });
+    expect(renameRes.status).toBe(200);
+
+    mockResolveHttpShareAccessForCoveredSession.mockResolvedValueOnce({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'viewer', coverage: { ...serverCoverage, effectiveRole: 'viewer' } },
+      shareProvenance: 'server',
+    });
+    const viewerRenameRes = await app.request('/api/server/srv-1/sessions/deck_sh_brain/rename', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: 'nope' }),
     });
-    expect(renameRes.status).toBe(403);
-    expect(await renameRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    expect(viewerRenameRes.status).toBe(403);
+    expect(await viewerRenameRes.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
 
-    // 3. Mixed-domain unbounded P2P broadcasts (@@all / p2pMode / __all__) relay for daemon LLM filtering; explicit shell recipients still rejected with 403
+    // 3. Mixed-domain unbounded and explicit shell P2P broadcasts relay with stamped sharedActor
     mockDbQueryOne.mockImplementation(async (sql: string, params: unknown[] = []) => {
       if (typeof sql === 'string' && sql.includes('FROM sessions')) {
         return { project_name: params[1] === 'deck_mix_brain' ? 'mix' : 'pure' };
@@ -2745,6 +2815,7 @@ describe('session-mgmt persistence routes', () => {
       { id: 'purellm', server_id: 'srv-1', type: 'codex-sdk', parent_session: 'deck_pure_brain', closed_at: null },
     ]);
 
+    sendToDaemonMock.mockClear();
     for (const payload of [
       { sessionName: 'deck_mix_brain', text: '@@discuss(deck_sub_mixsh, audit)' },
       { sessionName: 'deck_mix_brain', text: 'check', p2pAtTargets: [{ session: 'deck_sub_mixsh', mode: 'audit' }] },
@@ -2755,10 +2826,10 @@ describe('session-mgmt persistence routes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      expect(explicitShell.status).toBe(403);
-      expect(await explicitShell.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(explicitShell.status).toBe(200);
     }
-    expect(sendToDaemonMock).not.toHaveBeenCalled();
+    expect(sendToDaemonMock).toHaveBeenCalledTimes(3);
+    sendToDaemonMock.mockClear();
 
     for (const payload of [
       { sessionName: 'deck_mix_brain', text: '@@all(audit)' },

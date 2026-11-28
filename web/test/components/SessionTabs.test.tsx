@@ -27,7 +27,6 @@ vi.mock('../../src/api.js', () => ({
 }));
 
 import { SessionTabs } from '../../src/components/SessionTabs.js';
-import { hasShareRestrictedCloneShellMember } from '../../src/tab-sharing-ui.js';
 import type { SessionInfo } from '../../src/types.js';
 
 const makeSessions = (overrides: Partial<SessionInfo>[] = []): SessionInfo[] =>
@@ -1710,16 +1709,11 @@ describe('SessionTabs', () => {
     expect(agentBadge).not.toBeNull();
   });
 
-  it('uses shared clone eligibility predicate in SessionTabs context menu for shared participants vs owners', () => {
+  it('exposes Copy session in SessionTabs context menu even when group has active shell sub-sessions', () => {
     const sessions = makeSessions([
       { name: 'deck_mix_brain', label: 'Mix', role: 'brain', agentType: 'claude-code-sdk', userCreated: true },
       { name: 'deck_llm_brain', label: 'Pure', role: 'brain', agentType: 'claude-code-sdk', userCreated: true },
     ]);
-    const subSessions = [
-      { type: 'shell', state: 'idle', parentSession: 'deck_mix_brain' },
-      { type: 'shell', state: 'stopped', parentSession: 'deck_llm_brain' },
-      { type: 'codex-sdk', state: 'running', parentSession: 'deck_llm_brain' },
-    ];
     const onCloneSession = vi.fn();
     render(
       <SessionTabs
@@ -1729,13 +1723,16 @@ describe('SessionTabs', () => {
         sessionsLoaded={true}
         {...defaultProps}
         onCloneSession={onCloneSession}
-        canCloneSession={(session) => !hasShareRestrictedCloneShellMember({ sourceSession: session, subSessions })}
+        canCloneSession={() => true}
       />,
     );
 
     const tabs = screen.getAllByRole('tab');
     fireEvent.contextMenu(tabs[0], { clientX: 40, clientY: 40 });
-    expect(screen.queryByText('Copy session')).toBeNull();
+    const mixCloneBtn = screen.getByText('Copy session');
+    expect(mixCloneBtn).toBeDefined();
+    fireEvent.click(mixCloneBtn);
+    expect(onCloneSession).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck_mix_brain' }));
 
     fireEvent.contextMenu(tabs[1], { clientX: 80, clientY: 40 });
     const cloneBtn = screen.getByText('Copy session');

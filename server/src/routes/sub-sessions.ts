@@ -19,9 +19,9 @@ import { buildHttpSharedActor, isWholeServerShareAccess } from '../share/http-sh
 import { WsBridge } from '../ws/bridge.js';
 import logger from '../util/logger.js';
 import { listActiveSharesForUser } from '../db/tab-sharing.js';
-import { PARTICIPANT_SHELL_FORBIDDEN_REASON, rawSubSessionIdFromDisplayName } from '../../../shared/tab-sharing.js';
+import { rawSubSessionIdFromDisplayName } from '../../../shared/tab-sharing.js';
 import type { AppliedSessionRestartState, SessionRestartRelayResult } from '../../../shared/session-restart-contract.js';
-import { getSessionRuntimeType, isSessionAgentType, isShellLikeAgentType } from '../../../shared/agent-types.js';
+import { getSessionRuntimeType, isSessionAgentType } from '../../../shared/agent-types.js';
 import { SESSION_INCOGNITO_UNSUPPORTED, supportsSessionIncognito } from '../../../shared/session-incognito-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -197,9 +197,6 @@ subSessionRoutes.post('/:id/sub-sessions', async (c) => {
   const realMembershipForCreate = memberMayCreate
     ? await resolveServerMembershipRole(c.env.DB, serverId, userId)
     : 'none';
-  if (isShellLikeAgentType(body.type) && realMembershipForCreate !== 'owner' && realMembershipForCreate !== 'admin') {
-    return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
-  }
   if (body.transport_config !== undefined && body.transport_config !== null) {
     if (realMembershipForCreate !== 'owner' && realMembershipForCreate !== 'admin') {
       return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
@@ -354,18 +351,7 @@ subSessionRoutes.patch('/:id/sub-sessions/:subId', async (c) => {
     return c.json({ error: 'forbidden', reason: 'share-role-denied' }, 403);
   }
   const subSessionName = `deck_sub_${subId}`;
-  const liveAgentType = await WsBridge.get(serverId).resolveSessionAgentType?.(subSessionName);
   const isWholeServerShare = effectiveShareAccess ? isWholeServerShareAccess(effectiveShareAccess) : false;
-  if (
-    isShellLikeAgentType(body.type)
-    || isShellLikeAgentType(body.sessionType)
-    || isShellLikeAgentType(existing.type)
-    || isShellLikeAgentType(liveAgentType)
-  ) {
-    if (isShareActor) {
-      return c.json({ error: 'forbidden', reason: PARTICIPANT_SHELL_FORBIDDEN_REASON }, 403);
-    }
-  }
   if (isShareActor
     && (Object.prototype.hasOwnProperty.call(body, 'transportConfig')
       || (!isWholeServerShare

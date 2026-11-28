@@ -294,7 +294,7 @@ import {
   getSubSessionAccentColorMap,
 } from './subsession-accent-colors.js';
 import { hasPinnedPanelServerProvenance, type PanelRenderContext } from './components/PinnedPanelRegistry.js';
-import { canSharedActorControlSession, hasShareRestrictedCloneShellMember, isShareScopedState, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type ShareRole, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
+import { canSharedActorControlSession, isShareScopedState, shareTargetKey, type ShareDialogTarget, type ShareGrantSummary, type ShareRole, type SharedStateSummary, type ShareTarget } from './tab-sharing-ui.js';
 import {
   clearSharedTabRestoreMarker,
   findRememberedSharedEntry,
@@ -336,7 +336,7 @@ import {
   type DaemonUpgradeBlockedToastState,
 } from './daemon-upgrade-blocked.js';
 import { safeLocalStorageRemoveItem, safeLocalStorageSetItem } from './local-storage-quota.js';
-import { getSessionRuntimeType, isShellLikeAgentType } from '@shared/agent-types.js';
+import { getSessionRuntimeType } from '@shared/agent-types.js';
 import { canSessionRoleOwnAutomaticSupervision, getSupportedSupervisionBackendOptions } from '@shared/supervision-config.js';
 import type { SupervisionExecutionPoolKind } from '@shared/supervision-execution-pool.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
@@ -8403,10 +8403,11 @@ function InternalMainApp() {
       }
 
       const mainSession = sessionsRef.current.find((item) => item.name === session);
-      const targetAgentType = focusedSubId ? focusedSubRecord?.type : mainSession?.agentType;
       const isShareScopedTarget = selectedShareTargetRef.current !== null
         || Boolean(mainSession?.sharedState && mainSession.sharedState.outgoing !== true);
-      if (isShareScopedTarget && isShellLikeAgentType(targetAgentType)) return;
+      const effectiveShareRole = selectedShareCoverageRoleRef.current
+        ?? (mainSession?.sharedState && mainSession.sharedState.outgoing !== true ? mainSession.sharedState.effectiveRole : null);
+      if (isShareScopedTarget && effectiveShareRole !== 'participant') return;
 
       let data: string | null = null;
       if (e.key === 'Enter')     { data = '\r'; }
@@ -8460,10 +8461,11 @@ function InternalMainApp() {
       });
       if (currentViewMode !== 'terminal') return;
       const mainSession = sessionsRef.current.find((item) => item.name === session);
-      const targetAgentType = focusedSubId ? focusedSubRecord?.type : mainSession?.agentType;
       const isShareScopedTarget = selectedShareTargetRef.current !== null
         || Boolean(mainSession?.sharedState && mainSession.sharedState.outgoing !== true);
-      if (isShareScopedTarget && isShellLikeAgentType(targetAgentType)) return;
+      const effectiveShareRole = selectedShareCoverageRoleRef.current
+        ?? (mainSession?.sharedState && mainSession.sharedState.outgoing !== true ? mainSession.sharedState.effectiveRole : null);
+      if (isShareScopedTarget && effectiveShareRole !== 'participant') return;
       const text = e.clipboardData?.getData('text/plain') ?? '';
       if (!text) return;
       e.preventDefault();
@@ -12317,9 +12319,7 @@ function InternalMainApp() {
                   && canSessionRoleOwnAutomaticSupervision(session.role),
               })}
               onCloneSession={(session) => setCloneSessionTarget(session)}
-              canCloneSession={(session) => (
-                (!selectedShareTarget || (isSharedServerParticipant && !hasShareRestrictedCloneShellMember({ sourceSession: session, subSessions })))
-              )}
+              canCloneSession={(_session) => !selectedShareTarget || isSharedServerParticipant}
               onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}
               renameRequest={renameRequest}
               onRenameHandled={() => setRenameRequest(null)}
@@ -13573,7 +13573,6 @@ function InternalMainApp() {
         <NewSessionDialog
           ws={wsRef.current}
           serverId={selectedServerId ?? ''}
-          forbidShellAgentTypes={Boolean(selectedShareTarget)}
           onClose={() => setShowNewSession(false)}
           onSessionStarted={(name) => { setActiveSession(name); setShowNewSession(false); }}
           isProviderConnected={isProviderConnected}
@@ -13843,7 +13842,6 @@ function InternalMainApp() {
           serverId={selectedServerId ?? undefined}
           defaultCwd={activeSessionInfo?.projectDir}
           allowedAgentTypes={poolAddTarget ? getSupportedSupervisionBackendOptions() : undefined}
-          forbidShellAgentTypes={Boolean(selectedShareTarget)}
           overlayClassName={poolAddTarget ? 'session-settings-child-overlay' : undefined}
           isProviderConnected={isProviderConnected}
           getRemoteSessions={getRemoteSessions}
@@ -13901,7 +13899,6 @@ function InternalMainApp() {
           cwd={settingsTarget.cwd}
           type={settingsTarget.type}
           parentSession={settingsTarget.parentSession}
-          forbidShellAgentTypes={Boolean(selectedShareTarget)}
           canControlAutomaticSupervision={settingsTarget.canControlAutomaticSupervision}
           transportConfig={settingsTarget.transportConfig}
           supervisionMode={settingsTarget.supervisionMode}
@@ -13974,7 +13971,6 @@ function InternalMainApp() {
           sourceSession={sessions.find((session) => session.name === cloneSessionTarget.name) ?? cloneSessionTarget}
           sessions={sessions}
           subSessions={subSessions}
-          forbidShellAgentTypes={Boolean(selectedShareTarget)}
           onClose={() => setCloneSessionTarget(null)}
         />
       )}

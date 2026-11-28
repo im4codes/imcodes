@@ -389,7 +389,7 @@ describe('session group clone routes', () => {
     }), {});
   });
 
-  it('rejects whole-server participants cloning shell/script groups while stamping sharedActor on pure-LLM clones and keeping owner clones unchanged', async () => {
+  it('allows whole-server participants to clone shell/script groups with stamped sharedActor while keeping viewer denied and owner clones unchanged', async () => {
     const shareAuth = await import('../src/db/tab-sharing.js');
     const spyCoverage = vi.spyOn(shareAuth, 'resolveEffectiveShareCoverage').mockResolvedValue({
       target: { kind: 'server', serverId: 'srv-1' },
@@ -406,16 +406,21 @@ describe('session group clone routes', () => {
       mockGetDbSessionsByServer.mockResolvedValue([{ name: 'deck_sh_brain', agent_type: 'shell' }] as never);
       const app = await buildApp();
 
-      // 1) Shell main -> 403 participant_shell_forbidden
+      // 1) Shell main -> 200 with stamped sharedActor
       const shMainRes = await app.request('/api/server/srv-1/sessions/deck_sh_brain/group-clone', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ idempotencyKey: 'idem-sh-main' }),
       });
-      expect(shMainRes.status).toBe(403);
-      await expect(shMainRes.json()).resolves.toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(shMainRes.status).toBe(200);
+      expect(JSON.parse(String(mockSendToDaemon.mock.calls[0]?.[0]))).toMatchObject({
+        type: SESSION_GROUP_CLONE_MSG.START,
+        sourceMainSessionName: 'deck_sh_brain',
+        sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
+      });
 
-      // 2) LLM main with active script child -> 403 participant_shell_forbidden
+      // 2) LLM main with active script child -> 200 with stamped sharedActor
+      mockSendToDaemon.mockClear();
       mockGetDbSessionsByServer.mockResolvedValue([{ name: 'deck_cd_brain', agent_type: 'claude-code' }] as never);
       mockGetSubSessionsByServer.mockResolvedValue([{ id: 'sc1', parent_session: 'deck_cd_brain', type: 'script', closed_at: null }] as never);
       const mixRes = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
@@ -423,11 +428,33 @@ describe('session group clone routes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ idempotencyKey: 'idem-mix-sub' }),
       });
-      expect(mixRes.status).toBe(403);
-      await expect(mixRes.json()).resolves.toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(mixRes.status).toBe(200);
+      expect(JSON.parse(String(mockSendToDaemon.mock.calls[0]?.[0]))).toMatchObject({
+        type: SESSION_GROUP_CLONE_MSG.START,
+        sourceMainSessionName: 'deck_cd_brain',
+        sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
+      });
+
+      // 3) Viewer remains denied with 403
+      mockSendToDaemon.mockClear();
+      spyCoverage.mockResolvedValueOnce({
+        target: { kind: 'server', serverId: 'srv-1' },
+        effectiveRole: 'viewer',
+        historyCutoffAt: 0,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['srv-share-1'],
+        primaryShareId: 'srv-share-1',
+        authorizedAt: 1000,
+      });
+      const viewerRes = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idempotencyKey: 'idem-viewer-denied' }),
+      });
+      expect(viewerRes.status).toBe(403);
       expect(mockSendToDaemon).not.toHaveBeenCalled();
 
-      // 3) Pure LLM group -> 200 with stamped sharedActor
+      // 4) Pure LLM group -> 200 with stamped sharedActor
       mockGetSubSessionsByServer.mockResolvedValue([{ id: 'llm1', parent_session: 'deck_cd_brain', type: 'codex-sdk', closed_at: null }] as never);
       const llmRes = await app.request('/api/server/srv-1/sessions/deck_cd_brain/group-clone', {
         method: 'POST',

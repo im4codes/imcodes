@@ -55,7 +55,6 @@ import {
   isSubSessionRecord,
   unsupportedAgentTypeError,
 } from '../../shared/agent-types.js';
-import { PARTICIPANT_SHELL_FORBIDDEN_REASON, isParticipantSharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { isServerLinkResyncStatePayload, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import { aliasExpansionModeFor, expandForAgent } from '../../shared/alias-expand.js';
 import { ALIAS_REASONS } from '../../shared/alias-types.js';
@@ -3327,31 +3326,9 @@ async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
 
 // sanitizeProjectName moved to shared/sanitize-project-name.ts
 
-function isParticipantSharedActor(cmd: Record<string, unknown>): boolean {
-  return isParticipantSharedActorEnvelope(cmd.sharedActor);
-}
-
 async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const rawProject = cmd.project as string | undefined;
   const agentType = (cmd.agentType as string) || 'claude-code';
-  if (isParticipantSharedActor(cmd)) {
-    const targetProject = rawProject ? sanitizeProjectName(rawProject) : undefined;
-    const targetSession = targetProject ? `deck_${targetProject}_brain` : undefined;
-    const existingTarget = targetSession ? getSession(targetSession) : undefined;
-    if (
-      isShellLikeAgentType(agentType)
-      || isShellLikeAgentType(cmd.sessionType)
-      || isShellLikeAgentType(existingTarget?.agentType)
-    ) {
-      logger.warn({ project: targetProject ?? rawProject, agentType }, 'session.start rejected: participant_shell_forbidden');
-      serverLink.send({
-        type: 'session.error',
-        ...(targetProject ? { project: targetProject } : {}),
-        message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-      });
-      return;
-    }
-  }
   const requestedDir = expandTilde((cmd.dir as string) || '~');
   const ccPresetName = cmd.ccPreset as string | undefined;
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
@@ -3627,25 +3604,6 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     const restartEpoch = typeof cmd.restartEpoch === 'number' ? cmd.restartEpoch : undefined;
     const deadlineAt = typeof cmd.deadlineAt === 'number' && Number.isFinite(cmd.deadlineAt) ? cmd.deadlineAt : undefined;
     const record = getSession(sessionName);
-    if (
-      isParticipantSharedActor(cmd)
-      && (
-        isShellLikeAgentType(cmd.agentType)
-        || isShellLikeAgentType(cmd.sessionType)
-        || isShellLikeAgentType(record?.agentType)
-      )
-    ) {
-      logger.warn({ sessionName, requestedAgentType: cmd.agentType, currentAgentType: record?.agentType }, 'session.restart rejected: participant_shell_forbidden');
-      serverLink.send({
-        type: 'session.error',
-        project: record?.projectName ?? sessionName,
-        session: sessionName,
-        sessionName,
-        message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-      });
-      sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: PARTICIPANT_SHELL_FORBIDDEN_REASON, restartEpoch });
-      return;
-    }
     if (!record) {
       logger.warn({ sessionName }, 'session.restart: session not found in store');
       sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: 'session_not_found', restartEpoch });
@@ -3665,18 +3623,6 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
           }
           const liveRecord = getSession(sessionName) ?? record;
           const previousRuntimeEpoch = liveRecord.runtimeEpoch ?? null;
-          if (isParticipantSharedActor(cmd) && isShellLikeAgentType(liveRecord.agentType)) {
-            logger.warn({ sessionName, currentAgentType: liveRecord.agentType }, 'session.restart rejected inside lock: participant_shell_forbidden');
-            serverLink.send({
-              type: 'session.error',
-              project: liveRecord.projectName,
-              session: sessionName,
-              sessionName,
-              message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-            });
-            sendRestartResponse(serverLink, 'session.restart_response', cmd.requestId, { ok: false, rejected: true, error: PARTICIPANT_SHELL_FORBIDDEN_REASON, restartEpoch });
-            return;
-          }
           await relaunchSessionWithSettings(liveRecord, {
             agentType: (cmd.agentType as any) ?? undefined,
             projectDir: ('cwd' in cmd ? (cmd.cwd as string | undefined) : undefined),
@@ -3746,14 +3692,6 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     logger.warn({ project }, 'session.restart: no brain session found');
     return;
   }
-  if (
-    isParticipantSharedActor(cmd)
-    && (isShellLikeAgentType(cmd.agentType) || isShellLikeAgentType(brain.agentType))
-  ) {
-    logger.warn({ project, brainSession: brain.name, brainAgentType: brain.agentType }, 'session.restart(project) rejected: participant_shell_forbidden');
-    try { serverLink.send({ type: 'session.error', project, message: PARTICIPANT_SHELL_FORBIDDEN_REASON }); } catch { /* ignore */ }
-    return;
-  }
   if (!isSessionAgentType(brain.agentType)) {
     const message = unsupportedAgentTypeError(String(brain.agentType)).message;
     logger.warn({ project, sessionName: brain.name, agentType: brain.agentType }, 'session.restart aborted: unsupported brain agent type');
@@ -3770,17 +3708,6 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
       if (am && bm) return Number(am[1]) - Number(bm[1]);
       return 0;
     });
-  if (
-    isParticipantSharedActor(cmd)
-    && (
-      isShellLikeAgentType(cmd.sessionType)
-      || projectWorkers.some((worker) => isShellLikeAgentType(worker.agentType))
-    )
-  ) {
-    logger.warn({ project }, 'session.restart(project) rejected before teardown: participant_shell_forbidden');
-    try { serverLink.send({ type: 'session.error', project, message: PARTICIPANT_SHELL_FORBIDDEN_REASON }); } catch { /* ignore */ }
-    return;
-  }
   const workerTypes: ProjectConfig['workerTypes'] = [];
   for (const worker of projectWorkers) {
     if (!isSessionAgentType(worker.agentType)) {
@@ -5350,31 +5277,6 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
     return;
   }
 
-  const sendTargetRecord = getSession(sessionName);
-  if (
-    sharedActor?.effectiveActorRole === 'participant'
-    && (
-      isShellLikeAgentType(sendTargetRecord?.agentType)
-      || isShellLikeAgentType(cmd.agentType)
-      || isShellLikeAgentType(cmd.sessionType)
-    )
-  ) {
-    logger.warn({ sessionName, commandId: commandId ?? null, agentType: sendTargetRecord?.agentType }, 'session.send rejected: participant_shell_forbidden');
-    const errCommandId = commandId ?? crypto.randomUUID();
-    timelineEmitter.emit(sessionName, 'command.ack', {
-      commandId: errCommandId,
-      status: 'error',
-      error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-    });
-    emitCommandAckReliable(serverLink, {
-      commandId: errCommandId,
-      sessionName,
-      status: 'error',
-      error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-    });
-    return;
-  }
-
   // Only a message to a claude-code-sdk session counts as activity that keeps the
   // Claude usage-quota poll alive (the quota tracks the Claude subscription).
   // Cheap sync Map lookup — does not touch the send hot-path ack latency.
@@ -5795,24 +5697,6 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   }
 
   if (tokens.agents.length > 0) {
-    if (
-      sharedActor?.effectiveActorRole === 'participant'
-      && tokens.agents.some((target) => isShellLikeAgentType(getSession(target.session)?.agentType))
-    ) {
-      logger.warn({ sessionName, commandId: effectiveId }, 'session.send P2P rejected: participant_shell_forbidden');
-      timelineEmitter.emit(sessionName, 'command.ack', {
-        commandId: effectiveId,
-        status: 'error',
-        error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-      });
-      emitCommandAckReliable(serverLink, {
-        commandId: effectiveId,
-        sessionName,
-        status: 'error',
-        error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-      });
-      return;
-    }
     // P2P Quick Discussion — delegate to orchestrator
     try {
       // ── Concurrency guard: check for active P2P runs on same initiator ──
@@ -6735,27 +6619,6 @@ async function handleSendBound(cmd: Record<string, unknown>, serverLink: ServerL
   try {
     await sendProcessSessionMessage(sessionName, finalText, attachments, {
       onTyped: () => authorityBinding.current?.typed(),
-      ...(sharedActor?.effectiveActorRole === 'participant' ? {
-        beforeTyping: () => {
-          const currentType = getSession(sessionName)?.agentType;
-          if (isShellLikeAgentType(currentType)) {
-            logger.warn({ sessionName, commandId: effectiveId, agentType: currentType }, 'session.send rejected inside mutex: participant_shell_forbidden');
-            timelineEmitter.emit(sessionName, 'command.ack', {
-              commandId: effectiveId,
-              status: 'error',
-              error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-            });
-            emitCommandAckReliable(serverLink, {
-              commandId: effectiveId,
-              sessionName,
-              status: 'error',
-              error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-            });
-            return false;
-          }
-          return true;
-        },
-      } : {}),
       originalText: displayText,
       ...((attachmentRetentionPreamble && !isVerbatimRequested) ? { agentMessagePreamble: attachmentRetentionPreamble } : {}),
       commandId: effectiveId,
@@ -6916,23 +6779,6 @@ async function sendProcessSessionMessage(
     const liveIsVerbatim = Boolean(options?.verbatim || isShellLikeAgentType(liveAgentType));
     if (options?.beforeTyping && !options.beforeTyping()) {
       rollbackSummarySyncReservation(memoryContext.summaryReservation);
-      return false;
-    }
-    if (isParticipantSharedActorEnvelope(options?.userMessageMetadata?.sharedActor) && isShellLikeAgentType(liveAgentType)) {
-      rollbackSummarySyncReservation(memoryContext.summaryReservation);
-      if (options?.commandId) {
-        timelineEmitter.emit(sessionName, 'command.ack', {
-          commandId: options.commandId,
-          status: 'error',
-          error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-        });
-        emitCommandAckReliable(options.serverLink, {
-          commandId: options.commandId,
-          sessionName,
-          status: 'error',
-          error: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-        });
-      }
       return false;
     }
     await sendShellAwareCommand(sessionName, sendText, liveAgentType, liveIsVerbatim);
@@ -7674,19 +7520,6 @@ async function handleInput(cmd: Record<string, unknown>, serverLink: ServerLink)
   const sessionName = cmd.sessionName as string | undefined;
   if (!sessionName || cmd.data === undefined) return;
   const inputRecord = getSession(sessionName);
-  if (isParticipantSharedActor(cmd) && isShellLikeAgentType(inputRecord?.agentType)) {
-    logger.warn({ sessionName, agentType: inputRecord?.agentType }, 'session.input rejected: participant_shell_forbidden');
-    try {
-      serverLink.send({
-        type: 'session.error',
-        project: inputRecord?.projectName ?? sessionName,
-        session: sessionName,
-        sessionName,
-        message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-      });
-    } catch { /* ignore */ }
-    return;
-  }
   // Transport sessions have no terminal and never reach the process authority window.
   const binding = getTransportRuntime(sessionName)
     ? undefined
@@ -7723,20 +7556,6 @@ async function handleInputBound(cmd: Record<string, unknown>, serverLink: Server
   // write ordering, so the fast path keeps input ordering without coupling it
   // to the long-running process command lane.
   if (!terminalInputNeedsSessionMutex(BACKEND)) {
-    const liveAgentType = getSession(sessionName)?.agentType;
-    if (isParticipantSharedActor(cmd) && isShellLikeAgentType(liveAgentType)) {
-      logger.warn({ sessionName, agentType: liveAgentType }, 'session.input rejected before write: participant_shell_forbidden');
-      try {
-        serverLink.send({
-          type: 'session.error',
-          project: getSession(sessionName)?.projectName ?? sessionName,
-          session: sessionName,
-          sessionName,
-          message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-        });
-      } catch { /* ignore */ }
-      return;
-    }
     const stageStartedAt = Date.now();
     terminalStageTrace('browser_input_received', sessionName, stageStartedAt);
     try {
@@ -7755,19 +7574,6 @@ async function handleInputBound(cmd: Record<string, unknown>, serverLink: Server
     // Remap ESC → Ctrl+C for these agents so interrupt behavior is consistent with CC.
     const liveRecord = getSession(sessionName);
     const agentType = liveRecord?.agentType;
-    if (isParticipantSharedActor(cmd) && isShellLikeAgentType(agentType)) {
-      logger.warn({ sessionName, agentType }, 'session.input rejected inside mutex: participant_shell_forbidden');
-      try {
-        serverLink.send({
-          type: 'session.error',
-          project: liveRecord?.projectName ?? sessionName,
-          session: sessionName,
-          sessionName,
-          message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-        });
-      } catch { /* ignore */ }
-      return;
-    }
     const isEsc = data === '\x1b';
     if (agentType && agentType !== 'shell' && agentType !== 'script' && (isEsc || data === '\x03')) {
       if (!markSessionUserStopped(sessionName)) {
@@ -7782,19 +7588,6 @@ async function handleInputBound(cmd: Record<string, unknown>, serverLink: Server
   } catch (err) {
     logger.error({ sessionName, err }, 'session.input failed');
     const record = getSession(sessionName);
-    if (isParticipantSharedActor(cmd) && isShellLikeAgentType(record?.agentType)) {
-      logger.warn({ sessionName, agentType: record?.agentType }, 'session.input recovery blocked: participant_shell_forbidden');
-      try {
-        serverLink.send({
-          type: 'session.error',
-          project: record?.projectName ?? sessionName,
-          session: sessionName,
-          sessionName,
-          message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-        });
-      } catch { /* ignore */ }
-      return;
-    }
     const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
     const tmuxGone = record?.agentType === 'shell'
       && (message.includes('no server running')
@@ -9117,26 +8910,6 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
   const type = cmd.sessionType as string | undefined;
   const sessionName = id ? subSessionName(id) : undefined;
   const existingSub = sessionName ? getSession(sessionName) : undefined;
-  if (
-    isParticipantSharedActor(cmd)
-    && (
-      isShellLikeAgentType(type)
-      || isShellLikeAgentType(cmd.agentType)
-      || isShellLikeAgentType(existingSub?.agentType)
-    )
-  ) {
-    logger.warn({ id, sessionName, type: type ?? cmd.agentType, existingType: existingSub?.agentType }, 'subsession.start rejected: participant_shell_forbidden');
-    serverLink.send({
-      type: 'session.error',
-      message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-      ...(id && sessionName ? { id, session: sessionName, sessionName } : {}),
-      ...(typeof cmd.parentSession === 'string' && cmd.parentSession ? { project: cmd.parentSession } : {}),
-    });
-    if (incognito && id && sessionName) {
-      serverLink.send({ type: 'subsession.closed', id, sessionName, incognito: true });
-    }
-    return;
-  }
   if (incognito && (!type || !supportsSessionIncognito(type) || !serverLink.supportsIncognitoSessions())) {
     serverLink.send({
       type: 'session.error',
@@ -9318,25 +9091,6 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
   const record = getSession(sName);
   const restartEpoch = typeof cmd.restartEpoch === 'number' ? cmd.restartEpoch : undefined;
   const deadlineAt = typeof cmd.deadlineAt === 'number' && Number.isFinite(cmd.deadlineAt) ? cmd.deadlineAt : undefined;
-  if (
-    isParticipantSharedActor(cmd)
-    && (
-      isShellLikeAgentType(cmd.agentType)
-      || isShellLikeAgentType(cmd.sessionType)
-      || isShellLikeAgentType(record?.agentType)
-    )
-  ) {
-    logger.warn({ sessionName: sName, requestedAgentType: cmd.agentType ?? cmd.sessionType, currentAgentType: record?.agentType }, 'subsession.restart rejected: participant_shell_forbidden');
-    serverLink.send({
-      type: 'session.error',
-      project: record?.projectName ?? sName,
-      session: sName,
-      sessionName: sName,
-      message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-    });
-    sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: PARTICIPANT_SHELL_FORBIDDEN_REASON, restartEpoch });
-    return;
-  }
   if (!record) {
     logger.warn({ sessionName: sName }, 'subsession.restart: session not found in store');
     sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: 'session_not_found', restartEpoch });
@@ -9370,18 +9124,6 @@ async function handleSubSessionRestart(cmd: Record<string, unknown>, serverLink:
           return;
         }
         const liveRecord = getSession(sName) ?? record;
-        if (isParticipantSharedActor(cmd) && isShellLikeAgentType(liveRecord.agentType)) {
-          logger.warn({ sessionName: sName, currentAgentType: liveRecord.agentType }, 'subsession.restart rejected inside lock: participant_shell_forbidden');
-          serverLink.send({
-            type: 'session.error',
-            project: liveRecord.projectName,
-            session: sName,
-            sessionName: sName,
-            message: PARTICIPANT_SHELL_FORBIDDEN_REASON,
-          });
-          sendRestartResponse(serverLink, 'subsession.restart_response', cmd.requestId, { ok: false, rejected: true, error: PARTICIPANT_SHELL_FORBIDDEN_REASON, restartEpoch });
-          return;
-        }
         const effectiveRecord = (await recoverOpenCodeSessionRecord(liveRecord)) ?? liveRecord;
         const previousRuntimeEpoch = effectiveRecord.runtimeEpoch ?? liveRecord.runtimeEpoch ?? null;
         await relaunchSessionWithSettings(effectiveRecord, {

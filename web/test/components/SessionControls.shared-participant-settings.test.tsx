@@ -466,7 +466,7 @@ describe('SessionControls shared participant settings entry points', () => {
     expect(onSettings).not.toHaveBeenCalled();
   });
 
-  it('hides group clone menu when a whole-server participant views a group with shell/script members while allowing pure-LLM groups and owners', () => {
+  it('shows group clone menu when a whole-server participant views a group with shell/script members while hiding it for tab-scoped shares', () => {
     const serverParticipant = {
       name: 'deck_proj_brain',
       project: 'proj',
@@ -496,8 +496,25 @@ describe('SessionControls shared participant settings entry points', () => {
     );
     fireEvent.click(screen.getByTitle('Actions'));
     const mixedMenu = document.querySelector('.session-actions-menu') as HTMLElement;
-    expect(within(mixedMenu).queryByRole('button', { name: 'menu' })).toBeNull();
+    expect(within(mixedMenu).getByRole('button', { name: 'menu' })).toBeDefined();
     mixedView.unmount();
+
+    const tabParticipantView = render(
+      <SessionControls
+        ws={makeWs() as never}
+        connected
+        serverId="server-shared"
+        activeSession={sharedSession('participant')}
+        subSessions={[
+          { sessionName: 'deck_sub_sh1', type: 'shell', state: 'idle', parentSession: 'deck_proj_brain' },
+        ]}
+        quickData={quickData}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('Actions'));
+    const tabParticipantMenu = document.querySelector('.session-actions-menu') as HTMLElement;
+    expect(within(tabParticipantMenu).queryByRole('button', { name: 'menu' })).toBeNull();
+    tabParticipantView.unmount();
 
     const stoppedShellView = render(
       <SessionControls

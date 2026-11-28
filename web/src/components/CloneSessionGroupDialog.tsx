@@ -20,8 +20,6 @@ import {
 } from '@shared/session-group-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '@shared/git-remote-url.js';
 import { sanitizeProjectName } from '@shared/sanitize-project-name.js';
-import { PARTICIPANT_SHELL_FORBIDDEN_REASON } from '@shared/tab-sharing.js';
-import { hasShareRestrictedCloneShellMember } from '../tab-sharing-ui.js';
 
 interface Props {
   ws: WsClient | null;
@@ -38,7 +36,6 @@ interface Props {
     executionCloneKind?: string | null;
     parentRunId?: string | null;
   }>;
-  forbidShellAgentTypes?: boolean;
   onClose: () => void;
 }
 
@@ -204,7 +201,6 @@ export function CloneSessionGroupDialog({
   sourceSession,
   sessions,
   subSessions,
-  forbidShellAgentTypes = false,
   onClose,
 }: Props) {
   const { t } = useTranslation();
@@ -259,10 +255,6 @@ export function CloneSessionGroupDialog({
     () => (subSessions ?? []).filter((session) => session.parentSession === sourceSession.name),
     [sourceSession.name, subSessions],
   );
-  const hasForbiddenShellMember = forbidShellAgentTypes && hasShareRestrictedCloneShellMember({
-    sourceSession,
-    subSessions,
-  });
   const sourceRunning = isRunningSessionState(sourceSession.state)
     || directChildSessions.some((session) => isRunningSessionState(session.state));
   const capabilityReady = canUseKnownCloneCapability(ws);
@@ -349,10 +341,6 @@ export function CloneSessionGroupDialog({
 
   const submit = () => {
     if (busy) return;
-    if (hasForbiddenShellMember) {
-      setLocalError(t('share.shell_participant_forbidden'));
-      return;
-    }
     const trimmed = targetProjectName.trim();
     if (!trimmed) {
       setLocalError(t('session.clone.blankProject'));
@@ -430,9 +418,6 @@ export function CloneSessionGroupDialog({
 
   const errorText = useMemo(() => {
     if (!uiState.errorCode) return null;
-    if (uiState.errorCode === PARTICIPANT_SHELL_FORBIDDEN_REASON) {
-      return t('share.shell_participant_forbidden');
-    }
     if (uiState.errorCode === 'daemon_offline') {
       return t('session.clone.daemonOffline');
     }
@@ -668,9 +653,9 @@ export function CloneSessionGroupDialog({
             </div>
           )}
 
-          {(hasForbiddenShellMember || localError || errorText) && (
+          {(localError || errorText) && (
             <div style={{ border: '1px solid #7f1d1d', background: '#1f0808', color: '#fca5a5', borderRadius: 6, padding: '8px 10px', fontSize: 12, lineHeight: 1.45, marginBottom: 12 }}>
-              {hasForbiddenShellMember ? t('share.shell_participant_forbidden') : (localError ?? errorText)}
+              {localError ?? errorText}
             </div>
           )}
 
@@ -707,7 +692,7 @@ export function CloneSessionGroupDialog({
             <button
               type="button"
               class="btn btn-primary"
-              disabled={busy || terminal || hasForbiddenShellMember}
+              disabled={busy || terminal}
               onClick={submit}
             >
               {busy ? t('session.clone.submitting') : t('session.clone.submit')}

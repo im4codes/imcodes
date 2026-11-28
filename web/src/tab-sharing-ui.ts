@@ -1,7 +1,4 @@
 import type { EffectiveActorRole, SharedActorEnvelope } from '@shared/tab-sharing.js';
-import { isShellLikeAgentType } from '@shared/agent-types.js';
-import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
-import { isCloneableDirectChildState } from '@shared/session-group-clone.js';
 
 export type ShareRole = 'viewer' | 'participant';
 
@@ -136,27 +133,4 @@ export function buildCurrentTabShareTarget(target: ShareDialogTarget): ShareTarg
 
 export function isParticipantRole(role: ShareRole): boolean {
   return role === 'participant';
-}
-
-export interface CloneMemberCandidate {
-  type?: string | null;
-  agentType?: string | null;
-  state?: string | null;
-  parentSession?: string | null;
-  executionCloneKind?: string | null;
-  parentRunId?: string | null;
-}
-
-export function hasShareRestrictedCloneShellMember(params: {
-  sourceSession: { name: string; agentType?: string | null };
-  subSessions?: ReadonlyArray<CloneMemberCandidate>;
-}): boolean {
-  if (isShellLikeAgentType(params.sourceSession.agentType)) return true;
-  return (params.subSessions ?? []).some((sub) => (
-    sub.parentSession === params.sourceSession.name
-    && sub.executionCloneKind !== EXECUTION_CLONE_KIND
-    && typeof sub.parentRunId !== 'string'
-    && isCloneableDirectChildState(sub.state)
-    && isShellLikeAgentType(sub.type ?? sub.agentType)
-  ));
 }

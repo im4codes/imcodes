@@ -333,41 +333,49 @@ describe('sub-session routes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type }),
       });
-      expect(typeRes.status).toBe(403);
-      expect(await typeRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(typeRes.status).toBe(200);
     }
   });
 
-  it('blocks tab-share and whole-server-share participants from creating or mutating shell/script sub-sessions while allowing owner shell and participant LLM', async () => {
+  it('allows tab-share and whole-server-share participants to create and mutate shell/script sub-sessions while keeping viewers denied', async () => {
     const { getSubSessionById } = await import('../src/db/queries.js');
     const app = await buildApp();
 
-    // 1) Tab-share participant POST shell/script -> 403 participant_shell_forbidden; LLM -> 201
+    // 1) Tab-share participant POST shell/script & LLM -> 201
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
     mockResolveHttpShareAccess.mockResolvedValue({
       membership: 'none',
       actor: { kind: 'share', effectiveActorRole: 'participant' },
       shareProvenance: 'session',
     });
-    for (const type of ['shell', 'script']) {
+    for (const type of ['shell', 'script', 'codex-sdk']) {
       mockCreateSubSession.mockClear();
       const res = await app.request('/api/server/srv-1/sub-sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type, parent_session: 'deck_project_brain' }),
       });
-      expect(res.status).toBe(403);
-      expect(await res.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
-      expect(mockCreateSubSession).not.toHaveBeenCalled();
+      expect(res.status).toBe(201);
+      expect(mockCreateSubSession).toHaveBeenCalledTimes(1);
     }
-    const tabLlmRes = await app.request('/api/server/srv-1/sub-sessions', {
+
+    // Viewer remains blocked on POST shell/script (must use persistent mockResolvedValue across main + server fallback checks)
+    mockCreateSubSession.mockClear();
+    mockResolveHttpShareAccess.mockResolvedValue({
+      membership: 'none',
+      actor: { kind: 'share', effectiveActorRole: 'viewer' },
+      shareProvenance: 'session',
+    });
+    const viewerPostRes = await app.request('/api/server/srv-1/sub-sessions', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'codex-sdk', parent_session: 'deck_project_brain' }),
+      body: JSON.stringify({ type: 'shell', parent_session: 'deck_project_brain' }),
     });
-    expect(tabLlmRes.status).toBe(201);
+    expect(viewerPostRes.status).toBe(403);
+    expect(await viewerPostRes.json()).toEqual({ error: 'forbidden', reason: 'share-role-denied' });
+    expect(mockCreateSubSession).not.toHaveBeenCalled();
 
-    // 2) Whole-server share participant POST shell/script -> 403 participant_shell_forbidden; LLM -> 201
+    // 2) Whole-server share participant POST shell/script & LLM -> 201
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
     mockResolveServerMembershipRole.mockResolvedValue('none');
     mockResolveHttpShareAccess.mockResolvedValue({
@@ -375,25 +383,18 @@ describe('sub-session routes', () => {
       actor: { kind: 'share', effectiveActorRole: 'participant' },
       shareProvenance: 'server',
     });
-    for (const type of ['shell', 'script']) {
+    for (const type of ['shell', 'script', 'claude-code']) {
       mockCreateSubSession.mockClear();
       const res = await app.request('/api/server/srv-1/sub-sessions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type, parent_session: 'deck_project_brain' }),
       });
-      expect(res.status).toBe(403);
-      expect(await res.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
-      expect(mockCreateSubSession).not.toHaveBeenCalled();
+      expect(res.status).toBe(201);
+      expect(mockCreateSubSession).toHaveBeenCalledTimes(1);
     }
-    const serverLlmRes = await app.request('/api/server/srv-1/sub-sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ type: 'claude-code', parent_session: 'deck_project_brain' }),
-    });
-    expect(serverLlmRes.status).toBe(201);
 
-    // 3) PATCH switching to shell/script or mutating an existing shell/script sub-session -> 403 participant_shell_forbidden
+    // 3) PATCH switching to shell/script or mutating an existing shell/script sub-session -> 200
     vi.mocked(getSubSessionById).mockResolvedValue({
       id: 'sub-shell-1',
       server_id: 'srv-1',
@@ -404,8 +405,7 @@ describe('sub-session routes', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'renamed' }),
     });
-    expect(wholeExistingShellPatch.status).toBe(403);
-    expect(await wholeExistingShellPatch.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    expect(wholeExistingShellPatch.status).toBe(200);
 
     vi.mocked(getSubSessionById).mockResolvedValue({
       id: 'sub-llm-1',
@@ -418,8 +418,7 @@ describe('sub-session routes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type }),
       });
-      expect(wholeSwitchPatch.status).toBe(403);
-      expect(await wholeSwitchPatch.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+      expect(wholeSwitchPatch.status).toBe(200);
     }
 
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: false, reason: 'share-direct-surface-denied' });
@@ -438,8 +437,7 @@ describe('sub-session routes', () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ label: 'renamed' }),
     });
-    expect(tabExistingScriptPatch.status).toBe(403);
-    expect(await tabExistingScriptPatch.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
+    expect(tabExistingScriptPatch.status).toBe(200);
 
     // 4) Real owner still allowed to create shell/script sub-session
     mockResolveServerMemberAccessOrShareDeny.mockResolvedValue({ ok: true, role: 'owner' });
@@ -452,7 +450,7 @@ describe('sub-session routes', () => {
     expect(ownerShellRes.status).toBe(201);
   });
 
-  it('stamps sharedActor on participant PATCH sub-session restarts and rejects live daemon shell type mismatches', async () => {
+  it('stamps sharedActor on participant PATCH sub-session restarts including when live daemon type is shell', async () => {
     const { getSubSessionById } = await import('../src/db/queries.js');
     const { WsBridge } = await import('../src/ws/bridge.js');
     const bridge = WsBridge.get('srv-1');
@@ -536,7 +534,7 @@ describe('sub-session routes', () => {
         sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
       });
 
-      // 3) DB says codex-sdk, but live bridge type is shell -> rejected 403 participant_shell_forbidden
+      // 3) Live bridge type is shell -> still allowed and stamped with sharedActor
       sendSpy.mockClear();
       liveTypeSpy.mockResolvedValueOnce('shell');
       const mismatchRes = await app.request('/api/server/srv-1/sub-sessions/sub-llm-1', {
@@ -544,9 +542,13 @@ describe('sub-session routes', () => {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type: 'claude-code-sdk' }),
       });
-      expect(mismatchRes.status).toBe(403);
-      expect(await mismatchRes.json()).toEqual({ error: 'forbidden', reason: 'participant_shell_forbidden' });
-      expect(sendSpy).not.toHaveBeenCalled();
+      expect(mismatchRes.status).toBe(200);
+      expect(JSON.parse(String(sendSpy.mock.calls[0]?.[0]))).toMatchObject({
+        type: 'subsession.restart',
+        sessionName: 'deck_sub_sub-llm-1',
+        agentType: 'claude-code-sdk',
+        sharedActor: { effectiveActorRole: 'participant', origin: 'shared-server' },
+      });
     } finally {
       sendSpy.mockRestore();
       liveTypeSpy.mockRestore();

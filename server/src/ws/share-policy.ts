@@ -12,10 +12,8 @@ import { P2P_WORKFLOW_MSG } from '../../../shared/p2p-workflow-messages.js';
 import { P2P_CONFIG_MSG } from '../../../shared/p2p-config-events.js';
 import { isP2pSavedConfig, sanitizeP2pSavedConfig } from '../../../shared/p2p-modes.js';
 import { collectRoutedSessionNames } from '../../../shared/p2p-routing-fields.js';
-import { isShellLikeAgentType } from '../../../shared/agent-types.js';
 import { isIncognitoSession } from '../../../shared/session-incognito-types.js';
 import {
-  PARTICIPANT_SHELL_FORBIDDEN_REASON,
   SHARE_BROWSER_COMMANDS,
   isSharedServerParticipant,
   rawSubSessionIdFromDisplayName,
@@ -71,7 +69,6 @@ export type ShareReason = Extract<
   | 'share-cancel-unsupported'
   | 'share-dispatch-changed'
   | 'share-comment-invalid'
-  | typeof PARTICIPANT_SHELL_FORBIDDEN_REASON
 >;
 
 export type ShareScopedSocketState = {
@@ -145,18 +142,7 @@ export const SHARE_REASONS = {
   CANCEL_UNSUPPORTED: 'share-cancel-unsupported',
   DISPATCH_CHANGED: 'share-dispatch-changed',
   COMMENT_INVALID: 'share-comment-invalid',
-  PARTICIPANT_SHELL_FORBIDDEN: PARTICIPANT_SHELL_FORBIDDEN_REASON,
 } as const satisfies Record<string, ShareReason>;
-
-export const SHELL_FORBIDDEN_SHARE_COMMANDS: ReadonlySet<string> = new Set([
-  'session.input',
-  'session.send',
-  'session.start',
-  'session.restart',
-  'subsession.start',
-  'subsession.restart',
-  SESSION_GROUP_CLONE_MSG.START,
-]);
 
 const SHARE_LIFECYCLE_ACTOR_COMMANDS: ReadonlySet<string> = new Set([
   'session.start',
@@ -615,18 +601,6 @@ function stampNonServerShareFsMessage(
   };
 }
 
-function shareCommandHasForbiddenShellType(
-  type: string,
-  msg: Record<string, unknown>,
-  targetAgentType?: string | null,
-  targetAgentTypes?: ReadonlyArray<string | null | undefined>,
-): boolean {
-  if (!SHELL_FORBIDDEN_SHARE_COMMANDS.has(type)) return false;
-  if (isShellLikeAgentType(msg.agentType) || isShellLikeAgentType(msg.sessionType)) return true;
-  if (isShellLikeAgentType(targetAgentType)) return true;
-  return targetAgentTypes?.some((entry) => isShellLikeAgentType(entry)) ?? false;
-}
-
 function stripClientShareAuthorityFields(msg: Record<string, unknown>): Record<string, unknown> {
   const {
     sharedActor: _clientActor,
@@ -643,9 +617,6 @@ export function evaluateShareCommand(input: {
   state: ShareScopedSocketState;
   now: number;
   runtimeType: 'process' | 'transport' | 'unknown';
-  targetAgentType?: string | null;
-  targetAgentTypes?: ReadonlyArray<string | null | undefined>;
-  p2pForbiddenReason?: ShareReason | null;
   activeDispatchId: string | null;
 }): ShareCommandDecision {
   const type = typeof input.msg.type === 'string' ? input.msg.type : '';
@@ -664,9 +635,6 @@ export function evaluateShareCommand(input: {
   if (policy.kind === 'server-participant-action') {
     if (!serverParticipant) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
-    }
-    if (shareCommandHasForbiddenShellType(type, input.msg, input.targetAgentType, input.targetAgentTypes)) {
-      return { allowed: false, reason: SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN };
     }
     const actionId = typeof input.msg.idempotencyKey === 'string' && input.msg.idempotencyKey.trim()
       ? input.msg.idempotencyKey.trim()
@@ -798,10 +766,6 @@ export function evaluateShareCommand(input: {
 
   if (input.state.snapshot.effectiveRole !== 'participant') {
     return { allowed: false, reason: SHARE_REASONS.ROLE_DENIED };
-  }
-
-  if (shareCommandHasForbiddenShellType(type, input.msg, input.targetAgentType, input.targetAgentTypes)) {
-    return { allowed: false, reason: SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN };
   }
 
   if (policy.kind === 'participant-bound-action') {
@@ -982,7 +946,6 @@ export function evaluateShareCommand(input: {
   if (policy.kind === 'participant-send') {
     const p2pScopeReason = evaluateP2pSendScope(input.msg, input.state);
     if (p2pScopeReason) return { allowed: false, reason: p2pScopeReason };
-    if (input.p2pForbiddenReason) return { allowed: false, reason: input.p2pForbiddenReason };
     const actionId = typeof input.msg.actionId === 'string' && input.msg.actionId.trim()
       ? input.msg.actionId.trim()
       : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()

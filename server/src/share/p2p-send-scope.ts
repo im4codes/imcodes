@@ -1,5 +1,4 @@
-import { isShellLikeAgentType } from '../../../shared/agent-types.js';
-import { PARTICIPANT_SHELL_FORBIDDEN_REASON, type ShareDenialReason, type ShareTarget } from '../../../shared/tab-sharing.js';
+import type { ShareDenialReason, ShareTarget } from '../../../shared/tab-sharing.js';
 import { collectP2pRoutedSessionNames, extractInTextRoutingTargets } from '../../../shared/p2p-routing-fields.js';
 
 export interface P2pSendTargets {
@@ -97,24 +96,5 @@ export function evaluateP2pSendTargetScope(params: {
   for (const name of routed) {
     if (!params.coversSession(name)) return 'share-direct-surface-denied';
   }
-  return null;
-}
-
-export async function evaluateParticipantP2pShellRestriction(params: {
-  msg: Record<string, unknown>;
-  resolveAgentType: (sessionName: string) => Promise<string | null>;
-}): Promise<typeof PARTICIPANT_SHELL_FORBIDDEN_REASON | null> {
-  const routed = extractAllP2pRoutedSessionNames(params.msg);
-  if (!routed.hasP2pRouting) return null;
-
-  // Reject explicitly named shell/script recipients (including configured
-  // p2pSessionConfig participants). Unbounded expansions (@@all, p2pMode,
-  // __all__) keep the daemon's existing expandP2pTargets eligibility filter,
-  // which excludes shell/script targets rather than rejecting whole mixed domains.
-  for (const sessionName of routed.sessions) {
-    const agentType = await params.resolveAgentType(sessionName);
-    if (isShellLikeAgentType(agentType)) return PARTICIPANT_SHELL_FORBIDDEN_REASON;
-  }
-
   return null;
 }

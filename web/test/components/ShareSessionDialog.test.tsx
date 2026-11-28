@@ -16,13 +16,14 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, vars?: Record<string, unknown>) => {
       if (key === 'share.warning.device') {
-        return 'Security notice: Sharing this device grants full device permissions. Do not share devices containing private data — use only for shared development machines or similar non-private devices.';
+        return 'High-risk machine collaboration notice: Real-time collaboration on this computer/server is equivalent to Remote Desktop & terminal access with no OS sandbox. Never collaborate on a personal device containing private data — use only dedicated development machines or shared servers.';
       }
       if (key === 'share.warning.session') {
-        return "Security notice: Sharing a session lets collaborators interact with this device's environment. Do not share sessions on devices containing private data — use only for shared development machines or similar non-private devices.";
+        return "High-risk collaboration notice: Real-time collaboration lets participants run Shell commands, edit files, and use tools directly in this machine's environment with no OS sandbox. Never use on a personal computer with private data — only dedicated dev machines or shared servers.";
       }
       if (key === 'share.target.server') return 'Whole server';
       if (key === 'share.target.currentTab') return 'Current session tab';
+      if (key === 'share.role.participant') return 'Participant';
       if (!vars) return key;
       const suffix = Object.entries(vars)
         .map(([k, v]) => `${k}=${String(v)}`)
@@ -85,7 +86,7 @@ describe('ShareSessionDialog security warnings', () => {
     const warning = screen.getByTestId('share-security-warning');
     expect(warning).toBeTruthy();
     expect(warning.getAttribute('role')).toBe('note');
-    expect(warning.textContent).toContain('Security notice: Sharing this device grants full device permissions');
+    expect(warning.textContent).toContain('High-risk machine collaboration notice: Real-time collaboration on this computer/server is equivalent to Remote Desktop');
 
     // Switch to Remote Desktop tab
     const rdpTab = screen.getByRole('tab', { name: 'controlled_nodes.share.remote_desktop_tab' });
@@ -94,7 +95,7 @@ describe('ShareSessionDialog security warnings', () => {
     // Warning banner should still be present on Remote Desktop tab
     const warningAfterTabSwitch = screen.getByTestId('share-security-warning');
     expect(warningAfterTabSwitch).toBeTruthy();
-    expect(warningAfterTabSwitch.textContent).toContain('Security notice: Sharing this device grants full device permissions');
+    expect(warningAfterTabSwitch.textContent).toContain('High-risk machine collaboration notice: Real-time collaboration on this computer/server is equivalent to Remote Desktop');
     expect(screen.getByTestId('remote-desktop-owner-access')).toBeTruthy();
   });
 
@@ -110,21 +111,21 @@ describe('ShareSessionDialog security warnings', () => {
     const warning = screen.getByTestId('share-security-warning');
     expect(warning).toBeTruthy();
     // Default choice is current-tab -> session warning
-    expect(warning.textContent).toContain("Security notice: Sharing a session lets collaborators interact with this device's environment");
+    expect(warning.textContent).toContain('High-risk collaboration notice: Real-time collaboration lets participants run Shell commands');
 
     // Toggle radio to Whole server
     const serverRadio = screen.getByRole('radio', { name: 'Whole server' });
     fireEvent.click(serverRadio);
 
     // Should dynamically switch to device warning
-    expect(warning.textContent).toContain('Security notice: Sharing this device grants full device permissions');
+    expect(warning.textContent).toContain('High-risk machine collaboration notice: Real-time collaboration on this computer/server is equivalent to Remote Desktop');
 
     // Toggle back to Current session tab
     const tabRadio = screen.getByRole('radio', { name: 'Current session tab' });
     fireEvent.click(tabRadio);
 
     // Should switch back to session warning
-    expect(warning.textContent).toContain("Security notice: Sharing a session lets collaborators interact with this device's environment");
+    expect(warning.textContent).toContain('High-risk collaboration notice: Real-time collaboration lets participants run Shell commands');
   });
 
   it('renders device warning when fixedTarget is a whole server', () => {
@@ -139,7 +140,7 @@ describe('ShareSessionDialog security warnings', () => {
 
     const warning = screen.getByTestId('share-security-warning');
     expect(warning).toBeTruthy();
-    expect(warning.textContent).toContain('Security notice: Sharing this device grants full device permissions');
+    expect(warning.textContent).toContain('High-risk machine collaboration notice: Real-time collaboration on this computer/server is equivalent to Remote Desktop');
   });
 
   it('renders session warning when fixedTarget is a tab session', () => {
@@ -154,7 +155,28 @@ describe('ShareSessionDialog security warnings', () => {
 
     const warning = screen.getByTestId('share-security-warning');
     expect(warning).toBeTruthy();
-    expect(warning.textContent).toContain("Security notice: Sharing a session lets collaborators interact with this device's environment");
+    expect(warning.textContent).toContain('High-risk collaboration notice: Real-time collaboration lets participants run Shell commands');
+  });
+
+  it('escalates warning styling and renders trust disclosure when Participant role is selected', () => {
+    const { container } = render(
+      <ShareSessionDialog
+        variant="session"
+        target={defaultTarget}
+        onClose={vi.fn()}
+      />
+    );
+
+    const warning = screen.getByTestId('share-security-warning');
+    expect(warning.classList.contains('is-participant')).toBe(false);
+    expect(container.querySelector('.share-trust-disclosure')).toBeNull();
+
+    fireEvent.click(screen.getByRole('radio', { name: 'Participant' }));
+    expect(warning.classList.contains('is-participant')).toBe(true);
+    const disclosure = container.querySelector('.share-trust-disclosure');
+    expect(disclosure).toBeTruthy();
+    expect(disclosure?.textContent).toContain('share.trust.title');
+    expect(disclosure?.textContent).toContain('share.trust.body');
   });
 
   it('structures header, warning, panel, and actions with proper layout classes to support fixed actions', () => {

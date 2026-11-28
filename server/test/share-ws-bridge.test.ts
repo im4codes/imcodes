@@ -3734,7 +3734,9 @@ describe('WsBridge share-scoped sockets', () => {
       });
       daemon.sent.length = 0;
 
-      // Forbidden shell/script commands
+      sock.sent.length = 0;
+
+      // Shell/script commands now allowed within covered participant scope with stamped sharedActor
       sock.emit('message', JSON.stringify({ type: 'session.input', sessionName: 'deck_sub_sh1', data: 'whoami\r' }));
       sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_sub_sc1', text: 'ls', commandId: `send-${label}` }));
       sock.emit('message', JSON.stringify({ type: 'session.start', project: 'newsh', dir: '/tmp/newsh', agentType: 'shell' }));
@@ -3744,9 +3746,21 @@ describe('WsBridge share-scoped sockets', () => {
       sock.emit('message', JSON.stringify({ type: 'subsession.restart', sessionName: 'deck_sub_sh1' }));
       await flushAsync();
 
-      expect(daemon.sentJson).toHaveLength(0);
-      expect(sock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === `send-${label}` && m.reason === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN)).toBe(true);
-      expect(sock.sentJson.filter((m) => m.type === 'error' && m.code === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN).length).toBeGreaterThanOrEqual(4);
+      const expectedOrigin = label === 'server-share' ? 'shared-server' : 'shared-tab';
+      for (const cmdType of ['session.input', 'session.send', 'session.restart', 'subsession.start', 'subsession.restart']) {
+        const relayed = daemon.sentJson.find((m) => m.type === cmdType);
+        expect(relayed, `${label}:${cmdType}`).toBeDefined();
+        expect(relayed?.sharedActor).toMatchObject({
+          effectiveActorRole: 'participant',
+          origin: expectedOrigin,
+        });
+      }
+      if (label === 'server-share') {
+        expect(daemon.sentJson.some((m) => m.type === 'session.start' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+      } else {
+        expect(daemon.sentJson.some((m) => m.type === 'session.start')).toBe(false);
+        expect(sock.sentJson.some((m) => m.type === 'error' && m.code === SHARE_REASONS.DIRECT_SURFACE_DENIED)).toBe(true);
+      }
 
       // Permitted LLM session commands keep working normally and carry stamped sharedActor
       daemon.sent.length = 0;
@@ -3783,7 +3797,6 @@ describe('WsBridge share-scoped sockets', () => {
         agentType: 'claude-code',
       }));
       await flushAsync();
-      const expectedOrigin = label === 'server-share' ? 'shared-server' : 'shared-tab';
       const expectedCommands = label === 'server-share'
         ? ['session.input', 'subsession.start', 'subsession.restart', 'session.start', 'session.restart']
         : ['session.input', 'subsession.start', 'subsession.restart', 'session.restart'];
@@ -3796,9 +3809,27 @@ describe('WsBridge share-scoped sockets', () => {
         });
       }
     }
+
+    // Viewer stays strictly read-only on shell/script commands
+    const viewerCov = coverage(mainTarget, 'viewer', now);
+    bridge.setShareCoverageResolverForTests(async () => viewerCov);
+    const viewerSock = new MockWs();
+    bridge.handleShareBrowserConnection(viewerSock as never, 'viewer-shell-deny', db, {
+      ticketId: 'ticket-viewer-sh',
+      target: mainTarget,
+      snapshot: viewerCov,
+    });
+    daemon.sent.length = 0;
+    viewerSock.emit('message', JSON.stringify({ type: 'session.input', sessionName: 'deck_sub_sh1', data: 'whoami\r' }));
+    viewerSock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_sub_sc1', text: 'ls', commandId: 'viewer-send-sh' }));
+    viewerSock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'viewer_sh', sessionType: 'shell', parentSession: 'deck_proj_brain' }));
+    await flushAsync();
+    expect(daemon.sentJson).toHaveLength(0);
+    expect(viewerSock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === 'viewer-send-sh' && m.reason === SHARE_REASONS.ROLE_DENIED)).toBe(true);
+    expect(viewerSock.sentJson.some((m) => m.type === 'error' && m.code === SHARE_REASONS.ROLE_DENIED)).toBe(true);
   });
 
-  it('uses execution target (not parentSession) on subsession.start, checks mixed-project session.restart, dual type fields, group-clone, P2P targets, and cache invalidation', async () => {
+  it('relays shell/script subsession.start, mixed-project session.restart, group-clone, P2P targets, and keeps cache invalidation fresh', async () => {
     const now = Date.now();
     const daemon = new MockWs();
     const bridge = WsBridge.get(serverId);
@@ -3909,10 +3940,9 @@ describe('WsBridge share-scoped sockets', () => {
     });
     daemon.sent.length = 0;
 
-    // 1) Existing shell child sh1 under LLM parent deck_proj_brain blocked even if request claims codex-sdk;
-    //    dual field agentType=claude-code-sdk + sessionType=shell blocked; independent LLM subsession allowed
-    sock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'sh1', sessionType: 'codex-sdk', parentSession: 'deck_proj_brain' }));
-    sock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'dual1', agentType: 'claude-code-sdk', sessionType: 'shell', parentSession: 'deck_proj_brain' }));
+    // 1) Shell/script subsession.start, mixed-project restart, shell/mix group clone, and shell P2P sends all relay with stamped sharedActor
+    sock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'sh1', sessionType: 'shell', parentSession: 'deck_proj_brain' }));
+    sock.emit('message', JSON.stringify({ type: 'subsession.start', id: 'dual1', agentType: 'claude-code-sdk', sessionType: 'script', parentSession: 'deck_proj_brain' }));
     sock.emit('message', JSON.stringify({ type: 'session.restart', project: 'mixproj' }));
     sock.emit('message', JSON.stringify({ type: SESSION_GROUP_CLONE_MSG.START, serverId, sourceMainSessionName: 'deck_mixproj_brain', idempotencyKey: 'clone-mix-1' }));
     sock.emit('message', JSON.stringify({ type: SESSION_GROUP_CLONE_MSG.START, serverId, sourceMainSessionName: 'deck_shellmain_brain', idempotencyKey: 'clone-sh-1' }));
@@ -3921,10 +3951,13 @@ describe('WsBridge share-scoped sockets', () => {
     sock.emit('message', JSON.stringify({ type: 'session.send', sessionName: 'deck_proj_brain', text: 'hi', p2pSessionConfig: { deck_sub_sh1: { enabled: true, mode: 'audit' } }, commandId: 'p2p-cfg-sh' }));
     await flushAsync();
 
-    expect(daemon.sentJson).toHaveLength(0);
-    expect(sock.sentJson.filter((m) => m.type === 'error' && m.code === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN).length).toBeGreaterThanOrEqual(5);
+    expect(daemon.sentJson.some((m) => m.type === 'subsession.start' && m.id === 'sh1' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === 'subsession.start' && m.id === 'dual1' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === 'session.restart' && m.project === 'mixproj' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === SESSION_GROUP_CLONE_MSG.START && m.sourceMainSessionName === 'deck_mixproj_brain' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === SESSION_GROUP_CLONE_MSG.START && m.sourceMainSessionName === 'deck_shellmain_brain' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
     for (const cmdId of ['p2p-text-sh', 'p2p-at-sh', 'p2p-cfg-sh']) {
-      expect(sock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === cmdId && m.reason === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN)).toBe(true);
+      expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === cmdId && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
     }
 
     // 2) Pure-LLM subsession.start, pure-LLM group-clone, and pure-LLM P2P send succeed with stamped sharedActor
@@ -3938,7 +3971,7 @@ describe('WsBridge share-scoped sockets', () => {
     expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === 'p2p-llm-ok' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
   });
 
-  it('fences stale in-flight DB reads on newer sync, uses exact project match on session.restart, aligns clone visibility to active running/idle children, and allows mixed-domain P2P broadcasts while blocking explicit shell recipients', async () => {
+  it('fences stale in-flight DB reads on newer sync and allows whole-server participant shell/script restarts, inputs, group clones, and P2P sends', async () => {
     const now = Date.now();
     const daemon = new MockWs();
     const bridge = WsBridge.get(serverId);
@@ -4082,15 +4115,11 @@ describe('WsBridge share-scoped sockets', () => {
     await flushAsync();
 
     expect(daemon.sentJson.some((m) => m.type === 'session.restart' && m.project === 'app' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
-    expect(daemon.sentJson.some((m) => m.type === 'session.restart' && m.project === 'app_v2')).toBe(false);
-    expect(daemon.sentJson.some((m) => m.type === 'session.input' && m.sessionName === 'deck_inflight_brain')).toBe(false);
+    expect(daemon.sentJson.some((m) => m.type === 'session.restart' && m.project === 'app_v2' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
+    expect(daemon.sentJson.some((m) => m.type === 'session.input' && m.sessionName === 'deck_inflight_brain' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
     expect(daemon.sentJson.some((m) => m.type === SESSION_GROUP_CLONE_MSG.START && m.sourceMainSessionName === 'deck_stopshclone_brain' && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
-    for (const cmdId of ['bc-mix-all', 'bc-mix-mode', 'bc-mix-star', 'bc-pure-mode']) {
+    for (const cmdId of ['bc-mix-all', 'bc-mix-mode', 'bc-mix-star', 'bc-pure-mode', 'bc-mix-named-text', 'bc-mix-named-at', 'bc-mix-named-cfg']) {
       expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === cmdId && (m.sharedActor as any)?.effectiveActorRole === 'participant')).toBe(true);
-    }
-    for (const cmdId of ['bc-mix-named-text', 'bc-mix-named-at', 'bc-mix-named-cfg']) {
-      expect(daemon.sentJson.some((m) => m.type === 'session.send' && m.commandId === cmdId)).toBe(false);
-      expect(sock.sentJson.some((m) => m.type === 'command.failed' && m.commandId === cmdId && m.reason === SHARE_REASONS.PARTICIPANT_SHELL_FORBIDDEN)).toBe(true);
     }
   });
 

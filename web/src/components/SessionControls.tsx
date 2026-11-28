@@ -188,7 +188,7 @@ import {
   hasTransportPendingSyncSnapshot,
   normalizeTransportPendingEntries,
 } from '../transport-queue.js';
-import { canSharedActorControlSession, canSharedActorManageServer, formatSharedActorLabel, hasShareRestrictedCloneShellMember } from '../tab-sharing-ui.js';
+import { canSharedActorControlSession, canSharedActorManageServer, formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { resolveSessionInfoRuntimeType } from '../runtime-type.js';
 import {
   buildP2pConfigSelection,
@@ -3695,16 +3695,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   }, [activeSession?.agentType, activeSession?.qwenModel, qwenModel]);
 
   const hasSession = !!activeSession;
-  const hasParticipantForbiddenCloneMember = isShareScopedSession
-    && !!activeSession
-    && hasShareRestrictedCloneShellMember({ sourceSession: activeSession, subSessions });
   const canShowCloneGroupAction = !!activeSession
     && !subSessionId
     && !compact
     && activeSession.role === 'brain'
     && !activeSession.name.startsWith('deck_sub_')
     && activeSession.userCreated !== false
-    && (!isShareScopedSession || (canManageSharedServer && !hasParticipantForbiddenCloneMember));
+    && (!isShareScopedSession || canManageSharedServer);
   const canShowPinAction = !!activeSession
     && !subSessionId
     && !compact
@@ -12540,7 +12537,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           sourceSession={activeSession}
           sessions={sessions}
           subSessions={subSessions}
-          forbidShellAgentTypes={isShareScopedSession}
           onClose={() => setCloneDialogOpen(false)}
         />
       )}

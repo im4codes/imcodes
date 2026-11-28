@@ -179,7 +179,6 @@
     "menu": {
       "shareTab": "Colaborar"
     },
-    "shell_participant_forbidden": "Los participantes compartidos solo pueden usar sesiones de agentes de IA; shell y script son exclusivos del propietario.",
     "dialogTitle": "Colaboración en tiempo real",
     "dialogSubtitle": "Invita a colaboradores a trabajar juntos en {{target}}.",
     "target": {
@@ -198,12 +197,12 @@
       "system": "Sistema"
     },
     "roleHelp": {
-      "viewer": "Puede ver el estado del alcance y participar en debates del alcance sin dirigir al agente.",
-      "participant": "Puede colaborar plenamente dentro del ámbito compartido, incluido OpenSpec y nuevas subsesiones, pero no cerrar sesiones."
+      "viewer": "Solo lectura: Puede ver el estado del ámbito y unirse al debate sin operar la máquina ni dirigir herramientas.",
+      "participant": "Colaborador en tiempo real: Puede operar terminales Shell/script, archivos, herramientas del espacio de trabajo, OpenSpec y nuevas subsesiones dentro del ámbito (no puede cerrar sesiones existentes)."
     },
     "trust": {
-      "title": "Aviso de confianza para participantes",
-      "body": "Los agentes no están en una zona aislada. Los límites de UI/API reducen controles directos, pero una indicación de participante puede influir en un agente que actúa en su entorno accesible."
+      "title": "Alto riesgo: Equivale al control de escritorio remoto y del equipo",
+      "body": "El entorno no tiene aislamiento de sandbox. Los participantes pueden ejecutar comandos Shell, acceder a archivos y usar herramientas o escritorio remoto directamente en este host. Colabore solo con personas de confianza en máquinas de desarrollo dedicadas o servidores, nunca en equipos personales con datos privados."
     },
     "recipient": {
       "label": "Colaborador",
@@ -266,8 +265,8 @@
       "share-comment-invalid": "No se pudo publicar el comentario."
     },
     "warning": {
-      "device": "Aviso de seguridad: Compartir este dispositivo otorga permisos totales sobre él. No comparta dispositivos que contengan datos privados; úselo únicamente en máquinas de desarrollo compartidas u otros dispositivos no privados.",
-      "session": "Aviso de seguridad: Compartir una sesión permite a los colaboradores interactuar con el entorno y las sesiones de este dispositivo. No comparta sesiones en dispositivos con datos privados; úselo solo en máquinas de desarrollo compartidas u otros dispositivos no privados."
+      "device": "Aviso de alto riesgo: La colaboración en tiempo real en este equipo o servidor equivale a acceso por escritorio remoto y terminal sin aislamiento de sandbox. Nunca colabore en un equipo personal con datos privados; úselo solo en máquinas de desarrollo dedicadas o servidores compartidos.",
+      "session": "Aviso de alto riesgo: La colaboración en tiempo real permite a los participantes operar Shell, archivos y herramientas directamente en este entorno sin sandbox del sistema. No lo use en equipos personales con datos privados; solo en máquinas de desarrollo dedicadas o servidores del equipo."
     }
   },
   "window": {
@@ -4434,8 +4433,8 @@
         "viewer": "Puede ver la presencia y los datos básicos del nodo, pero no controlarlo.",
         "participant": "Puede ejecutar comandos, transferir archivos y usar el control del equipo mientras la ejecución esté habilitada."
       },
-      "trust_title": "El acceso de participante permite controlar esta máquina",
-      "trust_body": "Compártela solo con personas de confianza. Sus acciones se ejecutan con los privilegios del nodo controlado.",
+      "trust_title": "Alto riesgo: El participante puede controlar directamente este equipo o servidor",
+      "trust_body": "Úselo solo con colaboradores de confianza en máquinas de desarrollo dedicadas o servidores (nunca en equipos personales con datos privados). Las acciones se ejecutan sin sandbox con los privilegios del host.",
       "view_only": "Solo lectura"
     },
     "copy_install_link": "Copiar enlace de instalación",

@@ -127,7 +127,7 @@ const SERVER_PARTICIPANT = {
   },
 };
 
-describe('command-handler participant shell/script defense-in-depth', () => {
+describe('command-handler participant shell/script execution', () => {
   const serverLink = {
     send: vi.fn(),
     sendBinary: vi.fn(),
@@ -140,9 +140,9 @@ describe('command-handler participant shell/script defense-in-depth', () => {
     vi.clearAllMocks();
     clearProcessAutomationQueuesForTest();
     getSessionMock.mockImplementation((name: string) => {
-      if (name === 'deck_sub_sh1') return { name, projectName: 'proj', role: 'w1', agentType: 'shell', projectDir: '/tmp/proj', state: 'idle' };
-      if (name === 'deck_sub_sc1') return { name, projectName: 'proj', role: 'w1', agentType: 'script', projectDir: '/tmp/proj', state: 'idle' };
-      if (name === 'deck_proj_brain') return { name, projectName: 'proj', role: 'brain', agentType: 'claude-code', projectDir: '/tmp/proj', state: 'idle' };
+      if (name === 'deck_sub_sh1') return { name, projectName: 'proj', role: 'w1', agentType: 'shell', runtimeType: 'process', projectDir: '/tmp/proj', state: 'idle' };
+      if (name === 'deck_sub_sc1') return { name, projectName: 'proj', role: 'w1', agentType: 'script', runtimeType: 'process', projectDir: '/tmp/proj', state: 'idle' };
+      if (name === 'deck_proj_brain') return { name, projectName: 'proj', role: 'brain', agentType: 'claude-code', runtimeType: 'process', projectDir: '/tmp/proj', state: 'idle' };
       return undefined;
     });
     listSessionsMock.mockReturnValue([]);
@@ -151,66 +151,46 @@ describe('command-handler participant shell/script defense-in-depth', () => {
   it.each([
     ['tab-share', TAB_PARTICIPANT],
     ['whole-server-share', SERVER_PARTICIPANT],
-  ])('blocks %s participant from all 6 shell/script lifecycle, send, and input commands', async (_label, sharedActor) => {
+  ])('allows %s participant shell/script lifecycle, send, and input commands within authorized scope', async (label, sharedActor) => {
+    relaunchSessionWithSettingsMock.mockResolvedValue(undefined);
+    startSubSessionMock.mockResolvedValue(undefined);
+    startProjectMock.mockResolvedValue(undefined);
+
     for (const agentType of ['shell', 'script']) {
       const targetName = agentType === 'shell' ? 'deck_sub_sh1' : 'deck_sub_sc1';
 
-      // 1. session.input
       handleWebCommand({ type: 'session.input', sessionName: targetName, data: 'id\r', sharedActor }, serverLink as any);
-      // 2. session.send
-      handleWebCommand({ type: 'session.send', sessionName: targetName, text: 'whoami', commandId: `cmd-${agentType}`, sharedActor }, serverLink as any);
-      // 3. session.start
-      handleWebCommand({ type: 'session.start', project: 'newproj', dir: '/tmp/newproj', agentType, sharedActor }, serverLink as any);
-      // 4. session.restart
+      handleWebCommand({ type: 'session.send', sessionName: targetName, text: 'whoami', commandId: `cmd-${label}-${agentType}`, sharedActor }, serverLink as any);
+      handleWebCommand({ type: 'session.start', project: `new-${label}-${agentType}`, dir: `/tmp/new-${label}-${agentType}`, agentType, sharedActor }, serverLink as any);
+      handleWebCommand({ type: 'subsession.start', id: `new${label.replace(/[^a-z]/g, '')}${agentType}`, sessionType: agentType, parentSession: 'deck_proj_brain', sharedActor }, serverLink as any);
       handleWebCommand({ type: 'session.restart', sessionName: targetName, sharedActor }, serverLink as any);
-      handleWebCommand({ type: 'session.restart', sessionName: 'deck_proj_brain', agentType, sharedActor }, serverLink as any);
-      // 5. subsession.start
-      handleWebCommand({ type: 'subsession.start', id: `new${agentType}`, sessionType: agentType, parentSession: 'deck_proj_brain', sharedActor }, serverLink as any);
-      // 6. subsession.restart
+      await flushAsync();
       handleWebCommand({ type: 'subsession.restart', sessionName: targetName, sharedActor }, serverLink as any);
-      handleWebCommand({ type: 'subsession.restart', sessionName: 'deck_sub_sh1', agentType: 'claude-code', sharedActor }, serverLink as any);
+      await flushAsync();
     }
-    await flushAsync();
-
-    expect(sendRawInputMock).not.toHaveBeenCalled();
-    expect(sendKeysMock).not.toHaveBeenCalled();
-    expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
-    expect(startProjectMock).not.toHaveBeenCalled();
-    expect(relaunchSessionWithSettingsMock).not.toHaveBeenCalled();
-    expect(startSubSessionMock).not.toHaveBeenCalled();
-    expect(launchTransportSessionMock).not.toHaveBeenCalled();
-    expect(timelineEmitMock).not.toHaveBeenCalledWith(expect.any(String), 'user.message', expect.anything());
-    expect(timelineEmitMock).toHaveBeenCalledWith('deck_sub_sh1', 'command.ack', expect.objectContaining({ status: 'error', error: 'participant_shell_forbidden' }));
-    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'session.error', message: 'participant_shell_forbidden' }));
-  });
-
-  it('allows owner shell/script operations and participant LLM session input/send/start', async () => {
-    // Owner input & start on shell
-    handleWebCommand({ type: 'session.input', sessionName: 'deck_sub_sh1', data: '\r' }, serverLink as any);
-    handleWebCommand({ type: 'subsession.start', id: 'ownsh', sessionType: 'shell', parentSession: 'deck_proj_brain' }, serverLink as any);
-    // Participant ESC interrupt on LLM process session
-    handleWebCommand({ type: 'session.input', sessionName: 'deck_proj_brain', data: '\x1b', sharedActor: TAB_PARTICIPANT }, serverLink as any);
-    // Participant start LLM sub-session
-    handleWebCommand({ type: 'subsession.start', id: 'pcc', sessionType: 'claude-code', parentSession: 'deck_proj_brain', sharedActor: TAB_PARTICIPANT }, serverLink as any);
-    await flushAsync();
-
-    expect(sendRawInputMock).toHaveBeenCalledWith('deck_sub_sh1', '\r');
-    expect(sendRawInputMock).toHaveBeenCalledWith('deck_proj_brain', '\x1b');
-    expect(startSubSessionMock).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => {
+      expect(sendRawInputMock).toHaveBeenCalledTimes(2);
+      expect(sendKeysDelayedEnterMock).toHaveBeenCalledTimes(2);
+      expect(startProjectMock).toHaveBeenCalledTimes(2);
+      expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(4);
+      expect(startSubSessionMock).toHaveBeenCalledTimes(2);
+    }, { timeout: 3000 });
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ message: 'participant_shell_forbidden' }));
   });
 
-  it('guards existing shell subsession.start targets, mixed-project restart before teardown, in-lock input race, and P2P targets', async () => {
-    // 1. Existing shell sub-session target even when cmd.sessionType spoofs codex-sdk -> rejected before launch
-    handleWebCommand({
-      type: 'subsession.start',
-      id: 'sh1',
-      sessionType: 'codex-sdk',
-      parentSession: 'deck_proj_brain',
-      sharedActor: SERVER_PARTICIPANT,
-    }, serverLink as any);
+  it('allows owner shell/script operations and participant mixed-project restart, recovery, and P2P shell targets', async () => {
+    relaunchSessionWithSettingsMock.mockResolvedValue(undefined);
+    startProjectMock.mockResolvedValue(undefined);
+    teardownProjectMock.mockResolvedValue(undefined);
 
-    // 2. Mixed project restart -> rejected BEFORE teardownProject / startProject; single LLM session restart succeeds
+    // Owner + participant shell operations succeed
+    handleWebCommand({ type: 'session.input', sessionName: 'deck_sub_sh1', data: '\r' }, serverLink as any);
+    handleWebCommand({ type: 'session.input', sessionName: 'deck_proj_brain', data: '\x1b', sharedActor: TAB_PARTICIPANT }, serverLink as any);
+    await flushAsync();
+    expect(sendRawInputMock).toHaveBeenCalledWith('deck_sub_sh1', '\r');
+    expect(sendRawInputMock).toHaveBeenCalledWith('deck_proj_brain', '\x1b');
+
+    // Mixed project restart succeeds for whole-server participant
     listSessionsMock.mockReturnValue([
       { name: 'deck_mix_brain', projectName: 'mix', role: 'brain', agentType: 'claude-code', projectDir: '/tmp/mix', state: 'idle' },
       { name: 'deck_mix_w1', projectName: 'mix', role: 'w1', agentType: 'shell', projectDir: '/tmp/mix', state: 'idle' },
@@ -220,57 +200,12 @@ describe('command-handler participant shell/script defense-in-depth', () => {
       project: 'mix',
       sharedActor: SERVER_PARTICIPANT,
     }, serverLink as any);
-    await flushAsync();
-
-    expect(teardownProjectMock).not.toHaveBeenCalled();
-    expect(startProjectMock).not.toHaveBeenCalled();
-    expect(launchTransportSessionMock).not.toHaveBeenCalled();
-    expect(startSubSessionMock).not.toHaveBeenCalled();
-
-    // Single LLM session restart in the mixed project still succeeds
-    getSessionMock.mockImplementation((name: string) => {
-      if (name === 'deck_mix_brain') return { name, projectName: 'mix', role: 'brain', agentType: 'claude-code', projectDir: '/tmp/mix', state: 'idle' };
-      return undefined;
+    await vi.waitFor(() => {
+      expect(teardownProjectMock).toHaveBeenCalledWith('mix');
+      expect(startProjectMock).toHaveBeenCalledTimes(1);
     });
-    handleWebCommand({
-      type: 'session.restart',
-      sessionName: 'deck_mix_brain',
-      sharedActor: SERVER_PARTICIPANT,
-    }, serverLink as any);
-    await flushAsync();
-    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
 
-    // 3. Race: handleInput starts on claude-code then session switches to shell before inside-mutex write
-    let calls = 0;
-    getSessionMock.mockImplementation((name: string) => {
-      if (name === 'deck_race_brain') {
-        calls += 1;
-        return {
-          name,
-          projectName: 'race',
-          role: 'brain',
-          agentType: calls === 1 ? 'claude-code' : 'shell',
-          projectDir: '/tmp/race',
-          state: 'idle',
-        };
-      }
-      return undefined;
-    });
-    handleWebCommand({
-      type: 'session.input',
-      sessionName: 'deck_race_brain',
-      data: 'ls\r',
-      sharedActor: SERVER_PARTICIPANT,
-    }, serverLink as any);
-    await flushAsync();
-    expect(sendRawInputMock).not.toHaveBeenCalled();
-
-    // 4. Structured P2P targets containing shell/script rejected before startP2pRun
-    getSessionMock.mockImplementation((name: string) => {
-      if (name === 'deck_proj_brain') return { name, projectName: 'proj', role: 'brain', agentType: 'claude-code', projectDir: '/tmp/proj', state: 'idle' };
-      if (name === 'deck_sub_sh1') return { name, projectName: 'proj', role: 'w1', agentType: 'shell', projectDir: '/tmp/proj', state: 'idle' };
-      return undefined;
-    });
+    // Structured P2P target pointing to shell sub-session succeeds for participant
     handleWebCommand({
       type: 'session.send',
       sessionName: 'deck_proj_brain',
@@ -280,99 +215,23 @@ describe('command-handler participant shell/script defense-in-depth', () => {
       sharedActor: SERVER_PARTICIPANT,
     }, serverLink as any);
     await vi.waitFor(() => {
-      expect(timelineEmitMock).toHaveBeenCalledWith('deck_proj_brain', 'command.ack', expect.objectContaining({
-        commandId: 'p2p-mix-cmd',
-        status: 'error',
-        error: 'participant_shell_forbidden',
-      }));
+      expect(startP2pRunMock).toHaveBeenCalledTimes(1);
     });
+    expect(startP2pRunMock.mock.calls[0]?.[0].targets).toEqual([{ session: 'deck_sub_sh1', mode: 'audit' }]);
 
-    // 5. Direct process session.send flips to shell before in-mutex write -> no terminal write & error ack
-    sendKeysMock.mockClear();
-    sendKeysDelayedEnterMock.mockClear();
-    timelineEmitMock.mockClear();
-    let sendRaceStage = 0;
-    getSessionMock.mockImplementation((name: string) => {
-      if (name === 'deck_sendrace_brain') {
-        sendRaceStage += 1;
-        return {
-          name,
-          projectName: 'sendrace',
-          role: 'brain',
-          // Entry guards + Step 2 inspect codex; inside-mutex beforeTyping sees shell
-          agentType: sendRaceStage <= 4 ? 'codex' : 'shell',
-          projectDir: '/tmp/sendrace',
-          state: 'idle',
-          runtimeType: 'process',
-        };
-      }
-      return undefined;
-    });
-    handleWebCommand({
-      type: 'session.send',
-      sessionName: 'deck_sendrace_brain',
-      text: 'hello',
-      commandId: 'direct-send-race-1',
-      sharedActor: SERVER_PARTICIPANT,
-    }, serverLink as any);
-    await vi.waitFor(() => {
-      expect(timelineEmitMock).toHaveBeenCalledWith('deck_sendrace_brain', 'command.ack', expect.objectContaining({
-        commandId: 'direct-send-race-1',
-        status: 'error',
-        error: 'participant_shell_forbidden',
-      }));
-    });
-    expect(sendKeysMock).not.toHaveBeenCalled();
-    expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
-
-    // Direct automation send abort propagates 'aborted' cleanly
-    let autoStage = 0;
-    getSessionMock.mockImplementation((name: string) => {
-      if (name === 'deck_autorace_brain') {
-        autoStage += 1;
-        return {
-          name,
-          projectName: 'autorace',
-          role: 'brain',
-          agentType: autoStage === 1 ? 'codex' : 'shell',
-          projectDir: '/tmp/autorace',
-          state: 'idle',
-          runtimeType: 'process',
-        };
-      }
-      return undefined;
-    });
-    const autoResult = await sendProcessSessionMessageForAutomation('deck_autorace_brain', 'ping', {
-      verbatim: true,
-      beforeTyping: () => getSessionMock('deck_autorace_brain')?.agentType !== 'shell',
-    });
-    expect(autoResult).toBe('aborted');
-    expect(sendKeysMock).not.toHaveBeenCalled();
-    expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
-
-    // 6. Shell tmux recovery after input error blocked for participant, preserved for owner
+    // Tmux recovery after input error works cleanly for participant on shell session too
     relaunchSessionWithSettingsMock.mockClear();
     sendRawInputMock.mockReset();
     serverLink.send.mockClear();
-    let recAgentType = 'claude-code';
-    getSessionMock.mockImplementation((name: string) => {
-      if (name === 'deck_recsh_brain') {
-        return {
-          name,
-          projectName: 'recsh',
-          role: 'brain',
-          agentType: recAgentType,
-          projectDir: '/tmp/recsh',
-          state: 'idle',
-        };
-      }
-      return undefined;
+    getSessionMock.mockReturnValue({
+      name: 'deck_recsh_brain',
+      projectName: 'recsh',
+      role: 'brain',
+      agentType: 'shell',
+      projectDir: '/tmp/recsh',
+      state: 'idle',
     });
-    sendRawInputMock.mockImplementationOnce(async () => {
-      // Simulate session transitioning / resolving to shell as tmux error occurs before catch recovery
-      recAgentType = 'shell';
-      throw new Error("can't find pane");
-    });
+    sendRawInputMock.mockRejectedValueOnce(new Error("can't find pane")).mockResolvedValueOnce(undefined);
     handleWebCommand({
       type: 'session.input',
       sessionName: 'deck_recsh_brain',
@@ -380,100 +239,16 @@ describe('command-handler participant shell/script defense-in-depth', () => {
       sharedActor: SERVER_PARTICIPANT,
     }, serverLink as any);
     await vi.waitFor(() => {
-      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
-        type: 'session.error',
-        sessionName: 'deck_recsh_brain',
-        message: 'participant_shell_forbidden',
-      }));
-    });
-    expect(relaunchSessionWithSettingsMock).not.toHaveBeenCalled();
-    expect(sendRawInputMock).toHaveBeenCalledTimes(1);
-
-    // Owner recovery still relaunches shell and retries sendRawInput
-    relaunchSessionWithSettingsMock.mockClear();
-    relaunchSessionWithSettingsMock.mockResolvedValue(undefined);
-    sendRawInputMock.mockReset();
-    getSessionMock.mockReturnValue({
-      name: 'deck_ownersh_brain',
-      projectName: 'ownersh',
-      role: 'brain',
-      agentType: 'shell',
-      projectDir: '/tmp/ownersh',
-      state: 'idle',
-    });
-    sendRawInputMock.mockRejectedValueOnce(new Error("can't find pane")).mockResolvedValueOnce(undefined);
-    handleWebCommand({
-      type: 'session.input',
-      sessionName: 'deck_ownersh_brain',
-      data: 'ls\r',
-    }, serverLink as any);
-    await vi.waitFor(() => {
       expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
       expect(sendRawInputMock).toHaveBeenCalledTimes(2);
     });
-  });
 
-  it('delivers mixed-domain P2P broadcasts only to LLM targets while rejecting explicit shell recipients and keeping owner control', async () => {
-    const mixBrain = { name: 'deck_mixbc_brain', projectName: 'mixbc', role: 'brain', agentType: 'claude-code', projectDir: '/tmp/mixbc', state: 'idle' };
-    const mixLlm = { name: 'deck_sub_mixllm', projectName: 'mixbc', role: 'w1', parentSession: 'deck_mixbc_brain', agentType: 'codex-sdk', projectDir: '/tmp/mixbc', state: 'idle' };
-    const mixShell = { name: 'deck_sub_mixsh', projectName: 'mixbc', role: 'w2', parentSession: 'deck_mixbc_brain', agentType: 'shell', projectDir: '/tmp/mixbc', state: 'idle' };
-    listSessionsMock.mockReturnValue([mixBrain, mixLlm, mixShell]);
-    getSessionMock.mockImplementation((name: string) => [mixBrain, mixLlm, mixShell].find((s) => s.name === name));
-
-    // Participant unbounded @@all & p2pMode (with config) deliver only to LLM (shell excluded from expandP2pTargets)
-    handleWebCommand({ type: 'session.send', sessionName: 'deck_mixbc_brain', text: '@@all(audit) review please', commandId: 'mix-all-1', sharedActor: SERVER_PARTICIPANT }, serverLink as any);
-    handleWebCommand({
-      type: 'session.send',
-      sessionName: 'deck_mixbc_brain',
-      text: 'review',
-      p2pMode: 'audit',
-      p2pSessionConfig: {
-        deck_sub_mixllm: { enabled: true, mode: 'audit' },
-        deck_sub_mixsh: { enabled: false, mode: 'audit' },
-      },
-      commandId: 'mix-mode-1',
-      sharedActor: SERVER_PARTICIPANT,
-    }, serverLink as any);
-    await vi.waitFor(() => {
-      expect(startP2pRunMock).toHaveBeenCalledTimes(2);
+    // Direct automation send abort via custom beforeTyping still propagates cleanly
+    const autoResult = await sendProcessSessionMessageForAutomation('deck_recsh_brain', 'ping', {
+      verbatim: true,
+      beforeTyping: () => false,
     });
-    for (const call of startP2pRunMock.mock.calls) {
-      expect(call[0].targets).toEqual([{ session: 'deck_sub_mixllm', mode: 'audit' }]);
-      expect(call[0].targets.some((t: { session: string }) => t.session === 'deck_sub_mixsh')).toBe(false);
-    }
-
-    // Explicit participant shell target rejected without startP2pRun
-    startP2pRunMock.mockClear();
-    timelineEmitMock.mockClear();
-    handleWebCommand({
-      type: 'session.send',
-      sessionName: 'deck_mixbc_brain',
-      text: 'review',
-      commandId: 'mix-explicit-sh',
-      p2pAtTargets: [{ session: 'deck_sub_mixsh', mode: 'audit' }],
-      sharedActor: SERVER_PARTICIPANT,
-    }, serverLink as any);
-    await vi.waitFor(() => {
-      expect(timelineEmitMock).toHaveBeenCalledWith('deck_mixbc_brain', 'command.ack', expect.objectContaining({
-        commandId: 'mix-explicit-sh',
-        status: 'error',
-        error: 'participant_shell_forbidden',
-      }));
-    });
-    expect(startP2pRunMock).not.toHaveBeenCalled();
-
-    // Owner explicit shell target still allowed
-    handleWebCommand({
-      type: 'session.send',
-      sessionName: 'deck_mixbc_brain',
-      text: 'review',
-      commandId: 'mix-owner-sh',
-      p2pAtTargets: [{ session: 'deck_sub_mixsh', mode: 'audit' }],
-    }, serverLink as any);
-    await vi.waitFor(() => {
-      expect(startP2pRunMock).toHaveBeenCalledTimes(1);
-    });
-    expect(startP2pRunMock.mock.calls[0]?.[0].targets).toEqual([{ session: 'deck_sub_mixsh', mode: 'audit' }]);
+    expect(autoResult).toBe('aborted');
   });
 
   it('invokes onAborted and continues draining queued automation messages when in-lock guard returns false', async () => {

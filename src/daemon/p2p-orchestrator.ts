@@ -15,10 +15,6 @@ import { detectStatusAsync } from '../agent/detect.js';
 import { getSession } from '../store/session-store.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { isShellLikeAgentType } from '../../shared/agent-types.js';
-import {
-  PARTICIPANT_SHELL_FORBIDDEN_REASON,
-  isParticipantSharedActorEnvelope,
-} from '../../shared/tab-sharing.js';
 import { getTransportRuntime, launchTransportSession, stopTransportRuntimeSession } from '../agent/session-manager.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import {
@@ -981,10 +977,6 @@ async function dispatchP2pPromptToSession(args: {
   allowDuplicate?: boolean;
   reason: string;
 }): Promise<P2pPromptDispatchResult> {
-  const targetRecord = getSession(args.session);
-  if (isParticipantSharedActorEnvelope(args.run.sharedActor) && isShellLikeAgentType(targetRecord?.agentType)) {
-    throw new Error(PARTICIPANT_SHELL_FORBIDDEN_REASON);
-  }
   const transportRuntime = await getOrRestoreP2pTransportRuntime(args.session);
   if (transportRuntime) {
     const commandId = buildP2pPromptCommandId(args.run, args.session, args.reason);
@@ -1013,22 +1005,11 @@ async function dispatchP2pPromptToSession(args: {
     throw new Error(`missing_transport_runtime:${args.session}`);
   }
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
-  let abortedReason: string | null = null;
   const sendResult = await sendProcessSessionMessageForAutomation(args.session, args.prompt, {
-    beforeTyping: () => {
-      if (isParticipantSharedActorEnvelope(args.run.sharedActor) && isShellLikeAgentType(getSession(args.session)?.agentType)) {
-        abortedReason = PARTICIPANT_SHELL_FORBIDDEN_REASON;
-        return false;
-      }
-      return true;
-    },
     onAborted: () => {
       if (args.run._cancelled || isTerminal(args.run.status)) return;
       const serverLink = activeRunServerLinks.get(args.run.id) ?? null;
-      const reason = abortedReason ?? (isParticipantSharedActorEnvelope(args.run.sharedActor)
-        ? PARTICIPANT_SHELL_FORBIDDEN_REASON
-        : 'aborted_before_typing');
-      failRun(args.run, 'dispatch_failed', reason, serverLink);
+      failRun(args.run, 'dispatch_failed', 'aborted_before_typing', serverLink);
     },
     userMessageMetadata: {
       ...(args.allowDuplicate ? { allowDuplicate: true } : {}),
@@ -1039,11 +1020,7 @@ async function dispatchP2pPromptToSession(args: {
     },
   });
   if (sendResult === 'aborted') {
-    throw new Error(
-      abortedReason ?? (isParticipantSharedActorEnvelope(args.run.sharedActor)
-        ? PARTICIPANT_SHELL_FORBIDDEN_REASON
-        : 'aborted_before_typing'),
-    );
+    throw new Error('aborted_before_typing');
   }
   return { mode: sendResult === 'queued' ? 'queued' : 'tmux' };
 }
@@ -1385,13 +1362,6 @@ export async function startP2pRun(...args:
   for (const t of targets) {
     if (extractMainSession(t.session) !== mainSession) {
       throw new Error(`Cross-domain P2P not supported: ${t.session} is not in ${mainSession}`);
-    }
-  }
-  if (isParticipantSharedActorEnvelope(opts.sharedActor)) {
-    const blockedRecipient = [initiatorSession, ...targets.map((t) => t.session)]
-      .find((session) => isShellLikeAgentType(getSession(session)?.agentType));
-    if (blockedRecipient) {
-      throw new Error(PARTICIPANT_SHELL_FORBIDDEN_REASON);
     }
   }
 
@@ -4269,12 +4239,6 @@ async function dispatchHop(
       queuedDispatch = dispatchResult.mode === 'queued';
       queuedCommandId = dispatchResult.commandId;
     } catch (err) {
-      if (err instanceof Error && err.message === PARTICIPANT_SHELL_FORBIDDEN_REASON) {
-        logger.warn({ runId: run.id, session, err }, 'P2P: hop dispatch blocked by participant shell policy');
-        await finishHop('failed', PARTICIPANT_SHELL_FORBIDDEN_REASON);
-        failRun(run, 'dispatch_failed', PARTICIPANT_SHELL_FORBIDDEN_REASON, serverLink);
-        return false;
-      }
       if (attempt < MAX_RETRIES) {
         logger.warn({ runId: run.id, session, attempt }, 'P2P: dispatch failed, will retry');
         await sleep(2_000);

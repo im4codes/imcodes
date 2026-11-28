@@ -1263,10 +1263,7 @@ export function SubSessionWindow({
         <div style={{ display: viewMode === 'terminal' ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}>
           {visible && (() => {
             const isShareScoped = !!sharedState && sharedState.outgoing !== true;
-            const terminalReadOnly = isShareScoped && (isShell || sharedState?.effectiveRole !== 'participant');
-            const terminalReadOnlyHint = isShareScoped && isShell
-              ? t('share.shell_participant_forbidden')
-              : undefined;
+            const terminalReadOnly = isShareScoped && sharedState?.effectiveRole !== 'participant';
             return (
               <TerminalView
                 sessionName={sub.sessionName}
@@ -1280,7 +1277,6 @@ export function SubSessionWindow({
                 onScrollBottomFn={onTermScrollBottomFn}
                 mobileInput={isShell && !terminalReadOnly}
                 readOnly={terminalReadOnly}
-                readOnlyHint={terminalReadOnlyHint}
                 onRestart={onRestart}
               />
             );

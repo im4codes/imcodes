@@ -10,7 +10,7 @@ import { patchSession, patchSubSession } from '../api.js';
 import { useSupervisorDefaults } from '../hooks/useSupervisorDefaults.js';
 import { readCachedTransportModels, supportsDynamicTransportModels, useTransportModels } from '../hooks/useTransportModels.js';
 import type { WsClient } from '../ws-client.js';
-import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, isShellLikeAgentType, type SessionAgentType } from '@shared/agent-types.js';
+import { CLAUDE_CODE_CLI_SDK_AGENT_TYPE, SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES, getSessionRuntimeType, type SessionAgentType } from '@shared/agent-types.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { AGY_DEFAULT_MODEL_ID, AGY_SDK_PROVIDER_ID, sanitizeAgyStartupModel } from '@shared/agy-agent.js';
@@ -71,8 +71,6 @@ interface Props {
   cwd: string;
   type: string;
   parentSession?: string | null;
-  /** True for shared-session / shared-server participants: prevents switching to shell/script. */
-  forbidShellAgentTypes?: boolean;
   /** UI hint only; Server/daemon remain the authority for automatic mode. */
   canControlAutomaticSupervision?: boolean;
   transportConfig?: Record<string, unknown> | null;
@@ -515,7 +513,6 @@ export function SessionSettingsDialog({
   onAddPoolSession,
   poolSessionDialogOpen = false,
   parentSession,
-  forbidShellAgentTypes = false,
   canControlAutomaticSupervision = false,
   openIntent,
   surface,
@@ -1195,11 +1192,10 @@ export function SessionSettingsDialog({
               onInput={(e) => setAgentType((e.target as HTMLSelectElement).value as SessionAgentType)}
               onChange={(e) => setAgentType((e.target as HTMLSelectElement).value as SessionAgentType)}
               style={{ width: '100%' }}
-              disabled={saving || (forbidShellAgentTypes && isShellLikeAgentType(agentType))}
+              disabled={saving}
             >
-              {SESSION_AGENT_TYPES.filter((value) => (isSessionAgentTypeSelectable(value) && !(forbidShellAgentTypes && isShellLikeAgentType(value))) || value === agentType).map((value) => {
-                const optionForbidden = forbidShellAgentTypes && isShellLikeAgentType(value);
-                const optionDisabled = !isSessionAgentTypeSelectable(value) || optionForbidden;
+              {SESSION_AGENT_TYPES.filter((value) => isSessionAgentTypeSelectable(value) || value === agentType).map((value) => {
+                const optionDisabled = !isSessionAgentTypeSelectable(value);
                 return (
                   <option key={value} value={value} disabled={optionDisabled} hidden={optionDisabled}>{renderTypeLabel(value)}</option>
                 );

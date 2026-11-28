@@ -3511,7 +3511,7 @@ describe('P2P orchestrator — parallel rounds', () => {
     await waitForNoRoundHopArtifacts(tempProjectDir, done.id);
   }, 25_000);
 
-  it('blocks shared participant P2P runs and queued hop dispatches targeting shell/script while allowing pure-LLM and owner runs', async () => {
+  it('allows shared participant P2P runs targeting shell/script sessions while preserving dispatch-time abort propagation', async () => {
     const participantActor = {
       actorUserId: 'user-p1',
       actorDisplayName: 'Participant',
@@ -3532,14 +3532,17 @@ describe('P2P orchestrator — parallel rounds', () => {
       },
     };
 
-    // 1. Mixed recipients (LLM + shell) rejected at startP2pRun with zero writes
+    // 1. Mixed recipients (LLM + shell) allowed for participant and both targets execute cleanly
     getSessionMock.mockImplementation((name: string) => {
       if (name === 'deck_proj_brain') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'brain', runtimeType: 'process', state: 'idle' };
       if (name === 'deck_proj_w1') return { agentType: 'codex', projectDir: tempProjectDir, parentSession: undefined, label: 'w1', runtimeType: 'process', state: 'idle' };
       if (name === 'deck_sub_sh1') return { agentType: 'shell', projectDir: tempProjectDir, parentSession: 'deck_proj_brain', label: 'sh1', runtimeType: 'process', state: 'idle' };
       return null;
     });
-    await expect(startP2pRun({
+    processSessionSendMock.mockImplementation(async (session: string, prompt: string) => {
+      await sendKeysDelayedEnterMock(session, prompt);
+    });
+    const mixRun = await startP2pRun({
       initiatorSession: 'deck_proj_brain',
       targets: [
         { session: 'deck_proj_w1', mode: 'audit' },
@@ -3549,82 +3552,18 @@ describe('P2P orchestrator — parallel rounds', () => {
       fileContents: [],
       serverLink: serverLinkMock as any,
       sharedActor: participantActor,
-    })).rejects.toThrow('participant_shell_forbidden');
-    expect(processSessionSendMock).not.toHaveBeenCalled();
-    expect(sendKeysDelayedEnterMock).not.toHaveBeenCalled();
+    });
+    const mixDone = await waitForStatus(mixRun.id, ['completed'], 15_000);
+    expect(mixDone.status).toBe('completed');
+    expect(processSessionSendMock.mock.calls.some(([sess]) => sess === 'deck_proj_w1')).toBe(true);
+    expect(processSessionSendMock.mock.calls.some(([sess]) => sess === 'deck_sub_sh1')).toBe(true);
 
-    // 2. Queued/subsequent hop flip to shell aborts with participant_shell_forbidden, and beforeTyping catches in-lock flip
-    let w1AgentType = 'codex';
-    getSessionMock.mockImplementation((name: string) => {
-      if (name === 'deck_proj_brain') return { agentType: 'claude-code', projectDir: tempProjectDir, parentSession: undefined, label: 'brain', runtimeType: 'process', state: 'idle' };
-      if (name === 'deck_proj_w1') return { agentType: w1AgentType, projectDir: tempProjectDir, parentSession: undefined, label: 'w1', runtimeType: 'process', state: 'idle' };
-      return null;
-    });
-    let w1DispatchCount = 0;
-    let beforeTypingWhileLlm: boolean | undefined;
-    let beforeTypingAfterFlipToShell: boolean | undefined;
-    processSessionSendMock.mockImplementation(async (session: string, prompt: string, opts?: { beforeTyping?: () => boolean }) => {
-      if (session === 'deck_proj_w1') {
-        w1DispatchCount += 1;
-        beforeTypingWhileLlm = opts?.beforeTyping?.();
-        w1AgentType = 'shell';
-        beforeTypingAfterFlipToShell = opts?.beforeTyping?.();
-      }
-      await sendKeysDelayedEnterMock(session, prompt);
-    });
-
-    const raceRun = await startP2pRun({
-      initiatorSession: 'deck_proj_brain',
-      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
-      rounds: 2,
-      userText: 'race flip to shell',
-      fileContents: [],
-      serverLink: serverLinkMock as any,
-      sharedActor: participantActor,
-    });
-    const raceDone = await waitForStatus(raceRun.id, ['failed'], 10_000);
-    expect(raceDone.error).toContain('participant_shell_forbidden');
-    expect(w1DispatchCount).toBe(1);
-    expect(beforeTypingWhileLlm).toBe(true);
-    expect(beforeTypingAfterFlipToShell).toBe(false);
-
-    // 2b. When dispatch-time lock abort (beforeTyping -> false -> 'aborted') fires cleanly, run fails immediately without marking tmux delivery
-    sendKeysDelayedEnterMock.mockClear();
-    w1AgentType = 'codex';
-    processSessionSendMock.mockImplementation(async (session: string, prompt: string, opts?: { beforeTyping?: () => boolean }) => {
-      if (session === 'deck_proj_w1') {
-        w1AgentType = 'shell';
-        if (opts?.beforeTyping && !opts.beforeTyping()) {
-          return 'aborted';
-        }
-      }
-      await sendKeysDelayedEnterMock(session, prompt);
-      return 'sent';
-    });
-    const abortedRun = await startP2pRun({
-      initiatorSession: 'deck_proj_brain',
-      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
-      userText: 'aborted inside beforeTyping',
-      fileContents: [],
-      serverLink: serverLinkMock as any,
-      sharedActor: participantActor,
-    });
-    const abortedDone = await waitForStatus(abortedRun.id, ['failed'], 10_000);
-    expect(abortedDone.error).toContain('participant_shell_forbidden');
-    expect(sendKeysDelayedEnterMock.mock.calls.some(([sess]) => sess === 'deck_proj_w1')).toBe(false);
-
-    // 2c. Queued onAborted fires asynchronously after beforeTyping already flipped to shell ->
-    //     settles run with failRun AND pushes terminal p2p.run_error over active serverLink without re-reading type
+    // 2. When dispatch-time abort fires inside automation send, queued onAborted fails run with aborted_before_typing
     sendKeysDelayedEnterMock.mockClear();
     serverLinkMock.send.mockClear();
-    w1AgentType = 'codex';
-    let capturedAbortOpts: { beforeTyping?: () => boolean; onAborted?: () => void } | undefined;
-    processSessionSendMock.mockImplementation(async (session: string, prompt: string, opts?: { beforeTyping?: () => boolean; onAborted?: () => void }) => {
+    let capturedAbortOpts: { onAborted?: () => void } | undefined;
+    processSessionSendMock.mockImplementation(async (session: string, prompt: string, opts?: { onAborted?: () => void }) => {
       if (session === 'deck_proj_w1') {
-        w1AgentType = 'shell';
-        expect(opts?.beforeTyping?.()).toBe(false);
-        // Simulate session type changing back before async onAborted fires (reason must stay captured from abort)
-        w1AgentType = 'codex';
         capturedAbortOpts = opts;
         return 'queued';
       }
@@ -3644,7 +3583,7 @@ describe('P2P orchestrator — parallel rounds', () => {
     });
     capturedAbortOpts!.onAborted!();
     const queuedAbortedDone = await waitForStatus(queuedAbortedRun.id, ['failed'], 10_000);
-    expect(queuedAbortedDone.error).toContain('participant_shell_forbidden');
+    expect(queuedAbortedDone.error).toContain('aborted_before_typing');
     expect(serverLinkMock.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'p2p.run_error',
       run: expect.objectContaining({
@@ -3653,36 +3592,20 @@ describe('P2P orchestrator — parallel rounds', () => {
       }),
     }));
 
-    // 3. Pure-LLM participant run & owner run with shell session succeed cleanly
+    // 3. Owner run with shell target continues to succeed cleanly
     processSessionSendMock.mockClear();
-    w1AgentType = 'codex';
     processSessionSendMock.mockImplementation(async (session: string, prompt: string) => {
       await sendKeysDelayedEnterMock(session, prompt);
     });
-
-    const pureLlmRun = await startP2pRun({
-      initiatorSession: 'deck_proj_brain',
-      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
-      userText: 'pure llm participant run',
-      fileContents: [],
-      serverLink: serverLinkMock as any,
-      sharedActor: participantActor,
-    });
-    const pureDone = await waitForStatus(pureLlmRun.id, ['completed'], 15_000);
-    expect(pureDone.status).toBe('completed');
-    expect(processSessionSendMock.mock.calls.some(([sess]) => sess === 'deck_proj_w1')).toBe(true);
-
-    processSessionSendMock.mockClear();
-    w1AgentType = 'shell';
     const ownerRun = await startP2pRun({
       initiatorSession: 'deck_proj_brain',
-      targets: [{ session: 'deck_proj_w1', mode: 'audit' }],
+      targets: [{ session: 'deck_sub_sh1', mode: 'audit' }],
       userText: 'owner run with shell target',
       fileContents: [],
       serverLink: serverLinkMock as any,
     });
     const ownerDone = await waitForStatus(ownerRun.id, ['completed'], 15_000);
     expect(ownerDone.status).toBe('completed');
-    expect(processSessionSendMock.mock.calls.some(([sess]) => sess === 'deck_proj_w1')).toBe(true);
+    expect(processSessionSendMock.mock.calls.some(([sess]) => sess === 'deck_sub_sh1')).toBe(true);
   }, 25_000);
 });

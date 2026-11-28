@@ -152,7 +152,7 @@ describe('ShareSessionDialog mobile 375x667 & desktop layout in Chromium', () =>
       });
       expect(warningRect.width).toBeLessThanOrEqual(375);
       expect(warningRect.height).toBeGreaterThan(60); // Wrapped Russian text
-      expect(warningRect.text).toContain('Предупреждение безопасности: Предоставление доступа к сессии');
+      expect(warningRect.text).toContain('Предупреждение высокого риска: Совместная работа позволяет участникам напрямую использовать Shell');
 
       // 2. Verify Submit button is visible on initial render (rect.bottom <= 667)
       const submitBtn = page.locator('.ask-dialog .ask-btn-submit');
@@ -180,17 +180,18 @@ describe('ShareSessionDialog mobile 375x667 & desktop layout in Chromium', () =>
       const radios = page.locator('.share-choice input[type="radio"]');
       await radios.nth(1).check(); // "Весь сервер"
       const warningServer = await warning.evaluate((el) => el.textContent);
-      expect(warningServer).toContain('Предупреждение безопасности: Предоставление доступа к этому устройству открывает полные права на него');
+      expect(warningServer).toContain('Предупреждение высокого риска: Совместная работа на этом компьютере/сервере');
 
       // Submit button must remain visible
       const submitAfterToggle = await submitBtn.evaluate((el) => el.getBoundingClientRect().bottom);
       expect(submitAfterToggle).toBeLessThanOrEqual(667);
 
-      // Select participant role: panel scrolls if needed, actions stay pinned
+      // Select participant role: panel scrolls if needed, actions stay pinned, warning escalates
       const participantRadio = page.locator('.share-choice input[type="radio"][value="participant"], .share-choice:has-text("Участник") input, .share-choice input').nth(3);
       await participantRadio.check();
       const trustDisclosure = page.locator('.share-trust-disclosure');
       await expect.poll(() => trustDisclosure.count()).toBe(1);
+      expect(await warning.evaluate((el) => el.classList.contains('is-participant'))).toBe(true);
 
       // Verify submit button is still visible above the fold
       const submitWithTrust = await submitBtn.evaluate((el) => el.getBoundingClientRect().bottom);

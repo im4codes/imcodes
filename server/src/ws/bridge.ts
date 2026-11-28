@@ -509,7 +509,6 @@ import {
 } from '../../../shared/daemon-auth.js';
 import {
   SHARE_REASONS,
-  SHELL_FORBIDDEN_SHARE_COMMANDS,
   buildSharedActorEnvelope,
   commandSessionName,
   evaluateShareCommand,
@@ -525,7 +524,6 @@ import {
   type ShareScopedSocketState,
   type ShareTarget,
 } from './share-policy.js';
-import { evaluateParticipantP2pShellRestriction } from '../share/p2p-send-scope.js';
 import {
   sanitizeP2pRunForPersistAndBroadcast,
   sanitizeP2pRunUpdateForBroadcast,
@@ -548,7 +546,6 @@ import {
   SESSION_GROUP_CLONE_MSG,
   SESSION_GROUP_CLONE_STATES,
   cloneP2pConfigWithSessionRemap,
-  isCloneableDirectChildState,
   mainSessionNameForProjectSlug,
   type SessionGroupCloneCleanupResource,
   type SessionGroupCloneEvent,
@@ -8456,31 +8453,15 @@ export class WsBridge {
       };
     }
     const sessionName = commandSessionName(msg);
-    const msgType = typeof msg.type === 'string' ? msg.type : '';
     // Only a cancel depends on the runtime type, so a keystroke never waits on it.
     const runtimeType = sessionName && msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL
       ? await this.resolveSessionRuntimeType(sessionName)
       : 'unknown';
-    let targetAgentType: string | null = null;
-    let targetAgentTypes: Array<string | null> | undefined;
-    if (SHELL_FORBIDDEN_SHARE_COMMANDS.has(msgType)) {
-      targetAgentTypes = await this.resolveExecutionTargetAgentTypes(msgType, msg);
-      targetAgentType = targetAgentTypes[0] ?? null;
-    }
-    const p2pForbiddenReason = msgType === 'session.send' && current.snapshot.effectiveRole === 'participant'
-      ? await evaluateParticipantP2pShellRestriction({
-        msg,
-        resolveAgentType: (name) => this.resolveSessionAgentType(name),
-      })
-      : null;
     const decision = evaluateShareCommand({
       msg,
       state: current,
       now: shareClockNow(),
       runtimeType,
-      targetAgentType,
-      targetAgentTypes,
-      p2pForbiddenReason,
       activeDispatchId: sessionName ? this.activeDispatchIds.get(sessionName) ?? null : null,
     });
     if (decision.allowed && sessionName && msg.type === 'session.send' && decision.stampedMessage) {
@@ -9214,109 +9195,6 @@ export class WsBridge {
     }
     const finalCached = this.resolveCachedSessionAgentType(sessionName);
     return finalCached.hit ? finalCached.agentType : null;
-  }
-
-  private async resolveExecutionTargetAgentTypes(
-    msgType: string,
-    msg: Record<string, unknown>,
-  ): Promise<Array<string | null>> {
-    const readNameField = (key: string): string | null => {
-      const value = msg[key];
-      return typeof value === 'string' && value.trim() ? value.trim() : null;
-    };
-    const normalizeSubName = (rawId: string | null): string | null => {
-      if (!rawId) return null;
-      return rawId.startsWith('deck_sub_') ? rawId : `deck_sub_${rawId}`;
-    };
-
-    if (msgType === 'session.input' || msgType === 'session.send') {
-      const target = readNameField('sessionName') ?? readNameField('session') ?? readNameField('sessionId');
-      return target ? [await this.resolveSessionAgentType(target)] : [];
-    }
-    if (msgType === 'subsession.start') {
-      const target = normalizeSubName(readNameField('id')) ?? readNameField('sessionName');
-      return target ? [await this.resolveSessionAgentType(target)] : [];
-    }
-    if (msgType === 'subsession.restart') {
-      const target = readNameField('sessionName') ?? normalizeSubName(readNameField('id'));
-      return target ? [await this.resolveSessionAgentType(target)] : [];
-    }
-    if (msgType === 'session.start') {
-      const rawProject = readNameField('project');
-      const target = rawProject
-        ? mainSessionNameForProjectSlug(sanitizeProjectName(rawProject))
-        : readNameField('sessionName');
-      return target ? [await this.resolveSessionAgentType(target)] : [];
-    }
-    if (msgType === 'session.restart') {
-      const explicitSession = readNameField('sessionName');
-      if (explicitSession) return [await this.resolveSessionAgentType(explicitSession)];
-      const rawProject = readNameField('project');
-      if (!rawProject) return [];
-      const projectSlug = sanitizeProjectName(rawProject);
-      const matchesProject = (candidate: string | null | undefined): boolean => (
-        candidate === rawProject
-        || (typeof candidate === 'string' && candidate.trim() ? sanitizeProjectName(candidate) === projectSlug : false)
-      );
-      const types: Array<string | null> = [];
-      const seen = new Set<string>();
-      for (const session of this.activeMainSessions.values()) {
-        if (matchesProject(session.project)) {
-          seen.add(session.name);
-          types.push(await this.resolveSessionAgentType(session.name));
-        }
-      }
-      if (this.db) {
-        try {
-          const rows = await this.db.query<{ name: string; agent_type: string | null }>(
-            "SELECT name, agent_type FROM sessions WHERE server_id = $1 AND (project_name = $2 OR project_name = $3) AND name NOT LIKE 'deck_sub_%'",
-            [this.serverId, rawProject, projectSlug],
-          );
-          for (const row of rows) {
-            if (!seen.has(row.name)) {
-              seen.add(row.name);
-              types.push((await this.resolveSessionAgentType(row.name)) ?? row.agent_type);
-            }
-          }
-        } catch {
-          // Best-effort project lookup; individual session checks still apply.
-        }
-      }
-      return types;
-    }
-    if (msgType === SESSION_GROUP_CLONE_MSG.START) {
-      const sourceMain = readNameField('sourceMainSessionName') ?? readNameField('sourceSessionName');
-      if (!sourceMain) return [];
-      const types: Array<string | null> = [await this.resolveSessionAgentType(sourceMain)];
-      const seen = new Set<string>([sourceMain]);
-      for (const sub of this.activeSubSessions.values()) {
-        if (sub.parentSession === sourceMain && isCloneableDirectChildState(sub.state)) {
-          seen.add(sub.name);
-          types.push(await this.resolveSessionAgentType(sub.name));
-        }
-      }
-      if (this.db) {
-        try {
-          const rows = await this.db.query<{ id: string; type: string | null; execution_clone_metadata?: Record<string, unknown> | string | null }>(
-            'SELECT id, type, execution_clone_metadata FROM sub_sessions WHERE server_id = $1 AND parent_session = $2 AND closed_at IS NULL',
-            [this.serverId, sourceMain],
-          );
-          for (const row of rows) {
-            if (isExecutionCloneRow({ execution_clone_metadata: row.execution_clone_metadata ?? null })) continue;
-            const subName = `deck_sub_${row.id}`;
-            if (seen.has(subName)) continue;
-            const liveSub = this.activeSubSessions.get(subName);
-            if (liveSub && !isCloneableDirectChildState(liveSub.state)) continue;
-            seen.add(subName);
-            types.push(liveSub?.agentType ?? row.type ?? await this.resolveSessionAgentType(subName));
-          }
-        } catch {
-          // Best-effort clone member lookup.
-        }
-      }
-      return types;
-    }
-    return [];
   }
 
   private async resolveSessionRuntimeType(sessionName: string): Promise<'process' | 'transport' | 'unknown'> {

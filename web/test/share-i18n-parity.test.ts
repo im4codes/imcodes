@@ -59,4 +59,23 @@ describe('share i18n parity', () => {
       expect(warning?.session, locale).not.toBe('share.warning.session');
     }
   });
+
+  it('defines non-empty trust and roleHelp copy without legacy AI-account or sandbox-limit disclaimers in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(
+        readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8'),
+      ) as {
+        share?: {
+          shell_participant_forbidden?: unknown;
+          trust?: { title?: unknown; body?: unknown };
+          roleHelp?: { viewer?: unknown; participant?: unknown };
+        };
+      };
+      expect(messages.share?.shell_participant_forbidden, locale).toBeUndefined();
+      expect(String(messages.share?.trust?.title ?? '').trim(), locale).not.toBe('');
+      expect(String(messages.share?.trust?.body ?? '').trim(), locale).not.toBe('');
+      expect(String(messages.share?.roleHelp?.viewer ?? '').trim(), locale).not.toBe('');
+      expect(String(messages.share?.roleHelp?.participant ?? '').trim(), locale).not.toBe('');
+    }
+  });
 });

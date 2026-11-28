@@ -179,7 +179,6 @@
     "menu": {
       "shareTab": "Collaborate"
     },
-    "shell_participant_forbidden": "Shared participants can only use AI agent sessions; shell and script sessions are owner-only.",
     "dialogTitle": "Collaborate",
     "dialogSubtitle": "Invite collaborators to work together on {{target}}.",
     "target": {
@@ -198,12 +197,12 @@
       "system": "System"
     },
     "roleHelp": {
-      "viewer": "Can view scoped state and join scoped discussion without driving the agent.",
-      "participant": "Can fully collaborate within the shared scope, including OpenSpec and new sub-sessions, but cannot close sessions."
+      "viewer": "Read-only: Can view scoped state and join scoped discussion without operating this machine or driving tools.",
+      "participant": "Real-time collaborator: Can operate Shell/script terminals, files, workspace tools, OpenSpec, and sub-sessions within the shared machine scope (cannot stop/close existing sessions)."
     },
     "trust": {
-      "title": "Participant trust disclosure",
-      "body": "Agents are not sandboxed. UI/API limits reduce direct controls, but a participant prompt can still influence an agent acting in its accessible environment."
+      "title": "High risk: Equivalent to Remote Desktop & full host control",
+      "body": "Participants are NOT isolated by an OS sandbox — they can execute commands in Shell/script terminals, access local files, and drive workspace tools or Remote Desktop directly on this host. Only collaborate with trusted teammates on dedicated non-personal development machines or servers, NEVER personal devices with private data."
     },
     "recipient": {
       "label": "Collaborator",
@@ -266,8 +265,8 @@
       "share-comment-invalid": "The comment could not be posted."
     },
     "warning": {
-      "device": "Security notice: Sharing this device grants full device permissions. Do not share devices containing private data — use only for shared development machines or similar non-private devices.",
-      "session": "Security notice: Sharing a session lets collaborators interact with this device's environment. Do not share sessions on devices containing private data — use only for shared development machines or similar non-private devices."
+      "device": "High-risk machine collaboration notice: Real-time collaboration on this computer/server is equivalent to Remote Desktop & terminal access with no OS sandbox. Never collaborate on a personal device containing private data — use only dedicated development machines or shared servers.",
+      "session": "High-risk collaboration notice: Real-time collaboration lets participants run Shell commands, edit files, and use tools directly in this machine's environment with no OS sandbox. Never use on a personal computer with private data — only dedicated dev machines or shared servers."
     }
   },
   "window": {
@@ -4434,8 +4433,8 @@
         "viewer": "Can view this node's presence and basic details, but cannot operate it.",
         "participant": "Can run commands, transfer files, and use computer control while execution is enabled."
       },
-      "trust_title": "Participant access can control this machine",
-      "trust_body": "Only share with someone you trust. Their actions run with the controlled node's privileges.",
+      "trust_title": "High risk: Participant can directly control this computer",
+      "trust_body": "Only collaborate with trusted teammates on dedicated non-personal dev machines or servers (never personal devices with private data). Actions run directly with this host's system privileges with no sandbox.",
       "view_only": "View only"
     },
     "copy_install_link": "Copy install link",

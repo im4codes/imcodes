@@ -183,7 +183,12 @@ export function ShareSessionDialog({
           <div class="share-dialog-subtitle">{t(variant === 'machine' ? 'controlled_nodes.share.subtitle' : 'share.dialogSubtitle', { target: targetLabel })}</div>
         </div>
 
-        <div class="share-security-warning" role="note" data-testid="share-security-warning">
+        <div
+          class={`share-security-warning${isParticipantRole(role) ? ' is-participant' : ''}`}
+          role="note"
+          data-testid="share-security-warning"
+        >
+          <span class="share-security-warning-icon" aria-hidden="true">⚠</span>
           <span>{t(isDeviceShare ? 'share.warning.device' : 'share.warning.session')}</span>
         </div>
 

@@ -1521,7 +1521,7 @@ describe('daemon session group clone', () => {
     expect(stopProjectMock).toHaveBeenCalledWith('cd_1', link);
   });
 
-  it('forbids shared participants from cloning groups containing shell/script members while allowing pure-LLM and owner clones', async () => {
+  it('allows shared participants and owners to clone groups containing shell/script members as well as pure-LLM groups', async () => {
     const dir = await makeDir('share-shell');
     const participantActor = {
       actorUserId: 'user-p1',
@@ -1533,7 +1533,7 @@ describe('daemon session group clone', () => {
       authorizedAt: 1000,
     };
 
-    // 1. Mixed group (LLM brain + active script sub-session) rejected for participant
+    // 1. Mixed group (LLM brain + active script sub-session) succeeds for participant
     sessions.set('deck_cd_brain', makeSession({
       name: 'deck_cd_brain',
       projectName: 'cd',
@@ -1559,11 +1559,13 @@ describe('daemon session group clone', () => {
       idempotencyKey: `idem-part-mix-${unique++}`,
       sharedActor: participantActor,
     }, link as never);
-    expect(sent.at(-1)).toMatchObject({ state: 'failed', errorCode: 'participant_shell_forbidden' });
-    expect(launchSessionMock).not.toHaveBeenCalled();
-    expect(startSubSessionMock).not.toHaveBeenCalled();
+    expect(sent.at(-1)?.state).toBe('succeeded');
+    expect(launchSessionMock).toHaveBeenCalledTimes(1);
+    expect(startSubSessionMock).toHaveBeenCalledTimes(1);
 
-    // 2. Shell main session rejected for participant
+    // 2. Shell main session clone succeeds for participant
+    launchSessionMock.mockClear();
+    startSubSessionMock.mockClear();
     sessions.delete('deck_sub_sc1');
     sessions.set('deck_sh_brain', makeSession({
       name: 'deck_sh_brain',
@@ -1579,10 +1581,12 @@ describe('daemon session group clone', () => {
       idempotencyKey: `idem-part-sh-${unique++}`,
       sharedActor: participantActor,
     }, link as never);
-    expect(sent.at(-1)).toMatchObject({ state: 'failed', errorCode: 'participant_shell_forbidden' });
-    expect(launchSessionMock).not.toHaveBeenCalled();
+    expect(sent.at(-1)?.state).toBe('succeeded');
+    expect(launchSessionMock).toHaveBeenCalledTimes(1);
 
     // 3. Pure LLM group succeeds for participant
+    launchSessionMock.mockClear();
+    startSubSessionMock.mockClear();
     sessions.set('deck_sub_llm1', makeSession({
       name: 'deck_sub_llm1',
       projectName: 'deck_sub_llm1',
