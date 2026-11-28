@@ -1,6 +1,6 @@
 import { AGY_NATIVE_SESSION_STATE as AG } from '../../shared/agy-agent.js';
 import { AgySdkProvider } from '../../src/agent/providers/agy-sdk.js';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { mkdir, symlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
@@ -283,6 +283,8 @@ import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transp
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 import { appendTransportEvent, replayTransportHistory } from '../../src/daemon/transport-history.js';
+import { clearTransportConversation } from '../../src/daemon/command-handler.js';
+import { countTokensAsync } from '../../src/context/tokenizer.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import {
   DEFAULT_SUPERVISION_BACKEND,
@@ -556,6 +558,10 @@ function makeRestoreSdkSubagentDetail(overrides: Partial<SdkSubagentDetail['meta
 
 describe('sdk transport session restore', () => {
   let tempDir: string;
+
+  beforeAll(async () => {
+    await countTokensAsync('warmup').catch(() => {});
+  });
 
   beforeEach(() => {
     mocks.store.clear();
@@ -3506,7 +3512,6 @@ describe('sdk transport session restore', () => {
   });
 
   it('invalidates an in-flight /handoff pack on clearTransportConversation and never resurrects it on later restore', async () => {
-    const { clearTransportConversation } = await import('../../src/daemon/command-handler.js');
     const name = 'deck_clear_inflight_handoff_brain';
     const record = {
       name,
@@ -3576,7 +3581,6 @@ describe('sdk transport session restore', () => {
   });
 
   it('clears a ready-pending /handoff pack on clearTransportConversation and keeps subsequent restore clean', async () => {
-    const { clearTransportConversation } = await import('../../src/daemon/command-handler.js');
     const name = 'deck_clear_ready_handoff_brain';
     const record = {
       name,
@@ -3704,6 +3708,7 @@ describe('sdk transport session restore', () => {
     const deadline = Date.now() + 5_000;
     while (!mocks.store.get(name)?.crossVendorHandoff?.pending && Date.now() < deadline) {
       await flush();
+      await new Promise((r) => setTimeout(r, 10));
     }
     expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).toContain('LATEST_SECOND_HANDOFF');
     expect(mocks.store.get(name)?.crossVendorHandoff?.pending?.text).not.toContain('STALE_FIRST_HANDOFF');
@@ -3715,6 +3720,7 @@ describe('sdk transport session restore', () => {
     const firstTurnDeadline = Date.now() + 5_000;
     while (!codexRunForSession(name, 'start')?.input.includes('turn one') && Date.now() < firstTurnDeadline) {
       await flush();
+      await new Promise((r) => setTimeout(r, 10));
     }
     expect(codexRunForSession(name, 'start')?.input).toContain('LATEST_SECOND_HANDOFF');
     expect(codexRunForSession(name, 'start')?.input).not.toContain('STALE_FIRST_HANDOFF');

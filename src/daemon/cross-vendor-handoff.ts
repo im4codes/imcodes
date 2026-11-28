@@ -116,7 +116,10 @@ export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff:
   const config = normalizeCrossVendorHandoffConfig(inputConfig);
   if (!config.enabled) return undefined;
   const buildStartedAt = Date.now();
-  const tokenizerReserveMs = Math.min(250, Math.max(20, Math.floor(config.timeoutMs * 0.15)));
+  const tokenizerReserveMs = Math.min(
+    Math.max(1, config.timeoutMs - 1),
+    Math.min(750, Math.max(50, Math.floor(config.timeoutMs * 0.25))),
+  );
   const tokenizerDeadlineAt = buildStartedAt + Math.max(1, config.timeoutMs - tokenizerReserveMs);
   let messages;
   try {
