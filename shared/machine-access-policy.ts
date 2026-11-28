@@ -11,9 +11,8 @@
  *   from any valid direct/group source. Participant access is the product's execute grant; viewers remain denied. The signed authority and canonical target binding
  *   prevent owner fallback or cross-target replay.
  *
- * Reading files is EXECUTE-class on purpose: the node's account can read credentials, keys and browser profiles, so "read any path"
- * is a privilege escalation for whoever holds it. Directory listing is the bounded exception for group participants: it powers the
- * shared remote-desktop picker without granting file fetch, upload, or command execution.
+ * Reading files and listing directories are EXECUTE-class: owners and effective participants (direct share or machine group)
+ * may invoke them when the node's exec switch is ON; viewers and unshared actors remain strictly denied.
  */
 import { COMPUTER_USE_TOOLS, isReadOnlyComputerUseTool, type ComputerUseToolName } from './computer-use.js';
 
@@ -81,7 +80,7 @@ export interface MachineAccessSubject {
   /** null = the actor has no operate access (not the owner / participant share / group member). */
   accessRole: 'owner' | 'participant' | 'viewer' | null;
   accessSource: MachineAccessSource | null;
-  /** The direct share row's exec_granted flag (group access is granted by accessSource=group). */
+  /** Retained for DB/API schema compatibility; effective participant role is the execute grant. */
   execGranted: boolean;
   /** The node's exec switch. */
   execEnabled: boolean;
@@ -103,12 +102,7 @@ export function evaluateMachineAction(subject: MachineAccessSubject, action: Mac
   if (!machineActionRequiresExecute(action)) return { allowed: true };
   if (subject.accessSource === MACHINE_ACCESS_SOURCE.OWNER && subject.accessRole === 'owner') return { allowed: true };
   if (subject.accessRole === 'participant') {
-    if (!subject.participantTurn) {
-      return { allowed: true };
-    }
-    return subject.execGranted === true
-      ? { allowed: true }
-      : { allowed: false, reason: MACHINE_DENIAL_REASON.EXECUTE_NOT_GRANTED };
+    return { allowed: true };
   }
   return { allowed: false, reason: MACHINE_DENIAL_REASON.EXECUTE_NOT_GRANTED };
 }

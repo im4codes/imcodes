@@ -707,7 +707,7 @@ describe('file-transfer upload route', () => {
     );
   });
 
-  it('allows a browser group participant to browse a controlled-node directory without exec_granted', async () => {
+  it('allows a group participant to browse a controlled-node directory without extra exec_granted', async () => {
     queryOneMock.mockResolvedValue({ user_id: 'owner-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'participant', access_source: 'group', exec_granted: false });
     sendFileTransferRequestMock.mockResolvedValueOnce({
       type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
@@ -736,8 +736,8 @@ describe('file-transfer upload route', () => {
     );
   });
 
-  it('allows an exec-granted group participant to browse a controlled-node directory', async () => {
-    queryOneMock.mockResolvedValue({ user_id: 'owner-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'participant', access_source: 'group', exec_granted: true });
+  it('allows a direct participant to browse a controlled-node directory without extra exec_granted', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'owner-1', node_role: 'controlled', exec_enabled: true, revoked_at: null, access_role: 'participant', access_source: 'share', exec_granted: false });
     sendFileTransferRequestMock.mockResolvedValueOnce({
       type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
       requestId: 'a'.repeat(32),
@@ -756,13 +756,18 @@ describe('file-transfer upload route', () => {
       resolvedPath: '__imcodes_windows_drives__',
       entries: [{ name: 'C:\\', path: 'C:\\', isDir: true, hidden: false }],
     });
-    expect(sendFileTransferRequestMock).toHaveBeenCalledWith(
-      'a'.repeat(32),
-      expect.objectContaining({ type: FILE_TRANSFER_MSG.DIRECTORY_LIST, path: ':drives:' }),
-      FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
-      undefined,
-      1,
-    );
+  });
+
+  it('denies directory browsing when the controlled node exec_enabled switch is off', async () => {
+    queryOneMock.mockResolvedValue({ user_id: 'owner-1', node_role: 'controlled', exec_enabled: false, revoked_at: null, access_role: 'participant', access_source: 'group', exec_granted: false });
+    const res = await makeApp().request('/api/server/controlled-1/machine-file-list', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer browser', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: ':drives:' }),
+    });
+    expect(res.status).toBe(403);
+    await expect(res.json()).resolves.toEqual({ error: 'exec_disabled' });
+    expect(sendFileTransferRequestMock).not.toHaveBeenCalled();
   });
 
   it('keeps an explicit viewer denied for controlled-node directory browsing', async () => {

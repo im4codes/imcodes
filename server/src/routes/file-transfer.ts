@@ -712,7 +712,7 @@ type ControlledTargetGate =
 
 /**
  * What each file capability DOES on the node. All file operations (fetch/send/handle and directory listing) are
- * EXECUTE-class and require explicit `exec_granted` for participants. A capability nobody mapped is treated as a write.
+ * EXECUTE-class and require an owner or effective participant with the node's exec switch ON. A capability nobody mapped is treated as a write.
  */
 const FILE_CAPABILITY_ACTION: Readonly<Record<string, MachineAction>> = {
   [FILE_TRANSFER_PATH_HANDLE_CAPABILITY]: MACHINE_ACTION.FILE_FETCH,

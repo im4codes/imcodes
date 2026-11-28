@@ -240,13 +240,12 @@ export async function listControlledMachines(
       displayName: r.display_name ?? r.node_id,
       online,
       nodeRole: NODE_ROLE.CONTROLLED,
-      // Actor-facing execute state must match the relay gate: group members,
-      // viewers, and participant shares without an explicit grant are false.
+      // Actor-facing execute state must match the relay gate: owner and any
+      // effective participant (direct share or machine group) follow exec_enabled; viewers are false.
       execEnabled: canExecute,
       accessRole: r.access_role,
-      // Operating is not executing: the browser is told whether THIS actor may run commands / move files on the device (an owner, or a
-      // participant share with the owner's execute grant), where the access comes from, and whether a grant is held. A turn that was
-      // started by a share participant cannot use exec_remote, but other actions follow its real grant.
+      // Operating vs executing: the browser is told whether THIS actor may run commands / move files on the device (an owner, or an
+      // effective participant from direct share or machine group), where the access comes from, and whether the DB flag is set.
       canExecute,
       execGranted: r.exec_granted === true,
       ...(r.can_rename === true && r.access_role !== 'owner' ? { canRename: true } : {}),

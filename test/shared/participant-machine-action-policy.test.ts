@@ -4,8 +4,8 @@ import { MACHINE_ACTION, MACHINE_ACCESS_SOURCE as S, MACHINE_DENIAL_REASON as D,
 const subjects: Array<[string, MachineAccessSubject, boolean, boolean]> = [
   ['owner', { accessRole: 'owner', accessSource: S.OWNER, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
   ['granted', { accessRole: 'participant', accessSource: S.SHARE, execGranted: true, execEnabled: true, participantTurn: true }, true, true],
-  ['participant without extra grant', { accessRole: 'participant', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, true, false],
-  ['group without grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: false, execEnabled: true, participantTurn: true }, true, false],
+  ['participant without extra grant', { accessRole: 'participant', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
+  ['group without grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: false, execEnabled: true, participantTurn: true }, true, true],
   ['group with execute grant', { accessRole: 'participant', accessSource: S.GROUP, execGranted: true, execEnabled: true, participantTurn: true }, true, true],
   ['viewer', { accessRole: 'viewer', accessSource: S.SHARE, execGranted: false, execEnabled: true, participantTurn: true }, false, false],
   ['revoked', { accessRole: null, accessSource: null, execGranted: true, execEnabled: true, participantTurn: true }, false, false],
@@ -17,8 +17,8 @@ describe.each(subjects)('%s real access', (_name, subject, mayView, mayExecute) 
       : mayExecute;
     const participantTurnDecision = evaluateMachineAction(subject, action);
     expect(participantTurnDecision.allowed).toBe(expected);
-    if (!expected && (subject.accessRole === 'owner' || subject.accessRole === 'participant')) {
-      expect(participantTurnDecision).toEqual({ allowed: false, reason: D.EXECUTE_NOT_GRANTED });
+    if (!expected && subject.accessRole === 'viewer') {
+      expect(participantTurnDecision).toEqual({ allowed: false, reason: D.NO_ACCESS });
     }
     const nonParticipantTurnExpected =
       subject.accessRole === 'participant'
@@ -30,6 +30,9 @@ describe.each(subjects)('%s real access', (_name, subject, mayView, mayExecute) 
     expect(ownerTurn.allowed).toBe(nonParticipantTurnExpected);
     const switchedOff = evaluateMachineAction({ ...subject, execEnabled: false }, action);
     expect(switchedOff.allowed).toBe(action === MACHINE_ACTION.LIST && mayView);
+    if (action !== MACHINE_ACTION.LIST && mayView) {
+      expect(switchedOff).toEqual({ allowed: false, reason: D.EXEC_DISABLED });
+    }
   });
 });
 it('computer shell is not exec_remote, unknown verbs retain execute-class grant checks', () => {
