@@ -437,6 +437,60 @@ describe('install journal persistence + resume (10.10)', () => {
     expect(recovered.installId).toBe(IDENTITY.installId);
   });
 
+  it('allows explicit identity rotation on re-enrollment while keeping staged path, abiProfile, serviceName immutable', async () => {
+    const elevated = await writeInstallPhase(path, 'elevated', { now: 1 });
+    const prepared = await writeInstallPhase(path, 'credential_prepared', {
+      now: 2,
+      previous: elevated,
+      ...IDENTITY,
+      abiProfile: CONTROLLED_NODE_ABI_GLIBC217,
+    });
+    const staged = await writeInstallPhase(path, 'files_staged', {
+      now: 3,
+      previous: prepared,
+      stagedExePath: '/var/lib/imcodes-node/bin',
+    });
+    const enrolled = await writeInstallPhase(path, 'enrolled', {
+      now: 4,
+      previous: staged,
+      serverId: 'srv-old',
+    });
+
+    const rotated = await writeInstallPhase(path, 'enrolled', {
+      now: 5,
+      previous: enrolled,
+      installId: 'inst-2',
+      nodeTokenHash: 'c'.repeat(64),
+      serverId: 'srv-new',
+      sourceExePath: '/tmp/new-installer',
+      allowIdentityRotation: true,
+    });
+    expect(rotated.installId).toBe('inst-2');
+    expect(rotated.nodeTokenHash).toBe('c'.repeat(64));
+    expect(rotated.serverId).toBe('srv-new');
+    expect(rotated.sourceExePath).toBe('/tmp/new-installer');
+    expect(rotated.abiProfile).toBe(CONTROLLED_NODE_ABI_GLIBC217);
+
+    // Still forbids changing stagedExePath or abiProfile even during rotation.
+    await expect(writeInstallPhase(path, 'enrolled', {
+      now: 6,
+      previous: rotated,
+      stagedExePath: '/tmp/hijack',
+      allowIdentityRotation: true,
+    })).rejects.toBeInstanceOf(InstallJournalTransitionError);
+
+    // Still forbids rotation before files_staged.
+    const path2 = join(dir, 'pre-stage.json');
+    const e2 = await writeInstallPhase(path2, 'elevated', { now: 1 });
+    const p2 = await writeInstallPhase(path2, 'credential_prepared', { now: 2, previous: e2, ...IDENTITY });
+    await expect(writeInstallPhase(path2, 'credential_prepared', {
+      now: 3,
+      previous: p2,
+      installId: 'inst-2',
+      allowIdentityRotation: true,
+    })).rejects.toBeInstanceOf(InstallJournalTransitionError);
+  });
+
   it('fsyncs the parent directory after atomic rename', async () => {
     await writeInstallPhase(path, 'elevated', { now: 1 });
     const parent = join(dir);

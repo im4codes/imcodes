@@ -253,8 +253,30 @@ function sameSourceArtifact(a: SourceArtifactIdentity, b: SourceArtifactIdentity
   return a.sha256 === b.sha256 && a.size === b.size;
 }
 
-function assertImmutableMetadata(existing: InstallJournal, patch: Partial<InstallJournal>): void {
-  for (const field of IMMUTABLE_JOURNAL_FIELDS) {
+const REENROLL_IMMUTABLE_JOURNAL_FIELDS = [
+  'abiProfile',
+  'stagedExePath',
+  'serviceName',
+] as const satisfies readonly (keyof InstallJournal)[];
+
+function assertImmutableMetadata(
+  existing: InstallJournal,
+  patch: Partial<InstallJournal>,
+  nextPhase: InstallPhase,
+  options: { allowIdentityRotation?: boolean } = {},
+): void {
+  const allowIdentityRotation = Boolean(options.allowIdentityRotation);
+  if (allowIdentityRotation) {
+    if (phaseIndex(existing.phase) < phaseIndex('files_staged') || phaseIndex(nextPhase) < phaseIndex('enrolled')) {
+      throw new InstallJournalTransitionError(
+        `install journal identity rotation invalid for transition ${existing.phase} -> ${nextPhase}`,
+      );
+    }
+  }
+  const fieldsToCheck = allowIdentityRotation
+    ? REENROLL_IMMUTABLE_JOURNAL_FIELDS
+    : IMMUTABLE_JOURNAL_FIELDS;
+  for (const field of fieldsToCheck) {
     const current = existing[field];
     const next = patch[field];
     if (current !== undefined && next !== undefined && current !== next) {
@@ -262,9 +284,11 @@ function assertImmutableMetadata(existing: InstallJournal, patch: Partial<Instal
     }
   }
 
-  // The artifact IS the identity, so it is absolutely immutable. A different
-  // package, a re-signed package, or any byte change lands here.
-  if (existing.sourceArtifact !== undefined && patch.sourceArtifact !== undefined
+  // The artifact IS the identity, so it is absolutely immutable unless an explicit
+  // re-enrollment replaces a revoked/re-targeted installation with a new installer.
+  if (!allowIdentityRotation
+    && existing.sourceArtifact !== undefined
+    && patch.sourceArtifact !== undefined
     && !sameSourceArtifact(existing.sourceArtifact, patch.sourceArtifact)) {
     throw new InstallJournalTransitionError('install journal immutable field changed: sourceArtifact');
   }
@@ -291,7 +315,9 @@ function assertImmutableMetadata(existing: InstallJournal, patch: Partial<Instal
   // `sourceExePath` may move, but only as a bounded, evidence-backed migration:
   // still inside the retry window, and only when the NEW download is byte-for-byte
   // the artifact this install already committed to. Anything else fails closed.
-  if (existing.sourceExePath !== undefined && patch.sourceExePath !== undefined
+  if (!allowIdentityRotation
+    && existing.sourceExePath !== undefined
+    && patch.sourceExePath !== undefined
     && existing.sourceExePath !== patch.sourceExePath) {
     if (phaseIndex(existing.phase) > phaseIndex(SOURCE_PATH_MIGRATION_LAST_PHASE)) {
       throw new InstallJournalTransitionError(
@@ -436,6 +462,7 @@ export async function writeInstallPhase(
     serviceStartRequestedAt?: number;
     cleanupStatus?: SourceCleanupStatus;
     healthyAt?: number;
+    allowIdentityRotation?: boolean;
     now: number;
     previous?: InstallJournal | null;
   },
@@ -476,7 +503,7 @@ export async function writeInstallPhase(
     cleanupStatus: extra.cleanupStatus,
     healthyAt: extra.healthyAt,
   };
-  assertImmutableMetadata(previous, patch);
+  assertImmutableMetadata(previous, patch, phase, { allowIdentityRotation: extra.allowIdentityRotation });
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const payload = mergeJournal(previous, patch);
   validateJournalMetadata(payload);

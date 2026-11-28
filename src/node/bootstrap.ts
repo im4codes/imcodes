@@ -19,8 +19,10 @@ import {
   openVerifiedEnrollmentSource,
   persistCredential,
   persistInstallIdentity,
+  probeControlledNodeCredentialStatus,
   redeemEnrollmentV2,
   type ControlledNodeCredential,
+  type ControlledNodeCredentialProbeStatus,
   type PendingInstallIdentity,
   type StagedExecutableReceipt,
   type VerifiedEnrollmentSource,
@@ -107,6 +109,11 @@ export interface ControlledNodeBootstrapDeps {
   generateInstallIdentity: () => PendingInstallIdentity;
   redeemEnrollmentV2: (blob: EnrollmentBlob, identity: PendingInstallIdentity) => Promise<ControlledNodeCredential>;
   persistCredential: (credential: ControlledNodeCredential) => Promise<void>;
+  /**
+   * Optional authoritative server validity probe used ONLY during non-stable
+   * installer re-runs when a fresh enrollment blob is present.
+   */
+  probeExistingCredential?: (credential: ControlledNodeCredential) => Promise<ControlledNodeCredentialProbeStatus>;
   installDefinition: (exePath: string) => Promise<ServiceReceipt>;
   inspectDefinition: (receipt: ServiceReceipt) => Promise<ServiceReceipt>;
   /**
@@ -189,6 +196,7 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     generateInstallIdentity: () => ({ ...generateInstallIdentity(), sourceExePath: sourceExecutablePath }),
     redeemEnrollmentV2: (blob, identity) => redeemEnrollmentV2(blob, identity),
     persistCredential: (credential) => persistCredential(credential, credentialPath),
+    probeExistingCredential: (credential) => probeControlledNodeCredentialStatus(credential),
     installDefinition: (exePath) => installDefinition(exePath),
     inspectDefinition: (receipt) => inspectDefinition(receipt),
     inspectServiceState: (receipt) => inspectServiceState(receipt),
@@ -733,47 +741,119 @@ async function reconcileStableServicePersistence(
   return journal;
 }
 
+function normalizeServerOriginForCompare(serverUrl: string): string {
+  try {
+    return new URL(serverUrl).origin.toLowerCase();
+  } catch {
+    return serverUrl.trim().replace(/\/+$/, '').toLowerCase();
+  }
+}
+
 /**
  * Stage this installer's own executable over the stable copy, unconditionally.
  *
  * Not the resume shortcut: a person who re-runs the installer is asking for
  * these bytes to be the ones that run, so a receipt that happens to still match
- * is not a reason to keep an older image. A package with no enrollment trailer
- * is not an installer and is left alone.
+ * is not a reason to keep an older image.
  */
-async function restageFromInstallerPackage(
+async function restageWithResolvedSource(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
+  resolved: ResolvedEnrollmentSource,
+  source: VerifiedEnrollmentSource,
 ): Promise<InstallJournal> {
-  let source: VerifiedEnrollmentSource | null = null;
-  try {
-    source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
-    const resolved = await resolveEnrollmentSource(deps, source);
-    if (!resolved) return journal;
-    const stagedReceipt = await source.stageTrailerFreeExecutable(
-      deps.stagedExecutablePath,
-      resolved.trailerStart,
-      resolved.windowsAuthenticode,
-    );
-    // Re-running the same package restages identical bytes. Rewriting the
-    // journal for that would churn the phase log and blur the one-phase-at-a-
-    // time crash-recovery reasoning for no gain.
-    const previous = journal.stagedReceipt;
-    if (previous
-      && previous.path === stagedReceipt.path
-      && previous.size === stagedReceipt.size
-      && previous.sha256 === stagedReceipt.sha256) {
-      return journal;
-    }
-    return await deps.writeInstallPhase(deps.journalPath, journal.phase, {
-      now: Math.max(deps.now, journal.updatedAt),
-      previous: journal,
-      stagedExePath: deps.stagedExecutablePath,
-      stagedReceipt,
-    });
-  } finally {
-    if (source) await source.close().catch(() => {});
+  const stagedReceipt = await source.stageTrailerFreeExecutable(
+    deps.stagedExecutablePath,
+    resolved.trailerStart,
+    resolved.windowsAuthenticode,
+  );
+  // Re-running the same package restages identical bytes. Rewriting the
+  // journal for that would churn the phase log and blur the one-phase-at-a-
+  // time crash-recovery reasoning for no gain.
+  const previous = journal.stagedReceipt;
+  if (previous
+    && previous.path === stagedReceipt.path
+    && previous.size === stagedReceipt.size
+    && previous.sha256 === stagedReceipt.sha256) {
+    return journal;
   }
+  return deps.writeInstallPhase(deps.journalPath, journal.phase, {
+    now: Math.max(deps.now, journal.updatedAt),
+    previous: journal,
+    stagedExePath: deps.stagedExecutablePath,
+    stagedReceipt,
+  });
+}
+
+function ensureBootstrapPortForwardTrust(
+  deps: ControlledNodeBootstrapDeps,
+): { portForwardIdentityPublicKey?: string; portForwardIdentityFingerprint?: string } {
+  if (!deps.portForwardStateDir) return {};
+  try {
+    const kp = loadOrCreatePortForwardIdentity(join(deps.portForwardStateDir, PORT_FORWARD_IDENTITY_BASENAME));
+    if (deps.trustedPeers && deps.trustedPeers.length > 0) {
+      applyTrustedPeerPins(deps.portForwardStateDir, deps.trustedPeers);
+    }
+    return {
+      portForwardIdentityPublicKey: kp.publicKeyB64,
+      portForwardIdentityFingerprint: computePortForwardIdentityFingerprint(kp.publicKeyB64),
+    };
+  } catch (err) {
+    if (deps.trustedPeers && deps.trustedPeers.length > 0) throw err;
+    return {};
+  }
+}
+
+async function reenrollExistingInstallation(
+  deps: ControlledNodeBootstrapDeps,
+  journal: InstallJournal,
+  resolved: ResolvedEnrollmentSource,
+  source: VerifiedEnrollmentSource,
+  publisherTrustError: string | undefined,
+): Promise<BootstrapResult> {
+  assertProductionServerUrl(resolved.blob.serverUrl);
+  const sourceArtifact = await deps.inspectSourceArtifact(deps.sourceExecutablePath);
+  const stagedReceipt = await source.stageTrailerFreeExecutable(
+    deps.stagedExecutablePath,
+    resolved.trailerStart,
+    resolved.windowsAuthenticode,
+  );
+  await deps.prepareCredentialDir();
+  const freshIdentity: PendingInstallIdentity = {
+    ...deps.generateInstallIdentity(),
+    sourceExePath: deps.sourceExecutablePath,
+  };
+  // Redeem BEFORE overwriting credential.json, install-identity.json, or
+  // install-journal.json so an expired/offline ticket leaves existing state intact.
+  const newCredential = await deps.redeemEnrollmentV2(resolved.blob, freshIdentity);
+  await deps.persistInstallIdentity(freshIdentity);
+  await deps.persistCredential(newCredential);
+
+  const cleanupStatus = journal.cleanupStatus && journal.cleanupStatus !== 'pending'
+    ? journal.cleanupStatus
+    : 'skipped';
+  journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
+    now: Math.max(deps.now, journal.updatedAt),
+    previous: journal,
+    installId: freshIdentity.installId,
+    nodeTokenHash: freshIdentity.nodeTokenHash,
+    serverId: newCredential.serverId,
+    stagedExePath: journal.stagedExePath ?? deps.stagedExecutablePath,
+    stagedReceipt,
+    sourceExePath: deps.sourceExecutablePath,
+    sourceArtifact,
+    cleanupStatus,
+    allowIdentityRotation: true,
+  });
+  const pfTrust = ensureBootstrapPortForwardTrust(deps);
+  journal = await ensureServiceStartRequested(deps, journal, { startService: true });
+  return {
+    credential: newCredential,
+    disposition: 'handoff_complete',
+    journal,
+    publisherTrustError,
+    ...pfTrust,
+  };
 }
 
 async function ensureServiceStartRequested(
@@ -855,25 +935,6 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
   }
   const stableRuntime = await deps.isStableRuntime(journal);
 
-function ensureBootstrapPortForwardTrust(
-  deps: ControlledNodeBootstrapDeps,
-): { portForwardIdentityPublicKey?: string; portForwardIdentityFingerprint?: string } {
-  if (!deps.portForwardStateDir) return {};
-  try {
-    const kp = loadOrCreatePortForwardIdentity(join(deps.portForwardStateDir, PORT_FORWARD_IDENTITY_BASENAME));
-    if (deps.trustedPeers && deps.trustedPeers.length > 0) {
-      applyTrustedPeerPins(deps.portForwardStateDir, deps.trustedPeers);
-    }
-    return {
-      portForwardIdentityPublicKey: kp.publicKeyB64,
-      portForwardIdentityFingerprint: computePortForwardIdentityFingerprint(kp.publicKeyB64),
-    };
-  } catch (err) {
-    if (deps.trustedPeers && deps.trustedPeers.length > 0) throw err;
-    return {};
-  }
-}
-
   if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
     // A transient maintenance failure on an already healthy stable runtime must
     // not turn the node into a watchdog crash loop; keep serving and retry on
@@ -907,30 +968,66 @@ function ensureBootstrapPortForwardTrust(
     if (phaseIndex(journal.phase) < phaseIndex('files_staged')) {
       throw new Error('controlled node credential exists before files_staged journal phase; manual recovery required');
     }
-    // Legitimate crash window: the credential fsync completed, but the enrolled
-    // journal write did not. Reconcile exactly one phase before service install.
-    if (journal.phase === 'files_staged') {
-      journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
-        now: deps.now,
-        previous: journal,
-        serverId: existing.serverId,
-      });
+    if (stableRuntime) {
+      if (journal.phase === 'files_staged') {
+        journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
+          now: deps.now,
+          previous: journal,
+          serverId: existing.serverId,
+        });
+      }
+      journal = await ensureServiceStartRequested(deps, journal, { startService: false });
+      return {
+        credential: existing,
+        disposition: 'run_runtime',
+        journal,
+        publisherTrustError,
+        ...ensureBootstrapPortForwardTrust(deps),
+      };
     }
-    // Re-running the downloaded installer means installing ITS bytes. Skipping
-    // that is how an enrolled machine whose stable image had drifted became
-    // permanently un-installable: staging was never reached, and the receipt
-    // check downstream refused every attempt with nothing left to try. Only the
-    // installer does this; the service must never rewrite the image it is
-    // executing from.
-    if (!stableRuntime) journal = await restageFromInstallerPackage(deps, journal);
-    journal = await ensureServiceStartRequested(deps, journal, { startService: !stableRuntime });
-    return {
-      credential: existing,
-      disposition: stableRuntime ? 'run_runtime' : 'handoff_complete',
-      journal,
-      publisherTrustError,
-      ...ensureBootstrapPortForwardTrust(deps),
-    };
+
+    let source: VerifiedEnrollmentSource | null = null;
+    try {
+      source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
+      const resolved = await resolveEnrollmentSource(deps, source);
+      if (resolved) {
+        const serverUrlChanged = normalizeServerOriginForCompare(existing.serverUrl)
+          !== normalizeServerOriginForCompare(resolved.blob.serverUrl);
+        let shouldReenroll = serverUrlChanged;
+        if (serverUrlChanged) {
+          deps.warn('controlled node enrollment serverUrl differs from existing credential; re-enrolling with fresh install identity');
+        } else if (deps.probeExistingCredential) {
+          const probeStatus = await deps.probeExistingCredential(existing);
+          if (probeStatus === 'revoked') {
+            shouldReenroll = true;
+            deps.warn('controlled node existing credential was revoked on server; re-enrolling with fresh install identity');
+          }
+        }
+        if (shouldReenroll) {
+          return await reenrollExistingInstallation(deps, journal, resolved, source, publisherTrustError);
+        }
+      }
+      if (journal.phase === 'files_staged') {
+        journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
+          now: deps.now,
+          previous: journal,
+          serverId: existing.serverId,
+        });
+      }
+      if (resolved) {
+        journal = await restageWithResolvedSource(deps, journal, resolved, source);
+      }
+      journal = await ensureServiceStartRequested(deps, journal, { startService: true });
+      return {
+        credential: existing,
+        disposition: 'handoff_complete',
+        journal,
+        publisherTrustError,
+        ...ensureBootstrapPortForwardTrust(deps),
+      };
+    } finally {
+      if (source) await source.close().catch(() => {});
+    }
   }
 
   let source: VerifiedEnrollmentSource | null = null;

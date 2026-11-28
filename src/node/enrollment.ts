@@ -817,6 +817,57 @@ export async function redeemEnrollmentV2(
   };
 }
 
+export type ControlledNodeCredentialProbeStatus = 'valid' | 'revoked' | 'unknown';
+
+export const CONTROLLED_NODE_CREDENTIAL_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Probe the relay server with an existing controlled-node credential so an
+ * installer re-run only rotates a definitively revoked credential (`401`) and
+ * preserves valid credentials on `2xx` or transient `5xx`/network/timeout.
+ */
+export async function probeControlledNodeCredentialStatus(
+  credential: Pick<ControlledNodeCredential, 'serverId' | 'token' | 'serverUrl'>,
+  fetchFn: typeof fetch = fetch,
+  timeoutMs = CONTROLLED_NODE_CREDENTIAL_PROBE_TIMEOUT_MS,
+): Promise<ControlledNodeCredentialProbeStatus> {
+  if (!credential.serverId || !credential.token) return 'revoked';
+  let expectedOrigin: string;
+  try {
+    expectedOrigin = allowedEnrollmentServerOrigin(credential.serverUrl);
+  } catch {
+    return 'unknown';
+  }
+  const probeUrl = new URL(`/api/server/${encodeURIComponent(credential.serverId)}/heartbeat`, expectedOrigin).toString();
+  try {
+    const response = await fetchFn(probeUrl, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${credential.token}`,
+        'content-type': 'application/json',
+      },
+      body: '{}',
+      redirect: 'error',
+      signal: AbortSignal.timeout(Math.max(1, timeoutMs)),
+    });
+    if (response.redirected) return 'unknown';
+    if (response.url) {
+      let responseOrigin: string;
+      try {
+        responseOrigin = new URL(response.url).origin;
+      } catch {
+        return 'unknown';
+      }
+      if (responseOrigin !== expectedOrigin) return 'unknown';
+    }
+    if (response.status === 401) return 'revoked';
+    if (response.ok) return 'valid';
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
 /** Copy the trailer-free executable prefix to a stable protected path. */
 export async function copyCleanExecutable(
   sourcePath: string,
