@@ -1,0 +1,7 @@
+{
+  "repository": "https://github.com/iFurySt/open-computer-use.git",
+  "version": "1.1.6",
+  "commit": "0da1c69712a64048136419c51aa80b0f68c59104",
+  "license": "MIT",
+  "minMacosVersion": "12.0"
+}

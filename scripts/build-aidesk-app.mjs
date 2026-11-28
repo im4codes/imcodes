@@ -19,6 +19,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AIDESK_ICONSET_ENTRIES } from './aidesk-icon.mjs';
+import { assertUniversalBinaryCompat } from './build-macos-legacy-open-computer-use.mjs';
 import { readMacosRemoteDesktopCodeIdentity } from './macos-remote-desktop-build.mjs';
 import product from '../shared/aidesk-product.json' with { type: 'json' };
 import fsDelegate from '../shared/macos-fs-delegate.json' with { type: 'json' };
@@ -31,6 +32,7 @@ export const AIDESK_APP_NAME = product.macosAppName;
 export const AIDESK_BUNDLE_ID = product.macosBundleId;
 export const AIDESK_MAIN_EXECUTABLE = 'aidesk-agent';
 export const AIDESK_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
+export const AIDESK_COMPUTER_USE_LEGACY_EXECUTABLE = 'OpenComputerUseLegacy';
 export const AIDESK_LOCAL_UI_EXECUTABLE = product.localUiExecutableName;
 
 /**
@@ -132,6 +134,8 @@ ${body}
 export function aideskSigningOrder(bundlePath) {
   return Object.freeze([
     join(bundlePath, 'Contents', AIDESK_HELPERS_DIR, AIDESK_COMPUTER_USE_EXECUTABLE),
+    ...(existsSync(join(bundlePath, 'Contents', AIDESK_HELPERS_DIR, AIDESK_COMPUTER_USE_LEGACY_EXECUTABLE))
+      ? [join(bundlePath, 'Contents', AIDESK_HELPERS_DIR, AIDESK_COMPUTER_USE_LEGACY_EXECUTABLE)] : []),
     ...(existsSync(join(bundlePath, 'Contents', AIDESK_HELPERS_DIR, AIDESK_LOCAL_UI_EXECUTABLE))
       ? [join(bundlePath, 'Contents', AIDESK_HELPERS_DIR, AIDESK_LOCAL_UI_EXECUTABLE)] : []),
     join(bundlePath, 'Contents', 'MacOS', AIDESK_MAIN_EXECUTABLE),
@@ -437,6 +441,26 @@ export async function buildAideskApp(input) {
   buildAideskAgent(join(macos, AIDESK_MAIN_EXECUTABLE), minimumSystemVersion);
   // Into Helpers, which is where the dispatcher looks.
   extractComputerUseExecutable(computerUseArchive, join(helpers, AIDESK_COMPUTER_USE_EXECUTABLE));
+  const stagedLegacyBinary = join(
+    root,
+    'dist-node-exe',
+    'computer-use-helper',
+    'darwin-universal',
+    AIDESK_COMPUTER_USE_LEGACY_EXECUTABLE,
+  );
+  const legacyBinary = input.legacyComputerUseBinary
+    ?? process.env.IMCODES_MACOS_LEGACY_OCU_BINARY?.trim()
+    ?? (existsSync(stagedLegacyBinary) ? stagedLegacyBinary : '');
+  const requireLegacy = process.env.IMCODES_REQUIRE_MACOS_LEGACY_OCU === '1'
+    || process.env.IMCODES_REQUIRE_MACOS_LEGACY_OCU === 'true';
+  if (legacyBinary) {
+    assertUniversalBinaryCompat({ binaryPath: legacyBinary, maxMinos: '12.0' });
+    const legacyOut = join(helpers, AIDESK_COMPUTER_USE_LEGACY_EXECUTABLE);
+    cpSync(legacyBinary, legacyOut);
+    sh('/bin/chmod', ['755', legacyOut]);
+  } else if (requireLegacy) {
+    throw new Error('IMCODES_MACOS_LEGACY_OCU_BINARY is required when IMCODES_REQUIRE_MACOS_LEGACY_OCU=1');
+  }
   const localUiExecutable = input.localUiExecutable
     ?? process.env.AIDESK_LOCAL_UI_EXECUTABLE?.trim();
   if (localUiExecutable) {

@@ -5,8 +5,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   installMacosAideskAppFromArchive,
   MACOS_AIDESK_APP_NAME,
+  MACOS_COMPUTER_USE_LEGACY_EXECUTABLE,
   macosComputerUseAppBundleForExecutable,
+  parseDarwinMajorVersion,
   prepareMacosComputerUseRuntime,
+  resolveMacosAideskHelperExecutable,
+  selectMacosOpenComputerUseExecutable,
   validateMacosComputerUseArchiveEntries,
   verifyMacosComputerUseExecutable,
   type MacosComputerUseRuntime,
@@ -31,13 +35,22 @@ async function writeExtractedApp(destinationRoot: string, executableBytes: strin
   await writeFile(join(app, 'Contents', 'MacOS', 'OpenComputerUse'), executableBytes, { mode: 0o755 });
 }
 
-async function writeExtractedAiDesk(destinationRoot: string, executableBytes: string): Promise<void> {
+async function writeExtractedAiDesk(
+  destinationRoot: string,
+  executableBytes: string,
+  options: { includeLegacyHelper?: boolean } = {},
+): Promise<void> {
   const app = join(destinationRoot, MACOS_AIDESK_APP_NAME);
   await mkdir(join(app, 'Contents', 'MacOS'), { recursive: true });
+  await mkdir(join(app, 'Contents', 'Helpers'), { recursive: true });
   await mkdir(join(app, 'Contents', '_CodeSignature'), { recursive: true });
   await writeFile(join(app, 'Contents', 'Info.plist'), '<plist>aidesk-signed</plist>');
   await writeFile(join(app, 'Contents', '_CodeSignature', 'CodeResources'), 'imcodes-developer-id-seal');
   await writeFile(join(app, 'Contents', 'MacOS', 'aidesk-agent'), executableBytes, { mode: 0o755 });
+  await writeFile(join(app, 'Contents', 'Helpers', 'OpenComputerUse'), 'official-ocu', { mode: 0o755 });
+  if (options.includeLegacyHelper) {
+    await writeFile(join(app, 'Contents', 'Helpers', MACOS_COMPUTER_USE_LEGACY_EXECUTABLE), 'legacy-ocu', { mode: 0o755 });
+  }
 }
 
 afterEach(async () => {
@@ -341,5 +354,68 @@ describe('macOS Computer Use runtime boundary', () => {
       verifyCodeSignature: async () => {},
       verifyAppBundle: async () => {},
     })).rejects.toThrow('computer_use_runtime_root_not_directory');
+  });
+
+  it('routes Darwin 21-22 (macOS 12-13) to OpenComputerUseLegacy and keeps Darwin >= 23 (macOS 14+) on official OpenComputerUse', async () => {
+    expect(parseDarwinMajorVersion('21.6.0')).toBe(21);
+    expect(parseDarwinMajorVersion('22.6.0')).toBe(22);
+    expect(parseDarwinMajorVersion('23.0.0')).toBe(23);
+    expect(parseDarwinMajorVersion('6.8.0-generic')).toBe(6);
+    expect(parseDarwinMajorVersion('')).toBeNull();
+
+    expect(selectMacosOpenComputerUseExecutable('21.6.0')).toBe('OpenComputerUseLegacy');
+    expect(selectMacosOpenComputerUseExecutable('22.6.0')).toBe('OpenComputerUseLegacy');
+    expect(selectMacosOpenComputerUseExecutable('23.0.0')).toBe('OpenComputerUse');
+    expect(selectMacosOpenComputerUseExecutable('24.5.0')).toBe('OpenComputerUse');
+    expect(selectMacosOpenComputerUseExecutable('25.2.0')).toBe('OpenComputerUse');
+
+    const dir = await tempDir();
+    await writeExtractedAiDesk(dir, 'aidesk-v1', { includeLegacyHelper: true });
+    const app = join(dir, MACOS_AIDESK_APP_NAME);
+    const officialHelper = join(app, 'Contents', 'Helpers', 'OpenComputerUse');
+    const legacyHelper = join(app, 'Contents', 'Helpers', 'OpenComputerUseLegacy');
+    expect(resolveMacosAideskHelperExecutable(app, '21.6.0')).toBe(legacyHelper);
+    expect(resolveMacosAideskHelperExecutable(app, '23.0.0')).toBe(officialHelper);
+    expect(macosComputerUseAppBundleForExecutable(officialHelper)).toBe(app);
+    expect(macosComputerUseAppBundleForExecutable(legacyHelper)).toBe(app);
+
+    const verify = vi.fn(async () => {});
+    await expect(verifyMacosComputerUseExecutable(join(app, 'Contents', 'MacOS', 'aidesk-agent'), verify, '21.6.0')).resolves.toBeUndefined();
+    await expect(verifyMacosComputerUseExecutable(legacyHelper, verify, '21.6.0')).resolves.toBeUndefined();
+    expect(verify).toHaveBeenCalledWith(app);
+
+    // Reject bundles missing OpenComputerUseLegacy on macOS 12-13, while allowing them on macOS 14+
+    const incompleteDir = await tempDir();
+    await writeExtractedAiDesk(incompleteDir, 'aidesk-v1', { includeLegacyHelper: false });
+    const incompleteExe = join(incompleteDir, MACOS_AIDESK_APP_NAME, 'Contents', 'MacOS', 'aidesk-agent');
+    await expect(verifyMacosComputerUseExecutable(incompleteExe, async () => {}, '21.6.0'))
+      .rejects.toThrow('macos_legacy_open_computer_use_helper_unavailable');
+    await expect(verifyMacosComputerUseExecutable(incompleteExe, async () => {}, '23.0.0'))
+      .resolves.toBeUndefined();
+
+    // prepareMacosComputerUseRuntime fails clearly on Darwin < 23 when OpenComputerUseLegacy is missing, and succeeds when present
+    const runtimeRoot = join(dir, 'rt');
+    const sourceNode = join(dir, 'node');
+    const sourceArchive = join(dir, 'ocu.zip');
+    await writeFile(sourceNode, 'node-v1', { mode: 0o755 });
+    await writeFile(sourceArchive, 'archive-v1');
+    await expect(prepareMacosComputerUseRuntime(sourceNode, sourceArchive, {
+      runtimeRoot,
+      darwinRelease: '21.6.0',
+      extractAppArchive: async (_archive, destination) => writeExtractedAiDesk(destination, 'aidesk-no-legacy', { includeLegacyHelper: false }),
+      verifyCodeSignature: async () => {},
+      verifyAppBundle: async () => {},
+    })).rejects.toThrow('macos_legacy_open_computer_use_helper_unavailable');
+
+    const okRuntime = await prepareMacosComputerUseRuntime(sourceNode, sourceArchive, {
+      runtimeRoot: join(dir, 'rt-ok'),
+      darwinRelease: '21.6.0',
+      extractAppArchive: async (_archive, destination) => writeExtractedAiDesk(destination, 'aidesk-with-legacy', { includeLegacyHelper: true }),
+      verifyCodeSignature: async () => {},
+      verifyAppBundle: async () => {},
+    });
+    expect(okRuntime.openComputerUseExecutable).toBe(
+      join(dir, 'rt-ok', MACOS_AIDESK_APP_NAME, 'Contents', 'MacOS', 'aidesk-agent'),
+    );
   });
 });

@@ -14,6 +14,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
+import { release } from 'node:os';
 import {
   controlledNodeComputerUseHelperFilename,
   CONTROLLED_NODE_OS_MAC,
@@ -29,12 +30,15 @@ export const MACOS_COMPUTER_USE_APP_NAME = 'Open Computer Use.app';
 export const MACOS_AIDESK_APP_NAME = AIDESK_MACOS_APP_NAME;
 
 const MACOS_COMPUTER_USE_EXECUTABLE = 'OpenComputerUse';
+export const MACOS_COMPUTER_USE_LEGACY_EXECUTABLE = 'OpenComputerUseLegacy';
 export const MACOS_AIDESK_EXECUTABLE = 'aidesk-agent';
 const MACOS_COMPUTER_USE_BUNDLE_ID = 'com.ifuryst.opencomputeruse';
 const MACOS_COMPUTER_USE_TEAM_ID = 'J9P29FA5BX';
 export const MACOS_AIDESK_BUNDLE_ID = AIDESK_MACOS_BUNDLE_ID;
 export const MACOS_AIDESK_TEAM_ID = 'M675E26Q67';
 const MACOS_COMPUTER_USE_SOURCE_DIGEST = '.open-computer-use-source.sha256';
+const MACOS_SONOMA_DARWIN_MAJOR = 23;
+const MACOS_MONTEREY_DARWIN_MAJOR = 21;
 
 export type MacosConsoleUser = MacosUserSession;
 
@@ -45,9 +49,33 @@ export interface MacosComputerUseRuntime {
 
 interface MacosComputerUseRuntimeOptions {
   runtimeRoot?: string;
+  darwinRelease?: string;
   verifyCodeSignature?: (path: string, deep: boolean) => Promise<void>;
   verifyAppBundle?: (path: string) => Promise<void>;
   extractAppArchive?: (archivePath: string, destinationRoot: string) => Promise<void>;
+}
+
+export function parseDarwinMajorVersion(darwinRelease: string = release()): number | null {
+  const match = /^(\d+)(?:\.|$)/.exec(darwinRelease.trim());
+  if (!match) return null;
+  const major = Number.parseInt(match[1]!, 10);
+  return Number.isSafeInteger(major) ? major : null;
+}
+
+export function selectMacosOpenComputerUseExecutable(
+  darwinRelease: string = release(),
+): typeof MACOS_COMPUTER_USE_EXECUTABLE | typeof MACOS_COMPUTER_USE_LEGACY_EXECUTABLE {
+  const major = parseDarwinMajorVersion(darwinRelease);
+  return major !== null && major >= MACOS_MONTEREY_DARWIN_MAJOR && major < MACOS_SONOMA_DARWIN_MAJOR
+    ? MACOS_COMPUTER_USE_LEGACY_EXECUTABLE
+    : MACOS_COMPUTER_USE_EXECUTABLE;
+}
+
+export function resolveMacosAideskHelperExecutable(
+  appPath: string,
+  darwinRelease: string = release(),
+): string {
+  return join(appPath, 'Contents', 'Helpers', selectMacosOpenComputerUseExecutable(darwinRelease));
 }
 
 function execFileText(file: string, args: readonly string[], timeoutMs = 15_000): Promise<string> {
@@ -107,20 +135,40 @@ export async function verifyMacosComputerUseAppBundle(path: string): Promise<voi
 export function macosComputerUseAppBundleForExecutable(executablePath: string): string | null {
   const appPath = dirname(dirname(dirname(resolve(executablePath))));
   const appName = basename(appPath);
-  const executable = appName === MACOS_AIDESK_APP_NAME
-    ? MACOS_AIDESK_EXECUTABLE
-    : appName === MACOS_COMPUTER_USE_APP_NAME
-      ? MACOS_COMPUTER_USE_EXECUTABLE
+  const resolved = resolve(executablePath);
+  if (appName === MACOS_AIDESK_APP_NAME) {
+    if (resolved === join(appPath, 'Contents', 'MacOS', MACOS_AIDESK_EXECUTABLE)
+      || resolved === join(appPath, 'Contents', 'Helpers', MACOS_COMPUTER_USE_EXECUTABLE)
+      || resolved === join(appPath, 'Contents', 'Helpers', MACOS_COMPUTER_USE_LEGACY_EXECUTABLE)) {
+      return appPath;
+    }
+    return null;
+  }
+  if (appName === MACOS_COMPUTER_USE_APP_NAME) {
+    return resolved === join(appPath, 'Contents', 'MacOS', MACOS_COMPUTER_USE_EXECUTABLE)
+      ? appPath
       : null;
-  if (!executable) return null;
-  return resolve(executablePath) === join(appPath, 'Contents', 'MacOS', executable)
-    ? appPath
-    : null;
+  }
+  return null;
+}
+
+async function assertLegacyHelperAvailableForBundle(appPath: string, darwinRelease?: string): Promise<void> {
+  if (selectMacosOpenComputerUseExecutable(darwinRelease) !== MACOS_COMPUTER_USE_LEGACY_EXECUTABLE) {
+    return;
+  }
+  if (basename(appPath) !== MACOS_AIDESK_APP_NAME) {
+    throw new Error('macos_legacy_open_computer_use_helper_unavailable');
+  }
+  const legacyHelperPath = join(appPath, 'Contents', 'Helpers', MACOS_COMPUTER_USE_LEGACY_EXECUTABLE);
+  if (!await isRegularFile(legacyHelperPath)) {
+    throw new Error('macos_legacy_open_computer_use_helper_unavailable');
+  }
 }
 
 export async function verifyMacosComputerUseExecutable(
   executablePath: string,
   verifyAppBundle: (path: string) => Promise<void> = verifyMacosComputerUseAppBundle,
+  darwinRelease?: string,
 ): Promise<void> {
   const appPath = macosComputerUseAppBundleForExecutable(executablePath);
   if (!appPath || !await isRegularFile(executablePath)) {
@@ -135,6 +183,7 @@ export async function verifyMacosComputerUseExecutable(
   } catch {
     throw new Error('signed_macos_open_computer_use_helper_authenticity_failed');
   }
+  await assertLegacyHelperAvailableForBundle(appPath, darwinRelease);
 }
 
 export function validateMacosComputerUseArchiveEntries(entries: readonly string[]): void {
@@ -196,7 +245,7 @@ async function readSourceDigest(path: string): Promise<string | null> {
 async function publishAppBundle(
   sourceArchive: string,
   runtimeRoot: string,
-  options: Required<Pick<MacosComputerUseRuntimeOptions, 'verifyAppBundle' | 'extractAppArchive'>>,
+  options: Required<Pick<MacosComputerUseRuntimeOptions, 'verifyAppBundle' | 'extractAppArchive'>> & Pick<MacosComputerUseRuntimeOptions, 'darwinRelease'>,
 ): Promise<string> {
   if (!await isRegularFile(sourceArchive)) throw new Error('computer_use_helper_not_installed');
   const sourceDigest = await sha256File(sourceArchive);
@@ -210,9 +259,10 @@ async function publishAppBundle(
       if (!await isRegularFile(join(existing, 'Contents', 'MacOS', executable))) continue;
       try {
         await options.verifyAppBundle(existing);
+        await assertLegacyHelperAvailableForBundle(existing, options.darwinRelease);
         return existing;
       } catch {
-        // A matching archive digest never authorizes an invalid or replaced app.
+        // A matching archive digest never authorizes an invalid or legacy-incomplete app.
       }
     }
   }
@@ -242,6 +292,7 @@ async function publishAppBundle(
       throw new Error('computer_use_helper_not_installed');
     }
     await options.verifyAppBundle(extractedApp);
+    await assertLegacyHelperAvailableForBundle(extractedApp, options.darwinRelease);
 
     let movedExisting = false;
     let publishedNew = false;
@@ -337,7 +388,11 @@ export async function prepareMacosComputerUseRuntime(
   await verifyCodeSignature(helperExecutable, false);
 
   if (sourceOpenComputerUseArchive) {
-    appPath = await publishAppBundle(sourceOpenComputerUseArchive, runtimeRoot, { verifyAppBundle, extractAppArchive });
+    appPath = await publishAppBundle(sourceOpenComputerUseArchive, runtimeRoot, {
+      verifyAppBundle,
+      extractAppArchive,
+      darwinRelease: options.darwinRelease,
+    });
     await publishFile(
       sourceOpenComputerUseArchive,
       join(runtimeRoot, controlledNodeComputerUseHelperFilename(CONTROLLED_NODE_OS_MAC)),
@@ -356,6 +411,7 @@ export async function prepareMacosComputerUseRuntime(
     if (!existing) throw new Error('computer_use_helper_not_installed');
     appPath = existing;
     await verifyAppBundle(existing);
+    await assertLegacyHelperAvailableForBundle(existing, options.darwinRelease);
   }
 
   const openComputerUseExecutable = join(

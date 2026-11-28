@@ -125,6 +125,14 @@ jobs:
           version: ${{ env.IMCODES_BUILD_VERSION }}
           windows-signing-cert-thumbprint: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_THUMBPRINT }}
           windows-signing-cert-sha256: ${{ env.IMCODES_WINDOWS_SIGNING_CERT_SHA256 }}
+      - name: Build macOS 12+ legacy OpenComputerUse helper
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          LEGACY_BIN="$RUNNER_TEMP/ocu-legacy/OpenComputerUseLegacy"
+          node scripts/build-macos-legacy-open-computer-use.mjs --out "$LEGACY_BIN"
+          echo "IMCODES_MACOS_LEGACY_OCU_BINARY=$LEGACY_BIN" >> "$GITHUB_ENV"
+          echo "IMCODES_REQUIRE_MACOS_LEGACY_OCU=1" >> "$GITHUB_ENV"
       - name: Build controlled-node executable
         run: npm run build:node-exe
       - name: Notarize macOS controlled-node executable

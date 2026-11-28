@@ -1,0 +1,124 @@
+diff --git a/Package.swift b/Package.swift
+index 12c55dd..2240b0b 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -5,7 +5,7 @@ import PackageDescription
+ let package = Package(
+     name: "OpenComputerUse",
+     platforms: [
+-        .macOS(.v14),
++        .macOS(.v12),
+     ],
+     products: [
+         .executable(name: "OCULockInstaller", targets: ["OCULockInstaller"]),
+@@ -72,12 +72,18 @@ let package = Package(
+         .target(
+             name: "OpenComputerUseKit",
+             dependencies: ["OpenComputerUseVirtualDisplayShim", "LockedUseNative", .product(name: "libwebp", package: "libwebp-Xcode")],
+-            path: "packages/OpenComputerUseKit/Sources/OpenComputerUseKit"
++            path: "packages/OpenComputerUseKit/Sources/OpenComputerUseKit",
++            linkerSettings: [
++                .unsafeFlags(["-Xlinker", "-weak_framework", "-Xlinker", "ScreenCaptureKit"]),
++            ]
+         ),
+         .executableTarget(
+             name: "OpenComputerUse",
+             dependencies: ["OpenComputerUseKit"],
+-            path: "apps/OpenComputerUse/Sources/OpenComputerUse"
++            path: "apps/OpenComputerUse/Sources/OpenComputerUse",
++            linkerSettings: [
++                .unsafeFlags(["-Xlinker", "-weak_framework", "-Xlinker", "ScreenCaptureKit"]),
++            ]
+         ),
+         .executableTarget(
+             name: "OpenComputerUseFixture",
+diff --git a/apps/OpenComputerUse/Sources/OpenComputerUse/PermissionOnboardingApp.swift b/apps/OpenComputerUse/Sources/OpenComputerUse/PermissionOnboardingApp.swift
+index 6f2f740..c59a25f 100644
+--- a/apps/OpenComputerUse/Sources/OpenComputerUse/PermissionOnboardingApp.swift
++++ b/apps/OpenComputerUse/Sources/OpenComputerUse/PermissionOnboardingApp.swift
+@@ -540,7 +540,8 @@ final class PermissionAccessoryPanelController {
+     private var trackingTimer: Timer?
+     private var pendingSourceFrameInScreen: CGRect?
+     private var didPresentCurrentPanel = false
+-    private var launchDisplayLink: CADisplayLink?
++    private var launchDisplayLinkStorage: AnyObject?
++    private var launchFallbackTimer: Timer?
+     private var launchStartTime: CFTimeInterval = 0
+     private var launchFromFrame = NSRect.zero
+     private var launchToFrame = NSRect.zero
+@@ -798,12 +799,23 @@ final class PermissionAccessoryPanelController {
+         panel.order(.above, relativeTo: windowContext.windowNumber)
+         stepLaunchAnimation()
+ 
+-        let displayLink = panel.displayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
+-        displayLink.add(to: .main, forMode: .common)
+-        launchDisplayLink = displayLink
++        if #available(macOS 14.0, *) {
++            let displayLink = panel.displayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
++            displayLink.add(to: .main, forMode: .common)
++            launchDisplayLinkStorage = displayLink
++        } else {
++            let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
++                Task { @MainActor [weak self] in
++                    self?.stepLaunchAnimation()
++                }
++            }
++            RunLoop.main.add(timer, forMode: .common)
++            launchFallbackTimer = timer
++        }
+         scheduleLaunchSettlePasses(for: launchSettleGeneration)
+     }
+ 
++    @available(macOS 14.0, *)
+     @objc
+     private func displayLinkDidFire(_ displayLink: CADisplayLink) {
+         stepLaunchAnimation()
+@@ -838,8 +850,12 @@ final class PermissionAccessoryPanelController {
+ 
+     private func stopLaunchAnimation() {
+         isAnimatingLaunch = false
+-        launchDisplayLink?.invalidate()
+-        launchDisplayLink = nil
++        if #available(macOS 14.0, *) {
++            (launchDisplayLinkStorage as? CADisplayLink)?.invalidate()
++        }
++        launchDisplayLinkStorage = nil
++        launchFallbackTimer?.invalidate()
++        launchFallbackTimer = nil
+     }
+ 
+     private func updateLaunchTargetFrameIfNeeded() {
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift
+index 1e3be1d..2da72e7 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/AccessibilitySnapshot.swift
+@@ -645,7 +645,15 @@ private struct WindowCapture {
+     }
+ 
+     private static func captureImageWithScreenCaptureKit(windowID: CGWindowID, bounds: CGRect, config: ImageCaptureConfig) -> CGImage? {
+-        try? BlockingAsyncBridge.run(timeout: config.captureTimeout) {
++        guard #available(macOS 14.0, *) else {
++            return CGWindowListCreateImage(
++                .null,
++                .optionIncludingWindow,
++                windowID,
++                [.boundsIgnoreFraming, .bestResolution]
++            )
++        }
++        return try? BlockingAsyncBridge.run(timeout: config.captureTimeout) {
+             let shareableContent = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+             guard let window = shareableContent.windows.first(where: { $0.windowID == windowID }) else {
+                 return nil
+diff --git a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/SoftwareCursorOverlay.swift b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/SoftwareCursorOverlay.swift
+index 3d3928b..9d13100 100644
+--- a/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/SoftwareCursorOverlay.swift
++++ b/packages/OpenComputerUseKit/Sources/OpenComputerUseKit/SoftwareCursorOverlay.swift
+@@ -1068,7 +1068,7 @@ private final class SoftwareCursorView: NSView {
+         super.draw(dirtyRect)
+ 
+         NSColor.clear.setFill()
+-        dirtyRect.fill()
++        NSBezierPath(rect: dirtyRect).fill()
+ 
+         guard let context = NSGraphicsContext.current?.cgContext else {
+             return

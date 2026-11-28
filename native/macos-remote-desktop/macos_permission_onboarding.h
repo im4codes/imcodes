@@ -11,6 +11,13 @@ inline constexpr char kMacosRemoteDesktopWorkerBundleIdentifier[] =
     "to.aidesk.app";
 inline constexpr char kAiDeskMainExecutableName[] = "aidesk-agent";
 inline constexpr char kAiDeskComputerUseHelperName[] = "OpenComputerUse";
+inline constexpr char kAiDeskComputerUseLegacyHelperName[] =
+    "OpenComputerUseLegacy";
+
+// Selects the official macOS 14+ helper on Darwin >= 23, and the dedicated
+// macOS 12–13 compat build on Darwin 21–22.
+[[nodiscard]] const char* SelectComputerUseHelperNameForDarwinRelease(
+    const char* darwin_release) noexcept;
 
 // The argument that marks a launch-agent start. Declared here, with the
 // dispatch that reads it, so the product has one definition of the string

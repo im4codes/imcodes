@@ -19,6 +19,7 @@
 #include <spawn.h>
 #include <sysexits.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -171,8 +172,13 @@ bool LeadingComponentDirectory(int argc, const char* const argv[],
 
 const char* HelperFileName(AiDeskProductHelper helper) noexcept {
   switch (helper) {
-    case AiDeskProductHelper::kComputerUse:
+    case AiDeskProductHelper::kComputerUse: {
+      struct utsname system_info = {};
+      if (::uname(&system_info) == 0) {
+        return SelectComputerUseHelperNameForDarwinRelease(system_info.release);
+      }
       return kAiDeskComputerUseHelperName;
+    }
     case AiDeskProductHelper::kRemoteDesktopWorker:
       return "imcodes-remote-desktop-worker";
     case AiDeskProductHelper::kRemoteDesktopLaunchAgent:
@@ -397,6 +403,20 @@ void StartPermissionRegistrationInBackground() noexcept {
 
 void PrepareMacosPermissionResponsibleApplication() noexcept {
   PrepareResponsibleApplication(false);
+}
+
+const char* SelectComputerUseHelperNameForDarwinRelease(
+    const char* darwin_release) noexcept {
+  if (darwin_release == nullptr || *darwin_release == '\0') {
+    return kAiDeskComputerUseHelperName;
+  }
+  errno = 0;
+  char* end = nullptr;
+  const long major = std::strtol(darwin_release, &end, 10);
+  if (errno == 0 && end != darwin_release && major >= 21 && major < 23) {
+    return kAiDeskComputerUseLegacyHelperName;
+  }
+  return kAiDeskComputerUseHelperName;
 }
 
 AiDeskProductHelper SelectAiDeskProductHelper(

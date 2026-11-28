@@ -12,6 +12,7 @@ import {
   AIDESK_ARCHITECTURES,
   AIDESK_BUNDLE_ID,
   AIDESK_COMPUTER_USE_EXECUTABLE,
+  AIDESK_COMPUTER_USE_LEGACY_EXECUTABLE,
   AIDESK_THIRD_PARTY_LICENSE,
   AIDESK_MAIN_EXECUTABLE,
   AIDESK_LOCAL_UI_EXECUTABLE,
@@ -107,16 +108,28 @@ describe('aiDesk application bundle', () => {
     expect(aideskSigningOrder('/x')[0]).toContain('/Contents/Helpers/');
   });
 
-  it('signs the optional native local UI before sealing the containing app', () => {
+  it('signs the optional native local UI and legacy OpenComputerUse helper before sealing the containing app', () => {
     const directory = mkdtempSync(join(tmpdir(), 'imcodes-aidesk-ui-signing-'));
     const bundle = join(directory, AIDESK_APP_NAME);
     const helpers = join(bundle, 'Contents', 'Helpers');
     try {
       mkdirSync(helpers, { recursive: true });
       writeFileSync(join(helpers, AIDESK_LOCAL_UI_EXECUTABLE), 'fixture');
+      writeFileSync(join(helpers, AIDESK_COMPUTER_USE_LEGACY_EXECUTABLE), 'legacy-fixture');
       const order = aideskSigningOrder(bundle);
-      expect(order.indexOf(join(helpers, AIDESK_LOCAL_UI_EXECUTABLE))).toBeGreaterThan(-1);
+      const officialIdx = order.indexOf(join(helpers, AIDESK_COMPUTER_USE_EXECUTABLE));
+      const legacyIdx = order.indexOf(join(helpers, AIDESK_COMPUTER_USE_LEGACY_EXECUTABLE));
+      const uiIdx = order.indexOf(join(helpers, AIDESK_LOCAL_UI_EXECUTABLE));
+      const agentIdx = order.indexOf(join(bundle, 'Contents', 'MacOS', AIDESK_MAIN_EXECUTABLE));
+      expect(officialIdx).toBeGreaterThan(-1);
+      expect(legacyIdx).toBeGreaterThan(officialIdx);
+      expect(uiIdx).toBeGreaterThan(legacyIdx);
+      expect(agentIdx).toBeGreaterThan(uiIdx);
       expect(order.at(-1)).toBe(bundle);
+
+      const source = readSource('scripts/build-aidesk-app.mjs');
+      expect(source).toContain("assertUniversalBinaryCompat({ binaryPath: legacyBinary, maxMinos: '12.0' })");
+      expect(source).toContain('IMCODES_REQUIRE_MACOS_LEGACY_OCU');
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
