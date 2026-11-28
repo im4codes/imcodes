@@ -16961,4 +16961,246 @@ describe('App shell keyboard shortcuts, visual tab order, auto-focus & quote foc
       vi.useRealTimers();
     }
   }, 20_000);
+
+  it('keeps explicit same-server external route ahead of older transient recovery when discovery resolves while new POST is pending', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-old-srv');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+
+    const oldServerGrant = {
+      id: 'share-old-srv',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Server Old',
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+    const altMainGrant = {
+      id: 'share-alt-main',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Alt Shared Tab',
+      target: { kind: 'main' as const, serverId: 'srv-shared', sessionName: 'deck_alt_brain' },
+    };
+
+    let discoveryCalls = 0;
+    discoverSharedEntriesMock.mockImplementation(async () => {
+      discoveryCalls += 1;
+      if (discoveryCalls === 1) return [];
+      return [oldServerGrant, altMainGrant];
+    });
+
+    let serverUpgradeAttempts = 0;
+    let resolveAltPost!: (val: unknown) => void;
+    const altPostDeferred = new Promise((resolve) => {
+      resolveAltPost = resolve;
+    });
+    let altPostSignal: AbortSignal | undefined;
+
+    openSharedEntryMock.mockImplementation(async (target: { kind: string; serverId: string; sessionName?: string }) => {
+      if (target.kind === 'main' && target.sessionName === 'deck_beta_brain') {
+        return {
+          server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+          target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+          coverage: {
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['share-old-srv'],
+            primaryShareId: 'share-old-srv',
+            authorizedAt: Date.now(),
+          },
+          sessions: [
+            { sessionName: 'deck_beta_brain', title: 'Beta', state: 'running', agentType: 'codex-sdk' },
+          ],
+          subSessions: [],
+        };
+      }
+      if (target.kind === 'server') {
+        serverUpgradeAttempts += 1;
+        throw new Error('transient 503 old server upgrade');
+      }
+      const lastCall = openSharedEntryOptionsMock.mock.calls.at(-1);
+      altPostSignal = (lastCall?.[1] as { signal?: AbortSignal } | undefined)?.signal;
+      return altPostDeferred;
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+
+    const realDateNow = Date.now;
+    let fakeNow = realDateNow() + 20_000;
+    Date.now = () => fakeNow;
+    try {
+      // Discovery #2 finds oldServerGrant + altMainGrant; oldServerGrant upgrade fails transiently
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+      await waitFor(() => expect(serverUpgradeAttempts).toBe(1));
+
+      // User navigates to another discovered share link on the SAME server and keeps POST pending
+      await act(async () => {
+        window.location.hash = '#/srv-shared/deck_alt_brain?shared=share-alt-main';
+        window.dispatchEvent(new Event('hashchange'));
+      });
+      await waitFor(() => expect(altPostSignal).toBeDefined());
+      expect(altPostSignal?.aborted).toBe(false);
+
+      // Next foreground discovery completes while altMainGrant POST is still pending
+      fakeNow += 20_000;
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+      await waitFor(() => expect(discoveryCalls).toBe(3));
+    } finally {
+      Date.now = realDateNow;
+    }
+
+    expect(altPostSignal?.aborted).toBe(false);
+    expect(serverUpgradeAttempts).toBe(1);
+
+    await act(async () => {
+      resolveAltPost({
+        server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+        target: altMainGrant.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-alt-main'],
+          primaryShareId: 'share-alt-main',
+          authorizedAt: Date.now(),
+        },
+        sessions: [
+          { sessionName: 'deck_alt_brain', title: 'Alt', state: 'running', agentType: 'codex-sdk' },
+        ],
+        subSessions: [],
+      });
+    });
+
+    expect(await screen.findByTestId('session-pane-deck_alt_brain')).toBeTruthy();
+  }, 20_000);
+
+  it('keeps same-server UI click navigation (omitted source) ahead of older transient recovery when discovery resolves while POST is pending', async () => {
+    history.replaceState(null, '', '/#/srv-shared/deck_beta_brain?shared=share-old-ui');
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+
+    const oldServerGrant = {
+      id: 'share-old-ui',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Shared Server Old UI',
+      target: { kind: 'server' as const, serverId: 'srv-shared' },
+    };
+    const altUiGrant = {
+      id: 'share-alt-ui',
+      serverId: 'srv-shared',
+      serverName: 'Shared Server',
+      role: 'participant' as const,
+      status: 'active' as const,
+      targetLabel: 'Alt Shared Tab UI',
+      target: { kind: 'main' as const, serverId: 'srv-shared', sessionName: 'deck_alt_brain' },
+    };
+
+    let discoveryCalls = 0;
+    discoverSharedEntriesMock.mockImplementation(async () => {
+      discoveryCalls += 1;
+      if (discoveryCalls === 1) return [];
+      return [oldServerGrant, altUiGrant];
+    });
+
+    let serverUpgradeAttempts = 0;
+    let resolveUiPost!: (val: unknown) => void;
+    const uiPostDeferred = new Promise((resolve) => {
+      resolveUiPost = resolve;
+    });
+    let uiPostSignal: AbortSignal | undefined;
+
+    openSharedEntryMock.mockImplementation(async (target: { kind: string; serverId: string; sessionName?: string }) => {
+      if (target.kind === 'main' && target.sessionName === 'deck_beta_brain') {
+        return {
+          server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+          target: { kind: 'main', serverId: 'srv-shared', sessionName: 'deck_beta_brain' },
+          coverage: {
+            effectiveRole: 'participant',
+            historyCutoffAt: 0,
+            nextCoverageRecheckAt: null,
+            coveringShareIds: ['share-old-ui'],
+            primaryShareId: 'share-old-ui',
+            authorizedAt: Date.now(),
+          },
+          sessions: [
+            { sessionName: 'deck_beta_brain', title: 'Beta', state: 'running', agentType: 'codex-sdk' },
+          ],
+          subSessions: [],
+        };
+      }
+      if (target.kind === 'server') {
+        serverUpgradeAttempts += 1;
+        throw new Error('transient 503 old UI upgrade');
+      }
+      const lastCall = openSharedEntryOptionsMock.mock.calls.at(-1);
+      uiPostSignal = (lastCall?.[1] as { signal?: AbortSignal } | undefined)?.signal;
+      return uiPostDeferred;
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByTestId('session-pane-deck_beta_brain')).toBeTruthy();
+
+    const realDateNow = Date.now;
+    let fakeNow = realDateNow() + 20_000;
+    Date.now = () => fakeNow;
+    try {
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+      await waitFor(() => expect(serverUpgradeAttempts).toBe(1));
+
+      // Click the same-server sidebar entry (uses default omitted options.source -> 'ui')
+      const altBtn = (await screen.findByText('Alt Shared Tab UI')).closest('button')!;
+      fireEvent.click(altBtn);
+      await waitFor(() => expect(uiPostSignal).toBeDefined());
+      expect(uiPostSignal?.aborted).toBe(false);
+
+      fakeNow += 20_000;
+      await act(async () => {
+        window.dispatchEvent(new Event('focus'));
+      });
+      await waitFor(() => expect(discoveryCalls).toBe(3));
+    } finally {
+      Date.now = realDateNow;
+    }
+
+    expect(uiPostSignal?.aborted).toBe(false);
+    expect(serverUpgradeAttempts).toBe(1);
+
+    await act(async () => {
+      resolveUiPost({
+        server: { id: 'srv-shared', name: 'Shared Server', status: 'online', lastHeartbeatAt: Date.now() },
+        target: altUiGrant.target,
+        coverage: {
+          effectiveRole: 'participant',
+          historyCutoffAt: 0,
+          nextCoverageRecheckAt: null,
+          coveringShareIds: ['share-alt-ui'],
+          primaryShareId: 'share-alt-ui',
+          authorizedAt: Date.now(),
+        },
+        sessions: [
+          { sessionName: 'deck_alt_brain', title: 'Alt', state: 'running', agentType: 'codex-sdk' },
+        ],
+        subSessions: [],
+      });
+    });
+
+    expect(await screen.findByTestId('session-pane-deck_alt_brain')).toBeTruthy();
+  }, 20_000);
 });
