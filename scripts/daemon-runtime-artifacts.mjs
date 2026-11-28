@@ -113,6 +113,7 @@ const BUN_PTY_TARGET_BINARIES = Object.freeze({
   'linux-x64': new Set(['librust_pty.so', 'librust_pty_musl.so']),
   'linux-arm64': new Set(['librust_pty_arm64.so', 'librust_pty_arm64_musl.so']),
   'win32-x64': new Set(['rust_pty.dll']),
+  'win32-arm64': new Set(['rust_pty_arm64.dll']),
 });
 
 function isRecord(value) {

@@ -243,13 +243,13 @@ describe('shared voice hotwords', () => {
     expect(trimmed).toContain('IM.codes');
   });
 
-  it('completes 60 rules across >=500 chars well within CI latency budget (<5ms)', () => {
+  it('completes 60 rules across >=500 chars under 1.5ms per call across multi-batch sampling', () => {
     const rules = Array.from({ length: 60 }, (_, i) => `wrongterm${i} => CorrectTerm_${i}`).join('\n');
     const compiled = mergeVoiceHotwords({ projectRaw: rules });
     const text = '请帮我检查 wrongterm0 和 wrongterm15 以及 wrongterm59 在这个项目里的运行情况，还有其它无关内容重复拼接。'.repeat(11);
     expect(text.length).toBeGreaterThanOrEqual(500);
 
-    // Warm regex cache and JIT before timing so shared CI VM jitter does not flake
+    // Warm regex cache and JIT before timing
     for (let i = 0; i < 5; i += 1) {
       const out = applyVoiceHotwordPostProcess(text, compiled);
       if (i === 0) {
@@ -258,13 +258,19 @@ describe('shared voice hotwords', () => {
       }
     }
 
-    const iterations = 100;
-    const start = performance.now();
-    for (let i = 0; i < iterations; i += 1) {
-      applyVoiceHotwordPostProcess(text, compiled);
+    // Sample independent batches and take the fastest batch to isolate code cost from single-pause CI jitter
+    const batches = 7;
+    const iterationsPerBatch = 20;
+    const batchAverages: number[] = [];
+    for (let b = 0; b < batches; b += 1) {
+      const start = performance.now();
+      for (let i = 0; i < iterationsPerBatch; i += 1) {
+        applyVoiceHotwordPostProcess(text, compiled);
+      }
+      batchAverages.push((performance.now() - start) / iterationsPerBatch);
     }
-    const avgMs = (performance.now() - start) / iterations;
-    expect(avgMs).toBeLessThan(5);
+    const bestAvgMs = Math.min(...batchAverages);
+    expect(bestAvgMs).toBeLessThan(1.5);
   });
 
   it('encodes, decodes, normalizes, and validates project keys consistently', () => {
