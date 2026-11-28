@@ -72,6 +72,7 @@ import { DEFAULT_OPENCODE_MODEL_ID } from '../../shared/models/options.js';
 import { bindSharedProviderProcessResource, type AgentProcessResource } from './agent-process-resource.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import {
+  buildOpenCodeCliCommand,
   buildOpenCodeCliLaunchPlan,
   isExpiredOpenCodeAuthError,
   isLoopbackHostname,
@@ -112,10 +113,11 @@ interface OpenCodeV1ClientLike {
     create(options: Record<string, unknown>): SdkResult<Record<string, any>>;
     get(options: Record<string, unknown>): SdkResult<Record<string, any>>;
     list(options?: Record<string, unknown>): SdkResult<Array<Record<string, any>>>;
+    update?(options: Record<string, unknown>): SdkResult<Record<string, any>>;
     message(options: Record<string, unknown>): SdkResult<Record<string, any>>;
     messages(options: Record<string, unknown>): SdkResult<Array<Record<string, any>>>;
     prompt(options: Record<string, unknown>): SdkResult<Record<string, any>>;
-    promptAsync(options: Record<string, unknown>): SdkResult<void>;
+    promptAsync(options: Record<string, unknown>, requestOptions?: Record<string, unknown>): SdkResult<void>;
     abort(options: Record<string, unknown>): SdkResult<boolean>;
     summarize?(options: Record<string, unknown>, requestOptions?: Record<string, unknown>): SdkResult<boolean>;
   };
@@ -186,14 +188,14 @@ async function spawnV1OpencodeServer(options: OpenCodeV1RuntimeStartOptions): Pr
   }
 
   const password = randomBytes(24).toString('base64url');
-  const args = [
-    ...launchPlan.prependArgs,
+  const cliArgs = [
     'serve',
     `--hostname=${options.hostname}`,
     `--port=${options.port}`,
   ];
   const logLevel = safeString(options.config?.logLevel);
-  if (logLevel) args.push(`--log-level=${logLevel}`);
+  if (logLevel) cliArgs.push(`--log-level=${logLevel}`);
+  const cmd = buildOpenCodeCliCommand(launchPlan, cliArgs);
 
   const spawnEnv: NodeJS.ProcessEnv = {
     ...(options.env ?? process.env),
@@ -202,11 +204,11 @@ async function spawnV1OpencodeServer(options: OpenCodeV1RuntimeStartOptions): Pr
     OPENCODE_CONFIG_CONTENT: JSON.stringify(options.config ?? {}),
   };
 
-  const child = spawn(launchPlan.executable, args, {
+  const child = spawn(cmd.executable, cmd.args, {
     env: spawnEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
-    ...(launchPlan.shell ? { shell: true } : {}),
+    ...(cmd.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   const processResource = bindSharedProviderProcessResource('opencode-sdk', child);
 
@@ -407,11 +409,45 @@ interface OpenCodeSessionState {
   client: OpenCodeV1ClientLike;
   server: OpenCodeV1ServerLike;
   abort: AbortController;
+  pendingAdmissionAbort: AbortController | null;
   eventLoop: Promise<void>;
   pendingPermissions: Map<string, PendingOpenCodePermission>;
   runtimeConfig: SessionConfig;
   nativeAgentFence: NativeAgentFence;
   activeStepProviderId?: string;
+}
+
+function invokeWithOptionalAbort<TArgs extends Record<string, unknown>, TResult>(
+  fn: (options: TArgs, requestOptions?: Record<string, unknown>) => Promise<TResult>,
+  options: TArgs,
+  signal?: AbortSignal,
+): Promise<TResult> {
+  if (!signal) return fn(options);
+  if (signal.aborted) {
+    const abortErr = new Error('OpenCode request aborted');
+    abortErr.name = 'AbortError';
+    return Promise.reject(abortErr);
+  }
+  return new Promise<TResult>((resolveReq, rejectReq) => {
+    const onAbort = () => {
+      const abortErr = new Error('OpenCode request aborted');
+      abortErr.name = 'AbortError';
+      rejectReq(abortErr);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve()
+      .then(() => fn({ ...options, signal }, { signal }))
+      .then(
+        (res) => {
+          signal.removeEventListener('abort', onAbort);
+          resolveReq(res);
+        },
+        (err) => {
+          signal.removeEventListener('abort', onAbort);
+          rejectReq(err);
+        },
+      );
+  });
 }
 
 class OpenCodeRequestTimeoutError extends Error {
@@ -699,21 +735,29 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     this.spawnEnv = options?.env;
   }
 
-  async connect(config: ProviderConfig): Promise<void> {
+  async connect(config: ProviderConfig, externalSignal?: AbortSignal): Promise<void> {
     if (this.client && this.server) return;
-    if (!this.launchPlan) {
-      const configuredBin = safeString(config.binaryPath) ?? this.binaryPath;
-      this.launchPlan = configuredBin
-        ? buildOpenCodeCliLaunchPlan(configuredBin)
-        : (resolveOpenCodeCliLaunchPlan({ env: this.spawnEnv }) ?? undefined);
-      this.binaryPath = this.launchPlan?.resolvedPath ?? configuredBin;
+    if (externalSignal?.aborted) {
+      throw providerError(PROVIDER_ERROR_CODES.CANCELLED, 'OpenCode v1 CLI connect cancelled', true);
     }
     const abort = new AbortController();
     this.lifecycleAbort = abort;
-    const port = positiveNumber(config.port) || await reserveLoopbackPort();
-    const timeout = positiveNumber(config.startupTimeoutMs) || 10_000;
+    const onExternalAbort = () => abort.abort();
+    externalSignal?.addEventListener('abort', onExternalAbort, { once: true });
     const task = (async () => {
       try {
+        if (!this.launchPlan) {
+          const configuredBin = safeString(config.binaryPath) ?? this.binaryPath;
+          this.launchPlan = configuredBin
+            ? buildOpenCodeCliLaunchPlan(configuredBin, { env: this.spawnEnv })
+            : (resolveOpenCodeCliLaunchPlan({ env: this.spawnEnv }) ?? undefined);
+          this.binaryPath = this.launchPlan?.resolvedPath ?? configuredBin;
+        }
+        const port = positiveNumber(config.port) || await reserveLoopbackPort();
+        if (abort.signal.aborted) {
+          throw providerError(PROVIDER_ERROR_CODES.CANCELLED, 'OpenCode v1 CLI connect cancelled', true);
+        }
+        const timeout = positiveNumber(config.startupTimeoutMs) || 10_000;
         const started = await openCodeV1RuntimeHooks.start({
           hostname: LOOPBACK_HOST,
           port,
@@ -749,6 +793,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     try {
       await task;
     } finally {
+      externalSignal?.removeEventListener('abort', onExternalAbort);
       if (this.connectInFlight === task) this.connectInFlight = null;
     }
   }
@@ -810,6 +855,18 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
           query: { directory: cwd },
           throwOnError: true,
         })).data;
+        const guardTools = Boolean(this.toolExecutionGuard);
+        if ((nativeAgentsFenced || guardTools) && typeof sessionRuntime.client.session.update === 'function') {
+          const patchRules = this.computeV1PermissionPatch(info?.permission, nativeAgentsFenced, guardTools);
+          if (patchRules.length > 0) {
+            await sessionRuntime.client.session.update({
+              path: { id: safeString(info?.id) ?? config.resumeId },
+              query: { directory: cwd },
+              body: { permission: patchRules },
+              throwOnError: true,
+            });
+          }
+        }
       } catch (error) {
         await this.closeStartedRuntime(sessionRuntime);
         throw this.normalizeError(error, 'restore');
@@ -864,17 +921,25 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       client: sessionRuntime.client,
       server: sessionRuntime.server,
       abort: sessionRuntime.abort,
+      pendingAdmissionAbort: null,
       eventLoop: Promise.resolve(),
       pendingPermissions: new Map(),
       runtimeConfig: { ...config },
       nativeAgentFence: fenceOf(nativeAgentsFenced),
     };
+    const preLockOwnerId = this.providerToRoute.get(providerSessionId);
+    const preLockOwner = preLockOwnerId ? this.sessions.get(preLockOwnerId) : undefined;
+    const preLockOwnerWasBusy = Boolean(preLockOwner && preLockOwner !== state && preLockOwner.busy);
+    if (preLockOwner && preLockOwner !== state) {
+      preLockOwner.pendingAdmissionAbort?.abort();
+    }
     await this.withProviderSessionLock(providerSessionId, async () => {
       this.sessions.set(routeId, state);
       const previousOwnerId = this.providerToRoute.get(providerSessionId);
       const previousOwner = previousOwnerId ? this.sessions.get(previousOwnerId) : undefined;
       if (previousOwner && previousOwner !== state) {
-        if (previousOwner.busy) {
+        previousOwner.pendingAdmissionAbort?.abort();
+        if (previousOwner.busy || preLockOwnerWasBusy) {
           previousOwner.cancelled = true;
           previousOwner.generation += 1;
           await previousOwner.client.session.abort({
@@ -939,12 +1004,15 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
   private async closeOrDetachRoute(sessionId: string, interruptBusyOwner: boolean): Promise<void> {
     const state = this.sessions.get(sessionId);
     if (!state) return;
+    const preLockWasBusy = Boolean(interruptBusyOwner && state.busy);
+    state.pendingAdmissionAbort?.abort();
     await this.withProviderSessionLock(state.providerSessionId, async () => {
       if (this.sessions.get(sessionId) !== state) return;
+      state.pendingAdmissionAbort?.abort();
       state.generation += 1;
       this.sessions.delete(state.routeId);
       const removedSoleProviderRoute = this.releaseProviderRoute(state);
-      if (interruptBusyOwner && state.busy && removedSoleProviderRoute) {
+      if (interruptBusyOwner && (state.busy || preLockWasBusy) && removedSoleProviderRoute) {
         await state.client.session.abort({
           path: { id: state.providerSessionId },
           query: { directory: state.cwd },
@@ -961,6 +1029,49 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
 
   async detachSession(sessionId: string): Promise<void> {
     await this.closeOrDetachRoute(sessionId, false);
+  }
+
+  async inspectSessionSnapshot(
+    sessionId: string,
+    cwd?: string,
+  ): Promise<{ exists: true; timeUpdated: number; messageCount: number } | null> {
+    const client = this.assertConnected();
+    const dir = safeString(cwd);
+    try {
+      const response = await client.session.get({
+        path: { id: sessionId },
+        ...(dir ? { query: { directory: dir } } : {}),
+        throwOnError: true,
+      });
+      if (safeString(response.data?.id) !== sessionId) return null;
+      let timeUpdated = positiveNumber(response.data?.time?.updated)
+        ?? positiveNumber(response.data?.time?.created)
+        ?? 0;
+      let messageCount = 0;
+      if (typeof client.session.messages === 'function') {
+        try {
+          const msgRes = await client.session.messages({
+            path: { id: sessionId },
+            ...(dir ? { query: { directory: dir } } : {}),
+            throwOnError: true,
+          });
+          const rows = Array.isArray(msgRes?.data) ? msgRes.data : [];
+          messageCount = rows.length;
+          for (const msg of rows) {
+            const msgUpdated = positiveNumber(msg?.info?.time?.completed)
+              ?? positiveNumber(msg?.info?.time?.created)
+              ?? 0;
+            if (msgUpdated > timeUpdated) timeUpdated = msgUpdated;
+          }
+        } catch {
+          // Best-effort message count; session existence and session.time.updated remain authoritative
+        }
+      }
+      return { exists: true, timeUpdated, messageCount };
+    } catch (error) {
+      if (isNotFoundError(error)) return null;
+      throw error;
+    }
   }
 
   async restoreSession(sessionId: string): Promise<boolean> {
@@ -1129,33 +1240,41 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     const system = composeProviderSystemText(payload);
     const messageId = openCodePromptMessageId(state.providerSessionId, payload.deliveryId);
     state.deliveryMessageId = messageId;
+    const preAdmissionAbort = new AbortController();
+    state.pendingAdmissionAbort = preAdmissionAbort;
     try {
-      if (await this.hasAcceptedPrompt(state, messageId)) {
-        return;
-      }
-      this.assertRouteOwner(state);
-      if (!this.isCurrent(state, generation) || state.cancelled) return;
-      const fencedTools = state.nativeAgentFence === NATIVE_AGENT_FENCES.DISABLED
-        ? Object.fromEntries(OPENCODE_V1_NATIVE_AGENT_TOOLS.map((tool) => [tool, false]))
-        : undefined;
-      await state.client.session.promptAsync({
-        path: { id: state.providerSessionId },
-        query: { directory: state.cwd },
-        body: {
-          messageID: messageId,
-          ...(model ? { model } : {}),
-          ...(variant ? { variant } : {}),
-          ...(system ? { system } : {}),
-          ...(fencedTools ? { tools: fencedTools } : {}),
-          parts,
-        },
-        throwOnError: true,
+      await this.withProviderSessionLock(state.providerSessionId, async () => {
+        if (preAdmissionAbort.signal.aborted || !this.isCurrent(state, generation) || state.cancelled) return;
+        this.assertRouteOwner(state);
+        if (await this.hasAcceptedPrompt(state, messageId)) {
+          return;
+        }
+        this.assertRouteOwner(state);
+        if (preAdmissionAbort.signal.aborted || !this.isCurrent(state, generation) || state.cancelled) return;
+        await invokeWithOptionalAbort(
+          state.client.session.promptAsync.bind(state.client.session),
+          {
+            path: { id: state.providerSessionId },
+            query: { directory: state.cwd },
+            body: {
+              messageID: messageId,
+              ...(model ? { model } : {}),
+              ...(variant ? { variant } : {}),
+              ...(system ? { system } : {}),
+              parts,
+            },
+            throwOnError: true,
+          },
+          preAdmissionAbort.signal,
+        );
       });
     } catch (error) {
+      this.assertRouteOwner(state);
       if (!this.isCurrent(state, generation) || state.cancelled) return;
       if (isTransientRequestFailure(error)) {
         try {
           const acceptance = await this.waitForPromptAcceptance(state, generation, messageId);
+          this.assertRouteOwner(state);
           if (acceptance === 'accepted' || !this.isCurrent(state, generation) || state.cancelled) return;
           if (acceptance === 'unknown') {
             logger.warn(
@@ -1172,6 +1291,10 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       state.busy = false;
       this.emitStatus(state.routeId, { status: null, label: null });
       throw this.normalizeError(error, 'prompt submission');
+    } finally {
+      if (state.pendingAdmissionAbort === preAdmissionAbort) {
+        state.pendingAdmissionAbort = null;
+      }
     }
   }
 
@@ -1329,6 +1452,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     const state = this.sessions.get(sessionId);
     if (!state) return;
     this.clearPendingQuestion(state, true);
+    state.pendingAdmissionAbort?.abort();
     if (!state.busy) return;
     const wasCompacting = state.compacting;
     state.cancelled = true;
@@ -1465,7 +1589,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
     let lastObservation: PromptAcceptance = 'unknown';
     for (const delayMs of PROMPT_ACCEPTANCE_RECHECK_DELAYS_MS) {
       await sleep(delayMs);
-      if (!this.isCurrent(state, generation) || state.cancelled) return 'unknown';
+      if (!this.isCurrent(state, generation) || state.cancelled || !this.isRouteOwner(state)) return 'unknown';
       try {
         if (await this.hasAcceptedPrompt(state, messageId)) {
           logger.warn(
@@ -1528,6 +1652,73 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
       }
     }
     return rules;
+  }
+
+  private computeV1PermissionPatch(
+    existingRaw: unknown,
+    nativeAgentsFenced: boolean,
+    guardTools: boolean,
+  ): Array<{ permission: string; pattern: string; action: 'allow' | 'deny' | 'ask' }> {
+    const existing = Array.isArray(existingRaw)
+      ? existingRaw.flatMap((entry) => {
+          if (!entry || typeof entry !== 'object') return [];
+          const rec = entry as Record<string, unknown>;
+          const permission = safeString(rec.permission);
+          const pattern = safeString(rec.pattern) ?? '*';
+          const action = safeString(rec.action);
+          if (!permission || (action !== 'allow' && action !== 'deny' && action !== 'ask')) return [];
+          return [{ permission, pattern, action: action as 'allow' | 'deny' | 'ask' }];
+        })
+      : [];
+
+    const fencedSet = new Set<string>(OPENCODE_V1_NATIVE_AGENT_TOOLS);
+    const preservedSpecificDenies: Array<{ permission: string; pattern: string; action: 'deny' }> = [];
+    const seenSpecificDeny = new Set<string>();
+    for (const rule of existing) {
+      if (rule.action === 'deny' && rule.permission !== '*' && !fencedSet.has(rule.permission)) {
+        const key = `${rule.permission}\0${rule.pattern}`;
+        if (!seenSpecificDeny.has(key)) {
+          seenSpecificDeny.add(key);
+          preservedSpecificDenies.push({ permission: rule.permission, pattern: rule.pattern, action: 'deny' });
+        }
+      }
+    }
+
+    // OpenCode Permission.evaluate matches with .findLast(), and PATCH /session/:id appends.
+    // Check if the trailing ruleset already places wildcard ask BEFORE preserved specific denies & fenced denies,
+    // with no stale non-deny rules after the wildcard ask.
+    let lastWildcardAskIdx = -1;
+    for (let i = existing.length - 1; i >= 0; i--) {
+      const r = existing[i]!;
+      if (r.permission === '*' && r.pattern === '*' && r.action === 'ask') {
+        lastWildcardAskIdx = i;
+        break;
+      }
+    }
+    const tail = lastWildcardAskIdx >= 0 ? existing.slice(lastWildcardAskIdx + 1) : existing;
+    const wildcardSatisfied = !guardTools || (
+      lastWildcardAskIdx >= 0
+      && !tail.some((r) => r.action !== 'deny')
+    );
+    const deniesSatisfied = preservedSpecificDenies.every((req) =>
+      tail.some((r) => r.permission === req.permission && r.pattern === req.pattern && r.action === 'deny'),
+    );
+    const fencedSatisfied = !nativeAgentsFenced || OPENCODE_V1_NATIVE_AGENT_TOOLS.every((tool) =>
+      tail.some((r) => r.permission === tool && r.pattern === '*' && r.action === 'deny'),
+    );
+    if (wildcardSatisfied && deniesSatisfied && fencedSatisfied) return [];
+
+    const patch: Array<{ permission: string; pattern: string; action: 'allow' | 'deny' | 'ask' }> = [];
+    if (guardTools) {
+      patch.push({ permission: '*', pattern: '*', action: 'ask' });
+    }
+    patch.push(...preservedSpecificDenies);
+    if (nativeAgentsFenced) {
+      for (const tool of OPENCODE_V1_NATIVE_AGENT_TOOLS) {
+        patch.push({ permission: tool, pattern: '*', action: 'deny' });
+      }
+    }
+    return patch;
   }
 
   private async startSessionRuntime(config: SessionConfig, cwd: string, nativeAgentsFenced: boolean): Promise<{
@@ -2204,6 +2395,7 @@ export class OpenCodeV1CliProvider implements TransportProvider, InteractiveQues
   private emitSessionInfo(state: OpenCodeSessionState): void {
     const info: SessionInfoUpdate = {
       resumeId: state.providerSessionId,
+      openCodeStorageOwner: 'v1-cli',
       ...(state.model ? { model: state.model } : {}),
       ...(state.effort ? { effort: state.effort } : {}),
     };

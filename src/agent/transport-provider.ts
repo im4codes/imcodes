@@ -384,6 +384,8 @@ export interface SessionConfig extends SessionIncognitoConfig {
   bindExistingKey?: string;
   /** Provider-specific durable conversation/session identifier used for resume. */
   resumeId?: string;
+  /** Known OpenCode backend owner (`v1-cli`, `v2-cli`, `embedded`) for deterministic resume routing. */
+  openCodeStorageOwner?: 'v1-cli' | 'v2-cli' | 'embedded';
   /** Reasoning/thinking effort for future turns. */
   effort?: TransportEffortLevel;
   /** Skip the sessions.create RPC — session already exists on provider (auto-sync bind). */
@@ -486,6 +488,8 @@ export interface ApprovalRequest {
 export interface SessionInfoUpdate extends SessionContextBootstrapState {
   /** Durable session/thread identifier used for restoring continuity. */
   resumeId?: string;
+  /** Known OpenCode backend owner (`v1-cli`, `v2-cli`, `embedded`) when established by provider create/restore. */
+  openCodeStorageOwner?: 'v1-cli' | 'v2-cli' | 'embedded';
   /** Human-readable active model identifier, if known. */
   model?: string;
   /** Human-readable plan label, if known. */

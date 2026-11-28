@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
   OPENCODE_TRANSPORT_MODES,
+  buildOpenCodeCliCommand,
   classifyOpenCodeVersion,
   isLoopbackHostname,
   probeOpenCodeCli,
@@ -534,6 +535,45 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     expect(probeCalls).toEqual([{ executable: 'C:\\Program Files\\nodejs\\node.exe', args: [resolve(jsTarget), '--version'] }]);
     expect(probed?.launchPlan).toEqual(plan);
 
+    // Plain .cmd / .bat in a directory with spaces: uses cmd.exe /d /s /c with verbatim quoting (no shell: true)
+    const spacedDir = join(root, 'Program Files', 'OpenCode CLI');
+    mkdirSync(spacedDir, { recursive: true });
+    const plainCmd = join(spacedDir, 'opencode.cmd');
+    writeFileSync(plainCmd, '@echo off\r\necho opencode v2.4.2\r\n', 'utf8');
+    const plainPlan = resolveOpenCodeCliLaunchPlan({
+      binaryPath: plainCmd,
+      platform: 'win32',
+      env: { COMSPEC: 'C:\\Windows\\system32\\cmd.exe' },
+    });
+    expect(plainPlan).toEqual({
+      resolvedPath: resolve(plainCmd),
+      executable: 'C:\\Windows\\system32\\cmd.exe',
+      prependArgs: ['/d', '/s', '/c'],
+      windowsVerbatimArguments: true,
+    });
+    const probeCmd = buildOpenCodeCliCommand(plainPlan!, ['--version']);
+    expect(probeCmd).toEqual({
+      executable: 'C:\\Windows\\system32\\cmd.exe',
+      args: ['/d', '/s', '/c', `""${resolve(plainCmd)}" --version"`],
+      windowsVerbatimArguments: true,
+    });
+    const serveCmd = buildOpenCodeCliCommand(plainPlan!, ['serve', '--hostname', '127.0.0.1', '--port', '4321']);
+    expect(serveCmd).toEqual({
+      executable: 'C:\\Windows\\system32\\cmd.exe',
+      args: ['/d', '/s', '/c', `""${resolve(plainCmd)}" serve --hostname 127.0.0.1 --port 4321"`],
+      windowsVerbatimArguments: true,
+    });
+    const plainProbeCalls: Array<{ executable: string; args: string[]; plan: typeof plainPlan }> = [];
+    const plainProbed = await probeOpenCodeCli(plainPlan!, {
+      platform: 'win32',
+      execProbe: async (executable, args, _timeoutMs, lp) => {
+        plainProbeCalls.push({ executable, args, plan: lp });
+        return 'opencode v2.4.2\n';
+      },
+    });
+    expect(plainProbeCalls).toEqual([{ executable: probeCmd.executable, args: probeCmd.args, plan: plainPlan }]);
+    expect(plainProbed?.family).toBe('v2');
+
     // Explicit binaryPath missing -> throws CONFIG_ERROR instead of silently falling back to embedded
     await expect(resolveOpenCodeTransport({
       hookOverridden: false,
@@ -620,6 +660,33 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     await p.disconnect();
     expect(seenSignal?.aborted).toBe(true);
     await expect(connectPromise).rejects.toBeTruthy();
+
+    // 4. Real top-level OpenCodeSdkProvider slow v1 startup cancels immediately on disconnect() (no 5000ms hang or surviving child)
+    openCodeSdkRuntimeHooks.start = originalSdkStart;
+    const pidFile = join(root, 'v1-slow.pid');
+    const slowV1Script = join(root, 'v1-slow.mjs');
+    writeFileSync(slowV1Script, `
+      import { writeFileSync } from 'node:fs';
+      if (process.argv.includes('--version')) {
+        console.log('1.18.4');
+        process.exit(0);
+      }
+      writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+      setInterval(() => {}, 1000);
+    `, 'utf8');
+    const slowV1Bin = makeFakeExecutable(join(root, 'slow-v1'), 'opencode', `#!/bin/sh\nexec "${process.execPath}" "${slowV1Script}" "$@"\n`);
+    const pSlowV1 = new OpenCodeSdkProvider();
+    const t0 = Date.now();
+    const slowConnect = pSlowV1.connect({ binaryPath: slowV1Bin, startupTimeoutMs: 5_000, cwd: root } as any);
+    await vi.waitFor(() => expect(existsSync(pidFile)).toBe(true));
+    const childPid = Number(readFileSync(pidFile, 'utf8').trim());
+    const discPromise = pSlowV1.disconnect();
+    // Child receives SIGTERM and terminates well before 450ms (unlike before fix when it stayed alive for full timeout)
+    await vi.waitFor(() => expect(() => process.kill(childPid, 0)).toThrow(), { timeout: 450 });
+    await discPromise;
+    const elapsedMs = Date.now() - t0;
+    await expect(slowConnect).rejects.toBeTruthy();
+    expect(elapsedMs).toBeLessThan(2_500);
   });
 
   it('F3: isolates same-cwd v2 CLI sessions by MCP identity, reuses matching MCP host, and cleans up removed binding', async () => {
@@ -786,7 +853,7 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     ]);
 
     await provider.send(r, 'hello');
-    expect((seenPrompts[0] as any).body.tools).toEqual({ task: false, subagent: false });
+    expect((seenPrompts[0] as any).body.tools).toBeUndefined();
 
     // Synchronous guard throw must fail closed cleanly (no uncaught synchronous exception)
     queue.push({
@@ -906,6 +973,152 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     await expect(provider.send(routeB, 'after detach')).rejects.toMatchObject({ code: PROVIDER_ERROR_CODES.SESSION_NOT_FOUND });
     await provider.send(routeA, 'resumed after routeB detach');
     await provider.disconnect();
+
+    // Counterexample B: v1 in-flight prompt submission interrupted before admission completes by route handoff
+    let releaseLookupA!: () => void;
+    const lookupInFlightA = new Promise<void>((res) => { releaseLookupA = res; });
+    let lookupStartedResolve!: () => void;
+    const lookupStarted = new Promise<void>((res) => { lookupStartedResolve = res; });
+    const promptAsyncCalls: Array<string> = [];
+    let startCallSeq = 0;
+    openCodeV1RuntimeHooks.start = vi.fn(async (opts) => {
+      const myIdx = ++startCallSeq;
+      const q = createAsyncQueue<Record<string, any>>();
+      opts.signal.addEventListener('abort', q.close, { once: true });
+      return {
+        client: {
+          session: {
+            create: vi.fn(async () => ({ data: { id: 'shared-inflight-ses' } })),
+            get: vi.fn(async () => ({ data: { id: 'shared-inflight-ses' } })),
+            list: vi.fn(async () => ({ data: [] })),
+            message: vi.fn(async () => {
+              if (myIdx === 2) {
+                lookupStartedResolve();
+                await lookupInFlightA;
+              }
+              return { data: null };
+            }),
+            messages: vi.fn(async () => ({ data: [] })),
+            prompt: vi.fn(async () => ({ data: {} })),
+            promptAsync: vi.fn(async () => {
+              promptAsyncCalls.push(`client-${myIdx}`);
+              return { data: undefined };
+            }),
+            abort: vi.fn(async () => ({ data: true })),
+          },
+          provider: { list: vi.fn(async () => ({ data: { connected: [], all: [], default: {} } })) },
+          event: { subscribe: vi.fn(async () => ({ stream: q.stream })) },
+          postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+        } as any,
+        server: { url: `http://127.0.0.1:${42005 + myIdx}`, close: vi.fn(async () => { q.close(); }) },
+      };
+    });
+    const pInflight = new OpenCodeSdkProvider();
+    await pInflight.connect({ binaryPath: v1Bin } as any);
+    const rSlowA = await pInflight.createSession({ sessionKey: 'v1-slow-a', cwd: root });
+    const inflightSend = pInflight.send(rSlowA, 'in-flight payload');
+    await lookupStarted;
+    // Route B takes over while route A is mid-send before promptAsync enqueue; release lookup after takeover begins
+    const takeoverPromise = pInflight.createSession({
+      sessionKey: 'v1-takeover-b',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'shared-inflight-ses',
+    });
+    await new Promise((res) => setTimeout(res, 20));
+    releaseLookupA();
+    const rTakeoverB = await takeoverPromise;
+    expect(rTakeoverB).toBe('v1-takeover-b');
+    const inflightOutcome = await inflightSend.catch((err) => err);
+    if (inflightOutcome !== undefined) {
+      expect(inflightOutcome).toMatchObject({ code: PROVIDER_ERROR_CODES.CANCELLED });
+    }
+    // Old route A's promptAsync RPC must NEVER have executed after takeover!
+    expect(promptAsyncCalls).toEqual([]);
+    await pInflight.send(rTakeoverB, 'route B payload');
+    expect(promptAsyncCalls).toEqual(['client-3']);
+    await pInflight.disconnect();
+
+    // Counterexample C: v2 split-host sourceClient verification blocks late clientA frames after clientB owns resumeId
+    let v2ClientSeq = 0;
+    const v2Listeners = new Map<string, (ev: Record<string, any>) => void>();
+    const v2Clients: any[] = [];
+    openCodeSdkRuntimeHooks.start = vi.fn(async () => {
+      const idx = ++v2ClientSeq;
+      const clientObj: any = {
+        _idx: idx,
+        sessions: {
+          create: vi.fn(async () => ({ id: 'shared-v2-ses' })),
+          get: vi.fn(async () => ({ id: 'shared-v2-ses' })),
+          prompt: vi.fn(async () => ({})),
+          update: vi.fn(async () => ({ id: 'shared-v2-ses' })),
+        },
+        session: {
+          switchModel: vi.fn(async () => ({})),
+          interrupt: vi.fn(async () => ({})),
+          message: { get: vi.fn(async () => { const e: any = new Error('404'); e.status = 404; throw e; }) },
+        },
+        provider: { list: vi.fn(async () => ({ data: [] })) },
+        model: {
+          list: vi.fn(async () => ({ data: [] })),
+          default: vi.fn(async () => ({ data: null })),
+        },
+        mcp: { add: vi.fn(async () => ({})), list: vi.fn(async () => ({ data: [] })) },
+        permission: { reply: vi.fn(async () => ({})) },
+        events: { subscribe: vi.fn(async () => ({ stream: createAsyncQueue<Record<string, any>>().stream })) },
+      };
+      v2Clients.push(clientObj);
+      return {
+        client: clientObj,
+        server: { url: `http://127.0.0.1:${43000 + idx}`, close: vi.fn(async () => {}) },
+        subscribeEvents: async (_cid: symbol, listener: (ev: Record<string, any>) => void) => {
+          v2Listeners.set(`sub-${idx}`, listener);
+          return async () => { v2Listeners.delete(`sub-${idx}`); };
+        },
+      };
+    });
+    const pV2Iso = new OpenCodeSdkProvider();
+    const v2Deltas: Array<{ sid: string; delta: string }> = [];
+    const v2Approvals: Array<{ sid: string; id: string }> = [];
+    pV2Iso.onDelta((sid, d) => v2Deltas.push({ sid, delta: d.delta }));
+    pV2Iso.onApprovalRequest((sid, req) => v2Approvals.push({ sid, id: req.id }));
+    await pV2Iso.connect({});
+    const v2A = await pV2Iso.createSession({ sessionKey: 'v2-routeA', sessionName: 'deck_a', cwd: root });
+    await pV2Iso.send(v2A, 'turn A');
+    const v2B = await pV2Iso.createSession({
+      sessionKey: 'v2-routeB',
+      sessionName: 'deck_b',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'shared-v2-ses',
+    });
+    await pV2Iso.send(v2B, 'turn B');
+    const listenerFromClientA = v2Listeners.get('sub-2');
+    const listenerFromClientB = v2Listeners.get('sub-3');
+    expect(listenerFromClientA).toBeDefined();
+    expect(listenerFromClientB).toBeDefined();
+    // Late stale frames arriving from old host clientA must NOT reach v2B!
+    listenerFromClientA!({
+      id: 'ev-stale-perm',
+      type: 'permission.asked',
+      properties: { id: 'perm-stale-host', sessionID: 'shared-v2-ses', action: 'bash', resources: ['rm'] },
+    });
+    listenerFromClientA!({
+      id: 'ev-stale-delta',
+      type: 'session.text.delta',
+      properties: { sessionID: 'shared-v2-ses', delta: 'FROM_STALE_HOST_A' },
+    });
+    // Live frame with SAME session ID from active owner clientB must be delivered to v2B
+    listenerFromClientB!({
+      id: 'ev-live-delta',
+      type: 'session.text.delta',
+      properties: { sessionID: 'shared-v2-ses', delta: 'FROM_LIVE_HOST_B' },
+    });
+    await new Promise((res) => setTimeout(res, 20));
+    expect(v2Approvals).toEqual([]);
+    expect(v2Deltas.some((d) => d.delta.includes('FROM_STALE_HOST_A'))).toBe(false);
+    expect(v2Deltas.some((d) => d.sid === v2B && d.delta.includes('FROM_LIVE_HOST_B'))).toBe(true);
+    await pV2Iso.disconnect();
   });
 
   it('F6: preserves default embedded opencode-sdk.db session restore across upgrade to v1 CLI or v2 store', async () => {
@@ -991,6 +1204,87 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
     // New session uses v1 CLI normally
     const freshV1Route = await pUpgraded.createSession({ sessionKey: 'route-new-v1', cwd: root });
     expect(freshV1Route).toBe('route-new-v1');
+    // 4. Same-ID collision: BOTH v1 DB (older 2 msgs) and default embedded opencode-sdk.db (follow-up 3+ msgs) hold same ID!
+    // Unowned legacy restore must choose embedded DB so follow-up history is preserved & new messages append there.
+    const { DatabaseSync } = await import('node:sqlite');
+    const embeddedDbFile = join(stateHome, 'opencode-sdk.db');
+    const embDb = new DatabaseSync(embeddedDbFile);
+    const v2MsgsBefore = Number((embDb.prepare('SELECT COUNT(*) AS cnt FROM session_message WHERE session_id = ?').get(oldSessionId) as any).cnt);
+    embDb.prepare(
+      'INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    ).run('msg_emb_followup', oldSessionId, 'user', v2MsgsBefore + 1, Date.now() + 5000, Date.now() + 5000, JSON.stringify({ type: 'user', text: 'embedded follow-up' }));
+    embDb.prepare('UPDATE session_v2 SET time_updated = ? WHERE id = ?').run(Date.now() + 5000, oldSessionId);
+    embDb.close();
+
+    const collisionGet = vi.fn(async ({ path: reqPath }: any) => {
+      if (reqPath?.id === oldSessionId) {
+        return { data: { id: oldSessionId, directory: root, time: { created: 1000, updated: 1000 } } };
+      }
+      if (reqPath?.id === 'ses-only-v1') {
+        return { data: { id: 'ses-only-v1', directory: root, time: { created: 2000, updated: 2000 } } };
+      }
+      const err: any = new Error('404 session not found');
+      err.status = 404;
+      throw err;
+    });
+    const collisionMessages = vi.fn(async ({ path: reqPath }: any) => {
+      if (reqPath?.id === oldSessionId) return { data: [{ info: { id: 'm1', time: { created: 900 } } }] };
+      if (reqPath?.id === 'ses-only-v1') return { data: [{ info: { id: 'm2', time: { created: 2000 } } }] };
+      return { data: [] };
+    });
+    openCodeV1RuntimeHooks.start = vi.fn(async (opts) => {
+      opts.signal.addEventListener('abort', v1Queue.close, { once: true });
+      return {
+        client: {
+          session: {
+            create: vi.fn(async () => ({ data: { id: 'ses-new-v1-coll' } })),
+            get: collisionGet,
+            list: vi.fn(async () => ({ data: [] })),
+            message: vi.fn(async () => ({ data: null })),
+            messages: collisionMessages,
+            prompt: vi.fn(async () => ({ data: {} })),
+            promptAsync: vi.fn(async () => ({ data: undefined })),
+            abort: vi.fn(async () => ({ data: true })),
+          },
+          provider: { list: vi.fn(async () => ({ data: { connected: [], all: [], default: {} } })) },
+          event: { subscribe: vi.fn(async () => ({ stream: v1Queue.stream })) },
+          postSessionIdPermissionsPermissionId: vi.fn(async () => ({ data: true })),
+        } as any,
+        server: { url: 'http://127.0.0.1:42006', close: vi.fn(async () => { v1Queue.close(); }) },
+      };
+    });
+    const pCollision = new OpenCodeSdkProvider();
+    const collisionOwners: Array<string | undefined> = [];
+    pCollision.onSessionInfo((_sid, info) => collisionOwners.push(info.openCodeStorageOwner));
+    await pCollision.connect({ binaryPath: v1Bin, cwd: root } as any);
+    // Unowned legacy restore picks embedded because embedded has newer follow-up state!
+    const resumedEmbRoute = await pCollision.createSession({
+      sessionKey: 'route-collision-emb',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+    });
+    expect(resumedEmbRoute).toBe('route-collision-emb');
+    expect(collisionOwners[collisionOwners.length - 1]).toBe('embedded');
+    // Session only in v1 DB picks v1-cli!
+    const resumedV1Route = await pCollision.createSession({
+      sessionKey: 'route-only-v1',
+      cwd: root,
+      skipCreate: true,
+      resumeId: 'ses-only-v1',
+    });
+    expect(resumedV1Route).toBe('route-only-v1');
+    expect(collisionOwners[collisionOwners.length - 1]).toBe('v1-cli');
+    // Explicit ownership override forces v1-cli even if same ID is in embedded
+    const forcedV1Route = await pCollision.createSession({
+      sessionKey: 'route-explicit-v1',
+      cwd: root,
+      skipCreate: true,
+      resumeId: oldSessionId,
+      openCodeStorageOwner: 'v1-cli',
+    });
+    expect(forcedV1Route).toBe('route-explicit-v1');
+    await pCollision.disconnect();
     await pUpgraded.disconnect();
   }, 30_000);
 
@@ -1153,6 +1447,50 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
         { permission: 'task', pattern: '*', action: 'deny' },
         { permission: 'subagent', pattern: '*', action: 'deny' },
       ]);
+
+      // 3. Create existing session with custom specific deny (webfetch: deny) on stock server,
+      //    disconnect, restore with fenced+guarded provider (skipCreate: true), send noReply prompt (ZERO LLM calls),
+      //    and verify wildcard ask + webfetch deny + task/subagent deny ALL remain effective!
+      const customSession = await fencedState.client.session.create({
+        query: { directory: root },
+        body: {
+          title: 'f4-custom-restore',
+          permission: [{ permission: 'webfetch', pattern: '*', action: 'deny' }],
+        },
+        throwOnError: true,
+      });
+      const customId = customSession.data.id;
+      const rRestored = await guardedProvider.createSession({
+        sessionKey: 'f4-restored',
+        sessionName: 'f4-restored',
+        cwd: root,
+        skipCreate: true,
+        resumeId: customId,
+      });
+      const restoredState = ((guardedProvider as any).v1Delegate as any).sessions.get(rRestored);
+      // Issue a real noReply prompt WITHOUT tools (matching v1 promptAsync wire payload)
+      await restoredState.client.session.prompt({
+        path: { id: customId },
+        query: { directory: root },
+        body: {
+          noReply: true,
+          parts: [{ type: 'text', text: 'noop-policy-check' }],
+        },
+        throwOnError: true,
+      });
+      const afterPromptSession = await restoredState.client.session.get({ path: { id: customId }, query: { directory: root } });
+      const perms = (afterPromptSession.data?.permission ?? []) as Array<{ permission: string; pattern: string; action: string }>;
+      // Verify .findLast() semantics: * -> ask appears BEFORE webfetch -> deny & task/subagent -> deny
+      const evalPerm = (tool: string) => {
+        for (let i = perms.length - 1; i >= 0; i--) {
+          if (perms[i]!.permission === tool || perms[i]!.permission === '*') return perms[i]!.action;
+        }
+        return 'allow';
+      };
+      expect(evalPerm('webfetch')).toBe('deny');
+      expect(evalPerm('task')).toBe('deny');
+      expect(evalPerm('subagent')).toBe('deny');
+      expect(evalPerm('bash')).toBe('ask');
       await guardedProvider.disconnect();
     } finally {
       for (const [k, v] of Object.entries(prevXdg)) {
@@ -1160,5 +1498,5 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
         else process.env[k] = v;
       }
     }
-  }, 20_000);
+  }, 45_000);
 });

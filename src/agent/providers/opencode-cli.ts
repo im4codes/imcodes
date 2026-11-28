@@ -37,7 +37,13 @@ export interface OpenCodeCliLaunchPlan {
   resolvedPath: string;
   executable: string;
   prependArgs: string[];
-  shell?: boolean;
+  windowsVerbatimArguments?: boolean;
+}
+
+export interface OpenCodeCliCommand {
+  executable: string;
+  args: string[];
+  windowsVerbatimArguments?: boolean;
 }
 
 export interface OpenCodeCliProbeResult {
@@ -179,9 +185,46 @@ function parseWindowsCmdShimTarget(cmdPath: string): string | null {
   return normalize(join(dp0, inner));
 }
 
+function resolveWindowsCmdExe(env?: NodeJS.ProcessEnv): string {
+  const resolvedEnv = env ?? process.env;
+  return safeString(resolvedEnv.COMSPEC)
+    ?? `${safeString(resolvedEnv.SystemRoot) ?? 'C:\\Windows'}\\system32\\cmd.exe`;
+}
+
+function quoteWindowsCmdToken(token: string, alwaysQuote = false): string {
+  if (/[\r\n\0]/.test(token)) {
+    throw configError('OpenCode CLI command argument contains invalid control characters');
+  }
+  if (!alwaysQuote && token.length > 0 && !/[\s"&|<>^()%!]/.test(token)) {
+    return token;
+  }
+  return `"${token.replace(/"/g, '""')}"`;
+}
+
+export function buildOpenCodeCliCommand(
+  launchPlan: OpenCodeCliLaunchPlan,
+  cliArgs: readonly string[],
+): OpenCodeCliCommand {
+  if (launchPlan.windowsVerbatimArguments) {
+    const parts = [
+      quoteWindowsCmdToken(launchPlan.resolvedPath, true),
+      ...cliArgs.map((arg) => quoteWindowsCmdToken(arg)),
+    ];
+    return {
+      executable: launchPlan.executable,
+      args: [...launchPlan.prependArgs, `"${parts.join(' ')}"`],
+      windowsVerbatimArguments: true,
+    };
+  }
+  return {
+    executable: launchPlan.executable,
+    args: [...launchPlan.prependArgs, ...cliArgs],
+  };
+}
+
 export function buildOpenCodeCliLaunchPlan(
   resolvedPath: string,
-  options: { platform?: NodeJS.Platform; nodeExecutable?: string } = {},
+  options: { platform?: NodeJS.Platform; nodeExecutable?: string; env?: NodeJS.ProcessEnv } = {},
 ): OpenCodeCliLaunchPlan {
   const platform = options.platform ?? process.platform;
   const nodeExe = options.nodeExecutable ?? process.execPath;
@@ -194,7 +237,12 @@ export function buildOpenCodeCliLaunchPlan(
     if (scriptPath && isExecutableFile(scriptPath, platform)) {
       return { resolvedPath: abs, executable: nodeExe, prependArgs: [resolve(scriptPath)] };
     }
-    return { resolvedPath: abs, executable: abs, prependArgs: [], shell: true };
+    return {
+      resolvedPath: abs,
+      executable: resolveWindowsCmdExe(options.env),
+      prependArgs: ['/d', '/s', '/c'],
+      windowsVerbatimArguments: true,
+    };
   }
   return { resolvedPath: abs, executable: abs, prependArgs: [] };
 }
@@ -269,6 +317,7 @@ export function resolveOpenCodeCliLaunchPlan(options: {
   return buildOpenCodeCliLaunchPlan(resolved, {
     platform: options.platform,
     nodeExecutable: options.nodeExecutable,
+    env: options.env,
   });
 }
 
@@ -294,11 +343,13 @@ export async function probeOpenCodeCli(
   options: {
     timeoutMs?: number;
     platform?: NodeJS.Platform;
+    env?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
     execProbe?: (executable: string, args: string[], timeoutMs: number, launchPlan: OpenCodeCliLaunchPlan) => Promise<string>;
   } = {},
 ): Promise<OpenCodeCliProbeResult | null> {
   const launchPlan = typeof target === 'string'
-    ? buildOpenCodeCliLaunchPlan(target, { platform: options.platform })
+    ? buildOpenCodeCliLaunchPlan(target, { platform: options.platform, env: options.env })
     : target;
 
   let stat: ReturnType<typeof statSync>;
@@ -309,22 +360,23 @@ export async function probeOpenCodeCli(
     return null;
   }
 
-  const launchKey = JSON.stringify([launchPlan.executable, launchPlan.prependArgs, Boolean(launchPlan.shell)]);
+  const launchKey = JSON.stringify([launchPlan.executable, launchPlan.prependArgs, Boolean(launchPlan.windowsVerbatimArguments)]);
   const cached = probeCache.get(launchPlan.resolvedPath);
   if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.launchKey === launchKey) {
     return cached.result;
   }
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_CLI_PROBE_TIMEOUT_MS;
-  const probeArgs = [...launchPlan.prependArgs, '--version'];
+  const cmd = buildOpenCodeCliCommand(launchPlan, ['--version']);
   try {
     const rawOutput = options.execProbe
-      ? await options.execProbe(launchPlan.executable, probeArgs, timeoutMs, launchPlan)
+      ? await options.execProbe(cmd.executable, cmd.args, timeoutMs, launchPlan)
       : await (async () => {
-          const { stdout, stderr } = await execFileP(launchPlan.executable, probeArgs, {
+          const { stdout, stderr } = await execFileP(cmd.executable, cmd.args, {
             timeout: timeoutMs,
+            signal: options.signal,
             windowsHide: true,
-            ...(launchPlan.shell ? { shell: true } : {}),
+            ...(cmd.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
           });
           return `${stdout ?? ''}\n${stderr ?? ''}`;
         })();
@@ -355,6 +407,7 @@ export async function resolveOpenCodeTransport(options: {
   platform?: NodeJS.Platform;
   homeDir?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
   execProbe?: NonNullable<Parameters<typeof probeOpenCodeCli>[1]>['execProbe'];
 }): Promise<OpenCodeTransportResolution> {
   if (options.hookOverridden) {
@@ -410,6 +463,8 @@ export async function resolveOpenCodeTransport(options: {
   const probed = await probeOpenCodeCli(launchPlan, {
     timeoutMs: options.timeoutMs,
     platform: options.platform,
+    env,
+    signal: options.signal,
     execProbe: options.execProbe,
   });
   if (!probed) {
@@ -619,22 +674,21 @@ async function spawnV2ServeProcess(options: {
     ...(options.configJson ? { OPENCODE_CONFIG_CONTENT: options.configJson } : {}),
   };
 
-  const args = [
-    ...options.launchPlan.prependArgs,
+  const cmd = buildOpenCodeCliCommand(options.launchPlan, [
     'serve',
     '--hostname',
     options.hostname,
     '--port',
     String(options.port),
-  ];
+  ]);
   const child = spawn(
-    options.launchPlan.executable,
-    args,
+    cmd.executable,
+    cmd.args,
     {
       env: spawnEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
-      ...(options.launchPlan.shell ? { shell: true } : {}),
+      ...(cmd.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
     },
   );
   const processResource = bindSharedProviderProcessResource('opencode-sdk', child);
@@ -991,6 +1045,12 @@ export async function startOpenCodeV2CliHost(
             location: { directory: dirKey },
             config: { ...serverConfig },
           });
+          if (typeof entry.rawClient.experimental.mcp.connect === 'function') {
+            await entry.rawClient.experimental.mcp.connect({
+              server,
+              location: { directory: dirKey },
+            }).catch(() => {});
+          }
         }
       }
       if (prevBinding) {
@@ -1212,32 +1272,80 @@ export function isExpiredOpenCodeAuthError(error: unknown, sessionProviderId: st
   return (is401 || isStatuslessSdkAuth) && hasExpiredKeyMarker;
 }
 
-export async function hasSessionInOpenCodeSqliteDb(
+export interface OpenCodeSqliteSessionSnapshot {
+  dbPath: string;
+  table: 'session_v2' | 'session';
+  timeUpdated: number;
+  messageCount: number;
+  latestMessageTime: number;
+}
+
+export async function inspectOpenCodeSqliteSessions(
   sessionId: string,
   dbPaths: readonly string[],
-): Promise<boolean> {
-  if (!sessionId.trim() || dbPaths.length === 0) return false;
+): Promise<OpenCodeSqliteSessionSnapshot[]> {
+  if (!sessionId.trim() || dbPaths.length === 0) return [];
   let DatabaseSyncCtor: typeof import('node:sqlite')['DatabaseSync'];
   try {
     ({ DatabaseSync: DatabaseSyncCtor } = await import('node:sqlite'));
   } catch {
-    return false;
+    return [];
   }
+  const results: OpenCodeSqliteSessionSnapshot[] = [];
   for (const dbFile of dbPaths) {
     let db: import('node:sqlite').DatabaseSync | null = null;
     try {
       db = new DatabaseSyncCtor(dbFile, { readOnly: true });
       const tables = new Set(
-        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session', 'session_v2')").all() as Array<{ name: string }>)
+        (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session', 'session_v2', 'message', 'session_message')").all() as Array<{ name: string }>)
           .map((t) => t.name),
       );
       if (tables.has('session_v2')) {
-        const foundV2 = db.prepare('SELECT 1 AS found FROM session_v2 WHERE id = ? LIMIT 1').get(sessionId) as { found?: number } | undefined;
-        if (foundV2) return true;
+        const rowV2 = db.prepare('SELECT time_created, time_updated FROM session_v2 WHERE id = ? LIMIT 1').get(sessionId) as
+          | { time_created?: number; time_updated?: number }
+          | undefined;
+        if (rowV2) {
+          let messageCount = 0;
+          let latestMessageTime = 0;
+          if (tables.has('session_message')) {
+            const agg = db.prepare(
+              'SELECT COUNT(*) AS cnt, COALESCE(MAX(COALESCE(time_updated, time_created)), 0) AS latest FROM session_message WHERE session_id = ?',
+            ).get(sessionId) as { cnt?: number; latest?: number } | undefined;
+            messageCount = Number(agg?.cnt ?? 0);
+            latestMessageTime = Number(agg?.latest ?? 0);
+          }
+          results.push({
+            dbPath: dbFile,
+            table: 'session_v2',
+            timeUpdated: Number(rowV2.time_updated ?? rowV2.time_created ?? 0),
+            messageCount,
+            latestMessageTime,
+          });
+          continue;
+        }
       }
       if (tables.has('session')) {
-        const foundV1 = db.prepare('SELECT 1 AS found FROM session WHERE id = ? LIMIT 1').get(sessionId) as { found?: number } | undefined;
-        if (foundV1) return true;
+        const rowV1 = db.prepare('SELECT time_created, time_updated FROM session WHERE id = ? LIMIT 1').get(sessionId) as
+          | { time_created?: number; time_updated?: number }
+          | undefined;
+        if (rowV1) {
+          let messageCount = 0;
+          let latestMessageTime = 0;
+          if (tables.has('message')) {
+            const agg = db.prepare(
+              'SELECT COUNT(*) AS cnt, COALESCE(MAX(COALESCE(time_updated, time_created)), 0) AS latest FROM message WHERE session_id = ?',
+            ).get(sessionId) as { cnt?: number; latest?: number } | undefined;
+            messageCount = Number(agg?.cnt ?? 0);
+            latestMessageTime = Number(agg?.latest ?? 0);
+          }
+          results.push({
+            dbPath: dbFile,
+            table: 'session',
+            timeUpdated: Number(rowV1.time_updated ?? rowV1.time_created ?? 0),
+            messageCount,
+            latestMessageTime,
+          });
+        }
       }
     } catch {
       // Ignore corrupt/unreadable candidate and continue searching
@@ -1249,5 +1357,26 @@ export async function hasSessionInOpenCodeSqliteDb(
       }
     }
   }
-  return false;
+  return results;
+}
+
+export async function inspectOpenCodeSqliteSession(
+  sessionId: string,
+  dbPaths: readonly string[],
+): Promise<OpenCodeSqliteSessionSnapshot | null> {
+  const snapshots = await inspectOpenCodeSqliteSessions(sessionId, dbPaths);
+  if (snapshots.length === 0) return null;
+  snapshots.sort((a, b) => (
+    b.messageCount - a.messageCount
+    || b.timeUpdated - a.timeUpdated
+    || b.latestMessageTime - a.latestMessageTime
+  ));
+  return snapshots[0] ?? null;
+}
+
+export async function hasSessionInOpenCodeSqliteDb(
+  sessionId: string,
+  dbPaths: readonly string[],
+): Promise<boolean> {
+  return (await inspectOpenCodeSqliteSession(sessionId, dbPaths)) !== null;
 }

@@ -2626,6 +2626,15 @@ function wireTransportSessionInfo(
         changed = true;
       }
     }
+    if (
+      !isIncognitoSession(next)
+      && typeof info.openCodeStorageOwner === 'string'
+      && info.openCodeStorageOwner
+      && next.transportConfig?.openCodeStorageOwner !== info.openCodeStorageOwner
+    ) {
+      next.transportConfig = { ...(next.transportConfig ?? {}), openCodeStorageOwner: info.openCodeStorageOwner };
+      changed = true;
+    }
 
     const presetSelectedModelIsAuthoritative = isClaudeCodeSdkAgentType(agentType)
       && !!next.ccPreset
@@ -3593,6 +3602,9 @@ export async function restoreTransportSessions(
         ...(dshLlmConfig ? { llm: dshLlmConfig } : {}),
         ...(piLlmConfig ? { piLlm: piLlmConfig } : {}),
         resumeId,
+        ...(!freshOnRestore && typeof s.transportConfig?.openCodeStorageOwner === 'string'
+          ? { openCodeStorageOwner: s.transportConfig.openCodeStorageOwner as 'v1-cli' | 'v2-cli' | 'embedded' }
+          : {}),
         ...(s.providerId === AGY_SDK_PROVIDER_ID ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, s.name) } : {}),
         effort: s.effort,
         // Restore path: only re-inject startup memory if the prior run hadn't
@@ -3640,6 +3652,14 @@ export async function restoreTransportSessions(
           : {}),
         ...(!freshQoderRestore && usesProviderResumeId(s.providerId) && latestSessionInfo?.resumeId
           ? { providerResumeId: latestSessionInfo.resumeId }
+          : {}),
+        ...(!freshOnRestore && typeof latestSessionInfo?.openCodeStorageOwner === 'string'
+          ? {
+            transportConfig: {
+              ...(currentForFinalize.transportConfig ?? {}),
+              openCodeStorageOwner: latestSessionInfo.openCodeStorageOwner,
+            },
+          }
           : {}),
         ...((freshOnRestore || currentForFinalize.providerSessionId !== actualProviderSid)
           ? { providerSessionId: actualProviderSid, ...(freshAfterCancel ? { qwenFreshOnResume: undefined } : {}) }
@@ -4324,6 +4344,9 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
+    ...(effectiveSkipCreate && typeof effectiveTransportConfig?.openCodeStorageOwner === 'string'
+      ? { openCodeStorageOwner: effectiveTransportConfig.openCodeStorageOwner as 'v1-cli' | 'v2-cli' | 'embedded' }
+      : {}),
     ...(agentType === AGY_SDK_PROVIDER_ID && !opts.incognito && (!skipStore || existing) ? { beforeNativeSessionStart: agyNativeStartBarrier(runtime, name) } : {}),
     effort: effectiveEffort,
     ...(existing?.crossVendorHandoff?.pending && !opts.fresh
@@ -4386,7 +4409,16 @@ async function launchTransportSessionInner(opts: LaunchOpts, launchState?: Trans
         // Only write transportConfig when we actually have one — avoid writing `{}`
         // which would clobber a concurrently-set supervision config on the next
         // load cycle. The existing config is already carried via effectiveTransportConfig.
-        ...(effectiveTransportConfig ? { transportConfig: effectiveTransportConfig } : {}),
+        ...(effectiveTransportConfig || (!opts.incognito && latestSessionInfo?.openCodeStorageOwner)
+          ? {
+            transportConfig: {
+              ...(effectiveTransportConfig ?? {}),
+              ...(!opts.incognito && latestSessionInfo?.openCodeStorageOwner
+                ? { openCodeStorageOwner: latestSessionInfo.openCodeStorageOwner }
+                : {}),
+            },
+          }
+          : {}),
         ...(requestedTransportModel && agentType === 'qwen' ? { qwenModel: requestedTransportModel } : {}),
         ...(qwenAuthType ? { qwenAuthType } : {}),
         ...(qwenAuthLimit ? { qwenAuthLimit } : {}),
