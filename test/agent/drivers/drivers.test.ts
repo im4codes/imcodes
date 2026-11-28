@@ -299,6 +299,12 @@ describe('OpenCodeDriver', () => {
         expect(launchCmd).toBe(`"${homeBin}"`);
         expect(resumeIdCmd).toBe(`"${homeBin}" -s "oc-123"`);
         expect(resumeFallbackCmd).toBe(`"${homeBin}" -c || "${homeBin}"`);
+        expect(resolveOpenCodeCliSync({ env: sparseEnv, homeDir: tempHome, platform: 'win32', isElevated: false }).source).toBe('home_bin');
+
+        // Elevated caller refuses existing ~/.opencode/bin/opencode.exe fallback under sparse PATH
+        const elevatedLaunchCmd = driver.buildLaunchCommand('deck_proj_w1', { env: sparseEnv, homeDir: tempHome, isElevated: true });
+        expect(elevatedLaunchCmd).toBe('opencode');
+        expect(resolveOpenCodeCliSync({ env: sparseEnv, homeDir: tempHome, platform: 'win32', isElevated: true }).source).toBe('missing');
 
         // PATH-installed opencode takes precedence over ~/.opencode/bin
         const pathBin = path.join(pathBinDir, 'opencode.cmd');
@@ -358,7 +364,6 @@ describe('OpenCodeDriver', () => {
 
       // Elevated caller (Windows admin/SYSTEM or POSIX root with non-/root home) refuses user-writable home fallback
       expect(resolveOpenCodeCliSync({ env: { PATH: '/usr/bin' }, homeDir: tempHome, platform: 'linux', isElevated: true }).source).toBe('missing');
-      expect(resolveOpenCodeCliSync({ env: { PATH: 'C:\\Windows\\System32' }, homeDir: 'C:\\Users\\Alice Smith', platform: 'win32', isElevated: true }).source).toBe('missing');
       const winResolved = await resolveOpenCodeCliAsync({
         platform: 'win32',
         env: { PATH: 'C:\\Windows\\System32' },
