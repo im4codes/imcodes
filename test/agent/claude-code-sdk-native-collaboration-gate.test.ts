@@ -98,10 +98,11 @@ describe('Claude SDK native collaboration pre-execution gate', () => {
     // Not hidden, not disabled: only native scheduling tools stay disallowed.
     expect(options.disallowedTools).not.toContain('Agent');
     expect(options.disallowedTools).not.toContain('Task');
-    // The native-agent gate first, then the Bash tool-execution guard (its own test file).
-    expect(matchers).toHaveLength(2);
+    // The native-agent gate first, then the Bash and file-tool execution guards (tested separately).
+    expect(matchers).toHaveLength(3);
     expect(matchers[0]!.matcher).toBe('Agent|Task|Workflow|SendMessage');
     expect(matchers[1]!.matcher).toBe('Bash');
+    expect(matchers[2]!.matcher).toBe('^(?:Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep|LS)$');
     expect(typeof hook).toBe('function');
   });
 

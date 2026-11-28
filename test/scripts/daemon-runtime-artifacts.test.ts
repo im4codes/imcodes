@@ -292,6 +292,52 @@ describe('package-lock filtering and node_modules pruning', () => {
     expect(existsSync(join(nmWin, 'onnxruntime-node/bin/napi-v3/win32/x64/dxcompiler.dll'))).toBe(false);
     expect(existsSync(join(nmWin, 'onnxruntime-node/bin/napi-v3/win32/x64/dxil.dll'))).toBe(false);
   });
+
+  it('prunes foreign bun-pty native binaries per target while preserving target libraries and non-binary files', () => {
+    const allBunPtyFiles = [
+      'librust_pty.dylib',
+      'librust_pty_arm64.dylib',
+      'librust_pty.so',
+      'librust_pty_musl.so',
+      'librust_pty_arm64.so',
+      'librust_pty_arm64_musl.so',
+      'rust_pty.dll',
+      'rust_pty_arm64.dll',
+      'README.txt',
+    ];
+    const expectedByTarget: Array<{ target: string; hostOs: string; hostArch: string; kept: string[] }> = [
+      { target: 'darwin-arm64', hostOs: 'darwin', hostArch: 'arm64', kept: ['librust_pty_arm64.dylib', 'README.txt'] },
+      { target: 'darwin-x64', hostOs: 'darwin', hostArch: 'x64', kept: ['librust_pty.dylib', 'README.txt'] },
+      { target: 'linux-x64', hostOs: 'linux', hostArch: 'x64', kept: ['librust_pty.so', 'librust_pty_musl.so', 'README.txt'] },
+      { target: 'linux-arm64', hostOs: 'linux', hostArch: 'arm64', kept: ['librust_pty_arm64.so', 'librust_pty_arm64_musl.so', 'README.txt'] },
+      { target: 'win32-x64', hostOs: 'win32', hostArch: 'x64', kept: ['rust_pty.dll', 'README.txt'] },
+    ];
+
+    for (const tc of expectedByTarget) {
+      const nm = join(tempDir(), `nm-${tc.target}`);
+      for (const fileName of allBunPtyFiles) {
+        const abs = join(nm, 'bun-pty', 'rust-pty', 'target', 'release', fileName);
+        mkdirSync(join(abs, '..'), { recursive: true });
+        writeFileSync(abs, 'bin');
+      }
+      const res = pruneStagedNodeModulesForTarget(nm, parseDaemonRuntimeTarget(tc.target), {
+        hostOs: tc.hostOs,
+        hostArch: tc.hostArch,
+      });
+      expect(res.bytesRemoved).toBeGreaterThan(0);
+      for (const fileName of allBunPtyFiles) {
+        const exists = existsSync(join(nm, 'bun-pty', 'rust-pty', 'target', 'release', fileName));
+        expect(exists).toBe(tc.kept.includes(fileName));
+      }
+    }
+
+    // Safe when bun-pty directory is absent
+    const emptyNm = join(tempDir(), 'nm-no-bun-pty');
+    mkdirSync(emptyNm, { recursive: true });
+    expect(pruneStagedNodeModulesForTarget(emptyNm, parseDaemonRuntimeTarget('darwin-arm64'))).toEqual({
+      bytesRemoved: 0,
+    });
+  });
 });
 
 describe('manifest generation and verification', () => {

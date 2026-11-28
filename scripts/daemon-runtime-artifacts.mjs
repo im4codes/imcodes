@@ -107,6 +107,14 @@ const ONNXRUNTIME_GPU_STRIP_RULES = Object.freeze([
   { os: 'win32', arch: 'arm64', files: ['dxcompiler.dll', 'dxil.dll'] },
 ]);
 
+const BUN_PTY_TARGET_BINARIES = Object.freeze({
+  'darwin-arm64': new Set(['librust_pty_arm64.dylib']),
+  'darwin-x64': new Set(['librust_pty.dylib']),
+  'linux-x64': new Set(['librust_pty.so', 'librust_pty_musl.so']),
+  'linux-arm64': new Set(['librust_pty_arm64.so', 'librust_pty_arm64_musl.so']),
+  'win32-x64': new Set(['rust_pty.dll']),
+});
+
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -325,6 +333,17 @@ export function pruneStagedNodeModulesForTarget(nodeModulesDir, target, options 
     }
     if (hostOs !== target.os || hostArch !== target.arch) {
       measureAndRemove(join(nodePtyRoot, 'build'));
+    }
+  }
+
+  // 6. Prune bun-pty foreign native binaries in rust-pty/target/release.
+  const bunPtyReleaseDir = join(nodeModulesDir, 'bun-pty', 'rust-pty', 'target', 'release');
+  const allowedBunPtyBinaries = BUN_PTY_TARGET_BINARIES[target.target];
+  if (allowedBunPtyBinaries && existsSync(bunPtyReleaseDir)) {
+    for (const entry of readdirSync(bunPtyReleaseDir)) {
+      if (/\.(?:dylib|so|dll)$/i.test(entry) && !allowedBunPtyBinaries.has(entry)) {
+        measureAndRemove(join(bunPtyReleaseDir, entry));
+      }
     }
   }
 

@@ -27,6 +27,10 @@ const ALLOWED: Record<string, AllowedEntry> = {
   'src/util/test-home-guard.ts': 'names the REAL ~/.imcodes (from passwd) on purpose so tests can refuse to open it',
   'src/node/local-daemon-discovery.ts': 'reads ANOTHER local account\'s server.json by design',
   'src/daemon/remote-desktop-daemon.ts': 'explicit `home` argument (a caller-supplied account home), else the resolver',
+  'src/daemon/participant-privacy-guard.ts': {
+    reason: 'SINGLE_SENSITIVE_DIRS privacy blocklist names .imcodes so participant guard blocks host state access; never resolves or opens host state paths',
+    expectedCount: 1,
+  },
   'src/agent/provider-quota.ts': 'tmpdir() store under test',
   'src/agent/claude-usage-quota.ts': 'tmpdir() store under test',
   'src/agent/grok-usage-quota.ts': 'tmpdir() store under test',
@@ -114,6 +118,10 @@ describe('IMCODES_HOME reaches every state path', () => {
 
   it('rejects any extra unapproved `.imcodes` path added to a count-bounded exception file', () => {
     const cases: Array<{ rel: string; extraLine: string }> = [
+      {
+        rel: 'src/daemon/participant-privacy-guard.ts',
+        extraLine: "const leaked = `${homedir()}/.imcodes`;",
+      },
       {
         rel: 'shared/desktop-installer-compatibility.ts',
         extraLine: "const leaked = `${homedir()}/.imcodes`;",

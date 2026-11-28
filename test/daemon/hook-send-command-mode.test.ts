@@ -5,6 +5,7 @@
  * on the priority stop path, and never lets a command ride the ordinary `/send`.
  */
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
+import { HOOK_SESSION_CREDENTIAL_HEADER } from '../../shared/hook-session-credential.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
@@ -47,16 +48,26 @@ import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store
 function makeSession(overrides: Record<string, unknown>) {
   return {
     name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain', agentType: 'claude-code', projectDir: '/work/alpha',
-    state: 'idle', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 2, ...overrides,
+    state: 'idle', hookCredential: 'test-hook-cred', restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 2, ...overrides,
   };
 }
 
-function post(port: number, path: string, body: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }> {
+function post(port: number, path: string, body: Record<string, unknown>, headers?: Record<string, string>): Promise<{ status: number; body: Record<string, unknown> }> {
+  const claimedFrom = typeof body.from === 'string' ? getSessionMock(body.from) as { hookCredential?: string } | null | undefined : null;
+  const authHeaders: Record<string, string> = claimedFrom?.hookCredential && headers?.[HOOK_SESSION_CREDENTIAL_HEADER] === undefined
+    ? { [HOOK_SESSION_CREDENTIAL_HEADER]: claimedFrom.hookCredential }
+    : {};
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({
       hostname: '127.0.0.1', port, path, method: 'POST', agent: false,
-      headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(data)), Connection: 'close' },
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': String(Buffer.byteLength(data)),
+        Connection: 'close',
+        ...authHeaders,
+        ...headers,
+      },
     }, (res) => {
       let response = '';
       res.on('data', (chunk) => { response += chunk; });

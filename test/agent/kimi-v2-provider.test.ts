@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -1770,7 +1770,7 @@ describe('KimiV2Provider', () => {
   });
 
   it('enforces toolExecutionGuard in requestPermission, readTextFile, and writeTextFile BEFORE access and preserves owner turns', async () => {
-    const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-priv-'));
+    const tmpDir = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'imcodes-kimi-priv-')));
     try {
       const secretFile = path.join(tmpDir, 'id_ed25519');
       writeFileSync(secretFile, 'PRIVATE-KEY\n');
