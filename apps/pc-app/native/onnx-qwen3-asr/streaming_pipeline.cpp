@@ -174,6 +174,45 @@ void Qwen3StreamingPipeline::run_loop() {
     return candidate;
   };
 
+  auto has_prior_active_state = [&]() -> bool {
+    return !active_text.empty() ||
+           !active_trusted_real_text.empty() ||
+           retracted_segment_single_hotword ||
+           pending_retraction_final;
+  };
+
+  auto prepare_trimmed_audio = [&](
+      const std::vector<float>& seg_copy,
+      size_t prev_decoded_count,
+      std::vector<float>& out_trimmed,
+      size_t& out_trim_start) -> bool {
+    const SpeechEnergyBounds bounds = scan_speech_energy_bounds(seg_copy, 16000, false);
+    if (!bounds.found || bounds.last < bounds.first) {
+      confirmed_prefix_tokens.clear();
+      last_prefix_trim_start = std::numeric_limits<size_t>::max();
+      return false;
+    }
+    // Check unpadded speech bounds against prev_decoded_count so appending pure trailing
+    // silence never triggers a redundant decode that could truncate trusted active_text.
+    const bool has_new_speech =
+        (prev_decoded_count == 0) || (bounds.last >= prev_decoded_count);
+    if (!has_new_speech && has_prior_active_state()) {
+      return false;
+    }
+    out_trimmed = trim_silence_edges(seg_copy, 16000, 250, &out_trim_start);
+    if (out_trimmed.empty()) {
+      confirmed_prefix_tokens.clear();
+      last_prefix_trim_start = std::numeric_limits<size_t>::max();
+      return false;
+    }
+    if (last_prefix_trim_start != std::numeric_limits<size_t>::max() &&
+        out_trim_start != last_prefix_trim_start) {
+      confirmed_prefix_tokens.clear();
+    }
+    last_prefix_trim_start = out_trim_start;
+    return true;
+  };
+
   while (true) {
     bool abort_now = false;
     bool is_stop = false;
@@ -224,13 +263,15 @@ void Qwen3StreamingPipeline::run_loop() {
       break;
     }
 
-    const size_t new_count = current_len - last_decoded_count;
+    const size_t prev_decoded_count = last_decoded_count;
+    const size_t new_count = current_len - prev_decoded_count;
     const bool is_final_pass = is_stop && is_producer_finished && !has_remaining_pending;
 
     if (is_final_pass) {
-      // Segmented finalization: if no new undecoded samples arrived since the last pass
-      // (new_count == 0), emit finalized text with zero extra decode calls; otherwise decode
-      // only active_segment_ while preserving confirmed_prefix_tokens and committed_text.
+      // Segmented finalization: if no new undecoded speech arrived since the last pass
+      // (new_count == 0 or suffix contains only trailing silence while prior state exists),
+      // emit finalized text with zero extra decode calls; otherwise decode only
+      // active_segment_ while preserving confirmed_prefix_tokens and committed_text.
       std::string final_seg = active_text;
       if (new_count > 0) {
         std::vector<float> seg_copy;
@@ -241,21 +282,8 @@ void Qwen3StreamingPipeline::run_loop() {
         }
         if (seg_copy.size() >= config_.min_final_samples) {
           size_t trim_start = 0;
-          const std::vector<float> trimmed_tail =
-              trim_silence_edges(seg_copy, 16000, 250, &trim_start);
-          if (trimmed_tail.empty()) {
-            confirmed_prefix_tokens.clear();
-            last_prefix_trim_start = std::numeric_limits<size_t>::max();
-            if (has_hotwords) {
-              final_seg = active_trusted_real_text;
-            }
-          } else {
-            if (last_prefix_trim_start != std::numeric_limits<size_t>::max() &&
-                trim_start != last_prefix_trim_start) {
-              confirmed_prefix_tokens.clear();
-            }
-            last_prefix_trim_start = trim_start;
-
+          std::vector<float> trimmed_tail;
+          if (prepare_trimmed_audio(seg_copy, prev_decoded_count, trimmed_tail, trim_start)) {
             DecodeOptions opts;
             opts.hotwords_context = config_.hotwords_context;
             opts.language = config_.language;
@@ -289,8 +317,10 @@ void Qwen3StreamingPipeline::run_loop() {
                 final_seg = san.text;
               }
             }
+          } else if (has_hotwords && active_trusted_real_text.empty() && active_text.empty()) {
+            final_seg.clear();
           }
-        } else if (has_hotwords) {
+        } else if (has_hotwords && !active_trusted_real_text.empty()) {
           final_seg = active_trusted_real_text;
         }
       }
@@ -333,18 +363,8 @@ void Qwen3StreamingPipeline::run_loop() {
       }
 
       size_t trim_start = 0;
-      const std::vector<float> trimmed_seg = trim_silence_edges(seg_copy, 16000, 250, &trim_start);
-      if (trimmed_seg.empty()) {
-        // Sub-threshold silence chunk: skip decode so hotwords cannot hallucinate.
-        confirmed_prefix_tokens.clear();
-        last_prefix_trim_start = std::numeric_limits<size_t>::max();
-      } else {
-        // Anchor prefix continuation to the exact trimmed audio origin; clear if leading trim boundary shifted.
-        if (last_prefix_trim_start != std::numeric_limits<size_t>::max() && trim_start != last_prefix_trim_start) {
-          confirmed_prefix_tokens.clear();
-        }
-        last_prefix_trim_start = trim_start;
-
+      std::vector<float> trimmed_seg;
+      if (prepare_trimmed_audio(seg_copy, prev_decoded_count, trimmed_seg, trim_start)) {
         DecodeOptions opts;
         opts.hotwords_context = config_.hotwords_context;
         opts.language = config_.language;

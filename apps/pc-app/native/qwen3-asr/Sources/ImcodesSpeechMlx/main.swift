@@ -1694,6 +1694,48 @@ final class QwenSegmentedDecodeEngine {
         return !cancel
     }
 
+    private func emitFinalFromCurrentState() {
+        if !lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal || retractedSegmentSingleHotword || !activeText.isEmpty {
+            let dropRetractedCommitted = !hotwordTerms.isEmpty
+                && committedPendingSingleHotword
+                && !committedHasTrustedRealText
+                && (retractedSegmentSingleHotword || pendingRetractionFinal)
+            let baseCommitted = dropRetractedCommitted ? "" : committedText
+            let rawFinalCombined = !baseCommitted.isEmpty && !activeText.isEmpty
+                ? joinTranscriptSegments(baseCommitted, activeText)
+                : (!activeText.isEmpty
+                    ? activeText
+                    : (!lastEmittedText.isEmpty && !dropRetractedCommitted ? lastEmittedText : baseCommitted))
+            let guardedCombined = hotwordTerms.isEmpty
+                ? rawFinalCombined
+                : stripVoiceHotwordHallucination(
+                    rawFinalCombined,
+                    hotwordTerms: hotwordTerms,
+                    allowSingle: false,
+                    wholeOnly: true
+                )
+            let finalCombined: String
+            if !hotwordTerms.isEmpty
+                && (retractedSegmentSingleHotword || pendingRetractionFinal)
+                && !committedHasTrustedRealText
+                && activeTrustedRealText.isEmpty {
+                finalCombined = ""
+            } else if !hotwordTerms.isEmpty && guardedCombined.isEmpty && !rawFinalCombined.isEmpty && committedHasTrustedRealText {
+                finalCombined = committedText
+            } else {
+                finalCombined = guardedCombined
+            }
+            pendingRetractionFinal = false
+            retractedSegmentSingleHotword = false
+            lastEmittedText = finalCombined
+            _ = emitJsonIfNotAborted([
+                "type": "result",
+                "text": finalCombined,
+                "isFinal": true,
+            ])
+        }
+    }
+
     func runLoop() {
         var skipNextWait = false
         while true {
@@ -1728,42 +1770,7 @@ final class QwenSegmentedDecodeEngine {
 
             let isFinalPass = isStop && isProducerFinished && !hasRemainingPending
             if isFinalPass && newCount == 0 {
-                if !lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal || retractedSegmentSingleHotword {
-                    let dropRetractedCommitted = !hotwordTerms.isEmpty
-                        && committedPendingSingleHotword
-                        && !committedHasTrustedRealText
-                        && (retractedSegmentSingleHotword || pendingRetractionFinal)
-                    let baseCommitted = dropRetractedCommitted ? "" : committedText
-                    let rawFinalCombined = !baseCommitted.isEmpty && !activeText.isEmpty
-                        ? joinTranscriptSegments(baseCommitted, activeText)
-                        : (!lastEmittedText.isEmpty && !dropRetractedCommitted ? lastEmittedText : baseCommitted)
-                    let guardedCombined = hotwordTerms.isEmpty
-                        ? rawFinalCombined
-                        : stripVoiceHotwordHallucination(
-                            rawFinalCombined,
-                            hotwordTerms: hotwordTerms,
-                            allowSingle: false,
-                            wholeOnly: true
-                        )
-                    let finalCombined: String
-                    if !hotwordTerms.isEmpty
-                        && (retractedSegmentSingleHotword || pendingRetractionFinal)
-                        && !committedHasTrustedRealText
-                        && activeTrustedRealText.isEmpty {
-                        finalCombined = ""
-                    } else if !hotwordTerms.isEmpty && guardedCombined.isEmpty && !rawFinalCombined.isEmpty && committedHasTrustedRealText {
-                        finalCombined = committedText
-                    } else {
-                        finalCombined = guardedCombined
-                    }
-                    pendingRetractionFinal = false
-                    retractedSegmentSingleHotword = false
-                    _ = emitJsonIfNotAborted([
-                        "type": "result",
-                        "text": finalCombined,
-                        "isFinal": true,
-                    ])
-                }
+                emitFinalFromCurrentState()
                 break
             }
 
@@ -1771,86 +1778,110 @@ final class QwenSegmentedDecodeEngine {
             if (isFinalPass && currentLen > 0) || newCount >= threshold || (currentLen >= maxSegmentSamples && hasRemainingPending) {
                 let audioCopy: [Float]
                 let prefixCopy: [Int32]
+                let prevDecodedCount: Int
                 lock.lock()
                 audioCopy = activeSegment
                 prefixCopy = confirmedTokens
+                prevDecodedCount = lastDecodedCount
                 lastDecodedCount = currentLen
                 lock.unlock()
 
                 let hasTrustedText = !activeTrustedRealText.isEmpty || (hotwordTerms.isEmpty && !activeText.isEmpty)
+                let hasPriorActiveState = !activeText.isEmpty || !activeTrustedRealText.isEmpty || retractedSegmentSingleHotword || pendingRetractionFinal
+                let speechBounds = scanSpeechEnergyRange(audioCopy[...], sampleRate: 16_000, stopOnFirst: false)
+                let hasNewSpeech: Bool = {
+                    guard let speechBounds else { return false }
+                    return prevDecodedCount == 0 || speechBounds.last >= prevDecodedCount
+                }()
+                let onlyTrailingSilence = (speechBounds != nil) && !hasNewSpeech && hasPriorActiveState
 
-                let decodeAudio: [Float]
-                if !prefixCopy.isEmpty {
-                    let fixedStart = activeSegmentTrimStart ?? 0
-                    decodeAudio = trimTrailingSilence(audioCopy, fixedStart: fixedStart)
-                } else if let trimmed = trimSilenceEdgesWithRange(audioCopy) {
-                    decodeAudio = trimmed.samples
-                    activeSegmentTrimStart = trimmed.range.lowerBound
-                } else {
-                    decodeAudio = []
-                    activeSegmentTrimStart = nil
-                }
-
-                if decodeAudio.isEmpty && (!hasTrustedText || isFinalPass) {
-                    // Pure silence / faint noise floor: skip ASR decode so hotwords context cannot hallucinate.
-                    if isFinalPass && (!lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal || activePendingSingleHotword) {
-                        let finalCombined: String
-                        if hotwordTerms.isEmpty {
-                            finalCombined = !lastEmittedText.isEmpty ? lastEmittedText : committedText
-                        } else {
-                            finalCombined = (!lastEmittedText.isEmpty && !activePendingSingleHotword) ? lastEmittedText : committedText
-                        }
-                        pendingRetractionFinal = false
-                        activePendingSingleHotword = false
-                        lastEmittedText = finalCombined
-                        _ = emitJsonIfNotAborted([
-                            "type": "result",
-                            "text": finalCombined,
-                            "isFinal": true,
-                        ])
-                    }
-                } else if !decodeAudio.isEmpty, let result = try? decodeFn(
-                    decodeAudio,
-                    prefixCopy,
-                    { [weak self] in
-                        guard let self else { throw CancellationError() }
-                        if self.isAbortedNow() { throw CancellationError() }
-                    }
-                ) {
-                    if isAbortedNow() {
+                if onlyTrailingSilence {
+                    // New samples contain only trailing silence; keep prior active/committed text without re-decoding.
+                    if isFinalPass {
+                        emitFinalFromCurrentState()
                         break
                     }
-                    let rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let hasHotwords = !hotwordTerms.isEmpty
-                    if !hasHotwords {
-                        let text = sanitizeAsrRepetitionLoop(rawText)
-                        let hitRepetitionLoop = text != rawText
-                        activeText = text
-                        if hitRepetitionLoop {
-                            confirmedTokens = []
-                            activeSegmentTrimStart = nil
-                        } else if !isFinalPass {
-                            confirmedTokens = rollbackPrefixFn(
-                                result.tokens,
-                                rollbackTokenCount,
-                                expectLanguageHeader
-                            )
-                        }
-                        var combined = joinTranscriptSegments(committedText, activeText)
-                        if isFinalPass && combined.isEmpty && !lastEmittedText.isEmpty && !hitRepetitionLoop {
-                            combined = lastEmittedText
-                        }
-                        if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
-                            lastEmittedText = combined
-                            if !emitJsonIfNotAborted([
-                                "type": "result",
-                                "text": combined,
-                                "isFinal": isFinalPass,
-                            ]) {
-                                break
-                            }
-                        }
+                } else {
+                    let decodeAudio: [Float]
+                    if speechBounds == nil {
+                        decodeAudio = []
+                        activeSegmentTrimStart = nil
+                    } else if !prefixCopy.isEmpty {
+                        let fixedStart = activeSegmentTrimStart ?? 0
+                        decodeAudio = trimTrailingSilence(audioCopy, fixedStart: fixedStart)
+                    } else if let trimmed = trimSilenceEdgesWithRange(audioCopy) {
+                        decodeAudio = trimmed.samples
+                        activeSegmentTrimStart = trimmed.range.lowerBound
                     } else {
+                        decodeAudio = []
+                        activeSegmentTrimStart = nil
+                    }
+
+                    if decodeAudio.isEmpty && (!hasTrustedText || isFinalPass) {
+                        // Pure silence / faint noise floor: skip ASR decode so hotwords context cannot hallucinate.
+                        if isFinalPass && (!lastEmittedText.isEmpty || !committedText.isEmpty || pendingRetractionFinal || activePendingSingleHotword) {
+                            let finalCombined: String
+                            if hotwordTerms.isEmpty {
+                                finalCombined = !lastEmittedText.isEmpty ? lastEmittedText : committedText
+                            } else {
+                                finalCombined = (!lastEmittedText.isEmpty && !activePendingSingleHotword) ? lastEmittedText : committedText
+                            }
+                            pendingRetractionFinal = false
+                            activePendingSingleHotword = false
+                            lastEmittedText = finalCombined
+                            _ = emitJsonIfNotAborted([
+                                "type": "result",
+                                "text": finalCombined,
+                                "isFinal": true,
+                            ])
+                        }
+                    } else if !decodeAudio.isEmpty, let result = try? decodeFn(
+                        decodeAudio,
+                        prefixCopy,
+                        { [weak self] in
+                            guard let self else { throw CancellationError() }
+                            if self.isAbortedNow() { throw CancellationError() }
+                        }
+                    ) {
+                        if isAbortedNow() {
+                            break
+                        }
+                        let rawText = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let hasHotwords = !hotwordTerms.isEmpty
+                        if !hasHotwords {
+                            let previousActiveText = activeText
+                            let text = sanitizeAsrRepetitionLoop(rawText)
+                            let hitRepetitionLoop = text != rawText
+                            if isFinalPass && text.isEmpty && !previousActiveText.isEmpty {
+                                activeText = previousActiveText
+                            } else {
+                                activeText = text
+                            }
+                            if hitRepetitionLoop {
+                                confirmedTokens = []
+                                activeSegmentTrimStart = nil
+                            } else if !isFinalPass {
+                                confirmedTokens = rollbackPrefixFn(
+                                    result.tokens,
+                                    rollbackTokenCount,
+                                    expectLanguageHeader
+                                )
+                            }
+                            var combined = joinTranscriptSegments(committedText, activeText)
+                            if isFinalPass && combined.isEmpty && !lastEmittedText.isEmpty && !hitRepetitionLoop {
+                                combined = lastEmittedText
+                            }
+                            if !combined.isEmpty && (combined != lastEmittedText || isFinalPass) {
+                                lastEmittedText = combined
+                                if !emitJsonIfNotAborted([
+                                    "type": "result",
+                                    "text": combined,
+                                    "isFinal": isFinalPass,
+                                ]) {
+                                    break
+                                }
+                            }
+                        } else {
                         let preHallucination = stripVoiceHotwordHallucination(
                             rawText,
                             hotwordTerms: hotwordTerms,
@@ -2042,6 +2073,7 @@ final class QwenSegmentedDecodeEngine {
                         ])
                     }
                 }
+                } // end !onlyTrailingSilence
 
                 if !isFinalPass && currentLen >= maxSegmentSamples {
                     let nextCommitted = hotwordTerms.isEmpty

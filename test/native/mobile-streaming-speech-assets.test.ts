@@ -3624,7 +3624,7 @@ do {
     let finals = emitted.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
     check(finals.count == 1 && (finals[0]["text"] as? String) == "流式第一句，第二句", "case 3 final: \\(finals)")
 
-    // 3b: Stop with newCount > 0 (< strideSamples) decodes activeSegment while PRESERVING confirmedTokens!
+    // 3b: Stop with newCount > 0 (< strideSamples) of real speech decodes activeSegment while PRESERVING confirmedTokens!
     var emittedB: [[String: Any]] = []
     var prefixesB: [[Int32]] = []
     let lockB = NSLock()
@@ -3663,6 +3663,73 @@ do {
     check(prefixesB.count == 2 && prefixesB[0].isEmpty && prefixesB[1] == [10, 11, 12], "case 3b prefixes: \\(prefixesB)")
     let finalsB = emittedB.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
     check(finalsB.count == 1 && (finalsB[0]["text"] as? String) == "前缀部分和尾音", "case 3b final: \\(finalsB)")
+
+    // 3c (P0 counterexample): trusted activeText + trailing pure-zero silence (< stride) on stop MUST NOT re-decode or truncate;
+    //     and non-empty committedText + trusted activeText + empty final decode on real speech preserves BOTH segments.
+    var emittedC: [[String: Any]] = []
+    var callsC = 0
+    let lockC = NSLock()
+    let doneC = DispatchSemaphore(value: 0)
+    let engineC = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 12_800,
+        strideSamples: 12_800,
+        expectLanguageHeader: false,
+        decodeFn: { _, _, checkCancel in
+            try checkCancel()
+            lockC.lock(); callsC += 1; let p = callsC; lockC.unlock()
+            return QwenSegmentedDecodeResult(text: p == 1 ? "keep every word" : "keep", tokens: [1, 2, 3])
+        },
+        rollbackPrefixFn: { tokens, _, _ in tokens },
+        emitJsonFn: { payload in emitLock.lock(); emittedC.append(payload); emitLock.unlock() },
+        onLoopFinishedFn: { doneC.signal() }
+    )
+    DispatchQueue.global(qos: .userInitiated).async { engineC.runLoop() }
+    check(engineC.enqueue([Float](repeating: 0.2, count: 12_800)), "case 3c.1 enqueue failed")
+    for _ in 0..<200 {
+        lockC.lock(); let c = callsC; lockC.unlock()
+        if c >= 1 { break }
+        Thread.sleep(forTimeInterval: 0.005)
+    }
+    check(engineC.enqueue([Float](repeating: 0.0, count: 3_200)), "case 3c.2 trailing zero silence failed")
+    engineC.requestStop(abort: false, producerAlsoFinished: true)
+    check(doneC.wait(timeout: .now() + 5) == .success, "case 3c done")
+    check(callsC == 1, "case 3c decoded pure silence tail: calls=\\(callsC)")
+    let finalsC = emittedC.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
+    check(finalsC.count == 1 && (finalsC[0]["text"] as? String) == "keep every word", "case 3c final: \\(finalsC)")
+
+    var emittedD: [[String: Any]] = []
+    var callsD = 0
+    let lockD = NSLock()
+    let doneD = DispatchSemaphore(value: 0)
+    let engineD = QwenSegmentedDecodeEngine(
+        initialStrideSamples: 2_000,
+        strideSamples: 2_000,
+        maxSegmentSamples: 4_000,
+        expectLanguageHeader: false,
+        decodeFn: { _, _, checkCancel in
+            try checkCancel()
+            lockD.lock(); callsD += 1; let p = callsD; lockD.unlock()
+            if p == 1 { return QwenSegmentedDecodeResult(text: "first part", tokens: [1]) }
+            if p == 2 { return QwenSegmentedDecodeResult(text: "keep every word", tokens: [2]) }
+            return QwenSegmentedDecodeResult(text: "", tokens: [])
+        },
+        rollbackPrefixFn: { tokens, _, _ in tokens },
+        emitJsonFn: { payload in emitLock.lock(); emittedD.append(payload); emitLock.unlock() },
+        onLoopFinishedFn: { doneD.signal() }
+    )
+    DispatchQueue.global(qos: .userInitiated).async { engineD.runLoop() }
+    check(engineD.enqueue([Float](repeating: 0.2, count: 6_000)), "case 3d.1 enqueue failed")
+    for _ in 0..<200 {
+        lockD.lock(); let c = callsD; lockD.unlock()
+        if c >= 2 { break }
+        Thread.sleep(forTimeInterval: 0.005)
+    }
+    check(engineD.enqueue([Float](repeating: 0.2, count: 500)), "case 3d.2 real trail enqueue failed")
+    engineD.requestStop(abort: false, producerAlsoFinished: true)
+    check(doneD.wait(timeout: .now() + 5) == .success, "case 3d done")
+    check(callsD == 3, "case 3d expected final tail decode call: calls=\\(callsD)")
+    let finalsD = emittedD.filter { ($0["type"] as? String) == "result" && ($0["isFinal"] as? Bool) == true }
+    check(finalsD.count == 1 && (finalsD[0]["text"] as? String) == "first part keep every word", "case 3d final: \\(finalsD)")
 }
 
 // 4. Multi-segment (>432,000 = 3 segments): keeps committedText and decodes only trailing activeSegment.

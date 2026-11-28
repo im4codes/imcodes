@@ -659,6 +659,77 @@ void test_streaming_pipeline_30s_and_guards() {
     EXPECT_TRUE(!updates.empty() && updates.back().is_final);
     EXPECT_EQ(updates.back().text, "first-clause");
   }
+
+  // 9. P0 counterexample: trusted active_text + undecoded pure-zero trailing silence (< stride) on stop
+  //    MUST skip extra decode and preserve full active_text (even if mock would truncate or blank it),
+  //    while non-empty committed_text + empty final result on real new speech preserves both segments.
+  {
+    StreamingPipelineConfig cfg;
+    cfg.initial_stride_samples = 12800;
+    cfg.step_stride_samples = 12800;
+    cfg.max_segment_samples = 216000;
+    cfg.min_final_samples = 1600;
+    cfg.expect_language_header = false;
+
+    std::atomic<int> decode_calls{0};
+    std::vector<TranscriptUpdate> updates;
+    Qwen3StreamingPipeline pipe(
+        cfg,
+        tok,
+        [&](const std::vector<float>&, const DecodeOptions&) -> DecodeResult {
+          const int c = ++decode_calls;
+          DecodeResult r;
+          r.text = (c == 1) ? "keep every word" : "keep";
+          r.raw_tokens = {100, 101, 102, 103, 104, 105};
+          return r;
+        },
+        [&](const TranscriptUpdate& u) { updates.push_back(u); });
+
+    std::thread th([&]() { pipe.run_loop(); });
+    pipe.push_samples(std::vector<float>(12800, 0.2f));
+    while (decode_calls.load() < 1) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    pipe.push_samples(std::vector<float>(3200, 0.0f));  // < step_stride trailing zeros only
+    pipe.request_stop(false, true);
+    th.join();
+
+    EXPECT_EQ(decode_calls.load(), 1);
+    EXPECT_TRUE(!updates.empty() && updates.back().is_final);
+    EXPECT_EQ(updates.back().text, "keep every word");
+
+    // 9b: non-empty committed_text + trusted active_text + trailing silence OR empty final result -> both segments kept
+    StreamingPipelineConfig cfg_b;
+    cfg_b.initial_stride_samples = 2000;
+    cfg_b.step_stride_samples = 2000;
+    cfg_b.max_segment_samples = 4000;
+    cfg_b.min_final_samples = 100;
+    cfg_b.expect_language_header = false;
+    std::atomic<int> calls_b{0};
+    std::vector<TranscriptUpdate> updates_b;
+    Qwen3StreamingPipeline pipe_b(
+        cfg_b,
+        tok,
+        [&](const std::vector<float>&, const DecodeOptions&) -> DecodeResult {
+          const int c = ++calls_b;
+          DecodeResult r;
+          if (c == 1) r.text = "first part";
+          else if (c == 2) r.text = "keep every word";
+          else r.text = "";  // empty final result on real new speech must still keep active_text
+          r.raw_tokens = {100, 101, 102, 103, 104, 105};
+          return r;
+        },
+        [&](const TranscriptUpdate& u) { updates_b.push_back(u); });
+
+    std::thread th_b([&]() { pipe_b.run_loop(); });
+    pipe_b.push_samples(std::vector<float>(6000, 0.2f));
+    while (calls_b.load() < 2) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    pipe_b.push_samples(std::vector<float>(500, 0.2f));  // < step_stride real new speech
+    pipe_b.request_stop(false, true);
+    th_b.join();
+
+    EXPECT_EQ(calls_b.load(), 3);
+    EXPECT_TRUE(!updates_b.empty() && updates_b.back().is_final);
+    EXPECT_EQ(updates_b.back().text, "first part keep every word");
+  }
 }
 
 void test_trim_audio_features_unit() {
