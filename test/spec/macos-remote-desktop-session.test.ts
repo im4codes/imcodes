@@ -1,7 +1,6 @@
 import { NATIVE_COMPILE_TEST_TIMEOUT_MS, runNative } from './support/native-exec.js';
-import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { cpus, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { readSource } from '../helpers/read-source.js';
@@ -14,26 +13,21 @@ function read(relative: string): string {
   return readSource(resolve(ROOT, relative));
 }
 
-/**
- * Runs a long compile WITHOUT blocking the worker thread.
- *
- * `spawnSync` holds the event loop for the whole compile, so vitest's worker
- * cannot answer its own `onTaskUpdate` RPC and the run fails with an internal
- * timeout even though every test passed. Awaiting the child instead keeps the
- * worker responsive.
- */
-async function runTool(
-  command: string, args: readonly string[],
-): Promise<{ status: number | null; stdout: string; stderr: string }> {
-  return await new Promise((resolveRun) => {
-    const child = spawn(command, [...args], { encoding: 'utf8' } as never);
-    let stdout = '';
-    let stderr = '';
-    child.stdout?.on('data', (chunk: Buffer) => { stdout += String(chunk); });
-    child.stderr?.on('data', (chunk: Buffer) => { stderr += String(chunk); });
-    child.on('error', (error) => resolveRun({ status: 1, stdout, stderr: String(error) }));
-    child.on('close', (code) => resolveRun({ status: code, stdout, stderr }));
+async function runWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await fn(items[index], index);
+    }
   });
+  await Promise.all(workers);
+  return results;
 }
 
 describe('macOS SessionCore composition', () => {
@@ -121,10 +115,9 @@ describe('macOS SessionCore composition', () => {
           'native/remote-desktop-common/value_types.cc',
           'native/remote-desktop-common/quality_ladder.cc',
         ].map((path) => resolve(ROOT, path));
-        const compile = await runTool('xcrun', [
-          'clang++',
+        const objects = sources.map((_, index) => join(directory, `${index}.o`));
+        const compileArgs = [
           '-std=c++20',
-          '-fobjc-arc',
           '-fblocks',
           '-Wall',
           '-Wextra',
@@ -135,7 +128,29 @@ describe('macOS SessionCore composition', () => {
           '-mmacosx-version-min=12.3',
           '-I', NATIVE,
           '-I', COMMON,
-          ...sources,
+        ];
+        const concurrency = Math.max(2, Math.min(4, cpus().length));
+        await runWithConcurrency(sources, concurrency, async (src, index) => {
+          const obj = objects[index];
+          const isObjC = src.endsWith('.mm');
+          const compile = await runNative('xcrun', [
+            'clang++',
+            ...compileArgs,
+            ...(isObjC ? ['-fobjc-arc'] : []),
+            '-c',
+            src,
+            '-o',
+            obj,
+          ], { cwd: ROOT });
+          expect(compile.status, `Failed compiling ${src}:\n${compile.stdout}\n${compile.stderr}`).toBe(0);
+        });
+
+        const link = await runNative('xcrun', [
+          'clang++',
+          '-fsanitize=address,undefined',
+          '-fno-omit-frame-pointer',
+          '-mmacosx-version-min=12.3',
+          ...objects,
           '-framework', 'AppKit',
           '-framework', 'ApplicationServices',
           '-framework', 'CoreGraphics',
@@ -146,7 +161,7 @@ describe('macOS SessionCore composition', () => {
           '-framework', 'VideoToolbox',
           '-o', executable,
         ], { cwd: ROOT });
-        expect(compile.status, `${compile.stdout}\n${compile.stderr}`).toBe(0);
+        expect(link.status, `Link failed:\n${link.stdout}\n${link.stderr}`).toBe(0);
 
         const run = await runNative(executable, [], {
           cwd: ROOT,
