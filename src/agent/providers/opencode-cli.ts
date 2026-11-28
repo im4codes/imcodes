@@ -252,6 +252,7 @@ export function resolveOpenCodeCliBinary(options: {
   platform?: NodeJS.Platform;
   homeDir?: string;
   includeSystemFallback?: boolean;
+  resolveCandidate?: (candidate: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform) => string | null;
 } = {}): string | null {
   const env = options.env ?? process.env;
   const platform = options.platform ?? process.platform;
@@ -285,7 +286,7 @@ export function resolveOpenCodeCliBinary(options: {
   }
 
   // 4. Per-user / common install locations for sparse launchd / systemd PATHs
-  const includeSystem = options.includeSystemFallback ?? (platform === process.platform);
+  const includeSystem = platform === process.platform && options.includeSystemFallback !== false;
   const fallbackCandidates = platform === 'win32'
     ? [
         join(home, '.opencode', 'bin', 'opencode.exe'),
@@ -299,8 +300,9 @@ export function resolveOpenCodeCliBinary(options: {
         ...(includeSystem ? ['/usr/local/bin/opencode'] : []),
       ];
 
+  const candidateResolver = options.resolveCandidate ?? resolveCandidateFile;
   for (const candidate of fallbackCandidates) {
-    const found = resolveCandidateFile(candidate, env, platform);
+    const found = candidateResolver(candidate, env, platform);
     if (found) return found;
   }
   return null;
@@ -313,6 +315,7 @@ export function resolveOpenCodeCliLaunchPlan(options: {
   homeDir?: string;
   nodeExecutable?: string;
   includeSystemFallback?: boolean;
+  resolveCandidate?: (candidate: string, env: NodeJS.ProcessEnv, platform: NodeJS.Platform) => string | null;
 } = {}): OpenCodeCliLaunchPlan | null {
   const resolved = resolveOpenCodeCliBinary(options);
   if (!resolved) return null;

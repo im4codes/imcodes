@@ -162,13 +162,6 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
       includeSystemFallback: false,
     })).toBeNull();
 
-    // Causal: on macOS host with /opt/homebrew/bin/opencode, platform: 'linux' never probes macOS homebrew
-    expect(resolveOpenCodeCliBinary({
-      env: { PATH: '', HOME: join(root, 'empty-home') },
-      platform: 'linux',
-      homeDir: join(root, 'empty-home'),
-    })).toBeNull();
-
     const winDir = join(root, 'win-path');
     mkdirSync(winDir, { recursive: true });
     const winCmd = join(winDir, 'opencode.cmd');
@@ -178,6 +171,61 @@ describe('opencode-cli transport discovery, classification, and guards', () => {
       platform: 'win32',
       homeDir: join(root, 'win-home'),
     })).toBe(winCmd);
+  });
+
+  it('gates system fallback paths strictly to the matching host platform and respects includeSystemFallback', () => {
+    const candidatesProbed: string[] = [];
+    const mockResolveCandidate = (candidate: string) => {
+      candidatesProbed.push(candidate);
+      if (candidate === '/opt/homebrew/bin/opencode' || candidate === '/usr/local/bin/opencode') {
+        return candidate;
+      }
+      return null;
+    };
+
+    // 1. On darwin host with target platform: 'linux', host system paths are never probed even if includeSystemFallback: true is passed
+    const platformSpy = vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    try {
+      candidatesProbed.length = 0;
+      const res1 = resolveOpenCodeCliBinary({
+        env: { PATH: '' },
+        platform: 'linux',
+        homeDir: '/test-home',
+        includeSystemFallback: true,
+        resolveCandidate: mockResolveCandidate,
+      });
+      expect(res1).toBeNull();
+      expect(candidatesProbed).not.toContain('/opt/homebrew/bin/opencode');
+      expect(candidatesProbed).not.toContain('/usr/local/bin/opencode');
+
+      // 2. On linux host with target platform: 'linux' (same platform), default probes /usr/local/bin/opencode but NEVER /opt/homebrew
+      platformSpy.mockReturnValue('linux');
+      candidatesProbed.length = 0;
+      const res2 = resolveOpenCodeCliBinary({
+        env: { PATH: '' },
+        platform: 'linux',
+        homeDir: '/test-home',
+        resolveCandidate: mockResolveCandidate,
+      });
+      expect(res2).toBe('/usr/local/bin/opencode');
+      expect(candidatesProbed).toContain('/usr/local/bin/opencode');
+      expect(candidatesProbed).not.toContain('/opt/homebrew/bin/opencode');
+
+      // 3. On linux host with target platform: 'linux', includeSystemFallback: false isolates and returns null
+      candidatesProbed.length = 0;
+      const res3 = resolveOpenCodeCliBinary({
+        env: { PATH: '' },
+        platform: 'linux',
+        homeDir: '/test-home',
+        includeSystemFallback: false,
+        resolveCandidate: mockResolveCandidate,
+      });
+      expect(res3).toBeNull();
+      expect(candidatesProbed).not.toContain('/usr/local/bin/opencode');
+      expect(candidatesProbed).not.toContain('/opt/homebrew/bin/opencode');
+    } finally {
+      platformSpy.mockRestore();
+    }
   });
 
   it('classifies v1 (<2) and v2 (>=2) version strings accurately', () => {
