@@ -1,10 +1,15 @@
-import { execFileSync } from 'node:child_process';
-import { constants as fsConstants, statSync, accessSync } from 'node:fs';
+import { execFile as execFileCb, execFileSync } from 'node:child_process';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import { access, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFileCb);
 
 const DEFAULT_PATHEXT = '.COM;.EXE;.BAT;.CMD';
+export const OPENCODE_PRIVILEGE_PROBE_TIMEOUT_MS = 2_000;
+
 const WIN_ADMIN_CHECK = [
   '-NoProfile',
   '-NonInteractive',
@@ -14,6 +19,10 @@ const WIN_ADMIN_CHECK = [
 
 let cachedWin32Elevated: boolean | null = null;
 
+export function __resetOpenCodeElevationCacheForTests(): void {
+  cachedWin32Elevated = null;
+}
+
 export interface ResolveOpenCodeCliOptions {
   env?: NodeJS.ProcessEnv;
   homeDir?: string;
@@ -21,6 +30,8 @@ export interface ResolveOpenCodeCliOptions {
   isElevated?: boolean | (() => boolean);
   isExecutableFile?: (filePath: string) => Promise<boolean>;
   isExecutableFileSync?: (filePath: string) => boolean;
+  runPrivilegeProbeSync?: (file: string, args: readonly string[], timeoutMs: number) => string;
+  runPrivilegeProbeAsync?: (file: string, args: readonly string[], timeoutMs: number) => Promise<string>;
 }
 
 export interface ResolvedOpenCodeCli {
@@ -62,49 +73,107 @@ async function defaultIsFileExecutable(filePath: string, platform: NodeJS.Platfo
   }
 }
 
-export function isOpenCodeCallerElevated(platform: NodeJS.Platform = process.platform): boolean {
+function getTrustedWindowsPowerShellPath(env: NodeJS.ProcessEnv = process.env): string {
+  const systemRoot = readEnvCaseInsensitive(env, 'SystemRoot') ?? readEnvCaseInsensitive(env, 'WINDIR') ?? 'C:\\Windows';
+  return path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+
+function parseExplicitElevationOutput(rawOutput: unknown): boolean | null {
+  if (typeof rawOutput !== 'string') return null;
+  const normalized = rawOutput.trim().toLowerCase();
+  if (normalized === 'false') return false;
+  if (normalized === 'true') return true;
+  return null;
+}
+
+export function isOpenCodeCallerElevated(
+  platform: NodeJS.Platform = process.platform,
+  opts: Pick<ResolveOpenCodeCliOptions, 'env' | 'runPrivilegeProbeSync'> = {},
+): boolean {
   if (platform === 'linux' || platform === 'darwin') {
     return typeof process.getuid === 'function' ? process.getuid() === 0 : false;
   }
   if (platform === 'win32') {
-    if (process.platform !== 'win32') return false;
-    if (cachedWin32Elevated !== null) return cachedWin32Elevated;
-    const systemRoot = process.env.SystemRoot ?? process.env.WINDIR ?? 'C:\\Windows';
-    const candidates = [
-      path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
-      'powershell.exe',
-    ];
-    for (const ps of candidates) {
-      try {
-        const out = execFileSync(ps, [...WIN_ADMIN_CHECK], {
-          encoding: 'utf8',
-          stdio: ['ignore', 'pipe', 'ignore'],
-        });
-        cachedWin32Elevated = out.trim().toLowerCase() === 'true';
-        return cachedWin32Elevated;
-      } catch {
-        // Try next candidate
+    const useCache = !opts.runPrivilegeProbeSync && !opts.env;
+    if (useCache && cachedWin32Elevated !== null) return cachedWin32Elevated;
+    const psExe = getTrustedWindowsPowerShellPath(opts.env);
+    const runSync = opts.runPrivilegeProbeSync ?? ((file, args, timeoutMs) =>
+      execFileSync(file, [...args], {
+        encoding: 'utf8',
+        timeout: timeoutMs,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }));
+    try {
+      const parsed = parseExplicitElevationOutput(runSync(psExe, WIN_ADMIN_CHECK, OPENCODE_PRIVILEGE_PROBE_TIMEOUT_MS));
+      if (parsed !== null) {
+        if (useCache) cachedWin32Elevated = parsed;
+        return parsed;
       }
+      // Ambiguous/empty output fails closed (never grant user-dir fallback unless explicitly confirmed 'false')
+      return true;
+    } catch {
+      return true;
     }
-    cachedWin32Elevated = true;
-    return true;
   }
   return false;
 }
 
-function canUseOpenCodeHomeFallback(
-  platform: NodeJS.Platform,
-  homeDir: string,
-  isElevatedOption?: boolean | (() => boolean),
-): boolean {
+export async function isOpenCodeCallerElevatedAsync(
+  platform: NodeJS.Platform = process.platform,
+  opts: Pick<ResolveOpenCodeCliOptions, 'env' | 'runPrivilegeProbeAsync'> = {},
+): Promise<boolean> {
+  if (platform === 'linux' || platform === 'darwin') {
+    return typeof process.getuid === 'function' ? process.getuid() === 0 : false;
+  }
+  if (platform === 'win32') {
+    const useCache = !opts.runPrivilegeProbeAsync && !opts.env;
+    if (useCache && cachedWin32Elevated !== null) return cachedWin32Elevated;
+    const psExe = getTrustedWindowsPowerShellPath(opts.env);
+    const runAsync = opts.runPrivilegeProbeAsync ?? (async (file, args, timeoutMs) => {
+      const { stdout } = await execFileAsync(file, [...args], {
+        encoding: 'utf8',
+        timeout: timeoutMs,
+      });
+      return stdout;
+    });
+    try {
+      const parsed = parseExplicitElevationOutput(await runAsync(psExe, WIN_ADMIN_CHECK, OPENCODE_PRIVILEGE_PROBE_TIMEOUT_MS));
+      if (parsed !== null) {
+        if (useCache) cachedWin32Elevated = parsed;
+        return parsed;
+      }
+      return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+function canUseHomeWithElevationResult(platform: NodeJS.Platform, homeDir: string, elevated: boolean): boolean {
   if (!homeDir || !homeDir.trim()) return false;
-  const elevated = typeof isElevatedOption === 'function'
-    ? isElevatedOption()
-    : typeof isElevatedOption === 'boolean'
-      ? isElevatedOption
-      : isOpenCodeCallerElevated(platform);
   if (!elevated) return true;
   return platform !== 'win32' && homeDir === '/root';
+}
+
+function canUseOpenCodeHomeFallbackSync(platform: NodeJS.Platform, homeDir: string, opts: ResolveOpenCodeCliOptions): boolean {
+  if (!homeDir || !homeDir.trim()) return false;
+  const elevated = typeof opts.isElevated === 'function'
+    ? opts.isElevated()
+    : typeof opts.isElevated === 'boolean'
+      ? opts.isElevated
+      : isOpenCodeCallerElevated(platform, opts);
+  return canUseHomeWithElevationResult(platform, homeDir, elevated);
+}
+
+async function canUseOpenCodeHomeFallbackAsync(platform: NodeJS.Platform, homeDir: string, opts: ResolveOpenCodeCliOptions): Promise<boolean> {
+  if (!homeDir || !homeDir.trim()) return false;
+  const elevated = typeof opts.isElevated === 'function'
+    ? opts.isElevated()
+    : typeof opts.isElevated === 'boolean'
+      ? opts.isElevated
+      : await isOpenCodeCallerElevatedAsync(platform, opts);
+  return canUseHomeWithElevationResult(platform, homeDir, elevated);
 }
 
 function listOpenCodePathCandidates(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string[] {
@@ -144,7 +213,7 @@ export async function resolveOpenCodeCliAsync(opts: ResolveOpenCodeCliOptions = 
     }
   }
 
-  if (canUseOpenCodeHomeFallback(platform, homeDir, opts.isElevated)) {
+  if (await canUseOpenCodeHomeFallbackAsync(platform, homeDir, opts)) {
     const homeBin = getOpenCodeHomeBinaryPath(platform, homeDir);
     if (await isExec(homeBin)) {
       return { executable: homeBin, resolvedPath: homeBin, source: 'home_bin' };
@@ -166,7 +235,7 @@ export function resolveOpenCodeCliSync(opts: ResolveOpenCodeCliOptions = {}): Re
     }
   }
 
-  if (canUseOpenCodeHomeFallback(platform, homeDir, opts.isElevated)) {
+  if (canUseOpenCodeHomeFallbackSync(platform, homeDir, opts)) {
     const homeBin = getOpenCodeHomeBinaryPath(platform, homeDir);
     if (isExec(homeBin)) {
       return { executable: homeBin, resolvedPath: homeBin, source: 'home_bin' };

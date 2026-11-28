@@ -3082,6 +3082,7 @@ exec "${realStatBin}" "$@"
         platform: 'win32',
         homeDir: winHome,
         env: { PATH: 'C:\\Windows\\System32' },
+        isElevated: false,
         isExecutableFile: async (p) => p.toLowerCase() === expectedWinOc.toLowerCase(),
       },
     });

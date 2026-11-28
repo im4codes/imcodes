@@ -6,7 +6,15 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { ClaudeCodeDriver } from '../../../src/agent/drivers/claude-code.js';
 import { CodexDriver } from '../../../src/agent/drivers/codex.js';
 import { OpenCodeDriver } from '../../../src/agent/drivers/opencode.js';
-import { resolveOpenCodeCliAsync, resolveOpenCodeCliSync } from '../../../src/agent/opencode-cli-path.js';
+import { resolveOpenCodeVersion } from '../../../src/agent/agent-version.js';
+import {
+  __resetOpenCodeElevationCacheForTests,
+  isOpenCodeCallerElevated,
+  isOpenCodeCallerElevatedAsync,
+  OPENCODE_PRIVILEGE_PROBE_TIMEOUT_MS,
+  resolveOpenCodeCliAsync,
+  resolveOpenCodeCliSync,
+} from '../../../src/agent/opencode-cli-path.js';
 import { ShellDriver } from '../../../src/agent/drivers/shell.js';
 import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../../shared/cron-types.js';
 
@@ -332,6 +340,171 @@ describe('OpenCodeDriver', () => {
       rmSync(tempHome, { recursive: true, force: true });
       rmSync(pathBinDir, { recursive: true, force: true });
     }
+  });
+
+  it('fails closed on unconfirmed Windows privilege probes, uses trusted System32 PowerShell with timeout, and skips probe when PATH resolves', async () => {
+    __resetOpenCodeElevationCacheForTests();
+    const env = { SystemRoot: 'C:\\WinCustom', PATH: 'C:\\Windows\\System32' };
+    const expectedPs = 'C:\\WinCustom\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+    const expectedHomeBin = 'C:\\Users\\Alice Smith\\.opencode\\bin\\opencode.exe';
+
+    for (const badOutput of ['', '   \r\n', 'maybe', 'error: access denied']) {
+      const seenFiles: string[] = [];
+      const seenTimeouts: number[] = [];
+      expect(isOpenCodeCallerElevated('win32', {
+        env,
+        runPrivilegeProbeSync: (file, _args, timeoutMs) => {
+          seenFiles.push(file);
+          seenTimeouts.push(timeoutMs);
+          return badOutput;
+        },
+      })).toBe(true);
+      expect(seenFiles).toEqual([expectedPs]);
+      expect(seenTimeouts).toEqual([OPENCODE_PRIVILEGE_PROBE_TIMEOUT_MS]);
+
+      await expect(isOpenCodeCallerElevatedAsync('win32', {
+        env,
+        runPrivilegeProbeAsync: async (file, _args, timeoutMs) => {
+          expect(file).toBe(expectedPs);
+          expect(timeoutMs).toBe(OPENCODE_PRIVILEGE_PROBE_TIMEOUT_MS);
+          return badOutput;
+        },
+      })).resolves.toBe(true);
+    }
+
+    expect(isOpenCodeCallerElevated('win32', {
+      env,
+      runPrivilegeProbeSync: () => {
+        throw new Error('ETIMEDOUT');
+      },
+    })).toBe(true);
+
+    await expect(isOpenCodeCallerElevatedAsync('win32', {
+      env,
+      runPrivilegeProbeAsync: async () => {
+        throw new Error('ETIMEDOUT');
+      },
+    })).resolves.toBe(true);
+
+    expect(isOpenCodeCallerElevated('win32', { env, runPrivilegeProbeSync: () => '  False \r\n' })).toBe(false);
+    expect(isOpenCodeCallerElevated('win32', { env, runPrivilegeProbeSync: () => 'True\r\n' })).toBe(true);
+    await expect(isOpenCodeCallerElevatedAsync('win32', { env, runPrivilegeProbeAsync: async () => 'False\r\n' })).resolves.toBe(false);
+
+    // Ambiguous probe denies home_bin; explicit 'False' grants home_bin
+    expect(resolveOpenCodeCliSync({
+      platform: 'win32',
+      env,
+      homeDir: 'C:\\Users\\Alice Smith',
+      isExecutableFileSync: (p) => p === expectedHomeBin,
+      runPrivilegeProbeSync: () => '',
+    }).source).toBe('missing');
+
+    await expect(resolveOpenCodeCliAsync({
+      platform: 'win32',
+      env,
+      homeDir: 'C:\\Users\\Alice Smith',
+      isExecutableFile: async (p) => p === expectedHomeBin,
+      runPrivilegeProbeAsync: async () => '',
+    })).resolves.toEqual({ executable: 'opencode', source: 'missing' });
+
+    await expect(resolveOpenCodeCliAsync({
+      platform: 'win32',
+      env,
+      homeDir: 'C:\\Users\\Alice Smith',
+      isExecutableFile: async (p) => p === expectedHomeBin,
+      runPrivilegeProbeAsync: async () => 'False\r\n',
+    })).resolves.toEqual({
+      executable: expectedHomeBin,
+      resolvedPath: expectedHomeBin,
+      source: 'home_bin',
+    });
+
+    // PATH hit bypasses privilege probe completely
+    const syncProbeSpy = vi.fn(() => 'True');
+    const asyncProbeSpy = vi.fn(async () => 'True');
+    const npmEnv = { ...env, PATH: 'C:\\Users\\Alice Smith\\AppData\\Roaming\\npm', PATHEXT: '.EXE;.CMD' };
+    expect(resolveOpenCodeCliSync({
+      platform: 'win32',
+      env: npmEnv,
+      homeDir: 'C:\\Users\\Alice Smith',
+      isExecutableFileSync: (p) => p === 'C:\\Users\\Alice Smith\\AppData\\Roaming\\npm\\opencode.cmd',
+      runPrivilegeProbeSync: syncProbeSpy,
+    })).toEqual({
+      executable: 'opencode',
+      resolvedPath: 'C:\\Users\\Alice Smith\\AppData\\Roaming\\npm\\opencode.cmd',
+      source: 'path',
+    });
+    expect(syncProbeSpy).not.toHaveBeenCalled();
+
+    await expect(resolveOpenCodeCliAsync({
+      platform: 'win32',
+      env: npmEnv,
+      homeDir: 'C:\\Users\\Alice Smith',
+      isExecutableFile: async (p) => p === 'C:\\Users\\Alice Smith\\AppData\\Roaming\\npm\\opencode.cmd',
+      runPrivilegeProbeAsync: asyncProbeSpy,
+    })).resolves.toEqual({
+      executable: 'opencode',
+      resolvedPath: 'C:\\Users\\Alice Smith\\AppData\\Roaming\\npm\\opencode.cmd',
+      source: 'path',
+    });
+    expect(asyncProbeSpy).not.toHaveBeenCalled();
+  });
+
+  it('resolves opencode version across Windows PATH .cmd shims and home_bin native executables', async () => {
+    const shellCalls: string[] = [];
+    const fileCalls: Array<{ file: string; args: readonly string[]; verbatim?: boolean }> = [];
+
+    // 1. Windows PATH .cmd shim (e.g. npm install -g opencode-ai) uses shell lookup, never direct execFile
+    const pathVersion = await resolveOpenCodeVersion({
+      platform: 'win32',
+      resolveCli: async () => ({
+        executable: 'opencode',
+        resolvedPath: 'C:\\Users\\Alice\\AppData\\Roaming\\npm\\opencode.cmd',
+        source: 'path',
+      }),
+      execShell: async (cmd) => {
+        shellCalls.push(cmd);
+        return { stdout: '1.2.3\r\n', stderr: '' };
+      },
+      execFileFn: async () => {
+        throw new Error('EINVAL: direct execFile cannot launch .cmd without shell');
+      },
+    });
+    expect(pathVersion).toBe('1.2.3');
+    expect(shellCalls).toEqual(['opencode --version']);
+
+    // 2. Native Windows home_bin executable with spaces executes directly without shell
+    const homeExe = 'C:\\Users\\Alice Smith\\.opencode\\bin\\opencode.exe';
+    const homeExeVersion = await resolveOpenCodeVersion({
+      platform: 'win32',
+      resolveCli: async () => ({ executable: homeExe, resolvedPath: homeExe, source: 'home_bin' }),
+      execShell: async () => {
+        throw new Error('should not use shell for home_bin native executable');
+      },
+      execFileFn: async (file, args, opts) => {
+        fileCalls.push({ file, args, verbatim: opts.windowsVerbatimArguments });
+        return { stdout: '1.2.4\n', stderr: '' };
+      },
+    });
+    expect(homeExeVersion).toBe('1.2.4');
+    expect(fileCalls).toEqual([{ file: homeExe, args: ['--version'], verbatim: undefined }]);
+
+    // 3. Windows home_bin .cmd shim invokes explicit cmd.exe /d /s /c with verbatim quoting
+    const homeCmd = 'C:\\Users\\Alice Smith\\.opencode\\bin\\opencode.cmd';
+    const homeCmdVersion = await resolveOpenCodeVersion({
+      platform: 'win32',
+      env: { ComSpec: 'C:\\WinCustom\\System32\\cmd.exe' },
+      resolveCli: async () => ({ executable: homeCmd, resolvedPath: homeCmd, source: 'home_bin' }),
+      execFileFn: async (file, args, opts) => ({
+        stdout: file === 'C:\\WinCustom\\System32\\cmd.exe'
+          && args.join(' ') === `/d /s /c ""${homeCmd}" --version"`
+          && opts.windowsVerbatimArguments === true
+          ? '1.2.5\n'
+          : '',
+        stderr: '',
+      }),
+    });
+    expect(homeCmdVersion).toBe('1.2.5');
   });
 });
 

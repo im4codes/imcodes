@@ -670,5 +670,33 @@ describe('detectInstalledAgents()', () => {
       },
     });
     expect(detected.opencode?.installed).toBe(true);
+
+    // Windows home fallback requires confirmed non-elevation (fails closed when unconfirmed)
+    const winHome = 'C:\\Users\\alice';
+    const winHomeBin = 'C:\\Users\\alice\\.opencode\\bin\\opencode.exe';
+    const winUnconfirmed = await detectInstalledAgents({
+      deps: {
+        platform: 'win32',
+        homeDir: winHome,
+        imcodesHomeDir: 'C:\\Users\\alice\\.imcodes',
+        env: { PATH: 'C:\\Windows\\System32' },
+        isExecutableFile: async (p) => p.toLowerCase() === winHomeBin.toLowerCase(),
+        isProviderConnected: () => false,
+      },
+    });
+    expect(winUnconfirmed.opencode?.installed).toBe(false);
+
+    const winNonElevated = await detectInstalledAgents({
+      deps: {
+        platform: 'win32',
+        homeDir: winHome,
+        imcodesHomeDir: 'C:\\Users\\alice\\.imcodes',
+        env: { PATH: 'C:\\Windows\\System32' },
+        isElevated: false,
+        isExecutableFile: async (p) => p.toLowerCase() === winHomeBin.toLowerCase(),
+        isProviderConnected: () => false,
+      },
+    });
+    expect(winNonElevated.opencode?.installed).toBe(true);
   });
 });

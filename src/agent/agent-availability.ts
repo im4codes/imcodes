@@ -36,6 +36,7 @@ export interface AgentAvailabilityProbeDeps {
   env: NodeJS.ProcessEnv;
   homeDir: string;
   imcodesHomeDir: string;
+  isElevated?: boolean;
   isExecutableFile(filePath: string): Promise<boolean>;
   fileExists(filePath: string): Promise<boolean>;
   resolvePackageRoot(specifier: string, packageName?: string): string | null;
@@ -110,6 +111,7 @@ function buildDefaultDeps(overrides?: Partial<AgentAvailabilityProbeDeps>): Agen
     env,
     homeDir: overrides?.homeDir ?? homedir(),
     imcodesHomeDir: overrides?.imcodesHomeDir ?? resolveImcodesHome(),
+    ...(overrides?.isElevated !== undefined ? { isElevated: overrides.isElevated } : {}),
     isExecutableFile: overrides?.isExecutableFile ?? ((filePath) => defaultIsExecutableFile(filePath, platform)),
     fileExists: overrides?.fileExists ?? defaultFileExists,
     resolvePackageRoot: overrides?.resolvePackageRoot ?? resolveNodePackageRoot,
@@ -422,6 +424,7 @@ async function probeOpenCode(deps: AgentAvailabilityProbeDeps, requireSdkPackage
     platform: deps.platform,
     env: deps.env,
     homeDir: deps.homeDir,
+    ...(deps.isElevated !== undefined ? { isElevated: deps.isElevated } : {}),
     isExecutableFile: deps.isExecutableFile,
   });
   return resolved.source === 'missing'
